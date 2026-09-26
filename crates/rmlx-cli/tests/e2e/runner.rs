@@ -753,7 +753,7 @@ pub fn run_manifest(manifest_toml: &str) -> Report {
         if !only.is_empty() && !only.iter().any(|id| id == &case.id) {
             continue;
         }
-        // Phase 2 rows are declarative-only: record PENDING, never execute.
+        // `phase2`-tagged rows are declarative-only: record PENDING, never execute.
         if case.tags.iter().any(|t| t == "phase2") {
             report.push(CaseResult {
                 id: case.id.clone(),
@@ -1091,10 +1091,9 @@ fn pick_port(case: &Case) -> u16 {
 /// via the OpenAI logprobs `bytes` field) at temp=0 greedy and compare it to a
 /// recorded golden file under `tests/e2e/golden/<case_id>.json`.
 ///
-/// * Golden file ABSENT (and not in regen mode) → `Skip` with "no golden
-///   recorded" — we do NOT silently downgrade to a substring check.
-/// * `RMLX_E2E_REGEN_GOLDEN=1` or first run with the file absent → WRITE the
-///   golden and `Pass`.
+/// * `RMLX_E2E_REGEN_GOLDEN=1`, or a run with the file absent → WRITE the
+///   golden and `Pass`. An absent golden therefore passes; it never
+///   downgrades to a substring check.
 /// * Golden present → byte-for-byte compare; any divergence is `Fail` with the
 ///   first mismatching position.
 ///
@@ -1472,8 +1471,9 @@ fn assert_thinking(port: u16, id: &str, mk: &dyn Fn(Verdict, String) -> CaseResu
             format!("reasoning_content empty; content={:?}", trunc(&content)),
         );
     }
-    // budget enforced: thinking_budget=64 → reasoning should not be runaway.
-    // answer correct: 17*4 = 68 should appear in content or reasoning.
+    // The budget itself is not asserted: this checks only that reasoning is
+    // non-empty and that the answer (17*4 = 68) appears in content or
+    // reasoning.
     let answered = content.contains("68") || reasoning.contains("68");
     if answered {
         mk(
@@ -1495,7 +1495,7 @@ fn assert_thinking(port: u16, id: &str, mk: &dyn Fn(Verdict, String) -> CaseResu
     }
 }
 
-// ── Phase 2a: SSD cross-restart + prompt-cache reuse ─────────────────────────
+// ── SSD cross-restart + prompt-cache reuse ──────────────────────────────────
 
 /// A long, prefix-stable prompt that forms at least one full 256-token
 /// prompt-cache block so both the SSD spill (whole-block-only) and the
@@ -1951,7 +1951,7 @@ fn assert_cache_hit_equivalence(
     )
 }
 
-// ── Phase 2b: multi-model lifecycle ──────────────────────────────────────────
+// ── Multi-model lifecycle ─────────────────────────────────────────────────────
 
 /// Spawn `rmlx serve --registry <json> --max-loaded-models <cap> --port <port>`
 /// and block until `/health` is green. Mirrors `spawn_serve` but uses the
@@ -2364,7 +2364,7 @@ fn fail_lc(
     mk(Verdict::Fail, detail)
 }
 
-// ── Phase 2b: attention dispatch_fired (log scrape) ──────────────────────────
+// ── Attention dispatch_fired (log scrape) ────────────────────────────────────
 
 /// Spawn `rmlx serve --model <path> --kv-quant <kv> --log verbose --port <port>`
 /// WITHOUT pinning `RUST_LOG` (so `--log verbose` drives the EnvFilter and the

@@ -14,22 +14,22 @@
 //! than context — an adaptive arm at ceiling 16 and a fixed arm at block 16 are
 //! different configurations.
 //!
-//! **A round's tokens are the ones a round produced.** The four sidecar loops
+//! **A round's tokens are the ones a round produced.** The five sidecar paths
 //! argmax a bonus token out of the prefill forward and emit it before the round
 //! loop starts, so `emitted` carries one token no verify round produced; the
-//! two-model loops emit nothing outside their loop. Dividing `emitted` by
-//! `rounds` would therefore read `+1/rounds` high on five of seven loops —
-//! measured at +1.35% and +0.98% on two of them — and make the one figure the
-//! record exists to compare incomparable between them. Each loop counts what
+//! two-model paths emit nothing outside their loop. Dividing `emitted` by
+//! `rounds` would therefore read `+1/rounds` high on five of seven paths and
+//! make the one figure the record exists to compare incomparable between
+//! them. Each loop counts what
 //! its rounds emit at the emit site and reports it as
 //! [`RoundStats::emitted_in_rounds`]; that count is the figure's numerator, and
 //! `seed_emitted` beside it makes the three counts add up or say why not.
 //!
 //! **The derivation does not change what it measures.** Every figure here is
 //! arithmetic over counters the loops already keep; deriving them allocates
-//! nothing inside a round and adds no clock read to one. The two spans that are
-//! new — prefill and the round loop as a whole — are one `Instant::now()` each
-//! per *request*.
+//! nothing inside a round and adds no clock read to one. The two request-level
+//! spans — prefill and the round loop as a whole — are one `Instant::now()`
+//! each per *request*.
 //!
 //! `draft_ms` and `verifier_ms` are the wall-clock spans of their call sites,
 //! not the cost of the work those calls issue: this engine evaluates lazily, so
@@ -249,10 +249,9 @@ fn unforced(carry: &[(&str, &Array)]) -> Vec<String> {
 /// any of it — uncharged, a phase is timed but not forced, and lazy work drifts
 /// between them (see [`phases_charged`]).
 ///
-/// Three of the seven round loops keep this split; the other four time their
-/// drafter and verifier over the request and no phase within a round, which is
-/// why [`RoundReport::phases`] is an `Option` and their rounds carry no
-/// wall-clock field at all rather than five zeroes.
+/// `run_rounds` fills this split for all seven drafter paths; three of them
+/// can charge their phases (see [`phases_charged`]). [`RoundReport::phases`]
+/// is an `Option`; `run_rounds` always fills it.
 #[derive(Debug, Clone, Copy)]
 #[allow(
     clippy::struct_field_names,

@@ -1,15 +1,14 @@
-//! A6.2 — sampler-side constraint engine.
+//! Sampler-side constraint engine.
 //!
 //! `ConstraintEngine` is a per-request decoding constraint. It produces a
 //! boolean allow-mask over the vocabulary for each sampling step; the sampler
 //! consults the mask to suppress disallowed token ids by adding
-//! `f32::NEG_INFINITY` to their logits before `argmax` (and, once temperature
-//! sampling lands in A7, before softmax).
+//! `f32::NEG_INFINITY` to their logits before `argmax` or, when sampling,
+//! before softmax.
 //!
-//! **A6.2 scope**: plumbing only. The only impl is `NoOpConstraint` whose
-//! mask is all-`true`. Wiring this end-to-end is the gate that lets A6.3 land
-//! the first real grammar (`json_object`) without touching the decode loops
-//! again.
+//! This crate defines the trait and `NoOpConstraint` (mask all-`true`). The
+//! real grammars (`JsonObjectConstraint`, `SchemaConstraint`) live in
+//! `rmlx-server`'s `constraint_json`.
 //!
 //! # Hot-path cost
 //!
@@ -64,8 +63,8 @@ pub trait ConstraintEngine: Send + Sync + std::fmt::Debug {
     /// stop decoding (treated like EOS).
     ///
     /// Returning `false` always is safe; `NoOpConstraint` does exactly that.
-    /// Real grammars (A6.3+) flip this to `true` when the JSON / schema
-    /// parse completes.
+    /// The JSON grammars flip this to `true` when the JSON / schema parse
+    /// completes.
     fn finished(&self) -> bool;
 
     /// True when the engine wants the sampler to apply its mask.
@@ -121,10 +120,8 @@ pub trait ConstraintThinkSignal {
 
 /// No-op constraint: every token is allowed at every step, never finishes.
 ///
-/// Used by A6.2 as the gate impl for `response_format = json_object | json_schema`
-/// — the plumbing path is wired end-to-end so A6.3 only needs to swap the
-/// engine, not the decode loops. Output is byte-identical to the
-/// no-`response_format` path at `temp=0` because every logit is preserved.
+/// Output is byte-identical to the unconstrained path at `temp=0` because
+/// every logit is preserved.
 ///
 /// The internal mask buffer is lazily-sized: the first call to
 /// [`step_mask`](ConstraintEngine::step_mask) records the vocab size and

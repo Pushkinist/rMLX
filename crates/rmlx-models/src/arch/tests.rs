@@ -21,7 +21,7 @@ fn write_config(dir: &TempDir, architectures: &[&str]) -> std::path::PathBuf {
     dir.path().to_path_buf()
 }
 
-// -- B3: is_arch_supported predicate tests --------------------------------
+// -- is_arch_supported predicate tests ------------------------------------
 
 /// Every registered architecture is classified as generative or not, here,
 /// against the registry as a set — so a new entry fails this test until

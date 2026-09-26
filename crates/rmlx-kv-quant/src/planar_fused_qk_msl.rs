@@ -12,7 +12,7 @@
 //!
 //! The flash-decode kernel (`planar_flash_decode_msl`) extends this contract to
 //! fuse the V path as well.  Further generalisation to other codecs (rotor, iso)
-//! is deferred.  See `docs/KV_QUANT.md` §"Fused-QK kernels".
+//! is deferred.  See `docs/KV_FUSED_KERNELS.md` §"Fused-QK kernels".
 //!
 //! # Pattern reference
 //!

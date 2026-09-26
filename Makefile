@@ -111,6 +111,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         smoke-codec-matrix \
         e2e \
         file-size-report debt-report debt-report-selftest \
+        check-doc-size check-doc-size-selftest \
         kv-update-census kv-update-census-selftest \
         check-no-inline-tests check-no-scalar-f32-leak \
         check-doc-source-citations \
@@ -251,12 +252,9 @@ CI_PERF_INCOMPLETE := $(if $(GPU_HALF_NAME),ci-perf $(GPU_HALF_NAME)-half INCOMP
 # ci-perf runs the GPU/Metal suite after `test-perf`, and it is the only shared
 # gate that does. `make ci` cannot: the GPU tests need the Metal context to
 # themselves (hard rule 8) and take minutes, which is the wrong price on every
-# commit. This is a real new cost for `ci-perf` and not a free one — the target
-# used to be a single `cargo test --workspace`, runnable next to a live
-# `rmlx serve`, and now it refuses to start unless the GPU is idle. It is simply
-# the cheapest place in the tree to pay it: `ci-perf` is already the long,
-# pre-merge-only target, and the preflight line below makes the new precondition
-# fail in milliseconds instead of after the release-perf half.
+# commit. So `ci-perf` refuses to start unless the GPU is idle: it is already
+# the long, pre-merge-only target, and the preflight line below makes that
+# precondition fail in milliseconds instead of after the release-perf half.
 #
 # Three lines, in this order, for two different reasons:
 #
@@ -264,7 +262,7 @@ CI_PERF_INCOMPLETE := $(if $(GPU_HALF_NAME),ci-perf $(GPU_HALF_NAME)-half INCOMP
 #     only the things that cost nothing to check — RMLX_SKIP_GPU unset, no
 #     competing MLX process, a non-empty classification — and those are the most
 #     likely way this gate fails in daily use. Discovering a live `rmlx serve`
-#     after `test-perf` has run throws away the ~16 min it took.
+#     after `test-perf` has run throws away the time it took.
 #   * `test-perf` before the tests themselves because it covers the whole
 #     workspace, so a compile error anywhere shows up there, whereas the GPU run
 #     visits five crates and holds the GPU while it does. Fail on the broad,
@@ -297,18 +295,18 @@ CI_PERF_INCOMPLETE := $(if $(GPU_HALF_NAME),ci-perf $(GPU_HALF_NAME)-half INCOMP
 # wrapper. The last line is what makes that harmless.
 #
 # The two halves run under different profiles on purpose. The GPU run builds
-# under `dev`, where debug assertions are live — 61 `debug_assert!` sites in
-# rmlx-kv-quant alone — and those are correctness guards on correctness tests.
+# under `dev`, where debug assertions are live, and those are correctness
+# guards on correctness tests.
 # `test-perf` is the one that must be release-perf, because that is the codegen a
 # perf-sensitive change ships under. The consequence is in hard rule 9: no gate
 # runs a GPU test with debug-assertions off, so a defect that only appears there
 # has to be reproduced by hand.
 #
-# Cost: the GPU suite is 383 tests, serialized, under Metal shader validation,
-# and one measured whole run of it took 279 min on a host holding every
-# snapshot — which is what HALF exists for. The dev profile is not shared with
+# Cost: the GPU suite runs serialized, under Metal shader validation, and a
+# whole run on a host holding every snapshot takes hours — which is what HALF
+# exists for. The dev profile is not shared with
 # `test-perf` and is what `make target-gc` prunes first, so a run after a GC
-# pays a cold opt-level-0 build on top. See docs/TESTING.md.
+# pays a cold opt-level-0 build on top. See docs/GPU_TESTS.md.
 ci-perf:         ## pre-push gate under release-perf + the serialized GPU/Metal suite (HALF=codec|rest runs one side of the partition; separate from make ci)
 	@bash scripts/run_gpu_tests.sh --preflight
 	$(MAKE) test-perf
@@ -323,10 +321,9 @@ ci-perf:         ## pre-push gate under release-perf + the serialized GPU/Metal 
 
 # gpu-test: the execution step for the tests `check-gpu-tests-ignored` mandates.
 # Every test reaching Device::Gpu must carry #[ignore] (a shared Metal context
-# driven from parallel cargo-test threads aborts the whole binary), and until
-# this target existed nothing ran them: `make test` passes no --ignored and the
-# hosted CI has no Metal. GPU decode correctness for every KV codec sits in that
-# category, and tests in it have gone red on main and stayed red undetected.
+# driven from parallel cargo-test threads aborts the whole binary), and nothing
+# else runs them: `make test` passes no --ignored and the hosted CI has no
+# Metal. GPU decode correctness for every KV codec sits in that category.
 #
 # It is NOT part of `make ci`: it needs exclusive access to the Metal context and
 # is far too slow to block every commit. `ci-perf` runs the same suite as its
@@ -412,7 +409,8 @@ model-check-full: ## run model-logic crates + golden-token integration tests (MO
 
 # e2e: the feature-proof harness — drives the REAL rmlx binary per manifest case
 # (CLI subprocess or `rmlx serve` + HTTP), asserts on real output, writes the
-# PASS/FAIL grid to <RMLX_HOME>/e2e/report.{json,md}. Single-MLX discipline:
+# PASS/FAIL grid to <temp_dir>/rmlx_e2e_<pid>/e2e/report.{json,md} (the
+# harness pins its own RMLX_HOME there). Single-MLX discipline:
 # --test-threads=1 is mandatory. Model-gated cases skip when no Bonsai snapshot
 # resolves (RMLX_E2E_MODEL_BONSAI / RMLX_TEST_MODEL_BONSAI / RMLX_O_MODELS_ROOT).
 # See docs/E2E_TEST_PLAN.md.
@@ -453,6 +451,12 @@ debt-report: ## advisory: sibling similarity, debt counters, add/remove ratio, o
 debt-report-selftest: ## CI gate: recall test for debt-report over synthetic fixtures — a planted twin, a non-twin, the round-loop group, and a two-commit ratio repo
 	@bash scripts/debt_report_selftest.sh
 
+check-doc-size: ## CI gate: fail naming every docs/**/*.md over 40 KiB or carrying a size-exempt marker (exit 2: cannot measure)
+	@python3 scripts/lib/debt_report.py --check-doc-size
+
+check-doc-size-selftest: ## CI gate: recall test for check-doc-size over throwaway git trees, each case asserting its exit code and reason
+	@bash scripts/check_doc_size_selftest.sh
+
 kv-update-census: ## advisory: the KV structural figures — variant shapes, match sites a new codec must touch, per-variant update bodies (non-failing)
 	@python3 scripts/kv_update_census.py all
 
@@ -468,10 +472,10 @@ check-no-scalar-f32-leak: ## CI gate: fail if arch-layer code has unguarded scal
 check-kv-layer-quants: ## CI gate: fail if kv_quant_for_layer is called outside kv_cache/ (one producer: kv_layer_quants)
 	@bash scripts/check_kv_layer_quants.sh
 
-check-kv-codec-disposition: ## CI gate: fail if the --kv-quant/--kv-bits help or docs/KV_QUANT.md contradicts a codec's runtime disposition
+check-kv-codec-disposition: ## CI gate: fail if the --kv-quant/--kv-bits help or the INERT banner docs contradict a codec's runtime disposition
 	@bash scripts/check_kv_codec_disposition.sh
 
-check-kv-codec-disposition-fixtures: ## CI gate: recall test for the above — 10 synthetic scan roots, each asserting which rule fired
+check-kv-codec-disposition-fixtures: ## CI gate: recall test for the above — 25 synthetic scan roots, each asserting which rule fired
 	@bash scripts/check_kv_codec_disposition_fixtures.sh
 
 check-kv-byte-model-parity: ## CI gate: fail if scripts/perf_ceiling.py's KV byte model disagrees with the engine's
@@ -496,7 +500,7 @@ check-spec-sampling: ## CI gate: fail if a speculative round loop is not handed 
 	@bash scripts/check_spec_sampling.sh
 
 .PHONY: check-spec-sampling-fixtures
-check-spec-sampling-fixtures: ## CI gate: recall test for the above — 27 cases over two tree shapes, each asserting the reason as well as exit 1 vs exit 2
+check-spec-sampling-fixtures: ## CI gate: recall test for the above — 30 cases over four tree shapes, each asserting the reason as well as exit 1 vs exit 2
 	@bash scripts/check_spec_sampling_fixtures.sh
 
 .PHONY: check-spec-charge
@@ -555,6 +559,23 @@ published-table-selftest: ## CI gate: mutation check for the published-protocol 
 check-doc-source-citations: ## CI gate: fail if a `crates/...` source path cited in docs/ does not exist
 	@bash scripts/check_doc_source_citations.sh
 
+# The base is a make variable, never read from the environment: only
+# DOC_REFS_BASE=<ref> on the make command line counts, which in make includes
+# the same assignment passed in MAKEFLAGS. `auto` is the nearest of origin/main
+# and origin/next/* that does not already contain HEAD (see check_doc_refs.py).
+DOC_REFS_BASE_ARG := $(if $(filter command line,$(origin DOC_REFS_BASE)),$(DOC_REFS_BASE),auto)
+
+.PHONY: check-doc-refs
+check-doc-refs: ## CI gate: fail if a doc edit broke or re-pointed a reference into docs/ (DOC_REFS_BASE=<ref>, default auto)
+	@python3 scripts/check_doc_refs.py --base "$(DOC_REFS_BASE_ARG)"
+
+.PHONY: check-doc-refs-selftest
+check-doc-refs-selftest: ## CI gate: recall test for check_doc_refs.py over a synthetic repo, each case asserting its reason
+	@bash scripts/check_doc_refs_selftest.sh
+
+.PHONY: check-doc-consumers
+check-doc-consumers: check-doc-refs check-doc-source-citations check-kv-codec-disposition check-kv-boundary-default-parity check-published-table ## every reader of doc text still finds what it reads
+
 check-no-decode-swallow: ## CI gate: fail if a decode-step failure breaks instead of propagating (would report as finish_reason="length")
 	@bash scripts/check_no_decode_swallow.sh
 
@@ -579,7 +600,7 @@ gpu-runner-selftest: ## CI gate: the GPU runner reports a failing test and a sha
 check-named-skip-notices: ## CI gate: a classified GPU test that announces its own stand-down names itself, so the runner can attribute it
 	@bash scripts/check_named_skip_notices.sh
 
-check-named-skip-notices-fixtures: ## CI gate: recall test for the above, 13 synthetic roots, each asserting the reason as well as the exit code
+check-named-skip-notices-fixtures: ## CI gate: recall test for the above, 23 cases, each asserting the reason as well as the exit code
 	@bash scripts/check_named_skip_notices_fixtures.sh
 
 check-no-kernel-input-eval: ## CI gate: fail if a Metal-kernel dispatcher blocks on Array::eval() (serialises host vs GPU once per layer per decode step)
@@ -608,6 +629,8 @@ check-metal-format: ## CI gate: every .metal kernel is clang-format clean (skips
 # ---- one-shot CI gate -------------------------------------------------
 ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gate: fmt + clippy + test + feature-gated capture tests + deny + audit + metrics-sanity + inline-test + A/B-harness + MSL gates
 	@bash scripts/debt_report_selftest.sh
+	@bash scripts/check_doc_size_selftest.sh
+	@python3 scripts/lib/debt_report.py --check-doc-size
 	@bash scripts/kv_update_census_selftest.sh
 	@bash scripts/check_no_inline_tests.sh
 	@bash scripts/check_no_scalar_f32_leak.sh
@@ -626,6 +649,8 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@python3 scripts/published_samples.py verify
 	@bash scripts/check_published_samples_fixtures.sh
 	@bash scripts/check_doc_source_citations.sh
+	@bash scripts/check_doc_refs_selftest.sh
+	@$(MAKE) --no-print-directory check-doc-refs
 	@bash scripts/check_no_decode_swallow.sh
 	@bash scripts/check_eval_lock.sh
 	@bash scripts/check_eval_lock_fixtures.sh
@@ -786,19 +811,22 @@ perf-iter:       ## run 3-model regression bench in series (appends to metrics/p
 # ---- canary TPS gate (DB-backed, release-perf binary) -----------------
 #
 # `make canary`      — runs perf_canary.sh (1 warmup + 3 measured per model),
-#                      appends rows to both the LEGACY .rmlx/bench/perf_canary.csv
-#                      AND (authoritative) runs.db via `rmlx baseline --record`.
+#                      appends rows to <RMLX_HOME>/bench/perf_canary.csv and
+#                      records one run per model into runs.db via
+#                      `rmlx baseline --record` (the source of truth).
 #                      Requires the release-perf binary; build with `make build-perf`.
 #
 # `make canary-gate` — gates regressions by querying runs.db.
 #                      Requires SHA=<last-green-sha> to compare against.
 #                      Uses `rmlx metrics deltas --since-sha <SHA> --threshold-pct 3`.
-#                      Exit codes: 0=clean, 1=regression, 125=no-baseline-skip.
+#                      Exit codes: 0=clean, 1=regression. A SHA with no rows
+#                      also exits 0, so a clean exit does not prove the SHA
+#                      was measured.
 #                      For the simulated-regression test, use CANARY_DB=/tmp/... to point at
 #                      a temp DB so real runs.db is not polluted with fake rows.
 #
 # Protocol: --prompt-tokens 4096, --max-tokens 100, --max-ctx 8192, kv_quant=auto
-# (arch resolver picks best-known quant: Bonsai→mixed_k8g64_v4g64, Gemma4-e4b→k8v8, Qwen3.6→k8v8)
+# (bf16 on every arch), plus an explicit k8vturbo3 arm per model.
 
 CANARY_THRESHOLD_PCT ?= 3
 # SHA to compare against for canary-gate; required — no default.
@@ -1029,12 +1057,12 @@ asm:             ## cargo asm --release -p rmlx-quant $(ASM_SYM)  (codegen inspe
 	@command -v cargo-asm >/dev/null 2>&1 || { echo "install: cargo install cargo-asm"; exit 1; }
 	cargo asm --rust --release -p rmlx-quant "$(ASM_SYM)"
 
-# ---- J10: TheTom upstream kernel-fix watch (weekly; docs/research/J10-upstream-watch.md)
-# After triaging the printed commits, bump LAST_REVIEWED_SHA below + in the doc.
+# ---- Upstream TurboFlash kernel-fix watch (TheTom llama-cpp-turboquant)
+# After triaging the printed commits, bump LAST_REVIEWED_SHA below.
 UPSTREAM_REPO ?= ../llama-cpp-turboquant
 UPSTREAM_BRANCH ?= feature/turboquant-kv-cache
 LAST_REVIEWED_SHA ?= 2b61ea24e
-upstream-check:  ## J10: print TheTom commits since LAST_REVIEWED_SHA on the watched branch
+upstream-check:  ## print TheTom commits since LAST_REVIEWED_SHA on the watched branch
 	@test -d "$(UPSTREAM_REPO)/.git" || { echo "upstream repo absent: $(UPSTREAM_REPO)"; exit 1; }
 	@git -C "$(UPSTREAM_REPO)" fetch --quiet origin "$(UPSTREAM_BRANCH)" 2>/dev/null || git -C "$(UPSTREAM_REPO)" fetch --quiet 2>/dev/null || true
 	@echo "new commits on $(UPSTREAM_BRANCH) since $(LAST_REVIEWED_SHA):"

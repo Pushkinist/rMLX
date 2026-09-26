@@ -80,9 +80,9 @@ pub struct ProbeStep {
 /// Verdict returned by `classify_smoke`.
 ///
 /// Heuristic: after the seeded 8-token probe, the snapshot is flagged broken on
-/// a degenerate repeat — see `classify_smoke` for the exact (B5b-widened) rule.
+/// a degenerate repeat — see `classify_smoke` for the exact rule.
 /// Mirrors the Qwen3.6-35B-A3B-mxfp8 pattern in CLAUDE.md "mxfp8 broken-snapshot
-/// hazard" and the gemma-4-26b-a4b single-CJK-token loop (B5b audit).
+/// hazard" and the gemma-4-26b-a4b single-CJK-token loop.
 #[allow(
     clippy::exhaustive_enums,
     reason = "closed dispatch enum — four smoke outcomes (Ok/BrokenPunctLoop/BrokenNan/Inconclusive); adding an outcome requires updating classify_smoke and all SmokeVerdict match arms in the serve path"

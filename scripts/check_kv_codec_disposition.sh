@@ -6,9 +6,10 @@
 #   check_kv_codec_disposition.sh [SCAN_ROOT]
 #
 #   With no argument it reads the real surfaces and derives the manifest by
-#   running the emitter test. With a SCAN_ROOT it reads `main.rs`, `KV_QUANT.md`
-#   and a pre-captured `manifest.raw` from that directory instead — how
-#   `check_kv_codec_disposition_fixtures.sh` drives it, one mutation at a time.
+#   running the emitter test. With a SCAN_ROOT it reads `main.rs`, a
+#   pre-captured `manifest.raw` and the banner docs from that directory instead,
+#   which stands in for `docs/` — how `check_kv_codec_disposition_fixtures.sh`
+#   drives it, one mutation at a time.
 #
 # WHY
 #   Most of the `KvQuant` variants never run — the gate prints how many on every
@@ -17,7 +18,7 @@
 #   reads the bf16 mirror on both axes, so `exit_prefill` skips the encode and
 #   calls `storage.clear_payload()`: at runtime they are byte-identical to
 #   `--kv-quant none` in both resident bytes and generated tokens. That is not
-#   visible from the codec's name, its `docs/KV_QUANT.md` section (which
+#   visible from the codec's name, its per-variant doc section (which
 #   describes a packed store nothing builds), or a `--help` line that lists it
 #   beside a live codec. An operator who reads the help, picks a name and
 #   reads back the resolved-codec log line has no way to learn it did nothing.
@@ -56,8 +57,8 @@
 #   how the block goes stale when a codec is wired up.
 #
 # RULE 3 (docs, coverage)
-#   Every inert codec must be named in at least one INERT banner in
-#   docs/KV_QUANT.md. The per-variant sections describe pack formats and bit
+#   Every inert codec must be named in an INERT banner in one of the
+#   BANNER_DOCS. The per-variant sections describe pack formats and bit
 #   rates in the present tense; without the banner they describe a store the
 #   codec does not build.
 #
@@ -67,6 +68,16 @@
 # RULE 5 (docs, placement)
 #   A banner must open within 3 lines of a `### ` heading — it belongs at the
 #   head of the section it qualifies, not buried in one.
+#
+# RULE 10 (docs, where the banners are)
+#   The banners are read from BANNER_DOCS, a fixed list of docs, not a glob. A
+#   banner in any other doc under docs/ fails: it is a banner no rule reads. A
+#   listed doc that is missing is exit 2: the list names a surface that is gone.
+#   An empty list, or a doc listed twice, is exit 2 too: the list is config.
+#
+# RULE 11 (docs, one banner per codec)
+#   Each inert codec is named in exactly one banner across BANNER_DOCS. A
+#   second banner is a copy that the next edit to one of them leaves stale.
 #
 # RULE 6 (the help is actually reached)
 #   Every `--kv-quant`, `--kv-bits` and `--kv-preset` argument in the CLI must
@@ -103,8 +114,8 @@
 # RULE 7 (no ratio is written into the help)
 #   No resident-KV ratio may appear in any of these constants, in any spelling
 #   this tree uses: `0.44x`, `1.406x`, `2x`, and the same three with the Unicode
-#   multiplication sign `×`, which is what docs/KV_QUANT.md's own ratio
-#   tables are written with. Keyed on the SHAPE of such a figure, not on a list
+#   multiplication sign `×`, which is what the ratio rows of
+#   docs/KV_ROTATION_CODECS.md are written with. Keyed on the SHAPE of such a figure, not on a list
 #   of the ones that were there -- a corrected number is the same defect as a
 #   stale one, and a pattern that matches one spelling is a gate that a reviewer
 #   can walk past by typing the other.
@@ -117,8 +128,8 @@
 #   all set-membership rules on codec names and none of them reads a number.
 #
 # SCOPE
-#   Rules 3-5 check that an inert codec carries a banner *somewhere* in
-#   docs/KV_QUANT.md under a section heading, not that it is the heading of its
+#   Rules 3-5 check that an inert codec carries a banner in one of the
+#   BANNER_DOCS under a section heading, not that it is the heading of its
 #   own section — headings in that file are prose and not machine-addressable.
 #
 # EXIT CODES
@@ -134,20 +145,26 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCAN_ROOT="${1:-}"
 
+# The docs that carry the INERT banners, as paths under docs/ (RULE 10).
+BANNER_DOCS=(KV_CODECS.md KV_ROTATION_CODECS.md)
+
 if [ -n "${SCAN_ROOT}" ]; then
     CLI_MAIN="${SCAN_ROOT}/main.rs"
     CLI_SRC="${SCAN_ROOT}"
-    KV_DOC="${SCAN_ROOT}/KV_QUANT.md"
+    DOCS_DIR="${SCAN_ROOT}"
     MANIFEST_SRC="${SCAN_ROOT}/manifest.raw"
+    # The scan root stands in for docs/, so a message names the doc the same
+    # way in both modes.
+    DOCS_LABEL="docs"
 else
     CLI_MAIN="${REPO_ROOT}/crates/rmlx-cli/src/main.rs"
     # The whole crate, not one file: a help constant is wherever its module is.
     CLI_SRC="${REPO_ROOT}/crates/rmlx-cli/src"
-    KV_DOC="${REPO_ROOT}/docs/KV_QUANT.md"
+    DOCS_DIR="${REPO_ROOT}/docs"
+    DOCS_LABEL="docs"
     MANIFEST_SRC=""
 fi
 CLI_LABEL="${CLI_MAIN#"${REPO_ROOT}/"}"
-DOC_LABEL="${KV_DOC#"${REPO_ROOT}/"}"
 
 BANNER_MARKER='[*][*]INERT on this build[*][*]'
 HELP_INERT_MARKER='^[[:space:]]*INERT[[:space:]]*—'
@@ -161,8 +178,23 @@ die_violation() {
     exit 1
 }
 
-for f in "${CLI_MAIN}" "${KV_DOC}" ${MANIFEST_SRC:+"${MANIFEST_SRC}"}; do
+for f in "${CLI_MAIN}" ${MANIFEST_SRC:+"${MANIFEST_SRC}"}; do
     [ -f "$f" ] || die_env "missing ${f#"${REPO_ROOT}/"}"
+done
+# `${#BANNER_DOCS[@]}` is safe under `set -u` on an empty array in bash 3.2;
+# `"${BANNER_DOCS[@]}"` is not, so the count is read first.
+[ "${#BANNER_DOCS[@]}" -gt 0 ] ||
+    die_env "BANNER_DOCS is empty: the gate would read no INERT banner (RULE 10)"
+duplicate=$(printf '%s\n' "${BANNER_DOCS[@]}" | sort | uniq -d | head -1)
+[ -z "${duplicate}" ] ||
+    die_env "BANNER_DOCS lists ${duplicate} twice (RULE 10)"
+DOC_LIST_LABEL=""
+for d in "${BANNER_DOCS[@]}"; do
+    DOC_LIST_LABEL="${DOC_LIST_LABEL:+${DOC_LIST_LABEL}, }${DOCS_LABEL}/${d}"
+done
+for d in "${BANNER_DOCS[@]}"; do
+    [ -f "${DOCS_DIR}/${d}" ] ||
+        die_env "missing ${DOCS_LABEL}/${d}, a doc BANNER_DOCS lists (RULE 10)"
 done
 
 WORK="$(mktemp -d)"
@@ -421,36 +453,72 @@ if grep -q -- '--list-cache-types' "${WORK}/help.txt"; then
 fi
 
 # ── Surface 2: the docs banners ──────────────────────────────────────────────
-# A banner is a maximal run of consecutive `> ` lines whose first line carries
-# the marker. Rule 5 (placement) is checked in the same pass.
-awk -v marker="${BANNER_MARKER}" '
-    /^### / { last_heading = NR }
-    /^> / {
-        if (!inside) {
-            if ($0 ~ marker) {
-                inside = 1
-                if (last_heading == 0 || NR - last_heading > 3) {
-                    printf "PLACEMENT\t%d\n", NR
-                }
-            } else {
-                next
-            }
-        }
-        print "BANNER\t" $0
-        next
-    }
-    { inside = 0 }
-' "${KV_DOC}" >"${WORK}/banners.raw" ||
-    die_env "the banner scan of ${DOC_LABEL} failed"
+# RULE 10: a banner outside BANNER_DOCS is a banner no rule below reads.
+find "${DOCS_DIR}" -name '*.md' -type f | sort >"${WORK}/all_docs" ||
+    die_env "cannot list the docs under ${DOCS_LABEL}"
+[ -s "${WORK}/all_docs" ] || die_env "no .md docs under ${DOCS_LABEL}"
+: >"${WORK}/unlisted"
+while IFS= read -r f; do
+    rel="${f#"${DOCS_DIR}/"}"
+    listed=0
+    for d in "${BANNER_DOCS[@]}"; do
+        [ "${rel}" = "${d}" ] && listed=1
+    done
+    if [ "${listed}" -eq 0 ] && grep -qE "^> .*${BANNER_MARKER}" "$f"; then
+        printf '%s\n' "${DOCS_LABEL}/${rel}" >>"${WORK}/unlisted"
+    fi
+done <"${WORK}/all_docs"
+if [ -s "${WORK}/unlisted" ]; then
+    echo "ERROR: an INERT banner sits in a doc the gate does not list:" >&2
+    while IFS= read -r f; do
+        echo "  RULE 10  ${f}" >&2
+    done <"${WORK}/unlisted"
+    echo >&2
+    echo "The banners are read from ${DOC_LIST_LABEL} and nowhere else." >&2
+    echo "Move the banner and its section back, or add the doc to BANNER_DOCS." >&2
+    exit 1
+fi
 
+# A banner is a maximal run of consecutive `> ` lines whose first line carries
+# the marker. Rule 5 (placement) is checked in the same pass. Each banner is
+# written as one line, `<doc>:<line>` then its text, so rule 11 can count
+# banners rather than lines.
+: >"${WORK}/banners.raw"
+for d in "${BANNER_DOCS[@]}"; do
+    awk -v marker="${BANNER_MARKER}" -v doc="${DOCS_LABEL}/${d}" '
+        function flush() {
+            if (text != "") print "BANNER\t" start "\t" text
+            text = ""
+        }
+        /^### / { last_heading = NR }
+        /^> / {
+            if (!inside) {
+                if ($0 ~ marker) {
+                    inside = 1
+                    start = doc ":" NR
+                    if (last_heading == 0 || NR - last_heading > 3) {
+                        printf "PLACEMENT\t%s:%d\n", doc, NR
+                    }
+                } else {
+                    next
+                }
+            }
+            text = text " " $0
+            next
+        }
+        { inside = 0; flush() }
+        END { flush() }
+    ' "${DOCS_DIR}/${d}" >>"${WORK}/banners.raw" ||
+        die_env "the banner scan of ${DOCS_LABEL}/${d} failed"
+done
 
 grep '^PLACEMENT	' "${WORK}/banners.raw" >"${WORK}/placement" || true
 grep '^BANNER	' "${WORK}/banners.raw" | cut -f2- >"${WORK}/banners.txt" || true
 
 if [ -s "${WORK}/placement" ]; then
     echo "ERROR: an INERT banner does not open within 3 lines of a '### ' heading:" >&2
-    while IFS=$'\t' read -r _ line; do
-        echo "  RULE 5  ${DOC_LABEL}:${line}" >&2
+    while IFS=$'\t' read -r _ where; do
+        echo "  RULE 5  ${where}" >&2
     done <"${WORK}/placement"
     echo >&2
     echo "A banner qualifies the section it heads. Buried in the body it is a" >&2
@@ -459,7 +527,7 @@ if [ -s "${WORK}/placement" ]; then
 fi
 
 if [ ! -s "${WORK}/banners.txt" ]; then
-    die_violation "${DOC_LABEL} carries no INERT banner at all — every \
+    die_violation "${DOC_LIST_LABEL} carry no INERT banner at all — every \
 per-variant section for an inert codec needs one (marker: **INERT on this build**)"
 fi
 
@@ -467,15 +535,23 @@ fi
 # Match a stem on a word boundary. `iso3` must not match inside `iso3_sym`, and
 # `k8vturbo2` must not match inside `k8vturbo2tcq`, so an EXACT stem is fenced
 # on both sides and a PREFIX stem on the left only.
-match_stem() {
-    local stem="$1" mode="$2" file="$3"
-    local pattern
+stem_pattern() {
+    local stem="$1" mode="$2"
     if [ "${mode}" = "EXACT" ]; then
-        pattern="(^|[^A-Za-z0-9_])${stem}([^A-Za-z0-9_]|\$)"
+        printf '%s' "(^|[^A-Za-z0-9_])${stem}([^A-Za-z0-9_]|\$)"
     else
-        pattern="(^|[^A-Za-z0-9_])${stem}"
+        printf '%s' "(^|[^A-Za-z0-9_])${stem}"
     fi
-    grep -qE -- "${pattern}" "${file}"
+}
+match_stem() {
+    grep -qE -- "$(stem_pattern "$1" "$2")" "$3"
+}
+# The banners that name a stem, one `<doc>:<line>` per banner.
+banners_naming() {
+    cut -f2- "${WORK}/banners.txt" | grep -nE -- "$(stem_pattern "$1" "$2")" |
+        cut -d: -f1 | while IFS= read -r n; do
+            sed -n "${n}p" "${WORK}/banners.txt" | cut -f1
+        done
 }
 
 violations=0
@@ -495,9 +571,13 @@ while IFS=$'\t' read -r _ _idx display stem mode class _rs _bk _bv; do
                     report "RULE 1  '${display}' is inert but ${c} names it outside an INERT block"
                 fi
             done
-            # Rule 3: must carry a docs banner.
-            if ! match_stem "${stem}" "${mode}" "${WORK}/banners.txt"; then
-                report "RULE 3  '${display}' is inert but no ${DOC_LABEL} INERT banner names it"
+            # Rule 3: must carry a docs banner. Rule 11: exactly one.
+            banners_naming "${stem}" "${mode}" >"${WORK}/naming"
+            named=$(wc -l <"${WORK}/naming" | tr -d ' ')
+            if [ "${named}" -eq 0 ]; then
+                report "RULE 3  '${display}' is inert but no INERT banner in ${DOC_LIST_LABEL} names it"
+            elif [ "${named}" -gt 1 ]; then
+                report "RULE 11  '${display}' is named in ${named} INERT banners: $(tr '\n' ' ' <"${WORK}/naming")"
             fi
             ;;
         LIVE | BASELINE)
@@ -505,8 +585,9 @@ while IFS=$'\t' read -r _ _idx display stem mode class _rs _bk _bv; do
             if match_stem "${stem}" "${mode}" "${WORK}/help_inert.txt"; then
                 report "RULE 2  '${display}' is ${class}, not inert, but the CLI help's INERT block names it"
             fi
-            if match_stem "${stem}" "${mode}" "${WORK}/banners.txt"; then
-                report "RULE 4  '${display}' is ${class}, not inert, but a ${DOC_LABEL} INERT banner names it"
+            banners_naming "${stem}" "${mode}" >"${WORK}/naming"
+            if [ -s "${WORK}/naming" ]; then
+                report "RULE 4  '${display}' is ${class}, not inert, but the INERT banner at $(tr '\n' ' ' <"${WORK}/naming")names it"
             fi
             ;;
         *)
@@ -519,7 +600,7 @@ if [ "${violations}" -gt 0 ]; then
     echo >&2
     echo "ERROR: ${violations} disposition mismatch(es) between the code and the" >&2
     echo "user-facing surfaces. The code is the oracle — either the codec's" >&2
-    echo "classification moved (fix the help and docs/KV_QUANT.md to match), or" >&2
+    echo "classification moved (fix the help and the banner docs to match), or" >&2
     echo "a surface was written from the codec's name instead of its behaviour." >&2
     echo >&2
     echo "Manifest as derived (index, name, stem, match, class, reads_store, bf16_k, bf16_v):" >&2
@@ -528,4 +609,4 @@ if [ "${violations}" -gt 0 ]; then
 fi
 
 echo "OK: ${actual} KV codecs classified from the type (${inert_count} inert); \
-CLI help and ${DOC_LABEL} agree with all of them."
+CLI help and the INERT banners in ${DOC_LIST_LABEL} agree with all of them."

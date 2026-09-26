@@ -2,7 +2,7 @@
 // scripts/check_kv_codec_disposition_fixtures.sh. It is not compiled and is not
 // part of any crate: the gate reads six help constants and the `--kv-quant` /
 // `--kv-bits` / `--kv-preset` argument declarations out of the source, and each
-// fixture makes one edit to this file, to KV_QUANT.md beside it, or to
+// fixture makes one edit to this file, to a doc beside it, or to
 // manifest.raw.
 //
 // The codec names are invented (`fixbase`, `fixinert`, `fixinert2`, `fixlive`)

@@ -262,7 +262,7 @@ fn qwen35_mtp_substring_match() {
 fn empty_config_falls_through_to_qwen35_mtp() {
     // Both fields absent: legacy blank-config snapshot. The downstream
     // MtpDrafter::load warns and proceeds by tensor names — this must NOT
-    // be rejected as Unsupported (regression from issue #23 fix scope).
+    // be rejected as Unsupported (regression guard for the mtp family router).
     assert_eq!(
         classify_mtp_draft("", ""),
         MtpDraftFamily::Qwen35Mtp,
@@ -286,7 +286,7 @@ fn gemma4_assistant_routes_to_assistant_drafter() {
 
 #[test]
 fn plain_gemma4_draft_is_unsupported_not_qwen_fallthrough() {
-    // The issue #23 case: a plain dense Gemma4 model must NOT classify as the
+    // A plain dense Gemma4 model must NOT classify as the
     // Qwen3.5 MTP sidecar (which would leak `num_experts`); it is Unsupported.
     assert_eq!(
         classify_mtp_draft("Gemma4ForConditionalGeneration", ""),

@@ -1,7 +1,7 @@
 //! HTTP server with two chat-compatible surfaces.
 //!
 //! Both paths share one token stream. Schemas differ only in field names.
-//! Stage 3.5: multi-model registry, load/unload/swap, idle eviction.
+//! Multi-model registry, load/unload/swap, idle eviction.
 
 #![cfg_attr(
     test,
@@ -85,7 +85,7 @@ pub use session_cache::{effective_prompt_cache_slots, SessionCache, SessionKey};
 /// OpenAI routes:
 /// `POST /v1/chat/completions`
 /// `GET /v1/models`
-/// `POST /v1/models/:id/load` — G3: blocks until resident; 200 on ready (synchronous, no 202/poll)
+/// `POST /v1/models/:id/load` — blocks until resident; 200 on ready (synchronous, no 202/poll)
 /// `POST /v1/models/:id/unload`
 /// `GET /v1/models/:id/status`
 ///
@@ -96,8 +96,8 @@ pub use session_cache::{effective_prompt_cache_slots, SessionCache, SessionKey};
 /// `GET /health`
 ///
 /// Metrics:
-/// `GET /metrics/cache` — prompt-cache hit/miss/bytes (N19) + TTFT ring-buffer (L6) — JSON
-/// `GET /metrics` — Prometheus text exposition v0.0.4 (F5) — same data as /metrics/cache
+/// `GET /metrics/cache` — prompt-cache hit/miss/bytes + TTFT ring-buffer — JSON
+/// `GET /metrics` — Prometheus text exposition v0.0.4 — same data as /metrics/cache
 /// `GET /v1/metrics` — rolling request-level JSON summary — mlx-vlm compatible
 pub fn build_router(state: AppState) -> Router {
     Router::new()
@@ -122,13 +122,13 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/audio/speech", post(audio::audio_speech))
         // Anthropic API.
         .route("/v1/messages", post(anthropic::messages))
-        // Metrics (N19): JSON.
+        // Metrics: JSON.
         .route("/metrics/cache", get(openai::metrics_cache))
-        // Metrics (F5): Prometheus text exposition v0.0.4.
+        // Metrics: Prometheus text exposition v0.0.4.
         .route("/metrics", get(openai::metrics_prometheus))
         // Metrics: rolling request-level JSON summary (mlx-vlm compatible).
         .route("/v1/metrics", get(openai::metrics_v1_summary))
-        // A8: per-request HTTP timeout middleware.
+        // Per-request HTTP timeout middleware.
         // Applied after routing so it sees every handler (including /health).
         // Reads X-Request-Timeout-Seconds header; caps at AppState::max_timeout_secs.
         .layer(middleware::from_fn_with_state(state.clone(), timeout_mw))
@@ -167,11 +167,9 @@ pub async fn serve(state: AppState, host: &str, port: u16) -> anyhow::Result<()>
 
     // axum 0.8 removed implicit TCP_NODELAY. With Nagle's algorithm enabled by
     // default, small SSE frames (one chunked-encoding event per token, ~100
-    // bytes) interact with macOS delayed-ACK to add ~10–12 ms/token of
-    // server→client latency. Setting TCP_NODELAY on every accepted socket
-    // is what oMLX/mlx-lm/uvicorn already do via Python's default — closing
-    // this gap was the dominant contributor to the 26b-a4b bench-vs-internal
-    // 36→60 TPS gap.
+    // bytes) interact with macOS delayed-ACK and add per-token
+    // server→client latency. Setting TCP_NODELAY on every accepted socket is
+    // what oMLX/mlx-lm/uvicorn already do via Python's default.
     let listener = listener.tap_io(|tcp_stream| {
         if let Err(err) = tcp_stream.set_nodelay(true) {
             tracing::trace!("failed to set TCP_NODELAY on incoming connection: {err:#}");

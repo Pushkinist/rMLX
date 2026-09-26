@@ -1,15 +1,15 @@
 //! Snapshot resolution for the model-gated unit tests under `src/`.
 //!
 //! `tests/common` is a module of the integration-test binaries and cannot be
-//! reached from a lib unit test, so the join is made here — the same one
-//! `crates/rmlx-cli/src/commands/kv_calibrate_tests.rs` makes: the slug under
+//! reached from a lib unit test, so the join is made here: the slug under
 //! `RMLX_O_MODELS_ROOT`, with a per-architecture variable as the override for a
-//! root that does not hold it.
+//! root that does not hold it. (`crates/rmlx-cli/src/commands/kv_calibrate_tests.rs`
+//! reads `RMLX_TEST_MODEL_BONSAI` first and the slug second.)
 //!
 //! **An unset variable is not a stand-down.** A machine holding the snapshot
-//! runs the cell. That is the whole point: these cells were classified as GPU
-//! tests, selected by `make gpu-test`, and then returned before asserting
-//! anything on a host that had every snapshot they needed.
+//! runs the cell: these cells are GPU tests that `make gpu-test` selects, and
+//! a cell that returned before asserting on a host holding its snapshot would
+//! pass without testing anything.
 
 use std::path::{Path, PathBuf};
 

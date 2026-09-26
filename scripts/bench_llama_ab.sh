@@ -331,7 +331,7 @@ run_slot() { # <bin> <args> <env> <slotdir>
 	# parser cannot read must FAIL the slot. Emitting `0.00` on no match -- a
 	# build that logs GiB, or `2048.00MiB` without the space -- would put a
 	# fabricated zero in the report, the result JSON and `kv_cache_bytes`, where
-	# the §4.1 plausible-value bounds admit 0 as a real gauge reading.
+	# the docs/METRICS_SCHEMA.md §4.1 plausible-value bounds admit 0 as a real gauge reading.
 	local kv_mib kv_hits
 	kv_hits="$(grep -c "KV buffer size" "$dir/server.log" || true)"
 	kv_mib="$(awk '/KV buffer size/ { for (i = 1; i <= NF; i++) if ($i == "MiB") s += $(i-1); n++ } END { if (n == 0 || s <= 0) exit 1; printf "%.2f", s }' "$dir/server.log")" || {
@@ -362,7 +362,7 @@ try:
         raise ValueError("decode budget not spent: predicted_n=%s, wanted %d"
                          % (t["predicted_n"], want))
     # Zero tokens per second is `tokens / seconds` with a zero numerator --
-    # nothing was measured. It is outside the §4.1 rate window for the same
+    # nothing was measured. It is outside the docs/METRICS_SCHEMA.md §4.1 rate window for the same
     # reason and must not reach the median.
     if not t["predicted_per_second"] > 0:
         raise ValueError("predicted_per_second=%s is not a measurement"

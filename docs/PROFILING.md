@@ -2,271 +2,164 @@
 
 Reference: [Rust Perf Book, Chapter 5 — Profiling](https://nnethercote.github.io/perf-book/profiling.html)
 
-## Long-term perf trends
+Recorded bench figures live in `runs.db`; `docs/METRICS_DB.md` covers the
+queries over them. This doc covers taking a profile.
 
-Per-bench TPS / TTFT / RSS land in `metrics/runs.db` (see `docs/METRICS_DB.md`). Time-series queries:
-- `rmlx metrics history --backend rmlx --namespace mlx-community --model gemma-4-e2b-it-mxfp8 --weight-quant mxfp8 --kv-quant k8v8 --metric decode_tps_warm` — every observation for one cell.
-- `rmlx metrics deltas --since-sha <git-sha> --threshold-pct 5` — what regressed since a commit.
-- `rmlx metrics rank --metric decode_tps_warm --limit 20` — top-20 champions.
+## Ordering on this host
 
-## Ordering on this host: ABBA is not enough
+Two configurations compared in slots are compared at different slot
+positions. An ABBA block cancels drift that is linear in slot position. On
+this host the drift is not linear: slot 2 of a block runs slow for whichever
+arm occupies it. ABBA puts the same arm in slot 2 of every block, so that
+penalty lands on one arm and looks like a clean result.
 
-Any comparison of two or more configurations runs them in slots, and a slot's
-position in the run affects what it measures. The usual defence is an
-ABBA-interleaved block, which cancels drift that is **linear** in slot
-position: whatever the host does monotonically over the run — warming up,
-a background process ramping — contributes equally to both arms.
+- **Two arms**: pair every ABBA block with a BAAB block, so each arm holds
+  each slot position equally often. `scripts/perf_ab.sh` alternates ABBA,
+  BAAB, ABBA.
+- **Three or more levels**: run a Latin square. The level index is
+  `(position + row) % n_levels`, one row per cycle, so every level holds every
+  slot once per `n_levels` rows. `scripts/prefill_chunk_sweep.sh` runs this
+  shape.
+- **Report the paired statistic.** Compare each level to the baseline within
+  a row and take the median over rows. A pooled median across slots re-admits
+  the positional term.
 
-This host's drift is not linear. Slot 2 of a block runs slow for whichever arm
-occupies it, by a margin comparable to the effects being chased. ABBA puts the
-same arm in slot 2 of every block, so that penalty does not cancel — it lands
-entirely on one arm, and it lands there consistently enough to look like a
-clean result with a tight range. A single ABBA block has produced two confident
-wrong calls here, both later overturned by re-running with the arms exchanged.
+An unpaired block, or a paired block reported pooled, is not evidence here.
 
-The rule, therefore:
+## Build profiles
 
-- **Two arms** — pair every ABBA block with a BAAB block, so each arm occupies
-  each slot position equally often. `scripts/perf_ab.sh` alternates
-  ABBA / BAAB / ABBA for this reason.
-- **Three or more levels** — a Latin square over the levels: level index
-  `(position + row) % n_levels`, one row per cycle, so every level occupies
-  every slot position exactly once per `n_levels` rows.
-  `scripts/prefill_chunk_sweep.sh` runs this shape.
-- **Report the paired statistic, not the pooled one.** Compare each level to
-  the baseline *within a row* and take the median over rows. A pooled median
-  across all slots re-admits the positional term the design just removed.
+`[profile.release]` in `Cargo.toml` sets `debug = "line-tables-only"`,
+`strip = "debuginfo"` and `split-debuginfo = "packed"`. A release binary keeps
+its symbol table and line tables, so samply and Instruments can read it.
 
-An unpaired block, or a paired block reported pooled, is not evidence here
-regardless of how tight its range looks.
+`[profile.release-debug]` inherits `release` and sets `debug = true` and
+`strip = "none"`. Full DWARF lets samply resolve inlined frames under fat LTO.
+Build it with `make build-debug`.
 
-## Prerequisites (already shipped)
-
-`Cargo.toml [profile.release]` has:
-- `debug = "line-tables-only"` — filename + line info for samply/Instruments, no full DWARF.
-- `strip = "debuginfo"` — keeps the symbol table (readable backtraces), removes DWARF.
-- `split-debuginfo = "packed"` — bundles debug info in `.dSYM` alongside the binary.
-
-`.cargo/config.toml` has:
-- `force-frame-pointers=yes` — keeps x29 non-clobbered for stack-walking (samply, Instruments).
-
-These together mean `cargo build --release` already produces samply-readable binaries.
+No profile forces frame pointers. `.cargo/config.toml` shows the `RUSTFLAGS`
+spelling that adds `-C force-frame-pointers=yes` for a local build.
 
 ## Tool matrix (Apple Silicon / macOS aarch64)
 
-| Tool | macOS aarch64 | Notes |
-|------|--------------|-------|
-| **samply** | YES — recommended | Cross-platform sampling profiler. Outputs Firefox Profiler JSON. |
-| **Instruments / xctrace** | YES — recommended | Native Apple profiler. Time Profiler, Metal System Trace, Allocations. |
-| **cargo flamegraph** | YES (needs sudo for DTrace) | Uses DTrace under the hood on macOS. Lower ergonomics than samply. |
-| **dhat-rs** | YES — gated feature | Heap allocation profiling. Gate: `--features dhat-heap`. See below. |
-| **counts crate** | YES | Ad-hoc cardinality counting via `eprintln!`. No binary dep. |
-| **Intel VTune** | YES (x86 emulation only) | Not recommended on aarch64. |
-| **perf + Hotspot** | NO — Linux only | Use Instruments Time Profiler or samply instead. |
-| **Cachegrind / Callgrind** | NO — Valgrind ARM64-darwin broken | Use Instruments Counters template (PMU events). |
-| **heaptrack / bytehound** | NO — Linux only | Use dhat-rs or Instruments Allocations instead. |
-| **Coz (causal profiling)** | NO — macOS support poor | Skip. |
-| **AMD uProf** | NO — macOS not supported | Skip. |
+| Tool | Use | Notes |
+|---|---|---|
+| samply | CPU sampling | Opens the Firefox Profiler. No `sudo`. |
+| Instruments / `xctrace` | CPU and GPU timelines | Time Profiler, Metal System Trace, Allocations. |
+| `cargo flamegraph` | CPU sampling | DTrace, needs `sudo`. |
+| dhat-rs | Heap allocations | Gated feature `rmlx-cli/dhat-heap`. |
+| Metal GPU capture | Kernel identity | Gated feature `rmlx-cli/metal-capture`. |
 
-## 1. CPU sampling with samply (recommended)
+perf, Hotspot, Valgrind, heaptrack and bytehound do not run on macOS aarch64.
 
-Install:
+## 1. CPU sampling with samply
+
 ```bash
 cargo install samply
-```
-
-Profile a single `rmlx baseline` run:
-```bash
-samply record --rate 4000 -- \
-  ./target/release/rmlx baseline \
-    --model $RMLX_O_MODELS_ROOT/mlx-community__gemma-4-e2b-it-mxfp8 \
-    --kv-quant k8v8
-```
-
-`samply` opens the Firefox Profiler in your browser automatically. Requires no `sudo`.
-
-`--rate 4000` = 4000 Hz sampling (default is 1000 Hz; higher = more resolution, more overhead).
-
-### Make target
-
-```bash
 make profile-samply MODEL=/path/to/snapshot
 ```
 
+`profile-samply` records `target/release/rmlx baseline --kv-quant k8v8` at
+4000 Hz. `make profile-samply-debug MODEL=...` builds `release-debug` first
+and records a decode-weighted run: `PROF_PROMPT` (default 1024) prompt tokens
+and `PROF_GEN` (default 500) generated tokens.
+
 ## 2. Instruments / xctrace (Apple native)
-
-Time Profiler (CPU sampling, integrates with tracing spans via os_signpost):
-```bash
-xcrun xctrace record \
-  --template 'Time Profiler' \
-  --launch -- ./target/release/rmlx baseline \
-    --model $RMLX_O_MODELS_ROOT/mlx-community__gemma-4-e2b-it-mxfp8 \
-    --kv-quant k8v8
-```
-
-Output: `.trace` package. Open with Instruments.app.
-
-Metal System Trace (GPU kernel timings, see §5):
-```bash
-xcrun xctrace record \
-  --template 'Metal System Trace' \
-  --launch -- ./target/release/rmlx baseline \
-    --model /path/to/snapshot --kv-quant k8v8
-```
-
-### Make target
 
 ```bash
 make profile-instruments MODEL=/path/to/snapshot
 ```
 
+The target runs the Time Profiler template on
+`target/release/rmlx baseline --kv-quant k8v8` and writes a `.trace` package.
+For GPU timing use `make profile-mst` (§5).
+
 ## 3. cargo-flamegraph (DTrace-based, needs sudo)
 
-Install:
 ```bash
 cargo install flamegraph
+sudo cargo flamegraph --bin rmlx -- baseline --model /path/to/snapshot --kv-quant k8v8
 ```
 
-Run:
-```bash
-sudo cargo flamegraph --bin rmlx -- baseline \
-  --model $RMLX_O_MODELS_ROOT/mlx-community__gemma-4-e2b-it-mxfp8 \
-  --kv-quant k8v8
-```
-
-Output: `flamegraph.svg` in the current directory.
-
-Note: DTrace on macOS requires SIP to be partially disabled for kernel stacks. User-space
-stacks work without SIP changes when frame pointers are preserved (already configured).
+It writes `flamegraph.svg` to the current directory. Kernel stacks need SIP
+partly disabled; user-space stacks do not.
 
 ## 4. Heap profiling with dhat-rs (gated feature)
 
-`rmlx-cli` has a `dhat-heap` feature that instruments the global allocator to collect
-DHAT-format heap profiles. It is OFF by default and must be explicitly enabled.
+`rmlx-cli` has a `dhat-heap` feature that replaces the global allocator with
+DHAT's. It is off by default.
 
-Build and run:
 ```bash
 cargo build --features rmlx-cli/dhat-heap --bin rmlx
-./target/debug/rmlx baseline \
-  --model $RMLX_O_MODELS_ROOT/mlx-community__gemma-4-e2b-it-mxfp8 \
-  --kv-quant k8v8
+./target/debug/rmlx baseline --model /path/to/snapshot --kv-quant k8v8
 ```
 
-On exit, `dhat-heap.json` is written to the current directory.
-View it at: https://nnethercote.github.io/dh_view/dh_view.html
-
-Note: run in **debug** mode (or `opt-level=1`) — DHAT's overhead is significant at full opt.
-Note: the global allocator is replaced when this feature is active, so jemalloc is disabled.
-
-### What DHAT shows
-
-- Which call sites allocated the most heap bytes.
-- Which allocations are short-lived (high alloc + dealloc rate = pressure hot spots).
-- Useful for auditing `rmlx-loader` mmap vs full-read behaviour and KV-cache growth.
+On exit the binary writes `dhat-heap.json` to the current directory. Open it
+in [dh_view](https://nnethercote.github.io/dh_view/dh_view.html). DHAT is slow
+at full optimisation, so profile a debug build.
 
 ## 5. Metal GPU capture (the tool for kernel work)
 
-**This is the entry point for MSL kernel questions**, not samply — kernel cost
-lives on the GPU, where host stack sampling cannot see it. But a `.gputrace` is
-a *frame capture*, not a timeline, and it answers far less on its own than the
-Xcode marketing implies. [What a `.gputrace` actually
-answers](#what-a-gputrace-actually-answers) below splits the three questions
-people conflate; read it before planning a session, because one of the three is
-not answerable from a capture at all.
+Kernel cost lives on the GPU, where host stack sampling cannot see it. Two
+tools answer different questions:
 
-On M5 the Neural Accelerator is part of the GPU, so there is no separate NAX
-tool and none is needed
-([ml-explore/mlx#3182](https://github.com/ml-explore/mlx/issues/3182)): a
-capture *names* NAX pipelines like any other — `steel_gemm_fused_nax_*` for
-matmul, `steel_attention_*_bq64_*` for attention, where **`bq64` means the NAX
-attention branch was taken and `bq32` means it was not**. It does not *time*
-them, on this hardware or any other; see [What a `.gputrace` actually
-answers](#what-a-gputrace-actually-answers). Which paths can reach NAX at all
-is in [`docs/FFI.md`](FFI.md#where-nax-can-appear-and-where-it-cannot).
+- A `.gputrace` capture answers which kernels a decode window referenced.
+- A Metal System Trace answers how long each submission ran and how long the
+  GPU sat idle.
+
+Neither gives per-dispatch counters headlessly. Those come from the Xcode
+replay below, which needs a person.
+
+On M5 the Neural Accelerator is part of the GPU. A capture names NAX
+pipelines like any other: `steel_gemm_fused_nax_*` for matmul and
+`steel_attention_*_bq64_*` for attention. `bq64` means the NAX attention
+branch ran; `bq32` means it did not. Which paths can reach NAX is in
+[`docs/FFI.md`](FFI.md#where-nax-can-appear-and-where-it-cannot).
 
 ### How the window works
 
-The capture is a **bounded window of decode steps**, not a whole run: a run is
-dominated by weight load and prefill, which is not what kernel work studies, and
-a full-run trace is unusably large.
+A capture covers a bounded window of decode steps, not a whole run.
+`rmlx_mlx::metal_capture` owns it behind the `metal-capture` feature.
+`CaptureScope` is the RAII guard over `mlx_metal_start_capture` and
+`mlx_metal_stop_capture`. `Window` decides when the scope opens and closes.
+The one hook is `metal_capture::step()` at the top of the shared
+`rmlx_models::decode_loop::pipelined_decode`, so every arch on that loop is
+covered.
 
-`rmlx_mlx::metal_capture` owns the whole mechanism behind the `metal-capture`
-feature. `CaptureScope` is the RAII guard over `mlx_metal_start_capture` /
-`mlx_metal_stop_capture`; `Window` is the pure policy that decides when the
-scope opens and closes. The one hook is a `step()` call at the top of the
-**shared** decode loop (`rmlx_models::decode_loop::pipelined_decode`), so the
-window is model- and codec-agnostic — every arch that uses that loop (gemma4,
-gemma3, qwen3, qwen3.5-MoE) is covered with no per-arch wiring.
+With `--gpu-capture-skip 4 --gpu-capture-steps 8` (the defaults) the scope
+opens before decode step 5 and closes before step 13.
 
-With `--gpu-capture-skip 4 --gpu-capture-steps 8` the scope opens before decode
-step 5 and closes before step 13: eight whole steps, no load, no prefill.
+**Use at least 8 steps.** Decode is pipelined, so a step's work straddles the
+step boundary. A 1-step window misses kernels an 8-step window holds, such as
+the `gather_front*` embedding lookups.
 
-**Use at least 8 steps.** `pipelined_decode` is pipelined — a step's work
-straddles the boundary — so a 1-step window's kernel set is a strict *subset* of
-an 8-step window's (measured: it misses the `gather_front*` embedding lookups).
-A narrow window does not just capture less; it misrepresents which kernels
-decode runs.
-
-**Off, none of it exists.** Without the feature there is no flag, no hook, no
-`Window`, and no undefined reference to `mlx_metal_start_capture` — verifiable
-with `nm -u target/release/rmlx | grep mlx_metal_start_capture` (empty).
+Without the feature there is no flag, no hook and no reference to
+`mlx_metal_start_capture`. `nm -u target/release/rmlx | grep
+mlx_metal_start_capture` prints nothing.
 
 ### Prerequisites
 
-Capture and *replay* need different things, and the split is why a trace can be
-written successfully and still show nothing when opened. All of them are checked
-before a run writes anything — `scripts/gpu_capture.sh` refuses up front rather
-than after several GB.
+To capture:
 
-**To capture:**
+1. A binary built with the feature. `make build-capture` builds
+   `release-debug` with `rmlx-cli/metal-capture` and re-signs it.
+2. `MTL_CAPTURE_ENABLED=1` in the process environment. This is Apple's
+   variable: Metal inserts the capture layer at launch only. Without it the
+   run aborts before loading the model.
 
-1. A binary built with the feature:
+For Apple's GPU tools to attach to the process, checked by
+`make gputrace-preflight` (`scripts/gputrace_preflight.sh`):
 
-   ```sh
-   make build-capture     # cargo build --profile release-debug --features rmlx-cli/metal-capture, then signs it
-   ```
-
-2. `MTL_CAPTURE_ENABLED=1` in the process environment. This is **Apple's** —
-   Metal inserts the capture layer at launch and there is no in-process way to
-   add it later — not an rMLX configuration knob. The wrapper script sets it;
-   without it the run aborts before loading the model and says so.
-
-**For Apple's GPU tools to attach to the process** (developer mode plus the
-debuggable entitlement are what let them attach at all — a capture taken by a
-process they may not attach to is not usable in the Xcode GPU debugger),
-checked by `scripts/gputrace_preflight.sh` / `make gputrace-preflight`:
-
-3. Full **Xcode**, not just Command Line Tools:
-
-   ```sh
-   sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
-   ```
-
-4. **Developer mode** enabled — Xcode's GPU tools cannot attach without it:
-
-   ```sh
-   sudo DevToolsSecurity -enable
-   ```
-
-5. The capture binary signed with **`com.apple.security.get-task-allow`** —
-   Apple's "this process may be attached to" marker. Cargo emits an ad-hoc
-   *linker-signed* binary that carries no entitlements at all, so a plain
-   `cargo build` fails this. `make build-capture` re-signs with
-   `scripts/rmlx-capture.entitlements` as part of the build; `codesign --force`
-   is idempotent, so it also repairs a binary a bare `cargo build` re-created.
-   The re-sign is inert for throughput — measured on gemma-4-e2b at 4k, decode
-   128.5 TPS signed against 128.4 unsigned (+0.10%, inside a 2.2% run-to-run
-   range), identical token digest.
-
-   Verify by hand with:
-
-   ```sh
-   codesign -d --entitlements - target/release-debug/rmlx
-   ```
-
-6. The Metal toolchain, for the shader recompilation a replay does
-   (`xcodebuild -downloadComponent MetalToolchain`). Advisory — the preflight
-   warns rather than failing, since capture itself does not need it.
+3. Full Xcode selected: `sudo xcode-select -s
+   /Applications/Xcode.app/Contents/Developer`.
+4. Developer mode: `sudo DevToolsSecurity -enable`.
+5. The binary signed with `com.apple.security.get-task-allow`. Cargo emits a
+   linker-signed binary with no entitlements. `make build-capture` re-signs it
+   with `scripts/rmlx-capture.entitlements`, and re-running it repairs a
+   binary a plain `cargo build` re-created. Check with
+   `codesign -d --entitlements - target/release-debug/rmlx`.
+6. The Metal toolchain, for the shader recompile a replay does
+   (`xcodebuild -downloadComponent MetalToolchain`). The preflight only warns
+   about this one.
 
 ### Capture
 
@@ -277,20 +170,19 @@ bash scripts/gpu_capture.sh --kv-quant iso3_sym --model /path/to/snapshot \
   --prompt-tokens 4096 --skip 4 --steps 8
 ```
 
-Traces land in `.rmlx/traces/` named
+Traces land in `.rmlx/traces/` as
 `<model>-<codec>-<prompt>tok-<timestamp>.gputrace`. The script runs the MLX
-preflight, refuses a binary built without the feature, refuses a host that
-cannot attach (developer mode, entitlement — *before* the multi-GB write), sizes
-`--max-ctx` for the prompt, and enforces the trace-directory cap afterwards
-(see [Keeping `.rmlx/traces` bounded](#keeping-rmlxtraces-bounded)).
+preflight and refuses a binary without the feature. It refuses a host the
+tools cannot attach to before it writes anything. It sizes `--max-ctx` for the
+prompt and enforces the trace cap afterwards.
 
-A capture run's timings are worthless (see below), so `--gpu-capture` forces the
-metrics kill switch to `off` for the whole process — no `events` row, no
-`observations` row, no `metrics/baseline.csv` append — whatever `--metrics` says.
-It also conflicts with `--record`, so asking for a recorded capture is an error
-rather than a silent downgrade.
+Capture serialises every dispatch and snapshots every resident buffer. Decode
+drops to a few tokens per second, and a bundle is about the size of the
+model's resident footprint. So `--gpu-capture` conflicts with `--record` and
+forces the metrics kill switch to `off`: no `events` row, no `observations`
+row, no `metrics/baseline.csv` line.
 
-Driving it directly is the same thing without the guard rails:
+Driving the binary directly:
 
 ```sh
 MTL_CAPTURE_ENABLED=1 ./target/release-debug/rmlx --metrics off baseline \
@@ -299,76 +191,24 @@ MTL_CAPTURE_ENABLED=1 ./target/release-debug/rmlx --metrics off baseline \
   --gpu-capture .rmlx/traces/run.gputrace --gpu-capture-skip 4 --gpu-capture-steps 8
 ```
 
-### What it costs
-
-Capture serialises and records every dispatch and snapshots every resident GPU
-buffer. Two consequences worth planning for:
-
-- **Decode collapses** to single-digit TPS during the window (measured: ~2.5 TPS
-  on gemma-4-e2b against ~127 TPS for the same cell uncaptured). Timings from a
-  capture run are meaningless, which is why `--gpu-capture` conflicts with
-  `--record` *and* forces `--metrics off` — the flag conflict alone would still
-  have let the run write an `events` row and a `baseline.csv` line.
-- **Bundles are large** — the resource snapshot dominates, so the floor is
-  roughly the model's resident footprint. ~6 GB for an e2b-class model at 4k
-  context, near-identical for an 8-step and a 16-step window. Delete traces when
-  you are done with them; `.rmlx/traces/` has no size cap.
-
-The *command stream* (`<trace>/capture`) is the part that scales with the
-window — measured at ~2.2–2.6 MB per decode step with a fixed floor under 0.2%
-of an 8-step stream. That near-zero intercept is the check that a trace really
-holds only the decode window: model load or prefill inside it would show up as a
-large constant term.
-
 ### What a `.gputrace` actually answers
 
-Three questions people run this for. They need three different things, and only
-the first is in the bundle you just wrote. Measured across six bundles from this
-path — including ones captured with developer mode on and an entitled binary:
-**no `.gpuprofiler_raw`, and zero timestamp, duration or counter payloads
-anywhere** — the only `counter`-ish string in a whole 6 GB bundle is one empty
-`counterSampleBuffers` category label.
+**Kernel identity, offline.** `<trace>/device-resources-0x<addr>` names every
+pipeline and function the window referenced.
+`unused-device-resources-0x<addr>` holds the ones the capture layer recorded
+as unused. That answers whether a codec's own kernel runs or it decodes
+through the bf16 mirror. Read them with the scripts below.
 
-**1. Kernel identity — in the bundle, offline, no Xcode. This is the reason to
-capture.**
+**No timing, no counters.** The bundles hold no `.gpuprofiler_raw` and no
+timestamp or counter payload. Only Xcode's GUI Profile replay writes timing,
+and `xctrace` has no replay verb. On M5 Max
+`supportsCounterSampling(atDispatchBoundary)` is false and
+`device.counterSets` holds only `GPUTimestamp`. An empty timeline in Xcode is
+the expected state of these bundles.
 
-`<trace>/device-resources-0x<addr>` names every pipeline and function the window
-referenced, by mangled MSL name; `unused-device-resources-0x<addr>` holds the
-ones the capture layer recorded as unused. Read them with the bundle tools
-below, not by hand — the record layout has traps (see
-[Working with a bundle](#working-with-a-bundle)).
-
-That is enough to answer "is the codec's own kernel running at all, or is it
-decoding through the bf16 mirror?" — the question that motivated the capture
-window in the first place, and the one that produced the `iso3_sym` ⊃ `none`
-finding.
-
-**2. Per-dispatch time, limiter counters, occupancy, achieved bandwidth — do
-not plan a session around these. Most of them do not exist on this hardware.**
-
-- Timing appears only in `.gpuprofiler_raw`, and only Xcode's **GUI** Profile
-  replay writes it. There is no scriptable equivalent: `xctrace` has no replay
-  verb (Xcode 26.6 offers `record` / `import` / `export` / `remodel` /
-  `symbolicate`), `/System/Library/CoreServices/MTLReplayer.app` has hidden
-  `--replay` / `--counters` flags but hangs and is killed without Xcode's XPC
-  session, and Xcode 26's MCP server exposes nothing that touches a gputrace.
-- The counters people actually want are **unsupported on M5 Max**:
-  `supportsCounterSampling(atDispatchBoundary)` is false, `device.counterSets`
-  returns exactly one set (`GPUTimestamp`), and the *Metal GPU Counters*
-  template refuses with "Selected counter profile is not supported on target
-  device".
-
-So an empty timeline in Xcode is the expected state of these bundles, not a
-misconfiguration to chase.
-
-**3. Wall-clock GPU timing and the gaps between submissions — use Metal System
-Trace, not a capture. Ever.**
-
-A replay has the replay's schedule, not the schedule of the run you captured.
-Host round-trips — the blocking `Array::eval()` per layer per step, a per-step
-prefix restage — will **not** show up in a `.gputrace`, no matter how it is
-replayed. A timeline instrument over the live process does show them, headlessly
-and with nanosecond resolution. That path is built:
+**Wall-clock GPU time and host gaps need Metal System Trace.** A replay runs
+on the replay's schedule. Host round-trips, such as a blocking
+`Array::eval()` per layer, never show in a `.gputrace`.
 
 ```sh
 make profile-mst MODEL=/path/to/snapshot
@@ -377,461 +217,241 @@ bash scripts/mst_capture.sh --model /path/to/snapshot --kv-quant none \
   --prompt-tokens 4096 --max-tokens 600 --time-limit 18
 ```
 
-It records the live process, exports the `metal-gpu-intervals` table, parses it
-and prints a per-channel table plus a CSV a script can assert on. See
-[Reading the timeline](#reading-the-timeline) for what the numbers mean.
+`mst_capture.sh` records the live process, exports the `metal-gpu-intervals`
+table, parses it and prints a per-channel table and a CSV. The table gives
+each submission's `start` and `duration` in nanoseconds, `gpu-channel-name`,
+`start-latency`, `cmdbuffer-id` and `encoder-id`. One row is one encoder.
 
-**This works on this host**, and the claim is worth pinning because a report
-once concluded the opposite. Two runs, xctrace 16.0 / Xcode 26.6, M5 Max:
-gemma-4-e2b `none` @4096 on `target/release/rmlx` gave 6 931 rmlx rows
-(6 927 `Compute`, `start-latency` p50 3.98 ms), and Ternary-Bonsai-8B `k8v4`
-@8192 on `target/release-perf/rmlx` — the exact cell that report used — gave
-14 140. Neither needed `sudo` or an entitlement. The earlier zero-row
-recordings held **24 rows for the whole machine** across a 25 s window, against
-36 441 here across 20 s, so what failed was the recording, not the instrument's
-coverage of the compute channel. That is the state the summariser's two
-refusals now distinguish: `contains no rows` is an empty table, `holds N rows
-but none for a process matching …` is a populated one, and the second lists the
-processes it did see.
+- **`--attach <pid>` records nothing** for this template. Metal
+  instrumentation must be present at launch, so the harness uses `--launch`.
+- **Weight load leaves no rows; prefill does.** The table does not mark where
+  prefill ends. The harness reads the run's own `decode_profile{prefill_ms}`
+  from `<RMLX_HOME>/logs/<run-id>.jsonl` and uses it as the default
+  `--skip-ms`. An explicit `--skip-ms` wins. When no event is found, the
+  harness says so and summarises the whole window. `--skip-ms` counts from the
+  matched process's first submission.
+- **Tracing slows decode**, so the harness forces `--metrics off`.
+- **The export XML uses `id`/`ref` back-references** and `<sentinel/>` for
+  NULL. A naive parser misaligns columns into plausible wrong numbers.
+  `rmlx_mlx::xctrace` checks each row's cell count and each cell's tag
+  against the schema, and rejects an unresolvable `ref`.
+- **Bound the volume** with `--time-limit`. `.rmlx/traces/mst` keeps the
+  newest `--keep` bundles (default 5) and prunes the rest on every exit.
+  `make traces-gc` does not cover this directory.
+- **No kernel names on the timeline.** `metal-shader-profiler-shader-list`
+  names the pipelines, but the stock template records
+  `Shader Timeline: Disabled`, so no key joins a name to a timed row. Pair the
+  timeline with a `.gputrace` identity list.
 
-The table gives per-GPU-submission `start` and `duration` in nanoseconds,
-`gpu-channel-name`, `start-latency` (the CPU→GPU gap), and `cmdbuffer-id` /
-`encoder-id`, per process; `metal-application-encoders-list` and
-`metal-command-buffer-completed` join on those ids. Five things to know before
-using it:
-
-- **`--attach <pid>` does not work** for this template — it reports "No
-  configuration information received, will have to guess" and exports zero rows.
-  Metal instrumentation has to be present at launch: use `--launch --` (or
-  `--all-processes`, which does pick up a running process). The harness uses
-  `--launch`, which is why a recording always starts at process launch.
-- **Weight load leaves no rows**; prefill does. Load is CPU and file I/O, so it
-  is simply absent from a GPU-interval table however long it took, and the
-  traced process's very first row is already prefill. Nothing in the table marks
-  where prefill ends, and no `--skip-ms` value discovers it — re-summarising one
-  export at several skips just slides the window, `span(S) == span(0) - S` to
-  under 0.3 ms. The boundary has to come from outside, so the harness reads the
-  run's **own** `decode_profile{prefill_ms}` back out of
-  `<RMLX_HOME>/logs/<run-id>.jsonl` and defaults `--skip-ms` to it. That event
-  is a plain `info!`, so it is present at the default log level even though
-  `xctrace --launch` swallowed the child's stdout. An explicit `--skip-ms` still
-  wins; when no such event is found the harness says so and summarises the full
-  window rather than pretending. `--skip-ms` counts from the matched process's
-  own first submission, not from the start of the trace.
-- **Tracing costs about 1–3% of decode throughput.** Alternating traced and
-  untraced runs of the same cell, comparing each run's own
-  `n_steps / step_total_ms`: gemma-4-e2b −2.8% (n=3 pairs, this machine under
-  load) and −0.9% (n=3, independently, quiet). That straddles CLAUDE.md's ±1%
-  regression band, which is why `--metrics off` is forced: a traced run's
-  throughput must never be recorded.
-- The export XML uses an **`id`/`ref` back-reference encoding** with positional
-  columns and `<sentinel/>` for NULL. A naive parser silently misaligns columns,
-  which reads as plausible-but-wrong numbers rather than an error.
-  `rmlx_mlx::xctrace` refuses instead: it checks a row's cell count against the
-  schema, checks every cell's tag against the column's declared
-  `engineering-type`, and rejects an unresolvable `ref`.
-- **Volume**: a bundle runs ~300–400 MB and the one-table export ~110 MB for a
-  ~15 s recording. Bound it with `--time-limit`; `.rmlx/traces/mst` keeps the
-  newest `--keep` bundles (default 5) and prunes the rest, sidecar XML and CSV
-  included, on **every** exit — a run that refuses its arguments is exactly when
-  bundles pile up, so a bound that only applied on success would not be one.
-  `make traces-gc` does not cover this directory: it owns `.gputrace` bundles
-  only, and its reported total is scoped to those.
-
-**One row is one encoder.** In the Bonsai-8B bundle above, 14 140 rmlx rows
-carry 13 996 distinct `encoder-id`s, and the same run's
-`metal-application-command-buffer-submissions` table sums **13 997** encoders
-across 14 512 command buffers — 13 592 of which hold exactly one encoder, 826
-hold none, and 94 hold between 2 and 9. So the row is the encoder, the
-`cmdbuffer-id` column groups rows into submissions, and no row is a coalesced
-multi-encoder kick. Every `gpu-channel-name` in both bundles is exactly
-`Compute`, `Fragment` or `Vertex`.
-
-**Names are in the bundle; the join key is not.** The `metal-gpu-intervals`
-export carries no pipeline or function names, but
-`metal-shader-profiler-shader-list` names every pipeline the run compiled — 52
-for `rmlx` in the Bonsai bundle, MLX kernels and any rMLX `.metal` body the run
-dispatched alike. There is no key from one of those names to a timed row,
-because the stock template
-records `Shader Timeline: Disabled` and `metal-shader-profiler-intervals`
-therefore exports zero rows. Until that changes, pair the timeline with the
-identity list from a `.gputrace` capture when you need to know *which* kernel.
+The summariser tells two refusals apart: `contains no rows` is an empty table;
+`holds N rows but none for a process matching …` lists the processes it saw.
 
 #### Reading the timeline
 
-Measured with `--kv-quant none`, a 4096-token prompt and 600 decoded tokens.
-`--skip-ms` is the run's own reported `prefill_ms`, which is what the harness
-defaults to:
-
-| Model | `prefill_ms` | skip used | Compute subs | Compute busy / span | `start-latency` p50 |
-|---|---|---|---|---|---|
-| gemma-4-e2b-it-mxfp8 | 257.5 | 257 ms | 27 055 | 4908 / 5055 ms (97.1%) | 4.18 ms |
-| Ternary-Bonsai-8B-mlx-2bit | 1372.7 | 1373 ms | 44 534 | 4504 / 4690 ms (96.0%) | 6.27 ms |
-
-Note how far apart the two prefills are: a single hand-picked skip cannot serve
-both. A 500 ms skip leaves roughly a fifth of Bonsai's window as prefill while
-overshooting e2b's by 240 ms.
-
-**Cross-check the window within the run, against the same run's log.** The
-predictor is exact enough to be a gate:
-
-| Model | full span | `prefill_ms + step_total_ms` | decode span | `step_total_ms` |
-|---|---|---|---|---|
-| gemma-4-e2b | 5311.96 ms | 5319.9 ms (0.15%) | 5054.86 ms | 5062.4 ms (0.15%) |
-| Ternary-Bonsai-8B | 6063.09 ms | 6044.0 ms (0.32%) | 4689.73 ms | 4671.3 ms (0.39%) |
-
-Do **not** cross-check against a decode rate from a *separate* untraced run: the
-two runs differ by the observer effect above and by ordinary run-to-run spread,
-and the comparison also has to add the prefill term back. Both windows are
-printed by the harness for exactly this reason.
-
-Run-to-run spread of the span is **0.04%–0.33%** (n=4 per model): 0.04% on
-Bonsai, 0.33% on e2b. The 0.06% quoted for a toy compute workload is a floor,
-not a bound.
-
-**`start-latency` measures queueing in both regimes — it is not a host-stall
-signal.** It is the gap between a command buffer being *created* (committed) and
-starting on the GPU, so it can only ever see backlog. At 97% busy that is what
-it reports: a 4.18 ms p50 against a 0.14 ms p50 duration is roughly 30
-submissions deep on e2b, ~176 on Bonsai. But it does not rise when the host is
-the bottleneck — it falls, because the queue is empty. Measured on a
-deliberately host-bound cell (gemma-4-e2b `--kv-quant k_rotor3 --rotor-qjl on`,
-which forces the rotor K path onto the CPU and decodes at ~4 TPS):
-
-| cell | Compute busy / span | `dur` p50 | `start-latency` p50 |
-|---|---|---|---|
-| e2b `none` (saturated) | 4908 / 5055 ms (97.1%) | 0.144 ms | 4.18 ms |
-| e2b `k_rotor3` + QJL (host-bound) | 416 / 7196 ms (5.8%) | 0.158 ms | **2.42 ms** |
-
-**The host-stall signal is idle GPU time — `span - busy`**, which the harness
-prints as `idle:`. In the host-bound row above that is 6.78 s of a 7.20 s
-window; the run's own log agrees, at 249 ms per decode step. Read `idle` first,
-and read `start-latency` as queue depth.
+- **Check the window against the run's own log.** The full span should match
+  `prefill_ms + step_total_ms`, and the decode span should match
+  `step_total_ms`. The harness prints both. Do not compare against a separate
+  untraced run: tracing and run-to-run spread both move it.
+- **`start-latency` is queue depth, not a host stall.** It is the gap between
+  commit and start on the GPU. It is high when the GPU is saturated and falls
+  when the host is the bottleneck, because the queue is empty.
+- **The host-stall signal is idle GPU time**, `span - busy`, which the harness
+  prints as `idle:`. Read `idle` first.
 
 ### Working with a bundle
 
-A 6 GB bundle is opaque, and its layout is Apple's — not a stable contract. Four
-scripts cover the operations that have actually been needed. Each one checks the
-structure it depends on and fails loudly, by name, when the layout moves: an
-empty list is never printed in place of "could not read this".
+The bundle layout is Apple's, not a stable contract. Each script checks the
+structure it reads and fails by name when the layout moves.
 
 | Command | What it answers |
 |---|---|
-| `bash scripts/gputrace_summary.sh <bundle>` | What was captured (model, codec, prompt size, when — read back from the harness naming convention), total and command-stream size, and whether a `.gpuprofiler_raw` is present. |
-| `bash scripts/gputrace_kernels.sh <bundle>` | Which Metal functions the window referenced, and which the capture layer recorded as unused. `--set used\|unused\|all`, `--names-only` for piping. |
-| `bash scripts/gputrace_diff.sh <a> <b>` | What A's window referenced that B's did not, and vice versa — the codec-vs-codec or commit-vs-commit A/B. |
-| `bash scripts/gputrace_preflight.sh` | The host-side prerequisites above, each with its fix. Also `make gputrace-preflight`. |
+| `bash scripts/gputrace_summary.sh <bundle>` | What was captured (from the harness file name), total and command-stream size, and whether a `.gpuprofiler_raw` is present. |
+| `bash scripts/gputrace_kernels.sh <bundle>` | Which Metal functions the window referenced, and which it recorded as unused. `--set used\|unused\|all`, `--names-only`. |
+| `bash scripts/gputrace_diff.sh <a> <b>` | What A's window referenced that B's did not, and the reverse. |
+| `bash scripts/gputrace_preflight.sh` | The host prerequisites above, each with its fix. Also `make gputrace-preflight`. |
 
-Worked example — the same comparison that first had to be done by hand, on two
-captures of gemma-4-e2b at 4k taken minutes apart:
-
-```console
-$ bash scripts/gputrace_diff.sh <none>.gputrace <iso3_sym>.gputrace
-shared: 37
-only in A (0):
-only in B (9):
-  custom_kernel_rmlx_iso_flash_decode_symv_p1_b3
-  custom_kernel_rmlx_iso_flash_decode_symv_p2
-  custom_kernel_rmlx_iso3_quantize
-  ...
-```
-
-Two limits worth knowing. Some function records store their name by object id
-rather than inline; those are counted and reported (`… 46 named, 12 stored by
-object id`) instead of silently dropped, so the named list is a subset, not the
-whole set. And a `.gputrace` holds no dispatch *counts* — the command stream
-references pipelines by object id, so "which kernels ran" is answerable offline
-but "how many times" is not.
+Some function records store their name by object id. The scripts count and
+report those (`… 46 named, 12 stored by object id`), so the named list is a
+subset. A `.gputrace` holds no dispatch counts: which kernels ran is
+answerable offline, how many times is not.
 
 ### Keeping `.rmlx/traces` bounded
 
-Bundles are ~6 GB each — roughly the model's resident footprint — and a single
-A/B session produces several. Unlike `target/`, they are not cheap to
-regenerate: each is a model load plus a capture run. So the directory is
-**capped**, not expired on a timer:
-
-- keep the newest **6** bundles, and at most **40 GB** total;
-- eviction is oldest-first, never the bundle just written, and every removal is
-  printed with its reason and the space reclaimed;
-- `scripts/gpu_capture.sh` enforces the cap after a successful capture — the
-  point of a cap is to stop a session filling the disk, and an advisory the
-  operator runs afterwards does not do that. Pass `--keep-all`
-  (`make profile-gputrace … KEEP_ALL=1`) for a session that wants more.
+- `scripts/gpu_capture.sh` keeps the newest 6 bundles and at most 40 GB after
+  each capture. Eviction is oldest-first, never the bundle just written, and
+  each removal is printed.
+- `--keep-all` (`make profile-gputrace … KEEP_ALL=1`) skips the cap.
 
 ```sh
-make traces-gc                                   # report: what is over the caps
+make traces-gc                                   # report what is over the caps
 make traces-gc APPLY=1                           # enforce them
 make traces-gc APPLY=1 MAX_COUNT=12 MAX_TOTAL_GB=80
-bash scripts/traces_gc.sh --apply --max-age-days 7   # optional extra age rule
+bash scripts/traces_gc.sh --apply --max-age-days 7   # optional age rule
 ```
 
 ### Tests
 
-The window policy, the request validation and the `xctrace` export parser are
-pure and unit-tested, but the tests are behind the same feature, so a plain
-`cargo test` does not compile them. Run them with:
+The window policy, the request validation and the `xctrace` parser are unit
+tests behind the same feature, so `make test` compiles them out.
+`make test-capture` runs them, and `make ci` runs that target. Most parser
+tests pair a fixture with a mutated twin that must be refused: a dropped
+`<sentinel/>`, a one-column shift, a dangling `ref`, a non-numeric duration.
 
-```sh
-make test-capture
-```
+## 6. Log level for profiling sessions
 
-`make ci` runs that target too — without it, an off-by-one in the window policy
-would pass the gate green, since `make test` compiles these tests out entirely.
+`--log verbose` or `RUST_LOG=...=trace` turns on per-token and per-FFI
+events, which add log I/O to decode. Scope trace to one module:
 
-The parser's tests are mostly *refusals*, and deliberately so: each pairs a
-fixture carrying one of the export encoding's traps with a mutated twin that
-must be rejected — a dropped `<sentinel/>`, a one-column shift that keeps the
-cell count intact, a dangling `ref`, a `ref` into a still-open element, a
-non-numeric duration, the wrong table, and a filter that selects nothing. Every
-one of those, accepted, yields a well-formed table of wrong numbers.
-
-## 6. Ad-hoc cardinality counting with the `counts` crate
-
-The [counts crate](https://crates.io/crates/counts) is the perf-book's "ad-hoc profiling"
-recommendation: sprinkle `eprintln!` on a hot branch, run, pipe to `counts`, get a
-frequency table.
-
-No code change needed — add `counts` as a dev-dependency when needed:
-```toml
-[dev-dependencies]
-counts = "0.2"
-```
-
-Example use: counting how often mxfp8 vs bf16 dequant paths are taken in `rmlx-quant`:
-```rust
-eprintln!("dequant_path={}", if is_mxfp8 { "mxfp8" } else { "bf16" });
-```
-```bash
-./target/release/rmlx baseline ... 2>&1 | counts
-```
-
-## 7. RUST_LOG tuning for profiling sessions
-
-The default `RUST_LOG=debug,rmlx=trace` setting writes every span enter/exit for
-`rmlx_models` to the JSONL log. With `#[instrument]` on generate_greedy boundaries,
-this produces ~42 span events per decode step at trace level — tolerable for short runs.
-
-For long runs or when reducing log I/O is important:
-```bash
-RUST_LOG=debug,rmlx_models=debug ./target/release/rmlx baseline ...
-```
-
-To enable per-model trace for a specific module only:
 ```bash
 RUST_LOG=debug,rmlx_models::gemma4=trace ./target/release/rmlx baseline ...
 ```
 
-## 8. Symbol demangling
+## 7. Symbol demangling
 
-If a profiler shows mangled `_ZN` or `_R` prefixed names:
-```bash
-cargo install rustfilt
-some-profiler-output | rustfilt
-```
+If a profiler shows mangled `_ZN` or `_R` names, pipe its output through
+`rustfilt` (`cargo install rustfilt`).
 
-Or build with v0 mangling (more demangler-compatible):
-```bash
-RUSTFLAGS="-C symbol-mangling-version=v0" cargo build --release
-```
-(Not set by default — adds it only when needed for a specific profiling session.)
+## 8. Ad-hoc counting
+
+The [counts crate](https://crates.io/crates/counts) prints a frequency table
+of the lines on its stdin. Emit a `trace!` event on the branch under study,
+extract its field from the JSONL log, and pipe that through `counts`.
 
 ## 9. Process-memory counters: RSS vs phys_footprint vs Metal peak_alloc (J4)
 
-`rmlx_core::mach_mem::read_proc_mem()` exposes six counters from two `task_info` calls.
-They are related but not equal; understanding the difference matters for OOM tuning:
+`rmlx_core::mach_mem::read_proc_mem()` returns six counters from two
+`task_info` calls:
 
-| Counter | Source | What it counts | When to use |
-|---------|--------|----------------|-------------|
-| `rss_bytes` | `MACH_TASK_BASIC_INFO.resident_size` | Pages physically in RAM right now — what `ps -o rss` shows. | Quick sanity check; matches operator intuition. |
-| `virtual_bytes` | `MACH_TASK_BASIC_INFO.virtual_size` | Total VM address space committed. | Rarely actionable on Apple Silicon (48-bit VA space). |
-| `phys_footprint_bytes` | `TASK_VM_INFO.phys_footprint` | **Apple's pressure metric** — anonymous + file-backed resident + compressed pages counted as "yours". What Activity Monitor shows; what the kernel OOM killer uses. | Use this for pressure decisions (J3 OOM guard). |
-| `internal_bytes` | `TASK_VM_INFO.internal` | Anonymous heap pages — jemalloc arenas, KV-cache buffers, Rust Vec allocations. | Track heap growth independently of weights. |
-| `compressed_bytes` | `TASK_VM_INFO.compressed` | Pages handed to the macOS memory compressor ("soft swap" — still counts against `phys_footprint`). | Non-zero means the system is already under pressure. |
-| `external_bytes` | `TASK_VM_INFO.external` | File-backed pages — in rMLX this is primarily mmap'd safetensors weight files. | `external_bytes ≈ loaded-weight footprint`; grows with model size, shrinks on unload. |
+| Counter | Source | What it counts |
+|---|---|---|
+| `rss_bytes` | `MACH_TASK_BASIC_INFO.resident_size` | Pages in RAM now, as `ps -o rss` shows. |
+| `virtual_bytes` | `MACH_TASK_BASIC_INFO.virtual_size` | Virtual address space. |
+| `phys_footprint_bytes` | `TASK_VM_INFO.phys_footprint` | Apple's memory-pressure figure. It counts compressed pages. Activity Monitor shows it. |
+| `internal_bytes` | `TASK_VM_INFO.internal` | Anonymous pages. |
+| `compressed_bytes` | `TASK_VM_INFO.compressed` | Pages held by the memory compressor. Non-zero means the system is under pressure. |
+| `external_bytes` | `TASK_VM_INFO.external` | File-backed pages, mostly the mmap'd safetensors. |
 
-**Metal `peak_alloc_mb`** is a separate counter from the Metal Performance
-HUD / `MTLDevice.currentAllocatedSize`.  It counts GPU-private VRAM allocations (weight
-tensors, KV-cache MTLBuffers) and is disjoint from the `task_info` counters above — they
-measure CPU/UMA host memory, not GPU-private usage.  On Unified Memory Macs the boundaries
-blur (all memory is the same physical chips) but the accounting domains are distinct.
+The Metal peak is a different counter. `rmlx_mlx::mlx_peak_memory_bytes()`
+reads the MLX allocator's high-water mark of live bytes. The server publishes
+it as `metal_peak_alloc_mb`. It is a process-lifetime figure unless a
+`PeakBracket` scopes it.
 
 ### 9.1 Scoping the Metal peak to a region
 
-`rmlx_mlx::mlx_peak_memory_bytes()` alone is a process-lifetime high-water mark:
-it carries the model load, every prior request, and anything else the process
-did. That makes it a dashboard number, not something an assertion can be built
-on. `rmlx_mlx::PeakBracket` scopes it:
+`rmlx_mlx::PeakBracket` records the live bytes and zeroes the peak mark at
+`open()`, and reads them back at `close()`:
 
 ```rust
-let bracket = PeakBracket::open();   // record live bytes, zero the peak mark
-// ... region under test, MATERIALISED (MLX is lazy: eval inside the bracket) ...
+let bracket = PeakBracket::open();
+// ... region under test, evaluated inside the bracket (MLX is lazy) ...
 let reading = bracket.close();
 ```
 
 | Accessor | Meaning |
 |---|---|
 | `peak_bytes` | Most bytes live at once inside the region. `0` if it allocated nothing. |
-| `headroom_bytes()` | `peak - live_at_open` — what the region needed *on top of* the resident weights. The number to compare across two runs. |
-| `transient_bytes()` | `peak - live_at_close` — allocated inside and released again. Catches a scratch buffer *larger* than the region's own steady state; a smaller one hides under the peak the surviving buffers reach anyway, and reads zero. Zero is not a no-scratch proof. |
-| `observed_allocation()` | `headroom_bytes() > 0` — this region's live bytes rose above where they started. Assert this first; an upper bound is free to hold against a region that measured nothing. **Not** `peak_bytes > 0`: MLX updates the mark as `peak = max(peak, active)` where `active` is the whole live count, so after a reset one allocation anywhere in the process lifts `peak_bytes` to the full resident total, and the predicate would be true in every real process. |
-| `measurable()` | The peak mark was actually zeroed at `open()`. When it is `false` the peak is still process-lifetime, so every accessor above returns 0 rather than a large, stable, plausible-looking delta. |
+| `headroom_bytes()` | `peak - live_at_open`: what the region needed on top of what was resident. Compare this across runs. |
+| `transient_bytes()` | `peak - live_at_close`: allocated inside and released again. A scratch buffer smaller than the surviving buffers hides under the peak, so zero does not prove no scratch. |
+| `observed_allocation()` | `headroom_bytes() > 0`. Assert this first. `peak_bytes > 0` is no test: MLX sets `peak = max(peak, active)` over the whole live count, so one allocation anywhere lifts it to the full resident total. |
+| `measurable()` | The peak mark was zeroed at `open()`. When `false`, `headroom_bytes()` and `transient_bytes()` read 0 and `observed_allocation()` reads `false`, while the raw `peak_bytes` field holds the whole-process peak. |
 
-Two rules the pooling allocator imposes:
+Rules the pooling allocator imposes:
 
-- **Never assert on an absolute byte count.** MLX reuses pooled buffers, so an
-  absolute figure encodes what ran before as much as what ran now. Bound
-  `headroom_bytes()` by a multiple of the workload's own size instead — see
-  `q8_msl_roundtrip_allocation_stays_within_budget` in
-  `crates/rmlx-kv-quant/src/q8_msl_tests.rs`.
-- **Materialise inside the bracket.** MLX is lazy. An `eval()` after `close()`
-  allocates after the mark has been read, and the bracket reports
-  `peak_bytes: 0` — which `observed_allocation()` exists to catch.
+- **Never assert on an absolute byte count.** Pooled buffers carry what ran
+  before. Bound `headroom_bytes()` by a multiple of the workload's own size,
+  as `q8_msl_roundtrip_allocation_stays_within_budget` in
+  `crates/rmlx-kv-quant/src/q8_msl_tests.rs` does.
+- **Evaluate inside the bracket.** An `eval()` after `close()` allocates after
+  the mark was read, and `observed_allocation()` reads false.
+- **One bracket at a time.** The peak mark is process-global.
 
-The peak mark is process-global, so two brackets on different threads reset
-each other. Scope one at a time.
+`rmlx baseline` reports `metal_peak_mb` (the peak over prefill and decode) and
+`metal_gen_alloc_mb` (that peak minus the bytes live at open). Only the second
+compares across runs; the first carries the weights.
 
-`rmlx baseline` uses this to report `metal_peak_mb` (peak during
-prefill+decode) and `metal_gen_alloc_mb` (that figure minus what was already
-live). Only the second is comparable between two runs of the same model; the
-first still carries the weights.
+## 10. Prefill-chunk size knob
 
-**Typical relationship**: `rss_bytes ≤ phys_footprint_bytes ≤ rss_bytes + compressed_bytes`.
-`external_bytes` overlaps with `rss_bytes` (mmap'd weight pages that are currently resident).
-When weights are evicted by the compressor, `external_bytes` drops and `compressed_bytes` rises.
+The per-arch chunk defaults and their resolution order are in
+[`KV_CACHE.md`](KV_CACHE.md) § "Chunked prefill". The `arch_default` rows in
+`crates/rmlx-models/src/prefill_chunk.rs` record what each default was
+measured on. Do not change one without a sweep run as a Latin square (see
+"Ordering on this host" above).
 
-## 10. Prefill-chunk size knob (J9)
-
-Cold prefill is chunked per-arch by `rmlx_models::prefill_chunk::prefill_chunk_for(arch)`
-(every arch routes through it). The chunk size trades per-chunk lazy-graph and
-command-buffer overhead against the per-chunk attention and KV work, which
-grows with the chunk. Each default is tuned from a real-model sweep and the
-`arch_default` row in `crates/rmlx-models/src/prefill_chunk.rs` records what it
-was measured on — **do not change one without a sweep** (CLAUDE.md
-§"Regression-bench discipline"), and run that sweep as a Latin square, not an
-ABBA block (see §"Ordering on this host").
-
-The defaults themselves are that `arch_default` table; they are not restated
-here, because a second copy is a copy that goes stale.
-
-Override at runtime (resolution order: **runtime override
-(`set_prefill_chunk`, the adaptive controller) > per-arch env > global env >
-arch default > 64 fallback**):
-
-- `RMLX_PREFILL_CHUNK=<n>` — global, all archs.
-- `RMLX_PREFILL_CHUNK_<ARCH>=<n>` — per-arch, ARCH upper-cased, e.g.
-  `RMLX_PREFILL_CHUNK_QWEN3_5_MOE=256`.
-
-The two shared chunked-prefill engines — `decode_loop::chunked_prefill` (the
-cold-prompt path for gemma3 / gemma4 / qwen3 / qwen3_5_moe / qwen3_vl_moe) and
-`speculative::prefill_chunked_for_class` (the verifier) — emit the resolved
-size and the rule that produced it as `debug!` fields: `prefill_chunk` plus
-`prefill_chunk_source`, one of `arch_default`, `env_arch`, `env_global`,
-`adaptive` or `fallback`. Two sweeps had to infer the chunk by collapsing the
-environment before this existed.
-
-**Not every chunked prefill goes through those two.** The hand-rolled loops
-are silent: `laguna`, `qwen2` and `bitnet` generate, the gemma4 prefix-hit tail
-and the qwen3_5_moe prefix-append tail (both of which are what a cache-warm
-bench actually runs), and the qwen3_vl_moe image path. A run on one of those
-still leaves the chunk to be inferred.
-
-`scripts/prefill_chunk_sweep.sh` drives the per-arch sweep those overrides
-exist for, and records its cells in the metrics DB under
+`scripts/prefill_chunk_sweep.sh` drives the per-arch sweep through
+`RMLX_PREFILL_CHUNK_<ARCH>`. It records each cell in the metrics DB under
 `decode_config = 'prefill_chunk=<n>'`.
+
+`decode_loop::chunked_prefill` and `speculative::prefill_chunked_for_class`
+log the resolved size as `debug!` fields: `prefill_chunk` and
+`prefill_chunk_source`. The source is one of `adaptive`, `env_arch`,
+`env_global`, `arch_default` or `fallback`. A prefill loop that calls
+`prefill_chunk_for` directly logs neither field: the `laguna`, `qwen2` and
+`bitnet` generate paths, one `qwen3_5_moe` path and the `qwen3_vl_moe` image
+path.
 
 ## Quick reference
 
 | Goal | Command |
-|------|---------|
-| CPU profile (recommended) | `make profile-samply MODEL=...` |
+|---|---|
+| CPU profile | `make profile-samply MODEL=...` |
+| CPU profile with inlined frames | `make profile-samply-debug MODEL=...` |
 | Native Apple profiler | `make profile-instruments MODEL=...` |
-| Flamegraph (needs sudo) | `sudo cargo flamegraph --bin rmlx -- baseline ...` |
-| Heap profile | `cargo build --features rmlx-cli/dhat-heap && ./target/debug/rmlx baseline ...` |
-| GPU kernel identity (which kernels ran) | `make profile-gputrace CODEC=... MODEL=...` — see §5 |
-| GPU timing + CPU→GPU gap | `make profile-mst MODEL=...` — see §5 |
-| Ad-hoc branch counts | `eprintln!` + `counts` crate |
-| Process memory snapshot | `rmlx_core::mach_mem::read_proc_mem()` — see §9 |
-| Prefill-chunk override | `RMLX_PREFILL_CHUNK_<ARCH>=<n>` — see §10 |
+| Heap profile | `cargo build --features rmlx-cli/dhat-heap` (§4) |
+| Which kernels ran | `make profile-gputrace CODEC=... MODEL=...` (§5) |
+| GPU time and idle gaps | `make profile-mst MODEL=...` (§5) |
+| Process memory | `rmlx_core::mach_mem::read_proc_mem()` (§9) |
+| Prefill-chunk override | `RMLX_PREFILL_CHUNK_<ARCH>=<n>` |
 
----
+## Xcode GPU counter replay
 
-## Xcode GPU counter replay — the only per-kernel counter path on this host
-
-**This step needs a human.** It is a GUI workflow: Xcode's Metal Debugger cannot
-be driven headlessly here, the `xcode` MCP bridge never answers `tools/list`, and
-accessibility automation can select a navigator row but cannot make Xcode load
-its editor. An agent can capture the bundle, open it, and read the exported CSV —
-a person has to click Profile. **Ask the user; do not report the counters as
-unavailable.**
-
-Headless Metal System Trace is *not* a substitute, but not because it fails:
-it does instrument `rmlx`'s compute work here (§5 — reproduced on this host at
-xctrace 16.0 / Xcode 26.6, 6 931 and 14 140 rmlx `Compute` rows with
-`start-latency` populated). What it does not carry is *which kernel* and *any
-counter*: the `metal-gpu-intervals` export has no pipeline or function names,
-and per-dispatch counter sampling is unsupported on M5 Max. So MST answers
-"how long did each submission take and how long did it wait", and this GUI path
-answers "which kernel, and at what occupancy / limiter". Different questions —
-use both.
+This is a GUI workflow; an agent cannot drive it. An agent can capture the
+bundle and read the exported CSV. A person has to click Profile, so ask the
+user rather than report the counters as unavailable.
 
 ### Capture
 
 ```bash
-bash scripts/gputrace_preflight.sh          # Xcode selected, developer mode, get-task-allow
+bash scripts/gputrace_preflight.sh
 bash scripts/gpu_capture.sh --kv-quant <codec> --model <snapshot> \
      --prompt-tokens 8192 --skip 32 --steps 8 --keep-all
 ```
 
-Keep `--steps >= 8`: a shorter window's kernel set is a strict subset of an
-8-step one. Pass `--keep-all` when a sibling bundle must survive — the default
-prune is oldest-first and has already deleted a comparison arm once. Bundles run
-7-14 GB each.
+Keep `--steps` at 8 or more. Pass `--keep-all` when a sibling bundle must
+survive the default prune.
 
 ### Replay (the human step)
 
-1. `open -a Xcode <bundle>` — a `.gputrace` opens as **Debugging GPU Workload**,
-   not a project. If no window appears, check the other displays and Spaces:
-   `osascript -e 'tell application "System Events" to tell process "Xcode" to get position of every window'`.
-2. Navigator: **Performance** (4th row). It reads *"Performance data not
-   available"* with a **Profile...** button.
-3. In the Profile sheet set **Performance State: Maximum** and **GPU Execution
-   Mode: Serial**, then Profile.
-   * *Maximum* because the roofline (614 GB/s on M5 Max) and every recorded slope
-     assume full clocks; a reduced P-state deflates the bandwidth fraction and can
-     make an issue-bound kernel look memory-bound.
-   * *Serial* because per-dispatch attribution is the goal. Xcode warns *"Adds
-     precision to the data report, but it doesn't represent runtime
-     performance"* — that is the intended trade.
-4. **Both arms of a comparison must use identical settings**, or the comparison
-   is void.
+1. `open -a Xcode <bundle>`. A `.gputrace` opens as Debugging GPU Workload.
+2. In the navigator, open Performance. It reads "Performance data not
+   available" with a Profile button.
+3. In the Profile sheet set Performance State: Maximum and GPU Execution
+   Mode: Serial, then Profile. Maximum keeps full clocks, so the bandwidth
+   fraction is not deflated. Serial attributes time per dispatch; it does not
+   represent runtime performance.
+4. Both arms of a comparison use identical settings, or the comparison is
+   void.
 
 ### Read
 
-* **Shaders** tab — cost %, `# SIMD Groups`, `# Allocated Registers`,
-  `Spilled Bytes` per pipeline. Kernel dtype is visible in the name suffix
-  (`_float_` / `float32` vs `_bfloat16_t` / `bfloat16`), which is how a dtype
-  promotion shows up.
-* **Counters** tab — export CSV (one row per encoder, ~600 rows, 22 limiter
-  columns). The decisive columns:
+- **Shaders** tab: cost %, `# SIMD Groups`, `# Allocated Registers` and
+  `Spilled Bytes` per pipeline. The name suffix shows the kernel dtype
+  (`float32` against `bfloat16`), which is how a dtype promotion shows up.
+- **Counters** tab: export the CSV, one row per encoder. The decisive
+  columns:
 
 | column | reads |
 |---|---|
-| `Integer and Conditional Limiter` | integer/address/control issue pressure |
+| `Integer and Conditional Limiter` | integer, address and control issue pressure |
 | `Last Level Cache Limiter` | memory-bound |
 | `Instruction Throughput Limiter` | issue-bound |
 | `Kernel Occupancy` | resident threadgroups; falls as allocated registers rise |
-| `Device Memory Bandwidth` | achieved GB/s — against 614 on M5 Max |
+| `Device Memory Bandwidth` | achieved GB/s, against the ceiling `scripts/perf_ceiling.py` assumes |
 
-Group encoders by their own top limiter; dispatch counts identify the kernel
-(e.g. 26 codec layers x 8 steps = 208 encoders). Store exports under
+Group encoders by their top limiter. Dispatch counts identify the kernel: 26
+codec layers over 8 steps is 208 encoders. Store exports under
 `.rmlx/analysis/<probe>/xcode/`.
 
-### What is trustworthy under Serial
-
-Limiters, occupancy, register counts, SIMD-group counts, kernel identity and
-dtype are the precise half. Absolute wall-clock and absolute bandwidth are **not**
-production numbers; the ON/OFF *ratio* is what carries. Never compare a profiled
-millisecond against a `perf_ab.sh` millisecond.
-
-Xcode may report `Sampled Cores 12 / 40`. Relative shares hold; absolute
-extrapolation carries that uncertainty.
+Under Serial, limiters, occupancy, registers, SIMD groups, kernel identity
+and dtype are precise. Absolute time and bandwidth are not production
+numbers; compare the ON/OFF ratio. Never compare a profiled millisecond with
+a `perf_ab.sh` millisecond.

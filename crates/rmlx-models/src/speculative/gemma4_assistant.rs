@@ -58,10 +58,10 @@
 //!   greedy next token is a standard full-vocab argmax over `h @ embedW.T`.
 //!   See [`Gemma4AssistantDrafter::plain_argmax`].
 //!
-//! # MVP scope (document-the-truth, CLAUDE.md hard rule 7)
+//! # Scope
 //!
-//! Unbatched, B=1, greedy (temp=0). Stochastic temp>0 is deferred (the host
-//! sampler slots in at the round-loop level - ). Full-attention masks
+//! Unbatched, B=1. The drafter proposes greedily; a request with temp>0 is
+//! sampled by the verifier's draw in the shared round loop. Full-attention masks
 //! are `None` (B=1 no-padding); sliding-attention layers get an additive
 //! bidirectional-window bias (passed via mlx-c SDPA `"array"` mode, matching
 //! the verifier SWA path — there is no `"additive"` mode) when the verifier KV

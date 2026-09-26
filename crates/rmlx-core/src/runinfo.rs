@@ -26,7 +26,7 @@
 /// Build a stable run-id for the current process.
 ///
 /// Used by both `logs/<run-id>.jsonl` and `metrics/<run-id>.jsonl`. A run-id
-/// is just a tracking string (`docs/METRICS_DB.md` §3.2), not a value
+/// is just a tracking string (`docs/METRICS_SCHEMA.md` §3.2), not a value
 /// compared across runs — the version discriminator is enough to tell apart
 /// log files from different builds without claiming a commit the binary
 /// cannot actually verify.

@@ -40,8 +40,8 @@ use crate::kv_cache::kv_layer_quants;
 ///   filters are geometry, and folding them would make the key depend on
 ///   per-layer types the namespace does not otherwise carry.
 /// - **Attach-time, not per-request.** This is the launch codec's mixture. A
-///   request may resolve a different codec (auto-by-context, or a per-request
-///   override); the identity that separates *those* is the per-request
+///   request may resolve a different codec through a per-request override;
+///   the identity that separates *those* is the per-request
 ///   prompt-cache seed, which folds the mixture of the codec the request
 ///   actually runs.
 ///

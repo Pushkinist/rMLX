@@ -1,18 +1,9 @@
 // Apple10 (M5+) hazard re-validation at head_dim = 256.
 //
-// The original B1 report (`docs/reports/B1-turboflash-m5-validation.md`)
-// documented an `EXC_BAD_ACCESS SIGSEGV @ 0x0` hazard on M5 Max for the
-// TurboFlash MSL kernel when dispatched against the Qwen3.6-35B-A3B-8bit
-// `head_dim = 256` full-attention configuration at 32k context. The previous
-// validation host was M5 Max, but the routing-extension tests it shipped drove
-// `head_dim = 128`, which is the linear-attention head size on the same
-// Qwen3.6 snapshot — the hazard scenario itself was never re-exercised after
-// the kernel landed. The `Auto` arm of `--turbo-flash` was therefore left
-// as Apple ≥ 10 → OFF "pending an explicit M5 re-validation with the dispatch
-// counter and the historical `head_dim = 256` configuration".
-//
-// This file is that re-validation, run as a synthetic K8V4 cache driven
-// directly through the public `KvCache::update_and_sdpa` chain — no model
+// Upstream TurboFlash is default-OFF on Apple10 (M5+) because of corrupted
+// output. This file drives the TurboFlash MSL kernel at the `head_dim = 256`
+// full-attention configuration (the Qwen3.6-35B-A3B shape) as a synthetic
+// K8V4 cache through the public `KvCache::update_and_sdpa` chain — no model
 // snapshot required, reproducible on any Apple Silicon host.
 //
 // Assertions (per scenario):
@@ -44,9 +35,7 @@
 //   cargo test -p rmlx-kv-quant --test apple10_head_dim_256 -- \
 //       --ignored --test-threads=1 --nocapture
 //
-// CLAUDE.md hard rule 8 (single MLX process): preflight via
-//   pkill -f "rmlx serve"; pkill -f mlx_lm; pkill -f paroquant; pkill -f omlx
-//   rm -f /tmp/rmlx.62265.claim
+// CLAUDE.md hard rule 8 (single MLX process): stop every other MLX process
 // before running. The test does NOT claim a port — the integration runner
 // serialises tests within a single process and we keep `--test-threads=1`.
 #![allow(

@@ -13,9 +13,9 @@
 #   2. NA-class hosts only (M5 and later): `mlx.metallib` must actually contain
 #      `steel_gemm_fused_nax` GEMM kernels, and the linked pair must be the one
 #      the pin names. Some homebrew-core `arm64_tahoe` bottles ship ZERO nax
-#      kernels, costing ~2-3.8x on GEMM-bound prefill. Decode is largely
-#      unaffected, so the failure is silent: benches still run and still look
-#      plausible. See docs/FFI.md for which bottles and the measured cost.
+#      kernels, which slows GEMM-bound prefill. Decode is largely unaffected,
+#      so the failure is silent: benches still run and still look plausible.
+#      See docs/FFI.md.
 #
 # On M1-M4 both the nax check and the pinned-pair check are skipped, not failed
 # — those bottles legitimately contain no nax kernels because the hardware has

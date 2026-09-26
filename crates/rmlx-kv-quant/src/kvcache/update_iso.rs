@@ -611,10 +611,9 @@ pub(super) fn iso_v_encode_decode<const BITS: u8>(
 ///
 /// The V side routes its encode through the iso MSL kernel when
 /// `device == Device::Gpu` and decodes with `dequant_gpu`; CPU encode and
-/// `dequant_on` are the fallback. This hot path is shadowed by the warm-TTFT
-/// bf16 seed: the GPU encode fires once at `exit_prefill` (large `new_v`
-/// slice), not per decode step (the bf16 V buffer absorbs decode-step
-/// appends).
+/// `dequant_on` are the fallback. A cache that went through prefill never
+/// reaches this body: `exit_prefill` builds no iso V store and decode reads the
+/// bf16 mirror. It runs only on a cache with no mirror.
 #[allow(
     clippy::indexing_slicing,
     reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
@@ -869,8 +868,9 @@ pub(super) fn iso_v_bulk_encode<const BITS: u8>(
     let head_dim = new_shape[3];
     let t_enc = std::time::Instant::now();
     qv.append(&v_f32, &new_shape)?;
-    // `iso3_encode` is the one V-encode phase `docs/PERF_BASELINE.md` pins at
-    // this site; the 4-bit width has no pinned phase.
+    // `docs/PERF_BASELINE.md` names `iso3_encode` as this site's trace phase;
+    // the 4-bit width has none. It does not fire in a served run:
+    // `exit_prefill` builds no iso V store, so it never reaches this body.
     if BITS == 3 {
         tracing::trace!(
             phase = "iso3_encode",

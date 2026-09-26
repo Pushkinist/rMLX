@@ -1,12 +1,8 @@
-// LOC-exempt: the per-family decode and prefill bodies now live beside their
-// storage family in the sibling `update_*.rs` modules. `exit_prefill` is down
-// to 276 lines of 2198, 13 % of the file: its gate, its shared prologue and
-// epilogue, and one call per codec family. What is left is the dispatch
-// itself — the `KvStorage` and `KvQuant` matches, the prefill and decode
-// capacity bookkeeping, the bf16 decode mirror, the GPU-state and residency
-// walks, and the helpers more than one family calls. The chunk that writes
-// one update body per store shape is what removes the rest.
-// docs/KV_UPDATE_SPLIT.md holds the plan.
+// LOC-exempt: the dispatch itself — the `KvStorage` and `KvQuant` matches, the
+// prefill and decode capacity bookkeeping, the bf16 decode mirror, the
+// GPU-state and residency walks, and the helpers more than one codec family
+// calls. The per-family bodies live in the sibling `update_*.rs` modules;
+// docs/KV_UPDATE_PATH.md describes the layout.
 //! Update paths: `update`, prefill, GPU state management, and storage-specific appenders.
 
 use std::sync::OnceLock;
@@ -145,14 +141,13 @@ pub(super) fn head_dim_from_shape(new_shape: &[i32], ctx: &str) -> Result<usize>
 /// Whether a rotor K GPU append should also maintain the store's GPU ring.
 ///
 /// Only the K-only codecs (`RotorKOnly3` / `RotorKOnly4`) have a kernel that
-/// reads the ring — `Rotor{3,4}Sym` and `RotorK{3,4}Asym` quantize V as well and
-/// the flash kernel takes bf16 V only, so a ring built for them is never read.
-/// It is not free: one `u32` code word plus one
+/// reads the ring — `Rotor{3,4}Sym` and `RotorK{3,4}Asym` quantize V as well
+/// and the flash kernel takes bf16 V only, so a ring built for them is never
+/// read. It is not free: one `u32` code word plus one
 /// [`crate::storage::KV_SIDEBAND_DTYPE`] scale per group and one such norm per
 /// token, so
 /// `capacity * kv_h * (n_groups * (4 + KV_SIDEBAND_DTYPE.itemsize()) + KV_SIDEBAND_DTYPE.itemsize())`
-/// bytes per layer, growing with context — at 4k over a 36-layer model, on the
-/// order of a few hundred MB of pure waste. Written as the expression rather
+/// bytes per layer, growing with context. Written as the expression rather
 /// than as bytes so a sideband-width change moves it.
 ///
 /// Passed down from the caller rather than inferred here, so eligibility lives
@@ -1010,11 +1005,9 @@ impl KvCache {
         // They are kept, not deleted, because they ARE the re-enable path: a
         // codec that grows a decode kernel over its own packed store flips one
         // arm in `decode_reads_packed_store` and this bulk encode is what then
-        // fills the buffer that kernel reads (see `docs/KV_CACHE.md` §9.6 —
-        // `planar_flash_decode` and the fused quant-decode work are both
-        // waiting on exactly that flip). The hazard that creates is real: a
-        // flipped predicate re-arms code that has had no execution since. The
-        // pairing guard is
+        // fills the buffer that kernel reads (see `docs/KV_CACHE.md` §9.6). The
+        // hazard that creates is real: a flipped predicate re-arms code that
+        // does not run today. The pairing guard is
         // `warm_ttft_cross_codec_tests::exit_prefill_builds_a_store_exactly_when_the_predicate_says_so`,
         // which sweeps every variant and fails the moment a codec's arm and its
         // classification disagree.
@@ -1675,7 +1668,7 @@ impl KvCache {
         // buffer, reset prev_offset/new_offset relative to 0. The SWA cache
         // effectively starts fresh — the phantom prefix tokens were never spilled.
         if needs_expand && self.decode_fp16_k.is_none() && prev_offset >= max_seq {
-            // H5: tracing event for SWA hydration offset reset (emit before mutation).
+            // Tracing event for SWA hydration offset reset (emit before mutation).
             tracing::warn!(
                 layer_max_seq = max_seq,
                 old_offset = prev_offset,

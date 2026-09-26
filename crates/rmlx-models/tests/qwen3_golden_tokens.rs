@@ -5,8 +5,7 @@
 //! hybrid backbone (`Qwen3_5MoeForConditionalGeneration`).
 //!
 //! Model: `mlx-community__Qwen3.6-35B-A3B-8bit`.
-//! KV quant: K8V8 (the resolver default for Qwen3.5 MoE; K8V4 on the FA layers
-//! regressed decode).
+//! KV quant: K8V8, pinned by the test (`auto` resolves to bf16).
 //!
 //! The snapshot resolves from `RMLX_O_MODELS_ROOT` by slug, so no per-run
 //! variable is needed on a machine holding it (see `tests/common/mod.rs`).

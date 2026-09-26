@@ -1,10 +1,6 @@
-//! Weight + KV-cache quantization kernels.
-//!
-//! Stage 1: `affine`, `mxfp8`, `mxfp4`, `nvfp4` decode.
-//! Stage 2: TurboQuant (port from TheTom MSL kernels).
-//! Stage 3: PlanarQuant (port from johndpope / write MSL).
-//!
-//! Module per family. Empty stubs in Stage 0.
+//! Weight quantization codecs: `affine`, `awq`, `bf16`, `fp4`, `fp8` and
+//! `mxfp` (`mxfp8`, `mxfp4`, `nvfp4`) decode. One module per family. The KV
+//! codecs live in `rmlx-kv-quant`.
 
 #![warn(missing_docs)]
 #![cfg_attr(

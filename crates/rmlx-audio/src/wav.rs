@@ -222,7 +222,7 @@ impl WavEncoder {
             .map(|&s| {
                 let clamped = s.clamp(-1.0, 1.0);
                 // Scale to i16 range. Avoid i16::MIN edge case by using 32767.
-                // .round() prevents silent truncation bias (N1).
+                // .round() prevents silent truncation bias.
                 (clamped * 32767.0).round() as i16
             })
             .collect();

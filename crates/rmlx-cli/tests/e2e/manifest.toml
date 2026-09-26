@@ -1,4 +1,4 @@
-# rMLX E2E feature-proof manifest — Phase 1 (Bonsai run-1).
+# rMLX E2E feature-proof manifest.
 #
 # One [[case]] per feature × sub-feature. The runner
 # (`tests/e2e/runner.rs`) parses this, drives the real `rmlx` binary, and
@@ -14,7 +14,9 @@
 #   request     named request fixture (see runner::request_fixture)
 #   kv_quant    --kv-quant preset for serve cases
 #   assert      { kind, expect, min_cosine }
-#   tags        ["run1","quant",...]; "phase2" rows are stubbed, never executed
+#   tags        ["run1","quant",...]; "phase2" rows are stubs that record
+#               PENDING and never execute (the live `spec_decode` and `image`
+#               rows cover the first two)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. CLI surface (no / low GPU)
@@ -480,9 +482,8 @@ assert = { kind = "cosine_vs_bf16", min_cosine = 0.99 }
 tags = ["run1", "quant"]
 
 # --- rot_k (RotK, K rotated 8-bit + V affine 4/g64) ---
-# NOTE: the RotK Display form `rot_k_v4g64` does NOT round-trip through
-# `--kv-quant` FromStr (the valid list omits it). RotK is reachable only via the
-# compose form `--ctk rot_k --ctv q4_g64`. See E2E findings + docs/CLI.md.
+# These cases use the compose form `--ctk rot_k --ctv q4_g64`; `--kv-quant
+# rot_k_v4g64` parses to the same codec.
 [[case]]
 id = "quant_rotk_coherent"
 feature = "quant_matrix"
@@ -646,7 +647,7 @@ assert = { kind = "thinking" }
 tags = ["run1", "thinking"]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. Phase 2a — state features (SSD cross-restart + prompt-cache reuse), LIVE.
+# 5. State features (SSD cross-restart + prompt-cache reuse), LIVE.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # SSD KV cross-restart: the runner owns two serve phases under single-MLX
@@ -682,7 +683,7 @@ assert = { kind = "cache_hit_equivalence" }
 tags = ["run2a", "prompt_cache"]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Phase 2b/2c — stubbed rows (declarative only; runner records PENDING).
+# Stubbed rows (declarative only; runner records PENDING).
 # Broader models (Gemma4-e4b, Qwen3.6-MoE) + remaining state/modality features.
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -695,7 +696,7 @@ assert = { kind = "metric_present", expect = "accept_rate" }
 tags = ["phase2"]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Phase 2b — multi-model lifecycle + attention dispatch (LIVE).
+# Multi-model lifecycle + attention dispatch (LIVE).
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Multi-model lifecycle: the runner owns a registry-mode serve (Bonsai + a 2nd
@@ -756,7 +757,7 @@ assert = { kind = "coherent" }
 tags = ["phase2"]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Phase 2c — broader-model text-core proof: Gemma4-e4b + Qwen3.6-35B-A3B-MoE.
+# Broader-model text-core proof: Gemma4-e4b + Qwen3.6-35B-A3B-MoE.
 # LIVE rows (tag run2c). CORRECTNESS-first, REPRESENTATIVE legal-KV subset per
 # arch (not the full 18-preset matrix — that is extensible by adding rows). The
 # arch-guard refusals prove the per-arch KV invariant is a working feature.
@@ -795,11 +796,11 @@ request = "anthropic_basic"
 assert = { kind = "contains_coherent", expect = "Paris" }
 tags = ["run2c", "gemma4", "text"]
 
-# Representative legal Gemma4 KV cells. SWA layers always stay bf16 (§D6.7);
+# Representative legal Gemma4 KV cells. SWA layers always stay bf16;
 # only full-attention layers are quantized. K8V4 at head_dim=256 needs the
 # TurboFlash kernel — force it ON explicitly (`--turbo-flash on`) so the cell
 # is deterministic across host families (auto resolves ON on Apple10+ but we
-# do not depend on the host family here). niah@8k + cosine≥0.99 per docs/KV_QUANT.md.
+# do not depend on the host family here). niah@8k + cosine≥0.99 per docs/KV_CODECS.md.
 
 # --- K8V8 ---
 [[case]]
@@ -1045,7 +1046,7 @@ assert = { kind = "thinking" }
 tags = ["run2c", "qwen36", "thinking"]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Phase 2d — big-Gemma4 text-core proof: gemma-4-26b-a4b (MoE, 128 experts) +
+# Big-Gemma4 text-core proof: gemma-4-26b-a4b (MoE, 128 experts) +
 # gemma-4-31b (dense, 60 layers). Both Gemma4ForConditionalGeneration,
 # head_dim=256, SWA window=1024 → same KV legality as Gemma4-e4b (SWA layers
 # stay bf16, full-attn layers quantized, K8V4 needs TurboFlash). Heavy models:
@@ -1201,7 +1202,7 @@ assert = { kind = "niah_retrieval" }
 tags = ["run2d", "gemma4", "swa"]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Phase 2e — speculative decoding (LIVE). Real drafter + verifier; the round-loop
+# Speculative decoding (LIVE). Real drafter + verifier; the round-loop
 # must FIRE (accept_rate > 0 in the `<kind>_generate: done` jsonl summary)
 # AND the output must stay coherent. Verifier = Qwen3.6-35B-A3B-8bit (alias
 # QWEN36). Drafters carry their snapshot slug directly in `draft_model` (resolved
@@ -1251,7 +1252,7 @@ assert = { kind = "spec_decode", expect = "Paris" }
 tags = ["run2e", "qwen38", "speculative"]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Phase 2f — modalities + agent surface (LIVE). Image input (vision tower) and
+# Modalities + agent surface (LIVE). Image input (vision tower) and
 # function/tool-calling, the two heavy-use agent paths. Real models, real
 # image, real tool emission. SKIP (clear reason) when a model is absent.
 # ─────────────────────────────────────────────────────────────────────────────

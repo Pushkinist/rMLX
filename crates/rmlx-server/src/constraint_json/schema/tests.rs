@@ -460,7 +460,7 @@ fn property_conforming_values_accepted() {
     assert_eq!(pass, 50);
 }
 
-// ── A6.5: scalar-root engagement tests ──────────────────────────────────────
+// ── Scalar-root engagement tests ──────────────────────────────────────
 
 /// Builds a minimal synthetic bytes map for SchemaConstraint tests.
 fn synthetic_bm(entries: &[&[u8]]) -> Arc<TokenBytesMap> {

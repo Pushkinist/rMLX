@@ -160,7 +160,7 @@ fn rmlx_nax_probe_gpu() {
     assert_eq!(
         v[0], 400,
         "MLX's JIT no longer compiles custom kernel bodies at Metal 4.0 (got {}). \
-         docs/FFI.md records 400 as settled, scripts/check_metal_compiles.sh makes its \
+         docs/FFI.md \"JIT'd body and gets 400\" records it as settled, scripts/check_metal_compiles.sh makes its \
          second pass at -std=metal4.0 on that basis, and the msl CI job runs on a runner \
          image chosen for it. Re-probe, then update all three together: {v:?}",
         v[0]

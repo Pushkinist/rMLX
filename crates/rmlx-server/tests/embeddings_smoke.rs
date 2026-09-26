@@ -189,7 +189,7 @@ async fn non_embedding_model_is_400() {
 // No source shape in this file names the device and no call graph links the
 // `post(port, "/v1/embeddings", ..)` here to `embeddings()` there, so the
 // `#[ignore]` gate cannot infer the Metal context and each carries the
-// `metal-unscanned` marker instead. See docs/TESTING.md.
+// `metal-unscanned` marker instead. See docs/GPU_TESTS.md.
 //
 // The marker deliberately does NOT put them in `scripts/run_gpu_tests.sh`:
 // every one is gated on `RMLX_TEST_MODEL_JINA_V4` and returns early without it,

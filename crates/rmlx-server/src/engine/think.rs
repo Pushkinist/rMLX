@@ -1,4 +1,4 @@
-//! `<think>...</think>` stripping state machine for reasoning models (A3).
+//! `<think>...</think>` stripping state machine for reasoning models.
 
 /// Whether the rendered prompt leaves the assistant turn *inside* an open
 /// thinking block — i.e. the first token the model generates is reasoning.
@@ -39,7 +39,7 @@ pub(crate) fn prompt_leaves_think_open(rendered: &str, start: &str, end: &str) -
     }
 }
 
-// ── A3: <think>/</think> stripping state machine ─────────────────────────────
+// ── <think>/</think> stripping state machine ─────────────────────────────
 
 /// Tracks `<think>...</think>` boundaries across token pieces and routes
 /// the visible text on either the normal content channel or the reasoning

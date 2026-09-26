@@ -510,9 +510,10 @@ fn softmax(logits: &[f32], inv_temp: f32) -> Vec<f32> {
 
 // ── the pair ─────────────────────────────────────────────────────────────────
 
-/// Resolve the drafter: an operator's override, else the slug under the models
-/// root. Mirrors the sibling equivalence gate so a machine that runs one runs
-/// the other.
+/// Resolve the drafter: `RMLX_DRAFT_TEST_MODEL` first (any directory with a
+/// `config.json`), else the slug under the models root. The equivalence gate
+/// resolves through `common::slug_or_override(.., Role::Sidecar)` instead, so
+/// the two do not always pick the same snapshot.
 fn resolve_drafter() -> common::Gate {
     if let Some(named) = std::env::var(DRAFT_MODEL_VAR)
         .ok()

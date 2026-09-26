@@ -28,7 +28,7 @@ pub(super) fn warn_unsupported(keyword: &str) {
     if g.insert(keyword.to_string()) {
         tracing::warn!(
             keyword,
-            "A6.4: unsupported JSON Schema keyword — degrading that node to `Any`"
+            "unsupported JSON Schema keyword — degrading that node to `Any`"
         );
     }
 }

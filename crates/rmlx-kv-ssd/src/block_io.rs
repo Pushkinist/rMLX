@@ -961,8 +961,7 @@ fn k_turbo_shape<const BITS: u8>(k: Option<&QuantKTurbo<BITS>>) -> Vec<i32> {
 /// The wire layout is the same at both widths — `u32` codes plus `f32` scales,
 /// or the CPU `TurboBlocks` when no GPU mirror is live — so the width only
 /// changes how many code words a token occupies, which the store already
-/// carries in `gpu_words_per_step`. Trims GPU buffers to the filled prefix
-/// (C3 trim).
+/// carries in `gpu_words_per_step`. Trims GPU buffers to the filled prefix.
 #[allow(
     clippy::indexing_slicing,
     reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
@@ -1033,7 +1032,7 @@ fn csv(shape: &[i32]) -> String {
 
 /// Write a `QuantK` (q8_0) on the `side` ("k" or "v"). Returns the seq length.
 ///
-/// C3 fix: GPU buffers are allocated in paged increments (KV_PAGE_SIZE
+/// GPU buffers are allocated in paged increments (KV_PAGE_SIZE
 /// multiples) that may exceed the filled prefix. Trim to
 /// `prev_seq * words_per_step` before serialising so the on-disk payload
 /// matches the logical sequence length, preventing OOB slice_update on hydrate.
@@ -1085,7 +1084,7 @@ fn write_quant_k(
     Ok(qk.shape[2])
 }
 
-/// C3 fix: trim GPU buffers to filled prefix before serialising.
+/// Trim GPU buffers to filled prefix before serialising.
 #[allow(
     clippy::indexing_slicing,
     reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
@@ -1132,7 +1131,7 @@ fn write_quant_v(
     Ok(())
 }
 
-/// C3 fix: trim GPU buffers (codes, scales, rotations) to filled prefix.
+/// Trim GPU buffers (codes, scales, rotations) to filled prefix.
 #[allow(
     clippy::indexing_slicing,
     reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"

@@ -413,14 +413,12 @@ const SHARED_LOOP_PATTERN: &str = "SPEWGRIP";
 
 /// What each round loop declares at its edges, and the file that holds it.
 ///
-/// Five facts per loop: which exit skips the resident-KV report, how the loop
+/// Three facts per loop: which exit skips the resident-KV report, how the loop
 /// refuses an empty proposal chain, and which read of the verifier's offset its
 /// round line reports. This table is the statement; the two tests below are
-/// readings of it against today's source. It is data rather than seven assertions because it is what
-/// survives the collapse: the resident-KV disposition is a [`RoundDrafter`]
-/// declaration for a migrated loop, read here against its constant, and each
-/// migration drops its own file from [`LOOP_SOURCES`] and names
-/// [`SHARED_LOOP`] in its row instead, while these rows stay as they are. See
+/// readings of it against the source. The resident-KV disposition is a
+/// [`RoundDrafter`] declaration, read here against its constant; a row whose
+/// loop is the shared one names [`SHARED_LOOP`]. See
 /// `docs/SPEC_ROUND_SKELETON.md`.
 const DISPOSITIONS: [(
     SpecLoop,
@@ -585,7 +583,8 @@ fn marks_line(line: &str, mark: char, needle: &str) -> bool {
 /// to what it claims is between "the call is written here" and "the call runs
 /// and reports the verifier's caches": a report at the declared position inside
 /// a branch that never executes reads identical, and so does one handed the
-/// drafter's stack. See the mutation table in `docs/SPEC_ROUND_SKELETON.md`.
+/// drafter's stack. See `docs/SPEC_ROUND_SKELETON.md` § "What no runtime check
+/// sees".
 ///
 /// Mutation: move any loop's `report_verifier_kv_bytes` call above its early
 /// return, or below the head of its round loop, or delete it.
@@ -693,8 +692,9 @@ fn every_loop_reports_the_verifiers_resident_kv_at_the_exit_it_declares() {
 /// left is the source: the refusal deleted from the loop, which reads zero
 /// against a wanted one, and the refusal stated twice, which reads two. Those
 /// are the mutations this test is for from here, and neither is hypothetical —
-/// the first is the "empty-chain refusal lost" row of the mutation table in
-/// `docs/SPEC_ROUND_SKELETON.md`, which nothing at runtime covers.
+/// the first is the "empty-chain refusal lost" row of
+/// `docs/SPEC_ROUND_SKELETON.md` § "What no runtime check sees", which nothing
+/// at runtime covers.
 ///
 /// Mutation: delete `draft_tokens.is_empty()` from the loop; state it twice.
 #[test]

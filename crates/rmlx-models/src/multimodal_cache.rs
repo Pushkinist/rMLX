@@ -418,7 +418,7 @@ impl MultimodalCache {
             self.emit_event("mm_cache_miss", 1.0, "");
             return None;
         }
-        // L4: clone first; only bump `last_used` + `hits` on success.
+        // Clone first; only bump `last_used` + `hits` on success.
         let Some(first) = entry.arrays.first() else {
             drop(inner);
             self.misses.fetch_add(1, Ordering::Relaxed);
@@ -432,7 +432,7 @@ impl MultimodalCache {
             return None;
         };
         let bytes = entry.byte_size;
-        // L6: only bump tick on a confirmed hit.
+        // Only bump tick on a confirmed hit.
         let now = self.tick.fetch_add(1, Ordering::Relaxed) + 1;
         entry.last_used = now;
         self.hits.fetch_add(1, Ordering::Relaxed);
@@ -459,7 +459,7 @@ impl MultimodalCache {
             self.emit_event("mm_cache_miss", 1.0, "");
             return None;
         };
-        // L4: read every clone into a scratch Vec first; only on full success
+        // Read every clone into a scratch Vec first; only on full success
         // do we touch `last_used` / `hits`. A partial-clone failure must not
         // distort LRU.
         let mut out = Vec::with_capacity(entry.arrays.len());
@@ -476,7 +476,7 @@ impl MultimodalCache {
         }
         let bytes = entry.byte_size;
         let arrays_len = entry.arrays.len();
-        // L6: only bump tick on a confirmed hit.
+        // Only bump tick on a confirmed hit.
         let now = self.tick.fetch_add(1, Ordering::Relaxed) + 1;
         entry.last_used = now;
         self.hits.fetch_add(1, Ordering::Relaxed);

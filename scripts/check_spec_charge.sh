@@ -3,9 +3,10 @@
 # phase-charge decision, and it names it everywhere the decision is read.
 #
 # WHY
-#   A round loop decides once whether its phases are charged for the work they
-#   issue — `phases_charged()` in three loops, a literal `false` in four — and
-#   then repeats that decision in two unrelated places: the `charge` argument of
+#   Each of the seven entries decides once whether its request's phases are
+#   charged for the work they issue — `phases_charged()` in three, a literal
+#   `false` in four — and hands it to the one round loop, which repeats that
+#   decision in two unrelated places: the `charge` argument of
 #   every `rollback_round(...)` it makes, and the `charged:` field of
 #   every `RoundReport` it logs and of the `RoundTotals` it hands the one
 #   recorder. Nothing holds the two together. A loop whose rollback charges and whose record says it did not
@@ -21,10 +22,9 @@
 #   gate is for.
 #
 # THE THREE POPULATIONS, ALL DERIVED
-#   The seven loops are collapsing onto one shared loop that is handed its
-#   decision as a value. So the decision moves out of the loop and into the fn
-#   that starts one, and this gate follows it rather than staying on the shape
-#   it used to have. Nothing below is a name list.
+#   The seven paths share one loop that is handed its decision as a value, so
+#   the decision lives in the fn that starts the loop, and this gate reads it
+#   there. Nothing below is a name list.
 #
 #   (a) ROUND LOOPS. Two conditions, both structural, neither a count:
 #         (a1) the signature rule `check_spec_sampling.sh` uses — a fn whose

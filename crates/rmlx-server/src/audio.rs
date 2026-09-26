@@ -1,5 +1,5 @@
 //! Audio API endpoints: POST /v1/audio/transcriptions, /v1/audio/translations,
-//! and POST /v1/audio/speech (TTS — Phase 4b pending).
+//! and POST /v1/audio/speech (Qwen3-TTS).
 //!
 //! ## API shape (OpenAI-compatible)
 //!
@@ -212,7 +212,7 @@ async fn handle_audio(state: AppState, mut multipart: Multipart, task: WhisperTa
             .into_response();
     };
 
-    // 4. C5 admission gate — audio holds the GPU; go through the same FIFO
+    // 4. Admission gate — audio holds the GPU; go through the same FIFO
     //    semaphore as LLM chat routes for fairness + 429 backpressure.
     let guard =
         match admit_request(&state.gpu_queue, &state.gpu_pending, state.max_queue_depth).await {
@@ -549,7 +549,7 @@ fn build_response(
     }
 }
 
-// ── POST /v1/audio/speech (TTS — Phase 4b) ────────────────────────────────────
+// ── POST /v1/audio/speech (TTS) ───────────────────────────────────────────────
 //
 // Accepted body fields:
 //   model          — model identifier (e.g. "qwen3-tts", "tts-1")

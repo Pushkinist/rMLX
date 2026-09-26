@@ -41,12 +41,9 @@
 prompt = "Describe a sunrise in three sentences."
 max_tokens = 64
 # Fluent-prose detector: at least five words separated by any whitespace or
-# ASCII punctuation. Updated 2026-06-02: the original separator class
-# `[ ,.';:!?-]` excluded `\n`, `\t`, and markdown symbols (`*`, `#`),
-# causing the gate to incorrectly reject thinking-model output (Bonsai /
-# Qwen3.6 emit <think> blocks with structured markdown before the actual
-# answer). Using `\s` in the separator class allows any whitespace including
-# newlines, matching word sequences across multiple lines in thinking content.
+# ASCII punctuation. The separator class takes `\s` and the markdown symbols
+# `*` and `#`, because thinking models (Bonsai / Qwen3.6) emit <think> blocks
+# with structured markdown and newlines before the answer.
 # The min_printable_ratio guard (0.95) still catches pure-binary or
 # null-byte outputs. Incoherent repetition loops are caught by the multi-word
 # requirement: a model stuck emitting the same token cannot produce 5 distinct
@@ -58,26 +55,21 @@ min_printable_ratio = 0.95
 prompt = "List 3 benefits of regular exercise. Number them 1, 2, 3."
 max_tokens = 96
 # Require the digits 1, 2, 3 to appear in sequence anywhere in the output.
-# Updated 2026-06-02: the original regex `(?s).*1[.)].*2[.)].*3[.)]` required
-# the numerals as explicit list markers (`1.` or `1)`) in order, which thinking
-# models (Bonsai/Qwen3.6) fail in raw text-completion mode because they
-# continue the prompt format rather than producing a formatted list.
-# The `\b1\b` variant also fails: Rust Debug format escapes `\n` as `\\n`
-# (two chars: `\` + `n`), so extracted decoded text has `n` adjacent to
-# digits (`\\n1.`). `\b` requires a non-word char before `1`; `n` is `\w`
-# so `\b1` does not fire. Minimal correct form `(?s)1.*2.*3` matches digits
-# in sequence with any intervening content, including the prompt echo
-# `Number them 1, 2, 3.` and properly formatted `1.`/`2.`/`3.` lists.
+# Explicit list markers (`1.` / `1)`) are not required: thinking models
+# (Bonsai/Qwen3.6) in raw text-completion mode continue the prompt format
+# rather than producing a formatted list. `\b1\b` does not work either: Rust
+# Debug format escapes `\n` as `\\n`, so the decoded text has `n` adjacent to
+# the digit and `\b` does not fire. `(?s)1.*2.*3` matches the digits in
+# sequence with any intervening content, including the prompt echo.
 validate_regex = "(?s)1.*2.*3"
 min_printable_ratio = 0.95
 
 [prompts.multi_turn]
 # Short-context recall probe: the seed fact ("red and white") appears in
-# immediate context and the model must echo it back. This replaces the
-# original multi-turn `User:`/`Assistant:` format (2026-06-02 fix): Gemma4 in
-# raw text-completion mode does not use `User:`/`Assistant:` as turn
-# delimiters and answers "I don't have a specific color" without referencing
-# the colour from the prompt. The underlying KV-cache coherence property we
+# immediate context and the model must echo it back. A `User:`/`Assistant:`
+# format does not work: Gemma4 in raw text-completion mode does not use those
+# as turn delimiters and answers without referencing the colour from the
+# prompt. The underlying KV-cache coherence property we
 # care about — "does the codec retain recently-seen tokens?" — is equally
 # well tested by a single-paragraph proximity-recall format that is
 # arch-independent (no chat-template markup, no role labels).

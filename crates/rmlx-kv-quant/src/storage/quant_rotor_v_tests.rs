@@ -175,7 +175,7 @@ fn multi_append_matches_single_shot_gqa<const BITS: u8>() {
     );
 }
 
-/// Falsifies #284: at `kv_h > 1`, `truncate_to(n)` must keep exactly the
+/// At `kv_h > 1`, `truncate_to(n)` must keep exactly the
 /// leading blocks covering sequence `[0, n)`, not `floor(n / kv_h)` of them.
 ///
 /// Builds one block per token (CPU-only, no GPU ring ever touched), truncates
@@ -241,7 +241,7 @@ fn truncate_to_kv_h_gt_1_keeps_exact_prefix<const BITS: u8>() {
 
         let decoded = store
             .dequant()
-            .expect("dequant must succeed after truncate at kv_h>1 (#284)");
+            .expect("dequant must succeed after truncate at kv_h>1");
 
         let mut reference =
             QuantRotorV::<BITS>::new(vec![1_i32, kv_h as i32, 0, head_dim as i32], 64, 5);

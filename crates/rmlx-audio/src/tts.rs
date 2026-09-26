@@ -3,17 +3,17 @@
 // tightly coupled generation loop; splitting would obscure the data flow.
 // Estimated LOC: ~1800. Justified by architecture complexity.
 
-//! Qwen3-TTS speech synthesis pipeline — Phase 4b full implementation.
+//! Qwen3-TTS speech synthesis pipeline.
 //!
 //! Synthesizes mono 24 kHz PCM from text via two stages:
 //!
-//! **Stage 1 — Talker** (`talker.*` weights, `mlx-community__Qwen3-TTS-*-CustomVoice-8bit`):
+//! **Talker** (`talker.*` weights, `mlx-community__Qwen3-TTS-*-CustomVoice-8bit`):
 //! - 28-layer Qwen3 transformer with MRoPE, per-head q/k RMSNorm, affine-8bit weights
 //! - `text_projection` (fc1/fc2): projects text embeddings into talker hidden space
 //! - `codec_head`: affine-8bit LM head over audio token vocabulary
 //! - `code_predictor`: 5-layer mini-Qwen3, generates 16 codec groups per step
 //!
-//! **Stage 2 — Codec decoder** (`decoder.*` weights, `Qwen__Qwen3-TTS-Tokenizer-12Hz`):
+//! **Codec decoder** (`decoder.*` weights, `Qwen__Qwen3-TTS-Tokenizer-12Hz`):
 //! - SplitRVQ: 16 codebooks (1 semantic + 15 acoustic), each 2048×256, projected to 512
 //! - Pre-conv (k=3, 512→1024) + 8-layer pre-transformer (hidden=512, out=1024)
 //! - 2× ConvNeXt upsample (stride=2 each)
@@ -626,7 +626,7 @@ impl CodePredictor {
 
 // ── Codec decoder ─────────────────────────────────────────────────────────────
 
-/// Single VQ codebook. Embedding = embedding_sum / max(cluster_usage, 1).
+/// Single VQ codebook. Embedding = embedding_sum / max(cluster_usage, 1e-5).
 struct VqCodebook {
     embed: Array, // [2048, 256] f32 — pre-normalized embedding table
 }

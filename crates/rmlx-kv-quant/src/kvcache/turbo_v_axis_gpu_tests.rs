@@ -3,10 +3,9 @@
 //! `tsym_update` resolves the V device from the code width: the caller's
 //! device at 4 bits, `Device::Cpu` at 3. That rule is invisible to every CPU
 //! test in the tree, because on a `Device::Cpu` drive the caller's device *is*
-//! `Device::Cpu` and the two answers coincide. `docs/KV_TURBO_TWINS.md` §4
-//! records the mutation that proves it: routing the 3-bit V axis to the
-//! caller's device leaves all eight cells of
-//! `kvcache::turbo_store_bytes_tests` green.
+//! `Device::Cpu` and the two answers coincide: routing the 3-bit V axis to the
+//! caller's device leaves every cell of `kvcache::turbo_store_bytes_tests`
+//! green. `docs/KV_UPDATE_PATH.md` § "TurboQuant" states the rule.
 //!
 //! This file is the drive that sees it. It is the GPU twin of that oracle's
 //! own drive — `KvCache::update` with `in_prefill` false and no bf16 seed,

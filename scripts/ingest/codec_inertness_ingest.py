@@ -18,7 +18,7 @@ identity, not a measurement, and `observations` stores reals.
 
 A sweep run at non-default `--kv-boundary-layers` lands in a cell of its own:
 the probe records the counts in a `kv_boundary` column and the record carries
-them as `decode_config` (`docs/METRICS_DB.md` §3.2). Those cells do not rank
+them as `decode_config` (`docs/METRICS_SCHEMA.md` §3.2). Those cells do not rank
 against a default-boundary sweep, which is the point — a different head/tail
 count is a different engine configuration, not another sample of one.
 

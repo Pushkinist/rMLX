@@ -3,7 +3,7 @@
 //! Reads `tokenizer.json` (via the `tokenizers` crate) and
 //! `tokenizer_config.json` (via serde_json) from a model directory.
 //!
-//! Stage 1.7 — prompt pipeline.
+//! Prompt pipeline.
 
 use std::collections::HashMap;
 use std::path::Path;

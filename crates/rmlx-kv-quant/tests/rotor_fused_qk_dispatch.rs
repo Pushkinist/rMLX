@@ -20,7 +20,7 @@
 //
 // Every test here builds its caches under a fused-QK policy. The gate-off
 // behaviour (asym codecs reach no rotor kernel and serve from the warm bf16
-// mirror) is the shipped default and is documented in `docs/KV_QUANT.md`, not
+// mirror) is the shipped default and is documented in `docs/KV_ROTATION_CODECS.md`, not
 // asserted here.
 //
 // `#[ignore]`-gated because they need the GPU; run via:

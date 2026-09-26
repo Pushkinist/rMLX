@@ -1,6 +1,6 @@
-//! A6.4/A6.5 `SchemaConstraint` — `ConstraintEngine` impl for `response_format: json_schema`.
+//! `SchemaConstraint` — `ConstraintEngine` impl for `response_format: json_schema`.
 //!
-//! Reuses the `TokenBytesMap` + think-phase warm-up + engage logic from A6.3;
+//! Reuses the `TokenBytesMap` + think-phase warm-up + engage logic from `JsonObjectConstraint`;
 //! the inner grammar is schema-driven (`SchemaGrammar`).
 
 #![allow(
@@ -21,7 +21,7 @@ use super::super::TokenBytesMap;
 use super::grammar::{is_only_fence_or_whitespace, SchemaGrammar};
 use super::types::{EngagePolicy, SchemaError, SchemaNode};
 
-/// `ConstraintEngine` for `response_format: json_schema`. Reuses A6.3's
+/// `ConstraintEngine` for `response_format: json_schema`. Reuses `JsonObjectConstraint`'s
 /// `TokenBytesMap` + think-phase warm-up + engage logic; the inner grammar
 /// is schema-driven.
 ///
@@ -68,7 +68,7 @@ impl std::fmt::Debug for SchemaConstraint {
 
 impl SchemaConstraint {
     /// Build a constraint: parse the schema, then precompute the
-    /// token-bytes map (same ~600 ms one-time cost as A6.3).
+    /// token-bytes map (the same one-time cost as `JsonObjectConstraint`).
     ///
     /// Returns `Err(SchemaError)` if the schema is malformed; the handler
     /// maps this to HTTP 400.
@@ -385,7 +385,7 @@ impl ConstraintEngine for SchemaConstraint {
                 EngagePolicy::ValueStarter => {
                     // Container root: engage when the first non-whitespace
                     // byte is a legal value-starter for this schema (e.g.
-                    // `{` or `[`). This is the A6.3 strategy — safe because
+                    // `{` or `[`). This is the `JsonObjectConstraint` strategy — safe because
                     // instruction-tuned models reliably emit the structural
                     // opener as their first answer byte for object/array
                     // schemas.

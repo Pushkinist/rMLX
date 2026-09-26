@@ -32,16 +32,16 @@ pub(super) async fn generate_blocking(
     replay_plan: Option<crate::retry::RequestPlan>,
     model_id: &str,
     parser_format: Option<ToolCallFormat>,
-    // F1: drainer handle + ctx_max for TTFT/token-count DB emission.
+    // Drainer handle + ctx_max for TTFT/token-count DB emission.
     request_start: Instant,
     metrics_drainer: Option<&crate::metrics_drainer::DrainerHandle>,
     ctx_max: i64,
-    // F14: process-lifetime token counters shared with AppState.
+    // Process-lifetime token counters shared with AppState.
     tokens_in: &Arc<std::sync::atomic::AtomicU64>,
     tokens_out: &Arc<std::sync::atomic::AtomicU64>,
-    // F10: correlation id resolved at handler entry.
+    // Correlation id resolved at handler entry.
     request_id: &str,
-    // F8: per-category error counters shared with AppState.
+    // Per-category error counters shared with AppState.
     error_counts: &crate::openai::ApiErrorCounters,
     // request lifecycle counters.
     requests_completed: &Arc<std::sync::atomic::AtomicU64>,
@@ -79,14 +79,14 @@ pub(super) async fn generate_blocking(
         None => generator.generate(req),
     };
     let mut text = String::new();
-    // A3: accumulate reasoning text into a separate buffer; it becomes
+    // Accumulate reasoning text into a separate buffer; it becomes
     // a leading `thinking` content block in the response when non-empty.
     let mut thinking = String::new();
     let mut finish_reason: Option<String> = None;
     let mut output_tokens: u32 = 0;
-    // F1a: TTFT for non-streaming — measured when the first token arrives.
+    // TTFT for non-streaming — measured when the first token arrives.
     let mut ttft_ms_blocking: Option<u64> = None;
-    // A5.5: instantiate parser when caller supplied a format. `None` means
+    // Instantiate parser when caller supplied a format. `None` means
     // tools-disabled — every non-thinking piece flows straight to `text`.
     let mut parser: Option<ToolCallStreamParser> = parser_format.map(ToolCallStreamParser::new);
     let mut tool_calls_accum: Vec<ParsedToolCall> = Vec::new();
@@ -100,7 +100,7 @@ pub(super) async fn generate_blocking(
                 return engine_error_response(&e);
             }
             Ok(tok) => {
-                // F1a + : capture TTFT on the very first token and
+                // Capture TTFT on the very first token and
                 // immediately persist to the events table off the tokio worker
                 // so TTFT survives mid-stream errors.
                 if output_tokens == 0 {
@@ -138,7 +138,7 @@ pub(super) async fn generate_blocking(
                         });
                     }
                 }
-                // A5.5 / A5.6: feed the parser regardless of think state —
+                // Feed the parser regardless of think state —
                 // some reasoning models emit the tool call without closing
                 // `</think>`, so a thinking-only routing would never let the
                 // parser see the `<tool_call>` block. Parser passthrough is
@@ -176,7 +176,7 @@ pub(super) async fn generate_blocking(
         }
     }
 
-    // A5.5: drain residual passthrough + completed tool_calls from the parser.
+    // Drain residual passthrough + completed tool_calls from the parser.
     if let Some(p) = parser.as_mut() {
         if !p.passthrough_text.is_empty() {
             text.push_str(&p.passthrough_text);
@@ -207,7 +207,7 @@ pub(super) async fn generate_blocking(
         None
     };
 
-    // F1: emit TTFT + token counts to SQLite via the SPSC drainer.
+    // Emit TTFT + token counts to SQLite via the SPSC drainer.
     // Single-source: same counters that populate the Anthropic `usage` body.
     if let Some(drainer) = metrics_drainer {
         use crate::metrics_drainer::{MetricEvent, MetricKind};
@@ -236,7 +236,7 @@ pub(super) async fn generate_blocking(
             kind: MetricKind::CompletionTokens(output_tokens),
         });
     }
-    // F14: increment process-lifetime token counters (single source: same
+    // Increment process-lifetime token counters (single source: same
     // values as the SPSC drainer emit above; no double-count possible).
     tokens_in.fetch_add(
         u64::from(input_token_count),
@@ -285,11 +285,11 @@ pub(super) async fn generate_blocking(
         let terminal = map_stop_reason(finish_reason.as_deref());
         select_anthropic_stop_reason(any_tool_use, terminal)
     };
-    // F10: use the correlation id resolved at handler entry so that the
+    // Use the correlation id resolved at handler entry so that the
     // response body and the X-Request-Id header always agree.
     let id = format!("msg_{request_id}");
 
-    // A3+A5.5: emit thinking block first (if any), then text block (if any),
+    // Emit thinking block first (if any), then text block (if any),
     // then a tool_use block per parsed call. The text block is suppressed
     // when empty AND there is at least one tool_use block, so a pure
     // tool-call response is not padded with an empty `text` block.
@@ -298,7 +298,7 @@ pub(super) async fn generate_blocking(
         content.push(ContentBlock::Thinking { thinking });
     }
     if !text.is_empty() || !any_tool_use {
-        // Preserve pre-A5.5 behaviour: when no tool_use is present, always
+        // When no tool_use is present, always
         // emit the (possibly empty) text block. With tool_use, only emit it
         // when non-empty.
         content.push(ContentBlock::Text { text });
@@ -323,7 +323,7 @@ pub(super) async fn generate_blocking(
         },
     };
 
-    // F10: echo the correlation id as a response header.
+    // Echo the correlation id as a response header.
     let mut resp = (StatusCode::OK, Json(response)).into_response();
     if let Ok(hv) = HeaderValue::from_str(request_id) {
         resp.headers_mut().insert("x-request-id", hv);

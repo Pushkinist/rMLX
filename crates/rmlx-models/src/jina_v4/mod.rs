@@ -25,7 +25,7 @@
 //! (future) — M-RoPE merge / image-span pooling
 //! ```
 //!
-//! ## Key design decisions (from docs/jina-v4-recon.md)
+//! ## Key design decisions
 //!
 //! - LoRA key prefix: `base_model.model.model.language_model.layers.{N}.<proj>.lora_{A,B}.<task>.weight`
 //!   (note the `.language_model.` segment). Always enumerate from the actual

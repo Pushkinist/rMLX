@@ -29,10 +29,8 @@
 ///   compressed, external bytes.
 ///
 /// # Consumer note
-/// This module is a pure telemetry primitive. Wiring into the F1 metrics
-/// drainer / `MetricKind` registry is deferred to **J6** (healthcheck
-/// endpoint), which will own the registered `MetricKind::ProcMem` variant.
-/// Do not add ad-hoc drainer calls here — unregistered metrics are WARN-dropped
+/// This module is a pure telemetry primitive, not wired into the metrics
+/// drainer or the `MetricKind` registry. Do not add ad-hoc drainer calls here — unregistered metrics are WARN-dropped
 /// per the metrics-DB hard rule.
 #[cfg(target_os = "macos")]
 mod imp {

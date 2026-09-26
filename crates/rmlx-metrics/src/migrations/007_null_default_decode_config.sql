@@ -1,8 +1,8 @@
 -- Migration 007: a `decode_config` that spells the engine's own defaults is
 -- NULL.
 --
--- §3.2 says NULL is the engine at its defaults. A row that instead spells the
--- defaults out is a second spelling of one configuration, and two spellings are
+-- docs/METRICS_SCHEMA.md §3.2 says NULL is the engine at its defaults. A row
+-- that instead spells the defaults out is a second spelling of one configuration, and two spellings are
 -- two cells: neither ranks against the other, and both look like champions of
 -- whatever they contain. A boundary-layer campaign filed 61 rows as
 -- `kv_boundary/head=2,kv_boundary/tail=8` — an explicit spelling of the shipped

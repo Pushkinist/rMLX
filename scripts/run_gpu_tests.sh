@@ -29,7 +29,7 @@
 #   select it and the coverage check below would read the whole crate as
 #   under-matched. Those tests are still ENFORCED by the classifier, at their
 #   `macro_rules!` body; the enforcing run prints the excluded set. See
-#   docs/TESTING.md.
+#   docs/GPU_TESTS.md.
 #
 #   It deliberately does NOT run every `#[ignore]` test. Plenty are ignored for
 #   reasons that have nothing to do with Metal — live network access, a missing
@@ -436,7 +436,7 @@ if [ -n "${HALF}" ]; then
         echo >&2
         echo "Every classified GPU test belongs to exactly one half, or it runs under" >&2
         echo "no gate. Fix scripts/gpu_test_halves.sh, or run the whole suite with no" >&2
-        echo "--half. See docs/TESTING.md." >&2
+        echo "--half. See docs/GPU_TESTS.md." >&2
         exit 1
     fi
 fi
@@ -727,7 +727,7 @@ if [ "${n_stood_down}" -gt 0 ] || [ "${n_unattributed}" -gt 0 ]; then
         echo "  ${n_unattributed} further stand-down notice(s) named no test, or named something"
         echo "  that is not a classified GPU test in that crate, and could not be attributed."
         echo "  A cell that stands down must print 'SKIP <its own test fn>: <why>', or its"
-        echo "  absence is invisible here and to the census pin. See docs/TESTING.md."
+        echo "  absence is invisible here and to the census pin. See docs/GPU_TESTS.md."
     fi
     echo
 fi
@@ -902,7 +902,7 @@ if [ "${SHADER_VALIDATION}" = "1" ]; then
         echo "is benign, with the reference to that analysis in the entry. A count that" >&2
         echo "came in under the expectation, or a kernel that stopped firing, means the" >&2
         echo "pin is stale: re-derive it from a full run rather than editing it to fit" >&2
-        echo "this one. See docs/TESTING.md." >&2
+        echo "this one. See docs/GPU_TESTS.md." >&2
         echo >&2
         red=1
     elif [ -n "${census_notes}" ]; then
@@ -928,7 +928,7 @@ if [ -n "${failed_crates}" ]; then
     echo "attributing a failure above to your change, re-run the same crate and" >&2
     echo "filter on a clean checkout of your base commit and compare: that is the" >&2
     echo "only thing that separates a regression you caused from one you inherited," >&2
-    echo "and it is cheap. See docs/TESTING.md." >&2
+    echo "and it is cheap. See docs/GPU_TESTS.md." >&2
     echo "A crate reported as 'ran uninstrumented' usually failed to BUILD: no test" >&2
     echo "binary means no Metal device and therefore no validation banner." >&2
     red=1

@@ -1037,7 +1037,7 @@ if [ -n "$warnings" ]; then
     echo "  * it is ignored for some other reason — say THAT reason in the #[ignore]" >&2
     echo "    text instead of claiming Metal." >&2
     echo >&2
-    echo "See docs/TESTING.md." >&2
+    echo "See docs/GPU_TESTS.md." >&2
     exit 1
 fi
 
@@ -1066,7 +1066,7 @@ if [ -n "$declared_unscanned" ]; then
     echo "validation banner per crate, and these are snapshot-gated or drive a child" >&2
     echo "process, so listing them would fail the suite for a missing model):" >&2
     printf '%s' "$declared_unscanned" >&2
-    echo "  -> No gate executes these. See docs/TESTING.md for each one's coverage." >&2
+    echo "  -> No gate executes these. See docs/GPU_TESTS.md for each one's coverage." >&2
     echo >&2
 fi
 

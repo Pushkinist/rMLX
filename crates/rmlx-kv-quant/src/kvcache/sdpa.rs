@@ -287,26 +287,12 @@ impl KvCache {
         // `update_decode_fp16`) before it knows whether it can complete the
         // SDPA, and the legacy fallback would then double-append.
         //
-        // Warm-TTFT gate: every other quant (K8V4/K8V8/Planar/Mixed/
-        // K8VTurbo*/Iso*/Rotor*/TurboSym*) uses the bf16 K seed materialised in
-        // `decode_fp16_k` by `exit_prefill` for the entire post-prefill decode
-        // window — `update_<arch>` checks `self.decode_fp16_k.is_some()` and
-        // shortcuts to `update_decode_fp16`. Without this gate PlanarK was the
-        // SOLE codec that re-encoded K through the lossy 4-bit Lloyd-Max +
-        // Givens rotation kernel on every decode step, while K8V4 etc. silently
-        // stayed in bf16. On Bonsai NIAH 8k d50 that asymmetry caused
-        // `niah_pflash_bonsai_8k_d50` to fail retrieval (decoded text =
-        // `"9. The secret. The grass…"`) while `niah_bonsai_8k_d50` (K8V4 storage,
-        // bf16-warm K) passes. Honour the same warm-TTFT contract here: when the
-        // bf16 K seed is live, fall through to the legacy bf16 SDPA path. The
-        // explicit `--planar-fused-qk on` CLI override still reaches the fused
-        // kernel via the next branch's fall-through (the K seed is only set on
-        // the first `KvCache` of a request; later requests with a fresh cache
-        // hit `decode_fp16_k.is_none()` and the fused path fires).
-        //
-        // See `docs/reports/planar-chunked-prefill-fix.md` § "Followups"
-        // for the open question of whether warm-TTFT-as-default is the intended
-        // steady-state design for the entire quantised-KV surface.
+        // Warm-TTFT gate: when `exit_prefill` left a bf16 K seed in
+        // `decode_fp16_k`, PlanarK decodes from it like every other
+        // mirror-fed codec (`docs/KV_CACHE.md` §9.6), and the fused-QK /
+        // flash-decode kernels stay dormant. Without the gate PlanarK would
+        // re-encode K through its lossy 4-bit Givens kernel on every decode
+        // step. Only a cache with no seed reaches the fused path.
         if matches!(self.storage, KvStorage::PlanarK { .. })
             && planar_fused_qk_enabled()
             && device == Device::Gpu

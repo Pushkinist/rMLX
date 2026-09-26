@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# rmlx-vs-fork.sh — G5 parity gate: does rMLX agree with the mlx-lm-turboquant
+# rmlx-vs-fork.sh — parity gate: does rMLX agree with the mlx-lm-turboquant
 # fork on the first 32 tokens for real qwen-pm-style prompts at temperature=0?
 #
 # This is a GO/NO-GO harness. It does NOT flip any pi config. It launches one
@@ -23,7 +23,7 @@
 # unambiguous deterministic default — fp16 KV (no turbo flags) — as the PRIMARY
 # parity reference (no fabricated/guessed turbo mapping), and additionally
 # capture the closest real turbo config (turbo-kv-bits 4 + turbo-v-bits 4) as
-# informational divergence context. See the G5 report.
+# informational divergence context.
 #   compare         Pure-Python: read the jsonl, tokenize, emit per-prompt and
 #                   mean match rates + verdict to stdout. No backend launched.
 #

@@ -13,21 +13,15 @@
 //!
 //! 1. **The hydrated payload, field by field**, against the store that was
 //!    written: the packed codes, the scales, the per-block original shape and
-//!    bit tag, the accumulated shape and the block count. **This cannot move
-//!    at either width.** The collapse changes no byte on the wire and no byte
-//!    coming back off it.
-//! 2. **`max_seq` on the hydrated K store.** This was the divergence: the
-//!    3-bit hydrate forwarded the geometry's `max_seq` and the 4-bit one
-//!    dropped it, because its `from_cpu_blocks` took no such argument. The
-//!    K-storage collapse resolved it the 3-bit way, so both widths now restore
-//!    the window that was written, and the 4-bit constant below moved from `0`
-//!    to it. `docs/KV_TURBO_TWINS.md` records the decision.
+//!    bit tag, the accumulated shape and the block count, at either width.
+//! 2. **`max_seq` on the hydrated K store.** Both widths restore the window
+//!    that was written. `docs/KV_UPDATE_PATH.md` § "TurboQuant" states the
+//!    rule.
 //!
 //! Field-by-field rather than one digest: a digest names the store, and these
-//! assertions name the field, which is what a reviewer of a collapse needs.
-//! The serialisation helpers the `rmlx-kv-quant` pins share are `pub(crate)`
-//! to that crate and cannot be reached from here; copying them in to build a
-//! digest would plant the twin this campaign removes.
+//! assertions name the field. The serialisation helpers the `rmlx-kv-quant`
+//! pins share are `pub(crate)` to that crate and cannot be reached from here;
+//! copying them in would plant a twin.
 //!
 //! # What it cannot see
 //!

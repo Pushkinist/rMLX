@@ -9,7 +9,8 @@
 //! - `tokenizer` — Whisper BPE tokenizer (GPT-2 vocabulary + special tokens).
 //! - `whisper`   — Whisper encoder + decoder model layers and inference loop.
 //! - `vad`       — Silero VAD v4 (16kHz LSTM-based voice activity detection).
-//!   Used internally for long-audio chunking in the Whisper pipeline.
+//!   Exported, but nothing calls it: long audio is transcribed in 30 s
+//!   windows (`transcribe`).
 //!   Weights vendored in `assets/silero_vad_16k.safetensors` (MIT license).
 //!
 //! ## Design notes
@@ -24,7 +25,7 @@
 //!
 //! - `npz`       — ZIP/NPZ central-directory parser with ZIP64 support.
 //!   Used by `whisper` to load `weights.npz` and by `tts` to load codec weights.
-//! - `tts`       — Qwen3-TTS synthesis pipeline (Phase 4b).
+//! - `tts`       — Qwen3-TTS synthesis pipeline.
 //!
 //! ## Out of scope (v1)
 //!

@@ -6,7 +6,7 @@
 //! Loads `chat_template.jinja` from a model directory and renders it with
 //! the given messages and options. The rendered string is ready for tokenization.
 //!
-//! Stage 1.7 — prompt pipeline.
+//! Prompt pipeline.
 
 #![allow(clippy::needless_pass_by_value)]
 use std::path::Path;
@@ -90,8 +90,8 @@ pub struct RenderedPrompt {
 ///
 /// Tool fields are only populated for multi-turn tool conversations and are
 /// injected into the per-message Jinja context **only when present**, so plain
-/// (no-tool) messages render byte-identically to pre-tool-support output (the
-/// A5.2 invariant: `{% if message.tool_calls %}` stays falsy).
+/// (no-tool) messages render byte-identically to a tool-free render (the
+/// invariant: `{% if message.tool_calls %}` stays falsy).
 #[allow(
     clippy::exhaustive_structs,
     reason = "internal closed template-context struct — five fields are the complete per-message Jinja context contract; adding a field requires updating all ChatMessageTpl construction sites"
@@ -131,7 +131,7 @@ pub struct RenderOpts<'a> {
     /// `{"type":"function","function":{"name":...,"description":...,"parameters":{...}}}`.
     ///
     /// An empty slice causes the Jinja `{% if tools %}` branch to evaluate
-    /// false, so renders without tools are byte-identical to pre-A5.2 output.
+    /// false, so renders without tools are byte-identical to the tool-free render.
     pub tools: &'a [serde_json::Value],
     /// Controls the Qwen3.6 `enable_thinking` template variable.
     ///
@@ -457,7 +457,7 @@ impl ChatTemplate {
         // Build the messages list as a minijinja Value.
         //
         // Plain messages emit exactly {role, content} — byte-identical to
-        // pre-tool-support output (A5.2 invariant). Tool keys are added ONLY
+        // tool-free output. Tool keys are added ONLY
         // when present so `{% if message.tool_calls %}` / `message.role ==
         // "tool"` branches stay inert for ordinary conversation turns.
         let msgs_val: Vec<Value> = messages
@@ -498,10 +498,10 @@ impl ChatTemplate {
         // the think block, same as `None`. The undefined path is the contract;
         // only `Some(false)` changes the rendered output.
 
-        // A5.2: convert the (possibly empty) tools slice into a minijinja
+        // Convert the (possibly empty) tools slice into a minijinja
         // Value. An empty slice serialises as an empty JSON array, which
         // Jinja evaluates as falsy — so `{% if tools %}` is false when no
-        // tools are present and renders byte-identically to pre-A5.2 output.
+        // tools are present and renders byte-identically to the tool-free render.
         let tools_val = Value::from_serialize(opts.tools);
 
         // build the base context; conditionally extend with enable_thinking.

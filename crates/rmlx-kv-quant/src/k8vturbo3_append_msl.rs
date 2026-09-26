@@ -50,19 +50,13 @@
 //!
 //! # Dispatch status
 //!
-//! The bench (Gemma4-e4b / 26b, ctx ~17k) showed that wiring this
-//! GPU kernel into the K8VTurbo3 V-side update path regresses decode TPS
-//! by 3.5% (e4b) and 6.9% (26b) vs the `Mixed{v_bits:3}` affine baseline —
-//! both fail the −2% gate. The CPU dequant path is therefore kept
-//! as the canonical K8VTurbo3 V-side path (`k8_turbo_v_update` in
-//! `kvcache/update_turbo.rs`). This module is retained as a future-reference hook,
-//! with full unit-test coverage of bit-exact CPU↔GPU equivalence so that
-//! re-wiring it later (e.g. once Gemma4-arch PPL coverage exists) is a
-//! one-line change at the dispatch site. See
-//! `docs/research/turboquant_v3_vs_affine_v3.md` "Second pass: Metal
-//! 3-bit kernel" for the bench numbers and verdict.
-
-#![allow(dead_code)] // Future-gated hook, see module-level "Dispatch status".
+//! Two production paths dispatch these kernels: the 3-bit K store
+//! (`QuantKTurbo<3>` GPU append and dequant in `storage/quant_k_turbo.rs`) and
+//! the TurboSym3 fused-QK encode (`kvcache/fused_qk_dispatch.rs`). The
+//! K8VTurbo3 **V** axis does not: it is pinned to the CPU
+//! (`k8_turbo_v_update` in `kvcache/update_turbo.rs`), because
+//! `QuantV::append`'s GPU branch refuses `bits != 4`. Unit tests hold the
+//! kernel bit-exact against the CPU encode.
 
 use crate::turboquant::GROUP_SIZE;
 use rmlx_core::error::Result;

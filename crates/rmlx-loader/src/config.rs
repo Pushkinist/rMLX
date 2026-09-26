@@ -140,7 +140,7 @@ impl ModelConfig {
     /// Returns the value that downstream V-side codec validators (e.g. `tq4`
     /// requires head_dim ∈ {128, 256}) must check against. SWA-only fields
     /// (Gemma3/Gemma4 `head_dim` when `global_head_dim` is also present) are
-    /// **never** returned — SWA layers stay bf16 per D6.7.
+    /// **never** returned — SWA layers stay bf16.
     ///
     /// Resolution order:
     /// 1. If `architectures[0]` is a Gemma3/Gemma4 variant, prefer
@@ -153,8 +153,8 @@ impl ModelConfig {
     ///    `text_config`-nested values first, then the top-level extras.
     /// 5. Otherwise `None`.
     ///
-    /// Returning `None` is a valid outcome — callers must not guess. The T3
-    /// resolver explicitly maps `None` to `HeadDimUnknown`.
+    /// Returning `None` is a valid outcome — callers must not guess. The
+    /// `--cache-type-*` resolver explicitly maps `None` to `HeadDimUnknown`.
     pub fn head_dim(&self) -> Option<usize> {
         let arch = self.architectures.first().map_or("", String::as_str);
         let is_gemma = matches!(

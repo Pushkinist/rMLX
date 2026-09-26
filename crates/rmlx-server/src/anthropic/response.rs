@@ -18,9 +18,9 @@ use serde_json::Value;
 ///
 /// Anthropic encodes block kinds as a tagged JSON object where the text
 /// field key varies by kind: `text` blocks carry `text`, extended-
-/// thinking blocks carry `thinking`. A3 surfaces reasoning-capable
+/// thinking blocks carry `thinking`. Reasoning-capable
 /// architectures' `<think>...</think>` output as a leading `thinking`
-/// block followed by the normal `text` block. A5.5 adds `tool_use`
+/// block followed by the normal `text` block, and `tool_use`
 /// blocks emitted when the model produces a parsed `<tool_call>`.
 ///
 /// Per-variant `rename` is used instead of `rename_all = "lowercase"`
@@ -41,7 +41,7 @@ pub enum ContentBlock {
         /// Reasoning text emitted inside `<think>...</think>`.
         thinking: String,
     },
-    /// A5.5: tool_use block. `input` is a JSON object (NOT a JSON-stringified
+    /// tool_use block. `input` is a JSON object (NOT a JSON-stringified
     /// string — that's OpenAI's `arguments` shape). The Anthropic public ID
     /// prefix is `toolu_`, but reusing the parser's `call_<hex>` ID is
     /// acceptable for v1 — clients treat the field as an opaque string.

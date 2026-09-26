@@ -100,7 +100,7 @@ SHARED_PROTOCOL = ("passes", "warmups_per_pass", "macro_max_tokens", "thinking",
                    "seed_policy")
 
 # The `<drafter>/depth=` term the round loop puts on its own `done` line when it
-# resized its block instead of drafting the configured one (docs/METRICS_DB.md).
+# resized its block instead of drafting the configured one (docs/METRICS_SCHEMA.md §3.2).
 # Reading it here is reading the engine's statement, not keeping a second list
 # of which drafters are adaptive.
 ADAPTIVE_MARKER = "/depth="

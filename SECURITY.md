@@ -2,12 +2,7 @@
 
 ## Supported versions
 
-rMLX is pre-1.0. Security fixes land on the latest released version only.
-
-| Version | Supported |
-|---------|-----------|
-| 0.1.x   | ✅        |
-| < 0.1.0 | ❌        |
+rMLX is pre-1.0. Security fixes land on the latest release only.
 
 ## Reporting a vulnerability
 

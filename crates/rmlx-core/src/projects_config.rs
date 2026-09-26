@@ -24,7 +24,7 @@
 //! The resolved path is `<RMLX_HOME>/projects.toml` (via
 //! [`rmlx_core::paths::projects_toml_path`]). The file is **optional**: a
 //! missing file is a silent no-op (built-in defaults apply). A malformed file
-//! returns `Err` and the CLI surfaces it as a startup error (exit 2).
+//! returns `Err`; `rmlx serve` returns it from `main` (exit 1).
 //!
 //! Edits to the file take effect on the next `rmlx serve` restart (no live
 //! reload). The file is rMLX-read-only: `rmlx` never writes it; the operator

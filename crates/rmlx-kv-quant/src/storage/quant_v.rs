@@ -321,7 +321,7 @@ impl QuantV {
                     Dtype::F32,
                     device,
                 )?;
-                // C1 fix: upload CPU TurboBlocks to GPU when initialising a
+                // Upload CPU TurboBlocks to GPU when initialising a
                 // hydrated layer (prev_seq > 0 and self.blocks non-empty).
                 //
                 // TurboBlocks CPU layout: `codes: Vec<u8>` (4-bit packed, 4 bytes
@@ -366,7 +366,7 @@ impl QuantV {
                         &[1],
                         device,
                     )?;
-                    // H7: tracing event for hydrated QuantV GPU init.
+                    // Tracing event for hydrated QuantV GPU init.
                     tracing::debug!(
                         prev_seq,
                         init_cap,

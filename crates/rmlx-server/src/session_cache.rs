@@ -1,12 +1,12 @@
-//! Per-session KV-reuse registry (N2).
+//! Per-session KV-reuse registry.
 //!
 //! ## Purpose
 //!
 //! Multi-turn conversations share a session ID (`X-Session-Id` header). Each
 //! turn's chat template renders the **full** conversation history, so turn 2's
 //! `prompt_tokens` starts with exactly the same tokens as turn 1. The
-//! per-arch `PromptCache` (N1) already handles prefix matching — N2's job is
-//! to ensure the prior-turn's PromptCache slot is not evicted before the next
+//! per-arch `PromptCache` already handles prefix matching — this module's job
+//! is to ensure the prior-turn's PromptCache slot is not evicted before the next
 //! turn arrives.
 //!
 //! ## How slot reservation works
@@ -23,7 +23,7 @@
 //! When the number of entries hits `max_sessions`, the session with the oldest
 //! `last_used` timestamp is dropped before inserting the new one. Dropped
 //! sessions lose their slot-reservation benefit on subsequent turns — the next
-//! request will still get an N1 cache hit *if* the PromptCache slot has not been
+//! request will still get a prompt-cache hit *if* the PromptCache slot has not been
 //! overwritten (best-effort).
 //!
 //! Default `max_sessions`: `--session-cache-max-sessions` CLI flag (env: `RMLX_SESSION_CACHE_MAX_SESSIONS`), default 64.
@@ -53,7 +53,7 @@ struct SessionEntry {
     last_used: Instant,
     /// Number of prompt tokens in the last request (diagnostics only).
     ///
-    /// Not read back in this crate — kept for future slot-affinity work (M29).
+    /// Not read back in this crate — kept for future slot-affinity work.
     #[allow(dead_code)]
     last_prompt_len: usize,
 }

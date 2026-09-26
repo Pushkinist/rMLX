@@ -417,7 +417,7 @@ mod tests {
         }
     }
 
-    /// Falsifies #284 at the real production entry point: `KvCache::update` →
+    /// At the real production entry point: `KvCache::update` →
     /// dispatch → `QuantIsoV3::append`, then `KvCache::truncate_to` → dispatch
     /// → `QuantIsoV3::truncate_to`, at `kv_h = 4` (`kv_h == 1` is the masked
     /// case that hides the bug — see `kv_cache_truncate_k8v8_path` above,
@@ -428,7 +428,7 @@ mod tests {
     /// sequence position (block boundaries align with truncate targets).
     /// This is the same production path SWA-context-slide, speculative-decode
     /// rollback, and prompt-cache partial-prefix trim all drive — see
-    /// `docs/KV_QUANT.md` for the reachability audit per arch (Bonsai-8B
+    /// `docs/KV_STORE_TRUNCATION.md` for the reachability audit per arch (Bonsai-8B
     /// currently has no live serve trigger; Gemma4's prompt-cache `Partial`
     /// reuse policy does).
     #[test]
@@ -475,16 +475,16 @@ mod tests {
                 assert_eq!(
                     vs.blocks.len(),
                     keep as usize,
-                    "must keep exactly `keep` blocks, not floor(keep / kv_h) (#284)"
+                    "must keep exactly `keep` blocks, not floor(keep / kv_h)"
                 );
                 let kept_rows: usize = vs.blocks.iter().map(|b| b.n_tokens).sum();
                 assert_eq!(
                     kept_rows,
                     keep as usize * kv_h as usize,
-                    "kept rows must equal keep * kv_h, not keep (#284)"
+                    "kept rows must equal keep * kv_h, not keep"
                 );
                 vs.dequant()
-                    .expect("dequant must succeed after truncate at kv_h>1 (#284)");
+                    .expect("dequant must succeed after truncate at kv_h>1");
             }
             _ => panic!("expected IsoV3 storage"),
         }
@@ -839,13 +839,12 @@ mod tests {
 
     /// A boundary layer must never cost more than the `K8V8` it replaces.
     ///
-    /// This is the property the promotion target has to have and the one it
-    /// lost twice over. `K8V8` materialises no packed store, so a layer
-    /// promoted to it holds two full bf16 mirrors — byte-identical to `none`,
-    /// 16 bits per value — and promoting a codec that stores 6.50 there was a
-    /// 2.46x increase, not a floor. Promoting it in-family on a stack that
-    /// *keeps* the mirror is the inverse error: the store is charged on top of
-    /// the two mirrors, 24.50 bits per value, 1.53x the fallback.
+    /// `K8V8` materialises no packed store, so a layer promoted to it holds
+    /// two full bf16 mirrors — byte-identical to `none`, 16 bits per value —
+    /// and promoting a codec that stores 6.50 there would be a 2.46x increase,
+    /// not a floor. Promoting it in-family on a stack that *keeps* the mirror
+    /// is the inverse error: the store is charged on top of the two mirrors,
+    /// 24.50 bits per value, 1.53x the fallback.
     ///
     /// Swept over every base in `ALL_KV_QUANTS` that materialises a packed
     /// store — the population for which the promotion is a byte question at all
@@ -862,10 +861,9 @@ mod tests {
         /// SO(4)-rotated or rotor 3-/4-bit ring cannot be widened to 8 without
         /// leaving the family, so their floor is bought at the fallback rather
         /// than delivered from bytes they already spend. `SideStore::IsoRing`
-        /// is 12.125 bits per value, so the iso four pay a 1.32x byte
-        /// regression for it; `SideStore::Rotor` is 16.25, above bf16, so the
-        /// rotor four are neutral-to-favourable. Recorded in
-        /// `docs/KV_QUANT.md` §Layer-adaptive overrides.
+        /// is 7.125 / 8.125 bits per value and `SideStore::Rotor` 8.75 / 9.75,
+        /// so the fallback's 16.00 costs them more bytes on the boundary
+        /// layers. See `docs/KV_LAYER_POLICY.md` § "Which codec the floor is".
         const FALLBACK_BY_DESIGN: &[KvQuant] = &[
             KvQuant::Iso3Sym,
             KvQuant::Iso4Sym,
@@ -1994,7 +1992,7 @@ mod tests {
         );
     }
 
-    // ── Issue #34: KV-codec net-benefit decision (policy layer) ───────────────
+    // ── KV-codec net-benefit decision (policy layer) ───────────────────────────
 
     /// Build the Gemma4 e2b layer mix: 7 global (head_dim=256, 1 kv head) +
     /// 28 windowed (window=512). Model-agnostic helper — keyed on geometry.
@@ -2357,7 +2355,7 @@ mod tests {
 
     /// The default boundary carries no `decode_config`, so a default run's cell
     /// is the same cell every pre-flag row was written into. Anything else gets
-    /// a cell of its own, spelled in the §3.2 grammar and ordered by key.
+    /// a cell of its own, spelled in the `docs/METRICS_SCHEMA.md` §3.2 grammar and ordered by key.
     #[test]
     fn boundary_decode_config_is_none_at_the_default() {
         assert_eq!(KvBoundary::default().decode_config(), None);

@@ -140,9 +140,9 @@ pub fn classify(err: &RmlxError) -> RetryClass {
 /// - `has_guided_decoding` — the FSM resets on every request; replaying would
 ///   restart the grammar and produce malformed or duplicated JSON.
 ///
-/// The `n > 1` check (OpenAI `n` field) is evaluated at the call site where
-/// the raw request value is still in scope; pass `false` for `n_choices_ok`
-/// when the request set `n > 1`.
+/// `n_choices_ok = false` disables replay. Neither route parses the OpenAI
+/// `n` field, so both callers pass `true` and the parameter never disables
+/// anything today.
 pub fn is_replayable(req: &GenerationRequest, n_choices_ok: bool) -> bool {
     if req.sampling.temperature > 0.0 {
         return false;
@@ -229,9 +229,9 @@ pub struct RequestPlan {
     pub images: Vec<String>,
     /// Base64-encoded audio payloads attached to this request.
     pub audio_b64: Vec<String>,
-    /// Issue #26: per-request KV-quant codec override (`None` = launch default).
+    /// Per-request KV-quant codec override (`None` = launch default).
     pub kv_quant_override: Option<rmlx_kv_quant::KvQuant>,
-    /// Issue #26: per-request max-ctx ceiling override (`None` = launch default).
+    /// Per-request max-ctx ceiling override (`None` = launch default).
     pub max_ctx_override: Option<i32>,
     /// Per-request image-token budget override (`None` = launch default).
     pub image_max_tokens: Option<usize>,

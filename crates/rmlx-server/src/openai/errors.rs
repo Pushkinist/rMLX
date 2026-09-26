@@ -57,7 +57,7 @@ pub(crate) fn internal_error(message: &str) -> Response {
 pub enum SamplingSource {
     /// Parameter came from the inbound request body.
     Request,
-    /// G4: `--default-temperature` server-startup flag.
+    /// `--default-temperature` server-startup flag.
     ServerDefault,
     /// Parameter fell back to the model's `generation_config.json` defaults.
     ModelDefaults,
@@ -78,17 +78,17 @@ impl SamplingSource {
 }
 
 /// Resolve all sampling parameters from the four-tier fallback chain:
-/// **request > server default (G4) > model `generation_defaults` (A4) > hard-coded default**.
+/// **request > server default > model `generation_defaults` > hard-coded default**.
 ///
 /// `temperature` and `top_p` also return a `SamplingSource` label for the
-/// existing trace log. The remaining fields (A7.1) never fall back to model
+/// existing trace log. The remaining fields never fall back to model
 /// defaults for the ones not in `generation_config.json` (`frequency_penalty`,
 /// `presence_penalty`, `min_p`, `logit_bias`); `top_k` and `repetition_penalty`
 /// do fall back to model defaults because `GenerationConfig` already parses them.
 ///
-/// `server_default_temperature` — from `AppState::default_temperature` (G4
-/// `--default-temperature` flag). `None` = absent (behaviour unchanged). When
-/// `Some(t)` and the request omits temperature, `t` takes precedence over the A4
+/// `server_default_temperature` — from `AppState::default_temperature`
+/// (`--default-temperature` flag). `None` = absent. When `Some(t)` and the
+/// request omits temperature, `t` takes precedence over the
 /// `generation_config.json` value. An explicit request `temperature` always wins.
 ///
 /// `logit_bias_raw` — the JSON string-keyed map from the OpenAI request. Absent
@@ -214,10 +214,10 @@ pub(crate) fn enforce_max_tokens_cap(
     }
 }
 
-/// J3: build the typed-OOM error response (OpenAI error-spec compatible).
+/// Build the typed-OOM error response (OpenAI error-spec compatible).
 ///
 /// `type` is the stable automation key; `message` is human. Memory fields are
-/// best-effort from J4 `read_proc_mem()` — on read failure they serialize as
+/// best-effort from `read_proc_mem()` — on read failure they serialize as
 /// `null`, the error path never fails because telemetry failed.
 ///
 /// Status / `Retry-After` per phase:
@@ -244,7 +244,7 @@ pub(super) fn oom_response(
         OomPhase::Generation => (StatusCode::SERVICE_UNAVAILABLE, "oom_mid_stream", false),
     };
 
-    // Best-effort process-memory snapshot (J4). Never fail the error path.
+    // Best-effort process-memory snapshot. Never fail the error path.
     let mem = rmlx_core::mach_mem::read_proc_mem().ok();
     let to_mb = |b: u64| b / (1024 * 1024);
     let process_rss_mb = mem
@@ -261,8 +261,7 @@ pub(super) fn oom_response(
            "error": {
                "type": type_str,
                "message": msg,
-    // TODO: metal_peak_alloc_mb — telemetry not yet built; emit
-    // whatever the call site passed (today always None → null). Do not
+    // No raise site sets `peak_alloc_mb`, so it is always null. Do not
     // invent a Metal peak number here.
                "peak_alloc_mb": peak_alloc_mb.map(|v| json!(v)).unwrap_or(json!(null)),
                "requested_bytes": requested_bytes.map(|v| json!(v)).unwrap_or(json!(null)),
@@ -282,7 +281,7 @@ pub(super) fn oom_response(
 /// Map an `rmlx_core::Error` to an HTTP error response.
 ///
 /// `SmokeProbe` (NaN logits, broken snapshot) → 500 internal_error.
-/// `Oom` (J3) → 507 / 503 typed body with `Retry-After` per phase.
+/// `Oom` → 507 / 503 typed body with `Retry-After` per phase.
 /// Everything else → 503 service_unavailable (generator not ready / MLX error).
 #[allow(
     clippy::wildcard_enum_match_arm,
@@ -331,7 +330,7 @@ pub(crate) fn engine_error_type(e: &rmlx_core::Error) -> &'static str {
     }
 }
 
-/// F8: classify an `rmlx_core::Error` into an `ApiErrorCategory`.
+/// Classify an `rmlx_core::Error` into an `ApiErrorCategory`.
 ///
 /// Mirrors the match arms in `engine_error_response` so the same logic
 /// drives both the response shape and the counter.
@@ -352,7 +351,7 @@ pub(crate) fn engine_error_category(e: &rmlx_core::Error) -> ApiErrorCategory {
     }
 }
 
-// ── F10: request-id resolution ────────────────────────────────────────────────
+// ── Request-id resolution ────────────────────────────────────────────────
 
 /// Resolve a correlation id for this request.
 ///
@@ -408,7 +407,7 @@ pub(crate) fn record_metric(
     }
 }
 
-// ── Per-request HTTP timeout middleware (A8) ──────────────────────────────────
+// ── Per-request HTTP timeout middleware ──────────────────────────────────
 
 /// Resolve the effective per-request timeout.
 ///
@@ -446,7 +445,7 @@ pub fn compute_effective_timeout(
     }
 }
 
-/// Axum middleware: per-request HTTP timeout (A8).
+/// Axum middleware: per-request HTTP timeout.
 ///
 /// Wraps the downstream handler in `tokio::time::timeout(effective_dur)`.
 /// This bounds the **whole** request — including SSE streams (when

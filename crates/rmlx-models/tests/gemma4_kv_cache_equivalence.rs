@@ -35,7 +35,7 @@
     clippy::needless_pass_by_value
 )]
 
-// ── K8V4 variant (S2.4) ────────────────────────────────────────────────────────
+// ── K8V4 variant ────────────────────────────────────────────────────────
 //
 // With KvQuant::K8V4 the quantization is lossy. We cannot require argmax
 // equality to the full-precision run. Instead we verify:
@@ -84,9 +84,7 @@ fn kv_cache_k8v4_prefill_decode_sane() {
 
     // Sanity bounds on full-precision logits — K8V4 max-logit must stay
     // within the same order of magnitude (no exploding values from bad
-    // dequant). CLAUDE.md mandate is K8V4 for Qwen MoE; Gemma4 4:1 GQA has
-    // different sensitivity, so we don't require argmax-equality here —
-    // the Qwen MoE PPL check lands in S2.5 baseline.
+    // dequant). Argmax-equality is not required here.
     let full_max = full_last.iter().copied().fold(f32::NEG_INFINITY, f32::max);
 
     // K8V4 prefill+decode. K8V4 is not the engine default; it is forced here
@@ -138,7 +136,7 @@ fn kv_cache_k8v4_prefill_decode_sane() {
     );
 }
 
-// ── Planar variant (S3.4) ─────────────────────────────────────────────────────
+// ── Planar variant ─────────────────────────────────────────────────────
 //
 // Same sanity criteria as the K8V4 test: quantization is lossy so we only
 // require NaN-free output and bounded max logit. No argmax-equality required.
@@ -228,11 +226,10 @@ fn kv_cache_planar_prefill_decode_sane() {
     );
 }
 
-// ── C1 partial-prefix reuse: cold-equality regression ──────────────────────────
+// ── Partial-prefix reuse: cold-equality regression ─────────────────────────────
 //
-// This is the test C1's spec was missing. It asserts that the gemma4
-// block-truncate + tail-reprefill path (the production `CacheLookup::Prefix`
-// path) yields a greedy (argmax) token sequence TOKEN-FOR-TOKEN identical to a
+// It asserts that the gemma4 block-truncate + tail-reprefill path (the
+// production `Consumed::Reuse` path) yields a greedy (argmax) token sequence TOKEN-FOR-TOKEN identical to a
 // cold full-prompt run of the same prompt.
 //
 // Method (mirrors the production Prefix path at the KvCache level):
@@ -442,7 +439,7 @@ fn gemma4_partial_prefix_reuse_cold_equal() {
 
     assert_eq!(
         warm_tokens, cold_tokens,
-        "C1 cold-equality FAILED: partial-prefix-reuse greedy tokens diverge \
+        "cold-equality FAILED: partial-prefix-reuse greedy tokens diverge \
          from a cold full-prompt run.\n  cold = {cold_tokens:?}\n  warm = {warm_tokens:?}"
     );
 }

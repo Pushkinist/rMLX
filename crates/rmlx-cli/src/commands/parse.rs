@@ -193,7 +193,7 @@ pub(crate) fn parse_kv_boundary_layers(s: &str) -> Result<KvBoundary, String> {
 
 /// Parse a `--cache-type-k` / `--cache-type-v` tag string into a [`CacheType`].
 ///
-/// Accepts all canonical tags from §D1 plus documented aliases (`f16`, `none`,
+/// Accepts all canonical tags plus documented aliases (`f16`, `none`,
 /// `turbo4`). Returns an error for unknown tags or llama.cpp legacy block-32
 /// codecs that rMLX does not implement.
 pub(crate) fn parse_cache_type(s: &str) -> anyhow::Result<rmlx_models::kv_cache::CacheType> {
@@ -286,7 +286,7 @@ pub(crate) fn reject_paged_kv_without_store(
 /// On success: emits a `tracing::info!` with `arch`, `head_dim`, resolved
 /// `KvQuant`. If the resolved quant is non-`None` AND the arch is Gemma3 or
 /// Gemma4, emits an additional one-shot `info!` disclosing the SWA-stays-bf16
-/// rule (§D6.7).
+/// rule.
 ///
 /// fractional `--kv-bits` values (e.g. `3.5`) dispatch via
 /// [`parse_kv_bits_fractional`] → floor K / ceil V before the arch resolver
@@ -322,7 +322,7 @@ pub(crate) fn resolve_kv_quant(
                     "kv-quant preset rejected by arch invariant"
                 );
                 eprintln!("error: {e}");
-                eprintln!("see docs/KV_CACHE.md for supported codecs and combinations");
+                eprintln!("see docs/KV_QUANT.md for supported codecs and combinations");
                 std::process::exit(78);
             }
             kq
@@ -343,7 +343,7 @@ pub(crate) fn resolve_kv_quant(
                         "cache-type validation failed"
                     );
                     eprintln!("error: {e}");
-                    eprintln!("see docs/KV_CACHE.md for supported codecs and combinations");
+                    eprintln!("see docs/KV_QUANT.md for supported codecs and combinations");
                     std::process::exit(78);
                 }
             }
@@ -357,7 +357,7 @@ pub(crate) fn resolve_kv_quant(
                 "both --kv-quant preset and --cache-type-* per-side codecs supplied — these are mutually exclusive"
             );
             eprintln!("error: --kv-quant and --cache-type-k/--cache-type-v are mutually exclusive");
-            eprintln!("see docs/KV_CACHE.md for supported codecs and combinations");
+            eprintln!("see docs/KV_QUANT.md for supported codecs and combinations");
             std::process::exit(78);
         }
     };
@@ -374,7 +374,7 @@ pub(crate) fn resolve_kv_quant(
         "cache-type resolved"
     );
 
-    // §D6.7 disclosure: SWA layers always use bf16 regardless of --ctk/--ctv.
+    // Disclosure: SWA layers always use bf16 regardless of --ctk/--ctv.
     if !matches!(final_kv_quant, KvQuant::None)
         && (arch_class.starts_with("Gemma3") || arch_class.starts_with("Gemma4"))
     {

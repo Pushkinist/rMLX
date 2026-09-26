@@ -7,7 +7,7 @@
 //! row interleave) against regression.
 //!
 //! Model: `mlx-community__bitnet-b1.58-2B-4T` (BitNetForCausalLM).
-//! KV quant: K8V8 (the resolver default for this small dense backbone).
+//! KV quant: K8V8, pinned by the test (`auto` resolves to bf16).
 //!
 //! The snapshot resolves from `RMLX_O_MODELS_ROOT` by slug, so no per-run
 //! variable is needed on a machine holding it (see `tests/common/mod.rs`).

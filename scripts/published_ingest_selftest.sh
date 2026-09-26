@@ -41,7 +41,7 @@ BINARY="${WORK}/rmlx"
 cat >"${BINARY}" <<'BINEOF'
 #!/bin/sh
 # generate_streaming: TTFT
-# generate: ITL stats (M30)
+# generate: ITL stats
 # generate: host categorical sampler active
 # cache-type resolved
 # mtp_generate: done
@@ -108,7 +108,7 @@ markers = {
     m: blob.count(m.encode())
     for m in (
         "generate_streaming: TTFT",
-        "generate: ITL stats (M30)",
+        "generate: ITL stats",
         "generate: host categorical sampler active",
         "cache-type resolved",
     )
@@ -436,7 +436,7 @@ ingest_case binary_whose_markers_went_missing_is_refused 2 \
     "no longer contains" \
     'MUTATE:import hashlib, pathlib
 p = pathlib.Path(result["binary"]["path"])
-blob = p.read_bytes().replace(b"generate: ITL stats (M30)", b"")
+blob = p.read_bytes().replace(b"generate: ITL stats", b"")
 copy = work / "rmlx"
 copy.write_bytes(blob)
 result["binary"]["path"] = str(copy)

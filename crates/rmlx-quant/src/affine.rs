@@ -1,17 +1,14 @@
 //! Affine `bits ∈ {2,3,4,5,6,8}` × `group_size ∈ {32,64,128}` dequant.
 //!
-//! Ground truth: `docs/03-mlx-safetensors-format.md` §Dequantization formulas.
+//! Ground truth: `docs/WEIGHT_QUANTS.md` § "Dequant formula".
 //!
 //! Dequant formula (additive bias):
 //! w_fp = scale * code + bias
 //!
-//! Bias convention: ADDITIVE. The doc (`docs/03-mlx-safetensors-format.md`,
-//! §Dequantization formulas, §Affine) reads `w_fp = s * x_q + b`.
-//! The AWQ→MLX note in the same section explains `b = -zero_point * scale`,
-//! so the net effect is identical to `s*(x_q - zp)` — but the stored bf16 bias
+//! Bias convention: ADDITIVE. The doc (`docs/WEIGHT_QUANTS.md` § "Dequant formula") reads
+//! `w_fp = scale × code + bias` with `bias = -zero_point × scale`, so the net
+//! effect is identical to `s*(x_q - zp)` — but the stored bf16 bias
 //! already encodes the sign. rMLX stores and applies it as-is (additive).
-//!
-//! Stage 1.
 
 use std::sync::OnceLock;
 
@@ -280,7 +277,7 @@ fn warn_bias_sign_once() {
     BIAS_SIGN_WARNED.get_or_init(|| {
         warn!(
             "affine dequant: using ADDITIVE bias convention (w = scale * code + bias) \
-             as specified in docs/03-mlx-safetensors-format.md. \
+             as specified in docs/WEIGHT_QUANTS.md. \
              Some literature uses subtractive bias; rMLX follows the doc."
         );
     });
@@ -292,7 +289,7 @@ fn warn_bias_sign_once() {
 ///
 /// Dequant formula: `w_fp = scale * code + bias`
 ///
-/// Bias is ADDITIVE per `docs/03-mlx-safetensors-format.md`.
+/// Bias is ADDITIVE per `docs/WEIGHT_QUANTS.md` § "Dequant formula".
 /// The AWQ→MLX conversion stores `bias = -zero_point * scale`, so the stored
 /// bf16 bias value already carries the correct sign.
 ///

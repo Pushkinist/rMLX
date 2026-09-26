@@ -57,11 +57,11 @@
 //!
 //! Both axes rotate every group by the same golden-ratio unit quaternion
 //! ([`crate::isoquant::FIXED_QUAT`]), baked into the header as a constant. The
-//! rings therefore do not carry a quaternion table on either axis;
+//! rings therefore do not carry a quaternion table on either axis.
 //! [`crate::iso_flash_decode_msl::assert_fixed_quat_blocks`] rejects a store
-//! whose per-group quaternions are not the fixed constant, so a future
-//! per-group-quaternion encoder fails loudly at the dispatch boundary rather
-//! than decoding against the wrong rotation.
+//! whose per-group quaternions are not the fixed constant, but no dispatch path
+//! calls it, so a per-group-quaternion encoder would decode against the wrong
+//! rotation with no error.
 //!
 //! # Bit-width parameterisation
 //!

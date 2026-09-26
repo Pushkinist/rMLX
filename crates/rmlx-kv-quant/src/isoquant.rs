@@ -49,7 +49,7 @@
 //!   `q = (1, φ, φ−1, 1) / ||(1, φ, φ−1, 1)||`
 //! where `φ = (1 + √5) / 2`. This quaternion maximises channel decorrelation
 //! without calibration or per-group fitting. The same quaternion is applied to
-//! every group (fast-path; T11b will add per-group optimised quaternions).
+//! every group; there are no per-group optimised quaternions.
 //!
 //! # Bit-packing
 //!
@@ -98,7 +98,7 @@ pub const FIXED_QUAT: [f32; 4] = {
 /// Errors from the iso3 / iso4 codec.
 #[allow(
     clippy::exhaustive_enums,
-    reason = "closed codec-internal error enum; T11b/c/d may add variants but this is not a public extension point"
+    reason = "closed codec-internal error enum; not a public extension point"
 )]
 #[derive(Debug, Error)]
 pub enum IsoQuantError {

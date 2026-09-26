@@ -1,4 +1,4 @@
-//! Multi-model lifecycle smoke test (Stage 3.5).
+//! Multi-model lifecycle smoke test.
 //!
 //! Gated on the `RMLX_REGISTRY_TEST` environment variable. Mark `#[ignore]`
 //! so `cargo test` skips it by default.

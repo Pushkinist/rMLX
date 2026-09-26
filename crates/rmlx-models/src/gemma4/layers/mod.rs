@@ -300,7 +300,7 @@ impl Attention {
             // Mask must be built before the cache update so the wrapper can run
             // update + SDPA in one shot. The mask's key dim MUST equal the
             // post-update K seq dim the SDPA actually attends, otherwise mlx-c
-            // `scaled_dot_product_attention` rejects the broadcast (issue #32:
+            // `scaled_dot_product_attention` rejects the broadcast (e.g.
             // mask `(1,1,5,kv+1)` vs scores `(1,8,5,kv)`).
             //
             // The post-update K length is `producer_offset + seq` (non-rotating)
@@ -349,7 +349,7 @@ impl Attention {
                     mask_holder_pre.as_ref(),
                     device,
                 )?;
-                // Guard (issue #32): the array-mode mask's key dim must equal
+                // Guard: the array-mode mask's key dim must equal
                 // the K seq dim the SDPA just attended. A mismatch is a sizing
                 // bug, not user input — fail loudly here rather than let a
                 // later layer hit the opaque mlx-c broadcast error.
@@ -433,7 +433,7 @@ impl Attention {
             // SDPA attends — it is `k.shape()[2]` for a bf16 share and the
             // store's accumulated length for a store-backed one.
             // Size the mask's key dim from that actual K length, NOT
-            // from the model-wide `offset` (#32 part 2): across a speculative
+            // from the model-wide `offset`: across a speculative
             // partial-accept verify rollback the producer cache is rolled back
             // while the model-wide `offset` (`cache_base_offset`, taken from the
             // first full-attention cache that was NOT rolled back) is not, so
@@ -477,7 +477,7 @@ impl Attention {
                 bidi_overlay,
                 device,
             )?;
-            // Guard (issue #32 part 2): the array-mode consumer mask's key dim
+            // Guard: the array-mode consumer mask's key dim
             // must equal the K seq dim the SDPA is about to attend. Fail loudly
             // on any future off-by-one rather than surfacing the opaque mlx-c
             // broadcast error from a later frame.
@@ -506,7 +506,7 @@ impl Attention {
 /// Compute the effective mask offset from a **producer cache's own offset**
 /// (not the model-wide `cache_base_offset`).
 ///
-/// This is the single place that implements the #32 fix: at a speculative
+/// This is the single place that sizes it: at a speculative
 /// verify-block step the rotating sliding cache that drove the round's
 /// `v_target` can desync from the non-rotating full-attention producer by one
 /// position across a partial-accept rollback. Using the producer's `c.offset()`

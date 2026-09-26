@@ -151,8 +151,9 @@ impl<const BITS: u8> QuantKTurbo<BITS> {
     /// The field this writes is inert: nothing sizes a buffer from it, and the
     /// first GPU `append` overwrites it from its own parameter. The argument
     /// exists so an SSD hydrate restores the window the spill recorded instead
-    /// of `0` — see `docs/KV_TURBO_TWINS.md` §2(2). Pass the provisioned model
-    /// window, not the accumulated length at spill time (`shape[2]`).
+    /// of `0`; see `docs/KV_UPDATE_PATH.md` § "TurboQuant". Pass the
+    /// provisioned model window, not the accumulated length at spill time
+    /// (`shape[2]`).
     #[must_use]
     pub fn from_cpu_blocks(blocks: Vec<TurboBlocks>, shape: Vec<i32>, max_seq: i32) -> Self {
         let () = Self::WIDTH_IS_A_SHIPPED_ONE;

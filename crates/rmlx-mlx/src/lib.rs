@@ -225,7 +225,7 @@ const MLX_BUILD_VERSION: &str = env!("RMLX_MLX_BUILD_VERSION");
 /// install, which `rmlx-metrics` must not need), so `rmlx-cli::main()` — the
 /// one binary that links both — calls this and forwards it to
 /// `rmlx_metrics::identity::set_mlx_nax` once at startup, before any metrics
-/// recording. See `docs/METRICS_DB.md`.
+/// recording. See `docs/METRICS_SCHEMA.md` §3.6.
 #[must_use]
 pub fn nax_capability() -> &'static str {
     nax::loaded_nax_capability()
@@ -323,28 +323,14 @@ pub(crate) unsafe fn check_status(status: i32, context: &str) -> Result<()> {
 // Stream helper: borrow the process-global default stream, run a closure.
 // ---------------------------------------------------------------------------
 //
-// The previous implementation called `mlx_stream_new_device`
-// on every op invocation. Each call to `mlx_stream_new_device` spawns a new
-// OS worker thread inside MLX. A single Gemma4 forward pass invokes ~42
-// layers × several ops per layer — hundreds of `with_stream` calls per step.
-// After 3–6 decode steps the per-process thread limit is exhausted and
-// `pthread_create` returns EAGAIN, manifesting as:
-//
-// mlx: Array::eval: thread constructor failed: Resource temporarily unavailable
-//
-// Fix: use `mlx_default_cpu_stream_new` / `mlx_default_gpu_stream_new` which
-// return a *reference-counted handle to the already-running default stream*
-// (no new thread). Freeing the handle with `mlx_stream_free` decrements the
-// ref-count — it does NOT tear down the stream or its thread.
-//
-// The ceiling in force at the time of that incident was not recorded; an
-// earlier revision of this comment asserted ~2 048, which is not what this
-// machine reports. Measure before relying on a number:
-// `sysctl kern.num_taskthreads` is the per-task ceiling (16384 here) and
-// `ulimit -u` the per-user process cap. What has not changed is the shape of
-// the bug — MLX never reclaims a stream or the OS thread behind it, so any
-// per-call or per-thread stream creation grows monotonically until it hits
-// whatever the ceiling is.
+// Never call `mlx_stream_new_device` per op. Each call spawns an MLX worker
+// thread that MLX never reclaims, so per-call stream creation grows until
+// `pthread_create` returns EAGAIN ("thread constructor failed: Resource
+// temporarily unavailable"). The ceiling is the per-task thread limit
+// (`sysctl kern.num_taskthreads`). `mlx_default_cpu_stream_new` /
+// `mlx_default_gpu_stream_new` return a reference-counted handle to the
+// running default stream (no new thread); `mlx_stream_free` drops the
+// reference, not the stream or its thread.
 
 /// Borrow the process-global default stream for `device`, call `f(stream)`,
 /// release the handle, and return the result.
@@ -633,7 +619,7 @@ pub(crate) fn mode_to_cstr(
 }
 
 // ---------------------------------------------------------------------------
-// Null-handle sentinel for optional FFI arguments (ch-18 F1)
+// Null-handle sentinel for optional FFI arguments
 // ---------------------------------------------------------------------------
 //
 // Several mlx-c wrappers accept optional Array arguments (biases, freqs,
@@ -698,7 +684,7 @@ pub enum Device {
     Gpu,
 }
 
-/// Element dtype subset. Extend in S1.4b as needed.
+/// Element dtype subset.
 #[allow(
     clippy::exhaustive_enums,
     reason = "closed dtype enum — six MLX element types (Bf16/F16/F32/U8/U32/I32); adding a dtype requires updating to_sys(), from_sys(), and all Dtype match arms across the codebase"

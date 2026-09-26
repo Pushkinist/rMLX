@@ -1,7 +1,7 @@
 use super::*;
 
 // ---------------------------------------------------------------------------
-// Mask-mode selection (issue #24: "additive" is NOT a valid mlx-c mode).
+// Mask-mode selection ("additive" is NOT a valid mlx-c mode).
 // ---------------------------------------------------------------------------
 
 /// The mlx-c Metal SDPA kernel accepts only these mask_mode strings. A drafter
@@ -31,13 +31,10 @@ fn global_or_covered_layer_uses_empty_mode() {
 
 #[test]
 fn no_additive_mode_ever_emitted() {
-    // Regression guard for issue #24: neither branch may select "additive".
+    // Regression guard: neither branch may select "additive".
     let bias = make_bias();
     for m in [swa_sdpa_mode(Some(&bias)).0, swa_sdpa_mode(None).0] {
-        assert_ne!(
-            m, "additive",
-            "issue #24: mlx-c rejects mask_mode 'additive'"
-        );
+        assert_ne!(m, "additive", "mlx-c rejects mask_mode 'additive'");
         assert!(KERNEL_ACCEPTED_MODES.contains(&m));
     }
 }

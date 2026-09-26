@@ -1,10 +1,7 @@
 // Head-major persistent K storage for fused-QK MSL kernels.
 //
-// Extended the shadow into a `{per_token, sideband_table}` split per
-// the followup design (see
-// `docs/research/fused-qk-storage-design.md` §"Update — fix cycle").
-//
-// The shadow now carries up to **four** GPU-resident arrays per `KvCache`:
+// The shadow is a `{per_token, sideband_table}` split. It carries up to
+// **four** GPU-resident arrays per `KvCache`:
 //
 //   * `k_codes`              — `u32 [B, kv_h, max_seq, codes_per_token]`
 //   * `k_scales`             — `f32 [B, kv_h, max_seq, scales_per_token]`
@@ -13,10 +10,8 @@
 //
 // The `FusedQkFn` kernel signature uses 13 args; sidebands are passed as
 // **separate `Option<&Array>` arguments** rather than being concatenated
-// into the `k_scales` buffer at call time. The pre-fix concat path cost
-// ~28 MB of CPU↔GPU marshaling per decode step at Bonsai 8B head_dim=128,
-// n_groups=32, layers=26, kv_seq=8192 and swamped the kernel compute
-// savings (12.3 TPS vs 63.5 TPS legacy — see commit f42aa0f).
+// into the `k_scales` buffer at call time: a concat would marshal every
+// sideband between CPU and GPU on each decode step.
 //
 // The widened signature delivers:
 //   * `k_scales`      — flat `[B * kv_h * kv_seq * scales_per_token]`

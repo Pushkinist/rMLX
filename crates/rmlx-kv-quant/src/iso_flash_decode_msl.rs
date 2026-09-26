@@ -94,10 +94,10 @@
 //!
 //! This is a real coupling, not an assumption: if the codec ever emits
 //! per-group quaternions (the encoder's own docs float that as future work),
-//! this kernel becomes silently wrong rather than merely stale. The
-//! dispatcher's [`assert_fixed_quat_blocks`] rejects a store whose quaternions
-//! are not `FIXED_QUAT`, so that change fails loudly here instead of decoding
-//! K against the wrong rotation.
+//! this kernel becomes silently wrong rather than merely stale.
+//! [`assert_fixed_quat_blocks`] rejects a store whose quaternions are not
+//! `FIXED_QUAT`, but no dispatch path calls it: today only the encoder, which
+//! writes `FIXED_QUAT`, keeps this kernel correct.
 //!
 //! # Single-MLX claim
 //!
@@ -340,9 +340,9 @@ pub(crate) fn build_iso_flash_header(bits: u8) -> Result<String> {
 ///
 /// The kernel bakes `q̄` into its header instead of reading the store's
 /// quaternion table (see the module docs). That is correct only while the
-/// encoder writes the one constant into every slot. This check is what turns a
-/// future per-group-quaternion encoder from "silently decodes K against the
-/// wrong rotation" into a loud error at the dispatch boundary.
+/// encoder writes the one constant into every slot. This check turns a
+/// per-group-quaternion store into a loud error, but only where it is called:
+/// no dispatch path calls it today.
 ///
 /// `quaternions` is the CPU-side per-group table (`n * 4` f32, `[w, x, y, z]`
 /// per group) carried by [`crate::storage::quant_iso_v::IsoBlocks`].

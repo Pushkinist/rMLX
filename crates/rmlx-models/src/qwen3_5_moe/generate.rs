@@ -61,17 +61,17 @@ pub fn generate_greedy<'a>(
     max_ctx_override: Option<i32>,
     prompt_cache_slots: usize,
     eos_ids: &'a [u32],
-    // A6.2: optional sampler constraint. See gemma4::generate_greedy for
+    // Optional sampler constraint. See gemma4::generate_greedy for
     // the hot-path-cost-and-correctness contract.
     // The shared `DecodeCtx` bundles every per-request borrow under one
     // lifetime, so these references share `'a` (a `&mut dyn` trait-object
     // reborrow is invariant and cannot be re-unified once split).
     step_fn: &'a mut dyn FnMut(&crate::decode_loop::ProbeStep) -> Option<u32>,
     mut constraint: Option<&'a mut dyn ConstraintEngine>,
-    // A7.2: sampling config + per-request RNG. See gemma3::generate_greedy.
+    // Sampling config + per-request RNG. See gemma3::generate_greedy.
     sampler_cfg: &'a crate::sampler::SamplerConfig,
     rng: &'a mut crate::sampler::Pcg32,
-    // A7.3: logit-penalty configuration + per-request token history.
+    // Logit-penalty configuration + per-request token history.
     penalty_cfg: &'a crate::sampler::PenaltyConfig,
     token_history: &'a mut Vec<u32>,
 ) -> Result<Vec<crate::decode_loop::ProbeStep>> {
@@ -199,7 +199,7 @@ pub fn generate_greedy<'a>(
             logprobs: None,
         });
         step_fn(steps.last().unwrap());
-        // A7.3: exact-hit token into history.
+        // Exact-hit token into history.
         token_history.push(last_id);
 
         // EOS-stop. If prefill emitted an EOS already, no decode steps.
@@ -231,7 +231,7 @@ pub fn generate_greedy<'a>(
                 model.forward_arr(y, 1, Some(&mut kv_caches), Some(&mut lin_caches), device)
             })?
         };
-        // N16: store KV-cache bytes (KV + linear-attn state) for /metrics/cache (post-decode).
+        // Store KV-cache bytes (KV + linear-attn state) for /metrics/cache (post-decode).
         let kv_bytes: u64 = kv_caches.iter().map(|c| c.resident_bytes()).sum::<u64>()
             + lin_caches.iter().map(|c| c.resident_bytes()).sum::<u64>();
         model.kv_bytes.store(kv_bytes, post);
@@ -468,7 +468,7 @@ pub fn generate_greedy<'a>(
         return Ok(steps);
     }
 
-    // Issue #25: `--max-ctx` is a virtual ceiling the KV ring grows lazily up
+    // `--max-ctx` is a virtual ceiling the KV ring grows lazily up
     // to, not an eager allocation. `initial_max_seq` is the lazy start;
     // `max_seq_ceiling` caps growth and rejects over-long prompts.
     let resolved_ctx = crate::context::resolve_context(&model.cfg.context, max_ctx_override)?;
@@ -595,7 +595,7 @@ pub fn generate_greedy<'a>(
     top.eval()?;
     let top_bytes = top.to_bytes()?;
     let last_id = i32::from_le_bytes(top_bytes[..4].try_into().unwrap()) as u32;
-    // A6.3: advance constraint regardless of mask state (warm-up scans).
+    // Advance constraint regardless of mask state (warm-up scans).
     if let Some(c) = ctx.constraint.as_mut() {
         c.advance(last_id);
     }
@@ -729,7 +729,7 @@ pub fn generate_greedy<'a>(
         "decode_profile"
     );
 
-    // N16: store KV-cache bytes (KV + linear-attn state) for /metrics/cache (post-decode).
+    // Store KV-cache bytes (KV + linear-attn state) for /metrics/cache (post-decode).
     let kv_bytes: u64 = kv_caches.iter().map(|c| c.resident_bytes()).sum::<u64>()
         + lin_caches.iter().map(|c| c.resident_bytes()).sum::<u64>();
     model.kv_bytes.store(kv_bytes, post);

@@ -281,7 +281,7 @@ fn warm_up_blocks_engagement_during_thinking() {
     assert!(c.engaged, "engagement must fire after thinking ends");
 }
 
-// ── A6.5: fence suppression tests ───────────────────────────────────────
+// ── Fence suppression tests ───────────────────────────────────────
 
 /// Pre-engagement text that is only ` ```json\n ` must be flagged as a
 /// fence so the handler knows to discard it.
@@ -316,7 +316,7 @@ fn fence_suppression_real_prose_not_discarded() {
     );
 }
 
-/// Object/array root: engagement still requires `{`/`[` (not broken by A6.5).
+/// Object/array root: engagement still requires `{`/`[` (scalar-root engage does not change it).
 #[test]
 fn object_root_engage_policy_unaffected() {
     let pm = synthetic_bytes_map(&[b"AAAA", b"{", b"}", b""]);

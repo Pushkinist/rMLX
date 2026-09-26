@@ -277,7 +277,7 @@ for model_label, model_path in MODELS:
 print()
 print("Decision criteria:")
 print("  Promote k8vturbo3 iff PPL(turbo3) <= PPL(mixed3) - 0.3 AND TPS(turbo3) >= TPS(mixed3) * 0.98")
-print("  PPL bench: DEFERRED — no native rMLX PPL harness (see docs/research/turboquant_v3_vs_affine_v3.md)")
+print("  PPL: this script measures none; run `rmlx eval ppl` for each arm")
 print()
 print(f"Logs: {LOG_DIR}/")
 print("=" * 80)

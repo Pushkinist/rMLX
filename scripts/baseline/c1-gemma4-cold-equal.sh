@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# c1-gemma4-cold-equal.sh — C1 acceptance (C): gemma4 partial-prefix reuse
+# c1-gemma4-cold-equal.sh — gemma4 partial-prefix reuse
 # must be token-for-token cold-equal.
 #
 # gemma-4-26b-a4b-it-mxfp8 has sliding_window=1024. The production
@@ -128,7 +128,7 @@ except Exception as e:
 PYEOF
 }
 
-echo "=== C1 gemma4 cold-equality (${MODEL_ID}) ===" >&2
+echo "=== gemma4 cold-equality (${MODEL_ID}) ===" >&2
 
 # ---- Phase 1: COLD (fresh server, cache empty -> Miss) ----
 preflight

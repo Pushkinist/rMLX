@@ -16,8 +16,7 @@
 # A slot's position in the run affects what it measures, and on this host that
 # positional term is not linear: one slot position runs slow for whichever
 # level occupies it. An ABBA block cancels only a monotone drift, so it leaves
-# that penalty sitting on one arm — which is how two confident wrong calls have
-# been made here. This runs a cyclic Latin square instead: level index
+# that penalty sitting on one arm. This runs a cyclic Latin square instead: level index
 # `(position + row) % n_levels`, so across `n_levels` rows every level occupies
 # every slot position exactly once and the positional term cancels by
 # construction. See `docs/PROFILING.md` §"Ordering on this host".

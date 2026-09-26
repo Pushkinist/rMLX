@@ -148,12 +148,10 @@ pub use quant::{
 
 /// Returns `true` when the GPU-resident `QuantIsoV` mirror is enabled.
 ///
-/// **Hardcoded OFF** (bench-driven decision; no env-var opt-in). A/B bench
-/// showed deltas within noise on the iso V hot path because the
-/// warm-TTFT bf16 seed absorbs the dequant cost before the mirror is reached.
-/// See `docs/PERF_BASELINE.md` for bench numbers. The gate exists as a
-/// forward-compatibility hook for future seedless decode paths where
-/// `decode_fp16_k.is_none()` during steady-state decode.
+/// **Hardcoded OFF**, with no env-var opt-in, so the mirror is not reached in
+/// production. On the iso V hot path the bf16 decode seed is read before the
+/// mirror would be, so the mirror would only serve a decode with
+/// `decode_fp16_k.is_none()`.
 ///
 /// The value is [`GPU_RESIDENT_ISO_PRODUCTION`] rather than a literal, because
 /// `cfg(test)` replaces this whole body: a test that called this fn would read

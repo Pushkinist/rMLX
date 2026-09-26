@@ -99,10 +99,10 @@
 //! correction in MSL before the score is emitted — until then the gate is the
 //! contract, not an oversight.
 //!
-//! # A.y guard
+//! # Qwen MoE guard
 //!
-//! `RotorK{3,4}Asym` are K-side ≤ 4-bit — the Qwen-MoE 218→8641 PPL disaster
-//! applies. The guard lives in
+//! `RotorK{3,4}Asym` store K at 3 or 4 bits, so Qwen MoE rejects them. The
+//! guard lives in
 //! `rmlx_models::kv_cache::cache_type::validate_resolved` and rejects every
 //! rotor K-side codec on `Qwen3_5MoeForConditionalGeneration` at session
 //! start — the kernel does NOT re-check.
@@ -380,7 +380,7 @@ fn rotor_qk_kernel(bits: u8) -> Result<&'static MetalKernel> {
 /// per-token L2 norm, then accumulates the QK dot product. No bf16 / f32 K
 /// is materialised in HBM.
 ///
-/// **A.y guard**: caller must ensure arch is NOT Qwen MoE before calling.
+/// **Qwen MoE guard**: caller must ensure arch is NOT Qwen MoE before calling.
 ///
 /// # Inputs
 ///

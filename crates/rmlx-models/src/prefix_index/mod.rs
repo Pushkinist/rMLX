@@ -2,8 +2,7 @@
 //!
 //! Two implementations behind the [`PrefixIndex`] trait:
 //!
-//! - [`LinearScan`] — O(slots × n_blocks) walk, byte-identical to the
-//!   pre-`PromptCache::find_best_prefix` body.
+//! - [`LinearScan`] — O(slots × n_blocks) walk over the resident slots.
 //! - [`RadixTree`] — port of NVIDIA Dynamo's `PositionalRadixTree`
 //!   (single-payload variant). Lookup is
 //!   O(n_blocks · avg_fanout · avg_entries_per_node), not the textbook
@@ -11,8 +10,7 @@
 //!   `best_entry` linear-scans the cursor's `entries`. In practice fanout
 //!   stays small (≤ working-set distinct continuations) and entry counts
 //!   per node stay bounded, so the radix path is still effectively
-//!   independent of total slot count once branch density saturates. See
-//!   `docs/PERF_BASELINE.md` bench for empirical ns/op numbers.
+//!   independent of total slot count once branch density saturates.
 //!
 //! ## Contract
 //!

@@ -1,4 +1,4 @@
-//! A5.3: Stream parser for Qwen3.6-style `<tool_call>` blocks.
+//! Stream parser for Qwen3.6-style `<tool_call>` blocks.
 //!
 //! Qwen3.6's chat_template.jinja instructs the model to emit tool calls in
 //! the following shape (verified against the Qwen3.6-35B-A3B-8bit snapshot's
@@ -43,8 +43,8 @@
 //! (Bonsai/Hermes) format, a truncated `<tool_call>{json(unclosed)` is
 //! balanced and still yields a valid `ParsedToolCall`.
 //!
-//! Wired end-to-end into the decode loop: OpenAI `tool_calls` emission (A5.4)
-//! and Anthropic `tool_use` emission (A5.5) are live, streaming + non-streaming,
+//! Wired end-to-end into the decode loop: OpenAI `tool_calls` emission
+//! and Anthropic `tool_use` emission are live, streaming + non-streaming,
 //! with the Anthropic `stop_reason` upgrade and the tool-choice
 //! constrained-schema path. Proven by the E2E `tool_call` rows
 //! (Qwen3.6 XML + Bonsai Hermes-JSON, `make e2e`).
@@ -202,7 +202,7 @@ struct InFlightCall {
 pub struct ToolCallStreamParser {
     format: ToolCallFormat,
     state: ParserState,
-    /// Text emitted outside any `<tool_call>` block. Callers (A5.4 / A5.5)
+    /// Text emitted outside any `<tool_call>` block. Callers
     /// stream this back to the client as ordinary assistant content.
     pub passthrough_text: String,
     /// Completed tool calls, drained by `take_parsed`.

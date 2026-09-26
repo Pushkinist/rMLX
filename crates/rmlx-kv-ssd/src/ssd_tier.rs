@@ -62,12 +62,7 @@ use crate::ssd_index::SsdKvIndex;
 /// `None` (never configured) or a `per_namespace_budget_bytes == 0` (with
 /// `global_budget_bytes == 0`) means the tier is OFF.
 //
-// owned by ; consumers read-only
-//
-// Field order + types are FROZEN here. (per-project budgets via
-// `projects.toml`) will populate `per_project_budgets` and read the other
-// fields without mutating them. Do not reorder, rename, or change types
-// without bumping the owning ticket.
+// Consumers read this config and never mutate it.
 #[allow(
     clippy::exhaustive_structs,
     reason = "internal closed config struct — four fields are the complete SSD-tier config contract; cross-crate construction in rmlx-cli::serve must list all fields; adding a field requires updating both install_config callers"
@@ -75,8 +70,6 @@ use crate::ssd_index::SsdKvIndex;
 #[derive(Debug, Clone)]
 pub struct SsdTierConfig {
     /// Per-namespace byte budget (the `--kv-ssd-cache-gb` value in bytes).
-    /// name was `budget_bytes` pre-; renamed for symmetry with
-    /// `global_budget_bytes`. Kept public for tests + .
     pub per_namespace_budget_bytes: u64,
     /// SSD global pool ceiling across ALL namespaces under
     /// `<RMLX_HOME>/cache/kv/*`. `0` means no global cap (per-namespace only).
@@ -84,31 +77,26 @@ pub struct SsdTierConfig {
     /// Default namespace name (the `--project` override, or `None` →
     /// `model_id` fallback at `attach_at_load`).
     pub default_namespace: Option<String>,
-    /// hook: per-project budget overrides (`project_name -> budget_bytes`).
-    /// Always empty in ; populates from `projects.toml`.
+    /// Per-project budget overrides (`project_name -> budget_bytes`). `serve`
+    /// fills it from `projects.toml`, but nothing reads it: the project budget
+    /// reaches the tier through `per_namespace_budget_bytes`.
     pub per_project_budgets: std::collections::BTreeMap<String, u64>,
 }
 
 static CONFIG: OnceLock<Option<SsdTierConfig>> = OnceLock::new();
 
-/// Install the process-global SSD-tier config + run the pre-release
-/// schema wipe pass (call once at serve startup, before any model loads).
+/// Install the process-global SSD-tier config and run the schema wipe pass
+/// (call once at serve startup, before any model loads).
 ///
 /// Per-namespace budget `0` AND global budget `0` install the OFF state
-/// (tier disabled). Idempotent in the sense of `OnceLock`: the first call
-/// wins; later calls are ignored (with a `warn!` if they disagree). In debug
-/// builds, a second call PANICS to surface the bug. The wipe runs
-/// unconditionally on the first call, including when the tier is OFF — that
-/// way switching `--kv-ssd-cache-gb` 0 → N between restarts cannot resurrect
-/// a namespace at a superseded schema.
-///
-/// callers must pass an `SsdTierConfig` directly. `per_project_budgets`
-/// MUST be empty in — populated by from `projects.toml`. After
-/// the config is committed, runs [`startup_maintenance_pool`] to evict the
+/// (tier disabled). The wipe runs unconditionally on the first call, including
+/// when the tier is OFF, so switching `--kv-ssd-cache-gb` 0 → N between
+/// restarts cannot resurrect a namespace at a superseded schema. After the
+/// config is committed, runs [`startup_maintenance_pool`] to evict the
 /// cross-namespace pool down to `global_budget_bytes`.
-/// Install the process-global SSD-tier config (call once at serve startup).
 ///
-/// Returns `Err(Error::SsdTierAlreadyInstalled)` if called more than once.
+/// Returns `Err(Error::SsdTierAlreadyInstalled)` if called more than once, in
+/// every build.
 /// The first call always wins — the `OnceLock` is set on the first call and
 /// subsequent calls return the typed error so the caller can decide whether to
 /// propagate or log+ignore.

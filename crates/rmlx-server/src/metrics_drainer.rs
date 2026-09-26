@@ -1,4 +1,4 @@
-//! SPSC async metrics drainer — F6 / L18.
+//! SPSC async metrics drainer.
 //!
 //! Per-request metrics (kv_cache_bytes, ttft_ms, prompt_cache_hits/misses/bytes,
 //! load_phases) are emitted from the decode hot-path via `DrainerHandle::try_emit`.
@@ -72,7 +72,8 @@ pub enum MetricKind {
     PromptCacheHits(u64),
     /// Number of prompt-cache prefix misses for this request.
     PromptCacheMisses(u64),
-    /// Bytes of prompt-cache prefix data reused for this request.
+    /// `CacheStats::bytes`: the RAM the prompt-cache slots hold after this
+    /// request, not the bytes it reused.
     PromptCacheBytes(u64),
     /// Number of KV block-cache hits.
     BlockHits(u64),
@@ -111,7 +112,7 @@ pub enum MetricKind {
         /// Total load time from start to first-kernel-ready.
         total_ms: f64,
     },
-    /// Per-token inter-token latency aggregates (M30).
+    /// Per-token inter-token latency aggregates.
     ///
     /// Emitted once per request after all decode steps complete.
     /// One event carries all three aggregates so the drainer writes a single
@@ -126,38 +127,38 @@ pub enum MetricKind {
         /// Number of decode steps measured.
         step_count: usize,
     },
-    /// C5 Slice A: milliseconds this request spent in the FIFO admission
+    /// Milliseconds this request spent in the FIFO admission
     /// queue waiting for the single-GPU permit. Emitted once per admitted
     /// request at permit-acquire.
     QueueWaitMs(u64),
-    /// C5 Slice A: in-flight admitted-request count observed at admission
+    /// In-flight admitted-request count observed at admission
     /// (this request inclusive) — the queue-depth gauge. Emitted once per
     /// admitted request alongside `QueueWaitMs`.
     QueueDepth(u64),
-    /// C7: Metal allocator high-water mark, in MB (integer-divided from bytes).
+    /// Metal allocator high-water mark, in MB (integer-divided from bytes).
     ///
     /// Read from `mlx_get_peak_memory` once per request at the same boundary
     /// as `KvCacheBytes`. Fulfils the `metal_peak_alloc_mb` registry Todo.
     MetalPeakAllocMb(u64),
-    /// F1b: number of prompt (input) tokens for this request.
+    /// Number of prompt (input) tokens for this request.
     ///
     /// Sourced from the same counter that populates the `Usage` response body.
     /// Emitted once per completed request from the handler (both blocking and
     /// streaming paths), never from the engine decode loop.
     PromptTokens(u32),
-    /// F1b: number of completion (output/decode) tokens for this request.
+    /// Number of completion (output/decode) tokens for this request.
     ///
     /// Sourced from the same counter that populates the `Usage` response body.
     /// Emitted once per completed request from the handler (both blocking and
     /// streaming paths), never from the engine decode loop.
     CompletionTokens(u32),
-    /// F9: inter-token latency 99th percentile (ms), emitted alongside `ItlStats`.
+    /// Inter-token latency 99th percentile (ms), emitted alongside `ItlStats`.
     ///
     /// Separate event (rather than extending the `ItlStats` struct) so that
     /// the drainer can map it to a single `MetricEntry` row, matching the one
     /// row per event per metric convention used by `TtftMs`/`PromptTokens`.
     ItlP99Ms(f64),
-    /// F9: count of inter-token latency spikes for this request.
+    /// Count of inter-token latency spikes for this request.
     ///
     /// Spike = any interval > 3 × median (p50). Emitted alongside `ItlStats`
     /// and `ItlP99Ms` once per request after all decode steps complete.
@@ -623,7 +624,7 @@ fn event_kind_to_metrics(kind: &MetricKind) -> Vec<MetricEntry> {
         // Real percentiles (p50, p99) come from the Prometheus histogram
         // (`rmlx_ssd_spill_us_bucket{le=...}` in `openai.rs`); the registry row
         // here provides SQLite queryability of the raw duration. Emitting the
-        // same value as both p50 and p99 (H2 fix) was misleading — a single-sample
+        // same value as both p50 and p99 would mislead — a single-sample
         // distribution has no meaningful percentile breakdown.
         MetricKind::SsdSpillUs { dur_us, bytes } => {
             let dur_ms = *dur_us as f64 / 1000.0;

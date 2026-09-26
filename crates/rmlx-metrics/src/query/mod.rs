@@ -18,7 +18,8 @@
 //!
 //! # See also
 //!
-//! - `docs/METRICS_DB.md` — schema, query API contract, §8.2.
+//! - `docs/METRICS_SCHEMA.md` — schema.
+//! - `docs/METRICS_DB.md` §8.2 — query API contract.
 
 pub(crate) mod read;
 mod types;

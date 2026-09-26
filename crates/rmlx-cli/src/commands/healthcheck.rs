@@ -481,8 +481,8 @@ fn check_smoke(path: &Path) -> CheckLine {
 
 /// Check 5: open the SQLite DB, run `PRAGMA schema_version`, count observations.
 fn check_db(db_path: &Path) -> CheckLine {
-    // Use rusqlite directly — rmlx-metrics::schema already exposes open_readonly
-    // but the CLI crate already has rusqlite as a direct dep (Cargo.toml).
+    // A plain rusqlite open: it does not go through rmlx_metrics::schema, so
+    // the WAL and busy_timeout pragmas are not applied.
     use rusqlite::Connection;
 
     if !db_path.exists() {
@@ -676,7 +676,7 @@ fn collect_model_paths(
 }
 
 // ---------------------------------------------------------------------------
-// Unit tests (J6)
+// Unit tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]

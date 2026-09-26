@@ -71,7 +71,7 @@ fn timeseries_sql(bucket_expr: &str, plausible: &str) -> String {
 ///
 /// Ranks `observations` directly rather than reading `bests`, because it ranks
 /// *within a time window* the view does not know about — so it carries both the
-/// §4.1 plausibility predicate and the cell key itself.
+/// `docs/METRICS_SCHEMA.md` §4.1 plausibility predicate and the cell key itself.
 fn window_sql(
     ts_cmp: &str,
     cell_pred: &str,
@@ -325,7 +325,7 @@ pub fn timeseries(
     };
 
     // A mean is as corruptible as a ranking: one implausible row drags the
-    // bucket it lands in. Same §4.1 predicate as `bests`.
+    // bucket it lands in. Same `docs/METRICS_SCHEMA.md` §4.1 predicate as `bests`.
     let plausible = crate::bests_view::plausible_sql("value");
 
     let mut sql = timeseries_sql(&bucket_expr, &plausible);
@@ -410,7 +410,8 @@ pub fn deltas(
     //
     // These two rank `observations` directly rather than reading `bests`,
     // because they rank *within a time window* the view does not know about.
-    // They must therefore carry the same §4.1 plausibility predicate the view
+    // They must therefore carry the same `docs/METRICS_SCHEMA.md` §4.1
+    // plausibility predicate the view
     // does — `deltas --exit-code` is a CI gate, and a gate that ranks rows the
     // champion view refuses is worse than no gate.
     let plausible = crate::bests_view::plausible_sql("value");

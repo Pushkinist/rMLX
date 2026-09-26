@@ -155,7 +155,7 @@ pub struct RunRecord {
     /// files here too, e.g. `"mtp/block=5"` or `"prefill_chunk=1024"`.
     ///
     /// `None` is every setting at its default. A value is validated against
-    /// the §3.2 grammar by
+    /// the `docs/METRICS_SCHEMA.md` §3.2 grammar by
     /// [`crate::cell::decode_config_is_well_formed`] in [`RunRecord::validate`]:
     /// the column is cell identity, so two spellings of one configuration
     /// would split its measurements into two cells that never rank against
@@ -179,7 +179,7 @@ pub struct RunRecord {
 /// way to build one is to copy a real record and change a field. That record
 /// still carries real identity, so if the probe's expectation is wrong the row
 /// lands in a live cell under a placeholder value and wins it. Two such rows
-/// reached this DB that way; they are named in docs/METRICS_DB.md and cannot be
+/// reached this DB that way; they are named in docs/METRICS_SCHEMA.md and cannot be
 /// taken back out, because the table is append-only.
 ///
 /// So a record may declare itself. Put this anywhere in `notes` or
@@ -263,7 +263,7 @@ pub enum PromptRef {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// One §8.5 metric measurement: a registry name, an optional value, and an optional stddev.
 pub struct MetricEntry {
-    /// Metric name matching a registry entry (see docs/METRICS_DB.md §4).
+    /// Metric name matching a registry entry (see docs/METRICS_SCHEMA.md §4).
     pub name: String,
     /// `None` → skipped (sparse). Recorder writes no row for null entries.
     pub value: Option<f64>,
@@ -306,7 +306,7 @@ pub(crate) enum IdentityPolicy {
 // ── RunRecord impl ────────────────────────────────────────────────────────────
 
 impl RunRecord {
-    /// Drops metric entries the §4 registry cannot read as a measurement,
+    /// Drops metric entries the `docs/METRICS_SCHEMA.md` §4 registry cannot read as a measurement,
     /// returning how many were dropped.
     ///
     /// For the *archive* converters only (`migrate::legacy`). Those tools'
@@ -329,7 +329,8 @@ impl RunRecord {
         before - self.metrics.len()
     }
 
-    /// Validates per §8.5 required fields + §4 metric registry + §5
+    /// Validates per `docs/METRICS_DB.md` §8.5 required fields,
+    /// `docs/METRICS_SCHEMA.md` §4 metric registry and `docs/METRICS_DB.md` §5
     /// whitelists (`backend`, `weight_quant`), enforcing the run-identity
     /// contract ([`IdentityPolicy::Enforce`]). `model_namespace`, `model`,
     /// and `kv_quant` are free-form recorded labels, not whitelisted — see
@@ -507,7 +508,7 @@ impl RunRecord {
                         "'{config}' describes an adaptive drafter as though its block \
                          were fixed; that configuration has never run. The engine \
                          composes '{corrected}', and migration 008 rewrote the rows \
-                         that predate it (docs/METRICS_DB.md §3.2)"
+                         that predate it (docs/METRICS_SCHEMA.md §3.2)"
                     ),
                 });
             }

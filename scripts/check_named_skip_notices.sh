@@ -14,9 +14,8 @@
 #   names nothing. The runner counts it — it will not attribute it to whichever
 #   test was nearby — so the run is marked INCOMPLETE with a number and no list,
 #   and the reader is told that something stood down without being told what.
-#   That is the state `make ci-perf` ends in today on a host holding every
-#   snapshot, and no number of snapshots fixes it: the notice cannot be
-#   attributed at any point after it is printed.
+#   No number of snapshots fixes that: the notice cannot be attributed at any
+#   point after it is printed.
 #
 #   So the rule is enforced where it can be fixed — at the source line. This
 #   scan is the recall half of the runner's report: the runner says how many
@@ -237,7 +236,7 @@ if [ "${n_silent}" -gt 0 ]; then
     echo "  SKIP <the test fn>: <why>" >&2
     echo "A helper takes the caller's test name as an argument and prints" >&2
     echo "\`SKIP {test}: <why>\`; it cannot name itself, because no libtest filter" >&2
-    echo "reaches a helper. See docs/TESTING.md." >&2
+    echo "reaches a helper. See docs/GPU_TESTS.md." >&2
     red=1
 fi
 
@@ -248,7 +247,7 @@ if [ "${n}" -gt 0 ]; then
     echo "scripts/run_gpu_tests.sh counts such a notice and lists it nowhere, so the run" >&2
     echo "is INCOMPLETE with a number and no name. Write it as" >&2
     echo "  SKIP <this test fn>: <why>" >&2
-    echo "See docs/TESTING.md." >&2
+    echo "See docs/GPU_TESTS.md." >&2
     red=1
 fi
 

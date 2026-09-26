@@ -8,9 +8,9 @@
 //!   universal `RunRecord` to `<RMLX_HOME>/metrics/runs.db` under op
 //!   `ppl_wikitext2`.
 //!
-//! Option A (HTTP `echo`+`logprobs`) was rejected because it required exposing
-//! per-position logits across every supported architecture's forward path —
-//! not surgical. Option B (this CLI subcommand) was chosen instead.
+//! The chat route does not serve `echo`+`logprobs`: that needs per-position
+//! logits across every architecture's forward path. This CLI subcommand scores
+//! perplexity instead.
 
 #![allow(clippy::cognitive_complexity)]
 use std::path::{Path, PathBuf};

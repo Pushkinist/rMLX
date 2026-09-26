@@ -237,7 +237,7 @@ pub fn decode_config(draft_kind: &str, block_size: usize, depth_policy: Option<&
     }
 }
 
-/// Whether `value` is a well-formed `decode_config` — see `docs/METRICS_DB.md`
+/// Whether `value` is a well-formed `decode_config` — see `docs/METRICS_SCHEMA.md`
 /// §3.2 for the grammar and why it is a grammar and not a free-form label.
 ///
 /// One or more `key=value` terms joined by `,`, no whitespace, terms strictly
@@ -300,7 +300,7 @@ pub fn decode_config_names_a_drafter(value: &str) -> bool {
 
 /// Whether every term of `value` spells a setting's own shipped default.
 ///
-/// `NULL` is the engine at its defaults (`docs/METRICS_DB.md` §3.2), so a
+/// `NULL` is the engine at its defaults (`docs/METRICS_SCHEMA.md` §3.2), so a
 /// string that says the same thing is a second spelling of one configuration —
 /// and two spellings are two cells that never rank against each other. This is
 /// how a whole campaign's rows can sit beside the rows they were meant to be

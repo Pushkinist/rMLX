@@ -14,9 +14,9 @@
 //!
 //! For single-request decoding (current rMLX) the block table is monotonically
 //! appended (no sharing, no eviction) and degenerates to contiguous
-//! behaviour — same peak memory, same TPS. The value is in future N3
-//! continuous-batching support: different requests can share a pool, return
-//! pages on completion, and avoid per-request max-seq pre-allocation.
+//! behaviour — same peak memory, same TPS. Sharing a pool across requests,
+//! returning pages on completion and avoiding per-request max-seq
+//! pre-allocation would need continuous batching, which rMLX does not have.
 //!
 //! # Submodules
 //!

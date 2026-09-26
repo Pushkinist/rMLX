@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# d8-phase1-measure.sh — D8 Phase 1: quantify first-dispatch MSL-compile tax.
+# d8-phase1-measure.sh — quantify the first-dispatch MSL-compile tax.
 #
 # Method: cold process -> req1 (small, max_tokens=8, short prompt) -> req2
 # (identical). delta(req1-req2) with prefill subtracted via an n1/n8 pair

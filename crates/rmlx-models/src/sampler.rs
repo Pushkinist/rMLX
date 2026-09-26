@@ -8,9 +8,10 @@
 // unsafe_code: mlx-rs Array zero-copy view — slice::from_raw_parts byte-reinterpret for Array::from_bytes (seed state)
 #![allow(unsafe_code)]
 
-//! Sampler module — A6.2 masked argmax + A7.2/A7.3 host categorical sampler.
+//! Sampler module — masked argmax, logit penalties and the host categorical
+//! sampler.
 //!
-//! # Final sampling pipeline (A7.4)
+//! # Sampling pipeline
 //!
 //! The per-arch decode loops select the next token through one of two paths:
 //!
@@ -22,7 +23,7 @@
 //! action: GPU argmax(&logits_flat, -1, device) — untouched, byte-identical
 //! ```
 //!
-//! When only a constraint mask is present (A6, no temperature):
+//! When only a constraint mask is present (no temperature):
 //! `apply_mask_argmax` keeps the argmax on-GPU with an additive -Inf bias.
 //!
 //! ## Host path: everything else
@@ -30,7 +31,7 @@
 //! One GPU→host transfer per step, then in order:
 //!
 //! ```text
-//! 1. constraint mask (A6) — forbidden ids → NEG_INF
+//! 1. constraint mask — forbidden ids → NEG_INF
 //! 2. logit_bias (additive) — logit[id] += bias
 //! 3. repetition_penalty — sign-aware multiplicative, last-20 window
 //! if logit < 0: logit *= p; else: logit /= p
@@ -50,15 +51,12 @@
 //! ### mlx-lm parity notes
 //!
 //! - **Application order** is exact mlx-lm parity: bias → rep → presence → freq,
-//!   then top_p → min_p → top_k. This differs from the original A7 task-doc
-//!   draft (which listed `penalties → top-k → top-p → min-p`); the code follows
-//!   mlx-lm, not the draft.
+//!   then top_p → min_p → top_k.
 //! - **Window size** is last-20 generated tokens (`context_size=20` in
 //!   mlx-lm), **not** full-context OpenAI semantics. Documented divergence:
 //!   long repeated passages beyond the 20-token window are NOT penalised.
-//! - **Speculative path**: temperature > 0 is rejected for speculative decoding
-//!   (spec candidates must be greedy). The server returns a 400 if a caller
-//!   combines `temperature > 0` with speculative parameters.
+//! - **Speculative path**: every speculative arm honours `temperature > 0`;
+//!   the verifier's draw samples with this module's pipeline.
 //!
 //! ### GPU masked argmax (greedy + constraint)
 //!
@@ -70,15 +68,14 @@
 //! 3. `add(logits, bias)` — GPU op; result is F32 regardless of input dtype.
 //! 4. `argmax` along axis -1 — produces `[1] I32`.
 //!
-//! Total overhead vs unconstrained: ~0.05 ms for the host-side bias fill
-//! (O(vocab) writes for 262K-token vocab).
+//! The host-side bias fill is O(vocab) writes per step.
 
 #![allow(clippy::float_cmp)]
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{add, argmax, Array, Device, Dtype};
 
 // ===========================================================================
-// A7.2 — host-side categorical sampler
+// Host-side categorical sampler
 // ===========================================================================
 //
 // `temperature == 0` keeps the existing GPU `argmax` / `apply_mask_argmax`
@@ -91,7 +88,7 @@ use rmlx_mlx::{add, argmax, Array, Device, Dtype};
 // 1. GPU→host transfer of the `[1, vocab]` logits (single transfer/step).
 // 2. (optional) constraint mask: forbidden ids → -inf, exactly as
 // `apply_mask_argmax` does for the greedy branch, so sampling composes
-// with A6 grammars.
+// with constraint grammars.
 // 3. Scale logits by `1/temperature`.
 // 4. Numerically-stable softmax → probability `Vec<f32>`.
 // 5. Pure-Rust filters in mlx-lm `sample_utils.py` order:
@@ -103,7 +100,7 @@ use rmlx_mlx::{add, argmax, Array, Device, Dtype};
 //
 // mlx-lm parity references (`mlx-lm/mlx_lm/sample_utils.py`):
 // - `make_sampler` L46-69 — `temp == 0 ⇒ argmax`; else chain
-// `top_p → min_p → (xtc) → top_k → categorical`. XTC is A7.x, skipped.
+// `top_p → min_p → (xtc) → top_k → categorical`. XTC is not implemented.
 // - `apply_top_p` L205-237 — ascending sort, **inclusive** cumsum,
 // keep where `cumprob > 1 - top_p` (replicated exactly below).
 // - `apply_min_p` L155-201 — keep where `prob >= max_prob * min_p`
@@ -115,7 +112,7 @@ use rmlx_mlx::{add, argmax, Array, Device, Dtype};
 // which is mathematically identical.
 
 // ===========================================================================
-// A7.3 — penalty configuration (non-Copy: contains Vec for logit_bias)
+// Penalty configuration (non-Copy: contains Vec for logit_bias)
 // ===========================================================================
 //
 // Design: kept separate from `SamplerConfig` so `SamplerConfig` stays `Copy`
@@ -127,7 +124,7 @@ use rmlx_mlx::{add, argmax, Array, Device, Dtype};
 // mlx-lm parity (`mlx_lm/sample_utils.py`):
 // - Application order (L106-126): logit_bias → repetition → presence → freq.
 // - Window: last 20 generated tokens (`context_size=20`).
-// - Composition with A6 mask: mask is applied BEFORE penalties so a
+// - Composition with the constraint mask: mask is applied BEFORE penalties so a
 // NEG_INF logit stays NEG_INF; penalising it is harmless but we keep
 // mask-first order for semantic clarity.
 //
@@ -135,7 +132,7 @@ use rmlx_mlx::{add, argmax, Array, Device, Dtype};
 // temp=0 AND !penalties_active → existing pure-GPU `argmax` / `apply_mask_argmax`
 // path untouched, byte-identical (the common case, zero overhead).
 
-/// Per-request logit-penalty configuration (A7.3).
+/// Per-request logit-penalty configuration.
 ///
 /// Passed alongside [`SamplerConfig`] and [`Pcg32`] into every arch
 /// `generate_greedy` function. All fields default to no-ops so callers that
@@ -161,7 +158,7 @@ pub struct PenaltyConfig {
     pub frequency_penalty: f32,
     /// `(token_id, bias)` pairs applied additively to logits before the
     /// repetition/presence/frequency steps. Out-of-vocab ids are skipped
-    /// silently (A7.1 already validated and stored them). Empty = no-op.
+    /// silently (the request layer already validated them). Empty = no-op.
     pub logit_bias: Vec<(u32, f32)>,
 }
 
@@ -191,7 +188,7 @@ impl PenaltyConfig {
     }
 }
 
-/// Apply all A7.3 logit processors to `logits` in place, in mlx-lm order:
+/// Apply all logit processors to `logits` in place, in mlx-lm order:
 /// `logit_bias → repetition → presence → frequency`.
 ///
 /// `recent_tokens` must be the **already-trimmed** trailing window (the caller
@@ -438,7 +435,7 @@ fn host_argmax(logits: &[f32]) -> usize {
 /// `rmlx-models` must not depend on `rmlx-server`, so the server constructs
 /// this small struct from its `SamplingParams` and passes it down through
 /// `Architecture::generate_greedy`. Only the fields the host sampler needs
-/// are mirrored; penalties + logit_bias live in [`PenaltyConfig`] (A7.3).
+/// are mirrored; penalties + logit_bias live in [`PenaltyConfig`].
 #[allow(
     clippy::exhaustive_structs,
     reason = "internal closed struct — six sampler knob fields; adding a knob requires updating sampling_active(), sampling_distribution(), and all arch generate_greedy call sites"
@@ -921,9 +918,9 @@ fn sample_inverse_cdf(probs: &[f32], r: f32) -> usize {
 ///
 /// `mask`: optional constraint allow-mask (length `vocab`). When `Some`,
 /// `mask[i] == false` ids get `-inf` logits **before** penalties and softmax —
-/// so A6 mask composes correctly: mask first, then penalties, then softmax.
+/// so the constraint mask composes correctly: mask first, then penalties, then softmax.
 ///
-/// `penalty_cfg`: A7.3 penalty configuration. Applied after the constraint
+/// `penalty_cfg`: penalty configuration. Applied after the constraint
 /// mask, before softmax, in mlx-lm order: logit_bias → rep → presence → freq.
 /// `penalty_cfg.penalties_active() == false` skips the `apply_penalties` call.
 ///
@@ -1168,7 +1165,7 @@ pub fn stochastic_accept(p: &[f32], q: &[f32], x: u32, rng: &mut Pcg32) -> Resul
 ///
 /// Computed only when `SamplerConfig::top_logprobs_k > 0`. The disabled path
 /// (`k == 0`) never constructs this — no log-softmax, no top-k, no alloc — so
-/// the default greedy/sampling decode is byte-identical to before .
+/// the default greedy/sampling decode does no logprob work.
 ///
 /// Logprobs are natural-log probabilities of the **raw** model logits
 /// (temperature / penalties / nucleus filters are NOT applied — OpenAI reports

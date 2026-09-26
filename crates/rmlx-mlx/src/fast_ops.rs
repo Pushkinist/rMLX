@@ -42,8 +42,8 @@ use crate::{
 /// When weight is None we pass a default-constructed empty handle (ctx=null).
 pub fn rms_norm(x: &Array, weight: Option<&Array>, eps: f32, device: Device) -> Result<Array> {
     install_error_handler();
-    // When weight is None, pass the cached null sentinel (ch-18 F1).
-    // Previously: mlx_array_new() + mlx_array_free() per call.
+    // When weight is None, pass the cached null sentinel.
+    // A cached sentinel, not an mlx_array_new() + mlx_array_free() per call.
     let w_arr = match weight {
         Some(w) => w.inner,
         None => null_sentinel(),
@@ -85,7 +85,7 @@ pub fn rope(
         has_value: true,
     };
     // freqs = null sentinel (let MLX compute from base).
-    // Previously: mlx_array_new() + mlx_array_free() per call (ch-18 F1).
+    // A cached sentinel, not an mlx_array_new() + mlx_array_free() per call.
     let freqs_null = null_sentinel();
     let mut res = unsafe { sys::mlx_array_new() };
     let status = unsafe {
@@ -138,7 +138,7 @@ pub fn rope_dynamic(
         value: base,
         has_value: true,
     };
-    // freqs = null sentinel (ch-18 F1).
+    // freqs = null sentinel.
     let freqs_null = null_sentinel();
     let mut res = unsafe { sys::mlx_array_new() };
     let status = unsafe {
@@ -288,12 +288,12 @@ pub fn scaled_dot_product_attention(
 ) -> Result<Array> {
     install_error_handler();
     let mode_cstr = mode_to_cstr(mask_mode, "scaled_dot_product_attention")?;
-    // When mask_arr is None, use the cached null sentinel (ch-18 F1).
+    // When mask_arr is None, use the cached null sentinel.
     let mask_inner = match mask_arr {
         Some(m) => m.inner,
         None => null_sentinel(),
     };
-    // sinks = null sentinel (not used for causal/sliding window in Stage 1).
+    // sinks = null sentinel (not used for causal/sliding window).
     let sinks_null = null_sentinel();
     let mut res = unsafe { sys::mlx_array_new() };
     let status = unsafe {

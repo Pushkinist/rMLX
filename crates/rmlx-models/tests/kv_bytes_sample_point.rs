@@ -113,7 +113,7 @@ fn generate_and_read_bytes(
 }
 
 /// Process resident-set size in bytes (macOS `ps -o rss=`, reported in KiB).
-/// The #246/#258 anchor method: compare the reported KV bytes against the real
+/// The anchor method: compare the reported KV bytes against the real
 /// resident growth of the process, so the metric is tied to reality rather than
 /// to its own formula.
 fn process_rss_bytes() -> u64 {

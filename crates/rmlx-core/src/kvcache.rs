@@ -1,8 +1,8 @@
 //! KV-cache abstraction.
 //!
 //! KV-cache abstraction: dispatched as enum, not boxed trait, because per-layer
-//! cache type is fixed at model-load time. See docs/04-rust-stack-options.md
-//! and the mistral.rs `KvCache` enum for the same pattern.
+//! cache type is fixed at model-load time. The mistral.rs `KvCache` enum uses
+//! the same pattern.
 
 /// What gets used at each transformer layer for K/V storage.
 #[derive(Debug)]

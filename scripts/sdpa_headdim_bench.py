@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """What MLX's SDPA dispatch costs as a function of `head_dim`.
 
-Reproduces the measurement block in `docs/FFI.md`
-§`scaled_dot_product_attention` → "Head-dim dispatch and the unfused fallback".
-Re-run this whenever the pinned MLX pair moves: the numbers in that doc are
-valid only for the metallib this script reports at startup.
+`docs/FFI.md` § "Head-dim dispatch and the unfused fallback" names this
+script and records no numbers. A result is valid only for the metallib this
+script reports at startup, so re-run it whenever the pinned MLX pair moves.
 
 MLX ships a fused prefill kernel (`steel_attention`) only at `head_dim`
 64 / 80 / 128, and a fused decode kernel (`sdpa_vector`) only at 64 / 96 / 128 /

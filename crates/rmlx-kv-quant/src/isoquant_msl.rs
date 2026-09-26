@@ -2,8 +2,8 @@
 //!
 //! # Status
 //!
-//! Kernel hook landed. GPU execution leg is `#[ignore]`-gated. CPU path
-//! in `isoquant.rs` remains primary until T11e perf gates are evaluated.
+//! The GPU tests are `#[ignore]`-gated. `isoquant.rs` holds the CPU
+//! reference path.
 //!
 //! # Algorithm
 //!
@@ -187,8 +187,7 @@ fn build_msl_header_iso3() -> String {
 //   head_dim = n_groups * ISO3_GS
 //
 // The per-token L2 norm is recomputed redundantly by each group thread in the
-// same token (all threads read the full token row). Acceptable for a hook
-// implementation; T11e may introduce a two-pass approach if GPU time dominates.
+// same token (all threads read the full token row).
 //
 // Outputs:
 //   codes_out  : u32 [n_tokens * iso_row_words(head_dim, ISO3_BITS)] — the dense code plane
@@ -355,7 +354,6 @@ pub fn iso_quantize_v3_gpu(
     let codes = outputs.remove(0);
 
     // Quaternions: all fixed — emit a constant array (total_groups * 4 entries).
-    // T11e (per-group optimised quaternions) will replace this with per-group values.
     let quat_len = total_groups * 4;
     let quat_bytes: Vec<u8> = FIXED_QUAT
         .iter()

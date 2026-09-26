@@ -1,4 +1,4 @@
-//! Prompt registry per `docs/METRICS_DB.md` §3.1 + §8.7.
+//! Prompt registry per `docs/METRICS_SCHEMA.md` §3.1 and `docs/METRICS_DB.md` §8.7.
 //!
 //! Prompts are content-addressed by SHA-256 over the canonical JSON of the
 //! prompt body. This allows observations to reference a prompt by hash

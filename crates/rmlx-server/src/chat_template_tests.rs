@@ -396,13 +396,13 @@ fn gemma4_render_matches_hf_reference_byte_for_byte() {
     );
 }
 
-// ── A5.2: tool injection tests ────────────────────────────────────────────
+// ── Tool injection tests ────────────────────────────────────────────
 
 /// Empty tools slice must NOT produce a `<tools>` block.
 ///
 /// The `{% if tools %}` branch in Qwen3 (and most other templates) requires
 /// the tools list to be truthy. An empty list is falsy in Jinja, so the
-/// render output must be byte-identical to pre-A5.2 output.
+/// render output must be byte-identical to the tool-free render.
 #[test]
 fn qwen3_empty_tools_no_tools_block() {
     let Some(snap_buf) = qwen36_snap_dir() else {
@@ -586,7 +586,7 @@ fn qwen3_renders_full_tool_conversation() {
     );
 }
 
-/// A5.2 invariant: a plain system+user render must be byte-identical to the
+/// Invariant: a plain system+user render must be byte-identical to the
 /// pre-tool-support output. Same fixture as
 /// `qwen36_render_matches_hf_reference_byte_for_byte`; guards that the
 /// optional tool keys stay absent (and the context map stays {role,
@@ -630,7 +630,7 @@ fn qwen3_plain_render_byte_identical_after_tool_support() {
     let expected = "<|im_start|>system\nYou are a senior Python developer. DO NOT think out loud. DO NOT explain. Output exactly one ```python ... ``` block containing the full file. No prose before or after.<|im_end|>\n<|im_start|>user\nWrite a Python function add(a, b) returning a+b.\n\n/no_think<|im_end|>\n<|im_start|>assistant\n<think>\n";
     assert_eq!(
         r.text, expected,
-        "plain render diverged after tool-support change (A5.2 invariant)"
+        "plain render diverged from the tool-free render"
     );
 }
 
