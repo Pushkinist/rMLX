@@ -50,7 +50,7 @@ use sha2::{Digest, Sha256};
 use tracing::{info, instrument, warn};
 
 use crate::commands::calibration_softmax::SoftmaxMassSink;
-use crate::commands::parse::{claim_gpu, exit_if_held};
+use crate::commands::parse::{claim_gpu, exit_if_held, ClaimedDevice};
 
 /// Default mass coverage threshold for the head_budget recipe.
 const DEFAULT_HEAD_BUDGET_MASS_THRESHOLD: f32 = 0.95;
@@ -306,9 +306,9 @@ fn run_head_budget(
         anyhow::bail!("kv-calibrate --recipe head_budget: no usable prompts after tokenisation");
     }
 
-    let (device, claim) = exit_if_held(claim_gpu())?;
+    let gpu = exit_if_held(claim_gpu())?;
     let t_load = Instant::now();
-    let model = load_qwen3_for_calibration(model_dir, device, &claim)?;
+    let model = load_qwen3_for_calibration(model_dir, &gpu)?;
     let load_secs = t_load.elapsed().as_secs_f64();
     info!(
         load_secs,
@@ -326,9 +326,8 @@ fn run_head_budget(
     );
 
     let t_measure = Instant::now();
-    let measurement =
-        measure_head_budgets_qwen3(&model, &tokenised, mass_threshold, device, &claim)
-            .map_err(|e| anyhow::anyhow!("measure_head_budgets_qwen3: {e}"))?;
+    let measurement = measure_head_budgets_qwen3(&model, &tokenised, mass_threshold, &gpu)
+        .map_err(|e| anyhow::anyhow!("measure_head_budgets_qwen3: {e}"))?;
     let measure_secs = t_measure.elapsed().as_secs_f64();
     info!(
         measure_secs,
@@ -506,9 +505,9 @@ fn run_softmax_mass(
         anyhow::bail!("kv-calibrate --recipe softmax_mass: no usable prompts after tokenisation");
     }
 
-    let (device, claim) = exit_if_held(claim_gpu())?;
+    let gpu = exit_if_held(claim_gpu())?;
     let t_load = Instant::now();
-    let model = load_qwen3_for_calibration(model_dir, device, &claim)?;
+    let model = load_qwen3_for_calibration(model_dir, &gpu)?;
     let load_secs = t_load.elapsed().as_secs_f64();
     let num_layers = model.cfg.num_hidden_layers;
     let n_q_heads = model.cfg.num_attention_heads;
@@ -537,6 +536,7 @@ fn run_softmax_mass(
     );
 
     let t_measure = Instant::now();
+    let device = gpu.device();
     for (prompt_idx, ids) in tokenised.iter().enumerate() {
         let seq = ids.len();
         let mut caches: Vec<KvCache> = (0..num_layers)
@@ -646,19 +646,15 @@ fn load_tokenizer(model_dir: &Path) -> anyhow::Result<tokenizers::Tokenizer> {
 // ── Model load + softmax-mass measurement ────────────────────────────────────
 
 use rmlx_kv_quant::{KvCache, KvQuant};
-use rmlx_mlx::{Array, Device, Dtype};
+use rmlx_mlx::{Array, Dtype};
 use rmlx_models::arch;
 use rmlx_models::arch::Architecture;
 use rmlx_models::qwen3::Qwen3Text;
-use rmlx_server::MetalClaim;
 
-/// Load the Qwen3 model on `device`. The caller holds `_claim` until the model
-/// is dropped.
-fn load_qwen3_for_calibration(
-    model_dir: &Path,
-    device: Device,
-    _claim: &MetalClaim,
-) -> anyhow::Result<Qwen3Text> {
+/// Load the Qwen3 model on the GPU. The caller holds `gpu` until the model is
+/// dropped.
+fn load_qwen3_for_calibration(model_dir: &Path, gpu: &ClaimedDevice) -> anyhow::Result<Qwen3Text> {
+    let device = gpu.device();
     let arch = arch::load_model(model_dir, device, &arch::LoadOpts::default())
         .map_err(|e| anyhow::anyhow!("load_model: {e}"))?;
     let arch_name = arch.arch_class();
@@ -704,9 +700,9 @@ fn measure_head_budgets_qwen3(
     model: &Qwen3Text,
     tokenised_prompts: &[Vec<u32>],
     mass_threshold: f32,
-    device: Device,
-    _claim: &MetalClaim,
+    gpu: &ClaimedDevice,
 ) -> anyhow::Result<HeadBudgetMeasurement> {
+    let device = gpu.device();
     let num_layers = model.cfg.num_hidden_layers;
     let n_q_heads = model.cfg.num_attention_heads;
     let n_kv_heads = model.cfg.num_key_value_heads;

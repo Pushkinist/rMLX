@@ -31,7 +31,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use rmlx_mlx::Device;
+use crate::commands::parse::ClaimedDevice;
 use rmlx_models::{arch, classify_kv_bytes, CacheStats, KvBytesVerdict};
 use tracing::{info, warn};
 
@@ -587,15 +587,15 @@ pub(crate) fn sample_from_arrivals(
     reason = "internal closed struct — the argument bundle main.rs builds for the single call site"
 )]
 #[derive(Debug)]
-pub(crate) struct BenchArgs {
+pub(crate) struct BenchArgs<'a> {
     /// Model snapshot directory.
     pub model: PathBuf,
     /// Prompt file (plain text or chat-JSON fixture).
     pub prompt: PathBuf,
     /// Short label for the prompt in the summary.
     pub prompt_label: String,
-    /// Inference device.
-    pub device: Device,
+    /// Inference device, with the claim a GPU device needs.
+    pub device: &'a ClaimedDevice,
     /// Tokens to generate per run.
     pub max_tokens: u32,
     /// Measured runs (>= `MIN_RUNS`).
@@ -629,7 +629,7 @@ pub(crate) struct BenchArgs {
 /// benchable, but not a cell any served request can reach.
 const MAX_TEMPERATURE: f32 = 2.0;
 
-impl BenchArgs {
+impl BenchArgs<'_> {
     /// `true` when the cell routes through the host sampler rather than the GPU
     /// argmax. Mirrors the decode loop's own gate
     /// (`sampling_active() || penalties_active()`); it exists here so the
@@ -743,7 +743,7 @@ fn measure_one(
             tokenizer,
             prompt_ids,
             args.max_tokens as usize,
-            args.device,
+            args.device.device(),
             Some(args.kv_quant),
             args.max_ctx,
             BENCH_PROMPT_CACHE_SLOTS,
@@ -979,13 +979,13 @@ fn prepare_prompt(
         prompt_ids.len(),
         args.max_prompt_tokens,
         ceiling,
-        args.device,
+        args.device.device(),
         args.allow_truncate,
     )?;
     prompt_ids.truncate(effective_len);
     info!(
         model = %args.model.display(),
-        device = ?args.device,
+        device = ?args.device.device(),
         kv_quant = %args.kv_quant,
         prompt_tokens = prompt_ids.len(),
         max_ctx = ceiling,
@@ -1106,7 +1106,7 @@ fn collect_samples(
     clippy::needless_pass_by_value,
     reason = "owns the argument bundle for the whole invocation; main.rs builds it and hands it over"
 )]
-pub(crate) fn run_bench(args: BenchArgs) -> anyhow::Result<()> {
+pub(crate) fn run_bench(args: BenchArgs<'_>) -> anyhow::Result<()> {
     if args.runs < MIN_RUNS {
         return Err(anyhow::anyhow!(
             "--runs must be at least {MIN_RUNS}: a single measurement has no observable \
@@ -1128,8 +1128,12 @@ pub(crate) fn run_bench(args: BenchArgs) -> anyhow::Result<()> {
     }
 
     let load_start = Instant::now();
-    let model = arch::load_model(&args.model, args.device, &arch::LoadOpts::default())
-        .map_err(|e| anyhow::anyhow!("arch::load_model: {e}"))?;
+    let model = arch::load_model(
+        &args.model,
+        args.device.device(),
+        &arch::LoadOpts::default(),
+    )
+    .map_err(|e| anyhow::anyhow!("arch::load_model: {e}"))?;
     let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
     info!(load_ms, arch = model.arch_class(), "bench: model loaded");
 
@@ -1175,7 +1179,7 @@ pub(crate) fn run_bench(args: BenchArgs) -> anyhow::Result<()> {
 struct ReportCtx<'a> {
     model_name: &'a str,
     arch_class: &'a str,
-    args: &'a BenchArgs,
+    args: &'a BenchArgs<'a>,
     prompt_tokens: usize,
     gen_tokens: usize,
     load_ms: f64,

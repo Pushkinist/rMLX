@@ -27,8 +27,9 @@
 
 use std::path::{Path, PathBuf};
 
-use rmlx_mlx::Device;
-use rmlx_server::{ClaimError, MetalClaim, ModelRegistry, RegistryConfig};
+use rmlx_server::{ClaimError, ModelRegistry, RegistryConfig};
+
+use crate::commands::parse::ClaimedDevice;
 use tracing::debug;
 
 // ---------------------------------------------------------------------------
@@ -139,7 +140,7 @@ pub(crate) fn run_healthcheck(
             let claim = crate::commands::parse::claim_gpu();
             for path in &model_paths {
                 let line = match &claim {
-                    Ok((device, claim)) => check_smoke(path, *device, claim),
+                    Ok(gpu) => check_smoke(path, gpu),
                     Err(e) => smoke_refused(path, e),
                 };
                 if line.status == Status::Red {
@@ -404,7 +405,7 @@ fn smoke_refused(path: &Path, refusal: &ClaimError) -> CheckLine {
 }
 
 /// Check 4 (--full only): run the existing smoke probe via `rmlx info --probe-smoke`.
-fn check_smoke(path: &Path, device: Device, _claim: &MetalClaim) -> CheckLine {
+fn check_smoke(path: &Path, gpu: &ClaimedDevice) -> CheckLine {
     use rmlx_metrics::events::EventRecorder;
 
     let id = smoke_id(path);
@@ -426,7 +427,7 @@ fn check_smoke(path: &Path, device: Device, _claim: &MetalClaim) -> CheckLine {
         path,
         false, // probe_forward = false
         true,  // probe_smoke = true
-        Some(device),
+        Some(gpu),
         None, // kv_quant_override = auto
         None, // max_ctx_override = auto
         &sink,

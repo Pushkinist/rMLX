@@ -12,6 +12,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use crate::commands::parse::ClaimedDevice;
 use rmlx_metrics::events::EventRecorder;
 use rmlx_metrics::identity::RunIdentity;
 use rmlx_mlx::Device;
@@ -363,7 +364,7 @@ fn tokenize_chat_fixture(
 pub(crate) fn run_baseline(
     model_path: &Path,
     prompt_path: &Path,
-    device: Device,
+    claimed: &ClaimedDevice,
     device_label: &str,
     max_tokens: u32,
     run_id: &str,
@@ -377,6 +378,7 @@ pub(crate) fn run_baseline(
     sink: &EventRecorder,
     record_args: Option<BaselineRecordArgs<'_>>,
 ) -> anyhow::Result<()> {
+    let device = claimed.device();
     // -- Read prompt file -------------------------------------------------------
     let prompt_text = std::fs::read_to_string(prompt_path)
         .map_err(|e| anyhow::anyhow!("cannot read prompt file {}: {e}", prompt_path.display()))?;

@@ -18,6 +18,8 @@ use rmlx_audio::transcribe::{render, OutputFormat, TranscribeOptions, Transcribe
 use rmlx_audio::wav::WavDecoder;
 use rmlx_audio::whisper::WhisperModel;
 use rmlx_mlx::Device;
+
+use crate::commands::parse::ClaimedDevice;
 use std::sync::Arc;
 use tracing::info;
 
@@ -43,7 +45,8 @@ pub(crate) struct TranscribeArgs<'a> {
 /// Dispatch on the snapshot's architecture and run transcription.
 ///
 /// Returns the rendered output string (caller prints to stdout or writes a file).
-pub(crate) fn run_transcribe(args: &TranscribeArgs, device: Device) -> Result<String> {
+pub(crate) fn run_transcribe(args: &TranscribeArgs, claimed: &ClaimedDevice) -> Result<String> {
+    let device = claimed.device();
     let cfg_path = args.model.join("config.json");
     let cfg_str = std::fs::read_to_string(&cfg_path)
         .with_context(|| format!("read {}", cfg_path.display()))?;

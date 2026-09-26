@@ -31,11 +31,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::commands::parse::ClaimedDevice;
 use rmlx_core::runinfo::make_run_id;
 use rmlx_core::DispatchPolicy;
 use rmlx_loader::{discover_kv_calibration, load_config, load_head_budgets};
 use rmlx_metrics::events::EventRecorder;
-use rmlx_mlx::Device;
 use rmlx_server::{
     register_ssd_prom_hooks, spawn_drainer, AppState, ArchGenerator, KeepAlivePolicy,
     ModelLoadConfig, ModelLoader, ModelRegistry, RegistryConfig, SpeculativeGenerator, TtftStore,
@@ -462,7 +462,7 @@ pub(crate) fn run_serve(
     registry_file: Option<&Path>,
     host: &str,
     port: u16,
-    device: Device,
+    claimed: &ClaimedDevice,
     kv_quant_override: Option<rmlx_kv_quant::KvQuant>,
     max_ctx_override: Option<i32>,
     idle_timeout_spec: Option<String>,
@@ -510,6 +510,7 @@ pub(crate) fn run_serve(
     image_max_tokens: Option<usize>,
     sink: &EventRecorder,
 ) -> anyhow::Result<()> {
+    let device = claimed.device();
     // The TurboFlash / planar-flash-decode gates are resolved in `main`, before
     // any subcommand dispatch, alongside `--fused-qk`, `--sparse-attn` and
     // `--rot-k-fused`. Resolving them per-subcommand would let `serve` and the

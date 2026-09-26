@@ -21,6 +21,7 @@
 use std::io::Write as _;
 use std::path::Path;
 
+use crate::commands::parse::ClaimedDevice;
 use rmlx_loader::{
     count_tensors_per_shard, load_config, load_shard_index, resolve, resolve_paro, view, ShardSet,
     TensorKind,
@@ -117,7 +118,7 @@ pub(crate) fn run_info(
     model_path: &Path,
     probe_forward: bool,
     probe_smoke: bool,
-    probe_device: Option<Device>,
+    probe_device: Option<&ClaimedDevice>,
     kv_quant_override: Option<rmlx_kv_quant::KvQuant>,
     max_ctx_override: Option<i32>,
     sink: &EventRecorder,
@@ -412,7 +413,10 @@ pub(crate) fn run_info(
     }
 
     // -- forward probe ---------------------------------------------------------
-    if let Some(device) = probe_device.filter(|_| probe_forward) {
+    if let Some(device) = probe_device
+        .filter(|_| probe_forward)
+        .map(ClaimedDevice::device)
+    {
         info!(arch = %arch, ?device, "forward_probe: loading model via arch::load_model");
         match arch::load_model(model_path, device, &arch::LoadOpts::default()) {
             Err(e) => {
@@ -450,7 +454,10 @@ pub(crate) fn run_info(
     }
 
     // -- smoke probe ----------------------------------------------------------
-    if let Some(device) = probe_device.filter(|_| probe_smoke) {
+    if let Some(device) = probe_device
+        .filter(|_| probe_smoke)
+        .map(ClaimedDevice::device)
+    {
         info!(arch = %arch, ?device, "smoke_probe: loading model via arch::load_model");
 
         // Load model via architecture dispatch.

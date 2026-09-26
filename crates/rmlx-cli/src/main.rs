@@ -2283,7 +2283,7 @@ fn main() -> Result<()> {
                 return Err(anyhow::anyhow!(msg));
             }
 
-            let (dev, _claim) = parse_device(&device)?;
+            let claimed = parse_device(&device)?;
             // Build YARN override from CLI flags. None when either flag is absent.
             let yarn_override = yarn_factor.map(|factor| rmlx_models::qwen3::YarnOverride {
                 factor,
@@ -2294,7 +2294,7 @@ fn main() -> Result<()> {
                 registry.as_deref(),
                 &host,
                 port,
-                dev,
+                &claimed,
                 kv_quant_final,
                 max_ctx_override,
                 idle_timeout_spec,
@@ -2368,7 +2368,7 @@ fn main() -> Result<()> {
                     kv_group_size,
                 )?
             };
-            let (_device, _claim) = parse_device(&device)?;
+            let _claimed = parse_device(&device)?;
             println!("rmlx chat   model={}  device={device}", model.display());
         }
         Cmd::Transcribe {
@@ -2381,7 +2381,7 @@ fn main() -> Result<()> {
             output,
             device,
         } => {
-            let (dev, _claim) = parse_device(&device)?;
+            let claimed = parse_device(&device)?;
             let args = commands::transcribe::TranscribeArgs {
                 audio: &audio,
                 model: &model,
@@ -2390,7 +2390,7 @@ fn main() -> Result<()> {
                 language: &language,
                 translate,
             };
-            let rendered = commands::transcribe::run_transcribe(&args, dev)?;
+            let rendered = commands::transcribe::run_transcribe(&args, &claimed)?;
             match output {
                 Some(path) => {
                     std::fs::write(&path, rendered.as_bytes())
@@ -2452,17 +2452,16 @@ fn main() -> Result<()> {
             };
             // Only a probe runs MLX, so only a probe parses the device and
             // takes the claim.
-            let (kv_quant_resolved, probe_device, _claim) = if probe_forward || probe_smoke {
-                let (dev, claim) = parse_device(&device)?;
-                (Some(kv_quant_final), Some(dev), claim)
+            let (kv_quant_resolved, probe_device) = if probe_forward || probe_smoke {
+                (Some(kv_quant_final), Some(parse_device(&device)?))
             } else {
-                (None, None, None)
+                (None, None)
             };
             let exit_code = run_info(
                 &model,
                 probe_forward,
                 probe_smoke,
-                probe_device,
+                probe_device.as_ref(),
                 kv_quant_resolved,
                 max_ctx_override,
                 &sink,
@@ -2569,7 +2568,7 @@ fn main() -> Result<()> {
                     kv_group_size,
                 )?
             };
-            let (dev, _claim) = parse_device(&device)?;
+            let claimed = parse_device(&device)?;
 
             // Resolve --prompt-tokens → canonical longctx file when present.
             // The prompts/ dir lives at the workspace root; locate it via the
@@ -2633,7 +2632,7 @@ fn main() -> Result<()> {
             let baseline_result = run_baseline(
                 &model,
                 &effective_prompt_path,
-                dev,
+                &claimed,
                 &device,
                 max_tokens,
                 &run_id,
@@ -2707,7 +2706,7 @@ fn main() -> Result<()> {
                     kv_group_size,
                 )?
             };
-            let (dev, _claim) = parse_device(&device)?;
+            let claimed = parse_device(&device)?;
 
             let prompts_root = resolve_prompts_root(prompts_dir);
             let (prompt_path, prompt_label) =
@@ -2717,7 +2716,7 @@ fn main() -> Result<()> {
                 model,
                 prompt: prompt_path,
                 prompt_label,
-                device: dev,
+                device: &claimed,
                 max_tokens,
                 runs,
                 warmup,
@@ -2795,14 +2794,14 @@ fn main() -> Result<()> {
                     )?;
                     Some(kq)
                 };
-                let (dev, _claim) = parse_device(&device)?;
+                let claimed = parse_device(&device)?;
                 run_ppl(
                     &model,
                     &text_file,
                     ctx_window,
                     stride,
                     &corpus,
-                    dev,
+                    &claimed,
                     max_tokens,
                     &run_id,
                     git_sha.as_deref(),

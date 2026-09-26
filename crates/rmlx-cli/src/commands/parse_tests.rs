@@ -8,10 +8,10 @@ use rmlx_models::kv_cache::{CacheType, CacheTypeSpec};
 
 #[test]
 fn parse_device_cpu_takes_no_claim() {
-    let (device, claim) =
+    let cpu =
         device_from_flag("cpu", || panic!("--device cpu must not claim")).expect("cpu parses");
-    assert_eq!(device, Device::Cpu);
-    assert!(claim.is_none());
+    assert_eq!(cpu.device(), Device::Cpu);
+    assert!(!cpu.holds_claim());
 }
 
 #[test]

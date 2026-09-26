@@ -16,9 +16,9 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use crate::commands::parse::ClaimedDevice;
 use anyhow::Result;
 use rmlx_metrics::identity::RunIdentity;
-use rmlx_mlx::Device;
 use rmlx_models::{arch, ppl};
 use tracing::{info, instrument, warn};
 
@@ -37,7 +37,7 @@ use tracing::{info, instrument, warn};
     ctx_window,
     stride,
     corpus,
-    ?device,
+    device = ?claimed.device(),
     ?kv_quant,
 ))]
 #[allow(clippy::too_many_arguments)]
@@ -51,12 +51,13 @@ pub(crate) fn run_ppl(
     ctx_window: usize,
     stride: usize,
     corpus: &str,
-    device: Device,
+    claimed: &ClaimedDevice,
     max_tokens: usize,
     run_id: &str,
     git_sha: Option<&str>,
     kv_quant: Option<rmlx_kv_quant::KvQuant>,
 ) -> Result<()> {
+    let device = claimed.device();
     // -- Read corpus + tokenize ------------------------------------------------
     let corpus_text = std::fs::read_to_string(text_file)
         .map_err(|e| anyhow::anyhow!("cannot read text file {}: {e}", text_file.display()))?;

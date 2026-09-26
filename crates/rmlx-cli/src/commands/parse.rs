@@ -10,8 +10,9 @@
 //!
 //! - [`parse_device`] — `"cpu"` / `"gpu"` string → [`rmlx_mlx::Device`],
 //!   with the Metal claim when the device is the GPU.
-//! - [`claim_gpu`] — the GPU device together with the Metal claim. It is the
-//!   only place this binary names the GPU device.
+//! - [`ClaimedDevice`] — a device together with the claim a GPU device needs.
+//! - [`claim_gpu`] — the GPU device with the Metal claim. It is the only place
+//!   this binary names the GPU device.
 //! - [`exit_if_held`] — exit with code 11 when another process holds the claim.
 //! - [`parse_kv_quant`] — `--kv-quant` string → `Option<KvQuant>`.
 //! - [`parse_kv_preset`] — `--kv-preset` name → [`KvPresetArg`] via the
@@ -39,38 +40,65 @@ use tracing::error;
 
 use crate::commands::preset_table::{lookup_preset, PresetError, AVAILABLE_NAMES};
 
-/// Parse the `--device` flag value. `"gpu"` takes the Metal claim, which the
-/// caller holds until its last GPU work ends; `"cpu"` takes none.
-pub(crate) fn parse_device(s: &str) -> anyhow::Result<(Device, Option<MetalClaim>)> {
+/// A device together with the Metal claim a GPU device needs. A command's GPU
+/// work runs inside a fn that borrows this value, so the claim cannot be
+/// dropped before that work ends.
+#[derive(Debug)]
+pub(crate) struct ClaimedDevice {
+    device: Device,
+    claim: Option<MetalClaim>,
+}
+
+impl ClaimedDevice {
+    /// The CPU device, which takes no claim.
+    pub(crate) const fn cpu() -> Self {
+        Self {
+            device: Device::Cpu,
+            claim: None,
+        }
+    }
+
+    pub(crate) fn device(&self) -> Device {
+        self.device
+    }
+
+    pub(crate) fn holds_claim(&self) -> bool {
+        self.claim.is_some()
+    }
+}
+
+/// Parse the `--device` flag value. `"gpu"` takes the Metal claim; `"cpu"`
+/// takes none.
+pub(crate) fn parse_device(s: &str) -> anyhow::Result<ClaimedDevice> {
     device_from_flag(s, || exit_if_held(claim_gpu()))
 }
 
 fn device_from_flag(
     s: &str,
-    claim_gpu: impl FnOnce() -> anyhow::Result<(Device, MetalClaim)>,
-) -> anyhow::Result<(Device, Option<MetalClaim>)> {
-    let (device, claim) = match s {
-        "cpu" => (Device::Cpu, None),
-        "gpu" => {
-            let (device, claim) = claim_gpu()?;
-            (device, Some(claim))
-        }
+    claim_gpu: impl FnOnce() -> anyhow::Result<ClaimedDevice>,
+) -> anyhow::Result<ClaimedDevice> {
+    let device = match s {
+        "cpu" => ClaimedDevice::cpu(),
+        "gpu" => claim_gpu()?,
         other => {
             return Err(anyhow::anyhow!(
                 "--device must be 'cpu' or 'gpu', got '{other}'"
             ))
         }
     };
-    tracing::info!(device = s, "resolved device");
-    Ok((device, claim))
+    tracing::info!(device = s, claim = device.holds_claim(), "resolved device");
+    Ok(device)
 }
 
-/// The GPU device, and the Metal claim that must outlive every use of it.
+/// The GPU device with the Metal claim.
 ///
 /// # Errors
 /// The refusal from [`try_claim`].
-pub(crate) fn claim_gpu() -> Result<(Device, MetalClaim), ClaimError> {
-    try_claim().map(|claim| (Device::Gpu, claim))
+pub(crate) fn claim_gpu() -> Result<ClaimedDevice, ClaimError> {
+    try_claim().map(|claim| ClaimedDevice {
+        device: Device::Gpu,
+        claim: Some(claim),
+    })
 }
 
 /// Exit with code 11 when another process holds the Metal claim; any other
