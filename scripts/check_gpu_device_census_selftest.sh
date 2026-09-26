@@ -127,7 +127,7 @@ printf '// header\nfn a() -> X {\n    parse_device(s)\n}\nfn b(c: &ClaimedDevice
 case_run "tail_expression_then_fn" "commands/x.rs" 0 "ok (1 site" "$root"
 
 root="$(fresh definition_is_not_a_call)"
-printf '// header\npub(crate) fn claim_gpu() -> Result<ClaimedDevice, E> {\n    try_claim().map(|c| ClaimedDevice { claim: Some(c) })\n}\n' >"$root/commands/y.rs"
+printf '// header\npub(crate) fn claim_gpu() -> Result<ClaimedDevice, E> {\n    let claimed = ClaimedDevice { claim: None };\n    Ok(claimed)\n}\n' >"$root/commands/y.rs"
 case_run "definition_is_not_a_call" "commands/y.rs" 0 "ok (1 site" "$root"
 
 case_run "one_site" "the legitimate site alone passes" 0 \
