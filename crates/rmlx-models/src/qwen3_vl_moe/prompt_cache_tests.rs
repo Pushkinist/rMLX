@@ -121,3 +121,65 @@ fn ssd_hydrated_entry_field_invariants() {
         .is_reusable_prefix_of(&[10, 11, 12, 13], true, 0)
         .is_none());
 }
+
+/// An SSD source that records the per-layer codec vector each probe hands it
+/// and reports a miss.
+struct LayerQuantsProbe {
+    seen: std::sync::Arc<std::sync::Mutex<Vec<Vec<KvQuant>>>>,
+}
+
+impl rmlx_kv_ssd::SsdHydrate<Qwen3VlMoeEntry> for LayerQuantsProbe {
+    fn hydrate(
+        &self,
+        _prompt_ids: &[u32],
+        _seed: u64,
+        _kv_quant: KvQuant,
+        layer_quants: &[KvQuant],
+        _policy: rmlx_core::DispatchPolicy,
+    ) -> Result<Option<Qwen3VlMoeEntry>> {
+        self.seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(layer_quants.to_vec());
+        Ok(None)
+    }
+}
+
+/// This arch builds every layer at the requested codec, so an SSD hydrate must
+/// build every layer at that codec too. A boundary layer hydrated at the
+/// boundary floor would hold a base-width store under a floor codec.
+///
+/// Reads the arch's own `PROMPT_CACHE`, the static the generate path consumes
+/// through, and the vector its consume hands the SSD source. No other test in
+/// this binary touches this static.
+#[test]
+fn a_hydrate_builds_every_layer_at_the_requested_codec() {
+    const N_LAYERS: usize = 12;
+    let base = KvQuant::Mixed {
+        k_bits: 8,
+        v_bits: 4,
+        k_group_size: 64,
+        v_group_size: 64,
+    };
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    PROMPT_CACHE.with_inner_mut(|g| {
+        let mut cache = crate::prompt_cache::PromptCache::new(4);
+        cache.set_ssd_source(Box::new(LayerQuantsProbe {
+            seen: std::sync::Arc::clone(&seen),
+        }));
+        *g = Some(cache);
+    });
+    let prompt: Vec<u32> = (0..2 * rmlx_kv_ssd::BLOCK_TOKENS as u32).collect();
+    let _ = PROMPT_CACHE.consume(&prompt, base, N_LAYERS, false, 0x5eed);
+    PROMPT_CACHE.with_inner_mut(|g| *g = None);
+
+    let seen = seen
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert_eq!(
+        seen,
+        vec![vec![base; N_LAYERS]],
+        "one probe, every layer at the requested codec"
+    );
+}

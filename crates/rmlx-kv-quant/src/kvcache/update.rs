@@ -13,7 +13,7 @@ use rmlx_mlx::{zeros, Array, Device, Dtype};
 use crate::storage::KvStorage;
 use crate::KvQuant;
 
-use super::helpers::{slice_v_prefix, storage_variant_name};
+use super::helpers::slice_v_prefix;
 use super::KvCache;
 
 /// Narrow `layer_idx` (`usize`) to `u32` for rotor-seed APIs.
@@ -269,7 +269,7 @@ impl KvCache {
         let new_seq = new_k.shape()[2];
         // Provision the step before any mutation: `update_prefill_raw` runs the
         // prefill-side check itself, so this covers the decode dispatch below,
-        // whose stores all cap their capacity at the storage `max_seq`.
+        // whose stores all cap their capacity at the cache `max_seq`.
         if !self.in_prefill {
             self.ensure_decode_capacity(self.offset + new_seq)?;
         }
@@ -279,74 +279,11 @@ impl KvCache {
             return self.update_prefill_raw(new_k, new_v, device);
         }
 
-        // Dispatch on the actual storage variant, not self.quant.
-        //
-        // Using self.quant here was the bug: after SSD hydration, SWA
-        // layers are stored with tag "none" → KvStorage::None, but
-        // from_storage() sets self.quant to the model's global KvQuant (e.g.
-        // K8V8). The quant-based dispatch then routed to update_k8v8(), which
-        // pattern-matched self.storage expecting KvStorage::K8V8 and hit the
-        // unreachable!(). Dispatching on self.storage is the ground truth:
-        // it reflects what data is actually in the cache regardless of the
-        // declared KvQuant, and it already covers the Paged variant which was
-        // the only exception before this fix.
-        match &self.storage {
-            KvStorage::K8V4 { .. } => self.update_k8v4(new_k, new_v, device),
-            KvStorage::K8V8 { .. } => self.update_k8v8(new_k, new_v, device),
-            KvStorage::Planar { .. } => self.update_planar(new_k, new_v, device),
-            KvStorage::None { .. } => self.update_none(new_k, new_v, device),
-            KvStorage::Paged { .. } => self.update_paged(new_k, new_v, device),
-            KvStorage::Mixed { .. } => Err(Error::Mlx(
-                "Contract violation: KvCache::update called on a Mixed cache. \
-                     These caches MUST be driven through KvCache::update_and_sdpa (universal \
-                     wrapper). Direct update() bypasses the quantized SDPA and leaves the cache \
-                     in an inconsistent state."
-                    .into(),
-            )),
-            // Affine-K / turbo-V decode update at the variant's V width and
-            // TCQ flag, one entry over all four spellings.
-            KvStorage::K8VTurbo3 { .. }
-            | KvStorage::K8VTurbo2 { .. }
-            | KvStorage::K8VTurbo3Tcq { .. }
-            | KvStorage::K8VTurbo2Tcq { .. } => self.update_k8_turbo_v(new_k, new_v, device),
-            // TurboSym3 / TurboSym4 decode update — symmetric Lloyd-Max K + V
-            // at the variant's code width, one entry over both.
-            KvStorage::TurboSym3 { .. } | KvStorage::TurboSym4 { .. } => {
-                self.update_tsym(new_k, new_v, device)
-            }
-            // PlanarK decode update — K is PlanarQuant 4-bit, V bf16.
-            KvStorage::PlanarK { .. } => self.update_planar_k(new_k, new_v, device),
-            // IsoV3 / IsoV4 decode update — K = affine q8_0, V = IsoQuant at
-            // the variant's code width.
-            KvStorage::IsoV3 { .. } | KvStorage::IsoV4 { .. } => {
-                self.update_iso_v(new_k, new_v, device)
-            }
-            // RotorV3 / RotorV4 decode update — K = affine q8_0, V = rotor at
-            // the variant's code width (CPU).
-            KvStorage::RotorV3 { .. } | KvStorage::RotorV4 { .. } => {
-                self.update_rotor_v(new_k, new_v, device)
-            }
-            // Iso symmetric / K-only decode updates, one entry per family over
-            // both code widths.
-            KvStorage::IsoSym3 { .. } | KvStorage::IsoSym4 { .. } => {
-                self.update_iso_sym(new_k, new_v, device)
-            }
-            KvStorage::IsoKOnly3 { .. } | KvStorage::IsoKOnly4 { .. } => {
-                self.update_iso_k_only(new_k, new_v, device)
-            }
-            // Symmetric / K-only rotor variants, one entry per family over
-            // both code widths.
-            KvStorage::RotorSym3 { .. } | KvStorage::RotorSym4 { .. } => {
-                self.update_rotor_sym(new_k, new_v, device)
-            }
-            KvStorage::RotorKOnly3 { .. } | KvStorage::RotorKOnly4 { .. } => {
-                self.update_rotor_k_only(new_k, new_v, device)
-            }
-            // Asymmetric rotor K + affine V variants.
-            KvStorage::RotorKAsym3 { .. } | KvStorage::RotorKAsym4 { .. } => {
-                self.update_rotor_k_asym(new_k, new_v, device)
-            }
-        }
+        // The entry comes from the storage variant, not from `self.quant`; see
+        // `KvStorage::view_mut`. Copied out first, so the view's borrow of the
+        // storage ends before the call.
+        let entry = self.storage.view_mut().update;
+        entry(self, new_k, new_v, device)
     }
 
     /// Decode-step update for the unquantised (`KvQuant::None`) cache.
@@ -356,19 +293,19 @@ impl KvCache {
     /// On the first call, `update_decode_fp16` allocates the
     /// `[B, kv_h, max_seq, head_dim]` buffer; subsequent calls slice_update at
     /// the current offset.
-    fn update_none(
+    pub(crate) fn update_none(
         &mut self,
         new_k: &Array,
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
-        let KvStorage::None { max_seq } = &self.storage else {
+        let max_seq = self.max_seq;
+        let KvStorage::None { .. } = &self.storage else {
             return Err(Error::KvStorageMismatch {
                 expected: "None",
-                got: storage_variant_name(&self.storage),
+                got: self.storage.view().name,
             });
         };
-        let max_seq = *max_seq;
         self.update_decode_fp16(new_k, new_v, max_seq, device)
     }
 
@@ -379,7 +316,7 @@ impl KvCache {
     /// When the existing `[B, kv_h, max_seq, head_dim]` buffer is too small,
     /// a new buffer of the next power-of-two capacity is allocated and the
     /// filled prefix `[..prev_offset]` is copied forward via `slice_update`.
-    /// The storage variant's `max_seq` is bumped to the new capacity so
+    /// The cache's `max_seq` is bumped to the new capacity so
     /// downstream `exit_prefill` quantised buffers honour the same size.
     ///
     /// # Resumed-cache guard
@@ -390,7 +327,7 @@ impl KvCache {
     /// payload buffers or `MixedKvState.offset`. On any resumed-cache path
     /// (chunked-prefill resume across calls, SSD-hydrate seed, branched
     /// generation), the storage already carries on-axis buffers sized to the
-    /// old `max_seq`. Bumping the scalar would let it disagree with the
+    /// old `max_seq`. Bumping `max_seq` would let it disagree with the
     /// payload shape and produce a shape assert or silent truncation in
     /// `exit_prefill`. The guard below detects payload presence and fails
     /// loudly with a typed error instead.
@@ -438,13 +375,13 @@ impl KvCache {
             }
         }
 
-        let current_max_seq = storage_max_seq(&self.storage);
+        let current_max_seq = self.max_seq;
         if needed_seq <= current_max_seq {
             return Ok(());
         }
 
         // A grow on a resumed cache (any payload currently materialised)
-        // would leave the storage `max_seq` scalar disagreeing with the
+        // would leave the cache `max_seq` scalar disagreeing with the
         // on-axis payload buffer length sized to the old max_seq → shape
         // assert or silent truncation downstream. Detect and fail loudly
         // instead of corrupting the buffers. The grow path is only legal on
@@ -484,9 +421,9 @@ impl KvCache {
             "KV prefill buffer grow"
         );
 
-        // Bump max_seq on the storage variant first so subsequent reads see
-        // the new capacity (single-source-of-truth for exit_prefill).
-        set_storage_max_seq(&mut self.storage, new_max_seq);
+        // Bump max_seq first so subsequent reads see the new capacity
+        // (single-source-of-truth for exit_prefill).
+        self.max_seq = new_max_seq;
 
         // If the raw prefill buffer was already allocated, copy the filled
         // prefix `[..prev_offset]` into a fresh, larger buffer. If not
@@ -549,38 +486,12 @@ impl KvCache {
         if self.decode_fp16_k.is_some() || self.decode_fp16_v.is_some() {
             return true;
         }
-        match &self.storage {
-            KvStorage::K8V4 { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::K8V8 { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::Planar { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::None { .. } => false,
-            KvStorage::Mixed { state, .. } => state.offset > 0,
-            KvStorage::Paged {
-                k, v_k8, v_planar, ..
-            } => k.is_some() || v_k8.is_some() || v_planar.is_some(),
-            KvStorage::K8VTurbo3 { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::TurboSym3 { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::TurboSym4 { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::PlanarK { k, .. } => k.is_some(),
-            KvStorage::K8VTurbo2 { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::IsoV3 { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::IsoV4 { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::RotorV3 { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::RotorV4 { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::K8VTurbo3Tcq { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::K8VTurbo2Tcq { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::IsoSym3 { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::IsoSym4 { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::IsoKOnly3 { k, .. } => k.is_some(),
-            KvStorage::IsoKOnly4 { k, .. } => k.is_some(),
-            KvStorage::RotorSym3 { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::RotorSym4 { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::RotorKOnly3 { k, .. } => k.is_some(),
-            KvStorage::RotorKOnly4 { k, .. } => k.is_some(),
-            // RotorKAsym3 / RotorKAsym4 — either side materialised.
-            KvStorage::RotorKAsym3 { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::RotorKAsym4 { k, v, .. } => k.is_some() || v.is_some(),
-        }
+        self.storage
+            .view()
+            .slots
+            .iter()
+            .flatten()
+            .any(|slot| slot.is_filled())
     }
 
     /// Grow the provisioned `max_seq` when the next **decode** append would
@@ -658,7 +569,7 @@ impl KvCache {
             }
         }
 
-        let current_max_seq = storage_max_seq(&self.storage);
+        let current_max_seq = self.max_seq;
         if needed_seq <= current_max_seq {
             return Ok(());
         }
@@ -685,7 +596,7 @@ impl KvCache {
             "KV decode buffer grow"
         );
 
-        set_storage_max_seq(&mut self.storage, new_max_seq);
+        self.max_seq = new_max_seq;
         Ok(())
     }
 
@@ -694,12 +605,12 @@ impl KvCache {
     /// # Buffer-grow contract
     ///
     /// The raw prefill buffer is allocated lazily on first call with shape
-    /// `[B, kv_h, max_seq, head_dim]`, where `max_seq` is the value recorded
-    /// on the active `KvStorage` variant. Before every write we check whether
+    /// `[B, kv_h, max_seq, head_dim]`, where `max_seq` is the cache's
+    /// provisioned capacity. Before every write we check whether
     /// `prev_offset + new_seq` fits in the current buffer; if not, we grow
     /// the buffer to the next power-of-two ≥ needed (so subsequent chunks
     /// also fit without churn) and copy the existing filled prefix forward.
-    /// The storage variant's `max_seq` field is bumped in lockstep so
+    /// The cache's `max_seq` is bumped in lockstep so
     /// `exit_prefill` allocates downstream quantised buffers with the same
     /// new capacity.
     ///
@@ -744,7 +655,7 @@ impl KvCache {
 
         // Enforce the optional hard cap before any allocation, then grow the
         // per-layer raw prefill buffer if the new chunk would overflow it.
-        // The storage variant's `max_seq` is bumped in lockstep so the
+        // The cache's `max_seq` is bumped in lockstep so the
         // downstream `exit_prefill` quantised buffers see the new capacity.
         self.ensure_prefill_capacity(
             new_offset,
@@ -757,7 +668,7 @@ impl KvCache {
             device,
         )?;
 
-        let max_seq = storage_max_seq(&self.storage);
+        let max_seq = self.max_seq;
 
         if self.prefill_raw_k.is_none() {
             let buf_shape = [b, kv_h, max_seq, head_dim];
@@ -826,9 +737,6 @@ impl KvCache {
     )]
     /// Finalize prefill: quantize the accumulated raw K/V into the storage buffers.
     pub fn exit_prefill(&mut self, device: Device) -> Result<()> {
-        // Snapshot before the storage borrows below; one arm forwards it to
-        // `MixedKvState::bulk_init_from_fp16`.
-        let policy = self.policy;
         if self.rotating.is_some() {
             // No-op: rotating prefill writes go straight into the ring buffer.
             return Ok(());
@@ -950,9 +858,8 @@ impl KvCache {
         // SWA layers that were hydrated from the SSD tier (they are stored as
         // tag "none" since the rotating bf16 ring cannot be serialised, but
         // from_storage() sets self.quant to the model's global KvQuant) — take
-        // the bf16 path regardless of self.quant. The quantised dispatch arms
-        // all pattern-match self.storage expecting their specific variant and hit
-        // unreachable!() when they find KvStorage::None instead.
+        // the bf16 path regardless of self.quant. The gate and the entry below
+        // read self.quant, and a codec's entry refuses `None` storage.
         if matches!(self.storage, KvStorage::None { .. }) {
             if let Some((k_seed, v_seed)) = decode_fp16_pair {
                 // `is_bf16_storage` is true on this path, so both clones above
@@ -996,78 +903,8 @@ impl KvCache {
             return Ok(());
         }
 
-        // REACHABILITY, as of the gate above: only the arms for codecs whose
-        // `materialises_packed_store()` is true run. That is `Mixed`, `RotK`,
-        // `IsoKOnly3/4`, `RotorKOnly3/4`, `Iso3Sym`, `Iso4Sym`,
-        // `Rotor3Sym`, `Rotor4Sym` — eight of the arms below. The rest are the
-        // bf16-mirror family and the gate returns before them.
-        //
-        // They are kept, not deleted, because they ARE the re-enable path: a
-        // codec that grows a decode kernel over its own packed store flips one
-        // arm in `decode_reads_packed_store` and this bulk encode is what then
-        // fills the buffer that kernel reads (see `docs/KV_CACHE.md` §9.6). The
-        // hazard that creates is real: a flipped predicate re-arms code that
-        // does not run today. The pairing guard is
-        // `warm_ttft_cross_codec_tests::exit_prefill_builds_a_store_exactly_when_the_predicate_says_so`,
-        // which sweeps every variant and fails the moment a codec's arm and its
-        // classification disagree.
-        match self.quant {
-            // ── mirror-family group: NOT reachable today ────────────────────
-            // The arms from here down that belong to the bf16-mirror family
-            // (`K8V8`, `K8V4`, `Planar*`, `PlanarK`, `K8VTurbo*`, `TurboSym*`,
-            // `Iso3/4`, `Rotor3/4`, `RotorK*Asym`) are behind the gate above.
-            // The eight listed there are the ones that still run.
-            KvQuant::K8V8 => self.exit_prefill_k8v8(&k_full, &v_full, device)?,
-            KvQuant::K8V4 => self.exit_prefill_k8v4(&k_full, &v_full, device)?,
-            KvQuant::None => {
-                // BF16 KV path. The `raw_k`/`raw_v` buffers — already
-                // sized to `[B, kv_h, max_seq, head_dim]` by `update_prefill_raw`
-                // — are exactly the decode buffers we need. Promote them
-                // directly into `decode_fp16_k`/`decode_fp16_v`; subsequent
-                // `update_none` calls hit `update_decode_fp16` and slice_update
-                // at the current offset. No quantize/dequantize work.
-                self.decode_fp16_k = Some(raw_k.try_clone()?);
-                self.decode_fp16_v = Some(raw_v.try_clone()?);
-                return Ok(());
-            }
-            KvQuant::Planar | KvQuant::Planar3 => {
-                self.exit_prefill_planar(&k_full, &v_full, device)?;
-            }
-            KvQuant::Mixed { .. } | KvQuant::RotK { .. } => {
-                self.exit_prefill_mixed(&k_full, &v_full, device, total_seq, policy)?;
-            }
-            KvQuant::K8VTurbo3
-            | KvQuant::K8VTurbo2
-            | KvQuant::K8VTurbo3Tcq
-            | KvQuant::K8VTurbo2Tcq => {
-                self.exit_prefill_k8_turbo_v(&k_full, &v_full, device, total_seq)?;
-            }
-            KvQuant::TurboSym3 | KvQuant::TurboSym4 => {
-                self.exit_prefill_turbo_sym(&k_full, &v_full, device, total_seq)?;
-            }
-            KvQuant::PlanarK => self.exit_prefill_planar_k(&k_full, device, total_seq)?,
-            KvQuant::Iso3 | KvQuant::Iso4 => {
-                self.exit_prefill_iso_v(&k_full, &v_full, device, total_seq)?;
-            }
-            KvQuant::Rotor3 | KvQuant::Rotor4 => {
-                self.exit_prefill_rotor_v(&k_full, &v_full, device, total_seq)?;
-            }
-            KvQuant::Iso3Sym | KvQuant::Iso4Sym => {
-                self.exit_prefill_iso_sym(&k_full, &v_full, device, total_seq)?;
-            }
-            KvQuant::IsoKOnly3 | KvQuant::IsoKOnly4 => {
-                self.exit_prefill_iso_k_only(&k_full, device, total_seq)?;
-            }
-            KvQuant::Rotor3Sym | KvQuant::Rotor4Sym => {
-                self.exit_prefill_rotor_sym(&k_full, &v_full, device, total_seq)?;
-            }
-            KvQuant::RotorKOnly3 | KvQuant::RotorKOnly4 => {
-                self.exit_prefill_rotor_k_only(&k_full, device, total_seq)?;
-            }
-            KvQuant::RotorK3Asym { .. } | KvQuant::RotorK4Asym { .. } => {
-                self.exit_prefill_rotor_k_asym(&k_full, &v_full, device, total_seq)?;
-            }
-        }
+        let entry = KvStorage::new(self.quant).view_mut().exit_prefill;
+        entry(self, &k_full, &v_full, device, total_seq)?;
 
         // Warm-TTFT seed: the shortcut quant arms get the bf16 K+V decode
         // mirror that `update_decode_fp16` reads via the
@@ -1088,6 +925,24 @@ impl KvCache {
         }
 
         Ok(())
+    }
+
+    /// The `exit_prefill` entry of the `None` and `Paged` storages. It builds
+    /// nothing: `exit_prefill` finishes both at their guards before it calls an
+    /// entry (the bf16 seeds are the `None` storage; `Paged` keeps a compact
+    /// seed and fills its pages at decode). A call is a contract violation.
+    pub(crate) fn exit_prefill_behind_guard(
+        &mut self,
+        _k_full: &Array,
+        _v_full: &Array,
+        _device: Device,
+        _total_seq: i32,
+    ) -> Result<()> {
+        Err(Error::Mlx(format!(
+            "Contract violation: the {} storage has no exit_prefill bulk encode. \
+             KvCache::exit_prefill must finish it at its guard.",
+            self.storage.view().name
+        )))
     }
 
     /// Live-inference KV resident bytes held by this cache at the call-site.
@@ -1168,6 +1023,7 @@ impl KvCache {
             // decode mirrors above exist; the bytes are then counted off the
             // buffers themselves, so it must not be added a second time here.
             shares_kv: _,
+            max_seq: _,
             flash_max_seq: _,
             flash_filled: _,
             max_seq_ceiling: _,
@@ -1268,8 +1124,8 @@ impl KvCache {
             self.offset
         );
         // Roll the fused-QK shadow's filled count back on BOTH the rotating
-        // and non-rotating paths. Today `try_fused_qk_dispatch` gates
-        // rotating storage out via `storage_max_seq_for_fused_qk`, so the
+        // and non-rotating paths. Today `update_and_sdpa` returns through
+        // the ring path before the fused-QK dispatch, so the
         // rotating branch should never have a shadow allocated — but the
         // assertion below makes
         // that explicit and the truncate call keeps the shadow filled
@@ -1279,7 +1135,7 @@ impl KvCache {
             debug_assert!(
                 self.rotating.is_none(),
                 "rotating cache should never have a fused-QK shadow allocated \
-                 (storage_max_seq_for_fused_qk returns None for rotating variants)"
+                 (update_and_sdpa returns through the ring path before the fused-QK dispatch)"
             );
             shadow.truncate_to(n);
         }
@@ -1308,7 +1164,8 @@ impl KvCache {
         Ok(())
     }
 
-    /// Force evaluation of any pending MLX lazy operations in the KV buffers.
+    /// Force evaluation of the pending MLX graph of the KV buffers. The iso V
+    /// GPU buffers and the rotor K GPU ring are not evaluated here.
     pub fn eval_gpu_state(&self) -> Result<()> {
         // Rotating ring buffer holds K/V on its own arrays.
         if let Some(ref rot) = self.rotating {
@@ -1320,238 +1177,10 @@ impl KvCache {
             }
             return Ok(());
         }
-        match &self.storage {
-            KvStorage::K8V4 { k, v, .. } => {
-                if let Some(qk) = k {
-                    if let Some(codes) = &qk.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qk.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-                if let Some(qv) = v {
-                    if let Some(codes) = &qv.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qv.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-            }
-            KvStorage::K8V8 { k, v, .. } => {
-                if let Some(qk) = k {
-                    if let Some(codes) = &qk.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qk.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-                if let Some(qv) = v {
-                    if let Some(codes) = &qv.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qv.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-            }
-            KvStorage::Planar { k, v, .. } => {
-                if let Some(qk) = k {
-                    if let Some(codes) = &qk.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qk.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-                if let Some(qv) = v {
-                    if let Some(codes) = &qv.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qv.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                    if let Some(rotations) = &qv.gpu_rotations_buf {
-                        rotations.eval()?;
-                    }
-                }
-            }
-            KvStorage::None { .. } => {
-                // BF16 KV — buffers live on `decode_fp16_k`/`decode_fp16_v`
-                // and are eval'd by the trailing block below.
-            }
-            KvStorage::Mixed { state, .. } => {
-                state.eval_gpu_state()?;
-            }
-            // Paged storage — the active page arrays live inside PageSlab::pool.
-            // They are already async_eval'd by the slice_update chain inside write_page.
-            // No additional flush needed here beyond the decode_fp16 trailing block.
-            KvStorage::Paged { .. } => {}
-            // K8VTurbo3 — flush K (QuantK) and V (QuantV, bits=3, CPU-dequant only).
-            KvStorage::K8VTurbo3 { k, v, .. } => {
-                if let Some(qk) = k {
-                    if let Some(codes) = &qk.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qk.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-                if let Some(qv) = v {
-                    if let Some(codes) = &qv.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qv.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-            }
-            // TurboSym4 — flush both TurboQuant K + V GPU buffers.
-            KvStorage::TurboSym4 { k, v, .. } => {
-                if let Some(qk) = k {
-                    if let Some(codes) = &qk.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qk.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-                if let Some(qv) = v {
-                    if let Some(codes) = &qv.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qv.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-            }
-            // PlanarK — flush K (codes/scales/rotations); V is bf16
-            // (decode_fp16_v) and is flushed by the trailing block below.
-            KvStorage::PlanarK { k, .. } => {
-                if let Some(qk) = k {
-                    if let Some(codes) = &qk.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qk.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                    if let Some(rotations) = &qk.gpu_rotations_buf {
-                        rotations.eval()?;
-                    }
-                }
-            }
-            // K8VTurbo2 — K is QuantK (codes/scales), V is QuantV (CPU-only).
-            KvStorage::K8VTurbo2 { k, v, .. } => {
-                if let Some(qk) = k {
-                    if let Some(codes) = &qk.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qk.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-                if let Some(qv) = v {
-                    if let Some(codes) = &qv.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qv.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-            }
-            // IsoV3 / IsoV4 / RotorV3 / RotorV4 — K is QuantK (GPU-capable
-            // q8_0); V is CPU-only payload.
-            KvStorage::IsoV3 { k, .. }
-            | KvStorage::IsoV4 { k, .. }
-            | KvStorage::RotorV3 { k, .. }
-            | KvStorage::RotorV4 { k, .. } => {
-                // K is GPU-capable q8_0 (`QuantK`); V is CPU-only so no GPU
-                // buffers to flush on the V side.
-                if let Some(qk) = k {
-                    if let Some(codes) = &qk.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qk.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-            }
-            // K8VTurbo3Tcq — flush like K8VTurbo3 (K is GPU-capable q8_0,
-            // V is CPU-only QuantV with Viterbi encode; gpu_codes_buf
-            // may exist from a hydrated cache).
-            KvStorage::K8VTurbo3Tcq { k, v, .. } => {
-                if let Some(qk) = k {
-                    if let Some(codes) = &qk.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qk.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-                if let Some(qv) = v {
-                    if let Some(codes) = &qv.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qv.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-            }
-            // IsoSym3 / IsoSym4 / IsoKOnly3 / IsoKOnly4 — CPU-only
-            // codecs (no GPU buffers on either axis). V-side IsoKOnly* is bf16,
-            // flushed by the trailing decode_fp16 block below.
-            KvStorage::IsoSym3 { .. }
-            | KvStorage::IsoSym4 { .. }
-            | KvStorage::IsoKOnly3 { .. }
-            | KvStorage::IsoKOnly4 { .. } => {}
-            // Rotor symmetric / K-only — CPU-only codecs, no GPU buffers on
-            // either axis. V-side RotorKOnly* is bf16, flushed by the trailing
-            // decode_fp16 block below.
-            KvStorage::RotorSym3 { .. }
-            | KvStorage::RotorSym4 { .. }
-            | KvStorage::RotorKOnly3 { .. }
-            | KvStorage::RotorKOnly4 { .. } => {}
-            // RotorKAsym3 / RotorKAsym4 — K rotor is CPU-only; V is
-            // affine QuantV with optional GPU codes/scales buffers (flushed
-            // like the K8V4 V side).
-            KvStorage::RotorKAsym3 { v, .. } | KvStorage::RotorKAsym4 { v, .. } => {
-                if let Some(qv) = v {
-                    if let Some(codes) = &qv.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qv.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-            }
-            // TurboSym3 — K is GPU-capable (QuantKTurbo3 shares the same flush
-            // pattern as TurboSym4 K side); V is CPU-only (no GPU buffers).
-            // NOTE: No explicit eval() needed here. MLX is lazy — QuantKTurbo3::append
-            // builds the compute graph; the Metal encoder is flushed when the K buffer
-            // is first read (e.g. dequantize_choice). Omitting eval() is correct and
-            // consistent with how IsoSym3/RotorSym3 K-side GPU buffers are handled.
-            KvStorage::TurboSym3 { .. } => {}
-            // K8VTurbo2Tcq — flush like K8VTurbo2 / K8VTurbo3Tcq.
-            KvStorage::K8VTurbo2Tcq { k, v, .. } => {
-                if let Some(qk) = k {
-                    if let Some(codes) = &qk.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qk.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-                if let Some(qv) = v {
-                    if let Some(codes) = &qv.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qv.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-            }
+        // bf16 KV (`KvStorage::None`, and the V side of the K-only codecs)
+        // lives on `decode_fp16_k` / `decode_fp16_v`, flushed below.
+        for slot in self.storage.view().slots.iter().flatten() {
+            slot.eval()?;
         }
         if let Some(buf) = &self.decode_fp16_k {
             buf.eval()?;
@@ -1925,10 +1554,9 @@ impl KvCache {
     /// this, the drain thread's serialize fails with
     /// `There is no Stream(gpu, N) in current thread`.
     pub fn eval_for_spill(&self) -> Result<()> {
-        // Delegate to the complete GPU-state materializer (handles every storage
-        // variant + rotating ring + decode_fp16/prefill_raw scratch). Called on
-        // the inference thread by the spill sinks so the drain thread —
-        // which has no Metal stream — only copies already-evaluated host bytes.
+        // `eval_gpu_state` evaluates the GPU arrays of the store slots, the
+        // rotating ring and the decode_fp16/prefill_raw scratch. It does not
+        // evaluate the iso V GPU buffers or the rotor K GPU ring.
         self.eval_gpu_state()
     }
 
@@ -1936,6 +1564,7 @@ impl KvCache {
     pub fn try_deep_clone(&self) -> Result<Self> {
         Ok(Self {
             storage: self.storage.try_deep_clone()?,
+            max_seq: self.max_seq,
             offset: self.offset,
             quant: self.quant,
             layer_idx: self.layer_idx,
@@ -2026,7 +1655,7 @@ impl KvCache {
 pub(super) fn storage_mismatch(expected: &'static str, storage: &KvStorage) -> Error {
     Error::KvStorageMismatch {
         expected,
-        got: storage_variant_name(storage),
+        got: storage.view().name,
     }
 }
 
@@ -2110,86 +1739,4 @@ pub(super) fn next_pow2_seq(needed: i32) -> i32 {
     // next_power_of_two on u32; safe because n <= max_pow2 < 2^31.
     let p = n.next_power_of_two();
     p as i32
-}
-
-/// Read the `max_seq` recorded on whichever `KvStorage` variant is active.
-pub(super) fn storage_max_seq(storage: &KvStorage) -> i32 {
-    match storage {
-        KvStorage::K8V4 { max_seq, .. } => *max_seq,
-        KvStorage::K8V8 { max_seq, .. } => *max_seq,
-        KvStorage::Planar { max_seq, .. } => *max_seq,
-        KvStorage::None { max_seq } => *max_seq,
-        KvStorage::Mixed { max_seq, .. } => *max_seq,
-        KvStorage::Paged { max_seq, .. } => *max_seq,
-        KvStorage::K8VTurbo3 { max_seq, .. } => *max_seq,
-        KvStorage::TurboSym3 { max_seq, .. } => *max_seq,
-        KvStorage::TurboSym4 { max_seq, .. } => *max_seq,
-        KvStorage::PlanarK { max_seq, .. } => *max_seq,
-        KvStorage::K8VTurbo2 { max_seq, .. } => *max_seq,
-        KvStorage::IsoV3 { max_seq, .. } => *max_seq,
-        KvStorage::IsoV4 { max_seq, .. } => *max_seq,
-        KvStorage::RotorV3 { max_seq, .. } => *max_seq,
-        KvStorage::RotorV4 { max_seq, .. } => *max_seq,
-        KvStorage::K8VTurbo3Tcq { max_seq, .. } => *max_seq,
-        KvStorage::K8VTurbo2Tcq { max_seq, .. } => *max_seq,
-        KvStorage::IsoSym3 { max_seq, .. } => *max_seq,
-        KvStorage::IsoSym4 { max_seq, .. } => *max_seq,
-        KvStorage::IsoKOnly3 { max_seq, .. } => *max_seq,
-        KvStorage::IsoKOnly4 { max_seq, .. } => *max_seq,
-        KvStorage::RotorSym3 { max_seq, .. } => *max_seq,
-        KvStorage::RotorSym4 { max_seq, .. } => *max_seq,
-        KvStorage::RotorKOnly3 { max_seq, .. } => *max_seq,
-        KvStorage::RotorKOnly4 { max_seq, .. } => *max_seq,
-        KvStorage::RotorKAsym3 { max_seq, .. } => *max_seq,
-        KvStorage::RotorKAsym4 { max_seq, .. } => *max_seq,
-    }
-}
-
-/// Bump the `max_seq` recorded on the active storage variant. This is the
-/// single source of truth read by `update_prefill_raw`, `exit_prefill`, and the
-/// per-axis `QuantK::append` / `QuantV::append` capacity caps.
-///
-/// Two callers, with different payload states — neither needs bytes migrated
-/// here:
-///
-/// * [`KvCache::ensure_prefill_capacity`] — no quantised payload exists yet
-///   (`storage_has_materialised_payload` refuses the grow otherwise). The
-///   storage is materialised later, in `exit_prefill`, from the now-larger raw
-///   prefill buffer, and reads `max_seq` from here.
-/// * [`KvCache::ensure_decode_capacity`] — the payload always exists. Raising
-///   the scalar is exactly what lets each store's own grow path extend itself
-///   on the next append: capacity is tracked per-store and the filled prefix is
-///   copied forward on realloc.
-///
-/// In both cases this writes a scalar only; no buffer is resized here.
-fn set_storage_max_seq(storage: &mut KvStorage, new_max_seq: i32) {
-    match storage {
-        KvStorage::K8V4 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::K8V8 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::Planar { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::None { max_seq } => *max_seq = new_max_seq,
-        KvStorage::Mixed { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::Paged { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::K8VTurbo3 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::TurboSym3 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::TurboSym4 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::PlanarK { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::K8VTurbo2 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::IsoV3 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::IsoV4 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::RotorV3 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::RotorV4 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::K8VTurbo3Tcq { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::K8VTurbo2Tcq { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::IsoSym3 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::IsoSym4 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::IsoKOnly3 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::IsoKOnly4 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::RotorSym3 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::RotorSym4 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::RotorKOnly3 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::RotorKOnly4 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::RotorKAsym3 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::RotorKAsym4 { max_seq, .. } => *max_seq = new_max_seq,
-    }
 }

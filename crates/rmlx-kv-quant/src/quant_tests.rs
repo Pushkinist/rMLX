@@ -13,47 +13,16 @@ use super::{KvQuant, ALL_KV_QUANTS};
 use crate::mixed_quant::MixedTuple;
 use rmlx_mlx::{quantize, Array, Device, Dtype};
 
-/// Construct one representative instance of every `KvQuant` variant and assert
-/// `KvQuant::from_str(&q.to_string()) == Ok(q)`.
+/// Every spelling `Display` emits parses back to the codec that emitted it.
 ///
-/// Parametric variants (`Mixed`, `RotK`, `RotorK3Asym`, `RotorK4Asym`) are
-/// exercised with multiple sample parameter sets to guard against partial
-/// parse regressions (e.g. "parses 4-bit but not 8-bit").
+/// The sweep is [`ALL_KV_QUANTS`], so a codec whose `FromStr` arm is missing
+/// fails here. The four parametric variants (`Mixed`, `RotK`, `RotorK3Asym`,
+/// `RotorK4Asym`) are also swept at the other parameter sets below, because
+/// `ALL_KV_QUANTS` holds one set each and a parser can accept one width and
+/// reject another.
 #[test]
 fn all_variants_display_fromstr_roundtrip() {
-    let cases: &[KvQuant] = &[
-        // ── simple unit variants ─────────────────────────────────────────────
-        KvQuant::None,
-        KvQuant::K8V4,
-        KvQuant::K8V8,
-        KvQuant::Planar,
-        KvQuant::Planar3,
-        KvQuant::PlanarK,
-        KvQuant::K8VTurbo3,
-        KvQuant::K8VTurbo3Tcq,
-        KvQuant::K8VTurbo2,
-        KvQuant::K8VTurbo2Tcq,
-        KvQuant::TurboSym3,
-        KvQuant::TurboSym4,
-        KvQuant::Iso3,
-        KvQuant::Iso4,
-        KvQuant::Iso3Sym,
-        KvQuant::Iso4Sym,
-        KvQuant::IsoKOnly3,
-        KvQuant::IsoKOnly4,
-        KvQuant::Rotor3,
-        KvQuant::Rotor4,
-        KvQuant::Rotor3Sym,
-        KvQuant::Rotor4Sym,
-        KvQuant::RotorKOnly3,
-        KvQuant::RotorKOnly4,
-        // ── Mixed — multiple param sets ──────────────────────────────────────
-        KvQuant::Mixed {
-            k_bits: 8,
-            v_bits: 4,
-            k_group_size: 64,
-            v_group_size: 64,
-        },
+    let other_parameter_sets: &[KvQuant] = &[
         KvQuant::Mixed {
             k_bits: 8,
             v_bits: 8,
@@ -66,7 +35,6 @@ fn all_variants_display_fromstr_roundtrip() {
             k_group_size: 32,
             v_group_size: 32,
         },
-        // ── RotK — multiple param sets ───────────────────────────────────────
         KvQuant::RotK {
             v_bits: 4,
             v_group_size: 64,
@@ -79,14 +47,9 @@ fn all_variants_display_fromstr_roundtrip() {
             v_bits: 2,
             v_group_size: 32,
         },
-        // ── RotorK3Asym — multiple valid V codecs ────────────────────────────
         KvQuant::RotorK3Asym {
             v_bits: 4,
             v_group_size: 128,
-        },
-        KvQuant::RotorK3Asym {
-            v_bits: 4,
-            v_group_size: 64,
         },
         KvQuant::RotorK3Asym {
             v_bits: 3,
@@ -96,7 +59,6 @@ fn all_variants_display_fromstr_roundtrip() {
             v_bits: 2,
             v_group_size: 64,
         },
-        // ── RotorK4Asym — multiple valid V codecs ────────────────────────────
         KvQuant::RotorK4Asym {
             v_bits: 4,
             v_group_size: 32,
@@ -111,7 +73,7 @@ fn all_variants_display_fromstr_roundtrip() {
         },
     ];
 
-    for &q in cases {
+    for &q in ALL_KV_QUANTS.iter().chain(other_parameter_sets) {
         let displayed = q.to_string();
         let parsed = KvQuant::from_str(&displayed).unwrap_or_else(|e| {
             panic!("{q:?} Display='{displayed}' failed to parse back: {e}");
@@ -123,19 +85,46 @@ fn all_variants_display_fromstr_roundtrip() {
     }
 }
 
-/// Spot-check a few known aliases that should parse to their canonical variant
-/// but may Display differently (one-way only, not a round-trip failure).
+/// The inputs `FromStr` accepts that `Display` never emits, and the retired
+/// names it refuses by name.
 ///
-/// These are inputs that are valid CLI shortcuts but not the canonical Display
-/// form — they do not violate the round-trip invariant.
+/// An alias parses one way only, so the round trip above cannot see it. A
+/// retired name must keep its error and its successor: an alias in its place
+/// would let a saved CLI line run a codec it does not name.
 #[test]
 fn aliases_parse_correctly() {
-    // "bf16" and "f16" are accepted synonyms for None; Display emits "none".
-    assert_eq!(KvQuant::from_str("bf16").unwrap(), KvQuant::None);
-    assert_eq!(KvQuant::from_str("f16").unwrap(), KvQuant::None);
-    // "rotor_v_3" / "rotor_v_4" are alternate names for Rotor3 / Rotor4.
-    assert_eq!(KvQuant::from_str("rotor_v_3").unwrap(), KvQuant::Rotor3);
-    assert_eq!(KvQuant::from_str("rotor_v_4").unwrap(), KvQuant::Rotor4);
+    let aliases = [
+        ("bf16", KvQuant::None),
+        ("f16", KvQuant::None),
+        ("rotor_v_3", KvQuant::Rotor3),
+        ("rotor_v_4", KvQuant::Rotor4),
+    ];
+    for (alias, want) in aliases {
+        assert_eq!(KvQuant::from_str(alias), Ok(want), "alias {alias}");
+    }
+    assert_eq!(
+        KvQuant::from_str("rot_k_tq4v"),
+        Err(super::KvQuantParseError::Retired {
+            input: "rot_k_tq4v".to_string(),
+            replacement: "rot_k_v4g64",
+        }),
+        "the retired rot_k_tq4v must name its successor"
+    );
+}
+
+/// The spelling list in the `Unknown` error text is written by hand. It must
+/// name every fieldless codec, or an operator who mistypes one is not told it.
+#[test]
+fn unknown_error_text_names_every_fixed_spelling() {
+    let text = super::KvQuantParseError::Unknown(String::new()).to_string();
+    for quant in ALL_KV_QUANTS {
+        if let super::Spelling::Fixed(spelling) = quant.descriptor().spelling {
+            assert!(
+                text.contains(&format!(" {spelling},")),
+                "the Unknown error text does not name '{spelling}': {text}"
+            );
+        }
+    }
 }
 
 /// Confirm that the previously-broken RotK `Display`/`FromStr` form now
@@ -153,6 +142,21 @@ fn rotk_cli_form_parses() {
     );
     // And the Display round-trip.
     assert_eq!(q.to_string(), "rot_k_v4g64");
+}
+
+/// A `Mixed` codec with unequal K and V groups keeps each group on its own
+/// side, in both directions. Equal groups cannot show a swap of the two.
+#[test]
+fn mixed_unequal_groups_round_trip() {
+    let m = KvQuant::Mixed {
+        k_bits: 8,
+        v_bits: 4,
+        k_group_size: 128,
+        v_group_size: 64,
+    };
+    assert_eq!(m.to_string(), "mixed_k8g128_v4g64");
+    assert_eq!(KvQuant::from_str("mixed_k8g128_v4g64"), Ok(m));
+    assert_eq!(super::kv_quant_label(Some(m)), "mixed");
 }
 
 /// `cache_key_salt` must be collision-free across distinct codecs so
@@ -739,12 +743,12 @@ fn every_parseable_mixed_quantizes_a_side() {
 
 /// [`ALL_KV_QUANTS`] indexes densely from zero and repeats no variant.
 ///
-/// Pairs with `variant_index_has_one_arm_per_listed_codec`, which supplies the
+/// Pairs with `descriptor_has_one_arm_per_listed_codec`, which supplies the
 /// count this test cannot: both sides of the comparison here are derived from
 /// the list, so this one sees a duplicate or a re-used index and nothing else.
 #[test]
 fn all_kv_quants_indexes_densely_with_no_repeats() {
-    let mut seen: Vec<usize> = ALL_KV_QUANTS.iter().map(KvQuant::variant_index).collect();
+    let mut seen: Vec<usize> = ALL_KV_QUANTS.iter().map(|q| q.descriptor().index).collect();
     seen.sort_unstable();
     let n = seen.len();
     seen.dedup();
@@ -764,7 +768,7 @@ fn all_kv_quants_indexes_densely_with_no_repeats() {
 /// [`ALL_KV_QUANTS`] names every variant — including one no value in the test
 /// binary can construct.
 ///
-/// The oracle is `variant_index`, whose `match` the compiler checks, but the
+/// The oracle is the codec descriptor, whose `match` the compiler checks, but the
 /// coupling has to be read out of the *source*: a variant wired into that match
 /// and forgotten in the list produces no value anywhere in this crate, so no
 /// test that sweeps the list can observe it. `ALL_KV_QUANTS.len()` and
@@ -773,26 +777,27 @@ fn all_kv_quants_indexes_densely_with_no_repeats() {
 ///
 /// The count is `=>` occurrences inside the fn body, so a rustfmt-wrapped arm
 /// still counts once. Anything the scan cannot read back — a renamed fn, a
-/// comment carrying `=>` — fails loudly rather than passing.
+/// comment carrying `=>` — fails loudly rather than passing. Each arm states
+/// its own dense `index`, so no arm can cover two variants.
 #[test]
-fn variant_index_has_one_arm_per_listed_codec() {
-    const SRC: &str = include_str!("quant.rs");
-    const OPEN: &str = "pub fn variant_index(&self) -> usize {";
+fn descriptor_has_one_arm_per_listed_codec() {
+    const SRC: &str = include_str!("quant_descriptor.rs");
+    const OPEN: &str = "pub(super) fn descriptor(self) -> CodecDescriptor {";
 
     let Some((_, after_open)) = SRC.split_once(OPEN) else {
-        panic!("quant.rs no longer declares `{OPEN}` — this test reads that fn's arms")
+        panic!("quant_descriptor.rs no longer declares `{OPEN}` — this test reads that fn's arms")
     };
     // The fn body ends at the first line that closes an item at impl-block
     // indentation; everything before it is the `match self { ... }` arms.
     let Some((body, _)) = after_open.split_once("\n    }\n") else {
-        panic!("could not find the end of `variant_index` in quant.rs")
+        panic!("could not find the end of `descriptor` in quant_descriptor.rs")
     };
     let arms = body.lines().filter(|line| line.contains("=>")).count();
 
     assert_eq!(
         arms,
         ALL_KV_QUANTS.len(),
-        "`variant_index` has {arms} arms but ALL_KV_QUANTS lists {} codecs. \
+        "`descriptor` has {arms} arms but ALL_KV_QUANTS lists {} codecs. \
          A variant added to the enum reaches the match by compiler error; it \
          reaches the list, every sweep below, and the disposition manifest only \
          if someone adds it there too.",
@@ -805,7 +810,7 @@ fn variant_index_has_one_arm_per_listed_codec() {
 ///
 /// The two predicates live on different enums and nothing else couples them.
 /// `KvQuant::materialises_packed_store` decides whether `exit_prefill` builds a
-/// payload; `KvStorage::geometry_only_max_seq` is what the spill writer asks
+/// payload; `KvStorage::is_geometry_only` is what the spill writer asks
 /// before it stamps a codec geometry. A codec classified `false` whose storage
 /// sits in the "payload is not an `Option`" arm (`Mixed | Paged`)
 /// compiles cleanly and makes the writer emit a codec tag with no tensors
@@ -819,9 +824,9 @@ fn a_storeless_codec_always_has_a_geometry_only_storage() {
         if q.materialises_packed_store() {
             continue;
         }
-        let storage = crate::storage::KvStorage::new(q, 4096);
+        let storage = crate::storage::KvStorage::new(q);
         assert!(
-            storage.geometry_only_max_seq().is_some(),
+            storage.is_geometry_only(),
             "{q:?} builds no packed store, but its storage cannot report itself \
              geometry-only — the spill writer would stamp a codec geometry with \
              no tensors behind it"
@@ -910,7 +915,7 @@ fn disposition_of(q: KvQuant) -> Disposition {
 ///
 /// This exists so "nobody picks it" can never be an answer: a variant added to
 /// the enum reaches [`ALL_KV_QUANTS`] (pinned by
-/// `variant_index_has_one_arm_per_listed_codec`) and then has to be classified here
+/// `descriptor_has_one_arm_per_listed_codec`) and then has to be classified here
 /// or the sweep below fails on it. Writing the
 /// class by hand rather than deriving it is the point — the derivation is what
 /// is being checked.
@@ -1258,8 +1263,8 @@ fn surface_stem(q: KvQuant) -> String {
 /// against.
 ///
 /// The sweep is [`ALL_KV_QUANTS`], whose completeness
-/// `variant_index_has_one_arm_per_listed_codec` pins against the
-/// compiler-checked `variant_index` — so a codec cannot reach the CLI without
+/// `descriptor_has_one_arm_per_listed_codec` pins against the
+/// compiler-checked codec descriptor — so a codec cannot reach the CLI without
 /// reaching this manifest, and the gate cannot go stale by omission.
 ///
 /// `INERT` is [`KvQuant::materialises_packed_store`] returning false, which is
@@ -1295,7 +1300,7 @@ fn emit_kv_codec_disposition_manifest() {
         };
         println!(
             "KVQUANT-DISPOSITION\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            q.variant_index(),
+            q.descriptor().index,
             q,
             stem,
             mode,
@@ -2069,7 +2074,7 @@ fn side_stores_agree_with_approx_code_bits() {
 
 /// [`codec_side_layouts`] names every variant, one arm each.
 ///
-/// Same oracle and same reason as `variant_index_has_one_arm_per_listed_codec`:
+/// Same oracle and same reason as `descriptor_has_one_arm_per_listed_codec`:
 /// the `match` is exhaustive so a new variant cannot be forgotten, but a variant
 /// folded into a neighbour's arm with a `|` would be swept by
 /// [`every_codec_byte_model_matches_the_store_it_writes`] under the neighbour's

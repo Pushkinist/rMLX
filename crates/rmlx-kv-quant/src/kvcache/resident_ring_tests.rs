@@ -76,11 +76,9 @@ fn ring_backed_cache(quant: KvQuant) -> KvCache {
     let storage = match quant {
         KvQuant::IsoKOnly3 => KvStorage::IsoKOnly3 {
             k: Some(QuantIsoK3::from_cpu_blocks(Vec::new(), shape, MAX_SEQ)),
-            max_seq: MAX_SEQ,
         },
         KvQuant::IsoKOnly4 => KvStorage::IsoKOnly4 {
             k: Some(QuantIsoK4::from_cpu_blocks(Vec::new(), shape, MAX_SEQ)),
-            max_seq: MAX_SEQ,
         },
         KvQuant::RotorKOnly3 => KvStorage::RotorKOnly3 {
             k: Some(QuantRotorK3::from_cpu_blocks(
@@ -90,7 +88,6 @@ fn ring_backed_cache(quant: KvQuant) -> KvCache {
                 shape,
                 0,
             )),
-            max_seq: MAX_SEQ,
         },
         KvQuant::RotorKOnly4 => KvStorage::RotorKOnly4 {
             k: Some(QuantRotorK4::from_cpu_blocks(
@@ -100,11 +97,18 @@ fn ring_backed_cache(quant: KvQuant) -> KvCache {
                 shape,
                 0,
             )),
-            max_seq: MAX_SEQ,
         },
         _ => unreachable!("ring_backed_cache covers the K-only ring codecs only"),
     };
-    KvCache::from_storage(storage, quant, 0, 0, DispatchPolicy::default(), false)
+    KvCache::from_storage(
+        storage,
+        MAX_SEQ,
+        quant,
+        0,
+        0,
+        DispatchPolicy::default(),
+        false,
+    )
 }
 
 /// Every ring-backed K-only codec, both bit widths of both families.

@@ -21,8 +21,7 @@ use super::KvCache;
 impl KvCache {
     #[allow(
         clippy::unreachable,
-        reason = "storage variant is guaranteed by the `match &self.storage` dispatch in \
-                  KvCache::update() (KvStorage::K8V4 arm); \
+        reason = "storage variant is guaranteed by the KvStorage::view_mut arm that names this entry (KvStorage::K8V4); \
                   mismatch is a construction-time BUG"
     )]
     #[allow(
@@ -33,16 +32,16 @@ impl KvCache {
         clippy::unwrap_used,
         reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
     )]
-    pub(super) fn update_k8v4(
+    pub(crate) fn update_k8v4(
         &mut self,
         new_k: &Array,
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
-        let KvStorage::K8V4 { k, v, max_seq } = &mut self.storage else {
+        let max_seq = self.max_seq;
+        let KvStorage::K8V4 { k, v, .. } = &mut self.storage else {
             unreachable!("storage mismatch: expected K8V4");
         };
-        let max_seq = *max_seq;
 
         if self.decode_fp16_k.is_some() {
             return self.update_decode_fp16(new_k, new_v, max_seq, device);
@@ -251,7 +250,7 @@ impl KvCache {
         // Grow the provisioned decode window before the head-major append, the
         // same rule the legacy `update()` path applies via `ensure_decode_capacity`.
         // This flash dispatch bypasses `update()`, so without growing here the
-        // storage `max_seq` (and the bf16 mirror + latched flash buffers sized
+        // cache `max_seq` (and the bf16 mirror + latched flash buffers sized
         // off it) freeze at the prefill length; the append then walks off the
         // end at the next power-of-two boundary and slices an empty tensor
         // (surfacing downstream as a `reshape … size 0`). A request that
@@ -259,7 +258,7 @@ impl KvCache {
         // rather than crashing mid-append.
         self.ensure_decode_capacity(kv_seq_after_update)?;
         let max_seq = match &self.storage {
-            KvStorage::K8V4 { max_seq, .. } => *max_seq,
+            KvStorage::K8V4 { .. } => self.max_seq,
             _ => return Ok(None),
         };
         let prev_offset = self.offset;
@@ -743,8 +742,7 @@ impl KvCache {
     }
     #[allow(
         clippy::unreachable,
-        reason = "storage variant is guaranteed by the `match &self.storage` dispatch in \
-                  KvCache::update() (KvStorage::K8V8 arm); \
+        reason = "storage variant is guaranteed by the KvStorage::view_mut arm that names this entry (KvStorage::K8V8); \
                   mismatch is a construction-time BUG"
     )]
     #[allow(
@@ -755,16 +753,16 @@ impl KvCache {
         clippy::unwrap_used,
         reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
     )]
-    pub(super) fn update_k8v8(
+    pub(crate) fn update_k8v8(
         &mut self,
         new_k: &Array,
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
-        let KvStorage::K8V8 { k, v, max_seq } = &mut self.storage else {
+        let max_seq = self.max_seq;
+        let KvStorage::K8V8 { k, v, .. } = &mut self.storage else {
             unreachable!("storage mismatch: expected K8V8");
         };
-        let max_seq = *max_seq;
 
         if self.decode_fp16_k.is_some() {
             return self.update_decode_fp16(new_k, new_v, max_seq, device);
@@ -836,14 +834,15 @@ impl KvCache {
         clippy::wildcard_enum_match_arm,
         reason = "the arm reads one storage variant; every other is the same construction-time mismatch and needs no per-variant spelling"
     )]
-    pub(super) fn exit_prefill_k8v8(
+    pub(crate) fn exit_prefill_k8v8(
         &mut self,
         k_full: &Array,
         v_full: &Array,
         device: Device,
+        _total_seq: i32,
     ) -> Result<()> {
         let max_seq = match &self.storage {
-            KvStorage::K8V8 { max_seq, .. } => *max_seq,
+            KvStorage::K8V8 { .. } => self.max_seq,
             _ => return Err(storage_mismatch("K8V8", &self.storage)),
         };
         let new_shape = k_full.shape();
@@ -895,14 +894,15 @@ impl KvCache {
         clippy::wildcard_enum_match_arm,
         reason = "the arm reads one storage variant; every other is the same construction-time mismatch and needs no per-variant spelling"
     )]
-    pub(super) fn exit_prefill_k8v4(
+    pub(crate) fn exit_prefill_k8v4(
         &mut self,
         k_full: &Array,
         v_full: &Array,
         device: Device,
+        _total_seq: i32,
     ) -> Result<()> {
         let max_seq = match &self.storage {
-            KvStorage::K8V4 { max_seq, .. } => *max_seq,
+            KvStorage::K8V4 { .. } => self.max_seq,
             _ => return Err(storage_mismatch("K8V4", &self.storage)),
         };
         let new_shape = k_full.shape();

@@ -703,6 +703,10 @@ fn is_quantised(ct: CacheType) -> bool {
 /// not correspond to any canonical variant, the side falls back to `Bf16` — the
 /// resolver will then surface an `UnsupportedCombo` downstream rather than
 /// silently picking a wrong codec.
+///
+/// The match stays exhaustive. Its per-codec answer (a fallback, a warning, a
+/// panic, different tags for codecs with the same store facts) is policy that
+/// no codec fact gives, so a new codec must choose its arm here.
 #[allow(
     clippy::panic,
     reason = "K8VTurbo2 arm is a contract-violation guard: the variant has no decomposable CacheType pair and must never reach this path via auto-baseline selection; panic surfaces the misconfiguration at startup rather than silently producing wrong output"

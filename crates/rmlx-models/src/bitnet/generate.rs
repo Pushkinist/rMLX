@@ -372,9 +372,11 @@ pub fn generate_greedy(
     // `kv_cache_bytes` is NOT sampled here — this is the prefill snapshot,
     // before the decode ring is allocated. It is recorded post-decode below.
     {
-        let cloned_caches: Result<Vec<KvCache>> =
-            caches.iter().map(|c| c.try_deep_clone()).collect();
-        if let Ok(kv_snapshot) = cloned_caches {
+        if let Some(kv_snapshot) = crate::prompt_cache::snapshot_clone(
+            PROMPT_CACHE.arch_name(),
+            &caches,
+            KvCache::try_deep_clone,
+        ) {
             match kv_snapshot.iter().try_for_each(|c| c.eval_for_spill()) {
                 Ok(()) => {
                     // Salt the chained block-hash walk with the active layout_key

@@ -640,9 +640,11 @@ pub fn generate_greedy<'a>(
     // Save snapshot after full prefill (: never for image prompts —
     // their K/V is not reconstructible from the token-id cache key).
     if !has_image {
-        let kv_snap: rmlx_core::error::Result<Vec<_>> =
-            caches.iter().map(|c| c.try_deep_clone()).collect();
-        if let Ok(kvs) = kv_snap {
+        if let Some(kvs) = crate::prompt_cache::snapshot_clone(
+            PROMPT_CACHE.arch_name(),
+            &caches,
+            KvCache::try_deep_clone,
+        ) {
             // Materialize GPU arrays on the current inference thread before
             // storing in the prompt cache.  Each spawn_blocking request runs
             // on its own tokio thread with its own Metal GPU stream.  If these

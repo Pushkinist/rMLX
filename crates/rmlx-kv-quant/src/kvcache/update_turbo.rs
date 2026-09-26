@@ -3,8 +3,8 @@
 //! Holds every update-side body that only the TurboQuant storage types use:
 //! the two decode entries and the two prefill entries, the width-parametric
 //! symmetric bodies they enter, and the affine-K / turbo-V bodies the four
-//! `K8VTurbo*` spellings share. The `KvStorage` dispatch and the helpers
-//! with more than one family caller stay in [`super::update`].
+//! `K8VTurbo*` spellings share. The helpers with more than one family
+//! caller stay in [`super::update`].
 
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device};
@@ -12,7 +12,7 @@ use rmlx_mlx::{Array, Device};
 use crate::storage::{KvStorage, QuantK, QuantKTurbo, QuantV, TURBO_K4_BITS};
 
 use super::helpers::{array_to_f32_vec, arrays_to_f32, f32_vec_to_array};
-use super::update::{storage_max_seq, storage_mismatch, warn_if_width_disagrees};
+use super::update::{storage_mismatch, warn_if_width_disagrees};
 use super::KvCache;
 
 /// Decode update for `TurboSym3` / `TurboSym4`: K is [`QuantKTurbo`] at
@@ -371,7 +371,7 @@ impl KvCache {
     /// is [`k8_turbo_v_update`] at the V width and TCQ flag
     /// [`k8_turbo_v_knobs`] resolves; this entry takes the warm-TTFT bf16
     /// shortcut and hands the body its stores.
-    pub(super) fn update_k8_turbo_v(
+    pub(crate) fn update_k8_turbo_v(
         &mut self,
         new_k: &Array,
         new_v: &Array,
@@ -380,7 +380,7 @@ impl KvCache {
         let Some((v_bits, use_tcq, variant)) = k8_turbo_v_knobs(&self.storage) else {
             return Err(storage_mismatch(K8_TURBO_V_VARIANTS, &self.storage));
         };
-        let max_seq = storage_max_seq(&self.storage);
+        let max_seq = self.max_seq;
 
         if self.decode_fp16_k.is_some() {
             return self.update_decode_fp16(new_k, new_v, max_seq, device);
@@ -401,7 +401,7 @@ impl KvCache {
     /// Prefill bulk encode for the four affine-K / TurboQuant-V spellings. The
     /// body is [`k8_turbo_v_bulk_encode`] at the V width and TCQ flag
     /// [`k8_turbo_v_knobs`] resolves — the same table the decode entry reads.
-    pub(super) fn exit_prefill_k8_turbo_v(
+    pub(crate) fn exit_prefill_k8_turbo_v(
         &mut self,
         k_full: &Array,
         v_full: &Array,
@@ -412,15 +412,16 @@ impl KvCache {
             return Err(storage_mismatch(K8_TURBO_V_VARIANTS, &self.storage));
         };
         warn_if_width_disagrees(self.quant, self.quant.approx_code_bits().1, v_bits);
-        let (KvStorage::K8VTurbo3 { k, v, max_seq }
-        | KvStorage::K8VTurbo2 { k, v, max_seq }
-        | KvStorage::K8VTurbo3Tcq { k, v, max_seq }
-        | KvStorage::K8VTurbo2Tcq { k, v, max_seq }) = &mut self.storage
+        let max_seq = self.max_seq;
+        let (KvStorage::K8VTurbo3 { k, v, .. }
+        | KvStorage::K8VTurbo2 { k, v, .. }
+        | KvStorage::K8VTurbo3Tcq { k, v, .. }
+        | KvStorage::K8VTurbo2Tcq { k, v, .. }) = &mut self.storage
         else {
             return Err(storage_mismatch(K8_TURBO_V_VARIANTS, &self.storage));
         };
         k8_turbo_v_bulk_encode(
-            k, v, *max_seq, v_bits, use_tcq, k_full, v_full, device, total_seq,
+            k, v, max_seq, v_bits, use_tcq, k_full, v_full, device, total_seq,
         )
     }
     /// Symmetric TurboQuant decode update, both code widths.
@@ -433,18 +434,16 @@ impl KvCache {
         clippy::wildcard_enum_match_arm,
         reason = "the dispatch routes only the two symmetric turbo variants here; a future variant belongs in its own entry, and the fall-through names the mismatch rather than adding a branch per KvStorage variant"
     )]
-    pub(super) fn update_tsym(
+    pub(crate) fn update_tsym(
         &mut self,
         new_k: &Array,
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
-        let (KvStorage::TurboSym3 { max_seq, .. } | KvStorage::TurboSym4 { max_seq, .. }) =
-            &self.storage
-        else {
+        let max_seq = self.max_seq;
+        let (KvStorage::TurboSym3 { .. } | KvStorage::TurboSym4 { .. }) = &self.storage else {
             return Err(storage_mismatch("TurboSym3 | TurboSym4", &self.storage));
         };
-        let max_seq = *max_seq;
 
         if self.decode_fp16_k.is_some() {
             return self.update_decode_fp16(new_k, new_v, max_seq, device);
@@ -465,7 +464,7 @@ impl KvCache {
     /// Symmetric TurboQuant prefill bulk encode at the width the active
     /// storage variant carries (`TurboSym3` is 3 bits, `TurboSym4` is 4). The
     /// body is [`tsym_bulk_encode`]; this entry resolves the storage variant.
-    pub(super) fn exit_prefill_turbo_sym(
+    pub(crate) fn exit_prefill_turbo_sym(
         &mut self,
         k_full: &Array,
         v_full: &Array,
@@ -473,12 +472,13 @@ impl KvCache {
         total_seq: i32,
     ) -> Result<()> {
         let quant_bits = self.quant.approx_code_bits().0;
-        if let KvStorage::TurboSym3 { k, v, max_seq } = &mut self.storage {
+        let max_seq = self.max_seq;
+        if let KvStorage::TurboSym3 { k, v, .. } = &mut self.storage {
             warn_if_width_disagrees(self.quant, quant_bits, 3);
-            tsym_bulk_encode::<3>(k, v, *max_seq, k_full, v_full, device, total_seq)
-        } else if let KvStorage::TurboSym4 { k, v, max_seq } = &mut self.storage {
+            tsym_bulk_encode::<3>(k, v, max_seq, k_full, v_full, device, total_seq)
+        } else if let KvStorage::TurboSym4 { k, v, .. } = &mut self.storage {
             warn_if_width_disagrees(self.quant, quant_bits, 4);
-            tsym_bulk_encode::<4>(k, v, *max_seq, k_full, v_full, device, total_seq)
+            tsym_bulk_encode::<4>(k, v, max_seq, k_full, v_full, device, total_seq)
         } else {
             Err(storage_mismatch("TurboSym3 | TurboSym4", &self.storage))
         }

@@ -12,7 +12,7 @@
 //! - `image`         — VisionBundle, build_image_prompt, run_qwen3vl_image
 //! - `arch_generator` — ArchGenerator (real arch-dispatch engine)
 //! - `speculative`   — SpeculativeGenerator (greedy speculative decoding)
-//! - `helpers`       — shared private helpers (ITL/TTFT writers, kv_quant_label, etc.)
+//! - `helpers`       — shared private helpers (ITL/TTFT writers, etc.)
 
 #![allow(
     clippy::cognitive_complexity,

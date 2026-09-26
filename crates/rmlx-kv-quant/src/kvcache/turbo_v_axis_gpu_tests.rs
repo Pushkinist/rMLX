@@ -129,7 +129,7 @@ fn drive_on_gpu(quant: KvQuant) -> StoreDisposition {
         }
         other => panic!(
             "not a symmetric turbo storage variant: {}",
-            super::helpers::storage_variant_name(other)
+            other.view().name
         ),
     }
 }

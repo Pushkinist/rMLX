@@ -23,7 +23,7 @@ use crate::rotor_flash_decode_symv_msl::{
 };
 use crate::storage::{KvStorage, ISO_QUAT_BLOCK_SIZE};
 
-use super::helpers::{f32_vec_to_array, slice_v_prefix, storage_variant_name};
+use super::helpers::{f32_vec_to_array, slice_v_prefix};
 use super::shared_kv::SharedKv;
 use super::KvCache;
 
@@ -153,7 +153,7 @@ impl KvCache {
             _ => {
                 return Err(Error::KvStorageMismatch {
                     expected: "Mixed",
-                    got: storage_variant_name(&self.storage),
+                    got: self.storage.view().name,
                 })
             }
         };
@@ -190,16 +190,7 @@ impl KvCache {
         // `prev_offset + new_seq` above, so `update_decode_fp16` slices the new
         // token in at `[prev_offset:offset]` — identical bookkeeping to K8V4.
         let kv = if want_kv {
-            let max_seq = match &self.storage {
-                KvStorage::Mixed { max_seq, .. } => *max_seq,
-                _ => {
-                    return Err(Error::KvStorageMismatch {
-                        expected: "Mixed",
-                        got: storage_variant_name(&self.storage),
-                    })
-                }
-            };
-            let (k_full, v_full) = self.update_decode_fp16(new_k, new_v, max_seq, device)?;
+            let (k_full, v_full) = self.update_decode_fp16(new_k, new_v, self.max_seq, device)?;
             Some((k_full, v_full))
         } else {
             None
@@ -993,7 +984,7 @@ impl KvCache {
             other => Err(Error::Mlx(format!(
                 "sdpa_shared: storage variant {} has no fused-over-store consumer path — a \
                  producer must not report a store-backed share for it",
-                storage_variant_name(other)
+                other.view().name
             ))),
         }
     }
@@ -1119,7 +1110,7 @@ impl KvCache {
             other => {
                 return Err(Error::Mlx(format!(
                     "materialise_shared_kv: storage variant {} holds no store-backed share",
-                    storage_variant_name(other)
+                    other.view().name
                 )))
             }
         };
@@ -1348,10 +1339,10 @@ impl KvCache {
         self.ensure_decode_capacity(self.offset + new_k.shape()[2])?;
 
         // Extract & validate storage variant.
-        let KvStorage::PlanarK { k, max_seq } = &mut self.storage else {
+        let max_seq = self.max_seq;
+        let KvStorage::PlanarK { k, .. } = &mut self.storage else {
             return Ok(None);
         };
-        let max_seq = *max_seq;
 
         // Append K (packed) — same as the legacy update_planar_k path but
         // SKIPPING the K dequant (the bandwidth win).
@@ -1449,7 +1440,7 @@ impl KvCache {
         let KvStorage::PlanarK { k, .. } = &self.storage else {
             return Err(Error::KvStorageMismatch {
                 expected: "PlanarK",
-                got: storage_variant_name(&self.storage),
+                got: self.storage.view().name,
             });
         };
         let Some(ks) = k.as_ref() else {
@@ -1641,7 +1632,7 @@ impl KvCache {
             return Ok(None);
         }
         // Provision this step before the first mutation: both the packed ring
-        // below and the bf16 V mirror further down are capped by the storage
+        // below and the bf16 V mirror further down are capped by the cache
         // `max_seq`, so it has to cover `prev_seq + new_seq` first.
         self.ensure_decode_capacity(prev_seq + new_seq)?;
         super::update_rotor::rotor_k_only_gpu_append(self, new_k, &new_shape, device)?;
@@ -1652,7 +1643,7 @@ impl KvCache {
         // every decode step overwrites the last V position instead of
         // appending. Same ordering as `update_and_sdpa_planar_k_fused`.
         self.offset = prev_seq + new_seq;
-        let max_seq = rotor_k_max_seq(&self.storage)?;
+        let max_seq = self.max_seq;
         let (v_slab, v_valid) = self.update_decode_fp16_v_slab(new_v, max_seq, device)?;
 
         // Take `kv_seq` from the store the ring was written from, not from
@@ -1714,7 +1705,7 @@ impl KvCache {
         } else {
             return Err(Error::KvStorageMismatch {
                 expected: "RotorKOnly3 | RotorKOnly4",
-                got: storage_variant_name(&self.storage),
+                got: self.storage.view().name,
             });
         };
         let Some((codes, scales, norms, rotors)) = self.rotor_k_packed_view(kv_seq, device)? else {
@@ -1910,7 +1901,7 @@ impl KvCache {
 
         let prev_seq = self.offset;
         // Provision this step before the first mutation: both packed rings are
-        // capped by the storage `max_seq`, so it has to cover
+        // capped by the cache `max_seq`, so it has to cover
         // `prev_seq + new_seq` before either append runs. Without it the window
         // freezes at whatever the prompt needed and decode dies mid-stream once
         // it crosses that bound — on both axes here, since neither has a bf16
@@ -1965,7 +1956,7 @@ impl KvCache {
         } else {
             return Err(Error::KvStorageMismatch {
                 expected: "RotorSym3 | RotorSym4",
-                got: storage_variant_name(&self.storage),
+                got: self.storage.view().name,
             });
         };
         let Some((k_view, v_view)) = self.rotor_sym_packed_views(kv_seq, device)? else {
@@ -2169,7 +2160,7 @@ impl KvCache {
             return Ok(None);
         }
         // Provision this step before the first mutation: both the packed ring
-        // below and the bf16 V mirror further down are capped by the storage
+        // below and the bf16 V mirror further down are capped by the cache
         // `max_seq`, so it has to cover `prev_seq + new_seq` first.
         self.ensure_decode_capacity(prev_seq + new_seq)?;
         super::update_iso::iso_k_only_gpu_append(self, new_k, &new_shape, device)?;
@@ -2180,7 +2171,7 @@ impl KvCache {
         // every decode step overwrites the last V position instead of
         // appending. Same ordering as `update_and_sdpa_rotor_k_fused`.
         self.offset = prev_seq + new_seq;
-        let max_seq = iso_k_max_seq(&self.storage)?;
+        let max_seq = self.max_seq;
         let (v_slab, v_valid) = self.update_decode_fp16_v_slab(new_v, max_seq, device)?;
 
         // Take `kv_seq` from the store the ring was written from, not from
@@ -2234,7 +2225,7 @@ impl KvCache {
         } else {
             return Err(Error::KvStorageMismatch {
                 expected: "IsoKOnly3 | IsoKOnly4",
-                got: storage_variant_name(&self.storage),
+                got: self.storage.view().name,
             });
         };
         let Some((codes, scales, norms)) = self.iso_k_packed_view(kv_seq, device)? else {
@@ -2416,7 +2407,7 @@ impl KvCache {
 
         let prev_seq = self.offset;
         // Provision this step before the first mutation: both packed rings are
-        // capped by the storage `max_seq`, so it has to cover `prev_seq + new_seq`
+        // capped by the cache `max_seq`, so it has to cover `prev_seq + new_seq`
         // before either append runs.
         self.ensure_decode_capacity(prev_seq + new_seq)?;
         super::update_iso::iso_sym_gpu_append(self, new_k, new_v, &new_shape, device)?;
@@ -2461,7 +2452,7 @@ impl KvCache {
         } else {
             return Err(Error::KvStorageMismatch {
                 expected: "IsoSym3 | IsoSym4",
-                got: storage_variant_name(&self.storage),
+                got: self.storage.view().name,
             });
         };
         let store_shape = iso_sym_store_shape(&self.storage)?;
@@ -2636,7 +2627,7 @@ fn rotor_sym_store_shape(storage: &KvStorage) -> Result<&[i32]> {
     } else {
         Err(Error::KvStorageMismatch {
             expected: "RotorSym3 | RotorSym4 with a live K buffer",
-            got: storage_variant_name(storage),
+            got: storage.view().name,
         })
     }
 }
@@ -2667,7 +2658,7 @@ fn rotor_sym_accumulated_seq(storage: &KvStorage) -> Result<i32> {
         other => {
             return Err(Error::KvStorageMismatch {
                 expected: "RotorSym3 | RotorSym4 with live K and V buffers",
-                got: storage_variant_name(other),
+                got: other.view().name,
             })
         }
     };
@@ -2700,7 +2691,7 @@ fn rotor_k_store_shape(storage: &KvStorage) -> Result<&[i32]> {
     } else {
         Err(Error::KvStorageMismatch {
             expected: "RotorKOnly3 | RotorKOnly4 with a live K buffer",
-            got: storage_variant_name(storage),
+            got: storage.view().name,
         })
     }
 }
@@ -2728,7 +2719,7 @@ fn planar_k_accumulated_seq(storage: &KvStorage) -> Result<i32> {
     let KvStorage::PlanarK { k: Some(ks), .. } = storage else {
         return Err(Error::KvStorageMismatch {
             expected: "PlanarK with a live K buffer",
-            got: storage_variant_name(storage),
+            got: storage.view().name,
         });
     };
     ks.shape.get(2).copied().ok_or_else(|| {
@@ -2764,7 +2755,7 @@ fn iso_k_store_shape(storage: &KvStorage) -> Result<&[i32]> {
     } else {
         Err(Error::KvStorageMismatch {
             expected: "IsoKOnly3 | IsoKOnly4 with a live K buffer",
-            got: storage_variant_name(storage),
+            got: storage.view().name,
         })
     }
 }
@@ -2779,7 +2770,7 @@ fn iso_sym_store_shape(storage: &KvStorage) -> Result<&[i32]> {
     } else {
         Err(Error::KvStorageMismatch {
             expected: "IsoSym3 | IsoSym4 with a live K buffer",
-            got: storage_variant_name(storage),
+            got: storage.view().name,
         })
     }
 }
@@ -2810,7 +2801,7 @@ fn iso_sym_accumulated_seq(storage: &KvStorage) -> Result<i32> {
         other => {
             return Err(Error::KvStorageMismatch {
                 expected: "IsoSym3 | IsoSym4 with live K and V buffers",
-                got: storage_variant_name(other),
+                got: other.view().name,
             })
         }
     };
@@ -2831,33 +2822,4 @@ fn iso_sym_accumulated_seq(storage: &KvStorage) -> Result<i32> {
         )));
     }
     Ok(k_seq)
-}
-
-/// `max_seq` of the active iso K-only storage variant.
-///
-/// Read from the live `KvStorage` variant — which `ensure_decode_capacity` has
-/// just grown for this step — never from the store struct's own inert
-/// `max_seq` field, which is a prefill-time snapshot.
-fn iso_k_max_seq(storage: &KvStorage) -> Result<i32> {
-    if let KvStorage::IsoKOnly3 { max_seq, .. } | KvStorage::IsoKOnly4 { max_seq, .. } = storage {
-        Ok(*max_seq)
-    } else {
-        Err(Error::KvStorageMismatch {
-            expected: "IsoKOnly3 | IsoKOnly4",
-            got: storage_variant_name(storage),
-        })
-    }
-}
-
-/// `max_seq` of the active rotor K-only storage variant.
-fn rotor_k_max_seq(storage: &KvStorage) -> Result<i32> {
-    if let KvStorage::RotorKOnly3 { max_seq, .. } | KvStorage::RotorKOnly4 { max_seq, .. } = storage
-    {
-        Ok(*max_seq)
-    } else {
-        Err(Error::KvStorageMismatch {
-            expected: "RotorKOnly3 | RotorKOnly4",
-            got: storage_variant_name(storage),
-        })
-    }
 }

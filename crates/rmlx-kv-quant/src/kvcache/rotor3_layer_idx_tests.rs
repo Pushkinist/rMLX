@@ -306,7 +306,8 @@ fn rotor3_from_storage_records_layer_idx() {
     // builder field passthrough. The codec-specific storage round-trip is
     // exercised by the existing block_io_tests hydrate suite.
     let cache_l0 = KvCache::from_storage(
-        KvStorage::None { max_seq: 1024 },
+        KvStorage::None {},
+        1024,
         KvQuant::Rotor3,
         0,
         0,
@@ -314,7 +315,8 @@ fn rotor3_from_storage_records_layer_idx() {
         false,
     );
     let cache_l7 = KvCache::from_storage(
-        KvStorage::None { max_seq: 1024 },
+        KvStorage::None {},
+        1024,
         KvQuant::Rotor3,
         0,
         7,

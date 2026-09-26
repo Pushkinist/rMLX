@@ -14,6 +14,7 @@ use parking_lot::Mutex;
 
 use futures::stream::{self, Stream};
 use rmlx_core::Error;
+use rmlx_kv_quant::kv_quant_label;
 use rmlx_metrics::events::Measurement;
 
 use crate::openai::ItlSample;
@@ -21,7 +22,7 @@ use crate::openai::ItlSample;
 use super::audio::{build_audio_prompt, AudioBundle};
 use super::generator::Generator;
 use super::helpers::{
-    compute_itl_stats, is_reconstructible_tool_marker, kv_quant_label, record_itl_percentiles,
+    compute_itl_stats, is_reconstructible_tool_marker, record_itl_percentiles,
     resolve_kv_quant_for_load, spsc_ts,
 };
 use super::image::{build_image_prompt, run_qwen3vl_image, VisionBundle};
@@ -1308,10 +1309,6 @@ impl Generator for ArchGenerator {
                         0
                     }
                 };
-                // Reuse `kv_quant_label` so payload-bearing
-                // variants (RotorK*Asym, Mixed, RotK) render with their full
-                // tag (e.g. `rotor_k_3_asym_v8_g128`). Previously this match
-                // was inlined and missed payload variants.
                 let quant_mode_owned = kv_quant_label(kv_quant_override);
                 if kv_bytes > 0 {
                     tracing::info!(

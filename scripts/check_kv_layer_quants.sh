@@ -40,8 +40,11 @@
 #
 #   Rule 1 alone cannot see a hand-rolled `if i < 2 { K8V8 }`; this rule makes
 #   a per-layer stack that does not go through the producer a deliberate,
-#   written-down decision rather than an accident. Every current marker is a
-#   scratch stack that is never spilled and never keyed.
+#   written-down decision rather than an accident. A marker names one of two
+#   cases: a scratch stack that is never spilled and never keyed, or an arch
+#   that builds every layer at one codec, is spilled and keyed, and whose
+#   hydrate reads the one vector its prompt cache declares uniform
+#   (`ArchPromptCache::layer_quants`).
 #
 # Exit 0 = clean. Exit 1 = violation found.
 
@@ -119,7 +122,8 @@ if [ ${#rule2[@]} -gt 0 ]; then
     echo "Either build the stack from the producer:" >&2
     echo "  kv_layer_quants(n_layers, kv_quant).into_iter().enumerate().map(|(i, q)| …)" >&2
     echo "or, if this stack is deliberately uniform (a scratch stack that is never" >&2
-    echo "spilled and never keyed), record why with a line-leading marker:" >&2
+    echo "spilled and never keyed, or an arch whose hydrate reads the uniform vector" >&2
+    echo "its prompt cache declares), record why with a line-leading marker:" >&2
     echo "  // kv-layer-quants: uniform — <reason>" >&2
     exit 1
 fi

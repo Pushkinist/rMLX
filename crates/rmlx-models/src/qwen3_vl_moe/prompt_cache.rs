@@ -179,7 +179,8 @@ pub(crate) static PROMPT_CACHE: ArchPromptCache<Qwen3VlMoeEntry> = ArchPromptCac
     "Qwen3VLMoeForConditionalGeneration",
     ReusePolicy::ExactOnly,
     crate::qwen3_vl_moe::SHARES_KV_ACROSS_LAYERS,
-);
+)
+.with_uniform_layers();
 
 /// active SSD-tier `layout_key` for the qwen3-vl-moe cache, or `0` when the tier
 /// is OFF. `FNV_OFFSET ^ 0 == FNV_OFFSET` ⇒ legacy un-salted digests when no SSD

@@ -27,7 +27,7 @@
 #   `cargo test -p rmlx-models --lib emit_kv_byte_model_manifest` prints one
 #   `KVBYTES` row per (codec, topology, shape) and one `KVFLOOR` row per (codec,
 #   topology), swept over `ALL_KV_QUANTS`. That list's completeness is pinned
-#   against the compiler-checked `variant_index`, so a new codec reaches this
+#   against the compiler-checked codec descriptor, so a new codec reaches this
 #   gate without anyone adding it to a list here.
 #
 #   `perf_ceiling.py --byte-model` reads that manifest on stdin and re-emits it

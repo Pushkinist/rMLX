@@ -509,7 +509,8 @@ path runs only when all of these conditions are true
 - the codec has a fused-QK kernel and a GPU K encoder;
 - QJL is off (the kernel does not use the QJL residual);
 - the bf16 K mirror is live to seed the shadow;
-- the storage variant carries a `max_seq`, and the step does not overflow it.
+- the storage variant is in the fused-QK table, and the step does not
+  overflow the cache's `max_seq`.
 
 See `docs/KV_FUSED_KERNELS.md` § "Fused-QK head-major K storage".
 

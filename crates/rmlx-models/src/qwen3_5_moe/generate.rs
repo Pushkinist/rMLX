@@ -390,9 +390,15 @@ pub fn generate_greedy<'a>(
         // Push the completed full-length snapshot (both prefix + tail) so
         // future requests can serve this prompt as an Exact hit from RAM.
         {
-            let kv_snap: Result<Vec<_>> = kv_caches.iter().map(|c| c.try_deep_clone()).collect();
-            let lin_snap: Result<Vec<_>> = lin_caches.iter().map(|c| c.try_deep_clone()).collect();
-            if let (Ok(kvs), Ok(lins)) = (kv_snap, lin_snap) {
+            let arch = PROMPT_CACHE.arch_name();
+            if let (Some(kvs), Some(lins)) = (
+                crate::prompt_cache::snapshot_clone(arch, &kv_caches, KvCache::try_deep_clone),
+                crate::prompt_cache::snapshot_clone(
+                    arch,
+                    &lin_caches,
+                    LinearAttnCache::try_deep_clone,
+                ),
+            ) {
                 match kvs
                     .iter()
                     .try_for_each(|c| c.eval_for_spill())
@@ -614,9 +620,11 @@ pub fn generate_greedy<'a>(
     );
 
     {
-        let kv_snap: Result<Vec<_>> = kv_caches.iter().map(|c| c.try_deep_clone()).collect();
-        let lin_snap: Result<Vec<_>> = lin_caches.iter().map(|c| c.try_deep_clone()).collect();
-        if let (Ok(kvs), Ok(lins)) = (kv_snap, lin_snap) {
+        let arch = PROMPT_CACHE.arch_name();
+        if let (Some(kvs), Some(lins)) = (
+            crate::prompt_cache::snapshot_clone(arch, &kv_caches, KvCache::try_deep_clone),
+            crate::prompt_cache::snapshot_clone(arch, &lin_caches, LinearAttnCache::try_deep_clone),
+        ) {
             // Materialize GPU arrays on the current inference thread before
             // storing in the prompt cache.  Each spawn_blocking request runs
             // on its own tokio thread, which has its own Metal GPU stream

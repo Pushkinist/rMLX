@@ -281,9 +281,10 @@ fn shared_source_refuses_a_declared_producer_rebuilt_from_the_store_alone() {
 
     // Spill + hydrate, structurally: the store survives, the mirror does not.
     let offset = donor.offset();
-    let storage = std::mem::replace(&mut donor.storage, KvStorage::None { max_seq: 0 });
+    let storage = std::mem::replace(&mut donor.storage, KvStorage::None {});
     let mut hydrated = KvCache::from_storage(
         storage,
+        donor.max_seq(),
         quant,
         offset,
         donor.layer_idx(),

@@ -113,13 +113,13 @@ Prefill chunks accumulate into a raw per-layer buffer
 quantizes it once, at the end of prefill.
 
 `update_prefill_raw` calls `ensure_prefill_capacity` on every chunk. When the
-chunk needs more than the storage's `max_seq`, it:
+chunk needs more than the cache's `max_seq`, it:
 
 1. allocates a buffer at `next_pow2_seq(needed)`, the next power of two,
    saturated at `2^30` and clamped to the ceiling (§4.6);
 2. copies the filled prefix into it;
-3. raises `max_seq` on the storage variant, so `exit_prefill` sizes its
-   buffers to match.
+3. raises `KvCache::max_seq`, so `exit_prefill` sizes its buffers to
+   match.
 
 A grow is legal only before the first `exit_prefill`. On a cache whose
 quantized payload already exists, it fails with
@@ -412,6 +412,12 @@ the prompt into contiguous chunks with no padding tokens. `update_paged`
 reorders chunks to sequence-major before quantizing, since the page slabs are
 token-major.
 
+`KvStorage::try_deep_clone` refuses (`Err`) when a paged slot holds pages: the
+page slabs have no copy, and a clone without them would keep the cache's
+`offset` for tokens it does not hold. A paged slot with no pages clones to an
+empty store with the same page geometry. The prompt cache reads the refusal as
+a miss (`docs/PROMPT_CACHE.md`).
+
 ### 5.10 Pure 2-bit K is gated
 
 `q2_g64` is V-only. `combo_to_kv_quant` rejects `q2_g64` on K with
@@ -518,7 +524,8 @@ honours `RMLX_FUSED_QK=1`. Its life:
 The bf16 mirror stays maintained beside it as the fallback. A decode past
 `max_seq`, or rotor with QJL on, skips fused-QK for that step.
 `KvCache::reset` drops the shadow; `truncate_to` moves only its fill cursor.
-Rotating caches never get one (`storage_max_seq_for_fused_qk` is `None`).
+Rotating caches never get one: `update_and_sdpa` returns through the ring
+path before the fused-QK dispatch.
 Per-codec shapes and the dispatch wire-in are in `docs/KV_FUSED_KERNELS.md`
 § "Fused-QK head-major K storage".
 
@@ -575,9 +582,10 @@ Notes:
 - `PlanarK`'s fused-QK and flash-decode arm runs only when the K mirror is
   absent, which a seeded cache never is.
 
-`decode_reads_packed_store()` is the one place the classification lives. A
-codec that gains a decode kernel over its own store flips its arm there, and
-`exit_prefill` builds the store in the same change.
+`decode_reads_packed_store()` reads the one place the classification lives:
+the codec's row in `KvQuant::descriptor` (`quant_descriptor.rs`). A codec that
+gains a decode kernel over its own store flips `reads_packed_store` in that
+row, and `exit_prefill` builds the store in the same change.
 
 **Where the store is still read.** A cache with no mirror decodes through the
 codec body: one rebuilt by `KvCache::from_storage`, or one that never

@@ -37,7 +37,7 @@
 //!   collapse reduced to the one safe scale-byte form, needs a `Device::Gpu`
 //!   append after the hydrate. `make gpu-test` owns it.
 
-use super::block_io_tests::lcg;
+use super::block_io_tests::{lcg, split_layers};
 use super::{KvBlockReader, KvBlockWriter};
 use rmlx_kv_quant::storage::{KvStorage, QuantKTurbo3, QuantKTurbo4, QuantV};
 use rmlx_kv_quant::turboquant::{turbo_quantize_v, TurboBlocks};
@@ -87,7 +87,6 @@ fn build(bits: u8) -> (KvStorage, TurboBlocks) {
                 WRITTEN_MAX_SEQ,
             )),
             v,
-            max_seq: WRITTEN_MAX_SEQ,
         },
         _ => KvStorage::TurboSym4 {
             k: Some(QuantKTurbo4::from_cpu_blocks(
@@ -96,7 +95,6 @@ fn build(bits: u8) -> (KvStorage, TurboBlocks) {
                 WRITTEN_MAX_SEQ,
             )),
             v,
-            max_seq: WRITTEN_MAX_SEQ,
         },
     };
     (storage, k_block)
@@ -135,21 +133,23 @@ fn spill_and_hydrate(name: &str, quant: KvQuant, bits: u8) -> (HydratedK, TurboB
     let dir = TempDir::new().expect("temp dir");
     let path = dir.path().join(format!("{name}.safetensors"));
 
-    KvBlockWriter::new(MODEL_ID, quant, &layers, &[])
+    KvBlockWriter::new(MODEL_ID, quant, &layers, WRITTEN_MAX_SEQ, &[])
         .write(&path, device)
         .expect("spill");
     let reader = KvBlockReader::open(&path).expect("open the spilled block");
-    let (rebuilt, _bf16, _lin) = reader.hydrate(MODEL_ID, quant, device).expect("hydrate");
+    let (layers, _lin) = reader.hydrate(MODEL_ID, quant, device).expect("hydrate");
+    let (rebuilt, max_seqs, _bf16) = split_layers(layers);
 
     assert_eq!(rebuilt.len(), 1, "{name}: layer count");
+    assert_eq!(
+        max_seqs,
+        [WRITTEN_MAX_SEQ],
+        "{name}: the layer window is what the decode path reads, and it did not survive the \
+         round trip"
+    );
     let layer = rebuilt.into_iter().next().expect("one layer");
     let hydrated = match layer {
-        KvStorage::TurboSym3 { k, max_seq, .. } => {
-            assert_eq!(
-                max_seq, WRITTEN_MAX_SEQ,
-                "{name}: the storage-level window is what the decode path reads, and it did \
-                 not survive the round trip"
-            );
+        KvStorage::TurboSym3 { k, .. } => {
             let k = k.expect("hydrated K store");
             let QuantKTurbo3 {
                 blocks,
@@ -174,12 +174,7 @@ fn spill_and_hydrate(name: &str, quant: KvQuant, bits: u8) -> (HydratedK, TurboB
                 gpu_capacity,
             }
         }
-        KvStorage::TurboSym4 { k, max_seq, .. } => {
-            assert_eq!(
-                max_seq, WRITTEN_MAX_SEQ,
-                "{name}: the storage-level window is what the decode path reads, and it did \
-                 not survive the round trip"
-            );
+        KvStorage::TurboSym4 { k, .. } => {
             let k = k.expect("hydrated K store");
             let QuantKTurbo4 {
                 blocks,

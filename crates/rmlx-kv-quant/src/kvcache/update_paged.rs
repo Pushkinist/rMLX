@@ -1,8 +1,7 @@
 //! Paged KV update path.
 //!
 //! Holds the one update-side body that only the paged storage uses. The
-//! `KvStorage` dispatch and the helpers with more than one family caller stay
-//! in [`super::update`].
+//! helpers with more than one family caller stay in [`super::update`].
 
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device};
@@ -40,7 +39,7 @@ impl KvCache {
         clippy::wildcard_enum_match_arm,
         reason = "wildcard arm is the correct fallthrough for unsupported arch/quant variants; exhaustive expansion would require updating on every new variant"
     )]
-    pub(super) fn update_paged(
+    pub(crate) fn update_paged(
         &mut self,
         new_k: &Array,
         new_v: &Array,
@@ -55,7 +54,7 @@ impl KvCache {
 
         // Extract quant + max_seq without holding the storage borrow.
         let (paged_quant, max_seq) = match &self.storage {
-            KvStorage::Paged { quant, max_seq, .. } => (*quant, *max_seq),
+            KvStorage::Paged { quant, .. } => (*quant, self.max_seq),
             _ => unreachable!("update_paged called on non-Paged storage"),
         };
 

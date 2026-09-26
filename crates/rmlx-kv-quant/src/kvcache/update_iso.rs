@@ -9,8 +9,8 @@
 //! Holds every update-side body that only the iso storage types use: the
 //! per-variant `update_iso_*` decode entries, the `exit_prefill_iso*` prefill
 //! bulk-encode bodies, the GPU encode and ring-sync helpers, the chunk
-//! appenders and the materialise-tail path. The `KvStorage` dispatch and the
-//! helpers with more than one family caller stay in [`super::update`].
+//! appenders and the materialise-tail path. The helpers with more than one
+//! family caller stay in [`super::update`].
 
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device};
@@ -268,12 +268,10 @@ pub(super) fn iso_k_only_gpu_append(
     new_shape: &[i32],
     device: Device,
 ) -> Result<()> {
-    let (KvStorage::IsoKOnly3 { max_seq, .. } | KvStorage::IsoKOnly4 { max_seq, .. }) =
-        &cache.storage
-    else {
+    let max_seq = cache.max_seq;
+    let (KvStorage::IsoKOnly3 { .. } | KvStorage::IsoKOnly4 { .. }) = &cache.storage else {
         return Err(storage_mismatch("IsoKOnly3 | IsoKOnly4", &cache.storage));
     };
-    let max_seq = *max_seq;
 
     if let KvStorage::IsoKOnly3 { k, .. } = &mut cache.storage {
         iso_k_only_gpu_append_at::<3>(k, max_seq, "IsoKOnly3", new_k, new_shape, device)
@@ -357,11 +355,10 @@ pub(super) fn iso_sym_gpu_append(
     new_shape: &[i32],
     device: Device,
 ) -> Result<()> {
-    let (KvStorage::IsoSym3 { max_seq, .. } | KvStorage::IsoSym4 { max_seq, .. }) = &cache.storage
-    else {
+    let max_seq = cache.max_seq;
+    let (KvStorage::IsoSym3 { .. } | KvStorage::IsoSym4 { .. }) = &cache.storage else {
         return Err(storage_mismatch("IsoSym3 | IsoSym4", &cache.storage));
     };
-    let max_seq = *max_seq;
 
     if let KvStorage::IsoSym3 { k, v, .. } = &mut cache.storage {
         iso_sym_gpu_append_at::<3>(k, v, max_seq, "IsoSym3", new_k, new_v, new_shape, device)
@@ -955,17 +952,16 @@ impl KvCache {
     ///
     /// The body is [`iso_v_update`] at that width; this entry resolves the
     /// storage variant and takes the warm-TTFT bf16 shortcut.
-    pub(super) fn update_iso_v(
+    pub(crate) fn update_iso_v(
         &mut self,
         new_k: &Array,
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
-        let (KvStorage::IsoV3 { max_seq, .. } | KvStorage::IsoV4 { max_seq, .. }) = &self.storage
-        else {
+        let max_seq = self.max_seq;
+        let (KvStorage::IsoV3 { .. } | KvStorage::IsoV4 { .. }) = &self.storage else {
             return Err(storage_mismatch("IsoV3 | IsoV4", &self.storage));
         };
-        let max_seq = *max_seq;
 
         if self.decode_fp16_k.is_some() {
             return self.update_decode_fp16(new_k, new_v, max_seq, device);
@@ -986,18 +982,16 @@ impl KvCache {
     ///
     /// The body is [`iso_sym_update`] at that width; this entry resolves the
     /// storage variant and takes the warm-TTFT bf16 shortcut.
-    pub(super) fn update_iso_sym(
+    pub(crate) fn update_iso_sym(
         &mut self,
         new_k: &Array,
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
-        let (KvStorage::IsoSym3 { max_seq, .. } | KvStorage::IsoSym4 { max_seq, .. }) =
-            &self.storage
-        else {
+        let max_seq = self.max_seq;
+        let (KvStorage::IsoSym3 { .. } | KvStorage::IsoSym4 { .. }) = &self.storage else {
             return Err(storage_mismatch("IsoSym3 | IsoSym4", &self.storage));
         };
-        let max_seq = *max_seq;
 
         if self.decode_fp16_k.is_some() {
             return self.update_decode_fp16(new_k, new_v, max_seq, device);
@@ -1025,18 +1019,16 @@ impl KvCache {
     /// bf16-K regression).
     ///
     /// The K side is [`iso_k_only_k_side`] at the resolved width.
-    pub(super) fn update_iso_k_only(
+    pub(crate) fn update_iso_k_only(
         &mut self,
         new_k: &Array,
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
-        let (KvStorage::IsoKOnly3 { max_seq, .. } | KvStorage::IsoKOnly4 { max_seq, .. }) =
-            &self.storage
-        else {
+        let max_seq = self.max_seq;
+        let (KvStorage::IsoKOnly3 { .. } | KvStorage::IsoKOnly4 { .. }) = &self.storage else {
             return Err(storage_mismatch("IsoKOnly3 | IsoKOnly4", &self.storage));
         };
-        let max_seq = *max_seq;
 
         let k_full = if let KvStorage::IsoKOnly3 { k, .. } = &mut self.storage {
             iso_k_only_k_side::<3>(k, max_seq, "IsoKOnly3", new_k, device)?
@@ -1056,7 +1048,7 @@ impl KvCache {
     /// the active storage variant carries (`IsoV3` is 3 bits, `IsoV4` is 4).
     /// The body is [`iso_v_bulk_encode`]; this entry resolves the storage
     /// variant.
-    pub(super) fn exit_prefill_iso_v(
+    pub(crate) fn exit_prefill_iso_v(
         &mut self,
         k_full: &Array,
         v_full: &Array,
@@ -1064,12 +1056,13 @@ impl KvCache {
         total_seq: i32,
     ) -> Result<()> {
         let quant_bits = self.quant.approx_code_bits().1;
-        if let KvStorage::IsoV3 { k, v, max_seq } = &mut self.storage {
+        let max_seq = self.max_seq;
+        if let KvStorage::IsoV3 { k, v, .. } = &mut self.storage {
             warn_if_width_disagrees(self.quant, quant_bits, 3);
-            iso_v_bulk_encode::<3>(k, v, *max_seq, k_full, v_full, device, total_seq)
-        } else if let KvStorage::IsoV4 { k, v, max_seq } = &mut self.storage {
+            iso_v_bulk_encode::<3>(k, v, max_seq, k_full, v_full, device, total_seq)
+        } else if let KvStorage::IsoV4 { k, v, .. } = &mut self.storage {
             warn_if_width_disagrees(self.quant, quant_bits, 4);
-            iso_v_bulk_encode::<4>(k, v, *max_seq, k_full, v_full, device, total_seq)
+            iso_v_bulk_encode::<4>(k, v, max_seq, k_full, v_full, device, total_seq)
         } else {
             Err(storage_mismatch("IsoV3 | IsoV4", &self.storage))
         }
@@ -1078,7 +1071,7 @@ impl KvCache {
     /// Iso symmetric prefill bulk encode at the width the active storage
     /// variant carries (`IsoSym3` is 3 bits, `IsoSym4` is 4). The body is
     /// [`iso_sym_bulk_encode`]; this entry resolves the storage variant.
-    pub(super) fn exit_prefill_iso_sym(
+    pub(crate) fn exit_prefill_iso_sym(
         &mut self,
         k_full: &Array,
         v_full: &Array,
@@ -1086,12 +1079,13 @@ impl KvCache {
         total_seq: i32,
     ) -> Result<()> {
         let quant_bits = self.quant.approx_code_bits().0;
-        if let KvStorage::IsoSym3 { k, v, max_seq } = &mut self.storage {
+        let max_seq = self.max_seq;
+        if let KvStorage::IsoSym3 { k, v, .. } = &mut self.storage {
             warn_if_width_disagrees(self.quant, quant_bits, 3);
-            iso_sym_bulk_encode::<3>(k, v, *max_seq, k_full, v_full, device, total_seq)
-        } else if let KvStorage::IsoSym4 { k, v, max_seq } = &mut self.storage {
+            iso_sym_bulk_encode::<3>(k, v, max_seq, k_full, v_full, device, total_seq)
+        } else if let KvStorage::IsoSym4 { k, v, .. } = &mut self.storage {
             warn_if_width_disagrees(self.quant, quant_bits, 4);
-            iso_sym_bulk_encode::<4>(k, v, *max_seq, k_full, v_full, device, total_seq)
+            iso_sym_bulk_encode::<4>(k, v, max_seq, k_full, v_full, device, total_seq)
         } else {
             Err(storage_mismatch("IsoSym3 | IsoSym4", &self.storage))
         }
@@ -1101,19 +1095,21 @@ impl KvCache {
     /// carries (`IsoKOnly3` is 3 bits, `IsoKOnly4` is 4); V stays bf16. The
     /// body is [`iso_k_only_bulk_encode`]; this entry resolves the storage
     /// variant.
-    pub(super) fn exit_prefill_iso_k_only(
+    pub(crate) fn exit_prefill_iso_k_only(
         &mut self,
         k_full: &Array,
+        _v_full: &Array,
         device: Device,
         total_seq: i32,
     ) -> Result<()> {
         let quant_bits = self.quant.approx_code_bits().0;
-        if let KvStorage::IsoKOnly3 { k, max_seq } = &mut self.storage {
+        let max_seq = self.max_seq;
+        if let KvStorage::IsoKOnly3 { k, .. } = &mut self.storage {
             warn_if_width_disagrees(self.quant, quant_bits, 3);
-            iso_k_only_bulk_encode::<3>(k, *max_seq, k_full, device, total_seq)
-        } else if let KvStorage::IsoKOnly4 { k, max_seq } = &mut self.storage {
+            iso_k_only_bulk_encode::<3>(k, max_seq, k_full, device, total_seq)
+        } else if let KvStorage::IsoKOnly4 { k, .. } = &mut self.storage {
             warn_if_width_disagrees(self.quant, quant_bits, 4);
-            iso_k_only_bulk_encode::<4>(k, *max_seq, k_full, device, total_seq)
+            iso_k_only_bulk_encode::<4>(k, max_seq, k_full, device, total_seq)
         } else {
             Err(storage_mismatch("IsoKOnly3 | IsoKOnly4", &self.storage))
         }

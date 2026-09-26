@@ -76,7 +76,6 @@ fn seeded_cache_b(quant: KvQuant, b: i32, kv_h: i32, head_dim: i32, use_qjl: boo
                 shape,
                 0,
             )),
-            max_seq: MAX_SEQ,
         }
     } else {
         KvStorage::RotorKOnly3 {
@@ -87,10 +86,17 @@ fn seeded_cache_b(quant: KvQuant, b: i32, kv_h: i32, head_dim: i32, use_qjl: boo
                 shape,
                 0,
             )),
-            max_seq: MAX_SEQ,
         }
     };
-    KvCache::from_storage(storage, quant, 0, 0, DispatchPolicy::default(), false)
+    KvCache::from_storage(
+        storage,
+        MAX_SEQ,
+        quant,
+        0,
+        0,
+        DispatchPolicy::default(),
+        false,
+    )
 }
 
 /// Drive one prefill chunk + 4 decode steps through the production
@@ -180,7 +186,6 @@ fn seeded_sym_cache(quant: KvQuant, kv_h: i32, head_dim: i32) -> KvCache {
                 0,
             )),
             v: Some(QuantRotorV4::new(shape, MAX_SEQ, 0)),
-            max_seq: MAX_SEQ,
         }
     } else {
         KvStorage::RotorSym3 {
@@ -192,10 +197,17 @@ fn seeded_sym_cache(quant: KvQuant, kv_h: i32, head_dim: i32) -> KvCache {
                 0,
             )),
             v: Some(QuantRotorV3::new(shape, MAX_SEQ, 0)),
-            max_seq: MAX_SEQ,
         }
     };
-    KvCache::from_storage(storage, quant, 0, 0, DispatchPolicy::default(), false)
+    KvCache::from_storage(
+        storage,
+        MAX_SEQ,
+        quant,
+        0,
+        0,
+        DispatchPolicy::default(),
+        false,
+    )
 }
 
 /// `(cpu blocks, ring live)` for the K axis of the active symmetric rotor store.

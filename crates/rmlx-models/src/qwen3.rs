@@ -2175,9 +2175,11 @@ pub fn generate_greedy<'a>(
     // would omit the ring on ring-backed codecs. It is recorded post-decode
     // below, gated by the `PostDecode` witness.
     {
-        let cloned_caches: Result<Vec<KvCache>> =
-            caches.iter().map(|c| c.try_deep_clone()).collect();
-        if let Ok(kv_snapshot) = cloned_caches {
+        if let Some(kv_snapshot) = crate::prompt_cache::snapshot_clone(
+            QWEN3_PROMPT_CACHE.arch_name(),
+            &caches,
+            KvCache::try_deep_clone,
+        ) {
             // Materialize GPU arrays on the current inference thread before
             // storing in the prompt cache.  Each spawn_blocking request runs
             // on its own tokio thread with its own Metal GPU stream.  If these

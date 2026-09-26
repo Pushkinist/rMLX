@@ -12,13 +12,14 @@ use parking_lot::Mutex;
 
 use futures::stream::{self, Stream};
 use rmlx_core::Error;
+use rmlx_kv_quant::kv_quant_label;
 use rmlx_metrics::events::Measurement;
 
 use crate::openai::ItlSample;
 
 use super::generator::Generator;
 use super::helpers::{
-    compute_itl_stats, is_reconstructible_tool_marker, kv_quant_label, record_itl_percentiles,
+    compute_itl_stats, is_reconstructible_tool_marker, record_itl_percentiles,
     resolve_kv_quant_for_load, spsc_ts,
 };
 use super::think::ThinkSplitter;

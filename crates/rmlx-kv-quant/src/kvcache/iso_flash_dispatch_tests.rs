@@ -59,15 +59,21 @@ fn iso_cache_b(quant: KvQuant, b: i32, kv_h: i32, head_dim: i32) -> KvCache {
     let storage = if quant == KvQuant::IsoKOnly4 {
         KvStorage::IsoKOnly4 {
             k: Some(QuantIsoK4::from_cpu_blocks(Vec::new(), shape, MAX_SEQ)),
-            max_seq: MAX_SEQ,
         }
     } else {
         KvStorage::IsoKOnly3 {
             k: Some(QuantIsoK3::from_cpu_blocks(Vec::new(), shape, MAX_SEQ)),
-            max_seq: MAX_SEQ,
         }
     };
-    KvCache::from_storage(storage, quant, 0, 0, DispatchPolicy::default(), false)
+    KvCache::from_storage(
+        storage,
+        MAX_SEQ,
+        quant,
+        0,
+        0,
+        DispatchPolicy::default(),
+        false,
+    )
 }
 
 /// Whether the cache's iso store currently holds a live GPU ring.

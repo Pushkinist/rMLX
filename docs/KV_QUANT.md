@@ -378,8 +378,9 @@ The last column is the V-side cosine gate on the unit-test fixture.
 
 ## Metal-vs-CPU hot path + load-time MSL precompile
 
-Two codec attributes control startup behaviour. Both are exhaustive matches on
-`KvQuant` (`crates/rmlx-kv-quant/src/quant.rs`). A new variant must be
+Two codec attributes control startup behaviour. Both read the codec's row in
+the one exhaustive descriptor match on `KvQuant`
+(`crates/rmlx-kv-quant/src/quant_descriptor.rs`). A new variant must be
 classified, or the build fails.
 
 * **`KvQuant::carries_msl()`** is `true` for every codec except `none`. For
@@ -390,12 +391,13 @@ classified, or the build fails.
   compiles the pipeline on the first `apply()` dispatch (see `docs/FFI.md`
   § `MetalKernel`).
 
-* **`KvQuant::cpu_hot_path_reason()`** is `Some(reason)` when the codec's
-  encode and dequant run on the **CPU** on the default path:
+* **`KvQuant::cpu_hot_path_reason()`** is `Some(reason)` when no Metal kernel
+  runs the codec's store on the default path:
 
   * `iso3` / `iso4`, `rotor3` / `rotor4`, `rotor_k_*_asym_*` → `Some`. Their
-    `update_*` functions return early to the bf16 mirror at decode, so the GPU
-    branch is shadowed. The encode that exists is CPU.
+    `update_*` functions return early to the bf16 mirror at decode, and
+    `exit_prefill` builds no store, so the codec does not run on a cache that
+    went through prefill.
   * `iso3_sym` / `iso4_sym`, `k_iso3` / `k_iso4` → `None`. Decode is the iso
     flash-decode kernel over the packed ring (`iso_flash_decode`,
     `iso_flash_decode_symv`). Nothing restages through the host.
@@ -421,10 +423,10 @@ codec in the tree is for").
 | `k8v4` / `k8v8` / `planar` / `planar3` / `planar_k` | `None` | q8_0 K + tq4 / planar V GPU kernels; INERT on a seeded cache |
 | `mixed_*` / `rot_k_v*` | `None` | MLX-affine `mx.quantize` K and V (compiled Metal ops) |
 | `k8vturbo3` / `k8vturbo2` / `*tcq` / `tsym3` / `tsym4` | `None` | q8_0 or turbo K on GPU; 2-bit and 3-bit turbo V is CPU-forced; INERT on a seeded cache |
-| `iso3` / `iso4` | `Some` | bf16 mirror shadows the GPU iso branch; INERT on a seeded cache |
+| `iso3` / `iso4` | `Some` | decode reads the bf16 mirror, so the iso V codec does not run; INERT on a seeded cache |
 | `iso3_sym` / `iso4_sym` | `None` | `iso_flash_decode_symv` over both packed rings; no bf16 mirror |
 | `k_iso3` / `k_iso4` | `None` | iso K MSL encode into the packed ring + `iso_flash_decode` |
-| `rotor3` / `rotor4` / `rotor_k_*_asym_*` | `Some` | bf16 mirror shadows the GPU branch; INERT on a seeded cache |
+| `rotor3` / `rotor4` / `rotor_k_*_asym_*` | `Some` | decode reads the bf16 mirror, so the rotor codec does not run; the GPU fused-QK encoder is opt-in (`--fused-qk`); INERT on a seeded cache |
 | `rotor3_sym` / `rotor4_sym` / `k_rotor3` / `k_rotor4` | `None` with QJL off (default); `Some` with `--rotor-qjl on` | QJL off: rotor K MSL encode + `rotor_flash_decode` |
 
 ### Load-time precompile
@@ -570,8 +572,9 @@ holds for `k8vturbo2tcq` and `k8vturbo2`.
 **Disposition: keep parseable and selectable.** The reasons:
 
 1. **The store is the re-enable path.** A codec that gains a decode kernel over
-   its own store changes its arm in `decode_reads_packed_store`. `exit_prefill`
-   then builds the store that the kernel reads.
+   its own store changes `reads_packed_store` in its row of
+   `KvQuant::descriptor` (`quant_descriptor.rs`). `exit_prefill` then builds
+   the store that the kernel reads.
 2. **Recorded rows must stay readable.** `observations` is append-only, and
    its rows name these codecs.
 3. **The widest-matrix goal.** `CLAUDE.md` names the rotation KV families as a

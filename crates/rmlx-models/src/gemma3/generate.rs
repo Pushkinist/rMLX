@@ -391,8 +391,11 @@ pub fn generate_greedy<'a>(
     // later eviction on a different tokio/Metal thread can re-eval them as a
     // no-op (see gemma4/generate/mod.rs).
     if !has_image {
-        let kv_snap: Result<Vec<KvCache>> = caches.iter().map(KvCache::try_deep_clone).collect();
-        if let Ok(kvs) = kv_snap {
+        if let Some(kvs) = crate::prompt_cache::snapshot_clone(
+            PROMPT_CACHE.arch_name(),
+            &caches,
+            KvCache::try_deep_clone,
+        ) {
             match kvs.iter().try_for_each(KvCache::eval_for_spill) {
                 Ok(()) => {
                     // Salt the chained block-hash walk with the active layout_key
