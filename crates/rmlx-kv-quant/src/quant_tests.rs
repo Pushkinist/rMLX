@@ -129,6 +129,21 @@ fn rotk_cli_form_parses() {
     assert_eq!(q.to_string(), "rot_k_v4g64");
 }
 
+/// A `Mixed` codec with unequal K and V groups keeps each group on its own
+/// side, in both directions. Equal groups cannot show a swap of the two.
+#[test]
+fn mixed_unequal_groups_round_trip() {
+    let m = KvQuant::Mixed {
+        k_bits: 8,
+        v_bits: 4,
+        k_group_size: 128,
+        v_group_size: 64,
+    };
+    assert_eq!(m.to_string(), "mixed_k8g128_v4g64");
+    assert_eq!(KvQuant::from_str("mixed_k8g128_v4g64"), Ok(m));
+    assert_eq!(super::kv_quant_label(Some(m)), "mixed");
+}
+
 /// `cache_key_salt` must be collision-free across distinct codecs so
 /// the codec-partitioned prompt-cache key never conflates two codecs. Two
 /// distinct `KvQuant` values (including payload-bearing variants that differ
