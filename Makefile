@@ -123,6 +123,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         check-named-skip-notices check-named-skip-notices-fixtures \
         check-eval-lock check-eval-lock-fixtures eval-lock-stress \
         check-no-kernel-input-eval check-no-kernel-input-eval-fixtures \
+        check-gpu-device-census check-gpu-device-census-selftest \
         check-kernel-dtype-contract check-kernel-dtype-contract-fixtures \
         check-metal-compiles check-metal-format
 
@@ -609,6 +610,12 @@ check-no-kernel-input-eval: ## CI gate: fail if a Metal-kernel dispatcher blocks
 check-no-kernel-input-eval-fixtures: ## CI gate: the eval gate still fires on renamed/relocated/differently-spelled evals
 	@bash scripts/check_no_kernel_input_eval_fixtures.sh
 
+check-gpu-device-census: ## CI gate: the rmlx binary names Device::Gpu in exactly one place, claim_gpu, which takes the Metal claim
+	@bash scripts/check_gpu_device_census.sh
+
+check-gpu-device-census-selftest: ## CI gate: recall test for the above, 23 cases, each asserting the reason as well as the exit code
+	@bash scripts/check_gpu_device_census_selftest.sh
+
 check-kernel-dtype-contract: ## CI gate: fail if a Metal-kernel dispatcher returns its declared-f32 output without restoring a caller dtype (promotes the whole decode graph)
 	@bash scripts/check_kernel_dtype_contract.sh
 
@@ -661,6 +668,8 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_named_skip_notices_fixtures.sh
 	@bash scripts/check_no_kernel_input_eval.sh
 	@bash scripts/check_no_kernel_input_eval_fixtures.sh
+	@bash scripts/check_gpu_device_census.sh
+	@bash scripts/check_gpu_device_census_selftest.sh
 	@bash scripts/check_kernel_dtype_contract.sh
 	@bash scripts/check_kernel_dtype_contract_fixtures.sh
 	@bash scripts/perf_ab_selftest.sh
