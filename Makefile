@@ -613,7 +613,7 @@ check-no-kernel-input-eval-fixtures: ## CI gate: the eval gate still fires on re
 check-gpu-device-census: ## CI gate: the rmlx binary names Device::Gpu in exactly one place, claim_gpu, which takes the Metal claim, and never takes .device() from a fresh claim
 	@bash scripts/check_gpu_device_census.sh
 
-check-gpu-device-census-selftest: ## CI gate: recall test for the above, 36 cases, each asserting the reason as well as the exit code
+check-gpu-device-census-selftest: ## CI gate: recall test for the above, 41 cases, each asserting the reason as well as the exit code
 	@bash scripts/check_gpu_device_census_selftest.sh
 
 check-kernel-dtype-contract: ## CI gate: fail if a Metal-kernel dispatcher returns its declared-f32 output without restoring a caller dtype (promotes the whole decode graph)

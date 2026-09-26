@@ -17,11 +17,15 @@
 #                 (`type X[<…>] = [::][path::]Device;`): each lets the GPU
 #                 device be named without the token this gate counts.
 #   claim-dropped a statement that calls `parse_device`, `claim_gpu` or
-#                 `check_claim` and takes `.device()` (or
-#                 `ClaimedDevice::device`) from the result. `Device` is `Copy`,
-#                 so the claim-carrying value is a temporary and the claim is
-#                 released at the end of the statement. A statement is the code
-#                 up to a `;`, `{` or `}`, across lines.
+#                 `check_claim` and takes `.device()`, `ClaimedDevice::device`
+#                 or a `ClaimedDevice { .. }` pattern from the result, in a
+#                 closure, a `match` arm or a destructuring `let`. `Device` is
+#                 `Copy`, so the claim-carrying value is a temporary and the
+#                 claim is released at the end of the statement. A statement is
+#                 the code up to a `;`, across lines and braces; an `fn` line
+#                 starts a new one, so a tail expression does not run into the
+#                 next item. Blind spot: a statement that also names `.device(`
+#                 on a value it bound earlier reads as a drop.
 #
 # Scope: every `.rs` file under the scan root except `*_tests.rs`, `tests.rs`
 # and the `bin/` directory. The programs under `bin/` are separate binaries
@@ -76,16 +80,22 @@ IFS= read -r -d '' AWK_RULES <<'EOF'
     if (code ~ /Device[ \t]*::[ \t]*([*]|[{])/ || code ~ /(^|[^A-Za-z0-9_])Device[ \t]+as[ \t]/ ||
         code ~ /(^|[^A-Za-z0-9_])type[ \t]+[A-Za-z0-9_]+[ \t]*(<[^=]*>)?[ \t]*=[ \t]*(::[ \t]*)?([A-Za-z0-9_]+[ \t]*::[ \t]*)*Device[ \t]*;/)
         print "device-alias: " file ":" FNR ": " $0
+    if (code ~ /(^|[^A-Za-z0-9_])fn[ \t]/)
+        stmt = ""
     rest = code
-    while (match(rest, /[;{}]/)) {
+    while (match(rest, /;/)) {
         stmt = stmt " " substr(rest, 1, RSTART - 1)
-        if (stmt ~ /(^|[^A-Za-z0-9_])(parse_device|claim_gpu|check_claim)[ \t]*\(/ &&
-            stmt ~ /([.][ \t]*device[ \t]*\(|ClaimedDevice[ \t]*::[ \t]*device([^A-Za-z0-9_]|$))/)
-            print "claim-dropped: " file ":" FNR ": " $0
+        check_dropped(stmt)
         stmt = ""
         rest = substr(rest, RSTART + 1)
     }
     stmt = stmt " " rest
+}
+function check_dropped(s) {
+    gsub(/fn[ \t]+(parse_device|claim_gpu|check_claim)/, "fn _", s)
+    if (s ~ /(^|[^A-Za-z0-9_])(parse_device|claim_gpu|check_claim)[ \t]*[(<]/ &&
+        s ~ /([.][ \t]*device[ \t]*\(|ClaimedDevice[ \t]*(::[ \t]*device([^A-Za-z0-9_]|$)|[{]))/)
+        print "claim-dropped: " file ":" FNR ": " $0
 }
 EOF
 

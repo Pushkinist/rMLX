@@ -110,6 +110,26 @@ root="$(fresh drop_in_closure)"
 printf '// header\nlet d = parse_device(&s).map(|c| c.device())?;\n' >"$root/commands/q.rs"
 case_run "drop_in_closure" "commands/q.rs" 1 "claim-dropped: commands/q.rs:2:" "$root"
 
+root="$(fresh drop_in_block_closure)"
+printf '// header\nlet d = parse_device(&s).map(|c| { c.device() })?;\n' >"$root/commands/u.rs"
+case_run "drop_in_block_closure" "commands/u.rs" 1 "claim-dropped: commands/u.rs:2:" "$root"
+
+root="$(fresh drop_in_match)"
+printf '// header\nlet d = match parse_device(&s)? {\n    c => c.device(),\n};\n' >"$root/commands/v.rs"
+case_run "drop_in_match" "commands/v.rs" 1 "claim-dropped: commands/v.rs:4:" "$root"
+
+root="$(fresh drop_by_destructure)"
+printf '// header\nlet ClaimedDevice { device, .. } = parse_device(&s)?;\n' >"$root/commands/w.rs"
+case_run "drop_by_destructure" "commands/w.rs" 1 "claim-dropped: commands/w.rs:2:" "$root"
+
+root="$(fresh tail_expression_then_fn)"
+printf '// header\nfn a() -> X {\n    parse_device(s)\n}\nfn b(c: &ClaimedDevice) {\n    run(c.device());\n}\n' >"$root/commands/x.rs"
+case_run "tail_expression_then_fn" "commands/x.rs" 0 "ok (1 site" "$root"
+
+root="$(fresh definition_is_not_a_call)"
+printf '// header\npub(crate) fn claim_gpu() -> Result<ClaimedDevice, E> {\n    try_claim().map(|c| ClaimedDevice { claim: Some(c) })\n}\n' >"$root/commands/y.rs"
+case_run "definition_is_not_a_call" "commands/y.rs" 0 "ok (1 site" "$root"
+
 case_run "one_site" "the legitimate site alone passes" 0 \
     "gpu-device: commands/parse.rs:3:" "$(fresh one_site)"
 case_run "no_site" "the claimed-GPU helper lost its site" 1 \
