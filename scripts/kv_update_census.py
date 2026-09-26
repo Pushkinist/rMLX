@@ -23,7 +23,9 @@ Four modes, each printing one figure the restructure is judged on:
   struct-update base (`..<expr>`) or is not a literal of the return type: that
   row inherits facts nobody stated, and the site figure cannot see it. It
   prints `descriptor-fns N`, the number of those fns it read, so a renamed fn
-  reads 0 and not a clean scan.
+  reads 0 and not a clean scan. It also exits 1 when `KvStorage::view` holds a
+  `..`: an arm with a rest pattern leaves a new field out of every read-only
+  site the view serves. `view-fns N` counts those fns.
 
   Known false positives: a `use` inside one fn applies to the whole file, so
   a glob import there makes a same-named variant elsewhere in the file count;
@@ -397,10 +399,11 @@ STRUCT_UPDATE_BASE = re.compile(r"[{,]\s*\.\.(?!=)\s*[^\s,})\]]")
 
 
 def refuse(rel: str, line: int, what: str) -> None:
-    print(
-        f"refused: {rel}:{line} {what} in KvQuant::descriptor; each arm must state every fact as a literal",
-        file=sys.stderr,
-    )
+    refuse_in(rel, line, what, "KvQuant::descriptor", "each arm must state every fact as a literal")
+
+
+def refuse_in(rel: str, line: int, what: str, where: str, rule: str) -> None:
+    print(f"refused: {rel}:{line} {what} in {where}; {rule}", file=sys.stderr)
     raise SystemExit(1)
 
 
@@ -453,10 +456,48 @@ def check_descriptors(sources: dict[str, str], enums: dict[str, list[str]]) -> i
     return found
 
 
+#: The read-only storage view: `fn view` in an `impl KvStorage`. Each of its
+#: arms binds every field of its variant.
+VIEW_FN = re.compile(r"\bfn\s+view\s*[<(]")
+#: A rest pattern or a struct-update base: any `..` that is not `..=`.
+REST = re.compile(r"\.\.(?!=)")
+
+
+def check_views(sources: dict[str, str], enums: dict[str, list[str]]) -> int:
+    """Refuse a `..` in `KvStorage::view`, and return how many of those fns
+    the scan read.
+
+    An arm with `..` compiles when a field is added to its variant, so the new
+    field is left out of every read-only site the view serves with no error
+    anywhere. The count lets the real-tree pin see a renamed fn.
+    """
+    found = 0
+    for rel, blanked in sources.items():
+        scope = file_scope(blanked, enums)
+        for fn in VIEW_FN.finditer(blanked):
+            if scope.self_at(fn.start()) != "KvStorage":
+                continue
+            brace = blanked.find("{", fn.end())
+            if brace < 0:
+                continue
+            found += 1
+            rest = REST.search(blanked, brace, block_end(blanked, brace))
+            if rest:
+                refuse_in(
+                    rel,
+                    blanked.count("\n", 0, rest.start()) + 1,
+                    "a rest pattern (`..`)",
+                    "KvStorage::view",
+                    "each arm must bind every field",
+                )
+    return found
+
+
 def mode_match_sites(root: Path, threshold: int | None, include_tests: bool) -> None:
     sources = source_files(root, include_tests)
     enums = codec_enums(root, sources)
     descriptors = check_descriptors(sources, enums)
+    views = check_views(sources, enums)
 
     # A site naming fewer than half the enum's variants is a case analysis over
     # a subset; at half or more it enumerates the codec surface, which is the
@@ -519,6 +560,7 @@ def mode_match_sites(root: Path, threshold: int | None, include_tests: bool) -> 
     print(f"subset-sites {subsets}")
     print(f"table-sites {tables}")
     print(f"descriptor-fns {descriptors}")
+    print(f"view-fns {views}")
 
 
 def update_files(root: Path) -> list[Path]:

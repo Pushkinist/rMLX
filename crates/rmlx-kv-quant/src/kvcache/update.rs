@@ -13,7 +13,7 @@ use rmlx_mlx::{zeros, Array, Device, Dtype};
 use crate::storage::KvStorage;
 use crate::KvQuant;
 
-use super::helpers::{slice_v_prefix, storage_variant_name};
+use super::helpers::slice_v_prefix;
 use super::KvCache;
 
 /// Narrow `layer_idx` (`usize`) to `u32` for rotor-seed APIs.
@@ -366,7 +366,7 @@ impl KvCache {
         let KvStorage::None { .. } = &self.storage else {
             return Err(Error::KvStorageMismatch {
                 expected: "None",
-                got: storage_variant_name(&self.storage),
+                got: self.storage.view().name,
             });
         };
         self.update_decode_fp16(new_k, new_v, max_seq, device)
@@ -549,38 +549,12 @@ impl KvCache {
         if self.decode_fp16_k.is_some() || self.decode_fp16_v.is_some() {
             return true;
         }
-        match &self.storage {
-            KvStorage::K8V4 { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::K8V8 { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::Planar { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::None { .. } => false,
-            KvStorage::Mixed { state, .. } => state.offset > 0,
-            KvStorage::Paged {
-                k, v_k8, v_planar, ..
-            } => k.is_some() || v_k8.is_some() || v_planar.is_some(),
-            KvStorage::K8VTurbo3 { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::TurboSym3 { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::TurboSym4 { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::PlanarK { k, .. } => k.is_some(),
-            KvStorage::K8VTurbo2 { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::IsoV3 { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::IsoV4 { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::RotorV3 { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::RotorV4 { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::K8VTurbo3Tcq { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::K8VTurbo2Tcq { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::IsoSym3 { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::IsoSym4 { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::IsoKOnly3 { k, .. } => k.is_some(),
-            KvStorage::IsoKOnly4 { k, .. } => k.is_some(),
-            KvStorage::RotorSym3 { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::RotorSym4 { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::RotorKOnly3 { k, .. } => k.is_some(),
-            KvStorage::RotorKOnly4 { k, .. } => k.is_some(),
-            // RotorKAsym3 / RotorKAsym4 — either side materialised.
-            KvStorage::RotorKAsym3 { k, v, .. } => k.is_some() || v.is_some(),
-            KvStorage::RotorKAsym4 { k, v, .. } => k.is_some() || v.is_some(),
-        }
+        self.storage
+            .view()
+            .slots
+            .iter()
+            .flatten()
+            .any(|slot| slot.is_filled())
     }
 
     /// Grow the provisioned `max_seq` when the next **decode** append would
@@ -1321,238 +1295,10 @@ impl KvCache {
             }
             return Ok(());
         }
-        match &self.storage {
-            KvStorage::K8V4 { k, v, .. } => {
-                if let Some(qk) = k {
-                    if let Some(codes) = &qk.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qk.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-                if let Some(qv) = v {
-                    if let Some(codes) = &qv.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qv.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-            }
-            KvStorage::K8V8 { k, v, .. } => {
-                if let Some(qk) = k {
-                    if let Some(codes) = &qk.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qk.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-                if let Some(qv) = v {
-                    if let Some(codes) = &qv.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qv.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-            }
-            KvStorage::Planar { k, v, .. } => {
-                if let Some(qk) = k {
-                    if let Some(codes) = &qk.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qk.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-                if let Some(qv) = v {
-                    if let Some(codes) = &qv.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qv.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                    if let Some(rotations) = &qv.gpu_rotations_buf {
-                        rotations.eval()?;
-                    }
-                }
-            }
-            KvStorage::None { .. } => {
-                // BF16 KV — buffers live on `decode_fp16_k`/`decode_fp16_v`
-                // and are eval'd by the trailing block below.
-            }
-            KvStorage::Mixed { state, .. } => {
-                state.eval_gpu_state()?;
-            }
-            // Paged storage — the active page arrays live inside PageSlab::pool.
-            // They are already async_eval'd by the slice_update chain inside write_page.
-            // No additional flush needed here beyond the decode_fp16 trailing block.
-            KvStorage::Paged { .. } => {}
-            // K8VTurbo3 — flush K (QuantK) and V (QuantV, bits=3, CPU-dequant only).
-            KvStorage::K8VTurbo3 { k, v, .. } => {
-                if let Some(qk) = k {
-                    if let Some(codes) = &qk.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qk.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-                if let Some(qv) = v {
-                    if let Some(codes) = &qv.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qv.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-            }
-            // TurboSym4 — flush both TurboQuant K + V GPU buffers.
-            KvStorage::TurboSym4 { k, v, .. } => {
-                if let Some(qk) = k {
-                    if let Some(codes) = &qk.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qk.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-                if let Some(qv) = v {
-                    if let Some(codes) = &qv.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qv.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-            }
-            // PlanarK — flush K (codes/scales/rotations); V is bf16
-            // (decode_fp16_v) and is flushed by the trailing block below.
-            KvStorage::PlanarK { k, .. } => {
-                if let Some(qk) = k {
-                    if let Some(codes) = &qk.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qk.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                    if let Some(rotations) = &qk.gpu_rotations_buf {
-                        rotations.eval()?;
-                    }
-                }
-            }
-            // K8VTurbo2 — K is QuantK (codes/scales), V is QuantV (CPU-only).
-            KvStorage::K8VTurbo2 { k, v, .. } => {
-                if let Some(qk) = k {
-                    if let Some(codes) = &qk.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qk.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-                if let Some(qv) = v {
-                    if let Some(codes) = &qv.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qv.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-            }
-            // IsoV3 / IsoV4 / RotorV3 / RotorV4 — K is QuantK (GPU-capable
-            // q8_0); V is CPU-only payload.
-            KvStorage::IsoV3 { k, .. }
-            | KvStorage::IsoV4 { k, .. }
-            | KvStorage::RotorV3 { k, .. }
-            | KvStorage::RotorV4 { k, .. } => {
-                // K is GPU-capable q8_0 (`QuantK`); V is CPU-only so no GPU
-                // buffers to flush on the V side.
-                if let Some(qk) = k {
-                    if let Some(codes) = &qk.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qk.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-            }
-            // K8VTurbo3Tcq — flush like K8VTurbo3 (K is GPU-capable q8_0,
-            // V is CPU-only QuantV with Viterbi encode; gpu_codes_buf
-            // may exist from a hydrated cache).
-            KvStorage::K8VTurbo3Tcq { k, v, .. } => {
-                if let Some(qk) = k {
-                    if let Some(codes) = &qk.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qk.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-                if let Some(qv) = v {
-                    if let Some(codes) = &qv.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qv.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-            }
-            // IsoSym3 / IsoSym4 / IsoKOnly3 / IsoKOnly4 — CPU-only
-            // codecs (no GPU buffers on either axis). V-side IsoKOnly* is bf16,
-            // flushed by the trailing decode_fp16 block below.
-            KvStorage::IsoSym3 { .. }
-            | KvStorage::IsoSym4 { .. }
-            | KvStorage::IsoKOnly3 { .. }
-            | KvStorage::IsoKOnly4 { .. } => {}
-            // Rotor symmetric / K-only — CPU-only codecs, no GPU buffers on
-            // either axis. V-side RotorKOnly* is bf16, flushed by the trailing
-            // decode_fp16 block below.
-            KvStorage::RotorSym3 { .. }
-            | KvStorage::RotorSym4 { .. }
-            | KvStorage::RotorKOnly3 { .. }
-            | KvStorage::RotorKOnly4 { .. } => {}
-            // RotorKAsym3 / RotorKAsym4 — K rotor is CPU-only; V is
-            // affine QuantV with optional GPU codes/scales buffers (flushed
-            // like the K8V4 V side).
-            KvStorage::RotorKAsym3 { v, .. } | KvStorage::RotorKAsym4 { v, .. } => {
-                if let Some(qv) = v {
-                    if let Some(codes) = &qv.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qv.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-            }
-            // TurboSym3 — K is GPU-capable (QuantKTurbo3 shares the same flush
-            // pattern as TurboSym4 K side); V is CPU-only (no GPU buffers).
-            // NOTE: No explicit eval() needed here. MLX is lazy — QuantKTurbo3::append
-            // builds the compute graph; the Metal encoder is flushed when the K buffer
-            // is first read (e.g. dequantize_choice). Omitting eval() is correct and
-            // consistent with how IsoSym3/RotorSym3 K-side GPU buffers are handled.
-            KvStorage::TurboSym3 { .. } => {}
-            // K8VTurbo2Tcq — flush like K8VTurbo2 / K8VTurbo3Tcq.
-            KvStorage::K8VTurbo2Tcq { k, v, .. } => {
-                if let Some(qk) = k {
-                    if let Some(codes) = &qk.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qk.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-                if let Some(qv) = v {
-                    if let Some(codes) = &qv.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qv.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-            }
+        // bf16 KV (`KvStorage::None`, and the V side of the K-only codecs)
+        // lives on `decode_fp16_k` / `decode_fp16_v`, flushed below.
+        for slot in self.storage.view().slots.iter().flatten() {
+            slot.eval()?;
         }
         if let Some(buf) = &self.decode_fp16_k {
             buf.eval()?;
@@ -2028,7 +1774,7 @@ impl KvCache {
 pub(super) fn storage_mismatch(expected: &'static str, storage: &KvStorage) -> Error {
     Error::KvStorageMismatch {
         expected,
-        got: storage_variant_name(storage),
+        got: storage.view().name,
     }
 }
 

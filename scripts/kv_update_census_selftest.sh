@@ -12,8 +12,8 @@
 #   would pass against a producer that had stopped finding any site at all.
 #
 #   The fixtures are their own trees, and each case states the number its own
-#   planted source implies. The last case pins the real tree's four site
-#   figures exactly, so a change that moves one re-pins it in the same change.
+#   planted source implies. The last case pins the real tree's figures
+#   exactly, so a change that moves one re-pins it in the same change.
 #
 # EXIT CODES
 #   0  every case produced the expected exit code and output
@@ -997,9 +997,59 @@ EOF
 check "a descriptor arm that copies and patches another row is refused, with its line" "${T}" 1 \
     "^refused: ${QUANT_REL}:22 an arm whose body is not a \`Facts \{ \.\. \}\` literal" match-sites
 
-# 50 — the real tree, pinned exactly. One run, all four figures compared, and
+# 50 — a `..` in `KvStorage::view` is refused (exit 1), with its line. The arm
+# compiles when a field is added to its variant, so the new field is left out
+# of every read-only site the view serves.
+T="${WORK}/viewrest"; build_tree "${T}"
+cat >>"${T}/${STORAGE_REL}" <<'EOF'
+impl KvStorage {
+    fn view(&self) -> View<'_> {
+        match self {
+            KvStorage::Alpha { k, v } => View([Some(k), Some(v)]),
+            KvStorage::Beta { k, .. } => View([Some(k), None]),
+            KvStorage::Gamma { k } => View([Some(k), None]),
+            KvStorage::Delta { state } => View([Some(state), None]),
+        }
+    }
+}
+EOF
+check "a rest pattern in KvStorage::view is refused, with its line" "${T}" 1 \
+    "^refused: ${STORAGE_REL}:20 a rest pattern \(\`\.\.\`\) in KvStorage::view; each arm must bind every field" match-sites
+
+# 51 — negative control: a view whose arms bind every field passes and is one
+# more site; a `..` in a comment inside it, in an `impl Other` view and in a
+# free `view` fn is not refused. `view-fns` counts the one view it read.
+T="${WORK}/viewok"; build_tree "${T}"
+cat >>"${T}/${STORAGE_REL}" <<'EOF'
+impl KvStorage {
+    fn view(&self) -> View<'_> {
+        match self {
+            KvStorage::Alpha { k, v } => View([Some(k), Some(v)]),
+            // Not `KvStorage::Beta { k, .. }`: every field is bound.
+            KvStorage::Beta { k, v, bits: _ } => View([Some(k), Some(v)]),
+            KvStorage::Gamma { k } => View([Some(k), None]),
+            KvStorage::Delta { state } => View([Some(state), None]),
+        }
+    }
+}
+impl Other {
+    fn view(&self) -> usize {
+        let Other { a, .. } = self;
+        a
+    }
+}
+pub fn view(s: &Other) -> usize {
+    let Other { a, .. } = s;
+    a
+}
+EOF
+check "a view that binds every field passes, and a .. outside it is not refused" "${T}" 0 \
+    "^view-fns 1$" match-sites --threshold 2
+check "the view is one more site" "${T}" 0 "^match-sites 4$" match-sites --threshold 2
+
+# 52 — the real tree, pinned exactly. One run, every figure compared, and
 # each failure prints the figure beside its pin and what to do.
-REAL_PINS="match-sites=17 forcing-sites=17 subset-sites=154 table-sites=2 descriptor-fns=1"
+REAL_PINS="match-sites=11 forcing-sites=11 subset-sites=154 table-sites=2 descriptor-fns=1 view-fns=1"
 pin_advice() { # pin_advice NAME
     local list="python3 scripts/kv_update_census.py match-sites | grep"
     case "$1" in
@@ -1011,6 +1061,9 @@ pin_advice() { # pin_advice NAME
         ;;
     descriptor-fns)
         echo "The census reads KvQuant::descriptor (an \`fn descriptor\` inside \`impl KvQuant\`) to refuse a row that does not state its own facts. 0 means the fn was renamed or moved out of the impl, and the refusal checks nothing. Rename it back, or teach DESCRIPTOR_FN in scripts/kv_update_census.py the new name."
+        ;;
+    view-fns)
+        echo "The census reads KvStorage::view (an \`fn view\` inside \`impl KvStorage\`) to refuse an arm with a \`..\` rest pattern. 0 means the fn was renamed or moved out of the impl, and the refusal checks nothing. Rename it back, or teach VIEW_FN in scripts/kv_update_census.py the new name."
         ;;
     table-sites)
         echo "A table site is a match keyed by string literals or constants whose arms name the codec variants; a new codec compiles there and cannot be parsed. List them: ${list} '^table'. If the change is correct, set the pin in the real-tree case of scripts/kv_update_census_selftest.sh and name the site you added or removed in the commit message."

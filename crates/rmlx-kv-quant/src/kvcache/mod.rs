@@ -141,6 +141,10 @@ mod deep_clone_digest_tests;
 mod max_seq_accessor_tests;
 
 #[cfg(test)]
+#[path = "storage_view_tests.rs"]
+mod storage_view_tests;
+
+#[cfg(test)]
 #[path = "max_seq_paths_tests.rs"]
 mod max_seq_paths_tests;
 

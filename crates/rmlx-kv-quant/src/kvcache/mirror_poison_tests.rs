@@ -200,8 +200,8 @@ fn poison_store(storage: &mut KvStorage, donor: &mut KvStorage, axis: Axis) -> b
         ),
         (storage, donor) => panic!(
             "the donor holds a different storage variant: {} against {}",
-            super::helpers::storage_variant_name(storage),
-            super::helpers::storage_variant_name(donor)
+            storage.view().name,
+            donor.view().name
         ),
     }
 }

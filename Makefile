@@ -460,7 +460,7 @@ check-doc-size-selftest: ## CI gate: recall test for check-doc-size over throwaw
 kv-update-census: ## advisory: the KV structural figures — variant shapes, match sites a new codec must touch, subset sites (matches!, if-let, catch-all) and table sites, per-variant update bodies (non-failing)
 	@python3 scripts/kv_update_census.py all
 
-kv-update-census-selftest: ## CI gate: recall test for the KV structural figures over planted fixtures — a hidden site, a collapsed one, a tree that cannot be measured — and the real tree's four site figures, pinned exactly (a failing pin prints the figure, the pin and what to do)
+kv-update-census-selftest: ## CI gate: recall test for the KV structural figures over planted fixtures — a hidden site, a collapsed one, a tree that cannot be measured — and the real tree's figures, pinned exactly (a failing pin prints the figure, the pin and what to do)
 	@bash scripts/kv_update_census_selftest.sh
 
 check-no-inline-tests: ## CI gate: fail if any non-test.rs file has inline #[cfg(test)] mod tests { ... }

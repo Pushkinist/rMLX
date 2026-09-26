@@ -31,6 +31,7 @@
 // unsafe_code: mlx-rs Array zero-copy view — slice::from_raw_parts byte-reinterpret for quantized scale arrays
 #![allow(unsafe_code)]
 
+mod kv_slot;
 mod kv_storage;
 mod quant_iso_k;
 mod quant_iso_v;

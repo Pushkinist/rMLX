@@ -23,7 +23,7 @@ use crate::rotor_flash_decode_symv_msl::{
 };
 use crate::storage::{KvStorage, ISO_QUAT_BLOCK_SIZE};
 
-use super::helpers::{f32_vec_to_array, slice_v_prefix, storage_variant_name};
+use super::helpers::{f32_vec_to_array, slice_v_prefix};
 use super::shared_kv::SharedKv;
 use super::KvCache;
 
@@ -153,7 +153,7 @@ impl KvCache {
             _ => {
                 return Err(Error::KvStorageMismatch {
                     expected: "Mixed",
-                    got: storage_variant_name(&self.storage),
+                    got: self.storage.view().name,
                 })
             }
         };
@@ -984,7 +984,7 @@ impl KvCache {
             other => Err(Error::Mlx(format!(
                 "sdpa_shared: storage variant {} has no fused-over-store consumer path — a \
                  producer must not report a store-backed share for it",
-                storage_variant_name(other)
+                other.view().name
             ))),
         }
     }
@@ -1110,7 +1110,7 @@ impl KvCache {
             other => {
                 return Err(Error::Mlx(format!(
                     "materialise_shared_kv: storage variant {} holds no store-backed share",
-                    storage_variant_name(other)
+                    other.view().name
                 )))
             }
         };
@@ -1440,7 +1440,7 @@ impl KvCache {
         let KvStorage::PlanarK { k, .. } = &self.storage else {
             return Err(Error::KvStorageMismatch {
                 expected: "PlanarK",
-                got: storage_variant_name(&self.storage),
+                got: self.storage.view().name,
             });
         };
         let Some(ks) = k.as_ref() else {
@@ -1705,7 +1705,7 @@ impl KvCache {
         } else {
             return Err(Error::KvStorageMismatch {
                 expected: "RotorKOnly3 | RotorKOnly4",
-                got: storage_variant_name(&self.storage),
+                got: self.storage.view().name,
             });
         };
         let Some((codes, scales, norms, rotors)) = self.rotor_k_packed_view(kv_seq, device)? else {
@@ -1956,7 +1956,7 @@ impl KvCache {
         } else {
             return Err(Error::KvStorageMismatch {
                 expected: "RotorSym3 | RotorSym4",
-                got: storage_variant_name(&self.storage),
+                got: self.storage.view().name,
             });
         };
         let Some((k_view, v_view)) = self.rotor_sym_packed_views(kv_seq, device)? else {
@@ -2225,7 +2225,7 @@ impl KvCache {
         } else {
             return Err(Error::KvStorageMismatch {
                 expected: "IsoKOnly3 | IsoKOnly4",
-                got: storage_variant_name(&self.storage),
+                got: self.storage.view().name,
             });
         };
         let Some((codes, scales, norms)) = self.iso_k_packed_view(kv_seq, device)? else {
@@ -2452,7 +2452,7 @@ impl KvCache {
         } else {
             return Err(Error::KvStorageMismatch {
                 expected: "IsoSym3 | IsoSym4",
-                got: storage_variant_name(&self.storage),
+                got: self.storage.view().name,
             });
         };
         let store_shape = iso_sym_store_shape(&self.storage)?;
@@ -2627,7 +2627,7 @@ fn rotor_sym_store_shape(storage: &KvStorage) -> Result<&[i32]> {
     } else {
         Err(Error::KvStorageMismatch {
             expected: "RotorSym3 | RotorSym4 with a live K buffer",
-            got: storage_variant_name(storage),
+            got: storage.view().name,
         })
     }
 }
@@ -2658,7 +2658,7 @@ fn rotor_sym_accumulated_seq(storage: &KvStorage) -> Result<i32> {
         other => {
             return Err(Error::KvStorageMismatch {
                 expected: "RotorSym3 | RotorSym4 with live K and V buffers",
-                got: storage_variant_name(other),
+                got: other.view().name,
             })
         }
     };
@@ -2691,7 +2691,7 @@ fn rotor_k_store_shape(storage: &KvStorage) -> Result<&[i32]> {
     } else {
         Err(Error::KvStorageMismatch {
             expected: "RotorKOnly3 | RotorKOnly4 with a live K buffer",
-            got: storage_variant_name(storage),
+            got: storage.view().name,
         })
     }
 }
@@ -2719,7 +2719,7 @@ fn planar_k_accumulated_seq(storage: &KvStorage) -> Result<i32> {
     let KvStorage::PlanarK { k: Some(ks), .. } = storage else {
         return Err(Error::KvStorageMismatch {
             expected: "PlanarK with a live K buffer",
-            got: storage_variant_name(storage),
+            got: storage.view().name,
         });
     };
     ks.shape.get(2).copied().ok_or_else(|| {
@@ -2755,7 +2755,7 @@ fn iso_k_store_shape(storage: &KvStorage) -> Result<&[i32]> {
     } else {
         Err(Error::KvStorageMismatch {
             expected: "IsoKOnly3 | IsoKOnly4 with a live K buffer",
-            got: storage_variant_name(storage),
+            got: storage.view().name,
         })
     }
 }
@@ -2770,7 +2770,7 @@ fn iso_sym_store_shape(storage: &KvStorage) -> Result<&[i32]> {
     } else {
         Err(Error::KvStorageMismatch {
             expected: "IsoSym3 | IsoSym4 with a live K buffer",
-            got: storage_variant_name(storage),
+            got: storage.view().name,
         })
     }
 }
@@ -2801,7 +2801,7 @@ fn iso_sym_accumulated_seq(storage: &KvStorage) -> Result<i32> {
         other => {
             return Err(Error::KvStorageMismatch {
                 expected: "IsoSym3 | IsoSym4 with live K and V buffers",
-                got: storage_variant_name(other),
+                got: other.view().name,
             })
         }
     };

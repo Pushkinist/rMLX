@@ -15,6 +15,7 @@
 
 use rmlx_core::error::Result;
 
+use super::kv_slot::KvSlot;
 use super::{
     QuantIsoK3, QuantIsoK4, QuantIsoV3, QuantIsoV4, QuantK, QuantKTurbo3, QuantKTurbo4,
     QuantPlanarK, QuantPlanarV, QuantRotorK3, QuantRotorK4, QuantRotorV3, QuantRotorV4, QuantV,
@@ -1418,156 +1419,33 @@ impl KvStorage {
 
     /// Resident byte footprint of this variant's quantized storage.
     ///
-    /// Every arm delegates to the owning store's own `byte_size`, which derives
-    /// the total from that store's real allocations — CPU blocks, GPU mirrors
-    /// and GPU rings alike. There is deliberately **no** per-codec byte formula
-    /// here: a second, hand-maintained restatement of what each store holds is
-    /// what let a store grow a GPU ring while this total stayed blind to it.
-    /// The store owns its own size; this function only routes.
+    /// Every slot counts its store's own `byte_size`, which derives the total
+    /// from that store's real allocations — CPU blocks, GPU mirrors and GPU
+    /// rings alike. There is deliberately **no** per-codec byte formula here:
+    /// a second, hand-maintained restatement of what each store holds is what
+    /// let a store grow a GPU ring while this total stayed blind to it. The
+    /// store owns its own size; this function only sums the slots of
+    /// [`Self::view`].
     ///
     /// GPU buffers count their full allocation (rings and mirrors are sized to
     /// capacity, not to the filled prefix) — that is the memory actually held.
     ///
-    /// **Excludes paged-pool overhead.** The `Paged` arm counts the pages the
+    /// **Excludes paged-pool overhead.** The paged slots count the pages the
     /// slabs hold, not the arena bookkeeping around them. Paged KV
     /// (`--paged-kv`) is default-OFF, so that overhead is 0 on every normal
     /// path; if it is ever flipped default-ON, give `PagedKvArena` its own
-    /// `byte_size` and sum it in the `Paged` arm rather than estimating it here.
+    /// `byte_size` and sum it here rather than estimating it.
     ///
     /// `KvStorage::None` returns **0**: its buffers live on the parent
     /// `KvCache::decode_fp16_k/v` and are counted by `KvCache::resident_bytes`,
     /// which also adds the warm-TTFT fp16 decode seeds for quantized variants.
-    ///
-    /// The arms bind every field explicitly (no `..` rest-patterns): adding a
-    /// buffer to a variant is then a compile error here until it is accounted.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "exhaustive match over all KvStorage variants — LOC-exempt: KvStorage has 30 variants; each arm is a one-to-three line delegation that cannot be factored further without losing explicitness"
-    )]
     pub fn resident_bytes(&self) -> u64 {
-        match self {
-            // ── Unquantised (bf16) ─────────────────────────────────────────────
-            // Buffers live on KvCache::decode_fp16_k/v; nothing extra here.
-            KvStorage::None {} => 0,
-
-            // ── K8V8 (K = q8_0, V = q8_0; V uses QuantK not QuantV) ─────────
-            KvStorage::K8V8 { k, v } => {
-                opt_bytes(k.as_ref(), QuantK::byte_size) + opt_bytes(v.as_ref(), QuantK::byte_size)
-            }
-
-            // ── K8V4 / K8VTurbo* (K = q8_0, V = TurboQuant) ─────────────────
-            KvStorage::K8V4 { k, v }
-            | KvStorage::K8VTurbo3 { k, v }
-            | KvStorage::K8VTurbo3Tcq { k, v }
-            | KvStorage::K8VTurbo2 { k, v }
-            | KvStorage::K8VTurbo2Tcq { k, v } => {
-                opt_bytes(k.as_ref(), QuantK::byte_size) + opt_bytes(v.as_ref(), QuantV::byte_size)
-            }
-
-            // ── Planar (K=q8, V=PlanarQuant) ─────────────────────────────────
-            KvStorage::Planar { k, v, bits: _ } => {
-                opt_bytes(k.as_ref(), QuantK::byte_size)
-                    + opt_bytes(v.as_ref(), QuantPlanarV::byte_size)
-            }
-
-            // ── PlanarK (K=PlanarQuant, V=bf16 on KvCache) ───────────────────
-            KvStorage::PlanarK { k } => opt_bytes(k.as_ref(), QuantPlanarK::byte_size),
-
-            // ── Mixed (MLX mx.quantize 3-tuples, opt. RotK) ───────────────────
-            KvStorage::Mixed { state } => state.byte_size(),
-
-            // ── Symmetric Turbo (K=TurboK3/4, V=TurboV) ─────────────────────
-            KvStorage::TurboSym3 { k, v } => {
-                opt_bytes(k.as_ref(), QuantKTurbo3::byte_size)
-                    + opt_bytes(v.as_ref(), QuantV::byte_size)
-            }
-            KvStorage::TurboSym4 { k, v } => {
-                opt_bytes(k.as_ref(), QuantKTurbo4::byte_size)
-                    + opt_bytes(v.as_ref(), QuantV::byte_size)
-            }
-
-            // ── IsoQuant V (K=q8, V=Iso3/4) ──────────────────────────────────
-            KvStorage::IsoV3 { k, v } => {
-                opt_bytes(k.as_ref(), QuantK::byte_size)
-                    + opt_bytes(v.as_ref(), QuantIsoV3::byte_size)
-            }
-            KvStorage::IsoV4 { k, v } => {
-                opt_bytes(k.as_ref(), QuantK::byte_size)
-                    + opt_bytes(v.as_ref(), QuantIsoV4::byte_size)
-            }
-
-            // ── IsoQuant Sym (K=IsoK3/4, V=IsoV3/4) ─────────────────────────
-            KvStorage::IsoSym3 { k, v } => {
-                opt_bytes(k.as_ref(), QuantIsoK3::byte_size)
-                    + opt_bytes(v.as_ref(), QuantIsoV3::byte_size)
-            }
-            KvStorage::IsoSym4 { k, v } => {
-                opt_bytes(k.as_ref(), QuantIsoK4::byte_size)
-                    + opt_bytes(v.as_ref(), QuantIsoV4::byte_size)
-            }
-
-            // ── IsoKOnly (K=Iso3/4, V=bf16 on KvCache) ───────────────────────
-            KvStorage::IsoKOnly3 { k } => opt_bytes(k.as_ref(), QuantIsoK3::byte_size),
-            KvStorage::IsoKOnly4 { k } => opt_bytes(k.as_ref(), QuantIsoK4::byte_size),
-
-            // ── RotorV (K=q8, V=Rotor3/4) ────────────────────────────────────
-            KvStorage::RotorV3 { k, v } => {
-                opt_bytes(k.as_ref(), QuantK::byte_size)
-                    + opt_bytes(v.as_ref(), QuantRotorV3::byte_size)
-            }
-            KvStorage::RotorV4 { k, v } => {
-                opt_bytes(k.as_ref(), QuantK::byte_size)
-                    + opt_bytes(v.as_ref(), QuantRotorV4::byte_size)
-            }
-
-            // ── RotorSym (K=RotorK3/4, V=RotorV3/4) ─────────────────────────
-            KvStorage::RotorSym3 { k, v } => {
-                opt_bytes(k.as_ref(), QuantRotorK3::byte_size)
-                    + opt_bytes(v.as_ref(), QuantRotorV3::byte_size)
-            }
-            KvStorage::RotorSym4 { k, v } => {
-                opt_bytes(k.as_ref(), QuantRotorK4::byte_size)
-                    + opt_bytes(v.as_ref(), QuantRotorV4::byte_size)
-            }
-
-            // ── RotorKOnly (K=RotorK3/4, V=bf16 on KvCache) ─────────────────
-            KvStorage::RotorKOnly3 { k } => opt_bytes(k.as_ref(), QuantRotorK3::byte_size),
-            KvStorage::RotorKOnly4 { k } => opt_bytes(k.as_ref(), QuantRotorK4::byte_size),
-
-            // ── RotorKAsym (K=RotorK3/4, V=affine QuantV) ────────────────────
-            KvStorage::RotorKAsym3 {
-                k,
-                v,
-                v_bits: _,
-                v_group_size: _,
-            } => {
-                opt_bytes(k.as_ref(), QuantRotorK3::byte_size)
-                    + opt_bytes(v.as_ref(), QuantV::byte_size)
-            }
-            KvStorage::RotorKAsym4 {
-                k,
-                v,
-                v_bits: _,
-                v_group_size: _,
-            } => {
-                opt_bytes(k.as_ref(), QuantRotorK4::byte_size)
-                    + opt_bytes(v.as_ref(), QuantV::byte_size)
-            }
-
-            // ── Paged (block-table KV, --paged-kv path) ───────────────────────
-            KvStorage::Paged {
-                k,
-                v_k8,
-                v_planar,
-                quant: _,
-            } => {
-                let k_bytes = k.as_ref().map_or(0, PagedKStorage::resident_bytes);
-                // v_k8 / v_planar are Box-wrapped; closure used to deref through Box.
-                let vk8_bytes = v_k8.as_ref().map_or(0, |s| s.resident_bytes());
-                let vp_bytes = v_planar.as_ref().map_or(0, |s| s.resident_bytes());
-                k_bytes + vk8_bytes + vp_bytes
-            }
-        }
+        self.view()
+            .slots
+            .iter()
+            .flatten()
+            .map(|slot| slot.resident_bytes())
+            .sum()
     }
 
     /// Drop every packed payload this variant holds, leaving its geometry
@@ -1689,46 +1567,159 @@ impl KvStorage {
     /// here: their writers serialise their own empty state, and diverting them
     /// would change what an unfilled layer of theirs round-trips as.
     ///
-    /// Exhaustive on purpose: a new variant must be classified, or the writer
-    /// would stamp a codec geometry with no tensors behind it and the reader
-    /// would fail on the first missing tensor.
+    /// The answer is the first slot's [`KvSlot::geometry_only`], and `true`
+    /// for a variant with no slot. [`Self::view`] places every slot, so a new
+    /// variant is classified there: otherwise the writer would stamp a codec
+    /// geometry with no tensors behind it and the reader would fail on the
+    /// first missing tensor.
     #[must_use]
     pub fn is_geometry_only(&self) -> bool {
-        // `k.is_none()` is the test in every arm; a `Some` K means the layer
-        // carries a real payload and belongs to its codec's writer.
+        let [first, _, _] = self.view().slots;
+        first.is_none_or(KvSlot::geometry_only)
+    }
+
+    /// The one read-only match from a variant to its store slots, in K, V,
+    /// second-V order. The read-only sites (bytes, graph flush, the SSD
+    /// geometry decision, the probes, the variant name) go through it.
+    ///
+    /// Every arm binds every field and has no `..` rest pattern, so a field
+    /// added to a variant does not compile here until it is placed. The KV
+    /// census refuses a `..` in this fn.
+    pub(crate) fn view(&self) -> StorageView<'_> {
         match self {
-            KvStorage::None { .. } => true,
-            KvStorage::K8V4 { k, .. }
-            | KvStorage::K8V8 { k, .. }
-            | KvStorage::Planar { k, .. }
-            | KvStorage::K8VTurbo3 { k, .. }
-            | KvStorage::K8VTurbo3Tcq { k, .. }
-            | KvStorage::K8VTurbo2 { k, .. }
-            | KvStorage::K8VTurbo2Tcq { k, .. }
-            | KvStorage::IsoV3 { k, .. }
-            | KvStorage::IsoV4 { k, .. }
-            | KvStorage::RotorV3 { k, .. }
-            | KvStorage::RotorV4 { k, .. } => k.is_none(),
-            KvStorage::TurboSym3 { k, .. } => k.is_none(),
-            KvStorage::TurboSym4 { k, .. } => k.is_none(),
-            KvStorage::PlanarK { k, .. } => k.is_none(),
-            KvStorage::IsoSym3 { k, .. } => k.is_none(),
-            KvStorage::IsoSym4 { k, .. } => k.is_none(),
-            KvStorage::IsoKOnly3 { k, .. } => k.is_none(),
-            KvStorage::IsoKOnly4 { k, .. } => k.is_none(),
-            KvStorage::RotorSym3 { k, .. } => k.is_none(),
-            KvStorage::RotorSym4 { k, .. } => k.is_none(),
-            KvStorage::RotorKOnly3 { k, .. } => k.is_none(),
-            KvStorage::RotorKOnly4 { k, .. } => k.is_none(),
-            KvStorage::RotorKAsym3 { k, .. } => k.is_none(),
-            KvStorage::RotorKAsym4 { k, .. } => k.is_none(),
-            // Payload is not an Option — their own writers handle emptiness.
-            KvStorage::Mixed { .. } | KvStorage::Paged { .. } => false,
+            Self::K8V4 { k, v } => StorageView {
+                name: "K8V4",
+                slots: [Some(k), Some(v), None],
+            },
+            Self::K8V8 { k, v } => StorageView {
+                name: "K8V8",
+                slots: [Some(k), Some(v), None],
+            },
+            Self::Planar { k, v, bits: _ } => StorageView {
+                name: "Planar",
+                slots: [Some(k), Some(v), None],
+            },
+            Self::None {} => StorageView {
+                name: "None",
+                slots: [None, None, None],
+            },
+            Self::Mixed { state } => StorageView {
+                name: "Mixed",
+                slots: [Some(state), None, None],
+            },
+            Self::Paged {
+                quant: _,
+                k,
+                v_k8,
+                v_planar,
+            } => StorageView {
+                name: "Paged",
+                slots: [Some(k), Some(v_k8), Some(v_planar)],
+            },
+            Self::K8VTurbo3 { k, v } => StorageView {
+                name: "K8VTurbo3",
+                slots: [Some(k), Some(v), None],
+            },
+            Self::TurboSym3 { k, v } => StorageView {
+                name: "TurboSym3",
+                slots: [Some(k), Some(v), None],
+            },
+            Self::TurboSym4 { k, v } => StorageView {
+                name: "TurboSym4",
+                slots: [Some(k), Some(v), None],
+            },
+            Self::PlanarK { k } => StorageView {
+                name: "PlanarK",
+                slots: [Some(k), None, None],
+            },
+            Self::K8VTurbo2 { k, v } => StorageView {
+                name: "K8VTurbo2",
+                slots: [Some(k), Some(v), None],
+            },
+            Self::IsoV3 { k, v } => StorageView {
+                name: "IsoV3",
+                slots: [Some(k), Some(v), None],
+            },
+            Self::IsoV4 { k, v } => StorageView {
+                name: "IsoV4",
+                slots: [Some(k), Some(v), None],
+            },
+            Self::RotorV3 { k, v } => StorageView {
+                name: "RotorV3",
+                slots: [Some(k), Some(v), None],
+            },
+            Self::RotorV4 { k, v } => StorageView {
+                name: "RotorV4",
+                slots: [Some(k), Some(v), None],
+            },
+            Self::K8VTurbo3Tcq { k, v } => StorageView {
+                name: "K8VTurbo3Tcq",
+                slots: [Some(k), Some(v), None],
+            },
+            Self::K8VTurbo2Tcq { k, v } => StorageView {
+                name: "K8VTurbo2Tcq",
+                slots: [Some(k), Some(v), None],
+            },
+            Self::IsoSym3 { k, v } => StorageView {
+                name: "IsoSym3",
+                slots: [Some(k), Some(v), None],
+            },
+            Self::IsoSym4 { k, v } => StorageView {
+                name: "IsoSym4",
+                slots: [Some(k), Some(v), None],
+            },
+            Self::IsoKOnly3 { k } => StorageView {
+                name: "IsoKOnly3",
+                slots: [Some(k), None, None],
+            },
+            Self::IsoKOnly4 { k } => StorageView {
+                name: "IsoKOnly4",
+                slots: [Some(k), None, None],
+            },
+            Self::RotorSym3 { k, v } => StorageView {
+                name: "RotorSym3",
+                slots: [Some(k), Some(v), None],
+            },
+            Self::RotorSym4 { k, v } => StorageView {
+                name: "RotorSym4",
+                slots: [Some(k), Some(v), None],
+            },
+            Self::RotorKOnly3 { k } => StorageView {
+                name: "RotorKOnly3",
+                slots: [Some(k), None, None],
+            },
+            Self::RotorKOnly4 { k } => StorageView {
+                name: "RotorKOnly4",
+                slots: [Some(k), None, None],
+            },
+            Self::RotorKAsym3 {
+                k,
+                v,
+                v_bits: _,
+                v_group_size: _,
+            } => StorageView {
+                name: "RotorKAsym3",
+                slots: [Some(k), Some(v), None],
+            },
+            Self::RotorKAsym4 {
+                k,
+                v,
+                v_bits: _,
+                v_group_size: _,
+            } => StorageView {
+                name: "RotorKAsym4",
+                slots: [Some(k), Some(v), None],
+            },
         }
     }
 }
 
-/// Bytes of an optional store slot; an unpopulated slot (`None`) holds nothing.
-fn opt_bytes<T>(slot: Option<&T>, byte_size: impl Fn(&T) -> u64) -> u64 {
-    slot.map_or(0, byte_size)
+/// Read-only view of one [`KvStorage`], built by [`KvStorage::view`].
+pub(crate) struct StorageView<'a> {
+    /// The variant name that typed errors print.
+    pub(crate) name: &'static str,
+    /// The K slot, the V slot and the paged planar V slot; `None` where the
+    /// variant has no such slot. The scalar knobs (`bits`, `v_bits`,
+    /// `v_group_size`, the paged `quant`) are not slots.
+    pub(crate) slots: [Option<&'a dyn KvSlot>; 3],
 }
