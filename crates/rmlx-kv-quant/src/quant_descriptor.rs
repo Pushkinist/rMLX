@@ -185,7 +185,9 @@ impl KvQuant {
                 mixed_params: None,
             },
             // Mixed machinery: decode reads the affine 3-tuples every step; the
-            // mirrors exist only for a cross-layer-KV producer.
+            // mirrors exist only for a cross-layer-KV producer. Not in the
+            // `k_below_8bit` class: `validate_resolved` checks Mixed K bits
+            // from the field.
             KvQuant::Mixed {
                 k_bits,
                 v_bits,
@@ -488,7 +490,10 @@ impl KvQuant {
             // Rotor K with a V that is TurboQuant at a fixed group of 32
             // (`validate_rotor_k_asym_v`); `v_group_size` is a layout-key tag
             // only, so it does not reach a store parameter.
-            KvQuant::RotorK3Asym { v_bits, .. } => CodecDescriptor {
+            KvQuant::RotorK3Asym {
+                v_bits,
+                v_group_size: _,
+            } => CodecDescriptor {
                 index: 26,
                 k_mirror: Always,
                 v_mirror: Always,
@@ -501,7 +506,10 @@ impl KvQuant {
                 k_only_iso_rotor: false,
                 mixed_params: None,
             },
-            KvQuant::RotorK4Asym { v_bits, .. } => CodecDescriptor {
+            KvQuant::RotorK4Asym {
+                v_bits,
+                v_group_size: _,
+            } => CodecDescriptor {
                 index: 27,
                 k_mirror: Always,
                 v_mirror: Always,

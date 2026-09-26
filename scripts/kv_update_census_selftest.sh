@@ -941,7 +941,7 @@ EOF
 check "a descriptor row copied from another codec's row is refused" "${T}" 1 \
     "^refused: ${QUANT_REL}:24 a struct-update base" match-sites
 
-# 48 — negative control: rest patterns and a commented-out base inside the
+# 48 — negative control: rest patterns (tuple and slice) and a commented-out base inside the
 # descriptor, and struct-update bases in an `impl Other` descriptor and in a
 # free fn, are not refused. The descriptor is one more site.
 T="${WORK}/descok"; build_tree "${T}"
@@ -951,6 +951,7 @@ const BASE: Facts = Facts { a: 0, b: 0 };
 impl KvQuant {
     fn descriptor(&self) -> Facts {
         let (first, ..) = (1u8, 2u8, 3u8);
+        let [_, .., _last] = [1u8, 2u8, 3u8];
         match self {
             KvQuant::One => Facts { a: first, b: 1 },
             KvQuant::Two => Facts { a: 2, b: 2 },
@@ -972,9 +973,33 @@ EOF
 check "rest patterns, comments and bases outside the descriptor are not refused" "${T}" 0 \
     "^match-sites 4$" match-sites --threshold 2
 
-# 49 — the real tree, pinned exactly. One run, all four figures compared, and
+# 49 — a descriptor arm that copies another codec's row and patches it is
+# refused (exit 1), with the line of the arm: its body is not a literal of the
+# return type, so it states one fact and inherits the rest.
+T="${WORK}/desccopy"; build_tree "${T}"
+cat >>"${T}/${QUANT_REL}" <<'EOF'
+pub struct Facts { a: u8, b: u8 }
+impl KvQuant {
+    fn descriptor(&self) -> Facts {
+        match self {
+            KvQuant::One => Facts { a: 1, b: 1 },
+            KvQuant::Two => Facts { a: 2, b: 2 },
+            KvQuant::Three => {
+                let mut row = KvQuant::One.descriptor();
+                row.a = 3;
+                row
+            }
+            KvQuant::Four => Facts { a: 4, b: 4 },
+        }
+    }
+}
+EOF
+check "a descriptor arm that copies and patches another row is refused, with its line" "${T}" 1 \
+    "^refused: ${QUANT_REL}:22 an arm whose body is not a \`Facts \{ \.\. \}\` literal" match-sites
+
+# 50 — the real tree, pinned exactly. One run, all four figures compared, and
 # each failure prints the figure beside its pin and what to do.
-REAL_PINS="match-sites=22 forcing-sites=22 subset-sites=153 table-sites=2"
+REAL_PINS="match-sites=22 forcing-sites=22 subset-sites=153 table-sites=2 descriptor-fns=1"
 pin_advice() { # pin_advice NAME
     local list="python3 scripts/kv_update_census.py match-sites | grep"
     case "$1" in
@@ -983,6 +1008,9 @@ pin_advice() { # pin_advice NAME
         ;;
     subset-sites)
         echo "A subset site is a matches!, if-let or catch-all match over a codec enum; a new codec compiles there and silently takes false or the catch-all arm. List them: ${list} '^subset'. If the change is correct, set the pin in the real-tree case of scripts/kv_update_census_selftest.sh and name the site you added or removed in the commit message; if not, write an exhaustive match with no \`_\` arm."
+        ;;
+    descriptor-fns)
+        echo "The census reads KvQuant::descriptor (an \`fn descriptor\` inside \`impl KvQuant\`) to refuse a row that does not state its own facts. 0 means the fn was renamed or moved out of the impl, and the refusal checks nothing. Rename it back, or teach DESCRIPTOR_FN in scripts/kv_update_census.py the new name."
         ;;
     table-sites)
         echo "A table site is a match keyed by string literals or constants whose arms name the codec variants; a new codec compiles there and cannot be parsed. List them: ${list} '^table'. If the change is correct, set the pin in the real-tree case of scripts/kv_update_census_selftest.sh and name the site you added or removed in the commit message."

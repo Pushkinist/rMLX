@@ -467,13 +467,16 @@ classified or the build fails.
   actual decode/prefill dispatch in `crates/rmlx-kv-quant/src/kvcache/update.rs`,
   not in assumptions (CLAUDE.md hard rule 7):
 
-  * **V-only iso / rotor** (`iso3/4(/sym)`, `rotor3/4(/sym)`,
-    `rotor_k_*_asym_*`) → **`Some`**. At decode, `update_iso_{v,sym}` /
-    `update_rotor_{v,sym,k_asym}`
+  * **V-only iso / rotor** (`iso3/4`, `rotor3/4`, `rotor_k_*_asym_*`) →
+    **`Some`**. At decode, `update_iso_v` / `update_rotor_{v,k_asym}`
     early-return to the warm-TTFT bf16 decode seed (`decode_fp16_k.is_some()`),
     so the GPU iso/rotor branch is shadowed; the codec encode that runs (at
     prefill) is CPU. The rotor family's GPU fused-QK encoder is gated OFF by
     default (`--fused-qk`).
+  * **Symmetric iso / rotor** (`iso3_sym` / `iso4_sym`, `rotor3_sym` /
+    `rotor4_sym`) → no bf16 early-return; decode is the flash kernel over both
+    packed rings. Iso → **`None`**; rotor → **`Some`** only while
+    `rotor_qjl_enabled()` is on.
   * **K-only iso** (`k_iso3` / `k_iso4`) → **`None`** (Metal). No bf16
     early-return: `update_and_sdpa_iso_k_fused` GPU-encodes the step into the
     packed ring and `iso_flash_decode` reads that ring directly, so **both**
@@ -4337,8 +4340,9 @@ for three reasons, in descending order of force:
 
 1. **The store is the re-enable path.** `exit_prefill` keeps a bulk-encode arm
    for each of them behind the predicate. A codec that grows a decode kernel
-   over its own store flips one arm in `decode_reads_packed_store` and the arm
-   fills the buffer that kernel reads. Deleting the codec deletes the landing
+   over its own store flips `reads_packed_store` in its row of
+   `KvQuant::descriptor` (`quant_descriptor.rs`) and the arm fills the buffer
+   that kernel reads. Deleting the codec deletes the landing
    site, and the algorithm is not what failed — see "the tension", below.
 2. **Recorded rows must stay readable.** `observations` is append-only and
    metrics labels are free-form; a name that has been recorded has to keep

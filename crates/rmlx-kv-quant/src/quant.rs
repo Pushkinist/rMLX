@@ -939,12 +939,15 @@ impl KvQuant {
     /// grounded in the actual decode/prefill dispatch in
     /// [`crate::kvcache`]'s `update_*` functions — not in assumptions:
     ///
-    /// - **V-only iso / rotor** (`Iso3/4(/Sym)`, `Rotor3/4(/Sym)`,
-    ///   `RotorK{3,4}Asym`): `update_iso3*` / `update_rotor_{v,sym,k_asym}`
-    ///   early-return to
-    ///   the warm-TTFT bf16 decode seed (`decode_fp16_k.is_some()`) at decode,
-    ///   so the GPU iso/rotor branch is shadowed and the codec encode that does
+    /// - **V-only iso / rotor** (`Iso3/4`, `Rotor3/4`, `RotorK{3,4}Asym`):
+    ///   `update_iso3*` / `update_rotor_{v,k_asym}` early-return to the
+    ///   warm-TTFT bf16 decode seed (`decode_fp16_k.is_some()`) at decode, so
+    ///   the GPU iso/rotor branch is shadowed and the codec encode that does
     ///   run (at prefill) is CPU → `Some(reason)`.
+    /// - **Symmetric iso / rotor** (`Iso{3,4}Sym`, `Rotor{3,4}Sym`): NO bf16
+    ///   early-return — decode is the flash kernel over both packed rings.
+    ///   Iso → `None`; rotor → `Some` only while
+    ///   [`crate::rotor_qjl::rotor_qjl_enabled`] is on.
     /// - **K-only iso** (`IsoKOnly3/4`): NO bf16 early-return — the iso K MSL
     ///   kernel dispatches every decode step on GPU → `None` (Metal, and
     ///   GPU-resident end to end: the flash-decode kernel reads the packed ring

@@ -19,9 +19,11 @@ Four modes, each printing one figure the restructure is judged on:
   with a catch-all arm) and `table-sites` (a `match` keyed by string literals
   or constants whose arm bodies name at least half of one codec enum).
 
-  The mode exits 1 when `KvQuant::descriptor` builds a row from a
-  struct-update base (`..<expr>`): that row inherits facts nobody stated, and
-  the site figure cannot see it.
+  The mode exits 1 when an arm of `KvQuant::descriptor` builds its row from a
+  struct-update base (`..<expr>`) or is not a literal of the return type: that
+  row inherits facts nobody stated, and the site figure cannot see it. It
+  prints `descriptor-fns N`, the number of those fns it read, so a renamed fn
+  reads 0 and not a clean scan.
 
   Known false positives: a `use` inside one fn applies to the whole file, so
   a glob import there makes a same-named variant elsewhere in the file count;
@@ -386,18 +388,35 @@ def is_table(arms: list[MatchArm]) -> bool:
 #: The codec descriptor: `fn descriptor` in an `impl KvQuant`. Each of its arms
 #: states every fact as a literal.
 DESCRIPTOR_FN = re.compile(r"\bfn\s+descriptor\s*\(")
+#: The type the descriptor returns: each arm must be a literal of it.
+RETURN_TYPE = re.compile(r"->\s*([A-Za-z_]\w*)\s*$")
 #: A struct-update base: `..` after `{` or `,` and before an expression. A rest
-#: pattern (`{ a, .. }`, `(a, ..)`) is followed by a closing bracket instead.
-STRUCT_UPDATE_BASE = re.compile(r"[{,]\s*\.\.(?!=)\s*[^\s})\]]")
+#: pattern (`{ a, .. }`, `(a, ..)`, `[a, .., b]`) is followed by a closing
+#: bracket or a comma instead.
+STRUCT_UPDATE_BASE = re.compile(r"[{,]\s*\.\.(?!=)\s*[^\s,})\]]")
 
 
-def refuse_descriptor_base(sources: dict[str, str], enums: dict[str, list[str]]) -> None:
-    """Exit 1 when the codec descriptor builds a row from a struct-update base.
+def refuse(rel: str, line: int, what: str) -> None:
+    print(
+        f"refused: {rel}:{line} {what} in KvQuant::descriptor; each arm must state every fact as a literal",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
 
-    A row written `CodecDescriptor { index: 3, ..KvQuant::K8V4.descriptor() }`
-    compiles, and inherits every fact it does not state from another codec.
-    The census then still counts one site, so the figure cannot see it.
+
+def check_descriptors(sources: dict[str, str], enums: dict[str, list[str]]) -> int:
+    """Refuse a codec descriptor row that does not state its own facts, and
+    return how many `KvQuant::descriptor` fns the scan read.
+
+    Two row shapes compile and inherit facts from another codec, and the site
+    figure is the same with or without them: a struct-update base
+    (`CodecDescriptor { index: 3, ..KvQuant::K8V4.descriptor() }`), and an arm
+    whose body is not a literal of the return type (`{ let mut row =
+    KvQuant::K8V4.descriptor(); row.index = 3; row }`). Both exit 1 with the
+    line. The count lets the real-tree pin see a renamed fn, which would
+    otherwise leave nothing here to refuse.
     """
+    found = 0
     for rel, blanked in sources.items():
         scope = file_scope(blanked, enums)
         for fn in DESCRIPTOR_FN.finditer(blanked):
@@ -406,23 +425,38 @@ def refuse_descriptor_base(sources: dict[str, str], enums: dict[str, list[str]])
             brace = blanked.find("{", fn.end())
             if brace < 0:
                 continue
+            found += 1
+            first_line = blanked.count("\n", 0, brace) + 1
             body = blanked[brace : block_end(blanked, brace)]
             base = STRUCT_UPDATE_BASE.search(body)
             if base:
                 dots = brace + base.start() + base.group(0).index("..")
-                line = blanked.count("\n", 0, dots) + 1
-                print(
-                    f"refused: {rel}:{line} a struct-update base (`..<expr>`) in KvQuant::descriptor; "
-                    "each arm must state every fact as a literal",
-                    file=sys.stderr,
-                )
-                raise SystemExit(1)
+                refuse(rel, blanked.count("\n", 0, dots) + 1, "a struct-update base (`..<expr>`)")
+            ret = RETURN_TYPE.search(blanked[fn.end() : brace])
+            if not ret:
+                refuse(rel, first_line, "no return type the arms can be read against")
+            try:
+                sites = match_sites(body)
+            except ScanError as exc:
+                fail(f"{rel}: {exc}")
+                raise
+            if not sites:
+                refuse(rel, first_line, "no match")
+            literal = re.compile(rf"{re.escape(ret.group(1))}\s*\{{")
+            for arm in sites[0].arms:
+                if not literal.match(arm.body.strip()):
+                    refuse(
+                        rel,
+                        first_line + arm.line - 1,
+                        f"an arm whose body is not a `{ret.group(1)} {{ .. }}` literal",
+                    )
+    return found
 
 
 def mode_match_sites(root: Path, threshold: int | None, include_tests: bool) -> None:
     sources = source_files(root, include_tests)
     enums = codec_enums(root, sources)
-    refuse_descriptor_base(sources, enums)
+    descriptors = check_descriptors(sources, enums)
 
     # A site naming fewer than half the enum's variants is a case analysis over
     # a subset; at half or more it enumerates the codec surface, which is the
@@ -484,6 +518,7 @@ def mode_match_sites(root: Path, threshold: int | None, include_tests: bool) -> 
     print(f"forcing-sites {forcing}")
     print(f"subset-sites {subsets}")
     print(f"table-sites {tables}")
+    print(f"descriptor-fns {descriptors}")
 
 
 def update_files(root: Path) -> list[Path]:
