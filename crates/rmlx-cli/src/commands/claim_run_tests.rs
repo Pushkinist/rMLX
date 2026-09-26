@@ -10,6 +10,7 @@ use super::*;
 use std::fs::{File, TryLockError};
 use std::io::{BufRead as _, BufReader, IsTerminal as _, Write as _};
 use std::path::Path;
+use std::process::{Child, ChildStdin};
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -163,14 +164,13 @@ const FORWARDED: [(&str, i32); 3] = [
     ("HUP", libc::SIGHUP),
 ];
 
-/// Each forwarded signal sent to a process running `forward_signals` arrives
-/// on its channel instead of acting on the process. The handlers stay for the
-/// life of a process, so they are installed in a child of this test binary.
-#[test]
-fn claim_run_receives_sigterm_sigint_and_sighup() {
+/// Start the ignored child test `name` of this binary with a pipe as its
+/// stdin, send it `go`, and return it with its stdin and the lines it prints
+/// after `tag`.
+fn start_child(name: &str, tag: &'static str) -> (Child, ChildStdin, impl Iterator<Item = String>) {
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
-            "commands::claim_run::tests::signal_receiver_child",
+            &format!("commands::claim_run::tests::{name}"),
             "--exact",
             "--ignored",
             "--nocapture",
@@ -183,12 +183,56 @@ fn claim_run_receives_sigterm_sigint_and_sighup() {
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
     writeln!(stdin, "go").unwrap();
-    let mut lines = BufReader::new(child.stdout.take().unwrap())
+    let lines = BufReader::new(child.stdout.take().unwrap())
         .lines()
         .map_while(Result::ok)
         // libtest writes its `test <name> ... ` prefix on the child's first line.
-        .filter_map(|line| line.find("signal-child ").map(|at| line[at..].to_owned()));
-    assert_eq!(lines.next().as_deref(), Some("signal-child ready"));
+        .filter_map(move |line| line.find(tag).map(|at| line[at + tag.len()..].to_owned()));
+    (child, stdin, lines)
+}
+
+/// Whether this process was started by `start_child`: a child test returns at
+/// once when run by hand from a terminal.
+fn started_by_parent() -> bool {
+    let stdin = io::stdin();
+    let mut go = String::new();
+    !stdin.is_terminal() && stdin.lock().read_line(&mut go).is_ok() && go.trim() == "go"
+}
+
+/// The command's stdin is `/dev/null` even when this process's stdin is a
+/// pipe, so the check runs in a child of this test binary whose stdin is one.
+#[test]
+fn claim_run_child_stdin_is_dev_null() {
+    let (mut child, stdin, mut lines) = start_child("null_stdin_child", "null-stdin-child ");
+    assert_eq!(lines.next().as_deref(), Some("exit 0"));
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
+#[ignore = "child process of claim_run_child_stdin_is_dev_null; the parent test starts it"]
+fn null_stdin_child() {
+    if !started_by_parent() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_sender, signals) = mpsc::channel();
+    let code = run_holding(
+        temp_lock(dir.path()),
+        &sh("[ /dev/stdin -ef /dev/null ]"),
+        &signals,
+    )
+    .unwrap();
+    println!("null-stdin-child exit {code}");
+}
+
+/// Each forwarded signal sent to a process running `forward_signals` arrives
+/// on its channel instead of acting on the process. The handlers stay for the
+/// life of a process, so they are installed in a child of this test binary.
+#[test]
+fn claim_run_receives_sigterm_sigint_and_sighup() {
+    let (mut child, stdin, mut lines) = start_child("signal_receiver_child", "signal-child ");
+    assert_eq!(lines.next().as_deref(), Some("ready"));
     let pid = child.id().to_string();
     for (name, number) in FORWARDED {
         let sent = Command::new("/bin/kill")
@@ -198,7 +242,7 @@ fn claim_run_receives_sigterm_sigint_and_sighup() {
         assert!(sent.success(), "kill -{name} failed");
         assert_eq!(
             lines.next(),
-            Some(format!("signal-child got {number}")),
+            Some(format!("got {number}")),
             "SIG{name} must reach the channel"
         );
     }
@@ -206,17 +250,12 @@ fn claim_run_receives_sigterm_sigint_and_sighup() {
     assert!(child.wait().unwrap().success());
 }
 
-/// The child half of the signal test: installs the handlers, reports each
-/// signal it receives, and returns at once when run by hand from a terminal.
+/// The child half of the signal test: installs the handlers and reports each
+/// signal it receives.
 #[test]
 #[ignore = "child process of claim_run_receives_sigterm_sigint_and_sighup; the parent test starts it"]
 fn signal_receiver_child() {
-    let stdin = io::stdin();
-    if stdin.is_terminal() {
-        return;
-    }
-    let mut go = String::new();
-    if stdin.lock().read_line(&mut go).is_err() || go.trim() != "go" {
+    if !started_by_parent() {
         return;
     }
     let signals = forward_signals().unwrap();
