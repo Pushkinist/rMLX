@@ -588,13 +588,9 @@ for crate in "${crates[@]}"; do
         f && /^    [A-Za-z_][A-Za-z0-9_:]*$/ { print $1 }
     ' "${log}" | sort -u)"
 
+    crate_banner=0
+    grep -qF "${VALIDATION_BANNER}" "${log}" && crate_banner=1
     if [ "${SHADER_VALIDATION}" = "1" ]; then
-        # Per crate, matching the coverage check's granularity. A single global
-        # OR would let one crate's banner vouch for a crate whose tests all
-        # returned before creating a Metal device.
-        if ! grep -qF "${VALIDATION_BANNER}" "${log}"; then
-            failed_crates="${failed_crates}  ${crate}: ran uninstrumented (no validation banner)"$'\n'
-        fi
         # Split first, then match. The layer writes to stderr while libtest is
         # mid-line, so reports routinely share an output line, and the detector's
         # bounded `.{0,120}` is greedy: with a short kernel name the second
@@ -630,6 +626,7 @@ for crate in "${crates[@]}"; do
     # reason is cut there rather than carrying a second event's text.
     crate_skips="$(grep -Eo "${NAMED_SKIP}.*" "${log}" \
         | sed -E 's/Invalid (device|threadgroup).*$//; s/[[:space:]]+$//' | sort -u)"
+    crate_stood_down=""
     while IFS= read -r notice; do
         [ -z "${notice}" ] && continue
         skip_test="${notice%%:*}"
@@ -645,6 +642,7 @@ for crate in "${crates[@]}"; do
             *) n_unattributed=$((n_unattributed + 1)); continue ;;
         esac
         stood_down="${stood_down}  ${crate} ${skip_test}: ${notice#*: }"$'\n'
+        crate_stood_down="${crate_stood_down}${skip_test}"$'\n'
         validation_skips="${validation_skips}${crate}"$'\t'"${skip_test}"$'\n'
         n_stood_down=$((n_stood_down + 1))
     done <<< "${crate_skips}"
@@ -677,6 +675,17 @@ for crate in "${crates[@]}"; do
     if [ "${executed}" -lt "${classified}" ]; then
         echo "ERROR: ${crate} classified ${classified} GPU tests but executed ${executed} — a filter stopped matching." >&2
         failed_crates="${failed_crates}  ${crate}: under-matched (${executed}/${classified} executed)"$'\n'
+    fi
+
+    # Per crate, matching the coverage check's granularity: a single global OR
+    # would let one crate's banner vouch for a crate whose tests all returned
+    # before creating a Metal device. The one crate that may lack it is one
+    # whose every executed test named its own stand-down: nothing in it reached
+    # Metal, and each cell is already listed and marks the run INCOMPLETE.
+    n_crate_stood_down="$(printf '%s' "${crate_stood_down}" | sort -u | grep -c '.')"
+    if [ "${SHADER_VALIDATION}" = "1" ] && [ "${crate_banner}" = "0" ] &&
+        { [ "${executed}" -eq 0 ] || [ "${n_crate_stood_down}" -lt "${executed}" ]; }; then
+        failed_crates="${failed_crates}  ${crate}: ran uninstrumented (no validation banner)"$'\n'
     fi
     if [ "${rc}" -ne 0 ]; then
         failed_crates="${failed_crates}  ${crate}:"$'\n'

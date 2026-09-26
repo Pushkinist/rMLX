@@ -954,6 +954,66 @@ expect_out "rmlx-models spec_alpha: RMLX_DRAFT_TEST_MODEL is unset"
 expect_out "INCOMPLETE: 1 selected GPU test(s) stood down"
 
 # ---------------------------------------------------------------------------
+# A crate whose every executed test named its own stand-down reached no Metal,
+# so it has no validation banner to show. That is a stand-down, listed and
+# INCOMPLETE, and not a crate that ran uninstrumented: on a host without one
+# crate's snapshot, the rest of the suite must still be able to pass.
+new_case crate_all_stood_down_needs_no_banner || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+classify "${CASE_ROOT}" rmlx-server embed_alpha embed_beta
+crate_log "${CASE_ROOT}" rmlx-kv-quant 0 <<'LOG'
+Metal GPU Validation Enabled
+running 1 test
+test kv::gpu_alpha ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+crate_log "${CASE_ROOT}" rmlx-server 0 <<'LOG'
+running 2 tests
+test embed_alpha ... SKIP embed_alpha: RMLX_TEST_MODEL_JINA_V4 not set
+ok
+test embed_beta ... SKIP embed_beta: RMLX_TEST_MODEL_JINA_V4 not set
+ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}"
+expect_status 0
+expect_out "rmlx-server embed_alpha: RMLX_TEST_MODEL_JINA_V4 not set"
+expect_out "rmlx-server embed_beta: RMLX_TEST_MODEL_JINA_V4 not set"
+expect_out "INCOMPLETE: 2 selected GPU test(s) stood down"
+expect_no_out "ran uninstrumented"
+
+# ...but one executed test that did not stand down is a test that ran, and a
+# crate with such a test and no banner ran it uninstrumented.
+new_case crate_partly_stood_down_needs_banner || exit 1
+classify "${CASE_ROOT}" rmlx-server embed_alpha embed_beta
+crate_log "${CASE_ROOT}" rmlx-server 0 <<'LOG'
+running 2 tests
+test embed_alpha ... SKIP embed_alpha: RMLX_TEST_MODEL_JINA_V4 not set
+ok
+test embed_beta ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "rmlx-server: ran uninstrumented (no validation banner)"
+
+# ...and a stand-down notice that names no test attributes nothing, so it cannot
+# excuse the banner either.
+new_case unattributed_stand_down_needs_banner || exit 1
+classify "${CASE_ROOT}" rmlx-server embed_alpha embed_beta
+crate_log "${CASE_ROOT}" rmlx-server 0 <<'LOG'
+running 2 tests
+test embed_alpha ... SKIP embed_alpha: RMLX_TEST_MODEL_JINA_V4 not set
+ok
+test embed_beta ... SKIP: RMLX_TEST_MODEL_JINA_V4 not set
+ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "rmlx-server: ran uninstrumented (no validation banner)"
+
+# ---------------------------------------------------------------------------
 # A notice that names no test cannot be attributed. It is counted rather than
 # dropped — a report that omits it claims to have seen every stand-down when it
 # has not — and it must not be attributed to whichever test happened to be

@@ -345,7 +345,11 @@ Invalid device store at offset 4000064, executing kernel function: "custom_kerne
   (`man MetalValidation`).
 - **The banner is asserted per crate.** A crate that never printed
   `Metal GPU Validation Enabled` ran uninstrumented and fails. This usually
-  means it did not build.
+  means it did not build. The one exception is a crate whose every executed
+  test printed its own `SKIP <test>: <why>`: nothing in it reached Metal, each
+  cell is listed as a stand-down, and the run ends INCOMPLETE. The
+  `/v1/embeddings` GPU cells in `crates/rmlx-server/tests/embeddings_smoke.rs`
+  are such a crate on a host without the jina snapshot.
 - **A positive control runs first.**
   `crates/rmlx-kv-quant/src/shader_validation_canary.rs`, behind the
   `shader-validation-canary` feature, stores out of bounds on purpose. The run
