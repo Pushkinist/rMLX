@@ -36,8 +36,8 @@
 #       decode_reads_packed_store()  feeds_bf16_k_at_decode()  feeds_bf16_v_at_decode()
 #
 #   `ALL_KV_QUANTS`'s completeness is pinned by
-#   `variant_index_has_one_arm_per_listed_codec`, which counts the arms of the
-#   compiler-checked `variant_index` match out of the source and compares them
+#   `descriptor_has_one_arm_per_listed_codec`, which counts the arms of the
+#   compiler-checked codec descriptor match out of the source and compares them
 #   to the list's length — a variant absent from the list can be constructed
 #   nowhere in the crate, so nothing that sweeps the list could see it. A new
 #   enum variant therefore cannot slip past this gate by being absent from a

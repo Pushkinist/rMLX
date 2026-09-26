@@ -234,26 +234,24 @@ mod tests {
     }
 
     #[test]
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "wildcard arm is the correct fallthrough for unsupported arch/quant variants; exhaustive expansion would require updating on every new variant"
-    )]
     fn with_quant_max_seq_stores_correct_capacity() {
         let c_default = KvCache::with_quant(KvQuant::K8V4);
-        let default_max = match &c_default.storage {
-            KvStorage::K8V4 { max_seq, .. } => *max_seq,
-            _ => panic!("expected K8V4 storage"),
-        };
+        assert!(
+            matches!(c_default.storage, KvStorage::K8V4 { .. }),
+            "expected K8V4 storage"
+        );
+        let default_max = c_default.max_seq();
         assert_eq!(
             default_max, KV_MAX_SEQ_DEFAULT,
             "with_quant(K8V4) must cap at KV_MAX_SEQ_DEFAULT={KV_MAX_SEQ_DEFAULT}"
         );
 
         let c_long = KvCache::with_quant_max_seq(KvQuant::K8V4, 8192);
-        let long_max = match &c_long.storage {
-            KvStorage::K8V4 { max_seq, .. } => *max_seq,
-            _ => panic!("expected K8V4 storage"),
-        };
+        assert!(
+            matches!(c_long.storage, KvStorage::K8V4 { .. }),
+            "expected K8V4 storage"
+        );
+        let long_max = c_long.max_seq();
         assert_eq!(
             long_max, 8192,
             "with_quant_max_seq(K8V4, 8192) must store max_seq=8192, not KV_MAX_SEQ_DEFAULT"
@@ -971,6 +969,42 @@ mod tests {
                 "{named} is named as a deliberate fallback but never took it — drop it from \
                  the list"
             );
+        }
+    }
+
+    /// A policy fact of `kv_layer_quants`: a boundary codec that builds a
+    /// packed store builds the same storage variant as its base. The test
+    /// compares the variant only, not the widths or parameters it carries.
+    ///
+    /// It does not guard the SSD hydrate. Each hydrated layer gets the codec the
+    /// arch builder gives that layer, not the block's base codec, and
+    /// `ssd_boundary_codec_tests` holds that.
+    #[test]
+    fn a_boundary_layer_that_builds_a_store_keeps_the_base_storage() {
+        use std::mem::discriminant;
+        let n = LAYER_ADAPTIVE_HEAD_N + LAYER_ADAPTIVE_TAIL_N + 2;
+        for &base in rmlx_kv_quant::ALL_KV_QUANTS {
+            for shares_kv in [false, true] {
+                for layer_idx in 0..n {
+                    let layer = kv_quant_for_layer(
+                        layer_idx,
+                        n,
+                        base,
+                        LAYER_ADAPTIVE_TAIL_N,
+                        LAYER_ADAPTIVE_HEAD_N,
+                        shares_kv,
+                    );
+                    if !layer.materialises_packed_store() {
+                        continue;
+                    }
+                    assert!(
+                        discriminant(&KvStorage::new(layer)) == discriminant(&KvStorage::new(base)),
+                        "base {base} (shares_kv={shares_kv}) gives boundary layer {layer_idx} \
+                         the codec {layer}, which builds a store of another storage variant \
+                         than the base"
+                    );
+                }
+            }
         }
     }
 
@@ -2163,7 +2197,7 @@ mod tests {
     /// does not fail, it just prices a codec at a rate the allocation never had.
     ///
     /// The sweep is [`rmlx_kv_quant::ALL_KV_QUANTS`], whose completeness against
-    /// the compiler-checked `variant_index` is pinned in `rmlx-kv-quant`, so a
+    /// the compiler-checked codec descriptor is pinned in `rmlx-kv-quant`, so a
     /// new codec reaches this manifest without anyone adding it to a list. Both
     /// topologies are emitted because `shares_kv` moves `Mixed` / `RotK` by two
     /// whole mirrors, on the per-codec estimate and on the boundary floor alike.

@@ -11,37 +11,74 @@ The update path is in `crates/rmlx-kv-quant/src/kvcache/`:
 
 | File | Holds |
 |---|---|
-| `update.rs` | The `KvStorage` and `KvQuant` dispatch, `exit_prefill`, prefill and decode capacity bookkeeping, the bf16 decode mirror, the GPU-state and residency walks, helpers shared by two or more families, `storage_mismatch`, `warn_if_width_disagrees` |
+| `update.rs` | `update` and `exit_prefill`, which call the entries `KvStorage::view_mut` names, prefill and decode capacity bookkeeping, the bf16 decode mirror, the GPU-state and residency walks, helpers shared by two or more families, `storage_mismatch`, `warn_if_width_disagrees` |
 | `update_rotor.rs` | Rotor decode and prefill bodies, GPU encode, ring sync, materialised tail |
 | `update_iso.rs` | Iso bodies, the same parts |
 | `update_turbo.rs` | TurboQuant bodies and `k8_turbo_v_knobs` |
 | `update_affine.rs` | `k8v4`, `k8v8` |
 | `update_planar.rs` | `planar`, `planar_k`, including the warm-TTFT bypass |
 | `update_paged.rs` | The paged storage |
-| `update_mixed.rs` | The `Mixed` prefill body |
+| `update_mixed.rs` | The two `Mixed` entries: the prefill body and the decode refusal |
 
 The family files sit in `kvcache/`, not in `storage/`. The bodies are
 `impl KvCache` methods and read `KvCache` fields that are `pub(super)` in
-`kvcache::core`. `storage` is a leaf of `kvcache` and cannot see them.
+`kvcache::core`. `KvStorage::view_mut` in `storage` names the entries as
+`pub(crate)` fn pointers and does not read those fields.
 
-`exit_prefill` returns at its `materialises_packed_store()` gate, before any
-bulk-encode arm. It also clears any payload the cache arrived with. A spelling
-that reports `false` gets no packed store from a served prefill; its decode
-reads the bf16 mirror. Its `exit_prefill` arm is unreachable today and is kept
-as the re-enable path for a codec that grows a decode kernel over its own
-store. This test fails when an arm and the predicate disagree:
+## Entries
+
+`KvStorage::view_mut` names two entries for each storage variant, with one
+signature each:
+
+- `update`: `fn(&mut KvCache, &Array, &Array, Device) -> Result<(Array, Array)>`
+  (`new_k`, `new_v`, `device`).
+- `exit_prefill`: `fn(&mut KvCache, &Array, &Array, Device, i32) -> Result<()>`
+  (`k_full`, `v_full`, `device`, `total_seq`). An entry ignores an argument it
+  does not use. `exit_prefill_mixed` reads the dispatch policy from the cache.
+
+The caller copies the entry out of the view, drops the view, then calls the
+entry.
+
+**`update` is keyed on the storage.** It reads the entry of the storage the
+cache holds. After an SSD hydrate, an SWA layer holds `KvStorage::None` while
+its `quant` is the model's codec, and `Paged` comes from a process-global
+switch; both must take their own storage's entry. A decode step pays one view
+build (one match, no allocation) and one indirect call.
+`entry_routing_tests.rs` drives both shapes.
+
+**`exit_prefill` is keyed on the codec.** It reads the entry of
+`KvStorage::new(self.quant)`, the same key its `materialises_packed_store()`
+gate reads. Building that storage allocates nothing (every slot is `None`),
+and it runs once per layer per prefill. A storage of another family than the
+codec reaches a body that returns `KvStorageMismatch`. A width disagreement
+inside one family only warns (`warn_if_width_disagrees`).
+
+`exit_prefill` has three guards before the entry. `None` storage returns with
+the bf16 seeds as its storage. `Paged` returns with its compact seed. The gate
+returns before any bulk encode for a codec whose decode reads only the bf16
+mirror, and clears any payload the cache arrived with. The `exit_prefill` entry
+of `None` and `Paged` is `exit_prefill_behind_guard`, which refuses. The entries
+of the mirror family are unreachable through `exit_prefill` today and stay as
+the re-enable path for a codec that grows a decode kernel over its own store.
+`every_exit_prefill_entry_builds_a_store_on_its_own_storage` calls each entry
+directly. This test fails when an entry and the gate disagree:
 `warm_ttft_cross_codec_tests::exit_prefill_builds_a_store_exactly_when_the_predicate_says_so`.
 
-Two `exit_prefill` cases stay inline. `KvQuant::None` reads the raw buffers
-the function owns and returns early, promoting them into the bf16 mirror.
-`KvStorage::Paged` has no arm: its seed is an early return above the gate.
+After a hydrate, a non-`None` storage has the same storage variant as the one
+its codec builds, because each hydrated layer gets the codec the arch builder
+gave that layer. `block_io_storage_family_tests.rs` in `rmlx-kv-ssd` holds this
+for one codec, comparing the variant only. `ssd_boundary_codec_tests.rs` in
+`rmlx-models` holds it for the boundary layers by decoding them.
+`a_boundary_layer_that_builds_a_store_keeps_the_base_storage` holds a policy
+fact of `kv_layer_quants`, not of the hydrate: a boundary codec that builds a
+store builds the base's storage variant.
 
-`KvCache::update` refuses a `Mixed` cache. The `Mixed` per-step append is
-`update_and_sdpa_mixed` in `sdpa.rs`.
+The `update` entry of `Mixed` is `update_mixed`, which refuses. The `Mixed`
+per-step append is `update_and_sdpa_mixed` in `sdpa.rs`.
 
 ## One body per store shape
 
-24 of the 27 `KvStorage` variants hold store slots and `max_seq`. 19 hold a K
+24 of the 27 `KvStorage` variants hold store slots. 19 hold a K
 slot and a V slot; `Planar`, `RotorKAsym3` and `RotorKAsym4` also carry a
 scalar knob. 5 hold a K slot only, with V as bf16 on the parent cache:
 `PlanarK`, `IsoKOnly3`, `IsoKOnly4`, `RotorKOnly3`, `RotorKOnly4`. `None` holds
@@ -80,8 +117,8 @@ spellings read `(v_bits, use_tcq)` from one table, `k8_turbo_v_knobs`, which
 both entries share.
 
 **The width comes from the storage.** A prefill entry encodes at the storage's
-width even when the `KvQuant` spelling names another. Decode dispatches on the
-storage too, so the two halves agree. `warn_if_width_disagrees` warns when
+width even when the `KvQuant` spelling names another. Both entries come from
+the storage variant, so the two halves agree. `warn_if_width_disagrees` warns when
 they differ; it does not refuse.
 
 **Three bodies stay apart.** `update_k8v4`, `update_k8v8` and `update_planar`
@@ -245,6 +282,35 @@ The figures are printed by tools, not recorded here:
   figure per population. The KV ones are `rotor-storage`, `iso-storage`,
   `turbo-storage`, `rotor-updates`, `iso-updates`, `turbo-updates`,
   `turbo-ssd` and `update-bodies`.
+
+## The sites a new codec must touch
+
+A new `KvQuant` variant (and its `KvStorage` variant) does not compile until
+each exhaustive site below names it. Each stays for its reason:
+
+| Site | Why it cannot move |
+|---|---|
+| `quant_descriptor.rs` `KvQuant::descriptor` | The one place that classifies a codec. The predicates, `Display` and the fieldless `FromStr` spellings read it. |
+| `storage/kv_storage.rs` `KvStorage::new` | It builds one storage variant per codec. Data cannot name a variant. |
+| `storage/kv_storage.rs` `KvStorage::view` | The one place where the concrete stores become `&dyn KvSlot` for read-only work. |
+| `storage/kv_storage.rs` `KvStorage::view_mut` | The same for mutation, plus the `update` and `exit_prefill` entries. One view cannot be derived from the other without a macro. |
+| `storage/kv_storage.rs` `KvStorage::try_deep_clone` | Building the twin needs the concrete variant. A trait method would need `dyn Any` downcasts, or a codec the storage cannot always state. |
+| `rmlx-kv-ssd` `block_io.rs` `write_layer` | The SSD block format (tensor names, dtypes, trims) belongs to `rmlx-kv-ssd` and needs the concrete store types. |
+| `rmlx-models` `kv_cache/cache_type.rs` `decompose_auto` | Per-codec policy (fallback, warning, panic, per-side tag) that no codec fact decides. |
+
+One site compiles with a new variant and still must change: the layout-tag
+table of `rmlx-kv-ssd` `block_io.rs` `read_layer`. It is the read side of
+`write_layer`, for the same reason. Its keys are SSD layout tags, not codec
+spellings (`none_bf16`, `mixed`, `paged`, the `_qjl` rotor tags), so the
+descriptor spelling cannot drive it. A new codec without an arm there spills
+and then fails to hydrate with `unknown layer tag`.
+
+`FromStr` has no table of its own: it finds a fieldless spelling in
+`ALL_KV_QUANTS` through the descriptor, an alias in `KV_QUANT_ALIASES`, and
+keeps one structured parser per payload shape (`mixed_*`, `rot_k_v*`,
+`rotor_k_{3,4}_asym_*`). The list of valid spellings in the
+`KvQuantParseError::Unknown` text is written by hand and pinned by
+`unknown_error_text_names_every_fixed_spelling`.
 
 ## What cannot move
 

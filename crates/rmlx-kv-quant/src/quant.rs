@@ -15,6 +15,11 @@ use rmlx_mlx::Device;
 /// `KvCache::with_quant_max_seq`. If absent or >4096, this cap applies.
 pub const KV_MAX_SEQ_DEFAULT: i32 = 4096;
 
+#[path = "quant_descriptor.rs"]
+mod descriptor;
+
+use descriptor::{HotPathClass, Spelling};
+
 /// Quantization mode for the KV cache.
 ///
 /// Qwen MoE rejects every variant that stores K below 8 bits
@@ -383,12 +388,12 @@ pub enum KvQuant {
 /// stops covering the newest codec, which is the shape of gate this repo has
 /// shipped before.
 ///
-/// `variant_index_has_one_arm_per_listed_codec` pins this list against
-/// [`KvQuant::variant_index`], a `match` the compiler checks for exhaustiveness,
-/// so a variant added to the enum and not added here fails there. It counts
-/// that match's arms out of this file's source, because a variant missing from
-/// this list can be constructed nowhere in the crate and so is invisible to
-/// every test that sweeps it.
+/// `descriptor_has_one_arm_per_listed_codec` pins this list against the
+/// codec descriptor (`quant_descriptor.rs`), a `match` the compiler checks for
+/// exhaustiveness, so a variant added to the enum and not added here fails
+/// there. It counts that match's arms out of the source, because a variant
+/// missing from this list can be constructed nowhere in the crate and so is
+/// invisible to every test that sweeps it.
 pub const ALL_KV_QUANTS: &[KvQuant] = &[
     KvQuant::None,
     KvQuant::K8V4,
@@ -668,45 +673,6 @@ fn packed_side_bytes(store: SideStore, bits: u32, elems: u64, head_dim: u64, n_t
 }
 
 impl KvQuant {
-    /// Discriminant index, used only to prove [`ALL_KV_QUANTS`] names every
-    /// variant. The `match` is exhaustive, so a new variant fails to compile
-    /// here, and the distinct indices make the list's coverage checkable.
-    #[must_use]
-    pub fn variant_index(&self) -> usize {
-        match self {
-            KvQuant::None => 0,
-            KvQuant::K8V4 => 1,
-            KvQuant::K8V8 => 2,
-            KvQuant::Planar => 3,
-            KvQuant::Planar3 => 4,
-            KvQuant::PlanarK => 5,
-            KvQuant::Mixed { .. } => 6,
-            KvQuant::RotK { .. } => 7,
-            KvQuant::K8VTurbo3 => 8,
-            KvQuant::K8VTurbo3Tcq => 9,
-            KvQuant::K8VTurbo2 => 10,
-            KvQuant::K8VTurbo2Tcq => 11,
-            KvQuant::TurboSym3 => 12,
-            KvQuant::TurboSym4 => 13,
-            KvQuant::Iso3 => 14,
-            KvQuant::Iso4 => 15,
-            KvQuant::Iso3Sym => 16,
-            KvQuant::Iso4Sym => 17,
-            KvQuant::IsoKOnly3 => 18,
-            KvQuant::IsoKOnly4 => 19,
-            KvQuant::Rotor3 => 20,
-            KvQuant::Rotor4 => 21,
-            KvQuant::Rotor3Sym => 22,
-            KvQuant::Rotor4Sym => 23,
-            KvQuant::RotorKOnly3 => 24,
-            KvQuant::RotorKOnly4 => 25,
-            KvQuant::RotorK3Asym { .. } => 26,
-            KvQuant::RotorK4Asym { .. } => 27,
-        }
-    }
-}
-
-impl KvQuant {
     /// Stable per-codec salt for namespacing the in-RAM prompt/prefix cache
     /// key by KV codec.
     ///
@@ -746,7 +712,7 @@ impl KvQuant {
     /// True for the Mixed-machinery hot path (Mixed + RotK), which dispatches
     /// through `mx.quantize` 3-tuples + `mixed_quantized_sdpa`.
     pub fn uses_mixed_path(&self) -> bool {
-        matches!(self, KvQuant::Mixed { .. } | KvQuant::RotK { .. })
+        self.descriptor().mixed_params.is_some()
     }
 
     /// True for KV codecs that store K below 8 bits. `validate_resolved` in
@@ -757,21 +723,7 @@ impl KvQuant {
     /// `PlanarK` is guarded separately (dedicated resolve error) before
     /// this check runs.
     pub fn k_below_8bit(&self) -> bool {
-        matches!(
-            self,
-            KvQuant::TurboSym3
-                | KvQuant::TurboSym4
-                | KvQuant::Iso3Sym
-                | KvQuant::Iso4Sym
-                | KvQuant::IsoKOnly3
-                | KvQuant::IsoKOnly4
-                | KvQuant::Rotor3Sym
-                | KvQuant::Rotor4Sym
-                | KvQuant::RotorKOnly3
-                | KvQuant::RotorKOnly4
-                | KvQuant::RotorK3Asym { .. }
-                | KvQuant::RotorK4Asym { .. }
-        )
+        self.descriptor().k_below_8bit
     }
 
     /// True when the decode path reads the bf16 `decode_fp16_k` seed that
@@ -804,53 +756,14 @@ impl KvQuant {
     ///
     /// `shares_kv` is the cache's own [`crate::KvCache::shares_kv`], set by the
     /// arch builder that knows its own topology. It is not a codec property, so
-    /// it is a parameter rather than a match arm: the same codec is mirrored on
-    /// Gemma4 and mirror-free on Qwen3, and both are correct.
+    /// it is a parameter rather than a descriptor fact: the same codec is
+    /// mirrored on Gemma4 and mirror-free on Qwen3, and both are correct.
     ///
-    /// The match is **exhaustive on purpose** (no wildcard `_`): adding a new
-    /// `KvQuant` variant will produce a compile error until it is classified
-    /// here, preventing a new K-only-style variant from silently defaulting to
-    /// `true` and reintroducing the dead-seed leak.
+    /// The answer is the codec's row in `KvQuant::descriptor`
+    /// (`quant_descriptor.rs`), one exhaustive match: a new variant does not
+    /// compile until its row states this fact.
     pub fn feeds_bf16_k_at_decode(&self, shares_kv: bool) -> bool {
-        match self {
-            // Two families never read a bf16 K at decode, for two reasons:
-            //
-            // * K-only (IsoKOnly*, RotorKOnly*) — K is re-quantised at every
-            //   decode step; V routes through `update_decode_fp16_v_only`.
-            // * Fused symmetric (Iso{3,4}Sym, Rotor{3,4}Sym) — decode runs a
-            //   flash kernel straight off the packed K and V rings, so neither
-            //   axis reads a mirror (see `feeds_bf16_v_at_decode`).
-            KvQuant::IsoKOnly3
-            | KvQuant::IsoKOnly4
-            | KvQuant::RotorKOnly3
-            | KvQuant::RotorKOnly4
-            | KvQuant::Iso3Sym
-            | KvQuant::Iso4Sym
-            | KvQuant::Rotor3Sym
-            | KvQuant::Rotor4Sym => false,
-            // Mixed machinery: mirrored only for a cross-layer-KV producer.
-            KvQuant::Mixed { .. } | KvQuant::RotK { .. } => shares_kv,
-            // All other variants: decode reads the bf16 K seed materialised by
-            // exit_prefill (the warm-TTFT shortcut codecs and bf16 KV).
-            KvQuant::None
-            | KvQuant::K8V4
-            | KvQuant::K8V8
-            | KvQuant::Planar
-            | KvQuant::Planar3
-            | KvQuant::PlanarK
-            | KvQuant::K8VTurbo3
-            | KvQuant::K8VTurbo3Tcq
-            | KvQuant::K8VTurbo2
-            | KvQuant::K8VTurbo2Tcq
-            | KvQuant::TurboSym3
-            | KvQuant::TurboSym4
-            | KvQuant::Iso3
-            | KvQuant::Iso4
-            | KvQuant::Rotor3
-            | KvQuant::Rotor4
-            | KvQuant::RotorK3Asym { .. }
-            | KvQuant::RotorK4Asym { .. } => true,
-        }
+        self.descriptor().k_mirror.applies(shares_kv)
     }
 
     /// True when the decode path reads the bf16 `decode_fp16_v` seed that
@@ -873,41 +786,11 @@ impl KvQuant {
     /// consumer and nothing else reads it. Both axes move together — the
     /// `want_kv` arm surfaces the pair, so half a mirror serves nobody.
     ///
-    /// Exhaustive on purpose, same reasoning as the K-side predicate: a new
-    /// variant must be classified rather than silently inherit a mirror.
+    /// The answer is the codec's row in `KvQuant::descriptor`
+    /// (`quant_descriptor.rs`), one exhaustive match: a new variant does not
+    /// compile until its row states this fact.
     pub fn feeds_bf16_v_at_decode(&self, shares_kv: bool) -> bool {
-        match self {
-            // Fused symmetric: V is unpacked from the quant store inside the
-            // flash kernel's SV loop; no bf16 V exists.
-            KvQuant::Iso3Sym | KvQuant::Iso4Sym | KvQuant::Rotor3Sym | KvQuant::Rotor4Sym => false,
-            // Mixed machinery: mirrored only for a cross-layer-KV producer.
-            KvQuant::Mixed { .. } | KvQuant::RotK { .. } => shares_kv,
-            // Everything else reads the bf16 V seed at decode — including the
-            // K-only family (via `update_decode_fp16_v_only`) and `None`, whose
-            // bf16 V *is* this buffer.
-            KvQuant::None
-            | KvQuant::K8V4
-            | KvQuant::K8V8
-            | KvQuant::Planar
-            | KvQuant::Planar3
-            | KvQuant::PlanarK
-            | KvQuant::K8VTurbo3
-            | KvQuant::K8VTurbo3Tcq
-            | KvQuant::K8VTurbo2
-            | KvQuant::K8VTurbo2Tcq
-            | KvQuant::TurboSym3
-            | KvQuant::TurboSym4
-            | KvQuant::Iso3
-            | KvQuant::Iso4
-            | KvQuant::IsoKOnly3
-            | KvQuant::IsoKOnly4
-            | KvQuant::Rotor3
-            | KvQuant::Rotor4
-            | KvQuant::RotorKOnly3
-            | KvQuant::RotorKOnly4
-            | KvQuant::RotorK3Asym { .. }
-            | KvQuant::RotorK4Asym { .. } => true,
-        }
+        self.descriptor().v_mirror.applies(shares_kv)
     }
 
     /// True when some decode-time read path of this codec consults the packed
@@ -947,53 +830,15 @@ impl KvQuant {
     /// `true` — the classification is a property of the codec alone.
     ///
     /// A codec that grows a decode kernel over its own packed store must flip
-    /// its arm here in the same change, or `exit_prefill` will not have built
-    /// the buffer the kernel wants to read.
+    /// this fact in its descriptor row in the same change, or `exit_prefill`
+    /// will not have built the buffer the kernel wants to read.
     ///
-    /// Exhaustive on purpose, same reasoning as the two `feeds_bf16_*`
-    /// predicates: a new variant must be classified rather than silently
-    /// inherit a value.
+    /// The answer is the codec's row in `KvQuant::descriptor`
+    /// (`quant_descriptor.rs`), one exhaustive match: a new variant does not
+    /// compile until its row states this fact.
     #[must_use]
     pub fn decode_reads_packed_store(&self) -> bool {
-        match self {
-            // Quantized-SDPA over the affine 3-tuples, appended per step.
-            KvQuant::Mixed { .. }
-            | KvQuant::RotK { .. }
-            // K re-quantised into the packed store every decode step.
-            | KvQuant::IsoKOnly3
-            | KvQuant::IsoKOnly4
-            | KvQuant::RotorKOnly3
-            | KvQuant::RotorKOnly4
-            // Flash decode straight off both packed rings.
-            | KvQuant::Iso3Sym
-            | KvQuant::Iso4Sym
-            | KvQuant::Rotor3Sym
-            | KvQuant::Rotor4Sym => true,
-            // `None` has no packed store to read; the rest are the bf16-mirror
-            // family, which decodes off the mirror. `materialises_packed_store`
-            // is false for every one of them, so `exit_prefill` does not build
-            // their store at all — it returns at that gate and clears what is
-            // there. The store is the authority only for a cache with no
-            // mirror: an SSD hydrate, or one that never bracketed a prefill.
-            KvQuant::None
-            | KvQuant::K8V4
-            | KvQuant::K8V8
-            | KvQuant::Planar
-            | KvQuant::Planar3
-            | KvQuant::PlanarK
-            | KvQuant::K8VTurbo3
-            | KvQuant::K8VTurbo3Tcq
-            | KvQuant::K8VTurbo2
-            | KvQuant::K8VTurbo2Tcq
-            | KvQuant::TurboSym3
-            | KvQuant::TurboSym4
-            | KvQuant::Iso3
-            | KvQuant::Iso4
-            | KvQuant::Rotor3
-            | KvQuant::Rotor4
-            | KvQuant::RotorK3Asym { .. }
-            | KvQuant::RotorK4Asym { .. } => false,
-        }
+        self.descriptor().reads_packed_store
     }
 
     /// True when `exit_prefill` materialises this codec's packed store.
@@ -1005,7 +850,7 @@ impl KvQuant {
     ///
     /// This is the predicate `exit_prefill` gates the allocation on, and the one
     /// the byte estimate reads. The **spill path does not read it** — it asks
-    /// [`crate::storage::KvStorage::geometry_only_max_seq`], a predicate on the
+    /// [`crate::storage::KvStorage::is_geometry_only`], a predicate on the
     /// other enum, and nothing in the type system couples the two. A codec
     /// classified `false` here whose storage variant lands in that function's
     /// "payload is not an `Option`" arm would make the writer stamp a codec
@@ -1047,43 +892,11 @@ impl KvQuant {
     /// [`cpu_hot_path_reason`](Self::cpu_hot_path_reason).
     /// The only codec with no MSL at all is `None` (raw bf16, `slice_update`).
     ///
-    /// Exhaustive on purpose (no wildcard) so a new variant must be classified.
+    /// The answer is the codec's row in `KvQuant::descriptor`
+    /// (`quant_descriptor.rs`), one exhaustive match: a new variant does not
+    /// compile until its row states this fact.
     pub fn carries_msl(&self) -> bool {
-        match self {
-            // Raw bf16 KV: no quantization kernel, just slice_update on a bf16
-            // buffer. Nothing to cold-compile.
-            KvQuant::None => false,
-            // Everything else quantizes K with the q8_0 MSL kernel (or, for the
-            // Mixed/RotK family, MLX-native affine `mx.quantize`, itself a
-            // compiled Metal op) and therefore carries at least one shader.
-            KvQuant::K8V4
-            | KvQuant::K8V8
-            | KvQuant::Planar
-            | KvQuant::Planar3
-            | KvQuant::PlanarK
-            | KvQuant::Mixed { .. }
-            | KvQuant::RotK { .. }
-            | KvQuant::K8VTurbo3
-            | KvQuant::K8VTurbo3Tcq
-            | KvQuant::K8VTurbo2
-            | KvQuant::K8VTurbo2Tcq
-            | KvQuant::TurboSym3
-            | KvQuant::TurboSym4
-            | KvQuant::Iso3
-            | KvQuant::Iso4
-            | KvQuant::Iso3Sym
-            | KvQuant::Iso4Sym
-            | KvQuant::IsoKOnly3
-            | KvQuant::IsoKOnly4
-            | KvQuant::Rotor3
-            | KvQuant::Rotor4
-            | KvQuant::Rotor3Sym
-            | KvQuant::Rotor4Sym
-            | KvQuant::RotorKOnly3
-            | KvQuant::RotorKOnly4
-            | KvQuant::RotorK3Asym { .. }
-            | KvQuant::RotorK4Asym { .. } => true,
-        }
+        self.descriptor().carries_msl
     }
 
     /// `Ok` when this codec can run on `device`.
@@ -1136,100 +949,16 @@ impl KvQuant {
     /// tq4/planar/affine V, the Turbo/Mixed/RotK families, plus the K-only iso /
     /// QJL-off rotor families above).
     ///
-    /// Exhaustive on purpose (no wildcard) so a new variant must be classified.
-    #[allow(
-        clippy::match_same_arms,
-        reason = "the K-only iso arm returns None like the Metal arm but is kept separate to document the per-codec Metal-vs-CPU verdict this fn exists for: the K-only iso codec reaches Metal by its own encode + flash-decode kernels rather than the shared q8/turbo path, and unlike the rotor arm it carries no QJL gate that could flip the verdict. Merging the arms would erase that per-codec record."
-    )]
+    /// The answer is the codec's row in `KvQuant::descriptor`
+    /// (`quant_descriptor.rs`), one exhaustive match: a new variant does not
+    /// compile until its row states this fact.
     pub fn cpu_hot_path_reason(&self) -> Option<&'static str> {
-        match self {
-            // V-only iso variants: decode early-returns to the bf16 mirror and
-            // `exit_prefill` builds no store, so the iso V codec does not run on
-            // a cache that went through prefill.
-            KvQuant::Iso3 | KvQuant::Iso4 => Some(
-                "IsoQuant (quaternion SO(4)) V-only: decode reads the bf16 mirror, so \
-                 the iso V codec does not run on a cache that went through prefill",
-            ),
-            // Symmetric iso variants: NO bf16 decode-seed early-return — decode
-            // is the quant-V flash kernel over both packed iso rings. Iso carries
-            // no QJL sideband, so there is no CPU-fallback gate; the hot path is
-            // Metal.
-            KvQuant::Iso3Sym | KvQuant::Iso4Sym => None,
-            // K-only iso variants: NO bf16 decode-seed early-return — the iso K
-            // codec fires every decode step. On GPU, `update_iso_k_only_{3,4}`
-            // dispatches the real iso{3,4} MSL encode kernel; IsoKOnly3 also runs
-            // the iso3 MSL dequant kernel. Decode reads the packed ring through
-            // the iso flash-decode kernel, so the growing prefix stays on device;
-            // the only host readback (`packed_view_cpu`) is reached from
-            // `dequant()` / `dequant_gpu()` at a block-rebuild or SSD-spill
-            // boundary, never from a decode step. Metal hot path, no host stage.
-            KvQuant::IsoKOnly3 | KvQuant::IsoKOnly4 => None,
-            // V-only rotor variants and the rotor-K-asym variants early-return to
-            // the bf16 mirror at decode (`decode_fp16_k.is_some()`) and
-            // `exit_prefill` builds no store; the GPU fused-QK encoder is opt-in
-            // (`--fused-qk`).
-            KvQuant::Rotor3
-            | KvQuant::Rotor4
-            | KvQuant::RotorK3Asym { .. }
-            | KvQuant::RotorK4Asym { .. } => Some(
-                "RotorQuant (Clifford Cl(3,0)): decode reads the bf16 mirror, so the \
-                 rotor codec does not run on a cache that went through prefill; the \
-                 GPU fused-QK encoder is opt-in (--fused-qk)",
-            ),
-            // Symmetric rotor variants: NO bf16 decode-seed early-return — decode
-            // is the quant-V flash kernel over both packed rings. Same QJL gate as
-            // the K-only family, and for the same reason: the QJL residual cannot
-            // be reproduced in the flash inner loop, so a QJL-carrying store keeps
-            // the CPU dequant path on BOTH axes.
-            KvQuant::Rotor3Sym | KvQuant::Rotor4Sym => {
-                if crate::rotor_qjl::rotor_qjl_enabled() {
-                    Some(
-                        "RotorQuant (Clifford Cl(3,0)) symmetric with QJL enabled \
-                         (rotor_qjl_enabled): the QJL residual forces K and V onto the \
-                         CPU encode + dequant path every decode step; disable QJL \
-                         (--rotor-qjl off) to route both axes through the Metal \
-                         flash-decode kernel",
-                    )
-                } else {
-                    None
-                }
+        match self.descriptor().hot_path {
+            HotPathClass::Metal => None,
+            HotPathClass::Cpu(reason) => Some(reason),
+            HotPathClass::CpuWhenQjl(reason) => {
+                crate::rotor_qjl::rotor_qjl_enabled().then_some(reason)
             }
-            // K-only rotor variants: NO bf16 decode-seed early-return — the rotor
-            // K codec fires every decode step. `update_rotor_k_only` gates
-            // the GPU K encode on the store's sticky QJL flag (`use_qjl()`, fixed
-            // at first append), matching the sdpa fast path:
-            //   - QJL on (opt-in `--rotor-qjl on`): K append runs on CPU → CPU hot path.
-            //   - QJL off (default): `rotor{3,4}_gpu_append_into_k_blocks`
-            //     dispatches the per-codec rotor MSL encode kernel, and decode
-            //     reads the packed ring through the rotor flash-decode kernel →
-            //     Metal hot path, GPU-resident end to end, no host stage.
-            KvQuant::RotorKOnly3 | KvQuant::RotorKOnly4 => {
-                if crate::rotor_qjl::rotor_qjl_enabled() {
-                    Some(
-                        "RotorQuant (Clifford Cl(3,0)) K-only with QJL enabled \
-                         (rotor_qjl_enabled): the QJL residual forces the K append onto \
-                         CPU every decode step; disable QJL (--rotor-qjl off) to route \
-                         the rotor K encode through the Metal kernel",
-                    )
-                } else {
-                    None
-                }
-            }
-            // Genuinely Metal on the hot path (or no-op bf16): not a CPU codec.
-            KvQuant::None
-            | KvQuant::K8V4
-            | KvQuant::K8V8
-            | KvQuant::Planar
-            | KvQuant::Planar3
-            | KvQuant::PlanarK
-            | KvQuant::Mixed { .. }
-            | KvQuant::RotK { .. }
-            | KvQuant::K8VTurbo3
-            | KvQuant::K8VTurbo3Tcq
-            | KvQuant::K8VTurbo2
-            | KvQuant::K8VTurbo2Tcq
-            | KvQuant::TurboSym3
-            | KvQuant::TurboSym4 => None,
         }
     }
 
@@ -1242,39 +971,15 @@ impl KvQuant {
     /// first prefill. See [`crate::precompile::precompile_kv_codec_msl`].
     #[must_use]
     pub fn is_k_only_iso_rotor(&self) -> bool {
-        matches!(
-            self,
-            KvQuant::IsoKOnly3 | KvQuant::IsoKOnly4 | KvQuant::RotorKOnly3 | KvQuant::RotorKOnly4
-        )
+        self.descriptor().k_only_iso_rotor
     }
 
     /// The `(k_bits, v_bits, k_group_size, v_group_size)` the Mixed state should
     /// be built with for this quant, or `None` for non-Mixed-path variants.
     ///
     /// RotK fixes K at 8-bit/group=64 and carries V's bits/group from the tag.
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "wildcard arm is the correct fallthrough for unsupported arch/quant variants; exhaustive expansion would require updating on every new variant"
-    )]
     pub fn mixed_params(&self) -> Option<(i32, i32, i32, i32)> {
-        match self {
-            KvQuant::Mixed {
-                k_bits,
-                v_bits,
-                k_group_size,
-                v_group_size,
-            } => Some((
-                i32::from(*k_bits),
-                i32::from(*v_bits),
-                i32::from(*k_group_size),
-                i32::from(*v_group_size),
-            )),
-            KvQuant::RotK {
-                v_bits,
-                v_group_size,
-            } => Some((8, i32::from(*v_bits), 64, i32::from(*v_group_size))),
-            _ => None,
-        }
+        self.descriptor().mixed_params
     }
 
     /// Per-side `(k_bits, v_bits)` **codebook** width an estimator can use to
@@ -1304,39 +1009,8 @@ impl KvQuant {
     /// `None` for the same side. `side_stores_agree_with_approx_code_bits` pins
     /// the two together.
     #[must_use]
-    #[allow(
-        clippy::match_same_arms,
-        reason = "explicit per-variant bit widths read clearer than collapsing arms"
-    )]
     pub fn approx_code_bits(&self) -> (u32, u32) {
-        match self {
-            KvQuant::None => (16, 16),
-            KvQuant::K8V8 => (8, 8),
-            KvQuant::K8V4 => (8, 4),
-            KvQuant::Planar => (8, 4),
-            KvQuant::Planar3 => (8, 3),
-            KvQuant::PlanarK => (4, 16),
-            KvQuant::Mixed { k_bits, v_bits, .. } => (u32::from(*k_bits), u32::from(*v_bits)),
-            KvQuant::RotK { v_bits, .. } => (8, u32::from(*v_bits)),
-            KvQuant::K8VTurbo3 | KvQuant::K8VTurbo3Tcq => (8, 3),
-            KvQuant::K8VTurbo2 | KvQuant::K8VTurbo2Tcq => (8, 2),
-            KvQuant::TurboSym3 => (3, 3),
-            KvQuant::TurboSym4 => (4, 4),
-            KvQuant::Iso3 => (8, 3),
-            KvQuant::Iso4 => (8, 4),
-            KvQuant::Iso3Sym => (3, 3),
-            KvQuant::Iso4Sym => (4, 4),
-            KvQuant::IsoKOnly3 => (3, 16),
-            KvQuant::IsoKOnly4 => (4, 16),
-            KvQuant::Rotor3 => (8, 3),
-            KvQuant::Rotor4 => (8, 4),
-            KvQuant::Rotor3Sym => (3, 3),
-            KvQuant::Rotor4Sym => (4, 4),
-            KvQuant::RotorKOnly3 => (3, 16),
-            KvQuant::RotorKOnly4 => (4, 16),
-            KvQuant::RotorK3Asym { v_bits, .. } => (3, u32::from(*v_bits)),
-            KvQuant::RotorK4Asym { v_bits, .. } => (4, u32::from(*v_bits)),
-        }
+        self.descriptor().code_bits
     }
 
     /// The packed-store layout each axis of this codec writes, as
@@ -1365,61 +1039,11 @@ impl KvQuant {
     /// * **`RotK`'s K group is fixed at 64**, by `MixedKvState::new_rotated` —
     ///   the codec carries no `k_group_size` field to read it from.
     ///
-    /// Exhaustive on purpose, same reasoning as the decode predicates: a new
-    /// variant must state where its bytes go rather than inherit a layout.
-    #[allow(
-        clippy::match_same_arms,
-        reason = "the families that share a layout are kept in separate arms so the \
-                  match reads as a per-family record of where each codec's bytes go; merging \
-                  them would collapse q8/turbo/affine into one unlabelled arm"
-    )]
+    /// The answer is the codec's row in `KvQuant::descriptor`
+    /// (`quant_descriptor.rs`), one exhaustive match: a new variant does not
+    /// compile until its row states this fact.
     fn side_stores(self) -> (Option<SideStore>, Option<SideStore>) {
-        match self {
-            KvQuant::None => (None, None),
-            KvQuant::K8V4 => (Some(SideStore::Q8), Some(SideStore::Turbo)),
-            KvQuant::K8V8 => (Some(SideStore::Q8), Some(SideStore::Q8)),
-            KvQuant::Planar | KvQuant::Planar3 => (Some(SideStore::Q8), Some(SideStore::Planar)),
-            KvQuant::PlanarK => (Some(SideStore::Planar), None),
-            KvQuant::Mixed {
-                k_group_size,
-                v_group_size,
-                ..
-            } => (
-                Some(SideStore::Affine {
-                    group: u32::from(k_group_size),
-                }),
-                Some(SideStore::Affine {
-                    group: u32::from(v_group_size),
-                }),
-            ),
-            KvQuant::RotK { v_group_size, .. } => (
-                Some(SideStore::Affine { group: 64 }),
-                Some(SideStore::Affine {
-                    group: u32::from(v_group_size),
-                }),
-            ),
-            KvQuant::K8VTurbo3
-            | KvQuant::K8VTurbo3Tcq
-            | KvQuant::K8VTurbo2
-            | KvQuant::K8VTurbo2Tcq => (Some(SideStore::Q8), Some(SideStore::Turbo)),
-            KvQuant::TurboSym3 | KvQuant::TurboSym4 => {
-                (Some(SideStore::Turbo), Some(SideStore::Turbo))
-            }
-            // V-only iso: K is affine q8_0, V is the CPU-block iso form.
-            KvQuant::Iso3 | KvQuant::Iso4 => (Some(SideStore::Q8), Some(SideStore::IsoBlocks)),
-            KvQuant::Iso3Sym | KvQuant::Iso4Sym => {
-                (Some(SideStore::IsoRing), Some(SideStore::IsoRing))
-            }
-            KvQuant::IsoKOnly3 | KvQuant::IsoKOnly4 => (Some(SideStore::IsoRing), None),
-            KvQuant::Rotor3 | KvQuant::Rotor4 => (Some(SideStore::Q8), Some(SideStore::Rotor)),
-            KvQuant::Rotor3Sym | KvQuant::Rotor4Sym => {
-                (Some(SideStore::Rotor), Some(SideStore::Rotor))
-            }
-            KvQuant::RotorKOnly3 | KvQuant::RotorKOnly4 => (Some(SideStore::Rotor), None),
-            KvQuant::RotorK3Asym { .. } | KvQuant::RotorK4Asym { .. } => {
-                (Some(SideStore::Rotor), Some(SideStore::Turbo))
-            }
-        }
+        self.descriptor().side_stores
     }
 
     /// Estimate the resident KV bytes per layer this codec holds for a
@@ -1696,86 +1320,50 @@ pub fn validate_mixed_side(side: char, bits: u8, group_size: u16) -> Result<(), 
 
 impl std::fmt::Display for KvQuant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            KvQuant::None => f.write_str("none"),
-            KvQuant::K8V4 => f.write_str("k8v4"),
-            KvQuant::K8V8 => f.write_str("k8v8"),
-            KvQuant::Planar => f.write_str("planar"),
-            KvQuant::Mixed {
-                k_bits,
-                v_bits,
-                k_group_size,
-                v_group_size,
-            } => write!(f, "mixed_k{k_bits}g{k_group_size}_v{v_bits}g{v_group_size}"),
-            KvQuant::RotK {
-                v_bits,
-                v_group_size,
-            } => write!(f, "rot_k_v{v_bits}g{v_group_size}"),
-            KvQuant::K8VTurbo3 => f.write_str("k8vturbo3"),
-            KvQuant::TurboSym3 => f.write_str("tsym3"),
-            KvQuant::TurboSym4 => f.write_str("tsym4"),
-            KvQuant::Planar3 => f.write_str("planar3"),
-            KvQuant::PlanarK => f.write_str("planar_k"),
-            KvQuant::K8VTurbo2 => f.write_str("k8vturbo2"),
-            KvQuant::Iso3 => f.write_str("iso3"),
-            KvQuant::Iso4 => f.write_str("iso4"),
-            KvQuant::Rotor3 => f.write_str("rotor3"),
-            KvQuant::Rotor4 => f.write_str("rotor4"),
-            KvQuant::K8VTurbo3Tcq => f.write_str("k8vturbo3tcq"),
-            KvQuant::K8VTurbo2Tcq => f.write_str("k8vturbo2tcq"),
-            KvQuant::Iso3Sym => f.write_str("iso3_sym"),
-            KvQuant::Iso4Sym => f.write_str("iso4_sym"),
-            KvQuant::IsoKOnly3 => f.write_str("k_iso3"),
-            KvQuant::IsoKOnly4 => f.write_str("k_iso4"),
-            KvQuant::Rotor3Sym => f.write_str("rotor3_sym"),
-            KvQuant::Rotor4Sym => f.write_str("rotor4_sym"),
-            KvQuant::RotorKOnly3 => f.write_str("k_rotor3"),
-            KvQuant::RotorKOnly4 => f.write_str("k_rotor4"),
-            // Payload-bearing asymmetric rotor-K variants.
-            KvQuant::RotorK3Asym {
-                v_bits,
-                v_group_size,
-            } => write!(f, "rotor_k_3_asym_v{v_bits}_g{v_group_size}"),
-            KvQuant::RotorK4Asym {
-                v_bits,
-                v_group_size,
-            } => write!(f, "rotor_k_4_asym_v{v_bits}_g{v_group_size}"),
-        }
+        self.descriptor().spelling.fmt(f)
     }
 }
+
+/// The `kv_quant` label the metrics DB groups rows by. No codec override is
+/// `auto`. `Mixed` and `RotK` drop their widths, so each family has one label.
+/// Every other codec is its `Display` spelling.
+#[must_use]
+pub fn kv_quant_label(kv: Option<KvQuant>) -> String {
+    let Some(quant) = kv else {
+        return "auto".into();
+    };
+    if let KvQuant::Mixed { .. } = quant {
+        return "mixed".into();
+    }
+    if let KvQuant::RotK { .. } = quant {
+        return "rot_k".into();
+    }
+    quant.to_string()
+}
+
+/// The spellings `FromStr` accepts beside the `Display` text of each codec.
+const KV_QUANT_ALIASES: [(&str, KvQuant); 4] = [
+    ("bf16", KvQuant::None),
+    ("f16", KvQuant::None),
+    ("rotor_v_3", KvQuant::Rotor3),
+    ("rotor_v_4", KvQuant::Rotor4),
+];
 
 impl std::str::FromStr for KvQuant {
     type Err = KvQuantParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "none" | "bf16" | "f16" => return Ok(KvQuant::None),
-            "k8v4" => return Ok(KvQuant::K8V4),
-            "k8v8" => return Ok(KvQuant::K8V8),
-            "planar" => return Ok(KvQuant::Planar),
-            "planar3" => return Ok(KvQuant::Planar3),
-            "k8vturbo3" => return Ok(KvQuant::K8VTurbo3),
-            "tsym3" => return Ok(KvQuant::TurboSym3),
-            "tsym4" => return Ok(KvQuant::TurboSym4),
-            "planar_k" => return Ok(KvQuant::PlanarK),
-            "k8vturbo2" => return Ok(KvQuant::K8VTurbo2),
-            "iso3" => return Ok(KvQuant::Iso3),
-            "iso4" => return Ok(KvQuant::Iso4),
-            "rotor3" | "rotor_v_3" => return Ok(KvQuant::Rotor3),
-            "rotor4" | "rotor_v_4" => return Ok(KvQuant::Rotor4),
-            "k8vturbo3tcq" => return Ok(KvQuant::K8VTurbo3Tcq),
-            "k8vturbo2tcq" => return Ok(KvQuant::K8VTurbo2Tcq),
-            // Symmetric / K-only iso variants.
-            "iso3_sym" => return Ok(KvQuant::Iso3Sym),
-            "iso4_sym" => return Ok(KvQuant::Iso4Sym),
-            "k_iso3" => return Ok(KvQuant::IsoKOnly3),
-            "k_iso4" => return Ok(KvQuant::IsoKOnly4),
-            // Symmetric / K-only rotor variants.
-            "rotor3_sym" => return Ok(KvQuant::Rotor3Sym),
-            "rotor4_sym" => return Ok(KvQuant::Rotor4Sym),
-            "k_rotor3" => return Ok(KvQuant::RotorKOnly3),
-            "k_rotor4" => return Ok(KvQuant::RotorKOnly4),
-            _ => {}
+        let fixed = ALL_KV_QUANTS.iter().copied().find(
+            |quant| matches!(quant.descriptor().spelling, Spelling::Fixed(text) if text == s),
+        );
+        let found = fixed.or_else(|| {
+            KV_QUANT_ALIASES
+                .iter()
+                .find(|(name, _)| *name == s)
+                .map(|&(_, quant)| quant)
+        });
+        if let Some(quant) = found {
+            return Ok(quant);
         }
 
         // Withdrawn codecs: reject by name, and name the successor. Not an
@@ -1939,3 +1527,11 @@ fn parse_kv_side(spec: &str, expected_prefix: char) -> Result<(u8, u16), String>
 #[cfg(test)]
 #[path = "quant_tests.rs"]
 mod quant_tests;
+
+#[cfg(test)]
+#[path = "quant_from_str_tests.rs"]
+mod quant_from_str_tests;
+
+#[cfg(test)]
+#[path = "codec_facts_tests.rs"]
+pub(crate) mod codec_facts_tests;

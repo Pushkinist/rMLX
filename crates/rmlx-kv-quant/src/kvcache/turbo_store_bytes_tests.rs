@@ -223,10 +223,7 @@ fn turbo_store_geometry_follows_the_codec_bit_width() {
                     let s = v.as_ref().expect("turbo V store");
                     turbo_geometry!(s)
                 }
-                other => panic!(
-                    "{name}: not a turbo storage variant: {}",
-                    super::helpers::storage_variant_name(other)
-                ),
+                other => panic!("{name}: not a turbo storage variant: {}", other.view().name),
             };
 
             let want_bits = expected_bits(&name);
@@ -346,7 +343,7 @@ fn the_tcq_spellings_set_the_flag_and_still_write_the_plain_bytes() {
                 | KvStorage::K8VTurbo2Tcq { v, .. } => v.as_ref().expect("turbo V store").use_tcq,
                 other => panic!(
                     "{quant}: not an asymmetric turbo storage variant: {}",
-                    super::helpers::storage_variant_name(other)
+                    other.view().name
                 ),
             };
             assert_eq!(

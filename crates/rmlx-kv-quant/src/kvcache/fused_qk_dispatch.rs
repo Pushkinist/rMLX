@@ -135,7 +135,8 @@ impl KvCache {
     /// table, codec has a GPU encoder available, (for rotor codecs) the QJL
     /// toggle is OFF (the kernel does not consume the QJL residual — see
     /// `rotor_fused_qk_msl.rs`), the bf16 K mirror is seeded, the storage
-    /// variant carries a `max_seq`, and the step does not overflow it.
+    /// variant is in the fused-QK table, and the step does not overflow the
+    /// cache's `max_seq`.
     ///
     /// **Every** fall-through emits a `trace!` naming the gate that rejected
     /// (`fused_qk: skipped`, field `reason`); the `head_dim` gate also carries
@@ -220,8 +221,8 @@ impl KvCache {
             self.trace_fused_qk_skip("no bf16 K mirror to seed the shadow");
             return Ok(None);
         }
-        let Some(max_seq) = self.storage_max_seq_for_fused_qk() else {
-            self.trace_fused_qk_skip("storage variant carries no max_seq");
+        let Some(max_seq) = self.fused_qk_max_seq() else {
+            self.trace_fused_qk_skip("storage variant not in the fused-QK table");
             return Ok(None);
         };
 
@@ -464,21 +465,20 @@ impl KvCache {
         );
     }
 
-    /// Look up the `max_seq` the shadow should be sized to, taken from the
-    /// active storage variant.
+    /// The `max_seq` the shadow should be sized to: the cache's own, when the
+    /// active storage variant is one the kernel table admits.
     ///
     /// One arm per codec the kernel table admits — anything else returns
-    /// `None` and the caller falls through. Rotating (SWA) variants are among
-    /// those: they carry no `max_seq` the shadow could be sized to.
-    fn storage_max_seq_for_fused_qk(&self) -> Option<i32> {
+    /// `None` and the caller falls through.
+    pub(super) fn fused_qk_max_seq(&self) -> Option<i32> {
         use crate::storage::KvStorage;
         let m = match &self.storage {
-            KvStorage::K8V4 { max_seq, .. } => *max_seq,
-            KvStorage::K8V8 { max_seq, .. } => *max_seq,
-            KvStorage::TurboSym3 { max_seq, .. } => *max_seq,
-            KvStorage::TurboSym4 { max_seq, .. } => *max_seq,
-            KvStorage::RotorKAsym3 { max_seq, .. } => *max_seq,
-            KvStorage::RotorKAsym4 { max_seq, .. } => *max_seq,
+            KvStorage::K8V4 { .. }
+            | KvStorage::K8V8 { .. }
+            | KvStorage::TurboSym3 { .. }
+            | KvStorage::TurboSym4 { .. }
+            | KvStorage::RotorKAsym3 { .. }
+            | KvStorage::RotorKAsym4 { .. } => self.max_seq,
             _ => return None,
         };
         if m <= 0 {

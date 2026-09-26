@@ -18,10 +18,18 @@
     clippy::unnecessary_wraps
 )]
 
-use rmlx_core::error::Result;
+use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device, Dtype};
 
 use super::alloc::PageSlab;
+
+/// The deep clone of a paged store that holds pages. The page slabs have no
+/// copy, and a clone without the pages would lose the tokens its cache counts.
+fn refuse_clone_with_pages(store: &str, pages: usize) -> Error {
+    Error::Quant(format!(
+        "{store} holds {pages} page(s): a paged KV store with pages cannot be deep-cloned"
+    ))
+}
 
 // ── PagedKStorage ─────────────────────────────────────────────────────────────
 
@@ -239,6 +247,25 @@ impl PagedKStorage {
             n % self.page_tokens
         };
     }
+
+    /// A new empty store with the same page geometry.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Quant` when the store holds pages.
+    pub fn try_deep_clone(&self) -> Result<Self> {
+        if !self.block_table.is_empty() {
+            return Err(refuse_clone_with_pages(
+                "PagedKStorage",
+                self.block_table.len(),
+            ));
+        }
+        Ok(Self::new(
+            self.max_seq,
+            self.page_tokens,
+            self.codes.pool.len(),
+        ))
+    }
 }
 
 // ── PagedVStorage (TurboQuant V4) ─────────────────────────────────────────────
@@ -451,6 +478,26 @@ impl PagedVStorage {
         } else {
             n % self.page_tokens
         };
+    }
+
+    /// A new empty store with the same page geometry.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Quant` when the store holds pages.
+    pub fn try_deep_clone(&self) -> Result<Self> {
+        if !self.block_table.is_empty() {
+            return Err(refuse_clone_with_pages(
+                "PagedVStorage",
+                self.block_table.len(),
+            ));
+        }
+        Ok(Self::new(
+            self.max_seq,
+            self.page_tokens,
+            self.codes.pool.len(),
+            self.bits,
+        ))
     }
 }
 
@@ -697,6 +744,25 @@ impl PagedPlanarVStorage {
         } else {
             n % self.page_tokens
         };
+    }
+
+    /// A new empty store with the same page geometry.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Quant` when the store holds pages.
+    pub fn try_deep_clone(&self) -> Result<Self> {
+        if !self.block_table.is_empty() {
+            return Err(refuse_clone_with_pages(
+                "PagedPlanarVStorage",
+                self.block_table.len(),
+            ));
+        }
+        Ok(Self::new(
+            self.max_seq,
+            self.page_tokens,
+            self.codes.pool.len(),
+        ))
     }
 }
 

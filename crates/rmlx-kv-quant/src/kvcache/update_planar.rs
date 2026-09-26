@@ -19,8 +19,7 @@ use super::KvCache;
 impl KvCache {
     #[allow(
         clippy::unreachable,
-        reason = "storage variant is guaranteed by the `match &self.storage` dispatch in \
-                  KvCache::update() (KvStorage::Planar arm); \
+        reason = "storage variant is guaranteed by the KvStorage::view_mut arm that names this entry (KvStorage::Planar); \
                   mismatch is a construction-time BUG"
     )]
     #[allow(
@@ -31,22 +30,16 @@ impl KvCache {
         clippy::unwrap_used,
         reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
     )]
-    pub(super) fn update_planar(
+    pub(crate) fn update_planar(
         &mut self,
         new_k: &Array,
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
-        let KvStorage::Planar {
-            k,
-            v,
-            max_seq,
-            bits,
-        } = &mut self.storage
-        else {
+        let max_seq = self.max_seq;
+        let KvStorage::Planar { k, v, bits, .. } = &mut self.storage else {
             unreachable!("storage mismatch: expected Planar");
         };
-        let max_seq = *max_seq;
         let v_bits = *bits;
 
         if self.decode_fp16_k.is_some() {
@@ -125,16 +118,16 @@ impl KvCache {
         clippy::indexing_slicing,
         reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
     )]
-    pub(super) fn update_planar_k(
+    pub(crate) fn update_planar_k(
         &mut self,
         new_k: &Array,
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
-        let KvStorage::PlanarK { k, max_seq } = &mut self.storage else {
+        let max_seq = self.max_seq;
+        let KvStorage::PlanarK { k, .. } = &mut self.storage else {
             return Err(storage_mismatch("PlanarK", &self.storage));
         };
-        let max_seq = *max_seq;
 
         // Warm-TTFT bf16 K seed path, the shortcut every mirror-fed
         // `update_<codec>` takes.
@@ -189,14 +182,15 @@ impl KvCache {
         clippy::wildcard_enum_match_arm,
         reason = "the arm reads one storage variant; every other is the same construction-time mismatch and needs no per-variant spelling"
     )]
-    pub(super) fn exit_prefill_planar(
+    pub(crate) fn exit_prefill_planar(
         &mut self,
         k_full: &Array,
         v_full: &Array,
         device: Device,
+        _total_seq: i32,
     ) -> Result<()> {
         let (max_seq, v_bits) = match &self.storage {
-            KvStorage::Planar { max_seq, bits, .. } => (*max_seq, *bits),
+            KvStorage::Planar { bits, .. } => (self.max_seq, *bits),
             _ => return Err(storage_mismatch("Planar", &self.storage)),
         };
         let new_shape = k_full.shape();
@@ -252,9 +246,10 @@ impl KvCache {
         clippy::wildcard_enum_match_arm,
         reason = "the arm reads one storage variant; every other is the same construction-time mismatch and needs no per-variant spelling"
     )]
-    pub(super) fn exit_prefill_planar_k(
+    pub(crate) fn exit_prefill_planar_k(
         &mut self,
         k_full: &Array,
+        _v_full: &Array,
         device: Device,
         total_seq: i32,
     ) -> Result<()> {
@@ -263,7 +258,7 @@ impl KvCache {
             "exit_prefill PlanarK: bulk-quantizing K (planar4); V stays bf16"
         );
         let max_seq = match &self.storage {
-            KvStorage::PlanarK { max_seq, .. } => *max_seq,
+            KvStorage::PlanarK { .. } => self.max_seq,
             _ => return Err(storage_mismatch("PlanarK", &self.storage)),
         };
         let new_shape = k_full.shape();

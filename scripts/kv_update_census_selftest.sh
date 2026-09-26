@@ -11,9 +11,9 @@
 #   finished on the day the scan broke. A case that asserted only "non-zero"
 #   would pass against a producer that had stopped finding any site at all.
 #
-#   Nothing here hard-codes a figure the producer derives from the real tree:
-#   the fixtures are their own trees, and each case states the number its own
-#   planted source implies.
+#   The fixtures are their own trees, and each case states the number its own
+#   planted source implies. The last case pins the real tree's figures
+#   exactly, so a change that moves one re-pins it in the same change.
 #
 # EXIT CODES
 #   0  every case produced the expected exit code and output
@@ -47,10 +47,10 @@ build_tree() { # build_tree ROOT
     mkdir -p "${root}/$(dirname "${STORAGE_REL}")" "${root}/$(dirname "${UPDATE_REL}")"
     cat >"${root}/${STORAGE_REL}" <<'EOF'
 pub enum KvStorage {
-    Alpha { k: Option<QuantK>, v: Option<QuantV>, max_seq: i32 },
-    Beta { k: Option<QuantK>, v: Option<QuantV>, max_seq: i32, bits: u8 },
-    Gamma { k: Option<QuantK>, max_seq: i32 },
-    Delta { state: MixedKvState, max_seq: i32 },
+    Alpha { k: Option<QuantK>, v: Option<QuantV> },
+    Beta { k: Option<QuantK>, v: Option<QuantV>, bits: u8 },
+    Gamma { k: Option<QuantK> },
+    Delta { state: MixedKvState },
 }
 
 pub fn resident(s: &KvStorage) -> usize {
@@ -142,6 +142,8 @@ build_tree "${T}"
 check "clean tree counts its sites" "${T}" 0 "^match-sites 3$" match-sites --threshold 2
 check "clean tree: all three force a touch" "${T}" 0 "^forcing-sites 3$" match-sites --threshold 2
 check "clean tree: per-file count" "${T}" 0 "^file ${UPDATE_REL} 1$" match-sites --threshold 2
+check "clean tree: no subset site" "${T}" 0 "^subset-sites 0$" match-sites --threshold 2
+check "clean tree: no table site" "${T}" 0 "^table-sites 0$" match-sites --threshold 2
 
 # 1 — a fourth site planted in a file the producer was not told about. A
 # hand-written file list would miss it.
@@ -206,6 +208,8 @@ pub fn dispatch(s: &KvStorage) -> usize {
 }
 EOF
 check "a one-variant match is under the bar" "${T}" 0 "^match-sites 2$" match-sites --threshold 2
+check "a catch-all match under the bar is a subset site" "${T}" 0 \
+    "^subset ${UPDATE_REL}:2 kind=wildcard enum=KvStorage variants=1$" match-sites --threshold 2
 
 # 5 — the bar is derived from the enum, not fixed. Each of the three planted
 # sites names all four variants, so it is in at a bar of 3 and out at a bar of
@@ -235,7 +239,7 @@ check "a two-variant site sits at the derived bar" "${T}" 0 "^match-sites 4$" ma
 
 # 5b — a fifth variant moves the bar to 3, and the two-variant site drops out
 # with it. The bar and the count move together, which a fixed bar cannot do.
-sed -i.bak 's/    Delta { state: MixedKvState, max_seq: i32 },/    Delta { state: MixedKvState, max_seq: i32 },\n    Epsilon { k: Option<QuantK>, max_seq: i32 },/' \
+sed -i.bak 's/    Delta { state: MixedKvState },/    Delta { state: MixedKvState },\n    Epsilon { k: Option<QuantK> },/' \
     "${T}/${STORAGE_REL}"
 check "a fifth variant moves the derived bar" "${T}" 0 "^enum KvStorage variants=5 threshold=3$" match-sites
 check "the two-variant site drops below the moved bar" "${T}" 0 "^match-sites 3$" match-sites
@@ -259,7 +263,7 @@ check "a tree with no crates directory" "${T}" 2 "unavailable: crates" match-sit
 # 8 — a crates directory holding no variant reference.
 T="${WORK}/nomention"; build_tree "${T}"
 rm -rf "${T}/crates/rmlx-kv-quant/src/kvcache"
-printf 'pub enum KvStorage { Alpha { k: Option<QuantK>, v: Option<QuantV>, max_seq: i32 } }\n' \
+printf 'pub enum KvStorage { Alpha { k: Option<QuantK>, v: Option<QuantV> } }\n' \
     >"${T}/${STORAGE_REL}"
 printf 'pub enum KvQuant { One }\n' >"${T}/${QUANT_REL}"
 check "no file names a variant" "${T}" 2 "unavailable: no source file" match-sites --threshold 2
@@ -278,7 +282,7 @@ check "an unterminated block is a refusal" "${T}" 2 "unavailable: .*update.rs" m
 
 # 11 — the shape census. Four planted variants, one per shape class.
 T="${WORK}/shapes"; build_tree "${T}"
-check "shape census: two slots and max_seq" "${T}" 0 "^shape kv_slots 1$" variants
+check "shape census: two slots" "${T}" 0 "^shape kv_slots 1$" variants
 check "shape census: a scalar knob beside the slots" "${T}" 0 "^shape kv_slots_plus 1$" variants
 check "shape census: K only" "${T}" 0 "^shape k_only 1$" variants
 check "shape census: state the shape cannot reach" "${T}" 0 "^shape other 1$" variants
@@ -287,7 +291,7 @@ check "shape census: the shared-shape total" "${T}" 0 "^shape store_slots_total 
 # 12 — a variant that grows a field outside the scalar-knob set leaves the
 # shared shape. It must not be folded in quietly.
 T="${WORK}/newfield"; build_tree "${T}"
-sed -i.bak 's/    Beta { k: Option<QuantK>, v: Option<QuantV>, max_seq: i32, bits: u8 },/    Beta { k: Option<QuantK>, v: Option<QuantV>, max_seq: i32, table: Table },/' \
+sed -i.bak 's/    Beta { k: Option<QuantK>, v: Option<QuantV>, bits: u8 },/    Beta { k: Option<QuantK>, v: Option<QuantV>, table: Table },/' \
     "${T}/${STORAGE_REL}"
 check "a state field leaves the shared shape" "${T}" 0 "^shape store_slots_total 2$" variants
 
@@ -350,7 +354,7 @@ T="${WORK}/norefs"; build_tree "${T}"
 printf 'pub fn nothing() -> usize { 1 }\n' >"${T}/${UPDATE_REL}"
 check "a file naming no variant is a refusal" "${T}" 2 "unavailable: .*names no" refs --file "${UPDATE_REL}"
 
-# 18 — a wide match planted in a test file. The producer measures production
+# 19a — a wide match planted in a test file. The producer measures production
 # source, so it is not counted; `--include-tests` is the one way to see it.
 # Without this case the test-file exclusion could be disabled and every other
 # case here would stay green.
@@ -367,6 +371,812 @@ fn probe(s: &KvStorage) -> usize {
 EOF
 check "a site in a test file is not counted" "${T}" 0 "^match-sites 3$" match-sites --threshold 2
 check "--include-tests counts the test file's site" "${T}" 0 "^match-sites 4$" match-sites --threshold 2 --include-tests
+
+# 20 — a match over `Option<KvQuant>` names the variants inside `Some(..)`, and
+# its `None` arm is a variant of `Option`, not a catch-all. It forces a touch.
+T="${WORK}/option"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+pub fn label_of(q: Option<KvQuant>) -> usize {
+    match q {
+        Some(KvQuant::One) => 1,
+        Some(KvQuant::Two) => 2,
+        Some(KvQuant::Three) => 3,
+        Some(KvQuant::Four) => 4,
+        None => 0,
+    }
+}
+EOF
+check "a match over Option<KvQuant> is a site" "${T}" 0 "^match-sites 4$" match-sites --threshold 2
+check "its None arm is not a catch-all" "${T}" 0 "^forcing-sites 4$" match-sites --threshold 2
+
+# 21 — the `Self::` spelling inside `impl KvStorage` and `impl KvQuant`. The
+# compiler forces a touch on each of these exactly as on a `KvStorage::` arm.
+# Two enums, so a producer that resolves `Self` to one fixed enum fails one of
+# the two.
+T="${WORK}/selfpath"; build_tree "${T}"
+cat >>"${T}/${STORAGE_REL}" <<'EOF'
+
+impl KvStorage {
+    pub fn reset(&mut self) -> usize {
+        match self {
+            Self::Alpha { .. } => 1,
+            Self::Beta { .. } => 2,
+            Self::Gamma { .. } => 3,
+            Self::Delta { .. } => 4,
+        }
+    }
+}
+EOF
+cat >>"${T}/${QUANT_REL}" <<'EOF'
+
+impl KvQuant {
+    pub fn index(&self) -> usize {
+        match self {
+            Self::One => 1,
+            Self::Two => 2,
+            Self::Three => 3,
+            Self::Four => 4,
+        }
+    }
+}
+EOF
+check "Self:: arms in both impls are two more sites" "${T}" 0 "^match-sites 5$" match-sites --threshold 2
+check "the storage impl's Self:: site is its file's second" "${T}" 0 "^file ${STORAGE_REL} 2$" match-sites --threshold 2
+check "the quant impl's Self:: site is its file's second" "${T}" 0 "^file ${QUANT_REL} 2$" match-sites --threshold 2
+
+# 22 — an alias import. `S::Alpha` is `KvStorage::Alpha` to the compiler.
+T="${WORK}/alias"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+use KvStorage as S;
+
+pub fn aliased(s: &S) -> usize {
+    match s {
+        S::Alpha { .. } => 1,
+        S::Beta { .. } => 2,
+        S::Gamma { .. } => 3,
+        S::Delta { .. } => 4,
+    }
+}
+EOF
+check "an alias-path match is a site" "${T}" 0 "^match-sites 4$" match-sites --threshold 2
+
+# 23 — a glob import. The arms name bare variants.
+T="${WORK}/glob"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+use KvQuant::*;
+
+pub fn bare(q: KvQuant) -> usize {
+    match q {
+        One => 1,
+        Two => 2,
+        Three => 3,
+        Four => 4,
+    }
+}
+EOF
+check "a glob-import match is a site" "${T}" 0 "^match-sites 4$" match-sites --threshold 2
+
+# 24 — the per-codec dispatch moved one level down, into an enum a KvStorage
+# variant holds. A new codec with a new store still forces a touch there, so a
+# restructure that only moves the sites must not read as a reduction.
+T="${WORK}/slotenum"; build_tree "${T}"
+sed -i.bak 's/    Alpha { k: Option<QuantK>, v: Option<QuantV> },/    Alpha { k: KSlot, v: Option<QuantV> },/' \
+    "${T}/${STORAGE_REL}"
+cat >>"${T}/${STORAGE_REL}" <<'EOF'
+
+pub enum KSlot {
+    Q8(QuantK),
+    Turbo(QuantKTurbo),
+    Iso(QuantIso),
+    Rotor(QuantRotor),
+}
+
+pub fn slot_bytes(k: &KSlot) -> usize {
+    match k {
+        KSlot::Q8(_) => 1,
+        KSlot::Turbo(_) => 2,
+        KSlot::Iso(_) => 3,
+        KSlot::Rotor(_) => 4,
+    }
+}
+EOF
+check "an enum a KvStorage field holds joins the codec enums" "${T}" 0 "^enum KSlot variants=4 threshold=2$" match-sites --threshold 2
+check "a match over an enum a KvStorage field holds is a site" "${T}" 0 "^match-sites 4$" match-sites --threshold 2
+
+# 25 — a forcing site rewritten as a `matches!` subset. The count drops and a
+# new codec now defaults to `false` there with no compile error. The producer
+# must report the subset, so the drop cannot read as a reduction.
+T="${WORK}/matchesmacro"; build_tree "${T}"
+cat >"${T}/${QUANT_REL}" <<'EOF'
+pub enum KvQuant {
+    One,
+    Two,
+    Three,
+    Four,
+}
+
+pub fn low(q: KvQuant) -> bool {
+    matches!(q, KvQuant::One | KvQuant::Two)
+}
+EOF
+check "a matches! subset is not a match site" "${T}" 0 "^match-sites 2$" match-sites --threshold 2
+check "a matches! subset is reported as a subset site" "${T}" 0 "^subset-sites 1$" match-sites --threshold 2
+
+# 26 — a string spelling table. Its patterns are string literals and its arm
+# bodies name every variant. A new codec that is missing here compiles and
+# cannot be parsed.
+T="${WORK}/spelling"; build_tree "${T}"
+cat >>"${T}/${QUANT_REL}" <<'EOF'
+
+pub fn parse(s: &str) -> Option<KvQuant> {
+    match s {
+        "one" => Some(KvQuant::One),
+        "two" => Some(KvQuant::Two),
+        "three" => Some(KvQuant::Three),
+        "four" => Some(KvQuant::Four),
+        _ => None,
+    }
+}
+EOF
+check "a spelling table is not a match site" "${T}" 0 "^match-sites 3$" match-sites --threshold 2
+check "a spelling table is reported as a table site" "${T}" 0 "^table-sites 1$" match-sites --threshold 2
+
+# 27 — negative control for case 21: `Self::` arms inside `impl OtherEnum`,
+# whose variant names are the same as the storage enum's. `Self` is
+# `OtherEnum` there, so the match is not a site.
+T="${WORK}/otherimpl"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+pub enum OtherEnum {
+    Alpha,
+    Beta,
+    Gamma,
+    Delta,
+}
+
+impl OtherEnum {
+    pub fn index(&self) -> usize {
+        match self {
+            Self::Alpha => 1,
+            Self::Beta => 2,
+            Self::Gamma => 3,
+            Self::Delta => 4,
+        }
+    }
+}
+EOF
+check "Self:: arms in an impl of another enum are not a site" "${T}" 0 "^match-sites 3$" match-sites --threshold 2
+
+# 28 — negative control for case 22: an alias of an unrelated enum, spelling
+# the storage enum's variant names.
+T="${WORK}/otheralias"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+use OtherEnum as S;
+
+pub fn aliased(s: &S) -> usize {
+    match s {
+        S::Alpha => 1,
+        S::Beta => 2,
+        S::Gamma => 3,
+        S::Delta => 4,
+    }
+}
+EOF
+check "an alias of an unrelated enum is not a site" "${T}" 0 "^match-sites 3$" match-sites --threshold 2
+
+# 29 — negative control for case 24: the same slot enum and the same match,
+# but no KvStorage field holds the enum. Only a held enum joins the codec
+# enums, so a producer that counted every enum in the tree fails here.
+T="${WORK}/freeenum"; build_tree "${T}"
+cat >>"${T}/${STORAGE_REL}" <<'EOF'
+
+pub enum KSlot {
+    Q8(QuantK),
+    Turbo(QuantKTurbo),
+    Iso(QuantIso),
+    Rotor(QuantRotor),
+}
+
+pub fn slot_bytes(k: &KSlot) -> usize {
+    match k {
+        KSlot::Q8(_) => 1,
+        KSlot::Turbo(_) => 2,
+        KSlot::Iso(_) => 3,
+        KSlot::Rotor(_) => 4,
+    }
+}
+EOF
+check "an enum no KvStorage field holds is not a site" "${T}" 0 "^match-sites 3$" match-sites --threshold 2
+
+# 30 — a held enum that two files define. The producer cannot tell which one
+# the field holds, and says so rather than pick one.
+T="${WORK}/twoslots"; build_tree "${T}"
+sed -i.bak 's/    Alpha { k: Option<QuantK>, v: Option<QuantV> },/    Alpha { k: KSlot, v: Option<QuantV> },/' \
+    "${T}/${STORAGE_REL}"
+printf 'pub enum KSlot { Q8(QuantK), Turbo(QuantKTurbo) }\n' >>"${T}/${STORAGE_REL}"
+printf 'pub enum KSlot { Iso(QuantIso) }\n' >>"${T}/${UPDATE_REL}"
+check "a held enum defined twice is a refusal" "${T}" 2 "unavailable: enum KSlot, held by a KvStorage field, is defined in 2 files" \
+    match-sites --threshold 2
+
+# 31 — negative control for case 25: a `matches!` over an enum that is not a
+# codec enum is not a subset site.
+T="${WORK}/othermatches"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+pub fn low(o: Other) -> bool {
+    matches!(o, Other::Alpha | Other::Beta)
+}
+EOF
+check "a matches! over a non-codec enum is not a subset site" "${T}" 0 "^subset-sites 0$" match-sites --threshold 2
+
+# 32 — negative control for case 26: a string table whose bodies name one of
+# the four variants, under the bar. It is a lookup, not a spelling table.
+T="${WORK}/shorttable"; build_tree "${T}"
+cat >>"${T}/${QUANT_REL}" <<'EOF'
+
+pub fn parse_one(s: &str) -> Option<KvQuant> {
+    match s {
+        "one" => Some(KvQuant::One),
+        "uno" => Some(KvQuant::One),
+        _ => None,
+    }
+}
+EOF
+check "a string table under the bar is not a table site" "${T}" 0 "^table-sites 0$" match-sites --threshold 2
+
+# 33 — a storage enum with a `None` variant, a glob import of it, and a match
+# over `Option<..>` with a `None =>` arm, in one file. The bare-variant match
+# reaches the bar of 3 only through its `None` arm, so the glob must resolve
+# that `None` to the storage enum. The `Option<KvQuant>` match is one site, not
+# one per enum. The `Option<KvStorage>` match names two variants inside
+# `Some(..)`; its `None` is `Option`'s, and reads as a third variant only in a
+# producer that ignores the `Some(..)` beside it.
+T="${WORK}/globnone"; build_tree "${T}"
+sed -i.bak 's/    Delta { state: MixedKvState },/    Delta { state: MixedKvState },\n    None {},/' \
+    "${T}/${STORAGE_REL}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+use KvStorage::*;
+
+pub fn bare(s: &KvStorage) -> usize {
+    match s {
+        Alpha { .. } => 1,
+        Beta { .. } => 2,
+        None { .. } => 0,
+        _ => 9,
+    }
+}
+
+pub fn label_of(q: Option<KvQuant>) -> usize {
+    match q {
+        Some(KvQuant::One) => 1,
+        Some(KvQuant::Two) => 2,
+        Some(KvQuant::Three) => 3,
+        Some(KvQuant::Four) => 4,
+        None => 0,
+    }
+}
+
+pub fn maybe(s: Option<&KvStorage>) -> usize {
+    match s {
+        Some(Alpha { .. }) => 1,
+        Some(Beta { .. }) => 2,
+        Some(_) => 3,
+        None => 0,
+    }
+}
+EOF
+check "a glob-imported None variant counts toward the bar" "${T}" 0 \
+    "^site ${UPDATE_REL}:[0-9]+ enum=KvStorage variants=3 arms=4 catch_all=yes$" match-sites
+check "Option's None beside Some(..) is not a storage variant" "${T}" 0 "^match-sites 5$" match-sites
+check "the Option<KvQuant> match counts once and forces a touch" "${T}" 0 "^forcing-sites 4$" match-sites
+
+# 34 — negative control for the table-key rule: a match over a non-codec
+# enum whose arms return every quant variant. Its keys are enum paths, not
+# string literals or constants, so it is not a spelling table.
+T="${WORK}/enumtable"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+pub fn quant_of(o: Other) -> KvQuant {
+    match o {
+        Other::Alpha => KvQuant::One,
+        Other::Beta => KvQuant::Two,
+        Other::Gamma => KvQuant::Three,
+        Other::Delta => KvQuant::Four,
+    }
+}
+EOF
+check "a non-codec match returning every variant is not a table site" "${T}" 0 "^table-sites 0$" match-sites --threshold 2
+
+# 35 — a block in the scrutinee, here a closure body. The arm block is the
+# next block, and the site is still found.
+T="${WORK}/scrutineeblock"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+pub fn picked(q: Option<KvQuant>) -> usize {
+    match q.unwrap_or_else(|| {
+        KvQuant::One
+    }) {
+        KvQuant::One => 1,
+        KvQuant::Two => 2,
+        KvQuant::Three => 3,
+        KvQuant::Four => 4,
+    }
+}
+EOF
+check "a match whose scrutinee holds a block is a site" "${T}" 0 "^match-sites 4$" match-sites --threshold 2
+
+# 36 — a `match` whose arm block the reader cannot find is a refusal, never a
+# site dropped in silence.
+T="${WORK}/noarms"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+pub fn broken(q: Option<KvQuant>) -> usize {
+    let n = match q.map(|v| { v });
+    n
+}
+EOF
+check "a match with no arm block is a refusal" "${T}" 2 "unavailable: .*update.rs: match at line [0-9]+: no block holds its arms" \
+    match-sites --threshold 2
+
+# 37 — `ref` and `mut` bindings are catch-alls. The site stays, and it no
+# longer forces a touch.
+T="${WORK}/refbinding"; build_tree "${T}"
+cat >"${T}/${UPDATE_REL}" <<'EOF'
+pub fn dispatch(s: &KvStorage) -> usize {
+    match s {
+        KvStorage::Alpha { .. } => 1,
+        KvStorage::Beta { .. } => 2,
+        ref other => fallback(other),
+    }
+}
+
+pub fn owned(s: KvStorage) -> usize {
+    match s {
+        KvStorage::Alpha { .. } => 1,
+        KvStorage::Beta { .. } => 2,
+        mut other => fallback(&mut other),
+    }
+}
+
+fn update_alpha() -> usize {
+    1
+}
+EOF
+check "a ref binding is a catch-all" "${T}" 0 \
+    "^site ${UPDATE_REL}:2 enum=KvStorage variants=2 arms=3 catch_all=yes$" match-sites --threshold 2
+check "a mut binding is a catch-all" "${T}" 0 \
+    "^site ${UPDATE_REL}:10 enum=KvStorage variants=2 arms=3 catch_all=yes$" match-sites --threshold 2
+
+# 38 — a tuple of catch-alls is a catch-all, so a tuple match under the bar
+# is a subset site. A tuple that holds a variant is not a catch-all.
+T="${WORK}/tuplewild"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+pub fn pair(q: KvQuant, flag: bool) -> usize {
+    match (q, flag) {
+        (KvQuant::One, _) => 1,
+        (_, _) => 0,
+    }
+}
+EOF
+check "a tuple of catch-alls makes a subset site" "${T}" 0 \
+    "^subset ${UPDATE_REL}:[0-9]+ kind=wildcard enum=KvQuant variants=1$" match-sites --threshold 2
+check "the tuple match is the one subset site" "${T}" 0 "^subset-sites 1$" match-sites --threshold 2
+
+# 39 — a variant named only in an arm guard is not an arm of the match. The
+# `matches!` in the guard is one subset site; the bool match is not a second.
+T="${WORK}/guard"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+pub fn gated(flag: bool, q: KvQuant) -> usize {
+    match flag {
+        true if matches!(q, KvQuant::One) => 1,
+        _ => 0,
+    }
+}
+EOF
+check "a variant in a guard is not an arm" "${T}" 0 "^subset-sites 1$" match-sites --threshold 2
+check "the guard's matches! is the subset site" "${T}" 0 \
+    "^subset ${UPDATE_REL}:[0-9]+ kind=matches enum=KvQuant variants=1$" match-sites --threshold 2
+
+# 40 — variants imported by name, `use KvQuant::{One, Two, Three, Four}`.
+T="${WORK}/namedimport"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+use crate::quant::KvQuant::{One, Two, Three, Four};
+
+pub fn bare(q: KvQuant) -> usize {
+    match q {
+        One => 1,
+        Two => 2,
+        Three => 3,
+        Four => 4,
+    }
+}
+EOF
+check "a match over variants imported by name is a site" "${T}" 0 "^match-sites 4$" match-sites --threshold 2
+
+# 41 — a `type` alias, and `self as` inside a use tree, both name the enum.
+T="${WORK}/typealias"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+type S = crate::storage::KvStorage;
+use crate::quant::KvQuant::{self as Q, *};
+
+pub fn aliased(s: &S) -> usize {
+    match s {
+        S::Alpha { .. } => 1,
+        S::Beta { .. } => 2,
+        S::Gamma { .. } => 3,
+        S::Delta { .. } => 4,
+    }
+}
+
+pub fn quant(q: Q) -> usize {
+    match q {
+        Q::One => 1,
+        Q::Two => 2,
+        Q::Three => 3,
+        Q::Four => 4,
+    }
+}
+EOF
+check "a type alias and a use-tree self alias are sites" "${T}" 0 "^match-sites 5$" match-sites --threshold 2
+
+# 42 — negative control: a `type` alias of an unrelated enum.
+T="${WORK}/othertype"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+type S = OtherEnum;
+
+pub fn aliased(s: &S) -> usize {
+    match s {
+        S::Alpha => 1,
+        S::Beta => 2,
+        S::Gamma => 3,
+        S::Delta => 4,
+    }
+}
+EOF
+check "a type alias of an unrelated enum is not a site" "${T}" 0 "^match-sites 3$" match-sites --threshold 2
+
+# 43 — `if let`, `while let` and `let … else` over a codec variant are subset
+# sites: a new codec compiles there and takes the other branch.
+T="${WORK}/iflet"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+pub fn lets(q: KvQuant, s: &KvStorage, mut it: Iter) -> usize {
+    if let KvQuant::One = q {
+        return 1;
+    }
+    while let Some(KvStorage::Beta { .. }) = it.next() {}
+    let KvStorage::Gamma { .. } = s else {
+        return 0;
+    };
+    let plain = 3;
+    if let Some(x) = it.next() {
+        return x;
+    }
+    plain
+}
+EOF
+check "if let, while let and let-else are subset sites" "${T}" 0 "^subset-sites 3$" match-sites --threshold 2
+check "a let-else is a subset site of its own kind" "${T}" 0 \
+    "^subset ${UPDATE_REL}:31 kind=iflet enum=KvStorage variants=1$" match-sites --threshold 2
+
+# 44 — the rewrite from `matches!` (case 25) to `if let` keeps the figure.
+T="${WORK}/rewrite"; build_tree "${T}"
+cat >"${T}/${QUANT_REL}" <<'EOF'
+pub enum KvQuant {
+    One,
+    Two,
+    Three,
+    Four,
+}
+
+pub fn low(q: KvQuant) -> bool {
+    if let KvQuant::One | KvQuant::Two = q { true } else { false }
+}
+EOF
+check "a matches! rewritten as if let keeps the subset figure" "${T}" 0 "^subset-sites 1$" match-sites --threshold 2
+
+# 45 — negative control: `if let` over a non-codec enum.
+T="${WORK}/otherlet"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+pub fn other(o: Other) -> usize {
+    if let Other::Alpha = o {
+        return 1;
+    }
+    0
+}
+EOF
+check "an if let over a non-codec enum is not a subset site" "${T}" 0 "^subset-sites 0$" match-sites --threshold 2
+
+# 46 — a codec descriptor row built from a struct-update base is refused (exit
+# 1), and the reason names the line of the `..`. The row compiles and inherits
+# every fact it does not state; the site figure is the same with or without it.
+T="${WORK}/descbase"; build_tree "${T}"
+cat >>"${T}/${QUANT_REL}" <<'EOF'
+pub struct Facts { a: u8, b: u8 }
+const BASE: Facts = Facts { a: 0, b: 0 };
+impl KvQuant {
+    fn descriptor(&self) -> Facts {
+        match self {
+            KvQuant::One => Facts { a: 1, b: 1 },
+            KvQuant::Two => Facts { a: 2, b: 2 },
+            KvQuant::Three => Facts { a: 3, ..BASE },
+            KvQuant::Four => Facts { a: 4, b: 4 },
+        }
+    }
+}
+EOF
+check "a struct-update base in the descriptor is refused, with its line" "${T}" 1 \
+    "^refused: ${QUANT_REL}:23 a struct-update base \(\`\.\.<expr>\`\) in KvQuant::descriptor" match-sites
+
+# 47 — the same refusal when the base copies another codec's row on a line of
+# its own.
+T="${WORK}/descrow"; build_tree "${T}"
+cat >>"${T}/${QUANT_REL}" <<'EOF'
+pub struct Facts { a: u8, b: u8 }
+impl KvQuant {
+    fn descriptor(&self) -> Facts {
+        match self {
+            KvQuant::One => Facts { a: 1, b: 1 },
+            KvQuant::Two => Facts { a: 2, b: 2 },
+            KvQuant::Three => Facts {
+                a: 3,
+                ..KvQuant::One.descriptor()
+            },
+            KvQuant::Four => Facts { a: 4, b: 4 },
+        }
+    }
+}
+EOF
+check "a descriptor row copied from another codec's row is refused" "${T}" 1 \
+    "^refused: ${QUANT_REL}:24 a struct-update base" match-sites
+
+# 48 — negative control: rest patterns (tuple and slice) and a commented-out base inside the
+# descriptor, and struct-update bases in an `impl Other` descriptor and in a
+# free fn, are not refused. The descriptor is one more site.
+T="${WORK}/descok"; build_tree "${T}"
+cat >>"${T}/${QUANT_REL}" <<'EOF'
+pub struct Facts { a: u8, b: u8 }
+const BASE: Facts = Facts { a: 0, b: 0 };
+impl KvQuant {
+    fn descriptor(&self) -> Facts {
+        let (first, ..) = (1u8, 2u8, 3u8);
+        let [_, .., _last] = [1u8, 2u8, 3u8];
+        match self {
+            KvQuant::One => Facts { a: first, b: 1 },
+            KvQuant::Two => Facts { a: 2, b: 2 },
+            // Not `Facts { a: 3, ..BASE }`: each row states each fact.
+            KvQuant::Three => Facts { a: 3, b: 3 },
+            KvQuant::Four => Facts { a: 4, b: 4 },
+        }
+    }
+}
+impl Other {
+    fn descriptor(&self) -> Facts {
+        Facts { a: 0, ..BASE }
+    }
+}
+pub fn not_the_descriptor() -> Facts {
+    Facts { a: 9, ..BASE }
+}
+EOF
+check "rest patterns, comments and bases outside the descriptor are not refused" "${T}" 0 \
+    "^match-sites 4$" match-sites --threshold 2
+
+# 49 — a descriptor arm that copies another codec's row and patches it is
+# refused (exit 1), with the line of the arm: its body is not a literal of the
+# return type, so it states one fact and inherits the rest.
+T="${WORK}/desccopy"; build_tree "${T}"
+cat >>"${T}/${QUANT_REL}" <<'EOF'
+pub struct Facts { a: u8, b: u8 }
+impl KvQuant {
+    fn descriptor(&self) -> Facts {
+        match self {
+            KvQuant::One => Facts { a: 1, b: 1 },
+            KvQuant::Two => Facts { a: 2, b: 2 },
+            KvQuant::Three => {
+                let mut row = KvQuant::One.descriptor();
+                row.a = 3;
+                row
+            }
+            KvQuant::Four => Facts { a: 4, b: 4 },
+        }
+    }
+}
+EOF
+check "a descriptor arm that copies and patches another row is refused, with its line" "${T}" 1 \
+    "^refused: ${QUANT_REL}:22 an arm whose body is not a \`Facts \{ \.\. \}\` literal" match-sites
+
+# 50 — a `..` in `KvStorage::view` is refused (exit 1), with its line. The arm
+# compiles when a field is added to its variant, so the new field is left out
+# of every read-only site the view serves.
+T="${WORK}/viewrest"; build_tree "${T}"
+cat >>"${T}/${STORAGE_REL}" <<'EOF'
+impl KvStorage {
+    fn view(&self) -> View<'_> {
+        match self {
+            KvStorage::Alpha { k, v } => View([Some(k), Some(v)]),
+            KvStorage::Beta { k, .. } => View([Some(k), None]),
+            KvStorage::Gamma { k } => View([Some(k), None]),
+            KvStorage::Delta { state } => View([Some(state), None]),
+        }
+    }
+}
+EOF
+check "a rest pattern in KvStorage::view is refused, with its line" "${T}" 1 \
+    "^refused: ${STORAGE_REL}:20 a rest pattern \(\`\.\.\`\) in KvStorage::view; each arm must bind every field" match-sites
+
+# 51 — negative control: a view whose arms bind every field passes and is one
+# more site; a `..` in a comment inside it, in an `impl Other` view and in a
+# free `view` fn is not refused. `view-fns` counts the one view it read.
+T="${WORK}/viewok"; build_tree "${T}"
+cat >>"${T}/${STORAGE_REL}" <<'EOF'
+impl KvStorage {
+    fn view(&self) -> View<'_> {
+        match self {
+            KvStorage::Alpha { k, v } => View([Some(k), Some(v)]),
+            // Not `KvStorage::Beta { k, .. }`: every field is bound.
+            KvStorage::Beta { k, v, bits: _ } => View([Some(k), Some(v)]),
+            KvStorage::Gamma { k } => View([Some(k), None]),
+            KvStorage::Delta { state } => View([Some(state), None]),
+        }
+    }
+}
+impl Other {
+    fn view(&self) -> usize {
+        let Other { a, .. } = self;
+        a
+    }
+}
+pub fn view(s: &Other) -> usize {
+    let Other { a, .. } = s;
+    a
+}
+EOF
+check "a view that binds every field passes, and a .. outside it is not refused" "${T}" 0 \
+    "^view-fns 1$" match-sites --threshold 2
+check "the view is one more site" "${T}" 0 "^match-sites 4$" match-sites --threshold 2
+
+# 52 — a slot bound to `_v` in `KvStorage::view` is refused (exit 1), with its
+# line: only the scalar knobs may be discarded, so a field name outside that
+# fixed set fails closed. The fixture's first variant is renamed `IsoV3`.
+T="${WORK}/viewdiscard"; build_tree "${T}"
+for f in "${STORAGE_REL}" "${UPDATE_REL}"; do
+    sed -e 's/Alpha/IsoV3/g' "${T}/${f}" >"${T}/${f}.new" && mv "${T}/${f}.new" "${T}/${f}"
+done
+cat >>"${T}/${STORAGE_REL}" <<'EOF'
+impl KvStorage {
+    fn view(&self) -> View<'_> {
+        match self {
+            KvStorage::IsoV3 { k, v: _v } => View([Some(k), None]),
+            KvStorage::Beta { k, v, bits: _ } => View([Some(k), Some(v)]),
+            KvStorage::Gamma { k } => View([Some(k), None]),
+            KvStorage::Delta { state } => View([Some(state), None]),
+        }
+    }
+}
+EOF
+check "a slot discarded in KvStorage::view is refused, with its line" "${T}" 1 \
+    "^refused: ${STORAGE_REL}:19 the field \`v\` bound to \`_\` in KvStorage::view" match-sites
+
+# 53 — a `..` in `KvStorage::view_mut` is refused (exit 1), with its line and
+# the fn's name: the mutating view has the same binding rule as the read-only
+# one, so a new field is not left out of `reset`, `truncate_to` or the clear.
+T="${WORK}/viewmutrest"; build_tree "${T}"
+cat >>"${T}/${STORAGE_REL}" <<'EOF'
+impl KvStorage {
+    fn view_mut(&mut self) -> ViewMut<'_> {
+        match self {
+            KvStorage::Alpha { k, v } => ViewMut([Some(k), Some(v)]),
+            KvStorage::Beta { k, .. } => ViewMut([Some(k), None]),
+            KvStorage::Gamma { k } => ViewMut([Some(k), None]),
+            KvStorage::Delta { state } => ViewMut([Some(state), None]),
+        }
+    }
+}
+EOF
+check "a rest pattern in KvStorage::view_mut is refused, with its line" "${T}" 1 \
+    "^refused: ${STORAGE_REL}:20 a rest pattern \(\`\.\.\`\) in KvStorage::view_mut; each arm must bind every field" match-sites
+
+# 54 — a slot bound to `_v` in `KvStorage::view_mut` is refused (exit 1), with
+# its line.
+T="${WORK}/viewmutdiscard"; build_tree "${T}"
+for f in "${STORAGE_REL}" "${UPDATE_REL}"; do
+    sed -e 's/Alpha/IsoV3/g' "${T}/${f}" >"${T}/${f}.new" && mv "${T}/${f}.new" "${T}/${f}"
+done
+cat >>"${T}/${STORAGE_REL}" <<'EOF'
+impl KvStorage {
+    fn view_mut(&mut self) -> ViewMut<'_> {
+        match self {
+            KvStorage::IsoV3 { k, v: _v } => ViewMut([Some(k), None]),
+            KvStorage::Beta { k, v, bits: _ } => ViewMut([Some(k), Some(v)]),
+            KvStorage::Gamma { k } => ViewMut([Some(k), None]),
+            KvStorage::Delta { state } => ViewMut([Some(state), None]),
+        }
+    }
+}
+EOF
+check "a slot discarded in KvStorage::view_mut is refused, with its line" "${T}" 1 \
+    "^refused: ${STORAGE_REL}:19 the field \`v\` bound to \`_\` in KvStorage::view_mut" match-sites
+
+# 55 — negative control: a `view` and a `view_mut` that bind every field pass
+# and count two view fns.
+T="${WORK}/viewmutok"; build_tree "${T}"
+cat >>"${T}/${STORAGE_REL}" <<'EOF'
+impl KvStorage {
+    fn view(&self) -> View<'_> {
+        match self {
+            KvStorage::Alpha { k, v } => View([Some(k), Some(v)]),
+            KvStorage::Beta { k, v, bits: _ } => View([Some(k), Some(v)]),
+            KvStorage::Gamma { k } => View([Some(k), None]),
+            KvStorage::Delta { state } => View([Some(state), None]),
+        }
+    }
+    fn view_mut(&mut self) -> ViewMut<'_> {
+        match self {
+            KvStorage::Alpha { k, v } => ViewMut([Some(k), Some(v)]),
+            KvStorage::Beta { k, v, bits: _ } => ViewMut([Some(k), Some(v)]),
+            KvStorage::Gamma { k } => ViewMut([Some(k), None]),
+            KvStorage::Delta { state } => ViewMut([Some(state), None]),
+        }
+    }
+}
+EOF
+check "a view and a view_mut that bind every field pass and count two view fns" "${T}" 0 \
+    "^view-fns 2$" match-sites --threshold 2
+
+# 56 — the real tree, pinned exactly. One run, every figure compared, and
+# each failure prints the figure beside its pin and what to do.
+REAL_PINS="match-sites=7 forcing-sites=7 subset-sites=154 table-sites=1 descriptor-fns=1 view-fns=2"
+pin_advice() { # pin_advice NAME
+    local list="python3 scripts/kv_update_census.py match-sites | grep"
+    case "$1" in
+    match-sites | forcing-sites)
+        echo "A new codec must touch N sites; a change that moves N states the new N in its commit message. List them: ${list} '^site'. Set the pin in the real-tree case of scripts/kv_update_census_selftest.sh."
+        ;;
+    subset-sites)
+        echo "A subset site is a matches!, if-let or catch-all match over a codec enum; a new codec compiles there and silently takes false or the catch-all arm. List them: ${list} '^subset'. If the change is correct, set the pin in the real-tree case of scripts/kv_update_census_selftest.sh and name the site you added or removed in the commit message; if not, write an exhaustive match with no \`_\` arm."
+        ;;
+    descriptor-fns)
+        echo "The census reads KvQuant::descriptor (an \`fn descriptor\` inside \`impl KvQuant\`) to refuse a row that does not state its own facts. 0 means the fn was renamed or moved out of the impl, and the refusal checks nothing. Rename it back, or teach DESCRIPTOR_FN in scripts/kv_update_census.py the new name."
+        ;;
+    view-fns)
+        echo "The census reads KvStorage::view and KvStorage::view_mut (an \`fn view\` and an \`fn view_mut\` inside \`impl KvStorage\`) to refuse an arm with a \`..\` rest pattern. Fewer than 2 means a fn was renamed or moved out of the impl, and its refusal checks nothing. Rename it back, or teach VIEW_FN in scripts/kv_update_census.py the new name."
+        ;;
+    table-sites)
+        echo "A table site is a match keyed by string literals or constants whose arms name the codec variants; a new codec compiles there and cannot be parsed. List them: ${list} '^table'. If the change is correct, set the pin in the real-tree case of scripts/kv_update_census_selftest.sh and name the site you added or removed in the commit message."
+        ;;
+    esac
+}
+real_out="$(run "${REPO_ROOT}" match-sites)"
+real_rc=$?
+for pin in ${REAL_PINS}; do
+    name="${pin%%=*}"
+    want="${pin#*=}"
+    if [ "${real_rc}" -ne 0 ]; then
+        echo "FAIL  real tree: the census exited ${real_rc}, so ${name} is unmeasured, pinned ${want}." >&2
+        echo "${real_out}" | tail -3 >&2
+        failures=$((failures + 1))
+        continue
+    fi
+    got="$(sed -n "s/^${name} \([0-9][0-9]*\)$/\1/p" <<<"${real_out}")"
+    if [ "${got}" != "${want}" ]; then
+        echo "FAIL  real tree: ${name} is ${got:-missing}, pinned ${want}. $(pin_advice "${name}")" >&2
+        failures=$((failures + 1))
+        continue
+    fi
+    echo "ok    real tree: ${name} ${got}  (pinned)"
+done
 
 if [ "${failures}" -gt 0 ]; then
     echo >&2

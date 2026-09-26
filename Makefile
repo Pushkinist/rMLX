@@ -460,10 +460,10 @@ check-doc-size: ## CI gate: fail naming every docs/**/*.md over 40 KiB or carryi
 check-doc-size-selftest: ## CI gate: recall test for check-doc-size over throwaway git trees, each case asserting its exit code and reason
 	@bash scripts/check_doc_size_selftest.sh
 
-kv-update-census: ## advisory: the KV structural figures — variant shapes, match sites a new codec must touch, per-variant update bodies (non-failing)
+kv-update-census: ## advisory: the KV structural figures — variant shapes, match sites a new codec must touch, subset sites (matches!, if-let, catch-all) and table sites, per-variant update bodies (non-failing)
 	@python3 scripts/kv_update_census.py all
 
-kv-update-census-selftest: ## CI gate: recall test for the KV structural figures over planted fixtures — a hidden site, a collapsed one, and a tree that cannot be measured
+kv-update-census-selftest: ## CI gate: recall test for the KV structural figures over planted fixtures — a hidden site, a collapsed one, a tree that cannot be measured — and the real tree's figures, pinned exactly (a failing pin prints the figure, the pin and what to do)
 	@bash scripts/kv_update_census_selftest.sh
 
 check-no-inline-tests: ## CI gate: fail if any non-test.rs file has inline #[cfg(test)] mod tests { ... }

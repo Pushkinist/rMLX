@@ -545,10 +545,10 @@ fn rotor_decode_does_not_copy_the_v_mirror() {
             vec![B, MULTI_HEAD.kv_h, 0, HEAD_DIM],
             0,
         )),
-        max_seq: MAX_SEQ,
     };
     let cache = KvCache::from_storage(
         storage,
+        MAX_SEQ,
         KvQuant::RotorKOnly3,
         0,
         0,

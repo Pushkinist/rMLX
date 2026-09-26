@@ -128,6 +128,30 @@ mod rotor_flash_dispatch_tests;
 #[path = "store_bytes_tests.rs"]
 mod store_bytes_tests;
 
+#[cfg(test)]
+#[path = "mirror_poison_tests.rs"]
+mod mirror_poison_tests;
+
+#[cfg(test)]
+#[path = "deep_clone_digest_tests.rs"]
+mod deep_clone_digest_tests;
+
+#[cfg(test)]
+#[path = "max_seq_accessor_tests.rs"]
+mod max_seq_accessor_tests;
+
+#[cfg(test)]
+#[path = "storage_view_tests.rs"]
+mod storage_view_tests;
+
+#[cfg(test)]
+#[path = "storage_view_mut_tests.rs"]
+mod storage_view_mut_tests;
+
+#[cfg(test)]
+#[path = "max_seq_paths_tests.rs"]
+mod max_seq_paths_tests;
+
 // Byte-level pin on the rotor storage layer: what every rotor spelling writes
 // into its packed store, and what the attention reads back from it.
 #[cfg(test)]
@@ -174,6 +198,11 @@ mod rotor_qjl_store_gate_tests;
 #[cfg(test)]
 #[path = "rollback_tests.rs"]
 mod rollback_tests;
+
+// `update` and `exit_prefill` take their entry from the storage variant.
+#[cfg(test)]
+#[path = "entry_routing_tests.rs"]
+mod entry_routing_tests;
 
 pub use core::KvCache;
 pub use fused_qk_dispatch::fused_qk_total_dispatch_count;

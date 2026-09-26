@@ -193,10 +193,7 @@ fn rotor_store_geometry_follows_the_codec_bit_width() {
                     let s = k.as_ref().expect("rotor K store");
                     rotor_geometry!(s)
                 }
-                other => panic!(
-                    "{name}: not a rotor storage variant: {}",
-                    super::helpers::storage_variant_name(other)
-                ),
+                other => panic!("{name}: not a rotor storage variant: {}", other.view().name),
             };
 
             let want_bits = if name.contains('3') { 3_u8 } else { 4_u8 };

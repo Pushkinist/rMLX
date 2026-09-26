@@ -102,14 +102,16 @@ use rmlx_kv_ssd::cache_seed;
 /// Wraps [`rmlx_kv_ssd::cache_seed`] with the one argument that crate cannot
 /// produce: the per-layer codec vector `kv_quant` resolves to under this
 /// build's layer policy. That policy lives in [`crate::kv_cache`], above the
-/// SSD crate, so the vector is supplied from here — from the same
-/// [`kv_layer_quants`] every arch builds its caches from.
+/// SSD crate, so the vector is supplied from here — the nominal vector from
+/// [`kv_layer_quants`].
 ///
-/// Take `n_layers` rather than the vector so there is exactly one place in this
-/// crate that expands it. A caller that built the vector for its caches and a
-/// caller that only knows `n_layers` then cannot seed differently, which is the
-/// failure that matters here: a push seeded differently from the query does not
-/// return a wrong answer, it returns a cache that silently never hits.
+/// Take `n_layers` rather than the vector so the push side and the query side
+/// cannot fold different vectors: both call this function, and it expands the
+/// nominal vector itself. A push seeded differently from the query does not
+/// return a wrong answer, it returns a cache that silently never hits. The seed
+/// folds the nominal vector for every arch, also for an arch that builds every
+/// layer uniformly ([`ArchPromptCache::with_uniform_layers`]); the vector a
+/// hydrate builds its layers at is [`ArchPromptCache::layer_quants`].
 ///
 /// `shares_kv` is the same input for the same reason — it selects the
 /// boundary-layer codec, so two callers on one arch that disagree about it
@@ -673,9 +675,10 @@ impl<E: PromptCacheEntry> PromptCache<E> {
     /// that value and recomputes the promoted entry's block hashes from it, so
     /// the retried `find_best_prefix` matches what was just hydrated. `kv_quant`
     /// is the request's codec, used to verify the block header and tag the
-    /// reconstructed entry, and `dispatch_policy` is the kernel-path policy the
-    /// reconstructed caches must carry — the source holds none of the three
-    /// itself, because it is shared by every model of the arch and every
+    /// reconstructed entry, `layer_quants` the codec the arch builder gives each
+    /// layer at that `kv_quant` ([`ArchPromptCache::layer_quants`]), and `dispatch_policy` the
+    /// kernel-path policy the reconstructed caches must carry — the source
+    /// holds none of the four itself, because it is shared by every model of the arch and every
     /// hot-swapped codec.
     ///
     /// Corruption (bad read / metadata mismatch / missing file) is handled
@@ -688,6 +691,7 @@ impl<E: PromptCacheEntry> PromptCache<E> {
         prompt_ids: &[u32],
         seed: u64,
         kv_quant: KvQuant,
+        layer_quants: &[KvQuant],
         dispatch_policy: DispatchPolicy,
     ) -> Option<usize> {
         // A zero-slot cache can admit nothing, so hydrating would read a `.kvb`
@@ -701,7 +705,7 @@ impl<E: PromptCacheEntry> PromptCache<E> {
         // Take the source out so the `&self` borrow during `hydrate` does not
         // conflict with the `&mut self` `push` below; put it back after.
         let source = self.ssd.take()?;
-        let result = source.hydrate(prompt_ids, seed, kv_quant, dispatch_policy);
+        let result = source.hydrate(prompt_ids, seed, kv_quant, layer_quants, dispatch_policy);
         self.ssd = Some(source);
         match result {
             Ok(Some(entry)) => {
@@ -1056,6 +1060,28 @@ impl MissReason {
     }
 }
 
+/// Deep-clone the caches of a post-prefill snapshot. `None` when one clone
+/// refuses (for example a paged cache that holds pages): the refusal is one
+/// `debug!` event, and the arch stores no entry.
+pub(crate) fn snapshot_clone<T>(
+    arch: &'static str,
+    items: &[T],
+    clone: impl Fn(&T) -> Result<T>,
+) -> Option<Vec<T>> {
+    match items.iter().map(clone).collect::<Result<Vec<T>>>() {
+        Ok(cloned) => Some(cloned),
+        Err(e) => {
+            tracing::debug!(
+                arch,
+                branch = MissReason::DeepCloneErr.label(),
+                error = %e,
+                "prompt-cache snapshot: deep clone refused, entry not stored"
+            );
+            None
+        }
+    }
+}
+
 /// Outcome of a prompt-cache consume decision.
 ///
 /// Read-only — the engine that produces this never `push`es. The arch maps each
@@ -1199,6 +1225,10 @@ pub(crate) struct ArchPromptCache<E: PromptCacheEntry> {
     /// [`request_cache_seed`]: the per-layer codec mixture depends on it, and
     /// the query seed has to expand the same mixture the arch's push side does.
     shares_kv: bool,
+    /// The arch builds every layer at the requested codec and does not apply
+    /// the boundary promotion. Set with [`Self::with_uniform_layers`]; read
+    /// only by [`Self::layer_quants`].
+    uniform_layers: bool,
     /// The actual prompt cache. `None` until `ensure_prompt_cache` builds it.
     inner: std::sync::Mutex<Option<PromptCache<E>>>,
     /// SSD-tier attach parameters (set once by `attach_ssd_tier`); replayed on
@@ -1215,8 +1245,29 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
             arch_name,
             policy,
             shares_kv,
+            uniform_layers: false,
             inner: std::sync::Mutex::new(None),
             attach: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Declare that the arch builds every layer at the requested codec, with
+    /// no boundary promotion. [`Self::layer_quants`] then returns the uniform
+    /// vector.
+    pub(crate) const fn with_uniform_layers(mut self) -> Self {
+        self.uniform_layers = true;
+        self
+    }
+
+    /// The per-layer codec vector this arch builds its caches from at
+    /// `kv_quant`: [`kv_layer_quants`], or the uniform vector for an arch built
+    /// with [`Self::with_uniform_layers`]. A hydrated layer gets the same codec
+    /// the arch built it at.
+    pub(crate) fn layer_quants(&self, n_layers: usize, kv_quant: KvQuant) -> Vec<KvQuant> {
+        if self.uniform_layers {
+            vec![kv_quant; n_layers]
+        } else {
+            kv_layer_quants(n_layers, kv_quant, self.shares_kv)
         }
     }
 
@@ -1445,6 +1496,7 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
             self.shares_kv,
             model_sig,
         );
+        let layer_quants = self.layer_quants(n_layers, kv_quant);
         let policy = self.policy;
         let arch = self.arch_name;
         // Kernel-path policy for the caches a hydrate would reconstruct. The
@@ -1472,6 +1524,7 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
                 cache,
                 prompt_ids,
                 kv_quant,
+                &layer_quants,
                 seed,
                 dispatch_policy,
             )
@@ -1498,6 +1551,7 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
         cache: &mut PromptCache<E>,
         prompt_ids: &[u32],
         kv_quant: KvQuant,
+        layer_quants: &[KvQuant],
         seed: u64,
         dispatch_policy: DispatchPolicy,
     ) -> Consumed<E> {
@@ -1507,7 +1561,7 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
         let mut raw_match = cache.find_best_prefix(prompt_ids, seed);
         if raw_match.is_none()
             && cache
-                .hydrate_from_ssd(prompt_ids, seed, kv_quant, dispatch_policy)
+                .hydrate_from_ssd(prompt_ids, seed, kv_quant, layer_quants, dispatch_policy)
                 .is_some()
         {
             raw_match = cache.find_best_prefix(prompt_ids, seed);
@@ -1678,4 +1732,4 @@ where
 
 #[cfg(test)]
 #[path = "prompt_cache_tests.rs"]
-mod prompt_cache_tests;
+pub(crate) mod prompt_cache_tests;
