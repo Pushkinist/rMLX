@@ -538,7 +538,7 @@ enum Cmd {
         /// Device to run inference on: "cpu" or "gpu".
         /// Defaults to "gpu". Prefill runs in chunks, so a long prompt does not
         /// hit the Metal watchdog timeout. Use --device cpu to run on the CPU.
-        #[arg(long)]
+        #[arg(long, value_parser = ["cpu", "gpu"])]
         device: Option<String>,
         #[arg(long, help = KV_QUANT_HELP, long_help = KV_QUANT_LONG_HELP)]
         kv_quant: Option<String>,
@@ -936,7 +936,7 @@ enum Cmd {
         /// Device to run inference on: "cpu" or "gpu".
         /// Defaults to "gpu". Prefill runs in chunks, so a long prompt does not hit the
         /// Metal watchdog timeout.
-        #[arg(long, default_value = "gpu")]
+        #[arg(long, default_value = "gpu", value_parser = ["cpu", "gpu"])]
         device: String,
         #[arg(
             long,
@@ -1026,7 +1026,7 @@ enum Cmd {
         #[arg(long, value_name = "PATH")]
         output: Option<PathBuf>,
         /// Device: "cpu" or "gpu" (default "gpu").
-        #[arg(long, default_value = "gpu")]
+        #[arg(long, default_value = "gpu", value_parser = ["cpu", "gpu"])]
         device: String,
     },
     /// Print arch + quant info for a snapshot, no inference.
@@ -1041,7 +1041,7 @@ enum Cmd {
         /// Defaults to "gpu". Prefill runs in chunks, so a long prompt does not hit the
         /// Metal watchdog timeout.
         /// Only relevant when --probe-forward or --probe-smoke is set.
-        #[arg(long, default_value = "gpu")]
+        #[arg(long, default_value = "gpu", value_parser = ["cpu", "gpu"])]
         device: String,
         /// Run a single-token forward pass and print top-1 token + max logit.
         /// Token 2 (BOS) is used. Requires the model to be Gemma4ForConditionalGeneration.
@@ -1179,7 +1179,7 @@ enum Cmd {
         #[arg(long, value_name = "N")]
         prompt_tokens: Option<u32>,
         /// Device: "cpu" or "gpu". Defaults to "gpu".
-        #[arg(long, default_value = "gpu")]
+        #[arg(long, default_value = "gpu", value_parser = ["cpu", "gpu"])]
         device: String,
         /// Number of tokens to generate. Default 32. Visible alias `--gen-tokens`.
         #[arg(long, visible_alias = "gen-tokens", default_value_t = 32)]
@@ -1369,7 +1369,7 @@ enum Cmd {
         #[arg(long, value_name = "N")]
         prompt_tokens: Option<u32>,
         /// Device: "cpu" or "gpu".
-        #[arg(long, default_value = "gpu")]
+        #[arg(long, default_value = "gpu", value_parser = ["cpu", "gpu"])]
         device: String,
         /// Tokens to generate per run. Visible alias `--gen-tokens`.
         #[arg(long, visible_alias = "gen-tokens", default_value_t = 128)]
@@ -1600,7 +1600,7 @@ enum EvalCmd {
         #[arg(long, default_value = "")]
         corpus: String,
         /// Device: "cpu" or "gpu". Default "gpu".
-        #[arg(long, default_value = "gpu")]
+        #[arg(long, default_value = "gpu", value_parser = ["cpu", "gpu"])]
         device: String,
         /// Cap the number of tokens fed to the scorer. `0` = use the whole
         /// corpus. Defaults to `0`; the wikitext-2 harness sets this when

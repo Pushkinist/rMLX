@@ -333,3 +333,38 @@ fn draft_block_size_above_the_ceiling_is_refused_at_parse_time() {
         r.err()
     );
 }
+
+/// Every `--device` flag refuses a value other than cpu/gpu at parse time.
+#[test]
+fn device_flag_accepts_only_cpu_and_gpu() {
+    let commands: [&[&str]; 7] = [
+        &["serve", "--model", "m"],
+        &["chat", "--model", "m"],
+        &["transcribe", "a.wav", "--model", "m"],
+        &["info", "--model", "m"],
+        &["baseline", "--model", "m"],
+        &["bench", "--model", "m"],
+        &["eval", "ppl", "--model", "m", "--text-file", "t"],
+    ];
+    for args in commands {
+        for (device, accepted) in [("cpu", true), ("gpu", true), ("tpu", false)] {
+            let mut argv = vec!["rmlx"];
+            argv.extend_from_slice(args);
+            argv.extend_from_slice(&["--device", device]);
+            // A debug-build `Cli` parse is deeper than the default test-thread
+            // stack.
+            let kind = std::thread::Builder::new()
+                .stack_size(64 << 20)
+                .spawn(move || Cli::try_parse_from(&argv).map(drop).map_err(|e| e.kind()))
+                .expect("spawn parser thread")
+                .join()
+                .expect("parser thread");
+            let want = if accepted {
+                Ok(())
+            } else {
+                Err(clap::error::ErrorKind::InvalidValue)
+            };
+            assert_eq!(kind, want, "{args:?} --device {device}");
+        }
+    }
+}
