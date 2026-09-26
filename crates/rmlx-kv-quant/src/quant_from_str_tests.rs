@@ -4,6 +4,11 @@
 //! one literal arm of a `match`. The live parser finds those spellings through
 //! the codec descriptor. Both must give the same `Ok` value and the same `Err`
 //! text for every input, so the lookup cannot drop or add a spelling.
+//!
+//! A new codec adds its spelling arm to `reference_from_str`. The copy is
+//! otherwise frozen. Both sides format their errors through the same
+//! `Display`, so this test cannot see a change to the error text;
+//! `unknown_error_text_names_every_fixed_spelling` pins that text.
 
 use std::str::FromStr;
 
@@ -14,7 +19,7 @@ use super::{
 
 #[allow(
     clippy::too_many_lines,
-    reason = "a verbatim copy of the replaced parser; its value is that it is not edited"
+    reason = "the replaced parser, changed only by new-codec arms"
 )]
 fn reference_from_str(s: &str) -> Result<KvQuant, KvQuantParseError> {
     match s {

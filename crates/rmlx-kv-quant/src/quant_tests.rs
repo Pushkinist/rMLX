@@ -112,6 +112,21 @@ fn aliases_parse_correctly() {
     );
 }
 
+/// The spelling list in the `Unknown` error text is written by hand. It must
+/// name every fieldless codec, or an operator who mistypes one is not told it.
+#[test]
+fn unknown_error_text_names_every_fixed_spelling() {
+    let text = super::KvQuantParseError::Unknown(String::new()).to_string();
+    for quant in ALL_KV_QUANTS {
+        if let super::Spelling::Fixed(spelling) = quant.descriptor().spelling {
+            assert!(
+                text.contains(&format!(" {spelling},")),
+                "the Unknown error text does not name '{spelling}': {text}"
+            );
+        }
+    }
+}
+
 /// Confirm that the previously-broken RotK `Display`/`FromStr` form now
 /// parses correctly end-to-end.
 #[test]

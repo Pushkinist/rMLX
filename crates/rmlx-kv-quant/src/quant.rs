@@ -1327,11 +1327,13 @@ impl std::str::FromStr for KvQuant {
         let fixed = ALL_KV_QUANTS.iter().copied().find(
             |quant| matches!(quant.descriptor().spelling, Spelling::Fixed(text) if text == s),
         );
-        let alias = KV_QUANT_ALIASES
-            .iter()
-            .find(|(name, _)| *name == s)
-            .map(|&(_, quant)| quant);
-        if let Some(quant) = fixed.or(alias) {
+        let found = fixed.or_else(|| {
+            KV_QUANT_ALIASES
+                .iter()
+                .find(|(name, _)| *name == s)
+                .map(|&(_, quant)| quant)
+        });
+        if let Some(quant) = found {
             return Ok(quant);
         }
 

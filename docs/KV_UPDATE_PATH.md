@@ -283,7 +283,7 @@ The figures are printed by tools, not recorded here:
   `turbo-storage`, `rotor-updates`, `iso-updates`, `turbo-updates`,
   `turbo-ssd` and `update-bodies`.
 
-### The sites a new codec must touch
+## The sites a new codec must touch
 
 A new `KvQuant` variant (and its `KvStorage` variant) does not compile until
 each exhaustive site below names it. Each stays for its reason:
@@ -309,7 +309,8 @@ and then fails to hydrate with `unknown layer tag`.
 `ALL_KV_QUANTS` through the descriptor, an alias in `KV_QUANT_ALIASES`, and
 keeps one structured parser per payload shape (`mixed_*`, `rot_k_v*`,
 `rotor_k_{3,4}_asym_*`). The list of valid spellings in the
-`KvQuantParseError::Unknown` text is written by hand and is not checked.
+`KvQuantParseError::Unknown` text is written by hand and pinned by
+`unknown_error_text_names_every_fixed_spelling`.
 
 ## What cannot move
 
