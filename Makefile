@@ -125,6 +125,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         check-no-kernel-input-eval check-no-kernel-input-eval-fixtures \
         check-gpu-device-census check-gpu-device-census-library \
         check-gpu-device-census-selftest \
+        check-claim-bypass check-claim-bypass-selftest \
         check-kernel-dtype-contract check-kernel-dtype-contract-fixtures \
         check-metal-compiles check-metal-format
 
@@ -634,6 +635,12 @@ check-gpu-device-census-library: ## CI gate: library code in rmlx-audio, rmlx-se
 check-gpu-device-census-selftest: ## CI gate: recall test for the above and its library mode, 69 cases, each asserting the reason as well as the exit code
 	@bash scripts/check_gpu_device_census_selftest.sh
 
+check-claim-bypass: ## CI gate: nothing in the tree deletes the Metal claim, names its file outside the claim module, or kills by process-name pattern
+	@bash scripts/check_claim_bypass.sh
+
+check-claim-bypass-selftest: ## CI gate: recall test for the above, each case asserting the rule and file:line or the reason as well as the exit code
+	@bash scripts/check_claim_bypass_selftest.sh
+
 check-kernel-dtype-contract: ## CI gate: fail if a Metal-kernel dispatcher returns its declared-f32 output without restoring a caller dtype (promotes the whole decode graph)
 	@bash scripts/check_kernel_dtype_contract.sh
 
@@ -689,6 +696,8 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_gpu_device_census.sh
 	@bash scripts/check_gpu_device_census.sh --library
 	@bash scripts/check_gpu_device_census_selftest.sh
+	@bash scripts/check_claim_bypass.sh
+	@bash scripts/check_claim_bypass_selftest.sh
 	@bash scripts/check_kernel_dtype_contract.sh
 	@bash scripts/check_kernel_dtype_contract_fixtures.sh
 	@bash scripts/perf_ab_selftest.sh

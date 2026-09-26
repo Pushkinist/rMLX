@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # scripts/check_claim_bypass_selftest.sh — recall test for check_claim_bypass.sh.
+# doc-refs: fixture — the docs/ paths below belong to the synthetic scan roots.
 #
 # Each case builds a throwaway scan root with one planted line, runs the gate
 # and asserts the literal exit code and, for every failure, the rule and the
@@ -130,6 +131,25 @@ root="$(fresh self_exclude)"
 plant "$root" scripts/check_claim_bypass.sh "rm -f /tmp/rmlx.claim; pkill -f rmlx"
 plant "$root" scripts/check_claim_bypass_selftest.sh "rm -f /tmp/rmlx.claim; pkill -f rmlx"
 case_run self_exclude "the gate and its selftest are not scanned" 0 - "$root"
+
+# The rows that document the gate say what it refuses without spelling a
+# refused command. They are planted as the tree has them, so a row reworded into
+# a violation fails here, and a lost row fails as a missing row.
+root="$(fresh doc_rows)"
+doc_rows_found=1
+for doc in CLAUDE.md scripts/INDEX.md; do
+    rows="$(grep -F -e 'check-claim-bypass' -e 'check_claim_bypass' "$REPO_ROOT/$doc")"
+    if [ "$(grep -c '' <<<"$rows")" -lt 2 ]; then
+        echo "FAIL doc_rows: $doc has fewer than two rows naming the gate"
+        FAILED=$((FAILED + 1))
+        doc_rows_found=0
+        continue
+    fi
+    mkdir -p "$(dirname "$root/$doc")"
+    printf '%s\n' "$rows" >"$root/$doc"
+done
+[ "$doc_rows_found" -eq 1 ] &&
+    case_run doc_rows "the gate's rows in CLAUDE.md and scripts/INDEX.md pass it" 0 - "$root"
 
 # A scope with no file cannot pass.
 mkdir -p "$WORK/empty_scope/other"

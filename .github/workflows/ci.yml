@@ -103,6 +103,14 @@ jobs:
       # fixture trees in both modes.
       - name: the device census still catches what it is for
         run: make check-gpu-device-census-selftest
+      # One machine-wide flock is the only gate on the GPU. A script that
+      # deletes the claim file lets the next process lock a new one, and a kill
+      # by process-name pattern stops processes the caller did not start.
+      - name: nothing deletes the Metal claim or kills by process-name pattern
+        run: make check-claim-bypass
+      # ...and its recall is pinned by planted scan roots, per rule.
+      - name: the claim-bypass gate still catches what it is for
+        run: make check-claim-bypass-selftest
       # A headline number's provenance is these files, and a manifest sitting
       # beside them proves nothing on its own: the draw is recorded rather than
       # recomputed, and an edited file can be re-blessed in the same commit. The
