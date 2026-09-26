@@ -283,6 +283,34 @@ The figures are printed by tools, not recorded here:
   `turbo-storage`, `rotor-updates`, `iso-updates`, `turbo-updates`,
   `turbo-ssd` and `update-bodies`.
 
+### The sites a new codec must touch
+
+A new `KvQuant` variant (and its `KvStorage` variant) does not compile until
+each exhaustive site below names it. Each stays for its reason:
+
+| Site | Why it cannot move |
+|---|---|
+| `quant_descriptor.rs` `KvQuant::descriptor` | The one place that classifies a codec. The predicates, `Display` and the fieldless `FromStr` spellings read it. |
+| `storage/kv_storage.rs` `KvStorage::new` | It builds one storage variant per codec. Data cannot name a variant. |
+| `storage/kv_storage.rs` `KvStorage::view` | The one place where the concrete stores become `&dyn KvSlot` for read-only work. |
+| `storage/kv_storage.rs` `KvStorage::view_mut` | The same for mutation, plus the `update` and `exit_prefill` entries. One view cannot be derived from the other without a macro. |
+| `storage/kv_storage.rs` `KvStorage::try_deep_clone` | Building the twin needs the concrete variant. A trait method would need `dyn Any` downcasts, or a codec the storage cannot always state. |
+| `rmlx-kv-ssd` `block_io.rs` `write_layer` | The SSD block format (tensor names, dtypes, trims) belongs to `rmlx-kv-ssd` and needs the concrete store types. |
+| `rmlx-models` `kv_cache/cache_type.rs` `decompose_auto` | Per-codec policy (fallback, warning, panic, per-side tag) that no codec fact decides. |
+
+One site compiles with a new variant and still must change: the layout-tag
+table of `rmlx-kv-ssd` `block_io.rs` `read_layer`. It is the read side of
+`write_layer`, for the same reason. Its keys are SSD layout tags, not codec
+spellings (`none_bf16`, `mixed`, `paged`, the `_qjl` rotor tags), so the
+descriptor spelling cannot drive it. A new codec without an arm there spills
+and then fails to hydrate with `unknown layer tag`.
+
+`FromStr` has no table of its own: it finds a fieldless spelling in
+`ALL_KV_QUANTS` through the descriptor, an alias in `KV_QUANT_ALIASES`, and
+keeps one structured parser per payload shape (`mixed_*`, `rot_k_v*`,
+`rotor_k_{3,4}_asym_*`). The list of valid spellings in the
+`KvQuantParseError::Unknown` text is written by hand and is not checked.
+
 ## What cannot move
 
 - Every pin in `store_bytes_tests.rs` and the family files.

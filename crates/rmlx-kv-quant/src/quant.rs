@@ -16,7 +16,7 @@ pub const KV_MAX_SEQ_DEFAULT: i32 = 4096;
 #[path = "quant_descriptor.rs"]
 mod descriptor;
 
-use descriptor::HotPathClass;
+use descriptor::{HotPathClass, Spelling};
 
 /// Quantization mode for the KV cache.
 ///
@@ -1312,38 +1312,27 @@ pub fn kv_quant_label(kv: Option<KvQuant>) -> String {
     quant.to_string()
 }
 
+/// The spellings `FromStr` accepts beside the `Display` text of each codec.
+const KV_QUANT_ALIASES: [(&str, KvQuant); 4] = [
+    ("bf16", KvQuant::None),
+    ("f16", KvQuant::None),
+    ("rotor_v_3", KvQuant::Rotor3),
+    ("rotor_v_4", KvQuant::Rotor4),
+];
+
 impl std::str::FromStr for KvQuant {
     type Err = KvQuantParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "none" | "bf16" | "f16" => return Ok(KvQuant::None),
-            "k8v4" => return Ok(KvQuant::K8V4),
-            "k8v8" => return Ok(KvQuant::K8V8),
-            "planar" => return Ok(KvQuant::Planar),
-            "planar3" => return Ok(KvQuant::Planar3),
-            "k8vturbo3" => return Ok(KvQuant::K8VTurbo3),
-            "tsym3" => return Ok(KvQuant::TurboSym3),
-            "tsym4" => return Ok(KvQuant::TurboSym4),
-            "planar_k" => return Ok(KvQuant::PlanarK),
-            "k8vturbo2" => return Ok(KvQuant::K8VTurbo2),
-            "iso3" => return Ok(KvQuant::Iso3),
-            "iso4" => return Ok(KvQuant::Iso4),
-            "rotor3" | "rotor_v_3" => return Ok(KvQuant::Rotor3),
-            "rotor4" | "rotor_v_4" => return Ok(KvQuant::Rotor4),
-            "k8vturbo3tcq" => return Ok(KvQuant::K8VTurbo3Tcq),
-            "k8vturbo2tcq" => return Ok(KvQuant::K8VTurbo2Tcq),
-            // Symmetric / K-only iso variants.
-            "iso3_sym" => return Ok(KvQuant::Iso3Sym),
-            "iso4_sym" => return Ok(KvQuant::Iso4Sym),
-            "k_iso3" => return Ok(KvQuant::IsoKOnly3),
-            "k_iso4" => return Ok(KvQuant::IsoKOnly4),
-            // Symmetric / K-only rotor variants.
-            "rotor3_sym" => return Ok(KvQuant::Rotor3Sym),
-            "rotor4_sym" => return Ok(KvQuant::Rotor4Sym),
-            "k_rotor3" => return Ok(KvQuant::RotorKOnly3),
-            "k_rotor4" => return Ok(KvQuant::RotorKOnly4),
-            _ => {}
+        let fixed = ALL_KV_QUANTS.iter().copied().find(
+            |quant| matches!(quant.descriptor().spelling, Spelling::Fixed(text) if text == s),
+        );
+        let alias = KV_QUANT_ALIASES
+            .iter()
+            .find(|(name, _)| *name == s)
+            .map(|&(_, quant)| quant);
+        if let Some(quant) = fixed.or(alias) {
+            return Ok(quant);
         }
 
         // Withdrawn codecs: reject by name, and name the successor. Not an
@@ -1507,6 +1496,10 @@ fn parse_kv_side(spec: &str, expected_prefix: char) -> Result<(u8, u16), String>
 #[cfg(test)]
 #[path = "quant_tests.rs"]
 mod quant_tests;
+
+#[cfg(test)]
+#[path = "quant_from_str_tests.rs"]
+mod quant_from_str_tests;
 
 #[cfg(test)]
 #[path = "codec_facts_tests.rs"]
