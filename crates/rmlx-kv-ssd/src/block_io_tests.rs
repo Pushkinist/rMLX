@@ -532,7 +532,8 @@ fn roundtrip_variant(name: &str, quant: KvQuant) {
         .unwrap();
 
     let reader = KvBlockReader::open(&path).unwrap();
-    let (rebuilt, _max_seqs, _bf16, _lin) = reader.hydrate(MODEL_ID, quant, device).unwrap();
+    let (layers, _lin) = reader.hydrate(MODEL_ID, quant, device).unwrap();
+    let (rebuilt, _max_seqs, _bf16) = split_layers(layers);
     assert_eq!(rebuilt.len(), 1, "{name}: layer count");
 
     // Dequant K from the rebuilt storage and compare to the pre-write dequant.
@@ -753,8 +754,8 @@ fn roundtrip_planar3() {
         .unwrap();
 
     let reader = KvBlockReader::open(&path).unwrap();
-    let (rebuilt, _max_seqs, _bf16, _lin) =
-        reader.hydrate(MODEL_ID, KvQuant::Planar3, device).unwrap();
+    let (layers, _lin) = reader.hydrate(MODEL_ID, KvQuant::Planar3, device).unwrap();
+    let (rebuilt, _max_seqs, _bf16) = split_layers(layers);
     assert_eq!(rebuilt.len(), 1, "planar3: layer count");
 
     // Assert bits=3 is preserved through the round-trip.
@@ -846,9 +847,10 @@ fn roundtrip_k8vturbo3_tcq() {
         .unwrap();
 
     let reader = KvBlockReader::open(&path).unwrap();
-    let (rebuilt, _max_seqs, _bf16, _) = reader
+    let (layers, _) = reader
         .hydrate(MODEL_ID, KvQuant::K8VTurbo3Tcq, device)
         .unwrap();
+    let (rebuilt, _max_seqs, _bf16) = split_layers(layers);
     assert_eq!(rebuilt.len(), 1, "layer count");
 
     let (v_codes_after, v_bits_after, use_tcq_after) = match &rebuilt[0] {
@@ -913,9 +915,10 @@ fn roundtrip_k8vturbo2_v_codes_byte_identical() {
         .unwrap();
 
     let reader = KvBlockReader::open(&path).unwrap();
-    let (rebuilt, _max_seqs, _bf16, _) = reader
+    let (layers, _) = reader
         .hydrate(MODEL_ID, KvQuant::K8VTurbo2, device)
         .unwrap();
+    let (rebuilt, _max_seqs, _bf16) = split_layers(layers);
     assert_eq!(rebuilt.len(), 1, "layer count");
 
     let (v_codes_after, v_bits_after) = match &rebuilt[0] {
@@ -986,8 +989,8 @@ fn roundtrip_iso3() {
         .unwrap();
 
     let reader = KvBlockReader::open(&path).unwrap();
-    let (rebuilt, _max_seqs, _bf16, _lin) =
-        reader.hydrate(MODEL_ID, KvQuant::Iso3, device).unwrap();
+    let (layers, _lin) = reader.hydrate(MODEL_ID, KvQuant::Iso3, device).unwrap();
+    let (rebuilt, _max_seqs, _bf16) = split_layers(layers);
     assert_eq!(rebuilt.len(), 1, "iso3: layer count");
 
     // All four V-side buffers must be byte/value-identical after round-trip.
@@ -1104,8 +1107,8 @@ fn roundtrip_iso4() {
         .unwrap();
 
     let reader = KvBlockReader::open(&path).unwrap();
-    let (rebuilt, _max_seqs, _bf16, _lin) =
-        reader.hydrate(MODEL_ID, KvQuant::Iso4, device).unwrap();
+    let (layers, _lin) = reader.hydrate(MODEL_ID, KvQuant::Iso4, device).unwrap();
+    let (rebuilt, _max_seqs, _bf16) = split_layers(layers);
     assert_eq!(rebuilt.len(), 1, "iso4: layer count");
 
     let (v_codes_after, v_scales_after, v_quats_after, v_norms_after) = match &rebuilt[0] {
@@ -1220,8 +1223,8 @@ fn roundtrip_rotor3() {
         .unwrap();
 
     let reader = KvBlockReader::open(&path).unwrap();
-    let (rebuilt, _max_seqs, _bf16, _lin) =
-        reader.hydrate(MODEL_ID, KvQuant::Rotor3, device).unwrap();
+    let (layers, _lin) = reader.hydrate(MODEL_ID, KvQuant::Rotor3, device).unwrap();
+    let (rebuilt, _max_seqs, _bf16) = split_layers(layers);
     assert_eq!(rebuilt.len(), 1, "rotor3: layer count");
 
     let (v_codes_after, v_scales_after, v_norms_after, v_rotors_after) = match &rebuilt[0] {
@@ -1331,8 +1334,8 @@ fn roundtrip_rotor4() {
         .unwrap();
 
     let reader = KvBlockReader::open(&path).unwrap();
-    let (rebuilt, _max_seqs, _bf16, _lin) =
-        reader.hydrate(MODEL_ID, KvQuant::Rotor4, device).unwrap();
+    let (layers, _lin) = reader.hydrate(MODEL_ID, KvQuant::Rotor4, device).unwrap();
+    let (rebuilt, _max_seqs, _bf16) = split_layers(layers);
     assert_eq!(rebuilt.len(), 1, "rotor4: layer count");
 
     let (v_codes_after, v_scales_after, v_norms_after, v_rotors_after) = match &rebuilt[0] {
@@ -1402,6 +1405,70 @@ fn roundtrip_rotor4() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Split hydrated layers into their storages, capacities and bf16 seeds.
+pub(super) fn split_layers(
+    layers: Vec<HydratedLayer>,
+) -> (Vec<KvStorage>, Vec<i32>, Vec<NoneBf16Seed>) {
+    let mut out = (Vec::new(), Vec::new(), Vec::new());
+    for (storage, max_seq, bf16) in layers {
+        out.0.push(storage);
+        out.1.push(max_seq);
+        out.2.push(bf16);
+    }
+    out
+}
+
+/// Write a one-layer block with no tensors and the geometry `geom`.
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: an empty tensor list and a string map always serialise"
+)]
+fn write_geometry_only_block(path: &Path, geom: &str) {
+    let meta: HashMap<String, String> = [
+        (META_MODEL_ID, MODEL_ID.to_string()),
+        (META_KV_QUANT, KvQuant::None.to_string()),
+        (META_N_LAYERS, "1".to_string()),
+        (META_SEQ_LEN, "0".to_string()),
+        (META_N_LINEAR, "0".to_string()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .chain([(geom_key(0), geom.to_string())])
+    .collect();
+    let tensors: Vec<(String, &OwnedTensor)> = Vec::new();
+    safetensors::serialize_to_file(tensors, Some(meta), path).unwrap();
+}
+
+/// A geometry without `max_seq` is a bad block, not a layer at some default
+/// capacity. The control with the key present hydrates, so the refusal is the
+/// missing key and nothing else about the fixture.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test driver: the control block is well formed"
+)]
+fn hydrate_refuses_a_geometry_without_max_seq() {
+    let device = Device::Cpu;
+
+    let control = tmp_path("geom_with_max_seq");
+    write_geometry_only_block(&control, r#"{"tag":"none","max_seq":4096}"#);
+    let reader = KvBlockReader::open(&control).unwrap();
+    let (layers, _lin) = reader.hydrate(MODEL_ID, KvQuant::None, device).unwrap();
+    let (_storages, max_seqs, _bf16) = split_layers(layers);
+    assert_eq!(max_seqs, [4096], "control: the geometry's max_seq");
+    let _ = std::fs::remove_file(&control);
+
+    let path = tmp_path("geom_without_max_seq");
+    write_geometry_only_block(&path, r#"{"tag":"none"}"#);
+    let reader = KvBlockReader::open(&path).unwrap();
+    let res = reader.hydrate(MODEL_ID, KvQuant::None, device);
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        res.is_err(),
+        "a geometry without max_seq must fail the hydrate, not default the capacity"
+    );
+}
+
 /// `None` (bf16) keeps K/V on the parent KvCache, not in storage. Verify the
 /// geometry round-trips and the variant reconstructs as `None`.
 #[test]
@@ -1421,7 +1488,8 @@ fn roundtrip_none() {
         .write(&path, device)
         .unwrap();
     let reader = KvBlockReader::open(&path).unwrap();
-    let (rebuilt, max_seqs, _bf16, _) = reader.hydrate(MODEL_ID, KvQuant::None, device).unwrap();
+    let (layers, _) = reader.hydrate(MODEL_ID, KvQuant::None, device).unwrap();
+    let (rebuilt, max_seqs, _bf16) = split_layers(layers);
     assert!(matches!(rebuilt[0], KvStorage::None {}));
     assert_eq!(max_seqs, [4096]);
     let _ = std::fs::remove_file(&path);
@@ -1497,8 +1565,8 @@ fn roundtrip_none_bf16_payload_via_spill_hydrate() {
 
     // Sanity: the spilled file must carry real K/V tensors, not geometry-only.
     let reader = KvBlockReader::open(&path).unwrap();
-    let (rebuilt, _max_seqs, bf16_seeds, _lin) =
-        reader.hydrate(MODEL_ID, KvQuant::None, device).unwrap();
+    let (layers, _lin) = reader.hydrate(MODEL_ID, KvQuant::None, device).unwrap();
+    let (rebuilt, _max_seqs, bf16_seeds) = split_layers(layers);
     assert_eq!(rebuilt.len(), 2, "layer count");
     for layer in 0..2 {
         assert!(
@@ -2016,7 +2084,8 @@ fn roundtrip_paged() {
         .write(&path, device)
         .unwrap();
     let reader = KvBlockReader::open(&path).unwrap();
-    let (rebuilt, _max_seqs, _bf16, _) = reader.hydrate(MODEL_ID, KvQuant::K8V4, device).unwrap();
+    let (layers, _) = reader.hydrate(MODEL_ID, KvQuant::K8V4, device).unwrap();
+    let (rebuilt, _max_seqs, _bf16) = split_layers(layers);
     let after = dequant_k(&rebuilt[0], device);
     assert_eq!(before.len(), after.len(), "paged K length");
     let max_err = before
@@ -2065,8 +2134,7 @@ fn roundtrip_linear_attn() {
         .write(&path, device)
         .unwrap();
     let reader = KvBlockReader::open(&path).unwrap();
-    let (_layers, _max_seqs, _bf16, rebuilt_lin) =
-        reader.hydrate(MODEL_ID, KvQuant::None, device).unwrap();
+    let (_layers, rebuilt_lin) = reader.hydrate(MODEL_ID, KvQuant::None, device).unwrap();
     assert_eq!(rebuilt_lin.len(), 1, "linear cache count");
     assert_eq!(
         to_vec(rebuilt_lin[0].conv_state.as_ref().unwrap()),
@@ -2144,7 +2212,8 @@ fn c3_k8v4_hydrate_round_trip_no_panic() {
     write_caches(&path, device, MODEL_ID, KvQuant::K8V4, &[c], &[]).unwrap();
 
     let reader = KvBlockReader::open(&path).unwrap();
-    let (rebuilt, max_seqs, _bf16, _) = reader.hydrate(MODEL_ID, KvQuant::K8V4, device).unwrap();
+    let (layers, _) = reader.hydrate(MODEL_ID, KvQuant::K8V4, device).unwrap();
+    let (rebuilt, max_seqs, _bf16) = split_layers(layers);
     let storage = rebuilt.into_iter().next().unwrap();
     let max_seq = max_seqs.into_iter().next().unwrap();
 
@@ -2200,7 +2269,8 @@ fn c2_planar_hydrate_round_trip_no_panic() {
     write_caches(&path, device, MODEL_ID, KvQuant::Planar, &[c], &[]).unwrap();
 
     let reader = KvBlockReader::open(&path).unwrap();
-    let (rebuilt, max_seqs, _bf16, _) = reader.hydrate(MODEL_ID, KvQuant::Planar, device).unwrap();
+    let (layers, _) = reader.hydrate(MODEL_ID, KvQuant::Planar, device).unwrap();
+    let (rebuilt, max_seqs, _bf16) = split_layers(layers);
     let storage = rebuilt.into_iter().next().unwrap();
     let max_seq = max_seqs.into_iter().next().unwrap();
 
@@ -2375,9 +2445,10 @@ fn planar3_v_gpu_spill_cpu_hydrate_cross_path() {
 
     // ── Hydrate on CPU: GPU-word bytes → PlanarBlocks → CPU planar_dequantize ─
     let reader = KvBlockReader::open(&path).unwrap();
-    let (rebuilt, _max_seqs, _bf16, _) = reader
+    let (layers, _) = reader
         .hydrate(MODEL_ID, KvQuant::Planar3, Device::Cpu)
         .unwrap();
+    let (rebuilt, _max_seqs, _bf16) = split_layers(layers);
     let storage = rebuilt.into_iter().next().unwrap();
 
     let cpu_hydrated_v = match &storage {
@@ -2491,9 +2562,10 @@ fn roundtrip_k8vturbo2tcq() {
         .unwrap();
 
     let reader = KvBlockReader::open(&path).unwrap();
-    let (rebuilt, _max_seqs, _bf16, _) = reader
+    let (layers, _) = reader
         .hydrate(MODEL_ID, KvQuant::K8VTurbo2Tcq, device)
         .unwrap();
+    let (rebuilt, _max_seqs, _bf16) = split_layers(layers);
     assert_eq!(rebuilt.len(), 1, "layer count");
 
     let (v_codes_after, v_bits_after, use_tcq_after) = match &rebuilt[0] {
@@ -2583,8 +2655,8 @@ fn roundtrip_iso_sym_3() {
         .unwrap();
 
     let reader = KvBlockReader::open(&path).unwrap();
-    let (rebuilt, _max_seqs, _bf16, _) =
-        reader.hydrate(MODEL_ID, KvQuant::Iso3Sym, device).unwrap();
+    let (layers, _) = reader.hydrate(MODEL_ID, KvQuant::Iso3Sym, device).unwrap();
+    let (rebuilt, _max_seqs, _bf16) = split_layers(layers);
     assert_eq!(rebuilt.len(), 1, "iso_sym_3: layer count");
 
     let (k_codes_after, v_codes_after) = match &rebuilt[0] {
@@ -2651,8 +2723,8 @@ fn roundtrip_iso_sym_4() {
         .unwrap();
 
     let reader = KvBlockReader::open(&path).unwrap();
-    let (rebuilt, _max_seqs, _bf16, _) =
-        reader.hydrate(MODEL_ID, KvQuant::Iso4Sym, device).unwrap();
+    let (layers, _) = reader.hydrate(MODEL_ID, KvQuant::Iso4Sym, device).unwrap();
+    let (rebuilt, _max_seqs, _bf16) = split_layers(layers);
     assert_eq!(rebuilt.len(), 1);
 
     let (k_codes_after, v_codes_after) = match &rebuilt[0] {
@@ -2708,9 +2780,10 @@ fn roundtrip_iso_k_only_3() {
         .unwrap();
 
     let reader = KvBlockReader::open(&path).unwrap();
-    let (rebuilt, _max_seqs, _bf16, _) = reader
+    let (layers, _) = reader
         .hydrate(MODEL_ID, KvQuant::IsoKOnly3, device)
         .unwrap();
+    let (rebuilt, _max_seqs, _bf16) = split_layers(layers);
     assert_eq!(rebuilt.len(), 1);
 
     let k_codes_after = match &rebuilt[0] {
@@ -2761,9 +2834,10 @@ fn roundtrip_iso_k_only_4() {
         .unwrap();
 
     let reader = KvBlockReader::open(&path).unwrap();
-    let (rebuilt, _max_seqs, _bf16, _) = reader
+    let (layers, _) = reader
         .hydrate(MODEL_ID, KvQuant::IsoKOnly4, device)
         .unwrap();
+    let (rebuilt, _max_seqs, _bf16) = split_layers(layers);
     assert_eq!(rebuilt.len(), 1);
 
     let k_codes_after = match &rebuilt[0] {
@@ -2804,9 +2878,10 @@ fn roundtrip_rotor_sym_3_no_qjl() {
         .write(&path, device)
         .unwrap();
     let reader = KvBlockReader::open(&path).unwrap();
-    let (rebuilt, _max_seqs, _bf16, _) = reader
+    let (layers, _) = reader
         .hydrate(MODEL_ID, KvQuant::Rotor3Sym, device)
         .unwrap();
+    let (rebuilt, _max_seqs, _bf16) = split_layers(layers);
     let (k_codes_after, use_qjl_after) = match &rebuilt[0] {
         KvStorage::RotorSym3 { k: Some(qk), .. } => (qk.blocks[0].codes.clone(), qk.use_qjl()),
         _ => panic!("expected RotorSym3 after hydrate"),
@@ -2850,9 +2925,10 @@ fn roundtrip_rotor_sym_3_qjl() {
         .write(&path, device)
         .unwrap();
     let reader = KvBlockReader::open(&path).unwrap();
-    let (rebuilt, _max_seqs, _bf16, _) = reader
+    let (layers, _) = reader
         .hydrate(MODEL_ID, KvQuant::Rotor3Sym, device)
         .unwrap();
+    let (rebuilt, _max_seqs, _bf16) = split_layers(layers);
     let (k_codes_after, qjl_codes_after, use_qjl_after) = match &rebuilt[0] {
         KvStorage::RotorSym3 { k: Some(qk), .. } => (
             qk.blocks[0].codes.clone(),
@@ -2889,9 +2965,10 @@ fn roundtrip_rotor_sym_4_qjl() {
         .write(&path, device)
         .unwrap();
     let reader = KvBlockReader::open(&path).unwrap();
-    let (rebuilt, _max_seqs, _bf16, _) = reader
+    let (layers, _) = reader
         .hydrate(MODEL_ID, KvQuant::Rotor4Sym, device)
         .unwrap();
+    let (rebuilt, _max_seqs, _bf16) = split_layers(layers);
     let (k_codes_after, use_qjl_after) = match &rebuilt[0] {
         KvStorage::RotorSym4 { k: Some(qk), .. } => (qk.blocks[0].codes.clone(), qk.use_qjl()),
         _ => panic!("expected RotorSym4 after hydrate"),
@@ -2916,9 +2993,10 @@ fn roundtrip_rotor_sym_4_no_qjl() {
         .write(&path, device)
         .unwrap();
     let reader = KvBlockReader::open(&path).unwrap();
-    let (rebuilt, _max_seqs, _bf16, _) = reader
+    let (layers, _) = reader
         .hydrate(MODEL_ID, KvQuant::Rotor4Sym, device)
         .unwrap();
+    let (rebuilt, _max_seqs, _bf16) = split_layers(layers);
     let use_qjl_after = match &rebuilt[0] {
         KvStorage::RotorSym4 { k: Some(qk), .. } => qk.use_qjl(),
         _ => panic!("expected RotorSym4 after hydrate"),
@@ -2949,7 +3027,8 @@ fn roundtrip_rotor_k3_asym_v4_g64() {
         .write(&path, device)
         .unwrap();
     let reader = KvBlockReader::open(&path).unwrap();
-    let (rebuilt, _max_seqs, _bf16, _) = reader.hydrate(MODEL_ID, kq, device).unwrap();
+    let (layers, _) = reader.hydrate(MODEL_ID, kq, device).unwrap();
+    let (rebuilt, _max_seqs, _bf16) = split_layers(layers);
     assert_eq!(rebuilt.len(), 1);
     let (vb_after, vg_after) = match &rebuilt[0] {
         KvStorage::RotorKAsym3 {
@@ -2994,7 +3073,8 @@ fn roundtrip_rotor_k4_asym_v3_g64() {
         .write(&path, device)
         .unwrap();
     let reader = KvBlockReader::open(&path).unwrap();
-    let (rebuilt, _max_seqs, _bf16, _) = reader.hydrate(MODEL_ID, kq, device).unwrap();
+    let (layers, _) = reader.hydrate(MODEL_ID, kq, device).unwrap();
+    let (rebuilt, _max_seqs, _bf16) = split_layers(layers);
     assert_eq!(rebuilt.len(), 1);
     let (vb_after, vg_after) = match &rebuilt[0] {
         KvStorage::RotorKAsym4 {
@@ -3032,9 +3112,10 @@ fn roundtrip_rotor_k_only_3_qjl() {
         .write(&path, device)
         .unwrap();
     let reader = KvBlockReader::open(&path).unwrap();
-    let (rebuilt, _max_seqs, _bf16, _) = reader
+    let (layers, _) = reader
         .hydrate(MODEL_ID, KvQuant::RotorKOnly3, device)
         .unwrap();
+    let (rebuilt, _max_seqs, _bf16) = split_layers(layers);
     let use_qjl_after = match &rebuilt[0] {
         KvStorage::RotorKOnly3 { k: Some(qk), .. } => qk.use_qjl(),
         _ => panic!("expected RotorKOnly3 after hydrate"),
@@ -3058,9 +3139,10 @@ fn roundtrip_rotor_k_only_3_no_qjl() {
         .write(&path, device)
         .unwrap();
     let reader = KvBlockReader::open(&path).unwrap();
-    let (rebuilt, _max_seqs, _bf16, _) = reader
+    let (layers, _) = reader
         .hydrate(MODEL_ID, KvQuant::RotorKOnly3, device)
         .unwrap();
+    let (rebuilt, _max_seqs, _bf16) = split_layers(layers);
     let use_qjl_after = match &rebuilt[0] {
         KvStorage::RotorKOnly3 { k: Some(qk), .. } => qk.use_qjl(),
         _ => panic!("expected RotorKOnly3 after hydrate"),
@@ -3085,9 +3167,10 @@ fn roundtrip_rotor_k_only_4_qjl() {
         .write(&path, device)
         .unwrap();
     let reader = KvBlockReader::open(&path).unwrap();
-    let (rebuilt, _max_seqs, _bf16, _) = reader
+    let (layers, _) = reader
         .hydrate(MODEL_ID, KvQuant::RotorKOnly4, device)
         .unwrap();
+    let (rebuilt, _max_seqs, _bf16) = split_layers(layers);
     let use_qjl_after = match &rebuilt[0] {
         KvStorage::RotorKOnly4 { k: Some(qk), .. } => qk.use_qjl(),
         _ => panic!("expected RotorKOnly4 after hydrate"),
@@ -3111,9 +3194,10 @@ fn roundtrip_rotor_k_only_4_no_qjl() {
         .write(&path, device)
         .unwrap();
     let reader = KvBlockReader::open(&path).unwrap();
-    let (rebuilt, _max_seqs, _bf16, _) = reader
+    let (layers, _) = reader
         .hydrate(MODEL_ID, KvQuant::RotorKOnly4, device)
         .unwrap();
+    let (rebuilt, _max_seqs, _bf16) = split_layers(layers);
     let use_qjl_after = match &rebuilt[0] {
         KvStorage::RotorKOnly4 { k: Some(qk), .. } => qk.use_qjl(),
         _ => panic!("expected RotorKOnly4 after hydrate"),

@@ -37,7 +37,7 @@
 //!   collapse reduced to the one safe scale-byte form, needs a `Device::Gpu`
 //!   append after the hydrate. `make gpu-test` owns it.
 
-use super::block_io_tests::lcg;
+use super::block_io_tests::{lcg, split_layers};
 use super::{KvBlockReader, KvBlockWriter};
 use rmlx_kv_quant::storage::{KvStorage, QuantKTurbo3, QuantKTurbo4, QuantV};
 use rmlx_kv_quant::turboquant::{turbo_quantize_v, TurboBlocks};
@@ -137,8 +137,8 @@ fn spill_and_hydrate(name: &str, quant: KvQuant, bits: u8) -> (HydratedK, TurboB
         .write(&path, device)
         .expect("spill");
     let reader = KvBlockReader::open(&path).expect("open the spilled block");
-    let (rebuilt, max_seqs, _bf16, _lin) =
-        reader.hydrate(MODEL_ID, quant, device).expect("hydrate");
+    let (layers, _lin) = reader.hydrate(MODEL_ID, quant, device).expect("hydrate");
+    let (rebuilt, max_seqs, _bf16) = split_layers(layers);
 
     assert_eq!(rebuilt.len(), 1, "{name}: layer count");
     assert_eq!(

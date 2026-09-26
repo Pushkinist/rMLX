@@ -536,7 +536,7 @@ producer path. Its gates, in order:
 8. For a rotor codec, the global `--rotor-qjl` toggle is off.
 9. `decode_fp16_k` is seeded.
 10. The storage variant is in the fused-QK table
-    (`storage_max_seq_for_fused_qk`), which returns the cache's `max_seq`.
+    (`fused_qk_max_seq`), which returns the cache's `max_seq`.
 11. The step does not overflow it (`prev_offset + new_seq <= max_seq`). The
     shadow populate path has no out-of-range clamp.
 

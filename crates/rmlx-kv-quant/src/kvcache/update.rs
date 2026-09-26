@@ -1269,8 +1269,8 @@ impl KvCache {
             self.offset
         );
         // Roll the fused-QK shadow's filled count back on BOTH the rotating
-        // and non-rotating paths. Today `try_fused_qk_dispatch` gates
-        // rotating storage out via `storage_max_seq_for_fused_qk`, so the
+        // and non-rotating paths. Today `update_and_sdpa` returns through
+        // the ring path before the fused-QK dispatch, so the
         // rotating branch should never have a shadow allocated — but the
         // assertion below makes
         // that explicit and the truncate call keeps the shadow filled
@@ -1280,7 +1280,7 @@ impl KvCache {
             debug_assert!(
                 self.rotating.is_none(),
                 "rotating cache should never have a fused-QK shadow allocated \
-                 (storage_max_seq_for_fused_qk returns None for rotating variants)"
+                 (update_and_sdpa returns through the ring path before the fused-QK dispatch)"
             );
             shadow.truncate_to(n);
         }

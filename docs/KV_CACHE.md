@@ -518,7 +518,8 @@ honours `RMLX_FUSED_QK=1`. Its life:
 The bf16 mirror stays maintained beside it as the fallback. A decode past
 `max_seq`, or rotor with QJL on, skips fused-QK for that step.
 `KvCache::reset` drops the shadow; `truncate_to` moves only its fill cursor.
-Rotating caches never get one (`storage_max_seq_for_fused_qk` is `None`).
+Rotating caches never get one: `update_and_sdpa` returns through the ring
+path before the fused-QK dispatch.
 Per-codec shapes and the dispatch wire-in are in `docs/KV_FUSED_KERNELS.md`
 § "Fused-QK head-major K storage".
 

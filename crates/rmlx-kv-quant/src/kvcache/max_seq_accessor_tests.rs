@@ -126,7 +126,7 @@ fn the_accessor_and_every_gate_read_what_the_old_reads_read() {
         let storage = &cache.storage;
         let max_seq = cache.max_seq();
         assert_eq!(
-            cache.storage_max_seq_for_fused_qk(),
+            cache.fused_qk_max_seq(),
             old_fused_qk_gate(storage, max_seq),
             "{label}: the fused-QK gate"
         );
@@ -140,10 +140,7 @@ fn the_accessor_and_every_gate_read_what_the_old_reads_read() {
     // above is not over one outcome only.
     let admitted = |gate: &dyn Fn(&KvCache) -> bool| caches.iter().filter(|(_, c)| gate(c)).count();
     for (name, n) in [
-        (
-            "fused-QK",
-            admitted(&|c| c.storage_max_seq_for_fused_qk().is_some()),
-        ),
+        ("fused-QK", admitted(&|c| c.fused_qk_max_seq().is_some())),
         ("geometry-only", admitted(&|c| c.storage.is_geometry_only())),
     ] {
         assert!(

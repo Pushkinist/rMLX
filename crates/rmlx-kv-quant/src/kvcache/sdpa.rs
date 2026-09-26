@@ -1632,7 +1632,7 @@ impl KvCache {
             return Ok(None);
         }
         // Provision this step before the first mutation: both the packed ring
-        // below and the bf16 V mirror further down are capped by the storage
+        // below and the bf16 V mirror further down are capped by the cache
         // `max_seq`, so it has to cover `prev_seq + new_seq` first.
         self.ensure_decode_capacity(prev_seq + new_seq)?;
         super::update_rotor::rotor_k_only_gpu_append(self, new_k, &new_shape, device)?;
@@ -2160,7 +2160,7 @@ impl KvCache {
             return Ok(None);
         }
         // Provision this step before the first mutation: both the packed ring
-        // below and the bf16 V mirror further down are capped by the storage
+        // below and the bf16 V mirror further down are capped by the cache
         // `max_seq`, so it has to cover `prev_seq + new_seq` first.
         self.ensure_decode_capacity(prev_seq + new_seq)?;
         super::update_iso::iso_k_only_gpu_append(self, new_k, &new_shape, device)?;

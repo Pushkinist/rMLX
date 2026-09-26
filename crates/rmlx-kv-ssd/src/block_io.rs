@@ -91,15 +91,13 @@ use rmlx_kv_quant::KvQuant;
 /// inside the reconstructed `KvStorage`).
 type NoneBf16Seed = Option<(Array, Array)>;
 
-/// Result of [`KvBlockReader::hydrate`]: per-layer storages, the per-layer
-/// `max_seq` each geometry recorded, per-layer off-storage bf16 seeds, and the
+/// One hydrated attention layer: its storage, the `max_seq` its geometry
+/// recorded, and its off-storage bf16 seed.
+type HydratedLayer = (KvStorage, i32, NoneBf16Seed);
+
+/// Result of [`KvBlockReader::hydrate`]: one entry per attention layer, and the
 /// linear-attn recurrent caches.
-type HydratedLayers = (
-    Vec<KvStorage>,
-    Vec<i32>,
-    Vec<NoneBf16Seed>,
-    Vec<LinearAttnCache>,
-);
+type HydratedLayers = (Vec<HydratedLayer>, Vec<LinearAttnCache>);
 
 // ── Metadata keys ───────────────────────────────────────────────────────────
 
@@ -502,7 +500,7 @@ fn read_caches_inner(
     let dur_read_us = t_read.elapsed().as_micros() as u64;
 
     let t_dequant = Instant::now();
-    let (storages, max_seqs, none_bf16, lin_caches) = reader.hydrate(model_id, kv_quant, device)?;
+    let (layers, lin_caches) = reader.hydrate(model_id, kv_quant, device)?;
     let offset = reader.seq_len()?;
     let dur_dequant_us = t_dequant.elapsed().as_micros() as u64;
 
@@ -511,12 +509,10 @@ fn read_caches_inner(
     // layer-ordered at spill — see `write_caches` contract. A `None`-storage
     // layer that carried an off-storage bf16 prefix re-seeds the decode buffers
     // so an exact-hit replay reads the real K/V instead of zeros.
-    let kv_caches: Vec<KvCache> = storages
+    let kv_caches: Vec<KvCache> = layers
         .into_iter()
-        .zip(max_seqs)
-        .zip(none_bf16)
         .enumerate()
-        .map(|(layer_idx, ((s, max_seq), bf16))| {
+        .map(|(layer_idx, (s, max_seq, bf16))| {
             let cache =
                 KvCache::from_storage(s, max_seq, kv_quant, offset, layer_idx, policy, shares_kv);
             match bf16 {
@@ -1962,24 +1958,23 @@ impl KvBlockReader {
             .parse()
             .map_err(|e| BlockIoError::Header(format!("bad n_layers: {e}")))?;
 
-        let mut layers = Vec::with_capacity(n_layers);
-        let mut max_seqs = Vec::with_capacity(n_layers);
-        let mut none_bf16: Vec<NoneBf16Seed> = Vec::with_capacity(n_layers);
+        let mut layers: Vec<HydratedLayer> = Vec::with_capacity(n_layers);
         for idx in 0..n_layers {
             let geom = read_meta(&header, &geom_key(idx))?;
-            layers.push(read_layer(&st, idx, &geom, device)?);
-            max_seqs.push(geom_i32(&geom, "max_seq")?);
+            let storage = read_layer(&st, idx, &geom, device)?;
+            let max_seq = geom_i32(&geom, "max_seq")?;
             // For a "none_bf16" layer (KvQuant::None spill that carried the
             // off-storage bf16 prefix), restore the K/V pair so the caller can
             // re-seed the parent KvCache's decode buffers. All other tags hold
             // their K/V inside the reconstructed KvStorage and have no bf16 seed.
-            if geom_tag(&geom) == "none_bf16" {
+            let bf16 = if geom_tag(&geom) == "none_bf16" {
                 let k = tensor_req(&st, &format!("l{idx}.k.bf16"))?;
                 let v = tensor_req(&st, &format!("l{idx}.v.bf16"))?;
-                none_bf16.push(Some((k, v)));
+                Some((k, v))
             } else {
-                none_bf16.push(None);
-            }
+                None
+            };
+            layers.push((storage, max_seq, bf16));
         }
 
         let n_linear: usize = header
@@ -1996,7 +1991,7 @@ impl KvBlockReader {
             linear.push(lac);
         }
 
-        Ok((layers, max_seqs, none_bf16, linear))
+        Ok((layers, linear))
     }
 }
 
