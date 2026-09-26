@@ -75,26 +75,34 @@ fn j6_aggregate_red_when_any_red() {
 
 // ── Claim check (unit level) ────────────────────────────────────────────────
 
-/// Claim check on a non-existent file is red.
 #[test]
-fn j6_claim_missing_file_is_red() {
-    // Port unlikely to have a real claim file.
-    let port: u16 = 19999;
-    let _ = std::fs::remove_file(format!("/tmp/rmlx.{port}.claim"));
-    let line = check_claim(port);
-    assert_eq!(line.status, Status::Red, "missing claim file must be red");
+fn j6_claim_held_is_green_and_names_the_holder() {
+    let line = claim_line(Err(ClaimError::AlreadyHeld {
+        holder_pid: Some(4242),
+        holder_command: "rmlx serve --port 8080".to_owned(),
+    }));
+    assert_eq!(line.status, Status::Green, "a held claim must be green");
+    assert!(line.detail.contains("4242"), "{}", line.detail);
+    assert!(
+        line.detail.contains("rmlx serve --port 8080"),
+        "{}",
+        line.detail
+    );
 }
 
-/// Claim check with a valid PID in the file but no actual process is red.
 #[test]
-fn j6_claim_dead_pid_is_red() {
-    let port: u16 = 19998;
-    let path = format!("/tmp/rmlx.{port}.claim");
-    // Write a PID that is virtually guaranteed to not exist (PID 2^22).
-    std::fs::write(&path, "4194303").expect("write claim file");
-    let line = check_claim(port);
-    let _ = std::fs::remove_file(&path);
-    assert_eq!(line.status, Status::Red, "dead PID must produce red");
+fn j6_claim_free_is_red() {
+    let line = claim_line(Ok(()));
+    assert_eq!(line.status, Status::Red, "a free claim must be red");
+}
+
+#[test]
+fn j6_claim_io_error_is_red() {
+    let line = claim_line(Err(ClaimError::Io {
+        path: PathBuf::from("lock"),
+        source: std::io::Error::other("probe failed"),
+    }));
+    assert_eq!(line.status, Status::Red, "a claim I/O error must be red");
 }
 
 // ── DB check ────────────────────────────────────────────────────────────────

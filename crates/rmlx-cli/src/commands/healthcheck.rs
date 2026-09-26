@@ -1,6 +1,6 @@
 // CLI binary: user-facing output. tracing not appropriate for command results.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
-// unsafe_code: POSIX libc FFI — libc::kill (process-liveness probe) + libc::statvfs (disk-space check)
+// unsafe_code: POSIX libc FFI — libc::statvfs (disk-space check)
 #![allow(unsafe_code)]
 #![allow(trivial_numeric_casts)]
 
@@ -27,7 +27,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rmlx_server::{ModelRegistry, RegistryConfig};
+use rmlx_server::{ClaimError, ModelRegistry, RegistryConfig};
 use tracing::debug;
 
 // ---------------------------------------------------------------------------
@@ -107,7 +107,7 @@ pub(crate) fn run_healthcheck(
 
     // ── 1. Claim check ────────────────────────────────────────────────────────
     if let Some(p) = port {
-        let line = check_claim(p);
+        let line = check_claim();
         if line.status == Status::Red {
             red_checks.push(line.check.clone());
         }
@@ -212,53 +212,29 @@ pub(crate) fn run_healthcheck(
 // Individual checks
 // ---------------------------------------------------------------------------
 
-/// Check 1: claim file — exists, PID parses, process alive via `kill(pid, 0)`.
-fn check_claim(port: u16) -> CheckLine {
-    let path = PathBuf::from(format!("/tmp/rmlx.{port}.claim"));
+/// Check 1: the Metal claim. A server on the probed port holds it, so a held
+/// claim is green and a free claim is red. The probe takes a free claim for a
+/// moment and releases it at once.
+fn check_claim() -> CheckLine {
+    claim_line(rmlx_server::try_claim().map(drop))
+}
 
-    if !path.exists() {
-        return CheckLine::new(
-            "claim",
-            Status::Red,
-            format!("claim file /tmp/rmlx.{port}.claim not found"),
-        );
-    }
-
-    let contents = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) => {
-            return CheckLine::new("claim", Status::Red, format!("cannot read claim file: {e}"));
-        }
-    };
-
-    let pid: u32 = match contents.trim().parse() {
-        Ok(p) => p,
-        Err(_) => {
-            return CheckLine::new(
+fn claim_line(probe: Result<(), ClaimError>) -> CheckLine {
+    match probe {
+        Err(ClaimError::AlreadyHeld {
+            holder_pid,
+            holder_command,
+        }) => {
+            let pid = holder_pid.map_or_else(|| "unknown".to_owned(), |pid| pid.to_string());
+            debug!(pid, "claim check: held");
+            CheckLine::new(
                 "claim",
-                Status::Red,
-                format!("claim file body is not a valid PID: {:?}", contents.trim()),
-            );
+                Status::Green,
+                format!("held by pid={pid} ({holder_command})"),
+            )
         }
-    };
-
-    // Use kill(pid, 0) to check if the process is alive (signal 0 = existence probe).
-    // SAFETY: kill(2) is safe to call with any PID and signal 0.
-    let alive = unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
-
-    if alive {
-        debug!(port, pid, "claim check: process alive");
-        CheckLine::new(
-            "claim",
-            Status::Green,
-            format!("port={port} pid={pid} alive"),
-        )
-    } else {
-        CheckLine::new(
-            "claim",
-            Status::Red,
-            format!("claim file exists (pid={pid}) but process is not alive"),
-        )
+        Ok(()) => CheckLine::new("claim", Status::Red, "no process holds the Metal claim"),
+        Err(e) => CheckLine::new("claim", Status::Red, format!("{e}")),
     }
 }
 

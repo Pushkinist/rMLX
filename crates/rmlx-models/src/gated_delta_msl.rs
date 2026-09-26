@@ -49,7 +49,7 @@
 //! # Single-process GPU claim
 //!
 //! Per CLAUDE.md "Single MLX process per Mac" rule, callers must hold the
-//! `/tmp/rmlx.<port>.claim` lock before dispatching.
+//! Metal claim before dispatching.
 
 #![allow(clippy::float_cmp)]
 use rmlx_core::error::{Error, Result};

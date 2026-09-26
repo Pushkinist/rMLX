@@ -4,13 +4,13 @@
 //!
 //! Centralises the parsing logic used by multiple subcommands (`serve`,
 //! `info`, `baseline`, `eval`) so the same string → type conversions and
-//! claim-file semantics are applied consistently.
+//! claim semantics are applied consistently.
 //!
 //! # Public API
 //!
 //! - [`parse_device`] — `"cpu"` / `"gpu"` string → [`rmlx_mlx::Device`].
 //! - [`acquire_claim_for_device`] — acquire the single-MLX-process claim
-//!   file before any MLX call; aborts with a clear message on contention.
+//!   before any MLX call; exits with code 11 on contention.
 //! - [`parse_kv_quant`] — `--kv-quant` string → `Option<KvQuant>`.
 //! - [`parse_kv_preset`] — `--kv-preset` name → [`KvPresetArg`] via the
 //!   static preset table. `"auto"` yields `KvPresetArg::Auto`; unknown names
@@ -48,40 +48,27 @@ pub(crate) fn parse_device(s: &str) -> anyhow::Result<Device> {
     }
 }
 
-/// Acquire the Metal claim file for `device` and `port`.
+/// Acquire the Metal claim for `device`.
 ///
-/// - `Device::Gpu` → calls `try_claim(port)`. On conflict, logs the error and
-///   exits with code 11 (CLAUDE.md mandate).
+/// - `Device::Gpu` → calls `try_claim()`. When another process holds the
+///   claim, prints the refusal and exits with code 11.
 /// - `Device::Cpu` → no-op (returns `None`).
 pub(crate) fn acquire_claim_for_device(
     device: Device,
-    port: u16,
 ) -> anyhow::Result<Option<rmlx_server::MetalClaim>> {
     if device == Device::Cpu {
         return Ok(None);
     }
-    match try_claim(port) {
+    match try_claim() {
         Ok(claim) => Ok(Some(claim)),
-        Err(ClaimError::AlreadyHeld {
-            holder_pid,
-            port: p,
-        }) => {
-            error!(
-                holder_pid,
-                port = p,
-                "Metal claim held by another rMLX process — refusing to start"
-            );
-            eprintln!(
-                "error: another rMLX process (PID {holder_pid}) holds the Metal claim for port {p}.\n\
-                 Hint: stop it with `kill {holder_pid}` or via the /v1/models/<id>/unload API.\n\
-                 rMLX exits with code 11."
-            );
+        Err(e @ ClaimError::AlreadyHeld { .. }) => {
+            error!(error = %e, "Metal claim held by another process — refusing to start");
+            eprintln!("error: {e}\nrMLX exits with code 11.");
             std::process::exit(11);
         }
         Err(e) => {
             error!(
                 error = %e,
-                port,
                 "D-class startup: Metal claim I/O error — cannot acquire GPU lock"
             );
             Err(anyhow::anyhow!("Metal claim: {e}"))

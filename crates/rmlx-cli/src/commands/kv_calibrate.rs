@@ -647,11 +647,11 @@ use rmlx_models::arch;
 use rmlx_models::arch::Architecture;
 use rmlx_models::qwen3::Qwen3Text;
 
-/// Load the Qwen3 model on GPU. Holds the claim on port 0 only for the load:
+/// Load the Qwen3 model on GPU. Holds the claim only for the load:
 /// the claim drops when this function returns, before any measurement runs.
 fn load_qwen3_for_calibration(model_dir: &Path) -> anyhow::Result<Qwen3Text> {
     let device = Device::Gpu;
-    let _claim = crate::commands::parse::acquire_claim_for_device(device, 0)?;
+    let _claim = crate::commands::parse::acquire_claim_for_device(device)?;
 
     let arch = arch::load_model(model_dir, device, &arch::LoadOpts::default())
         .map_err(|e| anyhow::anyhow!("load_model: {e}"))?;

@@ -46,7 +46,6 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use rmlx_core::runinfo::make_run_id;
 use rmlx_metrics::events::EventRecorder;
-use rmlx_server::SENTINEL_PORT;
 use startup::{
     init_tracing, print_cache_type_table, print_kv_quant_residency_table, LogLevel, MetricsArg,
 };
@@ -1901,7 +1900,7 @@ fn main() -> Result<()> {
     }
 
     // `rmlx kv-calibrate` runs without opening the EventRecorder. The
-    // head-budget recipes take the claim on port 0 for the model load only;
+    // head-budget recipes take the claim for the model load only;
     // the weight-norm recipes (turbo*) are CPU-only.
     if let Cmd::KvCalibrate {
         model,
@@ -2248,7 +2247,7 @@ fn main() -> Result<()> {
             }
 
             // Acquire Metal claim for GPU runs; CPU-only skips.
-            let _claim = acquire_claim_for_device(dev, port)?;
+            let _claim = acquire_claim_for_device(dev)?;
             // Build YARN override from CLI flags. None when either flag is absent.
             let yarn_override = yarn_factor.map(|factor| rmlx_models::qwen3::YarnOverride {
                 factor,
@@ -2335,7 +2334,7 @@ fn main() -> Result<()> {
                     kv_group_size,
                 )?
             };
-            let _claim = acquire_claim_for_device(dev, SENTINEL_PORT)?;
+            let _claim = acquire_claim_for_device(dev)?;
             println!("rmlx chat   model={}  device={device}", model.display());
         }
         Cmd::Transcribe {
@@ -2351,7 +2350,7 @@ fn main() -> Result<()> {
             let dev = parse_device(&device)?;
             // ASR holds Metal; acquire the single-MLX claim like the other
             // model-loading subcommands.
-            let _claim = acquire_claim_for_device(dev, SENTINEL_PORT)?;
+            let _claim = acquire_claim_for_device(dev)?;
             let args = commands::transcribe::TranscribeArgs {
                 audio: &audio,
                 model: &model,
@@ -2429,7 +2428,7 @@ fn main() -> Result<()> {
             };
             // Claim only when a probe is requested (probes use the MLX runtime).
             let _claim = if probe_forward || probe_smoke {
-                Some(acquire_claim_for_device(dev, SENTINEL_PORT)?)
+                Some(acquire_claim_for_device(dev)?)
             } else {
                 None
             };
@@ -2546,7 +2545,7 @@ fn main() -> Result<()> {
                     kv_group_size,
                 )?
             };
-            let _claim = acquire_claim_for_device(dev, SENTINEL_PORT)?;
+            let _claim = acquire_claim_for_device(dev)?;
 
             // Resolve --prompt-tokens → canonical longctx file when present.
             // The prompts/ dir lives at the workspace root; locate it via the
@@ -2685,7 +2684,7 @@ fn main() -> Result<()> {
                     kv_group_size,
                 )?
             };
-            let _claim = acquire_claim_for_device(dev, SENTINEL_PORT)?;
+            let _claim = acquire_claim_for_device(dev)?;
 
             let prompts_root = resolve_prompts_root(prompts_dir);
             let (prompt_path, prompt_label) =
@@ -2778,11 +2777,8 @@ fn main() -> Result<()> {
                     )?;
                     (dev, Some(kq))
                 };
-                // claim the Metal GPU before loading the model so a
-                // running `rmlx serve` does not contend on the single-process
-                // claim file. Mirrors `run_baseline`'s acquire pattern --
-                // `SENTINEL_PORT` flags the CLI-side (non-HTTP) claim holder.
-                let _claim = acquire_claim_for_device(dev, SENTINEL_PORT)?;
+                // Claim the Metal GPU before loading the model.
+                let _claim = acquire_claim_for_device(dev)?;
                 run_ppl(
                     &model,
                     &text_file,

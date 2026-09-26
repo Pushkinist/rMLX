@@ -48,7 +48,7 @@ pub mod stop_matcher;
 pub mod tokenizer_io;
 pub mod tool_parser;
 
-pub use claim::{try_claim, ClaimError, MetalClaim, SENTINEL_PORT};
+pub use claim::{try_claim, ClaimError, MetalClaim};
 
 use std::net::SocketAddr;
 
@@ -178,20 +178,15 @@ pub async fn serve(state: AppState, host: &str, port: u16) -> anyhow::Result<()>
 
     info!(address = %addr, "rmlx-server listening");
 
-    // Graceful shutdown on SIGTERM/SIGINT so the future returns normally and the
-    // caller's `MetalClaim` guard `Drop` runs — proactively removing the claim
-    // file instead of leaving it for the next start's stale-reclaim path. This
-    // only covers signals tokio can intercept; SIGKILL/crash/power-loss still
-    // rely on acquisition-side stale-reclaim (see `claim::try_claim`).
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|e| anyhow::anyhow!("serve: {e}"))
 }
 
-/// Resolve when the process receives SIGINT (Ctrl-C) or SIGTERM (`kill` /
-/// `pkill`). Used as the axum graceful-shutdown trigger so normal teardown —
-/// including the `MetalClaim` `Drop` — runs on signalled exit.
+/// Resolve when the process receives SIGINT (Ctrl-C) or SIGTERM (`kill`).
+/// Used as the axum graceful-shutdown trigger so normal teardown runs on
+/// signalled exit.
 // cancel-safe: only awaits signal-notification futures; no partial state on drop.
 async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
