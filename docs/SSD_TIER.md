@@ -387,6 +387,13 @@ A `.kvb` is a safetensors file. Its `__metadata__`:
 A reader whose `model_id` or `kv_quant` differs fails with
 `BlockIoError::ModelIdMismatch` or `KvQuantMismatch` before any tensor read.
 
+A hydrated layer gets the block's `kv_quant`, except a `Mixed` store. Its
+geometry records `k_bits`, `v_bits`, the group sizes and `rotate_k`, and the
+layer gets the `Mixed` or `RotK` codec they give. A boundary layer of a `Mixed`
+or `RotK` block holds the 8-bit form of that codec
+(`docs/KV_LAYER_POLICY.md` § "Layer-adaptive overrides"), and decode reads its
+widths from the codec.
+
 **What a layer writes follows what it holds.**
 `KvStorage::is_geometry_only()` decides:
 

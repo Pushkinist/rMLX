@@ -509,18 +509,19 @@ fn read_caches_inner(
     // layer-ordered at spill — see `write_caches` contract. A `None`-storage
     // layer that carried an off-storage bf16 prefix re-seeds the decode buffers
     // so an exact-hit replay reads the real K/V instead of zeros.
-    let kv_caches: Vec<KvCache> = layers
+    let kv_caches = layers
         .into_iter()
         .enumerate()
         .map(|(layer_idx, (s, max_seq, bf16))| {
+            let quant = spilled_codec(&s, kv_quant)?;
             let cache =
-                KvCache::from_storage(s, max_seq, kv_quant, offset, layer_idx, policy, shares_kv);
-            match bf16 {
+                KvCache::from_storage(s, max_seq, quant, offset, layer_idx, policy, shares_kv);
+            Ok(match bf16 {
                 Some((k, v)) => cache.with_decode_fp16_seed(k, v),
                 None => cache,
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<KvCache>>>()?;
     let dur_finalize_us = t_finalize.elapsed().as_micros() as u64;
 
     Ok(Some((
@@ -531,6 +532,35 @@ fn read_caches_inner(
         dur_dequant_us,
         dur_finalize_us,
     )))
+}
+
+/// The codec a hydrated layer was spilled with.
+///
+/// A boundary layer of a `Mixed` or `RotK` block holds the 8-bit form of the
+/// block's codec, so a `Mixed` store gives its own widths, group sizes and K
+/// rotation. Every other store holds the block's codec `block_quant`.
+fn spilled_codec(storage: &KvStorage, block_quant: KvQuant) -> Result<KvQuant> {
+    let KvStorage::Mixed { state } = storage else {
+        return Ok(block_quant);
+    };
+    let bits =
+        |x: i32| u8::try_from(x).map_err(|_| Error::Mlx(format!("KV block read: Mixed bits {x}")));
+    let group = |x: i32| {
+        u16::try_from(x).map_err(|_| Error::Mlx(format!("KV block read: Mixed group size {x}")))
+    };
+    Ok(if state.rotate_k {
+        KvQuant::RotK {
+            v_bits: bits(state.v_bits)?,
+            v_group_size: group(state.v_group_size)?,
+        }
+    } else {
+        KvQuant::Mixed {
+            k_bits: bits(state.k_bits)?,
+            v_bits: bits(state.v_bits)?,
+            k_group_size: group(state.k_group_size)?,
+            v_group_size: group(state.v_group_size)?,
+        }
+    })
 }
 
 /// Shared serialization core over an owned-slice of storages.

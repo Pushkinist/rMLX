@@ -1,7 +1,8 @@
 //! A hydrated layer holds `None` storage or the same storage variant its own
 //! codec builds.
 //!
-//! `read_caches` hands every hydrated layer the block's `kv_quant`.
+//! `read_caches` hands every hydrated layer the block's `kv_quant`, except a
+//! `Mixed` store, which gets the codec its own geometry records.
 //! `KvCache::update` takes its entry from the storage and `exit_prefill` from
 //! the codec. The two keys agree when a non-`None` hydrated storage has the
 //! same storage variant `KvStorage::new` builds for that codec. The test

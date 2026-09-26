@@ -1103,3 +1103,7 @@ fn a_block_does_not_hydrate_under_a_different_layout_key() {
          running another"
     );
 }
+
+/// Boundary layers whose codec differs from the base, through the same tier.
+#[path = "ssd_boundary_codec_tests.rs"]
+mod ssd_boundary_codec_tests;
