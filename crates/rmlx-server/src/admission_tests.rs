@@ -192,7 +192,7 @@ fn tick_scale_up_when_est_itl_below_deadband() {
         });
     }
 
-    // L2: use tick_force() to bypass TICK_INTERVAL without the fragile
+    // Use tick_force() to bypass TICK_INTERVAL without the fragile
     // checked_sub pattern.
     ctrl.tick_force();
     // Depth should have increased from 4 to 5.
@@ -214,7 +214,7 @@ fn tick_scale_down_after_hold_ticks() {
         });
     }
 
-    // L2: use tick_force() to bypass TICK_INTERVAL without the fragile
+    // Use tick_force() to bypass TICK_INTERVAL without the fragile
     // checked_sub pattern.
     for _ in 0..HOLD_TICKS {
         ctrl.tick_force();
@@ -244,7 +244,7 @@ fn tick_deadband_holds_no_change() {
         });
     }
 
-    // L2: use tick_force() to bypass TICK_INTERVAL without the fragile
+    // Use tick_force() to bypass TICK_INTERVAL without the fragile
     // checked_sub pattern.
     ctrl.tick_force();
 

@@ -1,7 +1,7 @@
 #![warn(missing_docs)]
 //! Per-architecture inference graphs.
 //!
-//! Stage 1 wired architectures:
+//! Architecture modules include:
 //! `gemma4` — Gemma4ForConditionalGeneration (mxfp8 quantized; 26B has MoE block).
 //! `gemma3` — Gemma3ForConditionalGeneration (affine-int8 quantized, e.g. medgemma).
 //! `qwen2` — Qwen2ForCausalLM (dense, affine quantized).

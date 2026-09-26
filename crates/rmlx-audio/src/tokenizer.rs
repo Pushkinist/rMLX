@@ -75,14 +75,13 @@ pub const TOK_NO_TIMESTAMPS: u32 = 50_364;
 /// First timestamp token `<|0.00|>`. Timestamps run 50365..=51865 in 0.02 s steps.
 pub const TOK_TIMESTAMP_BEGIN: u32 = 50_365;
 
-/// Language token IDs for the 99 supported languages.
+/// Language token IDs for the 100 supported languages (50 259..=50 358).
 ///
 /// Offset from `<|en|>` (50 259): language codes in alphabetical order as
 /// stored in the Whisper vocab. For unknown codes, fall back to `<|en|>`.
 pub const fn language_token(lang_code: &str) -> u32 {
-    // This is a compile-time lookup of the most common languages.
-    // The full table is 99 entries; we inline the most common ones.
-    // For languages not listed, callers should use detect-language mode.
+    // Compile-time lookup over all 100 Whisper language codes; an unknown
+    // code falls back to `<|en|>`.
     match lang_code.as_bytes() {
         b"en" => 50_259,
         b"zh" => 50_260,

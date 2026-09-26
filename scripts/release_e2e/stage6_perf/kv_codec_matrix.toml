@@ -14,11 +14,10 @@
 # rows. Once populated, subsequent runs gate at `expected - 2%`.
 #
 # `skip_reason != ""` marks a cell as intentionally skipped:
-#   * "qwen-moe-A.y-rejected"   — A.y arch invariant: Qwen MoE (Qwen3.6-MoE-8bit)
-#                                 rejects K-side <= 4-bit codecs.
-#   * "fused-qk-dispatch-pending" — fused-QK / sparse-attn integration HOLD;
-#                                   do not gate on retrieval until production
-#                                   wiring lands.
+#   * "qwen-moe-low-k-rejected" — Qwen MoE (Qwen3.6-MoE-8bit) rejects every
+#                                 codec that stores K below 8 bits.
+#   * "fused-qk-dispatch-pending" — fused-QK / sparse-attn rows; never run.
+#   * a free-text reason        — the row's own comment says why.
 #
 # `cli_args` is the per-row `rmlx baseline` invocation suffix. The runner
 # prepends `--model <resolved>` and the smoke-prompt content.
@@ -147,11 +146,10 @@ model = "bonsai-8b"
 context_length = 32768
 expected_retrieval_pct = 0.0
 smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
-# measured=0.0000 on 2026-06-02 baseline run (all 5 NIAH depths failed).
-# Smoke probe passes (short-context generation is coherent). The zero retrieval
-# at 32k context is a correctness gap — Mixed is Bonsai's default auto-resolved
-# codec so this matters. Root cause TBD; follow-up filed. Skipped from gate.
-skip_reason = "mixed-bonsai-32k-niah-zero: NIAH retrieved 0.0 at 32k; root cause TBD"
+# A baseline run retrieved 0.0 at every NIAH depth while the smoke probe
+# passed. The zero retrieval at 32k context is an open correctness gap.
+# Skipped from gate.
+skip_reason = "mixed-bonsai-32k-niah-zero: NIAH retrieved 0.0 at 32k"
 cli_args = "--kv-quant mixed"
 niah_filter = "niah_bonsai_32k"
 
@@ -282,9 +280,9 @@ niah_filter = "niah_gemma4_32k"
 # ===========================================================================
 # qwen3.6-moe-8bit (Qwen3_5MoeForConditionalGeneration)
 #
-# A.y arch invariant: K-side <= 4-bit codecs are rejected. Six rows below
+# Qwen MoE rejects every codec that stores K below 8 bits. Six rows below
 # (TurboSym3/4, Iso3Sym/Iso4Sym, Rotor3Sym/Rotor4Sym) carry
-# skip_reason="qwen-moe-A.y-rejected" — they are present for cross-model
+# skip_reason="qwen-moe-low-k-rejected" — they are present for cross-model
 # inventory symmetry but never executed.
 # ===========================================================================
 
@@ -324,7 +322,7 @@ model = "qwen3.6-moe-8bit"
 context_length = 32768
 expected_retrieval_pct = 0.0
 smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
-skip_reason = "qwen-moe-A.y-rejected"
+skip_reason = "qwen-moe-low-k-rejected"
 cli_args = "--kv-preset speed"
 niah_filter = "niah_qwen36_32k"
 
@@ -334,7 +332,7 @@ model = "qwen3.6-moe-8bit"
 context_length = 32768
 expected_retrieval_pct = 0.0
 smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
-skip_reason = "qwen-moe-A.y-rejected"
+skip_reason = "qwen-moe-low-k-rejected"
 cli_args = "--kv-preset quality"
 niah_filter = "niah_qwen36_32k"
 
@@ -344,7 +342,7 @@ model = "qwen3.6-moe-8bit"
 context_length = 32768
 expected_retrieval_pct = 0.0
 smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
-skip_reason = "qwen-moe-A.y-rejected"
+skip_reason = "qwen-moe-low-k-rejected"
 cli_args = "--cache-type-k iso_k_3 --cache-type-v iso_v_3"
 niah_filter = "niah_qwen36_32k"
 
@@ -354,7 +352,7 @@ model = "qwen3.6-moe-8bit"
 context_length = 32768
 expected_retrieval_pct = 0.0
 smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
-skip_reason = "qwen-moe-A.y-rejected"
+skip_reason = "qwen-moe-low-k-rejected"
 cli_args = "--cache-type-k iso_k_4 --cache-type-v iso_v_4"
 niah_filter = "niah_qwen36_32k"
 
@@ -364,7 +362,7 @@ model = "qwen3.6-moe-8bit"
 context_length = 32768
 expected_retrieval_pct = 0.0
 smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
-skip_reason = "qwen-moe-A.y-rejected"
+skip_reason = "qwen-moe-low-k-rejected"
 cli_args = "--cache-type-k rotor_k_3 --cache-type-v rotor_v_3"
 niah_filter = "niah_qwen36_32k"
 
@@ -374,7 +372,7 @@ model = "qwen3.6-moe-8bit"
 context_length = 32768
 expected_retrieval_pct = 0.0
 smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
-skip_reason = "qwen-moe-A.y-rejected"
+skip_reason = "qwen-moe-low-k-rejected"
 cli_args = "--cache-type-k rotor_k_4 --cache-type-v rotor_v_4"
 niah_filter = "niah_qwen36_32k"
 
@@ -404,21 +402,18 @@ model = "qwen3.6-moe-8bit"
 context_length = 32768
 expected_retrieval_pct = 0.0
 smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
-# measured=0.0000 on 2026-06-02 baseline run (all 5 NIAH depths failed),
-# same symptom as bonsai-8b Mixed. Smoke probe passes at short context. The zero
-# retrieval at 32k context is a correctness gap — root cause TBD; follow-up
-# filed (shared with bonsai-8b Mixed). Skipped from gate.
-skip_reason = "mixed-qwen36-32k-niah-zero: NIAH retrieved 0.0 at 32k; root cause TBD"
+# Same symptom as bonsai-8b Mixed: 0.0 at every NIAH depth while the smoke
+# probe passed. An open correctness gap. Skipped from gate.
+skip_reason = "mixed-qwen36-32k-niah-zero: NIAH retrieved 0.0 at 32k"
 cli_args = "--kv-quant mixed"
 niah_filter = "niah_qwen36_32k"
 
 # ===========================================================================
-# HOLD rows — fused-QK / sparse-attn integration pending.
+# Fused-QK / sparse-attn rows.
 #
-# Production dispatch wiring is not yet landed; these codecs are kept in the
-# manifest so the inventory stays complete and so removing the `skip_reason`
-# value is the only edit required to bring them online once dispatch ships.
-# Until then they are unconditionally skipped (no smoke, no NIAH gate).
+# Kept for inventory. They are unconditionally skipped (no smoke, no NIAH
+# gate): no production path calls the sparse-attention dispatcher, and
+# `--fused-qk` is off by default.
 # ===========================================================================
 
 [[entries]]

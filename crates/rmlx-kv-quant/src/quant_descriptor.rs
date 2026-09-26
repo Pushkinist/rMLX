@@ -32,7 +32,7 @@ impl MirrorRule {
     }
 }
 
-/// When the codec's encode and dequant run on the CPU on the default hot path.
+/// Whether a Metal kernel runs the codec's store on the default hot path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum HotPathClass {
     Metal,
@@ -117,12 +117,13 @@ pub(super) struct CodecDescriptor {
     pub(super) mixed_params: Option<(i32, i32, i32, i32)>,
 }
 
-const ISO_V_ON_CPU: &str = "IsoQuant (quaternion SO(4)) V-only: a GPU iso encode/dequant branch \
-     exists but is shadowed by the bf16 decode seed; prefill V-encode runs \
-     on CPU";
+const ISO_V_READS_MIRROR: &str =
+    "IsoQuant (quaternion SO(4)) V-only: decode reads the bf16 mirror, so \
+     the iso V codec does not run on a cache that went through prefill";
 
-const ROTOR_ON_CPU: &str = "RotorQuant (Clifford Cl(3,0)) encode + dequant run on CPU on the \
-     default hot path (the bf16 decode seed shadows the GPU branch); the \
+const ROTOR_READS_MIRROR: &str =
+    "RotorQuant (Clifford Cl(3,0)): decode reads the bf16 mirror, so the \
+     rotor codec does not run on a cache that went through prefill; the \
      GPU fused-QK encoder is opt-in (--fused-qk)";
 
 const ROTOR_SYM_QJL_ON_CPU: &str = "RotorQuant (Clifford Cl(3,0)) symmetric with QJL enabled \
@@ -388,9 +389,9 @@ impl KvQuant {
                 k_only_iso_rotor: false,
                 mixed_params: None,
             },
-            // V-only iso: the bf16 decode seed shadows the GPU iso branch, and
-            // the V encode that runs (at prefill) is CPU. No ring path, so the
-            // store it would hold is the CPU-block form.
+            // V-only iso: decode reads the bf16 mirror and `exit_prefill` builds
+            // no store. No ring path, so the store it would hold is the
+            // CPU-block form.
             KvQuant::Iso3 => CodecDescriptor {
                 index: 14,
                 spelling: Fixed("iso3"),
@@ -398,7 +399,7 @@ impl KvQuant {
                 v_mirror: Always,
                 reads_packed_store: false,
                 carries_msl: true,
-                hot_path: Cpu(ISO_V_ON_CPU),
+                hot_path: Cpu(ISO_V_READS_MIRROR),
                 code_bits: (8, 3),
                 side_stores: (Some(Q8), Some(IsoBlocks)),
                 k_below_8bit: false,
@@ -412,7 +413,7 @@ impl KvQuant {
                 v_mirror: Always,
                 reads_packed_store: false,
                 carries_msl: true,
-                hot_path: Cpu(ISO_V_ON_CPU),
+                hot_path: Cpu(ISO_V_READS_MIRROR),
                 code_bits: (8, 4),
                 side_stores: (Some(Q8), Some(IsoBlocks)),
                 k_below_8bit: false,
@@ -479,8 +480,8 @@ impl KvQuant {
                 k_only_iso_rotor: true,
                 mixed_params: None,
             },
-            // V-only rotor: the bf16 decode seed shadows the GPU branch, so the
-            // rotor codec fires only at prefill, on the CPU.
+            // V-only rotor: decode reads the bf16 mirror and `exit_prefill`
+            // builds no store.
             KvQuant::Rotor3 => CodecDescriptor {
                 index: 20,
                 spelling: Fixed("rotor3"),
@@ -488,7 +489,7 @@ impl KvQuant {
                 v_mirror: Always,
                 reads_packed_store: false,
                 carries_msl: true,
-                hot_path: Cpu(ROTOR_ON_CPU),
+                hot_path: Cpu(ROTOR_READS_MIRROR),
                 code_bits: (8, 3),
                 side_stores: (Some(Q8), Some(Rotor)),
                 k_below_8bit: false,
@@ -502,7 +503,7 @@ impl KvQuant {
                 v_mirror: Always,
                 reads_packed_store: false,
                 carries_msl: true,
-                hot_path: Cpu(ROTOR_ON_CPU),
+                hot_path: Cpu(ROTOR_READS_MIRROR),
                 code_bits: (8, 4),
                 side_stores: (Some(Q8), Some(Rotor)),
                 k_below_8bit: false,
@@ -586,7 +587,7 @@ impl KvQuant {
                 v_mirror: Always,
                 reads_packed_store: false,
                 carries_msl: true,
-                hot_path: Cpu(ROTOR_ON_CPU),
+                hot_path: Cpu(ROTOR_READS_MIRROR),
                 code_bits: (3, u32::from(v_bits)),
                 side_stores: (Some(Rotor), Some(Turbo)),
                 k_below_8bit: true,
@@ -607,7 +608,7 @@ impl KvQuant {
                 v_mirror: Always,
                 reads_packed_store: false,
                 carries_msl: true,
-                hot_path: Cpu(ROTOR_ON_CPU),
+                hot_path: Cpu(ROTOR_READS_MIRROR),
                 code_bits: (4, u32::from(v_bits)),
                 side_stores: (Some(Rotor), Some(Turbo)),
                 k_below_8bit: true,

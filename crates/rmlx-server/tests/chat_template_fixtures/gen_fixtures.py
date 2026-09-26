@@ -14,7 +14,7 @@ Deterministic and re-runnable: overwrites existing fixtures.
 Snapshots absent on the current machine are skipped with a warning (do not
 fail generation — the round-trip test also skips gracefully when absent).
 
-TODO(A9): add Mistral / Llama3 fixtures when a local snapshot is available.
+Mistral / Llama3 fixtures are not generated: no local snapshot.
 """
 
 import json
@@ -159,7 +159,7 @@ def main():
             ):
                 generated += 1
 
-            # user + tools (A5 path — highest-value new coverage)
+            # user + tools (tools-injection path)
             if write_fixture(
                 "qwen3_5moe_tools", snap_dir, arch,
                 [{"role": "user", "content": "What is the weather in Paris?"}],

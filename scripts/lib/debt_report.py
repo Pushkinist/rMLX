@@ -1,4 +1,4 @@
-"""scripts/lib/debt_report.py — advisory technical-debt report.
+"""scripts/lib/debt_report.py — technical-debt report and the doc-size gate.
 
 Four sections, in order: sibling-file/fn similarity ("twins"), debt counters,
 the add/remove line ratio since the last tag, and oversized docs. Reads only
@@ -61,6 +61,11 @@ printed, and the "twin" measure is the normalised-diff idea that found the
 rotor/iso/turbo pairs by hand, generalised from those specific spellings to
 any digit run touching a letter, underscore or hyphen.
 
+``--check-doc-size`` is the third mode, a gate: it measures the same docs as
+the fourth section and exits 1 naming every doc over the cap and every doc
+carrying a ``size-exempt:`` marker, and exits 2 when the docs cannot be
+measured.
+
 Advisory (the four-section report only): this module never raises for
 anything short of a caller error (a ``--root`` that does not exist) — an
 unavailable round-loop-driver scan prints ``unavailable (...)`` in its
@@ -83,7 +88,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 SIM_THRESHOLD = 0.60
-DOC_SIZE_THRESHOLD_KB = 200
+DOC_SIZE_THRESHOLD_KIB = 40
+DOC_SIZE_CAP_BYTES = DOC_SIZE_THRESHOLD_KIB * 1024
+# No doc exempts itself: a marker at the start of any line fails the gate,
+# after any Markdown leader (comment, list item, quote, heading).
+SIZE_EXEMPT_MARKER = re.compile(r"^[ \t]*(?:(?:<!--|[-*+>]|#+|\d+\.)[ \t]*)*size-exempt:", re.M)
 LOC_THRESHOLD = 1000
 
 SIBLING_DIRS = ("crates/rmlx-kv-quant", "crates/rmlx-models")
@@ -965,20 +974,107 @@ def report_add_remove_ratio(root: Path, since: str | None, lines: list[str]) -> 
 # ---- section 4: doc sizes ---------------------------------------------------
 
 
+def git_ignored(root: Path, paths: list[str]) -> set[str]:
+    """The paths git ignores under `root`. Raises when git cannot tell: exit 0
+    is some ignored, 1 is none ignored, anything else (128: not a work tree) is
+    a question git did not answer."""
+    proc = subprocess.run(
+        ["git", "-C", str(root), "check-ignore", "--stdin"],
+        input="\n".join(paths),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode == 0:
+        return set(proc.stdout.splitlines())
+    if proc.returncode == 1:
+        return set()
+    raise RuntimeError(f"git check-ignore exit {proc.returncode}: {proc.stderr.strip()}")
+
+
+class DocSizeUnavailable(RuntimeError):
+    """The doc sizes could not be measured: no docs, or git could not say
+    which of them it ignores."""
+
+
+@dataclass
+class DocSizes:
+    measured: int
+    over: list[tuple[str, int]]
+    marked: list[str]
+
+
+def measure_doc_sizes(root: Path) -> DocSizes:
+    """Every `docs/**/*.md` git does not ignore, against the cap. The one
+    producer of both the advisory section and `--check-doc-size`."""
+    docs_dir = root / "docs"
+    if not docs_dir.is_dir():
+        raise DocSizeUnavailable(f"{docs_dir} is not a directory")
+    found = sorted(
+        f.relative_to(root).as_posix()
+        for f in docs_dir.rglob("*")
+        if f.is_file() and f.suffix.lower() == ".md"
+    )
+    try:
+        ignored = git_ignored(root, found)
+    except RuntimeError as err:
+        raise DocSizeUnavailable(str(err)) from err
+    docs = [name for name in found if name not in ignored]
+    if not docs:
+        raise DocSizeUnavailable(f"no docs/**/*.md under {root} to measure")
+    sizes = DocSizes(len(docs), [], [])
+    for name in docs:
+        size = (root / name).stat().st_size
+        if size > DOC_SIZE_CAP_BYTES:
+            sizes.over.append((name, size))
+        if SIZE_EXEMPT_MARKER.search((root / name).read_text(errors="replace")):
+            sizes.marked.append(name)
+    return sizes
+
+
+def doc_size_failures(sizes: DocSizes) -> list[str]:
+    failures = [
+        f"{name}  {size / 1024:.1f} KiB ({size} B) is over the {DOC_SIZE_THRESHOLD_KIB} KiB cap"
+        for name, size in sizes.over
+    ]
+    failures += [
+        f"{name}  carries a size-exempt marker; no doc may exempt itself from the cap"
+        for name in sizes.marked
+    ]
+    return failures
+
+
 def report_doc_sizes(root: Path, lines: list[str]) -> None:
     lines.append("")
-    lines.append(f"=== docs over {DOC_SIZE_THRESHOLD_KB} KB ===")
-    docs_dir = root / "docs"
-    over = []
-    if docs_dir.is_dir():
-        for f in sorted(docs_dir.glob("*.md")):
-            size_kb = f.stat().st_size / 1024
-            if size_kb > DOC_SIZE_THRESHOLD_KB:
-                over.append((f.name, size_kb))
-    if not over:
-        lines.append(f"  no docs/*.md file exceeds the {DOC_SIZE_THRESHOLD_KB} KB threshold")
-    for name, size_kb in over:
-        lines.append(f"  docs/{name}  {size_kb:.1f} KB")
+    lines.append(f"=== docs over {DOC_SIZE_THRESHOLD_KIB} KiB ===")
+    try:
+        sizes = measure_doc_sizes(root)
+    except DocSizeUnavailable as err:
+        lines.append(f"  unavailable ({err})")
+        return
+    if not sizes.over:
+        lines.append(f"  no docs/**/*.md file exceeds the {DOC_SIZE_THRESHOLD_KIB} KiB threshold")
+    for name, size in sizes.over:
+        lines.append(f"  {name}  {size / 1024:.1f} KiB")
+
+
+def check_doc_size(root: Path) -> int:
+    """`--check-doc-size`: exit 1 naming every failure, 2 when unmeasurable."""
+    try:
+        sizes = measure_doc_sizes(root)
+    except DocSizeUnavailable as err:
+        print(f"check-doc-size: unavailable ({err})", file=sys.stderr)
+        return 2
+    failures = doc_size_failures(sizes)
+    if failures:
+        for failure in failures:
+            print(f"check-doc-size: FAIL {failure}", file=sys.stderr)
+        return 1
+    print(
+        f"check-doc-size: ok ({sizes.measured} docs measured, none over the "
+        f"{DOC_SIZE_THRESHOLD_KIB} KiB cap)"
+    )
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1001,12 +1097,22 @@ def main(argv: list[str] | None = None) -> int:
         "population, over that population's own root, and exit, instead of "
         "the full report",
     )
+    parser.add_argument(
+        "--check-doc-size",
+        action="store_true",
+        help=f"fail (exit 1) naming every docs/**/*.md over {DOC_SIZE_THRESHOLD_KIB} KiB "
+        "and every size-exempt marker; exit 2 "
+        "when the docs cannot be measured",
+    )
     args = parser.parse_args(argv)
 
     root = Path(args.root)
     if not root.is_dir():
         print(f"debt-report: --root {root} is not a directory", file=sys.stderr)
-        return 1
+        return 2 if args.check_doc_size else 1
+
+    if args.check_doc_size:
+        return check_doc_size(root)
 
     if args.matched_lines:
         try:

@@ -115,7 +115,7 @@ fn main() -> anyhow::Result<()> {
         ids.push(s.token_id);
         None
     };
-    // A7.2: diag binary is greedy (temperature 0.0).
+    // Diag binary is greedy (temperature 0.0).
     let diag_sampler_cfg = rmlx_models::SamplerConfig {
         temperature: 0.0,
         top_p: 1.0,
@@ -138,7 +138,7 @@ fn main() -> anyhow::Result<()> {
         1,   // diag binary: single-slot cache
         &[], // diag binary: no EOS-stop, force full n_gen steps
         &mut step_fn,
-        None, // A6.2: no sampler constraint in diag.
+        None, // No sampler constraint in diag.
         &diag_sampler_cfg,
         &mut diag_rng,
         &diag_penalty_cfg,

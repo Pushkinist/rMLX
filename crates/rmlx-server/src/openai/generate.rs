@@ -36,7 +36,7 @@ use super::streaming::{handle_streaming_token, StreamState};
 
 // ── JSON extraction helpers ───────────────────────────────────────────────────
 
-/// A6.3/A6.5 helper: locate the first JSON value in `text` (skipping any
+/// Helper: locate the first JSON value in `text` (skipping any
 /// leading whitespace and/or a markdown code-fence header like ` ```json\n `),
 /// then extract the complete value and return it as an owned `String`.
 ///
@@ -257,16 +257,16 @@ pub(super) async fn generate_blocking(
     // the stream drains means the grammar was never applied to a single logit.
     // `None` when the request asked for no `response_format` constraint.
     response_format_engaged: Option<Arc<std::sync::atomic::AtomicBool>>,
-    // F1: drainer handle + ctx_max for TTFT/token-count DB emission.
+    // Drainer handle + ctx_max for TTFT/token-count DB emission.
     request_start: Instant,
     metrics_drainer: Option<&DrainerHandle>,
     ctx_max: i64,
-    // F14: process-lifetime token counters shared with AppState.
+    // Process-lifetime token counters shared with AppState.
     tokens_in: &Arc<std::sync::atomic::AtomicU64>,
     tokens_out: &Arc<std::sync::atomic::AtomicU64>,
-    // F10: correlation id resolved at handler entry.
+    // Correlation id resolved at handler entry.
     request_id: &str,
-    // F8: per-category error counters shared with AppState.
+    // Per-category error counters shared with AppState.
     error_counts: &ApiErrorCounters,
     // request lifecycle counters.
     requests_completed: &Arc<std::sync::atomic::AtomicU64>,
@@ -307,15 +307,15 @@ pub(super) async fn generate_blocking(
         None => generator.generate(req),
     };
     let mut text = String::new();
-    // A3: accumulate reasoning text separately. Stays empty for
+    // Accumulate reasoning text separately. Stays empty for
     // non-reasoning archs (the engine never sets `is_thinking == true`).
     let mut reasoning_text = String::new();
     let mut finish_reason: Option<String> = Some("stop".to_owned());
     let mut completion_tokens: u32 = 0;
-    // F1a: TTFT for non-streaming — measured when the first token arrives
+    // TTFT for non-streaming — measured when the first token arrives
     // from the decode thread, before any serialisation work. `None` until set.
     let mut ttft_ms_blocking: Option<u64> = None;
-    // A5.4: instantiate parser when caller supplied a format. `None` means
+    // Instantiate parser when caller supplied a format. `None` means
     // tools-disabled — every non-thinking piece flows straight to `text`.
     let mut parser: Option<ToolCallStreamParser> = parser_format.map(ToolCallStreamParser::new);
     let mut tool_calls_accum: Vec<ParsedToolCall> = Vec::new();
@@ -333,8 +333,8 @@ pub(super) async fn generate_blocking(
                 return engine_error_response(&e);
             }
             Ok(tok) => {
-                // F1a: capture TTFT on the very first token (completion_tokens == 0).
-                // F1a + : capture TTFT on the very first token and
+                // Capture TTFT on the very first token (completion_tokens == 0).
+                // Capture TTFT on the very first token and
                 // immediately persist to the events table off the tokio worker
                 // (spawn_blocking) so SQLite I/O never stalls the executor.
                 // Hoisted here (not post-loop) so TTFT survives mid-stream errors.
@@ -380,7 +380,7 @@ pub(super) async fn generate_blocking(
                 if let Some(lp) = tok.logprobs.clone() {
                     logprobs_accum.push(lp);
                 }
-                // A5.4 / A5.6: feed the parser regardless of think state.
+                // Feed the parser regardless of think state.
                 //
                 // A reasoning model whose prompt left a `<think>` open can
                 // emit the tool call WITHOUT first closing `</think>` — every
@@ -432,7 +432,7 @@ pub(super) async fn generate_blocking(
         }
     }
 
-    // A5.4: drain residual passthrough + completed tool_calls from the
+    // Drain residual passthrough + completed tool_calls from the
     // parser. Call `finalize` first (flips allow_eof_recovery=true) so that a
     // truncated Bonsai/Hermes `<tool_call>{json(unclosed)` at max_tokens/EOS
     // is balanced and recovered before draining.
@@ -490,7 +490,7 @@ pub(super) async fn generate_blocking(
         }
     }
 
-    // F1: emit TTFT + token counts to SQLite via the SPSC drainer.
+    // Emit TTFT + token counts to SQLite via the SPSC drainer.
     // Single-source: same counters that populate the `usage` response body.
     // One emit per metric per request — no double-emit possible.
     if let Some(drainer) = metrics_drainer {
@@ -521,7 +521,7 @@ pub(super) async fn generate_blocking(
         });
     }
     // TTFT events-table write hoisted to first-token time (finding #3).
-    // F14: increment process-lifetime token counters (single source: same
+    // Increment process-lifetime token counters (single source: same
     // values as the SPSC drainer emit above; no double-count possible).
     tokens_in.fetch_add(
         u64::from(prompt_token_count),
@@ -583,7 +583,7 @@ pub(super) async fn generate_blocking(
             (text, tool_calls_accum)
         }
     } else if json_object_mode {
-        // A6.3/A6.5: strip markdown fence wrapper for response_format=json_object/json_schema.
+        // Strip markdown fence wrapper for response_format=json_object/json_schema.
         (
             extract_top_level_json_value(&text).unwrap_or(text),
             tool_calls_accum,
@@ -605,7 +605,7 @@ pub(super) async fn generate_blocking(
     };
     let any_tool_calls = tool_calls_out.is_some();
     let finish_reason = select_finish_reason(any_tool_calls, finish_reason);
-    // F10: `id` uses the correlation id resolved at handler entry so that the
+    // `id` uses the correlation id resolved at handler entry so that the
     // response body and the X-Request-Id header always agree.
     // emit `choices[0].logprobs` only when at least one token carried a
     // logprob record (i.e. the request set `logprobs:true`).
@@ -639,7 +639,7 @@ pub(super) async fn generate_blocking(
         },
     };
 
-    // F10: echo the correlation id as a response header.
+    // Echo the correlation id as a response header.
     let mut resp = (StatusCode::OK, Json(response)).into_response();
     if let Ok(hv) = HeaderValue::from_str(request_id) {
         resp.headers_mut().insert("x-request-id", hv);
@@ -656,11 +656,11 @@ pub(super) async fn generate_blocking(
 /// axum flushes one SSE event per `Stream::poll_next`, so clients
 /// see tokens trickling in rather than arriving in one network burst.
 ///
-/// L6: `request_start` is the `Instant` captured at handler entry. TTFT is
+/// `request_start` is the `Instant` captured at handler entry. TTFT is
 /// computed as `request_start.elapsed()` when the first token arrives from the
 /// decode thread — before any SSE serialisation overhead.
 ///
-/// H4: `include_usage` / `prompt_token_count` support the usage-summary
+/// `include_usage` / `prompt_token_count` support the usage-summary
 /// chunk emitted before `[DONE]` when `stream_options.include_usage=true`.
 #[allow(clippy::too_many_arguments)]
 #[allow(
@@ -685,9 +685,9 @@ pub(super) async fn generate_streaming(
     bare_json_tool_call_mode: bool,
     include_usage: bool,
     prompt_token_count: u32,
-    // F1/F2: server effective_max_ctx for drainer MetricEvent.ctx_max.
+    // Server effective_max_ctx for drainer MetricEvent.ctx_max.
     ctx_max_for_metrics: i64,
-    // F10: correlation id resolved at handler entry.
+    // Correlation id resolved at handler entry.
     request_id: &str,
     // cold/warm flag for TTFT metric name selection.
     is_cold_request: bool,
@@ -727,12 +727,12 @@ pub(super) async fn generate_streaming(
             return engine_error_response(&e);
         }
         Some(Ok(tok)) => {
-            // L6: TTFT captured immediately when the first token arrives from
+            // TTFT captured immediately when the first token arrives from
             // the decode thread. This is the moment the first generated token
             // leaves the blocking decode loop and reaches the async layer —
             // before SSE serialisation, JSON encoding, or TCP flush.
             let ttft_ms = request_start.elapsed().as_millis() as u64;
-            tracing::info!(model_id, ttft_ms, "generate_streaming: TTFT (L6)");
+            tracing::info!(model_id, ttft_ms, "generate_streaming: TTFT");
             // Append to the rolling ring-buffer; evict oldest when full.
             {
                 let mut ring = state.ttft_store.lock();
@@ -744,7 +744,7 @@ pub(super) async fn generate_streaming(
                     ttft_ms,
                 });
             }
-            // F1a: emit TtftMs to SQLite via SPSC drainer (single emit per
+            // Emit TtftMs to SQLite via SPSC drainer (single emit per
             // request; kv_quant="none" matches queue-metric convention at
             // handler level — engine already emits kv-aware KV/ITL metrics).
             if let Some(ref drainer) = state.metrics_drainer {
@@ -784,7 +784,7 @@ pub(super) async fn generate_streaming(
     };
 
     let created = unix_now();
-    // F10: use the correlation id resolved at handler entry so that the id
+    // Use the correlation id resolved at handler entry so that the id
     // embedded in every SSE chunk matches the X-Request-Id response header.
     let id = format!("chatcmpl-{request_id}");
     let model = model_id.to_owned();
@@ -817,7 +817,7 @@ pub(super) async fn generate_streaming(
     // collecting all tokens into a Vec before yielding — axum flushes each
     // event as soon as the stream yields it.
     //
-    // A5.4: parser is threaded through the stream via `unfold`, which gives
+    // Parser is threaded through the stream via `unfold`, which gives
     // us mutable state without `Mutex`. Each input token may yield:
     // - 0 events (e.g. all bytes still buffered inside `<tool_call>` markers),
     // - 1 content / reasoning_content event (existing behaviour),
@@ -854,14 +854,14 @@ pub(super) async fn generate_streaming(
             include_usage,
             bare_json_tool_call_mode,
             bare_json_accum: String::new(),
-            // F1b/F2: drainer handle + context for per-request token-count emit.
+            // Drainer handle + context for per-request token-count emit.
             metrics_drainer: state.metrics_drainer.clone(),
             metrics_model_id: model_id.to_owned(),
             metrics_ctx_max: ctx_max_for_metrics,
-            // F14: share the process-lifetime counters from AppState.
+            // Share the process-lifetime counters from AppState.
             lifetime_tokens_in: Arc::clone(&state.tokens_in),
             lifetime_tokens_out: Arc::clone(&state.tokens_out),
-            // F8: share per-category error counters from AppState.
+            // Share per-category error counters from AppState.
             error_counts: state.error_counts.clone(),
             // share request lifecycle counters from AppState.
             lifetime_requests_completed: Arc::clone(&state.requests_completed),
@@ -897,7 +897,7 @@ pub(super) async fn generate_streaming(
         .chain(token_events)
         .chain(futures::stream::once(async move { done_event }));
 
-    // F10: add the correlation id as a response header on the SSE response.
+    // Add the correlation id as a response header on the SSE response.
     // Wrap the composed SSE stream in a GuardedStream so the
     // decode-lease guard drops when the stream is fully consumed or the
     // client disconnects. Box::pin the composed Chain<Chain<...>> so the

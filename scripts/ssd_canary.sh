@@ -4,7 +4,7 @@
 # Proves three things against a running rMLX server:
 #   1. SSD tier serves repeated cold-equivalent prompts (hit rate climbs on revisit).
 #   2. LRU eviction holds under budget pressure (SUM(byte_size) <= budget bytes).
-#   3. All step-2 timing slices fire: ssd_spill_ms, ssd_hydrate_ms, ssd_bytes_used,
+#   3. All SSD timing metrics fire: ssd_spill_ms, ssd_hydrate_ms, ssd_bytes_used,
 #      ssd_evict_total populate runs.db and /metrics.
 #
 # Usage:
@@ -47,7 +47,7 @@ HARDWARE_TAG="${RMLX_HARDWARE_TAG:-m5_max_128gb}"
 
 PORT="${PORT:-62265}"
 SSD_GB="${SSD_GB:-100}"
-EVICT_SSD_GB=0.05          # initial 50 MB; overridden dynamically after POPULATE (Option A)
+EVICT_SSD_GB=0.05          # initial 50 MB; overridden dynamically after POPULATE
 POPULATE_MAX_TOKENS=64
 TEMPERATURE=0
 SEED=42
@@ -591,7 +591,7 @@ echo "    total_ssd_hits    : ${TOTAL_SSD_HITS_POPULATE}"
 echo "    evict_total       : ${POPULATE_FINAL_EVICT}"
 echo ""
 
-# ── Compute dynamic EVICT budget (Option A) ───────────────────────────────────
+# ── Compute dynamic EVICT budget ───────────────────────────────────────────────
 # Formula: avg_block_bytes = SUM(byte_size) / COUNT(*) from index.db after
 # POPULATE. Budget = 4 × avg_block_bytes (the first 4 blocks fit; block 5+
 # evict). This makes eviction deterministic regardless of KV quant / model.
@@ -1047,7 +1047,7 @@ else
     echo "  WARN: ssd_bytes_used after POPULATE is 0" >&2
 fi
 
-# C4b: REVISIT total_ssd_hits >= 1 (FAIL — the fix's load-bearing assertion).
+# C4b: REVISIT total_ssd_hits >= 1 (FAIL — the load-bearing assertion).
 # Without the kvcache.rs dispatch fix, the server deadlocks on the hydrated SWA
 # layer and ssd_hits never increments. >= 1 total means at least one revisited
 # prompt was served from the SSD tier end-to-end (hydrate + generate completed).
@@ -1055,7 +1055,7 @@ if [[ "${TOTAL_SSD_HITS_REVISIT}" -ge 1 ]]; then
     echo "  [ok] REVISIT total_ssd_hits=${TOTAL_SSD_HITS_REVISIT} >= 1" >&2
 else
     VALIDATION_PASS=false
-    VALIDATION_NOTES="${VALIDATION_NOTES} [FAIL] REVISIT total_ssd_hits=${TOTAL_SSD_HITS_REVISIT} (expected >= 1; kvcache dispatch fix may not have landed)"
+    VALIDATION_NOTES="${VALIDATION_NOTES} [FAIL] REVISIT total_ssd_hits=${TOTAL_SSD_HITS_REVISIT} (expected >= 1)"
     echo "  FAIL: REVISIT total_ssd_hits=${TOTAL_SSD_HITS_REVISIT} (expected >= 1)" >&2
 fi
 
@@ -1090,7 +1090,7 @@ fi
 
 # Hydrate-panic note: if a bounce was triggered, document the observed failure mode.
 if $HYDRATE_PANIC_DETECTED; then
-    VALIDATION_NOTES="${VALIDATION_NOTES} [INFO] Hydrate-then-panic observed: SSD hydration succeeded but subsequent re-prefill panicked at kvcache.rs:2297 (storage mismatch: expected K8V8); server bounced automatically. Hydrate event rows ARE recorded. Root cause: hydrated KvCache has wrong KvStorage variant — bug in hydration path, not in spill or index."
+    VALIDATION_NOTES="${VALIDATION_NOTES} [INFO] Hydrate-then-panic observed: SSD hydration succeeded but the following re-prefill panicked; server bounced automatically. Hydrate event rows ARE recorded."
     echo "  [info] hydrate-panic detected and bounced; noted in summary." >&2
 fi
 

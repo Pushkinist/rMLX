@@ -1,105 +1,87 @@
 # Releasing rMLX
 
-The version lives in **one** place: `[workspace.package].version` in the root
-`Cargo.toml`. Member crates inherit it (`version.workspace = true`); internal
-path deps omit a version (`deny.toml` sets `allow-wildcard-paths = true`, and
-crates are `publish = false`). There is no separate `VERSION` file.
+The version lives in one place: `[workspace.package].version` in the root
+`Cargo.toml`. Member crates inherit it. Internal path dependencies carry no
+version: the crates are `publish = false`, and `deny.toml` sets
+`allow-wildcard-paths = true`.
 
-> **Hosted CI cannot build rMLX.** GitHub's macOS runners are VMs without a
-> usable Metal device, and the build links the Metal MLX libraries. CI
-> (`.github/workflows/ci.yml`) runs fmt + clippy + a best-effort release build
-> only. **All release artifacts are built locally** on an Apple-Silicon machine
-> with `brew install mlx-c` present.
+Hosted CI (`.github/workflows/ci.yml`) runs formatting, the source gates,
+the MSL compile, clippy and a release build. It runs the scripts' self-tests
+but no `cargo test`: the hosted macOS runners have no usable Metal device.
+Release artifacts are built on a local Apple Silicon machine with
+`brew install mlx-c`.
 
-## One-time setup
+## Setup
 
-- `brew install mlx-c` (pulls `mlx`) — provides the `libmlxc` / `libmlx` dylibs
-  the binary links.
-- A published tap repo `Pushkinist/homebrew-rmlx` for `brew tap`.
+- `brew install mlx-c` (pulls `mlx`) for the dylibs the binary links.
+- The tap repo `Pushkinist/homebrew-rmlx`.
+- `cosign` for signing, `gh` for the release.
 
-> **What the shipped artifacts resolve MLX to.** The release tarball links
-> `libmlx.dylib` / `libmlxc.dylib` through the moving
-> `/opt/homebrew/opt/...` symlinks, so **neither carries the MLX it was built
-> against** — each runs against whatever the installing user has, which
-> `depends_on "mlx-c"` resolves to the current release. Two consequences worth
-> holding onto when reading a user report:
->
->   - `events.mlx_nax` is read at run time from the metallib the user's
->     machine actually loaded (`crates/rmlx-mlx/src/nax.rs`), so a row from a
->     distributed binary is the *user's* answer, not the builder's. Nothing
->     about the nax capability is baked into the artifact.
-> - Run `make mlx-preflight` on the release machine before building the
->   release binary.
->   It does not change what users get, but it keeps the release machine's own
->   published prefill numbers honest.
->
-> The formula deliberately does **not** pin an MLX version — that would force a
-> downgrade on M1–M4 users for a benefit their hardware has no use for. The
-> rationale is in `packaging/homebrew/rmlx.rb`; do not "fix" it by adding a
-> version constraint.
+## What the artifacts link
+
+The linked dylibs' install names are the Homebrew `opt` symlinks
+(`crates/rmlx-mlx/build.rs`). So the tarball and the formula build both load
+the MLX that Homebrew links on the user's machine at run time.
+
+- The formula's `mlx-c` dependency carries no version. The reason is in
+  `packaging/homebrew/rmlx.rb`.
+- The binary reads `events.mlx_nax` from the metallib it loaded at run time
+  (`crates/rmlx-mlx/src/nax.rs`), so the value describes the user's MLX.
+- Run `make mlx-preflight` on the release machine before building.
 
 ## Branch model
 
-- **`main` holds released state only.** History on `main` is linear: a
-  commit reaches it only through a release fast-forward or a hotfix
-  fast-forward, never a merge commit. Tags live on `main`. A GitHub ruleset
-  on `main` requires a pull request, the `rustfmt` and `build + clippy`
-  checks, and linear history, and forbids force-push, deletion, and any push
-  or merge from a non-maintainer.
-- **`next/<name>` is the accumulation branch** open between releases (for
-  example `next/kv-quant-cleanup`). A GitHub ruleset on `next/*` requires
-  a pull request and the same checks, allows only the squash merge method,
-  and restricts force-push, deletion, and merges to maintainers.
-- **One issue = one branch = one PR = one commit on `next/<name>`.** See
-  `CONTRIBUTING.md` §Workflow for the day-to-day flow: branch from
-  `next/<name>`, rebase onto it to stay current, one PR per issue, squash-merged
-  by a maintainer.
-- **A release moves `next/<name>` onto `main` by fast-forward** — see step 4
-  below. A hotfix moves a `hotfix/<issue>` branch onto `main` the same way —
-  see Hotfix below.
+- **`main` holds the released state.** Its history is linear and tags live
+  on it. It takes the release and hotfix fast-forwards, and PRs merged by
+  rebase: the formula PR of step 9 and every Dependabot PR target `main`.
+- **`next/<name>` accumulates the next release.** Each issue lands as one
+  squash-merged PR, one commit. The day-to-day flow is in `CONTRIBUTING.md`
+  §Workflow.
+- **A release fast-forwards `next/<name>` onto `main`**; a hotfix
+  fast-forwards `hotfix/<issue>` onto `main`.
+
+The GitHub rulesets enforce this:
+
+| Ruleset | Rules |
+|---|---|
+| `main` | Pull request, rebase merge only; checks `rustfmt` and `build + clippy`, branch up to date; linear history; no force-push, no deletion, no direct update |
+| `next/*` | Pull request, squash merge only; the same two checks, branch up to date; no force-push, no deletion |
+
+So `main` accepts a PR merged by rebase, or a fast-forward push by a
+repository admin or maintainer. Admins and maintainers bypass both rulesets;
+that bypass is what lets the fast-forward push below reach `main`.
 
 ## Cut a release
 
-1. **Bump** `version` in `Cargo.toml` `[workspace.package]`, through a normal
-   issue branch merged into `next/<name>` like any other change — do this
-   last, once everything else for the release is in.
-2. **Changelog:** add a `## [<version>] - <date>` section to `CHANGELOG.md`
+1. **Bump** `version` in `Cargo.toml` through a normal issue PR into
+   `next/<name>`, once everything else for the release is in.
+2. **Changelog.** Add a `## [<version>] - <date>` section to `CHANGELOG.md`
    (Keep a Changelog format) and the matching `[<version>]:` link at the
-   bottom. This is the durable, in-repo record and the source of the Release
-   body.
-
-   > **Do not version-bump `README.md`.** The README is intentionally decoupled
-   > from the release steps: its version badge (`shields.io/github/v/release`)
-   > tracks GitHub Releases automatically, and the Status line carries no version
-   > number. `CHANGELOG.md` is the per-release doc edit; the README changes only
-   > when capabilities materially change (a new modality, architecture family, or
-   > endpoint) — never for a routine version bump.
-3. **Gate:** `make ci` green on `next/<name>` (fmt + clippy + test + deny +
-   audit). This is also where the real-model regression smoke and, for a
-   codec-layer or `.metal`-touching release, `make ci-perf` run — once, on
-   `next/<name>`, fixed before the release PR (see `CONTRIBUTING.md`
-   §Workflow).
-4. **Release PR + fast-forward:** open a PR `next/<name>` → `main` for review
-   and the required checks. Merge it by fast-forward push, not with a GitHub
-   merge button — the ruleset leaves only rebase-merge enabled on `main` as a
-   fallback that also keeps history linear, but the push below is the normal
-   path:
+   bottom. It is the source of the release body. `README.md` carries no
+   version and is not edited for a release. The section can end with an
+   optional `### Retrospective` heading that lists links to the issues the
+   previous release's retrospective filed (§Retrospective). Nothing else
+   goes under it: the section is the public release body. Released
+   sections are never edited.
+3. **Gate.** `make ci` and the whole `make ci-perf` green on `next/<name>`,
+   plus the real-model regression smoke. Every merge to `main` runs the whole
+   `make ci-perf`.
+4. **Release PR and fast-forward.** Open a PR `next/<name>` → `main` for the
+   checks, then push:
    ```sh
    git fetch origin
    git merge-base --is-ancestor origin/main origin/next/<name>
    git push origin origin/next/<name>:main
    ```
-   This pushes the accumulated issue commits onto `main` one by one, with no
-   merge commit and no rewritten SHAs. GitHub marks the PR merged once `main`
-   reaches the same commit. `git merge-base --is-ancestor` fails the command
-   before the push if `main` moved out from under `next/<name>` (a hotfix
-   landed, for example) — rebase `next/<name>` onto `main` and re-gate before
-   retrying.
-5. **Tag:** `make tag` → creates annotated `v<version>` from `Cargo.toml`.
-   Push it: `git push origin v<version>`.
-6. **Build the binary artifact:** `make release-package` →
-   `dist/rmlx-v<version>-aarch64-apple-darwin.tar.gz` (+ `.sha256`).
-7. **GitHub Release** (body = the CHANGELOG section for this version):
+   The ancestor check fails if `main` moved, for example after a hotfix.
+   Then rebase `next/<name>` onto `main` and gate again. GitHub marks the
+   PR merged once `main` reaches its head.
+5. **Tag.** `make tag` creates the annotated `v<version>` tag from
+   `Cargo.toml`. Push it: `git push origin v<version>`.
+6. **Package.** `make release-package` builds
+   `dist/rmlx-v<version>-aarch64-apple-darwin.tar.gz` and its `.sha256`.
+   The tarball holds `rmlx`, both licenses and `README.md`.
+7. **GitHub Release**, with the changelog section as the body:
    ```sh
    gh release create v<version> \
      --title "rMLX <version>" \
@@ -108,114 +90,71 @@ crates are `publish = false`). There is no separate `VERSION` file.
      dist/rmlx-v<version>-aarch64-apple-darwin.tar.gz \
      dist/rmlx-v<version>-aarch64-apple-darwin.tar.gz.sha256
    ```
-8. **Sign the artifact (keyless cosign):** `make release-sign` →
-   `dist/rmlx-v<version>-aarch64-apple-darwin.tar.gz.cosign.bundle` (needs
-   `brew install cosign`; opens a browser OIDC prompt). Upload it:
-   ```sh
-   gh release upload v<version> \
-     dist/rmlx-v<version>-aarch64-apple-darwin.tar.gz.cosign.bundle
-   ```
-   The release binary is built locally (hosted CI has no Metal), so the
-   `.sha256` alone is self-attested. The cosign bundle binds the tarball to
-   your authenticated identity + the public Rekor log — real provenance for
-   the prebuilt binary. Consumer-side verification is in "Verify both install
-   paths".
-9. **No Homebrew bottle is published.** `brew install rmlx` builds from source,
-   which is what `depends_on "rust" => :build` in the formula has always
-   described. The formula carries **no `bottle do` block**, and adding one back
-   needs the two problems below solved first — not just a fresh sha.
+8. **Sign.** `make release-sign` writes
+   `dist/rmlx-v<version>-aarch64-apple-darwin.tar.gz.cosign.bundle`.
+   It is a keyless cosign signature and opens a browser OIDC login.
+   Upload it with `gh release upload`. The `.sha256` alone is self-attested;
+   the bundle ties the tarball to the signer's identity and the Rekor log.
+9. **Formula.** `make release-sha` prints the sha256 of the `v<version>`
+   source archive. `bash scripts/release/source_sha256.sh --write` also
+   patches `url` and `sha256` in `packaging/homebrew/rmlx.rb`.
+   - GitHub builds the archive on first access. Fetch it two or three more
+     times and check that the digest is stable.
+   - Check that `url` and `sha256` both name the new version, then open a
+     PR with the formula change against `main`.
+10. **Tap.** `make tap-sync` copies the formula into
+    `Pushkinist/homebrew-rmlx` as `Formula/rmlx.rb` and pushes it.
+11. **Verify** the install paths (§Verify the install paths).
+12. **Retrospective** over the diff from the previous tag to the new one
+    (§Retrospective).
 
-   > **Why the block was removed (0.4.1).** A `bottle do` block names a
-   > `root_url` pinned to one release, but Homebrew derives the bottle
-   > *filename* from the formula's current version. So a block left behind after
-   > a version bump sends `brew install` looking for a bottle that was never
-   > built, under the previous release's URL, and it 404s. The block shipped
-   > pinned to `v0.3.0` through both `v0.3.0` and `v0.4.0` while the only bottle
-   > asset in existence was `rmlx-0.3.0.arm64_tahoe.bottle.tar.gz` — `brew info`
-   > reported `(bottled)` the whole time. Nothing in the release flow regenerated
-   > it, and nothing failed when it went stale.
-   >
-   > **The deeper reason not to reinstate it casually.** A bottle is a binary
-   > linked against the `mlx-c` present on the build machine, but `mlx-c` is
-   > deliberately an unversioned dependency (see the rationale in
-   > `packaging/homebrew/rmlx.rb`), and `crates/rmlx-mlx/mlx-pin.txt` records
-   > that a mismatched mlx / mlx-c pair aborts at load with a dyld
-   > `Symbol not found`. A bottle poured onto a user whose mlx-c revision differs
-   > from the builder's can therefore fail at load, where a source build against
-   > that user's own mlx-c cannot. Building one on this machine also requires
-   > `brew unpin mlx mlx-c`, which upgrades the pinned pair the project's own
-   > measurements depend on.
-   >
-   > `scripts/release/build_bottle.sh` and `make bottle` are kept for a future
-   > bottle channel that solves the ABI coupling — an mlx-c version constraint,
-   > or a static link. They are **not** part of the release flow. Do not run them
-   > and paste the output into the formula without also arranging for the next
-   > release to rebuild or remove the block.
+### No Homebrew bottle
 
-10. **Formula url + sha256.** Note `make release-sha` only **prints** the
-    sha of the `v<version>` GitHub source tarball; to patch the `url` +
-    `sha256` in `packaging/homebrew/rmlx.rb` in place, run the script with
-    `--write`:
-    ```sh
-    bash scripts/release/source_sha256.sh --write
-    ```
-    > GitHub generates the source archive on first access, so its sha256 can
-    > shift on the very first fetch right after a tag push. The
-    > `source_sha256.sh`-written value is usually the correct stable one — but
-    > re-fetch the archive 2-3× (`curl -fsSL .../archive/refs/tags/v<version>.tar.gz
-    > | shasum -a 256`) and confirm the digest is stable before trusting it.
-    Commit the url+sha change as its own formula PR; `main` is
-    ruleset-protected. Verify **both** lines read the new version before opening
-    it — `--write` patches `url` and `sha256` together, but a mismatch between
-    them makes `brew install` fail the checksum.
-11. **Publish the tap:** `make tap-sync` (copies the formula into
-    `Pushkinist/homebrew-rmlx` as `Formula/rmlx.rb` and pushes).
+`brew install rmlx` builds from source. The formula has no `bottle do` block.
+A bottle links the builder's `mlx-c`, while the formula's `mlx-c` is
+unversioned. A mismatched mlx / mlx-c pair fails at load with a dyld
+`Symbol not found` (`crates/rmlx-mlx/mlx-pin.txt`). `make bottle`
+(`scripts/release/build_bottle.sh`) builds a bottle; no release step
+runs it.
 
 ## Hotfix
 
-A hotfix fixes a bug already released on `main`, without waiting for the
-current `next/<name>` to finish accumulating.
+A hotfix fixes a bug already released on `main`.
 
-1. Branch `hotfix/<issue>` from `main` directly.
-2. Squash the fix to a single commit before requesting review.
-3. Open a PR `hotfix/<issue>` → `main` for review and the required checks.
-4. Merge by fast-forward push, the same mechanics as a release:
+1. Branch `hotfix/<issue>` from `main`.
+2. Squash the fix to one commit.
+3. Open a PR `hotfix/<issue>` → `main` for the checks, and run `make ci`
+   and the whole `make ci-perf` on it.
+4. Fast-forward `main`:
    ```sh
    git fetch origin
    git merge-base --is-ancestor origin/main origin/hotfix/<issue>
    git push origin origin/hotfix/<issue>:main
    ```
-5. **Carry the fix forward.** A maintainer rebases `next/<name>` onto the
-   new `main` so the hotfix is not lost when the next release ships. This
-   needs a force-push on `next/<name>`, which the ruleset allows only as a
-   maintainer bypass.
+5. A maintainer rebases `next/<name>` onto the new `main` and force-pushes
+   it, through the ruleset bypass.
 
-## Dependency-bump PRs (Dependabot)
+## Dependabot PRs
 
-Hosted CI runs only fmt + clippy + a best-effort build (no Metal, no tests), so
-a green Dependabot check does **not** prove the bump builds with Metal or passes
-the suite. **Gate every bump locally with `make ci`** (and a real-model smoke for
-runtime-affecting deps — allocator, tokenizer) before merging.
+`.github/dependabot.yml` sets no target branch, so Dependabot opens its PRs
+against `main`. Hosted CI runs no `cargo test`, so a green check does not
+prove the bump. Gate each bump locally with `make ci` and, since it merges
+into `main`, the whole `make ci-perf`. A runtime dependency, such as the
+allocator or the tokenizer, also needs a real-model smoke.
 
-A **major** bump that needs source migration is the trap: Dependabot only edits
-the manifest, so its branch stays RED until the migration commit is **pushed to
-the remote PR branch**:
+Dependabot edits only the manifest. A major bump that needs a source change
+stays red until that change is pushed to the PR branch:
 
 ```sh
-gh pr checkout <PR>            # work on the dependabot branch
-# … migrate source, `make ci`, prove …
-git push origin HEAD:dependabot/cargo/<branch>   # REQUIRED — push the fix
+gh pr checkout <PR>
+# migrate the source, run make ci
+git push origin HEAD:dependabot/cargo/<branch>
 ```
 
-`main`'s ruleset requires the `rustfmt` and `build + clippy` checks with **no
-bypass** (not even admin), so the PR cannot merge until the *remote* branch is
-green. A migration that lives only in your local checkout will not unblock the
-merge. Do **not** `git branch -D` the local branch before the remote has the
-fix (the migration commit is otherwise only reachable via reflog).
+## Verify the install paths
 
-## Verify both install paths
+Prebuilt binary:
 
-**Prebuilt binary (from the Release):**
 ```sh
 brew install mlx-c
 gh release download v<version> -p '*aarch64-apple-darwin.tar.gz*'
@@ -224,7 +163,8 @@ tar xzf rmlx-v<version>-aarch64-apple-darwin.tar.gz
 ./rmlx-v<version>-aarch64-apple-darwin/rmlx --version
 ```
 
-**Provenance (cosign bundle, if the release ships one):**
+Signature:
+
 ```sh
 gh release download v<version> -p '*.cosign.bundle'
 cosign verify-blob \
@@ -235,32 +175,169 @@ cosign verify-blob \
 # issuer: GitHub https://github.com/login/oauth · Google https://accounts.google.com
 ```
 
-**Homebrew (build from source):**
+Homebrew. Homebrew refuses a formula from an untrusted third-party tap, so
+`brew trust` runs once:
+
 ```sh
 brew tap Pushkinist/rmlx
-brew trust Pushkinist/rmlx   # one-time: Homebrew refuses to load formulae from untrusted third-party taps
+brew trust Pushkinist/rmlx
 brew install rmlx
 brew test rmlx
 rmlx --version
 ```
-> Recent Homebrew versions block third-party taps until trusted — a fresh
-> `brew install rmlx` fails with `Refusing to load formula … from untrusted tap`
-> until `brew trust Pushkinist/rmlx` is run once.
 
-Local formula check before publishing:
+Local formula check before publishing. Homebrew installs a formula only
+from a tap, so copy it into the local tap clone first:
+
 ```sh
-brew install --build-from-source ./packaging/homebrew/rmlx.rb
-brew audit --strict --new rmlx
+cp packaging/homebrew/rmlx.rb \
+  "$(brew --repository)/Library/Taps/pushkinist/homebrew-rmlx/Formula/rmlx.rb"
+HOMEBREW_NO_INSTALL_FROM_API=1 \
+  brew install --build-from-source pushkinist/rmlx/rmlx
+brew audit --strict pushkinist/rmlx/rmlx
+```
+
+## Retrospective
+
+Per-PR review sees one diff. It cannot see that a new file repeats a file
+beside it, or that a new gate does the work of an old one. The retrospective
+reads the whole diff from the previous tag to the new tag and files issues
+for what the release repeated, left inert, grew past a limit or made
+deletable.
+
+Rules:
+
+- Run it after step 11, in one working session.
+- It changes no code and makes no commit. Its output is issues.
+- Search the open and closed issues before you file. When an issue already
+  tracks a finding, name that issue and file nothing.
+- File one issue per finding group, not one per site. Give it exactly one of
+  the labels `documentation`, `bug`, `feature`, `enhancement` or `test`. Add
+  `premise-unverified` when the finding comes from code reading only.
+- It lists flags and codecs. It never retires, renames or deletes one:
+  retirement is a separate decision with its own proof.
+- Answer every checklist item, and write "none" when an item finds nothing.
+  An empty answer is evidence too. A measurement that could not run is "not
+  measured", never "none". Post the answers as one comment on the release
+  PR of step 4.
+
+Set the range and check out both tags beside the repo. Run every script
+from the current checkout, so one version of each tool measures both trees:
+
+```sh
+NEW=v<version>
+PREV=$(git describe --tags --abbrev=0 "$NEW^")
+git worktree add --detach ../rmlx-retro-prev "$PREV"
+git worktree add --detach ../rmlx-retro-new "$NEW"
+mkdir -p .rmlx/tmp
+```
+
+The checklist:
+
+1. **Twins.** Run the debt report and every `--matched-lines` population
+   over both trees, and compare. A new file or fn pair in the report is a
+   finding. It gets a const-generic or trait issue.
+   ```sh
+   bash scripts/debt_report.sh --root ../rmlx-retro-prev > .rmlx/tmp/retro-prev.txt
+   bash scripts/debt_report.sh --root ../rmlx-retro-new --since "$PREV" > .rmlx/tmp/retro-new.txt
+   diff .rmlx/tmp/retro-prev.txt .rmlx/tmp/retro-new.txt
+   pops=$(python3 -c 'import sys; sys.path.insert(0, "scripts/lib"); import debt_report; print(*sorted(debt_report.MATCHED_LINES_POPULATIONS))')
+   for tree in prev new; do
+     for p in $pops; do
+       printf '%s: ' "$p"
+       bash scripts/debt_report.sh --root "../rmlx-retro-$tree" --matched-lines "$p" 2>&1 | tail -1
+     done > ".rmlx/tmp/retro-lines-$tree.txt"
+   done
+   diff .rmlx/tmp/retro-lines-prev.txt .rmlx/tmp/retro-lines-new.txt
+   ```
+   Read a `--matched-lines` figure against its item count. Each new item
+   adds pairs, so the figure grows with the count alone. Compare figures
+   only at an equal item count. When the count changed, find the new items
+   in the release diff and compare each one with its closest sibling. A
+   population that reads `unavailable` in either tree is "not measured".
+   The report reads `.rs` files only. Compare each `.metal` file that the
+   release changed with its siblings in the same directory. The same edit
+   made in more than one file is also a twin signal.
+2. **Size.** A non-test source file that crossed 1000 lines gets a split
+   proposal or a `// LOC-exempt:` marker with its reason.
+   ```sh
+   git diff --name-only --no-renames --diff-filter=AM "$PREV" "$NEW" -- 'crates/*.rs' |
+     grep -v -E '/tests/|(^|/)tests\.rs$|_tests\.rs$' |
+     while read -r f; do
+       new=$(git show "$NEW:$f" | wc -l)
+       old=$(git show "$PREV:$f" 2>/dev/null | wc -l)
+       [ "$new" -gt 1000 ] && [ "$old" -le 1000 ] && echo "$old -> $new $f"
+     done
+   ```
+3. **Allows.** Each new `#[allow(` or `#![allow(` site gets a fix-or-keep
+   verdict.
+   ```sh
+   git diff -U0 "$PREV" "$NEW" -- '*.rs' |
+     awk '/^\+\+\+ /{f=$2; next} /^\+.*#!?\[allow\(/{print f": "$0}'
+   ```
+4. **Dead paths.** A new comment that marks a path as inert, dormant,
+   deferred or kept gets a delete-or-schedule verdict. The command reads
+   `//` comments and `#` comments followed by a space, so URLs and Rust
+   attributes do not match. It still matches prose that uses these words:
+   "inert" is also the name of a codec disposition (`docs/KV_QUANT.md`).
+   Read each hit.
+   ```sh
+   git diff -U0 "$PREV" "$NEW" -- '*.rs' '*.metal' '*.sh' '*.py' |
+     awk '/^\+\+\+ /{f=$2; next}
+          tolower($0) ~ /^\+([ \t]*|.*[ \t])(\/\/|#[ \t]).*(inert|dormant|deferred|kept for|future-reference|no longer)/ {print f": "$0}'
+   ```
+5. **Gates.** For each new gate, name the gate it makes unnecessary, or the
+   structural change that would make it unnecessary. A gate is a new
+   `check-*` target or a new line in the `ci:` recipe, which also runs the
+   `*-selftest` and `*-fixtures` scripts.
+   ```sh
+   git diff -U0 "$PREV" "$NEW" -- Makefile | grep -E '^\+check-[a-z0-9-]*:'
+   ci_recipe() { git show "$1:Makefile" | awk '/^ci:/{on=1; print; next} on && /^\t/{print; next} on{exit}'; }
+   diff <(ci_recipe "$PREV") <(ci_recipe "$NEW")
+   ```
+6. **Docs.** A doc that grew by more than 20%, or a new doc, gets a
+   proposal to cut it to current truth.
+   ```sh
+   git diff --name-only --no-renames --diff-filter=AM "$PREV" "$NEW" -- 'docs/*.md' |
+     while read -r f; do
+       old=$(git cat-file -s "$PREV:$f" 2>/dev/null || echo 0)
+       new=$(git cat-file -s "$NEW:$f")
+       [ "$new" -gt $((old * 6 / 5)) ] && echo "$old -> $new $f"
+     done
+   ```
+7. **Flags and codecs.** A new CLI flag, `--kv-quant` spelling or
+   `--kv-preset` name with no measured win: list it with the measurement
+   that would settle it. A digest oracle needs a positive control in the
+   same run.
+   ```sh
+   git diff -U0 "$PREV" "$NEW" -- 'crates/rmlx-cli/*.rs' | grep -E '^\+.*#\[arg\('
+   git diff -U0 "$PREV" "$NEW" -- crates/rmlx-kv-quant/src/quant.rs \
+       crates/rmlx-cli/src/commands/preset_table.rs |
+     grep -E '^\+[[:space:]]*\|?[[:space:]]*"[a-z0-9_]+"'
+   ```
+   The second command finds fixed spellings, aliases and preset names. The
+   parser also accepts parametric families such as `mixed_*` and
+   `rot_k_v*`, so read its diff when it changed.
+8. **One paragraph.** Name the pattern that this release repeated and the
+   generalisation that would have prevented it. It goes in the retrospective
+   comment on the release PR, not in `CHANGELOG.md`.
+
+Remove the two checkouts when the comment is posted:
+
+```sh
+git worktree remove ../rmlx-retro-prev
+git worktree remove ../rmlx-retro-new
 ```
 
 ## Files
 
 | Path | Role |
 |---|---|
-| `CHANGELOG.md` | Durable release notes (Keep a Changelog); body source |
-| `packaging/homebrew/rmlx.rb` | Canonical formula (source of truth) |
-| `scripts/release/package_binary.sh` | Build + bundle the binary tarball |
-| `scripts/release/build_bottle.sh` | Retired from the flow (step 9). Kept for a future bottle channel; not run at release time |
-| `scripts/release/source_sha256.sh` | Compute / patch the formula source sha256 |
-| `scripts/release/sync_tap.sh` | Push the formula to the tap repo |
-| `scripts/release/changelog_section.sh` | Print one version's CHANGELOG section |
+| `CHANGELOG.md` | Release notes (Keep a Changelog); the release body |
+| `packaging/homebrew/rmlx.rb` | The formula; the tap holds a copy |
+| `scripts/release/package_binary.sh` | `make release-package` |
+| `scripts/release/sign_artifact.sh` | `make release-sign` |
+| `scripts/release/source_sha256.sh` | `make release-sha`; `--write` patches the formula |
+| `scripts/release/sync_tap.sh` | `make tap-sync` |
+| `scripts/release/changelog_section.sh` | Prints one version's changelog section |
+| `scripts/release/build_bottle.sh` | `make bottle`; not part of the release flow |

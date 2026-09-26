@@ -118,16 +118,9 @@ impl KvCache {
     ///
     /// Warm-TTFT shortcut: when `decode_fp16_k` is present (set by
     /// `exit_prefill`), route through `update_decode_fp16` so the bf16 K seed
-    /// is used for the rest of the request. This matches every other
-    /// `update_<arch>` (K8V4/K8V8/Planar/Mixed/K8VTurbo*/Iso*/Rotor*/
-    /// TurboSym*). Before this fix, PlanarK was the **sole** codec that
-    /// re-encoded K through the lossy 4-bit Lloyd-Max + Givens kernel on every
-    /// decode step while every other variant silently stayed in bf16 K, and
-    /// that asymmetry surfaced as the Bonsai PlanarK NIAH retrieval failure.
-    ///
-    /// See `docs/reports/planar-chunked-prefill-fix.md` § "Followups"
-    /// for the open question of whether warm-TTFT-as-default is the intended
-    /// steady-state design for the entire quantised-KV surface.
+    /// is used for the rest of the request, as every mirror-fed codec does
+    /// (`docs/KV_CACHE.md` §9.6). Without it PlanarK would re-encode K through
+    /// the lossy 4-bit Lloyd-Max + Givens kernel on every decode step.
     #[allow(
         clippy::indexing_slicing,
         reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
@@ -143,13 +136,8 @@ impl KvCache {
         };
         let max_seq = *max_seq;
 
-        // Warm-TTFT bf16 K seed path. Same shortcut every other
-        // `update_<arch>` honours; before this fix PlanarK lacked it and was
-        // the only codec exercising the per-decode-step 4-bit K encode.
-        //
-        // See `docs/reports/planar-chunked-prefill-fix.md` § "Followups"
-        // for the open question of whether warm-TTFT-as-default is the intended
-        // steady-state design for the entire quantised-KV surface.
+        // Warm-TTFT bf16 K seed path, the shortcut every mirror-fed
+        // `update_<codec>` takes.
         if self.decode_fp16_k.is_some() {
             tracing::debug!(
                 target: "rmlx_kv_quant::warm_ttft",

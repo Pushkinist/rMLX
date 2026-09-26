@@ -4,10 +4,8 @@
 //!
 //! A KV codec advertises a codebook width. What matters for memory is what
 //! reaches the store: codes **plus** every per-group and per-token sideband.
-//! The two can differ by a lot — the rotor family quantizes to 3 bits and
-//! stores 16.25 bits per value, above the bf16 baseline it is supposed to
-//! compress, and stored 21.75 before its sideband planes were narrowed — and
-//! nothing in the tree observed that until it was found by hand.
+//! The two can differ by a lot: planar quantizes to 3 or 4 bits and stores
+//! 22.00 bits per value, above the bf16 baseline it is supposed to compress.
 //!
 //! So each codec family measures its rate here from the **actual bytes its own
 //! encoder produced** over a shared fixture, via
@@ -194,11 +192,11 @@ fn measure_rotor(data: &[f32], bits: u8) -> u64 {
 
 /// Every store family a shipped `KvQuant` variant can put an axis into.
 ///
-/// The remaining exemptions are the planar pair. Planar spends one `f32` scale
+/// The exemptions are the planar pair. Planar spends one `f32` scale
 /// per *pair* of values and two rotation words per 32-element group, so its
 /// 3-bit and 4-bit members occupy byte-identical storage and neither reaches
-/// the floor — a scale cadence, not a code one. Iso and rotor cleared the floor
-/// when their code plane became dense across a row's groups.
+/// the floor — a scale cadence, not a code one. Iso and rotor store a code
+/// plane that is dense across a row's groups and sit under the floor.
 const FAMILIES: &[Family] = &[
     Family {
         name: "bf16",
@@ -215,7 +213,7 @@ const FAMILIES: &[Family] = &[
         // (8-bit, group 32) at 9.0 bits per value. This IS a bound over every
         // parseable affine config — `validate_mixed_side` bounds the group size
         // to 32/64/128 and the width to the set MLX implements, so the grid is
-        // finite. See `mixed_grammar_no_longer_admits_unbounded_affine_rates`.
+        // finite. See `mixed_grammar_admits_only_bounded_affine_rates`.
         name: "affine",
         rate: Rate::AffineLayout { bits: 8, group: 32 },
         verdict: Verdict::UnderBf16,
@@ -440,13 +438,10 @@ fn rotor_rate_splits_into_documented_code_scale_and_norm_bits() {
     assert!((norm_bits - 0.125).abs() < 1e-9, "norm rate {norm_bits}");
     assert!((total - 8.75).abs() < 1e-9, "total rate {total}");
 
-    // Two further assertions used to stand here — that the codes dominate the
-    // sideband, and that the total clears the bf16 floor — with comments saying
-    // they force a code-cadence change back through this test. They cannot: the
-    // four exact equalities above already fix every term, so both inequalities
-    // are implied by them and neither can fail while they hold. What the
-    // equalities do NOT prove is that the exemption is honest; that is
-    // `exempt_families_actually_exceed_the_floor`'s job, and it measures the
+    // The four exact equalities above fix every term, so an inequality on the
+    // codes against the sideband, or on the total against the bf16 floor,
+    // could not fail while they hold. Whether an exemption is honest is
+    // `exempt_families_actually_exceed_the_floor`'s job; it measures the
     // family rather than restating a split.
 }
 
@@ -473,7 +468,7 @@ fn rotor_rate_splits_into_documented_code_scale_and_norm_bits() {
 ///
 /// `Mixed` / `RotK` carry runtime bit and group fields and map to the `affine`
 /// family, whose entry bounds the whole parseable grid (see
-/// [`mixed_grammar_no_longer_admits_unbounded_affine_rates`]). The `RotorK*Asym`
+/// [`mixed_grammar_admits_only_bounded_affine_rates`]). The `RotorK*Asym`
 /// variants do **not**: their V axis is TurboQuant at a fixed 32-element group,
 /// whatever `v_group_size` says.
 #[test]
@@ -592,25 +587,17 @@ fn every_kv_quant_variant_names_its_store_families() {
     }
 }
 
-/// The `mixed_*` grammar no longer admits affine rates above the bf16 floor.
+/// The `mixed_*` grammar admits no affine rate above the bf16 floor.
 ///
-/// This test used to pin the opposite, and said so: `parse_kv_side` read the
-/// group size as a bare `u16` with no whitelist, so `mixed_k8g4_v8g4` parsed
-/// and stored `8 + 32/4 = 16` bits per value on each axis, and nothing bounded
-/// the group below that (`g1` is 40) — a rate no
-/// enum-driven table can see, because it is a property of a runtime field with
-/// an unbounded domain rather than of the variant. Its own failure message
-/// named the disposition: *"if this now fails, the parser grew a floor and this
-/// test should assert that instead"*. It did, so this does.
-///
-/// The parser now validates both sides against MLX's affine grid
+/// A group size is a runtime field, so an enum-driven rate table cannot see
+/// it. The parser validates both sides against MLX's affine grid
 /// (`validate_mixed_side`), which bounds the domain to widths the codec can
-/// actually store. The ceiling gate's coverage claim therefore extends over the
+/// actually store; `mixed_k8g4_v8g4` (16 bits per value per axis) is a parse
+/// error. The ceiling gate's coverage claim therefore extends over the
 /// whole `mixed_*` grammar: every parseable spelling has a rate the table
 /// enumerates.
 #[test]
-fn mixed_grammar_no_longer_admits_unbounded_affine_rates() {
-    // The former witness: parses no more.
+fn mixed_grammar_admits_only_bounded_affine_rates() {
     let unbounded = "mixed_k8g4_v8g4".parse::<KvQuant>();
     assert!(
         unbounded.is_err(),
@@ -619,7 +606,6 @@ fn mixed_grammar_no_longer_admits_unbounded_affine_rates() {
 
     // The accepted grid is finite, so its worst rate is a number this test can
     // state: 8 bits at group 32 = 8 + 32/32 = 9.00 bits per value per axis.
-    // Before the floor, the grid had no worst case at all.
     let mut worst = 0.0_f64;
     for group in [32u16, 64, 128] {
         for bits in [2u8, 3, 4, 5, 6, 8] {

@@ -502,7 +502,7 @@ pub(crate) fn run_info(
             seed = arch::SMOKE_PROMPT,
             "smoke_probe: running 8-token greedy generation from seeded prompt"
         );
-        // A7.2: smoke probe is always greedy (temperature 0.0).
+        // Smoke probe is always greedy (temperature 0.0).
         let smoke_sampler_cfg = rmlx_models::SamplerConfig {
             temperature: 0.0,
             top_p: 1.0,
@@ -525,7 +525,7 @@ pub(crate) fn run_info(
                 1,   // smoke probe uses single-slot cache (no multi-slot needed)
                 &[], // smoke probe: no EOS-stop, force full 8 steps
                 &mut |_| None,
-                None, // A6.2: smoke probe never uses sampler constraints.
+                None, // The smoke probe never uses sampler constraints.
                 &smoke_sampler_cfg,
                 &mut smoke_rng,
                 &smoke_penalty_cfg,

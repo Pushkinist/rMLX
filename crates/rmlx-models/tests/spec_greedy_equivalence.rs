@@ -109,8 +109,8 @@
 //! two token streams — and is refused. Which position the loop was at is the
 //! only thing that separates them, so the loop reports it per emitted token
 //! rather than the gate inferring it from the answer. [`Restriction`] carries
-//! the rule; `docs/SPEC_ANSWER_EQUIVALENCE.md` carries the measurements and
-//! `scripts/spec_broken_engine.sh` takes them again.
+//! the rule; `scripts/spec_broken_engine.sh` takes the readings the thresholds
+//! are set from.
 //!
 //! # Pairs
 //!
@@ -235,7 +235,6 @@ const MAX_CTX: i32 = 8192;
 /// | block pair, one rejected draft kept every partial round | 0.1758 to 0.6406 |
 /// | adaptive pair, one rejected draft kept every partial round | 0.0703 to 0.8320 |
 /// | restricted-vocabulary pair, one rejected draft kept every round | 0.0000 to 0.8320 |
-/// | restricted-vocabulary pair, correction left on the restricted argmax | 0.0000 to 0.8828 |
 /// | two-model pair, one rejected draft kept every partial round | 0.0000 to 0.6680 |
 ///
 /// The measurement leaves a band, and the value sits inside it: above the worst
@@ -255,14 +254,14 @@ const MAX_CTX: i32 = 8192;
 /// pair was split in two and its block is not recorded; the served block
 /// reproduces it exactly.
 ///
-/// The exception is the last row, and it is a property of the defect rather than
-/// of the ceiling: leaving the correction on the restricted argmax only changes
-/// an answer where that vocabulary falls short of the verifier's, which the
-/// runs measure at one to five tokens per answer. It is refused on one of the
-/// five prompts the gate judges, at 0.8828, at a token the drafter's vocabulary
-/// cannot name — and at the round's **correction**, which is the only thing that
-/// keeps it refused now the boundary at an accepted position is not. See
-/// [`Restriction`].
+/// One broken engine is outside that statement, and that is a property of the
+/// defect rather than of the ceiling: leaving the correction on the restricted
+/// argmax only changes an answer where that vocabulary falls short of the
+/// verifier's, which the runs measure at one to five tokens per answer. It is
+/// refused on one of the five prompts the gate judges, at a token the
+/// drafter's vocabulary cannot name — and at the round's **correction**, which
+/// is the only thing that keeps it refused now the boundary at an accepted
+/// position is not. See [`Restriction`].
 const MAX_DIVERGENCE_CONFIDENCE: f64 = 0.12;
 
 /// The worst [`weakest_tail`] reading a **correct** pair reached over the prompts
@@ -270,7 +269,7 @@ const MAX_DIVERGENCE_CONFIDENCE: f64 = 0.12;
 /// but the reference `two_arms_in_the_same_ragged_loop_are_refused_until_they_are_no_longer_one_loop`
 /// reads to say how far the two populations overlap on this measure.
 /// `the_worst_correct_tail_is_the_worst_of_the_tails_measured` holds it to that
-/// population, and it moved from 0.2344 to here when four more pairs joined it.
+/// population.
 ///
 /// The paragraph below is about a **different measure** and its figures are not
 /// comparable to the one above: [`lcs_ratio`] over the whole arm, where the same

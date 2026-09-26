@@ -88,7 +88,7 @@ fn not_ready_state(registry: ModelRegistry) -> AppState {
 }
 
 /// Build an `AppState` with `NotReadyGenerator` loader and an explicit
-/// `max_tokens_cap`. Used by the A1 cap-enforcement tests.
+/// `max_tokens_cap`. Used by the cap-enforcement tests.
 fn not_ready_state_with_cap(registry: ModelRegistry, max_tokens_cap: u32) -> AppState {
     let mut s = not_ready_state(registry);
     s.max_tokens_cap = max_tokens_cap;
@@ -96,7 +96,7 @@ fn not_ready_state_with_cap(registry: ModelRegistry, max_tokens_cap: u32) -> App
 }
 
 /// Build an `AppState` with the slot pre-populated by a `LoadedModel`
-/// carrying the given `effective_max_ctx`. Used by the A2
+/// carrying the given `effective_max_ctx`. Used by the
 /// `context_length_exceeded` tests so the guard fires before the request
 /// ever reaches `NotReadyGenerator`.
 fn loaded_state_with_max_ctx(
@@ -522,7 +522,7 @@ async fn anthropic_messages_missing_max_tokens_returns_400() {
     );
 }
 
-// A5.1: tools field is now accepted — old 400 test updated.
+// Tools field is now accepted — old 400 test updated.
 // tools=[] is treated same as absent (empty normalises to None), so the
 // request reaches the generator which returns 404 (unknown model "x").
 #[tokio::test]
@@ -531,10 +531,10 @@ async fn anthropic_messages_with_empty_tools_is_accepted() {
     let payload =
         r#"{"model":"x","max_tokens":10,"messages":[{"role":"user","content":"hi"}],"tools":[]}"#;
     let (status, _body) = http(port, "POST", "/v1/messages", Some(payload)).await;
-    assert_ne!(status, 400, "tools=[] must not return 400 (A5.1)");
+    assert_ne!(status, 400, "tools=[] must not return 400");
 }
 
-// ── A1: max_tokens cap enforcement (configurable, HTTP 400) ──────────────────
+// ── max_tokens cap enforcement (configurable, HTTP 400) ──────────────────
 
 /// OpenAI: requesting `max_tokens` above the server cap returns HTTP 400
 /// `invalid_request_error` with the requested and cap values in the message.
@@ -928,7 +928,7 @@ async fn models_report_context_numbers_only_when_capacity_is_known() {
     std::fs::remove_dir_all(&tmp).ok();
 }
 
-// ── A2: context_length_exceeded guard (HTTP 400) ─────────────────────────────
+// ── context_length_exceeded guard (HTTP 400) ─────────────────────────────
 
 /// OpenAI: a prompt longer than the loaded model's `effective_max_ctx`
 /// returns HTTP 400 `context_length_exceeded` with both numbers in the
@@ -1041,7 +1041,7 @@ async fn short_prompt_passes_ctx_guard_openai() {
     );
 }
 
-// ── A5.1: tools + tool_choice schema (no execution) ──────────────────────────
+// ── Tools + tool_choice schema (no execution) ──────────────────────────
 
 /// OpenAI route: a request with a full `tools` + `tool_choice: "auto"` payload
 /// reaches the generator (404 for unknown model) — not rejected with 400.
@@ -1070,7 +1070,7 @@ async fn openai_tools_payload_is_accepted() {
     // Must NOT be 400; unknown model gives 404.
     assert_ne!(
         status, 400,
-        "tools payload must not be rejected (A5.1), body: {body}"
+        "tools payload must not be rejected, body: {body}"
     );
     assert_eq!(status, 404, "unknown model should give 404, body: {body}");
 }
@@ -1098,7 +1098,7 @@ async fn anthropic_tools_payload_is_accepted() {
     let (status, body) = http(port, "POST", "/v1/messages", Some(payload)).await;
     assert_ne!(
         status, 400,
-        "tools payload must not be rejected (A5.1), body: {body}"
+        "tools payload must not be rejected, body: {body}"
     );
     assert_eq!(status, 404, "unknown model should give 404, body: {body}");
 }
@@ -1138,10 +1138,10 @@ async fn openai_tool_choice_named_is_accepted() {
     );
 }
 
-// ── A6.1: response_format schema (no enforcement) ────────────────────────────
+// ── response_format schema ─────────────────────────────────────────────
 
-/// OpenAI: `response_format: {"type":"json_object"}` is now a first-class
-/// parsed field — must NOT return 400. With an unknown model it returns 404;
+/// OpenAI: `response_format: {"type":"json_object"}` is a parsed field —
+/// must NOT return 400. With an unknown model it returns 404;
 /// with a registered model + NotReadyGenerator it returns 503.
 ///
 /// This test uses an unknown model to avoid needing the snapshot on disk.
@@ -1159,7 +1159,7 @@ async fn openai_response_format_json_object_is_accepted() {
     let (status, body) = http(port, "POST", "/v1/chat/completions", Some(payload)).await;
     assert_ne!(
         status, 400,
-        "response_format=json_object must not return 400 (A6.1), body: {body}"
+        "response_format=json_object must not return 400, body: {body}"
     );
     // Unknown model → 404; the field did not cause a rejection.
     assert_eq!(status, 404, "unknown model must return 404, body: {body}");
@@ -1190,14 +1190,14 @@ async fn openai_response_format_json_schema_is_accepted() {
     let (status, body) = http(port, "POST", "/v1/chat/completions", Some(payload)).await;
     assert_ne!(
         status, 400,
-        "response_format=json_schema must not return 400 (A6.1), body: {body}"
+        "response_format=json_schema must not return 400, body: {body}"
     );
     assert_eq!(status, 404, "unknown model must return 404, body: {body}");
 }
 
-// ── A7.1: sampling params schema (no enforcement) ─────────────────────────────
+// ── Sampling params schema ──────────────────────────────────────────────
 
-// ── A8: timeout middleware integration test ───────────────────────────────────
+// ── Timeout middleware integration test ───────────────────────────────────
 
 /// Build a test router with a `/slow` handler (sleeps 5 s) and `max_timeout_secs`
 /// set to 1, so the timeout middleware fires before the handler returns.
@@ -1271,7 +1271,7 @@ async fn start_timeout_test_server(max_timeout_secs: u64) -> u16 {
     port
 }
 
-/// A8: request to a slow handler with max_timeout_secs=1 must return 408
+/// Request to a slow handler with max_timeout_secs=1 must return 408
 /// with an OpenAI-shaped error body containing `"type":"timeout"`.
 #[tokio::test]
 async fn a8_slow_handler_times_out_with_408() {
@@ -1296,7 +1296,7 @@ async fn a8_slow_handler_times_out_with_408() {
     );
 }
 
-/// A8: bad header value → 400 invalid_request_error.
+/// Bad header value → 400 invalid_request_error.
 #[tokio::test]
 async fn a8_bad_timeout_header_returns_400() {
     let port = start_server(ModelRegistry::default()).await;
@@ -1344,13 +1344,13 @@ async fn openai_sampling_params_all_fields_accepted() {
     let (status, body) = http(port, "POST", "/v1/chat/completions", Some(payload)).await;
     assert_ne!(
         status, 400,
-        "sampling params must not return 400 (A7.1), body: {body}"
+        "sampling params must not return 400, body: {body}"
     );
     // Unknown model → 404; the sampling fields did not cause a rejection.
     assert_eq!(status, 404, "unknown model must return 404, body: {body}");
 }
 
-// ── A9: tools-supported guard ─────────────────────────────────────────────────
+// ── Tools-supported guard ─────────────────────────────────────────────────
 
 /// Build a `ModelRegistry` with a single synthetic snapshot whose chat
 /// template raises an exception when `tools` is non-empty. The snapshot
@@ -1384,7 +1384,7 @@ fn make_no_tools_registry() -> (ModelRegistry, tempfile::TempDir) {
     (reg, tmp)
 }
 
-/// A9 guard: when the loaded model's template cannot render tools, a request
+/// Guard: when the loaded model's template cannot render tools, a request
 /// that includes `tools` must NOT return 500. It should return 503
 /// (NotReadyGenerator — no tokenizer, so the prompt pipeline is incomplete)
 /// rather than panicking or returning 500.
@@ -1425,7 +1425,7 @@ async fn a9_tools_unsupported_snapshot_returns_no_500() {
     let (status, body) = http(port, "POST", "/v1/chat/completions", Some(payload)).await;
     assert_ne!(
         status, 500,
-        "A9 guard: tools-unsupported snapshot must not 500 when tools are in request; body: {body}"
+        "tool-support guard: tools-unsupported snapshot must not 500 when tools are in request; body: {body}"
     );
     // 503 is expected here because the snapshot has no tokenizer.json.
     assert_eq!(
@@ -1434,7 +1434,7 @@ async fn a9_tools_unsupported_snapshot_returns_no_500() {
     );
 }
 
-// ── H3/H4: usage chunk in streaming path ────────────────────────────────────
+// ── Usage chunk in streaming path ────────────────────────────────────
 //
 // These tests require the primary snapshot and ~30 s wall-clock (CPU).
 // Run manually:
@@ -1461,7 +1461,7 @@ fn parse_sse_events(raw: &str) -> Vec<serde_json::Value> {
     events
 }
 
-/// H3: OpenAI non-streaming response has a correct `usage` triple for two
+/// OpenAI non-streaming response has a correct `usage` triple for two
 /// different `max_tokens` values. Verifies that `total_tokens ==
 /// prompt_tokens + completion_tokens` and both token counts are positive.
 #[ignore = "requires primary snapshot + ~30s wall-clock (CPU, no KV cache)"]
@@ -1499,29 +1499,26 @@ async fn h3_non_streaming_usage_triple_exact() {
     // max_tokens = 4.
     let payload4 = r#"{"model":"mlx-community__gemma-4-e4b-it-mxfp8","messages":[{"role":"user","content":"Hello"}],"max_tokens":4}"#;
     let (status, body) = http(port, "POST", "/v1/chat/completions", Some(payload4)).await;
-    assert_eq!(status, 200, "H3 max_tokens=4: expected 200, body: {body}");
+    assert_eq!(status, 200, "max_tokens=4: expected 200, body: {body}");
     let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
     let pt = v["usage"]["prompt_tokens"].as_u64().expect("prompt_tokens");
     let ct = v["usage"]["completion_tokens"]
         .as_u64()
         .expect("completion_tokens");
     let tt = v["usage"]["total_tokens"].as_u64().expect("total_tokens");
-    assert!(pt > 0, "H3: prompt_tokens must be > 0");
-    assert!(
-        ct >= 1,
-        "H3: completion_tokens must be >= 1 for max_tokens=4"
-    );
+    assert!(pt > 0, "prompt_tokens must be > 0");
+    assert!(ct >= 1, "completion_tokens must be >= 1 for max_tokens=4");
     assert_eq!(
         tt,
         pt + ct,
-        "H3: total_tokens must equal prompt_tokens + completion_tokens"
+        "total_tokens must equal prompt_tokens + completion_tokens"
     );
-    tracing::info!(pt, ct, tt, "H3 max_tokens=4: OK");
+    tracing::info!(pt, ct, tt, "max_tokens=4: OK");
 
     // max_tokens = 8 (separate request — same prompt, different cap).
     let payload8 = r#"{"model":"mlx-community__gemma-4-e4b-it-mxfp8","messages":[{"role":"user","content":"Hello"}],"max_tokens":8}"#;
     let (status2, body2) = http(port, "POST", "/v1/chat/completions", Some(payload8)).await;
-    assert_eq!(status2, 200, "H3 max_tokens=8: expected 200, body: {body2}");
+    assert_eq!(status2, 200, "max_tokens=8: expected 200, body: {body2}");
     let v2: serde_json::Value = serde_json::from_str(&body2).expect("valid JSON");
     let pt2 = v2["usage"]["prompt_tokens"]
         .as_u64()
@@ -1530,17 +1527,17 @@ async fn h3_non_streaming_usage_triple_exact() {
         .as_u64()
         .expect("completion_tokens");
     let tt2 = v2["usage"]["total_tokens"].as_u64().expect("total_tokens");
-    assert!(pt2 > 0, "H3 mt=8: prompt_tokens must be > 0");
-    assert!(ct2 >= 1, "H3 mt=8: completion_tokens must be >= 1");
+    assert!(pt2 > 0, "mt=8: prompt_tokens must be > 0");
+    assert!(ct2 >= 1, "mt=8: completion_tokens must be >= 1");
     assert_eq!(
         tt2,
         pt2 + ct2,
-        "H3 mt=8: total_tokens must equal prompt + completion"
+        "mt=8: total_tokens must equal prompt + completion"
     );
-    tracing::info!(pt2, ct2, tt2, "H3 max_tokens=8: OK");
+    tracing::info!(pt2, ct2, tt2, "max_tokens=8: OK");
 }
 
-/// H4: streaming with `stream_options.include_usage=true` — the penultimate
+/// Streaming with `stream_options.include_usage=true` — the penultimate
 /// SSE event must be a usage chunk with `choices: []` and exact triple; the
 /// final event must be `[DONE]`.
 #[ignore = "requires primary snapshot + ~30s wall-clock (CPU, no KV cache)"]
@@ -1579,13 +1576,13 @@ async fn h4_streaming_include_usage_true_emits_usage_chunk() {
     let (status, body) = http(port, "POST", "/v1/chat/completions", Some(payload)).await;
     assert_eq!(
         status, 200,
-        "H4 include_usage=true: expected 200, body: {body}"
+        "include_usage=true: expected 200, body: {body}"
     );
 
     let events = parse_sse_events(&body);
     assert!(
         events.len() >= 3,
-        "H4: expected at least 3 events (role chunk + usage + done), got {}: body: {body}",
+        "expected at least 3 events (role chunk + usage + done), got {}: body: {body}",
         events.len()
     );
 
@@ -1594,7 +1591,7 @@ async fn h4_streaming_include_usage_true_emits_usage_chunk() {
     assert_eq!(
         last["__done"],
         serde_json::json!(true),
-        "H4: last event must be [DONE], got: {last}"
+        "last event must be [DONE], got: {last}"
     );
 
     // Penultimate event must be the usage chunk.
@@ -1602,7 +1599,7 @@ async fn h4_streaming_include_usage_true_emits_usage_chunk() {
     assert_eq!(
         usage_ev["choices"].as_array().map(Vec::len),
         Some(0),
-        "H4: usage chunk must have choices=[], got: {usage_ev}"
+        "usage chunk must have choices=[], got: {usage_ev}"
     );
     let pt = usage_ev["usage"]["prompt_tokens"]
         .as_u64()
@@ -1613,23 +1610,23 @@ async fn h4_streaming_include_usage_true_emits_usage_chunk() {
     let tt = usage_ev["usage"]["total_tokens"]
         .as_u64()
         .expect("usage.total_tokens must be present");
-    assert!(pt > 0, "H4: prompt_tokens must be > 0");
-    assert!(ct >= 1, "H4: completion_tokens must be >= 1");
+    assert!(pt > 0, "prompt_tokens must be > 0");
+    assert!(ct >= 1, "completion_tokens must be >= 1");
     assert_eq!(
         tt,
         pt + ct,
-        "H4: total_tokens must equal prompt_tokens + completion_tokens"
+        "total_tokens must equal prompt_tokens + completion_tokens"
     );
     tracing::info!(
         pt,
         ct,
         tt,
         events_count = events.len(),
-        "H4 include_usage=true: OK"
+        "include_usage=true: OK"
     );
 }
 
-/// H4: streaming with `stream_options.include_usage=false` (or absent) — NO
+/// Streaming with `stream_options.include_usage=false` (or absent) — NO
 /// chunk in the stream may contain a `usage` key.
 #[ignore = "requires primary snapshot + ~30s wall-clock (CPU, no KV cache)"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1668,7 +1665,7 @@ async fn h4_streaming_include_usage_false_no_usage_in_stream() {
     let (status, body) = http(port, "POST", "/v1/chat/completions", Some(payload)).await;
     assert_eq!(
         status, 200,
-        "H4 include_usage=false: expected 200, body: {body}"
+        "include_usage=false: expected 200, body: {body}"
     );
 
     let events = parse_sse_events(&body);
@@ -1678,10 +1675,10 @@ async fn h4_streaming_include_usage_false_no_usage_in_stream() {
         }
         assert!(
             ev.get("usage").is_none(),
-            "H4: no chunk must contain 'usage' when include_usage omitted, chunk[{i}]: {ev}"
+            "no chunk must contain 'usage' when include_usage omitted, chunk[{i}]: {ev}"
         );
     }
-    tracing::info!(events_count = events.len(), "H4 include_usage=false: OK");
+    tracing::info!(events_count = events.len(), "include_usage=false: OK");
 }
 
 // ── B1: LoggedJson rejection logging ─────────────────────────────────────────
@@ -1939,7 +1936,7 @@ async fn cooperative_evict_on_conflicting_load() {
     assert_eq!(slots.first().unwrap().id, "kp-b", "B is now resident");
 }
 
-/// H1 regression: stale TTL fire post-`sleep().await` must not unload
+/// Regression: stale TTL fire post-`sleep().await` must not unload
 /// a freshly-reset slot.
 ///
 /// Race window we are pinning: timer task 1 sleeps for the full TTL, then
@@ -2005,14 +2002,14 @@ async fn stale_ttl_fire_after_reset_does_not_unload() {
     );
 }
 
-/// H2 regression: a warm-reset via `ensure_loaded` MUST swap the
+/// Regression: a warm-reset via `ensure_loaded` MUST swap the
 /// slot's `decode_lease` Arc, and the prior timer's stale TTL fire (still
 /// holding the OLD lease pointer as its identity token) MUST bail without
 /// evicting the resident slot.
 ///
 /// Two-part check:
 ///   1. After warm-reset, the slot's decode_lease pointer differs from the
-///      pointer captured before the reset (the H2 invariant).
+///      pointer captured before the reset.
 ///   2. A stale TTL fire from the pre-reset timer (forced by aborting its
 ///      handle race window) does not unload the slot.
 #[tokio::test]
@@ -2044,7 +2041,7 @@ async fn stale_ttl_fire_after_warm_reset_does_not_unload() {
 
     // Warm-reset path: call ensure_loaded again for the SAME model id.
     // This is the path a fresh chat request takes — same model, no unload,
-    // no reload. With the H2 fix this swaps the slot's decode_lease Arc
+    // no reload. This swaps the slot's decode_lease Arc
     // and arms a fresh timer T2 (cancelling T1 via abort()).
     let _ = state
         .ensure_loaded("kp-warm-race")
@@ -2057,12 +2054,12 @@ async fn stale_ttl_fire_after_warm_reset_does_not_unload() {
         .map(|m| Arc::as_ptr(&m.decode_lease) as usize)
         .expect("model must still be resident after warm-reset");
 
-    // Part 1: the H2 invariant — warm-reset MUST swap the slot's
+    // Part 1: warm-reset MUST swap the slot's
     // decode_lease Arc. Without this swap, the identity check in the
     // spawned timer task cannot distinguish T1 from T2.
     assert_ne!(
         lease_before_reset, lease_after_reset,
-        "warm-reset must swap the slot's decode_lease Arc (H2 invariant)"
+        "warm-reset must swap the slot's decode_lease Arc"
     );
 
     // Part 2: even if T1 somehow won an abort race and ran to completion
@@ -2071,7 +2068,7 @@ async fn stale_ttl_fire_after_warm_reset_does_not_unload() {
     // lease pointer and bails out as "stale TTL fire — slot was reset".
     // We wait well past the original TTL boundary AND past T2's new TTL,
     // then confirm the slot is still resident with the new lease pointer.
-    // (If H2 is fixed correctly the slot survives because T1 bails;
+    // (The slot survives because T1 bails;
     // T2 will fire its own TTL after warm-reset + 200 ms = 350 ms total;
     // we check earlier to avoid T2's own legitimate fire.)
     tokio::time::sleep(Duration::from_millis(120)).await;

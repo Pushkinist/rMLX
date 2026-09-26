@@ -180,7 +180,7 @@ pub(crate) fn parse_request_kv_quant(s: &str) -> Result<Option<rmlx_kv_quant::Kv
 
 // ── tool-marker allowlist ────────────────────────────────────────────────────
 
-/// A5.6: whether a special-token surface form is one of the Gemma-4
+/// Whether a special-token surface form is one of the Gemma-4
 /// tool-call protocol markers the response parser needs reconstructed.
 ///
 /// Restricted to exactly the three markers the [`crate::tool_parser`]

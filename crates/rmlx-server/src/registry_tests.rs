@@ -84,7 +84,7 @@ fn missing_chat_template_gives_none_not_error() {
     );
 }
 
-// ── A9: tools_supported probe ──────────────────────────────────────────────
+// ── tools_supported probe ──────────────────────────────────────────────
 
 /// A template with no `{% if tools %}` branch that errors when `tools` is
 /// passed must yield `tools_supported = false`.

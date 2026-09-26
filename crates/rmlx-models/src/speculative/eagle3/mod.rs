@@ -37,11 +37,7 @@
 //! KV cache), unlike the DFlash non-autoregressive block. The seed token
 //! and seed hidden come from the verifier's last position.
 //!
-//! # Status — document-the-truth (CLAUDE.md hard rule 7)
-//!
-//! **reference-alignment pass.** Three structural divergences from
-//! mlx-vlm reference identified and patched; live accept-rate
-//! measurement pending — see BENCHMARK_CHAMPIONS.md.
+//! # Status
 //!
 //! Per-step trace: `RUST_LOG=rmlx_models::speculative::eagle3=trace`.
 //!
@@ -53,7 +49,7 @@
 //!    `[id - 1]` for each `eagle_aux_hidden_state_layer_ids` id (mlx-vlm
 //!    `capture_layer_ids`), i.e. `[2, 18, 34]`.
 //! 2. **GDN rollback** — reuses the shared round tape
-//!    a round tape refolded over the kept prefix on partial acceptance (GDN recurrent
+//!    — refolded over the kept prefix on partial acceptance (GDN recurrent
 //!    state has no sequence axis; it cannot be truncated).
 //! 3. **Raw embed accessor** — [`Architecture::embed_tokens_raw`] (the verifier
 //!    `embed_tokens` is the EAGLE-3 `bind()` target; the checkpoint ships no
@@ -67,41 +63,24 @@
 //! autoregressive own-hidden feed, d2t remap) *plus* the speculators-format
 //! per-aux `fcs` norm (below).
 //!
-//! **`fcs.0/1/2` (`[2048]` each) — applied (verified accept-rate win, ).**
+//! **`fcs.0/1/2` (`[2048]` each) — applied.**
 //! The Dogacel checkpoint (a *speculators*-format export) carries three extra
 //! per-aux RMSNorm weight vectors that neither the mainline SpecForge
 //! `LlamaForCausalLMEagle3` model nor the mlx-vlm `Eagle3DraftModel` reference
 //! defines (mlx-vlm `sanitize` silently drops them; it cannot load this variant
 //! faithfully). The trained behavior is to RMSNorm each of the 3 aux hidden
-//! states by `fcs.{0,1,2}` *before* the `fc` concat-projection. Applying them
-//! more than doubled the live greedy accept-rate (0.09 -> 0.21). Auto-detected
-//! by tensor presence; `RMLX_EAGLE3_NO_FCS=1` forces the raw-concat fallback.
+//! states by `fcs.{0,1,2}` *before* the `fc` concat-projection, and rMLX
+//! applies them. The path is auto-detected by tensor presence;
+//! `RMLX_EAGLE3_NO_FCS=1` forces the raw-concat fallback.
 //!
-//! **: seed-token double-processing bug — fixed.** Via mlx-vlm reference
-//! diff, two related bugs were identified:
-//!
-//! 1. **Prefill path**: `prefill_from_verifier_hidden` returned the drafter's
-//!    hidden at the bonus position. The round then called
-//!    `draft_block(bonus, h_seed)` which ran `forward_token(bonus, h_seed)` —
-//!    processing bonus through the drafter a SECOND time using its own output as
-//!    conditioning (the drafter had already processed bonus in the prefill).
-//! 2. **Per-round seeding**: `accept_and_reseed` returned `h_seed` (drafter's
-//!    hidden at correction). The round then called
-//!    `draft_block(correction, h_seed)` which ran `forward_token(correction, h_seed)` —
-//!    again a second forward pass for correction.
-//!
-//! Root cause: the round was treating `h_seed` as an INPUT conditioning
-//! hidden (to be fed with a new token), whereas `h_seed` is the drafter's OUTPUT
-//! at the seed position (the drafter has already processed the seed token).
-//!
-//! Fix: `accept_and_reseed` and `prefill_from_verifier_hidden` now return
-//! `(h_seed, seed_tok)` where `seed_tok = greedy_target_token(h_seed)` mirrors
-//! mlx-vlm's `_seed_token`. `draft_block` gains `precomputed_first_tok:
-//! Option<u32>` — when `Some(t)`, `t` is prepended as the first draft token
-//! WITHOUT a forward pass, and the drafting loop runs `block_size - 2` more
-//! times.
-//! This exactly mirrors mlx-vlm `Eagle3DraftModel.draft_block` with `_seed_token`
-//! set. Net effect: each round the drafter makes one more genuine prediction.
+//! **Seed token.** The drafter's hidden at the seed position is its *output*
+//! for the seed token, not an input for a new one. `accept_and_reseed` and
+//! `prefill_from_verifier_hidden` therefore return `(h_seed, seed_tok)` with
+//! `seed_tok = greedy_target_token(h_seed)` (mlx-vlm's `_seed_token`), and
+//! `draft_block` takes `precomputed_first_tok: Option<u32>`: when `Some(t)`,
+//! `t` is prepended as the first draft token with no forward pass, and the
+//! drafting loop runs `block_size - 2` more times. This mirrors mlx-vlm
+//! `Eagle3DraftModel.draft_block` with `_seed_token` set.
 
 #![allow(
     clippy::cognitive_complexity,
@@ -367,10 +346,10 @@ impl Eagle3Drafter {
     /// (with `input_norm == None`, the default for this checkpoint). `concat_hidden`
     /// is `[1, n, 3*H]`; returns `[1, n, H]`.
     ///
-    /// When `fcs` is present (speculators checkpoint + `RMLX_EAGLE3_FCS=1`), each
-    /// aux slice is RMSNorm'd by `fcs.{0,1,2}` before re-concatenation — an
-    /// in-progress numeric-alignment hypothesis for the Dogacel accept gap (see
-    /// module docs). Default OFF (raw concat) matches the mlx-vlm reference.
+    /// When `fcs` is present (found by tensor presence in a speculators
+    /// checkpoint, unless `RMLX_EAGLE3_NO_FCS` is set), each aux slice is
+    /// RMSNorm'd by `fcs.{0,1,2}` before re-concatenation (see module docs).
+    /// Without `fcs` the raw concat matches the mlx-vlm reference.
     #[allow(
         clippy::indexing_slicing,
         reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
@@ -943,9 +922,8 @@ fn load_eagle3(
     let fc = Linear::Plain { weight: fc_w };
 
     // Per-aux RMSNorms (`fcs.{0,1,2}`). The speculators-format Dogacel checkpoint
-    // applies these to each aux hidden slice before the `fc` concat-projection;
-    // enabling them more than doubled the live greedy accept-rate (0.09 -> 0.21)
-    // — see module docs. Auto-detected by tensor presence: when all
+    // applies these to each aux hidden slice before the `fc` concat-projection
+    // (see module docs). Auto-detected by tensor presence: when all
     // `fcs.{i}.weight` exist we use the per-aux path, else fall back to the raw
     // concat (mlx-vlm / canonical SpecForge layout). `RMLX_EAGLE3_NO_FCS=1`
     // forces the raw-concat fallback for A/B comparison.

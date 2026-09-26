@@ -1,6 +1,6 @@
 //! rMLX binary entry.
 //!
-//! Parses subcommands, sets up tracing to `logs/<run-id>.jsonl`, prints version.
+//! Parses subcommands, sets up tracing to `<RMLX_HOME>/logs/<run-id>.jsonl`, prints version.
 
 // CLI binary: user-facing output. tracing not appropriate for command results.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
@@ -121,13 +121,12 @@ fn parse_draft_block_size(s: &str) -> Result<usize, String> {
 
 /// CLI value-enum wrapper for [`rmlx_models::prefix_index::PrefixIndexKind`].
 ///
-/// review MEDIUM-3: lets clap reject garbage values at parse-time
-/// (`possible values: linear, radix` usage error) rather than after the
-/// downstream `String::parse()` returns an anyhow. The model crate carries no
-/// clap dep, so the `ValueEnum` impl lives here.
+/// Lets clap reject an unknown value at parse time (`possible values: linear,
+/// radix`). The model crate carries no clap dep, so the `ValueEnum` impl lives
+/// here.
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum PrefixIndexKindArg {
-    /// O(slots × n_blocks) linear scan; byte-identical to pre-.
+    /// O(slots × n_blocks) linear scan over the resident slots.
     #[default]
     Linear,
     /// NVIDIA Dynamo positional radix tree.
@@ -155,8 +154,8 @@ use commands::{
 };
 
 /// Long-help body shared by `--cache-type-k` / `--cache-type-v` on every
-/// subcommand. Mirrors the §D1 table at a high level; full set is in
-/// `docs/KV_CACHE.md` and `rmlx info --list-cache-types`.
+/// subcommand. The full set is in `docs/KV_CACHE.md` and
+/// `rmlx info --list-cache-types`.
 const CACHE_TYPE_K_LONG_HELP: &str = "\
 Per-side KV cache codec for the K (key) tensor (`--cache-type-k` / `--ctk`).
 
@@ -210,8 +209,7 @@ one of them is a smaller cache.
 
 Special value:
   auto      -- the same codec `--kv-quant auto` resolves to (unquantised bf16).
-               It does not inspect the hardware: the memory-pressure selector
-               that used to live here returned a preset that saves no bytes.
+               It does not inspect the hardware.
 
 Presets:
   fp16          -- bf16 both sides (unquantised; KvQuant::None)
@@ -222,17 +220,16 @@ Presets:
   planar3       -- PlanarQuant 3-bit V-side (KvQuant::Planar3)
   k_only_planar -- PlanarQuant K-side, V bf16 (KvQuant::PlanarK; rejected on Qwen MoE)
 
-*Arch guard: --kv-preset quality resolves to TurboSym4 (symmetric 4-bit Lloyd-Max K+V), rejected on \
-Qwen MoE (PPL disaster path). --kv-preset speed resolves to TurboSym3 (symmetric 3-bit Lloyd-Max K+V), \
-also rejected on Qwen MoE (K-side 3-bit PPL disaster). \
-See docs/KV_QUANT.md sections \"Preset semantics\" and \"Codec disposition\".";
+*Arch guard: --kv-preset quality resolves to TurboSym4 (symmetric 4-bit Lloyd-Max K+V) and \
+--kv-preset speed to TurboSym3 (symmetric 3-bit Lloyd-Max K+V). Qwen MoE rejects both: it \
+refuses every codec that stores K below 8 bits. \
+See docs/KV_QUANT.md section \"Preset semantics\" and docs/KV_QUANT.md section \"Codec disposition\".";
 
 /// Short help for `--kv-quant`, shared by every subcommand that takes it.
 ///
 /// Names no codec and quotes no ratio on purpose. A name in a one-line help
 /// cannot carry its disposition, and a ratio typed into a help string is a
-/// second copy of a number the engine already computes — the one this line used
-/// to carry named two codec families as the only ones under bf16 when six are.
+/// second copy of a number the engine already computes.
 const KV_QUANT_HELP: &str = "\
 KV cache quantization codec. Default \"auto\" = unquantised bf16 on every arch. \
 Which codecs hold less resident KV than bf16 depends on the architecture — \
@@ -396,26 +393,23 @@ struct Cli {
     )]
     log_cap_mb: u64,
     /// Toggle the K-side 1-bit QJL residual for the rotor3_sym /
-    /// rotor4_sym / k_rotor3 / k_rotor4 codecs. Default `off`: QJL has no Metal
-    /// kernel, so turning it on forces the rotor K path onto CPU (single-digit
-    /// TPS) with no measured accuracy gain; off routes the rotor K encode
-    /// through the Metal fused-decode kernel. Pass `--rotor-qjl on` to opt into
-    /// the residual for ablation / fidelity study.
-    /// Env fallback `RMLX_ROTOR_QJL=1` honored when this flag is absent.
+    /// rotor4_sym / k_rotor3 / k_rotor4 / rotor_k_{3,4}_asym_* codecs.
+    /// Default `off`. QJL has no Metal kernel, so `on` runs the rotor K encode
+    /// and decode on the CPU; `off` keeps the rotor K path on the Metal
+    /// fused-decode kernel. The binary always installs this value, so
+    /// `RMLX_ROTOR_QJL` has no effect on it.
     #[arg(long, value_enum, global = true, default_value_t = RotorQjlArg::Off)]
     rotor_qjl: RotorQjlArg,
     /// Route pre-softmax QK over PlanarQuant-packed K through the fused MSL
-    /// kernel (`planar_fused_qk`).  Default `on`; `off` reverts to the legacy
+    /// kernel (`planar_fused_qk`).  Default `on`; `off` selects the
     /// dequant+SDPA path (ablation / bench baseline).  Affects only
     /// `KvStorage::PlanarK` caches.  No env fallback — CLI-only.
     #[arg(long, value_enum, global = true, default_value_t = PlanarFusedQkArg::On)]
     planar_fused_qk: PlanarFusedQkArg,
-    /// Generalized fused-QK kernels for q8 / turbo3 / turbo4 / iso / rotor
-    /// K-packed caches.  Default `auto`.
+    /// Fused-QK kernels over a head-major K shadow for the K8V4, K8V8,
+    /// TurboSym3/4 and rotor-asym 3/4 K codecs. Default `auto`.
     ///
-    /// `auto` (default): HOLD — kernel stubs present but not dispatching.
-    /// Auto stays OFF until codec implementations land and NIAH gates pass;
-    /// a pre-existing `RMLX_FUSED_QK=1` is still honoured.
+    /// `auto` (default): off, unless `RMLX_FUSED_QK=1` is set.
     /// `on`: resolve the gate on.
     /// `off`: HARD override — resolves off even with `RMLX_FUSED_QK=1` set.
     #[arg(long, value_enum, global = true, default_value_t = FusedQkMode::Auto)]
@@ -423,36 +417,27 @@ struct Cli {
     /// Two-phase sparse-attention dispatch (phase1_score +
     /// phase2_sparse_attend).  Default `auto`.
     ///
-    /// `auto` (default): HOLD — warm-TTFT dormant by design on normal generate
-    /// flows. Auto stays OFF until seedless workloads demonstrate measurable
-    /// speedup; a pre-existing `RMLX_SPARSE_ATTN=1` is still honoured.
+    /// No production path calls the sparse-attention dispatcher, so no value
+    /// changes the output.
+    ///
+    /// `auto` (default): off, unless `RMLX_SPARSE_ATTN=1` is set.
     /// `on`: resolve the gate on.
     /// `off`: HARD override — resolves off even with `RMLX_SPARSE_ATTN=1` set.
     #[arg(long, value_enum, global = true, default_value_t = SparseAttnMode::Auto)]
     sparse_attn: SparseAttnMode,
     /// TurboFlash MSL attention kernel. Default `auto`.
     ///
-    /// `auto` (default): resolves OFF on every host. On the one storage it
-    /// serves (K8V4, `kv_seq > 4096`) the kernel decodes 2.0–4.25× slower than
-    /// the generic path — the loss grows with `kv_seq` — and holds ~722 MB more
-    /// resident KV.
+    /// `auto` (default): off, unless `RMLX_TURBO_FLASH=1` is set; that case
+    /// logs a `warn!`, because the kernel then runs while the flag reads
+    /// `auto`. The kernel serves K8V4 at `kv_seq > 4096` and decodes slower
+    /// than the generic path there.
     ///
-    /// It also changes the generated tokens, for a reason that is not a kernel
-    /// defect: it is the only K8V4 configuration in which the 4-bit V codec
-    /// runs at decode at all (the generic path reads the bf16 mirror), so the
-    /// difference is that codec's ≈0.997 fidelity floor. Against a
-    /// dequant-then-SDPA reference over its *own* packed buffers the kernel
-    /// agrees to ≤2 bf16 ULP.
-    ///
-    /// That ratio predates the dtype fix: the dispatcher used to return its f32
-    /// kernel output uncast, which promoted the whole decode graph while the
-    /// gate was on. Read it as an upper bound on the kernel's own cost. The
-    /// direction, and this default, are unchanged. HOLD until a decode
-    /// re-measurement clears it; a pre-existing
-    /// `RMLX_TURBO_FLASH=1` is still honoured, and logs a `warn!` naming the
-    /// cost because the kernel then runs while the flag reads `auto`.
-    /// `on`: resolve the gate on (ablation, and the escape hatch for that
-    /// re-measurement).
+    /// It also changes the generated tokens, and that is the codec, not the
+    /// kernel: it is the only K8V4 configuration in which the 4-bit V codec
+    /// runs at decode (the generic path reads the bf16 mirror). Against a
+    /// dequant-then-SDPA reference over its own packed buffers the kernel is
+    /// gated at 0.5 bf16 ULP per row.
+    /// `on`: resolve the gate on.
     /// `off`: hard override — resolves off even with `RMLX_TURBO_FLASH=1` set.
     ///
     /// Global: every subcommand resolves this the same way, so `rmlx bench`
@@ -464,16 +449,15 @@ struct Cli {
     /// Skips bf16 K/V buffer maintenance once the persistent flash buffers are seeded.
     /// Has no effect unless `--turbo-flash` (or `RMLX_TURBO_FLASH=1`) is also active.
     /// There is no `off` arm: passing the flag resolves lock-on, and when it is
-    /// absent `RMLX_TURBO_FLASH_LOCK=1` is still honoured (back-compat), so
-    /// clearing it means unsetting the variable.
+    /// absent `RMLX_TURBO_FLASH_LOCK=1` also resolves lock-on, so clearing it
+    /// means unsetting the variable.
     #[arg(long, global = true, default_value_t = false)]
     turbo_flash_lock: bool,
     /// PlanarQuant flash-decode MSL kernel. Default `auto`.
     ///
-    /// `auto` (default): OFF on every host — the warm-TTFT bf16-K seed shadows
-    /// the kernel on the normal generate flow, so there is no measurable TPS
-    /// win to flip Auto for; a pre-existing `RMLX_PLANAR_FLASH_DECODE=1` is
-    /// still honoured.
+    /// `auto` (default): off, unless `RMLX_PLANAR_FLASH_DECODE=1` is set. A
+    /// cache that went through prefill holds a bf16 K seed and never reaches
+    /// the kernel, whatever this flag says.
     /// `on`: resolve the gate on.
     /// `off`: HARD override — resolves off even with
     /// `RMLX_PLANAR_FLASH_DECODE=1` set.
@@ -485,8 +469,8 @@ struct Cli {
     /// Fused FWHT + affine-quantize MSL kernel for the rot_k codec families.
     /// Default `auto`.
     ///
-    /// `auto` (default): OFF — the rotate-by-matmul path is the validated one;
-    /// a pre-existing `RMLX_ROT_K_FUSED=1` is still honoured.
+    /// `auto` (default): off (rotate-by-matmul), unless `RMLX_ROT_K_FUSED=1`
+    /// is set.
     /// `on`: force the fused kernel (ablation / bench).
     /// `off`: HARD override — ignores `RMLX_ROT_K_FUSED=1` in the shell.
     ///
@@ -553,8 +537,8 @@ enum Cmd {
         #[arg(long)]
         host: Option<String>,
         /// Device to run inference on: "cpu" or "gpu".
-        /// Defaults to "gpu". Chunked prefill (Stage-3.2b) resolves the Metal watchdog
-        /// timeout on long prompts. Use --device cpu to fall back to CPU.
+        /// Defaults to "gpu". Prefill runs in chunks, so a long prompt does not
+        /// hit the Metal watchdog timeout. Use --device cpu to run on the CPU.
         #[arg(long)]
         device: Option<String>,
         #[arg(long, help = KV_QUANT_HELP, long_help = KV_QUANT_LONG_HELP)]
@@ -628,7 +612,7 @@ enum Cmd {
         /// Number of prompt-cache slots for multi-slot prefix matching.
         /// Each slot holds a post-prefill KV snapshot; on a prefix match
         /// the cached state is cloned and the new tail is prefilled.
-        /// Default 4. Set to 1 for legacy single-slot exact-match behaviour.
+        /// Default 4. Set to 1 for a single slot.
         #[arg(long)]
         prompt_cache_slots: Option<usize>,
         /// Drafter snapshot for speculative decoding: a sidecar head (MTP,
@@ -658,7 +642,7 @@ enum Cmd {
         /// completion tokens, which applies when this flag is absent.
         #[arg(long)]
         max_tokens_cap: Option<u32>,
-        /// Server-startup cap on per-request wall-clock timeout, in seconds (A8).
+        /// Server-startup cap on per-request wall-clock timeout, in seconds.
         ///
         /// Every request (including SSE streams) is bounded by this timeout.
         /// The `X-Request-Timeout-Seconds` header can lower the effective timeout
@@ -666,7 +650,7 @@ enum Cmd {
         /// Default 600 (10 minutes).
         #[arg(long)]
         max_timeout_secs: Option<u64>,
-        /// Run the 8-token smoke probe on first model load (B5). Default OFF.
+        /// Run the 8-token smoke probe on first model load. Default OFF.
         ///
         /// When set, the server runs `classify_smoke` on the snapshot before
         /// placing it in the serving slot. If the verdict is `BrokenPunctLoop`
@@ -678,10 +662,10 @@ enum Cmd {
         /// hot path. Use `rmlx info --probe-smoke` for offline auditing instead.
         #[arg(long, default_value_t = false)]
         require_smoke_probe: bool,
-        /// Maximum number of models held resident in GPU memory at once (C4).
+        /// Maximum number of models held resident in GPU memory at once.
         ///
-        /// Default 1 — byte-equivalent to the single-slot behaviour: loading
-        /// a different model evicts the current one (implicit swap). With a
+        /// Default 1: loading a different model evicts the current one
+        /// (implicit swap). With a
         /// value > 1, up to N models stay resident and the least-recently-used
         /// model is evicted only when a new one is requested past capacity.
         /// All forward passes are still serialised process-wide (single Metal
@@ -689,22 +673,22 @@ enum Cmd {
         #[arg(long)]
         max_loaded_models: Option<usize>,
         /// Maximum number of admitted-and-in-flight requests before new ones
-        /// are rejected with HTTP 429 `server queue full` (C5 Slice A).
+        /// are rejected with HTTP 429 `server queue full`.
         ///
         /// Requests serialise on the single GPU; this bounds the FIFO
         /// admission queue depth so a burst cannot stack unbounded
         /// `spawn_blocking` threads. Admitted requests are served in strict
-        /// FIFO arrival order (fairness fix). `0` = unlimited (FIFO +
+        /// FIFO arrival order. `0` = unlimited (FIFO +
         /// queue metrics still apply, no 429). Default 64.
         #[arg(long)]
         max_queue_depth: Option<usize>,
         /// Server-startup default temperature applied when a request omits the
-        /// `temperature` field (G4). Precedence: request > this > model
+        /// `temperature` field. Precedence: request > this > model
         /// generation_config.json > hard-coded 1.0.
         ///
         /// Set to 0.0 for deterministic greedy decoding across all requests
         /// (parity with mlx_lm.server `--temp 0`). Must be in [0.0, 2.0].
-        /// When absent (default), behaviour is unchanged from before this flag.
+        /// When absent (default), the model default and then 1.0 apply.
         #[arg(long)]
         default_temperature: Option<f32>,
         /// Server-startup default for thinking mode on Qwen3-family models.
@@ -712,7 +696,7 @@ enum Cmd {
         /// `--enable-thinking false` suppresses the open `<think>` block (no-think
         /// mode) for all requests unless a per-request `enable_thinking` field
         /// overrides it. `--enable-thinking true` is the explicit opt-in (same as
-        /// the current default when the flag is absent).
+        /// the default when the flag is absent).
         ///
         /// Precedence: per-request `enable_thinking` > this > absent (= enabled).
         /// When absent (default), the Qwen3.6 template default is preserved:
@@ -725,7 +709,7 @@ enum Cmd {
         /// image, preserving more resolution for dense inputs (e.g. tables).
         /// Clamped to the model's safe upper bound (1120). When absent
         /// (default), the snapshot's `processor_config.json` `max_soft_tokens`
-        /// (typically 280) is used — behaviour unchanged.
+        /// (typically 280) is used.
         ///
         /// Precedence: per-request `image_max_tokens` > this > config default.
         /// A no-op for text-only requests and non-Gemma4-unified vision archs.
@@ -735,8 +719,8 @@ enum Cmd {
         /// active cache namespace's on-disk KV blocks.
         ///
         /// Default 0 = no per-namespace ceiling. With `--kv-ssd-global-gb` also
-        /// 0 that means the tier is OFF (RAM-only prompt cache, unchanged
-        /// behaviour); with a global pool set, the tier is on and the pool
+        /// 0 that means the tier is OFF (RAM-only prompt cache); with a global
+        /// pool set, the tier is on and the pool
         /// ceiling governs this namespace on its own.
         /// When the tier is on, RAM-evicted prompt-cache snapshots spill to
         /// `<RMLX_HOME>/cache/kv/<namespace>/` and a RAM miss is served from the
@@ -765,7 +749,7 @@ enum Cmd {
         /// stands alone). When `> 0`, every model load runs a cross-namespace
         /// LRU sweep at startup: rows are evicted oldest-first across the
         /// union of all namespaces until the pool sum is ≤ this budget. Then
-        /// the active namespace's own per-namespace eviction runs (as today).
+        /// the active namespace's own per-namespace eviction runs.
         ///
         /// Independent of `--kv-ssd-cache-gb`. If the per-namespace value
         /// exceeds the global budget, the per-namespace ceiling is implicitly
@@ -779,25 +763,27 @@ enum Cmd {
         kv_ssd_global_gb: f64,
         /// RAM cap for the in-process prompt cache, in GiB.
         ///
-        /// Precedence: CLI > default 2 GiB. Applies to every per-arch prompt
-        /// cache constructed during
-        /// this process — controls `PromptCache::new` via the
-        /// `install_ram_cap` resolver.
+        /// Precedence: this flag > `[global].ram_prompt_cache_gb` in
+        /// `<RMLX_HOME>/projects.toml` > 2 GiB. Applies to every per-arch
+        /// prompt cache this process constructs (`PromptCache::new` reads it
+        /// through `install_ram_cap`).
         #[arg(long, value_name = "GIB")]
         prompt_cache_ram_gb: Option<f64>,
         /// Enable the paged-KV block-table storage path.
         ///
-        /// OFF by default — the contiguous KV path is unchanged. When ON:
-        /// every freshly constructed K8V4 / K8V8 / Planar cache routes through
-        /// `KvStorage::Paged` (block-table allocator) instead of the
-        /// contiguous-growth path.
+        /// OFF by default. When ON, every K8V4 / K8V8 / Planar / Planar3 cache
+        /// stores its packed K and V in `KvStorage::Paged` (block-table
+        /// allocator) instead of contiguous buffers. Other codecs keep their
+        /// own storage.
         ///
-        /// Restrictions enforced at CLI parse time:
-        /// - `--paged-kv` + `--kv-quant bf16` (or `--kv-quant none`) is rejected
-        ///   (the paged path supports K8V4 / K8V8 / Planar only).
-        /// - `--paged-kv` + `--cache-type-k rot_k*` is rejected (RotK
-        ///   are not paged-compatible — they ride the Mixed quantized-SDPA path).
+        /// A cache that went through prefill holds a bf16 mirror and decodes
+        /// from it, so the paged store does not take part in that decode.
         ///
+        /// Refused at startup:
+        /// - a resolved bf16 codec (`--kv-quant auto`, `none`, `bf16`,
+        ///   `--kv-preset fp16`): bf16 keeps no packed store to page.
+        /// - `--cache-type-k rot_k*`: RotK uses the Mixed storage, which
+        ///   has no paged form.
         #[arg(long, default_value_t = false)]
         paged_kv: bool,
         /// per-page token count for `--paged-kv` (positive integer).
@@ -809,14 +795,11 @@ enum Cmd {
         paged_kv_page_tokens: Option<i32>,
         /// prompt-cache longest-prefix index strategy.
         ///
-        /// `linear` (default) — O(slots × n_blocks) scan, byte-identical to
-        /// the pre-path. The radix tree is still maintained in
-        /// parallel (for the differential bench) but unused on lookup.
+        /// `linear` (default) — O(slots × n_blocks) scan over the resident
+        /// slots.
         ///
         /// `radix` — NVIDIA Dynamo positional radix tree, O(n_blocks) lookup
-        /// independent of slot count. Opt-in pending the bench gate
-        /// (≥2× linear at N≥32 with <5% mem overhead → default flip). The
-        /// linear path remains the bisect-safe fallback either way.
+        /// independent of slot count.
         #[arg(
             long,
             value_name = "KIND",
@@ -838,7 +821,7 @@ enum Cmd {
         adaptive_admission: bool,
         /// End-to-end step SLA target in milliseconds for the adaptive controller.
         ///
-        /// M2: this is the admission→final-token wall-clock target (not TTFT per se).
+        /// This is the admission→final-token wall-clock target (not TTFT per se).
         /// Anticipatory 503 fires when `est_step > 2 × step_target`. Default 500 ms.
         /// `--ttft-target-ms` is accepted as a hidden alias for backward compatibility.
         #[arg(
@@ -850,21 +833,20 @@ enum Cmd {
         ttft_target_ms: u64,
         /// ITL SLA target in milliseconds for the adaptive controller.
         ///
-        /// Requires `--adaptive-admission`. Queue depth is lowered when sustained
+        /// Read only with `--adaptive-admission`; without it the value is
+        /// ignored. Queue depth is lowered when sustained
         /// `est_itl > itl_target` and raised when `est_itl < itl_target × 0.80`.
         /// Default 50 ms (Dynamo default).
         #[arg(long, value_name = "MS", default_value_t = rmlx_server::admission::DEFAULT_ITL_TARGET_MS)]
         itl_target_ms: u64,
         /// Enable adaptive prefill-chunk sizing (default OFF).
         ///
-        /// Requires `--adaptive-admission`. When enabled, the admission controller
+        /// Read only with `--adaptive-admission`; without it the flag is
+        /// ignored. When enabled, the admission controller
         /// also adjusts the process-wide prefill chunk size based on the same ITL
         /// regression: raises the chunk when load is below the deadband (< 80 % of
         /// `--itl-target-ms`), lowers it after `HOLD_TICKS` consecutive overload
         /// ticks. Operates independently of queue-depth adjustment. Bounds: 32–2048.
-        ///
-        /// OFF by default — the chunk tuning is higher-risk and defaults are locked
-        /// from p0b-ttft bench data. Use only when the bench shows clear headroom.
         #[arg(long, default_value_t = false)]
         adaptive_prefill_chunk: bool,
         /// Path to a Whisper model snapshot directory (e.g. mlx-community/whisper-large-v3-mlx).
@@ -883,13 +865,11 @@ enum Cmd {
         whisper_tokenizer_path: Option<PathBuf>,
         /// Path to the Qwen3-TTS model snapshot directory.
         ///
-        /// Required to serve `POST /v1/audio/speech`. The snapshot must contain
-        /// `config.json` and `model.safetensors` (or shards).
+        /// Required, together with `--tts-tokenizer-path`, to serve
+        /// `POST /v1/audio/speech`; without both the endpoint returns 503. The
+        /// snapshot must contain `config.json` and `model.safetensors` (or
+        /// shards).
         /// Env: `RMLX_TTS_MODEL_PATH`.
-        ///
-        /// NOTE: Phase 4b (neural codec decoder) is not yet implemented; the
-        /// endpoint returns HTTP 501 until Phase 4b lands. The flag is accepted
-        /// now so server startup configs can be written ahead of time.
         #[arg(long, env = "RMLX_TTS_MODEL_PATH", value_name = "PATH")]
         tts_model_path: Option<PathBuf>,
         /// Path to the Qwen3-TTS speech tokenizer (codec decoder) snapshot directory.
@@ -948,12 +928,15 @@ enum Cmd {
         #[arg(long, env = "RMLX_YARN_ORIGINAL_MAX", value_name = "U32")]
         yarn_original_max: Option<u32>,
     },
-    /// One-off REPL chat for sanity-checking a model.
+    /// Resolve the KV flags for a model, take the Metal claim (GPU only;
+    /// `--device cpu` takes none), print one line and exit. Runs no
+    /// generation.
     Chat {
         #[arg(long)]
         model: PathBuf,
         /// Device to run inference on: "cpu" or "gpu".
-        /// Defaults to "gpu". Chunked prefill (Stage-3.2b) resolves the Metal watchdog timeout.
+        /// Defaults to "gpu". Prefill runs in chunks, so a long prompt does not hit the
+        /// Metal watchdog timeout.
         #[arg(long, default_value = "gpu")]
         device: String,
         #[arg(
@@ -1051,12 +1034,13 @@ enum Cmd {
     Info {
         /// Path to the model snapshot directory.
         ///
-        /// Required unless `--list-cache-types` is set (which prints the §D1
+        /// Required unless `--list-cache-types` is set (which prints the
         /// codec table without loading a model).
         #[arg(long, required_unless_present = "list_cache_types")]
         model: Option<PathBuf>,
         /// Device to run inference on: "cpu" or "gpu".
-        /// Defaults to "gpu". Chunked prefill (Stage-3.2b) resolves the Metal watchdog timeout.
+        /// Defaults to "gpu". Prefill runs in chunks, so a long prompt does not hit the
+        /// Metal watchdog timeout.
         /// Only relevant when --probe-forward or --probe-smoke is set.
         #[arg(long, default_value = "gpu")]
         device: String,
@@ -1117,7 +1101,7 @@ enum Cmd {
         /// Group size for --kv-bits (default 64). See --kv-bits long-help.
         #[arg(long, value_name = "N", requires = "kv_bits")]
         kv_group_size: Option<usize>,
-        /// Print the full KV cache codec table (§D1) and exit.
+        /// Print the full KV cache codec table and exit.
         /// No model load is attempted when this flag is set.
         #[arg(long, default_value_t = false)]
         list_cache_types: bool,
@@ -1154,7 +1138,7 @@ enum Cmd {
         #[arg(long)]
         port: Option<u16>,
         /// Path to the metrics SQLite DB.
-        /// Defaults to env RMLX_METRICS_DB or metrics/runs.db.
+        /// Defaults to env RMLX_METRICS_DB or `<RMLX_HOME>/metrics/runs.db`.
         #[arg(long)]
         db: Option<PathBuf>,
         /// Minimum free disk space in GiB for metrics/ and logs/ directories.
@@ -1171,8 +1155,9 @@ enum Cmd {
     /// Record performance baseline for a model snapshot.
     ///
     /// Measures load time, time-to-first-token, tokens/sec, and peak RSS.
-    /// Appends one row to metrics/baseline.csv and one JSONL record to
-    /// metrics/<run-id>.jsonl. Prints a one-line summary to stdout.
+    /// Appends one row to `<RMLX_HOME>/metrics/baseline.csv` (none under
+    /// `--metrics off`); `--record` also ingests one run record into
+    /// `runs.db`. Prints a one-line summary to stdout.
     Baseline {
         /// Path to the model snapshot directory.
         #[arg(long)]
@@ -1190,7 +1175,7 @@ enum Cmd {
         /// harness convenience flag; mutually exclusive with `--prompt`.
         #[arg(long, value_name = "N")]
         prompt_tokens: Option<u32>,
-        /// Device: "cpu" or "gpu". Defaults to "gpu" (chunked prefill resolves watchdog, Stage-3.2b).
+        /// Device: "cpu" or "gpu". Defaults to "gpu".
         #[arg(long, default_value = "gpu")]
         device: String,
         /// Number of tokens to generate. Default 32. Visible alias `--gen-tokens`.
@@ -1508,11 +1493,14 @@ enum Cmd {
         #[command(subcommand)]
         cmd: EvalCmd,
     },
-    /// CPU-only KV calibration pass: computes top-K high-precision indices
-    /// per KV head from weight L2 norms and writes `kv_calib.json`.
+    /// KV calibration pass. The weight-norm recipes (`turbo*`) compute top-K
+    /// high-precision indices per KV head from weight L2 norms on the CPU and
+    /// write `kv_calib.json`; they need no Metal context and can run beside
+    /// `rmlx serve`. The head-budget recipes load a Qwen3 model on the GPU
+    /// and write `head_budgets.json`.
     ///
-    /// Requires no MLX/Metal context. Safe to run while `rmlx serve` is active.
-    /// Output path defaults to `<model>/kv_calib.json`.
+    /// Output path defaults to `<model>/kv_calib.json` (`<model>/head_budgets.json`
+    /// for a head-budget recipe).
     ///
     /// Recipes:
     ///   turbo2       — ~25% high-precision dims (turboquant25 internal)
@@ -1521,13 +1509,12 @@ enum Cmd {
     ///   turbo3_tcq   — same ratio as turbo3 with TCQ codec
     ///   turbo4       — same ratio as turbo3 (turboquant35 internal)
     ///   head_budget    — per-layer-per-head sparse-attn budgets (K-norm²
-    ///                    proxy). Legacy v1 recipe; superseded by `softmax_mass`.
+    ///                    proxy). Writes head_budgets.json schema v1.
     ///   softmax_mass   — true softmax-mass calibration. Computes real
     ///                    Q@K^T -> softmax -> cumulative-mass top-K per
     ///                    (layer, head) using a long-context calibration
     ///                    prompt set. Writes head_budgets.json schema v2.
-    ///   k_norm_proxy   — explicit alias for the legacy K-norm² proxy recipe,
-    ///                    recorded as schema v2 with the proxy label.
+    ///   k_norm_proxy   — alias for `head_budget`; writes schema v1.
     #[command(name = "kv-calibrate")]
     KvCalibrate {
         /// Path to the MLX model snapshot directory (must contain config.json + safetensors).
@@ -1913,11 +1900,9 @@ fn main() -> Result<()> {
         };
     }
 
-    // `rmlx kv-calibrate` runs without opening the EventRecorder; the
-    // GPU-loading recipes (`head_budget`, `softmax_mass`) acquire the
-    // single-MLX claim internally and are mutually exclusive with a live
-    // `rmlx serve`. Weight-norm recipes (turbo*) remain CPU-only and are safe
-    // to co-run with serve.
+    // `rmlx kv-calibrate` runs without opening the EventRecorder. The
+    // head-budget recipes take the claim on port 0 for the model load only;
+    // the weight-norm recipes (turbo*) are CPU-only.
     if let Cmd::KvCalibrate {
         model,
         recipe,
@@ -2034,7 +2019,7 @@ fn main() -> Result<()> {
                 .or_else(|| p.and_then(|x| x.kv_quant.clone()))
                 .unwrap_or_else(|| DEFAULT_SERVE_KV_QUANT.to_string());
             let max_ctx = max_ctx.or_else(|| p.and_then(|x| x.max_ctx));
-            // Idle keep-alive — CLI string > profile u64 (legacy) > unset.
+            // Idle keep-alive — CLI string > profile seconds (u64) > unset.
             //
             // When unset everywhere, `run_serve` falls back to the 15 min default.
             // `Option::None` here signals "no CLI override" — the layered resolver wins.
@@ -2077,14 +2062,14 @@ fn main() -> Result<()> {
                     "--model and --registry are mutually exclusive"
                 ));
             }
-            // G4: validate --default-temperature at startup.
+            // Validate --default-temperature at startup.
             if let Some(t) = default_temperature {
                 if !(0.0..=2.0).contains(&t) {
                     return Err(anyhow::anyhow!(
                         "--default-temperature must be in [0.0, 2.0], got {t}"
                     ));
                 }
-                info!(default_temperature = t, "G4: --default-temperature set");
+                info!(default_temperature = t, "--default-temperature set");
             }
             // log --enable-thinking at startup.
             if let Some(et) = enable_thinking {
@@ -2128,17 +2113,12 @@ fn main() -> Result<()> {
                     ));
                 }
             }
-            // review MEDIUM-3: clap `value_enum` already rejects
-            // garbage at parse-time (usage error mentioning the possible
-            // values). The downstream wiring just converts the wrapper
-            // into the model-crate type.
             let prefix_index_kind: rmlx_models::prefix_index::PrefixIndexKind = prefix_index.into();
             info!(?prefix_index_kind, "--prefix-index parsed");
             if paged_kv {
-                // Reject --paged-kv with rot_k* cache type (rotation-based K is
-                // not paged-compatible — Mixed quantized-SDPA dispatch).
-                // This check runs early because cache_type_k is a raw string flag
-                // unaffected by kv_preset resolution.
+                // RotK uses the Mixed storage, which has no paged form.
+                // cache_type_k is a raw string that --kv-preset does not
+                // resolve, so this check can run before resolution.
                 if let Some(ctk) = cache_type_k.as_deref() {
                     let lc = ctk.to_ascii_lowercase();
                     if lc.starts_with("rot_k") {
@@ -2154,9 +2134,8 @@ fn main() -> Result<()> {
                         ));
                     }
                 }
-                // Note: bf16/unquantised rejection for --paged-kv is checked
-                // AFTER kv_quant_final is resolved below. The old string-based
-                // check on kv_quant here would miss --kv-preset fp16.
+                // The bf16 refusal runs after kv_quant_final is resolved, so
+                // it also sees --kv-preset fp16.
                 info!(
                     page_tokens = ?paged_kv_page_tokens,
                     "--paged-kv requested"
@@ -2184,7 +2163,7 @@ fn main() -> Result<()> {
             // --model is supplied. Registry-mode resolution is per-model and
             // happens inside the loader closure; passing --cache-type-* with
             // --registry is rejected here (per-arch resolution would need to
-            // re-run for every model in the registry, out of scope for v0.0.1).
+            // re-run for every model in the registry).
             //
             // --kv-preset pre-resolution. parse_kv_preset returns a
             // KvPresetArg which is either Resolved(KvQuant) or Auto;
@@ -2219,14 +2198,9 @@ fn main() -> Result<()> {
                 // --kv-bits in registry mode is resolved directly (no arch validation).
                 // fractional dispatch mirrors resolve_model_flags.
                 //
-                // `--kv-preset auto` used to be rejected here with exit 78 and
-                // "auto-selection needs config.json to estimate model size".
-                // That reason is gone: `resolve_preset_arg` reads a constant and
-                // opens nothing, so there is nothing for a missing config.json
-                // to prevent — and `--kv-quant auto`, the same constant under
-                // another flag, was accepted on the same command line. Two
-                // spellings of one default must not disagree about whether they
-                // are allowed.
+                // `resolve_preset_arg` reads a constant and needs no
+                // config.json, so `--kv-preset auto` is accepted here exactly
+                // as `--kv-quant auto` is.
                 let kv_quant_opt = if let Some(preset_arg) = kv_preset {
                     let preset_kq = resolve_preset_arg(preset_arg);
                     info!(kv_quant = ?preset_kq, "rmlx serve registry: --kv-preset applied");
@@ -2258,7 +2232,7 @@ fn main() -> Result<()> {
                     eprintln!(
                         "error: --cache-type-k/--cache-type-v requires --model (not --registry)"
                     );
-                    eprintln!("see docs/KV_CACHE.md for supported codecs and combinations");
+                    eprintln!("see docs/KV_QUANT.md for supported codecs and combinations");
                     std::process::exit(78);
                 }
                 (dev, kv_quant_opt, max_ctx_override)
@@ -2410,7 +2384,7 @@ fn main() -> Result<()> {
             list_cache_types,
             max_ctx,
         } => {
-            // `--list-cache-types` prints the §D1 codec table and exits
+            // `--list-cache-types` prints the codec table and exits
             // before any model load. clap's `required_unless_present` guarantees
             // `model` is Some whenever this flag is absent.
             if list_cache_types {

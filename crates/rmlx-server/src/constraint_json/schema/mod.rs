@@ -1,4 +1,4 @@
-//! A6.4/A6.5 JSON-Schema constraint engine — submodules.
+//! JSON-Schema constraint engine — submodules.
 //!
 //! Exported surface (unchanged from the former `schema.rs`):
 //! - `SchemaError`, `EngagePolicy`, `SchemaNode` — types

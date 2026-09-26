@@ -134,7 +134,7 @@ fn infer_weight_quant_fallback() {
     );
 }
 
-// ── F1b: PromptTokens / CompletionTokens mapping ────────────────────────
+// ── PromptTokens / CompletionTokens mapping ────────────────────────
 
 /// `PromptTokens` maps to one `MetricEntry` row with name
 /// `"prompt_tokens_live"`.
@@ -163,7 +163,7 @@ fn f1b_completion_tokens_produces_one_metric() {
     assert!((m[0].value.unwrap() - 32.0).abs() < 1.0, "value must match");
 }
 
-// ── F2: ctx_max threading ────────────────────────────────────────────────
+// ── ctx_max threading ────────────────────────────────────────────────
 
 /// `MetricEvent.ctx_max` is forwarded to `RunRecord.ctx_max` (not
 /// the old sentinel `1`).
@@ -201,7 +201,7 @@ async fn f2_ctx_max_is_real_value_not_sentinel() {
     );
 }
 
-// ── F1b: registry coverage check ────────────────────────────────────────
+// ── Registry coverage check ────────────────────────────────────────
 
 /// The two new metric names must be present in the canonical registry
 /// (no WARN-drop on record_run path).
@@ -219,7 +219,7 @@ fn f1b_new_metrics_registered() {
     assert_eq!(dir2, rmlx_metrics::registry::Direction::LowerBetter);
 }
 
-// ── F9: ItlP99Ms / ItlSpikes metric mapping ─────────────────────────────
+// ── ItlP99Ms / ItlSpikes metric mapping ─────────────────────────────
 
 /// `ItlP99Ms` maps to one `MetricEntry` row with name `"itl_p99_ms"`.
 #[test]
@@ -292,7 +292,7 @@ async fn f9_itl_p99_and_spikes_round_trip() {
 // ── ItlStats metric mapping ──────────────────────────────────────────────
 
 /// `ItlStats` must produce exactly three `MetricEntry` rows with the
-/// correct names and values (M30 — itl_p50_ms, itl_p95_ms, step_ms_mean).
+/// correct names and values (itl_p50_ms, itl_p95_ms, step_ms_mean).
 #[test]
 fn itl_stats_produces_three_metrics_with_correct_names() {
     let m = event_kind_to_metrics(&MetricKind::ItlStats {

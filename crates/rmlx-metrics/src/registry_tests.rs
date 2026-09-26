@@ -19,11 +19,11 @@ fn every_spec_metric_present() {
         "kv_cache_bytes",
         "tps_per_gb_ram",
         "task_pass_at_1",
-        // N19 additions.
+        // Prompt-cache counters.
         "prompt_cache_hits",
         "prompt_cache_misses",
         "prompt_cache_bytes",
-        // C6 block-level counters.
+        // Block-level counters.
         "prompt_cache_block_hits",
         "prompt_cache_block_misses",
         "prompt_cache_partial_hits",
@@ -37,13 +37,13 @@ fn every_spec_metric_present() {
         "load_gpu_residency_ms",
         "load_first_kernel_ready_ms",
         "load_total_ms",
-        // C5 Slice A: admission-queue metrics.
+        // Admission-queue metrics.
         "queue_wait_ms",
         "queue_depth",
-        // F1b: per-request live token counts.
+        // Per-request live token counts.
         "prompt_tokens_live",
         "completion_tokens_live",
-        // F9: extended ITL stats.
+        // Extended ITL stats.
         "itl_p99_ms",
         "itl_spikes",
         // Speculative-decoding metrics.
@@ -59,7 +59,7 @@ fn every_spec_metric_present() {
         // SSD-tier observability (step2).
         "ssd_bytes_used",
         "ssd_evict_total",
-        // Raw per-event latency observations (H2: p50/p99 dropped — single-sample
+        // Raw per-event latency observations (no p50/p99 — single-sample
         // percentiles are meaningless; real aggregation via Prometheus histogram).
         "ssd_spill_ms",
         "ssd_hydrate_ms",

@@ -30,9 +30,9 @@
 #   spelled as its own segment (update_rotor_5_sym) is what separates a
 #   separator-collapsing key from one that leaves a doubled separator behind.
 #   The two size-critical
-#   docs (over/under the 200 KB threshold) are generated into a throwaway copy
+#   docs (over/under the 40 KiB threshold) are generated into a throwaway copy
 #   of the fixture at run time rather than committed, so this test does not
-#   carry ~250 KB of filler into the tree's own churn count. The churn section
+#   carry ~165 KB of filler into the tree's own churn count. The churn section
 #   needs real git history, which the base fixture does not have on its own
 #   (it is a subtree of this repo's working copy) — it builds its own
 #   throwaway two-commit, one-tag repo in a temp dir instead.
@@ -85,7 +85,7 @@ for f in \
     crates/rmlx-models/src/hydrate_alpha/prompt_cache_tests.rs \
     crates/rmlx-models/src/hydrate_beta/prompt_cache.rs \
     crates/rmlx-models/src/hydrate_gamma/prompt_cache.rs \
-    docs/SMALL.md
+    ./docs/SMALL.md
 do
     [ -f "$BASE/$f" ] || {
         echo "debt-report selftest: missing $BASE/$f" >&2
@@ -125,14 +125,21 @@ check_exit() {
 
 STATIC_WORK="$(mktemp -d)"
 cp -R "$BASE" "$STATIC_WORK/base"
+# The doc-size scan asks git which docs are ignored, so the root is a work tree.
+git -C "$STATIC_WORK/base" init -q || exit 1
 
 python3 - "$STATIC_WORK/base/docs" <<'EOF'
 import sys
 docs = sys.argv[1]
-big = ("This is a filler line documenting a codec variant in detail.\n" * 4300)
-open(f"{docs}/BIG.md", "w").write("# Big doc\n\n" + big)  # ~257 KB, over the 200 KB threshold
-almost = ("This is a filler line documenting a codec variant in detail.\n" * 3200)
-open(f"{docs}/ALMOST.md", "w").write("# Almost doc\n\n" + almost)  # ~191 KB, under the threshold
+big = ("This is a filler line documenting a codec variant in detail.\n" * 700)
+open(f"{docs}/BIG.md", "w").write("# Big doc\n\n" + big)  # 42,711 B, over the 40 KiB threshold
+almost = ("This is a filler line documenting a codec variant in detail.\n" * 650)
+open(f"{docs}/ALMOST.md", "w").write("# Almost doc\n\n" + almost)  # 39,664 B, under the threshold
+# 40,500 B: over 40 KB, under 40 KiB. A report that counted in KB would list it.
+open(f"{docs}/EDGE.md", "w").write("x" * 40499 + "\n")
+import os
+os.makedirs(f"{docs}/models/deep")
+open(f"{docs}/models/deep/NESTED.md", "w").write("# Nested doc\n\n" + big)
 EOF
 
 BASE_OUT=$(python3 "$TOOL" --root "$STATIC_WORK/base" --since HEAD)
@@ -1200,8 +1207,8 @@ check_exit "matched_lines_turbo_ssd_missing_exit" \
 rm -rf "$ABSENT_WORK"
 
 check "doc_over_threshold_listed" \
-    "BIG.md, generated over the 200 KB threshold, is listed" \
-    contains "docs/BIG.md" \
+    "BIG.md, generated over the 40 KiB threshold, is listed" \
+    contains "/BIG.md  " \
     BASE_OUT
 
 check "doc_under_threshold_absent" \
@@ -1212,6 +1219,21 @@ check "doc_under_threshold_absent" \
 check "doc_just_under_threshold_absent" \
     "ALMOST.md, generated just under the threshold, is not listed" \
     absent "ALMOST.md" \
+    BASE_OUT
+
+check "doc_size_unit_is_kib" \
+    "EDGE.md, 40,500 B, is over 40 KB and under 40 KiB, and is not listed" \
+    absent "EDGE.md" \
+    BASE_OUT
+
+check "doc_size_label_is_kib" \
+    "the section names its unit as KiB" \
+    contains "=== docs over 40 KiB ===" \
+    BASE_OUT
+
+check "doc_nested_over_threshold_listed" \
+    "a doc below docs/ in a subdirectory is scanned too" \
+    contains "models/deep/NESTED.md" \
     BASE_OUT
 
 check "dead_path_not_attempted" \
@@ -1244,6 +1266,7 @@ check "counter_oversized" \
 
 RENAME_WORK="$(mktemp -d)"
 cp -R "$BASE" "$RENAME_WORK/base"
+git -C "$RENAME_WORK/base" init -q || exit 1
 sed -i.bak 's/pub fn mtp_generate(/pub fn zzz_renamed_driver(/' \
     "$RENAME_WORK/base/crates/rmlx-models/src/speculative/mtp.rs"
 rm -f "$RENAME_WORK/base/crates/rmlx-models/src/speculative/mtp.rs.bak"
@@ -1296,7 +1319,8 @@ printf 'line1\nline2\nline3\nline4\nline5\n' >"$RATIO_WORK/crates/fixture-crate/
 printf 'docline1\ndocline2\ndocline3\ndocline4\n' >"$RATIO_WORK/docs/A.md"
 # A top-level *.md file, outside docs/ — proves the churn section's combined
 # pathspec still covers it; dropping the "*.md" half of that call would go
-# unnoticed if only docs/A.md (already covered by "docs") ever changed.
+# unnoticed if only the fixture doc under docs/ (already covered by "docs")
+# ever changed.
 printf 'r1\nr2\nr3\n' >"$RATIO_WORK/README.md"
 
 git_ratio add -A || exit 1
@@ -1306,7 +1330,7 @@ git_ratio commit -q -m "initial" || {
 }
 git_ratio tag v0.0.1 || exit 1
 
-# +4/-2 in the source file, +3/-1 in docs/A.md, +2/-1 in README.md — unique
+# +4/-2 in the source file, +3/-1 in the fixture doc, +2/-1 in README.md — unique
 # lines on both sides of each edit so the diff is unambiguous, not just
 # plausible.
 printf 'line1\nline2\nline3\nline6\nline7\nline8\nline9\n' >"$RATIO_WORK/crates/fixture-crate/src/lib.rs"
@@ -1331,7 +1355,7 @@ check "ratio_source_computed" \
     RATIO_OUT
 
 check "ratio_docs_computed" \
-    "docs/A.md and the top-level README.md are both in the combined figure (+3/-1 and +2/-1), not double-counted" \
+    "the fixture doc under docs/ and the top-level README.md are both in the combined figure (+3/-1 and +2/-1), not double-counted" \
     contains "docs (docs/, *.md): +5 / -2  (ratio 2.50x)" \
     RATIO_OUT
 
@@ -1342,6 +1366,40 @@ check "ratio_unavailable_on_bad_ref" \
     "an unresolvable --since is reported as unavailable, not read as zero churn" \
     contains "unavailable (" \
     UNAVAILABLE_OUT
+
+# The doc-size scan skips what git ignores: a local, untracked doc is not a
+# public doc, however large.
+mkdir -p "$RATIO_WORK/docs/private"
+printf 'docs/private/\n' >"$RATIO_WORK/.gitignore"
+python3 -c 'import sys; open(sys.argv[1], "w").write("x" * 50000)' "$RATIO_WORK/docs/private/HIDDEN.md"
+python3 -c 'import sys; open(sys.argv[1], "w").write("x" * 50000)' "$RATIO_WORK/docs/SHOWN.md"
+IGNORED_OUT=$(python3 "$TOOL" --root "$RATIO_WORK")
+
+NOT_GIT_WORK="$(mktemp -d)"
+mkdir -p "$NOT_GIT_WORK/docs"
+python3 -c 'import sys; open(sys.argv[1], "w").write("x" * 50000)' "$NOT_GIT_WORK/docs/LARGE.md"
+NOT_GIT_OUT=$(python3 "$TOOL" --root "$NOT_GIT_WORK")
+rm -rf "$NOT_GIT_WORK"
+
+check "doc_size_unavailable_outside_git" \
+    "outside a git work tree the doc-size section says unavailable, not a clean list" \
+    contains "unavailable (git check-ignore exit 128" \
+    NOT_GIT_OUT
+
+check "doc_size_unavailable_lists_nothing" \
+    "an unavailable doc-size section lists no doc" \
+    absent "LARGE.md" \
+    NOT_GIT_OUT
+
+check "doc_size_skips_ignored" \
+    "a gitignored doc over the threshold is not listed" \
+    absent "HIDDEN.md" \
+    IGNORED_OUT
+
+check "doc_size_keeps_untracked" \
+    "an untracked doc git does not ignore is listed" \
+    contains "SHOWN.md" \
+    IGNORED_OUT
 
 if [ "$FAILED" -ne 0 ]; then
     echo "debt-report selftest: FAIL ($FAILED of $((PASSED + FAILED)))" >&2

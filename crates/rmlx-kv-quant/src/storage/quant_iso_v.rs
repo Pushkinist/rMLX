@@ -1352,8 +1352,8 @@ const ISO_SLOT_BYTES: usize = 4;
 /// There is deliberately no quaternion buffer. The dequant kernel takes a
 /// quaternion slot it never dereferences — every group uses the constant
 /// `FIXED_QUAT` — so building one costs `total_groups * 4` f32 of allocation,
-/// memcpy and upload per call for data that is discarded. At the geometry #392
-/// reports (`head_dim = 512`, 128 groups) that is four times the codes buffer,
+/// memcpy and upload per call for data that is discarded. At
+/// `head_dim = 512` (128 groups) that is four times the codes buffer,
 /// on a per-decode-step path. The readers pass `codes_arr` for that slot, which
 /// is what the GPU mirror arm in `dequant_gpu` already did.
 #[derive(Debug)]

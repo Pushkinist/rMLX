@@ -1,4 +1,4 @@
-//! Public types for the A6.4 JSON-Schema constraint engine.
+//! Public types for the JSON-Schema constraint engine.
 //!
 //! `SchemaError`, `EngagePolicy`, `SchemaNode`.
 
@@ -52,7 +52,7 @@ impl SchemaError {
 ///
 /// - `ValueStarter`: engage on the first non-whitespace byte that is a legal
 ///   value-starter for this schema's root (e.g. `{` for object, `[` for
-///   array). This is the A6.3 behaviour and is correct for container roots
+///   array). This is the json_object behaviour and is correct for container roots
 ///   where the model reliably emits `{`/`[` as its first answer byte.
 ///
 /// - `Immediate`: engage on the very first post-think token, regardless of

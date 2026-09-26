@@ -6,11 +6,9 @@
 //! miss). Reports the criterion `ns/op` time per `match_best` call.
 //!
 //! Memory: best-effort resident-byte estimate per slot (`size_of_val` walk
-//! over the indexed entries) is dumped to `.rmlx/bench/prefix_index.csv`
-//! alongside the timing rows, so the radix vs linear overhead is observable.
-//! A small Markdown summary is appended to `docs/PERF_BASELINE.md` at the
-//! "Prefix-index bench" section by the runner (the bench itself just emits
-//! the CSV; the docs append is a one-line cat in the decision commit).
+//! over the indexed entries) is written to
+//! `<RMLX_HOME>/bench/prefix_index.csv` beside the timing rows, so the radix
+//! vs linear overhead is observable.
 //!
 //! ## Running
 //!
@@ -19,8 +17,7 @@
 //! ```
 //!
 //! Times under criterion's default 100-sample regime; full output lands at
-//! `target/criterion/`. The CSV under `.rmlx/bench/` is the load-bearing
-//! artefact the decision rule reads.
+//! `target/criterion/`.
 
 #![allow(
     missing_docs, // criterion_group!/criterion_main! expand to undocumented fns
@@ -133,13 +130,10 @@ fn radix_resident_bytes(idx: &RadixTree) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// CSV + Markdown emit
+// CSV emit
 // ---------------------------------------------------------------------------
 
 fn csv_path() -> PathBuf {
-    // review LOW-4: route through `rmlx_core::paths::bench_dir()`
-    // so the CSV lands at `<RMLX_HOME>/bench/prefix_index.csv`. Replaces
-    // the previous cwd walk-up that hard-coded `.rmlx/bench/` segments.
     rmlx_core::paths::bench_dir().join("prefix_index.csv")
 }
 
@@ -235,8 +229,7 @@ fn bench_prefix_index(c: &mut Criterion) {
         });
 
         // Also record a one-shot wall-clock + ns/op + RSS estimate to the
-        // CSV so the decision-rule script can read them without parsing
-        // criterion HTML.
+        // CSV, so a reader does not have to parse criterion HTML.
         let t0 = Instant::now();
         run_lookups_linear(&linear, &fx.probes);
         let wall = t0.elapsed();

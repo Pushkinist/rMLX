@@ -775,7 +775,7 @@ fn iso_v3_ssd_roundtrip_preserves_dequant_output() {
     );
 }
 
-/// Falsifies #284: `quant_iso_v_truncate_to_keeps_first_n` above only runs at
+/// `quant_iso_v_truncate_to_keeps_first_n` above only runs at
 /// `kv_h == 1`, where each block's `n_tokens` already equals its sequence
 /// length (rows == seq). At `kv_h > 1`, `n_tokens` is inflated by `kv_h` and
 /// `truncate_to(n)` must convert `n` to row units before comparing, or it
@@ -838,7 +838,7 @@ fn truncate_to_kv_h_gt_1_keeps_exact_prefix<const BITS: u8>() {
 
         let decoded = store
             .dequant()
-            .expect("dequant must succeed after truncate at kv_h>1 (#284)");
+            .expect("dequant must succeed after truncate at kv_h>1");
 
         let mut reference = QuantIsoV::<BITS>::new(vec![1_i32, kv_h as i32, 0, head_dim as i32]);
         for tok in 0..keep_tokens {

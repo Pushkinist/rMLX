@@ -121,6 +121,12 @@ jobs:
       # toolchain, no GPU, no model.
       - name: the debt report finds what it claims to find
         run: make debt-report-selftest
+      # The doc-size cap fails on a doc over 40 KiB. Pure python3 + git over the
+      # checkout and over throwaway trees — no toolchain, no GPU, no model.
+      - name: no doc is over the size cap
+        run: make check-doc-size
+      - name: the doc-size gate still catches what it is for
+        run: make check-doc-size-selftest
 
   msl:
     name: msl kernels (compile + format)

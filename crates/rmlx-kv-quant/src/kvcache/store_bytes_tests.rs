@@ -3,24 +3,13 @@
 //!
 //! # Why one file and not one per family
 //!
-//! The rotor, iso and turbo collapses each landed a pin file of their own.
-//! Those three files held one machinery three times — the same drive, the same
-//! five observed columns, the same census shape — and differed in the spelling
-//! filter, the family name and the per-variant field list. That is the twin
-//! shape the repo's own rule names, so the machinery lives here once and the
-//! three family files keep only the claims that are about their family. The
-//! width-twin control is the same shape and moved here too, as
-//! [`assert_width_twins_differ`]; what stays with each family is its pair
-//! list. Their three `*_store_geometry_follows_the_codec_bit_width` tests stay
-//! apart, because each restates a different codec's published layout
-//! arithmetic and one body cannot carry three.
-//!
-//! The method is stated in [`docs/KV_ROTOR_TWINS.md`] and is not restated here.
-//! What this file adds to it is coverage: the three family files pinned 20 of
-//! the 28 spellings, and the eight they left out — `none`, `k8v4`, `k8v8`,
-//! `planar`, `planar3`, `planar_k`, the mixed pair — are the ones a restructure
-//! of the update path is most likely to move, because they are the oldest
-//! bodies in it.
+//! One machinery drives, observes and pins every spelling. The rotor, iso and
+//! turbo family files keep only the claims that are about their family; their
+//! width-twin pair lists call [`assert_width_twins_differ`] here. Their three
+//! `*_store_geometry_follows_the_codec_bit_width` tests stay apart, because
+//! each restates a different codec's published layout arithmetic and one body
+//! cannot carry three. `docs/KV_UPDATE_PATH.md` § "The store-bytes oracle"
+//! places this file in the update path it pins.
 //!
 //! # What cannot move
 //!
@@ -32,10 +21,7 @@
 //!   append and at every decode step;
 //! * `resident_bytes()`.
 //!
-//! A restructure that moves any of them is a defect, not a re-baseline. The
-//! pin values the three family files captured are carried here unchanged; a
-//! reader comparing this table against the deleted ones finds the same 44 rows
-//! with the same five numbers each.
+//! A restructure that moves any of them is a defect, not a re-baseline.
 //!
 //! # Two drives, two populations
 //!
@@ -56,11 +42,10 @@
 //! **The 10 that report `true`.** Their `exit_prefill` arms run, and the bytes
 //! those arms bulk-encode are what a served decode reads. [`drive`] never
 //! reaches those arms, and the guard above reads only whether the store is
-//! non-empty, so before this table nothing in the tree read a byte one of them
-//! wrote. [`drive_prefill`] brackets the chunk and pins three columns per
-//! spelling per shape: the store the arm bulk-encoded, `resident_bytes()` at
-//! the same point, and the rows the first decode step after the bracket hands
-//! back.
+//! non-empty, so this table is what reads the bytes they write.
+//! [`drive_prefill`] brackets the chunk and pins three columns per spelling per
+//! shape: the store the arm bulk-encoded, `resident_bytes()` at the same point,
+//! and the rows the first decode step after the bracket hands back.
 //!
 //! Both counts are derived from the predicate and asserted below rather than
 //! written into prose, so they move when the dispositions move.
@@ -110,8 +95,6 @@
 //! `truncate_to` **is** covered: the drive rolls back into the bulk chunk after
 //! the decode steps, so both halves of the truncate plan run and the
 //! post-truncate store bytes are a pinned column.
-//!
-//! [`docs/KV_ROTOR_TWINS.md`]: ../../../../docs/KV_ROTOR_TWINS.md
 
 use super::core::KvCache;
 use crate::storage::KvStorage;

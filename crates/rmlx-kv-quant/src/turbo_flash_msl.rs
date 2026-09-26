@@ -3,74 +3,34 @@
 
 //! TurboFlash p1/p2 split-K FlashAttention kernel.
 //!
-//! # Apple10 (M5+) hazard — historical, cleared 2026-06
+//! # Apple10 (M5+) `head_dim = 256`
 //!
-//! TheTom's original TurboFlash kernel was default-OFF on Apple10 (M5+) due
-//! to corruption producing garbage output (commit `67f076f2e` in
-//! llama-cpp-turboquant). `67f076f2e` is a 4-line `return true`→
-//! `return false` default-flip, NOT a kernel fix — no upstream TurboFlash
-//! corruption fix exists.
+//! Upstream TurboFlash is default-OFF on Apple10 (M5+) because of corrupted
+//! output; the upstream change is a default flip, not a kernel fix.
+//! `crates/rmlx-kv-quant/tests/apple10_head_dim_256.rs` drives a synthetic
+//! K8V4 cache at `head_dim = 256` through the public
+//! `KvCache::update_and_sdpa` chain under a `turbo_flash: true` policy (smoke,
+//! a 16-step decode stress, and a `turbo_flash: false` control) and asserts the
+//! process survives, the kernel dispatches, and the output clears the V
+//! turbo-4 codec floor (`tests/apple10_cpu_baseline.rs` measures that floor
+//! on the CPU).
 //!
-//! On rMLX, the initial B1 validation reproduced a more severe failure on
-//! M5 Max: an `EXC_BAD_ACCESS (SIGSEGV) KERN_INVALID_ADDRESS at 0x0` the
-//! instant the K8V4 flash path dispatched at 32k context on
-//! Qwen3.6-35B-A3B-8bit (`head_dim = 256`). Null `Buffer::raw_ptr()` in
-//! `Array::to_bytes` reading back the kernel output. The `--turbo-flash`
-//! `Auto` arm therefore landed with a `family ≥ 10 → OFF` clause.
+//! The kernel's own error is gated separately: [`turbo_flash_reference_sdpa`]
+//! unpacks the same packed buffers and runs an ordinary SDPA, so the codec
+//! cancels between the arms and only the kernel's arithmetic is left. The gate
+//! is cosine >= 0.999999 and <= 0.5 bf16 ULP per row over three cells — the two
+//! dispatching geometries and an additive-mask cell. A comparison against a
+//! `--turbo-flash off` run is a comparison against a bf16 attention — that arm
+//! does not run the codec at all — and cannot answer this question.
 //!
-//! **Re-validation (2026-06)**: the hazard was re-driven on M5 Max via
-//! `crates/rmlx-kv-quant/tests/apple10_head_dim_256.rs` — a synthetic K8V4
-//! cache at `head_dim = 256` driven through the public
-//! `KvCache::update_and_sdpa` chain under a `turbo_flash: true` policy, smoke
-//! + 16-step decode stress + a `turbo_flash: false` control. Result:
+//! On throughput the kernel loses: `--turbo-flash auto` resolves **OFF on every
+//! host**, because at `kv_seq > 4096` it decodes slower than the generic K8V4
+//! path it replaces. Enabling it is an explicit opt-in.
 //!
-//! * smoke (1 dispatch, kv_seq=65): no SIGSEGV, cosine min 0.997 vs bf16.
-//! * stress (16 dispatches, kv_seq up to 80): no SIGSEGV, cosine min 0.997.
-//! * control (kernel off): dispatch dormant (delta=0).
-//!
-//! The 0.997 SDPA cosine vs the K8V4 fused-QK 0.999998 floor is the
-//! **codec floor**, not a kernel issue. A CPU baseline test
-//! (`tests/apple10_cpu_baseline.rs`) confirmed the V turbo-4 codec
-//! encode→decode round-trip cosine alone is 0.997 (~identical at
-//! head_dim ∈ {128, 256}). The K8V4 fused-QK 0.999998 measures Q·K^T
-//! (K-dominated); the full SDPA (softmax @ V) shows V's turbo-4 codec
-//! floor. Same numerics at both head dims.
-//!
-//! That attribution used to rest on the CPU round-trip alone — i.e. on the
-//! codec's error being *large enough* to explain the gap, never on the
-//! kernel's own error being *small*. [`turbo_flash_reference_sdpa`] closes
-//! that: it unpacks the same packed buffers and runs an ordinary SDPA, so the
-//! codec cancels between the arms and only the kernel's arithmetic is left.
-//! Gated at cosine >= 0.999999 and <= 0.5 bf16 ULP per row over three cells —
-//! the two dispatching geometries and an additive-mask cell — and measuring
-//! 0.056 ULP at worst, two of the three bit-identical. Any comparison against a
-//! `--turbo-flash off` run is a
-//! comparison against a bf16 attention — that arm does not run the codec at
-//! all — and cannot answer this question in either direction.
-//!
-//! The documented hazard does not reproduce against the current kernel
-//! surface. See `docs/reports/apple10-head-dim-256-revalidation.md` for the
-//! verbatim numbers and the kernel changes that almost certainly closed the
-//! original failure mode.
-//!
-//! That clearance is crash/fidelity only, and was never a throughput one. On
-//! throughput the kernel loses: `--turbo-flash auto` resolves **OFF on every
-//! host**, because at `kv_seq > 4096` it decodes 2.0-4.25x slower than the
-//! generic K8V4 path it replaces (see
-//! `rmlx_cli::commands::serve::TurboFlashMode` for the measured cells).
-//! Enabling it is an explicit opt-in.
-//!
-//! Those cells were measured while this dispatcher returned its f32 kernel
-//! output uncast, which promoted the whole decode graph — residual stream,
-//! norms, weight GEMV, sampler — to f32 for as long as the gate was on. Part
-//! of the recorded ratio was that promotion rather than the kernel, so read the
-//! range as an upper bound until the cells are re-measured on a quiet host. The
-//! direction is unchanged: the ON arm is still the slower one.
-//!
-//! The smoke-probe trip-wire below is retained as armour against any future
-//! drift in the kernel that might revive the `!!!!!!`-style garbage-token
-//! signature — it is cheap (≥4 consecutive identical token IDs check) and
-//! gives a soft fallback if it ever fires.
+//! The smoke-probe trip-wire below guards against a kernel drift that would
+//! produce the `!!!!!!`-style garbage-token signature — it is cheap (a check
+//! for ≥4 consecutive identical token IDs) and gives a soft fallback if it
+//! ever fires.
 //!
 //! # What this is
 //!
@@ -117,8 +77,8 @@
 //!
 //! # Reference
 //!
-//! TheTom `ggml-metal.metal:8843` (p1), `:9034` (p2). N69 §1.
-//! Commit `67f076f2e` disables it on Apple10. N73 §3.
+//! TheTom `ggml-metal.metal:8843` (p1), `:9034` (p2).
+//! Commit `67f076f2e` disables it on Apple10.
 //!
 //! # Single-process GPU claim
 //!
@@ -244,7 +204,9 @@ const KERNEL_HEADER: &str = include_str!("metal/turbo_flash_header.metal");
 // 3. v_codes: u32 [B × n_kv_heads × T_stride × (head_dim/8)] — turbo4 codes, 8/u32
 // 4. v_scales: f32 [B × n_kv_heads × T_stride × (head_dim/32)] — turbo4 scales
 // 5. mask_flat: f32 [B × n_q_heads × T_active] or empty if no mask
-// 6. params_p1: u32 [11] — {B, n_q_heads, n_kv_heads, n_repeats, T_active, head_dim, n_blocks, has_mask, q8_words_per_tok, tq4_words_per_tok, T_stride}
+// 6. params_p1: u32 [11] — {B, n_q_heads, n_kv_heads, n_repeats, T_active,
+//    head_dim, n_blocks, has_mask, q8_words_per_tok, tq4_words_per_tok,
+//    T_stride}
 //
 // `T_active` is the count of valid tokens (iteration bound + mask length).
 // `T_stride` is the per-head row stride in K/V code/scale buffers — equal to

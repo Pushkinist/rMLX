@@ -54,10 +54,11 @@ use rmlx_kv_quant::{KvCache, LinearAttnCache};
 
 /// How a round decides which of its proposals the verifier stands behind.
 ///
-/// The one thing item 1 of `docs/SPEC_ROUND_SKELETON.md` says cannot be shared:
-/// the greedy walk compares tokens, and the stochastic one compares the two
-/// distributions each position was drawn from. Both commit the same shape — an
-/// accepted prefix and one token the verifier stands behind — which is why one
+/// The one thing this drafter's two rules do not share; see
+/// `docs/SPEC_ROUND_SKELETON.md` § "The acceptance rule". The greedy walk
+/// compares tokens, and the stochastic one compares the two distributions each
+/// position was drawn from. Both commit the same shape — an accepted prefix and
+/// one token the verifier stands behind — which is why one
 /// [`Verdict`] carries either.
 #[allow(missing_debug_implementations)]
 pub(crate) enum Acceptance {

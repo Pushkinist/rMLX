@@ -7,7 +7,7 @@
 //!   schema v3, LRU eviction, layout-key column).
 //! - [`block_io`] — `KvBlockWriter` / `KvBlockReader` (safetensors record
 //!   format per `KvStorage` variant) — the authoritative dispatch for
-//!   Contract B (every codec adds one match arm here).
+//!   Every codec adds one match arm here.
 //! - [`spill`] — `SsdSpiller` + `SpillJob` + bounded-channel drain thread.
 //! - [`hydrate`] — `SsdHydrator` for on-demand RAM-miss reload.
 //! - [`ssd_tier`] — `install_config`, `attach_at_load`, `compute_layout_key`,

@@ -1,15 +1,14 @@
 # Contributing to rMLX
 
-Thanks for your interest. rMLX is a Rust-native, single-binary MLX inference +
-conversion backend for Apple Silicon. A few things up front:
+Thanks for your interest. rMLX is a Rust-native, single-binary MLX inference
+backend for Apple Silicon. A few things up front:
 
 - **Apple Silicon only.** Metal first. No CUDA, no ROCm, no x86 SIMD. You need a
   real Apple-Silicon Mac to build and test — GitHub-hosted macOS runners have no
   usable Metal device, so the full suite runs on hardware, not in hosted CI.
 - **No Python at runtime.** One `cargo build --release` is the artifact.
 - **MLX-format only.** GGUF is out of scope.
-- **No training.** Quant / format conversion is in scope; fine-tune / fuse /
-  lora-merge is not.
+- **No training.** No fine-tuning, fusing or LoRA merging.
 
 ## Prerequisites
 
@@ -23,9 +22,9 @@ conversion backend for Apple Silicon. A few things up front:
 ```sh
 make build          # cargo build --workspace --release
 make check          # fast cargo check
-make test           # workspace tests (needs a Metal GPU)
-make ci             # fmt-check + clippy + test + deny + audit  ← pre-PR gate
-make ci-perf        # test-perf + the GPU/Metal suite  ← also required, see below
+make test           # workspace tests; skips the GPU tests
+make ci             # the pre-PR gate: fmt, clippy, tests, deny, audit, CI gates
+make ci-perf        # test-perf + the GPU/Metal suite; see below
 ```
 
 `make ci` must be green before you open a PR. The per-commit hook runs the fast
@@ -40,8 +39,8 @@ serialized and under Metal shader validation.
 
 Run it as well as `make ci` if your change touches **`crates/rmlx-kv-quant`, any
 `.metal` kernel, or a KV-cache / decode path**. It needs the GPU to itself —
-stop any `rmlx serve` first — and takes around 21 minutes. While iterating,
-`make gpu-test CRATE=… FILTER=…` runs a narrowed subset in seconds.
+stop any `rmlx serve` first. While iterating, `make gpu-test CRATE=… FILTER=…`
+runs a narrowed subset.
 
 Model-touching changes: see the regression-bench discipline in
 [`CLAUDE.md`](CLAUDE.md). At minimum the three test-target families (Gemma4,
@@ -64,24 +63,20 @@ open, or check open PRs for the name).
 4. Keep the branch current with `next/<name>` by rebasing onto it — never
    merge `next/<name>` into the branch, and never open a second PR for the
    same issue.
-5. `make ci` green locally on every chunk you push (fmt + clippy + test +
-   deny + audit). `make ci-perf` and the real-model regression smoke run once
-   at the end, on `next/<name>` itself, right before the release PR — not per
-   issue branch (see §Build & test).
+5. `make ci` green locally on every chunk you push, plus `make ci-perf` when
+   the change touches what §Build & test names. Every merge to `main` runs
+   the whole `make ci-perf`.
 6. Open a PR into `next/<name>`. The hosted checks
    (`.github/workflows/ci.yml`) run on every PR into `main` and into
    `next/<name>`, as the branch rulesets require. Fill in the PR template,
    including the `Removals` section — see below. A maintainer squash-merges it.
 
 Both `main` and `next/<name>` are protected: changes land via PR with the
-required checks green, never a direct push or a force-push. Only a
-maintainer moves commits from `next/<name>` onto `main`, by fast-forward, at
-release time — see `docs/RELEASING.md`. A fix for a bug already released on
-`main` branches from `main` directly as `hotfix/<issue>`; see the Hotfix
-procedure in `docs/RELEASING.md`.
-
-An issue scheduled for the next release carries the `next` label and that
-release's milestone, so what ships next is readable from the label alone.
+required checks green. Only a maintainer pushes to them directly, through the
+ruleset bypass: the release fast-forward of `next/<name>` onto `main`, and the
+rebase of `next/<name>` after a hotfix. A fix for a bug already released on
+`main` branches from `main` directly as `hotfix/<issue>`. Both procedures are
+in `docs/RELEASING.md`.
 
 ### No twins
 

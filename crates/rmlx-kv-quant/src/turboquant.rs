@@ -3,9 +3,8 @@
 //! # What this is
 //!
 //! Scalar (CPU/Rust) quantize + dequantize for the V tensor in
-//! TurboQuant KV-cache compression. No MSL kernels yet — that is an S2.5
-//! optimization. This module is the correctness reference; the Metal port
-//! will produce bit-identical output.
+//! TurboQuant KV-cache compression. This module is the CPU correctness
+//! reference for the MSL kernels (`turboquant_msl`, `k8vturbo3_append_msl`).
 //!
 //! # Codebook — Lloyd-Max, N(0,1)
 //!
@@ -315,8 +314,9 @@ pub fn turbo_quantize_v(x: &[f32], bits: u8, original_shape: &[i32]) -> Result<T
 ///
 /// This function is always CPU scalar. The GPU MSL path (`turbo_quantize_v4_gpu`)
 /// has the Lloyd-Max codebook hardwired in MSL source. When `codebook_override` is
-/// `Some`, callers **must** route to this function (CPU) for that layer.
-/// T19b will add an MSL variant that accepts a codebook buffer arg.
+/// `Some`, callers route to this function (CPU) for that layer, except at
+/// `bits == 4`, where `turbo_quantize_v4_codebook_buf_gpu` takes the codebook
+/// as a buffer.
 ///
 /// # Errors
 ///

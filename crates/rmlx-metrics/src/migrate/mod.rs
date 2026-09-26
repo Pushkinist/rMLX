@@ -3,7 +3,7 @@
 //! Two sub-modules:
 //! - [`schema_runner`] — `run_pending` (schema migrations).
 //! - [`legacy`] — `migrate_all` + `MigrateOptions` + `MigrateReport`
-//!   (docs/METRICS_DB.md §7, legacy-data ingestion).
+//!   (legacy-data ingestion, docs/METRICS_DB.md § "Legacy import").
 //!
 //! Usage:
 //! ```ignore

@@ -114,7 +114,7 @@ pub fn chained_block_hashes(ids: &[u32]) -> Vec<u64> {
 /// The salt lives at the call site, NOT inside this function:
 ///
 /// ```text
-/// seed    = cache_seed(layout_key, kv_quant, model_sig)
+/// seed    = cache_seed(layout_key, kv_quant, layer_quants, model_sig)
 /// digests = chained_block_hashes_seeded(ids, seed)
 /// ```
 ///

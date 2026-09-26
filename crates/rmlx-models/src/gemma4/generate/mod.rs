@@ -90,15 +90,15 @@ pub fn generate_greedy<'a>(
     // lifetime, so these references share `'a` (a `&mut dyn` trait-object
     // reborrow is invariant and cannot be re-unified once split).
     step_fn: &'a mut dyn FnMut(&ProbeStep) -> Option<u32>,
-    // A6.2: optional sampler constraint. `None` = unmasked argmax (the hot
-    // path; identical to pre-A6.2 behaviour). `Some(_)` enables the masked
+    // Optional sampler constraint. `None` = unmasked argmax (the hot
+    // path). `Some(_)` enables the masked
     // branch at every argmax call site below.
     mut constraint: Option<&'a mut dyn ConstraintEngine>,
-    // A7.2: sampling config + per-request RNG. `temperature <= 0.0` keeps the
+    // Sampling config + per-request RNG. `temperature <= 0.0` keeps the
     // untouched greedy argmax path (`sampler_cfg.sampling_active() == false`).
     sampler_cfg: &'a crate::sampler::SamplerConfig,
     rng: &'a mut crate::sampler::Pcg32,
-    // A7.3: logit-penalty configuration + per-request token history.
+    // Logit-penalty configuration + per-request token history.
     // `penalty_cfg.penalties_active() == false` AND `!sampler_cfg.sampling_active()`
     // keeps the temp=0 pure-GPU argmax path byte-for-byte untouched.
     penalty_cfg: &'a crate::sampler::PenaltyConfig,
@@ -193,7 +193,7 @@ pub fn generate_greedy<'a>(
             );
             exact_hit = Some((cloned.kv_caches, cloned.first_id, cloned.first_piece));
         }
-        // B1 SWA snapshot/restore: restore the cloned snapshot verbatim at
+        // SWA snapshot/restore: restore the cloned snapshot verbatim at
         // absolute position `prefix_len == cached_len` and tail-forward only
         // `prompt_ids[prefix_len..]`. No truncation → no wrapped-SWA desync.
         Consumed::Reuse {
@@ -229,7 +229,7 @@ pub fn generate_greedy<'a>(
         Consumed::Miss(_) => {}
     }
 
-    // Derive the initial ring size and the virtual ceiling (issue #25):
+    // Derive the initial ring size and the virtual ceiling:
     // `--max-ctx` is a ceiling the ring grows lazily up to, not an eager
     // allocation. `initial_max_seq` is the small lazy start; `max_seq_ceiling`
     // caps growth and rejects over-long prompts.
@@ -338,7 +338,7 @@ pub fn generate_greedy<'a>(
     let sliding_window_i32 = model.cfg.sliding_window as i32;
     let n_layers = model.cfg.num_hidden_layers;
 
-    // Issue #34: advise once if the resolved codec is estimated to increase
+    // Advise once if the resolved codec is estimated to increase
     // resident KV vs bf16 on this windowed+global layer mix. Windowed (SWA)
     // layers already run the bf16 rotating ring and are a no-op for the codec;
     // the warn fires when the per-global-layer warm-TTFT bf16 seed + codec
@@ -503,7 +503,7 @@ pub fn generate_greedy<'a>(
             )
         })?
     } else if is_prefix {
-        // Prefix (B1): per-arch tail re-prefill. The cloned snapshot is already
+        // Prefix: per-arch tail re-prefill. The cloned snapshot is already
         // post-prefill quantized (offset == prefix_len), so the tail appends
         // via decode-mode `update` — do NOT enter the raw-BF16 prefill
         // scaffolding (it would route the tail into the empty prefill_raw
@@ -615,11 +615,11 @@ pub fn generate_greedy<'a>(
     top.eval()?;
     let top_bytes = top.to_bytes()?;
     let last_id = i32::from_le_bytes(top_bytes[..4].try_into().unwrap()) as u32;
-    // A6.3: advance constraint regardless of mask state (warm-up scans).
+    // Advance constraint regardless of mask state (warm-up scans).
     if let Some(c) = ctx.constraint.as_mut() {
         c.advance(last_id);
     }
-    // A7.3: push prefill token into history.
+    // Push prefill token into history.
     ctx.token_history.push(last_id);
     let prefill_total_ns = prefill_t0.elapsed().as_nanos();
 
@@ -661,7 +661,7 @@ pub fn generate_greedy<'a>(
                             // layout_key)` row the hydrator will reconstruct. When
                             // the SSD tier is OFF, `active_layout_key()` returns 0 and the
                             // seed collapses to `FNV_OFFSET` — legacy un-salted digests.
-                            // Issue #26: salt the stored digest stream by the
+                            // Salt the stored digest stream by the
                             // active KV codec too, so the push seed matches the
                             // codec-partitioned query seed in `find_best_prefix`
                             // above. Stacks with `layout_key` (XOR) exactly like
@@ -717,7 +717,7 @@ pub fn generate_greedy<'a>(
         nan_count,
         logprobs: prefill_logprobs,
     }));
-    // A7.3: prefill first token into history.
+    // Prefill first token into history.
     ctx.token_history.push(last_id);
 
     // EOS-stop. If prefill emitted an EOS already, no decode steps.
@@ -759,7 +759,7 @@ pub fn generate_greedy<'a>(
            "decode_profile"
        );
 
-    // N16: store KV-cache bytes for the /metrics/cache endpoint (post-decode).
+    // Store KV-cache bytes for the /metrics/cache endpoint (post-decode).
     let kv_bytes: u64 = caches.iter().map(|c| c.resident_bytes()).sum();
     model.kv_bytes.store(kv_bytes, post);
 

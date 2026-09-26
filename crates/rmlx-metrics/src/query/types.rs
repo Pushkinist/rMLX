@@ -44,7 +44,7 @@ pub struct BestRow {
     pub observation_id: i64,
     /// Cell coordinates (backend, model, quant, context, prompt).
     pub cell: Cell,
-    /// Metric name (§4 canonical).
+    /// Metric name (canonical, `docs/METRICS_SCHEMA.md` §4).
     pub metric: String,
     /// Champion metric value.
     pub value: f64,
@@ -79,7 +79,7 @@ pub struct ObservationRow {
     pub id: i64,
     /// Cell coordinates for this observation.
     pub cell: Cell,
-    /// Metric name (§4 canonical).
+    /// Metric name (canonical, `docs/METRICS_SCHEMA.md` §4).
     pub metric: String,
     /// Measured value.
     pub value: f64,
@@ -150,7 +150,7 @@ pub struct TimeseriesPoint {
 pub struct DeltaRow {
     /// Cell coordinates for this delta.
     pub cell: Cell,
-    /// Metric name (§4 canonical).
+    /// Metric name (canonical, `docs/METRICS_SCHEMA.md` §4).
     pub metric: String,
     /// `"higher_better"` or `"lower_better"`.
     pub direction: String,
@@ -173,7 +173,7 @@ pub struct RegressResult {
     /// The model name used for matching (partial substring match against
     /// `bests.model`).
     pub model: String,
-    /// Metric name (§4 canonical).
+    /// Metric name (canonical, `docs/METRICS_SCHEMA.md` §4).
     pub metric: String,
     /// `"higher_better"` or `"lower_better"`.
     pub direction: String,
@@ -214,7 +214,7 @@ pub struct ChampionCell {
 }
 
 /// One row per (model_namespace, model, weight_quant, kv_quant). Columns =
-/// canonical metrics from §4. Each cell = champion observation for that
+/// canonical metrics from `docs/METRICS_SCHEMA.md` §4. Each cell = champion observation for that
 /// (cell × metric), or absent if no observation present. Optionally filter
 /// to one backend (returns the per-backend champion).
 ///

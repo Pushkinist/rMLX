@@ -93,7 +93,7 @@ _CTV_EFF="${CTV:-}"
 [ "$_CTK_EFF" = "auto" ] && _CTK_EFF=""
 [ "$_CTV_EFF" = "auto" ] && _CTV_EFF=""
 
-# Collision check (per D2): if user sets CTK/CTV AND KV_QUANT positional is
+# Collision check: if user sets CTK/CTV AND KV_QUANT positional is
 # a real preset (not the "kv-flag-replaced" placeholder), refuse.
 if { [ -n "$_CTK_EFF" ] || [ -n "$_CTV_EFF" ]; } \
    && [ "$KV_QUANT" != "kv-flag-replaced" ] \
@@ -592,7 +592,8 @@ case "$BACKEND" in
     # GGUF arms. MODEL_PATH is a .gguf file here, not an MLX snapshot dir --
     # no file exists that both families can load, so a cell against an MLX
     # backend rests on a stated quant-equivalence assumption (see
-    # docs/PERF_BASELINE.md H2 addendum). The fork-vs-upstream pair does not.
+    # docs/PERF_BASELINE.md § "Cross-backend cells"). The fork-vs-upstream
+    # pair does not.
     #
     # KV_QUANT is the ggml cache type for both sides; `none` means f16, which
     # is what upstream calls unquantised KV. `turbo2|turbo3|turbo4` exist only

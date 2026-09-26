@@ -133,7 +133,7 @@ pub(crate) struct SsdHistogram {
     pub(crate) buckets: [u64; HIST_BUCKETS_US.len()],
     /// Count of observations that fell beyond the last finite bucket (overflow
     /// diagnostic only — NOT added to `count` or `+Inf` exposition to avoid
-    /// double-counting; see H1 fix comment at the exposition sites).
+    /// double-counting; see the comment at the exposition sites).
     pub(crate) count_inf_overflow: u64,
     /// Sum of all observed durations in µs.
     pub(crate) sum_us: u64,
@@ -291,7 +291,7 @@ pub type TtftStore = Arc<PLMutex<VecDeque<TtftSample>>>;
 /// Maximum number of TTFT samples kept in memory.
 pub const TTFT_RING_CAPACITY: usize = 20;
 
-/// Per-request ITL (inter-token latency) aggregate sample (M30).
+/// Per-request ITL (inter-token latency) aggregate sample.
 ///
 /// Written by the blocking decode thread after all steps complete.
 /// Read by `GET /metrics/cache` to populate the `last_itl` block.
@@ -321,7 +321,7 @@ pub type ItlStore = Arc<PLMutex<VecDeque<ItlSample>>>;
 /// Maximum number of ITL samples kept in memory.
 pub const ITL_RING_CAPACITY: usize = 20;
 
-// ── F8: API error-category lifetime counters ─────────────────────────────────
+// ── API error-category lifetime counters ─────────────────────────────────
 
 /// HTTP-boundary API error categories.
 ///
@@ -337,25 +337,25 @@ pub enum ApiErrorCategory {
     /// HTTP 400 `invalid_request_error` — bad request field, out-of-range
     /// param, unsupported field, etc.
     BadRequest,
-    /// HTTP 400 `context_length_exceeded` — A2 prompt-length guard.
+    /// HTTP 400 `context_length_exceeded` — prompt-length guard.
     ContextOverflow,
     /// HTTP 404 `not_found_error` / `model_not_found` — model absent from
     /// registry.
     NotFound,
-    /// HTTP 507 `oom_during_load` — weight-load OOM (J3).
+    /// HTTP 507 `oom_during_load` — weight-load OOM.
     OomLoad,
-    /// HTTP 507 `oom_kv_cache` — KV-cache allocation OOM (J3).
+    /// HTTP 507 `oom_kv_cache` — KV-cache allocation OOM.
     OomKvCache,
-    /// HTTP 503 `oom_mid_stream` — mid-decode OOM (J3).
+    /// HTTP 503 `oom_mid_stream` — mid-decode OOM.
     OomMidStream,
-    /// HTTP 408 `timeout` — A8 per-request wall-clock timeout.
+    /// HTTP 408 `timeout` — per-request wall-clock timeout.
     Timeout,
     /// HTTP 503 `service_unavailable` — loader failure, missing pipeline,
     /// engine catch-all (non-OOM).
     Upstream,
     /// HTTP 500 `internal_error` — NaN logits / smoke probe / task panic.
     Internal,
-    /// HTTP 429 `rate_limit_error` — C5 admission-queue full.
+    /// HTTP 429 `rate_limit_error` — admission-queue full.
     RateLimit,
     /// HTTP 503 `admission_sla_exceeded` — anticipatory SLA rejection.
     ///
@@ -384,13 +384,13 @@ impl ApiErrorCategory {
     }
 }
 
-/// Process-lifetime per-category error counters (F8).
+/// Process-lifetime per-category error counters.
 ///
 /// One `Arc<AtomicU64>` per `ApiErrorCategory` variant. Stored on `AppState`
 /// and incremented at every HTTP error-response emission site. Exposed as
 /// `error_counts` in `GET /metrics/cache`.
 ///
-/// Storage layout mirrors F14 (`tokens_in` / `tokens_out`): plain
+/// Storage layout mirrors `tokens_in` / `tokens_out`: plain
 /// `Arc<AtomicU64>` fields, constructed with `AtomicU64::new(0)`.
 #[derive(Clone, Debug)]
 #[allow(
@@ -523,7 +523,7 @@ pub struct AppState {
     /// try_lock/warn/lock critical section in `Generator::generate` serialises
     /// across ALL resident models (single Metal context per process).
     pub gpu_gate: Arc<PLMutex<()>>,
-    /// C5 Slice A: process-wide FIFO admission gate over the single-GPU
+    /// Process-wide FIFO admission gate over the single-GPU
     /// serialisation. Constructed with exactly **1 permit** — `tokio`'s
     /// `Semaphore` hands out permits in strict FIFO arrival order, which is
     /// the fairness fix (the old `gpu_gate` `try_lock`→`lock` path acquired
@@ -533,14 +533,14 @@ pub struct AppState {
     /// unchanged — still one forward at a time; this adds fairness +
     /// bounded-depth rejection + queue observability only.
     pub gpu_queue: Arc<tokio::sync::Semaphore>,
-    /// C5 Slice A: count of requests that have passed the depth check and
+    /// Count of requests that have passed the depth check and
     /// not yet finished (admitted-and-in-flight, including the one holding
     /// the permit plus those waiting on `acquire_owned`). Used both as the
     /// bound for the `max_queue_depth` 429 reject and as the `queue_depth`
     /// gauge emitted to metrics at permit-acquire. Decremented by an RAII
     /// guard on every completion path (success, error, timeout, drop).
     pub gpu_pending: Arc<AtomicUsize>,
-    /// C5 Slice A: maximum number of admitted-and-in-flight requests before
+    /// Maximum number of admitted-and-in-flight requests before
     /// new ones are rejected with HTTP 429 (`server queue full`). `0` =
     /// unlimited (no admission rejection, FIFO + metrics still apply).
     /// Configurable via `--max-queue-depth` (default 64).
@@ -579,7 +579,7 @@ pub struct AppState {
     /// Per-request `X-Request-Timeout-Seconds` header can lower the effective
     /// timeout, but never exceed this cap. 0 = no timeout (disabled).
     pub max_timeout_secs: u64,
-    /// Per-session KV-reuse registry (N2).
+    /// Per-session KV-reuse registry.
     ///
     /// Tracks active `X-Session-Id` → prompt_len entries. The route handler
     /// calls `touch()` on each request to update last_used and derive the
@@ -597,28 +597,28 @@ pub struct AppState {
     /// alternation between the two capacities would rebuild the cache on every
     /// request.
     pub prompt_cache_slots: usize,
-    /// Rolling ring-buffer of per-request TTFT samples (L6).
+    /// Rolling ring-buffer of per-request TTFT samples.
     ///
     /// Written by `generate_streaming` when the first token arrives from the
     /// decode thread; read by `GET /metrics/cache`. Capped at
     /// `TTFT_RING_CAPACITY` entries — oldest evicted when full.
     pub ttft_store: TtftStore,
-    /// Rolling ring-buffer of per-request ITL aggregate samples (M30).
+    /// Rolling ring-buffer of per-request ITL aggregate samples.
     ///
     /// Written by the blocking decode thread after all tokens are produced;
     /// read by `GET /metrics/cache` to populate the `last_itl` block.
     /// Capped at `ITL_RING_CAPACITY` entries — oldest evicted when full.
     pub itl_store: ItlStore,
-    /// SPSC async drainer for per-request SQLite metrics (F6/L18).
+    /// SPSC async drainer for per-request SQLite metrics.
     ///
     /// `None` when no drainer has been started (e.g. unit-test stubs that
     /// do not need SQLite persistence). Production `run_serve` always sets this.
     pub metrics_drainer: Option<DrainerHandle>,
-    /// B5: when `true`, run the 8-token smoke probe on first model load and
+    /// When `true`, run the 8-token smoke probe on first model load and
     /// refuse to serve if the verdict is `BrokenPunctLoop` or `BrokenNan`.
     /// Default `false` (zero-overhead path unchanged).
     pub require_smoke_probe: bool,
-    /// G4: server-startup default temperature applied when the request omits
+    /// Server-startup default temperature applied when the request omits
     /// `temperature`. Precedence: request > this > model generation_defaults >
     /// hard-coded 1.0. `None` = absent (behaviour unchanged).
     /// Configurable via `--default-temperature`.
@@ -640,19 +640,19 @@ pub struct AppState {
     ///
     /// Precedence: request `image_max_tokens` > this > snapshot config default.
     pub default_image_max_tokens: Option<usize>,
-    /// F14: process-lifetime cumulative prompt (input) token counter.
+    /// Process-lifetime cumulative prompt (input) token counter.
     ///
     /// Incremented at the same request-completion site that emits
     /// `MetricKind::PromptTokens` to the SPSC drainer (single source, no
     /// double-count). Exposed as `tokens_in` in `GET /metrics/cache`.
     pub tokens_in: Arc<std::sync::atomic::AtomicU64>,
-    /// F14: process-lifetime cumulative completion (output) token counter.
+    /// Process-lifetime cumulative completion (output) token counter.
     ///
     /// Incremented at the same request-completion site that emits
     /// `MetricKind::CompletionTokens` to the SPSC drainer. Exposed as
     /// `tokens_out` in `GET /metrics/cache`.
     pub tokens_out: Arc<std::sync::atomic::AtomicU64>,
-    /// F8: per-category HTTP error lifetime counters.
+    /// Per-category HTTP error lifetime counters.
     ///
     /// Incremented at every HTTP error-response emission site (OpenAI +
     /// Anthropic routes, timeout middleware). Exposed as `error_counts` in
@@ -769,7 +769,7 @@ impl AppState {
     /// Returns `usize::MAX` when the model is not resident (cold-start race)
     /// or when the generator does not participate in KV-cache sizing — the
     /// existing 503 path then catches real runtime overflows. Used by the
-    /// A2 `context_length_exceeded` guard in the chat routes.
+    /// `context_length_exceeded` guard in the chat routes.
     pub fn effective_max_ctx_for(&self, model_id: &str) -> usize {
         self.slots
             .read()
@@ -898,12 +898,12 @@ impl AppState {
             drop(evicted);
         }
 
-        // B5: --require-smoke-probe gate.
+        // --require-smoke-probe gate.
         // Run before the generator is placed in the slot so a broken snapshot
         // is never served. Default-OFF (require_smoke_probe=false) keeps the
         // zero-overhead path unchanged.
         if self.require_smoke_probe {
-            tracing::info!(model_id, path = %entry.abs_path.display(), "B5: running smoke probe before first load");
+            tracing::info!(model_id, path = %entry.abs_path.display(), "running smoke probe before first load");
 
             // Render the smoke seed through the model's real chat template so the
             // probe exercises production-shaped, turn-structured input. When no
@@ -926,7 +926,7 @@ impl AppState {
             use rmlx_models::SmokeVerdict;
             match &verdict {
                 SmokeVerdict::Ok | SmokeVerdict::Inconclusive { .. } => {
-                    tracing::info!(model_id, ?verdict, "B5: smoke probe passed");
+                    tracing::info!(model_id, ?verdict, "smoke probe passed");
                 }
                 SmokeVerdict::BrokenPunctLoop {
                     dominant_piece,
@@ -936,7 +936,7 @@ impl AppState {
                         model_id,
                         dominant_piece,
                         distinct_ids,
-                        "B5: smoke probe FAILED — BrokenPunctLoop; refusing to serve"
+                        "smoke probe FAILED — BrokenPunctLoop; refusing to serve"
                     );
                     return Err(rmlx_core::error::Error::SmokeProbe(format!(
                         "smoke probe failed for '{model_id}': broken_punct_loop \
@@ -947,7 +947,7 @@ impl AppState {
                     tracing::error!(
                         model_id,
                         at_step,
-                        "B5: smoke probe FAILED — BrokenNan; refusing to serve"
+                        "smoke probe FAILED — BrokenNan; refusing to serve"
                     );
                     return Err(rmlx_core::error::Error::SmokeProbe(format!(
                         "smoke probe failed for '{model_id}': broken_nan at step {at_step}"
@@ -1015,10 +1015,10 @@ impl AppState {
     /// without `block_on`), this becomes a no-op so tests don't crash —
     /// real production always runs inside `rt.block_on`.
     ///
-    /// H2 contract: the caller controls whether the slot's
+    /// Contract: the caller controls whether the slot's
     /// `decode_lease` Arc is swapped before this call. The swap MUST happen
     /// at request-triggered reset sites (`ensure_loaded` warm branch and
-    /// `reset_keep_alive`) so the H1 identity check in the spawned task can
+    /// `reset_keep_alive`) so the identity check in the spawned task can
     /// also detect warm-reset races. The swap MUST NOT happen at the
     /// internal busy re-arm tail (this function's own re-entry after the
     /// busy check) — that path inherits the slot's current lease so
@@ -1067,7 +1067,7 @@ impl AppState {
         let lease_clone = Arc::clone(decode_lease);
         let handle_slot_clone = Arc::clone(handle_slot);
         let ttl_secs = policy.ttl_secs_for_log();
-        // H1+H2: identity token captured at spawn time. After
+        // Identity token captured at spawn time. After
         // `sleep().await` returns we must verify the slot we were spawned
         // for is still the same slot — otherwise a freshly-reset model
         // would be torn down by a stale TTL fire that won its abort race
@@ -1075,10 +1075,10 @@ impl AppState {
         // point.
         //
         // The identity check catches BOTH races:
-        //   (H1) unload-then-reload — the new `LoadedModel` is constructed
+        //   unload-then-reload — the new `LoadedModel` is constructed
         //        with a fresh `Arc<AtomicUsize>` in the cold-load path of
         //        `ensure_loaded`, so the slot's lease pointer differs.
-        //   (H2) warm-reset — every `arm_or_reset_timer(reset=true)` call
+        //   warm-reset — every `arm_or_reset_timer(reset=true)` call
         //        is paired with a swap of the slot's `decode_lease` Arc at
         //        the caller site (`ensure_loaded` warm branch + the busy
         //        re-arm tail + `reset_keep_alive`), so the slot's lease
@@ -1098,7 +1098,7 @@ impl AppState {
         // unwinds and never reaches the unload logic — that is the intended
         // cancel path. But if the abort lands AFTER the sleep has resolved,
         // the task continues to completion and `prev.abort()` is a no-op.
-        // The H1 identity check below guards that exact window: we re-check
+        // The identity check below guards that exact window: we re-check
         // under the write lock that the slot we were spawned for has not been
         // reset (Arc pointer of decode_lease unchanged) before tearing down.
         let jh = rt_handle.spawn(async move {
@@ -1141,7 +1141,7 @@ impl AppState {
                 // fire) will overwrite as needed.
                 return;
             }
-            // H1: identity-check + remove under a single write lock.
+            // Identity-check + remove under a single write lock.
             // The captured `lease_ptr` is the Arc::as_ptr of this task's
             // decode_lease; the resident slot's lease pointer must match for
             // this TTL fire to be authoritative. If a request reset the timer
@@ -1219,7 +1219,7 @@ impl AppState {
     /// against the cold-start race between `ensure_loaded` and the very next
     /// statement.
     ///
-    /// H2: the prior "benign churn" race (timer fire between
+    /// The prior "benign churn" race (timer fire between
     /// `ensure_loaded` and this call evicts the slot) is closed by the
     /// lease-swap at `ensure_loaded`'s warm branch. After a warm reset, the
     /// slot's lease pointer differs from the previous timer's captured

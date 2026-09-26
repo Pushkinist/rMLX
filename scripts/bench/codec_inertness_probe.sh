@@ -13,24 +13,28 @@
 #   * `store_skipped`    — whether ANY layer-cache in the run logged
 #                          `exit_prefill: packed store skipped`. Corroborating
 #                          only, and NOT a per-codec fact: the layer-adaptive
-#                          head/tail promotion types some layers `K8V8`, so a
-#                          store-READING codec sets this too (`mixed_*` does, on
-#                          Ternary-Bonsai-8B, where 10 of 36 layers are
-#                          promoted). Do not classify a codec by this column.
+#                          head/tail promotion sends the iso and rotor codecs'
+#                          boundary layers to `K8V8`, so those store-READING
+#                          codecs set this too. (`mixed_*` promotes in its own
+#                          family on a stack that does not share K/V, and does
+#                          not.) Do not classify a codec by this column.
 #
 # `kv_cache_bytes` and the id digest are the deciding columns: a codec whose
 # bytes and ids both equal `none`'s is doing nothing a caller can observe.
 #
 # `ttft_ms`, `decode_tps` and `prefill_tps` are recorded for context only and
 # are NOT comparable across rows: these are single unpaired runs on a shared
-# host, where the same binary and flags have read 11% apart thirty minutes
-# apart. Use `scripts/perf_ab.sh` for any throughput claim. The two columns the
+# host. Use `scripts/perf_ab.sh` for any throughput claim. The two columns the
 # probe exists for — bytes and the id digest — do not depend on host load.
 #
 # Usage:
 #   scripts/bench/codec_inertness_probe.sh --model <snapshot-abs-path> \
 #       --prompt-tokens 4096 [--max-tokens 100] [--max-ctx N] [--out CSV] \
 #       [--codecs "none k8v8 ..."] [--kv-boundary-layers H,T]
+#
+# `--max-tokens` defaults to 100. `docs/KV_QUANT.md` asks for at least 200: at
+# short lengths, codecs that differ can give the same digest. Pass
+# `--max-tokens 200` for a disposition run.
 #
 # Output CSV (appended, header written once):
 #   timestamp,model,prompt_tokens,prompt_tokens_measured,max_ctx,max_tokens,
@@ -49,10 +53,9 @@
 #
 # Default CSV: <RMLX_HOME>/bench/codec_inertness.csv
 #
-# Hard rule 8: kills competing MLX processes and clears the claim file before
-# every run. A stale claim turns every later run into an empty-output exit 11
-# that reads like "the model emitted nothing", so the claim is re-checked per
-# codec, not once per sweep.
+# Before every codec the preflight kills every `rmlx serve`, `rmlx_main serve`
+# and `mlx_lm` process and deletes the claim files below, whoever holds them.
+# That bypasses the single-process claim (hard rule 8).
 
 set -uo pipefail
 
@@ -76,9 +79,7 @@ MAX_CTX=""
 KV_BOUNDARY=""
 # `rmlx baseline` is a single-shot GPU op: it takes the claim at
 # `rmlx_server::claim::SENTINEL_PORT` (0xCAFE = 51966), not at a server port.
-# An earlier version of this preflight removed `/tmp/rmlx.62265.claim` only —
-# the server default — so the mitigation never touched the file it was written
-# for. Both are cleared; 62265 covers a stray `rmlx serve` holding the GPU.
+# The preflight clears both that file and 62265's (a stray `rmlx serve`).
 CLAIM_PORTS=(51966 62265)
 
 # Every `KvQuant` the enum can spell, one representative per parameterised

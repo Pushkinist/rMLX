@@ -35,7 +35,7 @@ fn sample_req() -> GenerationRequest {
     }
 }
 
-// ── C5 Slice A: FIFO admission queue tests ───────────────────────────────
+// ── FIFO admission queue tests ───────────────────────────────
 
 use std::sync::atomic::Ordering;
 
@@ -351,7 +351,7 @@ fn compute_itl_skewed_sequence() {
     );
 }
 
-/// F9: verify p99 and spike count on a known skewed sequence.
+/// Verify p99 and spike count on a known skewed sequence.
 ///
 /// 100 tokens → 99 intervals: 90 × 10 ms + 9 × 100 ms (9× spikes at end).
 /// spike threshold = 3 × median(10 ms) = 30 ms → 9 spikes expected.
@@ -385,7 +385,7 @@ fn f9_compute_itl_p99_and_spikes_known_vector() {
     assert_eq!(spikes, 9, "should count exactly 9 spike intervals");
 }
 
-/// F9: uniform sequence has zero spikes (all intervals equal median).
+/// Uniform sequence has zero spikes (all intervals equal median).
 #[test]
 fn f9_no_spikes_uniform_sequence() {
     use std::time::Duration;
@@ -404,7 +404,7 @@ fn compute_itl_too_few_timestamps_returns_none() {
     assert!(compute_itl_stats(&[Instant::now()]).is_none());
 }
 
-// ── A3: ThinkSplitter state machine ─────────────────────────────────────
+// ── ThinkSplitter state machine ─────────────────────────────────────
 
 /// Run a slice of pieces through a splitter and collect the per-step
 /// (visible_text, is_thinking) pairs. Convenience helper for the

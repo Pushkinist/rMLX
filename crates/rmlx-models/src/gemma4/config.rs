@@ -92,8 +92,8 @@ pub struct Gemma4TextConfig {
     pub top_k_experts: usize,
     /// MoE expert FFN intermediate dimension.
     pub moe_intermediate_size: usize,
-    /// From `text_config.max_position_embeddings`. Used to size the pre-allocated
-    /// KV buffer (Stage-3.1). Capped to `KV_MAX_SEQ_DEFAULT` at runtime if absent.
+    /// From `text_config.max_position_embeddings`. Raw config value; the
+    /// generate path reads the capacity field below.
     pub max_position_embeddings: u32,
     /// Positional capacity of this checkpoint. The generate path reads this
     /// rather than `max_position_embeddings`, so the fold from raw field to

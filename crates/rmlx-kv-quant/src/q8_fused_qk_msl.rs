@@ -52,10 +52,10 @@
 //! `float` even when the caller passes f16/bf16 — converting at thread load
 //! is cheaper than threadgroup memory pressure.
 //!
-//! # A.y guard
+//! # Qwen MoE guard
 //!
-//! Not required — q8 is K-side 8-bit, so the Qwen-MoE 4-bit A.y guard
-//! does not apply.  Both K8V4 and K8V8 are accepted on every architecture.
+//! Not required — q8 stores K at 8 bits, so the Qwen MoE low-K guard does
+//! not apply.  Both K8V4 and K8V8 are accepted on every architecture.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;

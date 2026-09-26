@@ -140,7 +140,7 @@ fn round_trip_with_allowed_set_constraint() {
     assert_eq!(c.sampled(), &[4u32]);
 }
 
-// ── A7.2: host sampler unit tests (pure Rust, no GPU) ──────────────────
+// ── Host sampler unit tests (pure Rust, no GPU) ──────────────────
 
 #[test]
 fn pcg32_golden_sequence() {
@@ -750,7 +750,7 @@ fn sample_token_array_composes_with_constraint_mask() {
     }
 }
 
-// ── A7.3: penalty unit tests ────────────────────────────────────────────
+// ── Penalty unit tests ────────────────────────────────────────────
 
 #[test]
 #[allow(
@@ -964,9 +964,9 @@ fn penalties_all_noop_leaves_slice_unchanged() {
     assert_eq!(logits, orig, "all-noop must leave slice bit-identical");
 }
 
-// ── A7.4: spec-mandated named integration tests ─────────────────────────
+// ── Spec-mandated named integration tests ─────────────────────────
 
-/// A7.4 spec cell (b): `top_k=1` with any `temperature > 0` must collapse
+/// Sampling cell (b): `top_k=1` with any `temperature > 0` must collapse
 /// to the greedy argmax index — i.e. the same token that `temp=0` would
 /// have selected.
 ///
@@ -1008,7 +1008,7 @@ fn top_k_one_collapses_to_greedy() {
     );
 }
 
-/// A7.4 spec cell (g): `repetition_penalty > 1.0` on a repetitive prompt
+/// Sampling cell (g): `repetition_penalty > 1.0` on a repetitive prompt
 /// must prevent the decode loop from degenerating into a single-token
 /// infinite repeat.
 ///

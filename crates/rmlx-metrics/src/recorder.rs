@@ -1,9 +1,8 @@
 //! Atomic per-run recorder per `docs/METRICS_DB.md` §8.2.1.
 //!
 //! [`Recorder`] ingests one [`crate::ingest::RunRecord`] into the
-//! `observations` SQLite table in a single transaction. Duplicate runs
-//! (same identity × prompt × metric) are skipped with a warning rather
-//! than overwritten.
+//! `observations` SQLite table in a single transaction. Nothing deduplicates:
+//! recording the same run twice appends a second set of rows.
 //!
 //! # Public API
 //!
@@ -13,7 +12,7 @@
 //!
 //! # See also
 //!
-//! - `docs/METRICS_DB.md` §8.2.1 — recorder API contract and duplicate policy.
+//! - `docs/METRICS_DB.md` §8.2.1 — atomicity contract.
 
 use rusqlite::params;
 use rusqlite::Connection;

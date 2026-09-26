@@ -5,7 +5,7 @@
 //! because two crates that cannot see each other need the same numbers: the
 //! engine, which applies them, and `rmlx-metrics`, which has to recognise a
 //! `decode_config` that spells them out and refuse it (`NULL` is the engine at
-//! its defaults — `docs/METRICS_DB.md` §3.2). A second copy in the metrics
+//! its defaults — `docs/METRICS_SCHEMA.md` §3.2). A second copy in the metrics
 //! crate would be a table that drifts silently the day the counts move, which
 //! is exactly the failure the cell-identity grammar exists to prevent.
 //!
@@ -18,7 +18,7 @@ pub const DEFAULT_BOUNDARY_HEAD_N: usize = 2;
 /// Default number of trailing layers held at the boundary floor.
 pub const DEFAULT_BOUNDARY_TAIL_N: usize = 8;
 
-/// `decode_config` key for the head count (`docs/METRICS_DB.md` §3.2).
+/// `decode_config` key for the head count (`docs/METRICS_SCHEMA.md` §3.2).
 pub const BOUNDARY_HEAD_KEY: &str = "kv_boundary/head";
 
 /// `decode_config` key for the tail count.

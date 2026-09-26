@@ -2,28 +2,22 @@
 //!
 //! # Status
 //!
-//! Stage 1 of the runtime extraction surfaces *types* and *small helpers*
-//! that callers of `generate_greedy` use repeatedly. The full outer-loop
-//! refactor (chunked prefill + decode + decode-profile timers) is deferred
-//! until at least three archs have migrated to the runtime helpers
-//! provided here. Reason: the existing per-arch `generate_greedy` functions
-//! all return `rmlx_models::ProbeStep` (defined in `rmlx_models::decode_loop`
-//! and re-exported at the crate root). Introducing a `runtime::ProbeStep`
-//! and rewriting one arch's `generate_greedy` would force a cross-arch type
-//! rename that the task explicitly forbids ("no changes to non-migrated arches").
+//! This module holds *types* and *small helpers* for `generate_greedy`
+//! callers. The per-arch `generate_greedy` functions do not use them: they
+//! return `rmlx_models::ProbeStep` (defined in `rmlx_models::decode_loop` and
+//! re-exported at the crate root), and no arch imports this module. The
+//! models crate uses other parts of this crate: the probe helpers
+//! (`count_nan_in_bytes`, `max_abs_from_bytes`), `RmsNormShifted` and
+//! `repeat_kv`.
 //!
 //! What is provided here right now:
 //! - [`ProbeStep`], [`SmokeVerdict`], [`DecodeProfile`] — runtime-native
-//!   types that future arches and the unified `generate_greedy` will use.
-//!   Structurally identical to `rmlx_models::ProbeStep` /
-//!   `rmlx_models::SmokeVerdict`. They co-exist for now and the models-crate
-//!   versions will be migrated to type aliases in a follow-up.
+//!   types, structurally identical to `rmlx_models::ProbeStep` /
+//!   `rmlx_models::SmokeVerdict`, with no caller outside this crate.
 //! - [`PREFILL_CHUNK`] — the standard 64-token prefill chunk size (Metal
 //!   watchdog safety margin).
 //! - [`DecodeProfile::log`] — emits the standard `decode_profile` tracing
 //!   event used by decode-loop performance analysis.
-//!
-//! See `migration.md` (in the crate root) for the per-arch migration recipe.
 
 use std::time::Instant;
 

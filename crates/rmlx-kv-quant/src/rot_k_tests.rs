@@ -157,13 +157,11 @@ fn rot_k_hadamard_8bit_cosine_gate() {
 
     assert!(
         stats.mean >= 0.9970,
-        // empirical floor measured 2026-05-30
+        // empirical floor
         "rot_k Hadamard 8-bit mean cosine {:.6} < 0.9970 (rot_k gate)",
         stats.mean,
     );
-    // min assertion: docs/TESTING.md originally claimed min≥0.9950 but only checked mean.
-    // Remeasured on corrected LCG fixture (>> 32 fix): min=0.9999617
-    // → floor 0.9999617 − 0.001 = 0.9990 (empirical, 2026-05-30).
+    // Empirical min floor on the LCG fixture: measured − 0.001.
     assert!(
         stats.min >= 0.9990,
         "rot_k Hadamard 8-bit min cosine {:.6} < 0.9990 (empirical floor)",

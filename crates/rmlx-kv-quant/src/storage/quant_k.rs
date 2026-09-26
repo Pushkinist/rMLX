@@ -256,7 +256,7 @@ impl QuantK {
                 // - codes: pass `self.codes` bytes directly, shape=[cpu_words]
                 // where cpu_words = codes.len() / 4 (4 u8 per u32 word).
                 // - scales: reinterpret f32 Vec as bytes, shape=[cpu_scales].
-                // H7: emit tracing event when uploading CPU codes to GPU on hydration.
+                // Emit tracing event when uploading CPU codes to GPU on hydration.
                 let (codes_buf, scales_buf) = if !self.codes.is_empty() && prev_seq > 0 {
                     let cpu_words = self.codes.len() / 4; // u8 codes → u32 words
                     let cpu_scales = self.scales.len();

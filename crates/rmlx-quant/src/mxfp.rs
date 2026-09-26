@@ -1,7 +1,7 @@
 //! OCP microscaling formats: mxfp8 (E8M0 + E4M3), mxfp4 (E8M0 + E2M1), nvfp4
 //! (UE4M3 or signed-E4M3 + E2M1).
 //!
-//! Stage 1. Primary test path is mxfp8 g32 against
+//! Primary test path is mxfp8 g32 against
 //! `mlx-community__gemma-4-e4b-it-mxfp8`. Smoke probe rejects `!!!!!!`
 //! generation.
 //!

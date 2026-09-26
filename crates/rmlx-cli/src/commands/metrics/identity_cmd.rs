@@ -3,9 +3,8 @@
 
 //! `rmlx metrics identity` and `rmlx metrics validate`.
 //!
-//! `identity` is how a non-Rust emitter learns who the measured binary is. The
-//! shell benches used to hard-code `'0.0.1'`, guess `"release-perf"`, or omit
-//! the fields entirely; now they ask the binary and merge the answer verbatim.
+//! `identity` is how a non-Rust emitter learns who the measured binary is: a
+//! shell bench asks the binary and merges the answer verbatim.
 //!
 //! `validate` is a dry-run of the *same* `RunRecord::validate` the recorder
 //! runs — deliberately not a second, parallel schema that could drift.

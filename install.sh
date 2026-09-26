@@ -42,9 +42,9 @@ if ! command -v cargo >/dev/null 2>&1; then
   source "$HOME/.cargo/env"
 fi
 
-# 4. Build + install from source. The repo's .cargo/config.toml targets the
-#    building machine's own chip (target-cpu=native), so this is optimal for
-#    whatever Mac runs it. Compiling the workspace takes a few minutes.
+# 4. Build + install from source. `cargo install --git` ignores the repo's
+#    .cargo/config.toml, so its `target-cpu=native` does not apply here.
+#    Compiling the workspace takes a few minutes.
 info "Building rMLX ($REF) from source — this compiles the full workspace..."
 # No --root: cargo installs to $CARGO_HOME/bin (~/.cargo/bin), which rustup
 # already puts on PATH, so `rmlx` is usable immediately with no PATH edit.

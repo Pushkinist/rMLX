@@ -1,6 +1,6 @@
 -- Migration 008: a drafter that has always resized its block says so.
 --
--- §3.2 makes `decode_config` cell identity, and absence of a `<kind>/depth=`
+-- docs/METRICS_SCHEMA.md §3.2 makes `decode_config` cell identity, and absence of a `<kind>/depth=`
 -- term means the loop drafted the configured block every round. DFlash never
 -- did: its production call site has always passed `prefer_requested = false`,
 -- and the only caller passing `true` is a unit test. So `dflash/block=16`
@@ -31,7 +31,7 @@
 -- What this does NOT touch: `eagle/block=5` beside `eagle3/block=5`. That split
 -- is a drafter *name* an old bench script wrote, not a policy term the loop
 -- always had, and nothing recorded says the two populations ran the same
--- drafter. It is named in docs/METRICS_DB.md under the known-bad rows instead.
+-- drafter. It is named in docs/METRICS_SCHEMA.md under the known-bad rows instead.
 --
 -- This file itself is a no-op statement; the work is the post-hook.
 SELECT 1;
