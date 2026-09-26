@@ -82,7 +82,7 @@ fn main() -> anyhow::Result<()> {
     );
 
     // Hold the Metal claim for every GPU call below.
-    let _claim = rmlx_server::try_claim().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let _claim = rmlx_server::try_claim()?;
 
     rmlx_mlx::ensure_cpu_default_stream();
     rmlx_mlx::ensure_gpu_default_stream();
