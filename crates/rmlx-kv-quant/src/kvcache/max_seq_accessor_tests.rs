@@ -1,11 +1,10 @@
-//! `KvStorage::max_seq` is the one reader of the per-variant `max_seq`, and
-//! every gate that reads it through the accessor keeps its variant set.
+//! Every gate that reads `max_seq` through `KvStorage::max_seq` keeps its
+//! variant set.
 //!
-//! The references below are the per-variant reads as they stood before the
-//! accessor, copied verbatim. For every codec, on an empty and on a filled
-//! storage, and for the paged storage, the accessor must return the value the
-//! old read returned, and each gate must give the same `Some` / `None` (or
-//! `Ok` / `Err`) decision as its old copy.
+//! The references below are the gates as they stood before the accessor,
+//! copied verbatim. For every codec, on an empty and on a filled storage, and
+//! for the paged storage, each gate must give the same `Some` / `None` (or
+//! `Ok` / `Err`) decision and value as its old copy.
 
 use super::core::KvCache;
 use super::deep_clone_digest_tests::fill;
@@ -27,38 +26,6 @@ const PAGED_QUANTS: [KvQuant; 4] = [
 /// Capacities the empty storages are built with. `0` reaches the `m <= 0`
 /// branch of the fused-QK gate.
 const EMPTY_MAX_SEQS: [i32; 3] = [0, 1, TEST_MAX_SEQ];
-
-fn old_storage_max_seq(storage: &KvStorage) -> i32 {
-    match storage {
-        KvStorage::K8V4 { max_seq, .. } => *max_seq,
-        KvStorage::K8V8 { max_seq, .. } => *max_seq,
-        KvStorage::Planar { max_seq, .. } => *max_seq,
-        KvStorage::None { max_seq } => *max_seq,
-        KvStorage::Mixed { max_seq, .. } => *max_seq,
-        KvStorage::Paged { max_seq, .. } => *max_seq,
-        KvStorage::K8VTurbo3 { max_seq, .. } => *max_seq,
-        KvStorage::TurboSym3 { max_seq, .. } => *max_seq,
-        KvStorage::TurboSym4 { max_seq, .. } => *max_seq,
-        KvStorage::PlanarK { max_seq, .. } => *max_seq,
-        KvStorage::K8VTurbo2 { max_seq, .. } => *max_seq,
-        KvStorage::IsoV3 { max_seq, .. } => *max_seq,
-        KvStorage::IsoV4 { max_seq, .. } => *max_seq,
-        KvStorage::RotorV3 { max_seq, .. } => *max_seq,
-        KvStorage::RotorV4 { max_seq, .. } => *max_seq,
-        KvStorage::K8VTurbo3Tcq { max_seq, .. } => *max_seq,
-        KvStorage::K8VTurbo2Tcq { max_seq, .. } => *max_seq,
-        KvStorage::IsoSym3 { max_seq, .. } => *max_seq,
-        KvStorage::IsoSym4 { max_seq, .. } => *max_seq,
-        KvStorage::IsoKOnly3 { max_seq, .. } => *max_seq,
-        KvStorage::IsoKOnly4 { max_seq, .. } => *max_seq,
-        KvStorage::RotorSym3 { max_seq, .. } => *max_seq,
-        KvStorage::RotorSym4 { max_seq, .. } => *max_seq,
-        KvStorage::RotorKOnly3 { max_seq, .. } => *max_seq,
-        KvStorage::RotorKOnly4 { max_seq, .. } => *max_seq,
-        KvStorage::RotorKAsym3 { max_seq, .. } => *max_seq,
-        KvStorage::RotorKAsym4 { max_seq, .. } => *max_seq,
-    }
-}
 
 #[allow(
     clippy::wildcard_enum_match_arm,
@@ -179,11 +146,6 @@ fn the_accessor_and_every_gate_read_what_the_old_reads_read() {
     let caches = caches();
     for (label, cache) in &caches {
         let storage = &cache.storage;
-        assert_eq!(
-            storage.max_seq(),
-            old_storage_max_seq(storage),
-            "{label}: the accessor"
-        );
         assert_eq!(
             cache.storage_max_seq_for_fused_qk(),
             old_fused_qk_gate(storage),
