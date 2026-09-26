@@ -694,260 +694,114 @@ impl KvStorage {
         }
     }
 
-    #[allow(
-        clippy::cognitive_complexity,
-        reason = "single match over the closed KvStorage enum — one arm per variant, each is small and self-contained; splitting would hide the 1-to-1 mapping"
-    )]
+    /// An independent copy of this storage: every slot clones its own store,
+    /// and the variant keeps its scalar knobs. Every arm binds every field, so
+    /// a field added to a variant does not compile until its arm clones it.
+    ///
+    /// # Errors
+    ///
+    /// Forwards the first slot clone that fails. A paged slot that holds pages
+    /// refuses: its pages have no copy, and the [`KvCache`](crate::KvCache)
+    /// around it would keep an `offset` for tokens the clone does not hold.
     pub fn try_deep_clone(&self) -> Result<Self> {
         Ok(match self {
-            Self::K8V4 { k, v } => Self::K8V4 {
-                k: match k {
-                    Some(qk) => Some(qk.try_deep_clone()?),
-                    None => None,
-                },
-                v: match v {
-                    Some(qv) => Some(qv.try_deep_clone()?),
-                    None => None,
-                },
-            },
-            Self::K8V8 { k, v } => Self::K8V8 {
-                k: match k {
-                    Some(qk) => Some(qk.try_deep_clone()?),
-                    None => None,
-                },
-                v: match v {
-                    Some(qv) => Some(qv.try_deep_clone()?),
-                    None => None,
-                },
-            },
-            Self::Planar { k, v, bits } => Self::Planar {
-                k: match k {
-                    Some(qk) => Some(qk.try_deep_clone()?),
-                    None => None,
-                },
-                v: match v {
-                    Some(qv) => Some(qv.try_deep_clone()?),
-                    None => None,
-                },
-                bits: *bits,
-            },
             Self::None {} => Self::None {},
             Self::Mixed { state } => Self::Mixed {
-                state: state.try_deep_clone()?,
+                state: state.try_clone()?,
             },
-            // Paged: for speculative decoding clone, return a fresh Paged storage.
-            // The block-table state is not cloneable efficiently with the page-slab
-            // design; callers that need true deep-clone of paged state should
-            // re-populate from model forward passes. This returns an empty shell
-            // consistent with the existing QuantK::try_deep_clone semantics (which
-            // clone GPU buffers but the CPU path is also valid).
-            Self::Paged { quant, .. } => Self::Paged {
+            Self::Paged {
+                quant,
+                k,
+                v_k8,
+                v_planar,
+            } => Self::Paged {
                 quant: *quant,
-                k: None,
-                v_k8: None,
-                v_planar: None,
+                k: k.try_clone()?,
+                v_k8: v_k8.try_clone()?,
+                v_planar: v_planar.try_clone()?,
             },
-            // K8VTurbo3 deep-clones like K8V4.
+            Self::Planar { k, v, bits } => Self::Planar {
+                k: k.try_clone()?,
+                v: v.try_clone()?,
+                bits: *bits,
+            },
+            Self::K8V4 { k, v } => Self::K8V4 {
+                k: k.try_clone()?,
+                v: v.try_clone()?,
+            },
+            Self::K8V8 { k, v } => Self::K8V8 {
+                k: k.try_clone()?,
+                v: v.try_clone()?,
+            },
             Self::K8VTurbo3 { k, v } => Self::K8VTurbo3 {
-                k: match k {
-                    Some(qk) => Some(qk.try_deep_clone()?),
-                    None => None,
-                },
-                v: match v {
-                    Some(qv) => Some(qv.try_deep_clone()?),
-                    None => None,
-                },
+                k: k.try_clone()?,
+                v: v.try_clone()?,
             },
-            // TurboSym3 — deep-clone both the 3-bit turbo K store and QuantV.
             Self::TurboSym3 { k, v } => Self::TurboSym3 {
-                k: match k {
-                    Some(qk) => Some(qk.try_deep_clone()?),
-                    None => None,
-                },
-                v: match v {
-                    Some(qv) => Some(qv.try_deep_clone()?),
-                    None => None,
-                },
+                k: k.try_clone()?,
+                v: v.try_clone()?,
             },
-            // TurboSym4 — deep-clone both the 4-bit turbo K store and QuantV.
             Self::TurboSym4 { k, v } => Self::TurboSym4 {
-                k: match k {
-                    Some(qk) => Some(qk.try_deep_clone()?),
-                    None => None,
-                },
-                v: match v {
-                    Some(qv) => Some(qv.try_deep_clone()?),
-                    None => None,
-                },
+                k: k.try_clone()?,
+                v: v.try_clone()?,
             },
-            // PlanarK — deep-clone K only; V (bf16) on parent.
-            Self::PlanarK { k } => Self::PlanarK {
-                k: match k {
-                    Some(qk) => Some(qk.try_deep_clone()?),
-                    None => None,
-                },
-            },
-            // K8VTurbo2 deep-clones like K8V4.
             Self::K8VTurbo2 { k, v } => Self::K8VTurbo2 {
-                k: match k {
-                    Some(qk) => Some(qk.try_deep_clone()?),
-                    None => None,
-                },
-                v: match v {
-                    Some(qv) => Some(qv.try_deep_clone()?),
-                    None => None,
-                },
+                k: k.try_clone()?,
+                v: v.try_clone()?,
             },
-            // IsoV3 — deep-clone the K (QuantK) + V (QuantIsoV3).
             Self::IsoV3 { k, v } => Self::IsoV3 {
-                k: match k {
-                    Some(qk) => Some(qk.try_deep_clone()?),
-                    None => None,
-                },
-                v: match v {
-                    Some(qv) => Some(qv.try_deep_clone()?),
-                    None => None,
-                },
+                k: k.try_clone()?,
+                v: v.try_clone()?,
             },
-            // IsoV4 — deep-clone the K (QuantK) + V (QuantIsoV4).
             Self::IsoV4 { k, v } => Self::IsoV4 {
-                k: match k {
-                    Some(qk) => Some(qk.try_deep_clone()?),
-                    None => None,
-                },
-                v: match v {
-                    Some(qv) => Some(qv.try_deep_clone()?),
-                    None => None,
-                },
+                k: k.try_clone()?,
+                v: v.try_clone()?,
             },
-            // RotorV3 — deep-clone K (QuantK) + V (QuantRotorV3).
             Self::RotorV3 { k, v } => Self::RotorV3 {
-                k: match k {
-                    Some(qk) => Some(qk.try_deep_clone()?),
-                    None => None,
-                },
-                v: match v {
-                    Some(qv) => Some(qv.try_deep_clone()?),
-                    None => None,
-                },
+                k: k.try_clone()?,
+                v: v.try_clone()?,
             },
-            // RotorV4 — deep-clone K (QuantK) + V (QuantRotorV4).
             Self::RotorV4 { k, v } => Self::RotorV4 {
-                k: match k {
-                    Some(qk) => Some(qk.try_deep_clone()?),
-                    None => None,
-                },
-                v: match v {
-                    Some(qv) => Some(qv.try_deep_clone()?),
-                    None => None,
-                },
+                k: k.try_clone()?,
+                v: v.try_clone()?,
             },
-            // K8VTurbo3Tcq deep-clones like K8VTurbo3.
             Self::K8VTurbo3Tcq { k, v } => Self::K8VTurbo3Tcq {
-                k: match k {
-                    Some(qk) => Some(qk.try_deep_clone()?),
-                    None => None,
-                },
-                v: match v {
-                    Some(qv) => Some(qv.try_deep_clone()?),
-                    None => None,
-                },
+                k: k.try_clone()?,
+                v: v.try_clone()?,
             },
-            // K8VTurbo2Tcq deep-clones like K8VTurbo2 / K8VTurbo3Tcq.
             Self::K8VTurbo2Tcq { k, v } => Self::K8VTurbo2Tcq {
-                k: match k {
-                    Some(qk) => Some(qk.try_deep_clone()?),
-                    None => None,
-                },
-                v: match v {
-                    Some(qv) => Some(qv.try_deep_clone()?),
-                    None => None,
-                },
+                k: k.try_clone()?,
+                v: v.try_clone()?,
             },
-            // IsoSym3 / IsoSym4 — deep-clone both K + V iso buffers.
             Self::IsoSym3 { k, v } => Self::IsoSym3 {
-                k: match k {
-                    Some(qk) => Some(qk.try_deep_clone()?),
-                    None => None,
-                },
-                v: match v {
-                    Some(qv) => Some(qv.try_deep_clone()?),
-                    None => None,
-                },
+                k: k.try_clone()?,
+                v: v.try_clone()?,
             },
             Self::IsoSym4 { k, v } => Self::IsoSym4 {
-                k: match k {
-                    Some(qk) => Some(qk.try_deep_clone()?),
-                    None => None,
-                },
-                v: match v {
-                    Some(qv) => Some(qv.try_deep_clone()?),
-                    None => None,
-                },
+                k: k.try_clone()?,
+                v: v.try_clone()?,
             },
-            // IsoKOnly3 / IsoKOnly4 — K only.
-            Self::IsoKOnly3 { k } => Self::IsoKOnly3 {
-                k: match k {
-                    Some(qk) => Some(qk.try_deep_clone()?),
-                    None => None,
-                },
-            },
-            Self::IsoKOnly4 { k } => Self::IsoKOnly4 {
-                k: match k {
-                    Some(qk) => Some(qk.try_deep_clone()?),
-                    None => None,
-                },
-            },
-            // RotorSym3 / RotorSym4 — deep-clone both K + V rotor buffers.
             Self::RotorSym3 { k, v } => Self::RotorSym3 {
-                k: match k {
-                    Some(qk) => Some(qk.try_deep_clone()?),
-                    None => None,
-                },
-                v: match v {
-                    Some(qv) => Some(qv.try_deep_clone()?),
-                    None => None,
-                },
+                k: k.try_clone()?,
+                v: v.try_clone()?,
             },
             Self::RotorSym4 { k, v } => Self::RotorSym4 {
-                k: match k {
-                    Some(qk) => Some(qk.try_deep_clone()?),
-                    None => None,
-                },
-                v: match v {
-                    Some(qv) => Some(qv.try_deep_clone()?),
-                    None => None,
-                },
+                k: k.try_clone()?,
+                v: v.try_clone()?,
             },
-            // RotorKOnly3 / RotorKOnly4 — K only.
-            Self::RotorKOnly3 { k } => Self::RotorKOnly3 {
-                k: match k {
-                    Some(qk) => Some(qk.try_deep_clone()?),
-                    None => None,
-                },
-            },
-            Self::RotorKOnly4 { k } => Self::RotorKOnly4 {
-                k: match k {
-                    Some(qk) => Some(qk.try_deep_clone()?),
-                    None => None,
-                },
-            },
-            // RotorKAsym3 / RotorKAsym4 — deep-clone K rotor + V affine.
-            // V codec parameters (bits / group) carry forward unchanged.
+            Self::PlanarK { k } => Self::PlanarK { k: k.try_clone()? },
+            Self::IsoKOnly3 { k } => Self::IsoKOnly3 { k: k.try_clone()? },
+            Self::IsoKOnly4 { k } => Self::IsoKOnly4 { k: k.try_clone()? },
+            Self::RotorKOnly3 { k } => Self::RotorKOnly3 { k: k.try_clone()? },
+            Self::RotorKOnly4 { k } => Self::RotorKOnly4 { k: k.try_clone()? },
             Self::RotorKAsym3 {
                 k,
                 v,
                 v_bits,
                 v_group_size,
             } => Self::RotorKAsym3 {
-                k: match k {
-                    Some(qk) => Some(qk.try_deep_clone()?),
-                    None => None,
-                },
-                v: match v {
-                    Some(qv) => Some(qv.try_deep_clone()?),
-                    None => None,
-                },
+                k: k.try_clone()?,
+                v: v.try_clone()?,
                 v_bits: *v_bits,
                 v_group_size: *v_group_size,
             },
@@ -957,14 +811,8 @@ impl KvStorage {
                 v_bits,
                 v_group_size,
             } => Self::RotorKAsym4 {
-                k: match k {
-                    Some(qk) => Some(qk.try_deep_clone()?),
-                    None => None,
-                },
-                v: match v {
-                    Some(qv) => Some(qv.try_deep_clone()?),
-                    None => None,
-                },
+                k: k.try_clone()?,
+                v: v.try_clone()?,
                 v_bits: *v_bits,
                 v_group_size: *v_group_size,
             },

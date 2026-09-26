@@ -889,7 +889,7 @@ const PAGE_SLOTS: usize = 4;
     clippy::expect_used,
     reason = "test fixture: a CPU page allocation must succeed, and the panic names the slot"
 )]
-fn paged_filled() -> KvStorage {
+pub(super) fn paged_filled() -> KvStorage {
     let tokens = |pages: i32| pages * PAGE_TOKENS - 3;
     let mut k = PagedKStorage::new(TEST_MAX_SEQ, PAGE_TOKENS, PAGE_SLOTS);
     let id = k.codes.alloc(Device::Cpu).expect("allocate a K page");

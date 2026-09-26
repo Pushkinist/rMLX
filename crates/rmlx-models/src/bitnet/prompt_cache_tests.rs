@@ -117,3 +117,108 @@ fn ssd_hydrated_entry_field_invariants() {
         .is_reusable_prefix_of(&[10, 11, 12, 13], true, 0)
         .is_none());
 }
+
+/// One K8V4 paged layer: an empty storage, or one whose K slot holds a page.
+#[allow(
+    clippy::expect_used,
+    reason = "test fixture: a CPU page allocation must succeed, and the panic names the slab"
+)]
+fn paged_layer(with_page: bool) -> KvCache {
+    use rmlx_kv_quant::paged::PagedKStorage;
+    use rmlx_kv_quant::storage::KvStorage;
+
+    let k = with_page.then(|| {
+        let mut k = PagedKStorage::new(4096, 16, 4);
+        let id = k
+            .codes
+            .alloc(rmlx_mlx::Device::Cpu)
+            .expect("allocate a K page");
+        k.scales
+            .alloc(rmlx_mlx::Device::Cpu)
+            .expect("allocate a K scale page");
+        k.block_table.push(id);
+        k.total_tokens = 13;
+        k.shape = vec![1, 1, 13, 64];
+        k
+    });
+    let storage = KvStorage::Paged {
+        quant: KvQuant::K8V4,
+        k,
+        v_k8: None,
+        v_planar: None,
+    };
+    KvCache::from_storage(
+        storage,
+        4096,
+        KvQuant::K8V4,
+        if with_page { 13 } else { 0 },
+        0,
+        rmlx_core::DispatchPolicy::default(),
+        false,
+    )
+}
+
+/// An exact prompt repeat whose stored entry holds a paged layer with pages is
+/// a miss (`DeepCloneErr`), not a hit on an empty clone. The slot stays, so the
+/// next repeat is the same miss. An entry whose paged layer is empty is served,
+/// so the miss comes from the pages and not from the setup.
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "test assertion: the cache was installed and the entry pushed just above"
+)]
+fn exact_repeat_of_a_paged_entry_with_pages_is_a_miss() {
+    use crate::prompt_cache::{
+        chained_block_hashes_seeded, request_cache_seed, Consumed, MissReason, PromptCache,
+        BLOCK_TOKENS,
+    };
+
+    const SIG: u64 = 0x0bad_cafe;
+    let prompt = (0..BLOCK_TOKENS as u32).collect::<Vec<_>>();
+    let seed = request_cache_seed(
+        0,
+        KvQuant::K8V4,
+        1,
+        crate::bitnet::SHARES_KV_ACROSS_LAYERS,
+        SIG,
+    );
+    let consume = |with_page: bool| {
+        let arch: ArchPromptCache<BitNetEntry> = ArchPromptCache::new(
+            "test-paged-clone",
+            ReusePolicy::ExactOnly,
+            crate::bitnet::SHARES_KV_ACROSS_LAYERS,
+        );
+        arch.with_inner_mut(|guard| {
+            let mut cache = PromptCache::new(4);
+            cache.push(BitNetEntry {
+                prompt_token_ids: prompt.clone(),
+                block_hashes: chained_block_hashes_seeded(&prompt, seed),
+                kv_caches: vec![paged_layer(with_page)],
+                first_id: 7,
+                first_piece: "x".to_string(),
+                kv_quant: Some(KvQuant::K8V4),
+                is_ssd_hydrated: false,
+            });
+            *guard = Some(cache);
+        });
+        let first = arch.consume(&prompt, KvQuant::K8V4, 1, false, SIG);
+        let second = arch.consume(&prompt, KvQuant::K8V4, 1, false, SIG);
+        let slots = arch.with_inner_mut(|guard| guard.as_ref().map_or(0, |c| c.slots.len()));
+        (first, second, slots)
+    };
+
+    let (first, second, slots) = consume(true);
+    for (label, out) in [("first", first), ("second", second)] {
+        assert!(
+            matches!(out, Consumed::Miss(MissReason::DeepCloneErr)),
+            "{label} repeat: a paged entry with pages must miss on its refused clone"
+        );
+    }
+    assert_eq!(slots, 1, "the refused clone must leave the source slot");
+
+    let (first, _, _) = consume(false);
+    assert!(
+        matches!(first, Consumed::Exact(_)),
+        "an entry whose paged layer holds no page must be served"
+    );
+}

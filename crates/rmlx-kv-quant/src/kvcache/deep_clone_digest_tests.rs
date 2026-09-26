@@ -8,10 +8,13 @@
 //! The clone must also be deep: after one more append to the source, the clone
 //! still has the digest of the store it was cloned from.
 //!
-//! The paged storage has no digest cell: see
-//! [`paged_deep_clone_stays_paged_with_its_codec`].
+//! The paged storage has no digest cell. A paged slot that holds pages refuses
+//! to clone ([`paged_deep_clone_refuses_a_slot_that_holds_pages`]), and an
+//! empty one clones
+//! ([`paged_deep_clone_of_an_empty_storage_stays_paged_with_its_codec`]).
 
 use super::core::KvCache;
+use super::storage_view_mut_tests::paged_filled;
 use super::store_bytes_tests::{append, store_digest, CHUNK_SEQ, SHAPE_A, TEST_MAX_SEQ};
 use crate::storage::KvStorage;
 use crate::test_utils::{env_lock, f32_arr, lcg_data, TEST_SEED};
@@ -79,18 +82,83 @@ fn deep_clone_keeps_every_store_byte_of_every_codec() {
     }
 }
 
-/// A paged cache clones to a paged storage of the same codec and `max_seq`.
+fn paged_cache(storage: KvStorage, quant: KvQuant, offset: i32) -> KvCache {
+    KvCache::from_storage(
+        storage,
+        TEST_MAX_SEQ,
+        quant,
+        offset,
+        0,
+        DispatchPolicy::default(),
+        false,
+    )
+}
+
+/// The paged fixture with only the slots `keep` names; the others are empty.
+fn paged_with(keep: [bool; 3]) -> KvStorage {
+    let KvStorage::Paged {
+        quant,
+        k,
+        v_k8,
+        v_planar,
+    } = paged_filled()
+    else {
+        panic!("the paged fixture is not paged");
+    };
+    KvStorage::Paged {
+        quant,
+        k: k.filter(|_| keep[0]),
+        v_k8: v_k8.filter(|_| keep[1]),
+        v_planar: v_planar.filter(|_| keep[2]),
+    }
+}
+
+/// A paged storage whose slots hold pages refuses to clone, through the
+/// storage and through the cache around it. The pages have no copy, and the
+/// cache would keep an `offset` for tokens the clone does not hold.
 ///
-/// Not a digest cell: the paged update writes pages only on `Device::Gpu` and
-/// falls back to the bf16 seed on the CPU, so no CPU fill has pages to clone.
-/// The storage is built directly, because `KvStorage::new` builds it only when
-/// the CLI latched the paged switch, which no test in this binary can do.
+/// Each slot is tested alone (K with 1 page, V with 2, planar V with 3), so
+/// a slot that clones to an empty shell is found even when the other two
+/// refuse.
+#[test]
+fn paged_deep_clone_refuses_a_slot_that_holds_pages() {
+    let cells = [
+        ("PagedKStorage holds 1 page(s)", [true, false, false]),
+        ("PagedVStorage holds 2 page(s)", [false, true, false]),
+        ("PagedPlanarVStorage holds 3 page(s)", [false, false, true]),
+        ("PagedKStorage holds 1 page(s)", [true, true, true]),
+    ];
+    for (reason, keep) in cells {
+        let storage = paged_with(keep);
+        let Err(err) = storage.try_deep_clone() else {
+            panic!("{keep:?}: a paged storage with pages cloned");
+        };
+        assert!(
+            err.to_string().contains(reason),
+            "{keep:?}: the refusal does not name the slot and its pages: {err}"
+        );
+
+        let cache = paged_cache(paged_with(keep), KvQuant::K8V4, 45);
+        assert!(
+            cache.try_deep_clone().is_err(),
+            "{keep:?}: the cache around a paged storage with pages cloned"
+        );
+    }
+}
+
+/// An empty paged storage clones to a paged storage of the same codec and
+/// `max_seq`: with no slot, and with slots whose pages a reset released.
+///
+/// The paged update writes pages only on `Device::Gpu` and falls back to the
+/// bf16 seed on the CPU, so no CPU fill has pages. The storage is built
+/// directly, because `KvStorage::new` builds it only when the CLI latched the
+/// paged switch, which no test in this binary can do.
 #[test]
 #[allow(
     clippy::expect_used,
     reason = "test driver: a clone of an empty paged storage must succeed, and the panic names the codec"
 )]
-fn paged_deep_clone_stays_paged_with_its_codec() {
+fn paged_deep_clone_of_an_empty_storage_stays_paged_with_its_codec() {
     for quant in [
         KvQuant::K8V4,
         KvQuant::K8V8,
@@ -103,19 +171,15 @@ fn paged_deep_clone_stays_paged_with_its_codec() {
             v_k8: None,
             v_planar: None,
         };
-        let cache = KvCache::from_storage(
-            storage,
-            TEST_MAX_SEQ,
-            quant,
-            0,
-            0,
-            DispatchPolicy::default(),
-            false,
-        );
-        let clone = cache.try_deep_clone().expect("try_deep_clone");
+        let clone = paged_cache(storage, quant, 0)
+            .try_deep_clone()
+            .expect("try_deep_clone");
         let max_seq = clone.max_seq();
         let KvStorage::Paged {
-            quant: clone_quant, ..
+            quant: clone_quant,
+            k,
+            v_k8,
+            v_planar,
         } = clone.storage
         else {
             panic!("{quant}: the clone of a paged storage is not paged");
@@ -128,5 +192,35 @@ fn paged_deep_clone_stays_paged_with_its_codec() {
             max_seq, TEST_MAX_SEQ,
             "{quant}: the paged clone changed max_seq"
         );
+        assert!(
+            k.is_none() && v_k8.is_none() && v_planar.is_none(),
+            "{quant}: the clone of an empty paged storage holds a slot"
+        );
     }
+
+    let mut released = paged_filled();
+    released.reset();
+    let clone = released
+        .try_deep_clone()
+        .expect("a paged storage whose pages a reset released must clone");
+    let KvStorage::Paged {
+        quant,
+        k: Some(k),
+        v_k8: Some(v_k8),
+        v_planar: Some(v_planar),
+    } = clone
+    else {
+        panic!("the clone of a released paged storage lost a slot");
+    };
+    assert_eq!(quant, KvQuant::K8V4, "the paged clone changed its codec");
+    let tables = [
+        (k.block_table.len(), k.total_tokens),
+        (v_k8.block_table.len(), v_k8.total_tokens),
+        (v_planar.block_table.len(), v_planar.total_tokens),
+    ];
+    assert_eq!(
+        tables,
+        [(0, 0); 3],
+        "the clone of a released paged storage holds pages or tokens"
+    );
 }

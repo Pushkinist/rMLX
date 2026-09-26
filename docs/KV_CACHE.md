@@ -412,6 +412,12 @@ the prompt into contiguous chunks with no padding tokens. `update_paged`
 reorders chunks to sequence-major before quantizing, since the page slabs are
 token-major.
 
+`KvStorage::try_deep_clone` refuses (`Err`) when a paged slot holds pages: the
+page slabs have no copy, and a clone without them would keep the cache's
+`offset` for tokens it does not hold. A paged slot with no pages clones to an
+empty store with the same page geometry. The prompt cache reads the refusal as
+a miss (`docs/PROMPT_CACHE.md`).
+
 ### 5.10 Pure 2-bit K is gated
 
 `q2_g64` is V-only. `combo_to_kv_quant` rejects `q2_g64` on K with

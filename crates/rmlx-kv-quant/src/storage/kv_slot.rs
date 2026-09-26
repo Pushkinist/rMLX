@@ -9,7 +9,7 @@
 //!
 //! None of these calls is on the per-token decode math: they serve the byte
 //! total, the graph flush, the SSD spill decision, the test probes, the cache
-//! reset, the truncation and the payload clear.
+//! reset, the truncation, the payload clear and the deep clone.
 
 use rmlx_core::error::Result;
 use rmlx_mlx::{Array, Device, Dtype};
@@ -40,6 +40,11 @@ pub(crate) trait KvStore {
     fn reset_sequence(&mut self);
     /// Cut the sequence to `n >= 0` positions, with the store's own clamping.
     fn truncate_to(&mut self, n: i32);
+    /// An independent copy of the store. The paged stores refuse when they
+    /// hold pages.
+    fn try_deep_clone(&self) -> Result<Self>
+    where
+        Self: Sized;
 }
 
 /// One store slot of a `KvStorage` variant, filled or empty.
@@ -62,6 +67,10 @@ pub(crate) trait KvSlot {
     fn truncate_to(&mut self, n: i32);
     /// Drop the payload.
     fn clear(&mut self);
+    /// An independent copy of the slot, filled or empty.
+    fn try_clone(&self) -> Result<Self>
+    where
+        Self: Sized;
 }
 
 impl<T: KvStore> KvSlot for Option<T> {
@@ -100,6 +109,10 @@ impl<T: KvStore> KvSlot for Option<T> {
     fn clear(&mut self) {
         *self = None;
     }
+
+    fn try_clone(&self) -> Result<Self> {
+        self.as_ref().map(KvStore::try_deep_clone).transpose()
+    }
 }
 
 /// `Mixed` fills its capacity buffers in place: `offset` is its fill marker.
@@ -136,6 +149,10 @@ impl KvSlot for MixedKvState {
     fn clear(&mut self) {
         MixedKvState::reset(self);
     }
+
+    fn try_clone(&self) -> Result<Self> {
+        self.try_deep_clone()
+    }
 }
 
 impl<T: KvStore> KvStore for Box<T> {
@@ -159,6 +176,10 @@ impl<T: KvStore> KvStore for Box<T> {
 
     fn truncate_to(&mut self, n: i32) {
         T::truncate_to(self, n);
+    }
+
+    fn try_deep_clone(&self) -> Result<Self> {
+        T::try_deep_clone(self).map(Box::new)
     }
 }
 
@@ -187,6 +208,10 @@ impl KvStore for PagedKStorage {
     fn truncate_to(&mut self, n: i32) {
         Self::truncate_to(self, n);
     }
+
+    fn try_deep_clone(&self) -> Result<Self> {
+        Self::try_deep_clone(self)
+    }
 }
 
 impl KvStore for PagedVStorage {
@@ -211,6 +236,10 @@ impl KvStore for PagedVStorage {
     fn truncate_to(&mut self, n: i32) {
         Self::truncate_to(self, n);
     }
+
+    fn try_deep_clone(&self) -> Result<Self> {
+        Self::try_deep_clone(self)
+    }
 }
 
 impl KvStore for PagedPlanarVStorage {
@@ -234,6 +263,10 @@ impl KvStore for PagedPlanarVStorage {
 
     fn truncate_to(&mut self, n: i32) {
         Self::truncate_to(self, n);
+    }
+
+    fn try_deep_clone(&self) -> Result<Self> {
+        Self::try_deep_clone(self)
     }
 }
 
@@ -269,6 +302,10 @@ impl KvStore for QuantK {
     fn truncate_to(&mut self, n: i32) {
         Self::truncate_to(self, n);
     }
+
+    fn try_deep_clone(&self) -> Result<Self> {
+        Self::try_deep_clone(self)
+    }
 }
 
 impl KvStore for QuantV {
@@ -296,6 +333,10 @@ impl KvStore for QuantV {
     fn truncate_to(&mut self, n: i32) {
         Self::truncate_to(self, n);
     }
+
+    fn try_deep_clone(&self) -> Result<Self> {
+        Self::try_deep_clone(self)
+    }
 }
 
 impl<const BITS: u8> KvStore for QuantKTurbo<BITS> {
@@ -322,6 +363,10 @@ impl<const BITS: u8> KvStore for QuantKTurbo<BITS> {
 
     fn truncate_to(&mut self, n: i32) {
         Self::truncate_to(self, n);
+    }
+
+    fn try_deep_clone(&self) -> Result<Self> {
+        Self::try_deep_clone(self)
     }
 }
 
@@ -354,6 +399,10 @@ impl KvStore for QuantPlanarK {
     fn truncate_to(&mut self, n: i32) {
         Self::truncate_to(self, n);
     }
+
+    fn try_deep_clone(&self) -> Result<Self> {
+        Self::try_deep_clone(self)
+    }
 }
 
 impl KvStore for QuantPlanarV {
@@ -385,6 +434,10 @@ impl KvStore for QuantPlanarV {
     fn truncate_to(&mut self, n: i32) {
         Self::truncate_to(self, n);
     }
+
+    fn try_deep_clone(&self) -> Result<Self> {
+        Self::try_deep_clone(self)
+    }
 }
 
 // The iso and rotor stores dequantize on the CPU from their blocks. `eval` does
@@ -413,6 +466,10 @@ impl<const BITS: u8> KvStore for QuantIsoK<BITS> {
     fn truncate_to(&mut self, n: i32) {
         Self::truncate_to(self, n);
     }
+
+    fn try_deep_clone(&self) -> Result<Self> {
+        Self::try_deep_clone(self)
+    }
 }
 
 impl<const BITS: u8> KvStore for QuantIsoV<BITS> {
@@ -436,6 +493,10 @@ impl<const BITS: u8> KvStore for QuantIsoV<BITS> {
 
     fn truncate_to(&mut self, n: i32) {
         Self::truncate_to(self, n);
+    }
+
+    fn try_deep_clone(&self) -> Result<Self> {
+        Self::try_deep_clone(self)
     }
 }
 
@@ -461,6 +522,10 @@ impl<const BITS: u8> KvStore for QuantRotorK<BITS> {
     fn truncate_to(&mut self, n: i32) {
         Self::truncate_to(self, n);
     }
+
+    fn try_deep_clone(&self) -> Result<Self> {
+        Self::try_deep_clone(self)
+    }
 }
 
 impl<const BITS: u8> KvStore for QuantRotorV<BITS> {
@@ -484,5 +549,9 @@ impl<const BITS: u8> KvStore for QuantRotorV<BITS> {
 
     fn truncate_to(&mut self, n: i32) {
         Self::truncate_to(self, n);
+    }
+
+    fn try_deep_clone(&self) -> Result<Self> {
+        Self::try_deep_clone(self)
     }
 }
