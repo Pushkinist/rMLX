@@ -18,7 +18,9 @@ fn sh(script: &str) -> Vec<OsString> {
 }
 
 fn temp_lock(dir: &Path) -> OwnedFd {
-    let file = File::create(dir.join("lock")).unwrap();
+    let path = dir.join("lock");
+    std::fs::write(&path, "4242 holder record").unwrap();
+    let file = File::options().read(true).write(true).open(&path).unwrap();
     file.lock().unwrap();
     OwnedFd::from(file)
 }
@@ -88,7 +90,7 @@ fn claim_run_child_holds_the_lock() {
     assert_eq!(
         std::fs::read(step("stdin")).unwrap(),
         b"",
-        "the child's stdin must be empty"
+        "the child's stdin must be empty, not the holder record"
     );
 }
 
