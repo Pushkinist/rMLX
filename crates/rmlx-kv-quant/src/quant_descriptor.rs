@@ -1,9 +1,9 @@
 //! The per-codec facts of [`KvQuant`], stated once per variant.
 //!
 //! [`KvQuant::descriptor`] is the one place that classifies a codec. The
-//! public predicates on `KvQuant` read their answer from it. Each arm names
-//! one variant and states every fact as a literal, so a new variant does not
-//! compile until each of its facts is written down. The census
+//! public predicates on `KvQuant` and its `Display` read their answer from it.
+//! Each arm names one variant and states every fact as a literal, so a new
+//! variant does not compile until each of its facts is written down. The census
 //! (`scripts/kv_update_census.py`) refuses a struct-update base (`..X`) in the
 //! fn body: a row copied from a neighbour would inherit facts nobody stated.
 //!
@@ -42,6 +42,51 @@ pub(super) enum HotPathClass {
     CpuWhenQjl(&'static str),
 }
 
+/// The `Display` text of a codec. A fieldless codec has fixed text. A payload
+/// codec holds the fields its text is formatted from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Spelling {
+    Fixed(&'static str),
+    Mixed {
+        k_bits: u8,
+        v_bits: u8,
+        k_group_size: u16,
+        v_group_size: u16,
+    },
+    RotK {
+        v_bits: u8,
+        v_group_size: u16,
+    },
+    RotorKAsym {
+        k_bits: u8,
+        v_bits: u8,
+        v_group_size: u16,
+    },
+}
+
+impl std::fmt::Display for Spelling {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fixed(text) => f.write_str(text),
+            Self::Mixed {
+                k_bits,
+                v_bits,
+                k_group_size,
+                v_group_size,
+            } => write!(f, "mixed_k{k_bits}g{k_group_size}_v{v_bits}g{v_group_size}"),
+            Self::RotK {
+                v_bits,
+                v_group_size,
+            } => write!(f, "rot_k_v{v_bits}g{v_group_size}"),
+            Self::RotorKAsym {
+                k_bits,
+                v_bits,
+                v_group_size,
+            } => write!(f, "rotor_k_{k_bits}_asym_v{v_bits}_g{v_group_size}"),
+        }
+    }
+}
+
 /// Every fact one codec states. There is no `Default`: each arm of
 /// [`KvQuant::descriptor`] writes each field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +98,8 @@ pub(super) struct CodecDescriptor {
     /// Dense index from zero. It proves that [`super::ALL_KV_QUANTS`] names
     /// every variant.
     pub(super) index: usize,
+    /// The text `Display` writes, which `FromStr` reads back.
+    pub(super) spelling: Spelling,
     pub(super) k_mirror: MirrorRule,
     pub(super) v_mirror: MirrorRule,
     pub(super) reads_packed_store: bool,
@@ -100,10 +147,12 @@ impl KvQuant {
         use HotPathClass::{Cpu, CpuWhenQjl, Metal};
         use MirrorRule::{Always, Never, WhenSharesKv};
         use SideStore::{IsoBlocks, IsoRing, Planar, Rotor, Turbo, Q8};
+        use Spelling::{Fixed, RotorKAsym};
         match self {
             // Plain bf16: no store, no kernel.
             KvQuant::None => CodecDescriptor {
                 index: 0,
+                spelling: Fixed("none"),
                 k_mirror: Always,
                 v_mirror: Always,
                 reads_packed_store: false,
@@ -119,6 +168,7 @@ impl KvQuant {
             // packed store, so `exit_prefill` builds no store for them.
             KvQuant::K8V4 => CodecDescriptor {
                 index: 1,
+                spelling: Fixed("k8v4"),
                 k_mirror: Always,
                 v_mirror: Always,
                 reads_packed_store: false,
@@ -132,6 +182,7 @@ impl KvQuant {
             },
             KvQuant::K8V8 => CodecDescriptor {
                 index: 2,
+                spelling: Fixed("k8v8"),
                 k_mirror: Always,
                 v_mirror: Always,
                 reads_packed_store: false,
@@ -145,6 +196,7 @@ impl KvQuant {
             },
             KvQuant::Planar => CodecDescriptor {
                 index: 3,
+                spelling: Fixed("planar"),
                 k_mirror: Always,
                 v_mirror: Always,
                 reads_packed_store: false,
@@ -158,6 +210,7 @@ impl KvQuant {
             },
             KvQuant::Planar3 => CodecDescriptor {
                 index: 4,
+                spelling: Fixed("planar3"),
                 k_mirror: Always,
                 v_mirror: Always,
                 reads_packed_store: false,
@@ -173,6 +226,7 @@ impl KvQuant {
             // so it is not in the `k_below_8bit` class.
             KvQuant::PlanarK => CodecDescriptor {
                 index: 5,
+                spelling: Fixed("planar_k"),
                 k_mirror: Always,
                 v_mirror: Always,
                 reads_packed_store: false,
@@ -195,6 +249,12 @@ impl KvQuant {
                 v_group_size,
             } => CodecDescriptor {
                 index: 6,
+                spelling: Spelling::Mixed {
+                    k_bits,
+                    v_bits,
+                    k_group_size,
+                    v_group_size,
+                },
                 k_mirror: WhenSharesKv,
                 v_mirror: WhenSharesKv,
                 reads_packed_store: true,
@@ -224,6 +284,10 @@ impl KvQuant {
                 v_group_size,
             } => CodecDescriptor {
                 index: 7,
+                spelling: Spelling::RotK {
+                    v_bits,
+                    v_group_size,
+                },
                 k_mirror: WhenSharesKv,
                 v_mirror: WhenSharesKv,
                 reads_packed_store: true,
@@ -242,6 +306,7 @@ impl KvQuant {
             },
             KvQuant::K8VTurbo3 => CodecDescriptor {
                 index: 8,
+                spelling: Fixed("k8vturbo3"),
                 k_mirror: Always,
                 v_mirror: Always,
                 reads_packed_store: false,
@@ -255,6 +320,7 @@ impl KvQuant {
             },
             KvQuant::K8VTurbo3Tcq => CodecDescriptor {
                 index: 9,
+                spelling: Fixed("k8vturbo3tcq"),
                 k_mirror: Always,
                 v_mirror: Always,
                 reads_packed_store: false,
@@ -268,6 +334,7 @@ impl KvQuant {
             },
             KvQuant::K8VTurbo2 => CodecDescriptor {
                 index: 10,
+                spelling: Fixed("k8vturbo2"),
                 k_mirror: Always,
                 v_mirror: Always,
                 reads_packed_store: false,
@@ -281,6 +348,7 @@ impl KvQuant {
             },
             KvQuant::K8VTurbo2Tcq => CodecDescriptor {
                 index: 11,
+                spelling: Fixed("k8vturbo2tcq"),
                 k_mirror: Always,
                 v_mirror: Always,
                 reads_packed_store: false,
@@ -294,6 +362,7 @@ impl KvQuant {
             },
             KvQuant::TurboSym3 => CodecDescriptor {
                 index: 12,
+                spelling: Fixed("tsym3"),
                 k_mirror: Always,
                 v_mirror: Always,
                 reads_packed_store: false,
@@ -307,6 +376,7 @@ impl KvQuant {
             },
             KvQuant::TurboSym4 => CodecDescriptor {
                 index: 13,
+                spelling: Fixed("tsym4"),
                 k_mirror: Always,
                 v_mirror: Always,
                 reads_packed_store: false,
@@ -323,6 +393,7 @@ impl KvQuant {
             // store it would hold is the CPU-block form.
             KvQuant::Iso3 => CodecDescriptor {
                 index: 14,
+                spelling: Fixed("iso3"),
                 k_mirror: Always,
                 v_mirror: Always,
                 reads_packed_store: false,
@@ -336,6 +407,7 @@ impl KvQuant {
             },
             KvQuant::Iso4 => CodecDescriptor {
                 index: 15,
+                spelling: Fixed("iso4"),
                 k_mirror: Always,
                 v_mirror: Always,
                 reads_packed_store: false,
@@ -351,6 +423,7 @@ impl KvQuant {
             // mirror exists. Iso has no QJL sideband, so the hot path is Metal.
             KvQuant::Iso3Sym => CodecDescriptor {
                 index: 16,
+                spelling: Fixed("iso3_sym"),
                 k_mirror: Never,
                 v_mirror: Never,
                 reads_packed_store: true,
@@ -364,6 +437,7 @@ impl KvQuant {
             },
             KvQuant::Iso4Sym => CodecDescriptor {
                 index: 17,
+                spelling: Fixed("iso4_sym"),
                 k_mirror: Never,
                 v_mirror: Never,
                 reads_packed_store: true,
@@ -379,6 +453,7 @@ impl KvQuant {
             // by the iso MSL kernel; V is the bf16 mirror.
             KvQuant::IsoKOnly3 => CodecDescriptor {
                 index: 18,
+                spelling: Fixed("k_iso3"),
                 k_mirror: Never,
                 v_mirror: Always,
                 reads_packed_store: true,
@@ -392,6 +467,7 @@ impl KvQuant {
             },
             KvQuant::IsoKOnly4 => CodecDescriptor {
                 index: 19,
+                spelling: Fixed("k_iso4"),
                 k_mirror: Never,
                 v_mirror: Always,
                 reads_packed_store: true,
@@ -407,6 +483,7 @@ impl KvQuant {
             // rotor codec fires only at prefill, on the CPU.
             KvQuant::Rotor3 => CodecDescriptor {
                 index: 20,
+                spelling: Fixed("rotor3"),
                 k_mirror: Always,
                 v_mirror: Always,
                 reads_packed_store: false,
@@ -420,6 +497,7 @@ impl KvQuant {
             },
             KvQuant::Rotor4 => CodecDescriptor {
                 index: 21,
+                spelling: Fixed("rotor4"),
                 k_mirror: Always,
                 v_mirror: Always,
                 reads_packed_store: false,
@@ -435,6 +513,7 @@ impl KvQuant {
             // the flash inner loop, so a QJL store keeps both axes on the CPU.
             KvQuant::Rotor3Sym => CodecDescriptor {
                 index: 22,
+                spelling: Fixed("rotor3_sym"),
                 k_mirror: Never,
                 v_mirror: Never,
                 reads_packed_store: true,
@@ -448,6 +527,7 @@ impl KvQuant {
             },
             KvQuant::Rotor4Sym => CodecDescriptor {
                 index: 23,
+                spelling: Fixed("rotor4_sym"),
                 k_mirror: Never,
                 v_mirror: Never,
                 reads_packed_store: true,
@@ -463,6 +543,7 @@ impl KvQuant {
             // store's sticky QJL flag.
             KvQuant::RotorKOnly3 => CodecDescriptor {
                 index: 24,
+                spelling: Fixed("k_rotor3"),
                 k_mirror: Never,
                 v_mirror: Always,
                 reads_packed_store: true,
@@ -476,6 +557,7 @@ impl KvQuant {
             },
             KvQuant::RotorKOnly4 => CodecDescriptor {
                 index: 25,
+                spelling: Fixed("k_rotor4"),
                 k_mirror: Never,
                 v_mirror: Always,
                 reads_packed_store: true,
@@ -488,13 +570,18 @@ impl KvQuant {
                 mixed_params: None,
             },
             // Rotor K with a V that is TurboQuant at a fixed group of 32
-            // (`validate_rotor_k_asym_v`); `v_group_size` is a layout-key tag
+            // (`validate_rotor_k_asym_v`); `v_group_size` is a spelling tag
             // only, so it does not reach a store parameter.
             KvQuant::RotorK3Asym {
                 v_bits,
-                v_group_size: _,
+                v_group_size,
             } => CodecDescriptor {
                 index: 26,
+                spelling: RotorKAsym {
+                    k_bits: 3,
+                    v_bits,
+                    v_group_size,
+                },
                 k_mirror: Always,
                 v_mirror: Always,
                 reads_packed_store: false,
@@ -508,9 +595,14 @@ impl KvQuant {
             },
             KvQuant::RotorK4Asym {
                 v_bits,
-                v_group_size: _,
+                v_group_size,
             } => CodecDescriptor {
                 index: 27,
+                spelling: RotorKAsym {
+                    k_bits: 4,
+                    v_bits,
+                    v_group_size,
+                },
                 k_mirror: Always,
                 v_mirror: Always,
                 reads_packed_store: false,

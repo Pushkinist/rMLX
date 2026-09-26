@@ -999,7 +999,7 @@ check "a descriptor arm that copies and patches another row is refused, with its
 
 # 50 — the real tree, pinned exactly. One run, all four figures compared, and
 # each failure prints the figure beside its pin and what to do.
-REAL_PINS="match-sites=22 forcing-sites=22 subset-sites=153 table-sites=2 descriptor-fns=1"
+REAL_PINS="match-sites=19 forcing-sites=19 subset-sites=157 table-sites=2 descriptor-fns=1"
 pin_advice() { # pin_advice NAME
     local list="python3 scripts/kv_update_census.py match-sites | grep"
     case "$1" in

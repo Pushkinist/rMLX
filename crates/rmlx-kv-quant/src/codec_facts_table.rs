@@ -1,10 +1,9 @@
 // Literal per-codec facts, one row per `KvQuant` `Display` spelling.
 //
-// This file holds data only. Test code reads it with `include!`: the codec
-// tests in this crate and the metrics-label test in `rmlx-server`, which can
-// not see a test module of this crate. Every value is a literal. Do not derive
-// a value from the code under test: the table is an oracle only while it is
-// written apart from the predicates it checks.
+// This file holds data only. `codec_facts_tests.rs` reads it with `include!`.
+// Every value is a literal. Do not derive a value from the code under test:
+// the table is an oracle only while it is written apart from the predicates it
+// checks.
 
 /// When `KvQuant::cpu_hot_path_reason` gives `Some`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,10 +43,6 @@ pub(crate) struct CodecFacts {
     pub(crate) is_k_only_iso_rotor: bool,
     pub(crate) mixed_params: Option<(i32, i32, i32, i32)>,
     /// The `kv_quant` label the server writes into the metrics DB.
-    #[allow(
-        dead_code,
-        reason = "the label producer is in rmlx-server, and its test reads this field"
-    )]
     pub(crate) metrics_label: &'static str,
 }
 

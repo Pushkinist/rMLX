@@ -1330,52 +1330,25 @@ pub fn validate_mixed_side(side: char, bits: u8, group_size: u16) -> Result<(), 
 
 impl std::fmt::Display for KvQuant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            KvQuant::None => f.write_str("none"),
-            KvQuant::K8V4 => f.write_str("k8v4"),
-            KvQuant::K8V8 => f.write_str("k8v8"),
-            KvQuant::Planar => f.write_str("planar"),
-            KvQuant::Mixed {
-                k_bits,
-                v_bits,
-                k_group_size,
-                v_group_size,
-            } => write!(f, "mixed_k{k_bits}g{k_group_size}_v{v_bits}g{v_group_size}"),
-            KvQuant::RotK {
-                v_bits,
-                v_group_size,
-            } => write!(f, "rot_k_v{v_bits}g{v_group_size}"),
-            KvQuant::K8VTurbo3 => f.write_str("k8vturbo3"),
-            KvQuant::TurboSym3 => f.write_str("tsym3"),
-            KvQuant::TurboSym4 => f.write_str("tsym4"),
-            KvQuant::Planar3 => f.write_str("planar3"),
-            KvQuant::PlanarK => f.write_str("planar_k"),
-            KvQuant::K8VTurbo2 => f.write_str("k8vturbo2"),
-            KvQuant::Iso3 => f.write_str("iso3"),
-            KvQuant::Iso4 => f.write_str("iso4"),
-            KvQuant::Rotor3 => f.write_str("rotor3"),
-            KvQuant::Rotor4 => f.write_str("rotor4"),
-            KvQuant::K8VTurbo3Tcq => f.write_str("k8vturbo3tcq"),
-            KvQuant::K8VTurbo2Tcq => f.write_str("k8vturbo2tcq"),
-            KvQuant::Iso3Sym => f.write_str("iso3_sym"),
-            KvQuant::Iso4Sym => f.write_str("iso4_sym"),
-            KvQuant::IsoKOnly3 => f.write_str("k_iso3"),
-            KvQuant::IsoKOnly4 => f.write_str("k_iso4"),
-            KvQuant::Rotor3Sym => f.write_str("rotor3_sym"),
-            KvQuant::Rotor4Sym => f.write_str("rotor4_sym"),
-            KvQuant::RotorKOnly3 => f.write_str("k_rotor3"),
-            KvQuant::RotorKOnly4 => f.write_str("k_rotor4"),
-            // Payload-bearing asymmetric rotor-K variants.
-            KvQuant::RotorK3Asym {
-                v_bits,
-                v_group_size,
-            } => write!(f, "rotor_k_3_asym_v{v_bits}_g{v_group_size}"),
-            KvQuant::RotorK4Asym {
-                v_bits,
-                v_group_size,
-            } => write!(f, "rotor_k_4_asym_v{v_bits}_g{v_group_size}"),
-        }
+        self.descriptor().spelling.fmt(f)
     }
+}
+
+/// The `kv_quant` label the metrics DB groups rows by. No codec override is
+/// `auto`. `Mixed` and `RotK` drop their widths, so each family has one label.
+/// Every other codec is its `Display` spelling.
+#[must_use]
+pub fn kv_quant_label(kv: Option<KvQuant>) -> String {
+    let Some(quant) = kv else {
+        return "auto".into();
+    };
+    if let KvQuant::Mixed { .. } = quant {
+        return "mixed".into();
+    }
+    if let KvQuant::RotK { .. } = quant {
+        return "rot_k".into();
+    }
+    quant.to_string()
 }
 
 impl std::str::FromStr for KvQuant {

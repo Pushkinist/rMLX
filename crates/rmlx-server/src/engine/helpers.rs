@@ -5,7 +5,6 @@
 //! - `is_reconstructible_tool_marker` — Gemma-4 tool protocol marker allowlist
 //! - `compute_itl_stats` — ITL percentile / mean / spike computation
 //! - `spsc_ts` — UTC timestamp string for SPSC metric events
-//! - `kv_quant_label` — KvQuant → label string
 
 use std::time::Instant;
 
@@ -263,51 +262,6 @@ pub(crate) fn spsc_ts() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
-/// Map a `KvQuant` override to its canonical label string.
-pub(crate) fn kv_quant_label(kv: Option<rmlx_kv_quant::KvQuant>) -> String {
-    match kv {
-        Some(rmlx_kv_quant::KvQuant::K8V8) => "k8v8",
-        Some(rmlx_kv_quant::KvQuant::K8V4) => "k8v4",
-        Some(rmlx_kv_quant::KvQuant::Planar) => "planar",
-        Some(rmlx_kv_quant::KvQuant::Planar3) => "planar3",
-        Some(rmlx_kv_quant::KvQuant::None) => "none",
-        Some(rmlx_kv_quant::KvQuant::Mixed { .. }) => "mixed",
-        Some(rmlx_kv_quant::KvQuant::RotK { .. }) => "rot_k",
-        Some(rmlx_kv_quant::KvQuant::K8VTurbo3) => "k8vturbo3",
-        Some(rmlx_kv_quant::KvQuant::TurboSym4) => "tsym4",
-        Some(rmlx_kv_quant::KvQuant::PlanarK) => "planar_k",
-        Some(rmlx_kv_quant::KvQuant::K8VTurbo2) => "k8vturbo2",
-        Some(rmlx_kv_quant::KvQuant::Iso3) => "iso3",
-        Some(rmlx_kv_quant::KvQuant::Iso4) => "iso4",
-        Some(rmlx_kv_quant::KvQuant::Rotor3) => "rotor3",
-        Some(rmlx_kv_quant::KvQuant::Rotor4) => "rotor4",
-        Some(rmlx_kv_quant::KvQuant::K8VTurbo3Tcq) => "k8vturbo3tcq",
-        Some(rmlx_kv_quant::KvQuant::K8VTurbo2Tcq) => "k8vturbo2tcq",
-        Some(rmlx_kv_quant::KvQuant::Iso3Sym) => "iso3_sym",
-        Some(rmlx_kv_quant::KvQuant::Iso4Sym) => "iso4_sym",
-        Some(rmlx_kv_quant::KvQuant::IsoKOnly3) => "k_iso3",
-        Some(rmlx_kv_quant::KvQuant::IsoKOnly4) => "k_iso4",
-        Some(rmlx_kv_quant::KvQuant::Rotor3Sym) => "rotor3_sym",
-        Some(rmlx_kv_quant::KvQuant::Rotor4Sym) => "rotor4_sym",
-        Some(rmlx_kv_quant::KvQuant::RotorKOnly3) => "k_rotor3",
-        Some(rmlx_kv_quant::KvQuant::RotorKOnly4) => "k_rotor4",
-        // Payload-bearing asymmetric rotor-K variants — render via
-        // Display so the v-side spec is captured (`rotor_k_*_asym_v*_g*`).
-        Some(
-            kq @ (rmlx_kv_quant::KvQuant::RotorK3Asym { .. }
-            | rmlx_kv_quant::KvQuant::RotorK4Asym { .. }),
-        ) => return format!("{kq}"),
-        // TurboSym3 — symmetric 3-bit Lloyd-Max K+V.
-        Some(rmlx_kv_quant::KvQuant::TurboSym3) => "tsym3",
-        None => "auto",
-    }
-    .into()
-}
-
 #[cfg(test)]
 #[path = "helpers_tests.rs"]
 mod helpers_tests;
-
-#[cfg(test)]
-#[path = "kv_quant_label_tests.rs"]
-mod kv_quant_label_tests;

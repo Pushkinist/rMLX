@@ -5,7 +5,8 @@
 //!
 //! * The table and [`ALL_KV_QUANTS`] are a bijection: each codec has exactly
 //!   one row and each row names exactly one codec.
-//! * For each codec, each predicate gives the value its row states.
+//! * For each codec, each predicate and the metrics label give the value its
+//!   row states.
 //!
 //! A per-codec descriptor can give one row to both a predicate and the code
 //! that the predicate describes. Then a wrong row agrees with itself and passes
@@ -15,7 +16,7 @@
 //! What the table cannot see: a new codec. Its author writes its row too, so a
 //! wrong fact in a new row is for review to find.
 
-use super::{KvQuant, ALL_KV_QUANTS};
+use super::{kv_quant_label, KvQuant, ALL_KV_QUANTS};
 
 include!("codec_facts_table.rs");
 
@@ -127,6 +128,26 @@ fn every_codec_states_the_facts_its_row_holds() {
             "{name}: mixed_params"
         );
     }
+}
+
+/// The label bytes are what the metrics DB groups rows by, so they must not
+/// move.
+#[test]
+fn every_codec_writes_the_metrics_label_its_row_holds() {
+    for &quant in ALL_KV_QUANTS {
+        let want = row(quant);
+        let spelling = want.spelling;
+        assert_eq!(
+            kv_quant_label(Some(quant)),
+            want.metrics_label,
+            "{spelling}: metrics label"
+        );
+    }
+    assert_eq!(
+        kv_quant_label(None),
+        "auto",
+        "no codec override: metrics label"
+    );
 }
 
 /// `cpu_hot_path_reason` reads the rotor QJL switch at call time, so the class
