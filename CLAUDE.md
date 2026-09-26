@@ -72,7 +72,7 @@ areas before touching code:
 | [`docs/GPU_TESTS.md`](docs/GPU_TESTS.md) | GPU/Metal tests: the `#[ignore]` rule and its gate, `make gpu-test`, stand-downs, halves, `make ci-perf`, shader validation, census pin |
 | [`docs/AUDIO.md`](docs/AUDIO.md) | Audio: Whisper transcription, Qwen3-TTS, WAV I/O, Whisper token ids |
 | [`docs/E2E_TEST_PLAN.md`](docs/E2E_TEST_PLAN.md) | End-to-end feature-proof harness: modality, tool-calling and speculative-decoding cases |
-| [`docs/RELEASING.md`](docs/RELEASING.md) | Release flow: single-source version, `make tag` / `release-package` / `tap-sync`, Homebrew formula + tap, `CHANGELOG.md`, branch model (`next/*`, hotfix, fast-forward release) |
+| [`docs/RELEASING.md`](docs/RELEASING.md) | Release flow: single-source version, `make tag` / `release-package` / `tap-sync`, Homebrew formula + tap, `CHANGELOG.md`, branch model (`next/*`, hotfix, fast-forward release), post-release retrospective |
 
 ## What this project is not
 

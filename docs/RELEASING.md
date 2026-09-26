@@ -58,7 +58,11 @@ that bypass is what lets the fast-forward push below reach `main`.
 2. **Changelog.** Add a `## [<version>] - <date>` section to `CHANGELOG.md`
    (Keep a Changelog format) and the matching `[<version>]:` link at the
    bottom. It is the source of the release body. `README.md` carries no
-   version and is not edited for a release.
+   version and is not edited for a release. The section can end with an
+   optional `### Retrospective` heading that lists links to the issues the
+   previous release's retrospective filed (§Retrospective). Nothing else
+   goes under it: the section is the public release body. Released
+   sections are never edited.
 3. **Gate.** `make ci` and the whole `make ci-perf` green on `next/<name>`,
    plus the real-model regression smoke. Every merge to `main` runs the whole
    `make ci-perf`.
@@ -100,6 +104,9 @@ that bypass is what lets the fast-forward push below reach `main`.
      PR with the formula change against `main`.
 10. **Tap.** `make tap-sync` copies the formula into
     `Pushkinist/homebrew-rmlx` as `Formula/rmlx.rb` and pushes it.
+11. **Verify** the install paths (§Verify the install paths).
+12. **Retrospective** over the diff from the previous tag to the new one
+    (§Retrospective).
 
 ### No Homebrew bottle
 
@@ -188,6 +195,138 @@ cp packaging/homebrew/rmlx.rb \
 HOMEBREW_NO_INSTALL_FROM_API=1 \
   brew install --build-from-source pushkinist/rmlx/rmlx
 brew audit --strict pushkinist/rmlx/rmlx
+```
+
+## Retrospective
+
+Per-PR review sees one diff. It cannot see that a new file repeats a file
+beside it, or that a new gate does the work of an old one. The retrospective
+reads the whole diff from the previous tag to the new tag and files issues
+for what the release repeated, left inert, grew past a limit or made
+deletable.
+
+Rules:
+
+- Run it after step 11, in one working session.
+- It changes no code and makes no commit. Its output is issues.
+- Search the open and closed issues before you file. When an issue already
+  tracks a finding, name that issue and file nothing.
+- File one issue per finding group, not one per site. Give it exactly one of
+  the labels `documentation`, `bug`, `feature`, `enhancement` or `test`. Add
+  `premise-unverified` when the finding comes from code reading only.
+- It lists flags and codecs. It never retires, renames or deletes one:
+  retirement is a separate decision with its own proof.
+- Answer every checklist item, and write "none" when an item finds nothing.
+  An empty answer is evidence too. A measurement that could not run is "not
+  measured", never "none". Post the answers as one comment on the release
+  PR of step 4.
+
+Set the range and check out both tags beside the repo. Run every script
+from the current checkout, so one version of each tool measures both trees:
+
+```sh
+NEW=v<version>
+PREV=$(git describe --tags --abbrev=0 "$NEW^")
+git worktree add --detach ../rmlx-retro-prev "$PREV"
+git worktree add --detach ../rmlx-retro-new "$NEW"
+mkdir -p .rmlx/tmp
+```
+
+The checklist:
+
+1. **Twins.** Run the debt report and every `--matched-lines` population
+   over both trees, and compare. A new file or fn pair in the report is a
+   finding. It gets a const-generic or trait issue.
+   ```sh
+   bash scripts/debt_report.sh --root ../rmlx-retro-prev > .rmlx/tmp/retro-prev.txt
+   bash scripts/debt_report.sh --root ../rmlx-retro-new --since "$PREV" > .rmlx/tmp/retro-new.txt
+   diff .rmlx/tmp/retro-prev.txt .rmlx/tmp/retro-new.txt
+   pops=$(python3 -c 'import sys; sys.path.insert(0, "scripts/lib"); import debt_report; print(*sorted(debt_report.MATCHED_LINES_POPULATIONS))')
+   for tree in prev new; do
+     for p in $pops; do
+       printf '%s: ' "$p"
+       bash scripts/debt_report.sh --root "../rmlx-retro-$tree" --matched-lines "$p" 2>&1 | tail -1
+     done > ".rmlx/tmp/retro-lines-$tree.txt"
+   done
+   diff .rmlx/tmp/retro-lines-prev.txt .rmlx/tmp/retro-lines-new.txt
+   ```
+   Read a `--matched-lines` figure against its item count. Each new item
+   adds pairs, so the figure grows with the count alone. Compare figures
+   only at an equal item count. When the count changed, find the new items
+   in the release diff and compare each one with its closest sibling. A
+   population that reads `unavailable` in either tree is "not measured".
+   The report reads `.rs` files only. Compare each `.metal` file that the
+   release changed with its siblings in the same directory. The same edit
+   made in more than one file is also a twin signal.
+2. **Size.** A non-test source file that crossed 1000 lines gets a split
+   proposal or a `// LOC-exempt:` marker with its reason.
+   ```sh
+   git diff --name-only --no-renames --diff-filter=AM "$PREV" "$NEW" -- 'crates/*.rs' |
+     grep -v -E '/tests/|(^|/)tests\.rs$|_tests\.rs$' |
+     while read -r f; do
+       new=$(git show "$NEW:$f" | wc -l)
+       old=$(git show "$PREV:$f" 2>/dev/null | wc -l)
+       [ "$new" -gt 1000 ] && [ "$old" -le 1000 ] && echo "$old -> $new $f"
+     done
+   ```
+3. **Allows.** Each new `#[allow(` or `#![allow(` site gets a fix-or-keep
+   verdict.
+   ```sh
+   git diff -U0 "$PREV" "$NEW" -- '*.rs' |
+     awk '/^\+\+\+ /{f=$2; next} /^\+.*#!?\[allow\(/{print f": "$0}'
+   ```
+4. **Dead paths.** A new comment that marks a path as inert, dormant,
+   deferred or kept gets a delete-or-schedule verdict. The command reads
+   `//` comments and `#` comments followed by a space, so URLs and Rust
+   attributes do not match. It still matches prose that uses these words:
+   "inert" is also the name of a codec disposition (`docs/KV_QUANT.md`).
+   Read each hit.
+   ```sh
+   git diff -U0 "$PREV" "$NEW" -- '*.rs' '*.metal' '*.sh' '*.py' |
+     awk '/^\+\+\+ /{f=$2; next}
+          tolower($0) ~ /^\+([ \t]*|.*[ \t])(\/\/|#[ \t]).*(inert|dormant|deferred|kept for|future-reference|no longer)/ {print f": "$0}'
+   ```
+5. **Gates.** For each new gate, name the gate it makes unnecessary, or the
+   structural change that would make it unnecessary. A gate is a new
+   `check-*` target or a new line in the `ci:` recipe, which also runs the
+   `*-selftest` and `*-fixtures` scripts.
+   ```sh
+   git diff -U0 "$PREV" "$NEW" -- Makefile | grep -E '^\+check-[a-z0-9-]*:'
+   ci_recipe() { git show "$1:Makefile" | awk '/^ci:/{on=1; print; next} on && /^\t/{print; next} on{exit}'; }
+   diff <(ci_recipe "$PREV") <(ci_recipe "$NEW")
+   ```
+6. **Docs.** A doc that grew by more than 20%, or a new doc, gets a
+   proposal to cut it to current truth.
+   ```sh
+   git diff --name-only --no-renames --diff-filter=AM "$PREV" "$NEW" -- 'docs/*.md' |
+     while read -r f; do
+       old=$(git cat-file -s "$PREV:$f" 2>/dev/null || echo 0)
+       new=$(git cat-file -s "$NEW:$f")
+       [ "$new" -gt $((old * 6 / 5)) ] && echo "$old -> $new $f"
+     done
+   ```
+7. **Flags and codecs.** A new CLI flag, `--kv-quant` spelling or
+   `--kv-preset` name with no measured win: list it with the measurement
+   that would settle it. A digest oracle needs a positive control in the
+   same run.
+   ```sh
+   git diff -U0 "$PREV" "$NEW" -- 'crates/rmlx-cli/*.rs' | grep -E '^\+.*#\[arg\('
+   git diff -U0 "$PREV" "$NEW" -- crates/rmlx-kv-quant/src/quant.rs \
+       crates/rmlx-cli/src/commands/preset_table.rs |
+     grep -E '^\+[[:space:]]*\|?[[:space:]]*"[a-z0-9_]+"'
+   ```
+   The second command finds fixed spellings, aliases and preset names. The
+   parser also accepts parametric families such as `mixed_*` and
+   `rot_k_v*`, so read its diff when it changed.
+8. **One paragraph.** Name the pattern that this release repeated and the
+   generalisation that would have prevented it. It goes in the retrospective
+   comment on the release PR, not in `CHANGELOG.md`.
+
+Remove the two checkouts when the comment is posted:
+
+```sh
+git worktree remove ../rmlx-retro-prev
+git worktree remove ../rmlx-retro-new
 ```
 
 ## Files
