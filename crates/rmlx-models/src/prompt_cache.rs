@@ -1056,6 +1056,28 @@ impl MissReason {
     }
 }
 
+/// Deep-clone the caches of a post-prefill snapshot. `None` when one clone
+/// refuses (for example a paged cache that holds pages): the refusal is one
+/// `debug!` event, and the arch stores no entry.
+pub(crate) fn snapshot_clone<T>(
+    arch: &'static str,
+    items: &[T],
+    clone: impl Fn(&T) -> Result<T>,
+) -> Option<Vec<T>> {
+    match items.iter().map(clone).collect::<Result<Vec<T>>>() {
+        Ok(cloned) => Some(cloned),
+        Err(e) => {
+            tracing::debug!(
+                arch,
+                branch = MissReason::DeepCloneErr.label(),
+                error = %e,
+                "prompt-cache snapshot: deep clone refused, entry not stored"
+            );
+            None
+        }
+    }
+}
+
 /// Outcome of a prompt-cache consume decision.
 ///
 /// Read-only — the engine that produces this never `push`es. The arch maps each
@@ -1678,4 +1700,4 @@ where
 
 #[cfg(test)]
 #[path = "prompt_cache_tests.rs"]
-mod prompt_cache_tests;
+pub(crate) mod prompt_cache_tests;

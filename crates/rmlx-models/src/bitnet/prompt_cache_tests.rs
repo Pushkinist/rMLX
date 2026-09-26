@@ -7,6 +7,7 @@
 //! relies on. Decoded-token reuse is proven by the real-model smoke, not here.
 
 use super::*;
+use crate::prompt_cache::prompt_cache_tests::paged_layer;
 use rmlx_kv_quant::{KvCache, KvQuant};
 
 /// Build a `BitNetEntry` with `n_layers` empty (never-prefilled) KV caches.
@@ -116,46 +117,6 @@ fn ssd_hydrated_entry_field_invariants() {
     assert!(hydrated
         .is_reusable_prefix_of(&[10, 11, 12, 13], true, 0)
         .is_none());
-}
-
-/// One K8V4 paged layer: an empty storage, or one whose K slot holds a page.
-#[allow(
-    clippy::expect_used,
-    reason = "test fixture: a CPU page allocation must succeed, and the panic names the slab"
-)]
-fn paged_layer(with_page: bool) -> KvCache {
-    use rmlx_kv_quant::paged::PagedKStorage;
-    use rmlx_kv_quant::storage::KvStorage;
-
-    let k = with_page.then(|| {
-        let mut k = PagedKStorage::new(4096, 16, 4);
-        let id = k
-            .codes
-            .alloc(rmlx_mlx::Device::Cpu)
-            .expect("allocate a K page");
-        k.scales
-            .alloc(rmlx_mlx::Device::Cpu)
-            .expect("allocate a K scale page");
-        k.block_table.push(id);
-        k.total_tokens = 13;
-        k.shape = vec![1, 1, 13, 64];
-        k
-    });
-    let storage = KvStorage::Paged {
-        quant: KvQuant::K8V4,
-        k,
-        v_k8: None,
-        v_planar: None,
-    };
-    KvCache::from_storage(
-        storage,
-        4096,
-        KvQuant::K8V4,
-        if with_page { 13 } else { 0 },
-        0,
-        rmlx_core::DispatchPolicy::default(),
-        false,
-    )
 }
 
 /// An exact prompt repeat whose stored entry holds a paged layer with pages is

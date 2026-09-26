@@ -44,7 +44,7 @@ use rmlx_runtime::{count_nan_in_bytes, max_abs_from_bytes};
 use crate::constraint::ConstraintEngine;
 use crate::context::{resolve_context, ResolvedContext};
 use crate::decode_loop::{reject_nan_prefill, ProbeStep};
-use crate::prompt_cache::{chained_block_hashes_seeded, Consumed, ReusePolicy};
+use crate::prompt_cache::{chained_block_hashes_seeded, snapshot_clone, Consumed, ReusePolicy};
 use crate::sampler::{apply_mask_argmax, sample_token_array, Pcg32, PenaltyConfig, SamplerConfig};
 use rmlx_kv_quant::{KvCache, KvQuant};
 
@@ -322,8 +322,8 @@ pub fn generate_greedy(
     // for every request (text and image), at the same lifecycle point as the
     // exact-hit path.
     if !has_image {
-        let cloned_caches: Result<Vec<KvCache>> = kv.iter().map(|c| c.try_deep_clone()).collect();
-        if let Ok(kv_snapshot) = cloned_caches {
+        let arch = PROMPT_CACHE.arch_name();
+        if let Some(kv_snapshot) = snapshot_clone(arch, &kv, KvCache::try_deep_clone) {
             match kv_snapshot.iter().try_for_each(|c| c.eval_for_spill()) {
                 Ok(()) => {
                     // Salt the chained block-hash walk with the active layout_key

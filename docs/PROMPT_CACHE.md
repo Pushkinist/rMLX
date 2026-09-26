@@ -269,8 +269,9 @@ field is the reason's label: `has_image`, `no_cache`, `no_match`,
 
 A paged KV cache (`--paged-kv`) whose slots hold pages refuses its deep clone,
 because the pages have no copy. The post-prefill snapshot of such a cache is
-not stored, an Exact or Reuse clone of it misses with `deep_clone_err`, and
-the spill hook skips it with a `warn!`. A paged cache with no pages clones.
+not stored (`snapshot_clone` logs one `debug!` with branch `deep_clone_err`),
+an Exact or Reuse clone of it misses with `deep_clone_err`, and the spill hook
+skips it with a `warn!`. A paged cache with no pages clones.
 
 `ReuseKind` is `StrictPrefix { prefix_len }` (reuse the whole cached prefix,
 prefill the rest) or `BlockTruncate { effective_blocks }` (trim to a block

@@ -2718,3 +2718,78 @@ fn ensure_rebuilds_only_on_a_real_capacity_change() {
         "a changed capacity must rebuild the cache and discard its snapshots"
     );
 }
+
+// ── post-prefill snapshot clone ──────────────────────────────────────────────
+
+/// One K8V4 paged layer: an empty storage, or one whose K slot holds a page.
+#[allow(
+    clippy::expect_used,
+    reason = "test fixture: a CPU page allocation must succeed, and the panic names the slab"
+)]
+pub(crate) fn paged_layer(with_page: bool) -> KvCache {
+    use rmlx_kv_quant::paged::PagedKStorage;
+    use rmlx_kv_quant::storage::KvStorage;
+
+    let k = with_page.then(|| {
+        let mut k = PagedKStorage::new(4096, 16, 4);
+        let id = k.codes.alloc(Device::Cpu).expect("allocate a K page");
+        k.scales
+            .alloc(Device::Cpu)
+            .expect("allocate a K scale page");
+        k.block_table.push(id);
+        k.total_tokens = 13;
+        k.shape = vec![1, 1, 13, 64];
+        k
+    });
+    let storage = KvStorage::Paged {
+        quant: KvQuant::K8V4,
+        k,
+        v_k8: None,
+        v_planar: None,
+    };
+    KvCache::from_storage(
+        storage,
+        4096,
+        KvQuant::K8V4,
+        if with_page { 13 } else { 0 },
+        0,
+        DispatchPolicy::default(),
+        false,
+    )
+}
+
+/// A snapshot whose paged layer holds pages is not stored: the helper returns
+/// `None` and emits one `deep_clone_err` branch event. The same layer with no
+/// pages clones, so the `None` comes from the pages.
+#[test]
+fn snapshot_clone_refuses_a_paged_layer_with_pages_and_logs_it() {
+    let with_pages = [paged_layer(true)];
+    let mut refused = None;
+    let branches = capture_branches(|| {
+        refused = Some(snapshot_clone(
+            "test-snapshot",
+            &with_pages,
+            KvCache::try_deep_clone,
+        ));
+    });
+    assert!(
+        matches!(refused, Some(None)),
+        "a snapshot whose paged layer holds pages must not be stored"
+    );
+    assert_eq!(
+        branches,
+        vec![MissReason::DeepCloneErr.label().to_owned()],
+        "the refused snapshot must emit exactly one deep_clone_err event"
+    );
+
+    let control = snapshot_clone(
+        "test-snapshot",
+        &[paged_layer(false)],
+        KvCache::try_deep_clone,
+    );
+    assert_eq!(
+        control.map(|layers| layers.len()),
+        Some(1),
+        "a paged layer with no pages must be snapshotted"
+    );
+}
