@@ -16,8 +16,12 @@ fn sh(script: &str) -> Vec<OsString> {
     vec!["/bin/sh".into(), "-c".into(), script.into()]
 }
 
+const BODY: &str = "4242 rmlx claim run -- stand-in";
+
 fn temp_lock(dir: &Path) -> OwnedFd {
-    let file = File::create(dir.join("lock")).unwrap();
+    let path = dir.join("lock");
+    std::fs::write(&path, BODY).unwrap();
+    let file = File::options().read(true).write(true).open(&path).unwrap();
     file.lock().unwrap();
     OwnedFd::from(file)
 }
@@ -42,16 +46,18 @@ fn wait_for(path: &Path, limit: Duration) -> bool {
     false
 }
 
-/// The child reads its stdin to the end, which does not block, and holds the
-/// lock after this process has let go of every copy of it.
+/// The child's stdin is the lock file: reading it to the end gives the file's
+/// body and does not block, and the child holds the lock while it runs.
 #[test]
 fn claim_run_child_holds_the_lock() {
     let dir = tempfile::tempdir().unwrap();
     let ready = dir.path().join("ready");
     let go = dir.path().join("go");
+    let stdin_copy = dir.path().join("stdin");
     let command = sh(&format!(
-        "cat >/dev/null; touch {ready}; i=0; \
+        "cat >{stdin_copy}; touch {ready}; i=0; \
          while [ ! -e {go} ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done",
+        stdin_copy = stdin_copy.display(),
         ready = ready.display(),
         go = go.display(),
     ));
@@ -66,6 +72,11 @@ fn claim_run_child_holds_the_lock() {
     let held_by_child = locked_elsewhere(dir.path());
     File::create(&go).unwrap();
     assert_eq!(runner.join().unwrap().unwrap(), 0);
+    assert_eq!(
+        std::fs::read_to_string(&stdin_copy).unwrap(),
+        BODY,
+        "the child's stdin must be the lock file"
+    );
     assert!(held_by_child, "the child must hold the lock");
     assert!(
         !locked_elsewhere(dir.path()),
