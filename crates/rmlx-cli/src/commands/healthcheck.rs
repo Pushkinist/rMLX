@@ -226,9 +226,10 @@ pub(crate) fn run_healthcheck(
 // Individual checks
 // ---------------------------------------------------------------------------
 
-/// Check 1: the Metal claim. A server on the probed port holds it, so a held
-/// claim is green and a free claim is red. The probe does not take the claim;
-/// its shared lock refuses a GPU command that starts in the same moment.
+/// Check 1: the Metal claim. A running server holds it, so a held claim is
+/// green and a free claim is red. The holder is not matched to `--port`. The
+/// probe does not take the claim; its shared lock refuses a GPU command that
+/// starts in the same moment.
 fn claim_line(probe: &Result<(), ClaimError>) -> CheckLine {
     match probe {
         Err(held @ ClaimError::AlreadyHeld { .. }) => {
@@ -406,8 +407,8 @@ fn holder(claim: &ClaimError) -> String {
 }
 
 /// Check 4 (--full only). When check 1 found a holder, the probes do not run
-/// and each line is info, naming it: the checked server holds the GPU, which is
-/// the state check 1 reports green. Otherwise the probes take the Metal claim;
+/// and each line is info, naming it: a process holds the claim, which is the
+/// state check 1 reports green. Otherwise the probes take the Metal claim;
 /// a refused claim makes each line red and names the holder.
 fn smoke_lines(
     paths: &[PathBuf],
