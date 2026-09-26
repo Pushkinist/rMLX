@@ -3,6 +3,7 @@
 pub(crate) mod baseline;
 pub(crate) mod bench;
 pub(crate) mod calibration_softmax;
+pub(crate) mod claim_run;
 pub(crate) mod eval;
 #[cfg(feature = "metal-capture")]
 pub(crate) mod gpu_capture;
@@ -23,9 +24,9 @@ pub(crate) use healthcheck::run_healthcheck;
 pub(crate) use info::run_info;
 pub(crate) use kv_calibrate::run_kv_calibrate;
 pub(crate) use parse::{
-    acquire_claim_for_device, build_cache_type_spec, kv_bits_u8, parse_device, parse_kv_bits_combo,
-    parse_kv_bits_fractional, parse_kv_boundary_layers, parse_kv_preset, parse_kv_quant,
-    parse_max_ctx, parse_max_prompt_tokens, resolve_model_flags, resolve_preset_arg,
+    build_cache_type_spec, kv_bits_u8, parse_device, parse_kv_bits_combo, parse_kv_bits_fractional,
+    parse_kv_boundary_layers, parse_kv_preset, parse_kv_quant, parse_max_ctx,
+    parse_max_prompt_tokens, resolve_model_flags, resolve_preset_arg,
 };
 pub(crate) use profile::run_profile_list;
 pub(crate) use serve::run_serve;

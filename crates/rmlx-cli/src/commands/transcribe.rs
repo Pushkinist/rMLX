@@ -81,7 +81,7 @@ fn run_whisper(args: &TranscribeArgs, device: Device) -> Result<String> {
     );
 
     rmlx_mlx::ensure_cpu_default_stream();
-    if device == Device::Gpu {
+    if device != Device::Cpu {
         rmlx_mlx::ensure_gpu_default_stream();
     }
 

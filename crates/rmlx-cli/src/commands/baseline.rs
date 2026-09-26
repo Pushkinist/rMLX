@@ -337,7 +337,7 @@ fn tokenize_chat_fixture(
 /// Record a performance baseline for the given model snapshot.
 ///
 /// Steps:
-/// 1. Parse device, read prompt file, tokenize. A chat-JSON fixture
+/// 1. Read prompt file, tokenize. A chat-JSON fixture
 ///    (`{"messages": [...], ...}`, e.g. `prompts/longctx_<N>k.json`) is
 ///    rendered through the model's real `chat_template.jinja` first, so the
 ///    token count reflects the message content rather than the fixture's JSON
@@ -356,14 +356,15 @@ fn tokenize_chat_fixture(
 ///    sequence when `emit_token_ids` is set.
 #[tracing::instrument(skip_all, fields(
     model_dir = %model_path.display(),
-    device = device_str,
+    device = device_label,
     max_tokens,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_baseline(
     model_path: &Path,
     prompt_path: &Path,
-    device_str: &str,
+    device: Device,
+    device_label: &str,
     max_tokens: u32,
     run_id: &str,
     prompt_label: &str,
@@ -376,17 +377,6 @@ pub(crate) fn run_baseline(
     sink: &EventRecorder,
     record_args: Option<BaselineRecordArgs<'_>>,
 ) -> anyhow::Result<()> {
-    // -- Validate device -------------------------------------------------------
-    let device = match device_str {
-        "cpu" => Device::Cpu,
-        "gpu" => Device::Gpu,
-        other => {
-            return Err(anyhow::anyhow!(
-                "--device must be 'cpu' or 'gpu', got '{other}'"
-            ));
-        }
-    };
-
     // -- Read prompt file -------------------------------------------------------
     let prompt_text = std::fs::read_to_string(prompt_path)
         .map_err(|e| anyhow::anyhow!("cannot read prompt file {}: {e}", prompt_path.display()))?;
@@ -437,7 +427,7 @@ pub(crate) fn run_baseline(
 
     info!(
         model = %model_path.display(),
-        device = device_str,
+        device = device_label,
         prompt_tokens = prompt_token_count,
         max_ctx = resolved_ctx.ceiling,
         max_tokens,
@@ -829,7 +819,7 @@ pub(crate) fn run_baseline(
             baseline_csv_escape(&quantization_type),
             context_size,
             baseline_csv_escape(prompt_label),
-            baseline_csv_escape(device_str),
+            baseline_csv_escape(device_label),
             prompt_token_count,
             load_ms,
             fmt_measurement(ttft_ms, 0, ""),

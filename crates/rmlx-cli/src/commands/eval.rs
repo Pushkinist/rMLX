@@ -25,7 +25,7 @@ use tracing::{info, instrument, warn};
 /// Run `rmlx eval ppl`.
 ///
 /// Steps:
-/// 1. Validate `--device`, open model snapshot, tokenize `--text-file`.
+/// 1. Open model snapshot, tokenize `--text-file`.
 /// 2. Apply `--max-tokens` cap (0 = use whole corpus).
 /// 3. Invoke `rmlx_models::ppl::compute_ppl` with the requested window/stride.
 /// 4. Print one JSON line to stdout.
@@ -37,7 +37,7 @@ use tracing::{info, instrument, warn};
     ctx_window,
     stride,
     corpus,
-    device = %device_str,
+    ?device,
     ?kv_quant,
 ))]
 #[allow(clippy::too_many_arguments)]
@@ -51,22 +51,12 @@ pub(crate) fn run_ppl(
     ctx_window: usize,
     stride: usize,
     corpus: &str,
-    device_str: &str,
+    device: Device,
     max_tokens: usize,
     run_id: &str,
     git_sha: Option<&str>,
     kv_quant: Option<rmlx_kv_quant::KvQuant>,
 ) -> Result<()> {
-    let device = match device_str {
-        "cpu" => Device::Cpu,
-        "gpu" => Device::Gpu,
-        other => {
-            return Err(anyhow::anyhow!(
-                "--device must be 'cpu' or 'gpu', got '{other}'"
-            ));
-        }
-    };
-
     // -- Read corpus + tokenize ------------------------------------------------
     let corpus_text = std::fs::read_to_string(text_file)
         .map_err(|e| anyhow::anyhow!("cannot read text file {}: {e}", text_file.display()))?;

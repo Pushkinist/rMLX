@@ -106,6 +106,26 @@ fn j6_claim_io_error_is_red() {
     assert_eq!(line.status, Status::Red, "a claim I/O error must be red");
 }
 
+#[test]
+fn smoke_line_is_red_and_names_the_holder_when_the_claim_is_held() {
+    let line = smoke_refused(
+        Path::new("models/some-model"),
+        &ClaimError::AlreadyHeld {
+            holder_pid: Some(4242),
+            holder_command: "rmlx serve --port 8080".to_owned(),
+            path: PathBuf::from("lock"),
+        },
+    );
+    assert_eq!(line.check, "smoke:some-model");
+    assert_eq!(line.status, Status::Red, "a refused claim must be red");
+    assert!(line.detail.contains("PID 4242"), "{}", line.detail);
+    assert!(
+        line.detail.contains("rmlx serve --port 8080"),
+        "{}",
+        line.detail
+    );
+}
+
 // ── DB check ────────────────────────────────────────────────────────────────
 
 /// DB check on non-existent path is red.

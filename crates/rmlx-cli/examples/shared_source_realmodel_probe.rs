@@ -81,6 +81,9 @@ fn main() -> anyhow::Result<()> {
         policy.turbo_flash, policy.fused_qk
     );
 
+    // Hold the Metal claim for every GPU call below.
+    let _claim = rmlx_server::try_claim().map_err(|e| anyhow::anyhow!("{e}"))?;
+
     rmlx_mlx::ensure_cpu_default_stream();
     rmlx_mlx::ensure_gpu_default_stream();
 

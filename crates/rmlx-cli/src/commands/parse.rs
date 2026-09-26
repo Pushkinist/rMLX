@@ -8,9 +8,11 @@
 //!
 //! # Public API
 //!
-//! - [`parse_device`] — `"cpu"` / `"gpu"` string → [`rmlx_mlx::Device`].
-//! - [`acquire_claim_for_device`] — acquire the single-MLX-process claim
-//!   before any MLX call; exits with code 11 on contention.
+//! - [`parse_device`] — `"cpu"` / `"gpu"` string → [`rmlx_mlx::Device`],
+//!   with the Metal claim when the device is the GPU.
+//! - [`claim_gpu`] — the GPU device together with the Metal claim. It is the
+//!   only place this binary names the GPU device.
+//! - [`exit_if_held`] — exit with code 11 when another process holds the claim.
 //! - [`parse_kv_quant`] — `--kv-quant` string → `Option<KvQuant>`.
 //! - [`parse_kv_preset`] — `--kv-preset` name → [`KvPresetArg`] via the
 //!   static preset table. `"auto"` yields `KvPresetArg::Auto`; unknown names
@@ -32,35 +34,50 @@
 #![allow(clippy::cognitive_complexity)]
 use rmlx_mlx::Device;
 use rmlx_models::kv_cache::KvBoundary;
-use rmlx_server::{try_claim, ClaimError};
+use rmlx_server::{try_claim, ClaimError, MetalClaim};
 use tracing::error;
 
 use crate::commands::preset_table::{lookup_preset, PresetError, AVAILABLE_NAMES};
 
-/// Parse the `--device` flag value into a `Device`.
-pub(crate) fn parse_device(s: &str) -> anyhow::Result<Device> {
-    match s {
-        "cpu" => Ok(Device::Cpu),
-        "gpu" => Ok(Device::Gpu),
-        other => Err(anyhow::anyhow!(
-            "--device must be 'cpu' or 'gpu', got '{other}'"
-        )),
-    }
+/// Parse the `--device` flag value. `"gpu"` takes the Metal claim, which the
+/// caller holds until its last GPU work ends; `"cpu"` takes none.
+pub(crate) fn parse_device(s: &str) -> anyhow::Result<(Device, Option<MetalClaim>)> {
+    device_from_flag(s, || exit_if_held(claim_gpu()))
 }
 
-/// Acquire the Metal claim for `device`.
+fn device_from_flag(
+    s: &str,
+    claim_gpu: impl FnOnce() -> anyhow::Result<(Device, MetalClaim)>,
+) -> anyhow::Result<(Device, Option<MetalClaim>)> {
+    let (device, claim) = match s {
+        "cpu" => (Device::Cpu, None),
+        "gpu" => {
+            let (device, claim) = claim_gpu()?;
+            (device, Some(claim))
+        }
+        other => {
+            return Err(anyhow::anyhow!(
+                "--device must be 'cpu' or 'gpu', got '{other}'"
+            ))
+        }
+    };
+    tracing::info!(device = s, "resolved device");
+    Ok((device, claim))
+}
+
+/// The GPU device, and the Metal claim that must outlive every use of it.
 ///
-/// - `Device::Gpu` → calls `try_claim()`. When another process holds the
-///   claim, prints the refusal and exits with code 11.
-/// - `Device::Cpu` → no-op (returns `None`).
-pub(crate) fn acquire_claim_for_device(
-    device: Device,
-) -> anyhow::Result<Option<rmlx_server::MetalClaim>> {
-    if device == Device::Cpu {
-        return Ok(None);
-    }
-    match try_claim() {
-        Ok(claim) => Ok(Some(claim)),
+/// # Errors
+/// The refusal from [`try_claim`].
+pub(crate) fn claim_gpu() -> Result<(Device, MetalClaim), ClaimError> {
+    try_claim().map(|claim| (Device::Gpu, claim))
+}
+
+/// Exit with code 11 when another process holds the Metal claim; any other
+/// claim error is returned.
+pub(crate) fn exit_if_held<T>(claim: Result<T, ClaimError>) -> anyhow::Result<T> {
+    match claim {
+        Ok(held) => Ok(held),
         Err(e @ ClaimError::AlreadyHeld { .. }) => {
             error!(error = %e, "Metal claim held by another process — refusing to start");
             eprintln!("error: {e}\nrMLX exits with code 11.");
@@ -576,9 +593,10 @@ pub(crate) fn parse_kv_bits_combo(
 ///
 /// Shared preamble for `serve` (single-model path), `chat`, `info`, and
 /// `baseline`: runs `parse_kv_quant` → `build_cache_type_spec` →
-/// `parse_max_ctx` → `parse_device` → emits an `info!` span for the
-/// resolved device → loads `config.json` via `rmlx_loader::load_config` →
-/// resolves the final [`KvQuant`] via [`resolve_kv_quant`].
+/// `parse_max_ctx` → loads `config.json` via `rmlx_loader::load_config` →
+/// resolves the final [`KvQuant`] via [`resolve_kv_quant`]. It does not parse
+/// `--device`: [`parse_device`] takes the claim, so each command calls it
+/// where its GPU work starts.
 ///
 /// `kv_bits` + `kv_group_size`: when both are `Some`, they are resolved via
 /// [`parse_kv_bits_combo`] and used as the `kv_quant_override` (the
@@ -586,10 +604,10 @@ pub(crate) fn parse_kv_bits_combo(
 /// both from being set simultaneously). When `kv_bits` is `Some` but
 /// `kv_group_size` is `None`, `kv_group_size` defaults to 64 (mlx-lm default).
 ///
-/// `cmd_name` is a short label used only in the `info!` log line
+/// `cmd_name` is a short label used only in the `--kv-bits` `info!` log line
 /// (e.g. `"rmlx serve"`, `"rmlx chat"`, `"rmlx info"`, `"rmlx baseline"`).
 ///
-/// Returns `(device, kv_quant, max_ctx_override)`.
+/// Returns `(kv_quant, max_ctx_override)`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_model_flags(
     model: &std::path::Path,
@@ -597,11 +615,10 @@ pub(crate) fn resolve_model_flags(
     ctk: Option<&str>,
     ctv: Option<&str>,
     max_ctx: Option<u32>,
-    device: &str,
     cmd_name: &str,
     kv_bits: Option<f32>,
     kv_group_size: Option<usize>,
-) -> anyhow::Result<(Device, rmlx_kv_quant::KvQuant, Option<i32>)> {
+) -> anyhow::Result<(rmlx_kv_quant::KvQuant, Option<i32>)> {
     // --kv-bits / --kv-group-size: resolve to a KvQuant before the normal
     // preset path. clap conflicts_with prevents --kv-bits from appearing
     // alongside --kv-quant / --cache-type-k / --cache-type-v, so if kv_bits
@@ -628,11 +645,9 @@ pub(crate) fn resolve_model_flags(
         (parse_kv_quant(kv_quant)?, build_cache_type_spec(ctk, ctv)?)
     };
     let max_ctx_override = parse_max_ctx(max_ctx)?;
-    let dev = parse_device(device)?;
-    tracing::info!(device, "{cmd_name}: resolved device");
     let cfg = rmlx_loader::load_config(model).map_err(|e| anyhow::anyhow!("load_config: {e}"))?;
     let kv_quant_final = resolve_kv_quant(&cfg, kv_quant_opt, cts_override);
-    Ok((dev, kv_quant_final, max_ctx_override))
+    Ok((kv_quant_final, max_ctx_override))
 }
 
 #[cfg(test)]

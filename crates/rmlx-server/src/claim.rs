@@ -18,6 +18,7 @@
 
 use std::fs::{File, OpenOptions, Permissions, TryLockError};
 use std::io::{self, Read as _};
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::fs::{FileExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
@@ -65,11 +66,18 @@ pub enum ClaimError {
     },
 }
 
-/// Holds the Metal claim until it is dropped. The flock releases when the fd
-/// closes; the file stays.
+/// Holds the Metal claim until it is dropped. The flock releases when the
+/// last fd on its open file closes; the file stays. A child that inherits the
+/// fd (see [`AsFd`]) holds the flock too.
 #[derive(Debug)]
 pub struct MetalClaim {
-    _file: File,
+    file: File,
+}
+
+impl AsFd for MetalClaim {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.file.as_fd()
+    }
 }
 
 /// Get the machine-wide Metal claim, or refuse if another process holds it.
@@ -125,7 +133,7 @@ fn claim_at(path: &Path) -> Result<MetalClaim, ClaimError> {
         write_holder(&file).map_err(|e| io_error(path, e))?;
     }
     tracing::info!(pid = std::process::id(), path = %path.display(), writable, "Metal claim acquired");
-    Ok(MetalClaim { _file: file })
+    Ok(MetalClaim { file })
 }
 
 fn io_error(path: &Path, source: io::Error) -> ClaimError {

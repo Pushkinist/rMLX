@@ -1,45 +1,10 @@
-// Device-policy tests: `Device::Gpu` here is a selector value passed to pure
-// functions (`resolve_prompt_truncation`, device-arg parsing), never a Metal
-// dispatch. Each such test carries a per-fn `gpu-test-gate: exempt` marker so
-// the shape gate does not treat the value as a GPU test — while any genuinely
-// Metal-driving test added to this file still trips the gate.
+// Device-policy tests: `Device::Gpu` here is a selector value passed to a pure
+// function (`resolve_prompt_truncation`), never a Metal dispatch. Each such
+// test carries a per-fn `gpu-test-gate: exempt` marker so the shape gate does
+// not treat the value as a GPU test — while any genuinely Metal-driving test
+// added to this file still trips the gate.
 use super::*;
 use rmlx_mlx::Device;
-
-// gpu-test-gate: exempt
-#[test]
-fn device_arg_accepts_cpu_and_gpu() {
-    // Valid devices must not return Err.
-    assert!(matches!(
-        match "cpu" {
-            "cpu" => Ok(Device::Cpu),
-            "gpu" => Ok(Device::Gpu),
-            other => Err(anyhow::anyhow!("bad: {other}")),
-        },
-        Ok(Device::Cpu)
-    ));
-    assert!(matches!(
-        match "gpu" {
-            "cpu" => Ok(Device::Cpu),
-            "gpu" => Ok(Device::Gpu),
-            other => Err(anyhow::anyhow!("bad: {other}")),
-        },
-        Ok(Device::Gpu)
-    ));
-}
-
-// gpu-test-gate: exempt
-#[test]
-fn device_arg_rejects_tpu() {
-    let result: anyhow::Result<Device> = match "tpu" {
-        "cpu" => Ok(Device::Cpu),
-        "gpu" => Ok(Device::Gpu),
-        other => Err(anyhow::anyhow!("bad: {other}")),
-    };
-    assert!(result.is_err(), "expected error for 'tpu'");
-    let msg = result.unwrap_err().to_string();
-    assert!(msg.contains("tpu"), "error should mention the bad value");
-}
 
 #[test]
 fn csv_escape_plain_value() {

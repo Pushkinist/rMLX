@@ -3,6 +3,36 @@ use std::str::FromStr;
 use super::*;
 use rmlx_models::kv_cache::{CacheType, CacheTypeSpec};
 
+// ── parse_device ─────────────────────────────────────────────────────────
+// The GPU closure stands in for the Metal claim, so no test takes it.
+
+#[test]
+fn parse_device_cpu_takes_no_claim() {
+    let (device, claim) =
+        device_from_flag("cpu", || panic!("--device cpu must not claim")).expect("cpu parses");
+    assert_eq!(device, Device::Cpu);
+    assert!(claim.is_none());
+}
+
+#[test]
+fn parse_device_gpu_goes_through_the_claim() {
+    let mut claimed = false;
+    let err = device_from_flag("gpu", || {
+        claimed = true;
+        Err(anyhow::anyhow!("claim refused"))
+    })
+    .expect_err("a refused claim yields no GPU device");
+    assert!(claimed, "--device gpu must take the claim");
+    assert!(err.to_string().contains("claim refused"), "{err}");
+}
+
+#[test]
+fn parse_device_rejects_an_unknown_device_without_claiming() {
+    let err = device_from_flag("tpu", || panic!("an unknown device must not claim"))
+        .expect_err("tpu is not a device");
+    assert!(err.to_string().contains("'tpu'"), "{err}");
+}
+
 // ── parse_cache_type ─────────────────────────────────────────────────────
 
 #[test]

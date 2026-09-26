@@ -38,9 +38,13 @@ fn main() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("usage: qwen36_diag <model-dir> [cpu|gpu] [N_GEN]"))?
         .into();
     let dev_str = args.next().unwrap_or_else(|| "cpu".to_owned());
-    let device = match dev_str.as_str() {
-        "gpu" => Device::Gpu,
-        _ => Device::Cpu,
+    // The claim is held until `main` returns, after the last GPU call.
+    let (device, _claim) = match dev_str.as_str() {
+        "gpu" => (
+            Device::Gpu,
+            Some(rmlx_server::try_claim().map_err(|e| anyhow::anyhow!("{e}"))?),
+        ),
+        _ => (Device::Cpu, None),
     };
     let n_gen: usize = args
         .next()

@@ -4,9 +4,8 @@
 //!
 //! [`run_serve`] is the single entry point. It:
 //! 1. Resolves project caps from `projects.toml` (CLI flags override file).
-//! 2. On `--device gpu`, takes the machine-wide Metal claim via [`rmlx_server::try_claim`].
-//! 3. Loads the model (or a multi-model registry) and warms prompt-cache slots.
-//! 4. Launches the Axum HTTP server, then drives the idle-eviction loop until
+//! 2. Loads the model (or a multi-model registry) and warms prompt-cache slots.
+//! 3. Launches the Axum HTTP server, then drives the idle-eviction loop until
 //!    the process is signalled.
 //!
 //! # Public API
@@ -463,7 +462,7 @@ pub(crate) fn run_serve(
     registry_file: Option<&Path>,
     host: &str,
     port: u16,
-    device_str: &str,
+    device: Device,
     kv_quant_override: Option<rmlx_kv_quant::KvQuant>,
     max_ctx_override: Option<i32>,
     idle_timeout_spec: Option<String>,
@@ -638,17 +637,6 @@ pub(crate) fn run_serve(
              on first request (kind + block_size stored for drafter loaders)"
         );
     }
-    // Parse device flag.
-    let device = match device_str {
-        "cpu" => Device::Cpu,
-        "gpu" => Device::Gpu,
-        other => {
-            return Err(anyhow::anyhow!(
-                "--device must be 'cpu' or 'gpu', got '{other}'"
-            ));
-        }
-    };
-
     // Byte-to-byte port of mlx-lm server.py startup —
     // if mx.metal.is_available():
     // wired_limit = mx.device_info()["max_recommended_working_set_size"]

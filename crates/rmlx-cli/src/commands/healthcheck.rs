@@ -21,13 +21,14 @@
 //!
 //! ## MLX safety
 //! Default path (no `--full`) never loads the MLX runtime — safe to run
-//! repeatedly with no Metal context concern. `--full` invokes the smoke probe
-//! which DOES load MLX; the caller is responsible for the single-process
-//! constraint (do not run `--full` while another rMLX instance holds Metal).
+//! repeatedly with no Metal context concern. `--full` takes the Metal claim
+//! for the smoke probes and holds it until the last one ends; when another
+//! process holds the claim, every smoke line is red and names the holder.
 
 use std::path::{Path, PathBuf};
 
-use rmlx_server::{ClaimError, ModelRegistry, RegistryConfig};
+use rmlx_mlx::Device;
+use rmlx_server::{ClaimError, MetalClaim, ModelRegistry, RegistryConfig};
 use tracing::debug;
 
 // ---------------------------------------------------------------------------
@@ -135,8 +136,12 @@ pub(crate) fn run_healthcheck(
 
         // ── 4. Smoke probe (--full only) ──────────────────────────────────────
         if full {
+            let claim = crate::commands::parse::claim_gpu();
             for path in &model_paths {
-                let line = check_smoke(path);
+                let line = match &claim {
+                    Ok((device, claim)) => check_smoke(path, *device, claim),
+                    Err(e) => smoke_refused(path, e),
+                };
                 if line.status == Status::Red {
                     red_checks.push(line.check.clone());
                 }
@@ -382,17 +387,27 @@ fn check_registry(paths: &[PathBuf]) -> Vec<CheckLine> {
     lines
 }
 
-/// Check 4 (--full only): run the existing smoke probe via `rmlx info --probe-smoke`.
-///
-/// Loads MLX — the caller ensures the single-process constraint.
-fn check_smoke(path: &Path) -> CheckLine {
-    use rmlx_metrics::events::EventRecorder;
-    use rmlx_mlx::Device;
-
-    let id = path
-        .file_name()
+fn smoke_id(path: &Path) -> &str {
+    path.file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or("(unknown)");
+        .unwrap_or("(unknown)")
+}
+
+/// Check 4 (--full only) when the Metal claim was refused: the probe does not
+/// run, and the line names the holder.
+fn smoke_refused(path: &Path, refusal: &ClaimError) -> CheckLine {
+    CheckLine::new(
+        format!("smoke:{}", smoke_id(path)),
+        Status::Red,
+        format!("smoke probe not run: {refusal}"),
+    )
+}
+
+/// Check 4 (--full only): run the existing smoke probe via `rmlx info --probe-smoke`.
+fn check_smoke(path: &Path, device: Device, _claim: &MetalClaim) -> CheckLine {
+    use rmlx_metrics::events::EventRecorder;
+
+    let id = smoke_id(path);
 
     // We need a EventRecorder. Use a no-op path under /tmp.
     let run_id = format!("healthcheck-smoke-{id}");
@@ -411,7 +426,7 @@ fn check_smoke(path: &Path) -> CheckLine {
         path,
         false, // probe_forward = false
         true,  // probe_smoke = true
-        Device::Gpu,
+        Some(device),
         None, // kv_quant_override = auto
         None, // max_ctx_override = auto
         &sink,
