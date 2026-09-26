@@ -368,3 +368,22 @@ fn device_flag_accepts_only_cpu_and_gpu() {
         }
     }
 }
+
+/// A refused Metal claim leaves through the flushing exit path with code 11;
+/// other errors and codes pass through.
+#[test]
+fn claim_refusal_maps_to_exit_code_11() {
+    use rmlx_server::ClaimError;
+    let held = crate::commands::parse::check_claim::<()>(Err(ClaimError::AlreadyHeld {
+        holder_pid: Some(4242),
+        holder_command: "rmlx serve".to_owned(),
+        path: std::path::PathBuf::from("lock"),
+    }))
+    .map(|()| 0);
+    assert_eq!(
+        super::exit_code(held).expect("a refusal is an exit code"),
+        11
+    );
+    assert_eq!(super::exit_code(Ok(3)).expect("a code passes through"), 3);
+    assert!(super::exit_code(Err(anyhow::anyhow!("other"))).is_err());
+}

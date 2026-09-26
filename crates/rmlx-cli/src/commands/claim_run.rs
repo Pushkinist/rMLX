@@ -24,7 +24,7 @@ use anyhow::Context as _;
 use rmlx_server::try_claim;
 use tracing::{info, warn};
 
-use crate::commands::parse::exit_if_held;
+use crate::commands::parse::check_claim;
 
 /// How often the wait loop checks whether the child has exited.
 const POLL: Duration = Duration::from_millis(50);
@@ -32,7 +32,7 @@ const POLL: Duration = Duration::from_millis(50);
 /// Take the Metal claim, run `command` while holding it, and return the exit
 /// code to exit with.
 pub(crate) fn run_claim_run(command: &[OsString]) -> anyhow::Result<i32> {
-    let claim = exit_if_held(try_claim())?;
+    let claim = check_claim(try_claim())?;
     let lock = claim
         .as_fd()
         .try_clone_to_owned()

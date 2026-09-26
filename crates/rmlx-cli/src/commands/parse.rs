@@ -13,7 +13,8 @@
 //! - [`ClaimedDevice`] — a device together with the claim a GPU device needs.
 //! - [`claim_gpu`] — the GPU device with the Metal claim. It is the only place
 //!   this binary names the GPU device.
-//! - [`exit_if_held`] — exit with code 11 when another process holds the claim.
+//! - [`check_claim`] — a claim refusal becomes [`ClaimHeld`], which `main`
+//!   exits 11 on.
 //! - [`parse_kv_quant`] — `--kv-quant` string → `Option<KvQuant>`.
 //! - [`parse_kv_preset`] — `--kv-preset` name → [`KvPresetArg`] via the
 //!   static preset table. `"auto"` yields `KvPresetArg::Auto`; unknown names
@@ -70,7 +71,7 @@ impl ClaimedDevice {
 /// Parse the `--device` flag value. `"gpu"` takes the Metal claim; `"cpu"`
 /// takes none.
 pub(crate) fn parse_device(s: &str) -> anyhow::Result<ClaimedDevice> {
-    device_from_flag(s, || exit_if_held(claim_gpu()))
+    device_from_flag(s, || check_claim(claim_gpu()))
 }
 
 fn device_from_flag(
@@ -101,16 +102,24 @@ pub(crate) fn claim_gpu() -> Result<ClaimedDevice, ClaimError> {
     })
 }
 
-/// Exit with code 11 when another process holds the Metal claim; any other
-/// claim error is returned.
-pub(crate) fn exit_if_held<T>(claim: Result<T, ClaimError>) -> anyhow::Result<T> {
+/// Another process holds the Metal claim. `main` reports it and exits 11.
+#[derive(Debug)]
+pub(crate) struct ClaimHeld(ClaimError);
+
+impl std::fmt::Display for ClaimHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for ClaimHeld {}
+
+/// Turn a claim refusal into [`ClaimHeld`], which `main` exits 11 on; any
+/// other claim error is returned as is.
+pub(crate) fn check_claim<T>(claim: Result<T, ClaimError>) -> anyhow::Result<T> {
     match claim {
         Ok(held) => Ok(held),
-        Err(e @ ClaimError::AlreadyHeld { .. }) => {
-            error!(error = %e, "Metal claim held by another process — refusing to start");
-            eprintln!("error: {e}\nrMLX exits with code 11.");
-            std::process::exit(11);
-        }
+        Err(e @ ClaimError::AlreadyHeld { .. }) => Err(ClaimHeld(e).into()),
         Err(e) => {
             error!(
                 error = %e,

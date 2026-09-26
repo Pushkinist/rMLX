@@ -44,12 +44,14 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+use commands::parse::ClaimHeld;
 use rmlx_core::runinfo::make_run_id;
 use rmlx_metrics::events::EventRecorder;
 use startup::{
     init_tracing, print_cache_type_table, print_kv_quant_residency_table, LogLevel, MetricsArg,
 };
 use tracing::info;
+use tracing_appender::non_blocking::WorkerGuard;
 
 use commands::metrics::{dispatch as metrics_dispatch, MetricsCmd};
 
@@ -1794,20 +1796,6 @@ fn refuse_to_measure_off_the_pin(command: &str) -> Result<()> {
     )
 }
 
-#[allow(
-    clippy::expect_used,
-    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
-)]
-#[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or validated before call"
-)]
-#[allow(
-    clippy::cognitive_complexity,
-    clippy::too_many_lines,
-    reason = "fn main() is the top-level CLI dispatch — splitting fragments the \
-              subcommand wiring, which must remain co-located for clap arg resolution"
-)]
 fn main() -> Result<()> {
     // dhat profiler — instantiated FIRST so it covers all subsequent allocations.
     // Dropped at end of main, which triggers the JSON write to dhat-heap.json.
@@ -1855,7 +1843,53 @@ fn main() -> Result<()> {
         }
     }
     let log_guard = init_tracing(&run_id, cli.log, cli.log_cap_mb)?;
+    let outcome = run(cli, &run_id, capture_forces_metrics_off);
+    finish(log_guard, outcome)
+}
 
+/// Leave the process once the log writer has flushed: `exit` runs no
+/// destructor.
+fn finish(log_guard: WorkerGuard, outcome: Result<i32>) -> Result<()> {
+    let code = exit_code(outcome)?;
+    if code == 0 {
+        return Ok(());
+    }
+    drop(log_guard);
+    std::process::exit(code)
+}
+
+/// The exit code for a command's outcome. A refused Metal claim is 11; any
+/// other error is returned.
+fn exit_code(outcome: Result<i32>) -> Result<i32> {
+    match outcome {
+        Ok(code) => Ok(code),
+        Err(e) => match e.downcast::<ClaimHeld>() {
+            Ok(held) => {
+                tracing::error!(error = %held, "Metal claim held by another process — refusing to start");
+                eprintln!("error: {held}\nrMLX exits with code 11.");
+                Ok(11)
+            }
+            Err(e) => Err(e),
+        },
+    }
+}
+
+/// Everything after the log writer starts. Returns the exit code.
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or validated before call"
+)]
+#[allow(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    reason = "run() is the top-level CLI dispatch — splitting fragments the \
+              subcommand wiring, which must remain co-located for clap arg resolution"
+)]
+fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> {
     // Record the nax-GEMM-kernel capability of the MLX this process loaded.
     // `rmlx-metrics` cannot read this itself (see `identity::set_mlx_nax`
     // doc) — `rmlx-cli` is the one binary that links both `rmlx-mlx` and
@@ -1923,14 +1957,14 @@ fn main() -> Result<()> {
     // an `EventRecorder` — otherwise concurrent test subprocesses contend
     // on the workspace `.rmlx/metrics/runs.db` lock.
     if let Cmd::Metrics(cmd) = cli.cmd {
-        return metrics_dispatch(cmd);
+        return metrics_dispatch(cmd).map(|()| 0);
     }
 
     // `rmlx profile …` is a pure file-read admin command — it touches no model
     // and opens no metrics recorder, so it short-circuits like `metrics`.
     if let Cmd::Profile { cmd } = &cli.cmd {
         return match cmd {
-            ProfileCmd::List => commands::run_profile_list(),
+            ProfileCmd::List => commands::run_profile_list().map(|()| 0),
         };
     }
 
@@ -1939,10 +1973,7 @@ fn main() -> Result<()> {
         cmd: ClaimCmd::Run { command },
     } = &cli.cmd
     {
-        let code = commands::claim_run::run_claim_run(command)?;
-        // `exit` runs no destructor; the log writer must flush first.
-        drop(log_guard);
-        std::process::exit(code);
+        return commands::claim_run::run_claim_run(command);
     }
 
     // `rmlx kv-calibrate` runs without opening the EventRecorder. The
@@ -1964,12 +1995,13 @@ fn main() -> Result<()> {
             prompts.as_deref(),
             *mass_threshold,
             *target_mass_budget_floor,
-        );
+        )
+        .map(|()| 0);
     }
 
     // D-class startup site: EventRecorder::open failure is fatal; tracing is
     // already initialised here, so we emit an error event before propagating.
-    let sink = EventRecorder::open(&run_id).map_err(|e| {
+    let sink = EventRecorder::open(run_id).map_err(|e| {
         tracing::error!(error = %e, "D-class startup: metrics EventRecorder::open failed");
         anyhow::anyhow!("metrics open: {e}")
     })?;
@@ -2274,7 +2306,7 @@ fn main() -> Result<()> {
                         "error: --cache-type-k/--cache-type-v requires --model (not --registry)"
                     );
                     eprintln!("see docs/KV_QUANT.md for supported codecs and combinations");
-                    std::process::exit(78);
+                    return Ok(78);
                 }
                 (kv_quant_opt, max_ctx_override)
             };
@@ -2425,7 +2457,7 @@ fn main() -> Result<()> {
             if list_cache_types {
                 print_cache_type_table();
                 print_kv_quant_residency_table();
-                return Ok(());
+                return Ok(0);
             }
             let model = model.expect("clap required_unless_present guarantees model is Some");
             // Always run the cache-type resolver (it loads config + fails
@@ -2473,7 +2505,7 @@ fn main() -> Result<()> {
             )?;
             let code = exit_code.as_i32();
             if code != 0 {
-                std::process::exit(code);
+                return Ok(code);
             }
         }
         Cmd::Healthcheck {
@@ -2503,7 +2535,7 @@ fn main() -> Result<()> {
                 full,
                 human,
             )?;
-            std::process::exit(exit_code);
+            return Ok(exit_code);
         }
         Cmd::Baseline {
             model,
@@ -2640,7 +2672,7 @@ fn main() -> Result<()> {
                 &claimed,
                 &device,
                 max_tokens,
-                &run_id,
+                run_id,
                 &label_str,
                 Some(kv_quant_resolved),
                 max_ctx_override,
@@ -2808,14 +2840,14 @@ fn main() -> Result<()> {
                     &corpus,
                     &claimed,
                     max_tokens,
-                    &run_id,
+                    run_id,
                     git_sha.as_deref(),
                     kv_quant_resolved,
                 )?;
             }
         },
     }
-    Ok(())
+    Ok(0)
 }
 
 #[cfg(test)]

@@ -50,7 +50,7 @@ use sha2::{Digest, Sha256};
 use tracing::{info, instrument, warn};
 
 use crate::commands::calibration_softmax::SoftmaxMassSink;
-use crate::commands::parse::{claim_gpu, exit_if_held, ClaimedDevice};
+use crate::commands::parse::{check_claim, claim_gpu, ClaimedDevice};
 
 /// Default mass coverage threshold for the head_budget recipe.
 const DEFAULT_HEAD_BUDGET_MASS_THRESHOLD: f32 = 0.95;
@@ -306,7 +306,7 @@ fn run_head_budget(
         anyhow::bail!("kv-calibrate --recipe head_budget: no usable prompts after tokenisation");
     }
 
-    let gpu = exit_if_held(claim_gpu())?;
+    let gpu = check_claim(claim_gpu())?;
     let t_load = Instant::now();
     let model = load_qwen3_for_calibration(model_dir, &gpu)?;
     let load_secs = t_load.elapsed().as_secs_f64();
@@ -505,7 +505,7 @@ fn run_softmax_mass(
         anyhow::bail!("kv-calibrate --recipe softmax_mass: no usable prompts after tokenisation");
     }
 
-    let gpu = exit_if_held(claim_gpu())?;
+    let gpu = check_claim(claim_gpu())?;
     let t_load = Instant::now();
     let model = load_qwen3_for_calibration(model_dir, &gpu)?;
     let load_secs = t_load.elapsed().as_secs_f64();
