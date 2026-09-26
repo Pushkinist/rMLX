@@ -129,10 +129,21 @@ fn rmlx_binary() -> PathBuf {
     bin
 }
 
+/// A spawned `rmlx serve` child. `Drop` kills and reaps it, which releases its
+/// Metal claim on every exit path, a failed assertion's unwind included.
+struct ServeGuard(Child);
+
+impl Drop for ServeGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// Spawn `rmlx serve` with the SSD tier on, a single RAM prompt-cache slot, and
-/// the given hermetic `RMLX_HOME`. Returns the child handle.
-fn spawn_serve(bin: &Path, model: &str, port: u16, rmlx_home: &Path) -> Child {
-    Command::new(bin)
+/// the given hermetic `RMLX_HOME`.
+fn spawn_serve(bin: &Path, model: &str, port: u16, rmlx_home: &Path) -> ServeGuard {
+    let child = Command::new(bin)
         .arg("serve")
         .arg("--model")
         .arg(model)
@@ -153,13 +164,8 @@ fn spawn_serve(bin: &Path, model: &str, port: u16, rmlx_home: &Path) -> Child {
         // output live (model load, spill drain, hydrate) for debugging.
         .stderr(std::process::Stdio::inherit())
         .spawn()
-        .expect("spawn rmlx serve")
-}
-
-/// Kill and reap a serve child; its Metal claim is free when this returns.
-fn teardown(mut child: Child) {
-    let _ = child.kill();
-    let _ = child.wait();
+        .expect("spawn rmlx serve");
+    ServeGuard(child)
 }
 
 // ── HTTP helpers (raw HTTP/1.1 over TcpStream — mirrors http_smoke.rs) ───────
@@ -305,8 +311,8 @@ fn ssd_disk_state(rmlx_home: &Path) -> (usize, usize) {
 // instruments the test process, which dispatches no Metal at all; the test also
 // needs `cargo build -p rmlx-cli` first (`cargo test --tests` does not build the
 // binary), spawns `rmlx` itself, which the runner's own Metal claim would
-// refuse, and spends two 180 s readiness waits. The same spill -> restart -> hydrate chain, over the same two
-// prompts, is covered by `make e2e` phase 2a
+// refuse, and spends two 180 s readiness waits. The same spill -> restart ->
+// hydrate chain, over the same two prompts, is covered by `make e2e` phase 2a
 // (`crates/rmlx-cli/tests/e2e/runner.rs`).
 // gpu-test-gate: metal-unscanned  Metal belongs to the spawned serve process.
 #[ignore = "integration: requires RMLX_TEST_MODEL + a real rmlx serve process (Metal)"]
@@ -380,14 +386,14 @@ async fn ssd_cache_survives_server_restart() {
     );
 
     // ── Restart boundary: kill, reap, restart same model + RMLX_HOME ─────────
-    teardown(child);
+    drop(child);
 
     // ── Phase 2: restart + hydrate ──────────────────────────────────────────
     let child2 = spawn_serve(&bin, &model, port, &rmlx_home);
-    if !wait_ready(port, Duration::from_secs(180)).await {
-        teardown(child2);
-        panic!("phase-2 server did not become ready within 180s (see inherited stderr above)");
-    }
+    assert!(
+        wait_ready(port, Duration::from_secs(180)).await,
+        "phase-2 server did not become ready within 180s (see inherited stderr above)"
+    );
 
     // Spilled row must have survived startup prune+evict.
     let after_restart = ssd_disk_state(&rmlx_home);
@@ -406,9 +412,8 @@ async fn ssd_cache_survives_server_restart() {
 
     let ssd_hits = scrape_ssd_hits(port).await.expect("scrape /metrics");
 
-    // Part 4 (step 2 carry-over): scrape /metrics and collect the new
-    // SSD-tier Prometheus data. We collect the body here and defer assertions
-    // until AFTER teardown so the GPU is freed even on assertion failure.
+    // Scrape /metrics and collect the SSD-tier Prometheus data; the assertions
+    // on it run after the server is stopped.
     let metrics_body = http(port, "GET", "/metrics", None)
         .await
         .expect("GET /metrics for SSD assertions")
@@ -430,8 +435,7 @@ async fn ssd_cache_survives_server_restart() {
     }
     eprintln!("--- end SSD section ---");
 
-    // Teardown BEFORE the asserts so the GPU is freed regardless of outcome.
-    teardown(child2);
+    drop(child2);
 
     // ── Cross-restart assertions ────────────────────────────────────────────
     assert!(

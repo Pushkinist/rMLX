@@ -443,10 +443,13 @@ run_case() {
 		${extra_args[@]+"${extra_args[@]}"} >"$CASE_OUT" 2>&1
 	got=$?
 	set -e
-	stop_stubs "$CASE_HOME/stub_bound"
 
 	CASE_BAD=""
 	[ "$got" -ne "$want" ] && CASE_BAD="exit=$got (want $want)"
+	# However the run ended, it stopped the server it started: a server left
+	# alive holds the Metal claim after the harness is gone.
+	note_survivors "$CASE_HOME/stub_bound"
+	stop_stubs "$CASE_HOME/stub_bound"
 	# Only meaningful for a case that got as far as starting a server: one
 	# that refuses before then has no port to have bound.
 	if grep -q '\[server\] starting' "$CASE_OUT"; then
@@ -457,6 +460,16 @@ run_case() {
 	for g in ${greps[@]+"${greps[@]}"}; do
 		grep -qE "$g" "$CASE_OUT" || note_bad "missing /$g/"
 	done
+}
+
+# note_survivors <bound-file> — a failure reason per stub server still alive.
+note_survivors() {
+	[ -f "$1" ] || return 0
+	local pid
+	while read -r pid; do
+		kill -0 "$pid" 2>/dev/null && note_bad "server $pid outlived the harness"
+	done <"$1"
+	return 0
 }
 
 # Add a failure reason to the case being judged.
@@ -1115,6 +1128,53 @@ run_case partial_sampler_events_refused 1 \
 	'GREP:does not say whether the engine ran a sampler'
 no_row normal
 no_row mtp
+verdict
+
+# A run stopped from outside while its server is up — a CI timeout, an operator
+# — stops that server on the way out rather than leaving it on the claim.
+sigterm_case() {
+	CASE_NAME="sigterm_stops_the_server"
+	CASE_WHAT="a killed run takes its server with it"
+	CASE_HOME="$WORK/home_$CASE_NAME"
+	CASE_OUT="$WORK/$CASE_NAME.log"
+	CASE_BAD=""
+	mkdir -p "$CASE_HOME/logs" "$CASE_HOME/metrics/buffer/pending"
+
+	env -i \
+		PATH="$SHIM_DIR:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+		HOME="$WORK" \
+		RMLX_HOME="$CASE_HOME" \
+		VERIFIER_MODEL="$VERIFIER_DIR" \
+		DRAFTER_MODEL="$WORK/drafter" \
+		STUB_TOKENS=8 \
+		STUB_GAP_S=0.05 \
+		STUB_PREFILL_S=5 \
+		STUB_EMITTED=128 \
+		STUB_ELAPSED_MS=2560 \
+		STUB_DECODE_TPS_SEQ='"Some(20.0)"' \
+		STUB_PROMPT_TOKENS=1234 \
+		STUB_BOUND_FLAG="$CASE_HOME/stub_bound" \
+		bash "$FAKE_ROOT/scripts/spec_bench.sh" --port "$PORT" >"$CASE_OUT" 2>&1 &
+	local harness=$!
+
+	local waited=0
+	while [ ! -s "$CASE_HOME/stub_bound" ] && [ "$waited" -lt 200 ]; do
+		/bin/sleep 0.1
+		waited=$((waited + 1))
+	done
+	if [ ! -s "$CASE_HOME/stub_bound" ]; then
+		note_bad "the stub never bound; nothing was stopped"
+		kill "$harness" 2>/dev/null || true
+		wait "$harness" 2>/dev/null || true
+		return 0
+	fi
+
+	kill -TERM "$harness" 2>/dev/null || true
+	wait "$harness" 2>/dev/null || true
+	note_survivors "$CASE_HOME/stub_bound"
+	stop_stubs "$CASE_HOME/stub_bound"
+}
+sigterm_case
 verdict
 
 echo

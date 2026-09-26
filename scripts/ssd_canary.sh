@@ -24,6 +24,19 @@
 
 set -euo pipefail
 
+# The server this run started and has not yet stopped. Any exit — a failed
+# command under `set -e`, an interrupt, a CI timeout — stops it and waits, so no
+# failure leaves it holding the Metal claim.
+LIVE_PID=""
+stop_live_server() {
+    if [[ -n "${LIVE_PID}" ]]; then
+        kill "${LIVE_PID}" 2>/dev/null || true
+        wait "${LIVE_PID}" 2>/dev/null || true
+        LIVE_PID=""
+    fi
+}
+trap stop_live_server EXIT
+
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -294,6 +307,7 @@ bounce_if_stuck() {
     HYDRATE_PANIC_DETECTED=true
     kill "${pid}" 2>/dev/null || true
     wait "${pid}" 2>/dev/null || true
+    LIVE_PID=""
     sleep 3
     RMLX_HOME="${RMLX_HOME}" \
     RMLX_LOG_CAP_MB=500 \
@@ -301,6 +315,7 @@ bounce_if_stuck() {
         > /tmp/ssd_canary_revisit_stdout.txt 2>&1 &
     local new_pid=$!
     eval "${pid_ref}=${new_pid}"
+    LIVE_PID="${new_pid}"
     echo "  [bounce] new server pid=${new_pid}" >&2
     wait_for_server "${new_pid}"
     CONSECUTIVE_ERRORS=0
@@ -526,6 +541,7 @@ RMLX_LOG_CAP_MB=500 \
         > /tmp/ssd_canary_populate_stdout.txt 2>&1 &
 
 POPULATE_PID=$!
+LIVE_PID="${POPULATE_PID}"
 echo "  [server] pid=${POPULATE_PID}" >&2
 wait_for_server "${POPULATE_PID}"
 
@@ -567,6 +583,7 @@ echo "  [server] killing populate server pid=${POPULATE_PID}" >&2
 sleep 5
 kill "${POPULATE_PID}" 2>/dev/null || true
 wait "${POPULATE_PID}" 2>/dev/null || true
+LIVE_PID=""
 sleep 3
 
 # Re-read final metrics after kill (drain may have flushed during the 5s window).
@@ -654,6 +671,7 @@ RMLX_LOG_CAP_MB=500 \
         > /tmp/ssd_canary_revisit_stdout.txt 2>&1 &
 
 REVISIT_PID=$!
+LIVE_PID="${REVISIT_PID}"
 echo "  [server] pid=${REVISIT_PID}" >&2
 wait_for_server "${REVISIT_PID}"
 
@@ -698,6 +716,7 @@ echo "  [server] killing revisit server pid=${REVISIT_PID}" >&2
 sleep 5
 kill "${REVISIT_PID}" 2>/dev/null || true
 wait "${REVISIT_PID}" 2>/dev/null || true
+LIVE_PID=""
 sleep 3
 
 # Re-read final metrics after kill.
@@ -759,6 +778,7 @@ RMLX_LOG_CAP_MB=500 \
         > /tmp/ssd_canary_evict_stdout.txt 2>&1 &
 
 EVICT_PID=$!
+LIVE_PID="${EVICT_PID}"
 echo "  [server] pid=${EVICT_PID}" >&2
 wait_for_server "${EVICT_PID}"
 
@@ -859,6 +879,7 @@ echo "  [server] killing evict server pid=${EVICT_PID}" >&2
 sleep 5
 kill "${EVICT_PID}" 2>/dev/null || true
 wait "${EVICT_PID}" 2>/dev/null || true
+LIVE_PID=""
 sleep 3
 
 # Re-read final index after kill to get post-drain byte count.

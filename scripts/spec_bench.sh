@@ -46,6 +46,19 @@
 
 set -euo pipefail
 
+# The server this run started and has not yet stopped. Any exit — a failed
+# command under `set -e`, an interrupt, a CI timeout — stops it and waits, so no
+# failure leaves it holding the Metal claim.
+LIVE_PID=""
+stop_live_server() {
+    if [[ -n "${LIVE_PID}" ]]; then
+        kill "${LIVE_PID}" 2>/dev/null || true
+        wait "${LIVE_PID}" 2>/dev/null || true
+        LIVE_PID=""
+    fi
+}
+trap stop_live_server EXIT
+
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -603,6 +616,7 @@ RMLX_LOG_CAP_MB=200 \
         > "${SCRATCH_DIR}/normal_stdout.txt" 2>&1 &
 
 SERVER_PID=$!
+LIVE_PID="${SERVER_PID}"
 echo "  [server] pid=${SERVER_PID}" >&2
 
 wait_for_server "${SERVER_PID}"
@@ -669,6 +683,7 @@ done
 echo "  [server] killing pid=${SERVER_PID}" >&2
 kill "${SERVER_PID}" 2>/dev/null || true
 wait "${SERVER_PID}" 2>/dev/null || true
+LIVE_PID=""
 sleep 3
 
 NORMAL_LOG="$(phase_log "${SERVER_PID}")" || NORMAL_LOG=""
@@ -758,6 +773,7 @@ RMLX_LOG_CAP_MB=200 \
         > "${SCRATCH_DIR}/mtp_stdout.txt" 2>&1 &
 
 SERVER_PID=$!
+LIVE_PID="${SERVER_PID}"
 echo "  [server] pid=${SERVER_PID}" >&2
 
 wait_for_server "${SERVER_PID}"
@@ -809,6 +825,7 @@ done
 echo "  [server] killing speculative server pid=${SERVER_PID}" >&2
 kill "${SERVER_PID}" 2>/dev/null || true
 wait "${SERVER_PID}" 2>/dev/null || true
+LIVE_PID=""
 sleep 3
 
 # The log this phase's server created. No fallback to "the newest one": a
