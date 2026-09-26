@@ -1047,7 +1047,29 @@ check "a view that binds every field passes, and a .. outside it is not refused"
     "^view-fns 1$" match-sites --threshold 2
 check "the view is one more site" "${T}" 0 "^match-sites 4$" match-sites --threshold 2
 
-# 52 — the real tree, pinned exactly. One run, every figure compared, and
+# 52 — a slot bound to `_v` in `KvStorage::view` is refused (exit 1), with its
+# line: only the scalar knobs may be discarded, so a field name outside that
+# fixed set fails closed. The fixture's first variant is renamed `IsoV3`.
+T="${WORK}/viewdiscard"; build_tree "${T}"
+for f in "${STORAGE_REL}" "${UPDATE_REL}"; do
+    sed -e 's/Alpha/IsoV3/g' "${T}/${f}" >"${T}/${f}.new" && mv "${T}/${f}.new" "${T}/${f}"
+done
+cat >>"${T}/${STORAGE_REL}" <<'EOF'
+impl KvStorage {
+    fn view(&self) -> View<'_> {
+        match self {
+            KvStorage::IsoV3 { k, v: _v } => View([Some(k), None]),
+            KvStorage::Beta { k, v, bits: _ } => View([Some(k), Some(v)]),
+            KvStorage::Gamma { k } => View([Some(k), None]),
+            KvStorage::Delta { state } => View([Some(state), None]),
+        }
+    }
+}
+EOF
+check "a slot discarded in KvStorage::view is refused, with its line" "${T}" 1 \
+    "^refused: ${STORAGE_REL}:19 the field \`v\` bound to \`_\` in KvStorage::view" match-sites
+
+# 53 — the real tree, pinned exactly. One run, every figure compared, and
 # each failure prints the figure beside its pin and what to do.
 REAL_PINS="match-sites=11 forcing-sites=11 subset-sites=154 table-sites=2 descriptor-fns=1 view-fns=1"
 pin_advice() { # pin_advice NAME

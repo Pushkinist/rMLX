@@ -33,14 +33,19 @@ fn rows(seq: i32, seed: u64) -> (Array, Array) {
 }
 
 /// Append one chunk and [`DECODE_STEPS`] single tokens with `in_prefill`
-/// false.
+/// false, on the CPU.
 pub(super) fn fill(cache: &mut KvCache, quant: KvQuant) {
+    fill_on(cache, quant, Device::Cpu);
+}
+
+/// [`fill`] on `device`.
+pub(super) fn fill_on(cache: &mut KvCache, quant: KvQuant, device: Device) {
     let mut sink = Vec::new();
     let (k, v) = rows(CHUNK_SEQ, TEST_SEED);
-    append(cache, quant, &k, &v, &mut sink, Device::Cpu);
+    append(cache, quant, &k, &v, &mut sink, device);
     for step in 1..=DECODE_STEPS {
         let (k, v) = rows(1, TEST_SEED.wrapping_add(step));
-        append(cache, quant, &k, &v, &mut sink, Device::Cpu);
+        append(cache, quant, &k, &v, &mut sink, device);
     }
 }
 

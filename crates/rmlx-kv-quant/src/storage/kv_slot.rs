@@ -2,9 +2,9 @@
 //! `KvStorage` sites reach through [`KvStorage::view`](super::KvStorage::view).
 //!
 //! `KvStore` is implemented once per store type (the width stores once for all
-//! widths). Every `Option<Store>` slot gets its `KvSlot` from the one blanket
-//! impl. Only `MixedKvState` and the three paged slot types have their own
-//! `KvSlot` impl, because an empty slot of theirs is not geometry-only.
+//! widths, a boxed store through its box). Every `Option<Store>` slot gets its
+//! `KvSlot` from the one blanket impl. Only `MixedKvState` has its own `KvSlot`
+//! impl, because its payload is not an `Option`.
 //!
 //! None of these calls is on the per-token decode math: they serve the byte
 //! total, the graph flush, the SSD spill decision and the test probes.
@@ -19,14 +19,19 @@ use super::{
 use crate::mixed_quant::MixedKvState;
 use crate::paged::{PagedKStorage, PagedPlanarVStorage, PagedVStorage};
 
-/// The operations every packed KV store type has.
+/// The operations every KV store type has.
 pub(crate) trait KvStore {
+    /// True when an empty slot of this store, as a layer's first slot, leaves
+    /// the layer with only its geometry to persist. The paged writer
+    /// serialises its own empty state, so the paged stores say `false`.
+    const EMPTY_IS_GEOMETRY_ONLY: bool;
     /// Bytes the store holds. GPU buffers count their full allocation.
     fn bytes(&self) -> u64;
     /// Evaluate the pending MLX graph of the GPU arrays the store holds.
     fn eval(&self) -> Result<()>;
-    /// Dequantize the filled sequence to flat f32.
-    fn dequant_f32(&self, device: Device) -> Result<Vec<f32>>;
+    /// Dequantize the filled sequence to flat f32. `None` when the store has
+    /// no CPU dequant.
+    fn dequant_f32(&self, device: Device) -> Option<Result<Vec<f32>>>;
 }
 
 /// One store slot of a `KvStorage` variant, filled or empty.
@@ -51,7 +56,7 @@ impl<T: KvStore> KvSlot for Option<T> {
     }
 
     fn geometry_only(&self) -> bool {
-        self.is_none()
+        self.is_none() && T::EMPTY_IS_GEOMETRY_ONLY
     }
 
     fn resident_bytes(&self) -> u64 {
@@ -63,7 +68,7 @@ impl<T: KvStore> KvSlot for Option<T> {
     }
 
     fn dequant_f32(&self, device: Device) -> Option<Result<Vec<f32>>> {
-        self.as_ref().map(|store| store.dequant_f32(device))
+        self.as_ref().and_then(|store| store.dequant_f32(device))
     }
 }
 
@@ -90,20 +95,30 @@ impl KvSlot for MixedKvState {
     }
 }
 
+impl<T: KvStore> KvStore for Box<T> {
+    const EMPTY_IS_GEOMETRY_ONLY: bool = T::EMPTY_IS_GEOMETRY_ONLY;
+
+    fn bytes(&self) -> u64 {
+        T::bytes(self)
+    }
+
+    fn eval(&self) -> Result<()> {
+        T::eval(self)
+    }
+
+    fn dequant_f32(&self, device: Device) -> Option<Result<Vec<f32>>> {
+        T::dequant_f32(self, device)
+    }
+}
+
 // The paged pages are evaluated by the `slice_update` chain of `write_page`,
-// so `eval` has nothing to flush.
+// so `eval` has nothing to flush, and no probe dequantizes them.
 
-impl KvSlot for Option<PagedKStorage> {
-    fn is_filled(&self) -> bool {
-        self.is_some()
-    }
+impl KvStore for PagedKStorage {
+    const EMPTY_IS_GEOMETRY_ONLY: bool = false;
 
-    fn geometry_only(&self) -> bool {
-        false
-    }
-
-    fn resident_bytes(&self) -> u64 {
-        self.as_ref().map_or(0, PagedKStorage::resident_bytes)
+    fn bytes(&self) -> u64 {
+        self.resident_bytes()
     }
 
     fn eval(&self) -> Result<()> {
@@ -115,17 +130,11 @@ impl KvSlot for Option<PagedKStorage> {
     }
 }
 
-impl KvSlot for Option<Box<PagedVStorage>> {
-    fn is_filled(&self) -> bool {
-        self.is_some()
-    }
+impl KvStore for PagedVStorage {
+    const EMPTY_IS_GEOMETRY_ONLY: bool = false;
 
-    fn geometry_only(&self) -> bool {
-        false
-    }
-
-    fn resident_bytes(&self) -> u64 {
-        self.as_ref().map_or(0, |store| store.resident_bytes())
+    fn bytes(&self) -> u64 {
+        self.resident_bytes()
     }
 
     fn eval(&self) -> Result<()> {
@@ -137,17 +146,11 @@ impl KvSlot for Option<Box<PagedVStorage>> {
     }
 }
 
-impl KvSlot for Option<Box<PagedPlanarVStorage>> {
-    fn is_filled(&self) -> bool {
-        self.is_some()
-    }
+impl KvStore for PagedPlanarVStorage {
+    const EMPTY_IS_GEOMETRY_ONLY: bool = false;
 
-    fn geometry_only(&self) -> bool {
-        false
-    }
-
-    fn resident_bytes(&self) -> u64 {
-        self.as_ref().map_or(0, |store| store.resident_bytes())
+    fn bytes(&self) -> u64 {
+        self.resident_bytes()
     }
 
     fn eval(&self) -> Result<()> {
@@ -167,6 +170,8 @@ fn eval_arrays(arrays: &[&Option<Array>]) -> Result<()> {
 }
 
 impl KvStore for QuantK {
+    const EMPTY_IS_GEOMETRY_ONLY: bool = true;
+
     fn bytes(&self) -> u64 {
         self.byte_size()
     }
@@ -175,13 +180,17 @@ impl KvStore for QuantK {
         eval_arrays(&[&self.gpu_codes_buf, &self.gpu_scales_buf])
     }
 
-    fn dequant_f32(&self, device: Device) -> Result<Vec<f32>> {
-        self.dequantize_choice(device, Dtype::F32)
-            .map(|(flat, _)| flat)
+    fn dequant_f32(&self, device: Device) -> Option<Result<Vec<f32>>> {
+        Some(
+            self.dequantize_choice(device, Dtype::F32)
+                .map(|(flat, _)| flat),
+        )
     }
 }
 
 impl KvStore for QuantV {
+    const EMPTY_IS_GEOMETRY_ONLY: bool = true;
+
     fn bytes(&self) -> u64 {
         self.byte_size()
     }
@@ -190,13 +199,17 @@ impl KvStore for QuantV {
         eval_arrays(&[&self.gpu_codes_buf, &self.gpu_scales_buf])
     }
 
-    fn dequant_f32(&self, device: Device) -> Result<Vec<f32>> {
-        self.dequantize_choice(device, Dtype::F32)
-            .map(|(flat, _)| flat)
+    fn dequant_f32(&self, device: Device) -> Option<Result<Vec<f32>>> {
+        Some(
+            self.dequantize_choice(device, Dtype::F32)
+                .map(|(flat, _)| flat),
+        )
     }
 }
 
 impl<const BITS: u8> KvStore for QuantKTurbo<BITS> {
+    const EMPTY_IS_GEOMETRY_ONLY: bool = true;
+
     fn bytes(&self) -> u64 {
         self.byte_size()
     }
@@ -205,13 +218,17 @@ impl<const BITS: u8> KvStore for QuantKTurbo<BITS> {
         eval_arrays(&[&self.gpu_codes_buf, &self.gpu_scales_buf])
     }
 
-    fn dequant_f32(&self, device: Device) -> Result<Vec<f32>> {
-        self.dequantize_choice(device, Dtype::F32)
-            .map(|(flat, _)| flat)
+    fn dequant_f32(&self, device: Device) -> Option<Result<Vec<f32>>> {
+        Some(
+            self.dequantize_choice(device, Dtype::F32)
+                .map(|(flat, _)| flat),
+        )
     }
 }
 
 impl KvStore for QuantPlanarK {
+    const EMPTY_IS_GEOMETRY_ONLY: bool = true;
+
     fn bytes(&self) -> u64 {
         self.byte_size()
     }
@@ -224,13 +241,17 @@ impl KvStore for QuantPlanarK {
         ])
     }
 
-    fn dequant_f32(&self, device: Device) -> Result<Vec<f32>> {
-        self.dequantize_choice(device, Dtype::F32)
-            .map(|(flat, _)| flat)
+    fn dequant_f32(&self, device: Device) -> Option<Result<Vec<f32>>> {
+        Some(
+            self.dequantize_choice(device, Dtype::F32)
+                .map(|(flat, _)| flat),
+        )
     }
 }
 
 impl KvStore for QuantPlanarV {
+    const EMPTY_IS_GEOMETRY_ONLY: bool = true;
+
     fn bytes(&self) -> u64 {
         self.byte_size()
     }
@@ -243,9 +264,11 @@ impl KvStore for QuantPlanarV {
         ])
     }
 
-    fn dequant_f32(&self, device: Device) -> Result<Vec<f32>> {
-        self.dequantize_choice(device, Dtype::F32)
-            .map(|(flat, _)| flat)
+    fn dequant_f32(&self, device: Device) -> Option<Result<Vec<f32>>> {
+        Some(
+            self.dequantize_choice(device, Dtype::F32)
+                .map(|(flat, _)| flat),
+        )
     }
 }
 
@@ -254,6 +277,8 @@ impl KvStore for QuantPlanarV {
 // evaluates them when a kernel reads them.
 
 impl<const BITS: u8> KvStore for QuantIsoK<BITS> {
+    const EMPTY_IS_GEOMETRY_ONLY: bool = true;
+
     fn bytes(&self) -> u64 {
         self.byte_size()
     }
@@ -262,12 +287,14 @@ impl<const BITS: u8> KvStore for QuantIsoK<BITS> {
         Ok(())
     }
 
-    fn dequant_f32(&self, _device: Device) -> Result<Vec<f32>> {
-        self.dequant()
+    fn dequant_f32(&self, _device: Device) -> Option<Result<Vec<f32>>> {
+        Some(self.dequant())
     }
 }
 
 impl<const BITS: u8> KvStore for QuantIsoV<BITS> {
+    const EMPTY_IS_GEOMETRY_ONLY: bool = true;
+
     fn bytes(&self) -> u64 {
         self.byte_size()
     }
@@ -276,12 +303,14 @@ impl<const BITS: u8> KvStore for QuantIsoV<BITS> {
         Ok(())
     }
 
-    fn dequant_f32(&self, _device: Device) -> Result<Vec<f32>> {
-        self.dequant()
+    fn dequant_f32(&self, _device: Device) -> Option<Result<Vec<f32>>> {
+        Some(self.dequant())
     }
 }
 
 impl<const BITS: u8> KvStore for QuantRotorK<BITS> {
+    const EMPTY_IS_GEOMETRY_ONLY: bool = true;
+
     fn bytes(&self) -> u64 {
         self.byte_size()
     }
@@ -290,12 +319,14 @@ impl<const BITS: u8> KvStore for QuantRotorK<BITS> {
         Ok(())
     }
 
-    fn dequant_f32(&self, _device: Device) -> Result<Vec<f32>> {
-        self.dequant()
+    fn dequant_f32(&self, _device: Device) -> Option<Result<Vec<f32>>> {
+        Some(self.dequant())
     }
 }
 
 impl<const BITS: u8> KvStore for QuantRotorV<BITS> {
+    const EMPTY_IS_GEOMETRY_ONLY: bool = true;
+
     fn bytes(&self) -> u64 {
         self.byte_size()
     }
@@ -304,7 +335,7 @@ impl<const BITS: u8> KvStore for QuantRotorV<BITS> {
         Ok(())
     }
 
-    fn dequant_f32(&self, _device: Device) -> Result<Vec<f32>> {
-        self.dequant()
+    fn dequant_f32(&self, _device: Device) -> Option<Result<Vec<f32>>> {
+        Some(self.dequant())
     }
 }

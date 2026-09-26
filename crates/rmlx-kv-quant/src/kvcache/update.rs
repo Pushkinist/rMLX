@@ -1283,7 +1283,8 @@ impl KvCache {
         Ok(())
     }
 
-    /// Force evaluation of any pending MLX lazy operations in the KV buffers.
+    /// Force evaluation of the pending MLX graph of the KV buffers. The iso V
+    /// GPU buffers and the rotor K GPU ring are not evaluated here.
     pub fn eval_gpu_state(&self) -> Result<()> {
         // Rotating ring buffer holds K/V on its own arrays.
         if let Some(ref rot) = self.rotating {
@@ -1672,10 +1673,9 @@ impl KvCache {
     /// this, the drain thread's serialize fails with
     /// `There is no Stream(gpu, N) in current thread`.
     pub fn eval_for_spill(&self) -> Result<()> {
-        // Delegate to the complete GPU-state materializer (handles every storage
-        // variant + rotating ring + decode_fp16/prefill_raw scratch). Called on
-        // the inference thread by the spill sinks so the drain thread —
-        // which has no Metal stream — only copies already-evaluated host bytes.
+        // `eval_gpu_state` evaluates the GPU arrays of the store slots, the
+        // rotating ring and the decode_fp16/prefill_raw scratch. It does not
+        // evaluate the iso V GPU buffers or the rotor K GPU ring.
         self.eval_gpu_state()
     }
 

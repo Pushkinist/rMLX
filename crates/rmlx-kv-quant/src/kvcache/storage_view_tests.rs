@@ -10,6 +10,9 @@
 //! changes the byte total of the filled storage.
 //!
 //! `is_geometry_only` has its own old copy in `max_seq_accessor_tests.rs`.
+//!
+//! The last test is Metal-only: after `eval_gpu_state` every `gpu_*` buffer
+//! a store holds is evaluated.
 #![allow(
     clippy::too_many_lines,
     clippy::match_same_arms,
@@ -17,18 +20,19 @@
 )]
 
 use super::core::KvCache;
-use super::deep_clone_digest_tests::fill;
+use super::deep_clone_digest_tests::{fill, fill_on};
 use super::store_bytes_tests::TEST_MAX_SEQ;
 use crate::paged::{PagedKStorage, PagedPlanarVStorage, PagedVStorage};
 use crate::storage::{
-    KvStorage, QuantIsoK3, QuantIsoK4, QuantIsoV3, QuantIsoV4, QuantK, QuantKTurbo3, QuantKTurbo4,
-    QuantPlanarK, QuantPlanarV, QuantRotorK3, QuantRotorK4, QuantRotorV3, QuantRotorV4, QuantV,
+    KvStorage, QuantIsoK3, QuantIsoK4, QuantIsoV3, QuantIsoV4, QuantK, QuantKTurbo, QuantKTurbo3,
+    QuantKTurbo4, QuantPlanarK, QuantPlanarV, QuantRotorK3, QuantRotorK4, QuantRotorV3,
+    QuantRotorV4, QuantV,
 };
-use crate::test_utils::env_lock;
+use crate::test_utils::{env_lock, skip_if_no_gpu_env};
 use crate::{KvQuant, ALL_KV_QUANTS};
 use rmlx_core::error::Result;
 use rmlx_core::DispatchPolicy;
-use rmlx_mlx::{Device, Dtype};
+use rmlx_mlx::{Array, Device, Dtype};
 
 fn old_resident_bytes(storage: &KvStorage) -> u64 {
     match storage {
@@ -481,4 +485,145 @@ fn eval_gpu_state_flushes_every_filled_codec() {
     paged_cache(paged_with_pages())
         .eval_gpu_state()
         .expect("paged: eval_gpu_state");
+}
+
+type Buffers<'a> = Vec<(&'static str, &'a Option<Array>)>;
+
+fn affine_k(store: Option<&QuantK>) -> Buffers<'_> {
+    store
+        .iter()
+        .flat_map(|s| {
+            [
+                ("QuantK codes", &s.gpu_codes_buf),
+                ("QuantK scales", &s.gpu_scales_buf),
+            ]
+        })
+        .collect()
+}
+
+fn turbo_v(store: Option<&QuantV>) -> Buffers<'_> {
+    store
+        .iter()
+        .flat_map(|s| {
+            [
+                ("QuantV codes", &s.gpu_codes_buf),
+                ("QuantV scales", &s.gpu_scales_buf),
+            ]
+        })
+        .collect()
+}
+
+fn turbo_k<const BITS: u8>(store: Option<&QuantKTurbo<BITS>>) -> Buffers<'_> {
+    store
+        .iter()
+        .flat_map(|s| {
+            [
+                ("QuantKTurbo codes", &s.gpu_codes_buf),
+                ("QuantKTurbo scales", &s.gpu_scales_buf),
+            ]
+        })
+        .collect()
+}
+
+fn planar_k(store: Option<&QuantPlanarK>) -> Buffers<'_> {
+    store
+        .iter()
+        .flat_map(|s| {
+            [
+                ("QuantPlanarK codes", &s.gpu_codes_buf),
+                ("QuantPlanarK scales", &s.gpu_scales_buf),
+                ("QuantPlanarK rotations", &s.gpu_rotations_buf),
+            ]
+        })
+        .collect()
+}
+
+fn planar_v(store: Option<&QuantPlanarV>) -> Buffers<'_> {
+    store
+        .iter()
+        .flat_map(|s| {
+            [
+                ("QuantPlanarV codes", &s.gpu_codes_buf),
+                ("QuantPlanarV scales", &s.gpu_scales_buf),
+                ("QuantPlanarV rotations", &s.gpu_rotations_buf),
+            ]
+        })
+        .collect()
+}
+
+/// Every `gpu_*` buffer of the stores whose `eval` flushes it, read from the
+/// store fields and not from the `eval` bodies, so a buffer an `eval` body
+/// leaves out is still listed here. The iso and rotor stores, `Mixed` and the
+/// paged pages are not listed: their `eval` flushes no `gpu_*` field.
+fn gpu_buffers(storage: &KvStorage) -> Buffers<'_> {
+    match storage {
+        KvStorage::K8V4 { k, v }
+        | KvStorage::K8VTurbo3 { k, v }
+        | KvStorage::K8VTurbo3Tcq { k, v }
+        | KvStorage::K8VTurbo2 { k, v }
+        | KvStorage::K8VTurbo2Tcq { k, v } => [affine_k(k.as_ref()), turbo_v(v.as_ref())].concat(),
+        KvStorage::K8V8 { k, v } => [affine_k(k.as_ref()), affine_k(v.as_ref())].concat(),
+        KvStorage::Planar { k, v, bits: _ } => {
+            [affine_k(k.as_ref()), planar_v(v.as_ref())].concat()
+        }
+        KvStorage::PlanarK { k } => planar_k(k.as_ref()),
+        KvStorage::TurboSym3 { k, v } => [turbo_k(k.as_ref()), turbo_v(v.as_ref())].concat(),
+        KvStorage::TurboSym4 { k, v } => [turbo_k(k.as_ref()), turbo_v(v.as_ref())].concat(),
+        KvStorage::IsoV3 { k, v: _ }
+        | KvStorage::IsoV4 { k, v: _ }
+        | KvStorage::RotorV3 { k, v: _ }
+        | KvStorage::RotorV4 { k, v: _ } => affine_k(k.as_ref()),
+        KvStorage::RotorKAsym3 { v, .. } | KvStorage::RotorKAsym4 { v, .. } => turbo_v(v.as_ref()),
+        KvStorage::None {}
+        | KvStorage::Mixed { .. }
+        | KvStorage::Paged { .. }
+        | KvStorage::IsoSym3 { .. }
+        | KvStorage::IsoSym4 { .. }
+        | KvStorage::IsoKOnly3 { .. }
+        | KvStorage::IsoKOnly4 { .. }
+        | KvStorage::RotorSym3 { .. }
+        | KvStorage::RotorSym4 { .. }
+        | KvStorage::RotorKOnly3 { .. }
+        | KvStorage::RotorKOnly4 { .. } => Vec::new(),
+    }
+}
+
+/// After `eval_gpu_state`, every `gpu_*` buffer a Metal fill left in a store
+/// is materialised. A store `eval` that leaves one buffer out leaves it an
+/// unevaluated graph node.
+///
+/// Metal-only: a CPU fill builds no `gpu_*` buffer, so on the CPU this reads
+/// nothing.
+#[test]
+#[ignore = "GPU Metal context — run via `make gpu-test CRATE=rmlx-kv-quant FILTER=storage_view`"]
+#[allow(
+    clippy::expect_used,
+    reason = "test driver: the panic names the codec and the buffer"
+)]
+fn eval_gpu_state_materialises_every_gpu_buffer_of_every_codec() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    let _guard = env_lock();
+    let mut checked = 0_usize;
+    for &quant in ALL_KV_QUANTS {
+        let mut cache = KvCache::with_quant_max_seq(quant, TEST_MAX_SEQ);
+        fill_on(&mut cache, quant, Device::Gpu);
+        cache
+            .eval_gpu_state()
+            .unwrap_or_else(|err| panic!("{quant}: eval_gpu_state failed: {err}"));
+        for (buffer, array) in gpu_buffers(&cache.storage) {
+            let Some(array) = array else { continue };
+            let available = array.is_available().expect("is_available");
+            assert!(
+                available,
+                "{quant}: {buffer} is not evaluated after eval_gpu_state"
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked > 0,
+        "no Metal fill left a gpu_* buffer, so this test read nothing"
+    );
 }

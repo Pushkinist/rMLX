@@ -24,8 +24,9 @@ Four modes, each printing one figure the restructure is judged on:
   row inherits facts nobody stated, and the site figure cannot see it. It
   prints `descriptor-fns N`, the number of those fns it read, so a renamed fn
   reads 0 and not a clean scan. It also exits 1 when `KvStorage::view` holds a
-  `..`: an arm with a rest pattern leaves a new field out of every read-only
-  site the view serves. `view-fns N` counts those fns.
+  `..`, or binds to `_` a field that is not a scalar knob (`bits`, `v_bits`,
+  `v_group_size`, `quant`): either leaves a field out of every read-only site
+  the view serves. `view-fns N` counts those fns.
 
   Known false positives: a `use` inside one fn applies to the whole file, so
   a glob import there makes a same-named variant elsewhere in the file count;
@@ -461,15 +462,23 @@ def check_descriptors(sources: dict[str, str], enums: dict[str, list[str]]) -> i
 VIEW_FN = re.compile(r"\bfn\s+view\s*[<(]")
 #: A rest pattern or a struct-update base: any `..` that is not `..=`.
 REST = re.compile(r"\.\.(?!=)")
+#: A field bound to `_` or to an `_`-prefixed name: `field: _`, `field: _x`.
+DISCARDED_FIELD = re.compile(r"\b([a-z_]\w*)\s*(?<!:):(?!:)\s*_\w*\b")
+#: The scalar knobs a variant carries beside its slots. The view may discard
+#: them; a field outside this set is a slot or state, and discarding it leaves
+#: it out of every read-only site the view serves.
+VIEW_KNOBS = frozenset({"bits", "v_bits", "v_group_size", "quant"})
 
 
 def check_views(sources: dict[str, str], enums: dict[str, list[str]]) -> int:
-    """Refuse a `..` in `KvStorage::view`, and return how many of those fns
-    the scan read.
+    """Refuse a `..` in `KvStorage::view`, and a field discarded there that
+    is not one of `VIEW_KNOBS`. Return how many of those fns the scan read.
 
     An arm with `..` compiles when a field is added to its variant, so the new
     field is left out of every read-only site the view serves with no error
-    anywhere. The count lets the real-tree pin see a renamed fn.
+    anywhere. An arm that binds a slot to `_` does the same to that slot. The
+    knob set is fixed, so an unknown field name fails closed. The count lets
+    the real-tree pin see a renamed fn.
     """
     found = 0
     for rel, blanked in sources.items():
@@ -481,7 +490,8 @@ def check_views(sources: dict[str, str], enums: dict[str, list[str]]) -> int:
             if brace < 0:
                 continue
             found += 1
-            rest = REST.search(blanked, brace, block_end(blanked, brace))
+            end = block_end(blanked, brace)
+            rest = REST.search(blanked, brace, end)
             if rest:
                 refuse_in(
                     rel,
@@ -490,6 +500,15 @@ def check_views(sources: dict[str, str], enums: dict[str, list[str]]) -> int:
                     "KvStorage::view",
                     "each arm must bind every field",
                 )
+            for bound in DISCARDED_FIELD.finditer(blanked, brace, end):
+                if bound.group(1) not in VIEW_KNOBS:
+                    refuse_in(
+                        rel,
+                        blanked.count("\n", 0, bound.start()) + 1,
+                        f"the field `{bound.group(1)}` bound to `_`",
+                        "KvStorage::view",
+                        "only the scalar knobs " + ", ".join(sorted(VIEW_KNOBS)) + " may be discarded",
+                    )
     return found
 
 
