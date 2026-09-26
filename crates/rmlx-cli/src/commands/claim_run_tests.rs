@@ -7,7 +7,7 @@
 )]
 
 use super::*;
-use std::fs::File;
+use std::fs::{File, TryLockError};
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::Instant;
@@ -16,10 +16,19 @@ fn sh(script: &str) -> Vec<OsString> {
     vec!["/bin/sh".into(), "-c".into(), script.into()]
 }
 
-fn temp_lock(dir: &Path) -> File {
+fn temp_lock(dir: &Path) -> OwnedFd {
     let file = File::create(dir.join("lock")).unwrap();
     file.lock().unwrap();
-    file
+    OwnedFd::from(file)
+}
+
+fn locked_elsewhere(dir: &Path) -> bool {
+    let probe = File::open(dir.join("lock")).unwrap();
+    match probe.try_lock() {
+        Ok(()) => false,
+        Err(TryLockError::WouldBlock) => true,
+        Err(TryLockError::Error(e)) => panic!("lock probe: {e}"),
+    }
 }
 
 fn wait_for(path: &Path, limit: Duration) -> bool {
@@ -33,32 +42,47 @@ fn wait_for(path: &Path, limit: Duration) -> bool {
     false
 }
 
+/// The child reads its stdin to the end, which does not block, and holds the
+/// lock after this process has let go of every copy of it.
 #[test]
 fn claim_run_child_holds_the_lock() {
     let dir = tempfile::tempdir().unwrap();
+    let ready = dir.path().join("ready");
+    let go = dir.path().join("go");
+    let command = sh(&format!(
+        "cat >/dev/null; touch {ready}; i=0; \
+         while [ ! -e {go} ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done",
+        ready = ready.display(),
+        go = go.display(),
+    ));
     let lock = temp_lock(dir.path());
     let (_sender, signals) = mpsc::channel();
-    let fd = lock.as_raw_fd();
-    let code = run_holding(
-        lock.as_fd(),
-        &sh(&format!("test -e /dev/fd/{fd}")),
-        &signals,
-    )
-    .unwrap();
-    assert_eq!(code, 0, "the child must inherit the claim fd {fd}");
+    let runner = std::thread::spawn(move || run_holding(lock, &command, &signals));
+
+    assert!(
+        wait_for(&ready, Duration::from_secs(10)),
+        "the child's stdin read blocked"
+    );
+    let held_by_child = locked_elsewhere(dir.path());
+    File::create(&go).unwrap();
+    assert_eq!(runner.join().unwrap().unwrap(), 0);
+    assert!(held_by_child, "the child must hold the lock");
+    assert!(
+        !locked_elsewhere(dir.path()),
+        "the lock must be free once the child exits"
+    );
 }
 
 #[test]
 fn claim_run_exits_with_child_status() {
     let dir = tempfile::tempdir().unwrap();
-    let lock = temp_lock(dir.path());
     let (_sender, signals) = mpsc::channel();
     assert_eq!(
-        run_holding(lock.as_fd(), &sh("exit 7"), &signals).unwrap(),
+        run_holding(temp_lock(dir.path()), &sh("exit 7"), &signals).unwrap(),
         7
     );
     assert_eq!(
-        run_holding(lock.as_fd(), &sh("kill -TERM $$"), &signals).unwrap(),
+        run_holding(temp_lock(dir.path()), &sh("kill -TERM $$"), &signals).unwrap(),
         128 + libc::SIGTERM,
         "a child killed by a signal exits 128 + the signal"
     );
@@ -67,9 +91,8 @@ fn claim_run_exits_with_child_status() {
 #[test]
 fn claim_run_refuses_an_empty_command() {
     let dir = tempfile::tempdir().unwrap();
-    let lock = temp_lock(dir.path());
     let (_sender, signals) = mpsc::channel();
-    let err = run_holding(lock.as_fd(), &[], &signals).unwrap_err();
+    let err = run_holding(temp_lock(dir.path()), &[], &signals).unwrap_err();
     assert!(err.to_string().contains("no command"), "{err}");
 }
 
@@ -97,7 +120,7 @@ fn claim_run_forwards_sigterm() {
     ));
     let lock = temp_lock(dir.path());
     let (sender, signals) = mpsc::channel();
-    let runner = std::thread::spawn(move || run_holding(lock.as_fd(), &command, &signals));
+    let runner = std::thread::spawn(move || run_holding(lock, &command, &signals));
 
     assert!(
         wait_for(&ready, Duration::from_secs(10)),
@@ -111,4 +134,28 @@ fn claim_run_forwards_sigterm() {
         wait_for(&marker, Duration::from_secs(5)),
         "SIGTERM must reach the child's whole process group"
     );
+}
+
+/// Each forwarded signal sent to this process arrives on the channel instead
+/// of acting on the process.
+#[test]
+fn claim_run_receives_sigterm_sigint_and_sighup() {
+    let signals = forward_signals().unwrap();
+    let pid = std::process::id().to_string();
+    for (name, number) in [
+        ("TERM", libc::SIGTERM),
+        ("INT", libc::SIGINT),
+        ("HUP", libc::SIGHUP),
+    ] {
+        let sent = Command::new("/bin/kill")
+            .args([format!("-{name}"), pid.clone()])
+            .status()
+            .unwrap();
+        assert!(sent.success(), "kill -{name} failed");
+        assert_eq!(
+            signals.recv_timeout(Duration::from_secs(5)),
+            Ok(number),
+            "SIG{name} must reach the channel"
+        );
+    }
 }

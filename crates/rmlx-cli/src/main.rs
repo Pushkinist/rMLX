@@ -1678,12 +1678,12 @@ enum ProfileCmd {
 /// `rmlx claim <subcommand>`.
 #[derive(Subcommand, Debug)]
 enum ClaimCmd {
-    /// Run a command while this process holds the Metal claim.
+    /// Run a non-interactive command while this process holds the Metal claim.
     ///
-    /// The command inherits the claim, so the claim stays held until the
-    /// command exits. SIGTERM and SIGINT are forwarded to its process group,
-    /// and `rmlx claim run` exits with its status. When another process holds
-    /// the claim, nothing runs and the exit code is 11.
+    /// The command's stdin is the claim, not the terminal, so the claim stays
+    /// held until the command exits. SIGTERM, SIGINT and SIGHUP are forwarded to
+    /// its process group, and `rmlx claim run` exits with its status. When
+    /// another process holds the claim, nothing runs and the exit code is 11.
     ///
     /// The command must not start rmlx itself: this process holds the claim,
     /// so every rmlx GPU command the command starts is refused with exit 11.
@@ -1852,7 +1852,7 @@ fn main() -> Result<()> {
             std::env::set_var("RUST_BACKTRACE", "full");
         }
     }
-    let _guard = init_tracing(&run_id, cli.log, cli.log_cap_mb)?;
+    let log_guard = init_tracing(&run_id, cli.log, cli.log_cap_mb)?;
 
     // Record the nax-GEMM-kernel capability of the MLX this process loaded.
     // `rmlx-metrics` cannot read this itself (see `identity::set_mlx_nax`
@@ -1937,7 +1937,10 @@ fn main() -> Result<()> {
         cmd: ClaimCmd::Run { command },
     } = &cli.cmd
     {
-        std::process::exit(commands::claim_run::run_claim_run(command)?);
+        let code = commands::claim_run::run_claim_run(command)?;
+        // `exit` runs no destructor; the log writer must flush first.
+        drop(log_guard);
+        std::process::exit(code);
     }
 
     // `rmlx kv-calibrate` runs without opening the EventRecorder. The

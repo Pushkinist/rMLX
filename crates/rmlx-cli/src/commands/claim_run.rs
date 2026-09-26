@@ -1,23 +1,22 @@
-// unsafe_code: POSIX libc FFI — fcntl (clear FD_CLOEXEC on the claim fd) and
-// kill (forward a signal to the child's process group)
-#![allow(unsafe_code)]
 //! `rmlx claim run -- <command>` — run a command while this process holds the
 //! Metal claim.
 //!
-//! The child inherits the claim fd, so the flock stays held while the child
-//! runs even if this process dies first. SIGTERM and SIGINT sent to this
-//! process are forwarded to the child's process group. The exit status is the
-//! child's; a child killed by a signal exits `128 + <signal>`, as a shell
-//! reports it.
+//! The child's stdin is a duplicate of the claim fd. It shares the claim's
+//! open file and so its flock: the claim stays held while the child runs, even
+//! if this process dies first. It also keeps the terminal away from the child,
+//! which runs in its own process group, where a terminal read would stop it.
+//! SIGTERM, SIGINT and SIGHUP sent to this process are forwarded to the child's
+//! process group. The exit status is the child's; a child killed by a signal
+//! exits `128 + <signal>`, as a shell reports it.
 //!
 //! The command must not start `rmlx`: this process holds the claim, so a nested
 //! `rmlx` GPU command is refused it.
 
 use std::ffi::OsString;
 use std::io;
-use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd};
+use std::os::fd::{AsFd as _, OwnedFd};
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
-use std::process::{Command, ExitStatus};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
@@ -34,23 +33,28 @@ const POLL: Duration = Duration::from_millis(50);
 /// code to exit with.
 pub(crate) fn run_claim_run(command: &[OsString]) -> anyhow::Result<i32> {
     let claim = exit_if_held(try_claim())?;
+    let lock = claim
+        .as_fd()
+        .try_clone_to_owned()
+        .context("claim run: duplicate the claim fd")?;
     let signals = forward_signals()?;
-    run_holding(claim.as_fd(), command, &signals)
+    run_holding(lock, command, &signals)
 }
 
-/// Run `command` in its own process group with `lock` inherited, forwarding
-/// every signal number received on `signals` to that group.
+/// Run `command` in its own process group with `lock` as its stdin, forwarding
+/// every signal number received on `signals` to that group. This process keeps
+/// no copy of `lock` once the child has started.
 pub(crate) fn run_holding(
-    lock: BorrowedFd<'_>,
+    lock: OwnedFd,
     command: &[OsString],
     signals: &Receiver<i32>,
 ) -> anyhow::Result<i32> {
     let (program, args) = command
         .split_first()
         .ok_or_else(|| anyhow::anyhow!("claim run: no command given"))?;
-    inherit_across_exec(lock).context("claim run: keep the claim fd open across exec")?;
     let mut child = Command::new(program)
         .args(args)
+        .stdin(Stdio::from(lock))
         .process_group(0)
         .spawn()
         .with_context(|| format!("claim run: start {}", program.to_string_lossy()))?;
@@ -70,7 +74,7 @@ pub(crate) fn run_holding(
     }
 }
 
-/// Deliver SIGTERM and SIGINT to the returned channel instead of acting on
+/// Deliver SIGTERM, SIGINT and SIGHUP to the returned channel instead of acting on
 /// them. The handlers are installed before this returns, so no signal that
 /// arrives after the child starts kills this process.
 fn forward_signals() -> anyhow::Result<Receiver<i32>> {
@@ -80,11 +84,12 @@ fn forward_signals() -> anyhow::Result<Receiver<i32>> {
         .enable_all()
         .build()
         .context("claim run: signal runtime")?;
-    let (mut terminate, mut interrupt) = {
+    let (mut terminate, mut interrupt, mut hangup) = {
         let _entered = runtime.enter();
         (
             signal(SignalKind::terminate()).context("claim run: SIGTERM handler")?,
             signal(SignalKind::interrupt()).context("claim run: SIGINT handler")?,
+            signal(SignalKind::hangup()).context("claim run: SIGHUP handler")?,
         )
     };
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -94,6 +99,7 @@ fn forward_signals() -> anyhow::Result<Receiver<i32>> {
                 let signal = tokio::select! {
                     Some(()) = terminate.recv() => libc::SIGTERM,
                     Some(()) = interrupt.recv() => libc::SIGINT,
+                    Some(()) = hangup.recv() => libc::SIGHUP,
                     else => break,
                 };
                 if sender.send(signal).is_err() {
@@ -105,21 +111,10 @@ fn forward_signals() -> anyhow::Result<Receiver<i32>> {
     Ok(receiver)
 }
 
-fn inherit_across_exec(fd: BorrowedFd<'_>) -> io::Result<()> {
-    let raw = fd.as_raw_fd();
-    // SAFETY: F_GETFD / F_SETFD on an open, borrowed fd read and write only
-    // its descriptor flags.
-    let flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
-    if flags < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: as above.
-    if unsafe { libc::fcntl(raw, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
+#[allow(
+    unsafe_code,
+    reason = "libc::kill has no safe std equivalent for a process group"
+)]
 fn forward(group: libc::pid_t, signal: i32) {
     // SAFETY: kill takes plain integers; a negative pid names a process group.
     if unsafe { libc::kill(-group, signal) } == 0 {
