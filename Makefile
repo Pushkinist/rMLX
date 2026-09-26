@@ -178,6 +178,7 @@ test-capture: ## run the feature-gated GPU-profiling unit tests (capture window 
 	cargo test -p rmlx-mlx --features metal-capture --lib metal_capture
 	cargo test -p rmlx-mlx --features metal-capture --lib xctrace
 	cargo test -p rmlx-cli --features metal-capture --bin rmlx gpu_capture
+	cargo test -p rmlx-cli --features metal-capture --test device_cpu_refusal gpu_capture
 
 profile-gputrace: ## capture a decode-window Metal GPU trace (CODEC= MODEL= required; enforces the .rmlx/traces cap unless KEEP_ALL=1)
 	@if [ -z "$(CODEC)" ] || [ -z "$(MODEL)" ]; then \

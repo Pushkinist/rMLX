@@ -408,7 +408,7 @@ async fn request_kv_quant_refused_on_cpu_server() {
     let (status, body) = http(port, "POST", "/v1/chat/completions", Some(refused)).await;
     assert_eq!(status, 400, "body: {body}");
     assert!(
-        body.contains("k8v8") && body.contains("--device cpu"),
+        body.contains("k8v8") && body.contains("send kv_quant 'none'"),
         "body: {body}"
     );
     let admitted = r#"{"model":"no-such-model","messages":[{"role":"user","content":"hello"}],"kv_quant":"none"}"#;

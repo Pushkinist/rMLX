@@ -431,12 +431,12 @@ pub fn quantize_mode(
                 s,
             )
         })
-    }?;
+    };
     // Do NOT free global_scale — it is the cached null sentinel.
 
     // Check status before reading from vec_res.
     let extract_result = (|| -> Result<(Array, Array, Array)> {
-        unsafe { check_status(status, "quantize") }?;
+        unsafe { check_status(status?, "quantize") }?;
 
         // Affine emits 3 entries (codes, scales, biases); the mxfp*/nvfp4
         // codecs emit 2 (codes, scales) — biases is then left as the

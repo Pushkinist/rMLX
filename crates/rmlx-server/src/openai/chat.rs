@@ -226,9 +226,13 @@ pub(crate) async fn chat_completions(
         },
         None => None,
     };
-    if let Some(Err(e)) = req_kv_quant_override.map(|kq| kq.admitted_on(state.device)) {
+    if let Some(Err(refused)) = req_kv_quant_override.map(|kq| kq.admitted_on(state.device)) {
         state.error_counts.increment(ApiErrorCategory::BadRequest);
-        return bad_request(&format!("kv_quant: {e}"));
+        return bad_request(&format!(
+            "kv_quant '{}' runs Metal kernels and this server runs on the CPU device; \
+             send kv_quant 'none' or omit it",
+            refused.codec
+        ));
     }
     if let Some(c) = req.max_ctx {
         if c <= 0 {

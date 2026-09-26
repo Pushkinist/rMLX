@@ -168,8 +168,10 @@ fn tts_synthesize_on_cpu_is_admitted() {
     run_child("tts_synthesize_on_cpu_is_admitted_child");
 }
 
-/// The synthetic weights cannot produce speech, so synthesis may fail on a
-/// shape; what it must not do is ask for the GPU.
+/// The synthetic weights are f32 where the talker's quantized linears expect
+/// packed u32, so synthesis runs the embeddings and projections on the CPU and
+/// stops at the first quantized matmul. Any other outcome is a regression: a
+/// GPU refusal, or a failure before that point.
 #[test]
 #[ignore = "child process; its parent test starts it with a marker argument"]
 fn tts_synthesize_on_cpu_is_admitted_child() {
@@ -180,11 +182,10 @@ fn tts_synthesize_on_cpu_is_admitted_child() {
     let dir = tempfile::tempdir().unwrap();
     let mut model = loaded_cpu_model(dir.path());
     let result = synthesize("hello", "serena", &mut model, &TtsTokenizer::stub());
-    if let Err(e) = &result {
-        assert!(
-            !e.to_string().contains("GPU work is refused"),
-            "synthesis asked for the GPU: {e}"
-        );
+    match result {
+        Err(TtsError::Mlx(msg))
+            if msg.contains("[quantized_matmul] The weight matrix should be uint32") => {}
+        other => panic!("synthesis must reach the first quantized matmul on the CPU: {other:?}"),
     }
     println!("{CHILD_DONE}");
 }

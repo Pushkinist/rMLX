@@ -2560,17 +2560,6 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
             rmlx_models::kv_cache::install_kv_boundary(kv_boundary_layers)?;
             refuse_to_measure_off_the_pin("rmlx baseline")?;
 
-            // Arm the GPU-capture window before anything expensive happens: a
-            // request that cannot be honoured must cost seconds, not a full
-            // weight load followed by a failure at the first decode step.
-            #[cfg(feature = "metal-capture")]
-            let capture_requested = commands::gpu_capture::arm(
-                gpu_capture.as_deref(),
-                gpu_capture_skip,
-                gpu_capture_steps,
-                max_tokens,
-            )?;
-
             let max_prompt_tokens = max_prompt_tokens.map(parse_max_prompt_tokens).transpose()?;
             // --kv-preset pre-resolution. resolve_preset_arg turns
             // KvPresetArg::Auto into DEFAULT_KV_QUANT.
@@ -2596,6 +2585,20 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
             };
             let claimed = parse_device(&device)?;
             claimed.admits(&[kv_quant_resolved])?;
+            #[cfg(feature = "metal-capture")]
+            if gpu_capture.is_some() && !claimed.holds_claim() {
+                anyhow::bail!("--gpu-capture records a Metal trace and needs --device gpu");
+            }
+            // Arm the GPU-capture window before anything expensive happens: a
+            // request that cannot be honoured must cost seconds, not a full
+            // weight load followed by a failure at the first decode step.
+            #[cfg(feature = "metal-capture")]
+            let capture_requested = commands::gpu_capture::arm(
+                gpu_capture.as_deref(),
+                gpu_capture_skip,
+                gpu_capture_steps,
+                max_tokens,
+            )?;
 
             // Resolve --prompt-tokens → canonical longctx file when present.
             // The prompts/ dir lives at the workspace root; locate it via the

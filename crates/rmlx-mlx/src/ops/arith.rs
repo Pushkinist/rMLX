@@ -172,8 +172,9 @@ pub fn stack_axis(arrays: &[&Array], axis: i32, device: Device) -> Result<Array>
         with_stream(device, |s| {
             sys::mlx_stack_axis(&raw mut res, vec_arr, axis, s)
         })
-    }?;
+    };
     let _ = unsafe { sys::mlx_vector_array_free(vec_arr) };
+    let status = status?;
     unsafe { check_status(status, "stack_axis") }?;
     Ok(Array { inner: res })
 }
@@ -252,8 +253,9 @@ pub fn concatenate(arrays: &[&Array], axis: i32, device: Device) -> Result<Array
         with_stream(device, |s| {
             sys::mlx_concatenate_axis(&raw mut res, vec_arr, axis, s)
         })
-    }?;
+    };
     unsafe { sys::mlx_vector_array_free(vec_arr) };
+    let status = status?;
     unsafe { check_status(status, "concatenate") }?;
     Ok(Array { inner: res })
 }
