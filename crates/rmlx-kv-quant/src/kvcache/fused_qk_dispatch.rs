@@ -221,7 +221,7 @@ impl KvCache {
             return Ok(None);
         }
         let Some(max_seq) = self.storage_max_seq_for_fused_qk() else {
-            self.trace_fused_qk_skip("storage variant carries no max_seq");
+            self.trace_fused_qk_skip("storage variant not in the fused-QK table");
             return Ok(None);
         };
 
@@ -464,12 +464,11 @@ impl KvCache {
         );
     }
 
-    /// Look up the `max_seq` the shadow should be sized to, taken from the
-    /// active storage variant.
+    /// The `max_seq` the shadow should be sized to: the cache's own, when the
+    /// active storage variant is one the kernel table admits.
     ///
     /// One arm per codec the kernel table admits — anything else returns
-    /// `None` and the caller falls through. Rotating (SWA) variants are among
-    /// those: they carry no `max_seq` the shadow could be sized to.
+    /// `None` and the caller falls through.
     pub(super) fn storage_max_seq_for_fused_qk(&self) -> Option<i32> {
         use crate::storage::KvStorage;
         let m = match &self.storage {
@@ -478,7 +477,7 @@ impl KvCache {
             | KvStorage::TurboSym3 { .. }
             | KvStorage::TurboSym4 { .. }
             | KvStorage::RotorKAsym3 { .. }
-            | KvStorage::RotorKAsym4 { .. } => self.storage.max_seq(),
+            | KvStorage::RotorKAsym4 { .. } => self.max_seq,
             _ => return None,
         };
         if m <= 0 {

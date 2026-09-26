@@ -795,7 +795,7 @@ fn descriptor_has_one_arm_per_listed_codec() {
 ///
 /// The two predicates live on different enums and nothing else couples them.
 /// `KvQuant::materialises_packed_store` decides whether `exit_prefill` builds a
-/// payload; `KvStorage::geometry_only_max_seq` is what the spill writer asks
+/// payload; `KvStorage::is_geometry_only` is what the spill writer asks
 /// before it stamps a codec geometry. A codec classified `false` whose storage
 /// sits in the "payload is not an `Option`" arm (`Mixed | Paged`)
 /// compiles cleanly and makes the writer emit a codec tag with no tensors
@@ -809,9 +809,9 @@ fn a_storeless_codec_always_has_a_geometry_only_storage() {
         if q.materialises_packed_store() {
             continue;
         }
-        let storage = crate::storage::KvStorage::new(q, 4096);
+        let storage = crate::storage::KvStorage::new(q);
         assert!(
-            storage.geometry_only_max_seq().is_some(),
+            storage.is_geometry_only(),
             "{q:?} builds no packed store, but its storage cannot report itself \
              geometry-only — the spill writer would stamp a codec geometry with \
              no tensors behind it"

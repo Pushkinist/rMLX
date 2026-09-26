@@ -91,9 +91,15 @@ use rmlx_kv_quant::KvQuant;
 /// inside the reconstructed `KvStorage`).
 type NoneBf16Seed = Option<(Array, Array)>;
 
-/// Result of [`KvBlockReader::hydrate`]: per-layer storages, per-layer
-/// off-storage bf16 seeds, and the linear-attn recurrent caches.
-type HydratedLayers = (Vec<KvStorage>, Vec<NoneBf16Seed>, Vec<LinearAttnCache>);
+/// Result of [`KvBlockReader::hydrate`]: per-layer storages, the per-layer
+/// `max_seq` each geometry recorded, per-layer off-storage bf16 seeds, and the
+/// linear-attn recurrent caches.
+type HydratedLayers = (
+    Vec<KvStorage>,
+    Vec<i32>,
+    Vec<NoneBf16Seed>,
+    Vec<LinearAttnCache>,
+);
 
 // ── Metadata keys ───────────────────────────────────────────────────────────
 
@@ -252,6 +258,8 @@ pub struct KvBlockWriter<'a> {
     model_id: String,
     kv_quant: KvQuant,
     layers: &'a [KvStorage],
+    /// Capacity every layer's geometry records.
+    max_seq: i32,
     /// Optional linear-attention recurrent state, one per linear-attn layer.
     /// Empty for non-hybrid archs.
     linear: &'a [LinearAttnCache],
@@ -262,12 +270,14 @@ impl<'a> KvBlockWriter<'a> {
         model_id: impl Into<String>,
         kv_quant: KvQuant,
         layers: &'a [KvStorage],
+        max_seq: i32,
         linear: &'a [LinearAttnCache],
     ) -> Self {
         Self {
             model_id: model_id.into(),
             kv_quant,
             layers,
+            max_seq,
             linear,
         }
     }
@@ -280,6 +290,7 @@ impl<'a> KvBlockWriter<'a> {
             &self.model_id,
             self.kv_quant,
             self.layers,
+            self.max_seq,
             self.linear,
         )
     }
@@ -311,11 +322,19 @@ pub fn write_caches(
     kv_caches: &[KvCache],
     lin_caches: &[LinearAttnCache],
 ) -> Result<()> {
-    let layers: Vec<&KvStorage> = kv_caches.iter().map(KvCache::storage).collect();
+    let layers = spill_layers(kv_caches);
     let none_bf16 = none_bf16_payloads(kv_caches)?;
     serialize_block_refs(
         path, device, model_id, kv_quant, &layers, &none_bf16, lin_caches,
     )
+}
+
+/// Each cache's storage beside the capacity its geometry records.
+fn spill_layers(kv_caches: &[KvCache]) -> Vec<(&KvStorage, i32)> {
+    kv_caches
+        .iter()
+        .map(|c| (c.storage(), c.max_seq()))
+        .collect()
 }
 
 /// Collect the live bf16 K/V mirror of every layer that spills geometry-only,
@@ -323,7 +342,7 @@ pub fn write_caches(
 /// buffer (on `KvCache::decode_fp16_{k,v}`).
 ///
 /// Element `i` is `Some` only for a layer whose storage holds no packed payload
-/// ([`KvStorage::geometry_only_max_seq`]) and that actually holds a filled bf16
+/// ([`KvStorage::is_geometry_only`]) and that actually holds a filled bf16
 /// pair. That covers `KvQuant::None`, whose K/V has always lived there, and the
 /// bf16-mirror codecs, whose `exit_prefill` builds no packed store at all —
 /// without this the tier would spill those layers as empty geometry and the
@@ -353,7 +372,7 @@ fn none_bf16_payloads(kv_caches: &[KvCache]) -> Result<Vec<NoneBf16Seed>> {
     kv_caches
         .iter()
         .map(|c| {
-            if c.storage().geometry_only_max_seq().is_none() {
+            if !c.storage().is_geometry_only() {
                 return Ok(None);
             }
             let Some((k, v)) = c.decode_fp16_kv() else {
@@ -396,7 +415,7 @@ pub(crate) fn write_caches_timed(
     kv_caches: &[KvCache],
     lin_caches: &[LinearAttnCache],
 ) -> Result<(u64, u64, u64)> {
-    let layers: Vec<&KvStorage> = kv_caches.iter().map(KvCache::storage).collect();
+    let layers = spill_layers(kv_caches);
     let none_bf16 = none_bf16_payloads(kv_caches)?;
     serialize_block_refs_timed(
         path, device, model_id, kv_quant, &layers, &none_bf16, lin_caches,
@@ -483,7 +502,7 @@ fn read_caches_inner(
     let dur_read_us = t_read.elapsed().as_micros() as u64;
 
     let t_dequant = Instant::now();
-    let (storages, none_bf16, lin_caches) = reader.hydrate(model_id, kv_quant, device)?;
+    let (storages, max_seqs, none_bf16, lin_caches) = reader.hydrate(model_id, kv_quant, device)?;
     let offset = reader.seq_len()?;
     let dur_dequant_us = t_dequant.elapsed().as_micros() as u64;
 
@@ -494,10 +513,12 @@ fn read_caches_inner(
     // so an exact-hit replay reads the real K/V instead of zeros.
     let kv_caches: Vec<KvCache> = storages
         .into_iter()
+        .zip(max_seqs)
         .zip(none_bf16)
         .enumerate()
-        .map(|(layer_idx, (s, bf16))| {
-            let cache = KvCache::from_storage(s, kv_quant, offset, layer_idx, policy, shares_kv);
+        .map(|(layer_idx, ((s, max_seq), bf16))| {
+            let cache =
+                KvCache::from_storage(s, max_seq, kv_quant, offset, layer_idx, policy, shares_kv);
             match bf16 {
                 Some((k, v)) => cache.with_decode_fp16_seed(k, v),
                 None => cache,
@@ -523,9 +544,10 @@ fn serialize_block(
     model_id: &str,
     kv_quant: KvQuant,
     layers: &[KvStorage],
+    max_seq: i32,
     linear: &[LinearAttnCache],
 ) -> Result<()> {
-    let refs: Vec<&KvStorage> = layers.iter().collect();
+    let refs: Vec<(&KvStorage, i32)> = layers.iter().map(|s| (s, max_seq)).collect();
     // Storage-only callers (the `KvBlockWriter` struct path used by tests)
     // carry no off-storage bf16 — None layers serialize geometry-only.
     serialize_block_refs(path, device, model_id, kv_quant, &refs, &[], linear)
@@ -541,7 +563,7 @@ fn serialize_block_refs(
     device: Device,
     model_id: &str,
     kv_quant: KvQuant,
-    layers: &[&KvStorage],
+    layers: &[(&KvStorage, i32)],
     none_bf16: &[NoneBf16Seed],
     linear: &[LinearAttnCache],
 ) -> Result<()> {
@@ -558,7 +580,7 @@ fn serialize_block_refs_timed(
     device: Device,
     model_id: &str,
     kv_quant: KvQuant,
-    layers: &[&KvStorage],
+    layers: &[(&KvStorage, i32)],
     none_bf16: &[NoneBf16Seed],
     linear: &[LinearAttnCache],
 ) -> Result<(u64, u64, u64)> {
@@ -574,9 +596,9 @@ fn serialize_block_refs_timed(
     meta.insert(META_N_LAYERS.into(), layers.len().to_string());
 
     let mut max_seq_len = 0i32;
-    for (idx, storage) in layers.iter().enumerate() {
+    for (idx, &(storage, max_seq)) in layers.iter().enumerate() {
         let bf16 = none_bf16.get(idx).and_then(Option::as_ref);
-        let (geom, seq) = write_layer(idx, storage, bf16, device, &mut tensors)?;
+        let (geom, seq) = write_layer(idx, storage, max_seq, bf16, device, &mut tensors)?;
         meta.insert(geom_key(idx), geom);
         max_seq_len = max_seq_len.max(seq);
     }
@@ -619,6 +641,7 @@ fn serialize_block_refs_timed(
 fn write_layer(
     idx: usize,
     storage: &KvStorage,
+    max_seq: i32,
     none_bf16: Option<&(Array, Array)>,
     device: Device,
     out: &mut Vec<(String, OwnedTensor)>,
@@ -637,7 +660,7 @@ fn write_layer(
     // reconstructed cache decodes off exactly the bytes the spilling one did.
     // With no mirror (a rotating window, an unfilled cache) the layer falls
     // back to geometry-only "none" and the window is re-established on reuse.
-    if let Some(max_seq) = storage.geometry_only_max_seq() {
+    if storage.is_geometry_only() {
         let Some((k, v)) = none_bf16 else {
             return Ok((format!("{{\"tag\":\"none\",\"max_seq\":{max_seq}}}"), 0));
         };
@@ -656,24 +679,18 @@ fn write_layer(
             seq,
         ));
     }
-    let max_seq = storage.max_seq();
     match storage {
-        KvStorage::K8V4 { k, v, max_seq: _ } => {
+        KvStorage::K8V4 { k, v } => {
             let seq = write_quant_k(idx, "k", k.as_ref(), device, out)?;
             write_quant_v(idx, v.as_ref(), device, out)?;
             Ok((geom_kv("k8v4", max_seq, k_shape(k.as_ref())), seq))
         }
-        KvStorage::K8V8 { k, v, max_seq: _ } => {
+        KvStorage::K8V8 { k, v } => {
             let seq = write_quant_k(idx, "k", k.as_ref(), device, out)?;
             write_quant_k(idx, "v", v.as_ref(), device, out)?;
             Ok((geom_kv("k8v8", max_seq, k_shape(k.as_ref())), seq))
         }
-        KvStorage::Planar {
-            k,
-            v,
-            max_seq: _,
-            bits,
-        } => {
+        KvStorage::Planar { k, v, bits } => {
             let seq = write_quant_k(idx, "k", k.as_ref(), device, out)?;
             write_quant_planar_v(idx, v.as_ref(), device, out)?;
             // Tag encodes bit-width so the read side knows which codebook to
@@ -683,16 +700,13 @@ fn write_layer(
         }
         // `KvStorage::None` never reaches here — it has no packed payload and
         // is served by the geometry-only branch above.
-        KvStorage::None { max_seq: _ } => {
-            Ok((format!("{{\"tag\":\"none\",\"max_seq\":{max_seq}}}"), 0))
-        }
-        KvStorage::Mixed { state, max_seq: _ } => write_mixed(idx, state, max_seq, out),
+        KvStorage::None {} => Ok((format!("{{\"tag\":\"none\",\"max_seq\":{max_seq}}}"), 0)),
+        KvStorage::Mixed { state } => write_mixed(idx, state, max_seq, out),
         KvStorage::Paged {
             quant,
             k,
             v_k8,
             v_planar,
-            max_seq: _,
         } => write_paged(
             idx,
             *quant,
@@ -705,7 +719,7 @@ fn write_layer(
         ),
         // K8VTurbo3 — same layout as K8V4 but tagged "k8vturbo3".
         // V uses QuantV bits=3; codes/scales packing is the same format.
-        KvStorage::K8VTurbo3 { k, v, max_seq: _ } => {
+        KvStorage::K8VTurbo3 { k, v } => {
             let seq = write_quant_k(idx, "k", k.as_ref(), device, out)?;
             write_quant_v(idx, v.as_ref(), device, out)?;
             Ok((geom_kv("k8vturbo3", max_seq, k_shape(k.as_ref())), seq))
@@ -714,7 +728,7 @@ fn write_layer(
         // The Viterbi assignment is encode-side only; the codes stream and the
         // decoder are shared. Tagged separately so a hydrate cannot silently
         // demote a TCQ payload to plain turbo3 on the next decode-step encode.
-        KvStorage::K8VTurbo3Tcq { k, v, max_seq: _ } => {
+        KvStorage::K8VTurbo3Tcq { k, v } => {
             let seq = write_quant_k(idx, "k", k.as_ref(), device, out)?;
             write_quant_v(idx, v.as_ref(), device, out)?;
             Ok((
@@ -726,7 +740,7 @@ fn write_layer(
         // (2-bit LSB-first, 16 values per u32). Tagged separately via
         // K8VTURBO2_TCQ_LAYOUT_TAG to prevent silent demotion to nearest-centroid
         // on cross-restart hydrate.
-        KvStorage::K8VTurbo2Tcq { k, v, max_seq: _ } => {
+        KvStorage::K8VTurbo2Tcq { k, v } => {
             let seq = write_quant_k(idx, "k", k.as_ref(), device, out)?;
             write_quant_v(idx, v.as_ref(), device, out)?;
             Ok((
@@ -737,7 +751,7 @@ fn write_layer(
         // TurboSym3 — symmetric 3-bit Lloyd-Max K + turbo3 V.
         // K is `QuantKTurbo3` (3-bit codes, same GPU pack as V-side turbo3).
         // Layout tag: TURBOSYM3_LAYOUT_TAG = "tsym3_lloyd_3_3".
-        KvStorage::TurboSym3 { k, v, max_seq: _ } => {
+        KvStorage::TurboSym3 { k, v } => {
             let seq = write_quant_k_turbo(idx, k.as_ref(), device, out)?;
             write_quant_v(idx, v.as_ref(), device, out)?;
             Ok((
@@ -748,7 +762,7 @@ fn write_layer(
         // TurboSym4 — symmetric 4-bit Lloyd-Max K + tq4 V.
         // Both axes use TurboQuant 4-bit; K is `QuantKTurbo4` (not `QuantK`).
         // Geometry tag is `TURBOSYM4_LAYOUT_TAG` = "tsym4_lloyd_4_4".
-        KvStorage::TurboSym4 { k, v, max_seq: _ } => {
+        KvStorage::TurboSym4 { k, v } => {
             let seq = write_quant_k_turbo(idx, k.as_ref(), device, out)?;
             write_quant_v(idx, v.as_ref(), device, out)?;
             Ok((
@@ -758,14 +772,14 @@ fn write_layer(
         }
         // PlanarK — K-only payload (codes/scales/rotations); V is bf16 and
         // lives on the parent KvCache, NOT in KvStorage. Tag = PLANARK4_LAYOUT_TAG.
-        KvStorage::PlanarK { k, max_seq: _ } => {
+        KvStorage::PlanarK { k } => {
             let seq = write_quant_planar_k_side(idx, k.as_ref(), device, out)?;
             let shape = k.as_ref().map(|q| q.shape.clone()).unwrap_or_default();
             Ok((geom_kv(PLANARK4_LAYOUT_TAG, max_seq, shape), seq))
         }
         // K8VTurbo2 — same layout as K8V4 but tagged "k8vturbo2".
         // V uses QuantV bits=2; codes/scales packing is the same format.
-        KvStorage::K8VTurbo2 { k, v, max_seq: _ } => {
+        KvStorage::K8VTurbo2 { k, v } => {
             let seq = write_quant_k(idx, "k", k.as_ref(), device, out)?;
             write_quant_v(idx, v.as_ref(), device, out)?;
             Ok((geom_kv("k8vturbo2", max_seq, k_shape(k.as_ref())), seq))
@@ -773,7 +787,7 @@ fn write_layer(
         // IsoV3 SSD spill — K side uses QuantK (q8_0) writer; V side serializes
         // the four IsoBlocks buffers (codes_packed, scales, quaternions, norms)
         // flat into safetensors tensors.
-        KvStorage::IsoV3 { k, v, max_seq: _ } => {
+        KvStorage::IsoV3 { k, v } => {
             let seq = write_quant_k(idx, "k", k.as_ref(), device, out)?;
             write_quant_iso_v3(idx, v.as_ref(), out)?;
             Ok((geom_kv(ISOV3_LAYOUT_TAG, max_seq, k_shape(k.as_ref())), seq))
@@ -783,7 +797,7 @@ fn write_layer(
         // (`ISOV4_LAYOUT_TAG`, currently "iso_v_4_v2" — bumped when the GPU
         // append's byte orientation was fixed) so the reader picks the 4-bit codec /
         // pack on hydrate.
-        KvStorage::IsoV4 { k, v, max_seq: _ } => {
+        KvStorage::IsoV4 { k, v } => {
             let seq = write_quant_k(idx, "k", k.as_ref(), device, out)?;
             write_quant_iso_v4(idx, v.as_ref(), out)?;
             Ok((geom_kv(ISOV4_LAYOUT_TAG, max_seq, k_shape(k.as_ref())), seq))
@@ -792,7 +806,7 @@ fn write_layer(
         // (codes_packed, scales, norms, rotors). The static rotor table is
         // persisted so cross-restart identity is preserved regardless of
         // any seed-source drift.
-        KvStorage::RotorV3 { k, v, max_seq: _ } => {
+        KvStorage::RotorV3 { k, v } => {
             let seq = write_quant_k(idx, "k", k.as_ref(), device, out)?;
             write_quant_rotor_v3(idx, v.as_ref(), out)?;
             Ok((
@@ -803,7 +817,7 @@ fn write_layer(
         // RotorV4 SSD spill — K is q8_0; V uses four flat buffers identical in
         // structure to RotorV3 (codes_packed, scales, norms, rotors) but with
         // 4-bit codes (1 u32 per group of 8 multivector components).
-        KvStorage::RotorV4 { k, v, max_seq: _ } => {
+        KvStorage::RotorV4 { k, v } => {
             let seq = write_quant_k(idx, "k", k.as_ref(), device, out)?;
             write_quant_rotor_v4(idx, v.as_ref(), out)?;
             Ok((
@@ -814,7 +828,7 @@ fn write_layer(
         // IsoSym3 — both K and V are IsoBlocks (codes_packed / scales /
         // quaternions / norms each); K under `l{idx}.k.*` and V under
         // `l{idx}.v.*`. Layout tag: ISO_SYM_3_LAYOUT_TAG.
-        KvStorage::IsoSym3 { k, v, max_seq: _ } => {
+        KvStorage::IsoSym3 { k, v } => {
             write_quant_iso_k3(idx, k.as_ref(), out)?;
             write_quant_iso_v3(idx, v.as_ref(), out)?;
             let shape = k.as_ref().map(|q| q.shape.clone()).unwrap_or_default();
@@ -822,7 +836,7 @@ fn write_layer(
             Ok((geom_kv(ISO_SYM_3_LAYOUT_TAG, max_seq, shape), seq))
         }
         // IsoSym4 — same payload layout as IsoSym3 with 4-bit codes.
-        KvStorage::IsoSym4 { k, v, max_seq: _ } => {
+        KvStorage::IsoSym4 { k, v } => {
             write_quant_iso_k4(idx, k.as_ref(), out)?;
             write_quant_iso_v4(idx, v.as_ref(), out)?;
             let shape = k.as_ref().map(|q| q.shape.clone()).unwrap_or_default();
@@ -832,14 +846,14 @@ fn write_layer(
         // IsoKOnly3 — K-only payload (codes_packed/scales/quaternions/norms
         // under `l{idx}.k.*`); V is bf16 and lives on the parent KvCache.
         // Layout tag: ISO_K_ONLY_3_LAYOUT_TAG.
-        KvStorage::IsoKOnly3 { k, max_seq: _ } => {
+        KvStorage::IsoKOnly3 { k } => {
             write_quant_iso_k3(idx, k.as_ref(), out)?;
             let shape = k.as_ref().map(|q| q.shape.clone()).unwrap_or_default();
             let seq = shape.get(2).copied().unwrap_or(0);
             Ok((geom_kv(ISO_K_ONLY_3_LAYOUT_TAG, max_seq, shape), seq))
         }
         // IsoKOnly4 — same shape as IsoKOnly3 with 4-bit codes.
-        KvStorage::IsoKOnly4 { k, max_seq: _ } => {
+        KvStorage::IsoKOnly4 { k } => {
             write_quant_iso_k4(idx, k.as_ref(), out)?;
             let shape = k.as_ref().map(|q| q.shape.clone()).unwrap_or_default();
             let seq = shape.get(2).copied().unwrap_or(0);
@@ -850,7 +864,7 @@ fn write_layer(
         // (codes_packed/scales/norms/rotors under l{idx}.v.*). The static K
         // rotor table also lives at l{idx}.k.rotors so hydrate is independent
         // of the global seed.
-        KvStorage::RotorSym3 { k, v, max_seq: _ } => {
+        KvStorage::RotorSym3 { k, v } => {
             write_quant_rotor_k3(idx, k.as_ref(), out)?;
             write_quant_rotor_v3(idx, v.as_ref(), out)?;
             let shape = k.as_ref().map(|q| q.shape.clone()).unwrap_or_default();
@@ -863,7 +877,7 @@ fn write_layer(
             Ok((geom_kv(tag, max_seq, shape), seq))
         }
         // RotorSym4 — same shape as RotorSym3 with 4-bit codes.
-        KvStorage::RotorSym4 { k, v, max_seq: _ } => {
+        KvStorage::RotorSym4 { k, v } => {
             write_quant_rotor_k4(idx, k.as_ref(), out)?;
             write_quant_rotor_v4(idx, v.as_ref(), out)?;
             let shape = k.as_ref().map(|q| q.shape.clone()).unwrap_or_default();
@@ -876,7 +890,7 @@ fn write_layer(
             Ok((geom_kv(tag, max_seq, shape), seq))
         }
         // RotorKOnly3 — K-only payload; V is bf16 off-storage.
-        KvStorage::RotorKOnly3 { k, max_seq: _ } => {
+        KvStorage::RotorKOnly3 { k } => {
             write_quant_rotor_k3(idx, k.as_ref(), out)?;
             let shape = k.as_ref().map(|q| q.shape.clone()).unwrap_or_default();
             let seq = shape.get(2).copied().unwrap_or(0);
@@ -888,7 +902,7 @@ fn write_layer(
             Ok((geom_kv(tag, max_seq, shape), seq))
         }
         // RotorKOnly4 — same shape as RotorKOnly3 with 4-bit codes.
-        KvStorage::RotorKOnly4 { k, max_seq: _ } => {
+        KvStorage::RotorKOnly4 { k } => {
             write_quant_rotor_k4(idx, k.as_ref(), out)?;
             let shape = k.as_ref().map(|q| q.shape.clone()).unwrap_or_default();
             let seq = shape.get(2).copied().unwrap_or(0);
@@ -906,7 +920,6 @@ fn write_layer(
         KvStorage::RotorKAsym3 {
             k,
             v,
-            max_seq: _,
             v_bits,
             v_group_size,
         } => {
@@ -926,7 +939,6 @@ fn write_layer(
         KvStorage::RotorKAsym4 {
             k,
             v,
-            max_seq: _,
             v_bits,
             v_group_size,
         } => {
@@ -1951,10 +1963,12 @@ impl KvBlockReader {
             .map_err(|e| BlockIoError::Header(format!("bad n_layers: {e}")))?;
 
         let mut layers = Vec::with_capacity(n_layers);
+        let mut max_seqs = Vec::with_capacity(n_layers);
         let mut none_bf16: Vec<NoneBf16Seed> = Vec::with_capacity(n_layers);
         for idx in 0..n_layers {
             let geom = read_meta(&header, &geom_key(idx))?;
             layers.push(read_layer(&st, idx, &geom, device)?);
+            max_seqs.push(geom_i32(&geom, "max_seq")?);
             // For a "none_bf16" layer (KvQuant::None spill that carried the
             // off-storage bf16 prefix), restore the K/V pair so the caller can
             // re-seed the parent KvCache's decode buffers. All other tags hold
@@ -1982,7 +1996,7 @@ impl KvBlockReader {
             linear.push(lac);
         }
 
-        Ok((layers, none_bf16, linear))
+        Ok((layers, max_seqs, none_bf16, linear))
     }
 }
 
@@ -2069,75 +2083,61 @@ fn geom_shape(geom: &str) -> Result<Vec<i32>> {
 fn read_layer(st: &SafeTensors<'_>, idx: usize, geom: &str, device: Device) -> Result<KvStorage> {
     match geom_tag(geom) {
         "k8v4" => {
-            let max_seq = geom_i32(geom, "max_seq")?;
             let shape = geom_shape(geom)?;
             Ok(KvStorage::K8V4 {
                 k: Some(read_quant_k(st, idx, "k", &shape)?),
                 v: Some(read_quant_v(st, idx, &shape)?),
-                max_seq,
             })
         }
         "k8v8" => {
-            let max_seq = geom_i32(geom, "max_seq")?;
             let shape = geom_shape(geom)?;
             Ok(KvStorage::K8V8 {
                 k: Some(read_quant_k(st, idx, "k", &shape)?),
                 v: Some(read_quant_k(st, idx, "v", &shape)?),
-                max_seq,
             })
         }
         "planar" => {
-            let max_seq = geom_i32(geom, "max_seq")?;
             let shape = geom_shape(geom)?;
             Ok(KvStorage::Planar {
                 k: Some(read_quant_k(st, idx, "k", &shape)?),
                 v: Some(read_quant_planar_v(st, idx, &shape, 4)?),
-                max_seq,
                 bits: 4,
             })
         }
         // Planar3 — same layout as "planar" but 3-bit V codebook.
         "planar3" => {
-            let max_seq = geom_i32(geom, "max_seq")?;
             let shape = geom_shape(geom)?;
             Ok(KvStorage::Planar {
                 k: Some(read_quant_k(st, idx, "k", &shape)?),
                 v: Some(read_quant_planar_v(st, idx, &shape, 3)?),
-                max_seq,
                 bits: 3,
             })
         }
         // Both tags reconstruct geometry-only None storage. The "none_bf16"
         // variant additionally carries an off-storage bf16 K/V prefix, read in
         // `hydrate` and re-seeded onto the parent KvCache by the caller.
-        "none" | "none_bf16" => Ok(KvStorage::None {
-            max_seq: geom_i32(geom, "max_seq")?,
-        }),
+        "none" | "none_bf16" => Ok(KvStorage::None {}),
         "mixed" => read_mixed(st, idx, geom),
         "paged" => read_paged(st, idx, geom, device),
         // K8VTurbo3 — same structure as K8V4 but bits=3 on V.
         "k8vturbo3" => {
-            let max_seq = geom_i32(geom, "max_seq")?;
             let shape = geom_shape(geom)?;
             let v = read_quant_v_bits(st, idx, &shape, 3)?;
             Ok(KvStorage::K8VTurbo3 {
                 k: Some(read_quant_k(st, idx, "k", &shape)?),
                 v: Some(v),
-                max_seq,
             })
         }
         // K8VTurbo3Tcq — byte-for-byte compatible with k8vturbo3 on the V
         // codes/scales side. Hydrated `QuantV` is tagged `use_tcq=true` so
         // subsequent decode-step encodes re-enter the Viterbi path.
         tag if tag == K8VTURBO3_TCQ_LAYOUT_TAG => {
-            let max_seq = geom_i32(geom, "max_seq")?;
             let shape = geom_shape(geom)?;
             let mut v = read_quant_v_bits(st, idx, &shape, 3)?;
             v.use_tcq = true;
             Ok(KvStorage::K8VTurbo3Tcq {
                 k: Some(read_quant_k(st, idx, "k", &shape)?),
                 v: Some(v),
-                max_seq,
             })
         }
         // K8VTurbo2Tcq — byte-for-byte compatible with k8vturbo2 on the V
@@ -2145,14 +2145,12 @@ fn read_layer(st: &SafeTensors<'_>, idx: usize, geom: &str, device: Device) -> R
         // `use_tcq=true` so subsequent decode-step encodes re-enter the Viterbi
         // path instead of falling back to nearest-centroid.
         tag if tag == K8VTURBO2_TCQ_LAYOUT_TAG => {
-            let max_seq = geom_i32(geom, "max_seq")?;
             let shape = geom_shape(geom)?;
             let mut v = read_quant_v_bits(st, idx, &shape, 2)?;
             v.use_tcq = true;
             Ok(KvStorage::K8VTurbo2Tcq {
                 k: Some(read_quant_k(st, idx, "k", &shape)?),
                 v: Some(v),
-                max_seq,
             })
         }
         // TurboSym3 — symmetric 3-bit Lloyd-Max K + turbo3 V. Match against the canonical
@@ -2164,63 +2162,51 @@ fn read_layer(st: &SafeTensors<'_>, idx: usize, geom: &str, device: Device) -> R
         // PlanarK — K-only payload (codes/scales/rotations); V is bf16
         // off-storage. Match against the canonical layout tag constant.
         tag if tag == PLANARK4_LAYOUT_TAG => {
-            let max_seq = geom_i32(geom, "max_seq")?;
             let shape = geom_shape(geom)?;
             Ok(KvStorage::PlanarK {
                 k: Some(read_quant_planar_k(st, idx, &shape)?),
-                max_seq,
             })
         }
         // K8VTurbo2 — same structure as K8V4 but bits=2 on V.
         "k8vturbo2" => {
-            let max_seq = geom_i32(geom, "max_seq")?;
             let shape = geom_shape(geom)?;
             let v = read_quant_v_bits(st, idx, &shape, 2)?;
             Ok(KvStorage::K8VTurbo2 {
                 k: Some(read_quant_k(st, idx, "k", &shape)?),
                 v: Some(v),
-                max_seq,
             })
         }
         // IsoV3 — K is QuantK (q8_0); V is QuantIsoV3. Geometry bits must be
         // 3 and group_size must be 4; mismatch is a hard error.
         tag if tag == ISOV3_LAYOUT_TAG => {
-            let max_seq = geom_i32(geom, "max_seq")?;
             let shape = geom_shape(geom)?;
             Ok(KvStorage::IsoV3 {
                 k: Some(read_quant_k(st, idx, "k", &shape)?),
                 v: Some(read_quant_iso_v3(st, idx, &shape)?),
-                max_seq,
             })
         }
         // IsoV4 — K is QuantK (q8_0); V is QuantIsoV4.
         tag if tag == ISOV4_LAYOUT_TAG => {
-            let max_seq = geom_i32(geom, "max_seq")?;
             let shape = geom_shape(geom)?;
             Ok(KvStorage::IsoV4 {
                 k: Some(read_quant_k(st, idx, "k", &shape)?),
                 v: Some(read_quant_iso_v4(st, idx, &shape)?),
-                max_seq,
             })
         }
         // RotorV3 — K is QuantK (q8_0); V is QuantRotorV3.
         tag if tag == ROTORV3_LAYOUT_TAG => {
-            let max_seq = geom_i32(geom, "max_seq")?;
             let shape = geom_shape(geom)?;
             Ok(KvStorage::RotorV3 {
                 k: Some(read_quant_k(st, idx, "k", &shape)?),
                 v: Some(read_quant_rotor_v3(st, idx, &shape)?),
-                max_seq,
             })
         }
         // RotorV4 — K is QuantK (q8_0); V is QuantRotorV4.
         tag if tag == ROTORV4_LAYOUT_TAG => {
-            let max_seq = geom_i32(geom, "max_seq")?;
             let shape = geom_shape(geom)?;
             Ok(KvStorage::RotorV4 {
                 k: Some(read_quant_k(st, idx, "k", &shape)?),
                 v: Some(read_quant_rotor_v4(st, idx, &shape)?),
-                max_seq,
             })
         }
         // IsoSym3 — K is QuantIsoK3; V is QuantIsoV3.
@@ -2230,7 +2216,6 @@ fn read_layer(st: &SafeTensors<'_>, idx: usize, geom: &str, device: Device) -> R
             Ok(KvStorage::IsoSym3 {
                 k: Some(read_quant_iso_k3(st, idx, &shape, max_seq)?),
                 v: Some(read_quant_iso_v3(st, idx, &shape)?),
-                max_seq,
             })
         }
         // IsoSym4 — K is QuantIsoK4; V is QuantIsoV4.
@@ -2240,7 +2225,6 @@ fn read_layer(st: &SafeTensors<'_>, idx: usize, geom: &str, device: Device) -> R
             Ok(KvStorage::IsoSym4 {
                 k: Some(read_quant_iso_k4(st, idx, &shape, max_seq)?),
                 v: Some(read_quant_iso_v4(st, idx, &shape)?),
-                max_seq,
             })
         }
         // IsoKOnly3 — K-only payload; V is bf16 off-storage.
@@ -2249,7 +2233,6 @@ fn read_layer(st: &SafeTensors<'_>, idx: usize, geom: &str, device: Device) -> R
             let shape = geom_shape(geom)?;
             Ok(KvStorage::IsoKOnly3 {
                 k: Some(read_quant_iso_k3(st, idx, &shape, max_seq)?),
-                max_seq,
             })
         }
         // IsoKOnly4 — K-only payload; V is bf16 off-storage.
@@ -2258,50 +2241,41 @@ fn read_layer(st: &SafeTensors<'_>, idx: usize, geom: &str, device: Device) -> R
             let shape = geom_shape(geom)?;
             Ok(KvStorage::IsoKOnly4 {
                 k: Some(read_quant_iso_k4(st, idx, &shape, max_seq)?),
-                max_seq,
             })
         }
         // RotorSym3 — K is QuantRotorK3; V is QuantRotorV3.
         // QJL fields hydrated when layout tag carries `_qjl` suffix.
         tag if tag == ROTOR_SYM_3_LAYOUT_TAG || tag == ROTOR_SYM_3_QJL_LAYOUT_TAG => {
-            let max_seq = geom_i32(geom, "max_seq")?;
             let shape = geom_shape(geom)?;
             let use_qjl = tag == ROTOR_SYM_3_QJL_LAYOUT_TAG;
             Ok(KvStorage::RotorSym3 {
                 k: Some(read_quant_rotor_k3(st, idx, &shape, use_qjl)?),
                 v: Some(read_quant_rotor_v3(st, idx, &shape)?),
-                max_seq,
             })
         }
         // RotorSym4 — K is QuantRotorK4; V is QuantRotorV4.
         tag if tag == ROTOR_SYM_4_LAYOUT_TAG || tag == ROTOR_SYM_4_QJL_LAYOUT_TAG => {
-            let max_seq = geom_i32(geom, "max_seq")?;
             let shape = geom_shape(geom)?;
             let use_qjl = tag == ROTOR_SYM_4_QJL_LAYOUT_TAG;
             Ok(KvStorage::RotorSym4 {
                 k: Some(read_quant_rotor_k4(st, idx, &shape, use_qjl)?),
                 v: Some(read_quant_rotor_v4(st, idx, &shape)?),
-                max_seq,
             })
         }
         // RotorKOnly3 — K-only payload; V is bf16 off-storage.
         tag if tag == ROTOR_K_ONLY_3_LAYOUT_TAG || tag == ROTOR_K_ONLY_3_QJL_LAYOUT_TAG => {
-            let max_seq = geom_i32(geom, "max_seq")?;
             let shape = geom_shape(geom)?;
             let use_qjl = tag == ROTOR_K_ONLY_3_QJL_LAYOUT_TAG;
             Ok(KvStorage::RotorKOnly3 {
                 k: Some(read_quant_rotor_k3(st, idx, &shape, use_qjl)?),
-                max_seq,
             })
         }
         // RotorKOnly4 — same shape as RotorKOnly3 with 4-bit codes.
         tag if tag == ROTOR_K_ONLY_4_LAYOUT_TAG || tag == ROTOR_K_ONLY_4_QJL_LAYOUT_TAG => {
-            let max_seq = geom_i32(geom, "max_seq")?;
             let shape = geom_shape(geom)?;
             let use_qjl = tag == ROTOR_K_ONLY_4_QJL_LAYOUT_TAG;
             Ok(KvStorage::RotorKOnly4 {
                 k: Some(read_quant_rotor_k4(st, idx, &shape, use_qjl)?),
-                max_seq,
             })
         }
         // RotorKAsym3 — K is QuantRotorK3 (optional QJL); V is affine QuantV
@@ -2310,12 +2284,10 @@ fn read_layer(st: &SafeTensors<'_>, idx: usize, geom: &str, device: Device) -> R
         tag if rotor_k_asym_3_prefix_match(tag).is_some() => {
             let (use_qjl, v_bits, v_group_size) = rotor_k_asym_3_prefix_match(tag)
                 .ok_or_else(|| BlockIoError::Header(format!("bad rotor_k_asym_3 tag '{tag}'")))?;
-            let max_seq = geom_i32(geom, "max_seq")?;
             let shape = geom_shape(geom)?;
             Ok(KvStorage::RotorKAsym3 {
                 k: Some(read_quant_rotor_k3(st, idx, &shape, use_qjl)?),
                 v: Some(read_quant_v_bits(st, idx, &shape, v_bits)?),
-                max_seq,
                 v_bits,
                 v_group_size,
             })
@@ -2324,12 +2296,10 @@ fn read_layer(st: &SafeTensors<'_>, idx: usize, geom: &str, device: Device) -> R
         tag if rotor_k_asym_4_prefix_match(tag).is_some() => {
             let (use_qjl, v_bits, v_group_size) = rotor_k_asym_4_prefix_match(tag)
                 .ok_or_else(|| BlockIoError::Header(format!("bad rotor_k_asym_4 tag '{tag}'")))?;
-            let max_seq = geom_i32(geom, "max_seq")?;
             let shape = geom_shape(geom)?;
             Ok(KvStorage::RotorKAsym4 {
                 k: Some(read_quant_rotor_k4(st, idx, &shape, use_qjl)?),
                 v: Some(read_quant_v_bits(st, idx, &shape, v_bits)?),
-                max_seq,
                 v_bits,
                 v_group_size,
             })
@@ -2397,14 +2367,12 @@ fn read_tsym(st: &SafeTensors<'_>, idx: usize, geom: &str, bits: u8) -> Result<K
                 st, idx, &shape, max_seq,
             )?),
             v: Some(read_quant_v(st, idx, &shape)?),
-            max_seq,
         }),
         TURBO_K4_BITS => Ok(KvStorage::TurboSym4 {
             k: Some(read_quant_k_turbo::<TURBO_K4_BITS>(
                 st, idx, &shape, max_seq,
             )?),
             v: Some(read_quant_v(st, idx, &shape)?),
-            max_seq,
         }),
         other => Err(Error::Mlx(format!(
             "read_tsym: layout tag claims {other}-bit symmetric turbo, and the codec ships \
@@ -2707,7 +2675,6 @@ fn read_quant_rotor_v4(st: &SafeTensors<'_>, idx: usize, shape: &[i32]) -> Resul
 }
 
 fn read_mixed(st: &SafeTensors<'_>, idx: usize, geom: &str) -> Result<KvStorage> {
-    let max_seq = geom_i32(geom, "max_seq")?;
     let k_bits = geom_i32(geom, "k_bits")?;
     let v_bits = geom_i32(geom, "v_bits")?;
     let k_group_size = geom_i32(geom, "k_group_size")?;
@@ -2728,7 +2695,7 @@ fn read_mixed(st: &SafeTensors<'_>, idx: usize, geom: &str) -> Result<KvStorage>
         values,
         rotate_k,
     );
-    Ok(KvStorage::Mixed { state, max_seq })
+    Ok(KvStorage::Mixed { state })
 }
 
 fn read_mixed_tuple(st: &SafeTensors<'_>, idx: usize, side: &str) -> Result<Option<MixedTuple>> {
@@ -2805,7 +2772,6 @@ fn read_paged(st: &SafeTensors<'_>, idx: usize, geom: &str, device: Device) -> R
         k: Some(k),
         v_k8,
         v_planar,
-        max_seq,
     })
 }
 
@@ -3162,3 +3128,8 @@ mod block_io_tests;
 #[cfg(test)]
 #[path = "block_io_turbo_hydrate_tests.rs"]
 mod block_io_turbo_hydrate_tests;
+
+// Pin on the per-layer capacity across a spill and a hydrate.
+#[cfg(test)]
+#[path = "block_io_max_seq_tests.rs"]
+mod block_io_max_seq_tests;

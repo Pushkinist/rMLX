@@ -16,6 +16,7 @@ use super::store_bytes_tests::{append, store_digest, CHUNK_SEQ, SHAPE_A, TEST_MA
 use crate::storage::KvStorage;
 use crate::test_utils::{env_lock, f32_arr, lcg_data, TEST_SEED};
 use crate::{KvQuant, ALL_KV_QUANTS};
+use rmlx_core::DispatchPolicy;
 use rmlx_mlx::{Array, Device};
 
 /// One-token appends after the chunk, so the store holds more than one block.
@@ -73,7 +74,7 @@ fn deep_clone_keeps_every_store_byte_of_every_codec() {
     }
 }
 
-/// A paged storage clones to a paged storage of the same codec and `max_seq`.
+/// A paged cache clones to a paged storage of the same codec and `max_seq`.
 ///
 /// Not a digest cell: the paged update writes pages only on `Device::Gpu` and
 /// falls back to the bf16 seed on the CPU, so no CPU fill has pages to clone.
@@ -96,14 +97,21 @@ fn paged_deep_clone_stays_paged_with_its_codec() {
             k: None,
             v_k8: None,
             v_planar: None,
-            max_seq: TEST_MAX_SEQ,
         };
-        let clone = storage.try_deep_clone().expect("try_deep_clone");
+        let cache = KvCache::from_storage(
+            storage,
+            TEST_MAX_SEQ,
+            quant,
+            0,
+            0,
+            DispatchPolicy::default(),
+            false,
+        );
+        let clone = cache.try_deep_clone().expect("try_deep_clone");
+        let max_seq = clone.max_seq();
         let KvStorage::Paged {
-            quant: clone_quant,
-            max_seq,
-            ..
-        } = clone
+            quant: clone_quant, ..
+        } = clone.storage
         else {
             panic!("{quant}: the clone of a paged storage is not paged");
         };

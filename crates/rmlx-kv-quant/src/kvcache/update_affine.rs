@@ -39,7 +39,7 @@ impl KvCache {
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
-        let max_seq = self.storage.max_seq();
+        let max_seq = self.max_seq;
         let KvStorage::K8V4 { k, v, .. } = &mut self.storage else {
             unreachable!("storage mismatch: expected K8V4");
         };
@@ -251,7 +251,7 @@ impl KvCache {
         // Grow the provisioned decode window before the head-major append, the
         // same rule the legacy `update()` path applies via `ensure_decode_capacity`.
         // This flash dispatch bypasses `update()`, so without growing here the
-        // storage `max_seq` (and the bf16 mirror + latched flash buffers sized
+        // cache `max_seq` (and the bf16 mirror + latched flash buffers sized
         // off it) freeze at the prefill length; the append then walks off the
         // end at the next power-of-two boundary and slices an empty tensor
         // (surfacing downstream as a `reshape … size 0`). A request that
@@ -259,7 +259,7 @@ impl KvCache {
         // rather than crashing mid-append.
         self.ensure_decode_capacity(kv_seq_after_update)?;
         let max_seq = match &self.storage {
-            KvStorage::K8V4 { .. } => self.storage.max_seq(),
+            KvStorage::K8V4 { .. } => self.max_seq,
             _ => return Ok(None),
         };
         let prev_offset = self.offset;
@@ -761,7 +761,7 @@ impl KvCache {
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
-        let max_seq = self.storage.max_seq();
+        let max_seq = self.max_seq;
         let KvStorage::K8V8 { k, v, .. } = &mut self.storage else {
             unreachable!("storage mismatch: expected K8V8");
         };
@@ -843,7 +843,7 @@ impl KvCache {
         device: Device,
     ) -> Result<()> {
         let max_seq = match &self.storage {
-            KvStorage::K8V8 { .. } => self.storage.max_seq(),
+            KvStorage::K8V8 { .. } => self.max_seq,
             _ => return Err(storage_mismatch("K8V8", &self.storage)),
         };
         let new_shape = k_full.shape();
@@ -902,7 +902,7 @@ impl KvCache {
         device: Device,
     ) -> Result<()> {
         let max_seq = match &self.storage {
-            KvStorage::K8V4 { .. } => self.storage.max_seq(),
+            KvStorage::K8V4 { .. } => self.max_seq,
             _ => return Err(storage_mismatch("K8V4", &self.storage)),
         };
         let new_shape = k_full.shape();

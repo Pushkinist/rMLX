@@ -380,7 +380,7 @@ impl KvCache {
         let Some((v_bits, use_tcq, variant)) = k8_turbo_v_knobs(&self.storage) else {
             return Err(storage_mismatch(K8_TURBO_V_VARIANTS, &self.storage));
         };
-        let max_seq = self.storage.max_seq();
+        let max_seq = self.max_seq;
 
         if self.decode_fp16_k.is_some() {
             return self.update_decode_fp16(new_k, new_v, max_seq, device);
@@ -412,7 +412,7 @@ impl KvCache {
             return Err(storage_mismatch(K8_TURBO_V_VARIANTS, &self.storage));
         };
         warn_if_width_disagrees(self.quant, self.quant.approx_code_bits().1, v_bits);
-        let max_seq = self.storage.max_seq();
+        let max_seq = self.max_seq;
         let (KvStorage::K8VTurbo3 { k, v, .. }
         | KvStorage::K8VTurbo2 { k, v, .. }
         | KvStorage::K8VTurbo3Tcq { k, v, .. }
@@ -440,7 +440,7 @@ impl KvCache {
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
-        let max_seq = self.storage.max_seq();
+        let max_seq = self.max_seq;
         let (KvStorage::TurboSym3 { .. } | KvStorage::TurboSym4 { .. }) = &self.storage else {
             return Err(storage_mismatch("TurboSym3 | TurboSym4", &self.storage));
         };
@@ -472,7 +472,7 @@ impl KvCache {
         total_seq: i32,
     ) -> Result<()> {
         let quant_bits = self.quant.approx_code_bits().0;
-        let max_seq = self.storage.max_seq();
+        let max_seq = self.max_seq;
         if let KvStorage::TurboSym3 { k, v, .. } = &mut self.storage {
             warn_if_width_disagrees(self.quant, quant_bits, 3);
             tsym_bulk_encode::<3>(k, v, max_seq, k_full, v_full, device, total_seq)

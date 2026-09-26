@@ -234,26 +234,24 @@ mod tests {
     }
 
     #[test]
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "wildcard arm is the correct fallthrough for unsupported arch/quant variants; exhaustive expansion would require updating on every new variant"
-    )]
     fn with_quant_max_seq_stores_correct_capacity() {
         let c_default = KvCache::with_quant(KvQuant::K8V4);
-        let default_max = match &c_default.storage {
-            KvStorage::K8V4 { max_seq, .. } => *max_seq,
-            _ => panic!("expected K8V4 storage"),
-        };
+        assert!(
+            matches!(c_default.storage, KvStorage::K8V4 { .. }),
+            "expected K8V4 storage"
+        );
+        let default_max = c_default.max_seq();
         assert_eq!(
             default_max, KV_MAX_SEQ_DEFAULT,
             "with_quant(K8V4) must cap at KV_MAX_SEQ_DEFAULT={KV_MAX_SEQ_DEFAULT}"
         );
 
         let c_long = KvCache::with_quant_max_seq(KvQuant::K8V4, 8192);
-        let long_max = match &c_long.storage {
-            KvStorage::K8V4 { max_seq, .. } => *max_seq,
-            _ => panic!("expected K8V4 storage"),
-        };
+        assert!(
+            matches!(c_long.storage, KvStorage::K8V4 { .. }),
+            "expected K8V4 storage"
+        );
+        let long_max = c_long.max_seq();
         assert_eq!(
             long_max, 8192,
             "with_quant_max_seq(K8V4, 8192) must store max_seq=8192, not KV_MAX_SEQ_DEFAULT"

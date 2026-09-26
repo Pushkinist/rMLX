@@ -254,7 +254,8 @@ fn hydrate_incomplete_when_swa_layer_empty() {
     // Full-attention layer: real K8V8 storage with a recorded offset (the
     // hydrate path reconstructs these with payload).
     let full = KvCache::from_storage(
-        KvStorage::new(KvQuant::K8V8, 8192),
+        KvStorage::new(KvQuant::K8V8),
+        8192,
         KvQuant::K8V8,
         256,
         0,
@@ -269,7 +270,8 @@ fn hydrate_incomplete_when_swa_layer_empty() {
     // seed restored — exactly what `block_io` reconstructs for a gemma4 SWA
     // layer on hydrate.
     let swa = KvCache::from_storage(
-        KvStorage::None { max_seq: 512 },
+        KvStorage::None {},
+        512,
         KvQuant::K8V8,
         256,
         1,
@@ -662,9 +664,8 @@ fn gemma4_consume_engine_migration_golden() {
             // Drop the SWA ring to a payload-less None with no bf16 seed — the
             // incomplete-hydrate shape the engine must degrade.
             *c = KvCache::from_storage(
-                KvStorage::None {
-                    max_seq: model.cfg.sliding_window as i32,
-                },
+                KvStorage::None {},
+                model.cfg.sliding_window as i32,
                 kv_quant,
                 BLOCK_TOKENS as i32,
                 i,

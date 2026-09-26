@@ -269,7 +269,7 @@ impl KvCache {
         let new_seq = new_k.shape()[2];
         // Provision the step before any mutation: `update_prefill_raw` runs the
         // prefill-side check itself, so this covers the decode dispatch below,
-        // whose stores all cap their capacity at the storage `max_seq`.
+        // whose stores all cap their capacity at the cache `max_seq`.
         if !self.in_prefill {
             self.ensure_decode_capacity(self.offset + new_seq)?;
         }
@@ -362,7 +362,7 @@ impl KvCache {
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
-        let max_seq = self.storage.max_seq();
+        let max_seq = self.max_seq;
         let KvStorage::None { .. } = &self.storage else {
             return Err(Error::KvStorageMismatch {
                 expected: "None",
@@ -379,7 +379,7 @@ impl KvCache {
     /// When the existing `[B, kv_h, max_seq, head_dim]` buffer is too small,
     /// a new buffer of the next power-of-two capacity is allocated and the
     /// filled prefix `[..prev_offset]` is copied forward via `slice_update`.
-    /// The storage variant's `max_seq` is bumped to the new capacity so
+    /// The cache's `max_seq` is bumped to the new capacity so
     /// downstream `exit_prefill` quantised buffers honour the same size.
     ///
     /// # Resumed-cache guard
@@ -390,7 +390,7 @@ impl KvCache {
     /// payload buffers or `MixedKvState.offset`. On any resumed-cache path
     /// (chunked-prefill resume across calls, SSD-hydrate seed, branched
     /// generation), the storage already carries on-axis buffers sized to the
-    /// old `max_seq`. Bumping the scalar would let it disagree with the
+    /// old `max_seq`. Bumping `max_seq` would let it disagree with the
     /// payload shape and produce a shape assert or silent truncation in
     /// `exit_prefill`. The guard below detects payload presence and fails
     /// loudly with a typed error instead.
@@ -438,13 +438,13 @@ impl KvCache {
             }
         }
 
-        let current_max_seq = self.storage.max_seq();
+        let current_max_seq = self.max_seq;
         if needed_seq <= current_max_seq {
             return Ok(());
         }
 
         // A grow on a resumed cache (any payload currently materialised)
-        // would leave the storage `max_seq` scalar disagreeing with the
+        // would leave the cache `max_seq` scalar disagreeing with the
         // on-axis payload buffer length sized to the old max_seq → shape
         // assert or silent truncation downstream. Detect and fail loudly
         // instead of corrupting the buffers. The grow path is only legal on
@@ -484,9 +484,9 @@ impl KvCache {
             "KV prefill buffer grow"
         );
 
-        // Bump max_seq on the storage variant first so subsequent reads see
-        // the new capacity (single-source-of-truth for exit_prefill).
-        set_storage_max_seq(&mut self.storage, new_max_seq);
+        // Bump max_seq first so subsequent reads see the new capacity
+        // (single-source-of-truth for exit_prefill).
+        self.max_seq = new_max_seq;
 
         // If the raw prefill buffer was already allocated, copy the filled
         // prefix `[..prev_offset]` into a fresh, larger buffer. If not
@@ -658,7 +658,7 @@ impl KvCache {
             }
         }
 
-        let current_max_seq = self.storage.max_seq();
+        let current_max_seq = self.max_seq;
         if needed_seq <= current_max_seq {
             return Ok(());
         }
@@ -685,7 +685,7 @@ impl KvCache {
             "KV decode buffer grow"
         );
 
-        set_storage_max_seq(&mut self.storage, new_max_seq);
+        self.max_seq = new_max_seq;
         Ok(())
     }
 
@@ -694,12 +694,12 @@ impl KvCache {
     /// # Buffer-grow contract
     ///
     /// The raw prefill buffer is allocated lazily on first call with shape
-    /// `[B, kv_h, max_seq, head_dim]`, where `max_seq` is the value recorded
-    /// on the active `KvStorage` variant. Before every write we check whether
+    /// `[B, kv_h, max_seq, head_dim]`, where `max_seq` is the cache's
+    /// provisioned capacity. Before every write we check whether
     /// `prev_offset + new_seq` fits in the current buffer; if not, we grow
     /// the buffer to the next power-of-two ≥ needed (so subsequent chunks
     /// also fit without churn) and copy the existing filled prefix forward.
-    /// The storage variant's `max_seq` field is bumped in lockstep so
+    /// The cache's `max_seq` is bumped in lockstep so
     /// `exit_prefill` allocates downstream quantised buffers with the same
     /// new capacity.
     ///
@@ -744,7 +744,7 @@ impl KvCache {
 
         // Enforce the optional hard cap before any allocation, then grow the
         // per-layer raw prefill buffer if the new chunk would overflow it.
-        // The storage variant's `max_seq` is bumped in lockstep so the
+        // The cache's `max_seq` is bumped in lockstep so the
         // downstream `exit_prefill` quantised buffers see the new capacity.
         self.ensure_prefill_capacity(
             new_offset,
@@ -757,7 +757,7 @@ impl KvCache {
             device,
         )?;
 
-        let max_seq = self.storage.max_seq();
+        let max_seq = self.max_seq;
 
         if self.prefill_raw_k.is_none() {
             let buf_shape = [b, kv_h, max_seq, head_dim];
@@ -1168,6 +1168,7 @@ impl KvCache {
             // decode mirrors above exist; the bytes are then counted off the
             // buffers themselves, so it must not be added a second time here.
             shares_kv: _,
+            max_seq: _,
             flash_max_seq: _,
             flash_filled: _,
             max_seq_ceiling: _,
@@ -1936,6 +1937,7 @@ impl KvCache {
     pub fn try_deep_clone(&self) -> Result<Self> {
         Ok(Self {
             storage: self.storage.try_deep_clone()?,
+            max_seq: self.max_seq,
             offset: self.offset,
             quant: self.quant,
             layer_idx: self.layer_idx,
@@ -2110,53 +2112,4 @@ pub(super) fn next_pow2_seq(needed: i32) -> i32 {
     // next_power_of_two on u32; safe because n <= max_pow2 < 2^31.
     let p = n.next_power_of_two();
     p as i32
-}
-
-/// Bump the `max_seq` recorded on the active storage variant. This is the
-/// single source of truth read by `update_prefill_raw`, `exit_prefill`, and the
-/// per-axis `QuantK::append` / `QuantV::append` capacity caps.
-///
-/// Two callers, with different payload states — neither needs bytes migrated
-/// here:
-///
-/// * [`KvCache::ensure_prefill_capacity`] — no quantised payload exists yet
-///   (`storage_has_materialised_payload` refuses the grow otherwise). The
-///   storage is materialised later, in `exit_prefill`, from the now-larger raw
-///   prefill buffer, and reads `max_seq` from here.
-/// * [`KvCache::ensure_decode_capacity`] — the payload always exists. Raising
-///   the scalar is exactly what lets each store's own grow path extend itself
-///   on the next append: capacity is tracked per-store and the filled prefix is
-///   copied forward on realloc.
-///
-/// In both cases this writes a scalar only; no buffer is resized here.
-fn set_storage_max_seq(storage: &mut KvStorage, new_max_seq: i32) {
-    match storage {
-        KvStorage::K8V4 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::K8V8 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::Planar { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::None { max_seq } => *max_seq = new_max_seq,
-        KvStorage::Mixed { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::Paged { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::K8VTurbo3 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::TurboSym3 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::TurboSym4 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::PlanarK { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::K8VTurbo2 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::IsoV3 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::IsoV4 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::RotorV3 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::RotorV4 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::K8VTurbo3Tcq { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::K8VTurbo2Tcq { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::IsoSym3 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::IsoSym4 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::IsoKOnly3 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::IsoKOnly4 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::RotorSym3 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::RotorSym4 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::RotorKOnly3 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::RotorKOnly4 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::RotorKAsym3 { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::RotorKAsym4 { max_seq, .. } => *max_seq = new_max_seq,
-    }
 }

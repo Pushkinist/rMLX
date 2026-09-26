@@ -123,18 +123,18 @@ SCALAR_KNOBS = frozenset({"bits", "v_bits", "v_group_size"})
 def classify(fields: list[str]) -> str:
     """Which update body a variant's field shape can share.
 
-    `kv_slots` is the shape the restructure writes once: a K slot, a V slot and
-    `max_seq`. `kv_slots_plus` is that shape with scalar knobs beside it.
+    `kv_slots` is the shape the restructure writes once: a K slot and a V slot.
+    `kv_slots_plus` is that shape with scalar knobs beside it.
     `k_only` is the same shape with the V side living on the parent cache as
     bf16. Everything else holds its state somewhere the shape cannot reach, and
     keeps its own body.
     """
     has = set(fields)
-    if has == {"k", "v", "max_seq"}:
+    if has == {"k", "v"}:
         return "kv_slots"
-    if {"k", "v", "max_seq"} <= has and has - {"k", "v", "max_seq"} <= SCALAR_KNOBS:
+    if {"k", "v"} <= has and has - {"k", "v"} <= SCALAR_KNOBS:
         return "kv_slots_plus"
-    if has == {"k", "max_seq"}:
+    if has == {"k"}:
         return "k_only"
     return "other"
 

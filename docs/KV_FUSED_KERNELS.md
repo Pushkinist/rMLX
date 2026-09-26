@@ -535,7 +535,8 @@ producer path. Its gates, in order:
 7. The codec has a GPU encoder (`codec_has_gpu_encoder`).
 8. For a rotor codec, the global `--rotor-qjl` toggle is off.
 9. `decode_fp16_k` is seeded.
-10. The storage variant carries a `max_seq` (`storage_max_seq_for_fused_qk`).
+10. The storage variant is in the fused-QK table
+    (`storage_max_seq_for_fused_qk`), which returns the cache's `max_seq`.
 11. The step does not overflow it (`prev_offset + new_seq <= max_seq`). The
     shadow populate path has no out-of-range clamp.
 

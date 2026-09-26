@@ -37,7 +37,7 @@ impl KvCache {
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
-        let max_seq = self.storage.max_seq();
+        let max_seq = self.max_seq;
         let KvStorage::Planar { k, v, bits, .. } = &mut self.storage else {
             unreachable!("storage mismatch: expected Planar");
         };
@@ -125,7 +125,7 @@ impl KvCache {
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
-        let max_seq = self.storage.max_seq();
+        let max_seq = self.max_seq;
         let KvStorage::PlanarK { k, .. } = &mut self.storage else {
             return Err(storage_mismatch("PlanarK", &self.storage));
         };
@@ -190,7 +190,7 @@ impl KvCache {
         device: Device,
     ) -> Result<()> {
         let (max_seq, v_bits) = match &self.storage {
-            KvStorage::Planar { bits, .. } => (self.storage.max_seq(), *bits),
+            KvStorage::Planar { bits, .. } => (self.max_seq, *bits),
             _ => return Err(storage_mismatch("Planar", &self.storage)),
         };
         let new_shape = k_full.shape();
@@ -257,7 +257,7 @@ impl KvCache {
             "exit_prefill PlanarK: bulk-quantizing K (planar4); V stays bf16"
         );
         let max_seq = match &self.storage {
-            KvStorage::PlanarK { .. } => self.storage.max_seq(),
+            KvStorage::PlanarK { .. } => self.max_seq,
             _ => return Err(storage_mismatch("PlanarK", &self.storage)),
         };
         let new_shape = k_full.shape();

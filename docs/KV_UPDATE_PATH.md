@@ -41,7 +41,7 @@ the function owns and returns early, promoting them into the bf16 mirror.
 
 ## One body per store shape
 
-24 of the 27 `KvStorage` variants hold store slots and `max_seq`. 19 hold a K
+24 of the 27 `KvStorage` variants hold store slots. 19 hold a K
 slot and a V slot; `Planar`, `RotorKAsym3` and `RotorKAsym4` also carry a
 scalar knob. 5 hold a K slot only, with V as bf16 on the parent cache:
 `PlanarK`, `IsoKOnly3`, `IsoKOnly4`, `RotorKOnly3`, `RotorKOnly4`. `None` holds

@@ -268,7 +268,7 @@ pub(super) fn iso_k_only_gpu_append(
     new_shape: &[i32],
     device: Device,
 ) -> Result<()> {
-    let max_seq = cache.storage.max_seq();
+    let max_seq = cache.max_seq;
     let (KvStorage::IsoKOnly3 { .. } | KvStorage::IsoKOnly4 { .. }) = &cache.storage else {
         return Err(storage_mismatch("IsoKOnly3 | IsoKOnly4", &cache.storage));
     };
@@ -355,7 +355,7 @@ pub(super) fn iso_sym_gpu_append(
     new_shape: &[i32],
     device: Device,
 ) -> Result<()> {
-    let max_seq = cache.storage.max_seq();
+    let max_seq = cache.max_seq;
     let (KvStorage::IsoSym3 { .. } | KvStorage::IsoSym4 { .. }) = &cache.storage else {
         return Err(storage_mismatch("IsoSym3 | IsoSym4", &cache.storage));
     };
@@ -958,7 +958,7 @@ impl KvCache {
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
-        let max_seq = self.storage.max_seq();
+        let max_seq = self.max_seq;
         let (KvStorage::IsoV3 { .. } | KvStorage::IsoV4 { .. }) = &self.storage else {
             return Err(storage_mismatch("IsoV3 | IsoV4", &self.storage));
         };
@@ -988,7 +988,7 @@ impl KvCache {
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
-        let max_seq = self.storage.max_seq();
+        let max_seq = self.max_seq;
         let (KvStorage::IsoSym3 { .. } | KvStorage::IsoSym4 { .. }) = &self.storage else {
             return Err(storage_mismatch("IsoSym3 | IsoSym4", &self.storage));
         };
@@ -1025,7 +1025,7 @@ impl KvCache {
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
-        let max_seq = self.storage.max_seq();
+        let max_seq = self.max_seq;
         let (KvStorage::IsoKOnly3 { .. } | KvStorage::IsoKOnly4 { .. }) = &self.storage else {
             return Err(storage_mismatch("IsoKOnly3 | IsoKOnly4", &self.storage));
         };
@@ -1056,7 +1056,7 @@ impl KvCache {
         total_seq: i32,
     ) -> Result<()> {
         let quant_bits = self.quant.approx_code_bits().1;
-        let max_seq = self.storage.max_seq();
+        let max_seq = self.max_seq;
         if let KvStorage::IsoV3 { k, v, .. } = &mut self.storage {
             warn_if_width_disagrees(self.quant, quant_bits, 3);
             iso_v_bulk_encode::<3>(k, v, max_seq, k_full, v_full, device, total_seq)
@@ -1079,7 +1079,7 @@ impl KvCache {
         total_seq: i32,
     ) -> Result<()> {
         let quant_bits = self.quant.approx_code_bits().0;
-        let max_seq = self.storage.max_seq();
+        let max_seq = self.max_seq;
         if let KvStorage::IsoSym3 { k, v, .. } = &mut self.storage {
             warn_if_width_disagrees(self.quant, quant_bits, 3);
             iso_sym_bulk_encode::<3>(k, v, max_seq, k_full, v_full, device, total_seq)
@@ -1102,7 +1102,7 @@ impl KvCache {
         total_seq: i32,
     ) -> Result<()> {
         let quant_bits = self.quant.approx_code_bits().0;
-        let max_seq = self.storage.max_seq();
+        let max_seq = self.max_seq;
         if let KvStorage::IsoKOnly3 { k, .. } = &mut self.storage {
             warn_if_width_disagrees(self.quant, quant_bits, 3);
             iso_k_only_bulk_encode::<3>(k, max_seq, k_full, device, total_seq)

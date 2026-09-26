@@ -696,7 +696,6 @@ fn kv_storage_truncate_routes_every_arm_through_the_store_cut() {
         let mut storage = super::KvStorage::K8V4 {
             k: Some(k),
             v: Some(v),
-            max_seq: MAX_SEQ,
         };
         storage.truncate_to(3);
         let super::KvStorage::K8V4 { k, v, .. } = &mut storage else {
@@ -731,7 +730,6 @@ fn kv_storage_truncate_routes_every_arm_through_the_store_cut() {
         let mut storage = super::KvStorage::TurboSym3 {
             k: Some(k),
             v: Some(v),
-            max_seq: MAX_SEQ,
         };
         storage.truncate_to(3);
         let super::KvStorage::TurboSym3 { k, v, .. } = &mut storage else {
@@ -766,7 +764,6 @@ fn kv_storage_truncate_routes_every_arm_through_the_store_cut() {
         let mut storage = super::KvStorage::TurboSym4 {
             k: Some(k),
             v: Some(v),
-            max_seq: MAX_SEQ,
         };
         storage.truncate_to(3);
         let super::KvStorage::TurboSym4 { k, v, .. } = &mut storage else {
@@ -801,7 +798,6 @@ fn kv_storage_truncate_routes_every_arm_through_the_store_cut() {
         let mut storage = super::KvStorage::Planar {
             k: Some(k),
             v: Some(v),
-            max_seq: MAX_SEQ,
             bits: 4,
         };
         storage.truncate_to(3);
@@ -831,10 +827,7 @@ fn kv_storage_truncate_routes_every_arm_through_the_store_cut() {
         let mut k = QuantPlanarK::new(init_shape(1, kv_h, d), MAX_SEQ);
         append_cpu!(k, 1, kv_h, d, 0, 1, 0);
         append_cpu!(k, 1, kv_h, d, 1, 4, 0);
-        let mut storage = super::KvStorage::PlanarK {
-            k: Some(k),
-            max_seq: MAX_SEQ,
-        };
+        let mut storage = super::KvStorage::PlanarK { k: Some(k) };
         storage.truncate_to(3);
         let super::KvStorage::PlanarK { k, .. } = &mut storage else {
             unreachable!("constructed as PlanarK")
@@ -881,7 +874,6 @@ fn kv_storage_reset_clears_the_cpu_payload() {
     let mut storage = super::KvStorage::K8V4 {
         k: Some(k),
         v: Some(v),
-        max_seq: MAX_SEQ,
     };
 
     storage.reset();

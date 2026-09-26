@@ -190,16 +190,7 @@ impl KvCache {
         // `prev_offset + new_seq` above, so `update_decode_fp16` slices the new
         // token in at `[prev_offset:offset]` — identical bookkeeping to K8V4.
         let kv = if want_kv {
-            let max_seq = match &self.storage {
-                KvStorage::Mixed { .. } => self.storage.max_seq(),
-                _ => {
-                    return Err(Error::KvStorageMismatch {
-                        expected: "Mixed",
-                        got: storage_variant_name(&self.storage),
-                    })
-                }
-            };
-            let (k_full, v_full) = self.update_decode_fp16(new_k, new_v, max_seq, device)?;
+            let (k_full, v_full) = self.update_decode_fp16(new_k, new_v, self.max_seq, device)?;
             Some((k_full, v_full))
         } else {
             None
@@ -1348,7 +1339,7 @@ impl KvCache {
         self.ensure_decode_capacity(self.offset + new_k.shape()[2])?;
 
         // Extract & validate storage variant.
-        let max_seq = self.storage.max_seq();
+        let max_seq = self.max_seq;
         let KvStorage::PlanarK { k, .. } = &mut self.storage else {
             return Ok(None);
         };
@@ -1652,7 +1643,7 @@ impl KvCache {
         // every decode step overwrites the last V position instead of
         // appending. Same ordering as `update_and_sdpa_planar_k_fused`.
         self.offset = prev_seq + new_seq;
-        let max_seq = rotor_k_max_seq(&self.storage)?;
+        let max_seq = self.max_seq;
         let (v_slab, v_valid) = self.update_decode_fp16_v_slab(new_v, max_seq, device)?;
 
         // Take `kv_seq` from the store the ring was written from, not from
@@ -1910,7 +1901,7 @@ impl KvCache {
 
         let prev_seq = self.offset;
         // Provision this step before the first mutation: both packed rings are
-        // capped by the storage `max_seq`, so it has to cover
+        // capped by the cache `max_seq`, so it has to cover
         // `prev_seq + new_seq` before either append runs. Without it the window
         // freezes at whatever the prompt needed and decode dies mid-stream once
         // it crosses that bound — on both axes here, since neither has a bf16
@@ -2180,7 +2171,7 @@ impl KvCache {
         // every decode step overwrites the last V position instead of
         // appending. Same ordering as `update_and_sdpa_rotor_k_fused`.
         self.offset = prev_seq + new_seq;
-        let max_seq = iso_k_max_seq(&self.storage)?;
+        let max_seq = self.max_seq;
         let (v_slab, v_valid) = self.update_decode_fp16_v_slab(new_v, max_seq, device)?;
 
         // Take `kv_seq` from the store the ring was written from, not from
@@ -2416,7 +2407,7 @@ impl KvCache {
 
         let prev_seq = self.offset;
         // Provision this step before the first mutation: both packed rings are
-        // capped by the storage `max_seq`, so it has to cover `prev_seq + new_seq`
+        // capped by the cache `max_seq`, so it has to cover `prev_seq + new_seq`
         // before either append runs.
         self.ensure_decode_capacity(prev_seq + new_seq)?;
         super::update_iso::iso_sym_gpu_append(self, new_k, new_v, &new_shape, device)?;
@@ -2831,32 +2822,4 @@ fn iso_sym_accumulated_seq(storage: &KvStorage) -> Result<i32> {
         )));
     }
     Ok(k_seq)
-}
-
-/// `max_seq` of the active iso K-only storage variant.
-///
-/// Read from the live `KvStorage` variant — which `ensure_decode_capacity` has
-/// just grown for this step — never from the store struct's own inert
-/// `max_seq` field, which is a prefill-time snapshot.
-pub(super) fn iso_k_max_seq(storage: &KvStorage) -> Result<i32> {
-    if let KvStorage::IsoKOnly3 { .. } | KvStorage::IsoKOnly4 { .. } = storage {
-        Ok(storage.max_seq())
-    } else {
-        Err(Error::KvStorageMismatch {
-            expected: "IsoKOnly3 | IsoKOnly4",
-            got: storage_variant_name(storage),
-        })
-    }
-}
-
-/// `max_seq` of the active rotor K-only storage variant.
-pub(super) fn rotor_k_max_seq(storage: &KvStorage) -> Result<i32> {
-    if let KvStorage::RotorKOnly3 { .. } | KvStorage::RotorKOnly4 { .. } = storage {
-        Ok(storage.max_seq())
-    } else {
-        Err(Error::KvStorageMismatch {
-            expected: "RotorKOnly3 | RotorKOnly4",
-            got: storage_variant_name(storage),
-        })
-    }
 }

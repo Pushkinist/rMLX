@@ -50,10 +50,10 @@ fn seeded_cache() -> KvCache {
             vec![1, KV_H, 0, HEAD_DIM],
             0,
         )),
-        max_seq: MAX_SEQ,
     };
     KvCache::from_storage(
         storage,
+        MAX_SEQ,
         KvQuant::RotorKOnly3,
         0,
         0,

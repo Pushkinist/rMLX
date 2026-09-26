@@ -140,6 +140,10 @@ mod deep_clone_digest_tests;
 #[path = "max_seq_accessor_tests.rs"]
 mod max_seq_accessor_tests;
 
+#[cfg(test)]
+#[path = "max_seq_paths_tests.rs"]
+mod max_seq_paths_tests;
+
 // Byte-level pin on the rotor storage layer: what every rotor spelling writes
 // into its packed store, and what the attention reads back from it.
 #[cfg(test)]

@@ -848,7 +848,7 @@ impl KvQuant {
     ///
     /// This is the predicate `exit_prefill` gates the allocation on, and the one
     /// the byte estimate reads. The **spill path does not read it** — it asks
-    /// [`crate::storage::KvStorage::geometry_only_max_seq`], a predicate on the
+    /// [`crate::storage::KvStorage::is_geometry_only`], a predicate on the
     /// other enum, and nothing in the type system couples the two. A codec
     /// classified `false` here whose storage variant lands in that function's
     /// "payload is not an `Option`" arm would make the writer stamp a codec

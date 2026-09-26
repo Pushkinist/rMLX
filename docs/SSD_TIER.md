@@ -388,7 +388,7 @@ A reader whose `model_id` or `kv_quant` differs fails with
 `BlockIoError::ModelIdMismatch` or `KvQuantMismatch` before any tensor read.
 
 **What a layer writes follows what it holds.**
-`KvStorage::geometry_only_max_seq()` decides:
+`KvStorage::is_geometry_only()` decides:
 
 - a layer with a packed store writes its codec's tensors under
   `l{i}.k.*` / `l{i}.v.*` (codes, scales, and per codec biases, norms,

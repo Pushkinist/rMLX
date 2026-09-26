@@ -113,13 +113,13 @@ Prefill chunks accumulate into a raw per-layer buffer
 quantizes it once, at the end of prefill.
 
 `update_prefill_raw` calls `ensure_prefill_capacity` on every chunk. When the
-chunk needs more than the storage's `max_seq`, it:
+chunk needs more than the cache's `max_seq`, it:
 
 1. allocates a buffer at `next_pow2_seq(needed)`, the next power of two,
    saturated at `2^30` and clamped to the ceiling (§4.6);
 2. copies the filled prefix into it;
-3. raises `max_seq` on the storage variant, so `exit_prefill` sizes its
-   buffers to match.
+3. raises `KvCache::max_seq`, so `exit_prefill` sizes its buffers to
+   match.
 
 A grow is legal only before the first `exit_prefill`. On a cache whose
 quantized payload already exists, it fails with

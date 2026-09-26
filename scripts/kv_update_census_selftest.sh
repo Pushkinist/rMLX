@@ -47,10 +47,10 @@ build_tree() { # build_tree ROOT
     mkdir -p "${root}/$(dirname "${STORAGE_REL}")" "${root}/$(dirname "${UPDATE_REL}")"
     cat >"${root}/${STORAGE_REL}" <<'EOF'
 pub enum KvStorage {
-    Alpha { k: Option<QuantK>, v: Option<QuantV>, max_seq: i32 },
-    Beta { k: Option<QuantK>, v: Option<QuantV>, max_seq: i32, bits: u8 },
-    Gamma { k: Option<QuantK>, max_seq: i32 },
-    Delta { state: MixedKvState, max_seq: i32 },
+    Alpha { k: Option<QuantK>, v: Option<QuantV> },
+    Beta { k: Option<QuantK>, v: Option<QuantV>, bits: u8 },
+    Gamma { k: Option<QuantK> },
+    Delta { state: MixedKvState },
 }
 
 pub fn resident(s: &KvStorage) -> usize {
@@ -239,7 +239,7 @@ check "a two-variant site sits at the derived bar" "${T}" 0 "^match-sites 4$" ma
 
 # 5b — a fifth variant moves the bar to 3, and the two-variant site drops out
 # with it. The bar and the count move together, which a fixed bar cannot do.
-sed -i.bak 's/    Delta { state: MixedKvState, max_seq: i32 },/    Delta { state: MixedKvState, max_seq: i32 },\n    Epsilon { k: Option<QuantK>, max_seq: i32 },/' \
+sed -i.bak 's/    Delta { state: MixedKvState },/    Delta { state: MixedKvState },\n    Epsilon { k: Option<QuantK> },/' \
     "${T}/${STORAGE_REL}"
 check "a fifth variant moves the derived bar" "${T}" 0 "^enum KvStorage variants=5 threshold=3$" match-sites
 check "the two-variant site drops below the moved bar" "${T}" 0 "^match-sites 3$" match-sites
@@ -263,7 +263,7 @@ check "a tree with no crates directory" "${T}" 2 "unavailable: crates" match-sit
 # 8 — a crates directory holding no variant reference.
 T="${WORK}/nomention"; build_tree "${T}"
 rm -rf "${T}/crates/rmlx-kv-quant/src/kvcache"
-printf 'pub enum KvStorage { Alpha { k: Option<QuantK>, v: Option<QuantV>, max_seq: i32 } }\n' \
+printf 'pub enum KvStorage { Alpha { k: Option<QuantK>, v: Option<QuantV> } }\n' \
     >"${T}/${STORAGE_REL}"
 printf 'pub enum KvQuant { One }\n' >"${T}/${QUANT_REL}"
 check "no file names a variant" "${T}" 2 "unavailable: no source file" match-sites --threshold 2
@@ -282,7 +282,7 @@ check "an unterminated block is a refusal" "${T}" 2 "unavailable: .*update.rs" m
 
 # 11 — the shape census. Four planted variants, one per shape class.
 T="${WORK}/shapes"; build_tree "${T}"
-check "shape census: two slots and max_seq" "${T}" 0 "^shape kv_slots 1$" variants
+check "shape census: two slots" "${T}" 0 "^shape kv_slots 1$" variants
 check "shape census: a scalar knob beside the slots" "${T}" 0 "^shape kv_slots_plus 1$" variants
 check "shape census: K only" "${T}" 0 "^shape k_only 1$" variants
 check "shape census: state the shape cannot reach" "${T}" 0 "^shape other 1$" variants
@@ -291,7 +291,7 @@ check "shape census: the shared-shape total" "${T}" 0 "^shape store_slots_total 
 # 12 — a variant that grows a field outside the scalar-knob set leaves the
 # shared shape. It must not be folded in quietly.
 T="${WORK}/newfield"; build_tree "${T}"
-sed -i.bak 's/    Beta { k: Option<QuantK>, v: Option<QuantV>, max_seq: i32, bits: u8 },/    Beta { k: Option<QuantK>, v: Option<QuantV>, max_seq: i32, table: Table },/' \
+sed -i.bak 's/    Beta { k: Option<QuantK>, v: Option<QuantV>, bits: u8 },/    Beta { k: Option<QuantK>, v: Option<QuantV>, table: Table },/' \
     "${T}/${STORAGE_REL}"
 check "a state field leaves the shared shape" "${T}" 0 "^shape store_slots_total 2$" variants
 
@@ -463,7 +463,7 @@ check "a glob-import match is a site" "${T}" 0 "^match-sites 4$" match-sites --t
 # variant holds. A new codec with a new store still forces a touch there, so a
 # restructure that only moves the sites must not read as a reduction.
 T="${WORK}/slotenum"; build_tree "${T}"
-sed -i.bak 's/    Alpha { k: Option<QuantK>, v: Option<QuantV>, max_seq: i32 },/    Alpha { k: KSlot, v: Option<QuantV>, max_seq: i32 },/' \
+sed -i.bak 's/    Alpha { k: Option<QuantK>, v: Option<QuantV> },/    Alpha { k: KSlot, v: Option<QuantV> },/' \
     "${T}/${STORAGE_REL}"
 cat >>"${T}/${STORAGE_REL}" <<'EOF'
 
@@ -595,7 +595,7 @@ check "an enum no KvStorage field holds is not a site" "${T}" 0 "^match-sites 3$
 # 30 — a held enum that two files define. The producer cannot tell which one
 # the field holds, and says so rather than pick one.
 T="${WORK}/twoslots"; build_tree "${T}"
-sed -i.bak 's/    Alpha { k: Option<QuantK>, v: Option<QuantV>, max_seq: i32 },/    Alpha { k: KSlot, v: Option<QuantV>, max_seq: i32 },/' \
+sed -i.bak 's/    Alpha { k: Option<QuantK>, v: Option<QuantV> },/    Alpha { k: KSlot, v: Option<QuantV> },/' \
     "${T}/${STORAGE_REL}"
 printf 'pub enum KSlot { Q8(QuantK), Turbo(QuantKTurbo) }\n' >>"${T}/${STORAGE_REL}"
 printf 'pub enum KSlot { Iso(QuantIso) }\n' >>"${T}/${UPDATE_REL}"
@@ -636,7 +636,7 @@ check "a string table under the bar is not a table site" "${T}" 0 "^table-sites 
 # `Some(..)`; its `None` is `Option`'s, and reads as a third variant only in a
 # producer that ignores the `Some(..)` beside it.
 T="${WORK}/globnone"; build_tree "${T}"
-sed -i.bak 's/    Delta { state: MixedKvState, max_seq: i32 },/    Delta { state: MixedKvState, max_seq: i32 },\n    None { max_seq: i32 },/' \
+sed -i.bak 's/    Delta { state: MixedKvState },/    Delta { state: MixedKvState },\n    None {},/' \
     "${T}/${STORAGE_REL}"
 cat >>"${T}/${UPDATE_REL}" <<'EOF'
 
@@ -999,7 +999,7 @@ check "a descriptor arm that copies and patches another row is refused, with its
 
 # 50 — the real tree, pinned exactly. One run, all four figures compared, and
 # each failure prints the figure beside its pin and what to do.
-REAL_PINS="match-sites=19 forcing-sites=19 subset-sites=157 table-sites=2 descriptor-fns=1"
+REAL_PINS="match-sites=17 forcing-sites=17 subset-sites=154 table-sites=2 descriptor-fns=1"
 pin_advice() { # pin_advice NAME
     local list="python3 scripts/kv_update_census.py match-sites | grep"
     case "$1" in
