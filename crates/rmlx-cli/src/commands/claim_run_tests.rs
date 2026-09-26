@@ -8,7 +8,7 @@
 
 use super::*;
 use std::fs::{File, TryLockError};
-use std::io::{BufRead as _, BufReader, IsTerminal as _, Write as _};
+use std::io::{BufRead as _, BufReader};
 use std::path::Path;
 use std::process::{Child, ChildStdin};
 use std::sync::mpsc;
@@ -95,6 +95,28 @@ fn claim_run_child_holds_the_lock() {
     );
 }
 
+/// Only the claim-run child gets the lock fd across exec: this process's copy
+/// stays close-on-exec, so a process it starts at the same time does not.
+#[test]
+fn claim_run_other_spawns_do_not_inherit_the_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock = temp_lock(dir.path());
+    let probe = format!("test -e /dev/fd/{}", lock.as_raw_fd());
+    let mut holder = spawn_holding(&sh(&probe), lock.as_fd()).unwrap();
+    let other = Command::new("/bin/sh")
+        .args(["-c", &probe])
+        .status()
+        .unwrap();
+    assert!(
+        holder.wait().unwrap().success(),
+        "the claim-run child must inherit the lock fd"
+    );
+    assert!(
+        !other.success(),
+        "a process started beside it must not inherit the lock fd"
+    );
+}
+
 #[test]
 fn claim_run_exits_with_child_status() {
     let dir = tempfile::tempdir().unwrap();
@@ -164,13 +186,17 @@ const FORWARDED: [(&str, i32); 3] = [
     ("HUP", libc::SIGHUP),
 ];
 
-/// Start the ignored child test `name` of this binary with a pipe as its
-/// stdin, send it `go`, and return it with its stdin and the lines it prints
-/// after `tag`.
+/// A test filter that matches no test. A child test runs its body only when
+/// its argv carries it, so a hand run of the ignored child tests does nothing.
+const CHILD_MARKER: &str = "started-by-a-claim-run-parent-test";
+
+/// Start the ignored child test `name` of this binary with a pipe as its stdin
+/// and return it with its stdin and the lines it prints after `tag`.
 fn start_child(name: &str, tag: &'static str) -> (Child, ChildStdin, impl Iterator<Item = String>) {
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
             &format!("commands::claim_run::tests::{name}"),
+            CHILD_MARKER,
             "--exact",
             "--ignored",
             "--nocapture",
@@ -181,8 +207,7 @@ fn start_child(name: &str, tag: &'static str) -> (Child, ChildStdin, impl Iterat
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    writeln!(stdin, "go").unwrap();
+    let stdin = child.stdin.take().unwrap();
     let lines = BufReader::new(child.stdout.take().unwrap())
         .lines()
         .map_while(Result::ok)
@@ -191,12 +216,8 @@ fn start_child(name: &str, tag: &'static str) -> (Child, ChildStdin, impl Iterat
     (child, stdin, lines)
 }
 
-/// Whether this process was started by `start_child`: a child test returns at
-/// once when run by hand from a terminal.
 fn started_by_parent() -> bool {
-    let stdin = io::stdin();
-    let mut go = String::new();
-    !stdin.is_terminal() && stdin.lock().read_line(&mut go).is_ok() && go.trim() == "go"
+    std::env::args().any(|arg| arg == CHILD_MARKER)
 }
 
 /// The command's stdin is `/dev/null` even when this process's stdin is a
@@ -253,7 +274,7 @@ fn claim_run_receives_sigterm_sigint_and_sighup() {
 /// The child half of the signal test: installs the handlers and reports each
 /// signal it receives.
 #[test]
-#[ignore = "child process of claim_run_receives_sigterm_sigint_and_sighup; the parent test starts it"]
+#[ignore = "child of claim_run_receives_sigterm_sigint_and_sighup, which starts it"]
 fn signal_receiver_child() {
     if !started_by_parent() {
         return;

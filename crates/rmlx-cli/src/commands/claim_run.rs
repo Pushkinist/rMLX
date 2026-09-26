@@ -3,10 +3,13 @@
 //!
 //! The child inherits the claim fd as an extra descriptor and this process
 //! keeps no copy, so the claim is held exactly while the child, or a process it
-//! passed the fd to, runs. The child's stdin is `/dev/null`: it runs in its own
-//! process group, where a terminal read would stop it. SIGTERM, SIGINT and
-//! SIGHUP sent to this process are forwarded to the child's process group. The exit status is the child's; a child killed by a signal
-//! exits `128 + <signal>`, as a shell reports it.
+//! passed the fd to, runs. Only the child's copy of the fd survives exec: this
+//! process's copy stays close-on-exec, so no other process it starts gets the
+//! claim. The child's stdin is `/dev/null`: it runs in its own process group,
+//! where a terminal read would stop it. SIGTERM, SIGINT and SIGHUP sent to this
+//! process are forwarded to the child's process group. The exit status is the
+//! child's; a child killed by a signal exits `128 + <signal>`, as a shell
+//! reports it.
 //!
 //! The command must not start `rmlx`: this process holds the claim, so a nested
 //! `rmlx` GPU command is refused it.
@@ -15,7 +18,7 @@ use std::ffi::OsString;
 use std::io;
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
@@ -44,16 +47,7 @@ pub(crate) fn run_holding(
     command: &[OsString],
     signals: &Receiver<i32>,
 ) -> anyhow::Result<i32> {
-    let (program, args) = command
-        .split_first()
-        .ok_or_else(|| anyhow::anyhow!("claim run: no command given"))?;
-    inherit_across_exec(lock.as_fd()).context("claim run: keep the claim fd open across exec")?;
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .with_context(|| format!("claim run: start {}", program.to_string_lossy()))?;
+    let mut child = spawn_holding(command, lock.as_fd())?;
     drop(lock);
     let group = libc::pid_t::try_from(child.id()).context("claim run: child pid")?;
     info!(pid = child.id(), command = ?command, "claim run: child started");
@@ -71,8 +65,8 @@ pub(crate) fn run_holding(
     }
 }
 
-/// Deliver SIGTERM, SIGINT and SIGHUP to the returned channel instead of acting on
-/// them. The handlers are installed before this returns, so no signal that
+/// Deliver SIGTERM, SIGINT and SIGHUP to the returned channel instead of acting
+/// on them. The handlers are installed before this returns, so no signal that
 /// arrives after the child starts kills this process.
 fn forward_signals() -> anyhow::Result<Receiver<i32>> {
     use tokio::signal::unix::{signal, SignalKind};
@@ -108,20 +102,39 @@ fn forward_signals() -> anyhow::Result<Receiver<i32>> {
     Ok(receiver)
 }
 
-#[allow(unsafe_code, reason = "std has no safe way to clear FD_CLOEXEC")]
-fn inherit_across_exec(fd: BorrowedFd<'_>) -> io::Result<()> {
-    let raw = fd.as_raw_fd();
-    // SAFETY: F_GETFD / F_SETFD on an open, borrowed fd read and write only
-    // its descriptor flags.
-    let flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
-    if flags < 0 {
-        return Err(io::Error::last_os_error());
+/// Start `command` in its own process group with `/dev/null` as stdin and
+/// `lock` open across its exec. Only the child's copy of `lock` loses
+/// close-on-exec; this process's copy keeps it.
+#[allow(
+    unsafe_code,
+    reason = "std has no safe way to clear FD_CLOEXEC in the child"
+)]
+fn spawn_holding(command: &[OsString], lock: BorrowedFd<'_>) -> anyhow::Result<Child> {
+    let (program, args) = command
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("claim run: no command given"))?;
+    let raw = lock.as_raw_fd();
+    // The child's stdio is set up before `pre_exec` runs and would replace a
+    // claim fd numbered 0, 1 or 2.
+    anyhow::ensure!(
+        raw > libc::STDERR_FILENO,
+        "claim run: the claim fd {raw} is a standard stream"
+    );
+    let mut child = Command::new(program);
+    child.args(args).stdin(Stdio::null()).process_group(0);
+    // SAFETY: the closure runs in the forked child before exec and calls only
+    // fcntl, which is async-signal-safe, on an fd the child inherited open.
+    unsafe {
+        child.pre_exec(move || {
+            if libc::fcntl(raw, libc::F_SETFD, 0) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
-    // SAFETY: as above.
-    if unsafe { libc::fcntl(raw, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    child
+        .spawn()
+        .with_context(|| format!("claim run: start {}", program.to_string_lossy()))
 }
 
 #[allow(

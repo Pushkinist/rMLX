@@ -1994,14 +1994,14 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
     #[allow(
         clippy::unreachable,
         reason = "Cmd::Metrics, Cmd::Profile, Cmd::Claim and Cmd::KvCalibrate are handled by \
-                  early blocks above that return or exit; reaching these arms means the \
-                  early-exit guard was removed — a BUG"
+                  early blocks above that return; reaching these arms means the early-return \
+                  guard was removed — a BUG"
     )]
     #[allow(
         clippy::match_same_arms,
-        reason = "Metrics + Profile + Claim + KvCalibrate arms are unreachable!() guards documenting \
-                  distinct early-return commands above; collapsing them would lose the \
-                  Cmd-specific BUG narrative"
+        reason = "Metrics + Profile + Claim + KvCalibrate arms are unreachable!() guards \
+                  documenting distinct early-return commands above; collapsing them would \
+                  lose the Cmd-specific BUG narrative"
     )]
     match cli.cmd {
         Cmd::Metrics(_) => unreachable!("handled above"),
