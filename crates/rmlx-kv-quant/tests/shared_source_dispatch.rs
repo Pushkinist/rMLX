@@ -21,9 +21,8 @@
 // `#[ignore]` because it needs the Metal GPU. Run via:
 //   cargo test -p rmlx-kv-quant --test shared_source_dispatch -- --ignored --test-threads=1
 //
-// Preflight: `pkill -f "rmlx serve" || true; rm -f /tmp/rmlx.*.claim`.
-// CLAUDE.md hard rule 8 (single MLX process): integration runner serialises
-// tests within one process — no claim file is held by tests.
+// CLAUDE.md hard rule 8 (single MLX process): the test takes no Metal claim of
+// its own. Run it under `make gpu-test`, which holds the Metal claim.
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,

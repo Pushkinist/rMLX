@@ -171,8 +171,11 @@ It refuses to report OK when:
 - a crate executed fewer tests than were classified for it;
 - the selection matched no test, or the classification is empty;
 - `RMLX_SKIP_GPU=1` is set, since every classified test would return before
-  touching Metal (`TESTING.md` § "`RMLX_SKIP_GPU` opt-out");
-- another MLX process is live (`pgrep -f 'rmlx serve|mlx_lm|paroquant|omlx'`).
+  touching Metal (`TESTING.md` § "`RMLX_SKIP_GPU` opt-out").
+
+`make gpu-test` and `make ci-perf` run the suite under `rmlx claim run`, which
+holds the Metal claim for the whole run. When another process holds it, the
+suite does not start: the exit code is 11 and the refusal names the holder.
 
 A failing test is never on a known-red list; the runner keeps none. Before
 blaming a failure on a change, re-run the same crate and filter on a clean
@@ -296,8 +299,10 @@ the rest half. The whole gate on `main` finds it one merge later.
 `make ci-perf` is the only shared gate that runs the GPU tests. In order:
 
 1. `run_gpu_tests.sh --preflight` checks the environment and runs no test:
-   `RMLX_SKIP_GPU` unset, no competing MLX process, a non-empty
-   classification. It fails before the long step.
+   `RMLX_SKIP_GPU` unset and a non-empty classification. Then
+   `rmlx claim run -- true` takes the Metal claim and releases it, so a claim
+   another process holds fails here with exit 11. Both fail before the long
+   step.
 2. `make test-perf` runs the workspace under `release-perf`.
 3. The GPU suite runs, and the last line reports its verdict: `ci-perf ok`, or
    `ci-perf INCOMPLETE` when the runner printed the marker.

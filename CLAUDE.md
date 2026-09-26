@@ -514,9 +514,9 @@ baseline calls per model (Bonsai, Gemma4-e4b, Qwen3.6). It prints decode-only
 TPS, appends one CSV row per model to `<RMLX_HOME>/bench/perf_canary.csv` and
 records one further run in `runs.db`. The anchors in `docs/PERF_BASELINE.md`
 are at the bf16 `auto` default (Bonsai ~142, Gemma4-e4b ~80, Qwen3.6 ~101
-TPS). Its limit: the `canary` target deletes every `/tmp/rmlx.*.claim` file
-before it runs, which bypasses the claim (hard rule 8); check for another MLX
-process first. For automated gates use `make canary-gate SHA=<sha>` against
+TPS). The `canary` target stops no process and deletes no claim file: when
+another process holds the Metal claim, `perf_canary.sh` exits 11 and names the
+holder. For automated gates use `make canary-gate SHA=<sha>` against
 `runs.db`, or `scripts/regression_gate.sh <model> <baseline_tps>
 <baseline_stddev>`: exit 125 = `git bisect skip`, exit 1 = regression.
 `canary-gate` exits 0 when the SHA has no rows, so a clean exit does not prove

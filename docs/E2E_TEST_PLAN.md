@@ -113,9 +113,10 @@ A new model therefore needs only a manifest row carrying its slug, or, for one
 run, `RMLX_E2E_MODEL_<SLUG>=<path>`. When a model does not resolve, its cases
 record `SKIP` and the suite stays green.
 
-### Preflight
+### The Metal claim
 
-Every model-touching case runs a preflight first and tears down the `rmlx
-serve` it spawned afterwards. The preflight runs `pkill -f` on `rmlx serve`,
-`mlx_lm`, `paroquant` and `omlx`, whoever started them, and removes every
-`/tmp/rmlx.*.claim` file.
+Every `rmlx` the harness spawns takes the Metal claim itself. The harness kills
+and waits for each `rmlx serve` it spawned before it spawns the next one, so the
+claim is free again. It stops no process it did not start: when another process
+holds the claim, the spawned `rmlx` exits 11 and names the holder, and the case
+fails with that refusal.

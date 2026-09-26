@@ -10,9 +10,11 @@
 //!   wait for `/health`, send a named request fixture over raw HTTP/1.1, assert
 //!   on the response (golden / coherent / niah / cosine / thinking).
 //!
-//! Single-MLX discipline (hard rule 8): every model-touching case runs a
-//! `pkill`/claim-rm preflight first and tears down the spawned `rmlx serve`
-//! child after. The entry point pins `--test-threads=1`.
+//! Single-MLX discipline (hard rule 8): every `rmlx` the harness spawns takes
+//! the Metal claim itself, and the harness kills and waits for each `rmlx serve`
+//! child before it spawns the next, so the claim is free again. A claim some
+//! other process holds fails the case with the refusal; the harness stops no
+//! process it did not start. The entry point pins `--test-threads=1`.
 
 #![allow(
     clippy::unwrap_used,
@@ -209,31 +211,6 @@ fn cleanup_e2e_home() {
     }
 }
 
-// ── Single-MLX claim discipline (hard rule 8) ───────────────────────────────
-
-/// Kill any stray `rmlx serve` / mlx processes and remove the claim file.
-/// Best-effort; failures are logged, not fatal (the spawn will fail loudly if
-/// the GPU is genuinely held).
-fn claim_preflight() {
-    for pat in ["rmlx serve", "mlx_lm", "paroquant", "omlx"] {
-        let _ = Command::new("pkill").args(["-f", pat]).output();
-    }
-    std::thread::sleep(Duration::from_millis(800));
-    // Glob-remove EVERY stale claim. Serve binds in 18000..22000 (quant) and
-    // 17000..17500 (bf16 ref), so the old fixed `[62265, 8080]` list left a
-    // stale claim at the actual port alive. Best-effort: ignore read/remove
-    // errors (the spawn fails loudly if the GPU is genuinely held).
-    if let Ok(entries) = std::fs::read_dir("/tmp") {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with("rmlx.") && name.ends_with(".claim") {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    }
-}
-
 // ── HTTP (raw, std-only — mirrors http_smoke.rs over std::net) ───────────────
 
 fn http_post(port: u16, path: &str, body: &str) -> std::io::Result<(u16, String)> {
@@ -276,10 +253,10 @@ fn http_get(port: u16, path: &str) -> std::io::Result<(u16, String)> {
     Ok((status, text[body_start..].to_owned()))
 }
 
-/// A spawned `rmlx serve` child + its port. `Drop` kills the child.
+/// A spawned `rmlx serve` child. `Drop` kills the child and waits for it, which
+/// releases its Metal claim.
 struct ServeGuard {
     child: Child,
-    port: u16,
     home: PathBuf,
 }
 
@@ -287,7 +264,6 @@ impl Drop for ServeGuard {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_file(format!("/tmp/rmlx.{}.claim", self.port));
     }
 }
 
@@ -320,7 +296,6 @@ fn spawn_serve(
     let child = cmd.spawn().map_err(|e| format!("spawn rmlx serve: {e}"))?;
     let mut guard = ServeGuard {
         child,
-        port,
         home: home.to_path_buf(),
     };
 
@@ -861,13 +836,6 @@ fn run_cli_case(
     mk: &dyn Fn(Verdict, String) -> CaseResult,
 ) -> CaseResult {
     // GPU-loading CLI cases (probe-smoke, healthcheck --full) are claim-gated.
-    let loads_mlx = cli_args
-        .iter()
-        .any(|a| a == "--probe-smoke" || a == "--full");
-    if loads_mlx {
-        claim_preflight();
-    }
-
     let mut cmd = Command::new(rmlx_bin());
     cmd.env("RMLX_HOME", home).env("RUST_LOG", "warn");
     // Absolute fixtures dir so CWD-relative defaults in the spawned binary never
@@ -948,7 +916,6 @@ fn run_serve_case(
     home: &std::path::Path,
     mk: &dyn Fn(Verdict, String) -> CaseResult,
 ) -> CaseResult {
-    claim_preflight();
     let port = pick_port(case);
     let id = model_id(model);
     let fixture = case.request.as_deref().unwrap_or("chat_basic");
@@ -1041,12 +1008,9 @@ fn run_serve_case(
                 return mk(Verdict::Fail, e);
             }
         };
-        drop(guard); // release the quant server BEFORE the bf16 spawn.
-                     // HARD single-MLX: settle the quant Metal context (kill + ~800ms sleep
-                     // + claim glob-remove) BEFORE finish_cosine spawns the bf16 server. No
-                     // two `rmlx serve` may overlap. `Drop` already killed the child, but
-                     // claim_preflight guarantees the process is gone and the claim cleared.
-        claim_preflight();
+        // Single-MLX: `Drop` kills and waits for the quant server, so its claim
+        // is free before finish_cosine spawns the bf16 server.
+        drop(guard);
         return finish_cosine(case, &id, &quant_steps, refc, mk);
     }
 
@@ -1324,7 +1288,7 @@ fn fetch_logprobs(port: u16, id: &str) -> Result<Vec<LogprobStep>, String> {
 /// (lazily) compute the bf16 reference logprob steps once per (model, fixture),
 /// cache them, and compare against the quant codec's steps. The bf16 server is
 /// spawned here under single-MLX discipline — the quant server is already torn
-/// down (and the GPU settled via claim_preflight) by the caller.
+/// down by the caller.
 ///
 /// Fidelity signal: while the chosen token-ids agree, score the per-position
 /// top-k logprob DISTRIBUTIONS by cosine. A chosen-token-id divergence within
@@ -1345,7 +1309,6 @@ fn finish_cosine(
         let Some(model) = case.model.as_deref().and_then(resolve_model) else {
             return mk(Verdict::Fail, "model unresolved for bf16 ref".to_owned());
         };
-        // Caller already ran claim_preflight after dropping the quant server.
         let home = e2e_home();
         let port = 17000 + (case.id.len() as u16 % 500);
         let guard = match spawn_serve(&model, port, Some("none"), &[], &home) {
@@ -1676,8 +1639,8 @@ fn ssd_kvb_count(home: &std::path::Path) -> usize {
 ///   disjoint prompt → evicts the long prompt from the single RAM slot →
 ///   spills it to SSD. Poll the disk until a `.kvb` lands (fire-and-forget
 ///   drain).
-/// * **Restart boundary:** kill the server, `claim_preflight` (settle Metal +
-///   clear claim), restart with the SAME `RMLX_HOME` + same SSD flag.
+/// * **Restart boundary:** kill the server and wait for it, restart with the
+///   SAME `RMLX_HOME` + same SSD flag.
 /// * **Phase 2 (restart + hydrate):** RAM is empty (fresh process), so the
 ///   same long prompt is a RAM miss that MUST hydrate the rehydrated KV blocks
 ///   from the `.kvb` spill. Re-capture the per-token chosen-byte sequence.
@@ -1717,7 +1680,6 @@ fn assert_byte_identical_restart(
     let port2 = 18000 + ((port - 18000 + 1000) % 4000);
 
     // ── Phase 1: populate + spill ────────────────────────────────────────────
-    claim_preflight();
     let phase1 = match spawn_serve(model, port, None, &ssd_flags, &ssd_home) {
         Ok(g) => g,
         Err(e) => {
@@ -1774,7 +1736,6 @@ fn assert_byte_identical_restart(
 
     // ── Restart boundary: kill phase 1 BEFORE phase 2 spawns (single-MLX) ────
     drop(phase1);
-    claim_preflight();
 
     // ── Phase 2: restart + hydrate ───────────────────────────────────────────
     let phase2 = match spawn_serve(model, port2, None, &ssd_flags, &ssd_home) {
@@ -1795,7 +1756,6 @@ fn assert_byte_identical_restart(
     // Scrape the cross-restart ssd_hits BEFORE teardown.
     let counters = fetch_cache_counters(port2);
     drop(phase2);
-    claim_preflight();
     let _ = std::fs::remove_dir_all(&ssd_home);
 
     // ── Assertions ───────────────────────────────────────────────────────────
@@ -1986,7 +1946,6 @@ fn spawn_serve_registry(
         .map_err(|e| format!("spawn rmlx serve --registry: {e}"))?;
     let mut guard = ServeGuard {
         child,
-        port,
         home: home.to_path_buf(),
     };
     let deadline = Instant::now() + Duration::from_secs(180);
@@ -2099,7 +2058,6 @@ fn assert_model_lifecycle(
         };
         // Distinct port from the cap=1 phase to avoid TIME_WAIT re-bind races.
         let port2 = 18000 + ((port - 18000 + 1500) % 4000);
-        claim_preflight();
         let cap2_guard = match spawn_serve_registry(&reg2, port2, 2, &lc_home) {
             Ok(g) => g,
             Err(e) => {
@@ -2111,7 +2069,6 @@ fn assert_model_lifecycle(
         let b2 = model_loaded(port2, idb);
         // Tear down the cap=2 serve BEFORE any cap=1 spawn (single-MLX).
         drop(cap2_guard);
-        claim_preflight();
         match (a2, b2) {
             (Ok(true), Ok(true)) => {
                 legs.push(format!("(b) cap=2: both {id_a} + {idb} resident"));
@@ -2151,7 +2108,6 @@ fn assert_model_lifecycle(
         }
     };
 
-    claim_preflight();
     let cap1_guard = match spawn_serve_registry(&reg1, port, 1, &lc_home) {
         Ok(g) => g,
         Err(e) => {
@@ -2168,11 +2124,11 @@ fn assert_model_lifecycle(
         // swap regardless of which was preloaded: leg (c).
         let a_loaded = match model_loaded(port, id_a) {
             Ok(v) => v,
-            Err(e) => return fail_lc(&cap1_guard, &lc_home, mk, format!("status A (cap1): {e}")),
+            Err(e) => return fail_lc(&lc_home, mk, format!("status A (cap1): {e}")),
         };
         let b_loaded = match model_loaded(port, &idb) {
             Ok(v) => v,
-            Err(e) => return fail_lc(&cap1_guard, &lc_home, mk, format!("status B (cap1): {e}")),
+            Err(e) => return fail_lc(&lc_home, mk, format!("status B (cap1): {e}")),
         };
         // Defensive: if the eager order left A resident instead, force the swap
         // by explicitly loading B and re-checking — the LRU evict must fire.
@@ -2182,27 +2138,25 @@ fn assert_model_lifecycle(
                 Ok((200, _)) => {}
                 Ok((s, b)) => {
                     return fail_lc(
-                        &cap1_guard,
                         &lc_home,
                         mk,
                         format!("explicit load B status {s}: {}", trunc(&b)),
                     )
                 }
-                Err(e) => return fail_lc(&cap1_guard, &lc_home, mk, format!("load B http: {e}")),
+                Err(e) => return fail_lc(&lc_home, mk, format!("load B http: {e}")),
             }
         }
         // Re-read both: invariant is exactly-one-resident at cap=1, and it is B.
         let a_now = match model_loaded(port, id_a) {
             Ok(v) => v,
-            Err(e) => return fail_lc(&cap1_guard, &lc_home, mk, format!("re-status A: {e}")),
+            Err(e) => return fail_lc(&lc_home, mk, format!("re-status A: {e}")),
         };
         let b_now = match model_loaded(port, &idb) {
             Ok(v) => v,
-            Err(e) => return fail_lc(&cap1_guard, &lc_home, mk, format!("re-status B: {e}")),
+            Err(e) => return fail_lc(&lc_home, mk, format!("re-status B: {e}")),
         };
         if !b_now || a_now {
             return fail_lc(
-                &cap1_guard,
                 &lc_home,
                 mk,
                 format!(
@@ -2220,33 +2174,20 @@ fn assert_model_lifecycle(
         match http_post(port, &up, "{}") {
             Ok((200, _)) => {}
             Ok((s, b)) => {
-                return fail_lc(
-                    &cap1_guard,
-                    &lc_home,
-                    mk,
-                    format!("unload B status {s}: {}", trunc(&b)),
-                )
+                return fail_lc(&lc_home, mk, format!("unload B status {s}: {}", trunc(&b)))
             }
-            Err(e) => return fail_lc(&cap1_guard, &lc_home, mk, format!("unload B http: {e}")),
+            Err(e) => return fail_lc(&lc_home, mk, format!("unload B http: {e}")),
         }
         match model_loaded(port, &idb) {
             Ok(false) => {}
             Ok(true) => {
                 return fail_lc(
-                    &cap1_guard,
                     &lc_home,
                     mk,
                     "unload B succeeded but status still loaded:true".to_owned(),
                 )
             }
-            Err(e) => {
-                return fail_lc(
-                    &cap1_guard,
-                    &lc_home,
-                    mk,
-                    format!("post-unload status: {e}"),
-                )
-            }
+            Err(e) => return fail_lc(&lc_home, mk, format!("post-unload status: {e}")),
         }
         // 2nd unload of an already-unloaded model → 404 (idempotent-evict
         // contract: the slot is empty, so the unload route reports not-loaded).
@@ -2254,13 +2195,12 @@ fn assert_model_lifecycle(
             Ok((404, _)) => {}
             Ok((s, b)) => {
                 return fail_lc(
-                    &cap1_guard,
                     &lc_home,
                     mk,
                     format!("2nd unload B expected 404, got {s}: {}", trunc(&b)),
                 )
             }
-            Err(e) => return fail_lc(&cap1_guard, &lc_home, mk, format!("2nd unload http: {e}")),
+            Err(e) => return fail_lc(&lc_home, mk, format!("2nd unload http: {e}")),
         }
         legs.push(format!("(d) unload {idb}→loaded:false, 2nd unload→404"));
     } else {
@@ -2269,22 +2209,20 @@ fn assert_model_lifecycle(
             Ok(true) => legs.push(format!("(a) single-model: {id_a} resident")),
             Ok(false) => {
                 return fail_lc(
-                    &cap1_guard,
                     &lc_home,
                     mk,
                     format!("model A {id_a} not loaded after eager preload"),
                 )
             }
-            Err(e) => return fail_lc(&cap1_guard, &lc_home, mk, format!("status A: {e}")),
+            Err(e) => return fail_lc(&lc_home, mk, format!("status A: {e}")),
         }
     }
 
     // ── Leg (e): claim enforcement — 2nd serve on the HELD port is rejected. ──
     // cap1_guard still holds the claim for `port`. Start a SECOND `rmlx serve`
     // on the SAME port; it must hit ClaimError::AlreadyHeld and exit 11 WITHOUT
-    // ever binding a competing Metal context. We do NOT claim_preflight here —
-    // that would kill the holder and defeat the test. Use `.output()` so the
-    // child is reaped; a non-zero exit is the asserted outcome.
+    // ever binding a competing Metal context. Use `.output()` so the child is
+    // reaped; a non-zero exit is the asserted outcome.
     let mut rival = Command::new(rmlx_bin());
     rival
         .arg("serve")
@@ -2323,7 +2261,6 @@ fn assert_model_lifecycle(
     };
     // The claim holder is no longer needed; drop it (frees the claim + slot).
     drop(cap1_guard);
-    claim_preflight();
 
     let claim_desc = match claim_leg {
         Ok(d) => d,
@@ -2349,18 +2286,14 @@ fn assert_model_lifecycle(
     )
 }
 
-/// Tear down a lifecycle serve guard + hermetic home, then build a FAIL result.
+/// Remove a lifecycle case's hermetic home, then build a FAIL result. The
+/// caller's serve guard kills and reaps its child when it returns.
 fn fail_lc(
-    guard: &ServeGuard,
     home: &std::path::Path,
     mk: &dyn Fn(Verdict, String) -> CaseResult,
     detail: String,
 ) -> CaseResult {
-    // Guard is borrowed; the caller's `cap1_guard` Drop kills the child when the
-    // borrow ends at function return. Settle the claim here so a follow-on case
-    // is not blocked.
     let _ = std::fs::remove_dir_all(home);
-    let _ = guard.port; // touch to keep the borrow explicit (no early drop)
     mk(Verdict::Fail, detail)
 }
 
@@ -2410,7 +2343,6 @@ fn spawn_serve_verbose_flags(
         .map_err(|e| format!("spawn rmlx serve --log verbose: {e}"))?;
     let mut guard = ServeGuard {
         child,
-        port,
         home: home.to_path_buf(),
     };
     let deadline = Instant::now() + Duration::from_secs(120);
@@ -2523,7 +2455,6 @@ fn assert_dispatch_fired(
         return mk(Verdict::Fail, format!("create dispatch home: {e}"));
     }
 
-    claim_preflight();
     let guard = match spawn_serve_verbose(model, port, kv, &home) {
         Ok(g) => g,
         Err(e) => {
@@ -2562,7 +2493,6 @@ fn assert_dispatch_fired(
     // tail spans — acceptable because the assertion only requires ≥1 span.
     drop(guard);
     std::thread::sleep(Duration::from_millis(200));
-    claim_preflight();
 
     let paths = scrape_dispatch_paths(&home);
     let _ = std::fs::remove_dir_all(&home);
@@ -2743,7 +2673,6 @@ fn assert_spec_decode(
         return mk(Verdict::Fail, format!("create spec home: {e}"));
     }
 
-    claim_preflight();
     let mut extra = vec![
         "--draft-model".to_owned(),
         draft.to_string_lossy().into_owned(),
@@ -2792,7 +2721,6 @@ fn assert_spec_decode(
 
     drop(guard);
     std::thread::sleep(Duration::from_millis(200));
-    claim_preflight();
 
     let scraped = scrape_spec_accept(&home);
     let _ = std::fs::remove_dir_all(&home);
@@ -2910,8 +2838,6 @@ fn assert_serve_refused(
         return mk(Verdict::Fail, format!("create refused home: {e}"));
     }
 
-    claim_preflight();
-
     // Build the serve invocation the same way `run_serve_case` would, but
     // EXPECTING an early exit. --ctk/--ctv conflict with --kv-quant at the clap
     // layer (exit 2), so pass at most one form — exactly like the live cases.
@@ -2947,15 +2873,13 @@ fn assert_serve_refused(
     // The guard fires fast (config load + resolve, no model weights), so a few
     // seconds is plenty. Poll for early exit; if the process is still alive at
     // the deadline the guard did NOT fire — that is the failure we are proving
-    // against. Kill + clear claim on every exit path so single-MLX stays clean.
+    // against. Kill and reap the child on every exit path so single-MLX stays clean.
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 let code = status.code().unwrap_or(-1);
-                let _ = std::fs::remove_file(format!("/tmp/rmlx.{port}.claim"));
                 let _ = std::fs::remove_dir_all(&home);
-                claim_preflight();
                 return if code == want {
                     mk(
                         Verdict::Pass,
@@ -2977,9 +2901,7 @@ fn assert_serve_refused(
                     // Still alive → the guard did NOT fire. Kill it and FAIL.
                     let _ = child.kill();
                     let _ = child.wait();
-                    let _ = std::fs::remove_file(format!("/tmp/rmlx.{port}.claim"));
                     let _ = std::fs::remove_dir_all(&home);
-                    claim_preflight();
                     return mk(
                         Verdict::Fail,
                         "serve stayed alive past 30s — arch guard did NOT reject the \
@@ -2993,7 +2915,6 @@ fn assert_serve_refused(
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = std::fs::remove_dir_all(&home);
-                claim_preflight();
                 return mk(Verdict::Fail, format!("try_wait: {e}"));
             }
         }

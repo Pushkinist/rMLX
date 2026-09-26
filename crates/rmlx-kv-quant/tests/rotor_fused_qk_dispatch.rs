@@ -27,9 +27,8 @@
 //   cargo test -p rmlx-kv-quant --test rotor_fused_qk_dispatch -- \
 //       --ignored --test-threads=1
 //
-// CLAUDE.md hard rule 8 (single MLX process): the test claims no port — the
-// integration runner naturally serialises tests within one process. Run
-// after `pkill ... && rm -f /tmp/rmlx.<port>.claim`.
+// CLAUDE.md hard rule 8 (single MLX process): the test takes no Metal claim of
+// its own. Run it under `make gpu-test`, which holds the Metal claim.
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,
