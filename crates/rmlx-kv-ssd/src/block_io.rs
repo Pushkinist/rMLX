@@ -3128,3 +3128,8 @@ mod block_io_turbo_hydrate_tests;
 #[cfg(test)]
 #[path = "block_io_max_seq_tests.rs"]
 mod block_io_max_seq_tests;
+
+// A hydrated layer holds `None` storage or the storage of its own codec.
+#[cfg(test)]
+#[path = "block_io_storage_family_tests.rs"]
+mod block_io_storage_family_tests;

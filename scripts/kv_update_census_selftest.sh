@@ -1137,7 +1137,7 @@ check "a view and a view_mut that bind every field pass and count two view fns" 
 
 # 56 — the real tree, pinned exactly. One run, every figure compared, and
 # each failure prints the figure beside its pin and what to do.
-REAL_PINS="match-sites=9 forcing-sites=9 subset-sites=154 table-sites=2 descriptor-fns=1 view-fns=2"
+REAL_PINS="match-sites=7 forcing-sites=7 subset-sites=154 table-sites=2 descriptor-fns=1 view-fns=2"
 pin_advice() { # pin_advice NAME
     local list="python3 scripts/kv_update_census.py match-sites | grep"
     case "$1" in

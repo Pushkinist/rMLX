@@ -9,8 +9,8 @@
 //! Holds every update-side body that only the iso storage types use: the
 //! per-variant `update_iso_*` decode entries, the `exit_prefill_iso*` prefill
 //! bulk-encode bodies, the GPU encode and ring-sync helpers, the chunk
-//! appenders and the materialise-tail path. The `KvStorage` dispatch and the
-//! helpers with more than one family caller stay in [`super::update`].
+//! appenders and the materialise-tail path. The helpers with more than one
+//! family caller stay in [`super::update`].
 
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device};
@@ -952,7 +952,7 @@ impl KvCache {
     ///
     /// The body is [`iso_v_update`] at that width; this entry resolves the
     /// storage variant and takes the warm-TTFT bf16 shortcut.
-    pub(super) fn update_iso_v(
+    pub(crate) fn update_iso_v(
         &mut self,
         new_k: &Array,
         new_v: &Array,
@@ -982,7 +982,7 @@ impl KvCache {
     ///
     /// The body is [`iso_sym_update`] at that width; this entry resolves the
     /// storage variant and takes the warm-TTFT bf16 shortcut.
-    pub(super) fn update_iso_sym(
+    pub(crate) fn update_iso_sym(
         &mut self,
         new_k: &Array,
         new_v: &Array,
@@ -1019,7 +1019,7 @@ impl KvCache {
     /// bf16-K regression).
     ///
     /// The K side is [`iso_k_only_k_side`] at the resolved width.
-    pub(super) fn update_iso_k_only(
+    pub(crate) fn update_iso_k_only(
         &mut self,
         new_k: &Array,
         new_v: &Array,
@@ -1048,7 +1048,7 @@ impl KvCache {
     /// the active storage variant carries (`IsoV3` is 3 bits, `IsoV4` is 4).
     /// The body is [`iso_v_bulk_encode`]; this entry resolves the storage
     /// variant.
-    pub(super) fn exit_prefill_iso_v(
+    pub(crate) fn exit_prefill_iso_v(
         &mut self,
         k_full: &Array,
         v_full: &Array,
@@ -1071,7 +1071,7 @@ impl KvCache {
     /// Iso symmetric prefill bulk encode at the width the active storage
     /// variant carries (`IsoSym3` is 3 bits, `IsoSym4` is 4). The body is
     /// [`iso_sym_bulk_encode`]; this entry resolves the storage variant.
-    pub(super) fn exit_prefill_iso_sym(
+    pub(crate) fn exit_prefill_iso_sym(
         &mut self,
         k_full: &Array,
         v_full: &Array,
@@ -1095,9 +1095,10 @@ impl KvCache {
     /// carries (`IsoKOnly3` is 3 bits, `IsoKOnly4` is 4); V stays bf16. The
     /// body is [`iso_k_only_bulk_encode`]; this entry resolves the storage
     /// variant.
-    pub(super) fn exit_prefill_iso_k_only(
+    pub(crate) fn exit_prefill_iso_k_only(
         &mut self,
         k_full: &Array,
+        _v_full: &Array,
         device: Device,
         total_seq: i32,
     ) -> Result<()> {

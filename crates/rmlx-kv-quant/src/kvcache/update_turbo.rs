@@ -3,8 +3,8 @@
 //! Holds every update-side body that only the TurboQuant storage types use:
 //! the two decode entries and the two prefill entries, the width-parametric
 //! symmetric bodies they enter, and the affine-K / turbo-V bodies the four
-//! `K8VTurbo*` spellings share. The `KvStorage` dispatch and the helpers
-//! with more than one family caller stay in [`super::update`].
+//! `K8VTurbo*` spellings share. The helpers with more than one family
+//! caller stay in [`super::update`].
 
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device};
@@ -371,7 +371,7 @@ impl KvCache {
     /// is [`k8_turbo_v_update`] at the V width and TCQ flag
     /// [`k8_turbo_v_knobs`] resolves; this entry takes the warm-TTFT bf16
     /// shortcut and hands the body its stores.
-    pub(super) fn update_k8_turbo_v(
+    pub(crate) fn update_k8_turbo_v(
         &mut self,
         new_k: &Array,
         new_v: &Array,
@@ -401,7 +401,7 @@ impl KvCache {
     /// Prefill bulk encode for the four affine-K / TurboQuant-V spellings. The
     /// body is [`k8_turbo_v_bulk_encode`] at the V width and TCQ flag
     /// [`k8_turbo_v_knobs`] resolves — the same table the decode entry reads.
-    pub(super) fn exit_prefill_k8_turbo_v(
+    pub(crate) fn exit_prefill_k8_turbo_v(
         &mut self,
         k_full: &Array,
         v_full: &Array,
@@ -434,7 +434,7 @@ impl KvCache {
         clippy::wildcard_enum_match_arm,
         reason = "the dispatch routes only the two symmetric turbo variants here; a future variant belongs in its own entry, and the fall-through names the mismatch rather than adding a branch per KvStorage variant"
     )]
-    pub(super) fn update_tsym(
+    pub(crate) fn update_tsym(
         &mut self,
         new_k: &Array,
         new_v: &Array,
@@ -464,7 +464,7 @@ impl KvCache {
     /// Symmetric TurboQuant prefill bulk encode at the width the active
     /// storage variant carries (`TurboSym3` is 3 bits, `TurboSym4` is 4). The
     /// body is [`tsym_bulk_encode`]; this entry resolves the storage variant.
-    pub(super) fn exit_prefill_turbo_sym(
+    pub(crate) fn exit_prefill_turbo_sym(
         &mut self,
         k_full: &Array,
         v_full: &Array,

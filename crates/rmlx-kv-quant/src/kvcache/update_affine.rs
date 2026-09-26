@@ -33,7 +33,7 @@ impl KvCache {
         clippy::unwrap_used,
         reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
     )]
-    pub(super) fn update_k8v4(
+    pub(crate) fn update_k8v4(
         &mut self,
         new_k: &Array,
         new_v: &Array,
@@ -755,7 +755,7 @@ impl KvCache {
         clippy::unwrap_used,
         reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
     )]
-    pub(super) fn update_k8v8(
+    pub(crate) fn update_k8v8(
         &mut self,
         new_k: &Array,
         new_v: &Array,
@@ -836,11 +836,12 @@ impl KvCache {
         clippy::wildcard_enum_match_arm,
         reason = "the arm reads one storage variant; every other is the same construction-time mismatch and needs no per-variant spelling"
     )]
-    pub(super) fn exit_prefill_k8v8(
+    pub(crate) fn exit_prefill_k8v8(
         &mut self,
         k_full: &Array,
         v_full: &Array,
         device: Device,
+        _total_seq: i32,
     ) -> Result<()> {
         let max_seq = match &self.storage {
             KvStorage::K8V8 { .. } => self.max_seq,
@@ -895,11 +896,12 @@ impl KvCache {
         clippy::wildcard_enum_match_arm,
         reason = "the arm reads one storage variant; every other is the same construction-time mismatch and needs no per-variant spelling"
     )]
-    pub(super) fn exit_prefill_k8v4(
+    pub(crate) fn exit_prefill_k8v4(
         &mut self,
         k_full: &Array,
         v_full: &Array,
         device: Device,
+        _total_seq: i32,
     ) -> Result<()> {
         let max_seq = match &self.storage {
             KvStorage::K8V4 { .. } => self.max_seq,

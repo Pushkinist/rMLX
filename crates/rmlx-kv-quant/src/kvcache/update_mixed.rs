@@ -1,15 +1,12 @@
 //! Mixed / rotated-K KV update path.
 //!
-//! Holds the update-side body that only [`crate::storage::KvStorage::Mixed`]
-//! uses: the prefill bulk-encode into [`crate::mixed_quant::MixedKvState`].
-//! There is no decode body here — [`super::KvCache::update`] refuses a Mixed
-//! cache outright, and the per-step append is
-//! [`super::KvCache::update_and_sdpa_mixed`] in [`super::sdpa`]. The
-//! `KvStorage` dispatch and the helpers with more than one family caller stay
-//! in [`super::update`].
+//! Holds the two entries of [`crate::storage::KvStorage::Mixed`]: the prefill
+//! bulk-encode into [`crate::mixed_quant::MixedKvState`], and the decode entry
+//! that refuses a direct [`super::KvCache::update`]. The per-step append is
+//! [`super::KvCache::update_and_sdpa_mixed`] in [`super::sdpa`]. The helpers
+//! with more than one family caller stay in [`super::update`].
 
-use rmlx_core::error::Result;
-use rmlx_core::DispatchPolicy;
+use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device};
 
 use crate::storage::KvStorage;
@@ -18,22 +15,39 @@ use super::update::storage_mismatch;
 use super::KvCache;
 
 impl KvCache {
+    /// The decode entry of a Mixed cache. It refuses: the append must go
+    /// through `update_and_sdpa`.
+    pub(crate) fn update_mixed(
+        _cache: &mut Self,
+        _new_k: &Array,
+        _new_v: &Array,
+        _device: Device,
+    ) -> Result<(Array, Array)> {
+        Err(Error::Mlx(
+            "Contract violation: KvCache::update called on a Mixed cache. \
+                 These caches MUST be driven through KvCache::update_and_sdpa (universal \
+                 wrapper). Direct update() bypasses the quantized SDPA and leaves the cache \
+                 in an inconsistent state."
+                .into(),
+        ))
+    }
+
     // Mixed cache uses the fp16 prefill_raw scaffolding. Bulk-quantize
     // the accumulated fp16 K/V (total_seq tokens) into the Mixed state
     // directly (skips the zero-alloc + 6×slice_update round-trip that
     // the per-token path pays on large prefill prefixes).
-    pub(super) fn exit_prefill_mixed(
+    pub(crate) fn exit_prefill_mixed(
         &mut self,
         k_full: &Array,
         v_full: &Array,
         device: Device,
         total_seq: i32,
-        policy: DispatchPolicy,
     ) -> Result<()> {
         tracing::debug!(
             total_seq,
             "exit_prefill Mixed/RotK: bulk-quantizing fp16 prefill K/V"
         );
+        let policy = self.policy;
         let KvStorage::Mixed { state, .. } = &mut self.storage else {
             return Err(storage_mismatch("Mixed", &self.storage));
         };

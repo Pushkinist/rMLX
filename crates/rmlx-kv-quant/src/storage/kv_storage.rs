@@ -14,6 +14,7 @@
 #![allow(clippy::match_same_arms, clippy::too_many_lines)]
 
 use rmlx_core::error::Result;
+use rmlx_mlx::{Array, Device};
 
 use super::kv_slot::KvSlot;
 use super::{
@@ -21,7 +22,7 @@ use super::{
     QuantPlanarK, QuantPlanarV, QuantRotorK3, QuantRotorK4, QuantRotorV3, QuantRotorV4, QuantV,
 };
 use crate::paged::{PagedKStorage, PagedPlanarVStorage, PagedVStorage};
-use crate::KvQuant;
+use crate::{KvCache, KvQuant};
 
 /// Layout tag for symmetric TurboQuant 3-bit K + turbo3 V.
 ///
@@ -1038,8 +1039,13 @@ impl KvStorage {
     }
 
     /// The one mutating match from a variant to its store slots, in the same
-    /// K, V, second-V order as [`Self::view`]. `reset`, `truncate_to` and
-    /// `clear_payload` go through it.
+    /// K, V, second-V order as [`Self::view`], and to its `update` and
+    /// `exit_prefill` entries. `reset`, `truncate_to` and `clear_payload` go
+    /// through the slots.
+    ///
+    /// The entries are keyed on the storage variant and not on the cache's
+    /// `KvQuant`: a hydrated SWA layer holds `None` storage beside the model's
+    /// codec, and `Paged` comes from a process-global switch.
     ///
     /// The same binding rule as [`Self::view`]: every arm binds every field and
     /// has no `..`, and the KV census refuses a `..` in this fn.
@@ -1047,18 +1053,28 @@ impl KvStorage {
         match self {
             Self::K8V4 { k, v } => StorageViewMut {
                 slots: [Some(k), Some(v), None],
+                update: KvCache::update_k8v4,
+                exit_prefill: KvCache::exit_prefill_k8v4,
             },
             Self::K8V8 { k, v } => StorageViewMut {
                 slots: [Some(k), Some(v), None],
+                update: KvCache::update_k8v8,
+                exit_prefill: KvCache::exit_prefill_k8v8,
             },
             Self::Planar { k, v, bits: _ } => StorageViewMut {
                 slots: [Some(k), Some(v), None],
+                update: KvCache::update_planar,
+                exit_prefill: KvCache::exit_prefill_planar,
             },
             Self::None {} => StorageViewMut {
                 slots: [None, None, None],
+                update: KvCache::update_none,
+                exit_prefill: KvCache::exit_prefill_behind_guard,
             },
             Self::Mixed { state } => StorageViewMut {
                 slots: [Some(state), None, None],
+                update: KvCache::update_mixed,
+                exit_prefill: KvCache::exit_prefill_mixed,
             },
             Self::Paged {
                 quant: _,
@@ -1067,63 +1083,103 @@ impl KvStorage {
                 v_planar,
             } => StorageViewMut {
                 slots: [Some(k), Some(v_k8), Some(v_planar)],
+                update: KvCache::update_paged,
+                exit_prefill: KvCache::exit_prefill_behind_guard,
             },
             Self::K8VTurbo3 { k, v } => StorageViewMut {
                 slots: [Some(k), Some(v), None],
+                update: KvCache::update_k8_turbo_v,
+                exit_prefill: KvCache::exit_prefill_k8_turbo_v,
             },
             Self::TurboSym3 { k, v } => StorageViewMut {
                 slots: [Some(k), Some(v), None],
+                update: KvCache::update_tsym,
+                exit_prefill: KvCache::exit_prefill_turbo_sym,
             },
             Self::TurboSym4 { k, v } => StorageViewMut {
                 slots: [Some(k), Some(v), None],
+                update: KvCache::update_tsym,
+                exit_prefill: KvCache::exit_prefill_turbo_sym,
             },
             Self::PlanarK { k } => StorageViewMut {
                 slots: [Some(k), None, None],
+                update: KvCache::update_planar_k,
+                exit_prefill: KvCache::exit_prefill_planar_k,
             },
             Self::K8VTurbo2 { k, v } => StorageViewMut {
                 slots: [Some(k), Some(v), None],
+                update: KvCache::update_k8_turbo_v,
+                exit_prefill: KvCache::exit_prefill_k8_turbo_v,
             },
             Self::IsoV3 { k, v } => StorageViewMut {
                 slots: [Some(k), Some(v), None],
+                update: KvCache::update_iso_v,
+                exit_prefill: KvCache::exit_prefill_iso_v,
             },
             Self::IsoV4 { k, v } => StorageViewMut {
                 slots: [Some(k), Some(v), None],
+                update: KvCache::update_iso_v,
+                exit_prefill: KvCache::exit_prefill_iso_v,
             },
             Self::RotorV3 { k, v } => StorageViewMut {
                 slots: [Some(k), Some(v), None],
+                update: KvCache::update_rotor_v,
+                exit_prefill: KvCache::exit_prefill_rotor_v,
             },
             Self::RotorV4 { k, v } => StorageViewMut {
                 slots: [Some(k), Some(v), None],
+                update: KvCache::update_rotor_v,
+                exit_prefill: KvCache::exit_prefill_rotor_v,
             },
             Self::K8VTurbo3Tcq { k, v } => StorageViewMut {
                 slots: [Some(k), Some(v), None],
+                update: KvCache::update_k8_turbo_v,
+                exit_prefill: KvCache::exit_prefill_k8_turbo_v,
             },
             Self::K8VTurbo2Tcq { k, v } => StorageViewMut {
                 slots: [Some(k), Some(v), None],
+                update: KvCache::update_k8_turbo_v,
+                exit_prefill: KvCache::exit_prefill_k8_turbo_v,
             },
             Self::IsoSym3 { k, v } => StorageViewMut {
                 slots: [Some(k), Some(v), None],
+                update: KvCache::update_iso_sym,
+                exit_prefill: KvCache::exit_prefill_iso_sym,
             },
             Self::IsoSym4 { k, v } => StorageViewMut {
                 slots: [Some(k), Some(v), None],
+                update: KvCache::update_iso_sym,
+                exit_prefill: KvCache::exit_prefill_iso_sym,
             },
             Self::IsoKOnly3 { k } => StorageViewMut {
                 slots: [Some(k), None, None],
+                update: KvCache::update_iso_k_only,
+                exit_prefill: KvCache::exit_prefill_iso_k_only,
             },
             Self::IsoKOnly4 { k } => StorageViewMut {
                 slots: [Some(k), None, None],
+                update: KvCache::update_iso_k_only,
+                exit_prefill: KvCache::exit_prefill_iso_k_only,
             },
             Self::RotorSym3 { k, v } => StorageViewMut {
                 slots: [Some(k), Some(v), None],
+                update: KvCache::update_rotor_sym,
+                exit_prefill: KvCache::exit_prefill_rotor_sym,
             },
             Self::RotorSym4 { k, v } => StorageViewMut {
                 slots: [Some(k), Some(v), None],
+                update: KvCache::update_rotor_sym,
+                exit_prefill: KvCache::exit_prefill_rotor_sym,
             },
             Self::RotorKOnly3 { k } => StorageViewMut {
                 slots: [Some(k), None, None],
+                update: KvCache::update_rotor_k_only,
+                exit_prefill: KvCache::exit_prefill_rotor_k_only,
             },
             Self::RotorKOnly4 { k } => StorageViewMut {
                 slots: [Some(k), None, None],
+                update: KvCache::update_rotor_k_only,
+                exit_prefill: KvCache::exit_prefill_rotor_k_only,
             },
             Self::RotorKAsym3 {
                 k,
@@ -1132,6 +1188,8 @@ impl KvStorage {
                 v_group_size: _,
             } => StorageViewMut {
                 slots: [Some(k), Some(v), None],
+                update: KvCache::update_rotor_k_asym,
+                exit_prefill: KvCache::exit_prefill_rotor_k_asym,
             },
             Self::RotorKAsym4 {
                 k,
@@ -1140,6 +1198,8 @@ impl KvStorage {
                 v_group_size: _,
             } => StorageViewMut {
                 slots: [Some(k), Some(v), None],
+                update: KvCache::update_rotor_k_asym,
+                exit_prefill: KvCache::exit_prefill_rotor_k_asym,
             },
         }
     }
@@ -1155,9 +1215,21 @@ pub(crate) struct StorageView<'a> {
     pub(crate) slots: [Option<&'a dyn KvSlot>; 3],
 }
 
+/// The decode-step entry of one storage variant: `(new_k, new_v, device)`.
+pub(crate) type UpdateEntry = fn(&mut KvCache, &Array, &Array, Device) -> Result<(Array, Array)>;
+
+/// The prefill bulk-encode entry of one storage variant:
+/// `(k_full, v_full, device, total_seq)`. An entry that does not use an
+/// argument ignores it.
+pub(crate) type ExitPrefillEntry = fn(&mut KvCache, &Array, &Array, Device, i32) -> Result<()>;
+
 /// Mutable view of one [`KvStorage`], built by [`KvStorage::view_mut`].
 pub(crate) struct StorageViewMut<'a> {
     /// The K slot, the V slot and the paged planar V slot; `None` where the
     /// variant has no such slot.
     pub(crate) slots: [Option<&'a mut dyn KvSlot>; 3],
+    /// The entry [`KvCache::update`] calls after the prefill check.
+    pub(crate) update: UpdateEntry,
+    /// The entry [`KvCache::exit_prefill`] calls after its guards.
+    pub(crate) exit_prefill: ExitPrefillEntry,
 }

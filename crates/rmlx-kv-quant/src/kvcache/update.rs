@@ -279,74 +279,11 @@ impl KvCache {
             return self.update_prefill_raw(new_k, new_v, device);
         }
 
-        // Dispatch on the actual storage variant, not self.quant.
-        //
-        // Using self.quant here was the bug: after SSD hydration, SWA
-        // layers are stored with tag "none" → KvStorage::None, but
-        // from_storage() sets self.quant to the model's global KvQuant (e.g.
-        // K8V8). The quant-based dispatch then routed to update_k8v8(), which
-        // pattern-matched self.storage expecting KvStorage::K8V8 and hit the
-        // unreachable!(). Dispatching on self.storage is the ground truth:
-        // it reflects what data is actually in the cache regardless of the
-        // declared KvQuant, and it already covers the Paged variant which was
-        // the only exception before this fix.
-        match &self.storage {
-            KvStorage::K8V4 { .. } => self.update_k8v4(new_k, new_v, device),
-            KvStorage::K8V8 { .. } => self.update_k8v8(new_k, new_v, device),
-            KvStorage::Planar { .. } => self.update_planar(new_k, new_v, device),
-            KvStorage::None { .. } => self.update_none(new_k, new_v, device),
-            KvStorage::Paged { .. } => self.update_paged(new_k, new_v, device),
-            KvStorage::Mixed { .. } => Err(Error::Mlx(
-                "Contract violation: KvCache::update called on a Mixed cache. \
-                     These caches MUST be driven through KvCache::update_and_sdpa (universal \
-                     wrapper). Direct update() bypasses the quantized SDPA and leaves the cache \
-                     in an inconsistent state."
-                    .into(),
-            )),
-            // Affine-K / turbo-V decode update at the variant's V width and
-            // TCQ flag, one entry over all four spellings.
-            KvStorage::K8VTurbo3 { .. }
-            | KvStorage::K8VTurbo2 { .. }
-            | KvStorage::K8VTurbo3Tcq { .. }
-            | KvStorage::K8VTurbo2Tcq { .. } => self.update_k8_turbo_v(new_k, new_v, device),
-            // TurboSym3 / TurboSym4 decode update — symmetric Lloyd-Max K + V
-            // at the variant's code width, one entry over both.
-            KvStorage::TurboSym3 { .. } | KvStorage::TurboSym4 { .. } => {
-                self.update_tsym(new_k, new_v, device)
-            }
-            // PlanarK decode update — K is PlanarQuant 4-bit, V bf16.
-            KvStorage::PlanarK { .. } => self.update_planar_k(new_k, new_v, device),
-            // IsoV3 / IsoV4 decode update — K = affine q8_0, V = IsoQuant at
-            // the variant's code width.
-            KvStorage::IsoV3 { .. } | KvStorage::IsoV4 { .. } => {
-                self.update_iso_v(new_k, new_v, device)
-            }
-            // RotorV3 / RotorV4 decode update — K = affine q8_0, V = rotor at
-            // the variant's code width (CPU).
-            KvStorage::RotorV3 { .. } | KvStorage::RotorV4 { .. } => {
-                self.update_rotor_v(new_k, new_v, device)
-            }
-            // Iso symmetric / K-only decode updates, one entry per family over
-            // both code widths.
-            KvStorage::IsoSym3 { .. } | KvStorage::IsoSym4 { .. } => {
-                self.update_iso_sym(new_k, new_v, device)
-            }
-            KvStorage::IsoKOnly3 { .. } | KvStorage::IsoKOnly4 { .. } => {
-                self.update_iso_k_only(new_k, new_v, device)
-            }
-            // Symmetric / K-only rotor variants, one entry per family over
-            // both code widths.
-            KvStorage::RotorSym3 { .. } | KvStorage::RotorSym4 { .. } => {
-                self.update_rotor_sym(new_k, new_v, device)
-            }
-            KvStorage::RotorKOnly3 { .. } | KvStorage::RotorKOnly4 { .. } => {
-                self.update_rotor_k_only(new_k, new_v, device)
-            }
-            // Asymmetric rotor K + affine V variants.
-            KvStorage::RotorKAsym3 { .. } | KvStorage::RotorKAsym4 { .. } => {
-                self.update_rotor_k_asym(new_k, new_v, device)
-            }
-        }
+        // The entry comes from the storage variant, not from `self.quant`; see
+        // `KvStorage::view_mut`. Copied out first, so the view's borrow of the
+        // storage ends before the call.
+        let entry = self.storage.view_mut().update;
+        entry(self, new_k, new_v, device)
     }
 
     /// Decode-step update for the unquantised (`KvQuant::None`) cache.
@@ -356,7 +293,7 @@ impl KvCache {
     /// On the first call, `update_decode_fp16` allocates the
     /// `[B, kv_h, max_seq, head_dim]` buffer; subsequent calls slice_update at
     /// the current offset.
-    fn update_none(
+    pub(crate) fn update_none(
         &mut self,
         new_k: &Array,
         new_v: &Array,
@@ -800,9 +737,6 @@ impl KvCache {
     )]
     /// Finalize prefill: quantize the accumulated raw K/V into the storage buffers.
     pub fn exit_prefill(&mut self, device: Device) -> Result<()> {
-        // Snapshot before the storage borrows below; one arm forwards it to
-        // `MixedKvState::bulk_init_from_fp16`.
-        let policy = self.policy;
         if self.rotating.is_some() {
             // No-op: rotating prefill writes go straight into the ring buffer.
             return Ok(());
@@ -924,9 +858,8 @@ impl KvCache {
         // SWA layers that were hydrated from the SSD tier (they are stored as
         // tag "none" since the rotating bf16 ring cannot be serialised, but
         // from_storage() sets self.quant to the model's global KvQuant) — take
-        // the bf16 path regardless of self.quant. The quantised dispatch arms
-        // all pattern-match self.storage expecting their specific variant and hit
-        // unreachable!() when they find KvStorage::None instead.
+        // the bf16 path regardless of self.quant. The gate below reads
+        // self.quant, and the `None` entry refuses.
         if matches!(self.storage, KvStorage::None { .. }) {
             if let Some((k_seed, v_seed)) = decode_fp16_pair {
                 // `is_bf16_storage` is true on this path, so both clones above
@@ -970,78 +903,15 @@ impl KvCache {
             return Ok(());
         }
 
-        // REACHABILITY, as of the gate above: only the arms for codecs whose
-        // `materialises_packed_store()` is true run. That is `Mixed`, `RotK`,
-        // `IsoKOnly3/4`, `RotorKOnly3/4`, `Iso3Sym`, `Iso4Sym`,
-        // `Rotor3Sym`, `Rotor4Sym` — eight of the arms below. The rest are the
-        // bf16-mirror family and the gate returns before them.
-        //
-        // They are kept, not deleted, because they ARE the re-enable path: a
-        // codec that grows a decode kernel over its own packed store flips one
-        // arm in `decode_reads_packed_store` and this bulk encode is what then
-        // fills the buffer that kernel reads (see `docs/KV_CACHE.md` §9.6). The
-        // hazard that creates is real: a flipped predicate re-arms code that
-        // does not run today. The pairing guard is
-        // `warm_ttft_cross_codec_tests::exit_prefill_builds_a_store_exactly_when_the_predicate_says_so`,
-        // which sweeps every variant and fails the moment a codec's arm and its
-        // classification disagree.
-        match self.quant {
-            // ── mirror-family group: NOT reachable today ────────────────────
-            // The arms from here down that belong to the bf16-mirror family
-            // (`K8V8`, `K8V4`, `Planar*`, `PlanarK`, `K8VTurbo*`, `TurboSym*`,
-            // `Iso3/4`, `Rotor3/4`, `RotorK*Asym`) are behind the gate above.
-            // The eight listed there are the ones that still run.
-            KvQuant::K8V8 => self.exit_prefill_k8v8(&k_full, &v_full, device)?,
-            KvQuant::K8V4 => self.exit_prefill_k8v4(&k_full, &v_full, device)?,
-            KvQuant::None => {
-                // BF16 KV path. The `raw_k`/`raw_v` buffers — already
-                // sized to `[B, kv_h, max_seq, head_dim]` by `update_prefill_raw`
-                // — are exactly the decode buffers we need. Promote them
-                // directly into `decode_fp16_k`/`decode_fp16_v`; subsequent
-                // `update_none` calls hit `update_decode_fp16` and slice_update
-                // at the current offset. No quantize/dequantize work.
-                self.decode_fp16_k = Some(raw_k.try_clone()?);
-                self.decode_fp16_v = Some(raw_v.try_clone()?);
-                return Ok(());
-            }
-            KvQuant::Planar | KvQuant::Planar3 => {
-                self.exit_prefill_planar(&k_full, &v_full, device)?;
-            }
-            KvQuant::Mixed { .. } | KvQuant::RotK { .. } => {
-                self.exit_prefill_mixed(&k_full, &v_full, device, total_seq, policy)?;
-            }
-            KvQuant::K8VTurbo3
-            | KvQuant::K8VTurbo2
-            | KvQuant::K8VTurbo3Tcq
-            | KvQuant::K8VTurbo2Tcq => {
-                self.exit_prefill_k8_turbo_v(&k_full, &v_full, device, total_seq)?;
-            }
-            KvQuant::TurboSym3 | KvQuant::TurboSym4 => {
-                self.exit_prefill_turbo_sym(&k_full, &v_full, device, total_seq)?;
-            }
-            KvQuant::PlanarK => self.exit_prefill_planar_k(&k_full, device, total_seq)?,
-            KvQuant::Iso3 | KvQuant::Iso4 => {
-                self.exit_prefill_iso_v(&k_full, &v_full, device, total_seq)?;
-            }
-            KvQuant::Rotor3 | KvQuant::Rotor4 => {
-                self.exit_prefill_rotor_v(&k_full, &v_full, device, total_seq)?;
-            }
-            KvQuant::Iso3Sym | KvQuant::Iso4Sym => {
-                self.exit_prefill_iso_sym(&k_full, &v_full, device, total_seq)?;
-            }
-            KvQuant::IsoKOnly3 | KvQuant::IsoKOnly4 => {
-                self.exit_prefill_iso_k_only(&k_full, device, total_seq)?;
-            }
-            KvQuant::Rotor3Sym | KvQuant::Rotor4Sym => {
-                self.exit_prefill_rotor_sym(&k_full, &v_full, device, total_seq)?;
-            }
-            KvQuant::RotorKOnly3 | KvQuant::RotorKOnly4 => {
-                self.exit_prefill_rotor_k_only(&k_full, device, total_seq)?;
-            }
-            KvQuant::RotorK3Asym { .. } | KvQuant::RotorK4Asym { .. } => {
-                self.exit_prefill_rotor_k_asym(&k_full, &v_full, device, total_seq)?;
-            }
-        }
+        // Only the entries of codecs whose `materialises_packed_store()` is
+        // true run past the gate above. The bf16-mirror family's entries are
+        // kept as the re-enable path for a codec that grows a decode kernel over
+        // its own store (`docs/KV_CACHE.md` §9.6). The entry comes from the
+        // storage variant and the gate from `self.quant`; the pairing guard
+        // `warm_ttft_cross_codec_tests::exit_prefill_builds_a_store_exactly_when_the_predicate_says_so`
+        // fails when the two disagree.
+        let entry = self.storage.view_mut().exit_prefill;
+        entry(self, &k_full, &v_full, device, total_seq)?;
 
         // Warm-TTFT seed: the shortcut quant arms get the bf16 K+V decode
         // mirror that `update_decode_fp16` reads via the
@@ -1062,6 +932,24 @@ impl KvCache {
         }
 
         Ok(())
+    }
+
+    /// The `exit_prefill` entry of the `None` and `Paged` storages. It builds
+    /// nothing: `exit_prefill` finishes both at their guards before it calls an
+    /// entry (the bf16 seeds are the `None` storage; `Paged` keeps a compact
+    /// seed and fills its pages at decode). A call is a contract violation.
+    pub(crate) fn exit_prefill_behind_guard(
+        &mut self,
+        _k_full: &Array,
+        _v_full: &Array,
+        _device: Device,
+        _total_seq: i32,
+    ) -> Result<()> {
+        Err(Error::Mlx(format!(
+            "Contract violation: the {} storage has no exit_prefill bulk encode. \
+             KvCache::exit_prefill must finish it at its guard.",
+            self.storage.view().name
+        )))
     }
 
     /// Live-inference KV resident bytes held by this cache at the call-site.

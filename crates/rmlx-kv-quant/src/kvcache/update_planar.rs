@@ -31,7 +31,7 @@ impl KvCache {
         clippy::unwrap_used,
         reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
     )]
-    pub(super) fn update_planar(
+    pub(crate) fn update_planar(
         &mut self,
         new_k: &Array,
         new_v: &Array,
@@ -119,7 +119,7 @@ impl KvCache {
         clippy::indexing_slicing,
         reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
     )]
-    pub(super) fn update_planar_k(
+    pub(crate) fn update_planar_k(
         &mut self,
         new_k: &Array,
         new_v: &Array,
@@ -183,11 +183,12 @@ impl KvCache {
         clippy::wildcard_enum_match_arm,
         reason = "the arm reads one storage variant; every other is the same construction-time mismatch and needs no per-variant spelling"
     )]
-    pub(super) fn exit_prefill_planar(
+    pub(crate) fn exit_prefill_planar(
         &mut self,
         k_full: &Array,
         v_full: &Array,
         device: Device,
+        _total_seq: i32,
     ) -> Result<()> {
         let (max_seq, v_bits) = match &self.storage {
             KvStorage::Planar { bits, .. } => (self.max_seq, *bits),
@@ -246,9 +247,10 @@ impl KvCache {
         clippy::wildcard_enum_match_arm,
         reason = "the arm reads one storage variant; every other is the same construction-time mismatch and needs no per-variant spelling"
     )]
-    pub(super) fn exit_prefill_planar_k(
+    pub(crate) fn exit_prefill_planar_k(
         &mut self,
         k_full: &Array,
+        _v_full: &Array,
         device: Device,
         total_seq: i32,
     ) -> Result<()> {

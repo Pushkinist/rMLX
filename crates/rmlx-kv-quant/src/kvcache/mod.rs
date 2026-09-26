@@ -199,6 +199,11 @@ mod rotor_qjl_store_gate_tests;
 #[path = "rollback_tests.rs"]
 mod rollback_tests;
 
+// `update` and `exit_prefill` take their entry from the storage variant.
+#[cfg(test)]
+#[path = "entry_routing_tests.rs"]
+mod entry_routing_tests;
+
 pub use core::KvCache;
 pub use fused_qk_dispatch::fused_qk_total_dispatch_count;
 pub use shared_kv::SharedKv;

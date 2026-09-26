@@ -10,9 +10,8 @@
 //! Holds every update-side body that only the rotor storage types use: the
 //! per-variant `update_rotor_*` decode entries, the `exit_prefill_rotor*`
 //! prefill bulk-encode bodies, the GPU encode and ring-sync helpers, the
-//! chunk appenders and the materialise-tail path. The `KvStorage` dispatch
-//! and the helpers with more than one family caller stay in
-//! [`super::update`].
+//! chunk appenders and the materialise-tail path. The helpers with more
+//! than one family caller stay in [`super::update`].
 
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device};
@@ -1183,7 +1182,7 @@ impl KvCache {
     ///
     /// The body is [`rotor_v_update`] at that width; this entry resolves the
     /// storage variant and takes the warm-TTFT bf16 shortcut.
-    pub(super) fn update_rotor_v(
+    pub(crate) fn update_rotor_v(
         &mut self,
         new_k: &Array,
         new_v: &Array,
@@ -1216,7 +1215,7 @@ impl KvCache {
     ///
     /// The body is [`rotor_sym_update`] at that width; this entry resolves the
     /// storage variant and takes the warm-TTFT bf16 shortcut.
-    pub(super) fn update_rotor_sym(
+    pub(crate) fn update_rotor_sym(
         &mut self,
         new_k: &Array,
         new_v: &Array,
@@ -1253,7 +1252,7 @@ impl KvCache {
     /// bf16-K regression).
     ///
     /// The K side is [`rotor_k_only_k_side`] at the resolved width.
-    pub(super) fn update_rotor_k_only(
+    pub(crate) fn update_rotor_k_only(
         &mut self,
         new_k: &Array,
         new_v: &Array,
@@ -1301,7 +1300,7 @@ impl KvCache {
     /// semantics.
     ///
     /// The body is [`rotor_k_asym_update`] at the resolved width.
-    pub(super) fn update_rotor_k_asym(
+    pub(crate) fn update_rotor_k_asym(
         &mut self,
         new_k: &Array,
         new_v: &Array,
@@ -1334,7 +1333,7 @@ impl KvCache {
     /// the active storage variant carries (`RotorV3` is 3 bits, `RotorV4` is
     /// 4). The body is [`rotor_v_bulk_encode`] at that width; this entry
     /// resolves the storage variant.
-    pub(super) fn exit_prefill_rotor_v(
+    pub(crate) fn exit_prefill_rotor_v(
         &mut self,
         k_full: &Array,
         v_full: &Array,
@@ -1358,7 +1357,7 @@ impl KvCache {
     /// Rotor symmetric prefill bulk encode at the width the active storage
     /// variant carries (`RotorSym3` is 3 bits, `RotorSym4` is 4). The body is
     /// [`rotor_sym_bulk_encode`]; this entry resolves the storage variant.
-    pub(super) fn exit_prefill_rotor_sym(
+    pub(crate) fn exit_prefill_rotor_sym(
         &mut self,
         k_full: &Array,
         v_full: &Array,
@@ -1383,9 +1382,10 @@ impl KvCache {
     /// variant carries (`RotorKOnly3` is 3 bits, `RotorKOnly4` is 4); V stays
     /// bf16 on the caller's `decode_fp16_pair`. The body is
     /// [`rotor_k_only_bulk_encode`]; this entry resolves the storage variant.
-    pub(super) fn exit_prefill_rotor_k_only(
+    pub(crate) fn exit_prefill_rotor_k_only(
         &mut self,
         k_full: &Array,
+        _v_full: &Array,
         device: Device,
         total_seq: i32,
     ) -> Result<()> {
@@ -1406,7 +1406,7 @@ impl KvCache {
     /// variant carries (`RotorKAsym3` is 3 bits, `RotorKAsym4` is 4); V is
     /// affine `v_bits`. The body is [`rotor_k_asym_bulk_encode`]; this entry
     /// resolves the storage variant.
-    pub(super) fn exit_prefill_rotor_k_asym(
+    pub(crate) fn exit_prefill_rotor_k_asym(
         &mut self,
         k_full: &Array,
         v_full: &Array,
