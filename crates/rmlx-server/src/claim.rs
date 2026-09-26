@@ -43,7 +43,9 @@ pub enum ClaimError {
     #[error("{}", refusal_message(*.holder_pid, .holder_command, .path))]
     AlreadyHeld {
         /// PID the holder wrote into the file body. It can be stale or
-        /// forged, and it is `None` when the holder wrote no body.
+        /// forged. It is `None` when the holder wrote no body, and while a
+        /// holder is starting the body can be empty or still the previous
+        /// holder's: the holder truncates and rewrites it after it locks.
         holder_pid: Option<u32>,
         /// Command line of the holder, as it recorded it.
         holder_command: String,
@@ -169,7 +171,7 @@ fn open_claim_file(path: &Path) -> io::Result<(File, bool)> {
 /// with one link: a hard link planted at the path would make the body write
 /// land in its target.
 fn open_checked(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
-    let file = options.custom_flags(OPEN_FLAGS).open(path)?;
+    let file = open_no_follow(options, path)?;
     let meta = file.metadata()?;
     if !meta.file_type().is_file() {
         return Err(io::Error::other("the claim path is not a regular file"));
@@ -178,6 +180,10 @@ fn open_checked(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
         return Err(io::Error::other("the claim file has more than one link"));
     }
     Ok(file)
+}
+
+fn open_no_follow(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
+    options.custom_flags(OPEN_FLAGS).open(path)
 }
 
 /// `Ok(false)` when another open file holds a conflicting lock.
@@ -242,8 +248,10 @@ fn refusal_message(holder_pid: Option<u32>, holder_command: &str, path: &Path) -
 }
 
 /// Refuse when a legacy per-port claim in `dir` is held. The probe takes a
-/// shared lock for a moment and changes no file. It skips an entry that
-/// vanished or is a symlink; any other doubt refuses.
+/// shared lock for a moment and changes no file. Old builds made only regular
+/// files, so it skips an entry that vanished, is a symlink or is not a regular
+/// file; any other open error refuses. A hard-linked file keeps its inode's
+/// flock and is probed.
 fn refuse_held_legacy_claim(dir: &Path) -> Result<(), ClaimError> {
     let entries = std::fs::read_dir(dir).map_err(|e| io_error(dir, e))?;
     for entry in entries {
@@ -254,12 +262,20 @@ fn refuse_held_legacy_claim(dir: &Path) -> Result<(), ClaimError> {
             continue;
         }
         let path = entry.path();
-        let file = match open_checked(OpenOptions::new().read(true), &path) {
+        let file = match open_no_follow(OpenOptions::new().read(true), &path) {
             Ok(file) => file,
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) if e.raw_os_error() == Some(libc::ELOOP) => continue,
             Err(source) => return Err(io_error(&path, source)),
         };
+        if !file
+            .metadata()
+            .map_err(|e| io_error(&path, e))?
+            .file_type()
+            .is_file()
+        {
+            continue;
+        }
         refuse_if_held(
             &file,
             &path,

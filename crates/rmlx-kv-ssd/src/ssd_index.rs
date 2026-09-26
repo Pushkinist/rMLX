@@ -888,8 +888,9 @@ static LAST_STAMP_US: AtomicU64 = AtomicU64::new(0);
 /// It is **not** a total order over a namespace shared by two processes: the
 /// Metal claim admits one GPU process per machine, but a `--device cpu` run
 /// takes no claim, so two processes can each write the same pool, and two
-/// writes in the same microsecond from different processes still tie. The pool sweep's `(namespace, hash)`
-/// tiebreak is what keeps that case deterministic.
+/// writes in the same microsecond from different processes still tie. The
+/// pool sweep's `(namespace, hash)` tiebreak is what keeps that case
+/// deterministic.
 ///
 /// It stays a wall-clock value rather than a plain counter because the
 /// cross-namespace sweep merges rows from independent namespace databases and

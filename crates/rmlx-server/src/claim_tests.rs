@@ -202,6 +202,10 @@ fn read_only_file_is_still_locked() {
     let lock = lock_in(&dir);
     std::fs::write(&lock, "").expect("create the file");
     std::fs::set_permissions(&lock, Permissions::from_mode(0o444)).expect("chmod 0444");
+    assert!(
+        OpenOptions::new().write(true).open(&lock).is_err(),
+        "this test needs a user that a 0444 file refuses a write open"
+    );
     let claim = claim_at(&lock).expect("a read-only file must still be claimed");
     assert!(
         is_held(&claim_at(&lock)),
@@ -437,10 +441,7 @@ fn legacy_fifo_does_not_block_the_probe() {
     let result = rx
         .recv_timeout(Duration::from_secs(10))
         .expect("the legacy probe must not block on a FIFO");
-    assert!(
-        is_io(&result),
-        "a legacy FIFO must be refused, got {result:?}"
-    );
+    result.expect("an old build made no FIFO, so the probe skips it");
 }
 
 #[test]
@@ -511,4 +512,45 @@ fn probe_refuses_while_a_legacy_claim_is_held() {
     };
     assert_eq!(holder_pid, Some(holder.pid()));
     holder.exit();
+}
+
+#[test]
+fn legacy_directory_is_skipped() {
+    let dir = TempDir::new().expect("temp dir");
+    std::fs::create_dir(legacy_claim_in(&dir)).expect("plant a directory");
+    refuse_held_legacy_claim(dir.path()).expect("an old build made no directory");
+}
+
+/// A hard link to a held legacy claim shares its inode, and so its flock.
+#[test]
+fn hard_linked_legacy_claim_is_probed() {
+    let held_dir = TempDir::new().expect("held dir");
+    let held = held_dir.path().join("held");
+    let holder = Holder::start(&held);
+    let dir = TempDir::new().expect("temp dir");
+    std::fs::hard_link(&held, legacy_claim_in(&dir)).expect("hard-link the held file");
+    let result = refuse_held_legacy_claim(dir.path());
+    let Err(ClaimError::AlreadyHeld { holder_pid, .. }) = result else {
+        panic!("a held hard-linked legacy claim must refuse, got {result:?}");
+    };
+    assert_eq!(holder_pid, Some(holder.pid()));
+    holder.exit();
+}
+
+#[test]
+fn probe_refuses_a_hard_link_at_the_claim_path() {
+    let legacy = TempDir::new().expect("legacy dir");
+    let dir = TempDir::new().expect("temp dir");
+    let target = dir.path().join("target");
+    std::fs::write(&target, "4242 some command").expect("write target");
+    let lock = lock_in(&dir);
+    std::fs::hard_link(&target, &lock).expect("plant a hard link");
+    let result = probe_in(legacy.path(), &lock);
+    let Err(ClaimError::Io { source, .. }) = result else {
+        panic!("the probe must refuse a hard link, got {result:?}");
+    };
+    assert!(
+        source.to_string().contains("more than one link"),
+        "refused for another reason: {source}"
+    );
 }
