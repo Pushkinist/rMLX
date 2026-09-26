@@ -23,10 +23,10 @@ Four modes, each printing one figure the restructure is judged on:
   struct-update base (`..<expr>`) or is not a literal of the return type: that
   row inherits facts nobody stated, and the site figure cannot see it. It
   prints `descriptor-fns N`, the number of those fns it read, so a renamed fn
-  reads 0 and not a clean scan. It also exits 1 when `KvStorage::view` holds a
-  `..`, or binds to `_` a field that is not a scalar knob (`bits`, `v_bits`,
-  `v_group_size`, `quant`): either leaves a field out of every read-only site
-  the view serves. `view-fns N` counts those fns.
+  reads 0 and not a clean scan. It also exits 1 when `KvStorage::view` or
+  `KvStorage::view_mut` holds a `..`, or binds to `_` a field that is not a
+  scalar knob (`bits`, `v_bits`, `v_group_size`, `quant`): either leaves a
+  field out of every site the view serves. `view-fns N` counts those fns.
 
   Known false positives: a `use` inside one fn applies to the whole file, so
   a glob import there makes a same-named variant elsewhere in the file count;
@@ -457,26 +457,26 @@ def check_descriptors(sources: dict[str, str], enums: dict[str, list[str]]) -> i
     return found
 
 
-#: The read-only storage view: `fn view` in an `impl KvStorage`. Each of its
-#: arms binds every field of its variant.
-VIEW_FN = re.compile(r"\bfn\s+view\s*[<(]")
+#: The storage views: `fn view` and `fn view_mut` in an `impl KvStorage`. Each
+#: of their arms binds every field of its variant.
+VIEW_FN = re.compile(r"\bfn\s+(view|view_mut)\s*[<(]")
 #: A rest pattern or a struct-update base: any `..` that is not `..=`.
 REST = re.compile(r"\.\.(?!=)")
 #: A field bound to `_` or to an `_`-prefixed name: `field: _`, `field: _x`.
 DISCARDED_FIELD = re.compile(r"\b([a-z_]\w*)\s*(?<!:):(?!:)\s*_\w*\b")
-#: The scalar knobs a variant carries beside its slots. The view may discard
+#: The scalar knobs a variant carries beside its slots. A view may discard
 #: them; a field outside this set is a slot or state, and discarding it leaves
-#: it out of every read-only site the view serves.
+#: it out of every site the view serves.
 VIEW_KNOBS = frozenset({"bits", "v_bits", "v_group_size", "quant"})
 
 
 def check_views(sources: dict[str, str], enums: dict[str, list[str]]) -> int:
-    """Refuse a `..` in `KvStorage::view`, and a field discarded there that
-    is not one of `VIEW_KNOBS`. Return how many of those fns the scan read.
+    """Refuse a `..` in `KvStorage::view` or `KvStorage::view_mut`, and a
+    field discarded there that is not one of `VIEW_KNOBS`. Return how many of
+    those fns the scan read.
 
     An arm with `..` compiles when a field is added to its variant, so the new
-    field is left out of every read-only site the view serves with no error
-    anywhere. An arm that binds a slot to `_` does the same to that slot. The
+    field is left out of every site the view serves with no error anywhere. An arm that binds a slot to `_` does the same to that slot. The
     knob set is fixed, so an unknown field name fails closed. The count lets
     the real-tree pin see a renamed fn.
     """
@@ -490,6 +490,7 @@ def check_views(sources: dict[str, str], enums: dict[str, list[str]]) -> int:
             if brace < 0:
                 continue
             found += 1
+            where = f"KvStorage::{fn.group(1)}"
             end = block_end(blanked, brace)
             rest = REST.search(blanked, brace, end)
             if rest:
@@ -497,7 +498,7 @@ def check_views(sources: dict[str, str], enums: dict[str, list[str]]) -> int:
                     rel,
                     blanked.count("\n", 0, rest.start()) + 1,
                     "a rest pattern (`..`)",
-                    "KvStorage::view",
+                    where,
                     "each arm must bind every field",
                 )
             for bound in DISCARDED_FIELD.finditer(blanked, brace, end):
@@ -506,7 +507,7 @@ def check_views(sources: dict[str, str], enums: dict[str, list[str]]) -> int:
                         rel,
                         blanked.count("\n", 0, bound.start()) + 1,
                         f"the field `{bound.group(1)}` bound to `_`",
-                        "KvStorage::view",
+                        where,
                         "only the scalar knobs " + ", ".join(sorted(VIEW_KNOBS)) + " may be discarded",
                     )
     return found

@@ -145,6 +145,10 @@ mod max_seq_accessor_tests;
 mod storage_view_tests;
 
 #[cfg(test)]
+#[path = "storage_view_mut_tests.rs"]
+mod storage_view_mut_tests;
+
+#[cfg(test)]
 #[path = "max_seq_paths_tests.rs"]
 mod max_seq_paths_tests;
 

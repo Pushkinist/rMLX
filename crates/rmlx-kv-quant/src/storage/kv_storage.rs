@@ -639,504 +639,58 @@ impl KvStorage {
         }
     }
 
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-    )]
-    #[allow(
-        clippy::cognitive_complexity,
-        reason = "long match enumerates all KvStorage variants; splitting would obscure the 1-to-1 mapping"
-    )]
     /// Clear the accumulated sequence, keeping the allocations.
     ///
-    /// Every arm goes through the store's own `truncate_to(0)` / `reset()`, for
-    /// the same reason `truncate_to` does: zeroing `shape[2]` alone leaves the
-    /// CPU-side payload — a block list, or `QuantK`'s flat `codes`/`scales` —
-    /// covering the sequence that was just discarded, so the next `append`
-    /// stacks on top of it and the dequant reads the discarded tokens back.
-    /// `truncate_to(0)` cuts that payload as well. The GPU buffers are still
-    /// kept in place so the next request reuses the same allocation; the next
-    /// `append` overwrites their prefix from offset 0.
+    /// Every slot goes through its store's own `truncate_to(0)` or `reset()`
+    /// ([`KvSlot::reset`]), for the same reason `truncate_to` does: zeroing
+    /// `shape[2]` alone leaves the CPU-side payload — a block list, or
+    /// `QuantK`'s flat `codes`/`scales` — covering the sequence that was just
+    /// discarded, so the next `append` stacks on top of it and the dequant
+    /// reads the discarded tokens back. The flat stores keep their GPU buffers
+    /// in place so the next request reuses the same allocation; the next
+    /// `append` overwrites their prefix from offset 0. `None` has no slot: its
+    /// bf16 buffers live on `KvCache`, which resets them.
     pub fn reset(&mut self) {
-        match self {
-            Self::K8V4 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(0);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.truncate_to(0);
-                }
-            }
-            Self::K8V8 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(0);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.truncate_to(0);
-                }
-            }
-            Self::Planar { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(0);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.truncate_to(0);
-                }
-            }
-            // None: no quant state — the bf16 buffers live on KvCache and are
-            // dropped/reset by KvCache::reset directly.
-            Self::None { .. } => {}
-            Self::Mixed { state, .. } => state.reset(),
-            Self::Paged {
-                k, v_k8, v_planar, ..
-            } => {
-                if let Some(pk) = k.as_mut() {
-                    pk.reset();
-                }
-                if let Some(pv) = v_k8.as_mut() {
-                    pv.reset();
-                }
-                if let Some(pv) = v_planar.as_mut() {
-                    pv.reset();
-                }
-            }
-            // K8VTurbo3 resets like K8V4.
-            Self::K8VTurbo3 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(0);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.truncate_to(0);
-                }
-            }
-            // TurboSym3 — symmetric reset (K3 + V3 shape-zeroing).
-            Self::TurboSym3 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(0);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.truncate_to(0);
-                }
-            }
-            // TurboSym4 — symmetric reset (same shape-zeroing).
-            Self::TurboSym4 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(0);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.truncate_to(0);
-                }
-            }
-            // PlanarK — K only; V (bf16) lives on parent KvCache.
-            Self::PlanarK { k, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(0);
-                }
-            }
-            // K8VTurbo2 resets like K8V4.
-            Self::K8VTurbo2 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(0);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.truncate_to(0);
-                }
-            }
-            // IsoV3 — K is q8_0; V holds CPU IsoBlocks (reset clears them so
-            // the next request starts fresh).
-            Self::IsoV3 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(0);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.reset();
-                }
-            }
-            // IsoV4 — same shape semantics as IsoV3.
-            Self::IsoV4 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(0);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.reset();
-                }
-            }
-            // RotorV3 — K shape zeroes; V codec resets blocks but KEEPS the
-            // static rotor table.
-            Self::RotorV3 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(0);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.reset();
-                }
-            }
-            // RotorV4 — same semantics as RotorV3.
-            Self::RotorV4 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(0);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.reset();
-                }
-            }
-            // K8VTurbo3Tcq resets like K8VTurbo3 / K8V4.
-            Self::K8VTurbo3Tcq { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(0);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.truncate_to(0);
-                }
-            }
-            // K8VTurbo2Tcq resets like K8VTurbo2 / K8VTurbo3Tcq.
-            Self::K8VTurbo2Tcq { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(0);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.truncate_to(0);
-                }
-            }
-            // IsoSym3/IsoSym4 reset both K + V iso buffers.
-            Self::IsoSym3 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.reset();
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.reset();
-                }
-            }
-            Self::IsoSym4 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.reset();
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.reset();
-                }
-            }
-            // IsoKOnly3/4 — K iso buffer only; V bf16 lives on parent.
-            Self::IsoKOnly3 { k, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.reset();
-                }
-            }
-            Self::IsoKOnly4 { k, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.reset();
-                }
-            }
-            // RotorSym3 / RotorSym4 — reset both K + V rotor buffers (each has
-            // its own per-token blocks; rotor table + QJL matrix are layer-static
-            // and kept).
-            Self::RotorSym3 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.reset();
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.reset();
-                }
-            }
-            Self::RotorSym4 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.reset();
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.reset();
-                }
-            }
-            // RotorKOnly3/4 — K only; V bf16 on parent.
-            Self::RotorKOnly3 { k, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.reset();
-                }
-            }
-            Self::RotorKOnly4 { k, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.reset();
-                }
-            }
-            // RotorKAsym3 / RotorKAsym4 — K rotor reset; V affine shape-zero
-            // (same as K8V4 V-side).
-            Self::RotorKAsym3 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.reset();
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.truncate_to(0);
-                }
-            }
-            Self::RotorKAsym4 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.reset();
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.truncate_to(0);
-                }
-            }
+        for slot in self.view_mut().slots.into_iter().flatten() {
+            slot.reset();
         }
     }
 
     /// Truncate the sequence dimension to `n` tokens.
     ///
-    /// Every arm delegates to the store's own `truncate_to`, which lowers
+    /// Every slot delegates to its store's own `truncate_to`, which lowers
     /// `shape[2]` to `n` **and** cuts whatever CPU-side state accumulates
     /// independently of it. The GPU buffers are kept in place (no reallocation)
     /// because `append` uses `slice_update` with a position offset derived from
     /// `shape[2]`; the CPU-side blocks / codes are append-only and have to be
-    /// cut, or the next `append` stacks on top of the rejected tokens.
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-    )]
-    #[allow(
-        clippy::cognitive_complexity,
-        reason = "long match enumerates all KvStorage variants; splitting would obscure the 1-to-1 mapping"
-    )]
+    /// cut, or the next `append` stacks on top of the rejected tokens. `None`
+    /// has no slot: `KvCache::truncate_to` handles its bf16 buffers.
     pub fn truncate_to(&mut self, n: i32) {
-        // Clamp the negative case once, here, so no arm can compute from a
-        // negative `n` before delegating.
+        // Clamp the negative case once, here, so no store computes from a
+        // negative `n`.
         //
         // The upper clamp is NOT uniform, and the divergence is worth naming
         // rather than papering over. The turbo / planar / affine stores clamp
         // `n` down to their own `shape[2]` (`storage::clamp_truncate_target`);
         // the rotor / iso stores deliberately do not, because they abort loudly
-        // on an over-long target instead. So for `n > shape[2]` the mixed arms
-        // leave the two axes of one codec at different lengths: `IsoV3`,
-        // `IsoV4`, `RotorV3`, `RotorV4` (affine K clamps, codec V does not) and
-        // `RotorKAsym3` / `RotorKAsym4` (rotor K does not, affine V does). That
-        // matters on spill, where the layer geometry is derived from the K shape
-        // while the V payload is written raw — the reconciliation guard on the
-        // unclamped side is what surfaces it.
+        // on an over-long target instead. So for `n > shape[2]` the mixed
+        // variants leave the two axes of one codec at different lengths:
+        // `IsoV3`, `IsoV4`, `RotorV3`, `RotorV4` (affine K clamps, codec V does
+        // not) and `RotorKAsym3` / `RotorKAsym4` (rotor K does not, affine V
+        // does). That matters on spill, where the layer geometry is derived from
+        // the K shape while the V payload is written raw — the reconciliation
+        // guard on the unclamped side is what surfaces it.
         //
         // `Mixed` is a third reading and belongs in the same list: it has no
-        // `shape[2]` to clamp, because `state.offset` IS its coverage. It keeps
-        // its fill on an over-long target and reports one through an error
-        // event (`MixedKvState::truncate_to`) — loud like the rotor / iso
-        // stores, but at the truncate rather than at the next read, since
-        // nothing downstream of it would notice.
+        // `shape[2]` to clamp, because `state.offset` IS its coverage. Rolling
+        // that marker back is the truncation. It keeps its fill on an over-long
+        // target and reports one through an error event
+        // (`MixedKvState::truncate_to`) — loud like the rotor / iso stores, but
+        // at the truncate rather than at the next read, since nothing downstream
+        // of it would notice.
         let n = n.max(0);
-        match self {
-            Self::K8V4 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(n);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.truncate_to(n);
-                }
-            }
-            Self::K8V8 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(n);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.truncate_to(n);
-                }
-            }
-            Self::Planar { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(n);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.truncate_to(n);
-                }
-            }
-            // None: bf16 buffers are sliced lazily on next read; nothing to
-            // truncate here. KvCache::truncate_to drops the buffers itself.
-            Self::None { .. } => {}
-            // Mixed: the store is a capacity buffer with `state.offset` as its
-            // fill marker, so rolling that marker back IS the truncation — see
-            // `MixedKvState::truncate_to`. Resetting instead dropped the kept
-            // prefix too, and `KvCache::truncate_to` then set `offset = n`,
-            // leaving a cache that reports `n` positions and holds none.
-            Self::Mixed { state, .. } => state.truncate_to(n),
-            Self::Paged {
-                k, v_k8, v_planar, ..
-            } => {
-                if let Some(pk) = k.as_mut() {
-                    pk.truncate_to(n);
-                }
-                if let Some(pv) = v_k8.as_mut() {
-                    pv.truncate_to(n);
-                }
-                if let Some(pv) = v_planar.as_mut() {
-                    pv.truncate_to(n);
-                }
-            }
-            // K8VTurbo3 truncates like K8V4.
-            Self::K8VTurbo3 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(n);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.truncate_to(n);
-                }
-            }
-            // TurboSym3 — symmetric truncate (K3 + V3 shape).
-            Self::TurboSym3 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(n);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.truncate_to(n);
-                }
-            }
-            // TurboSym4 — symmetric truncate (same shape semantics).
-            Self::TurboSym4 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(n);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.truncate_to(n);
-                }
-            }
-            // PlanarK — truncate K only; V (bf16) sliced lazily.
-            Self::PlanarK { k, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(n);
-                }
-            }
-            // K8VTurbo2 truncates like K8V4.
-            Self::K8VTurbo2 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(n);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.truncate_to(n);
-                }
-            }
-            // IsoV3 — K shape truncates; V codec is per-token so dropping
-            // trailing blocks is delegated to QuantIsoV3.
-            Self::IsoV3 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(n);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.truncate_to(n);
-                }
-            }
-            // IsoV4 — same shape semantics as IsoV3.
-            Self::IsoV4 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(n);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.truncate_to(n);
-                }
-            }
-            // RotorV3 — K shape truncates; V codec drops trailing blocks
-            // (rotor table kept).
-            Self::RotorV3 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(n);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.truncate_to(n);
-                }
-            }
-            // RotorV4 — same semantics as RotorV3.
-            Self::RotorV4 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(n);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.truncate_to(n);
-                }
-            }
-            // K8VTurbo3Tcq truncates like K8VTurbo3 / K8V4.
-            Self::K8VTurbo3Tcq { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(n);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.truncate_to(n);
-                }
-            }
-            // K8VTurbo2Tcq truncates like K8VTurbo2 / K8VTurbo3Tcq.
-            Self::K8VTurbo2Tcq { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(n);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.truncate_to(n);
-                }
-            }
-            // IsoSym3 / IsoSym4 — both axes are per-token block codecs;
-            // delegate to each side's truncate_to (same as IsoV3).
-            Self::IsoSym3 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(n);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.truncate_to(n);
-                }
-            }
-            Self::IsoSym4 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(n);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.truncate_to(n);
-                }
-            }
-            // IsoKOnly3 / IsoKOnly4 — K only; V bf16 sliced lazily on parent.
-            Self::IsoKOnly3 { k, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(n);
-                }
-            }
-            Self::IsoKOnly4 { k, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(n);
-                }
-            }
-            // RotorSym3 / RotorSym4 — both axes are per-token block codecs;
-            // delegate to each side's truncate_to.
-            Self::RotorSym3 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(n);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.truncate_to(n);
-                }
-            }
-            Self::RotorSym4 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(n);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.truncate_to(n);
-                }
-            }
-            // RotorKOnly3 / RotorKOnly4 — K only; V bf16 sliced lazily on parent.
-            Self::RotorKOnly3 { k, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(n);
-                }
-            }
-            Self::RotorKOnly4 { k, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(n);
-                }
-            }
-            // RotorKAsym3 / RotorKAsym4 — K rotor truncate; V affine
-            // shape-truncate (same as K8V4 V-side).
-            Self::RotorKAsym3 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(n);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.truncate_to(n);
-                }
-            }
-            Self::RotorKAsym4 { k, v, .. } => {
-                if let Some(ks) = k.as_mut() {
-                    ks.truncate_to(n);
-                }
-                if let Some(vs) = v.as_mut() {
-                    vs.truncate_to(n);
-                }
-            }
+        for slot in self.view_mut().slots.into_iter().flatten() {
+            slot.truncate_to(n);
         }
     }
 
@@ -1462,89 +1016,11 @@ impl KvStorage {
     /// shorter `offset` and no error anywhere. Clearing at the source removes
     /// the divergence instead of teaching each reader to detect it.
     ///
-    /// Exhaustive on purpose: a new payload slot on any variant must be
-    /// classified here, or a stale copy of it survives the skip.
+    /// [`Self::view_mut`] places every slot, so a new payload slot is cleared
+    /// here, or a stale copy of it survives the skip.
     pub fn clear_payload(&mut self) {
-        match self {
-            KvStorage::None { .. } => {}
-            KvStorage::K8V4 { k, v, .. }
-            | KvStorage::K8VTurbo3 { k, v, .. }
-            | KvStorage::K8VTurbo3Tcq { k, v, .. }
-            | KvStorage::K8VTurbo2 { k, v, .. }
-            | KvStorage::K8VTurbo2Tcq { k, v, .. } => {
-                *k = None;
-                *v = None;
-            }
-            KvStorage::K8V8 { k, v, .. } => {
-                *k = None;
-                *v = None;
-            }
-            KvStorage::Planar { k, v, .. } => {
-                *k = None;
-                *v = None;
-            }
-            KvStorage::PlanarK { k, .. } => *k = None,
-            KvStorage::TurboSym3 { k, v, .. } => {
-                *k = None;
-                *v = None;
-            }
-            KvStorage::TurboSym4 { k, v, .. } => {
-                *k = None;
-                *v = None;
-            }
-            KvStorage::IsoV3 { k, v, .. } => {
-                *k = None;
-                *v = None;
-            }
-            KvStorage::IsoV4 { k, v, .. } => {
-                *k = None;
-                *v = None;
-            }
-            KvStorage::IsoSym3 { k, v, .. } => {
-                *k = None;
-                *v = None;
-            }
-            KvStorage::IsoSym4 { k, v, .. } => {
-                *k = None;
-                *v = None;
-            }
-            KvStorage::IsoKOnly3 { k, .. } => *k = None,
-            KvStorage::IsoKOnly4 { k, .. } => *k = None,
-            KvStorage::RotorV3 { k, v, .. } => {
-                *k = None;
-                *v = None;
-            }
-            KvStorage::RotorV4 { k, v, .. } => {
-                *k = None;
-                *v = None;
-            }
-            KvStorage::RotorSym3 { k, v, .. } => {
-                *k = None;
-                *v = None;
-            }
-            KvStorage::RotorSym4 { k, v, .. } => {
-                *k = None;
-                *v = None;
-            }
-            KvStorage::RotorKOnly3 { k, .. } => *k = None,
-            KvStorage::RotorKOnly4 { k, .. } => *k = None,
-            KvStorage::RotorKAsym3 { k, v, .. } => {
-                *k = None;
-                *v = None;
-            }
-            KvStorage::RotorKAsym4 { k, v, .. } => {
-                *k = None;
-                *v = None;
-            }
-            // Payload is not an `Option`; each owns a `reset`.
-            KvStorage::Mixed { state, .. } => state.reset(),
-            KvStorage::Paged {
-                k, v_k8, v_planar, ..
-            } => {
-                *k = None;
-                *v_k8 = None;
-                *v_planar = None;
-            }
+        for slot in self.view_mut().slots.into_iter().flatten() {
+            slot.clear();
         }
     }
 
@@ -1712,6 +1188,113 @@ impl KvStorage {
             },
         }
     }
+
+    /// The one mutating match from a variant to its store slots, in the same
+    /// K, V, second-V order as [`Self::view`]. `reset`, `truncate_to` and
+    /// `clear_payload` go through it.
+    ///
+    /// The same binding rule as [`Self::view`]: every arm binds every field and
+    /// has no `..`, and the KV census refuses a `..` in this fn.
+    pub(crate) fn view_mut(&mut self) -> StorageViewMut<'_> {
+        match self {
+            Self::K8V4 { k, v } => StorageViewMut {
+                slots: [Some(k), Some(v), None],
+            },
+            Self::K8V8 { k, v } => StorageViewMut {
+                slots: [Some(k), Some(v), None],
+            },
+            Self::Planar { k, v, bits: _ } => StorageViewMut {
+                slots: [Some(k), Some(v), None],
+            },
+            Self::None {} => StorageViewMut {
+                slots: [None, None, None],
+            },
+            Self::Mixed { state } => StorageViewMut {
+                slots: [Some(state), None, None],
+            },
+            Self::Paged {
+                quant: _,
+                k,
+                v_k8,
+                v_planar,
+            } => StorageViewMut {
+                slots: [Some(k), Some(v_k8), Some(v_planar)],
+            },
+            Self::K8VTurbo3 { k, v } => StorageViewMut {
+                slots: [Some(k), Some(v), None],
+            },
+            Self::TurboSym3 { k, v } => StorageViewMut {
+                slots: [Some(k), Some(v), None],
+            },
+            Self::TurboSym4 { k, v } => StorageViewMut {
+                slots: [Some(k), Some(v), None],
+            },
+            Self::PlanarK { k } => StorageViewMut {
+                slots: [Some(k), None, None],
+            },
+            Self::K8VTurbo2 { k, v } => StorageViewMut {
+                slots: [Some(k), Some(v), None],
+            },
+            Self::IsoV3 { k, v } => StorageViewMut {
+                slots: [Some(k), Some(v), None],
+            },
+            Self::IsoV4 { k, v } => StorageViewMut {
+                slots: [Some(k), Some(v), None],
+            },
+            Self::RotorV3 { k, v } => StorageViewMut {
+                slots: [Some(k), Some(v), None],
+            },
+            Self::RotorV4 { k, v } => StorageViewMut {
+                slots: [Some(k), Some(v), None],
+            },
+            Self::K8VTurbo3Tcq { k, v } => StorageViewMut {
+                slots: [Some(k), Some(v), None],
+            },
+            Self::K8VTurbo2Tcq { k, v } => StorageViewMut {
+                slots: [Some(k), Some(v), None],
+            },
+            Self::IsoSym3 { k, v } => StorageViewMut {
+                slots: [Some(k), Some(v), None],
+            },
+            Self::IsoSym4 { k, v } => StorageViewMut {
+                slots: [Some(k), Some(v), None],
+            },
+            Self::IsoKOnly3 { k } => StorageViewMut {
+                slots: [Some(k), None, None],
+            },
+            Self::IsoKOnly4 { k } => StorageViewMut {
+                slots: [Some(k), None, None],
+            },
+            Self::RotorSym3 { k, v } => StorageViewMut {
+                slots: [Some(k), Some(v), None],
+            },
+            Self::RotorSym4 { k, v } => StorageViewMut {
+                slots: [Some(k), Some(v), None],
+            },
+            Self::RotorKOnly3 { k } => StorageViewMut {
+                slots: [Some(k), None, None],
+            },
+            Self::RotorKOnly4 { k } => StorageViewMut {
+                slots: [Some(k), None, None],
+            },
+            Self::RotorKAsym3 {
+                k,
+                v,
+                v_bits: _,
+                v_group_size: _,
+            } => StorageViewMut {
+                slots: [Some(k), Some(v), None],
+            },
+            Self::RotorKAsym4 {
+                k,
+                v,
+                v_bits: _,
+                v_group_size: _,
+            } => StorageViewMut {
+                slots: [Some(k), Some(v), None],
+            },
+        }
+    }
 }
 
 /// Read-only view of one [`KvStorage`], built by [`KvStorage::view`].
@@ -1722,4 +1305,11 @@ pub(crate) struct StorageView<'a> {
     /// variant has no such slot. The scalar knobs (`bits`, `v_bits`,
     /// `v_group_size`, the paged `quant`) are not slots.
     pub(crate) slots: [Option<&'a dyn KvSlot>; 3],
+}
+
+/// Mutable view of one [`KvStorage`], built by [`KvStorage::view_mut`].
+pub(crate) struct StorageViewMut<'a> {
+    /// The K slot, the V slot and the paged planar V slot; `None` where the
+    /// variant has no such slot.
+    pub(crate) slots: [Option<&'a mut dyn KvSlot>; 3],
 }

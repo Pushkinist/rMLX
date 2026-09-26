@@ -66,10 +66,10 @@ and `quant_iso_v_tests.rs`.
 **Every store cuts its own payload.** The same planner drives the turbo and
 planar blocks (`TurboBlocks`, `PlanarBlocks`). `QuantV`, `QuantKTurbo3/4`,
 `QuantPlanarK` and `QuantPlanarV` implement `truncate_to`. `QuantK` cuts its
-flat `codes` / `scales` pair to the first `n` positions. Every arm of
-`KvStorage::truncate_to` and `KvStorage::reset` delegates to the store's own
-`truncate_to` or `reset`. So no arm lowers `shape[2]` and leaves the payload in
-place.
+flat `codes` / `scales` pair to the first `n` positions.
+`KvStorage::truncate_to` and `KvStorage::reset` reach every slot through
+`KvStorage::view_mut`, and each slot calls its store's own `truncate_to` or
+`reset`. So no variant lowers `shape[2]` and leaves the payload in place.
 
 **Every CPU dequant checks its length.** Each path checks that its blocks decode
 to `prod(shape)` elements. On a mismatch in either direction it returns an
@@ -93,13 +93,13 @@ raised to meet the target would claim tokens that no payload holds.
 
 The rotor and iso stores do not clamp: they set `shape[2]` to the target. A
 ring-only tail lies below `shape[2]`, and the ring readback returns `Err` on an
-over-long target. So for `n > shape[2]` the mixed arms leave the two axes of one
+over-long target. So for `n > shape[2]` the mixed variants leave the two axes of one
 codec at different lengths. These are `IsoV3`, `IsoV4`, `RotorV3` and `RotorV4`,
 where the q8 K (`QuantK`) clamps. They are also `RotorKAsym3/4`, where the
 TurboQuant V (`QuantV`) clamps. The guard on the unclamped side reports it at
 spill.
 
-**The `Mixed` arm truncates to its fill marker.** `MixedKvState` is a capacity
+**`Mixed` truncates to its fill marker.** `MixedKvState` is a capacity
 buffer that grows in `STEP` increments, with `offset` as its fill marker.
 `truncate_to(n)` sets the marker to `n`, and the next append writes over the
 rows from `n`. The bf16 mirror of a shared-KV producer follows the same offset.

@@ -1069,9 +1069,75 @@ EOF
 check "a slot discarded in KvStorage::view is refused, with its line" "${T}" 1 \
     "^refused: ${STORAGE_REL}:19 the field \`v\` bound to \`_\` in KvStorage::view" match-sites
 
-# 53 — the real tree, pinned exactly. One run, every figure compared, and
+# 53 — a `..` in `KvStorage::view_mut` is refused (exit 1), with its line and
+# the fn's name: the mutating view has the same binding rule as the read-only
+# one, so a new field is not left out of `reset`, `truncate_to` or the clear.
+T="${WORK}/viewmutrest"; build_tree "${T}"
+cat >>"${T}/${STORAGE_REL}" <<'EOF'
+impl KvStorage {
+    fn view_mut(&mut self) -> ViewMut<'_> {
+        match self {
+            KvStorage::Alpha { k, v } => ViewMut([Some(k), Some(v)]),
+            KvStorage::Beta { k, .. } => ViewMut([Some(k), None]),
+            KvStorage::Gamma { k } => ViewMut([Some(k), None]),
+            KvStorage::Delta { state } => ViewMut([Some(state), None]),
+        }
+    }
+}
+EOF
+check "a rest pattern in KvStorage::view_mut is refused, with its line" "${T}" 1 \
+    "^refused: ${STORAGE_REL}:20 a rest pattern \(\`\.\.\`\) in KvStorage::view_mut; each arm must bind every field" match-sites
+
+# 54 — a slot bound to `_v` in `KvStorage::view_mut` is refused (exit 1), with
+# its line.
+T="${WORK}/viewmutdiscard"; build_tree "${T}"
+for f in "${STORAGE_REL}" "${UPDATE_REL}"; do
+    sed -e 's/Alpha/IsoV3/g' "${T}/${f}" >"${T}/${f}.new" && mv "${T}/${f}.new" "${T}/${f}"
+done
+cat >>"${T}/${STORAGE_REL}" <<'EOF'
+impl KvStorage {
+    fn view_mut(&mut self) -> ViewMut<'_> {
+        match self {
+            KvStorage::IsoV3 { k, v: _v } => ViewMut([Some(k), None]),
+            KvStorage::Beta { k, v, bits: _ } => ViewMut([Some(k), Some(v)]),
+            KvStorage::Gamma { k } => ViewMut([Some(k), None]),
+            KvStorage::Delta { state } => ViewMut([Some(state), None]),
+        }
+    }
+}
+EOF
+check "a slot discarded in KvStorage::view_mut is refused, with its line" "${T}" 1 \
+    "^refused: ${STORAGE_REL}:19 the field \`v\` bound to \`_\` in KvStorage::view_mut" match-sites
+
+# 55 — negative control: a `view` and a `view_mut` that bind every field pass
+# and count two view fns.
+T="${WORK}/viewmutok"; build_tree "${T}"
+cat >>"${T}/${STORAGE_REL}" <<'EOF'
+impl KvStorage {
+    fn view(&self) -> View<'_> {
+        match self {
+            KvStorage::Alpha { k, v } => View([Some(k), Some(v)]),
+            KvStorage::Beta { k, v, bits: _ } => View([Some(k), Some(v)]),
+            KvStorage::Gamma { k } => View([Some(k), None]),
+            KvStorage::Delta { state } => View([Some(state), None]),
+        }
+    }
+    fn view_mut(&mut self) -> ViewMut<'_> {
+        match self {
+            KvStorage::Alpha { k, v } => ViewMut([Some(k), Some(v)]),
+            KvStorage::Beta { k, v, bits: _ } => ViewMut([Some(k), Some(v)]),
+            KvStorage::Gamma { k } => ViewMut([Some(k), None]),
+            KvStorage::Delta { state } => ViewMut([Some(state), None]),
+        }
+    }
+}
+EOF
+check "a view and a view_mut that bind every field pass and count two view fns" "${T}" 0 \
+    "^view-fns 2$" match-sites --threshold 2
+
+# 56 — the real tree, pinned exactly. One run, every figure compared, and
 # each failure prints the figure beside its pin and what to do.
-REAL_PINS="match-sites=11 forcing-sites=11 subset-sites=154 table-sites=2 descriptor-fns=1 view-fns=1"
+REAL_PINS="match-sites=9 forcing-sites=9 subset-sites=154 table-sites=2 descriptor-fns=1 view-fns=2"
 pin_advice() { # pin_advice NAME
     local list="python3 scripts/kv_update_census.py match-sites | grep"
     case "$1" in
@@ -1085,7 +1151,7 @@ pin_advice() { # pin_advice NAME
         echo "The census reads KvQuant::descriptor (an \`fn descriptor\` inside \`impl KvQuant\`) to refuse a row that does not state its own facts. 0 means the fn was renamed or moved out of the impl, and the refusal checks nothing. Rename it back, or teach DESCRIPTOR_FN in scripts/kv_update_census.py the new name."
         ;;
     view-fns)
-        echo "The census reads KvStorage::view (an \`fn view\` inside \`impl KvStorage\`) to refuse an arm with a \`..\` rest pattern. 0 means the fn was renamed or moved out of the impl, and the refusal checks nothing. Rename it back, or teach VIEW_FN in scripts/kv_update_census.py the new name."
+        echo "The census reads KvStorage::view and KvStorage::view_mut (an \`fn view\` and an \`fn view_mut\` inside \`impl KvStorage\`) to refuse an arm with a \`..\` rest pattern. Fewer than 2 means a fn was renamed or moved out of the impl, and its refusal checks nothing. Rename it back, or teach VIEW_FN in scripts/kv_update_census.py the new name."
         ;;
     table-sites)
         echo "A table site is a match keyed by string literals or constants whose arms name the codec variants; a new codec compiles there and cannot be parsed. List them: ${list} '^table'. If the change is correct, set the pin in the real-tree case of scripts/kv_update_census_selftest.sh and name the site you added or removed in the commit message."

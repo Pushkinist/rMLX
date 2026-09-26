@@ -1,5 +1,6 @@
-//! `KvStore` and `KvSlot`: the per-store operations that the read-only
-//! `KvStorage` sites reach through [`KvStorage::view`](super::KvStorage::view).
+//! `KvStore` and `KvSlot`: the per-store operations that the `KvStorage` sites
+//! reach through [`KvStorage::view`](super::KvStorage::view) and
+//! [`KvStorage::view_mut`](super::KvStorage::view_mut).
 //!
 //! `KvStore` is implemented once per store type (the width stores once for all
 //! widths, a boxed store through its box). Every `Option<Store>` slot gets its
@@ -7,7 +8,8 @@
 //! impl, because its payload is not an `Option`.
 //!
 //! None of these calls is on the per-token decode math: they serve the byte
-//! total, the graph flush, the SSD spill decision and the test probes.
+//! total, the graph flush, the SSD spill decision, the test probes, the cache
+//! reset, the truncation and the payload clear.
 
 use rmlx_core::error::Result;
 use rmlx_mlx::{Array, Device, Dtype};
@@ -32,6 +34,12 @@ pub(crate) trait KvStore {
     /// Dequantize the filled sequence to flat f32. `None` when the store has
     /// no CPU dequant.
     fn dequant_f32(&self, device: Device) -> Option<Result<Vec<f32>>>;
+    /// Empty the sequence for the next request. The flat and block stores keep
+    /// their GPU buffers (`truncate_to(0)`); the iso, rotor and paged stores
+    /// run their own `reset`, which keeps only their layer-static tables.
+    fn reset_sequence(&mut self);
+    /// Cut the sequence to `n >= 0` positions, with the store's own clamping.
+    fn truncate_to(&mut self, n: i32);
 }
 
 /// One store slot of a `KvStorage` variant, filled or empty.
@@ -48,6 +56,12 @@ pub(crate) trait KvSlot {
     /// `None` when the slot has no CPU-dequantizable store. `Some(Err(..))`
     /// when the store exists and its dequant refused.
     fn dequant_f32(&self, device: Device) -> Option<Result<Vec<f32>>>;
+    /// Empty the sequence and keep the payload's allocation.
+    fn reset(&mut self);
+    /// Cut the sequence to `n >= 0` positions.
+    fn truncate_to(&mut self, n: i32);
+    /// Drop the payload.
+    fn clear(&mut self);
 }
 
 impl<T: KvStore> KvSlot for Option<T> {
@@ -69,6 +83,22 @@ impl<T: KvStore> KvSlot for Option<T> {
 
     fn dequant_f32(&self, device: Device) -> Option<Result<Vec<f32>>> {
         self.as_ref().and_then(|store| store.dequant_f32(device))
+    }
+
+    fn reset(&mut self) {
+        if let Some(store) = self {
+            store.reset_sequence();
+        }
+    }
+
+    fn truncate_to(&mut self, n: i32) {
+        if let Some(store) = self {
+            KvStore::truncate_to(store, n);
+        }
+    }
+
+    fn clear(&mut self) {
+        *self = None;
     }
 }
 
@@ -93,6 +123,19 @@ impl KvSlot for MixedKvState {
     fn dequant_f32(&self, _device: Device) -> Option<Result<Vec<f32>>> {
         None
     }
+
+    fn reset(&mut self) {
+        MixedKvState::reset(self);
+    }
+
+    fn truncate_to(&mut self, n: i32) {
+        MixedKvState::truncate_to(self, n);
+    }
+
+    /// The payload is not an `Option`, so clearing it is its `reset`.
+    fn clear(&mut self) {
+        MixedKvState::reset(self);
+    }
 }
 
 impl<T: KvStore> KvStore for Box<T> {
@@ -108,6 +151,14 @@ impl<T: KvStore> KvStore for Box<T> {
 
     fn dequant_f32(&self, device: Device) -> Option<Result<Vec<f32>>> {
         T::dequant_f32(self, device)
+    }
+
+    fn reset_sequence(&mut self) {
+        T::reset_sequence(self);
+    }
+
+    fn truncate_to(&mut self, n: i32) {
+        T::truncate_to(self, n);
     }
 }
 
@@ -128,6 +179,14 @@ impl KvStore for PagedKStorage {
     fn dequant_f32(&self, _device: Device) -> Option<Result<Vec<f32>>> {
         None
     }
+
+    fn reset_sequence(&mut self) {
+        Self::reset(self);
+    }
+
+    fn truncate_to(&mut self, n: i32) {
+        Self::truncate_to(self, n);
+    }
 }
 
 impl KvStore for PagedVStorage {
@@ -144,6 +203,14 @@ impl KvStore for PagedVStorage {
     fn dequant_f32(&self, _device: Device) -> Option<Result<Vec<f32>>> {
         None
     }
+
+    fn reset_sequence(&mut self) {
+        Self::reset(self);
+    }
+
+    fn truncate_to(&mut self, n: i32) {
+        Self::truncate_to(self, n);
+    }
 }
 
 impl KvStore for PagedPlanarVStorage {
@@ -159,6 +226,14 @@ impl KvStore for PagedPlanarVStorage {
 
     fn dequant_f32(&self, _device: Device) -> Option<Result<Vec<f32>>> {
         None
+    }
+
+    fn reset_sequence(&mut self) {
+        Self::reset(self);
+    }
+
+    fn truncate_to(&mut self, n: i32) {
+        Self::truncate_to(self, n);
     }
 }
 
@@ -186,6 +261,14 @@ impl KvStore for QuantK {
                 .map(|(flat, _)| flat),
         )
     }
+
+    fn reset_sequence(&mut self) {
+        Self::truncate_to(self, 0);
+    }
+
+    fn truncate_to(&mut self, n: i32) {
+        Self::truncate_to(self, n);
+    }
 }
 
 impl KvStore for QuantV {
@@ -205,6 +288,14 @@ impl KvStore for QuantV {
                 .map(|(flat, _)| flat),
         )
     }
+
+    fn reset_sequence(&mut self) {
+        Self::truncate_to(self, 0);
+    }
+
+    fn truncate_to(&mut self, n: i32) {
+        Self::truncate_to(self, n);
+    }
 }
 
 impl<const BITS: u8> KvStore for QuantKTurbo<BITS> {
@@ -223,6 +314,14 @@ impl<const BITS: u8> KvStore for QuantKTurbo<BITS> {
             self.dequantize_choice(device, Dtype::F32)
                 .map(|(flat, _)| flat),
         )
+    }
+
+    fn reset_sequence(&mut self) {
+        Self::truncate_to(self, 0);
+    }
+
+    fn truncate_to(&mut self, n: i32) {
+        Self::truncate_to(self, n);
     }
 }
 
@@ -247,6 +346,14 @@ impl KvStore for QuantPlanarK {
                 .map(|(flat, _)| flat),
         )
     }
+
+    fn reset_sequence(&mut self) {
+        Self::truncate_to(self, 0);
+    }
+
+    fn truncate_to(&mut self, n: i32) {
+        Self::truncate_to(self, n);
+    }
 }
 
 impl KvStore for QuantPlanarV {
@@ -270,6 +377,14 @@ impl KvStore for QuantPlanarV {
                 .map(|(flat, _)| flat),
         )
     }
+
+    fn reset_sequence(&mut self) {
+        Self::truncate_to(self, 0);
+    }
+
+    fn truncate_to(&mut self, n: i32) {
+        Self::truncate_to(self, n);
+    }
 }
 
 // The iso and rotor stores dequantize on the CPU from their blocks. `eval` does
@@ -290,6 +405,14 @@ impl<const BITS: u8> KvStore for QuantIsoK<BITS> {
     fn dequant_f32(&self, _device: Device) -> Option<Result<Vec<f32>>> {
         Some(self.dequant())
     }
+
+    fn reset_sequence(&mut self) {
+        Self::reset(self);
+    }
+
+    fn truncate_to(&mut self, n: i32) {
+        Self::truncate_to(self, n);
+    }
 }
 
 impl<const BITS: u8> KvStore for QuantIsoV<BITS> {
@@ -305,6 +428,14 @@ impl<const BITS: u8> KvStore for QuantIsoV<BITS> {
 
     fn dequant_f32(&self, _device: Device) -> Option<Result<Vec<f32>>> {
         Some(self.dequant())
+    }
+
+    fn reset_sequence(&mut self) {
+        Self::reset(self);
+    }
+
+    fn truncate_to(&mut self, n: i32) {
+        Self::truncate_to(self, n);
     }
 }
 
@@ -322,6 +453,14 @@ impl<const BITS: u8> KvStore for QuantRotorK<BITS> {
     fn dequant_f32(&self, _device: Device) -> Option<Result<Vec<f32>>> {
         Some(self.dequant())
     }
+
+    fn reset_sequence(&mut self) {
+        Self::reset(self);
+    }
+
+    fn truncate_to(&mut self, n: i32) {
+        Self::truncate_to(self, n);
+    }
 }
 
 impl<const BITS: u8> KvStore for QuantRotorV<BITS> {
@@ -337,5 +476,13 @@ impl<const BITS: u8> KvStore for QuantRotorV<BITS> {
 
     fn dequant_f32(&self, _device: Device) -> Option<Result<Vec<f32>>> {
         Some(self.dequant())
+    }
+
+    fn reset_sequence(&mut self) {
+        Self::reset(self);
+    }
+
+    fn truncate_to(&mut self, n: i32) {
+        Self::truncate_to(self, n);
     }
 }
