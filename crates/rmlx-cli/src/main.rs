@@ -1148,7 +1148,9 @@ enum Cmd {
         /// Default 5.
         #[arg(long, default_value_t = 5)]
         min_disk_gb: u64,
-        /// Also run the MLX smoke probe per model (loads MLX — slow, exclusive Metal).
+        /// Also run the MLX smoke probe per model (loads MLX — slow, takes the
+        /// Metal claim). With --port, when the claim check finds a holder, the
+        /// probes do not run and each smoke line is info naming the holder.
         #[arg(long, default_value_t = false)]
         full: bool,
         /// Emit plain OK/FAIL text instead of JSON lines.

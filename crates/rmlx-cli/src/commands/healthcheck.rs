@@ -108,8 +108,11 @@ pub(crate) fn run_healthcheck(
     let mut red_checks: Vec<String> = Vec::new();
 
     // ── 1. Claim check ────────────────────────────────────────────────────────
+    let mut server_probe = None;
     if let Some(p) = port {
-        let line = check_claim();
+        let probe = rmlx_server::probe_claim();
+        let line = claim_line(&probe);
+        server_probe = Some(probe);
         if line.status == Status::Red {
             red_checks.push(line.check.clone());
         }
@@ -137,12 +140,17 @@ pub(crate) fn run_healthcheck(
 
         // ── 4. Smoke probe (--full only) ──────────────────────────────────────
         if full {
-            let claim = crate::commands::parse::claim_gpu();
-            for path in &model_paths {
-                let line = match &claim {
-                    Ok(gpu) => check_smoke(path, gpu),
-                    Err(e) => smoke_refused(path, e),
-                };
+            let holder = server_probe
+                .as_ref()
+                .and_then(|probe| probe.as_ref().err())
+                .filter(|e| matches!(e, ClaimError::AlreadyHeld { .. }));
+            let lines = smoke_lines(
+                &model_paths,
+                holder,
+                crate::commands::parse::claim_gpu,
+                check_smoke,
+            );
+            for line in lines {
                 if line.status == Status::Red {
                     red_checks.push(line.check.clone());
                 }
@@ -221,24 +229,11 @@ pub(crate) fn run_healthcheck(
 /// Check 1: the Metal claim. A server on the probed port holds it, so a held
 /// claim is green and a free claim is red. The probe does not take the claim;
 /// its shared lock refuses a GPU command that starts in the same moment.
-fn check_claim() -> CheckLine {
-    claim_line(rmlx_server::probe_claim())
-}
-
-fn claim_line(probe: Result<(), ClaimError>) -> CheckLine {
+fn claim_line(probe: &Result<(), ClaimError>) -> CheckLine {
     match probe {
-        Err(ClaimError::AlreadyHeld {
-            holder_pid,
-            holder_command,
-            ..
-        }) => {
-            let pid = holder_pid.map_or_else(|| "none".to_owned(), |pid| pid.to_string());
-            debug!(pid, "claim check: held");
-            CheckLine::new(
-                "claim",
-                Status::Green,
-                format!("held; the holder recorded pid={pid} ({holder_command})"),
-            )
+        Err(held @ ClaimError::AlreadyHeld { .. }) => {
+            debug!(holder = %holder(held), "claim check: held");
+            CheckLine::new("claim", Status::Green, format!("held; {}", holder(held)))
         }
         Ok(()) => CheckLine::new("claim", Status::Red, "no process holds the Metal claim"),
         Err(e) => CheckLine::new("claim", Status::Red, format!("{e}")),
@@ -394,14 +389,54 @@ fn smoke_id(path: &Path) -> &str {
         .unwrap_or("(unknown)")
 }
 
-/// Check 4 (--full only) when the Metal claim was refused: the probe does not
-/// run, and the line names the holder.
-fn smoke_refused(path: &Path, refusal: &ClaimError) -> CheckLine {
-    CheckLine::new(
-        format!("smoke:{}", smoke_id(path)),
-        Status::Red,
-        format!("smoke probe not run: {refusal}"),
-    )
+/// `the holder recorded pid=<pid> (<command>)`, or the error itself when it is
+/// not a refusal.
+fn holder(claim: &ClaimError) -> String {
+    if let ClaimError::AlreadyHeld {
+        holder_pid,
+        holder_command,
+        ..
+    } = claim
+    {
+        let pid = holder_pid.map_or_else(|| "none".to_owned(), |pid| pid.to_string());
+        format!("the holder recorded pid={pid} ({holder_command})")
+    } else {
+        claim.to_string()
+    }
+}
+
+/// Check 4 (--full only). When check 1 found a holder, the probes do not run
+/// and each line is info, naming it: the checked server holds the GPU, which is
+/// the state check 1 reports green. Otherwise the probes take the Metal claim;
+/// a refused claim makes each line red and names the holder.
+fn smoke_lines(
+    paths: &[PathBuf],
+    server_holder: Option<&ClaimError>,
+    claim_gpu: impl FnOnce() -> Result<ClaimedDevice, ClaimError>,
+    mut probe: impl FnMut(&Path, &ClaimedDevice) -> CheckLine,
+) -> Vec<CheckLine> {
+    let line = |path: &Path, status, detail: String| {
+        CheckLine::new(format!("smoke:{}", smoke_id(path)), status, detail)
+    };
+    if let Some(held) = server_holder {
+        return paths
+            .iter()
+            .map(|path| {
+                line(
+                    path,
+                    Status::Info,
+                    format!("not run: the Metal claim is held; {}", holder(held)),
+                )
+            })
+            .collect();
+    }
+    match claim_gpu() {
+        Ok(gpu) => paths.iter().map(|path| probe(path, &gpu)).collect(),
+        Err(refusal) => paths
+            .iter()
+            .map(|path| line(path, Status::Red, format!("smoke probe not run: {refusal}")))
+            .collect(),
+    }
 }
 
 /// Check 4 (--full only): run the existing smoke probe via `rmlx info --probe-smoke`.
