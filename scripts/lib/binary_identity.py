@@ -16,7 +16,10 @@ So this reports both:
             that does not contain one cannot write the event, so the reading
             that event carries cannot come out of this run — and that is
             knowable before the server is started rather than after three
-            passes produced nothing.
+            passes produced nothing. The check is a byte-substring check, so a
+            binary built before a log-text change can still pass it; the exact
+            log reader then fails loudly after the run. Rebuild before a
+            published run.
 
 The literals are imported from the readers that consume them, never restated
 here: a second copy would let the binary check pass while the reader that

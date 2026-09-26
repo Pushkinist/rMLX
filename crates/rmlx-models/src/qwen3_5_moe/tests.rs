@@ -268,7 +268,7 @@ fn qwen3_5_moe_routing_math() {
     );
 }
 
-// ── PromptCache unit tests (C1: block-level prefix sharing) ───────────────
+// ── PromptCache unit tests (block-level prefix sharing) ───────────────────
 
 /// Build a Qwen35MoeEntry test fixture with computed chained block hashes
 /// and empty KV / linear caches.
@@ -379,16 +379,15 @@ fn prompt_cache_fifo_eviction() {
     assert_eq!(blocks, 2, "slot C shares both blocks with its own prompt");
 }
 
-/// C1 regression (the gap 700 unit tests missed): an identical-prompt repeat
+/// Regression: an identical-prompt repeat
 /// must be detected as a true EXACT hit, NOT misrouted into the partial path.
 ///
-/// C1 shipped with the callsite Exact test written as
-/// `block_count * BLOCK_TOKENS == prompt_ids.len()`. That is essentially never
-/// true (only when len % 256 == 0), so an identical re-request of a
-/// non-block-aligned prompt fell into the block-truncate + tail-reprefill
-/// Prefix path. For qwen3_5_moe that path leaves the recurrent GDN
-/// `lin_caches` untouched while truncating KV, corrupting state → the model
-/// emitted EOS after 9 tokens instead of the correct 258 (cold value).
+/// A callsite Exact test written as `block_count * BLOCK_TOKENS ==
+/// prompt_ids.len()` is essentially never true (only when len % 256 == 0), so
+/// an identical re-request of a non-block-aligned prompt would fall into the
+/// block-truncate + tail-reprefill Prefix path. For qwen3_5_moe that path
+/// leaves the recurrent GDN `lin_caches` untouched while truncating KV, which
+/// corrupts state.
 ///
 /// The fixed callsite predicate is `entry.prompt_token_ids() == prompt_ids`
 /// (full token equality). This test asserts that predicate behaves correctly
@@ -438,7 +437,7 @@ fn prompt_cache_identical_prompt_is_exact_not_partial() {
     assert!(
         !old_broken_exact,
         "block-floored test must NOT detect this exact match \
-         (this is precisely the C1 regression being pinned)"
+         (this is the regression being pinned)"
     );
 }
 
@@ -1743,7 +1742,7 @@ fn integration_paro_generate_greedy() {
         println!("{}", line.trim());
         None
     };
-    // A7.2: greedy (temperature 0.0) — untouched argmax path.
+    // Greedy (temperature 0.0) — untouched argmax path.
     let test_sampler_cfg = crate::sampler::SamplerConfig {
         temperature: 0.0,
         top_p: 1.0,
@@ -2060,9 +2059,8 @@ fn integration_qwen3_5_moe_35b() {
 ///    decode output differs from a crafted different-tail cold run, NOT from the
 ///    warm run).
 ///
-/// Run:
+/// Run (the snapshot resolves by slug under `RMLX_O_MODELS_ROOT`):
 /// ```sh
-/// RMLX_KV_TEST_MODEL=/path/to/Qwen3.6-35B-A3B-8bit \
 /// cargo test -p rmlx-models hydrated_tail_produces_identical_output \
 ///     -- --ignored --nocapture
 /// ```
@@ -3338,7 +3336,7 @@ fn qwen3_5_moe_consume_engine_migration_golden() {
 
     // (b.3) The whole stream. Everything above stops at the tail: the GDN state
     // the tail leaves behind, and the first KV append on a resumed offset, are
-    // reached only by decoding. #571's own symptom — token 0 right and a cycle
+    // reached only by decoding. The defect's own symptom — token 0 right and a cycle
     // from token 1 — lives entirely in that gap.
     assert_eq!(
         warm_tail, cold_520_chunked,

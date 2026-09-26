@@ -1,14 +1,15 @@
 -- Migration 001: initial schema
--- docs/METRICS_DB.md §3: schema_meta, prompts, observations, bests VIEW
--- No triggers per §3.5. bests is a VIEW, not a base table (§3.3).
+-- docs/METRICS_SCHEMA.md §3: schema_meta, prompts, observations, bests VIEW
+-- No triggers per docs/METRICS_SCHEMA.md §3.5. bests is a VIEW, not a base
+-- table (docs/METRICS_SCHEMA.md §3.3).
 
--- §3.0 Versioning + provenance
+-- docs/METRICS_SCHEMA.md §3.0 Versioning + provenance
 CREATE TABLE IF NOT EXISTS schema_meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
 
--- §3.1 Prompt registry
+-- docs/METRICS_SCHEMA.md §3.1 Prompt registry
 CREATE TABLE IF NOT EXISTS prompts (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     sha256         TEXT    NOT NULL UNIQUE,
@@ -21,8 +22,9 @@ CREATE TABLE IF NOT EXISTS prompts (
 
 CREATE INDEX IF NOT EXISTS prompts_name_idx ON prompts(name);
 
--- §3.2 Observations — append-only ground truth
--- PK is surrogate INTEGER only; no composite PK on cell columns (§3.2 rule).
+-- docs/METRICS_SCHEMA.md §3.2 Observations — append-only ground truth
+-- PK is surrogate INTEGER only; no composite PK on cell columns
+-- (docs/METRICS_SCHEMA.md §3.2).
 CREATE TABLE IF NOT EXISTS observations (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     -- cell identity
@@ -46,7 +48,7 @@ CREATE TABLE IF NOT EXISTS observations (
     build_profile    TEXT,
     backend_version  TEXT,
     hardware_tag     TEXT    NOT NULL,
-    -- bench config (nullable — §3.4 sparse-rows policy)
+    -- bench config (nullable — docs/METRICS_SCHEMA.md §3.4 sparse-rows policy)
     prompt_tokens    INTEGER,
     max_tokens       INTEGER,
     temperature      REAL,
@@ -71,10 +73,13 @@ CREATE INDEX IF NOT EXISTS obs_run_id_idx    ON observations(run_id);
 CREATE INDEX IF NOT EXISTS obs_backend_idx   ON observations(backend);
 CREATE INDEX IF NOT EXISTS obs_inserted_idx  ON observations(inserted_utc);
 
--- §3.3 bests VIEW — champion per cell.
--- Not created here: the definition is generated from the §4 metric registry
--- (it carries the §4.1 plausibility filter, which this file cannot know), and
+-- docs/METRICS_SCHEMA.md §3.3 bests VIEW — champion per cell.
+-- Not created here: the definition is generated from the
+-- docs/METRICS_SCHEMA.md §4 metric registry
+-- (it carries the docs/METRICS_SCHEMA.md §4.1 plausibility filter, which
+-- this file cannot know), and
 -- `migrate::run_pending` installs it via `bests_view::ensure` after the last
 -- migration. Edit `bests_view::create_sql`.
--- Must remain a VIEW; do NOT convert to a base table (§3.3 note).
--- No triggers (§3.5).
+-- Must remain a VIEW; do NOT convert to a base table
+-- (docs/METRICS_SCHEMA.md §3.3).
+-- No triggers (docs/METRICS_SCHEMA.md §3.5).

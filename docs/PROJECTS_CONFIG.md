@@ -1,32 +1,41 @@
 # projects.toml — per-project cap defaults
 
-Place `projects.toml` inside `<RMLX_HOME>` (resolved as `$RMLX_HOME`,
-`<workspace>/.rmlx/`, or `$HOME/.rmlx/` — same as every other rMLX runtime
-file) to set stable per-project SSD and RAM budgets without long CLI lines.
-The file is **optional** (absent = silent no-op) and **rMLX-read-only**
-(operator or coding agent edits it; rMLX never writes it). Changes take
-effect on the next `rmlx serve` restart — there is no live reload.
+`rmlx serve` reads `<RMLX_HOME>/projects.toml` at startup to fill in its SSD
+and RAM cache caps. `<RMLX_HOME>` resolves as for every other runtime file.
+The file is optional: a missing or empty file changes nothing. rMLX never
+writes it. An edit takes effect at the next `rmlx serve` start.
 
 ## File shape
 
 ```toml
 [global]
-ssd_pool_gb = 200.0          # default --kv-ssd-global-gb (cross-namespace ceiling)
+ssd_pool_gb = 200.0          # default --kv-ssd-global-gb
 ram_prompt_cache_gb = 2.0    # default --prompt-cache-ram-gb
 
 [project.alpha]
-ssd_cap_gb = 50.0            # per-namespace SSD cap for --project alpha
+ssd_cap_gb = 50.0            # default --kv-ssd-cache-gb for --project alpha
 
 [project.beta]
 ssd_cap_gb = 30.0
 ```
 
-## Precedence
+## Resolution
 
-```
-CLI flag  >  [project.<name>]  >  [global]  >  built-in default
-```
+| Cap | Order | Built-in default |
+|---|---|---|
+| `--kv-ssd-global-gb` | flag, `[global].ssd_pool_gb`, default | `0.0` (no global ceiling) |
+| `--kv-ssd-cache-gb` | flag, `[project.<name>].ssd_cap_gb`, default | `0.0` (SSD tier off) |
+| `--prompt-cache-ram-gb` | flag, `[global].ram_prompt_cache_gb`, default | 2 GiB |
 
-Unknown `--project` names silently fall back to `[global]` (no section is
-auto-created). Passing `--kv-ssd-cache-gb` or `--kv-ssd-global-gb` on the
-CLI always beats the file values. A malformed file is a startup error (exit 2).
+- `[global]` has no `ssd_cap_gb`. Without a matching project section, the SSD
+  tier stays off unless the flag turns it on.
+- A `--project` name with no section uses no project values. No section is
+  created.
+- The two SSD flags default to `0.0`, so passing `0` counts as not passed and
+  the file value applies.
+- Unknown keys are ignored.
+- A file that is not valid TOML, or has a wrong value type, stops
+  `rmlx serve` at startup with `projects.toml: <error>` and exit code 1.
+
+The code is `crates/rmlx-core/src/projects_config.rs`; `serve` calls it from
+`crates/rmlx-cli/src/commands/serve.rs`.

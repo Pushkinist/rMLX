@@ -5,7 +5,7 @@
 //! regressions without server/metrics noise.
 //!
 //! Model: `mlx-community__gemma-4-e4b-it-mxfp8` (Gemma4ForConditionalGeneration).
-//! KV quant: K8V8 (the resolver default for small non-MoE Gemma4).
+//! KV quant: K8V8, pinned by the test (`auto` resolves to bf16).
 //!
 //! The snapshot resolves from `RMLX_O_MODELS_ROOT` by slug, so no per-run
 //! variable is needed on a machine holding it (see `tests/common/mod.rs`).

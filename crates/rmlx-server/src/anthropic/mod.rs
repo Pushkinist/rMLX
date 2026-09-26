@@ -12,7 +12,7 @@
 //! - `request`  — AnthropicContent, AnthropicSystem, AnthropicMessage,
 //!   AnthropicTool, AnthropicToolChoice, MessagesRequest
 //! - `response` — ContentBlock, AnthropicUsage, MessagesResponse
-//! - `errors`   — Anthropic-typed HTTP error helpers (J3 OOM surface)
+//! - `errors`   — Anthropic-typed HTTP error helpers (typed-OOM surface)
 
 pub(crate) mod blocking;
 pub(crate) mod errors;

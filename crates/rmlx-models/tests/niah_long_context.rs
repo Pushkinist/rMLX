@@ -9,8 +9,9 @@
 //! # Models
 //!
 //! Each model is gated by its `RMLX_TEST_MODEL_*` env var (see
-//! `docs/TESTING.md`). When the env var is unset, that model's tests skip
-//! silently — the suite is green on machines without snapshots.
+//! `docs/TESTING.md`). When the env var is unset, each of that model's cells
+//! prints `[niah] SKIP` and returns — the suite is green on machines without
+//! snapshots.
 //!
 //! Covered models (one `#[test]` per (model, ctx_len, depth) cell):
 //!
@@ -356,7 +357,7 @@ fn run_one(
 /// false: `update_and_sdpa_shared_source` reaches the TurboFlash, fused-QK,
 /// planar and rotor arms exactly as `update_and_sdpa` does, and a producer that
 /// runs a fused arm hands consumers `SharedKv::Store` rather than materialising
-/// bf16 (see `docs/KV_QUANT.md`). The measured reason per `Dormant` cell:
+/// bf16 (see `docs/KV_FUSED_KERNELS.md`). The measured reason per `Dormant` cell:
 ///
 /// * **Gemma4 + Turbo** — TurboFlash requires `head_dim ∈ {128, 256}`; Gemma4's
 ///   global layers are `head_dim=512`, so the kernel's own shape gate rejects
@@ -380,7 +381,7 @@ fn run_cell(model_path: &Path, ctx: usize, depth: f32, routing: FlashRouting) {
     run_cell_kind(model_path, ctx, depth, routing, FlashKind::Turbo);
 }
 
-/// Phase 4 entry point for planar_flash_decode cells. Same retrieval +
+/// Entry point for planar_flash_decode cells. Same retrieval +
 /// dispatch-counter contract as the TurboFlash cells, but consults the
 /// `planar_flash_decode` OnceLock + counter and forces `KvQuant::PlanarK`.
 fn run_pflash_cell(model_path: &Path, ctx: usize, depth: f32, routing: FlashRouting) {

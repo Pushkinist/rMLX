@@ -15,10 +15,9 @@
 //! the deterministic preload window rather than on the first request.
 //!
 //! The warm is **general per-codec**, keyed off [`KvQuant::carries_msl`] — never
-//! an arch name. It is a no-op for `none` and for the CPU-hot-path codecs (the
-//! V-only iso / rotor families and QJL-on rotor-K, see
-//! [`KvQuant::cpu_hot_path_reason`]) whose production encode + dequant run on
-//! CPU and therefore have no q8 shader to warm here. The K-only iso / rotor
+//! an arch name. It is a no-op for `none` and for the codecs whose store no
+//! Metal kernel runs on the default hot path (the V-only iso / rotor families
+//! and QJL-on rotor, see [`KvQuant::cpu_hot_path_reason`]). The K-only iso / rotor
 //! codecs ARE Metal on the hot path but dispatch the iso/rotor MSL kernel for K
 //! (not the shared q8_0 K kernel this module warms), so they are also skipped
 //! ([`KvQuant::is_k_only_iso_rotor`]) and compile lazily on first prefill.
@@ -80,7 +79,7 @@ pub fn precompile_kv_codec_msl(
         tracing::debug!(
             kv_quant = %kq,
             reason,
-            "precompile_kv_codec_msl: CPU-hot-path codec — no shader to warm, skip"
+            "precompile_kv_codec_msl: no Metal kernel on the default hot path — skip"
         );
         return Ok(());
     }

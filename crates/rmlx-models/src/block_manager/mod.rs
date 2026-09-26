@@ -1,11 +1,9 @@
-//! KVBM block manager (logical layer). Per-arch integration handled by the per-arch glue.
+//! KVBM block manager (logical layer).
 //!
-//! This module is **unwired** in the initial commit: no production code path
-//! (engine, prefill, decode, per-arch `PromptCache`) calls into it yet.
-//! The per-arch swap follows once the per-arch glue wires it in.
+//! No production code path (engine, prefill, decode, per-arch `PromptCache`)
+//! calls into this module.
 //!
-//! Reference: NVIDIA Dynamo `lib/kvbm-logical/` (Apache-2.0). Local research
-//! A local research summary covers the KVBM logical layer design.
+//! Reference: NVIDIA Dynamo `lib/kvbm-logical/` (Apache-2.0).
 //!
 //! ## Layered phases
 //!
@@ -16,12 +14,9 @@
 //!    `PowerOfTwoPolicy`.
 //! 5. [`manager`] — public `BlockManager` facade (`allocate_blocks` /
 //!    `register_blocks` / `match_blocks` / `scan_matches`).
-//! 6. **Skipped here, owned by the per-arch glue** — per-arch `PromptCache` swap. Files
-//!    under `crates/rmlx-models/src/{gemma4,qwen3_5_moe,qwen3}/prompt_cache.rs`
-//!    are intentionally untouched.
-//! 7. [`overflow`] — `OverflowSink` trait for the existing SSD spiller
-//!    (`kv_cache::spill::SsdSpiller`). Hydration on lookup-miss is NOT
-//!    plumbed here — the per-arch glue owns that.
+//! 6. [`overflow`] — `OverflowSink` trait for the SSD spiller
+//!    (`rmlx_kv_ssd::SsdSpiller`). Hydration on lookup-miss is not plumbed
+//!    here.
 //!
 //! ## Hash family
 //!

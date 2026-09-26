@@ -15,7 +15,7 @@
 
 ## Checklist
 
-- [ ] `make ci` green locally (fmt + clippy + test + deny + audit)
+- [ ] `make ci` green locally
 - [ ] Tests added/updated in sibling `*_tests.rs` (no inline `#[cfg(test)] mod`)
 - [ ] Docs/`CLAUDE.md` updated if behavior or layout changed
 - [ ] **Model-touching change:** regression smoke run — Gemma4, Qwen3.6, Bonsai

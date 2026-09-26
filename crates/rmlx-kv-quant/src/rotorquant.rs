@@ -77,7 +77,7 @@
 //! split off a real encode rather than restating it, and
 //! [`crate::storage::ring_bits_per_value`] is where the total comes from.
 //!
-//! **The scale is now the dominant term.** One `bf16` per 3 values is 5.375
+//! **The scale is the dominant term.** One `bf16` per 3 values is 5.375
 //! bits per value on its own — more than the codes at either width. A group of
 //! 3 sharing a whole scale is what keeps rotor behind iso, which shares one
 //! across 4, and no code-side change moves it.
@@ -935,7 +935,7 @@ pub(crate) fn rotor_k_encode_at(
 /// gives the same *expected* score as the Python score-time formula, with
 /// variance shrinking as `O(||r||^2 / m)`. Cosine on the final SDPA output
 /// (output-logit-lift on real models) is the meaningful gate; documented in
-/// `docs/KV_QUANT.md`.
+/// `docs/KV_ROTATION_CODECS.md`.
 ///
 /// # Layout contract
 ///

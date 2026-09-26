@@ -112,20 +112,20 @@ pub struct ResponseMessage {
     pub role: String,
     /// Generated text content of the assistant message.
     pub content: String,
-    /// A3: accumulated text emitted from inside `<think>...</think>` blocks
+    /// Accumulated text emitted from inside `<think>...</think>` blocks
     /// for reasoning-capable architectures (Qwen3 family). `None` when the
     /// model never produced any thinking text (non-reasoning archs, or the
     /// model exited the prefilled think block without emitting anything).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
-    /// A5.4: parsed tool calls from the model's output, in OpenAI shape.
+    /// Parsed tool calls from the model's output, in OpenAI shape.
     /// `None` when the model emitted no `<tool_call>` blocks (or tools were
     /// not enabled). Serialised key is omitted when `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
 }
 
-// ── A5.4: tool_call response shape ───────────────────────────────────────────
+// ── tool_call response shape ───────────────────────────────────────────
 
 /// One tool call entry in an OpenAI chat completion response.
 ///
@@ -178,7 +178,7 @@ pub(crate) fn to_response_tool_call(p: &ParsedToolCall, index: u32) -> ToolCall 
     }
 }
 
-/// A5.4: select the wire `finish_reason` after consuming the full token stream.
+/// Select the wire `finish_reason` after consuming the full token stream.
 ///
 /// Per OpenAI spec, when any tool_call was emitted, `finish_reason="tool_calls"`
 /// regardless of the natural model finish (which would typically be `"stop"`).
@@ -263,12 +263,12 @@ pub struct DeltaContent {
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Incremental text fragment for this chunk; `None` when chunk carries role or tool_call.
     pub content: Option<String>,
-    /// A3: reasoning text emitted from inside `<think>...</think>` blocks.
+    /// Reasoning text emitted from inside `<think>...</think>` blocks.
     /// Mutually exclusive with `content` per chunk — exactly one of them is
     /// populated for a non-role token chunk.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
-    /// A5.4: complete tool_call(s) for this chunk. v1 emits one complete call
+    /// Complete tool_call(s) for this chunk. v1 emits one complete call
     /// per chunk once `</tool_call>` is consumed by the parser. Clients
     /// accumulate by `index`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -313,7 +313,7 @@ pub struct ChatCompletionChunk {
     pub model: String,
     /// Content delta alternatives for this chunk; empty on the usage-summary chunk.
     pub choices: Vec<StreamChoice>,
-    /// H4: populated only on the final usage-summary chunk emitted when
+    /// Populated only on the final usage-summary chunk emitted when
     /// `stream_options.include_usage == true`. All other chunks serialize
     /// this field as absent (not `null`) via `skip_serializing_if`.
     #[serde(skip_serializing_if = "Option::is_none")]

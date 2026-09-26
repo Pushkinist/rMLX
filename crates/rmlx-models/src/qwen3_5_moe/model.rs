@@ -285,7 +285,7 @@ impl Qwen3_5MoeText {
     }
 
     /// Cache-using forward returning logits at the **last `k` positions**
-    /// (L36 Phase 4 — speculative verifier path).
+    /// (speculative verifier path).
     ///
     /// Mirrors `forward_arr` exactly but slices `[seq-k..seq]` before the
     /// LM head instead of `[seq-1..seq]`, returning shape `[1, k, vocab]`.

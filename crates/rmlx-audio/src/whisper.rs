@@ -712,7 +712,7 @@ impl WhisperModel {
     /// Falls back to English (`TOK_EN`) on error.
     ///
     /// Call after `encode_mel`. The returned token id can be passed directly to
-    /// `WhisperTokenizer::sot_sequence_from_lang_tok`.
+    /// `WhisperTokenizer::sot_sequence_from_tok`.
     pub fn detect_language(
         &self,
         encoder_out: &Array,

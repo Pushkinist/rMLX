@@ -90,7 +90,7 @@ pub struct AnthropicMessage {
     pub content: AnthropicContent,
 }
 
-// ── A5.1: Anthropic tool-calling request types (schema only) ─────────────────
+// ── Anthropic tool-calling request types (schema only) ─────────────────
 
 /// One entry in the Anthropic `tools` array.
 ///
@@ -149,7 +149,7 @@ pub struct MessagesRequest {
     /// `metadata` — accepted and ignored (debug-logged).
     pub metadata: Option<Value>,
 
-    // A5.1: tool-calling fields — parsed and normalised, not yet executed.
+    // Tool-calling fields — parsed and normalised; the client executes tools.
     /// Tool definitions available to the model.
     #[serde(default)]
     pub tools: Option<Vec<AnthropicTool>>,

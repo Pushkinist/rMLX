@@ -1,4 +1,4 @@
-//! J7 validation: panic hook writes sidecar file + tracing JSON record.
+//! Panic hook validation: the hook writes sidecar file + tracing JSON record.
 //!
 //! Strategy: install the hook logic (matching main.rs) in a temp logs dir,
 //! trigger a panic inside `std::thread::spawn` (which unwinds without
@@ -34,7 +34,7 @@ fn panic_hook_writes_sidecar_and_logs() {
     let tmp = std::env::temp_dir().join(format!("rmlx_panic_test_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).expect("create temp logs dir");
 
-    // Install the same hook logic as main.rs (J7.1), but write to tmp/.
+    // Install the same hook logic as main.rs, but write to tmp/.
     let tmp_clone = tmp.clone();
     let hook_fired = Arc::new(AtomicBool::new(false));
     let hook_fired_clone = hook_fired.clone();
@@ -57,7 +57,7 @@ fn panic_hook_writes_sidecar_and_logs() {
 
     // Trigger a panic on a background thread (unwinds without killing the process).
     let result = std::panic::catch_unwind(|| {
-        panic!("J7 test panic — deliberate");
+        panic!("deliberate test panic");
     });
 
     // The panic must have unwound (not abort).
@@ -80,7 +80,7 @@ fn panic_hook_writes_sidecar_and_logs() {
 
     // (i) Sidecar contains the panic message.
     assert!(
-        sidecar.contains("J7 test panic"),
+        sidecar.contains("deliberate test panic"),
         "sidecar must contain the panic message, got:\n{sidecar}"
     );
 

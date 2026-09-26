@@ -50,7 +50,7 @@ pub enum Error {
 
     /// Out-of-memory during a known allocation phase.
     ///
-    /// J3: distinct from the generic [`Error::Mlx`] catch-all so automation can
+    /// Distinct from the generic [`Error::Mlx`] catch-all so automation can
     /// tell "evict + retry" (load phases) from "stream is dead, don't retry"
     /// (mid-generation). Only constructed at call sites where the allocation
     /// phase is unambiguous by construction — the mlx-c FFI surfaces every

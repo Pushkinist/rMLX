@@ -5,15 +5,14 @@
 -- A speculative-decode arm and a plain-decode arm of the same model at the
 -- same quant and prompt therefore land in one partition, and the view's rule
 -- — largest `higher_better` value wins — publishes the drafter's rate as that
--- model's champion decode throughput. On gemma-4-e2b-it-mxfp8 that is 276
--- tok/s standing in for the 142 a request without a drafter gets. Neither
--- number is wrong; they are answers to different questions, and ranking them
--- against each other is a category error the bound in §4.1 cannot see.
+-- model's champion decode throughput. Neither rate is wrong; they are answers
+-- to different questions, and ranking them against each other is a category
+-- error the bound in docs/METRICS_SCHEMA.md §4.1 cannot see.
 --
 -- `decode_config` names the non-default engine configuration: NULL (or absent)
 -- is every setting at its default, a speculative arm records its drafter and
 -- block size (`mtp/block=5`), and a swept prefill chunk records the level
--- (`prefill_chunk=1024`). METRICS_DB.md §3.2 has the grammar.
+-- (`prefill_chunk=1024`). docs/METRICS_SCHEMA.md §3.2 has the grammar.
 --
 -- TEXT, not an enum or CHECK: the set of settings that can appear is open, so
 -- a configuration this binary has never heard of still records honestly (see
@@ -26,7 +25,7 @@
 -- ordinary decode writes — so legacy plain-decode rows keep their cells and
 -- keep competing with each other exactly as before. The one population this
 -- does not sort out is the speculative rows written before the column
--- existed; they are NULL too, and `docs/METRICS_DB.md` names them under
+-- existed; they are NULL too, and `docs/METRICS_SCHEMA.md` names them under
 -- "Known-bad rows already in the DB". Append-only table — no backfill, no
 -- UPDATE.
 --

@@ -1,7 +1,8 @@
 //! E2E grid report writer.
 //!
-//! Emits the PASS/FAIL grid (feature × sub-feature) to
-//! `<RMLX_HOME>/e2e/report.json` and `report.md`. The JSON is the
+//! Emits the PASS/FAIL grid (feature × sub-feature) to `report.json` and
+//! `report.md` under the harness's `e2e/` directory
+//! (`<temp_dir>/rmlx_e2e_<pid>/e2e`, see `runner.rs` `e2e_home`). The JSON is the
 //! machine-readable source of truth; the Markdown is the human grid.
 //!
 //! Kept dependency-free beyond `serde_json` (already a workspace dep) — the

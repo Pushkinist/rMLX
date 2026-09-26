@@ -4,7 +4,7 @@
 //!
 //! [`vectorized_parity_check`] runs a CPU-scalar path and a GPU/MSL path on
 //! the same input and asserts that the max-abs-error between their outputs
-//! does not exceed `tol`.  All four per-codec parity tests use this helper.
+//! does not exceed `tol`.
 //!
 //! # `RMLX_SKIP_GPU` env-var skip
 //!
@@ -22,17 +22,6 @@
 //!
 //! `RMLX_SKIP_GPU=1` wins even when `--include-ignored` is passed; `#[ignore]`
 //! still gates the default test run.
-//!
-//! # Per-codec tolerance policy
-//!
-//! | Codec family | Tolerance | Rationale |
-//! |---|---|---|
-//! | Integer / packed codes (bit-level) | exact | GPU layout == CPU pack |
-//! | TurboQuant V4 (codebook lookup) | 5e-3 | f32 rounding in lookup path |
-//! | PlanarQuant V4 (codebook + rotation) | 5e-3 | f32 rounding in lookup path |
-//! | K8VTurbo3 V (3-bit codebook lookup) | 1e-3 | tighter: 3-bit centroids smaller |
-//! | rot_k FWHT + affine q8 | 0.10 | one 8-bit quant step for D=128 FWHT range |
-//! | q8_0 group-128 affine | 5e-3 | f32 rounding in min/max scan |
 
 /// Process-global lock for every test in this binary that touches the
 /// environment — as a **writer or a reader**.
@@ -88,10 +77,10 @@ const MANAGED_ENV_KEYS: [&str; 1] = ["RMLX_ROTOR_QJL"];
 /// values on drop — including while unwinding from a failed assertion.
 ///
 /// That last part is the point. Every writer in this suite is shaped
-/// `set_var` → `assert!` → restore, so a failing assertion used to skip its own
-/// restore and leak the value into every subsequent test; the next reader then
-/// failed with "test assumes the default QJL-off state" and buried the assertion
-/// that actually broke. Restoring in `Drop` makes the writers unwind-safe
+/// `set_var` → `assert!` → restore, so without it a failing assertion would
+/// skip its own restore and leak the value into every subsequent test; the next
+/// reader would then fail with "test assumes the default QJL-off state" and
+/// bury the assertion that actually broke. Restoring in `Drop` makes the writers unwind-safe
 /// without each of them having to be.
 pub(crate) struct EnvGuard {
     /// Dropped after `Drop::drop` returns, so the restore below runs while the

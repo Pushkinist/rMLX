@@ -1,192 +1,7 @@
-//! `CacheType` enum, `CacheTypeSpec`, and the string parser.
+//! `CacheType` enum, `CacheTypeSpec`, the string parser and the resolver for
+//! `--cache-type-k` / `--cache-type-v`.
 //!
-//! This module implements the naming namespace from §D1 of the
-//! `--cache-type-k` / `--cache-type-v` implementation plan
-//! (`docs/superpowers/plans/cache-type-flags.md`).
-//!
-//! Implemented: enum + parser + inline tests.
-//! Not yet: Resolver, ResolverContext, ResolveError.
-//!
-//! ## Codec-parameter audit (kept as ground truth)
-//!
-//! The claims below were verified by reading the source symbols listed in the
-//! "Symbol inspected" columns. No assumptions were carried forward from the
-//! plan document without cross-checking the code.
-//!
-//! ---
-//!
-//! # Audit methodology
-//!
-//! Every claim below was verified by reading the source symbols listed in the
-//! "Symbol inspected" columns. No assumptions were carried forward from the
-//! plan document without cross-checking the code.
-//!
-//! ---
-//!
-//! # `KvQuant::None`
-//!
-//! **Codec**: unquantized; both K and V stored as `bf16` (the dtype of the
-//! incoming attention tensors).
-//!
-//! **Implementation path**: `KvCache::update_none` →
-//! `KvCache::update_decode_fp16`. Storage is a pre-allocated
-//! `[B, kv_h, max_seq, head_dim]` bf16 buffer per side, filled via
-//! `slice_update` at the current offset each step.
-//!
-//! **Symbols inspected**:
-//! - `KvCache::update_none` — dispatches to `update_decode_fp16`.
-//! - `KvCache::update_decode_fp16` — bf16 `slice_update` path; no quantize call.
-//! - `KvCache::exit_prefill` — `KvQuant::None` arm; promotes `raw_k/v` directly
-//!   to `decode_fp16_k/v` without any `quantize()` call.
-//! - `KvStorage::None` — holds only `max_seq: i32`; no quantized buffers.
-//!
-//! ---
-//!
-//! # `KvQuant::K8V8`
-//!
-//! **K codec**: rMLX MSL 8-bit symmetric affine (`q8_0`), `group_size=128`.
-//! **V codec**: same codec as K — rMLX MSL 8-bit symmetric affine (`q8_0`),
-//! `group_size=128`.
-//!
-//! Both sides use the same `QuantK` storage struct and the same `QuantK::append`
-//! / `QuantK::dequantize_choice` methods.
-//!
-//! **Group size source**: `crates/rmlx-models/src/kv_cache/q8.rs`,
-//! line `pub(super) const Q8_GROUP_SIZE: usize = 128;`.
-//!
-//! **Symbols inspected**:
-//! - `KvCache::update_k8v8` — constructs both `k` and `v` as `QuantK {..}`;
-//!   calls `qs.append(...)` for both sides. `QuantK` is the q8_0 struct.
-//! - `KvCache::exit_prefill` — `KvQuant::K8V8` arm; calls `qk.append` and
-//!   `qv.append` where both locals are `QuantK`.
-//! - `storage::QuantK` doc comment: "Accumulated q8_0 K cache (group_size=128)".
-//! - `storage::QuantK::append` GPU path: `scales_per_step = b * kv_h * d / Q8_GROUP_SIZE`.
-//!
-//! **Confirmed**: plan assumption correct — K and V both `q8_g128`.
-//!
-//! ---
-//!
-//! # `KvQuant::K8V4`
-//!
-//! **K codec**: rMLX MSL 8-bit symmetric affine (`q8_0`), `group_size=128`.
-//! **V codec**: TurboQuant 4-bit Lloyd-Max N(0,1) codebook, `group_size=32`.
-//!
-//! The K side uses `QuantK` (same as K8V8). The V side uses `QuantV` with
-//! `bits=4`. `QuantV::append` calls `turbo_quantize_v4_gpu` on GPU and
-//! `turbo_quantize_v` on CPU; the quantizer is `rmlx_kv_quant::turboquant`.
-//!
-//! **Group size source**:
-//! - K: `q8.rs` → `Q8_GROUP_SIZE = 128`.
-//! - V: `crates/rmlx-kv-quant/src/turboquant.rs`,
-//!   line `pub const GROUP_SIZE: usize = 32;`.
-//!   Also confirmed in `k8v4_append_msl.rs` comment (line 33–35):
-//!   "K: q8_0 (group_size=128 …). V: TurboQuant 4-bit Lloyd-Max N(0,1)
-//!   (group_size=32 …)."
-//!
-//! **Symbols inspected**:
-//! - `KvCache::update_k8v4` — `k` constructed as `QuantK`; `v` constructed as
-//!   `QuantV { bits: 4, .. }`.
-//! - `KvCache::exit_prefill` — `KvQuant::K8V4` arm; `k` is `QuantK`, `v` is
-//!   `QuantV { bits: 4, .. }`.
-//! - `KvCache::alloc_flash_buffers` — K scales shaped `[.., head_dim/Q8_GROUP_SIZE]`
-//!   (=128); V scales shaped `[.., head_dim/TQ4_GROUP]` where `TQ4_GROUP` is
-//!   re-exported as `rmlx_kv_quant::turboquant::GROUP_SIZE = 32`.
-//! - `k8v4_append_msl.rs` header comments and `alloc_k8_codes_buf` /
-//!   `alloc_v4_codes_buf` helpers: K group=128, V group=32.
-//!
-//! **Confirmed**: plan assumption correct — K is `q8_g128`, V is `tq4` (group=32).
-//!
-//! ---
-//!
-//! # `KvQuant::Planar`
-//!
-//! **K codec**: rMLX MSL 8-bit symmetric affine (`q8_0`), `group_size=128`.
-//! **V codec**: PlanarQuant 4-bit with per-pair Hadamard rotation, `group_size=32`.
-//!
-//! The K side uses `QuantK` (same as K8V8 / K8V4 K-side). The V side uses
-//! `QuantPlanarV`, which calls `planar_quantize_v4_gpu` (GPU) or
-//! `planar_quantize` (CPU) from `rmlx_kv_quant::planarquant`.
-//!
-//! **Group size source**:
-//! - K: `Q8_GROUP_SIZE = 128` (same as above).
-//! - V: `crates/rmlx-kv-quant/src/planarquant.rs`,
-//!   inline comments "Blocks are `GROUP_SIZE = 32` element groups" and
-//!   "`D` must be a multiple of `GROUP_SIZE = 32`". The `GROUP_SIZE` constant
-//!   itself is not `pub` in `planarquant.rs` but is documented as 32 in multiple
-//!   doc comments and enforced by the `group_size != GROUP_SIZE` guard at the
-//!   top of `planar_quantize`.
-//!   The plan (v4 §self-review) also explicitly corrects the earlier draft that
-//!   said group=2: "PlanarQuant actual group=32 (not 2)".
-//!
-//! **Symbols inspected**:
-//! - `KvCache::update_planar` — `k` is `QuantK`; `v` is `QuantPlanarV`.
-//! - `KvCache::exit_prefill` — `KvQuant::Planar` arm; `k` is `QuantK`, `v` is
-//!   `QuantPlanarV`.
-//! - `storage::QuantPlanarV` doc comment: "u32 codes buffer (4 words per group of
-//!   32 elements)"; `append` GPU path: `codes_words_per_step = total_per_step * 4 / GROUP_SIZE`.
-//! - `storage.rs` import: `use rmlx_kv_quant::planarquant::{planar_dequantize, planar_quantize, PlanarBlocks}`.
-//! - `storage.rs` `planar_quantize` call site: `planar_quantize(f32_data, GROUP_SIZE, 4, new_shape)?`
-//!   (the `GROUP_SIZE` here is the turboquant re-export, confirming both
-//!   turbo and planar share `GROUP_SIZE=32`).
-//!
-//! **Note**: PlanarQuant differs from TurboQuant in that it stores per-pair
-//! Hadamard rotation coefficients alongside the codes and scales (three buffers:
-//! codes, scales, rotations). Both use group=32.
-//!
-//! **Confirmed**: plan assumption correct — K is `q8_g128`, V is `planar4`
-//! (group=32).
-//!
-//! ---
-//!
-//! # `KvQuant::Mixed { k_bits, v_bits, k_group_size, v_group_size }`
-//!
-//! **K codec**: MLX `mx.quantize(..., mode="affine")` at `k_bits` / `k_group_size`.
-//! **V codec**: MLX `mx.quantize(..., mode="affine")` at `v_bits` / `v_group_size`.
-//!
-//! Both sides use the same MLX affine quantizer (`mx.quantize` / `mlx_rs::quantize`
-//! in the `rmlx_mlx` crate bindings), parametrized independently by the four
-//! fields. The default values wired by [`crate::kv_cache::DEFAULT_KV_QUANT`] for
-//! Qwen3/Bonsai are `k_bits=8, v_bits=4, k_group_size=64, v_group_size=64`
-//! (matching `mlx-lm-turboquant`'s `MixedQuantKVCache` defaults).
-//!
-//! **Implementation path**:
-//! - Decode: `KvCache::update_and_sdpa_mixed` → `MixedKvState::update_and_fetch`
-//!   (in `mixed_quant.rs`) → two `mx.quantize` calls (one per side).
-//! - Prefill: `KvCache::enter_prefill` / `KvCache::exit_prefill` accumulate raw
-//!   fp16 during prefill (via `update_prefill_raw`), then `exit_prefill`'s
-//!   `KvQuant::Mixed` arm calls `state.bulk_init_from_fp16` which issues a single
-//!   batched `mx.quantize` per side (direct-quantize path).
-//! - The SDPA step uses `mixed_quantized_sdpa` from `mixed_quant.rs`, which calls
-//!   `mx.quantized_matmul` directly on the stored 3-tuples (codes, scales, biases)
-//!   without a round-trip dequantize.
-//!
-//! **Key distinction vs K8V4/K8V8/Planar**: Mixed uses MLX's portable affine
-//! quantizer (Python-visible `mx.quantize`) with arbitrary bit-width and
-//! group_size. K8V4/K8V8 K-side use the rMLX-custom MSL `q8_0` kernel
-//! (`Q8_GROUP_SIZE=128`). The two 8-bit K codecs are **different** despite
-//! both being "8-bit affine":
-//! - `q8_g128` (K8V4/K8V8 K-side): symmetric, no bias term; scale = max(|x|)/127.
-//! - `mixed_k8g64` (Mixed K-side): MLX affine with separate scale + bias terms;
-//!   group_size=64 by default.
-//!
-//! **Symbols inspected**:
-//! - `KvCache::update_and_sdpa_mixed` — destructures `KvQuant::Mixed { k_bits,
-//! v_bits, k_group_size, v_group_size }` and passes all four to
-//!   `mixed_quantized_sdpa`.
-//! - `mixed_quant.rs` module doc: "Stores K and V as the canonical 3-tuple
-//!   `(codes_u32, scales, biases)` produced by `mx.quantize(..., mode="affine")`,
-//!   at independent bit widths and group sizes (default K=8 / V=4 / group=64 each)."
-//! - `MixedKvState::update_and_fetch` in `mixed_quant.rs`: calls `quantize(new_k,
-//! k_group_size, k_bits, device)` and `quantize(new_v, v_group_size, v_bits, device)`.
-//! - `KvCache::exit_prefill` — `KvQuant::Mixed` arm calls
-//!   `state.bulk_init_from_fp16(&k_full, &v_full, device)`.
-//!
-//! **Confirmed**: plan assumption correct — both sides use MLX `mx.quantize`
-//! affine with independent (bits, group_size) parameters.
-//!
-//! ---
-//!
-//! # Summary table
+//! # Codec per `KvQuant` variant
 //!
 //! | KvQuant variant | K codec | K group | V codec | V group |
 //! |------------------|-----------------------|---------|----------------------------|---------|
@@ -196,10 +11,13 @@
 //! | `Planar` | rMLX MSL q8_0 affine | 128 | PlanarQuant 4-bit+rotation | 32 |
 //! | `Mixed{..}` | MLX affine (k_bits) | k_group | MLX affine (v_bits) | v_group |
 //!
-//! K8V4 K-side and K8V8 K-side use the **same** rMLX MSL codec (`q8_0`,
-//! `Q8_GROUP_SIZE=128`, symmetric, no bias). Planar K-side is identical.
-//! Mixed's K-side is the **portable MLX affine quantizer** — a different codec
-//! even at 8 bits because it includes a bias term and defaults to group=64.
+//! K8V4, K8V8 and Planar share one K codec: `q8_0`
+//! (`rmlx_kv_quant::q8::Q8_GROUP_SIZE` = 128), symmetric, no bias, scale =
+//! max(|x|)/127. Mixed's K side is the MLX affine quantizer
+//! (`mx.quantize(..., mode="affine")`) — a different codec even at 8 bits,
+//! because it carries a bias term per group and takes its group size as a
+//! parameter. PlanarQuant stores per-pair rotation words beside its codes and
+//! scales.
 
 #![allow(
     clippy::elidable_lifetime_names,
@@ -257,10 +75,10 @@ pub enum ParseError {
 
 // ── CacheType ─────────────────────────────────────────────────────────────────
 
-/// A single-side KV cache codec type, corresponding to one tag in §D1 of the
-/// `--cache-type-k` / `--cache-type-v` plan.
+/// A single-side KV cache codec type, corresponding to one `--cache-type-k` /
+/// `--cache-type-v` tag.
 ///
-/// Variants map 1-to-1 to the canonical tag strings in §D1. Aliases are
+/// Variants map 1-to-1 to the canonical tag strings. Aliases are
 /// handled only in [`parse`] and never stored as a separate variant.
 #[allow(
     clippy::exhaustive_enums,
@@ -293,10 +111,9 @@ pub enum CacheType {
     /// `q2_g64` — MLX affine 2-bit, group=64. **V-side only**.
     ///
     /// 2-bit is the lowest rung MLX's affine quantizer supports (16 vals/u32).
-    /// On the V side it gives ~8× compression vs bf16 and stays coherent on
-    /// Bonsai. Pure 2-bit K is **not** a supported combo — `combo_to_kv_quant`
+    /// Pure 2-bit K is **not** a supported combo — `combo_to_kv_quant`
     /// rejects K-side 2-bit because 2-bit K degrades attention scores into
-    /// incoherent output (CLAUDE.md hard rule 6). Use the asymmetric
+    /// incoherent output. Use the asymmetric
     /// `--ctk q8_g128 --ctv q2_g64` (or `--kv-bits 2`, K stays 8-bit) instead.
     Q2G64,
     /// `tq4` (alias `turbo4`) — TurboQuant 4-bit; V-side only; requires head_dim ∈ {128, 256}.
@@ -306,7 +123,7 @@ pub enum CacheType {
     /// `planar_k4` — PlanarQuant 4-bit on the **K** axis.
     ///
     /// Opposite of `Planar4` (V-side). Pairs with `bf16` V (the `KvQuant::PlanarK`
-    /// resolution). Arch guard (Contract A.y): rejected on Qwen MoE.
+    /// resolution). Rejected on Qwen MoE (K below 8 bits).
     /// Requires `head_dim % 32 == 0`.
     PlanarK4,
     /// `rot_k` — **K-side** rotation codec: K is affine-quantized at
@@ -328,11 +145,10 @@ pub enum CacheType {
     Planar3,
     /// `iso_v_3` (alias `iso3`) — IsoQuant 3-bit V; V-side only.
     ///
-    /// Quaternion SO(4) rotation + 3-bit Lloyd-Max codebook. Requires
-    /// `head_dim % 4 == 0` (quaternion block alignment). Pairs with K-side
-    /// `q8_g128` (coerced to `KvQuant::Iso3`). Ships the CPU codec
-    /// only — SDPA falls through the dequant-then-SDPA legacy path; the MSL
-    /// kernel is deferred.
+    /// Quaternion SO(4) rotation + 3-bit Lloyd-Max codebook. Requires `head_dim % 4 == 0`
+    /// (quaternion block alignment). Pairs with K-side `q8_g128` (coerced to `KvQuant::Iso3`). Its
+    /// decode reads the bf16 mirror, so a cache that went through prefill builds no packed store
+    /// (`docs/KV_QUANT.md` § "Codec disposition", Class 2).
     Iso3,
     /// `iso_v_4` (alias `iso4`) — IsoQuant 4-bit V; V-side only.
     ///
@@ -340,8 +156,9 @@ pub enum CacheType {
     /// 16-centroid Lloyd-Max codebook, at 4 bits per code in the dense code
     /// plane. Requires
     /// `head_dim % 4 == 0`. Pairs with K-side `q8_g128` (coerced to
-    /// `KvQuant::Iso4`). CPU-only (no MSL kernel — the iso3 MSL
-    /// kernel is hard-coded for `bits=3`).
+    /// `KvQuant::Iso4`). Its decode reads the bf16 mirror, so a cache that went
+    /// through prefill builds no packed store (`docs/KV_QUANT.md` § "Codec
+    /// disposition", Class 2).
     Iso4,
     /// `rotor_v_3` (alias `rotor3`) — rotor3 (Cl(3,0) Clifford rotor sandwich)
     /// V; V-side only.
@@ -349,8 +166,10 @@ pub enum CacheType {
     /// 3-bit V codec built on Cl(3,0) multivectors (8 components per group of
     /// 3 grade-1 elements). Static per-layer rotor table; per-token codes +
     /// scales + L2 norm. Pack format: the dense code plane, 3 bits per code.
-    /// Pairs with K-side `q8_g128` (coerced to `KvQuant::Rotor3`). CPU-only
-    /// (no MSL kernel — same precedent as iso3 / iso4).
+    /// Pairs with K-side `q8_g128` (coerced to `KvQuant::Rotor3`). Its
+    /// decode reads the bf16 mirror, so a cache that went
+    /// through prefill builds no packed store (`docs/KV_QUANT.md` § "Codec
+    /// disposition", Class 2).
     Rotor3,
     /// `rotor_v_4` (alias `rotor4`) — rotor4 (Cl(3,0) Clifford rotor sandwich)
     /// V; V-side only.
@@ -362,30 +181,29 @@ pub enum CacheType {
     /// amortises across tokens. `head_dim` may be
     /// any positive integer (the last group is tail-padded when
     /// `head_dim % 3 != 0`). Pairs with K-side `q8_g128` (coerced to
-    /// `KvQuant::Rotor4`). CPU-only (no MSL kernel).
+    /// `KvQuant::Rotor4`). Its decode reads the bf16 mirror, so a cache that went
+    /// through prefill builds no packed store (`docs/KV_QUANT.md` § "Codec
+    /// disposition", Class 2).
     Rotor4,
     /// `k8v_turbo_3_tcq` (alias `turbo3_tcq`) — TurboQuant 3-bit with Viterbi
     /// trellis (TCQ) assignment; V-side only.
     ///
-    /// 3.25-bit V codec — same Lloyd-Max N(0,1) 8-centroid codebook and same
-    /// on-disk pack as plain [`Tq3`](CacheType)-equivalent (re-exported via
-    /// `KvQuant::K8VTurbo3`), but the **encoder** picks centroid indices by
-    /// Viterbi-optimal path search through a 4-state trellis instead of
-    /// nearest-centroid. The decoder is unchanged. Pairs with K-side
-    /// `q8_g128` (coerced to `KvQuant::K8VTurbo3Tcq`). Ships CPU encode
-    /// plus CPU dequant on the hot path; the MSL Viterbi kernel is a
-    /// future-reference hook (precedent: K8VTurbo3 / K8VTurbo2 MSL hooks).
+    /// 3.25-bit V codec — same Lloyd-Max N(0,1) 8-centroid codebook and same on-disk pack as plain
+    /// [`Tq3`](CacheType)-equivalent (re-exported via `KvQuant::K8VTurbo3`), but the **encoder**
+    /// picks centroid indices by Viterbi-optimal path search through a 4-state trellis instead of
+    /// nearest-centroid. The decoder is unchanged. Pairs with K-side `q8_g128` (coerced to
+    /// `KvQuant::K8VTurbo3Tcq`). Its decode reads the bf16 mirror, so a cache that went through
+    /// prefill builds no packed store (`docs/KV_QUANT.md` § "Codec disposition", Class 2).
     Turbo3Tcq,
     /// `k8v_turbo_2_tcq` (alias `turbo2_tcq`) — TurboQuant 2-bit with Viterbi
     /// trellis (TCQ) assignment; V-side only.
     ///
-    /// 2.25-bit V codec — same Lloyd-Max N(0,1) 4-centroid codebook and same
-    /// on-disk pack as plain `turbo2` (2-bit LSB-first, 16 values per u32), but
-    /// the **encoder** picks centroid indices via Viterbi-optimal path search
-    /// through a 4-state trellis. The decoder is unchanged. Pairs with K-side
-    /// `q8_g128` (coerced to `KvQuant::K8VTurbo2Tcq`). Ships CPU encode
-    /// plus CPU dequant on the hot path; the MSL Viterbi kernel is a
-    /// future-reference hook. Maps to the `max_compression` preset in mtq.
+    /// 2.25-bit V codec — same Lloyd-Max N(0,1) 4-centroid codebook and same on-disk pack as plain
+    /// `turbo2` (2-bit LSB-first, 16 values per u32), but the **encoder** picks centroid indices
+    /// via Viterbi-optimal path search through a 4-state trellis. The decoder is unchanged. Pairs
+    /// with K-side `q8_g128` (coerced to `KvQuant::K8VTurbo2Tcq`). Its decode reads the bf16
+    /// mirror, so a cache that went through prefill builds no packed store (`docs/KV_QUANT.md` §
+    /// "Codec disposition", Class 2). Maps to the `max_compression` preset in mtq.
     Turbo2Tcq,
     /// `iso_k_3` (alias `k_iso3`) — IsoQuant 3-bit K; K-side
     /// codec.
@@ -395,10 +213,9 @@ pub enum CacheType {
     /// or with V=`bf16` to form `KvQuant::IsoKOnly3` (K-only). Requires
     /// `head_dim % 4 == 0` (quaternion block alignment).
     ///
-    /// **Arch guard (Contract A.y — mandatory)**: K-side ≤4-bit on Qwen MoE
-    /// is the PPL-disaster (218→8641); `combo_to_kv_quant` paths that map to
-    /// `Iso3Sym` / `IsoKOnly3` are rejected on Qwen MoE via the
-    /// `validate_resolved` post-decompose guard. Opt-in only.
+    /// **Arch guard**: `Iso3Sym` / `IsoKOnly3` store K below 8 bits and are
+    /// rejected on Qwen MoE by the `validate_resolved` post-decompose guard.
+    /// Opt-in only.
     IsoK3,
     /// `iso_k_4` (alias `k_iso4`) — IsoQuant 4-bit K; K-side
     /// codec.
@@ -417,10 +234,9 @@ pub enum CacheType {
     /// via `--rotor-qjl on`). Pairs with V=`rotor_v_3` to form
     /// `KvQuant::Rotor3Sym` or V=`bf16` to form `KvQuant::RotorKOnly3`.
     ///
-    /// **Arch guard (Contract A.y — mandatory)**: K-side ≤4-bit on Qwen MoE
-    /// is the PPL-disaster (218→8641); `combo_to_kv_quant` paths that map to
-    /// `Rotor3Sym` / `RotorKOnly3` are rejected on Qwen MoE via the
-    /// `validate_resolved` post-decompose guard. Opt-in only.
+    /// **Arch guard**: `Rotor3Sym` / `RotorKOnly3` store K below 8 bits and are
+    /// rejected on Qwen MoE by the `validate_resolved` post-decompose guard.
+    /// Opt-in only.
     RotorK3,
     /// `rotor_k_4` (alias `k_rotor4`) — rotor4 (Cl(3,0) Clifford rotor) 4-bit
     /// K; K-side codec.
@@ -439,9 +255,8 @@ pub enum CacheType {
     /// there is no `tsym3` K-only or V-only decomposition). Maps to the
     /// `speed` preset in mtq.
     ///
-    /// **Arch guard (Contract A.y)**: K-side 3-bit on Qwen MoE is the
-    /// PPL-disaster zone; `TurboSym3` is rejected on Qwen MoE via
-    /// `validate_resolved`.
+    /// **Arch guard**: `TurboSym3` stores K at 3 bits and is rejected on Qwen
+    /// MoE by `validate_resolved`.
     TurboSym3,
 }
 
@@ -552,7 +367,7 @@ impl CacheType {
         self.bits().is_some()
     }
 
-    /// Every canonical [`CacheType`] variant, in §D1 table order.
+    /// Every canonical [`CacheType`] variant, in table order.
     ///
     /// Used by `rmlx info --list-cache-types` to render the full codec table
     /// without external file dependencies.
@@ -614,7 +429,7 @@ pub struct CacheTypeSpec {
 
 /// Parse a `--cache-type-k` / `--cache-type-v` tag string into a [`CacheType`].
 ///
-/// Accepts all canonical tags from §D1 plus the documented aliases.
+/// Accepts all canonical tags plus the documented aliases.
 ///
 /// ## Aliases
 /// - `"f16"`, `"none"` → [`CacheType::Bf16`]
@@ -652,11 +467,11 @@ pub fn parse(s: &str) -> Result<CacheType, ParseError> {
         "rotor_v_3" | "rotor3" => Ok(CacheType::Rotor3),
         // rotor4 — same dual-spelling pattern.
         "rotor_v_4" | "rotor4" => Ok(CacheType::Rotor4),
-        // TCQ — canonical tag matches the §D1 `k8v_*` pattern;
+        // TCQ — canonical tag follows the `k8v_*` pattern;
         // alias matches the `--kv-quant k8vturbo3tcq` selector and mtq's
         // `turbo3_tcq` row.
         "k8v_turbo_3_tcq" | "turbo3_tcq" => Ok(CacheType::Turbo3Tcq),
-        // 2-bit TCQ — same §D1 pattern; alias matches
+        // 2-bit TCQ — same pattern; alias matches
         // `--kv-quant k8vturbo2tcq` selector and mtq's `turbo2_tcq` row.
         "k8v_turbo_2_tcq" | "turbo2_tcq" => Ok(CacheType::Turbo2Tcq),
         // K-side IsoQuant — dual spelling.
@@ -712,10 +527,10 @@ pub fn parse(s: &str) -> Result<CacheType, ParseError> {
 
 // ── ResolverContext ───────────────────────────────────────────────────────────
 
-/// Inputs the resolver needs to validate a [`CacheTypeSpec`] against §D6
-/// invariants.
+/// Inputs the resolver needs to validate a [`CacheTypeSpec`] against the
+/// codec invariants.
 ///
-/// `head_dim` is the model's **full-attention** head_dim — see §D6.9. When the
+/// `head_dim` is the model's **full-attention** head_dim. When the
 /// model config does not declare it (and no safe fallback derives it), pass
 /// `None`; the resolver refuses to operate rather than guess.
 #[allow(
@@ -740,7 +555,7 @@ pub struct ResolverContext<'a> {
 #[non_exhaustive]
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ResolveError {
-    /// §D6.9 — model config did not declare a `head_dim` and no safe fallback derived one.
+    /// The model config did not declare a `head_dim` and no safe fallback derived one.
     #[error(
         "head_dim is not declared by the model config and could not be derived; \
          the resolver refuses to guess. \
@@ -749,35 +564,35 @@ pub enum ResolveError {
     )]
     HeadDimUnknown,
 
-    /// §D6.3 — K-side rotation codecs (`tq4`, `planar4`) are V-side only.
+    /// K-side rotation codecs (`tq4`, `planar4`) are V-side only.
     #[error(
         "K-side rotation codec '{0}' not implemented — V-side only. \
          Try '--ctk q8_g128' (the canonical K codec for K8V4/K8V8/Planar)."
     )]
     KSideRotationCodec(&'static str),
 
-    /// — `rot_k` requires a power-of-two head_dim (Walsh-Hadamard rotation).
+    /// `rot_k` requires a power-of-two head_dim (Walsh-Hadamard rotation).
     #[error(
         "rot_k requires a power-of-two head_dim (Walsh-Hadamard rotation); got head_dim={0}. \
          Use '--ctk q8_g128' for this head_dim."
     )]
     RotKHeadDimNotPow2(usize),
 
-    /// — `rot_k` is a K-side codec; it is invalid on the V side.
+    /// `rot_k` is a K-side codec; it is invalid on the V side.
     #[error(
         "rot_k is a K-side rotation codec and cannot be used on V. \
-         Use '--ctk rot_k' with an affine V codec (e.g. '--ctv q4_g64' or '--ctv tq4')."
+         Use '--ctk rot_k' with an affine V codec (e.g. '--ctv q4_g64' or '--ctv q8_g64')."
     )]
     RotKVSide,
 
-    /// §D6.5 — TurboQuant 4-bit kernel only supports head_dim ∈ {128, 256}.
+    /// The TurboQuant 4-bit kernel only supports head_dim ∈ {128, 256}.
     #[error(
         "tq4 requires head_dim ∈ {{128, 256}}; got head_dim={0}. \
          Try '--ctv q4_g64' or '--ctv planar4' instead."
     )]
     Tq4UnsupportedHeadDim(usize),
 
-    /// §D6.1 — `head_dim % group_size != 0` for an affine codec.
+    /// `head_dim % group_size != 0` for an affine codec.
     #[error(
         "head_dim={head_dim} not divisible by group_size={group_size} (affine codec invariant); \
          pick a codec whose group divides head_dim (e.g. q*_g32 or q*_g128 if applicable)."
@@ -789,7 +604,7 @@ pub enum ResolveError {
         group_size: usize,
     },
 
-    /// §D6.2 — MLX bit-packing requires `head_dim % (32 / bits) == 0`.
+    /// MLX bit-packing requires `head_dim % (32 / bits) == 0`.
     #[error(
         "MLX bit-packing rule violated: head_dim={head_dim} not divisible by (32 / bits) \
          where bits={bits}; pick a different head_dim or use a higher-bit codec \
@@ -802,33 +617,28 @@ pub enum ResolveError {
         bits: u8,
     },
 
-    /// §D6.4 — Qwen MoE family requires K-side bits ≥ 8 (Qwen MoE PPL disaster).
+    /// The Qwen MoE family requires K-side bits ≥ 8.
     #[error(
-        "Qwen MoE family requires K-side bits >= 8 (PPL disaster on K<8); got K-bits={0}. \
+        "Qwen MoE family requires K-side bits >= 8; got K-bits={0}. \
          Try '--ctk q8_g128' or '--ctk q8_g64' or use '--kv-quant k8v8' preset."
     )]
     QwenMoeKBitsTooLow(u8),
 
-    /// Contract A.y — PlanarK on Qwen MoE is PPL-disaster zone.
-    ///
-    /// K-side 4-bit on Qwen MoE causes catastrophic PPL collapse (218→8641 on
-    /// Q4_K_M baseline; 7:1 GQA amplifies K-head error through softmax).
-    /// `KvQuant::PlanarK` is rejected outright on Qwen MoE — no warn-and-proceed.
+    /// `KvQuant::PlanarK` (K at 4 bits) is rejected outright on Qwen MoE — no
+    /// warn-and-proceed.
     #[error(
-        "K-side 4-bit on Qwen MoE is PPL-disaster: --kv-quant planar_k (and '--ctk planar_k4') \
+        "Qwen MoE requires K-side bits >= 8: --kv-quant planar_k (and '--ctk planar_k4') \
          are rejected for Qwen3.5/3.6 MoE. Use '--kv-quant k8v8' or '--kv-quant planar' \
          (V-side rotation; K stays 8-bit)."
     )]
     QwenMoePlanarKRejected,
 
-    /// Contract A.y — IsoQuant K-side codecs are rejected on
-    /// Qwen MoE. K-side ≤4-bit on Qwen MoE is the PPL-disaster zone (same
-    /// 7:1 GQA softmax-amplification reason as `QwenMoePlanarKRejected`).
+    /// IsoQuant K-side codecs (K at 3 or 4 bits) are rejected on Qwen MoE.
     /// Applies to variants: `Iso3Sym`, `Iso4Sym`, `IsoKOnly3`,
     /// `IsoKOnly4`. The `variant` field carries the offending KvQuant
     /// `Display` form (e.g. `"iso3_sym"`, `"k_iso4"`).
     #[error(
-        "K-side ≤4-bit on Qwen MoE is PPL-disaster: --kv-quant {variant} \
+        "Qwen MoE requires K-side bits >= 8: --kv-quant {variant} \
          (and the matching '--ctk iso_k_*' selector) is rejected for Qwen3.5/3.6 MoE. \
          Use '--kv-quant k8v8' (K stays 8-bit) or a V-only iso variant \
          ('--kv-quant iso3' / '--kv-quant iso4')."
@@ -838,14 +648,12 @@ pub enum ResolveError {
         variant: String,
     },
 
-    /// Contract A.y — rotor K-side codecs are rejected on Qwen
-    /// MoE. K-side ≤4-bit on Qwen MoE is the PPL-disaster zone (same 7:1 GQA
-    /// softmax-amplification reason as `QwenMoeIsoKRejected`). Applies to
-    /// variants: `Rotor3Sym`, `Rotor4Sym`, `RotorKOnly3`,
+    /// Rotor K-side codecs (K at 3 or 4 bits) are rejected on Qwen MoE.
+    /// Applies to variants: `Rotor3Sym`, `Rotor4Sym`, `RotorKOnly3`,
     /// `RotorKOnly4`. The `variant` field carries the offending KvQuant
     /// `Display` form (e.g. `"rotor3_sym"`, `"k_rotor4"`).
     #[error(
-        "K-side ≤4-bit on Qwen MoE is PPL-disaster: --kv-quant {variant} is rejected for \
+        "Qwen MoE requires K-side bits >= 8: --kv-quant {variant} is rejected for \
          Qwen3.5/3.6 MoE. Use '--kv-quant k8v8' (K stays 8-bit) or a V-only rotor variant \
          ('--kv-quant rotor3' / '--kv-quant rotor4')."
     )]
@@ -854,12 +662,10 @@ pub enum ResolveError {
         variant: String,
     },
 
-    /// Contract A.y — TurboSym3 symmetric K+V 3-bit is rejected
-    /// on Qwen MoE. K-side 3-bit on Qwen MoE is the PPL-disaster zone (same
-    /// 7:1 GQA softmax-amplification as the other K-side guards). The `variant`
+    /// TurboSym3 (symmetric K+V 3-bit) is rejected on Qwen MoE. The `variant`
     /// field carries the offending KvQuant `Display` form (`"tsym3"`).
     #[error(
-        "K-side 3-bit on Qwen MoE is PPL-disaster: --kv-quant {variant} is rejected for \
+        "Qwen MoE requires K-side bits >= 8: --kv-quant {variant} is rejected for \
          Qwen3.5/3.6 MoE. Use '--kv-quant k8v8' (K stays 8-bit) or '--kv-quant k8vturbo3' \
          (K=8-bit, V=turbo3)."
     )]
@@ -868,10 +674,6 @@ pub enum ResolveError {
         variant: String,
     },
 
-    // The former `SharedKvIncompatibleWithMixed` variant was removed.
-    // Gemma3 / Gemma4 cross-layer KV sharing now supports `Mixed` via
-    // dequant-before-share in `KvCache::update_and_sdpa_shared_source`,
-    // so the combination is valid.
     /// No defined `KvQuant` mapping for this `(K, V)` tuple.
     ///
     /// Message names the actual K codec and explains the constraint.
@@ -890,7 +692,7 @@ fn is_quantised(ct: CacheType) -> bool {
 }
 
 /// Decompose a concrete [`KvQuant`] into the `(k, v)` [`CacheType`] pair it
-/// would have come from in the §D1 mapping.
+/// would have come from in the tag mapping.
 ///
 /// Inverse of [`combo_to_kv_quant`] for the canonical resolutions of
 /// [`crate::kv_cache::DEFAULT_KV_QUANT`]. Used by [`resolve`] to override only the
@@ -950,8 +752,7 @@ pub fn decompose_auto(kq: KvQuant) -> (CacheType, CacheType) {
             );
             (CacheType::Q8G128, CacheType::Q3G64)
         }
-        // TurboSym4 is never an auto base — symmetric 4-bit K is
-        // the Qwen MoE PPL-218→8641 disaster; opt-in only via `--kv-quant
+        // TurboSym4 is never an auto base; opt-in only via `--kv-quant
         // tsym4` or the `quality` preset. Decompose to (Tq4, Tq4) for
         // completeness; combo_to_kv_quant will reject a K-side Tq4 with
         // `KSideRotationCodec` if a defensive caller round-trips this.
@@ -959,8 +760,8 @@ pub fn decompose_auto(kq: KvQuant) -> (CacheType, CacheType) {
             tracing::warn!("unexpected TurboSym4 decompose_auto reached — TurboSym4 should never be an auto baseline");
             (CacheType::Tq4, CacheType::Tq4)
         }
-        // PlanarK is never an auto base — K-side 4-bit on Qwen MoE
-        // is the PPL-disaster; opt-in only via `--kv-quant planar_k`. Decompose
+        // PlanarK is never an auto base; opt-in only via `--kv-quant
+        // planar_k`. Decompose
         // to (PlanarK4, Bf16) — the canonical pairing.
         KvQuant::PlanarK => (CacheType::PlanarK4, CacheType::Bf16),
         // K8VTurbo2 is never an auto base (opt-in via --kv-quant
@@ -1373,10 +1174,8 @@ pub fn combo_to_kv_quant(k: CacheType, v: CacheType) -> Result<KvQuant, ResolveE
 
     // K-side rotation codec.
     // - V=affine: resolves to RotK (rotated affine K + affine V via mx.quantize).
-    // - V=tq4, planar4, bf16: unsupported. The rot_k + tq4 pairing used to
-    //   resolve to a dedicated hybrid whose decode rebuilt a full bf16 K *and*
-    //   V from the packed store every step; it was retired in favour of the
-    //   affine-V pairing, which `mixed_quantized_sdpa` consumes directly.
+    // - V=tq4, planar4, bf16: unsupported. The error names `--ctv q4_g64`,
+    //   the affine-V pairing `mixed_quantized_sdpa` consumes directly.
     if k == CacheType::RotK {
         let (Some(vb), Some(vg)) = (v.bits(), v.group_size()) else {
             return Err(ResolveError::UnsupportedCombo(format!(
@@ -1498,9 +1297,9 @@ pub fn combo_to_kv_quant(k: CacheType, v: CacheType) -> Result<KvQuant, ResolveE
             k.tag()
         ))),
 
-        // pure 2-bit K is gated. 2-bit on the K side degrades attention
-        // scores into incoherent output (CLAUDE.md hard rule 6 — smoke-probed
-        // on Bonsai). 2-bit is V-side only; K must stay >= 3-bit.
+        // Pure 2-bit K is gated: 2-bit on the K side degrades attention
+        // scores into incoherent output. 2-bit is V-side only; K must stay
+        // >= 3-bit.
         (CacheType::Q2G64, _) => Err(ResolveError::UnsupportedCombo(format!(
             "K='q2_g64' rejected: 2-bit K degrades attention into incoherent output. \
              2-bit is V-side only. Use '--ctk q8_g128 --ctv q2_g64' (asymmetric) \
@@ -1510,7 +1309,8 @@ pub fn combo_to_kv_quant(k: CacheType, v: CacheType) -> Result<KvQuant, ResolveE
 
         // Both sides MLX affine → Mixed.
         (k, v) if k.is_affine() && v.is_affine() => {
-            // Both bits/group_size are Some by is_affine() definition; bind via expect-free pattern.
+            // Both bits/group_size are Some by is_affine() definition; bind via expect-free
+            // pattern.
             let (Some(kb), Some(kg)) = (k.bits(), k.group_size()) else {
                 return Err(ResolveError::UnsupportedCombo(format!(
                     "internal: '{}' marked affine but bits/group_size missing",
@@ -1545,9 +1345,8 @@ pub fn combo_to_kv_quant(k: CacheType, v: CacheType) -> Result<KvQuant, ResolveE
 // Returns `true` for any Qwen sparse-MoE architecture that requires K-bits ≥ 8.
 //
 // Both text-only (`Qwen3_5MoeForConditionalGeneration`) and vision-language MoE
-// (`Qwen3VLMoeForConditionalGeneration`) share the same PPL-disaster sensitivity
-// on low K-bit quantization (§D6.4). Centralising the check here ensures that
-// future Qwen MoE variants are added in one place.
+// (`Qwen3VLMoeForConditionalGeneration`) take the same low-K-bit guard. A new
+// Qwen MoE arch string is added here, in one place.
 fn is_qwen_moe(arch: &str) -> bool {
     matches!(
         arch,
@@ -1558,17 +1357,12 @@ fn is_qwen_moe(arch: &str) -> bool {
 /// Re-check post-decompose invariants on a concrete [`KvQuant`].
 ///
 /// Enforces:
-/// - §D6.4 (Qwen MoE K-bits ≥ 8) — inspects the K side of `Mixed`.
-///   `K8V4`/`K8V8`/`Planar` always have K=8 so they pass; `None` passes.
+/// - Qwen MoE K-bits ≥ 8 — every codec that stores K below 8 bits is
+///   rejected on Qwen MoE. `K8V4`/`K8V8`/`Planar` always have K=8 so they
+///   pass; `None` passes.
 ///
-/// This runs **after** auto-decompose so a future auto-default table
-/// changes cannot bypass the invariant.
-///
-/// The former guard that rejected `Mixed` on Gemma3 / Gemma4 (cross-layer KV
-/// sharing) was removed. `KvCache::update_and_sdpa_shared_source` supports
-/// `Mixed` via dequant-before-share — it surfaces the accumulated bf16 K/V
-/// (prefill-raw during prefill, maintained `decode_fp16` during decode) to
-/// the shared-KV consumer layers.
+/// This runs **after** auto-decompose, so no auto default can bypass the
+/// invariant.
 #[allow(
     clippy::cognitive_complexity,
     reason = "sequential Qwen MoE guard chain — each arm is a distinct error variant; refactoring would obscure the invariant order"
@@ -1580,18 +1374,17 @@ pub fn validate_resolved(arch_class: &str, kq: &KvQuant) -> Result<(), ResolveEr
                 return Err(ResolveError::QwenMoeKBitsTooLow(*k_bits));
             }
         }
-        // Contract A.y — PlanarK is K-side 4-bit rotation. Hard reject
-        // with a dedicated error so the diagnostic surfaces the K-side disaster
-        // (separate from the generic Mixed-K<8 path and from TurboSym4).
+        // PlanarK is K-side 4-bit rotation. Hard reject with a dedicated
+        // error (separate from the generic Mixed-K<8 path and from TurboSym4).
         if matches!(kq, KvQuant::PlanarK) {
             tracing::warn!(
                 arch = arch_class,
                 kv_quant = ?kq,
-                "rejecting PlanarK (K-axis PlanarQuant 4-bit) on Qwen MoE — PPL disaster path"
+                "rejecting PlanarK (K-axis PlanarQuant 4-bit) on Qwen MoE — K below 8 bits"
             );
             return Err(ResolveError::QwenMoePlanarKRejected);
         }
-        // Contract A.y — IsoQuant K-side codecs are surfaced via a
+        // IsoQuant K-side codecs are surfaced via a
         // dedicated error so the diagnostic names the variant. Runs BEFORE the
         // generic `k_below_8bit → QwenMoeKBitsTooLow(4)` fallthrough.
         if matches!(
@@ -1601,13 +1394,13 @@ pub fn validate_resolved(arch_class: &str, kq: &KvQuant) -> Result<(), ResolveEr
             tracing::warn!(
                 arch = arch_class,
                 kv_quant = ?kq,
-                "rejecting iso K-side codec on Qwen MoE — PPL disaster path"
+                "rejecting iso K-side codec on Qwen MoE — K below 8 bits"
             );
             return Err(ResolveError::QwenMoeIsoKRejected {
                 variant: format!("{kq}"),
             });
         }
-        // Contract A.y — rotor K-side codecs use a dedicated error
+        // Rotor K-side codecs use a dedicated error
         // for the same reason (variant-named diagnostic). Runs after iso K-side
         // guard (no overlap) and before the generic fallthrough.
         if matches!(
@@ -1622,44 +1415,41 @@ pub fn validate_resolved(arch_class: &str, kq: &KvQuant) -> Result<(), ResolveEr
             tracing::warn!(
                 arch = arch_class,
                 kv_quant = ?kq,
-                "rejecting rotor K-side codec on Qwen MoE — PPL disaster path"
+                "rejecting rotor K-side codec on Qwen MoE — K below 8 bits"
             );
             return Err(ResolveError::QwenMoeRotorKRejected {
                 variant: format!("{kq}"),
             });
         }
-        // Contract A.y — TurboSym3 (symmetric 3-bit Lloyd-Max K+V) is K-side
+        // TurboSym3 (symmetric 3-bit Lloyd-Max K+V) is K-side
         // 3-bit on Qwen MoE — rejected with a dedicated error so the diagnostic
         // names the variant. Runs after rotor guard and before `k_below_8bit`.
         if matches!(kq, KvQuant::TurboSym3) {
             tracing::warn!(
                 arch = arch_class,
                 kv_quant = ?kq,
-                "rejecting TurboSym3 (symmetric K+V 3-bit) on Qwen MoE — PPL disaster path"
+                "rejecting TurboSym3 (symmetric K+V 3-bit) on Qwen MoE — K below 8 bits"
             );
             return Err(ResolveError::QwenMoeTurboKRejected {
                 variant: format!("{kq}"),
             });
         }
-        // Symmetric 4-bit Lloyd-Max K + tq4 V (`KvQuant::TurboSym4`) is
-        // the PPL-218→8641 disaster path on Qwen MoE (CLAUDE.md hard rule 6).
-        // Surface as `QwenMoeKBitsTooLow(4)` so the error class is uniform with
+        // Every other codec with K below 8 bits, `KvQuant::TurboSym4` among
+        // them. Surface as `QwenMoeKBitsTooLow(4)` so the error class is uniform with
         // the existing Mixed K<8 rejection — same exit code, same hint text.
         if kq.k_below_8bit() {
             tracing::warn!(
                 arch = arch_class,
                 kv_quant = ?kq,
-                "rejecting low-K-bit codec on Qwen MoE — PPL disaster path"
+                "rejecting low-K-bit codec on Qwen MoE — K below 8 bits"
             );
             return Err(ResolveError::QwenMoeKBitsTooLow(4));
         }
     }
 
-    // General (arch-agnostic) Metal-vs-CPU classification. Codecs whose KV
-    // encode + dequant run on the CPU on the default hot path (the iso / rotor
-    // families) are honestly surfaced here with a loud structured warn so the
-    // 30–60× cost is never silent. These codecs still produce correct output
-    // and are not rejected — only flagged.
+    // General (arch-agnostic) Metal-vs-CPU classification. A codec whose store
+    // no Metal kernel runs on the default hot path is flagged with a
+    // structured warn. It still produces correct output and is not rejected.
     //
     // The suggestion is deliberately a codec that reads its own packed store:
     // naming one of the mirror-fed codecs here would be advice to swap a slow
@@ -1670,10 +1460,9 @@ pub fn validate_resolved(arch_class: &str, kq: &KvQuant) -> Result<(), ResolveEr
                 arch = arch_class,
                 kv_quant = %kq,
                 reason,
-                "KV codec runs its encode + dequant on CPU on the default hot path — \
-                 expect a slow first forward and decode that slows as KV grows. \
-                 This is NOT a Metal kernel. \
-                 Pick a Metal codec that reads its own store \
+                "no Metal kernel runs this KV codec's store on the default hot path \
+                 (see reason). \
+                 For a quantised cache, pick a Metal codec that reads its own store \
                  (mixed_k8g64_v4g64 / rot_k_v4g64 / k_iso4) to avoid this."
             );
         });
@@ -1715,11 +1504,14 @@ pub fn validate_resolved(arch_class: &str, kq: &KvQuant) -> Result<(), ResolveEr
 /// Steps, in order:
 /// 1. `head_dim` required (else `HeadDimUnknown`).
 /// 2. K-side rotation rejected (`KSideRotationCodec`).
-/// 3. Each non-`Auto` side checked for affine group-divisibility (§D6.1) and
-/// 4. `tq4` on V requires `head_dim ∈ {128, 256}` (§D6.5).
-/// 5. Decompose `Auto` sides via [`decompose_auto`], overriding only the user-
+/// 3. Each non-`Auto` side checked for affine group-divisibility and MLX
+///    bit-packing.
+/// 4. `tq4` on V requires `head_dim ∈ {128, 256}`.
+/// 5. Decompose `Auto` sides via [`decompose_auto`], overriding only the
+///    side the user named.
 /// 6. Resolve `(k, v)` → `KvQuant` via [`combo_to_kv_quant`] (which holds the
-/// 7. Re-validate via [`validate_resolved`] (post-decompose §D6.4 check).
+///    pairing rules).
+/// 7. Re-validate via [`validate_resolved`] (post-decompose Qwen MoE check).
 #[allow(
     clippy::wildcard_enum_match_arm,
     reason = "wildcard arm is the correct fallthrough for unsupported arch/quant variants; exhaustive expansion would require updating on every new variant"
@@ -1823,21 +1615,21 @@ pub fn resolve(
     Ok(kq)
 }
 
-/// §D6.1 + §D6.2 — group-divisibility and MLX bit-packing for affine codecs.
+/// Group-divisibility and MLX bit-packing for affine codecs.
 ///
 /// No-op for non-affine codecs (`Auto`, `Bf16`, `Tq4`, `Planar4`).
 fn check_affine_invariants(ct: CacheType, head_dim: usize) -> Result<(), ResolveError> {
     let (Some(bits), Some(group_size)) = (ct.bits(), ct.group_size()) else {
         return Ok(());
     };
-    // §D6.1
+    // head_dim % group_size == 0
     if !head_dim.is_multiple_of(group_size) {
         return Err(ResolveError::GroupSizeNotDivisible {
             head_dim,
             group_size,
         });
     }
-    // §D6.2 — MLX bit-packing: head_dim % (32 / bits) == 0 for bits ∈ {2..8}.
+    // MLX bit-packing: head_dim % (32 / bits) == 0 for bits ∈ {2..8}.
     if (2..=8).contains(&bits) {
         let pack = 32usize / bits as usize;
         if pack > 0 && !head_dim.is_multiple_of(pack) {

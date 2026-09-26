@@ -73,35 +73,27 @@ impl Mlp {
 // MoeBlock (stub)
 // ---------------------------------------------------------------------------
 
-/// Sparse mixture-of-experts FFN — Stage 2 / Qwen3 territory.
+/// Sparse mixture-of-experts FFN — an unimplemented stub.
 ///
-/// Stubbed so arch.rs can reference the type in the dispatch infrastructure
-/// for Qwen3_5MoeForConditionalGeneration. The routing logic (expert selection,
-/// top-k, load-balancing loss) is not yet implemented.
-///
-/// See CLAUDE.md "Qwen MoE GQA disaster" before implementing: asymmetric
-/// q8_0 K + turbo4 V is the required default for Qwen MoE.
+/// The MoE architectures (e.g. `Qwen3_5MoeForConditionalGeneration`) route
+/// experts in their own modules and never use this type.
 #[allow(
     clippy::exhaustive_structs,
-    reason = "Stage 2 stub — placeholder; will gain fields when MoE routing is implemented"
+    reason = "unimplemented stub — placeholder with no fields"
 )]
 #[allow(missing_debug_implementations)]
 pub struct MoeBlock {
-    // Fields TBD in Stage 2.
     _placeholder: (),
 }
 
 impl MoeBlock {
     #[allow(
         clippy::unimplemented,
-        reason = "MoeBlock::forward is a Stage 2 stub; Qwen3_5MoeForConditionalGeneration \
-                  uses its own path and never calls this. Port pending when Stage 2 is wired."
+        reason = "MoeBlock::forward is an unimplemented stub; the MoE archs use their \
+                  own paths and never call this."
     )]
-    /// Stage 2 stub — unimplemented. See struct-level doc.
+    /// Unimplemented stub. See struct-level doc.
     pub fn forward(&self, _x: &Array, _device: Device) -> Result<Array> {
-        unimplemented!(
-            "MoeBlock::forward not yet implemented (Stage 2). \
-             Wire up Qwen3_5MoeForConditionalGeneration first."
-        )
+        unimplemented!("MoeBlock::forward is not implemented; the MoE archs use their own paths")
     }
 }

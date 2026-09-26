@@ -147,12 +147,11 @@ pub struct KvCache {
     pub(super) flash_filled: i32,
     // ── Head-major persistent K storage for fused-QK kernels ──
     //
-    // Generalises the TurboFlash `flash_*` field set above to all five
-    // fused-QK codec families (q8, TurboSym3, TurboSym4, Iso3/4Sym,
-    // Rotor3/4Sym). Allocated lazily on the first fused-QK decode
-    // dispatch from the bf16 prefill prefix; appended head-major on every
-    // subsequent decode token. See
-    // `docs/research/fused-qk-storage-design.md`.
+    // Generalises the TurboFlash `flash_*` field set above to the fused-QK
+    // codecs (K8V4, K8V8, TurboSym3/4, RotorKAsym3/4). Allocated lazily on
+    // the first fused-QK decode dispatch from the bf16 prefill prefix;
+    // appended head-major on every subsequent decode token. See
+    // `docs/KV_FUSED_KERNELS.md` § "Fused-QK head-major K storage".
     pub(super) fused_qk_shadow: Option<FusedQkShadow>,
     /// Virtual ceiling on the lazily-grown prefill ring, in tokens.
     ///
@@ -527,8 +526,8 @@ impl KvCache {
     }
 
     /// Test-only accessor: the `max_seq` currently recorded on the active
-    /// storage variant (the allocated ring capacity). Used by the issue-#25
-    /// lazy-grow / ceiling tests to assert the ring grew lazily rather than
+    /// storage variant (the allocated ring capacity). Used by the lazy-grow
+    /// / ceiling tests to assert the ring grew lazily rather than
     /// pre-allocating to the ceiling.
     #[cfg(test)]
     pub fn storage_max_seq_for_test(&self) -> i32 {

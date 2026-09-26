@@ -1,4 +1,4 @@
-//! A9 — Chat-template HF round-trip fixture tests.
+//! Chat-template HF round-trip fixture tests.
 //!
 //! For each fixture JSON in `tests/chat_template_fixtures/`, this test:
 //! 1. Checks whether the snapshot directory named in the fixture exists locally.
@@ -12,8 +12,8 @@
 //! as the oracle. Any mismatch is a real rMLX render bug — the assert is
 //! never weakened.
 //!
-//! Archs covered (as of A9):
-//! - Qwen3_5MoeForConditionalGeneration (incl. tools, A5 path)
+//! Archs covered:
+//! - Qwen3_5MoeForConditionalGeneration (incl. tools)
 //! - Gemma4ForConditionalGeneration
 //! - Gemma3ForConditionalGeneration
 //! - Qwen3ForCausalLM (incl. tools)
@@ -152,7 +152,7 @@ fn roundtrip_qwen3_5moe_basic() {
 
 #[test]
 fn roundtrip_qwen3_5moe_tools() {
-    // A5 tools-injection path — highest-value new coverage.
+    // Tools-injection path.
     run_fixture("qwen3_5moe_tools");
 }
 

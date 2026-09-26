@@ -1,14 +1,14 @@
 //! Regression tests for the Gemma4 verify-step attention mask sizing.
 //!
-//! Issue #32: at a speculative verify-block step (`query_len > 1`, prompt long
-//! enough to take the masked branch), the array-mode SWA / chunked-prefill mask
-//! was sized from the model-wide `cache_base_offset` instead of the
-//! cache-holding producer layer's own `offset()`. Across a partial-accept
-//! rollback the two desync by one position, so the mask came out one key too
-//! long (`(1,1,5,kv+1)`) vs the K the SDPA attended (`(1,8,5,kv)`), tripping the
-//! opaque mlx-c `scaled_dot_product_attention` broadcast error.
+//! At a speculative verify-block step (`query_len > 1`, prompt long enough to
+//! take the masked branch), an array-mode SWA / chunked-prefill mask sized from
+//! the model-wide `cache_base_offset` instead of the cache-holding producer
+//! layer's own `offset()` desyncs by one position across a partial-accept
+//! rollback: the mask comes out one key too long (`(1,1,5,kv+1)`) vs the K the
+//! SDPA attends (`(1,8,5,kv)`), tripping the opaque mlx-c
+//! `scaled_dot_product_attention` broadcast error.
 //!
-//! These tests pin the invariant the fix restores: for a verify-block step the
+//! These tests pin the invariant: for a verify-block step the
 //! mask built from the *producer* offset has its key dim equal to
 //! `producer_offset + seq` (== the post-update K seq dim), and the boundary
 //! case where base_offset = producer_offset + 1 no longer inflates it.
@@ -40,7 +40,7 @@ use super::{build_attn_mask, consumer_effective_offset, producer_effective_offse
     reason = "test asserts on known-good shapes; unwrap/expect failures are the assertion"
 )]
 fn full_attn_verify_block_mask_matches_producer_k_len() {
-    // Reproduce issue #32 magnitudes: prompt ~4121 already cached, verify block
+    // Reproduce the crash magnitudes: prompt ~4121 already cached, verify block
     // of 5 tokens (b + 4 drafted). producer_offset is the producer cache's own
     // offset; K after update = producer_offset + seq.
     let producer_offset = 4121;
@@ -143,7 +143,7 @@ fn sliding_attn_verify_block_mask_matches_capped_k_len() {
     reason = "test asserts on known-good shapes; unwrap/expect failures are the assertion"
 )]
 fn guard_invariant_producer_offset_matches_k_seq() {
-    // Reproduce issue #32 magnitudes: partial-accept rollback left producer
+    // Reproduce the crash magnitudes: partial-accept rollback left producer
     // cache at offset 4121 while the model-wide base_offset is 4122.
     let seq = 5;
     let producer_offset = 4121;
@@ -179,7 +179,7 @@ fn guard_invariant_producer_offset_matches_k_seq() {
     );
 }
 
-/// Consumer / shared-KV branch invariant (#32 part 2): the consumer mask must
+/// Consumer / shared-KV branch invariant: the consumer mask must
 /// size its key dim from the ACTUAL shared K length (`k.shape()[2]`), NOT from
 /// the model-wide `offset`. In `Attention::forward` the consumer branch calls
 /// `consumer_effective_offset(total_kv_len, seq)` where
@@ -206,7 +206,7 @@ fn guard_invariant_producer_offset_matches_k_seq() {
     reason = "test asserts on known-good shapes; unwrap/expect failures are the assertion"
 )]
 fn guard_invariant_consumer_mask_matches_shared_k_len() {
-    // Reproduce the #32-part-2 crash magnitudes: base_offset 3221 (the
+    // Reproduce the consumer-branch crash magnitudes: base_offset 3221 (the
     // un-rolled-back full-attention cache), producer rolled back by delta=4
     // (round-1 accepted tokens), verify block seq=5.
     let seq = 5;
@@ -257,7 +257,7 @@ fn guard_invariant_consumer_mask_matches_shared_k_len() {
     assert!(
         shape[3] < base_offset + seq,
         "offset-based sizing (base_offset + seq) would have been wider — the \
-         #32-part-2 broadcast crash"
+         consumer-branch broadcast crash"
     );
 }
 
@@ -354,7 +354,7 @@ fn guard_invariant_regressed_consumer_offset_inflates_mask() {
     assert_eq!(
         mask.expect("array mode must carry a mask array").shape()[3],
         k_seq + delta,
-        "model-wide-offset consumer mask is delta keys too long — the #32-part-2 \
+        "model-wide-offset consumer mask is delta keys too long — the consumer-branch \
          guard trigger"
     );
 }
@@ -363,7 +363,7 @@ fn guard_invariant_regressed_consumer_offset_inflates_mask() {
 /// (`producer_offset + 1`) were used instead of `producer_effective_offset`,
 /// the mask key dim would exceed K seq dim by exactly one.
 ///
-/// This test documents the exact #32 crash shape. Reverting `Attention::forward`
+/// This test documents the exact crash shape. Reverting `Attention::forward`
 /// to pass `base_offset` (== `producer_offset + 1`) into the mask builder —
 /// instead of routing through `producer_effective_offset(c.offset(), ...)` —
 /// makes `guard_invariant_producer_offset_matches_k_seq` RED (the
@@ -399,11 +399,11 @@ fn guard_invariant_regressed_base_offset_inflates_mask() {
     )
     .unwrap();
     let k_seq = producer_offset + seq; // the K seq dim the SDPA actually attends.
-                                       // Off-by-one: mask key dim is one longer than K — the #32 broadcast crash.
+                                       // Off-by-one: mask key dim is one longer than K — the broadcast crash.
     assert_eq!(
         mask.expect("array mode must carry a mask array").shape()[3],
         k_seq + 1,
-        "base_offset-desynced mask is one key too long — the #32 guard trigger"
+        "base_offset-desynced mask is one key too long — the guard trigger"
     );
 }
 

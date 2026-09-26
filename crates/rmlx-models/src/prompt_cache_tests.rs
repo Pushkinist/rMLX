@@ -91,7 +91,7 @@ impl TestEntry {
         }
     }
 
-    /// Issue #26: build an entry whose block-hash chain is salted with an
+    /// Build an entry whose block-hash chain is salted with an
     /// explicit `seed` (the `FNV_OFFSET ^ layout_key ^ codec_salt` the
     /// production push uses). Lets the codec-partition test store a slot under
     /// one codec seed and query under another.
@@ -652,7 +652,7 @@ fn short_prefix_treated_as_miss() {
     assert_eq!(stats.misses, 1);
 }
 
-// --- M29 LRU tests ---
+// --- LRU tests ---
 
 /// LRU ordering: push 3 entries (A, B, C) into a capacity-3 cache, then
 /// hit B and C. Push D — A should be evicted (oldest unused).
@@ -856,7 +856,7 @@ fn over_cap_refusal_preserves_existing_slots() {
     );
 }
 
-/// C1: long-prompt block-aligned partial hit.
+/// Long-prompt block-aligned partial hit.
 ///
 /// Cache a 4096-token prompt (16 full 256-tok blocks). Query with a
 /// prompt that shares the first 3840 tokens (15 blocks) then has 256
@@ -906,7 +906,7 @@ fn long_prompt_block_aligned_partial_hit() {
     assert_eq!(stats.misses, 0);
 }
 
-/// C6: block-level counters — partial hit, full block hit, and total miss.
+/// Block-level counters — partial hit, full block hit, and total miss.
 ///
 /// Cache a 16-block (4096-token) prompt.
 ///
@@ -1573,7 +1573,7 @@ fn exact_only_policy_forces_partial_match_to_miss_semantics() {
     );
 }
 
-/// Issue #26 — codec-partitioned prefix-cache key (the anti-cross-serve guard).
+/// Codec-partitioned prefix-cache key (the anti-cross-serve guard).
 ///
 /// A prefix cached under one KV codec must NOT be served to a request running a
 /// different codec — the cached K/V bytes are codec-specific. The production

@@ -69,7 +69,7 @@ fn synthesize_unknown_voice_returns_error() {
 }
 
 /// Synthesize with a valid voice but missing weights returns a load error.
-/// Phase 4b implementation is complete; this test exercises the lazy-load
+/// This test exercises the lazy-load
 /// error path that fires when the talker model directory is invalid.
 #[test]
 fn synthesize_valid_voice_returns_load_error() {

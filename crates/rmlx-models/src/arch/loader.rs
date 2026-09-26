@@ -38,8 +38,8 @@ pub struct LoadOpts {
 /// Load a model snapshot from `model_dir`.
 ///
 /// Reads `config.json`, dispatches on `architectures[0]`:
-/// - `"Gemma4ForConditionalGeneration"` -> Architecture::Gemma4(...)
-/// - Anything else -> Error::Model("architecture '...' not yet supported (v0.0.1)")
+/// - an architecture in `KNOWN_ARCHS` -> its `Architecture` variant
+/// - anything else -> `Error::Model("architecture '...' not yet supported")`
 ///
 /// Captures per-phase timing (`mmap_ms`, `dequant_ms`, `gpu_residency_ms`,
 /// `first_kernel_ready_ms`, `total_load_ms`) into `LAST_LOAD_PHASES`.
@@ -47,7 +47,7 @@ pub struct LoadOpts {
 ///
 /// `opts` carries optional runtime overrides (e.g. YARN RoPE for Qwen3).
 /// Pass `&LoadOpts::default()` (or `Default::default()`) when no overrides
-/// are needed — this is byte-identical to the no-opts behaviour.
+/// are needed.
 ///
 /// # Errors
 /// Returns `Error::Config` if `config.json` cannot be read or parsed.
@@ -77,10 +77,10 @@ pub fn load_model(model_dir: &Path, _device: Device, opts: &LoadOpts) -> Result<
         tracing::error!(
             arch = arch_str,
             model_dir = %model_dir.display(),
-            "arch::load_model: architecture not yet supported in v0.0.1"
+            "arch::load_model: architecture not yet supported"
         );
         return Err(Error::Model(format!(
-            "architecture '{arch_str}' not yet supported in v0.0.1; see arch.rs for how to add it"
+            "architecture '{arch_str}' not yet supported; see docs/ADDING_A_MODEL.md for how to add it"
         )));
     }
 
@@ -320,7 +320,7 @@ pub fn load_model(model_dir: &Path, _device: Device, opts: &LoadOpts) -> Result<
         first_kernel_ready_ms,
         total_load_ms,
         arch = arch_str,
-        "arch::load_model: load-time phases (N17)"
+        "arch::load_model: load-time phases"
     );
     {
         let mut guard = LAST_LOAD_PHASES
@@ -479,9 +479,9 @@ fn gdn_warmup(b: i32, t: i32, hk: i32, hv: i32, dk: i32, dv: i32) -> Result<()> 
 // Smoke-probe seed prompt
 // ---------------------------------------------------------------------------
 
-/// Fixed, deterministic seed prompt for the smoke probe (B5b).
+/// Fixed, deterministic seed prompt for the smoke probe.
 ///
-/// B5 fed the probe bare BOS (no prompt). That produced *false* degeneration on
+/// Feeding the probe bare BOS (no prompt) produces *false* degeneration on
 /// some healthy snapshots: `gemma-4-26b-a4b-it-mxfp8` answers
 /// "The capital of France is Paris." for a real prompt yet loops the Korean
 /// token `로` from bare BOS. Seeding with a tiny fixed instruction makes healthy
@@ -518,7 +518,7 @@ pub fn smoke_prompt_ids(tokenizer: &tokenizers::Tokenizer, bos_id: u32) -> Resul
 ///
 /// Loads the model via `load_model`, resolves the BOS token from
 /// `tokenizer_config.json`, runs greedy generation for 8 steps, and returns
-/// a `SmokeVerdict`. Used by the server's `--require-smoke-probe` gate (B5).
+/// a `SmokeVerdict`. Used by the server's `--require-smoke-probe` gate.
 ///
 /// `prompt_ids_override` lets a caller that owns the chat-template engine
 /// (e.g. `rmlx-server`) feed a production-shaped, turn-structured prompt so the

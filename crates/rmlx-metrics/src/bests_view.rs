@@ -1,4 +1,4 @@
-//! The `bests` view — champion per cell (docs/METRICS_DB.md §3.3).
+//! The `bests` view — champion per cell (docs/METRICS_SCHEMA.md §3.3).
 //!
 //! The partition is [`crate::cell::partition_columns`], shared with every query
 //! that looks a cell up. It includes `decode_config`, so a speculative-decode
@@ -16,13 +16,13 @@
 //! `prompt_tokens × 1000` — beats every real row it shares a partition with
 //! and then publishes into `BENCHMARK_CHAMPIONS.md`.
 //!
-//! So the view only ranks rows the §4 registry can call a measurement, and the
-//! predicate is *generated from that registry* rather than retyped in SQL:
-//! one definition of "plausible", enforced at ingest by
-//! [`crate::ingest::RunRecord::validate`] and here by the same [`Bounds`] the
-//! validator uses. [`ensure`] rebuilds the view whenever the stored definition
-//! and the registry disagree, so a bounds change propagates on the next open
-//! instead of silently applying to new rows only.
+//! So the view only ranks rows the `docs/METRICS_SCHEMA.md` §4 registry can
+//! call a measurement, and the predicate is *generated from that registry*
+//! rather than retyped in SQL: one definition of "plausible", enforced at
+//! ingest by [`crate::ingest::RunRecord::validate`] and here by the same
+//! [`Bounds`] the validator uses. [`ensure`] rebuilds the view whenever the
+//! stored definition and the registry disagree, so a bounds change propagates
+//! on the next open instead of silently applying to new rows only.
 //!
 //! [`Bounds`]: crate::registry::Bounds
 
@@ -33,8 +33,8 @@ use rusqlite::Connection;
 use crate::error::Result;
 use crate::registry;
 
-/// Renders the §4.1 plausibility predicate as a SQLite boolean expression over
-/// `column`, keyed on the row's `metric`.
+/// Renders the `docs/METRICS_SCHEMA.md` §4.1 plausibility predicate as a SQLite
+/// boolean expression over `column`, keyed on the row's `metric`.
 ///
 /// Every consumer that ranks or aggregates `observations` must `AND` this in.
 /// `bests` does it once, but `deltas`, `regress` and `timeseries` each run
@@ -58,7 +58,7 @@ pub fn plausible_sql(column: &str) -> String {
     sql
 }
 
-/// Renders the `CREATE VIEW` statement for `bests` from the §4 registry.
+/// Renders the `CREATE VIEW` statement for `bests` from the `docs/METRICS_SCHEMA.md` §4 registry.
 pub fn create_sql() -> String {
     let plausible = plausible_sql("value");
     let partition = crate::cell::partition_columns();

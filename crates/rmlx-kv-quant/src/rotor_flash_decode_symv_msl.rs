@@ -36,16 +36,17 @@
 //!
 //! # Reuse of the K-decode half
 //!
-//! [`crate::rotor_flash_decode_msl`] emits its per-lane rotor decode into the
-//! **header** as the MSL function `rf_decode_k_lane(...)` precisely so a
-//! quantized-V kernel could call it unchanged. This kernel does exactly that,
-//! for both axes:
+//! [`crate::rotor_flash_decode_msl`] emits its rotor decode into the
+//! **header** as the MSL functions `rf_decode_k_group(...)` and its per-lane
+//! wrapper `rf_decode_k_lane(...)`, so a quantized-V kernel can call it
+//! unchanged. This kernel does that for both axes:
 //!
 //! * The header is [`crate::rotor_flash_decode_msl::build_rotor_flash_header`],
 //!   reused verbatim — no second copy of the Lloyd-Max codebook or the Cl(3,0)
 //!   multiplication table, and no second probe snapshot to keep in sync.
-//! * The body calls `rf_decode_k_lane` twice per token: once over the K ring,
-//!   once over the V ring.
+//! * The body calls `rf_decode_k_group` twice per token, on lane 0 of each
+//!   group: once over the K ring, once over the V ring. The leader stages the
+//!   block's lanes in threadgroup memory.
 //!
 //! That works because the rotor codec is **axis-agnostic**: `rotor{3,4}_encode`
 //! (V) and `rotor{3,4}_k_encode` (K) are the same function, the K fork only

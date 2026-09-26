@@ -29,12 +29,12 @@ use super::types::{GenerationRequest, GenerationToken, ModelLoadConfig};
 /// Which drafter loader an `--draft-kind mtp` draft model routes to, decided by
 /// the draft's detected architecture family (never a substring leak).
 ///
-/// `--draft-kind mtp` historically fronted two structurally different loaders:
-/// the Qwen3.5-MoE MTP sidecar head (`MtpDrafter`) and the Gemma4 assistant
-/// drafter (`Gemma4AssistantDrafter`). A draft whose family backs neither must
-/// be rejected at load — see issue #23: a plain `Gemma4ForConditionalGeneration`
-/// snapshot used to fall through to the Qwen3.5 sidecar loader and leak a
-/// confusing `text_config missing num_experts` error.
+/// `--draft-kind mtp` fronts two structurally different loaders: the
+/// Qwen3.5-MoE MTP sidecar head (`MtpDrafter`) and the Gemma4 assistant
+/// drafter (`Gemma4AssistantDrafter`). A draft whose family backs neither is
+/// rejected at load with a typed error, so a plain
+/// `Gemma4ForConditionalGeneration` snapshot does not fall through to the
+/// Qwen3.5 sidecar loader and fail on a missing `num_experts`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MtpDraftFamily {
     /// Dedicated Gemma4 assistant drafter snapshot (`gemma4_assistant`).
@@ -54,8 +54,8 @@ enum MtpDraftFamily {
 /// sidecars (e.g. `mlx-community/Qwen3.6-35B-A3B-MTP-5bit`) carry
 /// `model_type=qwen3_5_mtp` but an absent `architectures` array — the downstream
 /// `MtpDrafter::load` (mtp.rs:~288) only warns on a mismatch and proceeds by
-/// tensor names. The issue #23 fix targets *populated* foreign families
-/// (e.g. `Gemma4ForConditionalGeneration`), not blanks.
+/// tensor names. The rejection targets *populated* foreign families (e.g.
+/// `Gemma4ForConditionalGeneration`), not blanks.
 fn classify_mtp_draft(arch: &str, model_type: &str) -> MtpDraftFamily {
     if model_type == "gemma4_assistant" || arch.contains("Gemma4Assistant") {
         MtpDraftFamily::Gemma4Assistant
@@ -176,7 +176,7 @@ fn decide_draft_kind(
         // The inference yields to the flag, but not into a loader that would
         // materialise the whole verifier first and then die on a tensor name.
         // `mtp` is not listed: its own family router refuses a full model
-        // before any weight is read.
+        // before any draft weight is read (the verifier is loaded first).
         (
             Some(f @ (DraftKind::Eagle3 | DraftKind::DFlash | DraftKind::DFlash2)),
             Declared::FullModel,
@@ -312,7 +312,7 @@ pub struct SpeculativeGenerator {
     /// The verifier's context limits. A per-request `max_ctx` override is
     /// resolved against these by the route layer.
     context_limits: rmlx_models::context::ContextLimits,
-    /// A10: detokenization family from the verifier's `tokenizer.json`.
+    /// Detokenization family from the verifier's `tokenizer.json`.
     tokenizer_kind: crate::detokenizer::TokenizerKind,
     /// The drafter, and with it the round loop. Never implicit: inferred from
     /// the draft snapshot's declaration, or named by `--draft-kind`.
@@ -500,7 +500,7 @@ impl SpeculativeGenerator {
         let tokenizer = tokenizers::Tokenizer::from_file(&tk_path)
             .map_err(|e| Error::Other(format!("load tokenizer: {e}")))?;
 
-        // A10: classify detokenizer family from the verifier tokenizer.json.
+        // Classify detokenizer family from the verifier tokenizer.json.
         let tokenizer_kind = match std::fs::read(&tk_path)
             .ok()
             .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
@@ -549,7 +549,7 @@ impl SpeculativeGenerator {
             tokenizer: Arc::new(tokenizer),
             device,
             model_id,
-            // C4: shared process-wide GPU gate (see ArchGenerator above).
+            // Shared process-wide GPU gate (see ArchGenerator above).
             _lock: gpu_gate,
             kv_quant_override: kv_quant_resolved,
             max_ctx_override,
@@ -635,7 +635,7 @@ impl Generator for SpeculativeGenerator {
         let drafter = self.drafter.clone();
         let block_size = self.block_size;
         let tokenizer = Arc::clone(&self.tokenizer);
-        // A10: detokenizer family for the streaming UTF-8 token-healer.
+        // Detokenizer family for the streaming UTF-8 token-healer.
         let tokenizer_kind = self.tokenizer_kind;
         let prompt_tokens = req.prompt_tokens.clone();
         let n_tokens = req.max_tokens as usize;
@@ -663,38 +663,34 @@ impl Generator for SpeculativeGenerator {
         }
         // Per-request max-ctx ceiling override (the lazy-grow path).
         let max_ctx_override = req.max_ctx_override.or(self.max_ctx_override);
-        // F2: capture effective_max_ctx for drainer MetricEvent.ctx_max field.
+        // Capture effective_max_ctx for drainer MetricEvent.ctx_max field.
         let effective_max_ctx_val = self.effective_max_ctx as i64;
-        // N2: use effective_prompt_cache_slots override if set by route handler.
+        // Use effective_prompt_cache_slots override if set by route handler.
         let prompt_cache_slots = req
             .effective_prompt_cache_slots
             .unwrap_or(self.prompt_cache_slots);
         let eos_ids = Arc::clone(&self.eos_ids);
         let model_id_for_log = self.model_id.clone();
-        // F6/L18: drainer handle for non-blocking SQLite metric emission.
+        // Drainer handle for non-blocking SQLite metric emission.
         let metrics_drainer = req.metrics_drainer;
-        // M30: ITL ring-buffer handle for per-request latency aggregates.
+        // ITL ring-buffer handle for per-request latency aggregates.
         let itl_store = req.itl_store;
         // per-event DB recorder (TTFT is written by the HTTP handler
         // layer off-runtime; only ITL/kv_cache_bytes are written here).
         let event_recorder = req.event_recorder;
-        // C5 Slice A: hold the FIFO admission guard for the lifetime of the
+        // Hold the FIFO admission guard for the lifetime of the
         // blocking decode (mirrors ArchGenerator). Released on completion.
         let gpu_admission = req.gpu_admission;
-        // A6.3 Option SK: speculative decode cannot honor a stateful
-        // grammar — the K+1 verifier argmax has no per-token mask hook
-        // that aligns with `ConstraintEngine::step_mask`. Rather than
-        // silently dropping the engine (the A6.2 behaviour, safe only
-        // for NoOp), refuse the request with a clear 503 so callers can
-        // either drop `response_format` or use the single-arch generator.
-        // Future work: sequential-mask integration (Option SQ in the
-        // A6.3 spec) would re-evaluate each accepted draft token
-        // through the constraint with rollback on rejection.
+        // Speculative decode cannot honor a stateful grammar: the K+1
+        // verifier argmax has no per-token mask hook that aligns with
+        // `ConstraintEngine::step_mask`. The request is refused, not run
+        // unconstrained. The refusal is an `Error::Other`, which both routes
+        // map to HTTP 503.
         if req.constraint.is_some() {
             tracing::warn!(
                 model_id = %req.model_id,
                 "SpeculativeGenerator: refusing request — response_format \
-                 + speculative decode not supported (A6.3 Option SK)"
+                 + speculative decode not supported"
             );
             return Box::pin(stream::once(async {
                 Err(Error::Other(
@@ -766,7 +762,7 @@ impl Generator for SpeculativeGenerator {
         } else {
             None
         };
-        // A5.6: reconstruct suppressed tool-protocol markers (see
+        // Reconstruct suppressed tool-protocol markers (see
         // ArchGenerator site for rationale).
         let emit_tool_markers = req.emit_tool_markers;
 
@@ -786,7 +782,7 @@ impl Generator for SpeculativeGenerator {
                 }
             };
 
-            // C5 Slice A: hold the FIFO admission guard for the whole decode
+            // Hold the FIFO admission guard for the whole decode
             // (mirrors ArchGenerator). Released on closure exit.
             let _gpu_admission = gpu_admission;
 
@@ -813,15 +809,15 @@ impl Generator for SpeculativeGenerator {
             // transparently — each ProbeStep call appends one id and
             // re-decodes the full prefix.
             //
-            // A10: owned by `StreamingDetokenizer` (UTF-8 token-healing —
+            // Owned by `StreamingDetokenizer` (UTF-8 token-healing —
             // see ArchGenerator site). A multi-byte codepoint split by a
             // speculative round boundary is held until the next ProbeStep
             // completes it.
             let mut detok = crate::detokenizer::StreamingDetokenizer::new(tokenizer_kind);
-            // M30: pre-allocated per-step timestamps for ITL computation.
+            // Pre-allocated per-step timestamps for ITL computation.
             let mut step_timestamps: Vec<Instant> = Vec::with_capacity(n_tokens);
             let mut cancelled = false;
-            // A3: same shape as ArchGenerator — `None` for non-reasoning archs.
+            // Same shape as ArchGenerator — `None` for non-reasoning archs.
             let mut think_splitter = think_splitter;
             let tx_ref = &tx;
             let cancelled_ref = &mut cancelled;
@@ -834,7 +830,7 @@ impl Generator for SpeculativeGenerator {
             // Every speculative loop discards it (see `emit_step`), so a
             // thinking budget's force-close is inert here.
             let mut step_fn = |s: &rmlx_models::ProbeStep| -> Option<u32> {
-                // M30: record step arrival time for ITL computation.
+                // Record step arrival time for ITL computation.
                 timestamps_ref.push(Instant::now());
                 if *cancelled_ref {
                     return None;
@@ -850,7 +846,7 @@ impl Generator for SpeculativeGenerator {
                         String::new()
                     }
                 };
-                // A5.6: reconstruct suppressed Gemma tool markers (see
+                // Reconstruct suppressed Gemma tool markers (see
                 // ArchGenerator site for the full rationale).
                 if emit_tool_markers && text.is_empty() {
                     if let Some(surface) = tokenizer_ref.id_to_token(s.token_id) {
@@ -859,7 +855,7 @@ impl Generator for SpeculativeGenerator {
                         }
                     }
                 }
-                // A3: route through the think-splitter when present.
+                // Route through the think-splitter when present.
                 let (visible, is_thinking) = match think_splitter_ref.as_mut() {
                     Some(sm) => sm.step(&text),
                     None => (text, false),
@@ -1014,7 +1010,7 @@ impl Generator for SpeculativeGenerator {
                 return;
             }
 
-            // M30: compute ITL stats from step timestamps and emit (same as ArchGenerator).
+            // Compute ITL stats from step timestamps and emit (same as ArchGenerator).
             {
                 let itl_opt = compute_itl_stats(&step_timestamps);
                 if let Some((p50, p95, p99, mean, spikes)) = itl_opt {
@@ -1027,7 +1023,7 @@ impl Generator for SpeculativeGenerator {
                         p99_ms = p99,
                         mean_ms = mean,
                         itl_spikes = spikes,
-                        "spec generate: ITL stats (M30)"
+                        "speculative: ITL stats"
                     );
                     if let Some(ref store) = itl_store {
                         let mut ring = store.lock();
@@ -1057,7 +1053,7 @@ impl Generator for SpeculativeGenerator {
                                 step_count,
                             },
                         });
-                        // F9: p99 and spike count as separate metric events.
+                        // P99 and spike count as separate metric events.
                         drainer.try_emit(MetricEvent {
                             model_id: model_id_for_log.clone(),
                             kv_quant: kv_quant_label(kv_quant_override),
@@ -1108,7 +1104,7 @@ impl Generator for SpeculativeGenerator {
                     } else {
                         "length".to_owned()
                     };
-                    // F6/L18: emit KV-cache bytes to the SPSC drainer, read off
+                    // Emit KV-cache bytes to the SPSC drainer, read off
                     // the verifier instance's own counter (see `kv_before`).
                     {
                         // Attribute the byte count to this generation before
@@ -1175,13 +1171,13 @@ impl Generator for SpeculativeGenerator {
                             }
                         }
                     }
-                    // C7: emit Metal allocator high-water at the same boundary.
+                    // Emit Metal allocator high-water at the same boundary.
                     if let Some(peak_bytes) = rmlx_mlx::mlx_peak_memory_bytes() {
                         let peak_mb = peak_bytes / 1_048_576;
                         tracing::info!(
                             model_id = %model_id_for_log,
                             metal_peak_alloc_mb = peak_mb,
-                            "generate: metal peak alloc speculative (C7)"
+                            "generate: metal peak alloc speculative"
                         );
                         if let Some(ref drainer) = metrics_drainer {
                             use crate::metrics_drainer::{MetricEvent, MetricKind};
@@ -1194,7 +1190,7 @@ impl Generator for SpeculativeGenerator {
                             });
                         }
                     }
-                    // A10: flush any withheld multi-byte tail (see
+                    // Flush any withheld multi-byte tail (see
                     // ArchGenerator site for rationale).
                     if !cancelled {
                         match detok.finalize(&tokenizer) {
@@ -1211,7 +1207,7 @@ impl Generator for SpeculativeGenerator {
                             Ok(_) => {}
                             Err(e) => tracing::debug!(
                                 error = ?e,
-                                "A10 detok.finalize error, dropping tail"
+                                "detok.finalize error, dropping tail"
                             ),
                         }
                     }
@@ -1220,7 +1216,7 @@ impl Generator for SpeculativeGenerator {
                         piece: String::new(),
                         done: true,
                         finish_reason: Some(finish_reason),
-                        // A3: see ArchGenerator done-token comment.
+                        // See ArchGenerator done-token comment.
                         is_thinking: false,
                         logprobs: None,
                     };

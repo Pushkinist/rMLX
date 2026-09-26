@@ -302,9 +302,8 @@ impl PinVerdict {
                  identified at all"
             ),
             Self::KernelsMissing { metallib, mlx } => format!(
-                "{} (mlx {}) carries no {NAX_GEMM_KERNEL} kernels — GPU matmul measured \
-                 ~3.8x slower and prefill 2.2-3.7x slower without them, while output and \
-                 decode look normal. Repoint both halves of the pair to {PIN_FILE_DISPLAY} \
+                "{} (mlx {}) carries no {NAX_GEMM_KERNEL} kernels — GPU matmul and prefill \
+                 run slower without them, while output and decode look normal. Repoint both halves of the pair to {PIN_FILE_DISPLAY} \
                  and see docs/FFI.md",
                 metallib.display(),
                 mlx.as_deref().unwrap_or("version unreadable")

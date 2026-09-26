@@ -34,8 +34,8 @@ pub enum Error {
     #[error("identity: cannot parse model path: {0}")]
     IdentityModelPath(String),
 
-    /// The metric name is not registered in the §4 METRICS registry.
-    #[error("unknown metric: '{0}' (not in registry; see docs/METRICS_DB.md §4)")]
+    /// The metric name is not registered in the `docs/METRICS_SCHEMA.md` §4 METRICS registry.
+    #[error("unknown metric: '{0}' (not in registry; see docs/METRICS_SCHEMA.md §4)")]
     UnknownMetric(String),
 
     /// The value cannot be a measurement of the metric it is filed under.
@@ -46,7 +46,7 @@ pub enum Error {
     /// Emitters must send `null` for a measurement they do not have.
     #[error(
         "ingest: {value} is not a plausible '{metric}' — the registry bounds are {bounds} \
-         (see docs/METRICS_DB.md §4). Send null, not a placeholder, for a metric \
+         (see docs/METRICS_SCHEMA.md §4). Send null, not a placeholder, for a metric \
          this run did not measure."
     )]
     ImplausibleValue {

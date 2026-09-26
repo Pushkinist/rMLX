@@ -1,27 +1,21 @@
 //! Process-global toggle for the optional 1-bit QJL residual on
 //! rotor K-side codecs (rotor3_sym / rotor4_sym / k_rotor3 / k_rotor4).
 //!
-//! Mirrors the [`paged_kv_enabled`](crate::paged::paged_kv_enabled) precedent:
-//! CLI > env > default. Default is **off** (`false`).
+//! Precedence: installed CLI value > `RMLX_ROTOR_QJL` > default **off**. The
+//! `rmlx` binary always installs the `--rotor-qjl` value, so the env var is
+//! read only by a caller that installs nothing (tests, library users).
 //!
 //! # Why off by default
 //!
 //! The QJL sideband has no MSL kernel, so turning it on forces the rotor K
-//! encode + dequant onto the CPU on every decode step — the GPU sits idle and
-//! the codec decodes at single-digit (often sub-1) TPS. With QJL off the rotor
-//! K path runs the Metal fused flash-decode-over-quant kernel, recovering
-//! roughly 16-70x decode and 3-4x prefill/TTFT. Measured across two
-//! architectures and a context sweep (short prompts and a long-context needle),
-//! the 1-bit residual bought no measurable accuracy — identical temp=0 output
-//! and identical needle retrieval on vs off. So the fast Metal path is the
-//! default, and QJL is the opt-in fidelity / ablation knob.
+//! encode + dequant onto the CPU on every decode step and the GPU sits idle.
+//! With QJL off the rotor K path runs the Metal fused flash-decode-over-quant
+//! kernel. QJL is the opt-in fidelity / ablation knob.
 //!
 //! # Storage cost
 //!
 //! When enabled, one signed-bit per `head_dim` element per token is appended
-//! to each token's payload. At `head_dim=128` this is 16 bytes/token/head —
-//! amortised by the rotor-table savings (rotor4_sym K-side compression goes
-//! from ~4.7× to ~4.1× with QJL on at `head_dim=128`).
+//! to each token's payload. At `head_dim=128` this is 16 bytes/token/head.
 //!
 //! # Wire format
 //!

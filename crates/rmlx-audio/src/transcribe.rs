@@ -7,8 +7,7 @@
 //!
 //! This is the single transcription core shared by the HTTP
 //! `POST /v1/audio/transcriptions` route and the `rmlx transcribe` CLI. It
-//! replaces the old "first 30 s only" behaviour with a sliding-window seek
-//! loop modelled on `openai-whisper` / `mlx_whisper` `transcribe()`:
+//! runs a sliding-window seek loop modelled on `openai-whisper` / `mlx_whisper` `transcribe()`:
 //!
 //! 1. Decode the input container to 16 kHz mono f32 (caller's responsibility;
 //!    see [`crate::wav::WavDecoder`] + [`resample_to_16k`]).

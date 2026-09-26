@@ -1,7 +1,7 @@
 //! DB connection factory with mandatory PRAGMAs.
 //!
-//! Every open path (`open`, `open_memory`, `open_readonly`) applies the same
-//! PRAGMA set from docs/METRICS_DB.md §8.2 / §10.5.
+//! Every open path applies the same PRAGMA set (`docs/METRICS_DB.md` §2,
+//! §10.5).
 
 use rusqlite::{Connection, OpenFlags};
 
@@ -86,9 +86,9 @@ pub fn open_migrated(path: &std::path::Path) -> Result<Connection> {
 ///   declared read-only archive material and `backups/` holds snapshots; both
 ///   are reachable through `--db`.
 ///
-/// So staleness is reported instead of silently repaired: if the stored
-/// `bests` definition does not match the §4 registry, the caller is told to
-/// run `rmlx metrics doctor --fix`.
+/// So staleness is reported instead of silently repaired: if the stored `bests`
+/// definition does not match the `docs/METRICS_SCHEMA.md` §4 registry, the
+/// caller is told to run `rmlx metrics doctor --fix`.
 ///
 /// The connection is opened read-write rather than with `open_readonly` on
 /// purpose. A read-only connection to a DB with a non-empty `-wal` must create
@@ -108,7 +108,7 @@ pub fn open_checked(path: &std::path::Path) -> Result<Connection> {
     if crate::bests_view::is_stale(&conn)? {
         return Err(Error::Schema(format!(
             "the `bests` view in {} was built from a different metric registry than this \
-             binary's, so a champion read here would not match §4.1 — run \
+             binary's, so a champion read here would not match docs/METRICS_SCHEMA.md §4.1 — run \
              `rmlx metrics doctor --fix` to rebuild it",
             path.display()
         )));
@@ -129,8 +129,8 @@ pub fn open_memory() -> Result<Connection> {
 
 /// Open an existing DB at `path` in read-only mode.
 ///
-/// Used by CLI read commands (`best`, `rank`, `query`, `export`) so they
-/// cannot accidentally mutate the DB while a writer is active.
+/// No CLI command uses it: the read commands (`best`, `rank`, `query`,
+/// `export`) open through [`open_checked`].
 pub fn open_readonly(path: &std::path::Path) -> Result<Connection> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     apply_pragmas(&conn)?;

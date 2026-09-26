@@ -1,4 +1,4 @@
-// ── §2 Legacy-data ingester (docs/METRICS_DB.md §7) ─────────────────────────
+// ── Legacy-data ingester (docs/METRICS_DB.md § "Legacy import") ──────────────
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -82,9 +82,9 @@ pub struct MigrateReport {
     /// Number of `BENCHMARK_RECORDS.md` table cells successfully ingested.
     pub records_md_cells_added: usize,
 
-    /// Metric entries dropped because the archive carried a placeholder the §4
-    /// bounds cannot read as a measurement (a `0.0` in a column the exporting
-    /// tool never measured). Counted, not silent.
+    /// Metric entries dropped because the archive carried a placeholder the
+    /// `docs/METRICS_SCHEMA.md` §4 bounds cannot read as a measurement (a `0.0` in
+    /// a column the exporting tool never measured). Counted, not silent.
     pub metrics_dropped_implausible: usize,
 
     /// Rows skipped because *every* one of their metrics was such a
@@ -97,7 +97,7 @@ pub struct MigrateReport {
 
 /// Replay legacy JSONL + CSV + optional MD records into `conn`.
 ///
-/// Per docs/METRICS_DB.md §7. Idempotent: rows already present (identified
+/// Per docs/METRICS_DB.md § "Legacy import". Idempotent: rows already present (identified
 /// by the `legacy_run_key=<hex>` prefix in `observations.notes`) are skipped.
 pub fn migrate_all(conn: &mut Connection, opts: &MigrateOptions) -> Result<MigrateReport> {
     let mut report = MigrateReport::default();
@@ -295,7 +295,7 @@ fn ingest_jsonl_row(
     // KV quant canonicalization (parser-based, accepts `mixed_*`).
     let kv_quant = identity::canonicalize_kv_quant(&row.kv_quant)?;
 
-    // Build legacy_run_key for idempotency (§7.5).
+    // Build legacy_run_key for idempotency (docs/METRICS_DB.md § "Legacy import").
     let legacy_key = legacy_run_key_jsonl(
         &row.model_path,
         &kv_quant,
@@ -608,11 +608,11 @@ fn migrate_cbb_csv(
                 stddev: None,
             });
         }
-        // CBB writes `0.0` in this column when it ran no quality probe at all.
-        // The number alone cannot tell that apart from a graded run that scored
-        // zero — both are a legitimate `task_pass_at_1` value, so the §4.1
-        // bounds cannot drop it and must not. The column convention is only
-        // known here, at the parse site, so the decision stays here.
+        // CBB writes `0.0` in this column when it ran no quality probe at all. The
+        // number alone cannot tell that apart from a graded run that scored zero — both
+        // are a legitimate `task_pass_at_1` value, so the `docs/METRICS_SCHEMA.md` §4.1
+        // bounds cannot drop it and must not. The column convention is only known here,
+        // at the parse site, so the decision stays here.
         if let Some(v) = parse_f64(ci_task_pass).filter(|v| *v != 0.0) {
             metrics.push(MetricEntry {
                 name: "task_pass_at_1".into(),
@@ -658,7 +658,7 @@ fn migrate_cbb_csv(
         };
 
         // The exporter also writes `0.0` in rate columns it never measured.
-        // Those the §4.1 bounds *can* identify — a rate of zero is not a
+        // Those the `docs/METRICS_SCHEMA.md` §4.1 bounds *can* identify — a rate of zero is not a
         // measurement of anything — so they are dropped generically here,
         // unlike `task_pass_at_1` above whose zero is a real score.
         report.metrics_dropped_implausible += run.drop_implausible_metrics();

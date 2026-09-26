@@ -1,172 +1,86 @@
 # HTTP Server
 
-Reference for the rMLX HTTP server (`crates/rmlx-server`). Covers architecture,
-routes, both API surfaces, streaming, tool calling, embeddings, chat templates,
-the model registry, claim-file enforcement, and the retry envelope.
+Reference for the rMLX HTTP server (`crates/rmlx-server`): routes, the OpenAI
+and Anthropic surfaces, streaming, tool calling, embeddings, audio, chat
+templates, admission, model lifecycle, the claim file and the retry envelope.
 
 ---
 
 ## Overview
 
-rMLX exposes two API surfaces from a single binary:
+One binary serves two API surfaces:
 
-- **OpenAI-compatible** — `POST /v1/chat/completions`, `GET /v1/models`, and
-  related management routes.
-- **Anthropic-compatible** — `POST /v1/messages`.
+- **OpenAI-compatible**: `POST /v1/chat/completions`, `GET /v1/models` and the
+  model lifecycle routes.
+- **Anthropic-compatible**: `POST /v1/messages`.
 
-Both surfaces share one token stream produced by the `Generator` trait. The
-wire schema differs (field names, SSE event types, block shape) but the
-underlying engine call is identical.
+Both drive the same `Generator` token stream. They differ only in the wire
+schema: field names, SSE event types and block shape.
 
 ---
 
 ## Architecture
 
-### Stack
-
-```
-tokio (multi-thread runtime)
-  └─ axum 0.8 Router
-       ├─ middleware::timeout_mw  (per-request wall-clock timeout)
-       └─ handlers
-            ├─ openai.rs    POST /v1/chat/completions, GET /v1/models, …
-            ├─ anthropic.rs POST /v1/messages
-            └─ embeddings.rs POST /v1/embeddings
-```
-
-The server is built by `build_router(state: AppState) -> Router` in `lib.rs`.
-`serve(state, host, port)` binds the TCP listener and calls `axum::serve`. All
-accepted sockets have `TCP_NODELAY` set to prevent Nagle-induced latency on SSE
-frames.
-
-### AppState
-
-`AppState` is cloned cheaply per request (all fields are `Arc`-wrapped). Key
-fields:
-
-| Field | Type | Purpose |
-|---|---|---|
-| `registry` | `Arc<ModelRegistry>` | In-process model catalog |
-| `slots` | `Arc<RwLock<Vec<LoadedModel>>>` | Resident model slots (≤ `max_loaded_models`) |
-| `embed_slot` | `Arc<RwLock<Option<JinaEmbedModel>>>` | Single resident embedding model |
-| `gpu_gate` | `Arc<Mutex<()>>` | Process-wide GPU serialisation lock |
-| `gpu_queue` | `Arc<Semaphore>` | FIFO admission gate (1 permit) |
-| `gpu_pending` | `Arc<AtomicUsize>` | Count of admitted-and-in-flight requests |
-| `max_queue_depth` | `usize` | HTTP 429 threshold; 0 = unlimited |
-| `max_loaded_models` | `usize` | LRU eviction threshold; default 1 |
-| `session_cache` | `Arc<Mutex<SessionCache>>` | Per-session KV-slot reservation |
-| `ttft_store` | `TtftStore` | Rolling ring-buffer of TTFT samples |
-| `itl_store` | `ItlStore` | Rolling ring-buffer of ITL aggregate samples |
-| `metrics_drainer` | `Option<DrainerHandle>` | SPSC channel to the SQLite writer task |
-| `error_counts` | `ApiErrorCounters` | Per-category atomic error counters |
-| `tokens_in` / `tokens_out` | `Arc<AtomicU64>` | Process-lifetime token counters |
-| `mm_cache` | `Arc<MultimodalCache>` | Shared encoder-output cache for vision towers + Whisper. Byte-budget LRU; sized by `--mm-cache-bytes` (default 512 MiB; `0` disables). Hit/miss/insert events are emitted into the `events` table with `op = "mm_cache_hit" / "mm_cache_miss" / "mm_cache_insert"` and `stage = "mm_cache"`. |
-
-### Single-GPU enforcement
-
-Apple Silicon Metal context is exclusive per process. Two mechanisms work in
-tandem:
-
-1. **Claim file** (`/tmp/rmlx.<port>.claim`) — POSIX advisory `flock` prevents
-   two rMLX processes from starting on the same port. See the
-   [Registry and claim](#registry-and-claim) section.
-2. **`gpu_gate` / `gpu_queue`** — inside a process, the `gpu_queue` semaphore
-   (1 permit) serialises all forward passes. Requests acquire the permit in
-   strict FIFO order via `tokio::sync::Semaphore::acquire_owned` and hold it
-   for the entire decode, so only one blocking inference thread runs at a time.
-
-### GPU admission and queue depth
-
-Before entering the semaphore wait, each request increments `gpu_pending` and
-checks it against `max_queue_depth`. If `pending > max_queue_depth` (and the
-cap is non-zero), the request is rejected with HTTP 429 `rate_limit_error`
-immediately, without waiting for the semaphore. This bounds memory consumption
-under sustained load. The acquired semaphore permit is held by an RAII guard
-dropped on every completion path (success, error, timeout, stream abort).
-
-### Adaptive admission controller
-
-Enabled via `--adaptive-admission` (default OFF). When enabled:
-
-1. **Anticipatory 503** — before the FIFO semaphore wait, the controller
-   estimates the end-to-end step latency (admission→final-token wall clock) using
-   a sliding-window 2D OLS regressor (`step_ms ≈ β₀ + β₁·prompt_tokens + β₂·kv_bytes`).
-   If `est_step > 2 × --step-target-ms` (default 500 ms, alias `--ttft-target-ms`),
-   the request is rejected immediately with HTTP 503 `service_unavailable` and
-   `Retry-After: 5`.
-
-2. **Adaptive queue depth** — a background tick loop (every 5 s) adjusts
-   `max_queue_depth` based on a predicted ITL proxy derived from the same
-   regressor:
-   - If `est_itl > --itl-target-ms` (default 50 ms) for 3 consecutive ticks →
-     depth decreases by 1 (scale-down with hold-ticks anti-thrash gate).
-   - If `est_itl < 0.80 × --itl-target-ms` → depth increases by 1
-     (scale-up, deadband prevents oscillation).
-   - Depth is clamped to `[1, 256]`.
-
-3. **StepMetrics** — after each request completes, the route layer records
-   `(prompt_tokens, kv_bytes, step_ms)` into the regressor window.
-
-4. **DB events** — every tick writes a `stage="admission_ctrl"` event to the
-   `events` table with `op` set to the `DecisionReason` string (see
-   `docs/METRICS_DB.md`). When OFF, the existing open-loop FIFO path is
-   byte-identical to the pre-admission-controller behavior.
-
-5. **Adaptive prefill chunk** (`--adaptive-prefill-chunk`, OFF by default) —
-   requires `--adaptive-admission`. The controller also adjusts the
-   process-wide prefill chunk size using the same deadband shape: raises when
-   `est_itl < 0.80 × --itl-target-ms`; lowers after 3 consecutive overload
-   ticks. Bounds: `[32, 2048]` tokens. `DecisionReason` values `prefill_chunk_raise`,
-   `prefill_chunk_lower`, `prefill_chunk_hold` are emitted as DB events.
-
-6. **Graceful shutdown** — the tick loop task is held as `AppState::admission_handle`
-   (`Option<Arc<AdmissionHandle>>`). The `AdmissionHandle` aborts the task on
-   `Drop` (fired when the last `AppState` clone is released on runtime teardown).
-   The 503 admission error counter is `admission_sla_503`, distinct from the
-   `upstream` catch-all engine-error counter.
+SIGINT and SIGTERM shut the server down gracefully, so the claim file is
+removed. A handler panic returns 500. The request body limit is 26 MiB.
 
 ### Compute placement
 
 Inference is synchronous and runs in `tokio::task::spawn_blocking`. Async is
-used only at the HTTP boundary (axum handlers, SSE channel receive) and for
-file I/O. The GPU gate mutex inside each generator ensures at most one blocking
-thread executes a forward pass at any instant.
+used only at the HTTP boundary and for file I/O.
 
 ### Concurrency model — single-stream by design
 
-rMLX serves requests **serially, one generation at a time**. This is a
-deliberate design choice, not a missing feature, and it shapes the latency
-profile under load.
+The server runs one generation at a time. The `gpu_queue` semaphore has one
+permit. Requests take it in FIFO order and hold it for the whole prefill and
+decode. There is no continuous batching and no interleaving across
+sequences: request B makes no progress while request A runs. Per-arch prefill
+chunking bounds one request's memory; it does not schedule other requests
+between chunks.
 
-**What happens with concurrent requests.** The 1-permit `gpu_queue` semaphore
-admits requests in strict FIFO order; the permit is held for the *entire*
-decode and released only on completion. There is **no continuous batching** and
-**no cross-sequence interleave**: the decode loop processes a single sequence,
-and a request's chunked prefill runs to completion before that request's own
-decode begins. Concretely, request B does not make progress while request A is
-running — B waits behind A's whole generation (prefill **and** decode), then
-runs in full. Per-arch prefill chunking (`prefill_chunk_for`) is a
-per-request memory/watchdog bound, not a scheduler that interleaves A's prefill
-chunks with B's decode steps.
+This fits the target workload: one user or one agent, with one generation in
+flight. Under concurrent load, aggregate throughput stays flat and a
+request's latency grows with the queue ahead of it. `max_queue_depth` and the
+adaptive admission controller shed load; neither adds parallelism. To serve
+many users at once, run several rMLX processes behind a load balancer, one
+Metal context each.
 
-**Why this is the right fit.** Apple Silicon gives one exclusive Metal context
-per process, and rMLX enforces a single MLX process per machine (claim file).
-The target workload is **single-user / agent-driving**, where exactly one
-generation is in flight at a time — the regime where a native Rust decode loop
-is at its strongest (no interpreter or async-scheduler overhead between tokens).
-A serial engine wins single-stream latency precisely because it does not pay for
-batching machinery it would not use.
+### GPU admission and queue depth
 
-**Implication under load.** Because requests serialize, aggregate throughput
-stays roughly flat as concurrency rises (no batching speedup), and a request's
-end-to-end latency grows roughly linearly with the number of requests queued
-ahead of it. `max_queue_depth` (HTTP 429) bounds memory under burst, and the
-optional adaptive-admission controller sheds load under SLA pressure — but
-neither adds parallelism. **High-concurrency multi-tenant serving is explicitly
-out of scope**: there is no in-process continuous batching or vLLM-style
-chunked-prefill-interleaved scheduler. To serve many simultaneous users, run a
-pool of rMLX processes behind a load balancer (one Metal context each), rather
-than expecting a single process to scale up internally.
+`engine::admit_request` refuses a request with HTTP 429 `rate_limit_error`
+when `max_queue_depth` is non-zero and `gpu_pending` has reached it. Otherwise
+it counts the request and waits for the permit. `--max-queue-depth` defaults
+to 64. An RAII guard releases the permit on every exit path: success, error,
+timeout and stream abort. Chat, messages and audio requests pass this gate.
+`/v1/embeddings` does not: it never returns 429, and it waits instead on the
+`gpu_gate` mutex that a running generation also holds.
+
+### Adaptive admission controller
+
+`--adaptive-admission` (off by default) adds `crate::admission`:
+
+1. **Anticipatory 503.** Before the FIFO wait, a sliding-window OLS regressor
+   predicts the request's admission-to-final-token time from
+   `(prompt_tokens, kv_bytes)`. When the prediction exceeds twice
+   `--step-target-ms` (default 500 ms; alias `--ttft-target-ms`), the request
+   gets HTTP 503 `admission_sla_exceeded` with `Retry-After: 5`.
+2. **Adaptive queue depth.** A tick every 5 s adjusts `max_queue_depth` from
+   a predicted inter-token latency. It lowers the depth by 1 after 3
+   consecutive ticks above `--itl-target-ms` (default 50 ms). It raises it by 1
+   when the prediction is below 0.80 × the target. The depth stays in
+   `[1, 256]`.
+3. **Step metrics.** Each completed request feeds
+   `(prompt_tokens, kv_bytes, step_ms)` back into the regressor.
+4. **Events.** Each tick writes a `stage = "admission_ctrl"` row to the
+   `events` table, with the `DecisionReason` as `op`.
+5. **Adaptive prefill chunk.** `--adaptive-prefill-chunk` also moves the
+   process-wide prefill chunk with the same deadband, within `[32, 2048]`
+   tokens. Its reasons (`prefill_chunk_raise`, `prefill_chunk_lower`,
+   `prefill_chunk_hold`) go to the log only, not to the `events` table.
+
+The tick task lives in `AppState::admission_handle` and is aborted when the
+last `AppState` clone drops. With the controller off, the FIFO gate above is
+the only admission path.
 
 ---
 
@@ -175,25 +89,31 @@ than expecting a single process to scale up internally.
 | Method | Path | Handler | Description |
 |---|---|---|---|
 | `GET` | `/health` | `health` | Liveness probe. Returns `{"ok":true}`. |
-| `POST` | `/v1/chat/completions` | `openai::chat_completions` | OpenAI chat, streaming + non-streaming. |
+| `POST` | `/v1/chat/completions` | `openai::chat_completions` | OpenAI chat, streaming and non-streaming. |
 | `GET` | `/v1/models` | `openai::list_models` | List registered models. |
-| `POST` | `/v1/models/{id}/load` | `openai::load_model` | Load model synchronously; 200 when resident. |
-| `POST` | `/v1/models/{id}/unload` | `openai::unload_model` | Unload resident model. |
-| `GET` | `/v1/models/{id}/status` | `openai::model_status` | Resident / unloaded status. |
+| `POST` | `/v1/models/{id}/load` | `openai::load_model` | Load a model; returns when it is resident. |
+| `POST` | `/v1/models/{id}/unload` | `openai::unload_model` | Unload a resident model. |
+| `GET` | `/v1/models/{id}/status` | `openai::model_status` | Resident or not, with timestamps. |
 | `POST` | `/v1/embeddings` | `embeddings::embeddings` | Text and image embeddings (jina-v4). |
-| `POST` | `/v1/audio/transcriptions` | `audio::audio_transcriptions` | Whisper STT — transcribe audio to text. |
-| `POST` | `/v1/audio/translations` | `audio::audio_translations` | Whisper STT — transcribe audio to English. |
-| `POST` | `/v1/audio/speech` | `audio::audio_speech` | Qwen3-TTS speech synthesis (returns 501 until codec decoder lands). |
-| `POST` | `/v1/messages` | `anthropic::messages` | Anthropic Messages API, streaming + non-streaming. |
-| `GET` | `/metrics/cache` | `openai::metrics_cache` | Prompt-cache hit/miss/bytes + TTFT ring-buffer — JSON. |
+| `POST` | `/v1/audio/transcriptions` | `audio::audio_transcriptions` | Whisper speech-to-text. |
+| `POST` | `/v1/audio/translations` | `audio::audio_translations` | Whisper speech-to-text, translated to English. |
+| `POST` | `/v1/audio/speech` | `audio::audio_speech` | Qwen3-TTS speech synthesis. |
+| `POST` | `/v1/messages` | `anthropic::messages` | Anthropic Messages API, streaming and non-streaming. |
+| `GET` | `/metrics/cache` | `openai::metrics_cache` | Prompt-cache, TTFT, ITL and error counters as JSON. |
 | `GET` | `/metrics` | `openai::metrics_prometheus` | Prometheus text exposition v0.0.4. |
-| `GET` | `/v1/metrics` | `openai::metrics_v1_summary` | Rolling request-level JSON summary (mlx-vlm compatible). |
+| `GET` | `/v1/metrics` | `openai::metrics_v1_summary` | Rolling request summary as JSON (mlx-vlm shape). |
 
-A per-request timeout middleware wraps every handler. It reads the optional
-`X-Request-Timeout-Seconds` header and caps the effective timeout at
-`AppState::max_timeout_secs` (default 600 s, configurable via
-`--max-timeout-secs`). Setting the cap to 0 disables the timeout entirely.
-Expired requests return HTTP 408 `timeout`.
+The timeout middleware reads an optional `X-Request-Timeout-Seconds` header
+and caps it at `--max-timeout-secs` (default 600). A cap of 0 disables the
+timeout. A header that is not a positive integer gets 400. An expired request
+gets HTTP 408 `timeout`.
+
+`X-Request-Id`, when present, becomes the request's correlation id (trimmed,
+printable ASCII, at most 128 characters). Otherwise the server makes a
+`req-<uuid>`. It is returned in the `X-Request-Id` response header and tagged
+on the request's tracing span. The response `id` is built from it:
+`chatcmpl-<request-id>` on the OpenAI route, `msg_<request-id>` on
+`/v1/messages`.
 
 ---
 
@@ -206,118 +126,92 @@ Expired requests return HTTP 408 `timeout`.
 | Field | Type | Notes |
 |---|---|---|
 | `model` | string (required) | Registry model id. |
-| `messages` | array (required) | `role` + `content`; also `tool_calls`, `tool_call_id`, `name`. |
+| `messages` | array (required) | `role` and `content`; also `tool_calls`, `tool_call_id`, `name`. |
 | `stream` | bool | Default false. |
-| `temperature` | f32 | Four-tier fallback: request → `--default-temperature` → `generation_config.json` → 1.0. |
-| `max_tokens` | u32 | Capped at `--max-tokens-cap`, itself bounded by the structural ceiling of 1 048 576 completion tokens. Over-cap requests are rejected with HTTP 400, never clamped. |
-| `top_p` | f32 | Same four-tier fallback as temperature. |
-| `top_k` | u32 | Falls back to `generation_config.json`. |
+| `temperature`, `top_p`, `top_k`, `min_p` | number | Resolution order in [`SAMPLING.md`](SAMPLING.md) § "Defaults and resolution order". |
+| `repetition_penalty`, `frequency_penalty`, `presence_penalty` | f32 | Same. |
+| `logit_bias` | object | Token id (string key) → finite bias. A bad key or a non-finite value is 400. |
 | `seed` | u64 | |
+| `max_tokens` | u32 | Default 512. Capped at `--max-tokens-cap`, itself bounded by 1 048 576. Over the cap is 400, never clamped. |
 | `stop` | string or array | Stop sequences. |
-| `tools` | array | OpenAI-shaped function specs. |
-| `tool_choice` | string or object | `"auto"` \| `"none"` \| `"required"` or `{type:"function",function:{name:…}}`. |
-| `response_format` | object | `{type:"text"}` \| `{type:"json_object"}` \| `{type:"json_schema",json_schema:{…}}`. |
-| `logprobs` | bool | Return chosen-token logprob per content token. |
+| `tools` | array | OpenAI function specs. |
+| `tool_choice` | string or object | `"auto"`, `"none"`, `"required"` or `{type:"function",function:{name:…}}`. |
+| `response_format` | object | `{type:"text"}`, `{type:"json_object"}` or `{type:"json_schema",json_schema:{…}}`. |
+| `logprobs` | bool | Return the chosen token's logprob for each content token. |
 | `top_logprobs` | u32 | 0–20; requires `logprobs:true`. |
 | `stream_options` | object | `{include_usage:true}` appends a usage chunk before `[DONE]`. |
-| `enable_thinking` | bool | `false` suppresses the open `<think>` block on Qwen3-family models. |
-| `thinking_budget` | u32 | Cap the reasoning channel at N tokens. |
-| `kv_quant` | string | **Issue #26 — per-request KV-codec hot-swap.** Override the KV-cache codec for this request on the resident model, no weight reload. Accepts the same grammar as the `--kv-quant` CLI flag (`"none"`/`"bf16"`, `"k8v4"`, `"k8v8"`, `"planar"`, `"mixed"`, `"mixed_k<kb>g<kg>_v<vb>g<vg>"`, …). `"auto"` selects the per-arch/per-ctx default. Omitted → the server's launch `--kv-quant`. A malformed codec string returns HTTP 400 `invalid_request_error`. |
-| `max_ctx` | i32 | **Issue #26 — per-request context-ceiling override.** Re-size the KV-ring virtual ceiling (lazy-grow, #25) for this request only; must be `> 0`, and is bounded by the checkpoint's positional capacity — a larger value returns HTTP 400 `context_length_exceeded` naming the capacity and the flag that would raise it, never a silent clamp. Omitted → the server's launch `--max-ctx`. No weight touch — a ring realloc only. |
-| `image_max_tokens` | u32 | **Issue #180 — per-request image-token budget for Gemma4-unified vision.** Raises the per-image soft-token budget so dense images (e.g. tables) keep more resolution; must be `> 0`, clamped to the model's safe upper bound (1120). A larger value yields a higher `num_soft_tokens` for the same image (visible in the serve log `Gemma4-unified image preprocessed` / `preprocess: done` lines). Resolution order: this field > `--image-max-tokens` launch flag > the snapshot's `processor_config.json` `max_soft_tokens` (typically 280). Omitted → launch default / config default (behaviour unchanged). No-op for text-only requests and non-Gemma4-unified vision archs. |
-| `logit_bias` | object | Token-id (string key) → logit bias (float). |
-| `frequency_penalty` | f32 | |
-| `presence_penalty` | f32 | |
-| `repetition_penalty` | f32 | Falls back to `generation_config.json`. |
-| `min_p` | f32 | |
-| `echo` | bool | Parsed but rejected with HTTP 501; use `rmlx eval ppl` instead. |
+| `enable_thinking` | bool | `false` selects the template's no-think branch. |
+| `thinking_budget` | u32 | Caps the reasoning channel at N tokens. |
+| `thinking_start_token`, `thinking_end_token` | string | Replace `<think>` / `</think>` for the splitter and the budget injection. |
+| `kv_quant` | string | Per-request KV codec. See "Per-request KV config". |
+| `max_ctx` | i32 | Per-request context ceiling. See "Per-request KV config". |
+| `image_max_tokens` | u32 | Per-image soft-token budget for Gemma4-unified vision. Must be `> 0`; clamped to the model's upper bound. Order: request, `--image-max-tokens`, the snapshot's `processor_config.json`. A no-op elsewhere. |
+| `echo` | bool | `echo:true` is 400; use `rmlx eval ppl` for prompt logprobs. |
 
-Unknown fields are accepted, debug-logged, and discarded. Fields that indicate
-injection intent are explicitly rejected.
+A `functions` field is refused with 400. Any other unknown field is
+debug-logged and ignored.
 
-### Per-request KV-config hot-swap (issue #26)
+### Per-request KV config
 
-`kv_quant` and `max_ctx` change the **KV cache** for one request without
-reloading the model weights. Weights are read-only during decode; the KV cache
-(codec, ring size) is built per request, so a config switch only rebuilds the
-cache — the resident weights stay put. This lets a single `rmlx serve` process
-sweep KV codecs / context ceilings, or pick a KV policy per request (aggressive
-quant for a 128k request, `none` for a short chat) with zero downtime.
+`kv_quant` and `max_ctx` change the KV cache for one request without
+reloading the weights. The cache is built per request, so a resident model
+can sweep codec and context cells, or run a different KV policy per request.
 
-- **Precedence.** A per-request `kv_quant` wins over the launch `--kv-quant`
-  (explicit or `auto`) and over the per-ctx auto policy — exactly like a
-  startup-explicit flag, but scoped to the one request. `"auto"` defers to the
-  generator's per-arch/per-ctx default. Absent → launch default (byte-identical
-  to pre-#26 behavior; zero regression).
-- **Codec-partitioned prefix cache.** The prompt/prefix cache key is namespaced
-  by KV codec, so a prefix cached under one codec **never** serves a request
-  running a different codec (the cached K/V bytes are codec-specific). Two
-  codecs for the same tokens occupy **distinct** cache slots and coexist — a
-  codec switch is a clean cross-codec miss, not a thrash-eviction. See
-  `docs/PROMPT_CACHE.md` § "Codec namespacing".
-- **`max_ctx`** re-sizes the KV-ring virtual ceiling (#25 lazy-grow) for the
-  request. The route resolves it through `rmlx_models::context::resolve_context`
-  — the same function the launch `--max-ctx` goes through — so a value above the
-  checkpoint's positional capacity is refused with that function's message
-  rather than clamped. The `context_length_exceeded` prompt-length guard then
-  uses the resolved per-request ceiling.
-- **Single-MLX claim is unaffected** — one model stays resident throughout.
-- **Anthropic `/v1/messages`** does not expose these fields (stricter wire
-  spec); it always uses the launch default.
-- **Not offered:** a per-request `kv_ssd` toggle. The SSD tier is per-namespace
-  global machinery, not a lookup salt, so it cannot be overridden for one
-  request — see `docs/SSD_TIER.md` § "Live reconfiguration".
+- **`kv_quant`** takes the `--kv-quant` grammar (`"none"`, `"k8v4"`,
+  `"planar"`, `"mixed_k<kb>g<kg>_v<vb>g<vg>"`, …). A malformed string is 400.
+  It wins over the launch `--kv-quant`. `"auto"` names no codec, so the
+  request runs what the server resolved at load. Absent means the launch
+  default.
+- **The prompt cache is partitioned by codec.** A prefix cached under one
+  codec never serves a request on another; see `docs/PROMPT_CACHE.md`
+  § "Codec namespacing".
+- **`max_ctx`** must be `> 0`. The route resolves it through
+  `rmlx_models::context::resolve_context`, the same function as the launch
+  `--max-ctx`. A value above the checkpoint's positional capacity is 400
+  `context_length_exceeded`, never clamped. The prompt-length guard then uses
+  the resolved ceiling.
+- `/v1/messages` does not take these fields; it uses the launch defaults.
+- There is no per-request SSD-tier switch; see `docs/SSD_TIER.md`
+  § "Live reconfiguration".
 
 ### Multimodal content parts — image + native audio input
 
-A user message's `content` may be a string (text) or an array of content parts.
-Image and native-audio parts are extracted from the last user message and routed
-through the model's multimodal towers. The tower output (soft tokens) is
-scattered into the prompt at the corresponding placeholder positions, then decode
-runs from the fused `inputs_embeds` (mirroring mlx-vlm `get_input_embeddings`).
+A user message's `content` is a string or an array of parts. Image and audio
+parts come from the last user message. The tower output is scattered into the
+prompt at the placeholder positions, and decode runs from the fused
+`inputs_embeds`.
 
-| Part `type` | Shape | Tower | Supported arch |
+| Part `type` | Shape | Tower | Architectures |
 |---|---|---|---|
 | `text` | `{type:"text", text:"…"}` | — | all |
 | `image_url` | `{type:"image_url", image_url:{url:"<url\|data-URL>"}}` | SigLIP vision | Gemma4, Gemma3, Qwen3-VL-MoE |
 | `input_image` | `{type:"input_image", image_url:"<url>"}` (mlx-vlm shape) | SigLIP vision | same |
-| `input_audio` | `{type:"input_audio", input_audio:{data:"<base64>", format:"wav"}}` | Conformer audio (USM) / unified encoder-free | **Gemma4** (e4b/26b Conformer; 12B unified) |
+| `input_audio` | `{type:"input_audio", input_audio:{data:"<base64>", format:"wav"}}` | Conformer or encoder-free | Gemma4 |
 
-**Native audio (`input_audio`) — Gemma4.** The base64 payload is decoded
-(`rmlx-audio` symphonia decoder — WAV/MP3/M4A/etc.), downmixed to mono and
-resampled to 16 kHz. The downstream front-end then forks by architecture:
+**Audio.** The `rmlx-audio` decoder (Symphonia: WAV, MP3, M4A and others)
+downmixes to mono and resamples to 16 kHz. The Gemma4 Conformer checkpoints
+run the USM log-mel front-end and the Conformer `audio_tower`. The unified
+encoder-free checkpoint (`Gemma4UnifiedForConditionalGeneration`) cuts the
+waveform into 640-sample frames and projects each with `embed_audio`, one soft
+token per 40 ms; see [`MODELS.md`](MODELS.md). The prompt gets `<|audio>`,
+N × `<|audio|>` and `<audio|>`, and the soft tokens land on the `<|audio|>`
+positions.
 
-- **Conformer (e4b/26b).** The waveform runs through the Gemma4 USM log-mel
-  front-end, then the Conformer `audio_tower` produces `T_sub` audio soft
-  tokens. `T_sub` is derived from the encoder's SSCP downsample
-  (`≈ mel_frames / 4`).
-- **Unified encoder-free (12B `Gemma4UnifiedForConditionalGeneration`).** No mel
-  front-end, no Conformer: the raw 16 kHz waveform is chunked into fixed-length
-  640-sample frames (`extract_waveform_frames`) and each frame is projected by
-  `embed_audio` (`RMSNorm → Linear`, 640→hidden). `num_soft_tokens =
-  ceil(num_samples / 640)` (one soft token per 40 ms frame). See *Unified
-  (encoder-free) audio* in `docs/MODELS.md`.
+- One clip per request; more is an error.
+- Image and audio together in one request is an error.
+- Audio sent to a model with no audio tower is 503 "this model does not
+  accept audio input (no audio tower)". Images sent to a model with no vision
+  tower get the matching "no vision tower" 503.
+- Each `input_audio` part is capped at 16 MiB decoded
+  (`bounds::MAX_INPUT_AUDIO_BYTES`); a larger clip is 400.
 
-In both cases the prompt is spliced with `<|audio>` + `N`×`<|audio|>` +
-`<audio|>` after the leading token, and the soft tokens are scattered at the
-`<|audio|>` positions; the placeholder count always matches the front-end output
-(scatter aligns by construction). One clip per request; >1 is rejected with a
-clear error. Combined image+audio in one request is also rejected with a clear
-error (on both the Conformer and unified arches), never a silent drop.
+### Responses
 
-**Not-supported path.** Submitting `input_audio` to a model without an audio
-tower (text-only, or a vision-only checkpoint) returns **HTTP 503**
-`"this model does not accept audio input (no audio tower)"` — never a silent
-drop. This mirrors the vision path's `503 no vision tower` rejection.
-
-**Bounds.** Each `input_audio` part is capped at 16 MiB decoded
-(`bounds::MAX_INPUT_AUDIO_BYTES`); larger clips return HTTP 400.
-
-**Non-streaming response** (`stream:false`):
+**Non-streaming** (`stream:false`):
 
 ```json
 {
-  "id": "chatcmpl-<hex>",
+  "id": "chatcmpl-<request-id>",
   "object": "chat.completion",
   "created": 1234567890,
   "model": "my-model",
@@ -336,18 +230,18 @@ drop. This mirrors the vision path's `503 no vision tower` rejection.
 }
 ```
 
-`reasoning_content` is omitted when the model produced no thinking text.
-`tool_calls` is omitted when no tool calls were parsed. `logprobs` is omitted
-unless `logprobs:true` was requested. When present, `logprobs.content` holds
-exactly one entry per emitted completion token — including the first token on a
-**prompt-cache exact hit**: the cached first-token logprob is captured
-at store time and replayed on the hit path, so a cache hit returns the same
-number of `logprobs.content` entries as the equivalent cache miss (it previously
-returned N-1).
+`reasoning_content` is omitted when the model produced no thinking text,
+`tool_calls` when no call was parsed, and `logprobs` unless requested. When
+present, `logprobs.content` has one entry per completion token. A prompt-cache
+exact hit replays the first token's logprob stored with the entry, so a hit
+returns as many entries as a miss.
 
-**Streaming response** (`stream:true`):
+A `response_format` request whose grammar never engaged returns 502
+`constraint_not_engaged`; see [`SAMPLING.md`](SAMPLING.md) § "Non-enforcement
+is reported".
 
-Each SSE event carries a `data:` line with a `ChatCompletionChunk` JSON object:
+**Streaming** (`stream:true`): each SSE event is a `data:` line holding a
+`ChatCompletionChunk`:
 
 ```
 data: {"id":"chatcmpl-…","object":"chat.completion.chunk","created":…,"model":"…",
@@ -362,22 +256,16 @@ data: {"id":"chatcmpl-…","object":"chat.completion.chunk","created":…,"model
 data: [DONE]
 ```
 
-When `enable_thinking` is active and the model emits reasoning text, the delta
-carries `reasoning_content` instead of `content` for thinking tokens, and
-`content` for answer tokens. The two fields are mutually exclusive within a
-single chunk.
+- Thinking tokens arrive as `reasoning_content` deltas and answer tokens as
+  `content`. One chunk never carries both.
+- `stream_options.include_usage:true` adds a chunk with `choices:[]` and a
+  `usage` object before `[DONE]`.
+- `logprobs` rides on each content chunk. Chunks with no content token (role
+  preamble, tool call, usage) omit it.
 
-When `stream_options.include_usage:true`, an extra chunk with `choices:[]` and
-a populated `usage` object is appended before `[DONE]`.
-
-**Logprobs in streaming**: per-token `logprobs` appears on each `StreamChoice`
-alongside the content delta. Chunks that carry no content token (role preamble,
-tool_call, usage chunk) omit the field.
-
-**Mid-stream failure**: when generation dies after the stream has started, the
-HTTP status is already `200`, so the failure is reported in the payload — an
-error event in the same envelope the blocking route returns, emitted in place
-of (never alongside) a terminal `finish_reason` chunk:
+**Mid-stream failure.** The status is already 200, so the failure goes in the
+payload. An error event, in the envelope the blocking route uses, replaces the
+terminal `finish_reason` chunk:
 
 ```
 data: {"error":{"message":"…","type":"service_unavailable"}}
@@ -385,209 +273,149 @@ data: {"error":{"message":"…","type":"service_unavailable"}}
 data: [DONE]
 ```
 
-A stream that carries no `finish_reason` chunk did **not** complete. Clients and
-harnesses must treat the absence of a terminal `finish_reason` — or the presence
-of an `error` key — as a failure, never as a short answer. The engine does not
-currently emit `finish_reason:"error"` (it is not in the OpenAI enum); if it
-ever did, the Anthropic mapping below surfaces an unrecognised reason as an
-explicit `"error"` stop reason rather than laundering it into a successful
-`stop_reason`.
+A stream with no `finish_reason` chunk did not complete. Treat a missing
+terminal `finish_reason`, or an `error` key, as a failure, not a short
+answer. The engine emits no `finish_reason:"error"`.
 
 ### Stop-sequence truncation
 
-The `stop` parameter (OpenAI `stop`, Anthropic `stop_sequences`) truncates the
-generated **content** at the first stop-string match. The contract is uniform
-across both API surfaces and both streaming and non-streaming:
+`stop` (OpenAI) and `stop_sequences` (Anthropic) truncate the generated
+content at the first match, on both surfaces, streaming or not:
 
-- The matched stop string is **excluded** from the returned content — output
-  ends just before the match.
-- Generation halts at the boundary; OpenAI sets `finish_reason:"stop"`,
-  Anthropic sets `stop_reason:"stop_sequence"` and names the match in the
-  `stop_sequence` field (non-streaming response body and the streaming
-  `message_delta`).
-- A multi-element `stop` array → the match at the **earliest byte offset**
-  wins; ties break to the **first** string in the array.
-- Matching is on the **detokenized text**, not raw token ids, so a stop string
-  that **straddles token boundaries** (e.g. `"char" + "lie"` for stop
-  `"charlie"`) is detected correctly.
-- In **streaming**, the chunk containing the stop is truncated and no post-stop
-  chunk is emitted. A partial-match tail (text that could still grow into a
-  stop string) is **held back** until it is confirmed not to be a stop, so a
-  straddling stop is never half-emitted.
-- Stop matching applies to the **content / text channel only**. Reasoning
-  (`reasoning_content` / Anthropic `thinking`) is a separate channel and is not
-  truncated by `stop`.
-- **Tool calls are not truncated by stop sequences.** When the model emits a
-  tool call (i.e. `tool_calls` is populated), stop-truncation does not apply to
-  that response — uniform across streaming and non-streaming paths.
+- The matched string is excluded; output ends just before it.
+- OpenAI sets `finish_reason:"stop"`. Anthropic sets
+  `stop_reason:"stop_sequence"` and names the match in `stop_sequence`.
+- With several strings, the earliest byte offset wins; a tie goes to the
+  first string in the array.
+- Matching runs on the detokenized text, so a stop string that straddles a
+  token boundary is found.
+- Streaming holds back a tail that could still grow into a stop string, so a
+  straddling stop is never half-emitted, and nothing follows the stop.
+- Only the content channel is matched; reasoning is not.
+- A response carrying tool calls is not truncated.
 
-The shared matcher lives in `rmlx_server::stop_matcher` (`find_stop_match` for
-non-streaming, `StopMatcher` for streaming). Empty stop strings are ignored.
+`rmlx_server::stop_matcher` holds the matcher: `find_stop_match` for
+non-streaming and `StopMatcher` for streaming. An empty stop string is
+ignored.
 
 ### Anthropic `stop_reason` mapping
 
-The `/v1/messages` route maps the engine's OpenAI-style `finish_reason` to the
-Anthropic `stop_reason` field via `map_stop_reason` in
-`crates/rmlx-server/src/anthropic/route.rs`:
+`map_stop_reason` (`crates/rmlx-server/src/anthropic/route.rs`) maps the
+engine's `finish_reason`:
 
 | Engine `finish_reason` | Anthropic `stop_reason` |
 |---|---|
-| `"stop"` (natural EOS) / `None` (unmarked clean terminal) | `"end_turn"` |
-| `"length"` (token cap) | `"max_tokens"` |
+| `"stop"` or none | `"end_turn"` |
+| `"length"` | `"max_tokens"` |
 | `"tool_calls"` | `"tool_use"` |
-| anything else (unrecognised) | `"error"` |
+| anything else | `"error"` |
 
-Only reasons with an explicit success contract map to a successful stop. An
-unrecognised or future reason maps to an explicit `"error"` stop reason — never
-laundered into `"end_turn"` — so a masked failure cannot be reported as a normal
-completion on `/v1/messages`. A stream that dies mid-flight does not reach this
-mapping at all: it terminates with Anthropic's native `error` event and emits no
-`message_delta` / `message_stop`:
+An unrecognised reason maps to `"error"`, never to `"end_turn"`.
+`"stop_sequence"` comes only from the stop-matching path in `blocking.rs` and
+`streaming.rs`, which bypasses `map_stop_reason`. A stream that dies mid-flight
+ends with Anthropic's native `error` event and no `message_delta` or
+`message_stop`:
 
 ```
 event: error
 data: {"type":"error","error":{"type":"service_unavailable_error","message":"…"}}
 ```
 
-A `/v1/messages` stream without a `message_stop` did not complete. The `type`
-carries this surface's `_error` suffix — matching what `/v1/messages` returns
-for the same fault on the blocking path, not the OpenAI spelling.
-
-`"stop_sequence"` is **never** produced by `map_stop_reason`. It is set
-exclusively by the stop-matching path in `blocking.rs` /
-`streaming.rs` when a `stop_sequences` entry actually matched — and that
-path bypasses `map_stop_reason` entirely. This keeps the two cases cleanly
-separated: real stop-string hit → `stop_reason:"stop_sequence"` +
-`stop_sequence:"<matched>"` (and `null` on the normal path). Natural EOS
-always yields `"end_turn"` with `stop_sequence:null`.
+A `/v1/messages` stream with no `message_stop` did not complete.
 
 ### `GET /v1/models`
 
-Returns the OpenAI-shaped model list:
-
 ```json
-{"object":"list","data":[{"id":"my-model","object":"model","owned_by":"rmlx","loaded":false}]}
+{"object":"list","data":[{"id":"my-model","object":"model","created":0,"owned_by":"rmlx","loaded":false}]}
 ```
 
-All models in the registry are listed regardless of resident status. A
-**resident** entry additionally carries `loaded_at`, `last_used`, and the two
-context numbers the run resolved:
+Every registry model is listed. A resident one also carries `loaded_at` and
+`last_used` (Unix seconds), and, when the architecture exposes
+`max_position_embeddings`, the two context numbers:
 
 | Field | Meaning |
 |---|---|
-| `max_ctx` | The context ceiling in force — what the admission guard enforces and what the KV ring may grow to. |
+| `max_ctx` | The ceiling in force: what the prompt guard enforces and what the KV ring may grow to. |
 | `positional_max` | What the checkpoint can address, RoPE scaling included; the highest a per-request `max_ctx` may ask for. |
 
-Both are **omitted** when the architecture does not expose
-`max_position_embeddings`: the resolver then accepts any `max_ctx`, so
-publishing a bound would state the opposite of the behaviour. The field's
-absence is what says "no limit known".
-
-This is the surface that reports the effective ceiling; the same pair is on the
-`slots: model loaded` log line. See `docs/CLI.md` § "Context ceiling".
+Without `max_position_embeddings` the resolver accepts any `max_ctx`, so both
+fields are omitted. The same pair is on the `slots: model loaded` log line.
+See `docs/CLI.md` § "Context ceiling".
 
 ### Model lifecycle endpoints
 
-- `POST /v1/models/{id}/load` — calls `AppState::ensure_loaded`. Blocks until
-  the model is resident. Returns 200 with `{"id":"…","status":"loaded"}` on
-  success. Returns 404 if the id is not in the registry, 507 on OOM, 503 on
-  loader failure.
+- `POST /v1/models/{id}/load` calls `AppState::ensure_loaded` and returns
+  once the model is resident: 200 `{"ok":true,"model":"<id>"}`. An id outside
+  the registry is 404 `model_not_found`. A load failure is 503
+  `service_unavailable`.
 
-  Accepts an optional JSON body with a
-  `keep_alive` integer field (Ollama / LM-Studio compatible). Negative pins
-  the model forever; `0` unloads after the next request finishes; positive
-  is the idle TTL in seconds. Absent = inherit the slot's current policy
-  (env `RMLX_KEEP_ALIVE` > `--idle-timeout-secs` flag > 15-min default).
+  An optional JSON body takes `keep_alive` (integer seconds, as in Ollama and
+  LM Studio): negative pins the model, `0` unloads after the next request,
+  positive sets the idle TTL. Absent keeps the slot's policy, which comes from
+  `--idle-timeout-secs`, then the `projects.toml` profile, then 15 minutes.
 
   ```bash
-  # Pin "gemma-4-e4b" forever (until the rmlx serve process exits).
   curl -X POST -d '{"keep_alive": -1}' http://127.0.0.1:8080/v1/models/gemma-4-e4b/load
-  # Load + auto-unload after 2 minutes idle.
   curl -X POST -d '{"keep_alive": 120}' http://127.0.0.1:8080/v1/models/gemma-4-e4b/load
   ```
 
-- `POST /v1/models/{id}/unload` — calls `AppState::unload`. Returns 200 with
-  `{"id":"…","status":"unloaded"}` whether or not the model was resident.
-- `GET /v1/models/{id}/status` — returns `{"id":"…","status":"loaded"|"unloaded"}`.
+- `POST /v1/models/{id}/unload` calls `AppState::unload`: 200 `{"ok":true}`
+  when the model was resident, 404 `{"ok":false,"message":"…"}` when not.
+- `GET /v1/models/{id}/status` returns 200
+  `{"id","loaded","loaded_at","last_used","idle_secs"}`, with the last three
+  `null` when not resident. An id outside the registry is 404
+  `model_not_found`.
 
-### Keep-alive on compat routes
+**Slots and eviction.** Up to `--max-loaded-models` (default 1) models stay
+resident. When the slots are full, `ensure_loaded` for another model evicts
+the least recently used one first. Any request can trigger this, not only
+`/load`.
 
-The OpenAI-compatible chat completions route (`/v1/chat/completions`) and
-the Anthropic (`/v1/messages`) route do **not** parse a per-request
-`keep_alive` body field — matching the broader ecosystem (cf. ollama#11458).
-They still **reset** the per-model keep-alive timer on every successful
-`ensure_loaded`, so an active client keeps the model resident without any
-explicit field.
+**Keep-alive on the compat routes.** `/v1/chat/completions` and
+`/v1/messages` take no `keep_alive` field. Each successful `ensure_loaded`
+resets the model's timer, so an active client keeps it resident. The
+embedding and audio models live in their own process-lifetime slots
+(`embed_slot`, `audio_model`, `tts_model`) with no keep-alive TTL.
 
-`/v1/embeddings` (jina) and `/v1/audio/*` (Whisper STT, Qwen3-TTS) use a
-separate process-lifetime cache (`embed_slot`, `audio_model`) that is **not**
-subject to the keep-alive TTL today: those slots stay resident for the
-lifetime of the `rmlx serve` process and do not feed into the per-model
-keep-alive lifecycle. A follow-up may unify them with the main slot
-lifecycle.
-
-### Decode-lease semantics
-
-Every generation path acquires an active-decode lease guard for the
-duration of the response. While the lease is held, the keep-alive timer
-**cannot** unload the model — when the TTL fires it observes the
-non-zero lease count, logs `keep_alive: decode in flight — deferring
-unload`, and reschedules a fresh TTL period. This guarantees:
-
-1. Streaming responses always complete — the SSE stream owns the guard via
-   the `GuardedStream` wrapper, so the guard drops only when the stream is
-   fully consumed or the client disconnects.
-2. Blocking responses hold the guard across the entire `.await`.
-3. The cooperative same-process evict path (loading a different model when
-   `max_loaded_models == 1`) still proceeds — it bypasses the TTL gate
-   because the evicting load goes through `ensure_loaded`'s LRU branch
-   rather than the timer. (A request that arrives mid-evict simply waits
-   for the GPU admission semaphore.)
-
-### Cooperative same-process evict
-
-`POST /v1/models/{id}/load` for a *different* model id while the slot is
-full and `max_loaded_models == 1` immediately unloads the resident model —
-the LM-Studio "Auto-Evict" semantics. The cross-process claim file at
-`/tmp/rmlx.<port>.claim` is **not** affected (the rMLX server still holds
-it for its full lifetime); only the in-process slot is freed. Loading a
-second model in *another* `rmlx serve` process is still blocked by the
-claim file — that's a binary single-MLX-per-machine guarantee.
+**Decode lease.** Every generation holds a decode lease for the life of its
+response. A streaming response holds it through `GuardedStream` until the
+stream is consumed or the client disconnects. While a lease is held, the
+keep-alive timer does not unload the model: it logs `keep_alive: decode in
+flight — deferring unload` and re-arms. LRU eviction does not wait on the
+timer.
 
 ### Error responses
 
-All errors follow the OpenAI error envelope:
+Errors use the OpenAI envelope:
 
 ```json
 {"error":{"message":"…","type":"<error_type>"}}
 ```
 
-Common `error_type` values:
-
-| HTTP | `error_type` | Condition |
+| HTTP | `type` | Condition |
 |---|---|---|
-| 400 | `invalid_request_error` | Bad field, out-of-range param, unsupported feature. |
-| 400 | `context_length_exceeded` | Prompt exceeds the model's effective max context, or a per-request `max_ctx` exceeds the checkpoint's positional capacity. See `docs/CLI.md` § "Context ceiling". |
-| 404 | `not_found_error` | Model id not in registry. |
-| 408 | `timeout` | Per-request wall-clock timeout exceeded. |
-| 429 | `rate_limit_error` | GPU admission queue full. |
-| 500 | `internal_error` | NaN logits, smoke-probe failure, task panic. |
-| 503 | `service_unavailable` | Loader failure or engine error (non-OOM). Counter label: `upstream`. |
-| 503 | `admission_sla_exceeded` | Anticipatory SLA rejection (adaptive admission controller). Includes `Retry-After: 5` header. Counter label: `admission_sla_503`. |
-| 507 | `oom_during_load` | Weight-load OOM. |
-| 507 | `oom_kv_cache` | KV-cache allocation OOM. |
-| 507 | `oom_mid_stream` | Mid-decode OOM. |
+| 400 | `invalid_request_error` | Bad field, out-of-range value, `echo:true`, `functions`, over-cap `max_tokens`. |
+| 400 | `context_length_exceeded` | The prompt exceeds the effective `max_ctx`, or a per-request `max_ctx` exceeds the positional capacity. |
+| 404 | `not_found_error` | Chat or embeddings model not in the registry (`model_not_found` on the lifecycle routes). |
+| 408 | `timeout` | The request timeout expired. |
+| 429 | `rate_limit_error` | The GPU admission queue is full. |
+| 500 | `internal_error` | A handler panic, a prompt-pipeline task panic, or an embeddings preprocessor or compute failure. The audio routes send 500 as `{"error":"…"}`. |
+| 502 | `constraint_not_engaged` | A non-streaming `response_format` request whose grammar never engaged. |
+| 503 | `service_unavailable` | Any load failure, OOM while loading included, and any other engine error. With `--require-smoke-probe` (off by default) a failed smoke probe at load lands here too. Counter: `upstream`. |
+| 503 | `admission_sla_exceeded` | The adaptive controller's anticipatory rejection, with `Retry-After: 5`. Counter: `admission_sla_503`. |
 
-Process-lifetime counters for each category are exposed via `GET /metrics/cache`
-under `error_counts`.
+`/v1/messages` sends the same statuses. `context_length_exceeded`,
+`admission_sla_exceeded`, `timeout`, `invalid_request_error`,
+`not_found_error` and `rate_limit_error` keep the OpenAI strings; 500 is
+`internal_server_error` and 503 is `service_unavailable_error`.
+`GET /metrics/cache` exposes a process-lifetime counter per category under
+`error_counts`.
 
 ### `X-Session-Id` header
 
-When a request includes an `X-Session-Id` header, the value is registered in
-the session cache keyed by `(model_id, session_id)`. This increases the
-effective prompt-cache slot count (`base_slots + active_count`) passed to the
-generator, preventing FIFO eviction from clobbering a live session's KV
-snapshot across turns. See [Session cache](#session-cache).
+A request with `X-Session-Id` registers `(model_id, session_id)` in the
+session cache, which raises the prompt-cache slot count passed to the
+generator. See [Session cache](#session-cache).
 
 ---
 
@@ -600,23 +428,21 @@ snapshot across turns. See [Session cache](#session-cache).
 | Field | Type | Notes |
 |---|---|---|
 | `model` | string (required) | Registry model id. |
-| `max_tokens` | u32 (required) | No default; missing field returns 400. |
-| `messages` | array (required) | `role` + `content` (string or block array). |
-| `system` | string or array | System prompt; injected before the first user turn via chat template. |
-| `temperature` | f32 | Same four-tier fallback as the OpenAI route. |
-| `top_p` | f32 | |
-| `top_k` | u32 | |
+| `max_tokens` | u32 (required) | Missing is 400. |
+| `messages` | array (required) | `role` and `content` (string or block array). `input_audio` blocks carry `source:{type:"base64",data:…}`. |
+| `system` | string or array | System prompt, rendered through the chat template. |
+| `temperature`, `top_p`, `top_k` | number | Same resolution order as the OpenAI route. |
 | `stop_sequences` | array | Stop sequences. |
 | `stream` | bool | Default false. |
-| `tools` | array | Anthropic-shaped: `name`, `description`, `input_schema` (not `parameters`). |
-| `tool_choice` | object | `{type:"auto"|"any"|"tool", name?:"…"}`. |
-| `metadata` | object | Accepted and debug-logged; ignored. |
+| `tools` | array | `name`, `description`, `input_schema`. |
+| `tool_choice` | object | `{type:"auto"\|"any"\|"tool", name?:"…"}`. |
+| `metadata` | object | Accepted and ignored. |
 
 **Non-streaming response**:
 
 ```json
 {
-  "id": "msg-<hex>",
+  "id": "msg_<request-id>",
   "type": "message",
   "role": "assistant",
   "content": [
@@ -630,38 +456,15 @@ snapshot across turns. See [Session cache](#session-cache).
 }
 ```
 
-The `thinking` block is included only when the model produced reasoning text
-(Qwen3-family with `enable_thinking` active). The `tool_use` block is included
-when the model emitted a parseable tool call. In the Anthropic surface,
-`input` is a JSON object — not a JSON-stringified string as in the OpenAI
-`arguments` field.
+The `thinking` block appears only when the model produced reasoning text, the
+`tool_use` block only for a parsed tool call. `input` is a JSON object, not the
+JSON string OpenAI puts in `arguments`.
 
-**Streaming response**:
-
-Events follow the Anthropic streaming protocol:
-
-```
-event: message_start
-data: {"type":"message_start","message":{…}}
-
-event: content_block_start
-data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
-
-event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}
-
-event: content_block_stop
-data: {"type":"content_block_stop","index":0}
-
-event: message_delta
-data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}
-
-event: message_stop
-data: {"type":"message_stop"}
-```
-
-When the model produces thinking text, a `thinking` block precedes the `text`
-block, with `thinking_delta` events carrying the reasoning fragments.
+**Streaming** follows the Anthropic protocol: `message_start`, a `ping`, then
+per block `content_block_start`, `content_block_delta` and
+`content_block_stop`, then `message_delta` and `message_stop`. Thinking text
+arrives in a `thinking` block with `thinking_delta` events, before the `text`
+block. A tool call arrives as a `tool_use` block with `input_json_delta`.
 
 ---
 
@@ -669,24 +472,20 @@ block, with `thinking_delta` events carrying the reasoning fragments.
 
 ### `POST /v1/embeddings`
 
-Supports jina-embeddings-v4 text and image embeddings.
-
-**Request**:
+Serves jina-embeddings-v4 text and image embeddings.
 
 | Field | Type | Notes |
 |---|---|---|
-| `model` | string | Registry model id resolving to a `JinaEmbeddingsV4Model`. |
-| `input` | string, array, or image object | Text: `"string"` or `["a","b"]`. Image: `{"image":"<data-URI|base64|path>"}` or a list of such objects. |
-| `encoding_format` | string | `"float"` (default) or `"base64"`. |
-| `dimensions` | usize | Matryoshka truncation. Must be one of `{128,256,512,1024,2048}`. |
-| `task` | string | LoRA task: `retrieval` (default), `text-matching`, `code`. |
-| `prompt_name` | string | `query` (default) or `passage`. `text-matching` always uses `Query` regardless of this field. |
-| `return_multivector` | bool | Return per-token multi-vector embeddings (`[[f32;128];seq]`) instead of a single pooled vector. |
+| `model` | string | Registry id of a jina-v4 snapshot; another architecture is 400, an unknown id 404. |
+| `input` | string, array, or image object | Text: `"a"` or `["a","b"]`. Image: `{"image":"<data-URI\|base64\|path>"}` or a list of them. |
+| `encoding_format` | string | `"float"` (default) or `"base64"`; `base64` with `return_multivector` is 400. |
+| `dimensions` | usize | Matryoshka truncation to one of the model's sizes. |
+| `task` | string | LoRA task: `retrieval` (default), `text-matching` or `code`. |
+| `prompt_name` | string | `query` (default) or `passage`. `text-matching` always uses `Query`. |
+| `return_multivector` | bool | Per-token multi-vector output instead of one pooled vector. |
 
-Text inputs are prepended with the task prefix `"{Query|Passage}: {text}"` per
-the jina convention. No BOS token is added; `add_special_tokens=false` is used.
-
-**Response**:
+Text gets the prefix `"{Query|Passage}: {text}"` and no special tokens. One
+request embeds all text or all images, not a mix.
 
 ```json
 {
@@ -697,14 +496,10 @@ the jina convention. No BOS token is added; `add_special_tokens=false` is used.
 }
 ```
 
-`embedding` is a `[f32]` array for single-vector float output, `[[f32]]` for
-multi-vector output, or a base64 string when `encoding_format="base64"`.
-
-**Model placement**: the embedding model is not a causal LM and is not placed
-in `AppState::slots`. It resides in `AppState::embed_slot` and is loaded lazily
-on the first embedding request. Per-request `apply_task` swaps the live LoRA
-adapter inside the GPU critical section. Text and image inputs are disjoint —
-a single request embeds either all text or all images, not a mix.
+`embedding` is `[f32]` for one vector, `[[f32]]` for multi-vector output, or
+a base64 string. The embedding model lives in `AppState::embed_slot`, not in
+the LLM slots, and loads on the first request. `apply_task` swaps the LoRA
+adapter inside the GPU critical section.
 
 ---
 
@@ -712,178 +507,74 @@ a single request embeds either all text or all images, not a mix.
 
 ### Parser architecture
 
-Tool-call output is parsed from the model's raw token stream by
-`ToolCallStreamParser`. The parser is arch-specific; the format is detected
-once at registry build time from the snapshot's `chat_template.jinja` source
-and architecture string, then cached in `ModelEntry`.
+`ToolCallStreamParser` parses tool calls out of the raw token stream. The
+format is detected once at registry build from markers in
+`chat_template.jinja`, with the architecture as the fallback, and cached in
+`ModelEntry`.
 
-Three formats are supported:
-
-| `ToolCallFormat` | Architecture | Syntax |
+| `ToolCallFormat` | Used by | Syntax |
 |---|---|---|
-| `Qwen3XmlFunction` | `Qwen3_5MoeForCausalLM` (Qwen3.6) | `<tool_call><function=NAME><parameter=KEY>VALUE</parameter></function></tool_call>` |
+| `Qwen3XmlFunction` | Qwen3.6 | `<tool_call><function=NAME><parameter=KEY>VALUE</parameter></function></tool_call>` |
 | `Qwen3JsonToolCall` | `Qwen3ForCausalLM` (Bonsai) | `<tool_call>{"name":"…","arguments":{…}}</tool_call>` |
-| `GemmaToolCall` | `Gemma4ForConditionalGeneration` | `<|tool_call>call:NAME{key:val}<tool_call|>` |
+| `GemmaToolCall` | `Gemma4ForConditionalGeneration` | `<\|tool_call>call:NAME{key:val}<tool_call\|>` |
 
-For `GemmaToolCall`, the `<|tool_call>`, `<tool_call|>`, and `<|"|>` markers
-are registered as special tokens and stripped by `tokenizer.decode`. The engine
-reconstructs them from raw token ids before feeding the parser.
+Gemma registers `<|tool_call>`, `<tool_call|>` and `<|"|>` as special tokens,
+which `tokenizer.decode` strips. The engine rebuilds them from the token ids
+before the parser sees them.
 
-The parser is stream-friendly: token pieces fed in arbitrary BPE-aligned splits
-produce the same parse result as the same string fed all at once. Multiple
-`<tool_call>` blocks may appear in sequence.
+The parser is split-invariant: any BPE-aligned split of the stream parses the
+same as the whole string. Several `<tool_call>` blocks may follow each other.
 
 ### Template support probe
 
-At registry build, each compiled `ChatTemplate` is probed with a minimal
-one-tool render (`probe_tools_supported`). The result is stored in
-`ModelEntry::tools_supported`. When `false`, tool injection is skipped and the
-request proceeds without tools rather than returning 500.
+At registry build, `probe_tools_supported` renders each template with one
+tool and stores the result in `ModelEntry::tools_supported`. When it is
+`false`, the request runs without tools instead of failing.
 
 ### Multi-turn tool loop
 
-The OpenAI client drives the multi-turn tool loop externally. On each turn:
-
-1. The client sends a request with a `tools` array.
-2. The model emits one or more `<tool_call>` blocks.
-3. The server parses them and returns `tool_calls` in the response with
-   `finish_reason:"tool_calls"`.
-4. The client executes the tools, appends `tool`-role result messages, and
-   sends the next request.
-5. The server renders the full conversation history (including tool results)
-   through the chat template on each turn.
+The client drives the loop. It sends `tools`; the model emits tool-call
+blocks; the server returns them as `tool_calls` with
+`finish_reason:"tool_calls"`; the client runs the tools and sends the results
+as `tool` messages. The server renders the whole history through the chat
+template each turn.
 
 ### `tool_choice=required` / `tool_choice=named` (constrained generation)
 
-When `tool_choice` is `"required"` or a named function (`{type:"function",function:{name:"…"}}`),
-the server engages the **constraint engine** (tokenizer-aware JSON byte-FSM) to force the
-model to emit a valid tool call as bare JSON, bypassing the marker-based stream parser.
+A `"required"` or named `tool_choice` engages the constraint engine to force
+a valid call as bare JSON. `tool_choice_to_schema` builds the schema:
 
-**Schema synthesis** (`tool_choice_to_schema`):
+- **Named**, or **required with one tool**:
+  `{"type":"object","properties":{"name":{"const":"<fn>"},"arguments":<fn-schema>},"required":["name","arguments"]}`.
+- **Required with several tools**: `{"oneOf":[…]}`, one such branch per tool.
 
-- `Named` — builds a single-branch JSON Schema `{"type":"object","properties":{"name":{"const":"<fn>"},"arguments":<fn-schema>},"required":["name","arguments"]}`.
-- `Required` with one tool — same single-branch shape (no `oneOf` wrapper needed).
-- `Required` with multiple tools — synthesises `{"oneOf":[…branches…]}` where each branch is the same single-tool schema for one of the declared functions.
+The `SchemaConstraint` runs with `EngagePolicy::Immediate`, so masking starts
+at the first token. The output has no `<tool_call>` wrapper, so the marker
+parser is bypassed: `bare_json_to_tool_call` turns the text into the
+`tool_calls` envelope. Streaming buffers the JSON and emits one `tool_calls`
+delta at the end. If the constraint cannot be built, for example because the
+named tool is not in `tools`, the request runs unconstrained and returns no
+error.
 
-The constraint is loaded as a `SchemaConstraint` with `EngagePolicy::Immediate` so generation
-begins in constrained mode from the first token.
+### EOF recovery
 
-**Bare-JSON mode**:
+Streaming never completes a partial call. On the non-streaming path, a
+Bonsai-style JSON call cut off mid-body (for example at `max_tokens`) is
+repaired by closing its open strings and brackets; a truncated Gemma call is
+dropped.
 
-Because the constraint engine produces bare JSON output (no `<tool_call>` wrapper), the
-marker-based `ToolCallStreamParser` is bypassed. After generation finishes, the accumulated
-text is parsed by `bare_json_to_tool_call` and wrapped into the standard OpenAI
-`tool_calls` envelope with `finish_reason:"tool_calls"`.
-
-In streaming mode the accumulated bare JSON is buffered internally (not forwarded as content
-chunks) and converted to a `tool_calls` delta at the done-token boundary.
-
-### EOF recovery and the `allow_eof_recovery` invariant
-
-`ToolCallStreamParser` carries an `allow_eof_recovery: bool` flag (default `false`).
-
-**Invariant:**
-- **Streaming path** — `allow_eof_recovery` stays `false`. Recovery logic is never triggered
-  mid-stream to prevent false-positive completion from partial BPE tokens.
-- **Non-streaming / finalize path** — the caller explicitly invokes `parser.finalize()` once
-  all tokens have been consumed. `finalize()` flips `allow_eof_recovery=true` and runs
-  `run_eof_recovery()` exactly once (idempotent on repeated calls).
-
-**Truncation recovery** (`run_eof_recovery`):
-
-- `Qwen3JsonToolCall` (Bonsai) — if generation ended mid-call (e.g. `max_tokens` hit), the
-  pending JSON body is repaired by `balance_truncated_json`, which closes any open strings,
-  braces, and brackets. The repaired JSON is then parsed as a Hermes call. This recovers
-  tool calls that were silently dropped on EOS/length truncation.
-- `Qwen3XmlFunction` — delegates to the existing `finalize_current_call` path.
-- `GemmaToolCall` — truncated blocks are dropped; no recovery (Gemma marker syntax cannot be
-  safely reconstructed from partial state).
-
-`balance_truncated_json` returns `None` when the input is already well-formed (no repair
-needed) and `Some(repaired)` otherwise. It handles mid-string truncation, dangling escape
-sequences, and arbitrarily nested `{}`/`[]` containers.
-
-### Tool normalization
-
-Inbound OpenAI `tools` (with `parameters`) and Anthropic `tools` (with
-`input_schema`) are normalized to a common `NormalizedTool` shape before
-being passed to the chat template renderer. The `PythonCompatFormatter`
-produces Python-compatible JSON spacing (`": "` and `", "`) so that rendered
-tool specs are byte-identical to HuggingFace `apply_chat_template` output.
+OpenAI `parameters` and Anthropic `input_schema` tools render identically.
 
 ---
 
 ## Chat Templates
 
-### Rendering
-
-`ChatTemplate` wraps a minijinja environment compiled from
-`<snapshot>/chat_template.jinja`. It is constructed once per model at registry
-build and is reused across requests.
-
-`ChatTemplate::render(messages, opts)` accepts:
-
-- `messages` — a slice of `ChatMessageTpl` structs (`role`, `content`,
-  optional `tool_calls`, `tool_call_id`, `name`).
-- `opts` — `RenderOpts` containing `bos_token`, `eos_token`,
-  `add_generation_prompt`, `tools`, and `enable_thinking`.
-
-The `{% generation %}` / `{% endgeneration %}` markers used by HuggingFace for
-loss-masking are stripped before compilation (replaced with empty Jinja
-comments) since minijinja rejects unknown statements.
-
-### Python-compatible JSON serialisation
-
-Chat templates commonly pass tool specs through the `| tojson` filter. The
-default minijinja `tojson` produces compact JSON (no spaces), while Python's
-`json.dumps` uses `": "` (colon-space) and `", "` (comma-space). A custom
-`PythonCompatFormatter` replaces the built-in `tojson` filter so rendered tool
-specs are byte-identical to HuggingFace output.
-
-### Thinking mode
-
-`enable_thinking` in `RenderOpts` controls the Qwen3-family `<think>` block:
-
-- `Some(false)` — injects `enable_thinking = false` into the Jinja context,
-  triggering the template's no-think branch (emits a closed `<think></think>`
-  block).
-- `None` or `Some(true)` — leaves the variable undefined; the template falls
-  through to its default, byte-identical to HuggingFace output.
-
-The variable is never defined as `true` — defining it would not change
-behavior relative to `None`, since the template tests `enable_thinking is
-defined and enable_thinking is false`.
-
-Per-request `enable_thinking` takes precedence over `AppState::default_enable_thinking`
-(`--enable-thinking` startup flag), which in turn takes precedence over the
-template default.
-
-**A template is free to ignore the flag, and some do.** Ternary-Bonsai's
-template prefills a closed `<think>\n\n</think>\n\n` on every request
-regardless of `enable_thinking`. The server therefore never infers the
-reasoning channel from the flag: after rendering it reads the prompt with
-`engine::think::prompt_leaves_think_open` and threads the answer as
-`GenerationRequest::prompt_think_open`. See `docs/SAMPLING.md`
-§Thinking-budget enforcement.
-
-### Detokenizer and UTF-8 healing
-
-`StreamingDetokenizer` in `detokenizer.rs` manages the streaming decode loop
-for all architectures. It uses a full-prefix decode model (decode the growing
-token-id prefix at every step, diff against the prior decoded string) rather
-than the HuggingFace `DecodeStream` which has known cross-request state leakage
-issues.
-
-**UTF-8 healing**: byte-level BPE tokenizers (Qwen3.6 uses `ByteLevel` decoder)
-may produce a replacement character U+FFFD (`\u{FFFD}`) when a multi-byte
-codepoint's bytes straddle two token ids. The detokenizer withholds any
-delta that would advance past a `\u{FFFD}`-terminated boundary, accumulating
-further tokens until the codepoint completes. `finalize()` flushes the
-remaining bytes lossy at true end-of-stream.
-
-No leading-space stripping is applied for the current target models (Gemma3/4
-and Qwen3/Qwen3.6), as neither uses the strict SentencePiece `Strip` decoder
-variant that would require it.
+Each model's `chat_template.jinja` renders every request. Tool specs render
+byte for byte as HuggingFace `apply_chat_template` does. A request's
+`enable_thinking` wins over `--enable-thinking`, which wins over the template
+default. A template may ignore the flag, so the server reads the thinking
+channel off the rendered prompt; see `docs/SAMPLING.md` § "Thinking-budget
+enforcement". Streamed deltas never split a UTF-8 code point.
 
 ---
 
@@ -891,64 +582,54 @@ variant that would require it.
 
 ### Model registry
 
-`ModelRegistry` is an in-process catalog of known snapshot directories. It is
-built at startup from either:
+`ModelRegistry` is the in-process catalog of snapshot directories. `rmlx
+serve` builds it from `--model <path>` (the id is the directory name) or
+`--registry <json>`:
 
-- `--model <path>` — single snapshot, id derived from directory basename.
-- `--registry <json>` — a JSON file of the form:
-  ```json
-  {"models":[{"id":"my-id","path":"/path/to/snapshot"},…]}
-  ```
-  The `id` field is optional; if absent, the basename is used.
+```json
+{"models":[{"id":"my-id","path":"/path/to/snapshot"},…]}
+```
 
-For each snapshot, the registry loads (all best-effort — missing files produce
-a `warn!` but do not skip the entry except for `config.json`):
+The `id` is optional and defaults to the directory name. Per snapshot:
 
-- `config.json` — required; determines the architecture string.
-- `chat_template.jinja` — compiled into a `ChatTemplate`. Raw source retained
+- `config.json`: required; gives the architecture.
+- `chat_template.jinja`: compiled into a `ChatTemplate`; the source is kept
   for tool-format detection.
-- `tokenizer.json` — loaded into a `tokenizers::Tokenizer`.
-- `tokenizer_config.json` — provides `bos_token` and `eos_token`.
-- `generation_config.json` — provides per-model sampling defaults
-  (`temperature`, `top_k`, `repetition_penalty`, etc.).
+- `tokenizer.json`: the tokenizer.
+- `tokenizer_config.json`: `bos_token` and `eos_token`.
+- `generation_config.json`: the model's sampling defaults.
 
-Entries are stored in a `BTreeMap` and returned alphabetically by `list()`.
+Everything but `config.json` is best-effort: a missing file logs a `warn!`.
+`list()` returns the entries in id order.
 
 ### Claim file
 
-`try_claim(port) -> Result<MetalClaim, ClaimError>` enforces the single-MLX-
-process-per-Mac constraint.
+`claim::try_claim(port) -> Result<MetalClaim, ClaimError>` guards the Metal
+claim for one port. The claim file is `/tmp/rmlx.<port>.claim`.
 
-On call:
+1. It creates the file with `O_CREAT | O_EXCL`.
+2. It takes an exclusive non-blocking `flock` on it.
+3. It writes its PID into it.
 
-1. Creates `/tmp/rmlx.<port>.claim` with `O_CREAT | O_EXCL`.
-2. Acquires an exclusive non-blocking `flock` (POSIX advisory lock) on the file.
-3. Writes the current PID as a decimal string into the file.
+If the file exists, it reads the holder's PID and probes it with
+`kill(pid, 0)`. A live holder gets `ClaimError::AlreadyHeld { port,
+holder_pid }`. A dead holder (ESRCH) left a stale file. The claimer then
+takes the `flock`, re-reads and re-probes the PID under the lock, and only
+then reclaims the file, with a `warn`. Any doubt refuses rather than
+reclaims. The `flock` is the real gate: a live holder keeps its fd open, so
+the lock fails whatever the PID says.
 
-If the file already exists:
+`MetalClaim` is a RAII guard. Dropping it removes the file; the `flock` goes
+with the fd. `rmlx serve` handles SIGINT and SIGTERM gracefully, so the guard
+drops. After SIGKILL or a crash, the next claimer reclaims the stale file.
 
-- The holder's PID is read from the file body.
-- The PID is probed with `kill(pid, 0)`. If the holder is **alive**,
-  `ClaimError::AlreadyHeld { port, holder_pid }` is returned — a live claim is
-  never stolen (the single-MLX invariant).
-- If the holder is **dead** (ESRCH), the claim is stale: it was left by a
-  process that died without running `Drop` (SIGKILL, crash, power loss). A
-  non-blocking `flock` confirms no live fd still holds the lock, the file is
-  reclaimed (truncated, rewritten with our PID), and a `warn` is logged.
-
-`MetalClaim` is a RAII guard. Dropping it removes the claim file and releases
-the lock (the `flock` is released automatically when the fd closes). The HTTP
-server installs a SIGINT/SIGTERM graceful-shutdown handler so a signalled
-`rmlx serve` runs `Drop` and removes the claim proactively; SIGKILL/crash are
-covered by the dead-PID reclaim above.
-
-Non-server GPU CLI operations (`rmlx info`, `rmlx chat`, `rmlx baseline`) use
-the sentinel port `0xCAFE` (51966) to represent "a single-shot GPU op in
-progress."
-
-The advisory lock prevents two rMLX processes from clobbering each other but
-does not block Python `mlx_lm.server` or other non-rMLX processes. Unload/stop
-hints are printed when `ClaimError` is returned.
+**The claim is per port, not per machine.** `rmlx serve` claims its
+`--port`. The single-shot GPU commands (`rmlx info`, `rmlx chat`,
+`rmlx baseline`) claim the sentinel port `0xCAFE` (51966). A `serve` and a
+`baseline`, or two `serve`s on different ports, each hold their own claim and
+can run on the GPU at once. The lock is advisory and does not see non-rMLX
+MLX processes such as `mlx_lm.server`; the `ClaimError` message prints
+unload and stop hints.
 
 ---
 
@@ -956,137 +637,74 @@ hints are printed when `ClaimError` is returned.
 
 ### Purpose
 
-When a Metal-level error interrupts a streaming response mid-decode (GPU
-watchdog kill, transient dispatch error), the client would otherwise receive a
-truncated stream. The retry envelope transparently reconstructs the response
-without client involvement.
+A transient Metal error can kill a response mid-decode. The retry envelope
+replays the request and delivers the rest of the stream without the client
+seeing the fault.
 
 ### Classification
 
-Errors are classified as `RetryClass::Migratable` or `RetryClass::Fatal`:
+`classify` sorts an error into `RetryClass::Migratable` or `RetryClass::Fatal`
+through `RmlxError::is_migratable` (`crates/rmlx-core/src/error.rs`):
 
-| Class | Conditions | Action |
+| Class | Variants | Action |
 |---|---|---|
-| `Migratable` | `RmlxError::Mlx` (any Metal error), `RmlxError::Other` (engine panic) | Replay permitted. |
-| `Fatal` | every other variant — `SmokeProbe` (NaN logits), `Oom`, `Config`, `Loader`, `Quant`, `Model`, `Io`, `ArchUnsupported`, `KvStorageMismatch`, `SsdTierAlreadyInstalled`, `Unimplemented`, `KvHardCapExceeded`, `KvCeilingExceeded`, `SpeculativePairing` | No retry; surface error. |
+| `Migratable` | `Mlx`, `Other` | Replay. |
+| `Fatal` | every other variant: `Io`, `Config`, `Loader`, `Quant`, `Model`, `SmokeProbe`, `Oom`, `ArchUnsupported`, `KvStorageMismatch`, `SsdTierAlreadyInstalled`, `Unimplemented`, `KvHardCapExceeded`, `KvCeilingExceeded`, `ContextCeilingExceeded`, `SpeculativePairing` | Surface the error. |
 
-`classify` delegates to `RmlxError::is_migratable`, whose match over the error
-enum is **exhaustive with no wildcard arm**. `RmlxError` is `#[non_exhaustive]`,
-so that match must live in the crate that defines the variants (`rmlx-core`);
-there, adding a variant fails the build until it is explicitly classified as
-transient or permanent — a new error can never silently default into a retry
-bucket.
+The match has no wildcard arm and lives in `rmlx-core`, where `RmlxError` is
+defined. A new variant fails the build until it is classified.
 
-**Determinism is the axis, not severity.** The two live engine faults raised
-from an arch's `generate_greedy` sit on opposite sides of it:
-
-- **Empty prompt** → `Error::Model` → `Fatal`. Deterministic: the same request
-  reproduces it every time, so a replay is guaranteed waste. Pinned by
-  `chunked_prefill_rejects_empty_prompt`.
-- **NaN prefill** (`reject_nan_prefill`) → `Error::Other` → `Migratable`.
-  Intermittent — observed at a few percent on an otherwise clean host — so a
-  replay of the same prompt at `temperature = 0` has a real chance of
-  completing, which is the case this envelope exists for. A deterministic NaN
-  (corrupt weights) costs two extra attempts and then surfaces with the same
-  cause.
-
-The `Fatal` row above also lists `SmokeProbe (NaN logits)`. Note that
-`Error::SmokeProbe` currently has **no production constructor**: only the
-variant, its `is_migratable` arm, the two HTTP mappers and tests.
-`--require-smoke-probe` refuses to serve via a plain `String`, never this enum.
-It is classified, not reachable — do not read it as the live comparator for the
-NaN decision.
-
-**What makes the Migratable classification safe** is that the guard is raised
-before the *offending* token reaches `step_fn`. That has two different shapes,
-and only the first is the "empty prefix" one:
-
-- At the six **prefill** sites nothing has been delivered yet, so `delivered` is
-  empty, `skip_count` is 0, and the replay starts from a clean slate.
-- At the one **mid-decode** site (`laguna`) `steps.len()` tokens have already
-  been delivered. They are healthy — the guard fires on the step that produced
-  the NaN row, before its token is pushed — so at `temperature = 0` the replay
-  reproduces exactly that prefix, and `replay_stream`'s prefix-identity
-  assertion is what covers the case where it does not: on divergence it surfaces
-  `root_error`, the real cause, rather than a synthetic message.
-
-`make check-no-decode-swallow` RULE 4 pins the ordering — a `step_fn` call
-before the propagation at a NaN-detection site fails the build, because "errors
-after emitting" is the original bug shape with `Err` substituted for `Ok`.
-
-**Surface class, for alerting.** `Error::Other` has no dedicated HTTP mapping:
-it falls through to **503 `service_unavailable`** and
-`ApiErrorCategory::Upstream`, shared with `Error::Mlx`. So this fault reaches
-clients as an availability signal and never increments `internal_error`. An
-operator who wants to see it must alert on the structured log event — `error =
-%e` with `nan_count` / `max_abs_logit` / `prompt_len` — not on the HTTP error
-category.
+A NaN logit row at prefill is `Other`, so it is replayed; a deterministic one
+surfaces after three attempts as 503 `service_unavailable`. An empty prompt is
+`Model`, so it fails at once.
 
 ### Skip conditions
 
-Token-replay retry is disabled when any of the following hold:
+`retry::is_replayable` turns replay off when:
 
-- `temperature > 0` — decode is non-deterministic.
-- `n > 1` — multiple choices requested.
-- Guided decoding (`constraint` is `Some`) — the FSM resets on every request.
+- `temperature > 0`: the continuation is not deterministic;
+- `constraint` is set (`response_format` or a forced `tool_choice`): the
+  grammar state would restart.
 
-When retry is disabled, the handler calls `generator.generate(req)` directly.
+Without replay, the handler calls `generator.generate(req)` directly.
 
 ### Replay mechanism
 
-`replay_stream(…)` wraps the generator call in a tokio task:
+`replay_stream(…)` runs the generator in a tokio task:
 
-1. Attempt 1 runs with the original `GenerationRequest` (holding the GPU
-   admission permit).
-2. Each delivered token id is appended to `delivered`.
-3. On `Migratable` error: the request is rebuilt from a `RequestPlan` that
-   re-issues the **original** prompt unchanged with the full original
-   `max_tokens`. At `temperature=0` the decode is deterministic, so the engine
-   re-emits the already-delivered tokens as its first `delivered.len()` outputs
-   and then continues past the fault point. The task skips those first
-   `delivered.len()` tokens, asserting prefix identity, and forwards only the
-   new continuation. The delivered tokens are **not** appended to the prompt —
-   doing so would double-count them (consumed as prompt *and* skipped on
-   output), shifting the continuation so the skip compares mismatched positions
-   and every legitimate partial-delivery replay spuriously diverges.
-4. On `Fatal` error or attempt exhaustion: the error is forwarded to the caller.
-5. On channel-send failure (client disconnect): the task exits silently — that
-   is intentional cancellation, not a transient fault.
+1. The first attempt runs the original `GenerationRequest` and holds the GPU
+   admission permit.
+2. Each delivered token id goes into `delivered`.
+3. On a `Migratable` error, the task rebuilds the request from a
+   `RequestPlan`: the original prompt, unchanged, with the original
+   `max_tokens`. At `temperature = 0` the engine re-emits the delivered tokens
+   first. The task skips `delivered.len()` tokens, asserting they match, and
+   forwards the continuation. If they do not match, it surfaces the root error.
+4. On a `Fatal` error, or once the attempts run out, it forwards the error.
+5. If the client is gone (the channel send fails), the task exits quietly.
 
-The default retry limit is 2 retries (3 total attempts).
-
-`RequestPlan` holds only the clonable fields needed to reconstruct the request.
-Non-clonable fields (`constraint`, `gpu_admission`) are excluded: `constraint`
-already disqualifies retry via the skip-condition check; `gpu_admission` is
-released when the first attempt's blocking task exits, and subsequent attempts
-run without it.
-
-The `ReplayStream` owns a `JoinHandle`. Dropping the stream (HTTP client
-cancel) calls `handle.abort()`, stopping the spawned engine task at the next
-`tx.send().await` yield point with no further engine work.
+`DEFAULT_MAX_RETRIES` is 2, so 3 attempts in all. `RequestPlan` holds only
+the clonable fields. It leaves out `constraint`, which already disables replay,
+and `gpu_admission`, which the first attempt releases when its blocking task
+exits. Dropping the `ReplayStream` (a client cancel) aborts the task at its
+next `tx.send().await`.
 
 ---
 
 ## Session Cache
 
-`SessionCache` tracks active sessions keyed by `(model_id, session_id)`. On
-each request carrying `X-Session-Id`:
+`SessionCache` tracks sessions keyed by `(model_id, session_id)`. For a
+request with `X-Session-Id` on either chat route:
 
-1. `cache.touch(key, prompt_len)` is called, returning `true` (hit) or
-   `false` (miss) and updating `last_used`.
-2. `active_count()` is read and added to the base prompt-cache slot count:
-   `effective_slots = base_slots + active_count`. This reserves headroom in the
-   per-arch `PromptCache` so a live session's KV snapshot is not FIFO-evicted
-   before the next turn arrives.
+1. `touch(key, prompt_len)` records the session and its `last_used`.
+2. `effective_prompt_cache_slots` passes `base_slots + active_count()` to
+   the generator. The extra slots keep a live session's KV snapshot from being
+   evicted before its next turn.
 
-When `active_count` reaches `max_sessions` (default 64, configurable via
-`RMLX_SESSION_CACHE_MAX_SESSIONS`), the entry with the oldest `last_used`
-timestamp is evicted before inserting the new session.
-
-KV tensors live inside the per-arch `PromptCache` global; the session cache
-holds only timestamps and prompt lengths. Two sessions always produce distinct
-`PromptCache` lookups keyed by different token sequences. When a model is
-unloaded, all session-cache entries for that model are removed.
+At `max_sessions` (`--session-cache-max-sessions`, default 64) a new session
+evicts the one with the oldest `last_used`. The session cache holds only
+timestamps and prompt lengths; the KV lives in the per-arch `PromptCache`.
+Unloading a model drops its sessions.
 
 ---
 
@@ -1094,238 +712,131 @@ unloaded, all session-cache entries for that model are removed.
 
 ### `GET /metrics/cache` (JSON)
 
-Returns a JSON object. Example response after two requests (one hit, one miss):
-
 ```json
 {
   "models": [
     {
       "model_id": "gemma4-26b",
-      "hits": 1,
-      "misses": 1,
-      "evictions": 0,
-      "bytes": 1048576,
-      "hit_rate": 0.5,
-      "block_hits": 72,
-      "block_misses": 72,
-      "partial_hits": 0,
-      "partial_hit_rate": 0.0,
-      "ssd_hits": 0,
+      "hits": 1, "misses": 1, "evictions": 0, "bytes": 1048576, "hit_rate": 0.5,
+      "block_hits": 72, "block_misses": 72,
+      "partial_hits": 0, "partial_hit_rate": 0.0, "ssd_hits": 0,
       "kv_cache_bytes": 134217728,
       "metal_peak_alloc_bytes": 4294967296,
       "load_phases": {
-        "mmap_ms": 120,
-        "dequant_ms": 340,
-        "gpu_residency_ms": 80,
-        "first_kernel_ready_ms": 25,
-        "total_load_ms": 565
+        "mmap_ms": 120, "dequant_ms": 340, "gpu_residency_ms": 80,
+        "first_kernel_ready_ms": 25, "total_load_ms": 565
       }
     }
   ],
-  "ttft": [
-    { "model_id": "gemma4-26b", "ttft_ms": 312 },
-    { "model_id": "gemma4-26b", "ttft_ms": 298 }
-  ],
-  "itl": [
-    {
-      "model_id": "gemma4-26b",
-      "p50_ms": 15.19,
-      "p95_ms": 23.2,
-      "step_mean_ms": 15.8,
-      "step_count": 163
-    }
-  ],
+  "ttft": [{ "model_id": "gemma4-26b", "ttft_ms": 312 }],
+  "itl": [{ "model_id": "gemma4-26b", "p50_ms": 15.19, "p95_ms": 23.2, "step_mean_ms": 15.8, "step_count": 163 }],
   "tokens_in": 37238,
   "tokens_out": 500,
   "error_counts": {
-    "bad_request": 0,
-    "context_overflow": 0,
-    "not_found": 0,
-    "oom_load": 0,
-    "oom_kv_cache": 0,
-    "oom_mid_stream": 0,
-    "timeout": 0,
-    "upstream": 0,
-    "internal": 0,
-    "rate_limit": 0,
+    "bad_request": 0, "context_overflow": 0, "not_found": 0,
+    "oom_load": 0, "oom_kv_cache": 0, "oom_mid_stream": 0,
+    "timeout": 0, "upstream": 0, "internal": 0, "rate_limit": 0,
     "admission_sla_503": 0
   }
 }
 ```
 
-Top-level fields:
-
-- `models` — array, one entry per currently loaded model. Each entry includes:
-  - `model_id` — logical model identifier.
-  - `hits` / `misses` / `evictions` / `bytes` — prompt-cache lifetime counts
-    and current byte size. Absent when the model has not been used yet.
-  - `hit_rate` — `hits / (hits + misses)`, range `[0.0, 1.0]`.
-  - `block_hits` / `block_misses` — block-level prompt-cache counts.
-  - `partial_hits` / `partial_hit_rate` — partial-prefix reuse counts.
-  - `ssd_hits` — RAM-miss requests served from the SSD KV tier.
-  - `kv_cache_bytes` — KV-cache allocation size from the last request (bytes).
-  - `metal_peak_alloc_bytes` — Metal allocator peak at the time of snapshot.
-  - `load_phases` — model-load timing breakdown (present when the generator
-    tracks it): `mmap_ms`, `dequant_ms`, `gpu_residency_ms`,
-    `first_kernel_ready_ms`, `total_load_ms` (all in milliseconds).
-- `ttft` — rolling ring-buffer of the last 20 TTFT samples across all models,
-  oldest first. Each entry: `{ "model_id": "…", "ttft_ms": <integer> }`.
-  Populated by both streaming and non-streaming completions. Empty until
-  at least one request has produced its first token.
-- `itl` — rolling ring-buffer of per-request ITL aggregates, oldest first.
-  Each entry: `{ "model_id": "…", "p50_ms": <f64>, "p95_ms": <f64>,
-  "step_mean_ms": <f64>, "step_count": <integer> }`.
-- `tokens_in` / `tokens_out` — process-lifetime cumulative prompt and
-  completion token counts.
-- `error_counts` — process-lifetime per-category API error counts. Keys:
-  `bad_request`, `context_overflow`, `not_found`, `oom_load`, `oom_kv_cache`,
-  `oom_mid_stream`, `timeout`, `upstream`, `internal`, `rate_limit`,
-  `admission_sla_503`. The `admission_sla_503` counter is incremented
-  specifically by adaptive-admission anticipatory SLA rejections, distinct
-  from the `upstream` catch-all.
+- `models`: one entry per resident model. `hits`, `misses`, `evictions`,
+  `bytes` and `hit_rate` are the prompt cache's lifetime counts and current
+  size. `block_*` are block-level counts, `partial_*` partial-prefix reuse,
+  `ssd_hits` RAM misses served from the SSD tier. `kv_cache_bytes` is the last
+  request's KV size; `metal_peak_alloc_bytes` the Metal allocator peak.
+  `load_phases` is the load timing, when the generator tracks it.
+- `ttft`: the last 20 TTFT samples across models, oldest first.
+- `itl`: the last 20 per-request inter-token latency aggregates.
+- `tokens_in` / `tokens_out`: process-lifetime prompt and completion tokens.
+- `error_counts`: process-lifetime counts per error category.
 
 ### `GET /metrics` (Prometheus)
 
-Exposes the same data in Prometheus text exposition format v0.0.4. Includes
-SSD-tier histograms for spill and hydrate latency (buckets at 100, 500, 1 000,
-5 000, 10 000, 50 000, 100 000, 500 000, 1 000 000 µs) and per-namespace
-gauges for on-disk bytes and eviction counters.
+The same data in Prometheus text exposition v0.0.4, plus the SSD tier's
+spill and hydrate latency histograms (`HIST_BUCKETS_US`) and its
+per-namespace byte and eviction series.
 
 ### `GET /v1/metrics` (JSON summary)
 
-Rolling request-level summary (mlx-vlm compatible). Includes `uptime_s`,
-`requests_started`, `requests_completed`, `requests_failed`, and a short-window
-decode TPS estimate.
+A rolling request summary in the mlx-vlm shape: `uptime_s`,
+`requests_started`, `requests_completed`, `requests_failed`, `in_flight`,
+`avg_decode_tok_s`, `avg_request_tok_s` and `last_error`.
 
 ---
 
 ## Audio
 
-Audio I/O: Whisper speech-to-text and Qwen3-TTS text-to-speech.
+### Speech-to-text: `/v1/audio/transcriptions` and `/v1/audio/translations`
 
-### Routes
-
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/v1/audio/transcriptions` | Transcribe audio to text in the original language. |
-| `POST` | `/v1/audio/translations` | Transcribe audio and translate to English. |
-| `POST` | `/v1/audio/speech` | Synthesize speech from text. Returns `audio/wav`. |
-
-STT returns HTTP 503 when the server was started without `--whisper-model-path`.
-TTS returns HTTP 503 when started without `--tts-model-path`.
-
-### Multipart form fields
+Both take a multipart form. `translations` translates to English.
 
 | Field | Required | Default | Description |
 |---|---|---|---|
-| `file` | yes | — | Audio bytes. Any Symphonia-supported container (WAV, MP3, FLAC, OGG, AAC/`.m4a`, …). Stereo is downmixed to mono and any sample rate is resampled to 16 kHz internally. |
-| `model` | no | `whisper-large-v3` | Model identifier (logged; routing is fixed to the configured snapshot). |
-| `language` | no | `auto` | BCP-47 language code, or `auto` (default) to detect language automatically via a single SOT decoder step. Unknown explicit codes return 422. |
-| `response_format` | no | `json` | `json` \| `text` \| `verbose_json` \| `srt` \| `vtt`. Unknown values return 422. |
-| `temperature` | no | `0.0` | Decoding temperature in `[0.0, 1.0]`. Malformed or out-of-range values return 422. |
-| `prompt` | no | — | Accepted, ignored at v1. |
-
-### Response formats
-
-Transcription is **long-form**: the engine walks the audio in 30 s windows and
-emits real per-segment timestamps (not a single hardcoded block).
+| `file` | yes | — | Audio in any Symphonia container (WAV, MP3, FLAC, OGG, AAC/`.m4a`, …). Downmixed to mono and resampled to 16 kHz. |
+| `model` | no | `whisper-large-v3` | Logged only; the configured snapshot serves every request. |
+| `language` | no | `auto` | A language code, or `auto` to detect it. An unknown code is 422. |
+| `response_format` | no | `json` | `json`, `text`, `verbose_json`, `srt` or `vtt`. Anything else is 422. |
+| `temperature` | no | `0.0` | In `[0.0, 1.0]`; anything else is 422. |
+| `prompt` | no | — | Accepted and ignored. |
 
 | `response_format` | Body |
 |---|---|
-| `json` (default) | `{"text": "..."}` |
-| `text` | Plain text string. |
-| `verbose_json` | `{"task":"transcribe","language":"en","duration":<seconds>,"text":"...","segments":[{"id","start","end","text"},…]}` |
-| `srt` | SRT subtitle, one cue per segment with real `HH:MM:SS,mmm` times. |
-| `vtt` | WebVTT, one cue per segment with real `HH:MM:SS.mmm` times. |
+| `json` | `{"text": "..."}` |
+| `text` | Plain text. |
+| `verbose_json` | `{"task","language","duration","text","segments":[{"id","start","end","text"},…]}` |
+| `srt` | SRT, one cue per segment. |
+| `vtt` | WebVTT, one cue per segment. |
 
-### Constraints
+- Without `--whisper-model-path` and `--whisper-tokenizer-path`, every request
+  is 503 `{"error":"audio model not configured; set --whisper-model-path"}`.
+- A file over 25 MiB is 422; the transport limit is 26 MiB.
+- A malformed form is 422.
+- No streaming and no word timestamps; timing is per segment.
 
-- Any sample rate / channel count is accepted — the server downmixes to mono and
-  resamples to 16 kHz (linear) before mel extraction.
-- Maximum audio file size: 25 MiB. Transport body limit is 26 MiB (25 MiB + 1 MiB multipart framing).
-- No streaming (SSE timestamps) — deferred to v2.
-- No word-level timestamps — segment-level timing only (real per-segment times).
+`rmlx_audio::transcribe::Transcriber`, shared with `rmlx transcribe`, walks
+the audio in 30 s windows. Each window decodes in timestamp mode with the
+openai-whisper logit filters (`SuppressBlank`, `SuppressTokens`,
+`ApplyTimestampRules`). The emitted timestamps become segments with real
+times. The seek advances to the last timestamp, and the previous window's text
+is fed back as a `<|startofprev|>` prompt. Filler in the zero-padded tail of
+the last window is dropped.
 
-### Model caching
+With `language` absent or `auto`, `WhisperModel::detect_language()` runs one
+SOT decoder step and takes the argmax over the language tokens. On error it
+falls back to English.
 
-The Whisper model + tokenizer are loaded on the **first** request and cached for
-the server lifetime. Subsequent requests skip disk I/O. A server restart is
-required to change the snapshot.
+The Whisper model and tokenizer load on the first request and stay for the
+life of the process; changing the snapshot needs a restart. Audio requests
+pass the same admission gate as chat, and hold the GPU permit for the encode
+and decode.
 
-### Admission
+### Text-to-speech: `/v1/audio/speech`
 
-Audio requests go through the same `admit_request` → `gpu_queue` FIFO semaphore
-as LLM chat requests. They are counted toward `max_queue_depth` and receive HTTP
-429 when the queue is full. The GPU permit is held for the duration of the Whisper
-encode + decode and released on completion.
-
-### 503-when-unset behaviour
-
-If `--whisper-model-path` or `--whisper-tokenizer-path` is absent at startup,
-every audio request returns:
-
-```json
-{"error": "audio model not configured; set --whisper-model-path"}
-```
-
-with HTTP 503.
-
-### Long-form transcription
-
-Audio of any length is transcribed by the shared long-form engine
-(`rmlx_audio::transcribe::Transcriber`, also used by `rmlx transcribe` — one core,
-not two). The engine:
-
-1. Walks the audio in 30 s windows. Each window runs the Whisper decoder in
-   **timestamp mode** with the full openai-whisper logit-filter chain
-   (`SuppressBlank` + `SuppressTokens` + `ApplyTimestampRules`).
-2. Parses the emitted timestamp tokens into segments with real cumulative times,
-   advances the window seek by the last consumed timestamp, and feeds the previous
-   window's text back as a `<|startofprev|>` prompt (previous-text conditioning).
-3. Drops filler hallucinated in the 30 s zero-pad tail of the final short window.
-
-Decoding is greedy at temperature 0 — output is deterministic across runs.
-
-Silero VAD weights remain vendored at
-`crates/rmlx-audio/assets/silero_vad_16k.safetensors` (MIT) for future
-voice-activity gating; the current long-form path uses fixed 30 s windows with
-timestamp-driven seek rather than VAD pre-segmentation.
-
-### `POST /v1/audio/speech` — Qwen3-TTS
-
-Synthesizes mono 24 kHz PCM from text. Returns `Content-Type: audio/wav` (default)
-or `audio/pcm` when `response_format=pcm`.
-
-JSON request body:
+Qwen3-TTS synthesizes mono 24 kHz audio from a JSON body:
 
 | Field | Required | Default | Description |
 |---|---|---|---|
-| `model` | yes | — | Model identifier (e.g. `qwen3-tts`). |
+| `model` | yes | — | Model identifier. |
 | `input` | yes | — | Text to synthesize. |
-| `voice` | no | `serena` | Voice name. Available: `serena`, `vivian`, `ryan`, `aiden`, `eric`, `dylan`, `ono_anna`, `sohee`, `uncle_fu`. |
-| `response_format` | no | `wav` | Output format: `wav` (44-byte RIFF header + PCM-16 LE) or `pcm` (raw f32-LE). |
-| `speed` | no | `1.0` | Accepted but not applied at v1 (codec speed is fixed). |
+| `voice` | no | `serena` | `serena`, `vivian`, `ryan`, `aiden`, `eric`, `dylan`, `ono_anna`, `sohee` or `uncle_fu`. An unknown voice is 422. |
+| `response_format` | no | `wav` | `wav` (RIFF, PCM-16 LE) as `audio/wav`, or `pcm` (raw f32 LE) as `audio/pcm`. |
+| `speed` | no | `1.0` | Accepted and ignored. |
 
-Returns HTTP 503 when `--tts-model-path` is absent. Unknown voice names return 422.
-
-#### Language auto-detection (Whisper)
-
-When `language` is absent or `"auto"` in `/v1/audio/transcriptions`, the handler
-runs `WhisperModel::detect_language()` — a single SOT decoder step followed by
-argmax over the 100 large-v3 language tokens (`<|en|>`=50259 … `<|yue|>`=50358) —
-and uses the detected token to build the SOT sequence. Falls back to English
-(50259) on error.
+Without `--tts-model-path` and `--tts-tokenizer-path` the route is 503 with
+type `not_supported`. Another synthesis failure is 500. The model loads on the
+first request, stays for the life of the process, and holds the GPU permit
+while it synthesizes.
 
 ---
 
 ## See also
 
-- `docs/CLI.md` — `rmlx serve` flags, `rmlx chat`, `rmlx info`, and other
-  subcommands.
-- `docs/MODELS.md` — supported architectures, quantization matrix, snapshot
-  layout.
-- `docs/SPECULATIVE.md` — Eagle3 speculative decoding, chunked prefill,
-  restricted-vocab hot-path.
-- `docs/KV_CACHE.md` — KV cache quantization presets and primitives.
-- `docs/METRICS_DB.md` — SQLite metrics schema, ingest pipeline, operating
-  rules.
+- `docs/CLI.md`: `rmlx serve` flags and the other subcommands.
+- `docs/MODELS.md`: per-architecture facts, including the multimodal towers.
+- `docs/SAMPLING.md`: sampling parameters, constrained decoding and the
+  thinking budget.
+- `docs/SPECULATIVE.md`: speculative decoding.
+- `docs/PROMPT_CACHE.md`: the prompt cache behind `/metrics/cache`.
+- `docs/METRICS_DB.md`: the metrics database the server writes.

@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# B1 — TurboFlash M5 validation + default-ON decision (2026-05-18).
+# TurboFlash validation on an Apple10 (M5) host.
 #
-# NOT a bisect. TheTom commit 67f076f2e is a 4-line default-flip, not a kernel
-# fix — no upstream TurboFlash corruption fix exists. B1 empirically validates
-# rMLX's DISTINCT kernel (q8_0 K + 4-bit Lloyd-Max V, no WHT) on THIS M5 Max,
-# then makes a data-driven default-ON-or-OFF decision.
+# NOT a bisect: upstream's Apple10 default-OFF is a default flip, not a kernel
+# fix. This script validates rMLX's own kernel (q8_0 K + 4-bit Lloyd-Max V,
+# no WHT) on the host it runs on.
 #
 # For each of {Qwen3.6-35B-A3B-8bit (head_dim 256), Bonsai-8B-2bit (head_dim
 # 128)} at --kv-quant k8v4 --max-ctx 32768, prompt prompts/longctx_32k.json,
@@ -16,8 +15,7 @@
 #      both TF on/off:  decode_tps = (n65 - n1) / ((ms65 - ms1) / 1000).
 #
 # Verdict per cell: CORRUPT (diverge / trip-wire / garbage) or CLEAN, plus a
-# TPS delta when CLEAN. The Rust gate / module docs are updated by the
-# executor only if >=+5% bit-exact gain is observed on at least one cell.
+# TPS delta when CLEAN.
 #
 # Output: B1_RESULT lines on stdout + /tmp/b1_tf_*.log serve logs.
 

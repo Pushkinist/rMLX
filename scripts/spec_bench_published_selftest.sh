@@ -254,9 +254,9 @@ biases nothing.
 
 Per request it appends to the run log the events the harness reads back:
 
-  generate_streaming: TTFT (L6)          unless capped by STUB_TTFT_LINES
-  generate: ITL stats (M30)              unless capped by STUB_ITL_LINES
-  generate: host categorical sampler active (A7.2)
+  generate_streaming: TTFT               unless capped by STUB_TTFT_LINES
+  generate: ITL stats                    unless capped by STUB_ITL_LINES
+  generate: host categorical sampler active
                                          unless STUB_SAMPLED=0, capped by
                                          STUB_SAMPLER_LINES
   <kind>_generate: done                  when the serve argv carried a drafter,
@@ -498,17 +498,17 @@ class Handler(BaseHTTPRequestHandler):
                 top_k = int(SAMPLER_TOP_K_PASS2)
             if SAMPLER_TOP_K_AFTER and served >= 2:
                 top_k = int(SAMPLER_TOP_K_AFTER)
-            log(event({"message": "generate: host categorical sampler active (A7.2)",
+            log(event({"message": "generate: host categorical sampler active",
                        "model_id": "stub", "temperature": 0.6, "top_p": 0.95,
                        "top_k": top_k, "min_p": 0.0, "seed": 42919}))
         if TTFT_LINES < 0 or served < TTFT_LINES:
-            log(event({"message": "generate_streaming: TTFT (L6)",
+            log(event({"message": "generate_streaming: TTFT",
                        "model_id": "stub", "ttft_ms": TTFT_MS}))
         if ITL_LINES < 0 or served < ITL_LINES:
             mean = this_gap_ms
             if ITL_MEAN_MS and served >= ITL_MEAN_FROM:
                 mean = float(ITL_MEAN_MS)
-            log(event({"message": "generate: ITL stats (M30)", "model_id": "stub",
+            log(event({"message": "generate: ITL stats", "model_id": "stub",
                        "step_count": TOKENS, "p50_ms": mean, "p95_ms": mean,
                        "p99_ms": mean, "mean_ms": mean, "itl_spikes": 0}))
         if SPECULATIVE or FORCE_DONE:
@@ -536,7 +536,7 @@ set -eu
 # contain before a run is started against it. A real rmlx carries them because
 # it writes them; this stub carries them because it fakes writing them, and a
 # case below removes one to show the check is not decorative.
-# markers: generate_streaming: TTFT | generate: ITL stats (M30)
+# markers: generate_streaming: TTFT | generate: ITL stats
 # markers: generate: host categorical sampler active | cache-type resolved
 # markers: mtp_generate: done
 case "\$1" in
@@ -594,7 +594,7 @@ MARKERLESS_ROOT="${WORK}/repo_markerless"
 mkdir -p "${MARKERLESS_ROOT}/target/release-perf"
 ln -s "${REPO_ROOT}/scripts" "${MARKERLESS_ROOT}/scripts"
 ln -s "${REPO_ROOT}/prompts" "${MARKERLESS_ROOT}/prompts"
-grep -v 'generate: ITL stats (M30)' "${STUB}" >"${MARKERLESS_ROOT}/target/release-perf/rmlx"
+grep -v 'generate: ITL stats' "${STUB}" >"${MARKERLESS_ROOT}/target/release-perf/rmlx"
 chmod +x "${MARKERLESS_ROOT}/target/release-perf/rmlx"
 
 # A port this host is not already using. Probed rather than assumed: a foreign

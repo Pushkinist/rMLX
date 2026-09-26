@@ -13,7 +13,7 @@
 //! that nothing read could only ever drift from the one that runs, so it was
 //! removed rather than kept in sync by hand. Codec coverage and the
 //! reachability rule are documented where the live table is: see
-//! `docs/KV_QUANT.md` § "Fused-QK head-major K storage".
+//! `docs/KV_FUSED_KERNELS.md` § "Fused-QK head-major K storage".
 
 use rmlx_core::error::Result;
 use rmlx_core::DispatchPolicy;

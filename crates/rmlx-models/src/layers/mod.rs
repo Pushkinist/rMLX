@@ -11,7 +11,7 @@
 //! - `Linear` — plain bf16 or quantized (affine-int / mxfp8).
 //! - `Embedding` — plain or quantized; also usable as tied-weight lm_head.
 //! - `Mlp` — dense gate-up-down FFN with pluggable activation.
-//! - `MoeBlock` — stub (Stage 2 / Qwen3 territory).
+//! - `MoeBlock` — unimplemented stub; the MoE archs use their own paths.
 
 #![allow(clippy::float_cmp, clippy::implicit_hasher)]
 

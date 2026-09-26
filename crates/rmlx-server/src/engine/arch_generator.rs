@@ -89,7 +89,7 @@ pub struct ArchGenerator {
     /// The checkpoint's context limits. A per-request `max_ctx` override is
     /// resolved against these by the route layer.
     context_limits: rmlx_models::context::ContextLimits,
-    /// A10: detokenization family classified from `tokenizer.json`'s
+    /// Detokenization family classified from `tokenizer.json`'s
     /// `decoder` node (mirrors mlx-lm). Drives the per-arch leading-space
     /// rule in the streaming UTF-8 token-healer. The byte-level withholding
     /// guard applies regardless of kind.
@@ -130,8 +130,7 @@ impl ArchGenerator {
     /// Load weights, tokenizer, and derive `model_id` from the snapshot
     /// directory basename.
     ///
-    /// `device = Device::Cpu` is the safe default until the S1.8
-    /// thread-exhaustion bug on Metal is resolved (Stage 2).
+    /// The device comes from `cfg`.
     pub fn from_snapshot(
         model_dir: &Path,
         cfg: &ModelLoadConfig,
@@ -235,7 +234,7 @@ impl ArchGenerator {
         let tokenizer = tokenizers::Tokenizer::from_file(&tk_path)
             .map_err(|e| Error::Other(format!("load tokenizer: {e}")))?;
 
-        // A10: classify the detokenization family from tokenizer.json's
+        // Classify the detokenization family from tokenizer.json's
         // `decoder` node (same heuristic mlx-lm uses). Used only for the
         // per-arch leading-space rule; the UTF-8 withholding guard is
         // unconditional. A parse failure is non-fatal — fall back to
@@ -250,7 +249,7 @@ impl ArchGenerator {
         tracing::debug!(
             model_id = %model_id,
             ?tokenizer_kind,
-            "ArchGenerator: classified detokenizer family (A10)"
+            "ArchGenerator: classified detokenizer family"
         );
 
         // Resolve the context bounds through the single resolver, so the
@@ -472,7 +471,7 @@ impl ArchGenerator {
             tokenizer: Arc::new(tokenizer),
             device,
             model_id,
-            // C4: shared process-wide GPU gate injected by the loader so the
+            // Shared process-wide GPU gate injected by the loader so the
             // serialisation critical section in `generate` blocks across ALL
             // resident models (single Metal context per process).
             _lock: gpu_gate,
@@ -567,7 +566,7 @@ impl Generator for ArchGenerator {
 
         let model = Arc::clone(&self.model);
         let tokenizer = Arc::clone(&self.tokenizer);
-        // A10: copied into the blocking decode thread for the streaming
+        // Copied into the blocking decode thread for the streaming
         // UTF-8 token-healer (drives the per-arch leading-space rule).
         let tokenizer_kind = self.tokenizer_kind;
         let device = self.device;
@@ -617,39 +616,39 @@ impl Generator for ArchGenerator {
                 "generate: per-request max-ctx override active"
             );
         }
-        // F2: capture effective_max_ctx for drainer MetricEvent.ctx_max field.
+        // Capture effective_max_ctx for drainer MetricEvent.ctx_max field.
         let effective_max_ctx_val = self.effective_max_ctx as i64;
-        // N2: route handler sets effective_prompt_cache_slots = base + active_sessions
+        // Route handler sets effective_prompt_cache_slots = base + active_sessions
         // when an X-Session-Id header is present. Use the override if supplied.
         let prompt_cache_slots = req
             .effective_prompt_cache_slots
             .unwrap_or(self.prompt_cache_slots);
         let eos_ids = Arc::clone(&self.eos_ids);
-        // F6/L18: drainer handle for non-blocking SQLite metric emission.
+        // Drainer handle for non-blocking SQLite metric emission.
         let metrics_drainer = req.metrics_drainer;
-        // M30: ITL ring-buffer handle for per-request latency aggregates.
+        // ITL ring-buffer handle for per-request latency aggregates.
         let itl_store = req.itl_store;
         // per-event DB recorder for events-table ITL/kv_cache writes.
         // TTFT is written by the HTTP handler layer off-runtime.
         let event_recorder = req.event_recorder;
-        // C5 Slice A: hold the FIFO admission guard (permit + pending-count
+        // Hold the FIFO admission guard (permit + pending-count
         // RAII) for the lifetime of the blocking decode. Moving it into the
         // spawn_blocking closure releases the permit — and decrements
         // `gpu_pending` — exactly when generation finishes (success/error).
         // `None` for non-route callers (unit tests, internal probes).
         let gpu_admission = req.gpu_admission;
-        // A6.2: optional sampler constraint engine (NoOp in A6.2, real
-        // json_object grammar in A6.3+). `None` means the hot decode path
-        // is identical to pre-A6.2 — see `generate_greedy` decode loops.
+        // Optional sampler constraint engine (the route's json_object or
+        // json_schema grammar). `None` skips the mask entirely in the
+        // `generate_greedy` decode loops.
         let mut constraint = req.constraint;
         if constraint.is_some() {
-            tracing::debug!(model_id = %req.model_id, "generate: constraint engine active (A6.2)");
+            tracing::debug!(model_id = %req.model_id, "generate: constraint engine active");
         }
         // Optional `X-Session-Id` header; `None` for most clients — the request
         // correlation id comes from the inherited `request` span, not from here.
         // Echoed on the never-engaged warn as a secondary key when present.
         let session_id_for_log = req.session_id.clone();
-        // A7.2: mirror the resolved sampling knobs into the rmlx-models
+        // Mirror the resolved sampling knobs into the rmlx-models
         // `SamplerConfig` (rmlx-models must not depend on rmlx-server). The
         // per-request `Pcg32` is created ONCE here and threaded through every
         // decode step so the random stream is contiguous and reproducible.
@@ -672,10 +671,10 @@ impl Generator for ArchGenerator {
                 top_k = sampler_cfg.top_k,
                 min_p = sampler_cfg.min_p,
                 seed = sampler_cfg.seed_or_default(),
-                "generate: host categorical sampler active (A7.2)"
+                "generate: host categorical sampler active"
             );
         }
-        // A7.3: logit-penalty config from per-request sampling params.
+        // Logit-penalty config from per-request sampling params.
         // `token_history` is per-request; starts empty each generation.
         let penalty_cfg = rmlx_models::PenaltyConfig {
             rep_penalty: req.sampling.repetition_penalty,
@@ -691,13 +690,13 @@ impl Generator for ArchGenerator {
                 presence_penalty = penalty_cfg.presence_penalty,
                 frequency_penalty = penalty_cfg.frequency_penalty,
                 logit_bias_len = penalty_cfg.logit_bias.len(),
-                "generate: logit penalties active (A7.3)"
+                "generate: logit penalties active"
             );
         }
-        // A6.3: handle for the step_fn closure to push `is_thinking` into
+        // Handle for the step_fn closure to push `is_thinking` into
         // the constraint after each emitted token.
         let is_thinking_handle = req.is_thinking_handle;
-        // A5.6: reconstruct suppressed tool-protocol special-token markers
+        // Reconstruct suppressed tool-protocol special-token markers
         // into the decoded stream so the response parser can see them.
         let emit_tool_markers = req.emit_tool_markers;
         // per-request thinking budget + pre-resolved thinking-end-token id.
@@ -712,7 +711,7 @@ impl Generator for ArchGenerator {
         // open and the model resumes reasoning, `false` when it closed one (or
         // never opened one) and the model answers directly.
         let splitter_open = req.prompt_think_open;
-        // A3: build the thinking-block splitter for reasoning-capable archs.
+        // Build the thinking-block splitter for reasoning-capable archs.
         // Non-reasoning archs get `None` here and bypass the matcher in step_fn.
         let supports_thinking = self.model.supports_thinking();
         let think_splitter: Option<ThinkSplitter> = if supports_thinking {
@@ -788,19 +787,19 @@ impl Generator for ArchGenerator {
                     tracing::warn!(
                         model_id = %model_id_for_log,
                         "ArchGenerator: concurrent generation — waiting for lock \
-                         (Stage 1 allows only one inflight generation at a time)"
+                         (one inflight generation at a time)"
                     );
                     lock.lock()
                 }
             };
 
-            // C5 Slice A: keep the FIFO admission guard alive for the whole
+            // Keep the FIFO admission guard alive for the whole
             // blocking decode. Dropping it here (closure exit) releases the
             // semaphore permit to the next FIFO waiter AND decrements
             // `gpu_pending`, on every exit path (return, panic-unwind, normal
             // completion). With the 1-permit semaphore upstream only one
             // request is ever in this closure, so the `try_lock` above always
-            // succeeds — the gpu_gate stays as C4 cross-model defense.
+            // succeeds — the gpu_gate stays as the cross-model defense.
             let _gpu_admission = gpu_admission;
 
             tracing::debug!(model_id = %model_id_for_log, "generate: blocking thread started");
@@ -822,7 +821,7 @@ impl Generator for ArchGenerator {
             // Avoids DecodeStream because of the cross-request panic
             // documented in 1cc775f (state was leaking between requests).
             //
-            // A10: the full-prefix decode + byte-diff is now owned by
+            // The full-prefix decode + byte-diff is now owned by
             // `StreamingDetokenizer`, which adds the UTF-8 token-healing
             // withholding guard (never emit / advance past a `�`-terminated
             // boundary — a multi-byte codepoint split across two token ids)
@@ -830,7 +829,7 @@ impl Generator for ArchGenerator {
             // already-complete codepoints stay byte-identical to pre-A10.
             let mut detok = crate::detokenizer::StreamingDetokenizer::new(tokenizer_kind);
 
-            // M30: pre-allocated timestamp vec for per-token step timing.
+            // Pre-allocated timestamp vec for per-token step timing.
             // Capacity = n_tokens so no realloc during decode (constraint: pre-allocate).
             // Timestamps are collected in step_fn and converted to intervals post-decode.
             let mut step_timestamps: Vec<Instant> = Vec::with_capacity(n_tokens);
@@ -839,7 +838,7 @@ impl Generator for ArchGenerator {
             // away; generate_greedy will still push to `steps` but the sends are
             // skipped by the early-return below.
             let mut cancelled = false;
-            // A3: think_splitter is `None` for non-reasoning archs; the
+            // think_splitter is `None` for non-reasoning archs; the
             // step_fn closure pattern-matches on the ref and short-circuits.
             let mut think_splitter = think_splitter;
             let tx_ref = &tx;
@@ -855,7 +854,7 @@ impl Generator for ArchGenerator {
             // so GPU work and HTTP serialise+flush overlap; cap=1 was the prior
             // setting and forced strict per-token serialisation, costing ~10ms/token.
             let tokenizer_ref = tokenizer.clone();
-            // A10: full-prefix decode → byte-diff with UTF-8 token-healing,
+            // Full-prefix decode → byte-diff with UTF-8 token-healing,
             // owned by `StreamingDetokenizer`. `step` returns "" when the
             // current token leaves a multi-byte codepoint incomplete; the
             // tail is flushed once at end-of-stream into the `done` sentinel.
@@ -868,7 +867,7 @@ impl Generator for ArchGenerator {
             // `Option`-discriminant + bool check, so the hot loop is
             // unchanged when no budget is set.
             let mut step_fn = |s: &rmlx_models::ProbeStep| -> Option<u32> {
-                // M30: record step arrival time for ITL computation.
+                // Record step arrival time for ITL computation.
                 // Instant::now() on macOS is a single rdtsc-equivalent syscall,
                 // ~3 ns; negligible vs the 8–15 ms decode step.
                 timestamps_ref.push(Instant::now());
@@ -886,7 +885,7 @@ impl Generator for ArchGenerator {
                         String::new()
                     }
                 };
-                // A5.6: the Gemma-4 tool markers (`<|tool_call>`,
+                // The Gemma-4 tool markers (`<|tool_call>`,
                 // `<tool_call|>`, `<|"|>`) are special tokens stripped by
                 // `decode(skip_special=true)`, so `text` is empty for them.
                 // When a tool parser is active, reconstruct the marker
@@ -902,7 +901,7 @@ impl Generator for ArchGenerator {
                         }
                     }
                 }
-                // A3: route the visible piece through the think-splitter
+                // Route the visible piece through the think-splitter
                 // state machine when the model architecture supports
                 // reasoning tokens. Non-reasoning archs bypass the
                 // matcher entirely and emit `is_thinking = false`.
@@ -910,7 +909,7 @@ impl Generator for ArchGenerator {
                     Some(sm) => sm.step(&text),
                     None => (text, false),
                 };
-                // A6.3: propagate is_thinking into the constraint engine
+                // Propagate is_thinking into the constraint engine
                 // BEFORE the next decode step calls `advance`. The
                 // engine state is consulted on each `advance` to decide
                 // whether to scan for `{` engagement; while thinking we
@@ -965,7 +964,7 @@ impl Generator for ArchGenerator {
                 None
             };
 
-            // A6.2: thread the per-request constraint into the arch-dispatched
+            // Thread the per-request constraint into the arch-dispatched
             // decode. We materialise `Option<&mut dyn ConstraintEngine>` from
             // the boxed value with an explicit `as_mut().map(...)` to avoid the
             // `as_deref_mut` lifetime-inference issue (the trait object's
@@ -1172,10 +1171,10 @@ impl Generator for ArchGenerator {
                 return;
             }
 
-            // N19: emit per-request prompt-cache stats to tracing after generation.
+            // Emit per-request prompt-cache stats to tracing after generation.
             // Reads the arch-specific global static (no lock contention with inference
             // since we are outside generate_greedy at this point).
-            // F6/L18: also emit via SPSC drainer for SQLite persistence.
+            // Also emit via SPSC drainer for SQLite persistence.
             {
                 let cs_opt = model.cache_stats();
                 if let Some(cs) = cs_opt {
@@ -1191,9 +1190,9 @@ impl Generator for ArchGenerator {
                         prompt_cache_misses = cs.misses,
                         prompt_cache_bytes = cs.bytes,
                         prompt_cache_hit_rate = hit_rate,
-                        "generate: prompt-cache stats (N19)"
+                        "generate: prompt-cache stats"
                     );
-                    // F6/L18: route prompt-cache stats to SQLite via SPSC drainer.
+                    // Route prompt-cache stats to SQLite via SPSC drainer.
                     if let Some(ref drainer) = metrics_drainer {
                         let kv_label = kv_quant_label(kv_quant_override);
                         let ts = spsc_ts();
@@ -1271,11 +1270,11 @@ impl Generator for ArchGenerator {
                 }
             }
 
-            // N16: emit per-request KV-cache bytes to tracing.
+            // Emit per-request KV-cache bytes to tracing.
             // Reads the counter on this model instance, written by
             // generate_greedy at request boundary — no lock contention with
             // inference at this point.
-            // F6/L18: also emit via SPSC drainer for SQLite persistence.
+            // Also emit via SPSC drainer for SQLite persistence.
             {
                 // Attribute the byte count to this generation before recording
                 // it: an unchanged store sequence means the readable figure is
@@ -1319,9 +1318,9 @@ impl Generator for ArchGenerator {
                         model_id = %model_id_for_log,
                         quant_mode = quant_mode_owned.as_str(),
                         kv_cache_bytes = kv_bytes,
-                        "generate: kv-cache bytes (N16)"
+                        "generate: kv-cache bytes"
                     );
-                    // F6/L18: route kv_cache_bytes to SQLite via SPSC drainer.
+                    // Route kv_cache_bytes to SQLite via SPSC drainer.
                     if let Some(ref drainer) = metrics_drainer {
                         use crate::metrics_drainer::{MetricEvent, MetricKind};
                         drainer.try_emit(MetricEvent {
@@ -1353,13 +1352,13 @@ impl Generator for ArchGenerator {
                         }
                     }
                 }
-                // C7: emit Metal allocator high-water at the same request boundary.
+                // Emit Metal allocator high-water at the same request boundary.
                 if let Some(peak_bytes) = rmlx_mlx::mlx_peak_memory_bytes() {
                     let peak_mb = peak_bytes / 1_048_576;
                     tracing::info!(
                         model_id = %model_id_for_log,
                         metal_peak_alloc_mb = peak_mb,
-                        "generate: metal peak alloc (C7)"
+                        "generate: metal peak alloc"
                     );
                     if let Some(ref drainer) = metrics_drainer {
                         use crate::metrics_drainer::{MetricEvent, MetricKind};
@@ -1374,7 +1373,7 @@ impl Generator for ArchGenerator {
                 }
             }
 
-            // M30: compute ITL p50/p95/mean from per-step timestamps and emit.
+            // Compute ITL p50/p95/mean from per-step timestamps and emit.
             //
             // Computed once, at request end — never inside the hot decode loop.
             // step_timestamps contains one Instant per produced token; intervals
@@ -1392,7 +1391,7 @@ impl Generator for ArchGenerator {
                         p99_ms = p99,
                         mean_ms = mean,
                         itl_spikes = spikes,
-                        "generate: ITL stats (M30)"
+                        "generate: ITL stats"
                     );
                     // Write to the ITL ring buffer for /metrics/cache.
                     if let Some(ref store) = itl_store {
@@ -1409,7 +1408,7 @@ impl Generator for ArchGenerator {
                         });
                     }
                     // Emit SPSC event carrying all five aggregates (p50/p95/mean in
-                    // ItlStats; p99 and spikes as separate F9 events at same boundary).
+                    // ItlStats; p99 and spikes as separate events at same boundary).
                     if let Some(ref drainer) = metrics_drainer {
                         use crate::metrics_drainer::{MetricEvent, MetricKind};
                         let ts = spsc_ts();
@@ -1425,7 +1424,7 @@ impl Generator for ArchGenerator {
                                 step_count,
                             },
                         });
-                        // F9: p99 and spike count as separate metric events.
+                        // P99 and spike count as separate metric events.
                         drainer.try_emit(MetricEvent {
                             model_id: model_id_for_log.clone(),
                             kv_quant: kv_quant_label(kv_quant_override),
@@ -1489,15 +1488,15 @@ impl Generator for ArchGenerator {
                 Ok(steps) => {
                     // finish_reason = "stop" when generation halted on
                     // EOS (last emitted token id is in the configured eos set);
-                    // "length" when we hit max_tokens. Stop-string matching is
-                    // still Stage 2.
+                    // "length" when we hit max_tokens. Stop strings are not
+                    // matched here.
                     let last_id = steps.last().map_or(0, |s| s.token_id);
                     let finish_reason = if eos_ids.contains(&last_id) {
                         "stop".to_owned()
                     } else {
                         "length".to_owned()
                     };
-                    // A10: flush any withheld multi-byte tail before the
+                    // Flush any withheld multi-byte tail before the
                     // sentinel. Non-empty only when generation genuinely
                     // ended mid-codepoint (lossy-replace per mlx-lm
                     // `_try_flush(force=True)`); normally empty. Sent as a
@@ -1520,7 +1519,7 @@ impl Generator for ArchGenerator {
                             Ok(_) => {}
                             Err(e) => tracing::debug!(
                                 error = ?e,
-                                "A10 detok.finalize error, dropping tail"
+                                "detok.finalize error, dropping tail"
                             ),
                         }
                     }
@@ -1531,7 +1530,7 @@ impl Generator for ArchGenerator {
                         piece: String::new(),
                         done: true,
                         finish_reason: Some(finish_reason),
-                        // A3: terminal sentinel always lives on the
+                        // Terminal sentinel always lives on the
                         // content channel; SSE handlers skip empty pieces
                         // anyway and only honour `finish_reason` here.
                         is_thinking: false,

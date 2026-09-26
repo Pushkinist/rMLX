@@ -10,7 +10,6 @@
 # `opt` symlinks, relocates install names, and re-signs.
 #
 # Verify afterwards with scripts/mlx_preflight.sh.
-# Background: .rmlx/mlx-homebrew-nax-regression.md
 
 set -uo pipefail
 
