@@ -92,7 +92,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         metrics-init metrics-doctor metrics-doctor-fix metrics-export \
         metrics-backup metrics-replay-pending metrics-prompts-sync \
         metrics-champions metrics-champions-rmlx \
-        build-perf build-debug test-perf ci-perf gpu-test model-check model-check-full \
+        build-perf build-debug test-perf ci-perf gpu-test claim-rmlx model-check model-check-full \
         profile-samply profile-samply-debug profile-instruments bench asm perf-iter \
         canary canary-gate canary-ab canary-ab-selftest canary-ab-ingest-selftest \
         canary-ab-host-gate-fixtures llama-ab-selftest spec-bench-selftest \
@@ -252,20 +252,31 @@ endif
 CI_PERF_OK := $(if $(GPU_HALF_NAME),ci-perf $(GPU_HALF_NAME)-half ok — NOT the whole gate,ci-perf ok)
 CI_PERF_INCOMPLETE := $(if $(GPU_HALF_NAME),ci-perf $(GPU_HALF_NAME)-half INCOMPLETE,ci-perf INCOMPLETE)
 
+# The GPU suite runs under `rmlx claim run`: the suite holds the Metal claim
+# for its whole run, and a claim another process holds refuses it with exit 11
+# and names the holder. The binary is this checkout's, built here and called by
+# path. Nothing the suite runs may start `rmlx` itself, since the nested claim
+# would be refused.
+CLAIM_RMLX := target/debug/rmlx
+claim-rmlx:      ## build the rmlx binary the GPU suite takes the Metal claim with
+	cargo build -p rmlx-cli --bin rmlx
+
 # ci-perf runs the GPU/Metal suite after `test-perf`, and it is the only shared
 # gate that does. `make ci` cannot: the GPU tests need the Metal context to
 # themselves (hard rule 8) and take minutes, which is the wrong price on every
-# commit. So `ci-perf` refuses to start unless the GPU is idle: it is already
-# the long, pre-merge-only target, and the preflight line below makes that
-# precondition fail in milliseconds instead of after the release-perf half.
+# commit. So `ci-perf` refuses to start unless the GPU is free: it is already
+# the long, pre-merge-only target, and the lines below make that precondition
+# fail before the release-perf half rather than after it.
 #
-# Three lines, in this order, for two different reasons:
+# In this order, for two different reasons:
 #
-#   * `--preflight` FIRST because it is a precondition, not a test. It checks
-#     only the things that cost nothing to check — RMLX_SKIP_GPU unset, no
-#     competing MLX process, a non-empty classification — and those are the most
-#     likely way this gate fails in daily use. Discovering a live `rmlx serve`
-#     after `test-perf` has run throws away the time it took.
+#   * `--preflight` and a claim probe FIRST because they are preconditions,
+#     not tests. The preflight checks RMLX_SKIP_GPU unset and a non-empty
+#     classification; `claim run -- true` takes the Metal claim and releases
+#     it at once, so a claim another process holds stops the gate here with
+#     exit 11. Finding a live server after `test-perf` has run throws away the
+#     time it took. The probe cannot keep the claim across `test-perf`; a
+#     process that takes it in between refuses the GPU half instead.
 #   * `test-perf` before the tests themselves because it covers the whole
 #     workspace, so a compile error anywhere shows up there, whereas the GPU run
 #     visits five crates and holds the GPU while it does. Fail on the broad,
@@ -312,9 +323,11 @@ CI_PERF_INCOMPLETE := $(if $(GPU_HALF_NAME),ci-perf $(GPU_HALF_NAME)-half INCOMP
 # pays a cold opt-level-0 build on top. See docs/GPU_TESTS.md.
 ci-perf:         ## pre-push gate under release-perf + the serialized GPU/Metal suite (HALF=codec|rest runs one side of the partition; separate from make ci)
 	@bash scripts/run_gpu_tests.sh --preflight
+	$(MAKE) claim-rmlx
+	@$(CLAIM_RMLX) claim run -- true
 	$(MAKE) test-perf
 	@log="$$(mktemp)"; rc="$$(mktemp)"; \
-	{ bash scripts/run_gpu_tests.sh $(GPU_HALF_ARG); echo $$? >"$$rc"; } | tee "$$log"; \
+	{ $(CLAIM_RMLX) claim run -- bash scripts/run_gpu_tests.sh $(GPU_HALF_ARG); echo $$? >"$$rc"; } | tee "$$log"; \
 	code="$$(cat "$$rc")"; rm -f "$$rc"; \
 	if [ "$$code" -ne 0 ]; then rm -f "$$log"; exit "$$code"; fi; \
 	if grep -q INCOMPLETE "$$log"; then \
@@ -350,8 +363,8 @@ ci-perf:         ## pre-push gate under release-perf + the serialized GPU/Metal 
 # or any store fails and names the delta. That is what keeps a standing
 # diagnostic from a kernel we do not own out of the exit code, where it would
 # train everyone to read a red run as noise.
-gpu-test:        ## run the GPU/Metal #[ignore] tests serialized under Metal shader validation (HALF=codec|rest, CRATE= FILTER= to narrow, VALIDATE=0 to skip instrumentation); needs exclusive machine access
-	@bash scripts/run_gpu_tests.sh $(GPU_HALF_ARG) $(if $(CRATE),--crate '$(CRATE)',) $(if $(FILTER),--filter '$(FILTER)',) \
+gpu-test: claim-rmlx ## run the GPU/Metal #[ignore] tests serialized under Metal shader validation, holding the Metal claim (HALF=codec|rest, CRATE= FILTER= to narrow, VALIDATE=0 to skip instrumentation)
+	@$(CLAIM_RMLX) claim run -- bash scripts/run_gpu_tests.sh $(GPU_HALF_ARG) $(if $(CRATE),--crate '$(CRATE)',) $(if $(FILTER),--filter '$(FILTER)',) \
 		$(if $(filter 0,$(VALIDATE)),--no-shader-validation,)
 
 # model-check: run only the model-logic crates (rmlx-models, rmlx-runtime,
@@ -787,7 +800,6 @@ profile-samply:  ## samply record rmlx baseline (CPU sampling; opens Firefox Pro
 # decode dominates the samples, not prefill. Override: PROF_PROMPT, PROF_GEN, MODEL.
 profile-samply-debug: build-debug ## samply flamegraph on release-debug (full DWARF, decode-focused)
 	@command -v samply >/dev/null 2>&1 || { echo "install: cargo install samply && samply setup"; exit 1; }
-	@pkill -f "rmlx serve" || true; rm -f /tmp/rmlx.*.claim
 	samply record --rate 4000 -- \
 	  ./target/release-debug/rmlx baseline --model "$(MODEL)" \
 	  --prompt-tokens $(PROF_PROMPT) --max-tokens $(PROF_GEN) --max-ctx 8192
@@ -848,7 +860,6 @@ CANARY_THRESHOLD_PCT ?= 3
 # Usage: make canary-gate SHA=3ba8aee
 
 canary: mlx-preflight build-perf  ## run 3-model TPS canary (records into runs.db + legacy CSV); requires release-perf binary
-	@pkill -f "rmlx serve" || true; pkill -f mlx_lm || true; sleep 1; rm -f /tmp/rmlx.*.claim
 	bash scripts/perf_canary.sh
 
 # The canary tracks ONE build over time. Comparing two builds (or two flag
@@ -919,7 +930,6 @@ canary-gate:        ## gate TPS regressions via runs.db (SHA= required; e.g. mak
 spec-canary: build-perf  ## run spec-decode canary (normal+MTP × 3 prompt classes); requires VERIFIER_MODEL + DRAFTER_MODEL env
 	@test -n "$$VERIFIER_MODEL" || { echo "ERROR: VERIFIER_MODEL= required (resolve via LOCAL.md)"; exit 125; }
 	@test -n "$$DRAFTER_MODEL"  || { echo "ERROR: DRAFTER_MODEL= required (resolve via LOCAL.md)";  exit 125; }
-	@pkill -f "rmlx serve" || true; pkill -f mlx_lm || true; sleep 1; rm -f /tmp/rmlx.*.claim
 	@echo "==> spec-canary: prose"
 	BENCH_PROMPT_FILE=prompts/spec_bench/prose.json \
 		bash scripts/spec_bench.sh --tag canary-prose
@@ -968,7 +978,6 @@ spec-canary-gate:   ## gate spec-decode regressions (decode_tps_warm + accept_ra
 
 ssd-canary: build-perf  ## run SSD canary (POPULATE/REVISIT/EVICT) against VERIFIER_MODEL
 	@test -n "$$VERIFIER_MODEL" || { echo "ERROR: VERIFIER_MODEL= required (resolve via LOCAL.md)"; exit 125; }
-	@pkill -f "rmlx serve" || true; pkill -f mlx_lm || true; sleep 1; rm -f /tmp/rmlx.*.claim
 	@echo "==> ssd-canary: populate + revisit + evict"
 	bash scripts/ssd_canary.sh --tag ssd-canary --ssd-gb $${SSD_GB:-100}
 

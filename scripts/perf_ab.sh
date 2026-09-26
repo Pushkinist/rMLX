@@ -763,7 +763,8 @@ fi
 # context is not a fact about the run.
 if ! $SYNTHETIC_ARMS && pgrep -f "rmlx serve" >/dev/null 2>&1; then
 	echo "ERROR: an 'rmlx serve' process is running and holds the Metal context." >&2
-	echo "  Stop it before measuring:  pkill -f 'rmlx serve'" >&2
+	echo "  Stop it by its PID before measuring:" >&2
+	pgrep -fl "rmlx serve" >&2 || true
 	exit 125
 fi
 

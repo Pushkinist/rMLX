@@ -42,22 +42,11 @@ ln -s "$REPO_ROOT/scripts" "$FAKE_ROOT/scripts"
 
 # ── Shims ─────────────────────────────────────────────────────────────────────
 #
-# These keep the suite off this host. `pkill` would reach real processes; the
-# script's inter-request sleeps are 5 s of nothing when the server is a stub;
-# and its preflight deletes the Metal claim files of whatever is running here,
-# which is the one thing a test must never do to a machine.
+# The script's inter-request sleeps are 5 s of nothing when the server is a stub.
 SHIM_DIR="$WORK/shims"
 mkdir -p "$SHIM_DIR"
-printf '#!/bin/sh\nexit 0\n' >"$SHIM_DIR/pkill"
 printf '#!/bin/sh\nexit 0\n' >"$SHIM_DIR/sleep"
-cat >"$SHIM_DIR/rm" <<'RMEOF'
-#!/bin/sh
-for a in "$@"; do
-	case "$a" in /tmp/rmlx.*.claim) exit 0 ;; esac
-done
-exec /bin/rm "$@"
-RMEOF
-chmod +x "$SHIM_DIR/pkill" "$SHIM_DIR/sleep" "$SHIM_DIR/rm"
+chmod +x "$SHIM_DIR/sleep"
 
 # ── Stub server ───────────────────────────────────────────────────────────────
 
@@ -313,6 +302,17 @@ if BOUND_FLAG:
 server.serve_forever()
 PYEOF
 
+# stop_stubs <bound-file> — stop every stub server a case started, by the PID
+# each wrote when it bound. The harness stops its own server; this keeps a
+# harness defect from leaving a stub on the next case's port.
+stop_stubs() {
+	[ -f "$1" ] || return 0
+	local pid
+	while read -r pid; do
+		kill "$pid" 2>/dev/null || true
+	done <"$1"
+}
+
 # ── Stub binary ───────────────────────────────────────────────────────────────
 
 STUB="$FAKE_ROOT/target/release-perf/rmlx"
@@ -443,7 +443,7 @@ run_case() {
 		${extra_args[@]+"${extra_args[@]}"} >"$CASE_OUT" 2>&1
 	got=$?
 	set -e
-	pkill -f "$SERVER_PY" 2>/dev/null || true
+	stop_stubs "$CASE_HOME/stub_bound"
 
 	CASE_BAD=""
 	[ "$got" -ne "$want" ] && CASE_BAD="exit=$got (want $want)"

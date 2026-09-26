@@ -8,25 +8,20 @@
 #     LOG_DIR      the run-log directory the server writes into
 #     SCRATCH_DIR  a writable scratch directory
 #
-# The functions here answer three questions a bench harness has to answer the
-# same way every time: is the machine free of competing MLX processes, is the
-# server up, and which run log belongs to the server this phase started.
+# The functions here answer two questions a bench harness has to answer the
+# same way every time: is the server up, and which run log belongs to the server
+# this phase started.
+#
+# A harness stops only the server it started, by its PID: `kill "$pid"; wait
+# "$pid"`. When `wait` returns the server's Metal claim is free. A server some
+# other process started is not the harness's to stop: `rmlx serve` refuses with
+# exit 11 and names the holder, and the harness stops with that status.
 
-# Kill competing MLX processes and drop the Metal claim, so this run has the
-# GPU to itself (CLAUDE.md hard rule 8).
-preflight() {
-    echo "  [preflight] killing competing MLX processes..." >&2
-    pkill -f "rmlx serve" 2>/dev/null || true
-    pkill -f mlx_lm 2>/dev/null || true
-    pkill -f paroquant 2>/dev/null || true
-    pkill -f omlx 2>/dev/null || true
-    sleep 5
-    rm -f /tmp/rmlx.*.claim 2>/dev/null || true
-    echo "  [preflight] done." >&2
-}
-
-# Wait for server to be ready (polls /v1/models).
+# Wait for the server with PID $1 to be ready (polls /v1/models). A server that
+# exits first returns its own exit status, so a refused claim (exit 11) stops
+# the harness with the status the server gave.
 wait_for_server() {
+    local pid="$1"
     local url="http://127.0.0.1:${PORT}/v1/models"
     local attempts=0
     local max_attempts=60
@@ -35,6 +30,13 @@ wait_for_server() {
         if curl -sf "${url}" > /dev/null 2>&1; then
             echo "  [wait] server ready." >&2
             return 0
+        fi
+        if ! kill -0 "${pid}" 2>/dev/null; then
+            local status=0
+            wait "${pid}" || status=$?
+            echo "ERROR: server (pid ${pid}) exited with status ${status} before it was ready" >&2
+            [[ ${status} -eq 0 ]] && status=1
+            return "${status}"
         fi
         attempts=$((attempts + 1))
         if [[ ${attempts} -ge ${max_attempts} ]]; then

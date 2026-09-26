@@ -163,23 +163,13 @@ printf '%s\n' '{"temperature": 0.0, "top_p": 1.0, "top_k": 0}' \
 
 # ── Shims ─────────────────────────────────────────────────────────────────────
 #
-# `pkill` would reach real processes and the preflight deletes the Metal claim
-# files of whatever is running here, which is the one thing a test must never do
-# to a machine. `sleep` turns the harness's waits into nothing.
+# `sleep` turns the harness's waits into nothing.
 SHIMS="${WORK}/shims"
 mkdir -p "${SHIMS}"
-printf '#!/bin/sh\nexit 0\n' >"${SHIMS}/pkill"
 # Not a no-op: the harness starts a fresh server on the same port every pass and
 # its own 3 s settle is what keeps the next bind off the previous listener. 50 ms
 # keeps that ordering while costing the suite seconds rather than minutes.
 printf '#!/bin/sh\nexec /bin/sleep 0.05\n' >"${SHIMS}/sleep"
-cat >"${SHIMS}/rm" <<'RMEOF'
-#!/bin/sh
-for a in "$@"; do
-	case "$a" in /tmp/rmlx.*.claim) exit 0 ;; esac
-done
-exec /bin/rm "$@"
-RMEOF
 # The thermal reading is a machine reading, so it is shimmed for the same reason
 # the process table is: no verdict here may depend on what this Mac's thermal
 # history happens to hold. The default says what an unthrottled Mac says — no
@@ -188,7 +178,7 @@ cat >"${SHIMS}/pmset" <<'PMSETEOF'
 #!/bin/sh
 echo "Note: No thermal warning level has been recorded"
 PMSETEOF
-chmod +x "${SHIMS}/pkill" "${SHIMS}/sleep" "${SHIMS}/rm" "${SHIMS}/pmset"
+chmod +x "${SHIMS}/sleep" "${SHIMS}/pmset"
 
 # A Mac that posted a level and is at full speed, one that is being held back,
 # and one where the tool is not there to ask.
@@ -526,6 +516,17 @@ if BOUND_FLAG:
 server.serve_forever()
 PYEOF
 
+# stop_stubs <bound-file> — stop every stub server a case started, by the PID
+# each wrote when it bound. The harness stops its own servers; this keeps a
+# harness defect from leaving a stub on the next case's port.
+stop_stubs() {
+    [ -f "$1" ] || return 0
+    local pid
+    while read -r pid; do
+        kill "${pid}" 2>/dev/null || true
+    done <"$1"
+}
+
 # ── Stub binary ───────────────────────────────────────────────────────────────
 
 STUB="${FAKE_ROOT}/target/release-perf/rmlx"
@@ -685,7 +686,7 @@ run_case() {
         "${verifier}" --port "${PORT}" \
         ${extra_args[@]+"${extra_args[@]}"} >"${CASE_OUT}" 2>&1
     got=$?
-    pkill -f "${SERVER_PY}" 2>/dev/null || true
+    stop_stubs "${CASE_HOME}/stub_bound"
 
     CASE_BAD=""
     [ "${got}" -ne "${want}" ] && CASE_BAD="exit=${got} (want ${want})"
@@ -1629,8 +1630,7 @@ verdict
 #
 # Three servers run per invocation, and a SIGTERM to the harness — a CI timeout,
 # an operator, a parent tearing down — must not leave one alive holding the
-# Metal claim. The next run's preflight would not find it: `pkill -f "rmlx
-# serve"` does not match a snapshotted binary.
+# Metal claim: no later run may stop a server it did not start.
 sigterm_case() {
     CASE_NAME="sigterm_leaves_no_server_running"
     CASE_WHAT="a killed run takes its server with it"

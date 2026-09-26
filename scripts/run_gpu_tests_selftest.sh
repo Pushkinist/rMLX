@@ -92,19 +92,11 @@ STUB
 cat "${root}/halves"
 STUB
 
-    # The GPU-free preconditions are not what this file exercises, and one of
-    # them reads the whole host: stub the process check so a live MLX server
-    # cannot decide the outcome of a reporting test, and answer the shader
-    # validation canary so the detector's positive control passes.
-    cat >"${root}/bin/pgrep" <<'STUB'
-#!/usr/bin/env bash
-exit 1
-STUB
-
-    # The stub records its own argv. The runner reports a per-crate count and no
-    # executed set, so with one crate declaring a cell in each half the two
-    # halves print the same count — the libtest filters the runner actually
-    # issued are the only observable that says WHICH cell it asked for.
+    # The stub answers the shader validation canary so the detector's positive
+    # control passes, and records its own argv. The runner reports a per-crate
+    # count and no executed set, so with one crate declaring a cell in each half
+    # the two halves print the same count — the libtest filters the runner
+    # actually issued are the only observable that says WHICH cell it asked for.
     : >"${root}/cargo_argv"
     cat >"${root}/bin/cargo" <<STUB
 #!/usr/bin/env bash
@@ -130,7 +122,7 @@ cat "${root}/logs/\${crate}.log"
 exit "\$(cat "${root}/logs/\${crate}.rc" 2>/dev/null || echo 0)"
 STUB
 
-    chmod +x "${root}/bin/pgrep" "${root}/bin/cargo" || return 1
+    chmod +x "${root}/bin/cargo" || return 1
 }
 
 # classify <root> <crate> <fn>... — name the GPU tests the classifier reports.

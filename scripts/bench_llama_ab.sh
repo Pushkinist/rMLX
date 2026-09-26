@@ -209,8 +209,13 @@ if curl -fsS -m 3 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
 fi
 
 TMP="$(mktemp -d)"
+# A slot runs in a command substitution, so it leaves its server's PID here for
+# an interrupted run to stop.
+SERVER_PID_FILE="$TMP/server.pid"
 cleanup() {
-	pkill -f "llama-server .*--port ${PORT}" 2>/dev/null || true
+	if [ -s "$SERVER_PID_FILE" ]; then
+		kill "$(cat "$SERVER_PID_FILE")" 2>/dev/null || true
+	fi
 	rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -274,6 +279,7 @@ run_slot() { # <bin> <args> <env> <slotdir>
 		-c "$N_CTX" -np 1 -fa on --no-webui \
 		$extra >"$dir/server.log" 2>&1 &
 	local pid=$!
+	echo "$pid" >"$SERVER_PID_FILE"
 
 	local deadline=$(( $(date +%s) + READY_TIMEOUT ))
 	local ready=0
@@ -284,6 +290,7 @@ run_slot() { # <bin> <args> <env> <slotdir>
 	done
 	if [ "$ready" -ne 1 ]; then
 		kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+		: >"$SERVER_PID_FILE"
 		echo "SLOT_FAIL server-not-ready" >&2
 		return 1
 	fi
@@ -295,6 +302,7 @@ run_slot() { # <bin> <args> <env> <slotdir>
 		python3 -c 'import json,sys; print(json.load(sys.stdin).get("model_path",""))' 2>/dev/null || true)"
 	if [ "$served" != "$MODEL" ]; then
 		kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+		: >"$SERVER_PID_FILE"
 		echo "SLOT_FAIL wrong-server: /props reports model '$served', expected '$MODEL'" >&2
 		return 1
 	fi
@@ -323,6 +331,7 @@ run_slot() { # <bin> <args> <env> <slotdir>
 
 	kill "$pid" 2>/dev/null || true
 	wait "$pid" 2>/dev/null || true
+	: >"$SERVER_PID_FILE"
 
 	# The backend's own KV figure. `llama.cpp` prints one line per KV buffer;
 	# summing them is the whole cache, and a codec arm that does not move this

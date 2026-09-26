@@ -110,7 +110,7 @@
 #
 # `--synthetic-arms` declares that the server is a stub, so the run exercises
 # this script's own scheduling, guards and arithmetic and measures nothing. The
-# machine is then not consulted at all — no preflight, no quiescence gate, no
+# machine is then not consulted at all — no quiescence gate, no
 # per-pass interference sampling — and the run says so on stdout and in
 # `synthetic_arms` in the result file. Every guard that reads the run instead of
 # the machine is untouched by it.
@@ -317,12 +317,12 @@ WORK="$(mktemp -d "${SCRATCH_DIR}/published.XXXXXX")"
 TS_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 # Three servers run per invocation. A SIGTERM to this script — a CI timeout, an
-# operator, a parent tearing down — would otherwise leave one alive holding
-# /tmp/rmlx.*.claim, and the next run's preflight `pkill -f "rmlx serve"` does
-# not match a snapshotted binary.
+# operator, a parent tearing down — would otherwise leave one alive holding the
+# Metal claim, and no later run may stop a server it did not start.
 cleanup() {
     if [[ -n "${SERVER_PID:-}" ]]; then
         kill "${SERVER_PID}" 2>/dev/null || true
+        wait "${SERVER_PID}" 2>/dev/null || true
     fi
     if [[ -n "${MEMORY_PID:-}" ]]; then
         kill "${MEMORY_PID}" 2>/dev/null || true
@@ -465,7 +465,7 @@ if $SYNTHETIC_ARMS; then
     cat >&2 <<'BANNER'
 INTERFERENCE GATE: OFF — --synthetic-arms. The server is a stub, so this run
   exercises this script's scheduling, guards and arithmetic and measures
-  nothing. The machine is not consulted: no preflight, no entry quiescence
+  nothing. The machine is not consulted: no entry quiescence
   gate, no per-pass interference sampling. No number below describes this host.
 BANNER
 else
@@ -540,7 +540,7 @@ start_server() {
     SERVER_PID=$!
     echo "  [server] pid=${SERVER_PID}" >&2
 
-    if ! wait_for_server; then
+    if ! wait_for_server "${SERVER_PID}"; then
         kill "${SERVER_PID}" 2>/dev/null || true
         tail -20 "${WORK}/server_${tag}.txt" >&2 || true
         return 1
@@ -563,7 +563,6 @@ FIXED_PAYLOAD=""
 FIXED_RECORD=""
 if [[ "${ARM}" == "plain" ]]; then
     echo "==> fitting the ${FIXED_PROMPT_TOKENS}-token prompt (preparation server)"
-    $SYNTHETIC_ARMS || preflight
     if ! start_server fit; then exit 1; fi
     FIXED_RECORD="${WORK}/fixed_fit.json"
     FIXED_PAYLOAD="${WORK}/fixed_payload.json"
@@ -594,7 +593,6 @@ FIXED_FILES=()
 
 for (( pass = 1; pass <= PASSES; pass++ )); do
     echo "==> pass ${pass}/${PASSES}"
-    $SYNTHETIC_ARMS || preflight
     snapshot_logs
 
     if ! start_server "${pass}"; then exit 1; fi

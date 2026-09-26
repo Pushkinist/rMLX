@@ -38,8 +38,9 @@
 #   comparison does not apply, and both rows say so in `answer_check`.
 #
 # Hard constraints honoured:
-#   - Preflight (pkill + claim-file delete) before each server start
-#   - Single server process at a time; killed explicitly between phases
+#   - Single server process at a time; the script stops the server it started
+#     (kill + wait on its PID) between phases. A claim some other process holds
+#     stops the run with the server's exit status (11).
 #   - 1 warmup + 3 measured requests per config; 5 s sleep between requests
 #   - All inserts go through `rmlx metrics record --file` (no direct sqlite writes)
 
@@ -588,8 +589,6 @@ PYEOF
 echo "==> Phase 1: normal decode (no drafter)"
 echo ""
 
-preflight
-
 snapshot_logs
 
 echo "  [server] starting..." >&2
@@ -606,7 +605,7 @@ RMLX_LOG_CAP_MB=200 \
 SERVER_PID=$!
 echo "  [server] pid=${SERVER_PID}" >&2
 
-wait_for_server
+wait_for_server "${SERVER_PID}"
 
 echo "  [normal] warmup..." >&2
 for i in $(seq 1 ${WARMUP_RUNS}); do
@@ -742,8 +741,6 @@ echo ""
 echo "==> Phase 2: speculative decode (draft_kind=${DRAFT_KIND} block_size=${DRAFT_BLOCK_SIZE:-engine})"
 echo ""
 
-preflight
-
 snapshot_logs
 
 echo "  [server] starting speculative server..." >&2
@@ -763,7 +760,7 @@ RMLX_LOG_CAP_MB=200 \
 SERVER_PID=$!
 echo "  [server] pid=${SERVER_PID}" >&2
 
-wait_for_server
+wait_for_server "${SERVER_PID}"
 
 echo "  [spec] warmup..." >&2
 for i in $(seq 1 ${WARMUP_RUNS}); do

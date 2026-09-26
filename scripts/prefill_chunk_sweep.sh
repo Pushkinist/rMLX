@@ -181,7 +181,8 @@ export CPU_SNAPSHOT_SKIP="$(basename "$BINARY") rmlx rmlx_main"
 # killing it would destroy someone else's work to make this number look better.
 if pgrep -f "rmlx serve" >/dev/null 2>&1; then
 	echo "ERROR: an 'rmlx serve' process is running and holds the Metal context." >&2
-	echo "  Stop it before measuring:  pkill -f 'rmlx serve'" >&2
+	echo "  Stop it by its PID before measuring:" >&2
+	pgrep -fl "rmlx serve" >&2 || true
 	exit 125
 fi
 

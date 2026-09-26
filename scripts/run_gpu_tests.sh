@@ -176,8 +176,8 @@ Usage: run_gpu_tests.sh [--crate <name>] [--filter <substring>]
                           memory access (default)
   --no-shader-validation  run the tests uninstrumented
   --preflight             check only the environment preconditions (no GPU
-                          variable set, no competing MLX process, a non-empty
-                          classification) and exit; runs no tests
+                          skip variable set, a non-empty classification) and
+                          exit; runs no tests
 USAGE
 }
 
@@ -352,19 +352,6 @@ elif [ ! -d "${RMLX_O_MODELS_ROOT}" ]; then
     snapshot_root_note="RMLX_O_MODELS_ROOT='${RMLX_O_MODELS_ROOT}' does not exist — every snapshot-gated cell skipped and counted as passed"
 fi
 
-# CLAUDE.md hard rule 8 — a single MLX process per Mac. These tests build their
-# own Metal context; a co-resident server already holding the GPU makes any
-# failure here unattributable. Refuse rather than pkill: killing a process this
-# script does not own is not its call.
-if pgrep -f 'rmlx serve|mlx_lm|paroquant|omlx' >/dev/null 2>&1; then
-    echo "ERROR: another MLX process is live — the GPU tests need the Metal context to themselves." >&2
-    pgrep -fl 'rmlx serve|mlx_lm|paroquant|omlx' >&2 || true
-    echo >&2
-    echo "Stop it first, e.g.:" >&2
-    echo "  pkill -f 'rmlx serve'; pkill -f mlx_lm; rm -f /tmp/rmlx.*.claim" >&2
-    exit 1
-fi
-
 listing="$(bash "${REPO_ROOT}/scripts/check_gpu_tests_ignored.sh" --list)"
 if [ -z "${listing}" ]; then
     echo "ERROR: check_gpu_tests_ignored.sh --list produced no GPU tests." >&2
@@ -372,14 +359,15 @@ if [ -z "${listing}" ]; then
 fi
 
 # Everything above this line is a precondition on the environment rather than a
-# test: the two refusals and a non-empty classification, all of them
+# test: the skip-variable refusal and a non-empty classification, both of them
 # milliseconds. `--preflight` stops here so a caller that is about to spend a
 # long time on something else can find out FIRST that this suite would refuse to
 # start. `make ci-perf` runs it before its release-perf half for exactly that
-# reason — discovering a live `rmlx serve` after the workspace suite has already
-# run wastes the whole of it.
+# reason. Whether the GPU is free is the Metal claim's question, not this
+# script's: `make gpu-test` and `make ci-perf` run the suite under
+# `rmlx claim run`, which refuses with exit 11 while another process holds it.
 if [ "${PREFLIGHT}" = "1" ]; then
-    echo "preflight OK: GPU free, no skip variable, $(printf '%s\n' "${listing}" | grep -c '') tests classified."
+    echo "preflight OK: no skip variable, $(printf '%s\n' "${listing}" | grep -c '') tests classified."
     [ -n "${snapshot_root_note}" ] && echo "preflight WARNING: ${snapshot_root_note}." >&2
     exit 0
 fi
