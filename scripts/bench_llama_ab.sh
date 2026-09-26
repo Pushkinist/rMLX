@@ -76,6 +76,7 @@ PORT=8199; BUSY_PCT=25; ALLOW_BUSY_HOST=false
 SYNTHETIC_ARMS=false
 READY_TIMEOUT=600
 OUT_DIR="${RMLX_HOME}/bench/llama_ab"
+CLAIM_RMLX="${REPO_ROOT}/target/release-perf/rmlx"
 
 usage() {
 	cat <<'USAGE'
@@ -102,6 +103,9 @@ bench_llama_ab.sh --bin-a P --bin-b P --model GGUF --prompt-file F [options]
                            and refused by the runs.db promoter.
   --ready-timeout S        seconds to wait for /health per slot (default 600)
   --out-dir PATH           JSON result directory (default $RMLX_HOME/bench/llama_ab)
+  --claim-rmlx PATH        the rmlx binary each slot's server runs under, as
+                           `rmlx claim run`, so it holds the Metal claim
+                           (default target/release-perf/rmlx)
 USAGE
 }
 
@@ -128,6 +132,7 @@ while [ $# -gt 0 ]; do
 	--synthetic-arms) SYNTHETIC_ARMS=true; shift ;;
 	--ready-timeout) need_value "$1" $#; READY_TIMEOUT="$2"; shift 2 ;;
 	--out-dir) need_value "$1" $#; OUT_DIR="$2"; shift 2 ;;
+	--claim-rmlx) need_value "$1" $#; CLAIM_RMLX="$2"; shift 2 ;;
 	-h | --help) usage; exit 0 ;;
 	*) echo "unknown argument: $1" >&2; usage >&2; exit 125 ;;
 	esac
@@ -137,6 +142,7 @@ done
 [ -n "$BIN_B" ] || { echo "missing required --bin-b" >&2; exit 125; }
 [ -n "$MODEL" ] || { echo "missing required --model" >&2; exit 125; }
 [ -n "$PROMPT_FILE" ] || { echo "missing required --prompt-file" >&2; exit 125; }
+[ -x "$CLAIM_RMLX" ] || { echo "no rmlx binary at $CLAIM_RMLX (make build-perf, or --claim-rmlx)" >&2; exit 125; }
 for f in "$BIN_A" "$BIN_B" "$MODEL" "$PROMPT_FILE"; do
 	[ -e "$f" ] || { echo "not found: $f" >&2; exit 125; }
 done
@@ -209,12 +215,20 @@ if curl -fsS -m 3 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
 fi
 
 TMP="$(mktemp -d)"
-# A slot runs in a command substitution, so it leaves its server's PID here for
-# an interrupted run to stop.
+# A slot runs in a command substitution, so it leaves the PID of its
+# `claim run` here for an interrupted run to stop. `claim run` passes the signal
+# to the server and exits when the server has, which releases the claim; that
+# process is not this shell's child, so the exit is polled rather than waited.
 SERVER_PID_FILE="$TMP/server.pid"
 cleanup() {
 	if [ -s "$SERVER_PID_FILE" ]; then
-		kill "$(cat "$SERVER_PID_FILE")" 2>/dev/null || true
+		local pid n=0
+		pid="$(cat "$SERVER_PID_FILE")"
+		kill "$pid" 2>/dev/null || true
+		while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 100 ]; do
+			sleep 0.1
+			n=$((n + 1))
+		done
 	fi
 	rm -rf "$TMP"
 }
@@ -274,11 +288,14 @@ fi
 run_slot() { # <bin> <args> <env> <slotdir>
 	local bin="$1" extra="$2" armenv="$3" dir="$4"
 	mkdir -p "$dir"
+	# The server runs under `rmlx claim run`: `pid` is that wrapper, which this
+	# slot stops, and `server` is the llama-server it runs, which this slot
+	# measures. A claim another process holds makes the wrapper exit 11.
 	# shellcheck disable=SC2086  # armenv and extra are deliberate word lists
-	env $armenv "$bin" --model "$MODEL" --port "$PORT" --host 127.0.0.1 \
-		-c "$N_CTX" -np 1 -fa on --no-webui \
+	"$CLAIM_RMLX" claim run -- env $armenv "$bin" --model "$MODEL" --port "$PORT" \
+		--host 127.0.0.1 -c "$N_CTX" -np 1 -fa on --no-webui \
 		$extra >"$dir/server.log" 2>&1 &
-	local pid=$!
+	local pid=$! server=""
 	echo "$pid" >"$SERVER_PID_FILE"
 
 	local deadline=$(( $(date +%s) + READY_TIMEOUT ))
@@ -288,10 +305,12 @@ run_slot() { # <bin> <args> <env> <slotdir>
 		kill -0 "$pid" 2>/dev/null || break
 		if curl -fsS -m 3 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then ready=1; break; fi
 	done
-	if [ "$ready" -ne 1 ]; then
-		kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+	if [ "$ready" -eq 1 ]; then server="$(pgrep -P "$pid" | head -1)"; fi
+	if [ "$ready" -ne 1 ] || [ -z "$server" ]; then
+		local status=0
+		kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || status=$?
 		: >"$SERVER_PID_FILE"
-		echo "SLOT_FAIL server-not-ready" >&2
+		echo "SLOT_FAIL server-not-ready (exit $status; 11: the Metal claim is held, see $dir/server.log)" >&2
 		return 1
 	fi
 
@@ -319,7 +338,7 @@ run_slot() { # <bin> <args> <env> <slotdir>
 	post_completion "$dir/measure.json" "$N_PREDICT" >/dev/null 2>&1 &
 	local reqpid=$!
 	while kill -0 "$reqpid" 2>/dev/null; do
-		rss="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')"
+		rss="$(ps -o rss= -p "$server" 2>/dev/null | tr -d ' ')"
 		[ -n "$rss" ] && [ "$rss" -gt "$rss_peak" ] && rss_peak="$rss"
 		sleep 0.5
 	done

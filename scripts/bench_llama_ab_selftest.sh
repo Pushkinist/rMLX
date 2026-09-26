@@ -110,6 +110,28 @@ SERVE
 
 KV_OK='llama_kv_cache:       MTL0 KV buffer size =   512.00 MiB'
 
+# Stands in for `rmlx claim run -- <command>`: runs the command as its child,
+# passes SIGTERM on, and exits with the child's status, so the harness's
+# wrapper-versus-server bookkeeping is exercised without a real claim. Each use
+# is recorded, so a case can tell that every slot ran under it.
+CLAIM_STUB="$WORK/claim_rmlx"
+cat >"$CLAIM_STUB" <<STUB
+#!/usr/bin/env bash
+[ "\$1 \$2 \$3" = "claim run --" ] || { echo "claim stub: unexpected argv \$*" >&2; exit 2; }
+shift 3
+echo "\$\$" >>"$WORK/claim_runs"
+"\$@" &
+child=\$!
+trap 'kill -TERM "\$child" 2>/dev/null' TERM
+while :; do
+    wait "\$child"
+    status=\$?
+    kill -0 "\$child" 2>/dev/null || break
+done
+exit "\$status"
+STUB
+chmod +x "$CLAIM_STUB"
+
 # WHY EVERY CASE DECLARES ITS ARMS SYNTHETIC
 #
 # `bench_llama_ab.sh` refuses to measure on a host it does not have to itself,
@@ -162,6 +184,7 @@ run_ab() { # [REALHOST:<shim-dir>] <extra args...> -> stdout+stderr in $OUT, cod
 		--model "$MODEL" --prompt-file "$PROMPT" \
 		--port "$PORT" --n-predict 4 --n-ctx 64 \
 		--out-dir "$WORK/home/run$RUN_SEQ/bench" --ready-timeout 25 \
+		--claim-rmlx "$CLAIM_STUB" \
 		${boundary[@]+"${boundary[@]}"} \
 		"$@" 2>&1)"
 	CODE=$?
@@ -302,8 +325,26 @@ run_ab --bin-a "$STUB_A" --bin-b "$STUB_B" --pairs 2 --allow-busy-host
 check_verdict "disjoint ranges at n=2 read SEPARATED-WEAK" 0 "SEPARATED-WEAK n=2-per-arm"
 
 # --- behaviour: disjoint ranges at n=3 read SEPARATED ------------------------
+: >"$WORK/claim_runs"
 run_ab --bin-a "$STUB_A" --bin-b "$STUB_B" --pairs 3 --allow-busy-host
 check_verdict "disjoint ranges at n=3 read SEPARATED" 0 "SEPARATED 0."
+
+# --- every slot's server ran under the Metal claim ---------------------------
+CLAIM_RUNS="$(grep -c '' "$WORK/claim_runs")"
+if [ "$CLAIM_RUNS" -eq 6 ]; then
+	echo "  PASS  each of the 6 slots ran its server under claim run"
+	PASS=$((PASS + 1))
+else
+	echo "  FAIL  each of the 6 slots ran its server under claim run (saw $CLAIM_RUNS)"
+	FAIL=$((FAIL + 1))
+fi
+
+# --- a held claim fails the slot and names the refusal -----------------------
+HELD_CLAIM="$WORK/claim_held"
+printf '#!/bin/sh\necho "claim held by PID 4242 (rmlx serve)" >&2\nexit 11\n' >"$HELD_CLAIM"
+chmod +x "$HELD_CLAIM"
+run_ab --bin-a "$STUB_A" --bin-b "$STUB_B" --pairs 2 --allow-busy-host --claim-rmlx "$HELD_CLAIM"
+check "a held Metal claim fails the slot with exit 11" 125 "server-not-ready (exit 11"
 
 # --- the same three verdicts, with the taint path forced --------------------
 #
