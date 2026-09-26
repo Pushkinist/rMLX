@@ -7,11 +7,13 @@ MLX-format models.
 ## Local-only machine paths
 
 Paths in this file are **relative on purpose** — it is checked in and public.
-Concrete absolute machine paths (the model-snapshot root `RMLX_O_MODELS_ROOT`,
-the single-MLX claim file under `/tmp`, and local sibling repos) live in a
-**gitignored** `LOCAL.md` at the repo root. Use it as a local resolver; never
-copy an absolute path from it into this file, a commit, a report, a log, or
-any artifact that leaves the machine.
+Concrete absolute machine paths (the model-snapshot root `RMLX_O_MODELS_ROOT`
+and local sibling repos) live in a **gitignored** `LOCAL.md` at the repo
+root. Use it as a local resolver; never copy an absolute path from it into
+this file, a commit, a report, a log, or any artifact that leaves the
+machine. The Metal claim path, `/var/tmp/rmlx.claim`, is a fixed system path,
+not a per-machine one — it is safe to write directly; see `docs/CLI.md`
+§ "Claim file".
 
 ## What this project is
 
@@ -141,8 +143,9 @@ coverage grows.
    incoherent output) before adding it to the registry.
 7. **Document the truth, not the docstring**. If an upstream algorithm name
    lies, call it out in code + docs.
-8. **Single MLX process per Mac**. Hold the claim file; unload competing MLX
-   servers before claiming the GPU; never bypass the claim silently.
+8. **Single MLX process per Mac**. A held claim refuses with exit code 11,
+   naming the holder; stop the holder by its PID (`kill <PID>`). Never
+   delete the claim file. See `docs/CLI.md` § "Claim file".
 9. **`make ci-perf` builds + tests under `release-perf` (panic=unwind, debug-assertions off), then runs the GPU/Metal suite.** A failure in the `release-perf` half that doesn't reproduce under `dev` → rebuild under `release-debug` (full DWARF) and re-run the failing case to capture symbols. Never rely on the `dev` profile to reproduce a release-mode bug — codegen and inlining differ. The GPU half is the exception and builds under `dev` on purpose: debug assertions are correctness guards and those are correctness tests. Its consequence: **no gate anywhere executes a `Device::Gpu` test under `release-perf`** — `make test` / `make ci` are `dev` with no `--ignored`, `test-perf` is `release-perf` with no `--ignored`, the GPU suite is `dev` with `--ignored`. A GPU-path defect that appears only with debug-assertions off is therefore out of every gate's scope and must be reproduced by hand at that profile.
 10. **Every KV-cache codec ships an MSL (Metal) decode kernel.** A codec whose decode falls back to CPU dequant is not shippable — it strands the codec at single-digit TPS (GPU idle) and is a bug, not a valid mode. New KV codecs (and the decode path of existing ones) MUST decode on-GPU, reading the quant store directly (fused flash-decode-over-quant; see `docs/KV_FUSED_KERNELS.md` and `docs/FFI.md`). Every MSL kernel body a **production** path can dispatch — KV codec or not — lives in a `.metal` file under a gated `src/metal/` directory (the list is `scripts/metal_dirs.sh`: `rmlx-kv-quant`, `rmlx-models`, `rmlx-mlx`), never in a Rust string literal, and carries a **native-compilation test** (`xcrun -sdk macosx metal -c` at `-std=metal3.1` and `-std=metal4.0`, wired as `make check-metal-compiles` in `make ci`) so MSL syntax errors surface at CI, not on first GPU dispatch. The gate also fails on a `.metal` file its directory's `probes/kernels.manifest` does not name — an unchecked body is the same defect wearing a different hat. Throwaway `#[cfg(test)]` bodies are exempt and stay inline (`metal_kernel_tests.rs` holds a trivial `add_one` smoke and a deliberately-invalid source that must never compile). **Know the gate's boundary:** it keys off directory membership, so it enforces this rule for kernels already in those directories but cannot detect a new inline-MSL literal in a fresh module — that part is review's job, not CI's. Kernels stay **model-agnostic** — keyed off codec + shape (`head_dim`, `kv_heads`, `bits`), never an arch name.
 

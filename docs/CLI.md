@@ -23,6 +23,7 @@ rmlx [global flags] <subcommand> [flags]
 | `metrics` | Metrics database: schema, ingest, queries, export |
 | `eval ppl` | Perplexity over a text corpus |
 | `profile list` | Names of the `serve` profiles in `profiles.toml` |
+| `claim run` | Run a command while holding the claim; see "Claim file" |
 
 `qwen36_diag` is a separate diagnostic binary; see its section below.
 
@@ -461,10 +462,10 @@ Exit `0` all green, `1` any red, `2` internal error.
 |---|---|---|---|
 | `--registry` | path | — | Checks each registered model. Conflicts with `--model`. |
 | `--model` | path | — | Checks one snapshot. Conflicts with `--registry`. |
-| `--port` | u16 | — | Also checks the claim file and `/health` of a server on this port. |
+| `--port` | u16 | — | Also probes the machine-wide claim and checks `/health` on this port. |
 | `--db` | path | `RMLX_METRICS_DB`, else `<RMLX_HOME>/metrics/runs.db` | Metrics DB. |
 | `--min-disk-gb` | u64 | `5` | Free space required for `metrics/` and `logs/`, in GiB. |
-| `--full` | bool flag | off | Also runs the smoke probe per model; loads MLX. |
+| `--full` | bool flag | off | Also runs the smoke probe per model, taking the claim; a held claim reds every smoke line and names the holder. |
 | `--human` | bool flag | off | Plain `OK` / `FAIL` text. |
 
 ---
@@ -621,37 +622,30 @@ Where a variable has a flag, the flag wins.
 
 ## Claim file
 
-Metal allows one GPU context per process. rMLX takes a claim file before it
-uses the GPU. The file is `/tmp/rmlx.<port>.claim`, locked with
-`flock` and holding the owner's PID. Internals are in
-[`SERVER.md`](SERVER.md) § "Claim file".
+rMLX takes one machine-wide claim, an exclusive `flock` on
+`/var/tmp/rmlx.claim`, before it uses the GPU. The file is never deleted.
+Internals are in [`SERVER.md`](SERVER.md) § "Claim file".
 
-| Holder | Port |
-|---|---|
-| `serve` | `--port` |
-| `chat`, `transcribe`, `baseline`, `bench`, `eval ppl`, `info --probe-forward`/`--probe-smoke` | `51966` (`0xCAFE`) |
-| `kv-calibrate` head-budget recipes, during the model load only | `0` |
-| `healthcheck --full` (runs the smoke probe on the GPU) | none |
+A second process that asks for the GPU while the claim is held is refused
+with exit code `11`, naming the recorded holder's PID and command (the
+record can be stale). Confirm with `lsof /var/tmp/rmlx.claim`, then `kill
+<PID>`. Never delete the claim file by hand while it is held — the next
+claimer would lock a fresh file while the old holder still runs.
 
-A claim refuses only a second holder of the same port. That process names the
-PID and exits with code `11`. So these pairs can hold the GPU together:
+`--device` accepts `cpu` or `gpu`. `gpu` (default) takes the claim before any
+model load. `cpu` takes no claim; it refuses every KV codec but `none`
+(`--kv-quant auto` resolves to `none`) and every later GPU stream or Metal
+call. `--gpu-capture` needs `--device gpu`.
 
-- a `serve` and any one-shot command;
-- two `serve` processes on different ports;
-- a one-shot command and a `kv-calibrate` model load;
-- `healthcheck --full` and anything;
-- a `kv-calibrate` measurement, which runs after the claim is released, and
-  anything.
+`rmlx claim run -- <command>` holds the claim for `<command>` and exits with
+its status. Stdin is `/dev/null`; `SIGTERM`, `SIGINT` and `SIGHUP` forward to
+its process group. Held elsewhere, it runs nothing and exits `11`. The
+command must not start `rmlx` itself — the nested claim would be refused.
 
-Other rules:
-
-- `--device cpu` takes no claim.
-- A claim whose PID is dead is reclaimed with a `warn!`; nothing needs
-  removing by hand.
-- Normal exit removes the file; `serve` also removes it on `SIGINT` and
-  `SIGTERM`. `info --probe-smoke` with a non-zero verdict exits without
-  removing it, and the next holder reclaims it.
-- `rmlx healthcheck --port <N>` checks the file without taking it.
+**Legacy per-port claim (one release).** An older build held
+`/tmp/rmlx.<port>.claim`. This build still probes that directory read-only
+first, so it does not miss an old holder, and deletes nothing there. Removed
+in the release after next.
 
 ---
 

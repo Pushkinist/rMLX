@@ -700,8 +700,11 @@ V storage follows the base `KvQuant`:
 `update_paged` has no `Planar3` arm. On the GPU, a paged `Planar3` cache with
 no bf16 mirror appends the new K page and then returns an error for V. By then
 `KvCache::update` has already advanced the offset. Thus the cache is left
-inconsistent, not only refused. On the CPU the same cache falls back to the
-bf16 mirror path.
+inconsistent, not only refused. `update_paged` still branches on `device` and
+falls back to the bf16 mirror path when it is not the GPU, but that branch is
+unreachable in production: `--device cpu` admits no codec but `none`, and
+`none` builds no paged store, so a paged `Planar3` cache never reaches this
+function on the CPU device.
 
 `exit_prefill` seeds the bf16 mirror, and `update_paged` returns early to the
 mirror while it is live. Thus a seeded paged cache decodes from the bf16
