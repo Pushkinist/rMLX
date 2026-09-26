@@ -399,3 +399,25 @@ fn asymmetric_auto_with_tq4_rejected_on_bonsai() {
         r.stderr
     );
 }
+
+/// A code a command returns (here the registry-mode cache-type refusal, 78)
+/// reaches the process exit status. The refusal comes before the device is
+/// parsed, so no claim is taken.
+#[test]
+fn registry_cache_type_refusal_exits_78() {
+    let r = run(&[
+        "serve",
+        "--registry",
+        "no-such-registry.toml",
+        "--device",
+        "cpu",
+        "--cache-type-k",
+        "q8_g64",
+    ]);
+    assert_eq!(r.exit_code, 78, "stderr was: {}", r.stderr);
+    assert!(
+        r.stderr.contains("requires --model"),
+        "expected the refusal in stderr; got: {}",
+        r.stderr
+    );
+}

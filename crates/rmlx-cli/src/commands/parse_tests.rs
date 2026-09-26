@@ -434,7 +434,7 @@ fn auto_resolution_fixtures() -> Vec<(&'static str, &'static str)> {
 fn auto_kv_quant_resolves_to_bf16_for_every_arch_branch() {
     for (name, body) in auto_resolution_fixtures() {
         let cfg: rmlx_loader::ModelConfig = serde_json::from_str(body).unwrap();
-        let resolved = resolve_kv_quant(&cfg, None, None);
+        let resolved = resolve_kv_quant(&cfg, None, None).expect("auto resolves");
         assert_eq!(
             resolved,
             rmlx_kv_quant::KvQuant::None,

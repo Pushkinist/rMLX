@@ -13,8 +13,7 @@
 //! - [`ClaimedDevice`] — a device together with the claim a GPU device needs.
 //! - [`claim_gpu`] — the GPU device with the Metal claim. It is the only place
 //!   this binary names the GPU device.
-//! - [`check_claim`] — a claim refusal becomes [`ClaimHeld`], which `main`
-//!   exits 11 on.
+//! - [`check_claim`] — report a claim refusal as exit code 11.
 //! - [`parse_kv_quant`] — `--kv-quant` string → `Option<KvQuant>`.
 //! - [`parse_kv_preset`] — `--kv-preset` name → [`KvPresetArg`] via the
 //!   static preset table. `"auto"` yields `KvPresetArg::Auto`; unknown names
@@ -38,6 +37,8 @@ use rmlx_mlx::Device;
 use rmlx_models::kv_cache::KvBoundary;
 use rmlx_server::{try_claim, ClaimError, MetalClaim};
 use tracing::error;
+
+use crate::exit::ExitWith;
 
 use crate::commands::preset_table::{lookup_preset, PresetError, AVAILABLE_NAMES};
 
@@ -102,24 +103,16 @@ pub(crate) fn claim_gpu() -> Result<ClaimedDevice, ClaimError> {
     })
 }
 
-/// Another process holds the Metal claim. `main` reports it and exits 11.
-#[derive(Debug)]
-pub(crate) struct ClaimHeld(ClaimError);
-
-impl std::fmt::Display for ClaimHeld {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl std::error::Error for ClaimHeld {}
-
-/// Turn a claim refusal into [`ClaimHeld`], which `main` exits 11 on; any
-/// other claim error is returned as is.
+/// Report a claim refusal and turn it into exit code 11; any other claim error
+/// is returned as is.
 pub(crate) fn check_claim<T>(claim: Result<T, ClaimError>) -> anyhow::Result<T> {
     match claim {
         Ok(held) => Ok(held),
-        Err(e @ ClaimError::AlreadyHeld { .. }) => Err(ClaimHeld(e).into()),
+        Err(e @ ClaimError::AlreadyHeld { .. }) => {
+            error!(error = %e, "Metal claim held by another process — refusing to start");
+            eprintln!("error: {e}\nrMLX exits with code 11.");
+            Err(ExitWith(11).into())
+        }
         Err(e) => {
             error!(
                 error = %e,
@@ -319,10 +312,10 @@ pub(crate) fn reject_paged_kv_without_store(
 /// - `(None, Some(spec))` → resolve the per-side spec. A side the operator left
 ///   `auto` takes the named side's canonical partner, not the engine default —
 ///   see [`rmlx_models::kv_cache::resolve_cache_type`]. On `Err`, log + hint +
-///   `exit(78)`.
+///   exit code 78.
 /// - `(None, None)` → [`rmlx_models::kv_cache::DEFAULT_KV_QUANT`].
 /// - `(Some(_), Some(_))` → defense-in-depth (clap should have rejected this);
-///   log + hint + `exit(78)`. No panic.
+///   log + hint + exit code 78. No panic.
 ///
 /// On success: emits a `tracing::info!` with `arch`, `head_dim`, resolved
 /// `KvQuant`. If the resolved quant is non-`None` AND the arch is Gemma3 or
@@ -337,7 +330,7 @@ pub(crate) fn resolve_kv_quant(
     model_cfg: &rmlx_loader::ModelConfig,
     kv_quant_override: Option<rmlx_kv_quant::KvQuant>,
     cts_override: Option<rmlx_models::kv_cache::CacheTypeSpec>,
-) -> rmlx_kv_quant::KvQuant {
+) -> anyhow::Result<rmlx_kv_quant::KvQuant> {
     use rmlx_kv_quant::KvQuant;
     use rmlx_models::kv_cache::{
         resolve_cache_type, validate_resolved_kv_quant, ResolverContext, DEFAULT_KV_QUANT,
@@ -364,7 +357,7 @@ pub(crate) fn resolve_kv_quant(
                 );
                 eprintln!("error: {e}");
                 eprintln!("see docs/KV_QUANT.md for supported codecs and combinations");
-                std::process::exit(78);
+                return Err(ExitWith(78).into());
             }
             kq
         }
@@ -385,7 +378,7 @@ pub(crate) fn resolve_kv_quant(
                     );
                     eprintln!("error: {e}");
                     eprintln!("see docs/KV_QUANT.md for supported codecs and combinations");
-                    std::process::exit(78);
+                    return Err(ExitWith(78).into());
                 }
             }
         }
@@ -399,7 +392,7 @@ pub(crate) fn resolve_kv_quant(
             );
             eprintln!("error: --kv-quant and --cache-type-k/--cache-type-v are mutually exclusive");
             eprintln!("see docs/KV_QUANT.md for supported codecs and combinations");
-            std::process::exit(78);
+            return Err(ExitWith(78).into());
         }
     };
 
@@ -422,7 +415,7 @@ pub(crate) fn resolve_kv_quant(
         tracing::info!("SWA layers always use bf16 — only full-attention layers are quantized");
     }
 
-    final_kv_quant
+    Ok(final_kv_quant)
 }
 
 /// Reject a zero `--max-prompt-tokens`; `truncate(0)` would empty the prompt.
@@ -683,7 +676,7 @@ pub(crate) fn resolve_model_flags(
     };
     let max_ctx_override = parse_max_ctx(max_ctx)?;
     let cfg = rmlx_loader::load_config(model).map_err(|e| anyhow::anyhow!("load_config: {e}"))?;
-    let kv_quant_final = resolve_kv_quant(&cfg, kv_quant_opt, cts_override);
+    let kv_quant_final = resolve_kv_quant(&cfg, kv_quant_opt, cts_override)?;
     Ok((kv_quant_final, max_ctx_override))
 }
 

@@ -1,6 +1,7 @@
 // CLI binary: user-facing output. tracing not appropriate for command results.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+use crate::exit::ExitWith;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
@@ -66,7 +67,7 @@ pub(super) fn cmd_best(
     match row {
         None => {
             eprintln!("no champion found for the given cell + metric");
-            std::process::exit(1);
+            return Err(ExitWith(1).into());
         }
         Some(r) => {
             println!("{}", serde_json::to_string(&r)?);
@@ -228,10 +229,10 @@ pub(super) fn cmd_regress(
     // 1 = regressed beyond threshold
     // 0 = within tolerance
     if result.champion_value.is_none() || result.latest_value.is_none() {
-        std::process::exit(125);
+        return Err(ExitWith(125).into());
     }
     if result.regressed {
-        std::process::exit(1);
+        return Err(ExitWith(1).into());
     }
     Ok(())
 }
@@ -260,13 +261,13 @@ pub(super) fn cmd_deltas(
         if has_baseline {
             let any_regressed = rows.iter().any(|r| r.regressed);
             if any_regressed {
-                std::process::exit(1);
+                return Err(ExitWith(1).into());
             }
         } else {
             // All rows lack a baseline (new cells never measured before the SHA).
             // Treat as "no comparison possible" → skip (exit 125, bisect-safe).
             if !rows.is_empty() {
-                std::process::exit(125);
+                return Err(ExitWith(125).into());
             }
             // Zero rows with a known SHA means the SHA exists but every cell
             // was within threshold — clean, exit 0.
@@ -384,7 +385,7 @@ pub(super) fn cmd_open(db_path: &Path, readonly: bool) -> anyhow::Result<()> {
     // Inherit all stdio so the interactive session works.
     let status = cmd.status().context("launch sqlite3")?;
     if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
+        return Err(ExitWith(status.code().unwrap_or(1)).into());
     }
     Ok(())
 }

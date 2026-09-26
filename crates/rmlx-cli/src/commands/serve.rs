@@ -695,7 +695,7 @@ pub(crate) fn run_serve(
                 arch_name
             );
             eprintln!("error: architecture '{arch_name}' not yet supported");
-            std::process::exit(1);
+            return Err(crate::exit::ExitWith(1).into());
         }
         Arc::new(ModelRegistry::from_paths(&[p.to_path_buf()]))
     } else {

@@ -41,8 +41,7 @@ use tracing::{info, warn};
 /// `None` = auto (`DEFAULT_KV_QUANT`); `Some(q)` = explicit override.
 /// Exit-code outcome for `--probe-smoke`.
 ///
-/// The variant maps 1:1 to the process exit code the caller passes to
-/// `std::process::exit`:
+/// The variant maps 1:1 to the process exit code:
 ///
 /// - `0` = coherent output; snapshot is healthy.
 /// - `1` = incoherent output (`BrokenPunctLoop` or `BrokenNan`).
@@ -68,7 +67,7 @@ pub(crate) enum SmokeExitCode {
 }
 
 impl SmokeExitCode {
-    /// Convert to the integer exit code passed to `std::process::exit`.
+    /// Convert to the integer process exit code.
     #[must_use]
     pub(crate) fn as_i32(self) -> i32 {
         self as i32

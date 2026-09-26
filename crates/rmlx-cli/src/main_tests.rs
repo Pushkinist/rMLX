@@ -381,9 +381,12 @@ fn claim_refusal_maps_to_exit_code_11() {
     }))
     .map(|()| 0);
     assert_eq!(
-        super::exit_code(held).expect("a refusal is an exit code"),
+        crate::exit::exit_code(held).expect("a refusal is an exit code"),
         11
     );
-    assert_eq!(super::exit_code(Ok(3)).expect("a code passes through"), 3);
-    assert!(super::exit_code(Err(anyhow::anyhow!("other"))).is_err());
+    assert_eq!(
+        crate::exit::exit_code(Ok(3)).expect("a code passes through"),
+        3
+    );
+    assert!(crate::exit::exit_code(Err(anyhow::anyhow!("other"))).is_err());
 }

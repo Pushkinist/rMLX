@@ -1,6 +1,7 @@
 // CLI binary: user-facing output. tracing not appropriate for command results.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+use crate::exit::ExitWith;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
@@ -218,7 +219,7 @@ fn cmd_record_replay(db_path: &Path, dry_run: bool) -> anyhow::Result<()> {
 
     println!("replay summary: ok={count_ok}, fail={count_fail}");
     if count_fail > 0 {
-        std::process::exit(2);
+        return Err(ExitWith(2).into());
     }
     Ok(())
 }

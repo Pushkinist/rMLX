@@ -37,6 +37,7 @@ static GLOBAL: dhat::Alloc = dhat::Alloc;
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod commands;
+mod exit;
 mod panic_hook;
 mod startup;
 
@@ -44,7 +45,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use commands::parse::ClaimHeld;
+use exit::exit_code;
 use rmlx_core::runinfo::make_run_id;
 use rmlx_metrics::events::EventRecorder;
 use startup::{
@@ -1858,22 +1859,6 @@ fn finish(log_guard: WorkerGuard, outcome: Result<i32>) -> Result<()> {
     std::process::exit(code)
 }
 
-/// The exit code for a command's outcome. A refused Metal claim is 11; any
-/// other error is returned.
-fn exit_code(outcome: Result<i32>) -> Result<i32> {
-    match outcome {
-        Ok(code) => Ok(code),
-        Err(e) => match e.downcast::<ClaimHeld>() {
-            Ok(held) => {
-                tracing::error!(error = %held, "Metal claim held by another process — refusing to start");
-                eprintln!("error: {held}\nrMLX exits with code 11.");
-                Ok(11)
-            }
-            Err(e) => Err(e),
-        },
-    }
-}
-
 /// Everything after the log writer starts. Returns the exit code.
 #[allow(
     clippy::expect_used,
@@ -2253,7 +2238,7 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
                         .map_err(|e| anyhow::anyhow!("load_config: {e}"))?;
                     let preset_kq = resolve_preset_arg(preset_arg);
                     info!(kv_quant = ?preset_kq, "--kv-preset resolved");
-                    let kq = commands::parse::resolve_kv_quant(&cfg, Some(preset_kq), None);
+                    let kq = commands::parse::resolve_kv_quant(&cfg, Some(preset_kq), None)?;
                     (Some(kq), max_ctx_override)
                 } else {
                     let (kq, ctx) = resolve_model_flags(
@@ -2306,7 +2291,7 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
                         "error: --cache-type-k/--cache-type-v requires --model (not --registry)"
                     );
                     eprintln!("see docs/KV_QUANT.md for supported codecs and combinations");
-                    return Ok(78);
+                    return Err(exit::ExitWith(78).into());
                 }
                 (kv_quant_opt, max_ctx_override)
             };
@@ -2391,7 +2376,7 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
                     .map_err(|e| anyhow::anyhow!("load_config: {e}"))?;
                 let preset_kq = resolve_preset_arg(preset_arg);
                 info!(kv_quant = ?preset_kq, "--kv-preset resolved");
-                let kq = commands::parse::resolve_kv_quant(&cfg, Some(preset_kq), None);
+                let kq = commands::parse::resolve_kv_quant(&cfg, Some(preset_kq), None)?;
                 (kq, max_ctx_override)
             } else {
                 resolve_model_flags(
@@ -2473,7 +2458,7 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
                     .map_err(|e| anyhow::anyhow!("load_config: {e}"))?;
                 let preset_kq = resolve_preset_arg(preset_arg);
                 info!(kv_quant = ?preset_kq, "--kv-preset resolved");
-                let kq = commands::parse::resolve_kv_quant(&cfg, Some(preset_kq), None);
+                let kq = commands::parse::resolve_kv_quant(&cfg, Some(preset_kq), None)?;
                 (kq, max_ctx_override)
             } else {
                 resolve_model_flags(
@@ -2591,7 +2576,7 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
                     .map_err(|e| anyhow::anyhow!("load_config: {e}"))?;
                 let preset_kq = resolve_preset_arg(preset_arg);
                 info!(kv_quant = ?preset_kq, "--kv-preset resolved");
-                let kq = commands::parse::resolve_kv_quant(&cfg, Some(preset_kq), None);
+                let kq = commands::parse::resolve_kv_quant(&cfg, Some(preset_kq), None)?;
                 (kq, max_ctx_override)
             } else {
                 resolve_model_flags(
@@ -2729,7 +2714,7 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
                     .map_err(|e| anyhow::anyhow!("load_config: {e}"))?;
                 let preset_kq = resolve_preset_arg(preset_arg);
                 info!(kv_quant = ?preset_kq, "--kv-preset resolved");
-                let kq = commands::parse::resolve_kv_quant(&cfg, Some(preset_kq), None);
+                let kq = commands::parse::resolve_kv_quant(&cfg, Some(preset_kq), None)?;
                 (kq, max_ctx_override)
             } else {
                 resolve_model_flags(
@@ -2817,7 +2802,7 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
                         &cfg,
                         Some(preset_kq),
                         None,
-                    ))
+                    )?)
                 } else {
                     let (kq, _) = resolve_model_flags(
                         &model,
