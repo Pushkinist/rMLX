@@ -93,11 +93,11 @@ raised to meet the target would claim tokens that no payload holds.
 
 The rotor and iso stores do not clamp: they set `shape[2]` to the target. A
 ring-only tail lies below `shape[2]`, and the ring readback returns `Err` on an
-over-long target. So for `n > shape[2]` the mixed variants leave the two axes of one
-codec at different lengths. These are `IsoV3`, `IsoV4`, `RotorV3` and `RotorV4`,
-where the q8 K (`QuantK`) clamps. They are also `RotorKAsym3/4`, where the
-TurboQuant V (`QuantV`) clamps. The guard on the unclamped side reports it at
-spill.
+over-long target. So for `n > shape[2]` the mixed variants leave the two axes
+of one codec at different lengths. These are `IsoV3`, `IsoV4`, `RotorV3` and
+`RotorV4`, where the q8 K (`QuantK`) clamps. They are also `RotorKAsym3/4`,
+where the TurboQuant V (`QuantV`) clamps. The guard on the unclamped side
+reports it at spill.
 
 **`Mixed` truncates to its fill marker.** `MixedKvState` is a capacity
 buffer that grows in `STEP` increments, with `offset` as its fill marker.

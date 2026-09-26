@@ -476,9 +476,10 @@ def check_views(sources: dict[str, str], enums: dict[str, list[str]]) -> int:
     those fns the scan read.
 
     An arm with `..` compiles when a field is added to its variant, so the new
-    field is left out of every site the view serves with no error anywhere. An arm that binds a slot to `_` does the same to that slot. The
-    knob set is fixed, so an unknown field name fails closed. The count lets
-    the real-tree pin see a renamed fn.
+    field is left out of every site the view serves with no error anywhere.
+    An arm that binds a slot to `_` does the same to that slot. The knob set
+    is fixed, so an unknown field name fails closed. The count lets the
+    real-tree pin see a renamed fn.
     """
     found = 0
     for rel, blanked in sources.items():

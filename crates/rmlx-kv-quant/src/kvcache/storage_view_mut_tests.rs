@@ -12,6 +12,13 @@
 //! full fill and past the fill, where the unclamped stores refuse the next
 //! read. A view arm that drops a slot leaves that slot uncut, and the digest
 //! changes.
+//!
+//! The digest does not see a store's GPU bookkeeping, and that is where a
+//! store's own `reset` and its `truncate_to(0)` differ. So both copies get a
+//! sentinel GPU capacity before each operation, and the state after it
+//! includes that capacity: a `reset` sets it to 0, a `truncate_to` keeps it.
+//! The paged slots show the same difference in the page ids they allocate
+//! next.
 #![allow(
     clippy::too_many_lines,
     clippy::match_same_arms,
@@ -23,7 +30,10 @@ use super::core::KvCache;
 use super::deep_clone_digest_tests::fill;
 use super::store_bytes_tests::{store_digest, CHUNK_SEQ, TEST_MAX_SEQ};
 use crate::paged::{PagedKStorage, PagedPlanarVStorage, PagedVStorage};
-use crate::storage::KvStorage;
+use crate::storage::{
+    KvStorage, QuantIsoK, QuantIsoV, QuantK, QuantKTurbo, QuantPlanarK, QuantPlanarV, QuantRotorK,
+    QuantRotorV, QuantV,
+};
 use crate::test_utils::env_lock;
 use crate::{KvQuant, ALL_KV_QUANTS};
 use rmlx_core::error::Result;
@@ -634,14 +644,198 @@ fn probe_bits(probe: Option<Result<Vec<f32>>>) -> ProbeBits {
     })
 }
 
-/// The store digest and the CPU dequant of the K and V slots.
-fn state(storage: &KvStorage) -> (u64, ProbeBits, ProbeBits) {
+/// A GPU capacity no append writes, so a store that still holds it after an
+/// operation kept its GPU buffers.
+const SENTINEL_CAPACITY: i32 = 7;
+
+/// The GPU bookkeeping of a store that its `reset` clears and its
+/// `truncate_to` keeps.
+trait GpuBookkeeping {
+    fn set_sentinel(&mut self);
+    fn read(&self) -> Vec<i32>;
+}
+
+macro_rules! flat_gpu_bookkeeping {
+    ($($store:ty),* $(,)?) => {$(
+        impl GpuBookkeeping for $store {
+            fn set_sentinel(&mut self) {
+                self.gpu_capacity = SENTINEL_CAPACITY;
+            }
+            fn read(&self) -> Vec<i32> {
+                vec![self.gpu_capacity]
+            }
+        }
+    )*};
+}
+
+flat_gpu_bookkeeping!(QuantK, QuantV, QuantPlanarK, QuantPlanarV);
+
+impl<const BITS: u8> GpuBookkeeping for QuantKTurbo<BITS> {
+    fn set_sentinel(&mut self) {
+        self.gpu_capacity = SENTINEL_CAPACITY;
+    }
+    fn read(&self) -> Vec<i32> {
+        vec![self.gpu_capacity]
+    }
+}
+
+impl<const BITS: u8> GpuBookkeeping for QuantIsoK<BITS> {
+    fn set_sentinel(&mut self) {
+        self.gpu.capacity = SENTINEL_CAPACITY;
+    }
+    fn read(&self) -> Vec<i32> {
+        vec![self.gpu.capacity]
+    }
+}
+
+impl<const BITS: u8> GpuBookkeeping for QuantIsoV<BITS> {
+    fn set_sentinel(&mut self) {
+        self.gpu.capacity = SENTINEL_CAPACITY;
+        self.gpu_capacity = SENTINEL_CAPACITY;
+    }
+    fn read(&self) -> Vec<i32> {
+        vec![self.gpu.capacity, self.gpu_capacity, self.gpu_offset]
+    }
+}
+
+impl<const BITS: u8> GpuBookkeeping for QuantRotorK<BITS> {
+    fn set_sentinel(&mut self) {
+        self.gpu.capacity = SENTINEL_CAPACITY;
+    }
+    fn read(&self) -> Vec<i32> {
+        vec![self.gpu.capacity]
+    }
+}
+
+impl<const BITS: u8> GpuBookkeeping for QuantRotorV<BITS> {
+    fn set_sentinel(&mut self) {
+        self.gpu.capacity = SENTINEL_CAPACITY;
+    }
+    fn read(&self) -> Vec<i32> {
+        vec![self.gpu.capacity]
+    }
+}
+
+/// Call `f` on every filled store slot of `storage`, in K, V order.
+fn for_each_store(storage: &mut KvStorage, f: &mut dyn FnMut(Option<&mut dyn GpuBookkeeping>)) {
+    fn visit<T: GpuBookkeeping>(
+        slot: &mut Option<T>,
+        f: &mut dyn FnMut(Option<&mut dyn GpuBookkeeping>),
+    ) {
+        match slot {
+            Some(store) => f(Some(store)),
+            None => f(None),
+        }
+    }
+    match storage {
+        KvStorage::K8V4 { k, v }
+        | KvStorage::K8VTurbo3 { k, v }
+        | KvStorage::K8VTurbo3Tcq { k, v }
+        | KvStorage::K8VTurbo2 { k, v }
+        | KvStorage::K8VTurbo2Tcq { k, v } => {
+            visit(k, f);
+            visit(v, f);
+        }
+        KvStorage::K8V8 { k, v } => {
+            visit(k, f);
+            visit(v, f);
+        }
+        KvStorage::Planar { k, v, bits: _ } => {
+            visit(k, f);
+            visit(v, f);
+        }
+        KvStorage::PlanarK { k } => visit(k, f),
+        KvStorage::TurboSym3 { k, v } => {
+            visit(k, f);
+            visit(v, f);
+        }
+        KvStorage::TurboSym4 { k, v } => {
+            visit(k, f);
+            visit(v, f);
+        }
+        KvStorage::IsoV3 { k, v } => {
+            visit(k, f);
+            visit(v, f);
+        }
+        KvStorage::IsoV4 { k, v } => {
+            visit(k, f);
+            visit(v, f);
+        }
+        KvStorage::IsoSym3 { k, v } => {
+            visit(k, f);
+            visit(v, f);
+        }
+        KvStorage::IsoSym4 { k, v } => {
+            visit(k, f);
+            visit(v, f);
+        }
+        KvStorage::IsoKOnly3 { k } => visit(k, f),
+        KvStorage::IsoKOnly4 { k } => visit(k, f),
+        KvStorage::RotorV3 { k, v } => {
+            visit(k, f);
+            visit(v, f);
+        }
+        KvStorage::RotorV4 { k, v } => {
+            visit(k, f);
+            visit(v, f);
+        }
+        KvStorage::RotorSym3 { k, v } => {
+            visit(k, f);
+            visit(v, f);
+        }
+        KvStorage::RotorSym4 { k, v } => {
+            visit(k, f);
+            visit(v, f);
+        }
+        KvStorage::RotorKOnly3 { k } => visit(k, f),
+        KvStorage::RotorKOnly4 { k } => visit(k, f),
+        KvStorage::RotorKAsym3 {
+            k,
+            v,
+            v_bits: _,
+            v_group_size: _,
+        } => {
+            visit(k, f);
+            visit(v, f);
+        }
+        KvStorage::RotorKAsym4 {
+            k,
+            v,
+            v_bits: _,
+            v_group_size: _,
+        } => {
+            visit(k, f);
+            visit(v, f);
+        }
+        // `Mixed` keeps no GPU bookkeeping beside its payload, and `None` has
+        // no store. The paged slots have their own test below.
+        KvStorage::None {} | KvStorage::Mixed { .. } | KvStorage::Paged { .. } => {}
+    }
+}
+
+fn set_sentinels(storage: &mut KvStorage) {
+    for_each_store(storage, &mut |store| {
+        if let Some(store) = store {
+            store.set_sentinel();
+        }
+    });
+}
+
+fn gpu_bookkeeping(storage: &mut KvStorage) -> Vec<Option<Vec<i32>>> {
+    let mut out = Vec::new();
+    for_each_store(storage, &mut |store| out.push(store.map(|s| s.read())));
+    out
+}
+
+type State = (u64, ProbeBits, ProbeBits, Vec<Option<Vec<i32>>>);
+
+/// The store digest, the CPU dequant of the K and V slots, and the GPU
+/// bookkeeping of every store.
+fn state(storage: &mut KvStorage) -> State {
     let [k, v, _] = storage.view().slots;
-    (
-        store_digest(storage),
-        probe_bits(k.and_then(|slot| slot.dequant_f32(Device::Cpu))),
-        probe_bits(v.and_then(|slot| slot.dequant_f32(Device::Cpu))),
-    )
+    let k = probe_bits(k.and_then(|slot| slot.dequant_f32(Device::Cpu)));
+    let v = probe_bits(v.and_then(|slot| slot.dequant_f32(Device::Cpu)));
+    (store_digest(storage), k, v, gpu_bookkeeping(storage))
 }
 
 #[test]
@@ -665,9 +859,11 @@ fn view_mut_sites_leave_the_storage_of_the_old_matches_for_every_codec() {
                     .try_deep_clone()
                     .expect("clone for the old copy");
                 let mut new = cache.storage.try_deep_clone().expect("clone for the view");
+                set_sentinels(&mut old);
+                set_sentinels(&mut new);
                 run_old(&mut old, op);
                 run_new(&mut new, op);
-                let (old_state, new_state) = (state(&old), state(&new));
+                let (old_state, new_state) = (state(&mut old), state(&mut new));
                 if matches!(old_state.1, Some(Err(_))) || matches!(old_state.2, Some(Err(_))) {
                     refused += 1;
                 }
@@ -787,6 +983,33 @@ fn paged_empty() -> KvStorage {
     }
 }
 
+/// The ids of the next two pages each paged slot allocates. `reset` returns
+/// every page to the free list and restarts the fresh ids at 0; `truncate_to`
+/// returns only the pages past the cut.
+#[allow(
+    clippy::expect_used,
+    reason = "test probe: a CPU page allocation must succeed, and the panic names the slot"
+)]
+fn next_page_ids(storage: &mut KvStorage) -> [Option<[usize; 2]>; 3] {
+    let KvStorage::Paged {
+        k, v_k8, v_planar, ..
+    } = storage
+    else {
+        panic!("the paged fixture is not paged");
+    };
+    macro_rules! two {
+        ($slot:expr) => {
+            $slot.as_mut().map(|s| {
+                [
+                    s.codes.alloc(Device::Cpu).expect("allocate a page"),
+                    s.codes.alloc(Device::Cpu).expect("allocate a page"),
+                ]
+            })
+        };
+    }
+    [two!(k), two!(v_k8), two!(v_planar)]
+}
+
 #[test]
 fn view_mut_sites_leave_the_paged_storage_of_the_old_matches() {
     let page_targets = [-1, 0, 5, PAGE_TOKENS, PAGE_TOKENS + 7, 2 * PAGE_TOKENS];
@@ -804,6 +1027,11 @@ fn view_mut_sites_leave_the_paged_storage_of_the_old_matches() {
                 paged_state(&new),
                 paged_state(&old),
                 "paged {label} {op:?}: the view-based fn left another storage"
+            );
+            assert_eq!(
+                next_page_ids(&mut new),
+                next_page_ids(&mut old),
+                "paged {label} {op:?}: the view-based fn left another page free list"
             );
         }
     }
