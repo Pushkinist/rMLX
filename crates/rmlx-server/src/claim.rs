@@ -18,7 +18,7 @@
 
 use std::fs::{File, OpenOptions, Permissions, TryLockError};
 use std::io::{self, Read as _};
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::{FileExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
@@ -68,7 +68,7 @@ pub enum ClaimError {
 
 /// Holds the Metal claim until it is dropped. The flock releases when the
 /// last fd on its open file closes; the file stays. A child that inherits the
-/// fd (see [`AsFd`]) holds the flock too.
+/// fd holds the flock too.
 #[derive(Debug)]
 pub struct MetalClaim {
     file: File,
@@ -77,6 +77,14 @@ pub struct MetalClaim {
 impl AsFd for MetalClaim {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.file.as_fd()
+    }
+}
+
+/// Give up the claim's fd, for a process that hands the claim to a child it
+/// starts.
+impl From<MetalClaim> for OwnedFd {
+    fn from(claim: MetalClaim) -> Self {
+        claim.file.into()
     }
 }
 

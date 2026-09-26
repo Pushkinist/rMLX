@@ -1684,8 +1684,8 @@ enum ProfileCmd {
 enum ClaimCmd {
     /// Run a non-interactive command while this process holds the Metal claim.
     ///
-    /// The command's stdin is the claim, not the terminal, so the claim stays
-    /// held until the command exits. SIGTERM, SIGINT and SIGHUP are forwarded to
+    /// The command inherits the claim, so the claim stays held until the command
+    /// exits; its stdin is /dev/null, not the terminal. SIGTERM, SIGINT and SIGHUP are forwarded to
     /// its process group, and `rmlx claim run` exits with its status. When
     /// another process holds the claim, nothing runs and the exit code is 11.
     ///

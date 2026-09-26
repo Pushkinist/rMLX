@@ -8,6 +8,7 @@
 
 use super::*;
 use std::fs::{File, TryLockError};
+use std::io::{BufRead as _, BufReader, IsTerminal as _, Write as _};
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::Instant;
@@ -16,12 +17,8 @@ fn sh(script: &str) -> Vec<OsString> {
     vec!["/bin/sh".into(), "-c".into(), script.into()]
 }
 
-const BODY: &str = "4242 rmlx claim run -- stand-in";
-
 fn temp_lock(dir: &Path) -> OwnedFd {
-    let path = dir.join("lock");
-    std::fs::write(&path, BODY).unwrap();
-    let file = File::options().read(true).write(true).open(&path).unwrap();
+    let file = File::create(dir.join("lock")).unwrap();
     file.lock().unwrap();
     OwnedFd::from(file)
 }
@@ -46,41 +43,52 @@ fn wait_for(path: &Path, limit: Duration) -> bool {
     false
 }
 
-/// The child's stdin is the lock file: reading it to the end gives the file's
-/// body and does not block, and the child holds the lock while it runs.
+/// The child holds the lock through its inherited fd after dropping its
+/// stdin, and this process keeps no copy: the lock frees when the child
+/// closes that fd, while the child still runs. The child's stdin is empty.
 #[test]
 fn claim_run_child_holds_the_lock() {
     let dir = tempfile::tempdir().unwrap();
-    let ready = dir.path().join("ready");
-    let go = dir.path().join("go");
-    let stdin_copy = dir.path().join("stdin");
-    let command = sh(&format!(
-        "cat >{stdin_copy}; touch {ready}; i=0; \
-         while [ ! -e {go} ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done",
-        stdin_copy = stdin_copy.display(),
-        ready = ready.display(),
-        go = go.display(),
-    ));
+    let step = |name: &str| dir.path().join(name);
     let lock = temp_lock(dir.path());
+    let fd = lock.as_raw_fd();
+    let command = sh(&format!(
+        "cat >{stdin}; exec 0</dev/null; touch {ready}; \
+         i=0; while [ ! -e {close} ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done; \
+         exec {fd}<&-; touch {closed}; \
+         i=0; while [ ! -e {done} ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done",
+        stdin = step("stdin").display(),
+        ready = step("ready").display(),
+        close = step("close").display(),
+        closed = step("closed").display(),
+        done = step("done").display(),
+    ));
     let (_sender, signals) = mpsc::channel();
     let runner = std::thread::spawn(move || run_holding(lock, &command, &signals));
 
     assert!(
-        wait_for(&ready, Duration::from_secs(10)),
+        wait_for(&step("ready"), Duration::from_secs(10)),
         "the child's stdin read blocked"
     );
-    let held_by_child = locked_elsewhere(dir.path());
-    File::create(&go).unwrap();
+    let held_after_stdin_redirect = locked_elsewhere(dir.path());
+    File::create(step("close")).unwrap();
+    assert!(wait_for(&step("closed"), Duration::from_secs(10)));
+    let held_after_child_closed = locked_elsewhere(dir.path());
+    File::create(step("done")).unwrap();
     assert_eq!(runner.join().unwrap().unwrap(), 0);
-    assert_eq!(
-        std::fs::read_to_string(&stdin_copy).unwrap(),
-        BODY,
-        "the child's stdin must be the lock file"
-    );
-    assert!(held_by_child, "the child must hold the lock");
+
     assert!(
-        !locked_elsewhere(dir.path()),
-        "the lock must be free once the child exits"
+        held_after_stdin_redirect,
+        "the child must hold the lock after redirecting its stdin"
+    );
+    assert!(
+        !held_after_child_closed,
+        "this process must keep no copy of the lock while the child runs"
+    );
+    assert_eq!(
+        std::fs::read(step("stdin")).unwrap(),
+        b"",
+        "the child's stdin must be empty"
     );
 }
 
@@ -147,26 +155,72 @@ fn claim_run_forwards_sigterm() {
     );
 }
 
-/// Each forwarded signal sent to this process arrives on the channel instead
-/// of acting on the process.
+const FORWARDED: [(&str, i32); 3] = [
+    ("TERM", libc::SIGTERM),
+    ("INT", libc::SIGINT),
+    ("HUP", libc::SIGHUP),
+];
+
+/// Each forwarded signal sent to a process running `forward_signals` arrives
+/// on its channel instead of acting on the process. The handlers stay for the
+/// life of a process, so they are installed in a child of this test binary.
 #[test]
 fn claim_run_receives_sigterm_sigint_and_sighup() {
-    let signals = forward_signals().unwrap();
-    let pid = std::process::id().to_string();
-    for (name, number) in [
-        ("TERM", libc::SIGTERM),
-        ("INT", libc::SIGINT),
-        ("HUP", libc::SIGHUP),
-    ] {
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "commands::claim_run::tests::signal_receiver_child",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, "go").unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap())
+        .lines()
+        .map_while(Result::ok)
+        // libtest writes its `test <name> ... ` prefix on the child's first line.
+        .filter_map(|line| line.find("signal-child ").map(|at| line[at..].to_owned()));
+    assert_eq!(lines.next().as_deref(), Some("signal-child ready"));
+    let pid = child.id().to_string();
+    for (name, number) in FORWARDED {
         let sent = Command::new("/bin/kill")
             .args([format!("-{name}"), pid.clone()])
             .status()
             .unwrap();
         assert!(sent.success(), "kill -{name} failed");
         assert_eq!(
-            signals.recv_timeout(Duration::from_secs(5)),
-            Ok(number),
+            lines.next(),
+            Some(format!("signal-child got {number}")),
             "SIG{name} must reach the channel"
         );
+    }
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+}
+
+/// The child half of the signal test: installs the handlers, reports each
+/// signal it receives, and returns at once when run by hand from a terminal.
+#[test]
+#[ignore = "child process of claim_run_receives_sigterm_sigint_and_sighup; the parent test starts it"]
+fn signal_receiver_child() {
+    let stdin = io::stdin();
+    if stdin.is_terminal() {
+        return;
+    }
+    let mut go = String::new();
+    if stdin.lock().read_line(&mut go).is_err() || go.trim() != "go" {
+        return;
+    }
+    let signals = forward_signals().unwrap();
+    println!("signal-child ready");
+    for _ in FORWARDED {
+        let number = signals.recv_timeout(Duration::from_secs(5)).unwrap();
+        println!("signal-child got {number}");
     }
 }
