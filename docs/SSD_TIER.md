@@ -388,7 +388,9 @@ A reader whose `model_id` or `kv_quant` differs fails with
 `BlockIoError::ModelIdMismatch` or `KvQuantMismatch` before any tensor read.
 
 Each hydrated layer gets the codec the arch builder gives that layer
-(`kv_layer_quants`), not the block's base codec. The caller passes that vector
+(`ArchPromptCache::layer_quants`: `kv_layer_quants`, or the base codec on
+every layer for an arch declared `with_uniform_layers`), not the block's base
+codec. The caller passes that vector
 to `SsdHydrator::lookup`, and a vector whose length is not the block's layer
 count is an error, which the tier treats as a corrupt block. A boundary layer
 holds the boundary floor, not the base codec

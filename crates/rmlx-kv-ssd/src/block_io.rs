@@ -430,8 +430,8 @@ pub(crate) fn write_caches_timed(
 /// `layer_quants[i]`, the codec the arch builder gives that layer, not the
 /// block's base `kv_quant`. Returns
 /// `Err(BlockIoError::ModelIdMismatch | KvQuantMismatch)` on a metadata
-/// mismatch, `Err` when `layer_quants` and the block's layer count differ, and
-/// any deserialize error otherwise — the caller treats every
+/// mismatch, `Err(Error::Config)` before any tensor read when `layer_quants`
+/// and the block's layer count differ, and any deserialize error otherwise — the caller treats every
 /// `Err` as a corrupt block (delete file + index row, fall through to
 /// prefill). Host-materialization (`to_bytes`) happens here, so call this off
 /// the hot path.
@@ -520,15 +520,16 @@ fn read_caches_inner(
     };
     let dur_read_us = t_read.elapsed().as_micros() as u64;
 
-    let t_dequant = Instant::now();
-    let (layers, lin_caches) = reader.hydrate(model_id, kv_quant, device)?;
-    if layers.len() != layer_quants.len() {
-        return Err(Error::Mlx(format!(
-            "KV block read: {} layers in the block, {} layer codecs given",
-            layers.len(),
+    let n_layers = reader.n_layers()?;
+    if n_layers != layer_quants.len() {
+        return Err(Error::Config(format!(
+            "KV block read: the block holds {n_layers} layers, the caller gave {} layer codecs",
             layer_quants.len()
         )));
     }
+
+    let t_dequant = Instant::now();
+    let (layers, lin_caches) = reader.hydrate(model_id, kv_quant, device)?;
     let offset = reader.seq_len()?;
     let dur_dequant_us = t_dequant.elapsed().as_micros() as u64;
 
@@ -1930,6 +1931,13 @@ impl KvBlockReader {
         read_meta(&self.header()?, META_KV_QUANT)
     }
 
+    /// Read the `n_layers` header: the number of attention layers in the block.
+    pub fn n_layers(&self) -> Result<usize> {
+        read_meta(&self.header()?, META_N_LAYERS)?
+            .parse()
+            .map_err(|e| BlockIoError::Header(format!("bad n_layers: {e}")).into())
+    }
+
     /// Read the recorded filled sequence length (`seq_len` header) — the number
     /// of prompt tokens this block was spilled at. Used by the hydrate
     /// path to set each reconstructed `KvCache`'s `offset`.
@@ -1983,9 +1991,7 @@ impl KvBlockReader {
             .into());
         }
 
-        let n_layers: usize = read_meta(&header, META_N_LAYERS)?
-            .parse()
-            .map_err(|e| BlockIoError::Header(format!("bad n_layers: {e}")))?;
+        let n_layers = self.n_layers()?;
 
         let mut layers: Vec<HydratedLayer> = Vec::with_capacity(n_layers);
         for idx in 0..n_layers {

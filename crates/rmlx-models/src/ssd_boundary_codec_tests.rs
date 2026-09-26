@@ -10,7 +10,8 @@
 //! topology uses. The two outputs must agree on every layer, except one case:
 //! on a stack that shares K/V, a hydrated layer at the base `Mixed` / `RotK`
 //! codec holds no bf16 mirror, and the shared-source entry refuses it. The test
-//! holds that refusal for those layers.
+//! holds that refusal for those layers: it is a pinned known limit, not a
+//! behaviour this test asks for.
 
 use rmlx_core::DispatchPolicy;
 use rmlx_kv_quant::{KvCache, KvQuant};
@@ -209,11 +210,11 @@ fn a_hydrated_rot_k_boundary_layer_decodes_like_the_spilled_one() {
 }
 
 #[test]
-fn a_hydrated_mixed_boundary_layer_on_a_sharing_stack_decodes_like_the_spilled_one() {
+fn a_hydrated_mixed_stack_on_a_sharing_stack_decodes_its_boundary_layers_like_the_spilled_ones() {
     assert_hydrated_boundary_decodes_like_spilled("boundary-mixed-shared", MIXED_K8_V4, true);
 }
 
 #[test]
-fn a_hydrated_rot_k_boundary_layer_on_a_sharing_stack_decodes_like_the_spilled_one() {
+fn a_hydrated_rot_k_stack_on_a_sharing_stack_decodes_its_boundary_layers_like_the_spilled_ones() {
     assert_hydrated_boundary_decodes_like_spilled("boundary-rotk-shared", ROT_K_V4, true);
 }

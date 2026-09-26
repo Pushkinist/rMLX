@@ -130,6 +130,66 @@ fn prefilled_cache_spills_through_the_bf16_route_not_the_store() {
     );
 }
 
+/// A `layer_quants` whose length is not the block's layer count is the
+/// caller's error: `lookup` returns `Err` and keeps the block, and a probe
+/// with the right vector still hits it.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test: a fixture this test just wrote that fails to spill or record is a fixture bug and must abort loudly"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test: index open and file metadata on a temp dir this test owns cannot fail"
+)]
+fn a_layer_codec_vector_of_the_wrong_length_keeps_the_block() {
+    let device = Device::Cpu;
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let index = SsdKvIndex::open_at(&dir.join("index.db")).unwrap();
+    let seed = cache_seed(TEST_LAYOUT_KEY, QUANT, &[QUANT], TEST_MODEL_SIG);
+    let prompt_ids: Vec<u32> = (0..BLOCK_TOKENS as u32).collect();
+    let chained = chained_block_hashes_seeded(&prompt_ids, seed);
+    let key = hash_to_hex_local(*chained.last().expect("one whole block"));
+    let path = dir.join(format!("{key}.kvb"));
+    let cache = build_kvcache(BLOCK_TOKENS as i32, 0x1E47);
+    write_caches(&path, device, MODEL_ID, QUANT, &[cache], &[]).expect("spill");
+    let size = std::fs::metadata(&path).unwrap().len();
+    index
+        .record(
+            &key,
+            TEST_LAYOUT_KEY,
+            &path,
+            MODEL_ID,
+            &QUANT.to_string(),
+            size,
+        )
+        .expect("record");
+    let hydrator = SsdHydrator::with_index(MODEL_ID, TEST_LAYOUT_KEY, device, dir, index);
+    let probe = |layer_quants: &[KvQuant]| {
+        hydrator.lookup(
+            &prompt_ids,
+            seed,
+            QUANT,
+            layer_quants,
+            DispatchPolicy::default(),
+            false,
+        )
+    };
+
+    assert!(
+        probe(&[QUANT, QUANT]).is_err(),
+        "two layer codecs for a one-layer block must be an error"
+    );
+    assert!(path.exists(), "the block file must survive a caller error");
+    assert!(
+        probe(&[QUANT])
+            .expect("the right vector must not error")
+            .is_some(),
+        "the block and its index row must survive a caller error"
+    );
+}
+
 /// (a): a block written by `write_caches` + recorded in the index is read
 /// back by `SsdHydrator::lookup`, reconstructing a KV cache whose K dequant
 /// matches the spilled one within the fp tolerance.

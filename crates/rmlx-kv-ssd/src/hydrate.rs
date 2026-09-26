@@ -185,11 +185,14 @@ impl SsdHydrator {
 
     /// Look up + reconstruct the longest cached block-aligned prefix of
     /// `prompt_ids`. Returns `Ok(Some(_))` on an SSD hit, `Ok(None)` on a true
-    /// miss **or** on corruption (after deleting the bad file + row + `warn!`).
+    /// miss **or** on corruption (after deleting the bad file + row + `warn!`),
+    /// and `Err` when `layer_quants` is not the block's layer count (the block
+    /// is kept).
     ///
     /// `seed` is the requesting model's prompt-cache seed, `kv_quant` the
     /// codec the request is running, `layer_quants` the codec the arch builder
-    /// gives each layer at that `kv_quant` (`kv_layer_quants` in `rmlx-models`),
+    /// gives each layer at that `kv_quant` (`ArchPromptCache::layer_quants` in
+    /// `rmlx-models`),
     /// `policy` the kernel paths its caches dispatch through, and `shares_kv`
     /// the model's cross-layer-KV topology (see
     /// [`rmlx_kv_quant::KvCache::shares_kv`]); all five come from the caller,
@@ -403,6 +406,9 @@ impl SsdHydrator {
                 self.drop_row(&row);
                 Ok(None)
             }
+            // A `layer_quants` of the wrong length is the caller's error, not a
+            // bad block: keep the block and report it.
+            Err(e @ rmlx_core::error::Error::Config(_)) => Err(e),
             Err(e) => {
                 // Genuinely bad block (truncated, wrong header, unreadable):
                 // delete row + file, fall through to prefill.

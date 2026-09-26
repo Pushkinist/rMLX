@@ -38,12 +38,11 @@ use crate::hydrate::{HydratedBlock, SsdHydrator};
 /// reconstructs the arch entry. It returns:
 /// - `Ok(Some(entry))` — an SSD hit; the cache promotes it into RAM.
 /// - `Ok(None)` — a true SSD miss (no indexed prefix).
-/// - `Err(_)` — never returned by the production impl: corruption
-///   (bad read / metadata mismatch / missing file) is handled inside the impl
-///   (delete file + index row, `warn!`) and surfaces as `Ok(None)` so the
-///   caller falls through to a full prefill. The signature keeps `Result`
-///   only so the impl can use `?` on the index calls and map any residual
-///   error to `None`.
+/// - `Err(_)` — a caller-contract error: a `layer_quants` whose length is not
+///   the block's layer count. The block is kept. Corruption (bad read /
+///   metadata mismatch / missing file) is not an `Err`: it is handled inside
+///   the impl (delete file + index row, `warn!`) and surfaces as `Ok(None)` so
+///   the caller falls through to a full prefill.
 ///
 /// Must not panic.
 pub trait SsdHydrate<E>: Send {

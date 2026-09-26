@@ -972,14 +972,13 @@ mod tests {
         }
     }
 
-    /// Every layer codec the policy hands out beside a base either builds no
-    /// packed store or builds the same storage variant as the base. The test
+    /// A policy fact of `kv_layer_quants`: a boundary codec that builds a
+    /// packed store builds the same storage variant as its base. The test
     /// compares the variant only, not the widths or parameters it carries.
     ///
-    /// Each hydrated layer gets the codec the arch builder gives that layer
-    /// (`kv_layer_quants`), not the block's base codec. A layer whose codec
-    /// builds no packed store comes back as `None` storage
-    /// (`block_io_storage_family_tests` in `rmlx-kv-ssd`).
+    /// It does not guard the SSD hydrate. Each hydrated layer gets the codec the
+    /// arch builder gives that layer, not the block's base codec, and
+    /// `ssd_boundary_codec_tests` holds that.
     #[test]
     fn a_boundary_layer_that_builds_a_store_keeps_the_base_storage() {
         use std::mem::discriminant;
@@ -1000,10 +999,9 @@ mod tests {
                     }
                     assert!(
                         discriminant(&KvStorage::new(layer)) == discriminant(&KvStorage::new(base)),
-                        "base {base} (shares_kv={shares_kv}) gives layer {layer_idx} the codec \
-                         {layer}, which builds a store of another storage variant; a hydrate \
-                         would hand \
-                         that storage the base codec"
+                        "base {base} (shares_kv={shares_kv}) gives boundary layer {layer_idx} \
+                         the codec {layer}, which builds a store of another storage variant \
+                         than the base"
                     );
                 }
             }

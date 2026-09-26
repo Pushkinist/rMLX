@@ -2,7 +2,8 @@
 //! codec builds.
 //!
 //! Each hydrated layer gets the codec the arch builder gives that layer
-//! (`kv_layer_quants`), not the block's base codec. `KvCache::update` takes its
+//! (`ArchPromptCache::layer_quants` in `rmlx-models`), not the block's base
+//! codec. `KvCache::update` takes its
 //! entry from the storage and `exit_prefill` from the codec. The two keys agree
 //! when a non-`None` hydrated storage has the same storage variant
 //! `KvStorage::new` builds for that codec. The test compares the variant only,

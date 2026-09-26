@@ -65,10 +65,13 @@ directly. This test fails when an entry and the gate disagree:
 `warm_ttft_cross_codec_tests::exit_prefill_builds_a_store_exactly_when_the_predicate_says_so`.
 
 After a hydrate, a non-`None` storage has the same storage variant as the one
-its codec builds: `block_io_storage_family_tests.rs` in `rmlx-kv-ssd` holds this
-for one codec, and `a_boundary_layer_that_builds_a_store_keeps_the_base_storage`
-in `rmlx-models` holds it for the boundary-layer policy. Both compare the
-variant only, not the widths or parameters it carries.
+its codec builds, because each hydrated layer gets the codec the arch builder
+gave that layer. `block_io_storage_family_tests.rs` in `rmlx-kv-ssd` holds this
+for one codec, comparing the variant only. `ssd_boundary_codec_tests.rs` in
+`rmlx-models` holds it for the boundary layers by decoding them.
+`a_boundary_layer_that_builds_a_store_keeps_the_base_storage` holds a policy
+fact of `kv_layer_quants`, not of the hydrate: a boundary codec that builds a
+store builds the base's storage variant.
 
 The `update` entry of `Mixed` is `update_mixed`, which refuses. The `Mixed`
 per-step append is `update_and_sdpa_mixed` in `sdpa.rs`.

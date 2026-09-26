@@ -313,9 +313,8 @@ struct Spilled {
 
 /// Write one block-aligned `.kvb` for `prompt_ids` and record its index row.
 ///
-/// `layer_quants` is the per-layer codec vector the seed folds. It is passed
-/// rather than derived so a test can spill under one mixture and probe under
-/// another.
+/// `layer_quants` is the uniform per-layer vector the seed folds, returned so
+/// the probe hydrates under the same vector.
 #[allow(
     clippy::expect_used,
     reason = "test fixture: index open / block write / file metadata failures are fixture bugs and must abort the test loudly"
