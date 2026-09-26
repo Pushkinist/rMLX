@@ -10,7 +10,7 @@
 #
 # Modes:
 #   collect <arm>   Launch the backend for <arm>, run all prompts, append rows
-#                   to metrics/parity_rmlx_vs_fork.jsonl, then kill + free Metal.
+#                   to metrics/parity_rmlx_vs_fork.jsonl, then stop the backend.
 #                   <arm> = fork-fp16 | fork-turbo4 | rmlx-k8v4 | rmlx-k8v8
 #
 # DEVIATION (2026-05-18): the installed mlx-lm-turboquant fork venv (HEAD
@@ -27,8 +27,11 @@
 #   compare         Pure-Python: read the jsonl, tokenize, emit per-prompt and
 #                   mean match rates + verdict to stdout. No backend launched.
 #
-# HARD rule: never run two MLX backends at once. Each `collect` fully tears the
-# backend down (pkill + claim-file rm + sleep) before returning.
+# HARD rule: never run two MLX backends at once. The Metal claim enforces it:
+# the rMLX arm takes it itself and a fork arm runs under `rmlx claim run`. Each
+# `collect` stops the backend it started and waits for it before returning, so
+# the claim is free again; a claim another process holds fails the launch with
+# exit 11 and names the holder.
 set -euo pipefail
 
 # ----- constants ------------------------------------------------------------
@@ -48,13 +51,10 @@ MAX_TOKENS=32
 
 mkdir -p "$REPO/metrics" "$LOGDIR" "$(dirname "$PROMPTS_JSON")"
 
-free_metal() {
-  pkill -f "rmlx serve" 2>/dev/null || true
-  pkill -f mlx_lm 2>/dev/null || true
-  pkill -f paroquant 2>/dev/null || true
-  pkill -f omlx 2>/dev/null || true
-  sleep 5
-  rm -f "/tmp/rmlx.${PORT}.claim"
+# stop_server <pid> — stop the backend this collect started and wait for it.
+stop_server() {
+  kill "$1" 2>/dev/null || true
+  wait "$1" 2>/dev/null || true
 }
 
 # ----- prompt set -----------------------------------------------------------
@@ -224,7 +224,6 @@ PY
 collect() {
   local arm="$1"
   build_prompts
-  free_metal
 
   local ts run_log kv server_pid
   ts="$(date +%Y%m%d-%H%M%S)"
@@ -236,7 +235,7 @@ collect() {
       # fork's true default — see DEVIATION header. This is the parity baseline.
       kv="fp16"
       echo "[parity] launching FORK mlx_lm.server (fp16 KV, no turbo) port $PORT" >&2
-      nohup "$FORK_PY" -m mlx_lm.server \
+      nohup "$RMLX_BIN" claim run -- "$FORK_PY" -m mlx_lm.server \
         --model "$MODEL_PATH" \
         --port "$PORT" \
         --max-tokens 32000 \
@@ -251,7 +250,7 @@ collect() {
       # V affine 4-bit). Not the parity gate baseline — divergence context only.
       kv="turbo4"
       echo "[parity] launching FORK mlx_lm.server (turbo-kv-bits 4 / turbo-v-bits 4) port $PORT" >&2
-      nohup "$FORK_PY" -m mlx_lm.server \
+      nohup "$RMLX_BIN" claim run -- "$FORK_PY" -m mlx_lm.server \
         --model "$MODEL_PATH" \
         --port "$PORT" \
         --turbo-kv-bits 4 \
@@ -286,20 +285,18 @@ EOF
     *)
       echo "[parity] unknown arm: $arm" >&2; exit 2 ;;
   esac
-  disown "$server_pid" 2>/dev/null || true
-
   if ! wait_ready "$server_pid"; then
     echo "[parity] $arm failed to become ready. Last log lines:" >&2
     tail -25 "$run_log" >&2
-    free_metal
+    stop_server "$server_pid"
     exit 1
   fi
   echo "[parity] $arm ready (pid $server_pid). Driving prompts." >&2
 
   run_prompts_against_backend "$arm" "$kv"
 
-  echo "[parity] $arm done — tearing down backend, freeing Metal." >&2
-  free_metal
+  echo "[parity] $arm done — stopping the backend." >&2
+  stop_server "$server_pid"
 }
 
 # ----- compare: tokenize jsonl, verdict -------------------------------------
