@@ -123,7 +123,8 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         check-named-skip-notices check-named-skip-notices-fixtures \
         check-eval-lock check-eval-lock-fixtures eval-lock-stress \
         check-no-kernel-input-eval check-no-kernel-input-eval-fixtures \
-        check-gpu-device-census check-gpu-device-census-selftest \
+        check-gpu-device-census check-gpu-device-census-library \
+        check-gpu-device-census-selftest \
         check-kernel-dtype-contract check-kernel-dtype-contract-fixtures \
         check-metal-compiles check-metal-format
 
@@ -613,6 +614,9 @@ check-no-kernel-input-eval-fixtures: ## CI gate: the eval gate still fires on re
 check-gpu-device-census: ## CI gate: the rmlx binary names Device::Gpu in exactly one place, claim_gpu, which takes the Metal claim, and never takes .device() from a fresh claim
 	@bash scripts/check_gpu_device_census.sh
 
+check-gpu-device-census-library: ## CI gate: library code in rmlx-audio, rmlx-server and rmlx-models never names Device::Gpu as a value; the device comes from the caller
+	@bash scripts/check_gpu_device_census.sh --library
+
 check-gpu-device-census-selftest: ## CI gate: recall test for the above and its library mode, 69 cases, each asserting the reason as well as the exit code
 	@bash scripts/check_gpu_device_census_selftest.sh
 
@@ -669,6 +673,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_no_kernel_input_eval.sh
 	@bash scripts/check_no_kernel_input_eval_fixtures.sh
 	@bash scripts/check_gpu_device_census.sh
+	@bash scripts/check_gpu_device_census.sh --library
 	@bash scripts/check_gpu_device_census_selftest.sh
 	@bash scripts/check_kernel_dtype_contract.sh
 	@bash scripts/check_kernel_dtype_contract_fixtures.sh

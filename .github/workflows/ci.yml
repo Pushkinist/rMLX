@@ -95,6 +95,14 @@ jobs:
       # passing forever. Fixture trees pin its recall, per rule.
       - name: the eval-lock gate still catches what it is for
         run: make check-eval-lock-fixtures
+      # A library that names the GPU device itself does Metal work in a process
+      # that decided on the CPU and holds no claim. Static gate.
+      - name: library code takes its device from the caller
+        run: make check-gpu-device-census-library
+      # ...and the census reads source shapes, so its recall is pinned by
+      # fixture trees in both modes.
+      - name: the device census still catches what it is for
+        run: make check-gpu-device-census-selftest
       # A headline number's provenance is these files, and a manifest sitting
       # beside them proves nothing on its own: the draw is recorded rather than
       # recomputed, and an edited file can be re-blessed in the same commit. The
