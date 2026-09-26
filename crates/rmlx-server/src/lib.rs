@@ -48,7 +48,7 @@ pub mod stop_matcher;
 pub mod tokenizer_io;
 pub mod tool_parser;
 
-pub use claim::{try_claim, ClaimError, MetalClaim};
+pub use claim::{probe_claim, try_claim, ClaimError, MetalClaim};
 
 use std::net::SocketAddr;
 

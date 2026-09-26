@@ -2,12 +2,15 @@ use super::*;
 use std::io::{BufRead as _, BufReader, IsTerminal as _, Write as _};
 use std::os::unix::fs::symlink;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{mpsc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 use tempfile::TempDir;
 
-/// A child that a concurrent test forks holds a copy of every open claim fd
-/// of this process until its exec. A test that needs its own claim released
-/// at drop holds this lock, and so does every spawn.
+/// When `Command::spawn` forks, the child holds a copy of every open fd of
+/// this process from the fork until its exec closes the `O_CLOEXEC` ones; a
+/// flock this process drops in that window stays held by the copy. A test
+/// that needs its own claim released at drop holds this lock, and so does
+/// every spawn.
 static SPAWN: Mutex<()> = Mutex::new(());
 
 fn no_spawn() -> MutexGuard<'static, ()> {
@@ -20,6 +23,27 @@ fn lock_in(dir: &TempDir) -> PathBuf {
 
 fn is_held(result: &Result<MetalClaim, ClaimError>) -> bool {
     matches!(result, Err(ClaimError::AlreadyHeld { .. }))
+}
+
+fn is_io<T>(result: &Result<T, ClaimError>) -> bool {
+    matches!(result, Err(ClaimError::Io { .. }))
+}
+
+fn make_fifo(path: &Path) {
+    let _spawn = no_spawn();
+    let status = Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .expect("run mkfifo");
+    assert!(status.success(), "mkfifo failed: {status}");
+}
+
+/// The body `write_holder` writes for this process.
+fn own_body() -> String {
+    let argv: Vec<String> = std::env::args_os()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    format!("{} {}", std::process::id(), argv.join(" "))
 }
 
 /// A child process that holds the claim on a lock file. The child is this
@@ -193,7 +217,9 @@ fn read_only_file_is_still_locked() {
 fn unlocked_file_with_live_pid_body_is_claimed() {
     let dir = TempDir::new().expect("temp dir");
     let lock = lock_in(&dir);
-    std::fs::write(&lock, format!("{} some command", std::process::id())).expect("write body");
+    let parent = std::os::unix::process::parent_id();
+    assert_ne!(parent, std::process::id());
+    std::fs::write(&lock, format!("{parent} some command")).expect("write body");
     let claim = claim_at(&lock).expect("an unlocked file must be claimed");
     let body = std::fs::read_to_string(&lock).expect("read body");
     let (pid, _) = body.split_once(' ').expect("body is `<pid> <argv>`");
@@ -202,16 +228,99 @@ fn unlocked_file_with_live_pid_body_is_claimed() {
 }
 
 #[test]
-fn refusal_message_names_holder_and_stop_action() {
+fn new_body_replaces_a_longer_one_whole() {
+    let dir = TempDir::new().expect("temp dir");
+    let lock = lock_in(&dir);
+    std::fs::write(&lock, format!("4242 {}", "x".repeat(4096))).expect("write a long body");
+    let claim = claim_at(&lock).expect("claim");
+    assert_eq!(
+        std::fs::read_to_string(&lock).expect("read body"),
+        own_body()
+    );
+    drop(claim);
+}
+
+/// A hard link planted at the claim path would make the body write land in
+/// the link's target.
+#[test]
+fn hard_link_at_claim_path_is_refused() {
+    let dir = TempDir::new().expect("temp dir");
+    let target = dir.path().join("target");
+    std::fs::write(&target, "keep").expect("write target");
+    let lock = lock_in(&dir);
+    std::fs::hard_link(&target, &lock).expect("plant a hard link");
+    let result = claim_at(&lock);
+    assert!(
+        is_io(&result),
+        "a hard link must be refused, got {result:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("read target"),
+        "keep"
+    );
+}
+
+#[test]
+fn fifo_at_claim_path_is_refused() {
+    let dir = TempDir::new().expect("temp dir");
+    let lock = lock_in(&dir);
+    make_fifo(&lock);
+    let result = claim_at(&lock);
+    assert!(is_io(&result), "a FIFO must be refused, got {result:?}");
+}
+
+/// A directory opens read-only and takes a flock, so only the regular-file
+/// check keeps the probe from reporting it as a free claim.
+#[test]
+fn directory_at_claim_path_is_refused_by_the_probe() {
+    let legacy = TempDir::new().expect("legacy dir");
+    let dir = TempDir::new().expect("temp dir");
+    let lock = lock_in(&dir);
+    std::fs::create_dir(&lock).expect("plant a directory");
+    let result = probe_in(legacy.path(), &lock);
+    assert!(
+        is_io(&result),
+        "a directory must be refused, got {result:?}"
+    );
+}
+
+#[test]
+fn refusal_message_names_the_record_and_how_to_confirm_it() {
     let message = ClaimError::AlreadyHeld {
         holder_pid: Some(4242),
         holder_command: "rmlx serve --port 8080".to_owned(),
+        path: PathBuf::from(CLAIM_PATH),
     }
     .to_string();
-    assert!(message.contains("PID 4242"), "{message}");
+    assert!(message.contains("recorded PID 4242"), "{message}");
     assert!(message.contains("rmlx serve --port 8080"), "{message}");
-    assert!(message.contains("kill 4242"), "{message}");
-    assert!(!message.contains(CLAIM_PATH), "{message}");
+    assert!(message.contains(&format!("lsof {CLAIM_PATH}")), "{message}");
+    assert!(message.contains("kill <PID>"), "{message}");
+    assert!(
+        !message.contains("kill 4242"),
+        "the recorded PID is not verified: {message}"
+    );
+    assert_no_delete_word(&message);
+}
+
+#[test]
+fn refusal_message_without_a_pid_promises_none() {
+    let message = ClaimError::AlreadyHeld {
+        holder_pid: None,
+        holder_command: String::new(),
+        path: PathBuf::from(CLAIM_PATH),
+    }
+    .to_string();
+    assert!(message.contains("recorded no PID"), "{message}");
+    assert!(message.contains(&format!("lsof {CLAIM_PATH}")), "{message}");
+    let lower = message.to_lowercase();
+    for promise in ["yet", "in a moment", "soon"] {
+        assert!(!lower.contains(promise), "{message}");
+    }
+    assert_no_delete_word(&message);
+}
+
+fn assert_no_delete_word(message: &str) {
     let lower = message.to_lowercase();
     for word in lower.split(|c: char| !c.is_ascii_alphanumeric()) {
         assert!(
@@ -230,11 +339,13 @@ fn second_process_is_refused_and_named() {
     let Err(ClaimError::AlreadyHeld {
         holder_pid,
         holder_command,
+        path,
     }) = result
     else {
         panic!("a claim held by another process must be refused, got {result:?}");
     };
     assert_eq!(holder_pid, Some(holder.pid()));
+    assert_eq!(path, lock);
     assert!(
         holder_command.contains("claim_holder_child"),
         "the refusal must name the holder's command: {holder_command}"
@@ -289,4 +400,109 @@ fn free_legacy_claim_is_passed_and_kept() {
     std::fs::write(&legacy, "4242").expect("write a legacy body");
     refuse_held_legacy_claim(dir.path()).expect("a free legacy claim must pass");
     assert_eq!(std::fs::read_to_string(&legacy).expect("read body"), "4242");
+}
+
+#[test]
+fn claim_refuses_while_a_legacy_claim_is_held() {
+    let legacy_dir = TempDir::new().expect("legacy dir");
+    let holder = Holder::start(&legacy_claim_in(&legacy_dir));
+    let dir = TempDir::new().expect("temp dir");
+    let lock = lock_in(&dir);
+    let result = claim_in(legacy_dir.path(), &lock);
+    let Err(ClaimError::AlreadyHeld { holder_pid, .. }) = result else {
+        panic!("a held legacy claim must refuse the claim, got {result:?}");
+    };
+    assert_eq!(holder_pid, Some(holder.pid()));
+    assert!(!lock.exists(), "a refused claim must not create the file");
+    holder.exit();
+    drop(claim_in(legacy_dir.path(), &lock).expect("the claim once the legacy holder exits"));
+}
+
+/// The open of a FIFO without `O_NONBLOCK` blocks until a writer appears.
+#[test]
+fn legacy_fifo_does_not_block_the_probe() {
+    let dir = TempDir::new().expect("temp dir");
+    make_fifo(&legacy_claim_in(&dir));
+    let (tx, rx) = mpsc::channel();
+    let path = dir.path().to_path_buf();
+    std::thread::spawn(move || {
+        let _ = tx.send(refuse_held_legacy_claim(&path));
+    });
+    let result = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the legacy probe must not block on a FIFO");
+    assert!(
+        is_io(&result),
+        "a legacy FIFO must be refused, got {result:?}"
+    );
+}
+
+#[test]
+fn unreadable_legacy_claim_is_refused() {
+    let dir = TempDir::new().expect("temp dir");
+    let legacy = legacy_claim_in(&dir);
+    std::fs::write(&legacy, "4242").expect("write a legacy body");
+    std::fs::set_permissions(&legacy, Permissions::from_mode(0o000)).expect("chmod 0000");
+    assert!(
+        File::open(&legacy).is_err(),
+        "this test needs a user that a 0000 file refuses"
+    );
+    let result = refuse_held_legacy_claim(dir.path());
+    assert!(
+        is_io(&result),
+        "an unreadable legacy claim must refuse, got {result:?}"
+    );
+}
+
+#[test]
+fn legacy_symlink_is_skipped() {
+    let dir = TempDir::new().expect("temp dir");
+    let target = dir.path().join("target");
+    std::fs::write(&target, "4242").expect("write target");
+    symlink(&target, legacy_claim_in(&dir)).expect("plant a symlink");
+    refuse_held_legacy_claim(dir.path()).expect("a legacy symlink is skipped");
+}
+
+#[test]
+fn probe_of_a_held_claim_names_the_holder_and_writes_nothing() {
+    let legacy = TempDir::new().expect("legacy dir");
+    let dir = TempDir::new().expect("temp dir");
+    let lock = lock_in(&dir);
+    let holder = Holder::start(&lock);
+    let body = std::fs::read_to_string(&lock).expect("read body");
+    let result = probe_in(legacy.path(), &lock);
+    let Err(ClaimError::AlreadyHeld { holder_pid, .. }) = result else {
+        panic!("the probe must report a held claim, got {result:?}");
+    };
+    assert_eq!(holder_pid, Some(holder.pid()));
+    assert_eq!(std::fs::read_to_string(&lock).expect("read body"), body);
+    holder.exit();
+}
+
+#[test]
+fn probe_of_a_free_claim_writes_nothing() {
+    let legacy = TempDir::new().expect("legacy dir");
+    let dir = TempDir::new().expect("temp dir");
+    let lock = lock_in(&dir);
+    probe_in(legacy.path(), &lock).expect("a missing file is a free claim");
+    assert!(!lock.exists(), "the probe must not create the file");
+    std::fs::write(&lock, "4242 old holder").expect("write body");
+    probe_in(legacy.path(), &lock).expect("an unlocked file is a free claim");
+    assert_eq!(
+        std::fs::read_to_string(&lock).expect("read body"),
+        "4242 old holder"
+    );
+}
+
+#[test]
+fn probe_refuses_while_a_legacy_claim_is_held() {
+    let legacy_dir = TempDir::new().expect("legacy dir");
+    let holder = Holder::start(&legacy_claim_in(&legacy_dir));
+    let dir = TempDir::new().expect("temp dir");
+    let result = probe_in(legacy_dir.path(), &lock_in(&dir));
+    let Err(ClaimError::AlreadyHeld { holder_pid, .. }) = result else {
+        panic!("a held legacy claim must show as held, got {result:?}");
+    };
+    assert_eq!(holder_pid, Some(holder.pid()));
+    holder.exit();
 }

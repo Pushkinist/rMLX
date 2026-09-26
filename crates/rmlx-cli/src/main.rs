@@ -1115,7 +1115,7 @@ enum Cmd {
     },
     /// Manage the metrics SQLite database (schema init, health checks, backup/restore).
     Metrics(MetricsCmd),
-    /// Check rMLX readiness: claim file, HTTP /health, registry loadability,
+    /// Check rMLX readiness: Metal claim, HTTP /health, registry loadability,
     /// metrics DB, disk space, and process memory.
     ///
     /// Emits one JSON line per check (or plain text with --human).
@@ -1133,7 +1133,10 @@ enum Cmd {
         /// Mutually exclusive with --registry.
         #[arg(long, conflicts_with = "registry")]
         model: Option<PathBuf>,
-        /// Also probe a live server on this port (claim + HTTP checks).
+        /// Also probe a live server on this port (claim + HTTP checks). The
+        /// claim check is machine-wide: green when any process holds the
+        /// claim, naming the holder it recorded. It does not take the claim,
+        /// but a GPU command that starts during the probe's moment exits 11.
         #[arg(long)]
         port: Option<u16>,
         /// Path to the metrics SQLite DB.

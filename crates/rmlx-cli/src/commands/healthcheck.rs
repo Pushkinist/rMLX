@@ -213,10 +213,10 @@ pub(crate) fn run_healthcheck(
 // ---------------------------------------------------------------------------
 
 /// Check 1: the Metal claim. A server on the probed port holds it, so a held
-/// claim is green and a free claim is red. The probe takes a free claim for a
-/// moment and releases it at once.
+/// claim is green and a free claim is red. The probe does not take the claim;
+/// its shared lock refuses a GPU command that starts in the same moment.
 fn check_claim() -> CheckLine {
-    claim_line(rmlx_server::try_claim().map(drop))
+    claim_line(rmlx_server::probe_claim())
 }
 
 fn claim_line(probe: Result<(), ClaimError>) -> CheckLine {
@@ -224,13 +224,14 @@ fn claim_line(probe: Result<(), ClaimError>) -> CheckLine {
         Err(ClaimError::AlreadyHeld {
             holder_pid,
             holder_command,
+            ..
         }) => {
-            let pid = holder_pid.map_or_else(|| "unknown".to_owned(), |pid| pid.to_string());
+            let pid = holder_pid.map_or_else(|| "none".to_owned(), |pid| pid.to_string());
             debug!(pid, "claim check: held");
             CheckLine::new(
                 "claim",
                 Status::Green,
-                format!("held by pid={pid} ({holder_command})"),
+                format!("held; the holder recorded pid={pid} ({holder_command})"),
             )
         }
         Ok(()) => CheckLine::new("claim", Status::Red, "no process holds the Metal claim"),

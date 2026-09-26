@@ -1,6 +1,3 @@
-// unsafe_code: POSIX libc FFI — libc::flock advisory lock for single-MLX-process enforcement
-#![allow(unsafe_code)]
-
 //! Metal claim — one MLX process per Mac.
 //!
 //! The Apple Silicon Metal context is exclusive per process. A GPU command
@@ -19,10 +16,9 @@
 //! `flock(2)` is advisory: it stops two rMLX processes, not Python
 //! `mlx_lm.server` or ollama.
 
-use std::fs::{File, OpenOptions, Permissions};
+use std::fs::{File, OpenOptions, Permissions, TryLockError};
 use std::io::{self, Read as _};
-use std::os::unix::fs::{FileExt as _, OpenOptionsExt as _, PermissionsExt as _};
-use std::os::unix::io::AsRawFd as _;
+use std::os::unix::fs::{FileExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 /// The one claim file. `/var/tmp` is machine-wide, and macOS `tmp_cleaner`
@@ -44,16 +40,19 @@ const OPEN_FLAGS: libc::c_int = libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NON
 #[derive(Debug, thiserror::Error)]
 pub enum ClaimError {
     /// Another process holds the claim.
-    #[error("{}", refusal_message(*.holder_pid, .holder_command))]
+    #[error("{}", refusal_message(*.holder_pid, .holder_command, .path))]
     AlreadyHeld {
-        /// PID of the holder. `None` when the holder has not written its
-        /// PID yet.
+        /// PID the holder wrote into the file body. It can be stale or
+        /// forged, and it is `None` when the holder wrote no body.
         holder_pid: Option<u32>,
         /// Command line of the holder, as it recorded it.
         holder_command: String,
+        /// The lock file the holder has locked.
+        path: PathBuf,
     },
 
-    /// OS error on the claim file, or the path is not a regular file.
+    /// OS error on the claim file, or the path is not a regular file with
+    /// one link.
     #[error("Metal claim I/O error at {}: {source}", .path.display())]
     Io {
         /// The file the claim operation used.
@@ -80,77 +79,128 @@ pub struct MetalClaim {
 /// [`ClaimError::AlreadyHeld`] names the holder. [`ClaimError::Io`] is an OS
 /// error; the caller must not use the GPU then either.
 pub fn try_claim() -> Result<MetalClaim, ClaimError> {
-    refuse_held_legacy_claim(Path::new(LEGACY_CLAIM_DIR))?;
-    claim_at(Path::new(CLAIM_PATH))
+    claim_in(Path::new(LEGACY_CLAIM_DIR), Path::new(CLAIM_PATH))
+}
+
+/// Report whether a process holds the Metal claim, without taking it.
+/// `Ok(())` means no process holds it. The probe writes no body and creates
+/// no file. It holds a shared lock for a moment, and a GPU command that
+/// starts in that moment is refused.
+///
+/// # Errors
+/// [`ClaimError::AlreadyHeld`] names the holder. [`ClaimError::Io`] is an OS
+/// error.
+pub fn probe_claim() -> Result<(), ClaimError> {
+    probe_in(Path::new(LEGACY_CLAIM_DIR), Path::new(CLAIM_PATH))
+}
+
+fn claim_in(legacy_dir: &Path, path: &Path) -> Result<MetalClaim, ClaimError> {
+    refuse_held_legacy_claim(legacy_dir)?;
+    claim_at(path)
+}
+
+fn probe_in(legacy_dir: &Path, path: &Path) -> Result<(), ClaimError> {
+    refuse_held_legacy_claim(legacy_dir)?;
+    let file = match open_checked(OpenOptions::new().read(true), path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => return Err(io_error(path, source)),
+    };
+    refuse_if_held(&file, path, None)
 }
 
 fn claim_at(path: &Path) -> Result<MetalClaim, ClaimError> {
-    let io_error = |source| ClaimError::Io {
-        path: path.to_path_buf(),
-        source,
-    };
-    let (file, writable) = open_claim_file(path).map_err(io_error)?;
-    if !flock_nb(&file, libc::LOCK_EX).map_err(io_error)? {
+    let (file, writable) = open_claim_file(path).map_err(|e| io_error(path, e))?;
+    if !locked(file.try_lock()).map_err(|e| io_error(path, e))? {
         let (holder_pid, holder_command) = read_holder(&file);
         return Err(ClaimError::AlreadyHeld {
             holder_pid,
             holder_command,
+            path: path.to_path_buf(),
         });
     }
     if writable {
-        write_holder(&file).map_err(io_error)?;
+        write_holder(&file).map_err(|e| io_error(path, e))?;
     }
     tracing::info!(pid = std::process::id(), path = %path.display(), writable, "Metal claim acquired");
     Ok(MetalClaim { _file: file })
 }
 
+fn io_error(path: &Path, source: io::Error) -> ClaimError {
+    ClaimError::Io {
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
 /// Open the claim file for the lock. Returns the file and whether it is
-/// writable. The open follows no symlink, and anything that is not a regular
-/// file is refused. A file this call creates gets mode 0666, so every user can
-/// open it later. When another user's file refuses a write open, a read-only
-/// open still takes the flock.
+/// writable. A file this call creates gets mode 0666, so every user can open
+/// it later. When another user's file refuses a write open, a read-only open
+/// still takes the flock.
 fn open_claim_file(path: &Path) -> io::Result<(File, bool)> {
     let open = |write: bool, create: bool| {
-        OpenOptions::new()
-            .read(true)
-            .write(write)
-            .create_new(create)
-            .mode(0o666)
-            .custom_flags(OPEN_FLAGS)
-            .open(path)
+        open_checked(
+            OpenOptions::new()
+                .read(true)
+                .write(write)
+                .create_new(create)
+                .mode(0o666),
+            path,
+        )
     };
-    let (file, writable) = match open(true, true) {
+    match open(true, true) {
         Ok(file) => {
             // The umask masks the create mode.
             file.set_permissions(Permissions::from_mode(0o666))?;
-            (file, true)
+            Ok((file, true))
         }
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => match open(true, false) {
-            Ok(file) => (file, true),
-            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => (open(false, false)?, false),
-            Err(e) => return Err(e),
+            Ok(file) => Ok((file, true)),
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                Ok((open(false, false)?, false))
+            }
+            Err(e) => Err(e),
         },
-        Err(e) => return Err(e),
-    };
-    if !file.metadata()?.file_type().is_file() {
-        return Err(io::Error::other("the claim path is not a regular file"));
+        Err(e) => Err(e),
     }
-    Ok((file, writable))
 }
 
-/// `flock(fd, op | LOCK_NB)`. `Ok(false)` when another open file holds a
-/// conflicting lock.
-fn flock_nb(file: &File, op: libc::c_int) -> io::Result<bool> {
-    // SAFETY: the fd is open for the lifetime of `file`. flock takes no pointer.
-    if unsafe { libc::flock(file.as_raw_fd(), op | libc::LOCK_NB) } == 0 {
-        return Ok(true);
+/// Open `path` following no symlink, and refuse anything but a regular file
+/// with one link: a hard link planted at the path would make the body write
+/// land in its target.
+fn open_checked(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
+    let file = options.custom_flags(OPEN_FLAGS).open(path)?;
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(io::Error::other("the claim path is not a regular file"));
     }
-    let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
-        Ok(false)
-    } else {
-        Err(error)
+    if meta.nlink() != 1 {
+        return Err(io::Error::other("the claim file has more than one link"));
     }
+    Ok(file)
+}
+
+/// `Ok(false)` when another open file holds a conflicting lock.
+fn locked(result: Result<(), TryLockError>) -> io::Result<bool> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(TryLockError::WouldBlock) => Ok(false),
+        Err(TryLockError::Error(e)) => Err(e),
+    }
+}
+
+/// Refuse when another open file holds an exclusive lock on `file`. The
+/// shared lock taken here is released when `file` closes.
+fn refuse_if_held(file: &File, path: &Path, command: Option<&str>) -> Result<(), ClaimError> {
+    if locked(file.try_lock_shared()).map_err(|e| io_error(path, e))? {
+        return Ok(());
+    }
+    let (holder_pid, recorded_command) = read_holder(file);
+    Err(ClaimError::AlreadyHeld {
+        holder_pid,
+        holder_command: command.map_or(recorded_command, str::to_owned),
+        path: path.to_path_buf(),
+    })
 }
 
 fn write_holder(file: &File) -> io::Result<()> {
@@ -173,62 +223,48 @@ fn read_holder(mut file: &File) -> (Option<u32>, String) {
     (pid.parse().ok(), command.to_owned())
 }
 
-fn refusal_message(holder_pid: Option<u32>, holder_command: &str) -> String {
+fn refusal_message(holder_pid: Option<u32>, holder_command: &str, path: &Path) -> String {
     let command = if holder_command.is_empty() {
         "command not recorded"
     } else {
         holder_command
     };
-    match holder_pid {
-        Some(pid) => format!(
-            "the Metal claim is held by PID {pid} ({command}). Stop that process \
-             (`kill {pid}`), then run this command again."
-        ),
-        None => format!(
-            "the Metal claim is held by a process that has not recorded its PID yet \
-             ({command}). Run this command again in a moment."
-        ),
-    }
+    let recorded = match holder_pid {
+        Some(pid) => format!("The holder recorded PID {pid} ({command}); the record can be stale."),
+        None => format!("The holder recorded no PID ({command})."),
+    };
+    format!(
+        "the Metal claim is held. {recorded} Find the process that holds the lock with \
+         `lsof {}` (as root to see another user's process), stop it with `kill <PID>`, \
+         then run this command again.",
+        path.display()
+    )
 }
 
 /// Refuse when a legacy per-port claim in `dir` is held. The probe takes a
-/// shared lock for a moment and changes no file.
+/// shared lock for a moment and changes no file. It skips an entry that
+/// vanished or is a symlink; any other doubt refuses.
 fn refuse_held_legacy_claim(dir: &Path) -> Result<(), ClaimError> {
-    let entries = std::fs::read_dir(dir).map_err(|source| ClaimError::Io {
-        path: dir.to_path_buf(),
-        source,
-    })?;
-    for entry in entries.flatten() {
+    let entries = std::fs::read_dir(dir).map_err(|e| io_error(dir, e))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| io_error(dir, e))?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if !(name.starts_with(LEGACY_CLAIM_PREFIX) && name.ends_with(LEGACY_CLAIM_SUFFIX)) {
             continue;
         }
         let path = entry.path();
-        let Ok(file) = OpenOptions::new()
-            .read(true)
-            .custom_flags(OPEN_FLAGS)
-            .open(&path)
-        else {
-            continue;
+        let file = match open_checked(OpenOptions::new().read(true), &path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => continue,
+            Err(source) => return Err(io_error(&path, source)),
         };
-        if !file.metadata().is_ok_and(|meta| meta.file_type().is_file()) {
-            continue;
-        }
-        let held = !flock_nb(&file, libc::LOCK_SH).map_err(|source| ClaimError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        if held {
-            let (holder_pid, _) = read_holder(&file);
-            return Err(ClaimError::AlreadyHeld {
-                holder_pid,
-                holder_command: format!(
-                    "an rmlx build older than the machine-wide claim, holding {}",
-                    path.display()
-                ),
-            });
-        }
+        refuse_if_held(
+            &file,
+            &path,
+            Some("an rmlx build older than the machine-wide claim"),
+        )?;
     }
     Ok(())
 }

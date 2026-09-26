@@ -80,6 +80,7 @@ fn j6_claim_held_is_green_and_names_the_holder() {
     let line = claim_line(Err(ClaimError::AlreadyHeld {
         holder_pid: Some(4242),
         holder_command: "rmlx serve --port 8080".to_owned(),
+        path: PathBuf::from("lock"),
     }));
     assert_eq!(line.status, Status::Green, "a held claim must be green");
     assert!(line.detail.contains("4242"), "{}", line.detail);
