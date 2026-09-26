@@ -656,21 +656,22 @@ fn write_layer(
             seq,
         ));
     }
+    let max_seq = storage.max_seq();
     match storage {
-        KvStorage::K8V4 { k, v, max_seq } => {
+        KvStorage::K8V4 { k, v, max_seq: _ } => {
             let seq = write_quant_k(idx, "k", k.as_ref(), device, out)?;
             write_quant_v(idx, v.as_ref(), device, out)?;
-            Ok((geom_kv("k8v4", *max_seq, k_shape(k.as_ref())), seq))
+            Ok((geom_kv("k8v4", max_seq, k_shape(k.as_ref())), seq))
         }
-        KvStorage::K8V8 { k, v, max_seq } => {
+        KvStorage::K8V8 { k, v, max_seq: _ } => {
             let seq = write_quant_k(idx, "k", k.as_ref(), device, out)?;
             write_quant_k(idx, "v", v.as_ref(), device, out)?;
-            Ok((geom_kv("k8v8", *max_seq, k_shape(k.as_ref())), seq))
+            Ok((geom_kv("k8v8", max_seq, k_shape(k.as_ref())), seq))
         }
         KvStorage::Planar {
             k,
             v,
-            max_seq,
+            max_seq: _,
             bits,
         } => {
             let seq = write_quant_k(idx, "k", k.as_ref(), device, out)?;
@@ -678,46 +679,46 @@ fn write_layer(
             // Tag encodes bit-width so the read side knows which codebook to
             // use (3-bit vs 4-bit).
             let tag = if *bits == 3 { "planar3" } else { "planar" };
-            Ok((geom_kv(tag, *max_seq, k_shape(k.as_ref())), seq))
+            Ok((geom_kv(tag, max_seq, k_shape(k.as_ref())), seq))
         }
         // `KvStorage::None` never reaches here — it has no packed payload and
         // is served by the geometry-only branch above.
-        KvStorage::None { max_seq } => {
+        KvStorage::None { max_seq: _ } => {
             Ok((format!("{{\"tag\":\"none\",\"max_seq\":{max_seq}}}"), 0))
         }
-        KvStorage::Mixed { state, max_seq } => write_mixed(idx, state, *max_seq, out),
+        KvStorage::Mixed { state, max_seq: _ } => write_mixed(idx, state, max_seq, out),
         KvStorage::Paged {
             quant,
             k,
             v_k8,
             v_planar,
-            max_seq,
+            max_seq: _,
         } => write_paged(
             idx,
             *quant,
             k.as_ref(),
             v_k8.as_deref(),
             v_planar.as_deref(),
-            *max_seq,
+            max_seq,
             device,
             out,
         ),
         // K8VTurbo3 — same layout as K8V4 but tagged "k8vturbo3".
         // V uses QuantV bits=3; codes/scales packing is the same format.
-        KvStorage::K8VTurbo3 { k, v, max_seq } => {
+        KvStorage::K8VTurbo3 { k, v, max_seq: _ } => {
             let seq = write_quant_k(idx, "k", k.as_ref(), device, out)?;
             write_quant_v(idx, v.as_ref(), device, out)?;
-            Ok((geom_kv("k8vturbo3", *max_seq, k_shape(k.as_ref())), seq))
+            Ok((geom_kv("k8vturbo3", max_seq, k_shape(k.as_ref())), seq))
         }
         // K8VTurbo3Tcq — byte-for-byte identical pack as K8VTurbo3.
         // The Viterbi assignment is encode-side only; the codes stream and the
         // decoder are shared. Tagged separately so a hydrate cannot silently
         // demote a TCQ payload to plain turbo3 on the next decode-step encode.
-        KvStorage::K8VTurbo3Tcq { k, v, max_seq } => {
+        KvStorage::K8VTurbo3Tcq { k, v, max_seq: _ } => {
             let seq = write_quant_k(idx, "k", k.as_ref(), device, out)?;
             write_quant_v(idx, v.as_ref(), device, out)?;
             Ok((
-                geom_kv(K8VTURBO3_TCQ_LAYOUT_TAG, *max_seq, k_shape(k.as_ref())),
+                geom_kv(K8VTURBO3_TCQ_LAYOUT_TAG, max_seq, k_shape(k.as_ref())),
                 seq,
             ))
         }
@@ -725,137 +726,131 @@ fn write_layer(
         // (2-bit LSB-first, 16 values per u32). Tagged separately via
         // K8VTURBO2_TCQ_LAYOUT_TAG to prevent silent demotion to nearest-centroid
         // on cross-restart hydrate.
-        KvStorage::K8VTurbo2Tcq { k, v, max_seq } => {
+        KvStorage::K8VTurbo2Tcq { k, v, max_seq: _ } => {
             let seq = write_quant_k(idx, "k", k.as_ref(), device, out)?;
             write_quant_v(idx, v.as_ref(), device, out)?;
             Ok((
-                geom_kv(K8VTURBO2_TCQ_LAYOUT_TAG, *max_seq, k_shape(k.as_ref())),
+                geom_kv(K8VTURBO2_TCQ_LAYOUT_TAG, max_seq, k_shape(k.as_ref())),
                 seq,
             ))
         }
         // TurboSym3 — symmetric 3-bit Lloyd-Max K + turbo3 V.
         // K is `QuantKTurbo3` (3-bit codes, same GPU pack as V-side turbo3).
         // Layout tag: TURBOSYM3_LAYOUT_TAG = "tsym3_lloyd_3_3".
-        KvStorage::TurboSym3 { k, v, max_seq } => {
+        KvStorage::TurboSym3 { k, v, max_seq: _ } => {
             let seq = write_quant_k_turbo(idx, k.as_ref(), device, out)?;
             write_quant_v(idx, v.as_ref(), device, out)?;
             Ok((
-                geom_kv(TURBOSYM3_LAYOUT_TAG, *max_seq, k_turbo_shape(k.as_ref())),
+                geom_kv(TURBOSYM3_LAYOUT_TAG, max_seq, k_turbo_shape(k.as_ref())),
                 seq,
             ))
         }
         // TurboSym4 — symmetric 4-bit Lloyd-Max K + tq4 V.
         // Both axes use TurboQuant 4-bit; K is `QuantKTurbo4` (not `QuantK`).
         // Geometry tag is `TURBOSYM4_LAYOUT_TAG` = "tsym4_lloyd_4_4".
-        KvStorage::TurboSym4 { k, v, max_seq } => {
+        KvStorage::TurboSym4 { k, v, max_seq: _ } => {
             let seq = write_quant_k_turbo(idx, k.as_ref(), device, out)?;
             write_quant_v(idx, v.as_ref(), device, out)?;
             Ok((
-                geom_kv(TURBOSYM4_LAYOUT_TAG, *max_seq, k_turbo_shape(k.as_ref())),
+                geom_kv(TURBOSYM4_LAYOUT_TAG, max_seq, k_turbo_shape(k.as_ref())),
                 seq,
             ))
         }
         // PlanarK — K-only payload (codes/scales/rotations); V is bf16 and
         // lives on the parent KvCache, NOT in KvStorage. Tag = PLANARK4_LAYOUT_TAG.
-        KvStorage::PlanarK { k, max_seq } => {
+        KvStorage::PlanarK { k, max_seq: _ } => {
             let seq = write_quant_planar_k_side(idx, k.as_ref(), device, out)?;
             let shape = k.as_ref().map(|q| q.shape.clone()).unwrap_or_default();
-            Ok((geom_kv(PLANARK4_LAYOUT_TAG, *max_seq, shape), seq))
+            Ok((geom_kv(PLANARK4_LAYOUT_TAG, max_seq, shape), seq))
         }
         // K8VTurbo2 — same layout as K8V4 but tagged "k8vturbo2".
         // V uses QuantV bits=2; codes/scales packing is the same format.
-        KvStorage::K8VTurbo2 { k, v, max_seq } => {
+        KvStorage::K8VTurbo2 { k, v, max_seq: _ } => {
             let seq = write_quant_k(idx, "k", k.as_ref(), device, out)?;
             write_quant_v(idx, v.as_ref(), device, out)?;
-            Ok((geom_kv("k8vturbo2", *max_seq, k_shape(k.as_ref())), seq))
+            Ok((geom_kv("k8vturbo2", max_seq, k_shape(k.as_ref())), seq))
         }
         // IsoV3 SSD spill — K side uses QuantK (q8_0) writer; V side serializes
         // the four IsoBlocks buffers (codes_packed, scales, quaternions, norms)
         // flat into safetensors tensors.
-        KvStorage::IsoV3 { k, v, max_seq } => {
+        KvStorage::IsoV3 { k, v, max_seq: _ } => {
             let seq = write_quant_k(idx, "k", k.as_ref(), device, out)?;
             write_quant_iso_v3(idx, v.as_ref(), out)?;
-            Ok((
-                geom_kv(ISOV3_LAYOUT_TAG, *max_seq, k_shape(k.as_ref())),
-                seq,
-            ))
+            Ok((geom_kv(ISOV3_LAYOUT_TAG, max_seq, k_shape(k.as_ref())), seq))
         }
         // IsoV4 SSD spill — K side identical to IsoV3 (q8_0); V side uses the
         // same flat IsoBlocks layout. Differentiated only by the geometry tag
         // (`ISOV4_LAYOUT_TAG`, currently "iso_v_4_v2" — bumped when the GPU
         // append's byte orientation was fixed) so the reader picks the 4-bit codec /
         // pack on hydrate.
-        KvStorage::IsoV4 { k, v, max_seq } => {
+        KvStorage::IsoV4 { k, v, max_seq: _ } => {
             let seq = write_quant_k(idx, "k", k.as_ref(), device, out)?;
             write_quant_iso_v4(idx, v.as_ref(), out)?;
-            Ok((
-                geom_kv(ISOV4_LAYOUT_TAG, *max_seq, k_shape(k.as_ref())),
-                seq,
-            ))
+            Ok((geom_kv(ISOV4_LAYOUT_TAG, max_seq, k_shape(k.as_ref())), seq))
         }
         // RotorV3 SSD spill — K is q8_0; V uses four flat buffers
         // (codes_packed, scales, norms, rotors). The static rotor table is
         // persisted so cross-restart identity is preserved regardless of
         // any seed-source drift.
-        KvStorage::RotorV3 { k, v, max_seq } => {
+        KvStorage::RotorV3 { k, v, max_seq: _ } => {
             let seq = write_quant_k(idx, "k", k.as_ref(), device, out)?;
             write_quant_rotor_v3(idx, v.as_ref(), out)?;
             Ok((
-                geom_kv(ROTORV3_LAYOUT_TAG, *max_seq, k_shape(k.as_ref())),
+                geom_kv(ROTORV3_LAYOUT_TAG, max_seq, k_shape(k.as_ref())),
                 seq,
             ))
         }
         // RotorV4 SSD spill — K is q8_0; V uses four flat buffers identical in
         // structure to RotorV3 (codes_packed, scales, norms, rotors) but with
         // 4-bit codes (1 u32 per group of 8 multivector components).
-        KvStorage::RotorV4 { k, v, max_seq } => {
+        KvStorage::RotorV4 { k, v, max_seq: _ } => {
             let seq = write_quant_k(idx, "k", k.as_ref(), device, out)?;
             write_quant_rotor_v4(idx, v.as_ref(), out)?;
             Ok((
-                geom_kv(ROTORV4_LAYOUT_TAG, *max_seq, k_shape(k.as_ref())),
+                geom_kv(ROTORV4_LAYOUT_TAG, max_seq, k_shape(k.as_ref())),
                 seq,
             ))
         }
         // IsoSym3 — both K and V are IsoBlocks (codes_packed / scales /
         // quaternions / norms each); K under `l{idx}.k.*` and V under
         // `l{idx}.v.*`. Layout tag: ISO_SYM_3_LAYOUT_TAG.
-        KvStorage::IsoSym3 { k, v, max_seq } => {
+        KvStorage::IsoSym3 { k, v, max_seq: _ } => {
             write_quant_iso_k3(idx, k.as_ref(), out)?;
             write_quant_iso_v3(idx, v.as_ref(), out)?;
             let shape = k.as_ref().map(|q| q.shape.clone()).unwrap_or_default();
             let seq = shape.get(2).copied().unwrap_or(0);
-            Ok((geom_kv(ISO_SYM_3_LAYOUT_TAG, *max_seq, shape), seq))
+            Ok((geom_kv(ISO_SYM_3_LAYOUT_TAG, max_seq, shape), seq))
         }
         // IsoSym4 — same payload layout as IsoSym3 with 4-bit codes.
-        KvStorage::IsoSym4 { k, v, max_seq } => {
+        KvStorage::IsoSym4 { k, v, max_seq: _ } => {
             write_quant_iso_k4(idx, k.as_ref(), out)?;
             write_quant_iso_v4(idx, v.as_ref(), out)?;
             let shape = k.as_ref().map(|q| q.shape.clone()).unwrap_or_default();
             let seq = shape.get(2).copied().unwrap_or(0);
-            Ok((geom_kv(ISO_SYM_4_LAYOUT_TAG, *max_seq, shape), seq))
+            Ok((geom_kv(ISO_SYM_4_LAYOUT_TAG, max_seq, shape), seq))
         }
         // IsoKOnly3 — K-only payload (codes_packed/scales/quaternions/norms
         // under `l{idx}.k.*`); V is bf16 and lives on the parent KvCache.
         // Layout tag: ISO_K_ONLY_3_LAYOUT_TAG.
-        KvStorage::IsoKOnly3 { k, max_seq } => {
+        KvStorage::IsoKOnly3 { k, max_seq: _ } => {
             write_quant_iso_k3(idx, k.as_ref(), out)?;
             let shape = k.as_ref().map(|q| q.shape.clone()).unwrap_or_default();
             let seq = shape.get(2).copied().unwrap_or(0);
-            Ok((geom_kv(ISO_K_ONLY_3_LAYOUT_TAG, *max_seq, shape), seq))
+            Ok((geom_kv(ISO_K_ONLY_3_LAYOUT_TAG, max_seq, shape), seq))
         }
         // IsoKOnly4 — same shape as IsoKOnly3 with 4-bit codes.
-        KvStorage::IsoKOnly4 { k, max_seq } => {
+        KvStorage::IsoKOnly4 { k, max_seq: _ } => {
             write_quant_iso_k4(idx, k.as_ref(), out)?;
             let shape = k.as_ref().map(|q| q.shape.clone()).unwrap_or_default();
             let seq = shape.get(2).copied().unwrap_or(0);
-            Ok((geom_kv(ISO_K_ONLY_4_LAYOUT_TAG, *max_seq, shape), seq))
+            Ok((geom_kv(ISO_K_ONLY_4_LAYOUT_TAG, max_seq, shape), seq))
         }
         // RotorSym3 — K is rotor3 K (codes_packed/scales/norms + optional
         // qjl_codes/qjl_norms/qjl_s under l{idx}.k.*); V is rotor3 V
         // (codes_packed/scales/norms/rotors under l{idx}.v.*). The static K
         // rotor table also lives at l{idx}.k.rotors so hydrate is independent
         // of the global seed.
-        KvStorage::RotorSym3 { k, v, max_seq } => {
+        KvStorage::RotorSym3 { k, v, max_seq: _ } => {
             write_quant_rotor_k3(idx, k.as_ref(), out)?;
             write_quant_rotor_v3(idx, v.as_ref(), out)?;
             let shape = k.as_ref().map(|q| q.shape.clone()).unwrap_or_default();
@@ -865,10 +860,10 @@ fn write_layer(
             } else {
                 ROTOR_SYM_3_LAYOUT_TAG
             };
-            Ok((geom_kv(tag, *max_seq, shape), seq))
+            Ok((geom_kv(tag, max_seq, shape), seq))
         }
         // RotorSym4 — same shape as RotorSym3 with 4-bit codes.
-        KvStorage::RotorSym4 { k, v, max_seq } => {
+        KvStorage::RotorSym4 { k, v, max_seq: _ } => {
             write_quant_rotor_k4(idx, k.as_ref(), out)?;
             write_quant_rotor_v4(idx, v.as_ref(), out)?;
             let shape = k.as_ref().map(|q| q.shape.clone()).unwrap_or_default();
@@ -878,10 +873,10 @@ fn write_layer(
             } else {
                 ROTOR_SYM_4_LAYOUT_TAG
             };
-            Ok((geom_kv(tag, *max_seq, shape), seq))
+            Ok((geom_kv(tag, max_seq, shape), seq))
         }
         // RotorKOnly3 — K-only payload; V is bf16 off-storage.
-        KvStorage::RotorKOnly3 { k, max_seq } => {
+        KvStorage::RotorKOnly3 { k, max_seq: _ } => {
             write_quant_rotor_k3(idx, k.as_ref(), out)?;
             let shape = k.as_ref().map(|q| q.shape.clone()).unwrap_or_default();
             let seq = shape.get(2).copied().unwrap_or(0);
@@ -890,10 +885,10 @@ fn write_layer(
             } else {
                 ROTOR_K_ONLY_3_LAYOUT_TAG
             };
-            Ok((geom_kv(tag, *max_seq, shape), seq))
+            Ok((geom_kv(tag, max_seq, shape), seq))
         }
         // RotorKOnly4 — same shape as RotorKOnly3 with 4-bit codes.
-        KvStorage::RotorKOnly4 { k, max_seq } => {
+        KvStorage::RotorKOnly4 { k, max_seq: _ } => {
             write_quant_rotor_k4(idx, k.as_ref(), out)?;
             let shape = k.as_ref().map(|q| q.shape.clone()).unwrap_or_default();
             let seq = shape.get(2).copied().unwrap_or(0);
@@ -902,7 +897,7 @@ fn write_layer(
             } else {
                 ROTOR_K_ONLY_4_LAYOUT_TAG
             };
-            Ok((geom_kv(tag, *max_seq, shape), seq))
+            Ok((geom_kv(tag, max_seq, shape), seq))
         }
         // RotorKAsym3 — K is rotor3 K (codes_packed/scales/norms + optional
         // qjl_codes/qjl_norms/qjl_s under l{idx}.k.*); V is affine QuantV
@@ -911,7 +906,7 @@ fn write_layer(
         KvStorage::RotorKAsym3 {
             k,
             v,
-            max_seq,
+            max_seq: _,
             v_bits,
             v_group_size,
         } => {
@@ -925,13 +920,13 @@ fn write_layer(
                 ROTOR_K_ASYM_3_LAYOUT_PREFIX
             };
             let tag = format!("{prefix}_v{v_bits}_g{v_group_size}");
-            Ok((geom_kv(&tag, *max_seq, shape), seq))
+            Ok((geom_kv(&tag, max_seq, shape), seq))
         }
         // RotorKAsym4 — same shape with rotor4 K + affine V.
         KvStorage::RotorKAsym4 {
             k,
             v,
-            max_seq,
+            max_seq: _,
             v_bits,
             v_group_size,
         } => {
@@ -945,7 +940,7 @@ fn write_layer(
                 ROTOR_K_ASYM_4_LAYOUT_PREFIX
             };
             let tag = format!("{prefix}_v{v_bits}_g{v_group_size}");
-            Ok((geom_kv(&tag, *max_seq, shape), seq))
+            Ok((geom_kv(&tag, max_seq, shape), seq))
         }
     }
 }

@@ -195,7 +195,7 @@ fn ceiling_does_not_pre_allocate_ring() {
     assert_eq!(cache.offset(), 192, "offset tracks filled length");
     // The ring grew only to the next pow2 ≥ 192 = 256 — NOT to 140_000.
     assert_eq!(
-        cache.storage_max_seq_for_test(),
+        cache.storage.max_seq(),
         256,
         "ring grows lazily to the doubling boundary, not the ceiling",
     );
@@ -225,7 +225,7 @@ fn grow_clamps_to_ceiling() {
 
     assert_eq!(cache.offset(), 192);
     assert_eq!(
-        cache.storage_max_seq_for_test(),
+        cache.storage.max_seq(),
         200,
         "doubled size (256) clamped down to the 200-token ceiling",
     );
@@ -278,7 +278,7 @@ fn non_positive_ceiling_means_unbounded() {
         .expect("unbounded grow with non-positive ceiling");
 
     assert_eq!(cache.offset(), 300);
-    assert_eq!(cache.storage_max_seq_for_test(), 512);
+    assert_eq!(cache.storage.max_seq(), 512);
 
     cache.exit_prefill(device).expect("exit_prefill");
 }

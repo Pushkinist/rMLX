@@ -362,13 +362,13 @@ impl KvCache {
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
-        let KvStorage::None { max_seq } = &self.storage else {
+        let max_seq = self.storage.max_seq();
+        let KvStorage::None { .. } = &self.storage else {
             return Err(Error::KvStorageMismatch {
                 expected: "None",
                 got: storage_variant_name(&self.storage),
             });
         };
-        let max_seq = *max_seq;
         self.update_decode_fp16(new_k, new_v, max_seq, device)
     }
 
@@ -438,7 +438,7 @@ impl KvCache {
             }
         }
 
-        let current_max_seq = storage_max_seq(&self.storage);
+        let current_max_seq = self.storage.max_seq();
         if needed_seq <= current_max_seq {
             return Ok(());
         }
@@ -658,7 +658,7 @@ impl KvCache {
             }
         }
 
-        let current_max_seq = storage_max_seq(&self.storage);
+        let current_max_seq = self.storage.max_seq();
         if needed_seq <= current_max_seq {
             return Ok(());
         }
@@ -757,7 +757,7 @@ impl KvCache {
             device,
         )?;
 
-        let max_seq = storage_max_seq(&self.storage);
+        let max_seq = self.storage.max_seq();
 
         if self.prefill_raw_k.is_none() {
             let buf_shape = [b, kv_h, max_seq, head_dim];
@@ -2110,39 +2110,6 @@ pub(super) fn next_pow2_seq(needed: i32) -> i32 {
     // next_power_of_two on u32; safe because n <= max_pow2 < 2^31.
     let p = n.next_power_of_two();
     p as i32
-}
-
-/// Read the `max_seq` recorded on whichever `KvStorage` variant is active.
-pub(super) fn storage_max_seq(storage: &KvStorage) -> i32 {
-    match storage {
-        KvStorage::K8V4 { max_seq, .. } => *max_seq,
-        KvStorage::K8V8 { max_seq, .. } => *max_seq,
-        KvStorage::Planar { max_seq, .. } => *max_seq,
-        KvStorage::None { max_seq } => *max_seq,
-        KvStorage::Mixed { max_seq, .. } => *max_seq,
-        KvStorage::Paged { max_seq, .. } => *max_seq,
-        KvStorage::K8VTurbo3 { max_seq, .. } => *max_seq,
-        KvStorage::TurboSym3 { max_seq, .. } => *max_seq,
-        KvStorage::TurboSym4 { max_seq, .. } => *max_seq,
-        KvStorage::PlanarK { max_seq, .. } => *max_seq,
-        KvStorage::K8VTurbo2 { max_seq, .. } => *max_seq,
-        KvStorage::IsoV3 { max_seq, .. } => *max_seq,
-        KvStorage::IsoV4 { max_seq, .. } => *max_seq,
-        KvStorage::RotorV3 { max_seq, .. } => *max_seq,
-        KvStorage::RotorV4 { max_seq, .. } => *max_seq,
-        KvStorage::K8VTurbo3Tcq { max_seq, .. } => *max_seq,
-        KvStorage::K8VTurbo2Tcq { max_seq, .. } => *max_seq,
-        KvStorage::IsoSym3 { max_seq, .. } => *max_seq,
-        KvStorage::IsoSym4 { max_seq, .. } => *max_seq,
-        KvStorage::IsoKOnly3 { max_seq, .. } => *max_seq,
-        KvStorage::IsoKOnly4 { max_seq, .. } => *max_seq,
-        KvStorage::RotorSym3 { max_seq, .. } => *max_seq,
-        KvStorage::RotorSym4 { max_seq, .. } => *max_seq,
-        KvStorage::RotorKOnly3 { max_seq, .. } => *max_seq,
-        KvStorage::RotorKOnly4 { max_seq, .. } => *max_seq,
-        KvStorage::RotorKAsym3 { max_seq, .. } => *max_seq,
-        KvStorage::RotorKAsym4 { max_seq, .. } => *max_seq,
-    }
 }
 
 /// Bump the `max_seq` recorded on the active storage variant. This is the

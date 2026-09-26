@@ -549,15 +549,13 @@ pub(super) fn rotor_k_only_gpu_append(
     device: Device,
 ) -> Result<()> {
     let layer_idx = layer_idx_u32(cache.layer_idx);
-    let (KvStorage::RotorKOnly3 { max_seq, .. } | KvStorage::RotorKOnly4 { max_seq, .. }) =
-        &cache.storage
-    else {
+    let max_seq = cache.storage.max_seq();
+    let (KvStorage::RotorKOnly3 { .. } | KvStorage::RotorKOnly4 { .. }) = &cache.storage else {
         return Err(storage_mismatch(
             "RotorKOnly3 | RotorKOnly4",
             &cache.storage,
         ));
     };
-    let max_seq = *max_seq;
 
     if let KvStorage::RotorKOnly3 { k, .. } = &mut cache.storage {
         rotor_k_only_gpu_append_at::<3>(
@@ -681,12 +679,10 @@ pub(super) fn rotor_sym_gpu_append(
     device: Device,
 ) -> Result<()> {
     let layer_idx = layer_idx_u32(cache.layer_idx);
-    let (KvStorage::RotorSym3 { max_seq, .. } | KvStorage::RotorSym4 { max_seq, .. }) =
-        &cache.storage
-    else {
+    let max_seq = cache.storage.max_seq();
+    let (KvStorage::RotorSym3 { .. } | KvStorage::RotorSym4 { .. }) = &cache.storage else {
         return Err(storage_mismatch("RotorSym3 | RotorSym4", &cache.storage));
     };
-    let max_seq = *max_seq;
 
     if let KvStorage::RotorSym3 { k, v, .. } = &mut cache.storage {
         rotor_sym_gpu_append_at::<3>(
@@ -1194,12 +1190,10 @@ impl KvCache {
         device: Device,
     ) -> Result<(Array, Array)> {
         let layer_idx = layer_idx_u32(self.layer_idx);
-        let (KvStorage::RotorV3 { max_seq, .. } | KvStorage::RotorV4 { max_seq, .. }) =
-            &self.storage
-        else {
+        let max_seq = self.storage.max_seq();
+        let (KvStorage::RotorV3 { .. } | KvStorage::RotorV4 { .. }) = &self.storage else {
             return Err(storage_mismatch("RotorV3 | RotorV4", &self.storage));
         };
-        let max_seq = *max_seq;
 
         if self.decode_fp16_k.is_some() {
             return self.update_decode_fp16(new_k, new_v, max_seq, device);
@@ -1229,12 +1223,10 @@ impl KvCache {
         device: Device,
     ) -> Result<(Array, Array)> {
         let layer_idx = layer_idx_u32(self.layer_idx);
-        let (KvStorage::RotorSym3 { max_seq, .. } | KvStorage::RotorSym4 { max_seq, .. }) =
-            &self.storage
-        else {
+        let max_seq = self.storage.max_seq();
+        let (KvStorage::RotorSym3 { .. } | KvStorage::RotorSym4 { .. }) = &self.storage else {
             return Err(storage_mismatch("RotorSym3 | RotorSym4", &self.storage));
         };
-        let max_seq = *max_seq;
 
         if self.decode_fp16_k.is_some() {
             return self.update_decode_fp16(new_k, new_v, max_seq, device);
@@ -1268,12 +1260,10 @@ impl KvCache {
         device: Device,
     ) -> Result<(Array, Array)> {
         let layer_idx = layer_idx_u32(self.layer_idx);
-        let (KvStorage::RotorKOnly3 { max_seq, .. } | KvStorage::RotorKOnly4 { max_seq, .. }) =
-            &self.storage
-        else {
+        let max_seq = self.storage.max_seq();
+        let (KvStorage::RotorKOnly3 { .. } | KvStorage::RotorKOnly4 { .. }) = &self.storage else {
             return Err(storage_mismatch("RotorKOnly3 | RotorKOnly4", &self.storage));
         };
-        let max_seq = *max_seq;
 
         let k_full = if let KvStorage::RotorKOnly3 { k, .. } = &mut self.storage {
             rotor_k_only_k_side::<3>(k, max_seq, layer_idx, "RotorKOnly3", new_k, device)?
@@ -1318,16 +1308,12 @@ impl KvCache {
         device: Device,
     ) -> Result<(Array, Array)> {
         let layer_idx = layer_idx_u32(self.layer_idx);
-        let (KvStorage::RotorKAsym3 {
-            max_seq, v_bits, ..
-        }
-        | KvStorage::RotorKAsym4 {
-            max_seq, v_bits, ..
-        }) = &self.storage
+        let max_seq = self.storage.max_seq();
+        let (KvStorage::RotorKAsym3 { v_bits, .. } | KvStorage::RotorKAsym4 { v_bits, .. }) =
+            &self.storage
         else {
             return Err(storage_mismatch("RotorKAsym3 | RotorKAsym4", &self.storage));
         };
-        let max_seq = *max_seq;
         let v_bits = *v_bits;
 
         if self.decode_fp16_k.is_some() {
@@ -1357,12 +1343,13 @@ impl KvCache {
     ) -> Result<()> {
         let quant_bits = self.quant.approx_code_bits().1;
         let layer_idx = layer_idx_u32(self.layer_idx);
-        if let KvStorage::RotorV3 { k, v, max_seq } = &mut self.storage {
+        let max_seq = self.storage.max_seq();
+        if let KvStorage::RotorV3 { k, v, .. } = &mut self.storage {
             warn_if_width_disagrees(self.quant, quant_bits, 3);
-            rotor_v_bulk_encode::<3>(k, v, *max_seq, layer_idx, k_full, v_full, device, total_seq)
-        } else if let KvStorage::RotorV4 { k, v, max_seq } = &mut self.storage {
+            rotor_v_bulk_encode::<3>(k, v, max_seq, layer_idx, k_full, v_full, device, total_seq)
+        } else if let KvStorage::RotorV4 { k, v, .. } = &mut self.storage {
             warn_if_width_disagrees(self.quant, quant_bits, 4);
-            rotor_v_bulk_encode::<4>(k, v, *max_seq, layer_idx, k_full, v_full, device, total_seq)
+            rotor_v_bulk_encode::<4>(k, v, max_seq, layer_idx, k_full, v_full, device, total_seq)
         } else {
             Err(storage_mismatch("RotorV3 | RotorV4", &self.storage))
         }
@@ -1380,12 +1367,13 @@ impl KvCache {
     ) -> Result<()> {
         let quant_bits = self.quant.approx_code_bits().0;
         let layer_idx = layer_idx_u32(self.layer_idx);
-        if let KvStorage::RotorSym3 { k, v, max_seq } = &mut self.storage {
+        let max_seq = self.storage.max_seq();
+        if let KvStorage::RotorSym3 { k, v, .. } = &mut self.storage {
             warn_if_width_disagrees(self.quant, quant_bits, 3);
-            rotor_sym_bulk_encode::<3>(k, v, *max_seq, layer_idx, k_full, v_full, device, total_seq)
-        } else if let KvStorage::RotorSym4 { k, v, max_seq } = &mut self.storage {
+            rotor_sym_bulk_encode::<3>(k, v, max_seq, layer_idx, k_full, v_full, device, total_seq)
+        } else if let KvStorage::RotorSym4 { k, v, .. } = &mut self.storage {
             warn_if_width_disagrees(self.quant, quant_bits, 4);
-            rotor_sym_bulk_encode::<4>(k, v, *max_seq, layer_idx, k_full, v_full, device, total_seq)
+            rotor_sym_bulk_encode::<4>(k, v, max_seq, layer_idx, k_full, v_full, device, total_seq)
         } else {
             Err(storage_mismatch("RotorSym3 | RotorSym4", &self.storage))
         }
@@ -1427,19 +1415,20 @@ impl KvCache {
     ) -> Result<()> {
         let quant_bits = self.quant.approx_code_bits().0;
         let layer_idx = layer_idx_u32(self.layer_idx);
+        let max_seq = self.storage.max_seq();
         if let KvStorage::RotorKAsym3 {
             k,
             v,
-            max_seq,
             v_bits,
             v_group_size,
+            ..
         } = &mut self.storage
         {
             warn_if_width_disagrees(self.quant, quant_bits, 3);
             rotor_k_asym_bulk_encode::<3>(
                 k,
                 v,
-                *max_seq,
+                max_seq,
                 *v_bits,
                 *v_group_size,
                 layer_idx,
@@ -1451,16 +1440,16 @@ impl KvCache {
         } else if let KvStorage::RotorKAsym4 {
             k,
             v,
-            max_seq,
             v_bits,
             v_group_size,
+            ..
         } = &mut self.storage
         {
             warn_if_width_disagrees(self.quant, quant_bits, 4);
             rotor_k_asym_bulk_encode::<4>(
                 k,
                 v,
-                *max_seq,
+                max_seq,
                 *v_bits,
                 *v_group_size,
                 layer_idx,

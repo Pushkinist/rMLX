@@ -525,15 +525,6 @@ impl KvCache {
         self.decode_fp16_k.as_ref()
     }
 
-    /// Test-only accessor: the `max_seq` currently recorded on the active
-    /// storage variant (the allocated ring capacity). Used by the lazy-grow
-    /// / ceiling tests to assert the ring grew lazily rather than
-    /// pre-allocating to the ceiling.
-    #[cfg(test)]
-    pub fn storage_max_seq_for_test(&self) -> i32 {
-        super::update::storage_max_seq(&self.storage)
-    }
-
     /// Test-only mutator: plant pre-allocated bf16 decode K/V buffers (sized to
     /// a capacity that may exceed the filled length) and set the filled
     /// `offset`. Lets `resident_bytes` tests reproduce the on-device case where

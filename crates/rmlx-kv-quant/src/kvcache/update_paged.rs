@@ -55,7 +55,7 @@ impl KvCache {
 
         // Extract quant + max_seq without holding the storage borrow.
         let (paged_quant, max_seq) = match &self.storage {
-            KvStorage::Paged { quant, max_seq, .. } => (*quant, *max_seq),
+            KvStorage::Paged { quant, .. } => (*quant, self.storage.max_seq()),
             _ => unreachable!("update_paged called on non-Paged storage"),
         };
 

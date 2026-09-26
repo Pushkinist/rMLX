@@ -191,7 +191,7 @@ impl KvCache {
         // token in at `[prev_offset:offset]` — identical bookkeeping to K8V4.
         let kv = if want_kv {
             let max_seq = match &self.storage {
-                KvStorage::Mixed { max_seq, .. } => *max_seq,
+                KvStorage::Mixed { .. } => self.storage.max_seq(),
                 _ => {
                     return Err(Error::KvStorageMismatch {
                         expected: "Mixed",
@@ -1348,10 +1348,10 @@ impl KvCache {
         self.ensure_decode_capacity(self.offset + new_k.shape()[2])?;
 
         // Extract & validate storage variant.
-        let KvStorage::PlanarK { k, max_seq } = &mut self.storage else {
+        let max_seq = self.storage.max_seq();
+        let KvStorage::PlanarK { k, .. } = &mut self.storage else {
             return Ok(None);
         };
-        let max_seq = *max_seq;
 
         // Append K (packed) — same as the legacy update_planar_k path but
         // SKIPPING the K dequant (the bandwidth win).
@@ -2838,9 +2838,9 @@ fn iso_sym_accumulated_seq(storage: &KvStorage) -> Result<i32> {
 /// Read from the live `KvStorage` variant — which `ensure_decode_capacity` has
 /// just grown for this step — never from the store struct's own inert
 /// `max_seq` field, which is a prefill-time snapshot.
-fn iso_k_max_seq(storage: &KvStorage) -> Result<i32> {
-    if let KvStorage::IsoKOnly3 { max_seq, .. } | KvStorage::IsoKOnly4 { max_seq, .. } = storage {
-        Ok(*max_seq)
+pub(super) fn iso_k_max_seq(storage: &KvStorage) -> Result<i32> {
+    if let KvStorage::IsoKOnly3 { .. } | KvStorage::IsoKOnly4 { .. } = storage {
+        Ok(storage.max_seq())
     } else {
         Err(Error::KvStorageMismatch {
             expected: "IsoKOnly3 | IsoKOnly4",
@@ -2850,10 +2850,9 @@ fn iso_k_max_seq(storage: &KvStorage) -> Result<i32> {
 }
 
 /// `max_seq` of the active rotor K-only storage variant.
-fn rotor_k_max_seq(storage: &KvStorage) -> Result<i32> {
-    if let KvStorage::RotorKOnly3 { max_seq, .. } | KvStorage::RotorKOnly4 { max_seq, .. } = storage
-    {
-        Ok(*max_seq)
+pub(super) fn rotor_k_max_seq(storage: &KvStorage) -> Result<i32> {
+    if let KvStorage::RotorKOnly3 { .. } | KvStorage::RotorKOnly4 { .. } = storage {
+        Ok(storage.max_seq())
     } else {
         Err(Error::KvStorageMismatch {
             expected: "RotorKOnly3 | RotorKOnly4",

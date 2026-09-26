@@ -39,10 +39,10 @@ impl KvCache {
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
-        let KvStorage::K8V4 { k, v, max_seq } = &mut self.storage else {
+        let max_seq = self.storage.max_seq();
+        let KvStorage::K8V4 { k, v, .. } = &mut self.storage else {
             unreachable!("storage mismatch: expected K8V4");
         };
-        let max_seq = *max_seq;
 
         if self.decode_fp16_k.is_some() {
             return self.update_decode_fp16(new_k, new_v, max_seq, device);
@@ -259,7 +259,7 @@ impl KvCache {
         // rather than crashing mid-append.
         self.ensure_decode_capacity(kv_seq_after_update)?;
         let max_seq = match &self.storage {
-            KvStorage::K8V4 { max_seq, .. } => *max_seq,
+            KvStorage::K8V4 { .. } => self.storage.max_seq(),
             _ => return Ok(None),
         };
         let prev_offset = self.offset;
@@ -761,10 +761,10 @@ impl KvCache {
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
-        let KvStorage::K8V8 { k, v, max_seq } = &mut self.storage else {
+        let max_seq = self.storage.max_seq();
+        let KvStorage::K8V8 { k, v, .. } = &mut self.storage else {
             unreachable!("storage mismatch: expected K8V8");
         };
-        let max_seq = *max_seq;
 
         if self.decode_fp16_k.is_some() {
             return self.update_decode_fp16(new_k, new_v, max_seq, device);
@@ -843,7 +843,7 @@ impl KvCache {
         device: Device,
     ) -> Result<()> {
         let max_seq = match &self.storage {
-            KvStorage::K8V8 { max_seq, .. } => *max_seq,
+            KvStorage::K8V8 { .. } => self.storage.max_seq(),
             _ => return Err(storage_mismatch("K8V8", &self.storage)),
         };
         let new_shape = k_full.shape();
@@ -902,7 +902,7 @@ impl KvCache {
         device: Device,
     ) -> Result<()> {
         let max_seq = match &self.storage {
-            KvStorage::K8V4 { max_seq, .. } => *max_seq,
+            KvStorage::K8V4 { .. } => self.storage.max_seq(),
             _ => return Err(storage_mismatch("K8V4", &self.storage)),
         };
         let new_shape = k_full.shape();

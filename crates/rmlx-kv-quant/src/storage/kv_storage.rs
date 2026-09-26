@@ -1248,8 +1248,9 @@ impl KvStorage {
         reason = "single match over the closed KvStorage enum — one arm per variant, each is small and self-contained; splitting would hide the 1-to-1 mapping"
     )]
     pub fn try_deep_clone(&self) -> Result<Self> {
+        let max_seq = self.max_seq();
         Ok(match self {
-            Self::K8V4 { k, v, max_seq } => Self::K8V4 {
+            Self::K8V4 { k, v, max_seq: _ } => Self::K8V4 {
                 k: match k {
                     Some(qk) => Some(qk.try_deep_clone()?),
                     None => None,
@@ -1258,9 +1259,9 @@ impl KvStorage {
                     Some(qv) => Some(qv.try_deep_clone()?),
                     None => None,
                 },
-                max_seq: *max_seq,
+                max_seq,
             },
-            Self::K8V8 { k, v, max_seq } => Self::K8V8 {
+            Self::K8V8 { k, v, max_seq: _ } => Self::K8V8 {
                 k: match k {
                     Some(qk) => Some(qk.try_deep_clone()?),
                     None => None,
@@ -1269,12 +1270,12 @@ impl KvStorage {
                     Some(qv) => Some(qv.try_deep_clone()?),
                     None => None,
                 },
-                max_seq: *max_seq,
+                max_seq,
             },
             Self::Planar {
                 k,
                 v,
-                max_seq,
+                max_seq: _,
                 bits,
             } => Self::Planar {
                 k: match k {
@@ -1285,13 +1286,13 @@ impl KvStorage {
                     Some(qv) => Some(qv.try_deep_clone()?),
                     None => None,
                 },
-                max_seq: *max_seq,
+                max_seq,
                 bits: *bits,
             },
-            Self::None { max_seq } => Self::None { max_seq: *max_seq },
-            Self::Mixed { state, max_seq } => Self::Mixed {
+            Self::None { max_seq: _ } => Self::None { max_seq },
+            Self::Mixed { state, max_seq: _ } => Self::Mixed {
                 state: state.try_deep_clone()?,
-                max_seq: *max_seq,
+                max_seq,
             },
             // Paged: for speculative decoding clone, return a fresh Paged storage.
             // The block-table state is not cloneable efficiently with the page-slab
@@ -1299,15 +1300,15 @@ impl KvStorage {
             // re-populate from model forward passes. This returns an empty shell
             // consistent with the existing QuantK::try_deep_clone semantics (which
             // clone GPU buffers but the CPU path is also valid).
-            Self::Paged { quant, max_seq, .. } => Self::Paged {
+            Self::Paged { quant, .. } => Self::Paged {
                 quant: *quant,
                 k: None,
                 v_k8: None,
                 v_planar: None,
-                max_seq: *max_seq,
+                max_seq,
             },
             // K8VTurbo3 deep-clones like K8V4.
-            Self::K8VTurbo3 { k, v, max_seq } => Self::K8VTurbo3 {
+            Self::K8VTurbo3 { k, v, max_seq: _ } => Self::K8VTurbo3 {
                 k: match k {
                     Some(qk) => Some(qk.try_deep_clone()?),
                     None => None,
@@ -1316,10 +1317,10 @@ impl KvStorage {
                     Some(qv) => Some(qv.try_deep_clone()?),
                     None => None,
                 },
-                max_seq: *max_seq,
+                max_seq,
             },
             // TurboSym3 — deep-clone both the 3-bit turbo K store and QuantV.
-            Self::TurboSym3 { k, v, max_seq } => Self::TurboSym3 {
+            Self::TurboSym3 { k, v, max_seq: _ } => Self::TurboSym3 {
                 k: match k {
                     Some(qk) => Some(qk.try_deep_clone()?),
                     None => None,
@@ -1328,10 +1329,10 @@ impl KvStorage {
                     Some(qv) => Some(qv.try_deep_clone()?),
                     None => None,
                 },
-                max_seq: *max_seq,
+                max_seq,
             },
             // TurboSym4 — deep-clone both the 4-bit turbo K store and QuantV.
-            Self::TurboSym4 { k, v, max_seq } => Self::TurboSym4 {
+            Self::TurboSym4 { k, v, max_seq: _ } => Self::TurboSym4 {
                 k: match k {
                     Some(qk) => Some(qk.try_deep_clone()?),
                     None => None,
@@ -1340,18 +1341,18 @@ impl KvStorage {
                     Some(qv) => Some(qv.try_deep_clone()?),
                     None => None,
                 },
-                max_seq: *max_seq,
+                max_seq,
             },
             // PlanarK — deep-clone K only; V (bf16) on parent.
-            Self::PlanarK { k, max_seq } => Self::PlanarK {
+            Self::PlanarK { k, max_seq: _ } => Self::PlanarK {
                 k: match k {
                     Some(qk) => Some(qk.try_deep_clone()?),
                     None => None,
                 },
-                max_seq: *max_seq,
+                max_seq,
             },
             // K8VTurbo2 deep-clones like K8V4.
-            Self::K8VTurbo2 { k, v, max_seq } => Self::K8VTurbo2 {
+            Self::K8VTurbo2 { k, v, max_seq: _ } => Self::K8VTurbo2 {
                 k: match k {
                     Some(qk) => Some(qk.try_deep_clone()?),
                     None => None,
@@ -1360,10 +1361,10 @@ impl KvStorage {
                     Some(qv) => Some(qv.try_deep_clone()?),
                     None => None,
                 },
-                max_seq: *max_seq,
+                max_seq,
             },
             // IsoV3 — deep-clone the K (QuantK) + V (QuantIsoV3).
-            Self::IsoV3 { k, v, max_seq } => Self::IsoV3 {
+            Self::IsoV3 { k, v, max_seq: _ } => Self::IsoV3 {
                 k: match k {
                     Some(qk) => Some(qk.try_deep_clone()?),
                     None => None,
@@ -1372,10 +1373,10 @@ impl KvStorage {
                     Some(qv) => Some(qv.try_deep_clone()?),
                     None => None,
                 },
-                max_seq: *max_seq,
+                max_seq,
             },
             // IsoV4 — deep-clone the K (QuantK) + V (QuantIsoV4).
-            Self::IsoV4 { k, v, max_seq } => Self::IsoV4 {
+            Self::IsoV4 { k, v, max_seq: _ } => Self::IsoV4 {
                 k: match k {
                     Some(qk) => Some(qk.try_deep_clone()?),
                     None => None,
@@ -1384,10 +1385,10 @@ impl KvStorage {
                     Some(qv) => Some(qv.try_deep_clone()?),
                     None => None,
                 },
-                max_seq: *max_seq,
+                max_seq,
             },
             // RotorV3 — deep-clone K (QuantK) + V (QuantRotorV3).
-            Self::RotorV3 { k, v, max_seq } => Self::RotorV3 {
+            Self::RotorV3 { k, v, max_seq: _ } => Self::RotorV3 {
                 k: match k {
                     Some(qk) => Some(qk.try_deep_clone()?),
                     None => None,
@@ -1396,10 +1397,10 @@ impl KvStorage {
                     Some(qv) => Some(qv.try_deep_clone()?),
                     None => None,
                 },
-                max_seq: *max_seq,
+                max_seq,
             },
             // RotorV4 — deep-clone K (QuantK) + V (QuantRotorV4).
-            Self::RotorV4 { k, v, max_seq } => Self::RotorV4 {
+            Self::RotorV4 { k, v, max_seq: _ } => Self::RotorV4 {
                 k: match k {
                     Some(qk) => Some(qk.try_deep_clone()?),
                     None => None,
@@ -1408,10 +1409,10 @@ impl KvStorage {
                     Some(qv) => Some(qv.try_deep_clone()?),
                     None => None,
                 },
-                max_seq: *max_seq,
+                max_seq,
             },
             // K8VTurbo3Tcq deep-clones like K8VTurbo3.
-            Self::K8VTurbo3Tcq { k, v, max_seq } => Self::K8VTurbo3Tcq {
+            Self::K8VTurbo3Tcq { k, v, max_seq: _ } => Self::K8VTurbo3Tcq {
                 k: match k {
                     Some(qk) => Some(qk.try_deep_clone()?),
                     None => None,
@@ -1420,10 +1421,10 @@ impl KvStorage {
                     Some(qv) => Some(qv.try_deep_clone()?),
                     None => None,
                 },
-                max_seq: *max_seq,
+                max_seq,
             },
             // K8VTurbo2Tcq deep-clones like K8VTurbo2 / K8VTurbo3Tcq.
-            Self::K8VTurbo2Tcq { k, v, max_seq } => Self::K8VTurbo2Tcq {
+            Self::K8VTurbo2Tcq { k, v, max_seq: _ } => Self::K8VTurbo2Tcq {
                 k: match k {
                     Some(qk) => Some(qk.try_deep_clone()?),
                     None => None,
@@ -1432,10 +1433,10 @@ impl KvStorage {
                     Some(qv) => Some(qv.try_deep_clone()?),
                     None => None,
                 },
-                max_seq: *max_seq,
+                max_seq,
             },
             // IsoSym3 / IsoSym4 — deep-clone both K + V iso buffers.
-            Self::IsoSym3 { k, v, max_seq } => Self::IsoSym3 {
+            Self::IsoSym3 { k, v, max_seq: _ } => Self::IsoSym3 {
                 k: match k {
                     Some(qk) => Some(qk.try_deep_clone()?),
                     None => None,
@@ -1444,9 +1445,9 @@ impl KvStorage {
                     Some(qv) => Some(qv.try_deep_clone()?),
                     None => None,
                 },
-                max_seq: *max_seq,
+                max_seq,
             },
-            Self::IsoSym4 { k, v, max_seq } => Self::IsoSym4 {
+            Self::IsoSym4 { k, v, max_seq: _ } => Self::IsoSym4 {
                 k: match k {
                     Some(qk) => Some(qk.try_deep_clone()?),
                     None => None,
@@ -1455,25 +1456,25 @@ impl KvStorage {
                     Some(qv) => Some(qv.try_deep_clone()?),
                     None => None,
                 },
-                max_seq: *max_seq,
+                max_seq,
             },
             // IsoKOnly3 / IsoKOnly4 — K only.
-            Self::IsoKOnly3 { k, max_seq } => Self::IsoKOnly3 {
+            Self::IsoKOnly3 { k, max_seq: _ } => Self::IsoKOnly3 {
                 k: match k {
                     Some(qk) => Some(qk.try_deep_clone()?),
                     None => None,
                 },
-                max_seq: *max_seq,
+                max_seq,
             },
-            Self::IsoKOnly4 { k, max_seq } => Self::IsoKOnly4 {
+            Self::IsoKOnly4 { k, max_seq: _ } => Self::IsoKOnly4 {
                 k: match k {
                     Some(qk) => Some(qk.try_deep_clone()?),
                     None => None,
                 },
-                max_seq: *max_seq,
+                max_seq,
             },
             // RotorSym3 / RotorSym4 — deep-clone both K + V rotor buffers.
-            Self::RotorSym3 { k, v, max_seq } => Self::RotorSym3 {
+            Self::RotorSym3 { k, v, max_seq: _ } => Self::RotorSym3 {
                 k: match k {
                     Some(qk) => Some(qk.try_deep_clone()?),
                     None => None,
@@ -1482,9 +1483,9 @@ impl KvStorage {
                     Some(qv) => Some(qv.try_deep_clone()?),
                     None => None,
                 },
-                max_seq: *max_seq,
+                max_seq,
             },
-            Self::RotorSym4 { k, v, max_seq } => Self::RotorSym4 {
+            Self::RotorSym4 { k, v, max_seq: _ } => Self::RotorSym4 {
                 k: match k {
                     Some(qk) => Some(qk.try_deep_clone()?),
                     None => None,
@@ -1493,29 +1494,29 @@ impl KvStorage {
                     Some(qv) => Some(qv.try_deep_clone()?),
                     None => None,
                 },
-                max_seq: *max_seq,
+                max_seq,
             },
             // RotorKOnly3 / RotorKOnly4 — K only.
-            Self::RotorKOnly3 { k, max_seq } => Self::RotorKOnly3 {
+            Self::RotorKOnly3 { k, max_seq: _ } => Self::RotorKOnly3 {
                 k: match k {
                     Some(qk) => Some(qk.try_deep_clone()?),
                     None => None,
                 },
-                max_seq: *max_seq,
+                max_seq,
             },
-            Self::RotorKOnly4 { k, max_seq } => Self::RotorKOnly4 {
+            Self::RotorKOnly4 { k, max_seq: _ } => Self::RotorKOnly4 {
                 k: match k {
                     Some(qk) => Some(qk.try_deep_clone()?),
                     None => None,
                 },
-                max_seq: *max_seq,
+                max_seq,
             },
             // RotorKAsym3 / RotorKAsym4 — deep-clone K rotor + V affine.
             // V codec parameters (bits / group) carry forward unchanged.
             Self::RotorKAsym3 {
                 k,
                 v,
-                max_seq,
+                max_seq: _,
                 v_bits,
                 v_group_size,
             } => Self::RotorKAsym3 {
@@ -1527,14 +1528,14 @@ impl KvStorage {
                     Some(qv) => Some(qv.try_deep_clone()?),
                     None => None,
                 },
-                max_seq: *max_seq,
+                max_seq,
                 v_bits: *v_bits,
                 v_group_size: *v_group_size,
             },
             Self::RotorKAsym4 {
                 k,
                 v,
-                max_seq,
+                max_seq: _,
                 v_bits,
                 v_group_size,
             } => Self::RotorKAsym4 {
@@ -1546,7 +1547,7 @@ impl KvStorage {
                     Some(qv) => Some(qv.try_deep_clone()?),
                     None => None,
                 },
-                max_seq: *max_seq,
+                max_seq,
                 v_bits: *v_bits,
                 v_group_size: *v_group_size,
             },
@@ -1845,37 +1846,71 @@ impl KvStorage {
     pub fn geometry_only_max_seq(&self) -> Option<i32> {
         // `k.is_none()` is the test in every arm; a `Some` K means the layer
         // carries a real payload and belongs to its codec's writer.
-        fn empty<T>(k: Option<&T>, max_seq: i32) -> Option<i32> {
-            k.is_none().then_some(max_seq)
-        }
-        match self {
-            KvStorage::None { max_seq } => Some(*max_seq),
-            KvStorage::K8V4 { k, max_seq, .. }
-            | KvStorage::K8V8 { k, max_seq, .. }
-            | KvStorage::Planar { k, max_seq, .. }
-            | KvStorage::K8VTurbo3 { k, max_seq, .. }
-            | KvStorage::K8VTurbo3Tcq { k, max_seq, .. }
-            | KvStorage::K8VTurbo2 { k, max_seq, .. }
-            | KvStorage::K8VTurbo2Tcq { k, max_seq, .. }
-            | KvStorage::IsoV3 { k, max_seq, .. }
-            | KvStorage::IsoV4 { k, max_seq, .. }
-            | KvStorage::RotorV3 { k, max_seq, .. }
-            | KvStorage::RotorV4 { k, max_seq, .. } => empty(k.as_ref(), *max_seq),
-            KvStorage::TurboSym3 { k, max_seq, .. } => empty(k.as_ref(), *max_seq),
-            KvStorage::TurboSym4 { k, max_seq, .. } => empty(k.as_ref(), *max_seq),
-            KvStorage::PlanarK { k, max_seq } => empty(k.as_ref(), *max_seq),
-            KvStorage::IsoSym3 { k, max_seq, .. } => empty(k.as_ref(), *max_seq),
-            KvStorage::IsoSym4 { k, max_seq, .. } => empty(k.as_ref(), *max_seq),
-            KvStorage::IsoKOnly3 { k, max_seq } => empty(k.as_ref(), *max_seq),
-            KvStorage::IsoKOnly4 { k, max_seq } => empty(k.as_ref(), *max_seq),
-            KvStorage::RotorSym3 { k, max_seq, .. } => empty(k.as_ref(), *max_seq),
-            KvStorage::RotorSym4 { k, max_seq, .. } => empty(k.as_ref(), *max_seq),
-            KvStorage::RotorKOnly3 { k, max_seq } => empty(k.as_ref(), *max_seq),
-            KvStorage::RotorKOnly4 { k, max_seq } => empty(k.as_ref(), *max_seq),
-            KvStorage::RotorKAsym3 { k, max_seq, .. } => empty(k.as_ref(), *max_seq),
-            KvStorage::RotorKAsym4 { k, max_seq, .. } => empty(k.as_ref(), *max_seq),
+        let geometry_only = match self {
+            KvStorage::None { .. } => true,
+            KvStorage::K8V4 { k, .. }
+            | KvStorage::K8V8 { k, .. }
+            | KvStorage::Planar { k, .. }
+            | KvStorage::K8VTurbo3 { k, .. }
+            | KvStorage::K8VTurbo3Tcq { k, .. }
+            | KvStorage::K8VTurbo2 { k, .. }
+            | KvStorage::K8VTurbo2Tcq { k, .. }
+            | KvStorage::IsoV3 { k, .. }
+            | KvStorage::IsoV4 { k, .. }
+            | KvStorage::RotorV3 { k, .. }
+            | KvStorage::RotorV4 { k, .. } => k.is_none(),
+            KvStorage::TurboSym3 { k, .. } => k.is_none(),
+            KvStorage::TurboSym4 { k, .. } => k.is_none(),
+            KvStorage::PlanarK { k, .. } => k.is_none(),
+            KvStorage::IsoSym3 { k, .. } => k.is_none(),
+            KvStorage::IsoSym4 { k, .. } => k.is_none(),
+            KvStorage::IsoKOnly3 { k, .. } => k.is_none(),
+            KvStorage::IsoKOnly4 { k, .. } => k.is_none(),
+            KvStorage::RotorSym3 { k, .. } => k.is_none(),
+            KvStorage::RotorSym4 { k, .. } => k.is_none(),
+            KvStorage::RotorKOnly3 { k, .. } => k.is_none(),
+            KvStorage::RotorKOnly4 { k, .. } => k.is_none(),
+            KvStorage::RotorKAsym3 { k, .. } => k.is_none(),
+            KvStorage::RotorKAsym4 { k, .. } => k.is_none(),
             // Payload is not an Option — their own writers handle emptiness.
-            KvStorage::Mixed { .. } | KvStorage::Paged { .. } => None,
+            KvStorage::Mixed { .. } | KvStorage::Paged { .. } => false,
+        };
+        geometry_only.then(|| self.max_seq())
+    }
+
+    /// The `max_seq` recorded on the active variant: the capacity cap every
+    /// store append and the bf16 mirror read. This is the one reader of the
+    /// per-variant field.
+    #[must_use]
+    pub fn max_seq(&self) -> i32 {
+        match self {
+            KvStorage::K8V4 { max_seq, .. } => *max_seq,
+            KvStorage::K8V8 { max_seq, .. } => *max_seq,
+            KvStorage::Planar { max_seq, .. } => *max_seq,
+            KvStorage::None { max_seq } => *max_seq,
+            KvStorage::Mixed { max_seq, .. } => *max_seq,
+            KvStorage::Paged { max_seq, .. } => *max_seq,
+            KvStorage::K8VTurbo3 { max_seq, .. } => *max_seq,
+            KvStorage::TurboSym3 { max_seq, .. } => *max_seq,
+            KvStorage::TurboSym4 { max_seq, .. } => *max_seq,
+            KvStorage::PlanarK { max_seq, .. } => *max_seq,
+            KvStorage::K8VTurbo2 { max_seq, .. } => *max_seq,
+            KvStorage::IsoV3 { max_seq, .. } => *max_seq,
+            KvStorage::IsoV4 { max_seq, .. } => *max_seq,
+            KvStorage::RotorV3 { max_seq, .. } => *max_seq,
+            KvStorage::RotorV4 { max_seq, .. } => *max_seq,
+            KvStorage::K8VTurbo3Tcq { max_seq, .. } => *max_seq,
+            KvStorage::K8VTurbo2Tcq { max_seq, .. } => *max_seq,
+            KvStorage::IsoSym3 { max_seq, .. } => *max_seq,
+            KvStorage::IsoSym4 { max_seq, .. } => *max_seq,
+            KvStorage::IsoKOnly3 { max_seq, .. } => *max_seq,
+            KvStorage::IsoKOnly4 { max_seq, .. } => *max_seq,
+            KvStorage::RotorSym3 { max_seq, .. } => *max_seq,
+            KvStorage::RotorSym4 { max_seq, .. } => *max_seq,
+            KvStorage::RotorKOnly3 { max_seq, .. } => *max_seq,
+            KvStorage::RotorKOnly4 { max_seq, .. } => *max_seq,
+            KvStorage::RotorKAsym3 { max_seq, .. } => *max_seq,
+            KvStorage::RotorKAsym4 { max_seq, .. } => *max_seq,
         }
     }
 }

@@ -33,7 +33,7 @@ fn rows(seq: i32, seed: u64) -> (Array, Array) {
 
 /// Append one chunk and [`DECODE_STEPS`] single tokens with `in_prefill`
 /// false.
-fn fill(cache: &mut KvCache, quant: KvQuant) {
+pub(super) fn fill(cache: &mut KvCache, quant: KvQuant) {
     let mut sink = Vec::new();
     let (k, v) = rows(CHUNK_SEQ, TEST_SEED);
     append(cache, quant, &k, &v, &mut sink, Device::Cpu);

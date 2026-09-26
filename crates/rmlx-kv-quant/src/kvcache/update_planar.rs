@@ -37,16 +37,10 @@ impl KvCache {
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
-        let KvStorage::Planar {
-            k,
-            v,
-            max_seq,
-            bits,
-        } = &mut self.storage
-        else {
+        let max_seq = self.storage.max_seq();
+        let KvStorage::Planar { k, v, bits, .. } = &mut self.storage else {
             unreachable!("storage mismatch: expected Planar");
         };
-        let max_seq = *max_seq;
         let v_bits = *bits;
 
         if self.decode_fp16_k.is_some() {
@@ -131,10 +125,10 @@ impl KvCache {
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
-        let KvStorage::PlanarK { k, max_seq } = &mut self.storage else {
+        let max_seq = self.storage.max_seq();
+        let KvStorage::PlanarK { k, .. } = &mut self.storage else {
             return Err(storage_mismatch("PlanarK", &self.storage));
         };
-        let max_seq = *max_seq;
 
         // Warm-TTFT bf16 K seed path, the shortcut every mirror-fed
         // `update_<codec>` takes.
@@ -196,7 +190,7 @@ impl KvCache {
         device: Device,
     ) -> Result<()> {
         let (max_seq, v_bits) = match &self.storage {
-            KvStorage::Planar { max_seq, bits, .. } => (*max_seq, *bits),
+            KvStorage::Planar { bits, .. } => (self.storage.max_seq(), *bits),
             _ => return Err(storage_mismatch("Planar", &self.storage)),
         };
         let new_shape = k_full.shape();
@@ -263,7 +257,7 @@ impl KvCache {
             "exit_prefill PlanarK: bulk-quantizing K (planar4); V stays bf16"
         );
         let max_seq = match &self.storage {
-            KvStorage::PlanarK { max_seq, .. } => *max_seq,
+            KvStorage::PlanarK { .. } => self.storage.max_seq(),
             _ => return Err(storage_mismatch("PlanarK", &self.storage)),
         };
         let new_shape = k_full.shape();
