@@ -122,9 +122,6 @@ Conventions:
 | `baseline/turbo_probe.py` | One identical decode loop run under either mlx-lm venv: decode TPS plus **true** KV residency (packed store *and* any dense dequant mirror) vs the cache's self-reported `nbytes`. `--seq` palindrome gives single-process ABBA. |
 | `baseline/turbo_abba.sh` | Process-level ABBA (stock, fork, fork, stock) around `turbo_probe.py` for the cross-venv leg. Hashes each arm's `mlx_lm` source tree and **refuses (exit 6)** when the two match — a venv resolving `mlx_lm` from site-packages would otherwise produce a fork-vs-stock ratio of 1.000x that reads as a measured null. The digests go into the artifact. |
 | `baseline/turbo_summarize.py` | Median / min / max / spread and per-mode ratios from `turbo_probe.py` jsonl. |
-| `baseline/group-A-baseline.sh` | Measure the rMLX baseline TPS for the Group-A regression gate. |
-| `baseline/c1-gemma4-cold-equal.sh` | C1 acceptance: gemma4 partial-prefix reuse. |
-| `baseline/d8-phase1-measure.sh` | Quantify the first-dispatch MSL-compile tax. |
 | `autoresearch_run.sh` | Single autoresearch experiment run. |
 
 ## Metrics ingest
@@ -209,28 +206,3 @@ Conventions:
 |---|---|
 | `gen_lloyd_codebook.py` | Generate Lloyd-Max optimal N(0,1) centroids for the TurboQuant codebook. |
 | `convert_silero_vad.py` | Convert Silero VAD v4 ONNX weights to safetensors. Run once; output is committed. |
-
-## `bench/` — campaign scripts
-
-These are **historical, campaign-scoped** drivers kept for reproducibility of a
-specific report. They hard-code models, contexts and flags for the campaign they
-were written for. Read one before reusing it; prefer extending the general
-drivers above.
-
-`b1_turbo_flash_validate.sh`, `p0b_prefill_bench.sh`, `p0b_ttft_only.sh`,
-`p0b_vg2_niah.sh`, `p1a4_turbo_flash_lock_bench.sh`,
-`p2a_turbo_flash_bench.sh`, `p2c1_remaining_cells.sh`,
-`p2c1_spec_128k_bench.sh`, `turboquant_v3_bench.sh`, `vg2_niah_surrogate.sh`,
-`vg2_turbo_flash_lock_qwen35b.sh`, `vg2_turbo_flash_qwen35b.sh`.
-
-Six of these are gone rather than frozen: `t1_final_bench.sh`,
-`t2_final_bench.sh`, `t3_final_bench.sh`, `fullctx_regression_bench.sh`,
-`gemma_matrix_bench.sh` and `final_matrix_bench.sh` each wrote a permanent
-`decode_tps_warm` row into `runs.db` from a whole-request stopwatch — a rate
-that counts the prompt prefill, which is `overall_tps` under another metric's
-name. None had a caller: no Makefile target, no doc, nothing but the row above.
-A driver nobody invokes and that writes an uncorrectable wrong row when someone
-does is not reproducibility, and the reports they produced are already written.
-Git holds them. A campaign script that is meant to stay runnable takes its
-decode rate from `lib/server_decode_tps.py` or `lib/spec_round_log.py` like the
-live drivers do.
