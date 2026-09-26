@@ -136,7 +136,7 @@ exits 125.
 | A slot or the comparison could not be sampled for interference | `TAINTED:` line, exit 125 | none |
 | Arms generate different token ids | exit 1 | `--allow-token-divergence` |
 | A slot stops reproducing its own arm's warmup token ids | exit 1 | none |
-| `rmlx serve` holds the Metal context | exit 125 (reported, never killed) | none |
+| Another process holds the Metal claim (probe exits 11) | exit 125 (reported, never stopped) | none |
 | A slot emits no `decode_tps` / Metal memory reading / `token_ids` line | exit 125 | none |
 | A slot reports `metal_peak_mb=0` — the bracket measured nothing | exit 125 | none |
 | A slot generates fewer tokens than `--max-tokens` | exit 125 | none |
@@ -204,7 +204,7 @@ process exercises one dispatch path.
 in `make ci`) mutation-checks the harness against stub binaries with planted
 differences. It must report a planted ratio exactly, and nothing for two equal
 arms. Every case passes `--synthetic-arms`. The cases that test host gating
-supply the machine as `ps` and `pgrep` shims on `PATH`. Every run counts the
+supply the machine as `ps` and `claim-holder` shims on `PATH`. Every run counts the
 cases that took each route; a case that could reach this machine fails the
 suite. `scripts/bench_llama_ab_selftest.sh` carries the same boundary, with
 `ps` as its whole host surface.

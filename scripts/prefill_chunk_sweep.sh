@@ -176,13 +176,15 @@ mkdir -p "$OUT_DIR/raw"
 # burning a core during a slot is.
 export CPU_SNAPSHOT_SKIP="$(basename "$BINARY") rmlx rmlx_main"
 
-# An `rmlx serve` holds the Metal context for the whole run, which is exactly
-# the confound this design removes for CPU. It is reported, not killed —
-# killing it would destroy someone else's work to make this number look better.
-if pgrep -f "rmlx serve" >/dev/null 2>&1; then
-	echo "ERROR: an 'rmlx serve' process is running and holds the Metal context." >&2
-	echo "  Stop it by its PID before measuring:" >&2
-	pgrep -fl "rmlx serve" >&2 || true
+# A process holding the Metal claim holds the Metal context for the whole run,
+# which is exactly the confound this design removes for CPU. It is reported,
+# not stopped. The probe takes the claim and releases it at once, or exits 11
+# and names the holder.
+claim_rc=0
+"$BINARY" claim run -- true || claim_rc=$?
+if [[ "$claim_rc" -ne 0 ]]; then
+	echo "ERROR: another process holds the Metal context (claim probe exit $claim_rc)." >&2
+	echo "  Stop it by the PID the refusal above names before measuring." >&2
 	exit 125
 fi
 

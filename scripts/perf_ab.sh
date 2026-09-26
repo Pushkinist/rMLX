@@ -754,18 +754,21 @@ if [[ "${INITIAL_HOST%% *}" == "busy" ]]; then
 	echo "WARNING: --allow-busy-host: starting on a busy host; every number below is suspect." >&2
 fi
 
-# Single MLX process per Mac. A running server would contend for the Metal
-# context throughout, which is exactly the confound this harness exists to
-# exclude -- so it is reported, not killed. Killing it here would destroy
-# someone else's work to make our number look better.
+# Single MLX process per Mac. A process holding the Metal claim would contend
+# for the Metal context throughout, which is exactly the confound this harness
+# exists to exclude -- so it is reported, not stopped. The probe takes the claim
+# and releases it at once, or exits 11 and names the holder.
 #
 # A stub arm dispatches no Metal, so under --synthetic-arms whoever holds the
 # context is not a fact about the run.
-if ! $SYNTHETIC_ARMS && pgrep -f "rmlx serve" >/dev/null 2>&1; then
-	echo "ERROR: an 'rmlx serve' process is running and holds the Metal context." >&2
-	echo "  Stop it by its PID before measuring:" >&2
-	pgrep -fl "rmlx serve" >&2 || true
-	exit 125
+if ! $SYNTHETIC_ARMS; then
+	claim_rc=0
+	"$BIN_A" claim run -- true || claim_rc=$?
+	if [[ "$claim_rc" -ne 0 ]]; then
+		echo "ERROR: another process holds the Metal context (claim probe exit $claim_rc)." >&2
+		echo "  Stop it by the PID the refusal above names before measuring." >&2
+		exit 125
+	fi
 fi
 
 OVERALL_EXIT=0

@@ -201,11 +201,11 @@ fi
 # also submits to the GPU, and Metal System Trace records the whole system, so
 # its rows would land in this table under a different process and any timing
 # read here would be unattributable. Refuse, and stop nothing: a process this
-# script did not start is not its to stop.
-if pgrep -f 'rmlx serve|mlx_lm|paroquant|omlx' >/dev/null 2>&1; then
-	echo "ERROR: another MLX process is live — this trace needs the GPU to itself." >&2
-	pgrep -fl 'rmlx serve|mlx_lm|paroquant|omlx' >&2 || true
-	echo "Stop it first, by the PID listed above." >&2
+# script did not start is not its to stop. The probe takes the Metal claim and
+# releases it at once, or exits 11 and names the holder.
+if ! "$BIN" claim run -- true; then
+	echo "ERROR: another process holds the Metal claim — this trace needs the GPU to itself." >&2
+	echo "Stop it first, by the PID the refusal above names." >&2
 	exit 1
 fi
 
