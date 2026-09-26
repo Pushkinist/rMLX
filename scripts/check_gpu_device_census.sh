@@ -31,19 +31,35 @@
 # and the `bin/` directory. The programs under `bin/` are separate binaries
 # that take the claim themselves.
 #
+# Library mode (`--library`): library code takes its device from its caller and
+# never picks the GPU itself, so there is no count to hold, only a position.
+#   gpu-value     `Device::Gpu` used as a value: an argument, a `let`, a field,
+#                 a return. A comparison is not a value: after `==` or `!=`,
+#                 inside `matches!(`, a match-arm or `|` pattern, or the pattern
+#                 of an `if let` / `while let`.
+#   device-alias  as above.
+# The whole file is scanned, `#[cfg(test)]` items in a non-test file included:
+# the scan does not read attributes, so it fails closed on them. A comparison
+# wrapped so that its operator or its `matches!(` sits on another line reads as
+# a value, which also fails closed. The default roots are rmlx-audio,
+# rmlx-server and rmlx-models; rmlx-kv-quant is not one, because its GPU-only
+# encoders are valid only behind the up-front refusal of GPU-only codecs under
+# `--device cpu`.
+#
 # What it cannot see: MLX's default device is the GPU, so a call that passes
 # no device, or runs on a default-device stream, reaches Metal with no
-# `Device::Gpu` anywhere; and nothing outside the scan root is counted. Library
-# code that names the GPU itself is outside it and runs under `--device cpu`
-# with no claim: the BitNet loader (crates/rmlx-models/src/bitnet/loader.rs)
-# transposes its weights on the GPU whatever device the caller passed; the
-# Qwen3-TTS codec and synthesis (crates/rmlx-audio/src/tts.rs) and the server's
-# transcription handler (crates/rmlx-server/src/audio.rs) run on the GPU.
+# `Device::Gpu` anywhere; a GPU device returned by a helper in a crate outside
+# the scan; and nothing outside the scan roots is counted. The text readers do
+# not know raw strings (scripts/lib/awk_text.sh).
 #
 # Usage: check_gpu_device_census.sh [<rmlx-cli-src-dir>]
 #        (default: crates/rmlx-cli/src)
-# Exit 0 = exactly one site, no alias, no dropped claim. 1 = a rule failed. 2 = cannot scan (the
-# root is not a directory, or it holds no in-scope file).
+#        check_gpu_device_census.sh --library [<src-dir>...]
+#        (default: crates/rmlx-audio/src crates/rmlx-server/src
+#         crates/rmlx-models/src)
+# Exit 0 = exactly one site (library mode: no value site), no alias, no dropped
+# claim. 1 = a rule failed. 2 = cannot scan (a root is not a directory, or it
+# holds no in-scope file).
 
 set -uo pipefail
 export LC_ALL=C
@@ -52,22 +68,112 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/lib/awk_text.sh
 . "$REPO_ROOT/scripts/lib/awk_text.sh"
 
-SRC="${1:-$REPO_ROOT/crates/rmlx-cli/src}"
-if [ ! -d "$SRC" ]; then
-    echo "check-gpu-device-census: unavailable: scan root '$SRC' is not a directory" >&2
-    exit 2
+# in_scope <root>: the in-scope files under <root>, relative, one per line.
+in_scope() {
+    (
+        cd "$1" || exit 2
+        find . -path ./bin -prune -o -type f -name '*.rs' \
+            ! -name '*_tests.rs' ! -name 'tests.rs' -print |
+            sed 's|^\./||' | sort
+    )
+}
+
+# check_root <root>: refuse a root that cannot be scanned.
+check_root() {
+    if [ ! -d "$1" ]; then
+        echo "check-gpu-device-census: unavailable: scan root '$1' is not a directory" >&2
+        exit 2
+    fi
+    if [ -z "$(in_scope "$1")" ]; then
+        echo "check-gpu-device-census: unavailable: no in-scope .rs file under '$1'" >&2
+        exit 2
+    fi
+}
+
+IFS= read -r -d '' AWK_ALIAS <<'EOF'
+function check_alias(code) {
+    if (code ~ /Device[ \t]*::[ \t]*([*]|[{])/ || code ~ /(^|[^A-Za-z0-9_])Device[ \t]+as[ \t]/ ||
+        code ~ /(^|[^A-Za-z0-9_])type[ \t]+[A-Za-z0-9_]+[ \t]*(<[^=]*>)?[ \t]*=[ \t]*(::[ \t]*)?([A-Za-z0-9_]+[ \t]*::[ \t]*)*Device[ \t]*;/)
+        print "device-alias: " file ":" FNR ": " $0
+}
+EOF
+
+if [ "${1:-}" = "--library" ]; then
+    shift
+    if [ "$#" -eq 0 ]; then
+        set -- "$REPO_ROOT/crates/rmlx-audio/src" "$REPO_ROOT/crates/rmlx-server/src" \
+            "$REPO_ROOT/crates/rmlx-models/src"
+    fi
+    for root in "$@"; do
+        check_root "$root"
+    done
+
+    IFS= read -r -d '' AWK_LIBRARY <<'EOF'
+{
+    code = blank_strings(decomment($0))
+    rest = code
+    seen = ""
+    while (match(rest, /Device[ \t]*::[ \t]*Gpu([^A-Za-z0-9_]|$)/)) {
+        start = RSTART
+        len = RLENGTH
+        pre = seen substr(rest, 1, start - 1)
+        post = substr(rest, start + len - 1)
+        path = "((::)?[A-Za-z0-9_]+[ \t]*::[ \t]*)*$"
+        compared = pre ~ ("(==|!=)[ \t]*" path) ||
+            pre ~ ("(^|[^|])[|][ \t]*" path) ||
+            inside_matches(pre) ||
+            post ~ /^[ \t]*(=>|[|]([^|]|$))/ ||
+            (pre ~ ("(if|while)[ \t]+let[ \t]+" path) && post ~ /^[ \t]*=([^=]|$)/)
+        if (!compared)
+            print "gpu-value: " file ":" FNR ": " $0
+        seen = pre substr(rest, start, len)
+        rest = substr(rest, start + len)
+    }
+    check_alias(code)
+}
+function inside_matches(s,   at, depth, i, ch) {
+    at = 0
+    while (match(substr(s, at + 1), /matches![ \t]*\(/))
+        at += RSTART + RLENGTH - 1
+    if (at == 0)
+        return 0
+    depth = 1
+    for (i = at + 1; i <= length(s); i++) {
+        ch = substr(s, i, 1)
+        if (ch == "(") depth++
+        else if (ch == ")" && --depth == 0) return 0
+    }
+    return 1
+}
+EOF
+
+    status=0
+    for root in "$@"; do
+        label="${root#"$REPO_ROOT"/}"
+        hits=""
+        while IFS= read -r f; do
+            out="$(awk -v file="$label/$f" "$AWK_TEXT_FNS $AWK_ALIAS $AWK_LIBRARY" "$root/$f")"
+            [ -n "$out" ] && hits="${hits}${out}"$'\n'
+        done <<<"$(in_scope "$root")"
+        values="$(grep -c '^gpu-value: ' <<<"$hits")"
+        aliases="$(grep -c '^device-alias: ' <<<"$hits")"
+        [ -n "$hits" ] && printf '%s' "$hits"
+        echo "check-gpu-device-census --library: $label: $values value site(s), $aliases alias(es)"
+        if [ "$values" -gt 0 ] || [ "$aliases" -gt 0 ]; then
+            status=1
+        fi
+    done
+    if [ "$status" -ne 0 ]; then
+        echo "check-gpu-device-census --library: FAIL: library code names the GPU device as a value; take the device from the caller" >&2
+    else
+        echo "check-gpu-device-census --library: ok ($# root(s) scanned)"
+    fi
+    exit "$status"
 fi
 
-files="$(
-    cd "$SRC" || exit 2
-    find . -path ./bin -prune -o -type f -name '*.rs' \
-        ! -name '*_tests.rs' ! -name 'tests.rs' -print |
-        sed 's|^\./||' | sort
-)"
-if [ -z "$files" ]; then
-    echo "check-gpu-device-census: unavailable: no in-scope .rs file under '$SRC'" >&2
-    exit 2
-fi
+SRC="${1:-$REPO_ROOT/crates/rmlx-cli/src}"
+check_root "$SRC"
+files="$(in_scope "$SRC")"
 
 IFS= read -r -d '' AWK_RULES <<'EOF'
 {
@@ -77,9 +183,7 @@ IFS= read -r -d '' AWK_RULES <<'EOF'
         print "gpu-device: " file ":" FNR ": " $0
         rest = substr(rest, RSTART + RLENGTH)
     }
-    if (code ~ /Device[ \t]*::[ \t]*([*]|[{])/ || code ~ /(^|[^A-Za-z0-9_])Device[ \t]+as[ \t]/ ||
-        code ~ /(^|[^A-Za-z0-9_])type[ \t]+[A-Za-z0-9_]+[ \t]*(<[^=]*>)?[ \t]*=[ \t]*(::[ \t]*)?([A-Za-z0-9_]+[ \t]*::[ \t]*)*Device[ \t]*;/)
-        print "device-alias: " file ":" FNR ": " $0
+    check_alias(code)
     if (code ~ /(^|[^A-Za-z0-9_])fn[ \t]/)
         stmt = ""
     rest = code
@@ -101,7 +205,7 @@ EOF
 
 hits=""
 while IFS= read -r f; do
-    out="$(awk -v file="$f" "$AWK_TEXT_FNS $AWK_RULES" "$SRC/$f")"
+    out="$(awk -v file="$f" "$AWK_TEXT_FNS $AWK_ALIAS $AWK_RULES" "$SRC/$f")"
     [ -n "$out" ] && hits="${hits}${out}"$'\n'
 done <<<"$files"
 

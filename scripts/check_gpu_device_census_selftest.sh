@@ -4,8 +4,10 @@
 #
 # Each case builds a throwaway scan root holding the one legitimate site, plants
 # one file, runs the gate and asserts the literal exit code and, for a failure,
-# the rule and the file:line it names (or the reason). The last case runs the
-# gate on the real tree.
+# the rule and the file:line it names (or the reason). The library-mode cases
+# plant one file in a root with no device site. The last case runs the binary
+# mode on the real tree; the library mode is red on the real tree until the
+# library sites take their device from the caller, so no case runs it there.
 #
 # Exit 0 = every case held. Exit 1 = at least one did not.
 
@@ -140,6 +142,92 @@ mkdir -p "$WORK/empty_root/bin"
 printf 'fn main() {}\n' >"$WORK/empty_root/bin/only.rs"
 case_run "empty_root" "a root with no in-scope file" 2 \
     "no in-scope .rs file" "$WORK/empty_root"
+
+# ── Library mode ────────────────────────────────────────────────────────────
+# case_lib <name> <what> <want-exit> <needle|-> <root>...
+case_lib() {
+    local name="$1" what="$2" want="$3" needle="$4"
+    shift 4
+    local out status
+    out=$(bash "$GATE" --library "$@" 2>&1)
+    status=$?
+    if [ "$status" -ne "$want" ]; then
+        echo "FAIL $name ($what): exit $status, want $want"
+        printf '%s\n' "$out" | sed 's/^/    /'
+        FAILED=$((FAILED + 1))
+        return
+    fi
+    if [ "$needle" != "-" ] && ! grep -qF -- "$needle" <<<"$out"; then
+        echo "FAIL $name ($what): output does not name '$needle'"
+        printf '%s\n' "$out" | sed 's/^/    /'
+        FAILED=$((FAILED + 1))
+        return
+    fi
+    PASSED=$((PASSED + 1))
+}
+
+# lib_root <name> <file-body>: a library root holding src/lib.rs, which has no
+# device, and src/x.rs with <file-body>.
+lib_root() {
+    local root="$WORK/lib_$1"
+    mkdir -p "$root"
+    printf 'pub fn run(device: Device) {}\n' >"$root/lib.rs"
+    printf '%b' "$2" >"$root/x.rs"
+    printf '%s' "$root"
+}
+
+# name ~ x.rs body ~ want-exit ~ needle
+LIB_CASES=(
+    "lib_let_value~use rmlx_mlx::Device;\n    let d = Device::Gpu;\n~1~gpu-value: $WORK/lib_lib_let_value/x.rs:2:"
+    "lib_argument~    let w = w.transpose(&[0, 2, 1], Device::Gpu)?;\n~1~gpu-value: $WORK/lib_lib_argument/x.rs:1:"
+    "lib_full_path~    let device = rmlx_mlx::Device::Gpu;\n~1~gpu-value: $WORK/lib_lib_full_path/x.rs:1:"
+    "lib_field~    Cfg {\n        device: Device::Gpu,\n    }\n~1~gpu-value: $WORK/lib_lib_field/x.rs:2:"
+    "lib_argument_list~    run_smoke_probe(\n        path,\n        rmlx_mlx::Device::Gpu,\n    )\n~1~gpu-value: $WORK/lib_lib_argument_list/x.rs:3:"
+    "lib_value_beside_compare~    let d = if x == Device::Gpu { Device::Gpu } else { Device::Cpu };\n~1~1 value site(s)"
+    "lib_cfg_test_fn_in_source~#[cfg(test)]\nfn gpu() -> Device {\n    Device::Gpu\n}\n~1~gpu-value: $WORK/lib_lib_cfg_test_fn_in_source/x.rs:3:"
+    "lib_value_after_closed_matches~    let g = matches!(d, Device::Cpu); run(Device::Gpu);\n~1~1 value site(s)"
+    "lib_alias~use rmlx_mlx::Device::*;\n~1~device-alias: $WORK/lib_lib_alias/x.rs:1:"
+    "lib_operator_on_line_above~    if device ==\n        Device::Gpu\n    {\n~1~gpu-value: $WORK/lib_lib_operator_on_line_above/x.rs:2:"
+    "lib_wrapped_matches~    let g = matches!(\n        d,\n        Device::Gpu\n    );\n~1~gpu-value: $WORK/lib_lib_wrapped_matches/x.rs:3:"
+    "lib_split_compare~    if device\n        == Device::Gpu\n    {\n~0~0 value site(s)"
+    "lib_eq~    if device == Device::Gpu {\n~0~0 value site(s)"
+    "lib_ne~    if d != rmlx_mlx::Device::Gpu {\n~0~0 value site(s)"
+    "lib_match_arm~        Device::Gpu => 1,\n~0~0 value site(s)"
+    "lib_or_pattern~        Device::Cpu | Device::Gpu => 1,\n~0~0 value site(s)"
+    "lib_or_pattern_first~        Device::Gpu | Device::Cpu => 1,\n~0~0 value site(s)"
+    "lib_matches~    let g = matches!(self.device(), Device::Gpu);\n~0~0 value site(s)"
+    "lib_or_pattern_in_if_let~    if let Device::Cpu | Device::Gpu = d {\n~0~0 value site(s)"
+    "lib_if_let~    if let Device::Gpu = d {\n~0~0 value site(s)"
+    "lib_comment~    // pass Device::Gpu here\n~0~0 value site(s)"
+    "lib_string~    let s = \"Device::Gpu\";\n~0~0 value site(s)"
+    "lib_longer_ident~    let d = Device::GpuLike;\n~0~0 value site(s)"
+)
+
+for c in "${LIB_CASES[@]}"; do
+    IFS='~' read -r name body want needle <<<"$c"
+    case_lib "$name" "library x.rs" "$want" "$needle" "$(lib_root "$name" "$body")"
+done
+
+# A value in a sibling test file is not library code.
+root="$(lib_root tests_file '    if device == Device::Gpu {\n')"
+printf 'fn t() { run(Device::Gpu); }\n' >"$root/x_tests.rs"
+printf 'fn t() { run(Device::Gpu); }\n' >"$root/tests.rs"
+case_lib "lib_tests_files" "values in *_tests.rs and tests.rs" 0 "0 value site(s)" "$root"
+
+# Two roots: a clean one does not hide a value in the other, and each root
+# reports its own count.
+clean="$(lib_root two_clean '    if device == Device::Gpu {\n')"
+dirty="$(lib_root two_dirty '    let d = Device::Gpu;\n')"
+case_lib "lib_two_roots_first_clean" "the value is in the second root" 1 \
+    "$dirty: 1 value site(s)" "$clean" "$dirty"
+case_lib "lib_two_roots_count_clean" "the clean root reports zero" 1 \
+    "$clean: 0 value site(s)" "$clean" "$dirty"
+case_lib "lib_missing_root" "one of two roots does not exist" 2 \
+    "is not a directory" "$clean" "$WORK/does-not-exist"
+mkdir -p "$WORK/lib_empty/bin"
+printf 'fn main() {}\n' >"$WORK/lib_empty/bin/only.rs"
+case_lib "lib_empty_root" "a root with no in-scope file" 2 \
+    "no in-scope .rs file" "$WORK/lib_empty"
 
 # The real tree: exactly one site, in the claimed-GPU helper.
 out=$(bash "$GATE" 2>&1)
