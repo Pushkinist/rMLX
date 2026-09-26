@@ -4,7 +4,10 @@
 # Reads `kv_codec_matrix.toml` + `smoke_prompts.toml`, executes per-row:
 #
 #   1. Skip if `skip_reason != ""` (structured log line).
-#   2. Preflight (CLAUDE.md hard rule 8: single MLX process).
+#   2. The Metal claim (CLAUDE.md hard rule 8: single MLX process): each
+#      `rmlx baseline` takes it, and the NIAH pass runs under `rmlx claim run`.
+#      A claim another process holds fails the row with exit 11; nothing is
+#      stopped for it.
 #   3. Smoke probe: one `rmlx baseline` call per `smoke_probe_prompts[i]`,
 #      validating the decoded continuation against the regex in
 #      `smoke_prompts.toml`. Any prompt fail => row fail.
@@ -93,15 +96,6 @@ if [[ -z "$PYTHON3" ]]; then
     printf '       brew install python@3.13 OR pip3 install tomli.\n' >&2
     exit 2
 fi
-
-preflight() {
-    pkill -f "rmlx serve" 2>/dev/null || true
-    pkill -f mlx_lm        2>/dev/null || true
-    pkill -f paroquant     2>/dev/null || true
-    pkill -f omlx          2>/dev/null || true
-    sleep 2
-    rm -f /tmp/rmlx.*.claim 2>/dev/null || true
-}
 
 # Map manifest `model` slug -> env var holding the absolute snapshot path.
 model_env_var() {
@@ -362,7 +356,6 @@ while IFS=$'\t' read -r CODEC MODEL CTX EXPECTED PROMPTS_CSV SKIP CLI_ARGS NIAH_
     fi
 
     log_evt info "row_start codec=$CODEC model=$MODEL ctx=$CTX"
-    preflight
 
     # ── smoke probes ────────────────────────────────────────────────────────
     SMOKE_VERDICT="pass"
@@ -428,7 +421,6 @@ while IFS=$'\t' read -r CODEC MODEL CTX EXPECTED PROMPTS_CSV SKIP CLI_ARGS NIAH_
     fi
 
     # ── NIAH ────────────────────────────────────────────────────────────────
-    preflight
     NIAH_LOG="$(mktemp -t rmlx-niah.XXXXXX.log)"
 
     # The NIAH harness wraps `cargo test -p rmlx-models --test niah_long_context`
@@ -448,7 +440,8 @@ while IFS=$'\t' read -r CODEC MODEL CTX EXPECTED PROMPTS_CSV SKIP CLI_ARGS NIAH_
         log_evt warn "niah_codec_unmapped codec=$CODEC — harness uses default"
     fi
     "${NIAH_ENV[@]}" \
-        timeout 3600 cargo test --profile release-perf \
+        timeout 3600 cargo run --quiet --profile release-perf --bin rmlx -- \
+            claim run -- cargo test --profile release-perf \
             -p rmlx-models --test niah_long_context \
             -- --ignored --test-threads=1 --nocapture "$NIAH_FILTER" \
             2>&1 | tee "$NIAH_LOG" >/dev/null || true

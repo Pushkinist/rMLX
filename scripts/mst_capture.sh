@@ -200,12 +200,12 @@ fi
 # CLAUDE.md hard rule 8 — a single MLX process per Mac. A co-resident server
 # also submits to the GPU, and Metal System Trace records the whole system, so
 # its rows would land in this table under a different process and any timing
-# read here would be unattributable. Refuse rather than pkill: killing a process
-# this script does not own is not its call.
+# read here would be unattributable. Refuse, and stop nothing: a process this
+# script did not start is not its to stop.
 if pgrep -f 'rmlx serve|mlx_lm|paroquant|omlx' >/dev/null 2>&1; then
 	echo "ERROR: another MLX process is live — this trace needs the GPU to itself." >&2
 	pgrep -fl 'rmlx serve|mlx_lm|paroquant|omlx' >&2 || true
-	echo "Stop it first: pkill -f 'rmlx serve'; pkill -f mlx_lm; rm -f /tmp/rmlx.*.claim" >&2
+	echo "Stop it first, by the PID listed above." >&2
 	exit 1
 fi
 

@@ -145,19 +145,12 @@ fi
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-preflight() {
-    echo "  [preflight] killing competing MLX processes..." >&2
-    pkill -f "rmlx serve" 2>/dev/null || true
-    pkill -f mlx_lm 2>/dev/null || true
-    pkill -f paroquant 2>/dev/null || true
-    pkill -f omlx 2>/dev/null || true
-    sleep 5
-    rm -f /tmp/rmlx.*.claim 2>/dev/null || true
-    echo "  [preflight] done." >&2
-}
-
-# Wait for server to be ready by polling /v1/models.
+# Wait for the server with PID $1 to be ready by polling /v1/models. A server
+# that exits first returns its own exit status: a Metal claim another process
+# holds (exit 11, holder named in the server's output) stops the canary. Each
+# phase stops only the server it started.
 wait_for_server() {
+    local pid="$1"
     local url="http://127.0.0.1:${PORT}/v1/models"
     local attempts=0
     local max_attempts=90
@@ -166,6 +159,13 @@ wait_for_server() {
         if curl -sf "${url}" > /dev/null 2>&1; then
             echo "  [wait] server ready." >&2
             return 0
+        fi
+        if ! kill -0 "${pid}" 2>/dev/null; then
+            local status=0
+            wait "${pid}" || status=$?
+            echo "ERROR: server (pid ${pid}) exited with status ${status} before it was ready" >&2
+            [[ ${status} -eq 0 ]] && status=1
+            return "${status}"
         fi
         attempts=$((attempts + 1))
         if [[ ${attempts} -ge ${max_attempts} ]]; then
@@ -302,7 +302,7 @@ bounce_if_stuck() {
     local new_pid=$!
     eval "${pid_ref}=${new_pid}"
     echo "  [bounce] new server pid=${new_pid}" >&2
-    wait_for_server
+    wait_for_server "${new_pid}"
     CONSECUTIVE_ERRORS=0
     # New server starts with cumulative ssd_hits=0; reset delta baseline.
     _PREV_CUMULATIVE_SSD_HITS=0
@@ -512,7 +512,6 @@ echo ""
 
 CONSECUTIVE_ERRORS=0
 _PREV_CUMULATIVE_SSD_HITS=0
-preflight
 
 echo "  [server] starting populate server..." >&2
 RMLX_HOME="${RMLX_HOME}" \
@@ -528,7 +527,7 @@ RMLX_LOG_CAP_MB=500 \
 
 POPULATE_PID=$!
 echo "  [server] pid=${POPULATE_PID}" >&2
-wait_for_server
+wait_for_server "${POPULATE_PID}"
 
 # CSV header.
 POPULATE_CSV="${ARTIFACT_DIR}/phase_populate.csv"
@@ -641,7 +640,6 @@ REVISIT_INDICES=(0 2 4 6 8 10 12 14 16 18)
 
 CONSECUTIVE_ERRORS=0
 _PREV_CUMULATIVE_SSD_HITS=0
-preflight
 
 echo "  [server] starting revisit server..." >&2
 RMLX_HOME="${RMLX_HOME}" \
@@ -657,7 +655,7 @@ RMLX_LOG_CAP_MB=500 \
 
 REVISIT_PID=$!
 echo "  [server] pid=${REVISIT_PID}" >&2
-wait_for_server
+wait_for_server "${REVISIT_PID}"
 
 REVISIT_CSV="${ARTIFACT_DIR}/phase_revisit.csv"
 echo "seq,prompt_name,ssd_hits,ssd_bytes_used,ssd_evict_total,spill_count,hydrate_count,spill_sum_us,hydrate_sum_us" \
@@ -747,7 +745,6 @@ echo ""
 
 CONSECUTIVE_ERRORS=0
 _PREV_CUMULATIVE_SSD_HITS=0
-preflight
 
 echo "  [server] starting evict server..." >&2
 RMLX_HOME="${RMLX_HOME}" \
@@ -763,7 +760,7 @@ RMLX_LOG_CAP_MB=500 \
 
 EVICT_PID=$!
 echo "  [server] pid=${EVICT_PID}" >&2
-wait_for_server
+wait_for_server "${EVICT_PID}"
 
 # index.db for the ssd-canary namespace (shared with POPULATE).
 EVICT_INDEX_DB="${RMLX_HOME}/cache/kv/ssd-canary/index.db"

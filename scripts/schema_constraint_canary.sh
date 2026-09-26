@@ -117,7 +117,9 @@
 #   - target/release-perf/rmlx  (make build-perf)
 #   - RMLX_O_MODELS_ROOT pointing at the snapshot root (resolve via LOCAL.md),
 #     or explicit BONSAI_MODEL / GEMMA_E2B_MODEL paths.
-#   - Exclusive GPU: one MLX process per Mac. The script preflights strays.
+#   - Exclusive GPU: one MLX process per Mac. Each server takes the Metal claim;
+#     a claim another process holds fails the probe at startup (exit 11,
+#     holder named in serve.log). The script stops only the servers it started.
 #
 # Writes nothing to the real metrics DB: hermetic RMLX_HOME per probe under
 # .rmlx/proofs/schema-constraint, `--metrics off` on every server.
@@ -206,18 +208,6 @@ print(json.dumps({
     },
 }, indent=2))
 PY
-}
-
-# ── Preflight ────────────────────────────────────────────────────────────────
-
-preflight() {
-    pkill -f "rmlx serve"      2>/dev/null || true
-    pkill -f "rmlx_main serve" 2>/dev/null || true
-    pkill -f mlx_lm            2>/dev/null || true
-    pkill -f paroquant         2>/dev/null || true
-    pkill -f omlx              2>/dev/null || true
-    sleep 3
-    rm -f /tmp/rmlx.*.claim 2>/dev/null || true
 }
 
 wait_for_server() {
@@ -402,7 +392,6 @@ run_probe() {
 
     rm -rf "${art}"
     mkdir -p "${art}"
-    preflight
 
     echo "==> ${cell}: starting server (kv-quant none, max-ctx 4096, metrics off)" >&2
     RMLX_HOME="${art}" \
@@ -420,6 +409,7 @@ run_probe() {
     if ! wait_for_server "${pid}"; then
         tail -40 "${art}/serve.log" >&2
         kill "${pid}" 2>/dev/null || true
+        wait "${pid}" 2>/dev/null || true
         record_cell "${cell}" "harness-error"
         return
     fi
@@ -433,6 +423,7 @@ run_probe() {
     if [[ -z "${model_id}" ]]; then
         echo "ERROR: could not read a model id from /v1/models" >&2
         kill "${pid}" 2>/dev/null || true
+        wait "${pid}" 2>/dev/null || true
         record_cell "${cell}" "harness-error"
         return
     fi
