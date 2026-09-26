@@ -192,12 +192,12 @@ fn dequant_trit_u8(
 /// Load a `BitNetForCausalLM` model from a snapshot directory.
 ///
 /// Reads `config.json`, opens the safetensors shards, and dequantizes all
-/// ternary (U8) linear weight tensors to BF16 at load time.
+/// ternary (U8) linear weight tensors to BF16 at load time, on `device`.
 #[allow(
     clippy::indexing_slicing,
     reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
 )]
-pub fn load_from_path(model_dir: &Path) -> Result<BitNetText> {
+pub fn load_from_path(model_dir: &Path, device: Device) -> Result<BitNetText> {
     let cfg_raw = load_config(model_dir)?;
     let cfg = BitNetConfig::from_model_config(&cfg_raw)?;
 
@@ -272,7 +272,7 @@ pub fn load_from_path(model_dir: &Path) -> Result<BitNetText> {
         // dequant produces [out, in]; pre-transpose to [in, out] so forward
         // is a direct matmul with no per-call transpose on the hot path.
         let weight = dequant_trit_u8(&bytes, packed_rows, cols, scale)?;
-        let weight_t = weight.transpose(&[1, 0], Device::Gpu).map_err(|e| {
+        let weight_t = weight.transpose(&[1, 0], device).map_err(|e| {
             Error::Loader(format!("bitnet: transposing weight for '{w_name}': {e}"))
         })?;
 
@@ -392,7 +392,7 @@ pub fn load_from_path(model_dir: &Path) -> Result<BitNetText> {
     // Pre-transpose embed_tokens [vocab, hidden] → [hidden, vocab] for the
     // tied LM head. Done once at load time to avoid a per-decode-step transpose.
     let embed_tokens_t = embed_tokens
-        .transpose(&[1, 0], Device::Gpu)
+        .transpose(&[1, 0], device)
         .map_err(|e| Error::Loader(format!("bitnet: transposing embed_tokens: {e}")))?;
 
     Ok(BitNetText {

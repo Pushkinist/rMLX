@@ -643,21 +643,26 @@ pub(crate) fn run_serve(
     // wired_limit = mx.device_info()["max_recommended_working_set_size"]
     // mx.set_wired_limit(wired_limit)
     // Locks pages to GPU residency, eliminating page-fault stalls during decode.
-    match rmlx_mlx::metal::set_wired_limit_to_recommended() {
-        Ok(Some((recommended, old))) => {
-            info!(
-                wired_limit_bytes = recommended,
-                wired_limit_gib = (recommended as f64) / (1024.0 * 1024.0 * 1024.0),
-                previous_wired_limit_bytes = old,
-                "set_wired_limit(max_recommended_working_set_size)"
-            );
+    // Only the GPU device holds the claim that Metal calls need.
+    if claimed.holds_claim() {
+        match rmlx_mlx::metal::set_wired_limit_to_recommended() {
+            Ok(Some((recommended, old))) => {
+                info!(
+                    wired_limit_bytes = recommended,
+                    wired_limit_gib = (recommended as f64) / (1024.0 * 1024.0 * 1024.0),
+                    previous_wired_limit_bytes = old,
+                    "set_wired_limit(max_recommended_working_set_size)"
+                );
+            }
+            Ok(None) => {
+                info!("Metal backend not available; skipping set_wired_limit");
+            }
+            Err(e) => {
+                warn!(error = %e, "set_wired_limit failed (continuing)");
+            }
         }
-        Ok(None) => {
-            info!("Metal backend not available; skipping set_wired_limit");
-        }
-        Err(e) => {
-            warn!(error = %e, "set_wired_limit failed (continuing)");
-        }
+    } else {
+        info!("device is cpu; skipping set_wired_limit");
     }
 
     // Log the kv_quant and max_ctx selections.

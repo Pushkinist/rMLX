@@ -10,7 +10,6 @@ pin. Snapshot resolution, the test variables and the CPU gates are in
 A test that drives the GPU carries `#[ignore]` and runs serialized:
 
 ```bash
-cargo test --test embeddings_smoke -- --ignored --test-threads=1
 cargo test -p rmlx-kv-quant --lib -- --ignored <filter> --test-threads=1
 ```
 
@@ -83,21 +82,9 @@ and the marker beside `exempt`.
 
 | test | file | route | covered by |
 |---|---|---|---|
-| `valid_single_vector_200_shape` | `crates/rmlx-server/tests/embeddings_smoke.rs` | HTTP → `embeddings()` → `Device::Gpu` | nothing; run by hand |
-| `return_multivector_toggles_shape` | same | same | nothing; run by hand |
-| `invalid_dimensions_is_400` | same | same; the 400 comes after a full forward | nothing; run by hand |
-| `image_single_vector_200_shape` | same | same | nothing; run by hand |
-| `image_multivector_toggles_shape` | same | same | nothing; run by hand |
 | `ssd_cache_survives_server_restart` | `crates/rmlx-server/tests/ssd_cache_restart.rs` | spawned `rmlx serve` child | `make e2e` phase 2a runs the same spill → restart → hydrate chain |
 | `serve_refuses_to_start_above_the_positional_capacity` | `crates/rmlx-cli/tests/serve_context_ceiling.rs` | spawned `rmlx serve` child | nothing; run by hand |
 | `paro_kernel_registration` | `crates/rmlx-models/src/paroquant_msl_tests.rs` | `paro_rotate_kernel()` in a non-scanned source file | the `paro_rotate_identity_roundtrip_*` cells in `make gpu-test` dispatch the same kernel |
-
-Run the embeddings cells by hand:
-
-```sh
-RMLX_TEST_MODEL_JINA_V4=/abs/path/to/jinaai__jina-embeddings-v4 \
-  cargo test -p rmlx-server --test embeddings_smoke -- --ignored --test-threads=1
-```
 
 **Three populations.** `--list` is what `make gpu-test` executes. It is a
 strict subset of what the gate enforces, and every run prints the difference:

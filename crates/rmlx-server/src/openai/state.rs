@@ -920,7 +920,7 @@ impl AppState {
 
             let verdict = rmlx_models::arch::run_smoke_probe(
                 &entry.abs_path,
-                rmlx_mlx::Device::Gpu,
+                self.device,
                 None, // use the engine default KV quant
                 None, // use model default max_ctx
                 templated_prompt,

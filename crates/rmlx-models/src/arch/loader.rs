@@ -57,7 +57,7 @@ pub struct LoadOpts {
 /// build's MLX/mlx-c.
 /// Returns `Error::Loader` / `Error::Mlx` if weight loading fails.
 #[tracing::instrument(skip_all, fields(model_dir = %model_dir.display()))]
-pub fn load_model(model_dir: &Path, _device: Device, opts: &LoadOpts) -> Result<Architecture> {
+pub fn load_model(model_dir: &Path, device: Device, opts: &LoadOpts) -> Result<Architecture> {
     let t_total_start = Instant::now();
 
     let cfg = load_config(model_dir)?;
@@ -182,7 +182,7 @@ pub fn load_model(model_dir: &Path, _device: Device, opts: &LoadOpts) -> Result<
             a
         }
         "BitNetForCausalLM" => {
-            let model = crate::bitnet::load_from_path(model_dir)?;
+            let model = crate::bitnet::load_from_path(model_dir, device)?;
             let a = Architecture::BitNet(model);
             tracing::info!(summary = %a.config_summary(), "arch::load_model: loaded BitNet");
             a
@@ -272,7 +272,7 @@ pub fn load_model(model_dir: &Path, _device: Device, opts: &LoadOpts) -> Result<
     // kernel at the qwen3_5_moe prefill chunk size so its Metal program is
     // compiled before the first real request (the kernel now serves both
     // prefill and decode — see qwen3_5_moe::gated_delta_net).
-    if _device == Device::Gpu {
+    if device == Device::Gpu {
         if let Architecture::Qwen3_5Moe(ref m) = arch {
             let t_gdn_warm = Instant::now();
             let b: i32 = 1;
@@ -290,7 +290,7 @@ pub fn load_model(model_dir: &Path, _device: Device, opts: &LoadOpts) -> Result<
                 dv,
                 "arch::load_model: pre-warm gated_delta_step_gpu kernel"
             );
-            let warmup_result = gdn_warmup(b, gdn_warmup_t, hk, hv, dk, dv);
+            let warmup_result = gdn_warmup(b, gdn_warmup_t, hk, hv, dk, dv, device);
             match warmup_result {
                 Ok(()) => tracing::info!(
                     warmup_ms = t_gdn_warm.elapsed().as_millis(),
@@ -443,7 +443,7 @@ fn check_affine_bits(mode: &str, bits: u8, tensor: Option<&str>, arch_str: &str)
 /// time so the first real request pays no kernel-compile cost.
 ///
 /// Extracted from `load_model` to keep that function below 200 LOC.
-fn gdn_warmup(b: i32, t: i32, hk: i32, hv: i32, dk: i32, dv: i32) -> Result<()> {
+fn gdn_warmup(b: i32, t: i32, hk: i32, hv: i32, dk: i32, dv: i32, device: Device) -> Result<()> {
     let zeros_f32 = |shape: &[i32]| {
         let n = shape.iter().map(|&x| x as usize).product::<usize>();
         let bytes = vec![0u8; n * 4];
@@ -460,15 +460,8 @@ fn gdn_warmup(b: i32, t: i32, hk: i32, hv: i32, dk: i32, dv: i32) -> Result<()> 
     let g = zeros_f32(&[b, t, hv])?;
     let beta = zeros_bf16(&[b, t, hv])?;
     let state_in = zeros_f32(&[b, hv, dv, dk])?;
-    let (y_out, s_out) = crate::gated_delta_msl::gated_delta_step_gpu(
-        &q,
-        &k,
-        &v,
-        &g,
-        &beta,
-        &state_in,
-        Device::Gpu,
-    )?;
+    let (y_out, s_out) =
+        crate::gated_delta_msl::gated_delta_step_gpu(&q, &k, &v, &g, &beta, &state_in, device)?;
     // Force evaluation to complete Metal compilation.
     y_out.eval()?;
     s_out.eval()?;

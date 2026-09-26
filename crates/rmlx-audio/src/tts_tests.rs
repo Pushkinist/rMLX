@@ -58,6 +58,7 @@ fn synthesize_unknown_voice_returns_error() {
         config,
         std::path::PathBuf::from("/tmp"),
         std::path::PathBuf::from("/tmp"),
+        rmlx_mlx::Device::Cpu,
     );
     let tok = TtsTokenizer::stub();
 
@@ -95,6 +96,7 @@ fn synthesize_valid_voice_returns_load_error() {
         config,
         std::path::PathBuf::from("/tmp"),
         std::path::PathBuf::from("/tmp"),
+        rmlx_mlx::Device::Cpu,
     );
     let tok = TtsTokenizer::stub();
 
@@ -130,7 +132,8 @@ fn codec_decoder_debug() {
         return;
     }
 
-    let decoder = load_codec_decoder(&codec_path).expect("load codec decoder");
+    let d = rmlx_mlx::Device::Gpu;
+    let decoder = load_codec_decoder(&codec_path, d).expect("load codec decoder");
 
     // codes: [1, 16, 12] — code 100 for semantic, 50 for acoustic (same as Python reference)
     let t = 12i32;
@@ -145,7 +148,6 @@ fn codec_decoder_debug() {
     }
     let codes = Array::from_i32_slice(&codes_data, &[1, 16, t]).expect("build codes array");
 
-    let d = rmlx_mlx::Device::Gpu;
     let samples = decoder.debug_decode(&codes, d).expect("debug decode");
     eprintln!(
         "samples len={} rms={:.6}",

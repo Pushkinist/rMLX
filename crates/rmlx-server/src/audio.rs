@@ -247,6 +247,7 @@ async fn handle_audio(state: AppState, mut multipart: Multipart, task: WhisperTa
 
     // 7. Clone metrics sink for the blocking closure.
     let metrics_arc = state.metrics.clone();
+    let device = state.device;
     let model_path_str = model_path.to_string_lossy().into_owned();
 
     // NOTE: the per-request multimodal encoder cache (`state.mm_cache`) is not
@@ -259,8 +260,6 @@ async fn handle_audio(state: AppState, mut multipart: Multipart, task: WhisperTa
         // Hold the GPU admission guard for the duration of Whisper decode.
         // Dropping it releases the semaphore permit and decrements gpu_pending.
         let _guard = guard;
-
-        let device = Device::Gpu;
 
         // Registering a thread-local GPU stream + CommandEncoder once per thread entry point.
         // tokio blocking-pool threads start with no GPU stream context; MLX's array
@@ -656,6 +655,7 @@ pub async fn audio_speech(
     let input = req.input.clone();
     let response_format = req.response_format.clone();
     let metrics_arc = state.metrics.clone();
+    let device = state.device;
     let model_path_str = tts_model_path.to_string_lossy().into_owned();
 
     let result = tokio::task::spawn_blocking(move || {
@@ -678,8 +678,12 @@ pub async fn audio_speech(
                 if let Some((ref m, ref t)) = *write_guard {
                     (Arc::clone(m), Arc::clone(t))
                 } else {
-                    let m = rmlx_audio::tts::TtsModel::load_config(&tts_model_path, &tts_tok_path)
-                        .map_err(|e| format!("tts config load: {e}"))?;
+                    let m = rmlx_audio::tts::TtsModel::load_config(
+                        &tts_model_path,
+                        &tts_tok_path,
+                        device,
+                    )
+                    .map_err(|e| format!("tts config load: {e}"))?;
                     // Text tokenizer lives in the talker model snapshot (vocab.json +
                     // merges.txt), not in the codec-decoder path.
                     let t = rmlx_audio::tts::TtsTokenizer::from_path(&tts_model_path)

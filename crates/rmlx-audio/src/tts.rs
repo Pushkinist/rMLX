@@ -1317,6 +1317,7 @@ pub struct TtsModel {
     pub talker_path: std::path::PathBuf,
     /// Path to the codec decoder model directory.
     pub codec_path: std::path::PathBuf,
+    device: Device,
     talker: Option<Box<TalkerModel>>,
     codec: Option<Box<CodecDecoder>>,
 }
@@ -1327,6 +1328,7 @@ impl std::fmt::Debug for TtsModel {
             .field("model_type", &self.config.model_type)
             .field("talker_path", &self.talker_path)
             .field("codec_path", &self.codec_path)
+            .field("device", &self.device)
             .field("talker_loaded", &self.talker.is_some())
             .field("codec_loaded", &self.codec.is_some())
             .finish()
@@ -1334,10 +1336,12 @@ impl std::fmt::Debug for TtsModel {
 }
 
 impl TtsModel {
-    /// Load config only (no weights). Weights loaded on first `synthesize` call.
+    /// Load config only (no weights). Weights loaded on first `synthesize` call;
+    /// loading and synthesis run on `device`.
     pub fn load_config(
         talker_path: impl AsRef<Path>,
         codec_path: impl AsRef<Path>,
+        device: Device,
     ) -> Result<Self, TtsError> {
         let cfg_path = talker_path.as_ref().join("config.json");
         let cfg_str = std::fs::read_to_string(&cfg_path)
@@ -1347,6 +1351,7 @@ impl TtsModel {
             config,
             talker_path: talker_path.as_ref().to_path_buf(),
             codec_path: codec_path.as_ref().to_path_buf(),
+            device,
             talker: None,
             codec: None,
         })
@@ -1358,11 +1363,13 @@ impl TtsModel {
         config: TtsConfig,
         talker_path: std::path::PathBuf,
         codec_path: std::path::PathBuf,
+        device: Device,
     ) -> Self {
         Self {
             config,
             talker_path,
             codec_path,
+            device,
             talker: None,
             codec: None,
         }
@@ -1382,7 +1389,7 @@ impl TtsModel {
 
         let t1 = Instant::now();
         info!("loading Qwen3-TTS codec decoder weights");
-        self.codec = Some(Box::new(load_codec_decoder(&self.codec_path)?));
+        self.codec = Some(Box::new(load_codec_decoder(&self.codec_path, self.device)?));
         info!(
             elapsed_ms = t1.elapsed().as_millis(),
             "codec decoder loaded"
@@ -1535,8 +1542,9 @@ fn load_codec_conv1d(
     idx: &rmlx_loader::ShardIndex,
     key: &str,
     padding: i32,
+    d: Device,
 ) -> Result<CodecConv1d, TtsError> {
-    load_codec_conv1d_dil(shards, idx, key, padding, 1)
+    load_codec_conv1d_dil(shards, idx, key, padding, 1, d)
 }
 
 fn load_codec_conv1d_dil(
@@ -1545,11 +1553,12 @@ fn load_codec_conv1d_dil(
     key: &str,
     padding: i32,
     dilation: i32,
+    d: Device,
 ) -> Result<CodecConv1d, TtsError> {
     let w = load_tensor(shards, idx, &format!("{key}.weight"))?;
     let b = load_tensor_opt(shards, idx, &format!("{key}.bias"))?;
     // PyTorch [out, in, kernel] → MLX [out, kernel, in].
-    let w_mlx = w.transpose(&[0, 2, 1], Device::Gpu)?;
+    let w_mlx = w.transpose(&[0, 2, 1], d)?;
     Ok(CodecConv1d {
         w: w_mlx,
         b,
@@ -1564,12 +1573,13 @@ fn load_codec_conv_t1d(
     idx: &rmlx_loader::ShardIndex,
     key: &str,
     stride: i32,
+    d: Device,
 ) -> Result<CodecConvT1d, TtsError> {
     let w = load_tensor(shards, idx, &format!("{key}.weight"))?;
     let b = load_tensor_opt(shards, idx, &format!("{key}.bias"))?;
     // ConvTranspose1d weight: PyTorch [in, out, kernel] → MLX [out, kernel, in]
     // Transpose: axes [1, 2, 0]
-    let w_mlx = w.transpose(&[1, 2, 0], Device::Gpu)?;
+    let w_mlx = w.transpose(&[1, 2, 0], d)?;
     let kernel = w_mlx.shape()[1];
     let trim_right = kernel - stride;
     Ok(CodecConvT1d {
@@ -1604,10 +1614,11 @@ fn load_conv_next(
     shards: &ShardSet,
     idx: &rmlx_loader::ShardIndex,
     pfx: &str,
+    d: Device,
 ) -> Result<ConvNeXt, TtsError> {
     // dwconv: depthwise k=7, groups=C — stored as [C, 1, 7] in PyTorch → [C, 7, 1] in MLX
     let dw_w_raw = load_tensor(shards, idx, &format!("{pfx}.dwconv.conv.weight"))?;
-    let dw_w = dw_w_raw.transpose(&[0, 2, 1], Device::Gpu)?;
+    let dw_w = dw_w_raw.transpose(&[0, 2, 1], d)?;
     let dw_b = load_tensor_opt(shards, idx, &format!("{pfx}.dwconv.conv.bias"))?;
     let c = dw_w.shape()[0];
     // causal padding = kernel_size - 1 = 6
@@ -1641,16 +1652,24 @@ fn load_res_block(
     idx: &rmlx_loader::ShardIndex,
     pfx: &str,
     dilation: i32,
+    d: Device,
 ) -> Result<ResBlock, TtsError> {
     let act1 = load_snake_beta(shards, idx, &format!("{pfx}.act1"))?;
     // conv1: CausalConv1d k=7 dilation=dilation, causal padding=(k-1)*dilation
     let conv1 = {
         let padding = (7 - 1) * dilation;
-        load_codec_conv1d_dil(shards, idx, &format!("{pfx}.conv1.conv"), padding, dilation)?
+        load_codec_conv1d_dil(
+            shards,
+            idx,
+            &format!("{pfx}.conv1.conv"),
+            padding,
+            dilation,
+            d,
+        )?
     };
     let act2 = load_snake_beta(shards, idx, &format!("{pfx}.act2"))?;
     // conv2: CausalConv1d k=1, no padding
-    let conv2 = load_codec_conv1d(shards, idx, &format!("{pfx}.conv2.conv"), 0)?;
+    let conv2 = load_codec_conv1d(shards, idx, &format!("{pfx}.conv2.conv"), 0, d)?;
     Ok(ResBlock {
         act1,
         conv1,
@@ -1672,7 +1691,7 @@ fn load_decoder_group(
 
     let snake_in = load_snake_beta(shards, idx, &format!("{pfx}.block.0"))?;
     // block[1]: DecoderBlockUpsample — conv.weight, conv.bias; kernel=2*stride
-    let upsample = load_codec_conv_t1d(shards, idx, &format!("{pfx}.block.1.conv"), stride)?;
+    let upsample = load_codec_conv_t1d(shards, idx, &format!("{pfx}.block.1.conv"), stride, d)?;
 
     // block[2,3,4]: ResidualUnits with dilation 1, 3, 9
     let mut res_blocks = Vec::with_capacity(3);
@@ -1682,10 +1701,10 @@ fn load_decoder_group(
             idx,
             &format!("{pfx}.block.{bi}"),
             dil,
+            d,
         )?);
     }
 
-    let _ = d;
     Ok(DecoderGroup {
         snake_in,
         upsample,
@@ -1727,25 +1746,38 @@ fn load_pre_trans_mlp(
 }
 
 #[cfg_attr(test, allow(dead_code))]
-pub(crate) fn load_codec_decoder(codec_path: &Path) -> Result<CodecDecoder, TtsError> {
+pub(crate) fn load_codec_decoder(codec_path: &Path, d: Device) -> Result<CodecDecoder, TtsError> {
     // load_shard_index handles both multi-shard (index.json) and single-shard cases.
     let idx = load_shard_index(codec_path).map_err(|e| TtsError::Load(e.to_string()))?;
     let shards = ShardSet::open(codec_path, &idx).map_err(|e| TtsError::Load(e.to_string()))?;
 
-    let d = Device::Gpu;
-
     // VQ: rvq_first has 1 codebook, rvq_rest has 15
-    let rvq_first_input =
-        load_codec_conv1d(&shards, &idx, "decoder.quantizer.rvq_first.input_proj", 0)?;
-    let rvq_first_output =
-        load_codec_conv1d(&shards, &idx, "decoder.quantizer.rvq_first.output_proj", 0)?;
+    let rvq_first_input = load_codec_conv1d(
+        &shards,
+        &idx,
+        "decoder.quantizer.rvq_first.input_proj",
+        0,
+        d,
+    )?;
+    let rvq_first_output = load_codec_conv1d(
+        &shards,
+        &idx,
+        "decoder.quantizer.rvq_first.output_proj",
+        0,
+        d,
+    )?;
     let rvq_first_cb =
         load_vq_codebook(&shards, &idx, "decoder.quantizer.rvq_first.vq.layers.0", d)?;
 
     let rvq_rest_input =
-        load_codec_conv1d(&shards, &idx, "decoder.quantizer.rvq_rest.input_proj", 0)?;
-    let rvq_rest_output =
-        load_codec_conv1d(&shards, &idx, "decoder.quantizer.rvq_rest.output_proj", 0)?;
+        load_codec_conv1d(&shards, &idx, "decoder.quantizer.rvq_rest.input_proj", 0, d)?;
+    let rvq_rest_output = load_codec_conv1d(
+        &shards,
+        &idx,
+        "decoder.quantizer.rvq_rest.output_proj",
+        0,
+        d,
+    )?;
 
     let mut rvq_rest_cbs = Vec::with_capacity(15);
     // rvq_rest.vq.layers has indices 0..14
@@ -1759,7 +1791,7 @@ pub(crate) fn load_codec_decoder(codec_path: &Path) -> Result<CodecDecoder, TtsE
     }
 
     // pre_conv: k=3, 512→1024, causal padding=2
-    let pre_conv = load_codec_conv1d(&shards, &idx, "decoder.pre_conv.conv", 2)?;
+    let pre_conv = load_codec_conv1d(&shards, &idx, "decoder.pre_conv.conv", 2, d)?;
 
     // pre_transformer
     let pre_trans_input = load_plain_p(&shards, &idx, "decoder.pre_transformer.input_proj")?;
@@ -1805,14 +1837,14 @@ pub(crate) fn load_codec_decoder(codec_path: &Path) -> Result<CodecDecoder, TtsE
         // upsample.{i}.0.conv: ConvTranspose1d stride=2, kernel=2*2=4
         // weight stored as [in, out, kernel]=[1024,1024,2] → MLX [out, kernel, in]=[1024,2,1024]
         let conv_t =
-            load_codec_conv_t1d(&shards, &idx, &format!("decoder.upsample.{i}.0.conv"), 2)?;
-        let conv_next = load_conv_next(&shards, &idx, &format!("decoder.upsample.{i}.1"))?;
+            load_codec_conv_t1d(&shards, &idx, &format!("decoder.upsample.{i}.0.conv"), 2, d)?;
+        let conv_next = load_conv_next(&shards, &idx, &format!("decoder.upsample.{i}.1"), d)?;
         upsample.push((conv_t, conv_next));
     }
 
     // decoder blocks
     // decoder.decoder.0: initial conv k=7, 1024→1536, causal padding=6
-    let initial_conv = load_codec_conv1d(&shards, &idx, "decoder.decoder.0.conv", 6)?;
+    let initial_conv = load_codec_conv1d(&shards, &idx, "decoder.decoder.0.conv", 6, d)?;
 
     // decoder.decoder.{1,2,3,4}: 4 DecoderGroups with strides 8,5,4,3
     let mut groups = Vec::with_capacity(4);
@@ -1824,7 +1856,7 @@ pub(crate) fn load_codec_decoder(codec_path: &Path) -> Result<CodecDecoder, TtsE
     let output_snake = load_snake_beta(&shards, &idx, "decoder.decoder.5")?;
 
     // decoder.decoder.6: OutputConv k=7, causal padding=6
-    let output_conv = load_codec_conv1d(&shards, &idx, "decoder.decoder.6.conv", 6)?;
+    let output_conv = load_codec_conv1d(&shards, &idx, "decoder.decoder.6.conv", 6, d)?;
 
     Ok(CodecDecoder {
         rvq_first_input,
@@ -2077,7 +2109,7 @@ pub fn synthesize(
         .as_ref()
         .ok_or_else(|| TtsError::Load("codec not loaded after model.load()".into()))?;
     let tcfg = &model.config.talker_config;
-    let d = Device::Gpu;
+    let d = model.device;
     let t_start = Instant::now();
 
     // ── Build input embeddings (matches _prepare_generation_inputs custom_voice path) ──
@@ -2348,3 +2380,7 @@ pub fn synthesize(
 #[cfg(test)]
 #[path = "tts_tests.rs"]
 mod tts_tests;
+
+#[cfg(test)]
+#[path = "tts_device_tests.rs"]
+mod tts_device_tests;
