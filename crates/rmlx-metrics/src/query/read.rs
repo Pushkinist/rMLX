@@ -359,12 +359,14 @@ pub fn timeseries(
 /// See docs/METRICS_DB.md §8.2 for full spec. Uses the earliest `ts_utc` of any
 /// observation carrying `since_sha` (or `since_sha-dirty`) as the baseline cutoff.
 /// Returns rows where the absolute delta percentage exceeds `threshold_pct`
-/// (default 5.0). All cells+metrics that appear in the current `bests` view are
-/// evaluated.
+/// (default 5.0). Every cell and metric in the current `bests` view is
+/// evaluated, or with `prompt_prefix` only the cells whose prompt name starts
+/// with it.
 pub fn deltas(
     conn: &Connection,
     since_sha: &str,
     threshold_pct: Option<f64>,
+    prompt_prefix: Option<&str>,
 ) -> Result<Vec<DeltaRow>> {
     let threshold = threshold_pct.unwrap_or(5.0);
 
@@ -395,9 +397,13 @@ pub fn deltas(
     // Step 2: collect all distinct (cell, metric, direction) tuples from bests.
     // We need to enumerate all cells+metrics that have observations.
     // Pull the full bests view for current bests.
-    let mut stmt = conn.prepare(&format!("SELECT {BEST_COLUMNS} FROM bests"))?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {BEST_COLUMNS} FROM bests
+          WHERE ?1 IS NULL
+             OR prompt_id IN (SELECT id FROM prompts WHERE substr(name, 1, length(?1)) = ?1)"
+    ))?;
     let current_bests: Vec<BestRow> = stmt
-        .query_map([], row_to_best)?
+        .query_map([prompt_prefix], row_to_best)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     // Step 3: for each current best, compute "best as of baseline_ts" (ts_utc <= baseline_ts)

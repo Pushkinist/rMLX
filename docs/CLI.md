@@ -497,7 +497,8 @@ refuse a missing DB, and a DB whose `bests` view is stale, naming
 | `history` | the `best` cell flags; `--metric`, `--since <date>` optional | Every observation of one cell, oldest first. |
 | `timeseries` | the `best` flags; `--since`, `--bucket day\|week` (`day`) | Mean per bucket for one cell and metric. |
 | `regress` | `--model <substring>`, `--metric` (required); `--kv`, `--threshold-pct` (`1.0`) | Latest observation against the champion. Exit `0` within tolerance, `1` regressed, `125` nothing to compare. |
-| `deltas` | `--since-sha` (required), `--threshold-pct` (`5.0`), `--exit-code` (`true`) | Changes per cell and metric since a commit. A SHA with no observations is an error (exit 1). With `--exit-code true`: `1` when a row regressed past the threshold, `125` when no row has a baseline, `0` otherwise. |
+| `path` | `--home` | Prints the DB path this invocation resolves, or with `--home` the data root. Opens nothing. |
+| `deltas` | `--since-sha` (required), `--threshold-pct` (`5.0`), `--exit-code` (`true`), `--prompt-prefix` | Changes per cell and metric since a commit; `--prompt-prefix` keeps the cells whose prompt name starts with it. A SHA with no observations is an error (exit 1). With `--exit-code true`: `1` when a row regressed past the threshold, `125` when no row has a baseline, `0` otherwise. |
 | `describe` | `--observation-id` \| `--run-id`; `--text` (required) | Sets the `description` of one observation or of every observation in a run. |
 | `query` | `<SQL>` | Runs one `SELECT`; TSV output. |
 | `open` | `--readonly` | Opens the DB in `sqlite3`. |

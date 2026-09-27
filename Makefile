@@ -977,7 +977,8 @@ spec-canary-gate:   ## gate spec-decode regressions (decode_tps_warm + accept_ra
 #                     run directory under <data root>/proofs/, writes CSVs +
 #                     iteration_summary.json there, and ingests per-phase observations
 #                     tagged ssd-canary-{populate,revisit,evict} into the DB
-#                     `scripts/ssd_canary.sh --print-db` names. It deletes nothing.
+#                     `rmlx metrics path` names. At exit it deletes the run
+#                     directory's SSD blocks and nothing else.
 #
 # `make ssd-canary-gate SHA=<sha>` — queries runs.db via `rmlx metrics deltas`
 #                     against the recorded baseline SHA. Direction-aware: higher-is-
@@ -985,8 +986,8 @@ spec-canary-gate:   ## gate spec-decode regressions (decode_tps_warm + accept_ra
 #                     prompt_cache_ssd_hits) flag on drop; lower-is-better metrics
 #                     (ssd_spill_ms, ssd_hydrate_ms) flag on rise. Exits non-zero on
 #                     regression beyond CANARY_THRESHOLD_PCT (default 3%). It reads
-#                     the DB `scripts/ssd_canary.sh --print-db` names, the one the
-#                     canary writes.
+#                     the DB `rmlx metrics path` names, the one the canary writes,
+#                     and compares only the cells under an `ssd-canary-` prompt.
 #
 # Required env: VERIFIER_MODEL (resolve via LOCAL.md, gitignored).
 # Optional: SSD_GB (default 100), RMLX_HOME (default $PWD/.rmlx),
@@ -1036,15 +1037,16 @@ schema-constraint-canary: build-perf  ## prove json_schema enforcement on Bonsai
 
 ssd-canary-gate:   ## gate SSD-tier regressions; SHA= required, THRESHOLD_PCT=3 default
 	@test -n "$(SHA)" || { echo "ERROR: SHA= required. Usage: make ssd-canary-gate SHA=<last-green-sha>"; exit 125; }
-	@DB_PATH="$$(bash scripts/ssd_canary.sh --print-db)"; \
+	@DB_PATH="$$(cargo run -q --release --bin rmlx -- metrics path)" || exit 1; \
 	if [ ! -f "$$DB_PATH" ]; then \
 		echo "skip: runs.db not found at $$DB_PATH (run 'make ssd-canary' first)"; \
 		exit 125; \
 	fi; \
 	echo "==> ssd-canary-gate: comparing vs SHA=$(SHA) threshold=$${CANARY_THRESHOLD_PCT:-3}%"; \
-	RMLX_METRICS_DB="$$DB_PATH" cargo run --release --bin rmlx -- \
-		metrics deltas \
+	cargo run --release --bin rmlx -- \
+		metrics --db "$$DB_PATH" deltas \
 		--since-sha "$(SHA)" \
+		--prompt-prefix ssd-canary- \
 		--threshold-pct $${CANARY_THRESHOLD_PCT:-3} \
 		--exit-code true
 

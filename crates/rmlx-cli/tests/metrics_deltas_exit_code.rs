@@ -6,6 +6,7 @@
 //! - `--exit-code=false` always exits 0 regardless of regressions
 //! - no-baseline case (all rows have `baseline_value == null`) exits 125, not 1
 //! - zero rows (every cell within threshold) exits 0
+//! - `--prompt-prefix` compares only the cells whose prompt name carries it
 //!
 //! All tests seed an in-memory DB via `rusqlite` + `rmlx_metrics`, then write
 //! it to a tempfile before spawning the rmlx binary.
@@ -26,7 +27,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use rmlx_metrics::{ingest::RunRecord, migrate, recorder::Recorder};
+use rmlx_metrics::{
+    ingest::{PromptRef, RunRecord},
+    migrate,
+    recorder::Recorder,
+};
 use rusqlite::Connection;
 use serde_json::json;
 
@@ -249,6 +254,56 @@ fn seed_clean_db(td: &tempfile::TempDir) -> PathBuf {
     db
 }
 
+/// One observation of `decode_tps_warm` on a cell keyed by its own prompt.
+/// Prompts are content-addressed, so each name carries its own body.
+fn make_prompt_run(prompt_name: &str, value: f64, ts: &str, git_sha: &str) -> RunRecord {
+    let mut run = make_run(
+        "rmlx",
+        "gemma-4-e4b-it-mxfp8",
+        "decode_tps_warm",
+        value,
+        ts,
+        Some(git_sha),
+    );
+    run.prompt = PromptRef::ByBody {
+        name: prompt_name.into(),
+        body: json!(format!("body of {prompt_name}")),
+        notes: None,
+        tokens_approx: Some(4),
+    };
+    run
+}
+
+/// Two cells measured before and after `sha_base`: one under an
+/// `ssd-canary-` prompt, one under an unrelated prompt. Each argument is that
+/// cell's value after the baseline of 100.
+fn seed_two_prompt_db(td: &tempfile::TempDir, canary_after: f64, other_after: f64) -> PathBuf {
+    let mut conn = open_mem();
+    let mut rec = Recorder::new(&mut conn, "test@0.0.1");
+    for (prompt, after) in [
+        ("ssd-canary-populate", canary_after),
+        ("perf-canary-4096", other_after),
+    ] {
+        rec.record_run(&make_prompt_run(
+            prompt,
+            100.0,
+            "2026-05-01T10:00:00Z",
+            "sha_base",
+        ))
+        .unwrap();
+        rec.record_run(&make_prompt_run(
+            prompt,
+            after,
+            "2026-05-10T10:00:00Z",
+            "sha_after",
+        ))
+        .unwrap();
+    }
+    let db = td.path().join("two_prompt.db");
+    persist_to(&conn, &db);
+    db
+}
+
 fn run_deltas(db: &Path, extra: &[&str]) -> std::process::Output {
     Command::new(rmlx_bin())
         .arg("metrics")
@@ -362,4 +417,54 @@ fn deltas_unknown_sha_exits_nonzero() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
+}
+
+/// A regression in a cell outside the prefix does not fail a gate scoped to
+/// the prefix, and the same DB fails the unscoped gate.
+#[test]
+fn deltas_prompt_prefix_ignores_an_unrelated_regression() {
+    let td = tempfile::tempdir().unwrap();
+    let db = seed_two_prompt_db(&td, 99.0, 50.0);
+    let scoped = run_deltas(
+        &db,
+        &["--since-sha", "sha_base", "--prompt-prefix", "ssd-canary-"],
+    );
+    assert_eq!(
+        scoped.status.code(),
+        Some(0),
+        "scoped gate failed on an unrelated cell; stdout={}  stderr={}",
+        String::from_utf8_lossy(&scoped.stdout),
+        String::from_utf8_lossy(&scoped.stderr),
+    );
+    let unscoped = run_deltas(&db, &["--since-sha", "sha_base"]);
+    assert_eq!(
+        unscoped.status.code(),
+        Some(1),
+        "the unrelated regression must still fail the unscoped gate"
+    );
+}
+
+/// A regression in a cell under the prefix fails the scoped gate, and only
+/// that cell is printed.
+#[test]
+fn deltas_prompt_prefix_fails_on_its_own_regression() {
+    let td = tempfile::tempdir().unwrap();
+    let db = seed_two_prompt_db(&td, 50.0, 40.0);
+    let out = run_deltas(
+        &db,
+        &["--since-sha", "sha_base", "--prompt-prefix", "ssd-canary-"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "scoped gate missed its own cell's regression; stdout={stdout}  stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(
+        stdout.lines().count(),
+        1,
+        "only the canary cell may be printed: {stdout}"
+    );
+    assert!(stdout.contains("\"current_value\":50.0"), "{stdout}");
 }

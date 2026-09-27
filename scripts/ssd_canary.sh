@@ -10,7 +10,6 @@
 # Usage:
 #   VERIFIER_MODEL=/path/to/snapshot bash scripts/ssd_canary.sh [--port N] \
 #     [--ssd-gb N] [--dry-run]
-#   bash scripts/ssd_canary.sh --print-db   # the DB the records go to; the gate reads it
 #
 # Requires:
 #   - Built binary at target/release-perf/rmlx  (run: make build-perf)
@@ -20,17 +19,20 @@
 # that is the phase servers' RMLX_HOME:
 #   - phase_populate.csv, phase_revisit.csv, phase_evict.csv
 #   - iteration_summary.json
-#   - metrics/runs.db (the servers' events), cache/kv/ssd-canary/ (the SSD tier)
-# The three phase records go to the DB `--print-db` names, via §8.5 ingest.
-# The script deletes nothing: it writes only into that new directory, and the
-# data root's metrics DB is written by `rmlx metrics record` alone.
+#   - metrics/runs.db (the servers' events), logs/, server_<phase>.log
+# The three phase records go to the metrics DB `rmlx metrics path` names, via
+# §8.5 ingest. The one thing the script deletes is that directory's SSD tier,
+# cache/kv/, at exit; the data root's metrics DB is written by
+# `rmlx metrics record` alone.
 
 set -euo pipefail
 
 # The server this run started and has not yet stopped. Any exit — a failed
 # command under `set -e`, an interrupt, a CI timeout — stops it and waits, so no
-# failure leaves it holding the Metal claim.
+# failure leaves it holding the Metal claim. Then the run's SSD blocks go: they
+# are the one bulky output, and nothing reads them after the run.
 LIVE_PID=""
+RUN_DIR=""
 stop_live_server() {
     if [[ -n "${LIVE_PID}" ]]; then
         kill "${LIVE_PID}" 2>/dev/null || true
@@ -38,15 +40,16 @@ stop_live_server() {
         LIVE_PID=""
     fi
 }
-trap stop_live_server EXIT
+on_exit() {
+    stop_live_server
+    if [[ -n "${RUN_DIR}" ]]; then
+        rm -rf "${RUN_DIR}/cache/kv"
+    fi
+}
+trap on_exit EXIT
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-
-# The data root is an inherited RMLX_HOME, else this checkout's .rmlx. The
-# metrics DB is resolved in the binary's order: RMLX_METRICS_DB, then the data
-# root. `make ssd-canary-gate` reads the path `--print-db` prints.
-DATA_ROOT="${RMLX_HOME:-${REPO_ROOT}/.rmlx}"
-INGEST_DB="${RMLX_METRICS_DB:-${DATA_ROOT}/metrics/runs.db}"
+BINARY="${REPO_ROOT}/target/release-perf/rmlx"
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -63,7 +66,6 @@ DRY_RUN=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --print-db)        echo "${INGEST_DB}"; exit 0 ;;
         --dry-run)         DRY_RUN=true; shift ;;
         --port=*)          PORT="${1#--port=}"; shift ;;
         --port)            shift; PORT="${1:?--port requires a value}"; shift ;;
@@ -73,9 +75,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
+if [[ ! -x "${BINARY}" ]]; then
+    echo "ERROR: binary not found at ${BINARY}. Run: make build-perf" >&2
+    exit 125
+fi
 
-BINARY="${REPO_ROOT}/target/release-perf/rmlx"
+# ── Paths ─────────────────────────────────────────────────────────────────────
 
 # Run identity (backend / version / git sha / build profile / hardware tag)
 # comes from the measured binary — never hard-coded here.
@@ -83,7 +88,14 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/identity.sh"
 rmlx_export_identity "${BINARY}"
 PROMPT_DIR="${REPO_ROOT}/prompts/ssd_bench"
 GIT_SHA="$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || echo "unknown")"
-HARDWARE_TAG="${RMLX_HARDWARE_TAG:-m5_max_128gb}"
+
+# The binary resolves the data root and the metrics DB, from the checkout, as
+# `make ssd-canary-gate` does, so the records land in the DB the gate reads.
+DATA_ROOT="$(cd "${REPO_ROOT}" && "${BINARY}" metrics path --home)"
+INGEST_DB="$(cd "${REPO_ROOT}" && "${BINARY}" metrics path)"
+
+# Every phase server runs at this context ceiling, and the records say so.
+CTX_MAX=8192
 
 # ── Model path requirement ────────────────────────────────────────────────────
 
@@ -109,11 +121,6 @@ MODEL_NAMESPACE="$(echo "${MODEL_ID}" | cut -d_ -f1)"
 MODEL_BASENAME="$(echo "${MODEL_ID}" | sed 's/^[^_]*__//')"
 
 # ── Sanity checks ─────────────────────────────────────────────────────────────
-
-if [[ ! -x "${BINARY}" ]]; then
-    echo "ERROR: binary not found at ${BINARY}. Run: make build-perf" >&2
-    exit 125
-fi
 
 if [[ ! -d "${VERIFIER_MODEL}" ]]; then
     echo "ERROR: verifier model not found: ${VERIFIER_MODEL}" >&2
@@ -440,7 +447,8 @@ emit_and_ingest() {
         BENCH_MODEL_BASENAME="${MODEL_BASENAME}" \
         BENCH_TS_UTC="${ts_utc}" \
         BENCH_GIT_SHA="${GIT_SHA}" \
-        BENCH_HARDWARE_TAG="${HARDWARE_TAG}" \
+        BENCH_KV_QUANT="${KV_QUANT}" \
+        BENCH_CTX_MAX="${CTX_MAX}" \
         BENCH_SEED="${SEED}" \
         BENCH_TEMPERATURE="${TEMPERATURE}" \
         python3 - <<'PYEOF'
@@ -454,7 +462,8 @@ model_namespace= os.environ["BENCH_MODEL_NAMESPACE"]
 model_basename = os.environ["BENCH_MODEL_BASENAME"]
 ts_utc         = os.environ["BENCH_TS_UTC"]
 git_sha        = os.environ["BENCH_GIT_SHA"]
-hardware_tag   = os.environ["BENCH_HARDWARE_TAG"]
+kv_quant       = os.environ["BENCH_KV_QUANT"]
+ctx_max        = int(os.environ["BENCH_CTX_MAX"])
 seed           = int(os.environ["BENCH_SEED"])
 temperature    = float(os.environ["BENCH_TEMPERATURE"])
 
@@ -476,8 +485,8 @@ obj = {
     "model_namespace": model_namespace,
     "model": model_basename,
     "weight_quant": weight_quant,
-    "kv_quant": "k8v8",
-    "ctx_max": 8192,
+    "kv_quant": kv_quant,
+    "ctx_max": ctx_max,
     "prompt": {
         "name": f"ssd-canary-{tag}",
         "body": [{"role": "user", "content": "ssd_canary batch"}],
@@ -539,6 +548,7 @@ RMLX_LOG_CAP_MB=500 \
         --model "${VERIFIER_MODEL}" \
         --port "${PORT}" \
         --prompt-cache-slots 4 \
+        --max-ctx "${CTX_MAX}" \
         --kv-ssd-cache-gb "${SSD_GB}" \
         --project ssd-canary \
         --log info \
@@ -589,6 +599,16 @@ kill "${POPULATE_PID}" 2>/dev/null || true
 wait "${POPULATE_PID}" 2>/dev/null || true
 LIVE_PID=""
 sleep 3
+
+# The KV codec the servers run, in the engine's own spelling, read from the
+# populate server's log once it has stopped: it is part of the records' cell key.
+KV_LOG="$(ls -t "${RUN_DIR}"/logs/*.jsonl 2>/dev/null | head -1)" || KV_LOG=""
+KV_QUANT="$(python3 "${REPO_ROOT}/scripts/lib/server_kv_quant.py" "${KV_LOG}" \
+    | sed -n 's/^kv_quant=//p')" || KV_QUANT=""
+if [[ -z "${KV_QUANT}" ]]; then
+    echo "ERROR: the populate server's log names no KV codec; the records cannot be labelled" >&2
+    exit 1
+fi
 
 # Re-read final metrics after kill (drain may have flushed during the 5s window).
 read -r ssd_bytes ssd_evict spill_count hydrate_count spill_sum_us hydrate_sum_us spill_bytes hydrate_bytes \
@@ -669,6 +689,7 @@ RMLX_LOG_CAP_MB=500 \
         --model "${VERIFIER_MODEL}" \
         --port "${PORT}" \
         --prompt-cache-slots 4 \
+        --max-ctx "${CTX_MAX}" \
         --kv-ssd-cache-gb "${SSD_GB}" \
         --project ssd-canary \
         --log info \
@@ -699,6 +720,7 @@ for rseq in $(seq 0 $((REVISIT_COUNT - 1))); do
         --model "${VERIFIER_MODEL}" \
         --port "${PORT}" \
         --prompt-cache-slots 4 \
+        --max-ctx "${CTX_MAX}" \
         --kv-ssd-cache-gb "${SSD_GB}" \
         --project ssd-canary \
         --log info || true
@@ -776,6 +798,7 @@ RMLX_LOG_CAP_MB=500 \
         --model "${VERIFIER_MODEL}" \
         --port "${PORT}" \
         --prompt-cache-slots 4 \
+        --max-ctx "${CTX_MAX}" \
         --kv-ssd-cache-gb "${EVICT_SSD_GB}" \
         --project ssd-canary \
         --log info \
@@ -844,6 +867,7 @@ for seq in $(seq 0 $((_evict_n - 1))); do
         --model "${VERIFIER_MODEL}" \
         --port "${PORT}" \
         --prompt-cache-slots 4 \
+        --max-ctx "${CTX_MAX}" \
         --kv-ssd-cache-gb "${EVICT_SSD_GB}" \
         --project ssd-canary \
         --log info || true
@@ -1046,9 +1070,10 @@ if ! $DRY_RUN && [[ -f "${EVENTS_DB}" ]]; then
 
     # C3: the metrics DB holds this run's three tagged rows.
     for obs_tag in "ssd-canary-populate" "ssd-canary-revisit" "ssd-canary-evict"; do
-        OBS_COUNT=$(sqlite3 "${INGEST_DB}" \
+        OBS_COUNT=$("${BINARY}" metrics --db "${INGEST_DB}" query \
             "SELECT COUNT(*) FROM observations WHERE ts_utc >= '${RUN_START_UTC}' AND description LIKE '%tag=${obs_tag} %';" \
-            2>/dev/null || echo "0")
+            2>/dev/null | tail -n +2) || OBS_COUNT=0
+        OBS_COUNT="${OBS_COUNT:-0}"
         if [[ "${OBS_COUNT}" -lt 1 ]]; then
             VALIDATION_NOTES="${VALIDATION_NOTES} [WARN] observations tag=${obs_tag} count=${OBS_COUNT}"
             echo "  WARN: observations tag=${obs_tag} not found" >&2
@@ -1193,12 +1218,12 @@ echo "==> Summary written to ${SUMMARY_FILE}"
 if ! $DRY_RUN && [[ -f "${INGEST_DB}" ]]; then
     echo ""
     echo "==> DB verification (this run's records):"
-    sqlite3 "${INGEST_DB}" \
+    "${BINARY}" metrics --db "${INGEST_DB}" query \
         "SELECT description, metric, ROUND(value,3) as value
          FROM observations
          WHERE ts_utc >= '${RUN_START_UTC}' AND description LIKE 'ssd_canary tag=%'
          ORDER BY ts_utc DESC, metric;" \
-        2>/dev/null || echo "  (sqlite3 not available or DB empty)"
+        2>/dev/null || echo "  (DB not readable)"
 fi
 
 # ── Final summary table ────────────────────────────────────────────────────────
