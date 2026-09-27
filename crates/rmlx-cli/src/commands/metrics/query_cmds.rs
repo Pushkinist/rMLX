@@ -246,11 +246,12 @@ pub(super) fn cmd_deltas(
     since_sha: &str,
     threshold_pct: f64,
     exit_code: bool,
+    prompt_prefix: Option<&str>,
 ) -> anyhow::Result<()> {
     let conn = schema::open_checked(db_path)
         .with_context(|| format!("open DB at {}", db_path.display()))?;
-    let rows =
-        query::deltas(&conn, since_sha, Some(threshold_pct)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let rows = query::deltas(&conn, since_sha, Some(threshold_pct), prompt_prefix)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     for r in &rows {
         println!("{}", serde_json::to_string(r)?);
     }
