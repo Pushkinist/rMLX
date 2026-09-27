@@ -2,10 +2,12 @@
 # scripts/check_claim_bypass_selftest.sh — recall test for check_claim_bypass.sh.
 # doc-refs: fixture — the docs/ paths below belong to the synthetic scan roots.
 #
-# Each case builds a throwaway scan root with one planted line, runs the gate
-# and asserts the literal exit code and, for every failure, the rule and the
-# file:line it names. Every scan root also holds one clean in-scope file, so a
-# must-fail case cannot pass through the "empty scope" branch.
+# Each case builds a throwaway git work tree with one planted line, runs the
+# gate and asserts the literal exit code and, for every failure, the rule and
+# the file:line it names. Every scan root also holds one clean in-scope file,
+# so a must-fail case cannot pass through the "empty scope" branch. A few
+# cases plant a `.gitignore` to prove the gate scans exactly the files git
+# does not ignore, and one runs outside any git work tree.
 #
 # Exit 0 = every case held. Exit 1 = at least one did not.
 
@@ -19,10 +21,11 @@ trap 'rm -rf "$WORK"' EXIT
 FAILED=0
 PASSED=0
 
-# fresh <name>: a scan root with one clean script in scope.
+# fresh <name>: a git work tree with one clean script in scope.
 fresh() {
     local root="$WORK/$1"
     mkdir -p "$root/scripts"
+    git -C "$root" init -q || exit 1
     # shellcheck disable=SC2016 # the planted script must hold the literal $SERVER_PID
     printf '#!/bin/sh\nkill "$SERVER_PID"\nwait "$SERVER_PID"\n' >"$root/scripts/clean.sh"
     printf '%s' "$root"
@@ -153,10 +156,30 @@ done
 
 # A scope with no file cannot pass.
 mkdir -p "$WORK/empty_scope/other"
+git -C "$WORK/empty_scope" init -q || exit 1
 printf 'rm -f /tmp/rmlx.claim\n' >"$WORK/empty_scope/other/notes.txt"
 case_run empty_scope "no in-scope file is exit 2, not a pass" 2 "unavailable: no in-scope file" "$WORK/empty_scope"
 
 case_run missing_root "a missing scan root is exit 2" 2 "is not a directory" "$WORK/does-not-exist"
+
+# A violation inside a git-ignored file is invisible to the gate; the same
+# violation in an untracked, not-ignored file is reported.
+root="$(fresh ignored_violation)"
+printf 'scripts/hidden.sh\n' >"$root/.gitignore"
+plant "$root" scripts/hidden.sh 'rm -f /tmp/rmlx.claim'
+case_run ignored_violation "a violation in a git-ignored file is not reported" 0 - "$root"
+
+root="$(fresh untracked_violation)"
+plant "$root" scripts/visible.sh 'rm -f /tmp/rmlx.claim'
+case_run untracked_violation "the same violation, untracked but not git-ignored, is reported" \
+    1 "claim-delete: scripts/visible.sh:2:" "$root"
+
+# Outside any git work tree the scope is unknown: fail closed, exit 2.
+root="$WORK/not_a_git_tree"
+mkdir -p "$root/scripts"
+printf '#!/bin/sh\nrm -f /tmp/rmlx.claim\n' >"$root/scripts/x.sh"
+case_run not_a_git_tree "outside a git work tree the gate cannot scan: exit 2" \
+    2 "unavailable: git ls-files exit 128" "$root"
 
 echo "check-claim-bypass selftest: $PASSED passed, $FAILED failed"
 [ "$FAILED" -eq 0 ]

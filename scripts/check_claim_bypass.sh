@@ -25,11 +25,15 @@
 #
 # Scope, under the scan root: Makefile, scripts/**, .github/**,
 # crates/*/{src,tests,examples,benches}/**, docs/**/*.md, CLAUDE.md,
-# CONTRIBUTING.md, README.md. This script and its selftest are outside it.
+# CONTRIBUTING.md, README.md, intersected with the files git does not
+# ignore (tracked plus untracked-not-ignored) — a git-ignored file cannot
+# hold a violation the gate reports. This script and its selftest are
+# outside the scope.
 #
 # Usage: check_claim_bypass.sh [<scan-root>]   (default: the repo root)
 # Exit 0 = no violation. 1 = at least one violation. 2 = cannot scan (the root
-# is not a directory, or the scope holds no file).
+# is not a directory, the root is not inside a git work tree, or the scope
+# holds no file).
 
 set -uo pipefail
 export LC_ALL=C
@@ -45,15 +49,17 @@ SELF_EXCLUDE='^scripts/check_claim_bypass(_selftest)?\.sh$'
 CLAIM_OWNER='crates/rmlx-server/src/claim.rs'
 
 in_scope_files() {
-    (
-        cd "$ROOT" || exit 2
-        find . \( -name .git -o -name target -o -name .rmlx -o -name node_modules \) -prune \
-            -o -type f -print |
-            sed 's|^\./||' |
-            grep -E "$SCOPE" |
-            grep -Ev "$SELF_EXCLUDE" |
-            sort
-    )
+    local tracked rc
+    tracked="$(git -C "$ROOT" ls-files --cached --others --exclude-standard 2>&1)"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "check-claim-bypass: unavailable: git ls-files exit $rc: $tracked" >&2
+        return 2
+    fi
+    printf '%s\n' "$tracked" |
+        grep -E "$SCOPE" |
+        grep -Ev "$SELF_EXCLUDE" |
+        sort
 }
 
 # `read -d ''` and not `$(cat <<EOF)`: bash 3.2 misparses the single quote
@@ -79,6 +85,9 @@ IFS= read -r -d '' AWK_RULES <<'EOF'
 EOF
 
 files="$(in_scope_files)"
+if [ $? -eq 2 ]; then
+    exit 2
+fi
 if [ -z "$files" ]; then
     echo "check-claim-bypass: unavailable: no in-scope file under '$ROOT'" >&2
     exit 2
