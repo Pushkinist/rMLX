@@ -351,6 +351,9 @@ The `KvQuant` of a request is not tied to the model load. A running
 `rmlx serve` accepts a per-request `kv_quant` field (OpenAI route). The field
 selects the codec for that request. The weights stay resident; only the KV
 cache is rebuilt. If the field is absent, the launch `--kv-quant` applies.
+On a server running `--device cpu`, a request naming any codec but `none`
+gets HTTP 400: every MSL codec needs the GPU, and the CPU device admits
+`none` alone.
 
 The prompt and prefix cache is **partitioned by codec**, so a switch cannot
 serve mismatched cached K/V. `KvQuant::cache_key_salt()` is XOR'd into the

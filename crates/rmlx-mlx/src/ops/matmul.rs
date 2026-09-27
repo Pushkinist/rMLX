@@ -17,7 +17,7 @@ pub fn matmul(a: &Array, b: &Array, device: Device) -> Result<Array> {
         with_stream(device, |s| {
             sys::mlx_matmul(&raw mut res, a.inner, b.inner, s)
         })
-    };
+    }?;
     unsafe { check_status(status, "matmul") }?;
     Ok(Array { inner: res })
 }
@@ -279,7 +279,7 @@ fn quantized_matmul_packed(
                 s,
             )
         })
-    };
+    }?;
 
     // Do NOT free biases_arr when biases.is_none() — it is the cached null sentinel.
 
@@ -348,7 +348,7 @@ pub fn dequantize(
                 s,
             )
         })
-    };
+    }?;
 
     // Do NOT free biases_arr or global_scale — both are the cached null sentinel.
 
@@ -436,7 +436,7 @@ pub fn quantize_mode(
 
     // Check status before reading from vec_res.
     let extract_result = (|| -> Result<(Array, Array, Array)> {
-        unsafe { check_status(status, "quantize") }?;
+        unsafe { check_status(status?, "quantize") }?;
 
         // Affine emits 3 entries (codes, scales, biases); the mxfp*/nvfp4
         // codecs emit 2 (codes, scales) — biases is then left as the
@@ -546,7 +546,7 @@ pub fn gather_qmm(
                 s,
             )
         })
-    };
+    }?;
     // Do NOT free biases_arr or lhs_arr — they are the cached null sentinel.
     unsafe { check_status(status, "gather_qmm") }?;
     Ok(Array { inner: res })

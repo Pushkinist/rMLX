@@ -5,8 +5,8 @@
 // always shortcuts through the bf16-K seed materialised by `exit_prefill`,
 // so sparse-attn must stay dormant on the normal generate flow.
 //
-// Run with:
-//   pkill -f "rmlx serve"; pkill -f mlx_lm; sleep 3; rm -f /tmp/rmlx.62265.claim
+// Run with `make gpu-test CRATE=rmlx-models FILTER=sparse_attn`, which holds
+// the Metal claim, or by hand:
 //   cargo test -p rmlx-models --test sparse_attn_dispatch -- \
 //     --ignored --test-threads=1
 //

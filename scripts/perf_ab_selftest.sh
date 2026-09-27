@@ -55,6 +55,15 @@ make_stub() {
 #!/usr/bin/env bash
 # stub rmlx: $name
 set -eu
+# \`claim run -- <cmd>\`: held when the host's claim-holder shim names a holder.
+if [ "\${1:-}" = claim ]; then
+  if holder="\$(claim-holder 2>/dev/null)"; then
+    echo "rmlx: the Metal claim is held by PID \$holder" >&2
+    exit 11
+  fi
+  shift 3
+  exec "\$@"
+fi
 # Imitate the real binary's metrics behaviour, including clap's last-occurrence
 # -wins resolution of a \`global = true\` flag: \`--metrics off ... --metrics full\`
 # records. Without that, the "no runs.db written" assertion at the end of the
@@ -136,7 +145,8 @@ HOST_READING_CASES=0
 # There is no host left for either to depend on.
 #
 # The cases whose subject IS the host gating say REALHOST, and supply the whole
-# machine as `ps` and `pgrep` shims on PATH. That is enforced below rather than
+# machine as `ps` and `claim-holder` shims on PATH (the stub arms answer the
+# claim probe from the latter). That is enforced below rather than
 # trusted -- a REALHOST case missing either shim would read this host again, and
 # is counted into the tally the suite fails on at the end rather than merely
 # reported.
@@ -155,10 +165,10 @@ check() {
 	done
 
 	if [[ "$real_host" -eq 1 ]]; then
-		if [[ ! -x "$path_prefix/ps" || ! -x "$path_prefix/pgrep" ]]; then
+		if [[ ! -x "$path_prefix/ps" || ! -x "$path_prefix/claim-holder" ]]; then
 			FAILED=$((FAILED + 1))
 			HOST_READING_CASES=$((HOST_READING_CASES + 1))
-			printf '  FAIL %-26s        — REALHOST without both a ps and a pgrep shim: the case would read this machine\n' "$name"
+			printf '  FAIL %-26s        — REALHOST without both a ps and a claim-holder shim: the case would read this machine\n' "$name"
 			return
 		fi
 		REAL_HOST_CASES=$((REAL_HOST_CASES + 1))
@@ -378,7 +388,7 @@ check missing_model 125 \
 # ---- the host gates, against a machine this file supplies --------------------
 #
 # These are the only cases that leave the host gating on, and none of them looks
-# at this machine: `ps` and `pgrep` are both shimmed, so the host is whatever
+# at this machine: `ps` and `claim-holder` are both shimmed, so the host is whatever
 # the case says it is. A `--busy-pct 0` would not do instead -- `classify_window`
 # short-circuits `idle` before the threshold is applied, so on a genuinely quiet
 # runner the refusal would never fire and the case would pass having tested
@@ -398,12 +408,12 @@ echo \$((n + 1)) >"$STATE/pshog.cnt"
 printf '%6d %12s %s\n' 4242 "0:\$((n * 100)).00" /usr/local/bin/hog
 $idle_rows
 PSHOG
-printf '#!/bin/sh\nexit 1\n' >"$WORK/busybin/pgrep"
+printf '#!/bin/sh\nexit 1\n' >"$WORK/busybin/claim-holder"
 
 # A quiet machine on which something else holds the Metal context.
 mkdir -p "$WORK/servebin"
 printf '#!/usr/bin/env bash\n%s\n' "$idle_rows" >"$WORK/servebin/ps"
-printf '#!/bin/sh\necho 4243\nexit 0\n' >"$WORK/servebin/pgrep"
+printf '#!/bin/sh\necho 4243\nexit 0\n' >"$WORK/servebin/claim-holder"
 
 chmod +x "$WORK"/busybin/* "$WORK"/servebin/*
 
@@ -584,8 +594,8 @@ mkdir -p "$WORK/failbin"
 printf '#!/bin/sh\nexit 1\n' >"$WORK/failbin/ps"
 # The end-to-end case below runs with host gating on, so this directory must
 # stand in for the whole machine, not just for `ps`.
-printf '#!/bin/sh\nexit 1\n' >"$WORK/failbin/pgrep"
-chmod +x "$WORK/failbin/ps" "$WORK/failbin/pgrep"
+printf '#!/bin/sh\nexit 1\n' >"$WORK/failbin/claim-holder"
+chmod +x "$WORK/failbin/ps" "$WORK/failbin/claim-holder"
 if PATH="$WORK/failbin:$PATH" cpu_snapshot "$WORK/snap_fail" 2>/dev/null; then
 	FAILED=$((FAILED + 1))
 	printf '  FAIL %-26s        — cpu_snapshot returned success for a failing ps\n' "cpu_snapshot_reports_failure"
@@ -711,7 +721,7 @@ echo ""
 # files, with `ps` shimmed wherever a snapshot is taken), or -- the bucket that
 # must stay empty -- reached this machine.
 LOCAL_CASES=$((PASSED + FAILED - SYNTHETIC_CASES - REAL_HOST_CASES - HOST_READING_CASES))
-printf 'host inputs: %d synthetic-arm cases (the machine is not consulted); %d against a shimmed ps and pgrep; %d ran no comparison; %d read this machine.\n' \
+printf 'host inputs: %d synthetic-arm cases (the machine is not consulted); %d against a shimmed ps and claim-holder; %d ran no comparison; %d read this machine.\n' \
 	"$SYNTHETIC_CASES" "$REAL_HOST_CASES" "$LOCAL_CASES" "$HOST_READING_CASES"
 if [[ "$HOST_READING_CASES" -ne 0 ]]; then
 	echo "perf_ab selftest: FAIL — $HOST_READING_CASES case(s) can read this machine, so this suite's answer is not a property of the code" >&2

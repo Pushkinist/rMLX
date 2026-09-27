@@ -3,10 +3,10 @@
 //! Mirrors `http_smoke.rs`: a real `TcpListener` on port 0, router in a
 //! background task, raw HTTP/1.1 over `TcpStream`.
 //!
-//! No-GPU validation tests run always. The 200/shape tests require the jina
-//! snapshot + Metal and are `#[ignore]` (single-MLX-process rule — run in
-//! isolation: `cargo test --test embeddings_smoke -- --ignored
-//! --test-threads=1`).
+//! Validation tests run always, on the CPU device. The 200/shape tests need the
+//! jina snapshot and are `#[ignore]`; each shape runs once per device. The CPU
+//! cells run by hand, and the GPU cells run under `make gpu-test`, which holds
+//! the Metal claim and reports a cell whose snapshot is missing as a stand-down.
 
 #![allow(
     clippy::unwrap_used,
@@ -24,6 +24,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use rmlx_mlx::Device;
 use rmlx_server::{
     ApiErrorCounters, AppState, Generator, ItlStore, ModelLoader, ModelRegistry, NotReadyGenerator,
     SessionCache, TtftStore,
@@ -41,10 +42,11 @@ fn gemma4_e4b_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("RMLX_TEST_MODEL_GEMMA4_E4B").map(std::path::PathBuf::from)
 }
 
-fn state(registry: ModelRegistry) -> AppState {
+fn state(registry: ModelRegistry, device: Device) -> AppState {
     let loader: ModelLoader =
         Arc::new(|_p, _i| Ok(Box::new(NotReadyGenerator) as Box<dyn Generator>));
     AppState {
+        device,
         registry: Arc::new(registry),
         slots: Arc::new(parking_lot::RwLock::new(Vec::new())),
         embed_slot: Arc::new(parking_lot::RwLock::new(None)),
@@ -130,7 +132,7 @@ fn jina_registry() -> Option<ModelRegistry> {
 /// Malformed JSON body (missing required `input`) → 422 (axum serde reject).
 #[tokio::test]
 async fn malformed_body_is_422() {
-    let port = start(state(ModelRegistry::default())).await;
+    let port = start(state(ModelRegistry::default(), Device::Cpu)).await;
     let (status, _b) = post(port, "/v1/embeddings", r#"{"model":"x"}"#).await;
     assert_eq!(status, 422, "missing `input` must be a 422 serde rejection");
 }
@@ -138,7 +140,7 @@ async fn malformed_body_is_422() {
 /// Unknown model id → 404.
 #[tokio::test]
 async fn unknown_model_is_404() {
-    let port = start(state(ModelRegistry::default())).await;
+    let port = start(state(ModelRegistry::default(), Device::Cpu)).await;
     let (status, body) = post(
         port,
         "/v1/embeddings",
@@ -155,7 +157,7 @@ async fn invalid_encoding_format_is_400() {
         eprintln!("[SKIP] invalid_encoding_format_is_400: RMLX_TEST_MODEL_JINA_V4 not set");
         return;
     };
-    let port = start(state(reg)).await;
+    let port = start(state(reg, Device::Cpu)).await;
     let body = format!(r#"{{"model":"{JINA_ID}","input":"hi","encoding_format":"weird"}}"#);
     let (status, b) = post(port, "/v1/embeddings", &body).await;
     assert_eq!(status, 400, "body: {b}");
@@ -170,7 +172,7 @@ async fn non_embedding_model_is_400() {
         return;
     };
     let reg = ModelRegistry::from_paths(std::slice::from_ref(&primary_buf));
-    let port = start(state(reg)).await;
+    let port = start(state(reg, Device::Cpu)).await;
     let (status, b) = post(
         port,
         "/v1/embeddings",
@@ -181,35 +183,22 @@ async fn non_embedding_model_is_400() {
     assert!(b.contains("not an embedding model"), "body: {b}");
 }
 
-// ── GPU shape tests (ignored — single-MLX-process; run in isolation) ──────────
+// ── Shape tests (ignored — they need the jina snapshot) ──────────────────────
 //
-// Each of these posts to `/v1/embeddings`, and the handler loads the jina
-// encoder and runs the forward under `rmlx_mlx::Device::Gpu` — in THIS process,
-// on a `spawn_blocking` worker, but on the far side of an axum routing table.
-// No source shape in this file names the device and no call graph links the
-// `post(port, "/v1/embeddings", ..)` here to `embeddings()` there, so the
-// `#[ignore]` gate cannot infer the Metal context and each carries the
-// `metal-unscanned` marker instead. See docs/GPU_TESTS.md.
-//
-// The marker deliberately does NOT put them in `scripts/run_gpu_tests.sh`:
-// every one is gated on `RMLX_TEST_MODEL_JINA_V4` and returns early without it,
-// so on a machine with no jina snapshot the runner would execute five no-ops,
-// see no Metal validation banner for rmlx-server, and fail the suite over a
-// missing model. They run by hand:
+// Each shape posts to `/v1/embeddings`, and the handler loads the jina encoder
+// and runs the forward on the `AppState` device. One helper per shape takes the
+// device; each has a CPU cell and a GPU cell. Every cell is gated on
+// `RMLX_TEST_MODEL_JINA_V4` and, without it, prints `SKIP <cell>: <why>` and
+// returns, which `make gpu-test` lists as a stand-down. The GPU cells name the
+// device, so the `#[ignore]` gate classifies them and `make gpu-test` runs them;
+// the CPU cells run by hand:
 //
 //   RMLX_TEST_MODEL_JINA_V4=/abs/path/to/jinaai__jina-embeddings-v4 \
-//     cargo test -p rmlx-server --test embeddings_smoke -- --ignored --test-threads=1
+//     cargo test -p rmlx-server --test embeddings_smoke -- --ignored --test-threads=1 _cpu
 
 /// Valid single-vector request → 200 + OpenAI embeddings shape.
-// gpu-test-gate: metal-unscanned  Metal is entered inside the handler.
-#[tokio::test]
-#[ignore = "GPU Metal: cargo test --test embeddings_smoke valid_single_vector -- --ignored --test-threads=1"]
-async fn valid_single_vector_200_shape() {
-    let Some(reg) = jina_registry() else {
-        eprintln!("[SKIP] valid_single_vector_200_shape: RMLX_TEST_MODEL_JINA_V4 not set");
-        return;
-    };
-    let port = start(state(reg)).await;
+async fn valid_single_vector_200_shape(reg: ModelRegistry, device: Device) {
+    let port = start(state(reg, device)).await;
     let body = format!(r#"{{"model":"{JINA_ID}","input":"hello world"}}"#);
     let (status, b) = post(port, "/v1/embeddings", &body).await;
     assert_eq!(status, 200, "body: {b}");
@@ -223,16 +212,29 @@ async fn valid_single_vector_200_shape() {
     assert!(v["usage"]["prompt_tokens"].as_u64().unwrap() > 0);
 }
 
-/// `return_multivector:true` toggles the embedding to `[[f32;128];seq]`.
-// gpu-test-gate: metal-unscanned  Metal is entered inside the handler.
 #[tokio::test]
-#[ignore = "GPU Metal: cargo test --test embeddings_smoke return_multivector -- --ignored --test-threads=1"]
-async fn return_multivector_toggles_shape() {
+#[ignore = "needs the jina snapshot: run by hand, see the note above"]
+async fn valid_single_vector_200_shape_cpu() {
     let Some(reg) = jina_registry() else {
-        eprintln!("[SKIP] return_multivector_toggles_shape: RMLX_TEST_MODEL_JINA_V4 not set");
+        eprintln!("SKIP valid_single_vector_200_shape_cpu: RMLX_TEST_MODEL_JINA_V4 not set");
         return;
     };
-    let port = start(state(reg)).await;
+    valid_single_vector_200_shape(reg, Device::Cpu).await;
+}
+
+#[tokio::test]
+#[ignore = "GPU Metal context and the jina snapshot: run under make gpu-test"]
+async fn valid_single_vector_200_shape_gpu() {
+    let Some(reg) = jina_registry() else {
+        eprintln!("SKIP valid_single_vector_200_shape_gpu: RMLX_TEST_MODEL_JINA_V4 not set");
+        return;
+    };
+    valid_single_vector_200_shape(reg, Device::Gpu).await;
+}
+
+/// `return_multivector:true` toggles the embedding to `[[f32;128];seq]`.
+async fn return_multivector_toggles_shape(reg: ModelRegistry, device: Device) {
+    let port = start(state(reg, device)).await;
     let body =
         format!(r#"{{"model":"{JINA_ID}","input":"hello world","return_multivector":true}}"#);
     let (status, b) = post(port, "/v1/embeddings", &body).await;
@@ -244,26 +246,59 @@ async fn return_multivector_toggles_shape() {
     assert_eq!(row0.len(), 128, "each token row width == 128");
 }
 
+#[tokio::test]
+#[ignore = "needs the jina snapshot: run by hand, see the note above"]
+async fn return_multivector_toggles_shape_cpu() {
+    let Some(reg) = jina_registry() else {
+        eprintln!("SKIP return_multivector_toggles_shape_cpu: RMLX_TEST_MODEL_JINA_V4 not set");
+        return;
+    };
+    return_multivector_toggles_shape(reg, Device::Cpu).await;
+}
+
+#[tokio::test]
+#[ignore = "GPU Metal context and the jina snapshot: run under make gpu-test"]
+async fn return_multivector_toggles_shape_gpu() {
+    let Some(reg) = jina_registry() else {
+        eprintln!("SKIP return_multivector_toggles_shape_gpu: RMLX_TEST_MODEL_JINA_V4 not set");
+        return;
+    };
+    return_multivector_toggles_shape(reg, Device::Gpu).await;
+}
+
 /// Invalid matryoshka `dimensions` (not in {128,256,512,1024,2048}) → 400.
 ///
 /// Unlike the other 400s in this file, this one is NOT a request-validation
 /// rejection: the handler defers `dimensions` to the model's matryoshka set, so
 /// the check runs in `pooling::single_vector` — after the encoder is loaded and
-/// after a full `Device::Gpu` forward. The 400 is the tail of a GPU round trip,
-/// which is why it needs the snapshot and the Metal context.
-// gpu-test-gate: metal-unscanned  Metal is entered inside the handler.
-#[tokio::test]
-#[ignore = "GPU Metal: cargo test --test embeddings_smoke invalid_dimensions -- --ignored --test-threads=1"]
-async fn invalid_dimensions_is_400() {
-    let Some(reg) = jina_registry() else {
-        eprintln!("[SKIP] invalid_dimensions_is_400: RMLX_TEST_MODEL_JINA_V4 not set");
-        return;
-    };
-    let port = start(state(reg)).await;
+/// after a full forward. The 400 is the tail of a model round trip, which is
+/// why it needs the snapshot.
+async fn invalid_dimensions_is_400(reg: ModelRegistry, device: Device) {
+    let port = start(state(reg, device)).await;
     let body = format!(r#"{{"model":"{JINA_ID}","input":"hi","dimensions":384}}"#);
     let (status, b) = post(port, "/v1/embeddings", &body).await;
     assert_eq!(status, 400, "body: {b}");
     assert!(b.contains("invalid truncate_dim"), "body: {b}");
+}
+
+#[tokio::test]
+#[ignore = "needs the jina snapshot: run by hand, see the note above"]
+async fn invalid_dimensions_is_400_cpu() {
+    let Some(reg) = jina_registry() else {
+        eprintln!("SKIP invalid_dimensions_is_400_cpu: RMLX_TEST_MODEL_JINA_V4 not set");
+        return;
+    };
+    invalid_dimensions_is_400(reg, Device::Cpu).await;
+}
+
+#[tokio::test]
+#[ignore = "GPU Metal context and the jina snapshot: run under make gpu-test"]
+async fn invalid_dimensions_is_400_gpu() {
+    let Some(reg) = jina_registry() else {
+        eprintln!("SKIP invalid_dimensions_is_400_gpu: RMLX_TEST_MODEL_JINA_V4 not set");
+        return;
+    };
+    invalid_dimensions_is_400(reg, Device::Gpu).await;
 }
 
 /// A deterministic 64x48 synthetic-gradient PNG, base64 — exactly the image
@@ -273,16 +308,9 @@ const TEST_IMG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAEAAAAAwCAIAAAAuKetIAAAA5UlE
 
 /// Image input (single-vector): `{"input":{"image":"data:...;base64,..."}}`
 /// → 200 + 2048-d float vector. End-to-end exercise of the M-RoPE + merge +
-/// image-span pooling path (GPU; single-MLX-process).
-// gpu-test-gate: metal-unscanned  Metal is entered inside the handler.
-#[tokio::test]
-#[ignore = "GPU Metal: cargo test --test embeddings_smoke image_single_vector -- --ignored --test-threads=1"]
-async fn image_single_vector_200_shape() {
-    let Some(reg) = jina_registry() else {
-        eprintln!("[SKIP] image_single_vector_200_shape: RMLX_TEST_MODEL_JINA_V4 not set");
-        return;
-    };
-    let port = start(state(reg)).await;
+/// image-span pooling path.
+async fn image_single_vector_200_shape(reg: ModelRegistry, device: Device) {
+    let port = start(state(reg, device)).await;
     let body = format!(
         r#"{{"model":"{JINA_ID}","input":{{"image":"data:image/png;base64,{TEST_IMG_B64}"}}}}"#
     );
@@ -296,17 +324,30 @@ async fn image_single_vector_200_shape() {
     assert!(emb[0].is_f64(), "elements are floats");
 }
 
-/// Image input with `return_multivector:true` → `[[f32;128];seq]` (one row
-/// per token of the expanded image sequence).
-// gpu-test-gate: metal-unscanned  Metal is entered inside the handler.
 #[tokio::test]
-#[ignore = "GPU Metal: cargo test --test embeddings_smoke image_multivector -- --ignored --test-threads=1"]
-async fn image_multivector_toggles_shape() {
+#[ignore = "needs the jina snapshot: run by hand, see the note above"]
+async fn image_single_vector_200_shape_cpu() {
     let Some(reg) = jina_registry() else {
-        eprintln!("[SKIP] image_multivector_toggles_shape: RMLX_TEST_MODEL_JINA_V4 not set");
+        eprintln!("SKIP image_single_vector_200_shape_cpu: RMLX_TEST_MODEL_JINA_V4 not set");
         return;
     };
-    let port = start(state(reg)).await;
+    image_single_vector_200_shape(reg, Device::Cpu).await;
+}
+
+#[tokio::test]
+#[ignore = "GPU Metal context and the jina snapshot: run under make gpu-test"]
+async fn image_single_vector_200_shape_gpu() {
+    let Some(reg) = jina_registry() else {
+        eprintln!("SKIP image_single_vector_200_shape_gpu: RMLX_TEST_MODEL_JINA_V4 not set");
+        return;
+    };
+    image_single_vector_200_shape(reg, Device::Gpu).await;
+}
+
+/// Image input with `return_multivector:true` → `[[f32;128];seq]` (one row
+/// per token of the expanded image sequence).
+async fn image_multivector_toggles_shape(reg: ModelRegistry, device: Device) {
+    let port = start(state(reg, device)).await;
     let body = format!(
         r#"{{"model":"{JINA_ID}","input":[{{"image":"data:image/png;base64,{TEST_IMG_B64}"}}],"return_multivector":true}}"#
     );
@@ -320,4 +361,24 @@ async fn image_multivector_toggles_shape() {
         128,
         "each token row width == 128"
     );
+}
+
+#[tokio::test]
+#[ignore = "needs the jina snapshot: run by hand, see the note above"]
+async fn image_multivector_toggles_shape_cpu() {
+    let Some(reg) = jina_registry() else {
+        eprintln!("SKIP image_multivector_toggles_shape_cpu: RMLX_TEST_MODEL_JINA_V4 not set");
+        return;
+    };
+    image_multivector_toggles_shape(reg, Device::Cpu).await;
+}
+
+#[tokio::test]
+#[ignore = "GPU Metal context and the jina snapshot: run under make gpu-test"]
+async fn image_multivector_toggles_shape_gpu() {
+    let Some(reg) = jina_registry() else {
+        eprintln!("SKIP image_multivector_toggles_shape_gpu: RMLX_TEST_MODEL_JINA_V4 not set");
+        return;
+    };
+    image_multivector_toggles_shape(reg, Device::Gpu).await;
 }

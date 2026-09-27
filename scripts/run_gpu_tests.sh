@@ -166,6 +166,7 @@ usage() {
 Usage: run_gpu_tests.sh [--crate <name>] [--filter <substring>]
                         [--half codec|rest]
                         [--shader-validation | --no-shader-validation]
+       run_gpu_tests.sh --build [narrowing options as for the run]
        run_gpu_tests.sh --preflight
 
   --crate <name>          restrict to one workspace member (e.g. rmlx-kv-quant)
@@ -175,9 +176,12 @@ Usage: run_gpu_tests.sh [--crate <name>] [--filter <substring>]
   --shader-validation     instrument every Metal pipeline and fail on an invalid
                           memory access (default)
   --no-shader-validation  run the tests uninstrumented
+  --build                 compile every test binary the same options would
+                          run, and run none; the run that follows compiles
+                          nothing, and fails if it has to
   --preflight             check only the environment preconditions (no GPU
-                          variable set, no competing MLX process, a non-empty
-                          classification) and exit; runs no tests
+                          skip variable set, a non-empty classification) and
+                          exit; runs no tests
 USAGE
 }
 
@@ -186,6 +190,7 @@ FILTER=""
 HALF=""
 SHADER_VALIDATION=1
 PREFLIGHT=0
+BUILD_ONLY=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --crate)  ONLY_CRATE="${2:?--crate needs a value}"; shift 2 ;;
@@ -194,6 +199,7 @@ while [ $# -gt 0 ]; do
         --shader-validation)    SHADER_VALIDATION=1; shift ;;
         --no-shader-validation) SHADER_VALIDATION=0; shift ;;
         --preflight) PREFLIGHT=1; shift ;;
+        --build) BUILD_ONLY=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "ERROR: unknown argument '$1'" >&2; usage >&2; exit 1 ;;
     esac
@@ -352,19 +358,6 @@ elif [ ! -d "${RMLX_O_MODELS_ROOT}" ]; then
     snapshot_root_note="RMLX_O_MODELS_ROOT='${RMLX_O_MODELS_ROOT}' does not exist — every snapshot-gated cell skipped and counted as passed"
 fi
 
-# CLAUDE.md hard rule 8 — a single MLX process per Mac. These tests build their
-# own Metal context; a co-resident server already holding the GPU makes any
-# failure here unattributable. Refuse rather than pkill: killing a process this
-# script does not own is not its call.
-if pgrep -f 'rmlx serve|mlx_lm|paroquant|omlx' >/dev/null 2>&1; then
-    echo "ERROR: another MLX process is live — the GPU tests need the Metal context to themselves." >&2
-    pgrep -fl 'rmlx serve|mlx_lm|paroquant|omlx' >&2 || true
-    echo >&2
-    echo "Stop it first, e.g.:" >&2
-    echo "  pkill -f 'rmlx serve'; pkill -f mlx_lm; rm -f /tmp/rmlx.*.claim" >&2
-    exit 1
-fi
-
 listing="$(bash "${REPO_ROOT}/scripts/check_gpu_tests_ignored.sh" --list)"
 if [ -z "${listing}" ]; then
     echo "ERROR: check_gpu_tests_ignored.sh --list produced no GPU tests." >&2
@@ -372,14 +365,15 @@ if [ -z "${listing}" ]; then
 fi
 
 # Everything above this line is a precondition on the environment rather than a
-# test: the two refusals and a non-empty classification, all of them
+# test: the skip-variable refusal and a non-empty classification, both of them
 # milliseconds. `--preflight` stops here so a caller that is about to spend a
 # long time on something else can find out FIRST that this suite would refuse to
 # start. `make ci-perf` runs it before its release-perf half for exactly that
-# reason — discovering a live `rmlx serve` after the workspace suite has already
-# run wastes the whole of it.
+# reason. Whether the GPU is free is the Metal claim's question, not this
+# script's: `make gpu-test` and `make ci-perf` run the suite under
+# `rmlx claim run`, which refuses with exit 11 while another process holds it.
 if [ "${PREFLIGHT}" = "1" ]; then
-    echo "preflight OK: GPU free, no skip variable, $(printf '%s\n' "${listing}" | grep -c '') tests classified."
+    echo "preflight OK: no skip variable, $(printf '%s\n' "${listing}" | grep -c '') tests classified."
     [ -n "${snapshot_root_note}" ] && echo "preflight WARNING: ${snapshot_root_note}." >&2
     exit 0
 fi
@@ -474,6 +468,42 @@ if [ ${#crates[@]} -eq 0 ]; then
     exit 1
 fi
 
+# `env` prefix, not `export`: the validation settings apply to the test process
+# and nothing else, and the empty-valued DISABLE_PIPELINES entry overrides a
+# stale export rather than merging with it. The prefix keeps a bare `env` when
+# validation is off, because expanding an empty array is an unbound-variable
+# error under `set -u` on the bash 3.2 that `/usr/bin/env bash` resolves to
+# here.
+validation_prefix=(env)
+[ "${SHADER_VALIDATION}" = "1" ] &&
+    validation_prefix=(env ${mtl_unset[@]+"${mtl_unset[@]}"} "${mtl_validation_env[@]}")
+
+# The run holds the machine-wide Metal claim, and every process it starts
+# inherits it. A compiler, a build script or a daemon one of them starts (a
+# compiler cache server) would hold the claim for as long as it lives, so every
+# binary is compiled here, outside the claim, under the same environment and
+# flags the run uses; the run then only fingerprint-checks and executes.
+if [ "${BUILD_ONLY}" = "1" ]; then
+    build_failed=""
+    if [ "${SHADER_VALIDATION}" = "1" ]; then
+        "${validation_prefix_canary[@]}" cargo test --no-run -p rmlx-kv-quant \
+            --features shader-validation-canary --lib || build_failed="${build_failed} canary"
+    fi
+    for crate in "${crates[@]}"; do
+        "${validation_prefix[@]}" cargo test --no-run -p "${crate}" --tests ||
+            build_failed="${build_failed} ${crate}"
+    done
+    if [ -n "${build_failed}" ]; then
+        echo "ERROR: the GPU test binaries did not build:${build_failed}" >&2
+        exit 1
+    fi
+    echo "build OK: ${#crates[@]} crate(s) compiled; the run compiles nothing."
+    exit 0
+fi
+
+# Cargo prints this status line for every crate it compiles.
+COMPILED_LINE='^[[:space:]]*Compiling [A-Za-z0-9_-]+ v'
+
 failed_crates=""
 total_passed=0
 total_failed=0
@@ -500,6 +530,11 @@ if [ "${SHADER_VALIDATION}" = "1" ]; then
     "${validation_prefix_canary[@]}" cargo test --no-fail-fast -p rmlx-kv-quant \
         --features shader-validation-canary --lib -- \
         --ignored --test-threads=1 "${CANARY_TEST}" >"${canary_log}" 2>&1
+    if grep -Eq "${COMPILED_LINE}" "${canary_log}"; then
+        echo "ERROR: the canary compiled under the Metal claim; run with --build first." >&2
+        echo "  Log: ${canary_log}" >&2
+        exit 1
+    fi
     if ! grep -Eq "${VALIDATION_DIAGNOSTIC}" "${canary_log}"; then
         echo "ERROR: the out-of-bounds canary produced no diagnostic this scan would" >&2
         echo "  match, so a clean scan proves nothing. Either the canary did not run" >&2
@@ -559,15 +594,6 @@ for crate in "${crates[@]}"; do
     # after the first test binary that fails, so every later binary in the crate
     # silently never runs and the coverage shortfall reports as "a filter
     # stopped matching" when the real cause was an earlier failure.
-    # `env` prefix, not `export`: the validation settings apply to the test
-    # process and nothing else, and the empty-valued DISABLE_PIPELINES entry
-    # overrides a stale export rather than merging with it. The prefix keeps a
-    # bare `env` when validation is off, because expanding an empty array is an
-    # unbound-variable error under `set -u` on the bash 3.2 that
-    # `/usr/bin/env bash` resolves to here.
-    validation_prefix=(env)
-    [ "${SHADER_VALIDATION}" = "1" ] &&
-        validation_prefix=(env ${mtl_unset[@]+"${mtl_unset[@]}"} "${mtl_validation_env[@]}")
     # `--nocapture` because this gate reads the tests' own words. libtest
     # discards a passing test's output, and a model-gated cell that skips is a
     # passing test — so without it the `SKIP <name>:` notice the census
@@ -576,6 +602,9 @@ for crate in "${crates[@]}"; do
     "${validation_prefix[@]}" cargo test --no-fail-fast -p "${crate}" --tests -- \
         --ignored --test-threads=1 --nocapture "${filters[@]}" 2>&1 | tee "${log}"
     rc=${PIPESTATUS[0]}
+    if grep -Eq "${COMPILED_LINE}" "${log}"; then
+        failed_crates="${failed_crates}  ${crate}: compiled under the Metal claim (run --build first)"$'\n'
+    fi
 
     counts="$(awk '
         /^test result:/ {
@@ -600,13 +629,9 @@ for crate in "${crates[@]}"; do
         f && /^    [A-Za-z_][A-Za-z0-9_:]*$/ { print $1 }
     ' "${log}" | sort -u)"
 
+    crate_banner=0
+    grep -qF "${VALIDATION_BANNER}" "${log}" && crate_banner=1
     if [ "${SHADER_VALIDATION}" = "1" ]; then
-        # Per crate, matching the coverage check's granularity. A single global
-        # OR would let one crate's banner vouch for a crate whose tests all
-        # returned before creating a Metal device.
-        if ! grep -qF "${VALIDATION_BANNER}" "${log}"; then
-            failed_crates="${failed_crates}  ${crate}: ran uninstrumented (no validation banner)"$'\n'
-        fi
         # Split first, then match. The layer writes to stderr while libtest is
         # mid-line, so reports routinely share an output line, and the detector's
         # bounded `.{0,120}` is greedy: with a short kernel name the second
@@ -640,8 +665,22 @@ for crate in "${crates[@]}"; do
     # with libtest's `test <name> ... ` prefix under --nocapture, so this is not
     # line-anchored; a validation diagnostic can land appended to it, so the
     # reason is cut there rather than carrying a second event's text.
-    crate_skips="$(grep -Eo "${NAMED_SKIP}.*" "${log}" \
-        | sed -E 's/Invalid (device|threadgroup).*$//; s/[[:space:]]+$//' | sort -u)"
+    #
+    # A notice speaks for the test whose output it is in: the one whose
+    # `test <path> ... ` line came last, with --test-threads=1. A notice naming
+    # any other test is not an attribution, however that test is spelled, or a
+    # cell that printed its sibling's name would stand the sibling down while
+    # the sibling ran.
+    crate_notices="$(awk -v named="${NAMED_SKIP}" '
+        /^test [^ ]+ \.\.\. / { cur = $2; sub(/.*::/, "", cur) }
+        match($0, named) {
+            notice = substr($0, RSTART)
+            name = substr($0, RSTART + 5, RLENGTH - 6)
+            print (name == cur ? "A" : "U") "\t" notice
+        }' "${log}" | sed -E 's/Invalid (device|threadgroup).*$//; s/[[:space:]]+$//')"
+    n_unattributed=$((n_unattributed + $(printf '%s\n' "${crate_notices}" | grep -c $'^U\t')))
+    crate_skips="$(printf '%s\n' "${crate_notices}" | sed -n $'s/^A\t//p' | sort -u)"
+    crate_stood_down=""
     while IFS= read -r notice; do
         [ -z "${notice}" ] && continue
         skip_test="${notice%%:*}"
@@ -657,6 +696,7 @@ for crate in "${crates[@]}"; do
             *) n_unattributed=$((n_unattributed + 1)); continue ;;
         esac
         stood_down="${stood_down}  ${crate} ${skip_test}: ${notice#*: }"$'\n'
+        crate_stood_down="${crate_stood_down}${skip_test}"$'\n'
         validation_skips="${validation_skips}${crate}"$'\t'"${skip_test}"$'\n'
         n_stood_down=$((n_stood_down + 1))
     done <<< "${crate_skips}"
@@ -689,6 +729,17 @@ for crate in "${crates[@]}"; do
     if [ "${executed}" -lt "${classified}" ]; then
         echo "ERROR: ${crate} classified ${classified} GPU tests but executed ${executed} — a filter stopped matching." >&2
         failed_crates="${failed_crates}  ${crate}: under-matched (${executed}/${classified} executed)"$'\n'
+    fi
+
+    # Per crate, matching the coverage check's granularity: a single global OR
+    # would let one crate's banner vouch for a crate whose tests all returned
+    # before creating a Metal device. The one crate that may lack it is one
+    # whose every executed test named its own stand-down: nothing in it reached
+    # Metal, and each cell is already listed and marks the run INCOMPLETE.
+    n_crate_stood_down="$(printf '%s' "${crate_stood_down}" | sort -u | grep -c '.')"
+    if [ "${SHADER_VALIDATION}" = "1" ] && [ "${crate_banner}" = "0" ] &&
+        { [ "${executed}" -eq 0 ] || [ "${n_crate_stood_down}" -lt "${executed}" ]; }; then
+        failed_crates="${failed_crates}  ${crate}: ran uninstrumented (no validation banner)"$'\n'
     fi
     if [ "${rc}" -ne 0 ]; then
         failed_crates="${failed_crates}  ${crate}:"$'\n'

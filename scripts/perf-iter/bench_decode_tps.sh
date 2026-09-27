@@ -22,9 +22,9 @@
 #   --repeat N   — override MEASURE_RUNS (useful for stable per-finding numbers;
 #                  perf-book ch 2 recommends N>=5 before committing a finding)
 #
-# CLAUDE.md mandatory pre-flight (single-MLX-process rule):
-#   pkill -f "rmlx serve"; pkill -f mlx_lm; pkill -f paroquant; pkill -f omlx;
-#   sleep 5; rm -f /tmp/rmlx.<port>.claim
+# Single MLX process per Mac: the server takes the Metal claim. A claim another
+# process holds makes it exit 11 at startup naming the holder, and this script
+# stops. It stops only the server it started.
 #
 # Measurement basis:
 #   decode_tps is the rate the server measured for each request over that
@@ -155,17 +155,6 @@ if [[ -z "${RMLX_BIN:-}" ]]; then
         die "rmlx binary not found; build first with 'make build'"
     fi
 fi
-
-# ── Pre-flight (CLAUDE.md mandatory) ─────────────────────────────────────────
-
-log "Pre-flight: killing any existing rmlx/mlx_lm/paroquant/omlx processes..."
-pkill -f "rmlx serve" 2>/dev/null || true
-pkill -f mlx_lm      2>/dev/null || true
-pkill -f paroquant   2>/dev/null || true
-pkill -f omlx        2>/dev/null || true
-sleep 5
-rm -f "/tmp/rmlx.${PORT}.claim"
-log "Pre-flight done."
 
 # ── Verify binary + model ─────────────────────────────────────────────────────
 
@@ -494,5 +483,4 @@ fi
 log "Stopping server (PID ${SERVER_PID})..."
 kill "${SERVER_PID}" 2>/dev/null || true
 wait "${SERVER_PID}" 2>/dev/null || true
-rm -f "/tmp/rmlx.${PORT}.claim"
 log "Done."

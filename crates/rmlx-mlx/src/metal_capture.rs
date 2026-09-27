@@ -47,7 +47,7 @@ use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-use crate::{check_status, install_error_handler, sys, Result};
+use crate::{check_gpu_allowed, check_status, install_error_handler, sys, Result};
 use rmlx_core::error::Error;
 
 // ---------------------------------------------------------------------------
@@ -72,8 +72,9 @@ impl CaptureScope {
     /// Start a Metal capture writing to `path`.
     ///
     /// Returns `Err` if the capture layer is not inserted, the path already
-    /// exists, or Metal is unavailable.
+    /// exists, Metal is unavailable, or the process forbade the GPU.
     pub(crate) fn start(path: &Path) -> Result<Self> {
+        check_gpu_allowed("metal_capture::start")?;
         install_error_handler();
         let path_str = path.to_str().ok_or_else(|| {
             Error::Mlx(format!(

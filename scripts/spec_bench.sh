@@ -38,12 +38,26 @@
 #   comparison does not apply, and both rows say so in `answer_check`.
 #
 # Hard constraints honoured:
-#   - Preflight (pkill + claim-file delete) before each server start
-#   - Single server process at a time; killed explicitly between phases
+#   - Single server process at a time; the script stops the server it started
+#     (kill + wait on its PID) between phases. A claim some other process holds
+#     stops the run with the server's exit status (11).
 #   - 1 warmup + 3 measured requests per config; 5 s sleep between requests
 #   - All inserts go through `rmlx metrics record --file` (no direct sqlite writes)
 
 set -euo pipefail
+
+# The server this run started and has not yet stopped. Any exit — a failed
+# command under `set -e`, an interrupt, a CI timeout — stops it and waits, so no
+# failure leaves it holding the Metal claim.
+LIVE_PID=""
+stop_live_server() {
+    if [[ -n "${LIVE_PID}" ]]; then
+        kill "${LIVE_PID}" 2>/dev/null || true
+        wait "${LIVE_PID}" 2>/dev/null || true
+        LIVE_PID=""
+    fi
+}
+trap stop_live_server EXIT
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
@@ -588,8 +602,6 @@ PYEOF
 echo "==> Phase 1: normal decode (no drafter)"
 echo ""
 
-preflight
-
 snapshot_logs
 
 echo "  [server] starting..." >&2
@@ -604,9 +616,10 @@ RMLX_LOG_CAP_MB=200 \
         > "${SCRATCH_DIR}/normal_stdout.txt" 2>&1 &
 
 SERVER_PID=$!
+LIVE_PID="${SERVER_PID}"
 echo "  [server] pid=${SERVER_PID}" >&2
 
-wait_for_server
+wait_for_server "${SERVER_PID}"
 
 echo "  [normal] warmup..." >&2
 for i in $(seq 1 ${WARMUP_RUNS}); do
@@ -670,6 +683,7 @@ done
 echo "  [server] killing pid=${SERVER_PID}" >&2
 kill "${SERVER_PID}" 2>/dev/null || true
 wait "${SERVER_PID}" 2>/dev/null || true
+LIVE_PID=""
 sleep 3
 
 NORMAL_LOG="$(phase_log "${SERVER_PID}")" || NORMAL_LOG=""
@@ -742,8 +756,6 @@ echo ""
 echo "==> Phase 2: speculative decode (draft_kind=${DRAFT_KIND} block_size=${DRAFT_BLOCK_SIZE:-engine})"
 echo ""
 
-preflight
-
 snapshot_logs
 
 echo "  [server] starting speculative server..." >&2
@@ -761,9 +773,10 @@ RMLX_LOG_CAP_MB=200 \
         > "${SCRATCH_DIR}/mtp_stdout.txt" 2>&1 &
 
 SERVER_PID=$!
+LIVE_PID="${SERVER_PID}"
 echo "  [server] pid=${SERVER_PID}" >&2
 
-wait_for_server
+wait_for_server "${SERVER_PID}"
 
 echo "  [spec] warmup..." >&2
 for i in $(seq 1 ${WARMUP_RUNS}); do
@@ -812,6 +825,7 @@ done
 echo "  [server] killing speculative server pid=${SERVER_PID}" >&2
 kill "${SERVER_PID}" 2>/dev/null || true
 wait "${SERVER_PID}" 2>/dev/null || true
+LIVE_PID=""
 sleep 3
 
 # The log this phase's server created. No fallback to "the newest one": a

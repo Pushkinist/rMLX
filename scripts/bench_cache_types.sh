@@ -7,13 +7,16 @@
 # RunRecord into <RMLX_HOME>/metrics/runs.db.
 #
 # Per combo:
-#   1. Cleanup (pkill rmlx serve, wait drain ≤30s, rm claim files).
-#   2. Smoke probe: short generation via `rmlx baseline`. Reject empty /
+#   1. Smoke probe: short generation via `rmlx baseline`. Reject empty /
 #      non-UTF-8 / 4-gram-repeat-heavy output. On fail, write a §8.5 record
 #      with notes "status=smoke_fail" and skip the cell.
-#   3. Call `scripts/bench_cell.sh` for the real measurement.
-#   4. Exit code 78 from `scripts/bench_cell.sh` (unsupported resolver combo) =>
+#   2. Call `scripts/bench_cell.sh` for the real measurement.
+#   3. Exit code 78 from `scripts/bench_cell.sh` (unsupported resolver combo) =>
 #      write a "status=skip" record and continue.
+#
+# Every step is a one-shot `rmlx` command that holds the Metal claim for its own
+# run, so nothing here stops a process. A claim another process holds fails the
+# step with exit 11 and names the holder.
 #
 # Usage:
 #   scripts/bench_cache_types.sh MODEL_PATH ARCH_CLASS [WEIGHT_BITS] [PROMPT_TOKENS]
@@ -142,15 +145,6 @@ printf "%s\t%s\t%s\t%s\t%s\n" "label" "kv_quant" "decode_tps" "decode_stddev" "s
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-cleanup_runtime() {
-  pkill -f "rmlx serve" 2>/dev/null || true
-  # Wait for drain ≤ 30s (script-level safety net; do not exit on timeout).
-  timeout 30 bash -c '
-    until ! pgrep -f "rmlx serve" >/dev/null 2>&1; do sleep 0.2; done
-  ' 2>/dev/null || true
-  rm -f /tmp/rmlx.*.claim 2>/dev/null || true
-}
 
 # Emit a §8.5 RunRecord JSON for skip / smoke_fail cases.
 #  $1 = canonical kv_quant string
@@ -379,10 +373,7 @@ for entry in "${COMBOS[@]}"; do
     planar4) KV_CANON_OVERRIDE="planar"; KV_CANON="planar" ;;
   esac
 
-  # 1. Cleanup before this cell.
-  cleanup_runtime
-
-  # 2. Smoke probe.
+  # 1. Smoke probe.
   if ! run_smoke_probe "$CTK_VAL" "$CTV_VAL" "$KV_ARG"; then
     rc=$?
     if [ "$SMOKE_REASON" = "resolver_skip" ]; then
@@ -399,13 +390,10 @@ for entry in "${COMBOS[@]}"; do
       emit_status_record "$KV_CANON" "$_emit_status" "$LABEL" "reason=$SMOKE_REASON"
       printf "%s\t%s\t%s\t%s\t%s\n" "$LABEL" "$KV_CANON" "" "" "$_emit_status" >>"$SUMMARY_FILE"
     fi
-    cleanup_runtime
     continue
   fi
 
-  cleanup_runtime
-
-  # 3. Real measurement via scripts/bench_cell.sh.
+  # 2. Real measurement via scripts/bench_cell.sh.
   CELL_LOG=$(mktemp /tmp/cell_${TAG_BASE}_${LABEL}.XXXXXX)
   CTK="$CTK_VAL" \
   CTV="$CTV_VAL" \
@@ -456,8 +444,6 @@ for entry in "${COMBOS[@]}"; do
       printf "%s\t%s\t%s\t%s\t%s\n" "$LABEL" "$KV_CANON" "" "" "fail_rc${CELL_RC}" >>"$SUMMARY_FILE"
       ;;
   esac
-
-  cleanup_runtime
 done
 
 # ---------------------------------------------------------------------------

@@ -46,7 +46,7 @@
 //!
 //! # Single-process GPU claim
 //!
-//! Per CLAUDE.md, callers must hold `/tmp/rmlx.<port>.claim` before dispatching.
+//! Per CLAUDE.md, callers must hold the Metal claim before dispatching.
 
 use std::fmt::Write as _;
 use std::sync::OnceLock;

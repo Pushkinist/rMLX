@@ -242,11 +242,32 @@ before any other mlx-c call can overwrite the slot.
 
 ### Default stream
 
-`with_stream(device, |s| …)` borrows the device's default stream through
-`mlx_default_gpu_stream_new` / `mlx_default_cpu_stream_new`, a ref-counted
-handle, and frees the handle after the closure. It never creates a stream:
-MLX backs every stream with an OS thread it never reclaims, so per-op stream
-creation exhausts the thread limit.
+`with_stream(device, |s| …) -> Result<T>` borrows the device's default stream
+through `mlx_default_gpu_stream_new` / `mlx_default_cpu_stream_new`, a
+ref-counted handle, and frees the handle after the closure. It never creates
+a stream: MLX backs every stream with an OS thread it never reclaims, so
+per-op stream creation exhausts the thread limit. For the GPU device it
+checks the latch below first.
+
+### The CPU-device latch
+
+`parse_device` calls `rmlx_mlx::forbid_gpu()` once, before any model work,
+when it resolves a device with no claim. `ClaimedDevice::cpu()` is a plain
+`const fn` and calls nothing; `qwen36_diag`'s `cpu` arm calls `forbid_gpu()`
+too, its own device decision. The call sets one process-global `AtomicBool`
+irreversibly. These calls check it first, returning
+`Err(Error::GpuForbidden { op })`, not the mlx-c call:
+`with_stream(Device::Gpu, ..)`, `ensure_gpu_default_stream()`, every
+`rmlx_mlx::metal` fn, and `CaptureScope::start`.
+
+**Guarantee.** Under `--device cpu`, no rmlx op runs on a GPU stream, and no
+rmlx Metal API is called. A KV codec carrying MSL, and `--gpu-capture`, are
+refused before the model load; any other GPU request returns `GpuForbidden`.
+
+Outside it: MLX's allocator opens an `MTLDevice` on first allocation either
+way — `metal::allocator()` backs every array buffer. `default_device()` is
+the GPU whenever Metal is available, and an MLX-internal GPU-stream request
+outside rMLX's two sites is uncovered.
 
 ### Per-thread GPU stream context — `ensure_gpu_default_stream`
 
@@ -256,9 +277,9 @@ streams created on that thread. A tokio blocking-pool worker never creates
 one, so its `Array::eval()` fails with
 `There is no Stream(gpu, N) in current thread.`.
 
-`rmlx_mlx::ensure_gpu_default_stream()` creates a GPU stream on the calling
-thread, sets it as the thread's default, and keeps the handle in a
-thread-local for the thread's life. It is idempotent and a no-op when the GPU
+`rmlx_mlx::ensure_gpu_default_stream() -> Result<()>` creates a GPU stream on
+the calling thread, sets it as the thread's default, and keeps the handle in
+a thread-local for the thread's life. It is idempotent and a no-op when the GPU
 is unavailable.
 
 ### Per-thread CPU stream context — `ensure_cpu_default_stream`

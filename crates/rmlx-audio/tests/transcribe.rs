@@ -67,7 +67,7 @@ fn whisper_paths() -> Option<(PathBuf, PathBuf)> {
 
 fn load_transcriber() -> Option<Transcriber> {
     let (model_path, tok_path) = whisper_paths()?;
-    rmlx_mlx::ensure_gpu_default_stream();
+    rmlx_mlx::ensure_gpu_default_stream().expect("GPU default stream");
     let model = WhisperModel::load(&model_path).expect("load whisper model");
     let tokenizer = WhisperTokenizer::from_path(&tok_path).expect("load tokenizer");
     Some(Transcriber::new(Arc::new(model), Arc::new(tokenizer)).expect("transcriber"))

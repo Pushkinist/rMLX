@@ -1,6 +1,6 @@
 // CLI binary: user-facing output. tracing not appropriate for command results.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
-// unsafe_code: POSIX libc FFI — libc::kill (process-liveness probe) + libc::statvfs (disk-space check)
+// unsafe_code: POSIX libc FFI — libc::statvfs (disk-space check)
 #![allow(unsafe_code)]
 #![allow(trivial_numeric_casts)]
 
@@ -21,13 +21,15 @@
 //!
 //! ## MLX safety
 //! Default path (no `--full`) never loads the MLX runtime — safe to run
-//! repeatedly with no Metal context concern. `--full` invokes the smoke probe
-//! which DOES load MLX; the caller is responsible for the single-process
-//! constraint (do not run `--full` while another rMLX instance holds Metal).
+//! repeatedly with no Metal context concern. `--full` takes the Metal claim
+//! for the smoke probes and holds it until the last one ends; when another
+//! process holds the claim, every smoke line is red and names the holder.
 
 use std::path::{Path, PathBuf};
 
-use rmlx_server::{ModelRegistry, RegistryConfig};
+use rmlx_server::{ClaimError, ModelRegistry, RegistryConfig};
+
+use crate::commands::parse::ClaimedDevice;
 use tracing::debug;
 
 // ---------------------------------------------------------------------------
@@ -106,8 +108,11 @@ pub(crate) fn run_healthcheck(
     let mut red_checks: Vec<String> = Vec::new();
 
     // ── 1. Claim check ────────────────────────────────────────────────────────
+    let mut server_probe = None;
     if let Some(p) = port {
-        let line = check_claim(p);
+        let probe = rmlx_server::probe_claim();
+        let line = claim_line(&probe);
+        server_probe = Some(probe);
         if line.status == Status::Red {
             red_checks.push(line.check.clone());
         }
@@ -135,8 +140,17 @@ pub(crate) fn run_healthcheck(
 
         // ── 4. Smoke probe (--full only) ──────────────────────────────────────
         if full {
-            for path in &model_paths {
-                let line = check_smoke(path);
+            let holder = server_probe
+                .as_ref()
+                .and_then(|probe| probe.as_ref().err())
+                .filter(|e| matches!(e, ClaimError::AlreadyHeld { .. }));
+            let lines = smoke_lines(
+                &model_paths,
+                holder,
+                crate::commands::parse::claim_gpu,
+                check_smoke,
+            );
+            for line in lines {
                 if line.status == Status::Red {
                     red_checks.push(line.check.clone());
                 }
@@ -212,53 +226,18 @@ pub(crate) fn run_healthcheck(
 // Individual checks
 // ---------------------------------------------------------------------------
 
-/// Check 1: claim file — exists, PID parses, process alive via `kill(pid, 0)`.
-fn check_claim(port: u16) -> CheckLine {
-    let path = PathBuf::from(format!("/tmp/rmlx.{port}.claim"));
-
-    if !path.exists() {
-        return CheckLine::new(
-            "claim",
-            Status::Red,
-            format!("claim file /tmp/rmlx.{port}.claim not found"),
-        );
-    }
-
-    let contents = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) => {
-            return CheckLine::new("claim", Status::Red, format!("cannot read claim file: {e}"));
+/// Check 1: the Metal claim. A running server holds it, so a held claim is
+/// green and a free claim is red. The holder is not matched to `--port`. The
+/// probe does not take the claim; its shared lock refuses a GPU command that
+/// starts in the same moment.
+fn claim_line(probe: &Result<(), ClaimError>) -> CheckLine {
+    match probe {
+        Err(held @ ClaimError::AlreadyHeld { .. }) => {
+            debug!(holder = %holder(held), "claim check: held");
+            CheckLine::new("claim", Status::Green, format!("held; {}", holder(held)))
         }
-    };
-
-    let pid: u32 = match contents.trim().parse() {
-        Ok(p) => p,
-        Err(_) => {
-            return CheckLine::new(
-                "claim",
-                Status::Red,
-                format!("claim file body is not a valid PID: {:?}", contents.trim()),
-            );
-        }
-    };
-
-    // Use kill(pid, 0) to check if the process is alive (signal 0 = existence probe).
-    // SAFETY: kill(2) is safe to call with any PID and signal 0.
-    let alive = unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
-
-    if alive {
-        debug!(port, pid, "claim check: process alive");
-        CheckLine::new(
-            "claim",
-            Status::Green,
-            format!("port={port} pid={pid} alive"),
-        )
-    } else {
-        CheckLine::new(
-            "claim",
-            Status::Red,
-            format!("claim file exists (pid={pid}) but process is not alive"),
-        )
+        Ok(()) => CheckLine::new("claim", Status::Red, "no process holds the Metal claim"),
+        Err(e) => CheckLine::new("claim", Status::Red, format!("{e}")),
     }
 }
 
@@ -405,17 +384,67 @@ fn check_registry(paths: &[PathBuf]) -> Vec<CheckLine> {
     lines
 }
 
-/// Check 4 (--full only): run the existing smoke probe via `rmlx info --probe-smoke`.
-///
-/// Loads MLX — the caller ensures the single-process constraint.
-fn check_smoke(path: &Path) -> CheckLine {
-    use rmlx_metrics::events::EventRecorder;
-    use rmlx_mlx::Device;
-
-    let id = path
-        .file_name()
+fn smoke_id(path: &Path) -> &str {
+    path.file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or("(unknown)");
+        .unwrap_or("(unknown)")
+}
+
+/// `the holder recorded pid=<pid> (<command>)`, or the error itself when it is
+/// not a refusal.
+fn holder(claim: &ClaimError) -> String {
+    if let ClaimError::AlreadyHeld {
+        holder_pid,
+        holder_command,
+        ..
+    } = claim
+    {
+        let pid = holder_pid.map_or_else(|| "none".to_owned(), |pid| pid.to_string());
+        format!("the holder recorded pid={pid} ({holder_command})")
+    } else {
+        claim.to_string()
+    }
+}
+
+/// Check 4 (--full only). When check 1 found a holder, the probes do not run
+/// and each line is info, naming it: a process holds the claim, which is the
+/// state check 1 reports green. Otherwise the probes take the Metal claim;
+/// a refused claim makes each line red and names the holder.
+fn smoke_lines(
+    paths: &[PathBuf],
+    server_holder: Option<&ClaimError>,
+    claim_gpu: impl FnOnce() -> Result<ClaimedDevice, ClaimError>,
+    mut probe: impl FnMut(&Path, &ClaimedDevice) -> CheckLine,
+) -> Vec<CheckLine> {
+    let line = |path: &Path, status, detail: String| {
+        CheckLine::new(format!("smoke:{}", smoke_id(path)), status, detail)
+    };
+    if let Some(held) = server_holder {
+        return paths
+            .iter()
+            .map(|path| {
+                line(
+                    path,
+                    Status::Info,
+                    format!("not run: the Metal claim is held; {}", holder(held)),
+                )
+            })
+            .collect();
+    }
+    match claim_gpu() {
+        Ok(gpu) => paths.iter().map(|path| probe(path, &gpu)).collect(),
+        Err(refusal) => paths
+            .iter()
+            .map(|path| line(path, Status::Red, format!("smoke probe not run: {refusal}")))
+            .collect(),
+    }
+}
+
+/// Check 4 (--full only): run the existing smoke probe via `rmlx info --probe-smoke`.
+fn check_smoke(path: &Path, gpu: &ClaimedDevice) -> CheckLine {
+    use rmlx_metrics::events::EventRecorder;
+
+    let id = smoke_id(path);
 
     // We need a EventRecorder. Use a no-op path under /tmp.
     let run_id = format!("healthcheck-smoke-{id}");
@@ -434,7 +463,7 @@ fn check_smoke(path: &Path) -> CheckLine {
         path,
         false, // probe_forward = false
         true,  // probe_smoke = true
-        Device::Gpu,
+        Some(gpu),
         None, // kv_quant_override = auto
         None, // max_ctx_override = auto
         &sink,

@@ -4,13 +4,16 @@
 //!
 //! Centralises the parsing logic used by multiple subcommands (`serve`,
 //! `info`, `baseline`, `eval`) so the same string → type conversions and
-//! claim-file semantics are applied consistently.
+//! claim semantics are applied consistently.
 //!
 //! # Public API
 //!
-//! - [`parse_device`] — `"cpu"` / `"gpu"` string → [`rmlx_mlx::Device`].
-//! - [`acquire_claim_for_device`] — acquire the single-MLX-process claim
-//!   file before any MLX call; aborts with a clear message on contention.
+//! - [`parse_device`] — `"cpu"` / `"gpu"` string → [`rmlx_mlx::Device`],
+//!   with the Metal claim when the device is the GPU.
+//! - [`ClaimedDevice`] — a device together with the claim a GPU device needs.
+//! - [`claim_gpu`] — the GPU device with the Metal claim. It is the only place
+//!   this binary names the GPU device.
+//! - [`check_claim`] — report a claim refusal as exit code 11.
 //! - [`parse_kv_quant`] — `--kv-quant` string → `Option<KvQuant>`.
 //! - [`parse_kv_preset`] — `--kv-preset` name → [`KvPresetArg`] via the
 //!   static preset table. `"auto"` yields `KvPresetArg::Auto`; unknown names
@@ -30,58 +33,108 @@
 //!   and combo KV-bit-width string parsers used by baseline / eval.
 
 #![allow(clippy::cognitive_complexity)]
+use rmlx_kv_quant::DeviceRefusesCodec;
 use rmlx_mlx::Device;
 use rmlx_models::kv_cache::KvBoundary;
-use rmlx_server::{try_claim, ClaimError};
+use rmlx_server::{try_claim, ClaimError, MetalClaim};
 use tracing::error;
+
+use crate::exit::ExitWith;
 
 use crate::commands::preset_table::{lookup_preset, PresetError, AVAILABLE_NAMES};
 
-/// Parse the `--device` flag value into a `Device`.
-pub(crate) fn parse_device(s: &str) -> anyhow::Result<Device> {
-    match s {
-        "cpu" => Ok(Device::Cpu),
-        "gpu" => Ok(Device::Gpu),
-        other => Err(anyhow::anyhow!(
-            "--device must be 'cpu' or 'gpu', got '{other}'"
-        )),
+/// A device together with the Metal claim a GPU device needs. A command's GPU
+/// work runs inside a fn that borrows this value, so the claim cannot be
+/// dropped before that work ends.
+#[derive(Debug)]
+pub(crate) struct ClaimedDevice {
+    device: Device,
+    claim: Option<MetalClaim>,
+}
+
+impl ClaimedDevice {
+    /// The CPU device, which takes no claim.
+    pub(crate) const fn cpu() -> Self {
+        Self {
+            device: Device::Cpu,
+            claim: None,
+        }
+    }
+
+    pub(crate) fn device(&self) -> Device {
+        self.device
+    }
+
+    pub(crate) fn holds_claim(&self) -> bool {
+        self.claim.is_some()
+    }
+
+    /// `Ok` when every codec in `quants` can run on this device.
+    ///
+    /// # Errors
+    /// The first codec [`rmlx_kv_quant::KvQuant::admitted_on`] refuses.
+    pub(crate) fn admits(
+        &self,
+        quants: &[rmlx_kv_quant::KvQuant],
+    ) -> Result<(), DeviceRefusesCodec> {
+        quants
+            .iter()
+            .try_for_each(|quant| quant.admitted_on(self.device))
     }
 }
 
-/// Acquire the Metal claim file for `device` and `port`.
-///
-/// - `Device::Gpu` → calls `try_claim(port)`. On conflict, logs the error and
-///   exits with code 11 (CLAUDE.md mandate).
-/// - `Device::Cpu` → no-op (returns `None`).
-pub(crate) fn acquire_claim_for_device(
-    device: Device,
-    port: u16,
-) -> anyhow::Result<Option<rmlx_server::MetalClaim>> {
-    if device == Device::Cpu {
-        return Ok(None);
+/// Parse the `--device` flag value. `"gpu"` takes the Metal claim; `"cpu"`
+/// takes none and forbids every later GPU stream and Metal call in this
+/// process.
+pub(crate) fn parse_device(s: &str) -> anyhow::Result<ClaimedDevice> {
+    let claimed = device_from_flag(s, || check_claim(claim_gpu()))?;
+    if !claimed.holds_claim() {
+        rmlx_mlx::forbid_gpu();
     }
-    match try_claim(port) {
-        Ok(claim) => Ok(Some(claim)),
-        Err(ClaimError::AlreadyHeld {
-            holder_pid,
-            port: p,
-        }) => {
-            error!(
-                holder_pid,
-                port = p,
-                "Metal claim held by another rMLX process — refusing to start"
-            );
-            eprintln!(
-                "error: another rMLX process (PID {holder_pid}) holds the Metal claim for port {p}.\n\
-                 Hint: stop it with `kill {holder_pid}` or via the /v1/models/<id>/unload API.\n\
-                 rMLX exits with code 11."
-            );
-            std::process::exit(11);
+    Ok(claimed)
+}
+
+fn device_from_flag(
+    s: &str,
+    claim_gpu: impl FnOnce() -> anyhow::Result<ClaimedDevice>,
+) -> anyhow::Result<ClaimedDevice> {
+    let device = match s {
+        "cpu" => ClaimedDevice::cpu(),
+        "gpu" => claim_gpu()?,
+        other => {
+            return Err(anyhow::anyhow!(
+                "--device must be 'cpu' or 'gpu', got '{other}'"
+            ))
+        }
+    };
+    tracing::info!(device = s, claim = device.holds_claim(), "resolved device");
+    Ok(device)
+}
+
+/// The GPU device with the Metal claim.
+///
+/// # Errors
+/// The refusal from [`try_claim`].
+pub(crate) fn claim_gpu() -> Result<ClaimedDevice, ClaimError> {
+    try_claim().map(|claim| ClaimedDevice {
+        device: Device::Gpu,
+        claim: Some(claim),
+    })
+}
+
+/// Report a claim refusal and turn it into exit code 11; any other claim error
+/// is returned as is.
+pub(crate) fn check_claim<T>(claim: Result<T, ClaimError>) -> anyhow::Result<T> {
+    match claim {
+        Ok(held) => Ok(held),
+        Err(e @ ClaimError::AlreadyHeld { .. }) => {
+            error!(error = %e, "Metal claim held by another process — refusing to start");
+            eprintln!("error: {e}\nrMLX exits with code 11.");
+            Err(ExitWith(11).into())
         }
         Err(e) => {
             error!(
                 error = %e,
-                port,
                 "D-class startup: Metal claim I/O error — cannot acquire GPU lock"
             );
             Err(anyhow::anyhow!("Metal claim: {e}"))
@@ -278,10 +331,10 @@ pub(crate) fn reject_paged_kv_without_store(
 /// - `(None, Some(spec))` → resolve the per-side spec. A side the operator left
 ///   `auto` takes the named side's canonical partner, not the engine default —
 ///   see [`rmlx_models::kv_cache::resolve_cache_type`]. On `Err`, log + hint +
-///   `exit(78)`.
+///   exit code 78.
 /// - `(None, None)` → [`rmlx_models::kv_cache::DEFAULT_KV_QUANT`].
 /// - `(Some(_), Some(_))` → defense-in-depth (clap should have rejected this);
-///   log + hint + `exit(78)`. No panic.
+///   log + hint + exit code 78. No panic.
 ///
 /// On success: emits a `tracing::info!` with `arch`, `head_dim`, resolved
 /// `KvQuant`. If the resolved quant is non-`None` AND the arch is Gemma3 or
@@ -296,7 +349,7 @@ pub(crate) fn resolve_kv_quant(
     model_cfg: &rmlx_loader::ModelConfig,
     kv_quant_override: Option<rmlx_kv_quant::KvQuant>,
     cts_override: Option<rmlx_models::kv_cache::CacheTypeSpec>,
-) -> rmlx_kv_quant::KvQuant {
+) -> anyhow::Result<rmlx_kv_quant::KvQuant> {
     use rmlx_kv_quant::KvQuant;
     use rmlx_models::kv_cache::{
         resolve_cache_type, validate_resolved_kv_quant, ResolverContext, DEFAULT_KV_QUANT,
@@ -323,7 +376,7 @@ pub(crate) fn resolve_kv_quant(
                 );
                 eprintln!("error: {e}");
                 eprintln!("see docs/KV_QUANT.md for supported codecs and combinations");
-                std::process::exit(78);
+                return Err(ExitWith(78).into());
             }
             kq
         }
@@ -344,7 +397,7 @@ pub(crate) fn resolve_kv_quant(
                     );
                     eprintln!("error: {e}");
                     eprintln!("see docs/KV_QUANT.md for supported codecs and combinations");
-                    std::process::exit(78);
+                    return Err(ExitWith(78).into());
                 }
             }
         }
@@ -358,7 +411,7 @@ pub(crate) fn resolve_kv_quant(
             );
             eprintln!("error: --kv-quant and --cache-type-k/--cache-type-v are mutually exclusive");
             eprintln!("see docs/KV_QUANT.md for supported codecs and combinations");
-            std::process::exit(78);
+            return Err(ExitWith(78).into());
         }
     };
 
@@ -381,7 +434,7 @@ pub(crate) fn resolve_kv_quant(
         tracing::info!("SWA layers always use bf16 — only full-attention layers are quantized");
     }
 
-    final_kv_quant
+    Ok(final_kv_quant)
 }
 
 /// Reject a zero `--max-prompt-tokens`; `truncate(0)` would empty the prompt.
@@ -589,9 +642,10 @@ pub(crate) fn parse_kv_bits_combo(
 ///
 /// Shared preamble for `serve` (single-model path), `chat`, `info`, and
 /// `baseline`: runs `parse_kv_quant` → `build_cache_type_spec` →
-/// `parse_max_ctx` → `parse_device` → emits an `info!` span for the
-/// resolved device → loads `config.json` via `rmlx_loader::load_config` →
-/// resolves the final [`KvQuant`] via [`resolve_kv_quant`].
+/// `parse_max_ctx` → loads `config.json` via `rmlx_loader::load_config` →
+/// resolves the final [`KvQuant`] via [`resolve_kv_quant`]. It does not parse
+/// `--device`: [`parse_device`] takes the claim, so each command calls it
+/// where its GPU work starts.
 ///
 /// `kv_bits` + `kv_group_size`: when both are `Some`, they are resolved via
 /// [`parse_kv_bits_combo`] and used as the `kv_quant_override` (the
@@ -599,10 +653,10 @@ pub(crate) fn parse_kv_bits_combo(
 /// both from being set simultaneously). When `kv_bits` is `Some` but
 /// `kv_group_size` is `None`, `kv_group_size` defaults to 64 (mlx-lm default).
 ///
-/// `cmd_name` is a short label used only in the `info!` log line
+/// `cmd_name` is a short label used only in the `--kv-bits` `info!` log line
 /// (e.g. `"rmlx serve"`, `"rmlx chat"`, `"rmlx info"`, `"rmlx baseline"`).
 ///
-/// Returns `(device, kv_quant, max_ctx_override)`.
+/// Returns `(kv_quant, max_ctx_override)`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_model_flags(
     model: &std::path::Path,
@@ -610,11 +664,10 @@ pub(crate) fn resolve_model_flags(
     ctk: Option<&str>,
     ctv: Option<&str>,
     max_ctx: Option<u32>,
-    device: &str,
     cmd_name: &str,
     kv_bits: Option<f32>,
     kv_group_size: Option<usize>,
-) -> anyhow::Result<(Device, rmlx_kv_quant::KvQuant, Option<i32>)> {
+) -> anyhow::Result<(rmlx_kv_quant::KvQuant, Option<i32>)> {
     // --kv-bits / --kv-group-size: resolve to a KvQuant before the normal
     // preset path. clap conflicts_with prevents --kv-bits from appearing
     // alongside --kv-quant / --cache-type-k / --cache-type-v, so if kv_bits
@@ -641,11 +694,9 @@ pub(crate) fn resolve_model_flags(
         (parse_kv_quant(kv_quant)?, build_cache_type_spec(ctk, ctv)?)
     };
     let max_ctx_override = parse_max_ctx(max_ctx)?;
-    let dev = parse_device(device)?;
-    tracing::info!(device, "{cmd_name}: resolved device");
     let cfg = rmlx_loader::load_config(model).map_err(|e| anyhow::anyhow!("load_config: {e}"))?;
-    let kv_quant_final = resolve_kv_quant(&cfg, kv_quant_opt, cts_override);
-    Ok((dev, kv_quant_final, max_ctx_override))
+    let kv_quant_final = resolve_kv_quant(&cfg, kv_quant_opt, cts_override)?;
+    Ok((kv_quant_final, max_ctx_override))
 }
 
 #[cfg(test)]

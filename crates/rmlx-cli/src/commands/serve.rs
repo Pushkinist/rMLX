@@ -4,9 +4,8 @@
 //!
 //! [`run_serve`] is the single entry point. It:
 //! 1. Resolves project caps from `projects.toml` (CLI flags override file).
-//! 2. Acquires the single-MLX-process claim file via [`rmlx_server::try_claim`].
-//! 3. Loads the model (or a multi-model registry) and warms prompt-cache slots.
-//! 4. Launches the Axum HTTP server, then drives the idle-eviction loop until
+//! 2. Loads the model (or a multi-model registry) and warms prompt-cache slots.
+//! 3. Launches the Axum HTTP server, then drives the idle-eviction loop until
 //!    the process is signalled.
 //!
 //! # Public API
@@ -32,11 +31,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::commands::parse::ClaimedDevice;
 use rmlx_core::runinfo::make_run_id;
 use rmlx_core::DispatchPolicy;
 use rmlx_loader::{discover_kv_calibration, load_config, load_head_budgets};
 use rmlx_metrics::events::EventRecorder;
-use rmlx_mlx::Device;
 use rmlx_server::{
     register_ssd_prom_hooks, spawn_drainer, AppState, ArchGenerator, KeepAlivePolicy,
     ModelLoadConfig, ModelLoader, ModelRegistry, RegistryConfig, SpeculativeGenerator, TtftStore,
@@ -463,7 +462,7 @@ pub(crate) fn run_serve(
     registry_file: Option<&Path>,
     host: &str,
     port: u16,
-    device_str: &str,
+    claimed: &ClaimedDevice,
     kv_quant_override: Option<rmlx_kv_quant::KvQuant>,
     max_ctx_override: Option<i32>,
     idle_timeout_spec: Option<String>,
@@ -511,6 +510,7 @@ pub(crate) fn run_serve(
     image_max_tokens: Option<usize>,
     sink: &EventRecorder,
 ) -> anyhow::Result<()> {
+    let device = claimed.device();
     // The TurboFlash / planar-flash-decode gates are resolved in `main`, before
     // any subcommand dispatch, alongside `--fused-qk`, `--sparse-attn` and
     // `--rot-k-fused`. Resolving them per-subcommand would let `serve` and the
@@ -638,37 +638,31 @@ pub(crate) fn run_serve(
              on first request (kind + block_size stored for drafter loaders)"
         );
     }
-    // Parse device flag.
-    let device = match device_str {
-        "cpu" => Device::Cpu,
-        "gpu" => Device::Gpu,
-        other => {
-            return Err(anyhow::anyhow!(
-                "--device must be 'cpu' or 'gpu', got '{other}'"
-            ));
-        }
-    };
-
     // Byte-to-byte port of mlx-lm server.py startup —
     // if mx.metal.is_available():
     // wired_limit = mx.device_info()["max_recommended_working_set_size"]
     // mx.set_wired_limit(wired_limit)
     // Locks pages to GPU residency, eliminating page-fault stalls during decode.
-    match rmlx_mlx::metal::set_wired_limit_to_recommended() {
-        Ok(Some((recommended, old))) => {
-            info!(
-                wired_limit_bytes = recommended,
-                wired_limit_gib = (recommended as f64) / (1024.0 * 1024.0 * 1024.0),
-                previous_wired_limit_bytes = old,
-                "set_wired_limit(max_recommended_working_set_size)"
-            );
+    // Only the GPU device holds the claim that Metal calls need.
+    if claimed.holds_claim() {
+        match rmlx_mlx::metal::set_wired_limit_to_recommended() {
+            Ok(Some((recommended, old))) => {
+                info!(
+                    wired_limit_bytes = recommended,
+                    wired_limit_gib = (recommended as f64) / (1024.0 * 1024.0 * 1024.0),
+                    previous_wired_limit_bytes = old,
+                    "set_wired_limit(max_recommended_working_set_size)"
+                );
+            }
+            Ok(None) => {
+                info!("Metal backend not available; skipping set_wired_limit");
+            }
+            Err(e) => {
+                warn!(error = %e, "set_wired_limit failed (continuing)");
+            }
         }
-        Ok(None) => {
-            info!("Metal backend not available; skipping set_wired_limit");
-        }
-        Err(e) => {
-            warn!(error = %e, "set_wired_limit failed (continuing)");
-        }
+    } else {
+        info!("device is cpu; skipping set_wired_limit");
     }
 
     // Log the kv_quant and max_ctx selections.
@@ -706,7 +700,7 @@ pub(crate) fn run_serve(
                 arch_name
             );
             eprintln!("error: architecture '{arch_name}' not yet supported");
-            std::process::exit(1);
+            return Err(crate::exit::ExitWith(1).into());
         }
         Arc::new(ModelRegistry::from_paths(&[p.to_path_buf()]))
     } else {
@@ -967,6 +961,7 @@ pub(crate) fn run_serve(
         let drainer_handle = spawn_drainer(drainer_db_path);
 
         let mut state = AppState {
+            device,
             registry,
             slots: Arc::new(parking_lot::RwLock::new(Vec::new())),
             embed_slot: Arc::new(parking_lot::RwLock::new(None)),

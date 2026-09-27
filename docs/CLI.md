@@ -23,6 +23,7 @@ rmlx [global flags] <subcommand> [flags]
 | `metrics` | Metrics database: schema, ingest, queries, export |
 | `eval ppl` | Perplexity over a text corpus |
 | `profile list` | Names of the `serve` profiles in `profiles.toml` |
+| `claim run` | Run a command while holding the claim; see "Claim file" |
 
 `qwen36_diag` is a separate diagnostic binary; see its section below.
 
@@ -156,7 +157,7 @@ unloads a model that is decoding. `POST /v1/models/{id}/load` takes a
 `keep_alive` field in the same syntax, which wins over the flag. The OpenAI
 and Anthropic routes ignore that field but still reset the timer. See
 [`SERVER.md`](SERVER.md) § "Model lifecycle endpoints". An unload frees the
-model, not the claim file; only process exit releases it.
+model, not the Metal claim; only process exit releases it.
 
 ### Context ceiling
 
@@ -461,10 +462,10 @@ Exit `0` all green, `1` any red, `2` internal error.
 |---|---|---|---|
 | `--registry` | path | — | Checks each registered model. Conflicts with `--model`. |
 | `--model` | path | — | Checks one snapshot. Conflicts with `--registry`. |
-| `--port` | u16 | — | Also checks the claim file and `/health` of a server on this port. |
+| `--port` | u16 | — | Checks `/health` on this port, and probes the machine-wide claim without taking it (a brief shared lock; a GPU command starting in that instant is refused). Held is green; the holder is not matched to the port. |
 | `--db` | path | `RMLX_METRICS_DB`, else `<RMLX_HOME>/metrics/runs.db` | Metrics DB. |
 | `--min-disk-gb` | u64 | `5` | Free space required for `metrics/` and `logs/`, in GiB. |
-| `--full` | bool flag | off | Also runs the smoke probe per model; loads MLX. |
+| `--full` | bool flag | off | Also runs the smoke probe per model, taking the claim. With `--port`, a held claim makes each smoke line info, naming the holder (not run); without `--port`, a held claim makes each smoke line red. |
 | `--human` | bool flag | off | Plain `OK` / `FAIL` text. |
 
 ---
@@ -589,69 +590,44 @@ The device defaults to `cpu`. The mlx-lm reference is `argmax_id=8160`,
 
 ## Environment variables
 
-Where a variable has a flag, the flag wins.
-
-| Variable | Flag | Read by | Effect |
-|---|---|---|---|
-| `RMLX_HOME` | — | `rmlx_core::paths` | Root of all on-disk state. A relative path is ignored with a `warn!`. Else `<workspace>/.rmlx/` (nearest `Cargo.lock` upward), else `$HOME/.rmlx/`. |
-| `RUST_BACKTRACE` | — | `main` | Set to `full` at startup when unset. |
-| `RUST_LOG` | `--log` | the tracing filter | Overrides `--log` when set, e.g. `RUST_LOG=debug,rmlx=trace`. |
-| `RMLX_LOG_CAP_MB` | `--log-cap-mb` | clap | Log directory cap. |
-| `RMLX_METRICS_DB` | `--db` | `rmlx metrics`, `rmlx healthcheck` | DB path. The event recorder and in-process ingest always use `<RMLX_HOME>/metrics/runs.db`. |
-| `RMLX_HARDWARE_TAG` | — | `rmlx_metrics::identity` | `hardware_tag` of every record this binary emits. Default `m5_max_128gb`. |
-| `RMLX_REPO_ROOT` | — | `metrics prompts sync`, `metrics migrate` | Directory holding `prompts/`. Default: the working directory. |
-| `RMLX_PROMPTS_DIR` | `--prompts-dir` | clap | Prompts directory for `baseline` and `bench`. |
-| `RMLX_YARN_FACTOR`, `RMLX_YARN_ORIGINAL_MAX` | `--yarn-factor`, `--yarn-original-max` | clap | `serve` and `baseline` only. |
-| `RMLX_SESSION_CACHE_MAX_SESSIONS` | `--session-cache-max-sessions` | clap | `serve`. |
-| `RMLX_MM_CACHE_BYTES` | `--mm-cache-bytes` | clap | `serve`. |
-| `RMLX_WHISPER_MODEL_PATH`, `RMLX_WHISPER_TOKENIZER_PATH` | `--whisper-*`, `transcribe --model` / `--tokenizer` | clap | Whisper paths. |
-| `RMLX_TTS_MODEL_PATH`, `RMLX_TTS_TOKENIZER_PATH` | `--tts-*` | clap | Qwen3-TTS paths. |
-| `MLX_VLM_DRAFT_KIND`, `MLX_VLM_DRAFT_BLOCK_SIZE` | `--draft-kind`, `--draft-block-size` | clap | `serve`. |
-| `RMLX_TURBO_FLASH`, `RMLX_FUSED_QK`, `RMLX_SPARSE_ATTN`, `RMLX_PLANAR_FLASH_DECODE`, `RMLX_ROT_K_FUSED` | the matching gate | `DispatchPolicy::from_env` | `=1` turns the gate on under `auto`. |
-| `RMLX_TURBO_FLASH_LOCK` | `--turbo-flash-lock` | `DispatchPolicy::from_env` | `=1` turns the lock on when the flag is absent. |
-| `RMLX_TURBO_FLASH_MIN` | — | `DispatchPolicy::from_env` | TurboFlash runs only above this `kv_seq`. Default `4096`; a negative value is `0`, an unparseable one warns and keeps the default. |
-| `RMLX_FUSED_QK_MIN` | — | `DispatchPolicy::from_env` | Minimum `kv_seq` for fused-QK. Default `512`; an unparseable value warns and keeps it. |
-| `RMLX_ROTOR_QJL` | `--rotor-qjl` | `rmlx_kv_quant::rotor_qjl` | Only for an embedder that never installs the flag; `rmlx` always does. `1`, `on`, `true` or `yes` turns QJL on. |
-| `RMLX_PREFILL_CHUNK`, `RMLX_PREFILL_CHUNK_<ARCH>` | — | `rmlx_models::prefill_chunk` | Prefill chunk in tokens; the per-architecture form wins. See [`KV_CACHE.md`](KV_CACHE.md) § "Chunked prefill". |
-| `RMLX_KV_MAX_SEQ_HARD_CAP` | — | `rmlx_kv_quant::kvcache::update` | Refuses a KV extension past this many tokens. Unset: no cap. |
-| `RMLX_EAGLE3_NO_FCS` | — | `speculative::eagle3` | Set to any value to skip the Eagle3 drafter's per-slice `fcs` norms. |
-| `MTL_CAPTURE_ENABLED` | — | Metal | Must be `1` at launch for `--gpu-capture`. |
+Split into [`CLI_ENV_VARS.md`](CLI_ENV_VARS.md) to keep this doc under the
+size cap. Where a variable has a flag, the flag wins.
 
 ---
 
 ## Claim file
 
-Metal allows one GPU context per process. rMLX takes a claim file before it
-uses the GPU. The file is `/tmp/rmlx.<port>.claim`, locked with
-`flock` and holding the owner's PID. Internals are in
-[`SERVER.md`](SERVER.md) § "Claim file".
+Metal allows one GPU context per process. rMLX takes one machine-wide claim,
+an exclusive `flock` on `/var/tmp/rmlx.claim`, before it uses the GPU. The
+file is never deleted; the kernel releases the lock when the holder exits,
+is killed, or crashes. Internals are in [`SERVER.md`](SERVER.md)
+§ "Claim file".
 
-| Holder | Port |
-|---|---|
-| `serve` | `--port` |
-| `chat`, `transcribe`, `baseline`, `bench`, `eval ppl`, `info --probe-forward`/`--probe-smoke` | `51966` (`0xCAFE`) |
-| `kv-calibrate` head-budget recipes, during the model load only | `0` |
-| `healthcheck --full` (runs the smoke probe on the GPU) | none |
+A second process that asks for the GPU while the claim is held is refused
+with exit code `11`, naming the recorded holder's PID and command (the
+record can be stale). Confirm with `lsof /var/tmp/rmlx.claim` (as root to
+see another user's process), then `kill <PID>`. Never delete the claim file.
 
-A claim refuses only a second holder of the same port. That process names the
-PID and exits with code `11`. So these pairs can hold the GPU together:
+`--device` accepts `cpu` or `gpu`. `gpu` (default) takes the claim before any
+model load. `cpu` takes no claim; it refuses every KV codec but `none`
+(`--kv-quant auto` resolves to `none`) and every later GPU stream or Metal
+call. `--gpu-capture` needs `--device gpu`.
 
-- a `serve` and any one-shot command;
-- two `serve` processes on different ports;
-- a one-shot command and a `kv-calibrate` model load;
-- `healthcheck --full` and anything;
-- a `kv-calibrate` measurement, which runs after the claim is released, and
-  anything.
+`rmlx claim run -- <command>` holds the claim for `<command>` and exits with
+its status — the command's own code, or `128 + <signal>` if a signal killed
+it. Every process `<command>` starts inherits the claim and holds it until
+that process exits, so the claim can outlive `<command>` if it leaves a
+child running. It runs non-interactively (stdin `/dev/null`) in its own
+process group; `SIGTERM`, `SIGINT` and `SIGHUP` sent to `rmlx claim run`
+forward to that group. Held elsewhere, it runs nothing and exits `11`. The
+command must not start `rmlx` itself — the nested claim would be refused.
 
-Other rules:
-
-- `--device cpu` takes no claim.
-- A claim whose PID is dead is reclaimed with a `warn!`; nothing needs
-  removing by hand.
-- Normal exit removes the file; `serve` also removes it on `SIGINT` and
-  `SIGTERM`. `info --probe-smoke` with a non-zero verdict exits without
-  removing it, and the next holder reclaims it.
-- `rmlx healthcheck --port <N>` checks the file without taking it.
+**Legacy per-port claim (one release).** An older build held
+`/tmp/rmlx.<port>.claim`. This build probes that directory first, with a
+brief shared lock per file, skipping a vanished entry, a symlink, or
+anything not a regular file. Any other open error there refuses every GPU
+command with an I/O error, not exit `11`. Nothing is deleted. Removed in the
+release after next.
 
 ---
 

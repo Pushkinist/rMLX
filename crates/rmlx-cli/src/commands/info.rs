@@ -21,6 +21,7 @@
 use std::io::Write as _;
 use std::path::Path;
 
+use crate::commands::parse::ClaimedDevice;
 use rmlx_loader::{
     count_tensors_per_shard, load_config, load_shard_index, resolve, resolve_paro, view, ShardSet,
     TensorKind,
@@ -34,13 +35,13 @@ use tracing::{info, warn};
 
 /// Print arch + quant info for `model_path` -- no inference, no MLX runtime.
 ///
-/// `device` is used for forward and smoke probes when enabled.
+/// `probe_device` is the device the forward and smoke probes run on; it is
+/// `None` when no probe runs, and a probe with no device does not run.
 /// `kv_quant_override` is forwarded to `generate_greedy` when `probe_smoke` is true.
 /// `None` = auto (`DEFAULT_KV_QUANT`); `Some(q)` = explicit override.
 /// Exit-code outcome for `--probe-smoke`.
 ///
-/// The variant maps 1:1 to the process exit code the caller passes to
-/// `std::process::exit`:
+/// The variant maps 1:1 to the process exit code:
 ///
 /// - `0` = coherent output; snapshot is healthy.
 /// - `1` = incoherent output (`BrokenPunctLoop` or `BrokenNan`).
@@ -66,7 +67,7 @@ pub(crate) enum SmokeExitCode {
 }
 
 impl SmokeExitCode {
-    /// Convert to the integer exit code passed to `std::process::exit`.
+    /// Convert to the integer process exit code.
     #[must_use]
     pub(crate) fn as_i32(self) -> i32 {
         self as i32
@@ -116,7 +117,7 @@ pub(crate) fn run_info(
     model_path: &Path,
     probe_forward: bool,
     probe_smoke: bool,
-    device: Device,
+    probe_device: Option<&ClaimedDevice>,
     kv_quant_override: Option<rmlx_kv_quant::KvQuant>,
     max_ctx_override: Option<i32>,
     sink: &EventRecorder,
@@ -411,7 +412,10 @@ pub(crate) fn run_info(
     }
 
     // -- forward probe ---------------------------------------------------------
-    if probe_forward {
+    if let Some(device) = probe_device
+        .filter(|_| probe_forward)
+        .map(ClaimedDevice::device)
+    {
         info!(arch = %arch, ?device, "forward_probe: loading model via arch::load_model");
         match arch::load_model(model_path, device, &arch::LoadOpts::default()) {
             Err(e) => {
@@ -449,7 +453,10 @@ pub(crate) fn run_info(
     }
 
     // -- smoke probe ----------------------------------------------------------
-    if probe_smoke {
+    if let Some(device) = probe_device
+        .filter(|_| probe_smoke)
+        .map(ClaimedDevice::device)
+    {
         info!(arch = %arch, ?device, "smoke_probe: loading model via arch::load_model");
 
         // Load model via architecture dispatch.

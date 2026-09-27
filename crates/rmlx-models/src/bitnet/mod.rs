@@ -47,6 +47,9 @@ pub use prompt_cache::read_cache_stats as bitnet_cache_stats;
 #[path = "tests.rs"]
 mod bitnet_tests;
 
+#[cfg(test)]
+mod device_tests;
+
 /// BitNet's decoder layers each project their own K/V — no cross-layer-KV
 /// topology. This is the single producer of that fact for this arch: it is what
 /// [`crate::kv_cache::kv_layer_quants`] resolves the boundary-layer codec
