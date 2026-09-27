@@ -18,9 +18,8 @@
 //   cargo test -p rmlx-kv-quant --test dispatch_policy_two_arms -- \
 //       --ignored --test-threads=1 --nocapture
 //
-// CLAUDE.md hard rule 8 (single MLX process): the test claims no port — the
-// integration runner serialises tests within one process. Preflight with
-//   pkill -f "rmlx serve"; rm -f /tmp/rmlx.*.claim
+// CLAUDE.md hard rule 8 (single MLX process): the test takes no Metal claim of
+// its own. Run it under `make gpu-test`, which holds the Metal claim.
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,

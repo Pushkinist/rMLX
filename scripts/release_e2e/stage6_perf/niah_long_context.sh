@@ -17,9 +17,10 @@
 # them; this driver passes `-- --ignored --test-threads=1` to opt in
 # (serial: one model at a time, to honour the single-MLX-process rule).
 #
-# Single-MLX-process discipline (CLAUDE.md hard rule 8): the script does
-# `pkill ... && rm -f /tmp/rmlx.*.claim` before each cargo invocation. Each
-# test binary acquires + releases the GPU implicitly via `arch::load_model`.
+# Single-MLX-process discipline (CLAUDE.md hard rule 8): each cargo invocation
+# runs under `rmlx claim run`, which holds the Metal claim for the whole pass.
+# A claim another process holds refuses the pass with exit 11 and names the
+# holder; nothing is stopped for it.
 #
 # Usage:
 #   bash scripts/release_e2e/stage6_perf/niah_long_context.sh \
@@ -79,14 +80,13 @@ case "$MODE" in
     *) echo "ERROR: --mode must be one of {turbo,pflash,both}, got: $MODE" >&2; exit 2 ;;
 esac
 
-preflight() {
-    pkill -f "rmlx serve" 2>/dev/null || true
-    pkill -f mlx_lm 2>/dev/null || true
-    pkill -f paroquant 2>/dev/null || true
-    pkill -f omlx 2>/dev/null || true
-    sleep 2
-    rm -f /tmp/rmlx.*.claim 2>/dev/null || true
-}
+# The binary the passes take the Metal claim with is this checkout's.
+CLAIM_RMLX="${REPO_ROOT}/target/debug/rmlx"
+# Every process a pass starts under the claim inherits it, so everything the
+# passes run is compiled here, outside it; a pass that still compiles fails.
+cargo build --manifest-path "${REPO_ROOT}/Cargo.toml" -p rmlx-cli --bin rmlx || exit 1
+cargo test --manifest-path "${REPO_ROOT}/Cargo.toml" --no-run --profile release-perf \
+    -p rmlx-models --test niah_long_context || exit 1
 
 # Run a single pass for one family (turbo|pflash) × one mode label (off|on).
 # Sets the corresponding env var and applies a default filter when none is
@@ -122,12 +122,12 @@ run_pass() {
     echo "================================================================"
     echo "NIAH pass: family=$family label=$label ($env_var=$val) filter=${effective_filter:-<all>}"
     echo "================================================================"
-    preflight
 
     # `--test-threads=1`: only one MLX context at a time.
     # `--ignored`: cells are `#[ignore]` by default.
     # `--nocapture`: surface the per-cell prompt_len/decoded lines.
-    local args=(test --profile release-perf -p rmlx-models --test niah_long_context)
+    local args=(test --manifest-path "${REPO_ROOT}/Cargo.toml" --profile release-perf
+        -p rmlx-models --test niah_long_context)
     if [[ -n "$effective_filter" ]]; then
         args+=("--" "--ignored" "--test-threads=1" "--nocapture" "$effective_filter")
     else
@@ -136,9 +136,13 @@ run_pass() {
 
     # Per-invocation env: declare via `env <NAME>=<VAL>` so $env_var expands
     # correctly. Direct `"$env_var"="$val" cmd` would not be a valid env-assignment.
-    env "${env_var}=${val}" timeout 1800 cargo "${args[@]}" 2>&1 \
+    env "${env_var}=${val}" timeout 1800 "${CLAIM_RMLX}" claim run -- cargo "${args[@]}" 2>&1 \
         | tee "/tmp/niah-${family}-${label}.log"
     local rc=${PIPESTATUS[0]}
+    if grep -Eq '^[[:space:]]*Compiling [A-Za-z0-9_-]+ v' "/tmp/niah-${family}-${label}.log"; then
+        echo "ERROR: the pass compiled under the Metal claim." >&2
+        rc=1
+    fi
     echo ""
     echo "exit=$rc  log=/tmp/niah-${family}-${label}.log"
     return $rc

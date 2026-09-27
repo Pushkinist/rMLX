@@ -48,7 +48,7 @@
 //! # Single-MLX claim
 //!
 //! Per CLAUDE.md "Single MLX process per Mac", callers must hold the
-//! `/tmp/rmlx.<port>.claim` lock before dispatching GPU kernels.
+//! Metal claim before dispatching GPU kernels.
 
 pub mod phase1_score_msl;
 pub mod phase2_sparse_attend_msl;

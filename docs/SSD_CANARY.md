@@ -31,10 +31,9 @@ The script deletes its data root whole before the run, except under
 exported `RMLX_HOME=$PWD/.rmlx` loses `metrics/runs.db`, `metrics/backups/`,
 `cache/` and `logs/`. Unset `RMLX_HOME` before the run.
 
-Before each phase the script kills every `rmlx serve`, `mlx_lm`, `paroquant`
-and `omlx` process and removes every `/tmp/rmlx.*.claim` file. The make
-target first kills every `rmlx serve` and `mlx_lm` process and removes every
-claim file.
+Each phase's server takes the Metal claim, and the script stops only the
+server it started. When another process holds the claim, the phase server
+exits 11 and names the holder, and the canary stops with that status.
 
 ## Phases
 

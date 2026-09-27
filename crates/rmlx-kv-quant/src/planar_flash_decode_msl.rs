@@ -49,7 +49,7 @@
 //! # Single-MLX claim
 //!
 //! Per CLAUDE.md "Single MLX process per Mac", callers must hold the
-//! `/tmp/rmlx.<port>.claim` lock before dispatching GPU kernels.
+//! Metal claim before dispatching GPU kernels.
 //! This kernel is no exception.
 
 use std::fmt::Write as _;

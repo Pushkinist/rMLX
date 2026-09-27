@@ -42,7 +42,7 @@ pub fn conv2d(
                 s,
             )
         })
-    };
+    }?;
     unsafe { check_status(status, "conv2d") }?;
     Ok(Array { inner: res })
 }
@@ -73,7 +73,7 @@ pub fn pad(a: &Array, axes: &[i32], low: &[i32], high: &[i32], device: Device) -
                 s,
             )
         })
-    };
+    }?;
     unsafe { check_status(status, "pad") }?;
     Ok(Array { inner: res })
 }
@@ -82,7 +82,7 @@ pub fn pad(a: &Array, axes: &[i32], low: &[i32], high: &[i32], device: Device) -
 pub fn sin(a: &Array, device: Device) -> Result<Array> {
     install_error_handler();
     let mut res = unsafe { sys::mlx_array_new() };
-    let status = unsafe { with_stream(device, |s| sys::mlx_sin(&raw mut res, a.inner, s)) };
+    let status = unsafe { with_stream(device, |s| sys::mlx_sin(&raw mut res, a.inner, s)) }?;
     unsafe { check_status(status, "sin") }?;
     Ok(Array { inner: res })
 }
@@ -91,7 +91,7 @@ pub fn sin(a: &Array, device: Device) -> Result<Array> {
 pub fn cos(a: &Array, device: Device) -> Result<Array> {
     install_error_handler();
     let mut res = unsafe { sys::mlx_array_new() };
-    let status = unsafe { with_stream(device, |s| sys::mlx_cos(&raw mut res, a.inner, s)) };
+    let status = unsafe { with_stream(device, |s| sys::mlx_cos(&raw mut res, a.inner, s)) }?;
     unsafe { check_status(status, "cos") }?;
     Ok(Array { inner: res })
 }
@@ -104,7 +104,7 @@ pub fn maximum(a: &Array, b: &Array, device: Device) -> Result<Array> {
         with_stream(device, |s| {
             sys::mlx_maximum(&raw mut res, a.inner, b.inner, s)
         })
-    };
+    }?;
     unsafe { check_status(status, "maximum") }?;
     Ok(Array { inner: res })
 }
@@ -113,7 +113,7 @@ pub fn maximum(a: &Array, b: &Array, device: Device) -> Result<Array> {
 pub fn tril(x: &Array, k: i32, device: Device) -> Result<Array> {
     install_error_handler();
     let mut res = unsafe { sys::mlx_array_new() };
-    let status = unsafe { with_stream(device, |s| sys::mlx_tril(&raw mut res, x.inner, k, s)) };
+    let status = unsafe { with_stream(device, |s| sys::mlx_tril(&raw mut res, x.inner, k, s)) }?;
     unsafe { check_status(status, "tril") }?;
     Ok(Array { inner: res })
 }
@@ -126,7 +126,7 @@ pub fn arange(start: f64, stop: f64, step: f64, device: Device) -> Result<Array>
         with_stream(device, |s| {
             sys::mlx_arange(&raw mut res, start, stop, step, Dtype::F32.to_sys(), s)
         })
-    };
+    }?;
     unsafe { check_status(status, "arange") }?;
     Ok(Array { inner: res })
 }
@@ -168,7 +168,7 @@ pub fn conv_transpose1d(
                 s,
             )
         })
-    };
+    }?;
     unsafe { check_status(status, "conv_transpose1d") }?;
     Ok(Array { inner: res })
 }
@@ -202,7 +202,7 @@ pub fn conv1d(
                 s,
             )
         })
-    };
+    }?;
     unsafe { check_status(status, "conv1d") }?;
     Ok(Array { inner: res })
 }

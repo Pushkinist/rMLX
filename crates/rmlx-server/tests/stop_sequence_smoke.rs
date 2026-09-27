@@ -110,6 +110,7 @@ fn scripted_state(pieces: &'static [&'static str]) -> (AppState, tempfile::TempD
         Ok(Box::new(ScriptedGenerator::new(pieces)) as Box<dyn Generator>)
     });
     let state = AppState {
+        device: rmlx_mlx::Device::Cpu,
         registry: Arc::new(reg),
         slots: Arc::new(parking_lot::RwLock::new(Vec::new())),
         embed_slot: Arc::new(parking_lot::RwLock::new(None)),

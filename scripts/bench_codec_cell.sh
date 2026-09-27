@@ -6,7 +6,8 @@
 #                               [--max-tokens 100] [--prompt-len 4096]
 #
 # Behavior:
-#   - Hard-rule-8 preflight: kills competing MLX processes + removes claim file.
+#   - Probes the Metal claim first: a claim another process holds stops the run
+#     with exit 11 and names the holder.
 #   - 1 warmup run (discarded), 3 measured runs.
 #   - Each run: target/release/rmlx baseline --model ... --kv-quant ... --prompt-tokens ... --max-tokens ...
 #   - Parses decode_tps + prefill_tps from stdout.
@@ -86,19 +87,16 @@ fi
 
 MODEL_BASENAME="$(basename "${MODEL_PATH}")"
 
-# ---- Preflight: Hard rule 8 —— kill competing MLX processes -----------------
-pkill -f "rmlx serve" || true
-pkill -f mlx_lm || true
-pkill -f paroquant || true
-pkill -f omlx || true
-sleep 5
-rm -f /tmp/rmlx.62265.claim 2>/dev/null || true
-
 # ---- Verify binary -----------------------------------------------------------
 if [[ ! -x "${BINARY}" ]]; then
     echo "ERROR: binary not found at ${BINARY}. Run: make build or make build-perf" >&2
     exit 1
 fi
+
+# The measured calls hide rmlx's stderr, so a Metal claim another process holds
+# is found here: the probe takes the claim and releases it, or exits 11 naming
+# the holder, and the run stops with that status.
+"${BINARY}" claim run -- true
 
 # ---- Verify model path -------------------------------------------------------
 if [[ ! -d "${MODEL_PATH}" ]]; then

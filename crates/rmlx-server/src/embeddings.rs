@@ -345,6 +345,7 @@ pub(crate) async fn embeddings(
     let gpu_gate = Arc::clone(&state.gpu_gate);
     // Clone the shared multimodal cache into the blocking compute task.
     let mm_cache = Arc::clone(&state.mm_cache);
+    let device = state.device;
 
     let (compute, prompt_tokens): (ComputeKind, usize) = match norm_input {
         NormInput::Texts(inputs) => {
@@ -460,6 +461,7 @@ pub(crate) async fn embeddings(
             return_multivector,
             want_base64,
             cache_ref,
+            device,
         )
     })
     .await;
@@ -553,6 +555,7 @@ fn compute_embeddings(
     return_multivector: bool,
     want_base64: bool,
     mm_cache: Option<&rmlx_models::multimodal_cache::MultimodalCache>,
+    device: rmlx_mlx::Device,
 ) -> Result<Vec<EmbeddingData>, EmbedError> {
     // Single Metal context: serialise the whole compute (load + forward).
     let _gpu = gpu_gate.lock();
@@ -596,8 +599,6 @@ fn compute_embeddings(
             .map_err(|e| EmbedError::Compute(format!("apply_task failed: {e}")))?;
     }
 
-    let device = rmlx_mlx::Device::Gpu;
-
     // Registering a thread-local GPU stream + CommandEncoder once per thread entry point.
     // tokio blocking-pool threads start with no GPU stream context; MLX's array
     // materialisation then fails with "There is no Stream(gpu, 0) in current thread".
@@ -606,7 +607,7 @@ fn compute_embeddings(
     // 0.31/0.32) so a CPU-scheduled op does not fault on this worker thread.
     rmlx_mlx::ensure_cpu_default_stream();
     if device == rmlx_mlx::Device::Gpu {
-        rmlx_mlx::ensure_gpu_default_stream();
+        rmlx_mlx::ensure_gpu_default_stream().map_err(|e| EmbedError::Compute(e.to_string()))?;
     }
 
     // Build (single_vec | multi_vec) per item with a uniform serializer so

@@ -236,12 +236,13 @@ fn equal_medians_with_different_stability_are_distinguishable() {
 /// A greedy, otherwise-valid argument bundle pointing at paths that do not
 /// exist, so any error a test observes came from an argument check rather than
 /// from I/O.
-fn unrunnable_args(runs: u32) -> BenchArgs {
+fn unrunnable_args(runs: u32) -> BenchArgs<'static> {
+    static CPU: ClaimedDevice = ClaimedDevice::cpu();
     BenchArgs {
         model: PathBuf::from("/nonexistent/model"),
         prompt: PathBuf::from("/nonexistent/prompt.txt"),
         prompt_label: "x".to_owned(),
-        device: Device::Cpu,
+        device: &CPU,
         max_tokens: 8,
         runs,
         warmup: 0,

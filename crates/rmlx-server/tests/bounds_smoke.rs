@@ -40,6 +40,7 @@ fn stub_state() -> AppState {
         Ok(g)
     });
     AppState {
+        device: rmlx_mlx::Device::Cpu,
         registry: Arc::new(ModelRegistry::default()),
         slots: Arc::new(parking_lot::RwLock::new(Vec::new())),
         embed_slot: Arc::new(parking_lot::RwLock::new(None)),

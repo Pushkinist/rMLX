@@ -55,7 +55,7 @@
 //! # Single-process GPU claim
 //!
 //! Per CLAUDE.md "Single MLX process per Mac" rule, callers must hold the
-//! `/tmp/rmlx.<port>.claim` lock before dispatching GPU kernels.
+//! Metal claim before dispatching GPU kernels.
 
 use std::sync::OnceLock;
 

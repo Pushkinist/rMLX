@@ -163,6 +163,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   code up by it. Identity comes from `lib/identity.sh` like every other bench
   script, and a dirty tree now records no `git_sha` at all.
 
+- **The Metal claim is one lock for the whole machine, not one per port.**
+  `serve` claimed its own `--port`, and every one-shot command claimed a
+  shared sentinel port — so a `serve` and a `baseline`, or two `serve`s on
+  different ports, could hold the GPU at once, defeating "one MLX process per
+  Mac". There is now one claim file, `/var/tmp/rmlx.claim`, held by an
+  exclusive `flock`, for every GPU command. The file is never deleted; the
+  kernel releases the lock when a holder exits, is killed, or crashes, and
+  the next claimer locks the same file with no operator action. A second
+  process that asks for the GPU while the claim is held is refused with exit
+  code `11`, naming the recorded holder's PID and command line.
+  `rmlx claim run -- <command>` runs a command while holding the claim, for
+  wrapping a script or a test suite; `make gpu-test` and `make ci-perf` now
+  run the GPU/Metal test suite under it. `--device cpu` takes no claim, and
+  now also refuses every KV codec but `none` (every other codec needs Metal)
+  and every later GPU stream or Metal call in the process; a running
+  server's per-request `kv_quant` override gets HTTP 400 for the same reason.
+  `rmlx healthcheck` probes the machine-wide claim instead of a per-port
+  file. For one release, a new binary also refuses when a build from before
+  this change holds the old per-port claim at `/tmp/rmlx.<port>.claim`; that
+  probe is removed in the release after next.
+
 ## [0.4.1] - 2026-09-02
 
 A patch release carrying one decode-path fix, one correction to what the

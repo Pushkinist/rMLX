@@ -243,7 +243,7 @@ fn k8v8_q8_quantize_eval_on_worker_thread() {
         // Register the worker's default CPU + GPU streams, as the generate
         // entry point does. Idempotent.
         rmlx_mlx::ensure_cpu_default_stream();
-        rmlx_mlx::ensure_gpu_default_stream();
+        rmlx_mlx::ensure_gpu_default_stream().expect("GPU default stream");
 
         // Shape mirrors a small K8V8 prefill K/V slice: [B=1, kv_h=1, S, D=256].
         // 256 elements/token → group=128 aligned.
