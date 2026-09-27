@@ -354,6 +354,15 @@ pub fn timeseries(
     Ok(rows)
 }
 
+/// A row's prompt name starts with the prefix bound at `?{idx}`, or that
+/// parameter is NULL. `substr`, not `LIKE`: `_` and `%` in a prefix are literal.
+fn prompt_prefix_pred(idx: usize) -> String {
+    format!(
+        "(?{idx} IS NULL
+          OR prompt_id IN (SELECT id FROM prompts WHERE substr(name, 1, length(?{idx})) = ?{idx}))"
+    )
+}
+
 /// `deltas(since_sha, threshold_pct?)` — compare current best vs best-as-of a commit.
 ///
 /// See docs/METRICS_DB.md §8.2 for full spec. Uses the earliest `ts_utc` of any
@@ -361,7 +370,8 @@ pub fn timeseries(
 /// Returns rows where the absolute delta percentage exceeds `threshold_pct`
 /// (default 5.0). Every cell and metric in the current `bests` view is
 /// evaluated, or with `prompt_prefix` only the cells whose prompt name starts
-/// with it.
+/// with it; the SHA is then looked up among those cells' observations too, and
+/// a prefix naming no cell is an error rather than an empty, passing result.
 pub fn deltas(
     conn: &Connection,
     since_sha: &str,
@@ -370,7 +380,25 @@ pub fn deltas(
 ) -> Result<Vec<DeltaRow>> {
     let threshold = threshold_pct.unwrap_or(5.0);
 
-    // Step 1: find the earliest ts_utc carrying that sha (or sha-dirty).
+    // Step 1: collect all distinct (cell, metric, direction) tuples from bests.
+    // We need to enumerate all cells+metrics that have observations.
+    // Pull the full bests view for current bests.
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {BEST_COLUMNS} FROM bests WHERE {}",
+        prompt_prefix_pred(1)
+    ))?;
+    let current_bests: Vec<BestRow> = stmt
+        .query_map([prompt_prefix], row_to_best)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if current_bests.is_empty() {
+        if let Some(p) = prompt_prefix {
+            return Err(Error::Query(format!(
+                "no cell has a prompt name starting '{p}'"
+            )));
+        }
+    }
+
+    // Step 2: find the earliest ts_utc carrying that sha (or sha-dirty).
     //
     // The binary itself no longer mints a `-dirty` suffix (`git_sha` is now
     // purely caller-supplied provenance — see `rmlx_core::runinfo`'s module
@@ -381,30 +409,25 @@ pub fn deltas(
     let dirty = format!("{since_sha}-dirty");
     let baseline_ts: Option<String> = conn
         .query_row(
-            "SELECT MIN(ts_utc) FROM observations WHERE git_sha = ?1 OR git_sha = ?2",
-            rusqlite::params![since_sha, dirty],
+            &format!(
+                "SELECT MIN(ts_utc) FROM observations
+                  WHERE (git_sha = ?1 OR git_sha = ?2) AND {}",
+                prompt_prefix_pred(3)
+            ),
+            rusqlite::params![since_sha, dirty, prompt_prefix],
             |r| r.get(0),
         )
         .optional()?
         .flatten();
 
+    let scope = prompt_prefix.map_or_else(String::new, |p| {
+        format!(" under a prompt name starting '{p}'")
+    });
     let baseline_ts = baseline_ts.ok_or_else(|| {
         Error::Query(format!(
-            "no observations found with git_sha '{since_sha}' (or '{since_sha}-dirty')"
+            "no observations found with git_sha '{since_sha}' (or '{since_sha}-dirty'){scope}"
         ))
     })?;
-
-    // Step 2: collect all distinct (cell, metric, direction) tuples from bests.
-    // We need to enumerate all cells+metrics that have observations.
-    // Pull the full bests view for current bests.
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {BEST_COLUMNS} FROM bests
-          WHERE ?1 IS NULL
-             OR prompt_id IN (SELECT id FROM prompts WHERE substr(name, 1, length(?1)) = ?1)"
-    ))?;
-    let current_bests: Vec<BestRow> = stmt
-        .query_map([prompt_prefix], row_to_best)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
 
     // Step 3: for each current best, compute "best as of baseline_ts" (ts_utc <= baseline_ts)
     // and "best after baseline_ts" (ts_utc > baseline_ts).

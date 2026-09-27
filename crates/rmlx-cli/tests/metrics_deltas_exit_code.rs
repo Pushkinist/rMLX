@@ -444,6 +444,29 @@ fn deltas_prompt_prefix_ignores_an_unrelated_regression() {
     );
 }
 
+/// A prefix that names no cell is an error naming the prefix, not a clean
+/// pass over nothing.
+#[test]
+fn deltas_prompt_prefix_naming_no_cell_fails() {
+    let td = tempfile::tempdir().unwrap();
+    let db = seed_two_prompt_db(&td, 99.0, 99.0);
+    let out = run_deltas(
+        &db,
+        &[
+            "--since-sha",
+            "sha_base",
+            "--prompt-prefix",
+            "no-such-bench-",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0), "stderr={stderr}");
+    assert!(
+        stderr.contains("no cell has a prompt name starting 'no-such-bench-'"),
+        "stderr={stderr}"
+    );
+}
+
 /// A regression in a cell under the prefix fails the scoped gate, and only
 /// that cell is printed.
 #[test]

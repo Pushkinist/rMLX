@@ -487,9 +487,11 @@ obj = {
     "weight_quant": weight_quant,
     "kv_quant": kv_quant,
     "ctx_max": ctx_max,
+    # Prompts are content-addressed and part of the cell key: each phase
+    # carries its own body, so the three phases are three cells.
     "prompt": {
-        "name": f"ssd-canary-{tag}",
-        "body": [{"role": "user", "content": "ssd_canary batch"}],
+        "name": tag,
+        "body": [{"role": "user", "content": f"ssd_canary {tag}"}],
     },
     "ts_utc": ts_utc,
     "temperature": temperature,

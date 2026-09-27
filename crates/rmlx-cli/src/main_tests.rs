@@ -134,8 +134,9 @@ fn every_draft_kind_is_a_flag_value() {
 use super::Cli;
 use clap::Parser;
 
-/// Parse `argv` as the `rmlx` command line. A debug-build `Cli` parse is
-/// deeper than the default test-thread stack, so it runs on a thread of its own.
+/// Parse `argv` as the `rmlx` command line, on a thread of its own: a debug
+/// `Cli` parse needs about 2.5 MB of stack, more than a test thread's default;
+/// production parses once, on the main thread.
 fn try_parse_cli<I, T>(argv: I) -> Result<Cli, clap::Error>
 where
     I: IntoIterator<Item = T>,
@@ -143,7 +144,7 @@ where
 {
     let argv: Vec<std::ffi::OsString> = argv.into_iter().map(Into::into).collect();
     std::thread::Builder::new()
-        .stack_size(64 << 20)
+        .stack_size(8 << 20)
         .spawn(move || Cli::try_parse_from(argv))
         .expect("spawn parser thread")
         .join()

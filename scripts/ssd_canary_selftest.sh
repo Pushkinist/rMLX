@@ -455,6 +455,31 @@ run_case() {
         fail "$name: no record for:$missing"
     fi
 
+    # Every record must fall under the prefix the gate scopes itself to, and
+    # each phase must be its own prompt (prompts are content-addressed).
+    local prefix prompts_ok
+    prefix="$(sed -n 's/.*--prompt-prefix \([^ ]*\).*/\1/p' "$tree/Makefile" | head -1)"
+    prompts_ok="$(python3 - "$cdir/log/records.jsonl" "$prefix" <<'PY' 2>&1
+import json, sys
+recs = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+names = [r["prompt"]["name"] for r in recs]
+bodies = {json.dumps(r["prompt"]["body"], sort_keys=True) for r in recs}
+if not sys.argv[2]:
+    print("the gate names no --prompt-prefix")
+elif not all(n.startswith(sys.argv[2]) for n in names):
+    print(f"prompt names {names} do not all start with {sys.argv[2]!r}")
+elif len(bodies) != len(recs):
+    print(f"{len(recs)} records share {len(bodies)} prompt bodies")
+else:
+    print("ok")
+PY
+)"
+    if [[ "$prompts_ok" == ok ]]; then
+        pass "$name: each phase has its own prompt, under the gate's prefix"
+    else
+        fail "$name: $prompts_ok"
+    fi
+
     # gate
     run_env "$cdir" "$tree" ${home_env[@]+"${home_env[@]}"} -- \
         make --no-print-directory -f "$tree/Makefile" ssd-canary-gate SHA=abc1234 >"$cdir/gate.out" 2>&1

@@ -33,12 +33,14 @@ root and the DB are the ones every `rmlx` command in the checkout resolves.
 Each run creates a new directory,
 `<data root>/proofs/ssd-canary-<UTC stamp>.<random>/`, and every phase server
 runs with its absolute path as `RMLX_HOME`: POPULATE starts from an empty SSD
-tier, and the servers' logs, `events` rows and SSD blocks stay in it. At exit,
-however the run ends, the script deletes that directory's `cache/kv/`, the SSD
+tier, and the servers' logs, `events` rows and SSD blocks stay in it. On any
+exit the trap sees, the script deletes that directory's `cache/kv/`, the SSD
 blocks, and nothing else: the CSVs, the summary, the logs and the `events` DB
-are kept. Nothing already in the data root is removed; outside the run
-directory, the one write is `rmlx metrics record` appending the three records
-to the metrics DB.
+are kept. The script itself removes nothing else. Outside the run directory it
+writes through `rmlx` alone: `rmlx metrics record` appends the three records to
+the metrics DB, and each `rmlx` call, like every `rmlx` command, starts a run
+log in the data root's `logs/`, which may rotate that directory's oldest logs
+by the size cap.
 
 Each phase's server takes the Metal claim, and the script stops only the
 server it started. When another process holds the claim, the phase server
@@ -79,7 +81,9 @@ The run exits 1 when any FAIL check fails. WARN checks only print a note.
 
 Each phase files one `RunRecord` through `rmlx metrics record`, tagged
 `ssd-canary-populate`, `ssd-canary-revisit` or `ssd-canary-evict`, into the
-metrics DB `rmlx metrics path` names. Its `ctx_max` is the 8192 the servers
+metrics DB `rmlx metrics path` names. Each phase's prompt is named after its
+tag and its body carries the tag, so the three phases are three cells
+(prompts are content-addressed, and a shared body would make them one). Its `ctx_max` is the 8192 the servers
 ran at, and its `kv_quant` is the codec the POPULATE server's log names
 (`scripts/lib/server_kv_quant.py`); a log naming none stops the run. The
 POPULATE and REVISIT records carry SSD hits, bytes used,
@@ -106,7 +110,11 @@ names, at `CANARY_THRESHOLD_PCT` (default 3). That is the DB the canary
 writes, so the comparison sees the rows of `<sha>` and of every later run.
 `--prompt-prefix` keeps it to the cells whose prompt name starts
 `ssd-canary-`, the canary's own; a regression in another bench's cell in the
-same DB does not fail it. It exits 125 without `SHA=` or without the DB.
+same DB does not fail it, and a prefix matching no cell is an error, not a
+pass. The SHA is looked up among those cells too. It exits 125 without `SHA=`,
+without the DB, or when no canary cell has a value at the SHA — which is every
+cell on the first run after the per-phase prompts were introduced, since the
+earlier runs filed all three phases under one prompt.
 
 `scripts/ssd_canary_selftest.sh` (`make ssd-canary-selftest`, in `make ci`)
 runs `make ssd-canary` and the gate against a stub binary and a stub server,

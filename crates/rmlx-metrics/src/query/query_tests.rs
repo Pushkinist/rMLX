@@ -867,9 +867,61 @@ fn deltas_prompt_prefix_keeps_only_matching_cells() {
     let scoped = deltas(&conn, "sha_base", Some(5.0), Some("ssd_canary_")).unwrap();
     assert_eq!(scoped.len(), 1, "{scoped:?}");
     assert!(scoped[0].regressed);
-    assert!(deltas(&conn, "sha_base", Some(5.0), Some("nothing-"))
-        .unwrap()
-        .is_empty());
+    let err = deltas(&conn, "sha_base", Some(5.0), Some("nothing-")).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("no cell has a prompt name starting 'nothing-'"),
+        "{err}"
+    );
+}
+
+/// With a prefix, the SHA is looked up among that prefix's cells only: a SHA
+/// that measured nothing under the prefix is no baseline for it.
+#[test]
+fn deltas_prompt_prefix_scopes_the_sha_lookup() {
+    let mut conn = test_conn();
+    {
+        let mut rec = Recorder::new(&mut conn, "test@0.0.1");
+        for (prompt, value, ts, sha) in [
+            (
+                "ssd-canary-populate",
+                100.0,
+                "2026-05-01T10:00:00Z",
+                "sha_canary",
+            ),
+            ("perf-canary", 100.0, "2026-05-02T10:00:00Z", "sha_other"),
+            (
+                "ssd-canary-populate",
+                99.0,
+                "2026-05-03T10:00:00Z",
+                "sha_after",
+            ),
+        ] {
+            let mut run = make_run(
+                "rmlx",
+                "gemma-4-e2b",
+                "decode_tps_warm",
+                value,
+                ts,
+                Some(sha),
+            );
+            run.prompt = PromptRef::ByBody {
+                name: prompt.into(),
+                body: json!(format!("body of {prompt}")),
+                notes: None,
+                tokens_approx: Some(4),
+            };
+            rec.record_run(&run).unwrap();
+        }
+    }
+    assert!(deltas(&conn, "sha_other", Some(5.0), None).is_ok());
+    let err = deltas(&conn, "sha_other", Some(5.0), Some("ssd-canary-")).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("no observations found with git_sha 'sha_other'"),
+        "{err}"
+    );
+    assert!(deltas(&conn, "sha_canary", Some(5.0), Some("ssd-canary-")).is_ok());
 }
 
 // ── cell key reaches every consumer ───────────────────────────────────────
