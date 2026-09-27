@@ -37,6 +37,7 @@ static GLOBAL: dhat::Alloc = dhat::Alloc;
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod commands;
+mod exit;
 mod panic_hook;
 mod startup;
 
@@ -44,13 +45,14 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+use exit::exit_code;
 use rmlx_core::runinfo::make_run_id;
 use rmlx_metrics::events::EventRecorder;
-use rmlx_server::SENTINEL_PORT;
 use startup::{
     init_tracing, print_cache_type_table, print_kv_quant_residency_table, LogLevel, MetricsArg,
 };
 use tracing::info;
+use tracing_appender::non_blocking::WorkerGuard;
 
 use commands::metrics::{dispatch as metrics_dispatch, MetricsCmd};
 
@@ -147,10 +149,10 @@ use commands::serve::{
     FusedQkMode, PlanarFlashDecodeMode, RotKFusedMode, SparseAttnMode, TurboFlashMode,
 };
 use commands::{
-    acquire_claim_for_device, build_cache_type_spec, kv_bits_u8, parse_device, parse_kv_bits_combo,
-    parse_kv_bits_fractional, parse_kv_boundary_layers, parse_kv_preset, parse_kv_quant,
-    parse_max_ctx, parse_max_prompt_tokens, resolve_model_flags, resolve_preset_arg, run_baseline,
-    run_bench, run_healthcheck, run_info, run_kv_calibrate, run_ppl, run_serve,
+    build_cache_type_spec, kv_bits_u8, parse_device, parse_kv_bits_combo, parse_kv_bits_fractional,
+    parse_kv_boundary_layers, parse_kv_preset, parse_kv_quant, parse_max_ctx,
+    parse_max_prompt_tokens, resolve_model_flags, resolve_preset_arg, run_baseline, run_bench,
+    run_healthcheck, run_info, run_kv_calibrate, run_ppl, run_serve,
 };
 
 /// Long-help body shared by `--cache-type-k` / `--cache-type-v` on every
@@ -539,7 +541,7 @@ enum Cmd {
         /// Device to run inference on: "cpu" or "gpu".
         /// Defaults to "gpu". Prefill runs in chunks, so a long prompt does not
         /// hit the Metal watchdog timeout. Use --device cpu to run on the CPU.
-        #[arg(long)]
+        #[arg(long, value_parser = ["cpu", "gpu"])]
         device: Option<String>,
         #[arg(long, help = KV_QUANT_HELP, long_help = KV_QUANT_LONG_HELP)]
         kv_quant: Option<String>,
@@ -937,7 +939,7 @@ enum Cmd {
         /// Device to run inference on: "cpu" or "gpu".
         /// Defaults to "gpu". Prefill runs in chunks, so a long prompt does not hit the
         /// Metal watchdog timeout.
-        #[arg(long, default_value = "gpu")]
+        #[arg(long, default_value = "gpu", value_parser = ["cpu", "gpu"])]
         device: String,
         #[arg(
             long,
@@ -1027,7 +1029,7 @@ enum Cmd {
         #[arg(long, value_name = "PATH")]
         output: Option<PathBuf>,
         /// Device: "cpu" or "gpu" (default "gpu").
-        #[arg(long, default_value = "gpu")]
+        #[arg(long, default_value = "gpu", value_parser = ["cpu", "gpu"])]
         device: String,
     },
     /// Print arch + quant info for a snapshot, no inference.
@@ -1042,7 +1044,7 @@ enum Cmd {
         /// Defaults to "gpu". Prefill runs in chunks, so a long prompt does not hit the
         /// Metal watchdog timeout.
         /// Only relevant when --probe-forward or --probe-smoke is set.
-        #[arg(long, default_value = "gpu")]
+        #[arg(long, default_value = "gpu", value_parser = ["cpu", "gpu"])]
         device: String,
         /// Run a single-token forward pass and print top-1 token + max logit.
         /// Token 2 (BOS) is used. Requires the model to be Gemma4ForConditionalGeneration.
@@ -1116,15 +1118,16 @@ enum Cmd {
     },
     /// Manage the metrics SQLite database (schema init, health checks, backup/restore).
     Metrics(MetricsCmd),
-    /// Check rMLX readiness: claim file, HTTP /health, registry loadability,
+    /// Check rMLX readiness: Metal claim, HTTP /health, registry loadability,
     /// metrics DB, disk space, and process memory.
     ///
     /// Emits one JSON line per check (or plain text with --human).
     /// Exit 0 = all green, 1 = any red, 2 = internal error.
     ///
     /// Default (no --full) path is MLX-free: safe to run repeatedly without
-    /// holding the Metal context. --full loads MLX for the smoke probe;
-    /// ensure no other rMLX instance is running before using --full.
+    /// holding the Metal context. --full takes the Metal claim for the smoke
+    /// probe; when another process holds it, the smoke lines are red and name
+    /// the holder.
     Healthcheck {
         /// Check every registered model's loadability.
         /// Mutually exclusive with --model.
@@ -1134,7 +1137,10 @@ enum Cmd {
         /// Mutually exclusive with --registry.
         #[arg(long, conflicts_with = "registry")]
         model: Option<PathBuf>,
-        /// Also probe a live server on this port (claim + HTTP checks).
+        /// Also probe a live server on this port (claim + HTTP checks). The
+        /// claim check is machine-wide: green when any process holds the
+        /// claim, naming the holder it recorded. It does not take the claim,
+        /// but a GPU command that starts during the probe's moment exits 11.
         #[arg(long)]
         port: Option<u16>,
         /// Path to the metrics SQLite DB.
@@ -1145,7 +1151,9 @@ enum Cmd {
         /// Default 5.
         #[arg(long, default_value_t = 5)]
         min_disk_gb: u64,
-        /// Also run the MLX smoke probe per model (loads MLX — slow, exclusive Metal).
+        /// Also run the MLX smoke probe per model (loads MLX — slow, takes the
+        /// Metal claim). With --port, when the claim check finds a holder, the
+        /// probes do not run and each smoke line is info naming the holder.
         #[arg(long, default_value_t = false)]
         full: bool,
         /// Emit plain OK/FAIL text instead of JSON lines.
@@ -1176,7 +1184,7 @@ enum Cmd {
         #[arg(long, value_name = "N")]
         prompt_tokens: Option<u32>,
         /// Device: "cpu" or "gpu". Defaults to "gpu".
-        #[arg(long, default_value = "gpu")]
+        #[arg(long, default_value = "gpu", value_parser = ["cpu", "gpu"])]
         device: String,
         /// Number of tokens to generate. Default 32. Visible alias `--gen-tokens`.
         #[arg(long, visible_alias = "gen-tokens", default_value_t = 32)]
@@ -1366,7 +1374,7 @@ enum Cmd {
         #[arg(long, value_name = "N")]
         prompt_tokens: Option<u32>,
         /// Device: "cpu" or "gpu".
-        #[arg(long, default_value = "gpu")]
+        #[arg(long, default_value = "gpu", value_parser = ["cpu", "gpu"])]
         device: String,
         /// Tokens to generate per run. Visible alias `--gen-tokens`.
         #[arg(long, visible_alias = "gen-tokens", default_value_t = 128)]
@@ -1488,6 +1496,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ProfileCmd,
     },
+    /// Hold the machine-wide Metal claim for a command that is not rmlx.
+    Claim {
+        #[command(subcommand)]
+        cmd: ClaimCmd,
+    },
     /// — offline evaluation harness (currently only `ppl`).
     Eval {
         #[command(subcommand)]
@@ -1592,7 +1605,7 @@ enum EvalCmd {
         #[arg(long, default_value = "")]
         corpus: String,
         /// Device: "cpu" or "gpu". Default "gpu".
-        #[arg(long, default_value = "gpu")]
+        #[arg(long, default_value = "gpu", value_parser = ["cpu", "gpu"])]
         device: String,
         /// Cap the number of tokens fed to the scorer. `0` = use the whole
         /// corpus. Defaults to `0`; the wikitext-2 harness sets this when
@@ -1665,6 +1678,30 @@ enum EvalCmd {
 enum ProfileCmd {
     /// List the names of all defined profiles, one per line.
     List,
+}
+
+/// `rmlx claim <subcommand>`.
+#[derive(Subcommand, Debug)]
+enum ClaimCmd {
+    /// Run a non-interactive command while this process holds the Metal claim.
+    ///
+    /// The command inherits the claim, so the claim stays held until the command
+    /// exits; its stdin is /dev/null, not the terminal. SIGTERM, SIGINT and SIGHUP are forwarded to
+    /// its process group, and `rmlx claim run` exits with its status. When
+    /// another process holds the claim, nothing runs and the exit code is 11.
+    ///
+    /// The command must not start rmlx itself: this process holds the claim,
+    /// so every rmlx GPU command the command starts is refused with exit 11.
+    Run {
+        /// The command to run and its arguments, after `--`.
+        #[arg(
+            required = true,
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "COMMAND"
+        )]
+        command: Vec<std::ffi::OsString>,
+    },
 }
 
 // — defaults for the profile-bindable `serve` flags. Kept here (not as
@@ -1760,20 +1797,6 @@ fn refuse_to_measure_off_the_pin(command: &str) -> Result<()> {
     )
 }
 
-#[allow(
-    clippy::expect_used,
-    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
-)]
-#[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or validated before call"
-)]
-#[allow(
-    clippy::cognitive_complexity,
-    clippy::too_many_lines,
-    reason = "fn main() is the top-level CLI dispatch — splitting fragments the \
-              subcommand wiring, which must remain co-located for clap arg resolution"
-)]
 fn main() -> Result<()> {
     // dhat profiler — instantiated FIRST so it covers all subsequent allocations.
     // Dropped at end of main, which triggers the JSON write to dhat-heap.json.
@@ -1820,8 +1843,38 @@ fn main() -> Result<()> {
             std::env::set_var("RUST_BACKTRACE", "full");
         }
     }
-    let _guard = init_tracing(&run_id, cli.log, cli.log_cap_mb)?;
+    let log_guard = init_tracing(&run_id, cli.log, cli.log_cap_mb)?;
+    let outcome = run(cli, &run_id, capture_forces_metrics_off);
+    finish(log_guard, outcome)
+}
 
+/// Leave the process once the log writer has flushed: `exit` runs no
+/// destructor.
+fn finish(log_guard: WorkerGuard, outcome: Result<i32>) -> Result<()> {
+    let code = exit_code(outcome)?;
+    if code == 0 {
+        return Ok(());
+    }
+    drop(log_guard);
+    std::process::exit(code)
+}
+
+/// Everything after the log writer starts. Returns the exit code.
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or validated before call"
+)]
+#[allow(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    reason = "run() is the top-level CLI dispatch — splitting fragments the \
+              subcommand wiring, which must remain co-located for clap arg resolution"
+)]
+fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> {
     // Record the nax-GEMM-kernel capability of the MLX this process loaded.
     // `rmlx-metrics` cannot read this itself (see `identity::set_mlx_nax`
     // doc) — `rmlx-cli` is the one binary that links both `rmlx-mlx` and
@@ -1889,20 +1942,28 @@ fn main() -> Result<()> {
     // an `EventRecorder` — otherwise concurrent test subprocesses contend
     // on the workspace `.rmlx/metrics/runs.db` lock.
     if let Cmd::Metrics(cmd) = cli.cmd {
-        return metrics_dispatch(cmd);
+        return metrics_dispatch(cmd).map(|()| 0);
     }
 
     // `rmlx profile …` is a pure file-read admin command — it touches no model
     // and opens no metrics recorder, so it short-circuits like `metrics`.
     if let Cmd::Profile { cmd } = &cli.cmd {
         return match cmd {
-            ProfileCmd::List => commands::run_profile_list(),
+            ProfileCmd::List => commands::run_profile_list().map(|()| 0),
         };
     }
 
+    // `rmlx claim run` records nothing itself; the command it runs does.
+    if let Cmd::Claim {
+        cmd: ClaimCmd::Run { command },
+    } = &cli.cmd
+    {
+        return commands::claim_run::run_claim_run(command);
+    }
+
     // `rmlx kv-calibrate` runs without opening the EventRecorder. The
-    // head-budget recipes take the claim on port 0 for the model load only;
-    // the weight-norm recipes (turbo*) are CPU-only.
+    // head-budget recipes hold the claim from the model load to the end of
+    // the measurement; the weight-norm recipes (turbo*) are CPU-only.
     if let Cmd::KvCalibrate {
         model,
         recipe,
@@ -1919,31 +1980,33 @@ fn main() -> Result<()> {
             prompts.as_deref(),
             *mass_threshold,
             *target_mass_budget_floor,
-        );
+        )
+        .map(|()| 0);
     }
 
     // D-class startup site: EventRecorder::open failure is fatal; tracing is
     // already initialised here, so we emit an error event before propagating.
-    let sink = EventRecorder::open(&run_id).map_err(|e| {
+    let sink = EventRecorder::open(run_id).map_err(|e| {
         tracing::error!(error = %e, "D-class startup: metrics EventRecorder::open failed");
         anyhow::anyhow!("metrics open: {e}")
     })?;
 
     #[allow(
         clippy::unreachable,
-        reason = "Cmd::Metrics, Cmd::Profile, and Cmd::KvCalibrate are handled by `return`-ing \
-                  early blocks above; reaching these arms means the early-return guard was \
-                  removed — a BUG"
+        reason = "Cmd::Metrics, Cmd::Profile, Cmd::Claim and Cmd::KvCalibrate are handled by \
+                  early blocks above that return; reaching these arms means the early-return \
+                  guard was removed — a BUG"
     )]
     #[allow(
         clippy::match_same_arms,
-        reason = "Metrics + Profile + KvCalibrate arms are unreachable!() guards documenting \
-                  distinct early-return commands above; collapsing them would lose the \
-                  Cmd-specific BUG narrative"
+        reason = "Metrics + Profile + Claim + KvCalibrate arms are unreachable!() guards \
+                  documenting distinct early-return commands above; collapsing them would \
+                  lose the Cmd-specific BUG narrative"
     )]
     match cli.cmd {
         Cmd::Metrics(_) => unreachable!("handled above"),
         Cmd::Profile { .. } => unreachable!("handled above"),
+        Cmd::Claim { .. } => unreachable!("handled above"),
         Cmd::KvCalibrate { .. } => unreachable!("handled above"),
         Cmd::Serve {
             model,
@@ -2168,30 +2231,27 @@ fn main() -> Result<()> {
             // --kv-preset pre-resolution. parse_kv_preset returns a
             // KvPresetArg which is either Resolved(KvQuant) or Auto;
             // resolve_preset_arg turns Auto into DEFAULT_KV_QUANT.
-            let (dev, kv_quant_final, max_ctx_override) = if let Some(ref model_path) = model {
+            let (kv_quant_final, max_ctx_override) = if let Some(ref model_path) = model {
                 if let Some(preset_arg) = kv_preset {
                     let max_ctx_override = parse_max_ctx(max_ctx)?;
-                    let dev = parse_device(&device)?;
-                    info!(device = %device, "rmlx serve: resolved device");
                     let cfg = rmlx_loader::load_config(model_path)
                         .map_err(|e| anyhow::anyhow!("load_config: {e}"))?;
                     let preset_kq = resolve_preset_arg(preset_arg);
                     info!(kv_quant = ?preset_kq, "--kv-preset resolved");
-                    let kq = commands::parse::resolve_kv_quant(&cfg, Some(preset_kq), None);
-                    (dev, Some(kq), max_ctx_override)
+                    let kq = commands::parse::resolve_kv_quant(&cfg, Some(preset_kq), None)?;
+                    (Some(kq), max_ctx_override)
                 } else {
-                    let (d, kq, ctx) = resolve_model_flags(
+                    let (kq, ctx) = resolve_model_flags(
                         model_path,
                         &kv_quant,
                         cache_type_k.as_deref(),
                         cache_type_v.as_deref(),
                         max_ctx,
-                        &device,
                         "rmlx serve",
                         kv_bits,
                         kv_group_size,
                     )?;
-                    (d, Some(kq), ctx)
+                    (Some(kq), ctx)
                 }
             } else {
                 // Registry mode: parse flags individually (no model to resolve against).
@@ -2222,8 +2282,6 @@ fn main() -> Result<()> {
                     build_cache_type_spec(cache_type_k.as_deref(), cache_type_v.as_deref())?
                 };
                 let max_ctx_override = parse_max_ctx(max_ctx)?;
-                let dev = parse_device(&device)?;
-                info!(device = %device, "rmlx serve: resolved device");
                 if cts_override.is_some() {
                     tracing::error!(
                         "--cache-type-k/--cache-type-v requires --model; \
@@ -2233,9 +2291,9 @@ fn main() -> Result<()> {
                         "error: --cache-type-k/--cache-type-v requires --model (not --registry)"
                     );
                     eprintln!("see docs/KV_QUANT.md for supported codecs and combinations");
-                    std::process::exit(78);
+                    return Err(exit::ExitWith(78).into());
                 }
-                (dev, kv_quant_opt, max_ctx_override)
+                (kv_quant_opt, max_ctx_override)
             };
 
             // Validate --paged-kv against the fully resolved KvQuant
@@ -2247,8 +2305,8 @@ fn main() -> Result<()> {
                 return Err(anyhow::anyhow!(msg));
             }
 
-            // Acquire Metal claim for GPU runs; CPU-only skips.
-            let _claim = acquire_claim_for_device(dev, port)?;
+            let claimed = parse_device(&device)?;
+            claimed.admits(kv_quant_final.as_slice())?;
             // Build YARN override from CLI flags. None when either flag is absent.
             let yarn_override = yarn_factor.map(|factor| rmlx_models::qwen3::YarnOverride {
                 factor,
@@ -2259,7 +2317,7 @@ fn main() -> Result<()> {
                 registry.as_deref(),
                 &host,
                 port,
-                &device,
+                &claimed,
                 kv_quant_final,
                 max_ctx_override,
                 idle_timeout_spec,
@@ -2313,15 +2371,14 @@ fn main() -> Result<()> {
             //
             // --kv-preset pre-resolution. resolve_preset_arg turns
             // KvPresetArg::Auto into DEFAULT_KV_QUANT.
-            let (dev, _kv_quant_final, _max_ctx_override) = if let Some(preset_arg) = kv_preset {
+            let (kv_quant_final, _max_ctx_override) = if let Some(preset_arg) = kv_preset {
                 let max_ctx_override = parse_max_ctx(max_ctx)?;
-                let dev = parse_device(&device)?;
                 let cfg = rmlx_loader::load_config(&model)
                     .map_err(|e| anyhow::anyhow!("load_config: {e}"))?;
                 let preset_kq = resolve_preset_arg(preset_arg);
                 info!(kv_quant = ?preset_kq, "--kv-preset resolved");
-                let kq = commands::parse::resolve_kv_quant(&cfg, Some(preset_kq), None);
-                (dev, kq, max_ctx_override)
+                let kq = commands::parse::resolve_kv_quant(&cfg, Some(preset_kq), None)?;
+                (kq, max_ctx_override)
             } else {
                 resolve_model_flags(
                     &model,
@@ -2329,13 +2386,13 @@ fn main() -> Result<()> {
                     cache_type_k.as_deref(),
                     cache_type_v.as_deref(),
                     max_ctx,
-                    &device,
                     "rmlx chat",
                     kv_bits,
                     kv_group_size,
                 )?
             };
-            let _claim = acquire_claim_for_device(dev, SENTINEL_PORT)?;
+            let claimed = parse_device(&device)?;
+            claimed.admits(&[kv_quant_final])?;
             println!("rmlx chat   model={}  device={device}", model.display());
         }
         Cmd::Transcribe {
@@ -2348,10 +2405,7 @@ fn main() -> Result<()> {
             output,
             device,
         } => {
-            let dev = parse_device(&device)?;
-            // ASR holds Metal; acquire the single-MLX claim like the other
-            // model-loading subcommands.
-            let _claim = acquire_claim_for_device(dev, SENTINEL_PORT)?;
+            let claimed = parse_device(&device)?;
             let args = commands::transcribe::TranscribeArgs {
                 audio: &audio,
                 model: &model,
@@ -2360,7 +2414,7 @@ fn main() -> Result<()> {
                 language: &language,
                 translate,
             };
-            let rendered = commands::transcribe::run_transcribe(&args, dev)?;
+            let rendered = commands::transcribe::run_transcribe(&args, &claimed)?;
             match output {
                 Some(path) => {
                     std::fs::write(&path, rendered.as_bytes())
@@ -2390,7 +2444,7 @@ fn main() -> Result<()> {
             if list_cache_types {
                 print_cache_type_table();
                 print_kv_quant_residency_table();
-                return Ok(());
+                return Ok(0);
             }
             let model = model.expect("clap required_unless_present guarantees model is Some");
             // Always run the cache-type resolver (it loads config + fails
@@ -2400,15 +2454,14 @@ fn main() -> Result<()> {
             //
             // --kv-preset pre-resolution. resolve_preset_arg turns
             // KvPresetArg::Auto into DEFAULT_KV_QUANT.
-            let (dev, kv_quant_final, max_ctx_override) = if let Some(preset_arg) = kv_preset {
+            let (kv_quant_final, max_ctx_override) = if let Some(preset_arg) = kv_preset {
                 let max_ctx_override = parse_max_ctx(max_ctx)?;
-                let dev = parse_device(&device)?;
                 let cfg = rmlx_loader::load_config(&model)
                     .map_err(|e| anyhow::anyhow!("load_config: {e}"))?;
                 let preset_kq = resolve_preset_arg(preset_arg);
                 info!(kv_quant = ?preset_kq, "--kv-preset resolved");
-                let kq = commands::parse::resolve_kv_quant(&cfg, Some(preset_kq), None);
-                (dev, kq, max_ctx_override)
+                let kq = commands::parse::resolve_kv_quant(&cfg, Some(preset_kq), None)?;
+                (kq, max_ctx_override)
             } else {
                 resolve_model_flags(
                     &model,
@@ -2416,35 +2469,32 @@ fn main() -> Result<()> {
                     cache_type_k.as_deref(),
                     cache_type_v.as_deref(),
                     max_ctx,
-                    &device,
                     "rmlx info",
                     kv_bits,
                     kv_group_size,
                 )?
             };
-            let kv_quant_resolved = if probe_forward || probe_smoke {
-                Some(kv_quant_final)
+            // Only a probe runs MLX, so only a probe parses the device and
+            // takes the claim.
+            let (kv_quant_resolved, probe_device) = if probe_forward || probe_smoke {
+                let claimed = parse_device(&device)?;
+                claimed.admits(&[kv_quant_final])?;
+                (Some(kv_quant_final), Some(claimed))
             } else {
-                None
-            };
-            // Claim only when a probe is requested (probes use the MLX runtime).
-            let _claim = if probe_forward || probe_smoke {
-                Some(acquire_claim_for_device(dev, SENTINEL_PORT)?)
-            } else {
-                None
+                (None, None)
             };
             let exit_code = run_info(
                 &model,
                 probe_forward,
                 probe_smoke,
-                dev,
+                probe_device.as_ref(),
                 kv_quant_resolved,
                 max_ctx_override,
                 &sink,
             )?;
             let code = exit_code.as_i32();
             if code != 0 {
-                std::process::exit(code);
+                return Ok(code);
             }
         }
         Cmd::Healthcheck {
@@ -2474,7 +2524,7 @@ fn main() -> Result<()> {
                 full,
                 human,
             )?;
-            std::process::exit(exit_code);
+            return Ok(exit_code);
         }
         Cmd::Baseline {
             model,
@@ -2510,6 +2560,35 @@ fn main() -> Result<()> {
             rmlx_models::kv_cache::install_kv_boundary(kv_boundary_layers)?;
             refuse_to_measure_off_the_pin("rmlx baseline")?;
 
+            let max_prompt_tokens = max_prompt_tokens.map(parse_max_prompt_tokens).transpose()?;
+            // --kv-preset pre-resolution. resolve_preset_arg turns
+            // KvPresetArg::Auto into DEFAULT_KV_QUANT.
+            let (kv_quant_resolved, max_ctx_override) = if let Some(preset_arg) = kv_preset {
+                let max_ctx_override = parse_max_ctx(max_ctx)?;
+                let cfg = rmlx_loader::load_config(&model)
+                    .map_err(|e| anyhow::anyhow!("load_config: {e}"))?;
+                let preset_kq = resolve_preset_arg(preset_arg);
+                info!(kv_quant = ?preset_kq, "--kv-preset resolved");
+                let kq = commands::parse::resolve_kv_quant(&cfg, Some(preset_kq), None)?;
+                (kq, max_ctx_override)
+            } else {
+                resolve_model_flags(
+                    &model,
+                    &kv_quant,
+                    cache_type_k.as_deref(),
+                    cache_type_v.as_deref(),
+                    max_ctx,
+                    "rmlx baseline",
+                    kv_bits,
+                    kv_group_size,
+                )?
+            };
+            let claimed = parse_device(&device)?;
+            claimed.admits(&[kv_quant_resolved])?;
+            #[cfg(feature = "metal-capture")]
+            if gpu_capture.is_some() && !claimed.holds_claim() {
+                anyhow::bail!("--gpu-capture records a Metal trace and needs --device gpu");
+            }
             // Arm the GPU-capture window before anything expensive happens: a
             // request that cannot be honoured must cost seconds, not a full
             // weight load followed by a failure at the first decode step.
@@ -2520,33 +2599,6 @@ fn main() -> Result<()> {
                 gpu_capture_steps,
                 max_tokens,
             )?;
-
-            let max_prompt_tokens = max_prompt_tokens.map(parse_max_prompt_tokens).transpose()?;
-            // --kv-preset pre-resolution. resolve_preset_arg turns
-            // KvPresetArg::Auto into DEFAULT_KV_QUANT.
-            let (dev, kv_quant_resolved, max_ctx_override) = if let Some(preset_arg) = kv_preset {
-                let max_ctx_override = parse_max_ctx(max_ctx)?;
-                let dev = parse_device(&device)?;
-                let cfg = rmlx_loader::load_config(&model)
-                    .map_err(|e| anyhow::anyhow!("load_config: {e}"))?;
-                let preset_kq = resolve_preset_arg(preset_arg);
-                info!(kv_quant = ?preset_kq, "--kv-preset resolved");
-                let kq = commands::parse::resolve_kv_quant(&cfg, Some(preset_kq), None);
-                (dev, kq, max_ctx_override)
-            } else {
-                resolve_model_flags(
-                    &model,
-                    &kv_quant,
-                    cache_type_k.as_deref(),
-                    cache_type_v.as_deref(),
-                    max_ctx,
-                    &device,
-                    "rmlx baseline",
-                    kv_bits,
-                    kv_group_size,
-                )?
-            };
-            let _claim = acquire_claim_for_device(dev, SENTINEL_PORT)?;
 
             // Resolve --prompt-tokens → canonical longctx file when present.
             // The prompts/ dir lives at the workspace root; locate it via the
@@ -2610,9 +2662,10 @@ fn main() -> Result<()> {
             let baseline_result = run_baseline(
                 &model,
                 &effective_prompt_path,
+                &claimed,
                 &device,
                 max_tokens,
-                &run_id,
+                run_id,
                 &label_str,
                 Some(kv_quant_resolved),
                 max_ctx_override,
@@ -2663,15 +2716,14 @@ fn main() -> Result<()> {
             // and a cell recorded there name the same codec.
             refuse_to_measure_off_the_pin("rmlx bench")?;
 
-            let (dev, kv_quant_resolved, max_ctx_override) = if let Some(preset_arg) = kv_preset {
+            let (kv_quant_resolved, max_ctx_override) = if let Some(preset_arg) = kv_preset {
                 let max_ctx_override = parse_max_ctx(max_ctx)?;
-                let dev = parse_device(&device)?;
                 let cfg = rmlx_loader::load_config(&model)
                     .map_err(|e| anyhow::anyhow!("load_config: {e}"))?;
                 let preset_kq = resolve_preset_arg(preset_arg);
                 info!(kv_quant = ?preset_kq, "--kv-preset resolved");
-                let kq = commands::parse::resolve_kv_quant(&cfg, Some(preset_kq), None);
-                (dev, kq, max_ctx_override)
+                let kq = commands::parse::resolve_kv_quant(&cfg, Some(preset_kq), None)?;
+                (kq, max_ctx_override)
             } else {
                 resolve_model_flags(
                     &model,
@@ -2679,13 +2731,13 @@ fn main() -> Result<()> {
                     cache_type_k.as_deref(),
                     cache_type_v.as_deref(),
                     max_ctx,
-                    &device,
                     "rmlx bench",
                     kv_bits,
                     kv_group_size,
                 )?
             };
-            let _claim = acquire_claim_for_device(dev, SENTINEL_PORT)?;
+            let claimed = parse_device(&device)?;
+            claimed.admits(&[kv_quant_resolved])?;
 
             let prompts_root = resolve_prompts_root(prompts_dir);
             let (prompt_path, prompt_label) =
@@ -2695,7 +2747,7 @@ fn main() -> Result<()> {
                 model,
                 prompt: prompt_path,
                 prompt_label,
-                device: dev,
+                device: &claimed,
                 max_tokens,
                 runs,
                 warmup,
@@ -2748,57 +2800,49 @@ fn main() -> Result<()> {
                 rmlx_models::kv_cache::install_kv_boundary(kv_boundary_layers)?;
                 // Same KV resolution ladder as `baseline` and `bench`, so a
                 // codec scored here is the codec those two measure.
-                let (dev, kv_quant_resolved) = if !kv_requested {
-                    (parse_device(&device)?, None)
+                let kv_quant_resolved = if !kv_requested {
+                    None
                 } else if let Some(preset_arg) = kv_preset {
-                    let dev = parse_device(&device)?;
                     let cfg = rmlx_loader::load_config(&model)
                         .map_err(|e| anyhow::anyhow!("load_config: {e}"))?;
                     let preset_kq = resolve_preset_arg(preset_arg);
                     info!(kv_quant = ?preset_kq, "--kv-preset resolved");
-                    (
-                        dev,
-                        Some(commands::parse::resolve_kv_quant(
-                            &cfg,
-                            Some(preset_kq),
-                            None,
-                        )),
-                    )
+                    Some(commands::parse::resolve_kv_quant(
+                        &cfg,
+                        Some(preset_kq),
+                        None,
+                    )?)
                 } else {
-                    let (dev, kq, _) = resolve_model_flags(
+                    let (kq, _) = resolve_model_flags(
                         &model,
                         kv_quant.as_deref().unwrap_or("auto"),
                         cache_type_k.as_deref(),
                         cache_type_v.as_deref(),
                         None,
-                        &device,
                         "rmlx eval ppl",
                         kv_bits,
                         kv_group_size,
                     )?;
-                    (dev, Some(kq))
+                    Some(kq)
                 };
-                // claim the Metal GPU before loading the model so a
-                // running `rmlx serve` does not contend on the single-process
-                // claim file. Mirrors `run_baseline`'s acquire pattern --
-                // `SENTINEL_PORT` flags the CLI-side (non-HTTP) claim holder.
-                let _claim = acquire_claim_for_device(dev, SENTINEL_PORT)?;
+                let claimed = parse_device(&device)?;
+                claimed.admits(kv_quant_resolved.as_slice())?;
                 run_ppl(
                     &model,
                     &text_file,
                     ctx_window,
                     stride,
                     &corpus,
-                    &device,
+                    &claimed,
                     max_tokens,
-                    &run_id,
+                    run_id,
                     git_sha.as_deref(),
                     kv_quant_resolved,
                 )?;
             }
         },
     }
-    Ok(())
+    Ok(0)
 }
 
 #[cfg(test)]

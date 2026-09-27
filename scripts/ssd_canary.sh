@@ -9,39 +9,49 @@
 #
 # Usage:
 #   VERIFIER_MODEL=/path/to/snapshot bash scripts/ssd_canary.sh [--port N] \
-#     [--tag TAG] [--ssd-gb N] [--dry-run]
+#     [--ssd-gb N] [--dry-run]
 #
 # Requires:
 #   - Built binary at target/release-perf/rmlx  (run: make build-perf)
 #   - VERIFIER_MODEL env var set to snapshot directory (resolve via LOCAL.md)
 #
-# Output:
-#   - .rmlx/proofs/step3-canary/phase_populate.csv
-#   - .rmlx/proofs/step3-canary/phase_revisit.csv
-#   - .rmlx/proofs/step3-canary/phase_evict.csv
-#   - .rmlx/proofs/step3-canary/iteration_summary.json
-#   - Observations ingested into runs.db via §8.5 ingest path
+# Output, in a new directory <data root>/proofs/ssd-canary-<UTC stamp>.<random>/
+# that is the phase servers' RMLX_HOME:
+#   - phase_populate.csv, phase_revisit.csv, phase_evict.csv
+#   - iteration_summary.json
+#   - metrics/runs.db (the servers' events), logs/, server_<phase>.log
+# The three phase records go to the metrics DB `rmlx metrics path` names, via
+# §8.5 ingest. The one thing the script deletes is that directory's SSD tier,
+# cache/kv/, at exit; the data root's metrics DB is written by
+# `rmlx metrics record` alone.
 
 set -euo pipefail
+
+# The server this run started and has not yet stopped. Any exit — a failed
+# command under `set -e`, an interrupt, a CI timeout — stops it and waits, so no
+# failure leaves it holding the Metal claim. Then the run's SSD blocks go: they
+# are the one bulky output, and nothing reads them after the run.
+LIVE_PID=""
+RUN_DIR=""
+stop_live_server() {
+    if [[ -n "${LIVE_PID}" ]]; then
+        kill "${LIVE_PID}" 2>/dev/null || true
+        wait "${LIVE_PID}" 2>/dev/null || true
+        LIVE_PID=""
+    fi
+}
+on_exit() {
+    stop_live_server
+    if [[ -n "${RUN_DIR}" ]]; then
+        rm -rf "${RUN_DIR}/cache/kv"
+    fi
+}
+trap on_exit EXIT
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BINARY="${REPO_ROOT}/target/release-perf/rmlx"
-
-# Run identity (backend / version / git sha / build profile / hardware tag)
-# comes from the measured binary — never hard-coded here.
-source "$(dirname "${BASH_SOURCE[0]}")/lib/identity.sh"
-rmlx_export_identity "${BINARY}"
-PROMPT_DIR="${REPO_ROOT}/prompts/ssd_bench"
-
-# RMLX_HOME for this canary run — hermetic, wiped before run.
-RMLX_HOME="${RMLX_HOME:-${REPO_ROOT}/.rmlx/proofs/step3-canary}"
-ARTIFACT_DIR="${RMLX_HOME}"
-BUFFER_DIR="${RMLX_HOME}/metrics/buffer/pending"
-DB_PATH="${RMLX_HOME}/metrics/runs.db"
-GIT_SHA="$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || echo "unknown")"
-HARDWARE_TAG="${RMLX_HARDWARE_TAG:-m5_max_128gb}"
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -53,7 +63,6 @@ TEMPERATURE=0
 SEED=42
 
 DRY_RUN=false
-BENCH_TAG="ssd-canary"
 
 # ── Arg parsing ───────────────────────────────────────────────────────────────
 
@@ -62,13 +71,33 @@ while [[ $# -gt 0 ]]; do
         --dry-run)         DRY_RUN=true; shift ;;
         --port=*)          PORT="${1#--port=}"; shift ;;
         --port)            shift; PORT="${1:?--port requires a value}"; shift ;;
-        --tag=*)           BENCH_TAG="${1#--tag=}"; shift ;;
-        --tag)             shift; BENCH_TAG="${1:?--tag requires a value}"; shift ;;
         --ssd-gb=*)        SSD_GB="${1#--ssd-gb=}"; shift ;;
         --ssd-gb)          shift; SSD_GB="${1:?--ssd-gb requires a value}"; shift ;;
         *) echo "Unknown flag: $1" >&2; exit 1 ;;
     esac
 done
+
+if [[ ! -x "${BINARY}" ]]; then
+    echo "ERROR: binary not found at ${BINARY}. Run: make build-perf" >&2
+    exit 125
+fi
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+
+# Run identity (backend / version / git sha / build profile / hardware tag)
+# comes from the measured binary — never hard-coded here.
+source "$(dirname "${BASH_SOURCE[0]}")/lib/identity.sh"
+rmlx_export_identity "${BINARY}"
+PROMPT_DIR="${REPO_ROOT}/prompts/ssd_bench"
+GIT_SHA="$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || echo "unknown")"
+
+# The binary resolves the data root and the metrics DB, from the checkout, as
+# `make ssd-canary-gate` does, so the records land in the DB the gate reads.
+DATA_ROOT="$(cd "${REPO_ROOT}" && "${BINARY}" metrics path --home)"
+INGEST_DB="$(cd "${REPO_ROOT}" && "${BINARY}" metrics path)"
+
+# Every phase server runs at this context ceiling, and the records say so.
+CTX_MAX=8192
 
 # ── Model path requirement ────────────────────────────────────────────────────
 
@@ -95,11 +124,6 @@ MODEL_BASENAME="$(echo "${MODEL_ID}" | sed 's/^[^_]*__//')"
 
 # ── Sanity checks ─────────────────────────────────────────────────────────────
 
-if [[ ! -x "${BINARY}" ]]; then
-    echo "ERROR: binary not found at ${BINARY}. Run: make build-perf" >&2
-    exit 125
-fi
-
 if [[ ! -d "${VERIFIER_MODEL}" ]]; then
     echo "ERROR: verifier model not found: ${VERIFIER_MODEL}" >&2
     exit 1
@@ -110,22 +134,26 @@ if [[ ! -d "${PROMPT_DIR}" ]]; then
     exit 1
 fi
 
-# ── Wipe hermetic RMLX_HOME ───────────────────────────────────────────────────
+# ── Run directory ─────────────────────────────────────────────────────────────
+# A new directory per run is the phase servers' RMLX_HOME, so POPULATE starts
+# from an empty SSD tier and no earlier run's blocks or events are read.
 
-if ! $DRY_RUN; then
-    echo "  [setup] wiping ${RMLX_HOME}" >&2
-    rm -rf "${RMLX_HOME}"
-fi
-mkdir -p "${ARTIFACT_DIR}" "${BUFFER_DIR}"
+RUN_START_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+mkdir -p "${DATA_ROOT}/proofs"
+RUN_DIR="$(mktemp -d "${DATA_ROOT}/proofs/ssd-canary-$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")"
+BUFFER_DIR="${RUN_DIR}/metrics/buffer/pending"
+EVENTS_DB="${RUN_DIR}/metrics/runs.db"
+mkdir -p "${BUFFER_DIR}"
 
 echo "==> ssd_canary.sh"
-echo "    model    : ${VERIFIER_MODEL}"
-echo "    model_id : ${MODEL_ID}"
-echo "    port     : ${PORT}"
-echo "    ssd_gb   : ${SSD_GB}"
-echo "    git_sha  : ${GIT_SHA}"
-echo "    dry_run  : ${DRY_RUN}"
-echo "    rmlx_home: ${RMLX_HOME}"
+echo "    model     : ${VERIFIER_MODEL}"
+echo "    model_id  : ${MODEL_ID}"
+echo "    port      : ${PORT}"
+echo "    ssd_gb    : ${SSD_GB}"
+echo "    git_sha   : ${GIT_SHA}"
+echo "    dry_run   : ${DRY_RUN}"
+echo "    run_dir   : ${RUN_DIR}"
+echo "    metrics_db: ${INGEST_DB}"
 echo ""
 
 # ── Collect all 20 prompt files ───────────────────────────────────────────────
@@ -145,19 +173,12 @@ fi
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-preflight() {
-    echo "  [preflight] killing competing MLX processes..." >&2
-    pkill -f "rmlx serve" 2>/dev/null || true
-    pkill -f mlx_lm 2>/dev/null || true
-    pkill -f paroquant 2>/dev/null || true
-    pkill -f omlx 2>/dev/null || true
-    sleep 5
-    rm -f /tmp/rmlx.*.claim 2>/dev/null || true
-    echo "  [preflight] done." >&2
-}
-
-# Wait for server to be ready by polling /v1/models.
+# Wait for the server with PID $1 to be ready by polling /v1/models. A server
+# that exits first returns its own exit status: a Metal claim another process
+# holds (exit 11, holder named in the server's output) stops the canary. Each
+# phase stops only the server it started.
 wait_for_server() {
+    local pid="$1"
     local url="http://127.0.0.1:${PORT}/v1/models"
     local attempts=0
     local max_attempts=90
@@ -166,6 +187,13 @@ wait_for_server() {
         if curl -sf "${url}" > /dev/null 2>&1; then
             echo "  [wait] server ready." >&2
             return 0
+        fi
+        if ! kill -0 "${pid}" 2>/dev/null; then
+            local status=0
+            wait "${pid}" || status=$?
+            echo "ERROR: server (pid ${pid}) exited with status ${status} before it was ready" >&2
+            [[ ${status} -eq 0 ]] && status=1
+            return "${status}"
         fi
         attempts=$((attempts + 1))
         if [[ ${attempts} -ge ${max_attempts} ]]; then
@@ -184,7 +212,7 @@ get_cumulative_ssd_hits() {
     # /v1/models returns standard OpenAI list without cache stats.
     # Write to temp file to avoid shell pipe truncation mangling JSON.
     local _tmp_mc
-    _tmp_mc="/tmp/ssd_canary_mc_$$.json"
+    _tmp_mc="${RUN_DIR}/metrics_cache.json"
     curl -sf "http://127.0.0.1:${PORT}/metrics/cache" --max-time 5 \
         -o "${_tmp_mc}" 2>/dev/null || { echo "0"; return; }
     python3 - "${_tmp_mc}" <<'PYEOF' 2>/dev/null || echo "0"
@@ -202,7 +230,6 @@ try:
 except Exception:
     print(0)
 PYEOF
-    rm -f "${_tmp_mc}" 2>/dev/null || true
 }
 
 # Send one chat-completion request for a given prompt file.
@@ -294,15 +321,17 @@ bounce_if_stuck() {
     HYDRATE_PANIC_DETECTED=true
     kill "${pid}" 2>/dev/null || true
     wait "${pid}" 2>/dev/null || true
+    LIVE_PID=""
     sleep 3
-    RMLX_HOME="${RMLX_HOME}" \
+    RMLX_HOME="${RUN_DIR}" \
     RMLX_LOG_CAP_MB=500 \
         "${BINARY}" serve "$@" \
-        > /tmp/ssd_canary_revisit_stdout.txt 2>&1 &
+        >> "${RUN_DIR}/server_bounce.log" 2>&1 &
     local new_pid=$!
     eval "${pid_ref}=${new_pid}"
+    LIVE_PID="${new_pid}"
     echo "  [bounce] new server pid=${new_pid}" >&2
-    wait_for_server
+    wait_for_server "${new_pid}"
     CONSECUTIVE_ERRORS=0
     # New server starts with cumulative ssd_hits=0; reset delta baseline.
     _PREV_CUMULATIVE_SSD_HITS=0
@@ -328,7 +357,7 @@ parse_metrics() {
     # the pipe content as its script source (because python3 - reads script
     # from stdin), not as sys.stdin input. Use a temp file to decouple.
     local _metrics_tmp
-    _metrics_tmp="/tmp/ssd_canary_pm_$$.txt"
+    _metrics_tmp="${RUN_DIR}/metrics.txt"
     curl -sf "http://127.0.0.1:${PORT}/metrics" \
         -o "${_metrics_tmp}" 2>/dev/null || printf "" > "${_metrics_tmp}"
 
@@ -398,7 +427,6 @@ if hydrate_count == 0 and prom_hydrate_count > 0:
 # The Prometheus gauge only updates at server startup.
 print(f"{ssd_bytes} {ssd_evict:.0f} {spill_count} {hydrate_count} {spill_sum_us:.0f} {hydrate_sum_us:.0f} 0 0")
 PYEOF
-    rm -f "${_metrics_tmp}" 2>/dev/null || true
 }
 
 # Emit a §8.5 RunRecord JSON and ingest it into runs.db.
@@ -421,7 +449,8 @@ emit_and_ingest() {
         BENCH_MODEL_BASENAME="${MODEL_BASENAME}" \
         BENCH_TS_UTC="${ts_utc}" \
         BENCH_GIT_SHA="${GIT_SHA}" \
-        BENCH_HARDWARE_TAG="${HARDWARE_TAG}" \
+        BENCH_KV_QUANT="${KV_QUANT}" \
+        BENCH_CTX_MAX="${CTX_MAX}" \
         BENCH_SEED="${SEED}" \
         BENCH_TEMPERATURE="${TEMPERATURE}" \
         python3 - <<'PYEOF'
@@ -435,7 +464,8 @@ model_namespace= os.environ["BENCH_MODEL_NAMESPACE"]
 model_basename = os.environ["BENCH_MODEL_BASENAME"]
 ts_utc         = os.environ["BENCH_TS_UTC"]
 git_sha        = os.environ["BENCH_GIT_SHA"]
-hardware_tag   = os.environ["BENCH_HARDWARE_TAG"]
+kv_quant       = os.environ["BENCH_KV_QUANT"]
+ctx_max        = int(os.environ["BENCH_CTX_MAX"])
 seed           = int(os.environ["BENCH_SEED"])
 temperature    = float(os.environ["BENCH_TEMPERATURE"])
 
@@ -457,11 +487,13 @@ obj = {
     "model_namespace": model_namespace,
     "model": model_basename,
     "weight_quant": weight_quant,
-    "kv_quant": "k8v8",
-    "ctx_max": 8192,
+    "kv_quant": kv_quant,
+    "ctx_max": ctx_max,
+    # Prompts are content-addressed and part of the cell key: each phase
+    # carries its own body, so the three phases are three cells.
     "prompt": {
-        "name": f"ssd-canary-{tag}",
-        "body": [{"role": "user", "content": "ssd_canary batch"}],
+        "name": tag,
+        "body": [{"role": "user", "content": f"ssd_canary {tag}"}],
     },
     "ts_utc": ts_utc,
     "temperature": temperature,
@@ -491,17 +523,17 @@ PYEOF
 
     echo "${record_json}" > "${buf_file}"
     echo "  [ingest] buffer: ${buf_file}" >&2
-    RMLX_HOME="${RMLX_HOME}" "${BINARY}" metrics record --file "${buf_file}" >&2
+    "${BINARY}" metrics --db "${INGEST_DB}" record --file "${buf_file}" >&2
     echo "  [ingest] done." >&2
 }
 
-# ── SSD index and events DB paths ─────────────────────────────────────────────
+# ── SSD index path ────────────────────────────────────────────────────────────
 # index.db is the ground truth for on-disk bytes (updated by drain thread).
-# events DB is the runs.db where ssd_spill + ssd_hydrate rows are recorded.
-POPULATE_INDEX_DB="${RMLX_HOME}/cache/kv/ssd-canary/index.db"
+# The servers record ssd_spill + ssd_hydrate rows in EVENTS_DB, the run
+# directory's runs.db.
+POPULATE_INDEX_DB="${RUN_DIR}/cache/kv/ssd-canary/index.db"
 # EVICT phase reuses ssd-canary namespace to verify startup eviction.
-EVICT_INDEX_DB="${RMLX_HOME}/cache/kv/ssd-canary/index.db"
-EVENTS_DB="${DB_PATH}"  # runs.db (metrics DB) holds the events table.
+EVICT_INDEX_DB="${RUN_DIR}/cache/kv/ssd-canary/index.db"
 
 # ── Phase POPULATE ────────────────────────────────────────────────────────────
 # Send all 20 prompts with a large SSD budget (tier ON, no budget pressure).
@@ -512,26 +544,27 @@ echo ""
 
 CONSECUTIVE_ERRORS=0
 _PREV_CUMULATIVE_SSD_HITS=0
-preflight
 
 echo "  [server] starting populate server..." >&2
-RMLX_HOME="${RMLX_HOME}" \
+RMLX_HOME="${RUN_DIR}" \
 RMLX_LOG_CAP_MB=500 \
     "${BINARY}" serve \
         --model "${VERIFIER_MODEL}" \
         --port "${PORT}" \
         --prompt-cache-slots 4 \
+        --max-ctx "${CTX_MAX}" \
         --kv-ssd-cache-gb "${SSD_GB}" \
         --project ssd-canary \
         --log info \
-        > /tmp/ssd_canary_populate_stdout.txt 2>&1 &
+        > "${RUN_DIR}/server_populate.log" 2>&1 &
 
 POPULATE_PID=$!
+LIVE_PID="${POPULATE_PID}"
 echo "  [server] pid=${POPULATE_PID}" >&2
-wait_for_server
+wait_for_server "${POPULATE_PID}"
 
 # CSV header.
-POPULATE_CSV="${ARTIFACT_DIR}/phase_populate.csv"
+POPULATE_CSV="${RUN_DIR}/phase_populate.csv"
 echo "seq,prompt_name,ssd_hits,ssd_bytes_used,ssd_evict_total,spill_count,hydrate_count,spill_sum_us,hydrate_sum_us" \
     > "${POPULATE_CSV}"
 
@@ -544,7 +577,7 @@ for seq in $(seq 0 $((NUM_PROMPTS - 1))); do
     prompt_name="$(basename "${pf}" .json)"
     echo "  [populate] req $((seq+1))/${NUM_PROMPTS}: ${prompt_name}" >&2
 
-    send_request "${pf}" "${POPULATE_MAX_TOKENS}" > /tmp/ssd_canary_resp.txt
+    send_request "${pf}" "${POPULATE_MAX_TOKENS}" > "${RUN_DIR}/last_response.json"
 
     ssd_hits_req="${SSD_HITS_LAST}"
     TOTAL_SSD_HITS_POPULATE=$((TOTAL_SSD_HITS_POPULATE + ssd_hits_req))
@@ -568,7 +601,18 @@ echo "  [server] killing populate server pid=${POPULATE_PID}" >&2
 sleep 5
 kill "${POPULATE_PID}" 2>/dev/null || true
 wait "${POPULATE_PID}" 2>/dev/null || true
+LIVE_PID=""
 sleep 3
+
+# The KV codec the servers run, in the engine's own spelling, read from the
+# populate server's log once it has stopped: it is part of the records' cell key.
+KV_LOG="$(ls -t "${RUN_DIR}"/logs/*.jsonl 2>/dev/null | head -1)" || KV_LOG=""
+KV_QUANT="$(python3 "${REPO_ROOT}/scripts/lib/server_kv_quant.py" "${KV_LOG}" \
+    | sed -n 's/^kv_quant=//p')" || KV_QUANT=""
+if [[ -z "${KV_QUANT}" ]]; then
+    echo "ERROR: the populate server's log names no KV codec; the records cannot be labelled" >&2
+    exit 1
+fi
 
 # Re-read final metrics after kill (drain may have flushed during the 5s window).
 read -r ssd_bytes ssd_evict spill_count hydrate_count spill_sum_us hydrate_sum_us spill_bytes hydrate_bytes \
@@ -641,25 +685,26 @@ REVISIT_INDICES=(0 2 4 6 8 10 12 14 16 18)
 
 CONSECUTIVE_ERRORS=0
 _PREV_CUMULATIVE_SSD_HITS=0
-preflight
 
 echo "  [server] starting revisit server..." >&2
-RMLX_HOME="${RMLX_HOME}" \
+RMLX_HOME="${RUN_DIR}" \
 RMLX_LOG_CAP_MB=500 \
     "${BINARY}" serve \
         --model "${VERIFIER_MODEL}" \
         --port "${PORT}" \
         --prompt-cache-slots 4 \
+        --max-ctx "${CTX_MAX}" \
         --kv-ssd-cache-gb "${SSD_GB}" \
         --project ssd-canary \
         --log info \
-        > /tmp/ssd_canary_revisit_stdout.txt 2>&1 &
+        > "${RUN_DIR}/server_revisit.log" 2>&1 &
 
 REVISIT_PID=$!
+LIVE_PID="${REVISIT_PID}"
 echo "  [server] pid=${REVISIT_PID}" >&2
-wait_for_server
+wait_for_server "${REVISIT_PID}"
 
-REVISIT_CSV="${ARTIFACT_DIR}/phase_revisit.csv"
+REVISIT_CSV="${RUN_DIR}/phase_revisit.csv"
 echo "seq,prompt_name,ssd_hits,ssd_bytes_used,ssd_evict_total,spill_count,hydrate_count,spill_sum_us,hydrate_sum_us" \
     > "${REVISIT_CSV}"
 
@@ -672,13 +717,14 @@ for rseq in $(seq 0 $((REVISIT_COUNT - 1))); do
     prompt_name="$(basename "${pf}" .json)"
     echo "  [revisit] req $((rseq+1))/${REVISIT_COUNT} (original idx=${idx}): ${prompt_name}" >&2
 
-    send_request "${pf}" "${POPULATE_MAX_TOKENS}" > /tmp/ssd_canary_resp.txt
+    send_request "${pf}" "${POPULATE_MAX_TOKENS}" > "${RUN_DIR}/last_response.json"
 
     # If the server got stuck (e.g. post-hydrate generation lock deadlock), bounce it.
     bounce_if_stuck REVISIT_PID \
         --model "${VERIFIER_MODEL}" \
         --port "${PORT}" \
         --prompt-cache-slots 4 \
+        --max-ctx "${CTX_MAX}" \
         --kv-ssd-cache-gb "${SSD_GB}" \
         --project ssd-canary \
         --log info || true
@@ -700,6 +746,7 @@ echo "  [server] killing revisit server pid=${REVISIT_PID}" >&2
 sleep 5
 kill "${REVISIT_PID}" 2>/dev/null || true
 wait "${REVISIT_PID}" 2>/dev/null || true
+LIVE_PID=""
 sleep 3
 
 # Re-read final metrics after kill.
@@ -747,26 +794,27 @@ echo ""
 
 CONSECUTIVE_ERRORS=0
 _PREV_CUMULATIVE_SSD_HITS=0
-preflight
 
 echo "  [server] starting evict server..." >&2
-RMLX_HOME="${RMLX_HOME}" \
+RMLX_HOME="${RUN_DIR}" \
 RMLX_LOG_CAP_MB=500 \
     "${BINARY}" serve \
         --model "${VERIFIER_MODEL}" \
         --port "${PORT}" \
         --prompt-cache-slots 4 \
+        --max-ctx "${CTX_MAX}" \
         --kv-ssd-cache-gb "${EVICT_SSD_GB}" \
         --project ssd-canary \
         --log info \
-        > /tmp/ssd_canary_evict_stdout.txt 2>&1 &
+        > "${RUN_DIR}/server_evict.log" 2>&1 &
 
 EVICT_PID=$!
+LIVE_PID="${EVICT_PID}"
 echo "  [server] pid=${EVICT_PID}" >&2
-wait_for_server
+wait_for_server "${EVICT_PID}"
 
 # index.db for the ssd-canary namespace (shared with POPULATE).
-EVICT_INDEX_DB="${RMLX_HOME}/cache/kv/ssd-canary/index.db"
+EVICT_INDEX_DB="${RUN_DIR}/cache/kv/ssd-canary/index.db"
 
 # Read index state immediately after startup: startup_maintenance() runs evict_lru_until()
 # at attach time, before any request. This is the invariant to verify:
@@ -798,7 +846,7 @@ read -r _s_ssd_bytes _s_ssd_evict _s_spill _s_hydrate _s_spill_us _s_hydrate_us 
 EVICT_STARTUP_EVICT_TOTAL="${_s_ssd_evict:-0}"
 echo "  [evict] post-startup ssd_evict_total=${EVICT_STARTUP_EVICT_TOTAL}" >&2
 
-EVICT_CSV="${ARTIFACT_DIR}/phase_evict.csv"
+EVICT_CSV="${RUN_DIR}/phase_evict.csv"
 echo "seq,prompt_name,ssd_hits,ssd_bytes_used,ssd_evict_total,index_count,index_sum_bytes,index_sum_ok" \
     > "${EVICT_CSV}"
 
@@ -816,13 +864,14 @@ for seq in $(seq 0 $((_evict_n - 1))); do
     prompt_name="$(basename "${pf}" .json)"
     echo "  [evict] req $((seq+1))/${_evict_n}: ${prompt_name}" >&2
 
-    send_request "${pf}" "${POPULATE_MAX_TOKENS}" > /tmp/ssd_canary_resp.txt
+    send_request "${pf}" "${POPULATE_MAX_TOKENS}" > "${RUN_DIR}/last_response.json"
 
     # Bounce the evict server if stuck (e.g. post-hydrate panic deadlock).
     bounce_if_stuck EVICT_PID \
         --model "${VERIFIER_MODEL}" \
         --port "${PORT}" \
         --prompt-cache-slots 4 \
+        --max-ctx "${CTX_MAX}" \
         --kv-ssd-cache-gb "${EVICT_SSD_GB}" \
         --project ssd-canary \
         --log info || true
@@ -862,6 +911,7 @@ echo "  [server] killing evict server pid=${EVICT_PID}" >&2
 sleep 5
 kill "${EVICT_PID}" 2>/dev/null || true
 wait "${EVICT_PID}" 2>/dev/null || true
+LIVE_PID=""
 sleep 3
 
 # Re-read final index after kill to get post-drain byte count.
@@ -894,7 +944,7 @@ POPULATE_HYDRATE_MBPS="0.000"
 
 if [[ "${POPULATE_FINAL_SPILL_COUNT}" -gt 0 ]] && ! $DRY_RUN; then
     read -r POPULATE_MEAN_SPILL_US_DB POPULATE_SPILL_BYTES_DB < <(
-        sqlite3 -separator ' ' "${DB_PATH}" \
+        sqlite3 -separator ' ' "${EVENTS_DB}" \
             "SELECT COALESCE(AVG(value),0), COALESCE(AVG(CAST(json_extract(notes,'$.bytes') AS REAL)),0)
              FROM events WHERE op='ssd_spill';" \
             2>/dev/null || echo "0 0"
@@ -912,7 +962,7 @@ fi
 
 if [[ "${POPULATE_FINAL_HYDRATE_COUNT}" -gt 0 ]] && ! $DRY_RUN; then
     read -r POPULATE_MEAN_HYDRATE_US_DB POPULATE_HYDRATE_BYTES_DB < <(
-        sqlite3 -separator ' ' "${DB_PATH}" \
+        sqlite3 -separator ' ' "${EVENTS_DB}" \
             "SELECT COALESCE(AVG(value),0), COALESCE(AVG(CAST(json_extract(notes,'$.bytes') AS REAL)),0)
              FROM events WHERE op='ssd_hydrate';" \
             2>/dev/null || echo "0 0"
@@ -931,7 +981,7 @@ fi
 # Mean hydrate from revisit phase (total hydrate events include populate + revisit).
 REVISIT_MEAN_HYDRATE_US_FINAL=0
 if [[ "${REVISIT_FINAL_HYDRATE_COUNT:-0}" -gt 0 ]] && ! $DRY_RUN; then
-    REVISIT_MEAN_HYDRATE_US_FINAL=$(sqlite3 "${DB_PATH}" \
+    REVISIT_MEAN_HYDRATE_US_FINAL=$(sqlite3 "${EVENTS_DB}" \
         "SELECT COALESCE(AVG(value),0) FROM events WHERE op='ssd_hydrate';" \
         2>/dev/null || echo "0")
 fi
@@ -1002,8 +1052,8 @@ VALIDATION_PASS=true
 VALIDATION_NOTES=""
 
 # C1: events table has >= 20 SsdSpill rows.
-if ! $DRY_RUN && [[ -f "${DB_PATH}" ]]; then
-    SPILL_EVENT_ROWS=$(sqlite3 "${DB_PATH}" \
+if ! $DRY_RUN && [[ -f "${EVENTS_DB}" ]]; then
+    SPILL_EVENT_ROWS=$(sqlite3 "${EVENTS_DB}" \
         "SELECT COUNT(*) FROM events WHERE op='ssd_spill';" 2>/dev/null || echo "0")
     if [[ "${SPILL_EVENT_ROWS}" -lt 1 ]]; then
         VALIDATION_NOTES="${VALIDATION_NOTES} [WARN] spill event rows=${SPILL_EVENT_ROWS} (expected >= 1; SSD tier may not have been active)"
@@ -1013,7 +1063,7 @@ if ! $DRY_RUN && [[ -f "${DB_PATH}" ]]; then
     fi
 
     # C2: events table has >= 1 SsdHydrate row.
-    HYDRATE_EVENT_ROWS=$(sqlite3 "${DB_PATH}" \
+    HYDRATE_EVENT_ROWS=$(sqlite3 "${EVENTS_DB}" \
         "SELECT COUNT(*) FROM events WHERE op='ssd_hydrate';" 2>/dev/null || echo "0")
     if [[ "${HYDRATE_EVENT_ROWS}" -lt 1 ]]; then
         VALIDATION_NOTES="${VALIDATION_NOTES} [WARN] hydrate event rows=${HYDRATE_EVENT_ROWS} (expected >= 1; revisit may need more cache pressure)"
@@ -1022,11 +1072,12 @@ if ! $DRY_RUN && [[ -f "${DB_PATH}" ]]; then
         echo "  [ok] hydrate_event_rows=${HYDRATE_EVENT_ROWS}" >&2
     fi
 
-    # C3: observations table has the three tagged rows.
+    # C3: the metrics DB holds this run's three tagged rows.
     for obs_tag in "ssd-canary-populate" "ssd-canary-revisit" "ssd-canary-evict"; do
-        OBS_COUNT=$(sqlite3 "${DB_PATH}" \
-            "SELECT COUNT(*) FROM observations WHERE notes LIKE '%tag=${obs_tag}%' OR description LIKE '%${obs_tag}%';" \
-            2>/dev/null || echo "0")
+        OBS_COUNT=$("${BINARY}" metrics --db "${INGEST_DB}" query \
+            "SELECT COUNT(*) FROM observations WHERE ts_utc >= '${RUN_START_UTC}' AND description LIKE '%tag=${obs_tag} %';" \
+            2>/dev/null | tail -n +2) || OBS_COUNT=0
+        OBS_COUNT="${OBS_COUNT:-0}"
         if [[ "${OBS_COUNT}" -lt 1 ]]; then
             VALIDATION_NOTES="${VALIDATION_NOTES} [WARN] observations tag=${obs_tag} count=${OBS_COUNT}"
             echo "  WARN: observations tag=${obs_tag} not found" >&2
@@ -1096,7 +1147,7 @@ fi
 
 # ── Write iteration_summary.json ──────────────────────────────────────────────
 
-SUMMARY_FILE="${ARTIFACT_DIR}/iteration_summary.json"
+SUMMARY_FILE="${RUN_DIR}/iteration_summary.json"
 
 python3 - <<PYEOF > "${SUMMARY_FILE}"
 import json, os, time
@@ -1105,7 +1156,7 @@ summary = {
     "ssd_canary_version": "1.0.0",
     "run_ts_utc": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
     "model_id": "${MODEL_ID}",
-    "rmlx_home": "${RMLX_HOME}",
+    "run_dir": "${RUN_DIR}",
     "dry_run": $( [[ "${DRY_RUN}" == "true" ]] && echo "True" || echo "False" ),
     "phases": {
         "POPULATE": {
@@ -1155,7 +1206,8 @@ summary = {
         "phase_populate_csv": "${POPULATE_CSV}",
         "phase_revisit_csv": "${REVISIT_CSV}",
         "phase_evict_csv": "${EVICT_CSV}",
-        "runs_db": "${DB_PATH}",
+        "runs_db": "${INGEST_DB}",
+        "events_db": "${EVENTS_DB}",
         "iteration_summary": "${SUMMARY_FILE}",
     },
 }
@@ -1167,15 +1219,15 @@ echo "==> Summary written to ${SUMMARY_FILE}"
 
 # ── Final DB verification ─────────────────────────────────────────────────────
 
-if ! $DRY_RUN && [[ -f "${DB_PATH}" ]]; then
+if ! $DRY_RUN && [[ -f "${INGEST_DB}" ]]; then
     echo ""
-    echo "==> DB verification (last 60 minutes):"
-    sqlite3 "${DB_PATH}" \
+    echo "==> DB verification (this run's records):"
+    "${BINARY}" metrics --db "${INGEST_DB}" query \
         "SELECT description, metric, ROUND(value,3) as value
          FROM observations
-         WHERE ts_utc >= datetime('now','-60 minutes')
+         WHERE ts_utc >= '${RUN_START_UTC}' AND description LIKE 'ssd_canary tag=%'
          ORDER BY ts_utc DESC, metric;" \
-        2>/dev/null || echo "  (sqlite3 not available or DB empty)"
+        2>/dev/null || echo "  (DB not readable)"
 fi
 
 # ── Final summary table ────────────────────────────────────────────────────────
@@ -1206,7 +1258,8 @@ echo "  populate csv    : ${POPULATE_CSV}"
 echo "  revisit csv     : ${REVISIT_CSV}"
 echo "  evict csv       : ${EVICT_CSV}"
 echo "  iteration summary: ${SUMMARY_FILE}"
-echo "  runs.db         : ${DB_PATH}"
+echo "  runs.db         : ${INGEST_DB}"
+echo "  events db       : ${EVENTS_DB}"
 echo ""
 echo "Done."
 

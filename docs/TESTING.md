@@ -490,8 +490,9 @@ only when every row that ran passed.
 
 A row reads its model from `RMLX_TEST_MODEL_BONSAI`,
 `RMLX_TEST_MODEL_GEMMA4_E4B` or `RMLX_TEST_MODEL_QWEN36`, and skips when the
-variable is unset. Before each smoke run and each NIAH run, the runner kills
-competing MLX processes and deletes the claim files.
+variable is unset. Each smoke run takes the Metal claim itself, and each NIAH
+run runs under `rmlx claim run`. When another process holds the claim, the row
+fails with exit 11 and the refusal names the holder.
 
 ### Manifest
 

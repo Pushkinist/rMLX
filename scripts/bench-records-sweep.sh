@@ -9,8 +9,9 @@
 #   Metrics  : decode_tps_warm, prefill_tps, ttft_cold, ttft_warm, peak_rss
 #   Output   : rows appended to Cross-Backend-Bench/metrics/summary.csv
 #
-# Teardown between every cell (CLAUDE.md single-MLX-process rule):
-#   pkill -f "rmlx serve"; pkill -f mlx_lm; pkill -f paroquant; pkill -f omlx; sleep 5; rm -f /tmp/rmlx.62265.claim
+# Each cell stops the server it started (kill + wait on its PID), which frees
+# the Metal claim. A claim another process holds makes the server exit 11 at
+# startup; the cell is skipped and the log names the holder.
 #
 # Usage:
 #   cd ${RMLX_ROOT}
@@ -58,18 +59,6 @@ MODELS=(
 
 KV_MODES=(bf16 k8v4 k8v8 planar)
 
-# ── Teardown helper ───────────────────────────────────────────────────────────
-teardown() {
-  log "  [teardown] pkill rmlx serve / mlx_lm / paroquant / omlx..."
-  pkill -f "rmlx serve"  >/dev/null 2>&1 || true
-  pkill -f "mlx_lm"      >/dev/null 2>&1 || true
-  pkill -f "paroquant"   >/dev/null 2>&1 || true
-  pkill -f "omlx"        >/dev/null 2>&1 || true
-  sleep 5
-  rm -f /tmp/rmlx.${PORT}.claim 2>/dev/null || true
-  log "  [teardown] done"
-}
-
 # ── Sanity-check output ───────────────────────────────────────────────────────
 check_output() {
   # Returns 0 if output looks coherent, 1 if it looks like garbage.
@@ -103,13 +92,11 @@ run_cell() {
 
   log "══ CELL: $MODEL_ID  kv=$KV ══"
 
-  teardown
-
   # Start rmlx serve
   local SERVER_LOG="$LOG_DIR/${MODEL_ID}_kv${KV}_$(date -u +%Y%m%d-%H%M%S).log"
   (
     cd "$RMLX_DIR"
-    "$RMLX_BIN" serve \
+    exec "$RMLX_BIN" serve \
       --model "$MODEL_PATH" \
       --port "$PORT" \
       --device gpu \
@@ -138,6 +125,7 @@ run_cell() {
   if [[ "$READY" -eq 0 ]]; then
     log "  ERROR: server not ready in 180s — skipping"
     kill "$RMLX_PID" 2>/dev/null || true
+    wait "$RMLX_PID" 2>/dev/null || true
     tail -20 "$SERVER_LOG" | tee -a "$SWEEP_LOG" || true
     return
   fi
@@ -170,7 +158,7 @@ run_cell() {
 
   log "  DONE cell $MODEL_ID kv=$KV"
   kill "$RMLX_PID" 2>/dev/null || true
-  sleep 3
+  wait "$RMLX_PID" 2>/dev/null || true
 }
 
 # ── Main sweep loop ───────────────────────────────────────────────────────────
@@ -197,9 +185,6 @@ for entry in "${MODELS[@]}"; do
     CELL_COUNT=$((CELL_COUNT + 1))
   done
 done
-
-# Final teardown
-teardown
 
 ELAPSED=$(( SECONDS - START_TS ))
 log "=== bench-records-sweep DONE  cells=$CELL_COUNT  elapsed=${ELAPSED}s ==="

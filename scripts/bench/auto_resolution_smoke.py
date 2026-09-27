@@ -252,11 +252,6 @@ def stop_proc(proc: subprocess.Popen):
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             pass
-    # Clean up claim file (the SIGINT handler may not always remove it).
-    try:
-        os.remove(f"/tmp/rmlx.{PORT}.claim")
-    except FileNotFoundError:
-        pass
 
 
 def main():

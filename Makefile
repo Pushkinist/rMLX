@@ -92,7 +92,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         metrics-init metrics-doctor metrics-doctor-fix metrics-export \
         metrics-backup metrics-replay-pending metrics-prompts-sync \
         metrics-champions metrics-champions-rmlx \
-        build-perf build-debug test-perf ci-perf gpu-test model-check model-check-full \
+        build-perf build-debug test-perf ci-perf gpu-test claim-rmlx model-check model-check-full \
         profile-samply profile-samply-debug profile-instruments bench asm perf-iter \
         canary canary-gate canary-ab canary-ab-selftest canary-ab-ingest-selftest \
         canary-ab-host-gate-fixtures llama-ab-selftest spec-bench-selftest \
@@ -105,7 +105,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         mlx-preflight mlx-restore-pin target-gc target-size-report profile-gputrace \
         profile-mst \
         build-capture test-capture gputrace-preflight traces-gc \
-        ssd-canary ssd-canary-gate \
+        ssd-canary ssd-canary-gate ssd-canary-selftest \
         schema-constraint-canary \
         bench-codec-cell \
         smoke-codec-matrix \
@@ -123,6 +123,9 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         check-named-skip-notices check-named-skip-notices-fixtures \
         check-eval-lock check-eval-lock-fixtures eval-lock-stress \
         check-no-kernel-input-eval check-no-kernel-input-eval-fixtures \
+        check-gpu-device-census check-gpu-device-census-library \
+        check-gpu-device-census-selftest \
+        check-claim-bypass check-claim-bypass-selftest \
         check-kernel-dtype-contract check-kernel-dtype-contract-fixtures \
         check-metal-compiles check-metal-format
 
@@ -176,6 +179,7 @@ test-capture: ## run the feature-gated GPU-profiling unit tests (capture window 
 	cargo test -p rmlx-mlx --features metal-capture --lib metal_capture
 	cargo test -p rmlx-mlx --features metal-capture --lib xctrace
 	cargo test -p rmlx-cli --features metal-capture --bin rmlx gpu_capture
+	cargo test -p rmlx-cli --features metal-capture --test device_cpu_refusal gpu_capture
 
 profile-gputrace: ## capture a decode-window Metal GPU trace (CODEC= MODEL= required; enforces the .rmlx/traces cap unless KEEP_ALL=1)
 	@if [ -z "$(CODEC)" ] || [ -z "$(MODEL)" ]; then \
@@ -249,20 +253,33 @@ endif
 CI_PERF_OK := $(if $(GPU_HALF_NAME),ci-perf $(GPU_HALF_NAME)-half ok — NOT the whole gate,ci-perf ok)
 CI_PERF_INCOMPLETE := $(if $(GPU_HALF_NAME),ci-perf $(GPU_HALF_NAME)-half INCOMPLETE,ci-perf INCOMPLETE)
 
+# The GPU suite runs under `rmlx claim run`: the suite holds the Metal claim
+# for its whole run, and a claim another process holds refuses it with exit 11
+# and names the holder. The binary is this checkout's, built here and called by
+# path. Nothing the suite runs may start `rmlx` itself, since the nested claim
+# would be refused. Every process the suite starts inherits the claim, so the
+# test binaries are compiled first, outside it (`--build`); the run under the
+# claim compiles nothing and fails if it has to.
+CLAIM_RMLX := target/debug/rmlx
+claim-rmlx:      ## build the rmlx binary the GPU suite takes the Metal claim with
+	cargo build -p rmlx-cli --bin rmlx
+
 # ci-perf runs the GPU/Metal suite after `test-perf`, and it is the only shared
 # gate that does. `make ci` cannot: the GPU tests need the Metal context to
 # themselves (hard rule 8) and take minutes, which is the wrong price on every
-# commit. So `ci-perf` refuses to start unless the GPU is idle: it is already
-# the long, pre-merge-only target, and the preflight line below makes that
-# precondition fail in milliseconds instead of after the release-perf half.
+# commit. So `ci-perf` refuses to start unless the GPU is free: it is already
+# the long, pre-merge-only target, and the lines below make that precondition
+# fail before the release-perf half rather than after it.
 #
-# Three lines, in this order, for two different reasons:
+# In this order, for two different reasons:
 #
-#   * `--preflight` FIRST because it is a precondition, not a test. It checks
-#     only the things that cost nothing to check — RMLX_SKIP_GPU unset, no
-#     competing MLX process, a non-empty classification — and those are the most
-#     likely way this gate fails in daily use. Discovering a live `rmlx serve`
-#     after `test-perf` has run throws away the time it took.
+#   * `--preflight` and a claim probe FIRST because they are preconditions,
+#     not tests. The preflight checks RMLX_SKIP_GPU unset and a non-empty
+#     classification; `claim run -- true` takes the Metal claim and releases
+#     it at once, so a claim another process holds stops the gate here with
+#     exit 11. Finding a live server after `test-perf` has run throws away the
+#     time it took. The probe cannot keep the claim across `test-perf`; a
+#     process that takes it in between refuses the GPU half instead.
 #   * `test-perf` before the tests themselves because it covers the whole
 #     workspace, so a compile error anywhere shows up there, whereas the GPU run
 #     visits five crates and holds the GPU while it does. Fail on the broad,
@@ -309,9 +326,12 @@ CI_PERF_INCOMPLETE := $(if $(GPU_HALF_NAME),ci-perf $(GPU_HALF_NAME)-half INCOMP
 # pays a cold opt-level-0 build on top. See docs/GPU_TESTS.md.
 ci-perf:         ## pre-push gate under release-perf + the serialized GPU/Metal suite (HALF=codec|rest runs one side of the partition; separate from make ci)
 	@bash scripts/run_gpu_tests.sh --preflight
+	$(MAKE) claim-rmlx
+	@$(CLAIM_RMLX) claim run -- true
 	$(MAKE) test-perf
+	@bash scripts/run_gpu_tests.sh --build $(GPU_HALF_ARG)
 	@log="$$(mktemp)"; rc="$$(mktemp)"; \
-	{ bash scripts/run_gpu_tests.sh $(GPU_HALF_ARG); echo $$? >"$$rc"; } | tee "$$log"; \
+	{ $(CLAIM_RMLX) claim run -- bash scripts/run_gpu_tests.sh $(GPU_HALF_ARG); echo $$? >"$$rc"; } | tee "$$log"; \
 	code="$$(cat "$$rc")"; rm -f "$$rc"; \
 	if [ "$$code" -ne 0 ]; then rm -f "$$log"; exit "$$code"; fi; \
 	if grep -q INCOMPLETE "$$log"; then \
@@ -347,9 +367,11 @@ ci-perf:         ## pre-push gate under release-perf + the serialized GPU/Metal 
 # or any store fails and names the delta. That is what keeps a standing
 # diagnostic from a kernel we do not own out of the exit code, where it would
 # train everyone to read a red run as noise.
-gpu-test:        ## run the GPU/Metal #[ignore] tests serialized under Metal shader validation (HALF=codec|rest, CRATE= FILTER= to narrow, VALIDATE=0 to skip instrumentation); needs exclusive machine access
-	@bash scripts/run_gpu_tests.sh $(GPU_HALF_ARG) $(if $(CRATE),--crate '$(CRATE)',) $(if $(FILTER),--filter '$(FILTER)',) \
-		$(if $(filter 0,$(VALIDATE)),--no-shader-validation,)
+GPU_TEST_ARGS = $(GPU_HALF_ARG) $(if $(CRATE),--crate '$(CRATE)',) $(if $(FILTER),--filter '$(FILTER)',) \
+	$(if $(filter 0,$(VALIDATE)),--no-shader-validation,)
+gpu-test: claim-rmlx ## run the GPU/Metal #[ignore] tests serialized under Metal shader validation, holding the Metal claim (HALF=codec|rest, CRATE= FILTER= to narrow, VALIDATE=0 to skip instrumentation)
+	@bash scripts/run_gpu_tests.sh --build $(GPU_TEST_ARGS)
+	@$(CLAIM_RMLX) claim run -- bash scripts/run_gpu_tests.sh $(GPU_TEST_ARGS)
 
 # model-check: run only the model-logic crates (rmlx-models, rmlx-runtime,
 # rmlx-quant) plus the KV-codec crate (rmlx-kv-quant). Excludes server, CLI, and
@@ -609,6 +631,21 @@ check-no-kernel-input-eval: ## CI gate: fail if a Metal-kernel dispatcher blocks
 check-no-kernel-input-eval-fixtures: ## CI gate: the eval gate still fires on renamed/relocated/differently-spelled evals
 	@bash scripts/check_no_kernel_input_eval_fixtures.sh
 
+check-gpu-device-census: ## CI gate: the rmlx binary names Device::Gpu in exactly one place, claim_gpu, which takes the Metal claim, and never takes .device() from a fresh claim
+	@bash scripts/check_gpu_device_census.sh
+
+check-gpu-device-census-library: ## CI gate: library code in rmlx-audio, rmlx-server and rmlx-models never names Device::Gpu as a value; the device comes from the caller
+	@bash scripts/check_gpu_device_census.sh --library
+
+check-gpu-device-census-selftest: ## CI gate: recall test for the above and its library mode, 69 cases, each asserting the reason as well as the exit code
+	@bash scripts/check_gpu_device_census_selftest.sh
+
+check-claim-bypass: ## CI gate: nothing in the tree deletes the Metal claim, names its file outside the claim module, or kills by process-name pattern
+	@bash scripts/check_claim_bypass.sh
+
+check-claim-bypass-selftest: ## CI gate: recall test for the above, each case asserting the rule and file:line or the reason as well as the exit code
+	@bash scripts/check_claim_bypass_selftest.sh
+
 check-kernel-dtype-contract: ## CI gate: fail if a Metal-kernel dispatcher returns its declared-f32 output without restoring a caller dtype (promotes the whole decode graph)
 	@bash scripts/check_kernel_dtype_contract.sh
 
@@ -662,6 +699,11 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_named_skip_notices_fixtures.sh
 	@bash scripts/check_no_kernel_input_eval.sh
 	@bash scripts/check_no_kernel_input_eval_fixtures.sh
+	@bash scripts/check_gpu_device_census.sh
+	@bash scripts/check_gpu_device_census.sh --library
+	@bash scripts/check_gpu_device_census_selftest.sh
+	@bash scripts/check_claim_bypass.sh
+	@bash scripts/check_claim_bypass_selftest.sh
 	@bash scripts/check_kernel_dtype_contract.sh
 	@bash scripts/check_kernel_dtype_contract_fixtures.sh
 	@bash scripts/perf_ab_selftest.sh
@@ -672,6 +714,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/spec_bench_published_selftest.sh
 	@bash scripts/published_ingest_selftest.sh
 	@bash scripts/published_table_selftest.sh
+	@bash scripts/ssd_canary_selftest.sh
 	@$(MAKE) --no-print-directory check-published-table
 	@bash scripts/check_metal_format.sh
 	@bash scripts/check_metal_compiles.sh
@@ -776,7 +819,6 @@ profile-samply:  ## samply record rmlx baseline (CPU sampling; opens Firefox Pro
 # decode dominates the samples, not prefill. Override: PROF_PROMPT, PROF_GEN, MODEL.
 profile-samply-debug: build-debug ## samply flamegraph on release-debug (full DWARF, decode-focused)
 	@command -v samply >/dev/null 2>&1 || { echo "install: cargo install samply && samply setup"; exit 1; }
-	@pkill -f "rmlx serve" || true; rm -f /tmp/rmlx.*.claim
 	samply record --rate 4000 -- \
 	  ./target/release-debug/rmlx baseline --model "$(MODEL)" \
 	  --prompt-tokens $(PROF_PROMPT) --max-tokens $(PROF_GEN) --max-ctx 8192
@@ -837,7 +879,6 @@ CANARY_THRESHOLD_PCT ?= 3
 # Usage: make canary-gate SHA=3ba8aee
 
 canary: mlx-preflight build-perf  ## run 3-model TPS canary (records into runs.db + legacy CSV); requires release-perf binary
-	@pkill -f "rmlx serve" || true; pkill -f mlx_lm || true; sleep 1; rm -f /tmp/rmlx.*.claim
 	bash scripts/perf_canary.sh
 
 # The canary tracks ONE build over time. Comparing two builds (or two flag
@@ -908,7 +949,6 @@ canary-gate:        ## gate TPS regressions via runs.db (SHA= required; e.g. mak
 spec-canary: build-perf  ## run spec-decode canary (normal+MTP × 3 prompt classes); requires VERIFIER_MODEL + DRAFTER_MODEL env
 	@test -n "$$VERIFIER_MODEL" || { echo "ERROR: VERIFIER_MODEL= required (resolve via LOCAL.md)"; exit 125; }
 	@test -n "$$DRAFTER_MODEL"  || { echo "ERROR: DRAFTER_MODEL= required (resolve via LOCAL.md)";  exit 125; }
-	@pkill -f "rmlx serve" || true; pkill -f mlx_lm || true; sleep 1; rm -f /tmp/rmlx.*.claim
 	@echo "==> spec-canary: prose"
 	BENCH_PROMPT_FILE=prompts/spec_bench/prose.json \
 		bash scripts/spec_bench.sh --tag canary-prose
@@ -937,29 +977,35 @@ spec-canary-gate:   ## gate spec-decode regressions (decode_tps_warm + accept_ra
 # ---- SSD-tier canary (POPULATE / REVISIT / EVICT) -------------------------
 #
 # `make ssd-canary` — runs scripts/ssd_canary.sh end-to-end against VERIFIER_MODEL.
-#                     Spawns three server phases (POPULATE, REVISIT, EVICT), ingests
-#                     per-phase observations tagged ssd-canary-{populate,revisit,evict}
-#                     into runs.db, and writes CSVs + iteration_summary.json under
-#                     .rmlx/proofs/step3-canary/.
+#                     Spawns three server phases (POPULATE, REVISIT, EVICT) in a new
+#                     run directory under <data root>/proofs/, writes CSVs +
+#                     iteration_summary.json there, and ingests per-phase observations
+#                     tagged ssd-canary-{populate,revisit,evict} into the DB
+#                     `rmlx metrics path` names. At exit it deletes the run
+#                     directory's SSD blocks and nothing else.
 #
 # `make ssd-canary-gate SHA=<sha>` — queries runs.db via `rmlx metrics deltas`
 #                     against the recorded baseline SHA. Direction-aware: higher-is-
 #                     better metrics (ssd_spill_mb_per_s, ssd_hydrate_mb_per_s,
 #                     prompt_cache_ssd_hits) flag on drop; lower-is-better metrics
 #                     (ssd_spill_ms, ssd_hydrate_ms) flag on rise. Exits non-zero on
-#                     regression beyond CANARY_THRESHOLD_PCT (default 3%).
+#                     regression beyond CANARY_THRESHOLD_PCT (default 3%). It reads
+#                     the DB `rmlx metrics path` names, the one the canary writes,
+#                     and compares only the cells under an `ssd-canary-` prompt.
 #
 # Required env: VERIFIER_MODEL (resolve via LOCAL.md, gitignored).
 # Optional: SSD_GB (default 100), RMLX_HOME (default $PWD/.rmlx),
-#           CANARY_DB (default $RMLX_HOME/metrics/runs.db),
+#           RMLX_METRICS_DB (default $RMLX_HOME/metrics/runs.db),
 #           CANARY_THRESHOLD_PCT (default 3).
 # See docs/SSD_CANARY.md for the full env-var table and phase descriptions.
 
 ssd-canary: build-perf  ## run SSD canary (POPULATE/REVISIT/EVICT) against VERIFIER_MODEL
 	@test -n "$$VERIFIER_MODEL" || { echo "ERROR: VERIFIER_MODEL= required (resolve via LOCAL.md)"; exit 125; }
-	@pkill -f "rmlx serve" || true; pkill -f mlx_lm || true; sleep 1; rm -f /tmp/rmlx.*.claim
 	@echo "==> ssd-canary: populate + revisit + evict"
-	bash scripts/ssd_canary.sh --tag ssd-canary --ssd-gb $${SSD_GB:-100}
+	bash scripts/ssd_canary.sh --ssd-gb $${SSD_GB:-100}
+
+ssd-canary-selftest: ## check ssd-canary and ssd-canary-gate against a stub binary and server (no GPU, no model, no real data root)
+	bash scripts/ssd_canary_selftest.sh
 
 # ---- json_schema constraint canary ---------------------------------------
 #
@@ -995,16 +1041,16 @@ schema-constraint-canary: build-perf  ## prove json_schema enforcement on Bonsai
 
 ssd-canary-gate:   ## gate SSD-tier regressions; SHA= required, THRESHOLD_PCT=3 default
 	@test -n "$(SHA)" || { echo "ERROR: SHA= required. Usage: make ssd-canary-gate SHA=<last-green-sha>"; exit 125; }
-	@RMLX_HOME="$${RMLX_HOME:-$$PWD/.rmlx}"; \
-	DB_PATH="$${CANARY_DB:-$$RMLX_HOME/metrics/runs.db}"; \
+	@DB_PATH="$$(cargo run -q --release --bin rmlx -- metrics path)" || exit 1; \
 	if [ ! -f "$$DB_PATH" ]; then \
 		echo "skip: runs.db not found at $$DB_PATH (run 'make ssd-canary' first)"; \
 		exit 125; \
 	fi; \
 	echo "==> ssd-canary-gate: comparing vs SHA=$(SHA) threshold=$${CANARY_THRESHOLD_PCT:-3}%"; \
-	RMLX_METRICS_DB="$$DB_PATH" cargo run --release --bin rmlx -- \
-		metrics deltas \
+	cargo run --release --bin rmlx -- \
+		metrics --db "$$DB_PATH" deltas \
 		--since-sha "$(SHA)" \
+		--prompt-prefix ssd-canary- \
 		--threshold-pct $${CANARY_THRESHOLD_PCT:-3} \
 		--exit-code true
 

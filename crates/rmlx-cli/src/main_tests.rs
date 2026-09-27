@@ -47,7 +47,7 @@ fn verbose_env_filter_leaves_the_global_default_at_info() {
 /// unreachable from the command line.
 #[test]
 fn draft_model_parses_without_draft_kind() {
-    let r = Cli::try_parse_from([
+    let r = try_parse_cli([
         "rmlx",
         "serve",
         "--model",
@@ -65,7 +65,7 @@ fn draft_model_parses_without_draft_kind() {
 /// `--draft-kind` without a draft is meaningless and stays refused.
 #[test]
 fn draft_kind_requires_draft_model() {
-    let r = Cli::try_parse_from(["rmlx", "serve", "--model", "/tmp/m", "--draft-kind", "mtp"]);
+    let r = try_parse_cli(["rmlx", "serve", "--model", "/tmp/m", "--draft-kind", "mtp"]);
     let msg = r.err().map_or_else(String::new, |e| e.to_string());
     assert!(
         msg.contains("--draft-model"),
@@ -78,7 +78,7 @@ fn draft_kind_requires_draft_model() {
 #[test]
 fn draft_block_size_below_the_floor_is_refused_at_parse_time() {
     for bad in ["0", "1"] {
-        let r = Cli::try_parse_from([
+        let r = try_parse_cli([
             "rmlx",
             "serve",
             "--model",
@@ -95,7 +95,7 @@ fn draft_block_size_below_the_floor_is_refused_at_parse_time() {
         );
     }
     let floor = rmlx_server::MIN_DRAFT_BLOCK_SIZE.to_string();
-    let r = Cli::try_parse_from([
+    let r = try_parse_cli([
         "rmlx",
         "serve",
         "--model",
@@ -113,7 +113,7 @@ fn draft_block_size_below_the_floor_is_refused_at_parse_time() {
 #[test]
 fn every_draft_kind_is_a_flag_value() {
     for &kind in rmlx_models::DraftKind::ALL {
-        let r = Cli::try_parse_from([
+        let r = try_parse_cli([
             "rmlx",
             "serve",
             "--model",
@@ -134,11 +134,28 @@ fn every_draft_kind_is_a_flag_value() {
 use super::Cli;
 use clap::Parser;
 
+/// Parse `argv` as the `rmlx` command line, on a thread of its own: a debug
+/// `Cli` parse needs about 2.5 MB of stack, more than a test thread's default;
+/// production parses once, on the main thread.
+fn try_parse_cli<I, T>(argv: I) -> Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString>,
+{
+    let argv: Vec<std::ffi::OsString> = argv.into_iter().map(Into::into).collect();
+    std::thread::Builder::new()
+        .stack_size(8 << 20)
+        .spawn(move || Cli::try_parse_from(argv))
+        .expect("spawn parser thread")
+        .join()
+        .expect("parser thread")
+}
+
 /// `--paged-kv-page-tokens N` without `--paged-kv` must be rejected by clap
 /// via the `requires` attribute.
 #[test]
 fn paged_kv_page_tokens_requires_paged_kv() {
-    let r = Cli::try_parse_from([
+    let r = try_parse_cli([
         "rmlx",
         "serve",
         "--model",
@@ -155,7 +172,7 @@ fn paged_kv_page_tokens_requires_paged_kv() {
 /// `--paged-kv --paged-kv-page-tokens N` parses cleanly.
 #[test]
 fn paged_kv_with_page_tokens_parses() {
-    let r = Cli::try_parse_from([
+    let r = try_parse_cli([
         "rmlx",
         "serve",
         "--model",
@@ -170,7 +187,7 @@ fn paged_kv_with_page_tokens_parses() {
 /// New flags accept GiB doubles and the default 0.0.
 #[test]
 fn global_gb_flag_parses() {
-    let r = Cli::try_parse_from([
+    let r = try_parse_cli([
         "rmlx",
         "serve",
         "--model",
@@ -185,7 +202,7 @@ fn global_gb_flag_parses() {
 
 #[test]
 fn prompt_cache_ram_gb_flag_parses() {
-    let r = Cli::try_parse_from([
+    let r = try_parse_cli([
         "rmlx",
         "serve",
         "--model",
@@ -200,7 +217,7 @@ fn prompt_cache_ram_gb_flag_parses() {
 /// flag prefix and rejects it. Fixed by `allow_hyphen_values = true`.
 #[test]
 fn idle_timeout_secs_accepts_negative() {
-    let r = Cli::try_parse_from([
+    let r = try_parse_cli([
         "rmlx",
         "serve",
         "--model",
@@ -219,7 +236,7 @@ fn idle_timeout_secs_accepts_negative() {
 /// (`-1`, `-1s`, `-30m`) all map to Pin.
 #[test]
 fn idle_timeout_secs_accepts_negative_with_unit() {
-    let r = Cli::try_parse_from([
+    let r = try_parse_cli([
         "rmlx",
         "serve",
         "--model",
@@ -246,7 +263,7 @@ fn idle_timeout_secs_accepts_negative_with_unit() {
 /// check rejects it; conflicts_with_all on kv_preset does not cover paged_kv).
 #[test]
 fn kv_preset_fp16_paged_kv_parses_at_clap_level() {
-    let r = Cli::try_parse_from([
+    let r = try_parse_cli([
         "rmlx",
         "serve",
         "--model",
@@ -299,7 +316,7 @@ fn draft_block_size_above_the_ceiling_is_refused_at_parse_time() {
     const CEILING: usize = rmlx_models::speculative::MAX_BLOCK_SIZE;
     for bad in [CEILING + 1, 4096] {
         let bad = bad.to_string();
-        let r = Cli::try_parse_from([
+        let r = try_parse_cli([
             "rmlx",
             "serve",
             "--model",
@@ -317,7 +334,7 @@ fn draft_block_size_above_the_ceiling_is_refused_at_parse_time() {
         );
     }
     let ceiling = CEILING.to_string();
-    let r = Cli::try_parse_from([
+    let r = try_parse_cli([
         "rmlx",
         "serve",
         "--model",
@@ -332,4 +349,54 @@ fn draft_block_size_above_the_ceiling_is_refused_at_parse_time() {
         "the ceiling itself must parse, got: {:?}",
         r.err()
     );
+}
+
+/// Every `--device` flag refuses a value other than cpu/gpu at parse time.
+#[test]
+fn device_flag_accepts_only_cpu_and_gpu() {
+    let commands: [&[&str]; 7] = [
+        &["serve", "--model", "m"],
+        &["chat", "--model", "m"],
+        &["transcribe", "a.wav", "--model", "m"],
+        &["info", "--model", "m"],
+        &["baseline", "--model", "m"],
+        &["bench", "--model", "m"],
+        &["eval", "ppl", "--model", "m", "--text-file", "t"],
+    ];
+    for args in commands {
+        for (device, accepted) in [("cpu", true), ("gpu", true), ("tpu", false)] {
+            let mut argv = vec!["rmlx"];
+            argv.extend_from_slice(args);
+            argv.extend_from_slice(&["--device", device]);
+            let kind = try_parse_cli(argv).map(drop).map_err(|e| e.kind());
+            let want = if accepted {
+                Ok(())
+            } else {
+                Err(clap::error::ErrorKind::InvalidValue)
+            };
+            assert_eq!(kind, want, "{args:?} --device {device}");
+        }
+    }
+}
+
+/// A refused Metal claim leaves through the flushing exit path with code 11;
+/// other errors and codes pass through.
+#[test]
+fn claim_refusal_maps_to_exit_code_11() {
+    use rmlx_server::ClaimError;
+    let held = crate::commands::parse::check_claim::<()>(Err(ClaimError::AlreadyHeld {
+        holder_pid: Some(4242),
+        holder_command: "rmlx serve".to_owned(),
+        path: std::path::PathBuf::from("lock"),
+    }))
+    .map(|()| 0);
+    assert_eq!(
+        crate::exit::exit_code(held).expect("a refusal is an exit code"),
+        11
+    );
+    assert_eq!(
+        crate::exit::exit_code(Ok(3)).expect("a code passes through"),
+        3
+    );
+    assert!(crate::exit::exit_code(Err(anyhow::anyhow!("other"))).is_err());
 }

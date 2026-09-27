@@ -24,9 +24,11 @@
 //!
 //! ## Single-MLX-process discipline (CLAUDE.md hard rule 8)
 //!
-//! Before each `rmlx serve` spawn the test runs the standard preflight
-//! (`pkill -f "rmlx serve"`, clear `/tmp/rmlx.*.claim`) and on teardown kills
-//! its own child + clears the claim. Only one MLX process is alive at a time.
+//! Each `rmlx serve` the test spawns takes the Metal claim. The test kills and
+//! reaps each child before it spawns the next, which frees the claim, so only
+//! one MLX process is alive at a time. A claim some other process holds makes
+//! the server exit 11 and the readiness wait fails; the test stops no process it
+//! did not start.
 
 #![allow(
     clippy::unwrap_used,
@@ -100,26 +102,7 @@ twice before approving the deployment to the production cluster on Friday.'";
 /// faster", not "warm is instant".
 const TTFT_DROP_THRESHOLD: f64 = 0.85;
 
-// ── Process / claim helpers ─────────────────────────────────────────────────
-
-/// CLAUDE.md hard rule 8 preflight: ensure no competing MLX process holds the
-/// Metal context, and clear any stale claim file before we spawn our own.
-fn preflight_claim() {
-    for pat in ["rmlx serve", "mlx_lm", "paroquant"] {
-        let _ = Command::new("pkill").arg("-f").arg(pat).status();
-    }
-    std::thread::sleep(Duration::from_secs(5));
-    // rm -f /tmp/rmlx.*.claim
-    if let Ok(entries) = std::fs::read_dir("/tmp") {
-        for e in entries.flatten() {
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with("rmlx.") && name.ends_with(".claim") {
-                let _ = std::fs::remove_file(e.path());
-            }
-        }
-    }
-}
+// ── Process helpers ─────────────────────────────────────────────────────────
 
 /// Resolve the built `rmlx` binary by walking up from the test executable's
 /// own path to the `target/<profile>/` directory it lives under
@@ -146,10 +129,21 @@ fn rmlx_binary() -> PathBuf {
     bin
 }
 
+/// A spawned `rmlx serve` child. `Drop` kills and reaps it, which releases its
+/// Metal claim on every exit path, a failed assertion's unwind included.
+struct ServeGuard(Child);
+
+impl Drop for ServeGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// Spawn `rmlx serve` with the SSD tier on, a single RAM prompt-cache slot, and
-/// the given hermetic `RMLX_HOME`. Returns the child handle.
-fn spawn_serve(bin: &Path, model: &str, port: u16, rmlx_home: &Path) -> Child {
-    Command::new(bin)
+/// the given hermetic `RMLX_HOME`.
+fn spawn_serve(bin: &Path, model: &str, port: u16, rmlx_home: &Path) -> ServeGuard {
+    let child = Command::new(bin)
         .arg("serve")
         .arg("--model")
         .arg(model)
@@ -170,14 +164,8 @@ fn spawn_serve(bin: &Path, model: &str, port: u16, rmlx_home: &Path) -> Child {
         // output live (model load, spill drain, hydrate) for debugging.
         .stderr(std::process::Stdio::inherit())
         .spawn()
-        .expect("spawn rmlx serve")
-}
-
-/// Best-effort kill + reap of a serve child, then clear the claim.
-fn teardown(mut child: Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-    preflight_claim();
+        .expect("spawn rmlx serve");
+    ServeGuard(child)
 }
 
 // ── HTTP helpers (raw HTTP/1.1 over TcpStream — mirrors http_smoke.rs) ───────
@@ -322,9 +310,9 @@ fn ssd_disk_state(rmlx_home: &Path) -> (usize, usize) {
 // shown. It stays out of `scripts/run_gpu_tests.sh` on top of that: that runner
 // instruments the test process, which dispatches no Metal at all; the test also
 // needs `cargo build -p rmlx-cli` first (`cargo test --tests` does not build the
-// binary), `pkill`s every MLX process on the machine, and spends two 180 s
-// readiness waits. The same spill -> restart -> hydrate chain, over the same two
-// prompts, is covered by `make e2e` phase 2a
+// binary), spawns `rmlx` itself, which the runner's own Metal claim would
+// refuse, and spends two 180 s readiness waits. The same spill -> restart ->
+// hydrate chain, over the same two prompts, is covered by `make e2e` phase 2a
 // (`crates/rmlx-cli/tests/e2e/runner.rs`).
 // gpu-test-gate: metal-unscanned  Metal belongs to the spawned serve process.
 #[ignore = "integration: requires RMLX_TEST_MODEL + a real rmlx serve process (Metal)"]
@@ -353,8 +341,7 @@ async fn ssd_cache_survives_server_restart() {
     let port: u16 = 8731;
 
     // ── Phase 1: populate + spill ───────────────────────────────────────────
-    preflight_claim();
-    let mut child = spawn_serve(&bin, &model, port, &rmlx_home);
+    let child = spawn_serve(&bin, &model, port, &rmlx_home);
     assert!(
         wait_ready(port, Duration::from_secs(180)).await,
         "phase-1 server did not become ready within 180s"
@@ -398,17 +385,15 @@ async fn ssd_cache_survives_server_restart() {
         disk.1
     );
 
-    // ── Restart boundary: kill, clear claim, restart same model + RMLX_HOME ──
-    let _ = child.kill();
-    let _ = child.wait();
-    preflight_claim();
+    // ── Restart boundary: kill, reap, restart same model + RMLX_HOME ─────────
+    drop(child);
 
     // ── Phase 2: restart + hydrate ──────────────────────────────────────────
     let child2 = spawn_serve(&bin, &model, port, &rmlx_home);
-    if !wait_ready(port, Duration::from_secs(180)).await {
-        teardown(child2);
-        panic!("phase-2 server did not become ready within 180s (see inherited stderr above)");
-    }
+    assert!(
+        wait_ready(port, Duration::from_secs(180)).await,
+        "phase-2 server did not become ready within 180s (see inherited stderr above)"
+    );
 
     // Spilled row must have survived startup prune+evict.
     let after_restart = ssd_disk_state(&rmlx_home);
@@ -427,9 +412,8 @@ async fn ssd_cache_survives_server_restart() {
 
     let ssd_hits = scrape_ssd_hits(port).await.expect("scrape /metrics");
 
-    // Part 4 (step 2 carry-over): scrape /metrics and collect the new
-    // SSD-tier Prometheus data. We collect the body here and defer assertions
-    // until AFTER teardown so the GPU is freed even on assertion failure.
+    // Scrape /metrics and collect the SSD-tier Prometheus data; the assertions
+    // on it run after the server is stopped.
     let metrics_body = http(port, "GET", "/metrics", None)
         .await
         .expect("GET /metrics for SSD assertions")
@@ -451,8 +435,7 @@ async fn ssd_cache_survives_server_restart() {
     }
     eprintln!("--- end SSD section ---");
 
-    // Teardown BEFORE the asserts so the GPU is freed regardless of outcome.
-    teardown(child2);
+    drop(child2);
 
     // ── Cross-restart assertions ────────────────────────────────────────────
     assert!(

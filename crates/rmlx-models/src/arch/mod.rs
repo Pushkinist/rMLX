@@ -1025,7 +1025,7 @@ impl Architecture {
         // already registered; zero ML-semantic effect.
         rmlx_mlx::ensure_cpu_default_stream();
         if device == Device::Gpu {
-            rmlx_mlx::ensure_gpu_default_stream();
+            rmlx_mlx::ensure_gpu_default_stream()?;
         }
 
         tracing::info!(
@@ -1236,7 +1236,7 @@ impl Architecture {
         // ML-semantic effect.
         rmlx_mlx::ensure_cpu_default_stream();
         if device == Device::Gpu {
-            rmlx_mlx::ensure_gpu_default_stream();
+            rmlx_mlx::ensure_gpu_default_stream()?;
         }
 
         match self {

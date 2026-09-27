@@ -75,26 +75,103 @@ fn j6_aggregate_red_when_any_red() {
 
 // ── Claim check (unit level) ────────────────────────────────────────────────
 
-/// Claim check on a non-existent file is red.
 #[test]
-fn j6_claim_missing_file_is_red() {
-    // Port unlikely to have a real claim file.
-    let port: u16 = 19999;
-    let _ = std::fs::remove_file(format!("/tmp/rmlx.{port}.claim"));
-    let line = check_claim(port);
-    assert_eq!(line.status, Status::Red, "missing claim file must be red");
+fn j6_claim_held_is_green_and_names_the_holder() {
+    let line = claim_line(&Err(held_by_server()));
+    assert_eq!(line.status, Status::Green, "a held claim must be green");
+    assert!(line.detail.contains("recorded pid=4242"), "{}", line.detail);
+    assert!(
+        line.detail.contains("rmlx serve --port 8080"),
+        "{}",
+        line.detail
+    );
 }
 
-/// Claim check with a valid PID in the file but no actual process is red.
 #[test]
-fn j6_claim_dead_pid_is_red() {
-    let port: u16 = 19998;
-    let path = format!("/tmp/rmlx.{port}.claim");
-    // Write a PID that is virtually guaranteed to not exist (PID 2^22).
-    std::fs::write(&path, "4194303").expect("write claim file");
-    let line = check_claim(port);
-    let _ = std::fs::remove_file(&path);
-    assert_eq!(line.status, Status::Red, "dead PID must produce red");
+fn j6_claim_free_is_red() {
+    let line = claim_line(&Ok(()));
+    assert_eq!(line.status, Status::Red, "a free claim must be red");
+}
+
+#[test]
+fn j6_claim_io_error_is_red() {
+    let line = claim_line(&Err(ClaimError::Io {
+        path: PathBuf::from("lock"),
+        source: std::io::Error::other("probe failed"),
+    }));
+    assert_eq!(line.status, Status::Red, "a claim I/O error must be red");
+}
+
+fn held_by_server() -> ClaimError {
+    ClaimError::AlreadyHeld {
+        holder_pid: Some(4242),
+        holder_command: "rmlx serve --port 8080".to_owned(),
+        path: PathBuf::from("lock"),
+    }
+}
+
+fn models() -> Vec<PathBuf> {
+    vec![PathBuf::from("models/a"), PathBuf::from("models/b")]
+}
+
+fn names_the_holder(line: &CheckLine) -> bool {
+    line.detail.contains("4242") && line.detail.contains("rmlx serve --port 8080")
+}
+
+/// With --port, a holder found by the claim check skips the probes: each smoke
+/// line is info, not red, so a healthy server can pass `--port --full`.
+#[test]
+fn smoke_lines_are_info_and_name_the_holder_when_the_server_holds_the_claim() {
+    let held = held_by_server();
+    let lines = smoke_lines(
+        &models(),
+        Some(&held),
+        || panic!("the probes must not take the claim the server holds"),
+        |_, _| panic!("no probe may run"),
+    );
+    assert_eq!(lines.len(), 2);
+    for line in &lines {
+        assert!(line.check.starts_with("smoke:"), "{}", line.check);
+        assert_eq!(line.status, Status::Info, "{}", line.detail);
+        assert!(names_the_holder(line), "{}", line.detail);
+    }
+}
+
+#[test]
+fn smoke_lines_are_red_and_name_the_holder_when_the_claim_is_refused() {
+    let lines = smoke_lines(
+        &models(),
+        None,
+        || Err(held_by_server()),
+        |_, _| panic!("no probe may run"),
+    );
+    assert_eq!(lines.len(), 2);
+    for line in &lines {
+        assert_eq!(line.status, Status::Red, "a refused claim must be red");
+        assert!(line.detail.contains("PID 4242"), "{}", line.detail);
+        assert!(names_the_holder(line), "{}", line.detail);
+    }
+}
+
+#[test]
+fn smoke_lines_probe_every_model_under_one_claim() {
+    let mut claims = 0;
+    let mut probed = Vec::new();
+    let lines = smoke_lines(
+        &models(),
+        None,
+        || {
+            claims += 1;
+            Ok(ClaimedDevice::cpu())
+        },
+        |path, _| {
+            probed.push(path.to_path_buf());
+            CheckLine::new("smoke:x", Status::Green, "ok")
+        },
+    );
+    assert_eq!(claims, 1, "one claim covers every probe");
+    assert_eq!(probed, models());
+    assert!(lines.iter().all(|line| line.status == Status::Green));
 }
 
 // ── DB check ────────────────────────────────────────────────────────────────

@@ -7,11 +7,13 @@ MLX-format models.
 ## Local-only machine paths
 
 Paths in this file are **relative on purpose** — it is checked in and public.
-Concrete absolute machine paths (the model-snapshot root `RMLX_O_MODELS_ROOT`,
-the single-MLX claim file under `/tmp`, and local sibling repos) live in a
-**gitignored** `LOCAL.md` at the repo root. Use it as a local resolver; never
-copy an absolute path from it into this file, a commit, a report, a log, or
-any artifact that leaves the machine.
+Concrete absolute machine paths (the model-snapshot root `RMLX_O_MODELS_ROOT`
+and local sibling repos) live in a **gitignored** `LOCAL.md` at the repo
+root. Use it as a local resolver; never copy an absolute path from it into
+this file, a commit, a report, a log, or any artifact that leaves the
+machine. The Metal claim path, `/var/tmp/rmlx.claim`, is a fixed system path,
+not a per-machine one — it is safe to name in checked-in text; see
+`docs/CLI.md` § "Claim file".
 
 ## What this project is
 
@@ -40,7 +42,8 @@ areas before touching code:
 
 | Doc | Topic |
 |---|---|
-| [`docs/CLI.md`](docs/CLI.md) | rmlx CLI: subcommands, flags, env vars, claim file |
+| [`docs/CLI.md`](docs/CLI.md) | rmlx CLI: subcommands, flags, claim file |
+| [`docs/CLI_ENV_VARS.md`](docs/CLI_ENV_VARS.md) | Environment variables `CLI.md` reads, split out for size |
 | [`docs/SERVER.md`](docs/SERVER.md) | HTTP server: OpenAI/Anthropic compat, routes, tool calling, retry envelope |
 | [`docs/MODELS.md`](docs/MODELS.md) | Per-architecture model reference (Qwen, Gemma, Laguna, Jina, etc.) |
 | [`docs/ADDING_A_MODEL.md`](docs/ADDING_A_MODEL.md) | New-arch integration surface: shared seams + per-arch points + verification ritual |
@@ -141,8 +144,9 @@ coverage grows.
    incoherent output) before adding it to the registry.
 7. **Document the truth, not the docstring**. If an upstream algorithm name
    lies, call it out in code + docs.
-8. **Single MLX process per Mac**. Hold the claim file; unload competing MLX
-   servers before claiming the GPU; never bypass the claim silently.
+8. **Single MLX process per Mac**. A held claim refuses with exit code 11,
+   naming the holder; stop the holder by its PID (`kill <PID>`). Never
+   delete the claim file. See `docs/CLI.md` § "Claim file".
 9. **`make ci-perf` builds + tests under `release-perf` (panic=unwind, debug-assertions off), then runs the GPU/Metal suite.** A failure in the `release-perf` half that doesn't reproduce under `dev` → rebuild under `release-debug` (full DWARF) and re-run the failing case to capture symbols. Never rely on the `dev` profile to reproduce a release-mode bug — codegen and inlining differ. The GPU half is the exception and builds under `dev` on purpose: debug assertions are correctness guards and those are correctness tests. Its consequence: **no gate anywhere executes a `Device::Gpu` test under `release-perf`** — `make test` / `make ci` are `dev` with no `--ignored`, `test-perf` is `release-perf` with no `--ignored`, the GPU suite is `dev` with `--ignored`. A GPU-path defect that appears only with debug-assertions off is therefore out of every gate's scope and must be reproduced by hand at that profile.
 10. **Every KV-cache codec ships an MSL (Metal) decode kernel.** A codec whose decode falls back to CPU dequant is not shippable — it strands the codec at single-digit TPS (GPU idle) and is a bug, not a valid mode. New KV codecs (and the decode path of existing ones) MUST decode on-GPU, reading the quant store directly (fused flash-decode-over-quant; see `docs/KV_FUSED_KERNELS.md` and `docs/FFI.md`). Every MSL kernel body a **production** path can dispatch — KV codec or not — lives in a `.metal` file under a gated `src/metal/` directory (the list is `scripts/metal_dirs.sh`: `rmlx-kv-quant`, `rmlx-models`, `rmlx-mlx`), never in a Rust string literal, and carries a **native-compilation test** (`xcrun -sdk macosx metal -c` at `-std=metal3.1` and `-std=metal4.0`, wired as `make check-metal-compiles` in `make ci`) so MSL syntax errors surface at CI, not on first GPU dispatch. The gate also fails on a `.metal` file its directory's `probes/kernels.manifest` does not name — an unchecked body is the same defect wearing a different hat. Throwaway `#[cfg(test)]` bodies are exempt and stay inline (`metal_kernel_tests.rs` holds a trivial `add_one` smoke and a deliberately-invalid source that must never compile). **Know the gate's boundary:** it keys off directory membership, so it enforces this rule for kernels already in those directories but cannot detect a new inline-MSL literal in a fresh module — that part is review's job, not CI's. Kernels stay **model-agnostic** — keyed off codec + shape (`head_dim`, `kv_heads`, `bits`), never an arch name.
 
@@ -235,7 +239,9 @@ Hard rules:
   `make ci`. See `docs/FFI.md`.
   Run GPU tests with **`make gpu-test`** (every member crate,
   serialized; `CRATE=` / `FILTER=` to narrow), or by hand as
-  `cargo test -p <crate> --lib -- --ignored <filter> --test-threads=1`.
+  `cargo test --no-run -p <crate> --tests` (build, outside any claim) then
+  `rmlx claim run -- cargo test -p <crate> --lib -- --ignored <filter>
+  --test-threads=1` (run, holding the Metal claim) — see `docs/GPU_TESTS.md`.
   `make gpu-test` is the only step that executes them — `make test` passes no
   `--ignored` and the hosted CI has no Metal. The same suite runs as the last
   step of **`make ci-perf`** (invoked directly, so `CRATE=`/`VALIDATE=` cannot
@@ -337,7 +343,7 @@ hand — keeps the CI gate and the local gate identical.
 | `make check-kv-byte-model-parity` | CI gate (in `make ci`): `scripts/perf_ceiling.py`'s KV byte model against the engine's, swept from `ALL_KV_QUANTS` across both topologies and two shapes. The engine is the oracle — this does not check either model is right, only that there is effectively one of them. |
 | `make check-kv-byte-model-parity-fixtures` | CI gate (in `make ci`): recall test for the above, synthetic scan roots asserting the reason as well as exit 2 vs exit 1. |
 | `make gpu-runner-selftest` | CI gate (in `make ci` and hosted CI): the GPU runner reports a shader-validation hit and a crate failure found in the same run, the access mix it prints is the one the diagnostics named, and every census-pin verdict — exact match, new kernel, count above or below the expectation, a silent entry, a hit that moved crate, any store, an entry whose test was not selected or skipped, and each way the pin file itself can be malformed — reaches the report as itself, the tracked pin included. Stub crates, no GPU. |
-| `make canary-ab-selftest` | CI gate (in `make ci`): mutation check for `scripts/perf_ab.sh` against stub binaries. Every case declares `--synthetic-arms`, so the machine is not consulted and the outcome cannot depend on host load; the cases that exercise the host gates supply `ps` and `pgrep` shims instead. |
+| `make canary-ab-selftest` | CI gate (in `make ci`): mutation check for `scripts/perf_ab.sh` against stub binaries. Every case declares `--synthetic-arms`, so the machine is not consulted and the outcome cannot depend on host load; the cases that exercise the host gates supply `ps` and `claim-holder` shims instead. |
 | `make canary-ab-host-gate-fixtures` | CI gate (in `make ci`): recall test for that boundary — the quiescence and Metal-exclusivity gates still fire on a shimmed hostile host, a hostile and a quiet host give `--synthetic-arms` the same verdict, the flag waives no arm-reading guard, and the result file carries no reading taken off this machine. |
 | `make llama-ab-selftest` | CI gate (in `make ci`): mutation check for `scripts/bench_llama_ab.sh` against a stub `llama-server`. Same `--synthetic-arms` boundary, shared through `scripts/lib/cpu_snapshot.sh`; every case asserts a literal exit code, and the count of cases that could reach this host must be zero. |
 | `make check-kv-boundary-default-parity` | CI gate (in `make ci`): the CLI help, `docs/CLI.md` and the ingest resolver all name the default KV boundary the engine applies. The Rust constants are the oracle; the Python side derives rather than restates. |
@@ -356,6 +362,8 @@ hand — keeps the CI gate and the local gate identical.
 | `make kv-update-census-selftest` | CI gate (in `make ci`): recall test for the above over planted trees, 92 cases, each asserting the exit code and the figure or reason — a site in a file the producer was never told about, a collapsed site, a catch-all arm (`_`, a `ref` or `mut` binding, a tuple of catch-alls), a match under the bar, a `match` inside a comment and inside a string literal, a match whose scrutinee holds a block, a match whose arm block cannot be found (a refusal, never a dropped site), a variant that grows a state field, a bodiless declaration, a body moved into a codec family's own update file, and every way the tree can be unmeasurable. Each spelling the census resolves has a case and a negative control: `Self::` arms in `impl KvStorage` and `impl KvQuant` against `Self::` arms in an `impl` of another enum with the same variant names; a `use … as` alias and a `type` alias against the same aliases of an unrelated enum; a glob import, a use-tree `self as` alias and variants imported by name; a glob-imported storage `None` beside an `Option` match whose `None` is `Option`'s; a match over an enum a `KvStorage` field holds against the same match over an enum no field holds, and a held enum defined twice, which is a refusal. A `matches!`, an `if let`, a `while let`, a `let … else` and a catch-all match under the bar are subset sites, and the rewrite of a `matches!` as an `if let` keeps the figure; a `matches!` or `if let` over a non-codec enum is not one, and a variant named only in an arm guard is not an arm. A spelling table is a table site; one under the bar is not, and neither is a match over a non-codec enum whose arms return every variant. The derived bar is read with no `--threshold`: it must be half the enum, and a fifth variant moves it and drops a two-variant site with it, so replacing the derivation with a constant turns four cases red. A wide `match` planted in a `*_tests.rs` file is counted only under `--include-tests`, so disabling the test-file exclusion turns one case red. A `KvQuant::descriptor` row built from a struct-update base (`..BASE`, or another codec's row), and an arm that copies another row and patches it, are refused with exit 1 and their line; tuple and slice rest patterns, a commented-out base and bases outside that fn are not, so dropping the `impl KvQuant` scope turns one case red. A `KvStorage::view` or `KvStorage::view_mut` arm with a `..` rest pattern, and one that binds a slot to `_v`, are refused with exit 1, their line and the fn's name; a view that binds every field, a `view` beside a `view_mut` (two view fns), a `..` in a comment inside a view, in an `impl Other` view and in a free `view` fn are not. The last case pins the real tree's `match-sites`, `forcing-sites`, `subset-sites`, `table-sites`, `descriptor-fns` and `view-fns` (so a renamed descriptor or view reads 0, not a clean scan) exactly, from one run: a pin that fails prints the figure beside its pin, how to list the sites, and what to do — re-pin in the same change and name the site added or removed in the commit message when the change is correct, otherwise write an exhaustive match with no `_` arm. |
 | `make check-eval-lock` | CI gate (in `make ci`): every MLX eval FFI call is made under the process-wide evaluation lock (25-symbol reach-set). |
 | `make check-eval-lock-fixtures` | CI gate (in `make ci`): recall test for the above, 26 synthetic scan roots, each asserting which rule fired. |
+| `make check-claim-bypass` | CI gate (in `make ci` and hosted CI): nothing in the tree deletes the Metal claim, names its file outside the claim module, or kills by process-name pattern. It scans the `Makefile`, `scripts/`, `.github/`, each crate's `src`, `tests`, `examples` and `benches`, `docs/` and the top-level guides, comment lines included, since an operator hint is an instruction; no marker exempts a line. The scan is over the files git does not ignore (tracked plus untracked-not-ignored) — a violation in a git-ignored file is invisible to it, so its verdict does not depend on local, untracked notes. Exit 2 when it cannot scan, including when the scan root is not inside a git work tree. |
+| `make check-claim-bypass-selftest` | CI gate (in `make ci` and hosted CI): recall test for the above over planted scan roots, each case asserting the exit code and the rule and `file:line` or the reason. It also plants the rows that document the gate, from this table and `scripts/INDEX.md`, which must pass. |
 | `make eval-lock-stress` | Drive the evaluation-lock reproducer across `RUNS` fresh processes (default 60). Not in `make ci` — probabilistic (~8%/run) and costs ~412 threads. |
 | `make tag` | Create annotated `v<version>` tag from `[workspace.package].version` (single source). |
 | `make release-package` | Build + bundle `dist/rmlx-v<ver>-aarch64-apple-darwin.tar.gz` (+ `.sha256`). |
@@ -514,9 +522,9 @@ baseline calls per model (Bonsai, Gemma4-e4b, Qwen3.6). It prints decode-only
 TPS, appends one CSV row per model to `<RMLX_HOME>/bench/perf_canary.csv` and
 records one further run in `runs.db`. The anchors in `docs/PERF_BASELINE.md`
 are at the bf16 `auto` default (Bonsai ~142, Gemma4-e4b ~80, Qwen3.6 ~101
-TPS). Its limit: the `canary` target deletes every `/tmp/rmlx.*.claim` file
-before it runs, which bypasses the claim (hard rule 8); check for another MLX
-process first. For automated gates use `make canary-gate SHA=<sha>` against
+TPS). The `canary` target stops no process and deletes no claim file: when
+another process holds the Metal claim, `perf_canary.sh` exits 11 and names the
+holder. For automated gates use `make canary-gate SHA=<sha>` against
 `runs.db`, or `scripts/regression_gate.sh <model> <baseline_tps>
 <baseline_stddev>`: exit 125 = `git bisect skip`, exit 1 = regression.
 `canary-gate` exits 0 when the SHA has no rows, so a clean exit does not prove

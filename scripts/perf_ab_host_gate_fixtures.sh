@@ -28,7 +28,8 @@
 #   * a run that took the flag is marked as one in its own result file (case 7),
 #     so nothing downstream can promote a stub run as a measurement.
 #
-# The host is supplied entirely by `ps` and `pgrep` shims on PATH, so no case
+# The host is supplied entirely by `ps` and `claim-holder` shims on PATH (the
+# stub arms answer the claim probe from the latter), so no case
 # here reads this machine and the file is deterministic under any load.
 #
 # EXIT CODES
@@ -65,6 +66,14 @@ make_arm() { # make_arm NAME TPS
 	local path="${WORK}/$1"
 	cat >"${path}" <<STUB
 #!/usr/bin/env bash
+if [ "\${1:-}" = claim ]; then
+  if holder="\$(claim-holder 2>/dev/null)"; then
+    echo "rmlx: the Metal claim is held by PID \$holder" >&2
+    exit 11
+  fi
+  shift 3
+  exec "\$@"
+fi
 printf 'baseline: model=stub  load=1ms  ttft_ms=1  decode_tps=$2  overall_tps=$2  prefill_tps=1.0  prompt_tokens=4096  peak_rss=1.0MB  metal_peak_mb=100.0  metal_gen_alloc_mb=40.0\n'
 printf 'baseline: token_ids=11,22,33,44,55\n'
 STUB
@@ -94,7 +103,7 @@ mkdir -p "${WORK}/quiet" "${WORK}/hostile" "${WORK}/metalheld"
 	echo '#!/usr/bin/env bash'
 	idle_rows
 } >"${WORK}/quiet/ps"
-printf '#!/bin/sh\nexit 1\n' >"${WORK}/quiet/pgrep"
+printf '#!/bin/sh\nexit 1\n' >"${WORK}/quiet/claim-holder"
 
 # A hostile machine: one process whose cumulative CPU advances by 100 s on
 # every call, which is 10000%% of a core over the harness's 1 s entry window.
@@ -105,18 +114,18 @@ printf '#!/bin/sh\nexit 1\n' >"${WORK}/quiet/pgrep"
 	echo 'printf "%6d %12s %s\n" 4242 "0:$((n * 100)).00" /usr/local/bin/hog'
 	idle_rows
 } >"${WORK}/hostile/ps"
-printf '#!/bin/sh\nexit 1\n' >"${WORK}/hostile/pgrep"
+printf '#!/bin/sh\nexit 1\n' >"${WORK}/hostile/claim-holder"
 
 # A quiet machine that is nonetheless not ours: something holds the Metal
 # context.
 cp "${WORK}/quiet/ps" "${WORK}/metalheld/ps"
-printf '#!/bin/sh\necho 4243\nexit 0\n' >"${WORK}/metalheld/pgrep"
+printf '#!/bin/sh\necho 4243\nexit 0\n' >"${WORK}/metalheld/claim-holder"
 
 chmod +x "${WORK}"/quiet/* "${WORK}"/hostile/* "${WORK}"/metalheld/* || {
 	echo "ERROR: could not build the host shims" >&2
 	exit 2
 }
-for shim in quiet/ps quiet/pgrep hostile/ps hostile/pgrep metalheld/ps metalheld/pgrep; do
+for shim in quiet/ps quiet/claim-holder hostile/ps hostile/claim-holder metalheld/ps metalheld/claim-holder; do
 	[ -x "${WORK}/${shim}" ] || {
 		echo "ERROR: host shim ${shim} is missing or not executable" >&2
 		exit 2

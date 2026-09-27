@@ -53,9 +53,9 @@
 #
 # Default CSV: <RMLX_HOME>/bench/codec_inertness.csv
 #
-# Before every codec the preflight kills every `rmlx serve`, `rmlx_main serve`
-# and `mlx_lm` process and deletes the claim files below, whoever holds them.
-# That bypasses the single-process claim (hard rule 8).
+# Each `rmlx baseline` takes the Metal claim for its own run. The probe checks
+# the claim once before the first codec: a claim another process holds stops the
+# run with exit 11 and names the holder, rather than filing a row per codec.
 
 set -uo pipefail
 
@@ -77,10 +77,6 @@ PROMPT_TOKENS=4096
 MAX_TOKENS=100
 MAX_CTX=""
 KV_BOUNDARY=""
-# `rmlx baseline` is a single-shot GPU op: it takes the claim at
-# `rmlx_server::claim::SENTINEL_PORT` (0xCAFE = 51966), not at a server port.
-# The preflight clears both that file and 62265's (a stray `rmlx serve`).
-CLAIM_PORTS=(51966 62265)
 
 # Every `KvQuant` the enum can spell, one representative per parameterised
 # family. Kept in the order of `ALL_KV_QUANTS` so a reader can diff the two.
@@ -188,16 +184,6 @@ else
 	fi
 fi
 
-preflight() {
-	pkill -f "rmlx serve" 2>/dev/null
-	pkill -f "rmlx_main serve" 2>/dev/null
-	pkill -f mlx_lm 2>/dev/null
-	for p in "${CLAIM_PORTS[@]}"; do
-		rm -f "/tmp/rmlx.${p}.claim"
-	done
-	sleep 1
-}
-
 echo "probe: binary=$BINARY ($BINARY_SHA)"
 echo "probe: model=$MODEL_NAME prompt_tokens=$PROMPT_TOKENS max_tokens=$MAX_TOKENS max_ctx=$MAX_CTX kv_boundary=${KV_BOUNDARY:-default}"
 echo "probe: ${#CODECS[@]} codecs -> $OUT"
@@ -207,8 +193,9 @@ if [[ -n "$KV_BOUNDARY" ]]; then
 	boundary_args=(--kv-boundary-layers "$KV_BOUNDARY")
 fi
 
+"$BINARY" claim run -- true || exit $?
+
 for codec in "${CODECS[@]}"; do
-	preflight
 	raw="$(mktemp -t codec_inertness)"
 	RMLX_HOME="$RMLX_HOME" "$BINARY" baseline \
 		--model "$MODEL" \
@@ -255,5 +242,4 @@ for codec in "${CODECS[@]}"; do
 	rm -f "$raw"
 done
 
-preflight
 echo "probe: done -> $OUT"

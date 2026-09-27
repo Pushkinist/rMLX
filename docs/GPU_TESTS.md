@@ -10,9 +10,22 @@ pin. Snapshot resolution, the test variables and the CPU gates are in
 A test that drives the GPU carries `#[ignore]` and runs serialized:
 
 ```bash
-cargo test --test embeddings_smoke -- --ignored --test-threads=1
 cargo test -p rmlx-kv-quant --lib -- --ignored <filter> --test-threads=1
 ```
+
+Run by hand like this, the command takes no Metal claim: only `make gpu-test`
+and `make ci-perf` hold one, through `rmlx claim run`. `make gpu-test` builds
+the test binaries first, outside the claim, then runs them under it — do the
+same by hand:
+
+```bash
+cargo test --no-run -p rmlx-kv-quant --tests
+rmlx claim run -- cargo test -p rmlx-kv-quant --lib -- --ignored <filter> --test-threads=1
+```
+
+Building under the claim would hold it for the whole compile, blocking any
+other GPU user for no GPU work at all — so build first, then run the
+already-built binary under `rmlx claim run`.
 
 `cargo test` runs a binary's tests on parallel threads. A shared Metal context
 driven from several of them aborts the whole process:
@@ -83,21 +96,9 @@ and the marker beside `exempt`.
 
 | test | file | route | covered by |
 |---|---|---|---|
-| `valid_single_vector_200_shape` | `crates/rmlx-server/tests/embeddings_smoke.rs` | HTTP → `embeddings()` → `Device::Gpu` | nothing; run by hand |
-| `return_multivector_toggles_shape` | same | same | nothing; run by hand |
-| `invalid_dimensions_is_400` | same | same; the 400 comes after a full forward | nothing; run by hand |
-| `image_single_vector_200_shape` | same | same | nothing; run by hand |
-| `image_multivector_toggles_shape` | same | same | nothing; run by hand |
 | `ssd_cache_survives_server_restart` | `crates/rmlx-server/tests/ssd_cache_restart.rs` | spawned `rmlx serve` child | `make e2e` phase 2a runs the same spill → restart → hydrate chain |
 | `serve_refuses_to_start_above_the_positional_capacity` | `crates/rmlx-cli/tests/serve_context_ceiling.rs` | spawned `rmlx serve` child | nothing; run by hand |
 | `paro_kernel_registration` | `crates/rmlx-models/src/paroquant_msl_tests.rs` | `paro_rotate_kernel()` in a non-scanned source file | the `paro_rotate_identity_roundtrip_*` cells in `make gpu-test` dispatch the same kernel |
-
-Run the embeddings cells by hand:
-
-```sh
-RMLX_TEST_MODEL_JINA_V4=/abs/path/to/jinaai__jina-embeddings-v4 \
-  cargo test -p rmlx-server --test embeddings_smoke -- --ignored --test-threads=1
-```
 
 **Three populations.** `--list` is what `make gpu-test` executes. It is a
 strict subset of what the gate enforces, and every run prints the difference:
@@ -184,8 +185,11 @@ It refuses to report OK when:
 - a crate executed fewer tests than were classified for it;
 - the selection matched no test, or the classification is empty;
 - `RMLX_SKIP_GPU=1` is set, since every classified test would return before
-  touching Metal (`TESTING.md` § "`RMLX_SKIP_GPU` opt-out");
-- another MLX process is live (`pgrep -f 'rmlx serve|mlx_lm|paroquant|omlx'`).
+  touching Metal (`TESTING.md` § "`RMLX_SKIP_GPU` opt-out").
+
+`make gpu-test` and `make ci-perf` run the suite under `rmlx claim run`, which
+holds the Metal claim for the whole run. When another process holds it, the
+suite does not start: the exit code is 11 and the refusal names the holder.
 
 A failing test is never on a known-red list; the runner keeps none. Before
 blaming a failure on a change, re-run the same crate and filter on a clean
@@ -309,8 +313,10 @@ the rest half. The whole gate on `main` finds it one merge later.
 `make ci-perf` is the only shared gate that runs the GPU tests. In order:
 
 1. `run_gpu_tests.sh --preflight` checks the environment and runs no test:
-   `RMLX_SKIP_GPU` unset, no competing MLX process, a non-empty
-   classification. It fails before the long step.
+   `RMLX_SKIP_GPU` unset and a non-empty classification. Then
+   `rmlx claim run -- true` takes the Metal claim and releases it, so a claim
+   another process holds fails here with exit 11. Both fail before the long
+   step.
 2. `make test-perf` runs the workspace under `release-perf`.
 3. The GPU suite runs, and the last line reports its verdict: `ci-perf ok`, or
    `ci-perf INCOMPLETE` when the runner printed the marker.
@@ -353,7 +359,11 @@ Invalid device store at offset 4000064, executing kernel function: "custom_kerne
   (`man MetalValidation`).
 - **The banner is asserted per crate.** A crate that never printed
   `Metal GPU Validation Enabled` ran uninstrumented and fails. This usually
-  means it did not build.
+  means it did not build. The one exception is a crate whose every executed
+  test printed its own `SKIP <test>: <why>`: nothing in it reached Metal, each
+  cell is listed as a stand-down, and the run ends INCOMPLETE. The
+  `/v1/embeddings` GPU cells in `crates/rmlx-server/tests/embeddings_smoke.rs`
+  are such a crate on a host without the jina snapshot.
 - **A positive control runs first.**
   `crates/rmlx-kv-quant/src/shader_validation_canary.rs`, behind the
   `shader-validation-canary` feature, stores out of bounds on purpose. The run

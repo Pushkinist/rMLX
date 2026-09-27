@@ -74,7 +74,7 @@ rmlx_export_identity "$RMLX_DIR/target/release/rmlx"
 # stamp that repo's SHA into this one's observations.git_sha.
 GIT_SHA="$(git -C "${RMLX_DIR}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 PORT=62265
-CLAIM=/tmp/rmlx.${PORT}.claim
+RMLX_BIN="$RMLX_DIR/target/release/rmlx"
 BUDGET_S=$((BUDGET_MIN * 60))
 
 export RMLX_METRICS_DB="${RMLX_DIR}/.rmlx/metrics/runs.db"
@@ -138,14 +138,10 @@ HARNESS_LOG=/tmp/bench_harness_${TAG}_${BACKEND}_${KV_QUANT}.log
 
 echo "[$(date +%T)] CELL START tag=$TAG backend=$BACKEND kv=$KV_QUANT model_id=$MODEL_ID ct_mode=$_CT_MODE" >&2
 
-# --- Preflight kill ---
-pkill -f "rmlx serve" 2>/dev/null
-pkill -f mlx_lm 2>/dev/null
-pkill -f paroquant 2>/dev/null
-pkill -f omlx 2>/dev/null
-pkill -f llama-server 2>/dev/null
-sleep 5
-rm -f /tmp/rmlx.*.claim 2>/dev/null
+# The Metal claim is the one gate on the GPU: an rmlx arm takes it itself, and
+# every other backend runs under `rmlx claim run`. A claim another process
+# holds stops the cell with exit 11 and names the holder; this script stops only
+# the server it started.
 
 # ---------------------------------------------------------------------------
 # CACHE-TYPE MODE: direct `rmlx baseline` loop, median + stddev,
@@ -210,8 +206,6 @@ if [ "$_CT_MODE" -eq 1 ]; then
       # exit 78 = unsupported combo → record skip and bail with status info.
       echo "[$(date +%T)] CELL FAIL baseline-exit=$_EXIT iter=$_i tag=$TAG" >&2
       echo "[$TS_HMS] $TAG | $BACKEND | ctk=$_CTK_EFF ctv=$_CTV_EFF | success=false | coh=false | BASELINE_EXIT_$_EXIT" >>"$PROGRESS"
-      # Cleanup before exit.
-      rm -f /tmp/rmlx.*.claim 2>/dev/null
       exit "$_EXIT"
     fi
 
@@ -410,7 +404,6 @@ json.dump(rec, sys.stdout, indent=2)
     if ! ( cd "$RMLX_DIR" && ./target/release/rmlx metrics record --file "$_FAIL_JSON" >/dev/null 2>&1 ); then
       echo "[$(date +%T)] WARN: failed to ingest runtime_fail record $_FAIL_JSON" >&2
     fi
-    rm -f /tmp/rmlx.*.claim 2>/dev/null
     exit 10
   fi
 
@@ -494,10 +487,6 @@ json.dump(rec, sys.stdout, indent=2)
 
   echo "[$TS_HMS] $TAG | $BACKEND | kv=$_KV_CANON ct=${_CTK_EFF:-auto}/${_CTV_EFF:-auto} | success=true | coh=true | median=${_MEDIAN_TPS} stddev=${_STDDEV_TPS} (n=${_MEASURED_EFF})" >>"$PROGRESS"
 
-  # --- Release ---
-  pkill -f "rmlx serve" 2>/dev/null
-  sleep 1
-  rm -f /tmp/rmlx.*.claim 2>/dev/null
   echo "[$(date +%T)] CELL DONE tag=$TAG backend=$BACKEND kv=$_KV_CANON median=${_MEDIAN_TPS} stddev=${_STDDEV_TPS}" >&2
   exit 0
 fi
@@ -512,7 +501,7 @@ WARMUP_MODEL=""
 
 case "$BACKEND" in
   rmlx)
-    ( cd "$RMLX_DIR" && ./target/release/rmlx serve \
+    ( cd "$RMLX_DIR" && exec ./target/release/rmlx serve \
         --model "$MODEL_PATH" \
         --port "$PORT" \
         --device gpu \
@@ -525,7 +514,7 @@ case "$BACKEND" in
     HARNESS_MODEL="$MODEL_ID"
     ;;
   mlx-lm-turboquant)
-    "${MLX_LM_TURBOQUANT_ROOT:-../mlx-lm-turboquant}/.venv/bin/mlx_lm.server" \
+    "$RMLX_BIN" claim run -- "${MLX_LM_TURBOQUANT_ROOT:-../mlx-lm-turboquant}/.venv/bin/mlx_lm.server" \
         --model "$MODEL_PATH" \
         --kv-cache-quantization 8,4 \
         --quantized-kv-start 0 \
@@ -542,7 +531,7 @@ case "$BACKEND" in
     find /tmp/omlx_models -mindepth 1 -maxdepth 1 -delete 2>/dev/null
     OMLX_MODEL_NAME="gemma4-${TAG}"
     ln -sfn "$MODEL_PATH" "/tmp/omlx_models/$OMLX_MODEL_NAME"
-    "${OMLX_ROOT:-../oMLX}/.venv/bin/omlx" serve \
+    "$RMLX_BIN" claim run -- "${OMLX_ROOT:-../oMLX}/.venv/bin/omlx" serve \
         --model-dir /tmp/omlx_models \
         --port "$PORT" \
         --api-key 1234 >"$LOG" 2>&1 &
@@ -552,7 +541,7 @@ case "$BACKEND" in
     HARNESS_MODEL="$OMLX_MODEL_NAME"
     ;;
   paroquant)
-    ${PAROQUANT_ROOT:-../paroquant}/.venv/bin/python -m paroquant.cli.serve \
+    "$RMLX_BIN" claim run -- ${PAROQUANT_ROOT:-../paroquant}/.venv/bin/python -m paroquant.cli.serve \
         --model "$MODEL_PATH" \
         --port "$PORT" \
         --log-level WARNING >"$LOG" 2>&1 &
@@ -578,7 +567,7 @@ case "$BACKEND" in
         exit 6
         ;;
     esac
-    "${MLX_LM_ROOT:-../mlx-lm}/.venv/bin/mlx_lm.server" \
+    "$RMLX_BIN" claim run -- "${MLX_LM_ROOT:-../mlx-lm}/.venv/bin/mlx_lm.server" \
         --model "$MODEL_PATH" \
         --port "$PORT" \
         --max-tokens 8192 \
@@ -613,7 +602,7 @@ case "$BACKEND" in
       none|auto) _LCPP_CT="f16" ;;
       *)         _LCPP_CT="$KV_QUANT" ;;
     esac
-    "$_LCPP_BIN" \
+    "$RMLX_BIN" claim run -- "$_LCPP_BIN" \
         --model "$MODEL_PATH" \
         --port "$PORT" \
         --host 127.0.0.1 \
@@ -648,6 +637,27 @@ case "$BACKEND" in
     ;;
 esac
 
+# The process to measure. A non-rmlx server is `claim run`'s child, and the
+# harness reads the server's memory, not the wrapper's.
+BACKEND_PID="$SERVER_PID"
+if [ "$BACKEND" != "rmlx" ]; then
+  BACKEND_PID=""
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    BACKEND_PID="$(pgrep -P "$SERVER_PID" | head -1)"
+    [ -n "$BACKEND_PID" ] && break
+    kill -0 "$SERVER_PID" 2>/dev/null || break
+    sleep 0.5
+  done
+fi
+
+# stop_server — stop the server this cell started and wait for it, so its
+# claim is free when this returns. Its exit status is left in SERVER_RC.
+stop_server() {
+  kill "$SERVER_PID" 2>/dev/null
+  wait "$SERVER_PID" 2>/dev/null
+  SERVER_RC=$?
+}
+
 # --- Wait for /v1/models within budget ---
 READY=0
 DEADLINE=$((TS_START + BUDGET_S))
@@ -664,12 +674,10 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
   fi
 done
 
-if [ "$READY" -ne 1 ]; then
-  echo "[$(date +%T)] CELL FAIL server-not-ready tag=$TAG backend=$BACKEND kv=$KV_QUANT" >&2
+if [ "$READY" -ne 1 ] || [ -z "$BACKEND_PID" ]; then
+  stop_server
+  echo "[$(date +%T)] CELL FAIL server-not-ready tag=$TAG backend=$BACKEND kv=$KV_QUANT server_exit=$SERVER_RC (11: the Metal claim is held; its holder is in $LOG)" >&2
   echo "[$(date +%T)] $TAG | $BACKEND | $KV_QUANT | success=false | coh=false | SERVER_NOT_READY" >>"$PROGRESS"
-  kill "$SERVER_PID" 2>/dev/null
-  pkill -f "rmlx serve" 2>/dev/null; pkill -f mlx_lm 2>/dev/null; pkill -f omlx 2>/dev/null; pkill -f paroquant 2>/dev/null; pkill -f llama-server 2>/dev/null
-  rm -f /tmp/rmlx.*.claim
   exit 2
 fi
 
@@ -691,9 +699,7 @@ REMAINING=$((DEADLINE - $(date +%s)))
 if [ "$REMAINING" -lt 60 ]; then
   echo "[$(date +%T)] CELL FAIL pre-bench-out-of-budget tag=$TAG" >&2
   echo "[$(date +%T)] $TAG | $BACKEND | $KV_QUANT | success=false | coh=false | OUT_OF_BUDGET" >>"$PROGRESS"
-  kill "$SERVER_PID" 2>/dev/null
-  pkill -f "rmlx serve" 2>/dev/null; pkill -f mlx_lm 2>/dev/null; pkill -f omlx 2>/dev/null; pkill -f paroquant 2>/dev/null; pkill -f llama-server 2>/dev/null
-  rm -f /tmp/rmlx.*.claim
+  stop_server
   exit 3
 fi
 
@@ -708,7 +714,7 @@ HARNESS_ARGS=(
   --device gpu
   --max-tokens 8192
   --runs 2
-  --backend-pid "$SERVER_PID"
+  --backend-pid "$BACKEND_PID"
   --model-disk-gb "$MODEL_DISK_GB"
   --prompt-file "$RMLX_DIR/prompts/longctx_8k.json"
   --request-timeout 1800
@@ -768,14 +774,7 @@ fi
 echo "[$(date +%T)] $TAG | $BACKEND | $KV_QUANT | success=$SUCCESS | coh=$COH | cold=${COLD_MS} warm=${WARM_MS} prefill=${PREFILL_TPS} decode=${DECODE_TPS}" >>"$PROGRESS"
 
 # --- Release ---
-kill "$SERVER_PID" 2>/dev/null
-pkill -f "rmlx serve" 2>/dev/null
-pkill -f mlx_lm 2>/dev/null
-pkill -f omlx 2>/dev/null
-pkill -f paroquant 2>/dev/null
-pkill -f llama-server 2>/dev/null
-sleep 3
-rm -f /tmp/rmlx.*.claim
+stop_server
 
 echo "[$(date +%T)] CELL DONE tag=$TAG backend=$BACKEND kv=$KV_QUANT success=$SUCCESS coh=$COH decode=$DECODE_TPS" >&2
 exit 0

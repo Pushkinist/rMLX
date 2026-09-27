@@ -76,15 +76,16 @@ if $INCLUDE_26B; then
     MODELS+=("mlx-community__gemma-4-26b-a4b-it-mxfp8|${GEMMA4_26B_PATH}")
 fi
 
-# Pre-flight: ensure no competing MLX process holds the GPU
-pkill -f "rmlx serve" || true
-rm -f /tmp/rmlx.*.claim 2>/dev/null || true
-
 # Verify binary present
 if [[ ! -x "${BINARY}" ]]; then
     echo "ERROR: binary not found at ${BINARY}. Run: make build-perf" >&2
     exit 125
 fi
+
+# The measured calls hide rmlx's stderr, so a Metal claim another process holds
+# is found here: the probe takes the claim and releases it, or exits 11 naming
+# the holder, and the run stops with that status.
+"${BINARY}" claim run -- true
 
 # Ensure CSV dir and header
 mkdir -p "${CSV_DIR}"

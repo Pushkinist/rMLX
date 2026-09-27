@@ -1,7 +1,7 @@
 //! Unit tests for `rmlx transcribe` arch dispatch (no model load).
 
 use super::{run_transcribe, TranscribeArgs};
-use rmlx_mlx::Device;
+use crate::commands::parse::ClaimedDevice;
 use std::path::Path;
 
 /// A non-Whisper config.json yields a clear "unsupported architecture" error
@@ -23,7 +23,7 @@ fn rejects_non_whisper_arch() {
         language: "auto",
         translate: false,
     };
-    let err = run_transcribe(&args, Device::Cpu).unwrap_err();
+    let err = run_transcribe(&args, &ClaimedDevice::cpu()).unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("unsupported ASR architecture") && msg.contains("qwen3"),
@@ -43,5 +43,5 @@ fn missing_config_is_error() {
         language: "auto",
         translate: false,
     };
-    assert!(run_transcribe(&args, Device::Cpu).is_err());
+    assert!(run_transcribe(&args, &ClaimedDevice::cpu()).is_err());
 }

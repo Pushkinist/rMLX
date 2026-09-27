@@ -273,6 +273,17 @@ pub(crate) enum MetricsAction {
         /// Pass --exit-code=false to suppress the non-zero exit (always exit 0).
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         exit_code: bool,
+        /// Compare only the cells whose prompt name starts with this prefix.
+        #[arg(long)]
+        prompt_prefix: Option<String>,
+    },
+
+    /// Print the metrics DB path this invocation resolves, or with `--home`
+    /// the data root. Opens nothing.
+    Path {
+        /// Print the data root (`<RMLX_HOME>`) instead of the DB path.
+        #[arg(long, default_value_t = false)]
+        home: bool,
     },
 
     /// Set/update the description field on one observation or all observations in a run.
@@ -498,7 +509,23 @@ pub(crate) fn dispatch(cmd: MetricsCmd) -> anyhow::Result<()> {
             since_sha,
             threshold_pct,
             exit_code,
-        } => query_cmds::cmd_deltas(&db_path, &since_sha, threshold_pct, exit_code),
+            prompt_prefix,
+        } => query_cmds::cmd_deltas(
+            &db_path,
+            &since_sha,
+            threshold_pct,
+            exit_code,
+            prompt_prefix.as_deref(),
+        ),
+        MetricsAction::Path { home } => {
+            let path = if home {
+                rmlx_core::paths::home()
+            } else {
+                db_path
+            };
+            println!("{}", path.display());
+            Ok(())
+        }
         MetricsAction::Describe {
             observation_id,
             run_id,

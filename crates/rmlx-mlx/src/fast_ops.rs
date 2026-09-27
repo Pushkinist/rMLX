@@ -53,7 +53,7 @@ pub fn rms_norm(x: &Array, weight: Option<&Array>, eps: f32, device: Device) -> 
         with_stream(device, |s| {
             sys::mlx_fast_rms_norm(&raw mut res, x.inner, w_arr, eps, s)
         })
-    };
+    }?;
     // Do NOT free w_arr when weight.is_none() — it is the cached null sentinel.
     unsafe { check_status(status, "rms_norm") }?;
     Ok(Array { inner: res })
@@ -102,7 +102,7 @@ pub fn rope(
                 s,
             )
         })
-    };
+    }?;
     // Do NOT free freqs_null — it is the cached null sentinel.
     unsafe { check_status(status, "rope") }?;
     Ok(Array { inner: res })
@@ -155,7 +155,7 @@ pub fn rope_dynamic(
                 s,
             )
         })
-    };
+    }?;
     // Do NOT free freqs_null — it is the cached null sentinel.
     unsafe { check_status(status, "rope_dynamic") }?;
     Ok(Array { inner: res })
@@ -201,7 +201,7 @@ pub fn rope_with_freqs_dynamic(
                 s,
             )
         })
-    };
+    }?;
     unsafe { check_status(status, "rope_with_freqs_dynamic") }?;
     Ok(Array { inner: res })
 }
@@ -254,7 +254,7 @@ pub fn rope_with_freqs(
                 s,
             )
         })
-    };
+    }?;
     unsafe { check_status(status, "rope_with_freqs") }?;
     Ok(Array { inner: res })
 }
@@ -310,7 +310,7 @@ pub fn scaled_dot_product_attention(
                 s,
             )
         })
-    };
+    }?;
     // Do NOT free mask_inner or sinks_null — both are the cached null sentinel.
     unsafe { check_status(status, "scaled_dot_product_attention") }?;
     Ok(Array { inner: res })

@@ -21,8 +21,9 @@ schema: field names, SSE event types and block shape.
 
 ## Architecture
 
-SIGINT and SIGTERM shut the server down gracefully, so the claim file is
-removed. A handler panic returns 500. The request body limit is 26 MiB.
+SIGINT and SIGTERM shut the server down gracefully, releasing the Metal
+claim; the claim file itself is never removed. A handler panic returns 500.
+The request body limit is 26 MiB.
 
 ### Compute placement
 
@@ -161,7 +162,9 @@ can sweep codec and context cells, or run a different KV policy per request.
   `"planar"`, `"mixed_k<kb>g<kg>_v<vb>g<vg>"`, …). A malformed string is 400.
   It wins over the launch `--kv-quant`. `"auto"` names no codec, so the
   request runs what the server resolved at load. Absent means the launch
-  default.
+  default. On a server running `--device cpu`, any codec but `"none"` is
+  400: the message names the codec and says to send `"none"` or omit the
+  field.
 - **The prompt cache is partitioned by codec.** A prefix cached under one
   codec never serves a request on another; see `docs/PROMPT_CACHE.md`
   § "Codec namespacing".
@@ -604,32 +607,50 @@ Everything but `config.json` is best-effort: a missing file logs a `warn!`.
 
 ### Claim file
 
-`claim::try_claim(port) -> Result<MetalClaim, ClaimError>` guards the Metal
-claim for one port. The claim file is `/tmp/rmlx.<port>.claim`.
+`claim::try_claim() -> Result<MetalClaim, ClaimError>` guards one
+machine-wide Metal claim: an exclusive `flock` on `/var/tmp/rmlx.claim`.
+`/var/tmp` is machine-wide and outlives macOS's `tmp_cleaner`, which only
+sweeps `/tmp`.
 
-1. It creates the file with `O_CREAT | O_EXCL`.
-2. It takes an exclusive non-blocking `flock` on it.
-3. It writes its PID into it.
+1. It opens (or creates, mode `0666`) the file with `O_NOFOLLOW | O_CLOEXEC |
+   O_NONBLOCK`, and refuses anything that is not a regular file with one
+   link. A write open on another user's file gets `EACCES`, and it falls
+   back to a read-only open.
+2. It takes an exclusive, non-blocking `flock` on it — a read-only open
+   takes the same `flock` as a writable one.
+3. If the open was writable, it truncates the file and writes `<pid>
+   <argv>` into it. A read-only claimer skips this step, so its body still
+   names whichever process last held it open for writing.
 
-If the file exists, it reads the holder's PID and probes it with
-`kill(pid, 0)`. A live holder gets `ClaimError::AlreadyHeld { port,
-holder_pid }`. A dead holder (ESRCH) left a stale file. The claimer then
-takes the `flock`, re-reads and re-probes the PID under the lock, and only
-then reclaims the file, with a `warn`. Any doubt refuses rather than
-reclaims. The `flock` is the real gate: a live holder keeps its fd open, so
-the lock fails whatever the PID says.
+If another process already holds the `flock`, `try_claim` returns
+`ClaimError::AlreadyHeld { holder_pid, holder_command, path }`, read from the
+body the holder wrote. The `flock` is the only gate — there is no PID
+liveness probe. The kernel releases a dead holder's lock the moment it exits
+or is killed; the next claimer locks the same file with no reclaim logic and
+no operator action.
 
-`MetalClaim` is a RAII guard. Dropping it removes the file; the `flock` goes
-with the fd. `rmlx serve` handles SIGINT and SIGTERM gracefully, so the guard
-drops. After SIGKILL or a crash, the next claimer reclaims the stale file.
+`MetalClaim` is a RAII guard. Dropping it releases the `flock`, unless a
+child it passed the fd to (`rmlx claim run`) still runs — that child's own
+copy of the fd keeps the lock held. The file itself is never deleted. `rmlx
+serve` handles SIGINT and SIGTERM gracefully, so the guard drops on a clean
+shutdown too. `rmlx claim run -- <command>` holds the claim for
+`<command>`'s whole life; see `docs/CLI.md` § "Claim file".
 
-**The claim is per port, not per machine.** `rmlx serve` claims its
-`--port`. The single-shot GPU commands (`rmlx info`, `rmlx chat`,
-`rmlx baseline`) claim the sentinel port `0xCAFE` (51966). A `serve` and a
-`baseline`, or two `serve`s on different ports, each hold their own claim and
-can run on the GPU at once. The lock is advisory and does not see non-rMLX
-MLX processes such as `mlx_lm.server`; the `ClaimError` message prints
-unload and stop hints.
+**The claim is machine-wide, not per port or per command.** Every GPU
+command — `serve`, `chat`, `baseline`, `bench`, `kv-calibrate`,
+`healthcheck --full`, and so on — takes the same claim, so only one can hold
+the GPU at a time; a second is refused with exit code `11`, naming the
+recorded holder. The lock is advisory and does not see non-rMLX MLX
+processes such as `mlx_lm.server`; the `ClaimError` message prints a stop
+hint (`kill <PID>`), never a delete hint.
+
+**Legacy per-port claim (one release).** Older builds held
+`/tmp/rmlx.<port>.claim`. Before it takes the machine-wide claim, this build
+opens each such file and takes a brief shared lock on it, released at once —
+enough to tell whether it is held, not to hold it. It skips a vanished
+entry, a symlink, or anything that is not a regular file. Any other open
+error there refuses every GPU command with an I/O error, not exit `11`.
+Nothing is deleted. Removed in the release after next.
 
 ---
 
