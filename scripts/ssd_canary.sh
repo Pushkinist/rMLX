@@ -48,6 +48,8 @@ on_exit() {
 }
 trap on_exit EXIT
 
+# ── Paths ─────────────────────────────────────────────────────────────────────
+
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BINARY="${REPO_ROOT}/target/release-perf/rmlx"
 
