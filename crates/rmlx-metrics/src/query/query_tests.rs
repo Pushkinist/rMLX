@@ -351,7 +351,7 @@ fn timeseries_buckets_by_week() {
 fn deltas_unknown_sha_errors() {
     let mut conn = test_conn();
     seed_observations(&mut conn).unwrap();
-    let err = deltas(&conn, "sha_does_not_exist", None).unwrap_err();
+    let err = deltas(&conn, "sha_does_not_exist", None, None).unwrap_err();
     assert!(matches!(err, Error::Query(_)));
 }
 
@@ -381,7 +381,7 @@ fn deltas_no_change_returns_zero_delta() {
 
     // sha_base baseline ts = 2026-05-01. Post-baseline best = 95.0 = baseline best = 95.0.
     // delta = 0%. With threshold=5%, delta=0 < 5 → NOT included (abs(0) > 5 is false).
-    let rows = deltas(&conn, "sha_base", Some(5.0)).unwrap();
+    let rows = deltas(&conn, "sha_base", Some(5.0), None).unwrap();
     // Row should NOT be in results because 0% delta is below 5% threshold.
     let row = rows.iter().find(|r| {
         r.cell.model == "gemma-4-e2b" && r.metric == "decode_tps_warm" && r.cell.backend == "rmlx"
@@ -447,7 +447,7 @@ fn deltas_do_not_rank_an_implausible_row() {
         "sha_after",
     );
 
-    let rows = deltas(&conn, "sha_base", Some(5.0)).unwrap();
+    let rows = deltas(&conn, "sha_base", Some(5.0), None).unwrap();
     let row = rows
         .iter()
         .find(|r| r.metric == "prefill_tps" && r.cell.model == "Qwen3.6-35B");
@@ -822,7 +822,7 @@ fn deltas_regression_flagged() {
 
     // sha002 baseline → rmlx/qwen3-8b/decode_tps_warm baseline = 75.0, current = 40.0
     // delta = (40-75)/75*100 ≈ -46.7% → regressed (higher_better, delta < -5%)
-    let rows = deltas(&conn, "sha002", Some(5.0)).unwrap();
+    let rows = deltas(&conn, "sha002", Some(5.0), None).unwrap();
     let reg_row = rows.iter().find(|r| {
         r.cell.model == "qwen3-8b" && r.metric == "decode_tps_warm" && r.cell.backend == "rmlx"
     });
@@ -830,6 +830,98 @@ fn deltas_regression_flagged() {
     let reg = reg_row.unwrap();
     assert!(reg.regressed, "should be flagged as regressed");
     assert!(reg.delta_pct.unwrap() < -5.0);
+}
+
+/// `prompt_prefix` keeps the cells whose prompt name starts with it and drops
+/// the rest, whatever their delta. `_` is not a wildcard: a prefix match that
+/// went through `LIKE` would also keep `ssdXcanary`.
+#[test]
+fn deltas_prompt_prefix_keeps_only_matching_cells() {
+    let mut conn = test_conn();
+    {
+        let mut rec = Recorder::new(&mut conn, "test@0.0.1");
+        for prompt in ["ssd_canary_populate", "ssdXcanaryXother", "perf_canary"] {
+            for (value, ts, sha) in [
+                (100.0, "2026-05-01T10:00:00Z", "sha_base"),
+                (50.0, "2026-05-10T10:00:00Z", "sha_after"),
+            ] {
+                let mut run = make_run(
+                    "rmlx",
+                    "gemma-4-e2b",
+                    "decode_tps_warm",
+                    value,
+                    ts,
+                    Some(sha),
+                );
+                run.prompt = PromptRef::ByBody {
+                    name: prompt.into(),
+                    body: json!(format!("body of {prompt}")),
+                    notes: None,
+                    tokens_approx: Some(4),
+                };
+                rec.record_run(&run).unwrap();
+            }
+        }
+    }
+    assert_eq!(deltas(&conn, "sha_base", Some(5.0), None).unwrap().len(), 3);
+    let scoped = deltas(&conn, "sha_base", Some(5.0), Some("ssd_canary_")).unwrap();
+    assert_eq!(scoped.len(), 1, "{scoped:?}");
+    assert!(scoped[0].regressed);
+    let err = deltas(&conn, "sha_base", Some(5.0), Some("nothing-")).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("no cell has a prompt name starting 'nothing-'"),
+        "{err}"
+    );
+}
+
+/// With a prefix, the SHA is looked up among that prefix's cells only: a SHA
+/// that measured nothing under the prefix is no baseline for it.
+#[test]
+fn deltas_prompt_prefix_scopes_the_sha_lookup() {
+    let mut conn = test_conn();
+    {
+        let mut rec = Recorder::new(&mut conn, "test@0.0.1");
+        for (prompt, value, ts, sha) in [
+            (
+                "ssd-canary-populate",
+                100.0,
+                "2026-05-01T10:00:00Z",
+                "sha_canary",
+            ),
+            ("perf-canary", 100.0, "2026-05-02T10:00:00Z", "sha_other"),
+            (
+                "ssd-canary-populate",
+                99.0,
+                "2026-05-03T10:00:00Z",
+                "sha_after",
+            ),
+        ] {
+            let mut run = make_run(
+                "rmlx",
+                "gemma-4-e2b",
+                "decode_tps_warm",
+                value,
+                ts,
+                Some(sha),
+            );
+            run.prompt = PromptRef::ByBody {
+                name: prompt.into(),
+                body: json!(format!("body of {prompt}")),
+                notes: None,
+                tokens_approx: Some(4),
+            };
+            rec.record_run(&run).unwrap();
+        }
+    }
+    assert!(deltas(&conn, "sha_other", Some(5.0), None).is_ok());
+    let err = deltas(&conn, "sha_other", Some(5.0), Some("ssd-canary-")).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("no observations found with git_sha 'sha_other'"),
+        "{err}"
+    );
+    assert!(deltas(&conn, "sha_canary", Some(5.0), Some("ssd-canary-")).is_ok());
 }
 
 // ── cell key reaches every consumer ───────────────────────────────────────
@@ -1045,7 +1137,7 @@ fn deltas_does_not_compare_across_decode_configurations() {
         rec.record_run(&spec).unwrap();
     }
 
-    let rows = deltas(&conn, "aaaaaaa", Some(3.0)).unwrap();
+    let rows = deltas(&conn, "aaaaaaa", Some(3.0), None).unwrap();
     for row in &rows {
         if row.cell.decode_config.is_none() {
             assert!(

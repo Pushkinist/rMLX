@@ -105,7 +105,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         mlx-preflight mlx-restore-pin target-gc target-size-report profile-gputrace \
         profile-mst \
         build-capture test-capture gputrace-preflight traces-gc \
-        ssd-canary ssd-canary-gate \
+        ssd-canary ssd-canary-gate ssd-canary-selftest \
         schema-constraint-canary \
         bench-codec-cell \
         smoke-codec-matrix \
@@ -713,6 +713,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/spec_bench_published_selftest.sh
 	@bash scripts/published_ingest_selftest.sh
 	@bash scripts/published_table_selftest.sh
+	@bash scripts/ssd_canary_selftest.sh
 	@$(MAKE) --no-print-directory check-published-table
 	@bash scripts/check_metal_format.sh
 	@bash scripts/check_metal_compiles.sh
@@ -972,28 +973,35 @@ spec-canary-gate:   ## gate spec-decode regressions (decode_tps_warm + accept_ra
 # ---- SSD-tier canary (POPULATE / REVISIT / EVICT) -------------------------
 #
 # `make ssd-canary` — runs scripts/ssd_canary.sh end-to-end against VERIFIER_MODEL.
-#                     Spawns three server phases (POPULATE, REVISIT, EVICT), ingests
-#                     per-phase observations tagged ssd-canary-{populate,revisit,evict}
-#                     into runs.db, and writes CSVs + iteration_summary.json under
-#                     .rmlx/proofs/step3-canary/.
+#                     Spawns three server phases (POPULATE, REVISIT, EVICT) in a new
+#                     run directory under <data root>/proofs/, writes CSVs +
+#                     iteration_summary.json there, and ingests per-phase observations
+#                     tagged ssd-canary-{populate,revisit,evict} into the DB
+#                     `rmlx metrics path` names. At exit it deletes the run
+#                     directory's SSD blocks and nothing else.
 #
 # `make ssd-canary-gate SHA=<sha>` — queries runs.db via `rmlx metrics deltas`
 #                     against the recorded baseline SHA. Direction-aware: higher-is-
 #                     better metrics (ssd_spill_mb_per_s, ssd_hydrate_mb_per_s,
 #                     prompt_cache_ssd_hits) flag on drop; lower-is-better metrics
 #                     (ssd_spill_ms, ssd_hydrate_ms) flag on rise. Exits non-zero on
-#                     regression beyond CANARY_THRESHOLD_PCT (default 3%).
+#                     regression beyond CANARY_THRESHOLD_PCT (default 3%). It reads
+#                     the DB `rmlx metrics path` names, the one the canary writes,
+#                     and compares only the cells under an `ssd-canary-` prompt.
 #
 # Required env: VERIFIER_MODEL (resolve via LOCAL.md, gitignored).
 # Optional: SSD_GB (default 100), RMLX_HOME (default $PWD/.rmlx),
-#           CANARY_DB (default $RMLX_HOME/metrics/runs.db),
+#           RMLX_METRICS_DB (default $RMLX_HOME/metrics/runs.db),
 #           CANARY_THRESHOLD_PCT (default 3).
 # See docs/SSD_CANARY.md for the full env-var table and phase descriptions.
 
 ssd-canary: build-perf  ## run SSD canary (POPULATE/REVISIT/EVICT) against VERIFIER_MODEL
 	@test -n "$$VERIFIER_MODEL" || { echo "ERROR: VERIFIER_MODEL= required (resolve via LOCAL.md)"; exit 125; }
 	@echo "==> ssd-canary: populate + revisit + evict"
-	bash scripts/ssd_canary.sh --tag ssd-canary --ssd-gb $${SSD_GB:-100}
+	bash scripts/ssd_canary.sh --ssd-gb $${SSD_GB:-100}
+
+ssd-canary-selftest: ## check ssd-canary and ssd-canary-gate against a stub binary and server (no GPU, no model, no real data root)
+	bash scripts/ssd_canary_selftest.sh
 
 # ---- json_schema constraint canary ---------------------------------------
 #
@@ -1029,16 +1037,16 @@ schema-constraint-canary: build-perf  ## prove json_schema enforcement on Bonsai
 
 ssd-canary-gate:   ## gate SSD-tier regressions; SHA= required, THRESHOLD_PCT=3 default
 	@test -n "$(SHA)" || { echo "ERROR: SHA= required. Usage: make ssd-canary-gate SHA=<last-green-sha>"; exit 125; }
-	@RMLX_HOME="$${RMLX_HOME:-$$PWD/.rmlx}"; \
-	DB_PATH="$${CANARY_DB:-$$RMLX_HOME/metrics/runs.db}"; \
+	@DB_PATH="$$(cargo run -q --release --bin rmlx -- metrics path)" || exit 1; \
 	if [ ! -f "$$DB_PATH" ]; then \
 		echo "skip: runs.db not found at $$DB_PATH (run 'make ssd-canary' first)"; \
 		exit 125; \
 	fi; \
 	echo "==> ssd-canary-gate: comparing vs SHA=$(SHA) threshold=$${CANARY_THRESHOLD_PCT:-3}%"; \
-	RMLX_METRICS_DB="$$DB_PATH" cargo run --release --bin rmlx -- \
-		metrics deltas \
+	cargo run --release --bin rmlx -- \
+		metrics --db "$$DB_PATH" deltas \
 		--since-sha "$(SHA)" \
+		--prompt-prefix ssd-canary- \
 		--threshold-pct $${CANARY_THRESHOLD_PCT:-3} \
 		--exit-code true
 
