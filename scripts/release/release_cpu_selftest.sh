@@ -175,5 +175,57 @@ tar -C "$root/dist" -czf "$root/dist/rmlx.tar.gz" "rmlx-v0.0.0-aarch64-apple-dar
 case_run tarball_without_binary_unavailable "a tarball holding no rmlx binary" \
     2 "expected one \`rmlx\` binary, found 0" "$root"
 
-printf '\nrelease-cpu selftest: %d passed, %d failed\n' "$PASSED" "$FAILED"
+root=$(fresh two_binaries_in_tarball "$BASELINE_FLAGS")
+unit "$root" "$HASH_B" "binary-b" "$CONFIG_FLAGS"
+mkdir -p "$root/dist/rmlx-v0.0.0-aarch64-apple-darwin/extra"
+printf 'binary-b' >"$root/dist/rmlx-v0.0.0-aarch64-apple-darwin/extra/rmlx"
+tar -C "$root/dist" -czf "$root/dist/rmlx.tar.gz" "rmlx-v0.0.0-aarch64-apple-darwin"
+case_run tarball_with_two_binaries_unavailable "a tarball holding two rmlx binaries is ambiguous, not the first checked" \
+    2 "expected one \`rmlx\` binary, found 2" "$root"
+
+# flags_run <name> <what> <want-exit> <want-output> <root>: the `rustflags`
+# producer, its 0x1f separators shown as spaces.
+flags_run() {
+    local name="$1" what="$2" want="$3" want_out="$4" root="$5"
+    local out status
+    out=$(python3 "$TOOL" rustflags --root "$root" 2>&1)
+    status=$?
+    out=$(printf '%s' "$out" | tr '\037' ' ')
+    if [ "$status" != "$want" ] || [ "$out" != "$want_out" ]; then
+        FAILED=$((FAILED + 1))
+        printf '  FAIL %-34s (want exit %s, %q; got %s, %q) — %s\n' \
+            "$name" "$want" "$want_out" "$status" "$out" "$what"
+    else
+        PASSED=$((PASSED + 1))
+        printf '  ok   %-34s — %s\n' "$name" "$what"
+    fi
+}
+
+root=$(fresh producer "$BASELINE_FLAGS")
+flags_run producer_replaces_cpu "config.toml's flags with native replaced by the baseline" \
+    0 "-Ctarget-cpu=apple-m1 -Clink-arg=-dead_strip" "$root"
+
+root=$(fresh producer_carries_flags "$BASELINE_FLAGS")
+printf '[build]\nrustflags = ["-C", "target-cpu=native", "-C", "link-arg=-dead_strip", "-C", "force-frame-pointers=yes"]\n' \
+    >"$root/.cargo/config.toml"
+flags_run producer_carries_new_flag "a flag added to config.toml reaches the release build" \
+    0 "-Ctarget-cpu=apple-m1 -Clink-arg=-dead_strip -Cforce-frame-pointers=yes" "$root"
+
+root=$(fresh producer_no_cpu "$BASELINE_FLAGS")
+printf '[build]\nrustflags = ["-C", "link-arg=-dead_strip"]\n' >"$root/.cargo/config.toml"
+flags_run producer_pins_without_config_cpu "config.toml naming no CPU still gets the pin" \
+    0 "-Ctarget-cpu=apple-m1 -Clink-arg=-dead_strip" "$root"
+
+root=$(fresh producer_multiline "$BASELINE_FLAGS")
+printf '[build]\nrustflags = [\n  "-C", "link-arg=-dead_strip",\n]\n' >"$root/.cargo/config.toml"
+flags_run producer_refuses_unreadable_config "an unreadable config.toml is refused, not an empty flag list" \
+    2 "release-cpu: unavailable: $root/.cargo/config.toml: the rustflags array is not on one line: rustflags = [" "$root"
+
+root=$(fresh producer_round_trip "$BASELINE_FLAGS")
+produced=$(python3 "$TOOL" rustflags --root "$root" | python3 -c 'import json, sys; print(json.dumps(sys.stdin.read().split("\x1f")))')
+unit "$root" "$HASH_A" "binary-a" "$produced"
+case_run producer_output_passes_check "a build with exactly the producer's flags passes the check" \
+    0 "release-cpu: ok" "$root"
+
+printf '\nrelease-cpu selftest:%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

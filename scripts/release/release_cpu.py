@@ -5,6 +5,12 @@
 build, wrong for a binary built on one Mac and run on another. The release
 build pins BASELINE_CPU instead, keeping every other flag config.toml sets.
 
+  rustflags [--root DIR]
+      Print the release build's rustflags in CARGO_ENCODED_RUSTFLAGS form
+      (0x1f-separated): config.toml's flags with its target CPU replaced by
+      BASELINE_CPU. That variable replaces build.rustflags outright, so this is
+      the one place the other flags are carried over rather than restated.
+
   check <tarball> [--root DIR]
       Exit 0 when the `rmlx` binary inside <tarball> was compiled with exactly
       one target CPU, BASELINE_CPU, and otherwise with config.toml's flags.
@@ -27,6 +33,8 @@ import sys
 import tarfile
 from pathlib import Path
 
+# The oldest chip the project supports (M1-M5); also rustc's default CPU for
+# aarch64-apple-darwin, so the pin changes nothing on an M1 build machine.
 BASELINE_CPU = "apple-m1"
 PACKAGE = "rmlx-cli"
 BIN = "rmlx"
@@ -119,6 +127,10 @@ def recorded_rustflags(root, binary):
     return record, flags
 
 
+def release_rustflags(root):
+    return ["-Ctarget-cpu=" + BASELINE_CPU] + split_cpu(config_rustflags(root))[1]
+
+
 def check(tarball, root):
     record, flags = recorded_rustflags(root, packaged_binary(tarball))
     cpus, rest = split_cpu(flags)
@@ -140,13 +152,17 @@ def main():
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
     sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("rustflags", parents=[common])
     c = sub.add_parser("check", parents=[common])
     c.add_argument("tarball", type=Path)
     args = ap.parse_args()
     try:
+        if args.cmd == "rustflags":
+            print("\x1f".join(release_rustflags(args.root)), end="")
+            return 0
         return check(args.tarball, args.root)
     except (Unreadable, OSError, tarfile.TarError) as e:
-        print(f"release-cpu: unavailable: {e}")
+        print(f"release-cpu: unavailable: {e}", file=sys.stderr)
         return 2
 
 
