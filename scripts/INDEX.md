@@ -70,7 +70,8 @@ Conventions:
 | `lib/skip_notice_patterns.sh` | — | The stand-down notice's shape, defined once. Read by both `check_named_skip_notices.sh` and `run_gpu_tests.sh` — a source gate accepting a shape the runner counts as nameless would pass CI and leave every run INCOMPLETE. |
 | `eval_lock_stress.sh` | `make eval-lock-stress` | Drives the evaluation-lock reproducer across N fresh processes. Deliberately out of `make ci`. |
 | `schema_constraint_canary.sh` | — | Real-model proof for the `json_schema` constrained-decoding path. |
-| `ssd_canary.sh` | — | End-to-end long-session SSD prompt-cache tier canary (see `docs/SSD_CANARY.md`). |
+| `ssd_canary.sh` | `make ssd-canary` | End-to-end long-session SSD prompt-cache tier canary (see `docs/SSD_CANARY.md`). Each run writes into a new directory under `<data root>/proofs/` and deletes nothing; the phase records go to the DB `--print-db` names, which `make ssd-canary-gate` reads. |
+| `ssd_canary_selftest.sh` | `make ssd-canary-selftest` | Check for `ssd_canary.sh` and its two Makefile targets against a stub `rmlx` and a stub HTTP server: for an exported `RMLX_HOME`, an unset one (run from outside the tree) and an exported `RMLX_METRICS_DB`, the data root survives byte for byte, the phase servers run in a directory the run created (a new one per run), nothing outside it is removed and no claim is, the three records go to the DB `--print-db` names, and the gate reads that DB; `--tag` is refused. No GPU, no model. In `make ci`. |
 | `release_e2e/stage6_perf/codec_smoke_runner.sh` | `make smoke-codec-matrix` | KV-codec smoke + NIAH gate matrix. |
 | `release_e2e/stage6_perf/niah_long_context.sh` | — | Needle-in-a-haystack long-context validation driver. |
 | `parity/rmlx-vs-fork.sh` | — | Parity gate: does rMLX agree with the mlx-lm-turboquant fork. |

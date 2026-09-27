@@ -10,6 +10,7 @@ earlier process spilled to SSD, and that startup eviction holds the budget.
 make build-perf
 VERIFIER_MODEL=/path/to/snapshot bash scripts/ssd_canary.sh \
   [--port 62265] [--ssd-gb 100] [--dry-run]
+bash scripts/ssd_canary.sh --print-db
 ```
 
 `make ssd-canary` builds `release-perf` and runs the script with
@@ -21,15 +22,19 @@ VERIFIER_MODEL=/path/to/snapshot bash scripts/ssd_canary.sh \
 | `VERIFIER_MODEL` | required | Snapshot directory to serve |
 | `--port`, `PORT` | `62265` | Server port |
 | `--ssd-gb`, `SSD_GB` | `100` | `--kv-ssd-cache-gb` for POPULATE and REVISIT |
-| `--tag` | — | Parsed and never read; it changes nothing |
-| `--dry-run` | off | Keeps the data root; skips the ingest and the `events` and `observations` checks |
-| `RMLX_HOME` | `.rmlx/proofs/step3-canary/` | Data root of every server process |
+| `--dry-run` | off | Skips the ingest and the `events` and `observations` checks |
+| `--print-db` | — | Prints the metrics DB the records go to, and exits |
+| `RMLX_HOME` | the checkout's `.rmlx/` | Data root: holds the run directory, and its `metrics/runs.db` is the default metrics DB |
+| `RMLX_METRICS_DB` | `<data root>/metrics/runs.db` | Metrics DB the records go to, as for every `rmlx metrics` command |
 | `RMLX_HARDWARE_TAG` | script default | Hardware label of the `runs.db` rows |
 
-The script deletes its data root whole before the run, except under
-`--dry-run`. An `RMLX_HOME` exported in the shell is that data root, so an
-exported `RMLX_HOME=$PWD/.rmlx` loses `metrics/runs.db`, `metrics/backups/`,
-`cache/` and `logs/`. Unset `RMLX_HOME` before the run.
+The script deletes nothing. Each run creates a new directory,
+`<data root>/proofs/ssd-canary-<UTC stamp>.<random>/`, and every phase server
+runs with that directory as its `RMLX_HOME`: POPULATE starts from an empty SSD
+tier, and the servers' logs, `events` rows and SSD blocks stay in it. Nothing
+already in the data root is removed; outside the run directory, the one write
+is `rmlx metrics record` appending the three records to the metrics DB. The
+run directories are kept; remove old ones by hand.
 
 Each phase's server takes the Metal claim, and the script stops only the
 server it started. When another process holds the claim, the phase server
@@ -49,7 +54,7 @@ as the change since the previous request.
 3. **EVICT.** A new server starts with `--kv-ssd-cache-gb` set to four times
    the mean block size in the POPULATE index, at least 1 MiB. With no
    POPULATE block, the budget is 0.05 GB. The script reads the namespace
-   index `<RMLX_HOME>/cache/kv/ssd-canary/index.db` before the first request,
+   index `<run directory>/cache/kv/ssd-canary/index.db` before the first request,
    then sends the first 8 prompts.
 
 In REVISIT and EVICT, two failed requests in a row restart the phase's
@@ -69,30 +74,36 @@ The run exits 1 when any FAIL check fails. WARN checks only print a note.
 | `ssd_bytes_used` after POPULATE is above 0 | WARN |
 
 Each phase files one `RunRecord` through `rmlx metrics record`, tagged
-`ssd-canary-populate`, `ssd-canary-revisit` or `ssd-canary-evict` whatever
-`--tag` says. The POPULATE and REVISIT records carry SSD hits, bytes used,
+`ssd-canary-populate`, `ssd-canary-revisit` or `ssd-canary-evict`, into the
+metrics DB `--print-db` names. The POPULATE and REVISIT records carry SSD hits, bytes used,
 evictions, and mean spill and hydrate time and rate. The EVICT record carries
 bytes used and evictions only.
 
 ## Output
 
-Under the data root:
+In the run directory:
 
 - `phase_populate.csv`, `phase_revisit.csv`, `phase_evict.csv`: one row per
   request.
 - `iteration_summary.json`: phase totals and the check results.
-- `metrics/runs.db`: the `events` rows and the three observations.
+- `server_<phase>.log`: each phase server's output.
+- `metrics/runs.db`: the phase servers' `events` rows.
+
+The three observations go to the metrics DB, beside every earlier run's.
 
 ## The regression gate
 
 `make ssd-canary-gate SHA=<sha>` runs `rmlx metrics deltas --since-sha <sha>
---exit-code true` on `CANARY_DB`, at `CANARY_THRESHOLD_PCT` (default 3). It
-exits 125 without `SHA=` or without the DB.
+--exit-code true` on the DB `scripts/ssd_canary.sh --print-db` names, at
+`CANARY_THRESHOLD_PCT` (default 3). That is the DB the canary writes, so the
+comparison sees the rows of `<sha>` and of every later run. It exits 125
+without `SHA=` or without the DB.
 
-`CANARY_DB` defaults to `$RMLX_HOME/metrics/runs.db`, with `RMLX_HOME`
-defaulting to `.rmlx`. With `RMLX_HOME` unset, that is not the DB the canary
-writes. Either way the canary's DB holds one run, since the script deletes its
-data root first.
+`scripts/ssd_canary_selftest.sh` (`make ssd-canary-selftest`, in `make ci`)
+runs `make ssd-canary` and the gate against a stub binary and a stub server.
+It checks that a data root survives the run byte for byte, that each run gets
+a new directory, that the script removes nothing outside it, and that the gate
+reads the DB the records went to.
 
 `docs/METRICS_DB.md` describes `runs.db`. The cross-restart integration test,
 one spill and one hydrate, is `crates/rmlx-server/tests/ssd_cache_restart.rs`.

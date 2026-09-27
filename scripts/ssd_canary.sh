@@ -9,18 +9,21 @@
 #
 # Usage:
 #   VERIFIER_MODEL=/path/to/snapshot bash scripts/ssd_canary.sh [--port N] \
-#     [--tag TAG] [--ssd-gb N] [--dry-run]
+#     [--ssd-gb N] [--dry-run]
+#   bash scripts/ssd_canary.sh --print-db   # the DB the records go to; the gate reads it
 #
 # Requires:
 #   - Built binary at target/release-perf/rmlx  (run: make build-perf)
 #   - VERIFIER_MODEL env var set to snapshot directory (resolve via LOCAL.md)
 #
-# Output:
-#   - .rmlx/proofs/step3-canary/phase_populate.csv
-#   - .rmlx/proofs/step3-canary/phase_revisit.csv
-#   - .rmlx/proofs/step3-canary/phase_evict.csv
-#   - .rmlx/proofs/step3-canary/iteration_summary.json
-#   - Observations ingested into runs.db via §8.5 ingest path
+# Output, in a new directory <data root>/proofs/ssd-canary-<UTC stamp>.<random>/
+# that is the phase servers' RMLX_HOME:
+#   - phase_populate.csv, phase_revisit.csv, phase_evict.csv
+#   - iteration_summary.json
+#   - metrics/runs.db (the servers' events), cache/kv/ssd-canary/ (the SSD tier)
+# The three phase records go to the DB `--print-db` names, via §8.5 ingest.
+# The script deletes nothing: it writes only into that new directory, and the
+# data root's metrics DB is written by `rmlx metrics record` alone.
 
 set -euo pipefail
 
@@ -37,24 +40,13 @@ stop_live_server() {
 }
 trap stop_live_server EXIT
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
-
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BINARY="${REPO_ROOT}/target/release-perf/rmlx"
 
-# Run identity (backend / version / git sha / build profile / hardware tag)
-# comes from the measured binary — never hard-coded here.
-source "$(dirname "${BASH_SOURCE[0]}")/lib/identity.sh"
-rmlx_export_identity "${BINARY}"
-PROMPT_DIR="${REPO_ROOT}/prompts/ssd_bench"
-
-# RMLX_HOME for this canary run — hermetic, wiped before run.
-RMLX_HOME="${RMLX_HOME:-${REPO_ROOT}/.rmlx/proofs/step3-canary}"
-ARTIFACT_DIR="${RMLX_HOME}"
-BUFFER_DIR="${RMLX_HOME}/metrics/buffer/pending"
-DB_PATH="${RMLX_HOME}/metrics/runs.db"
-GIT_SHA="$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || echo "unknown")"
-HARDWARE_TAG="${RMLX_HARDWARE_TAG:-m5_max_128gb}"
+# The data root is an inherited RMLX_HOME, else this checkout's .rmlx. The
+# metrics DB is resolved in the binary's order: RMLX_METRICS_DB, then the data
+# root. `make ssd-canary-gate` reads the path `--print-db` prints.
+DATA_ROOT="${RMLX_HOME:-${REPO_ROOT}/.rmlx}"
+INGEST_DB="${RMLX_METRICS_DB:-${DATA_ROOT}/metrics/runs.db}"
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -66,22 +58,32 @@ TEMPERATURE=0
 SEED=42
 
 DRY_RUN=false
-BENCH_TAG="ssd-canary"
 
 # ── Arg parsing ───────────────────────────────────────────────────────────────
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --print-db)        echo "${INGEST_DB}"; exit 0 ;;
         --dry-run)         DRY_RUN=true; shift ;;
         --port=*)          PORT="${1#--port=}"; shift ;;
         --port)            shift; PORT="${1:?--port requires a value}"; shift ;;
-        --tag=*)           BENCH_TAG="${1#--tag=}"; shift ;;
-        --tag)             shift; BENCH_TAG="${1:?--tag requires a value}"; shift ;;
         --ssd-gb=*)        SSD_GB="${1#--ssd-gb=}"; shift ;;
         --ssd-gb)          shift; SSD_GB="${1:?--ssd-gb requires a value}"; shift ;;
         *) echo "Unknown flag: $1" >&2; exit 1 ;;
     esac
 done
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+
+BINARY="${REPO_ROOT}/target/release-perf/rmlx"
+
+# Run identity (backend / version / git sha / build profile / hardware tag)
+# comes from the measured binary — never hard-coded here.
+source "$(dirname "${BASH_SOURCE[0]}")/lib/identity.sh"
+rmlx_export_identity "${BINARY}"
+PROMPT_DIR="${REPO_ROOT}/prompts/ssd_bench"
+GIT_SHA="$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || echo "unknown")"
+HARDWARE_TAG="${RMLX_HARDWARE_TAG:-m5_max_128gb}"
 
 # ── Model path requirement ────────────────────────────────────────────────────
 
@@ -123,22 +125,26 @@ if [[ ! -d "${PROMPT_DIR}" ]]; then
     exit 1
 fi
 
-# ── Wipe hermetic RMLX_HOME ───────────────────────────────────────────────────
+# ── Run directory ─────────────────────────────────────────────────────────────
+# A new directory per run is the phase servers' RMLX_HOME, so POPULATE starts
+# from an empty SSD tier and no earlier run's blocks or events are read.
 
-if ! $DRY_RUN; then
-    echo "  [setup] wiping ${RMLX_HOME}" >&2
-    rm -rf "${RMLX_HOME}"
-fi
-mkdir -p "${ARTIFACT_DIR}" "${BUFFER_DIR}"
+RUN_START_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+mkdir -p "${DATA_ROOT}/proofs"
+RUN_DIR="$(mktemp -d "${DATA_ROOT}/proofs/ssd-canary-$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")"
+BUFFER_DIR="${RUN_DIR}/metrics/buffer/pending"
+EVENTS_DB="${RUN_DIR}/metrics/runs.db"
+mkdir -p "${BUFFER_DIR}"
 
 echo "==> ssd_canary.sh"
-echo "    model    : ${VERIFIER_MODEL}"
-echo "    model_id : ${MODEL_ID}"
-echo "    port     : ${PORT}"
-echo "    ssd_gb   : ${SSD_GB}"
-echo "    git_sha  : ${GIT_SHA}"
-echo "    dry_run  : ${DRY_RUN}"
-echo "    rmlx_home: ${RMLX_HOME}"
+echo "    model     : ${VERIFIER_MODEL}"
+echo "    model_id  : ${MODEL_ID}"
+echo "    port      : ${PORT}"
+echo "    ssd_gb    : ${SSD_GB}"
+echo "    git_sha   : ${GIT_SHA}"
+echo "    dry_run   : ${DRY_RUN}"
+echo "    run_dir   : ${RUN_DIR}"
+echo "    metrics_db: ${INGEST_DB}"
 echo ""
 
 # ── Collect all 20 prompt files ───────────────────────────────────────────────
@@ -197,7 +203,7 @@ get_cumulative_ssd_hits() {
     # /v1/models returns standard OpenAI list without cache stats.
     # Write to temp file to avoid shell pipe truncation mangling JSON.
     local _tmp_mc
-    _tmp_mc="/tmp/ssd_canary_mc_$$.json"
+    _tmp_mc="${RUN_DIR}/metrics_cache.json"
     curl -sf "http://127.0.0.1:${PORT}/metrics/cache" --max-time 5 \
         -o "${_tmp_mc}" 2>/dev/null || { echo "0"; return; }
     python3 - "${_tmp_mc}" <<'PYEOF' 2>/dev/null || echo "0"
@@ -215,7 +221,6 @@ try:
 except Exception:
     print(0)
 PYEOF
-    rm -f "${_tmp_mc}" 2>/dev/null || true
 }
 
 # Send one chat-completion request for a given prompt file.
@@ -309,10 +314,10 @@ bounce_if_stuck() {
     wait "${pid}" 2>/dev/null || true
     LIVE_PID=""
     sleep 3
-    RMLX_HOME="${RMLX_HOME}" \
+    RMLX_HOME="${RUN_DIR}" \
     RMLX_LOG_CAP_MB=500 \
         "${BINARY}" serve "$@" \
-        > /tmp/ssd_canary_revisit_stdout.txt 2>&1 &
+        >> "${RUN_DIR}/server_bounce.log" 2>&1 &
     local new_pid=$!
     eval "${pid_ref}=${new_pid}"
     LIVE_PID="${new_pid}"
@@ -343,7 +348,7 @@ parse_metrics() {
     # the pipe content as its script source (because python3 - reads script
     # from stdin), not as sys.stdin input. Use a temp file to decouple.
     local _metrics_tmp
-    _metrics_tmp="/tmp/ssd_canary_pm_$$.txt"
+    _metrics_tmp="${RUN_DIR}/metrics.txt"
     curl -sf "http://127.0.0.1:${PORT}/metrics" \
         -o "${_metrics_tmp}" 2>/dev/null || printf "" > "${_metrics_tmp}"
 
@@ -413,7 +418,6 @@ if hydrate_count == 0 and prom_hydrate_count > 0:
 # The Prometheus gauge only updates at server startup.
 print(f"{ssd_bytes} {ssd_evict:.0f} {spill_count} {hydrate_count} {spill_sum_us:.0f} {hydrate_sum_us:.0f} 0 0")
 PYEOF
-    rm -f "${_metrics_tmp}" 2>/dev/null || true
 }
 
 # Emit a §8.5 RunRecord JSON and ingest it into runs.db.
@@ -506,17 +510,17 @@ PYEOF
 
     echo "${record_json}" > "${buf_file}"
     echo "  [ingest] buffer: ${buf_file}" >&2
-    RMLX_HOME="${RMLX_HOME}" "${BINARY}" metrics record --file "${buf_file}" >&2
+    "${BINARY}" metrics --db "${INGEST_DB}" record --file "${buf_file}" >&2
     echo "  [ingest] done." >&2
 }
 
-# ── SSD index and events DB paths ─────────────────────────────────────────────
+# ── SSD index path ────────────────────────────────────────────────────────────
 # index.db is the ground truth for on-disk bytes (updated by drain thread).
-# events DB is the runs.db where ssd_spill + ssd_hydrate rows are recorded.
-POPULATE_INDEX_DB="${RMLX_HOME}/cache/kv/ssd-canary/index.db"
+# The servers record ssd_spill + ssd_hydrate rows in EVENTS_DB, the run
+# directory's runs.db.
+POPULATE_INDEX_DB="${RUN_DIR}/cache/kv/ssd-canary/index.db"
 # EVICT phase reuses ssd-canary namespace to verify startup eviction.
-EVICT_INDEX_DB="${RMLX_HOME}/cache/kv/ssd-canary/index.db"
-EVENTS_DB="${DB_PATH}"  # runs.db (metrics DB) holds the events table.
+EVICT_INDEX_DB="${RUN_DIR}/cache/kv/ssd-canary/index.db"
 
 # ── Phase POPULATE ────────────────────────────────────────────────────────────
 # Send all 20 prompts with a large SSD budget (tier ON, no budget pressure).
@@ -529,7 +533,7 @@ CONSECUTIVE_ERRORS=0
 _PREV_CUMULATIVE_SSD_HITS=0
 
 echo "  [server] starting populate server..." >&2
-RMLX_HOME="${RMLX_HOME}" \
+RMLX_HOME="${RUN_DIR}" \
 RMLX_LOG_CAP_MB=500 \
     "${BINARY}" serve \
         --model "${VERIFIER_MODEL}" \
@@ -538,7 +542,7 @@ RMLX_LOG_CAP_MB=500 \
         --kv-ssd-cache-gb "${SSD_GB}" \
         --project ssd-canary \
         --log info \
-        > /tmp/ssd_canary_populate_stdout.txt 2>&1 &
+        > "${RUN_DIR}/server_populate.log" 2>&1 &
 
 POPULATE_PID=$!
 LIVE_PID="${POPULATE_PID}"
@@ -546,7 +550,7 @@ echo "  [server] pid=${POPULATE_PID}" >&2
 wait_for_server "${POPULATE_PID}"
 
 # CSV header.
-POPULATE_CSV="${ARTIFACT_DIR}/phase_populate.csv"
+POPULATE_CSV="${RUN_DIR}/phase_populate.csv"
 echo "seq,prompt_name,ssd_hits,ssd_bytes_used,ssd_evict_total,spill_count,hydrate_count,spill_sum_us,hydrate_sum_us" \
     > "${POPULATE_CSV}"
 
@@ -559,7 +563,7 @@ for seq in $(seq 0 $((NUM_PROMPTS - 1))); do
     prompt_name="$(basename "${pf}" .json)"
     echo "  [populate] req $((seq+1))/${NUM_PROMPTS}: ${prompt_name}" >&2
 
-    send_request "${pf}" "${POPULATE_MAX_TOKENS}" > /tmp/ssd_canary_resp.txt
+    send_request "${pf}" "${POPULATE_MAX_TOKENS}" > "${RUN_DIR}/last_response.json"
 
     ssd_hits_req="${SSD_HITS_LAST}"
     TOTAL_SSD_HITS_POPULATE=$((TOTAL_SSD_HITS_POPULATE + ssd_hits_req))
@@ -659,7 +663,7 @@ CONSECUTIVE_ERRORS=0
 _PREV_CUMULATIVE_SSD_HITS=0
 
 echo "  [server] starting revisit server..." >&2
-RMLX_HOME="${RMLX_HOME}" \
+RMLX_HOME="${RUN_DIR}" \
 RMLX_LOG_CAP_MB=500 \
     "${BINARY}" serve \
         --model "${VERIFIER_MODEL}" \
@@ -668,14 +672,14 @@ RMLX_LOG_CAP_MB=500 \
         --kv-ssd-cache-gb "${SSD_GB}" \
         --project ssd-canary \
         --log info \
-        > /tmp/ssd_canary_revisit_stdout.txt 2>&1 &
+        > "${RUN_DIR}/server_revisit.log" 2>&1 &
 
 REVISIT_PID=$!
 LIVE_PID="${REVISIT_PID}"
 echo "  [server] pid=${REVISIT_PID}" >&2
 wait_for_server "${REVISIT_PID}"
 
-REVISIT_CSV="${ARTIFACT_DIR}/phase_revisit.csv"
+REVISIT_CSV="${RUN_DIR}/phase_revisit.csv"
 echo "seq,prompt_name,ssd_hits,ssd_bytes_used,ssd_evict_total,spill_count,hydrate_count,spill_sum_us,hydrate_sum_us" \
     > "${REVISIT_CSV}"
 
@@ -688,7 +692,7 @@ for rseq in $(seq 0 $((REVISIT_COUNT - 1))); do
     prompt_name="$(basename "${pf}" .json)"
     echo "  [revisit] req $((rseq+1))/${REVISIT_COUNT} (original idx=${idx}): ${prompt_name}" >&2
 
-    send_request "${pf}" "${POPULATE_MAX_TOKENS}" > /tmp/ssd_canary_resp.txt
+    send_request "${pf}" "${POPULATE_MAX_TOKENS}" > "${RUN_DIR}/last_response.json"
 
     # If the server got stuck (e.g. post-hydrate generation lock deadlock), bounce it.
     bounce_if_stuck REVISIT_PID \
@@ -766,7 +770,7 @@ CONSECUTIVE_ERRORS=0
 _PREV_CUMULATIVE_SSD_HITS=0
 
 echo "  [server] starting evict server..." >&2
-RMLX_HOME="${RMLX_HOME}" \
+RMLX_HOME="${RUN_DIR}" \
 RMLX_LOG_CAP_MB=500 \
     "${BINARY}" serve \
         --model "${VERIFIER_MODEL}" \
@@ -775,7 +779,7 @@ RMLX_LOG_CAP_MB=500 \
         --kv-ssd-cache-gb "${EVICT_SSD_GB}" \
         --project ssd-canary \
         --log info \
-        > /tmp/ssd_canary_evict_stdout.txt 2>&1 &
+        > "${RUN_DIR}/server_evict.log" 2>&1 &
 
 EVICT_PID=$!
 LIVE_PID="${EVICT_PID}"
@@ -783,7 +787,7 @@ echo "  [server] pid=${EVICT_PID}" >&2
 wait_for_server "${EVICT_PID}"
 
 # index.db for the ssd-canary namespace (shared with POPULATE).
-EVICT_INDEX_DB="${RMLX_HOME}/cache/kv/ssd-canary/index.db"
+EVICT_INDEX_DB="${RUN_DIR}/cache/kv/ssd-canary/index.db"
 
 # Read index state immediately after startup: startup_maintenance() runs evict_lru_until()
 # at attach time, before any request. This is the invariant to verify:
@@ -815,7 +819,7 @@ read -r _s_ssd_bytes _s_ssd_evict _s_spill _s_hydrate _s_spill_us _s_hydrate_us 
 EVICT_STARTUP_EVICT_TOTAL="${_s_ssd_evict:-0}"
 echo "  [evict] post-startup ssd_evict_total=${EVICT_STARTUP_EVICT_TOTAL}" >&2
 
-EVICT_CSV="${ARTIFACT_DIR}/phase_evict.csv"
+EVICT_CSV="${RUN_DIR}/phase_evict.csv"
 echo "seq,prompt_name,ssd_hits,ssd_bytes_used,ssd_evict_total,index_count,index_sum_bytes,index_sum_ok" \
     > "${EVICT_CSV}"
 
@@ -833,7 +837,7 @@ for seq in $(seq 0 $((_evict_n - 1))); do
     prompt_name="$(basename "${pf}" .json)"
     echo "  [evict] req $((seq+1))/${_evict_n}: ${prompt_name}" >&2
 
-    send_request "${pf}" "${POPULATE_MAX_TOKENS}" > /tmp/ssd_canary_resp.txt
+    send_request "${pf}" "${POPULATE_MAX_TOKENS}" > "${RUN_DIR}/last_response.json"
 
     # Bounce the evict server if stuck (e.g. post-hydrate panic deadlock).
     bounce_if_stuck EVICT_PID \
@@ -912,7 +916,7 @@ POPULATE_HYDRATE_MBPS="0.000"
 
 if [[ "${POPULATE_FINAL_SPILL_COUNT}" -gt 0 ]] && ! $DRY_RUN; then
     read -r POPULATE_MEAN_SPILL_US_DB POPULATE_SPILL_BYTES_DB < <(
-        sqlite3 -separator ' ' "${DB_PATH}" \
+        sqlite3 -separator ' ' "${EVENTS_DB}" \
             "SELECT COALESCE(AVG(value),0), COALESCE(AVG(CAST(json_extract(notes,'$.bytes') AS REAL)),0)
              FROM events WHERE op='ssd_spill';" \
             2>/dev/null || echo "0 0"
@@ -930,7 +934,7 @@ fi
 
 if [[ "${POPULATE_FINAL_HYDRATE_COUNT}" -gt 0 ]] && ! $DRY_RUN; then
     read -r POPULATE_MEAN_HYDRATE_US_DB POPULATE_HYDRATE_BYTES_DB < <(
-        sqlite3 -separator ' ' "${DB_PATH}" \
+        sqlite3 -separator ' ' "${EVENTS_DB}" \
             "SELECT COALESCE(AVG(value),0), COALESCE(AVG(CAST(json_extract(notes,'$.bytes') AS REAL)),0)
              FROM events WHERE op='ssd_hydrate';" \
             2>/dev/null || echo "0 0"
@@ -949,7 +953,7 @@ fi
 # Mean hydrate from revisit phase (total hydrate events include populate + revisit).
 REVISIT_MEAN_HYDRATE_US_FINAL=0
 if [[ "${REVISIT_FINAL_HYDRATE_COUNT:-0}" -gt 0 ]] && ! $DRY_RUN; then
-    REVISIT_MEAN_HYDRATE_US_FINAL=$(sqlite3 "${DB_PATH}" \
+    REVISIT_MEAN_HYDRATE_US_FINAL=$(sqlite3 "${EVENTS_DB}" \
         "SELECT COALESCE(AVG(value),0) FROM events WHERE op='ssd_hydrate';" \
         2>/dev/null || echo "0")
 fi
@@ -1020,8 +1024,8 @@ VALIDATION_PASS=true
 VALIDATION_NOTES=""
 
 # C1: events table has >= 20 SsdSpill rows.
-if ! $DRY_RUN && [[ -f "${DB_PATH}" ]]; then
-    SPILL_EVENT_ROWS=$(sqlite3 "${DB_PATH}" \
+if ! $DRY_RUN && [[ -f "${EVENTS_DB}" ]]; then
+    SPILL_EVENT_ROWS=$(sqlite3 "${EVENTS_DB}" \
         "SELECT COUNT(*) FROM events WHERE op='ssd_spill';" 2>/dev/null || echo "0")
     if [[ "${SPILL_EVENT_ROWS}" -lt 1 ]]; then
         VALIDATION_NOTES="${VALIDATION_NOTES} [WARN] spill event rows=${SPILL_EVENT_ROWS} (expected >= 1; SSD tier may not have been active)"
@@ -1031,7 +1035,7 @@ if ! $DRY_RUN && [[ -f "${DB_PATH}" ]]; then
     fi
 
     # C2: events table has >= 1 SsdHydrate row.
-    HYDRATE_EVENT_ROWS=$(sqlite3 "${DB_PATH}" \
+    HYDRATE_EVENT_ROWS=$(sqlite3 "${EVENTS_DB}" \
         "SELECT COUNT(*) FROM events WHERE op='ssd_hydrate';" 2>/dev/null || echo "0")
     if [[ "${HYDRATE_EVENT_ROWS}" -lt 1 ]]; then
         VALIDATION_NOTES="${VALIDATION_NOTES} [WARN] hydrate event rows=${HYDRATE_EVENT_ROWS} (expected >= 1; revisit may need more cache pressure)"
@@ -1040,10 +1044,10 @@ if ! $DRY_RUN && [[ -f "${DB_PATH}" ]]; then
         echo "  [ok] hydrate_event_rows=${HYDRATE_EVENT_ROWS}" >&2
     fi
 
-    # C3: observations table has the three tagged rows.
+    # C3: the metrics DB holds this run's three tagged rows.
     for obs_tag in "ssd-canary-populate" "ssd-canary-revisit" "ssd-canary-evict"; do
-        OBS_COUNT=$(sqlite3 "${DB_PATH}" \
-            "SELECT COUNT(*) FROM observations WHERE notes LIKE '%tag=${obs_tag}%' OR description LIKE '%${obs_tag}%';" \
+        OBS_COUNT=$(sqlite3 "${INGEST_DB}" \
+            "SELECT COUNT(*) FROM observations WHERE ts_utc >= '${RUN_START_UTC}' AND description LIKE '%tag=${obs_tag} %';" \
             2>/dev/null || echo "0")
         if [[ "${OBS_COUNT}" -lt 1 ]]; then
             VALIDATION_NOTES="${VALIDATION_NOTES} [WARN] observations tag=${obs_tag} count=${OBS_COUNT}"
@@ -1114,7 +1118,7 @@ fi
 
 # ── Write iteration_summary.json ──────────────────────────────────────────────
 
-SUMMARY_FILE="${ARTIFACT_DIR}/iteration_summary.json"
+SUMMARY_FILE="${RUN_DIR}/iteration_summary.json"
 
 python3 - <<PYEOF > "${SUMMARY_FILE}"
 import json, os, time
@@ -1123,7 +1127,7 @@ summary = {
     "ssd_canary_version": "1.0.0",
     "run_ts_utc": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
     "model_id": "${MODEL_ID}",
-    "rmlx_home": "${RMLX_HOME}",
+    "run_dir": "${RUN_DIR}",
     "dry_run": $( [[ "${DRY_RUN}" == "true" ]] && echo "True" || echo "False" ),
     "phases": {
         "POPULATE": {
@@ -1173,7 +1177,8 @@ summary = {
         "phase_populate_csv": "${POPULATE_CSV}",
         "phase_revisit_csv": "${REVISIT_CSV}",
         "phase_evict_csv": "${EVICT_CSV}",
-        "runs_db": "${DB_PATH}",
+        "runs_db": "${INGEST_DB}",
+        "events_db": "${EVENTS_DB}",
         "iteration_summary": "${SUMMARY_FILE}",
     },
 }
@@ -1185,13 +1190,13 @@ echo "==> Summary written to ${SUMMARY_FILE}"
 
 # ── Final DB verification ─────────────────────────────────────────────────────
 
-if ! $DRY_RUN && [[ -f "${DB_PATH}" ]]; then
+if ! $DRY_RUN && [[ -f "${INGEST_DB}" ]]; then
     echo ""
-    echo "==> DB verification (last 60 minutes):"
-    sqlite3 "${DB_PATH}" \
+    echo "==> DB verification (this run's records):"
+    sqlite3 "${INGEST_DB}" \
         "SELECT description, metric, ROUND(value,3) as value
          FROM observations
-         WHERE ts_utc >= datetime('now','-60 minutes')
+         WHERE ts_utc >= '${RUN_START_UTC}' AND description LIKE 'ssd_canary tag=%'
          ORDER BY ts_utc DESC, metric;" \
         2>/dev/null || echo "  (sqlite3 not available or DB empty)"
 fi
@@ -1224,7 +1229,8 @@ echo "  populate csv    : ${POPULATE_CSV}"
 echo "  revisit csv     : ${REVISIT_CSV}"
 echo "  evict csv       : ${EVICT_CSV}"
 echo "  iteration summary: ${SUMMARY_FILE}"
-echo "  runs.db         : ${DB_PATH}"
+echo "  runs.db         : ${INGEST_DB}"
+echo "  events db       : ${EVENTS_DB}"
 echo ""
 echo "Done."
 

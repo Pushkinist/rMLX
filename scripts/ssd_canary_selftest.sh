@@ -5,14 +5,18 @@
 #
 # Each run case builds a fixture tree (a copy of the script, its identity
 # helper, the real `prompts/ssd_bench/` and the Makefile, plus a stub binary at
-# `target/release-perf/rmlx`), seeds a data root, runs `make ssd-canary`, then
-# `make ssd-canary-gate`, and asserts:
+# `target/release-perf/rmlx`), seeds a data root, runs the canary (`make
+# ssd-canary`, or the script by hand from outside the tree), then `make
+# ssd-canary-gate`, and asserts:
 #   survive  every file in the data root before the run is byte-identical after
-#   run-dir  every phase server ran in one directory that did not exist before
+#   run-dir  every phase server ran in one directory that did not exist before,
+#            and a second run gets another one
 #   rm       every path the script removed lies inside that directory, and none
 #            names a claim
-#   ingest   the three phase records went to the DB `--print-db` names
+#   ingest   the three phase records went to the DB `--print-db` names, which
+#            is an exported RMLX_METRICS_DB when there is one
 #   gate     the gate read that same DB
+# A last case holds that `--tag`, which was parsed and never read, is refused.
 #
 # The stub's `metrics record` logs the DB it was pointed at and creates the file
 # when absent (as the real one does), but never writes into an existing DB, so
@@ -197,15 +201,15 @@ free_port() {
     python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])'
 }
 
-# run_env <case-dir> <tree> <extra VAR=value...> -- <command...>
+# run_env <case-dir> <cwd> <extra VAR=value...> -- <command...>
 # Runs a command in a clean environment: no inherited RMLX_*, no make flags.
 run_env() {
-    local cdir="$1" tree="$2"
+    local cdir="$1" cwd="$2"
     shift 2
     local extra=()
     while [[ $# -gt 0 && "$1" != "--" ]]; do extra+=("$1"); shift; done
     shift
-    (cd "$tree" && env -i \
+    (cd "$cwd" && env -i \
         HOME="$cdir/home" \
         PATH="$SHIM:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin" \
         TMPDIR="$cdir/tmp" \
@@ -217,34 +221,52 @@ run_env() {
 # ── Run cases ─────────────────────────────────────────────────────────────────
 
 # run_case <name> <root-mode> — root-mode is `exported` (RMLX_HOME points at a
-# seeded temp root) or `unset` (the tree's own .rmlx is the seeded root).
+# seeded temp root), `unset` (the tree's own .rmlx is the seeded root) or
+# `metrics-db` (as `exported`, plus RMLX_METRICS_DB naming a DB elsewhere, which
+# the binary prefers over the data root's, so the records must go there).
 run_case() {
     local name="$1" mode="$2"
     local cdir="$WORK/$name"
     local tree="$cdir/tree"
     mkdir -p "$cdir/home" "$cdir/tmp" "$cdir/log"
     make_tree "$tree"
-    local root home_env=()
-    if [[ "$mode" == exported ]]; then
-        root="$cdir/data-root"
-        home_env=("RMLX_HOME=$root")
-    else
-        root="$tree/.rmlx"
-    fi
+    local root home_env=() expected_db=""
+    case "$mode" in
+        exported)
+            root="$cdir/data-root"
+            home_env=("RMLX_HOME=$root") ;;
+        metrics-db)
+            root="$cdir/data-root"
+            expected_db="$cdir/elsewhere/runs.db"
+            home_env=("RMLX_HOME=$root" "RMLX_METRICS_DB=$expected_db") ;;
+        *)
+            root="$tree/.rmlx" ;;
+    esac
     seed_root "$root"
     (cd "$root" && find . -type f -print0 | xargs -0 shasum -a 256) >"$cdir/before.sha"
     find "$root" -type d | sort >"$cdir/dirs_before"
 
-    local port
+    # With RMLX_HOME unset the script is run by hand from outside the tree, where
+    # the binary's own DB resolution (a walk up from the working directory) lands
+    # elsewhere: only the DB the script names keeps the records where the gate looks.
+    local port run_how rc
     port="$(free_port)"
-    run_env "$cdir" "$tree" ${home_env[@]+"${home_env[@]}"} \
-        "VERIFIER_MODEL=$tree/models/stub-ns__stub-model-8bit" "PORT=$port" -- \
-        make --no-print-directory -f "$tree/Makefile" ssd-canary >"$cdir/run.out" 2>&1
-    local rc=$?
-    if [[ $rc -eq 0 ]]; then
-        pass "$name: make ssd-canary exits 0"
+    if [[ "$mode" == unset ]]; then
+        run_how="ssd_canary.sh run from outside the tree"
+        run_env "$cdir" "$cdir" "VERIFIER_MODEL=$tree/models/stub-ns__stub-model-8bit" "PORT=$port" -- \
+            bash "$tree/scripts/ssd_canary.sh" --ssd-gb 100 >"$cdir/run.out" 2>&1
+        rc=$?
     else
-        fail "$name: make ssd-canary exited $rc (tail: $(tail -3 "$cdir/run.out" | tr '\n' ' '))"
+        run_how="make ssd-canary"
+        run_env "$cdir" "$tree" ${home_env[@]+"${home_env[@]}"} \
+            "VERIFIER_MODEL=$tree/models/stub-ns__stub-model-8bit" "PORT=$port" -- \
+            make --no-print-directory -f "$tree/Makefile" ssd-canary >"$cdir/run.out" 2>&1
+        rc=$?
+    fi
+    if [[ $rc -eq 0 ]]; then
+        pass "$name: $run_how exits 0"
+    else
+        fail "$name: $run_how exited $rc (tail: $(tail -3 "$cdir/run.out" | tr '\n' ' '))"
     fi
 
     # survive
@@ -300,6 +322,8 @@ run_case() {
         fail "$name: --print-db printed nothing ($(head -1 "$cdir/print.err"))"
     elif [[ "$n_records" != 3 || "$ingest_dbs" != "$printed" ]]; then
         fail "$name: $n_records record(s) into [$ingest_dbs], --print-db names [$printed]"
+    elif [[ -n "$expected_db" && "$printed" != "$expected_db" ]]; then
+        fail "$name: records went to [$printed], not the RMLX_METRICS_DB [$expected_db]"
     else
         pass "$name: three records went to the DB --print-db names"
     fi
@@ -326,11 +350,30 @@ run_case() {
     else
         pass "$name: the gate read the DB the run wrote"
     fi
+
+    # A second run must not reuse the first run's directory: a reused one holds
+    # the first run's SSD blocks, so POPULATE would not start cold.
+    if [[ "$mode" == exported ]]; then
+        find "$root" -type d | sort >"$cdir/dirs_before"
+        : >"$cdir/log/serve.log"
+        port="$(free_port)"
+        run_env "$cdir" "$tree" ${home_env[@]+"${home_env[@]}"} \
+            "VERIFIER_MODEL=$tree/models/stub-ns__stub-model-8bit" "PORT=$port" -- \
+            make --no-print-directory -f "$tree/Makefile" ssd-canary >"$cdir/run2.out" 2>&1
+        local second
+        second="$(sort -u "$cdir/log/serve.log" | sed 's/^home=//')"
+        if [[ -z "$second" || "$second" == "$run_dir" ]] || grep -qxF "$second" "$cdir/dirs_before"; then
+            fail "$name: the second run's servers ran in [$second], not a new directory"
+        else
+            pass "$name: a second run gets a new directory"
+        fi
+    fi
 }
 
 echo "==> ssd-canary-selftest"
 run_case exported-home exported
 run_case unset-home unset
+run_case metrics-db-env metrics-db
 
 # --tag was parsed and never read; it is refused rather than silently dropped.
 tag_dir="$WORK/tag"
