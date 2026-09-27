@@ -53,6 +53,12 @@ class Rmlx < Formula
     # build.rs needs BOTH prefixes; mlx-c pulls mlx transitively.
     ENV["MLX_C_PREFIX"] = Formula["mlx-c"].opt_prefix
     ENV["MLX_PREFIX"] = Formula["mlx"].opt_prefix
+    # A bottle runs on Macs other than the one that built it, so it takes the
+    # release tarball's flags (apple-m1) instead of config.toml's target-cpu=native.
+    if build.bottle?
+      ENV["CARGO_ENCODED_RUSTFLAGS"] =
+        Utils.safe_popen_read("python3", "scripts/release/release_cpu.py", "rustflags")
+    end
     system "cargo", "install", *std_cargo_args(path: "crates/rmlx-cli")
   end
 

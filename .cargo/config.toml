@@ -10,5 +10,8 @@
 # or add profiling frame pointers):
 #   RUSTFLAGS="-C target-cpu=apple-m5 -C force-frame-pointers=yes" cargo build --release
 #
+# The release tarball runs on other Macs, so it replaces `native` with apple-m1
+# and keeps the other flags here (scripts/release/release_cpu.py).
+#
 # -dead_strip drops unreachable symbols → smaller binary.
 rustflags = ["-C", "target-cpu=native", "-C", "link-arg=-dead_strip"]

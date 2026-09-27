@@ -24,8 +24,15 @@ NAME="rmlx-v${VER}-${TRIPLE}"
 DIST="dist"
 STAGE="${DIST}/${NAME}"
 
-echo "==> building rmlx v${VER} (release)"
-cargo build --release -p rmlx-cli
+# The tarball runs on Macs other than this one, so it is compiled for the oldest
+# supported chip rather than this machine's (config.toml's target-cpu=native).
+RELEASE_RUSTFLAGS=$(python3 scripts/release/release_cpu.py rustflags)
+
+echo "==> building rmlx v${VER} (release, $(printf '%s' "$RELEASE_RUSTFLAGS" | tr '\037' ' '))"
+# A rustc wrapper's arguments never reach cargo's record, which is all the check
+# reads. An empty variable also overrides build.rustc-wrapper in any config.
+RUSTC_WRAPPER= RUSTC_WORKSPACE_WRAPPER= CARGO_ENCODED_RUSTFLAGS="$RELEASE_RUSTFLAGS" \
+  cargo build --release -p rmlx-cli
 
 BIN="target/release/rmlx"
 [ -x "$BIN" ] || { echo "error: $BIN not found"; exit 1; }
@@ -38,6 +45,13 @@ cp LICENSE-MIT LICENSE-APACHE README.md "$STAGE/"
 
 echo "==> archiving"
 tar -C "$DIST" -czf "${DIST}/${NAME}.tar.gz" "$NAME"
+
+echo "==> checking the packaged binary's target CPU"
+python3 scripts/release/release_cpu.py check "${DIST}/${NAME}.tar.gz" || {
+  rm -rf "$STAGE" "${DIST}/${NAME}.tar.gz" "${DIST}/${NAME}.tar.gz.sha256"
+  echo "error: the packaged binary is not built for the release baseline CPU; tarball and staging removed"
+  exit 1
+}
 ( cd "$DIST" && shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
 
 echo "==> done"
