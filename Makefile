@@ -87,7 +87,7 @@ PROF_GEN    ?= 500
 AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
 
 .PHONY: help build check test fmt fmt-check lint audit deny precommit hooks \
-        ci ci-metrics tag release-package release-sha release-sign bottle tap-sync \
+        ci ci-metrics tag release-package release-cpu-selftest release-sha release-sign bottle tap-sync \
         clean serve chat info logs-tail metrics-summary \
         metrics-init metrics-doctor metrics-doctor-fix metrics-export \
         metrics-backup metrics-replay-pending metrics-prompts-sync \
@@ -631,6 +631,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/debt_report_selftest.sh
 	@bash scripts/check_doc_size_selftest.sh
 	@python3 scripts/lib/debt_report.py --check-doc-size
+	@bash scripts/release/release_cpu_selftest.sh
 	@bash scripts/kv_update_census_selftest.sh
 	@bash scripts/check_no_inline_tests.sh
 	@bash scripts/check_no_scalar_f32_leak.sh
@@ -689,8 +690,11 @@ tag:             ## create annotated git tag v<version> from Cargo.toml [workspa
 	git tag -a "v$$v" -m "rMLX v$$v" && echo "tagged v$$v — push with: git push origin v$$v"
 
 # ---- release (all local; hosted CI cannot build rMLX — no usable Metal) ----
-release-package: ## build + bundle dist/rmlx-v<ver>-aarch64-apple-darwin.tar.gz (+ .sha256)
+release-package: ## build + bundle dist/rmlx-v<ver>-aarch64-apple-darwin.tar.gz (+ .sha256), compiled for apple-m1 and checked
 	bash scripts/release/package_binary.sh
+
+release-cpu-selftest: ## CI gate: recall test for the release tarball's target-CPU check, each case asserting its exit code and reason
+	@bash scripts/release/release_cpu_selftest.sh
 
 release-sha:     ## print sha256 of the v<ver> GitHub source tarball (append --write to patch the formula)
 	bash scripts/release/source_sha256.sh

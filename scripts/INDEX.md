@@ -183,7 +183,9 @@ Conventions:
 
 | Script | Via | What it does |
 |---|---|---|
-| `release/package_binary.sh` | `make release-package` | Build + package the release binary for `aarch64-apple-darwin`. |
+| `release/package_binary.sh` | `make release-package` | Build + package the release binary for `aarch64-apple-darwin`, compiled for `apple-m1`; keeps the tarball only when `release_cpu.py check` passes. |
+| `release/release_cpu.py` | `make release-package` | `rustflags`: the tarball's build flags, `.cargo/config.toml`'s with its target CPU replaced by `apple-m1` (0x1f-separated, for `CARGO_ENCODED_RUSTFLAGS`). `check <tarball>`: follows the packaged binary to the byte-identical `target/release/deps/rmlx-<hash>` and reads the rustflags cargo recorded for that unit; exit 1 unless exactly one target CPU, `apple-m1`, and otherwise config.toml's flags; exit 2 when the chain cannot be followed. |
+| `release/release_cpu_selftest.sh` | `make release-cpu-selftest` | Recall test for the above over synthetic roots, 28 cases, each asserting the exit code and the reason: native, a newer core, no CPU, two CPUs, each flag spelling, a dropped `-dead_strip`, an extra target feature, a stale record beside the packaged unit in both directions, the producer's output round-tripped through the check, and each way the chain or config.toml can be unreadable. In `make ci`. |
 | `release/build_bottle.sh` | — | Build a Homebrew bottle from the installed keg. |
 | `release/source_sha256.sh` | `make release-sha` | Compute the sha256 of a GitHub source tarball and patch the formula. |
 | `release/sync_tap.sh` | `make tap-sync` | Sync `packaging/homebrew/rmlx.rb` into the Homebrew tap. |

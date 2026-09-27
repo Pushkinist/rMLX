@@ -29,6 +29,31 @@ the MLX that Homebrew links on the user's machine at run time.
   (`crates/rmlx-mlx/src/nax.rs`), so the value describes the user's MLX.
 - Run `make mlx-preflight` on the release machine before building.
 
+## The tarball's target CPU
+
+The tarball binary is compiled for `apple-m1`, the oldest chip rMLX supports,
+so it runs on every Apple Silicon Mac whatever chip built it. It is also
+`aarch64-apple-darwin`'s default CPU.
+
+- `.cargo/config.toml` sets `target-cpu=native`, right for a build that runs
+  where it was compiled: `cargo build` in the checkout and the Homebrew
+  formula. `install.sh` runs `cargo install --git`, which reads no repo
+  config and so builds for the default CPU. Only the tarball overrides the
+  config.
+- `package_binary.sh` builds with `CARGO_ENCODED_RUSTFLAGS` from
+  `scripts/release/release_cpu.py rustflags`: config.toml's flags, with its
+  target CPU replaced by `apple-m1`. `-dead_strip` is carried over, not
+  restated.
+- The binary records no target CPU. `release_cpu.py check` follows the
+  packaged bytes to the byte-identical `target/release/deps/rmlx-<hash>` and
+  reads the rustflags cargo recorded for that unit in
+  `target/release/.fingerprint/rmlx-cli-<hash>/bin-rmlx.json`. It passes on
+  exactly one target CPU, `apple-m1`, and otherwise config.toml's flags. A
+  failing check removes the tarball. `make release-cpu-selftest` is its
+  recall test.
+- The fingerprint record is cargo's internal format. If a cargo release
+  changes it, the check exits 2 (`unavailable`) rather than passing.
+
 ## Branch model
 
 - **`main` holds the released state.** Its history is linear and tags live
@@ -80,7 +105,8 @@ that bypass is what lets the fast-forward push below reach `main`.
    `Cargo.toml`. Push it: `git push origin v<version>`.
 6. **Package.** `make release-package` builds
    `dist/rmlx-v<version>-aarch64-apple-darwin.tar.gz` and its `.sha256`.
-   The tarball holds `rmlx`, both licenses and `README.md`.
+   The tarball holds `rmlx`, both licenses and `README.md`. The binary is
+   compiled for `apple-m1` and checked (§The tarball's target CPU).
 7. **GitHub Release**, with the changelog section as the body:
    ```sh
    gh release create v<version> \
@@ -338,6 +364,8 @@ git worktree remove ../rmlx-retro-new
 | `CHANGELOG.md` | Release notes (Keep a Changelog); the release body |
 | `packaging/homebrew/rmlx.rb` | The formula; the tap holds a copy |
 | `scripts/release/package_binary.sh` | `make release-package` |
+| `scripts/release/release_cpu.py` | The tarball's rustflags, and the check of its target CPU |
+| `scripts/release/release_cpu_selftest.sh` | `make release-cpu-selftest` |
 | `scripts/release/sign_artifact.sh` | `make release-sign` |
 | `scripts/release/source_sha256.sh` | `make release-sha`; `--write` patches the formula |
 | `scripts/release/sync_tap.sh` | `make tap-sync` |
