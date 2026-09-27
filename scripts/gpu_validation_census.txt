@@ -131,3 +131,6 @@ affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 80 | rmlx-mod
 affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 40 | rmlx-models | qwen3_moe_golden_tokens_k8v8 | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
 affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 1014 | rmlx-models | a_round_tape_refolds_to_what_the_replay_produced | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
 affine_qmm_t_splitk_bfloat16_t_gs_64_b_4_alN_false | device load | 2496 | rmlx-models | a_round_tape_refolds_to_what_the_replay_produced | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 4 | rmlx-mlx | split_k_tail_row_reads_never_reach_the_output | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_4_alN_false | device load | 4 | rmlx-mlx | split_k_tail_row_reads_never_reach_the_output | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
+mxfp8_qmm_t_splitk_bfloat16_t_gs_32_b_8_alN_false | device load | 4 | rmlx-mlx | split_k_tail_row_reads_never_reach_the_output | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
