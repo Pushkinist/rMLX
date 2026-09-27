@@ -36,20 +36,26 @@ so it runs on every Apple Silicon Mac whatever chip built it. It is also
 `aarch64-apple-darwin`'s default CPU.
 
 - `.cargo/config.toml` sets `target-cpu=native`, right for a build that runs
-  where it was compiled: `cargo build` in the checkout and the Homebrew
-  formula. `install.sh` runs `cargo install --git`, which reads no repo
-  config and so builds for the default CPU. Only the tarball overrides the
-  config.
+  where it was compiled: `cargo build` in the checkout and a from-source
+  `brew install`. `install.sh` runs `cargo install --git`, which reads no repo
+  config and so builds for the default CPU. The tarball and a bottle build
+  override the config.
 - `package_binary.sh` builds with `CARGO_ENCODED_RUSTFLAGS` from
   `scripts/release/release_cpu.py rustflags`: config.toml's flags, with its
   target CPU replaced by `apple-m1`. `-dead_strip` is carried over, not
-  restated.
+  restated. A `target-feature` in config.toml is refused: the release binary
+  enables nothing beyond `apple-m1`.
+- The build runs with `RUSTC_WRAPPER` and `RUSTC_WORKSPACE_WRAPPER` empty,
+  which also overrides `build.rustc-wrapper`. The check reads rustflags only;
+  a wrapper's own arguments reach rustc without reaching cargo's record.
 - The binary records no target CPU. `release_cpu.py check` follows the
   packaged bytes to the byte-identical `target/release/deps/rmlx-<hash>` and
   reads the rustflags cargo recorded for that unit in
   `target/release/.fingerprint/rmlx-cli-<hash>/bin-rmlx.json`. It passes on
-  exactly one target CPU, `apple-m1`, and otherwise config.toml's flags. A
-  failing check removes the tarball. `make release-cpu-selftest` is its
+  exactly one target CPU, `apple-m1`, no target feature, and otherwise
+  config.toml's flags in config.toml's order. `-C target_cpu` and
+  `--codegen target-cpu` read as `-Ctarget-cpu`. A failing check removes the
+  tarball, its checksum and the staging directory. `make release-cpu-selftest` is its
   recall test.
 - The fingerprint record is cargo's internal format. If a cargo release
   changes it, the check exits 2 (`unavailable`) rather than passing.
@@ -142,6 +148,13 @@ unversioned. A mismatched mlx / mlx-c pair fails at load with a dyld
 `Symbol not found` (`crates/rmlx-mlx/mlx-pin.txt`). `make bottle`
 (`scripts/release/build_bottle.sh`) builds a bottle; no release step
 runs it.
+
+A bottle also runs on Macs other than the one that built it. Under
+`brew install --build-bottle` the formula builds with
+`release_cpu.py rustflags`, the tarball's flags. On arm64 Homebrew's own rustc
+wrapper adds no target CPU to a bottle build. No check follows: the keg keeps
+no cargo record. A version whose source archive lacks `release_cpu.py` fails
+the bottle build rather than falling back to `native`.
 
 ## Hotfix
 

@@ -42,12 +42,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The release tarball binary is compiled for Apple M1, not for the machine
   that built it.** `make release-package` inherited `target-cpu=native` from
-  `.cargo/config.toml`, so the published binary was tuned to the release
-  machine's chip and could use instructions an older Mac lacks. It now builds
-  with config.toml's flags and `target-cpu=apple-m1`, keeping `-dead_strip`,
-  and `scripts/release/release_cpu.py check` reads the rustflags cargo recorded
-  for the packaged binary before the tarball is kept. `cargo build` and the
-  Homebrew formula still build for the local chip.
+  `.cargo/config.toml`, so the published binary was tuned to the build
+  machine's own chip and could use instructions an older Mac lacks. It now
+  builds with config.toml's flags and `target-cpu=apple-m1`, keeping
+  `-dead_strip`, with no rustc wrapper and no target feature, and
+  `scripts/release/release_cpu.py check` reads the rustflags cargo recorded for
+  the packaged binary before the tarball is kept. A Homebrew bottle build takes
+  the same flags. `cargo build` and a from-source `brew install` still build
+  for the local chip.
 
 - **A suite that could not run no longer reports what a suite that passed
   reports.** Two halves of one defect. The shared snapshot probe in the model

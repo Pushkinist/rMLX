@@ -109,7 +109,27 @@ case_run dead_strip_dropped_fails "the baseline without config.toml's -dead_stri
 
 root=$(fresh extra_feature '["-C", "target-cpu=apple-m1", "-C", "link-arg=-dead_strip", "-C", "target-feature=+i8mm"]')
 case_run extra_feature_fails "a target feature beyond the baseline fails" \
-    1 "'-Ctarget-feature=+i8mm'] besides the target CPU" "$root"
+    1 "was built with ['-Ctarget-feature=+i8mm']: no feature beyond apple-m1's" "$root"
+
+root=$(fresh feature_in_config '["-C", "target-cpu=apple-m1", "-C", "link-arg=-dead_strip", "-C", "target-feature=+bf16"]')
+printf '[build]\nrustflags = ["-C", "target-cpu=native", "-C", "link-arg=-dead_strip", "-C", "target-feature=+bf16"]\n' \
+    >"$root/.cargo/config.toml"
+case_run feature_in_config_fails "a target feature fails even when config.toml sets it too" \
+    1 "was built with ['-Ctarget-feature=+bf16']" "$root"
+
+root=$(fresh underscore_spelling '["-C", "target_cpu=native", "-C", "link-arg=-dead_strip"]')
+case_run underscore_spelling_fails "target_cpu (rustc reads _ and - alike) is read as a CPU" \
+    1 "built with target-cpu ['native']" "$root"
+
+root=$(fresh underscore_feature '["-C", "target-cpu=apple-m1", "-C", "link-arg=-dead_strip", "-Ctarget_feature=+i8mm"]')
+case_run underscore_feature_fails "target_feature is read as a target feature" \
+    1 "was built with ['-Ctarget-feature=+i8mm']" "$root"
+
+root=$(fresh order_swapped '["-C", "target-cpu=apple-m1", "-C", "link-arg=-b", "-C", "link-arg=-a"]')
+printf '[build]\nrustflags = ["-C", "target-cpu=native", "-C", "link-arg=-a", "-C", "link-arg=-b"]\n' \
+    >"$root/.cargo/config.toml"
+case_run order_swapped_fails "config.toml's flags in another order fail: order reaches the linker" \
+    1 "['-Clink-arg=-b', '-Clink-arg=-a'] besides the target CPU" "$root"
 
 root=$(fresh stale_record "$BASELINE_FLAGS")
 unit "$root" "$HASH_B" "binary-b" "$CONFIG_FLAGS"
@@ -129,6 +149,11 @@ package "$root" "binary-from-elsewhere"
 case_run unlinked_binary_unavailable "a packaged binary cargo did not link here is unknown, not a pass" \
     2 "found 0" "$root"
 
+root=$(fresh depinfo_beside "$BASELINE_FLAGS")
+printf 'binary-a' >"$root/target/release/deps/rmlx-$HASH_A.d"
+case_run depinfo_not_a_binary "a deps/rmlx-<hash>.d beside the binary is not a second linked unit" \
+    0 "release-cpu: ok" "$root"
+
 root=$(fresh twice_linked "$BASELINE_FLAGS")
 unit "$root" "$HASH_B" "binary-a" "$BASELINE_FLAGS"
 case_run twice_linked_unavailable "two units with the packaged bytes is ambiguous" \
@@ -147,7 +172,7 @@ case_run record_without_flags_unavailable "a record with no rustflags list is un
 root=$(fresh record_garbled "$BASELINE_FLAGS")
 printf '{"rustc": ' >"$root/target/release/.fingerprint/rmlx-cli-$HASH_A/bin-rmlx.json"
 case_run record_garbled_unavailable "an unreadable record is unknown" \
-    2 "release-cpu: unavailable" "$root"
+    2 "bin-rmlx.json: not JSON: Expecting value" "$root"
 
 root=$(fresh no_config "$BASELINE_FLAGS")
 rm -f "$root/.cargo/config.toml"
@@ -221,11 +246,96 @@ printf '[build]\nrustflags = [\n  "-C", "link-arg=-dead_strip",\n]\n' >"$root/.c
 flags_run producer_refuses_unreadable_config "an unreadable config.toml is refused, not an empty flag list" \
     2 "release-cpu: unavailable: $root/.cargo/config.toml: the rustflags array is not on one line: rustflags = [" "$root"
 
+root=$(fresh producer_feature "$BASELINE_FLAGS")
+printf '[build]\nrustflags = ["-C", "target-cpu=native", "-C", "target-feature=+i8mm"]\n' >"$root/.cargo/config.toml"
+flags_run producer_refuses_feature "config.toml setting a target feature is refused, not carried into the release" \
+    1 "release-cpu: FAIL .cargo/config.toml sets ['-Ctarget-feature=+i8mm']: the release binary enables no feature beyond apple-m1's" "$root"
+
 root=$(fresh producer_round_trip "$BASELINE_FLAGS")
 produced=$(python3 "$TOOL" rustflags --root "$root" | python3 -c 'import json, sys; print(json.dumps(sys.stdin.read().split("\x1f")))')
 unit "$root" "$HASH_A" "binary-a" "$produced"
 case_run producer_output_passes_check "a build with exactly the producer's flags passes the check" \
     0 "release-cpu: ok" "$root"
 
-printf '\nrelease-cpu selftest:%d passed, %d failed\n' "$PASSED" "$FAILED"
+# package_root <name> <honors-env: yes|no>: a copy of the files
+# package_binary.sh reads, and a stub `cargo` first on PATH. The stub links a
+# binary and records rustflags the way cargo does: CARGO_ENCODED_RUSTFLAGS when
+# set (unless told to ignore it), else config.toml's. It refuses to build under
+# a rustc wrapper, whose arguments no record would show.
+package_root() {
+    local root="$WORK/$1" honors="$2" release
+    release="$(dirname "$TOOL")"
+    mkdir -p "$root/scripts/release" "$root/.cargo" "$root/bin"
+    cp "$release/package_binary.sh" "$release/release_cpu.py" "$root/scripts/release/"
+    printf '[workspace.package]\nversion = "0.0.0"\n' >"$root/Cargo.toml"
+    printf '[build]\nrustflags = %s\n' "$CONFIG_FLAGS" >"$root/.cargo/config.toml"
+    printf 'licence\n' >"$root/LICENSE-MIT"
+    printf 'licence\n' >"$root/LICENSE-APACHE"
+    printf 'readme\n' >"$root/README.md"
+    cat >"$root/bin/cargo" <<STUB
+#!/usr/bin/env bash
+if [ -n "\${RUSTC_WRAPPER:-}\${RUSTC_WORKSPACE_WRAPPER:-}" ]; then
+    echo "stub cargo: a rustc wrapper is set" >&2
+    exit 1
+fi
+flags=\${CARGO_ENCODED_RUSTFLAGS-unset}
+[ "$honors" = yes ] || flags=unset
+mkdir -p target/release/deps target/release/.fingerprint/rmlx-cli-$HASH_A
+printf 'stub-binary %s' "\$flags" >target/release/deps/rmlx-$HASH_A
+cp target/release/deps/rmlx-$HASH_A target/release/rmlx
+chmod +x target/release/rmlx
+FLAGS="\$flags" python3 - <<'PY' >target/release/.fingerprint/rmlx-cli-$HASH_A/bin-rmlx.json
+import json, os, re
+flags = os.environ["FLAGS"]
+if flags == "unset":
+    line = re.search(r"^rustflags = (.*)$", open(".cargo/config.toml").read(), re.M).group(1)
+    listed = json.loads(line)
+else:
+    listed = flags.split("\x1f")
+print(json.dumps({"rustflags": listed}))
+PY
+STUB
+    chmod +x "$root/bin/cargo"
+    printf '%s' "$root"
+}
+
+# package_run <name> <what> <want-exit> <want-kept: yes|no> <root> [VAR=value...]
+# "kept" is the tarball, its .sha256 and the staging directory, all three;
+# "no" is none of them.
+package_run() {
+    local name="$1" what="$2" want="$3" kept="$4" root="$5"
+    shift 5
+    local out status have tarball="$root/dist/rmlx-v0.0.0-aarch64-apple-darwin.tar.gz"
+    out=$(cd "$root" && env PATH="$root/bin:$PATH" "$@" bash scripts/release/package_binary.sh 2>&1)
+    status=$?
+    if [ -f "$tarball" ] && [ -f "$tarball.sha256" ] && [ -d "${tarball%.tar.gz}" ]; then
+        have=yes
+    elif [ -e "$tarball" ] || [ -e "$tarball.sha256" ] || [ -e "${tarball%.tar.gz}" ]; then
+        have=partial
+    else
+        have=no
+    fi
+    if [ "$status" != "$want" ] || [ "$have" != "$kept" ]; then
+        FAILED=$((FAILED + 1))
+        printf '  FAIL %-34s (want exit %s, kept %s; got %s, %s) — %s\n%s\n' \
+            "$name" "$want" "$kept" "$status" "$have" "$what" "$out"
+    else
+        PASSED=$((PASSED + 1))
+        printf '  ok   %-34s — %s\n' "$name" "$what"
+    fi
+}
+
+root=$(package_root package_pins yes)
+package_run package_keeps_checked_tarball "package_binary.sh builds with the pin, checks it, keeps the tarball" \
+    0 yes "$root"
+
+root=$(package_root package_clears_wrappers yes)
+package_run package_clears_wrappers "a rustc wrapper in the environment does not reach the release build" \
+    0 yes "$root" RUSTC_WRAPPER=/wrapper RUSTC_WORKSPACE_WRAPPER=/wrapper
+
+root=$(package_root package_native_build no)
+package_run package_removes_unpinned_tarball "a build ignoring the pin fails, leaving no tarball, checksum or staging" \
+    1 no "$root"
+
+printf '\nrelease-cpu selftest: %d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

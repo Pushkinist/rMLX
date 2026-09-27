@@ -10,10 +10,14 @@ build pins BASELINE_CPU instead, keeping every other flag config.toml sets.
       (0x1f-separated): config.toml's flags with its target CPU replaced by
       BASELINE_CPU. That variable replaces build.rustflags outright, so this is
       the one place the other flags are carried over rather than restated.
+      Exit 1 when config.toml sets a target feature.
 
   check <tarball> [--root DIR]
       Exit 0 when the `rmlx` binary inside <tarball> was compiled with exactly
-      one target CPU, BASELINE_CPU, and otherwise with config.toml's flags.
+      one target CPU, BASELINE_CPU, no target feature, and otherwise with
+      config.toml's flags in config.toml's order. It reads rustflags only: a
+      rustc wrapper's own arguments are not recorded, which is why
+      package_binary.sh builds with every wrapper cleared.
       The binary carries no record of its target CPU, so the chain is: the
       packaged bytes -> the byte-identical `target/release/deps/rmlx-<hash>`
       cargo linked -> `target/release/.fingerprint/rmlx-cli-<hash>/bin-rmlx.json`,
@@ -44,6 +48,16 @@ class Unreadable(Exception):
     pass
 
 
+class Refused(Exception):
+    pass
+
+
+def codegen(opt):
+    """`-C<opt>` with the option name spelled with dashes: rustc reads `_` and `-` alike."""
+    name, eq, value = opt.partition("=")
+    return "-C" + name.replace("_", "-") + eq + value
+
+
 def normalize(flags):
     """rustc codegen flags as single `-C<opt>` tokens, whichever spelling was used."""
     out = []
@@ -53,9 +67,11 @@ def normalize(flags):
             nxt = next(it, None)
             if nxt is None:
                 raise Unreadable(f"flag list ends in a bare {tok}")
-            out.append("-C" + nxt)
+            out.append(codegen(nxt))
         elif tok.startswith("--codegen="):
-            out.append("-C" + tok[len("--codegen="):])
+            out.append(codegen(tok[len("--codegen="):]))
+        elif tok.startswith("-C"):
+            out.append(codegen(tok[2:]))
         else:
             out.append(tok)
     return out
@@ -121,14 +137,22 @@ def recorded_rustflags(root, binary):
     try:
         flags = json.loads(record.read_text()).get("rustflags")
     except json.JSONDecodeError as e:
-        raise Unreadable(f"{record}: {e}")
+        raise Unreadable(f"{record}: not JSON: {e}")
     if not isinstance(flags, list) or not all(isinstance(f, str) for f in flags):
         raise Unreadable(f"{record}: no rustflags list")
     return record, flags
 
 
+def target_features(flags):
+    return [f for f in flags if f.startswith("-Ctarget-feature=")]
+
+
 def release_rustflags(root):
-    return ["-Ctarget-cpu=" + BASELINE_CPU] + split_cpu(config_rustflags(root))[1]
+    rest = split_cpu(config_rustflags(root))[1]
+    if target_features(rest):
+        raise Refused(f".cargo/config.toml sets {target_features(rest)}: the release binary "
+                      f"enables no feature beyond {BASELINE_CPU}'s")
+    return ["-Ctarget-cpu=" + BASELINE_CPU] + rest
 
 
 def check(tarball, root):
@@ -138,6 +162,10 @@ def check(tarball, root):
     if cpus != [BASELINE_CPU]:
         print(f"release-cpu: FAIL {tarball.name} was built with target-cpu {cpus}, "
               f"expected exactly ['{BASELINE_CPU}'] (per {record.relative_to(root)})")
+        return 1
+    if target_features(rest):
+        print(f"release-cpu: FAIL {tarball.name} was built with {target_features(rest)}: "
+              f"no feature beyond {BASELINE_CPU}'s (per {record.relative_to(root)})")
         return 1
     if rest != want_rest:
         print(f"release-cpu: FAIL {tarball.name} was built with flags {rest} besides the "
@@ -161,6 +189,9 @@ def main():
             print("\x1f".join(release_rustflags(args.root)), end="")
             return 0
         return check(args.tarball, args.root)
+    except Refused as e:
+        print(f"release-cpu: FAIL {e}", file=sys.stderr)
+        return 1
     except (Unreadable, OSError, tarfile.TarError) as e:
         print(f"release-cpu: unavailable: {e}", file=sys.stderr)
         return 2
