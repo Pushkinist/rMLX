@@ -12,8 +12,8 @@ and local sibling repos) live in a **gitignored** `LOCAL.md` at the repo
 root. Use it as a local resolver; never copy an absolute path from it into
 this file, a commit, a report, a log, or any artifact that leaves the
 machine. The Metal claim path, `/var/tmp/rmlx.claim`, is a fixed system path,
-not a per-machine one — it is safe to write directly; see `docs/CLI.md`
-§ "Claim file".
+not a per-machine one — it is safe to name in checked-in text; see
+`docs/CLI.md` § "Claim file".
 
 ## What this project is
 
@@ -42,7 +42,8 @@ areas before touching code:
 
 | Doc | Topic |
 |---|---|
-| [`docs/CLI.md`](docs/CLI.md) | rmlx CLI: subcommands, flags, env vars, claim file |
+| [`docs/CLI.md`](docs/CLI.md) | rmlx CLI: subcommands, flags, claim file |
+| [`docs/CLI_ENV_VARS.md`](docs/CLI_ENV_VARS.md) | Environment variables `CLI.md` reads, split out for size |
 | [`docs/SERVER.md`](docs/SERVER.md) | HTTP server: OpenAI/Anthropic compat, routes, tool calling, retry envelope |
 | [`docs/MODELS.md`](docs/MODELS.md) | Per-architecture model reference (Qwen, Gemma, Laguna, Jina, etc.) |
 | [`docs/ADDING_A_MODEL.md`](docs/ADDING_A_MODEL.md) | New-arch integration surface: shared seams + per-arch points + verification ritual |
@@ -238,7 +239,9 @@ Hard rules:
   `make ci`. See `docs/FFI.md`.
   Run GPU tests with **`make gpu-test`** (every member crate,
   serialized; `CRATE=` / `FILTER=` to narrow), or by hand as
-  `cargo test -p <crate> --lib -- --ignored <filter> --test-threads=1`.
+  `cargo test --no-run -p <crate> --tests` (build, outside any claim) then
+  `rmlx claim run -- cargo test -p <crate> --lib -- --ignored <filter>
+  --test-threads=1` (run, holding the Metal claim) — see `docs/GPU_TESTS.md`.
   `make gpu-test` is the only step that executes them — `make test` passes no
   `--ignored` and the hosted CI has no Metal. The same suite runs as the last
   step of **`make ci-perf`** (invoked directly, so `CRATE=`/`VALIDATE=` cannot

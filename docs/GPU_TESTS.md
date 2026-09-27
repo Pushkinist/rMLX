@@ -14,9 +14,18 @@ cargo test -p rmlx-kv-quant --lib -- --ignored <filter> --test-threads=1
 ```
 
 Run by hand like this, the command takes no Metal claim: only `make gpu-test`
-and `make ci-perf` hold one, through `rmlx claim run`. Wrap a hand run the
-same way (`rmlx claim run -- cargo test …`) so a concurrent GPU command is
-refused instead of racing this process for the Metal context.
+and `make ci-perf` hold one, through `rmlx claim run`. `make gpu-test` builds
+the test binaries first, outside the claim, then runs them under it — do the
+same by hand:
+
+```bash
+cargo test --no-run -p rmlx-kv-quant --tests
+rmlx claim run -- cargo test -p rmlx-kv-quant --lib -- --ignored <filter> --test-threads=1
+```
+
+Building under the claim would hold it for the whole compile, blocking any
+other GPU user for no GPU work at all — so build first, then run the
+already-built binary under `rmlx claim run`.
 
 `cargo test` runs a binary's tests on parallel threads. A shared Metal context
 driven from several of them aborts the whole process:

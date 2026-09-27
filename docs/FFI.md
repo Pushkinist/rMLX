@@ -247,27 +247,27 @@ through `mlx_default_gpu_stream_new` / `mlx_default_cpu_stream_new`, a
 ref-counted handle, and frees the handle after the closure. It never creates
 a stream: MLX backs every stream with an OS thread it never reclaims, so
 per-op stream creation exhausts the thread limit. For the GPU device it
-checks the CPU-device latch below first, returning `Err` with no mlx-c call
-once the process forbade the GPU.
+checks the latch below first.
 
 ### The CPU-device latch
 
-`ClaimedDevice::cpu()` in `parse_device` calls `rmlx_mlx::forbid_gpu()` once,
-before any model work, setting a process-global `AtomicBool` with no way
-back. Every call that would otherwise touch the GPU checks it first and
-returns `Err(Error::GpuForbidden { op })` instead of making the mlx-c call:
-both stream creators, every `rmlx_mlx::metal` function, and
-`metal_capture::CaptureScope::start`.
+`parse_device` calls `rmlx_mlx::forbid_gpu()` once, before any model work,
+when it resolves a device with no claim. `ClaimedDevice::cpu()` is a plain
+`const fn` and calls nothing; `qwen36_diag`'s `cpu` arm calls `forbid_gpu()`
+too, its own device decision. The call sets one process-global `AtomicBool`
+irreversibly. These calls check it first, returning
+`Err(Error::GpuForbidden { op })`, not the mlx-c call:
+`with_stream(Device::Gpu, ..)`, `ensure_gpu_default_stream()`, every
+`rmlx_mlx::metal` fn, and `CaptureScope::start`.
 
-**Guarantee.** Under `--device cpu`, no op built by rmlx is scheduled on a
-GPU stream, and no rmlx Metal API is called. A codec or modality that cannot
-keep this is refused up front.
+**Guarantee.** Under `--device cpu`, no rmlx op runs on a GPU stream, and no
+rmlx Metal API is called. A KV codec carrying MSL, and `--gpu-capture`, are
+refused before the model load; any other GPU request returns `GpuForbidden`.
 
-Outside the guarantee: MLX's own allocator opens an `MTLDevice` at process
-start regardless of the device decision — `metal::allocator()` backs every
-array buffer with it. MLX's `default_device()` is the GPU whenever Metal is
-available, and an MLX-internal request for the default GPU stream, outside
-the two call sites rMLX itself uses, is not covered.
+Outside it: MLX's allocator opens an `MTLDevice` on first allocation either
+way — `metal::allocator()` backs every array buffer. `default_device()` is
+the GPU whenever Metal is available, and an MLX-internal GPU-stream request
+outside rMLX's two sites is uncovered.
 
 ### Per-thread GPU stream context — `ensure_gpu_default_stream`
 
