@@ -98,7 +98,9 @@
 #   states the rule. Each crate runs once per setting, each run skipping the
 #   other setting's names; the report lists every test under the setting it ran
 #   with, the final line counts both, and a classified test the producer gives
-#   no setting is a refusal. Device-memory instrumentation is on for every test.
+#   no setting, or a name inside a name of the other setting (which that
+#   setting's `--skip` would drop), is a refusal. Device-memory instrumentation
+#   is on for every test.
 #
 # THE CENSUS PIN
 #   A tree can carry a diagnostic from a kernel it does not own and cannot fix.
@@ -495,8 +497,22 @@ if [ "${SHADER_VALIDATION}" = "1" ] && [ "${BUILD_ONLY}" = "0" ]; then
             *) tg_errors="${tg_errors}  ${c_crate} ${c_test}: no threadgroup setting"$'\n' ;;
         esac
     done <<< "${listing}"
+    # Each setting's run skips the other setting's names, and libtest's
+    # `--skip` is a substring match: a name inside a name of the other setting
+    # in the same crate would skip that test in its own run.
+    tg_errors="${tg_errors}$(printf '%s' "${tg_rows}" | awk -F'\t' '
+        { n[++k] = $3; s[k] = $1; c[k] = $2 }
+        END {
+            for (i = 1; i <= k; i++)
+                for (j = 1; j <= k; j++)
+                    if (i != j && c[i] == c[j] && s[i] != s[j] && n[i] != n[j] &&
+                        index(n[j], n[i]) > 0)
+                        printf "  %s %s: contains %s, a name of the other setting, whose --skip would drop it\n",
+                            c[j], n[j], n[i]
+        }')"
+    [ -n "${tg_errors}" ] && tg_errors="${tg_errors%$'\n'}"$'\n'
     if [ -n "${tg_errors}" ]; then
-        echo "ERROR: the threadgroup split and the classification do not cover each other:" >&2
+        echo "ERROR: the threadgroup split cannot be run as computed:" >&2
         printf '%s' "${tg_errors}" >&2
         echo "Fix scripts/gpu_test_threadgroup.sh. See docs/GPU_TESTS.md." >&2
         exit 1

@@ -159,12 +159,13 @@
 # "Metal" or "GPU" is invisible to it.
 #
 # A REASONLESS `#[ignore]` ON AN ENVIRONMENT-GATED TEST is fatal for the same
-# reason: a test that reads an environment variable, reaches no `Device::Gpu`
+# reason: a test that reads an environment variable — `env::var`, `env::var_os`,
+# or the snapshot resolver `test_snapshot::snapshot` — reaches no `Device::Gpu`
 # and carries a bare `#[ignore]` runs under no gate, and the rule above reads
 # the reason text, which it does not have. Its dispositions: pass
 # `Device::Gpu` so the GPU suite lists it, drop the `#[ignore]` so the default
 # gate runs it, or write the reason. A bare `#[ignore]` on a test that reads no
-# variable, or reads one only in a helper, is outside it.
+# variable, or reads one only through another helper, is outside it.
 #
 # DECLARED METAL ROUTE (`// gpu-test-gate: metal-unscanned`)
 #   The inverse of the exemption below: a line-leading marker in the fn's own
@@ -910,10 +911,11 @@ read -r -d '' AWK_DETECT <<'AWK' || true
                 printf "W  %s: %s\n", file_of[g], label_of[g]
             }
             # The same place with no words on it: a reasonless `#[ignore]` on
-            # an environment-gated test no device is reachable from. The rule
-            # above reads the reason, so an empty one is invisible to it.
+            # an environment-gated test no device is reachable from, gated
+            # directly or through the snapshot resolver. The rule above reads
+            # the reason, so an empty one is invisible to it.
             if (!gpu[g] && !declared && attrs_of[g] ~ /#\[ignore\]/ \
-             && body_of[g] ~ /env::var(_os)?[[:space:]]*\(/) {
+             && body_of[g] ~ /(env::var(_os)?|test_snapshot::snapshot)[[:space:]]*\(/) {
                 printf "R  %s: %s\n", file_of[g], label_of[g]
             }
         }

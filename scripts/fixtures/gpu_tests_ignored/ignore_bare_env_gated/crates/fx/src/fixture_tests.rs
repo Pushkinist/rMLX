@@ -11,3 +11,15 @@ fn env_gated_cpu_cell() {
     };
     run(model, Device::Cpu);
 }
+
+// The same cell gated through the snapshot resolver, which reads the variable
+// for it.
+#[ignore]
+#[test]
+fn snapshot_gated_cpu_cell() {
+    let Some(model) = crate::test_snapshot::snapshot("snapshot_gated_cpu_cell", VAR, SLUG, &ARCHS)
+    else {
+        return;
+    };
+    run(model, Device::Cpu);
+}

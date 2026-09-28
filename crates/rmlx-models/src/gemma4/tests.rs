@@ -388,7 +388,7 @@ fn classify_smoke_two_distinct_nonpunct_is_ok() {
 // ── forward_seq arbitrary-length ────────────────────────────────────────
 
 #[test]
-#[ignore = "needs the checkpoint RMLX_TEST_MODEL_GEMMA4_E4B names; run by hand with --ignored"]
+#[ignore = "a CPU forward over the checkpoint RMLX_TEST_MODEL_GEMMA4_E4B names is too slow for make test; run by hand with --ignored"]
 #[allow(
     clippy::expect_used,
     reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
@@ -462,7 +462,7 @@ fn forward_seq_multi_token_gives_different_argmax() {
 /// the way `Architecture::logits_from_hidden` composes them. Also asserts shape
 /// `[1, k, hidden]` + no NaN.
 #[test]
-#[ignore = "needs the checkpoint RMLX_TEST_MODEL_GEMMA4_E2B names; run by hand with --ignored"]
+#[ignore = "a CPU forward over the checkpoint RMLX_TEST_MODEL_GEMMA4_E2B names is too slow for make test; run by hand with --ignored"]
 #[allow(
     clippy::expect_used,
     reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
@@ -550,7 +550,7 @@ fn forward_hidden_states_matches_reference_extraction() {
 }
 
 #[test]
-#[ignore = "needs the checkpoint RMLX_TEST_MODEL_GEMMA4_PARO names; run by hand with --ignored"]
+#[ignore = "a CPU forward over the checkpoint RMLX_TEST_MODEL_GEMMA4_PARO names is too slow for make test; run by hand with --ignored"]
 #[allow(
     clippy::expect_used,
     reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
@@ -606,7 +606,7 @@ fn integration_paro_forward_gemma4() {
 /// equal to the vision tower's `num_soft_tokens` (the scatter-alignment
 /// invariant). Gated `#[ignore]` — needs the model snapshot.
 #[test]
-#[ignore = "needs the checkpoint RMLX_TEST_MODEL_GEMMA4_E4B names; run by hand with --ignored"]
+#[ignore = "a CPU vision-tower pass over the checkpoint RMLX_TEST_MODEL_GEMMA4_E4B names is too slow for make test; run by hand with --ignored"]
 #[allow(
     clippy::expect_used,
     reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"

@@ -33,7 +33,7 @@
 )]
 
 /// E2E #1: projects.toml applies per-project SSD cap when no CLI override.
-#[ignore = "placeholder: the live check is not written; the resolver is unit-tested"]
+#[ignore = "placeholder: the live check is not written and panics when RMLX_KV_TEST_MODEL is set; the resolver is unit-tested"]
 #[test]
 fn projects_toml_applies_per_project_cap() {
     let Ok(_model) = std::env::var("RMLX_KV_TEST_MODEL") else {
@@ -55,7 +55,7 @@ fn projects_toml_applies_per_project_cap() {
 }
 
 /// E2E #2: CLI `--kv-ssd-cache-gb` beats the projects.toml value.
-#[ignore = "placeholder: the live check is not written; the resolver is unit-tested"]
+#[ignore = "placeholder: the live check is not written and panics when RMLX_KV_TEST_MODEL is set; the resolver is unit-tested"]
 #[test]
 fn cli_flag_beats_projects_toml() {
     let Ok(_model) = std::env::var("RMLX_KV_TEST_MODEL") else {

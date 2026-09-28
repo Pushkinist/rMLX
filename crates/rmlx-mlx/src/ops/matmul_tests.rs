@@ -382,45 +382,82 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     })
 }
 
-/// A 32-row quantized weight whose rows past the first all hold `tail`, sliced
-/// to its first row. The slice is a view into the 32-row buffers, so the rows an
+/// Thirty-one bf16 rows of width `k`: every value NaN when `scale` is NaN,
+/// otherwise varied values of magnitude up to `|scale|`. Varied rows quantize
+/// to non-zero codes, so a tail lane reaching a kept column would move it
+/// through its codes as well as through its scale and bias.
+#[allow(
+    clippy::expect_used,
+    reason = "GPU fixture setup in this fn; a failure here is a test bug"
+)]
+fn tail_rows(k: i32, scale: f32, device: Device) -> Array {
+    let values: Vec<f32> = if scale.is_nan() {
+        vec![f32::NAN; 31 * k as usize]
+    } else {
+        let unit = deterministic_bf16(&[31, k], 0x7A11, device)
+            .astype(Dtype::F32, device)
+            .expect("astype f32")
+            .to_bytes()
+            .expect("to_bytes");
+        unit.chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().expect("4 bytes")) * scale)
+            .collect()
+    };
+    Array::from_f32_slice(&values, &[31, k])
+        .expect("tail")
+        .astype(Dtype::Bf16, device)
+        .expect("astype")
+}
+
+/// A 32-row quantized weight whose rows past the first are `tail`, sliced to
+/// its first row. The slice is a view into the 32-row buffers, so the rows an
 /// `alN_false` tile reads past `N = 1` are the parent's rows, whose content the
-/// caller chose.
+/// caller chose. The flag says whether any code of the tail rows is non-zero.
 #[allow(
     clippy::expect_used,
     reason = "GPU fixture setup in this fn; a failure here is a test bug"
 )]
 fn one_row_view_over_tail(
     row: &Array,
-    tail: f32,
+    tail: &Array,
     mode: &str,
     group_size: i32,
     bits: i32,
     device: Device,
-) -> (Array, Array, Option<Array>) {
-    let k = row.shape()[1];
-    let tail_rows = Array::from_f32_slice(&vec![tail; 31 * k as usize], &[31, k])
-        .expect("tail")
-        .astype(Dtype::Bf16, device)
-        .expect("astype");
-    let parent = concatenate(&[row, &tail_rows], 0, device).expect("concatenate");
+) -> (Array, Array, Option<Array>, bool) {
+    let parent = concatenate(&[row, tail], 0, device).expect("concatenate");
     let (codes, scales, biases) =
         quantize_mode(&parent, group_size, bits, mode, device).expect("quantize");
-    let first = |a: &Array| {
+    let rows = |a: &Array, from: i32, to: i32| {
         let cols = a.shape()[1];
-        a.slice(&[0, 0], &[1, cols], &[1, 1], device)
+        a.slice(&[from, 0], &[to, cols], &[1, 1], device)
             .expect("slice")
     };
-    let biases = (mode == "affine").then(|| first(&biases));
-    (first(&codes), first(&scales), biases)
+    let tail_codes_nonzero = rows(&codes, 1, 32)
+        .to_bytes()
+        .expect("to_bytes")
+        .iter()
+        .any(|b| *b != 0);
+    let biases = (mode == "affine").then(|| rows(&biases, 0, 1));
+    (
+        rows(&codes, 0, 1),
+        rows(&scales, 0, 1),
+        biases,
+        tail_codes_nonzero,
+    )
 }
 
 /// Whether the rows MLX's `qmm_t` split-K loader reads past the end of an
 /// `N = 1` weight can reach the output. The same kept row is multiplied three
 /// ways: out of its own one-row buffers (where the tail read leaves the
-/// allocation and shader validation reports it), and out of two views whose
-/// tail rows are NaN and a large finite value. Any lane of a tail row that
-/// reached a kept column would make the three outputs differ bit for bit.
+/// allocation and shader validation reports it), and out of views whose tail
+/// rows are NaN, or varied values up to `+-3e4` with non-zero codes. Any lane
+/// of a tail row that reached a kept column would make the outputs differ bit
+/// for bit.
+///
+/// That a view's tile really reads its parent's tail rows is not asserted
+/// here: the evidence is the shader-validation census, where the fresh arm
+/// reports 4 loads per mode and the view arms none.
 ///
 /// The printed digest is the fresh arm's output; comparing it between a run
 /// under `make gpu-test` and one without shader validation says whether the
@@ -463,13 +500,20 @@ fn split_k_tail_row_reads_never_reach_the_output() {
             fnv1a64(&fresh)
         );
 
-        for tail in [f32::NAN, 3.0e4, -3.0e4] {
-            let (codes, scales, biases) =
-                one_row_view_over_tail(&row, tail, mode, group_size, bits, device);
+        for scale in [f32::NAN, 3.0e4, -3.0e4] {
+            let tail = tail_rows(k, scale, device);
+            let (codes, scales, biases, tail_codes_nonzero) =
+                one_row_view_over_tail(&row, &tail, mode, group_size, bits, device);
+            if !scale.is_nan() {
+                assert!(
+                    tail_codes_nonzero,
+                    "{mode} b{bits}: the tail rows at scale {scale} quantized to all-zero codes"
+                );
+            }
             assert_eq!(
                 product(&codes, &scales, biases.as_ref()),
                 fresh,
-                "{mode} b{bits}: a tail row of {tail} reached the output"
+                "{mode} b{bits}: a tail row at scale {scale} reached the output"
             );
         }
     }

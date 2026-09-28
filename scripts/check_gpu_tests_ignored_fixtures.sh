@@ -130,6 +130,7 @@ CASES=(
     "plain_gpu_ignored|0|${CLEAN}||NOTE:|the compliant non-macro shape stays green"
     "ignore_metal_undeclared|1|${UNDECLARED}|orphaned_metal_test||an #[ignore] claiming Metal with no reachable device and no declared route is fatal"
     "ignore_bare_env_gated|1|${UNREASONED}|env_gated_cpu_cell|${UNDECLARED}|a reasonless #[ignore] on an environment-gated test no device is reachable from is fatal"
+    "ignore_bare_env_gated|1|${UNREASONED}|snapshot_gated_cpu_cell|${UNDECLARED}|and so is one gated through the snapshot resolver"
     "ignore_bare_env_gated_dispositioned|0|OK: every GPU-touching test carries #[ignore] (1 files||ERROR|a written reason, a GPU cell, and an ungated cell each pass it"
     "unscanned_in_body|1|${UNDECLARED}|marker_inside_body||a declared-route marker among a fn's statements declares nothing"
     "unscanned_in_body|1|${UNDECLARED}|test_after_body_marker||and does not carry to the next fn"

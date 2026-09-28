@@ -80,7 +80,8 @@ reason never says "Metal" or "GPU" is invisible to it.
 ### A reasonless `#[ignore]` on an environment-gated test is fatal
 
 A bare `#[ignore]` on a test whose body reads an environment variable
-(`env::var`, `env::var_os`) and reaches no `Device::Gpu` runs under no gate
+(`env::var`, `env::var_os`, or through the snapshot resolver
+`test_snapshot::snapshot`) and reaches no `Device::Gpu` runs under no gate
 either, and has no reason for the check above to read. The gate fails it until
 one of three dispositions is recorded:
 
@@ -89,8 +90,8 @@ one of three dispositions is recorded:
 2. It stands down on its own: drop the `#[ignore]`.
 3. It is ignored for a reason: write the reason.
 
-A bare `#[ignore]` on a test that reads no variable, or reads one only through a
-helper, is outside this check. The fixtures `ignore_bare_env_gated` and
+A bare `#[ignore]` on a test that reads no variable, or reads one only through
+another helper, is outside this check. The fixtures `ignore_bare_env_gated` and
 `ignore_bare_env_gated_dispositioned` pin both directions.
 
 ### Declaring a Metal route the scanner cannot follow
@@ -391,7 +392,7 @@ Invalid device store at offset 4000064, executing kernel function: "custom_kerne
 MLX owns the allocator and reports buffers as `<unnamed>`. The kernel function
 name, `custom_kernel_` plus the rMLX kernel name, is the attribution.
 
-### Threadgroup-memory validation: on for rMLX's kernels, off for checkpoints
+### Threadgroup-memory validation: on for rMLX's kernels, off for MLX's
 
 `MTL_SHADER_VALIDATION_THREADGROUP_MEMORY=1` changes what MLX's NAX kernels
 compute. Measured on this suite's cells:
@@ -407,42 +408,57 @@ compute. Measured on this suite's cells:
   instrumentation off it reported nothing and matched the unvalidated output.
 
 Device-memory validation is unaffected: the split-K hits are reported at the
-same count either way. So a test that runs a checkpoint cannot be judged with
-threadgroup validation on, and a test of rMLX's own `.metal` kernels, which this
-repo can get wrong in threadgroup memory, loses coverage without it.
+same count either way. So a test whose GPU work is MLX's kernels cannot be
+judged with threadgroup validation on, and a test of rMLX's own `.metal`
+kernels, which this repo can get wrong in threadgroup memory, loses coverage
+without it.
 
-`scripts/gpu_test_threadgroup.sh` is the one producer of the split. A classified
-test runs with threadgroup validation on when its declaring file is under a
-member that owns a gated `.metal` directory (`scripts/metal_dirs.sh`) and either
-that member is not the model layer, or the file is the test file of a source
-that embeds a gated `.metal` — itself, or the `<name>.rs` beside
-`<name>_tests.rs`. Every other test runs with it off. On is `rmlx-kv-quant`,
-`rmlx-mlx`, and the gated-delta and PARO kernel tests in `rmlx-models`.
+`scripts/gpu_test_threadgroup.sh` is the one producer of the split. A
+*dispatcher* is a source file that embeds, with `include_str!`, a `.metal` file
+under a directory `scripts/metal_dirs.sh` names; its *entry names* are the fns a
+non-test dispatcher defines. A classified test runs with threadgroup validation
+on when its declaring file is itself a dispatcher, or when its body, or a
+same-file fn it calls (followed by name), names an entry name. Comments and
+string contents are not read. Every other test runs with it off, including the
+tests of `rmlx-mlx` and `rmlx-kv-quant` that dispatch only MLX's kernels.
 
 - The runner runs each crate once per setting. Each run names its own tests and
   skips the other setting's, so no test runs under both.
 - The report lists each crate's tests under `threadgroup validation ON (n):` or
   `OFF (n):`, and the final line counts both.
 - A classified test with no setting, a setting for a test that is not
-  classified, and one name declared twice in a crate with two settings are
-  refusals. So is a split with either side empty, from the producer.
+  classified, one name declared twice in a crate with two settings, and a name
+  that is part of a name of the other setting in the same crate (libtest's
+  `--skip` matches substrings, so its skip would drop that test) are refusals.
+  So is a split with either side empty, from the producer.
 - The canary runs with it on.
 
-What the rule cannot see: a test below the model layer that loads a checkpoint
-runs with it on, and a test of a model-layer kernel that is not its
-dispatcher's test file runs with it off. `rmlx-kv-ssd` owns no `.metal`
-directory, so its tests run with it off although they dispatch
-`rmlx-kv-quant` kernels; those kernels keep the coverage through
-`rmlx-kv-quant`'s own tests.
+What the rule cannot see:
+
+- A test that reaches an rMLX kernel only through production code — a
+  `KvCache` update, a storage append, a model forward — names no entry and runs
+  off. Following production calls would put every checkpoint test on, since a
+  model forward reaches the gated-delta and KV kernels. Those kernels keep the
+  coverage through the tests that name them.
+- A helper in another file (`tests/common`) is not followed.
+- Entry names are matched by name, not path: a test that names a dispatcher's
+  helper (`dtype_tag`, `is_supported_d`) without dispatching runs on.
+- A substring collision between a name and the other setting's module path is
+  not refused up front; the per-setting coverage check reports the test it
+  drops.
 
 `make gpu-runner-selftest` holds the split: the setting each cargo process saw,
 beside the names it was asked to run, for a crate with a test on each side; each
-refusal; and the real producer over a fixture tree, placing each shape and
-refusing both collapses.
+refusal; and the real producer over a fixture tree, placing each shape in both
+directions — a member that ships MSL with a test that dispatches only MLX
+(off), a model-layer test outside the dispatcher's test file that names its
+entry (on) — and refusing both collapses.
 
 Validation costs throughput, so it stays on this target and off every cell
 whose numbers are recorded. `VALIDATE=0` opts out. Never draw a conclusion
-about model output from a run with threadgroup-memory validation on (below).
+about model output from a run under Metal shader validation: a zero-filled
+out-of-bounds read changes what a kernel computes, and threadgroup validation
+is the part known to corrupt NAX output (above).
 
 A diagnostic names a *load* or a *store*. A store is a dropped write; a load
 matters only if the kernel keeps the lanes it filled. The failure banner
