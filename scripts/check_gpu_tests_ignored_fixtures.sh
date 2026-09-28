@@ -93,6 +93,7 @@ fi
 VIOLATION="ERROR: GPU-touching tests missing the #[ignore]"
 UNREADABLE="ERROR: this gate could not classify part of a scanned file"
 UNDECLARED="ERROR: #[ignore] claims a Metal context"
+UNREASONED="ERROR: #[ignore] with no reason on an environment-gated test"
 DECLARED_NOTE="NOTE: declared-route GPU tests"
 # Pins the file count too, so a fixture that lost its source file cannot pass by
 # scanning nothing.
@@ -128,6 +129,9 @@ CASES=(
     "macro_gpu_exempt|0|${CLEAN}||NOTE:|the per-test exemption marker works inside a macro body"
     "plain_gpu_ignored|0|${CLEAN}||NOTE:|the compliant non-macro shape stays green"
     "ignore_metal_undeclared|1|${UNDECLARED}|orphaned_metal_test||an #[ignore] claiming Metal with no reachable device and no declared route is fatal"
+    "ignore_bare_env_gated|1|${UNREASONED}|env_gated_cpu_cell|${UNDECLARED}|a reasonless #[ignore] on an environment-gated test no device is reachable from is fatal"
+    "ignore_bare_env_gated|1|${UNREASONED}|snapshot_gated_cpu_cell|${UNDECLARED}|and so is one gated through the snapshot resolver"
+    "ignore_bare_env_gated_dispositioned|0|OK: every GPU-touching test carries #[ignore] (1 files||ERROR|a written reason, a GPU cell, and an ungated cell each pass it"
     "unscanned_in_body|1|${UNDECLARED}|marker_inside_body||a declared-route marker among a fn's statements declares nothing"
     "unscanned_in_body|1|${UNDECLARED}|test_after_body_marker||and does not carry to the next fn"
     "metal_unscanned_no_ignore|1|${VIOLATION}|declared_without_ignore||a declared route makes the missing #[ignore] a violation"
@@ -263,6 +267,32 @@ case "${list_rc}:${list_out}" in
         printf '%s\n' "$list_out" | sed 's/^/       | /'
         ;;
 esac
+
+# The reasonless-#[ignore] rule refuses `--list` too, for the reason above; and
+# the GPU form of the same cell is what `--list` hands the runner, which is the
+# disposition that puts it under a gate.
+list_rc=0
+list_out=$(bash "$GATE" --list --root "$FIX/ignore_bare_env_gated" 2>&1) || list_rc=$?
+case "${list_rc}:${list_out}" in
+    "1:"*"${UNREASONED}"*)
+        PASSED=$((PASSED + 1))
+        printf '  ok   %-22s --list — refuses a reasonless environment-gated #[ignore] too\n' \
+            "ignore_bare_env_gated"
+        ;;
+    *)
+        fail "ignore_bare_env_gated" "--list exit=$list_rc, and not for the reasonless reason"
+        printf '%s\n' "$list_out" | sed 's/^/       | /'
+        ;;
+esac
+want_list=$'fx\tenv_gated_gpu_cell'
+got_list=$(bash "$GATE" --list --root "$FIX/ignore_bare_env_gated_dispositioned" 2>/dev/null)
+if [ "$got_list" = "$want_list" ]; then
+    PASSED=$((PASSED + 1))
+    printf '  ok   %-22s --list — the GPU form of the cell is listed; the others are not\n' \
+        "ignore_bare_env_gated_dispositioned"
+else
+    fail "ignore_bare_env_gated_dispositioned" "$(printf -- '--list got %q, want %q' "$got_list" "$want_list")"
+fi
 
 # The inverse of the missing-directory check above: a fixture tree that no case
 # names is never executed and never noticed. Lining up N directories against N

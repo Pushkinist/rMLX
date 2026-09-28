@@ -77,6 +77,23 @@ dispositions is recorded:
 This one check reads the ignore reason's wording. A Metal-driving test whose
 reason never says "Metal" or "GPU" is invisible to it.
 
+### A reasonless `#[ignore]` on an environment-gated test is fatal
+
+A bare `#[ignore]` on a test whose body reads an environment variable
+(`env::var`, `env::var_os`, or through the snapshot resolver
+`test_snapshot::snapshot`) and reaches no `Device::Gpu` runs under no gate
+either, and has no reason for the check above to read. The gate fails it until
+one of three dispositions is recorded:
+
+1. It drives Metal: pass `Device::Gpu`, so `make gpu-test` lists it and its
+   named `SKIP` is reported when the variable is unset.
+2. It stands down on its own: drop the `#[ignore]`.
+3. It is ignored for a reason: write the reason.
+
+A bare `#[ignore]` on a test that reads no variable, or reads one only through
+another helper, is outside this check. The fixtures `ignore_bare_env_gated` and
+`ignore_bare_env_gated_dispositioned` pin both directions.
+
 ### Declaring a Metal route the scanner cannot follow
 
 ```rust
@@ -353,10 +370,11 @@ Invalid device store at offset 4000064, executing kernel function: "custom_kerne
 - **The exit code is not the signal.** With validation on, cargo still exits 0.
   The runner scans the text, anywhere on a line: the layer writes while libtest
   is mid-line.
-- **The runner owns the environment.** It pins every
-  `MTL_SHADER_VALIDATION_*` knob it relies on, `REPORT_TO_STDERR=1` included;
-  that one defaults to 0 and sends reports to Unified Logging
-  (`man MetalValidation`).
+- **The runner owns the environment.** It clears every inherited `MTL_*`
+  variable and pins every `MTL_SHADER_VALIDATION_*` knob it relies on,
+  `REPORT_TO_STDERR=1` included; that one defaults to 0 and sends reports to
+  Unified Logging (`man MetalValidation`).
+- **Threadgroup-memory validation is set per test.** See below.
 - **The banner is asserted per crate.** A crate that never printed
   `Metal GPU Validation Enabled` ran uninstrumented and fails. This usually
   means it did not build. The one exception is a crate whose every executed
@@ -374,9 +392,73 @@ Invalid device store at offset 4000064, executing kernel function: "custom_kerne
 MLX owns the allocator and reports buffers as `<unnamed>`. The kernel function
 name, `custom_kernel_` plus the rMLX kernel name, is the attribution.
 
+### Threadgroup-memory validation: on for rMLX's kernels, off for MLX's
+
+`MTL_SHADER_VALIDATION_THREADGROUP_MEMORY=1` changes what MLX's NAX kernels
+compute. Measured on this suite's cells:
+
+- The routed-expert `gather_qmm` (`affine_gather_qmm_rhs_nax`) of a Qwen3.6 MoE
+  prefill returned a different wrong value on 11 of 60 repeats. Unvalidated,
+  and validated with only the threadgroup instrumentation off, it returned the
+  same value every time. The greedy spec pair on the 4k prompt diverged under
+  full validation for this reason alone.
+- The f32 `affine_qmm_t_nax` of a PARO forward reported device loads at
+  addresses no index in the kernel can form, at counts that change per run, and
+  returned wrong output on the repeats that reported. With the threadgroup
+  instrumentation off it reported nothing and matched the unvalidated output.
+
+Device-memory validation is unaffected: the split-K hits are reported at the
+same count either way. So a test whose GPU work is MLX's kernels cannot be
+judged with threadgroup validation on, and a test of rMLX's own `.metal`
+kernels, which this repo can get wrong in threadgroup memory, loses coverage
+without it.
+
+`scripts/gpu_test_threadgroup.sh` is the one producer of the split. A
+*dispatcher* is a source file that embeds, with `include_str!`, a `.metal` file
+under a directory `scripts/metal_dirs.sh` names; its *entry names* are the fns a
+non-test dispatcher defines. A classified test runs with threadgroup validation
+on when its declaring file is itself a dispatcher, or when its body, or a
+same-file fn it calls (followed by name), names an entry name. Comments and
+string contents are not read. Every other test runs with it off, including the
+tests of `rmlx-mlx` and `rmlx-kv-quant` that dispatch only MLX's kernels.
+
+- The runner runs each crate once per setting. Each run names its own tests and
+  skips the other setting's, so no test runs under both.
+- The report lists each crate's tests under `threadgroup validation ON (n):` or
+  `OFF (n):`, and the final line counts both.
+- A classified test with no setting, a setting for a test that is not
+  classified, one name declared twice in a crate with two settings, and a name
+  that is part of a name of the other setting in the same crate (libtest's
+  `--skip` matches substrings, so its skip would drop that test) are refusals.
+  So is a split with either side empty, from the producer.
+- The canary runs with it on.
+
+What the rule cannot see:
+
+- A test that reaches an rMLX kernel only through production code — a
+  `KvCache` update, a storage append, a model forward — names no entry and runs
+  off. Following production calls would put every checkpoint test on, since a
+  model forward reaches the gated-delta and KV kernels. Those kernels keep the
+  coverage through the tests that name them.
+- A helper in another file (`tests/common`) is not followed.
+- Entry names are matched by name, not path: a test that names a dispatcher's
+  helper (`dtype_tag`, `is_supported_d`) without dispatching runs on.
+- A substring collision between a name and the other setting's module path is
+  not refused up front; the per-setting coverage check reports the test it
+  drops.
+
+`make gpu-runner-selftest` holds the split: the setting each cargo process saw,
+beside the names it was asked to run, for a crate with a test on each side; each
+refusal; and the real producer over a fixture tree, placing each shape in both
+directions — a member that ships MSL with a test that dispatches only MLX
+(off), a model-layer test outside the dispatcher's test file that names its
+entry (on) — and refusing both collapses.
+
 Validation costs throughput, so it stays on this target and off every cell
 whose numbers are recorded. `VALIDATE=0` opts out. Never draw a conclusion
-about model output from a run under Metal shader validation.
+about model output from a run under Metal shader validation: a zero-filled
+out-of-bounds read changes what a kernel computes, and threadgroup validation
+is the part known to corrupt NAX output (above).
 
 A diagnostic names a *load* or a *store*. A store is a dropped write; a load
 matters only if the kernel keeps the lanes it filled. The failure banner
@@ -384,15 +466,28 @@ prints the access mix per diagnostic. A clean scan does not prove that nothing
 read out of bounds. The layer bounds against the `MTLBuffer`, not the array,
 and MLX recycles buffers from size buckets.
 
-The pin accepts one diagnostic: MLX's own
-`affine_qmm_t_splitk_bfloat16_t_gs_64_b_{4,8}_alN_false`, loads only. On a
-host with every snapshot, armed cells report hits the pin does not name, until
-the pin is derived again.
-`QuantizedBlockLoader::load_safe` in `mlx/backend/metal/kernels/quantized.h`
-bounds its row index against the tile's column extent. A transposed quantized
-matmul whose `N` is not a multiple of the output tile width then reads past the
-packed weight and scales. The header of `scripts/gpu_validation_census.txt`
-gives the argument that the loaded lanes never reach the output.
+The pin accepts two MLX kernel families, loads only:
+
+- the split-K quantized matmul,
+  `affine_qmm_t_splitk_bfloat16_t_gs_64_b_{4,8}_alN_false` and
+  `mxfp8_qmm_t_splitk_bfloat16_t_gs_32_b_8_alN_false`.
+  `QuantizedBlockLoader::load_safe` in `mlx/backend/metal/kernels/quantized.h`
+  bounds its row index against the tile's column extent, so a transposed
+  quantized matmul whose `N` is not a multiple of the output tile width reads
+  past the packed weight and scales;
+- the implicit-GEMM conv,
+  `implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s`,
+  whose weight loader checks the output-channel bound only for 8-wide tiles.
+
+In both, each output column is computed from its own weight row and the store
+clips, so the out-of-range rows never reach the output. The tests
+`split_k_tail_row_reads_never_reach_the_output` and
+`implicit_gemm_conv_tail_channel_reads_never_reach_the_output` in
+`crates/rmlx-mlx/src/ops/matmul_tests.rs` show it bit for bit with the tail rows
+poisoned. The header of `scripts/gpu_validation_census.txt` gives the argument
+and the run the pin was derived from. A cell a variable arms that the
+derivation run left standing down reports its hits as deltas until the pin is
+derived again.
 
 ### The census pin
 
