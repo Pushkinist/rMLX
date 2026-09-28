@@ -1,5 +1,5 @@
 use super::*;
-use crate::ops::{concatenate, max_axis, maximum, negative, subtract};
+use crate::ops::{concatenate, conv1d, max_axis, maximum, negative, subtract};
 use crate::Dtype;
 
 /// Group sizes at or above the K tile. A group this wide always divides the
@@ -472,5 +472,62 @@ fn split_k_tail_row_reads_never_reach_the_output() {
                 "{mode} b{bits}: a tail row of {tail} reached the output"
             );
         }
+    }
+}
+
+/// Whether the output-channel rows MLX's implicit-GEMM conv weight loader reads
+/// past the end of the weight can reach the output. With 64-wide N tiles the
+/// loader's bound check only exists for 8-wide tiles, so at `C_out = 96` the
+/// second tile reads rows 96..128 of a 96-row weight. Same method as
+/// `split_k_tail_row_reads_never_reach_the_output`: the fresh arm reads past
+/// its own allocation, the view arms read a parent's NaN / +-3e4 rows, and any
+/// tail lane reaching a kept channel makes the outputs differ bit for bit.
+///
+/// The shape is the audio codec's decoder residual conv: `bm = 64` needs an
+/// implicit M of at least 8192 and 64 or more input channels.
+#[test]
+#[ignore = "drives Metal; run under make gpu-test"]
+#[allow(
+    clippy::expect_used,
+    reason = "GPU fixture setup in this fn; a failure here is a test bug"
+)]
+fn implicit_gemm_conv_tail_channel_reads_never_reach_the_output() {
+    let device = Device::Gpu;
+    let (len, channels, taps, kept) = (8192, 96, 7, 96);
+    let f32_of = |a: Array| a.astype(Dtype::F32, device).expect("astype f32");
+    let x = f32_of(deterministic_bf16(&[1, len, channels], 0x5EED, device));
+    let weight = f32_of(deterministic_bf16(&[kept, taps, channels], 0xC0DE, device));
+
+    let conv = |w: &Array| {
+        let y = conv1d(&x, w, 1, taps / 2, 1, 1, device).expect("conv1d");
+        assert_eq!(y.shape(), vec![1, len, kept], "output shape changed");
+        y.to_bytes().expect("to_bytes")
+    };
+
+    let fresh = conv(&weight);
+    for repeat in 1..4 {
+        assert_eq!(
+            conv(&weight),
+            fresh,
+            "repeat {repeat} of the same conv differs"
+        );
+    }
+    println!("implicit-gemm conv tail digest: {:016x}", fnv1a64(&fresh));
+
+    for tail in [f32::NAN, 3.0e4, -3.0e4] {
+        let tail_rows = Array::from_f32_slice(
+            &vec![tail; (32 * taps * channels) as usize],
+            &[32, taps, channels],
+        )
+        .expect("tail");
+        let parent = concatenate(&[&weight, &tail_rows], 0, device).expect("concatenate");
+        let view = parent
+            .slice(&[0, 0, 0], &[kept, taps, channels], &[1, 1, 1], device)
+            .expect("slice");
+        assert_eq!(
+            conv(&view),
+            fresh,
+            "a tail channel row of {tail} reached the output"
+        );
     }
 }
