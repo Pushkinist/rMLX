@@ -134,10 +134,14 @@ EOF
 
 # ── Fixture tree ──────────────────────────────────────────────────────────────
 
-# make_tree <dir> — the script, its helpers, the prompts, the Makefile, a stub
-# binary and an empty Cargo.lock (so a workspace walk-up stops here).
+# make_tree <dir> [seed-hydrate=1] — the script, its helpers, the prompts, the
+# Makefile, a stub binary and an empty Cargo.lock (so a workspace walk-up
+# stops here). seed-hydrate=0 makes the stub server never record an
+# 'ssd_hydrate' event, matching a run that never hydrates anything from SSD.
+# seed-hydrate=2 records one only on the 2nd server started in the data root
+# (REVISIT), matching a run where POPULATE only ever spills.
 make_tree() {
-    local t="$1"
+    local t="$1" seed_hydrate="${2:-1}"
     mkdir -p "$t/scripts/lib" "$t/prompts" "$t/target/release-perf" "$t/models/stub-ns__stub-model-8bit"
     cp "$SCRIPT" "$t/scripts/ssd_canary.sh"
     cp "$REPO_ROOT/scripts/lib/identity.sh" "$REPO_ROOT/scripts/lib/server_kv_quant.py" "$t/scripts/lib/"
@@ -146,7 +150,8 @@ make_tree() {
     : >"$t/Cargo.lock"
     {
         printf '#!/usr/bin/env bash\n'
-        printf 'WORK=%q\nKV=%q\nSPILL_US=%q\nBLOCK=%q\n' "$WORK" "$STUB_KV_QUANT" "$STUB_SPILL_US" "$STUB_BLOCK_BYTES"
+        printf 'WORK=%q\nKV=%q\nSPILL_US=%q\nBLOCK=%q\nSEED_HYDRATE=%q\n' \
+            "$WORK" "$STUB_KV_QUANT" "$STUB_SPILL_US" "$STUB_BLOCK_BYTES" "$seed_hydrate"
         cat <<'EOF'
 LOG="$SELFTEST_LOG"
 inside() {
@@ -176,10 +181,25 @@ if [[ "${1:-}" == "serve" ]]; then
     done
     mkdir -p "$home/logs" "$home/metrics" "$home/cache/kv/ssd-canary/blocks"
     printf '{"fields":{"message":"cache-type resolved","kv_quant":"%s"}}\n' "$KV" >"$home/logs/stub-$$.jsonl"
+    # SEED_HYDRATE=1 seeds a hydrate on every phase server; SEED_HYDRATE=2
+    # seeds one only on the 2nd server started in this data root (REVISIT),
+    # matching a run where only REVISIT ever hydrates. serve_n counts servers
+    # started against this data root so far, this one included.
+    serve_n_file="$home/.serve_count"
+    serve_n=$(( $(cat "$serve_n_file" 2>/dev/null || echo 0) + 1 ))
+    printf '%s' "$serve_n" >"$serve_n_file"
     sqlite3 "$home/metrics/runs.db" \
-        "CREATE TABLE IF NOT EXISTS events(op TEXT, value REAL, notes TEXT);
-         INSERT INTO events VALUES ('ssd_spill', $SPILL_US, '{\"bytes\":1048576}');
-         INSERT INTO events VALUES ('ssd_hydrate', 1000, '{\"bytes\":524288}');"
+        "CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, op TEXT, value REAL, notes TEXT);
+         INSERT INTO events(op, value, notes) VALUES ('ssd_spill', $SPILL_US, '{\"bytes\":1048576}');"
+    seed_this_hydrate=0
+    case "$SEED_HYDRATE" in
+        1) seed_this_hydrate=1 ;;
+        2) [ "$serve_n" = 2 ] && seed_this_hydrate=1 ;;
+    esac
+    if [ "$seed_this_hydrate" = 1 ]; then
+        sqlite3 "$home/metrics/runs.db" \
+            "INSERT INTO events(op, value, notes) VALUES ('ssd_hydrate', 1000, '{\"bytes\":524288}');"
+    fi
     sqlite3 "$home/cache/kv/ssd-canary/index.db" \
         "CREATE TABLE IF NOT EXISTS kv_blocks(byte_size INTEGER);
          INSERT INTO kv_blocks VALUES ($BLOCK);"
@@ -213,6 +233,41 @@ if [[ "${1:-}" == "metrics" ]]; then
         record)
             inside "$db"
             [[ -n "$file" ]] || { echo "stub rmlx: record needs --file" >&2; exit 2; }
+            # Mirrors crates/rmlx-metrics's plausible-value bounds
+            # (docs/METRICS_SCHEMA.md §4.1) for the metrics ssd_canary.sh
+            # emits: a rate's floor excludes 0, a counter/duration/gauge's
+            # does not. A real emitter sends null, never a 0 placeholder,
+            # for a metric it did not measure.
+            if ! python3 - "$file" <<'PY'
+import json, sys
+BOUNDS = {
+    "ssd_bytes_used":       (1e13, True),
+    "ssd_evict_total":      (1e12, True),
+    "prompt_cache_ssd_hits": (1e12, True),
+    "ssd_spill_ms":         (3.6e6, True),
+    "ssd_hydrate_ms":       (3.6e6, True),
+    "ssd_spill_mb_per_s":   (1e6, False),
+    "ssd_hydrate_mb_per_s": (1e6, False),
+}
+rec = json.load(open(sys.argv[1]))
+for m in rec.get("metrics", []):
+    name, value = m["name"], m["value"]
+    if name not in BOUNDS:
+        continue
+    ceiling, zero_is_measurement = BOUNDS[name]
+    floor_ok = value >= 0.0 if zero_is_measurement else value > 0.0
+    if not floor_ok or value > ceiling:
+        bound = f"[0, {ceiling}]" if zero_is_measurement else f"(0, {ceiling}]"
+        sys.stderr.write(
+            f"ingest: {value} is not a plausible '{name}' - the registry bounds "
+            f"are {bound}. Send null, not a placeholder, for a metric this run "
+            "did not measure.\n"
+        )
+        sys.exit(1)
+PY
+            then
+                exit 1
+            fi
             mkdir -p "$(dirname "$db")"
             [[ -e "$db" ]] || : >"$db"
             printf 'db=%s\n' "$db" >>"$LOG/record.log"
@@ -293,6 +348,28 @@ for line in open(sys.argv[1]):
         r = json.loads(line)
         m = {e["name"]: e["value"] for e in r["metrics"]}
         print((m["ssd_spill_ms"], m["ssd_bytes_used"], r["kv_quant"], r["ctx_max"]))
+        break
+else:
+    print("MISSING")
+PY
+}
+
+# record_has_metric <records.jsonl> <tag> <metric-name> — whether the record
+# for <tag> carries <metric-name> at all. The stub server never measures a
+# hydrate (it reports no rmlx_ssd_hydrate_* counter), so a phase record must
+# omit 'ssd_hydrate_mb_per_s' — a rate's plausible-value floor excludes 0
+# (docs/METRICS_SCHEMA.md §4.1), so an emitter with nothing measured sends
+# null, which the CLI recorder drops before the record ever reaches ingest.
+record_has_metric() {
+    python3 - "$1" "$2" "$3" <<'PY' 2>/dev/null || echo MISSING
+import json, sys
+path, tag, metric = sys.argv[1], sys.argv[2], sys.argv[3]
+for line in open(path):
+    line = line.strip()
+    if line and f"tag={tag} " in line:
+        r = json.loads(line)
+        names = {e["name"] for e in r["metrics"]}
+        print(metric in names)
         break
 else:
     print("MISSING")
@@ -430,6 +507,16 @@ run_case() {
     else
         fail "$name: POPULATE record (ssd_spill_ms, ssd_bytes_used, kv_quant, ctx_max) = $got"
     fi
+
+    # The stub server measures a hydrate on every phase in this fixture, so a
+    # genuinely measured rate must still reach ingest as a number, not be
+    # dropped alongside the unmeasured case covered by run_null_hydrate_case.
+    got="$(record_has_metric "$cdir/log/records.jsonl" ssd-canary-populate ssd_hydrate_mb_per_s)"
+    if [[ "$got" == True ]]; then
+        pass "$name: a measured hydrate rate still reaches the POPULATE record"
+    else
+        fail "$name: POPULATE record ssd_hydrate_mb_per_s presence = $got (stub measured a hydrate)"
+    fi
     if grep -q -- '--max-ctx 8192' "$cdir/log/serve.log" && ! grep -v -- '--max-ctx 8192' "$cdir/log/serve.log" | grep -q .; then
         pass "$name: every phase server was given --max-ctx 8192"
     else
@@ -516,6 +603,100 @@ PY
     fi
 }
 
+# run_null_hydrate_case — a run where the stub server never records an
+# 'ssd_hydrate' event (a real cold POPULATE phase that only ever spills).
+# ssd_hydrate_mb_per_s is a rate: the registry's plausible-value floor
+# excludes 0 (docs/METRICS_SCHEMA.md §4.1), so ingest must never see a 0
+# placeholder for it. Before the fix, the script sent a literal "0.000" and
+# the (now-validating) stub's `metrics record` refused it, so the whole
+# canary aborted; this case fails on that script and passes once the script
+# sends null (dropped before it reaches the stub) instead.
+run_null_hydrate_case() {
+    local name="null-hydrate"
+    local cdir="$WORK/$name"
+    local tree="$cdir/tree"
+    mkdir -p "$cdir/home" "$cdir/tmp" "$cdir/log"
+    make_tree "$tree" 0
+    local root="$cdir/data-root"
+    seed_root "$root"
+
+    local port rc
+    port="$(free_port)"
+    run_env "$cdir" "$tree" "RMLX_HOME=$root" \
+        "VERIFIER_MODEL=$tree/models/stub-ns__stub-model-8bit" "PORT=$port" -- \
+        make --no-print-directory -f "$tree/Makefile" ssd-canary >"$cdir/run.out" 2>&1
+    rc=$?
+    if [[ $rc -eq 0 ]]; then
+        pass "$name: make ssd-canary exits 0 with no hydrate ever measured"
+    else
+        fail "$name: make ssd-canary exited $rc (tail: $(tail -5 "$cdir/run.out" | tr '\n' ' '))"
+    fi
+
+    local tag got any_present=""
+    for tag in ssd-canary-populate ssd-canary-revisit; do
+        got="$(record_has_metric "$cdir/log/records.jsonl" "$tag" ssd_hydrate_mb_per_s)"
+        if [[ "$got" == False ]]; then
+            pass "$name: $tag record omits the unmeasured ssd_hydrate_mb_per_s"
+        else
+            any_present="1"
+            fail "$name: $tag record ssd_hydrate_mb_per_s presence = $got (expected omitted)"
+        fi
+    done
+
+    # The measured spill rate must still reach ingest as a number: the null
+    # path must not swallow a real measurement alongside the unmeasured one.
+    got="$(record_has_metric "$cdir/log/records.jsonl" ssd-canary-populate ssd_spill_mb_per_s)"
+    if [[ "$got" == True ]]; then
+        pass "$name: the measured ssd_spill_mb_per_s still reaches the POPULATE record"
+    else
+        fail "$name: POPULATE record ssd_spill_mb_per_s presence = $got (stub measured a spill)"
+    fi
+}
+
+# run_revisit_hydrate_case — a run where the stub server records a hydrate
+# only on the REVISIT server (the real shape: a cold POPULATE phase spills
+# but hydrates nothing, and only a revisited prompt hydrates from SSD). Each
+# phase record must carry rates computed from that phase's own events: the
+# POPULATE record must omit the hydrate rate it never measured, and the
+# REVISIT record must carry the one it did. Before the fix, both records
+# read the same (POPULATE's) hydrate variables, so REVISIT's own hydrate
+# never reached ingest and POPULATE's absent one still did not read null.
+run_revisit_hydrate_case() {
+    local name="revisit-hydrate"
+    local cdir="$WORK/$name"
+    local tree="$cdir/tree"
+    mkdir -p "$cdir/home" "$cdir/tmp" "$cdir/log"
+    make_tree "$tree" 2
+    local root="$cdir/data-root"
+    seed_root "$root"
+
+    local port rc
+    port="$(free_port)"
+    run_env "$cdir" "$tree" "RMLX_HOME=$root" \
+        "VERIFIER_MODEL=$tree/models/stub-ns__stub-model-8bit" "PORT=$port" -- \
+        make --no-print-directory -f "$tree/Makefile" ssd-canary >"$cdir/run.out" 2>&1
+    rc=$?
+    if [[ $rc -eq 0 ]]; then
+        pass "$name: make ssd-canary exits 0 with only REVISIT ever hydrating"
+    else
+        fail "$name: make ssd-canary exited $rc (tail: $(tail -5 "$cdir/run.out" | tr '\n' ' '))"
+    fi
+
+    local got
+    got="$(record_has_metric "$cdir/log/records.jsonl" ssd-canary-populate ssd_hydrate_mb_per_s)"
+    if [[ "$got" == False ]]; then
+        pass "$name: the POPULATE record omits the hydrate rate it never measured"
+    else
+        fail "$name: POPULATE record ssd_hydrate_mb_per_s presence = $got (expected omitted)"
+    fi
+    got="$(record_has_metric "$cdir/log/records.jsonl" ssd-canary-revisit ssd_hydrate_mb_per_s)"
+    if [[ "$got" == True ]]; then
+        pass "$name: the REVISIT record carries the hydrate rate it measured itself"
+    else
+        fail "$name: REVISIT record ssd_hydrate_mb_per_s presence = $got (expected present)"
+    fi
+}
+
 echo "==> ssd-canary-selftest"
 
 # Every deletion must go through `rm`, the one the shim can see.
@@ -529,6 +710,8 @@ run_case exported-home exported
 run_case unset-home unset
 run_case metrics-db-env metrics-db
 run_case relative-home relative
+run_null_hydrate_case
+run_revisit_hydrate_case
 
 # A missing binary exits 125, as documented, before anything else asks it.
 nobin="$WORK/no-binary"
