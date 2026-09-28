@@ -1,5 +1,5 @@
 use super::*;
-use crate::ops::{max_axis, maximum, negative, subtract};
+use crate::ops::{concatenate, conv1d, max_axis, maximum, negative, subtract};
 use crate::Dtype;
 
 /// Group sizes at or above the K tile. A group this wide always divides the
@@ -374,4 +374,204 @@ fn max_abs(a: &Array, device: Device) -> f32 {
     host.eval().expect("eval");
     let bytes = host.to_bytes().expect("to_bytes");
     f32::from_le_bytes(bytes[..4].try_into().expect("4 bytes"))
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// Thirty-one bf16 rows of width `k`: every value NaN when `scale` is NaN,
+/// otherwise varied values of magnitude up to `|scale|`. Varied rows quantize
+/// to non-zero codes, so a tail lane reaching a kept column would move it
+/// through its codes as well as through its scale and bias.
+#[allow(
+    clippy::expect_used,
+    reason = "GPU fixture setup in this fn; a failure here is a test bug"
+)]
+fn tail_rows(k: i32, scale: f32, device: Device) -> Array {
+    let values: Vec<f32> = if scale.is_nan() {
+        vec![f32::NAN; 31 * k as usize]
+    } else {
+        let unit = deterministic_bf16(&[31, k], 0x7A11, device)
+            .astype(Dtype::F32, device)
+            .expect("astype f32")
+            .to_bytes()
+            .expect("to_bytes");
+        unit.chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().expect("4 bytes")) * scale)
+            .collect()
+    };
+    Array::from_f32_slice(&values, &[31, k])
+        .expect("tail")
+        .astype(Dtype::Bf16, device)
+        .expect("astype")
+}
+
+/// A 32-row quantized weight whose rows past the first are `tail`, sliced to
+/// its first row. The slice is a view into the 32-row buffers, so the rows an
+/// `alN_false` tile reads past `N = 1` are the parent's rows, whose content the
+/// caller chose. The flag says whether any code of the tail rows is non-zero.
+#[allow(
+    clippy::expect_used,
+    reason = "GPU fixture setup in this fn; a failure here is a test bug"
+)]
+fn one_row_view_over_tail(
+    row: &Array,
+    tail: &Array,
+    mode: &str,
+    group_size: i32,
+    bits: i32,
+    device: Device,
+) -> (Array, Array, Option<Array>, bool) {
+    let parent = concatenate(&[row, tail], 0, device).expect("concatenate");
+    let (codes, scales, biases) =
+        quantize_mode(&parent, group_size, bits, mode, device).expect("quantize");
+    let rows = |a: &Array, from: i32, to: i32| {
+        let cols = a.shape()[1];
+        a.slice(&[from, 0], &[to, cols], &[1, 1], device)
+            .expect("slice")
+    };
+    let tail_codes_nonzero = rows(&codes, 1, 32)
+        .to_bytes()
+        .expect("to_bytes")
+        .iter()
+        .any(|b| *b != 0);
+    let biases = (mode == "affine").then(|| rows(&biases, 0, 1));
+    (
+        rows(&codes, 0, 1),
+        rows(&scales, 0, 1),
+        biases,
+        tail_codes_nonzero,
+    )
+}
+
+/// Whether the rows MLX's `qmm_t` split-K loader reads past the end of an
+/// `N = 1` weight can reach the output. The same kept row is multiplied three
+/// ways: out of its own one-row buffers (where the tail read leaves the
+/// allocation and shader validation reports it), and out of views whose tail
+/// rows are NaN, or varied values up to `+-3e4` with non-zero codes. Any lane
+/// of a tail row that reached a kept column would make the outputs differ bit
+/// for bit.
+///
+/// That a view's tile really reads its parent's tail rows is not asserted
+/// here: the evidence is the shader-validation census, where the fresh arm
+/// reports 4 loads per mode and the view arms none.
+///
+/// The printed digest is the fresh arm's output; comparing it between a run
+/// under `make gpu-test` and one without shader validation says whether the
+/// validation layer itself changes what this kernel computes.
+#[test]
+#[ignore = "drives Metal; run under make gpu-test"]
+#[allow(
+    clippy::expect_used,
+    reason = "GPU fixture setup in this fn; a failure here is a test bug"
+)]
+fn split_k_tail_row_reads_never_reach_the_output() {
+    let device = Device::Gpu;
+    let (m, k) = (32, 2048);
+    let x = deterministic_bf16(&[m, k], 0x3C1E, device);
+    let row = deterministic_bf16(&[1, k], 0x0B0E, device);
+
+    for (mode, group_size, bits) in [("affine", 64, 8), ("affine", 64, 4), ("mxfp8", 32, 8)] {
+        let product = |codes: &Array, scales: &Array, biases: Option<&Array>| {
+            let y = quantized_matmul(
+                &x, codes, scales, biases, group_size, bits, mode, true, device,
+            )
+            .expect("quantized_matmul");
+            assert_eq!(y.shape(), vec![m, 1], "output shape changed");
+            y.to_bytes().expect("to_bytes")
+        };
+
+        let (codes, scales, biases) =
+            quantize_mode(&row, group_size, bits, mode, device).expect("quantize");
+        let biases = (mode == "affine").then_some(biases);
+        let fresh = product(&codes, &scales, biases.as_ref());
+        for repeat in 1..4 {
+            assert_eq!(
+                product(&codes, &scales, biases.as_ref()),
+                fresh,
+                "{mode} b{bits}: repeat {repeat} of the same product differs"
+            );
+        }
+        println!(
+            "split-k tail digest {mode} gs={group_size} b={bits}: {:016x}",
+            fnv1a64(&fresh)
+        );
+
+        for scale in [f32::NAN, 3.0e4, -3.0e4] {
+            let tail = tail_rows(k, scale, device);
+            let (codes, scales, biases, tail_codes_nonzero) =
+                one_row_view_over_tail(&row, &tail, mode, group_size, bits, device);
+            if !scale.is_nan() {
+                assert!(
+                    tail_codes_nonzero,
+                    "{mode} b{bits}: the tail rows at scale {scale} quantized to all-zero codes"
+                );
+            }
+            assert_eq!(
+                product(&codes, &scales, biases.as_ref()),
+                fresh,
+                "{mode} b{bits}: a tail row at scale {scale} reached the output"
+            );
+        }
+    }
+}
+
+/// Whether the output-channel rows MLX's implicit-GEMM conv weight loader reads
+/// past the end of the weight can reach the output. With 64-wide N tiles the
+/// loader's bound check only exists for 8-wide tiles, so at `C_out = 96` the
+/// second tile reads rows 96..128 of a 96-row weight. Same method as
+/// `split_k_tail_row_reads_never_reach_the_output`: the fresh arm reads past
+/// its own allocation, the view arms read a parent's NaN / +-3e4 rows, and any
+/// tail lane reaching a kept channel makes the outputs differ bit for bit.
+///
+/// The shape is the audio codec's decoder residual conv: `bm = 64` needs an
+/// implicit M of at least 8192 and 64 or more input channels.
+#[test]
+#[ignore = "drives Metal; run under make gpu-test"]
+#[allow(
+    clippy::expect_used,
+    reason = "GPU fixture setup in this fn; a failure here is a test bug"
+)]
+fn implicit_gemm_conv_tail_channel_reads_never_reach_the_output() {
+    let device = Device::Gpu;
+    let (len, channels, taps, kept) = (8192, 96, 7, 96);
+    let f32_of = |a: Array| a.astype(Dtype::F32, device).expect("astype f32");
+    let x = f32_of(deterministic_bf16(&[1, len, channels], 0x5EED, device));
+    let weight = f32_of(deterministic_bf16(&[kept, taps, channels], 0xC0DE, device));
+
+    let conv = |w: &Array| {
+        let y = conv1d(&x, w, 1, taps / 2, 1, 1, device).expect("conv1d");
+        assert_eq!(y.shape(), vec![1, len, kept], "output shape changed");
+        y.to_bytes().expect("to_bytes")
+    };
+
+    let fresh = conv(&weight);
+    for repeat in 1..4 {
+        assert_eq!(
+            conv(&weight),
+            fresh,
+            "repeat {repeat} of the same conv differs"
+        );
+    }
+    println!("implicit-gemm conv tail digest: {:016x}", fnv1a64(&fresh));
+
+    for tail in [f32::NAN, 3.0e4, -3.0e4] {
+        let tail_rows = Array::from_f32_slice(
+            &vec![tail; (32 * taps * channels) as usize],
+            &[32, taps, channels],
+        )
+        .expect("tail");
+        let parent = concatenate(&[&weight, &tail_rows], 0, device).expect("concatenate");
+        let view = parent
+            .slice(&[0, 0, 0], &[kept, taps, channels], &[1, 1, 1], device)
+            .expect("slice");
+        assert_eq!(
+            conv(&view),
+            fresh,
+            "a tail channel row of {tail} reached the output"
+        );
+    }
 }

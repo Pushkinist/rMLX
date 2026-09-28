@@ -829,7 +829,7 @@ fn embed_lookup_bf16_scales_passthrough_arm() {
 ///
 /// Run: cargo test -- --ignored quantize_paro_embed_row760
 #[test]
-#[ignore]
+#[ignore = "reads the PARO checkpoint shards on the CPU, too slow for make test; run by hand with --ignored"]
 #[allow(
     clippy::expect_used,
     reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
@@ -2004,7 +2004,7 @@ fn paro_rotation_kernel_vs_python() {
 /// Integration smoke probe — requires the actual model snapshot at the path.
 /// Skipped in CI; run manually with: cargo test -- --ignored integration_qwen3_5_moe_35b
 #[test]
-#[ignore]
+#[ignore = "a forward over the 35B mixture checkpoint is too slow for make test; run by hand with --ignored"]
 #[allow(
     clippy::expect_used,
     reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
