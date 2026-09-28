@@ -86,9 +86,14 @@ tag and its body carries the tag, so the three phases are three cells
 (prompts are content-addressed, and a shared body would make them one). Its `ctx_max` is the 8192 the servers
 ran at, and its `kv_quant` is the codec the POPULATE server's log names
 (`scripts/lib/server_kv_quant.py`); a log naming none stops the run. The
-POPULATE and REVISIT records carry SSD hits, bytes used,
-evictions, and mean spill and hydrate time and rate. The EVICT record carries
-bytes used and evictions only.
+POPULATE and REVISIT records carry SSD hits, bytes used, evictions, and mean
+spill and hydrate time and rate — each computed from that phase's own events
+(the events table's row-id range between that phase's start and end), never
+a whole-run figure or another phase's. A phase that measured no spill or no
+hydrate omits that figure (`null`) rather than sending a `0`: the duration
+would misread as the best ever seen, and the metrics registry's
+plausible-value bounds refuse a `0` rate outright (docs/METRICS_SCHEMA.md
+§4.1). The EVICT record carries bytes used and evictions only.
 
 ## Output
 
