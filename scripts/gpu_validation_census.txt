@@ -90,8 +90,9 @@
 # bits 2, 3, 4, 5, 6 and 8 across group sizes 32, 64 and 128 (18 of 18 cells),
 # the output-reachability arms were run at bits 2 and 8, and
 # `rmlx-mlx`'s `split_k_tail_row_reads_never_reach_the_output` multiplies one
-# kept row from its own buffers and from views whose tail rows are NaN, +3e4
-# and -3e4, bit-identical at affine b4, affine b8 and mxfp8 gs32 b8, the three
+# kept row from its own buffers and from views whose tail rows are NaN, or
+# varied values up to +-3e4 whose quantized codes are asserted non-zero,
+# bit-identical at affine b4, affine b8 and mxfp8 gs32 b8, the three
 # instantiations below. The selector is identical in the next MLX
 # release, so moving the pinned MLX does not remove it.
 #
@@ -117,8 +118,9 @@
 # libtest last announced, on a host holding every snapshot the suite resolves by
 # slug, with threadgroup-memory validation split per test
 # (`scripts/gpu_test_threadgroup.sh`) — every entry below comes from a test that
-# ran with it off, except the `rmlx-mlx` ones. Fifteen cells stood down for
-# want of `RMLX_KV_TEST_MODEL`, `RMLX_VL_TEST_MODEL`,
+# ran with it off. Two full runs, the second after the split was keyed on the
+# kernel a test names, attributed the same count to every entry. Fifteen cells
+# stood down for want of `RMLX_KV_TEST_MODEL`, `RMLX_VL_TEST_MODEL`,
 # `RMLX_PROMPT_CACHE_TEST_MODEL_A` or `RMLX_TEST_MODEL_JINA_V4`, and pin
 # nothing; a run that arms one of them reports its hits as deltas until the pin
 # is derived again. Totals: 8448 affine `b_4`, 3869 affine `b_8` and 3168
