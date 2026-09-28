@@ -430,33 +430,45 @@ PYEOF
 }
 
 # phase_rate_stats <op> <start-id-exclusive> <end-id-inclusive> — the mean
-# duration (us) and throughput (mb/s) of one op's events within one phase's
-# own row-id range, never another phase's. Prints "<mean_us> <mbps_json>".
-# mbps_json is the Python literal (`None` or a numeric string) an unmeasured
-# rate must reach the ingest JSON as: mb/s is a rate, and the metrics
-# registry's plausible-value floor excludes 0 (docs/METRICS_SCHEMA.md §4.1).
+# duration (ms) and throughput (mb/s) of one op's events within one phase's
+# own row-id range, never another phase's. Prints "<ms_json> <mbps_json>",
+# each the Python literal (`None` or a formatted number) the phase's ingest
+# JSON substitutes directly.
+#
+# A phase with no matching rows is unmeasured: both are `None`, never a
+# placeholder 0. A duration's plausible-value floor technically admits 0
+# (docs/METRICS_SCHEMA.md §4.1 — a sub-ms span rounds to 0), but a phase
+# that recorded nothing is not a measured zero-length event, and since the
+# metric is lower-better, a fake 0.0 would read as the best duration ever
+# seen. A rate's floor excludes 0 outright, and stays `None` even when the
+# phase measured something but the rate itself rounds to 0.000 (e.g. an
+# average of 0 bytes) — the ingest refuses a literal 0 there regardless of
+# why it is 0.
 phase_rate_stats() {
     local op="$1" start_id="$2" end_id="$3"
-    local mean_us="0" mbps_json="None"
+    local ms_json="None" mbps_json="None"
     if [[ -f "${EVENTS_DB}" ]] && ! $DRY_RUN; then
-        local bytes_val
-        read -r mean_us bytes_val < <(
+        local n mean_us bytes_val
+        if ! read -r n mean_us bytes_val < <(
             sqlite3 -separator ' ' "${EVENTS_DB}" \
-                "SELECT COALESCE(AVG(value),0), COALESCE(AVG(CAST(json_extract(notes,'$.bytes') AS REAL)),0)
+                "SELECT COUNT(*), COALESCE(AVG(value),0), COALESCE(AVG(CAST(json_extract(notes,'$.bytes') AS REAL)),0)
                  FROM events WHERE op='${op}' AND id > ${start_id} AND id <= ${end_id};" \
-                2>/dev/null || echo "0 0"
-        ) || true
-        mean_us="${mean_us:-0}"
-        if python3 -c "exit(0 if float('${mean_us}') > 0 else 1)" 2>/dev/null; then
+                2>/dev/null
+        ); then
+            echo "phase_rate_stats: sqlite3 query failed for op=${op}, events id range (${start_id}, ${end_id}]" >&2
+            n=0
+        fi
+        if [[ "${n:-0}" -gt 0 ]]; then
+            ms_json=$(python3 -c "print(f'{float(\"${mean_us:-0}\") / 1000.0:.6f}')" 2>/dev/null || echo "None")
             mbps_json=$(python3 -c "
 bytes_val = float('${bytes_val:-0}')
-dur_us = float('${mean_us}')
+dur_us = float('${mean_us:-0}')
 mbps = (bytes_val / dur_us) * 1e6 / (1024*1024) if dur_us > 0 else 0.0
-print(f'{mbps:.3f}')
+print(f'{mbps:.3f}' if round(mbps, 3) > 0 else 'None')
 " 2>/dev/null || echo "None")
         fi
     fi
-    printf '%s %s\n' "${mean_us}" "${mbps_json}"
+    printf '%s %s\n' "${ms_json}" "${mbps_json}"
 }
 
 # Emit a §8.5 RunRecord JSON and ingest it into runs.db.
@@ -658,11 +670,14 @@ POPULATE_FINAL_EVICT="${ssd_evict}"
 
 # The events table's row id boundary at the end of this phase: everything up
 # to it is POPULATE's own events; everything past it belongs to a later phase.
-POPULATE_EVENTS_END_ID="$(sqlite3 "${EVENTS_DB}" \
-    "SELECT COALESCE(MAX(id),0) FROM events;" 2>/dev/null || echo 0)"
-read -r POPULATE_MEAN_SPILL_US POPULATE_SPILL_MBPS_JSON < <(
+if ! POPULATE_EVENTS_END_ID="$(sqlite3 "${EVENTS_DB}" \
+    "SELECT COALESCE(MAX(id),0) FROM events;" 2>/dev/null)"; then
+    echo "WARNING: sqlite3 could not read the POPULATE events boundary from ${EVENTS_DB}; treating it as 0" >&2
+    POPULATE_EVENTS_END_ID=0
+fi
+read -r POPULATE_SPILL_MS_JSON POPULATE_SPILL_MBPS_JSON < <(
     phase_rate_stats ssd_spill 0 "${POPULATE_EVENTS_END_ID}")
-read -r POPULATE_MEAN_HYDRATE_US POPULATE_HYDRATE_MBPS_JSON < <(
+read -r POPULATE_HYDRATE_MS_JSON POPULATE_HYDRATE_MBPS_JSON < <(
     phase_rate_stats ssd_hydrate 0 "${POPULATE_EVENTS_END_ID}")
 
 echo ""
@@ -801,11 +816,14 @@ REVISIT_FINAL_EVICT="${ssd_evict}"
 
 # The events table's row id boundary at the end of this phase: everything
 # after POPULATE's boundary and up to this one is REVISIT's own events.
-REVISIT_EVENTS_END_ID="$(sqlite3 "${EVENTS_DB}" \
-    "SELECT COALESCE(MAX(id),0) FROM events;" 2>/dev/null || echo 0)"
-read -r REVISIT_MEAN_SPILL_US REVISIT_SPILL_MBPS_JSON < <(
+if ! REVISIT_EVENTS_END_ID="$(sqlite3 "${EVENTS_DB}" \
+    "SELECT COALESCE(MAX(id),0) FROM events;" 2>/dev/null)"; then
+    echo "WARNING: sqlite3 could not read the REVISIT events boundary from ${EVENTS_DB}; treating it as 0" >&2
+    REVISIT_EVENTS_END_ID=0
+fi
+read -r REVISIT_SPILL_MS_JSON REVISIT_SPILL_MBPS_JSON < <(
     phase_rate_stats ssd_spill "${POPULATE_EVENTS_END_ID}" "${REVISIT_EVENTS_END_ID}")
-read -r REVISIT_MEAN_HYDRATE_US REVISIT_HYDRATE_MBPS_JSON < <(
+read -r REVISIT_HYDRATE_MS_JSON REVISIT_HYDRATE_MBPS_JSON < <(
     phase_rate_stats ssd_hydrate "${POPULATE_EVENTS_END_ID}" "${REVISIT_EVENTS_END_ID}")
 
 REVISIT_SSD_HIT_RATE=$(python3 -c "
@@ -818,7 +836,7 @@ echo ""
 echo "==> Phase REVISIT complete."
 echo "    total_ssd_hits    : ${TOTAL_SSD_HITS_REVISIT} / ${REVISIT_COUNT} requests"
 echo "    ssd_hit_rate      : ${REVISIT_SSD_HIT_RATE}"
-echo "    mean_hydrate_us   : ${REVISIT_MEAN_HYDRATE_US}"
+echo "    mean_hydrate_ms   : ${REVISIT_HYDRATE_MS_JSON}"
 echo "    hydrate_events    : ${REVISIT_FINAL_HYDRATE_COUNT}"
 echo ""
 
@@ -975,11 +993,12 @@ echo "    startup_evict_total : ${EVICT_STARTUP_EVICT_TOTAL}"
 echo ""
 
 # ── Ingest phase records ───────────────────────────────────────────────────────
-# POPULATE_MEAN_SPILL_US, POPULATE_SPILL_MBPS_JSON, POPULATE_MEAN_HYDRATE_US,
-# POPULATE_HYDRATE_MBPS_JSON, REVISIT_MEAN_SPILL_US, REVISIT_SPILL_MBPS_JSON,
-# REVISIT_MEAN_HYDRATE_US and REVISIT_HYDRATE_MBPS_JSON were computed at each
+# POPULATE_SPILL_MS_JSON, POPULATE_SPILL_MBPS_JSON, POPULATE_HYDRATE_MS_JSON,
+# POPULATE_HYDRATE_MBPS_JSON, REVISIT_SPILL_MS_JSON, REVISIT_SPILL_MBPS_JSON,
+# REVISIT_HYDRATE_MS_JSON and REVISIT_HYDRATE_MBPS_JSON were computed at each
 # phase's own row-id boundary, above (phase_rate_stats), so each figure below
-# is that phase's own events, never another phase's.
+# is that phase's own events, never another phase's, and each is `None`
+# rather than a placeholder 0 when that phase measured nothing.
 
 echo "==> Ingesting phase records into runs.db..." >&2
 
@@ -990,8 +1009,8 @@ print(json.dumps({
     'prompt_cache_ssd_hits': ${TOTAL_SSD_HITS_POPULATE},
     'ssd_bytes_used':        ${POPULATE_FINAL_SSD_BYTES:-0},
     'ssd_evict_total':       int("${POPULATE_FINAL_EVICT}" or "0"),
-    'ssd_spill_ms':          float("${POPULATE_MEAN_SPILL_US}" or "0") / 1000.0,
-    'ssd_hydrate_ms':        float("${POPULATE_MEAN_HYDRATE_US}" or "0") / 1000.0,
+    'ssd_spill_ms':          ${POPULATE_SPILL_MS_JSON},
+    'ssd_hydrate_ms':        ${POPULATE_HYDRATE_MS_JSON},
     'ssd_spill_mb_per_s':    ${POPULATE_SPILL_MBPS_JSON},
     'ssd_hydrate_mb_per_s':  ${POPULATE_HYDRATE_MBPS_JSON},
 }))
@@ -1009,8 +1028,8 @@ print(json.dumps({
     'prompt_cache_ssd_hits': ${TOTAL_SSD_HITS_REVISIT},
     'ssd_bytes_used':        int("${REVISIT_FINAL_SSD_BYTES}" or "0"),
     'ssd_evict_total':       int("${REVISIT_FINAL_EVICT}" or "0"),
-    'ssd_spill_ms':          float("${REVISIT_MEAN_SPILL_US}" or "0") / 1000.0,
-    'ssd_hydrate_ms':        float("${REVISIT_MEAN_HYDRATE_US}" or "0") / 1000.0,
+    'ssd_spill_ms':          ${REVISIT_SPILL_MS_JSON},
+    'ssd_hydrate_ms':        ${REVISIT_HYDRATE_MS_JSON},
     'ssd_spill_mb_per_s':    ${REVISIT_SPILL_MBPS_JSON},
     'ssd_hydrate_mb_per_s':  ${REVISIT_HYDRATE_MBPS_JSON},
 }))
@@ -1160,8 +1179,8 @@ summary = {
             "hydrate_events": int("${POPULATE_FINAL_HYDRATE_COUNT}" or "0"),
             "total_ssd_hits": ${TOTAL_SSD_HITS_POPULATE},
             "ssd_evict_total": int("${POPULATE_FINAL_EVICT}" or "0"),
-            "mean_spill_us": float("${POPULATE_MEAN_SPILL_US}" or "0"),
-            "mean_hydrate_us": float("${POPULATE_MEAN_HYDRATE_US}" or "0"),
+            "mean_spill_ms": ${POPULATE_SPILL_MS_JSON},
+            "mean_hydrate_ms": ${POPULATE_HYDRATE_MS_JSON},
             "spill_mb_per_s": ${POPULATE_SPILL_MBPS_JSON},
             "hydrate_mb_per_s": ${POPULATE_HYDRATE_MBPS_JSON},
         },
@@ -1172,8 +1191,8 @@ summary = {
             "ssd_hit_rate": float("${REVISIT_SSD_HIT_RATE}" or "0"),
             "ssd_evict_total": int("${REVISIT_FINAL_EVICT}" or "0"),
             "hydrate_events": int("${REVISIT_FINAL_HYDRATE_COUNT}" or "0"),
-            "mean_spill_us": float("${REVISIT_MEAN_SPILL_US}" or "0"),
-            "mean_hydrate_us": float("${REVISIT_MEAN_HYDRATE_US}" or "0"),
+            "mean_spill_ms": ${REVISIT_SPILL_MS_JSON},
+            "mean_hydrate_ms": ${REVISIT_HYDRATE_MS_JSON},
             "spill_mb_per_s": ${REVISIT_SPILL_MBPS_JSON},
             "hydrate_mb_per_s": ${REVISIT_HYDRATE_MBPS_JSON},
         },
