@@ -450,15 +450,28 @@ prints the access mix per diagnostic. A clean scan does not prove that nothing
 read out of bounds. The layer bounds against the `MTLBuffer`, not the array,
 and MLX recycles buffers from size buckets.
 
-The pin accepts one diagnostic: MLX's own
-`affine_qmm_t_splitk_bfloat16_t_gs_64_b_{4,8}_alN_false`, loads only. On a
-host with every snapshot, armed cells report hits the pin does not name, until
-the pin is derived again.
-`QuantizedBlockLoader::load_safe` in `mlx/backend/metal/kernels/quantized.h`
-bounds its row index against the tile's column extent. A transposed quantized
-matmul whose `N` is not a multiple of the output tile width then reads past the
-packed weight and scales. The header of `scripts/gpu_validation_census.txt`
-gives the argument that the loaded lanes never reach the output.
+The pin accepts two MLX kernel families, loads only:
+
+- the split-K quantized matmul,
+  `affine_qmm_t_splitk_bfloat16_t_gs_64_b_{4,8}_alN_false` and
+  `mxfp8_qmm_t_splitk_bfloat16_t_gs_32_b_8_alN_false`.
+  `QuantizedBlockLoader::load_safe` in `mlx/backend/metal/kernels/quantized.h`
+  bounds its row index against the tile's column extent, so a transposed
+  quantized matmul whose `N` is not a multiple of the output tile width reads
+  past the packed weight and scales;
+- the implicit-GEMM conv,
+  `implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s`,
+  whose weight loader checks the output-channel bound only for 8-wide tiles.
+
+In both, each output column is computed from its own weight row and the store
+clips, so the out-of-range rows never reach the output. The tests
+`split_k_tail_row_reads_never_reach_the_output` and
+`implicit_gemm_conv_tail_channel_reads_never_reach_the_output` in
+`crates/rmlx-mlx/src/ops/matmul_tests.rs` show it bit for bit with the tail rows
+poisoned. The header of `scripts/gpu_validation_census.txt` gives the argument
+and the run the pin was derived from. A cell a variable arms that the
+derivation run left standing down reports its hits as deltas until the pin is
+derived again.
 
 ### The census pin
 
