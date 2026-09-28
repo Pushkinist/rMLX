@@ -70,64 +70,96 @@
 # arrives as a delta nobody can attribute. A reviewer checks the census line
 # against the test the change adds or touches.
 #
-# The entries below are MLX's own quantized matmul, not a kernel this repo
-# compiles or can specialise. `QuantizedBlockLoader::load_safe` in
+# The entries below are MLX's own kernels, not ones this repo compiles or can
+# specialise. Every diagnostic is a device load; no store has been observed.
+#
+# QUANTIZED MATMUL, `*_qmm_t_splitk_*`. `QuantizedBlockLoader::load_safe` in
 # `mlx/backend/metal/kernels/quantized.h` bounds its row index against the
 # tile's COLUMN extent, so the guard can never fire and a transposed quantized
 # matmul whose N is not a multiple of the output tile width reads the
 # out-of-range rows of the packed weight and the scales. rMLX passes correctly
-# sized operands; every diagnostic is a load, and no store has been observed.
+# sized operands.
 #
 # The loaded lanes do not reach the output, and the reason is structural rather
-# than a bit width that happened to be measured: `tile_matmad` computes
-# y[m][n] = SUM_k Xs[m][k] * Ws[n][k], so there is no reduction across n and no
-# path from a poisoned Ws row into a kept column, and the store then clips to
-# num_outs. That argument does not mention `bits`, which is what carries it to
-# the 4-bit instantiation. The measurements corroborate it from both sides: the
-# wrong selector reports at affine bits 2, 3, 4, 5, 6 and 8 across group sizes
-# 32, 64 and 128 (18 of 18 cells), and the output-reachability arms were run at
-# bits 2 and at bits 8, either side of 4 — including one holding the
-# out-of-range rows at NaN under the same kernel instantiation. So `b_4` and
-# `b_8` are one defect at two instantiations of one template, and one analysis
-# covers both. The selector is identical in the next MLX release, so moving the
-# pinned MLX does not remove it.
+# than a bit width or a loader that happened to be measured: `tile_matmad`
+# computes y[m][n] = SUM_k Xs[m][k] * Ws[n][k], so there is no reduction across
+# n and no path from a poisoned Ws row into a kept column, and the store then
+# clips to num_outs. The argument names neither `bits` nor the affine or mxfp8
+# dequantisation, which is what carries it across the instantiations pinned
+# here. The measurements corroborate it: the wrong selector reports at affine
+# bits 2, 3, 4, 5, 6 and 8 across group sizes 32, 64 and 128 (18 of 18 cells),
+# the output-reachability arms were run at bits 2 and 8, and
+# `rmlx-mlx`'s `split_k_tail_row_reads_never_reach_the_output` multiplies one
+# kept row from its own buffers and from views whose tail rows are NaN, or
+# varied values up to +-3e4 whose quantized codes are asserted non-zero,
+# bit-identical at affine b4, affine b8 and mxfp8 gs32 b8, the three
+# instantiations below. The selector is identical in the next MLX
+# release, so moving the pinned MLX does not remove it.
 #
-# Which operand overruns, read off the buffer line beside each diagnostic:
+# IMPLICIT-GEMM CONV, `implicit_gemm_conv_2d_float32_*_channel_l_filter_s`. The
+# weight loader in `loader_channel_l.h` checks the output-channel bound only for
+# 8-wide N tiles (`if (BN != 8 || do_read)`); with a 64-wide tile a 96-channel
+# weight has its second tile read rows 96..127. Each output channel is computed
+# from its own weight row only and the store clips channels at or above 96.
+# `rmlx-mlx`'s `implicit_gemm_conv_tail_channel_reads_never_reach_the_output`
+# is bit-identical with the tail rows at NaN, +3e4 and -3e4.
 #
-#   b_8   1174 of 1174 at length:2048 — the 1-row quantized
-#         `shared_expert_gate` packed weight, [1, 2048] at 8 bits. The
-#         mixture's reachable tensor is now measured, not inferred.
-#   b_4   2444 of 2496 at length:7680 — consistent with the 27B family's
-#         `linear_attn.in_proj_{a,b}` scales: N = 48 rows x K/group_size = 80
-#         entries x 2 bytes. Consistent with, not identified: no buffer name
-#         reaches the diagnostic, MLX owns the allocator and reports
-#         `<unnamed>`.
-#   b_4     52 of 2496 at length:8192 — unexplained. It is a load like the
-#         rest and the structural argument above covers it, but no tensor in
-#         that snapshot has been matched to the size.
+# The buffer length beside each diagnostic is the MTLBuffer MLX allocated from a
+# size bucket, not the tensor, so it does not identify the operand; the
+# argument above does not depend on which operand overruns. In the run below,
+# per kernel and length in `rmlx-models`:
 #
-# The first three entries run `mlx-community__Qwen3.6-35B-A3B-8bit` and are the
-# 8-bit instantiation alone. The fourth originating test sweeps two GDN hybrids
-# in one body — `mlx-community__Qwen3.8-27B-4bit` and that same 8-bit mixture —
-# so it carries one entry per instantiation. A full run reports 2496 `b_4` and
-# 1174 `b_8`.
+#   affine b_4    7680: 3077   8192: 4590   8960: 26   9216: 43   9344: 25
+#                 131072: 687
+#   affine b_8    2048: 2136   3072: 1733
+#   mxfp8 b_8     7680: 3168
 #
-# DERIVED ON a host holding every snapshot the suite resolves by slug, with the
-# per-architecture `RMLX_TEST_MODEL_*` family unset, while thirteen
-# per-architecture cells still stood down for want of those variables.
-# `crates/rmlx-models/src/test_snapshot.rs` now resolves those cells by slug,
-# so a full host arms them and this pin is stale for them: the next full
-# `make ci-perf` reports `not pinned` and `count moved up` deltas (for example
-# a fourth Qwen3.5-MoE cell on the same `shared_expert_gate`, and a `b_2`
-# kernel from `Ternary-Bonsai-8B-mlx-2bit`'s unaligned N = 151669 `lm_head`
-# and `model.embed_tokens`) until the pin is derived again.
+# DERIVED ON a full `make gpu-test`, every diagnostic attributed to the test
+# libtest last announced, on a host holding every snapshot the suite resolves by
+# slug, with threadgroup-memory validation split per test
+# (`scripts/gpu_test_threadgroup.sh`) — every entry below comes from a test that
+# ran with it off. Two full runs, the second after the split was keyed on the
+# kernel a test names, attributed the same count to every entry. Fifteen cells
+# stood down for want of `RMLX_KV_TEST_MODEL`, `RMLX_VL_TEST_MODEL`,
+# `RMLX_PROMPT_CACHE_TEST_MODEL_A` or `RMLX_TEST_MODEL_JINA_V4`, and pin
+# nothing; a run that arms one of them reports its hits as deltas until the pin
+# is derived again. Totals: 8448 affine `b_4`, 3869 affine `b_8` and 3168
+# mxfp8 `b_8` in `rmlx-models`; 4 of each split-K and 4 conv in `rmlx-mlx`; 3
+# conv in `rmlx-audio`.
 #
-# Both of the fourth test's hybrids were present. On a host holding one of them,
-# that test still runs and the absent one's entry reports `no longer fires`:
-# the entry key has no room for which checkpoint produced the count, and a red
-# that names the missing model is the intended outcome there.
-affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 40 | rmlx-models | qwen3_5_moe_forward_seq_last_k_equals_reference | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
-affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 80 | rmlx-models | thinking_budget_exact_hit_qwen3_5_moe | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
-affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 40 | rmlx-models | qwen3_moe_golden_tokens_k8v8 | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
-affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 1014 | rmlx-models | a_round_tape_refolds_to_what_the_replay_produced | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
+# A test that sweeps two checkpoints carries one entry per instantiation. On a
+# host holding one of them, that test still runs and the absent one's entry
+# reports `no longer fires`: the entry key has no room for which checkpoint
+# produced the count, and a red that names the missing model is the intended
+# outcome there.
 affine_qmm_t_splitk_bfloat16_t_gs_64_b_4_alN_false | device load | 2496 | rmlx-models | a_round_tape_refolds_to_what_the_replay_produced | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_4_alN_false | device load | 192 | rmlx-models | dflash2_carried_projection_against_one_call_at_full_height | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_4_alN_false | device load | 1536 | rmlx-models | the_block_round_loop_reproduces_plain_greedy | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_4_alN_false | device load | 1536 | rmlx-models | the_block_round_loop_reproduces_plain_greedy_at_the_declared_block | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_4_alN_false | device load | 1344 | rmlx-models | the_recurrent_round_loop_reproduces_plain_greedy_at_the_declared_block | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_4_alN_false | device load | 1344 | rmlx-models | the_recurrent_round_loop_reproduces_plain_greedy_past_the_declared_block | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 1014 | rmlx-models | a_round_tape_refolds_to_what_the_replay_produced | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 78 | rmlx-models | dflash1_carried_projection_against_one_call_at_full_height | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 39 | rmlx-models | dflash_live_loop_emits_coherent | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 39 | rmlx-models | dflash_round0_first_token_aligns | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 80 | rmlx-models | eagle3_greedy_tracks_plain_greedy_for_a_long_prefix | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 120 | rmlx-models | hydrated_exact_block_no_tail_not_placeholder | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 80 | rmlx-models | hydrated_tail_k8v8_equivalence | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 120 | rmlx-models | hydrated_tail_produces_identical_output | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 399 | rmlx-models | qwen3_5_moe_consume_engine_migration_golden | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 40 | rmlx-models | qwen3_5_moe_forward_seq_last_k_equals_reference | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 40 | rmlx-models | qwen3_moe_golden_tokens_k8v8 | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 552 | rmlx-models | the_adaptive_round_loop_reproduces_plain_greedy | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 552 | rmlx-models | the_adaptive_round_loop_reproduces_plain_greedy_over_its_whole_schedule | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 636 | rmlx-models | the_restricted_vocab_round_loop_reproduces_plain_greedy | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 80 | rmlx-models | thinking_budget_exact_hit_qwen3_5_moe | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
+mxfp8_qmm_t_splitk_bfloat16_t_gs_32_b_8_alN_false | device load | 192 | rmlx-models | mtp_greedy_tracks_plain_greedy_for_a_long_prefix | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
+mxfp8_qmm_t_splitk_bfloat16_t_gs_32_b_8_alN_false | device load | 1344 | rmlx-models | the_recurrent_round_loop_reproduces_plain_greedy | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
+mxfp8_qmm_t_splitk_bfloat16_t_gs_32_b_8_alN_false | device load | 96 | rmlx-models | the_round_loop_runs_a_block_deeper_than_the_sidecar_declares | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
+mxfp8_qmm_t_splitk_bfloat16_t_gs_32_b_8_alN_false | device load | 1344 | rmlx-models | the_two_model_round_loop_reproduces_plain_greedy | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
+mxfp8_qmm_t_splitk_bfloat16_t_gs_32_b_8_alN_false | device load | 192 | rmlx-models | two_model_greedy_tracks_plain_greedy_for_a_long_prefix | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 4 | rmlx-mlx | split_k_tail_row_reads_never_reach_the_output | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_4_alN_false | device load | 4 | rmlx-mlx | split_k_tail_row_reads_never_reach_the_output | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
+mxfp8_qmm_t_splitk_bfloat16_t_gs_32_b_8_alN_false | device load | 4 | rmlx-mlx | split_k_tail_row_reads_never_reach_the_output | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
+implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s | device load | 4 | rmlx-mlx | implicit_gemm_conv_tail_channel_reads_never_reach_the_output | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
+implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s | device load | 3 | rmlx-audio | codec_decoder_debug | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562

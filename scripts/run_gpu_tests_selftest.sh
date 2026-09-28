@@ -53,7 +53,9 @@ STATUS=0
 REPORT=""
 MIX=""
 ARGV=""
+INVOCATIONS=""
 HALVES_OUT=""
+TG_OUT=""
 
 # new_case <name> — build a throwaway repo root: a copy of the runner, a stub
 # classifier reading this case's population, and a stub PATH. Sets CASE_ROOT.
@@ -92,6 +94,22 @@ STUB
 cat "${root}/halves"
 STUB
 
+    # The threadgroup setting of each classified test, stubbed the same way. A
+    # case that states no split gets every test `on`, so each crate runs once
+    # with its one canned log, as it did before the split existed; the cases
+    # under THE THREADGROUP SPLIT state their own rows, and one runs the real
+    # producer over a fixture tree.
+    cat >"${root}/scripts/gpu_test_threadgroup.sh" <<STUB
+#!/usr/bin/env bash
+if [ -f "${root}/tg" ]; then
+    cat "${root}/tg"
+    exit "\$(cat "${root}/tg.rc" 2>/dev/null || echo 0)"
+fi
+while IFS= read -r row; do
+    [ -n "\${row}" ] && printf 'on\t%s\n' "\${row}"
+done <"${root}/classified"
+STUB
+
     # The stub answers the shader validation canary so the detector's positive
     # control passes, and records its own argv. The runner reports a per-crate
     # count and no executed set, so with one crate declaring a cell in each half
@@ -110,6 +128,8 @@ prev=""
 for a in "\$@"; do
     [ "\$prev" = "-p" ] && crate="\$a"
     if [ "\$a" = "shader-validation-canary" ]; then
+        printf 'crate=canary tg=%s\n' "\${MTL_SHADER_VALIDATION_THREADGROUP_MEMORY-unset}" \
+            >>"${root}/invocations"
         echo 'Metal GPU Validation Enabled'
         echo 'Invalid device store at offset 4000068, executing kernel function: "custom_kernel_rmlx_canary_oob_store"'
         echo 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out'
@@ -117,12 +137,16 @@ for a in "\$@"; do
     fi
     prev="\$a"
 done
-if [ ! -f "${root}/logs/\${crate}.log" ]; then
+tg="\${MTL_SHADER_VALIDATION_THREADGROUP_MEMORY-unset}"
+printf 'crate=%s tg=%s args=%s\n' "\${crate}" "\${tg}" "\$*" >>"${root}/invocations"
+log="${root}/logs/\${crate}.tg\${tg}.log"
+[ -f "\${log}" ] || log="${root}/logs/\${crate}.log"
+if [ ! -f "\${log}" ]; then
     echo "stub cargo: no canned log for '\${crate}'" >&2
     exit 99
 fi
-cat "${root}/logs/\${crate}.log"
-exit "\$(cat "${root}/logs/\${crate}.rc" 2>/dev/null || echo 0)"
+cat "\${log}"
+exit "\$(cat "\${log%.log}.rc" 2>/dev/null || echo 0)"
 STUB
 
     chmod +x "${root}/bin/cargo" || return 1
@@ -224,10 +248,12 @@ run_case() {
     local root="$1"
     shift
     : >"${root}/cargo_argv"
+    : >"${root}/invocations"
     OUT="$(PATH="${root}/bin:${PATH}" env -u RMLX_SKIP_GPU \
         RMLX_O_MODELS_ROOT="${WORK}" bash "${root}/scripts/run_gpu_tests.sh" "$@" 2>&1)"
     STATUS=$?
     ARGV="$(cat "${root}/cargo_argv")"
+    INVOCATIONS="$(cat "${root}/invocations")"
     REPORT="$(printf '%s\n' "${OUT}" | awk '
         /^ERROR: Metal shader validation reported invalid memory access:/ { seen = 1 }
         /^ERROR: the shader-validation census does not match the pin:/ { seen = 1 }
@@ -300,6 +326,53 @@ expect_did_not_run() {
     case $'\n'"${ARGV}"$'\n' in
         *$'\n'"$1"$'\n'*) fail "the runner asked cargo to run: $1" ;;
     esac
+}
+
+# One whole cargo invocation, as the stub recorded it: the crate, the
+# threadgroup setting the test process saw, and every argument.
+expect_invocation() {
+    case $'\n'"${INVOCATIONS}"$'\n' in
+        *$'\n'"$1"$'\n'*) ;;
+        *) fail "no cargo invocation reads: $1" ;;
+    esac
+}
+
+expect_no_invocation_with() {
+    case "${INVOCATIONS}" in
+        *"$1"*) fail "a cargo invocation reads: $1" ;;
+    esac
+}
+
+# threadgroup_fixture_tree <dir> — a workspace carrying every member
+# `scripts/metal_dirs.sh` names, each with its gated `src/metal` directory, plus
+# one member that ships no MSL. The model layer holds one kernel dispatcher that
+# embeds a gated `.metal` file.
+threadgroup_fixture_tree() {
+    local tree="$1" member
+    mkdir -p "${tree}/crates/rmlx-models/tests" "${tree}/crates/rmlx-audio/src" || return 1
+    cat >"${tree}/Cargo.toml" <<'TOML'
+[workspace]
+members = [
+    "crates/rmlx-kv-quant",
+    "crates/rmlx-mlx",
+    "crates/rmlx-models",
+    "crates/rmlx-audio",
+]
+TOML
+    for member in rmlx-kv-quant rmlx-mlx rmlx-models rmlx-audio; do
+        mkdir -p "${tree}/crates/${member}/src" || return 1
+        printf '[package]\nname = "%s"\n\n[dependencies]\n' "${member}" \
+            >"${tree}/crates/${member}/Cargo.toml"
+    done
+    for member in rmlx-kv-quant rmlx-mlx rmlx-models; do
+        mkdir -p "${tree}/crates/${member}/src/metal" || return 1
+    done
+    printf 'kernel void k() {}\n' >"${tree}/crates/rmlx-models/src/metal/step.metal"
+    printf 'const SRC: &str = include_str!("metal/step.metal");\n\npub fn step_gpu() {\n    run(SRC);\n}\n' \
+        >"${tree}/crates/rmlx-models/src/step_msl.rs"
+    printf 'kernel void q() {}\n' >"${tree}/crates/rmlx-kv-quant/src/metal/codec.metal"
+    printf 'const SRC: &str = include_str!("metal/codec.metal");\n\npub fn codec_quantize_gpu() {\n    run(SRC);\n}\n' \
+        >"${tree}/crates/rmlx-kv-quant/src/codec_msl.rs"
 }
 
 # ---------------------------------------------------------------------------
@@ -1400,6 +1473,220 @@ expect_placed rest rmlx-models flag_parses
 expect_placed rest rmlx-models none_is_pinned
 
 # ---------------------------------------------------------------------------
+# THE THREADGROUP SPLIT
+#
+# Threadgroup-memory validation is on for the tests of rMLX's own kernels and
+# off for the rest, per `scripts/gpu_test_threadgroup.sh`. The split has two
+# ways to collapse — every test on, or every test off — and each reads as a
+# green run with a plausible count, so what these cases read is the setting
+# each cargo process actually saw, next to the names it was asked to run.
+
+# One crate with a test on each side runs twice, each run naming its own tests,
+# skipping the other side's, and carrying its own setting. A runner that set one
+# value for everything, or left it unset, or dropped the skips, fails here.
+new_case threadgroup_split_runs_each_test_under_its_setting || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_kernel
+classify "${CASE_ROOT}" rmlx-models models_kernel models_checkpoint
+cat >"${CASE_ROOT}/tg" <<'TG'
+on	rmlx-kv-quant	kv_kernel
+on	rmlx-models	models_kernel
+off	rmlx-models	models_checkpoint
+TG
+crate_log "${CASE_ROOT}" rmlx-kv-quant 0 <<'LOG'
+Metal GPU Validation Enabled
+running 1 test
+test kv::kernel ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+crate_log "${CASE_ROOT}" rmlx-models.tg1 0 <<'LOG'
+Metal GPU Validation Enabled
+running 1 test
+test models::kernel ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 1.00s
+LOG
+crate_log "${CASE_ROOT}" rmlx-models.tg0 0 <<'LOG'
+Metal GPU Validation Enabled
+running 1 test
+test models::checkpoint ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}"
+expect_status 0
+expect_invocation "crate=rmlx-kv-quant tg=1 args=test --no-fail-fast -p rmlx-kv-quant --tests -- --ignored --test-threads=1 --nocapture kv_kernel"
+expect_invocation "crate=rmlx-models tg=1 args=test --no-fail-fast -p rmlx-models --tests -- --ignored --test-threads=1 --nocapture models_kernel --skip models_checkpoint"
+expect_invocation "crate=rmlx-models tg=0 args=test --no-fail-fast -p rmlx-models --tests -- --ignored --test-threads=1 --nocapture models_checkpoint --skip models_kernel"
+expect_no_invocation_with "crate=rmlx-kv-quant tg=0"
+expect_no_invocation_with "tg=unset"
+# The positive control is an rMLX kernel too, and runs under the same setting.
+expect_invocation "crate=canary tg=1"
+expect_out "threadgroup validation ON (1):"
+expect_out "threadgroup validation OFF (1):"
+expect_out "OK: 3 GPU tests passed"
+expect_out "(threadgroup validation on for 2 test(s), off for 1)"
+
+# A classified test the producer gives no setting would run under whichever one
+# a default picked. It is a refusal naming the test, before anything runs.
+new_case threadgroup_test_with_no_setting_is_refused || exit 1
+classify "${CASE_ROOT}" rmlx-models models_kernel models_checkpoint
+printf 'on\trmlx-models\tmodels_kernel\n' >"${CASE_ROOT}/tg"
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_out "rmlx-models models_checkpoint: no threadgroup setting"
+expect_no_invocation_with "crate=rmlx-models"
+
+# The mirror: a row naming no classified test means the producer and the
+# classifier read different populations.
+new_case threadgroup_row_for_an_unclassified_test_is_refused || exit 1
+classify "${CASE_ROOT}" rmlx-models models_kernel
+printf 'on\trmlx-models\tmodels_kernel\noff\trmlx-models\tmodels_gone\n' >"${CASE_ROOT}/tg"
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_out "rmlx-models models_gone: has a threadgroup setting but is not a classified GPU test"
+expect_no_invocation_with "crate=rmlx-models"
+
+# One name declared in two files of one crate is one libtest filter; if the two
+# declarations disagree on the setting, no filter can run each under its own.
+new_case threadgroup_one_name_with_two_settings_is_refused || exit 1
+classify "${CASE_ROOT}" rmlx-models shared_name shared_name
+printf 'on\trmlx-models\tshared_name\noff\trmlx-models\tshared_name\n' >"${CASE_ROOT}/tg"
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_out "rmlx-models shared_name: declared twice with different settings"
+expect_no_invocation_with "crate=rmlx-models"
+
+# libtest's `--skip` is a substring match. A name inside a name of the other
+# setting in the same crate would make the shorter name's skip drop the longer
+# test from its own run, so the pair is refused before anything runs; the
+# same pair across two crates is not a collision.
+new_case threadgroup_substring_across_settings_is_refused || exit 1
+classify "${CASE_ROOT}" rmlx-models step step_long
+classify "${CASE_ROOT}" rmlx-mlx step_long
+printf 'on\trmlx-models\tstep\noff\trmlx-models\tstep_long\noff\trmlx-mlx\tstep_long\n' \
+    >"${CASE_ROOT}/tg"
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_out "rmlx-models step_long: contains step, a name of the other setting, whose --skip would drop it"
+expect_no_out "rmlx-mlx step_long: contains"
+expect_no_invocation_with "crate=rmlx-models"
+
+# The producer's own refusal stops the run and reaches the operator as itself.
+new_case threadgroup_producer_refusal_stops_the_run || exit 1
+classify "${CASE_ROOT}" rmlx-models models_kernel
+printf 'ERROR: the threadgroup split collapsed — 1 test(s) on, 0 off.\n' >"${CASE_ROOT}/tg"
+printf '2\n' >"${CASE_ROOT}/tg.rc"
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_out "the threadgroup-validation split could not be computed"
+expect_out "the threadgroup split collapsed — 1 test(s) on, 0 off."
+expect_no_invocation_with "crate=rmlx-models"
+
+# Uninstrumented, there is no setting to split on: one run per crate, the
+# variable absent, and the producer not consulted — its refusal here would block
+# a run that has no use for it.
+new_case threadgroup_uninstrumented_run_has_no_setting || exit 1
+classify "${CASE_ROOT}" rmlx-models models_kernel models_checkpoint
+printf 'ERROR: not consulted\n' >"${CASE_ROOT}/tg"
+printf '2\n' >"${CASE_ROOT}/tg.rc"
+crate_log "${CASE_ROOT}" rmlx-models 0 <<'LOG'
+running 2 tests
+test models::kernel ... ok
+test models::checkpoint ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}" --no-shader-validation
+expect_status 0
+expect_invocation "crate=rmlx-models tg=unset args=test --no-fail-fast -p rmlx-models --tests -- --ignored --test-threads=1 --nocapture models_checkpoint models_kernel"
+expect_no_out "threadgroup validation"
+
+# The rule reads the tree: a test is on when it names a fn of a source that
+# embeds a gated `.metal` — directly, or through a same-file helper — or when
+# its own file embeds one. Both directions are cells here: a test in a member
+# that ships MSL but dispatches only MLX's kernels is off, and a model-layer
+# test outside the dispatcher's own test file that names the dispatcher is on.
+# A source embedding a `.metal` from outside the gated directories, a
+# commented-out embedding, and an entry name in a comment or a string are not
+# reads of a kernel.
+new_case threadgroup_rule_is_read_from_the_tree || exit 1
+tree="${CASE_ROOT}/tree"
+threadgroup_fixture_tree "${tree}" || exit 1
+mkdir -p "${tree}/crates/rmlx-kv-quant/tests"
+gpu_fixture_test "${tree}/crates/rmlx-kv-quant/src/codec_msl_tests.rs" codec_decodes \
+    'codec_quantize_gpu();'
+cat >"${tree}/crates/rmlx-kv-quant/tests/dispatch.rs" <<'TEST'
+fn through_a_helper() {
+    rmlx_kv_quant::codec_msl::codec_quantize_gpu();
+}
+
+#[test]
+#[ignore = "GPU: needs the Metal context to itself"]
+fn dispatch_holds() {
+    let device = Device::Gpu;
+    let _ = device;
+    through_a_helper();
+}
+TEST
+gpu_fixture_test "${tree}/crates/rmlx-kv-quant/src/ring_tests.rs" ring_appends \
+    'let ring = mlx_concatenate(&a, &b);'
+gpu_fixture_test "${tree}/crates/rmlx-mlx/src/op_tests.rs" op_computes
+gpu_fixture_test "${tree}/crates/rmlx-models/src/step_msl_tests.rs" step_kernel_steps \
+    'step_gpu();'
+mkdir -p "${tree}/crates/rmlx-models/src/arch"
+gpu_fixture_test "${tree}/crates/rmlx-models/src/arch/tests.rs" arch_kernel_vs_reference \
+    'let y = crate::step_msl::step_gpu();'
+gpu_fixture_test "${tree}/crates/rmlx-models/src/inline_kernel_tests.rs" inline_kernel_runs \
+    'let s = include_str!("metal/step.metal");'
+mkdir -p "${tree}/crates/rmlx-models/src/shaders"
+printf 'kernel void k() {}\n' >"${tree}/crates/rmlx-models/src/shaders/free.metal"
+printf 'const SRC: &str = include_str!("shaders/free.metal");\n\npub fn free_gpu() {\n    run(SRC);\n}\n' \
+    >"${tree}/crates/rmlx-models/src/free_msl.rs"
+gpu_fixture_test "${tree}/crates/rmlx-models/src/free_msl_tests.rs" free_kernel_runs \
+    'free_gpu();'
+printf '// const SRC: &str = include_str!("metal/step.metal");\n\npub fn retired_gpu() {}\n' \
+    >"${tree}/crates/rmlx-models/src/retired_msl.rs"
+gpu_fixture_test "${tree}/crates/rmlx-models/src/retired_msl_tests.rs" retired_kernel_runs \
+    'retired_gpu();'
+gpu_fixture_test "${tree}/crates/rmlx-models/src/prose_tests.rs" prose_mentions_the_kernel \
+    'println!("step_gpu"); // step_gpu is not called here'
+gpu_fixture_test "${tree}/crates/rmlx-models/tests/pipeline.rs" pipeline_agrees
+gpu_fixture_test "${tree}/crates/rmlx-audio/src/asr_tests.rs" asr_transcribes
+TG_OUT="$(bash "${ROOT}/scripts/gpu_test_threadgroup.sh" --root "${tree}" 2>&1)"
+HALVES_OUT="${TG_OUT}"
+expect_placed on rmlx-kv-quant codec_decodes
+expect_placed on rmlx-kv-quant dispatch_holds
+expect_placed off rmlx-kv-quant ring_appends
+expect_placed off rmlx-mlx op_computes
+expect_placed on rmlx-models step_kernel_steps
+expect_placed on rmlx-models arch_kernel_vs_reference
+expect_placed on rmlx-models inline_kernel_runs
+expect_placed off rmlx-models free_kernel_runs
+expect_placed off rmlx-models retired_kernel_runs
+expect_placed off rmlx-models prose_mentions_the_kernel
+expect_placed off rmlx-models pipeline_agrees
+expect_placed off rmlx-audio asr_transcribes
+
+# Both collapses are refusals from the producer itself, each naming its counts:
+# a tree whose every test would run with the instrumentation, and one whose
+# every test would run without it.
+new_case threadgroup_collapse_is_refused_both_ways || exit 1
+tree="${CASE_ROOT}/all_on"
+threadgroup_fixture_tree "${tree}" || exit 1
+gpu_fixture_test "${tree}/crates/rmlx-kv-quant/src/codec_msl_tests.rs" codec_decodes \
+    'codec_quantize_gpu();'
+TG_OUT="$(bash "${ROOT}/scripts/gpu_test_threadgroup.sh" --root "${tree}" 2>&1)"
+STATUS=$?
+OUT="${TG_OUT}"
+expect_status 2
+expect_out "the threadgroup split collapsed — 1 test(s) on, 0 off."
+tree="${CASE_ROOT}/all_off"
+threadgroup_fixture_tree "${tree}" || exit 1
+gpu_fixture_test "${tree}/crates/rmlx-models/src/arch_tests.rs" arch_forwards
+TG_OUT="$(bash "${ROOT}/scripts/gpu_test_threadgroup.sh" --root "${tree}" 2>&1)"
+STATUS=$?
+OUT="${TG_OUT}"
+expect_status 2
+expect_out "the threadgroup split collapsed — 0 test(s) on, 1 off."
+
+# ---------------------------------------------------------------------------
 # The half's marker line. It is the split's ONE structural defence — a half
 # narrows the classified population in lockstep with the executed one, so no
 # check inside the runner can tell a half from a complete run, and what keeps a
@@ -1441,4 +1728,4 @@ if [ "${failures}" -ne 0 ]; then
     exit 1
 fi
 
-echo "run_gpu_tests_selftest: OK — every kind of red is reported, the access mix is the one observed, the census pin accepts only what it names, and each half runs its own tests against its own slice of that pin."
+echo "run_gpu_tests_selftest: OK — every kind of red is reported, the access mix is the one observed, the census pin accepts only what it names, each half runs its own tests against its own slice of that pin, and each test runs under its own threadgroup setting."
