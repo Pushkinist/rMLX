@@ -139,7 +139,7 @@ fn qwen36_snapshot_tools_supported() {
 /// entry (text path). Snapshot-gated `#[ignore]`; run with
 /// `cargo test -p rmlx-server medgemma_registers_as_gemma3 -- --ignored`.
 #[test]
-#[ignore]
+#[ignore = "needs the checkpoint RMLX_TEST_MODEL_MEDGEMMA names; run by hand with --ignored"]
 fn medgemma_registers_as_gemma3() {
     let Some(snap_buf) = std::env::var_os("RMLX_TEST_MODEL_MEDGEMMA").map(PathBuf::from) else {
         return;

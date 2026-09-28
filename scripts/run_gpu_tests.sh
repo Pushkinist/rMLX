@@ -90,6 +90,16 @@
 #   Validation costs throughput, so it belongs here and not in any cell whose
 #   numbers get recorded. Pass --no-shader-validation to opt out.
 #
+# THREADGROUP
+#   Threadgroup-memory instrumentation makes MLX's NAX kernels return wrong
+#   values at random in a checkpoint's forward, so a test over a checkpoint
+#   cannot be judged with it. `scripts/gpu_test_threadgroup.sh` sets it `on`
+#   for the tests of rMLX's own `.metal` kernels and `off` for the rest, and
+#   states the rule. Each crate runs once per setting, each run skipping the
+#   other setting's names; the report lists every test under the setting it ran
+#   with, the final line counts both, and a classified test the producer gives
+#   no setting is a refusal. Device-memory instrumentation is on for every test.
+#
 # THE CENSUS PIN
 #   A tree can carry a diagnostic from a kernel it does not own and cannot fix.
 #   Failing every run on it is the inverse of a vacuous gate: the exit code stops
@@ -218,12 +228,17 @@ fi
 
 # Pinned rather than inherited. Every one of these can silently disarm the
 # gate: DEFAULT_STATE=none skips instrumenting pipelines, DISABLE_PIPELINES
-# exempts named ones, GLOBAL_MEMORY=0 / THREADGROUP_MEMORY=0 drop the
-# instrumentation this gate is about, ENABLE_ERROR_REPORTING=0 detects and says
-# nothing, and REPORT_TO_STDERR defaults to 0 so reports land in Unified
-# Logging where nothing here reads them. FAIL_MODE=zerofill keeps the run alive
-# after the first hit (invalid writes are dropped), so one run reports every
-# offending kernel instead of the first. See `man MetalValidation`.
+# exempts named ones, GLOBAL_MEMORY=0 drops the device-memory instrumentation
+# this gate is about, ENABLE_ERROR_REPORTING=0 detects and says nothing, and
+# REPORT_TO_STDERR defaults to 0 so reports land in Unified Logging where
+# nothing here reads them. FAIL_MODE=zerofill keeps the run alive after the
+# first hit (invalid writes are dropped), so one run reports every offending
+# kernel instead of the first. See `man MetalValidation`.
+#
+# THREADGROUP_MEMORY is not in this list because it is set per test, from
+# `scripts/gpu_test_threadgroup.sh`: its instrumentation makes MLX's NAX
+# kernels return wrong values in a checkpoint's forward, so it is on for the
+# tests of rMLX's own kernels and off for the rest. See THREADGROUP below.
 #
 # Naming these is not enough on its own: `env NAME=VALUE` overrides exactly what
 # it names and passes the rest of the environment through, so any other MTL_*
@@ -236,10 +251,10 @@ mtl_validation_env=(
     MTL_SHADER_VALIDATION_DISABLE_PIPELINES=
     MTL_SHADER_VALIDATION_ENABLE_ERROR_REPORTING=1
     MTL_SHADER_VALIDATION_GLOBAL_MEMORY=1
-    MTL_SHADER_VALIDATION_THREADGROUP_MEMORY=1
     MTL_SHADER_VALIDATION_FAIL_MODE=zerofill
     MTL_SHADER_VALIDATION_REPORT_TO_STDERR=1
 )
+TG_VAR=MTL_SHADER_VALIDATION_THREADGROUP_MEMORY
 # Every inherited MTL_* name, as `-u NAME` pairs for `env`. Built once, before
 # any crate runs. It is non-empty in practice only when the caller has such
 # exports, so it is expanded alongside a non-empty array and never alone — an
@@ -329,7 +344,7 @@ trim() {
 # the caller exported no MTL_* names, and expanding an empty array is an
 # unbound-variable error under `set -u` on the bash 3.2 that `/usr/bin/env bash`
 # resolves to here — being adjacent to a non-empty array does not help.
-validation_prefix_canary=(env ${mtl_unset[@]+"${mtl_unset[@]}"} "${mtl_validation_env[@]}")
+validation_prefix_canary=(env ${mtl_unset[@]+"${mtl_unset[@]}"} "${mtl_validation_env[@]}" "${TG_VAR}=1")
 
 # Every classified test starts with `if skip_if_no_gpu_env() { return; }`, so
 # this variable turns the entire suite into no-ops that still report as passed.
@@ -431,6 +446,59 @@ if [ -n "${HALF}" ]; then
         echo "Every classified GPU test belongs to exactly one half, or it runs under" >&2
         echo "no gate. Fix scripts/gpu_test_halves.sh, or run the whole suite with no" >&2
         echo "--half. See docs/GPU_TESTS.md." >&2
+        exit 1
+    fi
+fi
+
+# The threadgroup setting of every classified test, from its one producer, on
+# every instrumented run. Coverage is checked both ways, as for the halves: a
+# classified test with no setting would run under whichever one a default
+# picked, and a row naming no classified test means the two populations drifted.
+tg_rows=""
+n_tg_on=0
+n_tg_off=0
+if [ "${SHADER_VALIDATION}" = "1" ] && [ "${BUILD_ONLY}" = "0" ]; then
+    if ! tg_out="$(bash "${REPO_ROOT}/scripts/gpu_test_threadgroup.sh" --root "${REPO_ROOT}" 2>&1)"; then
+        echo "ERROR: the threadgroup-validation split could not be computed:" >&2
+        printf '%s\n' "${tg_out}" >&2
+        exit 1
+    fi
+    tg_errors=""
+    while IFS=$'\t' read -r t_setting t_crate t_test; do
+        [ -z "${t_setting}" ] && continue
+        case "${t_setting}" in
+            on|off) ;;
+            *) tg_errors="${tg_errors}  ${t_crate} ${t_test}: setting '${t_setting}' is neither on nor off"$'\n'
+               continue ;;
+        esac
+        case $'\n'"${listing}"$'\n' in
+            *$'\n'"${t_crate}"$'\t'"${t_test}"$'\n'*) ;;
+            *) tg_errors="${tg_errors}  ${t_crate} ${t_test}: has a threadgroup setting but is not a classified GPU test"$'\n'
+               continue ;;
+        esac
+        # A name declared twice in one crate is one libtest filter, so its
+        # declarations must agree on the setting or no filter can separate them.
+        other_setting=on
+        [ "${t_setting}" = "on" ] && other_setting=off
+        case $'\n'"${tg_rows}" in
+            *$'\n'"${other_setting}"$'\t'"${t_crate}"$'\t'"${t_test}"$'\n'*)
+                tg_errors="${tg_errors}  ${t_crate} ${t_test}: declared twice with different settings, and one name filter selects both"$'\n'
+                continue ;;
+        esac
+        tg_rows="${tg_rows}${t_setting}"$'\t'"${t_crate}"$'\t'"${t_test}"$'\n'
+    done <<< "${tg_out}"
+    while IFS=$'\t' read -r c_crate c_test; do
+        [ -z "${c_crate}" ] && continue
+        [ "${c_test}" = "${CANARY_TEST}" ] && continue
+        case $'\n'"${tg_rows}" in
+            *$'\n'on$'\t'"${c_crate}"$'\t'"${c_test}"$'\n'*|*$'\n'off$'\t'"${c_crate}"$'\t'"${c_test}"$'\n'*) ;;
+            *) tg_errors="${tg_errors}  ${c_crate} ${c_test}: no threadgroup setting"$'\n' ;;
+        esac
+    done <<< "${listing}"
+    if [ -n "${tg_errors}" ]; then
+        echo "ERROR: the threadgroup split and the classification do not cover each other:" >&2
+        printf '%s' "${tg_errors}" >&2
+        echo "Fix scripts/gpu_test_threadgroup.sh. See docs/GPU_TESTS.md." >&2
         exit 1
     fi
 fi
@@ -558,50 +626,121 @@ for crate in "${crates[@]}"; do
     # accept two of the three vanishing. The filter LIST is deduped, since
     # passing one substring twice selects nothing extra.
     classified=0
-    filters=()
     while IFS=$'\t' read -r c fn_name; do
         [ "$c" = "${crate}" ] || continue
         classified=$((classified + 1))
     done <<< "${selected}"
-    while IFS= read -r fn_name; do
-        [ -n "${fn_name}" ] && filters+=("${fn_name}")
-    done < <(printf '%s' "${selected}" | awk -F'\t' -v c="${crate}" '$1 == c {print $2}' | sort -u)
     echo "── ${crate} (${classified} GPU tests) ──────────────────────────"
-    # The names, not just the count. A per-crate count says nothing about WHICH
-    # cells a narrowed run asked for, and with one crate declaring a cell in
-    # each half the two halves print the same count.
-    [ ${#filters[@]} -gt 0 ] && printf '    %s\n' "${filters[@]}"
 
     log="$(mktemp "${TMPDIR:-/tmp}/rmlx-gpu-test-${crate}.XXXXXX")"
-    # `--tests` selects every target with `test = true` — the lib's unit tests,
-    # each bin's unit tests, and the `tests/*.rs` integration binaries. That is
-    # exactly the set the classifier scans, so the runner cannot be pointed at
-    # more or less than the rule covers. It is also the only spelling that gets
-    # all three without breaking:
-    #   * `--lib` hard-errors with "no library targets found in package" on a
-    #     bin-only member such as rmlx-cli, which the classifier does scan.
-    #   * `--all-targets` drags in benches, and criterion harnesses reject
-    #     `--ignored` outright ("error: unexpected argument found").
-    #   * doc-tests stay out either way, deliberately: `--ignored` makes rustdoc
-    #     compile ```ignore blocks, which are prose, not tests.
-    #
-    # Names come from the classifier as bare fn identifiers, while libtest
-    # matches against the full `module::path::fn` — so these are substring
-    # filters, not `--exact`. Over-matching a sibling is harmless (it runs one
-    # extra test); under-matching is what the coverage check below catches.
-    #
-    # `--no-fail-fast` is load-bearing for that check: without it cargo stops
-    # after the first test binary that fails, so every later binary in the crate
-    # silently never runs and the coverage shortfall reports as "a filter
-    # stopped matching" when the real cause was an earlier failure.
-    # `--nocapture` because this gate reads the tests' own words. libtest
-    # discards a passing test's output, and a model-gated cell that skips is a
-    # passing test — so without it the `SKIP <name>:` notice the census
-    # expectation is built from never reaches the log, and every skipped cell
-    # would look like one that ran and found nothing.
-    "${validation_prefix[@]}" cargo test --no-fail-fast -p "${crate}" --tests -- \
-        --ignored --test-threads=1 --nocapture "${filters[@]}" 2>&1 | tee "${log}"
-    rc=${PIPESTATUS[0]}
+    rc=0
+    # One cargo run per threadgroup setting, each naming its own tests and
+    # skipping the other setting's, so no test runs under both. Uninstrumented,
+    # there is one run and no setting.
+    settings=(none)
+    [ "${SHADER_VALIDATION}" = "1" ] && settings=(on off)
+    for setting in "${settings[@]}"; do
+        group_classified=0
+        group_names=""
+        filters=()
+        skips=()
+        while IFS=$'\t' read -r c fn_name; do
+            [ "$c" = "${crate}" ] || continue
+            if [ "${setting}" != "none" ]; then
+                case $'\n'"${tg_rows}" in
+                    *$'\n'"${setting}"$'\t'"${crate}"$'\t'"${fn_name}"$'\n'*) ;;
+                    *) continue ;;
+                esac
+            fi
+            group_classified=$((group_classified + 1))
+            group_names="${group_names}${fn_name}"$'\n'
+        done <<< "${selected}"
+        [ "${group_classified}" -eq 0 ] && continue
+        while IFS= read -r fn_name; do
+            [ -n "${fn_name}" ] && filters+=("${fn_name}")
+        done < <(printf '%s' "${group_names}" | sort -u)
+        if [ "${setting}" != "none" ]; then
+            while IFS=$'\t' read -r s c fn_name; do
+                [ "$c" = "${crate}" ] && [ "$s" != "${setting}" ] && [ -n "${fn_name}" ] &&
+                    skips+=(--skip "${fn_name}")
+            done <<< "${tg_rows}"
+        fi
+        group_prefix=("${validation_prefix[@]}")
+        tg_label=""
+        case "${setting}" in
+            on)  group_prefix+=("${TG_VAR}=1"); tg_label="threadgroup validation ON"
+                 n_tg_on=$((n_tg_on + group_classified)) ;;
+            off) group_prefix+=("${TG_VAR}=0"); tg_label="threadgroup validation OFF"
+                 n_tg_off=$((n_tg_off + group_classified)) ;;
+        esac
+        # The names, not just the count. A per-crate count says nothing about WHICH
+        # cells a narrowed run asked for, and with one crate declaring a cell in
+        # each half the two halves print the same count. Under validation the
+        # setting heads its own names, so the report says which tests ran with it.
+        [ -n "${tg_label}" ] && echo "  ${tg_label} (${group_classified}):"
+        printf '    %s\n' "${filters[@]}"
+
+        group_log="$(mktemp "${TMPDIR:-/tmp}/rmlx-gpu-test-${crate}-${setting}.XXXXXX")"
+        # `--tests` selects every target with `test = true` — the lib's unit tests,
+        # each bin's unit tests, and the `tests/*.rs` integration binaries. That is
+        # exactly the set the classifier scans, so the runner cannot be pointed at
+        # more or less than the rule covers. It is also the only spelling that gets
+        # all three without breaking:
+        #   * `--lib` hard-errors with "no library targets found in package" on a
+        #     bin-only member such as rmlx-cli, which the classifier does scan.
+        #   * `--all-targets` drags in benches, and criterion harnesses reject
+        #     `--ignored` outright ("error: unexpected argument found").
+        #   * doc-tests stay out either way, deliberately: `--ignored` makes rustdoc
+        #     compile ```ignore blocks, which are prose, not tests.
+        #
+        # Names come from the classifier as bare fn identifiers, while libtest
+        # matches against the full `module::path::fn` — so these are substring
+        # filters, not `--exact`. Over-matching a sibling is harmless (it runs one
+        # extra test); under-matching is what the coverage check below catches.
+        #
+        # `--no-fail-fast` is load-bearing for that check: without it cargo stops
+        # after the first test binary that fails, so every later binary in the crate
+        # silently never runs and the coverage shortfall reports as "a filter
+        # stopped matching" when the real cause was an earlier failure.
+        # `--nocapture` because this gate reads the tests' own words. libtest
+        # discards a passing test's output, and a model-gated cell that skips is a
+        # passing test — so without it the `SKIP <name>:` notice the census
+        # expectation is built from never reaches the log, and every skipped cell
+        # would look like one that ran and found nothing.
+        "${group_prefix[@]}" cargo test --no-fail-fast -p "${crate}" --tests -- \
+            --ignored --test-threads=1 --nocapture "${filters[@]}" \
+            ${skips[@]+"${skips[@]}"} 2>&1 | tee "${group_log}"
+        group_rc=${PIPESTATUS[0]}
+        [ "${group_rc}" -ne 0 ] && rc="${group_rc}"
+        group_executed="$(awk '
+            /^test result:/ {
+                for (i = 1; i <= NF; i++) {
+                    if ($(i+1) ~ /^passed/ || $(i+1) ~ /^failed/) { n += $i }
+                }
+            }
+            END { printf "%d", n }
+        ' "${group_log}")"
+        cat "${group_log}" >>"${log}"
+        rm -f "${group_log}"
+
+        # Coverage check: every classified test must have actually run. A shortfall
+        # means a filter stopped matching — a renamed fn, a target that is no longer
+        # built, a test compiled out behind a feature, or a name the other
+        # setting's skip list also matches — which is silence, not success.
+        # Over-matching inflates the count and is harmless, so this is a one-sided
+        # `-lt`. Per setting, so one setting's over-match cannot cover the other's
+        # shortfall.
+        #
+        # It records and falls through rather than skipping the rest of the crate: a
+        # test binary that aborts produces both a shortfall and a non-zero exit, and
+        # reporting only the shortfall sends the reader after a renamed fn instead of
+        # the test that took the binary down.
+        if [ "${group_executed}" -lt "${group_classified}" ]; then
+            echo "ERROR: ${crate} classified ${group_classified} GPU tests${tg_label:+ (${tg_label})} but executed ${group_executed} — a filter stopped matching." >&2
+            failed_crates="${failed_crates}  ${crate}: under-matched (${group_executed}/${group_classified} executed)${tg_label:+ with ${tg_label}}"$'\n'
+        fi
+    done
+
     if grep -Eq "${COMPILED_LINE}" "${log}"; then
         failed_crates="${failed_crates}  ${crate}: compiled under the Metal claim (run --build first)"$'\n'
     fi
@@ -715,21 +854,6 @@ for crate in "${crates[@]}"; do
     total_passed=$((total_passed + crate_passed))
     total_failed=$((total_failed + crate_failed))
     executed=$((crate_passed + crate_failed))
-
-    # Coverage check: every classified test must have actually run. A shortfall
-    # means a filter stopped matching — a renamed fn, a target that is no longer
-    # built, a test compiled out behind a feature — which is silence, not
-    # success. Over-matching inflates `executed` and is harmless, so this is a
-    # one-sided `-lt`.
-    #
-    # It records and falls through rather than skipping the rest of the crate: a
-    # test binary that aborts produces both a shortfall and a non-zero exit, and
-    # reporting only the shortfall sends the reader after a renamed fn instead of
-    # the test that took the binary down.
-    if [ "${executed}" -lt "${classified}" ]; then
-        echo "ERROR: ${crate} classified ${classified} GPU tests but executed ${executed} — a filter stopped matching." >&2
-        failed_crates="${failed_crates}  ${crate}: under-matched (${executed}/${classified} executed)"$'\n'
-    fi
 
     # Per crate, matching the coverage check's granularity: a single global OR
     # would let one crate's banner vouch for a crate whose tests all returned
@@ -1001,12 +1125,13 @@ fi
 if [ "${n_stood_down}" -gt 0 ] || [ "${n_unattributed}" -gt 0 ]; then
     incomplete="${incomplete} — INCOMPLETE: ${n_stood_down} selected GPU test(s) stood down and $((n_unattributed)) further notice(s) named no test; they asserted nothing (listed above)"
 fi
+tg_note=" (threadgroup validation on for ${n_tg_on} test(s), off for ${n_tg_off})"
 if [ "${SHADER_VALIDATION}" = "1" ] && [ -n "${census_notes}" ]; then
-    echo "OK: ${total_passed} GPU tests passed across ${#crates[@]} workspace member(s)${HALF_NOTE}, shader-validation census NOT enforced in full (see above).${incomplete}"
+    echo "OK: ${total_passed} GPU tests passed across ${#crates[@]} workspace member(s)${HALF_NOTE}, shader-validation census NOT enforced in full (see above)${tg_note}.${incomplete}"
 elif [ "${SHADER_VALIDATION}" = "1" ] && [ -n "${census_accepted}" ]; then
-    echo "OK: ${total_passed} GPU tests passed across ${#crates[@]} workspace member(s)${HALF_NOTE}, shader validation matches the pinned census.${incomplete}"
+    echo "OK: ${total_passed} GPU tests passed across ${#crates[@]} workspace member(s)${HALF_NOTE}, shader validation matches the pinned census${tg_note}.${incomplete}"
 elif [ "${SHADER_VALIDATION}" = "1" ]; then
-    echo "OK: ${total_passed} GPU tests passed across ${#crates[@]} workspace member(s)${HALF_NOTE}, shader validation clean.${incomplete}"
+    echo "OK: ${total_passed} GPU tests passed across ${#crates[@]} workspace member(s)${HALF_NOTE}, shader validation clean${tg_note}.${incomplete}"
 else
     echo "OK: ${total_passed} GPU tests passed across ${#crates[@]} workspace member(s)${HALF_NOTE} (uninstrumented).${incomplete}"
 fi

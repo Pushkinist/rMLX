@@ -77,6 +77,22 @@ dispositions is recorded:
 This one check reads the ignore reason's wording. A Metal-driving test whose
 reason never says "Metal" or "GPU" is invisible to it.
 
+### A reasonless `#[ignore]` on an environment-gated test is fatal
+
+A bare `#[ignore]` on a test whose body reads an environment variable
+(`env::var`, `env::var_os`) and reaches no `Device::Gpu` runs under no gate
+either, and has no reason for the check above to read. The gate fails it until
+one of three dispositions is recorded:
+
+1. It drives Metal: pass `Device::Gpu`, so `make gpu-test` lists it and its
+   named `SKIP` is reported when the variable is unset.
+2. It stands down on its own: drop the `#[ignore]`.
+3. It is ignored for a reason: write the reason.
+
+A bare `#[ignore]` on a test that reads no variable, or reads one only through a
+helper, is outside this check. The fixtures `ignore_bare_env_gated` and
+`ignore_bare_env_gated_dispositioned` pin both directions.
+
 ### Declaring a Metal route the scanner cannot follow
 
 ```rust
@@ -353,10 +369,11 @@ Invalid device store at offset 4000064, executing kernel function: "custom_kerne
 - **The exit code is not the signal.** With validation on, cargo still exits 0.
   The runner scans the text, anywhere on a line: the layer writes while libtest
   is mid-line.
-- **The runner owns the environment.** It pins every
-  `MTL_SHADER_VALIDATION_*` knob it relies on, `REPORT_TO_STDERR=1` included;
-  that one defaults to 0 and sends reports to Unified Logging
-  (`man MetalValidation`).
+- **The runner owns the environment.** It clears every inherited `MTL_*`
+  variable and pins every `MTL_SHADER_VALIDATION_*` knob it relies on,
+  `REPORT_TO_STDERR=1` included; that one defaults to 0 and sends reports to
+  Unified Logging (`man MetalValidation`).
+- **Threadgroup-memory validation is set per test.** See below.
 - **The banner is asserted per crate.** A crate that never printed
   `Metal GPU Validation Enabled` ran uninstrumented and fails. This usually
   means it did not build. The one exception is a crate whose every executed
@@ -374,9 +391,58 @@ Invalid device store at offset 4000064, executing kernel function: "custom_kerne
 MLX owns the allocator and reports buffers as `<unnamed>`. The kernel function
 name, `custom_kernel_` plus the rMLX kernel name, is the attribution.
 
+### Threadgroup-memory validation: on for rMLX's kernels, off for checkpoints
+
+`MTL_SHADER_VALIDATION_THREADGROUP_MEMORY=1` changes what MLX's NAX kernels
+compute. Measured on this suite's cells:
+
+- The routed-expert `gather_qmm` (`affine_gather_qmm_rhs_nax`) of a Qwen3.6 MoE
+  prefill returned a different wrong value on 11 of 60 repeats. Unvalidated,
+  and validated with only the threadgroup instrumentation off, it returned the
+  same value every time. The greedy spec pair on the 4k prompt diverged under
+  full validation for this reason alone.
+- The f32 `affine_qmm_t_nax` of a PARO forward reported device loads at
+  addresses no index in the kernel can form, at counts that change per run, and
+  returned wrong output on the repeats that reported. With the threadgroup
+  instrumentation off it reported nothing and matched the unvalidated output.
+
+Device-memory validation is unaffected: the split-K hits are reported at the
+same count either way. So a test that runs a checkpoint cannot be judged with
+threadgroup validation on, and a test of rMLX's own `.metal` kernels, which this
+repo can get wrong in threadgroup memory, loses coverage without it.
+
+`scripts/gpu_test_threadgroup.sh` is the one producer of the split. A classified
+test runs with threadgroup validation on when its declaring file is under a
+member that owns a gated `.metal` directory (`scripts/metal_dirs.sh`) and either
+that member is not the model layer, or the file is the test file of a source
+that embeds a gated `.metal` — itself, or the `<name>.rs` beside
+`<name>_tests.rs`. Every other test runs with it off. On is `rmlx-kv-quant`,
+`rmlx-mlx`, and the gated-delta and PARO kernel tests in `rmlx-models`.
+
+- The runner runs each crate once per setting. Each run names its own tests and
+  skips the other setting's, so no test runs under both.
+- The report lists each crate's tests under `threadgroup validation ON (n):` or
+  `OFF (n):`, and the final line counts both.
+- A classified test with no setting, a setting for a test that is not
+  classified, and one name declared twice in a crate with two settings are
+  refusals. So is a split with either side empty, from the producer.
+- The canary runs with it on.
+
+What the rule cannot see: a test below the model layer that loads a checkpoint
+runs with it on, and a test of a model-layer kernel that is not its
+dispatcher's test file runs with it off. `rmlx-kv-ssd` owns no `.metal`
+directory, so its tests run with it off although they dispatch
+`rmlx-kv-quant` kernels; those kernels keep the coverage through
+`rmlx-kv-quant`'s own tests.
+
+`make gpu-runner-selftest` holds the split: the setting each cargo process saw,
+beside the names it was asked to run, for a crate with a test on each side; each
+refusal; and the real producer over a fixture tree, placing each shape and
+refusing both collapses.
+
 Validation costs throughput, so it stays on this target and off every cell
 whose numbers are recorded. `VALIDATE=0` opts out. Never draw a conclusion
-about model output from a run under Metal shader validation.
+about model output from a run with threadgroup-memory validation on (below).
 
 A diagnostic names a *load* or a *store*. A store is a dropped write; a load
 matters only if the kernel keeps the lanes it filled. The failure banner

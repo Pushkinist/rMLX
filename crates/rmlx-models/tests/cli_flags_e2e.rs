@@ -38,7 +38,7 @@
 )]
 
 /// E2E #1: cross-namespace SSD eviction at the global ceiling.
-#[ignore]
+#[ignore = "placeholder: panics when RMLX_KV_TEST_MODEL is set; the resolver is unit-tested"]
 #[test]
 fn ssd_global_ceiling_evicts_across_namespaces() {
     let Ok(_model) = std::env::var("RMLX_KV_TEST_MODEL") else {
@@ -52,7 +52,7 @@ fn ssd_global_ceiling_evicts_across_namespaces() {
 }
 
 /// E2E #2: CLI `--prompt-cache-ram-gb` overrides env.
-#[ignore]
+#[ignore = "placeholder: panics when RMLX_KV_TEST_MODEL is set; the resolver is unit-tested"]
 #[test]
 fn ram_cap_cli_overrides_env() {
     let Ok(_model) = std::env::var("RMLX_KV_TEST_MODEL") else {
@@ -67,7 +67,7 @@ fn ram_cap_cli_overrides_env() {
 }
 
 /// E2E #3: `--paged-kv` flag routes to `KvStorage::Paged`.
-#[ignore]
+#[ignore = "placeholder: panics when RMLX_KV_TEST_MODEL is set; the resolver is unit-tested"]
 #[test]
 fn paged_kv_cli_flag_routes_correctly() {
     let Ok(_model) = std::env::var("RMLX_KV_TEST_MODEL") else {

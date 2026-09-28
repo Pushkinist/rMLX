@@ -158,6 +158,14 @@
 # and the consequence is that a Metal-driving test whose ignore text never says
 # "Metal" or "GPU" is invisible to it.
 #
+# A REASONLESS `#[ignore]` ON AN ENVIRONMENT-GATED TEST is fatal for the same
+# reason: a test that reads an environment variable, reaches no `Device::Gpu`
+# and carries a bare `#[ignore]` runs under no gate, and the rule above reads
+# the reason text, which it does not have. Its dispositions: pass
+# `Device::Gpu` so the GPU suite lists it, drop the `#[ignore]` so the default
+# gate runs it, or write the reason. A bare `#[ignore]` on a test that reads no
+# variable, or reads one only in a helper, is outside it.
+#
 # DECLARED METAL ROUTE (`// gpu-test-gate: metal-unscanned`)
 #   The inverse of the exemption below: a line-leading marker in the fn's own
 #   attribute block declaring that the test DOES drive Metal, by a route no
@@ -901,6 +909,13 @@ read -r -d '' AWK_DETECT <<'AWK' || true
              && attrs_of[g] ~ /#\[ignore[^]]*([Mm]etal|GPU)/) {
                 printf "W  %s: %s\n", file_of[g], label_of[g]
             }
+            # The same place with no words on it: a reasonless `#[ignore]` on
+            # an environment-gated test no device is reachable from. The rule
+            # above reads the reason, so an empty one is invisible to it.
+            if (!gpu[g] && !declared && attrs_of[g] ~ /#\[ignore\]/ \
+             && body_of[g] ~ /env::var(_os)?[[:space:]]*\(/) {
+                printf "R  %s: %s\n", file_of[g], label_of[g]
+            }
         }
     }
 AWK
@@ -912,6 +927,7 @@ AWK
 total_files=0
 violations=""
 warnings=""
+unreasoned=""
 gpu_tests=""
 unreadable=""
 macro_generated=""
@@ -969,6 +985,7 @@ for crate in "${members[@]}"; do
         case "$line" in
             "V  "*) violations="${violations}  ${line#V  }"$'\n' ;;
             "W  "*) warnings="${warnings}  ${line#W  }"$'\n' ;;
+            "R  "*) unreasoned="${unreasoned}  ${line#R  }"$'\n' ;;
             "U  "*) unreadable="${unreadable}  ${line#U  }"$'\n' ;;
             "S  "*) macro_generated="${macro_generated}  ${line#S  }"$'\n' ;;
             "N  "*) declared_unscanned="${declared_unscanned}  ${line#N  }"$'\n' ;;
@@ -1036,6 +1053,27 @@ if [ -n "$warnings" ]; then
     echo "    so it runs in the default gate again." >&2
     echo "  * it is ignored for some other reason — say THAT reason in the #[ignore]" >&2
     echo "    text instead of claiming Metal." >&2
+    echo >&2
+    echo "See docs/GPU_TESTS.md." >&2
+    exit 1
+fi
+
+# The reasonless twin of the rule above, fatal in both modes for the same
+# reason: a bare `#[ignore]` on a test that reads an environment variable and
+# reaches no `Device::Gpu` is skipped by `make test` and never listed for
+# `make gpu-test`, and with no reason text the rule above cannot see it.
+if [ -n "$unreasoned" ]; then
+    echo "ERROR: #[ignore] with no reason on an environment-gated test that reaches" >&2
+    echo "       no Device::Gpu:" >&2
+    printf '%s' "$unreasoned" >&2
+    echo >&2
+    echo "Each of these runs under NO gate: \`make test\` skips it (it is ignored)" >&2
+    echo "and \`make gpu-test\` skips it (it is not classified). Pick the true one:" >&2
+    echo >&2
+    echo "  * it drives Metal — pass Device::Gpu, so the GPU suite lists and runs it." >&2
+    echo "  * it stands down on its own when the variable is unset — drop the" >&2
+    echo "    #[ignore], so it runs in the default gate." >&2
+    echo "  * it is ignored for a reason — write that reason in the #[ignore]." >&2
     echo >&2
     echo "See docs/GPU_TESTS.md." >&2
     exit 1

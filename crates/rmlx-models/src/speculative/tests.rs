@@ -100,7 +100,7 @@ fn load_speculative_rejects_one_snapshot_on_both_sides() {
 /// the verifier only, so a verifier-only dispatcher is the right shape.
 /// Only checks shape `[1, K, vocab]`.
 #[test]
-#[ignore]
+#[ignore = "needs the checkpoint RMLX_TEST_MODEL_GEMMA4_E2B names; run by hand with --ignored"]
 #[allow(
     clippy::expect_used,
     reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"

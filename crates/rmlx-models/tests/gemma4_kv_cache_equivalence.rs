@@ -56,7 +56,7 @@ fn kv_cache_k8v4_prefill_decode_sane() {
     use rmlx_mlx::Device;
     use rmlx_models::gemma4;
 
-    let device = Device::Cpu;
+    let device = Device::Gpu;
     let model = gemma4::load_from_path(&model_path).expect("load model");
     let n_layers = model.cfg.num_hidden_layers;
 
