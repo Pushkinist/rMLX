@@ -53,12 +53,12 @@ fn tcq_v3_cosine_gate() {
     );
 }
 
-// ── Quality gate: TCQ ≥ turbo3 on a non-Gaussian fixture ─────────────────────
+// ── Quality gate: TCQ >= turbo3 on a non-Gaussian fixture ────────────────────
 //
-// The load-bearing test: prove Viterbi assignment actually helps over
-// nearest-centroid on data with structure the codebook does not match. We use
-// a sinusoidal sweep across the dim axis — strongly inter-element-correlated
-// values that nearest-centroid cannot exploit.
+// The load-bearing test: TCQ's trellis never forbids a centroid at any
+// position, so its Viterbi search always agrees with plain nearest-centroid
+// assignment — this asserts `>=`, never a strict win. We use a sinusoidal
+// sweep across the dim axis as the fixture.
 
 #[allow(
     clippy::suboptimal_flops,

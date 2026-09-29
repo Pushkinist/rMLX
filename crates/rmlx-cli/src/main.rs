@@ -823,7 +823,8 @@ enum Cmd {
         adaptive_admission: bool,
         /// End-to-end step SLA target in milliseconds for the adaptive controller.
         ///
-        /// This is the admission→final-token wall-clock target (not TTFT per se).
+        /// Read only with `--adaptive-admission`; without it the value is
+        /// ignored. This is the admission→final-token wall-clock target (not TTFT per se).
         /// Anticipatory 503 fires when `est_step > 2 × step_target`. Default 500 ms.
         /// `--ttft-target-ms` is accepted as a hidden alias for backward compatibility.
         #[arg(

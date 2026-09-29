@@ -744,7 +744,9 @@ pub fn decompose_auto(kq: KvQuant) -> (CacheType, CacheType) {
             CacheType::RotK,
             affine_to_cache_type(v_bits, v_group_size as usize),
         ),
-        // K8VTurbo3 — auto default for Gemma4 small.
+        // K8VTurbo3. `auto` is bf16 on every arch since #425 — this is not
+        // an auto default anywhere; reachable only via an explicit
+        // --kv-quant/--kv-preset or --ctk/--ctv override.
         // Decomposes to (Q8G128, Tq3). No dedicated CacheType::Tq3 variant exists yet;
         // per-side --ctk/--ctv overrides that hit this arm fall back to the Mixed{v_bits:3}
         // affine path (Q8G128, Q3G64) rather than K8VTurbo3 — acceptable because the

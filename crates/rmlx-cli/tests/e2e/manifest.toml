@@ -1203,8 +1203,11 @@ tags = ["run2d", "gemma4", "swa"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Speculative decoding (LIVE). Real drafter + verifier; the round-loop
-# must FIRE (accept_rate > 0 in the `<kind>_generate: done` jsonl summary)
-# AND the output must stay coherent. Verifier = Qwen3.6-35B-A3B-8bit (alias
+# must FIRE (accept_rate > 0 in the round-loop's jsonl summary) AND the
+# output must stay coherent. `scrape_spec_accept` matches a `_generate: done`
+# suffix, which the two two-model rows below never emit (their event ends
+# `_cached: done`) — those two rows cannot fail on accept_rate, only on
+# coherence. Verifier = Qwen3.6-35B-A3B-8bit (alias
 # QWEN36). Drafters carry their snapshot slug directly in `draft_model` (resolved
 # under RMLX_O_MODELS_ROOT). SKIP (clear reason) when a drafter snapshot absent.
 # Supersedes the declarative `p2_speculative_decode` phase2 stub.

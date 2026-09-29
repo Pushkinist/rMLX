@@ -19,8 +19,10 @@
 #                          family on a stack that does not share K/V, and does
 #                          not.) Do not classify a codec by this column.
 #
-# `kv_cache_bytes` and the id digest are the deciding columns: a codec whose
-# bytes and ids both equal `none`'s is doing nothing a caller can observe.
+# `KvQuant::decode_reads_packed_store` decides a codec's class
+# (`docs/KV_QUANT.md` § "Codec disposition"); `kv_cache_bytes` and the id
+# digest are corroborating evidence, not the decider. A codec whose bytes and
+# ids both equal `none`'s is doing nothing a caller can observe here.
 #
 # `ttft_ms`, `decode_tps` and `prefill_tps` are recorded for context only and
 # are NOT comparable across rows: these are single unpaired runs on a shared
@@ -78,8 +80,9 @@ MAX_TOKENS=100
 MAX_CTX=""
 KV_BOUNDARY=""
 
-# Every `KvQuant` the enum can spell, one representative per parameterised
-# family. Kept in the order of `ALL_KV_QUANTS` so a reader can diff the two.
+# One representative per parameterised family. Not every `KvQuant` the enum
+# can spell (`ALL_KV_QUANTS` holds 28; this list holds 27 and has no
+# `rotor_k_3_asym_*` entry), and not in `ALL_KV_QUANTS`'s order.
 CODECS_DEFAULT=(
 	none
 	k8v8 k8v4 planar planar3 planar_k

@@ -483,9 +483,10 @@ impl KvStorage {
     pub fn new(quant: KvQuant) -> Self {
         use crate::paged::paged_kv_enabled;
 
-        // When paged KV is enabled (--paged-kv), route K8V4 / K8V8 / Planar to
-        // the block-table paged path. None and Mixed stay on their existing paths (bf16
-        // buffers / mx.quantize 3-tuples) — paging does not apply to them.
+        // When paged KV is enabled (--paged-kv), route K8V4 / K8V8 / Planar /
+        // Planar3 to the block-table paged path. None and Mixed stay on their
+        // existing paths (bf16 buffers / mx.quantize 3-tuples) — paging does
+        // not apply to them.
         if paged_kv_enabled() {
             match quant {
                 KvQuant::K8V4 | KvQuant::K8V8 | KvQuant::Planar | KvQuant::Planar3 => {

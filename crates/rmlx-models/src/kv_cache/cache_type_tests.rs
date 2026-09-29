@@ -1487,7 +1487,8 @@ fn validate_resolved_non_moe_rotor_k_side_passes() {
 /// the declared name instead of the resolved one is a correctness bug, not a
 /// labelling nit. The seam that feeds the resolved name in
 /// (`Architecture::generate_greedy`) can only be exercised with a real
-/// snapshot; see `tests/resolved_arch_class.rs` and docs/TESTING.md.
+/// snapshot. `tests/resolved_arch_class.rs` calls `validate_kv_quant`
+/// directly, not `generate_greedy`; see docs/TESTING.md.
 #[test]
 #[allow(
     clippy::unwrap_used,

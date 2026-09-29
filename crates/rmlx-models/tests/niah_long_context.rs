@@ -933,8 +933,9 @@ niah_cell!(
 //   `KvCache::update_and_sdpa` → `sdpa_dispatch` → `update_and_sdpa_planar_k_fused`.
 // - Qwen3.6 (`Qwen3_5MoeForConditionalGeneration`) → Dormant. `validate_resolved`
 //   rejects `KvQuant::PlanarK` outright with `QwenMoePlanarKRejected`. The
-//   cache is never built; the kernel can never dispatch. Cells are kept so
-//   the assertion enforces the routing contract.
+//   cache is never built; the kernel can never dispatch, and the resolve
+//   failure means the cell's dispatch-counter assertion is never reached
+//   either — these three cells are not a test of the routing contract.
 // - Gemma4 (`Gemma4ForConditionalGeneration`) → Dormant. It DOES reach the same
 //   fused arm via `update_and_sdpa_shared_source`, but the warm-TTFT bf16-K-seed
 //   gate keeps the kernel dormant. Re-check if that gate changes.
@@ -1041,9 +1042,9 @@ niah_pflash_cell!(
 );
 
 // ── Qwen3.6 35B-A3B — Dormant. PlanarK rejected at validate_resolved
-//   (`QwenMoePlanarKRejected`).  Cells exist so the dispatch-counter
-//   assertion enforces "Dormant means delta == 0 even with ON". 32k per
-//   ticket DoD ceiling. ─────────────────────────────────────────────────
+//   (`QwenMoePlanarKRejected`). The resolve failure fires before the
+//   dispatch-counter assertion, so these cells do not exercise it — they
+//   only confirm the resolver still rejects PlanarK on this arch. ───────
 
 niah_pflash_cell!(
     niah_pflash_qwen36_32k_d10,

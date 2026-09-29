@@ -114,9 +114,8 @@ def _map_kv_quant(type_k: str, type_v: str) -> str:
     maps cleanly to a rMLX canonical (none / k8v4 / k8v8), use that.  Otherwise
     encode verbatim as "<type_k>_<type_v>" (lowercase, underscored).
 
-    Note: the rMLX whitelist only includes none/k8v4/k8v8/planar/turbo4/turbo8.
-    A non-canonical string will be rejected by `rmlx metrics record`.  In that
-    case the pending file is moved to buffer/failed/ for human triage.
+    Note: `kv_quant` has no whitelist in rMLX — `rmlx metrics record` accepts
+    any string, canonical or not, and records it verbatim.
     """
     k = type_k.lower().strip() if type_k else "f16"
     v = type_v.lower().strip() if type_v else "f16"

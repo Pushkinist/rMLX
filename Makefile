@@ -866,9 +866,10 @@ perf-iter:       ## run 3-model regression bench in series (appends to metrics/p
 # `make canary-gate` — gates regressions by querying runs.db.
 #                      Requires SHA=<last-green-sha> to compare against.
 #                      Uses `rmlx metrics deltas --since-sha <SHA> --threshold-pct 3`.
-#                      Exit codes: 0=clean, 1=regression. A SHA with no rows
-#                      also exits 0, so a clean exit does not prove the SHA
-#                      was measured.
+#                      Exit codes: 0=clean, 1=regression or unknown SHA. A SHA
+#                      that is known but has no cell measured again after it
+#                      also exits 0, so a clean exit does not prove every cell
+#                      was re-measured.
 #                      For the simulated-regression test, use CANARY_DB=/tmp/... to point at
 #                      a temp DB so real runs.db is not polluted with fake rows.
 #

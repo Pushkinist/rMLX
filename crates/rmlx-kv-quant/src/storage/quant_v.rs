@@ -61,20 +61,23 @@ pub struct QuantV {
     /// Maximum sequence length the GPU buffer was sized for.
     pub max_seq: i32,
     // ── Calibration surface ───────────────────────────────────────────────────
-    /// Per-KV-head sorted list of high-precision head-dimension indices for the
-    /// V projection, sourced from `kv_calib.json` via `KvCacheBuilder`.
+    /// Per-KV-head sorted list of high-precision head-dimension indices for
+    /// the V projection. Would be sourced from `kv_calib.json` via
+    /// `KvCacheBuilder`, but no per-arch construction code calls
+    /// `KvCacheBuilder::with_calibration` today — every construction sets
+    /// this `None` (see `KvCacheBuilder`'s doc).
     ///
     /// `None` = no calibration attached; codec behavior is unchanged (default).
     /// `Some(indices)` = calibration present; outer vec length = `num_kv_heads`,
     /// inner vec = sorted high-precision indices for that head.
     ///
-    /// Stored; not read by any codec yet. Wired by the TCQ / codebook-override
-    /// encode paths.
+    /// Stored; not read by any codec yet.
     pub high_precision_indices: Option<Vec<Vec<u32>>>,
     // ── Codebook override surface ─────────────────────────────────────────────
-    /// Per-layer V-side codebook override, sourced from `kv_calib.json`
+    /// Per-layer V-side codebook override. Would be sourced from
+    /// `kv_calib.json`
     /// [`CodebookOverride::value`][rmlx_loader::CodebookOverride::value] via
-    /// `KvCacheBuilder`.
+    /// `KvCacheBuilder`, same caveat as `high_precision_indices` above.
     ///
     /// `None` = use the built-in Lloyd-Max N(0,1) codebook (default).
     /// `Some(cb)` = use these centroids for the CPU V-encode path. Length must

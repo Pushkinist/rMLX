@@ -614,7 +614,8 @@ snapshot).
 | Code predictor | A small Qwen3 stack; predicts codec groups 1–15 from the talker hidden. |
 | Codec decoder | Split RVQ (1 semantic + 15 acoustic codebooks), a pre-transformer and a convolutional upsampler to 24 kHz. |
 
-Sizes come from `talker_config` and its `code_predictor_config`. Voices are the
+Sizes come from flat `talker_config` keys; the nested `code_predictor_config`
+block is not read (see `docs/AUDIO.md` § "CodePredictor"). Voices are the
 keys of `talker_config.spk_id`.
 
 ---

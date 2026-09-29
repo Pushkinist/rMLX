@@ -534,8 +534,8 @@ has its own.
 `export --markdown` (`rmlx_metrics::export::export_markdown`) renders:
 
 1. A fixed header (`crates/rmlx-metrics/src/templates/header.md`).
-2. `## Records`: one table per model with one row per backend and KV quant.
-   With `--scope <toml>` (`config/scope.toml`), only the listed models
+2. `## Records`: one table per model with one row per (backend, KV quant,
+   decode config) cell. With `--scope <toml>` (`config/scope.toml`), only the listed models
    appear, in its order. A backend the scope lists as `unsupported` shows
    `N/A`. Without `--scope`, every model in `bests` appears.
 3. A speculative-decoding table, when any champion's `decode_config` names a
@@ -565,8 +565,10 @@ only:
 `observations` by `run_id`.
 
 `KV GB` and `reduction vs bf16` are outside the column's scope. Both are
-minima over every cell that matches the model, across backends and prompts,
-so no single observation backs them.
+minima over `kv_cache_bytes` rows for the model at the row's own `ctx_max`
+and `kv_quant` only (`ctx_max` taken from the row's alphabetically-first
+metric), not across every context and prompt, so no single observation
+backs them.
 
 ---
 

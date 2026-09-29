@@ -173,9 +173,10 @@ pub(super) fn cmd_doctor(db_path: &Path, fix: bool) -> anyhow::Result<()> {
             }
         }
 
-        // kv_quant uses parser-based validation: the canonical form
-        // includes the long `mixed_k<kb>g<kg>_v<vb>g<vg>` shape which cannot
-        // fit a fixed IN-list. Pull the distinct values and validate each.
+        // kv_quant has no whitelist: the canonical form includes the long
+        // `mixed_k<kb>g<kg>_v<vb>g<vg>` shape which cannot fit a fixed
+        // IN-list. `canonicalize_kv_quant` only lowercases and aliases a few
+        // spellings; it never returns an error, so this sweep cannot fail.
         {
             let mut stmt = conn
                 .prepare("SELECT DISTINCT kv_quant, MIN(id) FROM observations GROUP BY kv_quant")

@@ -888,9 +888,11 @@ impl KvCache {
             );
             // Not just "build nothing" — drop anything already there. Every
             // arm below *replaces* the payload, so before this gate a second
-            // prefill on a cache that arrived carrying one (an SSD-hydrated
-            // entry, deep-cloned and tail-extended; `enter_prefill` does not
-            // clear `storage`) overwrote it. Returning early without clearing
+            // prefill on a cache that arrived carrying one (were an
+            // SSD-hydrated entry ever deep-cloned and tail-extended;
+            // `enter_prefill` does not clear `storage`, and no production
+            // architecture does this today) would overwrite it. Returning
+            // early without clearing
             // would leave a store of the old length beside a mirror of the new
             // one, and the spill writer prefers the store — so the block would
             // be written under the full prompt's hash while holding only the

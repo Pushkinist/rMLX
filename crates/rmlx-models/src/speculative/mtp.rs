@@ -32,7 +32,9 @@
 //! [`crate::qwen3_5_moe::MtpLayer`]), so there is no second hand-ported attention
 //! / MoE implementation. The verifier embedding accessor reuses
 //! [`crate::arch::Architecture::embed_tokens_raw`] (the same seam DFlash uses)
-//! and the LM head reuses [`crate::arch::Architecture::logits_from_hidden`]. The
+//! and the LM head reuses [`crate::arch::Architecture::logits_from_final_hidden`]
+//! (the drafter's own decoder layer ends with its final norm, so the
+//! verifier's norm must not run again). The
 //! conditioning hidden comes from [`crate::arch::Architecture::forward_verify_capture`]
 //! capturing the verifier's last decoder layer (penultimate, pre-final-norm).
 
@@ -198,7 +200,7 @@ impl MtpDrafter {
     ///
     /// Given the seed token id `seed_tok`, its conditioning `hidden` (`[1,1,H]`,
     /// the verifier penultimate state at the seed position), the verifier
-    /// `Architecture` (for `embed_tokens_raw` + `logits_from_hidden`), and the
+    /// `Architecture` (for `embed_tokens_raw` + `logits_from_final_hidden`), and the
     /// `start_offset` (the sidecar's `_next_position`, = verifier prefix length),
     /// produce up to `block_size - 1` draft token ids. Greedy (temp=0).
     ///

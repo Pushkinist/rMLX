@@ -287,11 +287,13 @@ impl KvCache {
     /// `max_seq` is the provisioned capacity the block geometry recorded.
     ///
     /// `offset` is the filled sequence length recorded in the block header
-    /// (`seq_len`). SWA / rotating layers are not spilled (their bf16 ring
-    /// lives off-storage and `KvBlockWriter` records them as geometry-only
-    /// `None`); a hydrated cache therefore never carries a `RotatingState`.
-    /// All other flash / fp16-seed scratch is left `None` — it is lazily
-    /// re-seeded on the first decode dispatch exactly as after a cold prefill.
+    /// (`seq_len`). SWA / rotating layers are never spilled: their bf16 ring
+    /// lives off-storage. A layer with no packed codec records this as
+    /// geometry-only `None`; a layer whose codec is `Mixed` / `RotK` still
+    /// spills, but as an empty `Mixed` store with no ring. Either way, a
+    /// hydrated cache never carries a `RotatingState`. All other flash /
+    /// fp16-seed scratch is left `None` — it is lazily re-seeded on the
+    /// first decode dispatch exactly as after a cold prefill.
     ///
     /// `layer_idx` is the 0-based model-side layer index. Pass the same index
     /// used when the cache was originally constructed so that any re-quantize
@@ -314,12 +316,12 @@ impl KvCache {
     /// shares K/V nothing else does either.** A hydrated cache comes back with
     /// `decode_fp16_{k,v}` empty — the spill path persists a bf16 payload only
     /// for storages that hold no packed store at all, which `Mixed` / `RotK`
-    /// are not. Some architectures tail-extend a hydrated block through a
-    /// bracketed re-prefill, and those do rebuild it; Gemma4, the only stack
-    /// whose `shares_kv` is ever `true`, does not — its prefix branch appends
-    /// the tail in decode mode with no enter/exit bracket, so `exit_prefill`
-    /// never re-runs. A `Mixed` / `RotK` cache reconstructed here is therefore
-    /// a declared producer holding no mirror, and
+    /// are not. No production architecture tail-extends a hydrated block
+    /// through an enter/exit prefill bracket, so `exit_prefill` never re-runs
+    /// to rebuild the mirror; Gemma4, the only stack whose `shares_kv` is ever
+    /// `true`, appends the tail in decode mode with no such bracket either. A
+    /// `Mixed` / `RotK` cache reconstructed here is therefore a declared
+    /// producer holding no mirror, and
     /// [`Self::update_and_sdpa_shared_source`] refuses it on that shape rather
     /// than serving a zero-filled prefix.
     pub fn from_storage(

@@ -87,7 +87,10 @@ pub struct RunRecord {
     /// Wire-format version of this record. Defaults to 1 when absent.
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
-    /// Canonical backend identifier (e.g. `"rmlx"`, `"mlx_lm"`). Read via [`RunRecord::backend`].
+    /// Backend identifier as the record spelled it (e.g. `"rmlx"`,
+    /// `"mlx_lm"`), validated to canonicalize against `BACKEND_WHITELIST`
+    /// but not rewritten to the canonical spelling. Read via
+    /// [`RunRecord::backend`].
     pub(crate) backend: String,
     /// Semver string of the backend binary, if known. Read via [`RunRecord::backend_version`].
     #[serde(default)]
@@ -103,9 +106,12 @@ pub struct RunRecord {
     /// `metrics/buffer/failed/`.
     #[serde(alias = "model_id")]
     pub model: String,
-    /// Canonical weight quantization string (e.g. `"mxfp8"`, `"8bit"`).
+    /// Weight quantization string as the record spelled it (e.g.
+    /// `"mxfp8"`, `"8bit"`), validated against `WEIGHT_QUANT_WHITELIST` but
+    /// not rewritten.
     pub weight_quant: String,
-    /// Canonical KV-cache quantization string (e.g. `"k8v8"`, `"none"`).
+    /// KV-cache quantization label as the record spelled it (e.g.
+    /// `"k8v8"`, `"none"`). Free-form: not validated against a whitelist.
     pub kv_quant: String,
     /// Maximum context length used during this bench run (tokens).
     pub ctx_max: i64,
@@ -194,7 +200,7 @@ pub struct RunRecord {
 pub const SYNTHETIC_MARKER: &str = "synthetic=true";
 
 impl RunRecord {
-    /// Canonical backend identifier (e.g. `"rmlx"`, `"mlx_lm"`).
+    /// Backend identifier as the record spelled it (see the field doc).
     pub fn backend(&self) -> &str {
         &self.backend
     }
@@ -418,8 +424,9 @@ impl RunRecord {
         )?;
 
         // kv_quant: free-form recorded label, not validated — see
-        // `identity::canonicalize_kv_quant`. Always `Ok`; called for the
-        // alias normalization (`bf16`/`f16` → `none`), not as a gate.
+        // `identity::canonicalize_kv_quant`. Always `Ok`, and its result is
+        // discarded here: this call normalizes nothing, it only proves the
+        // fn cannot fail on this input.
         identity::canonicalize_kv_quant(&self.kv_quant)?;
 
         // ctx_max

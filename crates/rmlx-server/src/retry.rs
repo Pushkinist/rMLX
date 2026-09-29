@@ -118,8 +118,12 @@ pub enum RetryClass {
 /// a catch-all here silently defaulting an unclassified error to `Fatal`.
 ///
 /// - Migratable: [`RmlxError::Mlx`] (any Metal-level fault) and
-///   [`RmlxError::Other`] (a recovered engine panic). Both may succeed on a
-///   fresh attempt.
+///   [`RmlxError::Other`]. `Other` also wraps permanent, request-shape
+///   refusals (model id mismatch, empty prompt, the speculative-decode
+///   constraint refusal), which this classifies as retryable too — the
+///   variant does not distinguish a recovered panic from a permanent
+///   refusal, so a request in the second group is retried and fails the
+///   same way every time.
 /// - Fatal: every other variant — structural, configuration, OOM, smoke-probe,
 ///   and the KV ceiling / hard-cap rejections (the bound is the same on every
 ///   attempt, whichever phase crossed it).

@@ -242,11 +242,14 @@ fn say_clip_deterministic() {
     let hyp = normalize(&r1.text);
     let w = wer(&reference, &hyp);
     println!("say-clip text: {:?}  WER={w:.3}", r1.text);
-    // Threshold 0.25: the sentence content must be correct. Whisper is known to
-    // append a single filler token ("you", "thank you") on the trailing-silence
-    // boundary of a very short clip; one such word over a 9-word sentence is
-    // ~0.11 WER and does not indicate a decode defect. Determinism (above) is the
-    // stricter property being asserted.
+    // Threshold 0.25: the sentence content must be correct. A filler token
+    // ("you", "thank you") can appear on the trailing-silence boundary of a
+    // very short clip: the seek rule re-prompts an extra near-silent window
+    // after a single trailing timestamp instead of consuming the whole
+    // window, which is a real decode defect (see `docs/AUDIO.md`), not
+    // benign Whisper behavior. The 0.25 bound tolerates up to two such
+    // words over a 9-word sentence. Determinism (above) is the stricter
+    // property being asserted.
     assert!(
         w <= 0.25,
         "say-clip WER {w:.3} too high (>0.25); got {:?}",

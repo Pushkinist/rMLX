@@ -186,9 +186,11 @@ Qwen3 implements RoPE scaling. On any other architecture the flag is ignored
 with a `warn!`, and a refusal does not offer it.
 
 The `slots: model loaded` log line (`effective_max_ctx`, `positional_max`)
-and `GET /v1/models` (`max_ctx`, `positional_max`) report the numbers. An
-architecture with no `max_position_embeddings` has no capacity to enforce, so
-neither field is published for it.
+and `GET /v1/models` (`max_ctx`, `positional_max`) report the numbers.
+Gemma3, Qwen2 and Laguna report a capacity of `0` (no field published):
+their checkpoints declare `max_position_embeddings`, but the architecture's
+own config struct does not read it, so `--max-ctx` above the checkpoint's
+trained window is accepted rather than refused on these three archs.
 
 ---
 
@@ -429,8 +431,10 @@ rmlx kv-calibrate /path/to/qwen3-snapshot --recipe softmax_mass
 | `--target-mass-budget-floor` | u32 | `16` | Minimum per-(layer, head) budget; `softmax_mass` only. |
 
 **Weight-norm recipes** (`turbo2`, `turbo2_tcq`, `turbo3`, `turbo3_tcq`,
-`turbo4`) run on the CPU with no Metal claim. They need float weights (F32,
-BF16 or F16). They write `kv_calib.json` in the `multi-turboquant`
+`turbo4`) run on the CPU with no Metal claim. Float weights (F32, BF16 or
+F16) run directly; `affine`, `mxfp8`, `mxfp4` and `nvfp4` weights are
+dequantized to f32 first (`crates/rmlx-loader/src/calibration.rs`). They
+write `kv_calib.json` in the `multi-turboquant`
 `turboquant_kv.json` v1 schema. `turbo2*` keeps 25% of `head_dim` at high
 precision (`turboquant25`); the others keep 50% (`turboquant35`). The count is
 rounded to a multiple of 16.

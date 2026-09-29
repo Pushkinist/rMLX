@@ -6,7 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "rMLX audio: Whisper STT, WAV I/O, mel-spectrogram, Silero VAD stub."
+description = "rMLX audio: Whisper STT, WAV I/O, mel-spectrogram, Silero VAD."
 
 [lints]
 workspace = true

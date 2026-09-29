@@ -20,8 +20,8 @@
 //! same plain quantize / dequantize kernels as `turboquant_msl.rs`, not the
 //! fused append-into-flash-buffer kernels of the K8V4 path. K8VTurbo2 does
 //! not use TurboFlash; the standard `QuantV::append` / `dequantize_choice`
-//! GPU path would call these functions for the `bits == 2` branch — but the
-//! The update site keeps the V-side on CPU mirroring K8VTurbo3.
+//! GPU path would call these functions for the `bits == 2` branch, but the
+//! update site keeps the V-side on CPU, mirroring K8VTurbo3.
 //!
 //! # Codebook (Lloyd-Max optimal, N(0,1))
 //!
@@ -56,12 +56,14 @@
 //!
 //! # Dispatch status
 //!
-//! The hot K8VTurbo2 V-side update path forces `Device::Cpu` in
-//! `k8_turbo_v_update` (`kvcache/update_turbo.rs`), mirroring the K8VTurbo3
-//! decision (Metal 3-bit kernel showed −3.5% to −6.9% TPS, failing the −2%
-//! gate). This module ships the kernels with full unit-test coverage of
-//! bit-exact CPU↔GPU equivalence so that re-wiring it later (e.g. once a
-//! bench shows a TPS win) is a one-line change at the dispatch site.
+//! `k8_turbo_v_update` (`kvcache/update_turbo.rs`) forces `Device::Cpu`,
+//! mirroring the K8VTurbo3 decision (Metal 3-bit kernel showed −3.5% to
+//! −6.9% TPS, failing the −2% gate). That path only runs during prefill; a
+//! cache that already has a decode bf16 mirror never reaches it, so no
+//! bench of the default decode path exercises this code. This module ships
+//! the kernels with full unit-test coverage of bit-exact CPU↔GPU
+//! equivalence so that re-wiring the dispatch site later is a one-line
+//! change, not a proof of a TPS win.
 
 #![allow(dead_code)] // Future-gated hook, see module-level "Dispatch status".
 

@@ -147,7 +147,9 @@ pub struct TalkerConfig {
     /// RMSNorm epsilon.
     #[serde(default = "default_rms_eps")]
     pub rms_norm_eps: f32,
-    /// Text vocabulary size.
+    /// Codec (audio) vocabulary size — despite the name, this is not the
+    /// text vocabulary. Sets the suppression start for codec-token
+    /// generation (`suppress_start = vocab_size - 1024`).
     #[serde(default = "default_vocab_size")]
     pub vocab_size: usize,
     /// Intermediate size for talker MLP (gate/up). Default = 4 * hidden_size.
@@ -2011,8 +2013,9 @@ impl TtsTokenizer {
 // ── synthesize ────────────────────────────────────────────────────────────────
 
 /// Greedy argmax over last position, returns scalar i32 bytes.
-/// `suppress`: if `Some((start, eos_id, vocab_size))`, tokens in `[start, vocab_size)` except
-///   `eos_id` are suppressed (set to -inf) before argmax. Matches the reference:
+/// `suppress`: if `Some((start, eos_id))`, tokens in `[start, vocab_size)`
+///   except `eos_id` are suppressed (set to -inf) before argmax, with
+///   `vocab_size` read from the logits shape. Matches the reference:
 ///   suppress_tokens = [vocab_size-1024..vocab_size) except eos.
 fn argmax_last(
     logits: &Array,

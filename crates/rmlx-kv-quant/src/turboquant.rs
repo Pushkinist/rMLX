@@ -54,10 +54,11 @@
 //!
 //! # K8 note
 //!
-//! For the asymmetric K8/V4 cache (the mandatory default for Qwen MoE per
-//! CLAUDE.md), K-cache uses standard affine 8-bit quantization with
-//! `group_size=128` (implemented in `crates/rmlx-quant/src/affine.rs`). Only
-//! V uses this module.
+//! For the asymmetric K8/V4 cache, K-cache uses standard affine 8-bit
+//! quantization with `group_size=128` (implemented in
+//! `crates/rmlx-quant/src/affine.rs`). This module also backs the `tsym`
+//! K-side codec family (`crates/rmlx-kv-quant/src/storage/quant_k_turbo.rs`),
+//! so it is not V-only.
 
 use rmlx_core::{Error, Result};
 

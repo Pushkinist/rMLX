@@ -169,7 +169,9 @@ linked MLX is past 0.32. The guard is then to be deleted, not carried.
 ## 4. Affine quants — block-affine weight quantization
 
 The affine family is every `qN_gG` with bits ∈ {2, 3, 4, 5, 6, 8} and group
-size ∈ {32, 64, 128}. One codec, `affine.rs`, covers them all.
+size ∈ {32, 64, 128}. One codec, `affine.rs`, spells all of them, but its
+CPU decoder only actually matches MLX's byte layout at 2, 4 and 8 bits —
+see § 4.2.
 
 ### 4.1 Dequant formula
 

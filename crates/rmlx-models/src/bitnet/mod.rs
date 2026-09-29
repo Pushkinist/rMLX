@@ -20,7 +20,9 @@
 //!    These are plain RMSNorm layers (eps=1e-5) with weights named
 //!    `self_attn.attn_sub_norm.weight` and `mlp.ffn_sub_norm.weight`.
 //!
-//! 3. **Relu2 activation** (`max(x, 0)^2`). Registered in `layers::Activation::Relu2`.
+//! 3. **Relu2 activation** (`max(x, 0)^2`). Inlined in `bitnet/model.rs`'s
+//!    FFN forward, not a `layers::Activation` variant — the shared `Mlp`
+//!    cannot express the sub-norm placement between relu2 and `down_proj`.
 //!
 //! 4. **Tied LM head** (`tie_word_embeddings=true`). The embedding weight is shared
 //!    as LM head.

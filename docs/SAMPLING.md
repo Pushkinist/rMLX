@@ -416,9 +416,11 @@ The span is carried across `spawn_blocking` explicitly.
 ## Logprobs
 
 Capture is off by default (`top_logprobs_k == 0`). `logprobs: true` with
-`top_logprobs: k` (at most 20) makes the decode loop call
-`compute_top_logprobs` after each step. It reads the row back and computes a
-stable log-softmax over the raw logits:
+`top_logprobs: k` (at most 20) makes the shared decode loop call
+`compute_top_logprobs` after each step. Qwen2, Laguna and Qwen3-VL-MoE run
+their own generate loops and never read `top_logprobs_k`, so they return no
+logprobs on any path. Where it runs, `compute_top_logprobs` reads the row
+back and computes a stable log-softmax over the raw logits:
 
 ```
 lse        = max(logits) + ln(sum(exp(logits - max)))

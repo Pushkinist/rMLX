@@ -48,9 +48,13 @@ interleaved A/B run supports a direction between two builds.
 
 - `make canary-gate SHA=<last-green-sha>` runs `rmlx metrics deltas
   --since-sha <SHA> --threshold-pct 3 --exit-code true` against `runs.db`.
-  `CANARY_THRESHOLD_PCT` sets the threshold. Exit 0 is clean and 1 a
-  regression. Exit 125 (a `git bisect` skip) means no `runs.db`, or no
-  returned row with a baseline. A SHA that returns no rows exits 0.
+  `CANARY_THRESHOLD_PCT` sets the threshold. A SHA with no observations at
+  all is an error (exit 1). Otherwise: exit 0 is clean and 1 a regression.
+  Exit 125 (a `git bisect` skip) means no returned row has a baseline. A
+  known SHA with no cell measured again after it also exits 0, so a clean
+  exit does not prove every cell was re-measured. Through `make`, a failed
+  recipe line always reports `make`'s own exit code (2), not the
+  underlying command's.
 - `scripts/regression_gate.sh <model> <baseline_tps> <baseline_stddev>
   [--tolerance PCT]` compares the last CSV row naming the model with the
   anchor given as arguments. The tolerance defaults to 3%. It widens to 5%

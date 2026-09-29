@@ -264,10 +264,11 @@ impl ArchGenerator {
             rmlx_models::context::resolve_context(&context_limits, max_ctx_override)?;
         let effective_max_ctx: usize = resolved_ctx.ceiling_tokens();
 
-        // load the Gemma4 vision tower once when the snapshot ships a
+        // Load the vision tower once when the snapshot ships a
         // `vision_config` (multimodal checkpoint). Text-only models return
         // `None` here and the image-input path is rejected at request time.
-        // Only the Gemma4 architecture has a vision tower today.
+        // Gemma4 (both the SigLIP-tower and the unified encoder-free forms)
+        // and Gemma3 (a SigLIP tower) have a vision arm today.
         let vision: Option<Arc<VisionBundle>> = match &model {
             // Gemma4 **unified** (12B): encoder-free vision embedder, no SigLIP
             // tower. Distinguished from the tower family by `architectures[0]`.

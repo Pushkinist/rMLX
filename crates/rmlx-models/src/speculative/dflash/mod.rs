@@ -87,7 +87,9 @@ pub use round::dflash_generate;
 ///   unit every other loop narrows against — the ceiling is
 ///   [`super::round_block`] of it, so this schedule adapts a block it does not
 ///   also define.
-/// - `prefer_requested` short-circuits to the requested size (config flag).
+/// - `prefer_requested` short-circuits to the requested size. No config
+///   flag sets it; the one production call site always passes `false`.
+///   Tests exercise `true` directly.
 ///
 /// Returns the next block total (including the seed token).
 pub(crate) fn dflash_next_block_size(

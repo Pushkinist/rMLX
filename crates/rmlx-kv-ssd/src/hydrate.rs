@@ -196,10 +196,11 @@ impl SsdHydrator {
     /// `policy` the kernel paths its caches dispatch through, and `shares_kv`
     /// the model's cross-layer-KV topology (see
     /// [`rmlx_kv_quant::KvCache::shares_kv`]); all five come from the caller,
-    /// never from this struct — see the type docs for why. A hydrated
-    /// cache can be tail-extended, which re-runs the `exit_prefill` gate that
-    /// `shares_kv` decides, so guessing it here would drop a mirror the
-    /// requesting architecture needs.
+    /// never from this struct — see the type docs for why. If a hydrated
+    /// cache is ever tail-extended through the `exit_prefill` gate that
+    /// `shares_kv` decides — no production architecture does this today —
+    /// guessing the flag here would drop a mirror the requesting
+    /// architecture needs.
     ///
     /// Never panics. The arch `SsdHydrate<E>` impl calls this and wraps the
     /// result as its concrete entry. Emits a [`SsdHydrateEvent`] via the

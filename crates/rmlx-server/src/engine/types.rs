@@ -124,9 +124,10 @@ pub struct ModelLoadConfig {
     pub mm_cache: Option<Arc<rmlx_models::multimodal_cache::MultimodalCache>>,
     /// Optional KV calibration discovered from `kv_calib.json`
     /// next to the model snapshot. `None` = no calibration file found or
-    /// validation failed (version/head_size mismatch). When `Some`, the
-    /// per-arch model builder forwards it to `KvCacheBuilder` so the codec
-    /// storage layer can attach per-layer high-precision indices.
+    /// validation failed (version/head_size mismatch). Nothing reads this
+    /// field today — no per-arch model builder forwards it to
+    /// `KvCacheBuilder`; `KvCacheBuilder::calibration` is set only by its
+    /// own setter, never from here.
     ///
     /// Discovery is automatic and transparent — missing JSON = unchanged
     /// behavior. No CLI flag is exposed; the field is populated by the loader
