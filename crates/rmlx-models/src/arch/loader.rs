@@ -386,6 +386,9 @@ pub fn refuse_hadamard_pack(cfg: &ModelConfig, model_dir: &Path) -> Result<()> {
 
 /// The first tensor name ending in `.signs` across the `*.safetensors` shards
 /// in `model_dir`. Reads only the shard headers.
+///
+/// Skips hidden files (AppleDouble `._*` side files). A file that cannot be
+/// opened or parsed feeds no weights, so it is logged and skipped.
 fn first_signs_tensor(model_dir: &Path) -> Result<Option<String>> {
     let entries = std::fs::read_dir(model_dir)
         .map_err(|e| Error::Loader(format!("cannot read dir {}: {e}", model_dir.display())))?;
@@ -396,12 +399,24 @@ fn first_signs_tensor(model_dir: &Path) -> Result<Option<String>> {
         let Ok(filename) = entry.file_name().into_string() else {
             continue;
         };
-        if !filename.ends_with(".safetensors") {
+        if filename.starts_with('.') || !filename.ends_with(".safetensors") {
             continue;
         }
-        let shard = ShardHandle::open(model_dir, &filename)?;
-        if let Some(name) = shard
-            .safetensors()?
+        let shard = match ShardHandle::open(model_dir, &filename) {
+            Ok(shard) => shard,
+            Err(e) => {
+                tracing::warn!(file = %filename, error = %e, "arch: Hadamard check skips a file it cannot open");
+                continue;
+            }
+        };
+        let header = match shard.safetensors() {
+            Ok(header) => header,
+            Err(e) => {
+                tracing::warn!(file = %filename, error = %e, "arch: Hadamard check skips a file it cannot parse");
+                continue;
+            }
+        };
+        if let Some(name) = header
             .names()
             .into_iter()
             .find(|n| n.rsplit_once('.').is_some_and(|(_, last)| last == "signs"))
