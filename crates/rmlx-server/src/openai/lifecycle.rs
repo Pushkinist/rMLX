@@ -100,8 +100,9 @@ pub(crate) async fn list_models(State(state): State<AppState>) -> Response {
             })
             .collect()
     };
-
     // A model in the embedding slot is loaded but has no slot timestamps.
+    let embedding_id = state.embedding_resident_id();
+
     let data: Vec<serde_json::Value> = state
         .registry
         .list()
@@ -112,7 +113,7 @@ pub(crate) async fn list_models(State(state): State<AppState>) -> Response {
                 "object": "model",
                 "created": 0,
                 "owned_by": "rmlx",
-                "loaded": state.is_resident(&e.id),
+                "loaded": resident.contains_key(&e.id) || embedding_id.as_ref() == Some(&e.id),
             });
             if let Some(info) = resident.get(&e.id) {
                 obj["loaded_at"] = info.loaded_at.into();

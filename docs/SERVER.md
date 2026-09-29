@@ -512,7 +512,10 @@ request embeds all text or all images, not a mix.
 `embedding` is `[f32]` for one vector, `[[f32]]` for multi-vector output, or
 a base64 string. The embedding model lives in `AppState::embed_slot`, not in
 the LLM slots, and loads on the first request. `apply_task` swaps the LoRA
-adapter inside the GPU critical section.
+adapter inside the GPU critical section. The model has its own lock, and a
+forward holds only that lock, so `/v1/models`, `/status` and `/unload` do not
+wait for a forward. An unload during a request removes the slot entry; the
+request finishes on the model it already holds.
 
 ---
 

@@ -1213,7 +1213,6 @@ fn slots_lru_eviction_at_cap() {
     assert!(!ids.contains(&"m1".to_owned()), "m1 (LRU) must be evicted");
 }
 
-/// `unload` removes exactly one matching entry and leaves the rest.
 /// `is_resident` follows the generation slots: true after a load, false for a
 /// model never loaded and after an unload.
 #[test]
@@ -1227,6 +1226,7 @@ fn is_resident_follows_the_generation_slots() {
     assert!(!state.is_resident("m0"));
 }
 
+/// `unload` removes exactly one matching entry and leaves the rest.
 #[test]
 fn slots_unload_removes_one() {
     let (reg, _tmp) = n_model_registry(3);

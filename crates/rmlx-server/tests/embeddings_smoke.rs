@@ -221,7 +221,8 @@ async fn non_embedding_model_is_400() {
 
 /// Valid single-vector request → 200 + OpenAI embeddings shape.
 async fn valid_single_vector_200_shape(reg: ModelRegistry, device: Device) {
-    let port = start(state(reg, device)).await;
+    let state = state(reg, device);
+    let port = start(state.clone()).await;
     let body = format!(r#"{{"model":"{JINA_ID}","input":"hello world"}}"#);
     let (status, b) = post(port, "/v1/embeddings", &body).await;
     assert_eq!(status, 200, "body: {b}");
@@ -236,6 +237,7 @@ async fn valid_single_vector_200_shape(reg: ModelRegistry, device: Device) {
 
     assert_eq!(listed_as_loaded(port).await, Some(true));
     assert_eq!(status_loaded(port).await, Some(true));
+    residency_read_does_not_wait_on_the_model_lock(&state);
 
     let (status, b) = post(port, &format!("/v1/models/{JINA_ID}/unload"), "").await;
     assert_eq!(
@@ -244,6 +246,28 @@ async fn valid_single_vector_200_shape(reg: ModelRegistry, device: Device) {
     );
     assert_eq!(listed_as_loaded(port).await, Some(false));
     assert_eq!(status_loaded(port).await, Some(false));
+}
+
+/// Hold the model lock, as a forward does, and read residency on another
+/// thread. The read must return while the lock is held.
+fn residency_read_does_not_wait_on_the_model_lock(state: &AppState) {
+    let model = state
+        .embed_slot
+        .read()
+        .as_ref()
+        .map(|m| Arc::clone(&m.model))
+        .expect("the jina model is resident");
+    let held = model.lock();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = state.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send((reader.is_resident(JINA_ID), reader.embedding_resident_id()));
+    });
+    let got = rx.recv_timeout(Duration::from_secs(5));
+    drop(held);
+    let (resident, id) = got.expect("the residency read waited on the model lock");
+    assert!(resident);
+    assert_eq!(id.as_deref(), Some(JINA_ID));
 }
 
 /// The `loaded` flag `GET /v1/models/{id}/status` gives for the jina id.

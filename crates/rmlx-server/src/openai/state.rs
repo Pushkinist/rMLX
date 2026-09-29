@@ -1258,14 +1258,17 @@ impl AppState {
     }
 
     /// True when `model_id` is resident: in a generation slot or in the
-    /// embedding slot. `/v1/models`, `/status` and `/unload` all read this.
+    /// embedding slot. `/status` reads this; `/v1/models` reads the same two
+    /// slots once per request.
     pub fn is_resident(&self, model_id: &str) -> bool {
         self.slots.read().iter().any(|m| m.id == model_id)
-            || self
-                .embed_slot
-                .read()
-                .as_ref()
-                .is_some_and(|m| m.id == model_id)
+            || self.embedding_resident_id().as_deref() == Some(model_id)
+    }
+
+    /// The id of the model in the embedding slot. Holds the slot lock only to
+    /// read the id, never while a forward runs.
+    pub fn embedding_resident_id(&self) -> Option<String> {
+        self.embed_slot.read().as_ref().map(|m| m.id.clone())
     }
 
     /// Unload the model `id` if it is currently resident, from a generation
