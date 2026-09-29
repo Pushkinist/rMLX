@@ -622,7 +622,7 @@ impl<E: PromptCacheEntry> PromptCache<E> {
     pub(crate) fn with_max_bytes(capacity: usize, max_bytes: u64) -> Self {
         let kind = active_prefix_index_kind();
         Self {
-            slots: Vec::with_capacity(capacity),
+            slots: Vec::new(),
             capacity,
             max_bytes,
             seq: 0,

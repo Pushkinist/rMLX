@@ -2730,6 +2730,31 @@ fn zero_slots_stores_nothing() {
     );
 }
 
+/// The slot count is a limit, not a reservation: `--prompt-cache-slots` has no
+/// upper bound, so any count the flag accepts must build a cache that stores.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test-only: `ensure` on the line above installs the cache the closure unwraps"
+)]
+fn slot_count_reserves_no_memory_up_front() {
+    let arch: ArchPromptCache<TestEntry> =
+        ArchPromptCache::new("test-unbounded-slots", ReusePolicy::Partial, false);
+    let prompt = make_ids(2 * BLOCK_TOKENS);
+
+    arch.ensure(usize::MAX);
+    let (stored, slots) = arch.with_inner_mut(|g| {
+        let cache = g.as_mut().unwrap();
+        let stored = cache.push(TestEntry::for_quant(prompt.clone(), TEST_QUANT));
+        (stored, cache.slots.len())
+    });
+    assert_eq!(stored, Some(0), "the first snapshot must be admitted");
+    assert_eq!(
+        slots, 1,
+        "the cache holds what was pushed, not what was allowed"
+    );
+}
+
 /// `ensure` still rebuilds when the capacity genuinely changes, and still does
 /// not when it has not. Without this the repair could be "never rebuild", which
 /// would silently ignore a capacity change between model loads.
