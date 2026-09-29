@@ -235,6 +235,23 @@ async fn valid_single_vector_200_shape(reg: ModelRegistry, device: Device) {
     assert!(v["usage"]["prompt_tokens"].as_u64().unwrap() > 0);
 
     assert_eq!(listed_as_loaded(port).await, Some(true));
+    assert_eq!(status_loaded(port).await, Some(true));
+
+    let (status, b) = post(port, &format!("/v1/models/{JINA_ID}/unload"), "").await;
+    assert_eq!(
+        status, 200,
+        "unload of the resident embedding model, body: {b}"
+    );
+    assert_eq!(listed_as_loaded(port).await, Some(false));
+    assert_eq!(status_loaded(port).await, Some(false));
+}
+
+/// The `loaded` flag `GET /v1/models/{id}/status` gives for the jina id.
+async fn status_loaded(port: u16) -> Option<bool> {
+    let (status, b) = get(port, &format!("/v1/models/{JINA_ID}/status")).await;
+    assert_eq!(status, 200, "body: {b}");
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    v["loaded"].as_bool()
 }
 
 /// The `loaded` flag `GET /v1/models` gives for the jina id.

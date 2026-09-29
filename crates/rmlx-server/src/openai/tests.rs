@@ -1214,6 +1214,19 @@ fn slots_lru_eviction_at_cap() {
 }
 
 /// `unload` removes exactly one matching entry and leaves the rest.
+/// `is_resident` follows the generation slots: true after a load, false for a
+/// model never loaded and after an unload.
+#[test]
+fn is_resident_follows_the_generation_slots() {
+    let (registry, _root) = n_model_registry(2);
+    let state = slot_test_state(registry, 1);
+    state.ensure_loaded("m0").unwrap();
+    assert!(state.is_resident("m0"));
+    assert!(!state.is_resident("m1"));
+    assert!(state.unload("m0"));
+    assert!(!state.is_resident("m0"));
+}
+
 #[test]
 fn slots_unload_removes_one() {
     let (reg, _tmp) = n_model_registry(3);

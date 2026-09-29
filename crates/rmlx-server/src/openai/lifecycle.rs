@@ -18,7 +18,6 @@ use tracing::info;
 use super::errors::{error_response, service_unavailable, unix_now};
 use super::state::{ApiErrorCategory, AppState};
 use crate::keep_alive::{policy_from_request_field, KeepAlivePolicy};
-use crate::registry::ModelRegistry;
 
 // ── /v1/models/{id}/load — request body ──────────────────────────────────────
 
@@ -73,6 +72,10 @@ struct ResidentInfo {
     clippy::unwrap_used,
     reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
 )]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "IndexMut on a JSON object inserts the key; it cannot panic"
+)]
 pub(crate) async fn list_models(State(state): State<AppState>) -> Response {
     // Snapshot resident-model timing under the read lock, then release.
     let now_unix = std::time::SystemTime::now()
@@ -98,32 +101,9 @@ pub(crate) async fn list_models(State(state): State<AppState>) -> Response {
             .collect()
     };
 
-    let embedding_id = state.embed_slot.read().as_ref().map(|m| m.id.clone());
-    let data = model_entries(&state.registry, &resident, embedding_id.as_deref());
-
-    let body = json!({
-        "object": "list",
-        "data": data,
-    });
-
-    (StatusCode::OK, Json(body)).into_response()
-}
-
-/// One `GET /v1/models` entry per registry model.
-///
-/// `loaded` is true for a model in a generation slot (`resident`) and for the
-/// model in the embedding slot (`embedding_id`). The embedding slot keeps no
-/// timestamps, so its entry carries no `loaded_at` or `last_used`.
-#[allow(
-    clippy::indexing_slicing,
-    reason = "IndexMut on a JSON object inserts the key; it cannot panic"
-)]
-fn model_entries(
-    registry: &ModelRegistry,
-    resident: &HashMap<String, ResidentInfo>,
-    embedding_id: Option<&str>,
-) -> Vec<serde_json::Value> {
-    registry
+    // A model in the embedding slot is loaded but has no slot timestamps.
+    let data: Vec<serde_json::Value> = state
+        .registry
         .list()
         .into_iter()
         .map(|e| {
@@ -132,7 +112,7 @@ fn model_entries(
                 "object": "model",
                 "created": 0,
                 "owned_by": "rmlx",
-                "loaded": resident.contains_key(&e.id) || embedding_id == Some(e.id.as_str()),
+                "loaded": state.is_resident(&e.id),
             });
             if let Some(info) = resident.get(&e.id) {
                 obj["loaded_at"] = info.loaded_at.into();
@@ -144,7 +124,14 @@ fn model_entries(
             }
             obj
         })
-        .collect()
+        .collect();
+
+    let body = json!({
+        "object": "list",
+        "data": data,
+    });
+
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 // ── Route: POST /v1/models/{id}/load ─────────────────────────────────────────
@@ -254,14 +241,10 @@ pub(crate) async fn model_status(
 
     let body = json!({
         "id": id,
-        "loaded": false,
+        "loaded": state.is_resident(&id),
         "loaded_at": null,
         "last_used": null,
         "idle_secs": null,
     });
     (StatusCode::OK, Json(body)).into_response()
 }
-
-#[cfg(test)]
-#[path = "lifecycle_tests.rs"]
-mod lifecycle_tests;

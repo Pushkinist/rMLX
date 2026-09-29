@@ -366,12 +366,17 @@ See `docs/CLI.md` § "Context ceiling".
   curl -X POST -d '{"keep_alive": 120}' http://127.0.0.1:8080/v1/models/gemma-4-e4b/load
   ```
 
-- `POST /v1/models/{id}/unload` calls `AppState::unload`: 200 `{"ok":true}`
-  when the model was resident, 404 `{"ok":false,"message":"…"}` when not.
+- `POST /v1/models/{id}/unload` calls `AppState::unload`, which clears a
+  generation slot or the embedding slot: 200 `{"ok":true}` when the model was
+  resident, 404 `{"ok":false,"message":"…"}` when not.
 - `GET /v1/models/{id}/status` returns 200
-  `{"id","loaded","loaded_at","last_used","idle_secs"}`, with the last three
-  `null` when not resident. An id outside the registry is 404
+  `{"id","loaded","loaded_at","last_used","idle_secs"}`. The last three are
+  `null` when the model is not in a generation slot; a model in the embedding
+  slot is `loaded:true` with them `null`. An id outside the registry is 404
   `model_not_found`.
+
+`AppState::is_resident` gives `loaded` on `/v1/models` and `/status` and is
+true for a generation slot or the embedding slot.
 
 **Slots and eviction.** Up to `--max-loaded-models` (default 1) models stay
 resident. When the slots are full, `ensure_loaded` for another model evicts
