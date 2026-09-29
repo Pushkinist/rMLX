@@ -26,7 +26,7 @@
 #     No release step runs this script (docs/RELEASING.md § "No Homebrew
 #     bottle").
 #   - A published GitHub Release for the current version tag must already
-#     exist (step 7 in docs/RELEASING.md) so the root_url is valid at
+#     exist (step 6 in docs/RELEASING.md) so the root_url is valid at
 #     install time.
 #   - `brew` and `jq` available in PATH.
 #

@@ -69,11 +69,16 @@ so it runs on every Apple Silicon Mac whatever chip built it. It is also
   every gate is green. Issues close from that landed commit's `Closes #N`.
   The day-to-day flow is in `CONTRIBUTING.md` §Workflow.
 
-The GitHub ruleset on `main` enforces this: pull request required, squash
-merge only; checks `rustfmt` and `build + clippy`, branch up to date; linear
-history; no force-push, no deletion, no direct update. Admins and
-maintainers can bypass it — that bypass is what lets the tag push below
-reach `main` without a PR.
+The GitHub ruleset on `main` requires a pull request, checks `rustfmt` and
+`build + clippy` green and up to date, linear history, no force-push, no
+deletion and no direct update — but its `allowed_merge_methods` names
+`rebase` while the repository itself allows only squash merges. GitHub's own
+merge button can therefore never complete a merge on `main`: no method both
+the repo and the ruleset accept exists. The owner's account squashes the
+branch locally into the one commit the issue closes from, then fast-forward
+pushes it straight to `main`; the ruleset's admin bypass is what lets that
+direct push through the "no direct update" rule. The tag push below needs no
+bypass — the ruleset's target is `main` alone, so a tag ref is outside it.
 
 ## Cut a release
 
@@ -327,7 +332,7 @@ The checklist:
    `mixed_*` and `rot_k_v*`, so read its diff when it changed.
 8. **One paragraph.** Name the pattern that this release repeated and the
    generalisation that would have prevented it. It goes in the retrospective
-   comment on the release PR, not in `CHANGELOG.md`.
+   comment on the version-bump PR of step 1, not in `CHANGELOG.md`.
 
 Remove the two checkouts when the comment is posted:
 

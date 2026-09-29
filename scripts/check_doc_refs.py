@@ -71,8 +71,9 @@ reference into it or out of it fails, so a cut fixes the broken citations of
 the docs it touches.
 
 `--base auto` picks origin/main: the merge-base of HEAD and origin/main, or
-HEAD itself when origin/main already contains HEAD. Every run prints its
-base.
+HEAD^ when origin/main already contains HEAD — every landing is one squashed
+commit, so HEAD itself would compare HEAD with HEAD and could never fail.
+Every run prints its base.
 
 `CHANGELOG.md` is released history and is never edited for a doc cut. Its
 references are scanned and a broken one is printed, but it never fails.
@@ -189,7 +190,8 @@ def nearest_base(root: Path) -> tuple[str, str]:
     ref = candidates[0]
     merge_base = git(root, "merge-base", "HEAD", ref).decode().strip()
     if merge_base == head:
-        return ("HEAD", head)
+        parent = git(root, "rev-parse", "HEAD^").decode().strip()
+        return ("HEAD^", parent)
     return (ref.removeprefix("refs/remotes/"), merge_base)
 
 
