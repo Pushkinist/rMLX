@@ -33,11 +33,25 @@ fresh() {
     printf '%s' "$root"
 }
 
+# Every gate run is bounded, so a scan that backtracks without end is a failed
+# case (exit 124) rather than a hung selftest. `timeout(1)` is not on stock macOS.
+CASE_TIMEOUT_S=5
+bounded() {
+    python3 -c '
+import subprocess, sys
+try:
+    sys.exit(subprocess.run(sys.argv[2:], timeout=float(sys.argv[1])).returncode)
+except subprocess.TimeoutExpired:
+    print(f"timed out after {sys.argv[1]} s")
+    sys.exit(124)
+' "$CASE_TIMEOUT_S" "$@"
+}
+
 # case_run <name> <what> <want-exit> <needle|-> <root>
 case_run() {
     local name="$1" what="$2" want="$3" needle="$4" root="$5"
     local out status
-    out=$(python3 "$TOOL" --root "$root" --check-doc-size 2>&1)
+    out=$(bounded python3 "$TOOL" --root "$root" --check-doc-size 2>&1)
     status=$?
     if [ "$status" != "$want" ]; then
         FAILED=$((FAILED + 1))
@@ -112,6 +126,11 @@ for leader in "- " "> " "* " "## " "1. " "<!-- - "; do
     case_run "marker_after_leader_${tag}" "a marker after the Markdown leader '${leader}' still fails" \
         1 "FAIL docs/LEAD.md  carries a size-exempt marker" "$root"
 done
+
+root=$(fresh marker_scan_linear)
+printf '%s\n' "$(printf '#%.0s' $(seq 64))x" >"$root/docs/HASHES.md"
+case_run marker_scan_is_linear "a line of 64 '#' and no marker is scanned in bounded time" \
+    0 "check-doc-size: ok (2 docs measured" "$root"
 
 root=$(fresh upper_case_suffix)
 bytes "$root/docs/SHOUT.MD" 45000
