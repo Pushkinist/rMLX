@@ -91,8 +91,9 @@ SIM_THRESHOLD = 0.60
 DOC_SIZE_THRESHOLD_KIB = 40
 DOC_SIZE_CAP_BYTES = DOC_SIZE_THRESHOLD_KIB * 1024
 # No doc exempts itself: a marker at the start of any line fails the gate,
-# after any Markdown leader (comment, list item, quote, heading).
-SIZE_EXEMPT_MARKER = re.compile(r"^[ \t]*(?:(?:<!--|[-*+>]|#+|\d+\.)[ \t]*)*size-exempt:", re.M)
+# after any Markdown leader (comment, list item, quote, heading). A heading is
+# matched one `#` per repetition: `#+` inside the `*` backtracks exponentially.
+SIZE_EXEMPT_MARKER = re.compile(r"^[ \t]*(?:(?:<!--|[-*+>]|#|\d+\.)[ \t]*)*size-exempt:", re.M)
 LOC_THRESHOLD = 1000
 
 SIBLING_DIRS = ("crates/rmlx-kv-quant", "crates/rmlx-models")
