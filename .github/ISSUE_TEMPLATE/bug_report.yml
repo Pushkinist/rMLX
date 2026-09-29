@@ -1,63 +1,136 @@
 name: Bug report
-description: Something broke — wrong output, crash, load failure, perf regression.
-labels: ["bug"]
+description: Something is wrong — wrong output, crash, load failure, refused request, performance regression.
+title: "<area>: <what is wrong>"
+labels: ["bug", "triage"]
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for the report. rMLX is Apple-Silicon-only — please confirm you're
-        on an M-series Mac. For security issues, **do not** file here; see
-        [SECURITY.md](../blob/main/SECURITY.md).
+        rMLX runs on Apple Silicon only. For a security problem, do not file
+        here: use the private advisory link in the issue chooser.
+
+        Before you paste text below, remove local paths, user names and host
+        names. Write `<RMLX_HOME>` or `~` instead of a home directory.
   - type: textarea
     id: what-happened
     attributes:
       label: What happened
-      description: What you did, what you expected, what you got.
-      placeholder: Loaded model X, sent request Y, got incoherent output / crash / …
+      description: What you did, what you expected, and what you got.
+      placeholder: Served model X with command Y, sent request Z, got a crash / wrong output / HTTP 503.
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Launch command
+      description: The exact `rmlx ...` command line, with every flag — also the cache, SSD tier, `--project`, speculative and drafter flags. If a script or harness started it, name the script and its arguments.
+      render: shell
     validations:
       required: true
   - type: textarea
     id: repro
     attributes:
       label: Reproduction
-      description: Exact command / request. Minimal is best.
+      description: The request or the steps after launch. Keep it minimal.
       render: shell
     validations:
       required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed output
+      description: The decisive line or lines — the error text, the wrong token, the number.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: control
+    attributes:
+      label: Comparison or control
+      description: If the defect is a difference (two processes, two flags, two models, two builds), give the other arm exactly as above — its command, snapshot and version — and say which arm is correct.
   - type: input
     id: model
     attributes:
-      label: Model snapshot
-      description: e.g. mlx-community__gemma-4-e4b-it-mxfp8
+      label: Model
+      description: Hugging Face link or snapshot name.
+      placeholder: https://huggingface.co/mlx-community/gemma-4-e4b-it-mxfp8
     validations:
       required: true
   - type: input
     id: arch
     attributes:
       label: Architecture
-      description: From config.json, e.g. Gemma4ForConditionalGeneration
+      description: The `architectures` value from the model's `config.json`.
+      placeholder: Gemma4ForConditionalGeneration
   - type: input
     id: quant
     attributes:
-      label: Weight / KV quant
-      description: e.g. mxfp8 weights, K8V8 KV
-  - type: input
-    id: version
+      label: Weight and KV settings
+      description: Weight format, and the KV flags if you set any (`--kv-quant`, `--cache-type-k`, `--cache-type-v`, `--max-ctx`, speculative flags, SSD tier).
+      placeholder: mxfp8 weights, --kv-quant k8v8 --max-ctx 32768
+  - type: textarea
+    id: environment
     attributes:
-      label: rMLX version / commit
-      description: "`rmlx --version` or git SHA"
-    validations:
-      required: true
-  - type: input
-    id: macos
-    attributes:
-      label: macOS version + chip
-      description: e.g. macOS 15.4, M3 Max, 64 GB
+      label: Environment
+      description: |
+        Get the values with these commands:
+        `rmlx --version`
+        `sysctl -n machdep.cpu.brand_string` (chip)
+        `sysctl -n hw.memsize` (memory, bytes)
+        `sw_vers -productVersion` (macOS)
+        `system_profiler SPDisplaysDataType | grep -i metal` (Metal support)
+        `brew list --versions mlx mlx-c`
+      value: |
+        rmlx:
+        chip:
+        memory:
+        macOS:
+        Metal:
+        mlx / mlx-c:
     validations:
       required: true
   - type: textarea
     id: logs
     attributes:
-      label: Relevant logs
-      description: From .rmlx/logs/. Run with --log debug if useful.
+      label: Logs
+      description: An excerpt from `<RMLX_HOME>/logs/<run-id>.jsonl`. Run with `--log debug` if it helps. Remove local paths first.
       render: shell
+  - type: textarea
+    id: performance
+    attributes:
+      label: Performance evidence
+      description: Only for a slowdown or a regression. The command, the numbers, the number of runs, and the host state (other GPU load, thermal state).
+  - type: dropdown
+    id: evidence
+    attributes:
+      label: Evidence type
+      description: How the defect is known. A defect known only from reading the code gets the `premise-unverified` label.
+      options:
+        - Measured (a run shows it)
+        - Read in the code (cite path:line@SHA and quote the line)
+        - Both
+  - type: textarea
+    id: not-checked
+    attributes:
+      label: Not checked
+      description: What you did not verify. For example, "did not trace the fallback path" or "did not try a second model".
+  - type: textarea
+    id: related
+    attributes:
+      label: Related issues
+      description: One line per link. Use these verbs so the links can be searched.
+      placeholder: |
+        Found while #
+        Blocked by #
+        Blocks #
+        Same branch as #
+        Duplicate of #
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched the open issues for this defect.
+          required: true
+        - label: The text above holds no local path, user name or host name.
+          required: true

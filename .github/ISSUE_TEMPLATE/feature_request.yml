@@ -1,28 +1,105 @@
-name: Feature / model request
-description: A new model arch, quant format, API surface, or capability.
-labels: ["enhancement"]
+name: Feature request
+description: A new capability — a KV codec, a weight format, a CLI command or flag, a server API, engine logic, a tool or a gate.
+title: "<area>: <what the change does>"
+labels: ["feature", "triage"]
 body:
   - type: markdown
     attributes:
       value: |
-        Keep scope in mind: rMLX is Apple-Silicon, no-Python, MLX-format only.
-        Not in scope: GGUF, training / fine-tune, non-Apple backends.
-  - type: textarea
-    id: request
+        rMLX is Apple Silicon only, native Rust, no Python at runtime, and
+        MLX-format only. GGUF, training and fine-tuning are out of scope. For
+        a model or architecture, use the "New model" template.
+
+        Describe the behavior you want, not a design.
+  - type: dropdown
+    id: kind
     attributes:
-      label: What would you like
-      description: The capability, model arch, or quant format.
+      label: Kind
+      options:
+        - KV codec
+        - Weight quantization format
+        - CLI command or flag
+        - Server API
+        - Engine logic
+        - Tool, test or CI gate
+        - Documentation
+        - Other
     validations:
       required: true
   - type: textarea
-    id: motivation
+    id: problem
     attributes:
-      label: Why
-      description: Use case. What does it unblock?
+      label: Problem
+      description: What cannot be done today, and how you know. Give the command and its output, or cite `path:line@SHA` and quote the line.
     validations:
       required: true
-  - type: input
-    id: refs
+  - type: textarea
+    id: behavior
     attributes:
-      label: References
-      description: Model card, paper, upstream impl, mlx-lm reference, etc.
+      label: Wanted behavior
+      description: What the system does after the change. Behavior, not a design.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Each item can be checked on its own.
+      value: |
+        - [ ]
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Kind details
+      description: |
+        KV codec: target bits per value, the reference paper or repo, the
+        shapes it must support (`head_dim`, KV heads). A KV codec ships an
+        on-GPU (Metal) decode kernel; a CPU-only decode is not shippable.
+        CLI flag: name, default, which commands it applies to, and why it is a
+        flag and not a fixed default. rMLX does not add environment variables
+        for configuration.
+        Server API: the endpoint and the request and response fields.
+  - type: dropdown
+    id: evidence
+    attributes:
+      label: Evidence type
+      description: How the problem is known. A problem known only from reading the code gets the `premise-unverified` label.
+      options:
+        - Measured (a run shows it)
+        - Read in the code (cite path:line@SHA and quote the line)
+        - Both
+        - A user need, not a defect
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: textarea
+    id: out-of-scope
+    attributes:
+      label: Out of scope
+  - type: textarea
+    id: related
+    attributes:
+      label: Related issues
+      description: One line per link. Use these verbs so the links can be searched.
+      placeholder: |
+        Found while #
+        Blocked by #
+        Blocks #
+        Same branch as #
+        Duplicate of #
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Constraints
+      options:
+        - label: Apple Silicon only.
+          required: true
+        - label: No new dependency, or the dependency and the reason are named above.
+          required: true
+        - label: No new environment variable.
+          required: true
+        - label: The text above holds no local path, user name or host name.
+          required: true

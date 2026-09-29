@@ -1,0 +1,105 @@
+name: New model
+description: Ask for a model or architecture that rMLX does not serve yet.
+title: "models: support <model name> (<architecture>)"
+labels: ["model", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        rMLX serves MLX-format models only (safetensors, `mlx-community`
+        layout). GGUF, training and fine-tuning are out of scope. Check
+        `docs/MODELS.md` first: the architecture can already be supported.
+
+        Acceptance for a new architecture follows `docs/ADDING_A_MODEL.md`
+        (section "Verification"): a smoke probe with coherent output, golden
+        tokens against the reference, and a served run for every modality the
+        model declares.
+  - type: input
+    id: link
+    attributes:
+      label: Model link
+      description: Hugging Face link of the MLX snapshot.
+      placeholder: https://huggingface.co/mlx-community/<model>
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: Revision
+      description: The snapshot commit, if you need one exact revision.
+  - type: input
+    id: architecture
+    attributes:
+      label: Architecture
+      description: "`architectures` and `model_type` from the model's `config.json`."
+      placeholder: Qwen3_5MoeForConditionalGeneration / qwen3_5_moe
+    validations:
+      required: true
+  - type: input
+    id: weights
+    attributes:
+      label: Weight format
+      description: bf16, affine N-bit, mxfp4, mxfp8, nvfp4, or other. Copy the `quantization` block of `config.json` if there is one.
+    validations:
+      required: true
+  - type: checkboxes
+    id: format
+    attributes:
+      label: Format
+      options:
+        - label: The weights are MLX-format safetensors, not GGUF.
+          required: true
+  - type: checkboxes
+    id: modalities
+    attributes:
+      label: Modalities
+      description: Select every modality the model declares.
+      options:
+        - label: Text generation
+        - label: Image input
+        - label: Audio input
+        - label: Embeddings
+        - label: Reranking
+        - label: Speech output (TTS)
+        - label: Transcription
+  - type: textarea
+    id: closest
+    attributes:
+      label: Closest supported architecture
+      description: |
+        Which rMLX architecture is closest (see `docs/MODELS.md`), and what is
+        different: attention type (full, sliding window, linear/GDN, other),
+        MoE, KV shared across layers, RoPE scaling, `head_dim`, a vision or
+        audio tower.
+  - type: textarea
+    id: reference
+    attributes:
+      label: Reference implementation
+      description: The mlx-lm, mlx-vlm or mlx-audio file, the transformers modeling file, or the paper.
+  - type: input
+    id: size
+    attributes:
+      label: Size and memory
+      description: Size on disk, and the smallest Mac memory it fits in.
+  - type: textarea
+    id: drafter
+    attributes:
+      label: Speculative drafter
+      description: A drafter the checkpoint ships or pairs with (MTP head, DFlash, EAGLE-3, a small assistant model), if any.
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: The use case, and what it unblocks.
+    validations:
+      required: true
+  - type: textarea
+    id: related
+    attributes:
+      label: Related issues
+      description: One line per link. Use these verbs so the links can be searched.
+      placeholder: |
+        Blocked by #
+        Blocks #
+        Same branch as #
+        Duplicate of #
