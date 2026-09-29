@@ -2756,11 +2756,13 @@ fn assert_spec_decode(
     }
 }
 
-/// Scrape the speculative round-loop summary (`<kind>_generate: done`)
-/// from the newest run jsonl under `<home>/logs/`. Returns the LAST summary's
-/// `(accept_rate, rounds)`. The fields shape (verified empirically):
-/// `fields.message == "<kind>_generate: done"`, `fields.accept_rate`,
-/// `fields.rounds`.
+/// Scrape the speculative round-loop summary from the newest run jsonl under
+/// `<home>/logs/`. Returns the LAST summary's `(accept_rate, rounds)`.
+/// Matches `fields.message.ends_with("_generate: done")`, then reads
+/// `fields.accept_rate` and `fields.rounds`. The engine's own contract is
+/// only that the message ends `: done` (`round_stats.rs::done_event`); this
+/// narrower suffix misses both two-model loops, whose event ends
+/// `"_cached: done"`.
 fn scrape_spec_accept(home: &std::path::Path) -> Result<(f64, u64), String> {
     let logs = home.join("logs");
     let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;

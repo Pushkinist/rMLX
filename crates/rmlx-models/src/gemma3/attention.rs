@@ -99,7 +99,12 @@ impl Attention {
         // Gemma3 rotates `dims = head_dim` (no ProportionalRoPE / partial rotation).
         // Reference: gemma3_text.py Attention.__init__ lines 57-70:
         // sliding: `rope(dims=head_dim, base=rope_local_base_freq)`
-        // full: `rope(dims=head_dim, base=rope_theta)`
+        // full: `rope(dims=head_dim, base=rope_theta, scaling_config=args.rope_scaling)`
+        //
+        // rMLX passes scale 1.0 unconditionally on full-attention layers and
+        // does not read `config.json`'s `rope_scaling` here, unlike the
+        // reference. A snapshot that declares scaling on `full_attention`
+        // (for example medgemma's `linear` factor 8) is served unscaled.
         let rope_dims = self.head_dim as i32;
         let q = rope(&q, rope_dims, false, self.rope_theta, 1.0, offset, device)?;
         let k = rope(&k, rope_dims, false, self.rope_theta, 1.0, offset, device)?;

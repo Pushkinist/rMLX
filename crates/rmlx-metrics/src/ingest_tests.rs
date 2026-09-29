@@ -416,7 +416,9 @@ fn record_ingests_with_unknown_kv_quant_token() {
     r.validate().unwrap();
 }
 
-/// `bf16`/`f16` still alias to `none` at the full-record level.
+/// `bf16`/`f16` still pass `validate()` at the full-record level. This only
+/// checks `canonicalize_kv_quant` does not error on them — `validate` does
+/// not write the canonical form back onto `r.kv_quant`.
 #[test]
 fn record_kv_quant_bf16_alias_still_normalizes() {
     for alias in ["bf16", "f16"] {

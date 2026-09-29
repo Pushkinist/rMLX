@@ -75,9 +75,10 @@ fn paged_kv_cli_flag_routes_correctly() {
         return;
     };
     // Live-decode wiring deferred — see ticket follow-up. The resolver
-    // contract (`resolve_paged_kv`) is unit-tested directly in
-    // `crates/rmlx-models/src/kv_cache/paged.rs`; this slot wires it through
-    // a live `storage = "paged"` vs `"contiguous"` tracing assertion + token
-    // parity check.
+    // contract (`resolve_paged_kv`, defined in
+    // `crates/rmlx-kv-quant/src/paged/config.rs`) is unit-tested directly in
+    // `crates/rmlx-kv-quant/src/paged/ops_tests.rs`; this slot wires it
+    // through a live `storage = "paged"` vs `"contiguous"` tracing
+    // assertion + token parity check.
     panic!("E2E paged_kv_cli_flag wiring deferred; see ticket follow-up");
 }

@@ -235,9 +235,12 @@ positions.
 
 `reasoning_content` is omitted when the model produced no thinking text,
 `tool_calls` when no call was parsed, and `logprobs` unless requested. When
-present, `logprobs.content` has one entry per completion token. A prompt-cache
-exact hit replays the first token's logprob stored with the entry, so a hit
-returns as many entries as a miss.
+present, `logprobs.content` has one entry per completion token on a
+prompt-cache miss. Only `Qwen3Entry` stores the first token's logprobs, so an
+exact hit on that arch replays them and returns as many entries as a miss;
+on Gemma4, Gemma3, Qwen3.5-MoE and BitNet an exact hit emits no logprob for
+the replayed token, so `logprobs.content` is one entry short. See
+[`PROMPT_CACHE.md`](PROMPT_CACHE.md) § "First-token logprob on Exact hit".
 
 A `response_format` request whose grammar never engaged returns 502
 `constraint_not_engaged`; see [`SAMPLING.md`](SAMPLING.md) § "Non-enforcement
@@ -799,7 +802,7 @@ Both take a multipart form. `translations` translates to English.
 | `model` | no | `whisper-large-v3` | Logged only; the configured snapshot serves every request. |
 | `language` | no | `auto` | A language code, or `auto` to detect it. An unknown code is 422. |
 | `response_format` | no | `json` | `json`, `text`, `verbose_json`, `srt` or `vtt`. Anything else is 422. |
-| `temperature` | no | `0.0` | In `[0.0, 1.0]`; anything else is 422. |
+| `temperature` | no | `0.0` | A non-finite or negative value is 422. A value above 1.0 is accepted and has no effect: decoding is always greedy argmax. |
 | `prompt` | no | — | Accepted and ignored. |
 
 | `response_format` | Body |
@@ -821,8 +824,9 @@ the audio in 30 s windows. Each window decodes in timestamp mode with the
 openai-whisper logit filters (`SuppressBlank`, `SuppressTokens`,
 `ApplyTimestampRules`). The emitted timestamps become segments with real
 times. The seek advances to the last timestamp, and the previous window's text
-is fed back as a `<|startofprev|>` prompt. Filler in the zero-padded tail of
-the last window is dropped.
+is fed back as a `<|startofprev|>` prompt. The only filler guard drops a
+segment that opens after the window's own length plus 0.5 s — in a short
+tail window, filler that opens at `<|0.00|>` still passes.
 
 With `language` absent or `auto`, `WhisperModel::detect_language()` runs one
 SOT decoder step and takes the argmax over the language tokens. On error it

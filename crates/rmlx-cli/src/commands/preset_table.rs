@@ -155,9 +155,10 @@ static PRESETS: &[(&str, PresetSpec)] = &[
     ),
     (
         // `planar3` preset: K = affine q8_0, V = PlanarQuant 3-bit.
-        // 3.25-bit effective V; same Givens-rotation algorithm as `planar` but
-        // with 3-bit Lloyd-Max N(0,1) codebook. ForgeAttention-compatible pack
-        // format (10 vals/u32, 4 words/group).
+        // 22.00 bits/value, byte-identical to `planar`'s 4-bit store; same
+        // Givens-rotation algorithm as `planar` but with 3-bit Lloyd-Max
+        // N(0,1) codebook. ForgeAttention-compatible pack format (10
+        // vals/u32, 4 words/group).
         "planar3",
         PresetSpec {
             kv_quant: KvQuant::Planar3,

@@ -134,13 +134,11 @@ pub use quant::{
 // and the dispatch sites read it from there, so two caches built under
 // different policies stay independent and both can run in one process.
 //
-// **Sparse-attention audit verdict** (warm-TTFT dormant): the two-phase
-// kernels are wired and dispatch-counter-instrumented, but the production
-// `update_and_sdpa` path always shortcuts through the bf16-K seed materialised
-// by `exit_prefill`. Setting `DispatchPolicy::sparse_attn` does NOT make
-// sparse-attn fire on the normal generate flow; the kernels are reserved for
-// **seedless** workloads (synthetic PlanarK caches, PPL eval, future
-// prompt-cache hits that skip prefill). See
+// **Sparse-attention audit verdict** (dormant): the two-phase kernels are
+// wired and dispatch-counter-instrumented, but
+// `sparse_attn_dispatch_if_enabled` has no production caller — every call
+// site is a test. Setting `DispatchPolicy::sparse_attn` does NOT make
+// sparse-attn fire on the normal generate flow. See
 // [`sparse_attn::sparse_attn_total_dispatch_count`] for the dispatch counter
 // aggregator.
 

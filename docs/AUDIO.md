@@ -29,10 +29,22 @@ With `condition_on_previous_text` set, the previous window's text is fed back
 after `<|startofprev|>`. The server and `rmlx transcribe` always set it.
 
 Each window decodes with the openai-whisper logit filters (`DecodeFilters`).
-Temperature is 0, so one input gives one output. A segment that opens in the
-zero-padded tail of the last window is dropped.
+Temperature is 0, so one input gives one output. The only filler guard drops
+a segment that opens after the window's own length plus 0.5 s; in a short
+tail window this bound is small, so filler that opens at `<|0.00|>` still
+passes.
 
 Long audio is walked window by window. No voice-activity detection runs.
+
+**Seek defect.** rMLX always seeks to the last emitted timestamp. The
+reference consumes the whole window when the tokens end in a single
+trailing timestamp (no speech after it). When speech ends before the window
+does, rMLX opens one or more extra tail windows over the remaining
+near-silent audio; each one decodes with the previous window's text fed
+back as a `<|startofprev|>` prompt, which is where the trailing filler
+("you", "thank you") and repeated segments come from. No no-speech gate
+exists to skip a near-silent window, and `temperature` has no fallback
+effect (decoding is always greedy).
 
 ### Language detection
 

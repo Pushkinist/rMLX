@@ -4,11 +4,14 @@
 //!
 //! # What this is
 //!
-//! Replaces TurboQuant's nearest-centroid V-side assignment with **Viterbi
-//! optimal** path selection through a fixed trellis. The codebook is the same
-//! Lloyd-Max N(0,1) table as plain `turbo3` / `turbo2` — quality comes purely
-//! from smarter assignment that exploits inter-dimension dependencies. The
-//! decoder is therefore bit-identical to [`crate::turboquant::turbo_dequantize`].
+//! Replaces TurboQuant's nearest-centroid V-side assignment with a Viterbi
+//! search through a fixed trellis. The codebook is the same Lloyd-Max N(0,1)
+//! table as plain `turbo3` / `turbo2`. The transition table it walks does
+//! not forbid any centroid at any position — every level is a legal
+//! transition from every state — so the per-position cost is separable and
+//! the search always lands on the same nearest centroid plain assignment
+//! would pick: measured gain is 0.000 dB. The decoder is bit-identical to
+//! [`crate::turboquant::turbo_dequantize`].
 //!
 //! Reference: `multi-turboquant/multi_turboquant/methods/tcq.py` (CPU Viterbi).
 //!
@@ -19,7 +22,9 @@
 //! - [`TCQ_NUM_STATES`] = 4 trellis states.
 //! - Transition: `next = ((state << 1) | (level & 1)) % NUM_STATES`.
 //! - At each dim-axis position the encoder picks the `(state, level)` that
-//!   minimises cumulative path cost `path_cost[state] + dist(rotated, level)`.
+//!   minimises cumulative path cost `path_cost[state] + dist(normalised, level)`.
+//!   Every level is a legal transition from every state, so this cost is
+//!   separable per position and always agrees with nearest-centroid.
 //! - Forward pass fills a back-pointer table of shape `[dim, NUM_STATES]`
 //!   (per-block); backward pass traces from the best final state and emits
 //!   centroid indices in stream order.
@@ -45,9 +50,8 @@ use crate::turboquant::{lloyd_gaussian_codebook, pack_index, TurboBlocks, GROUP_
 
 /// Number of states in the Viterbi trellis (rate-1/2, constraint length 3).
 ///
-/// Fixed at 4 in the initial port. The ticket allows up to 8 if a future MSL
-/// SMEM budget warrants it; widening requires recomputing the transition table
-/// and re-tuning the back-trace storage.
+/// Fixed at 4 in the initial port. Widening to 8 states requires recomputing
+/// the transition table and re-tuning the back-trace storage.
 pub const TCQ_NUM_STATES: usize = 4;
 
 // ── Public entry points ──────────────────────────────────────────────────────
@@ -67,8 +71,9 @@ pub const TCQ_NUM_STATES: usize = 4;
 /// 2. Per group: `scale = max(|x_i|) / max_centroid` (identical to plain
 ///    `turbo_quantize_v`). Zero-scale block emits all-zero indices.
 /// 3. Normalise `x_i / scale`, then run a 4-state Viterbi forward + back-trace
-///    over the 32 normalised values to pick centroid indices that minimise the
-///    cumulative L2 distortion under the trellis transition constraint.
+///    over the 32 normalised values to pick centroid indices that minimise
+///    cumulative L2 distortion. The trellis does not forbid any centroid at
+///    any position, so this always agrees with nearest-centroid.
 /// 4. Bit-pack indices LSB-first into u8 bytes.
 ///
 /// # Output

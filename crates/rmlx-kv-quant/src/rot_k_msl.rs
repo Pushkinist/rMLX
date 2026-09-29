@@ -35,8 +35,8 @@
 //! - Reads Q `[N, D]` (bf16 or f32).
 //! - Applies FWHT + `1/sqrt(D)` scale in SMEM.
 //! - Writes rotated Q as f32.
-//! - Used by `maybe_pre_rotate_q_gpu` to replace the `rotate_last_axis` matmul
-//!   in `mixed_quantized_sdpa` when the fused path is active.
+//! - Called inline from `mixed_quant::sdpa` to replace the `rotate_last_axis`
+//!   matmul in `mixed_quantized_sdpa` when the fused path is active.
 //!
 //! # Document the truth (CLAUDE.md hard rule 7)
 //!

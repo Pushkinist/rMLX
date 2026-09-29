@@ -254,7 +254,13 @@ pub trait HydratedEntry: Sized {
 Every entry sets `is_ssd_hydrated` and the placeholder `first_id` /
 `first_piece`, and destructures `HydratedBlock` exhaustively. `SHARES_KV`
 names the arch's own `SHARES_KV_ACROSS_LAYERS`. It lands on every restored
-cache and decides the bf16 mirror a tail extension builds.
+cache and would decide the bf16 mirror a tail extension builds, if a tail
+extension ran through the `exit_prefill` gate — no production architecture
+does that. Qwen3.5-MoE does tail-extend a hydrated block in production
+(`Consumed::Reuse { kind: ReuseKind::StrictPrefix, .. }`), and so does
+Gemma4's prefix path, but neither goes through an enter/exit prefill
+bracket, so `exit_prefill` never runs and the mirror is never built either
+way.
 
 **Why the blanket impl lives in `rmlx-kv-ssd`.** In `rmlx-models` both
 `SsdHydrate` and `SsdHydrator` are foreign and `E` is uncovered, so the orphan
@@ -421,12 +427,13 @@ from the bytes a RAM hit would. Codes and bf16 round-trip bit for bit.
 #### SWA layers are not spilled — hydrated entries degrade to re-prefill
 
 The bf16 rotating ring of a sliding-window layer has no `.kvb` form. On
-hydrate, Gemma3 and Gemma4 SWA layers come back as payload-less
-`KvStorage::None`.
+hydrate, a Gemma3 or Gemma4 SWA layer with no packed codec comes back as
+payload-less `KvStorage::None`; a SWA layer whose codec is `Mixed` / `RotK`
+comes back as an empty `Mixed` store instead. Either way it holds no ring.
 
 Reusing such an entry as a prefix would give every SWA layer an empty
-context. `KvCache::is_trimmable()` is `true` for a `None` layer, so it cannot
-detect this. `Gemma3Entry::is_hydrate_complete` and
+context. `KvCache::can_truncate_to()` is `true` for a `None` layer with no
+rotating state, so it cannot detect this. `Gemma3Entry::is_hydrate_complete` and
 `Gemma4Entry::is_hydrate_complete` therefore require every attended layer to
 hold a store or a bf16 seed. An incomplete hydrated entry falls back to a full
 re-prefill. A RAM-resident entry always passes.

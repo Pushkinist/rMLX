@@ -45,7 +45,8 @@ pub(super) fn internal_error(message: &str) -> Response {
 ///
 /// Mirrors the OpenAI mapping: same `type` strings (`oom_during_load`,
 /// `oom_kv_cache`, `oom_mid_stream`), same 507 / 503 + `Retry-After` per
-/// phase, same best-effort process-memory fields.
+/// phase, same best-effort process-memory fields. No production request
+/// reaches this fn — see [`engine_error_response`]'s doc.
 #[allow(
     clippy::expect_used,
     reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
@@ -101,7 +102,10 @@ pub(super) fn oom_response(
 /// Map an `rmlx_core::Error` to an HTTP error response (Anthropic error types).
 ///
 /// `SmokeProbe` (NaN logits) → 500 internal_server_error.
-/// `Oom` → 507 / 503 typed body with `Retry-After` per phase.
+/// `Oom` → 507 / 503 typed body with `Retry-After` per phase. No production
+/// request reaches this fn with an `Oom`: `ensure_loaded` failures (the only
+/// place an `Oom` is constructed) are mapped to a plain 503 before this fn
+/// runs, so the `Oom` arm is reachable only from tests.
 /// Everything else → 503 service_unavailable_error.
 #[allow(
     clippy::wildcard_enum_match_arm,

@@ -225,6 +225,9 @@ pub(crate) fn enforce_max_tokens_cap(
 ///   after eviction frees memory).
 /// - `Generation` → **503**, no `Retry-After` (KV cache is corrupt past the
 ///   failure point — retrying the same stream is unsafe).
+///
+/// No production request reaches this fn — see
+/// [`engine_error_response`]'s doc.
 #[allow(
     clippy::expect_used,
     reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
@@ -281,7 +284,10 @@ pub(super) fn oom_response(
 /// Map an `rmlx_core::Error` to an HTTP error response.
 ///
 /// `SmokeProbe` (NaN logits, broken snapshot) → 500 internal_error.
-/// `Oom` → 507 / 503 typed body with `Retry-After` per phase.
+/// `Oom` → 507 / 503 typed body with `Retry-After` per phase. No production
+/// request reaches this fn with an `Oom`: `ensure_loaded` failures (the only
+/// place an `Oom` is constructed) are mapped to a plain 503 before this fn
+/// runs, so the `Oom` arm is reachable only from tests.
 /// Everything else → 503 service_unavailable (generator not ready / MLX error).
 #[allow(
     clippy::wildcard_enum_match_arm,

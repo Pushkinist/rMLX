@@ -26,16 +26,30 @@ use crate::bf16::bf16_to_f32;
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodeStorage {
-    /// Codes packed LSB-first into u8 bytes.
+    /// Codes packed LSB-first into u8 bytes: one contiguous LSB-first
+    /// bitstream per row, `global_bit = (row * cols + col) * bits`.
     ///
-    /// Not observed in production MLX snapshots (all real snapshots use U32Le),
-    /// but required by the spec for completeness and round-trip testing.
+    /// This is MLX's real on-disk layout at every bit width, including 3,
+    /// 5 and 6 bits (`docs/WEIGHT_QUANTS.md` § "Dequant formula"). This
+    /// codec's one non-test, non-bench caller —
+    /// `rmlx-loader/src/calibration.rs`, behind `rmlx kv-calibrate` — always
+    /// picks `U32Le` instead, never this variant; see `U32Le`'s doc.
     U8,
     /// Codes packed LSB-first into u32 little-endian words.
+    /// `per_word = 32 / bits` (floor), padded to the next word per row.
     ///
-    /// This is what every real MLX affine snapshot uses.
-    /// `per_word = 32 / bits`. For 3-bit elements: 10 per u32, last 2 bits
-    /// of each u32 are unused padding.
+    /// Matches MLX's real layout only at 2, 4 and 8 bits, where `32 / bits`
+    /// divides evenly and the word-padded model coincides with `U8`'s
+    /// contiguous bitstream. At 3, 5 and 6 bits `per_word * bits < 32`, so
+    /// this variant's expected byte length is always larger than a real
+    /// MLX tensor's, and the length check rejects it before any decode —
+    /// it is a length mismatch, never silently wrong values.
+    ///
+    /// `rmlx-loader/src/calibration.rs` picks this variant unconditionally,
+    /// so `rmlx kv-calibrate` cannot run its weight-norm recipes against a
+    /// real 3/5/6-bit affine checkpoint. Model loading for serving does not
+    /// call this codec: it decodes affine weights on the GPU through
+    /// mlx-c, which is unaffected.
     U32Le,
 }
 
@@ -62,11 +76,14 @@ pub struct AffineParams {
 
 // ── Validation ────────────────────────────────────────────────────────────────
 
-/// Affine bit-widths this build's dequant codec supports — CPU (`dequant_to_f32`
-/// below) and GPU (mlx-c `affine_dequantize_*` / `quantized_matmul` kernels)
-/// alike. Single source of truth: `validate_params` and any load-time
-/// pre-flight check (e.g. `rmlx_models::arch::loader`) must both read this
-/// constant rather than re-deriving the set.
+/// Affine bit-widths the GPU path (mlx-c `affine_dequantize_*` /
+/// `quantized_matmul` kernels) supports. The CPU decoder below
+/// (`dequant_to_f32`) only actually matches a real MLX snapshot's byte
+/// layout at 2, 4 and 8 bits — see `CodeStorage::U32Le`'s doc — so this
+/// list is wider than what the CPU path can decode correctly. Single
+/// source of truth: `validate_params` and any load-time pre-flight check
+/// (e.g. `rmlx_models::arch::loader`) must both read this constant rather
+/// than re-deriving the set.
 pub const SUPPORTED_BITS: [u8; 6] = [2, 3, 4, 5, 6, 8];
 
 /// Cold helper: construct the "bits not supported" error.

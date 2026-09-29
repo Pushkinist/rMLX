@@ -355,10 +355,11 @@ pub fn load_model(model_dir: &Path, device: Device, opts: &LoadOpts) -> Result<A
 ///
 /// Only the literal `"affine"` mode (`config.json`'s `quantization.mode`,
 /// defaulting to `"affine"` when absent) has a variable bit-width kernel
-/// matrix — `SUPPORTED_BITS` lists exactly what
-/// `crates/rmlx-quant/src/affine.rs` (CPU codec) and this build's linked
-/// mlx-c (GPU `affine_dequantize_*_b_<bits>` / `quantized_matmul` kernels)
-/// both support. Every other mode string — a known fixed-format mode
+/// matrix — `SUPPORTED_BITS` lists what this build's linked mlx-c (GPU
+/// `affine_dequantize_*_b_<bits>` / `quantized_matmul` kernels) supports.
+/// The CPU codec (`crates/rmlx-quant/src/affine.rs`) only actually matches
+/// MLX's byte layout at 2, 4 and 8 bits of that list — see
+/// `CodeStorage::U32Le`'s doc. Every other mode string — a known fixed-format mode
 /// (`mxfp8`/`mxfp4`/`nvfp4`) or an unrecognized future one — is left alone.
 /// Gating on the exact string (rather than `QuantMode::from`'s
 /// "unknown -> affine" resolver-convenience fallback) matters here: treating

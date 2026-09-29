@@ -4,21 +4,23 @@
 //! ## API shape (OpenAI-compatible)
 //!
 //! `POST /v1/audio/transcriptions` — Multipart form with:
-//! - `file` — audio file bytes (any Symphonia-supported container at 16 kHz mono).
+//! - `file` — audio file bytes (any Symphonia-supported container, any sample
+//!   rate — downmixed to mono and resampled to 16 kHz).
 //! - `model` — model identifier (e.g. `whisper-large-v3`).
-//! - `language` — optional BCP-47 language code (default: `"en"`). Unknown codes
-//!   receive HTTP 422.
+//! - `language` — optional BCP-47 language code (default: `"auto"`, which
+//!   triggers language detection). Unknown codes receive HTTP 422.
 //! - `response_format` — `json` | `text` | `verbose_json` | `srt` | `vtt` (default: `json`).
-//! - `temperature` — sampling temperature in `[0.0, 1.0]` (default: `0.0`). Malformed
-//!   or out-of-range values receive HTTP 422.
+//! - `temperature` — sampling temperature in `[0.0, 1.0]` (default: `0.0`).
+//!   A non-finite or negative value receives HTTP 422; a value above 1.0 is
+//!   accepted and has no effect (greedy decode ignores it — see `whisper.rs`).
 //! - `prompt` — optional text to guide the decoder (not yet implemented).
 //!
 //! `POST /v1/audio/translations` — same shape; forces English output (translate task).
 //!
 //! ## v1 constraints
 //!
-//! - Any Symphonia-supported container at 16 kHz mono is accepted (WAV, MP3, FLAC, …).
-//!   The decoder rejects audio at a sample rate other than 16 kHz with 422.
+//! - Any Symphonia-supported container at any sample rate is accepted (WAV,
+//!   MP3, FLAC, …); non-16 kHz audio is resampled, never rejected.
 //! - No streaming (SSE timestamps) — deferred to v2.
 //! - 25 MiB audio file size cap (enforced by server body limit; additional
 //!   per-field check here). The transport `DefaultBodyLimit` is set to 26 MiB
@@ -466,11 +468,11 @@ async fn parse_multipart(multipart: &mut Multipart) -> Result<AudioFormFields, S
             "temperature" => {
                 let text = field.text().await.map_err(|e| e.to_string())?;
                 let t = text.parse::<f32>().map_err(|_| {
-                    format!("invalid temperature '{text}'; must be a finite float in [0.0, 1.0]")
+                    format!("invalid temperature '{text}'; must be a finite float >= 0.0")
                 })?;
                 if !t.is_finite() || t < 0.0 {
                     return Err(format!(
-                        "temperature {t} is out of range; must be a finite float in [0.0, 1.0]"
+                        "temperature {t} is out of range; must be a finite float >= 0.0"
                     ));
                 }
                 temperature = t;

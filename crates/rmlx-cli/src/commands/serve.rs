@@ -486,7 +486,10 @@ pub(crate) fn run_serve(
     prefix_index_kind: rmlx_models::prefix_index::PrefixIndexKind,
     // Enable the in-process adaptive admission controller (default OFF).
     adaptive_admission: bool,
-    // TTFT SLA target in ms for the adaptive controller (default 500 ms).
+    // End-to-end step SLA target in ms for the adaptive controller (not TTFT
+    // per se; default 500 ms). The current flag is `--step-target-ms`;
+    // `--ttft-target-ms` is a separate clap `alias` for backward
+    // compatibility. This field keeps its old name for both.
     ttft_target_ms: u64,
     // ITL SLA target in ms for the adaptive controller (default 50 ms).
     itl_target_ms: u64,
@@ -802,7 +805,9 @@ pub(crate) fn run_serve(
                     tracing::warn!(
                         path = %hb_path.display(),
                         "head_budgets.json present but no kv_calib.json — \
-                         budgets ignored (sparse-attn needs both)"
+                         budgets ignored. Note: sparse-attn has no \
+                         production caller regardless of whether both \
+                         files are present."
                     );
                 }
             }

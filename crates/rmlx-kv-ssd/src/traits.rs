@@ -81,9 +81,10 @@ pub trait SsdHydrate<E>: Send {
 pub trait HydratedEntry: Sized {
     /// The arch's cross-layer-KV topology — its `SHARES_KV_ACROSS_LAYERS`.
     ///
-    /// It lands on every restored `KvCache`, and a hydrated cache can be
-    /// tail-extended, which re-runs the `exit_prefill` gate this flag decides.
-    /// A hard-coded `false` drops a bf16 mirror a sharing arch reads; a
+    /// It lands on every restored `KvCache`. If a hydrated cache is ever
+    /// tail-extended through the `exit_prefill` gate this flag decides — no
+    /// production architecture does that — a hard-coded `false` drops
+    /// a bf16 mirror a sharing arch reads; a
     /// hard-coded `true` builds one no other arch reads. The constant is what
     /// keeps the shared body from choosing either.
     const SHARES_KV: bool;

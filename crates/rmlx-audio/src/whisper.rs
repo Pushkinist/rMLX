@@ -45,8 +45,9 @@
 //!
 //! ## Inference loop
 //!
-//! Uses greedy decoding (argmax) by default. Temperature scaling is applied
-//! when `temperature > 0`. KV-cache is maintained per-block for O(n) decode.
+//! Uses greedy decoding (argmax) only. `temperature` is accepted for API
+//! parity but `argmax_f32` ignores it — no temperature-scaled softmax path
+//! exists. KV-cache is maintained per-block for O(n) decode.
 
 use std::path::Path;
 
@@ -777,7 +778,9 @@ impl WhisperModel {
     ///
     /// `sot_sequence`: initial tokens (SOT + lang + task + no_timestamps).
     /// `max_tokens`: cap on generated tokens.
-    /// `temperature`: 0 = greedy argmax; > 0 = temperature-scaled softmax + argmax.
+    /// `temperature`: accepted for API parity; `argmax_f32` ignores it, so
+    /// every value decodes as greedy argmax — no temperature-scaled softmax
+    /// path exists.
     /// `filters`: per-step logit suppression set (`DecodeFilters`).
     ///
     /// Returns the full token sequence **including** any timestamp tokens — the

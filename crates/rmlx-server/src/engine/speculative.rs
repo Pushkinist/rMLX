@@ -685,21 +685,24 @@ impl Generator for SpeculativeGenerator {
         // Speculative decode cannot honor a stateful grammar: the K+1
         // verifier argmax has no per-token mask hook that aligns with
         // `ConstraintEngine::step_mask`. The request is refused, not run
-        // unconstrained. The refusal is an `Error::Other`, which both routes
-        // map to HTTP 503.
+        // unconstrained. The refusal is an `Error::Other`, which the OpenAI
+        // route maps to HTTP 503; the Anthropic route always sets
+        // `constraint: None`, so it can never reach this refusal.
+        // `req.constraint` is also set for `tool_choice: required` / a
+        // named tool, not only `response_format`.
         if req.constraint.is_some() {
             tracing::warn!(
                 model_id = %req.model_id,
                 "SpeculativeGenerator: refusing request — response_format \
-                 + speculative decode not supported"
+                 or tool_choice + speculative decode not supported"
             );
             return Box::pin(stream::once(async {
                 Err(Error::Other(
                     "speculative_decode_with_response_format_unsupported: \
-                     `response_format` (json_object / json_schema) is not \
-                     supported on the speculative-decoding path. Retry the \
-                     request without speculative draft, or drop \
-                     response_format."
+                     `response_format` (json_object / json_schema) or a \
+                     required/named `tool_choice` is not supported on the \
+                     speculative-decoding path. Retry the request without \
+                     speculative draft, or drop the constraint."
                         .to_owned(),
                 ))
             }));
@@ -865,8 +868,9 @@ impl Generator for SpeculativeGenerator {
                     None => (text, false),
                 };
                 // resolve raw decode logprobs into the OpenAI wire shape
-                // (tokenizer in scope). `None` on the disabled path and on the
-                // speculative verifier (Gemma4 captures no logprobs).
+                // (tokenizer in scope). `None` on the disabled path, and also
+                // on every speculative round: `emit_step` hard-codes
+                // `logprobs: None` for every architecture, not just Gemma4.
                 let logprobs = s.logprobs.as_ref().map(|lp| {
                     let chosen_surface = tokenizer_ref
                         .id_to_token(s.token_id)

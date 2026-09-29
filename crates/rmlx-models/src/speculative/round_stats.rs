@@ -724,8 +724,10 @@ impl RoundStats {
     /// Close the request with the one record every reader of a speculative run
     /// takes its numbers from.
     ///
-    /// `scripts/lib/spec_round_log.py` is the only thing that parses it, and
-    /// `scripts/spec_bench.sh` records what it finds here — including
+    /// `scripts/lib/spec_round_log.py` parses it, and so does
+    /// `crates/rmlx-cli/tests/e2e/runner.rs` (`assert_spec_decode`), with a
+    /// different rule for the two-model loops. `scripts/spec_bench.sh`
+    /// records what it finds here — including
     /// `decode_config`, so a new drafter or a new depth policy reaches the
     /// metrics store without a bench script learning about it.
     ///

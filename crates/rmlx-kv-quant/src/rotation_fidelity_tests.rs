@@ -847,9 +847,9 @@ fn planar4_outlier_cosine_gate() {
 /// behave like iso3 — both floors would still hold. This ordering can.
 ///
 /// `planar` is deliberately absent: it **inverts**, and does so on the i.i.d.
-/// fixture too. See `byte_identical_bit_widths_leave_one_width_dominated` in
-/// `rate_distortion_tests.rs`, which pins the inversion with dB numbers rather
-/// than hiding it here.
+/// fixture too. See `planar_widths_are_byte_identical_and_the_others_pay_for_their_bits`
+/// in `rate_distortion_tests.rs`, which pins the inversion with dB numbers
+/// rather than hiding it here.
 #[test]
 fn wider_codebooks_score_higher_on_the_outlier_fixture() {
     let data = outlier_fixture();

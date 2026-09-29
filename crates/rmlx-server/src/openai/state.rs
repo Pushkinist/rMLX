@@ -342,11 +342,17 @@ pub enum ApiErrorCategory {
     /// HTTP 404 `not_found_error` / `model_not_found` — model absent from
     /// registry.
     NotFound,
-    /// HTTP 507 `oom_during_load` — weight-load OOM.
+    /// HTTP 507 `oom_during_load` — weight-load OOM. No production request
+    /// path increments this category: `ensure_loaded` failures are
+    /// counted as `Upstream` before an `Error::Oom` can be classified.
     OomLoad,
-    /// HTTP 507 `oom_kv_cache` — KV-cache allocation OOM.
+    /// HTTP 507 `oom_kv_cache` — KV-cache allocation OOM. No production
+    /// request path increments this category: no site constructs an
+    /// `Error::Oom` at this phase.
     OomKvCache,
-    /// HTTP 503 `oom_mid_stream` — mid-decode OOM.
+    /// HTTP 503 `oom_mid_stream` — mid-decode OOM. No production request
+    /// path increments this category: no site constructs an `Error::Oom`
+    /// at this phase.
     OomMidStream,
     /// HTTP 408 `timeout` — per-request wall-clock timeout.
     Timeout,

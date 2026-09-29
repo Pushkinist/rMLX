@@ -270,8 +270,9 @@ pub(super) fn cmd_deltas(
             if !rows.is_empty() {
                 return Err(ExitWith(125).into());
             }
-            // Zero rows with a known SHA means the SHA exists but every cell
-            // was within threshold — clean, exit 0.
+            // Zero rows with a known SHA means every cell was within
+            // threshold, or no cell was measured again after the SHA —
+            // either way, exit 0.
         }
     }
     Ok(())

@@ -38,8 +38,8 @@
 //!
 //! ## Compile-only today
 //!
-//! Items are exposed `pub` so can build on top, but the upstream
-//! crates (`rmlx-runtime`, `rmlx-server`) do not yet import them. The unit
+//! Items are exposed `pub` so a future caller can build on top, but the
+//! upstream crates (`rmlx-runtime`, `rmlx-server`) do not yet import them. The unit
 //! tests in this module exercise the full state machine + eviction policy +
 //! event lifecycle.
 

@@ -7,9 +7,12 @@
 //! reads `RMLX_TEST_MODEL_BONSAI` first and the slug second.)
 //!
 //! **An unset variable is not a stand-down.** A machine holding the snapshot
-//! runs the cell: these cells are GPU tests that `make gpu-test` selects, and
-//! a cell that returned before asserting on a host holding its snapshot would
-//! pass without testing anything.
+//! runs the cell. Most of these cells are GPU tests that `make gpu-test`
+//! selects; a few (for example `quantize_paro_embed_row760`,
+//! `integration_qwen3_5_moe_35b`) are `#[ignore]`d CPU tests that reach no
+//! `Device::Gpu` and so run under no gate — they need `cargo test -- --ignored
+//! <name>` by hand. Either way, a cell that returned before asserting on a
+//! host holding its snapshot would pass without testing anything.
 
 use std::path::{Path, PathBuf};
 

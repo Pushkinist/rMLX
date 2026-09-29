@@ -292,7 +292,8 @@ fn ingest_jsonl_row(
     // Weight quant from model name suffix.
     let weight_quant = infer_weight_quant_from_model(&model).to_string();
 
-    // KV quant canonicalization (parser-based, accepts `mixed_*`).
+    // KV quant canonicalization: lowercase + a few known aliases; accepts
+    // any string, including `mixed_*`, unchanged.
     let kv_quant = identity::canonicalize_kv_quant(&row.kv_quant)?;
 
     // Build legacy_run_key for idempotency (docs/METRICS_DB.md § "Legacy import").

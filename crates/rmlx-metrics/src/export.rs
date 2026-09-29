@@ -525,7 +525,8 @@ fn render_model_table(
     out.push_str("|---:|---:|---|\n");
 
     // Order rows: BACKEND_DISPLAY_ORDER first, then alphabetic for unknown
-    // backends. Within a backend, sort kv_quant alphabetically.
+    // backends. Within a backend, sort kv_quant then decode_config
+    // alphabetically.
     let mut row_keys: Vec<RowKey> = cells.keys().cloned().collect();
     row_keys.sort_by(|a, b| {
         let aa = BACKEND_DISPLAY_ORDER
@@ -552,7 +553,9 @@ fn render_model_table(
         let kv_label = kv_quant_display(kv_quant);
         let decode_label = decode_config.as_deref().unwrap_or("plain");
 
-        // Derive ctx_max from any row in this (backend, kv_quant) cell.
+        // Derive ctx_max from the alphabetically-first metric's row in this
+        // (backend, kv_quant, decode_config) cell — `metric_map` is a
+        // `BTreeMap<String, _>` keyed by metric name.
         let ctx_max = metric_map.values().next().map_or(8192, |r| r.cell.ctx_max);
 
         // Look up kv_cache_bytes for this (model, ctx_max, kv_quant) across

@@ -136,10 +136,13 @@ pub enum KvQuant {
     TurboSym4,
     /// K = affine q8_0 (group_size=128), V = PlanarQuant **3-bit**.
     ///
-    /// 3.25-bit V codec extending the existing `Planar` (4.25-bit) codec downward.
+    /// A 3-bit V codec extending the existing `Planar` 4-bit codec downward.
     /// Same Givens-rotation + per-pair scale algorithm; 3-bit Lloyd-Max N(0,1) codebook
     /// (8 centroids). Pack format: 10 vals/u32 (3 × 10 = 30 bits, 2 wasted per u32) —
     /// ForgeAttention-compatible, same u32 word count as 4-bit (ceil(32/10) = 4 = 4).
+    /// Both widths store 22.00 bits/value: the per-pair scale alone is a
+    /// whole bf16 value's worth of sideband, so the 3-bit and 4-bit members
+    /// occupy byte-identical storage.
     ///
     /// Storage: routes to `KvStorage::Planar { bits: 3 }` — no new `KvStorage` variant.
     /// CPU path: scalar `planar_quantize(bits=3)`. GPU: `planar_quantize_v3_gpu`.

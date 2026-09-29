@@ -851,10 +851,12 @@ pub fn lookup_layer_calibration<'c>(
 /// per-layer high-precision indices to codec storage during cache construction.
 /// `with_calibration()` stores the calibration.
 ///
-/// **No in-tree caller yet.** The surface is wired end-to-end
-/// (loader → `ModelLoadConfig` → `KvCacheBuilder`) but per-arch construction
-/// code that calls `with_calibration` is deferred.
-/// Codec behavior is unchanged — indices are stored but not yet consumed.
+/// **No in-tree caller yet.** `rmlx_loader::discover_kv_calibration` finds
+/// the file and `ModelLoadConfig::calibration` (`rmlx-server`) carries it,
+/// but nothing forwards `ModelLoadConfig::calibration` to a
+/// `KvCacheBuilder` — no per-arch construction code calls
+/// `with_calibration`. Codec behavior is unchanged — indices are stored but
+/// not yet consumed.
 #[allow(
     clippy::exhaustive_structs,
     reason = "closed builder — field set is the complete calibration-attach contract; adding a field requires a review of all call sites"

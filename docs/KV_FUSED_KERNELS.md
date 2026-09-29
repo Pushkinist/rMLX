@@ -393,8 +393,10 @@ On a Qwen MoE arch, `validate_resolved` rejects `planar_k`
 (`QwenMoePlanarKRejected`).
 
 The `niah_pflash_*` cells in `crates/rmlx-models/tests/niah_long_context.rs`
-force `planar_k`, count dispatches and require the needle. With the policy on
-and a live bf16 K seed, they assert zero dispatches.
+force `planar_k`, count dispatches and require the needle — except the
+three `niah_pflash_qwen36_32k_*` cells, which never reach their asserts:
+`validate_resolved` rejects `PlanarK` on Qwen3.6 MoE and panics in
+`generate_greedy` first. See `docs/TESTING.md` § "NIAH long-context harness".
 
 ### Numerical relationship to the split chain — measured, not bit-exact
 
