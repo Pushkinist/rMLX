@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use rmlx_core::error::{Error, Result};
-use rmlx_loader::{load_config, load_shard_index, ShardSet};
+use rmlx_loader::{load_config, load_shard_index, ModelConfig, ShardHandle, ShardSet};
 use rmlx_mlx::{Array, Device};
 
 use super::phases::LAST_LOAD_PHASES;
@@ -51,7 +51,8 @@ pub struct LoadOpts {
 ///
 /// # Errors
 /// Returns `Error::Config` if `config.json` cannot be read or parsed.
-/// Returns `Error::Model` if the architecture is not yet supported.
+/// Returns `Error::Model` if the snapshot is a Hadamard pack (see
+/// [`refuse_hadamard_pack`]) or the architecture is not yet supported.
 /// Returns `Error::Quant` if the declared affine weight-quant bit-width (the
 /// global default or a `tensor_overrides` entry) is unsupported by this
 /// build's MLX/mlx-c.
@@ -61,6 +62,7 @@ pub fn load_model(model_dir: &Path, device: Device, opts: &LoadOpts) -> Result<A
     let t_total_start = Instant::now();
 
     let cfg = load_config(model_dir)?;
+    refuse_hadamard_pack(&cfg, model_dir)?;
 
     let arch_str = cfg.architectures.first().map_or("(empty)", String::as_str);
 
@@ -350,6 +352,66 @@ pub fn load_model(model_dir: &Path, device: Device, opts: &LoadOpts) -> Result<A
     Ok(arch)
 }
 
+/// Refuse a Prism Hadamard pack, found from file facts and not from
+/// `architectures`: `config.json` carries `hadamard_config`, or a shard carries
+/// a `.signs` tensor.
+///
+/// The weights of such a pack need an input-side Hadamard transform that rMLX
+/// does not apply. Without this check they load as plain affine weights and
+/// give wrong output with no error.
+///
+/// # Errors
+/// `Error::Model` naming the fact found. `Error::Loader` if a shard in
+/// `model_dir` cannot be opened or its header cannot be parsed.
+pub fn refuse_hadamard_pack(cfg: &ModelConfig, model_dir: &Path) -> Result<()> {
+    let fact = if cfg.extras.contains_key("hadamard_config") {
+        Some("config.json carries `hadamard_config`".to_owned())
+    } else {
+        first_signs_tensor(model_dir)?.map(|name| format!("shard tensor `{name}`"))
+    };
+    let Some(fact) = fact else {
+        return Ok(());
+    };
+    tracing::error!(
+        model_dir = %model_dir.display(),
+        fact = %fact,
+        "arch: Hadamard pack refused"
+    );
+    Err(Error::Model(format!(
+        "{} is a Hadamard pack ({fact}): its weights need an input-side Hadamard \
+         transform that rMLX does not apply, so they would give wrong output",
+        model_dir.display()
+    )))
+}
+
+/// The first tensor name ending in `.signs` across the `*.safetensors` shards
+/// in `model_dir`. Reads only the shard headers.
+fn first_signs_tensor(model_dir: &Path) -> Result<Option<String>> {
+    let entries = std::fs::read_dir(model_dir)
+        .map_err(|e| Error::Loader(format!("cannot read dir {}: {e}", model_dir.display())))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            Error::Loader(format!("read_dir entry in {}: {e}", model_dir.display()))
+        })?;
+        let Ok(filename) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !filename.ends_with(".safetensors") {
+            continue;
+        }
+        let shard = ShardHandle::open(model_dir, &filename)?;
+        if let Some(name) = shard
+            .safetensors()?
+            .names()
+            .into_iter()
+            .find(|n| n.rsplit_once('.').is_some_and(|(_, last)| last == "signs"))
+        {
+            return Ok(Some(name.to_owned()));
+        }
+    }
+    Ok(None)
+}
+
 /// Reject a declared weight-quant bit-width this build's mlx-c has no
 /// dequant kernel for.
 ///
@@ -375,7 +437,7 @@ pub fn load_model(model_dir: &Path, device: Device, opts: &LoadOpts) -> Result<A
 /// tensor, which would die at that tensor's first prefill exactly like the
 /// global case (`rmlx-loader/src/config_tests.rs::load_config_accepts_normal_tensor_overrides`
 /// documents this schema is real and accepted by `load_config`).
-fn preflight_weight_quant(cfg: &rmlx_loader::ModelConfig, arch_str: &str) -> Result<()> {
+fn preflight_weight_quant(cfg: &ModelConfig, arch_str: &str) -> Result<()> {
     let Some(q) = cfg.quantization.as_ref() else {
         return Ok(());
     };

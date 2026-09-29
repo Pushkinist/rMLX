@@ -220,6 +220,14 @@ tensor I/O. An unsupported width fails the load with one error, instead of
 failing at the first prefill. See `docs/ADDING_A_MODEL.md` for how the gate
 composes with a new architecture.
 
+**Hadamard packs are refused.** A Prism Hadamard pack stores affine weights
+that need an input-side Hadamard transform. rMLX does not apply that transform,
+so the weights would load as plain affine weights and give wrong output.
+`load_model` refuses the snapshot before the architecture check when
+`config.json` carries `hadamard_config` or a shard carries a tensor whose name
+ends in `.signs` (`refuse_hadamard_pack` in
+`crates/rmlx-models/src/arch/loader.rs`). The error names the fact it found.
+
 Source: `crates/rmlx-quant/src/affine.rs`
 
 ---

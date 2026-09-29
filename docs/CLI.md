@@ -593,7 +593,8 @@ qwen36_diag <model-dir> <device> <N>  # greedy generation of N tokens
 ```
 
 The device defaults to `cpu`. The mlx-lm reference is `argmax_id=8160`,
-`max_abs_logit=29.75`.
+`max_abs_logit=29.75`. It refuses a snapshot whose `architectures[0]` is not a
+Qwen3.5 class, and a Hadamard pack (`docs/WEIGHT_QUANTS.md` §4.4).
 
 ---
 

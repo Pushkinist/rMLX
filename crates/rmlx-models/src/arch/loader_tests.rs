@@ -4,7 +4,7 @@ use super::*;
 /// tests below. Only the `quantization` block matters for
 /// `preflight_weight_quant`; every other field takes its serde default.
 #[allow(clippy::unwrap_used)]
-fn cfg_with_quant(json: &str) -> rmlx_loader::ModelConfig {
+fn cfg_with_quant(json: &str) -> ModelConfig {
     serde_json::from_str(json).unwrap()
 }
 
