@@ -95,6 +95,103 @@ Every PR names what it makes deletable — code, a gate, a flag, a doc section
 but write it down: deletion is a deliverable, not something that happens to
 get scheduled later.
 
+## Issues
+
+### Templates
+
+File every issue with a template: **Bug report**, **New model** or **Feature
+request**. Agents that file with `gh issue create --body-file` write the
+template headings (`### <label>`) in the same order, so the body reads the
+same as a form submission.
+
+### Labels
+
+| Axis | Values | Rule |
+|---|---|---|
+| Kind | `bug`, `feature`, `enhancement`, `documentation`, `test`, `model` | Exactly one. The template sets it. |
+| State | `triage`, `ready`, `needs-measurement`, `needs-decision` | At most one. A new issue is `triage`. The analysis moves it. A falsified premise or a duplicate is closed. |
+| Evidence | `premise-unverified` | The premise comes from reading the code, not from a run. The first acceptance item is to reproduce it with a measurement. The label goes away when a failing test or a measurement exists. |
+| Topic | `performance` | Optional. |
+
+An issue with an assignee is in work. An issue without one is not.
+
+### Stages
+
+1. **File.** One defect or one request per issue. Give the evidence: a
+   command with its output, or `path:line@SHA` with the quoted line. Say what
+   you did not check. Do not design the fix.
+2. **Analyse.** One comment headed `Analysis @ <SHA>`: a verdict per claim
+   with evidence, where to look, the chunk-0 test plan, related issues, size,
+   and any decision the maintainer must make. The body stays as filed. An
+   issue is analysed again only when the cited files changed since that SHA
+   (`git diff --stat <SHA>..HEAD -- <paths>`). Use this shape for the
+   comment:
+
+   ```markdown
+   ## Analysis @ <SHA> (<branch>)
+
+   This comment is self-contained: an agent that reads only the issue body and its comments can act on it.
+
+   Verdict: CONFIRMED | PARTLY CONFIRMED | FALSIFIED | ALREADY FIXED | NEEDS MEASUREMENT
+   Next state: ready | needs-measurement | needs-decision | close (falsified or duplicate)
+
+   ### What changed since the body
+
+   Commits, merged PRs or earlier comments that moved the premise or the next step. "Nothing" is a valid answer.
+
+   ### Claims
+
+   | # | Claim | Verdict | Evidence (path:line @ SHA, quoted) |
+   |---|---|---|---|
+   | 1 | | | |
+
+   ### Where to look
+
+   Files, functions and types (repo-relative). The deepest seam the change touches.
+
+   ### Chunk 0
+
+   - Observable at the deepest seam:
+   - What cannot move under the defect:
+   - Mutations (mutation -> assertion that catches it):
+   - CPU or GPU. Snapshots and architectures (one shared-KV `kv_h == 1`, one dense `kv_h > 1` where it applies):
+
+   ### Related issues
+
+   - Blocked by #
+   - Blocks #
+   - Same branch as #
+   - Found while #
+   - Duplicate of #
+
+   ### Size and decisions
+
+   Size: S | M | L — the reason.
+   Decision needed: the question, or "none".
+
+   ### Not checked
+
+   What this analysis did not verify, and the test or run that would.
+   ```
+3. **Fix.** One issue, one branch, one PR (see "Workflow" above).
+
+### Related issues
+
+Link issues with these verbs, one line each, in the body or in the analysis
+comment. The verbs make the links searchable.
+
+- `Blocked by #<n>` — this issue cannot be solved before #<n>.
+- `Blocks #<n>` — #<n> cannot be solved before this issue.
+- `Same branch as #<n>` — solve both on one branch.
+- `Found while #<n>` — found during the work on #<n>.
+- `Duplicate of #<n>` — close this issue.
+
+### Public text
+
+Issues are public. Before you post, remove absolute local paths, user names,
+host names, tokens and internal links. Write `<RMLX_HOME>`, `~` or a
+repo-relative path instead.
+
 ## Commit messages
 
 Conventional-Commits style: `type(scope): summary`
