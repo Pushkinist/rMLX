@@ -490,6 +490,7 @@ Serves jina-embeddings-v4 text and image embeddings.
 | `task` | string | LoRA task: `retrieval` (default), `text-matching` or `code`. |
 | `prompt_name` | string | `query` (default) or `passage`. `text-matching` always uses `Query`. |
 | `return_multivector` | bool | Per-token multi-vector output instead of one pooled vector. |
+| `truncate_prompt_tokens` | i64 | Refused: any value except `null` is 400. Keeping the last N tokens removes the task prefix. |
 
 Text gets the prefix `"{Query|Passage}: {text}"` and no special tokens. One
 request embeds all text or all images, not a mix.

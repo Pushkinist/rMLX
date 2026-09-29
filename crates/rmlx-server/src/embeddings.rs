@@ -84,6 +84,10 @@ pub struct EmbeddingsRequest {
     /// instead of a single pooled vector.
     #[serde(default)]
     pub return_multivector: bool,
+    /// vLLM's keep-the-last-N-tokens truncation. Parsed only to refuse it:
+    /// see [`refused_field`].
+    #[serde(default)]
+    pub truncate_prompt_tokens: Option<i64>,
 }
 
 /// `input` accepts a single string, a list of strings (OpenAI text shape),
@@ -208,6 +212,21 @@ fn err(
     (status, Json(body)).into_response()
 }
 
+/// The 400 message for a request field this route refuses, or `None`.
+///
+/// `truncate_prompt_tokens` keeps the last N tokens. A jina text sequence starts
+/// with its task prefix, and an image sequence is a fixed prompt with image
+/// tokens, so a cut from the start removes the part the model needs.
+fn refused_field(req: &EmbeddingsRequest) -> Option<String> {
+    req.truncate_prompt_tokens.map(|n| {
+        format!(
+            "truncate_prompt_tokens ({n}) is not supported: removing tokens from the \
+             start of a jina sequence removes its task prefix. Truncate the input text \
+             before the request."
+        )
+    })
+}
+
 // ── Handler ───────────────────────────────────────────────────────────────────
 
 /// `POST /v1/embeddings` handler.
@@ -216,6 +235,15 @@ pub(crate) async fn embeddings(
     LoggedJson(req): LoggedJson<EmbeddingsRequest>,
 ) -> Response {
     // ── Validate request fields (400) ────────────────────────────────────────
+    if let Some(msg) = refused_field(&req) {
+        return err(
+            &state,
+            ApiErrorCategory::BadRequest,
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            &msg,
+        );
+    }
     let encoding_format = req.encoding_format.as_deref().unwrap_or("float");
     if encoding_format != "float" && encoding_format != "base64" {
         return err(

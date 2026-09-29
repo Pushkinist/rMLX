@@ -91,3 +91,26 @@ fn decode_image_source_data_uri_and_raw_base64() {
     // pathish but missing file -> clear error
     assert!(load_image("/no/such/file.png", DEFAULT_HTTP_TIMEOUT).is_err());
 }
+
+fn request(json: &str) -> EmbeddingsRequest {
+    serde_json::from_str(json).unwrap()
+}
+
+/// A set `truncate_prompt_tokens` is refused with a message naming the field.
+#[test]
+fn truncate_prompt_tokens_set_is_refused() {
+    let req = request(r#"{"model":"m","input":"hi","truncate_prompt_tokens":8}"#);
+    let msg = refused_field(&req).unwrap_or_default();
+    assert!(msg.contains("truncate_prompt_tokens"), "{msg}");
+}
+
+/// An absent or null `truncate_prompt_tokens` is not refused.
+#[test]
+fn truncate_prompt_tokens_unset_is_accepted() {
+    for json in [
+        r#"{"model":"m","input":"hi"}"#,
+        r#"{"model":"m","input":"hi","truncate_prompt_tokens":null}"#,
+    ] {
+        assert_eq!(refused_field(&request(json)), None, "{json}");
+    }
+}
