@@ -84,6 +84,10 @@ pub struct EmbeddingsRequest {
     /// instead of a single pooled vector.
     #[serde(default)]
     pub return_multivector: bool,
+    /// vLLM's keep-the-last-N-tokens truncation. Parsed only to refuse it:
+    /// see [`refused_field`].
+    #[serde(default)]
+    pub truncate_prompt_tokens: Option<i64>,
 }
 
 /// `input` accepts a single string, a list of strings (OpenAI text shape),
@@ -171,6 +175,10 @@ struct Usage {
 
 /// A resident jina-embeddings-v4 model plus the registry id it was loaded
 /// for. Kept in `AppState::embed_slot` (not `slots`).
+///
+/// The model has its own lock, and a forward holds only that lock. The
+/// `embed_slot` lock is held only to read or replace this entry, so a
+/// residency read never waits on a forward.
 #[allow(
     clippy::exhaustive_structs,
     reason = "internal closed model-slot struct — two fields are the complete jina embed model contract; adding a field requires updating all JinaEmbedModel construction sites in the serve path"
@@ -179,15 +187,14 @@ pub struct JinaEmbedModel {
     /// Registry model id this instance was loaded for.
     pub id: String,
     /// The loaded encoder (mutable: `apply_task` swaps the live LoRA).
-    pub model: JinaV4,
+    pub model: Arc<parking_lot::Mutex<JinaV4>>,
 }
 
 impl std::fmt::Debug for JinaEmbedModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("JinaEmbedModel")
             .field("id", &self.id)
-            .field("active_task", &self.model.active_task())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -208,6 +215,21 @@ fn err(
     (status, Json(body)).into_response()
 }
 
+/// The 400 message for a request field this route refuses, or `None`.
+///
+/// `truncate_prompt_tokens` keeps the last N tokens. A jina text sequence starts
+/// with its task prefix, and an image sequence is a fixed prompt with image
+/// tokens, so a cut from the start removes the part the model needs.
+fn refused_field(req: &EmbeddingsRequest) -> Option<String> {
+    req.truncate_prompt_tokens.map(|n| {
+        format!(
+            "truncate_prompt_tokens ({n}) is not supported: removing tokens from the \
+             start of a jina sequence removes its task prefix. Truncate the input text \
+             before the request."
+        )
+    })
+}
+
 // ── Handler ───────────────────────────────────────────────────────────────────
 
 /// `POST /v1/embeddings` handler.
@@ -216,6 +238,15 @@ pub(crate) async fn embeddings(
     LoggedJson(req): LoggedJson<EmbeddingsRequest>,
 ) -> Response {
     // ── Validate request fields (400) ────────────────────────────────────────
+    if let Some(msg) = refused_field(&req) {
+        return err(
+            &state,
+            ApiErrorCategory::BadRequest,
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            &msg,
+        );
+    }
     let encoding_format = req.encoding_format.as_deref().unwrap_or("float");
     if encoding_format != "float" && encoding_format != "base64" {
         return err(
@@ -560,41 +591,31 @@ fn compute_embeddings(
     // Single Metal context: serialise the whole compute (load + forward).
     let _gpu = gpu_gate.lock();
 
-    // Lazily load (or reuse) the resident embedding model.
-    {
-        let needs_load = {
-            let slot = embed_slot.read();
-            slot.as_ref().is_none_or(|m| m.id != model_id)
-        };
-        if needs_load {
-            tracing::info!(model_id, path = %abs_path.display(), "embeddings: loading jina-v4");
-            let model = jina_v4::load_from_path(abs_path)
-                .map_err(|e| EmbedError::Load(format!("failed to load '{model_id}': {e}")))?;
-            *embed_slot.write() = Some(JinaEmbedModel {
-                id: model_id.to_owned(),
-                model,
-            });
-        }
-    }
-
-    let mut slot = embed_slot.write();
-    let Some(holder) = slot.as_mut() else {
-        // Structural invariant: embed_slot was populated in the block above
-        // under the same gpu_gate. Reaching here means an unexpected state.
-        tracing::error!(
-            model_id,
-            lock_name = "embed_slot",
-            "embeddings: embed_slot is None after populate block — internal error"
-        );
-        return Err(EmbedError::Load(
-            "internal error: embed_slot missing after load".to_owned(),
-        ));
+    // Lazily load (or reuse) the resident embedding model. The slot lock is
+    // held only to read or replace the entry, never for the forward.
+    let resident = embed_slot
+        .read()
+        .as_ref()
+        .filter(|m| m.id == model_id)
+        .map(|m| Arc::clone(&m.model));
+    let model = if let Some(model) = resident {
+        model
+    } else {
+        tracing::info!(model_id, path = %abs_path.display(), "embeddings: loading jina-v4");
+        let loaded = jina_v4::load_from_path(abs_path)
+            .map_err(|e| EmbedError::Load(format!("failed to load '{model_id}': {e}")))?;
+        let model = Arc::new(parking_lot::Mutex::new(loaded));
+        *embed_slot.write() = Some(JinaEmbedModel {
+            id: model_id.to_owned(),
+            model: Arc::clone(&model),
+        });
+        model
     };
+    let mut model = model.lock();
 
     // Switch the live LoRA to the requested task (clean replace; idempotent).
-    if holder.model.active_task() != task {
-        holder
-            .model
+    if model.active_task() != task {
+        model
             .apply_task(task)
             .map_err(|e| EmbedError::Compute(format!("apply_task failed: {e}")))?;
     }
@@ -639,14 +660,12 @@ fn compute_embeddings(
             data.reserve(token_ids.len());
             for (index, ids) in token_ids.iter().enumerate() {
                 if return_multivector {
-                    let mv = holder
-                        .model
+                    let mv = model
                         .embed_multi(ids, device)
                         .map_err(|e| EmbedError::Compute(format!("embed_multi failed: {e}")))?;
                     push_multi(&mut data, index, mv);
                 } else {
-                    let v = holder
-                        .model
+                    let v = model
                         .embed_single(ids, device, truncate_dim)
                         .map_err(classify_single_err)?;
                     push_single(&mut data, index, v);
@@ -664,16 +683,14 @@ fn compute_embeddings(
             data.reserve(pixel_values.len());
             for (index, pv) in pixel_values.iter().enumerate() {
                 if return_multivector {
-                    let mv = holder
-                        .model
+                    let mv = model
                         .embed_image_multi(&prompt_ids, pv, device, mm_cache, model_sig)
                         .map_err(|e| {
                             EmbedError::Compute(format!("embed_image_multi failed: {e}"))
                         })?;
                     push_multi(&mut data, index, mv);
                 } else {
-                    let v = holder
-                        .model
+                    let v = model
                         .embed_image_single(
                             &prompt_ids,
                             pv,

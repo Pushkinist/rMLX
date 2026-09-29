@@ -143,6 +143,122 @@ fn load_model_rejects_empty_architectures() {
     );
 }
 
+/// A Prism Hadamard pack declares `hadamard_config`. Its weights need an
+/// input-side Hadamard transform that no loader applies, so `load_model`
+/// refuses it before the architecture check, whatever `architectures` says.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test fixture setup; a failed write is a broken test, not a result"
+)]
+fn load_model_refuses_a_hadamard_config_whatever_the_architecture() {
+    for architectures in [r#"["Qwen3_5ForConditionalGeneration"]"#, "[]"] {
+        let dir = TempDir::new().expect("tempdir");
+        let json = format!(
+            r#"{{"architectures": {architectures}, "hadamard_config": "hadamard.json",
+                "quantization": {{"group_size": 128, "bits": 2, "mode": "affine"}}}}"#
+        );
+        fs::write(dir.path().join("config.json"), json).expect("write config.json");
+
+        let msg = load_model(dir.path(), Device::Cpu, &LoadOpts::default())
+            .err()
+            .map_or_else(String::new, |e| e.to_string());
+        assert!(msg.contains("hadamard_config"), "names the fact: {msg}");
+        assert!(
+            msg.contains("Hadamard transform"),
+            "names the reason: {msg}"
+        );
+    }
+}
+
+/// Write `model.safetensors` holding one tensor, `model.embed_tokens.signs`.
+#[allow(
+    clippy::expect_used,
+    reason = "test fixture setup; a failed write is a broken test, not a result"
+)]
+fn write_signs_shard(dir: &TempDir) {
+    let signs = [0u8; 16];
+    let view = safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![4], &signs)
+        .expect("tensor view");
+    let bytes =
+        safetensors::serialize([("model.embed_tokens.signs", view)], None).expect("serialize");
+    fs::write(dir.path().join("model.safetensors"), bytes).expect("write shard");
+}
+
+/// `*.safetensors` files that cannot be parsed: an AppleDouble side file and a
+/// truncated stray. Neither feeds weights, so neither changes the outcome.
+#[allow(
+    clippy::expect_used,
+    reason = "test fixture setup; a failed write is a broken test, not a result"
+)]
+fn write_unparseable_strays(dir: &TempDir) {
+    fs::write(dir.path().join("._model.safetensors"), [0u8, 5, 22, 7]).expect("write");
+    fs::write(dir.path().join("stray.safetensors"), b"not a shard").expect("write");
+}
+
+/// Unparseable stray files beside a `.signs` shard: the pack is still refused
+/// for its `.signs` tensor.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test fixture setup; a failed write is a broken test, not a result"
+)]
+fn a_signs_shard_is_refused_beside_unparseable_strays() {
+    let dir = TempDir::new().expect("tempdir");
+    let model_path = write_config(&dir, &["Qwen3ForCausalLM"]);
+    write_signs_shard(&dir);
+    write_unparseable_strays(&dir);
+
+    let msg = load_model(&model_path, Device::Cpu, &LoadOpts::default())
+        .err()
+        .map_or_else(String::new, |e| e.to_string());
+    assert!(msg.contains("model.embed_tokens.signs"), "{msg}");
+}
+
+/// Unparseable stray files in a snapshot with no Hadamard fact do not fail the
+/// check: the load reaches the architecture's own config error, as it did
+/// before the check existed.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test fixture setup; a failed write is a broken test, not a result"
+)]
+fn unparseable_strays_do_not_fail_the_hadamard_check() {
+    let dir = TempDir::new().expect("tempdir");
+    let model_path = write_config(&dir, &["Qwen3ForCausalLM"]);
+    write_unparseable_strays(&dir);
+
+    let msg = load_model(&model_path, Device::Cpu, &LoadOpts::default())
+        .err()
+        .map_or_else(String::new, |e| e.to_string());
+    assert!(msg.contains("missing hidden_size"), "{msg}");
+}
+
+/// A pack whose config says nothing is still refused when a shard carries a
+/// `.signs` tensor, the per-channel signs of the same Hadamard transform.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test fixture setup; a failed write is a broken test, not a result"
+)]
+fn load_model_refuses_a_signs_tensor_in_a_shard() {
+    let dir = TempDir::new().expect("tempdir");
+    let model_path = write_config(&dir, &["Qwen3ForCausalLM"]);
+    write_signs_shard(&dir);
+
+    let msg = load_model(&model_path, Device::Cpu, &LoadOpts::default())
+        .err()
+        .map_or_else(String::new, |e| e.to_string());
+    assert!(
+        msg.contains("model.embed_tokens.signs"),
+        "names the tensor: {msg}"
+    );
+    assert!(
+        msg.contains("Hadamard transform"),
+        "names the reason: {msg}"
+    );
+}
+
 /// LoadPhases struct must have all 5 fields initialised and the sum of
 /// sub-phases must not exceed total_load_ms (modulo warmup rounding).
 ///

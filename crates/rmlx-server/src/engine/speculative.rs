@@ -253,8 +253,8 @@ impl Drafter {
     }
 }
 
-/// The sampling fields a speculative request sets that no speculative arm
-/// applies, named so the run log can be read back against what was asked for.
+/// The sampling and logprob fields a speculative request sets that no
+/// speculative arm applies, named so the run log can be read back against what was asked for.
 ///
 /// Empty for a request that set none of them, which is the common case and the
 /// one that must stay silent.
@@ -271,6 +271,9 @@ fn dropped_sampling_fields(sampling: &crate::engine::types::SamplingParams) -> V
     }
     if !sampling.logit_bias.is_empty() {
         named.push("logit_bias");
+    }
+    if sampling.top_logprobs_k > 0 {
+        named.push("logprobs");
     }
     named
 }
@@ -724,12 +727,9 @@ impl Generator for SpeculativeGenerator {
             // emits ProbeStep without logprobs); keep disabled.
             top_logprobs_k: 0,
         };
-        // Penalties and logit bias reach no speculative arm. A round scores its
-        // whole block in one forward, so an exact per-position distribution would
-        // need the penalty window rebuilt over the drafted prefix at each
-        // position, and no loop carries that window. Dropping them silently is
-        // what made a nominally penalised speculative request indistinguishable
-        // from an unpenalised one, so name them instead.
+        // Penalties and logit bias reach no speculative arm: a round scores its
+        // whole block in one forward, and no loop carries a per-position penalty
+        // window. No arm captures logprobs either. Name each dropped field.
         let dropped = dropped_sampling_fields(&req.sampling);
         if !dropped.is_empty() {
             tracing::warn!(

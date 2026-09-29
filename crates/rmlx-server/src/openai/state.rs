@@ -1257,14 +1257,42 @@ impl AppState {
         }
     }
 
-    /// Unload the model `id` if it is currently resident.
+    /// True when `model_id` is resident: in a generation slot or in the
+    /// embedding slot. `/status` reads this; `/v1/models` reads the same two
+    /// slots once per request.
+    pub fn is_resident(&self, model_id: &str) -> bool {
+        self.slots.read().iter().any(|m| m.id == model_id)
+            || self.embedding_resident_id().as_deref() == Some(model_id)
+    }
+
+    /// The id of the model in the embedding slot. Holds the slot lock only to
+    /// read the id, never while a forward runs.
+    pub fn embedding_resident_id(&self) -> Option<String> {
+        self.embed_slot.read().as_ref().map(|m| m.id.clone())
+    }
+
+    /// Unload the model `id` if it is currently resident, from a generation
+    /// slot or from the embedding slot.
     ///
     /// Also evicts all session-cache entries for the model so stale KV
     /// snapshots don't consume slot reservation headroom after unload.
     ///
     /// Returns `true` if the model was unloaded, `false` if it was not loaded.
     pub fn unload(&self, model_id: &str) -> bool {
-        self.unload_with_reason(model_id, UnloadReason::Explicit)
+        self.unload_with_reason(model_id, UnloadReason::Explicit) || self.unload_embedding(model_id)
+    }
+
+    /// Clear the embedding slot when it holds `model_id`.
+    fn unload_embedding(&self, model_id: &str) -> bool {
+        let mut slot = self.embed_slot.write();
+        if slot.as_ref().is_none_or(|m| m.id != model_id) {
+            return false;
+        }
+        let taken = slot.take();
+        drop(slot);
+        tracing::info!(model_id, reason = "explicit", "embed_slot: unloading model");
+        drop(taken);
+        true
     }
 
     /// Idempotent unload with attribution.

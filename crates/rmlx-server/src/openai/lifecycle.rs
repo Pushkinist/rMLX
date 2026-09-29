@@ -5,6 +5,8 @@
 //! - `unload_model` — POST /v1/models/{id}/unload
 //! - `model_status` — GET /v1/models/{id}/status
 
+use std::collections::HashMap;
+
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -67,19 +69,19 @@ struct ResidentInfo {
 }
 
 #[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or validated before call"
-)]
-#[allow(
     clippy::unwrap_used,
     reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "IndexMut on a JSON object inserts the key; it cannot panic"
 )]
 pub(crate) async fn list_models(State(state): State<AppState>) -> Response {
     // Snapshot resident-model timing under the read lock, then release.
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let resident: std::collections::HashMap<String, ResidentInfo> = {
+    let resident: HashMap<String, ResidentInfo> = {
         let slots = state.slots.read();
         slots
             .iter()
@@ -98,6 +100,8 @@ pub(crate) async fn list_models(State(state): State<AppState>) -> Response {
             })
             .collect()
     };
+    // A model in the embedding slot is loaded but has no slot timestamps.
+    let embedding_id = state.embedding_resident_id();
 
     let data: Vec<serde_json::Value> = state
         .registry
@@ -109,7 +113,7 @@ pub(crate) async fn list_models(State(state): State<AppState>) -> Response {
                 "object": "model",
                 "created": 0,
                 "owned_by": "rmlx",
-                "loaded": resident.contains_key(&e.id),
+                "loaded": resident.contains_key(&e.id) || embedding_id.as_ref() == Some(&e.id),
             });
             if let Some(info) = resident.get(&e.id) {
                 obj["loaded_at"] = info.loaded_at.into();
@@ -238,7 +242,7 @@ pub(crate) async fn model_status(
 
     let body = json!({
         "id": id,
-        "loaded": false,
+        "loaded": state.is_resident(&id),
         "loaded_at": null,
         "last_used": null,
         "idle_secs": null,

@@ -100,11 +100,19 @@ async fn start(state: AppState) -> u16 {
 }
 
 async fn post(port: u16, path: &str, body: &str) -> (u16, String) {
+    send(port, "POST", path, body).await
+}
+
+async fn get(port: u16, path: &str) -> (u16, String) {
+    send(port, "GET", path, "").await
+}
+
+async fn send(port: u16, method: &str, path: &str, body: &str) -> (u16, String) {
     let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
         .await
         .unwrap();
     let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     );
@@ -148,6 +156,21 @@ async fn unknown_model_is_404() {
     )
     .await;
     assert_eq!(status, 404, "body: {body}");
+}
+
+/// A set `truncate_prompt_tokens` → 400 naming the field. The model id is not
+/// in the registry, so a 404 would mean the check ran after the model lookup.
+#[tokio::test]
+async fn truncate_prompt_tokens_is_400_before_the_model_lookup() {
+    let port = start(state(ModelRegistry::default(), Device::Cpu)).await;
+    let (status, b) = post(
+        port,
+        "/v1/embeddings",
+        r#"{"model":"x","input":"hi","truncate_prompt_tokens":8}"#,
+    )
+    .await;
+    assert_eq!(status, 400, "body: {b}");
+    assert!(b.contains("truncate_prompt_tokens"), "body: {b}");
 }
 
 /// `encoding_format` outside {float,base64} → 400.
@@ -198,7 +221,8 @@ async fn non_embedding_model_is_400() {
 
 /// Valid single-vector request → 200 + OpenAI embeddings shape.
 async fn valid_single_vector_200_shape(reg: ModelRegistry, device: Device) {
-    let port = start(state(reg, device)).await;
+    let state = state(reg, device);
+    let port = start(state.clone()).await;
     let body = format!(r#"{{"model":"{JINA_ID}","input":"hello world"}}"#);
     let (status, b) = post(port, "/v1/embeddings", &body).await;
     assert_eq!(status, 200, "body: {b}");
@@ -210,6 +234,56 @@ async fn valid_single_vector_200_shape(reg: ModelRegistry, device: Device) {
     assert_eq!(emb.len(), 2048, "full single-vector dim == 2048");
     assert!(emb[0].is_f64(), "single-vector elements are floats");
     assert!(v["usage"]["prompt_tokens"].as_u64().unwrap() > 0);
+
+    assert_eq!(listed_as_loaded(port).await, Some(true));
+    assert_eq!(status_loaded(port).await, Some(true));
+    residency_read_does_not_wait_on_the_model_lock(&state);
+
+    let (status, b) = post(port, &format!("/v1/models/{JINA_ID}/unload"), "").await;
+    assert_eq!(
+        status, 200,
+        "unload of the resident embedding model, body: {b}"
+    );
+    assert_eq!(listed_as_loaded(port).await, Some(false));
+    assert_eq!(status_loaded(port).await, Some(false));
+}
+
+/// Hold the model lock, as a forward does, and read residency on another
+/// thread. The read must return while the lock is held.
+fn residency_read_does_not_wait_on_the_model_lock(state: &AppState) {
+    let model = state
+        .embed_slot
+        .read()
+        .as_ref()
+        .map(|m| Arc::clone(&m.model))
+        .expect("the jina model is resident");
+    let held = model.lock();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = state.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send((reader.is_resident(JINA_ID), reader.embedding_resident_id()));
+    });
+    let got = rx.recv_timeout(Duration::from_secs(5));
+    drop(held);
+    let (resident, id) = got.expect("the residency read waited on the model lock");
+    assert!(resident);
+    assert_eq!(id.as_deref(), Some(JINA_ID));
+}
+
+/// The `loaded` flag `GET /v1/models/{id}/status` gives for the jina id.
+async fn status_loaded(port: u16) -> Option<bool> {
+    let (status, b) = get(port, &format!("/v1/models/{JINA_ID}/status")).await;
+    assert_eq!(status, 200, "body: {b}");
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    v["loaded"].as_bool()
+}
+
+/// The `loaded` flag `GET /v1/models` gives for the jina id.
+async fn listed_as_loaded(port: u16) -> Option<bool> {
+    let (status, b) = get(port, "/v1/models").await;
+    assert_eq!(status, 200, "body: {b}");
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    v["data"].as_array()?.iter().find(|m| m["id"] == JINA_ID)?["loaded"].as_bool()
 }
 
 #[tokio::test]

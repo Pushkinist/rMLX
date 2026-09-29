@@ -335,8 +335,9 @@ A `/v1/messages` stream with no `message_stop` did not complete.
 {"object":"list","data":[{"id":"my-model","object":"model","created":0,"owned_by":"rmlx","loaded":false}]}
 ```
 
-Every registry model is listed. A resident one also carries `loaded_at` and
-`last_used` (Unix seconds), and, when the architecture exposes
+Every registry model is listed. `loaded` is true for a model in a generation
+slot and for the model in the embedding slot. A model in a generation slot also
+carries `loaded_at` and `last_used` (Unix seconds), and, when the architecture exposes
 `max_position_embeddings`, the two context numbers:
 
 | Field | Meaning |
@@ -365,12 +366,17 @@ See `docs/CLI.md` § "Context ceiling".
   curl -X POST -d '{"keep_alive": 120}' http://127.0.0.1:8080/v1/models/gemma-4-e4b/load
   ```
 
-- `POST /v1/models/{id}/unload` calls `AppState::unload`: 200 `{"ok":true}`
-  when the model was resident, 404 `{"ok":false,"message":"…"}` when not.
+- `POST /v1/models/{id}/unload` calls `AppState::unload`, which clears a
+  generation slot or the embedding slot: 200 `{"ok":true}` when the model was
+  resident, 404 `{"ok":false,"message":"…"}` when not.
 - `GET /v1/models/{id}/status` returns 200
-  `{"id","loaded","loaded_at","last_used","idle_secs"}`, with the last three
-  `null` when not resident. An id outside the registry is 404
+  `{"id","loaded","loaded_at","last_used","idle_secs"}`. The last three are
+  `null` when the model is not in a generation slot; a model in the embedding
+  slot is `loaded:true` with them `null`. An id outside the registry is 404
   `model_not_found`.
+
+`AppState::is_resident` gives `loaded` on `/v1/models` and `/status` and is
+true for a generation slot or the embedding slot.
 
 **Slots and eviction.** Up to `--max-loaded-models` (default 1) models stay
 resident. When the slots are full, `ensure_loaded` for another model evicts
@@ -489,6 +495,7 @@ Serves jina-embeddings-v4 text and image embeddings.
 | `task` | string | LoRA task: `retrieval` (default), `text-matching` or `code`. |
 | `prompt_name` | string | `query` (default) or `passage`. `text-matching` always uses `Query`. |
 | `return_multivector` | bool | Per-token multi-vector output instead of one pooled vector. |
+| `truncate_prompt_tokens` | i64 | Refused: any value except `null` is 400. Keeping the last N tokens removes the task prefix. |
 
 Text gets the prefix `"{Query|Passage}: {text}"` and no special tokens. One
 request embeds all text or all images, not a mix.
@@ -505,7 +512,10 @@ request embeds all text or all images, not a mix.
 `embedding` is `[f32]` for one vector, `[[f32]]` for multi-vector output, or
 a base64 string. The embedding model lives in `AppState::embed_slot`, not in
 the LLM slots, and loads on the first request. `apply_task` swaps the LoRA
-adapter inside the GPU critical section.
+adapter inside the GPU critical section. The model has its own lock, and a
+forward holds only that lock, so `/v1/models`, `/status` and `/unload` do not
+wait for a forward. An unload during a request removes the slot entry; the
+request finishes on the model it already holds.
 
 ---
 

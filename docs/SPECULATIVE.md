@@ -88,8 +88,9 @@ vocabulary (`restricted_read_back` is false).
   `tool_choice` set to required or to a named tool. The error names
   `speculative_decode_with_response_format_unsupported`, and the server
   answers HTTP 503 `service_unavailable`.
-- **Logprobs.** The speculative path returns no logprobs and logs no warning
-  when a request asks for them.
+- **Logprobs.** The speculative path returns no logprobs. A request that sets
+  `logprobs: true` (with or without `top_logprobs`) gets a response with no
+  `logprobs`, and the server logs the same `warn`, which names `logprobs`.
 
 ## Drafters
 

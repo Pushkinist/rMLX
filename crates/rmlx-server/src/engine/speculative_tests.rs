@@ -7,9 +7,10 @@
 //! `text_config missing num_experts` error).
 
 use super::{
-    classify_mtp_draft, decide_draft_kind, mtp_reject_reason, round_block, MtpDraftFamily,
-    MIN_DRAFT_BLOCK_SIZE,
+    classify_mtp_draft, decide_draft_kind, dropped_sampling_fields, mtp_reject_reason, round_block,
+    MtpDraftFamily, MIN_DRAFT_BLOCK_SIZE,
 };
+use crate::engine::types::SamplingParams;
 use rmlx_models::{Declared, DraftKind};
 
 // ── decide_draft_kind ────────────────────────────────────────────────────────
@@ -363,4 +364,24 @@ fn the_two_dflash_generations_do_not_take_each_other() {
         );
         assert!(msg.contains(arch), "names the snapshot's own words: {msg}");
     }
+}
+
+// ── dropped_sampling_fields ──────────────────────────────────────────────────
+
+/// A default request sets no field the speculative path drops, so it logs no
+/// warning.
+#[test]
+fn a_default_request_names_no_dropped_field() {
+    assert!(dropped_sampling_fields(&SamplingParams::default()).is_empty());
+}
+
+/// The speculative path captures no logprobs, so a request that asks for them
+/// is named in the warning.
+#[test]
+fn a_request_for_logprobs_names_logprobs() {
+    let sampling = SamplingParams {
+        top_logprobs_k: 1,
+        ..SamplingParams::default()
+    };
+    assert_eq!(dropped_sampling_fields(&sampling), vec!["logprobs"]);
 }
