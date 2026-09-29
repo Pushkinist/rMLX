@@ -335,8 +335,9 @@ A `/v1/messages` stream with no `message_stop` did not complete.
 {"object":"list","data":[{"id":"my-model","object":"model","created":0,"owned_by":"rmlx","loaded":false}]}
 ```
 
-Every registry model is listed. A resident one also carries `loaded_at` and
-`last_used` (Unix seconds), and, when the architecture exposes
+Every registry model is listed. `loaded` is true for a model in a generation
+slot and for the model in the embedding slot. A model in a generation slot also
+carries `loaded_at` and `last_used` (Unix seconds), and, when the architecture exposes
 `max_position_embeddings`, the two context numbers:
 
 | Field | Meaning |
