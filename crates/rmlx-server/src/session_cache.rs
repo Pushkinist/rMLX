@@ -188,7 +188,7 @@ pub const fn effective_prompt_cache_slots(base: usize, active_sessions: usize) -
     if base == 0 {
         None
     } else {
-        Some(base + active_sessions)
+        Some(base.saturating_add(active_sessions))
     }
 }
 
