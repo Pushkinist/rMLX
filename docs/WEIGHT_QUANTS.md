@@ -227,6 +227,8 @@ so the weights would load as plain affine weights and give wrong output.
 `config.json` carries `hadamard_config` or a shard carries a tensor whose name
 ends in `.signs` (`refuse_hadamard_pack` in
 `crates/rmlx-models/src/arch/loader.rs`). The error names the fact it found.
+The `.signs` scan skips hidden files, and it logs and skips a file it cannot
+parse. Sidecar drafter and embedding loaders do not run this check.
 
 Source: `crates/rmlx-quant/src/affine.rs`
 

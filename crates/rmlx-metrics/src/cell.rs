@@ -127,8 +127,9 @@ pub enum NotesVerdict {
 /// migration 008 rewrites the rows that predate it. A second copy in the engine
 /// would be the drift this column exists to prevent.
 ///
-/// DFlash is here because its round loop always sets the block from the recent
-/// accept rate. No DFlash path drafts a fixed block.
+/// `dflash` (DFlash 1) is here because its round loop always sets the block
+/// from the recent accept rate; `dflash2` is a separate label and uses the
+/// fixed shared block.
 pub const ADAPTIVE_DRAFTERS: &[(&str, &str)] = &[("dflash", "accept_rate")];
 
 /// The depth policy `draft_kind`'s round loop always runs under, if it always
