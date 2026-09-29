@@ -62,30 +62,23 @@ so it runs on every Apple Silicon Mac whatever chip built it. It is also
 
 ## Branch model
 
-- **`main` holds the released state.** Its history is linear and tags live
-  on it. It takes the release and hotfix fast-forwards, and PRs merged by
-  rebase: the formula PR of step 9 and every Dependabot PR target `main`.
-- **`next/<name>` accumulates the next release.** Each issue lands as one
-  squash-merged PR, one commit. The day-to-day flow is in `CONTRIBUTING.md`
-  §Workflow.
-- **A release fast-forwards `next/<name>` onto `main`**; a hotfix
-  fast-forwards `hotfix/<issue>` onto `main`.
+- **`main` holds the released state and the whole history.** Its history is
+  linear and tags live on it.
+- **Work happens on any branch.** There is no dedicated integration branch:
+  one issue is one PR into `main`, squash-merged to exactly one commit once
+  every gate is green. Issues close from that landed commit's `Closes #N`.
+  The day-to-day flow is in `CONTRIBUTING.md` §Workflow.
 
-The GitHub rulesets enforce this:
-
-| Ruleset | Rules |
-|---|---|
-| `main` | Pull request, rebase merge only; checks `rustfmt` and `build + clippy`, branch up to date; linear history; no force-push, no deletion, no direct update |
-| `next/*` | Pull request, squash merge only; the same two checks, branch up to date; no force-push, no deletion |
-
-So `main` accepts a PR merged by rebase, or a fast-forward push by a
-repository admin or maintainer. Admins and maintainers bypass both rulesets;
-that bypass is what lets the fast-forward push below reach `main`.
+The GitHub ruleset on `main` enforces this: pull request required, squash
+merge only; checks `rustfmt` and `build + clippy`, branch up to date; linear
+history; no force-push, no deletion, no direct update. Admins and
+maintainers can bypass it — that bypass is what lets the tag push below
+reach `main` without a PR.
 
 ## Cut a release
 
-1. **Bump** `version` in `Cargo.toml` through a normal issue PR into
-   `next/<name>`, once everything else for the release is in.
+1. **Bump** `version` in `Cargo.toml` through a normal issue PR into `main`,
+   once everything else for the release is in.
 2. **Changelog.** Add a `## [<version>] - <date>` section to `CHANGELOG.md`
    (Keep a Changelog format) and the matching `[<version>]:` link at the
    bottom. It is the source of the release body. `README.md` carries no
@@ -94,26 +87,16 @@ that bypass is what lets the fast-forward push below reach `main`.
    previous release's retrospective filed (§Retrospective). Nothing else
    goes under it: the section is the public release body. Released
    sections are never edited.
-3. **Gate.** `make ci` and the whole `make ci-perf` green on `next/<name>`,
-   plus the real-model regression smoke. Every merge to `main` runs the whole
-   `make ci-perf`.
-4. **Release PR and fast-forward.** Open a PR `next/<name>` → `main` for the
-   checks, then push:
-   ```sh
-   git fetch origin
-   git merge-base --is-ancestor origin/main origin/next/<name>
-   git push origin origin/next/<name>:main
-   ```
-   The ancestor check fails if `main` moved, for example after a hotfix.
-   Then rebase `next/<name>` onto `main` and gate again. GitHub marks the
-   PR merged once `main` reaches its head.
-5. **Tag.** `make tag` creates the annotated `v<version>` tag from
+3. **Gate.** Every PR already gates on `make ci` before it merges; `make
+   ci-perf` runs on every merge to `main`. Before tagging, confirm the
+   version-bump commit passed both, plus the real-model regression smoke.
+4. **Tag.** `make tag` creates the annotated `v<version>` tag from
    `Cargo.toml`. Push it: `git push origin v<version>`.
-6. **Package.** `make release-package` builds
+5. **Package.** `make release-package` builds
    `dist/rmlx-v<version>-aarch64-apple-darwin.tar.gz` and its `.sha256`.
    The tarball holds `rmlx`, both licenses and `README.md`. The binary is
    compiled for `apple-m1` and checked (§The tarball's target CPU).
-7. **GitHub Release**, with the changelog section as the body:
+6. **GitHub Release**, with the changelog section as the body:
    ```sh
    gh release create v<version> \
      --title "rMLX <version>" \
@@ -122,22 +105,22 @@ that bypass is what lets the fast-forward push below reach `main`.
      dist/rmlx-v<version>-aarch64-apple-darwin.tar.gz \
      dist/rmlx-v<version>-aarch64-apple-darwin.tar.gz.sha256
    ```
-8. **Sign.** `make release-sign` writes
+7. **Sign.** `make release-sign` writes
    `dist/rmlx-v<version>-aarch64-apple-darwin.tar.gz.cosign.bundle`.
    It is a keyless cosign signature and opens a browser OIDC login.
    Upload it with `gh release upload`. The `.sha256` alone is self-attested;
    the bundle ties the tarball to the signer's identity and the Rekor log.
-9. **Formula.** `make release-sha` prints the sha256 of the `v<version>`
+8. **Formula.** `make release-sha` prints the sha256 of the `v<version>`
    source archive. `bash scripts/release/source_sha256.sh --write` also
    patches `url` and `sha256` in `packaging/homebrew/rmlx.rb`.
    - GitHub builds the archive on first access. Fetch it two or three more
      times and check that the digest is stable.
    - Check that `url` and `sha256` both name the new version, then open a
      PR with the formula change against `main`.
-10. **Tap.** `make tap-sync` copies the formula into
-    `Pushkinist/homebrew-rmlx` as `Formula/rmlx.rb` and pushes it.
-11. **Verify** the install paths (§Verify the install paths).
-12. **Retrospective** over the diff from the previous tag to the new one
+9. **Tap.** `make tap-sync` copies the formula into
+   `Pushkinist/homebrew-rmlx` as `Formula/rmlx.rb` and pushes it.
+10. **Verify** the install paths (§Verify the install paths).
+11. **Retrospective** over the diff from the previous tag to the new one
     (§Retrospective).
 
 ### No Homebrew bottle
@@ -155,23 +138,6 @@ A bottle also runs on Macs other than the one that built it. Under
 wrapper adds no target CPU to a bottle build. No check follows: the keg keeps
 no cargo record. A version whose source archive lacks `release_cpu.py` fails
 the bottle build rather than falling back to `native`.
-
-## Hotfix
-
-A hotfix fixes a bug already released on `main`.
-
-1. Branch `hotfix/<issue>` from `main`.
-2. Squash the fix to one commit.
-3. Open a PR `hotfix/<issue>` → `main` for the checks, and run `make ci`
-   and the whole `make ci-perf` on it.
-4. Fast-forward `main`:
-   ```sh
-   git fetch origin
-   git merge-base --is-ancestor origin/main origin/hotfix/<issue>
-   git push origin origin/hotfix/<issue>:main
-   ```
-5. A maintainer rebases `next/<name>` onto the new `main` and force-pushes
-   it, through the ruleset bypass.
 
 ## Dependabot PRs
 
@@ -246,7 +212,7 @@ deletable.
 
 Rules:
 
-- Run it after step 11, in one working session.
+- Run it after step 10, in one working session.
 - It changes no code and makes no commit. Its output is issues.
 - Search the open and closed issues before you file. When an issue already
   tracks a finding, name that issue and file nothing.
@@ -257,8 +223,8 @@ Rules:
   retirement is a separate decision with its own proof.
 - Answer every checklist item, and write "none" when an item finds nothing.
   An empty answer is evidence too. A measurement that could not run is "not
-  measured", never "none". Post the answers as one comment on the release
-  PR of step 4.
+  measured", never "none". Post the answers as one comment on the
+  version-bump PR of step 1.
 
 Set the range and check out both tags beside the repo. Run every script
 from the current checkout, so one version of each tool measures both trees:
