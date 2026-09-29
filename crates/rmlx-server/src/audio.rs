@@ -468,11 +468,11 @@ async fn parse_multipart(multipart: &mut Multipart) -> Result<AudioFormFields, S
             "temperature" => {
                 let text = field.text().await.map_err(|e| e.to_string())?;
                 let t = text.parse::<f32>().map_err(|_| {
-                    format!("invalid temperature '{text}'; must be a finite float in [0.0, 1.0]")
+                    format!("invalid temperature '{text}'; must be a finite float >= 0.0")
                 })?;
                 if !t.is_finite() || t < 0.0 {
                     return Err(format!(
-                        "temperature {t} is out of range; must be a finite float in [0.0, 1.0]"
+                        "temperature {t} is out of range; must be a finite float >= 0.0"
                     ));
                 }
                 temperature = t;

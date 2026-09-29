@@ -343,7 +343,7 @@ pub enum ApiErrorCategory {
     /// registry.
     NotFound,
     /// HTTP 507 `oom_during_load` — weight-load OOM. No production request
-    /// path increments this category today: `ensure_loaded` failures are
+    /// path increments this category: `ensure_loaded` failures are
     /// counted as `Upstream` before an `Error::Oom` can be classified.
     OomLoad,
     /// HTTP 507 `oom_kv_cache` — KV-cache allocation OOM. No production

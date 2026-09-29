@@ -46,7 +46,7 @@ pub(super) fn internal_error(message: &str) -> Response {
 /// Mirrors the OpenAI mapping: same `type` strings (`oom_during_load`,
 /// `oom_kv_cache`, `oom_mid_stream`), same 507 / 503 + `Retry-After` per
 /// phase, same best-effort process-memory fields. No production request
-/// reaches this fn today — see [`engine_error_response`]'s doc.
+/// reaches this fn — see [`engine_error_response`]'s doc.
 #[allow(
     clippy::expect_used,
     reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"

@@ -338,9 +338,10 @@ pub const WEIGHT_QUANT_WHITELIST: &[&str] = &[
 /// Everything else — including codec names this binary has never heard of —
 /// is lowercased/trimmed and passed through unchanged. Always `Ok`; kept as
 /// `Result<String>` so a caller can propagate `?` without change if a future
-/// sanity check is added. No call site today assigns the result back onto
-/// the record — it validates the input can be canonicalized without
-/// applying the canonical form.
+/// sanity check is added. `RunRecordBuilder::rmlx` (`ingest.rs`) and the
+/// legacy-JSONL importer (`migrate/legacy.rs`) assign the canonicalized
+/// result onto the record; `RunRecord::validate_with` (`ingest.rs`) calls it
+/// only to prove the value cannot fail, and discards the result.
 pub fn canonicalize_kv_quant(value: &str) -> Result<String> {
     let lower = value.trim().to_lowercase();
     Ok(match lower.as_str() {

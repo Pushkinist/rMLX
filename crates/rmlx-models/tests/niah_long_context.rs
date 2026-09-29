@@ -1042,9 +1042,11 @@ niah_pflash_cell!(
 );
 
 // ── Qwen3.6 35B-A3B — Dormant. PlanarK rejected at validate_resolved
-//   (`QwenMoePlanarKRejected`). The resolve failure fires before the
-//   dispatch-counter assertion, so these cells do not exercise it — they
-//   only confirm the resolver still rejects PlanarK on this arch. ───────
+//   (`QwenMoePlanarKRejected`). The resolve failure panics inside
+//   `generate_greedy` before the dispatch-counter assertion runs. None of
+//   these cells carries `#[should_panic]`, so with `RMLX_TEST_MODEL_QWEN36`
+//   set the panic FAILS the test rather than confirming the rejection —
+//   these cells confirm nothing. ─────────────────────────────────────────
 
 niah_pflash_cell!(
     niah_pflash_qwen36_32k_d10,

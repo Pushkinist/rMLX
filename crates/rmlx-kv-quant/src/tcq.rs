@@ -4,8 +4,8 @@
 //!
 //! # What this is
 //!
-//! Runs a Viterbi search through a fixed trellis over TurboQuant's nearest-
-//! centroid V-side assignment. The codebook is the same Lloyd-Max N(0,1)
+//! Replaces TurboQuant's nearest-centroid V-side assignment with a Viterbi
+//! search through a fixed trellis. The codebook is the same Lloyd-Max N(0,1)
 //! table as plain `turbo3` / `turbo2`. The transition table it walks does
 //! not forbid any centroid at any position — every level is a legal
 //! transition from every state — so the per-position cost is separable and

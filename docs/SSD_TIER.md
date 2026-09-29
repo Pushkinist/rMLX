@@ -254,9 +254,13 @@ pub trait HydratedEntry: Sized {
 Every entry sets `is_ssd_hydrated` and the placeholder `first_id` /
 `first_piece`, and destructures `HydratedBlock` exhaustively. `SHARES_KV`
 names the arch's own `SHARES_KV_ACROSS_LAYERS`. It lands on every restored
-cache and would decide the bf16 mirror a tail extension builds, if any
-production architecture ever tail-extended a hydrated cache — none does
-today.
+cache and would decide the bf16 mirror a tail extension builds, if a tail
+extension ran through the `exit_prefill` gate — no production architecture
+does that. Qwen3.5-MoE does tail-extend a hydrated block in production
+(`Consumed::Reuse { kind: ReuseKind::StrictPrefix, .. }`), and so does
+Gemma4's prefix path, but neither goes through an enter/exit prefill
+bracket, so `exit_prefill` never runs and the mirror is never built either
+way.
 
 **Why the blanket impl lives in `rmlx-kv-ssd`.** In `rmlx-models` both
 `SsdHydrate` and `SsdHydrator` are foreign and `E` is uncovered, so the orphan

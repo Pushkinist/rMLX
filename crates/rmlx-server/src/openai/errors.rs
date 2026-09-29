@@ -226,7 +226,7 @@ pub(crate) fn enforce_max_tokens_cap(
 /// - `Generation` → **503**, no `Retry-After` (KV cache is corrupt past the
 ///   failure point — retrying the same stream is unsafe).
 ///
-/// No production request reaches this fn today — see
+/// No production request reaches this fn — see
 /// [`engine_error_response`]'s doc.
 #[allow(
     clippy::expect_used,

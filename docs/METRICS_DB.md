@@ -565,10 +565,11 @@ only:
 `observations` by `run_id`.
 
 `KV GB` and `reduction vs bf16` are outside the column's scope. Both are
-minima over `kv_cache_bytes` rows for the model at the row's own `ctx_max`
-and `kv_quant` only (`ctx_max` taken from the row's alphabetically-first
-metric), not across every context and prompt, so no single observation
-backs them.
+minima over `kv_cache_bytes` rows keyed on `(namespace, model, ctx_max,
+kv_quant)` — so the minimum runs across every backend, prompt and decode
+config at the row's own `ctx_max` and `kv_quant` (`ctx_max` taken from the
+row's alphabetically-first metric), not across every `ctx_max`. No single
+observation backs them.
 
 ---
 

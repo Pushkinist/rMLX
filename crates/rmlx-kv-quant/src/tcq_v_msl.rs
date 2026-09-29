@@ -33,17 +33,25 @@
 //!
 //! # Dispatch status
 //!
-//! Ships as a future-reference hook, mirroring `turbo2_v_msl.rs` — unlike
-//! `k8vturbo3_append_msl.rs`, which has production callers (see that
-//! module's doc). `KvCache::update_k8_turbo_v` (`kvcache/update_turbo.rs`)
-//! forces `Device::Cpu` for the `K8VTurbo3Tcq` V-side update — the
-//! sequential per-thread Viterbi loop is bandwidth-bound and the prior
-//! K8VTurbo3 / K8VTurbo2 MSL hooks both regressed −2 % decode TPS gates.
-//! That path only runs during prefill; a cache that already has a decode
-//! bf16 mirror never reaches it, so no bench of the default decode path
-//! exercises this code. The kernel is parity-tested CPU↔GPU (see
-//! `tcq_v_msl_tests.rs`) so re-wiring the dispatch site later is a one-line
-//! change, not a proof of a TPS win.
+//! Ships as a future-reference hook, mirroring `turbo2_v_msl.rs`. Unlike
+//! this module, `k8vturbo3_append_msl.rs` has production callers — see that
+//! module's doc.
+//!
+//! `KvCache::update_k8_turbo_v` (`kvcache/update_turbo.rs`) forces
+//! `Device::Cpu` for the `K8VTurbo3Tcq` V-side update. The sequential
+//! per-thread Viterbi loop is bandwidth-bound, and the prior K8VTurbo3 /
+//! K8VTurbo2 MSL hooks both regressed −2 % decode TPS gates.
+//!
+//! `update_k8_turbo_v` reaches this body only when the cache has no bf16
+//! decode mirror (`decode_fp16_k.is_none()` — the first materialization, or
+//! a hydrated cache with no mirror restored). A cache that already has a
+//! mirror takes the warm-TTFT bf16 shortcut and never reaches it. A
+//! default-configuration bench of a cache that reached its warm shortcut
+//! does not exercise this code.
+//!
+//! The kernel is parity-tested CPU↔GPU (see `tcq_v_msl_tests.rs`), so
+//! re-wiring the dispatch site later is a one-line change, not a proof of a
+//! TPS win.
 
 #![allow(dead_code)] // Future-gated hook, see module-level "Dispatch status".
 

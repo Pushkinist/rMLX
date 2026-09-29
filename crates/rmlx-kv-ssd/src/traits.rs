@@ -83,7 +83,7 @@ pub trait HydratedEntry: Sized {
     ///
     /// It lands on every restored `KvCache`. If a hydrated cache is ever
     /// tail-extended through the `exit_prefill` gate this flag decides — no
-    /// production architecture does this today — a hard-coded `false` drops
+    /// production architecture does that — a hard-coded `false` drops
     /// a bf16 mirror a sharing arch reads; a
     /// hard-coded `true` builds one no other arch reads. The constant is what
     /// keeps the shared body from choosing either.

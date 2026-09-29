@@ -267,8 +267,9 @@ impl ArchGenerator {
         // Load the vision tower once when the snapshot ships a
         // `vision_config` (multimodal checkpoint). Text-only models return
         // `None` here and the image-input path is rejected at request time.
-        // Gemma4 (both the SigLIP-tower and the unified encoder-free forms)
-        // and Gemma3 (a SigLIP tower) have a vision arm today.
+        // Gemma4 (both the SigLIP-tower and the unified encoder-free
+        // forms), Gemma3 (a SigLIP tower) and Qwen3-VL-MoE (a SigLIP tower)
+        // have a vision arm below.
         let vision: Option<Arc<VisionBundle>> = match &model {
             // Gemma4 **unified** (12B): encoder-free vision embedder, no SigLIP
             // tower. Distinguished from the tower family by `architectures[0]`.

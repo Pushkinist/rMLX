@@ -888,15 +888,17 @@ impl KvCache {
             );
             // Not just "build nothing" — drop anything already there. Every
             // arm below *replaces* the payload, so before this gate a second
-            // prefill on a cache that arrived carrying one (were an
-            // SSD-hydrated entry ever deep-cloned and tail-extended;
-            // `enter_prefill` does not clear `storage`, and no production
-            // architecture does this today) would overwrite it. Returning
-            // early without clearing
-            // would leave a store of the old length beside a mirror of the new
-            // one, and the spill writer prefers the store — so the block would
-            // be written under the full prompt's hash while holding only the
-            // prefix.
+            // prefill on a cache that arrived carrying one would overwrite
+            // it. That case is: an SSD-hydrated entry deep-cloned and
+            // tail-extended through `enter_prefill` — `enter_prefill` does
+            // not clear `storage` on its own. No production architecture
+            // tail-extends a hydrated cache through `enter_prefill`; the
+            // in-production tail extensions (Qwen3.5-MoE's `StrictPrefix`
+            // reuse, Gemma4's prefix path) both bypass it. Returning early
+            // without clearing would leave a store of the old length beside
+            // a mirror of the new one, and the spill writer prefers the
+            // store — so the block would be written under the full
+            // prompt's hash while holding only the prefix.
             self.storage.clear_payload();
             if let Some((k_seed, v_seed)) = decode_fp16_pair {
                 self.decode_fp16_k = k_seed;

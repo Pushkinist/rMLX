@@ -58,10 +58,13 @@
 //!
 //! `k8_turbo_v_update` (`kvcache/update_turbo.rs`) forces `Device::Cpu`,
 //! mirroring the K8VTurbo3 decision (Metal 3-bit kernel showed −3.5% to
-//! −6.9% TPS, failing the −2% gate). That path only runs during prefill; a
-//! cache that already has a decode bf16 mirror never reaches it, so no
-//! bench of the default decode path exercises this code. This module ships
-//! the kernels with full unit-test coverage of bit-exact CPU↔GPU
+//! −6.9% TPS, failing the −2% gate). `update_k8_turbo_v` reaches this body
+//! only when the cache has no bf16 decode mirror (`decode_fp16_k.is_none()`
+//! — the first materialization, or a hydrated cache with no mirror
+//! restored); a cache that already has a mirror takes the warm-TTFT bf16
+//! shortcut and never reaches it. A default-configuration bench of a cache
+//! that reached its warm shortcut does not exercise this code. This module
+//! ships the kernels with full unit-test coverage of bit-exact CPU↔GPU
 //! equivalence so that re-wiring the dispatch site later is a one-line
 //! change, not a proof of a TPS win.
 

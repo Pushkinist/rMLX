@@ -30,10 +30,10 @@ pub enum CodeStorage {
     /// bitstream per row, `global_bit = (row * cols + col) * bits`.
     ///
     /// This is MLX's real on-disk layout at every bit width, including 3,
-    /// 5 and 6 bits (`docs/WEIGHT_QUANTS.md` § "Dequant formula"). No
-    /// production loader constructs `AffineParams` with this variant today
-    /// — `calibration.rs` always picks `U32Le` — so the CPU decoder does
-    /// not actually match a real 3/5/6-bit MLX snapshot; see `U32Le`'s doc.
+    /// 5 and 6 bits (`docs/WEIGHT_QUANTS.md` § "Dequant formula"). This
+    /// codec's one non-test, non-bench caller —
+    /// `rmlx-loader/src/calibration.rs`, behind `rmlx kv-calibrate` — always
+    /// picks `U32Le` instead, never this variant; see `U32Le`'s doc.
     U8,
     /// Codes packed LSB-first into u32 little-endian words.
     /// `per_word = 32 / bits` (floor), padded to the next word per row.
@@ -43,10 +43,13 @@ pub enum CodeStorage {
     /// contiguous bitstream. At 3, 5 and 6 bits `per_word * bits < 32`, so
     /// this variant's expected byte length is always larger than a real
     /// MLX tensor's, and the length check rejects it before any decode —
-    /// it is a length mismatch, never silently wrong values. Every
-    /// production loader picks this variant unconditionally
-    /// (`calibration.rs`), so a real 3/5/6-bit affine checkpoint fails to
-    /// load through the CPU decoder.
+    /// it is a length mismatch, never silently wrong values.
+    ///
+    /// `rmlx-loader/src/calibration.rs` picks this variant unconditionally,
+    /// so `rmlx kv-calibrate` cannot run its weight-norm recipes against a
+    /// real 3/5/6-bit affine checkpoint. Model loading for serving does not
+    /// call this codec: it decodes affine weights on the GPU through
+    /// mlx-c, which is unaffected.
     U32Le,
 }
 

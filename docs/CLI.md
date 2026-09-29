@@ -433,7 +433,11 @@ rmlx kv-calibrate /path/to/qwen3-snapshot --recipe softmax_mass
 **Weight-norm recipes** (`turbo2`, `turbo2_tcq`, `turbo3`, `turbo3_tcq`,
 `turbo4`) run on the CPU with no Metal claim. Float weights (F32, BF16 or
 F16) run directly; `affine`, `mxfp8`, `mxfp4` and `nvfp4` weights are
-dequantized to f32 first (`crates/rmlx-loader/src/calibration.rs`). They
+dequantized to f32 first (`crates/rmlx-loader/src/calibration.rs`). The
+`affine` path only actually matches MLX's byte layout at 2, 4 and 8 bits
+(`crates/rmlx-quant/src/affine.rs`, `CodeStorage::U32Le`'s doc); at 3, 5 and
+6 bits the length check refuses the tensor, so this recipe cannot run
+against a real affine checkpoint at those widths. They
 write `kv_calib.json` in the `multi-turboquant`
 `turboquant_kv.json` v1 schema. `turbo2*` keeps 25% of `head_dim` at high
 precision (`turboquant25`); the others keep 50% (`turboquant35`). The count is

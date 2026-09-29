@@ -366,7 +366,7 @@ pub(crate) fn resolve_kv_quant(
         (Some(kq), None) => {
             // Preset path: run the post-resolve arch invariants even though
             // the user bypassed the cache-type spec resolver. `validate_resolved`
-            // only has Qwen-MoE rules today; this catches e.g.
+            // only has Qwen-MoE rules; this catches e.g.
             // `--kv-quant mixed_k4g64_v4g64` (K below 8 bits) on a Qwen MoE
             // model at startup (exit 78) instead of crashing at first prefill.
             if let Err(e) = validate_resolved_kv_quant(arch_class, &kq) {

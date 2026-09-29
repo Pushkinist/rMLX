@@ -52,16 +52,20 @@ pub enum Error {
     ///
     /// Distinct from the generic [`Error::Mlx`] catch-all so automation
     /// could, in principle, tell "evict + retry" (load phases) from "stream
-    /// is dead, don't retry" (mid-generation). No request path reads that
-    /// distinction today: only [`OomPhase::LoadWeights`] is ever
-    /// constructed in production, and the server routes that could
-    /// construct it from a load failure (`ensure_loaded`) count it as a
-    /// generic upstream error rather than mapping the `Oom` variant. Only
-    /// constructed at call sites where the allocation phase is unambiguous
-    /// by construction — the mlx-c FFI surfaces every failure through one
-    /// opaque string channel, so OOM is NOT reliably distinguishable from a
-    /// shape/kernel error at the status-code level. `requested_bytes` /
-    /// `peak_alloc_mb` are best-effort and may be `None`.
+    /// is dead, don't retry" (mid-generation).
+    ///
+    /// No request path reads that distinction: only
+    /// [`OomPhase::LoadWeights`] is ever constructed in production, and the
+    /// server routes that could construct it from a load failure
+    /// (`ensure_loaded`) count it as a generic upstream error rather than
+    /// mapping the `Oom` variant.
+    ///
+    /// Only constructed at call sites where the allocation phase is
+    /// unambiguous by construction — the mlx-c FFI surfaces every failure
+    /// through one opaque string channel, so OOM is NOT reliably
+    /// distinguishable from a shape/kernel error at the status-code level.
+    /// `requested_bytes` / `peak_alloc_mb` are best-effort and may be
+    /// `None`.
     #[error("oom during {phase:?}: {msg}")]
     Oom {
         /// The allocation phase in which the OOM occurred.
@@ -238,7 +242,7 @@ impl Error {
 /// `Retry-After` mapping: load-phase OOM is retryable after eviction (507 +
 /// `Retry-After`); a mid-generation OOM leaves the KV cache corrupt past the
 /// failure point and is NOT retryable (503, no `Retry-After`). No production
-/// request path hands this mapping an `Oom` value today — see the type doc.
+/// request path hands this mapping an `Oom` value — see the type doc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(
     clippy::exhaustive_enums,

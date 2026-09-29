@@ -64,7 +64,7 @@ pub struct QuantV {
     /// Per-KV-head sorted list of high-precision head-dimension indices for
     /// the V projection. Would be sourced from `kv_calib.json` via
     /// `KvCacheBuilder`, but no per-arch construction code calls
-    /// `KvCacheBuilder::with_calibration` today — every construction sets
+    /// `KvCacheBuilder::with_calibration` — every construction sets
     /// this `None` (see `KvCacheBuilder`'s doc).
     ///
     /// `None` = no calibration attached; codec behavior is unchanged (default).

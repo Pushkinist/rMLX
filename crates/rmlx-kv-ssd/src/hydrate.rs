@@ -198,7 +198,7 @@ impl SsdHydrator {
     /// [`rmlx_kv_quant::KvCache::shares_kv`]); all five come from the caller,
     /// never from this struct — see the type docs for why. If a hydrated
     /// cache is ever tail-extended through the `exit_prefill` gate that
-    /// `shares_kv` decides — no production architecture does this today —
+    /// `shares_kv` decides — no production architecture does that —
     /// guessing the flag here would drop a mirror the requesting
     /// architecture needs.
     ///

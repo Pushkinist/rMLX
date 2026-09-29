@@ -536,12 +536,14 @@ another process holds the Metal claim, `perf_canary.sh` exits 11 and names the
 holder. For automated gates use `make canary-gate SHA=<sha>` against
 `runs.db`, or `scripts/regression_gate.sh <model> <baseline_tps>
 <baseline_stddev>`: exit 125 = `git bisect skip`, exit 1 = regression.
-Through `make`, a failed recipe line always reports `make`'s own exit code
-(2), not the underlying command's — call `rmlx metrics deltas` directly for
-its own exit codes. `canary-gate` exits 1 when the SHA has no rows at all
-(unknown SHA). It also exits 0 when the SHA is known but no cell was
-measured again after it, so a clean exit does not prove every cell was
-re-measured. Two `Cargo.toml` perf profiles are
+Through `make canary-gate`, a failed recipe line always reports `make`'s own
+exit code (2) — a regression, an unknown SHA and the underlying skip
+condition all surface as the same 2. Call `rmlx metrics deltas
+--since-sha <SHA> --threshold-pct 3 --exit-code true` directly to read its
+own exit codes: 1 for a regression or a SHA with no rows at all (unknown
+SHA), 125 for the skip condition (no comparable baseline). A known SHA with
+no cell measured again after it exits 0 even directly, so a clean exit does
+not prove every cell was re-measured. Two `Cargo.toml` perf profiles are
 in play: `release-perf` (`debug-assertions=false`, `overflow-checks=false`,
 stripped debug, `panic=unwind` kept for `MetalClaim::Drop` RAII — see Hard
 rule 9) is the canary / bench profile and the profile of `make ci-perf`'s
