@@ -115,3 +115,13 @@ fn non_zero_base_is_widened_not_replaced() {
         "a base of 8 must not collapse to 4 + active"
     );
 }
+
+/// `--prompt-cache-slots` has no upper bound, so widening a base at the `usize`
+/// ceiling must saturate rather than overflow.
+#[test]
+fn base_at_the_ceiling_saturates() {
+    assert_eq!(
+        effective_prompt_cache_slots(usize::MAX, 1),
+        Some(usize::MAX)
+    );
+}
