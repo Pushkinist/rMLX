@@ -70,12 +70,10 @@ that this change edits, creates or deletes carries nothing: every broken
 reference into it or out of it fails, so a cut fixes the broken citations of
 the docs it touches.
 
-`--base auto` picks the nearest of origin/main and origin/next/*: the ref
-whose merge-base leaves the fewest commits on HEAD, among refs that do not
-already contain HEAD; with none, HEAD itself. On a next/* tip that main does
-not contain (main carries a hotfix), that is the merge-base with main. On the
-main tip, it is the merge-base with the next/* ref, because main contains
-itself. Every run prints its base.
+`--base auto` picks origin/main: the merge-base of HEAD and origin/main, or
+HEAD^ when origin/main already contains HEAD — every landing is one squashed
+commit, so HEAD itself would compare HEAD with HEAD and could never fail.
+Every run prints its base.
 
 `CHANGELOG.md` is released history and is never edited for a doc cut. Its
 references are scanned and a broken one is printed, but it never fails.
@@ -185,19 +183,16 @@ def ref_files(root: Path, ref: str) -> tuple[dict[str, str], set[str]]:
 def nearest_base(root: Path) -> tuple[str, str]:
     """(ref, merge-base sha) for `--base auto`; see the module docstring."""
     head = git(root, "rev-parse", "HEAD").decode().strip()
-    refs = git(root, "for-each-ref", "--format=%(refname)", "refs/remotes/origin/main", "refs/remotes/origin/next/")
+    refs = git(root, "for-each-ref", "--format=%(refname)", "refs/remotes/origin/main")
     candidates = refs.decode().split()
     if not candidates:
-        raise CannotRun("--base auto: no origin/main or origin/next/* ref; fetch, or pass a base")
-    best = None
-    for ref in sorted(candidates):
-        merge_base = git(root, "merge-base", "HEAD", ref).decode().strip()
-        if merge_base == head:
-            continue
-        ahead = int(git(root, "rev-list", "--count", f"{merge_base}..HEAD").decode())
-        if best is None or ahead < best[0]:
-            best = (ahead, ref.removeprefix("refs/remotes/"), merge_base)
-    return (best[1], best[2]) if best else ("HEAD", head)
+        raise CannotRun("--base auto: no origin/main ref; fetch, or pass a base")
+    ref = candidates[0]
+    merge_base = git(root, "merge-base", "HEAD", ref).decode().strip()
+    if merge_base == head:
+        parent = git(root, "rev-parse", "HEAD^").decode().strip()
+        return ("HEAD^", parent)
+    return (ref.removeprefix("refs/remotes/"), merge_base)
 
 
 def slug(heading: str) -> str:

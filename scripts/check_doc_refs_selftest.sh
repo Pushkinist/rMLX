@@ -471,47 +471,38 @@ git -C "${WORK}/no_docs" init -q
 run_exit no_docs 2 "no tracked docs/*.md" \
     "a tree with no docs is exit 2, not a clean scan" --root "${WORK}/no_docs"
 
-# --base auto: origin/main at the base commit, origin/next/x one commit above
-# it, HEAD one commit above that.
+# --base auto: origin/main at the base commit, HEAD two commits above it.
 AUTO="${WORK}/auto"
 cp -R "${BASE}" "${AUTO}"
 c0=$(git -C "${AUTO}" rev-parse HEAD)
 printf 'next\n' >"${AUTO}/next.txt" && commit_all "${AUTO}" next
 c1=$(git -C "${AUTO}" rev-parse HEAD)
 printf 'work\n' >"${AUTO}/work.txt" && commit_all "${AUTO}" work
-run_exit auto_without_refs 2 "no origin/main or origin/next/* ref" \
-    "--base auto with no origin ref is exit 2" --root "${AUTO}" --base auto
+run_exit auto_without_refs 2 "no origin/main ref" \
+    "--base auto with no origin/main ref is exit 2" --root "${AUTO}" --base auto
 git -C "${AUTO}" update-ref refs/remotes/origin/main "${c0}"
+run_exit auto_uses_main 0 "base: origin/main (merge-base ${c0:0:12})" \
+    "--base auto compares with the merge-base with origin/main" --root "${AUTO}" --base auto
 git -C "${AUTO}" update-ref refs/remotes/origin/next/x "${c1}"
-run_exit auto_picks_nearest 0 "base: origin/next/x (merge-base ${c1:0:12})" \
-    "--base auto picks the ref that leaves the fewest commits on HEAD" --root "${AUTO}" --base auto
-git -C "${AUTO}" update-ref refs/remotes/origin/next/x "$(git -C "${AUTO}" rev-parse HEAD)"
-run_exit auto_skips_a_ref_holding_head 0 "base: origin/main (merge-base ${c0:0:12})" \
-    "--base auto skips a ref that already contains HEAD" --root "${AUTO}" --base auto
+run_exit auto_ignores_next_refs 0 "base: origin/main (merge-base ${c0:0:12})" \
+    "--base auto reads only origin/main, even with a refs/remotes/origin/next/* ref nearer to HEAD" \
+    --root "${AUTO}" --base auto
 git -C "${AUTO}" update-ref refs/remotes/origin/main "$(git -C "${AUTO}" rev-parse HEAD)"
-run_exit auto_falls_back_to_head 0 "base: HEAD (merge-base" \
-    "--base auto compares with HEAD when every ref contains it" --root "${AUTO}" --base auto
+head_parent=$(git -C "${AUTO}" rev-parse HEAD^)
+run_exit auto_falls_back_to_head_parent 0 "base: HEAD^ (merge-base ${head_parent:0:12})" \
+    "--base auto falls back to HEAD^, not HEAD, when origin/main already contains HEAD" \
+    --root "${AUTO}" --base auto
 
-# A hotfix on main that next/ lacks: main no longer contains next/, and next/
-# does not contain main.
-HOTFIX="${WORK}/hotfix"
-cp -R "${BASE}" "${HOTFIX}"
-h0=$(git -C "${HOTFIX}" rev-parse HEAD)
-printf 'next\n' >"${HOTFIX}/next.txt" && commit_all "${HOTFIX}" next
-next_tip=$(git -C "${HOTFIX}" rev-parse HEAD)
-git -C "${HOTFIX}" checkout -q -b hotfix "${h0}"
-printf 'fix\n' >"${HOTFIX}/fix.txt" && commit_all "${HOTFIX}" hotfix
-main_tip=$(git -C "${HOTFIX}" rev-parse HEAD)
-git -C "${HOTFIX}" update-ref refs/remotes/origin/main "${main_tip}"
-git -C "${HOTFIX}" update-ref refs/remotes/origin/next/x "${next_tip}"
-git -C "${HOTFIX}" checkout -q --detach "${next_tip}"
-run_exit auto_on_next_tip_uses_main 0 "base: origin/main (merge-base ${h0:0:12})" \
-    "HEAD at a next/ tip that main does not contain compares with the merge-base with main" \
-    --root "${HOTFIX}" --base auto
-git -C "${HOTFIX}" checkout -q --detach "${main_tip}"
-run_exit auto_on_main_uses_next 0 "base: origin/next/x (merge-base ${h0:0:12})" \
-    "HEAD at the main tip compares with the merge-base with the next/ ref" \
-    --root "${HOTFIX}" --base auto
+# The HEAD^ fallback is not vacuous: a break landed in the tip commit itself is still caught
+# (comparing HEAD with HEAD, as before the fallback, could never fail).
+AUTO_TIP_BREAK="${WORK}/auto_tip_break"
+cp -R "${BASE}" "${AUTO_TIP_BREAK}"
+edit "${AUTO_TIP_BREAK}/docs/A.md" $'## Cost of the host path\n' ''
+commit_all "${AUTO_TIP_BREAK}" "break a doc citation"
+git -C "${AUTO_TIP_BREAK}" update-ref refs/remotes/origin/main "$(git -C "${AUTO_TIP_BREAK}" rev-parse HEAD)"
+run_exit auto_head_parent_catches_tip_break 1 "crates/c/m.sql:1: SECTION docs/A.md 'Cost of the host path' — resolves to nothing" \
+    "the HEAD^ fallback catches a reference broken in the commit that lands on main" \
+    --root "${AUTO_TIP_BREAK}" --base auto
 
 echo "check_doc_refs selftest: ${PASSED} passed, ${FAILED} failed"
 [ "${FAILED}" -eq 0 ]

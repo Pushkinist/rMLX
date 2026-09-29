@@ -583,8 +583,9 @@ check-doc-source-citations: ## CI gate: fail if a `crates/...` source path cited
 
 # The base is a make variable, never read from the environment: only
 # DOC_REFS_BASE=<ref> on the make command line counts, which in make includes
-# the same assignment passed in MAKEFLAGS. `auto` is the nearest of origin/main
-# and origin/next/* that does not already contain HEAD (see check_doc_refs.py).
+# the same assignment passed in MAKEFLAGS. `auto` is the merge-base with
+# origin/main, or HEAD itself when origin/main already contains HEAD (see
+# check_doc_refs.py).
 DOC_REFS_BASE_ARG := $(if $(filter command line,$(origin DOC_REFS_BASE)),$(DOC_REFS_BASE),auto)
 
 .PHONY: check-doc-refs

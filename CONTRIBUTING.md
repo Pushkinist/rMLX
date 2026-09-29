@@ -49,34 +49,30 @@ of the recorded decode TPS.
 
 ## Workflow
 
-`main` holds released state only — tag it, or fast-forward it at release
-time, but do not target it with a normal PR. Day-to-day work lands on the
-current accumulation branch, `next/<name>` (ask a maintainer which one is
-open, or check open PRs for the name).
+`main` holds released state and takes every change directly — there is no
+accumulation branch. One issue gets one branch and one PR, and it lands as
+exactly one commit on `main`; the issue closes from that commit's
+`Closes #N`.
 
-1. Branch from `next/<name>`, not from `main` (`feat/…`, `fix/…`, `chore/…`).
-   One issue gets one branch, one PR, and — once merged — one commit on
-   `next/<name>`; commits inside the branch itself are unlimited.
+1. Branch from `main` (`feat/…`, `fix/…`, `chore/…`). Commits inside the
+   branch itself are unlimited — only the landed result is one commit.
 2. Keep changes surgical — match existing style, no drive-by refactors.
 3. Tests live in sibling `*_tests.rs` files (no inline `#[cfg(test)] mod`
    blocks — `make check-no-inline-tests` enforces this).
-4. Keep the branch current with `next/<name>` by rebasing onto it — never
-   merge `next/<name>` into the branch, and never open a second PR for the
-   same issue.
+4. Keep the branch current with `main` by rebasing onto it — never merge
+   `main` into the branch, and never open a second PR for the same issue.
 5. `make ci` green locally on every chunk you push, plus `make ci-perf` when
    the change touches what §Build & test names. Every merge to `main` runs
    the whole `make ci-perf`.
-6. Open a PR into `next/<name>`. The hosted checks
-   (`.github/workflows/ci.yml`) run on every PR into `main` and into
-   `next/<name>`, as the branch rulesets require. Fill in the PR template,
-   including the `Removals` section — see below. A maintainer squash-merges it.
+6. Open a PR into `main`. The hosted checks (`.github/workflows/ci.yml`) run
+   on every PR into `main`, as the branch ruleset requires. Fill in the PR
+   template, including the `Removals` section — see below.
 
-Both `main` and `next/<name>` are protected: changes land via PR with the
-required checks green. Only a maintainer pushes to them directly, through the
-ruleset bypass: the release fast-forward of `next/<name>` onto `main`, and the
-rebase of `next/<name>` after a hotfix. A fix for a bug already released on
-`main` branches from `main` directly as `hotfix/<issue>`. Both procedures are
-in `docs/RELEASING.md`.
+`main` is protected: changes land via PR with the required checks green. A
+maintainer squashes the branch into that one commit and fast-forward pushes
+it to `main` directly, through the ruleset's admin bypass — see
+`docs/RELEASING.md` §Branch model for why GitHub's own merge button cannot do
+this.
 
 ### No twins
 
