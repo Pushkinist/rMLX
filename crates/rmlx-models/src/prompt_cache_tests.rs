@@ -2735,7 +2735,7 @@ fn zero_slots_stores_nothing() {
 #[test]
 #[allow(
     clippy::unwrap_used,
-    reason = "test-only: `ensure` on the line above installs the cache the closure unwraps"
+    reason = "test-only: `ensure` before the closure installs the cache"
 )]
 fn slot_count_reserves_no_memory_up_front() {
     let arch: ArchPromptCache<TestEntry> =
@@ -2743,15 +2743,19 @@ fn slot_count_reserves_no_memory_up_front() {
     let prompt = make_ids(2 * BLOCK_TOKENS);
 
     arch.ensure(usize::MAX);
-    let (stored, slots) = arch.with_inner_mut(|g| {
+    let (stored, slots, cap) = arch.with_inner_mut(|g| {
         let cache = g.as_mut().unwrap();
         let stored = cache.push(TestEntry::for_quant(prompt.clone(), TEST_QUANT));
-        (stored, cache.slots.len())
+        (stored, cache.slots.len(), cache.slots.capacity())
     });
     assert_eq!(stored, Some(0), "the first snapshot must be admitted");
     assert_eq!(
         slots, 1,
         "the cache holds what was pushed, not what was allowed"
+    );
+    assert!(
+        cap < 16,
+        "the slot vector grew with what was stored, not with the limit"
     );
 }
 
