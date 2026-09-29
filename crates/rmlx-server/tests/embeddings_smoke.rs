@@ -150,6 +150,21 @@ async fn unknown_model_is_404() {
     assert_eq!(status, 404, "body: {body}");
 }
 
+/// A set `truncate_prompt_tokens` → 400 naming the field. The model id is not
+/// in the registry, so a 404 would mean the check ran after the model lookup.
+#[tokio::test]
+async fn truncate_prompt_tokens_is_400_before_the_model_lookup() {
+    let port = start(state(ModelRegistry::default(), Device::Cpu)).await;
+    let (status, b) = post(
+        port,
+        "/v1/embeddings",
+        r#"{"model":"x","input":"hi","truncate_prompt_tokens":8}"#,
+    )
+    .await;
+    assert_eq!(status, 400, "body: {b}");
+    assert!(b.contains("truncate_prompt_tokens"), "body: {b}");
+}
+
 /// `encoding_format` outside {float,base64} → 400.
 #[tokio::test]
 async fn invalid_encoding_format_is_400() {
