@@ -100,11 +100,19 @@ async fn start(state: AppState) -> u16 {
 }
 
 async fn post(port: u16, path: &str, body: &str) -> (u16, String) {
+    send(port, "POST", path, body).await
+}
+
+async fn get(port: u16, path: &str) -> (u16, String) {
+    send(port, "GET", path, "").await
+}
+
+async fn send(port: u16, method: &str, path: &str, body: &str) -> (u16, String) {
     let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
         .await
         .unwrap();
     let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     );
@@ -225,6 +233,16 @@ async fn valid_single_vector_200_shape(reg: ModelRegistry, device: Device) {
     assert_eq!(emb.len(), 2048, "full single-vector dim == 2048");
     assert!(emb[0].is_f64(), "single-vector elements are floats");
     assert!(v["usage"]["prompt_tokens"].as_u64().unwrap() > 0);
+
+    assert_eq!(listed_as_loaded(port).await, Some(true));
+}
+
+/// The `loaded` flag `GET /v1/models` gives for the jina id.
+async fn listed_as_loaded(port: u16) -> Option<bool> {
+    let (status, b) = get(port, "/v1/models").await;
+    assert_eq!(status, 200, "body: {b}");
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    v["data"].as_array()?.iter().find(|m| m["id"] == JINA_ID)?["loaded"].as_bool()
 }
 
 #[tokio::test]
