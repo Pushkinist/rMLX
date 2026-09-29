@@ -363,7 +363,7 @@ pub fn load_model(model_dir: &Path, device: Device, opts: &LoadOpts) -> Result<A
 /// # Errors
 /// `Error::Model` naming the fact found. `Error::Loader` if a shard in
 /// `model_dir` cannot be opened or its header cannot be parsed.
-pub fn refuse_hadamard_pack(cfg: &ModelConfig, model_dir: &Path) -> Result<()> {
+fn refuse_hadamard_pack(cfg: &ModelConfig, model_dir: &Path) -> Result<()> {
     let fact = if cfg.extras.contains_key("hadamard_config") {
         Some("config.json carries `hadamard_config`".to_owned())
     } else {

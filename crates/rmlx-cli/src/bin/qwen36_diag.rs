@@ -56,22 +56,17 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let cfg = rmlx_loader::load_config(&model_dir).map_err(|e| anyhow::anyhow!("config: {e}"))?;
-    rmlx_models::arch::refuse_hadamard_pack(&cfg, &model_dir)
-        .map_err(|e| anyhow::anyhow!("refused: {e}"))?;
-    let arch = cfg.architectures.first().map_or("(empty)", String::as_str);
-    anyhow::ensure!(
-        matches!(
-            arch,
-            "Qwen3_5MoeForConditionalGeneration" | "Qwen3_5ForConditionalGeneration"
-        ),
-        "qwen36_diag loads Qwen3.5 snapshots only; {} declares '{arch}'",
-        model_dir.display()
-    );
-
     eprintln!("loading model from {}", model_dir.display());
-    let model = rmlx_models::qwen3_5_moe::load_from_path(&model_dir)
-        .map_err(|e| anyhow::anyhow!("load: {e}"))?;
+    let arch =
+        rmlx_models::arch::load_model(&model_dir, device, &rmlx_models::arch::LoadOpts::default())
+            .map_err(|e| anyhow::anyhow!("load: {e}"))?;
+    let rmlx_models::arch::Architecture::Qwen3_5Moe(model) = arch else {
+        anyhow::bail!(
+            "qwen36_diag runs Qwen3.5 models only; {} loaded as {}",
+            model_dir.display(),
+            arch.arch_class()
+        );
+    };
 
     if n_gen == 0 {
         eprintln!(

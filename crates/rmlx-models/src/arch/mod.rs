@@ -23,9 +23,7 @@ pub(crate) mod loader;
 pub(crate) mod phases;
 pub(crate) mod registry;
 
-pub use loader::{
-    load_model, refuse_hadamard_pack, run_smoke_probe, smoke_prompt_ids, LoadOpts, SMOKE_PROMPT,
-};
+pub use loader::{load_model, run_smoke_probe, smoke_prompt_ids, LoadOpts, SMOKE_PROMPT};
 pub use phases::{read_load_phases, LoadPhases};
 pub use registry::{is_arch_supported, is_generative_arch, KNOWN_ARCHS};
 
