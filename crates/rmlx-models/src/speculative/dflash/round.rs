@@ -160,7 +160,7 @@ impl RoundDrafter for AdaptiveRound<'_> {
 
     /// The loop's narrowing, moved by the accept rate of the recent rounds.
     fn block(&self, block_total: usize, remaining: usize) -> usize {
-        dflash_next_block_size(&self.recent, block_total, remaining, false)
+        dflash_next_block_size(&self.recent, block_total, remaining)
     }
 
     fn propose(&mut self, ctx: &mut RoundCtx<'_>, carry: u32, block: usize) -> Result<Vec<u32>> {

@@ -127,9 +127,8 @@ pub enum NotesVerdict {
 /// migration 008 rewrites the rows that predate it. A second copy in the engine
 /// would be the drift this column exists to prevent.
 ///
-/// DFlash is here because it has always been adaptive: its production call site
-/// passes `prefer_requested = false`, and the only caller passing `true` is a
-/// unit test. There has never been a fixed-block DFlash arm to describe.
+/// DFlash is here because its round loop always sets the block from the recent
+/// accept rate. No DFlash path drafts a fixed block.
 pub const ADAPTIVE_DRAFTERS: &[(&str, &str)] = &[("dflash", "accept_rate")];
 
 /// The depth policy `draft_kind`'s round loop always runs under, if it always

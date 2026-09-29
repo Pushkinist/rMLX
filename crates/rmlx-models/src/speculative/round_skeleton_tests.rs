@@ -204,8 +204,8 @@ fn the_round_block_is_one_function_of_the_block_and_the_budget() {
     // The adaptive schedule is a different function, and stays one: with no
     // history it takes the same narrowing, and with a poor recent accept rate it
     // does not.
-    assert_eq!(dflash_next_block_size(&[], 16, 8, false), 9);
-    assert_eq!(dflash_next_block_size(&[(0, 7), (0, 7)], 16, 16, false), 4);
+    assert_eq!(dflash_next_block_size(&[], 16, 8), 9);
+    assert_eq!(dflash_next_block_size(&[(0, 7), (0, 7)], 16, 16), 4);
 }
 
 /// The verifier's rollback target keeps the carry and the accepted prefix, and
