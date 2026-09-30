@@ -267,3 +267,68 @@ fn key_short_hex_is_8_chars() {
     let k = MmCacheKey::image_key(b"abc", 1, 1, 1, MmDtype::F32, SIG_A);
     assert_eq!(k.short_hex().len(), 8);
 }
+
+/// Publish through `get_or_compute` on one thread and never evaluate the
+/// output there, as a request that fails in prefill does, then read the entry
+/// on a second thread. The writer stays alive, as a blocking-pool worker does.
+fn read_after_unevaluated_publish(split: bool) -> rmlx_core::error::Result<Vec<u8>> {
+    let cache = Arc::new(MultimodalCache::new(1 << 20));
+    let key = MmCacheKey::image_key(b"px", 1, 1, 1, MmDtype::F32, SIG_A);
+    let publish = {
+        let cache = Arc::clone(&cache);
+        move || {
+            let lazy = get_or_compute(Some(&cache), key, || {
+                let a = Array::from_f32_slice(&[1.0, 2.0], &[2])?;
+                rmlx_mlx::add(&a, &a, rmlx_mlx::Device::Gpu)
+            });
+            drop(lazy);
+        }
+    };
+    let read = move || {
+        get_or_compute(Some(&cache), key, || {
+            panic!("the second request must hit the entry the first one published")
+        })?
+        .to_bytes()
+    };
+    if !split {
+        return std::thread::spawn(move || {
+            publish();
+            read()
+        })
+        .join()
+        .expect("thread panicked");
+    }
+    let (published_tx, published_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let writer = std::thread::spawn(move || {
+        publish();
+        published_tx.send(()).ok();
+        release_rx.recv().ok();
+    });
+    published_rx.recv().expect("writer published");
+    let out = std::thread::spawn(read).join().expect("reader panicked");
+    release_tx.send(()).ok();
+    writer.join().expect("writer panicked");
+    out
+}
+
+#[test]
+#[ignore = "requires Metal GPU; run with `make gpu-test`"]
+fn an_entry_whose_writer_never_evaluated_it_reads_on_another_thread() {
+    let expected: Vec<u8> = [2.0f32, 4.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let oracle = read_after_unevaluated_publish(false).expect("the one-thread oracle must read");
+    assert_eq!(
+        oracle, expected,
+        "the one-thread oracle read the wrong values"
+    );
+    let crossed = read_after_unevaluated_publish(true).unwrap_or_else(|e| {
+        panic!(
+            "the cache published an unevaluated graph bound to the writer's stream, and a \
+             reader on another thread cannot evaluate it: {e}"
+        )
+    });
+    assert_eq!(
+        crossed, expected,
+        "the cross-thread read differs from the oracle"
+    );
+}
