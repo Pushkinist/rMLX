@@ -7,7 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-09-30
+
+This release puts every speculative drafter on one round loop and makes that
+loop answer what plain decode answers, adds the DFlash 2 drafter, and lets
+`--yarn-factor` lift the context ceiling it used to leave in place. The packed
+iso and rotor KV codecs get between 33% and 46% smaller, and the rotor family
+drops below bf16 for the first time.
+
+Three changes to read before upgrading, all under **Changed**: the SSD KV tier
+bumps its schema, so each namespace takes one cold pass; the Metal claim is one
+machine-wide file, `/var/tmp/rmlx.claim`, instead of one per port; and
+`--device cpu` now refuses every KV codec except `none`. No CLI flag,
+environment variable or HTTP route is removed.
+
+The release tarball is now signed with a cosign key pair. Verify it against
+`cosign.pub` at the repository root:
+`cosign verify-blob --key cosign.pub --bundle <bundle> <tarball>`.
+
+### Added
+
+- **The DFlash 2 drafter.** Its loader reads every key from the checkpoint's own
+  config — `block_size` from `dflash_config`, the RoPE base from
+  `rope_parameters` — and names a missing one in a refusal instead of taking a
+  default. It also refuses a config it can parse but not run: a convolution with
+  more than two taps, a group size that does not divide the channels, a
+  full-attention layer in a stack the forward masks as sliding. (#523)
+
+- **The drafter kind is read off the draft snapshot.** `--draft-model` no longer
+  requires `--draft-kind`: EAGLE-3 and DFlash architectures, the
+  `gemma4_assistant` and `qwen3_5_mtp` sidecars, and any registered architecture
+  (as a two-model pair) declare themselves in their own `config.json`.
+  `--draft-kind` names a snapshot that declares nothing and is refused when it
+  contradicts a declaration. The two-model round loops were reachable only
+  through a `profiles.toml` `draft_model` before; the command line reaches them
+  now. Before loading a weight, the two tokenizers are compared id by id, with a
+  tail of at most 128 ids allowed on one side, because a same-size mismatched
+  pair serves garbage rather than failing. (#512)
+
+- **`--kv-boundary-layers <head>,<tail>`** on `serve`, `baseline`, `bench` and
+  `eval ppl` sets how many leading and trailing layers the KV boundary floor
+  promotes (default 2 and 8). A run at a non-default boundary is recorded as
+  such. `rmlx eval ppl` takes KV flags, and asking it for a codec teacher-forces
+  each window through a real per-layer cache, so each NLL is read off the decode
+  path a request runs. Without a KV flag the scorer is unchanged. (#494)
+
+- **A perplexity scorer for Qwen3.5**, dense and MoE, which had none. It scores
+  cacheless and refuses a KV codec, since a codec would touch only the sixteen
+  full-attention layers of sixty-four. (#515)
+
+- **`GET /v1/models` reports `max_ctx` and `positional_max`** for each resident
+  model. (#493)
+
+- **`rmlx metrics` subcommands take `--decode-config`**, the column that keeps a
+  speculative or otherwise non-default run out of the plain-decode cell.
+
 ### Changed
+
+- **Release tarballs are signed with a cosign key pair.** Keyless signing with
+  a personal OIDC login writes the signer's email into the bundle's certificate
+  and into the public Rekor log. The signature now carries no identity and is
+  checked against `cosign.pub` at the repository root. Releases up to 0.4.1
+  keep their keyless bundles. (#634)
+
+- **The four long-context prompts drop a contact address.** They carried a
+  third party's email from the README they were built from; it is replaced
+  with `contact@example.invalid`. The prompts are content-addressed, so each is
+  a new prompt row with a new id, and earlier observations keep the old one.
+  (#634)
 
 - **The packed K/V ring stores its codes in a dense plane, and the iso and rotor
   codecs get between 33% and 46% smaller.** The ring spent one whole `u32` code
@@ -37,6 +104,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   neither moves when the bits inside a block are re-cadenced — so a v7 block
   would hit and hydrate under the new unpacker. The bump routes those namespaces
   through the startup wipe instead. One cold pass after upgrading.
+
+- **One resolution decides every context cap, and `--yarn-factor` lifts it.**
+  `--yarn-factor` synthesised RoPE parameters but never raised the ceiling that
+  refused a long request, so the refusal was byte-identical with and without it.
+  Capacity is now `max_position_embeddings`, extended by a `rope_scaling` the
+  config declares or by `--yarn-factor` (with a warning past the trained
+  window). An explicit `--yarn-factor` overrides the config's own
+  `rope_scaling`, which is llama.cpp's precedence, and keeps the checkpoint's
+  declared YaRN betas. The KV ring, the server's admission guard, a per-request
+  `max_ctx` and the default `--max-prompt-tokens` all read the one resolution;
+  the last was an unrelated 65 536 constant and is now the resolved ceiling. A
+  request above capacity is refused, never clamped, naming the request, the
+  capacity, the trained window and what would lift it. The speculative sidecars
+  read it too, so an over-capacity `--max-ctx` on a speculative pair is refused
+  up front instead of overflowing a cache mid-round. (#493)
+
+- **An MTP request decides its own block.** The MTP round loop clamped the
+  requested block to the sidecar's declared `block_size`, which every shipped
+  Qwen3.5-family sidecar sets to 3, so a request for 4 or more silently ran 3.
+  The declared value is the depth the head was trained at, not a bound; the
+  block is now bounded only by what one verify forward can score. (#540)
+
+- **`truncate_prompt_tokens` on `/v1/embeddings` is refused with HTTP 400**
+  instead of being ignored. A client that sent it and relied on it being a
+  no-op gets an error now.
+
+- **A snapshot carrying `hadamard_config` or `.signs` tensors is refused at
+  load.** Its weights need an input-side Hadamard transform the engine does not
+  apply, so it would load and answer wrongly. Unreadable stray shards are
+  skipped with a warning.
+
+- **`/unload` can unload an embedding model**, and `/v1/models`, `/status` and
+  `/unload` read one residency check that includes the embedding slot. The
+  embedding model has its own lock, so these routes no longer wait on a forward.
+
+- **`brew install rmlx` builds from source.** The formula's `bottle do` block
+  pointed at a bottle that was never built for any version after 0.3.0, and a
+  bottle links the builder's `mlx-c` while the formula's `mlx-c` is deliberately
+  unversioned. The block is removed rather than refreshed. (#476)
 
 ### Fixed
 
@@ -194,6 +300,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file. For one release, a new binary also refuses when a build from before
   this change holds the old per-port claim at `/tmp/rmlx.<port>.claim`; that
   probe is removed in the release after next.
+
+- **A sidecar drafter honours the temperature it was asked for.** A request
+  that set a temperature and reached any of the five sidecar loops decoded
+  greedily and said nothing about it; a debug line claimed stochastic
+  acceptance was active. Every round loop now draws with the request's sampler.
+  (#529)
+
+- **A speculative arm reproduces plain greedy past the sliding-window ring's
+  wrap.** A round writes its whole verify block into every layer and rolls the
+  rejected tail off. The sliding-window ring kept the rejected drafts once it
+  had wrapped, and because the loop read its rollback target off layer 0, which
+  is sliding, the full-attention layers then rolled back to the wrong place
+  too. Under a 4k prompt the arm stopped matching plain greedy from the sixth
+  token. The ring now gives any rejectable tail back and refuses, loudly, the
+  one case it cannot serve. (#509)
+
+- **`Array::to_bytes` returns the array's own elements.** For a transpose, a
+  strided slice or a broadcast it read the parent allocation's leading
+  elements under the view's shape — right length, right dtype, wrong values —
+  and for a broadcast it read past the allocation's end. A non-contiguous array
+  is now relaid on the CPU stream before the read. (#479)
+
+- **An oversized `--prompt-cache-slots` no longer panics.** The slot vector
+  reserved memory for the whole configured limit up front and panicked with a
+  capacity overflow; the count is now a limit, and the session-widened count
+  saturates instead of overflowing.
+
+- **The perplexity walk scores every position.** The shared sliding walk skipped
+  one corpus position per window boundary — 0.05% of the denominator at the
+  default window, and everything after the first window at stride 1. (#515)
+
+- **A speculative request that asks for logprobs is named in the
+  dropped-sampling-fields warning.**
+
+- **The v0.4.1 Homebrew formula checksum.** The source archive GitHub serves for
+  v0.4.1 stopped matching the digest recorded at release time, so
+  `brew install rmlx` failed its checksum until the formula was corrected.
+  (#587)
+
+### Performance
+
+- **A partly-accepted speculative round rebuilds its recurrent state from a
+  tape.** The GatedDeltaNet state has no sequence axis, so a partial round
+  restored a snapshot and re-ran the accepted prefix through the whole layer
+  stack — a second full read of the weights on every partial round. The round
+  now records the recurrence inputs its forward built and refolds the accepted
+  prefix through the recurrence kernel alone. (#535)
+
+- **The acceptance walk reads the argmax the verify forward already built.** The
+  sidecar loop dropped the verify forward's head projection and re-derived it
+  one position at a time — another full read of an untied, quantised LM head per
+  position, on a bandwidth-bound verifier. (#518)
+
+- **The verifier's captured hidden state is bounded at prefill** to the rows a
+  drafter can read, and a round projects only the rows it committed. (#545)
+
+- **Qwen3 prefills in chunks of 1024.** A Latin-square sweep over five chunk
+  sizes on two Qwen3 snapshots at 4k, 16k and 32k prompts found 1024 the only
+  size that lowered time-to-first-token at every length on both, with decode
+  rate and token digest unchanged. The verifier of a speculative pair now
+  prefills at its own architecture's chunk. (#490)
 
 ## [0.4.1] - 2026-09-02
 
@@ -2739,7 +2906,8 @@ inference + conversion backend for Apple Silicon — no Python at runtime.
 - Speculative drafters validated against their verifiers: Qwen 3.6 MTP sidecar
   and the Gemma 4 assistant drafter.
 
-[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/Pushkinist/rMLX/releases/tag/v0.4.2
 [0.4.1]: https://github.com/Pushkinist/rMLX/releases/tag/v0.4.1
 [0.4.0]: https://github.com/Pushkinist/rMLX/releases/tag/v0.4.0
 [0.3.0]: https://github.com/Pushkinist/rMLX/releases/tag/v0.3.0
