@@ -116,28 +116,38 @@ fn a_panic_on_the_mlx_thread_reaches_the_caller_and_the_thread_goes_on() {
     );
 }
 
-/// MLX builds some ops inside other ops on the default stream of the building
-/// thread, not on the stream the caller passed. After one op, the default
-/// stream of a thread must be the MLX thread's stream.
+/// MLX builds some ops inside other ops on the default stream of the default
+/// device, not on the stream the caller passed. After one CPU op, the default
+/// CPU and GPU streams of a thread must be the MLX thread's streams.
 #[test]
-fn a_thread_that_built_an_op_defaults_to_the_mlx_threads_stream() {
-    let same = std::thread::spawn(|| {
+fn a_thread_that_built_an_op_defaults_to_the_mlx_threads_streams() {
+    let (cpu, gpu) = std::thread::spawn(|| {
         drop(lazy_sum(Device::Cpu));
-        let mlx = stream(Device::Cpu).unwrap();
-        // SAFETY: a new reference to this thread's default CPU stream, freed
-        // below; `mlx` lives for the process.
+        // SAFETY: new references to this thread's default streams, freed
+        // below; the MLX thread's handles live for the process.
         unsafe {
             let default = sys::mlx_default_cpu_stream_new();
-            let same = sys::mlx_stream_equal(default, mlx);
+            let cpu = sys::mlx_stream_equal(default, CPU_STREAM.get().unwrap().0);
             sys::mlx_stream_free(default);
-            same
+            let gpu = GPU_STREAM.get().map(|mlx| {
+                let default = sys::mlx_default_gpu_stream_new();
+                let same = sys::mlx_stream_equal(default, mlx.0);
+                sys::mlx_stream_free(default);
+                same
+            });
+            (cpu, gpu)
         }
     })
     .join()
     .unwrap();
     assert!(
-        same,
-        "an op MLX builds on this thread's default stream would not evaluate on the MLX thread"
+        cpu,
+        "the default CPU stream of a building thread is its own"
+    );
+    assert_eq!(
+        gpu,
+        metal_available().then_some(true),
+        "the default GPU stream of a building thread is its own, or the MLX thread has none"
     );
 }
 
