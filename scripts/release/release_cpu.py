@@ -8,14 +8,18 @@ build pins BASELINE_CPU instead, keeping every other flag config.toml sets.
   rustflags [--root DIR]
       Print the release build's rustflags in CARGO_ENCODED_RUSTFLAGS form
       (0x1f-separated): config.toml's flags with its target CPU replaced by
-      BASELINE_CPU. That variable replaces build.rustflags outright, so this is
-      the one place the other flags are carried over rather than restated.
-      Exit 1 when config.toml sets a target feature.
+      BASELINE_CPU, plus a `--remap-path-prefix` that rewrites the build
+      machine's home directory to `~`, so no dependency's source path carries
+      the builder's user name into the published binary. That variable
+      replaces build.rustflags outright, so this is the one place the other
+      flags are carried over rather than restated. Exit 1 when config.toml
+      sets a target feature.
 
   check <tarball> [--root DIR]
       Exit 0 when the `rmlx` binary inside <tarball> was compiled with exactly
       one target CPU, BASELINE_CPU, no target feature, and otherwise with
-      config.toml's flags in config.toml's order. It reads rustflags only: a
+      config.toml's flags in config.toml's order. A `--remap-path-prefix` is
+      not compared: it changes the paths the binary records, not its code. It reads rustflags only: a
       rustc wrapper's own arguments are not recorded, which is why
       package_binary.sh builds with every wrapper cleared.
       The binary carries no record of its target CPU, so the chain is: the
@@ -77,13 +81,16 @@ def normalize(flags):
     return out
 
 
+REMAP = "--remap-path-prefix"
+
+
 def split_cpu(flags):
-    """(target-cpu values, every other flag), both in order."""
+    """(target-cpu values, every other flag but a path remap), both in order."""
     cpus, rest = [], []
     for tok in normalize(flags):
         if tok.startswith("-Ctarget-cpu="):
             cpus.append(tok[len("-Ctarget-cpu="):])
-        else:
+        elif not tok.startswith(REMAP + "="):
             rest.append(tok)
     return cpus, rest
 
@@ -152,7 +159,7 @@ def release_rustflags(root):
     if target_features(rest):
         raise Refused(f".cargo/config.toml sets {target_features(rest)}: the release binary "
                       f"enables no feature beyond {BASELINE_CPU}'s")
-    return ["-Ctarget-cpu=" + BASELINE_CPU] + rest
+    return ["-Ctarget-cpu=" + BASELINE_CPU] + rest + [f"{REMAP}={Path.home()}=~"]
 
 
 def check(tarball, root):

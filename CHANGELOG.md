@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The release tarball's binary no longer carries the builder's home
+  directory.** Every dependency's panic location was compiled in as an
+  absolute path under the build machine's home, user name included — 577
+  strings in the 0.4.0 and 0.4.1 binaries. The release build remaps the home
+  directory to `~`, and `package_binary.sh` refuses to package a binary whose
+  bytes still contain it. The archive's tar headers also stop recording the
+  builder's user name, ids and macOS extended attributes. The 0.4.2 tarball is
+  built this way.
+
 ## [0.4.2] - 2026-09-30
 
 This release puts every speculative drafter on one round loop and makes that

@@ -228,18 +228,18 @@ flags_run() {
 
 root=$(fresh producer "$BASELINE_FLAGS")
 flags_run producer_replaces_cpu "config.toml's flags with native replaced by the baseline" \
-    0 "-Ctarget-cpu=apple-m1 -Clink-arg=-dead_strip" "$root"
+    0 "-Ctarget-cpu=apple-m1 -Clink-arg=-dead_strip --remap-path-prefix=$HOME=~" "$root"
 
 root=$(fresh producer_carries_flags "$BASELINE_FLAGS")
 printf '[build]\nrustflags = ["-C", "target-cpu=native", "-C", "link-arg=-dead_strip", "-C", "force-frame-pointers=yes"]\n' \
     >"$root/.cargo/config.toml"
 flags_run producer_carries_new_flag "a flag added to config.toml reaches the release build" \
-    0 "-Ctarget-cpu=apple-m1 -Clink-arg=-dead_strip -Cforce-frame-pointers=yes" "$root"
+    0 "-Ctarget-cpu=apple-m1 -Clink-arg=-dead_strip -Cforce-frame-pointers=yes --remap-path-prefix=$HOME=~" "$root"
 
 root=$(fresh producer_no_cpu "$BASELINE_FLAGS")
 printf '[build]\nrustflags = ["-C", "link-arg=-dead_strip"]\n' >"$root/.cargo/config.toml"
 flags_run producer_pins_without_config_cpu "config.toml naming no CPU still gets the pin" \
-    0 "-Ctarget-cpu=apple-m1 -Clink-arg=-dead_strip" "$root"
+    0 "-Ctarget-cpu=apple-m1 -Clink-arg=-dead_strip --remap-path-prefix=$HOME=~" "$root"
 
 root=$(fresh producer_multiline "$BASELINE_FLAGS")
 printf '[build]\nrustflags = [\n  "-C", "link-arg=-dead_strip",\n]\n' >"$root/.cargo/config.toml"
@@ -282,6 +282,7 @@ flags=\${CARGO_ENCODED_RUSTFLAGS-unset}
 [ "$honors" = yes ] || flags=unset
 mkdir -p target/release/deps target/release/.fingerprint/rmlx-cli-$HASH_A
 printf 'stub-binary %s' "\$flags" >target/release/deps/rmlx-$HASH_A
+[ -z "\${STUB_LEAK_HOME:-}" ] || printf ' panicked at %s/.cargo/registry/src/x.rs' "\$HOME" >>target/release/deps/rmlx-$HASH_A
 cp target/release/deps/rmlx-$HASH_A target/release/rmlx
 chmod +x target/release/rmlx
 FLAGS="\$flags" python3 - <<'PY' >target/release/.fingerprint/rmlx-cli-$HASH_A/bin-rmlx.json
@@ -336,6 +337,10 @@ package_run package_clears_wrappers "a rustc wrapper in the environment does not
 root=$(package_root package_native_build no)
 package_run package_removes_unpinned_tarball "a build ignoring the pin fails, leaving no tarball, checksum or staging" \
     1 no "$root"
+
+root=$(package_root package_home_path yes)
+package_run package_refuses_home_path "a binary carrying the build machine's home directory is not packaged" \
+    1 no "$root" STUB_LEAK_HOME=1
 
 printf '\nrelease-cpu selftest: %d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

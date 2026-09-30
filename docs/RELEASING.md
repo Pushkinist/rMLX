@@ -59,6 +59,15 @@ so it runs on every Apple Silicon Mac whatever chip built it. It is also
   recall test.
 - The fingerprint record is cargo's internal format. If a cargo release
   changes it, the check exits 2 (`unavailable`) rather than passing.
+- A dependency's panic location is an absolute source path, and under the
+  build machine's home directory it carries the builder's user name. The
+  release rustflags add `--remap-path-prefix=<home>=~`, and
+  `package_binary.sh` refuses to package a binary whose bytes still contain
+  the home directory. The check compares every flag but the remap, which
+  changes recorded paths and not code.
+- The archive is written with uid and gid 0, empty owner names and no
+  extended attributes, and is checked for that before it is kept: tar
+  otherwise records the builder's user name.
 
 ## Branch model
 
