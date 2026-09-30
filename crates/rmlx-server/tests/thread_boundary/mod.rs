@@ -69,6 +69,11 @@
 //!   (`mlx_thread::run` always in place): the `rmlx-mlx` cell
 //!   `a_cpu_op_built_on_one_thread_evaluates_on_another` and the three CPU
 //!   `multimodal_cache` publish cells turn red, "There is no Stream(cpu, 0)".
+//!   Of the seven cells run with it here, all seven turn red: the Qwen3 text
+//!   and gemma4 vision cells in the oracle arm (the thread that created the
+//!   streams has exited), the Whisper per-request cell in the oracle arm, and
+//!   the Qwen3 prompt-cache, gemma4 encoder-cache, TTS load-only and gemma4
+//!   MTP drafter cells in the crossed arm.
 //! - Do not make the MLX thread's streams the default streams of the building
 //!   thread: both TTS cells turn red in the oracle arm, "There is no
 //!   Stream(gpu, 2) in current thread", a stream that rMLX did not create:
