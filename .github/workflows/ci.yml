@@ -83,12 +83,9 @@ jobs:
       # exit code.
       - name: the dtype-contract gate still catches what it is for
         run: make check-kernel-dtype-contract-fixtures
-      # MLX 0.31.x fills a process-global CPU command-encoder map with no
-      # synchronisation, so two threads evaluating at once corrupt it and the
-      # process dies inside MLX with no failing test named. Serialising every
-      # evaluation is the fix; this gate is what keeps a new FFI call from
-      # quietly stepping outside it. Static — the local reproducer is
-      # probabilistic and deliberately not run here.
+      # rMLX serialises every MLX evaluation under one lock; this gate is what
+      # keeps a new FFI call from quietly stepping outside it. Static — the
+      # local stress driver is deliberately not run here.
       - name: MLX eval FFI calls are made under the evaluation lock
         run: make check-eval-lock
       # ...and the gate above is one regex edit from matching nothing and

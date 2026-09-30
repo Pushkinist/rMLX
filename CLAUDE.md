@@ -65,6 +65,7 @@ areas before touching code:
 | [`docs/SPEC_ROUND_SKELETON.md`](docs/SPEC_ROUND_SKELETON.md) | The speculative round loop `run_rounds` and the `RoundDrafter` interface: what each drafter declares, what differs per drafter, the two two-model entries kept apart, the oracle, what no runtime check sees |
 | [`docs/SAMPLING.md`](docs/SAMPLING.md) | Per-token sampling (temperature, top-k/p, penalties, thinking budget, constrained decoding) |
 | [`docs/FFI.md`](docs/FFI.md) | rmlx-mlx ↔ mlx-c FFI bridge; MSL kernel surface; unsafe policy |
+| [`docs/MLX_PAIR.md`](docs/MLX_PAIR.md) | The pinned MLX / mlx-c pair: what to do on each Mac, the source build, `make mlx-restore-pin`, the two mlx-c C APIs, moving the pin |
 | [`docs/METRICS_DB.md`](docs/METRICS_DB.md) | Metrics DB: path, identity rules, ingest, `rmlx metrics` tooling, operating rules |
 | [`docs/METRICS_SCHEMA.md`](docs/METRICS_SCHEMA.md) | Metrics DB schema: tables (observations, events, prompts, the bests view), metric registry, plausible-value bounds, known-bad rows |
 | [`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md) | The three canary anchors and the bench methods: A/B comparison, per-codec cells, the bandwidth ceiling, cross-backend cells |
@@ -229,19 +230,18 @@ Hard rules:
   Metal context driven from parallel `cargo test` threads aborts the whole test
   binary ("Rust cannot catch foreign exceptions"), taking every other test in
   the crate with it. **This rule is about Metal only — do not widen it to cover
-  MLX contact generally.** The CPU side has its own, unrelated hazard (MLX
-  0.31.x fills a process-global command-encoder map without synchronisation, so
-  unserialised parallel test threads SIGSEGV the binary with no failing test
-  named);
-  that one is contained by `EVAL_LOCK` / `with_eval_lock` in `rmlx-mlx`, which
-  serialises every evaluation process-wide — not by ignoring CPU tests, which
-  would only stop running them. Two deterministic gates hold it, and they are
+  MLX contact generally.** The CPU side is held apart differently:
+  `EVAL_LOCK` / `with_eval_lock` in `rmlx-mlx` serialises every evaluation
+  process-wide, so parallel test threads never evaluate at once — not by
+  ignoring CPU tests, which would only stop running them. On the linked MLX
+  (0.32.x) no command-encoder map is shared between threads; the lock keeps
+  evaluation serial because nothing shows concurrent evaluation safe. Two deterministic gates hold it, and they are
   complementary by construction: `make check-eval-lock` fails the build on any
   MLX eval FFI call made outside the lock (25-symbol reach-set, derived from the
   linked dylibs — **not** just the eval-named ones) but is blind to a lock that
   stopped locking, which `with_eval_lock_serialises_concurrent_callers` catches.
-  `make eval-lock-stress` is the probabilistic reproducer, deliberately out of
-  `make ci`. See `docs/FFI.md`.
+  `make eval-lock-stress` is the 400-thread end-to-end driver, deliberately out
+  of `make ci`. See `docs/FFI.md`.
   Run GPU tests with **`make gpu-test`** (every member crate,
   serialized; `CRATE=` / `FILTER=` to narrow), or by hand as
   `cargo test --no-run -p <crate> --tests` (build, outside any claim) then
@@ -375,7 +375,7 @@ hand — keeps the CI gate and the local gate identical.
 | `make check-claim-bypass-selftest` | CI gate (in `make ci` and hosted CI): recall test for the above over planted scan roots, each case asserting the exit code and the rule and `file:line` or the reason. It also plants the rows that document the gate, from this table and `scripts/INDEX.md`, which must pass. |
 | `make check-personal-data` | CI gate (in `make ci` and hosted CI): no personal data in any file git does not ignore — an email address outside the placeholder and GitHub noreply domains, a macOS home or per-user temp path, or an assistant session link. The repository is public, and a line published once is cached even after it is edited out. Exit 2 when it cannot scan. |
 | `make check-personal-data-selftest` | CI gate (in `make ci` and hosted CI): recall test for the above over throwaway git trees, 16 cases, each asserting the exit code and the rule and `file:line` or the reason. |
-| `make eval-lock-stress` | Drive the evaluation-lock reproducer across `RUNS` fresh processes (default 60). Not in `make ci` — probabilistic (~8%/run) and costs ~412 threads. |
+| `make eval-lock-stress` | Drive the 400-thread evaluation-lock test across `RUNS` fresh processes (default 60). Not in `make ci`: it costs ~412 threads, and on the linked MLX it is not measured to find a defect. |
 | `make tag` | Create annotated `v<version>` tag from `[workspace.package].version` (single source). |
 | `make release-package` | Build + bundle `dist/rmlx-v<ver>-aarch64-apple-darwin.tar.gz` (+ `.sha256`). |
 | `make release-sha` | Print sha256 of the `v<ver>` GitHub source tarball (`--write` patches the formula). |

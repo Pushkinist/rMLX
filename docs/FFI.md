@@ -43,53 +43,61 @@ The validated stack is declared in one file,
 `crates/rmlx-mlx/mlx-pin.txt`:
 
 ```
-mlx    0.31.2
-mlx-c  0.6.0_2
+mlx    0.32.3
+mlx-c  0.7.0
 ```
 
 `src/pin.rs` reads it; bumping a line there is the whole change.
 
 **The two bump together.** mlx-c is compiled against one mlx, and both
 resolve the `opt` symlink at run time, so a mismatched pair aborts at load
-with a `dyld: Symbol not found` naming an `mlx::core` symbol. mlx-c
-`0.6.0_3` is built against mlx 0.32.0; only the Homebrew revision suffix
-distinguishes it from `_2`, which is why the pin carries the suffix.
+with a `dyld: Symbol not found` naming an `mlx::core` symbol. The pin names
+Homebrew keg directories, so a revision suffix (`0.6.0_4`) is part of a
+version.
 
-**Why the pin exists.** Homebrew's `mlx` 0.32.0 bottle ships no
-`steel_gemm_fused_nax_*` kernels, the M5 Neural-Accelerator GEMM path. The
-0.31.2 bottle ships them. Without them GEMM-bound prefill is slower while
-output and decode look normal. This is a Homebrew bottle defect: the upstream
-0.32.0 PyPI wheel ships the kernels.
+**Why the pin exists.** MLX builds its Neural-Accelerator (NAX) kernels only
+for a deployment target of macOS 26.2 or later
+(`mlx/backend/metal/kernels/CMakeLists.txt`). Homebrew builds its macOS 26
+(`arm64_tahoe`) bottle for target 26, so that bottle has none; the macOS 27
+bottle has them. Without them GEMM-bound prefill is slower while output and
+decode look normal. The pinned pair is mlx 0.32.3 built from source for
+target 26.2, and mlx-c 0.7.0 with a one-line patch. How to build it, per
+host: [`docs/MLX_PAIR.md`](MLX_PAIR.md).
 
 ```sh
 strings "$(brew --prefix mlx)/lib/mlx.metallib" | grep -c steel_gemm_fused_nax
-# non-zero on 0.31.2, 0 on the 0.32.0 bottle
+# non-zero on a NAX build, 0 on the macOS 26 bottle
 ```
+
+rMLX also compiles against the Homebrew pair, mlx 0.32.1 + mlx-c 0.6.0_4
+(see [Two mlx-c C APIs](#two-mlx-c-c-apis)). The pin binds only on M5 and
+later.
 
 #### Where NAX can appear, and where it cannot
 
-The pin buys NAX **GEMM**, which every model's matmuls use. NAX
-**attention** is much narrower:
+NAX **GEMM** serves every model's matmuls. NAX **attention**
+(`mlx/backend/metal/scaled_dot_product_attention.cpp`, v0.32.3) is narrower:
 
 | Path | NAX? | Why |
 |---|---|---|
-| Prefill attention, `head_dim` 64 or 128, Q not f32 | yes, `steel_attention_<dtype>_bq64_…` | MLX's `sdpa_full` takes the NAX branch unless `head_dim == 80` or Q is f32 without TF32. An 80-wide head takes the `bq32` steel path. |
-| Prefill attention, `head_dim` 256 or 512 | no | MLX has no fused prefill kernel at either width; see [Head-dim dispatch](#head-dim-dispatch-and-the-unfused-fallback). |
-| Decode attention, any `head_dim`, any codec | no | `bq64` is a 64-query tile and decode is `q_seq = 1`. At `head_dim` ≤ 256 MLX routes `q_seq <= 8` to `sdpa_vector`, which has no NAX variant; at 512 decode falls to the composite path. |
+| Prefill attention (`q_seq > 8`), `head_dim` 64, 96 or 128, Q not f32 | yes | `sdpa_full` takes the NAX kernel. 72 and 80 are padded to 96 only for long unmasked half-precision calls. |
+| Prefill attention, `head_dim` 256 | when `q_seq >= 1024` with a causal or array mask | Otherwise the composite graph. |
+| Prefill attention, `head_dim` 512 | when `q_seq >= 1024`, causal, no array mask, and `B × H × ⌈q_seq/32⌉ >= 1024` | Otherwise the composite graph. |
+| Decode attention, any `head_dim`, any codec | no | `q_seq <= 8` routes to `sdpa_vector`, which has no NAX variant. |
 | Our own KV decode-attention kernels | no | They run at `q_seq = 1` and stream the KV cache at O(1) FLOPs per byte, so more arithmetic throughput cannot help. No production rMLX kernel uses `mpp::tensor_ops`; only the JIT probe does. |
 
-So no decode path on any codec reaches NAX; only prefill at a 64- or
-128-wide head does. The shipped NAX tile is `<M=16, N=32, K=16>`, a property
-of the bottle. `mpp::tensor_ops::matmul2d` itself allows smaller `M`, so the
-tile is not what keeps decode off NAX.
+So no decode path on any codec reaches NAX. `mpp::tensor_ops::matmul2d`
+allows an `M` below MLX's shipped tile, so the tile is not what keeps decode
+off NAX.
 
 #### The gate: `linked_mlx_matches_the_pinned_pair`
 
 `crates/rmlx-mlx/src/pin.rs` reads the two dylibs dyld resolved for this
 process, canonicalises them to their kegs, compares both versions with
-`mlx-pin.txt`, and scans the `mlx.metallib` beside `libmlx.dylib` for
-`steel_gemm_fused_nax`. `linked_mlx_matches_the_pinned_pair`
-(`src/pin_tests.rs`) fails unless all of that agrees.
+`mlx-pin.txt`, scans the `mlx.metallib` beside `libmlx.dylib` for
+`steel_gemm_fused_nax`, and reads the mlx-c C API verdict.
+`linked_mlx_matches_the_pinned_pair` (`src/pin_tests.rs`) fails unless all of
+that agrees.
 
 The metallib scan is the load-bearing half: bottle contents vary by build
 runner, so a version match does not prove the kernels are there. The version
@@ -105,10 +113,11 @@ pass:
 
 | Verdict | Means |
 |---|---|
-| `Match` | both kegs are the pinned pair and the metallib carries the kernels |
-| `KernelsMissing` | the metallib was read and has none; reported ahead of everything else |
+| `Match` | both kegs are the pinned pair, the metallib carries the kernels, and the C API matches |
+| `NotLoaded` | dyld listed no such image; reported first |
+| `CApiMismatch` | the loaded `libmlxc` has another C API than the compiled one; attention cannot run |
+| `KernelsMissing` | the metallib was read and has none |
 | `VersionMismatch` | a keg version disagrees with the pin |
-| `NotLoaded` | dyld listed no such image |
 | `NotAKeg` | the resolved library is not in a keg, so it has no version |
 | `KernelsUnverified` | the metallib could not be read |
 | `PinUnparsable` | `mlx-pin.txt` declares no pair |
@@ -117,12 +126,12 @@ The pin grammar is parsed twice, because the preflight and the restore script
 run before any binary exists: `parse_pin` (`src/pin.rs`) and
 `scripts/lib/mlx_pin.sh`. `the_shell_pin_parser_agrees_with_the_rust_one`
 holds them together. Versions must look like a keg directory name, because the
-restore script interpolates them into `rm -rf`, `cp -R` and `ln -sfn` targets.
+restore script interpolates them into Cellar paths and Ruby text.
 
 **Scoped to Neural-Accelerator hosts** (Apple GPU family 10 and later, from
-`rmlx_core::apple_gpu`). Earlier chips ship none of these kernels at any MLX
-version. `the_gate_can_tell_which_host_it_is_on` fails if the chip cannot be
-identified.
+`rmlx_core::apple_gpu`). Earlier chips have no Neural Accelerator, so the
+kernels buy nothing there. `the_gate_can_tell_which_host_it_is_on` fails if
+the chip cannot be identified.
 
 **It runs where numbers are made.** `rmlx baseline` and `rmlx bench` refuse to
 run when the pin binds and the loaded pair is wrong. `rmlx healthcheck`
@@ -146,38 +155,19 @@ suffix appears.
 
 #### Fixing a machine that drifted
 
-`make mlx-restore-pin` (`scripts/mlx_restore_pin.sh`) pours the pinned pair,
-repoints the `opt` symlinks and re-signs. By hand, with both kegs in the
-Cellar:
+`make mlx-restore-pin` (`scripts/mlx_restore_pin.sh`) takes the pinned kegs
+from the Cellar or from the durable store, refuses a keg without NAX
+kernels, and links and pins the exact kegs. Then run
+`cargo clean -p rmlx-mlx` and build again: moving to an older keg does not
+re-run `build.rs`, so the crate would keep bindings from the wrong headers.
+Details, and why `brew link` / `brew pin` cannot do this:
+[`docs/MLX_PAIR.md`](MLX_PAIR.md).
 
-```sh
-brew unpin mlx mlx-c && \
-ln -sfn ../Cellar/mlx/0.31.2 /opt/homebrew/opt/mlx && \
-ln -sfn ../Cellar/mlx-c/0.6.0_2 /opt/homebrew/opt/mlx-c && \
-brew pin mlx mlx-c && \
-cargo clean -p rmlx-mlx
-```
+### Two mlx-c C APIs
 
-- **`brew unpin` first.** `brew pin` pins whatever is linked when it runs.
-  Pinning while a newer keg is linked leaves the pin guarding the wrong
-  version, and a later `brew link` can repoint `opt/mlx`. Check with
-  `brew list --pinned --versions`.
-- **`cargo clean -p rmlx-mlx` is required.** Moving to an older keg does not
-  re-run `build.rs`, so the crate would keep bindings from the wrong headers
-  and a stale `RMLX_MLX_BUILD_VERSION`.
-
-#### Un-pinning when the bottle is fixed
-
-1. `brew unpin mlx mlx-c && brew upgrade mlx mlx-c`.
-2. Check the kernels came back: the `strings … | grep -c` count above must be
-   non-zero. The count tracks kernel-name spelling; assert non-zero only.
-3. Bump both lines of `mlx-pin.txt` to the new pair
-   (`brew list --versions mlx mlx-c` gives the keg names).
-4. `cargo clean -p rmlx-mlx`, rebuild, and confirm no MLX warning.
-   `cargo build -p rmlx-mlx -vv` shows whether `build.rs` really ran.
-5. Re-run a prefill cell and compare its prefill rate with the pinned pair's.
-   Pass `--max-ctx` explicitly: fixture lengths are nominal, and an over-long
-   prompt is refused.
+rMLX compiles against the mlx-c 0.6 and the 0.7 C API, and refuses the one
+call whose argument list differs when the loaded `libmlxc.dylib` has the
+other C API: [`docs/MLX_PAIR.md`](MLX_PAIR.md#two-mlx-c-c-apis).
 
 ### Runtime version skew
 
@@ -198,10 +188,18 @@ the image walk nor the file open happens.
 
 | Host | Kernels | Result |
 |---|---|---|
-| M5 and later | absent | `warn!` naming prefill/TTFT, the metallib and the check command |
+| M5 and later | absent | `warn!` naming prefill/TTFT, the metallib, and the fix for this macOS version |
 | M5 and later | present | `debug!` only |
 | M5 and later | metallib unreadable or not found | `debug!` only; "could not look" is not "absent" |
 | M1–M4, or chip unidentifiable | either | `debug!` only; no scan |
+
+The fix the warning names, from `kern.osproductversion`:
+
+| macOS | Fix |
+|---|---|
+| 27 and later | the Homebrew bottle carries the kernels: `brew upgrade mlx mlx-c`, or `brew reinstall mlx` at the same version |
+| 26.2 to 26.x | the source build for target 26.2 ([`docs/MLX_PAIR.md`](MLX_PAIR.md)) |
+| below 26.2 | none; MLX builds the kernels only for target 26.2 or later, so update macOS |
 
 The warning names prefill and TTFT only, because NAX is unreachable at decode.
 
@@ -213,7 +211,8 @@ The warning names prefill and TTFT only, because NAX is unreachable at decode.
    `mlx_dtype_` and `mlx_device_type_` as Rust enums.
 3. Inner attributes (`#![...]`) that bindgen emits at the file head are
    stripped; they are illegal at the `include!` site in `sys.rs`.
-4. The MLX version from `version.h` is baked in as `RMLX_MLX_BUILD_VERSION`.
+4. The MLX version from `version.h` is baked in as `RMLX_MLX_BUILD_VERSION`,
+   and the mlx-c C API of the bindings as `cfg(mlxc_c_api_0_7)`.
 5. Rebuild triggers: `MLX_C_PREFIX`, `MLX_PREFIX`, `wrapper.h`,
    `build_support.rs`, and a *newer* resolved `version.h` or `mlx.metallib`.
    Each file trigger is registered only when the file exists. Repointing `opt`
@@ -285,27 +284,20 @@ is unavailable.
 ### Per-thread CPU stream context — `ensure_cpu_default_stream`
 
 A GPU forward can still schedule CPU-stream ops, such as the scale reduction
-in the K8V8 `exit_prefill` quantize. How MLX resolves the CPU encoder depends
-on the version:
+in the K8V8 `exit_prefill` quantize. On the linked MLX (0.32.x) the CPU
+command encoders are per thread, like the GPU ones:
+`cpu::get_command_encoder` (`mlx/backend/cpu/encoder.cpp`) looks a stream up
+in the evaluating thread's map, then in a global map that only
+`new_thread_unsafe_stream` fills (rMLX calls none), and otherwise throws
+`There is no Stream(cpu, N) in current thread.`. Default streams are per
+thread too (`mlx/stream.cpp`). So an array built on one thread and evaluated
+on another throws; `cross_thread_cpu_eval_throws_and_same_thread_eval_succeeds`
+holds that.
 
-| | 0.31.x (pinned) | 0.32.0 |
-|---|---|---|
-| `cpu::get_command_encoder` map | one process-global `unordered_map<int, CommandEncoder>` | `thread_local`, with a process-global fallback |
-| Populated | lazily, on first evaluation, without synchronisation | at stream registration |
-| Unregistered stream | silently inserted | throws `There is no Stream(cpu, N) in current thread.` |
-| Cross-thread eval | succeeds | throws |
-
-Default CPU streams are per-thread either way (`mlx/stream.cpp`), so on 0.31.x
-every evaluating thread inserts its own stream into that shared map. The
-unsynchronised insert is an upstream defect; `EVAL_LOCK` contains it (below).
-`cross_thread_eval_resolves_through_the_process_global_encoder_map` pins the
-0.31.x behaviour and fails loudly if the pin moves to 0.32.0.
-
-`rmlx_mlx::ensure_cpu_default_stream()` is the CPU analog of the GPU guard. On
-0.31.x a thread that builds and evaluates its own graph does not need it; it
-pins the thread's stream identity and keeps the code correct under 0.32.0.
-Under 0.32.0 it would not rescue a cross-thread eval, because the foreign
-array is bound to another thread's stream.
+`rmlx_mlx::ensure_cpu_default_stream()` is the CPU analog of the GPU guard. It
+registers the calling thread's own stream, so a thread that builds and
+evaluates its own graph finds it. It does not rescue a cross-thread eval: the
+foreign array carries another thread's stream.
 
 **Contract.** Every blocking-thread inference entry point calls
 `ensure_cpu_default_stream()` unconditionally, before
@@ -376,9 +368,10 @@ MLX ops build a graph; evaluation runs it.
 
 **Both are serialised process-wide by `EVAL_LOCK`**
 (`crates/rmlx-mlx/src/lib.rs`), through `with_eval_lock`, which holds the lock
-across the FFI call and nothing else. `Closure::apply` is too. On 0.31.x two
-concurrent evaluations rehash the unsynchronised CPU encoder map under each
-other, and the process dies inside MLX with no Rust frame at fault.
+across the FFI call and nothing else. `Closure::apply` is too. On the linked
+MLX no encoder map is shared between threads (above), and no measurement shows
+concurrent evaluation to be safe or unsafe. rMLX does not need it, so the lock
+makes serial evaluation a property of the crate, not an assumption.
 
 `with_eval_lock` takes a closure instead of returning a guard, so
 `let _ = acquire();` cannot drop the guard before the FFI call.
@@ -388,17 +381,16 @@ other, and the process dies inside MLX with no Rust frame at fault.
   and `gpu_gate`.
 - `async_eval` still pipelines: only the graph walk and dispatch hold the
   lock.
-- The lock makes concurrent callers correct, not parallel.
+- The lock makes concurrent callers serial, not parallel.
 
 ### Which C entry points need the lock
 
 Twenty-five. `scripts/check_eval_lock.sh` records how they were derived; re-run
 it when the pin moves:
 
-- **Pass 1, automated (24 symbols).** Reverse reachability over `otool -tvV`
-  of both dylibs, backwards from `mlx::core::eval_impl` and from
-  `mlx::core::cpu::get_command_encoder(Stream)`, intersected with the exported
-  `mlx_*` C ABI.
+- **Pass 1, automated (24 symbols on mlx 0.32.3 + mlx-c 0.7.0).** Reverse
+  reachability over `otool -tvV` of both dylibs, backwards from
+  `mlx::core::eval_impl`, intersected with the exported `mlx_*` C ABI.
 - **Pass 2, by hand (1 more).** `mlx_closure_apply` reaches evaluation through
   a `std::function` call, which a disassembly walk does not follow. Re-running
   pass 1 gives 24 without it. That is the pass's blind spot, not a stale
@@ -418,7 +410,7 @@ it when the pin moves:
 The 22 uncalled entry points are the live risk. `mlx_array_item_float32`
 reads as a scalar accessor, `mlx_array_tostring` is what an `impl Debug`
 reaches for, and `mlx_save_safetensors` is the write side of `rmlx convert`.
-Calling one unguarded brings the crash back.
+Calling one unguarded makes that evaluation unserialised.
 
 A compiled-closure body runs inside `mlx_closure_apply` with the lock held.
 The mutex is not reentrant, so a body must not take the lock: no `eval`, and
@@ -430,7 +422,7 @@ no `Closure::apply` of another compiled closure either.
 |---|---|---|---|
 | `make check-eval-lock` | text gate, deterministic | an unguarded call to any of the 25 (RULE 1, RULE 2); a closure body that takes the lock (RULE 3) | a lock that no longer locks |
 | `with_eval_lock_serialises_concurrent_callers` | unit test, deterministic | a lock that does not exclude | which calls take the lock |
-| `make eval-lock-stress` | reproducer driver, probabilistic | the real crash | roughly one run in twelve per process, so it needs `RUNS` ≥ 60 |
+| `make eval-lock-stress` | end-to-end driver, 400 threads per process | wrong values from concurrent evaluation under the lock | no defect is measured on the linked MLX, so its detection power there is unknown |
 
 The gate and the unit test are complementary: each is blind to what the other
 catches. `make ci` runs both. The hosted `source gates` job runs the gate and
@@ -584,52 +576,43 @@ whether the call reaches a fused kernel or a composite graph.
 #### Head-dim dispatch and the unfused fallback
 
 `ScaledDotProductAttention::use_fallback`
-(`mlx/backend/metal/scaled_dot_product_attention.cpp`, v0.31.2) gates on
-`head_dim` and `q_seq`:
+(`mlx/backend/metal/scaled_dot_product_attention.cpp`, v0.32.3) gates on
+`head_dim`, `q_seq` and the mask:
 
-| Route | `head_dim` accepted | Other conditions |
+| Route | `head_dim` | Conditions |
 |---|---|---|
-| `sdpa_full` (fused `steel_attention`) | 64, 80, 128 | `q_seq > 8`, and the mask is absent, an array, or causal with `q_seq <= kL` |
-| `sdpa_vector` (fused) | 64, 96, 128, 256 | `q_seq <= 8`, `q_seq <= kL`, `q_seq × gqa_factor <= 32` |
-| composite graph | any | whatever both reject |
+| `sdpa_full` (fused, `q_seq > 8`) | 64, 72, 80, 96, 128, (96, 64) | the mask is absent, an array, or causal |
+| `sdpa_full` at 256 | 256 | NAX GPU, `q_seq >= 1024`, causal or array mask; or no NAX, causal, `q_seq >= 2048`, `q_seq == kL`, Q not f32 |
+| `sdpa_full` at 512 | 512 | NAX GPU, `q_seq >= 1024`, causal, no array mask, `B × H × ⌈q_seq/32⌉ >= 1024` |
+| `sdpa_vector` (fused, `q_seq <= 8`) | 64, 96, 128, 256, (192, 128), (96, 64) | GQA factors 8, 12 and 16 read K/V once in a two-pass kernel |
+| `sdpa_vector` at 512 | 512 | `q_seq == 1`, GQA factor 8, no array mask, `kL >= 1024` (`MLX_SDPA_D512_MIN_KL`) |
+| composite graph | any | whatever the rows above reject, including 192 |
 
 The composite route is `matmul(q, kᵀ)` → mask → `softmax` → `matmul`, with
-the `[B, n_heads, L_q, L_k]` score tensor materialised. The shipped kernels
-agree:
+the `[B, n_heads, L_q, L_k]` score tensor materialised.
 
-```sh
-LIB="$(brew --prefix mlx)/lib/mlx.metallib"
-xcrun metal-nm --defined-only "$LIB" | grep -o 'steel_attention[a-z0-9_]*' | sort -u
-# _bd64_ / _bd80_ / _bd128_ only
-xcrun metal-nm --defined-only "$LIB" | grep -o 'sdpa_vector[a-z0-9_]*' | sort -u
-# _64_64 / _96_96 / _128_128 / _256_256
-```
+| Family | Windowed / linear layers | Full-attention layers |
+|---|---|---|
+| Ternary-Bonsai-8B (`Qwen3ForCausalLM`) | none | 128 |
+| gemma-4 | 256, sliding window | 512 |
+| medgemma (`Gemma3…`) | 256, sliding window | 256 |
+| Qwen3.5 / Qwen3.6 (`Qwen3_5…`) | GatedDeltaNet, no SDPA | 256 |
 
-Above `head_dim` 128 there is no fused prefill kernel. At 512 there is no
-fused decode kernel either.
+So a gemma-4, medgemma or Qwen3.5 prefill chunk of 1024 or more rows reaches
+the fused 256 kernel on an M5, and the 512 layers of gemma-4 reach a fused
+kernel only inside the gates above. The composite path computes the whole
+causal score rectangle and then masks it, and it holds the score tensor in
+memory. `scripts/sdpa_headdim_bench.py` measures the cost against the metallib
+it reports.
 
-| Family | Windowed / linear layers | Full-attention layers | Fused prefill? |
-|---|---|---|---|
-| Ternary-Bonsai-8B (`Qwen3ForCausalLM`) | none | 128 | yes |
-| gemma-4 | 256, sliding window | 512 | no |
-| medgemma (`Gemma3…`) | 256, sliding window | 256 | no |
-| Qwen3.5 / Qwen3.6 (`Qwen3_5…`) | GatedDeltaNet, no SDPA | 256 | no |
-
-The composite path computes the whole causal score rectangle and then masks
-it, where the fused path skips fully masked tiles. It also holds the score
-tensor in memory. `scripts/sdpa_headdim_bench.py` measures the cost against
-the metallib it reports.
-
-What rMLX pays is bounded two ways:
+What rMLX pays on the composite path is bounded two ways:
 
 - Prefill is chunked per arch (`prefill_chunk.rs`: gemma-4 1024, Qwen3.5
   2048), so the score tensor is `[H_q, chunk, kL]`, linear in `kL`.
 - On gemma-4 the 256-wide layers are sliding-window, so their `kL` is capped
   at the window.
 
-The growing-`kL` composite cost falls on the full-attention layers of
-Qwen3.5 / Qwen3.6, medgemma and gemma-4 (at 512). At decode, `q_seq = 1`, so
-the composite path has no O(L²) term.
+At decode, `q_seq = 1`, so the composite path has no O(L²) term.
 
 ---
 

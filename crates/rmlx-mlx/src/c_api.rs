@@ -84,7 +84,7 @@ pub(crate) fn mismatch_message(compiled: CApi, loaded: CApi) -> String {
          loaded libmlxc.dylib has the {} C API. mlx_fast_scaled_dot_product_attention takes \
          a different argument list in the two, so rMLX does not call it. Rebuild rMLX \
          against the loaded mlx-c (`cargo clean -p rmlx-mlx`, then build again), or load \
-         the mlx-c it was built against. See docs/FFI.md, \"Two mlx-c C APIs\".",
+         the mlx-c it was built against. See docs/MLX_PAIR.md, \"Two mlx-c C APIs\".",
         compiled.name(),
         loaded.name(),
     )

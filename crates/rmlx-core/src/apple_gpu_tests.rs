@@ -6,7 +6,9 @@
 //! `runs_on_apple_silicon` smoke test, which is `#[ignore]` and only
 //! meaningful on a macOS Apple Silicon machine.
 
-use super::{apple_silicon_generation, family_for_m_number, parse_apple_generation};
+use super::{
+    apple_silicon_generation, family_for_m_number, parse_apple_generation, parse_macos_version,
+};
 
 #[test]
 fn family_mapping_m1_to_m5() {
@@ -92,4 +94,15 @@ fn runs_on_apple_silicon() {
         matches!(gen, Some(7..)),
         "expected Apple Silicon family >= 7, got {gen:?}"
     );
+}
+
+#[test]
+fn macos_version_reads_major_and_minor() {
+    assert_eq!(parse_macos_version("26.6.2"), Some((26, 6)));
+    assert_eq!(parse_macos_version("26.2"), Some((26, 2)));
+    assert_eq!(parse_macos_version("27"), Some((27, 0)));
+    assert_eq!(parse_macos_version("27.0\n"), Some((27, 0)));
+    assert_eq!(parse_macos_version(""), None);
+    assert_eq!(parse_macos_version("x.1"), None);
+    assert_eq!(parse_macos_version("26.x"), None);
 }

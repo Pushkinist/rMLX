@@ -97,13 +97,16 @@ MLX it loaded differs from the one it was built against. See
 
 ### On M5 and later: the Neural Accelerator kernels
 
-Some Homebrew MLX bottles omit the Neural Accelerator (NAX) GEMM kernels.
-On M5 and later that slows prefill; decode and output are unaffected. M1 to
-M4 have no Neural Accelerator, so there is nothing to check.
+MLX builds its Neural Accelerator (NAX) kernels only for macOS 26.2 or
+later, and the Homebrew bottle for macOS 26 has none. On M5 and later that
+slows prefill; decode and output are unaffected. M1 to M4 have no Neural
+Accelerator, so there is nothing to check.
 
 At startup, rMLX scans the `mlx.metallib` of the MLX it loaded. It warns
-only when the host has a Neural Accelerator and the kernels are missing. To
-check by hand:
+only when the host has a Neural Accelerator and the kernels are missing, and
+names the fix for that macOS version: the macOS 27 bottle, a source build on
+macOS 26.2 or later, or none below 26.2
+([`docs/MLX_PAIR.md`](docs/MLX_PAIR.md)). To check by hand:
 
 ```sh
 strings "$(brew --prefix mlx)/lib/mlx.metallib" | grep -c steel_gemm_fused_nax

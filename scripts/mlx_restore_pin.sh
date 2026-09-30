@@ -2,17 +2,17 @@
 # Restore the MLX pair named by crates/rmlx-mlx/mlx-pin.txt, then link and pin
 # exactly those two kegs.
 #
-# The pinned pair is a source build with the NAX kernels (docs/FFI.md,
-# "Pinned MLX / mlx-c pair"). No Homebrew bottle for macOS 26 carries them, so
-# this script pours no bottle. It takes each keg from, in this order:
+# The pinned pair is a source build with the NAX kernels (docs/MLX_PAIR.md).
+# No Homebrew bottle for macOS 26 carries them, so this script pours no
+# bottle. It takes each keg from, in this order:
 #
 #   1. the Cellar, when the keg is still there;
 #   2. the durable copy in $RMLX_BOTTLE_STORE/source-built (default
 #      ~/.rmlx/bottles/source-built): a tar of the Cellar keg directory, listed
 #      in the SHA256SUMS file there.
 #
-# When neither has a keg, it stops and names the source build (docs/FFI.md,
-# "Building the pinned pair").
+# When neither has a keg, it stops and names the source build
+# (docs/MLX_PAIR.md, "Building the pinned pair").
 #
 # Linking and pinning use Homebrew's own Keg and FormulaPin on the exact keg.
 # `brew link <f>` and `brew pin <f>` act on the newest keg in the Cellar, not on
@@ -77,7 +77,7 @@ for f in mlx mlx-c; do
 	else
 		from_store "$f" "$v" ||
 			die "no $f $v in $CELLAR and no copy of it in $STORE. Build the pair from source:" \
-				"docs/FFI.md, \"Building the pinned pair\""
+				"docs/MLX_PAIR.md, \"Building the pinned pair\""
 		[ -f "$keg/lib/$lib" ] || die "the copy of $f $v has no lib/$lib"
 	fi
 done
@@ -89,7 +89,7 @@ symbols=$(strings "$metallib") || die "cannot read $metallib, so the NAX check c
 nax=$(printf '%s\n' "$symbols" | grep -c steel_gemm_fused_nax)
 [ "$nax" -ge 1 ] ||
 	die "mlx $PIN_MLX in $CELLAR has no NAX GEMM kernels. It is a bottle build, not the" \
-		"source build the pin names: docs/FFI.md, \"Building the pinned pair\""
+		"source build the pin names: docs/MLX_PAIR.md, \"Building the pinned pair\""
 echo "[ok] mlx $PIN_MLX has $nax NAX GEMM kernel occurrences"
 
 echo "[link] link and pin mlx $PIN_MLX + mlx-c $PIN_MLXC"

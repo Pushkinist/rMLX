@@ -3,31 +3,21 @@
 # `mlx::core::eval_impl` must be made under the process-wide evaluation lock,
 # and nothing that runs under that lock may take it again.
 #
-# THE BUG THIS PINS
-#   The linked MLX (0.31.x) resolves a CPU stream's `CommandEncoder` through a
-#   *process-global* `std::unordered_map<int, CommandEncoder>` that
-#   `mlx/backend/cpu/encoder.cpp::get_command_encoder` fills lazily, on the
-#   evaluating thread, with no synchronisation. Default CPU streams are
-#   per-thread, so every thread that evaluates mints its own stream index and
-#   performs its own insert into that one shared map. Two inserts in flight
-#   together rehash it under a third thread's bucket walk.
-#
-#   The result is a SIGSEGV (or SIGTRAP, or an infinite spin on a bucket chain
-#   that became circular) *inside MLX*, on a thread named after whichever test
-#   happened to be running. libtest names no failing test, because none failed
-#   — the process died. `cargo test` runs one OS thread per test, so this
-#   reached `make ci` as an intermittent crash of a whole test binary that
-#   never reproduced in isolation and was indistinguishable from a real
-#   regression in the branch under test.
-#
-#   `rmlx_mlx::with_eval_lock` contains it by serialising evaluation
-#   process-wide.
+# WHAT THIS HOLDS
+#   rMLX evaluates one graph at a time, and `rmlx_mlx::with_eval_lock` makes
+#   that a property of the crate: every evaluating FFI call runs under one
+#   process-wide lock. On the linked MLX (0.32.x) no command-encoder map is
+#   shared between threads (`mlx/backend/cpu/encoder.cpp` looks a stream up in
+#   the evaluating thread's map and throws for a foreign one), and nothing
+#   measured here shows concurrent evaluation to be safe or unsafe. An
+#   evaluating call outside the lock makes evaluation concurrent again, with
+#   nothing red anywhere.
 #
 # WHY A GREP GATE AND NOT A TEST
-#   The reproducer for this (`concurrent_first_eval_reproducer`) is
-#   probabilistic — roughly one failure in twelve runs without the lock. Far
-#   too weak to gate on. The *structural* regressions are the ones a text gate
-#   catches deterministically, and they are the realistic ones:
+#   The end-to-end driver (`concurrent_first_eval_reproducer`) finds no
+#   defect on the linked MLX, so it cannot gate. The *structural* regressions
+#   are the ones a text gate catches deterministically, and they are the
+#   realistic ones:
 #
 #     1. Someone drops the lock from a guarded call site.
 #     2. Someone adds a call to one of the many other C entry points that
@@ -49,12 +39,11 @@
 #   It is not guesswork and must not become guesswork. TWO passes, because one
 #   of them is structurally blind to a quarter of the problem.
 #
-#   Pass 1 — automated, direct calls (yields 24 symbols):
+#   Pass 1 — automated, direct calls (24 symbols on the pinned pair):
 #     otool -tvV "$(brew --prefix mlx-c)/lib/libmlxc.dylib" > /tmp/mlxc.s
 #     otool -tvV "$(brew --prefix mlx)/lib/libmlx.dylib"    > /tmp/mlx.s
-#   Take the transitive closure of callers backwards from BOTH
-#   `mlx::core::eval_impl` and the hazard symbol itself,
-#   `mlx::core::cpu::get_command_encoder(Stream)`, then intersect with the
+#   Take the transitive closure of callers (`bl` / `b` targets, stubs
+#   included) backwards from `mlx::core::eval_impl`, then intersect with the
 #   exported `mlx_*` C ABI.
 #
 #   Pass 2 — by hand, INDIRECT dispatch (adds 1, for 25 total):

@@ -3,24 +3,15 @@
 # FRESH PROCESSES and fail on any non-zero exit.
 #
 # WHY A DRIVER AND NOT JUST A TEST
-#   `concurrent_first_eval_reproducer` is probabilistic: without the lock it
-#   fails about 1 run in 12 (15/180 measured). Running it once — which is what
-#   `make ci` does — is therefore weak evidence in the green direction. Its
-#   power comes only from repetition, and specifically from repetition across
-#   *processes*: the defect is an unsynchronised insert into a process-global
-#   hash map, and the map rehashes hardest while it is still growing from
-#   empty. Once a process has populated it, later bursts in that same process
-#   mostly find existing entries and stop inserting. So looping inside the test
-#   buys almost nothing; re-exec does.
-#
-#   At the measured ~8% per-run rate, N=60 gives ~99.3% detection and N=100
-#   ~99.98%. The default below is 60.
+#   `concurrent_first_eval_reproducer` has 400 threads evaluate at one moment
+#   under the lock and read back their own values. The streams and MLX state a
+#   burst creates persist for the process, so each run is a fresh process. On
+#   the linked MLX (0.32.x) no command-encoder map is shared between threads,
+#   and this driver is not measured to find a defect.
 #
 # WHY IT COUNTS TIMEOUTS AS FAILURES
-#   Corruption does not always segfault. Three failure shapes were observed:
-#   SIGSEGV, SIGTRAP, and an infinite spin (a bucket chain that became
-#   circular). The last one hangs forever and would otherwise stall the caller
-#   rather than reporting, so every run is bounded and a timeout is a failure.
+#   A corrupted MLX state can spin forever instead of crashing. Every run is
+#   bounded, and a timeout is a failure.
 #
 # WHAT THIS CANNOT REACH
 #   Same scope as the test it drives: the CPU evaluation path only. It says

@@ -822,13 +822,10 @@ fn with_eval_lock_serialises_concurrent_callers() {
 /// barrier, then evaluate at the same moment under `with_eval_lock`, and each
 /// must read back its own values.
 ///
-/// It was written for mlx 0.31.x, where the CPU command-encoder map was one
-/// unsynchronised process-global map: without the lock it failed about 1 run in
-/// 12 (15 in 180, measured) with SIGSEGV, SIGTRAP or an endless spin inside MLX.
-/// On the linked MLX that map is per thread (`mlx/backend/cpu/encoder.cpp`), so
-/// that crash cannot happen, and this test is not measured to find a defect on
-/// this pair. It stays the end-to-end check that concurrent evaluation under
-/// the lock gives correct values.
+/// On the linked MLX no command-encoder map is shared between threads
+/// (`mlx/backend/cpu/encoder.cpp`), and this test is not measured to find a
+/// defect. It is the end-to-end check that concurrent evaluation under the lock
+/// gives correct values.
 ///
 /// The gates for the lock are `make check-eval-lock` (every eval FFI call is
 /// made under it) and `with_eval_lock_serialises_concurrent_callers` (it

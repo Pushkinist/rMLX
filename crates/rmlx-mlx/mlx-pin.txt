@@ -11,8 +11,8 @@
 # exists to buy — a version match alone is not evidence, because bottle
 # contents vary by build runner.
 #
-# Why these versions, and how to build them: docs/FFI.md ->
-# "Pinned MLX / mlx-c pair".
+# Why these versions: docs/FFI.md -> "Pinned MLX / mlx-c pair".
+# How to build them: docs/MLX_PAIR.md.
 #
 # Format: <formula> <version>, the Homebrew keg directory name. A Homebrew
 # revision suffix (`0.6.0_4`) is part of the name: same upstream version,
