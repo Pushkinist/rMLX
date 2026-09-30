@@ -3,11 +3,12 @@
 //!
 //! # The defect class
 //!
-//! MLX binds a lazy op to the default stream of the thread that built it. From
-//! MLX 0.32 the CPU command-encoder map is thread-local, so the first
-//! evaluation of that op on another thread fails with "There is no Stream(cpu,
-//! N) in current thread.". The GPU map is thread-local on every supported MLX,
-//! so a lazy GPU op fails the same way with "There is no Stream(gpu, N)".
+//! MLX binds a lazy op to the stream it is built on, and evaluates a stream
+//! only on the thread that created it. From MLX 0.32 the CPU command-encoder
+//! map is thread-local, so the first evaluation of an op of another thread
+//! fails with "There is no Stream(cpu, N) in current thread.". The GPU map is
+//! thread-local on every supported MLX, so a GPU op fails the same way with
+//! "There is no Stream(gpu, N)".
 //!
 //! `rmlx serve` builds model state on one thread and uses it on another:
 //!
@@ -22,13 +23,17 @@
 //!   by a later one. A request that fails after it wrote an entry leaves an
 //!   entry that no forward has evaluated.
 //!
+//! rmlx-mlx builds every op on the streams of one MLX thread and runs every
+//! evaluation there (`docs/FFI.md` § "The MLX thread"). So these objects may
+//! cross with unevaluated arrays, and these tests hold that the step after the
+//! hand-over does not fail.
+//!
 //! # The seam
 //!
 //! The object that crosses the thread boundary in production: the model
 //! `arch::load_model` returns, the `ArchGenerator` or `SpeculativeGenerator`
 //! the server builds, the jina-v4, Whisper or TTS model the server caches
-//! between requests, and a prompt-cache or encoder-cache entry. Every array
-//! such an object holds must be evaluated before the object crosses.
+//! between requests, and a prompt-cache or encoder-cache entry.
 //!
 //! # The observable and what cannot move
 //!
@@ -58,51 +63,36 @@
 //!
 //! # Mutations and what catches them
 //!
-//! Measured on mlx 0.32.1 / mlx-c 0.6.0_4 unless stated:
+//! Measured on mlx 0.32.3 / mlx-c 0.7.0, each against the MLX thread:
 //!
-//! - Evaluate only the text-path load ops (the bf16 casts, the fused QKV, the
-//!   YARN scale): the Qwen3 and Qwen3.5 text cells turn green. The Qwen2 text
-//!   cell is green before and after: its loader leaves no lazy op. The BitNet
-//!   text cell, the vision and audio cells and both jina-v4 cells stay red.
-//! - Make every safetensors tensor a lazy CPU op at load: every drafter cell,
-//!   the Qwen2 text cell and the unified-audio cell turn red. The per-request
-//!   cells of the in-request loaders and the cache cells stay green, which is
-//!   why each in-request loader also has a load-only cell.
-//! - Add a lazy CPU cast to the Whisper encoder loader: the load-only Whisper
-//!   cell turns red, the per-request Whisper cell stays green.
-//! - Leave lazy GPU ops in `TtsModel::load`: the load-only TTS cell is red on
-//!   both MLX pairs. The per-request TTS cell stays green, because the load
-//!   runs inside the first `synthesize`.
-//! - Let the encoder cache store a node the writing request never evaluates:
-//!   the encoder-cache hit cell turns red. Let the cache evaluate every array
-//!   before it stores it: the `multimodal_cache` publish tests turn green on
-//!   both MLX pairs, and the gemma4 failed-request cell turns green on mlx
-//!   0.31.2.
-//! - Return the Qwen3-VL tower embeds unevaluated: nothing turns red, because
-//!   the image decode evaluates them before its context check. Also remove that
-//!   evaluation: the Qwen3-VL failed-request cell turns red (mlx 0.31.2).
-//! - Remove the evaluation from every prompt-cache store: the prompt-cache
-//!   cells stay green at the default codec, because the decode evaluates the
-//!   stored arrays. Also make the stored copies lazy: the Qwen3, gemma4 and
-//!   BitNet prompt-cache cells turn red. The Qwen2 cell hangs, and its step
-//!   limit fails it and ends the binary before the next cell.
-//! - Bypass the Qwen MTP drafter (plain verifier decode): the Qwen MTP cell
-//!   turns red on its round count, not on its tokens.
-//! - Remove the stream guards from the TTS request closure: no observable. The
-//!   TTS cells already synthesize on threads that never call a guard, and they
-//!   pass, because MLX creates a thread's default streams on first use.
+//! - Run every evaluation on the calling thread, not on the MLX thread
+//!   (`mlx_thread::run` always in place): the `rmlx-mlx` cell
+//!   `a_cpu_op_built_on_one_thread_evaluates_on_another` and the three CPU
+//!   `multimodal_cache` publish cells turn red, "There is no Stream(cpu, 0)".
+//! - Do not make the MLX thread's streams the default streams of the building
+//!   thread: both TTS cells turn red in the oracle arm, "There is no
+//!   Stream(gpu, 2) in current thread", a stream that rMLX did not create:
+//!   MLX built an op of the TTS forward on the default stream of the building
+//!   thread. The unit test
+//!   `a_thread_that_built_an_op_defaults_to_the_mlx_threads_streams` turns red
+//!   too.
+//! - Set only the CPU default stream of the building thread: that unit test
+//!   and the `rmlx-kv-quant` CPU cell
+//!   `mixed_truncate_to_keeps_the_prefix_it_was_told_to_keep` turn red,
+//!   "There is no Stream(gpu, 1)": MLX builds an op inside a CPU op on the
+//!   default stream of the default device, the GPU.
+//! - Build ops on a stream of the calling thread in `with_stream`: the
+//!   `rmlx-mlx` cell `a_cpu_op_built_on_one_thread_evaluates_on_another`, the
+//!   three CPU `multimodal_cache` publish cells and the source scan
+//!   `every_stream_comes_from_the_mlx_thread` turn red. A variant that still
+//!   sets the thread defaults first is caught only by the source scan.
 //!
 //! Not caught by any cell:
 //!
-//! - A lazy op on a load path that no local snapshot reaches, such as the zero
-//!   router bias that a Laguna checkpoint without `e_score_correction_bias`
-//!   gets.
-//! - A lazy packed store in a prompt-cache entry of a request that stops at
-//!   its first token (`max_tokens` 1, or a stop on the first token): no decode
-//!   step evaluates the store. The cells run the default codec for 24 tokens.
-//! - No measured mutation turns these cells red: the per-request Whisper and
-//!   TTS cells, and the Qwen3.5 MoE prompt-cache cell. They guard the same
-//!   hand-overs as their neighbours on other snapshots.
+//! - An op that MLX builds inside another op on a stream it creates, not on
+//!   the default stream of the building thread. No such op is known.
+//! - Two requests on two threads at once. Every cell hands over once and runs
+//!   one step at a time.
 
 #![allow(dead_code, unreachable_pub)]
 
