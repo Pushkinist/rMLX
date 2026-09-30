@@ -44,39 +44,45 @@
 //! The oracle cannot see a change that moves the one-thread output: both arms
 //! run the changed binary. The golden-token suites hold the one-thread tokens.
 //!
+//! A cross-thread evaluation can also wait forever in `mlx::core::synchronize`
+//! instead of failing. Each step after a hand-over therefore has a time limit,
+//! [`STEP_LIMIT`], and a hang fails the cell.
+//!
 //! # Mutations and what catches them
 //!
 //! Measured on mlx 0.32.1 / mlx-c 0.6.0_4 unless stated:
 //!
-//! - The text path of the loader left lazy (the current tree): the Qwen3 and
-//!   Qwen3.5 text cells are red. A fix of the text path alone (evaluate the
-//!   bf16 casts, the fused QKV and the YARN scale): the Qwen3 text cell turns
-//!   green, the tower cells and the jina image cell stay red.
-//! - A tower loader left lazy (the current tree): that tower's cell is red.
-//! - Every safetensors tensor made a lazy CPU op at load: every drafter cell,
-//!   the Qwen2, BitNet and unified-audio cells turn red. The per-request cells
-//!   of the in-request loaders stay green, which is why each in-request loader
-//!   also has a load-only cell.
-//! - A lazy op in the Whisper loader: the load-only Whisper cell turns red, the
-//!   per-request Whisper cell stays green.
-//! - `TtsModel::load` leaves lazy GPU ops (the current tree): the load-only TTS
-//!   cell is red on every MLX pair.
-//! - The encoder cache stores a node the writing request never evaluates: the
-//!   encoder-cache hit cell turns red. Publishing without an evaluation (the
-//!   current tree): the failed-request gemma4 cell and the `multimodal_cache`
-//!   publish tests are red on every MLX pair.
-//! - The Qwen3-VL tower returns unevaluated embeds: nothing turns red, because
-//!   the image decode evaluates them before its context check. Remove that
-//!   evaluation too: the failed-request Qwen3-VL cell turns red.
-//! - A prompt-cache store without its evaluation: nothing turns red at the
-//!   default codec, because the decode evaluates the stored arrays. Make the
-//!   stored copies lazy as well: the prompt-cache cell of that architecture
-//!   turns red.
-//! - The drafter bypassed (plain verifier decode): the drafter cell turns red
-//!   on its round count, not on its tokens.
+//! - Evaluate only the text-path load ops (the bf16 casts, the fused QKV, the
+//!   YARN scale): the Qwen3, Qwen3.5 and Qwen2 text cells turn green. The
+//!   BitNet text cell, the vision and audio cells and both jina-v4 cells stay
+//!   red.
+//! - Make every safetensors tensor a lazy CPU op at load: every drafter cell,
+//!   the Qwen2 text cell and the unified-audio cell turn red. The per-request
+//!   cells of the in-request loaders and the cache cells stay green, which is
+//!   why each in-request loader also has a load-only cell.
+//! - Add a lazy CPU cast to the Whisper encoder loader: the load-only Whisper
+//!   cell turns red, the per-request Whisper cell stays green.
+//! - Leave lazy GPU ops in `TtsModel::load`: the load-only TTS cell is red on
+//!   both MLX pairs. The per-request TTS cell stays green, because the load
+//!   runs inside the first `synthesize`.
+//! - Let the encoder cache store a node the writing request never evaluates:
+//!   the encoder-cache hit cell turns red. Let the cache evaluate every array
+//!   before it stores it: the `multimodal_cache` publish tests turn green on
+//!   both MLX pairs, and the gemma4 failed-request cell turns green on mlx
+//!   0.31.2.
+//! - Return the Qwen3-VL tower embeds unevaluated: nothing turns red, because
+//!   the image decode evaluates them before its context check. Also remove that
+//!   evaluation: the Qwen3-VL failed-request cell turns red (mlx 0.31.2).
+//! - Remove the evaluation from every prompt-cache store: the prompt-cache
+//!   cells stay green at the default codec, because the decode evaluates the
+//!   stored arrays. Also make the stored copies lazy: the Qwen3, gemma4 and
+//!   BitNet prompt-cache cells turn red, and the Qwen2 cell hangs until its
+//!   step limit fails it.
+//! - Bypass the Qwen MTP drafter (plain verifier decode): the Qwen MTP cell
+//!   turns red on its round count, not on its tokens.
 //!
-//! Not caught by any cell: a lazy op on a load path no local snapshot reaches,
-//! such as the zero router bias a Laguna checkpoint without
+//! Not caught by any cell: a lazy op on a load path that no local snapshot
+//! reaches, such as the zero router bias that a Laguna checkpoint without
 //! `e_score_correction_bias` gets.
 
 #![allow(dead_code, unreachable_pub)]
@@ -108,6 +114,11 @@ pub const RED_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAA
 pub const SPOKEN_TEXT: &str = "The capital of France is Paris.";
 
 pub const N_TOKENS: u32 = 24;
+
+/// The longest one step after a hand-over may take. A cross-thread evaluation
+/// can wait forever in `mlx::core::synchronize` instead of failing, and a hang
+/// must fail the cell rather than stop the suite.
+pub const STEP_LIMIT: Duration = Duration::from_secs(600);
 
 // ── Snapshots ───────────────────────────────────────────────────────────────
 
@@ -274,9 +285,13 @@ where
         release_rx.recv().ok();
     });
     let (state, a) = state_rx.recv().expect("state from the first thread");
-    let b = std::thread::spawn(move || second(state))
-        .join()
-        .expect("second thread panicked");
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        done_tx.send(second(state)).ok();
+    });
+    let b = done_rx.recv_timeout(STEP_LIMIT).unwrap_or_else(|e| {
+        panic!("the step after the hand-over did not finish within {STEP_LIMIT:?}: {e}")
+    });
     release_tx.send(()).ok();
     first_thread.join().expect("first thread panicked");
     (a, b)
@@ -404,7 +419,7 @@ pub fn serve(
         record_on(second_pool.as_ref().unwrap_or(&pool), recorder);
     }
     let last = requests.len() - 1;
-    let out = requests
+    let out: Vec<Result<Vec<u32>, String>> = requests
         .into_iter()
         .enumerate()
         .map(|(i, req)| {
@@ -412,19 +427,49 @@ pub fn serve(
                 Some(second) if i == last => second,
                 _ => &pool,
             };
-            rt.block_on(async {
-                let mut stream = generator.generate(req);
-                let mut ids = Vec::new();
-                while let Some(item) = stream.next().await {
-                    ids.push(item.map_err(|e| e.to_string())?.token_id);
-                }
-                Ok::<_, String>(ids)
-            })
+            decode(rt.handle(), &generator, req)
         })
         .collect();
+    if out
+        .iter()
+        .any(|r| r.as_ref().is_err_and(|e| e.starts_with(TIMED_OUT)))
+    {
+        // A decode still waits on a pool thread; dropping the pools would wait for it.
+        pool.shutdown_background();
+        if let Some(second) = second_pool {
+            second.shutdown_background();
+        }
+    }
     drop(generator);
     drop(parked);
     out
+}
+
+const TIMED_OUT: &str = "the request did not finish within";
+
+/// Serve one request and collect its token ids, or an error after
+/// [`STEP_LIMIT`].
+fn decode(
+    rt: &tokio::runtime::Handle,
+    generator: &Arc<dyn Generator>,
+    req: GenerationRequest,
+) -> Result<Vec<u32>, String> {
+    let (rt, generator) = (rt.clone(), Arc::clone(generator));
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let ids = rt.block_on(async {
+            let mut stream = generator.generate(req);
+            let mut ids = Vec::new();
+            while let Some(item) = stream.next().await {
+                ids.push(item.map_err(|e| e.to_string())?.token_id);
+            }
+            Ok::<_, String>(ids)
+        });
+        done_tx.send(ids).ok();
+    });
+    done_rx
+        .recv_timeout(STEP_LIMIT)
+        .unwrap_or_else(|_| Err(format!("{TIMED_OUT} {STEP_LIMIT:?}")))
 }
 
 /// Serve `requests` on one thread, then across `split`; the second arm must
