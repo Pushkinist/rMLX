@@ -241,12 +241,12 @@ before any other mlx-c call can overwrite the slot.
 
 ### Default stream
 
-`with_stream(device, |s| …) -> Result<T>` borrows the device's default stream
-through `mlx_default_gpu_stream_new` / `mlx_default_cpu_stream_new`, a
-ref-counted handle, and frees the handle after the closure. It never creates
-a stream: MLX backs every stream with an OS thread it never reclaims, so
-per-op stream creation exhausts the thread limit. For the GPU device it
-checks the latch below first.
+`with_stream(device, |s| …) -> Result<T>` gives `f` the stream of the MLX
+thread for the device (below). Every op is built on one of these two streams.
+Only `mlx_thread.rs` gets a stream from mlx-c:
+`every_stream_comes_from_the_mlx_thread` fails on a stream call in any other
+source file of the crate. For the GPU device `with_stream` checks the latch
+below first.
 
 ### The CPU-device latch
 
@@ -256,8 +256,8 @@ when it resolves a device with no claim. `ClaimedDevice::cpu()` is a plain
 too, its own device decision. The call sets one process-global `AtomicBool`
 irreversibly. These calls check it first, returning
 `Err(Error::GpuForbidden { op })`, not the mlx-c call:
-`with_stream(Device::Gpu, ..)`, `ensure_gpu_default_stream()`, every
-`rmlx_mlx::metal` fn, and `CaptureScope::start`.
+`with_stream(Device::Gpu, ..)`, every `rmlx_mlx::metal` fn, and
+`CaptureScope::start`.
 
 **Guarantee.** Under `--device cpu`, no rmlx op runs on a GPU stream, and no
 rmlx Metal API is called. A KV codec carrying MSL, and `--gpu-capture`, are
@@ -268,53 +268,49 @@ way — `metal::allocator()` backs every array buffer. `default_device()` is
 the GPU whenever Metal is available, and an MLX-internal GPU-stream request
 outside rMLX's two sites is uncovered.
 
-### Per-thread GPU stream context — `ensure_gpu_default_stream`
+### The MLX thread
 
-MLX evaluates through a **thread-local** map of
-`{stream_index → CommandEncoder}` on the GPU. An entry exists only for
-streams created on that thread. A tokio blocking-pool worker never creates
-one, so its `Array::eval()` fails with
-`There is no Stream(gpu, N) in current thread.`.
+MLX keeps the command encoder of a stream in the thread that created the
+stream, and an evaluation looks for the encoder only in the evaluating thread:
+`cpu::get_command_encoder` (`mlx/backend/cpu/encoder.cpp`, MLX 0.32) throws
+`There is no Stream(cpu, N) in current thread.`, and the Metal device throws
+`There is no Stream(gpu, N) in current thread.` on every supported MLX. Default
+streams are per thread too (`mlx/stream.cpp`). An op records its stream when it
+is built. So, without more, an array built on one thread fails when another
+thread evaluates it, or the evaluation waits forever. `rmlx serve` builds
+model state on one thread and uses it on another: a model loads on the preload
+thread, on an async worker or inside a request, and generates on a
+blocking-pool worker; a cache entry is written by one request and read by a
+later one.
 
-`rmlx_mlx::ensure_gpu_default_stream() -> Result<()>` creates a GPU stream on
-the calling thread, sets it as the thread's default, and keeps the handle in
-a thread-local for the thread's life. It is idempotent and a no-op when the GPU
-is unavailable.
+`crates/rmlx-mlx/src/mlx_thread.rs` starts one thread, the MLX thread, at the
+first op. It creates one CPU and one GPU stream (its own default streams),
+and keeps them for the life of the process.
 
-### Per-thread CPU stream context — `ensure_cpu_default_stream`
+- `with_stream` builds every op, on every thread, on one of the two. It also
+  makes each of them the default stream of the building thread, once per
+  thread and device, because MLX builds some ops inside other ops on the
+  default stream of the building thread, not on the stream the caller passed
+  (`a_thread_that_built_an_op_defaults_to_the_mlx_threads_stream`).
+- `with_eval_lock` runs every evaluation on the MLX thread, under the
+  evaluation lock. The caller waits. The mlx-c error message of the call moves
+  back to the calling thread, so `check_status` reads it there. A panic
+  continues on the calling thread.
+- A call from the MLX thread itself runs in place.
 
-A GPU forward can still schedule CPU-stream ops, such as the scale reduction
-in the K8V8 `exit_prefill` quantize. On the linked MLX (0.32.x) the CPU
-command encoders are per thread, like the GPU ones:
-`cpu::get_command_encoder` (`mlx/backend/cpu/encoder.cpp`) looks a stream up
-in the evaluating thread's map, then in a global map that only
-`new_thread_unsafe_stream` fills (rMLX calls none), and otherwise throws
-`There is no Stream(cpu, N) in current thread.`. Default streams are per
-thread too (`mlx/stream.cpp`). So an array built on one thread and evaluated
-on another throws; `cross_thread_cpu_eval_throws_and_same_thread_eval_succeeds`
-holds that.
+So an array built on any thread evaluates from any thread, and no loader,
+cache or request path has to evaluate its arrays before a hand-over. A new
+loader, cache or blocking-pool entry point needs no stream set-up.
 
-`rmlx_mlx::ensure_cpu_default_stream()` is the CPU analog of the GPU guard. It
-registers the calling thread's own stream, so a thread that builds and
-evaluates its own graph finds it. It does not rescue a cross-thread eval: the
-foreign array carries another thread's stream.
+Tests: `a_cpu_op_built_on_one_thread_evaluates_on_another` (not ignored) and
+`a_gpu_op_built_on_one_thread_evaluates_on_another` build a lazy op on a thread
+that stays alive and idle, and evaluate it on a second thread.
+`every_stream_comes_from_the_mlx_thread` holds that no other file gets a
+stream. The thread-boundary suite (`crates/rmlx-server/tests/thread_boundary*.rs`)
+holds the production hand-overs on real models.
 
-**Contract.** Every blocking-thread inference entry point calls
-`ensure_cpu_default_stream()` unconditionally, before
-`ensure_gpu_default_stream()` when both apply. Covered: the text generate
-dispatch (`arch::generate_greedy`), the image generate dispatch
-(`arch::generate_image`, the server's `run_qwen3vl_image`), the speculative
-blocking closure, the audio-transcription closures (`audio.rs`, the CLI
-`transcribe`), and `embeddings.rs` `compute_embeddings`. A new blocking-pool
-entry point that materialises arrays calls both guards, CPU first.
-
-**Bounded leak.** Both guards leak their stream handle on thread exit, since
-freeing it would drop an encoder entry a running eval may use. Each handle is
-also an MLX-internal OS thread. `rmlx serve`
-(`crates/rmlx-cli/src/commands/serve.rs`) therefore caps
-`max_blocking_threads` and sets a long `thread_keep_alive`, so workers are
-reused and the leak is bounded by the cap. One-shot commands end with their
-process.
+Cost: an evaluation from another thread waits for the hand-over to the MLX
+thread and back. An op no longer gets and frees a stream handle.
 
 ### Null sentinel for optional arguments
 
@@ -368,10 +364,10 @@ MLX ops build a graph; evaluation runs it.
 
 **Both are serialised process-wide by `EVAL_LOCK`**
 (`crates/rmlx-mlx/src/lib.rs`), through `with_eval_lock`, which holds the lock
-across the FFI call and nothing else. `Closure::apply` is too. On the linked
-MLX no encoder map is shared between threads (above), and no measurement shows
-concurrent evaluation to be safe or unsafe. rMLX does not need it, so the lock
-makes serial evaluation a property of the crate, not an assumption.
+across the FFI call and nothing else. `Closure::apply` is too. The lock is
+taken on the MLX thread ([above](#the-mlx-thread)), which already runs one
+evaluation at a time; the lock keeps serial evaluation a property of the crate
+even if an evaluation leaves that thread.
 
 `with_eval_lock` takes a closure instead of returning a guard, so
 `let _ = acquire();` cannot drop the guard before the FFI call.
@@ -827,8 +823,9 @@ reinterpretation (`slice::from_raw_parts`) of array data. Because
 | `Array::from_bytes` / `mlx_array_new_data` | MLX copies the buffer; `data` need not outlive the call. |
 | `mlx_array_shape`, `mlx_array_data_uint8` | The pointer is valid while the `Array` lives; it is copied into a `Vec` before return. |
 | `null_sentinel` | The null handle is only an "absent" argument to an mlx-c function that accepts null. Never store or materialise it. |
-| `with_stream` | `f` must not keep the stream handle past the call. Freeing it drops a ref-count, not the stream. |
-| `check_status` | Call immediately after the mlx-c call, on the same thread, before another call can overwrite the error slot. |
+| `Stream` (`mlx_thread.rs`) `Send + Sync` | The handle names an immutable `{device, index}` and is never freed. Only the MLX thread uses the encoder behind it. |
+| `check_status` | Call immediately after the mlx-c call, on the same thread, before another call can overwrite the error slot. After `with_eval_lock`, the error slot of the calling thread holds the message of the call on the MLX thread. |
+| `mlx_array`, `mlx_vector_array`, `mlx_closure` `Send` (`sys.rs`) | Handles to reference-counted mlx-c objects; `with_eval_lock` moves them to the MLX thread for the call while the caller waits. |
 | `rust_closure_callback` | `payload` is the boxed function, valid for the closure's life. `input` is borrowed and not freed; `output` is filled here. No panic crosses the boundary. |
 | `MetalKernel` / `Closure` `Send + Sync` | The handle is immutable and ref-counted by mlx-c. The Metal device context is process-global; callers hold the Metal claim (`crates/rmlx-server/src/claim.rs`). |
 

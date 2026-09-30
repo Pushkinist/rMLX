@@ -233,9 +233,9 @@ Hard rules:
   MLX contact generally.** The CPU side is held apart differently:
   `EVAL_LOCK` / `with_eval_lock` in `rmlx-mlx` serialises every evaluation
   process-wide, so parallel test threads never evaluate at once — not by
-  ignoring CPU tests, which would only stop running them. On the linked MLX
-  (0.32.x) no command-encoder map is shared between threads; the lock keeps
-  evaluation serial because nothing shows concurrent evaluation safe. Two deterministic gates hold it, and they are
+  ignoring CPU tests, which would only stop running them. Every evaluation
+  also runs on the one MLX thread that owns the streams every op is built on
+  (`docs/FFI.md` § "The MLX thread"). Two deterministic gates hold the lock, and they are
   complementary by construction: `make check-eval-lock` fails the build on any
   MLX eval FFI call made outside the lock (25-symbol reach-set, derived from the
   linked dylibs — **not** just the eval-named ones) but is blind to a lock that

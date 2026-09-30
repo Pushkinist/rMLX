@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A model loaded on one thread no longer fails on another.** On MLX 0.32 an
+  on-demand load (unload, then a request) failed its first request with
+  `There is no Stream(cpu, N) in current thread`, and so did an image request
+  after an on-demand load of a vision model, a jina-v4 image embedding, and a
+  cache entry that a failed request left. A BitNet on-demand load and the first
+  synthesis after a TTS load failed the same way on every MLX, with
+  `Stream(gpu, N)`. MLX evaluates a stream only on the thread that created it.
+  rMLX now builds every op on the streams of one MLX thread and runs every
+  evaluation there (`docs/FFI.md` § "The MLX thread"), so any thread can use
+  what another thread built.
 - **The release tarball's binary no longer carries the builder's home
   directory.** Every dependency's panic location was compiled in as an
   absolute path under the build machine's home, user name included — 577
