@@ -225,8 +225,8 @@ impl Closure {
     /// pure graph construction, but building the fused `Compiled` primitive
     /// bakes scalar constants into the kernel's library name, and that goes
     /// `print_constant` → `array::item<T>()` → `array::eval()`
-    /// (`mlx/backend/common/compiled.cpp`). So a closure application can reach
-    /// the unsynchronised command-encoder map like any other evaluation.
+    /// (`mlx/backend/common/compiled.cpp`). So a closure application evaluates
+    /// like any other evaluation.
     ///
     /// **Re-entrancy:** the closure body runs on the calling thread, inside
     /// this FFI call, with the lock held — so a body that *takes the lock

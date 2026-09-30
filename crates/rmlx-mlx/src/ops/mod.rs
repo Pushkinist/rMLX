@@ -43,9 +43,9 @@ pub use shape::{arange, conv1d, conv2d, conv_transpose1d, cos, maximum, pad, sin
 
 /// True: `mlx_quantized_matmul` with `mode="mxfp8"` is available.
 ///
-/// MLX 0.31 (brew) supports mxfp8 via `mlx_quantized_matmul`. The C-level
-/// `mode` parameter was added in mlx-c 0.6. A future version may swap the codepath
-/// for a custom Metal kernel; for now we use the upstream C symbol.
+/// The linked MLX supports mxfp8 through `mlx_quantized_matmul` and its `mode`
+/// parameter. A future version may swap the codepath for a custom Metal kernel;
+/// for now we use the upstream C symbol.
 pub const MLX_QUANTIZED_MM_OK_FOR_MXFP8: bool = true;
 
 // ---------------------------------------------------------------------------

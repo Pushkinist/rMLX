@@ -646,9 +646,9 @@ fn mk(v: &[f32]) -> Array {
 
 /// The CPU analog of `gpu_default_stream_guard_idempotent_on_worker_thread`.
 ///
-/// A tokio blocking-pool worker starts with no MLX stream context. Since MLX
-/// 0.31/0.32 the default CPU/GPU streams and the CPU command encoders are
-/// thread-local, so the generation entry points call `ensure_cpu_default_stream`
+/// A tokio blocking-pool worker starts with no MLX stream context. On the
+/// linked MLX the default CPU/GPU streams and the CPU command encoders are per
+/// thread, so the generation entry points call `ensure_cpu_default_stream`
 /// (and its GPU sibling) once per worker before building/evaluating any graph.
 /// This runs that exact sequence on a freshly-spawned OS thread — the analog of
 /// a blocking-pool worker — and asserts the guard is safe + idempotent and that
@@ -658,7 +658,7 @@ fn mk(v: &[f32]) -> Array {
 /// stream. It makes worker-built graphs eval cleanly, but it does NOT let a
 /// worker evaluate an array whose ops were built on a *different* thread — that
 /// is an upstream MLX limitation (streams from `new_stream` are usable only on
-/// their thread of creation; see `cross_thread_eval_faults_documents_mlx_limit`).
+/// their thread of creation; see `cross_thread_cpu_eval_throws_and_same_thread_eval_succeeds`).
 #[test]
 fn cpu_default_stream_guard_idempotent_on_worker_thread() {
     let out = std::thread::spawn(|| {
@@ -699,7 +699,7 @@ fn cpu_default_stream_guard_idempotent_on_worker_thread() {
 /// "faults-without-guard, succeeds-with-guard" negative control is therefore
 /// not constructible for this same-thread shape: the only fault class this fix
 /// addresses is genuinely cross-thread (an array built on one thread, eval'd on
-/// another — see `cross_thread_eval_faults_documents_mlx_limit`, which the
+/// another — see `cross_thread_cpu_eval_throws_and_same_thread_eval_succeeds`, which the
 /// guard does **not** cure either, since it registers the eval thread's *own*
 /// stream, not the foreign one). What this test *does* prove, CI-runnably and
 /// without any GPU dependency: the CPU guard alone (no GPU guard in the call
@@ -729,46 +729,39 @@ fn cpu_guard_alone_handles_scale_reduction_on_worker_thread() {
     assert_eq!(out, vec![8.0f32]);
 }
 
-/// Executable statement of the mechanism the evaluation lock exists for: on the
-/// linked MLX the CPU command-encoder map is **process-global**, so an array
-/// built — and therefore stream-bound — on one thread evaluates perfectly well
-/// on another.
+/// Executable statement of how the linked MLX resolves a CPU stream: through
+/// the command-encoder map of the evaluating thread (`mlx/backend/cpu/encoder.cpp`
+/// in mlx 0.32.x). An array built on one thread carries that thread's default
+/// CPU stream, and another thread that evaluates it throws
+/// "There is no Stream(cpu, N) in current thread.".
 ///
-/// That is the whole problem. A map every thread can reach is shared mutable
-/// state, and MLX fills it with no synchronisation
-/// (`mlx/backend/cpu/encoder.cpp::get_command_encoder`), which is why
-/// evaluation has to be serialised on our side — see
-/// `concurrent_first_eval_across_threads_does_not_corrupt_encoder_map`.
-///
-/// This also pins *which* upstream model is live. MLX 0.32.0 makes that map
-/// `thread_local` and throws "There is no Stream(cpu, N) in current thread."
-/// for exactly this shape, so if the MLX pin moves, this fails loudly here
-/// instead of quietly invalidating the reasoning in `ensure_cpu_default_stream`.
+/// The positive control builds the same graph and evaluates it on the thread
+/// that built it, so the failure comes from the thread boundary and not from
+/// the op. `ensure_cpu_default_stream` does not change this: it registers the
+/// evaluating thread's own stream, not the stream the graph carries.
 #[test]
-fn cross_thread_eval_resolves_through_the_process_global_encoder_map() {
-    // Bind this thread's default CPU stream and put its encoder in the map.
-    let warm = add(&mk(&[1.0]), &mk(&[1.0]), Device::Cpu).unwrap();
-    warm.eval().unwrap();
+fn cross_thread_cpu_eval_throws_and_same_thread_eval_succeeds() {
+    let same = add(&mk(&[1.0, 2.0]), &mk(&[3.0, 4.0]), Device::Cpu).unwrap();
+    same.eval().unwrap();
+    assert_eq!(bytes_to_f32(&same.to_bytes().unwrap()), vec![4.0f32, 6.0]);
 
-    // Build here, so the graph carries this thread's stream, then evaluate it
-    // on a thread that never established a CPU stream of its own.
-    let c = add(&mk(&[1.0, 2.0]), &mk(&[3.0, 4.0]), Device::Cpu).unwrap();
+    let foreign = add(&mk(&[1.0, 2.0]), &mk(&[3.0, 4.0]), Device::Cpu).unwrap();
     let result = std::thread::spawn(move || {
-        c.eval().map_err(|e| format!("{e}"))?;
-        c.to_bytes().map_err(|e| format!("{e}"))
+        ensure_cpu_default_stream();
+        foreign.eval().map_err(|e| format!("{e}"))
     })
     .join()
     .expect("worker thread panicked");
 
-    let bytes = result.unwrap_or_else(|e| {
-        panic!(
-            "cross-thread CPU eval failed: {e}\n\
-             The encoder map is no longer process-global — MLX 0.32.0 makes it \
-             thread_local and throws here. Recheck ensure_cpu_default_stream's \
-             rationale and the evaluation lock against the new pin."
-        )
-    });
-    assert_eq!(bytes_to_f32(&bytes), vec![4.0f32, 6.0]);
+    let err = result.expect_err(
+        "an array built on another thread evaluated here: the CPU encoder map is \
+         not per thread on the linked MLX. Recheck ensure_cpu_default_stream and \
+         the evaluation lock against it.",
+    );
+    assert!(
+        err.contains("There is no Stream(cpu,"),
+        "cross-thread eval failed for another reason: {err}"
+    );
 }
 
 /// The deterministic half of the evaluation-lock gate: `with_eval_lock` really
@@ -825,47 +818,22 @@ fn with_eval_lock_serialises_concurrent_callers() {
     );
 }
 
-/// **A reproducer, not a gate — and deliberately out of the default run.**
-/// Without the lock it fails about **1 run in 12** (15 in 180, measured), so
-/// eleven times in twelve it would go green with the defect fully present.
-/// Worse, that figure was measured the way `make eval-lock-stress` runs it:
-/// alone, against a genuinely cold encoder map. Inside a normal `cargo test`
-/// the map is already warm from every other MLX-touching test, so its real
-/// detection chance there is lower still and has never been measured — while
-/// its cost is exact and certain (412 threads peak against 4 without it, ~436
-/// still resident when the suite ends, in a binary whose test order is
-/// nondeterministic). A gate whose cost is measured and whose benefit is not
-/// does not belong in `make ci`.
+/// **Out of the default run.** 400 threads each build a CPU graph, wait at a
+/// barrier, then evaluate at the same moment under `with_eval_lock`, and each
+/// must read back its own values.
 ///
-/// The gates for this defect are `make check-eval-lock` (every eval FFI call
-/// is made under the lock) and
-/// `with_eval_lock_serialises_concurrent_callers` (the lock actually excludes),
-/// both deterministic. This test is the end-to-end demonstration that the two
-/// of them together prevent the real crash; run it with
-/// `make eval-lock-stress`, which drives it across fresh processes because the
-/// map only starts cold once per process.
+/// It was written for mlx 0.31.x, where the CPU command-encoder map was one
+/// unsynchronised process-global map: without the lock it failed about 1 run in
+/// 12 (15 in 180, measured) with SIGSEGV, SIGTRAP or an endless spin inside MLX.
+/// On the linked MLX that map is per thread (`mlx/backend/cpu/encoder.cpp`), so
+/// that crash cannot happen, and this test is not measured to find a defect on
+/// this pair. It stays the end-to-end check that concurrent evaluation under
+/// the lock gives correct values.
 ///
-/// The linked MLX resolves a CPU stream's `CommandEncoder` through a
-/// process-global `std::unordered_map<int, CommandEncoder>` that it fills
-/// **lazily, on first evaluation, with no synchronisation**
-/// (`mlx/backend/cpu/encoder.cpp::get_command_encoder`). Its default-CPU-stream
-/// storage is per-thread (`mlx/stream.cpp::default_stream_storage`), so every
-/// thread that evaluates a CPU graph mints its *own* stream index and therefore
-/// performs its *own* insert into that one shared map. Two inserts in flight
-/// together rehash the map underneath a third thread's bucket walk and the
-/// process takes SIGSEGV — the whole test binary dies and libtest reports no
-/// failing test, because no test failed.
-///
-/// `cargo test` runs each test on its own OS thread, so any crate with many
-/// MLX-touching tests reproduces exactly this shape. This test compresses it
-/// into one burst against a cold map: the map rehashes at every prime bucket
-/// count it grows through, and starting from empty is what puts *all* of those
-/// rehashes inside a single window with hundreds of inserts in flight.
-///
-/// It passes only because `Array::eval` / `Array::async_eval` evaluate under
-/// `with_eval_lock`. Drop that and it fails as SIGSEGV, SIGTRAP, or an
-/// infinite spin on a bucket chain that became circular — all three were
-/// observed.
+/// The gates for the lock are `make check-eval-lock` (every eval FFI call is
+/// made under it) and `with_eval_lock_serialises_concurrent_callers` (it
+/// excludes), both deterministic. Run this test with `make eval-lock-stress`,
+/// which drives it across fresh processes.
 ///
 /// Scope: the **CPU** evaluation path only. Concurrent *GPU* evaluation is not
 /// exercised (those tests carry `#[ignore]` and run serialised), nor are races
@@ -884,7 +852,7 @@ fn concurrent_first_eval_reproducer() {
     use std::sync::{Arc, Barrier};
 
     // Cost of this number, measured rather than estimated: the binary peaks at
-    // 412 threads running this test versus 4 without it, and MLX 0.31.2 has no
+    // 412 threads running this test versus 4 without it, and MLX has no
     // stream-reclaim path, so the streams minted here — and the OS threads
     // behind them — persist for the life of the test binary. The whole crate
     // suite peaks at 446 and is still holding ~436 when it finishes, i.e. every
@@ -899,7 +867,7 @@ fn concurrent_first_eval_reproducer() {
 
     // A barrier alone leaves the threads spread over the condvar wake-up. Park
     // them on a spinning flag instead: they are already running when it flips,
-    // so the inserts land together.
+    // so the evaluations start together.
     let gate = Arc::new(AtomicBool::new(false));
     let ready = Arc::new(Barrier::new(THREADS + 1));
 
@@ -912,7 +880,7 @@ fn concurrent_first_eval_reproducer() {
                 // Build first. MLX ops are lazy, so this only mints this
                 // thread's CPU stream — and stream creation takes an MLX mutex,
                 // which would otherwise stagger the threads apart before they
-                // ever reach the unsynchronised part.
+                // reach evaluation.
                 let sum = add(&mk(&[v, v]), &mk(&[v, v]), Device::Cpu).expect("cpu add failed");
                 ready.wait();
                 while !gate.load(Ordering::Acquire) {

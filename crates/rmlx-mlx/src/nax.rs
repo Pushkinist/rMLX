@@ -52,7 +52,7 @@ pub(crate) const NAX_GEMM_KERNEL: &str = "steel_gemm_fused_nax";
 /// would make every Mac NA-class.
 const NA_CLASS_GPU_FAMILY: u8 = 10;
 
-/// Read size for the metallib scan. The file is ~124-158 MB, which no startup
+/// Read size for the metallib scan. The file is ~150-200 MB, which no startup
 /// path should hold in memory at once.
 const SCAN_CHUNK: usize = 1 << 20;
 
@@ -231,7 +231,7 @@ impl KernelScan {
 /// Every reader — run identity, the startup warning, and the pin verdict —
 /// shares it. Three independent walks of dyld's image list would be three
 /// observations of a symlink this module exists to distrust, and could
-/// disagree with each other inside a single process; the file is also ~157 MB,
+/// disagree with each other inside a single process; the file is also ~150-200 MB,
 /// which no process should read three times.
 ///
 /// Ungated by host class: "does this MLX ship the kernels" has a true answer
@@ -366,11 +366,11 @@ fn has_needle(hay: &[u8], needle: &[u8], first: u8) -> bool {
 /// Each read is searched where it lands. Only the last needle-1 bytes are
 /// carried forward, and only they are ever copied — a match that begins any
 /// earlier was already either found or ruled out in the read it began in. The
-/// file is ~124-158 MB and the buffer this needs is 19 bytes, so nothing
+/// file is ~150-200 MB and the buffer this needs is 19 bytes, so nothing
 /// between those two sizes should be memcpy'd on a startup path.
 ///
 /// `chunk` is a parameter so the carry path — a match straddling two reads —
-/// is testable without a 124 MB fixture.
+/// is testable without a 150 MB fixture.
 fn contains_nax_kernel<R: Read>(mut reader: R, chunk: usize) -> std::io::Result<bool> {
     let needle = NAX_GEMM_KERNEL.as_bytes();
     let Some(&first) = needle.first() else {

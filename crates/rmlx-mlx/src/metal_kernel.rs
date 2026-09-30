@@ -2,7 +2,7 @@
 //!
 //! # What this is
 //!
-//! `MetalKernel` wraps the `mlx-c 0.6` `mlx_fast_metal_kernel` API, which lets
+//! `MetalKernel` wraps the mlx-c `mlx_fast_metal_kernel` API, which lets
 //! Rust code compile and dispatch MSL (Metal Shading Language) kernels on
 //! Apple Silicon's GPU without leaving the MLX compute graph.
 //!

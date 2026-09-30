@@ -41,7 +41,7 @@
 //!
 //! `mlx_metal_start_capture(path: *const c_char) -> int` — 0 = ok, non-0 = error.
 //! `mlx_metal_stop_capture() -> int` — 0 = ok, non-0 = error.
-//! Both live in `mlx/c/metal.h` (mlx-c 0.6.0).
+//! Both live in `mlx/c/metal.h`.
 
 use std::ffi::CString;
 use std::path::{Path, PathBuf};

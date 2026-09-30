@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
-# Restore the nax-capable MLX pair named by crates/rmlx-mlx/mlx-pin.txt.
+# Restore the MLX pair named by crates/rmlx-mlx/mlx-pin.txt, then link and pin
+# exactly those two kegs.
 #
-# Needed because `brew pin` does NOT protect a keg from `brew cleanup`: the
-# pinned versions can disappear entirely, leaving only the nax-less 0.32.0
-# bottle (unlinked), at which point `rmlx` cannot launch at all.
+# The pinned pair is a source build with the NAX kernels (docs/FFI.md,
+# "Pinned MLX / mlx-c pair"). No Homebrew bottle for macOS 26 carries them, so
+# this script pours no bottle. It takes each keg from, in this order:
 #
-# Sources the bottles from ~/.rmlx/bottles first (durable local copy), falling
-# back to ghcr. Pours alongside whatever else is in the Cellar, repoints the
-# `opt` symlinks, relocates install names, and re-signs.
+#   1. the Cellar, when the keg is still there;
+#   2. the durable copy in $RMLX_BOTTLE_STORE/source-built (default
+#      ~/.rmlx/bottles/source-built): a tar of the Cellar keg directory, listed
+#      in the SHA256SUMS file there.
+#
+# When neither has a keg, it stops and names the source build (docs/FFI.md,
+# "Building the pinned pair").
+#
+# Linking and pinning use Homebrew's own Keg and FormulaPin on the exact keg.
+# `brew link <f>` and `brew pin <f>` act on the newest keg in the Cellar, not on
+# the one the pin names.
 #
 # Verify afterwards with scripts/mlx_preflight.sh.
 
@@ -15,106 +24,94 @@ set -uo pipefail
 
 PREFIX="${HOMEBREW_PREFIX:-/opt/homebrew}"
 CELLAR="$PREFIX/Cellar"
-STORE="${RMLX_BOTTLE_STORE:-$HOME/.rmlx/bottles}"
-STAGE=$(mktemp -d)
-trap 'rm -rf "$STAGE"' EXIT
+STORE="${RMLX_BOTTLE_STORE:-$HOME/.rmlx/bottles}/source-built"
 
-# The pinned pair, read from its one declaration by the one parser. A copy
-# here would drift the moment the pin moves, and the drift would be silent.
+# The pinned pair, read from its one declaration by the one parser. The
+# versions pass the allowlist in scripts/lib/mlx_pin.sh before they reach a
+# path or the Ruby text below.
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 source "$REPO_ROOT/scripts/lib/mlx_pin.sh"
 mlx_pin_load "$REPO_ROOT/crates/rmlx-mlx/mlx-pin.txt" || exit 1
-MLX_VER="$PIN_MLX"
-MLXC_VER="$PIN_MLXC"
-# sha256 from the homebrew-core *bottle-update* commits (cbfd9632d44 / b2763d78a34),
-# for the pair the pin currently names. Moving the pin without moving these makes
-# the extracted version directory disagree with the requested one, which the
-# check below turns into a hard failure rather than a wrong restore.
-# NOTE: the version-bump commit still carries the PREVIOUS release's hashes —
-# taking the sha from there silently yields mlx 0.31.1.
-MLX_SHA="def8a7ae1e6a6506eed4dea45bf52b55be0f52f8364f8a928da6e65b1204a371"
-MLXC_SHA="b30c755158db3f9d9090b69a1a74f3e05ae8e7a3969695d9f0974f1bc1d3df1b"
 
 die() {
 	echo "restore FAIL: $*" >&2
 	exit 1
 }
 
-obtain() { # name version sha -> stages <name>.tar.gz
-	local name=$1 ver=$2 sha=$3
-	local out="$STAGE/$name.tar.gz"
-	local local_copy="$STORE/$name--$ver.arm64_tahoe.bottle.tar.gz"
-
-	if [ -f "$local_copy" ]; then
-		echo "[local] $name $ver from $STORE"
-		cp "$local_copy" "$out"
-	else
-		echo "[fetch] $name $ver from ghcr"
-		curl -sSL -H "Authorization: Bearer QQ==" \
-			"https://ghcr.io/v2/homebrew/core/$name/blobs/sha256:$sha" -o "$out" ||
-			die "download failed for $name"
-	fi
-
-	local got
-	got=$(shasum -a 256 "$out" | awk '{print $1}')
-	[ "$got" = "$sha" ] || die "$name sha mismatch: got $got want $sha"
-	echo "[ok] $name sha verified"
+# The dylib that a complete keg of the formula holds.
+keg_lib() {
+	case $1 in
+	mlx) echo libmlx.dylib ;;
+	mlx-c) echo libmlxc.dylib ;;
+	esac
 }
 
-obtain mlx "$MLX_VER" "$MLX_SHA"
-obtain mlx-c "$MLXC_VER" "$MLXC_SHA"
+# from_store <formula> <version>: extract that keg from the durable copy.
+# A tar is found by what it holds, not by its file name. Returns 1 when no
+# listed tar holds the keg.
+from_store() {
+	local f=$1 v=$2 sums="$STORE/SHA256SUMS" sha file top got
+	[ -f "$sums" ] || return 1
+	while read -r sha file; do
+		[ -f "$STORE/$file" ] || continue
+		top=$(tar -tzf "$STORE/$file" 2>/dev/null | head -1)
+		[ "$top" = "$f/$v/" ] || continue
+		got=$(shasum -a 256 "$STORE/$file" | awk '{print $1}')
+		[ "$got" = "$sha" ] || die "$STORE/$file has sha256 $got, but SHA256SUMS lists $sha"
+		mkdir -p "$CELLAR/$f"
+		tar -xzf "$STORE/$file" -C "$CELLAR" "$f/$v" || die "cannot extract $f $v from $file"
+		echo "[store] $f $v from $file"
+		return 0
+	done <"$sums"
+	return 1
+}
 
-tar -xzf "$STAGE/mlx.tar.gz" -C "$STAGE" || die "extract mlx"
-tar -xzf "$STAGE/mlx-c.tar.gz" -C "$STAGE" || die "extract mlx-c"
-
-# The version directory inside the tarball is the ground truth — a correct
-# checksum does not prove it is the version you asked for.
-[ -d "$STAGE/mlx/$MLX_VER" ] || die "bottle is not mlx $MLX_VER (got: $(ls "$STAGE/mlx"))"
-[ -d "$STAGE/mlx-c/$MLXC_VER" ] || die "bottle is not mlx-c $MLXC_VER (got: $(ls "$STAGE/mlx-c"))"
-
-# Reader status first: a `strings` that could not run also prints no matches,
-# and pouring a bottle on the strength of that would defeat the check.
-staged_symbols=$(strings "$STAGE/mlx/$MLX_VER/lib/mlx.metallib") ||
-	die "cannot read the staged mlx.metallib — the nax check could not run"
-staged_nax=$(printf '%s\n' "$staged_symbols" | grep -c steel_gemm_fused_nax)
-[ "$staged_nax" -ge 1 ] || die "staged mlx $MLX_VER has $staged_nax nax kernels — wrong bottle"
-echo "[ok] staged mlx has $staged_nax nax GEMM kernel occurrences"
-
-echo "[install] pouring into Cellar (other versions left intact)"
-rm -rf "${CELLAR:?}/mlx/$MLX_VER" "${CELLAR:?}/mlx-c/$MLXC_VER"
-mkdir -p "$CELLAR/mlx" "$CELLAR/mlx-c"
-cp -R "$STAGE/mlx/$MLX_VER" "$CELLAR/mlx/$MLX_VER" || die "install mlx"
-cp -R "$STAGE/mlx-c/$MLXC_VER" "$CELLAR/mlx-c/$MLXC_VER" || die "install mlx-c"
-
-echo "[link] repointing opt symlinks"
-ln -sfn "$CELLAR/mlx/$MLX_VER" "$PREFIX/opt/mlx"
-ln -sfn "$CELLAR/mlx-c/$MLXC_VER" "$PREFIX/opt/mlx-c"
-
-# Homebrew rewrites @@HOMEBREW_PREFIX@@ at install time; a hand-poured bottle
-# keeps the placeholders and dyld cannot resolve them.
-echo "[relocate] rewriting install names"
-for lib in "$CELLAR/mlx/$MLX_VER/lib/libmlx.dylib" \
-	"$CELLAR/mlx/$MLX_VER/lib/libjaccl.dylib" \
-	"$CELLAR/mlx-c/$MLXC_VER/lib/libmlxc.dylib"; do
-	[ -f "$lib" ] || continue
-	old_id=$(otool -D "$lib" | tail -1)
-	install_name_tool -id "${old_id//@@HOMEBREW_PREFIX@@/$PREFIX}" "$lib" 2>/dev/null
-	otool -L "$lib" | tail -n +2 | awk '{print $1}' | grep '@@HOMEBREW_PREFIX@@' |
-		while read -r dep; do
-			install_name_tool -change "$dep" "${dep//@@HOMEBREW_PREFIX@@/$PREFIX}" "$lib" 2>/dev/null
-		done
-	# install_name_tool invalidates the signature on arm64.
-	codesign --force --sign - --preserve-metadata=entitlements,flags "$lib" 2>/dev/null
+for f in mlx mlx-c; do
+	if [ "$f" = mlx ]; then v=$PIN_MLX; else v=$PIN_MLXC; fi
+	keg="$CELLAR/$f/$v"
+	lib=$(keg_lib "$f")
+	if [ -f "$keg/lib/$lib" ]; then
+		echo "[cellar] $f $v"
+	elif [ -e "$keg" ]; then
+		die "$keg exists but has no lib/$lib. Remove that directory, then run this again"
+	else
+		from_store "$f" "$v" ||
+			die "no $f $v in $CELLAR and no copy of it in $STORE. Build the pair from source:" \
+				"docs/FFI.md, \"Building the pinned pair\""
+		[ -f "$keg/lib/$lib" ] || die "the copy of $f $v has no lib/$lib"
+	fi
 done
 
-for script in "$CELLAR/mlx/$MLX_VER"/bin/*; do
-	[ -f "$script" ] && sed -i '' "s|@@HOMEBREW_PREFIX@@|$PREFIX|g" "$script" 2>/dev/null
+# The kernels are the reason for the pin. A keg of the right version without
+# them is a bottle build, not the source build the pin names.
+metallib="$CELLAR/mlx/$PIN_MLX/lib/mlx.metallib"
+symbols=$(strings "$metallib") || die "cannot read $metallib, so the NAX check could not run"
+nax=$(printf '%s\n' "$symbols" | grep -c steel_gemm_fused_nax)
+[ "$nax" -ge 1 ] ||
+	die "mlx $PIN_MLX in $CELLAR has no NAX GEMM kernels. It is a bottle build, not the" \
+		"source build the pin names: docs/FFI.md, \"Building the pinned pair\""
+echo "[ok] mlx $PIN_MLX has $nax NAX GEMM kernel occurrences"
+
+echo "[link] link and pin mlx $PIN_MLX + mlx-c $PIN_MLXC"
+brew ruby -e "
+[['mlx', '$PIN_MLX'], ['mlx-c', '$PIN_MLXC']].each do |name, version|
+  formula = Formula[name]
+  pin = FormulaPin.new(formula)
+  pin.unpin
+  formula.installed_kegs.each(&:unlink)
+  keg = Keg.new(HOMEBREW_CELLAR/name/version)
+  keg.lock { keg.link }
+  pin.pin_at(keg.version)
+end" || die "brew could not link and pin the pair"
+
+for f in mlx mlx-c; do
+	if [ "$f" = mlx ]; then v=$PIN_MLX; else v=$PIN_MLXC; fi
+	want=$(cd "$CELLAR/$f/$v" && pwd -P)
+	for record in "opt/$f" "var/homebrew/linked/$f" "var/homebrew/pinned/$f"; do
+		got=$(cd "$PREFIX/$record" 2>/dev/null && pwd -P)
+		[ "$got" = "$want" ] || die "$PREFIX/$record resolves to '${got:-nothing}', not $want"
+	done
 done
-
-echo "[cache] keeping a durable copy in $STORE"
-mkdir -p "$STORE"
-cp -n "$STAGE/mlx.tar.gz" "$STORE/mlx--$MLX_VER.arm64_tahoe.bottle.tar.gz" 2>/dev/null
-cp -n "$STAGE/mlx-c.tar.gz" "$STORE/mlx-c--$MLXC_VER.arm64_tahoe.bottle.tar.gz" 2>/dev/null
-
-echo "[done] rebuild rmlx so it links the restored pair:  touch crates/rmlx-mlx/build.rs && make build-perf"
+echo "[done] opt, linked and pinned records name mlx $PIN_MLX + mlx-c $PIN_MLXC"
+echo "       rebuild rmlx against them:  cargo clean -p rmlx-mlx && make build-perf"
 exec "$(dirname "$0")/mlx_preflight.sh"

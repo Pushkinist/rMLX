@@ -311,7 +311,7 @@ pub fn scaled_dot_product_attention(
     reason = "the seven arguments of scaled_dot_product_attention plus the verdict a test injects"
 )]
 fn sdpa_under(
-    _verdict: CApiVerdict,
+    verdict: CApiVerdict,
     q: &Array,
     k: &Array,
     v: &Array,
@@ -321,7 +321,7 @@ fn sdpa_under(
     device: Device,
 ) -> Result<Array> {
     install_error_handler();
-    CApiVerdict::Match(c_api::CApi::COMPILED).require_match()?;
+    verdict.require_match()?;
     let mode_cstr = mode_to_cstr(mask_mode, "scaled_dot_product_attention")?;
     // When mask_arr is None, use the cached null sentinel.
     let mask_inner = match mask_arr {
