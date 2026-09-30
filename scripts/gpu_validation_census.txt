@@ -127,6 +127,16 @@
 # mxfp8 `b_8` in `rmlx-models`; 4 of each split-K and 4 conv in `rmlx-mlx`; 3
 # conv in `rmlx-audio`.
 #
+# The `rmlx-server` entries were derived later, on mlx 0.32.1 / mlx-c 0.6.0_4,
+# by `make gpu-test CRATE=rmlx-server FILTER=thread` and `FILTER=text_decodes`,
+# every diagnostic attributed to the test libtest last announced. Totals: 384
+# affine `b_4`, 192 affine `gs_128_b_2`, 192 mxfp8 `b_8` and 12 conv. Affine
+# `gs_128_b_2` is one of the eighteen cells the split-K argument above measured.
+# `qwen3_5_text_decodes_on_a_thread_that_did_not_load_the_model` fails on that
+# pair after its one-thread arm, with 96 hits. Its pin of 192 is the count of
+# both arms, taken with the runner's validation settings on mlx 0.31.2 /
+# mlx-c 0.6.0_2, where the test passes.
+#
 # A test that sweeps two checkpoints carries one entry per instantiation. On a
 # host holding one of them, that test still runs and the absent one's entry
 # reports `no longer fires`: the entry key has no room for which checkpoint
@@ -163,3 +173,8 @@ affine_qmm_t_splitk_bfloat16_t_gs_64_b_4_alN_false | device load | 4 | rmlx-mlx 
 mxfp8_qmm_t_splitk_bfloat16_t_gs_32_b_8_alN_false | device load | 4 | rmlx-mlx | split_k_tail_row_reads_never_reach_the_output | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
 implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s | device load | 4 | rmlx-mlx | implicit_gemm_conv_tail_channel_reads_never_reach_the_output | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
 implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s | device load | 3 | rmlx-audio | codec_decoder_debug | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_4_alN_false | device load | 192 | rmlx-server | dflash2_drafter_runs_on_a_thread_that_did_not_load_it | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_4_alN_false | device load | 192 | rmlx-server | qwen_mtp_drafter_runs_on_a_thread_that_did_not_load_it | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_128_b_2_alN_false | device load | 192 | rmlx-server | qwen3_5_text_decodes_on_a_thread_that_did_not_load_the_model | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
+mxfp8_qmm_t_splitk_bfloat16_t_gs_32_b_8_alN_false | device load | 192 | rmlx-server | two_model_drafter_runs_on_a_thread_that_did_not_load_it | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
+implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s | device load | 12 | rmlx-server | tts_synthesizes_on_a_thread_that_did_not_load_it | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562

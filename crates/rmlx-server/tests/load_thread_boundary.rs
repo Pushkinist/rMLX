@@ -49,6 +49,7 @@ use rmlx_server::{
 };
 
 const BONSAI: &str = "prism-ml__Ternary-Bonsai-8B-mlx-2bit";
+const TERNARY_BONSAI_27B: &str = "prism-ml__Ternary-Bonsai-27B-mlx-2bit";
 const GEMMA4_E2B: &str = "mlx-community__gemma-4-e2b-it-mxfp8";
 const GEMMA4_E2B_ASSISTANT: &str = "mlx-community__gemma-4-E2B-it-assistant-bf16";
 const GEMMA4_UNIFIED_12B: &str = "mlx-community__gemma-4-12B-it-mxfp8";
@@ -458,13 +459,8 @@ fn load_model(dir: &Path) -> arch::Architecture {
     arch::load_model(dir, Device::Gpu, &arch::LoadOpts::default()).expect("load_model")
 }
 
-/// Bonsai ships F16 scales, biases and norms, so its loader leaves lazy CPU
-/// `astype` ops (and the fused QKV `concatenate`) in the model it returns.
-#[test]
-#[ignore = "requires Metal GPU and the Bonsai snapshot; run with `make gpu-test`"]
-fn text_decodes_on_a_thread_that_did_not_load_the_model() {
-    let test = "text_decodes_on_a_thread_that_did_not_load_the_model";
-    let Some([dir]) = snapshots(test, [BONSAI]) else {
+fn assert_text(test: &str, slug: &str) {
+    let Some([dir]) = snapshots(test, [slug]) else {
         return;
     };
     let run = |split: bool| {
@@ -483,6 +479,27 @@ fn text_decodes_on_a_thread_that_did_not_load_the_model() {
     assert_eq!(
         crossed, oracle,
         "{test}: different tokens than the one-thread oracle"
+    );
+}
+
+/// Bonsai-8B ships F16 scales, biases and norms, and a YARN scale. Its loader
+/// also builds the fused QKV `concatenate`.
+#[test]
+#[ignore = "requires Metal GPU and the Bonsai-8B snapshot; run with `make gpu-test`"]
+fn qwen3_text_decodes_on_a_thread_that_did_not_load_the_model() {
+    assert_text(
+        "qwen3_text_decodes_on_a_thread_that_did_not_load_the_model",
+        BONSAI,
+    );
+}
+
+/// A dense Qwen3.5 checkpoint with F16 scales, biases and norms.
+#[test]
+#[ignore = "requires Metal GPU and the Ternary-Bonsai-27B snapshot; run with `make gpu-test`"]
+fn qwen3_5_text_decodes_on_a_thread_that_did_not_load_the_model() {
+    assert_text(
+        "qwen3_5_text_decodes_on_a_thread_that_did_not_load_the_model",
+        TERNARY_BONSAI_27B,
     );
 }
 
@@ -658,6 +675,74 @@ fn an_encoder_cache_hit_decodes_on_another_thread() {
     assert_eq!(
         crossed[0], oracle[0],
         "{test}: first request differs from the oracle"
+    );
+}
+
+/// A request that fails after its vision tower ran leaves the encoder output
+/// in the cache. The next request for the same image hits that entry on
+/// another thread.
+fn assert_failed_request_cache_entry(test: &str, slug: &str, max_ctx: i32) {
+    let Some([dir]) = snapshots(test, [slug]) else {
+        return;
+    };
+    let run = |split: Split| {
+        let cache = Arc::new(MultimodalCache::new(256 << 20));
+        let load = arch_generator(dir.clone(), Some(Arc::clone(&cache)));
+        let mut too_long = image_request(&dir);
+        too_long.max_ctx_override = Some(max_ctx);
+        let out = serve(split, &load, vec![too_long, image_request(&dir)]);
+        (out, cache.stats().hits)
+    };
+    let (oracle, oracle_hits) = run(Split::None);
+    assert!(
+        oracle[0].is_err(),
+        "{test}: the first request must fail after the vision tower ran: {:?}",
+        oracle[0]
+    );
+    assert!(
+        oracle[1].as_ref().is_ok_and(|ids| !ids.is_empty()),
+        "{test}: the one-thread oracle must decode the second request: {:?}",
+        oracle[1]
+    );
+    assert_eq!(
+        oracle_hits, 1,
+        "{test}: the oracle's second request must hit the failed request's entry"
+    );
+    let (crossed, hits) = run(Split::BeforeLastRequest);
+    assert!(crossed[0].is_err(), "{test}: the first request must fail");
+    let second = crossed[1].as_ref().unwrap_or_else(|e| {
+        panic!("{test}: the encoder-cache entry of a failed request cannot be read on another thread: {e}")
+    });
+    assert_eq!(
+        hits, 1,
+        "{test}: the second request must hit the failed request's entry"
+    );
+    assert_eq!(
+        Some(second),
+        oracle[1].as_ref().ok(),
+        "{test}: different tokens than the one-thread oracle"
+    );
+}
+
+#[test]
+#[ignore = "requires Metal GPU and the gemma-4-e2b snapshot; run with `make gpu-test`"]
+fn a_failed_image_request_leaves_a_gemma4_encoder_cache_entry_another_thread_can_read() {
+    assert_failed_request_cache_entry(
+        "a_failed_image_request_leaves_a_gemma4_encoder_cache_entry_another_thread_can_read",
+        GEMMA4_E2B,
+        256,
+    );
+}
+
+/// The Qwen3-VL path publishes its encoder output through `put_many`, not
+/// `get_or_compute`.
+#[test]
+#[ignore = "requires Metal GPU and the Qwen3-VL snapshot; run with `make gpu-test`"]
+fn a_failed_image_request_leaves_a_qwen3_vl_encoder_cache_entry_another_thread_can_read() {
+    assert_failed_request_cache_entry(
+        "a_failed_image_request_leaves_a_qwen3_vl_encoder_cache_entry_another_thread_can_read",
+        QWEN3_VL,
+        16,
     );
 }
 
