@@ -344,10 +344,44 @@ fn read_after_unevaluated_publish(
         release_rx.recv().ok();
     });
     written_rx.recv().expect("writer published");
-    let out = std::thread::spawn(read).join().expect("reader panicked");
+    let (read_tx, read_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        read_tx.send(read()).ok();
+    });
+    let out = read_within_limit(&read_rx).expect("reader panicked");
     release_tx.send(()).ok();
     writer.join().expect("writer panicked");
     out
+}
+
+/// The longest a cross-thread read may take. A cross-thread evaluation can wait
+/// forever instead of failing, and it holds the process-wide evaluation lock
+/// while it waits, so every later test of this binary would wait on it too.
+const READ_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What the reader sent, `None` when it panicked. Past [`READ_LIMIT`] the read
+/// is hung: name the test and end the process.
+#[allow(
+    clippy::exit,
+    clippy::print_stderr,
+    reason = "a hung evaluation cannot be stopped, and it holds the lock every later test needs"
+)]
+fn read_within_limit<T>(done: &std::sync::mpsc::Receiver<T>) -> Option<T> {
+    match done.recv_timeout(READ_LIMIT) {
+        Ok(value) => Some(value),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            let test = std::thread::current()
+                .name()
+                .unwrap_or("a multimodal_cache publish test")
+                .to_owned();
+            eprintln!(
+                "{test}: the cross-thread read did not finish within {READ_LIMIT:?}. It holds \
+                 the evaluation lock, so this test binary ends here."
+            );
+            std::process::exit(101);
+        }
+    }
 }
 
 /// A published entry must read on a thread that did not write it.

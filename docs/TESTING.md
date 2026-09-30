@@ -68,9 +68,10 @@ tokenizer, and mlx-community ships drafter snapshots without one. A download
 writes the JSON files before the shards, so a snapshot with no shard is a
 half-written one. The probe reads it as absent, and the test skips.
 
-The thread-boundary tests in `rmlx-server` cannot reach `common`, which is a
-module of the `rmlx-models` integration tests, so `thread_boundary/mod.rs` has
-its own resolver with the same rules for a root. It fails when
+`thread_boundary/mod.rs` in `rmlx-server` has its own resolver, because its
+snapshots do not fit the `common` probe: the Whisper snapshot ships
+`weights.npz` and no safetensors, and the Whisper tokenizer directory has no
+`config.json`. It has the same rules for a root. It fails when
 `RMLX_O_MODELS_ROOT` is set but is not a directory, and when the snapshot
 declares another identity than the test expects: `architectures[0]`, or
 `model_type` for a snapshot that names no architecture (Whisper, an MTP

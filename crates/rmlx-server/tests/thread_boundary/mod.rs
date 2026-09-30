@@ -42,20 +42,28 @@
 //! drafter test that the second thread ran draft rounds.
 //!
 //! The oracle cannot see a change that moves the one-thread output: both arms
-//! run the changed binary. The golden-token suites hold the one-thread tokens.
+//! run the changed binary. Other suites hold the one-thread output for some of
+//! the snapshots here: the golden-token suites of `rmlx-models` for Bonsai-8B,
+//! medgemma, Qwen3.6-35B and BitNet (gemma4 is held at e4b, not the e2b used
+//! here), the speculative equivalence pairs for the drafters, and
+//! `crates/rmlx-audio/tests/transcribe.rs` for Whisper. No suite holds
+//! ReaderLM-v2, Ternary-Bonsai-27B, gemma-4-e2b, gemma-4-12B, Qwen3-VL, jina-v4
+//! or TTS.
 //!
 //! A cross-thread evaluation can also wait forever in `mlx::core::synchronize`
-//! instead of failing. Each step after a hand-over therefore has a time limit,
-//! [`STEP_LIMIT`], and a hang fails the cell.
+//! instead of failing. The hung evaluation holds the process-wide evaluation
+//! lock, so every later cell in the same binary would wait on it. Each step
+//! after a hand-over therefore has a time limit, [`STEP_LIMIT`]: a hang fails
+//! the cell and ends its test binary.
 //!
 //! # Mutations and what catches them
 //!
 //! Measured on mlx 0.32.1 / mlx-c 0.6.0_4 unless stated:
 //!
 //! - Evaluate only the text-path load ops (the bf16 casts, the fused QKV, the
-//!   YARN scale): the Qwen3, Qwen3.5 and Qwen2 text cells turn green. The
-//!   BitNet text cell, the vision and audio cells and both jina-v4 cells stay
-//!   red.
+//!   YARN scale): the Qwen3 and Qwen3.5 text cells turn green. The Qwen2 text
+//!   cell is green before and after: its loader leaves no lazy op. The BitNet
+//!   text cell, the vision and audio cells and both jina-v4 cells stay red.
 //! - Make every safetensors tensor a lazy CPU op at load: every drafter cell,
 //!   the Qwen2 text cell and the unified-audio cell turn red. The per-request
 //!   cells of the in-request loaders and the cache cells stay green, which is
@@ -76,14 +84,25 @@
 //! - Remove the evaluation from every prompt-cache store: the prompt-cache
 //!   cells stay green at the default codec, because the decode evaluates the
 //!   stored arrays. Also make the stored copies lazy: the Qwen3, gemma4 and
-//!   BitNet prompt-cache cells turn red, and the Qwen2 cell hangs until its
-//!   step limit fails it.
+//!   BitNet prompt-cache cells turn red. The Qwen2 cell hangs, and its step
+//!   limit fails it and ends the binary before the next cell.
 //! - Bypass the Qwen MTP drafter (plain verifier decode): the Qwen MTP cell
 //!   turns red on its round count, not on its tokens.
+//! - Remove the stream guards from the TTS request closure: no observable. The
+//!   TTS cells already synthesize on threads that never call a guard, and they
+//!   pass, because MLX creates a thread's default streams on first use.
 //!
-//! Not caught by any cell: a lazy op on a load path that no local snapshot
-//! reaches, such as the zero router bias that a Laguna checkpoint without
-//! `e_score_correction_bias` gets.
+//! Not caught by any cell:
+//!
+//! - A lazy op on a load path that no local snapshot reaches, such as the zero
+//!   router bias that a Laguna checkpoint without `e_score_correction_bias`
+//!   gets.
+//! - A lazy packed store in a prompt-cache entry of a request that stops at
+//!   its first token (`max_tokens` 1, or a stop on the first token): no decode
+//!   step evaluates the store. The cells run the default codec for 24 tokens.
+//! - No measured mutation turns these cells red: the per-request Whisper and
+//!   TTS cells, and the Qwen3.5 MoE prompt-cache cell. They guard the same
+//!   hand-overs as their neighbours on other snapshots.
 
 #![allow(dead_code, unreachable_pub)]
 
@@ -116,9 +135,34 @@ pub const SPOKEN_TEXT: &str = "The capital of France is Paris.";
 pub const N_TOKENS: u32 = 24;
 
 /// The longest one step after a hand-over may take. A cross-thread evaluation
-/// can wait forever in `mlx::core::synchronize` instead of failing, and a hang
-/// must fail the cell rather than stop the suite.
+/// can wait forever in `mlx::core::synchronize` instead of failing.
 pub const STEP_LIMIT: Duration = Duration::from_secs(600);
+
+/// What a step past a hand-over sent, `None` when it panicked. Past
+/// [`STEP_LIMIT`] the step is hung: its thread holds the process-wide
+/// evaluation lock, so every later cell of this binary would wait on that lock
+/// forever. Name the cell and end the process.
+#[allow(
+    clippy::exit,
+    reason = "a hung evaluation cannot be stopped, and it holds the lock every later cell needs"
+)]
+fn within_step_limit<T>(done: &mpsc::Receiver<T>) -> Option<T> {
+    match done.recv_timeout(STEP_LIMIT) {
+        Ok(value) => Some(value),
+        Err(mpsc::RecvTimeoutError::Disconnected) => None,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let cell = std::thread::current()
+                .name()
+                .unwrap_or("a thread-boundary cell")
+                .to_owned();
+            eprintln!(
+                "{cell}: the step after the hand-over did not finish within {STEP_LIMIT:?}. \
+                 It holds the evaluation lock, so this test binary ends here."
+            );
+            std::process::exit(101);
+        }
+    }
+}
 
 // ── Snapshots ───────────────────────────────────────────────────────────────
 
@@ -289,9 +333,8 @@ where
     std::thread::spawn(move || {
         done_tx.send(second(state)).ok();
     });
-    let b = done_rx.recv_timeout(STEP_LIMIT).unwrap_or_else(|e| {
-        panic!("the step after the hand-over did not finish within {STEP_LIMIT:?}: {e}")
-    });
+    let b = within_step_limit(&done_rx)
+        .unwrap_or_else(|| panic!("the step after the hand-over panicked"));
     release_tx.send(()).ok();
     first_thread.join().expect("first thread panicked");
     (a, b)
@@ -430,25 +473,13 @@ pub fn serve(
             decode(rt.handle(), &generator, req)
         })
         .collect();
-    if out
-        .iter()
-        .any(|r| r.as_ref().is_err_and(|e| e.starts_with(TIMED_OUT)))
-    {
-        // A decode still waits on a pool thread; dropping the pools would wait for it.
-        pool.shutdown_background();
-        if let Some(second) = second_pool {
-            second.shutdown_background();
-        }
-    }
     drop(generator);
     drop(parked);
     out
 }
 
-const TIMED_OUT: &str = "the request did not finish within";
-
-/// Serve one request and collect its token ids, or an error after
-/// [`STEP_LIMIT`].
+/// Serve one request and collect its token ids. Past [`STEP_LIMIT`] the test
+/// binary ends, see [`within_step_limit`].
 fn decode(
     rt: &tokio::runtime::Handle,
     generator: &Arc<dyn Generator>,
@@ -467,9 +498,7 @@ fn decode(
         });
         done_tx.send(ids).ok();
     });
-    done_rx
-        .recv_timeout(STEP_LIMIT)
-        .unwrap_or_else(|_| Err(format!("{TIMED_OUT} {STEP_LIMIT:?}")))
+    within_step_limit(&done_rx).unwrap_or_else(|| Err("the request panicked".to_owned()))
 }
 
 /// Serve `requests` on one thread, then across `split`; the second arm must
