@@ -126,6 +126,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         check-gpu-device-census check-gpu-device-census-library \
         check-gpu-device-census-selftest \
         check-claim-bypass check-claim-bypass-selftest \
+        check-personal-data check-personal-data-selftest \
         check-kernel-dtype-contract check-kernel-dtype-contract-fixtures \
         check-metal-compiles check-metal-format
 
@@ -647,6 +648,12 @@ check-claim-bypass: ## CI gate: nothing in the tree deletes the Metal claim, nam
 check-claim-bypass-selftest: ## CI gate: recall test for the above, each case asserting the rule and file:line or the reason as well as the exit code
 	@bash scripts/check_claim_bypass_selftest.sh
 
+check-personal-data: ## CI gate: no personal email address, home or per-user temp path, or assistant session link in any file git does not ignore
+	@bash scripts/check_personal_data.sh
+
+check-personal-data-selftest: ## CI gate: recall test for the above, each case asserting the rule and file:line or the reason as well as the exit code
+	@bash scripts/check_personal_data_selftest.sh
+
 check-kernel-dtype-contract: ## CI gate: fail if a Metal-kernel dispatcher returns its declared-f32 output without restoring a caller dtype (promotes the whole decode graph)
 	@bash scripts/check_kernel_dtype_contract.sh
 
@@ -705,6 +712,8 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_gpu_device_census_selftest.sh
 	@bash scripts/check_claim_bypass.sh
 	@bash scripts/check_claim_bypass_selftest.sh
+	@bash scripts/check_personal_data.sh
+	@bash scripts/check_personal_data_selftest.sh
 	@bash scripts/check_kernel_dtype_contract.sh
 	@bash scripts/check_kernel_dtype_contract_fixtures.sh
 	@bash scripts/perf_ab_selftest.sh
@@ -743,8 +752,8 @@ release-cpu-selftest: ## CI gate: recall test for the release tarball's target-C
 release-sha:     ## print sha256 of the v<ver> GitHub source tarball (append --write to patch the formula)
 	bash scripts/release/source_sha256.sh
 
-release-sign:    ## keyless cosign-sign dist/rmlx-v<ver>-...tar.gz -> .cosign.bundle (needs cosign + browser OIDC)
-	bash scripts/release/sign_artifact.sh
+release-sign:    ## cosign-sign dist/rmlx-v<ver>-...tar.gz with the maintainer key pair -> .cosign.bundle (KEY=<path>; default ~/.config/rmlx/cosign.key; prompts for the key password)
+	bash scripts/release/sign_artifact.sh $(KEY)
 
 bottle:          ## build a Homebrew bottle from the installed rmlx keg (run after brew install --build-bottle)
 	bash scripts/release/build_bottle.sh

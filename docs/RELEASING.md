@@ -111,10 +111,17 @@ bypass — the ruleset's target is `main` alone, so a tag ref is outside it.
      dist/rmlx-v<version>-aarch64-apple-darwin.tar.gz.sha256
    ```
 7. **Sign.** `make release-sign` writes
-   `dist/rmlx-v<version>-aarch64-apple-darwin.tar.gz.cosign.bundle`.
-   It is a keyless cosign signature and opens a browser OIDC login.
-   Upload it with `gh release upload`. The `.sha256` alone is self-attested;
-   the bundle ties the tarball to the signer's identity and the Rekor log.
+   `dist/rmlx-v<version>-aarch64-apple-darwin.tar.gz.cosign.bundle` with the
+   maintainer's cosign key pair and checks it against `cosign.pub` before
+   keeping it. Upload it with `gh release upload`. The `.sha256` alone is
+   self-attested; the bundle ties the tarball to the published key and the
+   Rekor log.
+   - The private key lives outside the repository, encrypted with its
+     password; `KEY=<path>` names it (default `~/.config/rmlx/cosign.key`).
+     cosign prompts for the password, so run this step in a terminal.
+   - Releases up to 0.4.1 were signed keyless. Keyless signing with a
+     personal OIDC login writes the signer's email into the bundle's
+     certificate and into the public Rekor log, which is why it is not used.
 8. **Formula.** `make release-sha` prints the sha256 of the `v<version>`
    source archive. `bash scripts/release/source_sha256.sh --write` also
    patches `url` and `sha256` in `packaging/homebrew/rmlx.rb`.
@@ -173,16 +180,14 @@ tar xzf rmlx-v<version>-aarch64-apple-darwin.tar.gz
 ./rmlx-v<version>-aarch64-apple-darwin/rmlx --version
 ```
 
-Signature:
+Signature, against the `cosign.pub` at the repository root:
 
 ```sh
 gh release download v<version> -p '*.cosign.bundle'
-cosign verify-blob \
+curl -fsSLO https://raw.githubusercontent.com/Pushkinist/rMLX/main/cosign.pub
+cosign verify-blob --key cosign.pub \
   --bundle rmlx-v<version>-aarch64-apple-darwin.tar.gz.cosign.bundle \
-  --certificate-identity <maintainer-oidc-email> \
-  --certificate-oidc-issuer <issuer-url> \
   rmlx-v<version>-aarch64-apple-darwin.tar.gz
-# issuer: GitHub https://github.com/login/oauth · Google https://accounts.google.com
 ```
 
 Homebrew. Homebrew refuses a formula from an untrusted third-party tap, so
@@ -351,6 +356,7 @@ git worktree remove ../rmlx-retro-new
 | `scripts/release/release_cpu.py` | The tarball's rustflags, and the check of its target CPU |
 | `scripts/release/release_cpu_selftest.sh` | `make release-cpu-selftest` |
 | `scripts/release/sign_artifact.sh` | `make release-sign` |
+| `cosign.pub` | The public half of the release signing key |
 | `scripts/release/source_sha256.sh` | `make release-sha`; `--write` patches the formula |
 | `scripts/release/sync_tap.sh` | `make tap-sync` |
 | `scripts/release/changelog_section.sh` | Prints one version's changelog section |
