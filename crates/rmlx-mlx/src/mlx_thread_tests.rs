@@ -116,6 +116,31 @@ fn a_panic_on_the_mlx_thread_reaches_the_caller_and_the_thread_goes_on() {
     );
 }
 
+/// MLX builds some ops inside other ops on the default stream of the building
+/// thread, not on the stream the caller passed. After one op, the default
+/// stream of a thread must be the MLX thread's stream.
+#[test]
+fn a_thread_that_built_an_op_defaults_to_the_mlx_threads_stream() {
+    let same = std::thread::spawn(|| {
+        drop(lazy_sum(Device::Cpu));
+        let mlx = stream(Device::Cpu).unwrap();
+        // SAFETY: a new reference to this thread's default CPU stream, freed
+        // below; `mlx` lives for the process.
+        unsafe {
+            let default = sys::mlx_default_cpu_stream_new();
+            let same = sys::mlx_stream_equal(default, mlx);
+            sys::mlx_stream_free(default);
+            same
+        }
+    })
+    .join()
+    .unwrap();
+    assert!(
+        same,
+        "an op MLX builds on this thread's default stream would not evaluate on the MLX thread"
+    );
+}
+
 /// Every `sys::` call whose name holds `stream` in a non-test source file of
 /// this crate. Only `mlx_thread.rs` may make one: a stream from anywhere else
 /// is a stream of the calling thread, and an op built on it evaluates only

@@ -9,10 +9,12 @@
 //! no Stream(cpu, N) in current thread."), or waits forever.
 //!
 //! This thread creates one CPU stream and one GPU stream. [`crate::with_stream`]
-//! builds every op, on every thread, on one of the two, and
-//! [`crate::with_eval_lock`] runs every evaluation here. So an array built on
-//! any thread evaluates from any thread, and no loader, cache or request path
-//! has to evaluate its arrays before another thread uses them.
+//! builds every op, on every thread, on one of the two, and makes them the
+//! default streams of the building thread too, because MLX builds some ops
+//! inside other ops on the default stream. [`crate::with_eval_lock`] runs every
+//! evaluation here. So an array built on any thread evaluates from any thread,
+//! and no loader, cache or request path has to evaluate its arrays before
+//! another thread uses them.
 //!
 //! Only this module gets a stream from mlx-c:
 //! `every_stream_comes_from_the_mlx_thread` fails on a stream call in any
@@ -25,12 +27,15 @@ use std::sync::OnceLock;
 
 use rmlx_core::error::{Error, Result};
 
-use crate::{sys, Device, LAST_ERROR};
+use crate::{check_status, sys, Device, LAST_ERROR};
 
 type Job = Box<dyn FnOnce() + Send>;
 
 thread_local! {
     static ON_MLX_THREAD: Cell<bool> = const { Cell::new(false) };
+    /// Per device (CPU, GPU): the default stream of this thread is already the
+    /// MLX thread's stream.
+    static DEFAULTS_SET: Cell<[bool; 2]> = const { Cell::new([false; 2]) };
 }
 
 /// A stream of the MLX thread. The handle is never freed: MLX keeps a stream
@@ -100,16 +105,44 @@ pub(crate) fn run<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
 }
 
 /// The MLX thread's stream for `device`, created on the MLX thread at first
-/// use.
+/// use. It also makes each stream the MLX thread has the default stream of the
+/// calling thread.
 pub(crate) fn stream(device: Device) -> Result<sys::mlx_stream> {
     let cell = match device {
         Device::Cpu => &CPU_STREAM,
         Device::Gpu => &GPU_STREAM,
     };
-    if let Some(stream) = cell.get() {
-        return Ok(stream.0);
+    let stream = match cell.get() {
+        Some(stream) => stream.0,
+        None => run(move || default_stream(device, cell))??.0,
+    };
+    set_thread_defaults()?;
+    Ok(stream)
+}
+
+/// Make each stream the MLX thread has the default stream of the calling
+/// thread, once per thread and device. A device without a stream yet gets it
+/// at a later call, after its first op creates the stream.
+fn set_thread_defaults() -> Result<()> {
+    if ON_MLX_THREAD.with(Cell::get) {
+        return Ok(());
     }
-    run(move || default_stream(device, cell))?.map(|stream| stream.0)
+    let mut set = DEFAULTS_SET.with(Cell::get);
+    if set == [true; 2] {
+        return Ok(());
+    }
+    for (done, cell) in set.iter_mut().zip([&CPU_STREAM, &GPU_STREAM]) {
+        if let (false, Some(stream)) = (*done, cell.get()) {
+            // SAFETY: the handle is valid for the life of the process; MLX
+            // copies the stream value into this thread's default slot.
+            let status = unsafe { sys::mlx_set_default_stream(stream.0) };
+            // SAFETY: called immediately after the C function on this thread.
+            unsafe { check_status(status, "mlx_set_default_stream") }?;
+            *done = true;
+        }
+    }
+    DEFAULTS_SET.with(|cell| cell.set(set));
+    Ok(())
 }
 
 /// Only the MLX thread calls this, so no other thread can set `cell` first.
