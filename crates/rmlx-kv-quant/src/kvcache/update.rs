@@ -1549,14 +1549,11 @@ impl KvCache {
     }
 
     /// Materialize all GPU `Array` buffers this cache holds to host-readable
-    /// memory, on the **calling** thread.
+    /// memory.
     ///
     /// Called on the inference thread by the spill sink right after the
-    /// refcount-clone, so that the background spill drain thread (which has no
-    /// access to the Metal stream that built these arrays) can serialize the
-    /// already-evaluated bytes without re-evaluating the lazy graph. Without
-    /// this, the drain thread's serialize fails with
-    /// `There is no Stream(gpu, N) in current thread`.
+    /// refcount-clone, so that the background spill drain thread serializes
+    /// already-evaluated bytes and does not run the lazy graph.
     pub fn eval_for_spill(&self) -> Result<()> {
         // `eval_gpu_state` evaluates the GPU arrays of the store slots, the
         // rotating ring and the decode_fp16/prefill_raw scratch. It does not

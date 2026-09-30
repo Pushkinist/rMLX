@@ -83,11 +83,6 @@ fn run_whisper(args: &TranscribeArgs, device: Device) -> Result<String> {
         "rmlx transcribe (whisper)"
     );
 
-    rmlx_mlx::ensure_cpu_default_stream();
-    if device != Device::Cpu {
-        rmlx_mlx::ensure_gpu_default_stream()?;
-    }
-
     let model = WhisperModel::load(args.model).context("load whisper model")?;
     let tokenizer = WhisperTokenizer::from_path(tok_dir).with_context(|| {
         format!(

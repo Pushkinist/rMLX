@@ -390,16 +390,6 @@ pub(crate) fn run_qwen3vl_image(
     mm_cache: Option<&rmlx_models::multimodal_cache::MultimodalCache>,
     model_sig: u64,
 ) -> rmlx_core::Result<Vec<rmlx_models::ProbeStep>> {
-    // Registering a thread-local GPU stream + CommandEncoder once per thread entry point.
-    // tokio blocking-pool threads start with no GPU stream context; MLX's array
-    // materialisation then fails with "There is no Stream(gpu, 0) in current thread".
-    // The ViT pass and decode below both materialise arrays on this thread; zero ML-semantic effect.
-    // The CPU stream is registered unconditionally (thread-local since MLX 0.31/0.32).
-    rmlx_mlx::ensure_cpu_default_stream();
-    if device == rmlx_mlx::Device::Gpu {
-        rmlx_mlx::ensure_gpu_default_stream()?;
-    }
-
     let (vision, processor) = match vb {
         VisionBundle::Qwen3VlMoe { vision, processor } => (vision, processor),
         _ => {

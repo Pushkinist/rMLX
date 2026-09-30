@@ -63,6 +63,7 @@ fn cpu_device_forbids_gpu_ops() {
     );
 }
 
+// gpu-test-gate: exempt  the latch refuses the GPU stream before any FFI call.
 #[test]
 #[ignore = "child process; its parent test starts it with a marker argument"]
 fn cpu_device_forbids_gpu_ops_child() {
@@ -72,7 +73,8 @@ fn cpu_device_forbids_gpu_ops_child() {
     let cpu = parse_device("cpu").expect("cpu parses");
     assert!(!cpu.holds_claim());
     assert!(rmlx_mlx::gpu_forbidden(), "--device cpu arms the latch");
-    match rmlx_mlx::ensure_gpu_default_stream() {
+    let one = rmlx_mlx::Array::from_f32_slice(&[1.0], &[1]).expect("a host array");
+    match rmlx_mlx::add(&one, &one, Device::Gpu) {
         Err(rmlx_core::error::Error::GpuForbidden { .. }) => {}
         other => panic!("a GPU stream under --device cpu: {other:?}"),
     }

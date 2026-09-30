@@ -55,45 +55,6 @@ fn add_two_f32_arrays_gpu() {
     assert_eq!(out, vec![2.0f32, 4.0, 6.0, 8.0]);
 }
 
-/// Smoke test for the blocking-thread GPU stream guard.
-///
-/// The generate entry points call `ensure_gpu_default_stream()` once at the
-/// top of each tokio blocking-pool worker so MLX's per-thread CommandEncoder
-/// map has a registered encoder before any `Array::eval()`. This test
-/// runs that exact sequence on a freshly-spawned OS thread (the analog of a
-/// blocking-pool worker that never called `mlx::core::new_stream`): establish
-/// the stream, then materialise a GPU array.
-///
-/// Note: this asserts the guard is safe + idempotent off a worker thread and
-/// that GPU eval succeeds there. It is NOT a strict negative regression — the
-/// "no Stream(gpu, 0)" eval failure is MLX-version- and timing-dependent
-/// (recent mlx-c may lazily register the encoder for the global default stream
-/// on first access), so a bare fresh-thread eval does not reliably fault. The
-/// real cross-path proof is a live serve exercising the speculative / image
-/// generate paths.
-#[test]
-#[ignore = "requires Metal GPU; run with `-- --ignored` in a GPU-capable environment"]
-fn gpu_default_stream_guard_idempotent_on_worker_thread() {
-    let handle = std::thread::spawn(|| {
-        // Establish the GPU default stream for THIS thread, exactly as the
-        // blocking-thread generate entry points do before any materialisation.
-        ensure_gpu_default_stream().unwrap();
-        // Idempotent: a second call from the same thread is a no-op.
-        ensure_gpu_default_stream().unwrap();
-
-        let input: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
-        let bytes = f32_as_bytes(&input);
-        let shape = [2i32, 2];
-        let a = Array::from_bytes(bytes, &shape, Dtype::F32).unwrap();
-        let b = Array::from_bytes(bytes, &shape, Dtype::F32).unwrap();
-        let c = add(&a, &b, Device::Gpu).unwrap();
-        c.eval().unwrap();
-        bytes_to_f32(&c.to_bytes().unwrap())
-    });
-    let out = handle.join().expect("worker thread panicked");
-    assert_eq!(out, vec![2.0f32, 4.0, 6.0, 8.0]);
-}
-
 #[test]
 fn from_bytes_wrong_size_is_err() {
     let result = Array::from_bytes(&[0u8; 3], &[2, 2], Dtype::F32);
@@ -644,126 +605,6 @@ fn mk(v: &[f32]) -> Array {
     Array::from_bytes(f32_as_bytes(v), &[v.len() as i32], Dtype::F32).unwrap()
 }
 
-/// The CPU analog of `gpu_default_stream_guard_idempotent_on_worker_thread`.
-///
-/// A tokio blocking-pool worker starts with no MLX stream context. On the
-/// linked MLX the default CPU/GPU streams and the CPU command encoders are per
-/// thread, so the generation entry points call `ensure_cpu_default_stream`
-/// (and its GPU sibling) once per worker before building/evaluating any graph.
-/// This runs that exact sequence on a freshly-spawned OS thread — the analog of
-/// a blocking-pool worker — and asserts the guard is safe + idempotent and that
-/// a CPU op *built and evaluated on that worker* succeeds.
-///
-/// Note (documented truth): this guard registers the *worker's own* default CPU
-/// stream. It makes worker-built graphs eval cleanly, but it does NOT let a
-/// worker evaluate an array whose ops were built on a *different* thread — that
-/// is an upstream MLX limitation (streams from `new_stream` are usable only on
-/// their thread of creation; see `cross_thread_cpu_eval_throws_and_same_thread_eval_succeeds`).
-#[test]
-fn cpu_default_stream_guard_idempotent_on_worker_thread() {
-    let out = std::thread::spawn(|| {
-        // Establish the worker's default CPU stream, exactly as the generate
-        // entry points do before any materialisation.
-        ensure_cpu_default_stream();
-        // Idempotent: a second call from the same thread is a no-op.
-        ensure_cpu_default_stream();
-
-        // Build AND evaluate on this worker thread — the safe, supported path.
-        let c = add(
-            &mk(&[1.0, 2.0, 3.0, 4.0]),
-            &mk(&[1.0, 2.0, 3.0, 4.0]),
-            Device::Cpu,
-        )
-        .unwrap();
-        c.eval().unwrap();
-        bytes_to_f32(&c.to_bytes().unwrap())
-    })
-    .join()
-    .expect("worker thread panicked");
-    assert_eq!(out, vec![2.0f32, 4.0, 6.0, 8.0]);
-}
-
-/// CI-runnable, GPU-free negative control isolating the **CPU guard alone**
-/// (never calls `ensure_gpu_default_stream`) on a **scale-reduction** shaped
-/// CPU pipeline — `square → max-reduce → divide` — the same op shape as the
-/// K8V8 `exit_prefill` scale computation (`abs_max` reduction, then
-/// `scale = abs_max / 127`) that this fix targets, so a pass here cannot be
-/// explained away by the GPU guard mattering instead of the CPU one.
-///
-/// Honest scope note: MLX's own `default_stream(Device)` lazily self-registers
-/// a fresh per-thread stream + `CommandEncoder` on first use
-/// (`mlx/stream.cpp::default_stream` → `new_stream` → `cpu::new_stream`), so a
-/// worker thread that **builds and evaluates its own graph** already succeeds
-/// without any guard call — confirmed empirically (this exact op shape run
-/// with no guard on a spawned worker also passes). A true
-/// "faults-without-guard, succeeds-with-guard" negative control is therefore
-/// not constructible for this same-thread shape: the only fault class this fix
-/// addresses is genuinely cross-thread (an array built on one thread, eval'd on
-/// another — see `cross_thread_cpu_eval_throws_and_same_thread_eval_succeeds`, which the
-/// guard does **not** cure either, since it registers the eval thread's *own*
-/// stream, not the foreign one). What this test *does* prove, CI-runnably and
-/// without any GPU dependency: the CPU guard alone (no GPU guard in the call
-/// path) is sufficient for a worker thread to build and evaluate a
-/// reduction-shaped CPU graph — the exact shape `exit_prefill` needs.
-#[test]
-fn cpu_guard_alone_handles_scale_reduction_on_worker_thread() {
-    let out = std::thread::spawn(|| {
-        // CPU guard only — deliberately no `ensure_gpu_default_stream()` call
-        // anywhere in this thread, so a pass cannot be attributed to the GPU
-        // guard.
-        ensure_cpu_default_stream();
-
-        // square → max-reduce → divide: the same op shape as the K8V8
-        // exit_prefill scale computation (abs_max reduction, then
-        // scale = abs_max / divisor), built AND evaluated on this worker.
-        let x = mk(&[1.0, -3.0, 2.0, -4.0]);
-        let squared = multiply(&x, &x, Device::Cpu).unwrap();
-        let reduced = max_axis(&squared, 0, Device::Cpu).unwrap(); // scalar: 16.0
-        let divisor = mk(&[2.0]);
-        let scale = divide(&reduced, &divisor, Device::Cpu).unwrap();
-        scale.eval().unwrap();
-        bytes_to_f32(&scale.to_bytes().unwrap())
-    })
-    .join()
-    .expect("worker thread panicked");
-    assert_eq!(out, vec![8.0f32]);
-}
-
-/// Executable statement of how the linked MLX resolves a CPU stream: through
-/// the command-encoder map of the evaluating thread (`mlx/backend/cpu/encoder.cpp`
-/// in mlx 0.32.x). An array built on one thread carries that thread's default
-/// CPU stream, and another thread that evaluates it throws
-/// "There is no Stream(cpu, N) in current thread.".
-///
-/// The positive control builds the same graph and evaluates it on the thread
-/// that built it, so the failure comes from the thread boundary and not from
-/// the op. `ensure_cpu_default_stream` does not change this: it registers the
-/// evaluating thread's own stream, not the stream the graph carries.
-#[test]
-fn cross_thread_cpu_eval_throws_and_same_thread_eval_succeeds() {
-    let same = add(&mk(&[1.0, 2.0]), &mk(&[3.0, 4.0]), Device::Cpu).unwrap();
-    same.eval().unwrap();
-    assert_eq!(bytes_to_f32(&same.to_bytes().unwrap()), vec![4.0f32, 6.0]);
-
-    let foreign = add(&mk(&[1.0, 2.0]), &mk(&[3.0, 4.0]), Device::Cpu).unwrap();
-    let result = std::thread::spawn(move || {
-        ensure_cpu_default_stream();
-        foreign.eval().map_err(|e| format!("{e}"))
-    })
-    .join()
-    .expect("worker thread panicked");
-
-    let err = result.expect_err(
-        "an array built on another thread evaluated here: the CPU encoder map is \
-         not per thread on the linked MLX. Recheck ensure_cpu_default_stream and \
-         the evaluation lock against it.",
-    );
-    assert!(
-        err.contains("There is no Stream(cpu,"),
-        "cross-thread eval failed for another reason: {err}"
-    );
-}
-
 /// The deterministic half of the evaluation-lock gate: `with_eval_lock` really
 /// does exclude.
 ///
@@ -801,7 +642,8 @@ fn with_eval_lock_serialises_concurrent_callers() {
                 if !OCCUPIED.swap(false, Ordering::SeqCst) {
                     OVERLAPS.fetch_add(1, Ordering::SeqCst);
                 }
-            });
+            })
+            .expect("the MLX thread runs the section");
         }
     };
 

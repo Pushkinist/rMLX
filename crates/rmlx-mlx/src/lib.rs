@@ -1,7 +1,7 @@
 // LOC-exempt: crate root of the mlx-c wrapper. `Array` — the owned handle every
 // other module in the workspace passes around — is inseparable from the
 // crate-private FFI plumbing it calls on every op: the thread-local error
-// capture behind `check_status`, the process-global default-stream helper, the
+// capture behind `check_status`, the stream helper, the
 // quant-mode CString cache, and the null-handle sentinel for optional
 // arguments. Splitting `Array` out would export that plumbing across a module
 // boundary purely to move lines, with no reader benefit.
@@ -45,6 +45,8 @@ pub mod compile;
 #[cfg(feature = "metal-capture")]
 pub mod metal_capture;
 pub mod metal_kernel;
+/// The one thread that owns the streams every op is built on, and evaluates.
+mod mlx_thread;
 mod nax;
 /// Whether the MLX this process loaded is the pair rMLX is validated against.
 mod pin;
@@ -83,22 +85,19 @@ thread_local! {
 // Evaluation serialisation
 // ---------------------------------------------------------------------------
 //
-// This crate funnels every MLX evaluation through one process-wide lock.
+// This crate funnels every MLX evaluation through one process-wide lock, on
+// one thread: `with_eval_lock` runs the call on the MLX thread
+// (`mlx_thread.rs`), and takes the lock there.
 //
-// On the linked MLX (0.32.x) the CPU and GPU command encoders are per thread:
-// `mlx/backend/cpu/encoder.cpp::get_command_encoder` looks a stream up in the
-// evaluating thread's own map, then in a global map that only
-// `new_thread_unsafe_stream` fills (rMLX calls none), and throws for any other
-// stream. So no encoder map is shared between threads. MLX does not document
-// concurrent evaluation from two threads as safe, no measurement here shows it
-// safe or unsafe, and rMLX does not need it: inference runs one request at a
-// time. The lock makes serial evaluation a property of this crate, not an
-// assumption, and the gates below keep every evaluating FFI call under it.
+// MLX finds the command encoder of a stream only in the thread that created
+// the stream (`mlx/backend/cpu/encoder.cpp` from MLX 0.32, the Metal device on
+// every MLX), so every op is built on a stream of the MLX thread and every
+// evaluation runs there. The lock is kept as a second guard: it makes serial
+// evaluation a property of this crate even if evaluation leaves that thread,
+// and the gates below keep every evaluating FFI call under it.
 //
-// Cost is one uncontended mutex acquire + release per evaluation — a CAS and a
-// release store, tens of nanoseconds — against an FFI call that walks a graph
-// and dispatches work in microseconds or more. rMLX runs inference on one
-// thread at a time by design, so the lock is not a throughput bottleneck.
+// Cost is one uncontended mutex acquire + release per evaluation, plus the
+// hand-over to the MLX thread when the caller is another thread.
 //
 // **Which C entry points need it.** Not just the eval-named ones: every mlx-c
 // function that reaches `mlx::core::eval_impl` evaluates. The set is
@@ -134,7 +133,7 @@ thread_local! {
 // `Closure::apply` takes it too, so applying one compiled closure from inside
 // another's body deadlocks without calling `eval` anywhere. That is only a live
 // question for `mlx_closure_apply`, which invokes a Rust closure body on the
-// calling thread while the lock is held. No body does it today and the gate's
+// MLX thread while the lock is held. No body does it today and the gate's
 // RULE 3 enforces it; see `Closure::apply`.
 static EVAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -163,11 +162,22 @@ static EVAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 ///
 /// Recovering from `PoisonError` rather than propagating it keeps that
 /// unreachable state from turning a later evaluation into a spurious failure.
-pub(crate) fn with_eval_lock<T>(f: impl FnOnce() -> T) -> T {
-    let _guard = EVAL_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    f()
+///
+/// `f` runs on the MLX thread, which owns the streams every op is built on. The
+/// mlx-c error message it leaves there moves to the calling thread, so
+/// `check_status` after this call reads it.
+///
+/// # Errors
+/// An error when the MLX thread cannot start or has stopped; `f` did not run.
+pub(crate) fn with_eval_lock<T: Send + 'static>(
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T> {
+    mlx_thread::run(move || {
+        let _guard = EVAL_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f()
+    })
 }
 
 /// Install the thread-local error handler. Called once per process, lazily.
@@ -381,209 +391,19 @@ fn check_gpu_allowed(op: &'static str) -> Result<()> {
     Ok(())
 }
 
-/// Borrow the process-global default stream for `device`, call `f(stream)`,
-/// release the handle, and return the result.
-///
-/// All ops that need a stream use this helper to avoid repeating the boilerplate.
+/// Call `f` with the stream for `device` that every op is built on: a stream
+/// of the MLX thread (`mlx_thread.rs`). An op built on it evaluates from any
+/// thread, because every evaluation runs on the MLX thread.
 ///
 /// # Errors
 /// [`Error::GpuForbidden`] for the GPU device after [`forbid_gpu`]; `f` is not
-/// called and no stream is requested.
-///
-/// # Safety
-/// `f` must not store the stream handle past the duration of the call.
-pub(crate) unsafe fn with_stream<T>(
-    device: Device,
-    f: impl FnOnce(sys::mlx_stream) -> T,
-) -> Result<T> {
-    // Obtain a reference-counted handle to the existing default stream.
-    // This does NOT spawn a new thread — the stream already owns its thread.
-    let stream = match device {
-        Device::Cpu => unsafe { sys::mlx_default_cpu_stream_new() },
-        Device::Gpu => {
-            check_gpu_allowed("GPU stream")?;
-            unsafe { sys::mlx_default_gpu_stream_new() }
-        }
-    };
-    let result = f(stream);
-    // Release our ref-count handle. The stream itself stays alive (process lifetime).
-    // SAFETY: stream is a valid handle obtained just above.
-    unsafe { sys::mlx_stream_free(stream) };
-    Ok(result)
-}
-
-/// Ensure a GPU stream with a Metal command encoder is registered as the
-/// default stream for the **calling thread**.
-///
-/// MLX's `eval.cpp::eval_impl` calls `metal::get_command_encoder(stream)`
-/// on the **calling thread**. That function looks up a thread-local map of
-/// `{stream_index → CommandEncoder}`.  The entry for a given stream index
-/// is created only when `mlx::core::new_stream` (which calls
-/// `metal::new_stream`) is called on that thread.  Tokio blocking-pool
-/// threads never call `new_stream`, so any `Array::eval()` on them fails
-/// with "There is no Stream(gpu, N) in current thread."
-///
-/// This function:
-///   1. Creates a new GPU stream via `mlx_stream_new_device` — which calls
-///      `mlx::core::new_stream` → `metal::new_stream` on the calling thread,
-///      registering a fresh `CommandEncoder` in the thread-local map.
-///   2. Sets the new stream as the calling thread's default so that all
-///      subsequent `with_stream(Device::Gpu, …)` calls return it.
-///   3. Stores the handle in a thread-local so it lives for the thread's
-///      lifetime (do NOT free — that would drop the CommandEncoder).
-///
-/// Idempotent — subsequent calls from the same thread are no-ops.
-///
-/// No-op if the GPU device is unavailable.
-///
-/// # Errors
-/// [`Error::GpuForbidden`] after [`forbid_gpu`]; no stream is created.
-pub fn ensure_gpu_default_stream() -> Result<()> {
-    check_gpu_allowed("ensure_gpu_default_stream")?;
-    // Thread-local storage: init flag + stream handle.
-    // The handle is held for the thread's lifetime so the CommandEncoder
-    // entry in the thread-local encoders map stays alive.
-    thread_local! {
-        static GPU_STREAM_INIT: Cell<bool> = const { Cell::new(false) };
-        // The mlx_stream handle keeps the stream and its CommandEncoder alive.
-        // Intentionally leaked on thread exit — each leaked handle is also an
-        // MLX-internal OS thread. This is only safe because callers bound the
-        // set of distinct threads that ever run this: `rmlx serve` builds its
-        // tokio runtime with a capped `max_blocking_threads` and a long
-        // `thread_keep_alive` (see `crates/rmlx-cli/src/commands/serve.rs`)
-        // so the blocking pool's worker threads are reused, not
-        // idle-reaped-and-replaced — the cumulative leak is bounded by that
-        // cap, not merely "these threads are long-lived."
-        static GPU_STREAM_HANDLE: Cell<sys::mlx_stream> =
-            const { Cell::new(sys::mlx_stream { ctx: ptr::null_mut() }) };
+/// called and no stream is requested. An error when the MLX thread cannot
+/// start.
+pub(crate) fn with_stream<T>(device: Device, f: impl FnOnce(sys::mlx_stream) -> T) -> Result<T> {
+    if device == Device::Gpu {
+        check_gpu_allowed("GPU stream")?;
     }
-
-    if GPU_STREAM_INIT.with(Cell::get) {
-        return Ok(());
-    }
-
-    // SAFETY:
-    // - mlx_device_new_type(MLX_GPU, 0): creates a handle to the GPU device.
-    //   Always succeeds on Apple Silicon; ctx is non-null on success.
-    // - mlx_stream_new_device(gpu_dev): calls mlx::core::new_stream which
-    //   calls metal::new_stream on the calling thread, registering a new
-    //   CommandEncoder in the calling thread's thread-local encoder map.
-    //   Returns a ref-counted handle to the new stream.
-    // - mlx_set_default_stream(stream): stores Stream(gpu, N) as the
-    //   calling thread's default.  All subsequent mlx_default_gpu_stream_new()
-    //   calls on this thread will return Stream(gpu, N).
-    // - mlx_device_free: releases the temporary device handle; the stream
-    //   retains a reference to the underlying device.
-    // - We store the stream handle in GPU_STREAM_HANDLE and do NOT call
-    //   mlx_stream_free — the CommandEncoder entry stays alive as long as
-    //   the handle is alive.
-    unsafe {
-        let gpu_dev = sys::mlx_device_new_type(sys::mlx_device_type_::MLX_GPU, 0);
-        if gpu_dev.ctx.is_null() {
-            return Ok(());
-        }
-        let stream = sys::mlx_stream_new_device(gpu_dev);
-        let _ = sys::mlx_device_free(gpu_dev);
-
-        if stream.ctx.is_null() {
-            return Ok(());
-        }
-
-        let _ = sys::mlx_set_default_stream(stream);
-
-        // Store the handle; do NOT call mlx_stream_free.
-        GPU_STREAM_HANDLE.with(|cell| cell.set(stream));
-        GPU_STREAM_INIT.with(|cell| cell.set(true));
-    }
-    Ok(())
-}
-
-/// Ensure a CPU stream is registered as the default stream for the **calling
-/// thread**, so any `Array::eval()` that schedules work on the CPU stream from
-/// this thread finds a registered command encoder.
-///
-/// This is the CPU analog of [`ensure_gpu_default_stream`]. On the linked MLX
-/// (0.32.x) the default CPU/GPU streams are per thread
-/// (`mlx/stream.cpp`), and so are the CPU command encoders
-/// (`mlx/backend/cpu/encoder.cpp`): an evaluation looks its stream up in the
-/// evaluating thread's map and throws
-/// "There is no Stream(cpu, N) in current thread." for a stream it does not
-/// find. That happens on paths like the K8V8 `exit_prefill` quantization, whose
-/// reduction MLX evaluates on the CPU stream even when the model forward runs
-/// on the GPU device.
-///
-/// This guard registers the calling thread's own default CPU stream. It does
-/// not make an array built on another thread evaluable here: that array
-/// carries the other thread's stream, and the lookup still throws
-/// (`cross_thread_cpu_eval_throws_and_same_thread_eval_succeeds`).
-///
-/// The mechanism mirrors the GPU guard:
-///   1. Create a fresh CPU stream via `mlx_stream_new_device` — which calls
-///      `mlx::core::new_stream`, allocating a new stream index.
-///   2. Set it as the calling thread's default CPU stream so every subsequent
-///      `default_stream(cpu)` / `with_stream(Device::Cpu, …)` on this thread
-///      resolves to it.
-///   3. Store the handle in a thread-local for the thread's lifetime (do NOT
-///      free — that would drop the stream and its encoder entry).
-///
-/// Idempotent — subsequent calls from the same thread are no-ops.
-///
-/// Note the cost this shares with MLX's own lazy path: a stream index is
-/// per-thread and never reclaimed, and MLX backs each one with an OS thread of
-/// its own, so both grow with the number of distinct threads that ever
-/// evaluate.
-pub fn ensure_cpu_default_stream() {
-    // Thread-local storage: init flag + stream handle. The handle is held for
-    // the thread's lifetime so the stream, and the encoder-map entry keyed on
-    // it, stay alive — intentionally leaked on thread exit, same
-    // tradeoff and same bound as `ensure_gpu_default_stream` above: this is
-    // only safe because the tokio blocking pool this guards is capped
-    // (`max_blocking_threads`) and kept warm (`thread_keep_alive`) by
-    // `rmlx serve`, so the cumulative leak is bounded by that cap rather than
-    // relying on the workers simply being long-lived.
-    thread_local! {
-        static CPU_STREAM_INIT: Cell<bool> = const { Cell::new(false) };
-        static CPU_STREAM_HANDLE: Cell<sys::mlx_stream> =
-            const { Cell::new(sys::mlx_stream { ctx: ptr::null_mut() }) };
-    }
-
-    if CPU_STREAM_INIT.with(Cell::get) {
-        return;
-    }
-
-    // SAFETY: mirror of ensure_gpu_default_stream for the CPU device.
-    // - mlx_device_new_type(MLX_CPU, 0): handle to the CPU device (always
-    //   available on Apple Silicon; ctx is non-null on success).
-    // - mlx_stream_new_device(cpu_dev): mlx::core::new_stream(cpu) →
-    //   cpu::new_stream(s), which registers a CommandEncoder for the new stream
-    //   index in the calling thread's thread-local encoder map. Returns a
-    //   ref-counted handle to the new stream.
-    // - mlx_set_default_stream(stream): store Stream(cpu, N) as the calling
-    //   thread's default; all subsequent mlx_default_cpu_stream_new() calls on
-    //   this thread return it.
-    // - mlx_device_free: releases the temporary device handle; the stream keeps
-    //   its own reference to the underlying device.
-    // - We store the stream handle in CPU_STREAM_HANDLE and do NOT call
-    //   mlx_stream_free — the CommandEncoder entry stays alive while the handle
-    //   is alive.
-    unsafe {
-        let cpu_dev = sys::mlx_device_new_type(sys::mlx_device_type_::MLX_CPU, 0);
-        if cpu_dev.ctx.is_null() {
-            return;
-        }
-        let stream = sys::mlx_stream_new_device(cpu_dev);
-        let _ = sys::mlx_device_free(cpu_dev);
-
-        if stream.ctx.is_null() {
-            return;
-        }
-
-        let _ = sys::mlx_set_default_stream(stream);
-
-        // Store the handle; do NOT call mlx_stream_free.
-        CPU_STREAM_HANDLE.with(|cell| cell.set(stream));
-        CPU_STREAM_INIT.with(|cell| cell.set(true));
-    }
+    Ok(f(mlx_thread::stream(device)?))
 }
 
 // ---------------------------------------------------------------------------
@@ -985,11 +805,12 @@ impl Array {
     /// `EVAL_LOCK`.
     pub fn eval(&self) -> Result<()> {
         install_error_handler();
-        // SAFETY: inner is a valid mlx_array.
-        let status = with_eval_lock(|| unsafe { sys::mlx_array_eval(self.inner) });
-        // SAFETY: called immediately after the C function on the same thread;
-        // the error slot it reads is thread-local, so releasing the evaluation
-        // lock first cannot lose or cross-wire a message.
+        let inner = self.inner;
+        // SAFETY: inner is a valid mlx_array, and `self` keeps it alive until
+        // the evaluation returns.
+        let status = with_eval_lock(move || unsafe { sys::mlx_array_eval(inner) })?;
+        // SAFETY: `with_eval_lock` moved the error message of the call to this
+        // thread's error slot, and no mlx-c call ran since.
         unsafe { check_status(status, "Array::eval") }
     }
 
@@ -1032,9 +853,9 @@ impl Array {
         install_error_handler();
         // mlx_async_eval takes a vector_array; build a single-element vec.
         let vec = unsafe { sys::mlx_vector_array_new_value(self.inner) };
-        let status = with_eval_lock(|| unsafe { sys::mlx_async_eval(vec) });
+        let status = with_eval_lock(move || unsafe { sys::mlx_async_eval(vec) });
         unsafe { sys::mlx_vector_array_free(vec) };
-        unsafe { check_status(status, "Array::async_eval") }
+        unsafe { check_status(status?, "Array::async_eval") }
     }
 
     /// Copy the array's logical elements, row-major, into a fresh `Vec<u8>`.

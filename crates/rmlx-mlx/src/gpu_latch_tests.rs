@@ -86,7 +86,6 @@ fn metal_api_refused_under_cpu_child() {
         metal::set_wired_limit_to_recommended(),
         "metal::set_wired_limit_to_recommended",
     );
-    assert_forbidden(ensure_gpu_default_stream(), "ensure_gpu_default_stream");
     #[cfg(feature = "metal-capture")]
     assert_forbidden(
         metal_capture::CaptureScope::start(std::path::Path::new("unused.gputrace")),

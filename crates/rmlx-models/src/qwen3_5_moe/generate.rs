@@ -625,15 +625,8 @@ pub fn generate_greedy<'a>(
             crate::prompt_cache::snapshot_clone(arch, &kv_caches, KvCache::try_deep_clone),
             crate::prompt_cache::snapshot_clone(arch, &lin_caches, LinearAttnCache::try_deep_clone),
         ) {
-            // Materialize GPU arrays on the current inference thread before
-            // storing in the prompt cache.  Each spawn_blocking request runs
-            // on its own tokio thread, which has its own Metal GPU stream
-            // (registered by ensure_gpu_default_stream() in arch::generate_greedy).
-            // If these lazy arrays are stored as-is and later evicted on a
-            // *different* inference thread (a subsequent request), that thread's
-            // eval_for_spill call will fail with "There is no Stream(gpu, N) in
-            // current thread" because stream N is only registered here.
-            // Pre-eval on this thread makes eval() a no-op from any future thread.
+            // Evaluate the copies before the store, so the entry holds its own
+            // buffers and not a graph over the live caches.
             match kvs
                 .iter()
                 .try_for_each(|c| c.eval_for_spill())

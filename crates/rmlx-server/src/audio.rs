@@ -67,7 +67,6 @@ use rmlx_audio::tokenizer::{WhisperTask, WhisperTokenizer};
 use rmlx_audio::transcribe::{TranscribeOptions, Transcriber};
 use rmlx_audio::wav::WavDecoder;
 use rmlx_audio::whisper::WhisperModel;
-use rmlx_mlx::Device;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
@@ -262,17 +261,6 @@ async fn handle_audio(state: AppState, mut multipart: Multipart, task: WhisperTa
         // Hold the GPU admission guard for the duration of Whisper decode.
         // Dropping it releases the semaphore permit and decrements gpu_pending.
         let _guard = guard;
-
-        // Registering a thread-local GPU stream + CommandEncoder once per thread entry point.
-        // tokio blocking-pool threads start with no GPU stream context; MLX's array
-        // materialisation then fails with "There is no Stream(gpu, 0) in current thread".
-        // Mirrors the pattern used at the text and image generate entry points.
-        // The CPU stream is registered unconditionally (thread-local since MLX
-        // 0.31/0.32) so a CPU-scheduled op does not fault on this worker thread.
-        rmlx_mlx::ensure_cpu_default_stream();
-        if device == Device::Gpu {
-            rmlx_mlx::ensure_gpu_default_stream().map_err(|e| e.to_string())?;
-        }
 
         // Resolve model + tokenizer from cache, loading on first call.
         //

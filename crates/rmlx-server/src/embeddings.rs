@@ -620,17 +620,6 @@ fn compute_embeddings(
             .map_err(|e| EmbedError::Compute(format!("apply_task failed: {e}")))?;
     }
 
-    // Registering a thread-local GPU stream + CommandEncoder once per thread entry point.
-    // tokio blocking-pool threads start with no GPU stream context; MLX's array
-    // materialisation then fails with "There is no Stream(gpu, 0) in current thread".
-    // Mirrors the pattern used at the text and image generate entry points.
-    // The CPU stream is registered unconditionally (thread-local since MLX
-    // 0.31/0.32) so a CPU-scheduled op does not fault on this worker thread.
-    rmlx_mlx::ensure_cpu_default_stream();
-    if device == rmlx_mlx::Device::Gpu {
-        rmlx_mlx::ensure_gpu_default_stream().map_err(|e| EmbedError::Compute(e.to_string()))?;
-    }
-
     // Build (single_vec | multi_vec) per item with a uniform serializer so
     // the response shape is identical for text and image.
     let mut data = Vec::new();

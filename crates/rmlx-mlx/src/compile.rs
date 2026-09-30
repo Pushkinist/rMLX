@@ -228,7 +228,7 @@ impl Closure {
     /// (`mlx/backend/common/compiled.cpp`). So a closure application evaluates
     /// like any other evaluation.
     ///
-    /// **Re-entrancy:** the closure body runs on the calling thread, inside
+    /// **Re-entrancy:** the closure body runs on the MLX thread, inside
     /// this FFI call, with the lock held — so a body that *takes the lock
     /// again* self-deadlocks on the non-reentrant mutex. That ban is broader
     /// than "must not evaluate": this method takes the lock, so a body which
@@ -253,11 +253,14 @@ impl Closure {
             }
         }
 
-        let mut vec_out = unsafe { sys::mlx_vector_array_new() };
-        let status = with_eval_lock(|| unsafe {
-            sys::mlx_closure_apply(&raw mut vec_out, self.inner, vec_in)
+        let closure = self.inner;
+        let applied = with_eval_lock(move || {
+            let mut vec_out = unsafe { sys::mlx_vector_array_new() };
+            let status = unsafe { sys::mlx_closure_apply(&raw mut vec_out, closure, vec_in) };
+            (status, vec_out)
         });
         unsafe { sys::mlx_vector_array_free(vec_in) };
+        let (status, vec_out) = applied?;
         unsafe { check_status(status, "Closure::apply") }?;
 
         // Unpack outputs.

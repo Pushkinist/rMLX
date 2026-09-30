@@ -645,15 +645,10 @@ pub fn generate_greedy<'a>(
             &caches,
             KvCache::try_deep_clone,
         ) {
-            // Materialize GPU arrays on the current inference thread before
-            // storing in the prompt cache.  Each spawn_blocking request runs
-            // on its own tokio thread with its own Metal GPU stream.  If these
-            // lazy arrays are evicted on a *different* inference thread later,
-            // that thread's eval_for_spill would fail with "There is no
-            // Stream(gpu, N) in current thread".  Pre-eval here makes eval()
-            // a no-op from any future thread.
-            // The drain thread's spill() refcount-clones these arrays (no new graph) and evals
-            // the clone, which shares the same buffers — so materializing here makes that eval a no-op.
+            // Evaluate the copies before the store, so the entry holds its own
+            // buffers and not a graph over the live caches. The drain thread's
+            // spill() refcount-clones these arrays (no new graph) and evals the
+            // clone, which shares the same buffers, so that eval is a no-op.
             match kvs.iter().try_for_each(|c| c.eval_for_spill()) {
                 Ok(()) => {
                     PROMPT_CACHE.with_inner_mut(|guard| {

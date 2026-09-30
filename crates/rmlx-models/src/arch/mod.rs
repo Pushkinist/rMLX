@@ -1015,19 +1015,6 @@ impl Architecture {
         // supplied per-request is checked on the same terms as a launch flag.
         self.validate_kv_quant(kv_quant)?;
 
-        // Register the thread-local CPU + GPU streams + CommandEncoders once per
-        // thread entry point. tokio blocking-pool threads start with no MLX stream
-        // context; MLX 0.31/0.32 made default streams and CPU command encoders
-        // thread-local, so the first op scheduled on a stream this thread never
-        // registered faults with "There is no Stream(<device>, N) in current thread".
-        // The CPU stream is registered unconditionally: even on the GPU device path,
-        // K8V8 `exit_prefill` schedules a reduction on the CPU stream. No-op if
-        // already registered; zero ML-semantic effect.
-        rmlx_mlx::ensure_cpu_default_stream();
-        if device == Device::Gpu {
-            rmlx_mlx::ensure_gpu_default_stream()?;
-        }
-
         tracing::info!(
             arch = arch_name,
             ?kv_quant,
@@ -1226,17 +1213,6 @@ impl Architecture {
         // separate check.
         if let Some(kq) = kv_quant_override {
             self.validate_kv_quant(kq)?;
-        }
-
-        // Register the thread-local CPU + GPU streams + CommandEncoders once per
-        // thread entry point (mirrors the text `generate_greedy` entry). The CPU
-        // stream is registered unconditionally because K8V8 `exit_prefill` schedules
-        // a reduction on the CPU stream even on the GPU device path; MLX 0.31/0.32
-        // made those streams thread-local. No-op if already registered; zero
-        // ML-semantic effect.
-        rmlx_mlx::ensure_cpu_default_stream();
-        if device == Device::Gpu {
-            rmlx_mlx::ensure_gpu_default_stream()?;
         }
 
         match self {
