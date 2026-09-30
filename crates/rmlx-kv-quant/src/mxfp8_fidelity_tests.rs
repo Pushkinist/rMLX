@@ -36,25 +36,29 @@
 //! # Two fp8 arms, and which one the criterion belongs on
 //!
 //! `mxfp8` is what MLX would actually store. `ref-fp8` is the same E4M3 codes
-//! under a **non-clipping** E8M0 scale, which no shipped encoder reaches: MLX's
-//! `fp_quantize` rounds its shared exponent to nearest and saturates the group
-//! maximum whenever that rounds down
-//! ([`the_mlx_mxfp8_encoder_clips_group_maxima_and_the_reference_encoder_does_not`]).
+//! under a **non-clipping** E8M0 scale. From mlx 0.32.2 MLX's `fp_quantize`
+//! rounds its shared exponent up (ml-explore/mlx #4353) and reaches it; before
+//! that it rounded to nearest and saturated the group maximum whenever that
+//! rounded down
+//! ([`the_mlx_mxfp8_encoder_clips_group_maxima_only_with_a_round_to_nearest_scale`]).
 //!
-//! That defect, not the encoding, is most of `mxfp8`'s measured loss. So the
-//! **declared criterion is carried by `ref-fp8`**, the arm that isolates the
-//! format. `mxfp8` carries two weaker duties: it must not beat affine, and its
-//! margin over `ref-fp8` is pinned, so an upstream fix to the E8M0 rounding
-//! turns this file red instead of passing silently on a premise that no longer
-//! holds.
+//! On the older encoder that defect, not the encoding, is most of `mxfp8`'s
+//! measured loss. So the **declared criterion is carried by `ref-fp8`**, the arm
+//! that isolates the format. The `mxfp8` duties depend on the loaded MLX: with
+//! the round-to-nearest scale it must not beat affine and its margin over
+//! `ref-fp8` is pinned; with the round-up scale it must land in `ref-fp8`'s
+//! bucket and carry no clipping margin.
 //!
 //! # What the sweep answers, on each arm
 //!
 //! The two arms land in **different buckets of the declared criterion**, and
 //! collapsing them into one verdict would overstate the result.
 //!
-//! * **MLX's shipped `mxfp8`: PASS.** Never below `4.04x` affine-g128 in any of
-//!   the 96 cells. Most of that margin is the clipping defect, not the format.
+//! * **MLX's shipped `mxfp8`, round-to-nearest scale: PASS.** Never below
+//!   `4.04x` affine-g128 in any of the 96 cells. Most of that margin is the
+//!   clipping defect, not the format. With the round-up scale (mlx 0.32.2 and
+//!   later) it is the format and lands where `ref-fp8` does: `0.939x` at its
+//!   closest.
 //! * **The format itself (`ref-fp8`): INCONCLUSIVE.** It is ahead of affine in
 //!   10 of 96 cells, all of them low outlier density at high magnitude, by at
 //!   most 6.1% — and the per-cell seed ranges straddle 1.0, so those cells are
@@ -111,7 +115,7 @@ use crate::test_utils::{
     gaussian_data, lcg_data, outlier_channel_data, outlier_channels, sqnr_db,
     stored_bits_per_value, TEST_SEED,
 };
-use rmlx_mlx::{dequantize, quantize_mode, Array, Device, Dtype};
+use rmlx_mlx::{dequantize, loaded_mlx_version, quantize_mode, Array, Device, Dtype};
 
 /// Bits both arms are held to. The comparison is only meaningful at equal rate.
 const BITS: i32 = 8;
@@ -795,19 +799,34 @@ fn no_eight_bit_float_arm_is_more_faithful_than_affine_eight_bit_at_equal_rate()
          answer for the format is a tie, not a loss, and it is held here in both directions so \
          that a clean win for either side has to be re-derived rather than absorbed",
     );
-    assert!(
-        closest_shipped >= 1.0,
-        "MLX's mxfp8 beat affine-g128 at equal rate in {closest_shipped_cell} \
-         ({closest_shipped:.3}x), contradicting the recorded verdict that fp8 buys no fidelity \
-         over affine at the same bits/value",
-    );
-    assert!(
-        narrowest_clipping_margin >= 1.5,
-        "MLX's mxfp8 came within {narrowest_clipping_margin:.2}x of the non-clipping reference \
-         in {narrowest_clipping_cell}. The shipped arm's margin over affine is largely its \
-         clipping defect; if that has been fixed upstream, the shipped arm no longer stands in \
-         for the format and the verdict must be re-derived from the reference arm alone",
-    );
+    // From mlx 0.32.2 the E8M0 scale rounds up (ml-explore/mlx #4353), so the
+    // shipped arm stops clipping and becomes the format: it lands in the
+    // reference arm's bucket, ahead somewhere and never materially.
+    if loaded_mlx_version().is_some_and(|v| v >= (0, 32, 2)) {
+        assert!(
+            closest_shipped > MATERIAL_GAIN,
+            "MLX's mxfp8 reached {closest_shipped:.3}x affine-g128 in {closest_shipped_cell}, \
+             at or past the {MATERIAL_GAIN}x declared falsifier",
+        );
+        assert!(
+            narrowest_clipping_margin < 1.5,
+            "MLX's mxfp8 stays {narrowest_clipping_margin:.2}x away from the non-clipping \
+             reference in {narrowest_clipping_cell}; a round-up E8M0 scale clips nothing",
+        );
+    } else {
+        assert!(
+            closest_shipped >= 1.0,
+            "MLX's mxfp8 beat affine-g128 at equal rate in {closest_shipped_cell} \
+             ({closest_shipped:.3}x), contradicting the recorded verdict that fp8 buys no \
+             fidelity over affine at the same bits/value",
+        );
+        assert!(
+            narrowest_clipping_margin >= 1.5,
+            "MLX's mxfp8 came within {narrowest_clipping_margin:.2}x of the non-clipping \
+             reference in {narrowest_clipping_cell}. The shipped arm's margin over affine is \
+             largely its clipping defect",
+        );
+    }
 }
 
 // ── What MLX's store and widener actually do ─────────────────────────────────
@@ -885,11 +904,11 @@ fn the_mlx_mxfp8_store_decodes_as_e4m3_codes_times_an_e8m0_scale() {
 ///
 /// Every one of the 256 codes is put through `mlx_dequantize` at a unit scale
 /// and compared against `half`'s value of the shifted bit pattern, times 256,
-/// with the sign bit reapplied. Both signs of every magnitude are covered, and
-/// so is the NaN pattern, where MLX's finite 480 diverges from the format
-/// definition (see [`e4m3_value`]). This is why an fp8 dequant contains a
-/// floating-point multiply and is not a bitcast: E4M3's exponent bias is 7 and
-/// `half`'s is 15.
+/// with the sign bit reapplied. Both signs of every magnitude are covered. The
+/// NaN pattern (`0x7F` / `0xFF`) decodes to NaN, as the format defines it (see
+/// [`e4m3_value`]), from mlx 0.32.3 (ml-explore/mlx #4376); earlier releases
+/// return the finite 480. This is why an fp8 dequant contains a floating-point
+/// multiply and is not a bitcast: E4M3's exponent bias is 7 and `half`'s is 15.
 #[test]
 #[allow(
     clippy::expect_used,
@@ -924,7 +943,15 @@ fn mlx_widens_e4m3_codes_by_bitcasting_into_half_and_multiplying_by_256() {
     );
     assert_eq!(decoded.len(), codes.len(), "one decoded value per code");
 
+    let nan_decoded = loaded_mlx_version().is_some_and(|v| v >= (0, 32, 3));
     for (&code, &got) in codes.iter().zip(decoded.iter()) {
+        if code & 0x7F == 0x7F && nan_decoded {
+            assert!(
+                got.is_nan(),
+                "code {code:#04x} is E4M3 NaN, MLX returned {got}"
+            );
+            continue;
+        }
         let reinterpreted = half_value(u16::from(code & 0x7F) << 7);
         let sign = if code & 0x80 == 0 { 1.0 } else { -1.0 };
         let want = sign * reinterpreted * 256.0;
@@ -936,16 +963,16 @@ fn mlx_widens_e4m3_codes_by_bitcasting_into_half_and_multiplying_by_256() {
     }
 }
 
-/// MLX's `mxfp8` encoder clips: its E8M0 scale is `round(log2(max/448))`, and
-/// when that rounds *down* the group maximum lands above E4M3's 448 ceiling and
-/// saturates, losing up to half its magnitude.
+/// From mlx 0.32.2, MLX's `mxfp8` encoder rounds its E8M0 scale up
+/// (ml-explore/mlx #4353), so no group maximum lands above E4M3's 448 ceiling.
+/// Earlier releases round it to nearest: when that rounds *down* the group
+/// maximum saturates and loses up to half its magnitude.
 ///
 /// Measured as the fraction of groups whose reconstructed maximum falls below
-/// 90% of the true one. The non-clipping reference arm must show none, which is
-/// what makes this a statement about the encoder rather than about the format —
-/// and is why the sweep carries the reference arm at all.
+/// 90% of the true one. E4M3 loses at most 6.25% of an in-range value, so a
+/// round-up encoder clips none, like the non-clipping reference arm.
 #[test]
-fn the_mlx_mxfp8_encoder_clips_group_maxima_and_the_reference_encoder_does_not() {
+fn the_mlx_mxfp8_encoder_clips_group_maxima_only_with_a_round_to_nearest_scale() {
     let head_dim = 128;
     let group = MXFP8_GROUP as usize;
     let data = Fixture::Gaussian.draw(head_dim, TEST_SEED);
@@ -973,12 +1000,20 @@ fn the_mlx_mxfp8_encoder_clips_group_maxima_and_the_reference_encoder_does_not()
         "groups clipped: mlx mxfp8 {mlx_clipped:.3}, non-clipping reference {ideal_clipped:.3}"
     );
 
-    assert!(
-        mlx_clipped > 0.25,
-        "MLX's mxfp8 encoder clipped only {mlx_clipped:.3} of groups; the round-to-nearest E8M0 \
-         scale rule this documents would clip far more, so either the rule changed or this \
-         measurement stopped measuring it",
-    );
+    if loaded_mlx_version().is_some_and(|v| v >= (0, 32, 2)) {
+        assert_eq!(
+            mlx_clipped, 0.0,
+            "MLX's mxfp8 encoder clipped {mlx_clipped:.3} of groups; a round-up E8M0 scale \
+             clips none, so the scale rule is round-to-nearest again",
+        );
+    } else {
+        assert!(
+            mlx_clipped > 0.25,
+            "MLX's mxfp8 encoder clipped only {mlx_clipped:.3} of groups; the round-to-nearest \
+             E8M0 scale rule would clip far more, so either the rule changed or this \
+             measurement stopped measuring it",
+        );
+    }
     assert_eq!(
         ideal_clipped, 0.0,
         "the reference encoder clipped {ideal_clipped:.3} of groups; it picks the smallest \

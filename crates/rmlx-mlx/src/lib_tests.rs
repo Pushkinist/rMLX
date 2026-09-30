@@ -1049,3 +1049,15 @@ fn an_unevaluated_result_is_not_available_and_a_forced_one_is() {
         "eval blocks until the data is there, so the answer after it is true"
     );
 }
+
+#[test]
+fn mlx_version_parses_release_and_dev_strings() {
+    assert_eq!(parse_mlx_version("0.32.3"), Some((0, 32, 3)));
+    assert_eq!(
+        parse_mlx_version("0.32.3.dev20260901+abc"),
+        Some((0, 32, 3))
+    );
+    assert_eq!(parse_mlx_version("0.32"), None);
+    assert_eq!(parse_mlx_version("x.32.3"), None);
+    assert!(loaded_mlx_version().is_some());
+}

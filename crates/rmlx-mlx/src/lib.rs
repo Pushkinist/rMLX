@@ -259,6 +259,23 @@ fn runtime_mlx_version() -> Option<String> {
     }
 }
 
+/// The version of the MLX this process loaded, as `(major, minor, patch)`.
+///
+/// `None` when mlx-c cannot report it or it does not parse. A test that pins
+/// numerics which changed between MLX releases keys its expectation on this.
+#[must_use]
+pub fn loaded_mlx_version() -> Option<(u32, u32, u32)> {
+    install_error_handler();
+    parse_mlx_version(&runtime_mlx_version()?)
+}
+
+/// `"0.32.3"` or `"0.32.3.dev20260901+abc"` -> `(0, 32, 3)`.
+fn parse_mlx_version(s: &str) -> Option<(u32, u32, u32)> {
+    let core = s.split(['-', '+']).next()?;
+    let mut parts = core.split('.').map(|p| p.parse::<u32>().ok());
+    Some((parts.next()??, parts.next()??, parts.next()??))
+}
+
 /// Warn when the loaded MLX differs from the one this binary was built against.
 ///
 /// The linked dylib's install name is a Homebrew `opt` symlink, so upgrading
