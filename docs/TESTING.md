@@ -47,6 +47,7 @@ Each test resolves its snapshot by one of these rules:
 | variable first | `tests/resolved_arch_class.rs`, `crates/rmlx-cli/src/commands/kv_calibrate_tests.rs` | a `RMLX_TEST_MODEL_*` variable, then the slug | falls through to the slug |
 | variable first, drafter | `resolve_drafter` in `tests/spec_sampled_distribution.rs` | `RMLX_DRAFT_TEST_MODEL`, then the slug; a directory with a `config.json` is enough | fails |
 | variable only | every other test that names a variable | the variable | skips |
+| slug and identity | `snapshot` in `crates/rmlx-server/tests/thread_boundary/mod.rs` | the slug only | fails |
 
 `common` is `crates/rmlx-models/tests/common/mod.rs`. Its two rules share one
 probe. It fails when `RMLX_O_MODELS_ROOT` is set but is not a directory, and
@@ -66,6 +67,15 @@ skips when nothing is configured, or when the root does not hold the slug.
 tokenizer, and mlx-community ships drafter snapshots without one. A download
 writes the JSON files before the shards, so a snapshot with no shard is a
 half-written one. The probe reads it as absent, and the test skips.
+
+The thread-boundary tests in `rmlx-server` cannot reach `common`, which is a
+module of the `rmlx-models` integration tests, so `thread_boundary/mod.rs` has
+its own resolver with the same rules for a root. It fails when
+`RMLX_O_MODELS_ROOT` is set but is not a directory, and when the snapshot
+declares another identity than the test expects: `architectures[0]`, or
+`model_type` for a snapshot that names no architecture (Whisper, an MTP
+sidecar). It skips when the root is unset, when the root does not hold the
+slug, and when the snapshot holds no weight file (a half-written download).
 
 ## Model snapshot variables
 
