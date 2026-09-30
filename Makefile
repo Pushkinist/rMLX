@@ -102,7 +102,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         check-spec-sampling check-spec-sampling-fixtures \
         check-spec-charge check-spec-charge-fixtures \
         check-published-samples check-published-samples-fixtures \
-        mlx-preflight mlx-restore-pin target-gc target-size-report profile-gputrace \
+        mlx-preflight mlx-restore-pin mlx-restore-pin-selftest target-gc target-size-report profile-gputrace \
         profile-mst \
         build-capture test-capture gputrace-preflight traces-gc \
         ssd-canary ssd-canary-gate ssd-canary-selftest \
@@ -222,8 +222,11 @@ profile-mst: ## record a Metal System Trace of a live rmlx run and summarise GPU
 		$(if $(GEN),--max-tokens $(GEN),) \
 		$(if $(KEEP),--keep $(KEEP),)
 
-mlx-restore-pin: ## restore mlx 0.31.2 + mlx-c 0.6.0_2 (nax-capable pair) and relink
+mlx-restore-pin: ## restore the pinned mlx + mlx-c pair (crates/rmlx-mlx/mlx-pin.txt) from the Cellar or the durable store, then link and pin it
 	bash scripts/mlx_restore_pin.sh
+
+mlx-restore-pin-selftest: ## CI gate: recall test for mlx-restore-pin over throwaway prefixes and a stub brew, each case asserting the exit code, a reason and the records left
+	bash scripts/mlx_restore_pin_selftest.sh
 
 build-perf:      ## cargo build --profile release-perf (debug-assertions off, stripped)
 	cargo build --workspace --profile release-perf
@@ -653,6 +656,7 @@ check-personal-data: ## CI gate: no personal email address, home or per-user tem
 
 check-personal-data-selftest: ## CI gate: recall test for the above, each case asserting the rule and file:line or the reason as well as the exit code
 	@bash scripts/check_personal_data_selftest.sh
+	@bash scripts/mlx_restore_pin_selftest.sh
 
 check-kernel-dtype-contract: ## CI gate: fail if a Metal-kernel dispatcher returns its declared-f32 output without restoring a caller dtype (promotes the whole decode graph)
 	@bash scripts/check_kernel_dtype_contract.sh

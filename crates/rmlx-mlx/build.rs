@@ -1,5 +1,6 @@
 //! Build script for `rmlx-mlx`: generates Rust FFI bindings from `mlx-c`
-//! headers via `bindgen` and repacks them into `bindings.rs`.
+//! headers via `bindgen`, repacks them into `bindings.rs`, and records which
+//! mlx-c C API they are.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -182,6 +183,18 @@ fn main() {
         .filter(|line| !line.trim_start().starts_with("#!["))
         .collect::<Vec<_>>()
         .join("\n");
+    // The one call whose argument list differs between the mlx-c C APIs is
+    // compiled per `mlxc_c_api_0_7`. `src/c_api.rs` compares that choice with
+    // the `libmlxc.dylib` the process loads, through the marker named here.
+    let force_fused = sdpa_takes_force_fused(&cleaned).unwrap_or_else(|e| {
+        panic!("rmlx-mlx build.rs: unknown mlx-c C API at {mlx_c_prefix}: {e}")
+    });
+    println!("cargo::rustc-check-cfg=cfg(mlxc_c_api_0_7)");
+    if force_fused {
+        println!("cargo:rustc-cfg=mlxc_c_api_0_7");
+    }
+    println!("cargo:rustc-env=RMLX_MLXC_0_7_MARKER={MLXC_0_7_MARKER}");
+
     std::fs::write(&bindings_path, cleaned)
         .expect("rmlx-mlx build.rs: could not rewrite bindings.rs after strip");
 }

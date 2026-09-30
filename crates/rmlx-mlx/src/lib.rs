@@ -36,6 +36,8 @@
     )
 )]
 
+/// The mlx-c C API this crate compiled against, and the one the process loaded.
+mod c_api;
 pub mod compile;
 /// Bounded-window Metal GPU trace capture. Debug-only: compiled out entirely
 /// unless the `metal-capture` feature is enabled, so a release build carries no
@@ -201,6 +203,7 @@ pub(crate) fn install_error_handler() {
         unsafe {
             sys::mlx_set_error_handler(Some(handler), ptr::null_mut(), None);
         }
+        c_api::report_at_init();
         warn_on_mlx_version_skew();
         nax::warn_if_nax_kernels_missing();
     });

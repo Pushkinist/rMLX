@@ -22,6 +22,7 @@
 
 use rmlx_core::error::Result;
 
+use crate::c_api::{self, CApiVerdict};
 use crate::{
     check_status, install_error_handler, mode_to_cstr, null_sentinel, sys, with_stream, Array,
     Device,
@@ -277,6 +278,11 @@ pub fn rope_with_freqs(
 /// `mask_arr` must be a valid array.
 ///
 /// Wraps `mlx_fast_scaled_dot_product_attention`.
+///
+/// # Errors
+/// `Error::Mlx` without a call into mlx-c when the loaded `libmlxc.dylib` has
+/// another C API than the one this crate was compiled against: the argument
+/// lists differ and the symbol name does not (`src/c_api.rs`).
 pub fn scaled_dot_product_attention(
     q: &Array,
     k: &Array,
@@ -286,7 +292,36 @@ pub fn scaled_dot_product_attention(
     mask_arr: Option<&Array>,
     device: Device,
 ) -> Result<Array> {
+    sdpa_under(
+        c_api::verdict(),
+        q,
+        k,
+        v,
+        scale,
+        mask_mode,
+        mask_arr,
+        device,
+    )
+}
+
+/// [`scaled_dot_product_attention`] under a given C API verdict, so a test on
+/// a matched pair can show that a mismatch stops the call.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the seven arguments of scaled_dot_product_attention plus the verdict a test injects"
+)]
+fn sdpa_under(
+    _verdict: CApiVerdict,
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    scale: f32,
+    mask_mode: &str,
+    mask_arr: Option<&Array>,
+    device: Device,
+) -> Result<Array> {
     install_error_handler();
+    CApiVerdict::Match(c_api::CApi::COMPILED).require_match()?;
     let mode_cstr = mode_to_cstr(mask_mode, "scaled_dot_product_attention")?;
     // When mask_arr is None, use the cached null sentinel.
     let mask_inner = match mask_arr {
@@ -307,6 +342,10 @@ pub fn scaled_dot_product_attention(
                 mode_cstr.as_ptr(),
                 mask_inner,
                 sinks_null,
+                // `force_fused = false` keeps MLX's own choice between its fused
+                // kernels and the composite graph.
+                #[cfg(mlxc_c_api_0_7)]
+                false,
                 s,
             )
         })
