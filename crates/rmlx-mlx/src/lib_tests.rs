@@ -661,13 +661,11 @@ fn with_eval_lock_serialises_concurrent_callers() {
 }
 
 /// **Out of the default run.** 400 threads each build a CPU graph, wait at a
-/// barrier, then evaluate at the same moment under `with_eval_lock`, and each
-/// must read back its own values.
+/// barrier, then hand their evaluations to the MLX thread at the same moment,
+/// and each must read back its own values.
 ///
-/// On the linked MLX no command-encoder map is shared between threads
-/// (`mlx/backend/cpu/encoder.cpp`), and this test is not measured to find a
-/// defect. It is the end-to-end check that concurrent evaluation under the lock
-/// gives correct values.
+/// This test is not measured to find a defect. It is the end-to-end check that
+/// a burst of evaluations from many threads gives correct values.
 ///
 /// The gates for the lock are `make check-eval-lock` (every eval FFI call is
 /// made under it) and `with_eval_lock_serialises_concurrent_callers` (it
@@ -690,18 +688,8 @@ fn concurrent_first_eval_reproducer() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
 
-    // Cost of this number, measured rather than estimated: the binary peaks at
-    // 412 threads running this test versus 4 without it, and MLX has no
-    // stream-reclaim path, so the streams minted here — and the OS threads
-    // behind them — persist for the life of the test binary. The whole crate
-    // suite peaks at 446 and is still holding ~436 when it finishes, i.e. every
-    // later test in this binary runs in a 400-thread process.
-    //
-    // Headroom against `sysctl kern.num_taskthreads` (16384 on this machine) is
-    // ~40x. That is the real ceiling; the ~2 048 figure this crate used to cite
-    // is unverified, and against it the margin would be only ~5x. Both are
-    // survivable, neither is "two orders of magnitude" — an earlier revision of
-    // this comment claimed that and was wrong in the unsafe direction.
+    // All alive at once. Headroom against `sysctl kern.num_taskthreads` (16384
+    // on this machine) is ~40x.
     const THREADS: usize = 400;
 
     // A barrier alone leaves the threads spread over the condvar wake-up. Park
@@ -716,10 +704,8 @@ fn concurrent_first_eval_reproducer() {
             let ready = Arc::clone(&ready);
             std::thread::spawn(move || {
                 let v = i as f32;
-                // Build first. MLX ops are lazy, so this only mints this
-                // thread's CPU stream — and stream creation takes an MLX mutex,
-                // which would otherwise stagger the threads apart before they
-                // reach evaluation.
+                // Build first: MLX ops are lazy, so the evaluations below
+                // start together.
                 let sum = add(&mk(&[v, v]), &mk(&[v, v]), Device::Cpu).expect("cpu add failed");
                 ready.wait();
                 while !gate.load(Ordering::Acquire) {

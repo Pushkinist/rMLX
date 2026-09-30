@@ -287,11 +287,12 @@ later one.
 first op. It creates one CPU and one GPU stream (its own default streams),
 and keeps them for the life of the process.
 
-- `with_stream` builds every op, on every thread, on one of the two. It also
-  makes each of them the default stream of the building thread, once per
-  thread and device, because MLX builds some ops inside other ops on the
-  default stream of the building thread, not on the stream the caller passed
-  (`a_thread_that_built_an_op_defaults_to_the_mlx_threads_stream`).
+- `with_stream` builds every op, on every thread, on one of the two. The first
+  op on a thread also makes both of them the default streams of that thread,
+  because MLX builds some ops inside other ops on the default stream of the
+  default device, whatever device the caller builds on
+  (`a_thread_that_built_an_op_defaults_to_the_mlx_threads_streams`). The GPU
+  is left out after `forbid_gpu` and on a Mac without Metal.
 - `with_eval_lock` runs every evaluation on the MLX thread, under the
   evaluation lock. The caller waits. The mlx-c error message of the call moves
   back to the calling thread, so `check_status` reads it there. A panic
@@ -417,7 +418,7 @@ no `Closure::apply` of another compiled closure either.
 | | Kind | Catches | Misses |
 |---|---|---|---|
 | `make check-eval-lock` | text gate, deterministic | an unguarded call to any of the 25 (RULE 1, RULE 2); a closure body that takes the lock (RULE 3) | a lock that no longer locks |
-| `with_eval_lock_serialises_concurrent_callers` | unit test, deterministic | a lock that does not exclude | which calls take the lock |
+| `with_eval_lock_serialises_concurrent_callers` | unit test, deterministic | two evaluations at once: a lock that does not exclude while evaluation also leaves the MLX thread | which calls take the lock; a lock that does not exclude while the MLX thread still runs one evaluation at a time |
 | `make eval-lock-stress` | end-to-end driver, 400 threads per process | wrong values from concurrent evaluation under the lock | no defect is measured on the linked MLX, so its detection power there is unknown |
 
 The gate and the unit test are complementary: each is blind to what the other
