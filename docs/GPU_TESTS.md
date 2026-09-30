@@ -390,7 +390,8 @@ Invalid device store at offset 4000064, executing kernel function: "custom_kerne
   `make gpu-test` selects.
 
 MLX owns the allocator and reports buffers as `<unnamed>`. The kernel function
-name, `custom_kernel_` plus the rMLX kernel name, is the attribution.
+name, `custom_kernel_` plus the rMLX kernel name and, on mlx 0.32.x, a suffix
+per input and output dtype, is the attribution.
 
 ### Threadgroup-memory validation: on for rMLX's kernels, off for MLX's
 
