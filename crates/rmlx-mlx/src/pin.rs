@@ -26,6 +26,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::c_api::{self, CApi, CApiVerdict};
 use crate::nax::{loaded_library_path, loaded_metallib_scan, KernelScan, NAX_GEMM_KERNEL};
 
 /// The validated pair, as checked in. Read at compile time from the same file
@@ -126,6 +127,8 @@ pub(crate) struct LinkedPair {
     pub(crate) mlx_c: Library,
     /// What the metallib scan established.
     pub(crate) kernels: KernelScan,
+    /// The mlx-c C API compiled in against the one of the loaded `libmlxc`.
+    pub(crate) c_api: CApiVerdict,
 }
 
 /// One half of the pair, as dyld resolved it.
@@ -164,6 +167,10 @@ pub(crate) enum PinVerdict {
     /// dyld has no image with this file name. In a binary that links MLX this
     /// means the image list could not be read, not that MLX is absent.
     NotLoaded { library: &'static str },
+    /// The loaded `libmlxc.dylib` has another C API than the one this binary
+    /// was compiled against, so attention cannot run. Outranks every finding
+    /// about the pair: a rebuild is the fix, whatever the kegs are.
+    CApiMismatch { compiled: CApi, loaded: CApi },
     /// The metallib was read and does not carry the kernels — the expensive
     /// failure, and the one a version number cannot detect.
     KernelsMissing {
@@ -193,8 +200,10 @@ impl LinkedPair {
     /// Pure, and total over the observation: the whole matrix is exercised
     /// without a Homebrew install to point at.
     ///
-    /// Precedence is by cost, not by the order the facts were read. A missing
-    /// kernel family is reported ahead of a version disagreement because it is
+    /// Precedence is by cost, not by the order the facts were read. An mlx-c
+    /// C API mismatch comes first after an unloaded library: attention cannot
+    /// run at all. A missing kernel family is reported ahead of a version
+    /// disagreement because it is
     /// the failure that is both expensive and invisible; a version
     /// disagreement is reported ahead of the inconclusive states because it is
     /// the one that is actually known to be wrong.
@@ -203,6 +212,9 @@ impl LinkedPair {
             if matches!(half, Library::NotLoaded) {
                 return PinVerdict::NotLoaded { library };
             }
+        }
+        if let CApiVerdict::Mismatch { compiled, loaded } = self.c_api {
+            return PinVerdict::CApiMismatch { compiled, loaded };
         }
         let metallib = match &self.kernels {
             KernelScan::Scanned {
@@ -301,6 +313,7 @@ impl PinVerdict {
                 "dyld lists no {library} in this process, so the loaded MLX cannot be \
                  identified at all"
             ),
+            Self::CApiMismatch { compiled, loaded } => c_api::mismatch_message(*compiled, *loaded),
             Self::KernelsMissing { metallib, mlx } => format!(
                 "{} (mlx {}) carries no {NAX_GEMM_KERNEL} kernels — GPU matmul and prefill \
                  run slower without them, while output and decode look normal. Repoint both halves of the pair to {PIN_FILE_DISPLAY} \
@@ -445,6 +458,7 @@ fn observe() -> LinkedPair {
         mlx: resolve_library(MLX_LIB, MLX_FORMULA),
         mlx_c: resolve_library(MLX_C_LIB, MLX_C_FORMULA),
         kernels: loaded_metallib_scan().clone(),
+        c_api: c_api::verdict(),
     }
 }
 

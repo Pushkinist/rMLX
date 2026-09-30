@@ -14,6 +14,7 @@ use super::{
     is_keg_version, keg_version_from, parse_pin, pin_check, verdict, Library, LinkedPair, MlxPin,
     PinVerdict, PIN_SRC,
 };
+use crate::c_api::{CApi, CApiVerdict};
 use crate::nax::KernelScan;
 use crate::nax::{loaded_library_path, NAX_GEMM_KERNEL};
 
@@ -33,6 +34,7 @@ fn pin() -> MlxPin {
 /// about that one thing and not about the fixture.
 fn pinned_pair() -> LinkedPair {
     LinkedPair {
+        c_api: CApiVerdict::Match(CApi::V0_7),
         mlx: keg("mlx", "0.31.2", "libmlx.dylib"),
         mlx_c: keg("mlx-c", "0.6.0_2", "libmlxc.dylib"),
         kernels: KernelScan::Scanned {
@@ -242,6 +244,7 @@ fn a_metallib_without_the_kernels_outranks_every_other_finding() {
     // The expensive, invisible failure. It is reported even when the version
     // also disagrees, because the version is the cheaper thing to notice.
     let observed = LinkedPair {
+        c_api: CApiVerdict::Match(CApi::V0_7),
         mlx: keg("mlx", "0.32.0", "libmlx.dylib"),
         kernels: KernelScan::Scanned {
             present: false,
@@ -353,6 +356,7 @@ fn an_unreadable_metallib_is_unverified_not_absent() {
     // The distinction the whole gate turns on: a scan that could not run has
     // established nothing, and must not read as either presence or absence.
     let unreadable = LinkedPair {
+        c_api: CApiVerdict::Match(CApi::V0_7),
         kernels: KernelScan::Unverified {
             metallib: Some(PathBuf::from(
                 "/opt/homebrew/Cellar/mlx/0.31.2/lib/mlx.metallib",
@@ -377,6 +381,38 @@ fn an_unreadable_metallib_is_unverified_not_absent() {
         PinVerdict::KernelsUnverified { metallib: None }
     );
     assert!(!no_path.classify(&pin()).is_match());
+}
+
+/// A binary compiled against the other mlx-c C API cannot run attention on
+/// the pinned kegs, so the pin gate must not read green for it. Only a
+/// library dyld never listed outranks it.
+#[test]
+fn a_c_api_mismatch_outranks_every_finding_about_the_pair() {
+    let mut observed = pinned_pair();
+    observed.c_api = CApiVerdict::Mismatch {
+        compiled: CApi::V0_6,
+        loaded: CApi::V0_7,
+    };
+    observed.kernels = KernelScan::Scanned {
+        present: false,
+        metallib: PathBuf::from("/keg/lib/mlx.metallib"),
+    };
+    let found = observed.classify(&pin());
+    assert_eq!(
+        found,
+        PinVerdict::CApiMismatch {
+            compiled: CApi::V0_6,
+            loaded: CApi::V0_7
+        }
+    );
+    assert!(!found.is_match());
+    assert!(found.report().contains("mlx-c C API mismatch"));
+
+    observed.mlx = Library::NotLoaded;
+    assert!(matches!(
+        observed.classify(&pin()),
+        PinVerdict::NotLoaded { .. }
+    ));
 }
 
 #[test]
@@ -407,6 +443,10 @@ fn no_two_verdicts_read_the_same() {
         PinVerdict::KernelsUnverified { metallib: None },
         PinVerdict::KernelsUnverified {
             metallib: Some(PathBuf::from("/keg/lib/mlx.metallib")),
+        },
+        PinVerdict::CApiMismatch {
+            compiled: CApi::V0_6,
+            loaded: CApi::V0_7,
         },
     ];
     let mut seen: Vec<String> = Vec::new();

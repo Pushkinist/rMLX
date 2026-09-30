@@ -78,7 +78,7 @@ impl CApiVerdict {
     }
 }
 
-fn mismatch_message(compiled: CApi, loaded: CApi) -> String {
+pub(crate) fn mismatch_message(compiled: CApi, loaded: CApi) -> String {
     format!(
         "mlx-c C API mismatch: this binary was compiled against the {} C API, but the \
          loaded libmlxc.dylib has the {} C API. mlx_fast_scaled_dot_product_attention takes \
