@@ -257,11 +257,12 @@ removed or `done` is set without Release ordering, a use after free when the
 `Posted` is forgotten or its drop does not wait for `done`, and a lost wake-up
 through the time limit of the test.
 
-Cost: each `Array::eval`, `async_eval` and `Closure::apply` from another
-thread is one hand-off. Median, release build, `eval` of an available array:
-1.7 to 4.3 µs. Decode makes 110 per token on Ternary-Bonsai-8B and 103 on
-gemma-4-e2b at the default KV quant; one `async_eval` of the K and V buffers
-is one hand-off, not two.
+Cost: each `Array::eval`, `Array::async_eval` and `Closure::apply` from
+another thread is one hand-off. Median, release build, `eval` of an available
+array: 1.7 to 4.3 µs. Decode makes 146 per token on Ternary-Bonsai-8B and
+118 on gemma-4-e2b at the default KV quant. The K and V buffers of a KV
+update take one `async_eval` each: one call for both made MLX copy the buffers
+at each step ([In-place update](KV_UPDATE_PATH.md#in-place-update)).
 
 ### Null sentinel for optional arguments
 
@@ -309,8 +310,7 @@ before calling into C.
 MLX ops build a graph; evaluation runs it.
 
 - `Array::eval()` wraps `mlx_array_eval` and blocks until the array exists.
-- `async_eval(&[..])` calls `mlx_async_eval` once for all its arrays and
-  returns at once; `Array::async_eval()` is the one-array form. A later
+- `Array::async_eval()` wraps `mlx_async_eval` and returns at once. A later
   `eval()` or `to_bytes()` waits. The decode loop uses it to queue the next
   forward while the current argmax is read back, as mlx-lm does.
 

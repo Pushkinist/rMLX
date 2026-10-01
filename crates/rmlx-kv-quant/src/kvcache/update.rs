@@ -8,7 +8,7 @@
 use std::sync::OnceLock;
 
 use rmlx_core::error::{Error, Result};
-use rmlx_mlx::{async_eval, zeros, Array, Device, Dtype};
+use rmlx_mlx::{zeros, Array, Device, Dtype};
 
 use crate::storage::KvStorage;
 use crate::KvQuant;
@@ -464,7 +464,8 @@ impl KvCache {
             } else {
                 new_v_buf
             };
-            let _ = async_eval(&[&new_k_buf, &new_v_buf]);
+            let _ = new_k_buf.async_eval();
+            let _ = new_v_buf.async_eval();
             self.prefill_raw_k = Some(new_k_buf);
             self.prefill_raw_v = Some(new_v_buf);
         }
@@ -689,7 +690,9 @@ impl KvCache {
         let v_updated = v_buf.slice_update(new_v, &start, &stop, &strides, device)?;
         *k_buf = k_updated;
         *v_buf = v_updated;
-        let _ = async_eval(&[k_buf, v_buf]);
+        // One evaluation per buffer (docs/KV_UPDATE_PATH.md, "In-place update").
+        let _ = k_buf.async_eval();
+        let _ = v_buf.async_eval();
 
         let slice_start = vec![0i32; ndim];
         let slice_stop: Vec<i32> = [b, kv_h, new_offset, head_dim].into();
@@ -1371,7 +1374,9 @@ impl KvCache {
         let v_updated = v_buf.slice_update(new_v, &start, &stop, &strides, device)?;
         *k_buf = k_updated;
         *v_buf = v_updated;
-        let _ = async_eval(&[k_buf, v_buf]);
+        // One evaluation per buffer (docs/KV_UPDATE_PATH.md, "In-place update").
+        let _ = k_buf.async_eval();
+        let _ = v_buf.async_eval();
 
         let slice_start = vec![0i32; ndim];
         let slice_stop: Vec<i32> = [b, kv_h, new_offset, head_dim].into();

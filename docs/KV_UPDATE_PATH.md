@@ -76,6 +76,41 @@ store builds the base's storage variant.
 The `update` entry of `Mixed` is `update_mixed`, which refuses. The `Mixed`
 per-step append is `update_and_sdpa_mixed` in `sdpa.rs`.
 
+## In-place update
+
+A step writes its K and V rows into buffers of many positions with
+`slice_update`. MLX writes in place only when nothing else owns the old buffer
+when MLX evaluates the update (`mlx/backend/common/copy.h:25-48` and
+`mlx/array.h:304-306`, MLX v0.32.3). If something owns it, MLX allocates a new
+buffer and copies the full buffer, at each step. Two kinds of owner cause this:
+
+- **A handle that the cache keeps.** The cache replaces its handle with the
+  result of `slice_update` before it evaluates that result. An evaluation
+  before the replacement copies the buffer at each step.
+  `crates/rmlx-kv-quant/src/kvcache/in_place_update_tests.rs` holds this on the
+  CPU for the bf16 mirror of each codec that decodes from it, for the raw
+  prefill buffer and for the ring.
+- **GPU work that is not complete.** Metal keeps the buffer of each input of a
+  command buffer until the GPU completes that command buffer
+  (`mlx/backend/metal/eval.cpp:47-68`). The attention of a step reads the K and
+  V buffers. If the CPU encodes the update of layer L before the GPU completes
+  the attention of layer L of the step before, MLX copies.
+
+The second owner depends on how far the CPU is ahead of the GPU. The decode
+loop encodes step t+1 while the GPU runs step t. Metal stops the CPU when a
+queue holds 64 command buffers that are not complete
+(`mlx/backend/metal/device.cpp:315` makes the queue with the default limit),
+and each `async_eval` commits one or more command buffers. Thus the update
+stays in place when one step commits more than 64 command buffers. The cache
+evaluates the K buffer and the V buffer with one `async_eval` each: a
+Ternary-Bonsai-8B step (36 layers) then commits more than 64. With one
+`async_eval` for both buffers, MLX copies them on that model: decode is 22 %
+slower and the Metal allocation is 497 MB larger (`scripts/perf_ab.sh`, 8
+slots). A step that commits fewer than 64 command buffers can copy in both
+forms. No CPU test
+sees this owner, because it depends on GPU timing. The A/B benchmark sees it
+in `metal_gen_alloc_mb`.
+
 ## One body per store shape
 
 24 of the 27 `KvStorage` variants hold store slots. 19 hold a K

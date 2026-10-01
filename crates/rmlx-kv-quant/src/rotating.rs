@@ -29,7 +29,7 @@
 //! line 686: `RotatingKVCache(max_size=sliding_window)` — no keep arg).
 
 use rmlx_core::error::{Error, Result};
-use rmlx_mlx::{async_eval, concatenate, zeros, Array, Device};
+use rmlx_mlx::{concatenate, zeros, Array, Device};
 
 /// Step size for buffer growth, mirrors mlx-lm `RotatingKVCache.step = 256`.
 const ROTATING_STEP: i32 = 256;
@@ -516,9 +516,10 @@ impl RotatingState {
         let vbuf = self.values.as_ref().unwrap();
         let k_updated = kbuf.slice_update(new_k, &start, &stop_k, &strides, device)?;
         let v_updated = vbuf.slice_update(new_v, &start, &stop_v, &strides, device)?;
-        let _ = async_eval(&[&k_updated, &v_updated]);
-        self.keys = Some(k_updated);
-        self.values = Some(v_updated);
+        // Replace the old buffers before the evaluation: MLX copies a buffer
+        // that has another owner (docs/KV_UPDATE_PATH.md, "In-place update").
+        let _ = self.keys.insert(k_updated).async_eval();
+        let _ = self.values.insert(v_updated).async_eval();
         self.offset += s;
         self.idx += s;
 

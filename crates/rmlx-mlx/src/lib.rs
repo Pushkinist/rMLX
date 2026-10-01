@@ -636,48 +636,6 @@ pub fn dtype_from_safetensors(st: safetensors::Dtype) -> Result<Dtype> {
 // Array
 // ---------------------------------------------------------------------------
 
-/// Schedule the compute graphs of `arrays` in one evaluation, without
-/// blocking the calling thread. The work runs in the background; a later
-/// `to_bytes` or `eval` waits for it.
-///
-/// The decode loop uses it to queue the next forward pass while the current
-/// argmax is read back (as `mx.async_eval` in mlx-lm's `generate.py`). One
-/// call for several arrays is one hand-off to the MLX thread, not one per
-/// array.
-///
-/// Serialised process-wide against every other evaluation — see
-/// `EVAL_LOCK`. Only the graph walk and dispatch run under the lock; the
-/// scheduled work completes after it is released, so the pipelining this
-/// exists for is kept.
-///
-/// # Errors
-/// An error when MLX cannot schedule the graphs.
-pub fn async_eval(arrays: &[&Array]) -> Result<()> {
-    install_error_handler();
-    let status = with_eval_lock(|| {
-        // SAFETY: every handle is a valid mlx_array that `arrays` keeps alive
-        // until this returns. The vector is freed before the job ends.
-        unsafe {
-            let vec = sys::mlx_vector_array_new();
-            let mut status = 0;
-            for array in arrays {
-                status = sys::mlx_vector_array_append_value(vec, array.inner);
-                if status != 0 {
-                    break;
-                }
-            }
-            if status == 0 {
-                status = sys::mlx_async_eval(vec);
-            }
-            sys::mlx_vector_array_free(vec);
-            status
-        }
-    })?;
-    // SAFETY: `with_eval_lock` moved the error message of the failed call to
-    // this thread's error slot, and no mlx-c call ran since.
-    unsafe { check_status(status, "async_eval") }
-}
-
 /// Heap-allocated MLX array. Dropping frees the underlying mlx-c handle.
 pub struct Array {
     inner: sys::mlx_array,
@@ -874,10 +832,53 @@ impl Array {
         Ok(available)
     }
 
-    /// Schedule this array's compute graph and return at once: [`async_eval`]
-    /// of this array alone.
+    /// Evaluate this array, then return the address of its first element.
+    ///
+    /// For identity checks only: an update that MLX did in place gives its
+    /// result the address of its input, and a copy gives a new address. Never
+    /// read through it.
+    ///
+    /// # Errors
+    /// An error when the evaluation fails.
+    pub fn data_address(&self) -> Result<usize> {
+        self.eval()?;
+        // SAFETY: `self.inner` is a valid mlx_array, and the evaluation above
+        // gave it a buffer, which MLX reads to make the pointer. The pointer
+        // is not dereferenced here.
+        let ptr = unsafe { sys::mlx_array_data_uint8(self.inner) };
+        Ok(ptr.addr())
+    }
+
+    /// Schedule this array's compute graph without blocking the calling
+    /// thread. The work runs in the background; a later `to_bytes` or `eval`
+    /// waits for it.
+    ///
+    /// The decode loop uses it to queue the next forward pass while the
+    /// current argmax is read back (as `mx.async_eval` in mlx-lm's
+    /// `generate.py`).
+    ///
+    /// Serialised process-wide against every other evaluation — see
+    /// `EVAL_LOCK`. Only the graph walk and dispatch run under the lock; the
+    /// scheduled work completes after it is released, so the pipelining this
+    /// exists for is kept.
+    ///
+    /// # Errors
+    /// An error when MLX cannot schedule the graph.
     pub fn async_eval(&self) -> Result<()> {
-        async_eval(&[self])
+        install_error_handler();
+        let status = with_eval_lock(|| {
+            // SAFETY: `self.inner` is a valid mlx_array that `self` keeps alive
+            // until this returns. The vector is freed before the job ends.
+            unsafe {
+                let vec = sys::mlx_vector_array_new_value(self.inner);
+                let status = sys::mlx_async_eval(vec);
+                sys::mlx_vector_array_free(vec);
+                status
+            }
+        })?;
+        // SAFETY: `with_eval_lock` moved the error message of the failed call to
+        // this thread's error slot, and no mlx-c call ran since.
+        unsafe { check_status(status, "Array::async_eval") }
     }
 
     /// Copy the array's logical elements, row-major, into a fresh `Vec<u8>`.
