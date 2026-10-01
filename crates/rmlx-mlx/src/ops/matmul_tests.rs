@@ -174,19 +174,16 @@ fn vector_kernel_floor_is_the_minimum_over_every_upstream_branch() {
 /// carries, so this is the drift alarm: it fails the build rather than letting
 /// the guard rot into a silent prefill tax.
 #[test]
+#[allow(
+    clippy::expect_used,
+    reason = "an MLX whose version is unknown cannot be cleared of the drift this test exists for"
+)]
 fn linked_mlx_still_carries_the_misaligned_split_k_partition() {
-    let Some(version) = crate::runtime_mlx_version() else {
-        return;
-    };
-    let mut parts = version
-        .split(['.', '-', '+'])
-        .filter_map(|p| p.parse::<u32>().ok());
-    let (Some(major), Some(minor)) = (parts.next(), parts.next()) else {
-        return;
-    };
+    let (major, minor, patch) =
+        crate::loaded_mlx_version().expect("the loaded MLX version could not be read");
     assert!(
         (major, minor) <= (0, 32),
-        "linked MLX is {version}, past the last release whose qmm_splitk aligns \
+        "linked MLX is {major}.{minor}.{patch}, past the last release whose qmm_splitk aligns \
          the split-K partition to group_size alone. Re-check upstream: if this \
          build aligns to max(group_size, 32), delete qmv_batch_limit_floor, \
          splitk_k_partition, splitk_safe_rows, their call in quantized_matmul \

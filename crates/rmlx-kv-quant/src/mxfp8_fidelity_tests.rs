@@ -720,9 +720,11 @@ fn the_log_uniform_control_separates_the_formats_on_relative_precision() {
 /// it must not beat affine and must stay at least 1.5x off `ref-fp8`: that
 /// margin *is* the clipping defect of the round-to-nearest scale. From that
 /// release it must land in `ref-fp8`'s bucket — ahead of affine somewhere,
-/// never past the falsifier — and be within [`BF16_ULP`] of `ref-fp8` in every
-/// cell, because it then stores the same codes. Either premise going away
-/// turns its arm red.
+/// never past the falsifier — and agree with `ref-fp8` to [`BF16_ULP`], in
+/// every cell's margin and in every element, because it then stores the same
+/// codes. The element check is the one that sees a single clipped group: one
+/// group among a cell's 1024 or more can move its margin by less than one ULP.
+/// Either premise going away turns its arm red.
 ///
 /// Prints every cell so the verdict can be read off the transcript rather than
 /// taken from the assertion.
@@ -737,6 +739,8 @@ fn no_eight_bit_float_arm_is_more_faithful_than_affine_eight_bit_at_equal_rate()
     let mut narrowest_clipping_cell = String::new();
     let mut widest_clipping_margin = 0.0_f64;
     let mut widest_clipping_cell = String::new();
+    let mut disagreeing_cells = 0usize;
+    let mut first_disagreement = String::new();
 
     for head_dim in HEAD_DIMS {
         for fixture in cells() {
@@ -754,9 +758,10 @@ fn no_eight_bit_float_arm_is_more_faithful_than_affine_eight_bit_at_equal_rate()
                     shipped.dtype, affine.dtype,
                 );
 
+                let ideal_values = ideal_mxfp8_round_trip(&reference, head_dim);
                 let ideal = score(
                     &reference,
-                    &ideal_mxfp8_round_trip(&reference, head_dim),
+                    &ideal_values,
                     ideal_store_bytes(reference.len()),
                 );
                 let mxfp8 = score(&reference, &shipped.values, shipped.bytes);
@@ -782,6 +787,18 @@ fn no_eight_bit_float_arm_is_more_faithful_than_affine_eight_bit_at_equal_rate()
                 );
 
                 let cell = format!("d={head_dim} {label} seed={seed:#x}");
+                let disagreement = shipped
+                    .values
+                    .iter()
+                    .zip(&ideal_values)
+                    .enumerate()
+                    .find(|(_, (got, want))| (*got - *want).abs() > BF16_ULP * want.abs());
+                if let Some((at, (got, want))) = disagreement {
+                    disagreeing_cells += 1;
+                    if first_disagreement.is_empty() {
+                        first_disagreement = format!("{cell} element {at}: {got} against {want}");
+                    }
+                }
                 if mxfp8_vs < closest_shipped {
                     closest_shipped = mxfp8_vs;
                     closest_shipped_cell = cell.clone();
@@ -851,6 +868,12 @@ fn no_eight_bit_float_arm_is_more_faithful_than_affine_eight_bit_at_equal_rate()
                  one bf16 ULP in every cell",
             );
         }
+        assert_eq!(
+            disagreeing_cells, 0,
+            "MLX's mxfp8 decode differs from the non-clipping reference by more than one bf16 \
+             ULP in {disagreeing_cells} cells, first in {first_disagreement}; a round-up E8M0 \
+             scale stores the reference's codes, so every element must agree",
+        );
     } else {
         assert!(
             closest_shipped >= 1.0,
