@@ -6,7 +6,7 @@
 # No Homebrew bottle for macOS 26 carries them, so this script pours no
 # bottle. It takes each keg from, in this order:
 #
-#   1. the Cellar, when a complete keg is there;
+#   1. the Cellar, when a usable keg is there;
 #   2. the durable copy in $RMLX_BOTTLE_STORE/source-built (default
 #      ~/.rmlx/bottles/source-built): a tar of the Cellar keg directory, listed
 #      in the SHA256SUMS file there.
@@ -18,7 +18,9 @@
 #
 # A copy is extracted into a staging directory and moved into the Cellar only
 # when it is usable, so a refused copy leaves no keg for a later run or for
-# Homebrew to take as installed.
+# Homebrew to take as installed. A refusal names a copy or keg for removal only
+# when it is bad; when a tool or the disk is the cause, it names that cause and
+# keeps the copy.
 #
 # Linking and pinning use Homebrew's own Keg and FormulaPin on the exact keg.
 # `brew link <f>` and `brew pin <f>` act on the newest keg in the Cellar, not on
@@ -40,18 +42,27 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 source "$REPO_ROOT/scripts/lib/mlx_pin.sh"
 mlx_pin_load "$REPO_ROOT/crates/rmlx-mlx/mlx-pin.txt" || exit 1
 
-# Staging is dot-named in the Cellar root: Homebrew counts every directory in a
-# formula directory as a keg but skips dot-named formulas, and a move inside one
-# file system is one rename.
-STAGE=""
-trap '[ -z "$STAGE" ] || rm -rf "$STAGE"' EXIT
-# A run stopped by SIGKILL leaves its staging directory, with a full keg in it.
-rm -rf "${CELLAR:?}"/.rmlx-restore.*
-
 die() {
 	echo "restore FAIL: $*" >&2
 	exit 1
 }
+
+# The lock and the staging are dot-named in the Cellar root: Homebrew counts
+# every directory in a formula directory as a keg but skips dot-named formulas,
+# and a move inside one file system is one rename. The lock name does not match
+# the staging pattern, so the sweep below cannot remove it.
+LOCK="$CELLAR/.rmlx-restore-lock"
+STAGE=""
+if ! mkdir "$LOCK" 2>/dev/null; then
+	[ -d "$LOCK" ] &&
+		die "another restore holds $LOCK. When no restore runs, remove $LOCK, then run this again"
+	die "cannot make $LOCK. $CELLAR must be a directory that you can write to"
+fi
+trap 'rm -rf "$LOCK"; [ -z "$STAGE" ] || rm -rf "$STAGE"' EXIT
+# A run stopped by SIGKILL leaves its staging directory, with a full keg in it.
+rm -rf "${CELLAR:?}"/.rmlx-restore.*
+
+STRINGS_FIX="Make sure that strings runs (the Xcode Command Line Tools give it: xcode-select --install) and can read that file, then run this again"
 
 pin_of() {
 	if [ "$1" = mlx ]; then echo "$PIN_MLX"; else echo "$PIN_MLXC"; fi
@@ -66,7 +77,9 @@ keg_files() {
 }
 
 # keg_problem <directory> <formula>: print why the directory is not a usable
-# keg of the formula. Exit 1 when it is usable.
+# keg of the formula and return 0, or return 1 when it is usable. Return 2,
+# with the reason, when the NAX check could not run: the tool failed, and the
+# keg can be good.
 keg_problem() {
 	local file symbols
 	for file in $(keg_files "$2"); do
@@ -79,8 +92,8 @@ keg_problem() {
 	# The kernels are the reason for the pin. The reader's status comes first:
 	# `grep -c` prints 0 also when `strings` could not run.
 	if ! symbols=$(strings "$1/lib/mlx.metallib"); then
-		echo "has a lib/mlx.metallib that strings cannot read, so the NAX check could not run"
-		return 0
+		echo "could not be checked for NAX kernels: strings failed on its lib/mlx.metallib"
+		return 2
 	fi
 	if [ "$(printf '%s\n' "$symbols" | grep -c steel_gemm_fused_nax)" -lt 1 ]; then
 		echo "has no NAX GEMM kernels. It is a bottle build, not the source build the pin names"
@@ -100,17 +113,33 @@ from_store() {
 		top=$(tar -tzf "$STORE/$file" 2>/dev/null | head -1)
 		[ "$top" = "$f/$v/" ] || continue
 		got=$(shasum -a 256 "$STORE/$file" | awk '{print $1}')
-		[ "$got" = "$sha" ] || die "$STORE/$file has sha256 $got, but SHA256SUMS lists $sha"
-		STAGE=$(mktemp -d "$CELLAR/.rmlx-restore.XXXXXX") || die "cannot make a staging directory in $CELLAR"
-		tar -xzf "$STORE/$file" -C "$STAGE" "$f/$v" ||
-			die "cannot extract $f $v from $file. Nothing was written to $CELLAR/$f." \
-				"Remove $STORE/$file and its line in $sums, then run this again"
-		if problem=$(keg_problem "$STAGE/$f/$v" "$f"); then
-			die "the copy of $f $v in $file $problem. Nothing was written to $CELLAR/$f." \
-				"Remove $STORE/$file and its line in $sums, then run this again"
+		[ "$got" = "$sha" ] ||
+			die "$STORE/$file has sha256 $got, but SHA256SUMS lists $sha." \
+				"Remove $STORE/$file and its line in $sums, or list its true sha256 when you know" \
+				"the copy is good, then run this again"
+		STAGE=$(mktemp -d "$CELLAR/.rmlx-restore.XXXXXX") ||
+			die "cannot make a staging directory in $CELLAR. Check the free space on that disk" \
+				"and that you can write to $CELLAR, then run this again"
+		if ! tar -xzf "$STORE/$file" -C "$STAGE" "$f/$v"; then
+			# The copy is bad only when it does not read to its end; else the write failed.
+			tar -tzf "$STORE/$file" >/dev/null 2>&1 ||
+				die "cannot extract $f $v from $file: the copy does not read to its end." \
+					"Nothing was written to $CELLAR/$f." \
+					"Remove $STORE/$file and its line in $sums, then run this again"
+			die "cannot write $f $v from $file into $CELLAR. Nothing was written to $CELLAR/$f," \
+				"and $file is kept. Check the free space on that disk and that you can write to" \
+				"$CELLAR, then run this again"
 		fi
+		problem=$(keg_problem "$STAGE/$f/$v" "$f")
+		case $? in
+		0) die "the copy of $f $v in $file $problem. Nothing was written to $CELLAR/$f." \
+			"Remove $STORE/$file and its line in $sums, then run this again" ;;
+		2) die "the copy of $f $v in $file $problem. Nothing was written to $CELLAR/$f," \
+			"and $file is kept. $STRINGS_FIX" ;;
+		esac
 		mkdir -p "$CELLAR/$f" && mv "$STAGE/$f/$v" "$CELLAR/$f/$v" ||
-			die "cannot move $f $v into $CELLAR/$f"
+			die "cannot move $f $v into $CELLAR/$f. $CELLAR/$f must be a directory that you" \
+				"can write to, with no $v in it. Remove or rename what is there, then run this again"
 		rm -rf "$STAGE"
 		STAGE=""
 		echo "[store] $f $v from $file"
@@ -123,9 +152,11 @@ for f in mlx mlx-c; do
 	v=$(pin_of "$f")
 	keg="$CELLAR/$f/$v"
 	if [ -e "$keg" ]; then
-		if problem=$(keg_problem "$keg" "$f"); then
-			die "$keg $problem. Remove that directory, then run this again"
-		fi
+		problem=$(keg_problem "$keg" "$f")
+		case $? in
+		0) die "$keg $problem. Remove that directory, then run this again" ;;
+		2) die "$keg $problem. It is kept. $STRINGS_FIX" ;;
+		esac
 		echo "[cellar] $f $v"
 	else
 		from_store "$f" "$v" ||
@@ -177,4 +208,5 @@ for f in mlx mlx-c; do
 done
 echo "[done] opt, linked and pinned records name mlx $PIN_MLX + mlx-c $PIN_MLXC"
 echo "       rebuild rmlx against them:  cargo clean -p rmlx-mlx && make build-perf"
-exec "$(dirname "$0")/mlx_preflight.sh"
+# Not exec: the exit trap must run to release the lock.
+"$(dirname "$0")/mlx_preflight.sh"

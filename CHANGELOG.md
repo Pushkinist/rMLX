@@ -38,8 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `~/.rmlx/bottles/source-built` (a tar listed in `SHA256SUMS`). It checks a
   copy in a staging directory, for every file rMLX loads and for the NAX
   kernels, and moves it into the Cellar only when it passes, so a refused copy
-  leaves no keg for Homebrew to take as installed. Each refusal names what to
-  remove. It then links and pins exactly the two pinned kegs; `brew link` and
+  leaves no keg for Homebrew to take as installed. A refusal names a copy or
+  keg for removal only when it is bad; when `strings` or the disk is the
+  cause, it names that cause and keeps the copy. One restore runs at a time.
+  It then links and pins exactly the two pinned kegs; `brew link` and
   `brew pin` take the newest keg instead.
 
 ### Fixed

@@ -29,7 +29,8 @@ fail=0
 
 # The stub `brew`. It logs every call and changes only the prefix it is given.
 # `brew.fail` in the prefix makes every call fail; `brew.newest` makes a
-# `brew ruby` link the newest keg instead of the one it names.
+# `brew ruby` link the newest keg instead of the one it names. A `brew ruby`
+# call made while the restore holds its lock says so.
 mkdir -p "$WORK/bin"
 cat >"$WORK/bin/brew" <<'STUB'
 #!/usr/bin/env bash
@@ -44,6 +45,7 @@ record() { # <dir> <formula> <version>
 newest() { ls "$P/Cellar/$1" | sort -V | tail -1; }
 case "${1:-}" in
 ruby)
+	[ ! -d "$P/Cellar/.rmlx-restore-lock" ] || echo "[brew ruby under the restore lock]"
 	pairs=$(printf '%s' "${3:-}" | grep -oE "\['[a-z-]+', '[^']+'\]" | tr -d "[]',")
 	while read -r name version; do
 		[ -n "$name" ] || continue
@@ -127,9 +129,10 @@ resolves() { (cd "$1/prefix/$2" 2>/dev/null && pwd -P); }
 
 # expect <name> <case> <exit> <needles> [<check> <arg>]...
 #   <needles>  one or more lines; each must occur in the output
-#   <check>    a prefix record that must resolve to the Cellar keg <arg>, or
-#              `absent`, and <arg> is a path pattern under the prefix that
-#              matches nothing
+#   <check>    a prefix record that must resolve to the Cellar keg <arg>;
+#              `absent` or `present`, and <arg> is a path pattern under the
+#              prefix that must match nothing or something; or `no-line`, and
+#              <arg> is text that must not occur in the output
 expect() {
 	local name=$1 c=$2 want=$3 needles=$4 out rc ok=1 why="" needle
 	shift 4
@@ -143,6 +146,10 @@ expect() {
 	while [ "$#" -ge 2 ]; do
 		if [ "$1" = absent ]; then
 			! compgen -G "$c/prefix/$2" >/dev/null || { ok=0; why="$why; $2 exists"; }
+		elif [ "$1" = present ]; then
+			compgen -G "$c/prefix/$2" >/dev/null || { ok=0; why="$why; no $2"; }
+		elif [ "$1" = no-line ]; then
+			! grep -qF -- "$2" <<<"$out" || { ok=0; why="$why; a line with: $2"; }
 		else
 			local got expected
 			got=$(resolves "$c" "$1")
@@ -175,7 +182,9 @@ keg "$c/prefix/Cellar" mlx-c "$MLXC_V" yes
 mkdir -p "$c/prefix/opt" "$c/prefix/var/homebrew/pinned"
 ln -sfn "$c/prefix/Cellar/mlx/$NEWER_V" "$c/prefix/opt/mlx"
 ln -sfn "$c/prefix/Cellar/mlx/$NEWER_V" "$c/prefix/var/homebrew/pinned/mlx"
-expect "kegs in the Cellar: link and pin the exact pinned kegs" "$c" 0 "[preflight stub]" "${LINKED[@]}"
+expect "kegs in the Cellar: link and pin the exact pinned kegs" "$c" 0 "[preflight stub]
+[brew ruby under the restore lock]" "${LINKED[@]}" \
+	absent "Cellar/.rmlx-restore-lock"
 
 c=$(new_case store)
 store_tar "$c" mlx-copy.tar.gz mlx "$MLX_V" yes
@@ -197,7 +206,9 @@ store_tar "$c" mlx-c-copy.tar.gz mlx-c "$MLXC_V" yes
 sums="$c/store/source-built/SHA256SUMS"
 awk '{ d = substr($1, 1, 1); print (d == "0" ? "1" : "0") substr($1, 2), $2 }' "$sums" >"$sums.new" &&
 	mv "$sums.new" "$sums"
-expect "a copy whose sha256 disagrees with SHA256SUMS is refused" "$c" 1 "but SHA256SUMS lists" \
+expect "a copy whose sha256 disagrees with SHA256SUMS is refused and named for removal" "$c" 1 \
+	"but SHA256SUMS lists
+Remove $c/store/source-built/mlx-copy.tar.gz and its line in $c/store/source-built/SHA256SUMS, or list its true sha256" \
 	absent "Cellar/mlx/$MLX_V"
 
 # The tar lists its keg, then ends half way through its data.
@@ -210,9 +221,22 @@ tar -czf "$c/full.tar.gz" -C "$src" "mlx/$MLX_V"
 head -c "$(($(wc -c <"$c/full.tar.gz") / 2))" "$c/full.tar.gz" >"$c/store/source-built/mlx-copy.tar.gz"
 list_sum "$c" mlx-copy.tar.gz
 expect "a copy that fails to extract leaves no keg and is named for removal" "$c" 1 \
-	"cannot extract mlx $MLX_V from mlx-copy.tar.gz
+	"cannot extract mlx $MLX_V from mlx-copy.tar.gz: the copy does not read to its end
 Remove $c/store/source-built/mlx-copy.tar.gz and its line in $c/store/source-built/SHA256SUMS" \
-	absent "Cellar/mlx/$MLX_V" absent "Cellar/.rmlx-restore.*"
+	absent "Cellar/mlx/$MLX_V" absent "Cellar/.rmlx-restore.*" absent "Cellar/.rmlx-restore-lock"
+
+# A good copy whose extract fails for a cause outside the tar (a full disk).
+c=$(new_case store-write-fails)
+store_tar "$c" mlx-copy.tar.gz mlx "$MLX_V" yes
+store_tar "$c" mlx-c-copy.tar.gz mlx-c "$MLXC_V" yes
+mkdir -p "$c/bin"
+printf '#!/usr/bin/env bash\nfor a in "$@"; do [ "$a" != -xzf ] || { echo "tar: write error: No space left on device" >&2; exit 1; }; done\nexec %q "$@"\n' \
+	"$(command -v tar)" >"$c/bin/tar"
+chmod +x "$c/bin/tar"
+expect "a good copy that cannot be written names the disk and is kept" "$c" 1 \
+	"cannot write mlx $MLX_V from mlx-copy.tar.gz into $c/prefix/Cellar
+and mlx-copy.tar.gz is kept. Check the free space on that disk" \
+	no-line "Remove" absent "Cellar/mlx/$MLX_V" absent "Cellar/.rmlx-restore.*"
 
 c=$(new_case store-no-dylib)
 store_tar "$c" mlx-copy.tar.gz mlx "$MLX_V" yes lib/libmlx.dylib
@@ -245,30 +269,64 @@ expect "a durable copy without NAX kernels is refused and leaves no keg" "$c" 1 
 Remove $c/store/source-built/mlx-copy.tar.gz and its line in $c/store/source-built/SHA256SUMS" \
 	absent "Cellar/mlx/$MLX_V" absent "Cellar/.rmlx-restore.*"
 
-# `strings` cannot read the metallib: "could not look" is not "no kernels".
+# `strings` cannot read the metallib: "could not look" is not "no kernels", and
+# the copy or keg is kept.
 c=$(new_case store-unreadable-metallib)
 store_tar "$c" mlx-copy.tar.gz mlx "$MLX_V" yes
 store_tar "$c" mlx-c-copy.tar.gz mlx-c "$MLXC_V" yes
 mkdir -p "$c/bin"
 printf '#!/usr/bin/env bash\nexit 1\n' >"$c/bin/strings"
 chmod +x "$c/bin/strings"
-expect "a metallib strings cannot read is refused for that reason" "$c" 1 \
-	"has a lib/mlx.metallib that strings cannot read, so the NAX check could not run" \
-	absent "Cellar/mlx/$MLX_V"
+expect "a copy strings cannot check names the tool and is kept" "$c" 1 \
+	"the copy of mlx $MLX_V in mlx-copy.tar.gz could not be checked for NAX kernels: strings failed
+and mlx-copy.tar.gz is kept. Make sure that strings runs" \
+	no-line "Remove" absent "Cellar/mlx/$MLX_V" absent "Cellar/.rmlx-restore.*"
+
+c=$(new_case cellar-unreadable-metallib)
+keg "$c/prefix/Cellar" mlx "$MLX_V" yes
+keg "$c/prefix/Cellar" mlx-c "$MLXC_V" yes
+mkdir -p "$c/bin"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$c/bin/strings"
+chmod +x "$c/bin/strings"
+expect "a keg strings cannot check names the tool and is kept" "$c" 1 \
+	"$c/prefix/Cellar/mlx/$MLX_V could not be checked for NAX kernels: strings failed on its lib/mlx.metallib. It is kept. Make sure that strings runs" \
+	no-line "Remove" present "Cellar/mlx/$MLX_V/lib/mlx.metallib"
 
 c=$(new_case no-cellar)
 store_tar "$c" mlx-copy.tar.gz mlx "$MLX_V" yes
 store_tar "$c" mlx-c-copy.tar.gz mlx-c "$MLXC_V" yes
 rmdir "$c/prefix/Cellar"
-expect "no Cellar to stage in stops the run" "$c" 1 "cannot make a staging directory in $c/prefix/Cellar"
+expect "no Cellar to lock stops the run" "$c" 1 \
+	"cannot make $c/prefix/Cellar/.rmlx-restore-lock. $c/prefix/Cellar must be a directory that you can write to"
+
+c=$(new_case staging-fails)
+store_tar "$c" mlx-copy.tar.gz mlx "$MLX_V" yes
+store_tar "$c" mlx-c-copy.tar.gz mlx-c "$MLXC_V" yes
+mkdir -p "$c/bin"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$c/bin/mktemp"
+chmod +x "$c/bin/mktemp"
+expect "no staging directory stops the run and names the disk" "$c" 1 \
+	"cannot make a staging directory in $c/prefix/Cellar. Check the free space on that disk" \
+	absent "Cellar/mlx/$MLX_V" absent "Cellar/.rmlx-restore-lock"
+
+# Another restore runs: this one stops, and leaves that run's lock and staging.
+c=$(new_case lock-held)
+store_tar "$c" mlx-copy.tar.gz mlx "$MLX_V" yes
+store_tar "$c" mlx-c-copy.tar.gz mlx-c "$MLXC_V" yes
+mkdir "$c/prefix/Cellar/.rmlx-restore-lock"
+keg "$c/prefix/Cellar/.rmlx-restore.LIVE" mlx "$MLX_V" yes
+expect "a second restore stops on the lock and keeps the first run's files" "$c" 1 \
+	"another restore holds $c/prefix/Cellar/.rmlx-restore-lock. When no restore runs, remove" \
+	present "Cellar/.rmlx-restore-lock" present "Cellar/.rmlx-restore.LIVE" absent "Cellar/mlx/$MLX_V"
 
 # A file where the formula directory must be: the move into the Cellar fails.
 c=$(new_case rack-is-a-file)
 store_tar "$c" mlx-copy.tar.gz mlx "$MLX_V" yes
 store_tar "$c" mlx-c-copy.tar.gz mlx-c "$MLXC_V" yes
 printf 'x' >"$c/prefix/Cellar/mlx"
-expect "a failed move into the Cellar stops the run and leaves no staging" "$c" 1 \
-	"cannot move mlx $MLX_V into $c/prefix/Cellar/mlx" absent "Cellar/.rmlx-restore.*"
+expect "a failed move into the Cellar names what blocks it and leaves no staging" "$c" 1 \
+	"cannot move mlx $MLX_V into $c/prefix/Cellar/mlx
+Remove or rename what is there" absent "Cellar/.rmlx-restore.*"
 
 # A run stopped by SIGKILL left its staging directory with a full keg in it.
 c=$(new_case stale-staging)
