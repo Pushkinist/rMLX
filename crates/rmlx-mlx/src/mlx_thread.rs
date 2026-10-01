@@ -24,9 +24,10 @@
 //! file of the crate.
 
 use std::cell::Cell;
+use std::marker::PhantomData;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::Thread;
 
 use rmlx_core::error::{Error, Result};
@@ -47,7 +48,7 @@ struct JobRef {
     call: unsafe fn(*mut ()),
 }
 
-// SAFETY: `hand_off` makes a `JobRef` only from a closure that is `Send`.
+// SAFETY: `Posted::new` makes a `JobRef` only from a closure that is `Send`.
 unsafe impl Send for JobRef {}
 
 /// Call the closure of type `F` that `job` points to.
@@ -88,6 +89,48 @@ static MAILBOX: Mailbox = Mailbox {
 fn wait_for(flag: &AtomicBool) {
     while !flag.load(Ordering::Acquire) {
         std::thread::park();
+    }
+}
+
+/// A job posted to the MLX thread. It holds `turn` and borrows the job. Its
+/// drop waits for `done` before it gives up `turn`, so no exit from
+/// `hand_off`, a return or an unwind, frees a job that the MLX thread can run.
+struct Posted<'job> {
+    mailbox: &'static Mailbox,
+    _turn: MutexGuard<'static, ()>,
+    _job: PhantomData<&'job mut ()>,
+}
+
+impl<'job> Posted<'job> {
+    /// Post `job` and wake the MLX thread.
+    fn new<F: FnMut() + Send>(
+        mailbox: &'static Mailbox,
+        mlx_thread: &Thread,
+        job: &'job mut F,
+    ) -> Self {
+        let turn = mailbox.turn.lock().unwrap_or_else(PoisonError::into_inner);
+        *mailbox.post.lock().unwrap_or_else(PoisonError::into_inner) = Some(Post {
+            job: JobRef {
+                job: std::ptr::from_mut(job).cast(),
+                call: call::<F>,
+            },
+            waiter: std::thread::current(),
+        });
+        let posted = Self {
+            mailbox,
+            _turn: turn,
+            _job: PhantomData,
+        };
+        mailbox.posted.store(true, Ordering::Release);
+        mlx_thread.unpark();
+        posted
+    }
+}
+
+impl Drop for Posted<'_> {
+    fn drop(&mut self) {
+        wait_for(&self.mailbox.done);
+        self.mailbox.done.store(false, Ordering::Relaxed);
     }
 }
 
@@ -139,34 +182,20 @@ fn serve(mailbox: &Mailbox) {
         let Some(Post { job, waiter }) = post else {
             continue;
         };
-        // SAFETY: `hand_off` made `job` from a live closure of the type that
-        // `job.call` expects. Its thread holds `turn`, so the next `done` is
-        // for this job, and it does not use or drop the closure until it sees
-        // that `done`: nothing in `hand_off` from the store of `posted` to the
-        // end of `wait_for` returns or unwinds.
+        // SAFETY: a `Posted` made `job` from a closure of the type that
+        // `job.call` expects. It holds `turn`, so the next `done` is for this
+        // job, and it borrows the closure until its drop sees that `done`.
         unsafe { (job.call)(job.job) };
         mailbox.done.store(true, Ordering::Release);
         waiter.unpark();
     }
 }
 
-/// Run `job` on the MLX thread and return when it is done.
+/// Run `job` on the MLX thread and return when it is done: the drop of the
+/// `Posted` waits for it.
 fn hand_off<F: FnMut() + Send>(job: &mut F) -> Result<()> {
     let (mailbox, mlx_thread) = mailbox()?;
-    let _turn = mailbox.turn.lock().unwrap_or_else(PoisonError::into_inner);
-    *mailbox.post.lock().unwrap_or_else(PoisonError::into_inner) = Some(Post {
-        job: JobRef {
-            job: std::ptr::from_mut(job).cast(),
-            call: call::<F>,
-        },
-        waiter: std::thread::current(),
-    });
-    // From here to the end of `wait_for`, nothing may return or unwind: the
-    // MLX thread can run `job` until it sets `done`.
-    mailbox.posted.store(true, Ordering::Release);
-    mlx_thread.unpark();
-    wait_for(&mailbox.done);
-    mailbox.done.store(false, Ordering::Relaxed);
+    let _posted = Posted::new(mailbox, mlx_thread, job);
     Ok(())
 }
 

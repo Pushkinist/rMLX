@@ -173,11 +173,12 @@ before any other mlx-c call can overwrite the slot.
 ### Default stream
 
 `with_stream(device, |s| …) -> Result<T>` gives `f` the stream of the MLX
-thread for the device ([below](#the-mlx-thread)). Only `mlx_thread.rs` names an mlx-c stream function:
-`every_stream_comes_from_the_mlx_thread` fails on one in any other source file
-of the crate. It reads identifiers, not calls, so an alias, a glob import or a
-`link_name` counts; a name that a macro builds from parts does not. For the GPU
-device `with_stream` checks the latch below first.
+thread for the device ([below](#the-mlx-thread)). Only `mlx_thread.rs` names
+an mlx-c stream function: `every_stream_comes_from_the_mlx_thread` fails on
+one in any other source file of the crate. It reads identifiers, not calls, so
+an alias, a glob import or a `link_name` counts; a name that a macro builds
+from parts does not. For the GPU device `with_stream` checks the latch below
+first.
 
 ### The CPU-device latch
 
@@ -235,7 +236,10 @@ and keeps them for the life of the process.
   pointer to the job (`crates/rmlx-mlx/tests/hand_off.rs`). Callers take
   turns (`concurrent_hand_offs_each_get_their_own_value`). Each side parks
   until the other unparks it. A job can borrow from its caller, so no mlx-c
-  handle type needs `Send`.
+  handle type needs `Send`. The waiting thread holds its posted job in a
+  guard whose drop waits until the MLX thread is done with it, so no exit
+  from the hand-off, a return or an unwind, frees a job that the MLX thread
+  can still run.
 - A call from the MLX thread itself runs in place
   (`a_hand_off_from_the_mlx_thread_runs_in_place`). A second hand-off from
   there would wait forever for the mailbox `turn`, which the thread that
@@ -250,9 +254,9 @@ the production hand-overs on real models.
 
 Cost: each `Array::eval`, `async_eval` and `Closure::apply` from another
 thread is one hand-off. Median, release build, `eval` of an available array:
-2 to 4 µs. Decode makes 110 per token on
-Ternary-Bonsai-8B and 103 on gemma-4-e2b at the default KV quant; one
-`async_eval` of the K and V buffers is one hand-off, not two.
+1.7 to 4.3 µs. Decode makes 110 per token on Ternary-Bonsai-8B and 103 on
+gemma-4-e2b at the default KV quant; one `async_eval` of the K and V buffers
+is one hand-off, not two.
 
 ### Null sentinel for optional arguments
 
@@ -751,7 +755,7 @@ reinterpretation (`slice::from_raw_parts`) of array data. Because
 | `null_sentinel` | The null handle is only an "absent" argument to an mlx-c function that accepts null. Never store or materialise it. |
 | `Stream` (`mlx_thread.rs`) `Send + Sync` | The handle names an immutable `{device, index}` and is never freed. Only the MLX thread uses the encoder behind it. |
 | `check_status` | Call immediately after the mlx-c call, on the same thread, before another call can overwrite the error slot. After `with_eval_lock`, the error slot of the calling thread holds the message of the call on the MLX thread. |
-| `JobRef` (`mlx_thread.rs`) `Send`, and its call in `serve` | `hand_off` makes it from a live `Send` closure on its own stack, holds `turn` so that the next `done` is for its job, and does not use or drop the closure until it sees `done`: nothing from the post to the end of the wait returns or unwinds. |
+| `JobRef` (`mlx_thread.rs`) `Send`, and its call in `serve` | `Posted::new` makes it from a `Send` closure on the stack of the waiting thread. The `Posted` holds `turn`, so the next `done` is for its job, and borrows the closure. Its drop waits for that `done`, so every exit from `hand_off` waits for it. |
 | `rust_closure_callback` | `payload` is the boxed function, valid for the closure's life. `input` is borrowed and not freed; `output` is filled here. No panic crosses the boundary. |
 | `MetalKernel` / `Closure` `Send + Sync` | The handle is immutable and ref-counted by mlx-c. The Metal device context is process-global; callers hold the Metal claim (`crates/rmlx-server/src/claim.rs`). |
 
