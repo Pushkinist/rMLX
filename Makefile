@@ -121,7 +121,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         check-no-decode-swallow check-gpu-tests-ignored \
         check-gpu-tests-ignored-fixtures gpu-runner-selftest \
         check-named-skip-notices check-named-skip-notices-fixtures \
-        check-eval-lock check-eval-lock-fixtures eval-lock-stress \
+        check-eval-lock check-eval-lock-fixtures eval-lock-stress miri \
         check-no-kernel-input-eval check-no-kernel-input-eval-fixtures \
         check-gpu-device-census check-gpu-device-census-library \
         check-gpu-device-census-selftest \
@@ -617,6 +617,20 @@ check-eval-lock-fixtures: ## CI gate: recall test for check-eval-lock (synthetic
 
 eval-lock-stress: ## run the evaluation-lock reproducer across RUNS fresh processes (default 60); not in `make ci`
 	@bash scripts/eval_lock_stress.sh $(RUNS)
+
+# The skipped tests call mlx-c or read files, which Miri refuses. A new test
+# that calls mlx-c fails here, so the skip list cannot hide one. The MLX thread
+# lives for the process and still runs when `main` ends, which Miri reports
+# without -Zmiri-ignore-leaks. The grep fails the target on a Miri error, a
+# failed test, or no test run.
+miri: ## run the MLX-thread hand-off tests under Miri (nightly toolchain with the miri component); not in `make ci`
+	MIRIFLAGS=-Zmiri-ignore-leaks cargo +nightly miri test -p rmlx-mlx --lib -- \
+	  mlx_thread::mlx_thread_tests \
+	  --skip a_cpu_op_built_on_one_thread_evaluates_on_another \
+	  --skip a_gpu_op_built_on_one_thread_evaluates_on_another \
+	  --skip a_thread_that_built_an_op_defaults_to_the_mlx_threads_streams \
+	  --skip every_stream_comes_from_the_mlx_thread \
+	  2>&1 | tee /dev/stderr | grep '^test result: ok\. [1-9]' > /dev/null
 
 check-gpu-tests-ignored: ## CI gate: fail if a GPU-touching test in ANY workspace member lacks #[ignore] (would abort the whole test binary under parallel cargo test)
 	@bash scripts/check_gpu_tests_ignored.sh

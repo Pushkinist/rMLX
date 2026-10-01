@@ -378,6 +378,7 @@ hand — keeps the CI gate and the local gate identical.
 | `make check-personal-data` | CI gate (in `make ci` and hosted CI): no personal data in any file git does not ignore — an email address outside the placeholder and GitHub noreply domains, a macOS home or per-user temp path, or an assistant session link. The repository is public, and a line published once is cached even after it is edited out. Exit 2 when it cannot scan. |
 | `make check-personal-data-selftest` | CI gate (in `make ci` and hosted CI): recall test for the above over throwaway git trees, 16 cases, each asserting the exit code and the rule and `file:line` or the reason. |
 | `make eval-lock-stress` | Drive the 400-thread evaluation-lock test across `RUNS` fresh processes (default 60). Not in `make ci`: it costs ~412 threads, and on the linked MLX it is not measured to find a defect. |
+| `make miri` | Run the MLX-thread hand-off tests that make no mlx-c call under Miri (`cargo +nightly miri`; needs the nightly toolchain with the `miri` component). Not in `make ci`. It fails on a Miri error, a failed test, an mlx-c call in a test that is not on its skip list, and a filter that matches no test. What Miri names: `docs/FFI.md` § "The MLX thread". |
 | `make tag` | Create annotated `v<version>` tag from `[workspace.package].version` (single source). |
 | `make release-package` | Build + bundle `dist/rmlx-v<ver>-aarch64-apple-darwin.tar.gz` (+ `.sha256`). |
 | `make release-sha` | Print sha256 of the `v<ver>` GitHub source tarball (`--write` patches the formula). |

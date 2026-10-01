@@ -251,7 +251,11 @@ cache or blocking-pool entry point needs no stream set-up or evaluation before
 a hand-over. `a_cpu_op_built_on_one_thread_evaluates_on_another` and
 `a_gpu_op_built_on_one_thread_evaluates_on_another` hold this; the
 thread-boundary suite (`crates/rmlx-server/tests/thread_boundary*.rs`) holds
-the production hand-overs on real models.
+the production hand-overs on real models. `make miri` runs the hand-off tests
+that make no mlx-c call under Miri, which names a data race when `turn` is
+removed or `done` is set without Release ordering, a use after free when the
+`Posted` is forgotten or its drop does not wait for `done`, and a lost wake-up
+through the time limit of the test.
 
 Cost: each `Array::eval`, `async_eval` and `Closure::apply` from another
 thread is one hand-off. Median, release build, `eval` of an available array:
