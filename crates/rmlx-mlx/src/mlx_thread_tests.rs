@@ -117,6 +117,29 @@ fn a_hand_off_from_the_mlx_thread_runs_in_place() {
     assert_eq!(nested.unwrap().unwrap(), 5);
 }
 
+/// Each side of a hand-off spins briefly, then parks. A job posted after the
+/// MLX thread parked, which runs longer than the spin of its waiter, must wake
+/// both threads.
+#[test]
+fn a_hand_off_wakes_a_parked_mlx_thread_and_a_parked_waiter() {
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        let value = run(|| {
+            std::thread::sleep(Duration::from_millis(50));
+            3
+        });
+        done_tx.send(value).ok();
+    });
+    let value = within_limit(
+        &done_rx,
+        Duration::from_secs(10),
+        "a hand-off after both parked",
+    )
+    .unwrap_or_else(|| panic!("the hand-off panicked"));
+    assert_eq!(value.unwrap(), 3);
+}
+
 /// The job and its result live on the stack of the waiting thread. A job that
 /// borrows a local and writes through a `&mut` reads back on that thread.
 #[test]
