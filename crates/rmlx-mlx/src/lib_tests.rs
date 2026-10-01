@@ -603,6 +603,10 @@ fn mk(v: &[f32]) -> Array {
     Array::from_bytes(f32_as_bytes(v), &[v.len() as i32], Dtype::F32).unwrap()
 }
 
+/// The two lock tests hold this, so that neither sees the evaluation lock that
+/// the other holds.
+static LOCK_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The deterministic half of the evaluation-lock gate: the lock really does
 /// exclude.
 ///
@@ -613,14 +617,15 @@ fn mk(v: &[f32]) -> Array {
 /// `under_eval_lock`, the part of `with_eval_lock` that takes the lock, from
 /// two threads at once, and fails every time if mutual exclusion is lost.
 ///
-/// The oracle is independent of the lock's implementation — a flag raised and
-/// cleared *inside* the critical section, with each entrant asserting it found
-/// the section empty. It shares no arithmetic with the code under test.
+/// The oracle is independent of the lock's implementation — a count of the
+/// threads inside the critical section, with each entrant that finds another
+/// thread there counting an overlap. It shares no arithmetic with the code
+/// under test.
 #[test]
 fn under_eval_lock_excludes_concurrent_callers() {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    static OCCUPIED: AtomicBool = AtomicBool::new(false);
+    static INSIDE: AtomicUsize = AtomicUsize::new(0);
     static OVERLAPS: AtomicUsize = AtomicUsize::new(0);
     static ENTRIES: AtomicUsize = AtomicUsize::new(0);
 
@@ -629,19 +634,18 @@ fn under_eval_lock_excludes_concurrent_callers() {
     const ITERS: usize = 200;
     const HOLD: std::time::Duration = std::time::Duration::from_micros(50);
 
+    let _serial = LOCK_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let worker = || {
         for _ in 0..ITERS {
             under_eval_lock(|| {
                 ENTRIES.fetch_add(1, Ordering::SeqCst);
-                // Entering: the section must have been empty.
-                if OCCUPIED.swap(true, Ordering::SeqCst) {
+                if INSIDE.fetch_add(1, Ordering::SeqCst) != 0 {
                     OVERLAPS.fetch_add(1, Ordering::SeqCst);
                 }
                 std::thread::sleep(HOLD);
-                // Leaving: and must still have been ours.
-                if !OCCUPIED.swap(false, Ordering::SeqCst) {
-                    OVERLAPS.fetch_add(1, Ordering::SeqCst);
-                }
+                INSIDE.fetch_sub(1, Ordering::SeqCst);
             });
         }
     };
@@ -663,9 +667,14 @@ fn under_eval_lock_excludes_concurrent_callers() {
 /// `with_eval_lock` runs its job under the lock that
 /// `under_eval_lock_excludes_concurrent_callers` holds to exclude. The MLX
 /// thread runs one job at a time either way, so only the lock state inside
-/// the job tells the two apart.
+/// the job tells the two apart. No other job runs on the MLX thread while this
+/// one does, and the other lock test, the only caller of `under_eval_lock` off
+/// the MLX thread, waits for `LOCK_TESTS`.
 #[test]
 fn with_eval_lock_holds_the_lock_while_its_job_runs() {
+    let _serial = LOCK_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let held =
         with_eval_lock(|| EVAL_LOCK.try_lock().is_err()).expect("the MLX thread runs the job");
     assert!(
@@ -682,8 +691,9 @@ fn with_eval_lock_holds_the_lock_while_its_job_runs() {
 /// a burst of evaluations from many threads gives correct values.
 ///
 /// The gates for the lock are `make check-eval-lock` (every eval FFI call is
-/// made under it) and `under_eval_lock_excludes_concurrent_callers` (it
-/// excludes), both deterministic. Run this test with `make eval-lock-stress`,
+/// made under it), `under_eval_lock_excludes_concurrent_callers` (it excludes)
+/// and `with_eval_lock_holds_the_lock_while_its_job_runs` (every evaluation
+/// takes it), all deterministic. Run this test with `make eval-lock-stress`,
 /// which drives it across fresh processes.
 ///
 /// Scope: the **CPU** evaluation path only. Concurrent *GPU* evaluation is not
