@@ -209,9 +209,10 @@ head -c 1048576 /dev/urandom >"$src/mlx/$MLX_V/lib/padding.bin"
 tar -czf "$c/full.tar.gz" -C "$src" "mlx/$MLX_V"
 head -c "$(($(wc -c <"$c/full.tar.gz") / 2))" "$c/full.tar.gz" >"$c/store/source-built/mlx-copy.tar.gz"
 list_sum "$c" mlx-copy.tar.gz
-expect "a copy that fails to extract leaves no keg in the Cellar" "$c" 1 \
-	"cannot extract mlx $MLX_V from mlx-copy.tar.gz" absent "Cellar/mlx/$MLX_V" \
-	absent "Cellar/.rmlx-restore.*"
+expect "a copy that fails to extract leaves no keg and is named for removal" "$c" 1 \
+	"cannot extract mlx $MLX_V from mlx-copy.tar.gz
+Remove $c/store/source-built/mlx-copy.tar.gz and its line in $c/store/source-built/SHA256SUMS" \
+	absent "Cellar/mlx/$MLX_V" absent "Cellar/.rmlx-restore.*"
 
 c=$(new_case store-no-dylib)
 store_tar "$c" mlx-copy.tar.gz mlx "$MLX_V" yes lib/libmlx.dylib
