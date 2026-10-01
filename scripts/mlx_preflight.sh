@@ -2,24 +2,31 @@
 # Verify the linked MLX stack is sane before benching, and — on hardware that
 # has a Neural Accelerator — that it is actually nax-capable.
 #
-# Two separate concerns, deliberately not conflated:
+# Three checks, deliberately not conflated:
 #
 #   1. Portable checks (every Apple Silicon host): the `opt` symlinks resolve,
 #      Mach-O install names are relocated, and the built binary can launch.
 #      A broken stack here means `rmlx` does not run at all. These read the
 #      package manager's view, which is a pre-filter and not the truth — see
-#      step 4.
+#      check 3.
 #
 #   2. NA-class hosts only (M5 and later): `mlx.metallib` must actually contain
 #      `steel_gemm_fused_nax` GEMM kernels, and the linked pair must be the one
 #      the pin names. Some homebrew-core `arm64_tahoe` bottles ship ZERO nax
 #      kernels, which slows GEMM-bound prefill. Decode is largely unaffected,
 #      so the failure is silent: benches still run and still look plausible.
-#      See docs/FFI.md.
+#      See docs/MLX_PAIR.md.
 #
-# On M1-M4 both the nax check and the pinned-pair check are skipped, not failed
-# — those bottles legitimately contain no nax kernels because the hardware has
-# no Neural Accelerator, so the pinned pair buys nothing there.
+#   3. When the binary is built, its own `mlx_pin` verdict. The preflight stops
+#      when that line is red, which is exactly when `rmlx baseline` and
+#      `rmlx bench` refuse: an mlx-c C API mismatch on every host, and a pair
+#      that is not the pinned one on M5 and later or on a host the binary
+#      cannot identify.
+#
+# On an identified M1-M4 host the pin does not bind: the nax check and the
+# pinned-pair check are skipped, and the binary's `mlx_pin` line is info, so
+# the preflight passes when the C API matches. It still stops on a C API
+# mismatch, on every host.
 #
 # The pinned pair is read from crates/rmlx-mlx/mlx-pin.txt, never restated here.
 #
@@ -145,10 +152,15 @@ if [ -x "$bin" ]; then
 		exit 1
 	fi
 	case "$pin_line" in
-	*"GREEN"*) echo "binary agrees: $pin_line" ;;
+	"mlx_pin: GREEN "* | "mlx_pin: INFO "*) echo "binary: $pin_line" ;;
 	*)
-		fail "the built binary did not load the pinned pair: $pin_line"
-		hint_restore
+		fail "the built binary refuses to measure: $pin_line"
+		# The line names the fix for a C API mismatch: a rebuild. A restore
+		# does not change the binary.
+		case "$pin_line" in
+		*"C API mismatch"*) ;;
+		*) hint_restore ;;
+		esac
 		exit 1
 		;;
 	esac

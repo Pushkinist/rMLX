@@ -102,7 +102,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         check-spec-sampling check-spec-sampling-fixtures \
         check-spec-charge check-spec-charge-fixtures \
         check-published-samples check-published-samples-fixtures \
-        mlx-preflight mlx-restore-pin mlx-restore-pin-selftest target-gc target-size-report profile-gputrace \
+        mlx-preflight mlx-preflight-selftest mlx-restore-pin mlx-restore-pin-selftest target-gc target-size-report profile-gputrace \
         profile-mst \
         build-capture test-capture gputrace-preflight traces-gc \
         ssd-canary ssd-canary-gate ssd-canary-selftest \
@@ -145,6 +145,9 @@ test:            ## cargo test --workspace
 
 mlx-preflight:   ## verify the linked MLX stack (and nax kernels on M5+) before benching
 	bash scripts/mlx_preflight.sh
+
+mlx-preflight-selftest: ## CI gate: recall test for mlx-preflight over throwaway prefixes, a stub chip and a stub built binary, each case asserting the exit code and the lines printed
+	bash scripts/mlx_preflight_selftest.sh
 
 target-gc:       ## report stale target/ profiles (APPLY=1 to prune; target/ has no size cap)
 	bash scripts/target_gc.sh $(if $(APPLY),--apply,) $(if $(ALL),--all,)
@@ -718,6 +721,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_personal_data.sh
 	@bash scripts/check_personal_data_selftest.sh
 	@bash scripts/mlx_restore_pin_selftest.sh
+	@bash scripts/mlx_preflight_selftest.sh
 	@bash scripts/check_kernel_dtype_contract.sh
 	@bash scripts/check_kernel_dtype_contract_fixtures.sh
 	@bash scripts/perf_ab_selftest.sh

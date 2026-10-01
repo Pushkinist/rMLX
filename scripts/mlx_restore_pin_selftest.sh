@@ -8,7 +8,8 @@
 # first on PATH, and asserts the exit code, lines of the output, and the
 # records and kegs the run left. The stub acts as Homebrew does: `brew link`
 # and `brew pin` take the newest keg, and a `brew ruby` Keg link takes the keg
-# it names. No case reads or changes the real Homebrew prefix.
+# it names. A case can put its own stubs in <case>/bin, which comes first on
+# PATH. No case reads or changes the real Homebrew prefix.
 #
 # Portable to GNU and BSD userlands: the hosted CI runs it on Linux.
 
@@ -132,7 +133,7 @@ resolves() { (cd "$1/prefix/$2" 2>/dev/null && pwd -P); }
 expect() {
 	local name=$1 c=$2 want=$3 needles=$4 out rc ok=1 why="" needle
 	shift 4
-	out=$(PATH="$WORK/bin:$PATH" HOMEBREW_PREFIX="$c/prefix" RMLX_BOTTLE_STORE="$c/store" \
+	out=$(PATH="$c/bin:$WORK/bin:$PATH" HOMEBREW_PREFIX="$c/prefix" RMLX_BOTTLE_STORE="$c/store" \
 		bash "$c/repo/scripts/mlx_restore_pin.sh" 2>&1)
 	rc=$?
 	[ "$rc" -eq "$want" ] || { ok=0; why="exit $rc, wanted $want"; }
@@ -230,12 +231,58 @@ expect "no keg and no copy: stop and name the source build" "$c" 1 "Building the
 c=$(new_case no-nax)
 keg "$c/prefix/Cellar" mlx "$MLX_V" no
 keg "$c/prefix/Cellar" mlx-c "$MLXC_V" yes
-expect "a keg without NAX kernels is refused" "$c" 1 "has no NAX GEMM kernels"
+expect "a keg without NAX kernels is refused and named for removal" "$c" 1 \
+	"$c/prefix/Cellar/mlx/$MLX_V has no NAX GEMM kernels. It is a bottle build, not the source build the pin names. Remove that directory, then run this again"
 
+# The copy is checked in staging, so a refused one never becomes a keg that a
+# later run or Homebrew takes as installed.
 c=$(new_case store-no-nax)
 store_tar "$c" mlx-copy.tar.gz mlx "$MLX_V" no
 store_tar "$c" mlx-c-copy.tar.gz mlx-c "$MLXC_V" yes
-expect "a durable copy without NAX kernels is refused" "$c" 1 "has no NAX GEMM kernels"
+expect "a durable copy without NAX kernels is refused and leaves no keg" "$c" 1 \
+	"the copy of mlx $MLX_V in mlx-copy.tar.gz has no NAX GEMM kernels
+Remove $c/store/source-built/mlx-copy.tar.gz and its line in $c/store/source-built/SHA256SUMS" \
+	absent "Cellar/mlx/$MLX_V" absent "Cellar/.rmlx-restore.*"
+
+# `strings` cannot read the metallib: "could not look" is not "no kernels".
+c=$(new_case store-unreadable-metallib)
+store_tar "$c" mlx-copy.tar.gz mlx "$MLX_V" yes
+store_tar "$c" mlx-c-copy.tar.gz mlx-c "$MLXC_V" yes
+mkdir -p "$c/bin"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$c/bin/strings"
+chmod +x "$c/bin/strings"
+expect "a metallib strings cannot read is refused for that reason" "$c" 1 \
+	"has a lib/mlx.metallib that strings cannot read, so the NAX check could not run" \
+	absent "Cellar/mlx/$MLX_V"
+
+c=$(new_case no-cellar)
+store_tar "$c" mlx-copy.tar.gz mlx "$MLX_V" yes
+store_tar "$c" mlx-c-copy.tar.gz mlx-c "$MLXC_V" yes
+rmdir "$c/prefix/Cellar"
+expect "no Cellar to stage in stops the run" "$c" 1 "cannot make a staging directory in $c/prefix/Cellar"
+
+# A file where the formula directory must be: the move into the Cellar fails.
+c=$(new_case rack-is-a-file)
+store_tar "$c" mlx-copy.tar.gz mlx "$MLX_V" yes
+store_tar "$c" mlx-c-copy.tar.gz mlx-c "$MLXC_V" yes
+printf 'x' >"$c/prefix/Cellar/mlx"
+expect "a failed move into the Cellar stops the run and leaves no staging" "$c" 1 \
+	"cannot move mlx $MLX_V into $c/prefix/Cellar/mlx" absent "Cellar/.rmlx-restore.*"
+
+# A run stopped by SIGKILL left its staging directory with a full keg in it.
+c=$(new_case stale-staging)
+keg "$c/prefix/Cellar" mlx "$MLX_V" yes
+keg "$c/prefix/Cellar" mlx-c "$MLXC_V" yes
+keg "$c/prefix/Cellar/.rmlx-restore.KILLED" mlx "$MLX_V" yes
+expect "the staging a killed run left is removed" "$c" 0 "[preflight stub]" \
+	"${LINKED[@]}" absent "Cellar/.rmlx-restore.*"
+
+c=$(new_case cellar-empty-dylib)
+keg "$c/prefix/Cellar" mlx "$MLX_V" yes
+keg "$c/prefix/Cellar" mlx-c "$MLXC_V" yes
+: >"$c/prefix/Cellar/mlx-c/$MLXC_V/lib/libmlxc.dylib"
+expect "a keg with an empty dylib is refused" "$c" 1 \
+	"$c/prefix/Cellar/mlx-c/$MLXC_V has no lib/libmlxc.dylib, or the file is empty"
 
 c=$(new_case incomplete)
 mkdir -p "$c/prefix/Cellar/mlx/$MLX_V"
@@ -246,7 +293,7 @@ c=$(new_case cellar-no-header)
 keg "$c/prefix/Cellar" mlx "$MLX_V" yes
 keg "$c/prefix/Cellar" mlx-c "$MLXC_V" yes include/mlx/c/fast.h
 expect "a keg in the Cellar without a header rMLX builds against is refused" "$c" 1 \
-	"has no include/mlx/c/fast.h, so it is not a complete keg"
+	"has no include/mlx/c/fast.h, or the file is empty. Remove that directory, then run this again"
 
 c=$(new_case brew-fails)
 keg "$c/prefix/Cellar" mlx "$MLX_V" yes

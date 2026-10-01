@@ -11,12 +11,14 @@
 #      ~/.rmlx/bottles/source-built): a tar of the Cellar keg directory, listed
 #      in the SHA256SUMS file there.
 #
-# When neither has a keg, it stops and names the source build
-# (docs/MLX_PAIR.md, "Building the pinned pair").
+# A keg is usable when it holds every file rMLX builds against and loads and,
+# for mlx, the NAX GEMM kernels. When neither source has a usable keg, the
+# script stops and names the source build (docs/MLX_PAIR.md, "Building the
+# pinned pair").
 #
 # A copy is extracted into a staging directory and moved into the Cellar only
-# when it is complete, so a failed extract leaves no keg for a later run to
-# link.
+# when it is usable, so a refused copy leaves no keg for a later run or for
+# Homebrew to take as installed.
 #
 # Linking and pinning use Homebrew's own Keg and FormulaPin on the exact keg.
 # `brew link <f>` and `brew pin <f>` act on the newest keg in the Cellar, not on
@@ -43,6 +45,8 @@ mlx_pin_load "$REPO_ROOT/crates/rmlx-mlx/mlx-pin.txt" || exit 1
 # file system is one rename.
 STAGE=""
 trap '[ -z "$STAGE" ] || rm -rf "$STAGE"' EXIT
+# A run stopped by SIGKILL leaves its staging directory, with a full keg in it.
+rm -rf "${CELLAR:?}"/.rmlx-restore.*
 
 die() {
 	echo "restore FAIL: $*" >&2
@@ -61,16 +65,27 @@ keg_files() {
 	esac
 }
 
-# keg_lacks <directory> <formula>: print the first file of keg_files that the
-# directory does not hold. Exit 1 when it holds all of them.
-keg_lacks() {
-	local file
+# keg_problem <directory> <formula>: print why the directory is not a usable
+# keg of the formula. Exit 1 when it is usable.
+keg_problem() {
+	local file symbols
 	for file in $(keg_files "$2"); do
-		if [ ! -f "$1/$file" ]; then
-			echo "$file"
+		if [ ! -s "$1/$file" ]; then
+			echo "has no $file, or the file is empty"
 			return 0
 		fi
 	done
+	[ "$2" = mlx ] || return 1
+	# The kernels are the reason for the pin. The reader's status comes first:
+	# `grep -c` prints 0 also when `strings` could not run.
+	if ! symbols=$(strings "$1/lib/mlx.metallib"); then
+		echo "has a lib/mlx.metallib that strings cannot read, so the NAX check could not run"
+		return 0
+	fi
+	if [ "$(printf '%s\n' "$symbols" | grep -c steel_gemm_fused_nax)" -lt 1 ]; then
+		echo "has no NAX GEMM kernels. It is a bottle build, not the source build the pin names"
+		return 0
+	fi
 	return 1
 }
 
@@ -78,7 +93,7 @@ keg_lacks() {
 # Cellar. A tar is found by what it holds, not by its file name. Returns 1 when
 # no listed tar holds the keg.
 from_store() {
-	local f=$1 v=$2 sums="$STORE/SHA256SUMS" sha file top got lacks
+	local f=$1 v=$2 sums="$STORE/SHA256SUMS" sha file top got problem
 	[ -f "$sums" ] || return 1
 	while read -r sha file; do
 		[ -f "$STORE/$file" ] || continue
@@ -88,9 +103,11 @@ from_store() {
 		[ "$got" = "$sha" ] || die "$STORE/$file has sha256 $got, but SHA256SUMS lists $sha"
 		STAGE=$(mktemp -d "$CELLAR/.rmlx-restore.XXXXXX") || die "cannot make a staging directory in $CELLAR"
 		tar -xzf "$STORE/$file" -C "$STAGE" "$f/$v" ||
-			die "cannot extract $f $v from $file. Nothing was written to $CELLAR/$f"
-		if lacks=$(keg_lacks "$STAGE/$f/$v" "$f"); then
-			die "the copy of $f $v in $file has no $lacks. Nothing was written to $CELLAR/$f"
+			die "cannot extract $f $v from $file. Nothing was written to $CELLAR/$f." \
+				"Remove $STORE/$file and its line in $sums, then run this again"
+		if problem=$(keg_problem "$STAGE/$f/$v" "$f"); then
+			die "the copy of $f $v in $file $problem. Nothing was written to $CELLAR/$f." \
+				"Remove $STORE/$file and its line in $sums, then run this again"
 		fi
 		mkdir -p "$CELLAR/$f" && mv "$STAGE/$f/$v" "$CELLAR/$f/$v" ||
 			die "cannot move $f $v into $CELLAR/$f"
@@ -106,8 +123,8 @@ for f in mlx mlx-c; do
 	v=$(pin_of "$f")
 	keg="$CELLAR/$f/$v"
 	if [ -e "$keg" ]; then
-		if lacks=$(keg_lacks "$keg" "$f"); then
-			die "$keg has no $lacks, so it is not a complete keg. Remove that directory, then run this again"
+		if problem=$(keg_problem "$keg" "$f"); then
+			die "$keg $problem. Remove that directory, then run this again"
 		fi
 		echo "[cellar] $f $v"
 	else
@@ -116,16 +133,6 @@ for f in mlx mlx-c; do
 				"docs/MLX_PAIR.md, \"Building the pinned pair\""
 	fi
 done
-
-# The kernels are the reason for the pin. A keg of the right version without
-# them is a bottle build, not the source build the pin names.
-metallib="$CELLAR/mlx/$PIN_MLX/lib/mlx.metallib"
-symbols=$(strings "$metallib") || die "cannot read $metallib, so the NAX check could not run"
-nax=$(printf '%s\n' "$symbols" | grep -c steel_gemm_fused_nax)
-[ "$nax" -ge 1 ] ||
-	die "mlx $PIN_MLX in $CELLAR has no NAX GEMM kernels. It is a bottle build, not the" \
-		"source build the pin names: docs/MLX_PAIR.md, \"Building the pinned pair\""
-echo "[ok] mlx $PIN_MLX has $nax NAX GEMM kernel occurrences"
 
 # record_keg <record> <formula>: the directory a prefix record resolves to.
 record_keg() {
