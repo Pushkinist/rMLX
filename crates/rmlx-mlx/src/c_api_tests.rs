@@ -28,6 +28,8 @@ fn a_mismatch_is_an_error_that_names_both_c_apis_and_the_call() {
     .expect_err("a mismatch must not pass")
     .to_string();
     for needle in [
+        // `scripts/mlx_preflight.sh` keys on this phrase to name no restore.
+        "C API mismatch",
         "compiled against the mlx-c 0.6 C API",
         "has the mlx-c 0.7 C API",
         "mlx_fast_scaled_dot_product_attention",

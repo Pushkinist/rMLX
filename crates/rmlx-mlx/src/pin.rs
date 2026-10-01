@@ -317,7 +317,7 @@ impl PinVerdict {
             Self::KernelsMissing { metallib, mlx } => format!(
                 "{} (mlx {}) carries no {NAX_GEMM_KERNEL} kernels — GPU matmul and prefill \
                  run slower without them, while output and decode look normal. Repoint both halves of the pair to {PIN_FILE_DISPLAY} \
-                 and see docs/FFI.md",
+                 and see docs/MLX_PAIR.md",
                 metallib.display(),
                 mlx.as_deref().unwrap_or("version unreadable")
             ),
@@ -327,7 +327,7 @@ impl PinVerdict {
                 pinned,
             } => format!(
                 "dyld resolved {formula} {resolved}, but {PIN_FILE_DISPLAY} pins {pinned}. \
-                 mlx and mlx-c are ABI-coupled and repoint as a pair; see docs/FFI.md"
+                 mlx and mlx-c are ABI-coupled and repoint as a pair; see docs/MLX_PAIR.md"
             ),
             Self::NotAKeg { formula, resolved } => format!(
                 "the loaded {formula} is {}, which is not a Homebrew keg, so its version \
@@ -397,16 +397,12 @@ pub enum PinEnforcement {
 }
 
 impl PinEnforcement {
-    /// Whether a mismatch is a failure on this host.
+    /// Whether a pair that is not the pinned one is a failure on this host:
+    /// where the pin binds, and where the host could not be identified, so
+    /// that an unknown host does not pass without a check.
     #[must_use]
-    pub const fn is_binding(self) -> bool {
-        matches!(self, Self::Binding)
-    }
-
-    /// Whether the host class itself could be established.
-    #[must_use]
-    pub const fn host_is_known(self) -> bool {
-        !matches!(self, Self::UnknownHost)
+    pub const fn requires_the_pinned_pair(self) -> bool {
+        !matches!(self, Self::NotApplicable { .. })
     }
 
     fn describe(self) -> String {
@@ -426,12 +422,14 @@ impl PinEnforcement {
 }
 
 impl PinCheck {
-    /// Whether a measurement must not run in this process: the C API differs
-    /// on any host, or the pin binds this host and the pair is not the pinned
-    /// one.
+    /// Whether a measurement must not run in this process: the C API differs,
+    /// on any host, or the pair is not the pinned one on a host that
+    /// [`PinEnforcement::requires_the_pinned_pair`]. The one verdict that
+    /// `rmlx baseline`, `rmlx bench`, `rmlx healthcheck` and the preflight
+    /// apply.
     #[must_use]
     pub const fn refuses_measurement(&self) -> bool {
-        !self.c_api_matches || (!self.matches && self.enforcement.is_binding())
+        !self.c_api_matches || (!self.matches && self.enforcement.requires_the_pinned_pair())
     }
 }
 

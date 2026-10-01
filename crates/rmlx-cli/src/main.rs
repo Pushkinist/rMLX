@@ -1784,21 +1784,39 @@ const fn gpu_capture_requested(_cmd: &Cmd) -> bool {
 /// binds: attention cannot run, so the run would fail after the model load.
 fn refuse_to_measure_off_the_pin(command: &str) -> Result<()> {
     let check = rmlx_mlx::pin_check();
-    if !check.refuses_measurement() {
-        tracing::debug!(
-            detail = %check.detail,
-            enforcement = ?check.enforcement,
-            command,
-            "MLX pin check cleared the measurement path"
-        );
-        return Ok(());
+    if let Some(refusal) = pin_refusal(
+        command,
+        check.refuses_measurement(),
+        check.c_api_matches,
+        &check.detail,
+    ) {
+        anyhow::bail!(refusal);
     }
-    anyhow::bail!(
-        "{command} refuses to measure: {}. Prefill and TTFT measured against an \
+    tracing::debug!(
+        detail = %check.detail,
+        enforcement = ?check.enforcement,
+        command,
+        "MLX pin check cleared the measurement path"
+    );
+    Ok(())
+}
+
+/// The refusal text for a pin verdict, or `None` when the measurement may run.
+///
+/// A C API mismatch names only the fix its detail gives, a rebuild: a restore
+/// of the pair does not change the binary.
+fn pin_refusal(command: &str, refuses: bool, c_api_matches: bool, detail: &str) -> Option<String> {
+    if !refuses {
+        return None;
+    }
+    if !c_api_matches {
+        return Some(format!("{command} refuses to run: {detail}"));
+    }
+    Some(format!(
+        "{command} refuses to measure: {detail}. Prefill and TTFT measured against an \
          unvalidated MLX are not comparable to any recorded number. Restore the pair \
-         with `make mlx-restore-pin`, or see docs/FFI.md.",
-        check.detail
-    )
+         with `make mlx-restore-pin`, or see docs/MLX_PAIR.md."
+    ))
 }
 
 fn main() -> Result<()> {

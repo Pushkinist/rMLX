@@ -400,3 +400,27 @@ fn claim_refusal_maps_to_exit_code_11() {
     );
     assert!(crate::exit::exit_code(Err(anyhow::anyhow!("other"))).is_err());
 }
+
+/// A C API mismatch names the rebuild its detail gives and no restore; a pair
+/// refusal names the restore; a cleared check refuses nothing.
+#[test]
+fn a_pin_refusal_names_the_fix_for_its_cause() {
+    use super::pin_refusal;
+
+    assert_eq!(pin_refusal("rmlx bench", false, true, "detail"), None);
+
+    let c_api = pin_refusal("rmlx bench", true, false, "mlx-c C API mismatch: rebuild");
+    assert_eq!(
+        c_api.as_deref(),
+        Some("rmlx bench refuses to run: mlx-c C API mismatch: rebuild")
+    );
+
+    let pair =
+        pin_refusal("rmlx baseline", true, true, "dyld resolved mlx 0.32.1").unwrap_or_default();
+    assert!(
+        pair.starts_with("rmlx baseline refuses to measure: dyld resolved mlx 0.32.1. ")
+            && pair.contains("make mlx-restore-pin")
+            && pair.contains("docs/MLX_PAIR.md"),
+        "{pair}"
+    );
+}

@@ -567,8 +567,9 @@ fn the_gate_can_tell_which_host_it_is_on() {
         apple_silicon_generation().is_some(),
         "the chip could not be identified, so the pin gate cannot tell whether it applies"
     );
-    assert!(
-        pin_check().enforcement.host_is_known(),
+    assert_ne!(
+        pin_check().enforcement,
+        super::PinEnforcement::UnknownHost,
         "the verdict must carry the same answer the probe gave"
     );
 }
@@ -592,12 +593,11 @@ fn host_class_maps_onto_whether_the_pin_binds() {
     );
     assert_eq!(enforcement_for(None), PinEnforcement::UnknownHost);
 
-    // "Does not bind" and "cannot tell" must not be the same answer, and only
-    // one of them is a host the gate may quietly pass.
-    assert!(!enforcement_for(Some(7)).is_binding());
-    assert!(!enforcement_for(None).is_binding());
-    assert!(enforcement_for(Some(7)).host_is_known());
-    assert!(!enforcement_for(None).host_is_known());
+    // "Does not bind" and "cannot tell" must not be the same answer: only an
+    // identified host the pin does not bind may run off the pinned pair.
+    assert!(enforcement_for(Some(10)).requires_the_pinned_pair());
+    assert!(!enforcement_for(Some(7)).requires_the_pinned_pair());
+    assert!(enforcement_for(None).requires_the_pinned_pair());
 
     // Each state says something different out loud.
     let described: Vec<String> = [Some(10), Some(7), None]
@@ -615,10 +615,11 @@ fn host_class_maps_onto_whether_the_pin_binds() {
 }
 
 /// A measurement refuses on an mlx-c C API mismatch on every host, and on a
-/// pair mismatch only where the pin binds. Over constructed checks, so the
-/// cells this machine cannot be in are covered too.
+/// pair mismatch everywhere but an identified host the pin does not bind.
+/// Over constructed checks, so the cells this machine cannot be in are
+/// covered too.
 #[test]
-fn a_c_api_mismatch_refuses_measurement_on_every_host() {
+fn the_measurement_refusal_covers_every_cell() {
     use super::{PinCheck, PinEnforcement};
 
     let check = |matches, c_api_matches, enforcement| PinCheck {
@@ -642,7 +643,10 @@ fn a_c_api_mismatch_refuses_measurement_on_every_host() {
     }
     assert!(check(false, true, binding).refuses_measurement());
     assert!(!check(false, true, not_applicable).refuses_measurement());
-    assert!(!check(false, true, unknown).refuses_measurement());
+    assert!(
+        check(false, true, unknown).refuses_measurement(),
+        "a host that could not be identified must not measure off the pinned pair"
+    );
 }
 
 /// `pin_check` hands the C API verdict to its callers, which is how a mismatch
@@ -664,17 +668,19 @@ fn the_pin_check_carries_the_c_api_verdict() {
 /// `opt` symlink that both dylibs' install names point at can move after the
 /// build, and cargo cannot see it move backwards.
 ///
-/// Scoped to Neural-Accelerator-class hosts, derived from the chip rather than
-/// from a list of machines. Earlier Apple Silicon legitimately ships zero of
-/// these kernels at every MLX version, so the pinned pair buys nothing there
-/// and demanding it would be noise on the majority of Macs.
+/// Scoped to Neural-Accelerator-class hosts and to hosts the chip probe cannot
+/// identify, derived from the chip rather than from a list of machines.
+/// Earlier Apple Silicon legitimately ships zero of these kernels at every MLX
+/// version, so the pinned pair buys nothing there and demanding it would be
+/// noise on the majority of Macs.
 #[test]
 fn linked_mlx_matches_the_pinned_pair() {
     let found = pin_check();
-    if found.enforcement.is_binding() {
+    if found.enforcement.requires_the_pinned_pair() {
         assert!(
             found.matches,
-            "this Mac has a GPU Neural Accelerator and is not running the validated MLX pair: {}",
+            "the pin binds this Mac, or its chip is unknown, and it is not running the validated \
+             MLX pair: {}",
             found.detail
         );
         return;
