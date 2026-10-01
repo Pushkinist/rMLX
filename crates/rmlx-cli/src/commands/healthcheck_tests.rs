@@ -333,15 +333,23 @@ fn j6_detail_escaping() {
 /// `the_measurement_refusal_covers_every_cell` in `rmlx-mlx`.
 #[test]
 fn j6_mlx_pin_status_covers_every_cell() {
-    // A refusal is red, whatever else was found.
-    assert_eq!(mlx_pin_status(true, false), Status::Red);
-    assert_eq!(mlx_pin_status(true, true), Status::Red);
+    use rmlx_mlx::PinRefusal;
+
+    // A refusal is red, for either cause.
+    assert_eq!(
+        mlx_pin_status(Some(PinRefusal::CApiMismatch), false),
+        Status::Red
+    );
+    assert_eq!(
+        mlx_pin_status(Some(PinRefusal::PairNotPinned), false),
+        Status::Red
+    );
 
     // The pinned pair, not refused.
-    assert_eq!(mlx_pin_status(false, true), Status::Green);
+    assert_eq!(mlx_pin_status(None, true), Status::Green);
 
     // Another pair on a host the pin does not bind: printed, not failed.
-    assert_eq!(mlx_pin_status(false, false), Status::Info);
+    assert_eq!(mlx_pin_status(None, false), Status::Info);
 }
 
 /// The check line carries the mapping's answer and a detail naming the host
@@ -351,10 +359,7 @@ fn j6_mlx_pin_line_reports_the_host_class() {
     let line = check_mlx_pin();
     assert_eq!(line.check, "mlx_pin");
     let check = rmlx_mlx::pin_check();
-    assert_eq!(
-        line.status,
-        mlx_pin_status(check.refuses_measurement(), check.matches)
-    );
+    assert_eq!(line.status, mlx_pin_status(check.refusal(), check.matches));
     assert!(
         line.detail.contains("Neural Accelerator")
             || line.detail.contains("could not be identified"),

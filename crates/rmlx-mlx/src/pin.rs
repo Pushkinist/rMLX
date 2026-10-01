@@ -414,22 +414,43 @@ impl PinEnforcement {
                 "Apple GPU family {gpu_family} has no Neural Accelerator, so the pinned \
                  kernels do not exist for it and the pin does not bind here"
             ),
-            Self::UnknownHost => "the chip could not be identified, so whether the pin binds \
-                                  here is unknown"
+            Self::UnknownHost => "the chip could not be identified, so the pinned pair is \
+                                  required here"
                 .to_owned(),
         }
     }
 }
 
+/// Why a measurement must not run in this process. Each cause has its own fix.
+#[allow(
+    clippy::exhaustive_enums,
+    reason = "closed set of refusal causes; each caller names the fix per cause, so a new cause must not compile until every caller names its fix"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinRefusal {
+    /// The loaded `libmlxc.dylib` has another C API than the one this binary
+    /// was compiled against, on any host. The fix is a rebuild against the
+    /// loaded mlx-c; a restore of the pair does not change the binary.
+    CApiMismatch,
+    /// The loaded pair is not the pinned one, on a host that
+    /// [`PinEnforcement::requires_the_pinned_pair`]. The fix is the pinned
+    /// pair.
+    PairNotPinned,
+}
+
 impl PinCheck {
-    /// Whether a measurement must not run in this process: the C API differs,
-    /// on any host, or the pair is not the pinned one on a host that
-    /// [`PinEnforcement::requires_the_pinned_pair`]. The one verdict that
-    /// `rmlx baseline`, `rmlx bench`, `rmlx healthcheck` and the preflight
-    /// apply.
+    /// Why a measurement must not run in this process, or `None` when it may.
+    /// The one verdict that `rmlx baseline`, `rmlx bench`,
+    /// `rmlx healthcheck` and the preflight apply.
     #[must_use]
-    pub const fn refuses_measurement(&self) -> bool {
-        !self.c_api_matches || (!self.matches && self.enforcement.requires_the_pinned_pair())
+    pub const fn refusal(&self) -> Option<PinRefusal> {
+        if !self.c_api_matches {
+            Some(PinRefusal::CApiMismatch)
+        } else if !self.matches && self.enforcement.requires_the_pinned_pair() {
+            Some(PinRefusal::PairNotPinned)
+        } else {
+            None
+        }
     }
 }
 

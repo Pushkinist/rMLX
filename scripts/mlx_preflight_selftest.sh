@@ -7,9 +7,10 @@
 # a repo tree whose pin names mlx 9.9.9 + mlx-c 8.8.8, and stubs first on
 # PATH: `sysctl` names the chip (or fails), `otool` prints nothing. A stub
 # built binary at target/release-perf/rmlx prints the `mlx_pin` line of the
-# case beside a red line of another check. The case runs the script from the
-# repo tree and asserts the exit code, lines that must occur in the output and
-# lines that must not. No case reads the real Homebrew prefix.
+# case beside a red line of another check; a case with no built binary takes
+# `none`. A case can change its tree before it runs. The case runs the script
+# from the repo tree and asserts the exit code, lines that must occur in the
+# output and lines that must not. No case reads the real Homebrew prefix.
 #
 # Portable to GNU and BSD userlands: the hosted CI runs it on Linux.
 
@@ -26,8 +27,9 @@ MLXC_V=8.8.8
 pass=0
 fail=0
 
-# new_case <name> <brand or `unknown`> <mlx> <mlx-c> <nax: yes|no> <mlx_pin line>
-#   -> prints the case directory. `unknown` makes `sysctl` fail.
+# new_case <name> <brand or `unknown`> <mlx> <mlx-c> <nax: yes|no> <mlx_pin line or `none`>
+#   -> prints the case directory. `unknown` makes `sysctl` fail; `none` builds
+#   no binary.
 new_case() {
 	local c="$WORK/$1" brand=$2 mlx=$3 mlxc=$4 nax=$5 line=$6 kernel
 	mkdir -p "$c/repo/scripts/lib" "$c/repo/crates/rmlx-mlx" "$c/repo/target/release-perf" \
@@ -49,15 +51,18 @@ new_case() {
 		printf '#!/usr/bin/env bash\necho "%s"\n' "$brand" >"$c/bin/sysctl"
 	fi
 	printf '#!/usr/bin/env bash\nexit 0\n' >"$c/bin/otool"
-	printf '%s\n' "registry: RED — no registry" "$line" >"$c/pin_line"
-	cat >"$c/repo/target/release-perf/rmlx" <<STUB
+	chmod +x "$c/bin/sysctl" "$c/bin/otool"
+	if [ "$line" != none ]; then
+		printf '%s\n' "registry: RED — no registry" "$line" >"$c/pin_line"
+		cat >"$c/repo/target/release-perf/rmlx" <<STUB
 #!/usr/bin/env bash
 case "\$1" in
 --version) echo "rmlx 0.0.0" ;;
 healthcheck) cat "$c/pin_line" ;;
 esac
 STUB
-	chmod +x "$c/bin/sysctl" "$c/bin/otool" "$c/repo/target/release-perf/rmlx"
+		chmod +x "$c/repo/target/release-perf/rmlx"
+	fi
 	printf '%s\n' "$c"
 }
 
@@ -91,7 +96,8 @@ CAPI="mlx_pin: RED — mlx-c C API mismatch: this binary was compiled against th
 
 c=$(new_case m2-info "Apple M2 Pro" 9.9.8 8.8.7 no \
 	"mlx_pin: INFO — dyld resolved mlx 9.9.8, but crates/rmlx-mlx/mlx-pin.txt pins 9.9.9 (the pin does not bind here)")
-expect "an M1-M4 Mac whose binary reports info passes" "$c" 0 "preflight ok: Apple M2 Pro"
+expect "an M1-M4 Mac whose binary reports info passes" "$c" 0 \
+	"preflight ok: the built binary reports mlx_pin: INFO"
 
 c=$(new_case m2-c-api "Apple M2 Pro" 9.9.8 8.8.7 no "$CAPI")
 expect "a C API mismatch on an M1-M4 Mac stops and does not name the restore" "$c" 1 \
@@ -109,7 +115,15 @@ make mlx-restore-pin"
 
 c=$(new_case m5-green "Apple M5 Max" "$MLX_V" "$MLXC_V" yes \
 	"mlx_pin: GREEN — loaded mlx 9.9.9 + mlx-c 8.8.8")
-expect "an M5 Mac whose binary loaded the pinned pair passes" "$c" 0 "preflight ok: Apple M5 Max (NA-class)"
+expect "an M5 Mac whose binary loaded the pinned pair passes" "$c" 0 \
+	"preflight ok: the built binary reports mlx_pin: GREEN"
+
+# The binary loads the pinned pair through MLX_PREFIX; the opt records name a
+# pair without NAX kernels. The binary decides, so the records are not read.
+c=$(new_case m5-green-opt-elsewhere "Apple M5 Max" 9.9.8 8.8.7 no \
+	"mlx_pin: GREEN — loaded mlx 9.9.9 + mlx-c 8.8.8")
+expect "with a binary the opt records are not read" "$c" 0 \
+	"preflight ok: the built binary reports mlx_pin: GREEN" "PREFLIGHT FAIL"
 
 c=$(new_case unknown-host unknown 9.9.8 8.8.7 no \
 	"mlx_pin: RED — dyld resolved mlx 9.9.8, but crates/rmlx-mlx/mlx-pin.txt pins 9.9.9 (the chip could not be identified)")
@@ -120,6 +134,71 @@ expect "a host the binary cannot identify, on another pair, stops" "$c" 1 \
 c=$(new_case unknown-status "Apple M2 Pro" 9.9.8 8.8.7 no "mlx_pin: AMBER — a status no rmlx prints")
 expect "a status other than green or info stops" "$c" 1 \
 	"PREFLIGHT FAIL: the built binary refuses to measure: mlx_pin: AMBER"
+
+# The status is the word after `mlx_pin:`, not a word anywhere in the line.
+c=$(new_case red-naming-green "Apple M2 Pro" 9.9.8 8.8.7 no \
+	"mlx_pin: RED — dyld resolved mlx 9.9.8 in /opt/EVERGREEN/lib, see INFO above")
+expect "a red line that names GREEN and INFO stops" "$c" 1 \
+	"PREFLIGHT FAIL: the built binary refuses to measure: mlx_pin: RED"
+
+c=$(new_case no-launch "Apple M5 Max" "$MLX_V" "$MLXC_V" yes "mlx_pin: GREEN — loaded mlx 9.9.9")
+printf '#!/usr/bin/env bash\nexit 1\n' >"$c/repo/target/release-perf/rmlx"
+expect "a binary that cannot launch stops" "$c" 1 \
+	"PREFLIGHT FAIL: target/release-perf/rmlx cannot launch"
+
+c=$(new_case no-pin-line "Apple M5 Max" "$MLX_V" "$MLXC_V" yes "")
+expect "a binary that prints no mlx_pin line stops" "$c" 1 \
+	"PREFLIGHT FAIL: target/release-perf/rmlx reported no mlx_pin line"
+
+# No binary yet: the opt records stand in for the pair a build would load.
+c=$(new_case m2-no-binary "Apple M2 Pro" 9.9.8 8.8.7 no none)
+expect "no binary, an M1-M4 Mac on another pair passes" "$c" 0 \
+	"preflight ok: Apple M2 Pro (no Neural Accelerator, the pin does not bind), mlx 9.9.8 + mlx-c 8.8.7, nax check skipped"
+
+c=$(new_case m5-no-binary "Apple M5 Max" "$MLX_V" "$MLXC_V" yes none)
+expect "no binary, an M5 Mac on the pinned pair passes" "$c" 0 \
+	"preflight ok: Apple M5 Max (the pin binds, or the chip is not identified), pinned mlx 9.9.9 + mlx-c 8.8.8"
+
+c=$(new_case m5-no-binary-no-nax "Apple M5 Max" "$MLX_V" "$MLXC_V" no none)
+expect "no binary, an M5 Mac without NAX kernels stops" "$c" 1 \
+	"ships 0 nax GEMM kernels
+make mlx-restore-pin"
+
+c=$(new_case m5-no-binary-pair "Apple M5 Max" 9.9.8 8.8.7 yes none)
+expect "no binary, an M5 Mac on another pair stops" "$c" 1 \
+	"linked mlx 9.9.8 + mlx-c 8.8.7 is not the pinned pair
+make mlx-restore-pin"
+
+c=$(new_case unknown-no-binary unknown 9.9.8 8.8.7 yes none)
+expect "no binary, a chip sysctl cannot name is held to the pin" "$c" 1 \
+	"linked mlx 9.9.8 + mlx-c 8.8.7 is not the pinned pair"
+
+# rmlx_core::apple_gpu identifies a chip only from a leading "Apple M<n>".
+c=$(new_case virtual-no-binary "Virtual Apple M2" 9.9.8 8.8.7 yes none)
+expect "no binary, a brand that does not start with Apple M<n> is held to the pin" "$c" 1 \
+	"linked mlx 9.9.8 + mlx-c 8.8.7 is not the pinned pair"
+
+c=$(new_case m41-no-binary "Apple M41" 9.9.8 8.8.7 yes none)
+expect "no binary, M41 is not M4" "$c" 1 "linked mlx 9.9.8 + mlx-c 8.8.7 is not the pinned pair"
+
+c=$(new_case no-opt "Apple M2 Pro" 9.9.8 8.8.7 no none)
+rm "$c/prefix/opt/mlx-c"
+expect "no binary, an opt record that does not resolve stops" "$c" 1 \
+	"PREFLIGHT FAIL: $c/prefix/opt/mlx-c does not resolve"
+
+c=$(new_case unrelocated "Apple M2 Pro" 9.9.8 8.8.7 no none)
+printf '#!/usr/bin/env bash\necho "@@HOMEBREW_PREFIX@@/opt/mlx/lib/libmlx.dylib"\n' >"$c/bin/otool"
+expect "no binary, an unrelocated dylib stops" "$c" 1 "carries @@HOMEBREW_PREFIX@@ placeholders"
+
+c=$(new_case no-metallib "Apple M5 Max" "$MLX_V" "$MLXC_V" yes none)
+rm "$c/prefix/Cellar/mlx/$MLX_V/lib/mlx.metallib"
+expect "no binary, an M5 Mac without mlx.metallib stops" "$c" 1 "mlx.metallib missing"
+
+c=$(new_case no-strings "Apple M5 Max" "$MLX_V" "$MLXC_V" yes none)
+printf '#!/usr/bin/env bash\nexit 1\n' >"$c/bin/strings"
+chmod +x "$c/bin/strings"
+expect "no binary, a metallib strings cannot read names the tool, not the restore" "$c" 1 \
+	"cannot read $c/prefix/opt/mlx/lib/mlx.metallib (is \`strings\` present?)" "make mlx-restore-pin"
 
 echo "mlx_preflight_selftest: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

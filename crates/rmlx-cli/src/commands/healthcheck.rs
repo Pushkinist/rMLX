@@ -632,24 +632,22 @@ fn check_mlx_pin() -> CheckLine {
     let check = rmlx_mlx::pin_check();
     CheckLine::new(
         "mlx_pin",
-        mlx_pin_status(check.refuses_measurement(), check.matches),
+        mlx_pin_status(check.refusal(), check.matches),
         check.detail,
     )
 }
 
 /// Map a pin verdict onto a check status.
 ///
-/// Red is exactly [`rmlx_mlx::PinCheck::refuses_measurement`], the verdict
+/// Red is exactly a [`rmlx_mlx::PinCheck::refusal`], the verdict
 /// `rmlx baseline` and `rmlx bench` refuse on and `scripts/mlx_preflight.sh`
 /// stops on, so the line cannot disagree with them. A pair that is not the
 /// pinned one on a host the pin does not bind is printed as info.
-const fn mlx_pin_status(refuses_measurement: bool, matches: bool) -> Status {
-    if refuses_measurement {
-        Status::Red
-    } else if matches {
-        Status::Green
-    } else {
-        Status::Info
+const fn mlx_pin_status(refusal: Option<rmlx_mlx::PinRefusal>, matches: bool) -> Status {
+    match refusal {
+        Some(_) => Status::Red,
+        None if matches => Status::Green,
+        None => Status::Info,
     }
 }
 

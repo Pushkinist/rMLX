@@ -90,8 +90,8 @@ rMLX ships no formula of its own.
    ```sh
    store=~/.rmlx/bottles/source-built; mkdir -p "$store"
    (cd "$(brew --cellar)" && tar czf "$store/mlx-0.32.3.tar.gz" mlx/0.32.3 &&
-     tar czf "$store/mlx-c-0.7.0.tar.gz" mlx-c/0.7.0)
-   (cd "$store" && shasum -a 256 *.tar.gz > SHA256SUMS)
+     tar czf "$store/mlx-c-0.7.0.tar.gz" mlx-c/0.7.0) &&
+     (cd "$store" && shasum -a 256 *.tar.gz > SHA256SUMS)
    ```
 
 The kegs link `libjaccl.dylib` through `@rpath`, so it must stay beside
@@ -114,7 +114,7 @@ checks that the `opt`, linked and pinned records all resolve to them.
 
 `scripts/mlx_restore_pin.sh` takes each pinned keg from:
 
-1. the Cellar, when the keg is there and complete;
+1. the Cellar, when the keg is there and usable;
 2. the durable store (`~/.rmlx/bottles/source-built`, or
    `$RMLX_BOTTLE_STORE/source-built`): a tar of the keg directory, found by
    the keg it holds and checked against `SHA256SUMS`.
@@ -125,12 +125,18 @@ empty: `libmlx.dylib`, `libjaccl.dylib`, `mlx.metallib` and
 for mlx-c. The mlx keg must also carry the NAX kernels. The script extracts a
 copy into a staging directory in the Cellar, checks it there, and moves it
 into the Cellar only when it is usable. So a refused copy leaves no keg that a
-later run, or Homebrew, can take as installed. Staging that a killed run left
-is removed at the start.
+later run, or Homebrew, can take as installed. One restore runs at a time: a
+second run stops on the lock `Cellar/.rmlx-restore-lock`. A run that was
+killed leaves that lock, and the refusal tells you to remove it. Staging that
+a killed run left is removed at the start.
 
-It stops when neither source has a usable keg. Each refusal names what to
-remove: the keg directory in the Cellar, or the tar in the store and its line
-in `SHA256SUMS`. It pours no Homebrew bottle. When the link step fails, or
+It stops when neither source has a usable keg. A refusal names the keg
+directory in the Cellar, or the tar in the store and its line in
+`SHA256SUMS`, for removal only when that keg or tar is bad: a file is missing
+or empty, there are no NAX kernels, the tar does not read to its end, or its
+sha256 is not the listed one. When `strings` cannot run, or the disk cannot
+take the keg, the refusal names that cause and keeps the copy. It pours no
+Homebrew bottle. When the link step fails, or
 leaves a record on another keg, it prints what the `opt`, linked and pinned
 records of both formulas resolve to, and tells you to run it again. After it, run
 `cargo clean -p rmlx-mlx` and build again: a move to an older keg does not
@@ -183,18 +189,22 @@ the pin, so that it cannot pass without a check, and
 `the_gate_can_tell_which_host_it_is_on` fails there. The C API verdict is not
 scoped: a mismatch fails on every host ([Two mlx-c C APIs](#two-mlx-c-c-apis)).
 
-**It runs where numbers are made.** `PinCheck::refuses_measurement` is the one
-verdict. `rmlx baseline` and `rmlx bench` refuse when the loaded pair is not
-the pinned one on a host the pin binds or a host that cannot be identified,
-and on every host when the C API differs. `rmlx healthcheck` reports the same
+**It runs where numbers are made.** `PinCheck::refusal` is the one verdict,
+and it names its cause: a C API mismatch, or a pair that is not the pinned
+one. `rmlx baseline` and `rmlx bench` refuse when the loaded pair is not the
+pinned one on a host the pin binds or a host that cannot be identified, and
+on every host when the C API differs. `rmlx healthcheck` reports the same
 verdict as an `mlx_pin` line: red where they refuse, info for another pair on
-an identified M1–M4 host, green for the pinned pair. `scripts/mlx_preflight.sh`
-(`make mlx-preflight`, run by `make canary`, `canary-ab` and
-`bench-codec-cell`) reads the `opt` symlinks as a pre-filter, then asks the
-built binary and stops when that line is red. `make mlx-preflight-selftest`
-(in `make ci` and the hosted CI) is its recall test. Only the process taking
-the measurement knows what dyld resolved: `MLX_PREFIX` or `DYLD_LIBRARY_PATH`
-can bypass the symlinks.
+an identified M1–M4 host, green for the pinned pair. `scripts/mlx_preflight.sh` (`make mlx-preflight`, run by
+`make canary`, `canary-ab` and `bench-codec-cell`) stops on the same verdict.
+With a built binary it reads only that binary's `mlx_pin` line: green or info
+passes, anything else stops. Only the process taking the measurement knows
+what dyld resolved, and `MLX_PREFIX` can load a pair that the `opt` symlinks
+do not name. With no binary it reads the `opt` symlinks as a pre-filter for
+the pair a build would load, and holds every host but an identified M1–M4 to
+the pin, as the binary does. It cannot see the C API without a binary.
+`make mlx-preflight-selftest` (in `make ci` and the hosted CI) is its recall
+test.
 
 ### Run identity: `events.mlx_nax`
 

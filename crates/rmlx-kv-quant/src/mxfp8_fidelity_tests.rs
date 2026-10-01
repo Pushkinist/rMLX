@@ -787,12 +787,13 @@ fn no_eight_bit_float_arm_is_more_faithful_than_affine_eight_bit_at_equal_rate()
                 );
 
                 let cell = format!("d={head_dim} {label} seed={seed:#x}");
-                let disagreement = shipped
-                    .values
-                    .iter()
-                    .zip(&ideal_values)
-                    .enumerate()
-                    .find(|(_, (got, want))| (*got - *want).abs() > BF16_ULP * want.abs());
+                let disagreement = shipped.values.iter().zip(&ideal_values).enumerate().find(
+                    |(_, (got, want))| {
+                        // `<=` is false for a NaN, so a NaN element never agrees.
+                        let agrees = (**got - **want).abs() <= BF16_ULP * want.abs();
+                        !agrees
+                    },
+                );
                 if let Some((at, (got, want))) = disagreement {
                     disagreeing_cells += 1;
                     if first_disagreement.is_empty() {

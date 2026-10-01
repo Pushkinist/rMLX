@@ -71,7 +71,8 @@ strings "$(brew --prefix mlx)/lib/mlx.metallib" | grep -c steel_gemm_fused_nax
 
 rMLX also compiles against the Homebrew pair, mlx 0.32.1 + mlx-c 0.6.0_4
 (see [Two mlx-c C APIs](#two-mlx-c-c-apis)). The gate that checks the loaded
-pair, and binds only on M5 and later, is in
+pair, and binds on M5 and later and on a host whose chip cannot be
+identified, is in
 [`docs/MLX_PAIR.md`](MLX_PAIR.md#the-pin-gate).
 
 #### Where NAX can appear, and where it cannot

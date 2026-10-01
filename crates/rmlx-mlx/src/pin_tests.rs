@@ -615,12 +615,12 @@ fn host_class_maps_onto_whether_the_pin_binds() {
 }
 
 /// A measurement refuses on an mlx-c C API mismatch on every host, and on a
-/// pair mismatch everywhere but an identified host the pin does not bind.
-/// Over constructed checks, so the cells this machine cannot be in are
-/// covered too.
+/// pair mismatch everywhere but an identified host the pin does not bind,
+/// each with its own cause. Over constructed checks, so the cells this
+/// machine cannot be in are covered too.
 #[test]
 fn the_measurement_refusal_covers_every_cell() {
-    use super::{PinCheck, PinEnforcement};
+    use super::{PinCheck, PinEnforcement, PinRefusal};
 
     let check = |matches, c_api_matches, enforcement| PinCheck {
         matches,
@@ -632,19 +632,25 @@ fn the_measurement_refusal_covers_every_cell() {
     let not_applicable = PinEnforcement::NotApplicable { gpu_family: 7 };
     let unknown = PinEnforcement::UnknownHost;
     for enforcement in [binding, not_applicable, unknown] {
-        assert!(
-            check(false, false, enforcement).refuses_measurement(),
+        assert_eq!(
+            check(false, false, enforcement).refusal(),
+            Some(PinRefusal::CApiMismatch),
             "a C API mismatch must refuse on {enforcement:?}"
         );
-        assert!(
-            !check(true, true, enforcement).refuses_measurement(),
+        assert_eq!(
+            check(true, true, enforcement).refusal(),
+            None,
             "the pinned pair must measure on {enforcement:?}"
         );
     }
-    assert!(check(false, true, binding).refuses_measurement());
-    assert!(!check(false, true, not_applicable).refuses_measurement());
-    assert!(
-        check(false, true, unknown).refuses_measurement(),
+    assert_eq!(
+        check(false, true, binding).refusal(),
+        Some(PinRefusal::PairNotPinned)
+    );
+    assert_eq!(check(false, true, not_applicable).refusal(), None);
+    assert_eq!(
+        check(false, true, unknown).refusal(),
+        Some(PinRefusal::PairNotPinned),
         "a host that could not be identified must not measure off the pinned pair"
     );
 }
