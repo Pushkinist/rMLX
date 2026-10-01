@@ -90,9 +90,11 @@ export MLX_PREFIX="$(brew --prefix mlx)"
 
 rMLX is validated against one MLX / mlx-c pair, declared in
 `crates/rmlx-mlx/mlx-pin.txt`. `rmlx healthcheck` and `make mlx-preflight`
-check it. On M5 and later, `rmlx bench` and `rmlx baseline` refuse to
-measure off the pair; serving is not blocked. At startup rMLX warns when the
-MLX it loaded differs from the one it was built against. See
+check it. On M5 and later, and on a Mac whose chip cannot be identified,
+`rmlx bench` and `rmlx baseline` refuse to measure off the pair; serving is
+not blocked. On every Mac they refuse when the loaded mlx-c has another C API
+than the one rMLX was built against. At startup rMLX warns when the MLX it
+loaded differs from the one it was built against. See
 [`docs/FFI.md`](docs/FFI.md#pinned-mlx--mlx-c-pair).
 
 ### On M5 and later: the Neural Accelerator kernels

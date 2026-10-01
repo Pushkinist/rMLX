@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **rMLX builds against the mlx-c 0.6 and the 0.7 C API.** `build.rs` reads
+  the C API from the generated bindings, and the one call whose argument list
+  differs, `mlx_fast_scaled_dot_product_attention`, is compiled for it. So
+  `brew install` builds against the Homebrew pair (mlx 0.32.1 + mlx-c
+  0.6.0_4), and a source build against mlx-c 0.7.0.
+- **A binary refuses to run on the other mlx-c C API.** The two C APIs keep
+  the name of that call, so dyld links a binary built against one to a
+  `libmlxc.dylib` of the other with no error, and the call then reads its
+  arguments from the wrong slots. rMLX reads the C API of the loaded library
+  once per process. On a mismatch, on every Mac, the attention call returns an
+  error instead of calling mlx-c, `rmlx healthcheck` reports `mlx_pin` red,
+  `rmlx baseline` and `rmlx bench` refuse before a model loads, and
+  `make mlx-preflight` stops. Each names the fix: a rebuild against the loaded
+  mlx-c, or the mlx-c the binary was built against.
+
+### Changed
+
+- **The validated MLX pair is mlx 0.32.3 + mlx-c 0.7.0, built from source for
+  a macOS 26.2 deployment target**, so that it carries the Neural-Accelerator
+  (NAX) kernels. No Homebrew bottle for macOS 26 has them. Off that pair,
+  `rmlx baseline` and `rmlx bench` refuse on M5 and later and on a Mac whose
+  chip cannot be identified. On M1–M4 the pin does not bind, and
+  `make mlx-preflight` passes when the C API matches. `docs/MLX_PAIR.md` gives
+  the steps for each Mac.
+- **`make mlx-restore-pin` no longer pours a Homebrew bottle.** It takes each
+  pinned keg from the Cellar, or from a source-built copy in
+  `~/.rmlx/bottles/source-built` (a tar listed in `SHA256SUMS`). It checks a
+  copy in a staging directory, for every file rMLX loads and for the NAX
+  kernels, and moves it into the Cellar only when it passes, so a refused copy
+  leaves no keg for Homebrew to take as installed. Each refusal names what to
+  remove. It then links and pins exactly the two pinned kegs; `brew link` and
+  `brew pin` take the newest keg instead.
+
 ### Fixed
 
 - **A model loaded on one thread no longer fails on another.** On MLX 0.32 an

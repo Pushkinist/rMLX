@@ -110,9 +110,12 @@ Neither gives per-dispatch counters headlessly. Those come from the Xcode
 replay below, which needs a person.
 
 On M5 the Neural Accelerator is part of the GPU. A capture names NAX
-pipelines like any other: `steel_gemm_fused_nax_*` for matmul and
-`steel_attention_*_bq64_*` for attention. `bq64` means the NAX attention
-branch ran; `bq32` means it did not. Which paths can reach NAX is in
+pipelines like any other: `steel_gemm_fused_nax_*` for matmul. For prefill
+attention (MLX 0.32.3), the NAX kernels are `steel_attention_*_bq64_*` at
+`head_dim` 64, 96 and 128, and `steel_attention_dsplit_*` at 256 (`bq64`) and
+512 (`bq32_bk32_bd512`). The attention kernel without NAX is
+`steel_attention_*_bq32_*` with no `dsplit` in the name. So `bq32` alone does
+not mean that NAX did not run. Which paths can reach NAX is in
 [`docs/FFI.md`](FFI.md#where-nax-can-appear-and-where-it-cannot).
 
 ### How the window works

@@ -12,13 +12,14 @@ The pinned pair is mlx 0.32.3 + mlx-c 0.7.0, built with the Neural-Accelerator
 
 | Mac | What to do |
 |---|---|
-| M1–M4, any macOS | Nothing for the kernels: `brew install mlx-c` gives a pair rMLX compiles against, and the pin does not bind. A binary must run on the mlx-c C API it was built against, as on every Mac ([Two mlx-c C APIs](#two-mlx-c-c-apis)). |
+| M1–M4, any macOS | Nothing for the kernels: `brew install mlx-c` gives a pair rMLX compiles against, and the pin does not bind. On that pair `rmlx healthcheck` reports `mlx_pin` info, and `rmlx baseline`, `rmlx bench` and `make mlx-preflight` run. They stop on an mlx-c C API mismatch, as on every Mac ([Two mlx-c C APIs](#two-mlx-c-c-apis)). |
 | M5, macOS 27 or later | The Homebrew bottle for macOS 27 carries the kernels, so `brew upgrade mlx mlx-c` (or `brew reinstall mlx` at the same version) gives `rmlx serve` the NAX kernels. That bottle is not the pinned pair (today it is mlx 0.32.1 + mlx-c 0.6.0_4), so `rmlx baseline` and `rmlx bench` refuse it and `rmlx healthcheck` reports `mlx_pin` red. To measure, build the pinned pair from source ([below](#building-the-pinned-pair)). |
 | M5, macOS 26.2 to 26.x | Build the pair from source ([below](#building-the-pinned-pair)). The macOS 26 bottle has no NAX kernels, and a plain `brew install --build-from-source mlx` has none either: the formula sets the deployment target to `26`. |
 | M5, below macOS 26.2 | No fix. Update macOS. Until then `rmlx baseline` and `rmlx bench` refuse. |
 
-The runtime warning in `crates/rmlx-mlx/src/nax.rs` names the same fix for the
-host it runs on.
+The runtime warning in `crates/rmlx-mlx/src/nax.rs` names the kernel fix for
+the host it runs on. To measure on M5 you also need the pinned pair (see the
+macOS 27 row).
 
 ## Building the pinned pair
 
@@ -118,16 +119,20 @@ checks that the `opt`, linked and pinned records all resolve to them.
    `$RMLX_BOTTLE_STORE/source-built`): a tar of the keg directory, found by
    the keg it holds and checked against `SHA256SUMS`.
 
-A complete keg holds the files rMLX builds against and loads: `libmlx.dylib`,
-`libjaccl.dylib`, `mlx.metallib` and `include/mlx/version.h` for mlx,
-`libmlxc.dylib` and `include/mlx/c/fast.h` for mlx-c. The script extracts a
-copy into a staging directory and moves it into the Cellar only when it is
-complete, so a failed extract leaves no keg.
+A usable keg holds the files rMLX builds against and loads, none of them
+empty: `libmlx.dylib`, `libjaccl.dylib`, `mlx.metallib` and
+`include/mlx/version.h` for mlx, `libmlxc.dylib` and `include/mlx/c/fast.h`
+for mlx-c. The mlx keg must also carry the NAX kernels. The script extracts a
+copy into a staging directory in the Cellar, checks it there, and moves it
+into the Cellar only when it is usable. So a refused copy leaves no keg that a
+later run, or Homebrew, can take as installed. Staging that a killed run left
+is removed at the start.
 
-It stops when neither source has a complete keg, and when the mlx keg has no
-NAX kernels. It pours no Homebrew bottle. When the link step fails, or leaves
-a record on another keg, it prints what the `opt`, linked and pinned records
-of both formulas resolve to, and tells you to run it again. After it, run
+It stops when neither source has a usable keg. Each refusal names what to
+remove: the keg directory in the Cellar, or the tar in the store and its line
+in `SHA256SUMS`. It pours no Homebrew bottle. When the link step fails, or
+leaves a record on another keg, it prints what the `opt`, linked and pinned
+records of both formulas resolve to, and tells you to run it again. After it, run
 `cargo clean -p rmlx-mlx` and build again: a move to an older keg does not
 re-run `build.rs`, so the crate would keep bindings from the wrong headers.
 `make mlx-restore-pin-selftest` (in `make ci` and the hosted CI) is its
@@ -173,18 +178,23 @@ restore script interpolates them into Cellar paths and Ruby text.
 
 **Scoped to Neural-Accelerator hosts** (Apple GPU family 10 and later, from
 `rmlx_core::apple_gpu`). Earlier chips have no Neural Accelerator, so the
-kernels buy nothing there. `the_gate_can_tell_which_host_it_is_on` fails if
-the chip cannot be identified. The C API verdict is not scoped: a mismatch
-fails on every host ([Two mlx-c C APIs](#two-mlx-c-c-apis)).
+kernels buy nothing there. A host whose chip cannot be identified is held to
+the pin, so that it cannot pass without a check, and
+`the_gate_can_tell_which_host_it_is_on` fails there. The C API verdict is not
+scoped: a mismatch fails on every host ([Two mlx-c C APIs](#two-mlx-c-c-apis)).
 
-**It runs where numbers are made.** `rmlx baseline` and `rmlx bench` refuse to
-run when the pin binds and the loaded pair is wrong, and on every host when
-the C API differs. `rmlx healthcheck` reports the verdict as an `mlx_pin`
-line. `scripts/mlx_preflight.sh` (`make mlx-preflight`, run by `make canary`,
-`canary-ab` and `bench-codec-cell`) reads the `opt` symlinks as a pre-filter,
-then asks the built binary and stops unless that line is green. Only the
-process taking the measurement knows what dyld resolved: `MLX_PREFIX` or
-`DYLD_LIBRARY_PATH` can bypass the symlinks.
+**It runs where numbers are made.** `PinCheck::refuses_measurement` is the one
+verdict. `rmlx baseline` and `rmlx bench` refuse when the loaded pair is not
+the pinned one on a host the pin binds or a host that cannot be identified,
+and on every host when the C API differs. `rmlx healthcheck` reports the same
+verdict as an `mlx_pin` line: red where they refuse, info for another pair on
+an identified M1–M4 host, green for the pinned pair. `scripts/mlx_preflight.sh`
+(`make mlx-preflight`, run by `make canary`, `canary-ab` and
+`bench-codec-cell`) reads the `opt` symlinks as a pre-filter, then asks the
+built binary and stops when that line is red. `make mlx-preflight-selftest`
+(in `make ci` and the hosted CI) is its recall test. Only the process taking
+the measurement knows what dyld resolved: `MLX_PREFIX` or `DYLD_LIBRARY_PATH`
+can bypass the symlinks.
 
 ### Run identity: `events.mlx_nax`
 
@@ -230,7 +240,9 @@ once per process, and a mismatch fails on every Mac, M1–M4 included:
 
 The fix is a rebuild against the loaded mlx-c (`cargo clean -p rmlx-mlx`, then
 build; `brew reinstall rmlx` for a Homebrew install), or the mlx-c the binary
-was built against, which is the only fix for a release tarball.
+was built against, which is the only fix for a release tarball. The refusals
+name that fix and not `make mlx-restore-pin`: a restore does not change the
+binary.
 
 On a matched pair the compiled and the loaded C API agree, so no test there
 can see a probe that always answers the compiled one. A cross-pair run can:
@@ -243,7 +255,8 @@ mlx-c 0.6.0_4 run on mlx 0.32.3 + mlx-c 0.7.0, and the reverse:
 | Check | Result, in both directions |
 |---|---|
 | `rmlx healthcheck --human` | `mlx_pin: RED — mlx-c C API mismatch: this binary was compiled against the mlx-c 0.6 C API, but the loaded libmlxc.dylib has the mlx-c 0.7 C API. …` |
-| `rmlx baseline --model <missing path>` | `Error: rmlx baseline refuses to measure: mlx-c C API mismatch: …`; on a matched pair the same command fails on the model path |
+| `rmlx baseline --model <missing path>` | `Error: rmlx baseline refuses to run: mlx-c C API mismatch: …`, naming the rebuild; on a matched pair the same command fails on the model path |
+| `scripts/mlx_preflight.sh`, the binary as `target/release-perf/rmlx` | exit 1 on that `mlx_pin` line, and no `make mlx-restore-pin` hint |
 | `the_loaded_c_api_is_the_compiled_one` | fails |
 | `scaled_dot_product_attention_on_cpu_follows_the_c_api_verdict` | passes through its mismatch arm |
 
