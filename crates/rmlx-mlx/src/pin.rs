@@ -89,11 +89,11 @@ pub(crate) fn parse_pin(src: &str) -> Option<MlxPin> {
 
 /// Whether a token is shaped like a Homebrew keg directory name.
 ///
-/// An allowlist, not a sanity check. These values name directories under the
-/// Cellar that `scripts/mlx_restore_pin.sh` removes, copies over and repoints
-/// symlinks at, so a token such as `..` would reach far outside a keg. Keeping
-/// the rule here as well as in the shell means neither parser can be the one
-/// that accepts it.
+/// An allowlist, not a sanity check. These values name the Cellar directories
+/// that `scripts/mlx_restore_pin.sh` moves kegs to and links, and go into the
+/// Ruby text it gives `brew ruby`, so a token such as `..` would reach far
+/// outside a keg. Keeping the rule here as well as in the shell means neither
+/// parser can be the one that accepts it.
 fn is_keg_version(token: &str) -> bool {
     let mut chars = token.chars();
     chars.next().is_some_and(|c| c.is_ascii_alphanumeric())

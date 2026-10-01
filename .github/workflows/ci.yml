@@ -114,6 +114,10 @@ jobs:
         run: make check-personal-data
       - name: the personal-data gate still catches what it is for
         run: make check-personal-data-selftest
+      # The restore script links and pins Homebrew kegs, so its recall test runs
+      # it against throwaway prefixes and a stub brew: bash, tar and shasum only.
+      - name: make mlx-restore-pin refuses what it must not link
+        run: make mlx-restore-pin-selftest
       # A headline number's provenance is these files, and a manifest sitting
       # beside them proves nothing on its own: the draw is recorded rather than
       # recomputed, and an edited file can be re-blessed in the same commit. The

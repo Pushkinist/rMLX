@@ -111,9 +111,9 @@ fn parse_pin_rejects_a_repeated_formula() {
 
 #[test]
 fn parse_pin_rejects_versions_that_are_not_keg_names() {
-    // These strings name directories the restore script removes, copies over
-    // and repoints symlinks at. `..` is the one that matters: it reaches the
-    // whole Cellar. The rest close the same door from other directions.
+    // These strings name the Cellar directories the restore script moves kegs
+    // to and links. `..` is the one that matters: it reaches the whole Cellar.
+    // The rest close the same door from other directions.
     for hostile in ["..", ".", "../mlx", "a/b", "-rf", "$(id)", "", "\u{7f}"] {
         assert!(
             !is_keg_version(hostile),

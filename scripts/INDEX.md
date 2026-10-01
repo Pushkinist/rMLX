@@ -178,7 +178,7 @@ Conventions:
 |---|---|---|
 | `mlx_preflight.sh` | `make mlx-preflight` | Refuse to bench unless the MLX the built binary loaded is the pinned, nax-capable pair. Pre-filters on the `opt` symlinks, then asks the binary; `rmlx baseline` / `rmlx bench` refuse on their own regardless. |
 | `mlx_restore_pin.sh` | `make mlx-restore-pin` | Restore the pair `crates/rmlx-mlx/mlx-pin.txt` names. |
-| `mlx_restore_pin_selftest.sh` | `make mlx-restore-pin-selftest` (in `make ci`) | Recall test for the above: 9 cases over throwaway prefixes and a stub `brew`, each asserting the exit code, a reason and the `opt` / linked / pinned records left. Takes the script under test as an argument. |
+| `mlx_restore_pin_selftest.sh` | `make mlx-restore-pin-selftest` (in `make ci` and hosted CI) | Recall test for the above: 14 cases over throwaway prefixes, durable stores and a stub `brew`, each asserting the exit code, the reasons, the `opt` / linked / pinned records left and the kegs a failed run must not leave. Takes the script under test as an argument. |
 | `target_gc.sh` | `make target-gc` | Prune stale build profiles from `target/`. |
 | `lib/env.sh` | — | Load repo `.env`, validate `RMLX_O_MODELS_ROOT`. **Source it.** |
 | `lib/mlx_pin.sh` | — | Parse `crates/rmlx-mlx/mlx-pin.txt` (same grammar as `parse_pin`, version shape allowlisted). **Source it.** |

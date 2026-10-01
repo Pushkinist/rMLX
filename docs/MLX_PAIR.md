@@ -113,15 +113,23 @@ checks that the `opt`, linked and pinned records all resolve to them.
 
 `scripts/mlx_restore_pin.sh` takes each pinned keg from:
 
-1. the Cellar, when the keg is still there;
+1. the Cellar, when the keg is there and complete;
 2. the durable store (`~/.rmlx/bottles/source-built`, or
    `$RMLX_BOTTLE_STORE/source-built`): a tar of the keg directory, found by
    the keg it holds and checked against `SHA256SUMS`.
 
-It stops when neither has the keg, when a keg directory is incomplete, and
-when the mlx keg has no NAX kernels. It pours no Homebrew bottle. After it,
-run `cargo clean -p rmlx-mlx` and build again. `make mlx-restore-pin-selftest`
-is its recall test.
+A complete keg holds the files rMLX builds against and loads: `libmlx.dylib`,
+`libjaccl.dylib`, `mlx.metallib` and `include/mlx/version.h` for mlx,
+`libmlxc.dylib` and `include/mlx/c/fast.h` for mlx-c. The script extracts a
+copy into a staging directory and moves it into the Cellar only when it is
+complete, so a failed extract leaves no keg.
+
+It stops when neither source has a complete keg, and when the mlx keg has no
+NAX kernels. It pours no Homebrew bottle. When the link step fails, or leaves
+a record on another keg, it prints what the `opt`, linked and pinned records
+of both formulas resolve to, and tells you to run it again. After it, run
+`cargo clean -p rmlx-mlx` and build again. `make mlx-restore-pin-selftest`
+(in `make ci` and the hosted CI) is its recall test.
 
 ## Two mlx-c C APIs
 
