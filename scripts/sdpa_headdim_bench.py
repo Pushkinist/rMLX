@@ -5,11 +5,12 @@
 script and records no numbers. A result is valid only for the metallib this
 script reports at startup, so re-run it whenever the pinned MLX pair moves.
 
-MLX ships a fused prefill kernel (`steel_attention`) only at `head_dim`
-64 / 80 / 128, and a fused decode kernel (`sdpa_vector`) only at 64 / 96 / 128 /
-256. Everything else silently falls back to the composite graph in
-`mlx/fast.cpp` — `matmul(q, k^T)` -> mask -> softmax -> matmul, with the
-`[B, n_heads, L_q, L_k]` score tensor materialised. This measures the gap.
+MLX routes each `head_dim` to a fused prefill kernel (`steel_attention`), a
+fused decode kernel (`sdpa_vector`), or the composite graph in `mlx/fast.cpp`
+— `matmul(q, k^T)` -> mask -> softmax -> matmul, with the
+`[B, n_heads, L_q, L_k]` score tensor materialised. Which widths and shapes
+take which route is the table in `docs/FFI.md` § "Head-dim dispatch and the
+unfused fallback". This measures the gap.
 
 Three sections, each answering one question:
 
@@ -36,10 +37,10 @@ Three sections, each answering one question:
 
 Preconditions:
 
-  - Python MLX whose bundled metallib matches the pinned Homebrew bottle. The
-    startup banner prints both the version and the `steel_attention` /
-    `sdpa_vector` inventory so a run records the toolchain it measured. Verify
-    against the bottle with:
+  - Python MLX whose bundled metallib matches the pinned pair
+    (docs/MLX_PAIR.md). The startup banner prints both the version and the
+    `steel_attention` / `sdpa_vector` inventory so a run records the toolchain
+    it measured. Verify against the pinned pair with:
         xcrun metal-nm --defined-only "$(brew --prefix mlx)/lib/mlx.metallib"
   - Exclusive GPU. Hold the rMLX claim file or make sure nothing else is on the
     device; a competing process invalidates every cell.
