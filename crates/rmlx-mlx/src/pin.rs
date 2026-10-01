@@ -169,8 +169,14 @@ pub(crate) enum PinVerdict {
     NotLoaded { library: &'static str },
     /// The loaded `libmlxc.dylib` has another C API than the one this binary
     /// was compiled against, so attention cannot run. Outranks every finding
-    /// about the pair: a rebuild is the fix, whatever the kegs are.
-    CApiMismatch { compiled: CApi, loaded: CApi },
+    /// about the pair. `pair` is the verdict on the pair alone: where the pin
+    /// binds, a pair that is not the pinned one needs the restore as well as
+    /// the rebuild.
+    CApiMismatch {
+        compiled: CApi,
+        loaded: CApi,
+        pair: Box<PinVerdict>,
+    },
     /// The metallib was read and does not carry the kernels — the expensive
     /// failure, and the one a version number cannot detect.
     KernelsMissing {
@@ -202,20 +208,32 @@ impl LinkedPair {
     ///
     /// Precedence is by cost, not by the order the facts were read. An mlx-c
     /// C API mismatch comes first after an unloaded library: attention cannot
-    /// run at all. A missing kernel family is reported ahead of a version
-    /// disagreement because it is
-    /// the failure that is both expensive and invisible; a version
-    /// disagreement is reported ahead of the inconclusive states because it is
-    /// the one that is actually known to be wrong.
+    /// run at all. It carries the verdict on the pair, because the fix also
+    /// depends on the pair.
     pub(crate) fn classify(&self, pin: &MlxPin) -> PinVerdict {
         for (half, library) in [(&self.mlx, MLX_LIB), (&self.mlx_c, MLX_C_LIB)] {
             if matches!(half, Library::NotLoaded) {
                 return PinVerdict::NotLoaded { library };
             }
         }
-        if let CApiVerdict::Mismatch { compiled, loaded } = self.c_api {
-            return PinVerdict::CApiMismatch { compiled, loaded };
+        let pair = self.classify_pair(pin);
+        match self.c_api {
+            CApiVerdict::Mismatch { compiled, loaded } => PinVerdict::CApiMismatch {
+                compiled,
+                loaded,
+                pair: Box::new(pair),
+            },
+            CApiVerdict::Match(_) => pair,
         }
+    }
+
+    /// Judge the kegs and the metallib, with the C API left out.
+    ///
+    /// A missing kernel family is reported ahead of a version disagreement
+    /// because it is the failure that is both expensive and invisible; a
+    /// version disagreement is reported ahead of the inconclusive states
+    /// because it is the one that is actually known to be wrong.
+    fn classify_pair(&self, pin: &MlxPin) -> PinVerdict {
         let metallib = match &self.kernels {
             KernelScan::Scanned {
                 present: false,
@@ -313,7 +331,9 @@ impl PinVerdict {
                 "dyld lists no {library} in this process, so the loaded MLX cannot be \
                  identified at all"
             ),
-            Self::CApiMismatch { compiled, loaded } => c_api::mismatch_message(*compiled, *loaded),
+            Self::CApiMismatch {
+                compiled, loaded, ..
+            } => c_api::mismatch_message(*compiled, *loaded),
             Self::KernelsMissing { metallib, mlx } => format!(
                 "{} (mlx {}) carries no {NAX_GEMM_KERNEL} kernels — GPU matmul and prefill \
                  run slower without them, while output and decode look normal. Repoint both halves of the pair to {PIN_FILE_DISPLAY} \
@@ -429,8 +449,8 @@ impl PinEnforcement {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinRefusal {
     /// The loaded `libmlxc.dylib` has another C API than the one this binary
-    /// was compiled against, on any host. The fix is a rebuild against the
-    /// loaded mlx-c; a restore of the pair does not change the binary.
+    /// was compiled against, on any host. The fix is a rebuild, and also the
+    /// restore where the pin binds and the loaded pair is not the pinned one.
     CApiMismatch,
     /// The loaded pair is not the pinned one, on a host that
     /// [`PinEnforcement::requires_the_pinned_pair`]. The fix is the pinned
@@ -460,9 +480,19 @@ pub fn pin_check() -> PinCheck {
     let found = verdict();
     let enforcement = enforcement_for(rmlx_core::apple_gpu::apple_silicon_generation());
     let c_api_matches = matches!(c_api::verdict(), CApiVerdict::Match(_));
-    // The host class is in the operator-facing line, not only in the status:
-    // without it an inapplicable gate and a gate that could not tell read
-    // identically.
+    PinCheck {
+        matches: found.is_match(),
+        c_api_matches,
+        enforcement,
+        detail: detail(&found, enforcement, c_api_matches),
+    }
+}
+
+/// The operator-facing line of a pin check.
+///
+/// The host class is in the line, not only in the status: without it an
+/// inapplicable gate and a gate that could not tell read identically.
+fn detail(found: &PinVerdict, enforcement: PinEnforcement, c_api_matches: bool) -> String {
     let scope = if c_api_matches {
         enforcement.describe()
     } else {
@@ -471,12 +501,23 @@ pub fn pin_check() -> PinCheck {
             enforcement.describe()
         )
     };
-    PinCheck {
-        matches: found.is_match(),
-        c_api_matches,
-        enforcement,
-        detail: format!("{} ({scope})", found.report()),
-    }
+    let restore = if let PinVerdict::CApiMismatch { pair, .. } = found {
+        if !pair.is_match() && enforcement.requires_the_pinned_pair() {
+            // A rebuild against this pair gives a binary that is refused as a
+            // pair that is not the pinned one, so the restore comes first.
+            format!(
+                " The loaded pair is not the pinned one either: {}. A measurement on this \
+                 host needs the pinned pair: run `make mlx-restore-pin`, then rebuild if this \
+                 binary was not built against the pinned pair.",
+                pair.report()
+            )
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+    format!("{} ({scope}){restore}", found.report())
 }
 
 /// Map the probed Apple GPU family onto whether the pin binds.

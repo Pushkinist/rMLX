@@ -279,7 +279,7 @@ printf '#!/usr/bin/env bash\nexit 1\n' >"$c/bin/strings"
 chmod +x "$c/bin/strings"
 expect "a copy strings cannot check names the tool and is kept" "$c" 1 \
 	"the copy of mlx $MLX_V in mlx-copy.tar.gz could not be checked for NAX kernels: strings failed
-and mlx-copy.tar.gz is kept. Make sure that strings runs" \
+and mlx-copy.tar.gz is kept. Make sure that strings runs (the Xcode Command Line Tools give it: xcode-select --install), then run this again" \
 	no-line "Remove" absent "Cellar/mlx/$MLX_V" absent "Cellar/.rmlx-restore.*"
 
 c=$(new_case cellar-unreadable-metallib)
@@ -289,7 +289,7 @@ mkdir -p "$c/bin"
 printf '#!/usr/bin/env bash\nexit 1\n' >"$c/bin/strings"
 chmod +x "$c/bin/strings"
 expect "a keg strings cannot check names the tool and is kept" "$c" 1 \
-	"$c/prefix/Cellar/mlx/$MLX_V could not be checked for NAX kernels: strings failed on its lib/mlx.metallib. It is kept. Make sure that strings runs" \
+	"$c/prefix/Cellar/mlx/$MLX_V could not be checked for NAX kernels: strings failed on its lib/mlx.metallib. It is kept. Make sure that strings runs (the Xcode Command Line Tools give it: xcode-select --install), then run this again" \
 	no-line "Remove" present "Cellar/mlx/$MLX_V/lib/mlx.metallib"
 
 c=$(new_case no-cellar)
@@ -316,7 +316,7 @@ store_tar "$c" mlx-c-copy.tar.gz mlx-c "$MLXC_V" yes
 mkdir "$c/prefix/Cellar/.rmlx-restore-lock"
 keg "$c/prefix/Cellar/.rmlx-restore.LIVE" mlx "$MLX_V" yes
 expect "a second restore stops on the lock and keeps the first run's files" "$c" 1 \
-	"another restore holds $c/prefix/Cellar/.rmlx-restore-lock. When no restore runs, remove" \
+	"another restore holds $c/prefix/Cellar/.rmlx-restore-lock. When \`pgrep -f mlx_restore_pin.sh\` finds no restore, \`rmdir $c/prefix/Cellar/.rmlx-restore-lock\`, then run this again" \
 	present "Cellar/.rmlx-restore-lock" present "Cellar/.rmlx-restore.LIVE" absent "Cellar/mlx/$MLX_V"
 
 # A file where the formula directory must be: the move into the Cellar fails.
@@ -326,7 +326,8 @@ store_tar "$c" mlx-c-copy.tar.gz mlx-c "$MLXC_V" yes
 printf 'x' >"$c/prefix/Cellar/mlx"
 expect "a failed move into the Cellar names what blocks it and leaves no staging" "$c" 1 \
 	"cannot move mlx $MLX_V into $c/prefix/Cellar/mlx
-Remove or rename what is there" absent "Cellar/.rmlx-restore.*"
+Remove or rename $c/prefix/Cellar/mlx when it is a file, or $c/prefix/Cellar/mlx/$MLX_V when it exists" \
+	absent "Cellar/.rmlx-restore.*"
 
 # A run stopped by SIGKILL left its staging directory with a full keg in it.
 c=$(new_case stale-staging)
@@ -335,6 +336,14 @@ keg "$c/prefix/Cellar" mlx-c "$MLXC_V" yes
 keg "$c/prefix/Cellar/.rmlx-restore.KILLED" mlx "$MLX_V" yes
 expect "the staging a killed run left is removed" "$c" 0 "[preflight stub]" \
 	"${LINKED[@]}" absent "Cellar/.rmlx-restore.*"
+
+# The preflight runs last and its verdict is the verdict of the restore.
+c=$(new_case preflight-fails)
+keg "$c/prefix/Cellar" mlx "$MLX_V" yes
+keg "$c/prefix/Cellar" mlx-c "$MLXC_V" yes
+printf '#!/usr/bin/env bash\necho "[preflight stub fails]"\nexit 1\n' >"$c/repo/scripts/mlx_preflight.sh"
+expect "a preflight that fails after the link fails the restore and releases the lock" "$c" 1 \
+	"[preflight stub fails]" "${LINKED[@]}" absent "Cellar/.rmlx-restore-lock"
 
 c=$(new_case cellar-empty-dylib)
 keg "$c/prefix/Cellar" mlx "$MLX_V" yes

@@ -5,6 +5,10 @@
 # identified. On an identified M1-M4 host the pin does not bind, so the
 # preflight passes there when the C API matches.
 #
+# A C API mismatch is fixed by a rebuild. The restore is named for it only
+# when the binary's line names it: where the pin binds and the loaded pair is
+# not the pinned one.
+#
 # Two sources, never both:
 #
 #   1. A built binary (target/release-perf/rmlx). It must launch, and its own
@@ -48,6 +52,11 @@ hint_restore() {
 
 # --- 1. the built binary's own verdict ---------------------------------------
 bin="target/release-perf/rmlx"
+if [ -e "$bin" ] && [ ! -x "$bin" ]; then
+	fail "$bin is not executable, so its verdict cannot be read. Build it again" \
+		"(make build-perf), then run this again"
+	exit 1
+fi
 if [ -x "$bin" ]; then
 	if ! "$bin" --version >/dev/null 2>&1; then
 		fail "$bin cannot launch against the MLX it loads (dyld failure? ABI mismatch?)"
@@ -68,9 +77,10 @@ if [ -x "$bin" ]; then
 		;;
 	esac
 	fail "the built binary refuses to measure: $pin_line"
-	# The line names the fix for a C API mismatch: a rebuild. A restore does
-	# not change the binary.
+	# A restore does not change the binary, so a C API mismatch takes the
+	# restore only when its line names it.
 	case "$pin_line" in
+	*"C API mismatch"*"make mlx-restore-pin"*) hint_restore ;;
 	*"C API mismatch"*) ;;
 	*) hint_restore ;;
 	esac

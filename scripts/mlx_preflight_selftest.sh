@@ -107,6 +107,14 @@ c=$(new_case m5-c-api "Apple M5 Max" "$MLX_V" "$MLXC_V" yes "$CAPI")
 expect "a C API mismatch on an M5 Mac stops and does not name the restore" "$c" 1 \
 	"PREFLIGHT FAIL: the built binary refuses to measure: $CAPI" "make mlx-restore-pin"
 
+# The binary was built against the pinned pair, and `opt` moved to another
+# pair: the binary's line names the restore, and so does the preflight.
+c=$(new_case m5-c-api-off-pin "Apple M5 Max" 9.9.8 8.8.7 no \
+	"$CAPI. The loaded pair is not the pinned one either: dyld resolved mlx 9.9.8. A measurement on this host needs the pinned pair: run \`make mlx-restore-pin\`, then rebuild if this binary was not built against the pinned pair.")
+expect "a C API mismatch whose line names the restore names it" "$c" 1 \
+	"PREFLIGHT FAIL: the built binary refuses to measure: $CAPI
+Restore the nax-capable pair:  make mlx-restore-pin"
+
 c=$(new_case m5-pair "Apple M5 Max" "$MLX_V" "$MLXC_V" yes \
 	"mlx_pin: RED — dyld resolved mlx 9.9.8, but crates/rmlx-mlx/mlx-pin.txt pins 9.9.9")
 expect "an M5 Mac whose binary loaded another pair stops and names the restore" "$c" 1 \
@@ -146,6 +154,13 @@ printf '#!/usr/bin/env bash\nexit 1\n' >"$c/repo/target/release-perf/rmlx"
 expect "a binary that cannot launch stops" "$c" 1 \
 	"PREFLIGHT FAIL: target/release-perf/rmlx cannot launch"
 
+# The opt records would pass: a binary that cannot run must not fall through
+# to them.
+c=$(new_case not-executable "Apple M2 Pro" 9.9.8 8.8.7 no "mlx_pin: GREEN — loaded mlx 9.9.9")
+chmod -x "$c/repo/target/release-perf/rmlx"
+expect "a binary that is not executable stops" "$c" 1 \
+	"PREFLIGHT FAIL: target/release-perf/rmlx is not executable" "no target/release-perf/rmlx yet"
+
 c=$(new_case no-pin-line "Apple M5 Max" "$MLX_V" "$MLXC_V" yes "")
 expect "a binary that prints no mlx_pin line stops" "$c" 1 \
 	"PREFLIGHT FAIL: target/release-perf/rmlx reported no mlx_pin line"
@@ -176,6 +191,19 @@ expect "no binary, a chip sysctl cannot name is held to the pin" "$c" 1 \
 # rmlx_core::apple_gpu identifies a chip only from a leading "Apple M<n>".
 c=$(new_case virtual-no-binary "Virtual Apple M2" 9.9.8 8.8.7 yes none)
 expect "no binary, a brand that does not start with Apple M<n> is held to the pin" "$c" 1 \
+	"linked mlx 9.9.8 + mlx-c 8.8.7 is not the pinned pair"
+
+# The spellings rmlx_core::apple_gpu::parse_apple_generation also reads as
+# M1-M4: lower and upper case, leading space, a zero before the number.
+for brand in "apple m2" "APPLE M3" "  Apple M3 Max" "Apple M04"; do
+	c=$(new_case "exempt-$(printf '%s' "$brand" | tr -c 'A-Za-z0-9' _)" "$brand" 9.9.8 8.8.7 no none)
+	expect "no binary, \"$brand\" is an M1-M4 Mac" "$c" 0 \
+		"(no Neural Accelerator, the pin does not bind), mlx 9.9.8 + mlx-c 8.8.7, nax check skipped"
+done
+
+# parse_apple_generation takes only these three spellings of the vendor.
+c=$(new_case mixed-case-no-binary "aPPLE M2" 9.9.8 8.8.7 yes none)
+expect "no binary, a vendor spelling the Rust parser refuses is held to the pin" "$c" 1 \
 	"linked mlx 9.9.8 + mlx-c 8.8.7 is not the pinned pair"
 
 c=$(new_case m41-no-binary "Apple M41" 9.9.8 8.8.7 yes none)

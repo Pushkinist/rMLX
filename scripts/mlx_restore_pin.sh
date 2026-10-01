@@ -55,14 +55,16 @@ LOCK="$CELLAR/.rmlx-restore-lock"
 STAGE=""
 if ! mkdir "$LOCK" 2>/dev/null; then
 	[ -d "$LOCK" ] &&
-		die "another restore holds $LOCK. When no restore runs, remove $LOCK, then run this again"
+		die "another restore holds $LOCK. When \`pgrep -f mlx_restore_pin.sh\` finds no restore," \
+			"\`rmdir $LOCK\`, then run this again"
 	die "cannot make $LOCK. $CELLAR must be a directory that you can write to"
 fi
-trap 'rm -rf "$LOCK"; [ -z "$STAGE" ] || rm -rf "$STAGE"' EXIT
-# A run stopped by SIGKILL leaves its staging directory, with a full keg in it.
+trap '[ -z "$STAGE" ] || rm -rf "$STAGE"; rm -rf "$LOCK"' EXIT
+# A run stopped by SIGKILL or a crash leaves its staging directory, with a full
+# keg in it.
 rm -rf "${CELLAR:?}"/.rmlx-restore.*
 
-STRINGS_FIX="Make sure that strings runs (the Xcode Command Line Tools give it: xcode-select --install) and can read that file, then run this again"
+STRINGS_FIX="Make sure that strings runs (the Xcode Command Line Tools give it: xcode-select --install), then run this again"
 
 pin_of() {
 	if [ "$1" = mlx ]; then echo "$PIN_MLX"; else echo "$PIN_MLXC"; fi
@@ -139,7 +141,8 @@ from_store() {
 		esac
 		mkdir -p "$CELLAR/$f" && mv "$STAGE/$f/$v" "$CELLAR/$f/$v" ||
 			die "cannot move $f $v into $CELLAR/$f. $CELLAR/$f must be a directory that you" \
-				"can write to, with no $v in it. Remove or rename what is there, then run this again"
+				"can write to, with no $v in it. Remove or rename $CELLAR/$f when it is a file," \
+				"or $CELLAR/$f/$v when it exists, then run this again"
 		rm -rf "$STAGE"
 		STAGE=""
 		echo "[store] $f $v from $file"

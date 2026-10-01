@@ -126,9 +126,9 @@ for mlx-c. The mlx keg must also carry the NAX kernels. The script extracts a
 copy into a staging directory in the Cellar, checks it there, and moves it
 into the Cellar only when it is usable. So a refused copy leaves no keg that a
 later run, or Homebrew, can take as installed. One restore runs at a time: a
-second run stops on the lock `Cellar/.rmlx-restore-lock`. A run that was
-killed leaves that lock, and the refusal tells you to remove it. Staging that
-a killed run left is removed at the start.
+second run stops on the lock `Cellar/.rmlx-restore-lock`. A run stopped by
+SIGKILL or a crash leaves that lock, and the refusal tells you how to remove
+it. Staging that such a run left is removed at the start.
 
 It stops when neither source has a usable keg. A refusal names the keg
 directory in the Cellar, or the tar in the store and its line in
@@ -169,7 +169,7 @@ pass:
 |---|---|
 | `Match` | both kegs are the pinned pair, the metallib carries the kernels, and the C API matches |
 | `NotLoaded` | dyld listed no such image; reported first |
-| `CApiMismatch` | the loaded `libmlxc` has another C API than the compiled one; attention cannot run |
+| `CApiMismatch` | the loaded `libmlxc` has another C API than the compiled one; attention cannot run. It carries the verdict on the pair, which decides whether the restore is part of the fix |
 | `KernelsMissing` | the metallib was read and has none |
 | `VersionMismatch` | a keg version disagrees with the pin |
 | `NotAKeg` | the resolved library is not in a keg, so it has no version |
@@ -195,8 +195,9 @@ one. `rmlx baseline` and `rmlx bench` refuse when the loaded pair is not the
 pinned one on a host the pin binds or a host that cannot be identified, and
 on every host when the C API differs. `rmlx healthcheck` reports the same
 verdict as an `mlx_pin` line: red where they refuse, info for another pair on
-an identified M1–M4 host, green for the pinned pair. `scripts/mlx_preflight.sh` (`make mlx-preflight`, run by
-`make canary`, `canary-ab` and `bench-codec-cell`) stops on the same verdict.
+an identified M1–M4 host, green for the pinned pair.
+`scripts/mlx_preflight.sh` (`make mlx-preflight`, run by `make canary`,
+`canary-ab` and `bench-codec-cell`) stops on the same verdict.
 With a built binary it reads only that binary's `mlx_pin` line: green or info
 passes, anything else stops. Only the process taking the measurement knows
 what dyld resolved, and `MLX_PREFIX` can load a pair that the `opt` symlinks
@@ -251,8 +252,12 @@ once per process, and a mismatch fails on every Mac, M1–M4 included:
 The fix is a rebuild against the loaded mlx-c (`cargo clean -p rmlx-mlx`, then
 build; `brew reinstall rmlx` for a Homebrew install), or the mlx-c the binary
 was built against, which is the only fix for a release tarball. The refusals
-name that fix and not `make mlx-restore-pin`: a restore does not change the
-binary.
+name that fix. A restore does not change the binary, so they name
+`make mlx-restore-pin` only where a measurement also needs the pinned pair: on
+a host that requires it, when the loaded pair is not the pinned one. There a
+rebuild against the loaded mlx-c gives a binary that is refused again, for
+the pair. Restore first, then rebuild if the binary was not built against the
+pinned pair.
 
 On a matched pair the compiled and the loaded C API agree, so no test there
 can see a probe that always answers the compiled one. A cross-pair run can:
@@ -260,15 +265,17 @@ build against one pair, then run with `DYLD_LIBRARY_PATH` set to the `lib`
 directories of both kegs of the other pair (set it on the command itself;
 macOS drops `DYLD_*` at a protected binary such as `/usr/bin/env`).
 Measured on an M5 Max, macOS 26.6, with a binary built against mlx 0.32.1 +
-mlx-c 0.6.0_4 run on mlx 0.32.3 + mlx-c 0.7.0, and the reverse:
+mlx-c 0.6.0_4 run on the pinned mlx 0.32.3 + mlx-c 0.7.0, and the reverse:
 
-| Check | Result, in both directions |
-|---|---|
-| `rmlx healthcheck --human` | `mlx_pin: RED — mlx-c C API mismatch: this binary was compiled against the mlx-c 0.6 C API, but the loaded libmlxc.dylib has the mlx-c 0.7 C API. …` |
-| `rmlx baseline --model <missing path>` | `Error: rmlx baseline refuses to run: mlx-c C API mismatch: …`, naming the rebuild; on a matched pair the same command fails on the model path |
-| `scripts/mlx_preflight.sh`, the binary as `target/release-perf/rmlx` | exit 1 on that `mlx_pin` line, and no `make mlx-restore-pin` hint |
-| `the_loaded_c_api_is_the_compiled_one` | fails |
-| `scaled_dot_product_attention_on_cpu_follows_the_c_api_verdict` | passes through its mismatch arm |
+| Check | 0.6 binary on the pinned pair | 0.7 binary on 0.32.1 + 0.6.0_4 |
+|---|---|---|
+| `rmlx healthcheck --human` | `mlx_pin: RED — mlx-c C API mismatch: this binary was compiled against the mlx-c 0.6 C API, but the loaded libmlxc.dylib has the mlx-c 0.7 C API. …`, naming the rebuild | the same with the C APIs swapped, then `The loaded pair is not the pinned one either: … run make mlx-restore-pin, then rebuild if …` |
+| `rmlx baseline --model <missing path>` | exit 1, `Error: rmlx baseline refuses to run: mlx-c C API mismatch: …` | exit 1, the same with the restore sentence |
+| `scripts/mlx_preflight.sh`, the binary as `target/release-perf/rmlx` | exit 1 on that `mlx_pin` line, no `make mlx-restore-pin` | exit 1, and `Restore the nax-capable pair:  make mlx-restore-pin` |
+| `the_loaded_c_api_is_the_compiled_one` | fails | fails |
+| `scaled_dot_product_attention_on_cpu_follows_the_c_api_verdict` | passes through its mismatch arm | passes through its mismatch arm |
+
+On a matched pair the same `rmlx baseline` fails on the model path.
 
 With `loaded()` changed to return the compiled C API, every test passes on a
 matched pair. Across pairs the CPU SDPA test then fails: the 0.6 binary on the

@@ -400,7 +400,11 @@ fn a_c_api_mismatch_outranks_every_finding_about_the_pair() {
         found,
         PinVerdict::CApiMismatch {
             compiled: CApi::V0_6,
-            loaded: CApi::V0_7
+            loaded: CApi::V0_7,
+            pair: Box::new(PinVerdict::KernelsMissing {
+                metallib: PathBuf::from("/keg/lib/mlx.metallib"),
+                mlx: Some("0.31.2".to_owned()),
+            }),
         }
     );
     assert!(!found.is_match());
@@ -445,6 +449,7 @@ fn no_two_verdicts_read_the_same() {
         PinVerdict::CApiMismatch {
             compiled: CApi::V0_6,
             loaded: CApi::V0_7,
+            pair: Box::new(pinned_pair().classify(&pin())),
         },
     ];
     let mut seen: Vec<String> = Vec::new();
@@ -653,6 +658,55 @@ fn the_measurement_refusal_covers_every_cell() {
         Some(PinRefusal::PairNotPinned),
         "a host that could not be identified must not measure off the pinned pair"
     );
+}
+
+/// A C API mismatch names the restore only where it is part of the fix: on a
+/// host that requires the pinned pair, when the loaded pair is not the pinned
+/// one. There a rebuild against the loaded mlx-c gives a binary that is
+/// refused again. Elsewhere a restore does not change the binary, so the line
+/// does not name it.
+#[test]
+fn a_c_api_mismatch_names_the_restore_only_when_the_pair_also_needs_it() {
+    use super::{detail, PinEnforcement};
+
+    let mismatch = CApiVerdict::Mismatch {
+        compiled: CApi::V0_7,
+        loaded: CApi::V0_6,
+    };
+    let off_pin = LinkedPair {
+        c_api: mismatch,
+        mlx: keg("mlx", "0.32.0", "libmlx.dylib"),
+        ..pinned_pair()
+    }
+    .classify(&pin());
+    let on_pin = LinkedPair {
+        c_api: mismatch,
+        ..pinned_pair()
+    }
+    .classify(&pin());
+    let restore = "make mlx-restore-pin";
+    for enforcement in [PinEnforcement::Binding, PinEnforcement::UnknownHost] {
+        let line = detail(&off_pin, enforcement, false);
+        assert!(
+            line.contains(restore) && line.contains("dyld resolved mlx 0.32.0"),
+            "off the pin on {enforcement:?}, the line must name the restore and the pair: {line}"
+        );
+        let line = detail(&on_pin, enforcement, false);
+        assert!(
+            !line.contains(restore),
+            "on the pinned pair a restore does not change the binary: {line}"
+        );
+    }
+    let line = detail(
+        &off_pin,
+        PinEnforcement::NotApplicable { gpu_family: 9 },
+        false,
+    );
+    assert!(
+        !line.contains(restore),
+        "where the pin does not bind, a rebuild against the loaded mlx-c is the fix: {line}"
+    );
+    assert!(line.contains("mlx-c C API mismatch"), "{line}");
 }
 
 /// `pin_check` hands the C API verdict to its callers, which is how a mismatch

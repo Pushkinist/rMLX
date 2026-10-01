@@ -22,7 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error instead of calling mlx-c, `rmlx healthcheck` reports `mlx_pin` red,
   `rmlx baseline` and `rmlx bench` refuse before a model loads, and
   `make mlx-preflight` stops. Each names the fix: a rebuild against the loaded
-  mlx-c, or the mlx-c the binary was built against.
+  mlx-c, or the mlx-c the binary was built against. Where the pin binds and
+  the loaded pair is not the pinned one, they also name `make mlx-restore-pin`,
+  because a rebuild against that pair is refused again.
 
 ### Changed
 

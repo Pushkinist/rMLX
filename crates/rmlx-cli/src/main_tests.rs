@@ -401,8 +401,9 @@ fn claim_refusal_maps_to_exit_code_11() {
     assert!(crate::exit::exit_code(Err(anyhow::anyhow!("other"))).is_err());
 }
 
-/// A C API mismatch names the rebuild its detail gives and no restore; a pair
-/// refusal names the restore; a cleared check refuses nothing.
+/// A C API mismatch names only the fixes its detail gives, and adds no
+/// restore of its own; a pair refusal names the restore; a cleared check
+/// refuses nothing.
 #[test]
 fn a_pin_refusal_names_the_fix_for_its_cause() {
     use super::pin_refusal;
