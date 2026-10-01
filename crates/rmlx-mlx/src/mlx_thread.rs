@@ -18,8 +18,6 @@
 //!
 //! A hand-off allocates nothing: the job and its result stay on the stack of
 //! the waiting thread, and the MLX thread reaches them through one mailbox.
-//! Each side spins briefly before it parks, because during decode the next
-//! job, or the result, usually comes within microseconds.
 //!
 //! Only this module names an mlx-c stream function:
 //! `every_stream_comes_from_the_mlx_thread` fails on one in any other source
@@ -85,18 +83,9 @@ static MAILBOX: Mailbox = Mailbox {
     done: AtomicBool::new(false),
 };
 
-/// About 20 µs of `spin_loop` on an M5 core.
-const SPIN_LIMIT: u32 = 2048;
-
-/// Return when `flag` is set: spin up to [`SPIN_LIMIT`] times, then park. The
-/// thread that sets `flag` unparks this one after it.
+/// Park until `flag` is set. The thread that sets `flag` unparks this one
+/// after it.
 fn wait_for(flag: &AtomicBool) {
-    for _ in 0..SPIN_LIMIT {
-        if flag.load(Ordering::Acquire) {
-            return;
-        }
-        std::hint::spin_loop();
-    }
     while !flag.load(Ordering::Acquire) {
         std::thread::park();
     }

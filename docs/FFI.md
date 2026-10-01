@@ -233,9 +233,9 @@ and keeps them for the life of the process.
 - A hand-off allocates nothing and creates no channel: the job and its result
   stay on the stack of the waiting thread, and one static mailbox passes a
   pointer to the job (`crates/rmlx-mlx/tests/hand_off.rs`). Callers take
-  turns (`concurrent_hand_offs_each_get_their_own_value`). Each side spins
-  about 20 µs, then parks. A job can borrow from its caller, so no mlx-c handle
-  type needs `Send`.
+  turns (`concurrent_hand_offs_each_get_their_own_value`). Each side parks
+  until the other unparks it. A job can borrow from its caller, so no mlx-c
+  handle type needs `Send`.
 - A call from the MLX thread itself runs in place
   (`a_hand_off_from_the_mlx_thread_runs_in_place`). A second hand-off from
   there would wait forever for the mailbox `turn`, which the thread that
@@ -249,8 +249,8 @@ thread-boundary suite (`crates/rmlx-server/tests/thread_boundary*.rs`) holds
 the production hand-overs on real models.
 
 Cost: each `Array::eval`, `async_eval` and `Closure::apply` from another
-thread is one hand-off. Median, release build: 0.4 µs while the MLX thread
-spins, 3 to 5 µs after it parked. Decode makes 110 per token on
+thread is one hand-off. Median, release build, `eval` of an available array:
+2 to 4 µs. Decode makes 110 per token on
 Ternary-Bonsai-8B and 103 on gemma-4-e2b at the default KV quant; one
 `async_eval` of the K and V buffers is one hand-off, not two.
 

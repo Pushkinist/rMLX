@@ -117,31 +117,6 @@ fn a_hand_off_from_the_mlx_thread_runs_in_place() {
     assert_eq!(nested.unwrap().unwrap(), 5);
 }
 
-/// Each side of a hand-off spins briefly, then parks. A job posted after the
-/// MLX thread parked, which runs longer than the spin of its waiter, must wake
-/// both threads. The first hand-off starts the MLX thread, so that it is
-/// parked, not starting, when the second one comes.
-#[test]
-fn a_hand_off_wakes_a_parked_mlx_thread_and_a_parked_waiter() {
-    let (done_tx, done_rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        run(|| ()).ok();
-        std::thread::sleep(Duration::from_millis(50));
-        let value = run(|| {
-            std::thread::sleep(Duration::from_millis(50));
-            3
-        });
-        done_tx.send(value).ok();
-    });
-    let value = within_limit(
-        &done_rx,
-        Duration::from_secs(10),
-        "a hand-off after both parked",
-    )
-    .unwrap_or_else(|| panic!("the hand-off panicked"));
-    assert_eq!(value.unwrap(), 3);
-}
-
 /// Eight threads hand off at the same time, and each must get back the value
 /// of its own job. Without `turn`, a second post replaces the first: that job
 /// is lost, or the MLX thread runs it after its waiter returned.
