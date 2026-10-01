@@ -41,13 +41,25 @@ thread_local! {
     static DEFAULTS_SET: Cell<bool> = const { Cell::new(false) };
 }
 
-/// A job on the stack of the thread that waits for it.
+/// A job on the stack of the thread that waits for it: a pointer to the
+/// closure, and [`call`] for the type of that closure.
 #[derive(Clone, Copy)]
-struct JobRef(*mut (dyn FnMut() + Send));
+struct JobRef {
+    job: *mut (),
+    call: unsafe fn(*mut ()),
+}
 
-// SAFETY: the job itself is `Send`, and its thread waits in `hand_off` until
-// the MLX thread is done with it.
+// SAFETY: `hand_off` makes a `JobRef` only from a closure that is `Send`.
 unsafe impl Send for JobRef {}
+
+/// Call the closure of type `F` that `job` points to.
+///
+/// # Safety
+/// `job` points to a live `F`, and nothing else uses that `F` during the call.
+unsafe fn call<F: FnMut()>(job: *mut ()) {
+    // SAFETY: the caller's contract.
+    unsafe { (*job.cast::<F>())() }
+}
 
 /// A posted job and the thread that waits for it.
 struct Post {
@@ -57,7 +69,7 @@ struct Post {
 
 /// Where a waiting thread puts its job for the MLX thread.
 struct Mailbox {
-    /// Held by the one thread whose job is posted.
+    /// Held by the one thread whose job is posted, until it sees `done`.
     turn: Mutex<()>,
     post: Mutex<Option<Post>>,
     /// Set when `post` holds a job that the MLX thread has not taken.
@@ -138,34 +150,30 @@ fn serve(mailbox: &Mailbox) {
         let Some(Post { job, waiter }) = post else {
             continue;
         };
-        // SAFETY: the waiting thread keeps the job alive, and does not touch
-        // it, until it sees `done`.
-        unsafe { (*job.0)() };
+        // SAFETY: `hand_off` made `job` from a live closure of the type that
+        // `job.call` expects. Its thread holds `turn`, so the next `done` is
+        // for this job, and it does not use or drop the closure until it sees
+        // that `done`: nothing in `hand_off` from the store of `posted` to the
+        // end of `wait_for` returns or unwinds.
+        unsafe { (job.call)(job.job) };
         mailbox.done.store(true, Ordering::Release);
         waiter.unpark();
     }
 }
 
 /// Run `job` on the MLX thread and return when it is done.
-#[allow(
-    clippy::transmute_ptr_to_ptr,
-    reason = "an `as` cast cannot extend the lifetime of a trait object (rust-lang/rust#141402)"
-)]
-fn hand_off(job: &mut (dyn FnMut() + Send + '_)) -> Result<()> {
+fn hand_off<F: FnMut() + Send>(job: &mut F) -> Result<()> {
     let (mailbox, mlx_thread) = mailbox()?;
     let _turn = mailbox.turn.lock().unwrap_or_else(PoisonError::into_inner);
-    // SAFETY: only the lifetime changes. This function returns only after the
-    // MLX thread has run the job and set `done`, so the job outlives every use
-    // of the pointer.
-    let job = unsafe {
-        std::mem::transmute::<*mut (dyn FnMut() + Send + '_), *mut (dyn FnMut() + Send + 'static)>(
-            job,
-        )
-    };
     *mailbox.post.lock().unwrap_or_else(PoisonError::into_inner) = Some(Post {
-        job: JobRef(job),
+        job: JobRef {
+            job: std::ptr::from_mut(job).cast(),
+            call: call::<F>,
+        },
         waiter: std::thread::current(),
     });
+    // From here to the end of `wait_for`, nothing may return or unwind: the
+    // MLX thread can run `job` until it sets `done`.
     mailbox.posted.store(true, Ordering::Release);
     mlx_thread.unpark();
     wait_for(&mailbox.done);

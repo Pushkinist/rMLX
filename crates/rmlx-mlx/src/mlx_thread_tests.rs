@@ -104,8 +104,8 @@ fn a_panic_on_the_mlx_thread_reaches_the_caller_and_the_thread_goes_on() {
 }
 
 /// A job on the MLX thread that hands off again runs the inner job in place.
-/// A second hand-off from the MLX thread would wait for the mailbox that the
-/// outer job holds.
+/// A second hand-off from the MLX thread would wait forever for `turn`, which
+/// the thread that posted the outer job holds until that job is done.
 #[test]
 fn a_hand_off_from_the_mlx_thread_runs_in_place() {
     let (done_tx, done_rx) = mpsc::channel();
@@ -140,6 +140,33 @@ fn a_hand_off_wakes_a_parked_mlx_thread_and_a_parked_waiter() {
     )
     .unwrap_or_else(|| panic!("the hand-off panicked"));
     assert_eq!(value.unwrap(), 3);
+}
+
+/// Eight threads hand off at the same time, and each must get back the value
+/// of its own job. Without `turn`, a second post replaces the first: that job
+/// is lost, or the MLX thread runs it after its waiter returned.
+#[test]
+fn concurrent_hand_offs_each_get_their_own_value() {
+    const THREADS: usize = 8;
+    const HAND_OFFS: usize = 2000;
+    let (done_tx, done_rx) = mpsc::channel();
+    for t in 0..THREADS {
+        let done_tx = done_tx.clone();
+        std::thread::spawn(move || {
+            let wrong = (0..HAND_OFFS)
+                .filter(|&i| run(move || (t, i)).ok() != Some((t, i)))
+                .count();
+            done_tx.send(wrong).ok();
+        });
+    }
+    for _ in 0..THREADS {
+        let wrong = within_limit(&done_rx, Duration::from_secs(60), "concurrent hand-offs")
+            .unwrap_or_else(|| panic!("a hand-off thread panicked"));
+        assert_eq!(
+            wrong, 0,
+            "{wrong} of {HAND_OFFS} hand-offs of one thread did not return the value of its job"
+        );
+    }
 }
 
 /// The job and its result live on the stack of the waiting thread. A job that
@@ -215,8 +242,11 @@ fn without_comments(source: &str) -> String {
     let blank = |c: char| if c == '\n' { '\n' } else { ' ' };
     let mut out = String::with_capacity(source.len());
     let mut i = 0;
+    let starts_token =
+        |j: usize| j == 0 || !at(j - 1).is_some_and(|p| p.is_alphanumeric() || p == '_');
     while let Some(c) = at(i) {
-        let starts_token = i == 0 || !at(i - 1).is_some_and(|p| p.is_alphanumeric() || p == '_');
+        let raw_prefix = starts_token(i)
+            || (i > 0 && matches!(at(i - 1), Some('b' | 'c')) && starts_token(i - 1));
         if c == '/' && at(i + 1) == Some('/') {
             while let Some(c) = at(i).filter(|&c| c != '\n') {
                 out.push(blank(c));
@@ -241,7 +271,7 @@ fn without_comments(source: &str) -> String {
                     i += 1;
                 }
             }
-        } else if c == 'r' && starts_token && matches!(at(i + 1), Some('"' | '#')) {
+        } else if c == 'r' && raw_prefix && matches!(at(i + 1), Some('"' | '#')) {
             let hashes = chars[i + 1..].iter().take_while(|&&h| h == '#').count();
             if at(i + 1 + hashes) != Some('"') {
                 out.push(c);
@@ -333,6 +363,18 @@ fn the_stream_scan_sees_every_spelling_of_a_stream_function() {
             "a default synchronize",
         ),
         (
+            "let b = br\"\\\"; let s = \"//\"; unsafe { sys::mlx_stream_new() };",
+            "a raw byte string that ends in a backslash",
+        ),
+        (
+            "let b = br#\"\\\"#; let s = \"//\"; unsafe { sys::mlx_stream_new() };",
+            "a raw byte string with hashes that ends in a backslash",
+        ),
+        (
+            "let c = cr\"\\\"; let s = \"//\"; unsafe { sys::mlx_stream_new() };",
+            "a raw C string that ends in a backslash",
+        ),
+        (
             "#[link_name = \"mlx_default_cpu_stream_new\"]\nfn f();",
             "a link name",
         ),
@@ -414,7 +456,7 @@ fn every_stream_comes_from_the_mlx_thread() {
             if names.is_empty() {
                 continue;
             }
-            if file.file_name().is_some_and(|f| f == "mlx_thread.rs") {
+            if file.strip_prefix(&src) == Ok(std::path::Path::new("mlx_thread.rs")) {
                 inside.extend(names.iter().map(|name| (*name).to_owned()));
             } else {
                 outside.push(format!(

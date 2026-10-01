@@ -2,8 +2,8 @@
 //!
 //! The decode loop hands work to the MLX thread several times per layer per
 //! token. This binary holds one test, so nothing else allocates while it
-//! counts, and its global allocator counts every allocation of the process,
-//! on every thread.
+//! counts, and its global allocator counts every Rust allocation of the
+//! process, on every thread. Allocations inside MLX and mlx-c do not reach it.
 
 #![allow(unsafe_code, reason = "a global allocator implements an unsafe trait")]
 
