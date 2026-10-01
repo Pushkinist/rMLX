@@ -56,10 +56,10 @@
 //! or TTS.
 //!
 //! A cross-thread evaluation can also wait forever in `mlx::core::synchronize`
-//! instead of failing. The hung evaluation holds the process-wide evaluation
-//! lock, so every later cell in the same binary would wait on it. Each step
-//! after a hand-over therefore has a time limit, [`STEP_LIMIT`]: a hang fails
-//! the cell and ends its test binary.
+//! instead of failing. The hung evaluation holds the MLX thread, so every later
+//! cell in the same binary would wait on it. Each step after a hand-over
+//! therefore has a time limit, [`STEP_LIMIT`]: a hang fails the cell and ends
+//! its test binary.
 //!
 //! # Mutations and what catches them
 //!
@@ -120,6 +120,9 @@ use rmlx_server::{
 #[path = "../../../rmlx-models/tests/common/round_stream.rs"]
 pub mod round_stream;
 
+#[path = "../../../rmlx-mlx/tests/common/within_limit.rs"]
+mod within_limit;
+
 use round_stream::RoundStreamRecorder;
 
 /// A 64x64 solid-red PNG.
@@ -132,32 +135,6 @@ pub const N_TOKENS: u32 = 24;
 /// The longest one step after a hand-over may take. A cross-thread evaluation
 /// can wait forever in `mlx::core::synchronize` instead of failing.
 pub const STEP_LIMIT: Duration = Duration::from_secs(600);
-
-/// What a step past a hand-over sent, `None` when it panicked. Past
-/// [`STEP_LIMIT`] the step is hung: its thread holds the process-wide
-/// evaluation lock, so every later cell of this binary would wait on that lock
-/// forever. Name the cell and end the process.
-#[allow(
-    clippy::exit,
-    reason = "a hung evaluation cannot be stopped, and it holds the lock every later cell needs"
-)]
-fn within_step_limit<T>(done: &mpsc::Receiver<T>) -> Option<T> {
-    match done.recv_timeout(STEP_LIMIT) {
-        Ok(value) => Some(value),
-        Err(mpsc::RecvTimeoutError::Disconnected) => None,
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            let cell = std::thread::current()
-                .name()
-                .unwrap_or("a thread-boundary cell")
-                .to_owned();
-            eprintln!(
-                "{cell}: the step after the hand-over did not finish within {STEP_LIMIT:?}. \
-                 It holds the evaluation lock, so this test binary ends here."
-            );
-            std::process::exit(101);
-        }
-    }
-}
 
 // ── Snapshots ───────────────────────────────────────────────────────────────
 
@@ -328,7 +305,7 @@ where
     std::thread::spawn(move || {
         done_tx.send(second(state)).ok();
     });
-    let b = within_step_limit(&done_rx)
+    let b = within_limit::within_limit(&done_rx, STEP_LIMIT, "the step after the hand-over")
         .unwrap_or_else(|| panic!("the step after the hand-over panicked"));
     release_tx.send(()).ok();
     first_thread.join().expect("first thread panicked");
@@ -474,7 +451,7 @@ pub fn serve(
 }
 
 /// Serve one request and collect its token ids. Past [`STEP_LIMIT`] the test
-/// binary ends, see [`within_step_limit`].
+/// binary ends, see [`within_limit::within_limit`].
 fn decode(
     rt: &tokio::runtime::Handle,
     generator: &Arc<dyn Generator>,
@@ -493,7 +470,8 @@ fn decode(
         });
         done_tx.send(ids).ok();
     });
-    within_step_limit(&done_rx).unwrap_or_else(|| Err("the request panicked".to_owned()))
+    within_limit::within_limit(&done_rx, STEP_LIMIT, "the request after the hand-over")
+        .unwrap_or_else(|| Err("the request panicked".to_owned()))
 }
 
 /// Serve `requests` on one thread, then across `split`; the second arm must

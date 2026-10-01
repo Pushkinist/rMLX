@@ -37,13 +37,3 @@ mod ffi {
 }
 
 pub(crate) use ffi::*;
-
-// SAFETY: each of these is a handle to a reference-counted mlx-c object
-// (`std::shared_ptr` inside). mlx-c lets any thread take, use and free a
-// handle; `Array` and `Closure` already rely on that. `with_eval_lock` moves
-// them to the MLX thread for the call.
-unsafe impl Send for mlx_array {}
-// SAFETY: as for `mlx_array`.
-unsafe impl Send for mlx_vector_array {}
-// SAFETY: as for `mlx_array`.
-unsafe impl Send for mlx_closure {}

@@ -34,9 +34,8 @@
 //!
 //! # Thread safety
 //!
-//! `Closure` is `Send + Sync`. The underlying `mlx_closure` is ref-counted by
-//! mlx-c. Do not share the same `Closure` across concurrent MLX dispatches (MLX
-//! is single-threaded inside a process on Apple Silicon).
+//! `Closure` is `Send + Sync`: mlx-c ref-counts the underlying `mlx_closure`,
+//! and every application runs on the MLX thread (`mlx_thread.rs`).
 
 // unsafe_code: mlx-rs FFI bridge — calls mlx_closure / mlx_compile C API via unsafe blocks
 #![allow(unsafe_code)]
@@ -240,46 +239,53 @@ impl Closure {
     /// RULE 3 fails the build if one starts to.
     pub fn apply(&self, inputs: &[&Array]) -> Result<Vec<Array>> {
         install_error_handler();
-
-        // Pack inputs.
-        let vec_in = unsafe { sys::mlx_vector_array_new() };
-        for arr in inputs {
-            let st = unsafe { sys::mlx_vector_array_append_value(vec_in, arr.inner) };
-            if st != 0 {
-                unsafe { sys::mlx_vector_array_free(vec_in) };
-                return Err(Error::Mlx(
-                    "Closure::apply: mlx_vector_array_append_value failed".to_owned(),
-                ));
+        let applied = with_eval_lock(|| {
+            // SAFETY: `self` and `inputs` keep every handle alive until this
+            // returns; both vectors are freed before the job ends.
+            unsafe {
+                let vec_in = sys::mlx_vector_array_new();
+                for arr in inputs {
+                    if sys::mlx_vector_array_append_value(vec_in, arr.inner) != 0 {
+                        sys::mlx_vector_array_free(vec_in);
+                        return Err(Error::Mlx(
+                            "Closure::apply: mlx_vector_array_append_value failed".to_owned(),
+                        ));
+                    }
+                }
+                let mut vec_out = sys::mlx_vector_array_new();
+                let status = sys::mlx_closure_apply(&raw mut vec_out, self.inner, vec_in);
+                let applied = check_status(status, "Closure::apply");
+                sys::mlx_vector_array_free(vec_in);
+                let out = applied.and_then(|()| unpack(vec_out));
+                sys::mlx_vector_array_free(vec_out);
+                out
             }
-        }
-
-        let closure = self.inner;
-        let applied = with_eval_lock(move || {
-            let mut vec_out = unsafe { sys::mlx_vector_array_new() };
-            let status = unsafe { sys::mlx_closure_apply(&raw mut vec_out, closure, vec_in) };
-            (status, vec_out)
         });
-        unsafe { sys::mlx_vector_array_free(vec_in) };
-        let (status, vec_out) = applied?;
-        unsafe { check_status(status, "Closure::apply") }?;
-
-        // Unpack outputs.
-        let n = unsafe { sys::mlx_vector_array_size(vec_out) };
-        let mut out = Vec::with_capacity(n);
-        for i in 0..n {
-            let mut arr = unsafe { sys::mlx_array_new() };
-            let st = unsafe { sys::mlx_vector_array_get(&raw mut arr, vec_out, i) };
-            if st != 0 {
-                unsafe { sys::mlx_vector_array_free(vec_out) };
-                return Err(Error::Mlx(format!(
-                    "Closure::apply: mlx_vector_array_get[{i}] failed"
-                )));
-            }
-            out.push(Array { inner: arr });
-        }
-        unsafe { sys::mlx_vector_array_free(vec_out) };
-        Ok(out)
+        applied?
     }
+}
+
+/// The arrays of `vec`, each with its own reference.
+///
+/// # Safety
+/// `vec` must be a valid `mlx_vector_array`.
+unsafe fn unpack(vec: sys::mlx_vector_array) -> Result<Vec<Array>> {
+    // SAFETY: `vec` is valid (the caller's contract).
+    let n = unsafe { sys::mlx_vector_array_size(vec) };
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        // SAFETY: `i < n`, and `arr` is a new handle that `Array` owns.
+        let mut arr = unsafe { sys::mlx_array_new() };
+        // SAFETY: as above; `arr` is a valid out-handle.
+        let st = unsafe { sys::mlx_vector_array_get(&raw mut arr, vec, i) };
+        if st != 0 {
+            return Err(Error::Mlx(format!(
+                "Closure::apply: mlx_vector_array_get[{i}] failed"
+            )));
+        }
+        out.push(Array { inner: arr });
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 //! Tests for the MLX thread: an op built on any thread evaluates on any
-//! thread, and only `mlx_thread.rs` gets a stream from mlx-c.
+//! thread, and only `mlx_thread.rs` names an mlx-c stream function.
 
 use std::sync::mpsc;
 use std::time::Duration;
@@ -7,28 +7,14 @@ use std::time::Duration;
 use super::*;
 use crate::{add, Array, Device};
 
-/// The longest the cross-thread read may take. A cross-thread evaluation can
-/// wait forever instead of failing, and it holds the evaluation lock while it
-/// waits, so every later test of this binary would wait too.
-const READ_LIMIT: Duration = Duration::from_secs(60);
+#[path = "../tests/common/within_limit.rs"]
+mod within_limit;
 
-#[allow(
-    clippy::exit,
-    reason = "a hung evaluation cannot be stopped, and it holds the lock every later test needs"
-)]
-fn within_read_limit<T>(done: &mpsc::Receiver<T>, test: &str) -> T {
-    match done.recv_timeout(READ_LIMIT) {
-        Ok(value) => value,
-        Err(mpsc::RecvTimeoutError::Disconnected) => panic!("{test}: the reader panicked"),
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            eprintln!(
-                "{test}: the cross-thread read did not finish within {READ_LIMIT:?}. It holds \
-                 the evaluation lock, so this test binary ends here."
-            );
-            std::process::exit(101);
-        }
-    }
-}
+use within_limit::within_limit;
+
+/// The longest the cross-thread read may take. A cross-thread evaluation can
+/// wait forever instead of failing.
+const READ_LIMIT: Duration = Duration::from_secs(60);
 
 fn lazy_sum(device: Device) -> Array {
     let a = Array::from_f32_slice(&[1.0, 2.0], &[2]).unwrap();
@@ -62,7 +48,8 @@ fn assert_crosses_threads(test: &str, device: Device) {
             .send(lazy.to_bytes().map_err(|e| e.to_string()))
             .ok();
     });
-    let crossed = within_read_limit(&read_rx, test);
+    let crossed = within_limit(&read_rx, READ_LIMIT, "the cross-thread read")
+        .unwrap_or_else(|| panic!("{test}: the reader panicked"));
     release_tx.send(()).ok();
     builder.join().unwrap();
     let crossed = crossed.unwrap_or_else(|e| panic!("{test}: an op built on another thread: {e}"));
@@ -116,6 +103,49 @@ fn a_panic_on_the_mlx_thread_reaches_the_caller_and_the_thread_goes_on() {
     );
 }
 
+/// A job on the MLX thread that hands off again runs the inner job in place.
+/// A second hand-off from the MLX thread would wait for the mailbox that the
+/// outer job holds.
+#[test]
+fn a_hand_off_from_the_mlx_thread_runs_in_place() {
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        done_tx.send(run(|| run(|| 5))).ok();
+    });
+    let nested = within_limit(&done_rx, Duration::from_secs(10), "a nested hand-off")
+        .unwrap_or_else(|| panic!("the nested hand-off panicked"));
+    assert_eq!(nested.unwrap().unwrap(), 5);
+}
+
+/// The job and its result live on the stack of the waiting thread. A job that
+/// borrows a local and writes through a `&mut` reads back on that thread.
+#[test]
+fn a_job_borrows_from_the_stack_of_the_waiting_thread() {
+    let input = [1u32, 2, 3];
+    let mut written = 0u32;
+    let sum = run(|| {
+        written = 9;
+        input.iter().sum::<u32>()
+    })
+    .unwrap();
+    assert_eq!((sum, written), (6, 9));
+}
+
+#[test]
+fn a_null_stream_error_names_the_reason_from_mlx_and_empties_the_slot() {
+    LAST_ERROR.with(|slot| slot.set(Some("no Metal device".to_owned())));
+    let message = no_stream(Device::Cpu).to_string();
+    assert!(
+        message.contains("no Metal device"),
+        "the reason from mlx-c is lost: {message}"
+    );
+    assert_eq!(
+        LAST_ERROR.with(Cell::take),
+        None,
+        "a stale reason would name a later, unrelated failure"
+    );
+}
+
 /// MLX builds some ops inside other ops on the default stream of the default
 /// device, not on the stream the caller passed. After one CPU op, the default
 /// CPU and GPU streams of a thread must be the MLX thread's streams.
@@ -151,10 +181,184 @@ fn a_thread_that_built_an_op_defaults_to_the_mlx_threads_streams() {
     );
 }
 
-/// Every `sys::` call whose name holds `stream` in a non-test source file of
-/// this crate. Only `mlx_thread.rs` may make one: a stream from anywhere else
-/// is a stream of the calling thread, and an op built on it evaluates only
-/// there.
+/// `source` with every comment blanked and every line kept. String and char
+/// literals stay, so a stream function named in one (a `link_name`, a `dlsym`
+/// argument) still counts, and a `//` inside a literal starts no comment.
+fn without_comments(source: &str) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let at = |i: usize| chars.get(i).copied();
+    let blank = |c: char| if c == '\n' { '\n' } else { ' ' };
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0;
+    while let Some(c) = at(i) {
+        let starts_token = i == 0 || !at(i - 1).is_some_and(|p| p.is_alphanumeric() || p == '_');
+        if c == '/' && at(i + 1) == Some('/') {
+            while let Some(c) = at(i).filter(|&c| c != '\n') {
+                out.push(blank(c));
+                i += 1;
+            }
+        } else if c == '/' && at(i + 1) == Some('*') {
+            let mut depth = 0;
+            while let Some(c) = at(i) {
+                if c == '/' && at(i + 1) == Some('*') {
+                    depth += 1;
+                    out.push_str("  ");
+                    i += 2;
+                } else if c == '*' && at(i + 1) == Some('/') {
+                    depth -= 1;
+                    out.push_str("  ");
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    out.push(blank(c));
+                    i += 1;
+                }
+            }
+        } else if c == 'r' && starts_token && matches!(at(i + 1), Some('"' | '#')) {
+            let hashes = chars[i + 1..].iter().take_while(|&&h| h == '#').count();
+            if at(i + 1 + hashes) != Some('"') {
+                out.push(c);
+                i += 1;
+                continue;
+            }
+            let close: String = std::iter::once('"')
+                .chain("#".repeat(hashes).chars())
+                .collect();
+            let body_start = i + 2 + hashes;
+            let rest: String = chars[body_start..].iter().collect();
+            let end = rest.find(&close).map_or(chars.len(), |at| {
+                body_start + rest[..at].chars().count() + close.chars().count()
+            });
+            out.extend(&chars[i..end]);
+            i = end;
+        } else if c == '"' {
+            out.push(c);
+            i += 1;
+            while let Some(c) = at(i) {
+                out.push(c);
+                i += 1;
+                if c == '\\' {
+                    out.extend(at(i));
+                    i += 1;
+                } else if c == '"' {
+                    break;
+                }
+            }
+        } else if c == '\'' && at(i + 1) == Some('\\') {
+            let end = (i + 3..chars.len())
+                .find(|&j| chars[j] == '\'')
+                .map_or(chars.len(), |j| j + 1);
+            out.extend(&chars[i..end]);
+            i = end;
+        } else if c == '\'' && at(i + 2) == Some('\'') {
+            out.extend(&chars[i..i + 3]);
+            i += 3;
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// The mlx-c stream functions that `code` names: every `mlx_` identifier that
+/// holds `stream`, except the handle type `mlx_stream`, and every
+/// `mlx_synchronize` function, which waits on a stream.
+fn stream_functions(code: &str) -> Vec<&str> {
+    code.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .map(|name| name.trim_start_matches('_'))
+        .filter(|name| {
+            name.starts_with("mlx_synchronize")
+                || (name.starts_with("mlx_") && name.contains("stream") && *name != "mlx_stream")
+        })
+        .collect()
+}
+
+/// The scan below must see a stream function however a file names it.
+#[test]
+fn the_stream_scan_sees_every_spelling_of_a_stream_function() {
+    let found = |source: &str| stream_functions(&without_comments(source)).len();
+    let named = [
+        (
+            "use sys::mlx_default_cpu_stream_new as f;\nunsafe { f() };",
+            "an alias",
+        ),
+        (
+            "use crate::sys::*;\nunsafe { mlx_default_gpu_stream_new() };",
+            "a glob import",
+        ),
+        ("let make = sys::mlx_stream_new_device;", "a fn pointer"),
+        (
+            "let url = \"http://x\"; unsafe { sys::mlx_stream_new() };",
+            "a `//` in a string",
+        ),
+        (
+            "let raw = r#\"/*\"#; unsafe { sys::mlx_stream_new() };",
+            "a `/*` in a raw string",
+        ),
+        (
+            "let q = '\"'; unsafe { sys::mlx_stream_new() };",
+            "a quote in a char literal",
+        ),
+        ("unsafe { sys::mlx_synchronize(s) };", "a synchronize"),
+        (
+            "unsafe { sys::mlx_synchronize_default() };",
+            "a default synchronize",
+        ),
+        (
+            "#[link_name = \"mlx_default_cpu_stream_new\"]\nfn f();",
+            "a link name",
+        ),
+        (
+            "unsafe { sys::_mlx_stream_private(s) };",
+            "a leading underscore",
+        ),
+    ];
+    for (source, spelling) in named {
+        assert_eq!(
+            found(source),
+            1,
+            "{spelling} hides a stream function: {source}"
+        );
+    }
+    let not_named = [
+        ("fn build(s: sys::mlx_stream) {}", "the handle type"),
+        ("// unsafe { sys::mlx_stream_new() }", "a line comment"),
+        (
+            "/* a /* nested */ sys::mlx_stream_new() */",
+            "a nested block comment",
+        ),
+        (
+            "let q = '\"'; // sys::mlx_stream_new()",
+            "a comment after a quote in a char literal",
+        ),
+        (
+            "fn f<'a>(s: &'a str) -> &'a str { s } // sys::mlx_stream_new()",
+            "a comment after lifetimes",
+        ),
+        (
+            "let s = \"\\\"\"; // sys::mlx_stream_new()",
+            "a comment after an escaped quote",
+        ),
+    ];
+    for (source, spelling) in not_named {
+        assert_eq!(
+            found(source),
+            0,
+            "{spelling} names no stream function: {source}"
+        );
+    }
+}
+
+/// Every mlx-c stream function that a non-test source file of this crate
+/// names. Only `mlx_thread.rs` may name one: a stream from anywhere else is a
+/// stream of the calling thread, and an op built on it evaluates only there.
+///
+/// The scan reads names, not calls. It cannot see a name that a macro builds
+/// from parts, a symbol looked up from a string built at run time, or a crate
+/// other than this one; no other crate can reach `sys`.
 #[test]
 fn every_stream_comes_from_the_mlx_thread() {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -176,27 +380,17 @@ fn every_stream_comes_from_the_mlx_thread() {
     };
     let mut scanned = 0;
     let mut outside = Vec::new();
-    let mut inside = 0;
+    let mut inside = Vec::new();
     for file in files.iter().filter(|f| !is_test(f)) {
         scanned += 1;
-        let text = std::fs::read_to_string(file).unwrap();
-        for (n, line) in text.lines().enumerate() {
-            let code = line.split("//").next().unwrap_or_default();
-            let calls = code
-                .match_indices("sys::mlx_")
-                .filter(|(at, _)| {
-                    let name: String = code[at + 5..]
-                        .chars()
-                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                        .collect();
-                    name.contains("stream") && code[at + 5 + name.len()..].starts_with('(')
-                })
-                .count();
-            if calls == 0 {
+        let code = without_comments(&std::fs::read_to_string(file).unwrap());
+        for (n, line) in code.lines().enumerate() {
+            let names = stream_functions(line);
+            if names.is_empty() {
                 continue;
             }
             if file.file_name().is_some_and(|f| f == "mlx_thread.rs") {
-                inside += calls;
+                inside.extend(names.iter().map(|name| (*name).to_owned()));
             } else {
                 outside.push(format!(
                     "{}:{}: {}",
@@ -208,10 +402,16 @@ fn every_stream_comes_from_the_mlx_thread() {
         }
     }
     assert!(scanned > 10, "the scan read {scanned} files");
-    assert!(
-        inside >= 2,
-        "the scan found {inside} stream calls in mlx_thread.rs, which gets both streams"
-    );
+    for name in [
+        "mlx_default_cpu_stream_new",
+        "mlx_default_gpu_stream_new",
+        "mlx_set_default_stream",
+    ] {
+        assert!(
+            inside.iter().any(|found| found == name),
+            "the scan did not find {name} in mlx_thread.rs, which calls it; found {inside:?}"
+        );
+    }
     assert!(
         outside.is_empty(),
         "a stream from outside the MLX thread; build ops through `with_stream`:\n{}",

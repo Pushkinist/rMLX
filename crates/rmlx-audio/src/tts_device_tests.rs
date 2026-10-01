@@ -156,7 +156,7 @@ fn tts_codec_load_on_cpu_is_admitted_child() {
     if !started_by_parent() {
         return;
     }
-    rmlx_mlx::forbid_gpu();
+    rmlx_mlx::forbid_gpu().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let model = loaded_cpu_model(dir.path());
     assert!(model.codec.is_some(), "the codec decoder loaded on the CPU");
@@ -178,7 +178,7 @@ fn tts_synthesize_on_cpu_is_admitted_child() {
     if !started_by_parent() {
         return;
     }
-    rmlx_mlx::forbid_gpu();
+    rmlx_mlx::forbid_gpu().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let mut model = loaded_cpu_model(dir.path());
     let result = synthesize("hello", "serena", &mut model, &TtsTokenizer::stub());

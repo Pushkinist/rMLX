@@ -142,7 +142,7 @@ fn bitnet_load_and_forward_on_cpu_is_admitted_child() {
     if !std::env::args().any(|arg| arg == CHILD_MARKER) {
         return;
     }
-    rmlx_mlx::forbid_gpu();
+    rmlx_mlx::forbid_gpu().unwrap();
     let dir = tempfile::tempdir().unwrap();
     write_snapshot(dir.path());
     let arch = load_model(dir.path(), Device::Cpu, &LoadOpts::default()).expect("CPU load");

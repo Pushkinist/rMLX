@@ -565,11 +565,9 @@ fn scalar_f32_roundtrip() {
 
 // ── stream exhaustion regression ─────────────────────────────────────────
 //
-// Before the fix, each `with_stream` call issued `mlx_stream_new_device`
-// which spawned a new OS thread. macOS caps per-process threads at ~2 048.
-// 1 000 add calls × ~2 stream handles each → ~2 000 threads → EAGAIN.
-// After the fix, `mlx_default_cpu_stream_new` reuses the existing thread;
-// the 1 000-iteration loop stays well within OS limits.
+// MLX keeps a worker thread for each CPU stream, so a stream per op ends in
+// EAGAIN from `pthread_create` after a few thousand ops. Every op is built on
+// the one CPU stream of the MLX thread, so 1 000 ops make no thread.
 #[test]
 fn add_1000_iterations_no_thread_exhaustion() {
     let data: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
@@ -605,25 +603,26 @@ fn mk(v: &[f32]) -> Array {
     Array::from_bytes(f32_as_bytes(v), &[v.len() as i32], Dtype::F32).unwrap()
 }
 
-/// The deterministic half of the evaluation-lock gate: `with_eval_lock` really
-/// does exclude.
+/// The deterministic half of the evaluation-lock gate: the lock really does
+/// exclude.
 ///
 /// `make check-eval-lock` proves every evaluation FFI call is *written* inside
 /// a `with_eval_lock` closure — a lexical property. It cannot tell whether the
-/// lock actually locks; a `with_eval_lock` that took no lock would satisfy it
-/// completely. This closes that half, and unlike the burst reproducer it is
-/// deterministic: two threads, no MLX, no 400-thread cost, and it fails every
-/// time if mutual exclusion is lost rather than one run in twelve.
+/// lock actually locks. The MLX thread runs one job at a time, so a test
+/// through `with_eval_lock` passes with no lock at all. This test calls
+/// `under_eval_lock`, the part of `with_eval_lock` that takes the lock, from
+/// two threads at once, and fails every time if mutual exclusion is lost.
 ///
 /// The oracle is independent of the lock's implementation — a flag raised and
 /// cleared *inside* the critical section, with each entrant asserting it found
 /// the section empty. It shares no arithmetic with the code under test.
 #[test]
-fn with_eval_lock_serialises_concurrent_callers() {
+fn under_eval_lock_excludes_concurrent_callers() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     static OCCUPIED: AtomicBool = AtomicBool::new(false);
     static OVERLAPS: AtomicUsize = AtomicUsize::new(0);
+    static ENTRIES: AtomicUsize = AtomicUsize::new(0);
 
     // Long enough that a lost lock overlaps essentially every iteration, short
     // enough that the whole test stays well under a second.
@@ -632,7 +631,8 @@ fn with_eval_lock_serialises_concurrent_callers() {
 
     let worker = || {
         for _ in 0..ITERS {
-            with_eval_lock(|| {
+            under_eval_lock(|| {
+                ENTRIES.fetch_add(1, Ordering::SeqCst);
                 // Entering: the section must have been empty.
                 if OCCUPIED.swap(true, Ordering::SeqCst) {
                     OVERLAPS.fetch_add(1, Ordering::SeqCst);
@@ -642,8 +642,7 @@ fn with_eval_lock_serialises_concurrent_callers() {
                 if !OCCUPIED.swap(false, Ordering::SeqCst) {
                     OVERLAPS.fetch_add(1, Ordering::SeqCst);
                 }
-            })
-            .expect("the MLX thread runs the section");
+            });
         }
     };
 
@@ -652,10 +651,11 @@ fn with_eval_lock_serialises_concurrent_callers() {
     a.join().expect("thread a panicked");
     b.join().expect("thread b panicked");
 
+    assert_eq!(ENTRIES.load(Ordering::SeqCst), 2 * ITERS);
     assert_eq!(
         OVERLAPS.load(Ordering::SeqCst),
         0,
-        "two threads were inside with_eval_lock at the same time — the evaluation \
+        "two threads were inside under_eval_lock at the same time — the evaluation \
          lock is not excluding, so every MLX eval FFI call under it is unprotected"
     );
 }
@@ -668,7 +668,7 @@ fn with_eval_lock_serialises_concurrent_callers() {
 /// a burst of evaluations from many threads gives correct values.
 ///
 /// The gates for the lock are `make check-eval-lock` (every eval FFI call is
-/// made under it) and `with_eval_lock_serialises_concurrent_callers` (it
+/// made under it) and `under_eval_lock_excludes_concurrent_callers` (it
 /// excludes), both deterministic. Run this test with `make eval-lock-stress`,
 /// which drives it across fresh processes.
 ///

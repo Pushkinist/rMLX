@@ -97,7 +97,7 @@ thread_local! {
 // and the gates below keep every evaluating FFI call under it.
 //
 // Cost is one uncontended mutex acquire + release per evaluation, plus the
-// hand-over to the MLX thread when the caller is another thread.
+// hand-off to the MLX thread when the caller is another thread.
 //
 // **Which C entry points need it.** Not just the eval-named ones: every mlx-c
 // function that reaches `mlx::core::eval_impl` evaluates. The set is
@@ -137,7 +137,7 @@ thread_local! {
 // RULE 3 enforces it; see `Closure::apply`.
 static EVAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Run `f` holding the process-wide evaluation lock.
+/// Run `f` on the MLX thread, holding the process-wide evaluation lock.
 ///
 /// Takes a closure rather than returning the guard on purpose: a
 /// `MutexGuard`-returning helper is only correct if every caller binds it to a
@@ -163,21 +163,21 @@ static EVAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Recovering from `PoisonError` rather than propagating it keeps that
 /// unreachable state from turning a later evaluation into a spurious failure.
 ///
-/// `f` runs on the MLX thread, which owns the streams every op is built on. The
-/// mlx-c error message it leaves there moves to the calling thread, so
-/// `check_status` after this call reads it.
+/// The mlx-c error message that `f` leaves on the MLX thread moves to the
+/// calling thread, so `check_status` after this call reads it.
 ///
 /// # Errors
-/// An error when the MLX thread cannot start or has stopped; `f` did not run.
-pub(crate) fn with_eval_lock<T: Send + 'static>(
-    f: impl FnOnce() -> T + Send + 'static,
-) -> Result<T> {
-    mlx_thread::run(move || {
-        let _guard = EVAL_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        f()
-    })
+/// An error when the MLX thread cannot start; `f` did not run.
+pub(crate) fn with_eval_lock<T: Send>(f: impl FnOnce() -> T + Send) -> Result<T> {
+    mlx_thread::run(|| under_eval_lock(f))
+}
+
+/// Run `f` on the calling thread, holding the process-wide evaluation lock.
+fn under_eval_lock<T>(f: impl FnOnce() -> T) -> T {
+    let _guard = EVAL_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    f()
 }
 
 /// Install the thread-local error handler. Called once per process, lazily.
@@ -345,19 +345,6 @@ pub(crate) unsafe fn check_status(status: i32, context: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Stream helper: borrow the process-global default stream, run a closure.
-// ---------------------------------------------------------------------------
-//
-// Never call `mlx_stream_new_device` per op. Each call spawns an MLX worker
-// thread that MLX never reclaims, so per-call stream creation grows until
-// `pthread_create` returns EAGAIN ("thread constructor failed: Resource
-// temporarily unavailable"). The ceiling is the per-task thread limit
-// (`sysctl kern.num_taskthreads`). `mlx_default_cpu_stream_new` /
-// `mlx_default_gpu_stream_new` return a reference-counted handle to the
-// running default stream (no new thread); `mlx_stream_free` drops the
-// reference, not the stream or its thread.
-
-// ---------------------------------------------------------------------------
 // The CPU-device latch: once set, nothing in this crate asks for a GPU stream
 // or calls a Metal API.
 // ---------------------------------------------------------------------------
@@ -368,13 +355,27 @@ pub(crate) unsafe fn check_status(status: i32, context: &str) -> Result<()> {
 static GPU_FORBIDDEN: AtomicBool = AtomicBool::new(false);
 
 /// Refuse every later GPU stream and Metal API call in this process with
-/// [`Error::GpuForbidden`].
+/// [`Error::GpuForbidden`], and make the CPU the MLX default device, so that
+/// an op MLX builds inside another op goes to a CPU stream too.
 ///
 /// Call it once, from the place that makes the process's device decision,
 /// before any model work. There is no way back.
-pub fn forbid_gpu() {
+///
+/// # Errors
+/// An error when MLX does not accept the CPU as its default device.
+pub fn forbid_gpu() -> Result<()> {
     GPU_FORBIDDEN.store(true, Ordering::Relaxed);
+    // SAFETY: a CPU device value that this function owns and frees below.
+    let cpu = unsafe { sys::mlx_device_new_type(sys::mlx_device_type::MLX_CPU, 0) };
+    // SAFETY: `cpu` is valid. MLX copies it into its process-wide default.
+    let status = unsafe { sys::mlx_set_default_device(cpu) };
+    // SAFETY: called immediately after the C function on this thread.
+    let set = unsafe { check_status(status, "mlx_set_default_device") };
+    // SAFETY: `cpu` is not used after this call.
+    unsafe { sys::mlx_device_free(cpu) };
+    set?;
     tracing::info!("GPU refused for this process: the device decision is cpu");
+    Ok(())
 }
 
 /// True once [`forbid_gpu`] has run in this process.
@@ -393,7 +394,9 @@ fn check_gpu_allowed(op: &'static str) -> Result<()> {
 
 /// Call `f` with the stream for `device` that every op is built on: a stream
 /// of the MLX thread (`mlx_thread.rs`). An op built on it evaluates from any
-/// thread, because every evaluation runs on the MLX thread.
+/// thread, because every evaluation runs on the MLX thread. Never create a
+/// stream per op: MLX keeps a worker thread for each CPU stream for the life
+/// of the process, so `pthread_create` fails after a few thousand ops.
 ///
 /// # Errors
 /// [`Error::GpuForbidden`] for the GPU device after [`forbid_gpu`]; `f` is not
@@ -640,6 +643,48 @@ pub fn dtype_from_safetensors(st: safetensors::Dtype) -> Result<Dtype> {
 // Array
 // ---------------------------------------------------------------------------
 
+/// Schedule the compute graphs of `arrays` in one evaluation, without
+/// blocking the calling thread. The work runs in the background; a later
+/// `to_bytes` or `eval` waits for it.
+///
+/// The decode loop uses it to queue the next forward pass while the current
+/// argmax is read back (as `mx.async_eval` in mlx-lm's `generate.py`). One
+/// call for several arrays is one hand-off to the MLX thread, not one per
+/// array.
+///
+/// Serialised process-wide against every other evaluation — see
+/// `EVAL_LOCK`. Only the graph walk and dispatch run under the lock; the
+/// scheduled work completes after it is released, so the pipelining this
+/// exists for is kept.
+///
+/// # Errors
+/// An error when MLX cannot schedule the graphs.
+pub fn async_eval(arrays: &[&Array]) -> Result<()> {
+    install_error_handler();
+    let status = with_eval_lock(|| {
+        // SAFETY: every handle is a valid mlx_array that `arrays` keeps alive
+        // until this returns. The vector is freed before the job ends.
+        unsafe {
+            let vec = sys::mlx_vector_array_new();
+            let mut status = 0;
+            for array in arrays {
+                status = sys::mlx_vector_array_append_value(vec, array.inner);
+                if status != 0 {
+                    break;
+                }
+            }
+            if status == 0 {
+                status = sys::mlx_async_eval(vec);
+            }
+            sys::mlx_vector_array_free(vec);
+            status
+        }
+    })?;
+    // SAFETY: `with_eval_lock` moved the error message of the failed call to
+    // this thread's error slot, and no mlx-c call ran since.
+    unsafe { check_status(status, "async_eval") }
+}
+
 /// Heap-allocated MLX array. Dropping frees the underlying mlx-c handle.
 pub struct Array {
     inner: sys::mlx_array,
@@ -805,10 +850,9 @@ impl Array {
     /// `EVAL_LOCK`.
     pub fn eval(&self) -> Result<()> {
         install_error_handler();
-        let inner = self.inner;
         // SAFETY: inner is a valid mlx_array, and `self` keeps it alive until
         // the evaluation returns.
-        let status = with_eval_lock(move || unsafe { sys::mlx_array_eval(inner) })?;
+        let status = with_eval_lock(|| unsafe { sys::mlx_array_eval(self.inner) })?;
         // SAFETY: `with_eval_lock` moved the error message of the call to this
         // thread's error slot, and no mlx-c call ran since.
         unsafe { check_status(status, "Array::eval") }
@@ -837,25 +881,10 @@ impl Array {
         Ok(available)
     }
 
-    /// Asynchronously schedule this array's compute graph on the GPU stream
-    /// without blocking the calling thread. The actual evaluation happens
-    /// in the background; subsequent `to_bytes`/`eval` will wait if needed.
-    ///
-    /// Used to pipeline the next decode step's forward pass on the GPU
-    /// while the current step's argmax is still being read out (mirrors
-    /// mlx-lm's `mx.async_eval` pattern in `generate.py`).
-    ///
-    /// Serialised process-wide against every other evaluation — see
-    /// `EVAL_LOCK`. Only the graph walk and dispatch run under the lock; the
-    /// scheduled work still completes asynchronously after it is released, so
-    /// the pipelining this exists for is preserved.
+    /// Schedule this array's compute graph and return at once: [`async_eval`]
+    /// of this array alone.
     pub fn async_eval(&self) -> Result<()> {
-        install_error_handler();
-        // mlx_async_eval takes a vector_array; build a single-element vec.
-        let vec = unsafe { sys::mlx_vector_array_new_value(self.inner) };
-        let status = with_eval_lock(move || unsafe { sys::mlx_async_eval(vec) });
-        unsafe { sys::mlx_vector_array_free(vec) };
-        unsafe { check_status(status?, "Array::async_eval") }
+        async_eval(&[self])
     }
 
     /// Copy the array's logical elements, row-major, into a fresh `Vec<u8>`.
