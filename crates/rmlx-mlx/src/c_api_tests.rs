@@ -32,6 +32,8 @@ fn a_mismatch_is_an_error_that_names_both_c_apis_and_the_call() {
         "has the mlx-c 0.7 C API",
         "mlx_fast_scaled_dot_product_attention",
         "cargo clean -p rmlx-mlx",
+        "brew reinstall rmlx",
+        "release tarball",
     ] {
         assert!(err.contains(needle), "{needle:?} missing from: {err}");
     }

@@ -306,10 +306,6 @@ pub fn scaled_dot_product_attention(
 
 /// [`scaled_dot_product_attention`] under a given C API verdict, so a test on
 /// a matched pair can show that a mismatch stops the call.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the seven arguments of scaled_dot_product_attention plus the verdict a test injects"
-)]
 fn sdpa_under(
     verdict: CApiVerdict,
     q: &Array,

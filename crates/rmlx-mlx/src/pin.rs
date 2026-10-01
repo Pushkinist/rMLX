@@ -353,13 +353,18 @@ impl PinVerdict {
 ///
 /// Flat and stringly on purpose: [`PinVerdict`] stays crate-private so the
 /// judgement has exactly one producer, and callers outside this crate get the
-/// two bits they can act on — is it a match, and does it have to be.
+/// bits they can act on — is it a match, does it have to be, and can
+/// attention run at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PinCheck {
     /// Whether the loaded MLX is the pair `mlx-pin.txt` declares, with a
     /// metallib that carries the kernels the pin exists to buy.
     pub matches: bool,
+    /// Whether the loaded `libmlxc.dylib` has the C API this binary was
+    /// compiled against. `false` is a failure on every host, whatever
+    /// [`Self::enforcement`] says: attention cannot run.
+    pub c_api_matches: bool,
     /// Whether the pin binds this host, and whether that could be established.
     pub enforcement: PinEnforcement,
     /// One line naming what was found, and what disagreed or could not be
@@ -420,18 +425,38 @@ impl PinEnforcement {
     }
 }
 
+impl PinCheck {
+    /// Whether a measurement must not run in this process: the C API differs
+    /// on any host, or the pin binds this host and the pair is not the pinned
+    /// one.
+    #[must_use]
+    pub const fn refuses_measurement(&self) -> bool {
+        !self.c_api_matches || (!self.matches && self.enforcement.is_binding())
+    }
+}
+
 /// Check the MLX this process loaded against the checked-in pin.
 #[must_use]
 pub fn pin_check() -> PinCheck {
     let found = verdict();
     let enforcement = enforcement_for(rmlx_core::apple_gpu::apple_silicon_generation());
+    let c_api_matches = matches!(c_api::verdict(), CApiVerdict::Match(_));
+    // The host class is in the operator-facing line, not only in the status:
+    // without it an inapplicable gate and a gate that could not tell read
+    // identically.
+    let scope = if c_api_matches {
+        enforcement.describe()
+    } else {
+        format!(
+            "{}; the C API mismatch fails on every host",
+            enforcement.describe()
+        )
+    };
     PinCheck {
         matches: found.is_match(),
+        c_api_matches,
         enforcement,
-        // The host class is in the operator-facing line, not only in the
-        // status: without it an inapplicable gate and a gate that could not
-        // tell read identically.
-        detail: format!("{} ({})", found.report(), enforcement.describe()),
+        detail: format!("{} ({scope})", found.report()),
     }
 }
 

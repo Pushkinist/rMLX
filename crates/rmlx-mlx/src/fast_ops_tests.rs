@@ -57,18 +57,13 @@ fn rope_dynamic_matches_static() {
     }
 }
 
-fn f32_array(values: &[f32], shape: &[i32]) -> Array {
-    let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-    Array::from_bytes(&bytes, shape, Dtype::F32).expect("from_bytes")
-}
-
 /// One query, two keys, head_dim 2, scale 1: the scores are [1, 0], so the
 /// output is `softmax([1, 0]) @ V` = [1 + 2w, 2 + 2w] with w = 1 / (1 + e).
-fn one_head_attention_inputs() -> (Array, Array, Array) {
-    let q = f32_array(&[1.0, 0.0], &[1, 1, 1, 2]);
-    let k = f32_array(&[1.0, 0.0, 0.0, 1.0], &[1, 1, 2, 2]);
-    let v = f32_array(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 2, 2]);
-    (q, k, v)
+fn one_head_attention_inputs() -> Result<(Array, Array, Array)> {
+    let q = Array::from_f32_slice(&[1.0, 0.0], &[1, 1, 1, 2])?;
+    let k = Array::from_f32_slice(&[1.0, 0.0, 0.0, 1.0], &[1, 1, 2, 2])?;
+    let v = Array::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 2, 2])?;
+    Ok((q, k, v))
 }
 
 fn one_head_attention_reference() -> Vec<f32> {
@@ -84,7 +79,7 @@ fn one_head_attention_reference() -> Vec<f32> {
 /// the call must be refused instead, with nothing passed to mlx-c.
 #[test]
 fn scaled_dot_product_attention_on_cpu_follows_the_c_api_verdict() {
-    let (q, k, v) = one_head_attention_inputs();
+    let (q, k, v) = one_head_attention_inputs().expect("attention inputs");
     let out = scaled_dot_product_attention(&q, &k, &v, 1.0, "", None, Device::Cpu);
     match c_api::verdict() {
         CApiVerdict::Match(_) => {
@@ -113,7 +108,7 @@ fn scaled_dot_product_attention_on_cpu_follows_the_c_api_verdict() {
 /// gone or comes after the call.
 #[test]
 fn a_c_api_mismatch_refuses_sdpa_before_the_mlx_c_call() {
-    let (q, k, v) = one_head_attention_inputs();
+    let (q, k, v) = one_head_attention_inputs().expect("attention inputs");
     let mismatch = CApiVerdict::Mismatch {
         compiled: CApi::COMPILED,
         loaded: CApi::COMPILED.other(),

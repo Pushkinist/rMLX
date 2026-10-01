@@ -34,7 +34,7 @@ fn pin() -> MlxPin {
 /// about that one thing and not about the fixture.
 fn pinned_pair() -> LinkedPair {
     LinkedPair {
-        c_api: CApiVerdict::Match(CApi::V0_7),
+        c_api: CApiVerdict::Match(CApi::V0_6),
         mlx: keg("mlx", "0.31.2", "libmlx.dylib"),
         mlx_c: keg("mlx-c", "0.6.0_2", "libmlxc.dylib"),
         kernels: KernelScan::Scanned {
@@ -244,7 +244,6 @@ fn a_metallib_without_the_kernels_outranks_every_other_finding() {
     // The expensive, invisible failure. It is reported even when the version
     // also disagrees, because the version is the cheaper thing to notice.
     let observed = LinkedPair {
-        c_api: CApiVerdict::Match(CApi::V0_7),
         mlx: keg("mlx", "0.32.0", "libmlx.dylib"),
         kernels: KernelScan::Scanned {
             present: false,
@@ -356,7 +355,6 @@ fn an_unreadable_metallib_is_unverified_not_absent() {
     // The distinction the whole gate turns on: a scan that could not run has
     // established nothing, and must not read as either presence or absence.
     let unreadable = LinkedPair {
-        c_api: CApiVerdict::Match(CApi::V0_7),
         kernels: KernelScan::Unverified {
             metallib: Some(PathBuf::from(
                 "/opt/homebrew/Cellar/mlx/0.31.2/lib/mlx.metallib",
@@ -613,6 +611,49 @@ fn host_class_maps_onto_whether_the_pin_binds() {
             .len(),
         3,
         "an operator must be able to tell the three apart: {described:?}"
+    );
+}
+
+/// A measurement refuses on an mlx-c C API mismatch on every host, and on a
+/// pair mismatch only where the pin binds. Over constructed checks, so the
+/// cells this machine cannot be in are covered too.
+#[test]
+fn a_c_api_mismatch_refuses_measurement_on_every_host() {
+    use super::{PinCheck, PinEnforcement};
+
+    let check = |matches, c_api_matches, enforcement| PinCheck {
+        matches,
+        c_api_matches,
+        enforcement,
+        detail: String::new(),
+    };
+    let binding = PinEnforcement::Binding;
+    let not_applicable = PinEnforcement::NotApplicable { gpu_family: 7 };
+    let unknown = PinEnforcement::UnknownHost;
+    for enforcement in [binding, not_applicable, unknown] {
+        assert!(
+            check(false, false, enforcement).refuses_measurement(),
+            "a C API mismatch must refuse on {enforcement:?}"
+        );
+        assert!(
+            !check(true, true, enforcement).refuses_measurement(),
+            "the pinned pair must measure on {enforcement:?}"
+        );
+    }
+    assert!(check(false, true, binding).refuses_measurement());
+    assert!(!check(false, true, not_applicable).refuses_measurement());
+    assert!(!check(false, true, unknown).refuses_measurement());
+}
+
+/// `pin_check` hands the C API verdict to its callers, which is how a mismatch
+/// reaches the hosts the pin does not bind. On a matched pair both sides are
+/// true; only a cross-pair run (docs/MLX_PAIR.md, "Two mlx-c C APIs") makes
+/// them false.
+#[test]
+fn the_pin_check_carries_the_c_api_verdict() {
+    assert_eq!(
+        pin_check().c_api_matches,
+        matches!(crate::c_api::verdict(), CApiVerdict::Match(_)),
     );
 }
 

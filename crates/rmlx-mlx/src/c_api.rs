@@ -10,6 +10,9 @@
 //!
 //! [`verdict`] compares the two once per process. The SDPA wrapper refuses the
 //! call on a mismatch, and the one-shot MLX init logs it as an error.
+//!
+//! The probe tells the 0.6 C API from the 0.7 one and nothing else. A later
+//! mlx-c that keeps the 0.7 marker and changes another signature reads as 0.7.
 
 use std::ffi::{c_char, c_void, CString};
 use std::sync::OnceLock;
@@ -60,10 +63,11 @@ pub(crate) enum CApiVerdict {
 }
 
 impl CApiVerdict {
-    pub(crate) const fn classify(compiled: CApi, loaded: CApi) -> Self {
-        match (compiled, loaded) {
-            (CApi::V0_6, CApi::V0_6) | (CApi::V0_7, CApi::V0_7) => Self::Match(compiled),
-            _ => Self::Mismatch { compiled, loaded },
+    pub(crate) fn classify(compiled: CApi, loaded: CApi) -> Self {
+        if compiled == loaded {
+            Self::Match(compiled)
+        } else {
+            Self::Mismatch { compiled, loaded }
         }
     }
 
@@ -83,8 +87,10 @@ pub(crate) fn mismatch_message(compiled: CApi, loaded: CApi) -> String {
         "mlx-c C API mismatch: this binary was compiled against the {} C API, but the \
          loaded libmlxc.dylib has the {} C API. mlx_fast_scaled_dot_product_attention takes \
          a different argument list in the two, so rMLX does not call it. Rebuild rMLX \
-         against the loaded mlx-c (`cargo clean -p rmlx-mlx`, then build again), or load \
-         the mlx-c it was built against. See docs/MLX_PAIR.md, \"Two mlx-c C APIs\".",
+         against the loaded mlx-c (in a checkout, `cargo clean -p rmlx-mlx` and build \
+         again; a Homebrew install, `brew reinstall rmlx`), or load the mlx-c it was \
+         built against, which is the only fix for a release tarball. See \
+         docs/MLX_PAIR.md, \"Two mlx-c C APIs\".",
         compiled.name(),
         loaded.name(),
     )

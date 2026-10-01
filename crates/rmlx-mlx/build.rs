@@ -186,6 +186,10 @@ fn main() {
     // The one call whose argument list differs between the mlx-c C APIs is
     // compiled per `mlxc_c_api_0_7`. `src/c_api.rs` compares that choice with
     // the `libmlxc.dylib` the process loads, through the marker named here.
+    // The two headers that declare the call and the marker re-run this script.
+    for header in ["fast.h", "compile.h"] {
+        rerun_if_present(&format!("{mlx_c_prefix}/include/mlx/c/{header}"));
+    }
     let force_fused = sdpa_takes_force_fused(&cleaned).unwrap_or_else(|e| {
         panic!("rmlx-mlx build.rs: unknown mlx-c C API at {mlx_c_prefix}: {e}")
     });

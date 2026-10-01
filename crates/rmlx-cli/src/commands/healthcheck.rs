@@ -632,7 +632,7 @@ fn check_mlx_pin() -> CheckLine {
     let check = rmlx_mlx::pin_check();
     CheckLine::new(
         "mlx_pin",
-        mlx_pin_status(check.matches, check.enforcement),
+        mlx_pin_status(check.matches, check.c_api_matches, check.enforcement),
         check.detail,
     )
 }
@@ -644,13 +644,22 @@ fn check_mlx_pin() -> CheckLine {
 /// against a second copy of itself over that one cell is an assertion that
 /// cannot fail.
 ///
-/// A mismatch is red only where the pinned kernels exist to be missed. On
+/// An mlx-c C API mismatch is red on every host: attention cannot run.
+///
+/// A pair mismatch is red only where the pinned kernels exist to be missed. On
 /// hardware without a Neural Accelerator they do not, so the finding is worth
 /// printing but is not a failure. On a host that could not be identified the
 /// answer is unknown either way, and an unknown that renders as a clean pass
 /// is how the host scoping becomes a way to succeed without checking — so it
 /// is red as well.
-const fn mlx_pin_status(matches: bool, enforcement: rmlx_mlx::PinEnforcement) -> Status {
+const fn mlx_pin_status(
+    matches: bool,
+    c_api_matches: bool,
+    enforcement: rmlx_mlx::PinEnforcement,
+) -> Status {
+    if !c_api_matches {
+        return Status::Red;
+    }
     if matches {
         return Status::Green;
     }

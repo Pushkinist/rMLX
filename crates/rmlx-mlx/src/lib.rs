@@ -298,21 +298,13 @@ fn parse_mlx_version(s: &str) -> Option<(u32, u32, u32)> {
 /// Warn (not fail): a skew is usually benign-but-slow, and a hard error here
 /// would brick every run on a host whose package manager moved ahead.
 fn warn_on_mlx_version_skew() {
-    if MLX_BUILD_VERSION == "unknown" {
+    let Some(built) = parse_mlx_version(MLX_BUILD_VERSION) else {
         return;
-    }
+    };
     let Some(runtime) = runtime_mlx_version() else {
         return;
     };
-    // The runtime string carries a ".devYYYYMMDD+hash" suffix on dev builds;
-    // compare only the leading "major.minor.patch".
-    let runtime_core = runtime.split(['-', '+']).next().unwrap_or(&runtime);
-    let runtime_core = runtime_core
-        .split('.')
-        .take(3)
-        .collect::<Vec<_>>()
-        .join(".");
-    if runtime_core != MLX_BUILD_VERSION {
+    if parse_mlx_version(&runtime) != Some(built) {
         tracing::warn!(
             build_version = MLX_BUILD_VERSION,
             runtime_version = %runtime,

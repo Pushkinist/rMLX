@@ -1779,9 +1779,12 @@ const fn gpu_capture_requested(_cmd: &Cmd) -> bool {
 /// not necessarily what this binary was linked against: `MLX_PREFIX` and
 /// `MLX_C_PREFIX` (`crates/rmlx-mlx/build.rs`) can point a build at an install
 /// the preflight never inspects.
+///
+/// An mlx-c C API mismatch refuses on every host, not only where the pin
+/// binds: attention cannot run, so the run would fail after the model load.
 fn refuse_to_measure_off_the_pin(command: &str) -> Result<()> {
     let check = rmlx_mlx::pin_check();
-    if check.matches || !check.enforcement.is_binding() {
+    if !check.refuses_measurement() {
         tracing::debug!(
             detail = %check.detail,
             enforcement = ?check.enforcement,
