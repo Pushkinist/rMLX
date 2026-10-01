@@ -103,7 +103,11 @@ struct Posted<'job> {
 
 impl<'job> Posted<'job> {
     /// Post `job` and wake the MLX thread.
-    fn new<F: FnMut() + Send>(
+    ///
+    /// # Safety
+    /// Drop the returned value. Do not forget or leak it: the MLX thread can
+    /// run `job` until the drop sees `done`.
+    unsafe fn new<F: FnMut() + Send>(
         mailbox: &'static Mailbox,
         mlx_thread: &Thread,
         job: &'job mut F,
@@ -184,7 +188,8 @@ fn serve(mailbox: &Mailbox) {
         };
         // SAFETY: a `Posted` made `job` from a closure of the type that
         // `job.call` expects. It holds `turn`, so the next `done` is for this
-        // job, and it borrows the closure until its drop sees that `done`.
+        // job. It borrows the closure and is dropped, never forgotten, so the
+        // closure lives until its drop sees that `done`.
         unsafe { (job.call)(job.job) };
         mailbox.done.store(true, Ordering::Release);
         waiter.unpark();
@@ -195,7 +200,8 @@ fn serve(mailbox: &Mailbox) {
 /// `Posted` waits for it.
 fn hand_off<F: FnMut() + Send>(job: &mut F) -> Result<()> {
     let (mailbox, mlx_thread) = mailbox()?;
-    let _posted = Posted::new(mailbox, mlx_thread, job);
+    // SAFETY: `_posted` drops at the end of this function.
+    let _posted = unsafe { Posted::new(mailbox, mlx_thread, job) };
     Ok(())
 }
 

@@ -756,7 +756,7 @@ reinterpretation (`slice::from_raw_parts`) of array data. Because
 | `null_sentinel` | The null handle is only an "absent" argument to an mlx-c function that accepts null. Never store or materialise it. |
 | `Stream` (`mlx_thread.rs`) `Send + Sync` | The handle names an immutable `{device, index}` and is never freed. Only the MLX thread uses the encoder behind it. |
 | `check_status` | Call immediately after the mlx-c call, on the same thread, before another call can overwrite the error slot. After `with_eval_lock`, the error slot of the calling thread holds the message of the call on the MLX thread. |
-| `JobRef` (`mlx_thread.rs`) `Send`, and its call in `serve` | `Posted::new` makes it from a `Send` closure on the stack of the waiting thread. The `Posted` holds `turn`, so the next `done` is for its job, and borrows the closure. Its drop waits for that `done`, so every exit from `hand_off` waits for it. |
+| `JobRef` (`mlx_thread.rs`) `Send`, and its call in `serve` | `Posted::new` makes it from a `Send` closure on the stack of the waiting thread. The `Posted` holds `turn`, so the next `done` is for its job. It borrows the closure and is dropped, never forgotten: `Posted::new` is `unsafe` for this reason. Its drop waits for that `done`, so every exit from `hand_off` waits for it. |
 | `rust_closure_callback` | `payload` is the boxed function, valid for the closure's life. `input` is borrowed and not freed; `output` is filled here. No panic crosses the boundary. |
 | `MetalKernel` / `Closure` `Send + Sync` | The handle is immutable and ref-counted by mlx-c. The Metal device context is process-global; callers hold the Metal claim (`crates/rmlx-server/src/claim.rs`). |
 
