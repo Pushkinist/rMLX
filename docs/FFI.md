@@ -262,10 +262,11 @@ returning `Err(Error::GpuForbidden { op })`, not the mlx-c call:
 **Guarantee.** Under `--device cpu`, no rmlx op runs on a GPU stream, and no
 rmlx Metal API is called. A KV codec carrying MSL, and `--gpu-capture`, are
 refused before the model load; any other GPU request returns `GpuForbidden`.
-
 An op that MLX builds inside another op (the `astype` of bf16 scales in an
 affine `quantized_matmul` with f32 input) runs on the CPU too
-(`an_op_that_mlx_builds_itself_runs_on_the_cpu_under_cpu`). Outside it: MLX's allocator opens an `MTLDevice` on first allocation either
+(`an_op_that_mlx_builds_itself_runs_on_the_cpu_under_cpu`).
+
+Outside it: MLX's allocator opens an `MTLDevice` on first allocation either
 way — `metal::allocator()` backs every array buffer. A GPU stream that MLX
 creates itself, not from the default device, is uncovered.
 
@@ -301,8 +302,9 @@ and keeps them for the life of the process.
   continues on the calling thread.
 - A hand-off allocates nothing and creates no channel: the job and its result
   stay on the stack of the waiting thread, and one static mailbox passes a
-  pointer to the job (`crates/rmlx-mlx/tests/hand_off.rs`). So a job can
-  borrow from its caller, and no mlx-c handle type needs `Send`.
+  pointer to the job (`crates/rmlx-mlx/tests/hand_off.rs`). Each side spins
+  about 20 µs, then parks. A job can borrow from its caller, so no mlx-c handle
+  type needs `Send`.
 - A call from the MLX thread itself runs in place
   (`a_hand_off_from_the_mlx_thread_runs_in_place`). A second hand-off from
   there would wait for the mailbox that the outer job holds.
@@ -310,15 +312,15 @@ and keeps them for the life of the process.
 So an array built on any thread evaluates from any thread, and a new loader,
 cache or blocking-pool entry point needs no stream set-up or evaluation before
 a hand-over. `a_cpu_op_built_on_one_thread_evaluates_on_another` and
-`a_gpu_op_built_on_one_thread_evaluates_on_another` hold this; the thread-boundary suite
-(`crates/rmlx-server/tests/thread_boundary*.rs`) holds the production
-hand-overs on real models.
+`a_gpu_op_built_on_one_thread_evaluates_on_another` hold this; the
+thread-boundary suite (`crates/rmlx-server/tests/thread_boundary*.rs`) holds
+the production hand-overs on real models.
 
 Cost: each `Array::eval`, `async_eval` and `Closure::apply` from another
-thread is one hand-off to the MLX thread and back, about 2 to 4 µs (median,
-release build). Decode makes 110 per token on Ternary-Bonsai-8B and 103 on
-gemma-4-e2b at the default KV quant; one `async_eval` of the K and V buffers is
-one hand-off, not two.
+thread is one hand-off. Median, release build: 0.4 µs while the MLX thread
+spins, 3 to 5 µs after it parked. Decode makes 110 per token on
+Ternary-Bonsai-8B and 103 on gemma-4-e2b at the default KV quant; one
+`async_eval` of the K and V buffers is one hand-off, not two.
 
 ### Null sentinel for optional arguments
 

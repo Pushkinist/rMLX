@@ -18,6 +18,8 @@
 //!
 //! A hand-off allocates nothing: the job and its result stay on the stack of
 //! the waiting thread, and the MLX thread reaches them through one mailbox.
+//! Each side spins briefly before it parks, because during decode the next
+//! job, or the result, usually comes within microseconds.
 //!
 //! Only this module names an mlx-c stream function:
 //! `every_stream_comes_from_the_mlx_thread` fails on one in any other source
@@ -25,7 +27,9 @@
 
 use std::cell::Cell;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::{Condvar, Mutex, OnceLock, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock, PoisonError};
+use std::thread::Thread;
 
 use rmlx_core::error::{Error, Result};
 
@@ -45,22 +49,46 @@ struct JobRef(*mut (dyn FnMut() + Send));
 // the MLX thread is done with it.
 unsafe impl Send for JobRef {}
 
+/// A posted job and the thread that waits for it.
+struct Post {
+    job: JobRef,
+    waiter: Thread,
+}
+
 /// Where a waiting thread puts its job for the MLX thread.
 struct Mailbox {
-    /// Held by the one thread whose job is in `job`.
+    /// Held by the one thread whose job is posted.
     turn: Mutex<()>,
-    /// `Some` from the post until the MLX thread has run the job.
-    job: Mutex<Option<JobRef>>,
-    posted: Condvar,
-    done: Condvar,
+    post: Mutex<Option<Post>>,
+    /// Set when `post` holds a job that the MLX thread has not taken.
+    posted: AtomicBool,
+    /// Set when the MLX thread has run the posted job.
+    done: AtomicBool,
 }
 
 static MAILBOX: Mailbox = Mailbox {
     turn: Mutex::new(()),
-    job: Mutex::new(None),
-    posted: Condvar::new(),
-    done: Condvar::new(),
+    post: Mutex::new(None),
+    posted: AtomicBool::new(false),
+    done: AtomicBool::new(false),
 };
+
+/// About 20 µs of `spin_loop` on an M5 core.
+const SPIN_LIMIT: u32 = 2048;
+
+/// Return when `flag` is set: spin up to [`SPIN_LIMIT`] times, then park. The
+/// thread that sets `flag` unparks this one after it.
+fn wait_for(flag: &AtomicBool) {
+    for _ in 0..SPIN_LIMIT {
+        if flag.load(Ordering::Acquire) {
+            return;
+        }
+        std::hint::spin_loop();
+    }
+    while !flag.load(Ordering::Acquire) {
+        std::thread::park();
+    }
+}
 
 /// A stream of the MLX thread. The handle is never freed: MLX keeps a stream
 /// and its encoder for the life of the process.
@@ -76,8 +104,10 @@ unsafe impl Sync for Stream {}
 static CPU_STREAM: OnceLock<Stream> = OnceLock::new();
 static GPU_STREAM: OnceLock<Stream> = OnceLock::new();
 
-fn mailbox() -> Result<&'static Mailbox> {
-    static STARTED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+/// The mailbox, and the MLX thread to wake for it. The first call starts the
+/// thread.
+fn mailbox() -> Result<(&'static Mailbox, &'static Thread)> {
+    static STARTED: OnceLock<std::result::Result<Thread, String>> = OnceLock::new();
     STARTED
         .get_or_init(|| {
             std::thread::Builder::new()
@@ -86,33 +116,33 @@ fn mailbox() -> Result<&'static Mailbox> {
                 // every evaluation of every command runs here.
                 .stack_size(8 << 20)
                 .spawn(|| serve(&MAILBOX))
-                .map(drop)
+                .map(|handle| handle.thread().clone())
                 .map_err(|e| e.to_string())
         })
         .as_ref()
-        .map(|()| &MAILBOX)
+        .map(|thread| (&MAILBOX, thread))
         .map_err(|e| Error::Mlx(format!("the MLX thread did not start: {e}")))
 }
 
-/// The loop of the MLX thread: run each posted job, then mark it done.
+/// The loop of the MLX thread: take each posted job, run it, mark it done.
 fn serve(mailbox: &Mailbox) {
     ON_MLX_THREAD.with(|on| on.set(true));
-    let mut posted = mailbox.job.lock().unwrap_or_else(PoisonError::into_inner);
     loop {
-        let Some(JobRef(job)) = *posted else {
-            posted = mailbox
-                .posted
-                .wait(posted)
-                .unwrap_or_else(PoisonError::into_inner);
+        wait_for(&mailbox.posted);
+        mailbox.posted.store(false, Ordering::Relaxed);
+        let post = mailbox
+            .post
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let Some(Post { job, waiter }) = post else {
             continue;
         };
-        drop(posted);
-        // SAFETY: the posting thread keeps the job alive, and does not touch
-        // it, until it sees the slot empty again below.
-        unsafe { (*job)() };
-        posted = mailbox.job.lock().unwrap_or_else(PoisonError::into_inner);
-        *posted = None;
-        mailbox.done.notify_one();
+        // SAFETY: the waiting thread keeps the job alive, and does not touch
+        // it, until it sees `done`.
+        unsafe { (*job.0)() };
+        mailbox.done.store(true, Ordering::Release);
+        waiter.unpark();
     }
 }
 
@@ -122,25 +152,24 @@ fn serve(mailbox: &Mailbox) {
     reason = "an `as` cast cannot extend the lifetime of a trait object (rust-lang/rust#141402)"
 )]
 fn hand_off(job: &mut (dyn FnMut() + Send + '_)) -> Result<()> {
-    let mailbox = mailbox()?;
+    let (mailbox, mlx_thread) = mailbox()?;
     let _turn = mailbox.turn.lock().unwrap_or_else(PoisonError::into_inner);
     // SAFETY: only the lifetime changes. This function returns only after the
-    // MLX thread has run the job and emptied the slot, so the job outlives
-    // every use of the pointer.
+    // MLX thread has run the job and set `done`, so the job outlives every use
+    // of the pointer.
     let job = unsafe {
         std::mem::transmute::<*mut (dyn FnMut() + Send + '_), *mut (dyn FnMut() + Send + 'static)>(
             job,
         )
     };
-    let mut posted = mailbox.job.lock().unwrap_or_else(PoisonError::into_inner);
-    *posted = Some(JobRef(job));
-    mailbox.posted.notify_one();
-    while posted.is_some() {
-        posted = mailbox
-            .done
-            .wait(posted)
-            .unwrap_or_else(PoisonError::into_inner);
-    }
+    *mailbox.post.lock().unwrap_or_else(PoisonError::into_inner) = Some(Post {
+        job: JobRef(job),
+        waiter: std::thread::current(),
+    });
+    mailbox.posted.store(true, Ordering::Release);
+    mlx_thread.unpark();
+    wait_for(&mailbox.done);
+    mailbox.done.store(false, Ordering::Relaxed);
     Ok(())
 }
 
