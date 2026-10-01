@@ -245,7 +245,11 @@ before any other mlx-c call can overwrite the slot.
 thread for the device (below). Every op is built on one of these two streams.
 Only `mlx_thread.rs` names an mlx-c stream function:
 `every_stream_comes_from_the_mlx_thread` fails on one in any other source file
-of the crate. For the GPU device `with_stream` checks the latch below first.
+of the crate. It reads every identifier with comments removed and literals
+kept, so an alias, a glob import, a function pointer or a `link_name` counts
+too. It cannot see a name that a macro builds from parts, or a symbol looked up
+by a string built at run time. For the GPU device `with_stream` checks the
+latch below first.
 
 ### The CPU-device latch
 
@@ -438,7 +442,7 @@ no `Closure::apply` of another compiled closure either.
 | | Kind | Catches | Misses |
 |---|---|---|---|
 | `make check-eval-lock` | text gate, deterministic | an unguarded call to any of the 25 (RULE 1, RULE 2); a closure body that takes the lock (RULE 3) | a lock that no longer locks |
-| `under_eval_lock_excludes_concurrent_callers` | unit test, deterministic | two callers inside the lock at once: a lock that does not exclude | which calls take the lock; whether evaluation runs on the MLX thread |
+| `under_eval_lock_excludes_concurrent_callers`, `with_eval_lock_holds_the_lock_while_its_job_runs` | unit tests, deterministic | a lock that does not exclude two callers; a `with_eval_lock` that runs its job without the lock | which FFI calls go through `with_eval_lock` |
 | `make eval-lock-stress` | end-to-end driver, 400 threads per process | wrong values from concurrent evaluation under the lock | no defect is measured on the linked MLX, so its detection power there is unknown |
 
 The gate and the unit test are complementary: each is blind to what the other

@@ -660,6 +660,20 @@ fn under_eval_lock_excludes_concurrent_callers() {
     );
 }
 
+/// `with_eval_lock` runs its job under the lock that
+/// `under_eval_lock_excludes_concurrent_callers` holds to exclude. The MLX
+/// thread runs one job at a time either way, so only the lock state inside
+/// the job tells the two apart.
+#[test]
+fn with_eval_lock_holds_the_lock_while_its_job_runs() {
+    let held =
+        with_eval_lock(|| EVAL_LOCK.try_lock().is_err()).expect("the MLX thread runs the job");
+    assert!(
+        held,
+        "with_eval_lock ran its job without the evaluation lock"
+    );
+}
+
 /// **Out of the default run.** 400 threads each build a CPU graph, wait at a
 /// barrier, then hand their evaluations to the MLX thread at the same moment,
 /// and each must read back its own values.

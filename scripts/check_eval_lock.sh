@@ -30,9 +30,11 @@
 #
 #   What it does NOT catch is a `with_eval_lock` that stopped locking: the
 #   lexical structure is unchanged, so this gate stays green. That half is
-#   covered by the unit test `under_eval_lock_excludes_concurrent_callers`,
-#   which takes the lock from two threads directly. The two are complementary
-#   by construction, verified by mutation — neither alone covers this defect.
+#   covered by the unit tests `under_eval_lock_excludes_concurrent_callers`
+#   (the lock excludes two threads) and
+#   `with_eval_lock_holds_the_lock_while_its_job_runs`. The two are
+#   complementary by construction, verified by mutation — neither alone
+#   covers this defect.
 #
 # HOW THE REACH-SET WAS DERIVED — re-run this when the mlx / mlx-c pin moves
 #   It is not guesswork and must not become guesswork. TWO passes, because one
