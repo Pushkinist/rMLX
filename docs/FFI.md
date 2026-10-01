@@ -70,8 +70,9 @@ strings "$(brew --prefix mlx)/lib/mlx.metallib" | grep -c steel_gemm_fused_nax
 ```
 
 rMLX also compiles against the Homebrew pair, mlx 0.32.1 + mlx-c 0.6.0_4
-(see [Two mlx-c C APIs](#two-mlx-c-c-apis)). The pin binds only on M5 and
-later.
+(see [Two mlx-c C APIs](#two-mlx-c-c-apis)). The gate that checks the loaded
+pair, and binds only on M5 and later, is in
+[`docs/MLX_PAIR.md`](MLX_PAIR.md#the-pin-gate).
 
 #### Where NAX can appear, and where it cannot
 
@@ -89,79 +90,6 @@ NAX **GEMM** serves every model's matmuls. NAX **attention**
 So no decode path on any codec reaches NAX. `mpp::tensor_ops::matmul2d`
 allows an `M` below MLX's shipped tile, so the tile is not what keeps decode
 off NAX.
-
-#### The gate: `linked_mlx_matches_the_pinned_pair`
-
-`crates/rmlx-mlx/src/pin.rs` reads the two dylibs dyld resolved for this
-process, canonicalises them to their kegs, compares both versions with
-`mlx-pin.txt`, scans the `mlx.metallib` beside `libmlx.dylib` for
-`steel_gemm_fused_nax`, and reads the mlx-c C API verdict.
-`linked_mlx_matches_the_pinned_pair` (`src/pin_tests.rs`) fails unless all of
-that agrees.
-
-The metallib scan is the load-bearing half: bottle contents vary by build
-runner, so a version match does not prove the kernels are there. The version
-check covers the ABI coupling.
-
-The check is not in a build script. Cargo re-runs a build script only when a
-`rerun-if-changed` path is *newer*, statting through symlinks. Repointing
-`opt/mlx` at an older keg moves the mtime backwards, so cargo would replay a
-stale verdict.
-
-Every failure is its own verdict, so an inconclusive probe never reads as a
-pass:
-
-| Verdict | Means |
-|---|---|
-| `Match` | both kegs are the pinned pair, the metallib carries the kernels, and the C API matches |
-| `NotLoaded` | dyld listed no such image; reported first |
-| `CApiMismatch` | the loaded `libmlxc` has another C API than the compiled one; attention cannot run |
-| `KernelsMissing` | the metallib was read and has none |
-| `VersionMismatch` | a keg version disagrees with the pin |
-| `NotAKeg` | the resolved library is not in a keg, so it has no version |
-| `KernelsUnverified` | the metallib could not be read |
-| `PinUnparsable` | `mlx-pin.txt` declares no pair |
-
-The pin grammar is parsed twice, because the preflight and the restore script
-run before any binary exists: `parse_pin` (`src/pin.rs`) and
-`scripts/lib/mlx_pin.sh`. `the_shell_pin_parser_agrees_with_the_rust_one`
-holds them together. Versions must look like a keg directory name, because the
-restore script interpolates them into Cellar paths and Ruby text.
-
-**Scoped to Neural-Accelerator hosts** (Apple GPU family 10 and later, from
-`rmlx_core::apple_gpu`). Earlier chips have no Neural Accelerator, so the
-kernels buy nothing there. `the_gate_can_tell_which_host_it_is_on` fails if
-the chip cannot be identified.
-
-**It runs where numbers are made.** `rmlx baseline` and `rmlx bench` refuse to
-run when the pin binds and the loaded pair is wrong. `rmlx healthcheck`
-reports the verdict as an `mlx_pin` line. `scripts/mlx_preflight.sh`
-(`make mlx-preflight`, run by `make canary`, `canary-ab` and
-`bench-codec-cell`) reads the `opt` symlinks as a pre-filter, then asks the
-built binary. Only the process taking the measurement knows what dyld
-resolved: `MLX_PREFIX` or `DYLD_LIBRARY_PATH` can bypass the symlinks.
-
-#### Run identity: `events.mlx_nax`
-
-`rmlx_mlx::nax_capability()` returns `present`, `absent` or `unknown` from
-the same runtime scan, once per process. `rmlx-cli`'s `main` forwards it to
-`rmlx_metrics::identity::set_mlx_nax`, so every `events` row records whether
-that run had the kernels. `unknown` means the metallib could not be
-inspected. See `docs/METRICS_SCHEMA.md` §3.6.
-
-mlx's version comes from `include/mlx/version.h`. mlx-c ships no version
-header; its identity is the keg directory name, the only place the revision
-suffix appears.
-
-#### Fixing a machine that drifted
-
-`make mlx-restore-pin` (`scripts/mlx_restore_pin.sh`) takes the pinned kegs
-from the Cellar or from the durable store, refuses a keg without NAX
-kernels, and links and pins the exact kegs. Then run
-`cargo clean -p rmlx-mlx` and build again: moving to an older keg does not
-re-run `build.rs`, so the crate would keep bindings from the wrong headers.
-Details, and why `brew link` / `brew pin` cannot do this:
-[`docs/MLX_PAIR.md`](MLX_PAIR.md).
 
 ### Two mlx-c C APIs
 
@@ -214,9 +142,12 @@ The warning names prefill and TTFT only, because NAX is unreachable at decode.
 4. The MLX version from `version.h` is baked in as `RMLX_MLX_BUILD_VERSION`,
    and the mlx-c C API of the bindings as `cfg(mlxc_c_api_0_7)`.
 5. Rebuild triggers: `MLX_C_PREFIX`, `MLX_PREFIX`, `wrapper.h`,
-   `build_support.rs`, and a *newer* resolved `version.h` or `mlx.metallib`.
-   Each file trigger is registered only when the file exists. Repointing `opt`
-   to an older keg does not re-run the script; use `cargo clean -p rmlx-mlx`.
+   `build_support.rs`, and a *newer* `mlx/version.h` of mlx or
+   `mlx/c/fast.h` / `mlx/c/compile.h` of mlx-c, the two headers that decide
+   `cfg(mlxc_c_api_0_7)`. Each file trigger is registered only when the file
+   exists. Repointing `opt` to an older keg does not re-run the script; use
+   `cargo clean -p rmlx-mlx`. A stale C API choice then fails at run time
+   ([Two mlx-c C APIs](#two-mlx-c-c-apis)).
 6. rpath entries for both prefixes let the binary run without
    `DYLD_LIBRARY_PATH`.
 
@@ -564,16 +495,19 @@ whether the call reaches a fused kernel or a composite graph.
 
 `ScaledDotProductAttention::use_fallback`
 (`mlx/backend/metal/scaled_dot_product_attention.cpp`, v0.32.3) gates on
-`head_dim`, `q_seq` and the mask:
+`head_dim`, `q_seq`, `kL`, the GQA factor and the mask:
 
 | Route | `head_dim` | Conditions |
 |---|---|---|
-| `sdpa_full` (fused, `q_seq > 8`) | 64, 72, 80, 96, 128, (96, 64) | the mask is absent, an array, or causal |
+| `sdpa_full` (fused, `q_seq > 8`) | 64, 72, 80, 96, 128, (96, 64) | the mask is absent, an array, or causal with `q_seq <= kL` (every `sdpa_full` row) |
 | `sdpa_full` at 256 | 256 | NAX GPU, `q_seq >= 1024`, causal or array mask; or no NAX, causal, `q_seq >= 2048`, `q_seq == kL`, Q not f32 |
 | `sdpa_full` at 512 | 512 | NAX GPU, `q_seq >= 1024`, causal, no array mask, `B × H × ⌈q_seq/32⌉ >= 1024` |
-| `sdpa_vector` (fused, `q_seq <= 8`) | 64, 96, 128, 256, (192, 128), (96, 64) | GQA factors 8, 12 and 16 read K/V once in a two-pass kernel |
+| `sdpa_vector` (fused, `q_seq <= 8`) | 64, 96, 128, 256, (192, 128), (96, 64) | `q_seq <= kL` and `q_seq × GQA factor <= 32`; GQA factors 8, 12 and 16 read K/V once in a two-pass kernel |
 | `sdpa_vector` at 512 | 512 | `q_seq == 1`, GQA factor 8, no array mask, `kL >= 1024` (`MLX_SDPA_D512_MIN_KL`) |
 | composite graph | any | whatever the rows above reject, including 192 |
+
+So at GQA factor 8 a call with 5 to 8 query rows, a speculative verify round
+of that size for one, takes the composite graph.
 
 The composite route is `matmul(q, kᵀ)` → mask → `softmax` → `matmul`, with
 the `[B, n_heads, L_q, L_k]` score tensor materialised.
