@@ -1510,3 +1510,7 @@ mod lib_tests;
 
 #[cfg(test)]
 mod gpu_latch_tests;
+
+#[cfg(test)]
+#[path = "../tests/common/within_limit.rs"]
+mod within_limit;

@@ -2,23 +2,22 @@
 //! thread, and only `mlx_thread.rs` names an mlx-c stream function.
 
 use std::sync::mpsc;
-use std::time::Duration;
 
 use super::*;
+use crate::within_limit::{within_limit, LIMIT};
 use crate::{add, Array, Device};
-
-#[path = "../tests/common/within_limit.rs"]
-mod within_limit;
-
-use within_limit::within_limit;
-
-/// The longest the cross-thread read may take. A cross-thread evaluation can
-/// wait forever instead of failing.
-const READ_LIMIT: Duration = Duration::from_secs(60);
 
 fn lazy_sum(device: Device) -> Array {
     let a = Array::from_f32_slice(&[1.0, 2.0], &[2]).unwrap();
     add(&a, &a, device).unwrap()
+}
+
+/// Wait for the one-time MLX init of this process, so that a time limit
+/// started after it counts only its own step. Under Miri no MLX runs.
+fn after_mlx_init() {
+    if !cfg!(miri) {
+        assert_eq!(lazy_sum(Device::Cpu).to_bytes().unwrap().len(), 8);
+    }
 }
 
 /// Build a lazy op on one thread and keep that thread alive and idle, as a
@@ -48,7 +47,7 @@ fn assert_crosses_threads(test: &str, device: Device) {
             .send(lazy.to_bytes().map_err(|e| e.to_string()))
             .ok();
     });
-    let crossed = within_limit(&read_rx, READ_LIMIT, "the cross-thread read")
+    let crossed = within_limit(&read_rx, LIMIT, "the cross-thread read")
         .unwrap_or_else(|| panic!("{test}: the reader panicked"));
     release_tx.send(()).ok();
     builder.join().unwrap();
@@ -108,22 +107,28 @@ fn a_panic_on_the_mlx_thread_reaches_the_caller_and_the_thread_goes_on() {
 /// the thread that posted the outer job holds until that job is done.
 #[test]
 fn a_hand_off_from_the_mlx_thread_runs_in_place() {
+    after_mlx_init();
     let (done_tx, done_rx) = mpsc::channel();
     std::thread::spawn(move || {
         done_tx.send(run(|| run(|| 5))).ok();
     });
-    let nested = within_limit(&done_rx, Duration::from_secs(10), "a nested hand-off")
+    let nested = within_limit(&done_rx, LIMIT, "a nested hand-off")
         .unwrap_or_else(|| panic!("the nested hand-off panicked"));
     assert_eq!(nested.unwrap().unwrap(), 5);
 }
 
 /// Eight threads hand off at the same time, and each must get back the value
 /// of its own job. Without `turn`, a second post replaces the first: that job
-/// is lost, or the MLX thread runs it after its waiter returned.
+/// is lost, or the MLX thread runs it after its waiter returned. Alone, this
+/// test then fails on its assertion. In the full test binary the process can
+/// end first, with a crash or a time-limit exit.
 #[test]
 fn concurrent_hand_offs_each_get_their_own_value() {
     const THREADS: usize = 8;
-    const HAND_OFFS: usize = 2000;
+    // Miri interleaves the threads at random, so it needs fewer hand-offs, and
+    // its clock runs slow against the time limit.
+    const HAND_OFFS: usize = if cfg!(miri) { 100 } else { 2000 };
+    after_mlx_init();
     let (done_tx, done_rx) = mpsc::channel();
     for t in 0..THREADS {
         let done_tx = done_tx.clone();
@@ -134,8 +139,9 @@ fn concurrent_hand_offs_each_get_their_own_value() {
             done_tx.send(wrong).ok();
         });
     }
+    drop(done_tx);
     for _ in 0..THREADS {
-        let wrong = within_limit(&done_rx, Duration::from_secs(60), "concurrent hand-offs")
+        let wrong = within_limit(&done_rx, LIMIT, "concurrent hand-offs")
             .unwrap_or_else(|| panic!("a hand-off thread panicked"));
         assert_eq!(
             wrong, 0,

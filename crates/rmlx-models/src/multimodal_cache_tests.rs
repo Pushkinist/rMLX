@@ -348,16 +348,12 @@ fn read_after_unevaluated_publish(
     std::thread::spawn(move || {
         read_tx.send(read()).ok();
     });
-    let out = within_limit::within_limit(&read_rx, READ_LIMIT, "the cross-thread read")
+    let out = within_limit::within_limit(&read_rx, within_limit::LIMIT, "the cross-thread read")
         .expect("reader panicked");
     release_tx.send(()).ok();
     writer.join().expect("writer panicked");
     out
 }
-
-/// The longest a cross-thread read may take. A cross-thread evaluation can wait
-/// forever instead of failing.
-const READ_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[path = "../../rmlx-mlx/tests/common/within_limit.rs"]
 mod within_limit;

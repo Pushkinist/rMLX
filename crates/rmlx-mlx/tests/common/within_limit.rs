@@ -6,15 +6,21 @@ use std::io::Write;
 use std::sync::mpsc;
 use std::time::Duration;
 
+/// The limit for a step that builds or evaluates a few small arrays. Start it
+/// only after the one-time MLX init of the process: the first Metal device
+/// init reads the directory of the test binary, and in a large
+/// `target/debug/deps` that takes minutes.
+pub(crate) const LIMIT: Duration = Duration::from_secs(60);
+
 /// What the step sent, or `None` when its thread ended without sending (it
 /// panicked).
 ///
-/// Past `limit` the step is hung. Nothing can stop it, and it holds the MLX
-/// thread that every later test of this binary needs. So name the test and
+/// Past `limit` the step is hung. Nothing can stop it, and it can hold the MLX
+/// thread, which every later test of this binary needs. So name the test and
 /// the step on stderr, and end the process.
 #[allow(
     clippy::exit,
-    reason = "a hung step cannot be stopped, and it holds the MLX thread every later test needs"
+    reason = "a hung step cannot be stopped, and it can hold the MLX thread every later test needs"
 )]
 pub(crate) fn within_limit<T>(done: &mpsc::Receiver<T>, limit: Duration, what: &str) -> Option<T> {
     match done.recv_timeout(limit) {
@@ -29,8 +35,8 @@ pub(crate) fn within_limit<T>(done: &mpsc::Receiver<T>, limit: Duration, what: &
             // it captured when the process exits.
             writeln!(
                 std::io::stderr().lock(),
-                "{test}: {what} did not finish within {limit:?}. It holds the MLX thread, so \
-                 this test binary ends here."
+                "{test}: {what} did not finish within {limit:?}. Nothing can stop that step, \
+                 so this test binary ends here."
             )
             .ok();
             std::process::exit(101);
