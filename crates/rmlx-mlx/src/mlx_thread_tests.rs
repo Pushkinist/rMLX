@@ -4,7 +4,7 @@
 use std::sync::mpsc;
 
 use super::*;
-use crate::within_limit::{within_limit, LIMIT};
+use crate::within_limit::{within_limit, INIT_LIMIT, LIMIT};
 use crate::{add, Array, Device};
 
 fn lazy_sum(device: Device) -> Array {
@@ -12,12 +12,21 @@ fn lazy_sum(device: Device) -> Array {
     add(&a, &a, device).unwrap()
 }
 
-/// Wait for the one-time MLX init of this process, so that a time limit
-/// started after it counts only its own step. Under Miri no MLX runs.
+/// Wait for the one-time MLX init of this process under [`INIT_LIMIT`], so
+/// that a later [`LIMIT`] counts only its own step. Under Miri no MLX runs.
 fn after_mlx_init() {
-    if !cfg!(miri) {
-        assert_eq!(lazy_sum(Device::Cpu).to_bytes().unwrap().len(), 8);
+    if cfg!(miri) {
+        return;
     }
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        done_tx
+            .send(lazy_sum(Device::Cpu).to_bytes().map_err(|e| e.to_string()))
+            .ok();
+    });
+    let bytes = within_limit(&done_rx, INIT_LIMIT, "the one-time MLX init")
+        .unwrap_or_else(|| panic!("the thread of the one-time MLX init panicked"));
+    assert_eq!(bytes.unwrap().len(), 8);
 }
 
 /// Build a lazy op on one thread and keep that thread alive and idle, as a
@@ -119,14 +128,16 @@ fn a_hand_off_from_the_mlx_thread_runs_in_place() {
 
 /// Eight threads hand off at the same time, and each must get back the value
 /// of its own job. Without `turn`, a second post replaces the first: that job
-/// is lost, or the MLX thread runs it after its waiter returned. This test
-/// then fails on its assertion, or the process ends first with a time-limit
-/// exit or a crash, alone and in the full test binary.
+/// is lost, or the MLX thread runs it after its waiter returned. Alone, this
+/// test then fails on its assertion or ends with a time-limit exit. In the
+/// full test binary the process can also crash, or hang with no exit: an
+/// untimed test that lost its job waits forever.
 #[test]
 fn concurrent_hand_offs_each_get_their_own_value() {
     const THREADS: usize = 8;
-    // Miri interleaves the threads at random, so it needs fewer hand-offs, and
-    // its clock runs slow against the time limit.
+    // Miri interleaves the threads at random, so it needs fewer hand-offs.
+    // Under Miri the clock moves with each step that Miri runs, so 2000
+    // hand-offs pass `LIMIT`.
     const HAND_OFFS: usize = if cfg!(miri) { 100 } else { 2000 };
     after_mlx_init();
     let (done_tx, done_rx) = mpsc::channel();
