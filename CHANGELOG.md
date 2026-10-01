@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rMLX now builds every op on the streams of one MLX thread and runs every
   evaluation there (`docs/FFI.md` § "The MLX thread"), so any thread can use
   what another thread built.
+- **`--device cpu` runs every op on the CPU.** MLX builds some ops inside
+  other ops on its default device, for example the `astype` of bf16 scales
+  inside an affine `quantized_matmul` with an f32 input. Under `--device cpu`
+  that default device was still the GPU, so such an op ran there.
+  `--device cpu` now makes the CPU the MLX default device too.
 - **The release tarball's binary no longer carries the builder's home
   directory.** Every dependency's panic location was compiled in as an
   absolute path under the build machine's home, user name included — 577

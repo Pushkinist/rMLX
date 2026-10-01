@@ -243,10 +243,9 @@ before any other mlx-c call can overwrite the slot.
 
 `with_stream(device, |s| …) -> Result<T>` gives `f` the stream of the MLX
 thread for the device (below). Every op is built on one of these two streams.
-Only `mlx_thread.rs` gets a stream from mlx-c:
-`every_stream_comes_from_the_mlx_thread` fails on a stream call in any other
-source file of the crate. For the GPU device `with_stream` checks the latch
-below first.
+Only `mlx_thread.rs` names an mlx-c stream function:
+`every_stream_comes_from_the_mlx_thread` fails on one in any other source file
+of the crate. For the GPU device `with_stream` checks the latch below first.
 
 ### The CPU-device latch
 
@@ -254,8 +253,9 @@ below first.
 when it resolves a device with no claim. `ClaimedDevice::cpu()` is a plain
 `const fn` and calls nothing; `qwen36_diag`'s `cpu` arm calls `forbid_gpu()`
 too, its own device decision. The call sets one process-global `AtomicBool`
-irreversibly. These calls check it first, returning
-`Err(Error::GpuForbidden { op })`, not the mlx-c call:
+irreversibly, and makes the CPU the MLX default device (process-wide). These
+calls check the latch first, returning `Err(Error::GpuForbidden { op })`, not
+the mlx-c call:
 `with_stream(Device::Gpu, ..)`, every `rmlx_mlx::metal` fn, and
 `CaptureScope::start`.
 
@@ -263,10 +263,15 @@ irreversibly. These calls check it first, returning
 rmlx Metal API is called. A KV codec carrying MSL, and `--gpu-capture`, are
 refused before the model load; any other GPU request returns `GpuForbidden`.
 
+MLX builds some ops inside other ops on the default stream of the default
+device. An affine `quantized_matmul` with an f32 input and bf16 scales builds
+`astype(scales, f32)` itself. With the CPU as the default device, such an op
+goes to the CPU stream of the MLX thread too
+(`an_op_that_mlx_builds_itself_runs_on_the_cpu_under_cpu`).
+
 Outside it: MLX's allocator opens an `MTLDevice` on first allocation either
-way — `metal::allocator()` backs every array buffer. `default_device()` is
-the GPU whenever Metal is available, and an MLX-internal GPU-stream request
-outside rMLX's two sites is uncovered.
+way — `metal::allocator()` backs every array buffer. A GPU stream that MLX
+creates itself, not from the default device, is uncovered.
 
 ### The MLX thread
 
@@ -292,12 +297,21 @@ and keeps them for the life of the process.
   because MLX builds some ops inside other ops on the default stream of the
   default device, whatever device the caller builds on
   (`a_thread_that_built_an_op_defaults_to_the_mlx_threads_streams`). The GPU
-  is left out after `forbid_gpu` and on a Mac without Metal.
+  is left out after `forbid_gpu`, which makes the CPU the default device, and
+  on a Mac without Metal.
 - `with_eval_lock` runs every evaluation on the MLX thread, under the
   evaluation lock. The caller waits. The mlx-c error message of the call moves
   back to the calling thread, so `check_status` reads it there. A panic
   continues on the calling thread.
-- A call from the MLX thread itself runs in place.
+- A hand-off allocates nothing and creates no channel. The job and its result
+  stay on the stack of the waiting thread. One static mailbox (two mutexes and
+  two condition variables) carries a pointer to the job, one waiting thread at
+  a time (`a_hand_off_to_the_mlx_thread_allocates_nothing`,
+  `crates/rmlx-mlx/tests/hand_off.rs`). So a job can borrow from its caller,
+  and no mlx-c handle type needs `Send`.
+- A call from the MLX thread itself runs in place
+  (`a_hand_off_from_the_mlx_thread_runs_in_place`). A second hand-off from
+  there would wait for the mailbox that the outer job holds.
 
 So an array built on any thread evaluates from any thread, and no loader,
 cache or request path has to evaluate its arrays before a hand-over. A new
@@ -310,8 +324,13 @@ that stays alive and idle, and evaluate it on a second thread.
 stream. The thread-boundary suite (`crates/rmlx-server/tests/thread_boundary*.rs`)
 holds the production hand-overs on real models.
 
-Cost: an evaluation from another thread waits for the hand-over to the MLX
-thread and back. An op no longer gets and frees a stream handle.
+Cost: an evaluation from another thread waits for the hand-off to the MLX
+thread and back, two thread wake-ups. The decode path hands off once for each
+`Array::eval`, `async_eval` and `Closure::apply`: 110 times per token on
+Ternary-Bonsai-8B and 103 times on gemma-4-e2b, at the default KV quant. One
+`async_eval` of the K and V buffers together is one hand-off, not two. A
+hand-off costs about 2 to 4 µs (median, release build), the time of the two
+wake-ups.
 
 ### Null sentinel for optional arguments
 
@@ -359,7 +378,8 @@ before calling into C.
 MLX ops build a graph; evaluation runs it.
 
 - `Array::eval()` wraps `mlx_array_eval` and blocks until the array exists.
-- `Array::async_eval()` calls `mlx_async_eval` and returns at once. A later
+- `async_eval(&[..])` calls `mlx_async_eval` once for all its arrays and
+  returns at once; `Array::async_eval()` is the one-array form. A later
   `eval()` or `to_bytes()` waits. The decode loop uses it to queue the next
   forward while the current argmax is read back, as mlx-lm does.
 
@@ -418,7 +438,7 @@ no `Closure::apply` of another compiled closure either.
 | | Kind | Catches | Misses |
 |---|---|---|---|
 | `make check-eval-lock` | text gate, deterministic | an unguarded call to any of the 25 (RULE 1, RULE 2); a closure body that takes the lock (RULE 3) | a lock that no longer locks |
-| `with_eval_lock_serialises_concurrent_callers` | unit test, deterministic | two evaluations at once: a lock that does not exclude while evaluation also leaves the MLX thread | which calls take the lock; a lock that does not exclude while the MLX thread still runs one evaluation at a time |
+| `under_eval_lock_excludes_concurrent_callers` | unit test, deterministic | two callers inside the lock at once: a lock that does not exclude | which calls take the lock; whether evaluation runs on the MLX thread |
 | `make eval-lock-stress` | end-to-end driver, 400 threads per process | wrong values from concurrent evaluation under the lock | no defect is measured on the linked MLX, so its detection power there is unknown |
 
 The gate and the unit test are complementary: each is blind to what the other
@@ -826,7 +846,7 @@ reinterpretation (`slice::from_raw_parts`) of array data. Because
 | `null_sentinel` | The null handle is only an "absent" argument to an mlx-c function that accepts null. Never store or materialise it. |
 | `Stream` (`mlx_thread.rs`) `Send + Sync` | The handle names an immutable `{device, index}` and is never freed. Only the MLX thread uses the encoder behind it. |
 | `check_status` | Call immediately after the mlx-c call, on the same thread, before another call can overwrite the error slot. After `with_eval_lock`, the error slot of the calling thread holds the message of the call on the MLX thread. |
-| `mlx_array`, `mlx_vector_array`, `mlx_closure` `Send` (`sys.rs`) | Handles to reference-counted mlx-c objects; `with_eval_lock` moves them to the MLX thread for the call while the caller waits. |
+| `JobRef` (`mlx_thread.rs`) `Send`, and the lifetime cast in `hand_off` | The job lives on the stack of the waiting thread. `hand_off` returns only after the MLX thread ran the job and emptied the mailbox. |
 | `rust_closure_callback` | `payload` is the boxed function, valid for the closure's life. `input` is borrowed and not freed; `output` is filled here. No panic crosses the boundary. |
 | `MetalKernel` / `Closure` `Send + Sync` | The handle is immutable and ref-counted by mlx-c. The Metal device context is process-global; callers hold the Metal claim (`crates/rmlx-server/src/claim.rs`). |
 

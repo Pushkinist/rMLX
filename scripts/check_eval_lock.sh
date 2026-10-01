@@ -5,13 +5,12 @@
 #
 # WHAT THIS HOLDS
 #   rMLX evaluates one graph at a time, and `rmlx_mlx::with_eval_lock` makes
-#   that a property of the crate: every evaluating FFI call runs under one
-#   process-wide lock. On the linked MLX (0.32.x) no command-encoder map is
-#   shared between threads (`mlx/backend/cpu/encoder.cpp` looks a stream up in
-#   the evaluating thread's map and throws for a foreign one), and nothing
-#   measured here shows concurrent evaluation to be safe or unsafe. An
-#   evaluating call outside the lock makes evaluation concurrent again, with
-#   nothing red anywhere.
+#   that a property of the crate: every evaluating FFI call runs on the MLX
+#   thread, under one process-wide lock (`docs/FFI.md` § "The MLX thread").
+#   An evaluating call outside `with_eval_lock` runs on the calling thread:
+#   MLX looks a stream's command encoder up in the evaluating thread only
+#   (`mlx/backend/cpu/encoder.cpp`), so it throws "There is no Stream(cpu, N)"
+#   or waits forever, and it runs at the same time as the MLX thread.
 #
 # WHY A GREP GATE AND NOT A TEST
 #   The end-to-end driver (`concurrent_first_eval_reproducer`) finds no
@@ -31,8 +30,8 @@
 #
 #   What it does NOT catch is a `with_eval_lock` that stopped locking: the
 #   lexical structure is unchanged, so this gate stays green. That half is
-#   covered by the unit test
-#   `with_eval_lock_serialises_concurrent_callers`. The two are complementary
+#   covered by the unit test `under_eval_lock_excludes_concurrent_callers`,
+#   which takes the lock from two threads directly. The two are complementary
 #   by construction, verified by mutation — neither alone covers this defect.
 #
 # HOW THE REACH-SET WAS DERIVED — re-run this when the mlx / mlx-c pin moves
@@ -74,7 +73,7 @@
 #           `with_eval_lock` closure: either on the call line itself, or inside
 #           an enclosing block whose opening line calls it.
 #   RULE 3  No `Closure::from_fn` body may take the evaluation lock. Those
-#           bodies run on the calling thread *inside* `mlx_closure_apply`, with
+#           bodies run on the MLX thread *inside* `mlx_closure_apply`, with
 #           the lock already held, so taking it again self-deadlocks on a
 #           non-reentrant mutex — a hang, which is one of this defect's own
 #           symptoms. The ban is on *taking the lock*, which is broader than

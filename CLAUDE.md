@@ -239,7 +239,9 @@ Hard rules:
   complementary by construction: `make check-eval-lock` fails the build on any
   MLX eval FFI call made outside the lock (25-symbol reach-set, derived from the
   linked dylibs — **not** just the eval-named ones) but is blind to a lock that
-  stopped locking, which `with_eval_lock_serialises_concurrent_callers` catches.
+  stopped locking, which `under_eval_lock_excludes_concurrent_callers` catches:
+  it takes the lock from two threads directly, because through the MLX thread
+  a lock that does not lock still runs one evaluation at a time.
   `make eval-lock-stress` is the 400-thread end-to-end driver, deliberately out
   of `make ci`. See `docs/FFI.md`.
   Run GPU tests with **`make gpu-test`** (every member crate,
