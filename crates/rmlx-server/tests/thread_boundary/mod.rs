@@ -65,15 +65,20 @@
 //!
 //! Measured on mlx 0.32.3 / mlx-c 0.7.0, each against the MLX thread:
 //!
-//! - Run every evaluation on the calling thread, not on the MLX thread
-//!   (`mlx_thread::run` always in place): the `rmlx-mlx` cell
-//!   `a_cpu_op_built_on_one_thread_evaluates_on_another` and the three CPU
-//!   `multimodal_cache` publish cells turn red, "There is no Stream(cpu, 0)".
-//!   Of the seven cells run with it here, all seven turn red: the Qwen3 text
-//!   and gemma4 vision cells in the oracle arm (the thread that created the
-//!   streams has exited), the Whisper per-request cell in the oracle arm, and
-//!   the Qwen3 prompt-cache, gemma4 encoder-cache, TTS load-only and gemma4
-//!   MTP drafter cells in the crossed arm.
+//! - Run every hand-off in place, so every evaluation runs on the calling
+//!   thread (`if true {` at the in-place branch of `mlx_thread::run`). All 30
+//!   cells turn red, with "There is no Stream(cpu, N)" or "There is no
+//!   Stream(gpu, N)", and so do the five `multimodal_cache` publish cells and
+//!   the two `rmlx-mlx` cross-thread cells. Only the thread that created the
+//!   streams can evaluate, so a cell fails at its first step on any other
+//!   thread: in the oracle arm (17 cells: the Qwen3, Qwen2 and BitNet text
+//!   cells, the six tower cells, the encoder-cache hit, the Qwen3-VL failed
+//!   request, the gemma4 MTP drafter, jina-v4 image, both Whisper and both
+//!   TTS cells), at `load_model` (Qwen3.5 text, Qwen3.5-MoE prompt cache), at
+//!   the first request (the Qwen3, gemma4 and Qwen2 prompt caches), at
+//!   `SpeculativeGenerator::from_snapshots_with_id` (Qwen MTP, DFlash,
+//!   EAGLE-3, two-model), or in the crossed arm (BitNet prompt cache, the
+//!   gemma4 failed request, DFlash2, jina-v4 first embedding).
 //! - Do not make the MLX thread's streams the default streams of the building
 //!   thread: both TTS cells turn red in the oracle arm, "There is no
 //!   Stream(gpu, 2) in current thread", a stream that rMLX did not create:

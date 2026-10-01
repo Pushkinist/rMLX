@@ -245,21 +245,17 @@ before any other mlx-c call can overwrite the slot.
 thread for the device (below). Every op is built on one of these two streams.
 Only `mlx_thread.rs` names an mlx-c stream function:
 `every_stream_comes_from_the_mlx_thread` fails on one in any other source file
-of the crate. It reads every identifier with comments removed and literals
-kept, so an alias, a glob import, a function pointer or a `link_name` counts
-too. It cannot see a name that a macro builds from parts, or a symbol looked up
-by a string built at run time. For the GPU device `with_stream` checks the
-latch below first.
+of the crate. It reads identifiers, not calls, so an alias, a glob import or a
+`link_name` counts; a name that a macro builds from parts does not. For the GPU
+device `with_stream` checks the latch below first.
 
 ### The CPU-device latch
 
 `parse_device` calls `rmlx_mlx::forbid_gpu()` once, before any model work,
-when it resolves a device with no claim. `ClaimedDevice::cpu()` is a plain
-`const fn` and calls nothing; `qwen36_diag`'s `cpu` arm calls `forbid_gpu()`
-too, its own device decision. The call sets one process-global `AtomicBool`
-irreversibly, and makes the CPU the MLX default device (process-wide). These
-calls check the latch first, returning `Err(Error::GpuForbidden { op })`, not
-the mlx-c call:
+when it resolves a device with no claim; `qwen36_diag`'s `cpu` arm does too.
+The call sets one process-global `AtomicBool` irreversibly, and makes the CPU
+the MLX default device (process-wide). These calls check the latch first,
+returning `Err(Error::GpuForbidden { op })`, not the mlx-c call:
 `with_stream(Device::Gpu, ..)`, every `rmlx_mlx::metal` fn, and
 `CaptureScope::start`.
 
@@ -267,13 +263,9 @@ the mlx-c call:
 rmlx Metal API is called. A KV codec carrying MSL, and `--gpu-capture`, are
 refused before the model load; any other GPU request returns `GpuForbidden`.
 
-MLX builds some ops inside other ops on the default stream of the default
-device. An affine `quantized_matmul` with an f32 input and bf16 scales builds
-`astype(scales, f32)` itself. With the CPU as the default device, such an op
-goes to the CPU stream of the MLX thread too
-(`an_op_that_mlx_builds_itself_runs_on_the_cpu_under_cpu`).
-
-Outside it: MLX's allocator opens an `MTLDevice` on first allocation either
+An op that MLX builds inside another op (the `astype` of bf16 scales in an
+affine `quantized_matmul` with f32 input) runs on the CPU too
+(`an_op_that_mlx_builds_itself_runs_on_the_cpu_under_cpu`). Outside it: MLX's allocator opens an `MTLDevice` on first allocation either
 way — `metal::allocator()` backs every array buffer. A GPU stream that MLX
 creates itself, not from the default device, is uncovered.
 
@@ -307,34 +299,26 @@ and keeps them for the life of the process.
   evaluation lock. The caller waits. The mlx-c error message of the call moves
   back to the calling thread, so `check_status` reads it there. A panic
   continues on the calling thread.
-- A hand-off allocates nothing and creates no channel. The job and its result
-  stay on the stack of the waiting thread. One static mailbox (two mutexes and
-  two condition variables) carries a pointer to the job, one waiting thread at
-  a time (`a_hand_off_to_the_mlx_thread_allocates_nothing`,
-  `crates/rmlx-mlx/tests/hand_off.rs`). So a job can borrow from its caller,
-  and no mlx-c handle type needs `Send`.
+- A hand-off allocates nothing and creates no channel: the job and its result
+  stay on the stack of the waiting thread, and one static mailbox passes a
+  pointer to the job (`crates/rmlx-mlx/tests/hand_off.rs`). So a job can
+  borrow from its caller, and no mlx-c handle type needs `Send`.
 - A call from the MLX thread itself runs in place
   (`a_hand_off_from_the_mlx_thread_runs_in_place`). A second hand-off from
   there would wait for the mailbox that the outer job holds.
 
-So an array built on any thread evaluates from any thread, and no loader,
-cache or request path has to evaluate its arrays before a hand-over. A new
-loader, cache or blocking-pool entry point needs no stream set-up.
+So an array built on any thread evaluates from any thread, and a new loader,
+cache or blocking-pool entry point needs no stream set-up or evaluation before
+a hand-over. `a_cpu_op_built_on_one_thread_evaluates_on_another` and
+`a_gpu_op_built_on_one_thread_evaluates_on_another` hold this; the thread-boundary suite
+(`crates/rmlx-server/tests/thread_boundary*.rs`) holds the production
+hand-overs on real models.
 
-Tests: `a_cpu_op_built_on_one_thread_evaluates_on_another` (not ignored) and
-`a_gpu_op_built_on_one_thread_evaluates_on_another` build a lazy op on a thread
-that stays alive and idle, and evaluate it on a second thread.
-`every_stream_comes_from_the_mlx_thread` holds that no other file gets a
-stream. The thread-boundary suite (`crates/rmlx-server/tests/thread_boundary*.rs`)
-holds the production hand-overs on real models.
-
-Cost: an evaluation from another thread waits for the hand-off to the MLX
-thread and back, two thread wake-ups. The decode path hands off once for each
-`Array::eval`, `async_eval` and `Closure::apply`: 110 times per token on
-Ternary-Bonsai-8B and 103 times on gemma-4-e2b, at the default KV quant. One
-`async_eval` of the K and V buffers together is one hand-off, not two. A
-hand-off costs about 2 to 4 µs (median, release build), the time of the two
-wake-ups.
+Cost: each `Array::eval`, `async_eval` and `Closure::apply` from another
+thread is one hand-off to the MLX thread and back, about 2 to 4 µs (median,
+release build). Decode makes 110 per token on Ternary-Bonsai-8B and 103 on
+gemma-4-e2b at the default KV quant; one `async_eval` of the K and V buffers is
+one hand-off, not two.
 
 ### Null sentinel for optional arguments
 
@@ -395,27 +379,15 @@ evaluation at a time; the lock keeps serial evaluation a property of the crate
 even if an evaluation leaves that thread.
 
 `with_eval_lock` takes a closure instead of returning a guard, so
-`let _ = acquire();` cannot drop the guard before the FFI call.
-
-- Cost: one uncontended mutex acquire and release per evaluation. The server
-  already runs inference one request at a time behind a 1-permit `gpu_queue`
-  and `gpu_gate`.
-- `async_eval` still pipelines: only the graph walk and dispatch hold the
-  lock.
-- The lock makes concurrent callers serial, not parallel.
+`let _ = acquire();` cannot drop the guard before the FFI call. `async_eval`
+still pipelines: only the graph walk and dispatch hold the lock.
 
 ### Which C entry points need the lock
 
 Twenty-five. `scripts/check_eval_lock.sh` records how they were derived; re-run
-it when the pin moves:
-
-- **Pass 1, automated (24 symbols on mlx 0.32.3 + mlx-c 0.7.0).** Reverse
-  reachability over `otool -tvV` of both dylibs, backwards from
-  `mlx::core::eval_impl`, intersected with the exported `mlx_*` C ABI.
-- **Pass 2, by hand (1 more).** `mlx_closure_apply` reaches evaluation through
-  a `std::function` call, which a disassembly walk does not follow. Re-running
-  pass 1 gives 24 without it. That is the pass's blind spot, not a stale
-  entry: do not delete the closure guard.
+it when the pin moves. Its automated pass finds 24; it cannot follow the
+`std::function` call through which `mlx_closure_apply` evaluates, so do not
+delete the closure guard.
 
 | Entry point | Count | Why it evaluates | Called here |
 |---|---|---|---|
@@ -445,19 +417,11 @@ no `Closure::apply` of another compiled closure either.
 | `under_eval_lock_excludes_concurrent_callers`, `with_eval_lock_holds_the_lock_while_its_job_runs` | unit tests, deterministic | a lock that does not exclude two callers; a `with_eval_lock` that runs its job without the lock | which FFI calls go through `with_eval_lock` |
 | `make eval-lock-stress` | end-to-end driver, 400 threads per process | wrong values from concurrent evaluation under the lock | no defect is measured on the linked MLX, so its detection power there is unknown |
 
-The gate and the unit test are complementary: each is blind to what the other
+The gate and the unit tests are complementary: each is blind to what the other
 catches. `make ci` runs both. The hosted `source gates` job runs the gate and
-its fixtures; it runs no `cargo test`.
-
-`make check-eval-lock-fixtures` is the gate's recall test: 26 synthetic scan
-roots under `scripts/fixtures/eval_lock/`, each asserting the exit code and
-which rule fired. Every RULE 1 and RULE 3 fixture also carries a guarded call
-site, so RULE 2's no-call-sites branch cannot mask the rule under test. The
-gate's own header lists what a text scan cannot reach.
-
-The stress driver is not in `make ci`, and the reproducer it runs
-(`concurrent_first_eval_reproducer`) carries `#[ignore]`. It costs about 400
-threads per run.
+its fixtures (`make check-eval-lock-fixtures`); it runs no `cargo test`. The
+stress driver is not in `make ci`; its reproducer
+(`concurrent_first_eval_reproducer`) carries `#[ignore]`.
 
 **Never `eval()` a kernel's inputs before dispatching it.** `Array::eval()`
 blocks the host until the GPU produces the array. Inside a per-layer
