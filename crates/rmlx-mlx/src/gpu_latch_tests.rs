@@ -7,19 +7,38 @@
 )]
 
 use super::*;
+use crate::within_limit::within_limit;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
 
 const CHILD_MARKER: &str = "started-by-a-gpu-latch-parent-test";
 const CHILD_DONE: &str = "gpu-latch-child done";
 
+/// The limit for one child process. It includes the one-time MLX init of the
+/// child, which takes minutes in a large `target/debug/deps`.
+const CHILD_LIMIT: Duration = Duration::from_secs(600);
+
+/// Whether a parent test started this process. Such a child ends when its
+/// parent ends: it holds the Metal claim that it got from the parent, and a
+/// child that outlives the parent keeps that claim.
 fn started_by_parent() -> bool {
-    std::env::args().any(|arg| arg == CHILD_MARKER)
+    let started = std::env::args().any(|arg| arg == CHILD_MARKER);
+    if started {
+        // The parent holds the write end of stdin and never writes, so the
+        // read ends when the parent process ends.
+        std::thread::spawn(|| {
+            std::io::copy(&mut std::io::stdin(), &mut std::io::sink()).ok();
+            std::process::abort();
+        });
+    }
+    started
 }
 
 /// Run the ignored child test `name` of this binary and assert it passed and
 /// reached its last line, so a filter that matched nothing cannot pass.
 fn run_child(name: &str) {
-    let out = Command::new(std::env::current_exe().unwrap())
+    let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
             &format!("gpu_latch_tests::{name}"),
             CHILD_MARKER,
@@ -28,8 +47,18 @@ fn run_child(name: &str) {
             "--nocapture",
             "--test-threads=1",
         ])
-        .stdin(Stdio::null())
-        .output()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _parent_end = child.stdin.take();
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        done_tx.send(child.wait_with_output()).ok();
+    });
+    let out = within_limit(&done_rx, CHILD_LIMIT, "the child process")
+        .unwrap_or_else(|| panic!("{name}: the thread that waits for the child panicked"))
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
