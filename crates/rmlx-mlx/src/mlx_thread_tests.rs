@@ -119,9 +119,9 @@ fn a_hand_off_from_the_mlx_thread_runs_in_place() {
 
 /// Eight threads hand off at the same time, and each must get back the value
 /// of its own job. Without `turn`, a second post replaces the first: that job
-/// is lost, or the MLX thread runs it after its waiter returned. Alone, this
-/// test then fails on its assertion. In the full test binary the process can
-/// end first, with a crash or a time-limit exit.
+/// is lost, or the MLX thread runs it after its waiter returned. This test
+/// then fails on its assertion, or the process ends first with a time-limit
+/// exit or a crash, alone and in the full test binary.
 #[test]
 fn concurrent_hand_offs_each_get_their_own_value() {
     const THREADS: usize = 8;
