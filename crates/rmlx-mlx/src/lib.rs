@@ -356,6 +356,7 @@ static GPU_FORBIDDEN: AtomicBool = AtomicBool::new(false);
 /// # Errors
 /// An error when MLX does not accept the CPU as its default device.
 pub fn forbid_gpu() -> Result<()> {
+    install_error_handler();
     GPU_FORBIDDEN.store(true, Ordering::Relaxed);
     // SAFETY: a CPU device value that this function owns and frees below.
     let cpu = unsafe { sys::mlx_device_new_type(sys::mlx_device_type::MLX_CPU, 0) };

@@ -124,9 +124,10 @@ fn an_op_that_mlx_builds_itself_runs_on_the_cpu_under_cpu() {
 /// An f32 input against bf16 scales: affine `quantized_matmul` builds
 /// `astype(scales, f32)` itself, on the default stream of the MLX default
 /// device. With the GPU still the default device, that op lands on a GPU
-/// stream of this thread, and the MLX thread cannot evaluate it. The oracle
-/// dequantizes the same weight to bf16 and multiplies in f32, so it agrees to
-/// bf16 rounding.
+/// stream of the building thread, and the MLX thread cannot evaluate it. As in
+/// production, the op is built on a thread other than the one that called
+/// `forbid_gpu`. The oracle dequantizes the same weight to bf16 and multiplies
+/// in f32, so it agrees to bf16 rounding.
 #[test]
 #[ignore = "child process; its parent test starts it with a marker argument"]
 fn an_op_that_mlx_builds_itself_runs_on_the_cpu_under_cpu_child() {
@@ -134,47 +135,53 @@ fn an_op_that_mlx_builds_itself_runs_on_the_cpu_under_cpu_child() {
         return;
     }
     forbid_gpu().unwrap();
-    let values: Vec<f32> = (0..64 * 64)
-        .map(|i| ((i % 17) as f32 - 8.0) / 8.0)
-        .collect();
-    let w = Array::from_f32_slice(&values, &[64, 64])
+    let (got, want) = std::thread::spawn(|| {
+        let values: Vec<f32> = (0..64 * 64)
+            .map(|i| ((i % 17) as f32 - 8.0) / 8.0)
+            .collect();
+        let w = Array::from_f32_slice(&values, &[64, 64])
+            .unwrap()
+            .astype(Dtype::Bf16, Device::Cpu)
+            .unwrap();
+        let (packed, scales, biases) = quantize(&w, 64, 4, Device::Cpu).unwrap();
+        assert_eq!(scales.dtype(), Dtype::Bf16, "the scales must stay bf16");
+        let x = Array::from_f32_slice(&[0.5; 64], &[1, 64]).unwrap();
+        let got = quantized_matmul(
+            &x,
+            &packed,
+            &scales,
+            Some(&biases),
+            64,
+            4,
+            "affine",
+            true,
+            Device::Cpu,
+        )
         .unwrap()
-        .astype(Dtype::Bf16, Device::Cpu)
+        .to_bytes();
+        let dense = dequantize(
+            &packed,
+            &scales,
+            Some(&biases),
+            64,
+            4,
+            "affine",
+            Device::Cpu,
+        )
+        .unwrap()
+        .astype(Dtype::F32, Device::Cpu)
         .unwrap();
-    let (packed, scales, biases) = quantize(&w, 64, 4, Device::Cpu).unwrap();
-    assert_eq!(scales.dtype(), Dtype::Bf16, "the scales must stay bf16");
-    let x = Array::from_f32_slice(&[0.5; 64], &[1, 64]).unwrap();
-    let got = quantized_matmul(
-        &x,
-        &packed,
-        &scales,
-        Some(&biases),
-        64,
-        4,
-        "affine",
-        true,
-        Device::Cpu,
-    )
-    .unwrap()
-    .to_bytes()
-    .unwrap_or_else(|e| panic!("an op that MLX built itself did not run on the CPU: {e}"));
-    let dense = dequantize(
-        &packed,
-        &scales,
-        Some(&biases),
-        64,
-        4,
-        "affine",
-        Device::Cpu,
-    )
-    .unwrap()
-    .astype(Dtype::F32, Device::Cpu)
+        let dense_t = dense.transpose(&[1, 0], Device::Cpu).unwrap();
+        let want = matmul(&x, &dense_t, Device::Cpu)
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        (got, want)
+    })
+    .join()
     .unwrap();
-    let dense_t = dense.transpose(&[1, 0], Device::Cpu).unwrap();
-    let want = matmul(&x, &dense_t, Device::Cpu)
-        .unwrap()
-        .to_bytes()
-        .unwrap();
+    let got =
+        got.unwrap_or_else(|e| panic!("an op that MLX built itself did not run on the CPU: {e}"));
     let floats = |b: &[u8]| -> Vec<f32> {
         b.chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -188,5 +195,35 @@ fn an_op_that_mlx_builds_itself_runs_on_the_cpu_under_cpu_child() {
             "column {i}: {g} against the oracle {w}"
         );
     }
+    println!("{CHILD_DONE}");
+}
+
+#[test]
+fn forbid_gpu_installs_the_error_handler() {
+    run_child("forbid_gpu_installs_the_error_handler_child");
+}
+
+/// `forbid_gpu` can be the first call into MLX of a process. Without the
+/// error handler, mlx-c ends the process on an error instead of returning it.
+#[test]
+#[ignore = "child process; its parent test starts it with a marker argument"]
+fn forbid_gpu_installs_the_error_handler_child() {
+    if !started_by_parent() {
+        return;
+    }
+    forbid_gpu().unwrap();
+    // SAFETY: a scalar that this test owns and frees. The size of a missing
+    // axis is an mlx-c error, which goes to the error handler.
+    let reason = unsafe {
+        let scalar = sys::mlx_array_new_float(1.0);
+        sys::mlx_array_dim(scalar, 3);
+        let reason = LAST_ERROR.with(Cell::take);
+        sys::mlx_array_free(scalar);
+        reason
+    };
+    assert!(
+        reason.is_some(),
+        "the error handler did not get the mlx-c error"
+    );
     println!("{CHILD_DONE}");
 }
