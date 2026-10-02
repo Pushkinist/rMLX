@@ -913,3 +913,20 @@ fn mlx_version_parses_release_and_dev_strings() {
     assert_eq!(parse_mlx_version("x.32.3"), None);
     assert!(loaded_mlx_version().is_some());
 }
+
+/// An array with no buffer has no address. Two empty arrays must not read as
+/// one buffer, so the identity check refuses rather than answer 0.
+#[test]
+fn an_array_with_no_buffer_has_no_data_address() {
+    let empty = Array::from_f32_slice(&[], &[0]).expect("an empty array");
+    let refused = empty.data_address();
+    assert!(
+        refused.is_err(),
+        "an empty array gave the address {refused:?}"
+    );
+    let full = Array::from_f32_slice(&[1.0], &[1]).expect("a one-element array");
+    assert!(
+        full.data_address().is_ok_and(|address| address != 0),
+        "an evaluated array with a buffer has an address"
+    );
+}

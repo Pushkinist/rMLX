@@ -261,8 +261,8 @@ Cost: each `Array::eval`, `Array::async_eval` and `Closure::apply` from
 another thread is one hand-off. Median, release build, `eval` of an available
 array: 1.7 to 4.3 µs. Decode makes 146 per token on Ternary-Bonsai-8B and
 118 on gemma-4-e2b at the default KV quant. The K and V buffers of a KV
-update take one `async_eval` each: one call for both made MLX copy the buffers
-at each step ([In-place update](KV_UPDATE_PATH.md#in-place-update)).
+update take one `async_eval` each: one call for both made MLX copy most K/V
+updates on Ternary-Bonsai-8B ([In-place update](KV_UPDATE_PATH.md#in-place-update)).
 
 ### Null sentinel for optional arguments
 

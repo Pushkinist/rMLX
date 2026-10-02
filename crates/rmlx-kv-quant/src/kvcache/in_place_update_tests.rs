@@ -64,7 +64,9 @@ fn one_buffer(addresses: &[usize]) -> bool {
 }
 
 /// Every codec whose decode reads the bf16 mirror writes each decode row into
-/// the mirror it holds, on each axis it reads from the mirror.
+/// the mirror it holds, on each axis it reads from the mirror, on a layer that
+/// does not share its KV. The `Mixed` / `RotK` mirror of a shared-KV producer
+/// is not driven here.
 #[test]
 fn every_decode_step_writes_into_the_mirror_it_holds() {
     let _guard = env_lock();

@@ -839,19 +839,24 @@ impl Array {
     /// read through it.
     ///
     /// # Errors
-    /// An error when the evaluation fails.
+    /// An error when the evaluation fails, or when the array has no buffer
+    /// after it (an empty array): two such arrays would read as one buffer.
     pub fn data_address(&self) -> Result<usize> {
         self.eval()?;
         // SAFETY: `self.inner` is a valid mlx_array, and the evaluation above
         // gave it a buffer, which MLX reads to make the pointer. The pointer
         // is not dereferenced here.
         let ptr = unsafe { sys::mlx_array_data_uint8(self.inner) };
+        if ptr.is_null() {
+            return Err(Error::Mlx(
+                "Array::data_address: no buffer after eval".into(),
+            ));
+        }
         Ok(ptr.addr())
     }
 
-    /// Schedule this array's compute graph without blocking the calling
-    /// thread. The work runs in the background; a later `to_bytes` or `eval`
-    /// waits for it.
+    /// Encode this array's graph on the MLX thread, and return without waiting
+    /// for the GPU. A later `to_bytes` or `eval` waits for it.
     ///
     /// The decode loop uses it to queue the next forward pass while the
     /// current argmax is read back (as `mx.async_eval` in mlx-lm's
