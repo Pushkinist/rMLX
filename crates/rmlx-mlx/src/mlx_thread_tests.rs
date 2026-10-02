@@ -12,21 +12,31 @@ fn lazy_sum(device: Device) -> Array {
     add(&a, &a, device).unwrap()
 }
 
-/// Wait for the one-time MLX init of this process under [`INIT_LIMIT`], so
-/// that a later [`LIMIT`] counts only its own step. Under Miri no MLX runs.
+/// Build and evaluate [`lazy_sum`] on one new thread, under [`INIT_LIMIT`]:
+/// the first MLX evaluation of a test can include the one-time MLX init.
+fn first_evaluation(device: Device) -> Vec<u8> {
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        done_tx
+            .send(lazy_sum(device).to_bytes().map_err(|e| e.to_string()))
+            .ok();
+    });
+    within_limit(
+        &done_rx,
+        INIT_LIMIT,
+        "the first MLX evaluation of this test (it can include the one-time MLX init)",
+    )
+    .unwrap_or_else(|| panic!("the thread of the first MLX evaluation panicked"))
+    .unwrap_or_else(|e| panic!("the first MLX evaluation failed: {e}"))
+}
+
+/// Wait for the one-time MLX init of this process, so that a later [`LIMIT`]
+/// counts only its own step. Under Miri no MLX runs.
 fn after_mlx_init() {
     if cfg!(miri) {
         return;
     }
-    let (done_tx, done_rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        done_tx
-            .send(lazy_sum(Device::Cpu).to_bytes().map_err(|e| e.to_string()))
-            .ok();
-    });
-    let bytes = within_limit(&done_rx, INIT_LIMIT, "the one-time MLX init")
-        .unwrap_or_else(|| panic!("the thread of the one-time MLX init panicked"));
-    assert_eq!(bytes.unwrap().len(), 8);
+    assert_eq!(first_evaluation(Device::Cpu).len(), 8);
 }
 
 /// Build a lazy op on one thread and keep that thread alive and idle, as a
@@ -34,9 +44,7 @@ fn after_mlx_init() {
 /// thread. The oracle builds and evaluates on one thread.
 fn assert_crosses_threads(test: &str, device: Device) {
     let expected: Vec<u8> = [2.0f32, 4.0].iter().flat_map(|v| v.to_le_bytes()).collect();
-    let oracle = std::thread::spawn(move || lazy_sum(device).to_bytes().unwrap())
-        .join()
-        .unwrap();
+    let oracle = first_evaluation(device);
     assert_eq!(oracle, expected, "{test}: the one-thread oracle");
 
     let (built_tx, built_rx) = mpsc::channel();
@@ -137,7 +145,7 @@ fn concurrent_hand_offs_each_get_their_own_value() {
     const THREADS: usize = 8;
     // Miri interleaves the threads at random, so it needs fewer hand-offs.
     // Under Miri the clock moves with each step that Miri runs, so 2000
-    // hand-offs pass `LIMIT`.
+    // hand-offs take more time than `LIMIT`.
     const HAND_OFFS: usize = if cfg!(miri) { 100 } else { 2000 };
     after_mlx_init();
     let (done_tx, done_rx) = mpsc::channel();

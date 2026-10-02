@@ -621,10 +621,10 @@ eval-lock-stress: ## run the evaluation-lock reproducer across RUNS fresh proces
 # The skipped tests call mlx-c or read files, which Miri refuses. A new test
 # that calls mlx-c fails here, so the skip list cannot hide one. The MLX thread
 # lives for the process and still runs when `main` ends, which Miri reports
-# without -Zmiri-ignore-leaks. The grep fails the target on a Miri error, a
-# failed test, or no test run.
+# without -Zmiri-ignore-leaks. cargo fails the target on a Miri error or a
+# failed test. The grep fails it when no test ran.
 miri: ## run the MLX-thread hand-off tests under Miri (nightly toolchain with the miri component); not in `make ci`
-	MIRIFLAGS=-Zmiri-ignore-leaks cargo +nightly miri test -p rmlx-mlx --lib -- \
+	set -o pipefail; MIRIFLAGS=-Zmiri-ignore-leaks cargo +nightly miri test -p rmlx-mlx --lib -- \
 	  mlx_thread::mlx_thread_tests \
 	  --skip a_cpu_op_built_on_one_thread_evaluates_on_another \
 	  --skip a_gpu_op_built_on_one_thread_evaluates_on_another \
