@@ -109,10 +109,14 @@ tools answer different questions:
 Neither gives per-dispatch counters headlessly. Those come from the Xcode
 replay below, which needs a person.
 
-On M5 the Neural Accelerator is part of the GPU. A capture names NAX
-pipelines like any other. In MLX 0.32.3 the matmul NAX pipelines carry `_nax`
-in the name: `steel_gemm_fused_nax_*`, `steel_gemm_splitk_nax_*`,
-`steel_gather_mm_rhs_nax_*` and `steel_segmented_mm_nax_*` (dense),
+On M5 the Neural Accelerator is part of the GPU. A `.gputrace` does not name
+NAX pipelines reliably: it can store a NAX GEMM by object id only, and a
+window that holds only `steel_attention_dsplit_*` can give no function records.
+The Metal System Trace shader list names them
+([below](#what-a-gputrace-actually-answers)). In MLX 0.32.3 the matmul NAX
+pipelines carry `_nax` in the name: `steel_gemm_fused_nax_*`,
+`steel_gemm_splitk_nax_*`, `steel_gather_mm_rhs_nax_*` and
+`steel_segmented_mm_nax_*` (unquantized),
 `affine_qmm_t_nax_*`, `affine_qmm_n_nax_*`, `mxfp8_qmm_t_nax_*`,
 `mxfp4_qmm_t_nax_*` and `nvfp4_qmm_t_nax_*` (quantized), and
 `*_gather_qmm_rhs_nax_*` and `*_gather_qmm_t_nax_*` (quantized MoE). The
@@ -203,8 +207,8 @@ MTL_CAPTURE_ENABLED=1 ./target/release-debug/rmlx --metrics off baseline \
 
 ### What a `.gputrace` actually answers
 
-**Kernel identity, offline.** `<trace>/device-resources-0x<addr>` names every
-pipeline and function the window referenced.
+**Kernel identity, offline.** `<trace>/device-resources-0x<addr>` names the
+pipelines and functions the window referenced, with the NAX limits above.
 `unused-device-resources-0x<addr>` holds the ones the capture layer recorded
 as unused. That answers whether a codec's own kernel runs or it decodes
 through the bf16 mirror. Read them with the scripts below.
@@ -234,6 +238,10 @@ each submission's `start` and `duration` in nanoseconds, `gpu-channel-name`,
 
 - **`--attach <pid>` records nothing** for this template. Metal
   instrumentation must be present at launch, so the harness uses `--launch`.
+- **A launched `rmlx` cannot open a model under a TCC-protected folder**, such
+  as `~/Documents`. It stops in `open()` of `config.json`, and the trace has
+  no rows for it. Keep the snapshot outside those folders, or clone it there
+  with `cp -c -R`.
 - **Weight load leaves no rows; prefill does.** The table does not mark where
   prefill ends. The harness reads the run's own `decode_profile{prefill_ms}`
   from `<RMLX_HOME>/logs/<run-id>.jsonl` and uses it as the default
@@ -248,10 +256,15 @@ each submission's `start` and `duration` in nanoseconds, `gpu-channel-name`,
 - **Bound the volume** with `--time-limit`. `.rmlx/traces/mst` keeps the
   newest `--keep` bundles (default 5) and prunes the rest on every exit.
   `make traces-gc` does not cover this directory.
-- **No kernel names on the timeline.** `metal-shader-profiler-shader-list`
-  names the pipelines, but the stock template records
-  `Shader Timeline: Disabled`, so no key joins a name to a timed row. Pair the
-  timeline with a `.gputrace` identity list.
+- **No kernel names on the timeline.** The stock template records
+  `Shader Timeline: Disabled`, so no key joins a name to a timed row. The
+  table `metal-shader-profiler-shader-list` names each pipeline that a
+  process compiled, NAX pipelines included. It is per process, not per
+  dispatch. It can have no rows for a process that stops right after its last
+  GPU work, so let the process live 3 s more (a wrapper that sleeps), and take
+  no rows for the process as a failed instrument. Export it with
+  `xcrun xctrace export --input <trace> --xpath
+  '/trace-toc/run[@number="1"]/data/table[@schema="metal-shader-profiler-shader-list"]'`.
 
 The summariser tells two refusals apart: `contains no rows` is an empty table;
 `holds N rows but none for a process matching …` lists the processes it saw.

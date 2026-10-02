@@ -531,7 +531,18 @@ the `[B, n_heads, L_q, L_k]` score tensor materialised.
 
 So a gemma-4, medgemma or Qwen3.5 prefill chunk of 1024 or more rows reaches
 the fused 256 kernel on an M5, and the 512 layers of gemma-4 reach a fused
-kernel only inside the gates above. The composite path computes the whole
+kernel only inside the gates above. Measured on an M5 Max, gemma-4-e4b and
+26b-a4b at the default prefill chunk of 1024 (the pipelines each process
+compiled):
+
+- sliding layers (256): `steel_attention_dsplit_*_bd256` in each full chunk;
+  a shorter last chunk takes the composite graph, by the gate above;
+- full layers (512): the composite graph in every chunk. The first chunk has
+  too few query blocks, and later chunks have an array mask. A larger chunk
+  (4096 on e4b, 2048 on 26b-a4b) lets the first chunk reach
+  `steel_attention_dsplit_*_bd512`. At `kL` 32768 that kernel was 5 % faster
+  than the composite graph on the e4b shape and 10 % slower on the 26b shape,
+  and a chunk of 4096 made the e4b time to first token 2 % to 12 % longer. The composite path computes the whole
 causal score rectangle and then masks it, and it holds the score tensor in
 memory. `scripts/sdpa_headdim_bench.py` measures the cost against the metallib
 it reports.

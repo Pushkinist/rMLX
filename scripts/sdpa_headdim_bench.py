@@ -19,9 +19,10 @@ Three sections, each answering one question:
            128 -> 256 doubles the FLOPs, so a fused kernel present at both
            widths lands near 2.0x. <= 2.4x means the gap costs <= ~20% and is a
            curiosity; >= 4.0x means >= 2x overhead and upstream work pays.
-           `head_dim` 512 is the control: it is unfused like 256, so 512 / 256
-           near 2.0x would mean "wider is slower" rather than "the kernel is
-           missing".
+           The route of each cell (fused or composite) is in the table in
+           `docs/FFI.md`, and it moves with the GPU, `L` and the head count:
+           on a NAX GPU 256 and 512 can both be fused here. Read the route of
+           each cell from that table before you compare two widths.
 
   decode   Is decode affected? At `q_seq = 1` the score tensor is [H, 1, kL],
            so the fallback has no O(L^2) term. Cells below this host's dispatch
