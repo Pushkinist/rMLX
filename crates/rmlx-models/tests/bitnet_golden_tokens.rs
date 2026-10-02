@@ -54,5 +54,10 @@ fn bitnet_golden_tokens_k8v8() {
     let Some(model_path) = common::model_for(&MODEL, "bitnet_golden_tokens_k8v8") else {
         return;
     };
-    common::run_golden_test("bitnet_2b_k8v8", KvQuant::K8V8, &model_path);
+    common::run_golden_test(
+        "bitnet_golden_tokens_k8v8",
+        "bitnet_2b_k8v8",
+        KvQuant::K8V8,
+        &model_path,
+    );
 }

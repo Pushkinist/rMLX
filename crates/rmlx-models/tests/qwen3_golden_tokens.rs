@@ -55,7 +55,12 @@ fn qwen3_moe_golden_tokens_k8v8() {
     let Some(model_path) = common::model_for(&MODEL, "qwen3_moe_golden_tokens_k8v8") else {
         return;
     };
-    common::run_golden_test("qwen3_moe_35b_k8v8", KvQuant::K8V8, &model_path);
+    common::run_golden_test(
+        "qwen3_moe_golden_tokens_k8v8",
+        "qwen3_moe_35b_k8v8",
+        KvQuant::K8V8,
+        &model_path,
+    );
 }
 
 /// thinking_budget forced injection on the Exact-hit decode path (Qwen3_5Moe).
