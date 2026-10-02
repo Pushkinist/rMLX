@@ -110,7 +110,7 @@ expect "a C API mismatch on an M5 Mac stops and does not name the restore" "$c" 
 # The binary was built against the pinned pair, and `opt` moved to another
 # pair: the binary's line names the restore, and so does the preflight.
 c=$(new_case m5-c-api-off-pin "Apple M5 Max" 9.9.8 8.8.7 no \
-	"$CAPI. The loaded pair is not the pinned one either: dyld resolved mlx 9.9.8. A measurement on this host needs the pinned pair: run \`make mlx-restore-pin\`, then rebuild if this binary was not built against the pinned pair.")
+	"$CAPI. On this host a rebuild against the loaded mlx-c is refused for the pair: the loaded pair does not pass the pin either (dyld resolved mlx 9.9.8). Run \`make mlx-restore-pin\` first, then rebuild if this binary was not built against the pinned pair.")
 expect "a C API mismatch whose line names the restore names it" "$c" 1 \
 	"PREFLIGHT FAIL: the built binary refuses to measure: $CAPI
 Restore the nax-capable pair:  make mlx-restore-pin"

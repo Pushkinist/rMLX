@@ -540,11 +540,15 @@ compiled):
 - full layers (512): the composite graph in every chunk. The first chunk has
   too few query blocks, and later chunks have an array mask. A larger chunk
   (4096 on e4b, 2048 on 26b-a4b) lets the first chunk reach
-  `steel_attention_dsplit_*_bd512`. At `kL` 32768 that kernel was 5 % faster
-  than the composite graph on the e4b shape and 10 % slower on the 26b shape,
-  and a chunk of 4096 made the e4b time to first token 2 % to 12 % longer. The composite path computes the whole
-causal score rectangle and then masks it, and it holds the score tensor in
-memory. `scripts/sdpa_headdim_bench.py` measures the cost against the metallib
+  `steel_attention_dsplit_*_bd512`. At `q` 4096 that kernel was 1.76x faster
+  than the composite graph at `kL` 4096 and 1.2x at 8192. Later chunks would
+  reach it only with a `"causal"` mask at an offset, which rMLX does not pass;
+  at `kL` 32768 such a call was 5 % faster (e4b shape) and 10 % slower (26b
+  shape). A chunk of 4096 made the e4b time to first token 2 % to 12 %
+  longer; the cause is not known.
+
+The composite path computes the whole causal score rectangle and then masks
+it, and it holds the score tensor in memory. `scripts/sdpa_headdim_bench.py` measures the cost against the metallib
 it reports.
 
 What rMLX pays on the composite path is bounded two ways:

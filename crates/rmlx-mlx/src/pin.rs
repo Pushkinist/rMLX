@@ -169,9 +169,10 @@ pub(crate) enum PinVerdict {
     NotLoaded { library: &'static str },
     /// The loaded `libmlxc.dylib` has another C API than the one this binary
     /// was compiled against, so attention cannot run. Outranks every finding
-    /// about the pair. `pair` is the verdict on the pair alone: where the pin
-    /// binds, a pair that is not the pinned one needs the restore as well as
-    /// the rebuild.
+    /// about the pair. `pair` is the verdict on the pair alone: where the
+    /// pinned pair is required (the pin binds, or the chip is not identified),
+    /// a pair that is not the pinned one needs the restore as well as the
+    /// rebuild.
     CApiMismatch {
         compiled: CApi,
         loaded: CApi,
@@ -425,6 +426,13 @@ impl PinEnforcement {
         !matches!(self, Self::NotApplicable { .. })
     }
 
+    /// Whether this host refuses the loaded pair: a pair that does not pass
+    /// the pin, on a host that requires the pinned pair.
+    #[must_use]
+    pub const fn refuses_the_pair(self, pair_matches: bool) -> bool {
+        !pair_matches && self.requires_the_pinned_pair()
+    }
+
     fn describe(self) -> String {
         match self {
             Self::Binding => "this Mac has a GPU Neural Accelerator, so the pinned pair is \
@@ -450,7 +458,8 @@ impl PinEnforcement {
 pub enum PinRefusal {
     /// The loaded `libmlxc.dylib` has another C API than the one this binary
     /// was compiled against, on any host. The fix is a rebuild, and also the
-    /// restore where the pin binds and the loaded pair is not the pinned one.
+    /// restore where the pinned pair is required (the pin binds, or the chip
+    /// is not identified) and the loaded pair is not the pinned one.
     CApiMismatch,
     /// The loaded pair is not the pinned one, on a host that
     /// [`PinEnforcement::requires_the_pinned_pair`]. The fix is the pinned
@@ -466,7 +475,7 @@ impl PinCheck {
     pub const fn refusal(&self) -> Option<PinRefusal> {
         if !self.c_api_matches {
             Some(PinRefusal::CApiMismatch)
-        } else if !self.matches && self.enforcement.requires_the_pinned_pair() {
+        } else if self.enforcement.refuses_the_pair(self.matches) {
             Some(PinRefusal::PairNotPinned)
         } else {
             None
@@ -502,13 +511,12 @@ fn detail(found: &PinVerdict, enforcement: PinEnforcement, c_api_matches: bool) 
         )
     };
     let restore = if let PinVerdict::CApiMismatch { pair, .. } = found {
-        if !pair.is_match() && enforcement.requires_the_pinned_pair() {
-            // A rebuild against this pair gives a binary that is refused as a
-            // pair that is not the pinned one, so the restore comes first.
+        if enforcement.refuses_the_pair(pair.is_match()) {
             format!(
-                " The loaded pair is not the pinned one either: {}. A measurement on this \
-                 host needs the pinned pair: run `make mlx-restore-pin`, then rebuild if this \
-                 binary was not built against the pinned pair.",
+                " On this host a rebuild against the loaded mlx-c is refused for the pair: \
+                 the loaded pair does not pass the pin either ({}). Run \
+                 `make mlx-restore-pin` first, then rebuild if this binary was not built \
+                 against the pinned pair.",
                 pair.report()
             )
         } else {

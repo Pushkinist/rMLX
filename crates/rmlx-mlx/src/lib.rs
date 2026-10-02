@@ -844,8 +844,8 @@ impl Array {
     pub fn data_address(&self) -> Result<usize> {
         self.eval()?;
         // SAFETY: `self.inner` is a valid mlx_array, and the evaluation above
-        // gave it a buffer, which MLX reads to make the pointer. The pointer
-        // is not dereferenced here.
+        // ran; for an array with no buffer MLX gives a null pointer. The
+        // pointer is not dereferenced here.
         let ptr = unsafe { sys::mlx_array_data_uint8(self.inner) };
         if ptr.is_null() {
             return Err(Error::Mlx(

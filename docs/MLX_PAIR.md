@@ -269,13 +269,13 @@ mlx-c 0.6.0_4 run on the pinned mlx 0.32.3 + mlx-c 0.7.0, and the reverse:
 
 | Check | 0.6 binary on the pinned pair | 0.7 binary on 0.32.1 + 0.6.0_4 |
 |---|---|---|
-| `rmlx healthcheck --human` | `mlx_pin: RED — mlx-c C API mismatch: this binary was compiled against the mlx-c 0.6 C API, but the loaded libmlxc.dylib has the mlx-c 0.7 C API. …`, naming the rebuild | the same with the C APIs swapped, then `The loaded pair is not the pinned one either: … run make mlx-restore-pin, then rebuild if …` |
+| `rmlx healthcheck --human` | `mlx_pin: RED — mlx-c C API mismatch: this binary was compiled against the mlx-c 0.6 C API, but the loaded libmlxc.dylib has the mlx-c 0.7 C API. …`, naming the rebuild | the same with the C APIs swapped, then `On this host a rebuild against the loaded mlx-c is refused for the pair: the loaded pair does not pass the pin either (…). Run make mlx-restore-pin first, then rebuild if …` |
 | `rmlx baseline --model <missing path>` | exit 1, `Error: rmlx baseline refuses to run: mlx-c C API mismatch: …` | exit 1, the same with the restore sentence |
 | `scripts/mlx_preflight.sh`, the binary as `target/release-perf/rmlx` | exit 1 on that `mlx_pin` line, no `make mlx-restore-pin` | exit 1, and `Restore the nax-capable pair:  make mlx-restore-pin` |
 | `the_loaded_c_api_is_the_compiled_one` | fails | fails |
 | `scaled_dot_product_attention_on_cpu_follows_the_c_api_verdict` | passes through its mismatch arm | passes through its mismatch arm |
 
-On a matched pair the same `rmlx baseline` fails on the model path.
+On the pinned pair the same `rmlx baseline` fails on the model path.
 
 With `loaded()` changed to return the compiled C API, every test passes on a
 matched pair. Across pairs the CPU SDPA test then fails: the 0.6 binary on the

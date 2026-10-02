@@ -240,8 +240,8 @@ each submission's `start` and `duration` in nanoseconds, `gpu-channel-name`,
   instrumentation must be present at launch, so the harness uses `--launch`.
 - **A launched `rmlx` cannot open a model under a TCC-protected folder**, such
   as `~/Documents`. It stops in `open()` of `config.json`, and the trace has
-  no rows for it. Keep the snapshot outside those folders, or clone it there
-  with `cp -c -R`.
+  no rows for it. Keep the snapshot outside those folders, or clone it with
+  `cp -c -R` to a folder outside them.
 - **Weight load leaves no rows; prefill does.** The table does not mark where
   prefill ends. The harness reads the run's own `decode_profile{prefill_ms}`
   from `<RMLX_HOME>/logs/<run-id>.jsonl` and uses it as the default

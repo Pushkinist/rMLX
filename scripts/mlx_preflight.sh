@@ -6,8 +6,9 @@
 # preflight passes there when the C API matches.
 #
 # A C API mismatch is fixed by a rebuild. The restore is named for it only
-# when the binary's line names it: where the pin binds and the loaded pair is
-# not the pinned one.
+# when the binary's line names it: where the pinned pair is required (the pin
+# binds, or the chip is not identified) and the loaded pair is not the pinned
+# one.
 #
 # Two sources, never both:
 #
