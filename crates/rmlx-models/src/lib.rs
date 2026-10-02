@@ -60,6 +60,9 @@ pub mod speculative;
 pub mod ssd_tier;
 
 #[cfg(test)]
+mod test_child;
+
+#[cfg(test)]
 mod test_snapshot;
 
 /// Oracle for the per-arch SSD-hydrate entry impls.

@@ -722,7 +722,7 @@ fn pipelined_decode_host_path_emits_the_argmax_stream() {
     );
     assert_eq!(greedy, sampled, "temperature path over a one-hot softmax");
 
-    // A repetition penalty at temperature 0 takes the host argmax path. The
+    // A repetition penalty at temperature 0 takes the host penalty path. The
     // window holds ids 0 and 1, and 40.0 / 1.1 still dominates the zeros.
     let penalised = ids_for(
         &greedy_cfg(),
@@ -731,7 +731,7 @@ fn pipelined_decode_host_path_emits_the_argmax_stream() {
             ..PenaltyConfig::default()
         },
     );
-    assert_eq!(greedy, penalised, "host argmax-with-penalties path");
+    assert_eq!(greedy, penalised, "host penalty path");
 }
 
 /// A scripted forward that serves `rows` and then fails on call `fail_at`

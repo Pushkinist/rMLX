@@ -702,13 +702,14 @@ pub(crate) fn pipelined_decode(
 /// It covers every host-side consumer of the logits row — the readback, the
 /// mask fill, penalties, softmax, the filters, the draw, and logprob capture.
 ///
-/// It does **not** cover GPU work that a selection path merely *schedules*. The
-/// constraint-mask-only path (`temperature == 0`, no penalties, no logprobs) is
-/// the one case that matters: `apply_mask_argmax` returns a lazy graph, so only
-/// its host-side bias fill is timed here and the GPU add + argmax execute at the
-/// next step's `eval`, where they are billed to `sync`. That path's figure is
-/// therefore a host-work floor, not its total cost. Every other path forces the
-/// row to the host inside the window and is fully accounted.
+/// It does **not** cover GPU work that a selection path merely *schedules*.
+/// The constraint-mask-only path (`temperature == 0`, no penalties, no
+/// logprobs) is the main case: `apply_mask_argmax` returns a lazy graph, so
+/// only its host-side allow fill is timed here, and the GPU `where` + argmax
+/// execute at the next step's `eval`, where they are billed to `sync`. That
+/// path's figure is therefore a host-work floor, not its total cost. The
+/// penalty path (`temperature == 0` with penalties) reads the row back inside
+/// the window, but its final `argmax` is also lazy and is billed to `sync`.
 ///
 /// It also omits, on every path, the software pipelining the host path forfeits:
 /// that loss lands in `step` rather than in `sample`. A decode-TPS comparison

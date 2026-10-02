@@ -11,12 +11,10 @@
 )]
 
 use crate::arch::{load_model, Architecture, LoadOpts};
+use crate::test_child::{run_child, started_by_parent, CHILD_DONE};
 use rmlx_mlx::Device;
 use std::path::Path;
-use std::process::{Command, Stdio};
 
-const CHILD_MARKER: &str = "started-by-a-bitnet-device-parent-test";
-const CHILD_DONE: &str = "bitnet-device-child done";
 const HIDDEN: usize = 8;
 const KV_OUT: usize = 4;
 
@@ -115,31 +113,13 @@ fn write_snapshot(dir: &Path) {
 
 #[test]
 fn bitnet_load_and_forward_on_cpu_is_admitted() {
-    let out = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "bitnet::device_tests::bitnet_load_and_forward_on_cpu_is_admitted_child",
-            CHILD_MARKER,
-            "--exact",
-            "--ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "{stdout}\n{stderr}");
-    assert!(
-        stdout.contains(CHILD_DONE),
-        "child did not run to its end:\n{stdout}"
-    );
+    run_child("bitnet::device_tests::bitnet_load_and_forward_on_cpu_is_admitted_child");
 }
 
 #[test]
 #[ignore = "child process; its parent test starts it with a marker argument"]
 fn bitnet_load_and_forward_on_cpu_is_admitted_child() {
-    if !std::env::args().any(|arg| arg == CHILD_MARKER) {
+    if !started_by_parent() {
         return;
     }
     rmlx_mlx::forbid_gpu().unwrap();

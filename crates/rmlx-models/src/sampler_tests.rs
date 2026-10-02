@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_child::{run_child, started_by_parent, CHILD_DONE};
 
 /// Reinterpret a &[f32] as &[u8] (no copy).
 fn f32_as_bytes(s: &[f32]) -> &[u8] {
@@ -1096,7 +1097,7 @@ fn repetition_penalty_breaks_single_token_loop() {
 // this section check Metal, which is a separate implementation — a CPU-only
 // oracle cannot establish a Metal property.
 
-/// Decode the `[1] I32` selection Array into a token id.
+/// Decode the `[1]` index array of a selection into a token id.
 #[allow(
     clippy::indexing_slicing,
     reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] I32 result, and sampler calls on inputs built in the same fn — all infallible by construction"
@@ -1343,22 +1344,27 @@ fn nan_shapes() -> Vec<(&'static str, Vec<f32>)> {
 
 /// On a row that holds a `NaN`, the host greedy path must choose the token the
 /// device greedy path chooses, on every MLX pair the engine supports.
-#[test]
-fn host_greedy_matches_device_argmax_on_nan_rows() {
+fn check_host_greedy_on_nan_rows(device: Device) {
     for (name, row) in nan_shapes() {
         let logits = f32_row(&row);
-        let device_id = device_argmax(&logits, Device::Cpu);
-        let host_id = host_greedy(&logits, Device::Cpu);
+        let device_id = device_argmax(&logits, device);
+        let host_id = host_greedy(&logits, device);
         assert_eq!(
             host_id, device_id,
-            "{name} NaN: host greedy picked {host_id}, device argmax picked {device_id}"
+            "{name} NaN on {device:?}: host greedy picked {host_id}, device argmax picked {device_id}"
         );
     }
 }
 
-/// Rows with a `NaN` at a forbidden and at an allowed id, as `(name, row,
-/// allow-mask)`.
-fn masked_nan_shapes() -> Vec<(&'static str, Vec<f32>, Vec<bool>)> {
+#[test]
+fn host_greedy_matches_device_argmax_on_nan_rows() {
+    check_host_greedy_on_nan_rows(Device::Cpu);
+}
+
+/// Rows with a `NaN` or a `+inf` at a forbidden id, or a `NaN` at an allowed
+/// id, as `(name, logits, allow-mask)`. A forbidden `+inf` plus a `-inf` bias is
+/// `NaN`, so it fails an additive mask the way a forbidden `NaN` does.
+fn masked_nan_shapes() -> Vec<(&'static str, Array, Vec<bool>)> {
     let nan = f32::NAN;
     let mut wide = wide_row_with_peaks(&[WIDE_VOCAB / 2]);
     if let Some(slot) = wide.get_mut(3) {
@@ -1368,23 +1374,34 @@ fn masked_nan_shapes() -> Vec<(&'static str, Vec<f32>, Vec<bool>)> {
     if let Some(slot) = wide_mask.get_mut(3) {
         *slot = false;
     }
+    let first_forbidden = vec![false, true, true, true];
     vec![
         (
             "forbidden NaN first",
-            vec![nan, 1.0, 5.0, 2.0],
-            vec![false, true, true, true],
+            f32_row(&[nan, 1.0, 5.0, 2.0]),
+            first_forbidden.clone(),
         ),
         (
             "forbidden NaN last",
-            vec![1.0, 5.0, 2.0, nan],
+            f32_row(&[1.0, 5.0, 2.0, nan]),
             vec![true, true, true, false],
         ),
         (
             "allowed NaN",
-            vec![1.0, nan, 5.0, 2.0],
+            f32_row(&[1.0, nan, 5.0, 2.0]),
             vec![true, true, false, true],
         ),
-        ("wide, forbidden NaN", wide, wide_mask),
+        (
+            "forbidden +inf first",
+            f32_row(&[f32::INFINITY, 1.0, 5.0, 2.0]),
+            first_forbidden.clone(),
+        ),
+        (
+            "bf16, forbidden NaN first",
+            bf16_row(&[BF16_NAN, 0x3F80, 0x40A0, 0x4000]),
+            first_forbidden,
+        ),
+        ("wide, forbidden NaN", f32_row(&wide), wide_mask),
     ]
 }
 
@@ -1397,8 +1414,7 @@ fn masked_nan_shapes() -> Vec<(&'static str, Vec<f32>, Vec<bool>)> {
 )]
 fn check_masked_greedy_on_nan_rows(device: Device) {
     let nop = PenaltyConfig::default();
-    for (name, row, mask) in masked_nan_shapes() {
-        let logits = f32_row(&row);
+    for (name, logits, mask) in masked_nan_shapes() {
         let device_id = token_id(&apply_mask_argmax(&logits, &mask, device).unwrap());
         let host_id =
             token_id(&argmax_with_penalties(&logits, Some(&mask), &nop, &[], device).unwrap());
@@ -1417,6 +1433,58 @@ fn check_masked_greedy_on_nan_rows(device: Device) {
 #[test]
 fn masked_greedy_paths_agree_and_stay_allowed_on_nan_rows() {
     check_masked_greedy_on_nan_rows(Device::Cpu);
+}
+
+/// The two host-side greedy paths select on the device they are given, as the
+/// device greedy path does. MLX's `argmax` can answer a `NaN` row differently
+/// on the CPU and the Metal stream, so a path that selects on another stream
+/// can choose another token. The GPU latch is process-global and one-way, so
+/// the check runs in a child process.
+#[test]
+fn greedy_paths_select_on_the_device_they_are_given() {
+    run_child("sampler::sampler_tests::greedy_paths_select_on_the_device_they_are_given_child");
+}
+
+// gpu-test-gate: exempt  the latch refuses the GPU stream before any FFI call.
+#[test]
+#[ignore = "child process; its parent test starts it with a marker argument"]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: sampler calls on a row built in the same fn"
+)]
+fn greedy_paths_select_on_the_device_they_are_given_child() {
+    if !started_by_parent() {
+        return;
+    }
+    rmlx_mlx::forbid_gpu().unwrap();
+    let logits = f32_row(&[1.0, 5.0, 2.0]);
+    let mask = [true, true, false];
+    let nop = PenaltyConfig::default();
+    let on = |device| {
+        [
+            (
+                "argmax_with_penalties",
+                argmax_with_penalties(&logits, Some(&mask), &nop, &[], device),
+            ),
+            (
+                "apply_mask_argmax",
+                apply_mask_argmax(&logits, &mask, device),
+            ),
+        ]
+    };
+    for (path, got) in on(Device::Cpu) {
+        assert_eq!(token_id(&got.unwrap()), 1, "{path} on the CPU");
+    }
+    for (path, got) in on(Device::Gpu) {
+        match got {
+            Ok(_) => panic!("{path} selected on another device than the GPU it was given"),
+            Err(e) => assert!(
+                e.to_string().contains("GPU work is refused"),
+                "{path} failed for another reason than the GPU latch: {e}"
+            ),
+        }
+    }
+    println!("{CHILD_DONE}");
 }
 
 /// An all-`false` constraint mask must be **refused**, on every path that
@@ -2044,8 +2112,10 @@ fn near_zero_temperature_is_a_uniform_draw_over_an_exact_tie() {
 // CPU tests above cannot establish a Metal property. These re-run the
 // contract on the real stream.
 //
-// `#[ignore]`d per the workspace rule for tests that reach `Device::Gpu`; run
-// via `make gpu-test CRATE=rmlx-models FILTER=tie`.
+// `#[ignore]`d per the workspace rule for tests that reach `Device::Gpu`.
+// `make gpu-test` filters on the bare function name, and no one substring
+// selects all of these, so run them by hand with the libtest path filter
+// `sampler_tests::` (docs/GPU_TESTS.md).
 
 /// Metal's `argmax` must break ties to the lowest index at every width,
 /// including a width that crosses its multi-threadgroup reduction strategy.
@@ -2102,15 +2172,7 @@ fn host_greedy_matches_device_argmax_on_a_bf16_tie_gpu() {
 #[test]
 #[ignore = "reaches Device::Gpu; run via make gpu-test"]
 fn host_greedy_matches_device_argmax_on_nan_rows_gpu() {
-    for (name, row) in nan_shapes() {
-        let logits = f32_row(&row);
-        let device_id = device_argmax(&logits, Device::Gpu);
-        let host_id = host_greedy(&logits, Device::Gpu);
-        assert_eq!(
-            host_id, device_id,
-            "{name} NaN: host greedy picked {host_id}, Metal argmax picked {device_id}"
-        );
-    }
+    check_host_greedy_on_nan_rows(Device::Gpu);
 }
 
 /// The masked `NaN` rows on Metal.
@@ -2149,20 +2211,24 @@ fn all_neg_inf_row_agrees_with_metal_gpu() {
     }
 }
 
-/// BF16 is the high half-word of the F32 pattern:
-/// `0x3F80` = 1.0, `0x4000` = 2.0, `0x4020` = 2.5, `0x4080` = 4.0.
-/// Tied maxima at index 1 and index 3.
+/// The BF16 quiet `NaN` pattern.
+const BF16_NAN: u16 = 0x7FC0;
+
+/// Wrap BF16 bit patterns as a `[1, n]` BF16 Array. BF16 is the high half-word
+/// of the F32 pattern: `0x3F80` = 1.0, `0x4000` = 2.0, `0x4020` = 2.5,
+/// `0x4080` = 4.0, `0x40A0` = 5.0.
 #[allow(
     clippy::unwrap_used,
     reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] I32 result, and sampler calls on inputs built in the same fn — all infallible by construction"
 )]
+fn bf16_row(patterns: &[u16]) -> Array {
+    let bytes: Vec<u8> = patterns.iter().flat_map(|p| p.to_le_bytes()).collect();
+    Array::from_bytes(&bytes, &[1, patterns.len() as i32], Dtype::Bf16).unwrap()
+}
+
+/// Tied BF16 maxima at index 1 and index 3.
 fn bf16_tie_row() -> Array {
-    let patterns: [u16; 5] = [0x4020, 0x4080, 0x3F80, 0x4080, 0x4000];
-    let mut bytes = Vec::with_capacity(patterns.len() * 2);
-    for p in patterns {
-        bytes.extend_from_slice(&p.to_le_bytes());
-    }
-    Array::from_bytes(&bytes, &[1, 5], Dtype::Bf16).unwrap()
+    bf16_row(&[0x4020, 0x4080, 0x3F80, 0x4080, 0x4000])
 }
 
 /// The same BF16 contract on the CPU stream, so the ordinary suite still

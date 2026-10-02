@@ -79,7 +79,7 @@ The rule covers every site that selects or filters a token:
 | `argmax_with_penalties` (host greedy) | the same `argmax`, over the host row |
 | `filter_top_k` | equal probabilities → lowest ids survive, so `top_k = 1` is the argmax on tied rows too |
 | `filter_top_p` | equal probabilities → lowest ids survive the nucleus |
-| `compute_top_logprobs` | equal logits → ascending id, so rank 0 is the token `argmax` picks |
+| `compute_top_logprobs` | equal logits → ascending id, so on a row without a `NaN` rank 0 is the token `argmax` picks |
 
 It does not cover the inverse-CDF draw. A draw from a tied distribution is
 meant to be random; forcing the lowest id would bias `temperature > 0`.
@@ -140,8 +140,9 @@ every step, whatever the seed.
 chooses ([A row with a `NaN`](#a-row-with-a-nan)). The pure-GPU `argmax` cannot
 refuse anything without an extra reduction per token. A test pins the
 asymmetry. `reject_nan_prefill` refuses a `NaN` in the first logit row of a
-generation; no decode step checks for one, so a `NaN` row that a decode step
-produces reaches the selection.
+generation. No step of the shared pipelined decode loop checks for one
+(laguna's own loop does), so a `NaN` row that a step of that loop produces
+reaches the selection.
 
 ### Temperature scaling and softmax
 
@@ -282,7 +283,9 @@ drive the path. `scripts/perf_canary.sh` is greedy-only and cannot see it.
 
 - It understates, because it omits the lost pipelining. On the mask-only
   greedy path, `apply_mask_argmax` only schedules the GPU `where` and argmax.
-  They run at the next step's `eval` and are billed to `sync`.
+  They run at the next step's `eval` and are billed to `sync`. The penalty
+  path reads the row back inside `sample`, but its final `argmax` is also
+  billed to `sync`.
 - It overstates on a busy host. `sample` is host CPU while `sync` is mostly
   GPU time, so CPU contention stretches only the numerator.
 
@@ -456,8 +459,8 @@ contract. With `k == 0` no log-softmax runs and nothing is allocated.
 - `top`: the `k` most likely `(token_id, logprob)` pairs, descending. It may
   not include the chosen token.
 
-Equal logits rank by ascending id, so rank 0 is the token the device `argmax`
-selects. `top[0].logprob - top[1].logprob` is the top-2 gap at that step.
+Equal logits rank by ascending id, so on a row without a `NaN` rank 0 is the
+token the device `argmax` selects. `top[0].logprob - top[1].logprob` is the top-2 gap at that step.
 
 ---
 

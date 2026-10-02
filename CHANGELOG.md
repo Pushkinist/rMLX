@@ -65,12 +65,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that default device was still the GPU, so such an op ran there.
   `--device cpu` now makes the CPU the MLX default device too.
 - **A greedy step with a `NaN` logit chooses the same token on every path, and
-  a constrained step never chooses a forbidden one.** mlx 0.32.3 returns the
-  first `NaN` from `argmax`, and older MLX skips it. The penalty path
-  selected with a host scan that skipped it, so it could choose another token
-  than the plain path, and the constraint path added a `-inf` bias, which
-  leaves a forbidden `NaN` as `NaN`, so on mlx 0.32.3 it could choose a token
-  the grammar forbids. The penalty path now hands its row to MLX's `argmax`,
+  a constrained step never chooses a forbidden one because of a `NaN` or
+  `+inf` logit.** mlx 0.32.3 returns the first `NaN` from `argmax`, and older
+  MLX skips it. The penalty path selected with a host scan that skipped it, so
+  it could choose another token than the plain path, and the constraint path
+  added a `-inf` bias, which leaves a forbidden `NaN` as `NaN` and makes a
+  forbidden `+inf` a `NaN`, so on mlx 0.32.3 it could choose a token the
+  grammar forbids. The penalty path now hands its row to MLX's `argmax`,
   and the constraint path replaces each forbidden logit with `-inf`. A `NaN`
   row is still not refused at a decode step (`docs/SAMPLING.md`).
 - **The release tarball's binary no longer carries the builder's home
