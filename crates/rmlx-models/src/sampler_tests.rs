@@ -1082,17 +1082,18 @@ fn repetition_penalty_breaks_single_token_loop() {
     );
 }
 
-// ── Greedy tie-break: host selection must mirror the device reduction ─────
+// ── Greedy selection: the host path must choose what the device path does ──
 //
-// The oracle in this section is MLX's own `argmax`, called through the same
-// FFI the decode loop uses. It shares no arithmetic with the host scan under
-// test: one is a C++/Metal reduction over the array, the other a Rust loop
-// over a host copy.
+// The host greedy path applies the mask and the penalties to a host copy of
+// the row, then hands the row back to MLX's `argmax`. The oracle in this
+// section is that same op on the row the device path reduces, called through
+// the FFI the decode loop uses. What these tests can catch is a host path
+// that selects by another rule, or that hands MLX a row other than the one the
+// device path would reduce.
 //
 // Most of these run on `Device::Cpu` so they land in the ordinary
-// (non-`#[ignore]`) suite. `host_argmax` is written against the **Metal**
-// reduction's seed, so the Metal backend is checked rather than assumed by the
-// `#[ignore]`d `Device::Gpu` mirrors at the end of this section — a CPU-only
+// (non-`#[ignore]`) suite. The `#[ignore]`d `Device::Gpu` mirrors at the end of
+// this section check Metal, which is a separate implementation — a CPU-only
 // oracle cannot establish a Metal property.
 
 /// Decode the `[1] I32` selection Array into a token id.
@@ -2038,10 +2039,10 @@ fn near_zero_temperature_is_a_uniform_draw_over_an_exact_tie() {
 
 // ── Device::Gpu mirrors ───────────────────────────────────────────────────
 //
-// `host_argmax` mirrors the **Metal** reduction, and the CPU tests above
-// cannot establish a Metal property — MLX's two backends are separate
-// implementations that are already known to differ on one shape (the `-inf`
-// vs `in[0]` seed). These re-run the tie contract on the real stream.
+// MLX's two backends are separate implementations, and on mlx 0.32.1 they
+// differ on one shape (a leading `NaN`: `-inf` against `in[0]` seed), so the
+// CPU tests above cannot establish a Metal property. These re-run the
+// contract on the real stream.
 //
 // `#[ignore]`d per the workspace rule for tests that reach `Device::Gpu`; run
 // via `make gpu-test CRATE=rmlx-models FILTER=tie`.
@@ -2124,7 +2125,7 @@ fn masked_greedy_paths_agree_and_stay_allowed_on_nan_rows_gpu() {
 /// property of its seeding rather than of its comparisons — and the CPU test
 /// **cannot fail**, because MLX's CPU backend seeds with `in[0]` and so returns
 /// 0 by construction whatever Metal does. This is the only check with power
-/// over `host_argmax`'s third documented bullet.
+/// over the id 0 that `docs/SAMPLING.md` documents for this row.
 ///
 /// The row is deliberately wide enough to cross the single- to
 /// multi-threadgroup boundary. If this fails, that bullet is wrong and needs
@@ -2143,7 +2144,7 @@ fn all_neg_inf_row_agrees_with_metal_gpu() {
         );
         assert_eq!(
             device_id, 0,
-            "width {width}: host_argmax documents id 0 for an all -inf row"
+            "width {width}: docs/SAMPLING.md documents id 0 for an all -inf row"
         );
     }
 }

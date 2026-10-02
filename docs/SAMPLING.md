@@ -51,18 +51,18 @@ Steps 2–5 are `apply_penalties`, in the order of mlx-lm
 | Condition | Path |
 |---|---|
 | No constraint, no penalties | GPU `argmax` |
-| Constraint mask, no penalties | `apply_mask_argmax`: add a `0` / `-inf` bias row on the GPU, then `argmax` |
-| Penalties, with or without a constraint | `argmax_with_penalties`: read back, mask, penalties, host argmax |
+| Constraint mask, no penalties | `apply_mask_argmax`: replace each forbidden logit with `-inf` on the GPU, then `argmax` |
+| Penalties, with or without a constraint | `argmax_with_penalties`: read back, mask, penalties, then `argmax` of that row on the same device |
 
 #### Tie-break contract
 
 **Selection and filtering resolve an exact tie to the lowest token id, on the
 host and on the device.** MLX's `argmax` reduces with a strict `>`, so an equal
-value never displaces an earlier index. `host_argmax` mirrors it. Tests pin
-three consequences:
+value never displaces an earlier index. Every greedy path selects with that
+op: the host path hands its masked and penalised row back to it. Tests pin
+two consequences:
 
 - equal logits → lowest id;
-- a `NaN` never displaces a real maximum;
 - an all-`-inf` row yields id 0.
 
 The three greedy cases must agree, because setting a constraint or a penalty
@@ -76,7 +76,7 @@ The rule covers every site that selects or filters a token:
 | Site | Rule |
 |---|---|
 | `argmax` / `apply_mask_argmax` (device) | equal logits → lowest id |
-| `argmax_with_penalties` (host greedy) | mirrors it through `host_argmax` |
+| `argmax_with_penalties` (host greedy) | the same `argmax`, over the host row |
 | `filter_top_k` | equal probabilities → lowest ids survive, so `top_k = 1` is the argmax on tied rows too |
 | `filter_top_p` | equal probabilities → lowest ids survive the nucleus |
 | `compute_top_logprobs` | equal logits → ascending id, so rank 0 is the token `argmax` picks |
@@ -97,12 +97,28 @@ Both filters order integers under `Ord` instead:
 The keys use the IEEE total-order flip, not the raw bit pattern, so they order
 every `f32`, including negatives and `-0.0`.
 
-MLX seeds its CPU reduction with element 0 and its Metal reduction with
-`-inf`. So a `NaN` at index 0 returns 0 on CPU and the first real maximum on
-Metal. `host_argmax` follows Metal, the production stream. Three `#[ignore]`
-`Device::Gpu` tests re-run the contract on Metal, one per consequence. The
-all-`-inf` CPU test cannot fail, because MLX's CPU backend returns 0 by
-construction; only its Metal mirror tests the claim.
+`#[ignore]` `Device::Gpu` tests re-run the contract on Metal. The all-`-inf`
+CPU test cannot fail, because MLX's CPU backend returns 0 by construction;
+only its Metal mirror tests the claim.
+
+#### A row with a `NaN`
+
+MLX's `argmax` answers a row that holds a `NaN` differently by version.
+Measured on the CPU and the Metal stream, f32 and bf16, 4 and 262,144 wide:
+
+| Pair | `argmax` of a row with a `NaN` |
+|---|---|
+| mlx 0.32.3 / mlx-c 0.7.0 (pinned) | the index of the first `NaN`, on both streams (ml-explore/mlx#4291) |
+| mlx 0.32.1 / mlx-c 0.6.0_4 (Homebrew) | the `NaN` is skipped. Metal starts from `-inf`, CPU from element 0, so a leading `NaN` gives 0 on CPU and the real maximum on Metal |
+
+An all-`NaN` row gives 0 on both pairs. Every greedy path selects with
+MLX's `argmax` on the same device, so the paths agree on such a row on each
+pair; which token they emit depends on the pair. A host scan can match only
+one of the two rules. `apply_mask_argmax` replaces a forbidden logit instead
+of adding `-inf` to it: `NaN + -inf` is `NaN`, and on the pinned pair a
+forbidden `NaN` would win. `host_greedy_matches_device_argmax_on_nan_rows` and
+`masked_greedy_paths_agree_and_stay_allowed_on_nan_rows`, with their `_gpu`
+mirrors, hold this on both pairs. They assert agreement, not an id.
 
 ### Rows the sampler refuses
 
@@ -120,10 +136,12 @@ the exponentials do not sum to a finite value, which happens when a logit is
 `NaN` or `+inf`. Sampling such a row would return the same last nonzero id
 every step, whatever the seed.
 
-**Greedy does not refuse a `NaN` row.** It mirrors the device reduction, which
-skips `NaN` and returns the largest real logit. The pure-GPU `argmax` cannot
+**Greedy does not refuse a `NaN` row.** It emits the token MLX's `argmax`
+chooses ([A row with a `NaN`](#a-row-with-a-nan)). The pure-GPU `argmax` cannot
 refuse anything without an extra reduction per token. A test pins the
-asymmetry.
+asymmetry. `reject_nan_prefill` refuses a `NaN` in the first logit row of a
+generation; no decode step checks for one, so a `NaN` row that a decode step
+produces reaches the selection.
 
 ### Temperature scaling and softmax
 
@@ -263,7 +281,7 @@ drive the path. `scripts/perf_canary.sh` is greedy-only and cannot see it.
 `sample_share_pct` is not a bound in either direction:
 
 - It understates, because it omits the lost pipelining. On the mask-only
-  greedy path, `apply_mask_argmax` only schedules the GPU add and argmax.
+  greedy path, `apply_mask_argmax` only schedules the GPU `where` and argmax.
   They run at the next step's `eval` and are billed to `sync`.
 - It overstates on a busy host. `sample` is host CPU while `sync` is mostly
   GPU time, so CPU contention stretches only the numerator.
@@ -491,7 +509,7 @@ Consequences:
 | `PenaltyConfig` | `rmlx-models::sampler` | Repetition, presence and frequency penalties, `logit_bias` |
 | `Pcg32` | `rmlx-models::sampler` | Per-request RNG |
 | `sample_token_array` | `rmlx-models::sampler` | Host sampling entry point |
-| `argmax_with_penalties` | `rmlx-models::sampler` | Greedy with penalties (host argmax) |
+| `argmax_with_penalties` | `rmlx-models::sampler` | Greedy with penalties (host mask and penalties, then `argmax`) |
 | `apply_mask_argmax` | `rmlx-models::sampler` | Greedy with a constraint mask (GPU argmax) |
 | `apply_penalties` | `rmlx-models::sampler` | Bias → repetition → presence → frequency |
 | `sampling_distribution` | `rmlx-models::sampler` | The post-filter probability vector, shared with the speculative path |

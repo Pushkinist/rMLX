@@ -156,12 +156,14 @@ pub fn regen_requested() -> bool {
 /// therefore admits an exact tie at every magnitude and a one-ULP gap only in
 /// the lower octave.
 ///
-/// **One** measured case exists — bonsai, index 18, margin exactly 0.00000000 —
-/// so nothing in the tree distinguishes 0.10 from 0.01. A single exact tie is
-/// no evidence for any particular bound above zero. If a case ever lands
-/// between, **tighten rather than widen**: a genuine tie stays a tie under any
-/// smaller bound, while raising the bound buys nothing except the ability to
-/// absorb a real preference.
+/// **Two** measured cases exist: bonsai, index 18, margin exactly 0; and
+/// gemma-4-e4b, index 5, margin 0.0706. Gemma-4 logits pass through an f32
+/// softcap, so one bf16 ULP of the LM-head output (0.25 at 37) arrives as
+/// 0.0706; an independent implementation of that checkpoint has the same
+/// one-ULP gap. Nothing in the tree distinguishes 0.10 from 0.08. If a case
+/// ever lands between, **tighten rather than widen**: a genuine tie stays a tie
+/// under any smaller bound, while raising the bound buys nothing except the
+/// ability to absorb a real preference.
 pub const REGEN_MAX_TIE_MARGIN: f32 = 0.10;
 
 /// Index of the first differing token id. `None` when the sequences match.
