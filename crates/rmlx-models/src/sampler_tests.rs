@@ -1308,22 +1308,114 @@ fn host_greedy_matches_device_argmax_with_mask_and_penalties() {
     );
 }
 
-/// A `NaN` in the row must not displace a real maximum, and must not reset the
-/// running best — both are properties of the device reduction, which compares
-/// with a strict `>` and therefore skips `NaN` entirely. The `NaN` is placed
-/// away from index 0 on purpose: MLX seeds its CPU reduction with `in[0]` and
-/// its Metal reduction with `-inf`, so a leading `NaN` is the one shape where
-/// MLX's own two backends disagree and no host rule can match both.
+/// Rows that hold a `NaN`, as `(name, row)`. Shared by the CPU tests and their
+/// `Device::Gpu` mirrors.
+///
+/// MLX's `argmax` answers these rows differently by version: mlx 0.32.3 returns
+/// the first `NaN` (ml-explore/mlx#4291), and 0.32.1 skips it, from a `-inf`
+/// seed on Metal and from `in[0]` on CPU. So the tests over these rows assert
+/// that the greedy paths agree, never which id they choose.
+fn nan_shapes() -> Vec<(&'static str, Vec<f32>)> {
+    let nan = f32::NAN;
+    let wide = |nans: &[usize], peak: usize| {
+        let mut row = wide_row_with_peaks(&[peak]);
+        for &i in nans {
+            if let Some(slot) = row.get_mut(i) {
+                *slot = nan;
+            }
+        }
+        row
+    };
+    vec![
+        ("leading", vec![nan, 1.0, 5.0, 2.0]),
+        ("middle", vec![1.0, 3.0, nan, 2.0]),
+        ("trailing", vec![1.0, 5.0, 2.0, nan]),
+        ("after +inf", vec![1.0, f32::INFINITY, nan]),
+        ("before +inf", vec![1.0, nan, f32::INFINITY]),
+        ("all", vec![nan; 8]),
+        ("wide, at index 0", wide(&[0], WIDE_VOCAB / 2)),
+        ("wide, before the max", wide(&[100], WIDE_VOCAB / 2)),
+        ("wide, after the max", wide(&[WIDE_VOCAB - 1], 7)),
+        ("wide, all", vec![nan; WIDE_VOCAB]),
+    ]
+}
+
+/// On a row that holds a `NaN`, the host greedy path must choose the token the
+/// device greedy path chooses, on every MLX pair the engine supports.
 #[test]
-fn host_greedy_skips_nan_like_the_device() {
-    let logits = f32_row(&[1.0, 3.0, f32::NAN, 2.0]);
-    let device_id = device_argmax(&logits, Device::Cpu);
-    assert_eq!(device_id, 1, "device reduction must skip the NaN");
-    let host_id = host_greedy(&logits, Device::Cpu);
-    assert_eq!(
-        host_id, device_id,
-        "NaN row: host greedy picked {host_id}, device argmax picked {device_id}"
-    );
+fn host_greedy_matches_device_argmax_on_nan_rows() {
+    for (name, row) in nan_shapes() {
+        let logits = f32_row(&row);
+        let device_id = device_argmax(&logits, Device::Cpu);
+        let host_id = host_greedy(&logits, Device::Cpu);
+        assert_eq!(
+            host_id, device_id,
+            "{name} NaN: host greedy picked {host_id}, device argmax picked {device_id}"
+        );
+    }
+}
+
+/// Rows with a `NaN` at a forbidden and at an allowed id, as `(name, row,
+/// allow-mask)`.
+fn masked_nan_shapes() -> Vec<(&'static str, Vec<f32>, Vec<bool>)> {
+    let nan = f32::NAN;
+    let mut wide = wide_row_with_peaks(&[WIDE_VOCAB / 2]);
+    if let Some(slot) = wide.get_mut(3) {
+        *slot = nan;
+    }
+    let mut wide_mask = vec![true; WIDE_VOCAB];
+    if let Some(slot) = wide_mask.get_mut(3) {
+        *slot = false;
+    }
+    vec![
+        (
+            "forbidden NaN first",
+            vec![nan, 1.0, 5.0, 2.0],
+            vec![false, true, true, true],
+        ),
+        (
+            "forbidden NaN last",
+            vec![1.0, 5.0, 2.0, nan],
+            vec![true, true, true, false],
+        ),
+        (
+            "allowed NaN",
+            vec![1.0, nan, 5.0, 2.0],
+            vec![true, true, false, true],
+        ),
+        ("wide, forbidden NaN", wide, wide_mask),
+    ]
+}
+
+/// The masked greedy paths must agree on a row with a `NaN`, and neither may
+/// choose a forbidden id. An additive `-inf` bias leaves a forbidden `NaN` as
+/// `NaN`, so on an MLX whose `argmax` returns the first `NaN` it would win.
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] I32 result, and sampler calls on inputs built in the same fn — all infallible by construction"
+)]
+fn check_masked_greedy_on_nan_rows(device: Device) {
+    let nop = PenaltyConfig::default();
+    for (name, row, mask) in masked_nan_shapes() {
+        let logits = f32_row(&row);
+        let device_id = token_id(&apply_mask_argmax(&logits, &mask, device).unwrap());
+        let host_id =
+            token_id(&argmax_with_penalties(&logits, Some(&mask), &nop, &[], device).unwrap());
+        assert_eq!(
+            host_id, device_id,
+            "{name}: host masked greedy picked {host_id}, device masked argmax picked {device_id}"
+        );
+        assert_eq!(
+            mask.get(device_id as usize),
+            Some(&true),
+            "{name}: masked greedy chose the forbidden id {device_id}"
+        );
+    }
+}
+
+#[test]
+fn masked_greedy_paths_agree_and_stay_allowed_on_nan_rows() {
+    check_masked_greedy_on_nan_rows(Device::Cpu);
 }
 
 /// An all-`false` constraint mask must be **refused**, on every path that
@@ -1689,12 +1781,12 @@ fn a_non_finite_logits_row_is_refused_not_sampled() {
     );
 }
 
-/// The greedy paths deliberately do **not** refuse a `NaN` row: they mirror the
-/// device reduction, which skips `NaN` and returns the largest real logit, and
-/// diverging from it would re-create the host/device split this contract
-/// exists to close. Pinned so the asymmetry is a decision rather than an
-/// oversight — the sampling path refuses because its failure is a constant
-/// stream, the greedy path does not because its answer is the device's.
+/// The greedy paths deliberately do **not** refuse a `NaN` row: the device path
+/// cannot refuse without an extra reduction per token, and the host path must
+/// choose what the device path chooses. Pinned so the asymmetry is a decision
+/// rather than an oversight — the sampling path refuses because its failure is
+/// a constant stream, the greedy path does not because its answer is the
+/// device's.
 #[test]
 fn greedy_does_not_refuse_a_nan_row_but_the_sampler_does() {
     let logits = f32_row(&[1.0, 3.0, f32::NAN, 2.0]);
@@ -1792,21 +1884,20 @@ fn compute_top_logprobs_breaks_ties_to_lowest_id() {
     );
 }
 
-/// `top_logprobs` is reported alongside the emitted token, computed from the
-/// same raw logits row the greedy path reduces, so rank 0 must be the token the
-/// device would emit on a `NaN` row too. Seeding the selection from a candidate
-/// rather than from `-inf` breaks exactly this: a `NaN` at the seed position
-/// wins the rank, because every later `>` and `==` against it is false.
+/// The top-logprob ranks list real logits ahead of a `NaN`. Seeding the
+/// selection from a candidate rather than from `-inf` breaks this: a `NaN` at
+/// the seed position wins the rank, because every later `>` and `==` against
+/// it is false.
+///
+/// Rank 0 is not compared with the emitted token here. On a `NaN` row the
+/// emitted token is MLX's `argmax`, which returns the `NaN` on mlx 0.32.3 and
+/// the real maximum on 0.32.1, and every logprob of the row is `NaN`.
 #[test]
-#[allow(
-    clippy::indexing_slicing,
-    reason = "top is built with exactly k = 2 entries immediately above"
-)]
 #[allow(
     clippy::unwrap_used,
     reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] I32 result, and sampler calls on inputs built in the same fn — all infallible by construction"
 )]
-fn compute_top_logprobs_skips_nan_like_the_device() {
+fn compute_top_logprobs_ranks_real_logits_ahead_of_nan() {
     // NaN at index 0 — the seed position of the first selection round.
     let logits = f32_row(&[f32::NAN, 1.0, 5.0, 2.0]);
     let out = compute_top_logprobs(&logits, 2, 2).unwrap();
@@ -1815,11 +1906,6 @@ fn compute_top_logprobs_skips_nan_like_the_device() {
         ids,
         vec![2, 3],
         "a NaN must not take a rank ahead of a real logit"
-    );
-    assert_eq!(
-        ids[0],
-        host_greedy(&logits, Device::Cpu),
-        "rank 0 must be the token the greedy path emits"
     );
 }
 
@@ -2010,24 +2096,27 @@ fn host_greedy_matches_device_argmax_on_a_bf16_tie_gpu() {
     );
 }
 
-/// `host_argmax` claims a `NaN` never displaces a real maximum *on the device*.
-/// The CPU test of that claim is weak — MLX's CPU backend seeds its reduction
-/// with `in[0]`, so it skips a mid-row `NaN` for a reason Metal does not share.
-/// This is the mirror that actually checks Metal.
+/// The `NaN` rows on Metal. On mlx 0.32.1 the Metal and the CPU reductions
+/// disagree on a leading `NaN`, so the CPU test cannot stand in for this one.
 #[test]
 #[ignore = "reaches Device::Gpu; run via make gpu-test"]
-fn host_greedy_skips_nan_like_the_device_gpu() {
-    let logits = f32_row(&[1.0, 3.0, f32::NAN, 2.0]);
-    let device_id = device_argmax(&logits, Device::Gpu);
-    let host_id = host_greedy(&logits, Device::Gpu);
-    assert_eq!(
-        host_id, device_id,
-        "NaN row: host greedy picked {host_id}, Metal argmax picked {device_id}"
-    );
-    assert_eq!(
-        device_id, 1,
-        "Metal must skip the NaN and take the real max"
-    );
+fn host_greedy_matches_device_argmax_on_nan_rows_gpu() {
+    for (name, row) in nan_shapes() {
+        let logits = f32_row(&row);
+        let device_id = device_argmax(&logits, Device::Gpu);
+        let host_id = host_greedy(&logits, Device::Gpu);
+        assert_eq!(
+            host_id, device_id,
+            "{name} NaN: host greedy picked {host_id}, Metal argmax picked {device_id}"
+        );
+    }
+}
+
+/// The masked `NaN` rows on Metal.
+#[test]
+#[ignore = "reaches Device::Gpu; run via make gpu-test"]
+fn masked_greedy_paths_agree_and_stay_allowed_on_nan_rows_gpu() {
+    check_masked_greedy_on_nan_rows(Device::Gpu);
 }
 
 /// The all-`-inf` row is the one shape where the `-inf` seed is never
