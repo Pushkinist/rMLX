@@ -444,6 +444,16 @@ fn one_row_view_over_tail(
     )
 }
 
+/// Rows of the product under test. MLX leaves its vector kernel at the row
+/// count `get_qmv_batch_limit` returns, and the highest return on any Apple
+/// GPU is 33 (32 in MLX 0.31.2). The test does not rely on this figure: it
+/// fails when the product stays on the vector kernel.
+const SPLITK_ROWS: i32 = 64;
+
+/// A batch height MLX runs on its vector kernel on every Apple GPU: the lowest
+/// return of `get_qmv_batch_limit` is 6.
+const VECTOR_KERNEL_ROWS: i32 = 2;
+
 /// Whether the rows MLX's `qmm_t` split-K loader reads past the end of an
 /// `N = 1` weight can reach the output. The same kept row is multiplied three
 /// ways: out of its own one-row buffers (where the tail read leaves the
@@ -453,8 +463,22 @@ fn one_row_view_over_tail(
 /// for bit.
 ///
 /// That a view's tile really reads its parent's tail rows is not asserted
-/// here: the evidence is the shader-validation census, where the fresh arm
+/// here. On an MLX whose loader reads past the weight (every release before
+/// 0.32.3) the evidence is the shader-validation census, where the fresh arm
 /// reports 4 loads per mode and the view arms none.
+///
+/// **How the test knows the product ran on split-K.** MLX gives a transposed,
+/// unbatched quantized product to its vector kernel below a row count that
+/// depends on the GPU, and to `qmm_t_splitk` at or above it
+/// (`QuantizedMatmul::eval_gpu`, `M >= vector_limit`). mlx-c reports neither
+/// the limit nor the kernel. The two kernels sum in a different order, so the
+/// test multiplies the same rows two more ways: in batches of
+/// [`VECTOR_KERNEL_ROWS`], which every GPU runs on the vector kernel, and four
+/// rows as one batch, also below every limit. The four-row batch must equal
+/// its two-row batches bit for bit, which shows the vector kernel does not
+/// depend on the batch height. The full batch must then differ from its
+/// two-row batches, or the product did not leave the vector kernel and the
+/// tail arms below prove nothing about split-K.
 ///
 /// The printed digest is the fresh arm's output; comparing it between a run
 /// under `make gpu-test` and one without shader validation says whether the
@@ -467,24 +491,60 @@ fn one_row_view_over_tail(
 )]
 fn split_k_tail_row_reads_never_reach_the_output() {
     let device = Device::Gpu;
-    let (m, k) = (32, 2048);
+    let (m, k) = (SPLITK_ROWS, 2048);
     let x = deterministic_bf16(&[m, k], 0x3C1E, device);
     let row = deterministic_bf16(&[1, k], 0x0B0E, device);
 
     for (mode, group_size, bits) in [("affine", 64, 8), ("affine", 64, 4), ("mxfp8", 32, 8)] {
-        let product = |codes: &Array, scales: &Array, biases: Option<&Array>| {
+        let product_of = |x: &Array, codes: &Array, scales: &Array, biases: Option<&Array>| {
             let y = quantized_matmul(
-                &x, codes, scales, biases, group_size, bits, mode, true, device,
+                x, codes, scales, biases, group_size, bits, mode, true, device,
             )
             .expect("quantized_matmul");
-            assert_eq!(y.shape(), vec![m, 1], "output shape changed");
+            assert_eq!(y.shape(), vec![x.shape()[0], 1], "output shape changed");
             y.to_bytes().expect("to_bytes")
+        };
+        let product = |codes: &Array, scales: &Array, biases: Option<&Array>| {
+            product_of(&x, codes, scales, biases)
         };
 
         let (codes, scales, biases) =
             quantize_mode(&row, group_size, bits, mode, device).expect("quantize");
         let biases = (mode == "affine").then_some(biases);
         let fresh = product(&codes, &scales, biases.as_ref());
+
+        let on_the_vector_kernel = |rows: i32| -> Vec<u8> {
+            (0..rows / VECTOR_KERNEL_ROWS)
+                .flat_map(|batch| {
+                    let from = batch * VECTOR_KERNEL_ROWS;
+                    let pair = x
+                        .slice(&[from, 0], &[from + VECTOR_KERNEL_ROWS, k], &[1, 1], device)
+                        .expect("slice");
+                    product_of(&pair, &codes, &scales, biases.as_ref())
+                })
+                .collect()
+        };
+        let four = x.slice(&[0, 0], &[4, k], &[1, 1], device).expect("slice");
+        assert_eq!(
+            product_of(&four, &codes, &scales, biases.as_ref()),
+            on_the_vector_kernel(4),
+            "{mode} b{bits}: four rows as one batch differ from the same rows in batches \
+             of {VECTOR_KERNEL_ROWS}, so a difference at {m} rows would not show which \
+             kernel ran"
+        );
+        let vector = on_the_vector_kernel(m);
+        let moved = fresh
+            .chunks_exact(2)
+            .zip(vector.chunks_exact(2))
+            .filter(|(a, b)| a != b)
+            .count();
+        println!("split-k reach {mode} gs={group_size} b={bits}: {moved} of {m} rows differ");
+        assert!(
+            moved > 0,
+            "{mode} b{bits}: {m} rows as one batch equal the same rows in batches of \
+             {VECTOR_KERNEL_ROWS} bit for bit, so the product ran on the vector kernel \
+             and this test did not reach split-K"
+        );
         for repeat in 1..4 {
             assert_eq!(
                 product(&codes, &scales, biases.as_ref()),
