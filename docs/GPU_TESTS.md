@@ -410,9 +410,7 @@ an array mask, at least 1024 query rows, query rows that are not a multiple of
 - mlx 0.31.2 and 0.32.1 do not show it.
 
 rMLX sends MLX no call in that configuration (`FFI.md`,
-"`scaled_dot_product_attention`"), so no test fails for this reason, and
-`scripts/gpu_instrument_only.txt` has no entry. The rule that follows is for
-another kernel that behaves the same way.
+"`scaled_dot_product_attention`"), so no test fails for this reason.
 
 After the instrumented runs of a crate, the runner runs its selected tests
 once more with no `MTL_*` or `METAL_*` variable:
@@ -422,37 +420,32 @@ once more with no `MTL_*` or `METAL_*` variable:
 - A stand-down notice from either run is listed and ends the run INCOMPLETE.
   The census skip set is the instrumented runs' notices alone.
 - Each instrumented run that exits non-zero and names no failing test is a
-  failure.
+  failure, read per run: a failing test that one run names does not vouch for
+  another run that died.
+- A build under the Metal claim in either kind of run is a failure.
 - The uninstrumented run has the same coverage check as each instrumented run.
 
 The cost is one more pass over every selected test. No complete run has
 measured the wall time of the suite with it.
 
-**A test that fails only under the instrument is accepted by name.** A kernel
-defect that only the instrument's timing exposes looks the same as an artifact
-of the instrument: red with validation, green without, no diagnostic. So
-`scripts/gpu_instrument_only.txt` pins the accepted tests, one
-`crate | test | reference` entry each, and its header gives the evidence each
-entry rests on.
+**A test that fails under the instrument and passes without it is a failure.**
+The report names it: `<crate>: <test> failed with shader validation on and
+passed without it`. A kernel defect that only the instrument's timing exposes
+looks the same as an artifact of the instrument: red with validation, green
+without, no diagnostic. The scan of such a test stopped at its failure, so
+its census entries stay an expectation and the hits it did not print are a
+deviation.
 
-| observed | verdict |
-|---|---|
-| a pinned test fails only under the instrument | pass: listed under `changed under the instrument` with its reference, final line INCOMPLETE |
-| a test with no entry fails only under the instrument | fail: `not pinned: <crate> <test> failed with shader validation on and passed without it` |
-| a pinned test passes under the instrument | fail: `stale: <crate> <test> is pinned as failing under the instrument and passed under it` |
-| a pinned test not selected, stood down, or red in both runs | nothing about the pin |
-| a pin line without three fields, an unknown test, a test pinned twice, the file missing | fail, naming the line |
-
-The scan of an accepted test stopped at its failure. The hits it printed
-before that are part of what its census entries accept, so each of its pinned
-counts is a ceiling for the run: from 0 to the count passes, as `census NOT
-enforced in full`, and more fails as `count moved up`. The floor of the census
-is the sum per kernel, so a hit of the cut test can stand in for a missing hit
-of another test on the same kernel.
+The runner reads no list of accepted tests, because no test is in that state.
+A list keyed on test names cannot hold a fault that fires at random: an entry
+whose test passed by chance turns a correct tree red, and an entry accepts any
+failure of its test, a new defect included. What this gives up: a fault of the
+instrument that fires at random makes the gate red at random. The answer is
+the one the attention kernel above got. Find the configuration with a
+reproduction in pure MLX, and stop reaching it.
 
 Each rule is a case under `THE VERDICT` in
-`scripts/run_gpu_tests_selftest.sh`, and one case holds the tracked pin to
-no entry.
+`scripts/run_gpu_tests_selftest.sh`.
 
 ### Threadgroup-memory validation: on for rMLX's kernels, off for MLX's
 
@@ -588,7 +581,6 @@ not `SKIP`. Its entries stay expected. The missing checkpoint's kernel reports
 | nothing where the expectation is positive | fail: `no longer fires: …` |
 | any store | fail: `never accepted: …` |
 | an entry whose test was not selected, or skipped | pass: `census NOT enforced in full`, naming the entry |
-| 0 to the count of an entry whose test failed only under the instrument | pass: `census NOT enforced in full`, the count named as a ceiling |
 | a count from 0 to N against an entry pinned `<=N` | pass, printed as `<test> = at most N` |
 | above N against an entry pinned `<=N` | fail: `count moved up: … expected at most N, observed M` |
 
