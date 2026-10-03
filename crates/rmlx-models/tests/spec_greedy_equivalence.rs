@@ -62,10 +62,13 @@
 //! **The repetition control** is the second oracle, and it exists because the
 //! first has nothing to read when both arms are degenerate: two arms in the same
 //! loop have no healthy reference arm whose margins mean anything. So every run
-//! also checks that neither arm repeats at a short period across more than
-//! [`MAX_CYCLE_FRACTION`] of its tokens, over the whole stream and over each
-//! tail cut, at every period up to [`MAX_CYCLE_PERIOD`] that leaves
-//! [`MIN_CYCLE_SAMPLES`] comparisons.
+//! also reads how much of each arm repeats at a short period, over the whole
+//! stream and over each tail cut, at every period up to [`MAX_CYCLE_PERIOD`]
+//! that leaves [`MIN_CYCLE_SAMPLES`] comparisons. A reference arm above
+//! [`MAX_CYCLE_FRACTION`] is an input the gate cannot judge. A speculative arm
+//! above it is refused when it also reads [`MIN_CYCLE_EXCESS`] standard errors
+//! above the reference arm: an answer about one subject repeats that subject in
+//! both arms, and the reference arm is the control for how much.
 //!
 //! Windowing and the period sweep are both load-bearing; three real
 //! degeneracies score under any ceiling without them:
@@ -286,25 +289,26 @@ const MAX_DIVERGENCE_CONFIDENCE: f64 = 0.12;
 const WORST_CORRECT_TAIL_AGREEMENT: f64 = 0.1094;
 
 /// How much of an arm — or of any tail cut of it — may repeat at a short period
-/// before it counts as collapsed.
+/// before the control reads it as a possible loop.
 ///
-/// Set against **the output this gate's own prompts produce**, which is prose:
-/// across the prompts the gate judges the real arms read 0.0426 to 0.1351, and 1000
-/// synthetic healthy streams at each of six lengths peaked at 0.1351 and tripped
-/// this ceiling none (`the_false_positive_rate_on_healthy_output` prints that).
-/// 1.48x over the worst of those 6000, and far under every collapse the gate has
-/// to catch — the one this gate was built on reads 1.0000.
+/// A reference arm above it is an input the gate cannot judge. A speculative arm
+/// above it is refused only when it also reads [`MIN_CYCLE_EXCESS`] above the
+/// reference arm.
+///
+/// **The ceiling alone does not separate healthy prose from a ragged loop.**
+/// 1000 synthetic healthy streams at each of six lengths peak at 0.1351 and trip
+/// it none (`the_false_positive_rate_on_healthy_output` prints that). Real prose
+/// reads higher, because an answer about one subject repeats that subject:
+/// [`MEASURED_SPEC_ARM`] is a healthy arm of a correct engine and reads 0.2308,
+/// where a period-8 loop at 58% raggedness can read 0.20.
 ///
 /// The other side is set by the pair regime, and it is **swept rather than
 /// sampled**: `two_arms_in_the_same_ragged_loop_are_refused_until_they_are_no_longer_one_loop`
 /// walks two arms in the same period-8 loop from 0% to 100% raggedness over four
-/// seed pairs and pins where this control stops refusing them — 60%, past which
-/// the arms are more noise than loop. Twenty seed pairs over that band leave the
-/// range covered at 0.22 and open the first hole at 0.24, so the value here has
-/// room rather than sitting on the boundary. An earlier 0.50 — placed from six
-/// sampled points — left 34% to 52% passing. Nothing takes over past 60%: what
-/// the control admits there agrees better than the worst correct pair does, which
-/// is the measurement behind having no subsequence floor.
+/// seed pairs and pins where the control stops refusing them. Past that edge the
+/// arms are more noise than loop. Nothing takes over there: what the control
+/// admits agrees better than the worst correct pair does, which is the
+/// measurement behind having no subsequence floor.
 ///
 /// It is **not** a general degeneracy threshold and there is none: healthy
 /// markdown tables read 0.68 to 0.88 on this measure and ragged loops read 0.37
@@ -313,6 +317,34 @@ const WORST_CORRECT_TAIL_AGREEMENT: f64 = 0.1094;
 /// exists and why the value here is only meaningful for arms these prompts
 /// produced.
 const MAX_CYCLE_FRACTION: f64 = 0.20;
+
+/// How far a speculative arm above [`MAX_CYCLE_FRACTION`] must read above the
+/// reference arm before it counts as collapsed: [`cycle_excess`], in standard
+/// errors of the difference between the two readings.
+///
+/// The reference arm is the control for the prompt. The narrowest window gives
+/// a reading from as few as [`MIN_CYCLE_SAMPLES`] comparisons, where four
+/// coincidences move it across the ceiling. The standard error carries the
+/// sample count, so one rule reads a 39-comparison window and a 255-comparison
+/// stream.
+///
+/// **Both sides are measured.** The upper side is swept:
+/// `a_speculative_arm_in_a_ragged_loop_is_refused_against_a_healthy_reference`
+/// walks a looping arm against a healthy reference arm from 0% to 100%
+/// raggedness. The lowest excess of an arm above the ceiling there is 2.2913.
+/// The value is under it, so this bound admits no arm of that sweep. The lower
+/// side is one measured pair of a correct engine, which reads 1.1802
+/// (`a_healthy_arm_that_repeats_no_more_than_its_reference_is_not_a_collapse`).
+/// `Rng::prose` gives no second reading on that side: no synthetic healthy
+/// stream reaches the ceiling.
+///
+/// **What this bound cannot see.** It follows the reference arm. A speculative
+/// arm in a ragged loop is admitted when the reference arm reads near the
+/// ceiling too. Two arms in one loop are such a pair, and only the reference
+/// arm's own reading refuses them:
+/// `two_arms_in_the_same_ragged_loop_are_refused_until_they_are_no_longer_one_loop`
+/// pins that edge.
+const MIN_CYCLE_EXCESS: f64 = 2.0;
 
 /// Longest cycle the control looks for.
 ///
@@ -336,11 +368,12 @@ const MAX_CYCLE_PERIOD: usize = 64;
 /// `strongest_cycle` divides by `len - period`. In the last quarter of a
 /// 256-token arm that is a 64-token window, and at period 63 the denominator is
 /// **one comparison** — a single coincidental token match read 1.0000 and the
-/// gate reported a repetition loop on healthy output. Every false positive
-/// observed came from a denominator of one or two, at any ceiling, so this floor
-/// is the whole fix; `the_false_positive_rate_on_healthy_output` prints the
-/// measured rate per length rather than recording a number nothing can
-/// regenerate.
+/// gate reported a repetition loop on healthy output. Every false positive on a
+/// synthetic stream came from a denominator of one or two, at any ceiling, and
+/// this floor removes them; `the_false_positive_rate_on_healthy_output` prints
+/// the measured rate per length rather than recording a number nothing can
+/// regenerate. The floor does not make a reading from 39 comparisons exact.
+/// [`MIN_CYCLE_EXCESS`] reads the sample count for that.
 ///
 /// A bound on the *period relative to the window* was tried alongside it and
 /// removed: it changed no false-positive rate and it blinded the sweep to real
@@ -401,48 +434,91 @@ fn divergence_confidence(spec: &[u32], plain: &[u32], margins: &[f32]) -> Option
     Some((d, below as f64 / margins.len() as f64))
 }
 
-/// The strongest short cycle in `tokens`: its period, and the fraction of
-/// positions that repeat at that period.
+/// One reading of the repetition control: `matches` of `samples` positions
+/// from `start` on repeat the token `period` positions before them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Cycle {
+    start: usize,
+    period: usize,
+    matches: usize,
+    samples: usize,
+}
+
+impl Cycle {
+    /// The fraction of positions that repeat. Zero when nothing was read.
+    fn fraction(&self) -> f64 {
+        if self.samples == 0 {
+            return 0.0;
+        }
+        self.matches as f64 / self.samples as f64
+    }
+}
+
+/// The strongest short cycle in `tokens`.
 ///
 /// A stream stuck in a loop matches itself at the loop's period, and two arms in
 /// the same loop agree perfectly — so the equivalence oracle says nothing
 /// exactly when this is high. It covers every period up to [`MAX_CYCLE_PERIOD`],
 /// because a collapse that starts at token 20 and a two-token `A B A B` cycle are
 /// both degeneracies a leading-run measure scores at zero.
-fn strongest_cycle(tokens: &[u32]) -> (usize, f64) {
-    let mut worst = (1usize, 0.0f64);
+fn strongest_cycle(tokens: &[u32]) -> Cycle {
+    let mut worst = Cycle {
+        start: 0,
+        period: 1,
+        matches: 0,
+        samples: 0,
+    };
     for period in 1..=MAX_CYCLE_PERIOD.min(tokens.len().saturating_sub(MIN_CYCLE_SAMPLES)) {
-        let samples = tokens.len() - period;
-        let matches = tokens[period..]
-            .iter()
-            .zip(tokens)
-            .filter(|(a, b)| a == b)
-            .count();
-        let fraction = matches as f64 / samples as f64;
-        if fraction > worst.1 {
-            worst = (period, fraction);
+        let cycle = Cycle {
+            start: 0,
+            period,
+            matches: tokens[period..]
+                .iter()
+                .zip(tokens)
+                .filter(|(a, b)| a == b)
+                .count(),
+            samples: tokens.len() - period,
+        };
+        if cycle.fraction() > worst.fraction() {
+            worst = cycle;
         }
     }
     worst
 }
 
-/// The strongest short cycle in `tokens` or in any tail cut of it: where it
-/// starts, its period, and the fraction of that window repeating at it.
+/// The strongest short cycle in `tokens` or in any tail cut of it.
 ///
 /// Over the whole stream a collapse confined to the last two fifths reads
 /// 0.3992 — under the ceiling, because the healthy majority dilutes it. The
 /// same cuts `weakest_tail` uses give it a window it fills.
-fn strongest_windowed_cycle(tokens: &[u32]) -> (usize, usize, f64) {
+fn strongest_windowed_cycle(tokens: &[u32]) -> Cycle {
     let starts =
         std::iter::once(0).chain((1..TAIL_WINDOWS).map(|n| tokens.len() * n / TAIL_WINDOWS));
-    let mut worst = (0usize, 1usize, 0.0f64);
+    let mut worst = strongest_cycle(&[]);
     for start in starts {
-        let (period, fraction) = strongest_cycle(&tokens[start..]);
-        if fraction > worst.2 {
-            worst = (start, period, fraction);
+        let cycle = strongest_cycle(&tokens[start..]);
+        if cycle.fraction() > worst.fraction() {
+            worst = Cycle { start, ..cycle };
         }
     }
     worst
+}
+
+/// How far the speculative arm's reading sits above the reference arm's, in
+/// standard errors of the difference between two proportions.
+///
+/// Infinite when the reference arm gave no reading: there is no control to
+/// read the speculative arm against. [`judge`] calls it for a speculative arm
+/// above [`MAX_CYCLE_FRACTION`] and a reference arm at or under it, so the
+/// pooled proportion is strictly between 0 and 1.
+fn cycle_excess(spec: Cycle, plain: Cycle) -> f64 {
+    if plain.samples == 0 {
+        return f64::INFINITY;
+    }
+    let (n, m) = (spec.samples as f64, plain.samples as f64);
+    let pooled = (spec.matches + plain.matches) as f64 / (n + m);
+    let standard_error = (pooled * (1.0 - pooled) * (1.0 / n + 1.0 / m)).sqrt();
+    (spec.fraction() - plain.fraction()) / standard_error
 }
 
 /// The weakest agreement over the tail windows, and where it was found.
@@ -534,23 +610,32 @@ fn judge(
 
     // The controls first. A degenerate arm is a more specific verdict than a
     // short one, and a collapse can be what cut the run short.
-    let (plain_from, plain_period, plain_cycle) = strongest_windowed_cycle(plain);
-    if plain_cycle > MAX_CYCLE_FRACTION {
+    let plain_cycle = strongest_windowed_cycle(plain);
+    if plain_cycle.fraction() > MAX_CYCLE_FRACTION {
         return Verdict::Unjudgeable(format!(
-            "the reference arm repeats at period {plain_period} across {plain_cycle:.4} of \
-             its tokens from {plain_from} on (ceiling {MAX_CYCLE_FRACTION}) — plain greedy \
-             is the control here, so this says the prompt did not come back as prose the \
-             control can read"
+            "the reference arm repeats at period {} across {:.4} of its tokens from {} on \
+             (ceiling {MAX_CYCLE_FRACTION}) — plain greedy is the control here, so this says \
+             the prompt did not come back as prose the control can read",
+            plain_cycle.period,
+            plain_cycle.fraction(),
+            plain_cycle.start
         ));
     }
-    let (spec_from, spec_period, spec_cycle) = strongest_windowed_cycle(spec);
-    if spec_cycle > MAX_CYCLE_FRACTION {
-        return Verdict::Refused(format!(
-            "the speculative arm repeats at period {spec_period} across {spec_cycle:.4} of \
-             its tokens from {spec_from} on (ceiling {MAX_CYCLE_FRACTION}) while the \
-             reference arm reads {plain_cycle:.4} — it has collapsed into a repetition \
-             loop the verifier does not produce on its own"
-        ));
+    let spec_cycle = strongest_windowed_cycle(spec);
+    if spec_cycle.fraction() > MAX_CYCLE_FRACTION {
+        let excess = cycle_excess(spec_cycle, plain_cycle);
+        if excess > MIN_CYCLE_EXCESS {
+            return Verdict::Refused(format!(
+                "the speculative arm repeats at period {} across {:.4} of its tokens from {} \
+                 on (ceiling {MAX_CYCLE_FRACTION}) while the reference arm reads {:.4}, \
+                 {excess:.2} standard errors under it (floor {MIN_CYCLE_EXCESS}) — it has \
+                 collapsed into a repetition loop the verifier does not produce on its own",
+                spec_cycle.period,
+                spec_cycle.fraction(),
+                spec_cycle.start,
+                plain_cycle.fraction()
+            ));
+        }
     }
 
     if longer < MIN_ANSWER_TOKENS {
@@ -1045,16 +1130,27 @@ const MEASURED_PLAIN_ARM: [u32; 256] = [
 /// does alone has not collapsed.
 #[test]
 fn a_healthy_arm_that_repeats_no_more_than_its_reference_is_not_a_collapse() {
-    let (from, period, fraction) = strongest_windowed_cycle(&MEASURED_SPEC_ARM);
-    assert_eq!((from, period), (192, 25), "where the measured arm repeats");
+    let spec = strongest_windowed_cycle(&MEASURED_SPEC_ARM);
+    let plain = strongest_windowed_cycle(&MEASURED_PLAIN_ARM);
+    let read = |start, matches| Cycle {
+        start,
+        period: 25,
+        matches,
+        samples: 39,
+    };
+    assert_eq!(spec, read(192, 9), "where the measured arm repeats");
+    assert_eq!(plain, read(192, 5), "where its reference arm repeats");
     assert!(
-        fraction > MAX_CYCLE_FRACTION,
-        "the measured arm reads {fraction:.4}, at or under the ceiling, so this \
-         fixture no longer holds the case it was recorded for"
+        spec.fraction() > MAX_CYCLE_FRACTION && plain.fraction() <= MAX_CYCLE_FRACTION,
+        "the fixture must hold a speculative arm above the ceiling and a reference \
+         arm the control can read: {:.4} and {:.4}",
+        spec.fraction(),
+        plain.fraction()
     );
+    let excess = cycle_excess(spec, plain);
     assert!(
-        strongest_windowed_cycle(&MEASURED_PLAIN_ARM).2 <= MAX_CYCLE_FRACTION,
-        "the measured reference arm must be one the control can read"
+        (excess - 1.1802).abs() < 1e-4,
+        "the measured pair reads {excess:.4} standard errors, not the recorded 1.1802"
     );
     assert_eq!(
         judge(&MEASURED_SPEC_ARM, &MEASURED_PLAIN_ARM, &[], None),
@@ -1093,6 +1189,11 @@ fn the_measured_arms_exchanged_are_an_input_the_gate_cannot_judge() {
 #[test]
 fn a_collapsed_arm_is_refused_when_the_reference_gives_no_reading() {
     let plain = Rng(0xC0DE).prose(MIN_CYCLE_SAMPLES);
+    assert_eq!(
+        strongest_windowed_cycle(&plain).samples,
+        0,
+        "the reference arm must be too short to read"
+    );
     let failure = judge(&quarter_collapse(0x55, 8), &plain, &[], None)
         .refusal()
         .expect("a collapsed arm must be refused when there is no reference reading");
@@ -1114,15 +1215,25 @@ fn a_collapsed_arm_is_refused_when_the_reference_gives_no_reading() {
 fn a_speculative_arm_in_a_ragged_loop_is_refused_against_a_healthy_reference() {
     /// Raggedness, in per cent, of the first pair the control admits.
     const FIRST_ADMITTED: u64 = 58;
+    /// The lowest [`cycle_excess`] of a speculative arm above the ceiling.
+    /// [`MIN_CYCLE_EXCESS`] must stay under it, or the bound admits a pair of
+    /// this sweep that the ceiling refuses.
+    const LOWEST_EXCESS_ABOVE_THE_CEILING: f64 = 2.2913;
 
     let head = Rng(0xFEED).prose(N_TOKENS / 2);
     let mut first_admitted = None;
+    let mut lowest_excess = f64::INFINITY;
     for noise in (0..=100).step_by(2) {
         for seed in [0x33u64, 0x91, 0xB3, 0xD5] {
             for reference_seed in [0x44u64, 0xA7, 0xC1, 0xE9] {
                 let spec = ragged_loop_arm(seed, noise);
                 let mut plain = head.clone();
                 plain.extend(Rng(reference_seed).prose(N_TOKENS / 2));
+                let spec_cycle = strongest_windowed_cycle(&spec);
+                if spec_cycle.fraction() > MAX_CYCLE_FRACTION {
+                    lowest_excess = lowest_excess
+                        .min(cycle_excess(spec_cycle, strongest_windowed_cycle(&plain)));
+                }
                 match judge(&spec, &plain, &[], None) {
                     Verdict::Agreed => first_admitted = first_admitted.or(Some(noise)),
                     Verdict::Refused(why) => {
@@ -1141,6 +1252,12 @@ fn a_speculative_arm_in_a_ragged_loop_is_refused_against_a_healthy_reference() {
         "the control admits its first pair at {first_admitted:?}% raggedness, not the \
          recorded {FIRST_ADMITTED}%"
     );
+    assert!(
+        (lowest_excess - LOWEST_EXCESS_ABOVE_THE_CEILING).abs() < 1e-4,
+        "the lowest excess of an arm above the ceiling is {lowest_excess:.4}, not the \
+         recorded {LOWEST_EXCESS_ABOVE_THE_CEILING}"
+    );
+    const { assert!(MIN_CYCLE_EXCESS < LOWEST_EXCESS_ABOVE_THE_CEILING) }
 }
 
 /// A prompt neither arm answered is not a failure of the round loop, and a
@@ -1197,7 +1314,7 @@ fn structured_output_trips_the_control_which_is_why_the_prompts_forbid_it() {
         ),
         ("a numbered list", numbered[..N_TOKENS].to_vec()),
     ] {
-        let (_, _, fraction) = strongest_windowed_cycle(&stream);
+        let fraction = strongest_windowed_cycle(&stream).fraction();
         assert!(
             fraction > MAX_CYCLE_FRACTION,
             "{shape} reads {fraction:.4}, at or under the ceiling — if structured \
@@ -1215,11 +1332,14 @@ fn prose_clears_the_control_at_every_length_the_gate_can_hand_it() {
     for len in [MIN_ANSWER_TOKENS, 200, 218, 256] {
         for seed in 0..64u64 {
             let stream = Rng(0x1234_0000 + seed).prose(len);
-            let (start, period, fraction) = strongest_windowed_cycle(&stream);
+            let cycle = strongest_windowed_cycle(&stream);
+            let fraction = cycle.fraction();
             assert!(
                 fraction <= MAX_CYCLE_FRACTION,
                 "healthy prose of {len} tokens (seed {seed}) read {fraction:.4} at \
-                 period {period} from {start}"
+                 period {} from {}",
+                cycle.period,
+                cycle.start
             );
             worst = worst.max(fraction);
         }
@@ -1227,8 +1347,7 @@ fn prose_clears_the_control_at_every_length_the_gate_can_hand_it() {
     assert!(
         worst * 1.5 < MAX_CYCLE_FRACTION,
         "the margin over healthy prose has fallen to {worst:.4} against a ceiling \
-         of {MAX_CYCLE_FRACTION}; the real arms measure 0.05 to 0.10 and the \
-         1000-stream sweep peaks at 0.1351"
+         of {MAX_CYCLE_FRACTION}; the 1000-stream sweep peaks at 0.1351"
     );
 }
 
@@ -1250,7 +1369,7 @@ fn a_cycle_too_short_a_window_to_evidence_is_not_read() {
     let mut coincidence: Vec<u32> = (0..64).collect();
     coincidence[63] = 0;
     assert_eq!(
-        strongest_cycle(&coincidence).1,
+        strongest_cycle(&coincidence).fraction(),
         0.0,
         "a reading from a single comparison must not be taken"
     );
@@ -1258,7 +1377,7 @@ fn a_cycle_too_short_a_window_to_evidence_is_not_read() {
     // An exact period of 10 in 40 tokens: 30 comparisons, under the floor.
     let short_window: Vec<u32> = (0..40u32).map(|i| i % 10).collect();
     assert_eq!(
-        strongest_cycle(&short_window).1,
+        strongest_cycle(&short_window).fraction(),
         0.0,
         "a reading from fewer than the sample floor must not be taken"
     );
@@ -1268,13 +1387,13 @@ fn a_cycle_too_short_a_window_to_evidence_is_not_read() {
     // to score it 0.0000 — the case that showed the bound cost real detection.
     let long_period: Vec<u32> = (0..200u32).map(|i| i % 60).collect();
     assert!(
-        strongest_cycle(&long_period).1 > MAX_CYCLE_FRACTION,
+        strongest_cycle(&long_period).fraction() > MAX_CYCLE_FRACTION,
         "an exact period-60 cycle over 140 comparisons must be read, not bounded away"
     );
 
     let supported: Vec<u32> = (0..N_TOKENS as u32).map(|i| i % 10).collect();
     assert!(
-        strongest_cycle(&supported).1 > MAX_CYCLE_FRACTION,
+        strongest_cycle(&supported).fraction() > MAX_CYCLE_FRACTION,
         "an exact cycle a full window supports must still be caught"
     );
 }
@@ -1302,7 +1421,7 @@ fn the_false_positive_rate_on_healthy_output() {
         let mut trips = 0u32;
         let mut worst = 0.0f64;
         for seed in 0..TRIALS {
-            let f = strongest_windowed_cycle(&Rng(0x9E37_0000 + seed).prose(len)).2;
+            let f = strongest_windowed_cycle(&Rng(0x9E37_0000 + seed).prose(len)).fraction();
             worst = worst.max(f);
             if f > MAX_CYCLE_FRACTION {
                 trips += 1;
@@ -1325,7 +1444,10 @@ fn the_false_positive_rate_on_healthy_output() {
 /// It refuses every pair up to [`FIRST_ADMITTED`]% raggedness, and past that the
 /// arms are more noise than loop and it admits them. **The tail measure does not
 /// take over there**: what the control admits agrees up to
-/// [`WORST_ADMITTED_TAIL`], twice the worst reading a correct pair reached. That
+/// [`WORST_ADMITTED_TAIL`], more than twice the worst reading a correct pair
+/// reached. Two arms in one loop read alike, so the speculative arm is seldom
+/// [`MIN_CYCLE_EXCESS`] above the reference arm, and the reference arm's own
+/// reading against the ceiling is what refuses the pair. That
 /// is the "no subsequence floor" claim as a measurement rather than an
 /// assertion, and it is why [`WORST_CORRECT_TAIL_AGREEMENT`] is a recorded
 /// figure and not a threshold.
@@ -1339,9 +1461,9 @@ fn the_false_positive_rate_on_healthy_output() {
 #[test]
 fn two_arms_in_the_same_ragged_loop_are_refused_until_they_are_no_longer_one_loop() {
     /// Raggedness, in per cent, of the first pair the control admits.
-    const FIRST_ADMITTED: u64 = 60;
+    const FIRST_ADMITTED: u64 = 56;
     /// The best tail agreement any admitted pair reached.
-    const WORST_ADMITTED_TAIL: f64 = 0.2188;
+    const WORST_ADMITTED_TAIL: f64 = 0.2500;
 
     let mut worst_admitted = 0.0f64;
     let mut first_admitted = None;
@@ -1446,7 +1568,7 @@ fn a_speculative_arm_collapsing_over_its_last_quarter_is_refused_by_the_control(
                 panic!(
                     "period {period}: an arm collapsing over its last quarter passed: \
                      cycle {:.4}",
-                    strongest_windowed_cycle(&spec).2,
+                    strongest_windowed_cycle(&spec).fraction(),
                 )
             });
         assert!(
@@ -1474,20 +1596,22 @@ fn a_cycle_confined_to_a_window_too_narrow_to_read_it_is_a_declared_blind_spot()
         "the bound the blind spot is stated in terms of"
     );
 
-    let (start, _, inside) = strongest_windowed_cycle(&quarter_collapse(0x55, readable));
+    let cycle = strongest_windowed_cycle(&quarter_collapse(0x55, readable));
+    let inside = cycle.fraction();
     assert!(
-        inside > MAX_CYCLE_FRACTION && start == N_TOKENS * 3 / 4,
+        inside > MAX_CYCLE_FRACTION && cycle.start == N_TOKENS * 3 / 4,
         "a period the last window can evidence must be read in that window; \
-         it read {inside:.4} from {start}"
+         it read {inside:.4} from {}",
+        cycle.start
     );
 
-    let caught = strongest_windowed_cycle(&quarter_collapse(0x55, 40)).2;
+    let caught = strongest_windowed_cycle(&quarter_collapse(0x55, 40)).fraction();
     assert!(
         caught > MAX_CYCLE_FRACTION,
         "a period-40 last-quarter collapse reads {caught:.4} from a wider window \
          and must still be caught"
     );
-    let missed = strongest_windowed_cycle(&quarter_collapse(0x55, 48)).2;
+    let missed = strongest_windowed_cycle(&quarter_collapse(0x55, 48)).fraction();
     assert!(
         missed <= MAX_CYCLE_FRACTION,
         "a period-48 last-quarter collapse reads {missed:.4} and is caught; the \
@@ -1506,7 +1630,7 @@ fn a_cycle_confined_to_a_window_too_narrow_to_read_it_is_a_declared_blind_spot()
         });
     }
     assert!(
-        strongest_windowed_cycle(&wide).2 > MAX_CYCLE_FRACTION,
+        strongest_windowed_cycle(&wide).fraction() > MAX_CYCLE_FRACTION,
         "the same period over four fifths of the arm must still be caught"
     );
 }
@@ -2171,9 +2295,9 @@ fn declared_quant_mode(path: &Path) -> Option<String> {
 /// spans 0.37 for a ragged loop to 1.00 for an exact one — two populations
 /// overlapping over most of their range, with no threshold between them.
 ///
-/// Prose is the one regime where they separate. Asking for it is not a
-/// convenience: it is what lets [`MAX_CYCLE_FRACTION`] sit above every healthy
-/// reading measured here and below every collapse the gate has to catch.
+/// Prose is the one regime where the control can read an arm. Asking for it is
+/// not a convenience: it is what keeps the reference arm under
+/// [`MAX_CYCLE_FRACTION`], so a speculative arm has a control to be read against.
 const PROSE_INSTRUCTION: &str = "Answer at length, in continuous prose, in at least \
      six full paragraphs. Do not use lists, numbered steps, tables, headings, bullet \
      points or code blocks.";
@@ -3014,8 +3138,8 @@ fn report(
     verdict: &Verdict,
 ) {
     let (tail_start, tail_ratio) = weakest_tail(spec, plain);
-    let (spec_from, spec_period, spec_cycle) = strongest_windowed_cycle(spec);
-    let (plain_from, plain_period, plain_cycle) = strongest_windowed_cycle(plain);
+    let spec_cycle = strongest_windowed_cycle(spec);
+    let plain_cycle = strongest_windowed_cycle(plain);
     let (div, confidence) = divergence_confidence(spec, plain, margins)
         .unwrap_or((common_prefix_len(spec, plain), 0.0));
     // For a pair whose drafter names a reduced vocabulary: how much of the
@@ -3035,8 +3159,7 @@ fn report(
     eprintln!(
         "[{test}/{}] block={block} drafter={} lcs={:.4} tail={tail_ratio:.4}@{tail_start} divergence={div} \
          margin={:.4} confidence={confidence:.4}{outside} \
-         cycle spec={spec_cycle:.4}/p{spec_period}@{spec_from} \
-         plain={plain_cycle:.4}/p{plain_period}@{plain_from} spec={} plain={}\n  \
+         cycle spec={:.4}/p{}@{} plain={:.4}/p{}@{} excess={:.2} spec={} plain={}\n  \
          verdict = {verdict:?}\n  spec  = {:?}\n  plain = {:?}",
         prompt.name,
         drafter
@@ -3045,6 +3168,13 @@ fn report(
             .to_string_lossy(),
         lcs_ratio(spec, plain),
         margins.get(div).copied().unwrap_or(f32::NAN),
+        spec_cycle.fraction(),
+        spec_cycle.period,
+        spec_cycle.start,
+        plain_cycle.fraction(),
+        plain_cycle.period,
+        plain_cycle.start,
+        cycle_excess(spec_cycle, plain_cycle),
         spec.len(),
         plain.len(),
         tk.decode(spec, false).unwrap_or_default(),

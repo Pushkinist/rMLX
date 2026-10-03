@@ -133,18 +133,47 @@ it to show that the two populations overlap.
 ## The second oracle: the repetition control
 
 The first oracle has nothing to read when both arms are degenerate: there is no
-healthy reference whose margins mean anything. So every run also checks that
-neither arm repeats at a short period across more than `MAX_CYCLE_FRACTION`
-(0.20) of its tokens. It checks the whole stream and each of the
-`TAIL_WINDOWS` (4) tail cuts, at every period up to `MAX_CYCLE_PERIOD` (64)
-that leaves `MIN_CYCLE_SAMPLES` (32) comparisons.
+healthy reference whose margins mean anything. So every run also reads how
+much of each arm repeats at a short period. It reads the whole stream and each
+of the `TAIL_WINDOWS` (4) tail cuts, at every period up to `MAX_CYCLE_PERIOD`
+(64) that leaves `MIN_CYCLE_SAMPLES` (32) comparisons.
 
-The ceiling holds only for prose. Healthy structured output, such as a
-markdown table, overlaps ragged loops on this measure, which is why the
-prompts ask for prose. The upper side is swept, not sampled: two arms in one
-period-8 loop are walked from 0% to 100% raggedness, and the control refuses
-every pair up to 60%. Past that the arms are more noise than loop, and nothing
-takes over.
+The control has two constants:
+
+- `MAX_CYCLE_FRACTION` (0.20) is the ceiling. A reference arm above it is
+  unjudgeable.
+- `MIN_CYCLE_EXCESS` (2.0) is how far a speculative arm above the ceiling
+  must read above the reference arm before it is refused. The unit is the
+  standard error of the difference between the two readings
+  (`cycle_excess`), so the rule carries the sample count of each reading.
+
+The ceiling alone does not separate healthy prose from a ragged loop. An
+answer about one subject repeats that subject, in both arms. A healthy arm of
+a correct engine reads 0.2308 from 39 comparisons in its last window, where
+its reference arm reads 0.1282 at the same period. A period-8 loop at 58%
+raggedness can read 0.20. So the reference arm is the control for how much a
+prompt repeats: the measured pair reads 1.18 standard errors and passes.
+`a_healthy_arm_that_repeats_no_more_than_its_reference_is_not_a_collapse`
+holds both arms as a fixture, and the same speculative arm with a loop over
+its last window is the negative control.
+
+Both sides of `MIN_CYCLE_EXCESS` are measured. A looping arm against a healthy
+reference arm is walked from 0% to 100% raggedness
+(`a_speculative_arm_in_a_ragged_loop_is_refused_against_a_healthy_reference`).
+The lowest excess of an arm above the ceiling there is 2.29, so the bound
+admits no arm of that sweep, and the control refuses every pair under 58%. The
+lower side is the one measured pair.
+
+The bound follows the reference arm, and that is its limit. A speculative arm
+in a ragged loop is admitted when the reference arm reads near the ceiling
+too. Two arms in one loop are such a pair. Only the reference arm's own
+reading refuses them: walked from 0% to 100% raggedness, the control refuses
+every such pair under 56%. Past that the arms are more noise than loop, and
+nothing takes over.
+
+The control reads only prose. Healthy structured output, such as a markdown
+table, overlaps ragged loops on this measure, which is why the prompts ask for
+prose.
 
 Its declared blind spot is its own sample floor. The narrowest window is
 `len / TAIL_WINDOWS`, so at the 256-token budget it can evidence no period
@@ -156,7 +185,9 @@ pins that from both sides.
 Which arm collapsed decides the verdict. A degenerate speculative arm against
 a healthy reference is refused. A degenerate reference arm says the prompt
 did not come back as prose the control can read: it is reported as
-unjudgeable, not failed. Plain greedy is the control.
+unjudgeable, not failed. Plain greedy is the control. A reference arm too
+short to give a reading is no control, and a speculative arm above the ceiling
+is refused against it.
 
 ## Which arm is short
 
@@ -221,6 +252,8 @@ correction, the defect the pair exists to catch. Every run of the pair prints
 One limitation stands. `Rng::prose` is an i.i.d. word model with no
 autocorrelation, so it reads lower on a self-similarity measure than real
 prose. `prose_clears_the_control_at_every_length_the_gate_can_hand_it` is a
-hard gate on it and bounds `MAX_CYCLE_FRACTION` from below, so the synthetic
-headroom overstates the true headroom. The real arms are measured too, and
-the constant rests on those readings.
+hard gate on it and bounds `MAX_CYCLE_FRACTION` from below, but no synthetic
+healthy stream reaches the ceiling, and a real one does. So the healthy side
+of `MIN_CYCLE_EXCESS` rests on one measured pair, and the sweep that bounds
+its other side uses a synthetic reference arm that reads lower than a real
+one.
