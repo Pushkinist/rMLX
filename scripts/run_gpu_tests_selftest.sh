@@ -1114,7 +1114,7 @@ expect_no_out "expected 3 fields"
 tracked_at_most="$(awk -F'|' '!/^[[:space:]]*#/ && $3 ~ /<=/' "${ROOT}/scripts/gpu_validation_census.txt" | grep -c '')"
 [ "${tracked_at_most}" = "1" ] || fail "the tracked census pins ${tracked_at_most} at-most count(s), expected 1"
 tracked_instrument="$(grep -Evc '^[[:space:]]*(#|$)' "${ROOT}/scripts/gpu_instrument_only.txt")"
-[ "${tracked_instrument}" = "4" ] || fail "the tracked instrument-only pin holds ${tracked_instrument} entr(ies), expected 4"
+[ "${tracked_instrument}" = "0" ] || fail "the tracked instrument-only pin holds ${tracked_instrument} entr(ies), expected 0"
 expect_no_out "has no classified GPU test"
 expect_no_out "not found"
 

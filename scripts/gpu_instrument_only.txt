@@ -28,26 +28,11 @@
 # is not yet shown. A passing uninstrumented run is not evidence: that is the
 # state every entry here is in.
 #
-# THE QWEN3.5 ROUND LOOPS. On mlx 0.32.3, device-memory validation makes MLX's
-# `fast::scaled_dot_product_attention` (head_dim 256, bf16, additive mask, 1844
-# query rows over 3892 keys) return `inf` cells, with no diagnostic. In pure
-# MLX: `inf` on 3 of 6 validated repeats of one input, one digest on 640
-# unvalidated repeats, no non-finite cell on 640 fresh unvalidated inputs. The
-# second prefill chunk of the 4k prompt on a Qwen3.5-family verifier has that
-# shape, and each loop's plain-greedy arm then reads an all-NaN prefill. The
-# two adaptive loops were observed in that state under this runner. The block
-# loop was observed in a full run before the verdict run existed, and in the
-# same model's prefill outside the test.
-#
-# THE GEMMA-4 WRAPPED MULTI-TURN CELL. Same signature on gemma-4-e4b: all-zero
-# tokens under device-memory validation on mlx 0.32.3 (3 of 3 runs, `allow`
-# mode included), no diagnostic, a pass with that instrumentation off and with
-# none (2 of 2), a pass under full validation on mlx 0.31.2 and 0.32.1. The
-# kernel is NOT localized and there is no reproduction outside rMLX; that work
-# is in progress. Until it lands this entry rests on the signature alone.
+# NO ENTRY NOW. The four tests this file named reached MLX 0.32.3's
+# head-dim-split attention kernel with unaligned query and key rows, where the
+# instrumented compile of that kernel returns `inf` rows. No attention call
+# reaches MLX in that configuration any more (docs/FFI.md,
+# "scaled_dot_product_attention"), and each of the four passes under the
+# instrument.
 #
 # crate | test | reference
-rmlx-models | the_adaptive_round_loop_reproduces_plain_greedy | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/638
-rmlx-models | the_adaptive_round_loop_reproduces_plain_greedy_over_its_whole_schedule | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/638
-rmlx-models | the_block_round_loop_reproduces_plain_greedy | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/638
-rmlx-models | gemma4_b1_swa_snapshot_restore_multiturn_token_identical | kernel not localized, localization in progress: docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/638

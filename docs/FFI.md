@@ -498,6 +498,27 @@ Wraps `mlx_fast_scaled_dot_product_attention`. `q`, `k`, `v` are
 
 `sinks` is always the null sentinel.
 
+One function, `sdpa_under`, builds every attention node, and it holds one rule
+on the query rows. On the GPU, with `"array"`, `head_dim` 256 for Q and V, and
+at least 1024 query rows that are not a multiple of 64, the node reaches MLX
+with its query rows padded with zero rows to the next multiple of 64, and the
+mask padded with zero rows to match. The padded rows are sliced off the
+output. Query rows are independent in attention, so each real row is the row
+the caller asked for.
+
+The reason is in MLX 0.32.3. Its head-dim-split kernel (`sdpa_full` at 256
+below) is compiled per call for "query rows a multiple of 64" and "key rows a
+multiple of 32". With both false and an array mask, it returns `+inf` rows
+under Metal device-memory shader validation. The cause is the instrumented
+compile of that kernel; no run without the instrument has shown the fault. The
+rule is on the query rows alone, because a call with aligned key rows was
+measured clean and a clean cell is only a bound on a rate.
+
+An affected call costs at most 63 more query rows, two `zeros`, two
+`concatenate` and one `slice`. Every other call pays the check: a decode step
+has one query row. `crates/rmlx-models/tests/prefill_attention_configuration.rs`
+holds the rule at the mlx-c call, by shape, and holds the output.
+
 It is not always a FlashAttention kernel. `head_dim` decides, silently,
 whether the call reaches a fused kernel or a composite graph.
 

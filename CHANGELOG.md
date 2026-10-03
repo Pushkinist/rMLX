@@ -49,6 +49,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A long prefill no longer returns `NaN` logits under Metal shader
+  validation on mlx 0.32.3.** MLX's attention kernel for `head_dim` 256
+  returned `+inf` rows under device-memory validation when a call had an array
+  mask, at least 1024 query rows that are not a multiple of 64, and key rows
+  that are not a multiple of 32. The last prefill chunk of a Qwen3.5 or
+  Qwen3.6 prompt has that shape. The cause is the instrumented compile of the
+  MLX kernel; no run without validation has shown the fault. rMLX now pads the
+  query rows of such a call to the next multiple of 64 and drops the padded
+  rows from the output. Generated tokens are unchanged.
+
 - **A model loaded on one thread no longer fails on another.** On MLX 0.32 an
   on-demand load (unload, then a request) failed its first request with
   `There is no Stream(cpu, N) in current thread`, and so did an image request

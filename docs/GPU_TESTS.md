@@ -399,21 +399,20 @@ per input and output dtype, is the attribution.
 The instrumentation can change what a kernel computes, so an instrumented run
 is a scan and not a verdict. Measured on mlx 0.32.3, in pure MLX with no rMLX
 code: MLX's `fast::scaled_dot_product_attention` at `head_dim` 256, bf16, with
-an additive mask, 1844 query rows over 3892 keys.
+an array mask, at least 1024 query rows, query rows that are not a multiple of
+64 and key rows that are not a multiple of 32.
 
-- With device-memory validation on, it returned `inf` cells on 3 of 6 repeats
-  of one input, in other heads each time, and the layer printed no diagnostic.
-- With no instrumentation, 640 repeats of fixed inputs returned one digest per
-  input, and 640 fresh inputs returned no non-finite cell.
+- With device-memory validation on, it returned `inf` cells on 2 of 16 to 11 of
+  24 repeats of one input, by shape, and the layer printed no diagnostic.
+- With no instrumentation, no repeat returned a non-finite cell.
+- With one of the two row counts aligned, no repeat failed.
+- The cause is the instrumented compile of the kernel, not the kernel source.
 - mlx 0.31.2 and 0.32.1 do not show it.
 
-The second prefill chunk of a Qwen3.5-family model has that shape. So the
-three `spec_greedy_equivalence` loops over that family read an all-`NaN`
-prefill under validation and pass without it. The wrapped multi-turn cell of
-gemma-4-e4b, `gemma4_b1_swa_snapshot_restore_multiturn_token_identical`, has
-the same signature: all-zero tokens under device-memory validation on mlx
-0.32.3, no diagnostic, a pass with that instrumentation off, and a pass under
-full validation on mlx 0.31.2 and 0.32.1. Its kernel was not localized.
+rMLX no longer sends MLX a call in that configuration (`FFI.md`,
+"`scaled_dot_product_attention`"), so no test fails for this reason, and
+`scripts/gpu_instrument_only.txt` has no entry. The rule that follows stays,
+because another kernel can behave the same way.
 
 After the instrumented runs of a crate, the runner runs its selected tests
 once more with no `MTL_*` or `METAL_*` variable:
@@ -453,7 +452,7 @@ of another test on the same kernel.
 
 Each rule is a case under `THE VERDICT` in
 `scripts/run_gpu_tests_selftest.sh`, and one case holds the tracked pin to
-four entries.
+no entry.
 
 ### Threadgroup-memory validation: on for rMLX's kernels, off for MLX's
 
