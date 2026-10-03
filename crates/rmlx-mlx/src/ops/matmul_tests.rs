@@ -463,22 +463,29 @@ const VECTOR_KERNEL_ROWS: i32 = 2;
 /// for bit.
 ///
 /// That a view's tile really reads its parent's tail rows is not asserted
-/// here. On an MLX whose loader reads past the weight (every release before
-/// 0.32.3) the evidence is the shader-validation census, where the fresh arm
-/// reports 4 loads per mode and the view arms none.
+/// here. `QuantizedBlockLoader::load_safe` bounds the row index of a transposed
+/// weight against the tile's column extent in MLX 0.31.2, 0.32.1 and 0.32.2,
+/// so there the loader reads past the weight, the fresh arm reports 4 loads
+/// per mode in the shader-validation census, and the view arms report none.
+/// MLX 0.32.3 bounds it against the row extent, and nothing is read past the
+/// weight or reported.
 ///
-/// **How the test knows the product ran on split-K.** MLX gives a transposed,
-/// unbatched quantized product to its vector kernel below a row count that
-/// depends on the GPU, and to `qmm_t_splitk` at or above it
-/// (`QuantizedMatmul::eval_gpu`, `M >= vector_limit`). mlx-c reports neither
-/// the limit nor the kernel. The two kernels sum in a different order, so the
-/// test multiplies the same rows two more ways: in batches of
-/// [`VECTOR_KERNEL_ROWS`], which every GPU runs on the vector kernel, and four
-/// rows as one batch, also below every limit. The four-row batch must equal
-/// its two-row batches bit for bit, which shows the vector kernel does not
-/// depend on the batch height. The full batch must then differ from its
-/// two-row batches, or the product did not leave the vector kernel and the
-/// tail arms below prove nothing about split-K.
+/// **How the test knows the product left the vector kernel.** MLX gives a
+/// transposed, unbatched quantized product to its vector kernel below a row
+/// count that depends on the GPU (`QuantizedMatmul::eval_gpu`,
+/// `M >= vector_limit`). mlx-c reports neither the limit nor the kernel. A
+/// tiled kernel sums in a different order, so the test multiplies the same
+/// rows two more ways: in batches of [`VECTOR_KERNEL_ROWS`], which every GPU
+/// runs on the vector kernel, and four rows as one batch, also below every
+/// limit. The four-row batch must equal its two-row batches bit for bit, which
+/// shows the vector kernel gives one answer at those two heights. The full
+/// batch must then differ from its two-row batches, or the product did not
+/// leave the vector kernel and the tail arms below prove nothing.
+///
+/// The check does not name the kernel the product went to. That it is
+/// `qmm_t_splitk` is read from MLX's source for this shape, and from the census
+/// on an MLX where the tail load is reported. A vector kernel that changed its
+/// order above four rows would pass the check too.
 ///
 /// The printed digest is the fresh arm's output; comparing it between a run
 /// under `make gpu-test` and one without shader validation says whether the
@@ -538,12 +545,14 @@ fn split_k_tail_row_reads_never_reach_the_output() {
             .zip(vector.chunks_exact(2))
             .filter(|(a, b)| a != b)
             .count();
-        println!("split-k reach {mode} gs={group_size} b={bits}: {moved} of {m} rows differ");
+        println!(
+            "left the vector kernel {mode} gs={group_size} b={bits}: {moved} of {m} rows differ"
+        );
         assert!(
             moved > 0,
             "{mode} b{bits}: {m} rows as one batch equal the same rows in batches of \
-             {VECTOR_KERNEL_ROWS} bit for bit, so the product ran on the vector kernel \
-             and this test did not reach split-K"
+             {VECTOR_KERNEL_ROWS} bit for bit, so the product did not leave the vector \
+             kernel and this test reached no tiled kernel"
         );
         for repeat in 1..4 {
             assert_eq!(

@@ -279,13 +279,21 @@ const FORWARD_REFERENCE: &str = concat!(
 /// the_forward_reproduces`, the same figures on 0.32.1 / mlx-c 0.6.0_4 and on
 /// 0.32.3 / mlx-c 0.7.0: of 40960 cells, 6827 are equal, 39579 are within 1/32,
 /// 40843 within 1/16, 40959 within 1/8, and the last one differs by 0.171875.
-/// That is rounding spread over five cells in six, not one wrong cell.
+/// That is rounding spread over five cells in six, not one wrong cell. The
+/// test holds the shape as well as the maximum: at most [`FORWARD_OVER_EIGHTH`]
+/// cells above 1/8 (measured 1) and at most [`FORWARD_OVER_SIXTEENTH`] above
+/// 1/16 (measured 117), so a change that moves every cell by less than the
+/// bound does not pass.
 ///
 /// An algebraic change is two orders of magnitude away. With the conditioning
 /// norm removed the largest difference is 21.8, with the layers run in reverse
 /// order 27.75, with the first layer skipped 33.4, and in each case more than
 /// 36000 cells differ by more than 1/4.
 const FORWARD_TOL: f32 = 0.25;
+/// Cells allowed above 1/8; eight times the one measured.
+const FORWARD_OVER_EIGHTH: usize = 8;
+/// Cells allowed above 1/16; 1 % of the 40960, against 117 measured.
+const FORWARD_OVER_SIXTEENTH: usize = 409;
 
 /// The inputs the reference was run over: `count` values from an integer
 /// recurrence, so nothing but the reference's answer has to be committed.
@@ -405,6 +413,15 @@ fn the_forward_reproduces_the_reference_on_the_published_weights() {
     assert!(
         diff <= FORWARD_TOL,
         "the forward differs from the reference by {diff} on the published weights"
+    );
+    let over = |bound: f32| diffs.len() - upto(bound);
+    assert!(
+        over(0.125) <= FORWARD_OVER_EIGHTH && over(0.062_5) <= FORWARD_OVER_SIXTEENTH,
+        "the forward differs from the reference in too many cells: {} above 1/8 and {} \
+         above 1/16 of {}",
+        over(0.125),
+        over(0.062_5),
+        diffs.len()
     );
 }
 

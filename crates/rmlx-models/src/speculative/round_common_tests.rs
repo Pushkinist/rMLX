@@ -777,15 +777,19 @@ fn tape_replay_run(
 /// a_round_tape_refolds` on MLX 0.32.3 / mlx-c 0.7.0, the dense hybrid reads
 /// 0.010378, 0.014533, 0.015036 and 0.014971 at two to five tokens.
 ///
-/// A round taken as a forward per token also has an exact answer: the refold
-/// is the state the first `kept` of those forwards left, bit for bit. A refold
-/// that is exact against its own forwards agrees with the replay to the
-/// disagreement at that prefix, to the last digit.
+/// For a round taken as a forward per token the bound is derived: the refold
+/// is the state the first `kept` of those forwards left, bit for bit, so its
+/// distance from the replay is the disagreement at that prefix, to the last
+/// digit. For a round taken as one verify forward the bound is empirical. The
+/// tested quantity is a prefix of a five-row forward against a forward of
+/// `kept` rows, which the run does not measure on its own, and the measured
+/// disagreement is used as its scale. On the mixture it reads up to 0.0369
+/// against a bound of 0.0450.
 ///
 /// The control is what gives the comparison power: the same refold against the
 /// replay one token short of the accepted length, which is where a refold that
-/// folded the wrong number of positions would sit. It reads about 0.5 against a
-/// refold-to-replay agreement of at most a few percent.
+/// folded the wrong number of positions would sit. It reads 0.53 to 0.76
+/// against a refold-to-replay agreement of at most a few percent.
 #[test]
 #[ignore = "requires Metal GPU context and a 27B snapshot"]
 #[allow(
@@ -865,7 +869,11 @@ fn a_round_tape_refolds_to_what_the_replay_produced() {
                 );
                 if stepped_round {
                     assert!(
-                        refolded == *stepped_states.get(kept - 1).expect("stepped state"),
+                        refolded.iter().map(|x| x.to_bits()).eq(stepped_states
+                            .get(kept - 1)
+                            .expect("stepped state")
+                            .iter()
+                            .map(|x| x.to_bits())),
                         "{model}, {shape} at kept={kept}: the refold is not the state \
                          the first {kept} forwards of the round left"
                     );
