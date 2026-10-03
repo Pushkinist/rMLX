@@ -1100,11 +1100,11 @@ fn repetition_penalty_breaks_single_token_loop() {
 /// Decode the `[1]` index array of a selection into a token id.
 #[allow(
     clippy::indexing_slicing,
-    reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] I32 result, and sampler calls on inputs built in the same fn — all infallible by construction"
+    reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] index array, and sampler calls on inputs built in the same fn — all infallible by construction"
 )]
 #[allow(
     clippy::unwrap_used,
-    reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] I32 result, and sampler calls on inputs built in the same fn — all infallible by construction"
+    reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] index array, and sampler calls on inputs built in the same fn — all infallible by construction"
 )]
 fn token_id(a: &Array) -> u32 {
     materialise(a);
@@ -1435,11 +1435,14 @@ fn masked_greedy_paths_agree_and_stay_allowed_on_nan_rows() {
     check_masked_greedy_on_nan_rows(Device::Cpu);
 }
 
-/// The two host-side greedy paths select on the device they are given, as the
-/// device greedy path does. MLX's `argmax` can answer a `NaN` row differently
-/// on the CPU and the Metal stream, so a path that selects on another stream
-/// can choose another token. The GPU latch is process-global and one-way, so
-/// the check runs in a child process.
+/// `argmax_with_penalties` selects on the device it is given, and
+/// `apply_mask_argmax` builds its first op there, as the device greedy path
+/// does. MLX's `argmax` can answer a `NaN` row differently on the CPU and the
+/// Metal stream, so a path that selects on another stream can choose another
+/// token. The GPU latch is process-global and one-way, so the check runs in a
+/// child process. The latch refuses the first GPU op, so this test cannot see
+/// the device of the final `argmax` of `apply_mask_argmax`: a change that
+/// moves only that op to another stream passes.
 #[test]
 fn greedy_paths_select_on_the_device_they_are_given() {
     run_child("sampler::sampler_tests::greedy_paths_select_on_the_device_they_are_given_child");
@@ -2113,9 +2116,9 @@ fn near_zero_temperature_is_a_uniform_draw_over_an_exact_tie() {
 // contract on the real stream.
 //
 // `#[ignore]`d per the workspace rule for tests that reach `Device::Gpu`.
-// `make gpu-test` filters on the bare function name, and no one substring
-// selects all of these, so run them by hand with the libtest path filter
-// `sampler_tests::` (docs/GPU_TESTS.md).
+// `make gpu-test` filters on the bare function name. No substring selects only
+// these six; `make gpu-test CRATE=rmlx-models FILTER=_gpu` runs them with four
+// other `_gpu` tests of the crate.
 
 /// Metal's `argmax` must break ties to the lowest index at every width,
 /// including a width that crosses its multi-threadgroup reduction strategy.
@@ -2219,7 +2222,7 @@ const BF16_NAN: u16 = 0x7FC0;
 /// `0x4080` = 4.0, `0x40A0` = 5.0.
 #[allow(
     clippy::unwrap_used,
-    reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] I32 result, and sampler calls on inputs built in the same fn — all infallible by construction"
+    reason = "test fixture: from_bytes over 2 bytes per pattern with the matching [1, n] shape"
 )]
 fn bf16_row(patterns: &[u16]) -> Array {
     let bytes: Vec<u8> = patterns.iter().flat_map(|p| p.to_le_bytes()).collect();

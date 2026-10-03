@@ -73,7 +73,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   forbidden `+inf` a `NaN`, so on mlx 0.32.3 it could choose a token the
   grammar forbids. The penalty path now hands its row to MLX's `argmax`,
   and the constraint path replaces each forbidden logit with `-inf`. A `NaN`
-  row is still not refused at a decode step (`docs/SAMPLING.md`).
+  row is still not refused at a step of the shared decode loop
+  (`docs/SAMPLING.md`).
 - **The release tarball's binary no longer carries the builder's home
   directory.** Every dependency's panic location was compiled in as an
   absolute path under the build machine's home, user name included — 577

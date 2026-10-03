@@ -140,9 +140,9 @@ every step, whatever the seed.
 chooses ([A row with a `NaN`](#a-row-with-a-nan)). The pure-GPU `argmax` cannot
 refuse anything without an extra reduction per token. A test pins the
 asymmetry. `reject_nan_prefill` refuses a `NaN` in the first logit row of a
-generation. No step of the shared pipelined decode loop checks for one
-(laguna's own loop does), so a `NaN` row that a step of that loop produces
-reaches the selection.
+generation. Only laguna's own loop also checks each decode step. The shared
+pipelined decode loop and the own loops of BitNet, Qwen2 and Qwen3-VL-MoE do
+not, so a `NaN` row that one of their steps produces reaches the selection.
 
 ### Temperature scaling and softmax
 
