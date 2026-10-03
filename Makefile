@@ -376,7 +376,7 @@ ci-perf:         ## pre-push gate under release-perf + the serialized GPU/Metal 
 # train everyone to read a red run as noise.
 GPU_TEST_ARGS = $(GPU_HALF_ARG) $(if $(CRATE),--crate '$(CRATE)',) $(if $(FILTER),--filter '$(FILTER)',) \
 	$(if $(filter 0,$(VALIDATE)),--no-shader-validation,)
-gpu-test: claim-rmlx ## run the GPU/Metal #[ignore] tests serialized under Metal shader validation, holding the Metal claim (HALF=codec|rest, CRATE= FILTER= to narrow, VALIDATE=0 to skip instrumentation)
+gpu-test: claim-rmlx ## run the GPU/Metal #[ignore] tests serialized under Metal shader validation for the scan and uninstrumented for the verdict, holding the Metal claim (HALF=codec|rest, CRATE= FILTER= to narrow, VALIDATE=0 to skip instrumentation)
 	@bash scripts/run_gpu_tests.sh --build $(GPU_TEST_ARGS)
 	@$(CLAIM_RMLX) claim run -- bash scripts/run_gpu_tests.sh $(GPU_TEST_ARGS)
 
@@ -638,7 +638,7 @@ check-gpu-tests-ignored: ## CI gate: fail if a GPU-touching test in ANY workspac
 check-gpu-tests-ignored-fixtures: ## CI gate: the #[ignore] gate still fires on macro-generated and helper-reached GPU tests
 	@bash scripts/check_gpu_tests_ignored_fixtures.sh
 
-gpu-runner-selftest: ## CI gate: the GPU runner reports a failing test and a shader-validation hit in the same run, reports the access mix it saw, and reaches every census-pin verdict (stubbed crates, no GPU)
+gpu-runner-selftest: ## CI gate: the GPU runner reports a failing test and a shader-validation hit in the same run, reports the access mix it saw, reads the verdict from the uninstrumented run, and reaches every census-pin verdict (stubbed crates, no GPU)
 	@bash scripts/run_gpu_tests_selftest.sh
 
 check-named-skip-notices: ## CI gate: a classified GPU test that announces its own stand-down names itself, so the runner can attribute it

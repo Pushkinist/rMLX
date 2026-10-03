@@ -375,6 +375,7 @@ Invalid device store at offset 4000064, executing kernel function: "custom_kerne
   `REPORT_TO_STDERR=1` included; that one defaults to 0 and sends reports to
   Unified Logging (`man MetalValidation`).
 - **Threadgroup-memory validation is set per test.** See below.
+- **The verdict is not read from an instrumented run.** See below.
 - **The banner is asserted per crate.** A crate that never printed
   `Metal GPU Validation Enabled` ran uninstrumented and fails. This usually
   means it did not build. The one exception is a crate whose every executed
@@ -392,6 +393,47 @@ Invalid device store at offset 4000064, executing kernel function: "custom_kerne
 MLX owns the allocator and reports buffers as `<unnamed>`. The kernel function
 name, `custom_kernel_` plus the rMLX kernel name and, on mlx 0.32.x, a suffix
 per input and output dtype, is the attribution.
+
+### The verdict is the uninstrumented run
+
+The instrumentation can change what a kernel computes, so an instrumented run
+is a scan and not a verdict. Measured on mlx 0.32.3, in pure MLX with no rMLX
+code: MLX's `fast::scaled_dot_product_attention` at `head_dim` 256, bf16, with
+an additive mask, 1844 query rows over 3892 keys.
+
+- With device-memory validation on, it returned `inf` cells on 3 of 6 repeats
+  of one input, in other heads each time, and the layer printed no diagnostic.
+- With no instrumentation, 640 repeats of fixed inputs returned one digest per
+  input, and 640 fresh inputs returned no non-finite cell.
+- mlx 0.31.2 and 0.32.1 do not show it.
+
+The second prefill chunk of a Qwen3.5-family model has that shape. So the
+three `spec_greedy_equivalence` loops over that family read an all-`NaN`
+prefill under validation and pass without it. The wrapped multi-turn cell of
+gemma-4-e4b, `gemma4_b1_swa_snapshot_restore_multiturn_token_identical`, has
+the same signature: all-zero tokens under device-memory validation on mlx
+0.32.3, no diagnostic, a pass with that instrumentation off, and a pass under
+full validation on mlx 0.31.2 and 0.32.1. Its kernel was not localized.
+
+After the instrumented runs of a crate, the runner runs its selected tests
+once more with no `MTL_*` variable:
+
+- Pass, fail and the count on the final line are the uninstrumented run's.
+- Hits, the banner and the stand-down notices are read from the instrumented
+  runs.
+- A test that fails only under the instrument is not a failure. It is listed
+  under `changed under the instrument`, and the final line reads INCOMPLETE:
+  the scan of that test stopped at its failure. Its pinned counts are not
+  expected, so a hit it printed before it stopped fails as `count moved up`.
+- An instrumented run that exits non-zero and names no failing test is a
+  failure.
+- The uninstrumented run has the same coverage check as each instrumented run.
+
+Each rule is a case under `THE VERDICT` in
+`scripts/run_gpu_tests_selftest.sh`. What no case can see: a kernel defect
+that only the instrument's timing exposes reads as `changed under the
+instrument`, the same as an instrument artifact. The list is the place to
+start from.
 
 ### Threadgroup-memory validation: on for rMLX's kernels, off for MLX's
 
@@ -423,8 +465,9 @@ same-file fn it calls (followed by name), names an entry name. Comments and
 string contents are not read. Every other test runs with it off, including the
 tests of `rmlx-mlx` and `rmlx-kv-quant` that dispatch only MLX's kernels.
 
-- The runner runs each crate once per setting. Each run names its own tests and
-  skips the other setting's, so no test runs under both.
+- The runner scans each crate once per setting. Each run names its own tests
+  and skips the other setting's, so no test is scanned under both. The
+  uninstrumented run that follows names every test.
 - The report lists each crate's tests under `threadgroup validation ON (n):` or
   `OFF (n):`, and the final line counts both.
 - A classified test with no setting, a setting for a test that is not
@@ -480,8 +523,15 @@ The pin accepts two MLX kernel families, loads only:
   `implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s`,
   whose weight loader checks the output-channel bound only for 8-wide tiles.
 
-In both, each output column is computed from its own weight row and the store
-clips, so the out-of-range rows never reach the output. The tests
+It also accepts one report that is not a read of the kernel:
+`gemv_wide_bfloat16_nv5_kl32_nc0_axpby0` in
+`the_assistant_round_loop_reproduces_plain_greedy`, pinned `<=6`. The kernel
+clamps every index it forms, the reported offsets are gigabytes outside the
+buffer, and the count changes per run (6, 3, 4, 1, 4). The validated and the
+unvalidated run of the test give byte-identical round streams.
+
+In the two families, each output column is computed from its own weight row
+and the store clips, so the out-of-range rows never reach the output. The tests
 `split_k_tail_row_reads_never_reach_the_output` and
 `implicit_gemm_conv_tail_channel_reads_never_reach_the_output` in
 `crates/rmlx-mlx/src/ops/matmul_tests.rs` show it bit for bit with the tail rows
@@ -515,6 +565,14 @@ not `SKIP`. Its entries stay expected. The missing checkpoint's kernel reports
 | nothing where the expectation is positive | fail: `no longer fires: …` |
 | any store | fail: `never accepted: …` |
 | an entry whose test was not selected, or skipped | pass: `census NOT enforced in full`, naming the entry |
+| an entry whose test failed only under the instrument | pass: `census NOT enforced in full`, naming the entry |
+| a count from 0 to N against an entry pinned `<=N` | pass, printed as `<test> = at most N` |
+| above N against an entry pinned `<=N` | fail: `count moved up: … expected at most N, observed M` |
+
+A count is pinned `<=N` only when it is not reproducible: the same test gives
+another count on each run. N is the largest count the derivation runs
+observed, and the header of the pin names those runs. An exact entry beside it
+on the same kernel stays a floor.
 
 A hit in another crate than its entry names reads as `not pinned` there and
 `no longer fires` where it was pinned.
@@ -524,7 +582,7 @@ The pin file is checked as it is read. Each defect is a failure:
 | pin defect | reason reported |
 |---|---|
 | not six `\|`-separated fields | `line N: expected 6 fields — …` |
-| count not a positive integer | `line N: count '<x>' is not a positive integer` |
+| count not a positive integer, or `<=` and one | `line N: count '<x>' is not a positive integer, or '<=' and one` |
 | a kind naming a store | `line N: a store is never pinnable — …` |
 | a test that is not a classified GPU test of that crate | `line N: <crate> has no classified GPU test '<test>'` |
 | the same kernel, kind and test twice | `line N: … is pinned twice …` |

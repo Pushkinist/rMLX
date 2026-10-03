@@ -30,6 +30,11 @@
 # output the report is supposed to summarise — so a runner that exits 1 while
 # reporting the wrong half of the run still fails here.
 #
+# An instrumented run is a scan and not a verdict: the instrument can change
+# what a kernel computes. The cases under THE VERDICT hold the runner to a
+# verdict read from a run with no `MTL_*` variable, and to naming a test only
+# the instrument turned red.
+#
 # The suite is also partitioned, so a change can pay for the part of it that
 # guards what the change touched, and that partition is a gate of its own: the
 # cases under THE HALVES below hold it to a union that loses nothing, a census
@@ -54,6 +59,7 @@ REPORT=""
 MIX=""
 ARGV=""
 INVOCATIONS=""
+MTL_SEEN=""
 HALVES_OUT=""
 TG_OUT=""
 
@@ -95,8 +101,9 @@ cat "${root}/halves"
 STUB
 
     # The threadgroup setting of each classified test, stubbed the same way. A
-    # case that states no split gets every test `on`, so each crate runs once
-    # with its one canned log, as it did before the split existed; the cases
+    # case that states no split gets every test `on`, so each crate has one
+    # instrumented run and one uninstrumented run, both replaying its one
+    # canned log (`<crate>.tgunset.log` overrides the uninstrumented one); the cases
     # under THE THREADGROUP SPLIT state their own rows, and one runs the real
     # producer over a fixture tree.
     cat >"${root}/scripts/gpu_test_threadgroup.sh" <<STUB
@@ -139,6 +146,7 @@ for a in "\$@"; do
 done
 tg="\${MTL_SHADER_VALIDATION_THREADGROUP_MEMORY-unset}"
 printf 'crate=%s tg=%s args=%s\n' "\${crate}" "\${tg}" "\$*" >>"${root}/invocations"
+printf 'crate=%s tg=%s mtl=%s\n' "\${crate}" "\${tg}" "\$(env | grep -c '^MTL_')" >>"${root}/mtl_seen"
 log="${root}/logs/\${crate}.tg\${tg}.log"
 [ -f "\${log}" ] || log="${root}/logs/\${crate}.log"
 if [ ! -f "\${log}" ]; then
@@ -249,11 +257,13 @@ run_case() {
     shift
     : >"${root}/cargo_argv"
     : >"${root}/invocations"
+    : >"${root}/mtl_seen"
     OUT="$(PATH="${root}/bin:${PATH}" env -u RMLX_SKIP_GPU \
         RMLX_O_MODELS_ROOT="${WORK}" bash "${root}/scripts/run_gpu_tests.sh" "$@" 2>&1)"
     STATUS=$?
     ARGV="$(cat "${root}/cargo_argv")"
     INVOCATIONS="$(cat "${root}/invocations")"
+    MTL_SEEN="$(cat "${root}/mtl_seen")"
     REPORT="$(printf '%s\n' "${OUT}" | awk '
         /^ERROR: Metal shader validation reported invalid memory access:/ { seen = 1 }
         /^ERROR: the shader-validation census does not match the pin:/ { seen = 1 }
@@ -334,6 +344,14 @@ expect_invocation() {
     case $'\n'"${INVOCATIONS}"$'\n' in
         *$'\n'"$1"$'\n'*) ;;
         *) fail "no cargo invocation reads: $1" ;;
+    esac
+}
+
+# How many `MTL_*` variables one cargo process saw.
+expect_mtl_seen() {
+    case $'\n'"${MTL_SEEN}"$'\n' in
+        *$'\n'"$1"$'\n'*) ;;
+        *) fail "no cargo process reads: $1" ;;
     esac
 }
 
@@ -895,6 +913,57 @@ run_case "${CASE_ROOT}"
 expect_status 1
 expect_report "line 1: expected 6 fields"
 
+# An entry whose count is not reproducible carries `<=N`: any count up to the
+# bound passes and is printed as what it is, zero included.
+new_case census_at_most_accepts_a_count_under_the_bound || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+census_pin "${CASE_ROOT}" '<=6'
+census_log "${CASE_ROOT}" rmlx-kv-quant 3
+run_case "${CASE_ROOT}"
+expect_status 0
+expect_out "census matches the pin"
+expect_out "3 device load \"${CENSUS_KERNEL}\" in rmlx-kv-quant"
+expect_out "kv_gpu_alpha = at most 6"
+expect_no_out "shader validation clean"
+
+new_case census_at_most_accepts_zero_and_says_so || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+census_pin "${CASE_ROOT}" '<=6'
+census_log "${CASE_ROOT}" rmlx-kv-quant 0
+run_case "${CASE_ROOT}"
+expect_status 0
+expect_out "0 device load \"${CENSUS_KERNEL}\" in rmlx-kv-quant"
+expect_out "kv_gpu_alpha = at most 6"
+
+# The bound is a bound.
+new_case census_at_most_refuses_a_count_over_the_bound || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+census_pin "${CASE_ROOT}" '<=6'
+census_log "${CASE_ROOT}" rmlx-kv-quant 7
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "count moved up: \"${CENSUS_KERNEL}\" device load in rmlx-kv-quant — expected at most 6, observed 7"
+
+# Beside an exact entry on the same kernel, the exact count is still a floor.
+new_case census_at_most_keeps_an_exact_entry_exact || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+{
+    census_pin_line "${CASE_ROOT}" 4 kv_gpu_alpha rmlx-kv-quant
+    census_pin_line "${CASE_ROOT}" '<=2' kv_gpu_beta rmlx-kv-quant
+} | pin "${CASE_ROOT}"
+census_log "${CASE_ROOT}" rmlx-kv-quant 3 "" 2
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "count moved down: \"${CENSUS_KERNEL}\" device load in rmlx-kv-quant — expected 4, observed 3"
+
+new_case census_at_most_zero_is_refused || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+census_pin "${CASE_ROOT}" '<=0'
+census_log "${CASE_ROOT}" rmlx-kv-quant 0
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "count '<=0' is not a positive integer"
+
 new_case census_pin_with_a_bad_count_is_refused || exit 1
 classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
 pin "${CASE_ROOT}" <<PIN
@@ -1178,6 +1247,141 @@ expect_status 0
 expect_out "1 further stand-down notice(s)"
 expect_out "INCOMPLETE: 0 selected GPU test(s) stood down"
 expect_no_out "rmlx-models dflash2_loader:"
+
+# ---------------------------------------------------------------------------
+# THE VERDICT
+#
+# The instrument can change what a kernel computes, so the instrumented runs are
+# the scan and one uninstrumented run per crate is the verdict. Each case states
+# the two logs apart: `<crate>.log` is what the instrumented run replays and
+# `<crate>.tgunset.log` what the uninstrumented one does. The test paths end in
+# the classified fn name, as libtest's do: that is how a test the instrument
+# turned red is matched to its pin entries.
+
+VERDICT_GREEN='running 2 tests
+test kv::kv_gpu_alpha ... ok
+test kv::kv_gpu_beta ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s'
+VERDICT_BETA_RED='running 2 tests
+test kv::kv_gpu_alpha ... ok
+test kv::kv_gpu_beta ... FAILED
+
+failures:
+
+---- kv::kv_gpu_beta stdout ----
+thread kv::kv_gpu_beta panicked: prefill logits contain 248320 NaN cells
+
+failures:
+    kv::kv_gpu_beta
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s'
+
+# A test red under the instrument and green without it is not a failure. It is
+# named, the count on the final line is the uninstrumented run's, and the line
+# is INCOMPLETE: the scan of that test stopped at its failure.
+new_case verdict_is_the_uninstrumented_run || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+printf 'Metal GPU Validation Enabled\n%s\n' "${VERDICT_BETA_RED}" | crate_log "${CASE_ROOT}" rmlx-kv-quant 101
+printf '%s\n' "${VERDICT_GREEN}" | crate_log "${CASE_ROOT}" rmlx-kv-quant.tgunset 0
+run_case "${CASE_ROOT}"
+expect_status 0
+expect_out "changed under the instrument"
+expect_out "  rmlx-kv-quant kv::kv_gpu_beta"
+expect_out "OK: 2 GPU tests passed"
+expect_out "INCOMPLETE: 1 test(s) failed only under the instrument"
+expect_no_out "ERROR: GPU tests failed in:"
+
+# The verdict run sees no Metal variable at all, and the scan sees the pinned
+# set. An exported one in the caller's shell does not reach the verdict.
+new_case verdict_run_carries_no_metal_variable || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+printf 'Metal GPU Validation Enabled\n%s\n' "${VERDICT_GREEN}" | crate_log "${CASE_ROOT}" rmlx-kv-quant 0
+export MTL_SHADER_VALIDATION=1 MTL_CAPTURE_ENABLED=1
+run_case "${CASE_ROOT}"
+unset MTL_SHADER_VALIDATION MTL_CAPTURE_ENABLED
+expect_status 0
+expect_mtl_seen "crate=rmlx-kv-quant tg=unset mtl=0"
+expect_mtl_seen "crate=rmlx-kv-quant tg=1 mtl=8"
+expect_invocation "crate=rmlx-kv-quant tg=unset args=test --no-fail-fast -p rmlx-kv-quant --tests -- --ignored --test-threads=1 --nocapture kv_gpu_alpha kv_gpu_beta"
+
+# The other direction is a failure like any other: green under the instrument,
+# red without it.
+new_case verdict_red_uninstrumented_is_a_failure || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+printf 'Metal GPU Validation Enabled\n%s\n' "${VERDICT_GREEN}" | crate_log "${CASE_ROOT}" rmlx-kv-quant 0
+printf '%s\n' "${VERDICT_BETA_RED}" | crate_log "${CASE_ROOT}" rmlx-kv-quant.tgunset 101
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "ERROR: GPU tests failed in:"
+expect_report "kv::kv_gpu_beta"
+expect_no_out "changed under the instrument"
+
+# Red in both runs is a failure, and is not listed as the instrument's.
+new_case verdict_red_in_both_is_a_failure || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+printf 'Metal GPU Validation Enabled\n%s\n' "${VERDICT_BETA_RED}" | crate_log "${CASE_ROOT}" rmlx-kv-quant 101
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "kv::kv_gpu_beta"
+expect_no_out "changed under the instrument"
+
+# A hit is read from the instrumented run alone, and a test the instrument
+# turned red still has its hits counted: one it reported before it stopped is
+# above an expectation that no longer includes it.
+new_case verdict_cut_test_drops_its_pinned_count || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+{
+    census_pin_line "${CASE_ROOT}" 4 kv_gpu_alpha rmlx-kv-quant
+    census_pin_line "${CASE_ROOT}" 9 kv_gpu_beta rmlx-kv-quant
+} | pin "${CASE_ROOT}"
+cut_hit="Invalid device load at offset 64, executing kernel function: \"${CENSUS_KERNEL}\""
+{
+    echo 'Metal GPU Validation Enabled'
+    echo "test kv::kv_gpu_alpha ... ok${cut_hit}${cut_hit}${cut_hit}${cut_hit}"
+    printf '%s\n' "${VERDICT_BETA_RED}" | grep -v 'kv_gpu_alpha'
+} | crate_log "${CASE_ROOT}" rmlx-kv-quant 101
+printf '%s\n' "${VERDICT_GREEN}" | crate_log "${CASE_ROOT}" rmlx-kv-quant.tgunset 0
+run_case "${CASE_ROOT}"
+expect_status 0
+expect_out "not enforced in full"
+expect_out "kv_gpu_beta failed under the instrument only, so its 9 are not expected"
+expect_out "kv_gpu_alpha = 4"
+expect_out "INCOMPLETE: 1 test(s) failed only under the instrument"
+
+# A hit printed by the uninstrumented run is not a hit: only the instrument
+# reports one, and text of that shape from anything else is not a diagnostic.
+new_case verdict_run_text_is_not_scanned || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+printf 'Metal GPU Validation Enabled\n%s\n' "${VERDICT_GREEN}" | crate_log "${CASE_ROOT}" rmlx-kv-quant 0
+printf '%s\nInvalid device load at offset 64, executing kernel function: "%s"\n' "${VERDICT_GREEN}" "${CENSUS_KERNEL}" \
+    | crate_log "${CASE_ROOT}" rmlx-kv-quant.tgunset 0
+run_case "${CASE_ROOT}"
+expect_status 0
+expect_out "shader validation clean"
+
+# An instrumented run that dies without naming a test scanned an unknown part
+# of the crate. That is a failure, whatever the uninstrumented run says.
+new_case verdict_scan_exit_with_no_named_test_is_a_failure || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+printf 'Metal GPU Validation Enabled\n%s\n' "${VERDICT_GREEN}" | crate_log "${CASE_ROOT}" rmlx-kv-quant 134
+printf '%s\n' "${VERDICT_GREEN}" | crate_log "${CASE_ROOT}" rmlx-kv-quant.tgunset 0
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "rmlx-kv-quant: the instrumented run exited 134 and named no failing test"
+
+# The uninstrumented run is held to the same coverage as the scan: a verdict
+# over fewer tests than were classified is not a verdict on the crate.
+new_case verdict_run_under_matched_is_a_failure || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+printf 'Metal GPU Validation Enabled\n%s\n' "${VERDICT_GREEN}" | crate_log "${CASE_ROOT}" rmlx-kv-quant 0
+crate_log "${CASE_ROOT}" rmlx-kv-quant.tgunset 0 <<'LOG'
+running 1 test
+test kv::kv_gpu_alpha ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "rmlx-kv-quant: under-matched (1/2 executed) with uninstrumented, for the verdict"
 
 # ---------------------------------------------------------------------------
 # THE HALVES
@@ -1510,13 +1714,20 @@ running 1 test
 test models::checkpoint ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 1.00s
 LOG
+crate_log "${CASE_ROOT}" rmlx-models.tgunset 0 <<'LOG'
+running 2 tests
+test models::checkpoint ... ok
+test models::kernel ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
 run_case "${CASE_ROOT}"
 expect_status 0
 expect_invocation "crate=rmlx-kv-quant tg=1 args=test --no-fail-fast -p rmlx-kv-quant --tests -- --ignored --test-threads=1 --nocapture kv_kernel"
 expect_invocation "crate=rmlx-models tg=1 args=test --no-fail-fast -p rmlx-models --tests -- --ignored --test-threads=1 --nocapture models_kernel --skip models_checkpoint"
 expect_invocation "crate=rmlx-models tg=0 args=test --no-fail-fast -p rmlx-models --tests -- --ignored --test-threads=1 --nocapture models_checkpoint --skip models_kernel"
 expect_no_invocation_with "crate=rmlx-kv-quant tg=0"
-expect_no_invocation_with "tg=unset"
+# The verdict run carries no setting, names every test and skips none.
+expect_invocation "crate=rmlx-models tg=unset args=test --no-fail-fast -p rmlx-models --tests -- --ignored --test-threads=1 --nocapture models_checkpoint models_kernel"
 # The positive control is an rMLX kernel too, and runs under the same setting.
 expect_invocation "crate=canary tg=1"
 expect_out "threadgroup validation ON (1):"
@@ -1728,4 +1939,4 @@ if [ "${failures}" -ne 0 ]; then
     exit 1
 fi
 
-echo "run_gpu_tests_selftest: OK — every kind of red is reported, the access mix is the one observed, the census pin accepts only what it names, each half runs its own tests against its own slice of that pin, and each test runs under its own threadgroup setting."
+echo "run_gpu_tests_selftest: OK — every kind of red is reported, the access mix is the one observed, the census pin accepts only what it names, each half runs its own tests against its own slice of that pin, each test runs under its own threadgroup setting, and the verdict is the uninstrumented run's."
