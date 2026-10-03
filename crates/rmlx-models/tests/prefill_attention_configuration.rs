@@ -39,9 +39,12 @@
 //!
 //! - A call outside the configuration: it reaches mlx-c as one node with the
 //!   shape the caller gave. A decode step has one query row.
-//! - The output of a call in the configuration: it is bit-equal to the
-//!   concatenation of the nodes that reached mlx-c, issued by hand, and within
-//!   one bf16 unit of an f32 reference.
+//! - The node of a call a rule changes: one node, the call's own fields, and
+//!   its query rows padded to the next multiple of 64. Every real row stays on
+//!   the fused kernel.
+//! - The output of that call: the caller's rows and no padded row, each row
+//!   bit-equal to the same row of the padded node built by hand under two
+//!   paddings, and within one bf16 unit of an f32 reference.
 //! - The served tokens, except at a bf16 near-tie. The model cells hold the
 //!   argmax at eight positions after the prefill, and the first generated
 //!   token, against a reference split. The size of a logit move across two
@@ -57,7 +60,8 @@
 //! | a rule in some prefill loops and not at the call (an unchunked image prefill, a hydrated tail, `ppl`, a codec route is left out) | `no_call_in_the_configuration_reaches_mlx_c` |
 //! | a rule keyed on an architecture or module name | the same: the direct call carries no name |
 //! | a rule that also changes a call outside the configuration (head dim 128, 192 or 512, no array mask, under the floor, query rows aligned) | `a_call_outside_the_configuration_reaches_mlx_c_unchanged`; the Bonsai-8B cell, which holds the plain chunk split |
-//! | a rule that drops, repeats, reorders or shifts query rows, or slices the mask wrongly | `a_call_in_the_configuration_returns_the_attention_of_its_rows` |
+//! | a rule that splits the query rows, pads the keys, or pads to another block | `no_call_in_the_configuration_reaches_mlx_c`: one node, padded query rows, nothing else changed |
+//! | a padded row in the output, a dropped or moved row, a mask that is not padded or is given to another row | `a_call_in_the_configuration_returns_the_attention_of_its_rows` |
 //! | a second call of the mlx-c symbol, or the event moved away from the call | `one_function_hands_attention_to_mlx_c` |
 //! | the event is removed, or reports another field under a name | `an_attention_call_reports_what_mlx_receives` |
 //! | the oracle states another configuration (a block size, the query-row floor, the head dim, the value head dim, the mask kind, the device) | `the_oracle_agrees_with_every_measured_cell` |
@@ -462,24 +466,30 @@ fn a_rule_may_change(call: &AttentionCall) -> bool {
         && call.q_rows % QUERY_BLOCK != 0
 }
 
-/// The nodes must be the caller's query rows in order, each over all keys.
-fn assert_the_nodes_partition_the_query_rows(asked: &AttentionCall, nodes: &[AttentionCall]) {
-    assert!(!nodes.is_empty(), "no node reached mlx-c for {asked:?}");
-    assert_eq!(
-        nodes.iter().map(|n| n.q_rows).sum::<i64>(),
-        asked.q_rows,
-        "the nodes do not hold the query rows of {asked:?}: {nodes:?}"
-    );
-    for node in nodes {
-        let whole = AttentionCall {
-            q_rows: asked.q_rows,
-            ..node.clone()
-        };
-        assert_eq!(
-            &whole, asked,
-            "a node differs from the call in more than its query rows"
-        );
+/// The query rows of the node a call must reach mlx-c as: the next multiple of
+/// the kernel's query block when a rule may change the call, its own count
+/// otherwise.
+fn node_query_rows(asked: &AttentionCall) -> i64 {
+    if a_rule_may_change(asked) {
+        (asked.q_rows + QUERY_BLOCK - 1) / QUERY_BLOCK * QUERY_BLOCK
+    } else {
+        asked.q_rows
     }
+}
+
+/// A call reaches mlx-c as exactly one node, and the node differs from the
+/// call in nothing but padded query rows.
+fn assert_one_node_with_padded_query_rows(asked: &AttentionCall, nodes: &[AttentionCall]) {
+    let expected = AttentionCall {
+        q_rows: node_query_rows(asked),
+        ..asked.clone()
+    };
+    assert_eq!(
+        nodes,
+        std::slice::from_ref(&expected),
+        "the call {asked:?} must reach mlx-c as one node with its query rows padded to the \
+         next multiple of {QUERY_BLOCK}"
+    );
 }
 
 #[ignore = "builds attention nodes on the Metal GPU stream"]
@@ -490,15 +500,20 @@ fn no_call_in_the_configuration_reaches_mlx_c() {
     for measured in MEASURED_CELLS.iter().filter(|c| c.bad > 0) {
         asked_cells += 1;
         let asked = measured.as_gpu_call();
-        let (_node, nodes) = recorded(|| measured.issue(DEVICE));
-        assert_the_nodes_partition_the_query_rows(&asked, &nodes);
+        let (output, nodes) = recorded(|| measured.issue(DEVICE));
+        assert_one_node_with_padded_query_rows(&asked, &nodes);
+        assert_eq!(
+            i64::from(output.shape()[2]),
+            asked.q_rows,
+            "the output must hold the caller's query rows and no padded row"
+        );
         reached.extend(nodes.into_iter().filter(is_faulty));
     }
     assert_eq!(asked_cells, 6);
 
     // Every query row count from the route's floor to four times the largest
     // chunk, over unaligned key rows: a prefill with no chunking has as many
-    // query rows as its prompt.
+    // query rows as its prompt. An aligned count is its own node.
     for q_rows in SPLIT_KERNEL_MIN_QUERY_ROWS..=8192 {
         let k_rows = if (q_rows + 1) % KEY_BLOCK == 0 {
             q_rows + 2
@@ -507,15 +522,9 @@ fn no_call_in_the_configuration_reaches_mlx_c() {
         };
         let derived = cell((q_rows, k_rows), (256, 256), (8, 1), "array", (0, 0));
         let asked = derived.as_gpu_call();
-        let (_node, nodes) = recorded(|| derived.issue(DEVICE));
-        assert_the_nodes_partition_the_query_rows(&asked, &nodes);
-        assert_eq!(
-            nodes.len() > 1,
-            is_faulty(&asked),
-            "{q_rows} query rows over {k_rows} keys: the call is split exactly when it is in \
-             the configuration; nodes {:?}",
-            nodes.iter().map(|n| n.q_rows).collect::<Vec<_>>()
-        );
+        let (output, nodes) = recorded(|| derived.issue(DEVICE));
+        assert_one_node_with_padded_query_rows(&asked, &nodes);
+        assert_eq!(i64::from(output.shape()[2]), q_rows);
         reached.extend(nodes.into_iter().filter(is_faulty));
     }
     assert!(
@@ -662,11 +671,11 @@ const OUTPUT_CELLS: [OutputCell; 4] = [
 ///
 /// Two oracles, and neither is a tolerance fitted to a result:
 ///
-/// - The nodes that reached mlx-c, issued again by hand over the same query
-///   rows and mask rows and concatenated, give the wrapper's output bit for
-///   bit. Query rows are independent in attention, so this holds for every
-///   partition of the rows and fails for a dropped, repeated, reordered or
-///   shifted row and for a mask row given to another query row.
+/// - The padded node, built by hand with two different paddings, gives the
+///   same real rows bit for bit, and the wrapper's output is those rows. Query
+///   rows are independent in attention, so this fails for a padded row in the
+///   output, a dropped or moved row, and a mask row given to another query
+///   row.
 /// - Each output is a convex combination of value rows, so the exact result
 ///   is no larger than the largest value. An f32 reference, built from matmul
 ///   and softmax with no attention kernel, must agree within one bf16 unit at
@@ -722,64 +731,76 @@ fn check_the_output_of(output_cell: OutputCell) {
         is_faulty(&asked),
         "{output_cell:?} must ask for the configuration"
     );
-    assert_the_nodes_partition_the_query_rows(&asked, &nodes);
-    assert!(
-        !nodes.iter().any(is_faulty),
-        "{output_cell:?}: a node in the configuration reached mlx-c"
-    );
-    let output = to_f32_vec(&output);
-    assert!(output.iter().all(|x| x.is_finite()));
-
-    // Oracle 1: the same nodes by hand.
+    assert_one_node_with_padded_query_rows(&asked, &nodes);
     let row_len = DIM as usize;
     let head_len = q_rows as usize * row_len;
-    let mut first_row = 0i32;
-    for node in &nodes {
-        let rows = node.q_rows as i32;
-        let q_part = q
-            .slice(
-                &[0, 0, first_row, 0],
-                &[1, q_heads, first_row + rows, DIM],
-                &full,
-                DEVICE,
-            )
-            .expect("q rows");
-        let mask_part = mask
-            .slice(
-                &[0, 0, first_row, 0],
-                &[1, 1, first_row + rows, k_rows],
-                &full,
-                DEVICE,
-            )
-            .expect("mask rows");
-        let by_hand = to_f32_vec(
-            &rmlx_mlx::scaled_dot_product_attention(
-                &q_part,
+    let output = to_f32_vec(&output);
+    assert_eq!(
+        output.len(),
+        q_heads as usize * head_len,
+        "{output_cell:?}: the output must hold the caller's query rows and no padded row"
+    );
+    assert!(output.iter().all(|x| x.is_finite()));
+
+    // Oracle 1: the padded node by hand, twice, with two paddings. Query rows
+    // are independent in attention, so a real row is the same bits under every
+    // padding, and the wrapper's rows are those bits. A real row that takes
+    // another row's mask, a padded row in the output, or a row dropped or
+    // moved, differs here.
+    let padded_rows = node_query_rows(&asked) as i32;
+    let pad = padded_rows - q_rows;
+    assert!(pad > 0, "{output_cell:?} must need padding");
+    let real_rows_of_a_node_padded_with = |q_pad: &Array, mask_pad: &Array| -> Vec<f32> {
+        let q_padded = rmlx_mlx::concatenate(&[&q, q_pad], 2, DEVICE).expect("pad q");
+        let mask_padded = rmlx_mlx::concatenate(&[&mask, mask_pad], 2, DEVICE).expect("pad mask");
+        let (node, hand_nodes) = recorded(|| {
+            rmlx_mlx::scaled_dot_product_attention(
+                &q_padded,
                 &k,
                 &v,
                 scale,
                 "array",
-                Some(&mask_part),
+                Some(&mask_padded),
                 DEVICE,
             )
-            .expect("node by hand"),
+            .expect("padded node by hand")
+        });
+        assert_eq!(
+            hand_nodes, nodes,
+            "the node by hand is the node the wrapper built"
         );
-        // Rows are axis 2, so a row range is one slice of each head.
-        let node_len = rows as usize * row_len;
-        for head in 0..q_heads as usize {
-            let got = &output[head * head_len + first_row as usize * row_len..][..node_len];
-            let hand = &by_hand[head * node_len..][..node_len];
-            assert!(
-                got.iter()
-                    .zip(hand)
-                    .all(|(a, b)| a.to_bits() == b.to_bits()),
-                "{output_cell:?}, head {head}, query rows {first_row}..{}: the wrapper's \
-                 output is not the output of the node that reached mlx-c for those rows",
-                first_row + rows
-            );
-        }
-        first_row += rows;
-    }
+        let all = to_f32_vec(&node);
+        let padded_head_len = padded_rows as usize * row_len;
+        (0..q_heads as usize)
+            .flat_map(|head| all[head * padded_head_len..][..head_len].to_vec())
+            .collect()
+    };
+    let zero_q = rmlx_mlx::zeros(&[1, q_heads, pad, DIM], Dtype::Bf16, DEVICE).expect("zero q");
+    let open_mask = rmlx_mlx::zeros(&[1, 1, pad, k_rows], Dtype::Bf16, DEVICE).expect("open mask");
+    let random_q = uniform_bf16(&mut rng, &[1, q_heads, pad, DIM]);
+    let first_mask_rows = mask
+        .slice(&[0, 0, 0, 0], &[1, 1, pad, k_rows], &full, DEVICE)
+        .expect("first mask rows");
+    let with_zeros = real_rows_of_a_node_padded_with(&zero_q, &open_mask);
+    let with_noise = real_rows_of_a_node_padded_with(&random_q, &first_mask_rows);
+    let first_difference = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .position(|(x, y)| x.to_bits() != y.to_bits())
+            .map(|at| (at / head_len, (at % head_len) / row_len))
+    };
+    assert_eq!(
+        first_difference(&with_zeros, &with_noise),
+        None,
+        "{output_cell:?}: a real row (head, query row) changes with the content of the padded \
+         rows, so MLX does not keep query rows independent"
+    );
+    assert_eq!(
+        first_difference(&output, &with_zeros),
+        None,
+        "{output_cell:?}: an output row (head, query row) is not the same row of the padded \
+         node issued by hand"
+    );
 
     // Oracle 2: an f32 reference with no attention kernel.
     let group = q_heads / kv_heads;
