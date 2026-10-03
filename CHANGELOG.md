@@ -56,8 +56,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that are not a multiple of 32. The last prefill chunk of a Qwen3.5 or
   Qwen3.6 prompt has that shape. The cause is the instrumented compile of the
   MLX kernel; no run without validation has shown the fault. rMLX now pads the
-  query rows of such a call to the next multiple of 64 and drops the padded
-  rows from the output. Generated tokens are unchanged.
+  query rows of an array-mask call at `head_dim` 256 with at least 1024 query
+  rows to the next multiple of 64, whatever its key rows, and drops the padded
+  rows from the output. Generated tokens are unchanged on the four test
+  models (Qwen3.6-35B-A3B, Ternary-Bonsai-27B, gemma-4-e2b, Ternary-Bonsai-8B).
+  The prefill cost of the padding is not measured.
 
 - **A model loaded on one thread no longer fails on another.** On MLX 0.32 an
   on-demand load (unload, then a request) failed its first request with

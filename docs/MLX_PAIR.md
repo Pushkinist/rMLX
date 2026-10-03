@@ -297,4 +297,10 @@ across pairs.
    header), re-run `layout_flag_classifies_views_once_they_are_evaluated` and
    the JIT language probe (`docs/FFI.md`), and derive the GPU census again
    (`docs/GPU_TESTS.md`).
-5. Re-run a prefill cell and compare its prefill rate with the old pair's.
+5. Measure the cells of `MEASURED_CELLS`
+   (`crates/rmlx-models/tests/prefill_attention_configuration.rs`) in pure MLX
+   on the new pair, under device-memory shader validation. If no cell returns
+   a non-finite value, delete the query-row rule in `sdpa_under`
+   (`docs/FFI.md`, "`scaled_dot_product_attention`") and its tests. If the
+   faulty shapes changed, change the rule and the table together.
+6. Re-run a prefill cell and compare its prefill rate with the old pair's.

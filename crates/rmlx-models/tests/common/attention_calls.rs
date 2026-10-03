@@ -15,6 +15,9 @@ use rmlx_mlx::ATTENTION_CALL_TARGET;
 pub struct AttentionCall {
     pub q_heads: i64,
     pub q_rows: i64,
+    /// The query rows the caller gave; `q_rows` is larger when the node is
+    /// padded.
+    pub caller_q_rows: i64,
     pub head_dim: i64,
     pub kv_heads: i64,
     pub k_rows: i64,
@@ -43,6 +46,7 @@ impl AttentionCall {
         Self {
             q_heads: int("q_heads"),
             q_rows: int("q_rows"),
+            caller_q_rows: int("caller_q_rows"),
             head_dim: int("head_dim"),
             kv_heads: int("kv_heads"),
             k_rows: int("k_rows"),

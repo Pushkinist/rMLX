@@ -117,3 +117,94 @@ fn a_c_api_mismatch_refuses_sdpa_before_the_mlx_c_call() {
         .expect_err("a C API mismatch must refuse the call");
     assert!(err.to_string().contains("mlx-c C API mismatch"), "{err}");
 }
+
+/// Uniform values in `[-1, 1)` from a fixed sequence, as bf16 on the GPU.
+fn uniform_bf16(state: &mut u64, shape: &[i32]) -> Array {
+    let len: i32 = shape.iter().product();
+    let data: Vec<f32> = (0..len)
+        .map(|_| {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            (*state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+        })
+        .collect();
+    Array::from_f32_slice(&data, shape)
+        .expect("host array")
+        .astype(Dtype::Bf16, Device::Gpu)
+        .expect("astype bf16")
+}
+
+fn f32_bits(a: &Array) -> Vec<u32> {
+    let f32_array = a.astype(Dtype::F32, Device::Gpu).expect("astype f32");
+    f32_array.eval().expect("materialise");
+    f32_array
+        .to_bytes()
+        .expect("to_bytes")
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect()
+}
+
+/// The call the rule pads, against the same call handed to MLX as it is.
+///
+/// Only this crate can build the unpadded node: every other caller passes the
+/// rule. The key rows are a multiple of 32, so the unpadded node is not in the
+/// configuration that fails under the instrument, and this test reads the
+/// same under the GPU runner's instrumented pass. The rule is on the query
+/// rows alone and pads these calls.
+///
+/// The bound is bit equality. MLX compiles the kernel for "query rows a
+/// multiple of 64" or not; the two differ in how the last partial block of
+/// query rows is loaded, and not in the arithmetic of a row.
+#[test]
+#[ignore = "evaluates attention on the Metal GPU"]
+fn a_padded_call_returns_the_rows_of_the_unpadded_node() {
+    // (query rows, key rows, query heads, kv heads): the Qwen3.5 head layout,
+    // and one KV head with the query rows as long as the keys allow.
+    for (q_rows, k_rows, q_heads, kv_heads) in [(1025, 3072, 8, 2), (1296, 1312, 8, 1)] {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let q = uniform_bf16(&mut state, &[1, q_heads, q_rows, 256]);
+        let k = uniform_bf16(&mut state, &[1, kv_heads, k_rows, 256]);
+        let v = uniform_bf16(&mut state, &[1, kv_heads, k_rows, 256]);
+        let offset = (k_rows - q_rows) as usize;
+        let mut mask_host = vec![0.0f32; (q_rows * k_rows) as usize];
+        for (i, row) in mask_host.chunks_exact_mut(k_rows as usize).enumerate() {
+            for hidden in &mut row[offset + i + 1..] {
+                *hidden = -1e30;
+            }
+        }
+        let mask = Array::from_f32_slice(&mask_host, &[1, 1, q_rows, k_rows])
+            .expect("mask")
+            .astype(Dtype::Bf16, Device::Gpu)
+            .expect("mask bf16");
+
+        assert_eq!(
+            padded_query_rows(&q, &v, "array", Device::Gpu),
+            Some((q_rows, (q_rows + 63) / 64 * 64)),
+            "the rule must pad this call"
+        );
+        let unpadded = attention_node(&q, &k, &v, 0.5, "array", Some(&mask), Device::Gpu, None)
+            .expect("unpadded node");
+        let padded = sdpa_under(
+            c_api::verdict(),
+            &q,
+            &k,
+            &v,
+            0.5,
+            "array",
+            Some(&mask),
+            Device::Gpu,
+        )
+        .expect("padded call");
+        assert_eq!(padded.shape(), unpadded.shape());
+        let (padded, unpadded) = (f32_bits(&padded), f32_bits(&unpadded));
+        assert!(padded.iter().all(|x| f32::from_bits(*x).is_finite()));
+        let first = padded.iter().zip(&unpadded).position(|(a, b)| a != b);
+        assert_eq!(
+            first, None,
+            "{q_rows} query rows over {k_rows} keys: the padded call differs from the unpadded \
+             node at flat index {first:?}"
+        );
+    }
+}

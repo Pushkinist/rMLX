@@ -56,12 +56,13 @@
 //!
 //! | Mutation | Caught by |
 //! |---|---|
-//! | no rule (this tree) | `no_call_in_the_configuration_reaches_mlx_c`; the model cells |
+//! | no rule (the tree before the rule) | `no_call_in_the_configuration_reaches_mlx_c`; the model cells |
 //! | a rule in some prefill loops and not at the call (an unchunked image prefill, a hydrated tail, `ppl`, a codec route is left out) | `no_call_in_the_configuration_reaches_mlx_c` |
 //! | a rule keyed on an architecture or module name | the same: the direct call carries no name |
 //! | a rule that also changes a call outside the configuration (head dim 128, 192 or 512, no array mask, under the floor, query rows aligned) | `a_call_outside_the_configuration_reaches_mlx_c_unchanged`; the Bonsai-8B cell, which holds the plain chunk split |
 //! | a rule that splits the query rows, pads the keys, or pads to another block | `no_call_in_the_configuration_reaches_mlx_c`: one node, padded query rows, nothing else changed |
 //! | a padded row in the output, a dropped or moved row, a mask that is not padded or is given to another row | `a_call_in_the_configuration_returns_the_attention_of_its_rows` |
+//! | a mask padded wrongly for its dtype or layout (boolean, `[q, k]`, one broadcast row), or a batch above 1 | the same test, last four cells; `a_mask_with_another_row_count_is_refused` |
 //! | a second call of the mlx-c symbol, or the event moved away from the call | `one_function_hands_attention_to_mlx_c` |
 //! | the event is removed, or reports another field under a name | `an_attention_call_reports_what_mlx_receives` |
 //! | the oracle states another configuration (a block size, the query-row floor, the head dim, the value head dim, the mask kind, the device) | `the_oracle_agrees_with_every_measured_cell` |
@@ -190,6 +191,7 @@ impl Cell {
         AttentionCall {
             q_heads: self.q_heads,
             q_rows: self.q_rows,
+            caller_q_rows: self.q_rows,
             head_dim: self.head_dim,
             kv_heads: self.kv_heads,
             k_rows: self.k_rows,
@@ -279,6 +281,7 @@ fn an_attention_call_reports_what_mlx_receives() {
     let expected = |mask: &str| AttentionCall {
         q_heads: 2,
         q_rows: 5,
+        caller_q_rows: 5,
         head_dim: 8,
         kv_heads: 1,
         k_rows: 7,
@@ -482,6 +485,7 @@ fn node_query_rows(asked: &AttentionCall) -> i64 {
 fn assert_one_node_with_padded_query_rows(asked: &AttentionCall, nodes: &[AttentionCall]) {
     let expected = AttentionCall {
         q_rows: node_query_rows(asked),
+        caller_q_rows: asked.q_rows,
         ..asked.clone()
     };
     assert_eq!(
@@ -594,7 +598,7 @@ fn to_f32_vec(a: &Array) -> Vec<f32> {
         .collect()
 }
 
-/// The additive mask of one output cell.
+/// Which keys a query row sees.
 #[derive(Clone, Copy, Debug)]
 enum MaskKind {
     /// A later chunk of a causal prefill: query row `i` is prompt row
@@ -604,70 +608,164 @@ enum MaskKind {
     Banded(usize),
 }
 
-/// One call in the configuration, with data.
+/// How the mask reaches the call. MLX broadcasts a mask against
+/// `[batch, heads, query rows, key rows]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MaskLayout {
+    /// `[1, 1, query rows, key rows]`, additive bf16: what every model builds.
+    Additive,
+    /// `[query rows, key rows]`, additive bf16.
+    Rank2,
+    /// `[1, 1, query rows, key rows]`, boolean: true where the row sees the key.
+    Boolean,
+    /// `[1, 1, 1, key rows]`, additive bf16: one row for every query row. It
+    /// hides the last third of the keys; the mask kind is not used.
+    OneRow,
+}
+
+/// One call the rule changes, with data.
 #[derive(Clone, Copy, Debug)]
 struct OutputCell {
+    batch: i32,
     q_rows: i32,
     k_rows: i32,
     q_heads: i32,
     kv_heads: i32,
     mask: MaskKind,
+    layout: MaskLayout,
 }
 
-/// The mask as host rows: 0 where a query row sees a key, -1e30 elsewhere.
-fn additive_mask(q_rows: i32, k_rows: i32, mask_kind: MaskKind) -> Vec<f32> {
-    let offset = (k_rows - q_rows) as usize;
-    let mut mask_host = vec![0.0f32; (q_rows * k_rows) as usize];
-    for (i, row) in mask_host.chunks_exact_mut(k_rows as usize).enumerate() {
-        let own = offset + i;
-        for cell in &mut row[own + 1..] {
-            *cell = -1e30;
-        }
-        if let MaskKind::Banded(window) = mask_kind {
-            for cell in &mut row[..(own + 1).saturating_sub(window)] {
-                *cell = -1e30;
-            }
-        }
+const fn output_cell(
+    (q_rows, k_rows): (i32, i32),
+    (q_heads, kv_heads): (i32, i32),
+    mask: MaskKind,
+) -> OutputCell {
+    OutputCell {
+        batch: 1,
+        q_rows,
+        k_rows,
+        q_heads,
+        kv_heads,
+        mask,
+        layout: MaskLayout::Additive,
     }
-    mask_host
 }
 
-/// The cells of the output oracle: the Qwen3.5 head layout on the shortest
-/// call in the configuration; one KV head; a banded mask on one KV head, which
-/// is the gemma-4 sliding-window layer; and a call of more than 2048 query
-/// rows with a second node of 52 rows.
-const OUTPUT_CELLS: [OutputCell; 4] = [
+/// The cells of the output oracle. The first four are in the measured
+/// configuration: the Qwen3.5 head layout on the shortest such call; one KV
+/// head; a banded mask on one KV head, which is the gemma-4 sliding-window
+/// layer; and a call of 2100 query rows, padded by 12. The fifth has aligned
+/// key rows: the rule is on the query rows alone, so it pads that call too.
+/// The last four are the mask layouts and the batch no model builds today.
+const OUTPUT_CELLS: [OutputCell; 9] = [
+    output_cell((1025, 3073), (8, 2), MaskKind::Causal),
+    output_cell((1025, 3073), (8, 1), MaskKind::Causal),
+    output_cell((1296, 1807), (8, 1), MaskKind::Banded(512)),
+    output_cell((2100, 4133), (8, 2), MaskKind::Causal),
+    output_cell((1296, 1312), (8, 1), MaskKind::Banded(512)),
     OutputCell {
-        q_rows: 1025,
-        k_rows: 3073,
-        q_heads: 8,
-        kv_heads: 2,
-        mask: MaskKind::Causal,
+        layout: MaskLayout::Rank2,
+        ..output_cell((1025, 3073), (8, 2), MaskKind::Causal)
     },
     OutputCell {
-        q_rows: 1025,
-        k_rows: 3073,
-        q_heads: 8,
-        kv_heads: 1,
-        mask: MaskKind::Causal,
+        layout: MaskLayout::Boolean,
+        ..output_cell((1025, 3073), (8, 2), MaskKind::Causal)
     },
     OutputCell {
-        q_rows: 1296,
-        k_rows: 1807,
-        q_heads: 8,
-        kv_heads: 1,
-        mask: MaskKind::Banded(512),
+        layout: MaskLayout::OneRow,
+        ..output_cell((1025, 3073), (8, 2), MaskKind::Causal)
     },
     OutputCell {
-        q_rows: 2100,
-        k_rows: 4133,
-        q_heads: 8,
-        kv_heads: 2,
-        mask: MaskKind::Causal,
+        batch: 2,
+        ..output_cell((1025, 1537), (4, 2), MaskKind::Causal)
     },
 ];
 
-/// Calls in the configuration, with data, evaluated.
+/// The mask as host values in the cell's layout: 0 where a query row sees a
+/// key, -1e30 elsewhere, and the shape MLX is given.
+fn additive_mask(cell: OutputCell) -> (Vec<f32>, Vec<i32>) {
+    let (q_rows, k_rows) = (cell.q_rows as usize, cell.k_rows as usize);
+    if cell.layout == MaskLayout::OneRow {
+        let mut row = vec![0.0f32; k_rows];
+        for hidden in &mut row[k_rows - k_rows / 3..] {
+            *hidden = -1e30;
+        }
+        return (row, vec![1, 1, 1, cell.k_rows]);
+    }
+    let offset = k_rows - q_rows;
+    let mut mask_host = vec![0.0f32; q_rows * k_rows];
+    for (i, row) in mask_host.chunks_exact_mut(k_rows).enumerate() {
+        let own = offset + i;
+        for hidden in &mut row[own + 1..] {
+            *hidden = -1e30;
+        }
+        if let MaskKind::Banded(window) = cell.mask {
+            for hidden in &mut row[..(own + 1).saturating_sub(window)] {
+                *hidden = -1e30;
+            }
+        }
+    }
+    let shape = if cell.layout == MaskLayout::Rank2 {
+        vec![cell.q_rows, cell.k_rows]
+    } else {
+        vec![1, 1, cell.q_rows, cell.k_rows]
+    };
+    (mask_host, shape)
+}
+
+/// Rows `from..to` of `a` along `axis`.
+fn rows_of(a: &Array, axis: usize, from: i32, to: i32) -> Array {
+    let shape = a.shape();
+    let mut start = vec![0; shape.len()];
+    let mut stop = shape.clone();
+    start[axis] = from;
+    stop[axis] = to;
+    a.slice(&start, &stop, &vec![1; shape.len()], DEVICE)
+        .expect("rows")
+}
+
+/// Attention from matmul and softmax in f32, one KV head of one batch at a
+/// time, with the mask in the cell's own layout.
+fn f32_reference(
+    cell: OutputCell,
+    [q, k, v]: [&Array; 3],
+    mask_f32: &Array,
+    scale: f32,
+) -> Vec<f32> {
+    const DIM: i32 = 256;
+    let group = cell.q_heads / cell.kv_heads;
+    let mut reference = Vec::new();
+    for b in 0..cell.batch {
+        for kv_head in 0..cell.kv_heads {
+            let f32_of = |a: &Array, from: i32, to: i32, rows: i32| {
+                a.slice(
+                    &[b, from, 0, 0],
+                    &[b + 1, to, rows, DIM],
+                    &[1, 1, 1, 1],
+                    DEVICE,
+                )
+                .expect("head slice")
+                .astype(Dtype::F32, DEVICE)
+                .expect("astype f32")
+            };
+            let q_f32 = f32_of(q, kv_head * group, (kv_head + 1) * group, cell.q_rows);
+            let k_f32 = f32_of(k, kv_head, kv_head + 1, cell.k_rows);
+            let v_f32 = f32_of(v, kv_head, kv_head + 1, cell.k_rows);
+            let k_t = k_f32.transpose(&[0, 1, 3, 2], DEVICE).expect("transpose");
+            let scores = rmlx_mlx::matmul(&q_f32, &k_t, DEVICE).expect("q k^T");
+            let scores =
+                rmlx_mlx::multiply(&scores, &rmlx_mlx::scalar_f32(scale), DEVICE).expect("scale");
+            let scores = rmlx_mlx::add(&scores, mask_f32, DEVICE).expect("mask");
+            let weights = rmlx_mlx::softmax_precise(&scores, -1, DEVICE).expect("softmax");
+            reference.extend(to_f32_vec(
+                &rmlx_mlx::matmul(&weights, &v_f32, DEVICE).expect("p v"),
+            ));
+        }
+    }
+    reference
+}
+
+/// Calls the rule changes, with data, evaluated.
 ///
 /// Two oracles, and neither is a tolerance fitted to a result:
 ///
@@ -681,7 +779,8 @@ const OUTPUT_CELLS: [OutputCell; 4] = [
 ///   and softmax with no attention kernel, must agree within one bf16 unit at
 ///   that magnitude. The limit assumes that a kernel accumulates wider than
 ///   bf16 and rounds once; a kernel that accumulates in bf16 can exceed it.
-///   This is what holds a node on another kernel to the same arithmetic.
+///   The reference takes the mask in the cell's own layout, so a mask that
+///   the rule pads wrongly for a layout or a dtype differs here.
 #[ignore = "evaluates attention on the Metal GPU"]
 #[test]
 fn a_call_in_the_configuration_returns_the_attention_of_its_rows() {
@@ -693,32 +792,39 @@ fn a_call_in_the_configuration_returns_the_attention_of_its_rows() {
 fn check_the_output_of(output_cell: OutputCell) {
     const DIM: i32 = 256;
     let OutputCell {
+        batch,
         q_rows,
         k_rows,
         q_heads,
         kv_heads,
-        mask: mask_kind,
+        layout,
+        ..
     } = output_cell;
     // Sharp attention weights, so each output row is close to a few value rows
     // and a wrong row shows at the size of a value.
     let scale = 0.5;
-    let full = [1, 1, 1, 1];
 
     let mut rng = Pcg32::new(7);
-    let q = uniform_bf16(&mut rng, &[1, q_heads, q_rows, DIM]);
-    let k = uniform_bf16(&mut rng, &[1, kv_heads, k_rows, DIM]);
-    let v = uniform_bf16(&mut rng, &[1, kv_heads, k_rows, DIM]);
-    let mask_host = additive_mask(q_rows, k_rows, mask_kind);
-    let mask_f32 = Array::from_f32_slice(&mask_host, &[1, 1, q_rows, k_rows]).expect("mask");
-    let mask = mask_f32.astype(Dtype::Bf16, DEVICE).expect("mask bf16");
+    let q = uniform_bf16(&mut rng, &[batch, q_heads, q_rows, DIM]);
+    let k = uniform_bf16(&mut rng, &[batch, kv_heads, k_rows, DIM]);
+    let v = uniform_bf16(&mut rng, &[batch, kv_heads, k_rows, DIM]);
+    let (mask_host, mask_shape) = additive_mask(output_cell);
+    let mask_f32 = Array::from_f32_slice(&mask_host, &mask_shape).expect("mask");
+    let mask = if layout == MaskLayout::Boolean {
+        rmlx_mlx::greater_equal(&mask_f32, &rmlx_mlx::scalar_f32(-1.0), DEVICE).expect("bool mask")
+    } else {
+        mask_f32.astype(Dtype::Bf16, DEVICE).expect("mask bf16")
+    };
+    let mask_row_axis = mask_shape.len() - 2;
 
     let (output, nodes) = recorded(|| {
         rmlx_mlx::scaled_dot_product_attention(&q, &k, &v, scale, "array", Some(&mask), DEVICE)
-            .expect("the call in the configuration")
+            .expect("the call the rule changes")
     });
     let asked = AttentionCall {
         q_heads: i64::from(q_heads),
         q_rows: i64::from(q_rows),
+        caller_q_rows: i64::from(q_rows),
         head_dim: i64::from(DIM),
         kv_heads: i64::from(kv_heads),
         k_rows: i64::from(k_rows),
@@ -728,31 +834,33 @@ fn check_the_output_of(output_cell: OutputCell) {
         device: "Gpu".to_owned(),
     };
     assert!(
-        is_faulty(&asked),
-        "{output_cell:?} must ask for the configuration"
+        a_rule_may_change(&asked),
+        "{output_cell:?} must be a call the rule changes"
     );
     assert_one_node_with_padded_query_rows(&asked, &nodes);
     let row_len = DIM as usize;
     let head_len = q_rows as usize * row_len;
+    let heads = (batch * q_heads) as usize;
     let output = to_f32_vec(&output);
     assert_eq!(
         output.len(),
-        q_heads as usize * head_len,
+        heads * head_len,
         "{output_cell:?}: the output must hold the caller's query rows and no padded row"
     );
     assert!(output.iter().all(|x| x.is_finite()));
 
-    // Oracle 1: the padded node by hand, twice, with two paddings. Query rows
-    // are independent in attention, so a real row is the same bits under every
-    // padding, and the wrapper's rows are those bits. A real row that takes
-    // another row's mask, a padded row in the output, or a row dropped or
-    // moved, differs here.
+    // Oracle 1: the padded node by hand, twice, with two paddings.
     let padded_rows = node_query_rows(&asked) as i32;
     let pad = padded_rows - q_rows;
     assert!(pad > 0, "{output_cell:?} must need padding");
     let real_rows_of_a_node_padded_with = |q_pad: &Array, mask_pad: &Array| -> Vec<f32> {
         let q_padded = rmlx_mlx::concatenate(&[&q, q_pad], 2, DEVICE).expect("pad q");
-        let mask_padded = rmlx_mlx::concatenate(&[&mask, mask_pad], 2, DEVICE).expect("pad mask");
+        let mask_padded = if layout == MaskLayout::OneRow {
+            rows_of(&mask, mask_row_axis, 0, 1)
+        } else {
+            rmlx_mlx::concatenate(&[&mask, mask_pad], mask_row_axis as i32, DEVICE)
+                .expect("pad mask")
+        };
         let (node, hand_nodes) = recorded(|| {
             rmlx_mlx::scaled_dot_product_attention(
                 &q_padded,
@@ -766,23 +874,34 @@ fn check_the_output_of(output_cell: OutputCell) {
             .expect("padded node by hand")
         });
         assert_eq!(
-            hand_nodes, nodes,
-            "the node by hand is the node the wrapper built"
+            hand_nodes
+                .iter()
+                .map(|n| (n.q_rows, n.k_rows))
+                .collect::<Vec<_>>(),
+            nodes
+                .iter()
+                .map(|n| (n.q_rows, n.k_rows))
+                .collect::<Vec<_>>(),
+            "the node by hand has the rows of the node the wrapper built"
         );
         let all = to_f32_vec(&node);
         let padded_head_len = padded_rows as usize * row_len;
-        (0..q_heads as usize)
+        (0..heads)
             .flat_map(|head| all[head * padded_head_len..][..head_len].to_vec())
             .collect()
     };
-    let zero_q = rmlx_mlx::zeros(&[1, q_heads, pad, DIM], Dtype::Bf16, DEVICE).expect("zero q");
-    let open_mask = rmlx_mlx::zeros(&[1, 1, pad, k_rows], Dtype::Bf16, DEVICE).expect("open mask");
-    let random_q = uniform_bf16(&mut rng, &[1, q_heads, pad, DIM]);
-    let first_mask_rows = mask
-        .slice(&[0, 0, 0, 0], &[1, 1, pad, k_rows], &full, DEVICE)
-        .expect("first mask rows");
-    let with_zeros = real_rows_of_a_node_padded_with(&zero_q, &open_mask);
-    let with_noise = real_rows_of_a_node_padded_with(&random_q, &first_mask_rows);
+    let mask_rows = |from: i32, to: i32| {
+        if layout == MaskLayout::OneRow {
+            rows_of(&mask, mask_row_axis, 0, 1)
+        } else {
+            rows_of(&mask, mask_row_axis, from, to)
+        }
+    };
+    let last_q_rows = rows_of(&q, 2, q_rows - pad, q_rows);
+    let random_q = uniform_bf16(&mut rng, &[batch, q_heads, pad, DIM]);
+    let with_last_rows =
+        real_rows_of_a_node_padded_with(&last_q_rows, &mask_rows(q_rows - pad, q_rows));
+    let with_noise = real_rows_of_a_node_padded_with(&random_q, &mask_rows(100, 100 + pad));
     let first_difference = |a: &[f32], b: &[f32]| {
         a.iter()
             .zip(b)
@@ -790,43 +909,35 @@ fn check_the_output_of(output_cell: OutputCell) {
             .map(|at| (at / head_len, (at % head_len) / row_len))
     };
     assert_eq!(
-        first_difference(&with_zeros, &with_noise),
+        first_difference(&with_last_rows, &with_noise),
         None,
         "{output_cell:?}: a real row (head, query row) changes with the content of the padded \
          rows, so MLX does not keep query rows independent"
     );
     assert_eq!(
-        first_difference(&output, &with_zeros),
+        first_difference(&output, &with_last_rows),
         None,
         "{output_cell:?}: an output row (head, query row) is not the same row of the padded \
          node issued by hand"
     );
 
     // Oracle 2: an f32 reference with no attention kernel.
-    let group = q_heads / kv_heads;
-    let mut reference = Vec::new();
-    for kv_head in 0..kv_heads {
-        let f32_of = |a: &Array, from: i32, to: i32, rows: i32| {
-            a.slice(&[0, from, 0, 0], &[1, to, rows, DIM], &full, DEVICE)
-                .expect("head slice")
-                .astype(Dtype::F32, DEVICE)
-                .expect("astype f32")
-        };
-        let q_f32 = f32_of(&q, kv_head * group, (kv_head + 1) * group, q_rows);
-        let k_f32 = f32_of(&k, kv_head, kv_head + 1, k_rows);
-        let v_f32 = f32_of(&v, kv_head, kv_head + 1, k_rows);
-        let k_t = k_f32.transpose(&[0, 1, 3, 2], DEVICE).expect("transpose");
-        let scores = rmlx_mlx::matmul(&q_f32, &k_t, DEVICE).expect("q k^T");
-        let scores =
-            rmlx_mlx::multiply(&scores, &rmlx_mlx::scalar_f32(scale), DEVICE).expect("scale");
-        let scores = rmlx_mlx::add(&scores, &mask_f32, DEVICE).expect("mask");
-        let weights = rmlx_mlx::softmax_precise(&scores, -1, DEVICE).expect("softmax");
-        reference.extend(to_f32_vec(
-            &rmlx_mlx::matmul(&weights, &v_f32, DEVICE).expect("p v"),
-        ));
-    }
+    let reference = f32_reference(output_cell, [&q, &k, &v], &mask_f32, scale);
+    assert_within_one_bf16_unit(output_cell, &output, &reference, &v, &nodes);
+}
+
+/// The limit of the f32-reference oracle: one bf16 unit at the largest value.
+fn assert_within_one_bf16_unit(
+    output_cell: OutputCell,
+    output: &[f32],
+    reference: &[f32],
+    v: &Array,
+    nodes: &[AttentionCall],
+) {
+    let row_len = 256;
+    let q_rows = output_cell.q_rows;
     assert_eq!(reference.len(), output.len());
-    let largest_value = to_f32_vec(&v).iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    let largest_value = to_f32_vec(v).iter().fold(0.0f32, |m, x| m.max(x.abs()));
     // bf16 keeps 8 significant bits: one unit at magnitude `x` is 2^(exp(x) - 7).
     let one_unit = 2.0f32.powi(largest_value.log2().floor() as i32 - 7);
     let (worst_row, worst) = output
@@ -851,6 +962,26 @@ fn check_the_output_of(output_cell: OutputCell) {
         worst <= one_unit,
         "{output_cell:?}: the output differs from the f32 reference by {worst} at query row \
          {worst_row}, more than one bf16 unit ({one_unit}) at the largest value {largest_value}"
+    );
+}
+
+/// A mask the rule cannot pad is refused, not padded wrongly: its query axis
+/// holds neither one row nor the query rows.
+#[ignore = "builds attention nodes on the Metal GPU stream"]
+#[test]
+fn a_mask_with_another_row_count_is_refused() {
+    let q = rmlx_mlx::zeros(&[1, 8, 1025, 256], Dtype::Bf16, DEVICE).expect("q");
+    let kv = rmlx_mlx::zeros(&[1, 2, 3073, 256], Dtype::Bf16, DEVICE).expect("kv");
+    let mask = rmlx_mlx::zeros(&[1, 1, 7, 3073], Dtype::Bf16, DEVICE).expect("mask");
+    let (result, nodes) = recorded(|| {
+        rmlx_mlx::scaled_dot_product_attention(&q, &kv, &kv, 1.0, "array", Some(&mask), DEVICE)
+    });
+    let err = result.expect_err("a mask of 7 rows for 1025 query rows");
+    assert!(err.to_string().contains("query axis"), "{err}");
+    assert_eq!(
+        nodes,
+        Vec::new(),
+        "no node may reach mlx-c for a refused call"
     );
 }
 

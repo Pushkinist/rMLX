@@ -28,11 +28,9 @@
 # is not yet shown. A passing uninstrumented run is not evidence: that is the
 # state every entry here is in.
 #
-# NO ENTRY NOW. The four tests this file named reached MLX 0.32.3's
-# head-dim-split attention kernel with unaligned query and key rows, where the
-# instrumented compile of that kernel returns `inf` rows. No attention call
-# reaches MLX in that configuration any more (docs/FFI.md,
-# "scaled_dot_product_attention"), and each of the four passes under the
-# instrument.
+# NO ENTRY. No test of this tree fails only under the instrument. The one
+# kernel known to change under it, MLX 0.32.3's head-dim-split attention
+# kernel with unaligned query and key rows, receives no call from rMLX
+# (docs/FFI.md, "scaled_dot_product_attention").
 #
 # crate | test | reference

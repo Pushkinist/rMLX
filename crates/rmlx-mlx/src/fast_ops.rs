@@ -267,10 +267,18 @@ pub fn rope_with_freqs(
 /// evaluated is reported too. At TRACE it carries what selects MLX's attention
 /// kernel, apart from the batch size: `q_heads`, `q_rows`, `head_dim`,
 /// `kv_heads`, `k_rows`, `v_head_dim`, `dtype`, `mask` (the mask mode string)
-/// and `device`.
+/// and `device`. `caller_q_rows` is the query row count the caller gave: it
+/// differs from `q_rows` when the node's query rows are padded.
 pub const ATTENTION_CALL_TARGET: &str = "rmlx_mlx::attention_call";
 
-fn trace_attention_call(q: &Array, k: &Array, v: &Array, mask_mode: &str, device: Device) {
+fn trace_attention_call(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    mask_mode: &str,
+    device: Device,
+    caller_query_rows: Option<i32>,
+) {
     if !tracing::enabled!(target: ATTENTION_CALL_TARGET, tracing::Level::TRACE) {
         return;
     }
@@ -280,6 +288,7 @@ fn trace_attention_call(q: &Array, k: &Array, v: &Array, mask_mode: &str, device
         target: ATTENTION_CALL_TARGET,
         q_heads = dim(&q_shape, 1),
         q_rows = dim(&q_shape, 2),
+        caller_q_rows = caller_query_rows.unwrap_or_else(|| dim(&q_shape, 2)),
         head_dim = dim(&q_shape, 3),
         kv_heads = dim(&k_shape, 1),
         k_rows = dim(&k_shape, 2),
@@ -352,33 +361,37 @@ fn sdpa_under(
 ) -> Result<Array> {
     install_error_handler();
     verdict.require_match()?;
-    let Some(padded_rows) = padded_query_rows(q, v, mask_mode, device) else {
-        return attention_node(q, k, v, scale, mask_mode, mask_arr, device);
+    let Some((query_rows, padded_rows)) = padded_query_rows(q, v, mask_mode, device) else {
+        return attention_node(q, k, v, scale, mask_mode, mask_arr, device, None);
     };
-    // Rows of zeros along one axis. A zero query row over a zero mask row is an
-    // even attention over every key: finite, and never read.
-    let padded = |a: &Array, axis: usize, to: i32| -> Result<Array> {
-        let mut pad_shape = a.shape();
-        let Some(rows) = pad_shape.get_mut(axis) else {
-            return Err(Error::Mlx(
-                "scaled_dot_product_attention: an array has no row axis".to_owned(),
-            ));
-        };
-        *rows = to - *rows;
-        let pad = crate::zeros(&pad_shape, a.dtype(), device)?;
-        crate::concatenate(&[a, &pad], axis as i32, device)
+    // The padding is the array's own first rows. It keeps the dtype and every
+    // other dim, a boolean mask and a batch included, and each padded row is a
+    // real attention row: finite, and never read.
+    let padded = |a: &Array, shape: &[i32], axis: usize| -> Result<Array> {
+        let mut stop = shape.to_vec();
+        if let Some(rows) = stop.get_mut(axis) {
+            *rows = padded_rows - query_rows;
+        }
+        let first_rows = a.slice(&vec![0; stop.len()], &stop, &vec![1; stop.len()], device)?;
+        crate::concatenate(&[a, &first_rows], axis as i32, device)
     };
-    let q_shape = q.shape();
-    let query_rows = q_shape.get(QUERY_ROW_AXIS).copied().unwrap_or(0);
-    let q_padded = padded(q, QUERY_ROW_AXIS, padded_rows)?;
+    let q_padded = padded(q, &q.shape(), QUERY_ROW_AXIS)?;
     let mask_padded = match mask_arr {
         Some(mask) => {
             let mask_shape = mask.shape();
+            // MLX broadcasts the mask against `[batch, heads, query rows, key
+            // rows]`, so its query rows are its second axis from the end.
             match mask_shape.len().checked_sub(2) {
-                // A mask with one row is broadcast over the query rows, the
-                // padded rows included.
                 Some(axis) if mask_shape.get(axis) == Some(&query_rows) => {
-                    Some(padded(mask, axis, padded_rows)?)
+                    Some(padded(mask, &mask_shape, axis)?)
+                }
+                // One row, or no row axis: MLX broadcasts it over the query
+                // rows, the padded rows included.
+                Some(axis) if mask_shape.get(axis) != Some(&1) => {
+                    return Err(Error::Mlx(format!(
+                        "scaled_dot_product_attention: the mask has shape {mask_shape:?}, and \
+                         its query axis is neither 1 nor the {query_rows} query rows"
+                    )));
                 }
                 _ => None,
             }
@@ -393,6 +406,7 @@ fn sdpa_under(
         mask_mode,
         mask_padded.as_ref().or(mask_arr),
         device,
+        Some(query_rows),
     )?;
     let mut stop = node.shape();
     if let Some(rows) = stop.get_mut(QUERY_ROW_AXIS) {
@@ -402,17 +416,19 @@ fn sdpa_under(
 }
 
 const QUERY_ROW_AXIS: usize = 2;
+const HEAD_DIM_AXIS: usize = 3;
 
-/// The query row count this call must have when it reaches MLX, when that is
-/// not its own.
+/// `(query rows, padded query rows)` when this call must reach MLX with more
+/// query rows than it has.
 ///
-/// MLX 0.32.3 runs an attention call at head dim 256, with an array mask and
-/// at least 1024 query rows, on its head-dim-split Metal kernel. That kernel is
-/// compiled per call for "the query rows are a multiple of 64" and "the key
-/// rows are a multiple of 32". With both false it returns `+inf` rows under
-/// Metal device-memory shader validation. The fault is seen only under that
-/// validation: its cause is the instrumented compile of the kernel, not the
-/// kernel source. No run without the instrument has shown it.
+/// This rule is for MLX 0.32.3, the pinned version. MLX 0.32.3 runs an
+/// attention call at head dim 256, with an array mask and at least 1024 query
+/// rows, on its head-dim-split Metal kernel. That kernel is compiled per call
+/// for "the query rows are a multiple of 64" and "the key rows are a multiple
+/// of 32". With both false it returns `+inf` rows under Metal device-memory
+/// shader validation. The fault is seen only under that validation: its cause
+/// is the instrumented compile of the kernel, not the kernel source. No run
+/// without the instrument has shown it.
 ///
 /// The rule is on the query rows alone. A call with aligned key rows was
 /// measured clean, but a clean cell is a bound on a rate, and the padding
@@ -420,25 +436,38 @@ const QUERY_ROW_AXIS: usize = 2;
 /// multiple of 64, and the padded rows are sliced off the output. Query rows
 /// are independent in attention, so every real row is what the call asked for,
 /// and it stays on the fused kernel.
-fn padded_query_rows(q: &Array, v: &Array, mask_mode: &str, device: Device) -> Option<i32> {
+///
+/// When the pin moves, measure the cells of `MEASURED_CELLS` in
+/// `crates/rmlx-models/tests/prefill_attention_configuration.rs` on the new
+/// MLX under device-memory validation, then keep this rule or delete it
+/// (`docs/MLX_PAIR.md`, "Moving the pin"). The rule has no `cfg` on purpose:
+/// the mlx-c C API a binary is built against is not the MLX version it runs
+/// on, and the padding changes no real row on an MLX without the fault.
+///
+/// A call under the row floor returns after two dim reads, with no
+/// allocation: a decode step has one query row.
+fn padded_query_rows(q: &Array, v: &Array, mask_mode: &str, device: Device) -> Option<(i32, i32)> {
     const HEAD_DIM: i32 = 256;
     const MIN_QUERY_ROWS: i32 = 1024;
     const QUERY_BLOCK: i32 = 64;
     if mask_mode != "array" || device != Device::Gpu {
         return None;
     }
-    let q_shape = q.shape();
-    let query_rows = *q_shape.get(QUERY_ROW_AXIS)?;
+    let query_rows = q.dim(QUERY_ROW_AXIS).ok()?;
     if query_rows < MIN_QUERY_ROWS || query_rows % QUERY_BLOCK == 0 {
         return None;
     }
-    if q_shape.last() != Some(&HEAD_DIM) || v.shape().last() != Some(&HEAD_DIM) {
+    if q.dim(HEAD_DIM_AXIS).ok()? != HEAD_DIM || v.dim(HEAD_DIM_AXIS).ok()? != HEAD_DIM {
         return None;
     }
-    Some(query_rows + QUERY_BLOCK - query_rows % QUERY_BLOCK)
+    Some((
+        query_rows,
+        query_rows + QUERY_BLOCK - query_rows % QUERY_BLOCK,
+    ))
 }
 
 /// Hand one attention node to mlx-c. Only [`sdpa_under`] calls this.
+/// `caller_query_rows` is `Some` when the node's query rows are padded.
 fn attention_node(
     q: &Array,
     k: &Array,
@@ -447,6 +476,7 @@ fn attention_node(
     mask_mode: &str,
     mask_arr: Option<&Array>,
     device: Device,
+    caller_query_rows: Option<i32>,
 ) -> Result<Array> {
     let mode_cstr = mode_to_cstr(mask_mode, "scaled_dot_product_attention")?;
     // When mask_arr is None, use the cached null sentinel.
@@ -456,7 +486,7 @@ fn attention_node(
     };
     // sinks = null sentinel (not used for causal/sliding window).
     let sinks_null = null_sentinel();
-    trace_attention_call(q, k, v, mask_mode, device);
+    trace_attention_call(q, k, v, mask_mode, device, caller_query_rows);
     let mut res = unsafe { sys::mlx_array_new() };
     let status = unsafe {
         with_stream(device, |s| {

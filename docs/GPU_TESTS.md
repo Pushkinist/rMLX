@@ -409,10 +409,10 @@ an array mask, at least 1024 query rows, query rows that are not a multiple of
 - The cause is the instrumented compile of the kernel, not the kernel source.
 - mlx 0.31.2 and 0.32.1 do not show it.
 
-rMLX no longer sends MLX a call in that configuration (`FFI.md`,
+rMLX sends MLX no call in that configuration (`FFI.md`,
 "`scaled_dot_product_attention`"), so no test fails for this reason, and
-`scripts/gpu_instrument_only.txt` has no entry. The rule that follows stays,
-because another kernel can behave the same way.
+`scripts/gpu_instrument_only.txt` has no entry. The rule that follows is for
+another kernel that behaves the same way.
 
 After the instrumented runs of a crate, the runner runs its selected tests
 once more with no `MTL_*` or `METAL_*` variable:
