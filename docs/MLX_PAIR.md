@@ -284,6 +284,26 @@ matched pair. Across pairs the CPU SDPA test then fails: the 0.6 binary on the
 `the_pin_check_carries_the_c_api_verdict` passes on a matched pair and fails
 across pairs.
 
+## The attention row rule
+
+MLX 0.32.3 runs an attention call at `head_dim` 256, with an array mask and at
+least 1024 query rows, on its head-dim-split kernel. The kernel is compiled per
+call for "query rows a multiple of 64" and "key rows a multiple of 32". With
+both false it returns `+inf` rows under Metal device-memory shader validation.
+The cause is the instrumented compile of that kernel; no run without the
+instrument has shown the fault, and mlx 0.31.2 and 0.32.1 do not have that
+kernel.
+
+`sdpa_under` in `crates/rmlx-mlx/src/fast_ops.rs` keeps every call away from
+it: it pads the query rows of such a call to the next multiple of 64
+(`FFI.md`, "`scaled_dot_product_attention`"). The rule is on the query rows
+alone: a call with aligned key rows was measured clean, and a clean cell is
+only a bound on a rate. It has no `cfg` and runs on both mlx-c C API arms,
+because the C API a binary is built against is not the MLX it runs on. Query
+rows are independent in attention, so each real row is the row the caller
+asked for. `crates/rmlx-models/tests/prefill_attention_configuration.rs` and
+`crates/rmlx-mlx/tests/attention_check_allocations.rs` hold the rule.
+
 ## Moving the pin
 
 1. Build the new pair ([above](#building-the-pinned-pair)) and check the NAX
@@ -301,6 +321,6 @@ across pairs.
    (`crates/rmlx-models/tests/prefill_attention_configuration.rs`) in pure MLX
    on the new pair, under device-memory shader validation. If no cell returns
    a non-finite value, delete the query-row rule in `sdpa_under`
-   (`docs/FFI.md`, "`scaled_dot_product_attention`") and its tests. If the
+   ([above](#the-attention-row-rule)) and its tests. If the
    faulty shapes changed, change the rule and the table together.
 6. Re-run a prefill cell and compare its prefill rate with the old pair's.

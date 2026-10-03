@@ -502,39 +502,23 @@ One function, `sdpa_under`, builds every attention node, and it holds one rule
 on the query rows. On the GPU, with `"array"`, `head_dim` 256 for Q and V, and
 at least 1024 query rows that are not a multiple of 64, the node reaches MLX
 with its query rows padded to the next multiple of 64. The padding is the
-first rows of Q, and the first rows of the mask to match, so the mask keeps
-its dtype and layout. A mask with one row is broadcast and is not padded. A
-mask whose query axis has another size is refused with an error. The padded
-rows are sliced off the output. Query rows are independent in attention, so
-each real row is the row the caller asked for.
+first rows of Q and of the mask, so the mask keeps its dtype and layout. A
+one-row mask is broadcast and not padded; a mask with another row count is
+refused. The padded rows are sliced off the output. Why: [`MLX_PAIR.md`](MLX_PAIR.md) §
+"The attention row rule".
 
-The reason is in MLX 0.32.3, the pinned version. Its head-dim-split kernel
-(`sdpa_full` at 256 below) is compiled per call for "query rows a multiple of
-64" and "key rows a multiple of 32". With both false and an array mask, it
-returns `+inf` rows under Metal device-memory shader validation. The cause is
-the instrumented compile of that kernel; no run without the instrument has
-shown the fault. The rule is on the query rows alone, because a call with
-aligned key rows was measured clean and a clean cell is only a bound on a
-rate. The rule has no `cfg`: it runs on both mlx-c C API arms.
+An affected call costs, in each attention layer that issues one:
 
-The cost of an affected call, for each attention layer that issues one:
+- up to 63 more query rows in the kernel;
+- one copy of Q, `batch × heads × padded rows × 256` elements;
+- one copy of the mask, `padded rows × key rows` elements. A model shares one
+  mask across its layers, and the wrapper pads it again in each layer: about
+  131 MB a layer at 2000 query rows over 32,000 keys in bf16.
 
-- up to 63 more query rows in the attention kernel;
-- one copy of Q: `batch × heads × padded rows × 256` elements;
-- one copy of the mask: `padded rows × key rows` elements in the mask dtype.
-  A model builds one mask for a forward and shares it across its layers, but
-  the wrapper pads it again in each layer. At 2000 query rows over 32,000 keys
-  in bf16 that is about 131 MB for each layer;
-- the output slice is a view.
-
-The copies are lazy graph nodes that MLX evaluates with the forward. Their
-time and peak memory are not measured.
-
-Every other call pays the check and nothing else. A call under 1024 query
-rows returns after one dim read and allocates nothing in Rust: a decode step
-has one query row (`crates/rmlx-mlx/tests/attention_check_allocations.rs`).
-`crates/rmlx-models/tests/prefill_attention_configuration.rs` holds the rule
-at the mlx-c call, by shape, and holds the output.
+The output slice is a view. The copies are lazy nodes; their time and peak
+memory are not measured. Every other call pays the check: under 1024 query
+rows it is one dim read with no Rust allocation, and a decode step has one
+query row.
 
 It is not always a FlashAttention kernel. `head_dim` decides, silently,
 whether the call reaches a fused kernel or a composite graph.
