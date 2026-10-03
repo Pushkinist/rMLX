@@ -260,6 +260,36 @@ pub fn rope_with_freqs(
     Ok(Array { inner: res })
 }
 
+/// The `tracing` target of the one event per attention call handed to MLX.
+///
+/// At TRACE the event carries what selects MLX's attention kernel: `q_heads`,
+/// `q_rows`, `head_dim`, `kv_heads`, `k_rows`, `v_head_dim`, `dtype`, `mask`
+/// (the mask mode string) and `device`. It is emitted where the call leaves
+/// this crate, so it reports the calls MLX receives and not the calls a caller
+/// asked for.
+pub const ATTENTION_CALL_TARGET: &str = "rmlx_mlx::attention_call";
+
+fn trace_attention_call(q: &Array, k: &Array, v: &Array, mask_mode: &str, device: Device) {
+    if !tracing::enabled!(target: ATTENTION_CALL_TARGET, tracing::Level::TRACE) {
+        return;
+    }
+    let (q_shape, k_shape, v_shape) = (q.shape(), k.shape(), v.shape());
+    let dim = |shape: &[i32], axis: usize| shape.get(axis).copied().unwrap_or(-1);
+    tracing::trace!(
+        target: ATTENTION_CALL_TARGET,
+        q_heads = dim(&q_shape, 1),
+        q_rows = dim(&q_shape, 2),
+        head_dim = dim(&q_shape, 3),
+        kv_heads = dim(&k_shape, 1),
+        k_rows = dim(&k_shape, 2),
+        v_head_dim = dim(&v_shape, 3),
+        dtype = ?q.dtype(),
+        mask = mask_mode,
+        device = ?device,
+        "attention call"
+    );
+}
+
 /// Scaled dot-product attention.
 ///
 /// `q`, `k`, `v` shapes: `[batch, n_heads, seq_len, head_dim]`.
@@ -326,6 +356,7 @@ fn sdpa_under(
     };
     // sinks = null sentinel (not used for causal/sliding window).
     let sinks_null = null_sentinel();
+    trace_attention_call(q, k, v, mask_mode, device);
     let mut res = unsafe { sys::mlx_array_new() };
     let status = unsafe {
         with_stream(device, |s| {

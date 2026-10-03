@@ -85,6 +85,7 @@ use rmlx_mlx::Device;
 use rmlx_models::arch;
 use rmlx_models::{Pcg32, PenaltyConfig, SamplerConfig};
 
+pub mod attention_calls;
 pub mod round_stream;
 
 #[cfg(test)]

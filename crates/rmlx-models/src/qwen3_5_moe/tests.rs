@@ -28,6 +28,22 @@ use super::prompt_cache::Qwen35MoeEntry;
 use crate::prompt_cache::{PromptCache, BLOCK_TOKENS};
 use rmlx_kv_ssd::chained_block_hashes;
 
+#[allow(
+    dead_code,
+    unreachable_pub,
+    clippy::panic,
+    reason = "shared with the integration tests, which use more of it"
+)]
+#[path = "../../tests/common/attention_calls.rs"]
+mod attention_calls;
+#[allow(
+    dead_code,
+    unreachable_pub,
+    reason = "shared with the integration tests, which use more of it"
+)]
+#[path = "../../tests/common/round_stream.rs"]
+mod round_stream;
+
 /// The PARO snapshot the PARO cells below read, and the variable that overrides
 /// it for a models root that does not hold it.
 const PARO_SLUG: &str = "z-lab__Qwen3.6-27B-PARO";
@@ -97,6 +113,105 @@ fn moe_consume_branch(
         Consumed::Reuse { kind, .. } => format!("Reuse{kind:?}"),
         Consumed::Miss(reason) => reason.label().to_owned(),
     }
+}
+
+/// The caches a fresh prefill leaves for `prefix`: `enter_prefill`, the prefix
+/// in production chunks, `exit_prefill`, then evaluated for a hand-over.
+#[allow(
+    clippy::expect_used,
+    reason = "test helper: a failed prefill is a failed test"
+)]
+fn prefilled_prefix_caches(
+    model: &Qwen3_5MoeText,
+    prefix: &[u32],
+    kv_quant: rmlx_kv_quant::KvQuant,
+    max_seq: i32,
+) -> (
+    Vec<rmlx_kv_quant::KvCache>,
+    Vec<rmlx_kv_quant::LinearAttnCache>,
+) {
+    let device = Device::Gpu;
+    let n_layers = model.cfg.num_hidden_layers;
+    let mut kv_caches: Vec<rmlx_kv_quant::KvCache> =
+        crate::kv_cache::kv_layer_quants(n_layers, kv_quant, false)
+            .into_iter()
+            .enumerate()
+            .map(|(i, q)| rmlx_kv_quant::KvCache::with_quant_max_seq(q, max_seq).with_layer_idx(i))
+            .collect();
+    let mut lin_caches: Vec<rmlx_kv_quant::LinearAttnCache> = (0..n_layers)
+        .map(|_| rmlx_kv_quant::LinearAttnCache::new())
+        .collect();
+
+    for c in &mut kv_caches {
+        c.enter_prefill();
+    }
+    let prefill_chunk = crate::prefill_chunk::prefill_chunk_for("qwen3_5_moe");
+    let n_chunks = prefix.len().div_ceil(prefill_chunk);
+    for (chunk_idx, chunk) in prefix.chunks(prefill_chunk).enumerate() {
+        let logits = model
+            .forward_seq_with_cache(chunk, Some(&mut kv_caches), Some(&mut lin_caches), device)
+            .expect("prefix prefill chunk");
+        if chunk_idx + 1 == n_chunks {
+            logits.eval().expect("eval last-chunk logits");
+        } else {
+            for c in &kv_caches {
+                c.eval_prefill_state().expect("eval_prefill_state");
+            }
+        }
+    }
+    for c in &mut kv_caches {
+        c.exit_prefill(device).expect("exit_prefill");
+    }
+    for c in &kv_caches {
+        c.eval_for_spill().expect("eval_for_spill kv");
+    }
+    for c in &lin_caches {
+        c.eval_for_spill().expect("eval_for_spill lin");
+    }
+    (kv_caches, lin_caches)
+}
+
+/// Replace the prompt cache's content with one entry for `prefix`, marked
+/// SSD-hydrated: the only entry the HydratedTail arm takes.
+#[allow(
+    clippy::expect_used,
+    reason = "test helper: a failed clone is a failed test"
+)]
+fn push_hydrated_prefix(
+    model: &Qwen3_5MoeText,
+    prefix: &[u32],
+    kv_caches: &[rmlx_kv_quant::KvCache],
+    lin_caches: &[rmlx_kv_quant::LinearAttnCache],
+    kv_quant: rmlx_kv_quant::KvQuant,
+) {
+    prompt_cache::PROMPT_CACHE.with_inner_mut(|guard| {
+        if let Some(cache) = guard.as_mut() {
+            cache.clear();
+            let prefix_ids = prefix.to_vec();
+            let block_hashes = crate::prompt_cache::chained_block_hashes_seeded(
+                &prefix_ids,
+                moe_push_seed(model, kv_quant),
+            );
+            let kv_snap: rmlx_core::error::Result<Vec<_>> = kv_caches
+                .iter()
+                .map(rmlx_kv_quant::KvCache::try_deep_clone)
+                .collect();
+            let lin_snap: rmlx_core::error::Result<Vec<_>> = lin_caches
+                .iter()
+                .map(rmlx_kv_quant::LinearAttnCache::try_deep_clone)
+                .collect();
+            cache.push(Qwen35MoeEntry {
+                prompt_token_ids: prefix_ids,
+                block_hashes,
+                kv_caches: kv_snap.expect("kv clone"),
+                lin_caches: lin_snap.expect("lin clone"),
+                first_id: 0,
+                first_piece: String::new(),
+                kv_quant: Some(kv_quant),
+                is_ssd_hydrated: true,
+            });
+        }
+    });
 }
 
 /// Rows of a `[1, n_rows, vocab]` logits array as `f32`.
@@ -2091,7 +2206,6 @@ fn hydrated_tail_produces_identical_output() {
 
     println!("Loading model from {}", model_dir.display());
     let model = load_from_path(model_dir).expect("load model");
-    let n_layers = model.cfg.num_hidden_layers;
     let device = Device::Gpu;
 
     // Unquantized KV: the codec adds no error of its own, so what remains
@@ -2170,87 +2284,18 @@ fn hydrated_tail_produces_identical_output() {
     );
 
     // ── Step 2: Build a real KV/lin snapshot for the block-aligned prefix ────
-    // Run a manual prefill of `prompt_ids[..prefix_len]` using the same KV
-    // stack as Path C in generate_greedy, so the snapshot is physically correct.
-    let (prefix_kv_caches, prefix_lin_caches) = {
-        let mut kv_caches: Vec<rmlx_kv_quant::KvCache> =
-            crate::kv_cache::kv_layer_quants(n_layers, kv_quant, false)
-                .into_iter()
-                .enumerate()
-                .map(|(i, q)| {
-                    rmlx_kv_quant::KvCache::with_quant_max_seq(q, max_seq).with_layer_idx(i)
-                })
-                .collect();
-        let mut lin_caches: Vec<rmlx_kv_quant::LinearAttnCache> = (0..n_layers)
-            .map(|_| rmlx_kv_quant::LinearAttnCache::new())
-            .collect();
-
-        // Mirror Path C: enter_prefill → run prefix chunks → exit_prefill.
-        for c in &mut kv_caches {
-            c.enter_prefill();
-        }
-        let prefill_chunk = crate::prefill_chunk::prefill_chunk_for("qwen3_5_moe");
-        let prefix = &prompt_ids[..prefix_len];
-        let n_chunks = prefix.len().div_ceil(prefill_chunk);
-        for (chunk_idx, chunk) in prefix.chunks(prefill_chunk).enumerate() {
-            let is_last = chunk_idx + 1 == n_chunks;
-            let logits = model
-                .forward_seq_with_cache(chunk, Some(&mut kv_caches), Some(&mut lin_caches), device)
-                .expect("prefix prefill chunk");
-            if is_last {
-                // materialise the last-chunk logits so arrays are evaluated.
-                logits.eval().expect("eval last-chunk logits");
-            } else {
-                for c in &kv_caches {
-                    c.eval_prefill_state().expect("eval_prefill_state");
-                }
-            }
-        }
-        for c in &mut kv_caches {
-            c.exit_prefill(device).expect("exit_prefill");
-        }
-        // Pre-eval for safe cross-thread use (mirrors Path C's pre-eval before push).
-        for c in &kv_caches {
-            c.eval_for_spill().expect("eval_for_spill kv");
-        }
-        for c in &lin_caches {
-            c.eval_for_spill().expect("eval_for_spill lin");
-        }
-        (kv_caches, lin_caches)
-    };
+    let (prefix_kv_caches, prefix_lin_caches) =
+        prefilled_prefix_caches(&model, &prompt_ids[..prefix_len], kv_quant, max_seq);
 
     // ── Step 3: WARM — inject SSD-hydrated prefix, re-run generate_greedy ───
     // Clear the cache, then inject the prefix snapshot as a "SSD-hydrated" entry.
-    prompt_cache::PROMPT_CACHE.with_inner_mut(|guard| {
-        if let Some(cache) = guard.as_mut() {
-            cache.clear();
-            let prefix_ids = prompt_ids[..prefix_len].to_vec();
-            let block_hashes = crate::prompt_cache::chained_block_hashes_seeded(
-                &prefix_ids,
-                moe_push_seed(&model, kv_quant),
-            );
-            let kv_snap: rmlx_core::error::Result<Vec<_>> = prefix_kv_caches
-                .iter()
-                .map(rmlx_kv_quant::KvCache::try_deep_clone)
-                .collect();
-            let lin_snap: rmlx_core::error::Result<Vec<_>> = prefix_lin_caches
-                .iter()
-                .map(rmlx_kv_quant::LinearAttnCache::try_deep_clone)
-                .collect();
-            let (kv_snap, lin_snap) = (kv_snap.expect("kv clone"), lin_snap.expect("lin clone"));
-            cache.push(Qwen35MoeEntry {
-                prompt_token_ids: prefix_ids,
-                block_hashes,
-                kv_caches: kv_snap,
-                lin_caches: lin_snap,
-                first_id: 0,
-                first_piece: String::new(),
-                kv_quant: Some(kv_quant),
-                // KEY: mark as SSD-hydrated so the HydratedTail arm fires.
-                is_ssd_hydrated: true,
-            });
-        }
-    });
+    push_hydrated_prefix(
+        &model,
+        &prompt_ids[..prefix_len],
+        &prefix_kv_caches,
+        &prefix_lin_caches,
+        kv_quant,
+    );
 
     assert_eq!(
         moe_consume_branch(&model, &prompt_ids, kv_quant),
@@ -2315,35 +2360,13 @@ fn hydrated_tail_produces_identical_output() {
     divergent_prompt[prefix_len - 1] = altered_val;
 
     // Inject the original prefix snapshot back (it was consumed by the warm run's push).
-    prompt_cache::PROMPT_CACHE.with_inner_mut(|guard| {
-        if let Some(cache) = guard.as_mut() {
-            cache.clear();
-            let prefix_ids = prompt_ids[..prefix_len].to_vec();
-            let block_hashes = crate::prompt_cache::chained_block_hashes_seeded(
-                &prefix_ids,
-                moe_push_seed(&model, kv_quant),
-            );
-            let kv_snap: rmlx_core::error::Result<Vec<_>> = prefix_kv_caches
-                .iter()
-                .map(rmlx_kv_quant::KvCache::try_deep_clone)
-                .collect();
-            let lin_snap: rmlx_core::error::Result<Vec<_>> = prefix_lin_caches
-                .iter()
-                .map(rmlx_kv_quant::LinearAttnCache::try_deep_clone)
-                .collect();
-            let (kv_snap, lin_snap) = (kv_snap.expect("kv clone"), lin_snap.expect("lin clone"));
-            cache.push(Qwen35MoeEntry {
-                prompt_token_ids: prefix_ids,
-                block_hashes,
-                kv_caches: kv_snap,
-                lin_caches: lin_snap,
-                first_id: 0,
-                first_piece: String::new(),
-                kv_quant: Some(kv_quant),
-                is_ssd_hydrated: true,
-            });
-        }
-    });
+    push_hydrated_prefix(
+        &model,
+        &prompt_ids[..prefix_len],
+        &prefix_kv_caches,
+        &prefix_lin_caches,
+        kv_quant,
+    );
 
     assert_eq!(
         moe_consume_branch(&model, &divergent_prompt, kv_quant),
@@ -2409,6 +2432,123 @@ fn hydrated_tail_produces_identical_output() {
     println!(
         "hydrated_tail_produces_identical_output PASS: \
          prefix_len={prefix_len} tail_len={tail_len} n_decode={n_decode}"
+    );
+}
+
+/// A request that resumes an SSD-hydrated prefix forwards its tail through a
+/// chunk loop of its own. The tail here is 1025 tokens over a 2048-token
+/// prefix: one chunk of 1025 query rows over 3073 keys, with an array mask.
+/// `tests/prefill_attention_configuration.rs` states the configuration and
+/// holds the other prefill paths; this cell is here because a hydrated entry
+/// needs the crate-private cache.
+#[test]
+#[ignore = "loads a model and drives the Metal GPU"]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: indices bounded by slice length validated before call"
+)]
+fn a_hydrated_tail_issues_no_attention_call_in_the_faulty_configuration() {
+    let Some(model_dir_buf) = crate::test_snapshot::snapshot(
+        "a_hydrated_tail_issues_no_attention_call_in_the_faulty_configuration",
+        MOE_VAR,
+        MOE_SLUG,
+        &MOE_ARCHS,
+    ) else {
+        return;
+    };
+    let model_dir = model_dir_buf.as_path();
+    let model = load_from_path(model_dir).expect("load model");
+    let tokenizer =
+        tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json")).expect("load tokenizer");
+    let device = Device::Gpu;
+    let kv_quant = rmlx_kv_quant::KvQuant::None;
+    let max_seq = 4096i32;
+
+    let prefix_len = 8 * BLOCK_TOKENS;
+    let prompt_len = prefix_len + 1025;
+    let prompt_ids: Vec<u32> = (1u32..=prompt_len as u32)
+        .map(|i| (i % 9999).max(1))
+        .collect();
+
+    prompt_cache::ensure_prompt_cache(4);
+    let (kv_caches, lin_caches) =
+        prefilled_prefix_caches(&model, &prompt_ids[..prefix_len], kv_quant, max_seq);
+    push_hydrated_prefix(
+        &model,
+        &prompt_ids[..prefix_len],
+        &kv_caches,
+        &lin_caches,
+        kv_quant,
+    );
+    assert_eq!(
+        moe_consume_branch(&model, &prompt_ids, kv_quant),
+        format!("HydratedTail{{prefix_len={prefix_len}}}"),
+        "the hydrated prefix must reach HydratedTail: a Miss prefills the whole prompt \
+         through another chunk loop"
+    );
+
+    let sampler_cfg = crate::sampler::SamplerConfig {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        min_p: 0.0,
+        seed: Some(0),
+        top_logprobs_k: 0,
+    };
+    let penalty_cfg = crate::sampler::PenaltyConfig::default();
+    let mut rng = crate::sampler::Pcg32::new(sampler_cfg.seed_or_default());
+    let mut token_history: Vec<u32> = Vec::new();
+    let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> Option<u32> { None };
+    let (steps, calls) = attention_calls::recorded(|| {
+        generate_greedy(
+            &model,
+            &tokenizer,
+            &prompt_ids,
+            1,
+            device,
+            kv_quant,
+            Some(max_seq),
+            4,
+            &[],
+            &mut step_fn,
+            None,
+            &sampler_cfg,
+            &mut rng,
+            &penalty_cfg,
+            &mut token_history,
+        )
+        .expect("warm generate_greedy")
+    });
+    assert_eq!(steps.len(), 1);
+    prompt_cache::PROMPT_CACHE.with_inner_mut(|guard| {
+        if let Some(cache) = guard.as_mut() {
+            cache.clear();
+        }
+    });
+
+    assert!(
+        calls.iter().any(|c| c.k_rows == prompt_len as i64),
+        "no attention call covered the whole prompt of {prompt_len} tokens"
+    );
+    assert!(
+        calls.iter().all(|c| c.k_rows > c.q_rows),
+        "a call of the request starts at key row zero, so it did not resume the prefix"
+    );
+    let faulty: Vec<&attention_calls::AttentionCall> = calls
+        .iter()
+        .filter(|c| attention_calls::is_faulty(c))
+        .collect();
+    assert!(
+        faulty.is_empty(),
+        "the hydrated tail issued {} of {} attention calls in the configuration where the \
+         pinned MLX returns non-finite rows under device-memory validation; first: {:?}",
+        faulty.len(),
+        calls.len(),
+        faulty.first()
     );
 }
 
