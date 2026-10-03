@@ -32,6 +32,7 @@ use rmlx_kv_ssd::chained_block_hashes;
     dead_code,
     unreachable_pub,
     clippy::panic,
+    clippy::expect_used,
     reason = "shared with the integration tests, which use more of it"
 )]
 #[path = "../../tests/common/attention_calls.rs"]
@@ -2436,11 +2437,11 @@ fn hydrated_tail_produces_identical_output() {
 }
 
 /// A request that resumes an SSD-hydrated prefix forwards its tail through a
-/// chunk loop of its own. The tail here is 1025 tokens over a 2048-token
-/// prefix: one chunk of 1025 query rows over 3073 keys, with an array mask.
-/// `tests/prefill_attention_configuration.rs` states the configuration and
-/// holds the other prefill paths; this cell is here because a hydrated entry
-/// needs the crate-private cache.
+/// chunk loop of its own. Two tails over a 2048-token prefix: 1025 tokens at
+/// the default chunk, and one chunk plus 1025 tokens at a chunk the adaptive
+/// controller installs. `tests/prefill_attention_configuration.rs` states the
+/// configuration and why the call itself is where the rule is held; this cell
+/// is evidence on the one resume path that needs the crate-private cache.
 #[test]
 #[ignore = "loads a model and drives the Metal GPU"]
 #[allow(
@@ -2452,6 +2453,7 @@ fn hydrated_tail_produces_identical_output() {
     reason = "bounds established by construction: indices bounded by slice length validated before call"
 )]
 fn a_hydrated_tail_issues_no_attention_call_in_the_faulty_configuration() {
+    const ADAPTIVE_CHUNK: usize = 1296;
     let Some(model_dir_buf) = crate::test_snapshot::snapshot(
         "a_hydrated_tail_issues_no_attention_call_in_the_faulty_configuration",
         MOE_VAR,
@@ -2466,31 +2468,10 @@ fn a_hydrated_tail_issues_no_attention_call_in_the_faulty_configuration() {
         tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json")).expect("load tokenizer");
     let device = Device::Gpu;
     let kv_quant = rmlx_kv_quant::KvQuant::None;
-    let max_seq = 4096i32;
+    let max_seq = 8192i32;
+    attention_calls::assert_the_recorder_is_live(device);
 
     let prefix_len = 8 * BLOCK_TOKENS;
-    let prompt_len = prefix_len + 1025;
-    let prompt_ids: Vec<u32> = (1u32..=prompt_len as u32)
-        .map(|i| (i % 9999).max(1))
-        .collect();
-
-    prompt_cache::ensure_prompt_cache(4);
-    let (kv_caches, lin_caches) =
-        prefilled_prefix_caches(&model, &prompt_ids[..prefix_len], kv_quant, max_seq);
-    push_hydrated_prefix(
-        &model,
-        &prompt_ids[..prefix_len],
-        &kv_caches,
-        &lin_caches,
-        kv_quant,
-    );
-    assert_eq!(
-        moe_consume_branch(&model, &prompt_ids, kv_quant),
-        format!("HydratedTail{{prefix_len={prefix_len}}}"),
-        "the hydrated prefix must reach HydratedTail: a Miss prefills the whole prompt \
-         through another chunk loop"
-    );
-
     let sampler_cfg = crate::sampler::SamplerConfig {
         temperature: 0.0,
         top_p: 1.0,
@@ -2500,55 +2481,87 @@ fn a_hydrated_tail_issues_no_attention_call_in_the_faulty_configuration() {
         top_logprobs_k: 0,
     };
     let penalty_cfg = crate::sampler::PenaltyConfig::default();
-    let mut rng = crate::sampler::Pcg32::new(sampler_cfg.seed_or_default());
-    let mut token_history: Vec<u32> = Vec::new();
-    let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> Option<u32> { None };
-    let (steps, calls) = attention_calls::recorded(|| {
-        generate_greedy(
-            &model,
-            &tokenizer,
-            &prompt_ids,
-            1,
-            device,
-            kv_quant,
-            Some(max_seq),
-            4,
-            &[],
-            &mut step_fn,
-            None,
-            &sampler_cfg,
-            &mut rng,
-            &penalty_cfg,
-            &mut token_history,
-        )
-        .expect("warm generate_greedy")
-    });
-    assert_eq!(steps.len(), 1);
-    prompt_cache::PROMPT_CACHE.with_inner_mut(|guard| {
-        if let Some(cache) = guard.as_mut() {
-            cache.clear();
-        }
-    });
+    let mut offenders = Vec::new();
 
+    for (chunk, tail_len) in [(0usize, 1025usize), (ADAPTIVE_CHUNK, ADAPTIVE_CHUNK + 1025)] {
+        let prompt_len = prefix_len + tail_len;
+        let prompt_ids: Vec<u32> = (1u32..=prompt_len as u32)
+            .map(|i| (i % 9999).max(1))
+            .collect();
+
+        prompt_cache::ensure_prompt_cache(4);
+        let (kv_caches, lin_caches) =
+            prefilled_prefix_caches(&model, &prompt_ids[..prefix_len], kv_quant, max_seq);
+        push_hydrated_prefix(
+            &model,
+            &prompt_ids[..prefix_len],
+            &kv_caches,
+            &lin_caches,
+            kv_quant,
+        );
+        assert_eq!(
+            moe_consume_branch(&model, &prompt_ids, kv_quant),
+            format!("HydratedTail{{prefix_len={prefix_len}}}"),
+            "the hydrated prefix must reach HydratedTail: a Miss prefills the whole prompt \
+             through another chunk loop"
+        );
+
+        crate::prefill_chunk::set_prefill_chunk(chunk);
+        let mut rng = crate::sampler::Pcg32::new(sampler_cfg.seed_or_default());
+        let mut token_history: Vec<u32> = Vec::new();
+        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> Option<u32> { None };
+        let (steps, calls) = attention_calls::recorded(|| {
+            generate_greedy(
+                &model,
+                &tokenizer,
+                &prompt_ids,
+                1,
+                device,
+                kv_quant,
+                Some(max_seq),
+                4,
+                &[],
+                &mut step_fn,
+                None,
+                &sampler_cfg,
+                &mut rng,
+                &penalty_cfg,
+                &mut token_history,
+            )
+        });
+        crate::prefill_chunk::set_prefill_chunk(0);
+        prompt_cache::PROMPT_CACHE.with_inner_mut(|guard| {
+            if let Some(cache) = guard.as_mut() {
+                cache.clear();
+            }
+        });
+        assert_eq!(steps.expect("warm generate_greedy").len(), 1);
+
+        assert!(
+            calls.iter().any(|c| c.k_rows == prompt_len as i64),
+            "no attention call covered the whole prompt of {prompt_len} tokens"
+        );
+        assert!(
+            calls.iter().all(|c| c.k_rows > c.q_rows),
+            "a call of the request starts at key row zero, so it did not resume the prefix"
+        );
+        let faulty: Vec<&attention_calls::AttentionCall> = calls
+            .iter()
+            .filter(|c| attention_calls::is_faulty(c))
+            .collect();
+        if let Some(first) = faulty.first() {
+            offenders.push(format!(
+                "chunk override {chunk}, tail of {tail_len} tokens: {} of {} calls, first {first:?}",
+                faulty.len(),
+                calls.len()
+            ));
+        }
+    }
     assert!(
-        calls.iter().any(|c| c.k_rows == prompt_len as i64),
-        "no attention call covered the whole prompt of {prompt_len} tokens"
-    );
-    assert!(
-        calls.iter().all(|c| c.k_rows > c.q_rows),
-        "a call of the request starts at key row zero, so it did not resume the prefix"
-    );
-    let faulty: Vec<&attention_calls::AttentionCall> = calls
-        .iter()
-        .filter(|c| attention_calls::is_faulty(c))
-        .collect();
-    assert!(
-        faulty.is_empty(),
-        "the hydrated tail issued {} of {} attention calls in the configuration where the \
-         pinned MLX returns non-finite rows under device-memory validation; first: {:?}",
-        faulty.len(),
-        calls.len(),
-        faulty.first()
+        offenders.is_empty(),
+        "a hydrated tail issued an attention call in the configuration where the pinned MLX \
+         returns non-finite rows under device-memory validation:\n  {}",
+        offenders.join("\n  ")
     );
 }
 

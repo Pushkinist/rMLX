@@ -260,13 +260,14 @@ pub fn rope_with_freqs(
     Ok(Array { inner: res })
 }
 
-/// The `tracing` target of the one event per attention call handed to MLX.
+/// The `tracing` target of one event for each attention node handed to mlx-c.
 ///
-/// At TRACE the event carries what selects MLX's attention kernel: `q_heads`,
-/// `q_rows`, `head_dim`, `kv_heads`, `k_rows`, `v_head_dim`, `dtype`, `mask`
-/// (the mask mode string) and `device`. It is emitted where the call leaves
-/// this crate, so it reports the calls MLX receives and not the calls a caller
-/// asked for.
+/// The event is emitted at graph construction, beside the one call of
+/// `mlx_fast_scaled_dot_product_attention`. A node that is built and never
+/// evaluated is reported too. At TRACE it carries what selects MLX's attention
+/// kernel, apart from the batch size: `q_heads`, `q_rows`, `head_dim`,
+/// `kv_heads`, `k_rows`, `v_head_dim`, `dtype`, `mask` (the mask mode string)
+/// and `device`.
 pub const ATTENTION_CALL_TARGET: &str = "rmlx_mlx::attention_call";
 
 fn trace_attention_call(q: &Array, k: &Array, v: &Array, mask_mode: &str, device: Device) {

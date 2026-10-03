@@ -75,6 +75,29 @@ pub fn recorded<T>(body: impl FnOnce() -> T) -> (T, Vec<AttentionCall>) {
     (out, calls)
 }
 
+/// Control, in the same process as the cells: the recorder is live. A call
+/// outside the configuration, built and never evaluated, reaches it with its
+/// own shape.
+pub fn assert_the_recorder_is_live(device: rmlx_mlx::Device) {
+    use rmlx_mlx::{zeros, Dtype};
+    let ((), calls) = recorded(|| {
+        let q = zeros(&[1, 4, 1025, 128], Dtype::Bf16, device).expect("q");
+        let kv = zeros(&[1, 2, 3073, 128], Dtype::Bf16, device).expect("kv");
+        let mask = zeros(&[1, 1, 1025, 3073], Dtype::Bf16, device).expect("mask");
+        rmlx_mlx::scaled_dot_product_attention(&q, &kv, &kv, 1.0, "array", Some(&mask), device)
+            .expect("control call");
+    });
+    let shapes: Vec<(i64, i64, i64)> = calls
+        .iter()
+        .map(|c| (c.q_rows, c.k_rows, c.head_dim))
+        .collect();
+    assert_eq!(
+        shapes,
+        vec![(1025, 3073, 128)],
+        "control: the recorder must see the one call that was built"
+    );
+}
+
 /// The head dim MLX 0.32.3 gives its head-dim-split attention kernel in a
 /// masked prefill.
 pub const SPLIT_KERNEL_HEAD_DIM: i64 = 256;
