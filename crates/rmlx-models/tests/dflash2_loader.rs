@@ -269,14 +269,23 @@ const FORWARD_REFERENCE: &str = concat!(
 );
 
 /// Largest absolute difference from the reference this forward is allowed on
-/// the published weights.
+/// the published weights: two bf16 places at the magnitude these hidden states
+/// reach (27, where a place is 0.125).
 ///
-/// Both sides run the same MLX ops on the same device here, and the measured
-/// difference is zero — the two are bit-identical. The bound is one bf16 place
-/// at the magnitude these hidden states reach (27, where a place is 0.125), so
-/// a rounding difference from a future kernel choice passes and an algebraic
-/// one does not.
-const FORWARD_TOL: f32 = 0.125;
+/// The reference was written on MLX 0.31.2, and there this forward is
+/// bit-identical to it. MLX 0.32.1 and 0.32.3 sum a bf16 product of 2 to 15
+/// rows in a different order, and the forward moves with them. Measured with
+/// `cargo test -p rmlx-models --test dflash2_loader -- --ignored --nocapture
+/// the_forward_reproduces`, the same figures on 0.32.1 / mlx-c 0.6.0_4 and on
+/// 0.32.3 / mlx-c 0.7.0: of 40960 cells, 6827 are equal, 39579 are within 1/32,
+/// 40843 within 1/16, 40959 within 1/8, and the last one differs by 0.171875.
+/// That is rounding spread over five cells in six, not one wrong cell.
+///
+/// An algebraic change is two orders of magnitude away. With the conditioning
+/// norm removed the largest difference is 21.8, with the layers run in reverse
+/// order 27.75, with the first layer skipped 33.4, and in each case more than
+/// 36000 cells differ by more than 1/4.
+const FORWARD_TOL: f32 = 0.25;
 
 /// The inputs the reference was run over: `count` values from an integer
 /// recurrence, so nothing but the reference's answer has to be committed.
@@ -323,7 +332,8 @@ fn reference_ids(name: &str) -> Vec<u32> {
         .collect()
 }
 
-fn max_abs_diff(a: &rmlx_mlx::Array, b: &rmlx_mlx::Array) -> f32 {
+/// `|a - b|` per cell, both sides read back as f32.
+fn abs_diffs(a: &rmlx_mlx::Array, b: &rmlx_mlx::Array) -> Vec<f32> {
     let f32s = |x: &rmlx_mlx::Array| -> Vec<f32> {
         let c = x
             .astype(rmlx_mlx::Dtype::F32, Device::Gpu)
@@ -337,10 +347,7 @@ fn max_abs_diff(a: &rmlx_mlx::Array, b: &rmlx_mlx::Array) -> f32 {
     };
     let (x, y) = (f32s(a), f32s(b));
     assert_eq!(x.len(), y.len(), "compared arrays must be the same length");
-    x.iter()
-        .zip(&y)
-        .map(|(p, q)| (p - q).abs())
-        .fold(0.0f32, f32::max)
+    x.iter().zip(&y).map(|(p, q)| (p - q).abs()).collect()
 }
 
 /// The forward reproduces the reference implementation on the published
@@ -381,8 +388,20 @@ fn the_forward_reproduces_the_reference_on_the_published_weights() {
         want.shape(),
         "the forward returns one hidden row per block position"
     );
-    let diff = max_abs_diff(&got, &want);
+    let diffs = abs_diffs(&got, &want);
+    let diff = diffs.iter().copied().fold(0.0f32, f32::max);
     println!("dflash2 published-weight forward: max abs diff {diff}");
+    let upto = |bound: f32| diffs.iter().filter(|d| **d <= bound).count();
+    println!(
+        "dflash2 published-weight forward: of {} cells, {} equal, {} within 1/32, \
+         {} within 1/16, {} within 1/8, {} within 1/4",
+        diffs.len(),
+        upto(0.0),
+        upto(0.031_25),
+        upto(0.062_5),
+        upto(0.125),
+        upto(0.25),
+    );
     assert!(
         diff <= FORWARD_TOL,
         "the forward differs from the reference by {diff} on the published weights"
