@@ -2453,7 +2453,7 @@ fn hydrated_tail_produces_identical_output() {
     reason = "bounds established by construction: indices bounded by slice length validated before call"
 )]
 fn a_hydrated_tail_issues_no_attention_call_in_the_faulty_configuration() {
-    const ADAPTIVE_CHUNK: usize = 1296;
+    use attention_calls::{ChunkOverride, ADAPTIVE_CHUNK};
     let Some(model_dir_buf) = crate::test_snapshot::snapshot(
         "a_hydrated_tail_issues_no_attention_call_in_the_faulty_configuration",
         MOE_VAR,
@@ -2506,7 +2506,7 @@ fn a_hydrated_tail_issues_no_attention_call_in_the_faulty_configuration() {
              through another chunk loop"
         );
 
-        crate::prefill_chunk::set_prefill_chunk(chunk);
+        let chunk_override = ChunkOverride::install(crate::prefill_chunk::set_prefill_chunk, chunk);
         let mut rng = crate::sampler::Pcg32::new(sampler_cfg.seed_or_default());
         let mut token_history: Vec<u32> = Vec::new();
         let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> Option<u32> { None };
@@ -2529,7 +2529,7 @@ fn a_hydrated_tail_issues_no_attention_call_in_the_faulty_configuration() {
                 &mut token_history,
             )
         });
-        crate::prefill_chunk::set_prefill_chunk(0);
+        drop(chunk_override);
         prompt_cache::PROMPT_CACHE.with_inner_mut(|guard| {
             if let Some(cache) = guard.as_mut() {
                 cache.clear();

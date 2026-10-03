@@ -337,6 +337,9 @@ pub fn scaled_dot_product_attention(
 
 /// [`scaled_dot_product_attention`] under a given C API verdict, so a test on
 /// a matched pair can show that a mismatch stops the call.
+///
+/// Every attention node is built here, so the row rule below holds for every
+/// caller.
 fn sdpa_under(
     verdict: CApiVerdict,
     q: &Array,
@@ -349,6 +352,98 @@ fn sdpa_under(
 ) -> Result<Array> {
     install_error_handler();
     verdict.require_match()?;
+    let Some(aligned_rows) = aligned_query_rows(q, v, mask_mode, device) else {
+        return attention_node(q, k, v, scale, mask_mode, mask_arr, device);
+    };
+    let q_shape = q.shape();
+    let rows = |a: &Array, shape: &[i32], axis: usize, from: i32, to: i32| {
+        let mut start = vec![0; shape.len()];
+        let mut stop = shape.to_vec();
+        if let (Some(lo), Some(hi)) = (start.get_mut(axis), stop.get_mut(axis)) {
+            *lo = from;
+            *hi = to;
+        }
+        a.slice(&start, &stop, &vec![1; shape.len()], device)
+    };
+    let all_rows = q_shape.get(QUERY_ROW_AXIS).copied().unwrap_or(0);
+    let mut parts = Vec::with_capacity(2);
+    for (from, to) in [(0, aligned_rows), (aligned_rows, all_rows)] {
+        let q_part = rows(q, &q_shape, QUERY_ROW_AXIS, from, to)?;
+        let mask_part = match mask_arr {
+            // A mask with one row is broadcast over the query rows: every node
+            // takes it whole.
+            Some(mask) => {
+                let mask_shape = mask.shape();
+                match mask_shape.len().checked_sub(2) {
+                    Some(axis) if mask_shape.get(axis) == Some(&all_rows) => {
+                        Some(rows(mask, &mask_shape, axis, from, to)?)
+                    }
+                    _ => None,
+                }
+            }
+            None => None,
+        };
+        parts.push(attention_node(
+            &q_part,
+            k,
+            v,
+            scale,
+            mask_mode,
+            mask_part.as_ref().or(mask_arr),
+            device,
+        )?);
+    }
+    let parts: Vec<&Array> = parts.iter().collect();
+    crate::concatenate(&parts, QUERY_ROW_AXIS as i32, device)
+}
+
+const QUERY_ROW_AXIS: usize = 2;
+
+/// The query rows of the first of two nodes, when this call must not reach
+/// MLX as one node.
+///
+/// MLX 0.32.3 runs an attention call at head dim 256, with an array mask and
+/// at least 1024 query rows, on its head-dim-split Metal kernel. That kernel is
+/// compiled per call for "the query rows are a multiple of 64" and "the key
+/// rows are a multiple of 32". With both false it returns `+inf` rows under
+/// Metal device-memory shader validation. The fault is seen only under that
+/// validation: its cause is the instrumented compile of the kernel, not the
+/// kernel source. No run without the instrument has shown it.
+///
+/// The rule is on the query rows alone. A call with aligned key rows was
+/// measured clean, but a clean cell is a bound on a rate, and the split costs
+/// the same. The first node holds the largest multiple of 64 rows; the second
+/// holds the rest, fewer than 64, which MLX does not run on that kernel. Query
+/// rows are independent in attention, so the two outputs concatenated are the
+/// attention of the call.
+fn aligned_query_rows(q: &Array, v: &Array, mask_mode: &str, device: Device) -> Option<i32> {
+    const HEAD_DIM: i32 = 256;
+    const MIN_QUERY_ROWS: i32 = 1024;
+    const QUERY_BLOCK: i32 = 64;
+    if mask_mode != "array" || device != Device::Gpu {
+        return None;
+    }
+    let q_shape = q.shape();
+    let query_rows = *q_shape.get(QUERY_ROW_AXIS)?;
+    if query_rows < MIN_QUERY_ROWS || query_rows % QUERY_BLOCK == 0 {
+        return None;
+    }
+    if q_shape.last() != Some(&HEAD_DIM) || v.shape().last() != Some(&HEAD_DIM) {
+        return None;
+    }
+    Some(query_rows - query_rows % QUERY_BLOCK)
+}
+
+/// Hand one attention node to mlx-c. Only [`sdpa_under`] calls this.
+fn attention_node(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    scale: f32,
+    mask_mode: &str,
+    mask_arr: Option<&Array>,
+    device: Device,
+) -> Result<Array> {
     let mode_cstr = mode_to_cstr(mask_mode, "scaled_dot_product_attention")?;
     // When mask_arr is None, use the cached null sentinel.
     let mask_inner = match mask_arr {

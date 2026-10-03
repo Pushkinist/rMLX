@@ -85,8 +85,8 @@
 mod common;
 
 use common::attention_calls::{
-    assert_the_recorder_is_live, is_faulty, recorded, AttentionCall, KEY_BLOCK, QUERY_BLOCK,
-    SPLIT_KERNEL_HEAD_DIM, SPLIT_KERNEL_MIN_QUERY_ROWS,
+    assert_the_recorder_is_live, is_faulty, recorded, AttentionCall, ChunkOverride, ADAPTIVE_CHUNK,
+    KEY_BLOCK, QUERY_BLOCK, SPLIT_KERNEL_HEAD_DIM, SPLIT_KERNEL_MIN_QUERY_ROWS,
 };
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 use rmlx_mlx::{Array, Device, Dtype};
@@ -363,6 +363,67 @@ fn one_function_hands_attention_to_mlx_c() {
         "the attention-call event must be emitted in the function that calls mlx-c, before \
          the call"
     );
+
+    // The function that holds the call has one caller function, and that
+    // function holds the rule: a second caller would build nodes past it.
+    let node_fn = before[fn_start]
+        .trim_start_matches("pub ")
+        .trim_start_matches("fn ")
+        .split('(')
+        .next()
+        .expect("fn name")
+        .to_owned();
+    let call = format!("{node_fn}(");
+    let mut callers = Vec::new();
+    for file in &files {
+        let name = file
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .into_owned();
+        if name == "tests.rs" || name.ends_with("_tests.rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(file).expect("read source");
+        let lines: Vec<&str> = text.lines().collect();
+        for (n, line) in lines.iter().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            if !code.contains(&call) || code.trim_start().starts_with("fn ") {
+                continue;
+            }
+            let holder = lines[..n]
+                .iter()
+                .rev()
+                .find(|l| l.starts_with("fn ") || l.starts_with("pub fn "))
+                .expect("the function that holds a caller line");
+            let holder = format!("{name}: {}", holder.split('(').next().unwrap_or(holder));
+            if !callers.contains(&holder) {
+                callers.push(holder);
+            }
+        }
+    }
+    assert_eq!(
+        callers,
+        vec!["fast_ops.rs: fn sdpa_under".to_owned()],
+        "one function may build attention nodes, and it holds the row rule"
+    );
+}
+
+/// The rule is for the Metal kernel. The same shapes on the CPU reach mlx-c as
+/// the one node the caller built.
+#[test]
+fn a_call_in_the_configuration_shape_on_the_cpu_is_one_node() {
+    let mut asked_cells = 0;
+    for measured in MEASURED_CELLS.iter().filter(|c| c.bad > 0) {
+        asked_cells += 1;
+        let asked = AttentionCall {
+            device: "Cpu".to_owned(),
+            ..measured.as_gpu_call()
+        };
+        let (_node, nodes) = recorded(|| measured.issue(Device::Cpu));
+        assert_eq!(nodes, vec![asked]);
+    }
+    assert_eq!(asked_cells, 6);
 }
 
 // ---------------------------------------------------------------------------
@@ -375,30 +436,13 @@ const DEVICE: Device = Device::Gpu;
 /// prompt a cell builds.
 const MAX_CTX: i32 = 8192;
 
-/// A chunk the adaptive prefill controller reaches from a default of 256
-/// (256, 384, 576, 864, 1296) and installs for every architecture of the
-/// process. It is at least 1024 rows and not a multiple of 64.
-const ADAPTIVE_CHUNK: usize = 1296;
-
 /// A chunk under which no call is in the configuration: a whole chunk is 1024
 /// rows, a multiple of 64, and a last chunk is shorter than the route's floor.
 /// It is the reference split of the tail-argmax cells.
 const REFERENCE_CHUNK: usize = 1024;
 
-/// Installs a process-wide prefill chunk, and clears it when dropped.
-struct ChunkOverride;
-
-impl ChunkOverride {
-    fn install(chunk: usize) -> Self {
-        set_prefill_chunk(chunk);
-        Self
-    }
-}
-
-impl Drop for ChunkOverride {
-    fn drop(&mut self) {
-        set_prefill_chunk(0);
-    }
+fn install_chunk(chunk: usize) -> ChunkOverride {
+    ChunkOverride::install(set_prefill_chunk, chunk)
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +495,29 @@ fn no_call_in_the_configuration_reaches_mlx_c() {
         reached.extend(nodes.into_iter().filter(is_faulty));
     }
     assert_eq!(asked_cells, 6);
+
+    // Every query row count from the route's floor to four times the largest
+    // chunk, over unaligned key rows: a prefill with no chunking has as many
+    // query rows as its prompt.
+    for q_rows in SPLIT_KERNEL_MIN_QUERY_ROWS..=8192 {
+        let k_rows = if (q_rows + 1) % KEY_BLOCK == 0 {
+            q_rows + 2
+        } else {
+            q_rows + 1
+        };
+        let derived = cell((q_rows, k_rows), (256, 256), (8, 1), "array", (0, 0));
+        let asked = derived.as_gpu_call();
+        let (_node, nodes) = recorded(|| derived.issue(DEVICE));
+        assert_the_nodes_partition_the_query_rows(&asked, &nodes);
+        assert_eq!(
+            nodes.len() > 1,
+            is_faulty(&asked),
+            "{q_rows} query rows over {k_rows} keys: the call is split exactly when it is in \
+             the configuration; nodes {:?}",
+            nodes.iter().map(|n| n.q_rows).collect::<Vec<_>>()
+        );
+        reached.extend(nodes.into_iter().filter(is_faulty));
+    }
     assert!(
         reached.is_empty(),
         "the wrapper handed mlx-c {} attention nodes in the configuration where the pinned \
@@ -474,7 +541,17 @@ fn a_call_outside_the_configuration_reaches_mlx_c_unchanged() {
         .collect();
     cells.push(cell((1, 4097), (256, 256), (16, 2), "", (0, 0)));
     cells.push(cell((8, 3081), (256, 256), (16, 2), "array", (0, 0)));
-    assert!(cells.len() >= 18, "the grid lost cells: {}", cells.len());
+    assert_eq!(cells.len(), 20, "18 measured cells and the 2 above");
+    // Under the route's floor, with an array mask at head dim 256.
+    for q_rows in [2, 9, 63, 64, 65, 1000, 1023] {
+        cells.push(cell(
+            (q_rows, q_rows + 2049),
+            (256, 256),
+            (8, 1),
+            "array",
+            (0, 0),
+        ));
+    }
     for outside in cells {
         let asked = outside.as_gpu_call();
         assert!(!is_faulty(&asked));
@@ -508,7 +585,80 @@ fn to_f32_vec(a: &Array) -> Vec<f32> {
         .collect()
 }
 
-/// One call in the configuration, with data, evaluated with no instrument.
+/// The additive mask of one output cell.
+#[derive(Clone, Copy, Debug)]
+enum MaskKind {
+    /// A later chunk of a causal prefill: query row `i` is prompt row
+    /// `key rows - query rows + i` and sees every key up to itself.
+    Causal,
+    /// A sliding window: the same, and no key further back than the window.
+    Banded(usize),
+}
+
+/// One call in the configuration, with data.
+#[derive(Clone, Copy, Debug)]
+struct OutputCell {
+    q_rows: i32,
+    k_rows: i32,
+    q_heads: i32,
+    kv_heads: i32,
+    mask: MaskKind,
+}
+
+/// The mask as host rows: 0 where a query row sees a key, -1e30 elsewhere.
+fn additive_mask(q_rows: i32, k_rows: i32, mask_kind: MaskKind) -> Vec<f32> {
+    let offset = (k_rows - q_rows) as usize;
+    let mut mask_host = vec![0.0f32; (q_rows * k_rows) as usize];
+    for (i, row) in mask_host.chunks_exact_mut(k_rows as usize).enumerate() {
+        let own = offset + i;
+        for cell in &mut row[own + 1..] {
+            *cell = -1e30;
+        }
+        if let MaskKind::Banded(window) = mask_kind {
+            for cell in &mut row[..(own + 1).saturating_sub(window)] {
+                *cell = -1e30;
+            }
+        }
+    }
+    mask_host
+}
+
+/// The cells of the output oracle: the Qwen3.5 head layout on the shortest
+/// call in the configuration; one KV head; a banded mask on one KV head, which
+/// is the gemma-4 sliding-window layer; and a call of more than 2048 query
+/// rows with a second node of 52 rows.
+const OUTPUT_CELLS: [OutputCell; 4] = [
+    OutputCell {
+        q_rows: 1025,
+        k_rows: 3073,
+        q_heads: 8,
+        kv_heads: 2,
+        mask: MaskKind::Causal,
+    },
+    OutputCell {
+        q_rows: 1025,
+        k_rows: 3073,
+        q_heads: 8,
+        kv_heads: 1,
+        mask: MaskKind::Causal,
+    },
+    OutputCell {
+        q_rows: 1296,
+        k_rows: 1807,
+        q_heads: 8,
+        kv_heads: 1,
+        mask: MaskKind::Banded(512),
+    },
+    OutputCell {
+        q_rows: 2100,
+        k_rows: 4133,
+        q_heads: 8,
+        kv_heads: 2,
+        mask: MaskKind::Causal,
+    },
+];
+
+/// Calls in the configuration, with data, evaluated.
 ///
 /// Two oracles, and neither is a tolerance fitted to a result:
 ///
@@ -520,34 +670,37 @@ fn to_f32_vec(a: &Array) -> Vec<f32> {
 /// - Each output is a convex combination of value rows, so the exact result
 ///   is no larger than the largest value. An f32 reference, built from matmul
 ///   and softmax with no attention kernel, must agree within one bf16 unit at
-///   that magnitude. This is what holds a node on another kernel to the same
-///   arithmetic.
+///   that magnitude. The limit assumes that a kernel accumulates wider than
+///   bf16 and rounds once; a kernel that accumulates in bf16 can exceed it.
+///   This is what holds a node on another kernel to the same arithmetic.
 #[ignore = "evaluates attention on the Metal GPU"]
 #[test]
 fn a_call_in_the_configuration_returns_the_attention_of_its_rows() {
-    const Q_ROWS: i32 = 1025;
-    const K_ROWS: i32 = 3073;
+    for output_cell in OUTPUT_CELLS {
+        check_the_output_of(output_cell);
+    }
+}
+
+fn check_the_output_of(output_cell: OutputCell) {
     const DIM: i32 = 256;
-    const Q_HEADS: i32 = 8;
-    const KV_HEADS: i32 = 2;
+    let OutputCell {
+        q_rows,
+        k_rows,
+        q_heads,
+        kv_heads,
+        mask: mask_kind,
+    } = output_cell;
     // Sharp attention weights, so each output row is close to a few value rows
     // and a wrong row shows at the size of a value.
     let scale = 0.5;
     let full = [1, 1, 1, 1];
 
     let mut rng = Pcg32::new(7);
-    let q = uniform_bf16(&mut rng, &[1, Q_HEADS, Q_ROWS, DIM]);
-    let k = uniform_bf16(&mut rng, &[1, KV_HEADS, K_ROWS, DIM]);
-    let v = uniform_bf16(&mut rng, &[1, KV_HEADS, K_ROWS, DIM]);
-    // A chunk's causal mask: query row `i` is prompt row `K_ROWS - Q_ROWS + i`.
-    let offset = (K_ROWS - Q_ROWS) as usize;
-    let mut mask_host = vec![0.0f32; (Q_ROWS * K_ROWS) as usize];
-    for (i, row) in mask_host.chunks_exact_mut(K_ROWS as usize).enumerate() {
-        for cell in &mut row[offset + i + 1..] {
-            *cell = -1e30;
-        }
-    }
-    let mask_f32 = Array::from_f32_slice(&mask_host, &[1, 1, Q_ROWS, K_ROWS]).expect("mask");
+    let q = uniform_bf16(&mut rng, &[1, q_heads, q_rows, DIM]);
+    let k = uniform_bf16(&mut rng, &[1, kv_heads, k_rows, DIM]);
+    let v = uniform_bf16(&mut rng, &[1, kv_heads, k_rows, DIM]);
+    let mask_host = additive_mask(q_rows, k_rows, mask_kind);
+    let mask_f32 = Array::from_f32_slice(&mask_host, &[1, 1, q_rows, k_rows]).expect("mask");
     let mask = mask_f32.astype(Dtype::Bf16, DEVICE).expect("mask bf16");
 
     let (output, nodes) = recorded(|| {
@@ -555,87 +708,92 @@ fn a_call_in_the_configuration_returns_the_attention_of_its_rows() {
             .expect("the call in the configuration")
     });
     let asked = AttentionCall {
-        q_heads: i64::from(Q_HEADS),
-        q_rows: i64::from(Q_ROWS),
+        q_heads: i64::from(q_heads),
+        q_rows: i64::from(q_rows),
         head_dim: i64::from(DIM),
-        kv_heads: i64::from(KV_HEADS),
-        k_rows: i64::from(K_ROWS),
+        kv_heads: i64::from(kv_heads),
+        k_rows: i64::from(k_rows),
         v_head_dim: i64::from(DIM),
         dtype: "Bf16".to_owned(),
         mask: "array".to_owned(),
         device: "Gpu".to_owned(),
     };
-    assert!(is_faulty(&asked), "the cell must ask for the configuration");
+    assert!(
+        is_faulty(&asked),
+        "{output_cell:?} must ask for the configuration"
+    );
     assert_the_nodes_partition_the_query_rows(&asked, &nodes);
+    assert!(
+        !nodes.iter().any(is_faulty),
+        "{output_cell:?}: a node in the configuration reached mlx-c"
+    );
     let output = to_f32_vec(&output);
     assert!(output.iter().all(|x| x.is_finite()));
 
     // Oracle 1: the same nodes by hand.
-    let mut by_hand = Vec::new();
-    let mut row = 0i32;
+    let row_len = DIM as usize;
+    let head_len = q_rows as usize * row_len;
+    let mut first_row = 0i32;
     for node in &nodes {
         let rows = node.q_rows as i32;
         let q_part = q
             .slice(
-                &[0, 0, row, 0],
-                &[1, Q_HEADS, row + rows, DIM],
+                &[0, 0, first_row, 0],
+                &[1, q_heads, first_row + rows, DIM],
                 &full,
                 DEVICE,
             )
             .expect("q rows");
         let mask_part = mask
-            .slice(&[0, 0, row, 0], &[1, 1, row + rows, K_ROWS], &full, DEVICE)
+            .slice(
+                &[0, 0, first_row, 0],
+                &[1, 1, first_row + rows, k_rows],
+                &full,
+                DEVICE,
+            )
             .expect("mask rows");
-        let part = rmlx_mlx::scaled_dot_product_attention(
-            &q_part,
-            &k,
-            &v,
-            scale,
-            "array",
-            Some(&mask_part),
-            DEVICE,
-        )
-        .expect("node by hand");
-        by_hand.extend(to_f32_vec(&part));
-        row += rows;
-    }
-    // Rows are axis 2, so a concatenation of row ranges is not a concatenation
-    // of the flat buffers: compare head by head.
-    let row_len = DIM as usize;
-    let head_len = Q_ROWS as usize * row_len;
-    let mut start = 0usize;
-    let mut first_row = 0usize;
-    for node in &nodes {
-        let rows = node.q_rows as usize;
-        for head in 0..Q_HEADS as usize {
-            let got = &output[head * head_len + first_row * row_len..][..rows * row_len];
-            let hand = &by_hand[start + head * rows * row_len..][..rows * row_len];
+        let by_hand = to_f32_vec(
+            &rmlx_mlx::scaled_dot_product_attention(
+                &q_part,
+                &k,
+                &v,
+                scale,
+                "array",
+                Some(&mask_part),
+                DEVICE,
+            )
+            .expect("node by hand"),
+        );
+        // Rows are axis 2, so a row range is one slice of each head.
+        let node_len = rows as usize * row_len;
+        for head in 0..q_heads as usize {
+            let got = &output[head * head_len + first_row as usize * row_len..][..node_len];
+            let hand = &by_hand[head * node_len..][..node_len];
             assert!(
                 got.iter()
                     .zip(hand)
                     .all(|(a, b)| a.to_bits() == b.to_bits()),
-                "head {head}, query rows {first_row}..{}: the wrapper's output is not the \
-                 output of the node that reached mlx-c for those rows",
+                "{output_cell:?}, head {head}, query rows {first_row}..{}: the wrapper's \
+                 output is not the output of the node that reached mlx-c for those rows",
                 first_row + rows
             );
         }
-        start += Q_HEADS as usize * rows * row_len;
         first_row += rows;
     }
 
     // Oracle 2: an f32 reference with no attention kernel.
-    let group = Q_HEADS / KV_HEADS;
+    let group = q_heads / kv_heads;
     let mut reference = Vec::new();
-    for kv_head in 0..KV_HEADS {
+    for kv_head in 0..kv_heads {
         let f32_of = |a: &Array, from: i32, to: i32, rows: i32| {
             a.slice(&[0, from, 0, 0], &[1, to, rows, DIM], &full, DEVICE)
                 .expect("head slice")
                 .astype(Dtype::F32, DEVICE)
                 .expect("astype f32")
         };
-        let q_f32 = f32_of(&q, kv_head * group, (kv_head + 1) * group, Q_ROWS);
-        let k_f32 = f32_of(&k, kv_head, kv_head + 1, K_ROWS);
-        let v_f32 = f32_of(&v, kv_head, kv_head + 1, K_ROWS);
+        let q_f32 = f32_of(&q, kv_head * group, (kv_head + 1) * group, q_rows);
+        let k_f32 = f32_of(&k, kv_head, kv_head + 1, k_rows);
+        let v_f32 = f32_of(&v, kv_head, kv_head + 1, k_rows);
         let k_t = k_f32.transpose(&[0, 1, 3, 2], DEVICE).expect("transpose");
         let scores = rmlx_mlx::matmul(&q_f32, &k_t, DEVICE).expect("q k^T");
         let scores =
@@ -650,14 +808,19 @@ fn a_call_in_the_configuration_returns_the_attention_of_its_rows() {
     let largest_value = to_f32_vec(&v).iter().fold(0.0f32, |m, x| m.max(x.abs()));
     // bf16 keeps 8 significant bits: one unit at magnitude `x` is 2^(exp(x) - 7).
     let one_unit = 2.0f32.powi(largest_value.log2().floor() as i32 - 7);
-    let worst = output
-        .iter()
-        .zip(&reference)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
+    let (worst_row, worst) = output
+        .chunks_exact(row_len)
+        .zip(reference.chunks_exact(row_len))
+        .enumerate()
+        .map(|(row, (a, b))| {
+            let d = a.iter().zip(b).map(|(x, y)| (x - y).abs());
+            (row % q_rows as usize, d.fold(0.0f32, f32::max))
+        })
+        .fold((0, 0.0f32), |m, x| if x.1 > m.1 { x } else { m });
     println!(
-        "[a_call_in_the_configuration_returns_the_attention_of_its_rows] nodes {:?}, largest \
-         |output - f32 reference| {worst}, one bf16 unit at the largest value {one_unit}",
+        "[a_call_in_the_configuration_returns_the_attention_of_its_rows] {output_cell:?}: nodes \
+         {:?}, largest |output - f32 reference| {worst} at query row {worst_row}, one bf16 unit \
+         at the largest value {one_unit}",
         nodes
             .iter()
             .map(|n| (n.q_rows, n.k_rows))
@@ -665,8 +828,8 @@ fn a_call_in_the_configuration_returns_the_attention_of_its_rows() {
     );
     assert!(
         worst <= one_unit,
-        "the output differs from the f32 reference by {worst}, more than one bf16 unit \
-         ({one_unit}) at the largest value {largest_value}"
+        "{output_cell:?}: the output differs from the f32 reference by {worst} at query row \
+         {worst_row}, more than one bf16 unit ({one_unit}) at the largest value {largest_value}"
     );
 }
 
@@ -1011,7 +1174,7 @@ fn check_every_prefill_path(loaded: &Loaded, test: &str, paths: Paths) {
         ("default:", None, 1025),
         ("override:", Some(ADAPTIVE_CHUNK), 1100),
     ] {
-        let _chunk = chunk.map(ChunkOverride::install);
+        let _chunk = chunk.map(install_chunk);
         check_fresh_prefills(loaded, label, paths.plain_split, &mut report);
         if paths.resumes_an_extended_prompt {
             // The default codec, and one quantized store: a resumed tail
@@ -1223,6 +1386,12 @@ fn moved_per_position(a: &[Vec<f32>], b: &[Vec<f32>]) -> Vec<f32> {
 /// A token that differs is a stop, not a re-pin: the message carries both
 /// top-2 margins, which is what tells a near-tie from a defect.
 ///
+/// These cells are evidence on a real prefill and have no measured power: the
+/// prompt is one sentence repeated, with top-2 margins of 2.5 to 24 logits,
+/// and no control shows a defect that moves an argmax here. The output of the
+/// changed call is held at the call, by
+/// [`a_call_in_the_configuration_returns_the_attention_of_its_rows`].
+///
 /// `production_chunk` is `None` for the architecture's default and `Some` for
 /// a chunk the adaptive controller installs.
 fn check_tail_argmax_against_the_reference_split(
@@ -1232,7 +1401,7 @@ fn check_tail_argmax_against_the_reference_split(
 ) {
     let model = &loaded.model;
     let rows_at = |chunk: Option<usize>, ids: &[u32], prefill_len: usize| {
-        let _chunk = chunk.map(ChunkOverride::install);
+        let _chunk = chunk.map(install_chunk);
         (
             resolved_chunk(model),
             tail_rows_after_prefill(model, ids, prefill_len),
@@ -1272,7 +1441,7 @@ fn check_tail_argmax_against_the_reference_split(
     // The prefill's own last row, through the entry the CLI and the server
     // call: the first token of a fresh generation.
     let first_token = |chunk: Option<usize>| {
-        let _chunk = chunk.map(ChunkOverride::install);
+        let _chunk = chunk.map(install_chunk);
         model.clear_prompt_cache();
         let (steps, _) = generate_one(loaded, &ids[..prefill_len], 0, None, 2);
         let top = &steps[0].logprobs.as_ref().expect("top logprobs").top;

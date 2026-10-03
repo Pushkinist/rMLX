@@ -75,6 +75,29 @@ pub fn recorded<T>(body: impl FnOnce() -> T) -> (T, Vec<AttentionCall>) {
     (out, calls)
 }
 
+/// A chunk the adaptive prefill controller reaches from a default of 256
+/// (256, 384, 576, 864, 1296) and installs for every architecture of the
+/// process. It is at least 1024 rows and not a multiple of 64.
+pub const ADAPTIVE_CHUNK: usize = 1296;
+
+/// Installs a process-wide prefill chunk, and clears it when dropped, a panic
+/// included. The setter is an argument because this file is compiled into two
+/// crates, which name it by two paths.
+pub struct ChunkOverride(fn(usize));
+
+impl ChunkOverride {
+    pub fn install(set_prefill_chunk: fn(usize), chunk: usize) -> Self {
+        set_prefill_chunk(chunk);
+        Self(set_prefill_chunk)
+    }
+}
+
+impl Drop for ChunkOverride {
+    fn drop(&mut self) {
+        (self.0)(0);
+    }
+}
+
 /// Control, in the same process as the cells: the recorder is live. A call
 /// outside the configuration, built and never evaluated, reaches it with its
 /// own shape.
