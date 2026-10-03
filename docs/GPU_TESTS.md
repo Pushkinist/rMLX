@@ -370,8 +370,8 @@ Invalid device store at offset 4000064, executing kernel function: "custom_kerne
 - **The exit code is not the signal.** With validation on, cargo still exits 0.
   The runner scans the text, anywhere on a line: the layer writes while libtest
   is mid-line.
-- **The runner owns the environment.** It clears every inherited `MTL_*`
-  variable and pins every `MTL_SHADER_VALIDATION_*` knob it relies on,
+- **The runner owns the environment.** It clears every inherited `MTL_*` and
+  `METAL_*` variable and pins every `MTL_SHADER_VALIDATION_*` knob it relies on,
   `REPORT_TO_STDERR=1` included; that one defaults to 0 and sends reports to
   Unified Logging (`man MetalValidation`).
 - **Threadgroup-memory validation is set per test.** See below.
@@ -416,24 +416,44 @@ the same signature: all-zero tokens under device-memory validation on mlx
 full validation on mlx 0.31.2 and 0.32.1. Its kernel was not localized.
 
 After the instrumented runs of a crate, the runner runs its selected tests
-once more with no `MTL_*` variable:
+once more with no `MTL_*` or `METAL_*` variable:
 
 - Pass, fail and the count on the final line are the uninstrumented run's.
-- Hits, the banner and the stand-down notices are read from the instrumented
-  runs.
-- A test that fails only under the instrument is not a failure. It is listed
-  under `changed under the instrument`, and the final line reads INCOMPLETE:
-  the scan of that test stopped at its failure. Its pinned counts are not
-  expected, so a hit it printed before it stopped fails as `count moved up`.
-- An instrumented run that exits non-zero and names no failing test is a
+- Hits and the banner are read from the instrumented runs.
+- A stand-down notice from either run is listed and ends the run INCOMPLETE.
+  The census skip set is the instrumented runs' notices alone.
+- Each instrumented run that exits non-zero and names no failing test is a
   failure.
 - The uninstrumented run has the same coverage check as each instrumented run.
 
+The cost is one more pass over every selected test. No complete run has
+measured the wall time of the suite with it.
+
+**A test that fails only under the instrument is accepted by name.** A kernel
+defect that only the instrument's timing exposes looks the same as an artifact
+of the instrument: red with validation, green without, no diagnostic. So
+`scripts/gpu_instrument_only.txt` pins the accepted tests, one
+`crate | test | reference` entry each, and its header gives the evidence each
+entry rests on.
+
+| observed | verdict |
+|---|---|
+| a pinned test fails only under the instrument | pass: listed under `changed under the instrument` with its reference, final line INCOMPLETE |
+| a test with no entry fails only under the instrument | fail: `not pinned: <crate> <test> failed with shader validation on and passed without it` |
+| a pinned test passes under the instrument | fail: `stale: <crate> <test> is pinned as failing under the instrument and passed under it` |
+| a pinned test not selected, stood down, or red in both runs | nothing about the pin |
+| a pin line without three fields, an unknown test, a test pinned twice, the file missing | fail, naming the line |
+
+The scan of an accepted test stopped at its failure. The hits it printed
+before that are part of what its census entries accept, so each of its pinned
+counts is a ceiling for the run: from 0 to the count passes, as `census NOT
+enforced in full`, and more fails as `count moved up`. The floor of the census
+is the sum per kernel, so a hit of the cut test can stand in for a missing hit
+of another test on the same kernel.
+
 Each rule is a case under `THE VERDICT` in
-`scripts/run_gpu_tests_selftest.sh`. What no case can see: a kernel defect
-that only the instrument's timing exposes reads as `changed under the
-instrument`, the same as an instrument artifact. The list is the place to
-start from.
+`scripts/run_gpu_tests_selftest.sh`, and one case holds the tracked pin to
+four entries.
 
 ### Threadgroup-memory validation: on for rMLX's kernels, off for MLX's
 
@@ -515,10 +535,14 @@ The pin accepts two MLX kernel families, loads only:
 - the split-K quantized matmul,
   `affine_qmm_t_splitk_bfloat16_t_gs_64_b_{4,8}_alN_false` and
   `mxfp8_qmm_t_splitk_bfloat16_t_gs_32_b_8_alN_false`.
-  `QuantizedBlockLoader::load_safe` in `mlx/backend/metal/kernels/quantized.h`
-  bounds its row index against the tile's column extent, so a transposed
-  quantized matmul whose `N` is not a multiple of the output tile width reads
-  past the packed weight and scales;
+  In MLX 0.31.2, 0.32.1 and 0.32.2, `QuantizedBlockLoader::load_safe` in
+  `mlx/backend/metal/kernels/quantized.h` bounds the row index of a transposed
+  weight against the tile's column extent, so a quantized matmul whose `N` is
+  not a multiple of the output tile width reads past the packed weight and
+  scales. MLX 0.32.3 bounds it against the row extent
+  (`if (bi >= src_tile_dim.y)`), and the read is gone. The split-K entries of
+  the pin were derived before that and are to be derived again from the next
+  complete run; until then they read `no longer fires` on the pinned pair;
 - the implicit-GEMM conv,
   `implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s`,
   whose weight loader checks the output-channel bound only for 8-wide tiles.
@@ -565,14 +589,16 @@ not `SKIP`. Its entries stay expected. The missing checkpoint's kernel reports
 | nothing where the expectation is positive | fail: `no longer fires: …` |
 | any store | fail: `never accepted: …` |
 | an entry whose test was not selected, or skipped | pass: `census NOT enforced in full`, naming the entry |
-| an entry whose test failed only under the instrument | pass: `census NOT enforced in full`, naming the entry |
+| 0 to the count of an entry whose test failed only under the instrument | pass: `census NOT enforced in full`, the count named as a ceiling |
 | a count from 0 to N against an entry pinned `<=N` | pass, printed as `<test> = at most N` |
 | above N against an entry pinned `<=N` | fail: `count moved up: … expected at most N, observed M` |
 
 A count is pinned `<=N` only when it is not reproducible: the same test gives
 another count on each run. N is the largest count the derivation runs
 observed, and the header of the pin names those runs. An exact entry beside it
-on the same kernel stays a floor.
+on the same kernel stays a floor, on the sum: the hits of the `<=N` test can
+stand in for missing hits of the exact one. A `<=N` entry has no stale verdict.
+The selftest holds the tracked pin to one such entry.
 
 A hit in another crate than its entry names reads as `not pinned` there and
 `no longer fires` where it was pinned.
@@ -582,7 +608,7 @@ The pin file is checked as it is read. Each defect is a failure:
 | pin defect | reason reported |
 |---|---|
 | not six `\|`-separated fields | `line N: expected 6 fields — …` |
-| count not a positive integer, or `<=` and one | `line N: count '<x>' is not a positive integer, or '<=' and one` |
+| count not a positive integer, or `<=` and one; a leading zero | `line N: count '<x>' is not a positive integer, or '<=' and one` |
 | a kind naming a store | `line N: a store is never pinnable — …` |
 | a test that is not a classified GPU test of that crate | `line N: <crate> has no classified GPU test '<test>'` |
 | the same kernel, kind and test twice | `line N: … is pinned twice …` |

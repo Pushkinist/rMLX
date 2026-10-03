@@ -43,7 +43,11 @@
 #             | `<=N` instead of a number is for a count that is not
 #             | reproducible, and for nothing else: any count from 0 to N
 #             | passes, and N is the largest count the named derivation runs
-#             | observed. An exact entry on the same kernel stays a floor.
+#             | observed. An exact entry on the same kernel stays a floor,
+#             | but on the sum per (crate, kind, kernel): hits of the `<=N`
+#             | test can stand in for missing hits of the exact one. A `<=N`
+#             | entry has no stale verdict, so the runner's selftest holds
+#             | the number of them in this file (1).
 #   crate     | the workspace member the test belongs to
 #   test      | exactly one test fn name. It must be a classified GPU test, and
 #             | it must print a NAMED `SKIP <test>: <why>` notice when it skips,
@@ -77,12 +81,22 @@
 # The entries below are MLX's own kernels, not ones this repo compiles or can
 # specialise. Every diagnostic is a device load; no store has been observed.
 #
-# QUANTIZED MATMUL, `*_qmm_t_splitk_*`. `QuantizedBlockLoader::load_safe` in
-# `mlx/backend/metal/kernels/quantized.h` bounds its row index against the
-# tile's COLUMN extent, so the guard can never fire and a transposed quantized
-# matmul whose N is not a multiple of the output tile width reads the
-# out-of-range rows of the packed weight and the scales. rMLX passes correctly
-# sized operands.
+# TO RE-DERIVE FROM THE NEXT COMPLETE RUN: every `*_qmm_t_splitk_*` entry
+# below. They were derived on an MLX before 0.32.3. MLX 0.32.3, the pinned
+# release, removed the read they count (next paragraph), so on the pinned pair
+# each of them is expected to read `no longer fires`. Observed so far on
+# 0.32.3: 0 reports from `split_k_tail_row_reads_never_reach_the_output` run
+# alone under validation, where 0.32.1 and 0.31.2 report 4 per kernel. No
+# count below was changed on that evidence; a complete run decides them.
+#
+# QUANTIZED MATMUL, `*_qmm_t_splitk_*`, MLX 0.31.2, 0.32.1 and 0.32.2.
+# `QuantizedBlockLoader::load_safe` in `mlx/backend/metal/kernels/quantized.h`
+# bounds the row index of a transposed weight (`reduction_dim == 1`) against
+# the tile's COLUMN extent, `bi >= src_tile_dim.x`, so the guard can never fire
+# and a transposed quantized matmul whose N is not a multiple of the output
+# tile width reads the out-of-range rows of the packed weight and the scales.
+# rMLX passes correctly sized operands. MLX 0.32.3 has one guard,
+# `bi >= src_tile_dim.y`, and the read is gone.
 #
 # The loaded lanes do not reach the output, and the reason is structural rather
 # than a bit width or a loader that happened to be measured: `tile_matmad`
@@ -97,8 +111,9 @@
 # kept row from its own buffers and from views whose tail rows are NaN, or
 # varied values up to +-3e4 whose quantized codes are asserted non-zero,
 # bit-identical at affine b4, affine b8 and mxfp8 gs32 b8, the three
-# instantiations below. The selector is identical in the next MLX
-# release, so moving the pinned MLX does not remove it.
+# instantiations below. That test multiplied 32 rows when these counts were
+# derived; it multiplies 64 now, and reports the same 4 per kernel on 0.32.1
+# and 0.31.2.
 #
 # IMPLICIT-GEMM CONV, `implicit_gemm_conv_2d_float32_*_channel_l_filter_s`. The
 # weight loader in `loader_channel_l.h` checks the output-channel bound only for
@@ -139,7 +154,7 @@
 #   affine b_8    2048: 2136   3072: 1733
 #   mxfp8 b_8     7680: 3168
 #
-# DERIVED ON a full `make gpu-test`, every diagnostic attributed to the test
+# DERIVED ON a full `make gpu-test` on an MLX before 0.32.3, every diagnostic attributed to the test
 # libtest last announced, on a host holding every snapshot the suite resolves by
 # slug, with threadgroup-memory validation split per test
 # (`scripts/gpu_test_threadgroup.sh`) — every entry below comes from a test that

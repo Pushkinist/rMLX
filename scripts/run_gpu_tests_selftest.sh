@@ -84,6 +84,7 @@ new_case() {
     # overwrite it.
     printf '# kernel | kind | count | crate | test | reference\n' \
         >"${root}/scripts/gpu_validation_census.txt"
+    printf '# crate | test | reference\n' >"${root}/scripts/gpu_instrument_only.txt"
 
     cat >"${root}/scripts/check_gpu_tests_ignored.sh" <<STUB
 #!/usr/bin/env bash
@@ -146,7 +147,7 @@ for a in "\$@"; do
 done
 tg="\${MTL_SHADER_VALIDATION_THREADGROUP_MEMORY-unset}"
 printf 'crate=%s tg=%s args=%s\n' "\${crate}" "\${tg}" "\$*" >>"${root}/invocations"
-printf 'crate=%s tg=%s mtl=%s\n' "\${crate}" "\${tg}" "\$(env | grep -c '^MTL_')" >>"${root}/mtl_seen"
+printf 'crate=%s tg=%s mtl=%s\n' "\${crate}" "\${tg}" "\$(env | grep -Ec '^(MTL|METAL)_')" >>"${root}/mtl_seen"
 log="${root}/logs/\${crate}.tg\${tg}.log"
 [ -f "\${log}" ] || log="${root}/logs/\${crate}.log"
 if [ ! -f "\${log}" ]; then
@@ -240,6 +241,17 @@ pin() {
     cat >"$1/scripts/gpu_validation_census.txt"
 }
 
+# instrument_pin <root> <crate> <test>... — accept these tests as failing under
+# the instrument only.
+instrument_pin() {
+    local root="$1" crate="$2" fn
+    shift 2
+    for fn in "$@"; do
+        printf '%s | %s | analysis of the instrument\n' "${crate}" "${fn}" \
+            >>"${root}/scripts/gpu_instrument_only.txt"
+    done
+}
+
 # run_case <root> [runner args...] — run this case's runner; set OUT, STATUS,
 # REPORT and MIX.
 #
@@ -268,6 +280,7 @@ run_case() {
         /^ERROR: Metal shader validation reported invalid memory access:/ { seen = 1 }
         /^ERROR: the shader-validation census does not match the pin:/ { seen = 1 }
         /^ERROR: GPU tests failed in:/ { seen = 1 }
+        /^ERROR: the instrument-only pin does not match this run:/ { seen = 1 }
         seen')"
     MIX="$(printf '%s\n' "${REPORT}" | awk '
         /^Access mix over the hits above:$/ { in_mix = 1; next }
@@ -634,6 +647,26 @@ run_case "${CASE_ROOT}"
 expect_status 1
 expect_report "rmlx-models: compiled under the Metal claim (run --build first)"
 
+# The scan is the first run of a crate, so a compile under the claim shows
+# there and the uninstrumented run that follows is clean.
+new_case compiled_under_the_claim_in_the_scan_alone_fails || exit 1
+classify "${CASE_ROOT}" rmlx-models models_gpu_alpha
+crate_log "${CASE_ROOT}" rmlx-models 0 <<'LOG'
+   Compiling rmlx-models v0.4.1 (/src/crates/rmlx-models)
+Metal GPU Validation Enabled
+running 1 test
+test models::gpu_alpha ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+crate_log "${CASE_ROOT}" rmlx-models.tgunset 0 <<'LOG'
+running 1 test
+test models::gpu_alpha ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "rmlx-models: compiled under the Metal claim (run --build first)"
+
 # ---------------------------------------------------------------------------
 # So must the third kind: a crate that produced no validation banner ran
 # uninstrumented (usually it failed to build), while another crate reported hits.
@@ -964,6 +997,24 @@ run_case "${CASE_ROOT}"
 expect_status 1
 expect_report "count '<=0' is not a positive integer"
 
+# A leading zero is an octal literal to the shell's arithmetic, and `08` is not
+# a number in it at all.
+new_case census_count_with_a_leading_zero_is_refused || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+census_pin "${CASE_ROOT}" '08'
+census_log "${CASE_ROOT}" rmlx-kv-quant 9
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "count '08' is not a positive integer"
+
+new_case census_at_most_with_a_leading_zero_is_refused || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+census_pin "${CASE_ROOT}" '<=08'
+census_log "${CASE_ROOT}" rmlx-kv-quant 9
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "count '<=08' is not a positive integer"
+
 new_case census_pin_with_a_bad_count_is_refused || exit 1
 classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
 pin "${CASE_ROOT}" <<PIN
@@ -1025,6 +1076,7 @@ expect_report "not pinned: 4 device load \"${CENSUS_KERNEL}\" in rmlx-kv-quant"
 # skipped here, which is what proves the file parsed into entries at all.
 new_case tracked_census_pin || exit 1
 cp "${ROOT}/scripts/gpu_validation_census.txt" "${CASE_ROOT}/scripts/gpu_validation_census.txt" || exit 1
+cp "${ROOT}/scripts/gpu_instrument_only.txt" "${CASE_ROOT}/scripts/gpu_instrument_only.txt" || exit 1
 bash "${ROOT}/scripts/check_gpu_tests_ignored.sh" --list >"${CASE_ROOT}/classified" || exit 1
 while IFS= read -r tracked_crate; do
     [ -n "${tracked_crate}" ] || continue
@@ -1036,6 +1088,12 @@ while IFS= read -r tracked_crate; do
               gsub(/^[[:space:]]+|[[:space:]]+$/, "", $5)
               if ($4 == c) print "test " $5 " ... SKIP " $5 ": no snapshot in this fixture" }
         ' "${CASE_ROOT}/scripts/gpu_validation_census.txt"
+        awk -F'|' -v c="${tracked_crate}" '
+            /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+            { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1)
+              gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2)
+              if ($1 == c) print "test " $2 " ... SKIP " $2 ": no snapshot in this fixture" }
+        ' "${CASE_ROOT}/scripts/gpu_instrument_only.txt"
         printf 'test result: ok. %s passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s\n' \
             "$(awk -F'\t' -v c="${tracked_crate}" '$1 == c' "${CASE_ROOT}/classified" | grep -c '')"
     } | crate_log "${CASE_ROOT}" "${tracked_crate}" 0
@@ -1048,6 +1106,15 @@ expect_no_out "expected 6 fields"
 expect_no_out "is not a positive integer"
 expect_no_out "is pinned twice"
 expect_no_out "never pinnable"
+expect_no_out "the instrument-only pin does not match"
+expect_no_out "expected 3 fields"
+# An at-most count has no floor and no stale verdict, so nothing but this line
+# and review stops an exact entry from being rewritten as one. Re-pin the
+# figure in the change that adds such an entry.
+tracked_at_most="$(awk -F'|' '!/^[[:space:]]*#/ && $3 ~ /<=/' "${ROOT}/scripts/gpu_validation_census.txt" | grep -c '')"
+[ "${tracked_at_most}" = "1" ] || fail "the tracked census pins ${tracked_at_most} at-most count(s), expected 1"
+tracked_instrument="$(grep -Evc '^[[:space:]]*(#|$)' "${ROOT}/scripts/gpu_instrument_only.txt")"
+[ "${tracked_instrument}" = "4" ] || fail "the tracked instrument-only pin holds ${tracked_instrument} entr(ies), expected 4"
 expect_no_out "has no classified GPU test"
 expect_no_out "not found"
 
@@ -1252,7 +1319,9 @@ expect_no_out "rmlx-models dflash2_loader:"
 # THE VERDICT
 #
 # The instrument can change what a kernel computes, so the instrumented runs are
-# the scan and one uninstrumented run per crate is the verdict. Each case states
+# the scan and one uninstrumented run per crate is the verdict. A test only the
+# instrument turned red is accepted when `scripts/gpu_instrument_only.txt`
+# names it, and is a failure when it does not. Each case states
 # the two logs apart: `<crate>.log` is what the instrumented run replays and
 # `<crate>.tgunset.log` what the uninstrumented one does. The test paths end in
 # the classified fn name, as libtest's do: that is how a test the instrument
@@ -1281,24 +1350,126 @@ test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
 # is INCOMPLETE: the scan of that test stopped at its failure.
 new_case verdict_is_the_uninstrumented_run || exit 1
 classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+instrument_pin "${CASE_ROOT}" rmlx-kv-quant kv_gpu_beta
 printf 'Metal GPU Validation Enabled\n%s\n' "${VERDICT_BETA_RED}" | crate_log "${CASE_ROOT}" rmlx-kv-quant 101
 printf '%s\n' "${VERDICT_GREEN}" | crate_log "${CASE_ROOT}" rmlx-kv-quant.tgunset 0
 run_case "${CASE_ROOT}"
 expect_status 0
 expect_out "changed under the instrument"
-expect_out "  rmlx-kv-quant kv::kv_gpu_beta"
+expect_out "  rmlx-kv-quant kv::kv_gpu_beta — analysis of the instrument"
 expect_out "OK: 2 GPU tests passed"
-expect_out "INCOMPLETE: 1 test(s) failed only under the instrument"
-expect_no_out "ERROR: GPU tests failed in:"
+expect_out "INCOMPLETE: 1 pinned test(s) failed only under the instrument"
+expect_no_out "ERROR:"
 
-# The verdict run sees no Metal variable at all, and the scan sees the pinned
-# set. An exported one in the caller's shell does not reach the verdict.
+# The same run with no entry for the test is a failure. A defect that only the
+# instrument's timing exposes looks exactly like this, so the name has to be
+# one somebody analysed and wrote down.
+new_case instrument_only_failure_with_no_entry_is_a_failure || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+instrument_pin "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+printf 'Metal GPU Validation Enabled\n%s\n' "${VERDICT_BETA_RED}" | crate_log "${CASE_ROOT}" rmlx-kv-quant 101
+printf '%s\n' "${VERDICT_GREEN}" | crate_log "${CASE_ROOT}" rmlx-kv-quant.tgunset 0
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "ERROR: the instrument-only pin does not match this run:"
+expect_report "not pinned: rmlx-kv-quant kv::kv_gpu_beta failed with shader validation on and passed without it"
+# ...and the other entry, whose test passed under the instrument, is stale.
+expect_report "stale: rmlx-kv-quant kv_gpu_alpha is pinned as failing under the instrument and passed under it"
+expect_no_out "changed under the instrument"
+
+# An entry is not stale when its test was not selected...
+new_case instrument_pin_entry_not_selected_is_silent || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+instrument_pin "${CASE_ROOT}" rmlx-kv-quant kv_gpu_beta
+crate_log "${CASE_ROOT}" rmlx-kv-quant 0 <<'LOG'
+Metal GPU Validation Enabled
+running 1 test
+test kv::kv_gpu_alpha ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}" --filter kv_gpu_alpha
+expect_status 0
+expect_no_out "stale:"
+
+# ...or stood down under the instrument...
+new_case instrument_pin_entry_stood_down_is_silent || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+instrument_pin "${CASE_ROOT}" rmlx-kv-quant kv_gpu_beta
+crate_log "${CASE_ROOT}" rmlx-kv-quant 0 <<'LOG'
+Metal GPU Validation Enabled
+running 2 tests
+test kv::kv_gpu_alpha ... ok
+test kv::kv_gpu_beta ... SKIP kv_gpu_beta: no snapshot on this machine
+ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}"
+expect_status 0
+expect_no_out "stale:"
+expect_out "INCOMPLETE: 1 selected GPU test(s) stood down"
+
+# ...or failed in both runs, which is a failing test and says nothing of the pin.
+new_case instrument_pin_entry_red_in_both_is_not_stale || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+instrument_pin "${CASE_ROOT}" rmlx-kv-quant kv_gpu_beta
+printf 'Metal GPU Validation Enabled\n%s\n' "${VERDICT_BETA_RED}" | crate_log "${CASE_ROOT}" rmlx-kv-quant 101
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "kv::kv_gpu_beta"
+expect_no_out "stale:"
+expect_no_out "changed under the instrument"
+
+# The pin is checked as it is read, like the census.
+new_case instrument_pin_line_missing_fields_is_refused || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+printf 'rmlx-kv-quant | kv_gpu_beta\n' >"${CASE_ROOT}/scripts/gpu_instrument_only.txt"
+printf 'Metal GPU Validation Enabled\n%s\n' "${VERDICT_GREEN}" | crate_log "${CASE_ROOT}" rmlx-kv-quant 0
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "line 1: expected 3 fields — crate | test | reference"
+
+new_case instrument_pin_naming_an_unknown_test_is_refused || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+instrument_pin "${CASE_ROOT}" rmlx-kv-quant kv_gpu_gamma
+printf 'Metal GPU Validation Enabled\n%s\n' "${VERDICT_GREEN}" | crate_log "${CASE_ROOT}" rmlx-kv-quant 0
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "line 2: rmlx-kv-quant has no classified GPU test 'kv_gpu_gamma'"
+
+new_case instrument_pin_with_a_duplicate_entry_is_refused || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+instrument_pin "${CASE_ROOT}" rmlx-kv-quant kv_gpu_beta kv_gpu_beta
+printf 'Metal GPU Validation Enabled\n%s\n' "${VERDICT_BETA_RED}" | crate_log "${CASE_ROOT}" rmlx-kv-quant 101
+printf '%s\n' "${VERDICT_GREEN}" | crate_log "${CASE_ROOT}" rmlx-kv-quant.tgunset 0
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "line 3: rmlx-kv-quant kv_gpu_beta is pinned twice"
+
+new_case instrument_pin_missing_file_is_named || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+rm -f "${CASE_ROOT}/scripts/gpu_instrument_only.txt"
+printf 'Metal GPU Validation Enabled\n%s\n' "${VERDICT_GREEN}" | crate_log "${CASE_ROOT}" rmlx-kv-quant 0
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "gpu_instrument_only.txt not found — the instrument-only pin is tracked"
+
+# Uninstrumented, there is no scan and the pin is not read.
+new_case instrument_pin_is_not_read_uninstrumented || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+instrument_pin "${CASE_ROOT}" rmlx-kv-quant kv_gpu_beta
+printf '%s\n' "${VERDICT_GREEN}" | crate_log "${CASE_ROOT}" rmlx-kv-quant 0
+run_case "${CASE_ROOT}" --no-shader-validation
+expect_status 0
+expect_no_out "stale:"
+
+# The verdict run sees no `MTL_*` or `METAL_*` variable, and the scan sees the
+# pinned set. An exported one in the caller's shell reaches neither.
 new_case verdict_run_carries_no_metal_variable || exit 1
 classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
 printf 'Metal GPU Validation Enabled\n%s\n' "${VERDICT_GREEN}" | crate_log "${CASE_ROOT}" rmlx-kv-quant 0
-export MTL_SHADER_VALIDATION=1 MTL_CAPTURE_ENABLED=1
+export MTL_SHADER_VALIDATION=1 MTL_CAPTURE_ENABLED=1 METAL_DEVICE_WRAPPER_TYPE=1
 run_case "${CASE_ROOT}"
-unset MTL_SHADER_VALIDATION MTL_CAPTURE_ENABLED
+unset MTL_SHADER_VALIDATION MTL_CAPTURE_ENABLED METAL_DEVICE_WRAPPER_TYPE
 expect_status 0
 expect_mtl_seen "crate=rmlx-kv-quant tg=unset mtl=0"
 expect_mtl_seen "crate=rmlx-kv-quant tg=1 mtl=8"
@@ -1325,28 +1496,64 @@ expect_status 1
 expect_report "kv::kv_gpu_beta"
 expect_no_out "changed under the instrument"
 
-# A hit is read from the instrumented run alone, and a test the instrument
-# turned red still has its hits counted: one it reported before it stopped is
-# above an expectation that no longer includes it.
-new_case verdict_cut_test_drops_its_pinned_count || exit 1
-classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
-{
-    census_pin_line "${CASE_ROOT}" 4 kv_gpu_alpha rmlx-kv-quant
-    census_pin_line "${CASE_ROOT}" 9 kv_gpu_beta rmlx-kv-quant
-} | pin "${CASE_ROOT}"
+# A test the instrument turned red did part of its work, so what its census
+# entries pin is a ceiling for this run: the hits it printed before it stopped
+# are hits the pin accepts, and it cannot be held to the rest.
 cut_hit="Invalid device load at offset 64, executing kernel function: \"${CENSUS_KERNEL}\""
-{
-    echo 'Metal GPU Validation Enabled'
-    echo "test kv::kv_gpu_alpha ... ok${cut_hit}${cut_hit}${cut_hit}${cut_hit}"
-    printf '%s\n' "${VERDICT_BETA_RED}" | grep -v 'kv_gpu_alpha'
-} | crate_log "${CASE_ROOT}" rmlx-kv-quant 101
-printf '%s\n' "${VERDICT_GREEN}" | crate_log "${CASE_ROOT}" rmlx-kv-quant.tgunset 0
+# cut_case_logs <beta-hits> — alpha prints its four pinned hits and passes;
+# beta prints <beta-hits> and then fails under the instrument only.
+cut_case_logs() {
+    local beta_hits="" i=0
+    while [ "${i}" -lt "$1" ]; do beta_hits="${beta_hits}${cut_hit}"; i=$((i + 1)); done
+    classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+    instrument_pin "${CASE_ROOT}" rmlx-kv-quant kv_gpu_beta
+    {
+        census_pin_line "${CASE_ROOT}" 4 kv_gpu_alpha rmlx-kv-quant
+        census_pin_line "${CASE_ROOT}" 9 kv_gpu_beta rmlx-kv-quant
+    } | pin "${CASE_ROOT}"
+    {
+        echo 'Metal GPU Validation Enabled'
+        echo "test kv::kv_gpu_alpha ... ok${cut_hit}${cut_hit}${cut_hit}${cut_hit}"
+        printf '%s\n' "${VERDICT_BETA_RED}" | grep -v 'kv_gpu_alpha' \
+            | sed "s/^test kv::kv_gpu_beta ... FAILED\$/&${beta_hits//\"/\\\"}/" | sed 's/\\"/"/g'
+    } | crate_log "${CASE_ROOT}" rmlx-kv-quant 101
+    printf '%s\n' "${VERDICT_GREEN}" | crate_log "${CASE_ROOT}" rmlx-kv-quant.tgunset 0
+}
+
+new_case verdict_cut_test_count_is_a_ceiling || exit 1
+cut_case_logs 0
 run_case "${CASE_ROOT}"
 expect_status 0
 expect_out "not enforced in full"
-expect_out "kv_gpu_beta failed under the instrument only, so its 9 are not expected"
+expect_out "kv_gpu_beta failed under the instrument only, so its 9 are a ceiling and not an expectation"
 expect_out "kv_gpu_alpha = 4"
-expect_out "INCOMPLETE: 1 test(s) failed only under the instrument"
+expect_out "INCOMPLETE: 1 pinned test(s) failed only under the instrument"
+
+# Two hits before the failure are under the ceiling and are printed as accepted.
+new_case verdict_cut_test_hits_under_the_ceiling_pass || exit 1
+cut_case_logs 2
+run_case "${CASE_ROOT}"
+expect_status 0
+expect_out "6 device load \"${CENSUS_KERNEL}\" in rmlx-kv-quant"
+expect_out "kv_gpu_beta = at most 9, cut short"
+expect_no_out "ERROR:"
+
+# Ten are above it.
+new_case verdict_cut_test_hits_over_the_ceiling_fail || exit 1
+cut_case_logs 10
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "count moved up: \"${CENSUS_KERNEL}\" device load in rmlx-kv-quant — expected at most 13, observed 14"
+
+# The ceiling does not lower the floor of a test that ran to its end. The
+# floor is on the sum per kernel, so this holds while the cut test prints
+# nothing; a hit of the cut test can stand in for a missing one of the other.
+new_case verdict_cut_test_keeps_the_other_entry_exact || exit 1
+cut_case_logs 0
+sed -i '' "s/kv_gpu_alpha ... ok${cut_hit}/kv_gpu_alpha ... ok/" "${CASE_ROOT}/logs/rmlx-kv-quant.log"
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "count moved down: \"${CENSUS_KERNEL}\" device load in rmlx-kv-quant — expected 4, observed 3"
 
 # A hit printed by the uninstrumented run is not a hit: only the instrument
 # reports one, and text of that shape from anything else is not a diagnostic.
@@ -1368,6 +1575,82 @@ printf '%s\n' "${VERDICT_GREEN}" | crate_log "${CASE_ROOT}" rmlx-kv-quant.tgunse
 run_case "${CASE_ROOT}"
 expect_status 1
 expect_report "rmlx-kv-quant: the instrumented run exited 134 and named no failing test"
+
+# The rule is per instrumented run. Here the threadgroup-on run dies and names
+# nothing, while the threadgroup-off run names a pinned instrument-only
+# failure: the named one must not vouch for the unnamed one.
+new_case verdict_scan_death_is_read_per_run || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+instrument_pin "${CASE_ROOT}" rmlx-kv-quant kv_gpu_beta
+cat >"${CASE_ROOT}/tg" <<'TG'
+on	rmlx-kv-quant	kv_gpu_alpha
+off	rmlx-kv-quant	kv_gpu_beta
+TG
+crate_log "${CASE_ROOT}" rmlx-kv-quant.tg1 134 <<'LOG'
+Metal GPU Validation Enabled
+running 1 test
+test kv::kv_gpu_alpha ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 1.00s
+LOG
+printf 'Metal GPU Validation Enabled\n%s\n' "${VERDICT_BETA_RED}" | grep -v 'kv_gpu_alpha' \
+    | sed 's/1 passed; 1 failed/0 passed; 1 failed/' | crate_log "${CASE_ROOT}" rmlx-kv-quant.tg0 101
+printf '%s\n' "${VERDICT_GREEN}" | crate_log "${CASE_ROOT}" rmlx-kv-quant.tgunset 0
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "rmlx-kv-quant: the instrumented run exited 134 and named no failing test (threadgroup validation ON)"
+
+# A test that stood down in the uninstrumented run asserted nothing for the
+# verdict, whatever the instrumented run did. It is listed and the line is
+# INCOMPLETE.
+new_case stand_down_in_the_verdict_run_alone_is_reported || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+printf 'Metal GPU Validation Enabled\n%s\n' "${VERDICT_GREEN}" | crate_log "${CASE_ROOT}" rmlx-kv-quant 0
+crate_log "${CASE_ROOT}" rmlx-kv-quant.tgunset 0 <<'LOG'
+running 2 tests
+test kv::kv_gpu_alpha ... ok
+test kv::kv_gpu_beta ... SKIP kv_gpu_beta: no snapshot on this machine
+ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}"
+expect_status 0
+expect_out "  rmlx-kv-quant kv_gpu_beta: no snapshot on this machine"
+expect_out "INCOMPLETE: 1 selected GPU test(s) stood down"
+
+# The census counts hits in the instrumented runs, so its skip set is those
+# runs' notices. A stand-down there drops the entry...
+new_case census_skip_set_is_the_scan_runs || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+census_pin "${CASE_ROOT}" 9 kv_gpu_beta
+crate_log "${CASE_ROOT}" rmlx-kv-quant 0 <<'LOG'
+Metal GPU Validation Enabled
+running 2 tests
+test kv::kv_gpu_alpha ... ok
+test kv::kv_gpu_beta ... SKIP kv_gpu_beta: no snapshot on this machine
+ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+printf '%s\n' "${VERDICT_GREEN}" | crate_log "${CASE_ROOT}" rmlx-kv-quant.tgunset 0
+run_case "${CASE_ROOT}"
+expect_status 0
+expect_out "kv_gpu_beta skipped, so its 9 are not expected"
+
+# ...and a stand-down in the uninstrumented run alone does not: the scan ran
+# the test and it reported nothing.
+new_case census_skip_set_is_not_the_verdict_run || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+census_pin "${CASE_ROOT}" 9 kv_gpu_beta
+printf 'Metal GPU Validation Enabled\n%s\n' "${VERDICT_GREEN}" | crate_log "${CASE_ROOT}" rmlx-kv-quant 0
+crate_log "${CASE_ROOT}" rmlx-kv-quant.tgunset 0 <<'LOG'
+running 2 tests
+test kv::kv_gpu_alpha ... ok
+test kv::kv_gpu_beta ... SKIP kv_gpu_beta: no snapshot on this machine
+ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "no longer fires: \"${CENSUS_KERNEL}\" device load in rmlx-kv-quant — expected 9, observed 0"
 
 # The uninstrumented run is held to the same coverage as the scan: a verdict
 # over fewer tests than were classified is not a verdict on the crate.
@@ -1939,4 +2222,4 @@ if [ "${failures}" -ne 0 ]; then
     exit 1
 fi
 
-echo "run_gpu_tests_selftest: OK — every kind of red is reported, the access mix is the one observed, the census pin accepts only what it names, each half runs its own tests against its own slice of that pin, each test runs under its own threadgroup setting, and the verdict is the uninstrumented run's."
+echo "run_gpu_tests_selftest: OK — every kind of red is reported, the access mix is the one observed, the census pin accepts only what it names, each half runs its own tests against its own slice of that pin, each test runs under its own threadgroup setting, the verdict is the uninstrumented run's, and a test only the instrument turned red is accepted by name."

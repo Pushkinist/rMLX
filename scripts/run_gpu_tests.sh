@@ -95,22 +95,33 @@
 #   validation makes MLX's attention kernel return `inf` at random on one
 #   prefill shape, with no diagnostic, and the same call is bit-stable without
 #   it (docs/GPU_TESTS.md). So an instrumented run is a scan and not a verdict:
-#   each crate runs once more with no `MTL_*` variable at all, and pass, fail
-#   and the counts on the final line are that run's.
+#   each crate runs once more with no `MTL_*` or `METAL_*` variable, and pass,
+#   fail and the counts on the final line are that run's. The price is one
+#   more pass over every selected test.
 #
-#   A test that fails only under the instrument is not a failure. It is listed
-#   by name, and it marks the final line INCOMPLETE: its scan stopped at the
-#   failure, so the kernels it reaches after that point were not scanned, and
-#   the counts the pin holds for it are not expected. An instrumented run that
-#   exits non-zero and names no failing test is a failure.
+#   A test that fails only under the instrument is accepted only when
+#   `scripts/gpu_instrument_only.txt` names it, with the reference to its
+#   analysis. An accepted one is listed and marks the final line INCOMPLETE:
+#   its scan stopped at the failure. One the pin does not name is a failure,
+#   because a defect that only the instrument's timing exposes looks the same.
+#   A pinned test that passed under the instrument is a failure too: the pin
+#   is stale. Each instrumented run that exits non-zero and names no failing
+#   test is a failure.
+#
+#   The hits such a test printed before it stopped are part of what its census
+#   entries accept, so each of its pinned counts is a ceiling for this run and
+#   not an expectation.
+#
+#   A stand-down notice from either run is reported. The census reads the
+#   instrumented runs' notices alone, since those are the runs it counts.
 #
 # THREADGROUP
 #   Threadgroup-memory instrumentation makes MLX's NAX kernels return wrong
 #   values at random in a checkpoint's forward, so a test over a checkpoint
 #   cannot be judged with it. `scripts/gpu_test_threadgroup.sh` sets it `on`
 #   for the tests of rMLX's own `.metal` kernels and `off` for the rest, and
-#   states the rule. Each crate runs once per setting, each run skipping the
-#   other setting's names; the report lists every test under the setting it ran
+#   states the rule. Each crate is scanned once per setting, each scan skipping
+#   the other setting's names; the report lists every test under the setting it ran
 #   with, the final line counts both, and a classified test the producer gives
 #   no setting, or a name inside a name of the other setting (which that
 #   setting's `--skip` would drop), is a refusal. Device-memory instrumentation
@@ -173,10 +184,12 @@
 #       This is the one a split can launder: a test the selection never asked
 #       for is only `not enforced in full`, which carries no INCOMPLETE.
 #
-# Exit 0 = every selected GPU test passed uninstrumented and every
-# shader-validation hit was one the census pin accounts for. Exit 1 = a failing test, a hit the pin does
-# not account for, or a run that executed nothing. A stand-down is not an exit
-# code — a developer without the weights must not be blocked — but it is on the
+# Exit 0 = every selected GPU test passed uninstrumented, every
+# shader-validation hit was one the census pin accounts for, and every test the
+# instrument alone turned red is one the instrument-only pin names. Exit 1 = a
+# failing test, a hit or an instrument-only failure a pin does not account for,
+# a stale pin, or a run that executed nothing. A stand-down is not an exit code
+# — a developer without the weights must not be blocked — but it is on the
 # final line, marked INCOMPLETE.
 
 # No `-e`: cargo's exit code is captured explicitly via PIPESTATUS, and one
@@ -259,7 +272,8 @@ fi
 # Naming these is not enough on its own: `env NAME=VALUE` overrides exactly what
 # it names and passes the rest of the environment through, so any other MTL_*
 # knob — a stale export, or one a future toolchain adds — still reaches the test
-# process. `mtl_unset` below clears the whole MTL_* namespace first, so the
+# process. `mtl_unset` below clears the whole MTL_* namespace first, and
+# METAL_* with it (`METAL_DEVICE_WRAPPER_TYPE` loads the API validation layer), so the
 # pinned set is the entire Metal configuration the tests run under.
 mtl_validation_env=(
     MTL_SHADER_VALIDATION=1
@@ -279,7 +293,7 @@ TG_VAR=MTL_SHADER_VALIDATION_THREADGROUP_MEMORY
 mtl_unset=()
 while IFS='=' read -r mtl_name _; do
     case "${mtl_name}" in
-    MTL_*) mtl_unset+=(-u "${mtl_name}") ;;
+    MTL_*|METAL_*) mtl_unset+=(-u "${mtl_name}") ;;
     esac
 done < <(env)
 
@@ -346,6 +360,10 @@ diagnostic_records() {
 # every deviation from the pin is a failure naming the delta. The comparison is
 # a tally diff — this script knows no kernel name.
 CENSUS_PIN="${REPO_ROOT}/scripts/gpu_validation_census.txt"
+
+# The tests this tree accepts as failing under the instrument only, one
+# `crate | test | reference` entry each. The file's header carries the rule.
+INSTRUMENT_PIN="${REPO_ROOT}/scripts/gpu_instrument_only.txt"
 
 # Strip leading and trailing whitespace, so the pin can be laid out as a table.
 trim() {
@@ -610,6 +628,7 @@ validation_kinds=""
 validation_records=""
 validation_skips=""
 validation_cut=""
+scan_failed=""
 instrument_only=""
 n_instrument_only=0
 stood_down=""
@@ -684,7 +703,6 @@ for crate in "${crates[@]}"; do
     scan_log="$(mktemp "${TMPDIR:-/tmp}/rmlx-gpu-scan-${crate}.XXXXXX")"
     log="$(mktemp "${TMPDIR:-/tmp}/rmlx-gpu-test-${crate}.XXXXXX")"
     rc=0
-    scan_rc=0
     # One instrumented cargo run per threadgroup setting, each naming its own
     # tests and skipping the other setting's, so no test is scanned under both.
     # Then one run of every selected test with no instrumentation.
@@ -768,7 +786,11 @@ for crate in "${crates[@]}"; do
         if [ "${setting}" = "plain" ]; then
             [ "${group_rc}" -ne 0 ] && rc="${group_rc}"
         else
-            [ "${group_rc}" -ne 0 ] && scan_rc="${group_rc}"
+            # Per run, not per crate: a run that died unnamed must not hide
+            # behind the other setting's named failure.
+            if [ "${group_rc}" -ne 0 ] && [ -z "$(failing_names "${group_log}")" ]; then
+                failed_crates="${failed_crates}  ${crate}: the instrumented run exited ${group_rc} and named no failing test (${tg_label})"$'\n'
+            fi
         fi
         group_executed="$(awk '
             /^test result:/ {
@@ -834,14 +856,10 @@ for crate in "${crates[@]}"; do
         validation_cut="${validation_cut}${crate}"$'\t'"${fail_name##*::}"$'\n'
         n_instrument_only=$((n_instrument_only + 1))
     done <<< "${scan_fails}"
-    if [ "${scan_rc}" -ne 0 ] && [ -z "${scan_fails}" ]; then
-        failed_crates="${failed_crates}  ${crate}: the instrumented run exited ${scan_rc} and named no failing test"$'\n'
-    fi
-
-    # The scan reads the instrumented runs. A stand-down notice is the same in
-    # every run of a test, so it is harvested from one of them.
-    notice_log="${log}"
-    [ "${SHADER_VALIDATION}" = "1" ] && notice_log="${scan_log}"
+    while IFS= read -r fail_name; do
+        [ -n "${fail_name}" ] &&
+            scan_failed="${scan_failed}${crate}"$'\t'"${fail_name##*::}"$'\n'
+    done <<< "${scan_fails}"
 
     crate_banner=0
     grep -qF "${VALIDATION_BANNER}" "${scan_log}" && crate_banner=1
@@ -885,43 +903,63 @@ for crate in "${crates[@]}"; do
     # any other test is not an attribution, however that test is spelled, or a
     # cell that printed its sibling's name would stand the sibling down while
     # the sibling ran.
-    crate_notices="$(awk -v named="${NAMED_SKIP}" '
-        /^test [^ ]+ \.\.\. / { cur = $2; sub(/.*::/, "", cur) }
-        match($0, named) {
-            notice = substr($0, RSTART)
-            name = substr($0, RSTART + 5, RLENGTH - 6)
-            print (name == cur ? "A" : "U") "\t" notice
-        }' "${notice_log}" | sed -E 's/Invalid (device|threadgroup).*$//; s/[[:space:]]+$//')"
-    n_unattributed=$((n_unattributed + $(printf '%s\n' "${crate_notices}" | grep -c $'^U\t')))
-    crate_skips="$(printf '%s\n' "${crate_notices}" | sed -n $'s/^A\t//p' | sort -u)"
+    # Both runs are read. The census skip set is the instrumented runs' alone,
+    # since those are the runs it counts hits in; a stand-down in either run is
+    # listed, because that run asserted nothing for the test.
     crate_stood_down=""
-    while IFS= read -r notice; do
-        [ -z "${notice}" ] && continue
-        skip_test="${notice%%:*}"
-        skip_test="${skip_test#SKIP }"
-        # The shape is not the attribution: a notice naming a suite, a file or a
-        # helper passes the pattern and names nothing this runner can select, so
-        # listing it would put a name in the report that no filter reaches.
-        # Checked against the whole classification rather than the selection,
-        # since an over-matching filter can run a classified test the selection
-        # did not ask for.
-        case $'\n'"${listing}"$'\n' in
-            *$'\n'"${crate}"$'\t'"${skip_test}"$'\n'*) ;;
-            *) n_unattributed=$((n_unattributed + 1)); continue ;;
-        esac
-        stood_down="${stood_down}  ${crate} ${skip_test}: ${notice#*: }"$'\n'
-        crate_stood_down="${crate_stood_down}${skip_test}"$'\n'
-        validation_skips="${validation_skips}${crate}"$'\t'"${skip_test}"$'\n'
-        n_stood_down=$((n_stood_down + 1))
-    done <<< "${crate_skips}"
+    crate_listed=""
+    crate_unattributed=0
+    notice_logs=("${log}")
+    [ "${SHADER_VALIDATION}" = "1" ] && notice_logs=("${scan_log}" "${log}")
+    for notice_log in "${notice_logs[@]}"; do
+        log_unattributed=0
+        crate_notices="$(awk -v named="${NAMED_SKIP}" '
+            /^test [^ ]+ \.\.\. / { cur = $2; sub(/.*::/, "", cur) }
+            match($0, named) {
+                notice = substr($0, RSTART)
+                name = substr($0, RSTART + 5, RLENGTH - 6)
+                print (name == cur ? "A" : "U") "\t" notice
+            }' "${notice_log}" | sed -E 's/Invalid (device|threadgroup).*$//; s/[[:space:]]+$//')"
+        log_unattributed=$((log_unattributed + $(printf '%s\n' "${crate_notices}" | grep -c $'^U\t')))
+        crate_skips="$(printf '%s\n' "${crate_notices}" | sed -n $'s/^A\t//p' | sort -u)"
+        while IFS= read -r notice; do
+            [ -z "${notice}" ] && continue
+            skip_test="${notice%%:*}"
+            skip_test="${skip_test#SKIP }"
+            # The shape is not the attribution: a notice naming a suite, a file or a
+            # helper passes the pattern and names nothing this runner can select, so
+            # listing it would put a name in the report that no filter reaches.
+            # Checked against the whole classification rather than the selection,
+            # since an over-matching filter can run a classified test the selection
+            # did not ask for.
+            case $'\n'"${listing}"$'\n' in
+                *$'\n'"${crate}"$'\t'"${skip_test}"$'\n'*) ;;
+                *) log_unattributed=$((log_unattributed + 1)); continue ;;
+            esac
+            if [ "${notice_log}" = "${notice_logs[0]}" ]; then
+                crate_stood_down="${crate_stood_down}${skip_test}"$'\n'
+                validation_skips="${validation_skips}${crate}"$'\t'"${skip_test}"$'\n'
+            fi
+            case $'\n'"${crate_listed}" in
+                *$'\n'"${skip_test}"$'\n'*) continue ;;
+            esac
+            crate_listed="${crate_listed}${skip_test}"$'\n'
+            stood_down="${stood_down}  ${crate} ${skip_test}: ${notice#*: }"$'\n'
+            n_stood_down=$((n_stood_down + 1))
+        done <<< "${crate_skips}"
 
-    # A notice that names no test cannot be attributed, so it can be counted but
-    # not listed — and a report that silently drops it claims a completeness it
-    # does not have. Counted per occurrence rather than deduplicated: the point
-    # is how much of this run went unaccounted for.
-    all_notices="$(grep -Eo "${ANY_SKIP}" "${notice_log}" | grep -c '')"
-    named_notices="$(grep -Eo "${NAMED_SKIP}" "${notice_log}" | grep -c '')"
-    n_unattributed=$((n_unattributed + all_notices - named_notices))
+        # A notice that names no test cannot be attributed, so it can be counted but
+        # not listed — and a report that silently drops it claims a completeness it
+        # does not have. Counted per occurrence rather than deduplicated: the point
+        # is how much of this run went unaccounted for.
+        all_notices="$(grep -Eo "${ANY_SKIP}" "${notice_log}" | grep -c '')"
+        named_notices="$(grep -Eo "${NAMED_SKIP}" "${notice_log}" | grep -c '')"
+        log_unattributed=$((log_unattributed + all_notices - named_notices))
+        # The same notice appears in each run of a test, so the larger count is
+        # the number of notices and the sum would count each twice.
+        [ "${log_unattributed}" -gt "${crate_unattributed}" ] && crate_unattributed="${log_unattributed}"
+    done
+    n_unattributed=$((n_unattributed + crate_unattributed))
 
     rm -f "${log}" "${scan_log}"
     crate_passed=${counts% *}
@@ -982,16 +1020,97 @@ if [ "${n_stood_down}" -gt 0 ] || [ "${n_unattributed}" -gt 0 ]; then
     echo
 fi
 
-# A test the instrument alone turned red. Not a failure: the verdict is the
-# uninstrumented run's. Not a clean scan either, so it is named here and on the
-# final line.
-if [ "${n_instrument_only}" -gt 0 ]; then
-    echo "changed under the instrument — these tests failed with shader validation on and passed without it:"
-    printf '%s' "${instrument_only}"
-    echo "  The verdict is the uninstrumented run's. The scan of such a test stopped at"
-    echo "  its failure, so the kernels it reaches after that point were not scanned."
-    echo "  See docs/GPU_TESTS.md."
-    echo
+# A test the instrument alone turned red. The verdict is the uninstrumented
+# run's, but only a test the instrument-only pin names is accepted: a defect
+# that the instrument's timing exposes looks exactly like an artifact of it.
+if [ "${SHADER_VALIDATION}" = "1" ]; then
+    ipin_entries=""
+    ipin_errors=""
+    ipin_lineno=0
+    if [ ! -f "${INSTRUMENT_PIN}" ]; then
+        ipin_errors="    ${INSTRUMENT_PIN} not found — the instrument-only pin is tracked; restore it rather than running without one"$'\n'
+    else
+        while IFS= read -r pin_line || [ -n "${pin_line}" ]; do
+            ipin_lineno=$((ipin_lineno + 1))
+            case "$(trim "${pin_line}")" in ''|'#'*) continue ;; esac
+            IFS='|' read -r i_crate i_test i_ref i_extra <<< "${pin_line}"
+            i_crate="$(trim "${i_crate}")"
+            i_test="$(trim "${i_test}")"
+            i_ref="$(trim "${i_ref}")"
+            if [ -z "${i_crate}" ] || [ -z "${i_test}" ] || [ -z "${i_ref}" ] || [ -n "${i_extra}" ]; then
+                ipin_errors="${ipin_errors}    line ${ipin_lineno}: expected 3 fields — crate | test | reference"$'\n'
+                continue
+            fi
+            case $'\n'"${listing}"$'\n' in
+                *$'\n'"${i_crate}"$'\t'"${i_test}"$'\n'*) ;;
+                *) ipin_errors="${ipin_errors}    line ${ipin_lineno}: ${i_crate} has no classified GPU test '${i_test}'"$'\n'
+                   continue ;;
+            esac
+            case $'\n'"${ipin_entries}" in
+                *$'\n'"${i_crate}"$'\t'"${i_test}"$'\t'*)
+                    ipin_errors="${ipin_errors}    line ${ipin_lineno}: ${i_crate} ${i_test} is pinned twice"$'\n'
+                    continue ;;
+            esac
+            ipin_entries="${ipin_entries}${i_crate}"$'\t'"${i_test}"$'\t'"${i_ref}"$'\n'
+        done < "${INSTRUMENT_PIN}"
+    fi
+
+    ipin_accepted=""
+    ipin_deviations=""
+    while IFS= read -r changed; do
+        [ -z "${changed}" ] && continue
+        c_crate="${changed%% *}"
+        c_path="${changed#* }"
+        c_ref=""
+        while IFS=$'\t' read -r i_crate i_test i_ref; do
+            [ "${i_crate}" = "${c_crate}" ] && [ "${i_test}" = "${c_path##*::}" ] && c_ref="${i_ref}"
+        done <<< "${ipin_entries}"
+        if [ -n "${c_ref}" ]; then
+            ipin_accepted="${ipin_accepted}  ${c_crate} ${c_path} — ${c_ref}"$'\n'
+        else
+            ipin_deviations="${ipin_deviations}    not pinned: ${c_crate} ${c_path} failed with shader validation on and passed without it"$'\n'
+            n_instrument_only=$((n_instrument_only - 1))
+        fi
+    done <<< "$(printf '%s' "${instrument_only}" | sed 's/^  //')"
+
+    # A pinned test that the scan ran to its end, green. A test the selection
+    # dropped and one that stood down say nothing about the pin.
+    while IFS=$'\t' read -r i_crate i_test i_ref; do
+        [ -z "${i_test}" ] && continue
+        case $'\n'"${selected}" in
+            *$'\n'"${i_crate}"$'\t'"${i_test}"$'\n'*) ;;
+            *) continue ;;
+        esac
+        case $'\n'"${validation_skips}" in
+            *$'\n'"${i_crate}"$'\t'"${i_test}"$'\n'*) continue ;;
+        esac
+        case $'\n'"${scan_failed}" in
+            *$'\n'"${i_crate}"$'\t'"${i_test}"$'\n'*) continue ;;
+        esac
+        ipin_deviations="${ipin_deviations}    stale: ${i_crate} ${i_test} is pinned as failing under the instrument and passed under it"$'\n'
+    done <<< "${ipin_entries}"
+
+    if [ -n "${ipin_accepted}" ]; then
+        echo "changed under the instrument — these tests failed with shader validation on and passed without it:"
+        printf '%s' "${ipin_accepted}"
+        echo "  The verdict is the uninstrumented run's. The scan of such a test stopped at"
+        echo "  its failure, so the kernels it reaches after that point were not scanned."
+        echo "  Each is accepted by ${INSTRUMENT_PIN#"${REPO_ROOT}"/}. See docs/GPU_TESTS.md."
+        echo
+    fi
+    if [ -n "${ipin_errors}${ipin_deviations}" ]; then
+        echo "ERROR: the instrument-only pin does not match this run:" >&2
+        printf '%s' "${ipin_errors}${ipin_deviations}" >&2
+        echo >&2
+        echo "Pin: ${INSTRUMENT_PIN}" >&2
+        echo "A test that fails with shader validation on and passes without it is" >&2
+        echo "accepted only with an entry that refers to its analysis: a kernel defect" >&2
+        echo "that the instrument's timing exposes looks the same as an artifact of the" >&2
+        echo "instrument. A pinned test that passed under the instrument makes its entry" >&2
+        echo "stale; delete the entry. See docs/GPU_TESTS.md." >&2
+        echo >&2
+        red=1
+    fi
 fi
 
 # An invalid access is a failure even though every test reported `ok` and cargo
@@ -1031,7 +1150,7 @@ if [ "${SHADER_VALIDATION}" = "1" ]; then
             # `<=N` is an entry whose count is not reproducible: the bound is
             # the largest count its derivation runs observed.
             case "${p_count#<=}" in
-                ''|*[!0-9]*|0) pin_errors="${pin_errors}    line ${pin_lineno}: count '${p_count}' is not a positive integer, or '<=' and one"$'\n'
+                ''|*[!0-9]*|0*) pin_errors="${pin_errors}    line ${pin_lineno}: count '${p_count}' is not a positive integer, or '<=' and one"$'\n'
                                continue ;;
             esac
             # The pin holds validated-benign READS. A dropped write is
@@ -1127,7 +1246,11 @@ if [ "${SHADER_VALIDATION}" = "1" ]; then
             esac
             case $'\n'"${validation_cut}" in
                 *$'\n'"${e_crate}"$'\t'"${e_test}"$'\n'*)
-                   census_notes="${census_notes}    not enforced in full: \"${e_kernel}\" ${e_kind} in ${e_crate} — ${e_test} failed under the instrument only, so its ${e_count} are not expected"$'\n'
+                   # What it printed before it stopped is part of what this
+                   # entry accepts, so the count is a ceiling for this run.
+                   census_notes="${census_notes}    not enforced in full: \"${e_kernel}\" ${e_kind} in ${e_crate} — ${e_test} failed under the instrument only, so its ${e_count#<=} are a ceiling and not an expectation"$'\n'
+                   allowance=$((allowance + ${e_count#<=}))
+                   key_accepted="${key_accepted}        ${e_test} = at most ${e_count#<=}, cut short — ${e_ref}"$'\n'
                    continue ;;
             esac
             case "${e_count}" in
@@ -1227,7 +1350,7 @@ if [ "${n_stood_down}" -gt 0 ] || [ "${n_unattributed}" -gt 0 ]; then
     incomplete="${incomplete} — INCOMPLETE: ${n_stood_down} selected GPU test(s) stood down and $((n_unattributed)) further notice(s) named no test; they asserted nothing (listed above)"
 fi
 if [ "${n_instrument_only}" -gt 0 ]; then
-    incomplete="${incomplete} — INCOMPLETE: ${n_instrument_only} test(s) failed only under the instrument, so the scan did not cover them in full (listed above)"
+    incomplete="${incomplete} — INCOMPLETE: ${n_instrument_only} pinned test(s) failed only under the instrument, so the scan did not cover them in full (listed above)"
 fi
 tg_note=" (threadgroup validation on for ${n_tg_on} test(s), off for ${n_tg_off})"
 if [ "${SHADER_VALIDATION}" = "1" ] && [ -n "${census_notes}" ]; then
