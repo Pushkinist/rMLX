@@ -991,6 +991,158 @@ fn a_collapsed_reference_arm_is_reported_as_an_input_the_gate_cannot_judge() {
     );
 }
 
+/// The speculative arm of the block-8 recurrent pair on the congestion prompt,
+/// as the 4-bit verifier wrote it on MLX 0.32.3. It parts from the reference at
+/// token 31, on a top-two margin of one bf16 step, and writes on as healthy
+/// prose. Its last quarter says "the congestion window is" twice, 25 tokens
+/// apart, and reads 9 of 39 at that period: above [`MAX_CYCLE_FRACTION`].
+const MEASURED_SPEC_ARM: [u32; 256] = [
+    760, 15346, 16456, 539, 864, 25804, 27930, 3790, 52231, 369, 279, 8476, 26207, 314, 279, 52231,
+    3136, 11, 3428, 13464, 310, 430, 272, 22429, 11, 864, 76511, 279, 6966, 3202, 314, 632, 463,
+    48338, 3438, 795, 264, 4495, 628, 599, 303, 10650, 506, 866, 2574, 4299, 13, 1061, 3136, 25224,
+    303, 30412, 440, 279, 13563, 725, 44218, 3136, 11, 321, 279, 4495, 369, 2590, 51948, 539, 279,
+    8882, 314, 279, 1330, 2663, 11, 21873, 421, 424, 1503, 524, 92435, 2892, 279, 3790, 466, 279,
+    13563, 13, 561, 11870, 4661, 411, 1785, 369, 39527, 303, 279, 21254, 421, 3790, 52231, 369,
+    524, 264, 1064, 1528, 694, 264, 15133, 2876, 421, 4203, 3018, 383, 279, 22468, 9163, 494, 660,
+    7916, 13, 3113, 16070, 15358, 25304, 321, 88295, 11, 279, 4495, 3996, 382, 279, 1428, 2730,
+    314, 279, 3790, 1752, 321, 80456, 1141, 17822, 4238, 26211, 11, 13057, 25773, 9849, 4557, 430,
+    264, 8028, 421, 279, 3790, 369, 10141, 47821, 13, 1061, 10732, 6136, 5954, 25804, 310, 381,
+    638, 31103, 15031, 11, 9184, 23891, 974, 948, 279, 3790, 369, 30509, 321, 66319, 948, 4802,
+    513, 2420, 11, 26600, 84171, 61610, 1345, 19720, 19150, 13, 271, 760, 1817, 11690, 440, 6103,
+    1151, 11, 264, 9956, 5995, 310, 28314, 18553, 264, 491, 3511, 1083, 279, 3790, 310, 5471,
+    13969, 13522, 52231, 13, 3095, 264, 3511, 369, 1118, 9272, 11, 279, 52231, 3136, 369, 16761,
+    310, 264, 2526, 869, 11, 10813, 799, 466, 1330, 6966, 9933, 11930, 13, 1577, 1754, 9933, 369,
+    7544, 24687, 11, 279, 52231, 3136, 369, 6946, 71630, 11,
+];
+
+/// The reference arm of the same run. Plain greedy writes the same two
+/// sentences and reads 5 of 39 at the same period in the same window.
+const MEASURED_PLAIN_ARM: [u32; 256] = [
+    760, 15346, 16456, 539, 864, 25804, 27930, 3790, 52231, 369, 279, 8476, 26207, 314, 279, 52231,
+    3136, 11, 3428, 13464, 310, 430, 272, 22429, 11, 864, 76511, 279, 6966, 3202, 314, 795, 264,
+    4495, 628, 599, 303, 10650, 506, 866, 2574, 854, 13, 1061, 3136, 25224, 303, 30412, 440, 279,
+    13563, 725, 44218, 3136, 11, 321, 279, 4495, 369, 2590, 51948, 539, 279, 8882, 314, 279, 1330,
+    2663, 11, 21873, 421, 424, 1503, 524, 92435, 2892, 279, 3790, 466, 279, 13563, 13, 561, 11870,
+    4661, 411, 2444, 369, 39527, 303, 279, 21254, 421, 3790, 52231, 369, 524, 264, 1064, 1528, 694,
+    264, 15133, 2876, 421, 4203, 3018, 383, 279, 22468, 9163, 494, 660, 7916, 13, 3113, 16070,
+    15358, 25304, 321, 51730, 17157, 11, 279, 4495, 3996, 382, 279, 1428, 2730, 314, 279, 3790,
+    1752, 321, 80456, 1141, 17822, 4238, 26211, 11, 13057, 24141, 264, 1304, 314, 809, 4534, 12692,
+    6195, 2444, 421, 369, 11352, 31349, 310, 5190, 8997, 4011, 888, 36879, 321, 16905, 9849, 20382,
+    13, 271, 760, 1817, 11690, 440, 6103, 1151, 11, 264, 9956, 5995, 310, 17958, 21059, 279, 2420,
+    32288, 1973, 13969, 13522, 52231, 13, 3095, 264, 3511, 369, 1118, 9272, 466, 1238, 264, 4927,
+    71486, 11, 279, 52231, 3136, 369, 16761, 310, 264, 2526, 869, 11, 10813, 799, 466, 1330, 6966,
+    9933, 11930, 13, 1577, 1754, 9933, 369, 7544, 24687, 11, 279, 52231, 3136, 369, 6946, 71630,
+    11, 57020, 364, 1396, 4625, 9885, 558, 854, 421, 15734, 13, 1061, 56768, 6310, 5954, 279, 4495,
+    310, 5964, 21603, 685, 1141, 17822, 4238, 11,
+];
+
+/// Real prose on a prompt about one subject repeats that subject, in both arms.
+///
+/// These are two measured arms of a correct engine. The speculative arm reads
+/// above the ceiling in its last window, and the reference arm reads the same
+/// phrase at the same period, lower by four coincidences in 39 comparisons. The
+/// reference arm is the control: an arm that repeats no more than the verifier
+/// does alone has not collapsed.
+#[test]
+fn a_healthy_arm_that_repeats_no_more_than_its_reference_is_not_a_collapse() {
+    let (from, period, fraction) = strongest_windowed_cycle(&MEASURED_SPEC_ARM);
+    assert_eq!((from, period), (192, 25), "where the measured arm repeats");
+    assert!(
+        fraction > MAX_CYCLE_FRACTION,
+        "the measured arm reads {fraction:.4}, at or under the ceiling, so this \
+         fixture no longer holds the case it was recorded for"
+    );
+    assert!(
+        strongest_windowed_cycle(&MEASURED_PLAIN_ARM).2 <= MAX_CYCLE_FRACTION,
+        "the measured reference arm must be one the control can read"
+    );
+    assert_eq!(
+        judge(&MEASURED_SPEC_ARM, &MEASURED_PLAIN_ARM, &[], None),
+        Verdict::Agreed
+    );
+}
+
+/// The negative control for the fixture above, built from the same arm: its
+/// last window replaced by an exact loop of its own first 25 tokens there. The
+/// reference arm is unchanged, so the only thing that moved is the collapse.
+#[test]
+fn the_same_measured_arm_collapsed_over_its_last_window_is_refused() {
+    let last = N_TOKENS - N_TOKENS / TAIL_WINDOWS;
+    let mut collapsed = MEASURED_SPEC_ARM[..last].to_vec();
+    collapsed.extend((0..N_TOKENS - last).map(|i| MEASURED_SPEC_ARM[last + i % 25]));
+    let failure = judge(&collapsed, &MEASURED_PLAIN_ARM, &[], None)
+        .refusal()
+        .expect("an exact loop over the last window must be refused");
+    assert!(failure.contains("repeats at period 25"), "{failure}");
+}
+
+/// The reference arm is the control, and the rule is not symmetric. With the
+/// two measured arms exchanged, the arm that reads above the ceiling is the
+/// reference, and a reference the control cannot read is not agreement.
+#[test]
+fn the_measured_arms_exchanged_are_an_input_the_gate_cannot_judge() {
+    let verdict = judge(&MEASURED_PLAIN_ARM, &MEASURED_SPEC_ARM, &[], None);
+    assert!(
+        matches!(verdict, Verdict::Unjudgeable(ref why) if why.contains("reference arm")),
+        "{verdict:?}"
+    );
+}
+
+/// A reference arm too short to give a reading is no control. A collapsed
+/// speculative arm is refused against it.
+#[test]
+fn a_collapsed_arm_is_refused_when_the_reference_gives_no_reading() {
+    let plain = Rng(0xC0DE).prose(MIN_CYCLE_SAMPLES);
+    let failure = judge(&quarter_collapse(0x55, 8), &plain, &[], None)
+        .refusal()
+        .expect("a collapsed arm must be refused when there is no reference reading");
+    assert!(failure.contains("repeats at period"), "{failure}");
+}
+
+/// A speculative arm in a period-8 loop against a healthy reference arm,
+/// **swept** over the whole raggedness range.
+///
+/// The two arms share a real prefix. The reference arm then writes prose, and
+/// the speculative arm writes the loop. The control refuses every pair under
+/// [`FIRST_ADMITTED`]% raggedness, and each refusal is the control's own. Both
+/// edges are pinned, so the sweep fails when either moves.
+///
+/// The reference arm here is `Rng::prose`, which reads lower than real prose
+/// does. Against a reference that repeats its subject, the speculative arm
+/// must repeat more before the control can tell the two apart.
+#[test]
+fn a_speculative_arm_in_a_ragged_loop_is_refused_against_a_healthy_reference() {
+    /// Raggedness, in per cent, of the first pair the control admits.
+    const FIRST_ADMITTED: u64 = 58;
+
+    let head = Rng(0xFEED).prose(N_TOKENS / 2);
+    let mut first_admitted = None;
+    for noise in (0..=100).step_by(2) {
+        for seed in [0x33u64, 0x91, 0xB3, 0xD5] {
+            for reference_seed in [0x44u64, 0xA7, 0xC1, 0xE9] {
+                let spec = ragged_loop_arm(seed, noise);
+                let mut plain = head.clone();
+                plain.extend(Rng(reference_seed).prose(N_TOKENS / 2));
+                match judge(&spec, &plain, &[], None) {
+                    Verdict::Agreed => first_admitted = first_admitted.or(Some(noise)),
+                    Verdict::Refused(why) => {
+                        assert!(why.contains("repeats at period"), "{noise}%: {why}");
+                    }
+                    Verdict::Unjudgeable(why) => {
+                        panic!("{noise}%: the reference arm is healthy prose: {why}")
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        first_admitted,
+        Some(FIRST_ADMITTED),
+        "the control admits its first pair at {first_admitted:?}% raggedness, not the \
+         recorded {FIRST_ADMITTED}%"
+    );
+}
+
 /// A prompt neither arm answered is not a failure of the round loop, and a
 /// prompt only one arm answered is.
 #[test]
