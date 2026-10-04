@@ -153,8 +153,12 @@ counted when the reference arm holds that whole stretch, token for token, in
 the tail cut the stretch starts in. A stretch that starts in the last quarter
 of the speculative arm is looked for in the last quarter of the reference
 arm; one that starts in the first quarter is looked for in all of it. A run
-is excused whole or not at all. The reading is still the strongest one over
-every window and period, taken after the runs are excused.
+is excused whole or not at all. In one reading, a repeat of the reference arm
+excuses one repeat of the speculative arm, once: a second copy of the same
+stretch needs a second place in the reference arm. A run is read inside the
+window of the reading, so a loop that begins before a cut is cut there. The
+reading is still the strongest one over every window and period, taken after
+the runs are excused.
 
 The position bound exists because a judgeable reference arm can hold a long
 loop. Over the whole reference arm a 57-token loop at period 8 reads 49 of
@@ -173,9 +177,10 @@ holds both arms as a fixture.
 
 What the tests hold, and against what:
 
-- Fourteen constructed arms against judgeable reference arms are each
-  refused: eight whose reference arm reads near the ceiling, and six whose
-  reference arm holds the same loop somewhere else.
+- Eighteen constructed arms against judgeable reference arms are each
+  refused: eight whose reference arm reads near the ceiling, seven whose
+  reference arm holds the same loop somewhere else, and three that hold a
+  burst of the reference arm twice.
 - An exact loop at the end of the measured arm is refused past 13 tokens at
   period 1 and past 19 at period 8. The test asserts that each of those
   verdicts is the one a fixed ceiling gives on the raw reading of the last
@@ -197,14 +202,28 @@ ceiling in other words, or by single-token coincidences alone, is refused:
 the measured arm against a reference arm with one token of that stretch
 changed is refused
 (`a_healthy_arm_above_the_ceiling_is_refused_when_the_reference_did_not_write_its_phrase`).
+Position is a cause too. A healthy arm whose reference arm said the phrase in
+an earlier tail cut is refused. The measured pair has 7 tokens of margin: its
+stretch starts at token 223, the reference arm holds it at token 199, and the
+last quarter starts at token 192. With the reference arm's phrase 7 tokens
+earlier the pair is agreed; at 8 tokens earlier it is refused
+(`the_measured_pair_is_agreed_with_seven_tokens_of_position_margin`).
 The declared blind spot is the converse: a loop that the reference arm also
-wrote in full, in the same tail cut. Its size is bounded by the reference
-arm's own ceiling. A judgeable reference arm holds at most 19 tokens of a
-period-8 loop in its last window (11 of 56). A speculative arm that holds
-that loop and a second one of its own, up to the ceiling again, reads 22 of
-56 raw and is agreed; one more token of its own loop and it is refused. So
-the control can admit a raw reading of up to twice the ceiling in one window
-(`the_control_admits_at_most_the_ceiling_twice_in_one_window`).
+wrote in full, in the same tail cut. Its size is bounded. In one reading, the
+repeats left out of the speculative arm are at most the raw repeats of the
+reference arm from the same cut at the same period, and for a judgeable
+reference arm of the same length those are at most the ceiling. So the control
+admits a raw reading of at most twice the ceiling in one window. The edge is
+pinned: a reference arm holds at most 19 tokens of a period-8 loop in its last
+window (11 of 56); a speculative arm that holds that loop and a second one of
+its own, up to the ceiling again, reads 22 of 56 raw and is agreed; one more
+token of its own loop and it is refused
+(`the_control_admits_at_most_the_ceiling_twice_in_one_window`). One burst in
+the reference arm does not excuse two: a speculative arm that holds the
+reference arm's 13-token burst twice and one of its own reads 36 of 63 and is
+refused (`one_burst_in_the_reference_arm_excuses_one_burst_and_no_more`). For
+two arms of different lengths the windows differ in length, and the bound is
+on the count of repeats, not on the fraction.
 
 The control reads only prose. Healthy structured output, such as a markdown
 table, overlaps ragged loops on this measure, which is why the prompts ask for

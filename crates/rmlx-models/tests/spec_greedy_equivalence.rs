@@ -457,6 +457,14 @@ fn tail_cut(len: usize, at: usize) -> usize {
 /// cut. A run that goes one token past what the reference wrote is counted in
 /// full.
 ///
+/// **A repeat of the reference arm excuses one repeat, once.** The run of an
+/// excused stretch lies on repeats of the reference arm's own, and in one
+/// reading each of those excuses one position of the speculative arm. A second
+/// copy of the same stretch needs a second place in the reference arm. So the
+/// repeats left out of one reading are at most the raw repeats of the reference
+/// arm from the same cut at the same period, and for a judgeable reference arm
+/// of the same length that is at most the ceiling.
+///
 /// The position bound is what keeps a loop the reference arm holds early from
 /// excusing the same loop at the tail. Over the whole reference arm such a loop
 /// is diluted under the ceiling, so the reference arm is judgeable; in the last
@@ -465,6 +473,8 @@ fn tail_cut(len: usize, at: usize) -> usize {
 /// An empty `reference` excuses nothing, and that is the raw reading.
 fn repeats_beyond(tokens: &[u32], from: usize, period: usize, reference: &[u32]) -> usize {
     let repeats = |i: usize| tokens[i] == tokens[i - period];
+    // The positions of `reference` that have excused a run in this reading.
+    let mut spent = vec![false; reference.len()];
     let mut count = 0;
     let mut at = from + period;
     while at < tokens.len() {
@@ -478,11 +488,13 @@ fn repeats_beyond(tokens: &[u32], from: usize, period: usize, reference: &[u32])
         }
         let stretch = &tokens[at - period..=end];
         let cut = reference.len() * tail_cut(tokens.len(), at - period) / TAIL_WINDOWS;
-        if !reference[cut..]
-            .windows(stretch.len())
-            .any(|w| w == stretch)
-        {
-            count += end - at + 1;
+        let held = (cut..(reference.len() + 1).saturating_sub(stretch.len())).find(|&start| {
+            reference[start..start + stretch.len()] == *stretch
+                && !spent[start + period..start + stretch.len()].contains(&true)
+        });
+        match held {
+            Some(start) => spent[start + period..start + stretch.len()].fill(true),
+            None => count += end - at + 1,
         }
         at = end + 1;
     }
@@ -1724,6 +1736,18 @@ fn one_burst_in_the_reference_arm_excuses_one_burst_and_no_more() {
     for (shape, spec, plain, _) in &cases {
         assert_the_excused_repeats_are_the_reference_arms_own(shape, spec, plain);
     }
+
+    // Two shorter bursts against one longer one. The reference arm holds 12
+    // repeats. A burst of 7 takes 6 of them, and a burst of 8 then needs 7 and
+    // finds 6, so it is counted in full.
+    let mut plain = unique.clone();
+    burst(&mut plain, 200, 777_777);
+    let mut spec = unique;
+    spec[192..199].fill(777_777);
+    spec[220..228].fill(777_777);
+    assert_eq!(repeats_beyond(&spec, 192, 1, &[]), 13);
+    assert_eq!(repeats_beyond(&spec, 192, 1, &plain), 7);
+    assert_the_excused_repeats_are_the_reference_arms_own("two shorter bursts", &spec, &plain);
 }
 
 /// The declared blind spot, with its size.
