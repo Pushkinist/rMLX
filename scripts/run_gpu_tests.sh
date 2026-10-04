@@ -617,6 +617,7 @@ validation_hits=""
 validation_kinds=""
 validation_records=""
 validation_skips=""
+scan_cut=""
 stood_down=""
 n_stood_down=0
 n_unattributed=0
@@ -829,17 +830,7 @@ for crate in "${crates[@]}"; do
     # regression from the known baseline without re-running by hand.
     crate_fails="$(failing_names "${log}")"
 
-    # A test the instrumented run failed and the uninstrumented run did not:
-    # the instrument changed its result. That is a failure. A defect that the
-    # instrument's timing exposes looks the same as an artifact of it, and the
-    # scan of the test stopped there.
-    while IFS= read -r fail_name; do
-        [ -z "${fail_name}" ] && continue
-        case $'\n'"${crate_fails}"$'\n' in
-            *$'\n'"${fail_name}"$'\n'*) continue ;;
-        esac
-        failed_crates="${failed_crates}  ${crate}: ${fail_name} failed with shader validation on and passed without it"$'\n'
-    done <<< "$(failing_names "${scan_log}")"
+    scan_fails="$(failing_names "${scan_log}")"
 
     crate_banner=0
     grep -qF "${VALIDATION_BANNER}" "${scan_log}" && crate_banner=1
@@ -887,6 +878,7 @@ for crate in "${crates[@]}"; do
     # since those are the runs it counts hits in; a stand-down in either run is
     # listed, because that run asserted nothing for the test.
     crate_stood_down=""
+    verdict_stood_down=""
     crate_listed=""
     crate_unattributed=0
     notice_logs=("${log}")
@@ -916,6 +908,7 @@ for crate in "${crates[@]}"; do
                 *$'\n'"${crate}"$'\t'"${skip_test}"$'\n'*) ;;
                 *) log_unattributed=$((log_unattributed + 1)); continue ;;
             esac
+            [ "${notice_log}" = "${log}" ] && verdict_stood_down="${verdict_stood_down}${skip_test}"$'\n'
             if [ "${notice_log}" = "${notice_logs[0]}" ]; then
                 crate_stood_down="${crate_stood_down}${skip_test}"$'\n'
                 validation_skips="${validation_skips}${crate}"$'\t'"${skip_test}"$'\n'
@@ -942,6 +935,24 @@ for crate in "${crates[@]}"; do
     done
     n_unattributed=$((n_unattributed + crate_unattributed))
 
+    # A test the instrumented run failed and the uninstrumented run did not:
+    # the instrument changed its result. That is a failure. A defect that the
+    # instrument's timing exposes looks the same as an artifact of it, and the
+    # scan of the test stopped there. The line says what the uninstrumented run
+    # did with the test: it passed there, or it stood down and so did not run.
+    while IFS= read -r fail_name; do
+        [ -z "${fail_name}" ] && continue
+        scan_cut="${scan_cut}  ${crate} ${fail_name}"$'\n'
+        case $'\n'"${crate_fails}"$'\n' in
+            *$'\n'"${fail_name}"$'\n'*) continue ;;
+        esac
+        without="passed"
+        case $'\n'"${verdict_stood_down}" in
+            *$'\n'"${fail_name##*::}"$'\n'*) without="stood down" ;;
+        esac
+        failed_crates="${failed_crates}  ${crate}: ${fail_name} failed with shader validation on and ${without} without it"$'\n'
+    done <<< "${scan_fails}"
+
     rm -f "${log}" "${scan_log}"
     crate_passed=${counts% *}
     crate_failed=${counts#* }
@@ -960,13 +971,23 @@ for crate in "${crates[@]}"; do
         failed_crates="${failed_crates}  ${crate}: ran uninstrumented (no validation banner)"$'\n'
     fi
     if [ "${rc}" -ne 0 ]; then
-        failed_crates="${failed_crates}  ${crate}:"$'\n'
-        if [ -n "${crate_fails}" ]; then
+        if [ -z "${crate_fails}" ]; then
+            failed_crates="${failed_crates}  ${crate}: the uninstrumented run exited ${rc} and named no failing test"$'\n'
+        else
+            failed_crates="${failed_crates}  ${crate}:"$'\n'
             # Read loop, not an unquoted expansion: splitting on newlines that
-            # way also glob-expands each test name against the cwd.
+            # way also glob-expands each test name against the cwd. A test that
+            # failed in this run alone says so: the scan ran it green.
             while IFS= read -r fail_name; do
-                [ -n "${fail_name}" ] &&
-                    failed_crates="${failed_crates}    ${fail_name}"$'\n'
+                [ -z "${fail_name}" ] && continue
+                only=""
+                if [ "${SHADER_VALIDATION}" = "1" ]; then
+                    case $'\n'"${scan_fails}"$'\n' in
+                        *$'\n'"${fail_name}"$'\n'*) ;;
+                        *) only=" (passed with shader validation on)" ;;
+                    esac
+                fi
+                failed_crates="${failed_crates}    ${fail_name}${only}"$'\n'
             done <<< "${crate_fails}"
         fi
     fi
@@ -1193,6 +1214,15 @@ if [ "${SHADER_VALIDATION}" = "1" ]; then
         echo "shader validation: census matches the pin (${CENSUS_PIN#"${REPO_ROOT}"/})"
         printf '%s' "${census_accepted}"
     fi
+    # Whatever the census said above, it said it about a scan that stopped early.
+    if [ -n "${scan_cut}" ]; then
+        echo "NOTE: the census above is over incomplete scans. These tests failed in a scan" >&2
+        echo "and stopped before their last hit. A count under the expectation in their" >&2
+        echo "crates is not evidence of a stale pin, and a count that matches is not" >&2
+        echo "evidence of a match:" >&2
+        printf '%s' "${scan_cut}" >&2
+        echo >&2
+    fi
 fi
 
 if [ -n "${failed_crates}" ]; then
@@ -1201,7 +1231,7 @@ if [ -n "${failed_crates}" ]; then
     echo >&2
     echo "Reproduce one crate with:" >&2
     echo "  cargo test --no-fail-fast -p <crate> --tests -- --ignored --test-threads=1 <filter>" >&2
-    echo "A test that failed with shader validation on and passed without it is a" >&2
+    echo "A test that failed with shader validation on and not without it is a" >&2
     echo "failure too: a kernel defect that the instrument's timing exposes looks the" >&2
     echo "same as an artifact of the instrument, and no list accepts one." >&2
     echo "A failing TEST is not covered by the census pin — that pin accounts for" >&2

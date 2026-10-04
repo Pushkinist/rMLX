@@ -1404,7 +1404,7 @@ printf '%s\n' "${VERDICT_BETA_RED}" | crate_log "${CASE_ROOT}" rmlx-kv-quant.tgu
 run_case "${CASE_ROOT}"
 expect_status 1
 expect_report "ERROR: GPU tests failed in:"
-expect_report "kv::kv_gpu_beta"
+expect_report "    kv::kv_gpu_beta (passed with shader validation on)"
 expect_no_report "kv_gpu_beta failed with shader validation on"
 
 # Red in both runs is a failure, and is not listed as the instrument's.
@@ -1413,12 +1413,62 @@ classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
 printf 'Metal GPU Validation Enabled\n%s\n' "${VERDICT_BETA_RED}" | crate_log "${CASE_ROOT}" rmlx-kv-quant 101
 run_case "${CASE_ROOT}"
 expect_status 1
-expect_report "kv::kv_gpu_beta"
+expect_report "    kv::kv_gpu_beta"
 expect_no_report "kv_gpu_beta failed with shader validation on"
+expect_no_report "(passed with shader validation on)"
+# Its scan stopped at the failure all the same, and the note says so.
+expect_out "NOTE: the census above is over incomplete scans."
+expect_out "  rmlx-kv-quant kv::kv_gpu_beta"
+
+# A test red under the instrument that stood down in the uninstrumented run did
+# not pass there. The line says which.
+new_case a_test_red_under_the_instrument_that_stood_down_without_it_is_named_as_that || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+printf 'Metal GPU Validation Enabled\n%s\n' "${VERDICT_BETA_RED}" | crate_log "${CASE_ROOT}" rmlx-kv-quant 101
+crate_log "${CASE_ROOT}" rmlx-kv-quant.tgunset 0 <<'LOG'
+running 2 tests
+test kv::kv_gpu_alpha ... ok
+test kv::kv_gpu_beta ... SKIP kv_gpu_beta: no snapshot on this machine
+ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "  rmlx-kv-quant: kv::kv_gpu_beta failed with shader validation on and stood down without it"
+expect_no_report "kv_gpu_beta failed with shader validation on and passed"
+
+# The counts on the final line are the uninstrumented run's. Here the scan
+# over-matched and ran three tests, and the uninstrumented run ran two.
+new_case verdict_counts_are_the_uninstrumented_run || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+crate_log "${CASE_ROOT}" rmlx-kv-quant 0 <<'LOG'
+Metal GPU Validation Enabled
+running 3 tests
+test kv::kv_gpu_alpha ... ok
+test kv::kv_gpu_alpha_wide ... ok
+test kv::kv_gpu_beta ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+printf '%s\n' "${VERDICT_GREEN}" | crate_log "${CASE_ROOT}" rmlx-kv-quant.tgunset 0
+run_case "${CASE_ROOT}"
+expect_status 0
+expect_out "OK: 2 GPU tests passed"
+expect_no_out "OK: 3 GPU tests passed"
+
+# An uninstrumented run that dies and names no test is a failure with its
+# reason, as an instrumented one is.
+new_case verdict_run_exit_with_no_named_test_is_a_failure || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+printf 'Metal GPU Validation Enabled\n%s\n' "${VERDICT_GREEN}" | crate_log "${CASE_ROOT}" rmlx-kv-quant 0
+printf '%s\n' "${VERDICT_GREEN}" | crate_log "${CASE_ROOT}" rmlx-kv-quant.tgunset 134
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "  rmlx-kv-quant: the uninstrumented run exited 134 and named no failing test"
 
 # A test the instrument turned red gets no census allowance. Its entry stays an
-# expectation, so the hits it did not print are a deviation, and a hit of
-# another test on the same kernel cannot hide behind them.
+# expectation, so the hits it did not print are a deviation. The census is on
+# the sum per kernel, and the report says that the scan of that test is
+# incomplete: the short count is the test that stopped, not a stale pin.
 new_case a_test_red_under_the_instrument_alone_keeps_its_census_entry_exact || exit 1
 cut_hit="Invalid device load at offset 64, executing kernel function: \"${CENSUS_KERNEL}\""
 classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
@@ -1436,7 +1486,33 @@ run_case "${CASE_ROOT}"
 expect_status 1
 expect_report "count moved down: \"${CENSUS_KERNEL}\" device load in rmlx-kv-quant — expected 13, observed 6"
 expect_report "  rmlx-kv-quant: kv::kv_gpu_beta failed with shader validation on and passed without it"
+expect_report "NOTE: the census above is over incomplete scans."
+expect_report "  rmlx-kv-quant kv::kv_gpu_beta"
 expect_no_out "ceiling"
+
+# The sum per kernel can match while one test stopped early: the other test
+# prints the hits the stopped one did not. The census says `matches`, the note
+# says the match is not evidence, and the run is red.
+new_case a_census_match_over_a_stopped_scan_is_said_to_be_incomplete || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+{
+    census_pin_line "${CASE_ROOT}" 4 kv_gpu_alpha rmlx-kv-quant
+    census_pin_line "${CASE_ROOT}" 9 kv_gpu_beta rmlx-kv-quant
+} | pin "${CASE_ROOT}"
+{
+    echo 'Metal GPU Validation Enabled'
+    thirteen=""
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13; do thirteen="${thirteen}${cut_hit}"; done
+    echo "test kv::kv_gpu_alpha ... ok${thirteen}"
+    printf '%s\n' "${VERDICT_BETA_RED}" | grep -v 'kv_gpu_alpha'
+} | crate_log "${CASE_ROOT}" rmlx-kv-quant 101
+printf '%s\n' "${VERDICT_GREEN}" | crate_log "${CASE_ROOT}" rmlx-kv-quant.tgunset 0
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_out "census matches the pin"
+expect_out "NOTE: the census above is over incomplete scans."
+expect_out "  rmlx-kv-quant kv::kv_gpu_beta"
+expect_report "  rmlx-kv-quant: kv::kv_gpu_beta failed with shader validation on and passed without it"
 
 # A hit printed by the uninstrumented run is not a hit: only the instrument
 # reports one, and text of that shape from anything else is not a diagnostic.
