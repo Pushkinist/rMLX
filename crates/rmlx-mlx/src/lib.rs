@@ -1234,6 +1234,22 @@ pub fn mlx_reset_peak_memory() -> bool {
     status == 0
 }
 
+/// Free the buffers the Metal allocator keeps for reuse.
+///
+/// Wraps `mlx_clear_cache`. Returns `false` if the C call reports an error.
+/// For memory measurement only; no engine path calls it. MLX gives a new array
+/// a cached buffer of up to `min(2 * size, size + 2 pages)` bytes when it has
+/// one (`mlx/backend/common/buffer_cache.h`) and counts the length of that
+/// buffer, so what an earlier region freed moves the count of a later one.
+/// After this call the next allocations are new buffers.
+pub fn mlx_clear_cache() -> bool {
+    install_error_handler();
+    // SAFETY: no arguments, no out-params; `mlx_clear_cache` takes the
+    // allocator's own mutex.
+    let status = unsafe { sys::mlx_clear_cache() };
+    status == 0
+}
+
 /// A scoped Metal-allocator measurement: reset the peak, run a region, read it.
 ///
 /// MLX pools its device buffers, so an absolute byte count says as much about

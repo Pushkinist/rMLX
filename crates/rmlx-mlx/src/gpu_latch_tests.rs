@@ -138,6 +138,11 @@ fn gpu_stream_refused_under_cpu_child() {
     let bytes: Vec<u8> = [1.0f32].iter().flat_map(|v| v.to_le_bytes()).collect();
     let a = Array::from_bytes(&bytes, &[1], Dtype::F32).unwrap();
     assert_forbidden(add(&a, &a, Device::Gpu), "GPU stream");
+    assert_forbidden(synchronize_gpu(), "synchronize_gpu");
+    assert!(
+        !mlx_thread::has_gpu_stream(),
+        "a refused call must not create the GPU stream"
+    );
     println!("{CHILD_DONE}");
 }
 

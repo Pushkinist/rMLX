@@ -188,8 +188,8 @@ when it resolves a device with no claim; `qwen36_diag`'s `cpu` arm does too.
 The call sets one process-global `AtomicBool` irreversibly, and makes the CPU
 the MLX default device (process-wide). These calls check the latch first,
 returning `Err(Error::GpuForbidden { op })`, not the mlx-c call:
-`with_stream(Device::Gpu, ..)`, every `rmlx_mlx::metal` fn, and
-`CaptureScope::start`.
+`with_stream(Device::Gpu, ..)`, every `rmlx_mlx::metal` fn,
+`CaptureScope::start`, and `synchronize_gpu`.
 
 **Guarantee.** Under `--device cpu`, no rmlx op runs on a GPU stream, and no
 rmlx Metal API is called. A KV codec carrying MSL, and `--gpu-capture`, are
@@ -231,7 +231,8 @@ and keeps them for the life of the process.
 - `with_eval_lock` runs every evaluation on the MLX thread, under the
   evaluation lock. The caller waits. The mlx-c error message of the call moves
   back to the calling thread, so `check_status` reads it there. A panic
-  continues on the calling thread.
+  continues on the calling thread. `synchronize_gpu` (measurement only)
+  takes the lock too; a job on the MLX thread gets an error from it.
 - A hand-off allocates nothing and creates no channel: the job and its result
   stay on the stack of the waiting thread, and one static mailbox passes a
   pointer to the job (`crates/rmlx-mlx/tests/hand_off.rs`). Callers take

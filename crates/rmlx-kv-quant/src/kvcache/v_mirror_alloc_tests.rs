@@ -23,7 +23,7 @@
 //! no test here reads it there. Every reading follows
 //! `rmlx_mlx::synchronize_gpu`, which waits for the handlers. From that settled
 //! state the copy is gone from the live count, so the instrument for the copy
-//! is the peak over one dispatch ([`headroom_from_settled`]), and the settled
+//! is the peak over one dispatch ([`bracket_from_settled`]), and the settled
 //! live count is the instrument for what the cache keeps.
 //!
 //! # What each test covers, and what it does not
@@ -73,7 +73,10 @@ use crate::storage::{
 };
 use crate::test_utils::{lcg_data, skip_if_no_gpu_env};
 use rmlx_core::DispatchPolicy;
-use rmlx_mlx::{mlx_active_memory_bytes, synchronize_gpu, Array, Device, Dtype, PeakBracket};
+use rmlx_mlx::{
+    mlx_active_memory_bytes, mlx_clear_cache, synchronize_gpu, Array, Device, Dtype, PeakBracket,
+    PeakReading,
+};
 
 /// One direct-dispatch fixture shape.
 #[derive(Debug, Clone, Copy)]
@@ -332,16 +335,24 @@ fn every_flash_decode_dispatcher_strides_over_the_whole_v_mirror() {
 
 // ── The copy is real, is visible, and the dispatchers no longer pay it ────────
 
-/// Bytes `region` needs on top of the settled live count.
+/// Put the allocator in the one state a reading does not inherit from what ran
+/// before: no temporary of an earlier evaluation live, no cached buffer.
 ///
 /// An evaluation returns before Metal calls the completion handlers that free
 /// its temporaries, so the live count right after one has two states and which
-/// one a reading sees is a race. `synchronize_gpu` waits for the handlers, so
-/// the bracket opens from the one state that does not depend on that timing,
-/// and the peak inside it is then a property of `region` alone.
+/// one a reading sees is a race. `synchronize_gpu` waits for the handlers. MLX
+/// also gives a new array a cached buffer longer than the array when it has
+/// one, so `mlx_clear_cache` empties the cache.
 #[allow(clippy::expect_used, reason = "test helper: invariants documented")]
-fn headroom_from_settled(region: impl FnOnce()) -> u64 {
-    synchronize_gpu().expect("synchronize before the bracket opens");
+fn settle() {
+    synchronize_gpu().expect("synchronize before a reading");
+    assert!(mlx_clear_cache(), "the allocator's cache was not cleared");
+}
+
+/// What `region` allocated, in a bracket that opens from the settled state.
+/// The peak inside it is then a property of `region` alone.
+fn bracket_from_settled(region: impl FnOnce()) -> PeakReading {
+    settle();
     let bracket = PeakBracket::open();
     region();
     let reading = bracket.close();
@@ -349,7 +360,7 @@ fn headroom_from_settled(region: impl FnOnce()) -> u64 {
         reading.measurable(),
         "the peak mark was not reset, so nothing below is scoped to the region ({reading:?})"
     );
-    reading.headroom_bytes()
+    reading
 }
 
 /// Measure the bytes one iso dispatch needs when V arrives whole against when
@@ -376,9 +387,10 @@ fn the_slice_the_dispatchers_no_longer_take_costs_a_measurable_prefix_copy() {
     // The first dispatch of a kernel compiles it; keep that out of the brackets.
     let _ = iso3_dispatch(shape, &iso, &mirror);
     let headroom = |v: &Array| {
-        headroom_from_settled(|| {
+        bracket_from_settled(|| {
             let _ = iso3_dispatch(shape, &iso, v);
         })
+        .headroom_bytes()
     };
 
     let whole_before = headroom(&mirror);
@@ -415,14 +427,23 @@ const PREFILL: i32 = 512;
 const SETTLE_STEPS: u64 = 256;
 const MEASURED_STEPS: u64 = 1024;
 
-/// MLX's Metal allocator rounds a buffer larger than one VM page up to whole
-/// VM pages (`mlx/backend/metal/allocator.cpp`), and the page is 16 KiB on
-/// Apple Silicon. So the allocator's count for a buffer is less than one page
-/// above the buffer's own size.
+/// The VM page of Apple Silicon, the unit of MLX's Metal allocator.
 const ALLOCATOR_PAGE: u64 = 16 * 1024;
 
 /// The buffers a packed K ring holds: codes, scales, norms.
 const RING_PLANES: u64 = 3;
+
+/// How far the allocator's count of the ring can be above the ring's own bytes.
+///
+/// The allocator rounds a buffer larger than one page up to whole pages
+/// (`mlx/backend/metal/allocator.cpp`, "Align up memory"), which is less than
+/// one page more. It then gives the array a cached buffer of less than
+/// `min(2 * size, size + 2 pages)` when it has one
+/// (`mlx/backend/common/buffer_cache.h`, `reuse_from_cache`) and counts the
+/// length of that buffer. So a plane counts less than three pages above its
+/// size. A step can free a buffer and allocate a plane after it, so the cache
+/// is not always empty when a plane is allocated.
+const RING_COUNT_ALLOWANCE: u64 = RING_PLANES * 3 * ALLOCATOR_PAGE;
 
 /// Bytes the packed K store of `quant` holds for `positions` positions of
 /// [`MULTI_HEAD`], from the codec's own byte model: its per-layer estimate
@@ -454,27 +475,32 @@ fn paged(positions: i32) -> i32 {
 /// Drive `update_and_sdpa` on `cache` and hold what each decode step needed
 /// and what stayed allocated.
 ///
-/// Every reading is taken from a settled state (see [`headroom_from_settled`]),
-/// so none depends on when Metal calls a completion handler.
+/// Every reading is taken from a settled state (see [`settle`]), so none
+/// depends on when Metal calls a completion handler or on what an earlier test
+/// left in the allocator's cache.
+///
+/// **The live count, at every reading.** Since the run opened, the settled
+/// live count grew by what the store grew by, to within
+/// [`RING_COUNT_ALLOWANCE`]. Every buffer sized at `max_seq` is allocated
+/// before the run opens and cancels out. This holds at the open of every step,
+/// so a settle that left a temporary live fails here; it cannot pass as a
+/// smaller headroom of the next step.
 ///
 /// **Each step.** The step's headroom, less the new ring of a step that regrows
-/// the store, is what the step allocated and freed again. It must be less than
-/// one packed K prefix of the attended length. A re-materialised V prefix is at
-/// least `kv_h * kv_seq * head_dim * 2` bytes of exactly that (the mirror of
-/// this fixture is f32, twice that), and the packed K prefix is smaller than
-/// the bf16 V prefix, so the bound fails a V prefix copy and a K prefix copy
-/// both. Only a peak sees either: the copy is freed
+/// the store, is what the step allocated and freed again. With the allowance
+/// added, it must be less than one packed K prefix of the attended length. A
+/// re-materialised V prefix is at least `kv_h * kv_seq * head_dim * 2` bytes of
+/// exactly that (the mirror of this fixture is f32, twice that), and the packed
+/// K prefix is smaller than the bf16 V prefix, so the bound fails a V prefix
+/// copy and a K prefix copy both. Only a peak sees either: the copy is freed
 /// when the step is done.
 ///
-/// **The whole run.** After every step the store holds its layer-static tables
-/// plus whole pages of positions, by the codec's own byte model. Over the run
-/// the settled live count grew by what the store grew by, to within the
-/// allocator's rounding of the ring's planes. Every buffer sized at `max_seq` is allocated before the run
-/// opens and cancels out.
+/// **The store.** After every step it holds its layer-static tables plus whole
+/// pages of positions, by the codec's own byte model.
 ///
-/// `dispatch_count` is the codec's own kernel counter: a run that did not
-/// advance it once per step never reached the kernel, and its readings would
-/// describe a CPU-dequant fallback instead.
+/// **The kernel.** `dispatch_count` is the codec's own kernel counter. It must
+/// advance by one for each step. A step that does not reach the kernel is a
+/// CPU-dequant fallback, and its readings describe another path.
 #[allow(clippy::expect_used, reason = "test helper: invariants documented")]
 fn assert_decode_allocates_no_prefix_copy(
     quant: KvQuant,
@@ -506,15 +532,17 @@ fn assert_decode_allocates_no_prefix_copy(
             &lcg_data((shape.n_q_heads() * HEAD_DIM) as usize, 30 + seed),
             &[B, shape.n_q_heads(), 1, HEAD_DIM],
         );
+        let dispatches = dispatch_count();
         let out = cache
             .update_and_sdpa(&q1, &k1, &v1, scale, "", None, device)
             .expect("decode update_and_sdpa");
         out.eval().expect("decode out eval");
-    };
-    let settled_live = || {
-        synchronize_gpu().expect("synchronize before a live reading");
-        mlx_active_memory_bytes()
-            .expect("no Metal allocator reading — the bounds below would be vacuous")
+        assert_eq!(
+            dispatch_count() - dispatches,
+            1,
+            "{quant}: the decode step at kv_seq={} must dispatch the flash-decode kernel once",
+            cache.offset()
+        );
     };
     let store_holds_whole_pages = |cache: &KvCache| {
         let (held, positions) = (cache.storage.resident_bytes(), cache.offset());
@@ -532,16 +560,38 @@ fn assert_decode_allocates_no_prefix_copy(
     for s in 0..SETTLE_STEPS {
         step(&mut cache, s);
     }
-    let live_before = settled_live();
+    settle();
+    let live_before = mlx_active_memory_bytes()
+        .expect("no Metal allocator reading — the bounds below would be vacuous");
     let store_before = store_holds_whole_pages(&cache);
     let offset_before = cache.offset();
-    let dispatches_before = dispatch_count();
+
+    // How far a settled live count is from the opening count plus what the
+    // store grew by since.
+    let mut widest_gap = 0;
+    let mut live_is_the_store = |live: u64, store: u64, kv_seq: i32| {
+        let gap = (live + store_before).abs_diff(live_before + store);
+        assert!(
+            gap < RING_COUNT_ALLOWANCE,
+            "{quant}: at kv_seq={kv_seq} the settled live count is {live} B. It opened at \
+             {live_before} B and the store grew by {} B since, so {gap} B are not the store's, \
+             and the allowance is {RING_COUNT_ALLOWANCE} B: a buffer that the store does not \
+             account for is live",
+            store - store_before
+        );
+        widest_gap = widest_gap.max(gap);
+    };
 
     let mut most_per_position = 0;
     for s in SETTLE_STEPS..SETTLE_STEPS + MEASURED_STEPS {
         let store_at_open = cache.storage.resident_bytes();
-        let headroom = headroom_from_settled(|| step(&mut cache, s));
-        let kv_seq = cache.offset();
+        let reading = bracket_from_settled(|| step(&mut cache, s));
+        live_is_the_store(
+            reading.live_at_open_bytes,
+            store_at_open,
+            cache.offset() - 1,
+        );
+        let (headroom, kv_seq) = (reading.headroom_bytes(), cache.offset());
         // A step that regrows the ring allocates the whole new ring while the
         // old one is still live.
         let store_now = store_holds_whole_pages(&cache);
@@ -553,7 +603,7 @@ fn assert_decode_allocates_no_prefix_copy(
         let transient = headroom.saturating_sub(new_ring);
         let k_prefix = packed_k_bytes(quant, kv_seq);
         assert!(
-            transient < k_prefix,
+            transient + RING_COUNT_ALLOWANCE < k_prefix,
             "{quant}: the decode step at kv_seq={kv_seq} allocated and freed {transient} B. \
              One packed K prefix is {k_prefix} B and a bf16 V prefix, the narrowest a V \
              mirror gets, is {} B: the step materialised a prefix (headroom {headroom} B)",
@@ -561,12 +611,14 @@ fn assert_decode_allocates_no_prefix_copy(
         );
         most_per_position = most_per_position.max(transient / kv_seq as u64);
     }
-    let live_after = settled_live();
+    settle();
+    let live_after = mlx_active_memory_bytes().expect("no Metal allocator reading");
     let store_after = store_holds_whole_pages(&cache);
-    let grown = live_after.saturating_sub(live_before);
+    live_is_the_store(live_after, store_after, cache.offset());
     eprintln!(
-        "{quant}: readings grown={grown} store_grown={} most_transient_per_position=\
-         {most_per_position}",
+        "{quant}: readings grown={} store_grown={} widest_gap={widest_gap} \
+         most_transient_per_position={most_per_position}",
+        live_after.saturating_sub(live_before),
         store_after - store_before
     );
 
@@ -574,27 +626,6 @@ fn assert_decode_allocates_no_prefix_copy(
         cache.offset() - offset_before,
         MEASURED_STEPS as i32,
         "{quant}: the cache did not advance one position per decode step"
-    );
-    assert!(
-        dispatch_count() - dispatches_before >= MEASURED_STEPS,
-        "{quant}: the measured steps did not each reach the flash-decode kernel — \
-         the readings describe a CPU-dequant fallback, not the dispatch this gate is about"
-    );
-    assert!(
-        most_per_position > 0,
-        "{quant}: no decode step allocated anything; the step bound passed by measuring nothing"
-    );
-    assert!(
-        store_after > store_before,
-        "{quant}: the store did not grow over {MEASURED_STEPS} steps; the bound below would \
-         pass by measuring nothing"
-    );
-    assert!(
-        grown.abs_diff(store_after - store_before) < RING_PLANES * ALLOCATOR_PAGE,
-        "{quant}: the settled live count grew by {grown} B over {MEASURED_STEPS} steps and the \
-         store by {} B. They must agree to within the allocator's rounding of the ring's \
-         {RING_PLANES} planes: the decode loop keeps a buffer that the store does not account for",
-        store_after - store_before
     );
 }
 

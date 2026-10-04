@@ -403,18 +403,32 @@ the MLX thread both move that timing.
 `rmlx_mlx::synchronize_gpu()` removes the race. It commits the open command
 buffer of the MLX thread's GPU stream and waits until that buffer is complete
 (`mlx_synchronize`, Metal `waitUntilCompleted`). That wait returns after the
-completion handlers of the buffer ran, and the buffer is the last of its
-queue, so after the call the count holds no temporary. The settled count
-repeats exactly from run to run, with and without shader validation.
+completion handlers of the buffer ran. MLX waits on the last buffer of the
+queue only; that the handlers of the earlier buffers ran too is held by
+tests, not by a contract: `after_synchronize_gpu_the_live_count_holds_no_temporary`
+(`crates/rmlx-mlx/src/synchronize_tests.rs`) reads the count after a 4 MiB
+temporary, and the V-mirror tests read it at the open of every decode step.
+The call is for measurement only. It returns an error after `forbid_gpu`, and
+from a job on the MLX thread, which holds the evaluation lock.
 
-- **Call `synchronize_gpu()` before each reading a test judges on**: before
-  `PeakBracket::open()`, and before a bare `mlx_active_memory_bytes()`.
+The count of one buffer is not its size. The allocator rounds a buffer larger
+than one VM page up to whole 16 KiB pages (`mlx/backend/metal/allocator.cpp`).
+It then gives the array a cached buffer of less than
+`min(2 * size, size + 2 pages)` when it has one
+(`mlx/backend/common/buffer_cache.h`) and counts the length of that buffer. So
+a buffer counts less than three pages above its size, and what an earlier
+region freed moves the count of a later one. `rmlx_mlx::mlx_clear_cache()`
+empties the cache.
+
+- **Call `synchronize_gpu()` and `mlx_clear_cache()` before each reading a
+  test judges on**: before `PeakBracket::open()`, and before a bare
+  `mlx_active_memory_bytes()`.
 - **A temporary is not in the settled live count.** A copy that a step makes
   and frees shows only in the peak over that step: open a bracket from the
-  settled state, run one step, read `headroom_bytes()`.
-- **The settled live count shows what stays allocated.** MLX rounds a buffer
-  larger than one VM page up to whole 16 KiB pages, so compare it with a byte
-  model to within one page for each buffer.
+  settled state, run one step, read `headroom_bytes()`. Assert the count at
+  the open too, or a settle that left the copy live reads as a small headroom.
+- **The settled live count shows what stays allocated.** Compare it with a
+  byte model to within three pages for each buffer.
 
 `crates/rmlx-kv-quant/src/kvcache/v_mirror_alloc_tests.rs` uses both readings.
 The engine does not call `synchronize_gpu()`: `metal_gen_alloc_mb` reads its

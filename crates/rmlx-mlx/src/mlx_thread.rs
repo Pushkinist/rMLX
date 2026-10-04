@@ -282,16 +282,31 @@ fn set_thread_defaults() -> Result<()> {
 /// Wait until the GPU has run every command buffer of the MLX thread's GPU
 /// stream and Metal has called their completion handlers.
 ///
-/// An evaluation returns when its outputs are written. MLX frees the
-/// temporaries of a command buffer in the completion handler of that buffer,
-/// which Metal can call after the evaluation returned. Until then
-/// [`crate::mlx_active_memory_bytes`] still counts them. After this call it
-/// does not: a memory measurement calls this before each reading.
+/// For memory measurement only; no engine path calls it. An evaluation returns
+/// when its outputs are written. MLX frees the temporaries of a command buffer
+/// in the completion handler of that buffer, which Metal can call after the
+/// evaluation returned. Until then [`crate::mlx_active_memory_bytes`] still
+/// counts them. After this call it does not: a memory measurement calls this
+/// before each reading.
+///
+/// Do not call it from a job that runs on the MLX thread (a compiled closure
+/// body): that job holds the evaluation lock, which this call takes. Such a
+/// call returns an error and does not wait.
 ///
 /// # Errors
-/// An error when the MLX thread cannot start, when MLX gives no GPU stream, or
+/// [`Error::GpuForbidden`] after [`crate::forbid_gpu`]: no GPU stream is
+/// created and no Metal API is called. An error for a call from the MLX
+/// thread, when the MLX thread cannot start, when MLX gives no GPU stream, or
 /// when a command buffer of the stream failed.
 pub fn synchronize_gpu() -> Result<()> {
+    crate::check_gpu_allowed("synchronize_gpu")?;
+    if ON_MLX_THREAD.with(Cell::get) {
+        return Err(Error::Mlx(
+            "synchronize_gpu: called from a job on the MLX thread, which holds the evaluation \
+             lock that this call takes"
+                .to_owned(),
+        ));
+    }
     crate::install_error_handler();
     let stream = Stream(mlx_stream(Device::Gpu)?);
     let status = crate::with_eval_lock(move || {
@@ -304,6 +319,12 @@ pub fn synchronize_gpu() -> Result<()> {
     // SAFETY: `with_eval_lock` moved the error message of the call to this
     // thread's error slot, and no mlx-c call ran since.
     unsafe { check_status(status, "mlx_synchronize") }
+}
+
+/// Whether the MLX thread has created its GPU stream.
+#[cfg(test)]
+pub(crate) fn has_gpu_stream() -> bool {
+    GPU_STREAM.get().is_some()
 }
 
 fn metal_available() -> bool {
@@ -344,3 +365,7 @@ fn no_stream(device: Device) -> Error {
 #[cfg(test)]
 #[path = "mlx_thread_tests.rs"]
 mod mlx_thread_tests;
+
+#[cfg(test)]
+#[path = "synchronize_tests.rs"]
+mod synchronize_tests;
