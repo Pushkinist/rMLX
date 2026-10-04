@@ -66,9 +66,9 @@
 //! stream and over each tail cut, at every period up to [`MAX_CYCLE_PERIOD`]
 //! that leaves [`MIN_CYCLE_SAMPLES`] comparisons. A reference arm above
 //! [`MAX_CYCLE_FRACTION`] is an input the gate cannot judge. A speculative arm
-//! above it is refused when it also reads [`MIN_CYCLE_EXCESS`] standard errors
-//! above the reference arm: an answer about one subject repeats that subject in
-//! both arms, and the reference arm is the control for how much.
+//! is refused above the same ceiling, and its reading does not count a repeat
+//! the reference arm wrote itself, token for token: an answer about one subject
+//! repeats that subject in both arms. See [`repeats_beyond`].
 //!
 //! Windowing and the period sweep are both load-bearing; three real
 //! degeneracies score under any ceiling without them:
@@ -289,18 +289,21 @@ const MAX_DIVERGENCE_CONFIDENCE: f64 = 0.12;
 const WORST_CORRECT_TAIL_AGREEMENT: f64 = 0.1094;
 
 /// How much of an arm — or of any tail cut of it — may repeat at a short period
-/// before the control reads it as a possible loop.
+/// before it counts as collapsed.
 ///
-/// A reference arm above it is an input the gate cannot judge. A speculative arm
-/// above it is refused only when it also reads [`MIN_CYCLE_EXCESS`] above the
-/// reference arm.
+/// The reference arm is read as it is, and above the ceiling it is an input the
+/// gate cannot judge. The speculative arm is read without the repeats the
+/// reference arm wrote itself ([`repeats_beyond`]), and above the ceiling it is
+/// refused. There is no second threshold.
 ///
-/// **The ceiling alone does not separate healthy prose from a ragged loop.**
-/// 1000 synthetic healthy streams at each of six lengths peak at 0.1351 and trip
-/// it none (`the_false_positive_rate_on_healthy_output` prints that). Real prose
-/// reads higher, because an answer about one subject repeats that subject:
-/// [`MEASURED_SPEC_ARM`] is a healthy arm of a correct engine and reads 0.2308,
-/// where a period-8 loop at 58% raggedness can read 0.20.
+/// **The ceiling does not separate healthy prose from a ragged loop on a raw
+/// reading.** 1000 synthetic healthy streams at each of six lengths peak at
+/// 0.1351 and trip it none (`the_false_positive_rate_on_healthy_output` prints
+/// that). Real prose reads higher, because an answer about one subject repeats
+/// that subject: [`MEASURED_SPEC_ARM`] is a healthy arm of a correct engine and
+/// reads 9 of 39, where a period-8 loop at 58% raggedness can read 0.20. Five of
+/// those nine are one phrase that the reference arm wrote too, and the reading
+/// without them is 4 of 39.
 ///
 /// The other side is set by the pair regime, and it is **swept rather than
 /// sampled**: `two_arms_in_the_same_ragged_loop_are_refused_until_they_are_no_longer_one_loop`
@@ -317,34 +320,6 @@ const WORST_CORRECT_TAIL_AGREEMENT: f64 = 0.1094;
 /// exists and why the value here is only meaningful for arms these prompts
 /// produced.
 const MAX_CYCLE_FRACTION: f64 = 0.20;
-
-/// How far a speculative arm above [`MAX_CYCLE_FRACTION`] must read above the
-/// reference arm before it counts as collapsed: [`cycle_excess`], in standard
-/// errors of the difference between the two readings.
-///
-/// The reference arm is the control for the prompt. The narrowest window gives
-/// a reading from as few as [`MIN_CYCLE_SAMPLES`] comparisons, where four
-/// coincidences move it across the ceiling. The standard error carries the
-/// sample count, so one rule reads a 39-comparison window and a 255-comparison
-/// stream.
-///
-/// **Both sides are measured.** The upper side is swept:
-/// `a_speculative_arm_in_a_ragged_loop_is_refused_against_a_healthy_reference`
-/// walks a looping arm against a healthy reference arm from 0% to 100%
-/// raggedness. The lowest excess of an arm above the ceiling there is 2.2913.
-/// The value is under it, so this bound admits no arm of that sweep. The lower
-/// side is one measured pair of a correct engine, which reads 1.1802
-/// (`a_healthy_arm_that_repeats_no_more_than_its_reference_is_not_a_collapse`).
-/// `Rng::prose` gives no second reading on that side: no synthetic healthy
-/// stream reaches the ceiling.
-///
-/// **What this bound cannot see.** It follows the reference arm. A speculative
-/// arm in a ragged loop is admitted when the reference arm reads near the
-/// ceiling too. Two arms in one loop are such a pair, and only the reference
-/// arm's own reading refuses them:
-/// `two_arms_in_the_same_ragged_loop_are_refused_until_they_are_no_longer_one_loop`
-/// pins that edge.
-const MIN_CYCLE_EXCESS: f64 = 2.0;
 
 /// Longest cycle the control looks for.
 ///
@@ -372,8 +347,8 @@ const MAX_CYCLE_PERIOD: usize = 64;
 /// synthetic stream came from a denominator of one or two, at any ceiling, and
 /// this floor removes them; `the_false_positive_rate_on_healthy_output` prints
 /// the measured rate per length rather than recording a number nothing can
-/// regenerate. The floor does not make a reading from 39 comparisons exact.
-/// [`MIN_CYCLE_EXCESS`] reads the sample count for that.
+/// regenerate. The floor does not make a reading from 39 comparisons exact:
+/// four coincidences move it across the ceiling.
 ///
 /// A bound on the *period relative to the window* was tried alongside it and
 /// removed: it changed no false-positive rate and it blinded the sweep to real
@@ -454,14 +429,50 @@ impl Cycle {
     }
 }
 
-/// The strongest short cycle in `tokens`.
+/// How many positions of `tokens` hold the token `period` positions before
+/// them, without the repeats `reference` wrote itself.
+///
+/// The positions that repeat are read as runs. A run of consecutive repeats,
+/// together with the `period` tokens before it, is one stretch of the arm: a
+/// phrase and the place where the arm said it before. When `reference` holds
+/// that whole stretch, token for token, the run is not counted. The verifier
+/// wrote that repeat on its own.
+///
+/// **A run is excused whole or not at all.** A loop is one long run, and no
+/// healthy reference holds it, so a loop loses nothing. A run that goes one
+/// token past what the reference wrote is counted in full.
+///
+/// An empty `reference` excuses nothing, and that is the raw reading.
+fn repeats_beyond(tokens: &[u32], period: usize, reference: &[u32]) -> usize {
+    let repeats = |i: usize| tokens[i] == tokens[i - period];
+    let mut count = 0;
+    let mut at = period;
+    while at < tokens.len() {
+        if !repeats(at) {
+            at += 1;
+            continue;
+        }
+        let mut end = at;
+        while end + 1 < tokens.len() && repeats(end + 1) {
+            end += 1;
+        }
+        let stretch = &tokens[at - period..=end];
+        if !reference.windows(stretch.len()).any(|w| w == stretch) {
+            count += end - at + 1;
+        }
+        at = end + 1;
+    }
+    count
+}
+
+/// The strongest short cycle in `tokens`, read with [`repeats_beyond`].
 ///
 /// A stream stuck in a loop matches itself at the loop's period, and two arms in
 /// the same loop agree perfectly — so the equivalence oracle says nothing
 /// exactly when this is high. It covers every period up to [`MAX_CYCLE_PERIOD`],
 /// because a collapse that starts at token 20 and a two-token `A B A B` cycle are
 /// both degeneracies a leading-run measure scores at zero.
-fn strongest_cycle(tokens: &[u32]) -> Cycle {
+fn strongest_cycle_beyond(tokens: &[u32], reference: &[u32]) -> Cycle {
     let mut worst = Cycle {
         start: 0,
         period: 1,
@@ -472,11 +483,7 @@ fn strongest_cycle(tokens: &[u32]) -> Cycle {
         let cycle = Cycle {
             start: 0,
             period,
-            matches: tokens[period..]
-                .iter()
-                .zip(tokens)
-                .filter(|(a, b)| a == b)
-                .count(),
+            matches: repeats_beyond(tokens, period, reference),
             samples: tokens.len() - period,
         };
         if cycle.fraction() > worst.fraction() {
@@ -486,17 +493,18 @@ fn strongest_cycle(tokens: &[u32]) -> Cycle {
     worst
 }
 
-/// The strongest short cycle in `tokens` or in any tail cut of it.
+/// The strongest short cycle in `tokens` or in any tail cut of it, read with
+/// [`repeats_beyond`].
 ///
 /// Over the whole stream a collapse confined to the last two fifths reads
 /// 0.3992 — under the ceiling, because the healthy majority dilutes it. The
 /// same cuts `weakest_tail` uses give it a window it fills.
-fn strongest_windowed_cycle(tokens: &[u32]) -> Cycle {
+fn strongest_windowed_cycle_beyond(tokens: &[u32], reference: &[u32]) -> Cycle {
     let starts =
         std::iter::once(0).chain((1..TAIL_WINDOWS).map(|n| tokens.len() * n / TAIL_WINDOWS));
-    let mut worst = strongest_cycle(&[]);
+    let mut worst = strongest_cycle_beyond(&[], reference);
     for start in starts {
-        let cycle = strongest_cycle(&tokens[start..]);
+        let cycle = strongest_cycle_beyond(&tokens[start..], reference);
         if cycle.fraction() > worst.fraction() {
             worst = Cycle { start, ..cycle };
         }
@@ -504,21 +512,14 @@ fn strongest_windowed_cycle(tokens: &[u32]) -> Cycle {
     worst
 }
 
-/// How far the speculative arm's reading sits above the reference arm's, in
-/// standard errors of the difference between two proportions.
-///
-/// Infinite when the reference arm gave no reading: there is no control to
-/// read the speculative arm against. [`judge`] calls it for a speculative arm
-/// above [`MAX_CYCLE_FRACTION`] and a reference arm at or under it, so the
-/// pooled proportion is strictly between 0 and 1.
-fn cycle_excess(spec: Cycle, plain: Cycle) -> f64 {
-    if plain.samples == 0 {
-        return f64::INFINITY;
-    }
-    let (n, m) = (spec.samples as f64, plain.samples as f64);
-    let pooled = (spec.matches + plain.matches) as f64 / (n + m);
-    let standard_error = (pooled * (1.0 - pooled) * (1.0 / n + 1.0 / m)).sqrt();
-    (spec.fraction() - plain.fraction()) / standard_error
+/// The raw reading of one window: every repeat counts.
+fn strongest_cycle(tokens: &[u32]) -> Cycle {
+    strongest_cycle_beyond(tokens, &[])
+}
+
+/// The raw reading of an arm: every repeat counts.
+fn strongest_windowed_cycle(tokens: &[u32]) -> Cycle {
+    strongest_windowed_cycle_beyond(tokens, &[])
 }
 
 /// The weakest agreement over the tail windows, and where it was found.
@@ -621,21 +622,18 @@ fn judge(
             plain_cycle.start
         ));
     }
-    let spec_cycle = strongest_windowed_cycle(spec);
+    let spec_cycle = strongest_windowed_cycle_beyond(spec, plain);
     if spec_cycle.fraction() > MAX_CYCLE_FRACTION {
-        let excess = cycle_excess(spec_cycle, plain_cycle);
-        if excess > MIN_CYCLE_EXCESS {
-            return Verdict::Refused(format!(
-                "the speculative arm repeats at period {} across {:.4} of its tokens from {} \
-                 on (ceiling {MAX_CYCLE_FRACTION}) while the reference arm reads {:.4}, \
-                 {excess:.2} standard errors under it (floor {MIN_CYCLE_EXCESS}) — it has \
-                 collapsed into a repetition loop the verifier does not produce on its own",
-                spec_cycle.period,
-                spec_cycle.fraction(),
-                spec_cycle.start,
-                plain_cycle.fraction()
-            ));
-        }
+        return Verdict::Refused(format!(
+            "the speculative arm repeats at period {} across {:.4} of its tokens from {} on \
+             (ceiling {MAX_CYCLE_FRACTION}), not counting a repeat the reference arm wrote \
+             itself, while the reference arm reads {:.4} — it has collapsed into a \
+             repetition loop the verifier does not produce on its own",
+            spec_cycle.period,
+            spec_cycle.fraction(),
+            spec_cycle.start,
+            plain_cycle.fraction()
+        ));
     }
 
     if longer < MIN_ANSWER_TOKENS {
@@ -1124,33 +1122,45 @@ const MEASURED_PLAIN_ARM: [u32; 256] = [
 /// Real prose on a prompt about one subject repeats that subject, in both arms.
 ///
 /// These are two measured arms of a correct engine. The speculative arm reads
-/// above the ceiling in its last window, and the reference arm reads the same
-/// phrase at the same period, lower by four coincidences in 39 comparisons. The
-/// reference arm is the control: an arm that repeats no more than the verifier
-/// does alone has not collapsed.
+/// 9 of 39 at period 25 in its last window, above the ceiling. Five of the nine
+/// are one phrase, and the reference arm holds that phrase and the 25 tokens
+/// before it, token for token. Without them the arm reads 4 of 39.
+///
+/// The margins are empty on purpose: the repetition control is the only oracle
+/// in play, and the length guards after it. The first divergence of this pair
+/// is at token 31; nothing here reads the margin there.
 #[test]
 fn a_healthy_arm_that_repeats_no_more_than_its_reference_is_not_a_collapse() {
-    let spec = strongest_windowed_cycle(&MEASURED_SPEC_ARM);
-    let plain = strongest_windowed_cycle(&MEASURED_PLAIN_ARM);
     let read = |start, matches| Cycle {
         start,
         period: 25,
         matches,
         samples: 39,
     };
-    assert_eq!(spec, read(192, 9), "where the measured arm repeats");
-    assert_eq!(plain, read(192, 5), "where its reference arm repeats");
-    assert!(
-        spec.fraction() > MAX_CYCLE_FRACTION && plain.fraction() <= MAX_CYCLE_FRACTION,
-        "the fixture must hold a speculative arm above the ceiling and a reference \
-         arm the control can read: {:.4} and {:.4}",
-        spec.fraction(),
-        plain.fraction()
+    assert_eq!(
+        strongest_windowed_cycle(&MEASURED_SPEC_ARM),
+        read(192, 9),
+        "where the measured arm repeats"
     );
-    let excess = cycle_excess(spec, plain);
+    assert_eq!(
+        strongest_windowed_cycle(&MEASURED_PLAIN_ARM),
+        read(192, 5),
+        "where its reference arm repeats"
+    );
     assert!(
-        (excess - 1.1802).abs() < 1e-4,
-        "the measured pair reads {excess:.4} standard errors, not the recorded 1.1802"
+        read(192, 9).fraction() > MAX_CYCLE_FRACTION
+            && read(192, 5).fraction() <= MAX_CYCLE_FRACTION,
+        "the fixture must hold a raw reading above the ceiling and a reference arm \
+         the control can read"
+    );
+    assert_eq!(
+        strongest_windowed_cycle_beyond(&MEASURED_SPEC_ARM, &MEASURED_PLAIN_ARM),
+        read(192, 4),
+        "what the measured arm repeats beyond its reference arm"
+    );
+    assert_eq!(
+        common_prefix_len(&MEASURED_SPEC_ARM, &MEASURED_PLAIN_ARM),
+        31
     );
     assert_eq!(
         judge(&MEASURED_SPEC_ARM, &MEASURED_PLAIN_ARM, &[], None),
@@ -1184,7 +1194,7 @@ fn the_measured_arms_exchanged_are_an_input_the_gate_cannot_judge() {
     );
 }
 
-/// A reference arm too short to give a reading is no control. A collapsed
+/// A reference arm too short to give a reading excuses nothing. A collapsed
 /// speculative arm is refused against it.
 #[test]
 fn a_collapsed_arm_is_refused_when_the_reference_gives_no_reading() {
@@ -1209,31 +1219,21 @@ fn a_collapsed_arm_is_refused_when_the_reference_gives_no_reading() {
 /// edges are pinned, so the sweep fails when either moves.
 ///
 /// The reference arm here is `Rng::prose`, which reads lower than real prose
-/// does. Against a reference that repeats its subject, the speculative arm
-/// must repeat more before the control can tell the two apart.
+/// does. `a_reference_arm_near_the_ceiling_does_not_move_the_ragged_loop_edge`
+/// is the same sweep against two reference arms that read near the ceiling.
 #[test]
 fn a_speculative_arm_in_a_ragged_loop_is_refused_against_a_healthy_reference() {
     /// Raggedness, in per cent, of the first pair the control admits.
     const FIRST_ADMITTED: u64 = 58;
-    /// The lowest [`cycle_excess`] of a speculative arm above the ceiling.
-    /// [`MIN_CYCLE_EXCESS`] must stay under it, or the bound admits a pair of
-    /// this sweep that the ceiling refuses.
-    const LOWEST_EXCESS_ABOVE_THE_CEILING: f64 = 2.2913;
 
     let head = Rng(0xFEED).prose(N_TOKENS / 2);
     let mut first_admitted = None;
-    let mut lowest_excess = f64::INFINITY;
     for noise in (0..=100).step_by(2) {
         for seed in [0x33u64, 0x91, 0xB3, 0xD5] {
             for reference_seed in [0x44u64, 0xA7, 0xC1, 0xE9] {
                 let spec = ragged_loop_arm(seed, noise);
                 let mut plain = head.clone();
                 plain.extend(Rng(reference_seed).prose(N_TOKENS / 2));
-                let spec_cycle = strongest_windowed_cycle(&spec);
-                if spec_cycle.fraction() > MAX_CYCLE_FRACTION {
-                    lowest_excess = lowest_excess
-                        .min(cycle_excess(spec_cycle, strongest_windowed_cycle(&plain)));
-                }
                 match judge(&spec, &plain, &[], None) {
                     Verdict::Agreed => first_admitted = first_admitted.or(Some(noise)),
                     Verdict::Refused(why) => {
@@ -1252,12 +1252,42 @@ fn a_speculative_arm_in_a_ragged_loop_is_refused_against_a_healthy_reference() {
         "the control admits its first pair at {first_admitted:?}% raggedness, not the \
          recorded {FIRST_ADMITTED}%"
     );
-    assert!(
-        (lowest_excess - LOWEST_EXCESS_ABOVE_THE_CEILING).abs() < 1e-4,
-        "the lowest excess of an arm above the ceiling is {lowest_excess:.4}, not the \
-         recorded {LOWEST_EXCESS_ABOVE_THE_CEILING}"
+}
+
+/// What the reference arm must hold before a repeat is excused: the run of
+/// repeats and the `period` tokens before it, from the first token to the last.
+#[test]
+fn a_repeat_is_excused_only_when_the_reference_holds_the_whole_stretch() {
+    // Period 4. Positions 4 and 5 repeat positions 0 and 1, so the stretch is
+    // the first six tokens.
+    let arm = [10, 11, 12, 13, 10, 11, 20, 21];
+    for (reference, counted, what) in [
+        (&[][..], 2, "an empty reference excuses nothing"),
+        (&[7, 10, 11, 12, 13, 10, 11, 7][..], 0, "the whole stretch"),
+        (&[10, 11, 12, 13, 10, 7][..], 2, "all but its last token"),
+        (&[7, 11, 12, 13, 10, 11][..], 2, "all but its first token"),
+        (
+            &[10, 11, 7, 12, 13, 10, 11][..],
+            2,
+            "its tokens, not in one stretch",
+        ),
+        (
+            &[10, 11, 10, 11][..],
+            2,
+            "the run and its source, without the tokens between",
+        ),
+    ] {
+        assert_eq!(repeats_beyond(&arm, 4, reference), counted, "{what}");
+    }
+
+    // Two runs are read apart: the reference holds the stretch of the first and
+    // not of the second.
+    let two_runs = [10, 11, 12, 13, 10, 11, 20, 21, 30, 11, 20, 21];
+    assert_eq!(
+        repeats_beyond(&two_runs, 4, &[10, 11, 12, 13, 10, 11]),
+        3,
+        "positions 9 to 11 repeat 5 to 7, and the reference does not hold that stretch"
     );
-    const { assert!(MIN_CYCLE_EXCESS < LOWEST_EXCESS_ABOVE_THE_CEILING) }
 }
 
 /// `base` with its last `len` tokens replaced by an exact loop, at `period`, of
@@ -1300,6 +1330,10 @@ const LOOP_PHRASE: [u32; 8] = [1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007];
 /// did not write the loop. Each is a collapse and each is refused, whatever
 /// the reference arm reads. A rule that compares the two readings admits them:
 /// the reference arms read 5 of 39 and 8 of 40, which is near the ceiling.
+///
+/// The third arm is the measured one with three more tokens of its own phrase.
+/// The reference arm wrote the first five tokens of that run and not the whole
+/// of it, so the run is counted in full.
 #[test]
 fn a_loop_the_reference_arm_did_not_write_is_refused_whatever_the_reference_reads() {
     let phrase_reference = prose_that_repeats_one_phrase();
@@ -1639,10 +1673,7 @@ fn the_false_positive_rate_on_healthy_output() {
 /// It refuses every pair up to [`FIRST_ADMITTED`]% raggedness, and past that the
 /// arms are more noise than loop and it admits them. **The tail measure does not
 /// take over there**: what the control admits agrees up to
-/// [`WORST_ADMITTED_TAIL`], more than twice the worst reading a correct pair
-/// reached. Two arms in one loop read alike, so the speculative arm is seldom
-/// [`MIN_CYCLE_EXCESS`] above the reference arm, and the reference arm's own
-/// reading against the ceiling is what refuses the pair. That
+/// [`WORST_ADMITTED_TAIL`], twice the worst reading a correct pair reached. That
 /// is the "no subsequence floor" claim as a measurement rather than an
 /// assertion, and it is why [`WORST_CORRECT_TAIL_AGREEMENT`] is a recorded
 /// figure and not a threshold.
@@ -2491,8 +2522,8 @@ fn declared_quant_mode(path: &Path) -> Option<String> {
 /// overlapping over most of their range, with no threshold between them.
 ///
 /// Prose is the one regime where the control can read an arm. Asking for it is
-/// not a convenience: it is what keeps the reference arm under
-/// [`MAX_CYCLE_FRACTION`], so a speculative arm has a control to be read against.
+/// not a convenience: it is what keeps a healthy arm under
+/// [`MAX_CYCLE_FRACTION`].
 const PROSE_INSTRUCTION: &str = "Answer at length, in continuous prose, in at least \
      six full paragraphs. Do not use lists, numbered steps, tables, headings, bullet \
      points or code blocks.";
@@ -3333,7 +3364,8 @@ fn report(
     verdict: &Verdict,
 ) {
     let (tail_start, tail_ratio) = weakest_tail(spec, plain);
-    let spec_cycle = strongest_windowed_cycle(spec);
+    let spec_cycle = strongest_windowed_cycle_beyond(spec, plain);
+    let spec_raw = strongest_windowed_cycle(spec);
     let plain_cycle = strongest_windowed_cycle(plain);
     let (div, confidence) = divergence_confidence(spec, plain, margins)
         .unwrap_or((common_prefix_len(spec, plain), 0.0));
@@ -3354,7 +3386,7 @@ fn report(
     eprintln!(
         "[{test}/{}] block={block} drafter={} lcs={:.4} tail={tail_ratio:.4}@{tail_start} divergence={div} \
          margin={:.4} confidence={confidence:.4}{outside} \
-         cycle spec={:.4}/p{}@{} plain={:.4}/p{}@{} excess={:.2} spec={} plain={}\n  \
+         cycle spec={:.4}/p{}@{} (raw {:.4}/p{}@{}) plain={:.4}/p{}@{} spec={} plain={}\n  \
          verdict = {verdict:?}\n  spec  = {:?}\n  plain = {:?}",
         prompt.name,
         drafter
@@ -3366,10 +3398,12 @@ fn report(
         spec_cycle.fraction(),
         spec_cycle.period,
         spec_cycle.start,
+        spec_raw.fraction(),
+        spec_raw.period,
+        spec_raw.start,
         plain_cycle.fraction(),
         plain_cycle.period,
         plain_cycle.start,
-        cycle_excess(spec_cycle, plain_cycle),
         spec.len(),
         plain.len(),
         tk.decode(spec, false).unwrap_or_default(),

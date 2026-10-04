@@ -138,38 +138,53 @@ much of each arm repeats at a short period. It reads the whole stream and each
 of the `TAIL_WINDOWS` (4) tail cuts, at every period up to `MAX_CYCLE_PERIOD`
 (64) that leaves `MIN_CYCLE_SAMPLES` (32) comparisons.
 
-The control has two constants:
+`MAX_CYCLE_FRACTION` (0.20) is the ceiling, and the only threshold. The two
+arms are read differently:
 
-- `MAX_CYCLE_FRACTION` (0.20) is the ceiling. A reference arm above it is
-  unjudgeable.
-- `MIN_CYCLE_EXCESS` (2.0) is how far a speculative arm above the ceiling
-  must read above the reference arm before it is refused. The unit is the
-  standard error of the difference between the two readings
-  (`cycle_excess`), so the rule carries the sample count of each reading.
+- The reference arm is read as it is. Above the ceiling it is unjudgeable.
+- The speculative arm is read without the repeats the reference arm wrote
+  itself (`repeats_beyond`). Above the ceiling it is refused.
 
-The ceiling alone does not separate healthy prose from a ragged loop. An
-answer about one subject repeats that subject, in both arms. A healthy arm of
-a correct engine reads 0.2308 from 39 comparisons in its last window, where
-its reference arm reads 0.1282 at the same period. A period-8 loop at 58%
-raggedness can read 0.20. So the reference arm is the control for how much a
-prompt repeats: the measured pair reads 1.18 standard errors and passes.
+What "wrote itself" means, exactly. At one period, the positions that repeat
+the token one period before them are read as runs. A run of consecutive
+repeats, together with the tokens of one period before it, is one stretch of
+the arm: a phrase and the place where the arm said it before. When the
+reference arm holds that whole stretch, token for token, anywhere, the run is
+not counted. A run is excused whole or not at all. A loop is one long run and
+no healthy reference arm holds it, so a loop loses nothing. The reading is
+still the strongest one over every window and period, taken after the runs
+are excused.
+
+The reason is a measurement. An answer about one subject repeats that subject,
+in both arms. A healthy arm of a correct engine reads 9 of 39 at period 25 in
+its last window, where a period-8 loop at 58% raggedness can read 0.20. Five
+of the nine are one phrase, and the reference arm wrote the same phrase after
+the same 25 tokens. Without them the arm reads 4 of 39.
 `a_healthy_arm_that_repeats_no_more_than_its_reference_is_not_a_collapse`
-holds both arms as a fixture, and the same speculative arm with a loop over
-its last window is the negative control.
+holds both arms as a fixture.
 
-Both sides of `MIN_CYCLE_EXCESS` are measured. A looping arm against a healthy
-reference arm is walked from 0% to 100% raggedness
-(`a_speculative_arm_in_a_ragged_loop_is_refused_against_a_healthy_reference`).
-The lowest excess of an arm above the ceiling there is 2.29, so the bound
-admits no arm of that sweep, and the control refuses every pair under 58%. The
-lower side is the one measured pair.
+The rule gives up no refusal of a fixed ceiling on the arms the tests hold:
 
-The bound follows the reference arm, and that is its limit. A speculative arm
-in a ragged loop is admitted when the reference arm reads near the ceiling
-too. Two arms in one loop are such a pair. Only the reference arm's own
-reading refuses them: walked from 0% to 100% raggedness, the control refuses
-every such pair under 56%. Past that the arms are more noise than loop, and
-nothing takes over.
+- Eight constructed arms against reference arms that read near the ceiling
+  are each refused
+  (`a_loop_the_reference_arm_did_not_write_is_refused_whatever_the_reference_reads`).
+- An exact loop at the end of the measured arm is refused past 13 tokens at
+  period 1 and past 19 at period 8, as under a fixed ceiling. At period 25 it
+  is refused when it goes one token past what the reference arm wrote.
+- A looping arm against a healthy reference arm, walked from 0% to 100%
+  raggedness, is refused under 58%, against synthetic prose and against two
+  reference arms that read near the ceiling.
+- Two arms in one period-8 loop, walked the same way, are refused under 60%.
+  Past that the arms are more noise than loop, and nothing takes over.
+
+A healthy arm can still be refused. Only a run the reference arm wrote token
+for token is excused. A healthy arm that repeats its subject above the
+ceiling in other words, or by single-token coincidences alone, is refused:
+the measured arm against a reference arm with one token of that stretch
+changed is refused
+(`a_healthy_arm_above_the_ceiling_is_refused_when_the_reference_did_not_write_its_phrase`).
+What a broken loop can hide behind is the converse: a repeat that the
+reference arm also wrote in full.
 
 The control reads only prose. Healthy structured output, such as a markdown
 table, overlaps ragged loops on this measure, which is why the prompts ask for
@@ -185,9 +200,7 @@ pins that from both sides.
 Which arm collapsed decides the verdict. A degenerate speculative arm against
 a healthy reference is refused. A degenerate reference arm says the prompt
 did not come back as prose the control can read: it is reported as
-unjudgeable, not failed. Plain greedy is the control. A reference arm too
-short to give a reading is no control, and a speculative arm above the ceiling
-is refused against it.
+unjudgeable, not failed. Plain greedy is the control.
 
 ## Which arm is short
 
@@ -253,7 +266,5 @@ One limitation stands. `Rng::prose` is an i.i.d. word model with no
 autocorrelation, so it reads lower on a self-similarity measure than real
 prose. `prose_clears_the_control_at_every_length_the_gate_can_hand_it` is a
 hard gate on it and bounds `MAX_CYCLE_FRACTION` from below, but no synthetic
-healthy stream reaches the ceiling, and a real one does. So the healthy side
-of `MIN_CYCLE_EXCESS` rests on one measured pair, and the sweep that bounds
-its other side uses a synthetic reference arm that reads lower than a real
-one.
+healthy stream reaches the ceiling, and a real one does. So the excused
+repeat rests on one measured pair.
