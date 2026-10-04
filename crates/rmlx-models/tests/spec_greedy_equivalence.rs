@@ -1403,6 +1403,38 @@ fn a_repeat_is_excused_only_by_the_same_tail_cut_of_the_reference() {
         let reference = holding(long_filler.clone(), at);
         assert_eq!(repeats_beyond(&late, 0, 4, &reference), counted, "{what}");
     }
+
+    // Both cut divisions round down. The cuts of a 30-token arm start at tokens
+    // 0, 7, 15 and 22.
+    let odd_len = 30;
+    assert_eq!(
+        [6, 7, 14, 15, 21, 22].map(|at| tail_cut(odd_len, at)),
+        [0, 1, 1, 2, 2, 3]
+    );
+    let odd = |from: u32, at: usize| -> Vec<u32> {
+        let mut arm: Vec<u32> = (0..odd_len as u32).map(|i| from + i).collect();
+        arm[at..at + STRETCH.len()].copy_from_slice(&STRETCH);
+        arm
+    };
+    for (at, counted, what) in [
+        (
+            22,
+            0,
+            "the last cut of a 30-token reference starts at token 22",
+        ),
+        (21, 2, "one token before it"),
+        (
+            16,
+            2,
+            "in the cut before, where a stretch at token 22 is not looked for",
+        ),
+    ] {
+        assert_eq!(
+            repeats_beyond(&odd(100, 22), 0, 4, &odd(500, at)),
+            counted,
+            "{what}"
+        );
+    }
 }
 
 /// `base` with its last `len` tokens replaced by an exact loop, at `period`, of
@@ -1560,6 +1592,14 @@ fn a_loop_the_reference_arm_holds_somewhere_else_is_refused() {
         restart,
         MEASURED_PLAIN_ARM.to_vec(),
     ));
+    // The loop begins seven tokens before the last cut. In the last window the
+    // run is cut at the window start, so its stretch starts in the last cut,
+    // and the reference arm holds the loop only before that cut.
+    cases.push((
+        "period 8, 32 tokens from token 185, the reference arm holds it at token 128".into(),
+        prose_with_a_loop(&prose, 185, 32, 8),
+        prose_with_a_loop(&prose, 128, 32, 8),
+    ));
     let mut admitted = Vec::new();
     for (shape, spec, plain) in cases {
         assert!(
@@ -1597,14 +1637,108 @@ fn a_stretch_the_reference_arm_holds_in_another_order_is_not_excused() {
     assert!(failure.contains("repeats at period 25"), "{failure}");
 }
 
+/// What the reference arm can excuse in one reading is bounded by what the
+/// reference arm itself repeats there: for every tail cut and every period, the
+/// repeats left out of the speculative arm are at most the raw repeats of the
+/// reference arm from the same cut at the same period.
+fn assert_the_excused_repeats_are_the_reference_arms_own(shape: &str, spec: &[u32], plain: &[u32]) {
+    for n in 0..TAIL_WINDOWS {
+        let from = spec.len() * n / TAIL_WINDOWS;
+        for period in 1..=MAX_CYCLE_PERIOD.min(spec.len() - from - 1) {
+            let excused =
+                repeats_beyond(spec, from, period, &[]) - repeats_beyond(spec, from, period, plain);
+            let held = repeats_beyond(plain, plain.len() * n / TAIL_WINDOWS, period, &[]);
+            assert!(
+                excused <= held,
+                "{shape}: from {from} at period {period}, {excused} repeats are excused and \
+                 the reference arm holds {held}"
+            );
+        }
+    }
+}
+
+/// One burst in the reference arm does not excuse every copy of it.
+///
+/// In the first two pairs the reference arm holds one token 13 times in its
+/// last window and reads 12 of 63. The speculative arm holds that burst twice
+/// and a 13-token burst of its own between them: 36 of 63 raw. In the third the
+/// reference arm holds a 17-token period-8 loop (9 of 56), and the speculative
+/// arm holds it twice with a 19-token loop of its own: 29 of 56 raw. Each
+/// reference occurrence excuses one run, so one copy and the arm's own burst
+/// are counted.
+#[test]
+fn one_burst_in_the_reference_arm_excuses_one_burst_and_no_more() {
+    let burst = |arm: &mut [u32], at: usize, token: u32| arm[at..at + 13].fill(token);
+    let unique: Vec<u32> = (0..N_TOKENS as u32).map(|i| 10_000 + i).collect();
+    let mut cases: Vec<(String, Vec<u32>, Vec<u32>, (usize, usize, usize))> = Vec::new();
+    for (name, base) in [
+        ("unique tokens", unique.as_slice()),
+        ("the measured reference arm", &MEASURED_PLAIN_ARM[..]),
+    ] {
+        let mut plain = base.to_vec();
+        burst(&mut plain, 200, 777_777);
+        let mut spec = base.to_vec();
+        burst(&mut spec, 192, 777_777);
+        burst(&mut spec, 231, 777_777);
+        burst(&mut spec, 206, 888_888);
+        cases.push((
+            format!("three bursts of one token on {name}"),
+            spec,
+            plain,
+            (1, 36, 63),
+        ));
+    }
+    let prose = Rng(0xC0DE).prose(N_TOKENS);
+    let mut spec = prose_with_a_loop(&prose_with_a_loop(&prose, 192, 17, 8), 233, 17, 8);
+    for i in 0..19 {
+        spec[210 + i] = 3000 + (i % 8) as u32;
+    }
+    cases.push((
+        "two copies of a period-8 loop and one loop of its own".into(),
+        spec,
+        prose_with_a_loop(&prose, 200, 17, 8),
+        (8, 29, 56),
+    ));
+
+    let mut admitted = Vec::new();
+    for (shape, spec, plain, (period, matches, samples)) in &cases {
+        assert!(
+            strongest_windowed_cycle(plain).fraction() <= MAX_CYCLE_FRACTION,
+            "{shape}: the reference arm must be one the control can read"
+        );
+        assert_eq!(
+            strongest_windowed_cycle(spec),
+            Cycle {
+                start: 192,
+                period: *period,
+                matches: *matches,
+                samples: *samples
+            },
+            "{shape}: the raw reading"
+        );
+        if judge(spec, plain, &[], None).refusal().is_none() {
+            admitted.push(shape);
+        }
+    }
+    assert!(admitted.is_empty(), "not refused: {admitted:#?}");
+    for (shape, spec, plain, _) in &cases {
+        assert_the_excused_repeats_are_the_reference_arms_own(shape, spec, plain);
+    }
+}
+
 /// The declared blind spot, with its size.
 ///
 /// A loop that the reference arm wrote in the same tail cut is not counted in
-/// the speculative arm. A judgeable reference arm holds at most the ceiling of
-/// such a loop: 19 tokens at period 8 in the last window, which reads 11 of 56.
-/// So the speculative arm can hold that loop and a second one of its own, up to
-/// the ceiling again, and be agreed: 22 of 56 raw, twice the ceiling less one
-/// repeat. One more token of its own and it is refused.
+/// the speculative arm, once for each time the reference arm wrote it. A
+/// judgeable reference arm holds at most the ceiling of such a loop: 19 tokens
+/// at period 8 in the last window, which reads 11 of 56. So the speculative arm
+/// can hold that loop and a second one of its own, up to the ceiling again, and
+/// be agreed: 22 of 56 raw, twice the ceiling less one repeat. One more token
+/// of its own and it is refused.
+///
+/// The bound is general for two arms of one length: in one window at one
+/// period, the repeats left out are at most the reference arm's own raw repeats
+/// there, which are at most the ceiling.
 #[test]
 fn the_control_admits_at_most_the_ceiling_twice_in_one_window() {
     let prose = Rng(0xC0DE).prose(N_TOKENS);
@@ -1625,6 +1759,12 @@ fn the_control_admits_at_most_the_ceiling_twice_in_one_window() {
         "the raw reading of the arm the control admits"
     );
     assert_eq!(judge(&at_the_edge, &plain, &[], None), Verdict::Agreed);
+    assert_the_excused_repeats_are_the_reference_arms_own("the edge", &at_the_edge, &plain);
+    assert_the_excused_repeats_are_the_reference_arms_own(
+        "the measured pair",
+        &MEASURED_SPEC_ARM,
+        &MEASURED_PLAIN_ARM,
+    );
 
     let failure = judge(&own_loop(&plain, 20), &plain, &[], None)
         .refusal()
@@ -1639,6 +1779,45 @@ fn the_control_admits_at_most_the_ceiling_twice_in_one_window() {
         ),
         "a reference arm with one more token of the loop is not judgeable"
     );
+}
+
+/// How much earlier the reference arm can say the shared phrase before the
+/// measured pair is refused.
+///
+/// The speculative arm's stretch starts at token 223, in its last quarter. The
+/// measured reference arm holds it at token 199, and its last quarter starts at
+/// token 192. So the pair has 7 tokens of margin: with the reference arm's text
+/// from token 150 on 7 tokens earlier the pair is agreed, and at 8 tokens
+/// earlier the stretch starts before the cut and the pair is refused. The
+/// reference arm is healthy in both.
+#[test]
+fn the_measured_pair_is_agreed_with_seven_tokens_of_position_margin() {
+    let earlier = |k: usize| -> Vec<u32> {
+        let mut plain = MEASURED_PLAIN_ARM[..150].to_vec();
+        plain.extend_from_slice(&MEASURED_PLAIN_ARM[150 + k..]);
+        plain.extend((0..k as u32).map(|i| 50_000 + i));
+        plain
+    };
+    let stretch = &MEASURED_SPEC_ARM[223..253];
+    let holds_at = |plain: &[u32]| plain.windows(stretch.len()).position(|w| w == stretch);
+
+    let at_the_cut = earlier(7);
+    assert_eq!(holds_at(&at_the_cut), Some(192));
+    assert_eq!(
+        judge(&MEASURED_SPEC_ARM, &at_the_cut, &[], None),
+        Verdict::Agreed
+    );
+
+    let before_the_cut = earlier(8);
+    assert_eq!(holds_at(&before_the_cut), Some(191));
+    assert!(
+        strongest_windowed_cycle(&before_the_cut).fraction() <= MAX_CYCLE_FRACTION,
+        "the reference arm is healthy"
+    );
+    let failure = judge(&MEASURED_SPEC_ARM, &before_the_cut, &[], None)
+        .refusal()
+        .expect("the stretch starts one token before the last cut of the reference arm");
+    assert!(failure.contains("repeats at period 25"), "{failure}");
 }
 
 /// How long an exact loop at the end of the measured arm can be before the
