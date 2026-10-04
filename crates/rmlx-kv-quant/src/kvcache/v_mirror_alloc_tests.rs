@@ -36,9 +36,9 @@
 //!   — the allocation oracle's power measurement. It pays a prefix copy on
 //!   purpose so the peak is shown to be able to see one.
 //! * [`iso_decode_does_not_copy_the_v_mirror`] and its rotor sibling — the
-//!   production seam, through `update_and_sdpa`. A copy of one plane of the
-//!   packed K prefix per step is below their step bound; a whole K prefix and
-//!   a V prefix are not.
+//!   production seam, through `update_and_sdpa`. A per-step copy smaller than
+//!   one packed K prefix, the norms plane for one, is below their step bound; a
+//!   whole K prefix and a V prefix are not.
 //!
 //! **Planar has no production-seam probe.** Its fused arm is warm-TTFT
 //! quiescent: after `exit_prefill` the bf16 K seed is live and the dispatcher
