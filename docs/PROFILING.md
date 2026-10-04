@@ -387,6 +387,38 @@ Rules the pooling allocator imposes:
 - **Evaluate inside the bracket.** An `eval()` after `close()` allocates after
   the mark was read, and `observed_allocation()` reads false.
 - **One bracket at a time.** The peak mark is process-global.
+- **Open from a settled state.** See 9.2.
+
+### 9.2 The live count right after an evaluation
+
+`rmlx_mlx::mlx_active_memory_bytes()` reads the bytes MLX holds now. Right
+after an evaluation that reading has two states. MLX frees the temporaries of
+a command buffer (the inputs of its ops that nothing else holds) in the
+completion handler of that buffer (`mlx/backend/metal/eval.cpp`), and an
+evaluation returns when its outputs are written, which can be before Metal
+calls the handler. So the count holds the temporaries of the last command
+buffers or does not, by timing. Metal shader validation and the hand-off to
+the MLX thread both move that timing.
+
+`rmlx_mlx::synchronize_gpu()` removes the race. It commits the open command
+buffer of the MLX thread's GPU stream and waits until that buffer is complete
+(`mlx_synchronize`, Metal `waitUntilCompleted`). That wait returns after the
+completion handlers of the buffer ran, and the buffer is the last of its
+queue, so after the call the count holds no temporary. The settled count
+repeats exactly from run to run, with and without shader validation.
+
+- **Call `synchronize_gpu()` before each reading a test judges on**: before
+  `PeakBracket::open()`, and before a bare `mlx_active_memory_bytes()`.
+- **A temporary is not in the settled live count.** A copy that a step makes
+  and frees shows only in the peak over that step: open a bracket from the
+  settled state, run one step, read `headroom_bytes()`.
+- **The settled live count shows what stays allocated.** MLX rounds a buffer
+  larger than one VM page up to whole 16 KiB pages, so compare it with a byte
+  model to within one page for each buffer.
+
+`crates/rmlx-kv-quant/src/kvcache/v_mirror_alloc_tests.rs` uses both readings.
+The engine does not call `synchronize_gpu()`: `metal_gen_alloc_mb` reads its
+open count unsettled.
 
 `rmlx baseline` reports `metal_peak_mb` (the peak over prefill and decode) and
 `metal_gen_alloc_mb` (that peak minus the bytes live at open). Only the second

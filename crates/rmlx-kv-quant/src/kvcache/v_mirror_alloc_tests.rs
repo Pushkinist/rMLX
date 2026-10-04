@@ -459,16 +459,17 @@ fn paged(positions: i32) -> i32 {
 ///
 /// **Each step.** The step's headroom, less the new ring of a step that regrows
 /// the store, is what the step allocated and freed again. It must be less than
-/// one packed K prefix of the attended length. A re-materialised V prefix is
-/// `kv_h * kv_seq * head_dim * 2` bytes of exactly that, and the packed K
-/// prefix is smaller than the bf16 V prefix, so the bound fails a V prefix
-/// copy and a K prefix copy both. Only a peak sees either: the copy is freed
+/// one packed K prefix of the attended length. A re-materialised V prefix is at
+/// least `kv_h * kv_seq * head_dim * 2` bytes of exactly that (the mirror of
+/// this fixture is f32, twice that), and the packed K prefix is smaller than
+/// the bf16 V prefix, so the bound fails a V prefix copy and a K prefix copy
+/// both. Only a peak sees either: the copy is freed
 /// when the step is done.
 ///
-/// **The whole run.** The store holds its layer-static tables plus whole pages
-/// of positions, by the codec's own byte model, and the settled live count
-/// grew by what the store grew by, to within the allocator's rounding of the
-/// ring's planes. Every buffer sized at `max_seq` is allocated before the run
+/// **The whole run.** After every step the store holds its layer-static tables
+/// plus whole pages of positions, by the codec's own byte model. Over the run
+/// the settled live count grew by what the store grew by, to within the
+/// allocator's rounding of the ring's planes. Every buffer sized at `max_seq` is allocated before the run
 /// opens and cancels out.
 ///
 /// `dispatch_count` is the codec's own kernel counter: a run that did not
@@ -543,7 +544,7 @@ fn assert_decode_allocates_no_prefix_copy(
         let kv_seq = cache.offset();
         // A step that regrows the ring allocates the whole new ring while the
         // old one is still live.
-        let store_now = cache.storage.resident_bytes();
+        let store_now = store_holds_whole_pages(&cache);
         let new_ring = if store_now == store_at_open {
             0
         } else {
@@ -554,8 +555,8 @@ fn assert_decode_allocates_no_prefix_copy(
         assert!(
             transient < k_prefix,
             "{quant}: the decode step at kv_seq={kv_seq} allocated and freed {transient} B. \
-             One packed K prefix is {k_prefix} B and one bf16 V prefix is {} B: the step \
-             materialised a prefix (headroom {headroom} B)",
+             One packed K prefix is {k_prefix} B and a bf16 V prefix, the narrowest a V \
+             mirror gets, is {} B: the step materialised a prefix (headroom {headroom} B)",
             shape.prefix_copy_bytes(kv_seq)
         );
         most_per_position = most_per_position.max(transient / kv_seq as u64);

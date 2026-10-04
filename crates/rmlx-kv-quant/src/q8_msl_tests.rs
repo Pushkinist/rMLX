@@ -1,5 +1,5 @@
 use super::*;
-use rmlx_mlx::{Array, Device, Dtype, PeakBracket};
+use rmlx_mlx::{synchronize_gpu, Array, Device, Dtype, PeakBracket};
 
 #[allow(
     clippy::expect_used,
@@ -153,6 +153,11 @@ fn q8_msl_roundtrip_allocation_stays_within_budget() {
     // Materialise the input before the bracket opens: its bytes are part of
     // "already live", not part of what the round trip costs.
     arr.eval().expect("eval input");
+    // MLX frees a command buffer's temporaries in its completion handler, which
+    // Metal can call after the evaluation returned. Wait for the handlers, or
+    // the bracket opens on bytes an earlier test of this process still holds
+    // and reads their release as this region's transient.
+    synchronize_gpu().expect("synchronize before the bracket opens");
 
     let bracket = PeakBracket::open();
     let (codes, scales) = q8_quantize_gpu(&arr, Device::Gpu).expect("GPU quantize");
