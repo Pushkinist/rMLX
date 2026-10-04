@@ -1260,6 +1260,201 @@ fn a_speculative_arm_in_a_ragged_loop_is_refused_against_a_healthy_reference() {
     const { assert!(MIN_CYCLE_EXCESS < LOWEST_EXCESS_ABOVE_THE_CEILING) }
 }
 
+/// `base` with its last `len` tokens replaced by an exact loop, at `period`, of
+/// the tokens `base` holds there.
+fn exact_tail_loop(base: &[u32], len: usize, period: usize) -> Vec<u32> {
+    let from = base.len() - len;
+    let mut out = base[..from].to_vec();
+    out.extend((0..len).map(|i| base[from + i % period]));
+    out
+}
+
+/// `base` with every token from `from` on replaced by a period-8 loop of
+/// `phrase`, `noise` percent of whose tokens are drawn at random instead.
+fn ragged_tail_loop(base: &[u32], from: usize, phrase: &[u32], seed: u64, noise: u32) -> Vec<u32> {
+    let mut rng = Rng(seed);
+    let mut out = base[..from].to_vec();
+    for i in 0..base.len() - from {
+        out.push(if rng.below(100) < noise {
+            rng.below(300)
+        } else {
+            phrase[i % 8]
+        });
+    }
+    out
+}
+
+/// Healthy synthetic prose that says one 8-token phrase twice, 24 tokens apart,
+/// in its last window. It reads 8 of 40 there: at the ceiling and not above it.
+fn prose_that_repeats_one_phrase() -> Vec<u32> {
+    let mut out = Rng(0xC0DE).prose(N_TOKENS);
+    for i in 0..8 {
+        out[232 + i] = out[208 + i];
+    }
+    out
+}
+
+const LOOP_PHRASE: [u32; 8] = [1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007];
+
+/// Every constructed arm here reads above the ceiling, and its reference arm
+/// did not write the loop. Each is a collapse and each is refused, whatever
+/// the reference arm reads. A rule that compares the two readings admits them:
+/// the reference arms read 5 of 39 and 8 of 40, which is near the ceiling.
+#[test]
+fn a_loop_the_reference_arm_did_not_write_is_refused_whatever_the_reference_reads() {
+    let phrase_reference = prose_that_repeats_one_phrase();
+    let at_the_ceiling = strongest_windowed_cycle(&phrase_reference);
+    assert_eq!(
+        (at_the_ceiling.matches, at_the_ceiling.samples),
+        (8, 40),
+        "the synthetic reference must read at the ceiling"
+    );
+    let cases: [(&str, Vec<u32>, &[u32]); 8] = [
+        (
+            "the measured arm, its last 25 tokens an exact period-8 loop",
+            exact_tail_loop(&MEASURED_SPEC_ARM, 25, 8),
+            &MEASURED_PLAIN_ARM,
+        ),
+        (
+            "the measured arm, its last 19 tokens one repeated token",
+            exact_tail_loop(&MEASURED_SPEC_ARM, 19, 1),
+            &MEASURED_PLAIN_ARM,
+        ),
+        (
+            "the measured arm, its last 33 tokens an exact period-25 loop",
+            exact_tail_loop(&MEASURED_SPEC_ARM, 33, 25),
+            &MEASURED_PLAIN_ARM,
+        ),
+        (
+            "a half-stream period-8 loop at 44% raggedness",
+            ragged_loop_arm(0x91, 44),
+            &MEASURED_PLAIN_ARM,
+        ),
+        (
+            "the measured arm, its last quarter a period-8 loop at 44% raggedness",
+            ragged_tail_loop(
+                &MEASURED_SPEC_ARM,
+                192,
+                &MEASURED_SPEC_ARM[192..200],
+                7919,
+                44,
+            ),
+            &MEASURED_PLAIN_ARM,
+        ),
+        (
+            "prose, its last 28 tokens an exact period-8 loop",
+            exact_tail_loop(&phrase_reference, 28, 8),
+            &phrase_reference,
+        ),
+        (
+            "prose, its last 26 tokens an exact period-4 loop",
+            exact_tail_loop(&phrase_reference, 26, 4),
+            &phrase_reference,
+        ),
+        (
+            "prose, its second half a period-8 loop at 40% raggedness",
+            ragged_tail_loop(&phrase_reference, 128, &LOOP_PHRASE, 0x33, 40),
+            &phrase_reference,
+        ),
+    ];
+    for (shape, spec, plain) in cases {
+        let failure = judge(&spec, plain, &[], None)
+            .refusal()
+            .unwrap_or_else(|| panic!("{shape} was not refused"));
+        assert!(failure.contains("repeats at period"), "{shape}: {failure}");
+    }
+}
+
+/// How long an exact loop at the end of the measured arm can be before the
+/// control refuses it, against the measured reference arm. Both sides of each
+/// limit are held.
+///
+/// At period 25 the loop starts as the phrase the two arms share, so its first
+/// tokens are the measured arm itself. The limit there is where the loop goes
+/// one token past what the reference arm wrote.
+#[test]
+fn an_exact_loop_at_the_end_of_the_measured_arm_is_refused_past_a_pinned_length() {
+    for (period, longest_admitted) in [(1, 13), (8, 19), (25, 27)] {
+        for len in period + 1..=N_TOKENS / 2 {
+            let spec = exact_tail_loop(&MEASURED_SPEC_ARM, len, period);
+            let refused = judge(&spec, &MEASURED_PLAIN_ARM, &[], None)
+                .refusal()
+                .is_some();
+            assert_eq!(
+                refused,
+                len > longest_admitted,
+                "period {period}: a loop of {len} tokens, against a limit of {longest_admitted}"
+            );
+        }
+    }
+}
+
+/// The measured arm is agreed because the reference arm wrote its repeated
+/// phrase, and for no other reason. Here one token of that stretch of the
+/// reference arm is another token. The reference arm still reads 5 of 39. The
+/// speculative arm is the same healthy arm, and it is refused.
+///
+/// **This is what a healthy arm can still be refused for:** it repeats its
+/// subject above the ceiling in words the reference arm did not write token for
+/// token.
+#[test]
+fn a_healthy_arm_above_the_ceiling_is_refused_when_the_reference_did_not_write_its_phrase() {
+    let mut plain = MEASURED_PLAIN_ARM;
+    plain[210] = 0;
+    assert_eq!(
+        strongest_windowed_cycle(&plain),
+        strongest_windowed_cycle(&MEASURED_PLAIN_ARM),
+        "the reading of the reference arm must not move"
+    );
+    let failure = judge(&MEASURED_SPEC_ARM, &plain, &[], None)
+        .refusal()
+        .expect("the reference arm no longer holds the phrase");
+    assert!(failure.contains("repeats at period 25"), "{failure}");
+}
+
+/// A looping arm against a healthy reference arm that reads near the ceiling,
+/// **swept** over the whole raggedness range: the measured reference arm, and
+/// synthetic prose that says one phrase twice. The edge and the number of pairs
+/// admitted are those of a fixed ceiling, because neither reference arm wrote
+/// the loop.
+#[test]
+fn a_reference_arm_near_the_ceiling_does_not_move_the_ragged_loop_edge() {
+    /// Raggedness, in per cent, of the first pair the control admits.
+    const FIRST_ADMITTED: u32 = 58;
+    /// How many of the 204 pairs of each sweep the control admits.
+    const ADMITTED: usize = 82;
+
+    let phrase_reference = prose_that_repeats_one_phrase();
+    let references: [(&str, &[u32]); 2] = [
+        ("the measured reference arm", &MEASURED_PLAIN_ARM),
+        ("prose that repeats one phrase", &phrase_reference),
+    ];
+    for (name, plain) in references {
+        let mut first_admitted = None;
+        let mut admitted = 0;
+        for noise in (0..=100).step_by(2) {
+            for seed in [0x33u64, 0x91, 0xB3, 0xD5] {
+                let spec = ragged_tail_loop(plain, N_TOKENS / 2, &LOOP_PHRASE, seed, noise);
+                match judge(&spec, plain, &[], None) {
+                    Verdict::Agreed => {
+                        admitted += 1;
+                        first_admitted = first_admitted.or(Some(noise));
+                    }
+                    Verdict::Refused(why) => {
+                        assert!(why.contains("repeats at period"), "{noise}%: {why}");
+                    }
+                    Verdict::Unjudgeable(why) => panic!("{name}, {noise}%: {why}"),
+                }
+            }
+        }
+        assert_eq!(
+            (first_admitted, admitted),
+            (Some(FIRST_ADMITTED), ADMITTED),
+            "{name}: the first admitted pair and the number admitted"
+        );
+    }
+}
+
 /// A prompt neither arm answered is not a failure of the round loop, and a
 /// prompt only one arm answered is.
 #[test]
@@ -1461,9 +1656,9 @@ fn the_false_positive_rate_on_healthy_output() {
 #[test]
 fn two_arms_in_the_same_ragged_loop_are_refused_until_they_are_no_longer_one_loop() {
     /// Raggedness, in per cent, of the first pair the control admits.
-    const FIRST_ADMITTED: u64 = 56;
+    const FIRST_ADMITTED: u64 = 60;
     /// The best tail agreement any admitted pair reached.
-    const WORST_ADMITTED_TAIL: f64 = 0.2500;
+    const WORST_ADMITTED_TAIL: f64 = 0.2188;
 
     let mut worst_admitted = 0.0f64;
     let mut first_admitted = None;
