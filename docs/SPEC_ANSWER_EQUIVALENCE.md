@@ -148,12 +148,20 @@ arms are read differently:
 What "wrote itself" means, exactly. At one period, the positions that repeat
 the token one period before them are read as runs. A run of consecutive
 repeats, together with the tokens of one period before it, is one stretch of
-the arm: a phrase and the place where the arm said it before. When the
-reference arm holds that whole stretch, token for token, anywhere, the run is
-not counted. A run is excused whole or not at all. A loop is one long run and
-no healthy reference arm holds it, so a loop loses nothing. The reading is
-still the strongest one over every window and period, taken after the runs
-are excused.
+the arm: a phrase and the place where the arm said it before. The run is not
+counted when the reference arm holds that whole stretch, token for token, in
+the tail cut the stretch starts in. A stretch that starts in the last quarter
+of the speculative arm is looked for in the last quarter of the reference
+arm; one that starts in the first quarter is looked for in all of it. A run
+is excused whole or not at all. The reading is still the strongest one over
+every window and period, taken after the runs are excused.
+
+The position bound exists because a judgeable reference arm can hold a long
+loop. Over the whole reference arm a 57-token loop at period 8 reads 49 of
+248, under the ceiling. The same loop at the tail of the speculative arm
+reads 49 of 56. A stretch matched anywhere would excuse it; the last quarter
+of the reference arm does not hold it
+(`a_loop_the_reference_arm_holds_somewhere_else_is_refused`).
 
 The reason is a measurement. An answer about one subject repeats that subject,
 in both arms. A healthy arm of a correct engine reads 9 of 39 at period 25 in
@@ -163,19 +171,25 @@ the same 25 tokens. Without them the arm reads 4 of 39.
 `a_healthy_arm_that_repeats_no_more_than_its_reference_is_not_a_collapse`
 holds both arms as a fixture.
 
-The rule gives up no refusal of a fixed ceiling on the arms the tests hold:
+What the tests hold, and against what:
 
-- Eight constructed arms against reference arms that read near the ceiling
-  are each refused
-  (`a_loop_the_reference_arm_did_not_write_is_refused_whatever_the_reference_reads`).
+- Fourteen constructed arms against judgeable reference arms are each
+  refused: eight whose reference arm reads near the ceiling, and six whose
+  reference arm holds the same loop somewhere else.
 - An exact loop at the end of the measured arm is refused past 13 tokens at
-  period 1 and past 19 at period 8, as under a fixed ceiling. At period 25 it
-  is refused when it goes one token past what the reference arm wrote.
+  period 1 and past 19 at period 8. The test asserts that each of those
+  verdicts is the one a fixed ceiling gives on the raw reading of the last
+  window at the loop's period. At period 25 the loop is refused when it goes
+  one token past what the reference arm wrote, at 28 tokens. A fixed ceiling
+  refuses the measured arm itself, so there is no raw verdict to compare with
+  there.
 - A looping arm against a healthy reference arm, walked from 0% to 100%
   raggedness, is refused under 58%, against synthetic prose and against two
-  reference arms that read near the ceiling.
-- Two arms in one period-8 loop, walked the same way, are refused under 60%.
-  Past that the arms are more noise than loop, and nothing takes over.
+  reference arms that read near the ceiling. Each verdict of these sweeps is
+  asserted equal to a fixed ceiling on the raw reading.
+- Two arms in one period-8 loop, walked the same way, are refused under 60%,
+  with the same assertion on the two raw readings. Past that the arms are
+  more noise than loop, and nothing takes over.
 
 A healthy arm can still be refused. Only a run the reference arm wrote token
 for token is excused. A healthy arm that repeats its subject above the
@@ -183,8 +197,14 @@ ceiling in other words, or by single-token coincidences alone, is refused:
 the measured arm against a reference arm with one token of that stretch
 changed is refused
 (`a_healthy_arm_above_the_ceiling_is_refused_when_the_reference_did_not_write_its_phrase`).
-What a broken loop can hide behind is the converse: a repeat that the
-reference arm also wrote in full.
+The declared blind spot is the converse: a loop that the reference arm also
+wrote in full, in the same tail cut. Its size is bounded by the reference
+arm's own ceiling. A judgeable reference arm holds at most 19 tokens of a
+period-8 loop in its last window (11 of 56). A speculative arm that holds
+that loop and a second one of its own, up to the ceiling again, reads 22 of
+56 raw and is agreed; one more token of its own loop and it is refused. So
+the control can admit a raw reading of up to twice the ceiling in one window
+(`the_control_admits_at_most_the_ceiling_twice_in_one_window`).
 
 The control reads only prose. Healthy structured output, such as a markdown
 table, overlaps ragged loops on this measure, which is why the prompts ask for

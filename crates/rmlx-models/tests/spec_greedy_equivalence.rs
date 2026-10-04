@@ -67,8 +67,9 @@
 //! that leaves [`MIN_CYCLE_SAMPLES`] comparisons. A reference arm above
 //! [`MAX_CYCLE_FRACTION`] is an input the gate cannot judge. A speculative arm
 //! is refused above the same ceiling, and its reading does not count a repeat
-//! the reference arm wrote itself, token for token: an answer about one subject
-//! repeats that subject in both arms. See [`repeats_beyond`].
+//! the reference arm wrote itself, token for token and in the same tail cut: an
+//! answer about one subject repeats that subject in both arms. See
+//! [`repeats_beyond`].
 //!
 //! Windowing and the period sweep are both load-bearing; three real
 //! degeneracies score under any ceiling without them:
@@ -429,24 +430,43 @@ impl Cycle {
     }
 }
 
-/// How many positions of `tokens` hold the token `period` positions before
-/// them, without the repeats `reference` wrote itself.
+/// Which tail cut holds position `at` of an arm of `len` tokens: the last of the
+/// `TAIL_WINDOWS` cuts that starts at or before it. Cut `n` starts at
+/// `len * n / TAIL_WINDOWS`.
+fn tail_cut(len: usize, at: usize) -> usize {
+    (0..TAIL_WINDOWS)
+        .rfind(|n| len * n / TAIL_WINDOWS <= at)
+        .unwrap_or(0)
+}
+
+/// How many positions of `tokens` from `from + period` on hold the token
+/// `period` positions before them, without the repeats `reference` wrote
+/// itself in the same part of its own text.
 ///
 /// The positions that repeat are read as runs. A run of consecutive repeats,
 /// together with the `period` tokens before it, is one stretch of the arm: a
-/// phrase and the place where the arm said it before. When `reference` holds
-/// that whole stretch, token for token, the run is not counted. The verifier
-/// wrote that repeat on its own.
+/// phrase and the place where the arm said it before. The run is not counted
+/// when `reference` holds that whole stretch, token for token, **from the tail
+/// cut the stretch starts in**: a stretch that starts in the last quarter of
+/// the arm is looked for in the last quarter of `reference`, and one that
+/// starts in the first quarter is looked for in all of it. The verifier wrote
+/// that repeat on its own, at that depth of the answer.
 ///
-/// **A run is excused whole or not at all.** A loop is one long run, and no
-/// healthy reference holds it, so a loop loses nothing. A run that goes one
-/// token past what the reference wrote is counted in full.
+/// **A run is excused whole or not at all.** A loop is one long run, and it
+/// loses nothing unless the reference arm wrote the same loop in the same tail
+/// cut. A run that goes one token past what the reference wrote is counted in
+/// full.
+///
+/// The position bound is what keeps a loop the reference arm holds early from
+/// excusing the same loop at the tail. Over the whole reference arm such a loop
+/// is diluted under the ceiling, so the reference arm is judgeable; in the last
+/// quarter it is not there.
 ///
 /// An empty `reference` excuses nothing, and that is the raw reading.
-fn repeats_beyond(tokens: &[u32], period: usize, reference: &[u32]) -> usize {
+fn repeats_beyond(tokens: &[u32], from: usize, period: usize, reference: &[u32]) -> usize {
     let repeats = |i: usize| tokens[i] == tokens[i - period];
     let mut count = 0;
-    let mut at = period;
+    let mut at = from + period;
     while at < tokens.len() {
         if !repeats(at) {
             at += 1;
@@ -457,7 +477,11 @@ fn repeats_beyond(tokens: &[u32], period: usize, reference: &[u32]) -> usize {
             end += 1;
         }
         let stretch = &tokens[at - period..=end];
-        if !reference.windows(stretch.len()).any(|w| w == stretch) {
+        let cut = reference.len() * tail_cut(tokens.len(), at - period) / TAIL_WINDOWS;
+        if !reference[cut..]
+            .windows(stretch.len())
+            .any(|w| w == stretch)
+        {
             count += end - at + 1;
         }
         at = end + 1;
@@ -465,26 +489,28 @@ fn repeats_beyond(tokens: &[u32], period: usize, reference: &[u32]) -> usize {
     count
 }
 
-/// The strongest short cycle in `tokens`, read with [`repeats_beyond`].
+/// The strongest short cycle in `tokens` from `from` on, read with
+/// [`repeats_beyond`].
 ///
 /// A stream stuck in a loop matches itself at the loop's period, and two arms in
 /// the same loop agree perfectly — so the equivalence oracle says nothing
 /// exactly when this is high. It covers every period up to [`MAX_CYCLE_PERIOD`],
 /// because a collapse that starts at token 20 and a two-token `A B A B` cycle are
 /// both degeneracies a leading-run measure scores at zero.
-fn strongest_cycle_beyond(tokens: &[u32], reference: &[u32]) -> Cycle {
+fn strongest_cycle_beyond(tokens: &[u32], from: usize, reference: &[u32]) -> Cycle {
+    let window = tokens.len() - from;
     let mut worst = Cycle {
-        start: 0,
+        start: from,
         period: 1,
         matches: 0,
         samples: 0,
     };
-    for period in 1..=MAX_CYCLE_PERIOD.min(tokens.len().saturating_sub(MIN_CYCLE_SAMPLES)) {
+    for period in 1..=MAX_CYCLE_PERIOD.min(window.saturating_sub(MIN_CYCLE_SAMPLES)) {
         let cycle = Cycle {
-            start: 0,
+            start: from,
             period,
-            matches: repeats_beyond(tokens, period, reference),
-            samples: tokens.len() - period,
+            matches: repeats_beyond(tokens, from, period, reference),
+            samples: window - period,
         };
         if cycle.fraction() > worst.fraction() {
             worst = cycle;
@@ -500,21 +526,22 @@ fn strongest_cycle_beyond(tokens: &[u32], reference: &[u32]) -> Cycle {
 /// 0.3992 — under the ceiling, because the healthy majority dilutes it. The
 /// same cuts `weakest_tail` uses give it a window it fills.
 fn strongest_windowed_cycle_beyond(tokens: &[u32], reference: &[u32]) -> Cycle {
-    let starts =
-        std::iter::once(0).chain((1..TAIL_WINDOWS).map(|n| tokens.len() * n / TAIL_WINDOWS));
-    let mut worst = strongest_cycle_beyond(&[], reference);
-    for start in starts {
-        let cycle = strongest_cycle_beyond(&tokens[start..], reference);
+    let mut worst = strongest_cycle_beyond(tokens, tokens.len(), reference);
+    for start in (0..TAIL_WINDOWS).map(|n| tokens.len() * n / TAIL_WINDOWS) {
+        let cycle = strongest_cycle_beyond(tokens, start, reference);
         if cycle.fraction() > worst.fraction() {
-            worst = Cycle { start, ..cycle };
+            worst = cycle;
         }
     }
-    worst
+    Cycle {
+        start: if worst.samples == 0 { 0 } else { worst.start },
+        ..worst
+    }
 }
 
 /// The raw reading of one window: every repeat counts.
 fn strongest_cycle(tokens: &[u32]) -> Cycle {
-    strongest_cycle_beyond(tokens, &[])
+    strongest_cycle_beyond(tokens, 0, &[])
 }
 
 /// The raw reading of an arm: every repeat counts.
@@ -1124,7 +1151,8 @@ const MEASURED_PLAIN_ARM: [u32; 256] = [
 /// These are two measured arms of a correct engine. The speculative arm reads
 /// 9 of 39 at period 25 in its last window, above the ceiling. Five of the nine
 /// are one phrase, and the reference arm holds that phrase and the 25 tokens
-/// before it, token for token. Without them the arm reads 4 of 39.
+/// before it, token for token, in its last quarter too. Without them the arm
+/// reads 4 of 39.
 ///
 /// The margins are empty on purpose: the repetition control is the only oracle
 /// in play, and the length guards after it. The first divergence of this pair
@@ -1287,17 +1315,94 @@ fn a_repeat_is_excused_only_when_the_reference_holds_the_whole_stretch() {
             "the tokens of the stretch in another order",
         ),
     ] {
-        assert_eq!(repeats_beyond(&arm, 4, reference), counted, "{what}");
+        assert_eq!(repeats_beyond(&arm, 0, 4, reference), counted, "{what}");
     }
 
     // Two runs are read apart: the reference holds the stretch of the first and
     // not of the second.
     let two_runs = [10, 11, 12, 13, 10, 11, 20, 21, 30, 11, 20, 21];
     assert_eq!(
-        repeats_beyond(&two_runs, 4, &[10, 11, 12, 13, 10, 11]),
+        repeats_beyond(&two_runs, 0, 4, &[10, 11, 12, 13, 10, 11]),
         3,
         "positions 9 to 11 repeat 5 to 7, and the reference does not hold that stretch"
     );
+}
+
+/// Where the reference arm must hold the stretch: in the tail cut the stretch
+/// starts in, read from both sides of the cut.
+#[test]
+fn a_repeat_is_excused_only_by_the_same_tail_cut_of_the_reference() {
+    const LEN: usize = 32;
+    const STRETCH: [u32; 6] = [10, 11, 12, 13, 10, 11];
+    let filler = |from: u32| -> Vec<u32> { (0..LEN as u32).map(|i| from + i).collect() };
+    let holding = |mut arm: Vec<u32>, at: usize| -> Vec<u32> {
+        arm[at..at + STRETCH.len()].copy_from_slice(&STRETCH);
+        arm
+    };
+    let last_cut = LEN - LEN / TAIL_WINDOWS;
+    assert_eq!(tail_cut(LEN, last_cut), 3);
+    assert_eq!(tail_cut(LEN, last_cut - 1), 2);
+    assert_eq!(tail_cut(LEN, LEN - 1), 3);
+    assert_eq!(tail_cut(LEN, 0), 0);
+
+    // The stretch starts where the last cut starts.
+    let late = holding(filler(100), last_cut);
+    for (at, counted, what) in [
+        (
+            last_cut,
+            0,
+            "the last cut of the reference holds the stretch",
+        ),
+        (last_cut + 2, 0, "anywhere in that cut"),
+        (
+            last_cut - 1,
+            2,
+            "the stretch starts one token before the cut",
+        ),
+        (
+            0,
+            2,
+            "the first cut of the reference holds it, and the last does not",
+        ),
+    ] {
+        let reference = holding(filler(500), at);
+        assert_eq!(repeats_beyond(&late, 0, 4, &reference), counted, "{what}");
+    }
+
+    // A stretch one token earlier starts in the cut before, and that cut of the
+    // reference reaches to its end.
+    let earlier = holding(filler(100), last_cut - 1);
+    for (at, counted, what) in [
+        (
+            last_cut + 2,
+            0,
+            "a later place in the reference is in the same cut",
+        ),
+        (LEN / 2, 0, "the start of that cut"),
+        (LEN / 2 - 1, 2, "one token before that cut"),
+    ] {
+        let reference = holding(filler(500), at);
+        assert_eq!(
+            repeats_beyond(&earlier, 0, 4, &reference),
+            counted,
+            "{what}"
+        );
+    }
+
+    // The cut is a fraction of each arm's own length. The last cut of a
+    // 64-token reference starts at token 48, not at token 24.
+    let long_filler: Vec<u32> = (0..2 * LEN as u32).map(|i| 500 + i).collect();
+    for (at, counted, what) in [
+        (50, 0, "in the last cut of the longer reference"),
+        (
+            30,
+            2,
+            "past token 24 of the longer reference and before its last cut",
+        ),
+    ] {
+        let reference = holding(long_filler.clone(), at);
+        assert_eq!(repeats_beyond(&late, 0, 4, &reference), counted, "{what}");
+    }
 }
 
 /// `base` with its last `len` tokens replaced by an exact loop, at `period`, of
@@ -1560,11 +1665,11 @@ fn an_exact_loop_at_the_end_of_the_measured_arm_is_refused_past_a_pinned_length(
             // so the verdict is the one a fixed ceiling gives on the raw
             // reading of the last window at the loop's own period.
             if period != 25 {
-                let window = &spec[N_TOKENS - N_TOKENS / TAIL_WINDOWS..];
-                let raw = repeats_beyond(window, period, &[]);
+                let window = N_TOKENS / TAIL_WINDOWS;
+                let raw = repeats_beyond(&spec, N_TOKENS - window, period, &[]);
                 assert_eq!(
                     refused,
-                    raw as f64 / (window.len() - period) as f64 > MAX_CYCLE_FRACTION,
+                    raw as f64 / (window - period) as f64 > MAX_CYCLE_FRACTION,
                     "period {period}, {len} tokens: {raw} raw repeats"
                 );
             }
