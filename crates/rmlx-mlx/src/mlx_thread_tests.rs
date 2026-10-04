@@ -473,6 +473,7 @@ fn every_stream_comes_from_the_mlx_thread() {
         "mlx_default_cpu_stream_new",
         "mlx_default_gpu_stream_new",
         "mlx_set_default_stream",
+        "mlx_synchronize",
     ] {
         assert!(
             inside.iter().any(|found| found == name),

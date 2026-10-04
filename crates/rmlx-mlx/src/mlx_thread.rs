@@ -279,6 +279,33 @@ fn set_thread_defaults() -> Result<()> {
     Ok(())
 }
 
+/// Wait until the GPU has run every command buffer of the MLX thread's GPU
+/// stream and Metal has called their completion handlers.
+///
+/// An evaluation returns when its outputs are written. MLX frees the
+/// temporaries of a command buffer in the completion handler of that buffer,
+/// which Metal can call after the evaluation returned. Until then
+/// [`crate::mlx_active_memory_bytes`] still counts them. After this call it
+/// does not: a memory measurement calls this before each reading.
+///
+/// # Errors
+/// An error when the MLX thread cannot start, when MLX gives no GPU stream, or
+/// when a command buffer of the stream failed.
+pub fn synchronize_gpu() -> Result<()> {
+    crate::install_error_handler();
+    let stream = Stream(mlx_stream(Device::Gpu)?);
+    let status = crate::with_eval_lock(move || {
+        // The whole `Stream` moves into the job: its field alone is not `Send`.
+        let stream = stream;
+        // SAFETY: the handle is valid for the life of the process, and the job
+        // runs on the MLX thread, which owns the encoder behind it.
+        unsafe { sys::mlx_synchronize(stream.0) }
+    })?;
+    // SAFETY: `with_eval_lock` moved the error message of the call to this
+    // thread's error slot, and no mlx-c call ran since.
+    unsafe { check_status(status, "mlx_synchronize") }
+}
+
 fn metal_available() -> bool {
     let mut available = false;
     // SAFETY: the out-pointer is a stack `bool` we own.

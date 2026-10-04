@@ -239,6 +239,7 @@ pub fn nax_capability() -> &'static str {
     nax::loaded_nax_capability()
 }
 
+pub use mlx_thread::synchronize_gpu;
 pub use pin::{pin_check, PinCheck, PinEnforcement, PinRefusal};
 
 /// Read the MLX version of the dylib actually loaded into this process.
