@@ -200,7 +200,12 @@ fn fused_qk_dispatch_routes_through_kernel_turbo_sym3() {
     if skip_if_no_gpu() {
         return;
     }
-    run_parity_for_codec(KvQuant::TurboSym3, "TurboSym3", 0.95);
+    run_parity_for_codec(
+        "fused_qk_dispatch_routes_through_kernel_turbo_sym3",
+        KvQuant::TurboSym3,
+        "TurboSym3",
+        0.95,
+    );
 }
 
 /// Same shape as the K8V4 test but with TurboSym4 (4-bit K codec).
@@ -210,10 +215,17 @@ fn fused_qk_dispatch_routes_through_kernel_turbo_sym4() {
     if skip_if_no_gpu() {
         return;
     }
-    run_parity_for_codec(KvQuant::TurboSym4, "TurboSym4", 0.99);
+    run_parity_for_codec(
+        "fused_qk_dispatch_routes_through_kernel_turbo_sym4",
+        KvQuant::TurboSym4,
+        "TurboSym4",
+        0.99,
+    );
 }
 
-fn run_parity_for_codec(codec: KvQuant, name: &str, cosine_floor: f32) {
+/// `test` is the calling test fn. A helper cannot name itself in a stand-down
+/// notice: no libtest filter reaches it.
+fn run_parity_for_codec(test: &str, codec: KvQuant, name: &str, cosine_floor: f32) {
     let device = Device::Gpu;
     let b: i32 = 1;
     let kv_h: i32 = 2;
@@ -270,7 +282,7 @@ fn run_parity_for_codec(codec: KvQuant, name: &str, cosine_floor: f32) {
             // Codec storage may not support `update` for the K-only or
             // weight-K-bf16-V split; record the dispatch counter behaviour
             // and skip the cosine assertion in that case.
-            eprintln!("{name}:update_and_sdpa errored: {e} (skipping parity, dispatch counter stays before)");
+            eprintln!("SKIP {test}: {name} update_and_sdpa errored: {e}");
             assert_eq!(
                 after, before,
                 "{name}: failed call must not increment counter"
@@ -291,7 +303,7 @@ fn run_parity_for_codec(codec: KvQuant, name: &str, cosine_floor: f32) {
         // fused-QK). Document as HOLD-soft. Under RMLX_FUSED_QK_STRICT=1
         // this is a hard fail — used by the CI gate to catch silent
         // regressions where a codec stops routing.
-        eprintln!("{name}:HOLD-soft — dispatch counter did not increment; cosine check skipped");
+        eprintln!("SKIP {test}: {name} HOLD-soft, the dispatch counter did not increment");
         assert!(
             !strict,
             "{name}:RMLX_FUSED_QK_STRICT=1 — dispatch counter did not increment; \

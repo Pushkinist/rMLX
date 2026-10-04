@@ -252,13 +252,27 @@ tests:
   `return None;`, `return Ok(());`) must print a notice. `RMLX_SKIP_GPU` guards
   are exempt. The variable can be read on one line and the block opened on a
   later one;
-- in a classified test, a block that prints a line and returns with no value
-  must hold a notice. A test that prints `<test>: skipping: <why>` and returns
-  has stood down in a form the runner does not harvest, so libtest prints `ok`
-  and the run counts the cell as passed. The notice has one form, and the gate
-  refuses a block that announces in another. It does not read what guards the
-  block. A block that returns and prints nothing is not read: that is a test
-  that returns after a helper announced the stand-down.
+- in every fn of those files, a block that prints a line and returns with no
+  value must hold a notice. A test that prints `<test>: skipping: <why>` and
+  returns has stood down in a form the runner does not harvest, so libtest
+  prints `ok` and the run counts the cell as passed. The notice has one form,
+  and the gate refuses a block that announces in another. It does not read
+  what guards the block. A print is `println!`, `eprintln!`, `print!` or
+  `eprint!`; a return with no value is one of the four forms above. A helper
+  that serves several tests is read too: it takes the caller's name and prints
+  `SKIP {test}:`.
+
+The third rule cannot read these forms, and review holds them:
+
+- a block that returns and prints nothing, which is also the shape of a test
+  that returns after a helper announced the stand-down;
+- a line written through `tracing` or through another macro that prints;
+- a print with no return after it: a test that falls through to its end, or
+  that takes the `else` body;
+- a print in an outer block with the return in an inner one;
+- a block after a nested `fn` item, because the scan starts its depth again
+  at every `fn`;
+- a print and a return at the top level of a fn body.
 
 The notice's shape lives in `scripts/lib/skip_notice_patterns.sh`, which the
 gate and the runner both read. `make check-named-skip-notices-fixtures` is the
@@ -435,7 +449,8 @@ once more with no `MTL_*` or `METAL_*` variable:
   that reason, read per run: a failing test that one run names does not vouch
   for another run that died.
 - A test that failed in the uninstrumented run alone is listed with
-  `(passed with shader validation on)`.
+  `(passed with shader validation on)`, or with
+  `(stood down with shader validation on)` when the scan did not run it.
 - A build under the Metal claim in either kind of run is a failure.
 - The uninstrumented run has the same coverage check as each instrumented run.
 

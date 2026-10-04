@@ -75,9 +75,19 @@
 #   refuses a block that announces in any other. Whatever guards the block —
 #   a variable, a missing file, a counter that did not move — is not read.
 #
-#   Its population is the classified test fns. A block that returns and prints
-#   nothing is not read by this rule: a test that returns after a helper
-#   announced the stand-down by the test's name is that shape.
+#   Its population is every fn of the declaring files, as for the guard rule:
+#   a helper that serves several tests stands each of them down. A return with
+#   no value is the guard rule's: `return;`, a bare `return`, `return None;`
+#   and `return Ok(());`. A print is `println!`, `eprintln!`, `print!` or
+#   `eprint!`.
+#
+#   WHAT THIS RULE CANNOT READ. A block that returns and prints nothing: a
+#   test that returns after a helper announced the stand-down by the test's
+#   name is that shape. A line written through `tracing` or another macro. A
+#   print with no return after it: a test that falls through to its end, or
+#   that takes the `else` body. A print in an outer block with the return in
+#   an inner one. A block after a nested `fn` item, because the scan restarts
+#   its depth at every `fn`. A block at the top level of a fn body.
 #
 #   The notice's SHAPE is not defined here. `scripts/lib/skip_notice_patterns.sh`
 #   holds it, and `scripts/run_gpu_tests.sh` reads the same file — a source gate
@@ -264,8 +274,7 @@ while IFS=$'\t' read -r o_file o_line o_fn o_text; do
     n_other=$((n_other + 1))
 done <<< "$(printf '%s\n' "${gpu_files}" | while IFS= read -r f; do
     [ -n "${f}" ] || continue
-    fns="$(printf '%s\n' "${classification}" | awk -F'\t' -v f="${f}" '$3 == f { printf " %s", $2 } END { printf " " }')"
-    awk -v FILE="${f}" -v FNS="${fns}" -v ANY="${ANY_SKIP}" "${AWK_TEXT_FNS}"'
+    awk -v FILE="${f}" -v ANY="${ANY_SKIP}" "${AWK_TEXT_FNS}"'
         {
             raw = $0
             code = blank_strings(decomment(raw))
@@ -282,13 +291,13 @@ done <<< "$(printf '%s\n' "${gpu_files}" | while IFS= read -r f; do
                 if (ch == "{") { sp++; printed[sp] = ""; noticed[sp] = 0 }
                 else if (ch == "}" && sp > 0) sp--
             }
-            if (sp < 2 || index(FNS, " " cur " ") == 0) next
-            if (code ~ /(^|[^A-Za-z0-9_])e?println!/) {
+            if (sp < 2) next
+            if (code ~ /(^|[^A-Za-z0-9_])e?print(ln)?!/) {
                 printed[sp] = raw
                 sub(/^[[:space:]]+/, "", printed[sp])
             }
             if (raw ~ /"/ && raw ~ ANY) noticed[sp] = 1
-            if (code ~ /(^|[^A-Za-z0-9_])return[[:space:]]*;/ && printed[sp] != "" && !noticed[sp])
+            if (code ~ /(^|[^A-Za-z0-9_])return([[:space:]]*(;|$)|[[:space:]]+(None|Ok\(\(\)\))[[:space:]]*;)/ && printed[sp] != "" && !noticed[sp])
                 printf "%s\t%d\t%s\t%s\n", FILE, NR, cur, printed[sp]
         }
     ' "${f}"
@@ -300,14 +309,15 @@ done)"
 red=0
 
 if [ "${n_other}" -gt 0 ]; then
-    echo "ERROR: ${n_other} block(s) in classified GPU tests announce a stand-down in a form" >&2
+    echo "ERROR: ${n_other} block(s) in classified GPU tests' files announce a stand-down in a form" >&2
     echo "       the runner does not harvest:" >&2
     printf '%s' "${other}" >&2
     echo >&2
-    echo "A test that prints and returns with no value did not run to its end. libtest" >&2
+    echo "A fn that prints and returns with no value did not run to its end. libtest" >&2
     echo "reports it as \`ok\`, and scripts/run_gpu_tests.sh lists it only when the line" >&2
     echo "it printed is" >&2
     echo "  SKIP <this test fn>: <why>" >&2
+    echo "A helper takes the caller's test name and prints \`SKIP {test}: <why>\`." >&2
     echo "See docs/GPU_TESTS.md." >&2
     echo >&2
     red=1

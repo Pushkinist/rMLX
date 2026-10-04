@@ -638,14 +638,14 @@ RS
 run_case
 expect_status 0
 
-# The population is the classified tests. A helper, or a test the classifier
-# does not name, is not read.
-new_case a_printed_return_outside_a_classified_test_is_dropped
+# The population is every fn of a file that declares a classified test. A
+# helper that serves several tests stands each of them down.
+new_case a_printed_return_in_a_helper_fails
 classify rmlx-kv-quant tests/alpha.rs gpu_alpha
 source_file rmlx-kv-quant tests/alpha.rs <<'RS'
-fn helper() {
+fn parity(name: &str) {
     if nothing() {
-        eprintln!("nothing to do, skipping");
+        eprintln!("{name}: HOLD-soft, the counter did not move; check skipped");
         return;
     }
 }
@@ -653,9 +653,44 @@ fn helper() {
 #[test]
 #[ignore = "GPU Metal"]
 fn gpu_alpha() {
-    helper();
+    parity("alpha");
+}
+RS
+run_case
+expect_status 1
+expect_out "tests/alpha.rs:4 — parity prints and returns with no value, and the block holds no stand-down notice"
+
+# The same helper with the caller's name in the notice passes.
+new_case a_helper_that_names_its_caller_passes
+classify rmlx-kv-quant tests/alpha.rs gpu_alpha
+source_file rmlx-kv-quant tests/alpha.rs <<'RS'
+fn parity(test: &str, name: &str) {
+    if nothing() {
+        eprintln!("SKIP {test}: {name} HOLD-soft, the counter did not move");
+        return;
+    }
 }
 
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    parity("gpu_alpha", "alpha");
+}
+RS
+run_case
+expect_status 0
+
+# A file that declares no classified test is not read.
+new_case a_printed_return_in_a_file_with_no_classified_test_is_dropped
+classify rmlx-kv-quant tests/alpha.rs gpu_alpha
+source_file rmlx-kv-quant tests/alpha.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    work();
+}
+RS
+source_file rmlx-kv-quant tests/beta.rs <<'RS'
 #[test]
 fn cpu_beta() {
     if nothing() {
@@ -666,6 +701,164 @@ fn cpu_beta() {
 RS
 run_case
 expect_status 0
+
+# Every print macro of the standard library is read, not `eprintln!` alone.
+for print_macro in 'println!' 'print!' 'eprint!'; do
+    new_case "a_stand_down_printed_with_${print_macro%!}_fails"
+    classify rmlx-kv-quant tests/alpha.rs gpu_alpha
+    source_file rmlx-kv-quant tests/alpha.rs <<RS
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    if nothing() {
+        ${print_macro}("gpu_alpha: skipping, the dispatch did not fire");
+        return;
+    }
+}
+RS
+    run_case
+    expect_status 1
+    expect_out "tests/alpha.rs:6 — gpu_alpha prints and returns with no value, and the block holds no stand-down notice"
+done
+
+# Every return with no value is read, as in the guard rule.
+new_case a_stand_down_that_returns_ok_fails
+classify rmlx-kv-quant tests/alpha.rs gpu_alpha
+source_file rmlx-kv-quant tests/alpha.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() -> anyhow::Result<()> {
+    if nothing() {
+        eprintln!("gpu_alpha: the dispatch did not fire, skipping");
+        return Ok(());
+    }
+    Ok(())
+}
+RS
+run_case
+expect_status 1
+expect_out "tests/alpha.rs:6 — gpu_alpha prints and returns with no value, and the block holds no stand-down notice"
+
+# A return that carries a value is a result, not a stand-down.
+new_case a_printed_return_with_a_value_is_not_a_stand_down
+classify rmlx-kv-quant tests/alpha.rs gpu_alpha
+source_file rmlx-kv-quant tests/alpha.rs <<'RS'
+fn width() -> usize {
+    if narrow() {
+        eprintln!("narrow terminal");
+        return 80;
+    }
+    120
+}
+
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    let _ = width();
+}
+RS
+run_case
+expect_status 0
+
+# A notice excuses the block it is in and no other. Here the first block
+# announces in the one form and a later block of the same fn does not: a suite
+# converted by half.
+new_case a_notice_in_an_earlier_block_does_not_excuse_a_later_one
+classify rmlx-kv-quant tests/alpha.rs gpu_alpha
+source_file rmlx-kv-quant tests/alpha.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    if no_model() {
+        eprintln!("SKIP gpu_alpha: no snapshot");
+        return;
+    }
+    if no_dispatch() {
+        eprintln!("gpu_alpha: the dispatch did not fire, skipping");
+        return;
+    }
+}
+RS
+run_case
+expect_status 1
+expect_out "tests/alpha.rs:10 — gpu_alpha prints and returns with no value, and the block holds no stand-down notice"
+expect_no_out "tests/alpha.rs:6"
+
+# A print belongs to the block it is in. A block that prints and goes on does
+# not make a later block's silent return an announcement.
+new_case a_print_in_an_earlier_block_does_not_convict_a_later_one
+classify rmlx-kv-quant tests/alpha.rs gpu_alpha
+source_file rmlx-kv-quant tests/alpha.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    if verbose() {
+        eprintln!("gpu_alpha: starting");
+    }
+    let Some(loaded) = load("gpu_alpha") else {
+        return;
+    };
+    let _ = loaded;
+}
+RS
+run_case
+expect_status 0
+
+# The depth of the scan starts again at every fn. Here the first fn leaves the
+# scan one block deep: neither text reader knows a character literal.
+new_case the_block_depth_starts_again_at_every_fn
+classify rmlx-kv-quant tests/alpha.rs gpu_alpha
+source_file rmlx-kv-quant tests/alpha.rs <<'RS'
+fn opener() -> char {
+    '{'
+}
+
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    eprintln!("gpu_alpha: done");
+    return;
+}
+RS
+run_case
+expect_status 0
+
+# The report names the line of the return.
+new_case the_other_form_is_reported_at_the_return
+classify rmlx-kv-quant tests/alpha.rs gpu_alpha
+source_file rmlx-kv-quant tests/alpha.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    if nothing() {
+        eprintln!("gpu_alpha: skipping");
+        let _ = cleanup();
+        return;
+    }
+}
+RS
+run_case
+expect_status 1
+expect_out "tests/alpha.rs:7 — gpu_alpha prints"
+
+# A pending environment read opens its guard at the next block, whatever opens
+# that block: an `if` whose condition runs over two lines has no `else`.
+new_case silent_multi_line_if_guard_is_seen
+classify rmlx-models src/alpha_tests.rs gpu_alpha
+source_file rmlx-models src/alpha_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    if std::env::var("RMLX_TEST_MODEL_ALPHA")
+        .is_err()
+    {
+        return;
+    }
+}
+RS
+run_case
+expect_status 1
+expect_out "src/alpha_tests.rs:4 — gpu_alpha returns from an environment guard with no stand-down notice"
 
 if [ "${failures}" -gt 0 ]; then
     echo "check_named_skip_notices_fixtures: ${failures} case(s) failed" >&2

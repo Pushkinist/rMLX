@@ -145,6 +145,17 @@
 # tree armed each of them and reported no diagnostic, so they pin nothing.
 # `RMLX_KV_TEST_MODEL` was not set in the complete run on purpose: it outranks
 # the slug of every golden-rule cell of its architecture (docs/TESTING.md).
+#
+# NOT YET SHOWN. No run has printed `census matches the pin` against this file
+# for the whole suite, or for `rmlx-models` whole. The derivation run read the
+# hits; it was not compared with these entries. Delete this paragraph when a
+# whole run matches.
+#
+# The stand-down list above predates the notice-form change. The runner of the
+# derivation run could not read a stand-down that a test announced in another
+# form than `SKIP <test>: <why>`, and counted that test as passed. The tests
+# that announced in another form now use that form, so a whole run can list
+# more stand-downs than the seventeen above.
 implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s | device load | 4 | rmlx-mlx | implicit_gemm_conv_tail_channel_reads_never_reach_the_output | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
 implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s | device load | 3 | rmlx-audio | codec_decoder_debug | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
 implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s | device load | 6 | rmlx-server | tts_first_synthesis_runs_on_a_thread_that_did_not_load_it | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
