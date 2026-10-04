@@ -154,9 +154,10 @@ fn f32_bits(a: &Array) -> Vec<u32> {
 /// same under the GPU runner's instrumented pass. The rule is on the query
 /// rows alone and pads these calls.
 ///
-/// The bound is bit equality. MLX compiles the kernel for "query rows a
-/// multiple of 64" or not; the two differ in how the last partial block of
-/// query rows is loaded, and not in the arithmetic of a row.
+/// The bound is bit equality, and it is the measured result on these two
+/// shapes. MLX compiles the kernel for "query rows a multiple of 64" or not.
+/// That the two differ only in how the last partial block of query rows is
+/// loaded is a reading of the kernel, not checked in its source.
 #[test]
 #[ignore = "evaluates attention on the Metal GPU"]
 fn a_padded_call_returns_the_rows_of_the_unpadded_node() {

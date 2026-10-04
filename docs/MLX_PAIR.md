@@ -291,8 +291,7 @@ least 1024 query rows, on its head-dim-split kernel. The kernel is compiled per
 call for "query rows a multiple of 64" and "key rows a multiple of 32". With
 both false it returns `+inf` rows under Metal device-memory shader validation.
 The cause is the instrumented compile of that kernel; no run without the
-instrument has shown the fault, and mlx 0.31.2 and 0.32.1 do not have that
-kernel.
+instrument has shown the fault, and mlx 0.31.2 and 0.32.1 do not show it.
 
 `sdpa_under` in `crates/rmlx-mlx/src/fast_ops.rs` keeps every call away from
 it: it pads the query rows of such a call to the next multiple of 64
@@ -301,8 +300,9 @@ alone: a call with aligned key rows was measured clean, and a clean cell is
 only a bound on a rate. It has no `cfg` and runs on both mlx-c C API arms,
 because the C API a binary is built against is not the MLX it runs on. Query
 rows are independent in attention, so each real row is the row the caller
-asked for. `crates/rmlx-models/tests/prefill_attention_configuration.rs` and
-`crates/rmlx-mlx/tests/attention_check_allocations.rs` hold the rule.
+asked for. `crates/rmlx-models/tests/prefill_attention_configuration.rs`,
+`crates/rmlx-mlx/tests/attention_check_allocations.rs` and the padded-against-
+unpadded cell in `crates/rmlx-mlx/src/fast_ops_tests.rs` hold the rule.
 
 ## Moving the pin
 
@@ -319,8 +319,10 @@ asked for. `crates/rmlx-models/tests/prefill_attention_configuration.rs` and
    (`docs/GPU_TESTS.md`).
 5. Measure the cells of `MEASURED_CELLS`
    (`crates/rmlx-models/tests/prefill_attention_configuration.rs`) in pure MLX
-   on the new pair, under device-memory shader validation. If no cell returns
-   a non-finite value, delete the query-row rule in `sdpa_under`
-   ([above](#the-attention-row-rule)) and its tests. If the
+   on the new pair, under device-memory shader validation. The probe is not
+   in the tree, and with the rule in place no public call builds the unpadded
+   node: only `attention_node` in `crates/rmlx-mlx/src/fast_ops.rs` does. If
+   no cell returns a non-finite value, delete the query-row rule in
+   `sdpa_under` ([above](#the-attention-row-rule)) and its tests. If the
    faulty shapes changed, change the rule and the table together.
 6. Re-run a prefill cell and compare its prefill rate with the old pair's.

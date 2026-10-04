@@ -65,7 +65,7 @@ areas before touching code:
 | [`docs/SPEC_ROUND_SKELETON.md`](docs/SPEC_ROUND_SKELETON.md) | The speculative round loop `run_rounds` and the `RoundDrafter` interface: what each drafter declares, what differs per drafter, the two two-model entries kept apart, the oracle, what no runtime check sees |
 | [`docs/SAMPLING.md`](docs/SAMPLING.md) | Per-token sampling (temperature, top-k/p, penalties, thinking budget, constrained decoding) |
 | [`docs/FFI.md`](docs/FFI.md) | rmlx-mlx ↔ mlx-c FFI bridge; MSL kernel surface; unsafe policy |
-| [`docs/MLX_PAIR.md`](docs/MLX_PAIR.md) | The pinned MLX / mlx-c pair: what to do on each Mac, the source build, `make mlx-restore-pin`, the pin gate and its verdicts, the two mlx-c C APIs, moving the pin |
+| [`docs/MLX_PAIR.md`](docs/MLX_PAIR.md) | The pinned MLX / mlx-c pair: what to do on each Mac, the source build, `make mlx-restore-pin`, the pin gate and its verdicts, the two mlx-c C APIs, the attention row rule, moving the pin |
 | [`docs/METRICS_DB.md`](docs/METRICS_DB.md) | Metrics DB: path, identity rules, ingest, `rmlx metrics` tooling, operating rules |
 | [`docs/METRICS_SCHEMA.md`](docs/METRICS_SCHEMA.md) | Metrics DB schema: tables (observations, events, prompts, the bests view), metric registry, plausible-value bounds, known-bad rows |
 | [`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md) | The three canary anchors and the bench methods: A/B comparison, per-codec cells, the bandwidth ceiling, cross-backend cells |

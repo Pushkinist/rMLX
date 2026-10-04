@@ -444,7 +444,7 @@ const HEAD_DIM_AXIS: usize = 3;
 /// the mlx-c C API a binary is built against is not the MLX version it runs
 /// on, and the padding changes no real row on an MLX without the fault.
 ///
-/// A call under the row floor returns after two dim reads, with no
+/// A call under the row floor returns after one dim read, with no
 /// allocation: a decode step has one query row.
 fn padded_query_rows(q: &Array, v: &Array, mask_mode: &str, device: Device) -> Option<(i32, i32)> {
     const HEAD_DIM: i32 = 256;
