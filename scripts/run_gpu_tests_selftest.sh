@@ -1437,6 +1437,110 @@ expect_status 1
 expect_report "  rmlx-kv-quant: kv::kv_gpu_beta failed with shader validation on and stood down without it"
 expect_no_report "kv_gpu_beta failed with shader validation on and passed"
 
+# The stand-down that changes the line is the uninstrumented run's. Here the
+# test printed a notice for one cell in the scan and then failed there, and it
+# passed without the instrument.
+new_case a_stand_down_notice_in_the_scan_does_not_change_the_instrument_line || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+printf 'Metal GPU Validation Enabled\n%s\n' "${VERDICT_BETA_RED}" \
+    | sed 's/^test kv::kv_gpu_beta ... FAILED$/test kv::kv_gpu_beta ... SKIP kv_gpu_beta: one cell has no snapshot\
+FAILED/' | crate_log "${CASE_ROOT}" rmlx-kv-quant 101
+printf '%s\n' "${VERDICT_GREEN}" | crate_log "${CASE_ROOT}" rmlx-kv-quant.tgunset 0
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "  rmlx-kv-quant: kv::kv_gpu_beta failed with shader validation on and passed without it"
+expect_no_report "and stood down without it"
+
+# The name is matched whole. Here another test, whose name holds the failing
+# test's name, stood down in the uninstrumented run.
+new_case a_stand_down_of_a_longer_name_does_not_change_the_instrument_line || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_beta a_kv_gpu_beta
+crate_log "${CASE_ROOT}" rmlx-kv-quant 101 <<'LOG'
+Metal GPU Validation Enabled
+running 2 tests
+test kv::a_kv_gpu_beta ... ok
+test kv::kv_gpu_beta ... FAILED
+
+failures:
+
+---- kv::kv_gpu_beta stdout ----
+thread kv::kv_gpu_beta panicked: prefill logits contain 248320 NaN cells
+
+failures:
+    kv::kv_gpu_beta
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+crate_log "${CASE_ROOT}" rmlx-kv-quant.tgunset 0 <<'LOG'
+running 2 tests
+test kv::a_kv_gpu_beta ... SKIP a_kv_gpu_beta: no snapshot on this machine
+ok
+test kv::kv_gpu_beta ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "  rmlx-kv-quant: kv::kv_gpu_beta failed with shader validation on and passed without it"
+expect_no_report "and stood down without it"
+
+# The other direction has the same two readings. A test red in the
+# uninstrumented run whose scan stood down did not pass under the instrument.
+new_case a_test_red_without_the_instrument_whose_scan_stood_down_is_named_as_that || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+crate_log "${CASE_ROOT}" rmlx-kv-quant 0 <<'LOG'
+Metal GPU Validation Enabled
+running 2 tests
+test kv::kv_gpu_alpha ... ok
+test kv::kv_gpu_beta ... SKIP kv_gpu_beta: no snapshot on this machine
+ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+printf '%s\n' "${VERDICT_BETA_RED}" | crate_log "${CASE_ROOT}" rmlx-kv-quant.tgunset 101
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "    kv::kv_gpu_beta (stood down with shader validation on)"
+expect_no_report "(passed with shader validation on)"
+
+# The name is matched whole there too.
+new_case a_scan_stand_down_of_a_longer_name_does_not_change_the_marker || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_beta a_kv_gpu_beta
+crate_log "${CASE_ROOT}" rmlx-kv-quant 0 <<'LOG'
+Metal GPU Validation Enabled
+running 2 tests
+test kv::a_kv_gpu_beta ... SKIP a_kv_gpu_beta: no snapshot on this machine
+ok
+test kv::kv_gpu_beta ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+crate_log "${CASE_ROOT}" rmlx-kv-quant.tgunset 101 <<'LOG'
+running 2 tests
+test kv::a_kv_gpu_beta ... SKIP a_kv_gpu_beta: no snapshot on this machine
+ok
+test kv::kv_gpu_beta ... FAILED
+
+failures:
+
+---- kv::kv_gpu_beta stdout ----
+thread kv::kv_gpu_beta panicked: prefill logits contain 248320 NaN cells
+
+failures:
+    kv::kv_gpu_beta
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "    kv::kv_gpu_beta (passed with shader validation on)"
+
+# With no scan there is nothing to say about the instrument.
+new_case a_failing_test_with_no_scan_carries_no_instrument_marker || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+printf '%s\n' "${VERDICT_BETA_RED}" | crate_log "${CASE_ROOT}" rmlx-kv-quant 101
+run_case "${CASE_ROOT}" --no-shader-validation
+expect_status 1
+expect_report "    kv::kv_gpu_beta"
+expect_no_report "shader validation on)"
+
 # The counts on the final line are the uninstrumented run's. Here the scan
 # over-matched and ran three tests, and the uninstrumented run ran two.
 new_case verdict_counts_are_the_uninstrumented_run || exit 1

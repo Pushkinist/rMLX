@@ -977,14 +977,18 @@ for crate in "${crates[@]}"; do
             failed_crates="${failed_crates}  ${crate}:"$'\n'
             # Read loop, not an unquoted expansion: splitting on newlines that
             # way also glob-expands each test name against the cwd. A test that
-            # failed in this run alone says so: the scan ran it green.
+            # failed in this run alone says what the scan did with it: it passed
+            # there, or it stood down and so did not run.
             while IFS= read -r fail_name; do
                 [ -z "${fail_name}" ] && continue
                 only=""
                 if [ "${SHADER_VALIDATION}" = "1" ]; then
                     case $'\n'"${scan_fails}"$'\n' in
                         *$'\n'"${fail_name}"$'\n'*) ;;
-                        *) only=" (passed with shader validation on)" ;;
+                        *) only=" (passed with shader validation on)"
+                           case $'\n'"${crate_stood_down}" in
+                               *$'\n'"${fail_name##*::}"$'\n'*) only=" (stood down with shader validation on)" ;;
+                           esac ;;
                     esac
                 fi
                 failed_crates="${failed_crates}    ${fail_name}${only}"$'\n'
