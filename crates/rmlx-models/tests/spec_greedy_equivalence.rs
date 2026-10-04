@@ -1234,7 +1234,12 @@ fn a_speculative_arm_in_a_ragged_loop_is_refused_against_a_healthy_reference() {
                 let spec = ragged_loop_arm(seed, noise);
                 let mut plain = head.clone();
                 plain.extend(Rng(reference_seed).prose(N_TOKENS / 2));
-                match judge(&spec, &plain, &[], None) {
+                // The verdict is the one a fixed ceiling gives on the raw reading:
+                // the reference arm did not write the loop, so nothing is excused.
+                let raw = strongest_windowed_cycle(&spec).fraction() > MAX_CYCLE_FRACTION;
+                let verdict = judge(&spec, &plain, &[], None);
+                assert_eq!(verdict.refusal().is_some(), raw, "{noise}%, seed {seed:#x}");
+                match verdict {
                     Verdict::Agreed => first_admitted = first_admitted.or(Some(noise)),
                     Verdict::Refused(why) => {
                         assert!(why.contains("repeats at period"), "{noise}%: {why}");
@@ -1275,6 +1280,11 @@ fn a_repeat_is_excused_only_when_the_reference_holds_the_whole_stretch() {
             &[10, 11, 10, 11][..],
             2,
             "the run and its source, without the tokens between",
+        ),
+        (
+            &[11, 10, 13, 12, 11, 10][..],
+            2,
+            "the tokens of the stretch in another order",
         ),
     ] {
         assert_eq!(repeats_beyond(&arm, 4, reference), counted, "{what}");
@@ -1399,6 +1409,133 @@ fn a_loop_the_reference_arm_did_not_write_is_refused_whatever_the_reference_read
     }
 }
 
+/// `prose` with an exact loop of `len` tokens at `period` written at `at`.
+fn prose_with_a_loop(prose: &[u32], at: usize, len: usize, period: usize) -> Vec<u32> {
+    let mut out = prose.to_vec();
+    for i in 0..len {
+        out[at + i] = 2000 + (i % period) as u32;
+    }
+    out
+}
+
+/// A loop the reference arm holds somewhere else does not excuse the same loop
+/// at the tail of the speculative arm.
+///
+/// In the first four arms the reference arm is prose with an exact loop at
+/// token 4. Over the whole reference arm that loop is under the ceiling, so the
+/// reference arm is judgeable. The speculative arm is the reference arm with the
+/// same loop as its tail. In the fifth the reference arm holds the loop at
+/// token 130. The sixth is the measured reference arm restarted from its own
+/// first token after 42 tokens: it reads 45 of 214 at period 42, and three of
+/// those repeats are the reference arm's own, 42 tokens earlier.
+#[test]
+fn a_loop_the_reference_arm_holds_somewhere_else_is_refused() {
+    let prose = Rng(0xC0DE).prose(N_TOKENS);
+    let mut cases: Vec<(String, Vec<u32>, Vec<u32>)> = [(2, 51), (8, 57), (16, 64), (25, 70)]
+        .into_iter()
+        .map(|(period, len)| {
+            let plain = prose_with_a_loop(&prose, 4, len, period);
+            let spec = prose_with_a_loop(&plain, N_TOKENS - len, len, period);
+            (
+                format!("period {period}, a tail of {len} tokens"),
+                spec,
+                plain,
+            )
+        })
+        .collect();
+    cases.push((
+        "period 8, a tail of 24 tokens, the reference arm holds it at token 130".into(),
+        prose_with_a_loop(&prose, N_TOKENS - 24, 24, 8),
+        prose_with_a_loop(&prose, 130, 24, 8),
+    ));
+    let mut restart = MEASURED_PLAIN_ARM[..42].to_vec();
+    restart.extend_from_slice(&MEASURED_PLAIN_ARM[..N_TOKENS - 42]);
+    cases.push((
+        "the measured reference arm restarted after 42 tokens".into(),
+        restart,
+        MEASURED_PLAIN_ARM.to_vec(),
+    ));
+    let mut admitted = Vec::new();
+    for (shape, spec, plain) in cases {
+        assert!(
+            strongest_windowed_cycle(&plain).fraction() <= MAX_CYCLE_FRACTION,
+            "{shape}: the reference arm must be one the control can read"
+        );
+        assert!(
+            strongest_windowed_cycle(&spec).fraction() > MAX_CYCLE_FRACTION,
+            "{shape}: the raw reading must be above the ceiling"
+        );
+        match judge(&spec, &plain, &[], None).refusal() {
+            Some(failure) => assert!(failure.contains("repeats at period"), "{shape}: {failure}"),
+            None => admitted.push(shape),
+        }
+    }
+    assert!(admitted.is_empty(), "not refused: {admitted:#?}");
+}
+
+/// "Token for token", on the measured pair. Two neighbouring tokens of the
+/// stretch change places in the reference arm. The reference arm still holds
+/// every token of the stretch, in the same window, and still reads 5 of 39. It
+/// does not hold the stretch, and the speculative arm is refused.
+#[test]
+fn a_stretch_the_reference_arm_holds_in_another_order_is_not_excused() {
+    let mut plain = MEASURED_PLAIN_ARM;
+    plain.swap(210, 211);
+    assert_eq!(
+        strongest_windowed_cycle(&plain),
+        strongest_windowed_cycle(&MEASURED_PLAIN_ARM),
+        "the reading of the reference arm must not move"
+    );
+    let failure = judge(&MEASURED_SPEC_ARM, &plain, &[], None)
+        .refusal()
+        .expect("the reference arm holds the tokens and not the stretch");
+    assert!(failure.contains("repeats at period 25"), "{failure}");
+}
+
+/// The declared blind spot, with its size.
+///
+/// A loop that the reference arm wrote in the same tail cut is not counted in
+/// the speculative arm. A judgeable reference arm holds at most the ceiling of
+/// such a loop: 19 tokens at period 8 in the last window, which reads 11 of 56.
+/// So the speculative arm can hold that loop and a second one of its own, up to
+/// the ceiling again, and be agreed: 22 of 56 raw, twice the ceiling less one
+/// repeat. One more token of its own and it is refused.
+#[test]
+fn the_control_admits_at_most_the_ceiling_twice_in_one_window() {
+    let prose = Rng(0xC0DE).prose(N_TOKENS);
+    let own_loop = |plain: &[u32], len: usize| -> Vec<u32> {
+        let mut spec = plain.to_vec();
+        for i in 0..len {
+            spec[228 + i] = 3000 + (i % 8) as u32;
+        }
+        spec
+    };
+
+    let plain = prose_with_a_loop(&prose, 200, 19, 8);
+    let at_the_edge = own_loop(&plain, 19);
+    let raw = strongest_windowed_cycle(&at_the_edge);
+    assert_eq!(
+        (raw.start, raw.period, raw.matches, raw.samples),
+        (192, 8, 22, 56),
+        "the raw reading of the arm the control admits"
+    );
+    assert_eq!(judge(&at_the_edge, &plain, &[], None), Verdict::Agreed);
+
+    let failure = judge(&own_loop(&plain, 20), &plain, &[], None)
+        .refusal()
+        .expect("one more token of its own loop is above the ceiling");
+    assert!(failure.contains("repeats at period 8"), "{failure}");
+
+    let longer_reference = prose_with_a_loop(&prose, 200, 20, 8);
+    assert!(
+        matches!(
+            judge(&longer_reference, &longer_reference, &[], None),
+            Verdict::Unjudgeable(_)
+        ),
+        "a reference arm with one more token of the loop is not judgeable"
+    );
+}
+
 /// How long an exact loop at the end of the measured arm can be before the
 /// control refuses it, against the measured reference arm. Both sides of each
 /// limit are held.
@@ -1419,6 +1556,18 @@ fn an_exact_loop_at_the_end_of_the_measured_arm_is_refused_past_a_pinned_length(
                 len > longest_admitted,
                 "period {period}: a loop of {len} tokens, against a limit of {longest_admitted}"
             );
+            // At periods 1 and 8 the reference arm wrote no part of the loop,
+            // so the verdict is the one a fixed ceiling gives on the raw
+            // reading of the last window at the loop's own period.
+            if period != 25 {
+                let window = &spec[N_TOKENS - N_TOKENS / TAIL_WINDOWS..];
+                let raw = repeats_beyond(window, period, &[]);
+                assert_eq!(
+                    refused,
+                    raw as f64 / (window.len() - period) as f64 > MAX_CYCLE_FRACTION,
+                    "period {period}, {len} tokens: {raw} raw repeats"
+                );
+            }
         }
     }
 }
@@ -1469,7 +1618,16 @@ fn a_reference_arm_near_the_ceiling_does_not_move_the_ragged_loop_edge() {
         for noise in (0..=100).step_by(2) {
             for seed in [0x33u64, 0x91, 0xB3, 0xD5] {
                 let spec = ragged_tail_loop(plain, N_TOKENS / 2, &LOOP_PHRASE, seed, noise);
-                match judge(&spec, plain, &[], None) {
+                // The verdict is the one a fixed ceiling gives on the raw reading:
+                // the reference arm did not write the loop, so nothing is excused.
+                let raw = strongest_windowed_cycle(&spec).fraction() > MAX_CYCLE_FRACTION;
+                let verdict = judge(&spec, plain, &[], None);
+                assert_eq!(
+                    verdict.refusal().is_some(),
+                    raw,
+                    "{name}, {noise}%, seed {seed:#x}"
+                );
+                match verdict {
                     Verdict::Agreed => {
                         admitted += 1;
                         first_admitted = first_admitted.or(Some(noise));
@@ -1696,6 +1854,16 @@ fn two_arms_in_the_same_ragged_loop_are_refused_until_they_are_no_longer_one_loo
     for noise in (0..=100).step_by(2) {
         for (sa, sb) in [(0x33u64, 0x44u64), (0x91, 0xA7), (0xB3, 0xC1), (0xD5, 0xE9)] {
             let (a, b) = (ragged_loop_arm(sa, noise), ragged_loop_arm(sb, noise));
+            // As a fixed ceiling on the two raw readings.
+            let raw = strongest_windowed_cycle(&a)
+                .fraction()
+                .max(strongest_windowed_cycle(&b).fraction())
+                > MAX_CYCLE_FRACTION;
+            assert_eq!(
+                judge(&a, &b, &[], None) != Verdict::Agreed,
+                raw,
+                "{noise}%, seeds {sa:#x} and {sb:#x}"
+            );
             if judge(&a, &b, &[], None) != Verdict::Agreed {
                 continue;
             }
