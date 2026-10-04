@@ -482,9 +482,13 @@ fn paged(positions: i32) -> i32 {
 /// **The live count, at every reading.** Since the run opened, the settled
 /// live count grew by what the store grew by, to within
 /// [`RING_COUNT_ALLOWANCE`]. Every buffer sized at `max_seq` is allocated
-/// before the run opens and cancels out. This holds at the open of every step,
-/// so a settle that left a temporary live fails here; it cannot pass as a
-/// smaller headroom of the next step.
+/// before the run opens and cancels out. This holds at the open of every step.
+/// The comparison is with the count at the open of the run, not with an
+/// absolute state. So a leftover that changes by the allowance or more since
+/// the run opened fails here, and it cannot pass as a smaller headroom of the
+/// next step. A leftover of constant size passes.
+/// `after_synchronize_gpu_the_live_count_holds_no_temporary` in `rmlx-mlx` is
+/// the test that reads the absolute state.
 ///
 /// **Each step.** The step's headroom, less the new ring of a step that regrows
 /// the store, is what the step allocated and freed again. With the allowance

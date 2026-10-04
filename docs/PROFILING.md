@@ -405,9 +405,12 @@ buffer of the MLX thread's GPU stream and waits until that buffer is complete
 (`mlx_synchronize`, Metal `waitUntilCompleted`). That wait returns after the
 completion handlers of the buffer ran. MLX waits on the last buffer of the
 queue only; that the handlers of the earlier buffers ran too is held by
-tests, not by a contract: `after_synchronize_gpu_the_live_count_holds_no_temporary`
-(`crates/rmlx-mlx/src/synchronize_tests.rs`) reads the count after a 4 MiB
-temporary, and the V-mirror tests read it at the open of every decode step.
+tests, not by a contract. The V-mirror tests read the count at the open of
+every decode step; they compare it with the count at the open of the run, so
+a leftover of constant size passes them. `after_synchronize_gpu_the_live_count_holds_no_temporary`
+(`crates/rmlx-mlx/src/synchronize_tests.rs`) reads the absolute count after a
+4 MiB temporary. Its one evaluation commits one command buffer, so it says
+nothing about earlier buffers.
 The call is for measurement only. It returns an error after `forbid_gpu`, and
 from a job on the MLX thread, which holds the evaluation lock.
 
@@ -420,9 +423,12 @@ a buffer counts less than three pages above its size, and what an earlier
 region freed moves the count of a later one. `rmlx_mlx::mlx_clear_cache()`
 empties the cache.
 
-- **Call `synchronize_gpu()` and `mlx_clear_cache()` before each reading a
-  test judges on**: before `PeakBracket::open()`, and before a bare
-  `mlx_active_memory_bytes()`.
+- **Call `synchronize_gpu()` before each reading a test judges on**: before
+  `PeakBracket::open()`, and before a bare `mlx_active_memory_bytes()`.
+- **Call `mlx_clear_cache()` too when the reading is compared to within
+  pages.** A cached buffer moves a count by less than three pages for each
+  buffer. A bound that is a multiple of the input size, as in
+  `crates/rmlx-kv-quant/src/q8_msl_tests.rs`, does not need it.
 - **A temporary is not in the settled live count.** A copy that a step makes
   and frees shows only in the peak over that step: open a bracket from the
   settled state, run one step, read `headroom_bytes()`. Assert the count at

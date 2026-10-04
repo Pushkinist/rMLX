@@ -1241,7 +1241,8 @@ pub fn mlx_reset_peak_memory() -> bool {
 /// a cached buffer of up to `min(2 * size, size + 2 pages)` bytes when it has
 /// one (`mlx/backend/common/buffer_cache.h`) and counts the length of that
 /// buffer, so what an earlier region freed moves the count of a later one.
-/// After this call the next allocations are new buffers.
+/// After this call the next allocations are new buffers, until a later free
+/// puts a buffer back in the cache.
 pub fn mlx_clear_cache() -> bool {
     install_error_handler();
     // SAFETY: no arguments, no out-params; `mlx_clear_cache` takes the
