@@ -271,6 +271,10 @@ Cells that read only a variable still stand down without it. Examples:
 `kv_bytes_sample_point.rs`, `RMLX_VL_TEST_MODEL` in
 `qwen3_vl_moe_text_parity.rs`, the `RMLX_PROMPT_CACHE_TEST_MODEL_*` pair in
 `prompt_cache_cross_model.rs`. A run ends INCOMPLETE unless those are set.
+`RMLX_KV_TEST_MODEL` also outranks the slug of every golden-rule cell of its
+architecture (`TESTING.md` § "The resolvers"): set at gemma-4-e4b, it hands
+that snapshot to the cells that name gemma-4-e2b. Arm its variable-only cells
+in a run narrowed to them.
 
 `spec_greedy_equivalence.rs` refuses a mis-paired drafter before either model
 loads, with a named notice. `declared_kind` checks that the sidecar declares the
@@ -425,8 +429,11 @@ once more with no `MTL_*` or `METAL_*` variable:
 - A build under the Metal claim in either kind of run is a failure.
 - The uninstrumented run has the same coverage check as each instrumented run.
 
-The cost is one more pass over every selected test. No complete run has
-measured the wall time of the suite with it.
+The cost is one more pass over every selected test. One complete run on the
+pinned pair, on a host holding every snapshot the suite resolves by slug, took
+5 h 46 min: `rmlx-models` 4 h 50 min, `rmlx-server` 30 min, `rmlx-audio`
+21 min, `rmlx-kv-quant` 4 min, and the other crates under a minute together.
+The uninstrumented pass of `rmlx-models` was 1 h 31 min of that.
 
 **A test that fails under the instrument and passes without it is a failure.**
 The report names it: `<crate>: <test> failed with shader validation on and
@@ -462,8 +469,8 @@ compute. Measured on this suite's cells:
   returned wrong output on the repeats that reported. With the threadgroup
   instrumentation off it reported nothing and matched the unvalidated output.
 
-Device-memory validation is unaffected: the split-K hits are reported at the
-same count either way. So a test whose GPU work is MLX's kernels cannot be
+Device-memory validation is unaffected: on an MLX before 0.32.3 the split-K
+hits were reported at the same count either way. So a test whose GPU work is MLX's kernels cannot be
 judged with threadgroup validation on, and a test of rMLX's own `.metal`
 kernels, which this repo can get wrong in threadgroup memory, loses coverage
 without it.
@@ -522,22 +529,19 @@ prints the access mix per diagnostic. A clean scan does not prove that nothing
 read out of bounds. The layer bounds against the `MTLBuffer`, not the array,
 and MLX recycles buffers from size buckets.
 
-The pin accepts two MLX kernel families, loads only:
+The pin accepts one MLX kernel family, loads only: the implicit-GEMM conv,
+`implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s`,
+whose weight loader checks the output-channel bound only for 8-wide tiles.
 
-- the split-K quantized matmul,
-  `affine_qmm_t_splitk_bfloat16_t_gs_64_b_{4,8}_alN_false` and
-  `mxfp8_qmm_t_splitk_bfloat16_t_gs_32_b_8_alN_false`.
-  In MLX 0.31.2, 0.32.1 and 0.32.2, `QuantizedBlockLoader::load_safe` in
-  `mlx/backend/metal/kernels/quantized.h` bounds the row index of a transposed
-  weight against the tile's column extent, so a quantized matmul whose `N` is
-  not a multiple of the output tile width reads past the packed weight and
-  scales. MLX 0.32.3 bounds it against the row extent
-  (`if (bi >= src_tile_dim.y)`), and the read is gone. The split-K entries of
-  the pin were derived before that and are to be derived again from the next
-  complete run; until then they read `no longer fires` on the pinned pair;
-- the implicit-GEMM conv,
-  `implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s`,
-  whose weight loader checks the output-channel bound only for 8-wide tiles.
+The pin has no split-K entry. In MLX 0.31.2, 0.32.1 and 0.32.2,
+`QuantizedBlockLoader::load_safe` in `mlx/backend/metal/kernels/quantized.h`
+bounds the row index of a transposed weight against the tile's column extent,
+so a quantized matmul whose `N` is not a multiple of the output tile width
+reads past the packed weight and scales, and the
+`affine_qmm_t_splitk_*` and `mxfp8_qmm_t_splitk_*` kernels report. MLX 0.32.3
+bounds it against the row extent (`if (bi >= src_tile_dim.y)`). The complete
+run the pin was derived from reported no split-K diagnostic in any crate. A
+run on an MLX before 0.32.3 reads each of them as `not pinned`.
 
 It also accepts one report that is not a read of the kernel:
 `gemv_wide_bfloat16_nv5_kl32_nc0_axpby0` in
@@ -546,15 +550,15 @@ clamps every index it forms, the reported offsets are gigabytes outside the
 buffer, and the count changes per run (6, 3, 4, 1, 4). The validated and the
 unvalidated run of the test give byte-identical round streams.
 
-In the two families, each output column is computed from its own weight row
-and the store clips, so the out-of-range rows never reach the output. The tests
+In the conv and in the split-K matmul, each output column is computed from its
+own weight row and the store clips, so the out-of-range rows never reach the
+output. The tests
 `split_k_tail_row_reads_never_reach_the_output` and
 `implicit_gemm_conv_tail_channel_reads_never_reach_the_output` in
 `crates/rmlx-mlx/src/ops/matmul_tests.rs` show it bit for bit with the tail rows
 poisoned. The header of `scripts/gpu_validation_census.txt` gives the argument
-and the run the pin was derived from. A cell a variable arms that the
-derivation run left standing down reports its hits as deltas until the pin is
-derived again.
+and the run the pin was derived from. The cells that run left standing down
+for a variable were armed in filtered runs afterwards and reported nothing.
 
 ### The census pin
 
