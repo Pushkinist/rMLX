@@ -243,7 +243,7 @@ fn turbo_flash_head_dim_256_smoke_dispatch_and_cosine() {
         Ok(o) => o,
         Err(e) => {
             eprintln!(
-                "smoke head_dim=256 TF=1: update_and_sdpa errored: {e} \
+                "SKIP turbo_flash_head_dim_256_smoke_dispatch_and_cosine: update_and_sdpa errored: {e} \
                  (skipping cosine; dispatch counter delta={})",
                 after - before
             );
@@ -264,7 +264,7 @@ fn turbo_flash_head_dim_256_smoke_dispatch_and_cosine() {
 
     if delta == 0 {
         eprintln!(
-            "smoke head_dim=256 TF=1: HOLD-soft — dispatch did not fire \
+            "SKIP turbo_flash_head_dim_256_smoke_dispatch_and_cosine: HOLD-soft, dispatch did not fire \
              (expected: kv_seq={} > RMLX_TURBO_FLASH_MIN=0). Skipping cosine.",
             cache.offset()
         );
@@ -388,7 +388,7 @@ fn turbo_flash_head_dim_256_long_decode_stress() {
             Ok(o) => o,
             Err(e) => {
                 eprintln!(
-                    "stress head_dim=256 TF=1 step={step} kv_seq={} errored: {e}",
+                    "SKIP turbo_flash_head_dim_256_long_decode_stress: step={step} kv_seq={} errored: {e}",
                     cache.offset()
                 );
                 assert!(
@@ -415,7 +415,7 @@ fn turbo_flash_head_dim_256_long_decode_stress() {
     );
 
     if total_delta == 0 {
-        eprintln!("stress head_dim=256 TF=1: HOLD-soft — no dispatches fired across the loop");
+        eprintln!("SKIP turbo_flash_head_dim_256_long_decode_stress: HOLD-soft, no dispatches fired across the loop");
         assert!(
             !strict,
             "RMLX_APPLE10_STRICT=1 — stress loop saw zero TurboFlash dispatches at \

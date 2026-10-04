@@ -250,7 +250,15 @@ tests:
 - in the files that declare those tests, a block that reads an environment
   variable and exits by a `return` carrying no value (`return;`, `return`,
   `return None;`, `return Ok(());`) must print a notice. `RMLX_SKIP_GPU` guards
-  are exempt.
+  are exempt. The variable can be read on one line and the block opened on a
+  later one;
+- in a classified test, a block that prints a line and returns with no value
+  must hold a notice. A test that prints `<test>: skipping: <why>` and returns
+  has stood down in a form the runner does not harvest, so libtest prints `ok`
+  and the run counts the cell as passed. The notice has one form, and the gate
+  refuses a block that announces in another. It does not read what guards the
+  block. A block that returns and prints nothing is not read: that is a test
+  that returns after a helper announced the stand-down.
 
 The notice's shape lives in `scripts/lib/skip_notice_patterns.sh`, which the
 gate and the runner both read. `make check-named-skip-notices-fixtures` is the
@@ -386,7 +394,7 @@ Invalid device store at offset 4000064, executing kernel function: "custom_kerne
   test printed its own `SKIP <test>: <why>`: nothing in it reached Metal, each
   cell is listed as a stand-down, and the run ends INCOMPLETE. The
   `/v1/embeddings` GPU cells in `crates/rmlx-server/tests/embeddings_smoke.rs`
-  are such a crate on a host without the jina snapshot.
+  are such a crate when `RMLX_TEST_MODEL_JINA_V4` is not set.
 - **A positive control runs first.**
   `crates/rmlx-kv-quant/src/shader_validation_canary.rs`, behind the
   `shader-validation-canary` feature, stores out of bounds on purpose. The run
@@ -423,9 +431,11 @@ once more with no `MTL_*` or `METAL_*` variable:
 - Hits and the banner are read from the instrumented runs.
 - A stand-down notice from either run is listed and ends the run INCOMPLETE.
   The census skip set is the instrumented runs' notices alone.
-- Each instrumented run that exits non-zero and names no failing test is a
-  failure, read per run: a failing test that one run names does not vouch for
-  another run that died.
+- Each run that exits non-zero and names no failing test is a failure with
+  that reason, read per run: a failing test that one run names does not vouch
+  for another run that died.
+- A test that failed in the uninstrumented run alone is listed with
+  `(passed with shader validation on)`.
 - A build under the Metal claim in either kind of run is a failure.
 - The uninstrumented run has the same coverage check as each instrumented run.
 
@@ -435,13 +445,17 @@ pinned pair, on a host holding every snapshot the suite resolves by slug, took
 21 min, `rmlx-kv-quant` 4 min, and the other crates under a minute together.
 The uninstrumented pass of `rmlx-models` was 1 h 31 min of that.
 
-**A test that fails under the instrument and passes without it is a failure.**
+**A test that fails under the instrument and not without it is a failure.**
 The report names it: `<crate>: <test> failed with shader validation on and
-passed without it`. A kernel defect that only the instrument's timing exposes
+passed without it`, or `… and stood down without it` when the uninstrumented
+run did not run the test. A kernel defect that only the instrument's timing exposes
 looks the same as an artifact of the instrument: red with validation, green
 without, no diagnostic. The scan of such a test stopped at its failure, so
 its census entries stay an expectation and the hits it did not print are a
-deviation.
+deviation. The census is on the sum per kernel, so another test's hits can
+stand in for them. For both cases the report adds a note that names each test
+that failed in a scan: a short count in its crate is not evidence of a stale
+pin, and a matching count is not evidence of a match.
 
 The runner reads no list of accepted tests, because no test is in that state.
 A list keyed on test names cannot hold a fault that fires at random: an entry

@@ -199,7 +199,7 @@ fn shared_source_turbo_flash_on_dispatch_fires_and_surfaces_bf16_mirror() {
         Ok(triple) => triple,
         Err(e) => {
             eprintln!(
-                "TF=1: update_and_sdpa_shared_source errored: {e} (skipping dispatch/parity assert)"
+                "SKIP shared_source_turbo_flash_on_dispatch_fires_and_surfaces_bf16_mirror: update_and_sdpa_shared_source errored: {e}"
             );
             assert!(
                 !strict,
@@ -215,7 +215,7 @@ fn shared_source_turbo_flash_on_dispatch_fires_and_surfaces_bf16_mirror() {
 
     if delta == 0 {
         eprintln!(
-            "TF=1: HOLD-soft — TurboFlash did not fire on the shared-KV producer path \
+            "SKIP shared_source_turbo_flash_on_dispatch_fires_and_surfaces_bf16_mirror: HOLD-soft, TurboFlash did not fire on the shared-KV producer path \
              (expected when head_dim not in {{128,256}} or kv_seq below threshold). \
              Skipping byte-identity assertion."
         );

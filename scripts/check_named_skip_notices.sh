@@ -62,13 +62,31 @@
 #   test fns: such a guard is routinely in a file-local helper, and a rule
 #   scoped to test bodies reads a helper's silent return as a clean scan.
 #
+#   The line that reads the variable and the line that opens the block can be
+#   two lines: `let Some(p) =` / `std::env::var_os("X")` / `else {`. The guard
+#   starts at the block, whichever line opens it.
+#
+# WHAT IS ALSO REFUSED: A STAND-DOWN IN ANOTHER FORM
+#   A classified GPU test that prints a line and then returns with no value, in
+#   one block, has announced a stand-down. When the block holds no `SKIP`
+#   notice, the announcement is in a form the runner does not harvest:
+#   `<test>: skipping: <why>` reads as prose there, libtest prints `ok`, and
+#   the cell is counted as passed. So the notice has one form, and this rule
+#   refuses a block that announces in any other. Whatever guards the block —
+#   a variable, a missing file, a counter that did not move — is not read.
+#
+#   Its population is the classified test fns. A block that returns and prints
+#   nothing is not read by this rule: a test that returns after a helper
+#   announced the stand-down by the test's name is that shape.
+#
 #   The notice's SHAPE is not defined here. `scripts/lib/skip_notice_patterns.sh`
 #   holds it, and `scripts/run_gpu_tests.sh` reads the same file — a source gate
 #   that accepted `SKIP  foo:` while the runner counted it as nameless would pass
 #   CI and leave every run INCOMPLETE with a number and no name.
 #
-# Exit 0 = every notice in a classified GPU test names its own test, and every
-# environment guard in those tests' files announces the stand-down it takes.
+# Exit 0 = every notice in a classified GPU test names its own test, every
+# environment guard in those tests' files announces the stand-down it takes,
+# and no classified test announces a stand-down in another form.
 # Exit 1 = at least one does not; each is named with its file, line and reason.
 # Exit 2 = the scan could not be trusted (no classification, no crates).
 
@@ -204,8 +222,17 @@ done <<< "$(printf '%s\n' "${gpu_files}" | while IFS= read -r f; do
         !g && code ~ /env::var/ && bare !~ /RMLX_SKIP_GPU/ && index(code, "{") > 0 {
             g = 1; gl = NR; gfn = cur; gtext = raw
             sub(/^[[:space:]]+/, "", gtext)
-            depth = 0; notice = 0; ret = 0
+            depth = 0; notice = 0; ret = 0; pend = 0
         }
+        # The variable is read on one line and the block opens on a later one.
+        # The statement that ends first, with no block, is not a guard.
+        !g && !pend && code ~ /env::var/ && bare !~ /RMLX_SKIP_GPU/ && code !~ /;[[:space:]]*$/ {
+            pend = 1; gl = NR; gfn = cur; gtext = raw
+            sub(/^[[:space:]]+/, "", gtext)
+            next
+        }
+        pend && index(code, "{") > 0 { g = 1; pend = 0; depth = 0; notice = 0; ret = 0 }
+        pend && code ~ /;[[:space:]]*$/ { pend = 0 }
         g {
             opens = gsub(/\{/, "{", code)
             closes = gsub(/\}/, "}", code)
@@ -221,10 +248,70 @@ done <<< "$(printf '%s\n' "${gpu_files}" | while IFS= read -r f; do
     ' "${f}"
 done)"
 
-# Both kinds are printed before the single exit at the end. They co-occur — a
+# The blocks of a classified test that print, return with no value and hold no
+# stand-down notice. One record per block, `<file>\t<line>\t<fn>\t<text>`, at
+# the line of the `return`.
+#
+# Blocks are followed by brace depth over the line's CODE, as above. A print
+# and a notice belong to the innermost block open on their line.
+other=""
+n_other=0
+while IFS=$'\t' read -r o_file o_line o_fn o_text; do
+    [ -n "${o_file:-}" ] || continue
+    rel="${o_file#"${ROOT}"/crates/}"
+    other="${other}    ${rel}:${o_line} — ${o_fn} prints and returns with no value, and the block holds no stand-down notice"$'\n'
+    other="${other}        ${o_text}"$'\n'
+    n_other=$((n_other + 1))
+done <<< "$(printf '%s\n' "${gpu_files}" | while IFS= read -r f; do
+    [ -n "${f}" ] || continue
+    fns="$(printf '%s\n' "${classification}" | awk -F'\t' -v f="${f}" '$3 == f { printf " %s", $2 } END { printf " " }')"
+    awk -v FILE="${f}" -v FNS="${fns}" -v ANY="${ANY_SKIP}" "${AWK_TEXT_FNS}"'
+        {
+            raw = $0
+            code = blank_strings(decomment(raw))
+        }
+        match(code, /^[[:space:]]*(pub[[:space:]]+(\([^)]*\)[[:space:]]*)?)?(async[[:space:]]+)?fn[[:space:]]+[A-Za-z_][A-Za-z0-9_]*/) {
+            head = substr(code, RSTART, RLENGTH)
+            sub(/^.*fn[[:space:]]+/, "", head)
+            cur = head; sp = 0
+        }
+        {
+            n = length(code)
+            for (i = 1; i <= n; i++) {
+                ch = substr(code, i, 1)
+                if (ch == "{") { sp++; printed[sp] = ""; noticed[sp] = 0 }
+                else if (ch == "}" && sp > 0) sp--
+            }
+            if (sp < 2 || index(FNS, " " cur " ") == 0) next
+            if (code ~ /(^|[^A-Za-z0-9_])e?println!/) {
+                printed[sp] = raw
+                sub(/^[[:space:]]+/, "", printed[sp])
+            }
+            if (raw ~ /"/ && raw ~ ANY) noticed[sp] = 1
+            if (code ~ /(^|[^A-Za-z0-9_])return[[:space:]]*;/ && printed[sp] != "" && !noticed[sp])
+                printf "%s\t%d\t%s\t%s\n", FILE, NR, cur, printed[sp]
+        }
+    ' "${f}"
+done)"
+
+# Every kind is printed before the single exit at the end. They co-occur — a
 # suite half-converted has one of each — and a gate that exits inside the first
 # block sends the reader back for the second one run later.
 red=0
+
+if [ "${n_other}" -gt 0 ]; then
+    echo "ERROR: ${n_other} block(s) in classified GPU tests announce a stand-down in a form" >&2
+    echo "       the runner does not harvest:" >&2
+    printf '%s' "${other}" >&2
+    echo >&2
+    echo "A test that prints and returns with no value did not run to its end. libtest" >&2
+    echo "reports it as \`ok\`, and scripts/run_gpu_tests.sh lists it only when the line" >&2
+    echo "it printed is" >&2
+    echo "  SKIP <this test fn>: <why>" >&2
+    echo "See docs/GPU_TESTS.md." >&2
+    echo >&2
+    red=1
+fi
 
 if [ "${n_silent}" -gt 0 ]; then
     echo "ERROR: ${n_silent} environment guard(s) in classified GPU tests' files stand a" >&2
@@ -255,5 +342,6 @@ if [ "${red}" = "1" ]; then
     exit 1
 fi
 
-echo "OK: every stand-down notice in a classified GPU test names its own test, and
-every environment guard in those files announces the stand-down it takes."
+echo "OK: every stand-down notice in a classified GPU test names its own test,
+every environment guard in those files announces the stand-down it takes, and
+no classified test announces a stand-down in another form."

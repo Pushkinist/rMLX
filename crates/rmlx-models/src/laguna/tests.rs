@@ -90,12 +90,12 @@ fn integration_laguna_xs2() {
     let Some(model_dir_buf) =
         std::env::var_os("RMLX_TEST_MODEL_LAGUNA").map(std::path::PathBuf::from)
     else {
-        eprintln!("integration_laguna_xs2: skipping: RMLX_TEST_MODEL_LAGUNA not set");
+        eprintln!("SKIP integration_laguna_xs2: RMLX_TEST_MODEL_LAGUNA not set");
         return;
     };
     let model_dir = model_dir_buf.as_path();
     if !model_dir.exists() {
-        eprintln!("integration_laguna_xs2: snapshot absent, skipping");
+        eprintln!("SKIP integration_laguna_xs2: snapshot absent");
         return;
     }
 
