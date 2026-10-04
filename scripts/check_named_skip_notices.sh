@@ -89,6 +89,13 @@
 #   an inner one. A block after a nested `fn` item, because the scan restarts
 #   its depth at every `fn`. A block at the top level of a fn body.
 #
+#   WHAT IS OUTSIDE THE POPULATION. A helper module that classified tests call
+#   and that declares no classified test is read by neither this rule nor the
+#   guard rule: `crates/rmlx-models/tests/common/mod.rs`,
+#   `crates/rmlx-server/tests/thread_boundary/mod.rs` and
+#   `crates/rmlx-models/src/test_snapshot.rs`. Review holds their stand-downs
+#   to `SKIP {test}:`.
+#
 #   The notice's SHAPE is not defined here. `scripts/lib/skip_notice_patterns.sh`
 #   holds it, and `scripts/run_gpu_tests.sh` reads the same file — a source gate
 #   that accepted `SKIP  foo:` while the runner counted it as nameless would pass

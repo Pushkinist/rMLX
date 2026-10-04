@@ -739,6 +739,47 @@ run_case
 expect_status 1
 expect_out "tests/alpha.rs:6 — gpu_alpha prints and returns with no value, and the block holds no stand-down notice"
 
+new_case a_stand_down_that_returns_none_fails
+classify rmlx-kv-quant tests/alpha.rs gpu_alpha
+source_file rmlx-kv-quant tests/alpha.rs <<'RS'
+fn loaded(name: &str) -> Option<Model> {
+    if nothing() {
+        eprintln!("{name}: no snapshot, skipping");
+        return None;
+    }
+    Some(load())
+}
+
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    let _ = loaded("alpha");
+}
+RS
+run_case
+expect_status 1
+expect_out "tests/alpha.rs:4 — loaded prints and returns with no value, and the block holds no stand-down notice"
+
+new_case a_stand_down_that_ends_in_a_bare_return_fails
+classify rmlx-kv-quant tests/alpha.rs gpu_alpha
+source_file rmlx-kv-quant tests/alpha.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    let model = match load() {
+        Some(model) => model,
+        None => {
+            eprintln!("gpu_alpha: no snapshot, skipping");
+            return
+        }
+    };
+    let _ = model;
+}
+RS
+run_case
+expect_status 1
+expect_out "tests/alpha.rs:8 — gpu_alpha prints and returns with no value, and the block holds no stand-down notice"
+
 # A return that carries a value is a result, not a stand-down.
 new_case a_printed_return_with_a_value_is_not_a_stand_down
 classify rmlx-kv-quant tests/alpha.rs gpu_alpha

@@ -274,6 +274,12 @@ The third rule cannot read these forms, and review holds them:
   at every `fn`;
 - a print and a return at the top level of a fn body.
 
+Three helper modules are outside the population of the second and third rule,
+because they declare no classified test: `crates/rmlx-models/tests/common/mod.rs`,
+`crates/rmlx-server/tests/thread_boundary/mod.rs` and
+`crates/rmlx-models/src/test_snapshot.rs`. Classified tests call them, and a
+stand-down in them is held to `SKIP {test}:` by review.
+
 The notice's shape lives in `scripts/lib/skip_notice_patterns.sh`, which the
 gate and the runner both read. `make check-named-skip-notices-fixtures` is the
 gate's recall test.
