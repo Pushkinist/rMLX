@@ -134,6 +134,10 @@ pub fn generate_greedy(
         // produced its logits, and the cache entry stores the id and piece only.
         // Decode steps below still carry them. Same shape as the other
         // exact-hit paths that do not persist a logprob payload.
+        // The constraint sees every token, a replayed one included.
+        if let Some(c) = constraint.as_mut() {
+            c.advance(last_id);
+        }
         steps.push(ProbeStep {
             token_id: last_id,
             piece: piece.into_boxed_str(),

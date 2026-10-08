@@ -418,16 +418,29 @@ single-word cell is a no-regression check.
 Both engines start masking only once the model emits something the grammar
 can latch onto: a value-start byte for a container root, or the first token
 after reasoning for a scalar root. `ConstraintEngine::engaged()` reports
-whether that happened. `engaged_handle()` gives the route a handle that
-outlives the move of the engine into the decode thread. A generation that
-ends unengaged was never constrained.
+whether that happened. A generation that ends unengaged was never
+constrained.
 
-- **Non-streaming refuses.** No byte has reached the client yet, so the route
-  returns HTTP 502 `constraint_not_engaged`.
-- **Streaming cannot refuse.** The deltas are already sent. It logs the warn
-  and completes.
-- Only `response_format` is checked. A forced `tool_choice` also builds a
-  constraint, but it has a text-parsing fallback.
+The engine is the one producer of the place where it engaged.
+`engagement()` gives the route a handle (`rmlx_models::Engagement`) that
+outlives the move of the engine into the decode thread. The engine writes the
+place to it: the token, by its count of `advance` calls, and the byte, by its
+distance from the end of the text of that token. A decode loop shows each
+token to `advance`, a replayed first token included, before it hands the
+token on, so the route can ask about each token it receives.
+
+The route cuts the answer text at that byte and has no rule of its own for it
+([`SERVER.md`](SERVER.md), "JSON-mode reply"). Returned text that ends before
+the byte holds nothing the grammar checked. That is a reply that never
+engaged, and also a reply that a `stop` string ended before the byte:
+
+- **Non-streaming refuses.** The route returns HTTP 502
+  `constraint_not_engaged`.
+- **Streaming refuses.** No content delta is sent before the byte, so the
+  stream ends with the mid-stream error event, type `constraint_not_engaged`,
+  and no `finish_reason` chunk.
+- Only `response_format` is refused. A forced `tool_choice` also builds a
+  constraint; a reply that does not parse as a tool call is returned as text.
 
 Either way the decode loop emits a `warn!` carrying the route's `request_id`.
 The span is carried across `spawn_blocking` explicitly.

@@ -191,6 +191,10 @@ pub fn generate_greedy<'a>(
             token_id = last_id,
             "qwen3_5moe generate_greedy: prompt cache EXACT HIT"
         );
+        // The constraint sees every token, a replayed one included.
+        if let Some(c) = constraint.as_mut() {
+            c.advance(last_id);
+        }
         steps.push(ProbeStep {
             token_id: last_id,
             piece: piece.into_boxed_str(),

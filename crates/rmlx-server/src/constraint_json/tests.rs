@@ -281,39 +281,29 @@ fn warm_up_blocks_engagement_during_thinking() {
     assert!(c.engaged, "engagement must fire after thinking ends");
 }
 
-// ── Fence suppression tests ───────────────────────────────────────
+// ── Engagement report ─────────────────────────────────────────────
 
-/// Pre-engagement text that is only ` ```json\n ` must be flagged as a
-/// fence so the handler knows to discard it.
+/// The engine reports the token and the byte at which the grammar engaged.
+/// Text before it, a fence header or prose, is before the reply.
 #[test]
-fn fence_suppression_pure_fence() {
-    let pm = synthetic_bytes_map(&[b"```json\n", b"{", b"}", b""]);
-    let mut c = JsonObjectConstraint::from_bytes_map(pm, vec![3]);
-    // Token 0 decodes to ` ```json\n` — pre-engagement, fence-only.
-    c.advance(0);
-    assert!(!c.engaged, "fence token must not trigger engagement");
-    assert!(
-        c.pre_engage_is_fence(),
-        "pure fence pre-text must be detected"
-    );
-    // Token 1 is `{` — engagement fires.
-    c.advance(1);
-    assert!(c.engaged, "engagement must fire on `{{` token");
-}
-
-/// Pre-engagement text that contains real prose must NOT be silently
-/// discarded (it is not a fence).
-#[test]
-fn fence_suppression_real_prose_not_discarded() {
-    let pm = synthetic_bytes_map(&[b"Sure, here: ", b"{", b"}", b""]);
-    let mut c = JsonObjectConstraint::from_bytes_map(pm, vec![3]);
-    c.advance(0); // real prose pre-text
-    assert!(!c.engaged);
-    // pre_engage_is_fence must be false for real prose.
-    assert!(
-        !c.pre_engage_is_fence(),
-        "real prose pre-text must NOT be flagged as fence"
-    );
+fn the_engagement_report_names_the_brace() {
+    for pre in [&b"```json\n"[..], &b"Sure, here: "[..]] {
+        let pm = synthetic_bytes_map(&[pre, b"\n{", b"}", b""]);
+        let mut c = JsonObjectConstraint::from_bytes_map(pm, vec![3]);
+        let place = c.engagement().unwrap();
+        c.advance(0);
+        assert!(!c.engaged, "the text before the brace does not engage");
+        assert_eq!(place.bytes_before(1, "x"), 1, "not engaged: all before");
+        c.advance(1);
+        assert!(c.engaged, "engagement must fire on `{{` token");
+        assert_eq!(place.bytes_before(1, "x"), 1, "the token before the brace");
+        assert_eq!(
+            place.bytes_before(2, "\n{"),
+            1,
+            "the newline before the brace"
+        );
+        assert_eq!(place.bytes_before(3, "}"), 0, "a token after the brace");
+    }
 }
 
 /// Object/array root: engagement still requires `{`/`[` (scalar-root engage does not change it).

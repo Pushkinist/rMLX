@@ -14,11 +14,11 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use rmlx_models::ConstraintEngine;
+use rmlx_models::{ConstraintEngine, Engagement};
 use serde_json::Value;
 
 use super::super::TokenBytesMap;
-use super::grammar::{is_only_fence_or_whitespace, SchemaGrammar};
+use super::grammar::SchemaGrammar;
 use super::types::{EngagePolicy, SchemaError, SchemaNode};
 
 /// `ConstraintEngine` for `response_format: json_schema`. Reuses `JsonObjectConstraint`'s
@@ -43,15 +43,12 @@ pub struct SchemaConstraint {
     eos_ids: Vec<u32>,
     mask: Vec<bool>,
     pub(super) engaged: bool,
-    /// Mirror of `engaged` the route keeps a clone of. The engine itself is
-    /// moved into the decode thread, so this is the only way the route can
-    /// learn — after the stream drains — whether the grammar was ever applied.
-    engaged_flag: Arc<AtomicBool>,
+    /// Where the grammar engaged. The route keeps a clone and cuts the reply
+    /// there; the engine itself is moved into the decode thread.
+    engagement: Arc<Engagement>,
+    /// How many tokens `advance` has seen.
+    advances: u32,
     engage_policy: EngagePolicy,
-    /// Text accumulated from tokens seen before engagement. Used to detect
-    /// and suppress a leading markdown-fence (```` ```json\n ````). Cleared
-    /// when engagement fires.
-    pre_engage_buf: String,
     is_thinking: Arc<AtomicBool>,
 }
 
@@ -101,9 +98,9 @@ impl SchemaConstraint {
             eos_ids,
             mask: Vec::new(),
             engaged: false,
-            engaged_flag: Arc::new(AtomicBool::new(false)),
+            engagement: Arc::default(),
+            advances: 0,
             engage_policy: policy,
-            pre_engage_buf: String::new(),
             is_thinking: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -130,30 +127,16 @@ impl SchemaConstraint {
             eos_ids,
             mask: Vec::new(),
             engaged: false,
-            engaged_flag: Arc::new(AtomicBool::new(false)),
+            engagement: Arc::default(),
+            advances: 0,
             engage_policy: policy,
-            pre_engage_buf: String::new(),
             is_thinking: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// Force the constraint into the engaged state immediately, bypassing the engage policy.
     pub fn force_engage(&mut self) {
-        self.mark_engaged();
-    }
-
-    /// The one place `engaged` flips, so the route-visible mirror can never
-    /// drift from the field the mask logic reads.
-    fn mark_engaged(&mut self) {
         self.engaged = true;
-        self.engaged_flag.store(true, Ordering::Release);
-    }
-
-    /// Shared handle the route reads after generation to learn whether the
-    /// engine ever engaged. `false` at end of stream means the response was
-    /// never checked against the requested schema.
-    pub fn engaged_handle(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.engaged_flag)
     }
 
     /// Return a shared handle to the `is_thinking` flag for external budget enforcement.
@@ -193,14 +176,6 @@ impl SchemaConstraint {
             }
         }
     }
-
-    /// Returns `true` when the text accumulated before engagement matches
-    /// the pattern `^\s*(```(json)?\s*)?$` — i.e. it is only whitespace
-    /// and/or a markdown code-fence header with no real prose. The caller
-    /// (route handler) may discard that prefix from `content`.
-    pub fn pre_engage_is_fence(&self) -> bool {
-        is_only_fence_or_whitespace(&self.pre_engage_buf)
-    }
 }
 
 impl ConstraintEngine for SchemaConstraint {
@@ -229,7 +204,9 @@ impl ConstraintEngine for SchemaConstraint {
                     policy = "immediate",
                     "SchemaConstraint: proactively engaging at first step_mask (scalar root)"
                 );
-                self.mark_engaged();
+                // The mask constrains the token that is sampled next.
+                self.engaged = true;
+                self.engagement.report_token_start(self.advances + 1);
             // Fall through to the filtered mask path below.
             } else {
                 self.mask.fill(true);
@@ -295,6 +272,7 @@ impl ConstraintEngine for SchemaConstraint {
         reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or validated before call"
     )]
     fn advance(&mut self, token_id: u32) {
+        self.advances += 1;
         if self.eos_ids.contains(&token_id) {
             return;
         }
@@ -312,11 +290,6 @@ impl ConstraintEngine for SchemaConstraint {
             if self.is_thinking.load(Ordering::Relaxed) {
                 // Still inside the <think> block — do not engage yet.
                 return;
-            }
-            // Accumulate pre-engagement text so the handler can detect and
-            // suppress a leading markdown-fence wrapper.
-            if let Ok(s) = std::str::from_utf8(&bytes) {
-                self.pre_engage_buf.push_str(s);
             }
             match self.engage_policy {
                 EngagePolicy::Immediate => {
@@ -336,7 +309,10 @@ impl ConstraintEngine for SchemaConstraint {
                     // feed it so we don't throw away a correctly formatted
                     // token that arrived on the engagement step.
                     if !bytes.is_empty() {
-                        self.mark_engaged();
+                        self.engaged = true;
+                        // The value starts in the next token unless this
+                        // token holds a legal first byte (reported below).
+                        self.engagement.report_token_start(self.advances + 1);
                         let starters = self.grammar.allowed_bytes();
                         // Skip leading whitespace, then check first non-WS byte.
                         let first_json_idx = bytes
@@ -351,6 +327,7 @@ impl ConstraintEngine for SchemaConstraint {
                                     policy = "immediate",
                                     "SchemaConstraint: engaging (scalar root, first post-think token, valid starter)"
                                 );
+                                self.engagement.report(self.advances, bytes.len() - idx);
                                 // Partial feed: the engagement token's suffix may
                                 // contain invalid bytes that the mask couldn't filter.
                                 self.feed_bytes_partial(&bytes[idx..]);
@@ -393,7 +370,8 @@ impl ConstraintEngine for SchemaConstraint {
                     if let Some(idx) = bytes.iter().position(|&b| {
                         b != b' ' && b != b'\t' && b != b'\n' && b != b'\r' && starters[b as usize]
                     }) {
-                        self.mark_engaged();
+                        self.engaged = true;
+                        self.engagement.report(self.advances, bytes.len() - idx);
                         tracing::info!(
                             token_id,
                             engage_byte = bytes[idx],
@@ -419,8 +397,8 @@ impl ConstraintEngine for SchemaConstraint {
         self.engaged
     }
 
-    fn engaged_handle(&self) -> Option<Arc<AtomicBool>> {
-        Some(Arc::clone(&self.engaged_flag))
+    fn engagement(&self) -> Option<Arc<Engagement>> {
+        Some(Arc::clone(&self.engagement))
     }
 
     /// Always returns `true` so the pipelined generate loop uses the masked

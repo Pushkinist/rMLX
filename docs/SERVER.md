@@ -242,9 +242,19 @@ on Gemma4, Gemma3, Qwen3.5-MoE and BitNet an exact hit emits no logprob for
 the replayed token, so `logprobs.content` is one entry short. See
 [`PROMPT_CACHE.md`](PROMPT_CACHE.md) § "First-token logprob on Exact hit".
 
-A `response_format` request whose grammar never engaged returns 502
-`constraint_not_engaged`; see [`SAMPLING.md`](SAMPLING.md) § "Non-enforcement
-is reported".
+**JSON-mode reply.** With `response_format` `json_object` or `json_schema`,
+`content` is the answer text from the byte at which the grammar engaged
+([`SAMPLING.md`](SAMPLING.md) § "Non-enforcement is reported") to its end,
+streaming or not:
+
+- Text before that byte (prose, a code-fence header) is not in `content`, and
+  `logprobs` has no entry for its tokens.
+- No byte after it is dropped or added. White space after the value stays. A
+  value cut by `max_tokens` is returned cut, with `finish_reason:"length"`:
+  read `finish_reason` before parsing.
+- `stop` is matched on the whole answer text, then the rule above applies.
+- Text that ends before that byte is refused: 502 `constraint_not_engaged`,
+  or, streaming, the error event below with that type and no content delta.
 
 **Streaming** (`stream:true`): each SSE event is a `data:` line holding a
 `ChatCompletionChunk`:
@@ -412,7 +422,7 @@ Errors use the OpenAI envelope:
 | 408 | `timeout` | The request timeout expired. |
 | 429 | `rate_limit_error` | The GPU admission queue is full. |
 | 500 | `internal_error` | A handler panic, a prompt-pipeline task panic, or an embeddings preprocessor or compute failure. The audio routes send 500 as `{"error":"…"}`. |
-| 502 | `constraint_not_engaged` | A non-streaming `response_format` request whose grammar never engaged. |
+| 502 | `constraint_not_engaged` | A `response_format` reply with no text at the engagement byte (streaming: an error event). |
 | 503 | `service_unavailable` | Any load failure, OOM while loading included, and any other engine error. With `--require-smoke-probe` (off by default) a failed smoke probe at load lands here too. Counter: `upstream`. |
 | 503 | `admission_sla_exceeded` | The adaptive controller's anticipatory rejection, with `Retry-After: 5`. Counter: `admission_sla_503`. |
 

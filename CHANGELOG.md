@@ -49,6 +49,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `response_format` reply is the same text streamed and not, and is
+  never one smaller value.** With `json_object` or `json_schema`, the
+  streamed reply was cut at the first `t`, `f`, `n`, quote, dash or digit of
+  the text before the JSON (`t that maps…`, or the `n` of a ` ```json `
+  header). The non-streamed reply was the first complete value in the text:
+  one key or number of an object that `max_tokens` or a `stop` string cut,
+  or a number in the prose. Now `content` starts at the byte where the
+  grammar engaged and runs to the end of the text on both paths. A cut value
+  is returned cut, with its `finish_reason`. Text that ends before that byte
+  is refused on both paths: 502 `constraint_not_engaged`, or that error
+  event in a stream, which before completed with unchecked text. A request
+  sent again with the same prompt is constrained from its first token: the
+  grammar did not see a first token replayed from the prompt cache, so a
+  reply that started with `{` answered 502 the second time.
+  `docs/SERVER.md` ("JSON-mode reply") states the contract.
+
 - **A long prefill no longer returns `NaN` logits under Metal shader
   validation on mlx 0.32.3.** MLX's attention kernel for `head_dim` 256
   returned `+inf` rows under device-memory validation when a call had an array

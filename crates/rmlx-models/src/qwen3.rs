@@ -1959,6 +1959,10 @@ pub fn generate_greedy<'a>(
         } else {
             None
         };
+        // The constraint sees every token, a replayed one included.
+        if let Some(c) = constraint.as_mut() {
+            c.advance(last_id);
+        }
         steps.push(ProbeStep {
             token_id: last_id,
             piece: piece.into_boxed_str(),

@@ -243,6 +243,10 @@ pub fn generate_greedy<'a>(
     // closure threads only `kv_caches`.
     // ------------------------------------------------------------------
     if let Some((mut kv_caches, last_id, piece)) = exact_hit {
+        // The constraint sees every token, a replayed one included.
+        if let Some(c) = constraint.as_mut() {
+            c.advance(last_id);
+        }
         step_fn(steps.push_mut(ProbeStep {
             token_id: last_id,
             piece: piece.into_boxed_str(),

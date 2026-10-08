@@ -451,13 +451,13 @@ fn decode_from(
             },
             None => make_step(next, tokenizer),
         };
+        if let Some(c) = constraint.as_mut() {
+            c.advance(next);
+        }
         let forced = step_fn(&step);
         steps.push(step);
         if eos_ids.contains(&next) {
             break;
-        }
-        if let Some(c) = constraint.as_mut() {
-            c.advance(next);
         }
         let feed = forced.unwrap_or(next);
         let logits = model.forward_seq_with_cache(&[feed], Some(&mut *kv), device)?;
@@ -605,13 +605,13 @@ pub fn generate_image(
         let pos_val = decode_base + g as i64;
         token_history.push(next);
         let step = make_step(next, tokenizer);
+        if let Some(c) = constraint.as_mut() {
+            c.advance(next);
+        }
         let forced = step_fn(&step);
         steps.push(step);
         if eos_ids.contains(&next) {
             break;
-        }
-        if let Some(c) = constraint.as_mut() {
-            c.advance(next);
         }
         let feed = forced.unwrap_or(next);
         let ids_i32 = [feed as i32];

@@ -984,18 +984,9 @@ pub(crate) async fn chat_completions(
         },
     };
 
-    // Clone of the engine's engaged mirror, taken before the box is moved into
-    // the generator. The non-streaming path reads it once the stream drains: a
-    // `response_format` request whose grammar never engaged was never checked,
-    // and nothing has reached the client yet, so it can still be refused.
-    // Scoped to `response_format` — `tool_choice` has its own text-parsing
-    // fallback and a non-engaged constraint there is not a failed contract.
-    let response_format_engaged: Option<Arc<std::sync::atomic::AtomicBool>> =
-        if bare_json_tool_call_mode {
-            None
-        } else {
-            constraint.as_ref().and_then(|c| c.engaged_handle())
-        };
+    // Where the grammar engaged, cloned before the box is moved into the
+    // generator. Both reply paths cut the answer text there.
+    let engagement = constraint.as_ref().and_then(|c| c.engagement());
 
     // extract image_url / input_audio content parts from user messages.
     // Collected across all user messages in order; will pass them to the
@@ -1165,22 +1156,6 @@ pub(crate) async fn chat_completions(
         tools_enabled.then_some(()).and(tool_format)
     };
 
-    // Detect json_object mode for the response post-processor — even
-    // with constraint masking, the model may emit a markdown fence wrapper
-    // (` ```json ... ``` `) DURING the warm-up phase. The grammar guarantees
-    // bytes from the engagement `{` through the matched closing `}` form a
-    // valid JSON object; the post-processor extracts that substring before
-    // the response is shipped to the client.
-    //
-    // bare_json_tool_call_mode also requires JSON extraction from text.
-    let json_object_mode = bare_json_tool_call_mode
-        || matches!(
-            gen_req.response_format,
-            Some(
-                NormalizedResponseFormat::JsonObject | NormalizedResponseFormat::JsonSchema { .. }
-            )
-        );
-
     // Anticipatory 503 — when the adaptive controller is enabled, predict
     // TTFT for the incoming request before entering the FIFO queue. If the
     // regression says `est_ttft > 2 × ttft_target`, reject early with 503 +
@@ -1333,7 +1308,7 @@ pub(crate) async fn chat_completions(
             request_start,
             &state,
             parser_format,
-            json_object_mode,
+            engagement,
             bare_json_tool_call_mode,
             include_usage,
             prompt_token_count,
@@ -1357,9 +1332,8 @@ pub(crate) async fn chat_completions(
             replay_plan,
             &req.model,
             parser_format,
-            json_object_mode,
+            engagement,
             bare_json_tool_call_mode,
-            response_format_engaged,
             request_start,
             state.metrics_drainer.as_ref(),
             ctx_max_for_metrics,

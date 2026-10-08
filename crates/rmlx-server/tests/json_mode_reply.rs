@@ -18,11 +18,6 @@
 //! The constraint is the one producer of the engagement byte. This file holds
 //! no rule for it: each expected value is a literal, and the harness checks
 //! the literal against the piece at which the constraint reported `engaged()`.
-//!
-//! A test with `#[should_panic]` holds a reply that is wrong today. Its
-//! `expected` string is the tag of the one assertion that must fail, so a
-//! harness failure does not satisfy it. When the reply is corrected, the test
-//! fails with "test did not panic" and the attribute must go.
 
 // LOC-exempt: one scripted harness and the reply contract it holds on both
 // paths; the scripts and the tests that read them stay in one file.
@@ -1025,52 +1020,44 @@ async fn a_stop_string_inside_the_object_cuts_the_streamed_reply_there() {
     assert!(got.errors.is_empty(), "{:?}", got.errors);
 }
 
-// ── Wrong today: the streamed reply does not start at the engagement byte ───
+// ── The streamed reply starts at the engagement byte ────────────────────────
 
 #[tokio::test]
-#[should_panic(expected = "streamed content deltas")]
 async fn a_json_fence_header_is_not_in_the_streamed_reply() {
     assert_streamed(JSON_FENCE, Mode::JsonObject, OBJECT_PIECES).await;
 }
 
 #[tokio::test]
-#[should_panic(expected = "streamed content deltas")]
 async fn a_json_fence_header_is_not_in_the_streamed_reply_of_an_object_schema() {
     assert_streamed(JSON_FENCE, Mode::Schema(SCHEMA_OBJECT), OBJECT_PIECES).await;
 }
 
 #[tokio::test]
-#[should_panic(expected = "streamed content deltas")]
 async fn prose_before_the_object_is_not_cut_at_a_letter_in_the_streamed_reply() {
     assert_streamed(PROSE, Mode::JsonObject, OBJECT_PIECES).await;
 }
 
 #[tokio::test]
-#[should_panic(expected = "streamed content deltas")]
 async fn prose_before_the_object_is_not_in_the_streamed_reply_of_an_object_schema() {
     assert_streamed(PROSE, Mode::Schema(SCHEMA_OBJECT), OBJECT_PIECES).await;
 }
 
 #[tokio::test]
-#[should_panic(expected = "streamed content deltas")]
 async fn prose_with_a_number_is_not_cut_at_the_digit_in_the_streamed_reply() {
     assert_streamed(PROSE_WITH_NUMBER, Mode::JsonObject, OBJECT_PIECES).await;
 }
 
 #[tokio::test]
-#[should_panic(expected = "streamed content deltas")]
 async fn prose_with_a_quoted_word_is_not_cut_at_the_quote_in_the_streamed_reply() {
     assert_streamed(PROSE_WITH_QUOTED_WORD, Mode::JsonObject, OBJECT_PIECES).await;
 }
 
 #[tokio::test]
-#[should_panic(expected = "streamed content deltas")]
 async fn prose_that_starts_with_a_dash_is_not_in_the_streamed_reply() {
     assert_streamed(PROSE_WITH_DASH, Mode::JsonObject, OBJECT_PIECES).await;
 }
 
 #[tokio::test]
-#[should_panic(expected = "streamed content deltas")]
 async fn a_cut_object_in_a_json_fence_is_streamed_from_its_brace() {
     assert_streamed(
         CUT_OBJECT_IN_JSON_FENCE,
@@ -1090,7 +1077,6 @@ async fn a_cut_object_in_a_json_fence_is_streamed_from_its_brace() {
 
 /// The array grammar does not engage at the `{` of the prose.
 #[tokio::test]
-#[should_panic(expected = "streamed content deltas")]
 async fn a_brace_in_the_prose_does_not_start_the_streamed_reply_of_an_array_schema() {
     assert_streamed(
         BRACE_PROSE_THEN_ARRAY,
@@ -1102,7 +1088,6 @@ async fn a_brace_in_the_prose_does_not_start_the_streamed_reply_of_an_array_sche
 
 /// The object grammar does not engage at the `[` of the prose.
 #[tokio::test]
-#[should_panic(expected = "streamed content deltas")]
 async fn a_bracket_in_the_prose_does_not_start_the_streamed_reply_of_an_object_schema() {
     assert_streamed(
         BRACKET_PROSE_THEN_OBJECT,
@@ -1112,17 +1097,38 @@ async fn a_bracket_in_the_prose_does_not_start_the_streamed_reply_of_an_object_s
     .await;
 }
 
-// ── Wrong today: a streamed reply that is not engaged completes ─────────────
+// ── A streamed reply that is not engaged is refused ─────────────────────────
 
 #[tokio::test]
-#[should_panic(expected = "streamed reply that is not engaged")]
 async fn a_streamed_reply_whose_grammar_never_engaged_ends_with_an_error_event() {
     assert_stream_refuses(ask(NO_JSON, Mode::JsonObject, true)).await;
 }
 
+/// The refused stream is a mid-stream failure: the error event, then `[DONE]`.
+/// The request asks for a usage chunk, and a failed stream sends none.
+#[tokio::test]
+async fn a_refused_stream_sends_the_error_event_and_nothing_after_it() {
+    let (status, raw, _) = serve(ask(NO_JSON, Mode::JsonObject, true)).await;
+    assert_eq!(status, 200, "body: {raw}");
+    let data: Vec<&str> = raw
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("data:"))
+        .map(str::trim)
+        .collect();
+    let at = data
+        .iter()
+        .position(|d| d.contains("\"error\""))
+        .unwrap_or_else(|| panic!("no error event: {data:?}"));
+    let error: Value = serde_json::from_str(data[at]).unwrap();
+    assert_eq!(error["error"]["type"], "constraint_not_engaged");
+    assert!(error["error"]["message"].is_string());
+    assert_eq!(error.as_object().unwrap().len(), 1, "the envelope only");
+    assert_eq!(data[at + 1..], ["[DONE]"], "nothing after the error event");
+    assert!(!raw.contains("\"usage\":{"), "no usage chunk: {raw}");
+}
+
 /// The generation ends at the stop string, before the grammar engaged.
 #[tokio::test]
-#[should_panic(expected = "streamed reply that is not engaged")]
 async fn a_stop_string_in_the_prose_ends_the_streamed_reply_with_an_error_event() {
     let stopped = Ask {
         stop: Some(" JSON"),
@@ -1131,28 +1137,24 @@ async fn a_stop_string_in_the_prose_ends_the_streamed_reply_with_an_error_event(
     assert_stream_refuses(stopped).await;
 }
 
-// ── Wrong today: the non-streamed reply is one smaller value ────────────────
+// ── The non-streamed reply is never one smaller value ───────────────────────
 
 #[tokio::test]
-#[should_panic(expected = "non-streamed content")]
 async fn an_object_cut_by_the_token_limit_is_not_returned_as_its_first_key() {
     assert_blocking(CUT_OBJECT, Mode::JsonObject, CUT_OBJECT_TEXT).await;
 }
 
 #[tokio::test]
-#[should_panic(expected = "non-streamed content")]
 async fn a_cut_object_of_an_object_schema_is_not_returned_as_its_first_key() {
     assert_blocking(CUT_SCHEMA_OBJECT, Mode::Schema(SCHEMA_OBJECT), r#"{"a":"#).await;
 }
 
 #[tokio::test]
-#[should_panic(expected = "non-streamed content")]
 async fn a_cut_object_in_a_json_fence_is_not_returned_as_its_first_key() {
     assert_blocking(CUT_OBJECT_IN_JSON_FENCE, Mode::JsonObject, CUT_OBJECT_TEXT).await;
 }
 
 #[tokio::test]
-#[should_panic(expected = "non-streamed content")]
 async fn a_cut_object_is_not_returned_as_a_closed_inner_object_or_key() {
     assert_blocking(
         CUT_AFTER_INNER_OBJECT,
@@ -1163,31 +1165,26 @@ async fn a_cut_object_is_not_returned_as_a_closed_inner_object_or_key() {
 }
 
 #[tokio::test]
-#[should_panic(expected = "non-streamed content")]
 async fn a_cut_array_is_not_returned_as_its_first_number() {
     assert_blocking(CUT_ARRAY, Mode::JsonObject, "[10, 20,").await;
 }
 
 #[tokio::test]
-#[should_panic(expected = "non-streamed content")]
 async fn a_number_in_the_prose_is_not_returned_in_place_of_the_object() {
     assert_blocking(PROSE_WITH_NUMBER, Mode::JsonObject, OBJECT_TEXT).await;
 }
 
 #[tokio::test]
-#[should_panic(expected = "non-streamed content")]
 async fn a_number_in_the_prose_is_not_returned_in_place_of_the_object_of_a_schema() {
     assert_blocking(PROSE_WITH_NUMBER, Mode::Schema(SCHEMA_OBJECT), OBJECT_TEXT).await;
 }
 
 #[tokio::test]
-#[should_panic(expected = "non-streamed content")]
 async fn a_quoted_word_in_the_prose_is_not_returned_in_place_of_the_object() {
     assert_blocking(PROSE_WITH_QUOTED_WORD, Mode::JsonObject, OBJECT_TEXT).await;
 }
 
 #[tokio::test]
-#[should_panic(expected = "non-streamed content")]
 async fn a_brace_in_the_prose_is_not_returned_in_place_of_the_array_of_a_schema() {
     assert_blocking(
         BRACE_PROSE_THEN_ARRAY,
@@ -1198,7 +1195,6 @@ async fn a_brace_in_the_prose_is_not_returned_in_place_of_the_array_of_a_schema(
 }
 
 #[tokio::test]
-#[should_panic(expected = "non-streamed content")]
 async fn a_bracket_in_the_prose_is_not_returned_in_place_of_the_object_of_a_schema() {
     assert_blocking(
         BRACKET_PROSE_THEN_OBJECT,
@@ -1208,9 +1204,9 @@ async fn a_bracket_in_the_prose_is_not_returned_in_place_of_the_object_of_a_sche
     .await;
 }
 
-/// The streamed reply holds this white space today, so the two paths differ.
+/// The streamed reply holds this white space, so the non-streamed reply holds
+/// it also.
 #[tokio::test]
-#[should_panic(expected = "non-streamed content")]
 async fn white_space_after_the_closed_object_is_in_the_non_streamed_reply() {
     assert_blocking(OBJECT_THEN_NEWLINE, Mode::JsonObject, "{\"a\": 1}\n").await;
 }
@@ -1218,7 +1214,6 @@ async fn white_space_after_the_closed_object_is_in_the_non_streamed_reply() {
 /// A stop string inside the JSON ends the non-streamed reply before it, as it
 /// ends the streamed reply.
 #[tokio::test]
-#[should_panic(expected = "non-streamed content")]
 async fn a_stop_string_inside_the_object_cuts_the_non_streamed_reply_there() {
     let stopped = Ask {
         stop: Some(","),
@@ -1231,7 +1226,6 @@ async fn a_stop_string_inside_the_object_cuts_the_non_streamed_reply_there() {
 
 /// The generation ends at the stop string, before the grammar engaged.
 #[tokio::test]
-#[should_panic(expected = "non-streamed status")]
 async fn a_stop_string_in_the_prose_makes_the_non_streamed_reply_a_refusal() {
     let stopped = Ask {
         stop: Some(" JSON"),

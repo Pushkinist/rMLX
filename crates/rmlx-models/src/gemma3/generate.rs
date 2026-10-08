@@ -534,6 +534,10 @@ fn exact_hit_decode<'a>(
         "gemma3 generate_greedy: prompt cache EXACT HIT"
     );
 
+    // The constraint sees every token, a replayed one included.
+    if let Some(c) = constraint.as_mut() {
+        c.advance(last_id);
+    }
     step_fn(steps.push_mut(ProbeStep {
         token_id: last_id,
         piece: piece.into_boxed_str(),

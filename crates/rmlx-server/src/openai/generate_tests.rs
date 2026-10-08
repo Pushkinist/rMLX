@@ -130,9 +130,8 @@ async fn blocking_ttft_ring_populated() {
         None,
         "test-model",
         None,
-        false,
-        false,
         None,
+        false,
         Instant::now(),
         None,
         0,
@@ -180,9 +179,8 @@ async fn blocking_ttft_ring_empty_on_engine_error() {
         None,
         "test-model",
         None,
-        false,
-        false,
         None,
+        false,
         Instant::now(),
         None,
         0,
@@ -229,9 +227,8 @@ async fn blocking_ttft_ring_respects_capacity() {
             None,
             &model,
             None,
-            false,
-            false,
             None,
+            false,
             Instant::now(),
             None,
             0,
@@ -264,4 +261,97 @@ async fn blocking_ttft_ring_respects_capacity() {
         ring.iter().all(|s| s.model_id != "model-1"),
         "model-1 must have been evicted"
     );
+}
+
+// ── `response_format` reply: logprobs ─────────────────────────────────────────
+
+/// Emits one token for each `(piece, is_thinking)` with a logprob record whose
+/// token surface is the piece, then the terminal token.
+struct LogprobGenerator {
+    pieces: Vec<(&'static str, bool)>,
+}
+
+impl Generator for LogprobGenerator {
+    fn generate(
+        &self,
+        _req: GenerationRequest,
+    ) -> Pin<Box<dyn Stream<Item = rmlx_core::Result<GenerationToken>> + Send>> {
+        let token = |piece: &str, is_thinking: bool, done: bool| {
+            Ok(GenerationToken {
+                token_id: 1,
+                piece: piece.to_owned(),
+                done,
+                finish_reason: done.then(|| "stop".to_owned()),
+                is_thinking,
+                logprobs: (!done).then(|| crate::openai::ChatLogprobContent {
+                    token: piece.to_owned(),
+                    logprob: -0.5,
+                    bytes: None,
+                    top_logprobs: vec![],
+                }),
+            })
+        };
+        let mut tokens: Vec<_> = self
+            .pieces
+            .iter()
+            .map(|(piece, is_thinking)| token(piece, *is_thinking, false))
+            .collect();
+        tokens.push(token("", false, true));
+        Box::pin(stream::iter(tokens))
+    }
+}
+
+/// The non-streamed `logprobs` cover the reasoning tokens and the answer
+/// tokens whose bytes are in the content: the stream sends the same set.
+#[tokio::test]
+async fn blocking_json_mode_logprobs_cover_the_tokens_of_the_content() {
+    let ttft_store = TtftStore::default();
+    let counter = || Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (tokens_in, tokens_out) = (counter(), counter());
+    let (requests_completed, requests_failed) = (counter(), counter());
+    let error_counts = ApiErrorCounters::new();
+    let generator: Arc<dyn Generator> = Arc::new(LogprobGenerator {
+        pieces: vec![("hm", true), ("```", false), ("\n{", false), ("}", false)],
+    });
+    // The grammar engaged at the brace of the third token.
+    let engagement = Arc::new(rmlx_models::Engagement::default());
+    engagement.report(3, 1);
+
+    let response = super::generate_blocking(
+        generator,
+        minimal_request("test-model"),
+        None,
+        "test-model",
+        None,
+        Some(engagement),
+        false,
+        Instant::now(),
+        None,
+        0,
+        &tokens_in,
+        &tokens_out,
+        "req-logprobs",
+        &error_counts,
+        &requests_completed,
+        &requests_failed,
+        None,
+        false,
+        None,
+        &ttft_store,
+    )
+    .await;
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let choice = &body["choices"][0];
+    assert_eq!(choice["message"]["content"], "{}");
+    let surfaces: Vec<&str> = choice["logprobs"]["content"]
+        .as_array()
+        .expect("the reply has logprobs")
+        .iter()
+        .map(|entry| entry["token"].as_str().unwrap())
+        .collect();
+    assert_eq!(surfaces, ["hm", "\n{", "}"]);
 }

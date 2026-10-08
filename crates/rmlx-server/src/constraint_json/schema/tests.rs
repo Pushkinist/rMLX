@@ -676,42 +676,63 @@ fn scalar_root_boolean_immediate_engage() {
     assert!(c.finished(), "`true` completes boolean grammar");
 }
 
-/// Schema fence suppression: pre-engagement buffer detects fence.
+/// A scalar root engages on the first answer token. A token the mask did not
+/// see and the grammar cannot take is before the reply: the value starts in
+/// the next token.
 #[test]
-fn schema_fence_suppression_detected() {
+fn a_scalar_root_reports_the_token_after_one_the_grammar_cannot_take() {
     let bm = synthetic_bm(&[b"```json\n", b"\"ok\"", b""]);
     let schema = json!({"type":"string","enum":["ok","bad"]});
     let node = SchemaNode::parse(&schema, false).unwrap();
     let mut c = SchemaConstraint::from_parts(bm, vec![2], node, None);
-    // Token 0 is fence — Immediate policy engages immediately, but we want
-    // to check that the fence IS detected in pre_engage_buf before engagement.
-    // Reset engaged to test pre-buf accumulation via a non-Immediate path.
-    // We'll directly inspect the pre_engage_buf via pre_engage_is_fence.
-    // For the Immediate policy, pre_engage_buf is populated then engagement
-    // fires on the same token. The fence must be detectable.
-    c.advance(0); // token 0 = "```json\n" — not valid JSON, grammar rejects and clamps
-                  // pre_engage_buf should hold the fence text.
-    assert!(
-        c.pre_engage_is_fence(),
-        "fence prefix must be detected in pre_engage_buf"
-    );
+    let place = c.engagement().unwrap();
+    c.advance(0);
+    assert!(c.engaged, "Immediate policy engaged");
+    assert_eq!(place.bytes_before(1, "```json\n"), 8);
+    assert_eq!(place.bytes_before(2, "\"ok\""), 0);
 }
 
-/// fence_suppression negative: real prose before JSON is NOT flagged as fence.
+/// A scalar root that engages in `step_mask` reports the token that the mask
+/// constrains, and a legal first token reports its own first value byte.
 #[test]
-fn schema_fence_suppression_prose_not_fence() {
-    let bm = synthetic_bm(&[b"Sure, here: ", b"{", b"}", b""]);
+fn a_scalar_root_reports_the_first_value_byte() {
+    let schema = json!({"type":"string","enum":["ok","bad"]});
+    let node = || SchemaNode::parse(&schema, false).unwrap();
+
+    let bm = synthetic_bm(&[b"\"ok\"", b""]);
+    let mut masked = SchemaConstraint::from_parts(bm, vec![1], node(), None);
+    let place = masked.engagement().unwrap();
+    let _ = masked.step_mask(2);
+    assert_eq!(place.bytes_before(1, "\"ok\""), 0, "the masked token");
+
+    let bm = synthetic_bm(&[b" \"ok\"", b""]);
+    let mut unmasked = SchemaConstraint::from_parts(bm, vec![1], node(), None);
+    let place = unmasked.engagement().unwrap();
+    unmasked.advance(0);
+    assert_eq!(place.bytes_before(1, " \"ok\""), 1, "the space before it");
+}
+
+/// A container root does not engage on prose, and reports its opener.
+#[test]
+fn a_container_root_reports_its_opener() {
+    let bm = synthetic_bm(&[b"Sure, here: [", b"{", b"}", b""]);
     let schema = json!({"type":"object","properties":{"x":{"type":"integer"}}});
     let node = SchemaNode::parse(&schema, false).unwrap();
     // ValueStarter policy (object root).
     assert!(!node.is_scalar_root());
     let mut c = SchemaConstraint::from_parts(bm, vec![3], node, None);
-    c.advance(0); // prose token — ValueStarter, no engagement yet
+    let place = c.engagement().unwrap();
+    c.advance(0);
     assert!(!c.engaged, "no engagement on prose before `{{`");
-    assert!(
-        !c.pre_engage_is_fence(),
-        "real prose must NOT be flagged as fence"
+    assert_eq!(place.bytes_before(1, "x"), 1);
+    c.advance(1);
+    assert!(c.engaged);
+    assert_eq!(
+        place.bytes_before(1, "x"),
+        1,
+        "the prose is before the reply"
     );
+    assert_eq!(place.bytes_before(2, "{"), 0);
 }
 
 /// object/array roots keep ValueStarter policy (regression guard).

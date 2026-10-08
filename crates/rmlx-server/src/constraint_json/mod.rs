@@ -44,7 +44,7 @@
 //! | `strict` mode | All properties required, `additionalProperties:false`. |
 //! | Think-phase warm-up | `<think>…</think>` blocks on Qwen3/DeepSeek-R1 pass through without engaging. |
 //! | Scalar-root `Immediate` engage | Scalar-root schemas engage at the **first post-think token** regardless of its bytes; no waiting for `{`/`[` that never come. |
-//! | Markdown-fence suppression | Leading ` ```json\n ` wrapper stripped from `content` in both blocking and streaming paths. |
+//! | Reply start | The engine reports the byte at which it engaged (`Engagement`); the route cuts `content` there, streamed or not. |
 //!
 //! ## Schema keyword coverage — see [`schema`] module docs for the
 //! full gap table (every keyword × status × strict-mode decision).
@@ -84,7 +84,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use rmlx_models::ConstraintEngine;
+use rmlx_models::{ConstraintEngine, Engagement};
 
 pub mod schema;
 
@@ -757,14 +757,11 @@ pub struct JsonObjectConstraint {
     mask: Vec<bool>,
     /// Pre-engagement state — see the doc comment above.
     engaged: bool,
-    /// Mirror of `engaged` the route keeps a clone of. The engine itself is
-    /// moved into the decode thread, so this is the only way the route can
-    /// learn — after the stream drains — whether the grammar was ever applied.
-    engaged_flag: Arc<AtomicBool>,
-    /// Text accumulated from tokens seen before engagement. Used to detect
-    /// and suppress a leading markdown-fence (` ```json\n `) wrapper.
-    /// Cleared when engagement fires.
-    pre_engage_buf: String,
+    /// Where the grammar engaged. The route keeps a clone and cuts the reply
+    /// there; the engine itself is moved into the decode thread.
+    engagement: Arc<Engagement>,
+    /// How many tokens `advance` has seen.
+    advances: u32,
     /// Shared `is_thinking` flag updated by the route's step_fn after
     /// the think-splitter classifies each emitted token. When `true`,
     /// the constraint refuses to engage on `{` because the model is
@@ -800,8 +797,8 @@ impl JsonObjectConstraint {
             eos_ids,
             mask: Vec::new(),
             engaged: false,
-            engaged_flag: Arc::new(AtomicBool::new(false)),
-            pre_engage_buf: String::new(),
+            engagement: Arc::default(),
+            advances: 0,
             is_thinking: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -815,8 +812,8 @@ impl JsonObjectConstraint {
             eos_ids,
             mask: Vec::new(),
             engaged: false,
-            engaged_flag: Arc::new(AtomicBool::new(false)),
-            pre_engage_buf: String::new(),
+            engagement: Arc::default(),
+            advances: 0,
             is_thinking: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -824,21 +821,7 @@ impl JsonObjectConstraint {
     /// Force-engage the constraint, bypassing warm-up. Used by tests
     /// that drive the mask directly via [`feed_bytes`].
     pub fn force_engage(&mut self) {
-        self.mark_engaged();
-    }
-
-    /// The one place `engaged` flips, so the route-visible mirror can never
-    /// drift from the field the mask logic reads.
-    fn mark_engaged(&mut self) {
         self.engaged = true;
-        self.engaged_flag.store(true, Ordering::Release);
-    }
-
-    /// Shared handle the route reads after generation to learn whether the
-    /// engine ever engaged. `false` at end of stream means the response was
-    /// never checked against the requested grammar.
-    pub fn engaged_handle(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.engaged_flag)
     }
 
     /// Handle to the shared `is_thinking` flag. The route's step_fn
@@ -846,14 +829,6 @@ impl JsonObjectConstraint {
     /// each `advance` call to decide whether to scan for engagement.
     pub fn is_thinking_handle(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.is_thinking)
-    }
-
-    /// Returns `true` when the text accumulated before engagement is only
-    /// whitespace and/or a markdown fence header (```` ```json ```` /
-    /// ```` ``` ````). The route handler may discard that prefix from
-    /// `content` rather than leaking it.
-    pub fn pre_engage_is_fence(&self) -> bool {
-        schema::is_only_fence_or_whitespace(&self.pre_engage_buf)
     }
 
     /// Feed raw bytes into the grammar (used by tests + by `advance`).
@@ -947,6 +922,7 @@ impl ConstraintEngine for JsonObjectConstraint {
         reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or validated before call"
     )]
     fn advance(&mut self, token_id: u32) {
+        self.advances += 1;
         if self.eos_ids.contains(&token_id) {
             return;
         }
@@ -961,11 +937,6 @@ impl ConstraintEngine for JsonObjectConstraint {
             if self.is_thinking.load(Ordering::Relaxed) {
                 return;
             }
-            // Accumulate pre-engagement text so the handler can detect and
-            // suppress a leading markdown-fence wrapper.
-            if let Ok(s) = std::str::from_utf8(&bytes) {
-                self.pre_engage_buf.push_str(s);
-            }
             // Pre-engagement: engage on the next `{` or `[` byte. By
             // construction we only reach here when `is_thinking == false`,
             // so a structural opener signals the start of the answer
@@ -974,7 +945,8 @@ impl ConstraintEngine for JsonObjectConstraint {
             // which is still valid JSON; the grammar accepts top-level
             // arrays.
             if let Some(idx) = bytes.iter().position(|&b| b == b'{' || b == b'[') {
-                self.mark_engaged();
+                self.engaged = true;
+                self.engagement.report(self.advances, bytes.len() - idx);
                 tracing::info!(
                     token_id,
                     engage_byte = bytes[idx],
@@ -998,8 +970,8 @@ impl ConstraintEngine for JsonObjectConstraint {
         self.engaged
     }
 
-    fn engaged_handle(&self) -> Option<Arc<AtomicBool>> {
-        Some(Arc::clone(&self.engaged_flag))
+    fn engagement(&self) -> Option<Arc<Engagement>> {
+        Some(Arc::clone(&self.engagement))
     }
 
     /// Always returns `true` so the pipelined generate loop uses the masked

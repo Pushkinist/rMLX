@@ -95,15 +95,65 @@ pub trait ConstraintEngine: Send + Sync + std::fmt::Debug {
         true
     }
 
-    /// A shared mirror of [`engaged`](Self::engaged) that outlives the borrow.
+    /// Where the grammar engaged, in a handle that outlives the borrow.
     ///
-    /// [`engaged`](Self::engaged) answers the owner, which is the decode loop —
-    /// the engine is moved into its blocking closure and dropped there. A route
-    /// that wants the same answer *after* the token stream drains has to hold a
-    /// clone of this from before the move. `None` for engines with no warm-up:
-    /// there is nothing to report.
-    fn engaged_handle(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+    /// The engine is moved into the decode thread and dropped there. A route
+    /// that cuts the reply at the engagement byte holds a clone of this from
+    /// before the move. `None` for engines with no warm-up: the whole
+    /// generation is the value.
+    fn engagement(&self) -> Option<std::sync::Arc<Engagement>> {
         None
+    }
+}
+
+/// The place where a constraint's grammar engaged: the first byte of the
+/// value it enforces.
+///
+/// The constraint is the only writer. It names the token by its place in the
+/// sequence of [`ConstraintEngine::advance`] calls (the first is 1), and the
+/// byte by its distance from the end of that token's text. A detokenizer can
+/// change the start of a token's text (a leading space), and that does not
+/// move the byte. A decode loop shows a token to `advance` before it hands the
+/// token on, so a reader that has the n-th token can ask about it.
+#[derive(Debug, Default)]
+pub struct Engagement(std::sync::atomic::AtomicU64);
+
+impl Engagement {
+    const WHOLE_TOKEN: u32 = u32::MAX;
+
+    /// The value starts `bytes_to_end` bytes before the end of the text of
+    /// the `token`-th token.
+    pub fn report(&self, token: u32, bytes_to_end: usize) {
+        let bytes_to_end = u32::try_from(bytes_to_end).unwrap_or(Self::WHOLE_TOKEN);
+        self.0.store(
+            (u64::from(token) << 32) | u64::from(bytes_to_end),
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
+    /// The value starts at the first byte of the `token`-th token.
+    pub fn report_token_start(&self, token: u32) {
+        self.report(token, Self::WHOLE_TOKEN as usize);
+    }
+
+    /// How many bytes at the start of `piece`, the text of the `token`-th
+    /// token, are before the engagement byte. All of them while the grammar
+    /// has not engaged at or before that token.
+    pub fn bytes_before(&self, token: u32, piece: &str) -> usize {
+        let place = self.0.load(std::sync::atomic::Ordering::Acquire);
+        let (engaged_token, bytes_to_end) = ((place >> 32) as u32, place as u32 as usize);
+        if engaged_token == 0 || token < engaged_token {
+            return piece.len();
+        }
+        if token > engaged_token {
+            return 0;
+        }
+        let before = piece.len().saturating_sub(bytes_to_end);
+        if piece.is_char_boundary(before) {
+            before
+        } else {
+            0
+        }
     }
 }
 
@@ -178,6 +228,28 @@ pub(crate) mod tests {
         assert!(!c.finished());
         let m2 = c.step_mask(4);
         assert!(m2.iter().all(|&b| b));
+    }
+
+    #[test]
+    fn engagement_gives_the_bytes_of_each_token_that_are_before_the_value() {
+        let e = Engagement::default();
+        assert_eq!(e.bytes_before(1, "ab"), 2, "not engaged: all before");
+        e.report(3, 1);
+        assert_eq!(e.bytes_before(2, "ab"), 2, "a token before the place");
+        assert_eq!(e.bytes_before(3, "\n{"), 1, "the token of the place");
+        assert_eq!(e.bytes_before(3, " \n{"), 2, "counted from the end");
+        assert_eq!(e.bytes_before(3, ""), 0, "a text shorter than the tail");
+        assert_eq!(e.bytes_before(4, "ab"), 0, "a token after the place");
+        e.report(3, 2);
+        assert_eq!(e.bytes_before(3, "é{"), 0, "not inside a character");
+        e.report_token_start(5);
+        assert_eq!(e.bytes_before(4, "ab"), 2);
+        assert_eq!(e.bytes_before(5, "ab"), 0);
+    }
+
+    #[test]
+    fn noop_reports_no_engagement() {
+        assert!(NoOpConstraint::new().engagement().is_none());
     }
 
     #[test]
