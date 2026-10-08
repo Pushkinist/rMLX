@@ -266,9 +266,10 @@ async fn blocking_ttft_ring_respects_capacity() {
 // ── `response_format` reply: logprobs ─────────────────────────────────────────
 
 /// Emits one token for each `(piece, is_thinking)` with a logprob record whose
-/// token surface is the piece, then the terminal token.
+/// token surface is the piece, then the terminal token with the text `tail`.
 struct LogprobGenerator {
     pieces: Vec<(&'static str, bool)>,
+    tail: &'static str,
 }
 
 impl Generator for LogprobGenerator {
@@ -296,41 +297,36 @@ impl Generator for LogprobGenerator {
             .iter()
             .map(|(piece, is_thinking)| token(piece, *is_thinking, false))
             .collect();
-        tokens.push(token("", false, true));
+        tokens.push(token(self.tail, false, true));
         Box::pin(stream::iter(tokens))
     }
 }
 
-/// The non-streamed `logprobs` cover the reasoning tokens and the answer
-/// tokens whose bytes are in the content: the stream sends the same set.
-#[tokio::test]
-async fn blocking_json_mode_logprobs_cover_the_tokens_of_the_content() {
+/// The JSON body of one `generate_blocking` reply whose constraint reported
+/// `engagement`.
+async fn blocking_reply(
+    generator: LogprobGenerator,
+    engagement: rmlx_models::Engagement,
+) -> serde_json::Value {
     let ttft_store = TtftStore::default();
     let counter = || Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (tokens_in, tokens_out) = (counter(), counter());
     let (requests_completed, requests_failed) = (counter(), counter());
     let error_counts = ApiErrorCounters::new();
-    let generator: Arc<dyn Generator> = Arc::new(LogprobGenerator {
-        pieces: vec![("hm", true), ("```", false), ("\n{", false), ("}", false)],
-    });
-    // The grammar engaged at the brace of the third token.
-    let engagement = Arc::new(rmlx_models::Engagement::default());
-    engagement.report(3, 1);
-
     let response = super::generate_blocking(
-        generator,
+        Arc::new(generator),
         minimal_request("test-model"),
         None,
         "test-model",
         None,
-        Some(engagement),
+        Some(Arc::new(engagement)),
         false,
         Instant::now(),
         None,
         0,
         &tokens_in,
         &tokens_out,
-        "req-logprobs",
+        "req-json",
         &error_counts,
         &requests_completed,
         &requests_failed,
@@ -340,11 +336,25 @@ async fn blocking_json_mode_logprobs_cover_the_tokens_of_the_content() {
         &ttft_store,
     )
     .await;
-
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
-    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+/// The non-streamed `logprobs` cover the reasoning tokens and the answer
+/// tokens whose bytes are in the content: the stream sends the same set.
+#[tokio::test]
+async fn blocking_json_mode_logprobs_cover_the_tokens_of_the_content() {
+    let generator = LogprobGenerator {
+        pieces: vec![("hm", true), ("```", false), ("\n{", false), ("}", false)],
+        tail: "",
+    };
+    // The grammar engaged at the brace of the third token.
+    let engagement = rmlx_models::Engagement::default();
+    engagement.report(3, 1);
+
+    let body = blocking_reply(generator, engagement).await;
     let choice = &body["choices"][0];
     assert_eq!(choice["message"]["content"], "{}");
     let surfaces: Vec<&str> = choice["logprobs"]["content"]
@@ -354,4 +364,19 @@ async fn blocking_json_mode_logprobs_cover_the_tokens_of_the_content() {
         .map(|entry| entry["token"].as_str().unwrap())
         .collect();
     assert_eq!(surfaces, ["hm", "\n{", "}"]);
+}
+
+/// The terminal token can carry text (the end of a character that the
+/// detokenizer held). A reply can start in it.
+#[tokio::test]
+async fn blocking_json_mode_reply_can_start_in_the_terminal_token() {
+    let generator = LogprobGenerator {
+        pieces: vec![("```", false)],
+        tail: "\n{",
+    };
+    let engagement = rmlx_models::Engagement::default();
+    engagement.report(2, 1);
+
+    let body = blocking_reply(generator, engagement).await;
+    assert_eq!(body["choices"][0]["message"]["content"], "{");
 }

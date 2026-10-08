@@ -238,6 +238,7 @@ const CUT_AFTER_INNER_OBJECT: Script = length(&[
 ]);
 const CUT_ARRAY: Script = length(&["[", "10", ",", " 20", ","]);
 const CUT_SCHEMA_OBJECT: Script = length(&["{", "\"a\"", ":"]);
+const CUT_AT_THE_BRACE: Script = length(&["```", "\n{"]);
 const NO_JSON: Script = stop(&["I", " cannot", " do", " that"]);
 
 const SCALAR_TRUE: Script = stop(&["true"]);
@@ -1018,6 +1019,36 @@ async fn a_stop_string_inside_the_object_cuts_the_streamed_reply_there() {
     assert_eq!(got.content, ["{", "\"a\"", ":", " 1"]);
     assert_eq!(got.finish, ["stop"]);
     assert!(got.errors.is_empty(), "{:?}", got.errors);
+}
+
+/// A stop string that does not match holds back the end of the text. That
+/// text is cut at the engagement byte as all other text is.
+#[tokio::test]
+async fn text_held_for_a_stop_string_is_cut_at_the_engagement_byte_on_both_paths() {
+    for stream in [true, false] {
+        let held = Ask {
+            stop: Some("\n{x"),
+            ..ask(CUT_AT_THE_BRACE, Mode::JsonObject, stream)
+        };
+        let (got, _) = reply(held).await;
+        assert_eq!(got.text(), "{", "stream={stream}");
+        assert_eq!(got.finish, ["length"], "stream={stream}");
+    }
+}
+
+/// A stop string that starts inside a token keeps the text of that token
+/// before it.
+#[tokio::test]
+async fn a_stop_string_inside_a_token_keeps_the_text_before_it_on_both_paths() {
+    for stream in [true, false] {
+        let stopped = Ask {
+            stop: Some("a\""),
+            ..ask(TWO_KEYS, Mode::JsonObject, stream)
+        };
+        let (got, _) = reply(stopped).await;
+        assert_eq!(got.text(), "{\"", "stream={stream}");
+        assert_eq!(got.finish, ["stop"], "stream={stream}");
+    }
 }
 
 // ── The streamed reply starts at the engagement byte ────────────────────────
