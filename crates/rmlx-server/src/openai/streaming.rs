@@ -244,13 +244,11 @@ pub(crate) fn handle_streaming_token(
 
     // A forced tool call is the text from the engagement byte on, in either
     // channel.
-    let piece = match state.json_reply.as_mut() {
-        Some(reply) if state.bare_json_tool_call_mode => {
-            reply.receive(state.completion_tokens, &piece);
-            reply.release(&piece).to_owned()
-        }
-        _ => piece,
-    };
+    let mut piece = piece;
+    if let (Some(reply), true) = (state.json_reply.as_mut(), state.bare_json_tool_call_mode) {
+        reply.receive(state.completion_tokens, &piece);
+        piece.drain(..reply.release(&piece));
+    }
 
     // bare_json_tool_call_mode — when tool_choice=required/named the
     // constraint forces bare JSON output. For thinking models (Bonsai/Qwen3)
@@ -321,7 +319,7 @@ pub(crate) fn handle_streaming_token(
                         "text before the engagement byte is not in the `response_format` reply"
                     );
                 }
-                let released = if state.stop_hit {
+                let mut released = if state.stop_hit {
                     String::new()
                 } else if state.stop_matcher.is_active() {
                     let pushed = state.stop_matcher.push(&piece);
@@ -336,7 +334,8 @@ pub(crate) fn handle_streaming_token(
                 } else {
                     piece
                 };
-                reply.release(&released).to_owned()
+                released.drain(..reply.release(&released));
+                released
             }
             _ => piece,
         };
@@ -452,11 +451,12 @@ pub(crate) fn handle_streaming_token(
         // If a stop matcher is active and no stop matched, flush the
         // held-back tail (it cannot grow into a stop string at end-of-stream).
         if !state.stop_hit && state.stop_matcher.is_active() {
-            let tail = state.stop_matcher.finalize();
-            let tail = match state.json_reply.as_mut() {
-                Some(reply) if !state.bare_json_tool_call_mode => reply.release(&tail).to_owned(),
-                _ => tail,
-            };
+            let mut tail = state.stop_matcher.finalize();
+            if let (Some(reply), false) =
+                (state.json_reply.as_mut(), state.bare_json_tool_call_mode)
+            {
+                tail.drain(..reply.release(&tail));
+            }
             if !tail.is_empty() {
                 let chunk = make_content_chunk(state, Some(tail), None, false, None, None);
                 out.push(Ok(chunk_to_event(&chunk)));
@@ -508,6 +508,9 @@ pub(crate) fn handle_streaming_token(
                 .lifetime_requests_failed
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
+                model = %state.model,
+                id = %state.id,
+                completion_tokens = state.completion_tokens,
                 "refusing: the streamed text ends before the `response_format` grammar engaged"
             );
             return vec![Ok(error_event(NOT_ENGAGED_MESSAGE, NOT_ENGAGED_TYPE))];

@@ -242,19 +242,22 @@ on Gemma4, Gemma3, Qwen3.5-MoE and BitNet an exact hit emits no logprob for
 the replayed token, so `logprobs.content` is one entry short. See
 [`PROMPT_CACHE.md`](PROMPT_CACHE.md) § "First-token logprob on Exact hit".
 
+An `eos_token_id` token ends a generation and adds no text.
+
 **JSON-mode reply.** With `response_format` `json_object` or `json_schema`,
 `content` is the answer text from the byte at which the grammar engaged
 ([`SAMPLING.md`](SAMPLING.md) § "Non-enforcement is reported") to its end,
 streaming or not:
 
-- Text before that byte (prose, a code-fence header) is not in `content`, and
-  `logprobs` has no entry for its tokens.
-- No byte after it is dropped or added. White space after the value stays. A
-  value cut by `max_tokens` is returned cut, with `finish_reason:"length"`:
-  read `finish_reason` before parsing.
-- `stop` is matched on the whole answer text, then the rule above applies.
-- Text that ends before that byte is refused: 502 `constraint_not_engaged`,
-  or, streaming, the error event below with that type and no content delta.
+- Text before that byte (prose, a fence) is not in `content` or
+  `logprobs`.
+- No byte after it is dropped or added: white space after the value stays,
+  and a value cut by `max_tokens` is returned cut (`finish_reason:"length"`).
+- `stop` is matched on the whole answer text first.
+- Text that ends before that byte is refused: 502 `constraint_not_engaged`;
+  streaming, that error event and no content delta.
+- Known limit: an `integer` or `number` root can be wrong with
+  `finish_reason:"stop"`: sign characters before it, or its first token only.
 
 **Streaming** (`stream:true`): each SSE event is a `data:` line holding a
 `ChatCompletionChunk`:
@@ -422,7 +425,7 @@ Errors use the OpenAI envelope:
 | 408 | `timeout` | The request timeout expired. |
 | 429 | `rate_limit_error` | The GPU admission queue is full. |
 | 500 | `internal_error` | A handler panic, a prompt-pipeline task panic, or an embeddings preprocessor or compute failure. The audio routes send 500 as `{"error":"…"}`. |
-| 502 | `constraint_not_engaged` | A `response_format` reply with no text at the engagement byte (streaming: an error event). |
+| 502 | `constraint_not_engaged` | A `response_format` reply with no text at the engagement byte (streaming: error event). |
 | 503 | `service_unavailable` | Any load failure, OOM while loading included, and any other engine error. With `--require-smoke-probe` (off by default) a failed smoke probe at load lands here too. Counter: `upstream`. |
 | 503 | `admission_sla_exceeded` | The adaptive controller's anticipatory rejection, with `Retry-After: 5`. Counter: `admission_sla_503`. |
 
@@ -578,9 +581,10 @@ The `SchemaConstraint` runs with `EngagePolicy::Immediate`, so masking starts
 at the first token. The output has no `<tool_call>` wrapper, so the marker
 parser is bypassed: `bare_json_to_tool_call` turns the text into the
 `tool_calls` envelope. Streaming buffers the JSON and emits one `tool_calls`
-delta at the end. If the constraint cannot be built, for example because the
-named tool is not in `tools`, the request runs unconstrained and returns no
-error.
+delta at the end. If the constraint cannot be built (the tool is not in
+`tools`, or its schema does not compile), the request runs unconstrained: a
+marked call is parsed as for `auto`, else the text is tried as bare JSON,
+else returned as text.
 
 ### EOF recovery
 

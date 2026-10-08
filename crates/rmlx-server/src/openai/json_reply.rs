@@ -57,14 +57,16 @@ impl JsonReply {
         self.received += piece.len();
     }
 
-    /// The part of `text` that is in the reply. `text` is the next answer
-    /// text in order: all of it, or what a stop matcher let through.
-    pub(crate) fn release<'a>(&mut self, text: &'a str) -> &'a str {
+    /// How many bytes at the start of `text` are before the reply. `text` is
+    /// the next answer text in order: all of it, or what a stop matcher let
+    /// through.
+    pub(crate) fn release(&mut self, text: &str) -> usize {
         let from = self.released;
         self.released += text.len();
         self.start
-            .and_then(|start| text.get(start.saturating_sub(from)..))
-            .unwrap_or_default()
+            .map(|start| start.saturating_sub(from))
+            .filter(|&before| text.is_char_boundary(before))
+            .unwrap_or(text.len())
     }
 
     /// `true` when released text reached the engagement byte.

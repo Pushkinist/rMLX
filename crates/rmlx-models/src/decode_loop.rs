@@ -181,6 +181,27 @@ impl PostDecode {
     }
 }
 
+/// Emit the first token of an exact prompt-cache hit. The token is replayed,
+/// not sampled, and the constraint sees it before the step callback as it
+/// sees every sampled token. Returns `true` when the token ends the
+/// generation.
+pub(crate) fn emit_replayed_token(
+    constraint: &mut Option<&mut dyn ConstraintEngine>,
+    step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    steps: &mut Vec<ProbeStep>,
+    token_history: &mut Vec<u32>,
+    eos_ids: &[u32],
+    step: ProbeStep,
+) -> bool {
+    let token_id = step.token_id;
+    if let Some(c) = constraint.as_mut() {
+        c.advance(token_id);
+    }
+    step_fn(steps.push_mut(step));
+    token_history.push(token_id);
+    eos_ids.contains(&token_id)
+}
+
 /// Abort a generation whose prefill logits contain NaN.
 ///
 /// A logit row with NaN in it is not a degraded answer, it is no answer: greedy

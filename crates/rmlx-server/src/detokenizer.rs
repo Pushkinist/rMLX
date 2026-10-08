@@ -166,6 +166,13 @@ pub struct StreamingDetokenizer {
     /// True until the first non-empty segment is emitted (for the
     /// strict-SPM first-segment leading-space rule).
     first_segment_pending: bool,
+    /// The ids that end a generation. Such a token is a control token and
+    /// adds no text, also when the tokenizer file does not mark it special.
+    #[allow(
+        clippy::rc_buffer,
+        reason = "the generator's own list, shared with no copy for each request"
+    )]
+    eos_ids: std::sync::Arc<Vec<u32>>,
 }
 
 impl StreamingDetokenizer {
@@ -176,7 +183,20 @@ impl StreamingDetokenizer {
             ids: Vec::new(),
             decoded: String::new(),
             first_segment_pending: true,
+            eos_ids: std::sync::Arc::default(),
         }
+    }
+
+    /// Give the ids that end a generation: [`step`](Self::step) returns no
+    /// text for them.
+    #[must_use]
+    #[allow(
+        clippy::rc_buffer,
+        reason = "the generator's own list, shared with no copy for each request"
+    )]
+    pub fn with_eos_ids(mut self, eos_ids: std::sync::Arc<Vec<u32>>) -> Self {
+        self.eos_ids = eos_ids;
+        self
     }
 
     /// Detokenizer's view of all accepted ids (engine keeps its own for
@@ -196,6 +216,9 @@ impl StreamingDetokenizer {
         tk: &tokenizers::Tokenizer,
         id: u32,
     ) -> Result<String, tokenizers::Error> {
+        if self.eos_ids.contains(&id) {
+            return Ok(String::new());
+        }
         self.ids.push(id);
         let full = tk.decode(&self.ids, true)?;
         Ok(self.diff_emit(full))

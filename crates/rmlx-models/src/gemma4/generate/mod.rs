@@ -243,24 +243,21 @@ pub fn generate_greedy<'a>(
     // closure threads only `kv_caches`.
     // ------------------------------------------------------------------
     if let Some((mut kv_caches, last_id, piece)) = exact_hit {
-        // The constraint sees every token, a replayed one included.
-        if let Some(c) = constraint.as_mut() {
-            c.advance(last_id);
-        }
-        step_fn(steps.push_mut(ProbeStep {
-            token_id: last_id,
-            piece: piece.into_boxed_str(),
-            max_abs_logit: 0.0,
-            nan_count: 0,
-            logprobs: None,
-        }));
-        // exact-hit token into history.
-        token_history.push(last_id);
-
-        // EOS-stop. If the cached first token is an EOS, no decode steps —
-        // return before the loop, with no kv-bytes store and no decode_profile
-        // emission (the cached snapshot already accounts for its own bytes).
-        if eos_ids.contains(&last_id) {
+        let ends = crate::decode_loop::emit_replayed_token(
+            &mut constraint,
+            step_fn,
+            &mut steps,
+            token_history,
+            eos_ids,
+            ProbeStep {
+                token_id: last_id,
+                piece: piece.into_boxed_str(),
+                max_abs_logit: 0.0,
+                nan_count: 0,
+                logprobs: None,
+            },
+        );
+        if ends {
             return Ok(steps);
         }
 

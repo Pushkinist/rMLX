@@ -288,7 +288,7 @@ fn warm_up_blocks_engagement_during_thinking() {
 #[test]
 fn the_engagement_report_names_the_brace() {
     for pre in [&b"```json\n"[..], &b"Sure, here: "[..]] {
-        let pm = synthetic_bytes_map(&[pre, b"\n{", b"}", b""]);
+        let pm = synthetic_bytes_map(&[pre, b"\n{\"a\"", b"}", b""]);
         let mut c = JsonObjectConstraint::from_bytes_map(pm, vec![3]);
         let place = c.engagement().unwrap();
         c.advance(0);
@@ -298,9 +298,9 @@ fn the_engagement_report_names_the_brace() {
         assert!(c.engaged, "engagement must fire on `{{` token");
         assert_eq!(place.bytes_before(1, "x"), 1, "the token before the brace");
         assert_eq!(
-            place.bytes_before(2, "\n{"),
+            place.bytes_before(2, "\n{\"a\""),
             1,
-            "the newline before the brace"
+            "the newline before the brace; the key after it is in the reply"
         );
         assert_eq!(place.bytes_before(3, "}"), 0, "a token after the brace");
     }

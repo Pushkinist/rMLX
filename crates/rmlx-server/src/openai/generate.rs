@@ -273,7 +273,7 @@ pub(super) async fn generate_blocking(
         bare_json_tool_call_mode,
         tool_calls_accum.is_empty(),
     ) {
-        let content = reply.release(&text).to_owned();
+        let dropped_bytes = reply.release(&text);
         if !reply.engaged() {
             tracing::warn!(
                 model_id,
@@ -291,10 +291,10 @@ pub(super) async fn generate_blocking(
         }
         tracing::debug!(
             model_id,
-            dropped_bytes = text.len() - content.len(),
+            dropped_bytes,
             "text before the engagement byte is not in the `response_format` reply"
         );
-        text = content;
+        text.drain(..dropped_bytes);
     }
 
     // Emit TTFT + token counts to SQLite via the SPSC drainer.
@@ -376,7 +376,7 @@ pub(super) async fn generate_blocking(
     // the response envelope has `tool_calls` and `content=""` (not raw JSON).
     let (text, tool_calls_accum) = if bare_json_tool_call_mode && tool_calls_accum.is_empty() {
         let json_str = match json_reply.as_mut() {
-            Some(reply) => reply.release(&text),
+            Some(reply) => &text[reply.release(&text)..],
             None => &text,
         };
         if let Some(tc) = bare_json_to_tool_call(json_str) {
@@ -390,7 +390,7 @@ pub(super) async fn generate_blocking(
                 json = %json_str,
                 "bare_json_tool_call_mode: could not parse constrained output as tool call; returning as content"
             );
-            (text, tool_calls_accum)
+            (json_str.to_owned(), tool_calls_accum)
         }
     } else {
         (text, tool_calls_accum)

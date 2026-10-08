@@ -715,7 +715,7 @@ fn a_scalar_root_reports_the_first_value_byte() {
 /// A container root does not engage on prose, and reports its opener.
 #[test]
 fn a_container_root_reports_its_opener() {
-    let bm = synthetic_bm(&[b"Sure, here: [", b"{", b"}", b""]);
+    let bm = synthetic_bm(&[b"Sure, here: [", b" {\"x\"", b"}", b""]);
     let schema = json!({"type":"object","properties":{"x":{"type":"integer"}}});
     let node = SchemaNode::parse(&schema, false).unwrap();
     // ValueStarter policy (object root).
@@ -732,7 +732,11 @@ fn a_container_root_reports_its_opener() {
         1,
         "the prose is before the reply"
     );
-    assert_eq!(place.bytes_before(2, "{"), 0);
+    assert_eq!(
+        place.bytes_before(2, " {\"x\""),
+        1,
+        "the key after the opener is in the reply"
+    );
 }
 
 /// object/array roots keep ValueStarter policy (regression guard).

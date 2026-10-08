@@ -218,3 +218,48 @@ fn finalize_flushes_truncated_tail_lossy() {
     let tail = dt.tail_after_decoded("ab\u{FFFD}");
     assert_eq!(tail, "\u{FFFD}");
 }
+
+// ── The token that ends the generation ───────────────────────────────
+
+/// A tokenizer whose end-of-turn marker is a plain vocabulary token, as in a
+/// checkpoint that lists the id in `eos_token_id` and does not mark the token
+/// special.
+fn tokenizer_with_a_plain_end_marker() -> tokenizers::Tokenizer {
+    let json = serde_json::json!({
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": [],
+        "normalizer": null,
+        "pre_tokenizer": null,
+        "post_processor": null,
+        "decoder": null,
+        "model": {
+            "type": "WordLevel",
+            "vocab": {"{}": 0, "</assistant>": 1, "[UNK]": 2},
+            "unk_token": "[UNK]"
+        }
+    });
+    json.to_string().parse().unwrap()
+}
+
+#[test]
+fn an_eos_token_adds_no_text_when_the_tokenizer_does_not_mark_it_special() {
+    let tk = tokenizer_with_a_plain_end_marker();
+    let mut dt =
+        StreamingDetokenizer::new(TokenizerKind::Other).with_eos_ids(std::sync::Arc::new(vec![1]));
+    let mut out = dt.step(&tk, 0).unwrap();
+    out.push_str(&dt.step(&tk, 1).unwrap());
+    out.push_str(&dt.finalize(&tk).unwrap());
+    assert_eq!(out, "{}");
+}
+
+#[test]
+fn a_token_that_is_not_an_eos_id_keeps_its_text() {
+    let tk = tokenizer_with_a_plain_end_marker();
+    let mut dt = StreamingDetokenizer::new(TokenizerKind::Other);
+    let mut out = dt.step(&tk, 0).unwrap();
+    out.push_str(&dt.step(&tk, 1).unwrap());
+    out.push_str(&dt.finalize(&tk).unwrap());
+    assert_eq!(out, "{} </assistant>");
+}

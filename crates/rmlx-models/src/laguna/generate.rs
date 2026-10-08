@@ -189,21 +189,21 @@ pub fn generate_greedy(
             token_id = last_id,
             "laguna generate_greedy: prompt cache EXACT HIT"
         );
-        // The constraint sees every token, a replayed one included.
-        if let Some(c) = constraint.as_mut() {
-            c.advance(last_id);
-        }
-        steps.push(ProbeStep {
-            token_id: last_id,
-            piece: piece.into_boxed_str(),
-            max_abs_logit: 0.0,
-            nan_count: 0,
-            logprobs: None,
-        });
-        step_fn(steps.last().unwrap());
-        token_history.push(last_id);
-
-        if eos_ids.contains(&last_id) {
+        let ends = crate::decode_loop::emit_replayed_token(
+            &mut constraint,
+            step_fn,
+            &mut steps,
+            token_history,
+            eos_ids,
+            ProbeStep {
+                token_id: last_id,
+                piece: piece.into_boxed_str(),
+                max_abs_logit: 0.0,
+                nan_count: 0,
+                logprobs: None,
+            },
+        );
+        if ends {
             return Ok(steps);
         }
 

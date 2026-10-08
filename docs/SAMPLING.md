@@ -442,8 +442,9 @@ engaged, and also a reply that a `stop` string ended before the byte:
 - Only `response_format` is refused. A forced `tool_choice` also builds a
   constraint; a reply that does not parse as a tool call is returned as text.
 
-Either way the decode loop emits a `warn!` carrying the route's `request_id`.
-The span is carried across `spawn_blocking` explicitly.
+The route logs each refusal with a `warn!`. When the engine never engaged,
+the decode loop also emits a `warn!` carrying the route's `request_id`; the
+span is carried across `spawn_blocking` explicitly.
 
 ---
 

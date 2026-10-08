@@ -108,6 +108,9 @@ const VOCAB: &[&str] = &[
     "\"name\"",
     "\"f\"",
     "\"arguments\"",
+    "{\"a\"",
+    "<tool_call>",
+    "</tool_call>",
 ];
 
 fn token_id(piece: &str) -> u32 {
@@ -147,6 +150,9 @@ struct Script {
     thinking: &'static [&'static str],
     answer: &'static [&'static str],
     finish: &'static str,
+    /// The first answer token is replayed from a prompt cache: the constraint
+    /// sees it, and no mask was applied to it.
+    replayed_first: bool,
 }
 
 impl Script {
@@ -161,6 +167,7 @@ const fn stop(answer: &'static [&'static str]) -> Script {
         thinking: &[],
         answer,
         finish: "stop",
+        replayed_first: false,
     }
 }
 
@@ -169,6 +176,7 @@ const fn length(answer: &'static [&'static str]) -> Script {
         thinking: &[],
         answer,
         finish: "length",
+        replayed_first: false,
     }
 }
 
@@ -181,9 +189,11 @@ const OBJECT_AFTER_REASONING: Script = Script {
     thinking: &["Let", " me", " think", " {\"x\"}"],
     answer: OBJECT_PIECES,
     finish: "stop",
+    replayed_first: false,
 };
 const OBJECT_THEN_NEWLINE: Script = stop(&["{", "\"a\"", ":", " 1", "}\n"]);
 const TWO_KEYS: Script = stop(&["{", "\"a\"", ":", " 1", ",", "\"b\"", ":", " 1", "}"]);
+const FENCE_THEN_BRACE_AND_KEY: Script = stop(&["```", "\n", "{\"a\"", ":", " 1", "}"]);
 const BARE_FENCE: Script = stop(&["```", "\n", "{", "\"a\"", ":", " 1", "}"]);
 const BARE_FENCE_MID_TOKEN: Script = stop(&["```", "\n{", "\"a\"", ":", " 1", "}"]);
 const JSON_FENCE: Script = stop(&["```", "json", "\n", "{", "\"a\"", ":", " 1", "}"]);
@@ -264,6 +274,36 @@ const TOOL_CALL: Script = stop(&[
 ]);
 const CUT_TOOL_CALL: Script = length(&["{", "\"name\"", ":", "\"f\"", ",", "\"arguments\"", ":"]);
 
+const MARKED_TOOL_CALL: Script = stop(&[
+    "<tool_call>",
+    "{",
+    "\"name\"",
+    ":",
+    "\"f\"",
+    ",",
+    "\"arguments\"",
+    ":",
+    "{",
+    "}",
+    "}",
+    "</tool_call>",
+]);
+const CUT_TOOL_CALL_AFTER_A_REPLAYED_WORD: Script = Script {
+    thinking: &[],
+    answer: &[
+        "Here",
+        "{",
+        "\"name\"",
+        ":",
+        "\"f\"",
+        ",",
+        "\"arguments\"",
+        ":",
+    ],
+    finish: "length",
+    replayed_first: true,
+};
+
 // ── Scripted generator ──────────────────────────────────────────────────────
 
 /// What the generator saw. `violations` is empty for a sound script.
@@ -321,8 +361,9 @@ impl Generator for ScriptedGenerator {
         }
 
         for (id, piece, is_thinking, answer_at) in steps {
+            let masked = !(self.script.replayed_first && answer_at == Some(0));
             if let Some(c) = constraint.as_mut() {
-                if !c.step_mask(VOCAB.len())[id as usize] {
+                if masked && !c.step_mask(VOCAB.len())[id as usize] {
                     seen.violations.push(format!(
                         "the grammar refuses token {:?}",
                         VOCAB[id as usize]
@@ -396,7 +437,9 @@ fn scripted_state(
     .unwrap();
     std::fs::write(
         snap.join("chat_template.jinja"),
-        "{% for m in messages %}{{ m['content'] }}{% endfor %}",
+        // The comment names the Hermes markers, so the route has a tool-call
+        // parser for this model.
+        "{% for m in messages %}{{ m['content'] }}{% endfor %}{# <tool_call>{\"name\" #}",
     )
     .unwrap();
     std::fs::write(snap.join("tokenizer.json"), tokenizer_json()).unwrap();
@@ -525,6 +568,9 @@ enum Mode {
     Text,
     NoFormat,
     RequiredTool,
+    /// A forced tool call whose schema the route cannot compile: the request
+    /// runs with no constraint.
+    RequiredToolUnconstrained,
 }
 
 impl Mode {
@@ -581,6 +627,20 @@ fn request_body(mode: Mode, stop: Option<&str>, stream: bool) -> String {
         }
         Mode::Text => body["response_format"] = json!({"type": "text"}),
         Mode::NoFormat => {}
+        Mode::RequiredToolUnconstrained => {
+            body["tools"] = json!([{
+                "type": "function",
+                "function": {
+                    "name": "f",
+                    "parameters": {
+                        "type": "object",
+                        "$defs": {"P": {"type": "object", "properties": {}}},
+                        "properties": {"p": {"$ref": "#/$defs/P"}}
+                    }
+                }
+            }]);
+            body["tool_choice"] = json!("required");
+        }
         Mode::RequiredTool => {
             body["tools"] = json!([{
                 "type": "function",
@@ -836,6 +896,17 @@ async fn a_bare_fence_header_is_not_in_the_reply_on_both_paths() {
     }
 }
 
+/// The engagement token holds text after its opener. The reply starts at the
+/// opener, not at a fixed distance from the end of the token.
+#[tokio::test]
+async fn text_after_the_opener_in_its_token_is_in_the_reply_on_both_paths() {
+    for mode in [Mode::JsonObject, Mode::Schema(SCHEMA_OBJECT)] {
+        let script = FENCE_THEN_BRACE_AND_KEY;
+        assert_streamed(script, mode, &["{\"a\"", ":", " 1", "}"]).await;
+        assert_blocking(script, mode, OBJECT_TEXT).await;
+    }
+}
+
 #[tokio::test]
 async fn a_json_fence_header_is_not_in_the_non_streamed_reply() {
     for mode in [Mode::JsonObject, Mode::Schema(SCHEMA_OBJECT)] {
@@ -999,6 +1070,34 @@ async fn a_cut_forced_tool_call_is_returned_as_its_text_on_both_paths() {
         assert_eq!(got.text(), r#"{"name":"f","arguments":"#, "stream={stream}");
         assert!(got.tool_names.is_empty(), "stream={stream}");
         assert_eq!(got.finish, ["length"], "stream={stream}");
+    }
+}
+
+/// The cut call starts at the engagement byte on both paths: a replayed word
+/// before it is not in the text.
+#[tokio::test]
+async fn a_cut_forced_tool_call_after_a_replayed_word_is_the_same_text_on_both_paths() {
+    for stream in [true, false] {
+        let script = CUT_TOOL_CALL_AFTER_A_REPLAYED_WORD;
+        let (got, _) = reply(ask(script, Mode::RequiredTool, stream)).await;
+        assert_eq!(got.text(), r#"{"name":"f","arguments":"#, "stream={stream}");
+        assert!(got.tool_names.is_empty(), "stream={stream}");
+        assert_eq!(got.finish, ["length"], "stream={stream}");
+    }
+}
+
+/// With no constraint the model writes the call in its own format, marked or
+/// bare. The reply is the tool call on both paths.
+#[tokio::test]
+async fn a_forced_tool_call_with_no_constraint_is_a_tool_call_on_both_paths() {
+    for script in [MARKED_TOOL_CALL, TOOL_CALL] {
+        for stream in [true, false] {
+            let (got, _) = reply(ask(script, Mode::RequiredToolUnconstrained, stream)).await;
+            let what = format!("stream={stream} answer={:?}", script.answer);
+            assert_eq!(got.tool_names, ["f"], "{what}");
+            assert_eq!(got.text(), "", "{what}");
+            assert_eq!(got.finish, ["tool_calls"], "{what}");
+        }
     }
 }
 

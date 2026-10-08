@@ -830,7 +830,8 @@ impl Generator for ArchGenerator {
             // boundary — a multi-byte codepoint split across two token ids)
             // ported from HF `DecodeStream` / mlx-lm `_try_flush`. ASCII /
             // already-complete codepoints stay byte-identical to pre-A10.
-            let mut detok = crate::detokenizer::StreamingDetokenizer::new(tokenizer_kind);
+            let mut detok = crate::detokenizer::StreamingDetokenizer::new(tokenizer_kind)
+                .with_eos_ids(Arc::clone(&eos_ids));
 
             // Pre-allocated timestamp vec for per-token step timing.
             // Capacity = n_tokens so no realloc during decode (constraint: pre-allocate).

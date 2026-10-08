@@ -414,10 +414,9 @@ pub fn generate_greedy(
 /// Miss-path push, so it is byte-identical to what `make_step` produces); `None`
 /// re-derives it via `make_step`, matching the Miss path exactly.
 ///
-/// The per-step decode math (token push, `step_fn` forced-feed, EOS break,
-/// constraint advance, `pick_token`) is byte-identical to the original inline
-/// loop; only the function boundary + the step-0 piece source differ (and that
-/// source produces the same string on both paths via `piece_for`).
+/// Each step: token push, constraint advance, `step_fn` (which can force the
+/// next input), EOS break, `pick_token`. The step-0 piece is the same string on
+/// both paths (`piece_for`).
 #[allow(clippy::too_many_arguments)]
 fn decode_from(
     model: &Qwen3VlMoeText,

@@ -814,7 +814,8 @@ pub(crate) async fn chat_completions(
     // `tool_choice=required/named` → synthesise a JSON-Schema constraint
     // so the model is forced to emit bare `{"name":"…","arguments":{…}}` JSON.
     // In this mode the marker-based tool parser is bypassed; the post-processor
-    // extracts the bare JSON and converts it into the OpenAI tool_calls envelope.
+    // converts the text from the engagement byte on into the OpenAI tool_calls
+    // envelope.
     //
     // `bare_json_tool_call_mode` is true when the constrained path is active and
     // the post-processor needs to interpret the output as a tool call (not content).
@@ -987,6 +988,7 @@ pub(crate) async fn chat_completions(
     // Where the grammar engaged, cloned before the box is moved into the
     // generator. Both reply paths cut the answer text there.
     let engagement = constraint.as_ref().and_then(|c| c.engagement());
+    let constrained = constraint.is_some();
 
     // extract image_url / input_audio content parts from user messages.
     // Collected across all user messages in order; will pass them to the
@@ -1147,10 +1149,10 @@ pub(crate) async fn chat_completions(
     // the arch has a known parser. Otherwise the decode loop bypasses the
     // parser entirely.
     //
-    // In bare_json_tool_call_mode (tool_choice=required/named) the
-    // constraint drives output; the marker-based parser is bypassed entirely
-    // (model emits bare JSON, not `<tool_call>…</tool_call>`).
-    let parser_format: Option<ToolCallFormat> = if bare_json_tool_call_mode {
+    // A constrained forced tool call is bare JSON, so the marker parser is
+    // bypassed. With no constraint the model can write the call in its own
+    // format, and the parser reads it as it does for `tool_choice: auto`.
+    let parser_format: Option<ToolCallFormat> = if bare_json_tool_call_mode && constrained {
         None
     } else {
         tools_enabled.then_some(()).and(tool_format)

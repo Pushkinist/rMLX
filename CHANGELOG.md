@@ -59,11 +59,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   grammar engaged and runs to the end of the text on both paths. A cut value
   is returned cut, with its `finish_reason`. Text that ends before that byte
   is refused on both paths: 502 `constraint_not_engaged`, or that error
-  event in a stream, which before completed with unchecked text. A request
-  sent again with the same prompt is constrained from its first token: the
-  grammar did not see a first token replayed from the prompt cache, so a
-  reply that started with `{` answered 502 the second time.
-  `docs/SERVER.md` ("JSON-mode reply") states the contract.
+  event in a stream, which before completed with unchecked text. The
+  grammar now sees a first token that the prompt cache replays (no mask is
+  applied to that token): before, a request sent again with the same prompt
+  answered 502 when its reply started with `{`. The token that ends a
+  generation adds no text to a reply, also on a model whose tokenizer does
+  not mark that token special. `docs/SERVER.md` ("JSON-mode reply") states
+  the contract and a known limit of `integer` and `number` roots.
 
 - **A long prefill no longer returns `NaN` logits under Metal shader
   validation on mlx 0.32.3.** MLX's attention kernel for `head_dim` 256
