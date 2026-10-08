@@ -122,7 +122,7 @@ fn ssd_hydrated_entry_field_invariants() {
     };
 
     assert_eq!(hydrated.first_id, 0, "SSD block stores no real first token");
-    assert!(hydrated.first_piece.is_empty());
+    assert_eq!(hydrated.first_piece, "");
     assert!(hydrated.is_ssd_hydrated());
     // ExactOnly Gemma3 declines even a hydrated strict-prefix reuse (default
     // hook → None), unlike the moe HydratedTail seam.

@@ -554,7 +554,7 @@ impl Drop for GpuAdmission {
         // double-drops. fetch_sub on usize would wrap; guard explicitly.
         let prev = self
             .pending
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Acquire,
                 |v| Some(v.saturating_sub(1)),

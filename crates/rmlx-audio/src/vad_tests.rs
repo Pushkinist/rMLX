@@ -108,5 +108,8 @@ fn test_voiced_segments_basic() {
 /// voiced_segments: empty input returns empty.
 #[test]
 fn test_voiced_segments_empty() {
-    assert!(voiced_segments(&[], 0.5, 1, 1).is_empty());
+    assert_eq!(
+        voiced_segments(&[], 0.5, 1, 1),
+        Vec::<(usize, usize)>::new()
+    );
 }

@@ -76,7 +76,7 @@ fn parses_target_snapshot_config() {
     assert_eq!(cfg.text.num_experts_per_tok, 8);
     assert_eq!(cfg.text.moe_intermediate_size, 768);
     assert_eq!(cfg.text.decoder_sparse_step, 1);
-    assert!(cfg.text.mlp_only_layers.is_empty());
+    assert_eq!(cfg.text.mlp_only_layers, Vec::<usize>::new());
     assert_eq!(cfg.text.rope_theta, 5_000_000.0);
     assert_eq!(cfg.text.mrope_section, vec![24, 20, 20]);
     assert!(cfg.text.mrope_interleaved);

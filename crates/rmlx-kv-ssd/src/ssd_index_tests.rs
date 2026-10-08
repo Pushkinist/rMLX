@@ -404,7 +404,7 @@ fn evict_lru_returns_oldest_first_and_leaves_within_budget() {
     assert!(idx.lookup("bbb", LK_A).unwrap().is_none());
 
     let evicted2 = idx.evict_lru_until(1500).unwrap();
-    assert!(evicted2.paths.is_empty());
+    assert_eq!(evicted2.paths, Vec::<PathBuf>::new());
     assert_eq!(evicted2.total_bytes_after, 1000);
 }
 
@@ -440,7 +440,7 @@ fn total_bytes_sums_all_rows_and_tracks_eviction() {
 fn evict_empty_index_is_noop() {
     let idx = open();
     let evicted = idx.evict_lru_until(0).unwrap();
-    assert!(evicted.paths.is_empty());
+    assert_eq!(evicted.paths, Vec::<PathBuf>::new());
     assert_eq!(evicted.total_bytes_after, 0);
 }
 

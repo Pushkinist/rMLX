@@ -454,7 +454,7 @@ fn a7_absent_fields_give_defaults() {
     assert_eq!(sp.repetition_penalty, 1.0);
     assert_eq!(sp.frequency_penalty, 0.0);
     assert_eq!(sp.presence_penalty, 0.0);
-    assert!(sp.logit_bias.is_empty());
+    assert_eq!(sp.logit_bias, Vec::<(u32, f32)>::new());
     assert!(sp.seed.is_none());
 }
 

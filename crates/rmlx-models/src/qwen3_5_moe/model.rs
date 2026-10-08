@@ -780,8 +780,8 @@ impl Qwen3_5MoeText {
         device: Device,
     ) -> Result<(Array, Array)> {
         let seq = ids.len();
-        debug_assert!(!ids.is_empty());
-        debug_assert!(!capture_layer_ids.is_empty());
+        debug_assert_ne!(ids.len(), 0);
+        debug_assert_ne!(capture_layer_ids.len(), 0);
 
         let ids_i32: Vec<i32> = ids.iter().map(|&x| x as i32).collect();
         let ids_bytes =

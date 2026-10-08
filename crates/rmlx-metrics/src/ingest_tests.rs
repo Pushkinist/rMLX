@@ -343,7 +343,7 @@ fn builder_fills_identity_and_canonicalization() {
     assert_eq!(rec.model, "gemma-4-e4b-it-mxfp8");
     assert_eq!(rec.weight_quant, "mxfp8");
     assert_eq!(rec.kv_quant, "k8v8");
-    assert!(!rec.ts_utc.is_empty());
+    assert_ne!(rec.ts_utc, "");
 }
 
 #[test]

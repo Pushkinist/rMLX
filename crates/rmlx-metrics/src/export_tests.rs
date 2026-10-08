@@ -468,7 +468,7 @@ fn export_json_round_trip() {
     let json_str = export_json(&conn).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
     assert!(parsed.is_array());
-    assert!(!parsed.as_array().unwrap().is_empty());
+    assert_ne!(parsed.as_array().unwrap().len(), 0);
     assert_eq!(parsed[0]["value"], 77.5);
 }
 

@@ -605,7 +605,7 @@ fn truncate_to_zero_and_to_the_exact_length_are_both_clean() {
     let (flat, _) = zeroed
         .dequantize_choice(Device::Cpu, Dtype::F32)
         .expect("an emptied store decodes to nothing");
-    assert!(flat.is_empty());
+    assert_eq!(flat, Vec::<f32>::new());
     // And it is reusable: the next append starts from position 0.
     append_cpu!(zeroed, 1, kv_h, d, 0, 1, 1);
     let (reused, _) = zeroed

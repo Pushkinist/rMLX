@@ -372,7 +372,10 @@ fn the_two_dflash_generations_do_not_take_each_other() {
 /// warning.
 #[test]
 fn a_default_request_names_no_dropped_field() {
-    assert!(dropped_sampling_fields(&SamplingParams::default()).is_empty());
+    assert_eq!(
+        dropped_sampling_fields(&SamplingParams::default()),
+        Vec::<&str>::new()
+    );
 }
 
 /// The speculative path captures no logprobs, so a request that asks for them

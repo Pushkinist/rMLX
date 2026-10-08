@@ -487,7 +487,7 @@ fn splitter_close_tag_midpiece() {
 fn splitter_lone_close_tag_emits_empty_visible() {
     let mut sm = ThinkSplitter::new_qwen3_prefilled();
     let (text, is_thinking) = sm.step("</think>");
-    assert!(text.is_empty());
+    assert_eq!(text, "");
     assert!(!is_thinking);
 }
 
@@ -648,7 +648,7 @@ fn splitter_custom_start_token_routes_correctly() {
 
     // Custom close flips back to content.
     let (text, is_thinking) = sm.step("</custom>");
-    assert!(text.is_empty());
+    assert_eq!(text, "");
     assert!(!is_thinking);
 }
 

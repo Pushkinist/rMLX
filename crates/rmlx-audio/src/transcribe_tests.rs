@@ -148,5 +148,5 @@ fn resample_downsamples_48k_to_16k() {
 
 #[test]
 fn resample_empty() {
-    assert!(resample_to_16k(&[], 48_000).is_empty());
+    assert_eq!(resample_to_16k(&[], 48_000), Vec::<f32>::new());
 }

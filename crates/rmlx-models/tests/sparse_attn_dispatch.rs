@@ -353,15 +353,15 @@ fn sparse_attn_dispatches_on_seedless_planar_k() {
     let delta = after - before;
     eprintln!("seedless: sparse_attn aggregate delta = {delta}");
     if delta == 0 {
-        if strict {
-            panic!("RMLX_SPARSE_ATTN_STRICT=1: sparse_attn aggregate counter did not increment");
-        } else {
-            eprintln!(
-                "SKIP sparse_attn_dispatches_on_seedless_planar_k: the aggregate counter \
-                 did not move on the seedless call (non-strict)"
-            );
-            return;
-        }
+        assert!(
+            !strict,
+            "RMLX_SPARSE_ATTN_STRICT=1: sparse_attn aggregate counter did not increment"
+        );
+        eprintln!(
+            "SKIP sparse_attn_dispatches_on_seedless_planar_k: the aggregate counter \
+             did not move on the seedless call (non-strict)"
+        );
+        return;
     }
     assert_eq!(
         delta, 2,

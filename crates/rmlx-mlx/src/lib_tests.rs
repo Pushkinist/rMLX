@@ -293,7 +293,7 @@ fn to_bytes_of_a_gpu_transpose_reads_the_permuted_order() {
 fn to_bytes_of_an_empty_array_is_empty() {
     // The load-path warmup evaluates a `[0]` array through this method.
     let a = Array::from_bytes(&[], &[0], Dtype::F32).unwrap();
-    assert!(a.to_bytes().unwrap().is_empty());
+    assert_eq!(a.to_bytes().unwrap(), Vec::<u8>::new());
 }
 
 #[test]
