@@ -55,22 +55,26 @@ delta at the end.
 
 A named tool that is not in `tools` builds no schema: the request runs as
 `auto`. When the schema does not compile, or the model has no tokenizer file,
-the forced call runs with no constraint, and the reply is read as for `auto`,
-streaming or not:
+the forced call runs with no constraint, and the reply is read as for `auto`:
 
 - A marked call is a tool call, in the content or in the reasoning. Text
   outside it is `content` or `reasoning_content`.
 - When no call is marked, the whole content is tried as bare JSON.
-- Bare JSON after prose or inside a code fence is not a tool call: the reply
-  is text with `finish_reason:"stop"`.
+- Bare JSON after prose, inside a code fence or on the reasoning channel is
+  not a tool call: the reply is text. A `<tool_call>` literal that the
+  reasoning opens and does not close hides a call that follows it.
 - Streaming sends reasoning deltas as they arrive and holds the content to
   the end.
 
+`stop` differs between the paths for a forced call, with or without the
+constraint: streaming does not give the held content to the stop matcher; the
+non-streamed path cuts the text first, then reads the call.
+
 ### EOF recovery
 
-Streaming never completes a partial call. On the non-streaming path, a
-Bonsai-style JSON call cut off mid-body (for example at `max_tokens`) is
-repaired by closing its open strings and brackets; a truncated Gemma call is
-dropped.
+While tokens arrive, a partial call is not completed. At the end of the
+generation, streaming or not, a Bonsai-style JSON call cut off mid-body (for
+example at `max_tokens`) is repaired by closing its open strings and
+brackets; a truncated Gemma call is dropped.
 
 OpenAI `parameters` and Anthropic `input_schema` tools render identically.

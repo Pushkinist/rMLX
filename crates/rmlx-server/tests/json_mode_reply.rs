@@ -144,8 +144,8 @@ fn tokenizer_json() -> String {
 // ── Scripted generations ────────────────────────────────────────────────────
 
 /// One generation: reasoning pieces, answer pieces, the terminal reason. A
-/// script with reasoning has one more token between the two: the token that
-/// closes the reasoning block, which carries no visible text.
+/// script with reasoning and an answer has one more token between the two:
+/// the token that closes the reasoning block, which carries no visible text.
 #[derive(Clone, Copy)]
 struct Script {
     thinking: &'static [&'static str],
@@ -157,8 +157,12 @@ struct Script {
 }
 
 impl Script {
+    fn closes_its_reasoning(self) -> bool {
+        !self.thinking.is_empty() && !self.answer.is_empty()
+    }
+
     fn tokens(self) -> u64 {
-        let close = usize::from(!self.thinking.is_empty());
+        let close = usize::from(self.closes_its_reasoning());
         (self.thinking.len() + close + self.answer.len() + 1) as u64
     }
 }
@@ -354,7 +358,7 @@ impl Generator for ScriptedGenerator {
         for piece in self.script.thinking {
             steps.push((token_id(piece), piece, true, None));
         }
-        if !self.script.thinking.is_empty() {
+        if self.script.closes_its_reasoning() {
             steps.push((token_id("</think>"), "", false, None));
         }
         for (at, piece) in self.script.answer.iter().enumerate() {
@@ -377,6 +381,9 @@ impl Generator for ScriptedGenerator {
                             seen.engaged_at = Some(at);
                             gate_after = Some(toks.len());
                         }
+                        // With no thinking flag from the route (a forced
+                        // tool call) the grammar cannot tell the channels.
+                        None if req.is_thinking_handle.is_none() => {}
                         None => seen
                             .violations
                             .push("the grammar engaged on a reasoning token".to_owned()),
@@ -1079,6 +1086,20 @@ async fn a_cut_forced_tool_call_is_returned_as_its_text_on_both_paths() {
         assert_eq!(got.text(), r#"{"name":"f","arguments":"#, "stream={stream}");
         assert!(got.tool_names.is_empty(), "stream={stream}");
         assert_eq!(got.finish, ["length"], "stream={stream}");
+    }
+}
+
+/// A model whose prompt left the reasoning block open writes the constrained
+/// call on the reasoning channel. It is the tool call on both paths.
+#[tokio::test]
+async fn a_constrained_forced_tool_call_on_the_reasoning_channel_is_a_tool_call() {
+    let script = unconstrained(BARE, &[]);
+    for stream in [true, false] {
+        let (got, _) = reply(ask(script, Mode::RequiredTool, stream)).await;
+        assert_eq!(got.tool_names, ["f"], "stream={stream}");
+        assert_eq!(got.text(), "", "stream={stream}");
+        assert_eq!(got.reasoning, "", "stream={stream}");
+        assert_eq!(got.finish, ["tool_calls"], "stream={stream}");
     }
 }
 

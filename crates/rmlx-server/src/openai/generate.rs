@@ -48,8 +48,8 @@ pub(super) async fn generate_blocking(
     // engine was moved into the generator. `None` when the request built no
     // constraint that reports it.
     engagement: Option<Arc<rmlx_models::Engagement>>,
-    // True when tool_choice=required/named drives the constraint; the
-    // text output (bare JSON) must be converted to a tool_calls envelope.
+    // True for a forced tool call (tool_choice=required/named); the text
+    // output (bare JSON) must be converted to a tool_calls envelope.
     bare_json_tool_call_mode: bool,
     // Drainer handle + ctx_max for TTFT/token-count DB emission.
     request_start: Instant,
@@ -368,10 +368,10 @@ pub(super) async fn generate_blocking(
         Some(reasoning_text)
     };
 
-    // bare_json_tool_call_mode — the constraint forced the model to
-    // emit bare `{"name":"…","arguments":{…}}` JSON (no marker wrapper).
-    // Convert the text from the engagement byte on to a ParsedToolCall so
-    // the response envelope has `tool_calls` and `content=""` (not raw JSON).
+    // A forced tool call with no marked call: the text is bare
+    // `{"name":"…","arguments":{…}}` JSON. Convert it, from the engagement
+    // byte on when a constraint reported one, to a ParsedToolCall so the
+    // response envelope has `tool_calls` and `content=""` (not raw JSON).
     let (text, tool_calls_accum) = if bare_json_tool_call_mode && tool_calls_accum.is_empty() {
         let json_str = match json_reply.as_mut() {
             Some(reply) => &text[reply.release(&text)..],
@@ -380,7 +380,7 @@ pub(super) async fn generate_blocking(
         if let Some(tc) = bare_json_to_tool_call(json_str) {
             tracing::debug!(
                 name = %tc.name,
-                "bare_json_tool_call_mode: synthesised tool call from constrained JSON output"
+                "bare_json_tool_call_mode: synthesised tool call from the bare JSON of a forced tool call"
             );
             (String::new(), vec![tc])
         } else {

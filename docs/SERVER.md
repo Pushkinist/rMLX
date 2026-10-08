@@ -256,8 +256,9 @@ streaming or not:
 - `stop` is matched on the whole answer text first.
 - Text that ends before that byte is refused: 502 `constraint_not_engaged`;
   streaming, that error event and no content delta.
-- Known limit: a number can have `-`, `+` and white space before or between
-  its digits; a root number ends at its first token.
+- Known limit: after its first byte (`-` or a digit) a number accepts `-` and
+  `+` at each place, and white space between a sign and the first digit; a
+  root number ends at the first token that holds a digit.
 
 **Streaming** (`stream:true`): each SSE event is a `data:` line holding a
 `ChatCompletionChunk`:

@@ -1323,6 +1323,8 @@ fn every_exact_hit_loop_shows_the_replayed_token_to_the_constraint_first() {
     let sources = exact_hit_loop_sources();
     assert_eq!(sources.len(), 8, "the loops with an exact hit");
     for (path, code) in sources {
+        // The reader removes `//` comments only.
+        assert!(!code.contains("/*"), "{path}: a block comment");
         assert!(
             shows_the_replayed_token_to_the_constraint(&code),
             "{path}: the replayed first token does not reach the constraint before the step callback"
