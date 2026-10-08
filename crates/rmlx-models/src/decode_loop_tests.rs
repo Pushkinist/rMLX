@@ -1232,7 +1232,29 @@ fn a_replayed_eos_token_ends_the_generation_and_no_constraint_is_needed() {
     assert_eq!(history, [9]);
 }
 
-/// The source files of the decode loops that take an exact prompt-cache hit.
+/// The code of a Rust source file: `//` comments removed and the body of each
+/// string literal blanked, by the readers of `scripts/lib/awk_text.sh`.
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test-only: a panic names the source file that cannot be read"
+)]
+fn code_of(path: &std::path::Path) -> String {
+    let readers =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/lib/awk_text.sh");
+    let out = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(r#". "$1"; awk "${AWK_TEXT_FNS}"'{ print blank_strings(decomment($0)) }' "$2""#)
+        .arg("code_of")
+        .arg(&readers)
+        .arg(path)
+        .output()
+        .expect("bash must run");
+    assert!(out.status.success(), "{}: {out:?}", path.display());
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// The code of each decode loop that takes an exact prompt-cache hit.
 #[allow(
     clippy::unwrap_used,
     reason = "test-only: a panic names the source tree that cannot be read"
@@ -1252,9 +1274,9 @@ fn exact_hit_loop_sources() -> Vec<(String, String)> {
                 && !name.ends_with("tests.rs")
                 && name != "prompt_cache.rs"
             {
-                let text = std::fs::read_to_string(&path).unwrap();
-                if text.contains("Consumed::Exact") {
-                    out.push((path.to_string_lossy().into_owned(), text));
+                let code = code_of(&path);
+                if code.contains("Consumed::Exact") {
+                    out.push((path.to_string_lossy().into_owned(), code));
                 }
             }
         }
@@ -1267,38 +1289,73 @@ fn exact_hit_loop_sources() -> Vec<(String, String)> {
     out
 }
 
-/// `true` when each `step_fn(` call of `source` has a constraint `advance` in
-/// the four lines before it.
-fn every_step_follows_an_advance(source: &str) -> bool {
-    let lines: Vec<&str> = source.lines().collect();
+/// `true` when each step callback of `code` has a constraint `advance` in the
+/// four lines before it.
+fn every_step_follows_an_advance(code: &str) -> bool {
+    let lines: Vec<&str> = code.lines().collect();
     lines.iter().enumerate().all(|(at, line)| {
-        !line.contains("step_fn(")
+        !(line.contains("step_fn(") || line.contains("step_fn)("))
             || lines
                 .get(at.saturating_sub(4)..at)
                 .is_some_and(|before| before.iter().any(|l| l.contains(".advance(")))
     })
 }
 
-/// A loop that replays the first token of an exact hit shows it to the
-/// constraint first: through `emit_replayed_token`, or, where the replayed
-/// token goes through the loop's own steps, by `advance` before each callback.
+/// `true` when `code` replays the first token of each exact hit through
+/// `emit_replayed_token` with the loop's constraint, or, with no such call,
+/// calls `advance` before each step callback.
+fn shows_the_replayed_token_to_the_constraint(code: &str) -> bool {
+    let arms = code.matches("Consumed::Exact").count();
+    let calls: Vec<&str> = code.split("emit_replayed_token(").skip(1).collect();
+    if calls.is_empty() {
+        return every_step_follows_an_advance(code);
+    }
+    calls.len() == arms
+        && calls
+            .iter()
+            .all(|args| args.trim_start().starts_with("&mut constraint,"))
+}
+
+/// The loops with an exact hit are counted, so a loop that the scan loses, or
+/// a new loop, makes this test state its rule again.
 #[test]
-#[allow(clippy::unwrap_used)]
 fn every_exact_hit_loop_shows_the_replayed_token_to_the_constraint_first() {
     let sources = exact_hit_loop_sources();
-    assert!(sources.len() >= 8, "the scan lost loops: {}", sources.len());
-    for (path, text) in sources {
+    assert_eq!(sources.len(), 8, "the loops with an exact hit");
+    for (path, code) in sources {
         assert!(
-            text.contains("emit_replayed_token(") || every_step_follows_an_advance(&text),
+            shows_the_replayed_token_to_the_constraint(&code),
             "{path}: the replayed first token does not reach the constraint before the step callback"
         );
     }
 }
 
 #[test]
-fn the_source_rule_reads_the_order_of_advance_and_the_step_callback() {
-    let shown = "c.advance(next);\n}\nlet forced = step_fn(&step);";
-    let late = "let forced = step_fn(&step);\nc.advance(next);";
-    assert!(every_step_follows_an_advance(shown));
-    assert!(!every_step_follows_an_advance(late));
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: a panic names the fixture step that failed"
+)]
+fn the_source_rule_reads_calls_and_order_and_not_comments_or_strings() {
+    let by_hand = "Consumed::Exact(e) => {\nstep_fn(steps.last());\n}";
+    let shown = "Consumed::Exact(e) => {\nc.advance(next);\nlet forced = step_fn(&step);\n}";
+    let late = "Consumed::Exact(e) => {\n(ctx.step_fn)(&step);\nc.advance(next);\n}";
+    let call = "Consumed::Exact(e) => {\nemit_replayed_token(\n    &mut constraint,\n);\n}";
+    let no_constraint = call.replace("&mut constraint,", "&mut None,");
+    let two_arms = format!("{call}\n{by_hand}");
+    assert!(shows_the_replayed_token_to_the_constraint(shown));
+    assert!(shows_the_replayed_token_to_the_constraint(call));
+    assert!(!shows_the_replayed_token_to_the_constraint(by_hand));
+    assert!(!shows_the_replayed_token_to_the_constraint(late));
+    assert!(!shows_the_replayed_token_to_the_constraint(&no_constraint));
+    assert!(!shows_the_replayed_token_to_the_constraint(&two_arms));
+
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let file = dir.path().join("loop.rs");
+    let source = format!(
+        "// emit_replayed_token(&mut constraint, ...)\nlet s = \"emit_replayed_token(\";\n{by_hand}\n"
+    );
+    std::fs::write(&file, source).expect("write the source");
+    let code = code_of(&file);
+    assert!(!code.contains("emit_replayed_token("), "{code}");
+    assert!(!shows_the_replayed_token_to_the_constraint(&code));
 }

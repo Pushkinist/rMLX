@@ -256,8 +256,8 @@ streaming or not:
 - `stop` is matched on the whole answer text first.
 - Text that ends before that byte is refused: 502 `constraint_not_engaged`;
   streaming, that error event and no content delta.
-- Known limit: an `integer` or `number` root can be wrong with
-  `finish_reason:"stop"`: sign characters before it, or its first token only.
+- Known limit: a number can have `-`, `+` and white space before or between
+  its digits; a root number ends at its first token.
 
 **Streaming** (`stream:true`): each SSE event is a `data:` line holding a
 `ChatCompletionChunk`:
@@ -534,66 +534,8 @@ request finishes on the model it already holds.
 
 ## Tool Calling
 
-### Parser architecture
-
-`ToolCallStreamParser` parses tool calls out of the raw token stream. The
-format is detected once at registry build from markers in
-`chat_template.jinja`, with the architecture as the fallback, and cached in
-`ModelEntry`.
-
-| `ToolCallFormat` | Used by | Syntax |
-|---|---|---|
-| `Qwen3XmlFunction` | Qwen3.6 | `<tool_call><function=NAME><parameter=KEY>VALUE</parameter></function></tool_call>` |
-| `Qwen3JsonToolCall` | `Qwen3ForCausalLM` (Bonsai) | `<tool_call>{"name":"…","arguments":{…}}</tool_call>` |
-| `GemmaToolCall` | `Gemma4ForConditionalGeneration` | `<\|tool_call>call:NAME{key:val}<tool_call\|>` |
-
-Gemma registers `<|tool_call>`, `<tool_call|>` and `<|"|>` as special tokens,
-which `tokenizer.decode` strips. The engine rebuilds them from the token ids
-before the parser sees them.
-
-The parser is split-invariant: any BPE-aligned split of the stream parses the
-same as the whole string. Several `<tool_call>` blocks may follow each other.
-
-### Template support probe
-
-At registry build, `probe_tools_supported` renders each template with one
-tool and stores the result in `ModelEntry::tools_supported`. When it is
-`false`, the request runs without tools instead of failing.
-
-### Multi-turn tool loop
-
-The client drives the loop. It sends `tools`; the model emits tool-call
-blocks; the server returns them as `tool_calls` with
-`finish_reason:"tool_calls"`; the client runs the tools and sends the results
-as `tool` messages. The server renders the whole history through the chat
-template each turn.
-
-### `tool_choice=required` / `tool_choice=named` (constrained generation)
-
-A `"required"` or named `tool_choice` engages the constraint engine to force
-a valid call as bare JSON. `tool_choice_to_schema` builds the schema:
-
-- **Named**, or **required with one tool**:
-  `{"type":"object","properties":{"name":{"const":"<fn>"},"arguments":<fn-schema>},"required":["name","arguments"]}`.
-- **Required with several tools**: `{"oneOf":[…]}`, one such branch per tool.
-
-The `SchemaConstraint` runs with `EngagePolicy::Immediate`, so masking starts
-at the first token. The output has no `<tool_call>` wrapper, so the marker
-parser is bypassed: `bare_json_to_tool_call` turns the text into the
-`tool_calls` envelope. Streaming buffers the JSON and emits one `tool_calls`
-delta at the end. If the constraint cannot be built (the tool is not in
-`tools`, or its schema does not compile), the request runs unconstrained: a
-marked call is parsed as for `auto`, else the text is tried as bare JSON,
-else returned as text.
-
-### EOF recovery
-
-Streaming never completes a partial call. On the non-streaming path, a
-Bonsai-style JSON call cut off mid-body (for example at `max_tokens`) is
-repaired by closing its open strings and brackets; a truncated Gemma call is
-dropped.
-
-OpenAI `parameters` and Anthropic `input_schema` tools render identically.
+Split into [`SERVER_TOOLS.md`](SERVER_TOOLS.md) to keep this doc under the
+size cap.
 
 ---
 

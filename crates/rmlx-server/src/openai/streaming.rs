@@ -45,9 +45,9 @@ pub(crate) struct StreamState {
     pub(crate) completion_tokens: u32,
     /// Whether to emit a usage-summary chunk before `[DONE]`.
     pub(crate) include_usage: bool,
-    /// When true (tool_choice=required/named), the model is constrained
-    /// to emit bare JSON. At stream-end, the accumulated JSON is converted
-    /// into a tool_calls envelope rather than streamed as content.
+    /// True for a forced tool call (tool_choice=required/named). The content
+    /// is held and converted to a tool_calls envelope at stream-end. The call
+    /// is constrained to bare JSON when `json_reply` is `Some`.
     pub(crate) bare_json_tool_call_mode: bool,
     /// Accumulated content for bare_json_tool_call_mode. All non-empty
     /// content pieces are appended here; converted at done-token boundary.
@@ -250,12 +250,11 @@ pub(crate) fn handle_streaming_token(
         piece.drain(..reply.release(&piece));
     }
 
-    // bare_json_tool_call_mode — when tool_choice=required/named the
-    // constraint forces bare JSON output. For thinking models (Bonsai/Qwen3)
+    // A constrained forced tool call: for thinking models (Bonsai/Qwen3)
     // whose template starts inside <think>, the constrained JSON is emitted
-    // while is_thinking == true. Route ALL pieces to bare_json_accum in this
-    // mode so the done-handler can extract and convert the tool call.
-    if is_thinking && state.bare_json_tool_call_mode {
+    // while is_thinking == true, so every piece goes to bare_json_accum. With
+    // no constraint the reasoning is reasoning, as for `tool_choice: auto`.
+    if is_thinking && state.bare_json_tool_call_mode && state.json_reply.is_some() {
         if !piece.is_empty() {
             state.bare_json_accum.push_str(&piece);
         }
@@ -471,8 +470,15 @@ pub(crate) fn handle_streaming_token(
             out.push(Ok(chunk_to_event(&chunk)));
         }
 
-        // bare_json_tool_call_mode — convert accumulated JSON to tool call.
-        if state.bare_json_tool_call_mode && !state.any_tool_calls {
+        // A forced tool call: the held content is the call, or, around a
+        // marked call that the parser read, it is content.
+        if state.bare_json_tool_call_mode && state.any_tool_calls {
+            if !state.bare_json_accum.is_empty() {
+                let accum = std::mem::take(&mut state.bare_json_accum);
+                let chunk = make_content_chunk(state, Some(accum), None, false, None, None);
+                out.push(Ok(chunk_to_event(&chunk)));
+            }
+        } else if state.bare_json_tool_call_mode {
             if let Some(tc_parsed) = bare_json_to_tool_call(&state.bare_json_accum) {
                 tracing::debug!(
                     name = %tc_parsed.name,
@@ -487,7 +493,7 @@ pub(crate) fn handle_streaming_token(
             } else if !state.bare_json_accum.is_empty() {
                 tracing::warn!(
                     json = %state.bare_json_accum,
-                    "bare_json_tool_call_mode: could not parse constrained output; returning as content"
+                    "bare_json_tool_call_mode: a forced tool call did not parse; returning as content"
                 );
                 // Fallback: emit accumulated text as content.
                 let accum = std::mem::take(&mut state.bare_json_accum);
@@ -508,8 +514,8 @@ pub(crate) fn handle_streaming_token(
                 .lifetime_requests_failed
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
-                model = %state.model,
-                id = %state.id,
+                model_id = %state.model,
+                request_id = %state.id,
                 completion_tokens = state.completion_tokens,
                 "refusing: the streamed text ends before the `response_format` grammar engaged"
             );

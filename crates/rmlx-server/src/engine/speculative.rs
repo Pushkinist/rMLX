@@ -802,8 +802,8 @@ impl Generator for SpeculativeGenerator {
             // see ArchGenerator site). A multi-byte codepoint split by a
             // speculative round boundary is held until the next ProbeStep
             // completes it.
-            let mut detok = crate::detokenizer::StreamingDetokenizer::new(tokenizer_kind)
-                .with_eos_ids(Arc::clone(&eos_ids));
+            let mut detok =
+                crate::detokenizer::StreamingDetokenizer::new(tokenizer_kind, Arc::clone(&eos_ids));
             // Pre-allocated per-step timestamps for ITL computation.
             let mut step_timestamps: Vec<Instant> = Vec::with_capacity(n_tokens);
             let mut cancelled = false;

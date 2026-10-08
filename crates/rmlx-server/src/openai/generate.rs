@@ -213,13 +213,11 @@ pub(super) async fn generate_blocking(
                         }
                     }
                     None => {
-                        // bare_json_tool_call_mode — constrained output goes to
-                        // `text` regardless of is_thinking. When the prompt left
-                        // a `<think>` open, the JSON the constraint forced is
-                        // emitted while is_thinking == true. We need it in `text`
-                        // so the post-processor can extract it via
-                        // bare_json_to_tool_call.
-                        if tok.is_thinking && !bare_json_tool_call_mode {
+                        // A constrained forced tool call goes to `text`
+                        // regardless of is_thinking: when the prompt left a
+                        // `<think>` open, the JSON the constraint forced is
+                        // emitted while is_thinking == true.
+                        if tok.is_thinking && !(bare_json_tool_call_mode && json_reply.is_some()) {
                             reasoning_text.push_str(&tok.piece);
                         } else {
                             text.push_str(&tok.piece);
@@ -388,7 +386,7 @@ pub(super) async fn generate_blocking(
         } else {
             tracing::warn!(
                 json = %json_str,
-                "bare_json_tool_call_mode: could not parse constrained output as tool call; returning as content"
+                "bare_json_tool_call_mode: a forced tool call did not parse; returning as content"
             );
             (json_str.to_owned(), tool_calls_accum)
         }

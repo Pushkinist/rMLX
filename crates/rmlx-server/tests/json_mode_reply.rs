@@ -111,6 +111,7 @@ const VOCAB: &[&str] = &[
     "{\"a\"",
     "<tool_call>",
     "</tool_call>",
+    "\n```",
 ];
 
 fn token_id(piece: &str) -> u32 {
@@ -426,6 +427,7 @@ impl Generator for ScriptedGenerator {
 fn scripted_state(
     script: Script,
     gate: Option<Arc<Notify>>,
+    tool_call_parser: bool,
 ) -> (AppState, Arc<Mutex<Seen>>, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let snap = tmp.path().join("scripted");
@@ -437,9 +439,13 @@ fn scripted_state(
     .unwrap();
     std::fs::write(
         snap.join("chat_template.jinja"),
-        // The comment names the Hermes markers, so the route has a tool-call
+        // A comment that names the Hermes markers gives the route a tool-call
         // parser for this model.
-        "{% for m in messages %}{{ m['content'] }}{% endfor %}{# <tool_call>{\"name\" #}",
+        if tool_call_parser {
+            "{% for m in messages %}{{ m['content'] }}{% endfor %}{# <tool_call>{\"name\" #}"
+        } else {
+            "{% for m in messages %}{{ m['content'] }}{% endfor %}"
+        },
     )
     .unwrap();
     std::fs::write(snap.join("tokenizer.json"), tokenizer_json()).unwrap();
@@ -571,6 +577,8 @@ enum Mode {
     /// A forced tool call whose schema the route cannot compile: the request
     /// runs with no constraint.
     RequiredToolUnconstrained,
+    /// The same, on a model whose template names no tool-call markers.
+    RequiredToolUnconstrainedNoParser,
 }
 
 impl Mode {
@@ -627,7 +635,7 @@ fn request_body(mode: Mode, stop: Option<&str>, stream: bool) -> String {
         }
         Mode::Text => body["response_format"] = json!({"type": "text"}),
         Mode::NoFormat => {}
-        Mode::RequiredToolUnconstrained => {
+        Mode::RequiredToolUnconstrained | Mode::RequiredToolUnconstrainedNoParser => {
             body["tools"] = json!([{
                 "type": "function",
                 "function": {
@@ -766,7 +774,8 @@ const fn ask(script: Script, mode: Mode, stream: bool) -> Ask {
 /// Run one request and return `(status, raw body, what the generator saw)`.
 async fn serve(ask: Ask) -> (u16, String, Arc<Mutex<Seen>>) {
     let gate = ask.gated.then(|| Arc::new(Notify::new()));
-    let (state, seen, _tmp) = scripted_state(ask.script, gate.clone());
+    let parser = !matches!(ask.mode, Mode::RequiredToolUnconstrainedNoParser);
+    let (state, seen, _tmp) = scripted_state(ask.script, gate.clone(), parser);
     let router = rmlx_server::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -1086,18 +1095,198 @@ async fn a_cut_forced_tool_call_after_a_replayed_word_is_the_same_text_on_both_p
     }
 }
 
-/// With no constraint the model writes the call in its own format, marked or
-/// bare. The reply is the tool call on both paths.
+const MARKED: &[&str] = MARKED_TOOL_CALL.answer;
+const BARE: &[&str] = TOOL_CALL.answer;
+const REASONING: &[&str] = &["Let", " me", " think"];
+
+const fn unconstrained(
+    thinking: &'static [&'static str],
+    answer: &'static [&'static str],
+) -> Script {
+    Script {
+        thinking,
+        answer,
+        finish: "stop",
+        replayed_first: false,
+    }
+}
+
+/// One reply shape of a forced tool call that runs with no constraint, and
+/// what a client reads: tool names, content, reasoning, finish reason.
+type ForcedCallShape = (
+    &'static str,
+    Script,
+    &'static [&'static str],
+    &'static str,
+    &'static str,
+    &'static str,
+);
+
+const BARE_TEXT: &str = r#"{"name":"f","arguments":{}}"#;
+
+const UNCONSTRAINED_FORCED_CALLS: &[ForcedCallShape] = &[
+    (
+        "marked",
+        unconstrained(&[], MARKED),
+        &["f"],
+        "",
+        "",
+        "tool_calls",
+    ),
+    (
+        "bare",
+        unconstrained(&[], BARE),
+        &["f"],
+        "",
+        "",
+        "tool_calls",
+    ),
+    (
+        "marked_in_thinking",
+        unconstrained(MARKED, &[]),
+        &["f"],
+        "",
+        "",
+        "tool_calls",
+    ),
+    (
+        "reasoning_then_bare",
+        unconstrained(REASONING, BARE),
+        &["f"],
+        "",
+        "Let me think",
+        "tool_calls",
+    ),
+    (
+        "reasoning_then_marked",
+        unconstrained(REASONING, MARKED),
+        &["f"],
+        "",
+        "Let me think",
+        "tool_calls",
+    ),
+    (
+        "prose_then_marked",
+        unconstrained(
+            &[],
+            &[
+                "Here",
+                "<tool_call>",
+                "{",
+                "\"name\"",
+                ":",
+                "\"f\"",
+                ",",
+                "\"arguments\"",
+                ":",
+                "{",
+                "}",
+                "}",
+                "</tool_call>",
+            ],
+        ),
+        &["f"],
+        "Here",
+        "",
+        "tool_calls",
+    ),
+    (
+        "prose_then_bare",
+        unconstrained(
+            &[],
+            &[
+                "Here",
+                "{",
+                "\"name\"",
+                ":",
+                "\"f\"",
+                ",",
+                "\"arguments\"",
+                ":",
+                "{",
+                "}",
+                "}",
+            ],
+        ),
+        &[],
+        "Here{\"name\":\"f\",\"arguments\":{}}",
+        "",
+        "stop",
+    ),
+    (
+        "fenced_bare",
+        unconstrained(
+            &[],
+            &[
+                "```",
+                "json",
+                "\n",
+                "{",
+                "\"name\"",
+                ":",
+                "\"f\"",
+                ",",
+                "\"arguments\"",
+                ":",
+                "{",
+                "}",
+                "}",
+                "\n```",
+            ],
+        ),
+        &[],
+        "```json\n{\"name\":\"f\",\"arguments\":{}}\n```",
+        "",
+        "stop",
+    ),
+];
+
+/// With no constraint the reply is read as for `tool_choice: auto`: a marked
+/// call is a tool call in either channel, and text outside it is content or
+/// reasoning. When no call is marked, the whole content is tried as bare JSON.
+/// Bare JSON after prose or inside a code fence is text. The two paths agree
+/// in each field.
 #[tokio::test]
-async fn a_forced_tool_call_with_no_constraint_is_a_tool_call_on_both_paths() {
-    for script in [MARKED_TOOL_CALL, TOOL_CALL] {
+async fn a_forced_tool_call_with_no_constraint_is_the_same_reply_on_both_paths() {
+    assert_eq!(BARE.concat(), BARE_TEXT);
+    for (shape, script, tools, content, reasoning, finish) in UNCONSTRAINED_FORCED_CALLS {
         for stream in [true, false] {
-            let (got, _) = reply(ask(script, Mode::RequiredToolUnconstrained, stream)).await;
-            let what = format!("stream={stream} answer={:?}", script.answer);
-            assert_eq!(got.tool_names, ["f"], "{what}");
-            assert_eq!(got.text(), "", "{what}");
-            assert_eq!(got.finish, ["tool_calls"], "{what}");
+            let (got, _) = reply(ask(*script, Mode::RequiredToolUnconstrained, stream)).await;
+            assert_eq!(
+                (
+                    got.tool_names.as_slice(),
+                    got.text().as_str(),
+                    got.reasoning.as_str(),
+                    got.finish.as_slice()
+                ),
+                (
+                    tools
+                        .iter()
+                        .map(|t| (*t).to_owned())
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                    *content,
+                    *reasoning,
+                    [(*finish).to_owned()].as_slice()
+                ),
+                "{shape} stream={stream}"
+            );
         }
+    }
+}
+
+/// A model with no tool-call parser: the reasoning stays reasoning and the
+/// bare call is the tool call, on both paths.
+#[tokio::test]
+async fn a_forced_tool_call_with_no_constraint_and_no_parser_keeps_its_reasoning() {
+    let script = unconstrained(REASONING, BARE);
+    for stream in [true, false] {
+        let mode = Mode::RequiredToolUnconstrainedNoParser;
+        let (got, _) = reply(ask(script, mode, stream)).await;
+        assert_eq!(got.tool_names, ["f"], "stream={stream}");
+        assert_eq!(got.text(), "", "stream={stream}");
+        assert_eq!(got.reasoning, "Let me think", "stream={stream}");
+        assert_eq!(got.finish, ["tool_calls"], "stream={stream}");
     }
 }
 

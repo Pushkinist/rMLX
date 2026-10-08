@@ -150,7 +150,7 @@ impl TokenizerKind {
 ///
 /// Usage mirrors mlx-lm's contract:
 /// ```ignore
-/// let mut dt = StreamingDetokenizer::new(kind);
+/// let mut dt = StreamingDetokenizer::new(kind, eos_ids);
 /// for id in ids { let seg = dt.step(&tk, id)?; emit(seg); }
 /// let tail = dt.finalize(&tk, &all_ids)?; // lossy flush at true EOS
 /// ```
@@ -176,27 +176,21 @@ pub struct StreamingDetokenizer {
 }
 
 impl StreamingDetokenizer {
-    /// Create a new detokenizer for the given tokenizer family.
-    pub fn new(kind: TokenizerKind) -> Self {
+    /// Create a new detokenizer for the given tokenizer family. `eos_ids`
+    /// are the ids that end a generation: [`step`](Self::step) returns no
+    /// text for them.
+    #[allow(
+        clippy::rc_buffer,
+        reason = "the generator's own list, shared with no copy for each request"
+    )]
+    pub fn new(kind: TokenizerKind, eos_ids: std::sync::Arc<Vec<u32>>) -> Self {
         Self {
             kind,
             ids: Vec::new(),
             decoded: String::new(),
             first_segment_pending: true,
-            eos_ids: std::sync::Arc::default(),
+            eos_ids,
         }
-    }
-
-    /// Give the ids that end a generation: [`step`](Self::step) returns no
-    /// text for them.
-    #[must_use]
-    #[allow(
-        clippy::rc_buffer,
-        reason = "the generator's own list, shared with no copy for each request"
-    )]
-    pub fn with_eos_ids(mut self, eos_ids: std::sync::Arc<Vec<u32>>) -> Self {
-        self.eos_ids = eos_ids;
-        self
     }
 
     /// Detokenizer's view of all accepted ids (engine keeps its own for

@@ -69,7 +69,7 @@ fn classify_other_when_no_decoder() {
 /// and assert the concatenation of segments + a final flush equals the
 /// fully-decoded string with no `�`.
 fn drive(kind: TokenizerKind, full_decodes: &[&str], final_full: &str) -> String {
-    let mut dt = StreamingDetokenizer::new(kind);
+    let mut dt = StreamingDetokenizer::new(kind, std::sync::Arc::default());
     let mut out = String::new();
     for f in full_decodes {
         out.push_str(&dt.diff_emit((*f).to_owned()));
@@ -105,7 +105,7 @@ fn ascii_invariance_identical_to_naive() {
     // Pure ASCII: every byte is its own boundary → no withholding ever.
     // Segments must equal the naive per-step byte-diff exactly.
     let steps = ["H", "He", "Hel", "Hell", "Hello", "Hello ", "Hello w"];
-    let mut dt = StreamingDetokenizer::new(TokenizerKind::ByteLevel);
+    let mut dt = StreamingDetokenizer::new(TokenizerKind::ByteLevel, std::sync::Arc::default());
     let mut naive_prev = String::new();
     for f in steps {
         let seg = dt.diff_emit(f.to_owned());
@@ -160,7 +160,7 @@ fn fuzz_random_utf8_random_chunking_roundtrips() {
         cuts.push(bytes.len());
         cuts.sort_unstable();
 
-        let mut dt = StreamingDetokenizer::new(TokenizerKind::ByteLevel);
+        let mut dt = StreamingDetokenizer::new(TokenizerKind::ByteLevel, std::sync::Arc::default());
         let mut out = String::new();
         let mut last_full = String::new();
         for &cut in &cuts {
@@ -187,7 +187,7 @@ fn fuzz_random_utf8_random_chunking_roundtrips() {
 #[test]
 fn spm_strip_first_segment_leading_space_only() {
     // Strict-SPM: first segment " The" → "The"; later " world" kept.
-    let mut dt = StreamingDetokenizer::new(TokenizerKind::SpmStrip);
+    let mut dt = StreamingDetokenizer::new(TokenizerKind::SpmStrip, std::sync::Arc::default());
     assert_eq!(dt.diff_emit(" The".to_owned()), "The");
     assert_eq!(dt.diff_emit(" The world".to_owned()), " world");
 }
@@ -195,14 +195,14 @@ fn spm_strip_first_segment_leading_space_only() {
 #[test]
 fn spm_no_strip_keeps_genuine_leading_space() {
     // Gemma (`SpmNoStrip`): a genuine leading space is preserved.
-    let mut dt = StreamingDetokenizer::new(TokenizerKind::SpmNoStrip);
+    let mut dt = StreamingDetokenizer::new(TokenizerKind::SpmNoStrip, std::sync::Arc::default());
     assert_eq!(dt.diff_emit(" The".to_owned()), " The");
 }
 
 #[test]
 fn bytelevel_never_strips() {
     // Qwen (`ByteLevel`): no leading-space rule, ever.
-    let mut dt = StreamingDetokenizer::new(TokenizerKind::ByteLevel);
+    let mut dt = StreamingDetokenizer::new(TokenizerKind::ByteLevel, std::sync::Arc::default());
     assert_eq!(dt.diff_emit(" hello".to_owned()), " hello");
 }
 
@@ -210,7 +210,7 @@ fn bytelevel_never_strips() {
 fn finalize_flushes_truncated_tail_lossy() {
     // Generation genuinely stops mid-codepoint: finalize must emit the
     // lossy tail (a `�`) rather than swallow it.
-    let mut dt = StreamingDetokenizer::new(TokenizerKind::ByteLevel);
+    let mut dt = StreamingDetokenizer::new(TokenizerKind::ByteLevel, std::sync::Arc::default());
     // Mid-stream: "ab" then a split codepoint → withheld.
     assert_eq!(dt.diff_emit("ab".to_owned()), "ab");
     assert_eq!(dt.diff_emit("ab\u{FFFD}".to_owned()), "");
@@ -246,8 +246,7 @@ fn tokenizer_with_a_plain_end_marker() -> tokenizers::Tokenizer {
 #[test]
 fn an_eos_token_adds_no_text_when_the_tokenizer_does_not_mark_it_special() {
     let tk = tokenizer_with_a_plain_end_marker();
-    let mut dt =
-        StreamingDetokenizer::new(TokenizerKind::Other).with_eos_ids(std::sync::Arc::new(vec![1]));
+    let mut dt = StreamingDetokenizer::new(TokenizerKind::Other, std::sync::Arc::new(vec![1]));
     let mut out = dt.step(&tk, 0).unwrap();
     out.push_str(&dt.step(&tk, 1).unwrap());
     out.push_str(&dt.finalize(&tk).unwrap());
@@ -257,7 +256,7 @@ fn an_eos_token_adds_no_text_when_the_tokenizer_does_not_mark_it_special() {
 #[test]
 fn a_token_that_is_not_an_eos_id_keeps_its_text() {
     let tk = tokenizer_with_a_plain_end_marker();
-    let mut dt = StreamingDetokenizer::new(TokenizerKind::Other);
+    let mut dt = StreamingDetokenizer::new(TokenizerKind::Other, std::sync::Arc::default());
     let mut out = dt.step(&tk, 0).unwrap();
     out.push_str(&dt.step(&tk, 1).unwrap());
     out.push_str(&dt.finalize(&tk).unwrap());

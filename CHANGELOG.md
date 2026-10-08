@@ -65,7 +65,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answered 502 when its reply started with `{`. The token that ends a
   generation adds no text to a reply, also on a model whose tokenizer does
   not mark that token special. `docs/SERVER.md` ("JSON-mode reply") states
-  the contract and a known limit of `integer` and `number` roots.
+  the contract and a known limit of numbers. Behaviour change: a forced tool
+  call (`tool_choice` required or named) whose constraint cannot be built is
+  now read as for `auto`, with its reasoning kept. Bare JSON after prose or
+  inside a code fence was a tool call in that case and is now text
+  (`docs/SERVER_TOOLS.md`).
 
 - **A long prefill no longer returns `NaN` logits under Metal shader
   validation on mlx 0.32.3.** MLX's attention kernel for `head_dim` 256

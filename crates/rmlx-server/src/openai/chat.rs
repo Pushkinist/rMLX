@@ -817,8 +817,9 @@ pub(crate) async fn chat_completions(
     // converts the text from the engagement byte on into the OpenAI tool_calls
     // envelope.
     //
-    // `bare_json_tool_call_mode` is true when the constrained path is active and
-    // the post-processor needs to interpret the output as a tool call (not content).
+    // `bare_json_tool_call_mode` is true for a forced tool call: the
+    // post-processor reads the output as a tool call (not content), with or
+    // without the constraint.
     let tool_choice_schema: Option<Value> = norm_tool_choice.as_ref().and_then(|tc| {
         norm_tools
             .as_deref()
