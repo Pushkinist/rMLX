@@ -304,6 +304,37 @@ asked for. `crates/rmlx-models/tests/prefill_attention_configuration.rs`,
 `crates/rmlx-mlx/tests/attention_check_allocations.rs` and the padded-against-
 unpadded cell in `crates/rmlx-mlx/src/fast_ops_tests.rs` hold the rule.
 
+The cost of the copies (`FFI.md`, same section) was measured with
+`rmlx baseline --kv-quant none` on Qwen3.6-35B-A3B-8bit against a build
+without the rule, in alternating runs: 12 for each build at 4,000 and at
+32,518 prompt tokens, 8 at 130,790. The last prefill chunk is padded in each
+of the 10 full-attention layers, so a prefill has 10 padded nodes. The limits
+were declared before the runs. The figures are the build with the rule against
+the build without it.
+
+| Prompt tokens | Prefill rate | Verdict | `metal_gen_alloc_mb` | Verdict |
+|---:|---:|---|---:|---|
+| 4,000 | -0.39 % | PASS | -12.3 MB (-0.67 %) | PASS |
+| 32,518 | +0.82 % | PASS | 0.0 MB | PASS |
+| 130,790 | -1.59 % | INCONCLUSIVE | +268.8 MB (+5.43 %) | FAIL |
+
+- Prefill rate: PASS is a median within 1 % and no run under 95 % of the
+  median of the other build; FAIL is a median under 97 %. The 130,790 cell has
+  one run at 92.3 %. Two sets of runs of one build at 32,518 tokens differ by
+  0.64 % in the median, with one run at 94.5 %, and 8 runs for each build do
+  not separate the 130,790 cell from that.
+- `metal_gen_alloc_mb` (`CLI.md`): PASS is within 1 % and FAIL is more than
+  3 %. Each build gave one value in all its runs. At 130,790 tokens the padded
+  mask copy, 1792 x 130790 x bf16 = 469 MB in each padded layer, sets the peak
+  of the generation. At 32,518 tokens the copy is 121 MB and stays below a
+  peak that another step sets. `metal_peak_mb`, which includes the weights,
+  and the peak RSS are PASS in the three cells.
+- Decode rate, 200 tokens after 4,000 prompt tokens: PASS on Qwen3.6
+  (+0.65 %), gemma-4-e4b (-0.24 %) and Ternary-Bonsai-8B (+0.11 %).
+
+Not measured: the HTTP server path, speculative prefill, and
+`metal_gen_alloc_mb` with a settled start count.
+
 ## Moving the pin
 
 1. Build the new pair ([above](#building-the-pinned-pair)) and check the NAX

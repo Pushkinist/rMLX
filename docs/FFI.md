@@ -516,10 +516,9 @@ An affected call costs, in each attention layer that issues one:
   mask across its layers, and the wrapper pads it again in each layer: about
   131 MB a layer at 2000 query rows over 32,000 keys in bf16.
 
-The output slice is a view. The copies are lazy nodes; their time and peak
-memory are not measured. Every other call pays the check: under 1024 query
-rows it is one dim read with no Rust allocation, and a decode step has one
-query row.
+The output slice is a view. The copies are lazy nodes; that section has the
+measured cost. Every other call pays the check: under 1024 query rows it is
+one dim read with no Rust allocation, and a decode step has one query row.
 
 It is not always a FlashAttention kernel. `head_dim` decides, silently,
 whether the call reaches a fused kernel or a composite graph.

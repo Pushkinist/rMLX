@@ -60,7 +60,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rows to the next multiple of 64, whatever its key rows, and drops the padded
   rows from the output. Generated tokens are unchanged on the four test
   models (Qwen3.6-35B-A3B, Ternary-Bonsai-27B, gemma-4-e2b, Ternary-Bonsai-8B).
-  The prefill cost of the padding is not measured.
+  The padding was measured on Qwen3.6-35B-A3B-8bit: the prefill rate stays
+  within 1 % at 4k and 32k prompt tokens, the 128k cell (-1.6 %) is
+  inconclusive, and at 128k the Metal memory of a generation peaks 269 MB
+  (5.4 %) higher. `docs/MLX_PAIR.md` § "The attention row rule" has the cells.
 
 - **A model loaded on one thread no longer fails on another.** On MLX 0.32 an
   on-demand load (unload, then a request) failed its first request with
