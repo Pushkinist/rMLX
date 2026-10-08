@@ -408,9 +408,11 @@ queue only; that the handlers of the earlier buffers ran too is held by
 tests, not by a contract. The V-mirror tests read the count at the open of
 every decode step; they compare it with the count at the open of the run, so
 a leftover of constant size passes them. `after_synchronize_gpu_the_live_count_holds_no_temporary`
-(`crates/rmlx-mlx/src/synchronize_tests.rs`) reads the absolute count after a
-4 MiB temporary. Its one evaluation commits one command buffer, so it says
-nothing about earlier buffers.
+(`crates/rmlx-mlx/src/synchronize_tests.rs`) compares two settled readings
+around one evaluation with a 4 MiB temporary. The reading before follows the
+same evaluation, so a leftover of the same size at both readings passes. Its
+one evaluation commits one command buffer, so it says nothing about earlier
+buffers. No test reads the absolute count.
 The call is for measurement only. It returns an error after `forbid_gpu`, and
 from a job on the MLX thread, which holds the evaluation lock.
 

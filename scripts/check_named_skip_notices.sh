@@ -91,7 +91,8 @@
 #
 #   WHAT IS OUTSIDE THE POPULATION. A helper module that classified tests call
 #   and that declares no classified test is read by neither this rule nor the
-#   guard rule: `crates/rmlx-models/tests/common/mod.rs`,
+#   guard rule. The three that hold a stand-down today are
+#   `crates/rmlx-models/tests/common/mod.rs`,
 #   `crates/rmlx-server/tests/thread_boundary/mod.rs` and
 #   `crates/rmlx-models/src/test_snapshot.rs`. Review holds their stand-downs
 #   to `SKIP {test}:`.

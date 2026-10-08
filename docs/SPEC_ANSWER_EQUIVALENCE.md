@@ -160,6 +160,18 @@ window of the reading, so a loop that begins before a cut is cut there. The
 reading is still the strongest one over every window and period, taken after
 the runs are excused.
 
+A run takes the first free place: the first one from the cut on that holds
+its stretch and whose repeats no run has taken. A later place is not tried
+first, and a place is not kept for a longer run. So the verdict can depend on
+the order of the runs. The measured pair is pinned
+(`a_run_takes_the_first_free_place_so_the_order_of_the_runs_can_decide`). A
+reference arm holds a burst of 9 tokens and then a burst of 5 tokens in its
+last window, 12 of 63. A speculative arm that holds the same two bursts and a
+6-token burst of its own reads 17 of 63 raw. In the reference order it is
+agreed, with 5 repeats counted. With the two bursts exchanged, the burst of 5
+takes the start of the 9-token place, the burst of 9 fits no free place, and
+the arm is refused at 13 of 63. This was found on burst arms only.
+
 The position bound exists because a judgeable reference arm can hold a long
 loop. Over the whole reference arm a 57-token loop at period 8 reads 49 of
 248, under the ceiling. The same loop at the tail of the speculative arm
@@ -177,10 +189,10 @@ holds both arms as a fixture.
 
 What the tests hold, and against what:
 
-- Eighteen constructed arms against judgeable reference arms are each
+- Twenty-one constructed arms against judgeable reference arms are each
   refused: eight whose reference arm reads near the ceiling, seven whose
-  reference arm holds the same loop somewhere else, and three that hold a
-  burst of the reference arm twice.
+  reference arm holds the same loop somewhere else, and six that hold a burst
+  or a loop of the reference arm twice, in full or in part.
 - An exact loop at the end of the measured arm is refused past 13 tokens at
   period 1 and past 19 at period 8. The test asserts that each of those
   verdicts is the one a fixed ceiling gives on the raw reading of the last
@@ -219,11 +231,15 @@ window (11 of 56); a speculative arm that holds that loop and a second one of
 its own, up to the ceiling again, reads 22 of 56 raw and is agreed; one more
 token of its own loop and it is refused
 (`the_control_admits_at_most_the_ceiling_twice_in_one_window`). One burst in
-the reference arm does not excuse two: a speculative arm that holds the
-reference arm's 13-token burst twice and one of its own reads 36 of 63 and is
-refused (`one_burst_in_the_reference_arm_excuses_one_burst_and_no_more`). For
-two arms of different lengths the windows differ in length, and the bound is
-on the count of repeats, not on the fraction.
+the reference arm does not excuse two copies of itself; it excuses at most its
+own 12 repeats. A speculative arm that holds the reference arm's 13-token
+burst twice and one of its own reads 36 of 63 and is refused
+(`one_burst_in_the_reference_arm_excuses_one_burst_and_no_more`). A place is
+not one run: two 7-token bursts take 6 repeats each of that 13-token burst,
+and both are excused. The same test pins that row at 0, and pins the rows
+where the second burst needs one repeat more than is left. For two arms of
+different lengths the windows differ in length, and the bound is on the count
+of repeats, not on the fraction.
 
 The control reads only prose. Healthy structured output, such as a markdown
 table, overlaps ragged loops on this measure, which is why the prompts ask for

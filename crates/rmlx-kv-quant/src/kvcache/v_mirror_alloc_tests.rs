@@ -487,8 +487,9 @@ fn paged(positions: i32) -> i32 {
 /// absolute state. So a leftover that changes by the allowance or more since
 /// the run opened fails here, and it cannot pass as a smaller headroom of the
 /// next step. A leftover of constant size passes.
-/// `after_synchronize_gpu_the_live_count_holds_no_temporary` in `rmlx-mlx` is
-/// the test that reads the absolute state.
+/// `after_synchronize_gpu_the_live_count_holds_no_temporary` in `rmlx-mlx`
+/// compares two settled readings around one evaluation. A leftover of the same
+/// size at both readings passes there too. No test reads the absolute state.
 ///
 /// **Each step.** The step's headroom, less the new ring of a step that regrows
 /// the store, is what the step allocated and freed again. With the allowance

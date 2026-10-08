@@ -274,8 +274,9 @@ The third rule cannot read these forms, and review holds them:
   at every `fn`;
 - a print and a return at the top level of a fn body.
 
-Three helper modules are outside the population of the second and third rule,
-because they declare no classified test: `crates/rmlx-models/tests/common/mod.rs`,
+A helper module that declares no classified test is outside the population of
+the second and third rule. The three that hold a stand-down today are
+`crates/rmlx-models/tests/common/mod.rs`,
 `crates/rmlx-server/tests/thread_boundary/mod.rs` and
 `crates/rmlx-models/src/test_snapshot.rs`. Classified tests call them, and a
 stand-down in them is held to `SKIP {test}:` by review.
