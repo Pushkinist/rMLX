@@ -1,21 +1,31 @@
 //! HTTP-surface tests for the reply of a `response_format` request.
 //!
 //! The observable is what a client reads: the `content` bytes of each SSE
-//! delta of a streamed reply, and `message.content` of a non-streamed reply.
-//! A scripted generator replays one fixed generation into both paths. It
-//! drives the constraint the route built in the way the decode loop does (one
-//! `step_mask` and one `advance` for each token), so the grammar engages where
-//! it engages on a model, and a script that the grammar refuses is a harness
+//! delta of a streamed reply, its error events and its `finish_reason` chunks,
+//! and `message.content` of a non-streamed reply. A scripted generator replays
+//! one fixed generation into both paths. It drives the constraint the route
+//! built in the order of the decode loop: `step_mask`, `advance`, and only
+//! then the `is_thinking` flag of that token. So the grammar engages where it
+//! engages on a model, and a script that the grammar refuses is a harness
 //! failure.
 //!
 //! The rule the tests hold: the reply is the generated answer text from the
 //! byte at which the grammar engaged to the end of the generation, with no
-//! byte dropped and no byte added after that point, on both paths.
+//! byte dropped and no byte added after that point, on both paths. A reply
+//! whose text ends before that byte is not engaged: the non-streamed path
+//! answers 502 and the stream ends with an error event.
+//!
+//! The constraint is the one producer of the engagement byte. This file holds
+//! no rule for it: each expected value is a literal, and the harness checks
+//! the literal against the piece at which the constraint reported `engaged()`.
 //!
 //! A test with `#[should_panic]` holds a reply that is wrong today. Its
 //! `expected` string is the tag of the one assertion that must fail, so a
 //! harness failure does not satisfy it. When the reply is corrected, the test
 //! fails with "test did not panic" and the attribute must go.
+
+// LOC-exempt: one scripted harness and the reply contract it holds on both
+// paths; the scripts and the tests that read them stay in one file.
 
 // Test harness: panics/unwraps are acceptable in test bodies.
 #![allow(
@@ -31,7 +41,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::stream::{self, Stream};
+use futures::stream::{self, Stream, StreamExt};
 use parking_lot::Mutex;
 use rmlx_server::{
     ApiErrorCounters, AppState, GenerationRequest, GenerationToken, Generator, ItlStore,
@@ -40,6 +50,7 @@ use rmlx_server::{
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::Notify;
 
 // ── Vocabulary ──────────────────────────────────────────────────────────────
 
@@ -49,15 +60,17 @@ const VOCAB: &[&str] = &[
     "<eos>",
     "[UNK]",
     "hi",
+    "</think>",
     "{",
     "}",
     "[",
+    "]",
     ":",
     ",",
     "\"a\"",
+    "\"b\"",
     " 1",
     " {",
-    "\"b\"",
     " \"c\"",
     "\"Afghanistan\"",
     " \"Kabul\"",
@@ -69,6 +82,7 @@ const VOCAB: &[&str] = &[
     "\n",
     "\n{",
     "\n\n",
+    "}\n",
     "Here",
     " is",
     " a",
@@ -86,20 +100,19 @@ const VOCAB: &[&str] = &[
     "42",
     "\"medium\"",
     "\"me",
+    "dium\"",
+    "\"a{b\"",
     "Let",
     " me",
     " think",
+    " {\"x\"}",
     "Note",
     " x",
     " true",
+    "-",
     "\"name\"",
     "\"f\"",
     "\"arguments\"",
-    "}\n",
-    "dium\"",
-    "\"a{b\"",
-    "-",
-    " {\"x\"}",
 ];
 
 fn token_id(piece: &str) -> u32 {
@@ -131,12 +144,21 @@ fn tokenizer_json() -> String {
 
 // ── Scripted generations ────────────────────────────────────────────────────
 
-/// One generation: reasoning pieces, answer pieces, the terminal reason.
+/// One generation: reasoning pieces, answer pieces, the terminal reason. A
+/// script with reasoning has one more token between the two: the token that
+/// closes the reasoning block, which carries no visible text.
 #[derive(Clone, Copy)]
 struct Script {
     thinking: &'static [&'static str],
     answer: &'static [&'static str],
     finish: &'static str,
+}
+
+impl Script {
+    fn tokens(self) -> u64 {
+        let close = usize::from(!self.thinking.is_empty());
+        (self.thinking.len() + close + self.answer.len() + 1) as u64
+    }
 }
 
 const fn stop(answer: &'static [&'static str]) -> Script {
@@ -155,14 +177,18 @@ const fn length(answer: &'static [&'static str]) -> Script {
     }
 }
 
-const OBJECT: Script = stop(&["{", "\"a\"", ":", " 1", "}"]);
-const OBJECT_AT_LENGTH: Script = length(&["{", "\"a\"", ":", " 1", "}"]);
+const OBJECT_TEXT: &str = r#"{"a": 1}"#;
+const OBJECT_PIECES: &[&str] = &["{", "\"a\"", ":", " 1", "}"];
+
+const OBJECT: Script = stop(OBJECT_PIECES);
+const OBJECT_AT_LENGTH: Script = length(OBJECT_PIECES);
 const OBJECT_AFTER_REASONING: Script = Script {
     thinking: &["Let", " me", " think", " {\"x\"}"],
-    answer: &["{", "\"a\"", ":", " 1", "}"],
+    answer: OBJECT_PIECES,
     finish: "stop",
 };
 const OBJECT_THEN_NEWLINE: Script = stop(&["{", "\"a\"", ":", " 1", "}\n"]);
+const TWO_KEYS: Script = stop(&["{", "\"a\"", ":", " 1", ",", "\"b\"", ":", " 1", "}"]);
 const BARE_FENCE: Script = stop(&["```", "\n", "{", "\"a\"", ":", " 1", "}"]);
 const BARE_FENCE_MID_TOKEN: Script = stop(&["```", "\n{", "\"a\"", ":", " 1", "}"]);
 const JSON_FENCE: Script = stop(&["```", "json", "\n", "{", "\"a\"", ":", " 1", "}"]);
@@ -183,8 +209,13 @@ const PROSE_WITH_NUMBER: Script = stop(&[
     "}",
 ]);
 const PROSE_WITH_QUOTED_WORD: Script =
-    stop(&["Note", " \"c\"", ":", "\n\n", "{", "\"a\"", ":", " 1", "}"]);
+    stop(&["Here", " \"c\"", ":", "\n\n", "{", "\"a\"", ":", " 1", "}"]);
 const PROSE_WITH_DASH: Script = stop(&["-", " JSON", ":", "\n", "{", "\"a\"", ":", " 1", "}"]);
+const BRACE_PROSE_THEN_ARRAY: Script = stop(&[
+    "Here", " {", " x", "}", ":", "\n", "[", "10", ",", " 20", "]",
+]);
+const BRACKET_PROSE_THEN_OBJECT: Script =
+    stop(&["[", "Here", "]", ":", "\n", "{", "\"a\"", ":", " 1", "}"]);
 const CUT_OBJECT: Script = length(&[
     "{",
     "\"Afghanistan\"",
@@ -194,6 +225,7 @@ const CUT_OBJECT: Script = length(&[
     " \"Albania\"",
     ":",
 ]);
+const CUT_OBJECT_TEXT: &str = r#"{"Afghanistan": "Kabul", "Albania":"#;
 const CUT_OBJECT_IN_JSON_FENCE: Script = length(&[
     "```",
     "json",
@@ -210,6 +242,7 @@ const CUT_AFTER_INNER_OBJECT: Script = length(&[
     "{", "\"a\"", ":", " {", "\"b\"", ":", " 1", "}", ",", " \"c\"", ":",
 ]);
 const CUT_ARRAY: Script = length(&["[", "10", ",", " 20", ","]);
+const CUT_SCHEMA_OBJECT: Script = length(&["{", "\"a\"", ":"]);
 const NO_JSON: Script = stop(&["I", " cannot", " do", " that"]);
 
 const SCALAR_TRUE: Script = stop(&["true"]);
@@ -233,7 +266,6 @@ const TOOL_CALL: Script = stop(&[
     "}",
     "}",
 ]);
-
 const CUT_TOOL_CALL: Script = length(&["{", "\"name\"", ":", "\"f\"", ",", "\"arguments\"", ":"]);
 
 // ── Scripted generator ──────────────────────────────────────────────────────
@@ -245,17 +277,23 @@ struct Seen {
     /// `Some` when the route built a constraint: the engine's `finished()`
     /// after the last token.
     constraint_finished: Option<bool>,
+    /// The index of the answer piece after which the constraint first
+    /// reported `engaged()`.
+    engaged_at: Option<usize>,
 }
 
 #[derive(Clone)]
 struct ScriptedGenerator {
     script: Script,
+    /// When set, the generation waits here after the token at which the
+    /// constraint engaged.
+    gate: Option<Arc<Notify>>,
     seen: Arc<Mutex<Seen>>,
 }
 
-fn token(piece: &str, is_thinking: bool) -> GenerationToken {
+fn token(id: u32, piece: &str, is_thinking: bool) -> GenerationToken {
     GenerationToken {
-        token_id: token_id(piece),
+        token_id: id,
         piece: piece.to_owned(),
         done: false,
         finish_reason: None,
@@ -272,27 +310,53 @@ impl Generator for ScriptedGenerator {
         let mut seen = self.seen.lock();
         let mut constraint = req.constraint.take();
         let mut toks = Vec::new();
-        let pieces = self
-            .script
-            .thinking
-            .iter()
-            .map(|p| (*p, true))
-            .chain(self.script.answer.iter().map(|p| (*p, false)));
-        for (piece, is_thinking) in pieces {
-            let id = token_id(piece);
+        let mut gate_after = None;
+
+        // (token id, visible piece, is_thinking, answer index)
+        let mut steps: Vec<(u32, &str, bool, Option<usize>)> = Vec::new();
+        for piece in self.script.thinking {
+            steps.push((token_id(piece), piece, true, None));
+        }
+        if !self.script.thinking.is_empty() {
+            steps.push((token_id("</think>"), "", false, None));
+        }
+        for (at, piece) in self.script.answer.iter().enumerate() {
+            steps.push((token_id(piece), piece, false, Some(at)));
+        }
+
+        for (id, piece, is_thinking, answer_at) in steps {
+            if let Some(c) = constraint.as_mut() {
+                if !c.step_mask(VOCAB.len())[id as usize] {
+                    seen.violations.push(format!(
+                        "the grammar refuses token {:?}",
+                        VOCAB[id as usize]
+                    ));
+                }
+                c.advance(id);
+                if seen.engaged_at.is_none() && c.engaged() {
+                    match answer_at {
+                        Some(at) => {
+                            seen.engaged_at = Some(at);
+                            gate_after = Some(toks.len());
+                        }
+                        None => seen
+                            .violations
+                            .push("the grammar engaged on a reasoning token".to_owned()),
+                    }
+                }
+            }
             if let Some(flag) = req.is_thinking_handle.as_ref() {
                 flag.store(is_thinking, Ordering::Relaxed);
             }
-            if let Some(c) = constraint.as_mut() {
-                if !c.step_mask(VOCAB.len())[id as usize] {
-                    seen.violations
-                        .push(format!("the grammar refuses piece {piece:?}"));
-                }
-                c.advance(id);
-            }
-            toks.push(Ok(token(piece, is_thinking)));
+            toks.push(Ok(token(id, piece, is_thinking)));
         }
-        seen.constraint_finished = constraint.as_ref().map(|c| c.finished());
+        if let Some(c) = constraint.as_mut() {
+            if self.script.finish == "stop" && !c.step_mask(VOCAB.len())[0] {
+                seen.violations
+                    .push("the grammar refuses EOS at the end of the script".to_owned());
+            }
+            seen.constraint_finished = Some(c.finished());
+        }
         toks.push(Ok(GenerationToken {
             token_id: 0,
             piece: String::new(),
@@ -301,13 +365,31 @@ impl Generator for ScriptedGenerator {
             is_thinking: false,
             logprobs: None,
         }));
-        Box::pin(stream::iter(toks))
+
+        let Some(gate) = self.gate.clone() else {
+            return Box::pin(stream::iter(toks));
+        };
+        let Some(gate_after) = gate_after else {
+            seen.violations
+                .push("a gated script did not engage".to_owned());
+            return Box::pin(stream::iter(toks));
+        };
+        let tail = toks.split_off(gate_after + 1);
+        let open = stream::once(async move {
+            gate.notified().await;
+            stream::iter(tail)
+        })
+        .flatten();
+        Box::pin(stream::iter(toks).chain(open))
     }
 }
 
 // ── AppState + server wiring ────────────────────────────────────────────────
 
-fn scripted_state(script: Script) -> (AppState, Arc<Mutex<Seen>>, tempfile::TempDir) {
+fn scripted_state(
+    script: Script,
+    gate: Option<Arc<Notify>>,
+) -> (AppState, Arc<Mutex<Seen>>, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let snap = tmp.path().join("scripted");
     std::fs::create_dir_all(&snap).unwrap();
@@ -326,6 +408,7 @@ fn scripted_state(script: Script) -> (AppState, Arc<Mutex<Seen>>, tempfile::Temp
     let seen = Arc::new(Mutex::new(Seen::default()));
     let generator = ScriptedGenerator {
         script,
+        gate,
         seen: Arc::clone(&seen),
     };
     let reg = ModelRegistry::from_paths(std::slice::from_ref(&snap));
@@ -388,7 +471,9 @@ fn scripted_state(script: Script) -> (AppState, Arc<Mutex<Seen>>, tempfile::Temp
     (state, seen, tmp)
 }
 
-async fn http(port: u16, body: &str) -> (u16, String) {
+/// Send one request. `on_first_content` runs when the first content delta of
+/// the reply is in the bytes read so far; with `None` nothing waits.
+async fn http(port: u16, body: &str, on_first_content: Option<&Notify>) -> (u16, String) {
     let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
         .await
         .unwrap();
@@ -399,6 +484,18 @@ async fn http(port: u16, body: &str) -> (u16, String) {
     );
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut response = Vec::new();
+    if let Some(gate) = on_first_content {
+        let mut buf = [0u8; 4096];
+        while !String::from_utf8_lossy(&response).contains("\"delta\":{\"content\":") {
+            let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+                .await
+                .expect("no content delta arrived while the generation was open");
+            let n = read.unwrap();
+            assert!(n > 0, "the reply ended with no content delta");
+            response.extend_from_slice(&buf[..n]);
+        }
+        gate.notify_one();
+    }
     stream.read_to_end(&mut response).await.unwrap();
     let text = String::from_utf8_lossy(&response).into_owned();
     let status: u16 = text
@@ -413,15 +510,34 @@ async fn http(port: u16, body: &str) -> (u16, String) {
 
 // ── The reply a client reads ────────────────────────────────────────────────
 
+const SCHEMA_OBJECT: &str = r#"{"type":"object","properties":{"a":{"type":"integer"}},"required":["a"],"additionalProperties":false}"#;
+const SCHEMA_ARRAY: &str = r#"{"type":"array","items":{"type":"integer"}}"#;
+const SCHEMA_OBJECT_OR_NULL: &str = r#"{"anyOf":[{"type":"object","properties":{"a":{"type":"integer"}},"required":["a"],"additionalProperties":false},{"type":"null"}]}"#;
+const SCHEMA_TYPE_LIST: &str = r#"{"type":["object","null"]}"#;
+const SCHEMA_ANY: &str = "{}";
+const SCHEMA_BOOLEAN: &str = r#"{"type":"boolean"}"#;
+const SCHEMA_NULL: &str = r#"{"type":"null"}"#;
+const SCHEMA_INTEGER: &str = r#"{"type":"integer"}"#;
+const SCHEMA_STRING: &str = r#"{"type":"string"}"#;
+
 /// The request modes under test.
 #[derive(Clone, Copy)]
 enum Mode {
     JsonObject,
-    /// `json_schema` with this root type.
-    SchemaRoot(&'static str),
+    /// `json_schema` with this schema text, not strict.
+    Schema(&'static str),
     Text,
     NoFormat,
     RequiredTool,
+}
+
+impl Mode {
+    fn builds_a_constraint(self) -> bool {
+        matches!(
+            self,
+            Mode::JsonObject | Mode::Schema(_) | Mode::RequiredTool
+        )
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -430,7 +546,10 @@ struct Reply {
     /// one entry.
     content: Vec<String>,
     reasoning: String,
-    finish: String,
+    /// The `finish_reason` values, one for each chunk that carries one.
+    finish: Vec<String>,
+    /// The `type` of each error event of a streamed reply.
+    errors: Vec<String>,
     completion_tokens: u64,
     tool_names: Vec<String>,
 }
@@ -441,21 +560,7 @@ impl Reply {
     }
 }
 
-/// A schema with this root type. The object root accepts `{"a": <integer>}`.
-fn schema_of(root: &str) -> Value {
-    if root == "object" {
-        json!({
-            "type": "object",
-            "properties": {"a": {"type": "integer"}},
-            "required": ["a"],
-            "additionalProperties": false
-        })
-    } else {
-        json!({"type": root})
-    }
-}
-
-fn request_body(mode: Mode, stream: bool) -> String {
+fn request_body(mode: Mode, stop: Option<&str>, stream: bool) -> String {
     let mut body = json!({
         "model": "scripted",
         "messages": [{"role": "user", "content": "hi"}],
@@ -466,12 +571,16 @@ fn request_body(mode: Mode, stream: bool) -> String {
     if stream {
         body["stream_options"] = json!({"include_usage": true});
     }
+    if let Some(stop) = stop {
+        body["stop"] = json!([stop]);
+    }
     match mode {
         Mode::JsonObject => body["response_format"] = json!({"type": "json_object"}),
-        Mode::SchemaRoot(root) => {
+        Mode::Schema(schema) => {
+            let schema: Value = serde_json::from_str(schema).unwrap();
             body["response_format"] = json!({
                 "type": "json_schema",
-                "json_schema": {"name": "root", "strict": true, "schema": schema_of(root)}
+                "json_schema": {"name": "root", "strict": false, "schema": schema}
             });
         }
         Mode::Text => body["response_format"] = json!({"type": "text"}),
@@ -494,17 +603,30 @@ fn parse_streamed(raw: &str) -> Reply {
     let mut reply = Reply {
         content: Vec::new(),
         reasoning: String::new(),
-        finish: String::new(),
+        finish: Vec::new(),
+        errors: Vec::new(),
         completion_tokens: 0,
         tool_names: Vec::new(),
     };
+    let mut done = 0;
     for line in raw.lines() {
         let Some(data) = line.trim().strip_prefix("data:") else {
             continue;
         };
-        let Ok(v) = serde_json::from_str::<Value>(data.trim()) else {
+        let data = data.trim();
+        if data == "[DONE]" {
+            done += 1;
             continue;
-        };
+        }
+        let v: Value = serde_json::from_str(data)
+            .unwrap_or_else(|e| panic!("harness: a data line is not JSON: {e}: {data}"));
+        if let Some(error) = v.get("error") {
+            let kind = error["type"]
+                .as_str()
+                .unwrap_or_else(|| panic!("harness: an error event has no type: {data}"));
+            reply.errors.push(kind.to_owned());
+            continue;
+        }
         let choice = &v["choices"][0];
         if let Some(c) = choice["delta"]["content"].as_str() {
             reply.content.push(c.to_owned());
@@ -513,7 +635,7 @@ fn parse_streamed(raw: &str) -> Reply {
             reply.reasoning.push_str(r);
         }
         if let Some(f) = choice["finish_reason"].as_str() {
-            f.clone_into(&mut reply.finish);
+            reply.finish.push(f.to_owned());
         }
         if let Some(n) = v["usage"]["completion_tokens"].as_u64() {
             reply.completion_tokens = n;
@@ -526,6 +648,7 @@ fn parse_streamed(raw: &str) -> Reply {
             }
         }
     }
+    assert_eq!(done, 1, "harness: a stream ends with one [DONE]: {raw}");
     reply
 }
 
@@ -533,17 +656,23 @@ fn parse_blocking(raw: &str) -> Reply {
     let v: Value = serde_json::from_str(raw).unwrap_or_else(|e| panic!("harness: {e}: {raw}"));
     let choice = &v["choices"][0];
     let message = &choice["message"];
+    let field = |v: &Value, name: &str| -> String {
+        v[name]
+            .as_str()
+            .unwrap_or_else(|| panic!("harness: the reply has no `{name}`: {raw}"))
+            .to_owned()
+    };
     Reply {
-        content: vec![message["content"].as_str().unwrap_or_default().to_owned()],
+        content: vec![field(message, "content")],
         reasoning: message["reasoning_content"]
             .as_str()
             .unwrap_or_default()
             .to_owned(),
-        finish: choice["finish_reason"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned(),
-        completion_tokens: v["usage"]["completion_tokens"].as_u64().unwrap_or_default(),
+        finish: vec![field(choice, "finish_reason")],
+        errors: Vec::new(),
+        completion_tokens: v["usage"]["completion_tokens"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("harness: the reply has no token count: {raw}")),
         tool_names: message["tool_calls"]
             .as_array()
             .map(|calls| {
@@ -556,87 +685,144 @@ fn parse_blocking(raw: &str) -> Reply {
     }
 }
 
-/// Run `script` through one request and return `(status, raw body, what the
-/// generator saw)`.
-async fn serve(script: Script, mode: Mode, stream: bool) -> (u16, String, Arc<Mutex<Seen>>) {
-    let (state, seen, _tmp) = scripted_state(script);
+/// One request against one scripted generation.
+#[derive(Clone, Copy)]
+struct Ask {
+    script: Script,
+    mode: Mode,
+    stop: Option<&'static str>,
+    stream: bool,
+    /// Hold the generation after the engagement token until the client has
+    /// the first content delta.
+    gated: bool,
+}
+
+const fn ask(script: Script, mode: Mode, stream: bool) -> Ask {
+    Ask {
+        script,
+        mode,
+        stop: None,
+        stream,
+        gated: false,
+    }
+}
+
+/// Run one request and return `(status, raw body, what the generator saw)`.
+async fn serve(ask: Ask) -> (u16, String, Arc<Mutex<Seen>>) {
+    let gate = ask.gated.then(|| Arc::new(Notify::new()));
+    let (state, seen, _tmp) = scripted_state(ask.script, gate.clone());
     let router = rmlx_server::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    let (status, raw) = http(port, &request_body(mode, stream)).await;
+    let body = request_body(ask.mode, ask.stop, ask.stream);
+    let (status, raw) = http(port, &body, gate.as_deref()).await;
+    {
+        let seen = seen.lock();
+        assert!(
+            seen.violations.is_empty(),
+            "harness: unsound script: {:?}",
+            seen.violations
+        );
+        assert_eq!(
+            seen.constraint_finished.is_some(),
+            ask.mode.builds_a_constraint(),
+            "harness: the route built a constraint for this mode"
+        );
+    }
     (status, raw, seen)
 }
 
-/// The reply of a request that must answer 200 from a sound script.
-async fn reply(script: Script, mode: Mode, stream: bool) -> Reply {
-    let (status, raw, seen) = serve(script, mode, stream).await;
+/// The reply of a request that answers 200.
+async fn reply(ask: Ask) -> (Reply, Arc<Mutex<Seen>>) {
+    let (status, raw, seen) = serve(ask).await;
     assert_eq!(status, 200, "harness: body: {raw}");
-    let seen = seen.lock();
-    assert!(
-        seen.violations.is_empty(),
-        "harness: unsound script: {:?}",
-        seen.violations
-    );
-    if stream {
+    let reply = if ask.stream {
         parse_streamed(&raw)
     } else {
         parse_blocking(&raw)
+    };
+    (reply, seen)
+}
+
+/// A literal expected reply must start in the answer piece at which the
+/// constraint reported that it engaged.
+fn check_literal_against_the_constraint(script: Script, seen: &Seen, literal: &str) {
+    let at = seen
+        .engaged_at
+        .expect("harness: the constraint did not engage");
+    let rest = script.answer[at + 1..].concat();
+    let starts_in_the_piece = literal
+        .strip_suffix(rest.as_str())
+        .is_some_and(|head| !head.is_empty() && script.answer[at].ends_with(head));
+    assert!(
+        starts_in_the_piece,
+        "harness: the literal {literal:?} does not start where the constraint engaged \
+         (answer piece {at} of {:?})",
+        script.answer
+    );
+}
+
+async fn assert_streamed(script: Script, mode: Mode, deltas: &[&str]) {
+    let (got, seen) = reply(ask(script, mode, true)).await;
+    if mode.builds_a_constraint() {
+        check_literal_against_the_constraint(script, &seen.lock(), &deltas.concat());
     }
-}
-
-/// The answer pieces from the first piece that holds `{` or `[`, that piece
-/// cut at the byte. This is where the `json_object` grammar engages.
-fn from_first_container_byte(script: Script) -> Vec<String> {
-    let mut out = Vec::new();
-    for piece in script.answer {
-        if out.is_empty() {
-            if let Some(at) = piece.find(['{', '[']) {
-                out.push(piece[at..].to_owned());
-            }
-        } else {
-            out.push((*piece).to_owned());
-        }
-    }
-    assert!(!out.is_empty(), "harness: the script holds no `{{` or `[`");
-    out
-}
-
-fn all_answer_pieces(script: Script) -> Vec<String> {
-    script.answer.iter().map(|p| (*p).to_owned()).collect()
-}
-
-async fn assert_streamed(script: Script, mode: Mode, deltas: Vec<String>) {
-    let got = reply(script, mode, true).await;
     assert_eq!(got.content, deltas, "streamed content deltas");
+    assert!(got.errors.is_empty(), "harness: {:?}", got.errors);
 }
 
-async fn assert_blocking(script: Script, mode: Mode, deltas: &[String]) {
-    let got = reply(script, mode, false).await;
-    assert_eq!(got.text(), deltas.concat(), "non-streamed content");
+async fn assert_blocking(script: Script, mode: Mode, text: &str) {
+    let (got, seen) = reply(ask(script, mode, false)).await;
+    if mode.builds_a_constraint() {
+        check_literal_against_the_constraint(script, &seen.lock(), text);
+    }
+    assert_eq!(got.text(), text, "non-streamed content");
+}
+
+/// The stream of a reply that is not engaged: no content, one error event of
+/// the type of the non-streamed refusal, and no `finish_reason` chunk.
+async fn assert_stream_refuses(ask: Ask) {
+    let (got, _) = reply(ask).await;
+    assert_eq!(
+        (got.content, got.errors, got.finish),
+        (
+            Vec::<String>::new(),
+            vec!["constraint_not_engaged".to_owned()],
+            Vec::<String>::new()
+        ),
+        "streamed reply that is not engaged"
+    );
+}
+
+async fn assert_blocking_refuses(ask: Ask) {
+    let (status, raw, _) = serve(ask).await;
+    assert_eq!(status, 502, "non-streamed status: body: {raw}");
+    assert!(raw.contains("constraint_not_engaged"), "body: {raw}");
 }
 
 // ── What must not move: a JSON reply that is correct today ──────────────────
 
 #[tokio::test]
 async fn a_bare_object_is_streamed_piece_for_piece() {
-    assert_streamed(OBJECT, Mode::JsonObject, all_answer_pieces(OBJECT)).await;
+    for mode in [Mode::JsonObject, Mode::Schema(SCHEMA_OBJECT)] {
+        assert_streamed(OBJECT, mode, OBJECT_PIECES).await;
+    }
 }
 
 #[tokio::test]
 async fn a_bare_object_is_returned_whole() {
-    assert_blocking(OBJECT, Mode::JsonObject, &all_answer_pieces(OBJECT)).await;
-    assert_eq!(all_answer_pieces(OBJECT).concat(), r#"{"a": 1}"#);
+    for mode in [Mode::JsonObject, Mode::Schema(SCHEMA_OBJECT)] {
+        assert_blocking(OBJECT, mode, OBJECT_TEXT).await;
+    }
 }
 
 #[tokio::test]
 async fn an_object_that_closes_on_the_last_allowed_token_is_whole_on_both_paths() {
-    let whole = all_answer_pieces(OBJECT_AT_LENGTH);
-    assert_streamed(OBJECT_AT_LENGTH, Mode::JsonObject, whole.clone()).await;
-    assert_blocking(OBJECT_AT_LENGTH, Mode::JsonObject, &whole).await;
+    assert_streamed(OBJECT_AT_LENGTH, Mode::JsonObject, OBJECT_PIECES).await;
+    assert_blocking(OBJECT_AT_LENGTH, Mode::JsonObject, OBJECT_TEXT).await;
 }
 
 #[tokio::test]
@@ -644,113 +830,138 @@ async fn a_bare_fence_header_is_not_in_the_reply_on_both_paths() {
     for (script, mode) in [
         (BARE_FENCE, Mode::JsonObject),
         (BARE_FENCE_MID_TOKEN, Mode::JsonObject),
-        (BARE_FENCE, Mode::SchemaRoot("object")),
+        (BARE_FENCE, Mode::Schema(SCHEMA_OBJECT)),
+        (BARE_FENCE, Mode::Schema(SCHEMA_OBJECT_OR_NULL)),
+        (BARE_FENCE, Mode::Schema(SCHEMA_TYPE_LIST)),
+        (BARE_FENCE, Mode::Schema(SCHEMA_ANY)),
     ] {
-        let from_brace = from_first_container_byte(script);
-        assert_eq!(from_brace.concat(), r#"{"a": 1}"#);
-        assert_streamed(script, mode, from_brace.clone()).await;
-        assert_blocking(script, mode, &from_brace).await;
+        assert_streamed(script, mode, OBJECT_PIECES).await;
+        assert_blocking(script, mode, OBJECT_TEXT).await;
     }
 }
 
 #[tokio::test]
 async fn a_json_fence_header_is_not_in_the_non_streamed_reply() {
-    let from_brace = from_first_container_byte(JSON_FENCE);
-    assert_blocking(JSON_FENCE, Mode::JsonObject, &from_brace).await;
+    for mode in [Mode::JsonObject, Mode::Schema(SCHEMA_OBJECT)] {
+        assert_blocking(JSON_FENCE, mode, OBJECT_TEXT).await;
+    }
 }
 
 #[tokio::test]
 async fn prose_before_the_object_is_not_in_the_non_streamed_reply() {
-    let from_brace = from_first_container_byte(PROSE);
-    assert_blocking(PROSE, Mode::JsonObject, &from_brace).await;
+    for mode in [
+        Mode::JsonObject,
+        Mode::Schema(SCHEMA_OBJECT),
+        Mode::Schema(SCHEMA_OBJECT_OR_NULL),
+    ] {
+        assert_blocking(PROSE, mode, OBJECT_TEXT).await;
+    }
 }
 
 #[tokio::test]
-async fn an_object_cut_by_the_token_limit_is_streamed_piece_for_piece() {
-    for script in [CUT_OBJECT, CUT_AFTER_INNER_OBJECT, CUT_ARRAY] {
-        assert_streamed(script, Mode::JsonObject, all_answer_pieces(script)).await;
+async fn a_dash_in_the_prose_is_not_returned_in_place_of_the_object() {
+    assert_blocking(PROSE_WITH_DASH, Mode::JsonObject, OBJECT_TEXT).await;
+}
+
+#[tokio::test]
+async fn a_value_cut_by_the_token_limit_is_streamed_piece_for_piece() {
+    for (script, mode) in [
+        (CUT_OBJECT, Mode::JsonObject),
+        (CUT_AFTER_INNER_OBJECT, Mode::JsonObject),
+        (CUT_ARRAY, Mode::JsonObject),
+        (CUT_SCHEMA_OBJECT, Mode::Schema(SCHEMA_OBJECT)),
+    ] {
+        assert_streamed(script, mode, script.answer).await;
     }
 }
 
 #[tokio::test]
 async fn white_space_after_the_closed_object_is_streamed() {
-    let whole = all_answer_pieces(OBJECT_THEN_NEWLINE);
-    assert_streamed(OBJECT_THEN_NEWLINE, Mode::JsonObject, whole).await;
-}
-
-#[tokio::test]
-async fn a_dash_in_the_prose_is_not_returned_in_place_of_the_object() {
-    let from_brace = from_first_container_byte(PROSE_WITH_DASH);
-    assert_blocking(PROSE_WITH_DASH, Mode::JsonObject, &from_brace).await;
+    assert_streamed(
+        OBJECT_THEN_NEWLINE,
+        Mode::JsonObject,
+        &["{", "\"a\"", ":", " 1", "}\n"],
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn reasoning_stays_on_its_channel_and_the_object_is_whole_on_both_paths() {
-    let whole = all_answer_pieces(OBJECT_AFTER_REASONING);
     for stream in [true, false] {
-        let got = reply(OBJECT_AFTER_REASONING, Mode::JsonObject, stream).await;
-        assert_eq!(got.text(), whole.concat(), "stream={stream}");
+        let (got, _) = reply(ask(OBJECT_AFTER_REASONING, Mode::JsonObject, stream)).await;
+        assert_eq!(got.text(), OBJECT_TEXT, "stream={stream}");
         assert_eq!(got.reasoning, "Let me think {\"x\"}", "stream={stream}");
     }
 }
 
 #[tokio::test]
 async fn a_scalar_schema_root_is_returned_unchanged_on_both_paths() {
-    for (script, root) in [
-        (SCALAR_TRUE, "boolean"),
-        (SCALAR_NULL, "null"),
-        (SCALAR_INTEGER, "integer"),
-        (SCALAR_STRING, "string"),
-        (SCALAR_STRING_IN_TWO_PIECES, "string"),
-        (SCALAR_STRING_WITH_BRACE, "string"),
-        (CUT_SCALAR_STRING, "string"),
+    for (script, schema) in [
+        (SCALAR_TRUE, SCHEMA_BOOLEAN),
+        (SCALAR_NULL, SCHEMA_NULL),
+        (SCALAR_INTEGER, SCHEMA_INTEGER),
+        (SCALAR_STRING, SCHEMA_STRING),
+        (SCALAR_STRING_IN_TWO_PIECES, SCHEMA_STRING),
+        (SCALAR_STRING_WITH_BRACE, SCHEMA_STRING),
+        (CUT_SCALAR_STRING, SCHEMA_STRING),
     ] {
-        let whole = all_answer_pieces(script);
-        assert_streamed(script, Mode::SchemaRoot(root), whole.clone()).await;
-        assert_blocking(script, Mode::SchemaRoot(root), &whole).await;
+        assert_streamed(script, Mode::Schema(schema), script.answer).await;
+        assert_blocking(script, Mode::Schema(schema), &script.answer.concat()).await;
     }
 }
 
+/// The first content delta reaches the client while the generation is open: a
+/// reply is not held until its end.
 #[tokio::test]
-async fn an_object_schema_root_is_returned_unchanged_on_both_paths() {
-    let whole = all_answer_pieces(OBJECT);
-    assert_streamed(OBJECT, Mode::SchemaRoot("object"), whole.clone()).await;
-    assert_blocking(OBJECT, Mode::SchemaRoot("object"), &whole).await;
+async fn the_first_delta_of_an_engaged_reply_is_sent_before_the_generation_ends() {
+    let gated = Ask {
+        gated: true,
+        ..ask(BARE_FENCE, Mode::JsonObject, true)
+    };
+    let (got, _) = reply(gated).await;
+    assert_eq!(got.content, OBJECT_PIECES);
 }
 
 // ── What must not move: the other fields, and the other modes ───────────────
 
-/// Every JSON-mode script, with the request mode it runs under.
+/// Every JSON-mode script that answers 200, with the request mode it runs
+/// under.
 const JSON_MODE_SCRIPTS: &[(Script, Mode)] = &[
     (OBJECT, Mode::JsonObject),
+    (OBJECT, Mode::Schema(SCHEMA_OBJECT)),
     (OBJECT_AT_LENGTH, Mode::JsonObject),
     (OBJECT_AFTER_REASONING, Mode::JsonObject),
     (OBJECT_THEN_NEWLINE, Mode::JsonObject),
+    (TWO_KEYS, Mode::JsonObject),
     (PROSE_WITH_QUOTED_WORD, Mode::JsonObject),
     (PROSE_WITH_DASH, Mode::JsonObject),
     (BARE_FENCE, Mode::JsonObject),
     (BARE_FENCE_MID_TOKEN, Mode::JsonObject),
     (JSON_FENCE, Mode::JsonObject),
+    (JSON_FENCE, Mode::Schema(SCHEMA_OBJECT)),
     (PROSE, Mode::JsonObject),
     (PROSE_WITH_NUMBER, Mode::JsonObject),
+    (BRACE_PROSE_THEN_ARRAY, Mode::Schema(SCHEMA_ARRAY)),
+    (BRACKET_PROSE_THEN_OBJECT, Mode::Schema(SCHEMA_OBJECT)),
     (CUT_OBJECT, Mode::JsonObject),
     (CUT_OBJECT_IN_JSON_FENCE, Mode::JsonObject),
     (CUT_AFTER_INNER_OBJECT, Mode::JsonObject),
     (CUT_ARRAY, Mode::JsonObject),
-    (SCALAR_TRUE, Mode::SchemaRoot("boolean")),
-    (CUT_SCALAR_STRING, Mode::SchemaRoot("string")),
+    (CUT_SCHEMA_OBJECT, Mode::Schema(SCHEMA_OBJECT)),
+    (SCALAR_TRUE, Mode::Schema(SCHEMA_BOOLEAN)),
+    (CUT_SCALAR_STRING, Mode::Schema(SCHEMA_STRING)),
 ];
 
 #[tokio::test]
 async fn the_finish_reason_and_the_token_count_are_the_generation_s_on_both_paths() {
     for (script, mode) in JSON_MODE_SCRIPTS {
-        let tokens = (script.thinking.len() + script.answer.len() + 1) as u64;
         for stream in [true, false] {
-            let got = reply(*script, *mode, stream).await;
+            let (got, _) = reply(ask(*script, *mode, stream)).await;
             let what = format!("stream={stream} answer={:?}", script.answer);
-            assert_eq!(got.finish, script.finish, "{what}");
-            assert_eq!(got.completion_tokens, tokens, "{what}");
+            assert_eq!(got.finish, [script.finish], "{what}");
+            assert_eq!(got.completion_tokens, script.tokens(), "{what}");
             assert!(got.tool_names.is_empty(), "{what}");
+            assert!(got.errors.is_empty(), "{what}");
         }
     }
 }
@@ -758,7 +969,7 @@ async fn the_finish_reason_and_the_token_count_are_the_generation_s_on_both_path
 #[tokio::test]
 async fn the_grammar_reports_a_closed_value_only_for_a_closed_value() {
     for (script, closed) in [(OBJECT, true), (CUT_OBJECT, false), (PROSE, true)] {
-        let (status, raw, seen) = serve(script, Mode::JsonObject, false).await;
+        let (status, raw, seen) = serve(ask(script, Mode::JsonObject, false)).await;
         assert_eq!(status, 200, "harness: body: {raw}");
         assert_eq!(seen.lock().constraint_finished, Some(closed));
     }
@@ -766,23 +977,20 @@ async fn the_grammar_reports_a_closed_value_only_for_a_closed_value() {
 
 #[tokio::test]
 async fn a_reply_without_json_mode_is_returned_byte_for_byte_on_both_paths() {
-    let whole = all_answer_pieces(PLAIN_TEXT);
-    assert_eq!(whole.concat(), "Note: 30 { x} true");
+    assert_eq!(PLAIN_TEXT.answer.concat(), "Note: 30 { x} true");
     for mode in [Mode::Text, Mode::NoFormat] {
-        assert_streamed(PLAIN_TEXT, mode, whole.clone()).await;
-        assert_blocking(PLAIN_TEXT, mode, &whole).await;
-        let (_, _, seen) = serve(PLAIN_TEXT, mode, false).await;
-        assert_eq!(seen.lock().constraint_finished, None, "no constraint");
+        assert_streamed(PLAIN_TEXT, mode, PLAIN_TEXT.answer).await;
+        assert_blocking(PLAIN_TEXT, mode, "Note: 30 { x} true").await;
     }
 }
 
 #[tokio::test]
 async fn a_forced_tool_call_becomes_a_tool_call_on_both_paths() {
     for stream in [true, false] {
-        let got = reply(TOOL_CALL, Mode::RequiredTool, stream).await;
+        let (got, _) = reply(ask(TOOL_CALL, Mode::RequiredTool, stream)).await;
         assert_eq!(got.tool_names, ["f"], "stream={stream}");
         assert_eq!(got.text(), "", "stream={stream}");
-        assert_eq!(got.finish, "tool_calls", "stream={stream}");
+        assert_eq!(got.finish, ["tool_calls"], "stream={stream}");
     }
 }
 
@@ -790,77 +998,137 @@ async fn a_forced_tool_call_becomes_a_tool_call_on_both_paths() {
 /// return the text.
 #[tokio::test]
 async fn a_cut_forced_tool_call_is_returned_as_its_text_on_both_paths() {
-    let whole = all_answer_pieces(CUT_TOOL_CALL).concat();
     for stream in [true, false] {
-        let got = reply(CUT_TOOL_CALL, Mode::RequiredTool, stream).await;
-        assert_eq!(got.text(), whole, "stream={stream}");
+        let (got, _) = reply(ask(CUT_TOOL_CALL, Mode::RequiredTool, stream)).await;
+        assert_eq!(got.text(), r#"{"name":"f","arguments":"#, "stream={stream}");
         assert!(got.tool_names.is_empty(), "stream={stream}");
-        assert_eq!(got.finish, "length", "stream={stream}");
+        assert_eq!(got.finish, ["length"], "stream={stream}");
     }
 }
 
 #[tokio::test]
 async fn a_non_streamed_reply_whose_grammar_never_engaged_is_refused() {
-    let (status, raw, _) = serve(NO_JSON, Mode::JsonObject, false).await;
-    assert_eq!(status, 502, "body: {raw}");
-    assert!(raw.contains("constraint_not_engaged"), "body: {raw}");
+    assert_blocking_refuses(ask(NO_JSON, Mode::JsonObject, false)).await;
 }
 
-// ── Wrong today: the streamed reply loses or keeps the wrong text ───────────
+/// A stop string inside the JSON ends the streamed reply before it, with
+/// `finish_reason: "stop"`.
+#[tokio::test]
+async fn a_stop_string_inside_the_object_cuts_the_streamed_reply_there() {
+    let stopped = Ask {
+        stop: Some(","),
+        ..ask(TWO_KEYS, Mode::JsonObject, true)
+    };
+    let (got, _) = reply(stopped).await;
+    assert_eq!(got.content, ["{", "\"a\"", ":", " 1"]);
+    assert_eq!(got.finish, ["stop"]);
+    assert!(got.errors.is_empty(), "{:?}", got.errors);
+}
+
+// ── Wrong today: the streamed reply does not start at the engagement byte ───
 
 #[tokio::test]
 #[should_panic(expected = "streamed content deltas")]
 async fn a_json_fence_header_is_not_in_the_streamed_reply() {
-    let from_brace = from_first_container_byte(JSON_FENCE);
-    assert_streamed(JSON_FENCE, Mode::JsonObject, from_brace).await;
+    assert_streamed(JSON_FENCE, Mode::JsonObject, OBJECT_PIECES).await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "streamed content deltas")]
+async fn a_json_fence_header_is_not_in_the_streamed_reply_of_an_object_schema() {
+    assert_streamed(JSON_FENCE, Mode::Schema(SCHEMA_OBJECT), OBJECT_PIECES).await;
 }
 
 #[tokio::test]
 #[should_panic(expected = "streamed content deltas")]
 async fn prose_before_the_object_is_not_cut_at_a_letter_in_the_streamed_reply() {
-    let from_brace = from_first_container_byte(PROSE);
-    assert_streamed(PROSE, Mode::JsonObject, from_brace).await;
+    assert_streamed(PROSE, Mode::JsonObject, OBJECT_PIECES).await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "streamed content deltas")]
+async fn prose_before_the_object_is_not_in_the_streamed_reply_of_an_object_schema() {
+    assert_streamed(PROSE, Mode::Schema(SCHEMA_OBJECT), OBJECT_PIECES).await;
 }
 
 #[tokio::test]
 #[should_panic(expected = "streamed content deltas")]
 async fn prose_with_a_number_is_not_cut_at_the_digit_in_the_streamed_reply() {
-    let from_brace = from_first_container_byte(PROSE_WITH_NUMBER);
-    assert_streamed(PROSE_WITH_NUMBER, Mode::JsonObject, from_brace).await;
+    assert_streamed(PROSE_WITH_NUMBER, Mode::JsonObject, OBJECT_PIECES).await;
 }
 
 #[tokio::test]
 #[should_panic(expected = "streamed content deltas")]
 async fn prose_with_a_quoted_word_is_not_cut_at_the_quote_in_the_streamed_reply() {
-    let from_brace = from_first_container_byte(PROSE_WITH_QUOTED_WORD);
-    assert_streamed(PROSE_WITH_QUOTED_WORD, Mode::JsonObject, from_brace).await;
+    assert_streamed(PROSE_WITH_QUOTED_WORD, Mode::JsonObject, OBJECT_PIECES).await;
 }
 
 #[tokio::test]
 #[should_panic(expected = "streamed content deltas")]
 async fn prose_that_starts_with_a_dash_is_not_in_the_streamed_reply() {
-    let from_brace = from_first_container_byte(PROSE_WITH_DASH);
-    assert_streamed(PROSE_WITH_DASH, Mode::JsonObject, from_brace).await;
+    assert_streamed(PROSE_WITH_DASH, Mode::JsonObject, OBJECT_PIECES).await;
 }
 
 #[tokio::test]
 #[should_panic(expected = "streamed content deltas")]
 async fn a_cut_object_in_a_json_fence_is_streamed_from_its_brace() {
-    let from_brace = from_first_container_byte(CUT_OBJECT_IN_JSON_FENCE);
-    assert_streamed(CUT_OBJECT_IN_JSON_FENCE, Mode::JsonObject, from_brace).await;
+    assert_streamed(
+        CUT_OBJECT_IN_JSON_FENCE,
+        Mode::JsonObject,
+        &[
+            "{",
+            "\"Afghanistan\"",
+            ":",
+            " \"Kabul\"",
+            ",",
+            " \"Albania\"",
+            ":",
+        ],
+    )
+    .await;
 }
 
-/// The grammar never engaged, so no byte of the reply is JSON-mode output. The
-/// stream cannot refuse, and the text the model wrote is all the client has.
+/// The array grammar does not engage at the `{` of the prose.
 #[tokio::test]
-#[should_panic(expected = "streamed content of an unengaged reply")]
-async fn a_streamed_reply_whose_grammar_never_engaged_keeps_its_text() {
-    let got = reply(NO_JSON, Mode::JsonObject, true).await;
-    assert_eq!(
-        got.text(),
-        "I cannot do that",
-        "streamed content of an unengaged reply"
-    );
+#[should_panic(expected = "streamed content deltas")]
+async fn a_brace_in_the_prose_does_not_start_the_streamed_reply_of_an_array_schema() {
+    assert_streamed(
+        BRACE_PROSE_THEN_ARRAY,
+        Mode::Schema(SCHEMA_ARRAY),
+        &["[", "10", ",", " 20", "]"],
+    )
+    .await;
+}
+
+/// The object grammar does not engage at the `[` of the prose.
+#[tokio::test]
+#[should_panic(expected = "streamed content deltas")]
+async fn a_bracket_in_the_prose_does_not_start_the_streamed_reply_of_an_object_schema() {
+    assert_streamed(
+        BRACKET_PROSE_THEN_OBJECT,
+        Mode::Schema(SCHEMA_OBJECT),
+        OBJECT_PIECES,
+    )
+    .await;
+}
+
+// ── Wrong today: a streamed reply that is not engaged completes ─────────────
+
+#[tokio::test]
+#[should_panic(expected = "streamed reply that is not engaged")]
+async fn a_streamed_reply_whose_grammar_never_engaged_ends_with_an_error_event() {
+    assert_stream_refuses(ask(NO_JSON, Mode::JsonObject, true)).await;
+}
+
+/// The generation ends at the stop string, before the grammar engaged.
+#[tokio::test]
+#[should_panic(expected = "streamed reply that is not engaged")]
+async fn a_stop_string_in_the_prose_ends_the_streamed_reply_with_an_error_event() {
+    let stopped = Ask {
+        stop: Some(" JSON"),
+        ..ask(PROSE, Mode::JsonObject, true)
+    };
+    assert_stream_refuses(stopped).await;
 }
 
 // ── Wrong today: the non-streamed reply is one smaller value ────────────────
@@ -868,14 +1136,19 @@ async fn a_streamed_reply_whose_grammar_never_engaged_keeps_its_text() {
 #[tokio::test]
 #[should_panic(expected = "non-streamed content")]
 async fn an_object_cut_by_the_token_limit_is_not_returned_as_its_first_key() {
-    assert_blocking(CUT_OBJECT, Mode::JsonObject, &all_answer_pieces(CUT_OBJECT)).await;
+    assert_blocking(CUT_OBJECT, Mode::JsonObject, CUT_OBJECT_TEXT).await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "non-streamed content")]
+async fn a_cut_object_of_an_object_schema_is_not_returned_as_its_first_key() {
+    assert_blocking(CUT_SCHEMA_OBJECT, Mode::Schema(SCHEMA_OBJECT), r#"{"a":"#).await;
 }
 
 #[tokio::test]
 #[should_panic(expected = "non-streamed content")]
 async fn a_cut_object_in_a_json_fence_is_not_returned_as_its_first_key() {
-    let from_brace = from_first_container_byte(CUT_OBJECT_IN_JSON_FENCE);
-    assert_blocking(CUT_OBJECT_IN_JSON_FENCE, Mode::JsonObject, &from_brace).await;
+    assert_blocking(CUT_OBJECT_IN_JSON_FENCE, Mode::JsonObject, CUT_OBJECT_TEXT).await;
 }
 
 #[tokio::test]
@@ -884,7 +1157,7 @@ async fn a_cut_object_is_not_returned_as_a_closed_inner_object_or_key() {
     assert_blocking(
         CUT_AFTER_INNER_OBJECT,
         Mode::JsonObject,
-        &all_answer_pieces(CUT_AFTER_INNER_OBJECT),
+        r#"{"a": {"b": 1}, "c":"#,
     )
     .await;
 }
@@ -892,27 +1165,77 @@ async fn a_cut_object_is_not_returned_as_a_closed_inner_object_or_key() {
 #[tokio::test]
 #[should_panic(expected = "non-streamed content")]
 async fn a_cut_array_is_not_returned_as_its_first_number() {
-    assert_blocking(CUT_ARRAY, Mode::JsonObject, &all_answer_pieces(CUT_ARRAY)).await;
+    assert_blocking(CUT_ARRAY, Mode::JsonObject, "[10, 20,").await;
 }
 
 #[tokio::test]
 #[should_panic(expected = "non-streamed content")]
 async fn a_number_in_the_prose_is_not_returned_in_place_of_the_object() {
-    let from_brace = from_first_container_byte(PROSE_WITH_NUMBER);
-    assert_blocking(PROSE_WITH_NUMBER, Mode::JsonObject, &from_brace).await;
+    assert_blocking(PROSE_WITH_NUMBER, Mode::JsonObject, OBJECT_TEXT).await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "non-streamed content")]
+async fn a_number_in_the_prose_is_not_returned_in_place_of_the_object_of_a_schema() {
+    assert_blocking(PROSE_WITH_NUMBER, Mode::Schema(SCHEMA_OBJECT), OBJECT_TEXT).await;
 }
 
 #[tokio::test]
 #[should_panic(expected = "non-streamed content")]
 async fn a_quoted_word_in_the_prose_is_not_returned_in_place_of_the_object() {
-    let from_brace = from_first_container_byte(PROSE_WITH_QUOTED_WORD);
-    assert_blocking(PROSE_WITH_QUOTED_WORD, Mode::JsonObject, &from_brace).await;
+    assert_blocking(PROSE_WITH_QUOTED_WORD, Mode::JsonObject, OBJECT_TEXT).await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "non-streamed content")]
+async fn a_brace_in_the_prose_is_not_returned_in_place_of_the_array_of_a_schema() {
+    assert_blocking(
+        BRACE_PROSE_THEN_ARRAY,
+        Mode::Schema(SCHEMA_ARRAY),
+        "[10, 20]",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "non-streamed content")]
+async fn a_bracket_in_the_prose_is_not_returned_in_place_of_the_object_of_a_schema() {
+    assert_blocking(
+        BRACKET_PROSE_THEN_OBJECT,
+        Mode::Schema(SCHEMA_OBJECT),
+        OBJECT_TEXT,
+    )
+    .await;
 }
 
 /// The streamed reply holds this white space today, so the two paths differ.
 #[tokio::test]
 #[should_panic(expected = "non-streamed content")]
 async fn white_space_after_the_closed_object_is_in_the_non_streamed_reply() {
-    let whole = all_answer_pieces(OBJECT_THEN_NEWLINE);
-    assert_blocking(OBJECT_THEN_NEWLINE, Mode::JsonObject, &whole).await;
+    assert_blocking(OBJECT_THEN_NEWLINE, Mode::JsonObject, "{\"a\": 1}\n").await;
+}
+
+/// A stop string inside the JSON ends the non-streamed reply before it, as it
+/// ends the streamed reply.
+#[tokio::test]
+#[should_panic(expected = "non-streamed content")]
+async fn a_stop_string_inside_the_object_cuts_the_non_streamed_reply_there() {
+    let stopped = Ask {
+        stop: Some(","),
+        ..ask(TWO_KEYS, Mode::JsonObject, false)
+    };
+    let (got, _) = reply(stopped).await;
+    assert_eq!(got.finish, ["stop"], "harness: the stop string matched");
+    assert_eq!(got.text(), r#"{"a": 1"#, "non-streamed content");
+}
+
+/// The generation ends at the stop string, before the grammar engaged.
+#[tokio::test]
+#[should_panic(expected = "non-streamed status")]
+async fn a_stop_string_in_the_prose_makes_the_non_streamed_reply_a_refusal() {
+    let stopped = Ask {
+        stop: Some(" JSON"),
+        ..ask(PROSE, Mode::JsonObject, false)
+    };
+    assert_blocking_refuses(stopped).await;
 }

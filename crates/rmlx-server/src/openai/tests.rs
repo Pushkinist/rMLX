@@ -1327,6 +1327,54 @@ fn usage_stream_state(prompt_tokens: u32, include_usage: bool) -> StreamState {
     }
 }
 
+/// In JSON mode each content delta carries the logprobs of its own token, and
+/// a piece that is not sent sends no logprobs.
+#[test]
+fn json_mode_content_delta_carries_the_logprobs_of_its_own_token() {
+    let mut state = usage_stream_state(1, false);
+    state.json_object_mode = true;
+    let escaped = |json: &str| json.replace('"', "\\\"");
+    let mut sent: Vec<Vec<String>> = Vec::new();
+    for (piece, surface) in [("```", "FENCE"), ("\n{", "BRACE"), (" 1", "ONE")] {
+        let events = handle_streaming_token(
+            Ok(GenerationToken {
+                token_id: 1,
+                piece: piece.to_owned(),
+                done: false,
+                finish_reason: None,
+                is_thinking: false,
+                logprobs: Some(ChatLogprobContent {
+                    token: surface.to_owned(),
+                    logprob: -0.5,
+                    bytes: None,
+                    top_logprobs: vec![],
+                }),
+            }),
+            &mut state,
+        );
+        sent.push(
+            events
+                .iter()
+                .map(|e| format!("{:?}", e.as_ref().unwrap()))
+                .collect(),
+        );
+    }
+    assert!(sent[0].is_empty(), "the fence header sends no event");
+    for (events, content, surface) in [(&sent[1], "{", "BRACE"), (&sent[2], " 1", "ONE")] {
+        assert_eq!(events.len(), 1, "one delta for {surface}");
+        let delta = &events[0];
+        assert!(
+            delta.contains(&escaped(&format!(r#""content":"{content}""#))),
+            "{delta}"
+        );
+        assert!(
+            delta.contains(&escaped(&format!(r#""token":"{surface}""#))),
+            "{delta}"
+        );
+        assert_eq!(delta.matches(&escaped(r#""token":"#)).count(), 1, "{delta}");
+    }
+}
+
 /// Proxy: feed N non-done tokens + 1 done token through
 /// `handle_streaming_token` and verify `state.completion_tokens` is exact.
 #[test]
