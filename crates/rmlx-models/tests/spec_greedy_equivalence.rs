@@ -465,6 +465,11 @@ fn tail_cut(len: usize, at: usize) -> usize {
 /// arm from the same cut at the same period, and for a judgeable reference arm
 /// of the same length that is at most the ceiling.
 ///
+/// **A run takes the first free place.** The place is the first one from the
+/// cut on that holds the stretch and whose repeats no run has taken. A later
+/// place is not tried first, so the order of the runs can decide which of them
+/// is excused.
+///
 /// The position bound is what keeps a loop the reference arm holds early from
 /// excusing the same loop at the tail. Over the whole reference arm such a loop
 /// is diluted under the ceiling, so the reference arm is judgeable; in the last
@@ -1649,6 +1654,32 @@ fn a_stretch_the_reference_arm_holds_in_another_order_is_not_excused() {
     assert!(failure.contains("repeats at period 25"), "{failure}");
 }
 
+/// The two sides of the bound in one reading: the repeats left out of `spec`
+/// from tail cut `n` at `period`, and the raw repeats of `plain` from the same
+/// cut of its own length at the same period.
+fn excused_and_held(spec: &[u32], plain: &[u32], n: usize, period: usize) -> (usize, usize) {
+    let from = spec.len() * n / TAIL_WINDOWS;
+    let excused =
+        repeats_beyond(spec, from, period, &[]) - repeats_beyond(spec, from, period, plain);
+    let held = repeats_beyond(plain, plain.len() * n / TAIL_WINDOWS, period, &[]);
+    (excused, held)
+}
+
+/// "The same cut", on a pair that tells it from the whole reference arm. The
+/// reference arm holds a 57-token loop at token 4 and the speculative arm holds
+/// it there and at its tail. From the first cut the copy at token 4 is excused,
+/// and the reference arm holds those repeats. From the last cut nothing is
+/// excused, and the reference arm holds no repeat there: its loop is before
+/// that cut.
+#[test]
+fn the_bound_reads_the_reference_arm_from_the_same_cut_as_the_speculative_arm() {
+    let prose = Rng(0xC0DE).prose(N_TOKENS);
+    let plain = prose_with_a_loop(&prose, 4, 57, 8);
+    let spec = prose_with_a_loop(&plain, N_TOKENS - 57, 57, 8);
+    assert_eq!(excused_and_held(&spec, &plain, 0, 8), (49, 49));
+    assert_eq!(excused_and_held(&spec, &plain, 3, 8), (0, 0));
+}
+
 /// What the reference arm can excuse in one reading is bounded by what the
 /// reference arm itself repeats there: for every tail cut and every period, the
 /// repeats left out of the speculative arm are at most the raw repeats of the
@@ -1657,9 +1688,7 @@ fn assert_the_excused_repeats_are_the_reference_arms_own(shape: &str, spec: &[u3
     for n in 0..TAIL_WINDOWS {
         let from = spec.len() * n / TAIL_WINDOWS;
         for period in 1..=MAX_CYCLE_PERIOD.min(spec.len() - from - 1) {
-            let excused =
-                repeats_beyond(spec, from, period, &[]) - repeats_beyond(spec, from, period, plain);
-            let held = repeats_beyond(plain, plain.len() * n / TAIL_WINDOWS, period, &[]);
+            let (excused, held) = excused_and_held(spec, plain, n, period);
             assert!(
                 excused <= held,
                 "{shape}: from {from} at period {period}, {excused} repeats are excused and \
@@ -1669,15 +1698,24 @@ fn assert_the_excused_repeats_are_the_reference_arms_own(shape: &str, spec: &[u3
     }
 }
 
-/// One burst in the reference arm does not excuse every copy of it.
+/// One burst in the reference arm does not excuse two copies of itself. It
+/// excuses at most its own repeats, each of them once.
 ///
-/// In the first two pairs the reference arm holds one token 13 times in its
-/// last window and reads 12 of 63. The speculative arm holds that burst twice
-/// and a 13-token burst of its own between them: 36 of 63 raw. In the third the
-/// reference arm holds a 17-token period-8 loop (9 of 56), and the speculative
-/// arm holds it twice with a 19-token loop of its own: 29 of 56 raw. Each
-/// reference occurrence excuses one run, so one copy and the arm's own burst
-/// are counted.
+/// In four pairs the reference arm holds one token 13 times in its last window
+/// and reads 12 of 63. In two of them the speculative arm holds that burst
+/// twice and a 13-token burst of its own between them: 36 of 63 raw. In the
+/// other two the second copy is one token shorter: 35 of 63 raw. In the fifth
+/// pair the reference arm holds a 17-token period-8 loop (9 of 56), and the
+/// speculative arm holds it twice with a 19-token loop of its own: 29 of 56
+/// raw. In the sixth the reference arm holds a 19-token period-8 loop (11 of
+/// 56). The speculative arm holds a 15-token piece of it, a 19-token loop of
+/// its own, and then the whole loop: 29 of 56 raw. In each pair the first run
+/// takes repeats that the later run needs, so the later run and the arm's own
+/// run are counted.
+///
+/// A place in the reference arm is not one run. Two bursts of 7 tokens take 6
+/// repeats each of the 12 that one burst of 13 tokens holds, and both are
+/// excused. The rows after the pairs hold each side of that.
 #[test]
 fn one_burst_in_the_reference_arm_excuses_one_burst_and_no_more() {
     let burst = |arm: &mut [u32], at: usize, token: u32| arm[at..at + 13].fill(token);
@@ -1696,8 +1734,18 @@ fn one_burst_in_the_reference_arm_excuses_one_burst_and_no_more() {
         cases.push((
             format!("three bursts of one token on {name}"),
             spec,
-            plain,
+            plain.clone(),
             (1, 36, 63),
+        ));
+        let mut spec = base.to_vec();
+        burst(&mut spec, 192, 777_777);
+        burst(&mut spec, 206, 888_888);
+        spec[231..243].fill(777_777);
+        cases.push((
+            format!("the burst, one of its own, and the burst less one token on {name}"),
+            spec,
+            plain,
+            (1, 35, 63),
         ));
     }
     let prose = Rng(0xC0DE).prose(N_TOKENS);
@@ -1709,6 +1757,20 @@ fn one_burst_in_the_reference_arm_excuses_one_burst_and_no_more() {
         "two copies of a period-8 loop and one loop of its own".into(),
         spec,
         prose_with_a_loop(&prose, 200, 17, 8),
+        (8, 29, 56),
+    ));
+    let mut spec = prose.clone();
+    for i in 0..15 {
+        spec[192 + i] = 2000 + ((i + 4) % 8) as u32;
+    }
+    for i in 0..19 {
+        spec[210 + i] = 3000 + (i % 8) as u32;
+        spec[237 + i] = 2000 + (i % 8) as u32;
+    }
+    cases.push((
+        "a piece of a period-8 loop, one loop of its own, and the whole loop".into(),
+        spec,
+        prose_with_a_loop(&prose, 200, 19, 8),
         (8, 29, 56),
     ));
 
@@ -1737,17 +1799,111 @@ fn one_burst_in_the_reference_arm_excuses_one_burst_and_no_more() {
         assert_the_excused_repeats_are_the_reference_arms_own(shape, spec, plain);
     }
 
-    // Two shorter bursts against one longer one. The reference arm holds 12
-    // repeats. A burst of 7 takes 6 of them, and a burst of 8 then needs 7 and
-    // finds 6, so it is counted in full.
+    // Two bursts against one burst of 13 tokens, at period 1. The reference
+    // arm holds 12 repeats in one place. The first burst takes the first
+    // repeats of the place. The second burst is excused when the repeats that
+    // are left are as many as it needs, and counted in full when they are not.
     let mut plain = unique.clone();
     burst(&mut plain, 200, 777_777);
-    let mut spec = unique;
-    spec[192..199].fill(777_777);
-    spec[220..228].fill(777_777);
-    assert_eq!(repeats_beyond(&spec, 192, 1, &[]), 13);
-    assert_eq!(repeats_beyond(&spec, 192, 1, &plain), 7);
-    assert_the_excused_repeats_are_the_reference_arms_own("two shorter bursts", &spec, &plain);
+    for (first, second, raw, counted, what) in [
+        (
+            7,
+            7,
+            12,
+            0,
+            "6 are taken and 6 are left; a burst of 7 needs 6",
+        ),
+        (
+            7,
+            8,
+            13,
+            7,
+            "6 are taken and 6 are left; a burst of 8 needs 7",
+        ),
+        (
+            8,
+            7,
+            13,
+            6,
+            "7 are taken and 5 are left; a burst of 7 needs 6",
+        ),
+        (
+            13,
+            12,
+            23,
+            11,
+            "12 are taken and none is left; a burst of 12 needs 11",
+        ),
+    ] {
+        let mut spec = unique.clone();
+        spec[192..192 + first].fill(777_777);
+        spec[220..220 + second].fill(777_777);
+        assert_eq!(repeats_beyond(&spec, 192, 1, &[]), raw, "raw: {what}");
+        assert_eq!(repeats_beyond(&spec, 192, 1, &plain), counted, "{what}");
+        assert_the_excused_repeats_are_the_reference_arms_own(what, &spec, &plain);
+    }
+
+    // A run that takes the end of a place and not its start, at period 8. The
+    // reference arm holds a 19-token loop: 11 repeats. A 15-token piece of that
+    // loop, from its fifth token on, takes the last 7 of them. The whole loop
+    // then needs all 11, so it is counted in full. All of this is in the first
+    // cut.
+    let plain = prose_with_a_loop(&unique, 0, 19, 8);
+    let mut spec = prose_with_a_loop(&unique, 18, 19, 8);
+    spec[..15].copy_from_slice(&plain[4..19]);
+    assert_eq!(repeats_beyond(&spec, 0, 8, &[]), 18);
+    assert_eq!(repeats_beyond(&spec, 0, 8, &plain), 11);
+    assert_the_excused_repeats_are_the_reference_arms_own("a piece, then the whole", &spec, &plain);
+}
+
+/// A run takes the first free place that holds its stretch. A later place is
+/// not tried first, and a place is not kept for a longer run. So the verdict
+/// can depend on the order of the runs.
+///
+/// The reference arm holds a burst of 9 tokens and then a burst of 5 tokens of
+/// one token in its last window: 12 of 63. Each speculative arm holds the same
+/// two bursts and a 6-token burst of its own: 17 of 63 raw. In the order of the
+/// reference arm each burst takes its own place, and the arm's own 5 repeats
+/// are counted. With the two bursts exchanged, the burst of 5 takes the start
+/// of the 9-token place. The burst of 9 then fits no free place, and 13 of 63
+/// are counted.
+#[test]
+fn a_run_takes_the_first_free_place_so_the_order_of_the_runs_can_decide() {
+    let unique: Vec<u32> = (0..N_TOKENS as u32).map(|i| 10_000 + i).collect();
+    let arm = |first: usize, second: usize| -> Vec<u32> {
+        let mut arm = unique.clone();
+        arm[200..200 + first].fill(777_777);
+        arm[230..230 + second].fill(777_777);
+        arm
+    };
+    let with_its_own_burst = |mut arm: Vec<u32>| -> Vec<u32> {
+        arm[215..221].fill(888_888);
+        arm
+    };
+    let plain = arm(9, 5);
+    let reference = strongest_windowed_cycle(&plain);
+    assert_eq!((reference.matches, reference.samples), (12, 63));
+
+    let in_order = with_its_own_burst(arm(9, 5));
+    let exchanged = with_its_own_burst(arm(5, 9));
+    for (shape, spec, counted) in [
+        ("in the reference order", &in_order, 5),
+        ("exchanged", &exchanged, 13),
+    ] {
+        let raw = strongest_windowed_cycle(spec);
+        assert_eq!(
+            (raw.start, raw.period, raw.matches, raw.samples),
+            (192, 1, 17, 63),
+            "{shape}: the raw reading"
+        );
+        assert_eq!(repeats_beyond(spec, 192, 1, &plain), counted, "{shape}");
+        assert_the_excused_repeats_are_the_reference_arms_own(shape, spec, &plain);
+    }
+    assert_eq!(judge(&in_order, &plain, &[], None), Verdict::Agreed);
+    let failure = judge(&exchanged, &plain, &[], None)
+        .refusal()
+        .expect("the burst of 9 fits no free place");
+    assert!(failure.contains("repeats at period 1"), "{failure}");
 }
 
 /// The declared blind spot, with its size.
