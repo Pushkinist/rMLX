@@ -1109,7 +1109,7 @@ expect_no_out "never pinnable"
 # and review stops an exact entry from being rewritten as one. Re-pin the
 # figure in the change that adds such an entry.
 tracked_at_most="$(awk -F'|' '!/^[[:space:]]*#/ && $3 ~ /<=/' "${ROOT}/scripts/gpu_validation_census.txt" | grep -c '')"
-[ "${tracked_at_most}" = "1" ] || fail "the tracked census pins ${tracked_at_most} at-most count(s), expected 1"
+[ "${tracked_at_most}" = "2" ] || fail "the tracked census pins ${tracked_at_most} at-most count(s), expected 2"
 expect_no_out "has no classified GPU test"
 expect_no_out "not found"
 

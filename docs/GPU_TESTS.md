@@ -579,12 +579,20 @@ bounds it against the row extent (`if (bi >= src_tile_dim.y)`). The complete
 run the pin was derived from reported no split-K diagnostic in any crate. A
 run on an MLX before 0.32.3 reads each of them as `not pinned`.
 
-It also accepts one report that is not a read of the kernel:
-`gemv_wide_bfloat16_nv5_kl32_nc0_axpby0` in
-`the_assistant_round_loop_reproduces_plain_greedy`, pinned `<=6`. The kernel
-clamps every index it forms, the reported offsets are gigabytes outside the
-buffer, and the count changes per run (6, 3, 4, 1, 4). The validated and the
-unvalidated run of the test give byte-identical round streams.
+It also accepts one report that is not a read of the kernel, on two
+instantiations of MLX's wide gemv, both on the gemma-4-e2b assistant pair:
+
+- `gemv_wide_bfloat16_nv5_kl32_nc0_axpby0` in
+  `the_assistant_round_loop_reproduces_plain_greedy`, pinned `<=10`. The count
+  changes per run (6, 3, 4, 1, 4, 4, 10, 5).
+- `gemv_wide_bfloat16_nv4_kl32_nc0_axpby0` in
+  `a_sampled_sidecar_arm_draws_from_the_verifiers_distribution`, pinned `<=1`.
+  The count changes per run (1, 0, 1, 0).
+
+The kernel clamps every index it forms, and the reported offsets are hundreds
+of megabytes to gigabytes outside the buffer. Each test prints the same output
+in a validated and in an unvalidated run. The cause of the report is not
+known; the header of the pin says what was measured.
 
 In the conv and in the split-K matmul, each output column is computed from its
 own weight row and the store clips, so the out-of-range rows never reach the
@@ -629,7 +637,8 @@ another count on each run. N is the largest count the derivation runs
 observed, and the header of the pin names those runs. An exact entry beside it
 on the same kernel stays a floor, on the sum: the hits of the `<=N` test can
 stand in for missing hits of the exact one. A `<=N` entry has no stale verdict.
-The selftest holds the tracked pin to one such entry.
+It still refuses a store, another kernel, another crate or test, and a count
+above N. The selftest holds the tracked pin to two such entries.
 
 A hit in another crate than its entry names reads as `not pinned` there and
 `no longer fires` where it was pinned.
