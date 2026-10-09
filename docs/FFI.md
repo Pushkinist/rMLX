@@ -61,18 +61,18 @@ for a deployment target of macOS 26.2 or later
 (`arm64_tahoe`) bottle for target 26, so that bottle has none; the macOS 27
 bottle has them. Without them GEMM-bound prefill is slower while output and
 decode look normal. The pinned pair is mlx 0.32.3 built from source for
-target 26.2, and mlx-c 0.7.0 with a one-line patch. How to build it, per
-host: [`docs/MLX_PAIR.md`](MLX_PAIR.md).
+target 26.2, and mlx-c 0.7.0 with a one-line `gather_qmm` fix. How to build
+it, per host: [`docs/MLX_PAIR.md`](MLX_PAIR.md).
 
 ```sh
 strings "$(brew --prefix mlx)/lib/mlx.metallib" | grep -c steel_gemm_fused_nax
 # non-zero on a NAX build, 0 on the macOS 26 bottle
 ```
 
-rMLX also compiles against the Homebrew pair, mlx 0.32.1 + mlx-c 0.6.0_4
-(see [Two mlx-c C APIs](#two-mlx-c-c-apis)). The gate that checks the loaded
-pair, and binds on M5 and later and on a host whose chip cannot be
-identified, is in
+The pin is for development and measurement. rMLX builds against the pair
+Homebrew ships (`brew info mlx mlx-c`), and `rmlx serve` runs on it. The gate
+that checks the loaded pair, and binds on M5 and later and on a host whose
+chip cannot be identified, is in
 [`docs/MLX_PAIR.md`](MLX_PAIR.md#the-pin-gate).
 
 #### Where NAX can appear, and where it cannot

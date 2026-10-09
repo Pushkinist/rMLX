@@ -6,25 +6,35 @@ protects a binary from the wrong one. How the build links the pair is in
 
 ## What to do on each Mac
 
-The pinned pair is mlx 0.32.3 + mlx-c 0.7.0, built with the Neural-Accelerator
-(NAX) kernels. MLX builds those kernels only for a deployment target of macOS
-26.2 or later. Only M5 and later chips can use them.
+rMLX uses the `mlx` and `mlx-c` that Homebrew installs, on every Mac. Its
+formula depends on `mlx-c` with no version, and rMLX ships no MLX formula of
+its own. `brew info mlx mlx-c` shows what Homebrew ships.
+
+`crates/rmlx-mlx/mlx-pin.txt` names the pinned pair: the pair rMLX is
+developed and measured on, built with the Neural-Accelerator (NAX) kernels.
+The pin does not limit `rmlx serve`. MLX builds the NAX kernels only for a
+deployment target of macOS 26.2 or later, and the Homebrew formula builds each
+bottle for the macOS of that bottle. Only M5 and later chips can use the
+kernels. Without them on such a chip, prefill is slower; decode and the output
+do not change.
 
 | Mac | What to do |
 |---|---|
 | M1–M4, any macOS | Nothing for the kernels: `brew install mlx-c` gives a pair rMLX compiles against, and the pin does not bind. On that pair `rmlx healthcheck` reports `mlx_pin` info, and `rmlx baseline`, `rmlx bench` and `make mlx-preflight` run. They stop on an mlx-c C API mismatch, as on every Mac ([Two mlx-c C APIs](#two-mlx-c-c-apis)). |
-| M5, macOS 27 or later | The Homebrew bottle for macOS 27 carries the kernels, so `brew upgrade mlx mlx-c` (or `brew reinstall mlx` at the same version) gives `rmlx serve` the NAX kernels. That bottle is not the pinned pair (today it is mlx 0.32.1 + mlx-c 0.6.0_4), so `rmlx baseline` and `rmlx bench` refuse it and `rmlx healthcheck` reports `mlx_pin` red. To measure, build the pinned pair from source ([below](#building-the-pinned-pair)). |
-| M5, macOS 26.2 to 26.x | Build the pair from source ([below](#building-the-pinned-pair)). The macOS 26 bottle has no NAX kernels, and a plain `brew install --build-from-source mlx` has none either: the formula sets the deployment target to `26`. |
-| M5, below macOS 26.2 | No fix. Update macOS. Until then `rmlx baseline` and `rmlx bench` refuse. |
+| M5 and later, macOS 27 or later | The Homebrew bottle for macOS 27 carries the kernels, so `brew upgrade mlx mlx-c` (or `brew reinstall mlx` at the same version) gives `rmlx serve` the NAX kernels. While Homebrew ships the versions that `mlx-pin.txt` names, that bottle also passes the pin gate. When Homebrew ships another version, `rmlx baseline` and `rmlx bench` refuse it and `rmlx healthcheck` reports `mlx_pin` red. To measure then, build the pinned pair from source ([below](#building-the-pinned-pair)). |
+| M5 and later, macOS 26.2 to 26.x | `rmlx serve` runs on the Homebrew bottle, with slower prefill and the startup warning. For the kernels, build the pair from source ([below](#building-the-pinned-pair)). The macOS 26 bottle has no NAX kernels, and a plain `brew install --build-from-source mlx` has none either: the formula sets the deployment target to `26`. `rmlx baseline` and `rmlx bench` refuse the bottle. |
+| M5 and later, below macOS 26.2 | No fix. Update macOS. Until then `rmlx serve` runs with slower prefill and the warning, and `rmlx baseline` and `rmlx bench` refuse. |
 
-The runtime warning in `crates/rmlx-mlx/src/nax.rs` names the kernel fix for
-the host it runs on. To measure on M5 you also need the pinned pair (see the
-macOS 27 row).
+The runtime warning in `crates/rmlx-mlx/src/nax.rs` fires only on an M5 or
+later chip whose loaded MLX has no NAX kernels, and names the kernel fix for
+the macOS it runs on.
 
 ## Building the pinned pair
 
 This edits the two formulas in a local `homebrew/core` tap and builds them.
-rMLX ships no formula of its own.
+The versions and checksums below are those of the pin. The steps were written
+against the formulas Homebrew ships for those versions; `brew info mlx mlx-c`
+shows whether Homebrew is still there.
 
 1. Install the Metal toolchain (Xcode 16.3 and later ship it separately):
 
@@ -33,35 +43,25 @@ rMLX ships no formula of its own.
    ```
 
 2. Edit `$(brew --repo homebrew/core)/Formula/m/mlx.rb`:
-   - `url` → `https://github.com/ml-explore/mlx/archive/refs/tags/v0.32.3.tar.gz`,
-     `sha256` → `4129039ddcb36cb860982b616c975a5b9b8e6d8fa97efa86335b4427c29c4b4b`;
-   - delete the `stable do` wrapper, its nanobind backport `patch :DATA` and the
-     `__END__` patch (mlx 0.32.3 carries that fix), and the `bottle do` block;
+   - `url` must be `https://github.com/ml-explore/mlx/archive/refs/tags/v0.32.3.tar.gz`,
+     and `sha256` `4129039ddcb36cb860982b616c975a5b9b8e6d8fa97efa86335b4427c29c4b4b`;
+   - delete the `bottle do` block;
+   - delete the `stable do` wrapper around `url` and `sha256`, with its
+     `patch :DATA` and the `__END__` patch. That patch is a compile fix for
+     macOS 27, and the pinned kegs were built without it;
    - in `install`, set `ENV["MACOSX_DEPLOYMENT_TARGET"] = "26.2"`. This line
      turns the NAX kernels on.
 
 3. Edit `Formula/m/mlx-c.rb`:
-   - `url` → `https://github.com/ml-explore/mlx-c/archive/refs/tags/v0.7.0.tar.gz`,
-     `sha256` → `ee726bb38e191bb3c516a6bae47dc8abad9e5f273873385839019ce46bfceab5`;
-   - delete `revision`, the `bottle do` block and the four backport `patch do`
-     blocks (v0.7.0 contains them);
-   - replace the `__END__` patch with this one. mlx 0.32.3 adds `global_scale`
-     in front of `sorted_indices` in `gather_qmm`, and mlx-c 0.7.0 still passes
-     the old argument list. `std::nullopt` is the upstream default; the C API of
-     `mlx_gather_qmm` does not change.
-
-     ```diff
-     --- a/mlx/c/ops.cpp
-     +++ b/mlx/c/ops.cpp
-     @@ -1708,6 +1708,7 @@
-                  (bits.has_value ? std::make_optional<int>(bits.value)
-                                  : std::nullopt),
-                  std::string(mode),
-     +            std::nullopt,
-                  sorted_indices,
-                  mlx_stream_get_(s)));
-        } catch (std::exception& e) {
-     ```
+   - `url` must be `https://github.com/ml-explore/mlx-c/archive/refs/tags/v0.7.0.tar.gz`,
+     and `sha256` `ee726bb38e191bb3c516a6bae47dc8abad9e5f273873385839019ce46bfceab5`;
+   - delete the `bottle do` block;
+   - keep the `gather_qmm` patch (`patch do`, mlx-c commit `cfc471f`). mlx
+     0.32.3 adds `global_scale` in front of `sorted_indices` in `gather_qmm`,
+     and mlx-c 0.7.0 passes the old argument list. The patch passes
+     `std::nullopt`, the upstream default, in that slot; the C API of
+     `mlx_gather_qmm` does not change. The pinned kegs were built with that
+     one line as a local patch, without the version guard the commit adds.
 
 4. Build, from a directory outside `~/Documents` (the sandboxed relocation step
    fails there), mlx first:
@@ -83,6 +83,10 @@ rMLX ships no formula of its own.
    make mlx-restore-pin
    strings "$(brew --prefix mlx)/lib/mlx.metallib" | grep -c steel_gemm_fused_nax   # non-zero
    ```
+
+   `make mlx-restore-pin` needs a checkout of rMLX. Without one,
+   `brew pin mlx mlx-c` pins these kegs while they are the newest in the
+   Cellar.
 
 6. Keep a durable copy, which `make mlx-restore-pin` reads when a keg is gone
    from the Cellar:

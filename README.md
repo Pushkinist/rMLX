@@ -7,6 +7,12 @@
 [![Platform](https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple)](#requirements)
 [![Rust](https://img.shields.io/badge/rust-1.95%2B-orange?logo=rust)](#requirements)
 
+> [!WARNING]
+> rMLX uses the MLX that Homebrew installs. On M5 with macOS 26, Homebrew's
+> MLX has no Neural Accelerator kernels; rMLX warns and tells you how to build
+> MLX with them: [`docs/MLX_PAIR.md`](docs/MLX_PAIR.md#building-the-pinned-pair).
+> See [which Mac gets what](#mlx-on-each-mac).
+
 A native, no-Python local LLM server for Apple Silicon. It serves
 MLX-format models over OpenAI- and Anthropic-compatible HTTP APIs, so any
 client of those APIs can use it as a local backend. One
@@ -88,34 +94,49 @@ export MLX_C_PREFIX="$(brew --prefix mlx-c)"   # dir containing lib/libmlxc.dyli
 export MLX_PREFIX="$(brew --prefix mlx)"
 ```
 
-rMLX is validated against one MLX / mlx-c pair, declared in
-`crates/rmlx-mlx/mlx-pin.txt`. `rmlx healthcheck` and `make mlx-preflight`
-check it. On M5 and later, and on a Mac whose chip cannot be identified,
-`rmlx bench` and `rmlx baseline` refuse to measure off the pair; serving is
-not blocked. On every Mac they refuse when the loaded mlx-c has another C API
-than the one rMLX was built against. At startup rMLX warns when the MLX it
-loaded differs from the one it was built against. See
-[`docs/FFI.md`](docs/FFI.md#pinned-mlx--mlx-c-pair).
+### MLX on each Mac
 
-### On M5 and later: the Neural Accelerator kernels
+rMLX uses the `mlx` and `mlx-c` that Homebrew installs, on every Mac, and
+ships no MLX formula of its own. The install command is the same everywhere
+([Install](#install)); what differs is MLX's Neural Accelerator (NAX) kernels.
+MLX builds them only for a deployment target of macOS 26.2 or later, and only
+M5 and later chips have the GPU Neural Accelerator that runs them. Without
+them on such a chip, prompt processing (prefill) is slower. Token generation
+(decode) and the output do not change.
 
-MLX builds its Neural Accelerator (NAX) kernels only for macOS 26.2 or
-later, and the Homebrew bottle for macOS 26 has none. On M5 and later that
-slows prefill; decode and output are unaffected. M1 to M4 have no Neural
-Accelerator, so there is nothing to check.
+| Mac | After `brew install rmlx` | To get the NAX kernels |
+|---|---|---|
+| M1 to M4, any macOS | Nothing is missing: these chips have no Neural Accelerator. No warning. | Not applicable. |
+| M5 and later, macOS 27 or later | The Homebrew bottle of MLX for macOS 27 has the kernels. No warning. | Nothing to do. |
+| M5 and later, macOS 26.2 to 26.x | The Homebrew bottle of MLX for macOS 26 has no NAX kernels. rMLX serves, prefill is slower, and rMLX warns at startup. | Build MLX from source for a macOS 26.2 target. |
+| M5 and later, macOS 26.0 or 26.1 | The same bottle, the same warning. | Update macOS: MLX does not build the kernels for a lower target. |
+
+The steps for each Mac, and the source build, are in
+[`docs/MLX_PAIR.md`](docs/MLX_PAIR.md#what-to-do-on-each-mac).
 
 At startup, rMLX scans the `mlx.metallib` of the MLX it loaded. It warns
-only when the host has a Neural Accelerator and the kernels are missing, and
-names the fix for that macOS version: the macOS 27 bottle, a source build on
-macOS 26.2 or later, or none below 26.2
-([`docs/MLX_PAIR.md`](docs/MLX_PAIR.md)). To check by hand:
+only when the chip has a Neural Accelerator and the kernels are missing. The
+warning names the file it read and the fix for that macOS version. To check
+by hand:
 
 ```sh
 strings "$(brew --prefix mlx)/lib/mlx.metallib" | grep -c steel_gemm_fused_nax
-# M5+: a non-zero count. 0 means the bottle has no NAX kernels.
+# M5 and later: a non-zero count. 0 means this MLX has no NAX kernels.
 ```
 
-`make mlx-preflight` runs this and the other MLX checks.
+`crates/rmlx-mlx/mlx-pin.txt` names the MLX / mlx-c pair rMLX is developed
+and measured on. It does not limit `rmlx serve`. On M5 and later, and on a
+Mac whose chip cannot be identified, `rmlx bench` and `rmlx baseline` refuse
+to measure when the loaded pair is not the pinned one with the NAX kernels.
+`rmlx healthcheck` and `make mlx-preflight` report the same verdict.
+
+rMLX builds against the mlx-c 0.6 and the 0.7 C API. When Homebrew moves
+`mlx-c` to the other C API under an installed `rmlx`, rMLX does not make the
+attention call whose argument list differs. It returns an error that names the
+fix, `brew reinstall rmlx`, and `rmlx bench` and `rmlx baseline` refuse on
+every Mac. rMLX also warns at startup when the MLX it loaded has another
+version than the one it was built against. See
+[`docs/FFI.md`](docs/FFI.md#pinned-mlx--mlx-c-pair).
 
 ### Extra tooling for kernel work (contributors only)
 

@@ -109,7 +109,7 @@ Measured on the CPU and the Metal stream, f32 and bf16, 4 and 262,144 wide:
 | Pair | `argmax` of a row with a `NaN` |
 |---|---|
 | mlx 0.32.3 / mlx-c 0.7.0 (pinned) | the index of the first `NaN`, on both streams (ml-explore/mlx#4291) |
-| mlx 0.32.1 / mlx-c 0.6.0_4 (Homebrew) | the `NaN` is skipped. Metal starts from `-inf`, CPU from element 0, so a leading `NaN` gives 0 on CPU and the real maximum on Metal |
+| mlx 0.32.1 / mlx-c 0.6.0_4 | the `NaN` is skipped. Metal starts from `-inf`, CPU from element 0, so a leading `NaN` gives 0 on CPU and the real maximum on Metal |
 
 An all-`NaN` row gives 0 on both pairs. Every greedy path selects with
 MLX's `argmax` on the same device, so the paths agree on such a row on each

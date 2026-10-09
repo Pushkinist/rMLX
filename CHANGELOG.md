@@ -12,8 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **rMLX builds against the mlx-c 0.6 and the 0.7 C API.** `build.rs` reads
   the C API from the generated bindings, and the one call whose argument list
   differs, `mlx_fast_scaled_dot_product_attention`, is compiled for it. So
-  `brew install` builds against the Homebrew pair (mlx 0.32.1 + mlx-c
-  0.6.0_4), and a source build against mlx-c 0.7.0.
+  `brew install rmlx` builds against the `mlx-c` that Homebrew ships today
+  (0.7.0), and against the 0.6 releases before it.
+- **The README says at its top which MLX rMLX uses.** rMLX uses the MLX that
+  Homebrew installs, on every Mac. On M5 with macOS 26, the Homebrew bottle of
+  MLX has no Neural-Accelerator (NAX) kernels, so prefill is slower; rMLX
+  warns at startup and names the fix. A table in the README gives the result
+  of `brew install rmlx` on each Mac, and `docs/MLX_PAIR.md` gives the steps.
 - **A binary refuses to run on the other mlx-c C API.** The two C APIs keep
   the name of that call, so dyld links a binary built against one to a
   `libmlxc.dylib` of the other with no error, and the call then reads its
@@ -22,7 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error instead of calling mlx-c, `rmlx healthcheck` reports `mlx_pin` red,
   `rmlx baseline` and `rmlx bench` refuse before a model loads, and
   `make mlx-preflight` stops. Each names the fix: a rebuild against the loaded
-  mlx-c, or the mlx-c the binary was built against. Where the pinned pair is
+  mlx-c (`brew reinstall rmlx` for a Homebrew install, after Homebrew moves
+  `mlx-c`), or the mlx-c the binary was built against. Where the pinned pair is
   required (the pin binds, or the chip is not identified) and the loaded pair
   is not the pinned one, they also name `make mlx-restore-pin`, because a
   rebuild against that pair is refused again.
@@ -31,7 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The validated MLX pair is mlx 0.32.3 + mlx-c 0.7.0, built from source for
   a macOS 26.2 deployment target**, so that it carries the Neural-Accelerator
-  (NAX) kernels. No Homebrew bottle for macOS 26 has them. Off that pair,
+  (NAX) kernels. Homebrew ships the same versions, and its bottle for macOS 26
+  has no NAX kernels. The pin is for development and measurement: it does not
+  limit `rmlx serve`, and the formula's `mlx-c` dependency keeps no version.
+  Off that pair,
   `rmlx baseline` and `rmlx bench` refuse on M5 and later and on a Mac whose
   chip cannot be identified. On M1–M4 the pin does not bind, and
   `make mlx-preflight` passes when the C API matches. `docs/MLX_PAIR.md` gives
