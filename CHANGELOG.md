@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-10-09
+
+This release makes rMLX build and run on the MLX that Homebrew ships today:
+mlx 0.32.3 with mlx-c 0.7.0.
+
+For a Homebrew install, `brew upgrade rmlx` builds again. rMLX 0.4.2 does not
+compile against mlx-c 0.7.0, because one mlx-c call has a new argument. An
+`rmlx` that was built against mlx-c 0.6 must be reinstalled: on the mlx-c 0.7
+library it reads the arguments of that call from the wrong slots.
+`brew upgrade rmlx` replaces it. After a later move of `mlx-c`, use
+`brew reinstall rmlx`; from this release a binary on the other mlx-c C API
+refuses and names that fix. A release tarball runs only on the mlx-c C API it
+was built against.
+
+On M5 with macOS 26, the MLX that Homebrew installs has no Neural-Accelerator
+kernels, so prefill is slower. rMLX warns at startup and names the fix.
+
+Three changes to read before upgrading: a JSON-mode reply (`response_format`)
+starts at the JSON and drops the text before it, and a stream in which the
+JSON does not start ends with an error event (**Fixed**); a forced tool call
+whose constraint cannot be built returns four reply shapes as text and not as
+a tool call (**Fixed**); `rmlx baseline` and `rmlx bench` refuse off the
+validated MLX pair also on a Mac whose chip cannot be identified
+(**Changed**). No CLI flag, environment variable or HTTP route is removed.
+
 ### Added
 
 - **rMLX builds against the mlx-c 0.6 and the 0.7 C API.** `build.rs` reads
@@ -44,7 +69,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rmlx baseline` and `rmlx bench` refuse on M5 and later and on a Mac whose
   chip cannot be identified. On M1–M4 the pin does not bind, and
   `make mlx-preflight` passes when the C API matches. `docs/MLX_PAIR.md` gives
-  the steps for each Mac.
+  the steps for each Mac. (#638)
 - **`make mlx-restore-pin` no longer pours a Homebrew bottle.** It takes each
   pinned keg from the Cellar, or from a source-built copy in
   `~/.rmlx/bottles/source-built` (a tar listed in `SHA256SUMS`). It checks a
@@ -106,7 +131,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Stream(gpu, N)`. MLX evaluates a stream only on the thread that created it.
   rMLX now builds every op on the streams of one MLX thread and runs every
   evaluation there (`docs/FFI.md` § "The MLX thread"), so any thread can use
-  what another thread built.
+  what another thread built. (#638)
 - **`--device cpu` runs every op on the CPU.** MLX builds some ops inside
   other ops on its default device, for example the `astype` of bf16 scales
   inside an affine `quantized_matmul` with an f32 input. Under `--device cpu`
@@ -3031,7 +3056,8 @@ inference + conversion backend for Apple Silicon — no Python at runtime.
 - Speculative drafters validated against their verifiers: Qwen 3.6 MTP sidecar
   and the Gemma 4 assistant drafter.
 
-[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/Pushkinist/rMLX/releases/tag/v0.4.3
 [0.4.2]: https://github.com/Pushkinist/rMLX/releases/tag/v0.4.2
 [0.4.1]: https://github.com/Pushkinist/rMLX/releases/tag/v0.4.1
 [0.4.0]: https://github.com/Pushkinist/rMLX/releases/tag/v0.4.0
