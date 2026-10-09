@@ -179,7 +179,10 @@
 #
 # NOT YET SHOWN. No run has printed `census matches the pin` against this file
 # for the whole suite, or for `rmlx-models` whole. The derivation run read the
-# hits; it was not compared with these entries. Delete this paragraph when a
+# hits; it was not compared with these entries. One whole `make ci-perf`, on
+# the commit before the two wide-gemv entries got their present counts, passed
+# every test in both halves and ended red on the census with those two deltas
+# and no other. No whole run has been made since. Delete this paragraph when a
 # whole run matches.
 #
 # The stand-down list above predates the notice-form change. The runner of the

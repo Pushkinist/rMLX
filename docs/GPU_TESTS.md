@@ -594,6 +594,10 @@ of megabytes to gigabytes outside the buffer. Each test prints the same output
 in a validated and in an unvalidated run. The cause of the report is not
 known; the header of the pin says what was measured.
 
+No whole run has yet ended with the census matching the pin. One whole
+`make ci-perf` passed every test and showed these two counts as its only
+deltas; the two entries were set from it and from runs of each test alone.
+
 In the conv and in the split-K matmul, each output column is computed from its
 own weight row and the store clips, so the out-of-range rows never reach the
 output. The tests
