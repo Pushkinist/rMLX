@@ -109,10 +109,24 @@ tools answer different questions:
 Neither gives per-dispatch counters headlessly. Those come from the Xcode
 replay below, which needs a person.
 
-On M5 the Neural Accelerator is part of the GPU. A capture names NAX
-pipelines like any other: `steel_gemm_fused_nax_*` for matmul and
-`steel_attention_*_bq64_*` for attention. `bq64` means the NAX attention
-branch ran; `bq32` means it did not. Which paths can reach NAX is in
+On M5 the Neural Accelerator is part of the GPU. A `.gputrace` does not name
+NAX pipelines reliably: it can store a NAX GEMM by object id only, and a
+window that holds only `steel_attention_dsplit_*` can give no function records.
+The Metal System Trace shader list names them
+([below](#what-a-gputrace-actually-answers)). In MLX 0.32.3 the matmul NAX
+pipelines carry `_nax` in the name: `steel_gemm_fused_nax_*`,
+`steel_gemm_splitk_nax_*`, `steel_gather_mm_rhs_nax_*` and
+`steel_segmented_mm_nax_*` (unquantized),
+`affine_qmm_t_nax_*`, `affine_qmm_n_nax_*`, `mxfp8_qmm_t_nax_*`,
+`mxfp4_qmm_t_nax_*` and `nvfp4_qmm_t_nax_*` (quantized), and
+`*_gather_qmm_rhs_nax_*` and `*_gather_qmm_t_nax_*` (quantized MoE). The
+gated-delta kernel is `gated_delta_fused_nax_*`. The attention NAX pipelines
+do not carry `_nax`. For prefill attention, the NAX kernels are
+`steel_attention_*_bq64_*` at `head_dim` 64, 96 and 128, and
+`steel_attention_dsplit_*` at 256 (`bq64`) and 512 (`bq32_bk32_bd512`). The
+attention kernel without NAX is
+`steel_attention_*_bq32_*` with no `dsplit` in the name. So `bq32` alone does
+not mean that NAX did not run. Which paths can reach NAX is in
 [`docs/FFI.md`](FFI.md#where-nax-can-appear-and-where-it-cannot).
 
 ### How the window works
@@ -193,8 +207,8 @@ MTL_CAPTURE_ENABLED=1 ./target/release-debug/rmlx --metrics off baseline \
 
 ### What a `.gputrace` actually answers
 
-**Kernel identity, offline.** `<trace>/device-resources-0x<addr>` names every
-pipeline and function the window referenced.
+**Kernel identity, offline.** `<trace>/device-resources-0x<addr>` names the
+pipelines and functions the window referenced, with the NAX limits above.
 `unused-device-resources-0x<addr>` holds the ones the capture layer recorded
 as unused. That answers whether a codec's own kernel runs or it decodes
 through the bf16 mirror. Read them with the scripts below.
@@ -224,6 +238,10 @@ each submission's `start` and `duration` in nanoseconds, `gpu-channel-name`,
 
 - **`--attach <pid>` records nothing** for this template. Metal
   instrumentation must be present at launch, so the harness uses `--launch`.
+- **A launched `rmlx` cannot open a model under a TCC-protected folder**, such
+  as `~/Documents`. It stops in `open()` of `config.json`, and the trace has
+  no rows for it. Keep the snapshot outside those folders, or clone it with
+  `cp -c -R` to a folder outside them.
 - **Weight load leaves no rows; prefill does.** The table does not mark where
   prefill ends. The harness reads the run's own `decode_profile{prefill_ms}`
   from `<RMLX_HOME>/logs/<run-id>.jsonl` and uses it as the default
@@ -238,10 +256,15 @@ each submission's `start` and `duration` in nanoseconds, `gpu-channel-name`,
 - **Bound the volume** with `--time-limit`. `.rmlx/traces/mst` keeps the
   newest `--keep` bundles (default 5) and prunes the rest on every exit.
   `make traces-gc` does not cover this directory.
-- **No kernel names on the timeline.** `metal-shader-profiler-shader-list`
-  names the pipelines, but the stock template records
-  `Shader Timeline: Disabled`, so no key joins a name to a timed row. Pair the
-  timeline with a `.gputrace` identity list.
+- **No kernel names on the timeline.** The stock template records
+  `Shader Timeline: Disabled`, so no key joins a name to a timed row. The
+  table `metal-shader-profiler-shader-list` names each pipeline that a
+  process compiled, NAX pipelines included. It is per process, not per
+  dispatch. It can have no rows for a process that stops right after its last
+  GPU work, so let the process live 3 s more (a wrapper that sleeps), and take
+  no rows for the process as a failed instrument. Export it with
+  `xcrun xctrace export --input <trace> --xpath
+  '/trace-toc/run[@number="1"]/data/table[@schema="metal-shader-profiler-shader-list"]'`.
 
 The summariser tells two refusals apart: `contains no rows` is an empty table;
 `holds N rows but none for a process matching …` lists the processes it saw.
@@ -364,6 +387,60 @@ Rules the pooling allocator imposes:
 - **Evaluate inside the bracket.** An `eval()` after `close()` allocates after
   the mark was read, and `observed_allocation()` reads false.
 - **One bracket at a time.** The peak mark is process-global.
+- **Open from a settled state.** See 9.2.
+
+### 9.2 The live count right after an evaluation
+
+`rmlx_mlx::mlx_active_memory_bytes()` reads the bytes MLX holds now. Right
+after an evaluation that reading has two states. MLX frees the temporaries of
+a command buffer (the inputs of its ops that nothing else holds) in the
+completion handler of that buffer (`mlx/backend/metal/eval.cpp`), and an
+evaluation returns when its outputs are written, which can be before Metal
+calls the handler. So the count holds the temporaries of the last command
+buffers or does not, by timing. Metal shader validation and the hand-off to
+the MLX thread both move that timing.
+
+`rmlx_mlx::synchronize_gpu()` removes the race. It commits the open command
+buffer of the MLX thread's GPU stream and waits until that buffer is complete
+(`mlx_synchronize`, Metal `waitUntilCompleted`). That wait returns after the
+completion handlers of the buffer ran. MLX waits on the last buffer of the
+queue only; that the handlers of the earlier buffers ran too is held by
+tests, not by a contract. The V-mirror tests read the count at the open of
+every decode step; they compare it with the count at the open of the run, so
+a leftover of constant size passes them. `after_synchronize_gpu_the_live_count_holds_no_temporary`
+(`crates/rmlx-mlx/src/synchronize_tests.rs`) compares two settled readings
+around one evaluation with a 4 MiB temporary. The reading before follows the
+same evaluation, so a leftover of the same size at both readings passes. Its
+one evaluation commits one command buffer, so it says nothing about earlier
+buffers. No test reads the absolute count.
+The call is for measurement only. It returns an error after `forbid_gpu`, and
+from a job on the MLX thread, which holds the evaluation lock.
+
+The count of one buffer is not its size. The allocator rounds a buffer larger
+than one VM page up to whole 16 KiB pages (`mlx/backend/metal/allocator.cpp`).
+It then gives the array a cached buffer of less than
+`min(2 * size, size + 2 pages)` when it has one
+(`mlx/backend/common/buffer_cache.h`) and counts the length of that buffer. So
+a buffer counts less than three pages above its size, and what an earlier
+region freed moves the count of a later one. `rmlx_mlx::mlx_clear_cache()`
+empties the cache.
+
+- **Call `synchronize_gpu()` before each reading a test judges on**: before
+  `PeakBracket::open()`, and before a bare `mlx_active_memory_bytes()`.
+- **Call `mlx_clear_cache()` too when the reading is compared to within
+  pages.** A cached buffer moves a count by less than three pages for each
+  buffer. A bound that is a multiple of the input size, as in
+  `crates/rmlx-kv-quant/src/q8_msl_tests.rs`, does not need it.
+- **A temporary is not in the settled live count.** A copy that a step makes
+  and frees shows only in the peak over that step: open a bracket from the
+  settled state, run one step, read `headroom_bytes()`. Assert the count at
+  the open too, or a settle that left the copy live reads as a small headroom.
+- **The settled live count shows what stays allocated.** Compare it with a
+  byte model to within three pages for each buffer.
+
+`crates/rmlx-kv-quant/src/kvcache/v_mirror_alloc_tests.rs` uses both readings.
+The engine does not call `synchronize_gpu()`: `metal_gen_alloc_mb` reads its
+open count unsettled.
 
 `rmlx baseline` reports `metal_peak_mb` (the peak over prefill and decode) and
 `metal_gen_alloc_mb` (that peak minus the bytes live at open). Only the second

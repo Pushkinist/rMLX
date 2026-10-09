@@ -20,22 +20,24 @@
 # (depends_on "mlx-c"), so the mlx-c rpath always matches the user's MLX install.
 #
 # The `mlx-c` dependency is deliberately unversioned, and must stay that way.
-# rMLX pins one validated mlx / mlx-c pair for development
-# (crates/rmlx-mlx/mlx-pin.txt), but that pin exists for a bottle regression
-# that only costs anything on M5-and-later hardware — the generation that has a
-# GPU Neural Accelerator. On M1-M4 the same MLX is entirely correct, and
-# requiring an older release there would force a downgrade for a benefit that
-# hardware cannot use. The pin is a this-machine, this-generation workaround,
-# not a product requirement.
+# rMLX follows Homebrew's MLX: it uses the mlx / mlx-c that Homebrew installs,
+# on every Mac. The pair in crates/rmlx-mlx/mlx-pin.txt is a development and
+# measurement pin, not a product requirement. It exists because MLX builds its
+# Neural-Accelerator kernels only for a macOS 26.2 deployment target, so the
+# Homebrew bottle for macOS 26 has none. Only M5 and later hardware, the
+# generation that has a GPU Neural Accelerator, can use those kernels. On
+# M1-M4 the Homebrew MLX is entirely correct.
 #
 # What ships to users instead is a runtime check: rmlx probes the mlx.metallib
 # of the library it actually loaded and warns on startup only when the host has
 # a Neural Accelerator and the kernels are missing. That stays true after a
 # `brew upgrade mlx` moves the symlink underneath an already-installed rmlx,
-# which no version constraint here could. See crates/rmlx-mlx/src/nax.rs and
-# docs/FFI.md. There is no `caveats` block for the same reason: it would print
-# for every user on every Mac, and the runtime warning reaches exactly the
-# hosts the finding applies to.
+# which no version constraint here could. A second check reads the C API of
+# the loaded mlx-c and names `brew reinstall rmlx` when it is not the one this
+# build compiled against. See crates/rmlx-mlx/src/nax.rs and docs/MLX_PAIR.md.
+# There is no `caveats` block for the same reason: it would print for every
+# user on every Mac, and the runtime warning reaches exactly the hosts the
+# finding applies to.
 class Rmlx < Formula
   desc "Rust-native, single-binary MLX inference + conversion backend for Apple Silicon"
   homepage "https://github.com/Pushkinist/rMLX"

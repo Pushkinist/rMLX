@@ -86,7 +86,14 @@ pub const FIXED_QUAT: [f32; 4] = {
     //         = sqrt(1 + 2.6180339887 + 0.3819660113 + 1)
     //         = sqrt(5.0) ≈ 2.2360679775
     //   q     = q_raw / norm
-    // Values rounded to nearest f32:
+    // The literals are below the nearest f32 of each value: PHI and NORM by one
+    // ulp, PHI_M1 by two. Of the components, only x is the nearest f32 of its
+    // exact value. The literals stay, because they set the bytes of every iso codec.
+    #[allow(
+        clippy::approx_constant,
+        reason = "this literal is 0x3FCF1BBC; the std constant is one ulp above it and \
+                  moves the x component, and with it the bytes of every iso codec"
+    )]
     const PHI: f32 = 1.618_033_9;
     const PHI_M1: f32 = 0.618_033_9;
     const NORM: f32 = 2.236_067_8; // sqrt(5)

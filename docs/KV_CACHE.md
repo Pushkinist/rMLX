@@ -375,21 +375,11 @@ only; upstream f32 compute stays f32. `f32_prefill_seed_is_stored_bf16` and
 ### 5.7.5 `exit_prefill` runs on a worker thread — MLX stream affinity
 
 `exit_prefill` evaluates on the thread that runs the request's generation, a
-tokio blocking-pool worker under `rmlx serve`. MLX default streams are
-per-thread. On the linked MLX 0.31.x the CPU command-encoder map is
-process-global, so an array built on one thread evaluates on another.
-`cross_thread_eval_resolves_through_the_process_global_encoder_map`
-(`rmlx-mlx`) pins that. The map is filled without synchronisation, so
-concurrent evaluation is serialised by the evaluation lock; see `docs/FFI.md`
-§ "Evaluation (lazy graph)".
-
-The generation entry points call `rmlx_mlx::ensure_cpu_default_stream()` and
-`ensure_gpu_default_stream()` before building a graph, so each worker owns its
-streams. `k8v8_q8_quantize_eval_on_worker_thread` (`rmlx-kv-quant`) covers the
-`exit_prefill` quantize on a worker.
-
-The limitation under MLX 0.32.0, where a cross-thread eval throws, is in
-`docs/FFI.md` § "Per-thread CPU stream context — `ensure_cpu_default_stream`".
+tokio blocking-pool worker under `rmlx serve`. MLX evaluates a stream only on
+the thread that created it, so rMLX builds every op on a stream of one MLX
+thread and runs every evaluation there (`docs/FFI.md` § "The MLX thread"). The
+worker needs no stream set-up. `k8v8_q8_quantize_eval_on_worker_thread`
+(`rmlx-kv-quant`) covers the `exit_prefill` quantize on a worker.
 
 ### 5.8 `head_dim` must be declarable
 

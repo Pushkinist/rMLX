@@ -414,10 +414,9 @@ pub fn generate_greedy(
 /// Miss-path push, so it is byte-identical to what `make_step` produces); `None`
 /// re-derives it via `make_step`, matching the Miss path exactly.
 ///
-/// The per-step decode math (token push, `step_fn` forced-feed, EOS break,
-/// constraint advance, `pick_token`) is byte-identical to the original inline
-/// loop; only the function boundary + the step-0 piece source differ (and that
-/// source produces the same string on both paths via `piece_for`).
+/// Each step: token push, constraint advance, `step_fn` (which can force the
+/// next input), EOS break, `pick_token`. The step-0 piece is the same string on
+/// both paths (`piece_for`).
 #[allow(clippy::too_many_arguments)]
 fn decode_from(
     model: &Qwen3VlMoeText,
@@ -451,13 +450,13 @@ fn decode_from(
             },
             None => make_step(next, tokenizer),
         };
+        if let Some(c) = constraint.as_mut() {
+            c.advance(next);
+        }
         let forced = step_fn(&step);
         steps.push(step);
         if eos_ids.contains(&next) {
             break;
-        }
-        if let Some(c) = constraint.as_mut() {
-            c.advance(next);
         }
         let feed = forced.unwrap_or(next);
         let logits = model.forward_seq_with_cache(&[feed], Some(&mut *kv), device)?;
@@ -605,13 +604,13 @@ pub fn generate_image(
         let pos_val = decode_base + g as i64;
         token_history.push(next);
         let step = make_step(next, tokenizer);
+        if let Some(c) = constraint.as_mut() {
+            c.advance(next);
+        }
         let forced = step_fn(&step);
         steps.push(step);
         if eos_ids.contains(&next) {
             break;
-        }
-        if let Some(c) = constraint.as_mut() {
-            c.advance(next);
         }
         let feed = forced.unwrap_or(next);
         let ids_i32 = [feed as i32];

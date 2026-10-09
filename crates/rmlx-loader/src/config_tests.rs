@@ -404,5 +404,5 @@ fn eos_null_top_and_null_text_config_returns_empty() {
         "text_config":{"eos_token_id":null}
     }"#;
     let cfg: ModelConfig = serde_json::from_str(json).unwrap();
-    assert!(cfg.eos_token_ids().is_empty());
+    assert_eq!(cfg.eos_token_ids(), Vec::<u32>::new());
 }

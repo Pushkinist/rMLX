@@ -250,7 +250,36 @@ tests:
 - in the files that declare those tests, a block that reads an environment
   variable and exits by a `return` carrying no value (`return;`, `return`,
   `return None;`, `return Ok(());`) must print a notice. `RMLX_SKIP_GPU` guards
-  are exempt.
+  are exempt. The variable can be read on one line and the block opened on a
+  later one;
+- in every fn of those files, a block that prints a line and returns with no
+  value must hold a notice. A test that prints `<test>: skipping: <why>` and
+  returns has stood down in a form the runner does not harvest, so libtest
+  prints `ok` and the run counts the cell as passed. The notice has one form,
+  and the gate refuses a block that announces in another. It does not read
+  what guards the block. A print is `println!`, `eprintln!`, `print!` or
+  `eprint!`; a return with no value is one of the four forms above. A helper
+  that serves several tests is read too: it takes the caller's name and prints
+  `SKIP {test}:`.
+
+The third rule cannot read these forms, and review holds them:
+
+- a block that returns and prints nothing, which is also the shape of a test
+  that returns after a helper announced the stand-down;
+- a line written through `tracing` or through another macro that prints;
+- a print with no return after it: a test that falls through to its end, or
+  that takes the `else` body;
+- a print in an outer block with the return in an inner one;
+- a block after a nested `fn` item, because the scan starts its depth again
+  at every `fn`;
+- a print and a return at the top level of a fn body.
+
+A helper module that declares no classified test is outside the population of
+the second and third rule. The three that hold a stand-down today are
+`crates/rmlx-models/tests/common/mod.rs`,
+`crates/rmlx-server/tests/thread_boundary/mod.rs` and
+`crates/rmlx-models/src/test_snapshot.rs`. Classified tests call them, and a
+stand-down in them is held to `SKIP {test}:` by review.
 
 The notice's shape lives in `scripts/lib/skip_notice_patterns.sh`, which the
 gate and the runner both read. `make check-named-skip-notices-fixtures` is the
@@ -271,6 +300,10 @@ Cells that read only a variable still stand down without it. Examples:
 `kv_bytes_sample_point.rs`, `RMLX_VL_TEST_MODEL` in
 `qwen3_vl_moe_text_parity.rs`, the `RMLX_PROMPT_CACHE_TEST_MODEL_*` pair in
 `prompt_cache_cross_model.rs`. A run ends INCOMPLETE unless those are set.
+`RMLX_KV_TEST_MODEL` also outranks the slug of every golden-rule cell of its
+architecture (`TESTING.md` § "The resolvers"): set at gemma-4-e4b, it hands
+that snapshot to the cells that name gemma-4-e2b. Arm its variable-only cells
+in a run narrowed to them.
 
 `spec_greedy_equivalence.rs` refuses a mis-paired drafter before either model
 loads, with a named notice. `declared_kind` checks that the sidecar declares the
@@ -370,18 +403,19 @@ Invalid device store at offset 4000064, executing kernel function: "custom_kerne
 - **The exit code is not the signal.** With validation on, cargo still exits 0.
   The runner scans the text, anywhere on a line: the layer writes while libtest
   is mid-line.
-- **The runner owns the environment.** It clears every inherited `MTL_*`
-  variable and pins every `MTL_SHADER_VALIDATION_*` knob it relies on,
+- **The runner owns the environment.** It clears every inherited `MTL_*` and
+  `METAL_*` variable and pins every `MTL_SHADER_VALIDATION_*` knob it relies on,
   `REPORT_TO_STDERR=1` included; that one defaults to 0 and sends reports to
   Unified Logging (`man MetalValidation`).
 - **Threadgroup-memory validation is set per test.** See below.
+- **The verdict is not read from an instrumented run.** See below.
 - **The banner is asserted per crate.** A crate that never printed
   `Metal GPU Validation Enabled` ran uninstrumented and fails. This usually
   means it did not build. The one exception is a crate whose every executed
   test printed its own `SKIP <test>: <why>`: nothing in it reached Metal, each
   cell is listed as a stand-down, and the run ends INCOMPLETE. The
   `/v1/embeddings` GPU cells in `crates/rmlx-server/tests/embeddings_smoke.rs`
-  are such a crate on a host without the jina snapshot.
+  are such a crate when `RMLX_TEST_MODEL_JINA_V4` is not set.
 - **A positive control runs first.**
   `crates/rmlx-kv-quant/src/shader_validation_canary.rs`, behind the
   `shader-validation-canary` feature, stores out of bounds on purpose. The run
@@ -390,7 +424,71 @@ Invalid device store at offset 4000064, executing kernel function: "custom_kerne
   `make gpu-test` selects.
 
 MLX owns the allocator and reports buffers as `<unnamed>`. The kernel function
-name, `custom_kernel_` plus the rMLX kernel name, is the attribution.
+name, `custom_kernel_` plus the rMLX kernel name and, on mlx 0.32.x, a suffix
+per input and output dtype, is the attribution.
+
+### The verdict is the uninstrumented run
+
+The instrumentation can change what a kernel computes, so an instrumented run
+is a scan and not a verdict. Measured on mlx 0.32.3, in pure MLX with no rMLX
+code: MLX's `fast::scaled_dot_product_attention` at `head_dim` 256, bf16, with
+an array mask, at least 1024 query rows, query rows that are not a multiple of
+64 and key rows that are not a multiple of 32.
+
+- With device-memory validation on, it returned `inf` cells on 2 of 16 to 11 of
+  24 repeats of one input, by shape, and the layer printed no diagnostic.
+- With no instrumentation, no repeat returned a non-finite cell.
+- With one of the two row counts aligned, no repeat failed.
+- The cause is the instrumented compile of the kernel, not the kernel source.
+- mlx 0.31.2 and 0.32.1 do not show it.
+
+rMLX sends MLX no call in that configuration (`FFI.md`,
+"`scaled_dot_product_attention`"), so no test fails for this reason.
+
+After the instrumented runs of a crate, the runner runs its selected tests
+once more with no `MTL_*` or `METAL_*` variable:
+
+- Pass, fail and the count on the final line are the uninstrumented run's.
+- Hits and the banner are read from the instrumented runs.
+- A stand-down notice from either run is listed and ends the run INCOMPLETE.
+  The census skip set is the instrumented runs' notices alone.
+- Each run that exits non-zero and names no failing test is a failure with
+  that reason, read per run: a failing test that one run names does not vouch
+  for another run that died.
+- A test that failed in the uninstrumented run alone is listed with
+  `(passed with shader validation on)`, or with
+  `(stood down with shader validation on)` when the scan did not run it.
+- A build under the Metal claim in either kind of run is a failure.
+- The uninstrumented run has the same coverage check as each instrumented run.
+
+The cost is one more pass over every selected test. One complete run on the
+pinned pair, on a host holding every snapshot the suite resolves by slug, took
+5 h 46 min: `rmlx-models` 4 h 50 min, `rmlx-server` 30 min, `rmlx-audio`
+21 min, `rmlx-kv-quant` 4 min, and the other crates under a minute together.
+The uninstrumented pass of `rmlx-models` was 1 h 31 min of that.
+
+**A test that fails under the instrument and not without it is a failure.**
+The report names it: `<crate>: <test> failed with shader validation on and
+passed without it`, or `… and stood down without it` when the uninstrumented
+run did not run the test. A kernel defect that only the instrument's timing exposes
+looks the same as an artifact of the instrument: red with validation, green
+without, no diagnostic. The scan of such a test stopped at its failure, so
+its census entries stay an expectation and the hits it did not print are a
+deviation. The census is on the sum per kernel, so another test's hits can
+stand in for them. For both cases the report adds a note that names each test
+that failed in a scan: a short count in its crate is not evidence of a stale
+pin, and a matching count is not evidence of a match.
+
+The runner reads no list of accepted tests, because no test is in that state.
+A list keyed on test names cannot hold a fault that fires at random: an entry
+whose test passed by chance turns a correct tree red, and an entry accepts any
+failure of its test, a new defect included. What this gives up: a fault of the
+instrument that fires at random makes the gate red at random. The answer is
+the one the attention kernel above got. Find the configuration with a
+reproduction in pure MLX, and stop reaching it.
+
+Each rule is a case under `THE VERDICT` in
+`scripts/run_gpu_tests_selftest.sh`.
 
 ### Threadgroup-memory validation: on for rMLX's kernels, off for MLX's
 
@@ -407,8 +505,8 @@ compute. Measured on this suite's cells:
   returned wrong output on the repeats that reported. With the threadgroup
   instrumentation off it reported nothing and matched the unvalidated output.
 
-Device-memory validation is unaffected: the split-K hits are reported at the
-same count either way. So a test whose GPU work is MLX's kernels cannot be
+Device-memory validation is unaffected: on an MLX before 0.32.3 the split-K
+hits were reported at the same count either way. So a test whose GPU work is MLX's kernels cannot be
 judged with threadgroup validation on, and a test of rMLX's own `.metal`
 kernels, which this repo can get wrong in threadgroup memory, loses coverage
 without it.
@@ -422,8 +520,9 @@ same-file fn it calls (followed by name), names an entry name. Comments and
 string contents are not read. Every other test runs with it off, including the
 tests of `rmlx-mlx` and `rmlx-kv-quant` that dispatch only MLX's kernels.
 
-- The runner runs each crate once per setting. Each run names its own tests and
-  skips the other setting's, so no test runs under both.
+- The runner scans each crate once per setting. Each run names its own tests
+  and skips the other setting's, so no test is scanned under both. The
+  uninstrumented run that follows names every test.
 - The report lists each crate's tests under `threadgroup validation ON (n):` or
   `OFF (n):`, and the final line counts both.
 - A classified test with no setting, a setting for a test that is not
@@ -466,28 +565,48 @@ prints the access mix per diagnostic. A clean scan does not prove that nothing
 read out of bounds. The layer bounds against the `MTLBuffer`, not the array,
 and MLX recycles buffers from size buckets.
 
-The pin accepts two MLX kernel families, loads only:
+The pin accepts one MLX kernel family, loads only: the implicit-GEMM conv,
+`implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s`,
+whose weight loader checks the output-channel bound only for 8-wide tiles.
 
-- the split-K quantized matmul,
-  `affine_qmm_t_splitk_bfloat16_t_gs_64_b_{4,8}_alN_false` and
-  `mxfp8_qmm_t_splitk_bfloat16_t_gs_32_b_8_alN_false`.
-  `QuantizedBlockLoader::load_safe` in `mlx/backend/metal/kernels/quantized.h`
-  bounds its row index against the tile's column extent, so a transposed
-  quantized matmul whose `N` is not a multiple of the output tile width reads
-  past the packed weight and scales;
-- the implicit-GEMM conv,
-  `implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s`,
-  whose weight loader checks the output-channel bound only for 8-wide tiles.
+The pin has no split-K entry. In MLX 0.31.2, 0.32.1 and 0.32.2,
+`QuantizedBlockLoader::load_safe` in `mlx/backend/metal/kernels/quantized.h`
+bounds the row index of a transposed weight against the tile's column extent,
+so a quantized matmul whose `N` is not a multiple of the output tile width
+reads past the packed weight and scales, and the
+`affine_qmm_t_splitk_*` and `mxfp8_qmm_t_splitk_*` kernels report. MLX 0.32.3
+bounds it against the row extent (`if (bi >= src_tile_dim.y)`). The complete
+run the pin was derived from reported no split-K diagnostic in any crate. A
+run on an MLX before 0.32.3 reads each of them as `not pinned`.
 
-In both, each output column is computed from its own weight row and the store
-clips, so the out-of-range rows never reach the output. The tests
+It also accepts one report that is not a read of the kernel, on two
+instantiations of MLX's wide gemv, both on the gemma-4-e2b assistant pair:
+
+- `gemv_wide_bfloat16_nv5_kl32_nc0_axpby0` in
+  `the_assistant_round_loop_reproduces_plain_greedy`, pinned `<=10`. The count
+  changes per run (6, 3, 4, 1, 4, 4, 10, 5).
+- `gemv_wide_bfloat16_nv4_kl32_nc0_axpby0` in
+  `a_sampled_sidecar_arm_draws_from_the_verifiers_distribution`, pinned `<=1`.
+  The count changes per run (1, 0, 1, 0).
+
+The kernel clamps every index it forms, and the reported offsets are hundreds
+of megabytes to gigabytes outside the buffer. Each test prints the same output
+in a validated and in an unvalidated run. The cause of the report is not
+known; the header of the pin says what was measured.
+
+No whole run has yet ended with the census matching the pin. One whole
+`make ci-perf` passed every test and showed these two counts as its only
+deltas; the two entries were set from it and from runs of each test alone.
+
+In the conv and in the split-K matmul, each output column is computed from its
+own weight row and the store clips, so the out-of-range rows never reach the
+output. The tests
 `split_k_tail_row_reads_never_reach_the_output` and
 `implicit_gemm_conv_tail_channel_reads_never_reach_the_output` in
 `crates/rmlx-mlx/src/ops/matmul_tests.rs` show it bit for bit with the tail rows
 poisoned. The header of `scripts/gpu_validation_census.txt` gives the argument
-and the run the pin was derived from. A cell a variable arms that the
-derivation run left standing down reports its hits as deltas until the pin is
-derived again.
+and the run the pin was derived from. The cells that run left standing down
+for a variable were armed in filtered runs afterwards and reported nothing.
 
 ### The census pin
 
@@ -514,6 +633,16 @@ not `SKIP`. Its entries stay expected. The missing checkpoint's kernel reports
 | nothing where the expectation is positive | fail: `no longer fires: …` |
 | any store | fail: `never accepted: …` |
 | an entry whose test was not selected, or skipped | pass: `census NOT enforced in full`, naming the entry |
+| a count from 0 to N against an entry pinned `<=N` | pass, printed as `<test> = at most N` |
+| above N against an entry pinned `<=N` | fail: `count moved up: … expected at most N, observed M` |
+
+A count is pinned `<=N` only when it is not reproducible: the same test gives
+another count on each run. N is the largest count the derivation runs
+observed, and the header of the pin names those runs. An exact entry beside it
+on the same kernel stays a floor, on the sum: the hits of the `<=N` test can
+stand in for missing hits of the exact one. A `<=N` entry has no stale verdict.
+It still refuses a store, another kernel, another crate or test, and a count
+above N. The selftest holds the tracked pin to two such entries.
 
 A hit in another crate than its entry names reads as `not pinned` there and
 `no longer fires` where it was pinned.
@@ -523,7 +652,7 @@ The pin file is checked as it is read. Each defect is a failure:
 | pin defect | reason reported |
 |---|---|
 | not six `\|`-separated fields | `line N: expected 6 fields — …` |
-| count not a positive integer | `line N: count '<x>' is not a positive integer` |
+| count not a positive integer, or `<=` and one; a leading zero | `line N: count '<x>' is not a positive integer, or '<=' and one` |
 | a kind naming a store | `line N: a store is never pinnable — …` |
 | a test that is not a classified GPU test of that crate | `line N: <crate> has no classified GPU test '<test>'` |
 | the same kernel, kind and test twice | `line N: … is pinned twice …` |

@@ -7,8 +7,147 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-10-09
+
+This release makes rMLX build and run on the MLX that Homebrew ships today:
+mlx 0.32.3 with mlx-c 0.7.0.
+
+For a Homebrew install, `brew upgrade rmlx` builds again. rMLX 0.4.2 does not
+compile against mlx-c 0.7.0, because one mlx-c call has a new argument. An
+`rmlx` that was built against mlx-c 0.6 must be reinstalled: on the mlx-c 0.7
+library it reads the arguments of that call from the wrong slots.
+`brew upgrade rmlx` replaces it. After a later move of `mlx-c`, use
+`brew reinstall rmlx`; from this release a binary on the other mlx-c C API
+refuses and names that fix. A release tarball runs only on the mlx-c C API it
+was built against.
+
+On M5 with macOS 26, the MLX that Homebrew installs has no Neural-Accelerator
+kernels, so prefill is slower. rMLX warns at startup and names the fix.
+
+Three changes to read before upgrading: a JSON-mode reply (`response_format`)
+starts at the JSON and drops the text before it, and a stream in which the
+JSON does not start ends with an error event (**Fixed**); a forced tool call
+whose constraint cannot be built returns four reply shapes as text and not as
+a tool call (**Fixed**); `rmlx baseline` and `rmlx bench` refuse off the
+validated MLX pair also on a Mac whose chip cannot be identified
+(**Changed**). No CLI flag, environment variable or HTTP route is removed.
+
+### Added
+
+- **rMLX builds against the mlx-c 0.6 and the 0.7 C API.** `build.rs` reads
+  the C API from the generated bindings, and the one call whose argument list
+  differs, `mlx_fast_scaled_dot_product_attention`, is compiled for it. So
+  `brew install rmlx` builds against the `mlx-c` that Homebrew ships today
+  (0.7.0), and against the 0.6 releases before it.
+- **The README says at its top which MLX rMLX uses.** rMLX uses the MLX that
+  Homebrew installs, on every Mac. On M5 with macOS 26, the Homebrew bottle of
+  MLX has no Neural-Accelerator (NAX) kernels, so prefill is slower; rMLX
+  warns at startup and names the fix. A table in the README gives the result
+  of `brew install rmlx` on each Mac, and `docs/MLX_PAIR.md` gives the steps.
+- **A binary refuses to run on the other mlx-c C API.** The two C APIs keep
+  the name of that call, so dyld links a binary built against one to a
+  `libmlxc.dylib` of the other with no error, and the call then reads its
+  arguments from the wrong slots. rMLX reads the C API of the loaded library
+  once per process. On a mismatch, on every Mac, the attention call returns an
+  error instead of calling mlx-c, `rmlx healthcheck` reports `mlx_pin` red,
+  `rmlx baseline` and `rmlx bench` refuse before a model loads, and
+  `make mlx-preflight` stops. Each names the fix: a rebuild against the loaded
+  mlx-c (`brew reinstall rmlx` for a Homebrew install, after Homebrew moves
+  `mlx-c`), or the mlx-c the binary was built against. Where the pinned pair is
+  required (the pin binds, or the chip is not identified) and the loaded pair
+  is not the pinned one, they also name `make mlx-restore-pin`, because a
+  rebuild against that pair is refused again.
+
+### Changed
+
+- **The validated MLX pair is mlx 0.32.3 + mlx-c 0.7.0, built from source for
+  a macOS 26.2 deployment target**, so that it carries the Neural-Accelerator
+  (NAX) kernels. Homebrew ships the same versions, and its bottle for macOS 26
+  has no NAX kernels. The pin is for development and measurement: it does not
+  limit `rmlx serve`, and the formula's `mlx-c` dependency keeps no version.
+  Off that pair,
+  `rmlx baseline` and `rmlx bench` refuse on M5 and later and on a Mac whose
+  chip cannot be identified. On M1–M4 the pin does not bind, and
+  `make mlx-preflight` passes when the C API matches. `docs/MLX_PAIR.md` gives
+  the steps for each Mac. (#638)
+- **`make mlx-restore-pin` no longer pours a Homebrew bottle.** It takes each
+  pinned keg from the Cellar, or from a source-built copy in
+  `~/.rmlx/bottles/source-built` (a tar listed in `SHA256SUMS`). It checks a
+  copy in a staging directory, for every file rMLX loads and for the NAX
+  kernels, and moves it into the Cellar only when it passes, so a refused copy
+  leaves no keg for Homebrew to take as installed. A refusal names a copy or
+  keg for removal only when it is bad; when `strings` or the disk is the
+  cause, it names that cause and keeps the copy. One restore runs at a time.
+  It then links and pins exactly the two pinned kegs; `brew link` and
+  `brew pin` take the newest keg instead.
+
 ### Fixed
 
+- **A `response_format` reply is the same text streamed and not, and is
+  never one smaller value.** With `json_object` or `json_schema`, the
+  streamed reply was cut at the first `t`, `f`, `n`, quote, dash or digit of
+  the text before the JSON (`t that maps…`, or the `n` of a ` ```json `
+  header). The non-streamed reply was the first complete value in the text:
+  one key or number of an object that `max_tokens` or a `stop` string cut,
+  or a number in the prose. Now `content` starts at the byte where the
+  grammar engaged and runs to the end of the text on both paths. A cut value
+  is returned cut, with its `finish_reason`. Text that ends before that byte
+  is refused on both paths: 502 `constraint_not_engaged`, or that error
+  event in a stream, which before completed with unchecked text. The
+  grammar now sees a first token that the prompt cache replays (no mask is
+  applied to that token): before, a request sent again with the same prompt
+  answered 502 when its reply started with `{`. The token that ends a
+  generation adds no text to a reply, also on a model whose tokenizer does
+  not mark that token special. `docs/SERVER.md` ("JSON-mode reply") states
+  the contract and a known limit of numbers. Behaviour change: a forced tool
+  call (`tool_choice` required or named) whose constraint cannot be built is
+  now read as for `auto`, with its reasoning kept. These replies were a tool
+  call in that case and are now text: bare JSON after prose, inside a code
+  fence or on the reasoning channel, and a call after a `<tool_call>` literal
+  that the reasoning opens and does not close (`docs/SERVER_TOOLS.md`).
+
+- **A long prefill no longer returns `NaN` logits under Metal shader
+  validation on mlx 0.32.3.** MLX's attention kernel for `head_dim` 256
+  returned `+inf` rows under device-memory validation when a call had an array
+  mask, at least 1024 query rows that are not a multiple of 64, and key rows
+  that are not a multiple of 32. The last prefill chunk of a Qwen3.5 or
+  Qwen3.6 prompt has that shape. The cause is the instrumented compile of the
+  MLX kernel; no run without validation has shown the fault. rMLX now pads the
+  query rows of an array-mask call at `head_dim` 256 with at least 1024 query
+  rows to the next multiple of 64, whatever its key rows, and drops the padded
+  rows from the output. Generated tokens are unchanged on the four test
+  models (Qwen3.6-35B-A3B, Ternary-Bonsai-27B, gemma-4-e2b, Ternary-Bonsai-8B).
+  The padding was measured on Qwen3.6-35B-A3B-8bit: the prefill rate stays
+  within 1 % at 4k and 32k prompt tokens, the 128k cell (-1.6 %) is
+  inconclusive, and at 128k the Metal memory of a generation peaks 269 MB
+  (5.4 %) higher. `docs/MLX_PAIR.md` § "The attention row rule" has the cells.
+
+- **A model loaded on one thread no longer fails on another.** On MLX 0.32 an
+  on-demand load (unload, then a request) failed its first request with
+  `There is no Stream(cpu, N) in current thread`, and so did an image request
+  after an on-demand load of a vision model, a jina-v4 image embedding, and a
+  cache entry that a failed request left. A BitNet on-demand load and the first
+  synthesis after a TTS load failed the same way on every MLX, with
+  `Stream(gpu, N)`. MLX evaluates a stream only on the thread that created it.
+  rMLX now builds every op on the streams of one MLX thread and runs every
+  evaluation there (`docs/FFI.md` § "The MLX thread"), so any thread can use
+  what another thread built. (#638)
+- **`--device cpu` runs every op on the CPU.** MLX builds some ops inside
+  other ops on its default device, for example the `astype` of bf16 scales
+  inside an affine `quantized_matmul` with an f32 input. Under `--device cpu`
+  that default device was still the GPU, so such an op ran there.
+  `--device cpu` now makes the CPU the MLX default device too.
+- **A greedy step with a `NaN` logit chooses the same token on every path, and
+  a constrained step never chooses a forbidden one because of a `NaN` or
+  `+inf` logit.** mlx 0.32.3 returns the first `NaN` from `argmax`, and older
+  MLX skips it. The penalty path selected with a host scan that skipped it, so
+  it could choose another token than the plain path, and the constraint path
+  added a `-inf` bias, which leaves a forbidden `NaN` as `NaN` and makes a
+  forbidden `+inf` a `NaN`, so on mlx 0.32.3 it could choose a token the
+  grammar forbids. The penalty path now hands its row to MLX's `argmax`,
+  and the constraint path replaces each forbidden logit with `-inf`. A `NaN`
+  row is still not refused at a step of the shared decode loop
+  (`docs/SAMPLING.md`).
 - **The release tarball's binary no longer carries the builder's home
   directory.** Every dependency's panic location was compiled in as an
   absolute path under the build machine's home, user name included — 577
@@ -2917,7 +3056,8 @@ inference + conversion backend for Apple Silicon — no Python at runtime.
 - Speculative drafters validated against their verifiers: Qwen 3.6 MTP sidecar
   and the Gemma 4 assistant drafter.
 
-[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/Pushkinist/rMLX/releases/tag/v0.4.3
 [0.4.2]: https://github.com/Pushkinist/rMLX/releases/tag/v0.4.2
 [0.4.1]: https://github.com/Pushkinist/rMLX/releases/tag/v0.4.1
 [0.4.0]: https://github.com/Pushkinist/rMLX/releases/tag/v0.4.0

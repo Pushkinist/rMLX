@@ -100,7 +100,7 @@ fn extract_frames_exact_multiple_no_extra_frame() {
 fn extract_frames_empty_clip_is_zero_frames() {
     let (frames, num_tokens) = extract_waveform_frames(&[], 640);
     assert_eq!(num_tokens, 0);
-    assert!(frames.is_empty());
+    assert_eq!(frames, Vec::<f32>::new());
 }
 
 #[test]

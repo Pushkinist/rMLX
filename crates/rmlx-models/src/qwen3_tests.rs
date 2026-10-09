@@ -65,12 +65,12 @@ fn integration_qwen3_dr_venus() {
     let Some(model_dir_buf) =
         std::env::var_os("RMLX_TEST_MODEL_DR_VENUS").map(std::path::PathBuf::from)
     else {
-        eprintln!("integration_qwen3_dr_venus: skipping: RMLX_TEST_MODEL_DR_VENUS not set");
+        eprintln!("SKIP integration_qwen3_dr_venus: RMLX_TEST_MODEL_DR_VENUS not set");
         return;
     };
     let model_dir = model_dir_buf.as_path();
     if !model_dir.exists() {
-        eprintln!("integration_qwen3_dr_venus: snapshot absent, skipping");
+        eprintln!("SKIP integration_qwen3_dr_venus: snapshot absent");
         return;
     }
 

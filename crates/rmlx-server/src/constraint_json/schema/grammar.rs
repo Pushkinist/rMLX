@@ -1,7 +1,6 @@
 //! Schema-driven JSON byte state machine and supporting utilities.
 //!
 //! Contains:
-//! - `is_only_fence_or_whitespace` — markdown-fence detection helper
 //! - `literal_bytes` / `union_literals` — literal serialization helpers
 //! - `LiteralTrie` — byte-level literal match tracker for `enum`/`const`/`oneOf`
 //! - `FreeKeyNext` / `free_key_step` — additional-property key parser
@@ -37,31 +36,6 @@ use super::types::SchemaNode;
 
 /// Whitespace bytes allowed outside strings (mirrors `super::super::WS`).
 pub(super) const WS: [u8; 4] = *b" \t\n\r";
-
-// ────────────────── fence-suppression helper ────────────────────────────────
-
-/// Returns `true` when `s` is entirely whitespace optionally followed by a
-/// markdown code-fence header (` ```json` or ` ``` `) and nothing else. Used
-/// to decide whether to discard the pre-engagement buffer rather than
-/// leaking it into `content`.
-///
-/// Pattern: `^\s*(```(json)?\s*)?$`
-pub(crate) fn is_only_fence_or_whitespace(s: &str) -> bool {
-    let trimmed = s.trim_start_matches(|c: char| c.is_ascii_whitespace());
-    if trimmed.is_empty() {
-        return true;
-    }
-    // Must start with ` ``` `, otherwise it is real prose → false.
-    let Some(after_backticks) = trimmed.strip_prefix("```") else {
-        return false;
-    };
-    // Optionally followed by `json`.
-    let after_lang = after_backticks
-        .strip_prefix("json")
-        .unwrap_or(after_backticks);
-    // Remainder must be whitespace only (newline etc.).
-    after_lang.chars().all(|c| c.is_ascii_whitespace())
-}
 
 // ────────────────── literal trie (enum / const) ─────────────────────────────
 

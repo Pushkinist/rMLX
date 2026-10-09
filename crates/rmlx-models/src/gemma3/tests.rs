@@ -77,13 +77,13 @@ fn integration_medgemma_forward() {
     let Some(model_dir_buf) =
         std::env::var_os("RMLX_TEST_MODEL_MEDGEMMA").map(std::path::PathBuf::from)
     else {
-        eprintln!("integration_medgemma_forward: skipping: RMLX_TEST_MODEL_MEDGEMMA not set");
+        eprintln!("SKIP integration_medgemma_forward: RMLX_TEST_MODEL_MEDGEMMA not set");
         return;
     };
     let model_dir = model_dir_buf.as_path();
     if !model_dir.exists() {
         eprintln!(
-            "integration_medgemma_forward: snapshot absent at {}, skipping",
+            "SKIP integration_medgemma_forward: snapshot absent at {}",
             model_dir.display()
         );
         return;

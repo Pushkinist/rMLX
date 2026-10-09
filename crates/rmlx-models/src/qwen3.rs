@@ -1959,17 +1959,21 @@ pub fn generate_greedy<'a>(
         } else {
             None
         };
-        steps.push(ProbeStep {
-            token_id: last_id,
-            piece: piece.into_boxed_str(),
-            max_abs_logit: 0.0,
-            nan_count: 0,
-            logprobs: first_lp,
-        });
-        step_fn(steps.last().unwrap());
-        token_history.push(last_id);
-
-        if eos_ids.contains(&last_id) {
+        let ends = crate::decode_loop::emit_replayed_token(
+            &mut constraint,
+            step_fn,
+            &mut steps,
+            token_history,
+            eos_ids,
+            ProbeStep {
+                token_id: last_id,
+                piece: piece.into_boxed_str(),
+                max_abs_logit: 0.0,
+                nan_count: 0,
+                logprobs: first_lp,
+            },
+        );
+        if ends {
             return Ok(steps);
         }
 
@@ -2180,15 +2184,10 @@ pub fn generate_greedy<'a>(
             &caches,
             KvCache::try_deep_clone,
         ) {
-            // Materialize GPU arrays on the current inference thread before
-            // storing in the prompt cache.  Each spawn_blocking request runs
-            // on its own tokio thread with its own Metal GPU stream.  If these
-            // lazy arrays are evicted on a *different* inference thread later,
-            // that thread's eval_for_spill would fail with "There is no
-            // Stream(gpu, N) in current thread".  Pre-eval here makes eval()
-            // a no-op from any future thread.
-            // The drain thread's spill() refcount-clones these arrays (no new graph) and evals
-            // the clone, which shares the same buffers — so materializing here makes that eval a no-op.
+            // Evaluate the copies before the store, so the entry holds its own
+            // buffers and not a graph over the live caches. The drain thread's
+            // spill() refcount-clones these arrays (no new graph) and evals the
+            // clone, which shares the same buffers, so that eval is a no-op.
             match kv_snapshot.iter().try_for_each(|c| c.eval_for_spill()) {
                 Ok(()) => {
                     // Salt the chained walk with the active layout_key + KV codec.

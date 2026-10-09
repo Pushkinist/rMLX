@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_child::{run_child, started_by_parent, CHILD_DONE};
 
 /// Reinterpret a &[f32] as &[u8] (no copy).
 fn f32_as_bytes(s: &[f32]) -> &[u8] {
@@ -1082,27 +1083,28 @@ fn repetition_penalty_breaks_single_token_loop() {
     );
 }
 
-// ── Greedy tie-break: host selection must mirror the device reduction ─────
+// ── Greedy selection: the host path must choose what the device path does ──
 //
-// The oracle in this section is MLX's own `argmax`, called through the same
-// FFI the decode loop uses. It shares no arithmetic with the host scan under
-// test: one is a C++/Metal reduction over the array, the other a Rust loop
-// over a host copy.
+// The host greedy path applies the mask and the penalties to a host copy of
+// the row, then hands the row back to MLX's `argmax`. The oracle in this
+// section is that same op on the row the device path reduces, called through
+// the FFI the decode loop uses. What these tests can catch is a host path
+// that selects by another rule, or that hands MLX a row other than the one the
+// device path would reduce.
 //
 // Most of these run on `Device::Cpu` so they land in the ordinary
-// (non-`#[ignore]`) suite. `host_argmax` is written against the **Metal**
-// reduction's seed, so the Metal backend is checked rather than assumed by the
-// `#[ignore]`d `Device::Gpu` mirrors at the end of this section — a CPU-only
+// (non-`#[ignore]`) suite. The `#[ignore]`d `Device::Gpu` mirrors at the end of
+// this section check Metal, which is a separate implementation — a CPU-only
 // oracle cannot establish a Metal property.
 
-/// Decode the `[1] I32` selection Array into a token id.
+/// Decode the `[1]` index array of a selection into a token id.
 #[allow(
     clippy::indexing_slicing,
-    reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] I32 result, and sampler calls on inputs built in the same fn — all infallible by construction"
+    reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] index array, and sampler calls on inputs built in the same fn — all infallible by construction"
 )]
 #[allow(
     clippy::unwrap_used,
-    reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] I32 result, and sampler calls on inputs built in the same fn — all infallible by construction"
+    reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] index array, and sampler calls on inputs built in the same fn — all infallible by construction"
 )]
 fn token_id(a: &Array) -> u32 {
     materialise(a);
@@ -1308,22 +1310,184 @@ fn host_greedy_matches_device_argmax_with_mask_and_penalties() {
     );
 }
 
-/// A `NaN` in the row must not displace a real maximum, and must not reset the
-/// running best — both are properties of the device reduction, which compares
-/// with a strict `>` and therefore skips `NaN` entirely. The `NaN` is placed
-/// away from index 0 on purpose: MLX seeds its CPU reduction with `in[0]` and
-/// its Metal reduction with `-inf`, so a leading `NaN` is the one shape where
-/// MLX's own two backends disagree and no host rule can match both.
+/// Rows that hold a `NaN`, as `(name, row)`. Shared by the CPU tests and their
+/// `Device::Gpu` mirrors.
+///
+/// MLX's `argmax` answers these rows differently by version: mlx 0.32.3 returns
+/// the first `NaN` (ml-explore/mlx#4291), and 0.32.1 skips it, from a `-inf`
+/// seed on Metal and from `in[0]` on CPU. So the tests over these rows assert
+/// that the greedy paths agree, never which id they choose.
+fn nan_shapes() -> Vec<(&'static str, Vec<f32>)> {
+    let nan = f32::NAN;
+    let wide = |nans: &[usize], peak: usize| {
+        let mut row = wide_row_with_peaks(&[peak]);
+        for &i in nans {
+            if let Some(slot) = row.get_mut(i) {
+                *slot = nan;
+            }
+        }
+        row
+    };
+    vec![
+        ("leading", vec![nan, 1.0, 5.0, 2.0]),
+        ("middle", vec![1.0, 3.0, nan, 2.0]),
+        ("trailing", vec![1.0, 5.0, 2.0, nan]),
+        ("after +inf", vec![1.0, f32::INFINITY, nan]),
+        ("before +inf", vec![1.0, nan, f32::INFINITY]),
+        ("all", vec![nan; 8]),
+        ("wide, at index 0", wide(&[0], WIDE_VOCAB / 2)),
+        ("wide, before the max", wide(&[100], WIDE_VOCAB / 2)),
+        ("wide, after the max", wide(&[WIDE_VOCAB - 1], 7)),
+        ("wide, all", vec![nan; WIDE_VOCAB]),
+    ]
+}
+
+/// On a row that holds a `NaN`, the host greedy path must choose the token the
+/// device greedy path chooses, on every MLX pair the engine supports.
+fn check_host_greedy_on_nan_rows(device: Device) {
+    for (name, row) in nan_shapes() {
+        let logits = f32_row(&row);
+        let device_id = device_argmax(&logits, device);
+        let host_id = host_greedy(&logits, device);
+        assert_eq!(
+            host_id, device_id,
+            "{name} NaN on {device:?}: host greedy picked {host_id}, device argmax picked {device_id}"
+        );
+    }
+}
+
 #[test]
-fn host_greedy_skips_nan_like_the_device() {
-    let logits = f32_row(&[1.0, 3.0, f32::NAN, 2.0]);
-    let device_id = device_argmax(&logits, Device::Cpu);
-    assert_eq!(device_id, 1, "device reduction must skip the NaN");
-    let host_id = host_greedy(&logits, Device::Cpu);
-    assert_eq!(
-        host_id, device_id,
-        "NaN row: host greedy picked {host_id}, device argmax picked {device_id}"
-    );
+fn host_greedy_matches_device_argmax_on_nan_rows() {
+    check_host_greedy_on_nan_rows(Device::Cpu);
+}
+
+/// Rows with a `NaN` or a `+inf` at a forbidden id, or a `NaN` at an allowed
+/// id, as `(name, logits, allow-mask)`. A forbidden `+inf` plus a `-inf` bias is
+/// `NaN`, so it fails an additive mask the way a forbidden `NaN` does.
+fn masked_nan_shapes() -> Vec<(&'static str, Array, Vec<bool>)> {
+    let nan = f32::NAN;
+    let mut wide = wide_row_with_peaks(&[WIDE_VOCAB / 2]);
+    if let Some(slot) = wide.get_mut(3) {
+        *slot = nan;
+    }
+    let mut wide_mask = vec![true; WIDE_VOCAB];
+    if let Some(slot) = wide_mask.get_mut(3) {
+        *slot = false;
+    }
+    let first_forbidden = vec![false, true, true, true];
+    vec![
+        (
+            "forbidden NaN first",
+            f32_row(&[nan, 1.0, 5.0, 2.0]),
+            first_forbidden.clone(),
+        ),
+        (
+            "forbidden NaN last",
+            f32_row(&[1.0, 5.0, 2.0, nan]),
+            vec![true, true, true, false],
+        ),
+        (
+            "allowed NaN",
+            f32_row(&[1.0, nan, 5.0, 2.0]),
+            vec![true, true, false, true],
+        ),
+        (
+            "forbidden +inf first",
+            f32_row(&[f32::INFINITY, 1.0, 5.0, 2.0]),
+            first_forbidden.clone(),
+        ),
+        (
+            "bf16, forbidden NaN first",
+            bf16_row(&[BF16_NAN, 0x3F80, 0x40A0, 0x4000]),
+            first_forbidden,
+        ),
+        ("wide, forbidden NaN", f32_row(&wide), wide_mask),
+    ]
+}
+
+/// The masked greedy paths must agree on a row with a `NaN`, and neither may
+/// choose a forbidden id. An additive `-inf` bias leaves a forbidden `NaN` as
+/// `NaN`, so on an MLX whose `argmax` returns the first `NaN` it would win.
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] I32 result, and sampler calls on inputs built in the same fn — all infallible by construction"
+)]
+fn check_masked_greedy_on_nan_rows(device: Device) {
+    let nop = PenaltyConfig::default();
+    for (name, logits, mask) in masked_nan_shapes() {
+        let device_id = token_id(&apply_mask_argmax(&logits, &mask, device).unwrap());
+        let host_id =
+            token_id(&argmax_with_penalties(&logits, Some(&mask), &nop, &[], device).unwrap());
+        assert_eq!(
+            host_id, device_id,
+            "{name}: host masked greedy picked {host_id}, device masked argmax picked {device_id}"
+        );
+        assert_eq!(
+            mask.get(device_id as usize),
+            Some(&true),
+            "{name}: masked greedy chose the forbidden id {device_id}"
+        );
+    }
+}
+
+#[test]
+fn masked_greedy_paths_agree_and_stay_allowed_on_nan_rows() {
+    check_masked_greedy_on_nan_rows(Device::Cpu);
+}
+
+/// `argmax_with_penalties` selects on the device it is given, and
+/// `apply_mask_argmax` builds its first op there, as the device greedy path
+/// does. MLX's `argmax` can answer a `NaN` row differently on the CPU and the
+/// Metal stream, so a path that selects on another stream can choose another
+/// token. The GPU latch is process-global and one-way, so the check runs in a
+/// child process. The latch refuses the first GPU op, so this test cannot see
+/// the device of the final `argmax` of `apply_mask_argmax`: a change that
+/// moves only that op to another stream passes.
+#[test]
+fn greedy_paths_select_on_the_device_they_are_given() {
+    run_child("sampler::sampler_tests::greedy_paths_select_on_the_device_they_are_given_child");
+}
+
+// gpu-test-gate: exempt  the latch refuses the GPU stream before any FFI call.
+#[test]
+#[ignore = "child process; its parent test starts it with a marker argument"]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: sampler calls on a row built in the same fn"
+)]
+fn greedy_paths_select_on_the_device_they_are_given_child() {
+    if !started_by_parent() {
+        return;
+    }
+    rmlx_mlx::forbid_gpu().unwrap();
+    let logits = f32_row(&[1.0, 5.0, 2.0]);
+    let mask = [true, true, false];
+    let nop = PenaltyConfig::default();
+    let on = |device| {
+        [
+            (
+                "argmax_with_penalties",
+                argmax_with_penalties(&logits, Some(&mask), &nop, &[], device),
+            ),
+            (
+                "apply_mask_argmax",
+                apply_mask_argmax(&logits, &mask, device),
+            ),
+        ]
+    };
+    for (path, got) in on(Device::Cpu) {
+        assert_eq!(token_id(&got.unwrap()), 1, "{path} on the CPU");
+    }
+    for (path, got) in on(Device::Gpu) {
+        match got {
+            Ok(_) => panic!("{path} selected on another device than the GPU it was given"),
+            Err(e) => assert!(
+                e.to_string().contains("GPU work is refused"),
+                "{path} failed for another reason than the GPU latch: {e}"
+            ),
+        }
+    }
+    println!("{CHILD_DONE}");
 }
 
 /// An all-`false` constraint mask must be **refused**, on every path that
@@ -1689,12 +1853,12 @@ fn a_non_finite_logits_row_is_refused_not_sampled() {
     );
 }
 
-/// The greedy paths deliberately do **not** refuse a `NaN` row: they mirror the
-/// device reduction, which skips `NaN` and returns the largest real logit, and
-/// diverging from it would re-create the host/device split this contract
-/// exists to close. Pinned so the asymmetry is a decision rather than an
-/// oversight — the sampling path refuses because its failure is a constant
-/// stream, the greedy path does not because its answer is the device's.
+/// The greedy paths deliberately do **not** refuse a `NaN` row: the device path
+/// cannot refuse without an extra reduction per token, and the host path must
+/// choose what the device path chooses. Pinned so the asymmetry is a decision
+/// rather than an oversight — the sampling path refuses because its failure is
+/// a constant stream, the greedy path does not because its answer is the
+/// device's.
 #[test]
 fn greedy_does_not_refuse_a_nan_row_but_the_sampler_does() {
     let logits = f32_row(&[1.0, 3.0, f32::NAN, 2.0]);
@@ -1792,21 +1956,20 @@ fn compute_top_logprobs_breaks_ties_to_lowest_id() {
     );
 }
 
-/// `top_logprobs` is reported alongside the emitted token, computed from the
-/// same raw logits row the greedy path reduces, so rank 0 must be the token the
-/// device would emit on a `NaN` row too. Seeding the selection from a candidate
-/// rather than from `-inf` breaks exactly this: a `NaN` at the seed position
-/// wins the rank, because every later `>` and `==` against it is false.
+/// The top-logprob ranks list real logits ahead of a `NaN`. Seeding the
+/// selection from a candidate rather than from `-inf` breaks this: a `NaN` at
+/// the seed position wins the rank, because every later `>` and `==` against
+/// it is false.
+///
+/// Rank 0 is not compared with the emitted token here. On a `NaN` row the
+/// emitted token is MLX's `argmax`, which returns the `NaN` on mlx 0.32.3 and
+/// the real maximum on 0.32.1, and every logprob of the row is `NaN`.
 #[test]
-#[allow(
-    clippy::indexing_slicing,
-    reason = "top is built with exactly k = 2 entries immediately above"
-)]
 #[allow(
     clippy::unwrap_used,
     reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] I32 result, and sampler calls on inputs built in the same fn — all infallible by construction"
 )]
-fn compute_top_logprobs_skips_nan_like_the_device() {
+fn compute_top_logprobs_ranks_real_logits_ahead_of_nan() {
     // NaN at index 0 — the seed position of the first selection round.
     let logits = f32_row(&[f32::NAN, 1.0, 5.0, 2.0]);
     let out = compute_top_logprobs(&logits, 2, 2).unwrap();
@@ -1815,11 +1978,6 @@ fn compute_top_logprobs_skips_nan_like_the_device() {
         ids,
         vec![2, 3],
         "a NaN must not take a rank ahead of a real logit"
-    );
-    assert_eq!(
-        ids[0],
-        host_greedy(&logits, Device::Cpu),
-        "rank 0 must be the token the greedy path emits"
     );
 }
 
@@ -1952,13 +2110,15 @@ fn near_zero_temperature_is_a_uniform_draw_over_an_exact_tie() {
 
 // ── Device::Gpu mirrors ───────────────────────────────────────────────────
 //
-// `host_argmax` mirrors the **Metal** reduction, and the CPU tests above
-// cannot establish a Metal property — MLX's two backends are separate
-// implementations that are already known to differ on one shape (the `-inf`
-// vs `in[0]` seed). These re-run the tie contract on the real stream.
+// MLX's two backends are separate implementations, and on mlx 0.32.1 they
+// differ on one shape (a leading `NaN`: `-inf` against `in[0]` seed), so the
+// CPU tests above cannot establish a Metal property. These re-run the
+// contract on the real stream.
 //
-// `#[ignore]`d per the workspace rule for tests that reach `Device::Gpu`; run
-// via `make gpu-test CRATE=rmlx-models FILTER=tie`.
+// `#[ignore]`d per the workspace rule for tests that reach `Device::Gpu`.
+// `make gpu-test` filters on the bare function name. No substring selects only
+// these six; `make gpu-test CRATE=rmlx-models FILTER=_gpu` runs them with four
+// other `_gpu` tests of the crate.
 
 /// Metal's `argmax` must break ties to the lowest index at every width,
 /// including a width that crosses its multi-threadgroup reduction strategy.
@@ -2010,24 +2170,19 @@ fn host_greedy_matches_device_argmax_on_a_bf16_tie_gpu() {
     );
 }
 
-/// `host_argmax` claims a `NaN` never displaces a real maximum *on the device*.
-/// The CPU test of that claim is weak — MLX's CPU backend seeds its reduction
-/// with `in[0]`, so it skips a mid-row `NaN` for a reason Metal does not share.
-/// This is the mirror that actually checks Metal.
+/// The `NaN` rows on Metal. On mlx 0.32.1 the Metal and the CPU reductions
+/// disagree on a leading `NaN`, so the CPU test cannot stand in for this one.
 #[test]
 #[ignore = "reaches Device::Gpu; run via make gpu-test"]
-fn host_greedy_skips_nan_like_the_device_gpu() {
-    let logits = f32_row(&[1.0, 3.0, f32::NAN, 2.0]);
-    let device_id = device_argmax(&logits, Device::Gpu);
-    let host_id = host_greedy(&logits, Device::Gpu);
-    assert_eq!(
-        host_id, device_id,
-        "NaN row: host greedy picked {host_id}, Metal argmax picked {device_id}"
-    );
-    assert_eq!(
-        device_id, 1,
-        "Metal must skip the NaN and take the real max"
-    );
+fn host_greedy_matches_device_argmax_on_nan_rows_gpu() {
+    check_host_greedy_on_nan_rows(Device::Gpu);
+}
+
+/// The masked `NaN` rows on Metal.
+#[test]
+#[ignore = "reaches Device::Gpu; run via make gpu-test"]
+fn masked_greedy_paths_agree_and_stay_allowed_on_nan_rows_gpu() {
+    check_masked_greedy_on_nan_rows(Device::Gpu);
 }
 
 /// The all-`-inf` row is the one shape where the `-inf` seed is never
@@ -2035,7 +2190,7 @@ fn host_greedy_skips_nan_like_the_device_gpu() {
 /// property of its seeding rather than of its comparisons — and the CPU test
 /// **cannot fail**, because MLX's CPU backend seeds with `in[0]` and so returns
 /// 0 by construction whatever Metal does. This is the only check with power
-/// over `host_argmax`'s third documented bullet.
+/// over the id 0 that `docs/SAMPLING.md` documents for this row.
 ///
 /// The row is deliberately wide enough to cross the single- to
 /// multi-threadgroup boundary. If this fails, that bullet is wrong and needs
@@ -2054,25 +2209,29 @@ fn all_neg_inf_row_agrees_with_metal_gpu() {
         );
         assert_eq!(
             device_id, 0,
-            "width {width}: host_argmax documents id 0 for an all -inf row"
+            "width {width}: docs/SAMPLING.md documents id 0 for an all -inf row"
         );
     }
 }
 
-/// BF16 is the high half-word of the F32 pattern:
-/// `0x3F80` = 1.0, `0x4000` = 2.0, `0x4020` = 2.5, `0x4080` = 4.0.
-/// Tied maxima at index 1 and index 3.
+/// The BF16 quiet `NaN` pattern.
+const BF16_NAN: u16 = 0x7FC0;
+
+/// Wrap BF16 bit patterns as a `[1, n]` BF16 Array. BF16 is the high half-word
+/// of the F32 pattern: `0x3F80` = 1.0, `0x4000` = 2.0, `0x4020` = 2.5,
+/// `0x4080` = 4.0, `0x40A0` = 5.0.
 #[allow(
     clippy::unwrap_used,
-    reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] I32 result, and sampler calls on inputs built in the same fn — all infallible by construction"
+    reason = "test fixture: from_bytes over 2 bytes per pattern with the matching [1, n] shape"
 )]
+fn bf16_row(patterns: &[u16]) -> Array {
+    let bytes: Vec<u8> = patterns.iter().flat_map(|p| p.to_le_bytes()).collect();
+    Array::from_bytes(&bytes, &[1, patterns.len() as i32], Dtype::Bf16).unwrap()
+}
+
+/// Tied BF16 maxima at index 1 and index 3.
 fn bf16_tie_row() -> Array {
-    let patterns: [u16; 5] = [0x4020, 0x4080, 0x3F80, 0x4080, 0x4000];
-    let mut bytes = Vec::with_capacity(patterns.len() * 2);
-    for p in patterns {
-        bytes.extend_from_slice(&p.to_le_bytes());
-    }
-    Array::from_bytes(&bytes, &[1, 5], Dtype::Bf16).unwrap()
+    bf16_row(&[0x4020, 0x4080, 0x3F80, 0x4080, 0x4000])
 }
 
 /// The same BF16 contract on the CPU stream, so the ordinary suite still

@@ -121,6 +121,8 @@ pub fn round_events(events: &[CapturedEvent]) -> Vec<CapturedEvent> {
 pub struct RoundStreamRecorder {
     events: std::sync::Mutex<Vec<CapturedEvent>>,
     asked: std::sync::Mutex<Vec<(String, tracing::Level, bool)>>,
+    /// `Some`: accept this target at every level and nothing else.
+    only_target: Option<&'static str>,
 }
 
 impl Default for RoundStreamRecorder {
@@ -128,6 +130,7 @@ impl Default for RoundStreamRecorder {
         Self {
             events: std::sync::Mutex::new(Vec::new()),
             asked: std::sync::Mutex::new(Vec::new()),
+            only_target: None,
         }
     }
 }
@@ -136,6 +139,17 @@ impl RoundStreamRecorder {
     #[must_use]
     pub fn new() -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self::default())
+    }
+
+    /// A recorder that accepts one target, TRACE included, and declines every
+    /// other callsite at every level, so it turns on no switch but that
+    /// target's own.
+    #[must_use]
+    pub fn for_target(target: &'static str) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            only_target: Some(target),
+            ..Self::default()
+        })
     }
 
     /// Every event this recorder accepted, in order.
@@ -186,7 +200,10 @@ impl tracing::Subscriber for RoundStreamRecorder {
         // target also carries every loop's round event at DEBUG. Declining the
         // target rather than the level would leave the capture with no round
         // at all while changing neither switch's answer.
-        let answer = *meta.level() <= tracing::Level::DEBUG;
+        let answer = match self.only_target {
+            Some(target) => meta.target() == target,
+            None => *meta.level() <= tracing::Level::DEBUG,
+        };
         self.asked
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

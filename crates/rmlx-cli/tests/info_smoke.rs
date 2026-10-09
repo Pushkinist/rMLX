@@ -88,7 +88,7 @@ mod rmlx_cli_test_helper {
 
         // Just assert we can derive the fields — the real println! output is
         // tested by the smoke run in OUTCOME.
-        assert!(!cfg.architectures.is_empty());
+        assert_ne!(cfg.architectures.len(), 0);
         assert!(total > 0);
     }
 }

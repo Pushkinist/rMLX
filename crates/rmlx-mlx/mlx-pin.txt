@@ -11,10 +11,11 @@
 # exists to buy — a version match alone is not evidence, because bottle
 # contents vary by build runner.
 #
-# Why these versions, and how to un-pin once Homebrew's bottle is fixed:
-# docs/FFI.md -> "Pinned MLX / mlx-c pair".
+# Why these versions: docs/FFI.md -> "Pinned MLX / mlx-c pair".
+# How to build them: docs/MLX_PAIR.md.
 #
-# Format: <formula> <version>. The mlx-c version carries the Homebrew revision
-# suffix (`_2`), which is load-bearing: same upstream 0.6.0, different build.
-mlx    0.31.2
-mlx-c  0.6.0_2
+# Format: <formula> <version>, the Homebrew keg directory name. A Homebrew
+# revision suffix (`0.6.0_4`) is part of the name: same upstream version,
+# different build.
+mlx    0.32.3
+mlx-c  0.7.0

@@ -722,7 +722,7 @@ fn pipelined_decode_host_path_emits_the_argmax_stream() {
     );
     assert_eq!(greedy, sampled, "temperature path over a one-hot softmax");
 
-    // A repetition penalty at temperature 0 takes the host argmax path. The
+    // A repetition penalty at temperature 0 takes the host penalty path. The
     // window holds ids 0 and 1, and 40.0 / 1.1 still dominates the zeros.
     let penalised = ids_for(
         &greedy_cfg(),
@@ -731,7 +731,7 @@ fn pipelined_decode_host_path_emits_the_argmax_stream() {
             ..PenaltyConfig::default()
         },
     );
-    assert_eq!(greedy, penalised, "host argmax-with-penalties path");
+    assert_eq!(greedy, penalised, "host penalty path");
 }
 
 /// A scripted forward that serves `rows` and then fails on call `fail_at`
@@ -1155,4 +1155,209 @@ fn chunked_prefill_logs_the_chunk_it_cut_at() {
     assert_eq!(field("n_chunks").as_deref(), Some("3"));
     assert_eq!(field("arch").as_deref(), Some("Qwen3ForCausalLM"));
     assert_eq!(seen, vec![4], "prefill did not cut at the chunk it logged");
+}
+
+// ── The replayed first token of an exact prompt-cache hit ────────────────────
+
+/// Records each `advance` in a log that the step callback also writes to.
+#[derive(Debug)]
+struct RecordAdvance(Arc<Mutex<Vec<String>>>);
+impl ConstraintEngine for RecordAdvance {
+    fn step_mask(&mut self, _vocab_size: usize) -> &[bool] {
+        &[]
+    }
+    #[allow(clippy::unwrap_used)]
+    fn advance(&mut self, token_id: u32) {
+        self.0.lock().unwrap().push(format!("advance {token_id}"));
+    }
+    fn finished(&self) -> bool {
+        false
+    }
+}
+
+fn replayed(token_id: u32) -> ProbeStep {
+    ProbeStep {
+        token_id,
+        piece: "x".to_owned().into_boxed_str(),
+        max_abs_logit: 0.0,
+        nan_count: 0,
+        logprobs: None,
+    }
+}
+
+#[test]
+#[allow(clippy::unwrap_used)]
+fn a_replayed_token_is_shown_to_the_constraint_before_the_step_callback() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut engine = RecordAdvance(Arc::clone(&log));
+    let mut constraint: Option<&mut dyn ConstraintEngine> = Some(&mut engine);
+    let mut step_fn = |s: &ProbeStep| {
+        log.lock().unwrap().push(format!("step {}", s.token_id));
+        None
+    };
+    let (mut steps, mut history) = (Vec::new(), vec![5]);
+    let ends = emit_replayed_token(
+        &mut constraint,
+        &mut step_fn,
+        &mut steps,
+        &mut history,
+        &[9],
+        replayed(7),
+    );
+    assert_eq!(*log.lock().unwrap(), ["advance 7", "step 7"]);
+    assert_eq!(steps.len(), 1);
+    assert_eq!(history, [5, 7]);
+    assert!(!ends);
+}
+
+#[test]
+fn a_replayed_eos_token_ends_the_generation_and_no_constraint_is_needed() {
+    let mut constraint: Option<&mut dyn ConstraintEngine> = None;
+    let mut seen = Vec::new();
+    let mut step_fn = |s: &ProbeStep| {
+        seen.push(s.token_id);
+        None
+    };
+    let (mut steps, mut history) = (Vec::new(), Vec::new());
+    let ends = emit_replayed_token(
+        &mut constraint,
+        &mut step_fn,
+        &mut steps,
+        &mut history,
+        &[9],
+        replayed(9),
+    );
+    assert!(ends);
+    assert_eq!(seen, [9]);
+    assert_eq!(history, [9]);
+}
+
+/// The code of a Rust source file: `//` comments removed and the body of each
+/// string literal blanked, by the readers of `scripts/lib/awk_text.sh`.
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test-only: a panic names the source file that cannot be read"
+)]
+fn code_of(path: &std::path::Path) -> String {
+    let readers =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/lib/awk_text.sh");
+    let out = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(r#". "$1"; awk "${AWK_TEXT_FNS}"'{ print blank_strings(decomment($0)) }' "$2""#)
+        .arg("code_of")
+        .arg(&readers)
+        .arg(path)
+        .output()
+        .expect("bash must run");
+    assert!(out.status.success(), "{}: {out:?}", path.display());
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// The code of each decode loop that takes an exact prompt-cache hit.
+#[allow(
+    clippy::unwrap_used,
+    reason = "test-only: a panic names the source tree that cannot be read"
+)]
+fn exact_hit_loop_sources() -> Vec<(String, String)> {
+    #[allow(
+        clippy::unwrap_used,
+        reason = "test-only: a panic names the source file that cannot be read"
+    )]
+    fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs")
+                && !name.ends_with("tests.rs")
+                && name != "prompt_cache.rs"
+            {
+                let code = code_of(&path);
+                if code.contains("Consumed::Exact") {
+                    out.push((path.to_string_lossy().into_owned(), code));
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut out,
+    );
+    out
+}
+
+/// `true` when each step callback of `code` has a constraint `advance` in the
+/// four lines before it.
+fn every_step_follows_an_advance(code: &str) -> bool {
+    let lines: Vec<&str> = code.lines().collect();
+    lines.iter().enumerate().all(|(at, line)| {
+        !(line.contains("step_fn(") || line.contains("step_fn)("))
+            || lines
+                .get(at.saturating_sub(4)..at)
+                .is_some_and(|before| before.iter().any(|l| l.contains(".advance(")))
+    })
+}
+
+/// `true` when `code` replays the first token of each exact hit through
+/// `emit_replayed_token` with the loop's constraint, or, with no such call,
+/// calls `advance` before each step callback.
+fn shows_the_replayed_token_to_the_constraint(code: &str) -> bool {
+    let arms = code.matches("Consumed::Exact").count();
+    let calls: Vec<&str> = code.split("emit_replayed_token(").skip(1).collect();
+    if calls.is_empty() {
+        return every_step_follows_an_advance(code);
+    }
+    calls.len() == arms
+        && calls
+            .iter()
+            .all(|args| args.trim_start().starts_with("&mut constraint,"))
+}
+
+/// The loops with an exact hit are counted, so a loop that the scan loses, or
+/// a new loop, makes this test state its rule again.
+#[test]
+fn every_exact_hit_loop_shows_the_replayed_token_to_the_constraint_first() {
+    let sources = exact_hit_loop_sources();
+    assert_eq!(sources.len(), 8, "the loops with an exact hit");
+    for (path, code) in sources {
+        // The reader removes `//` comments only.
+        assert!(!code.contains("/*"), "{path}: a block comment");
+        assert!(
+            shows_the_replayed_token_to_the_constraint(&code),
+            "{path}: the replayed first token does not reach the constraint before the step callback"
+        );
+    }
+}
+
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: a panic names the fixture step that failed"
+)]
+fn the_source_rule_reads_calls_and_order_and_not_comments_or_strings() {
+    let by_hand = "Consumed::Exact(e) => {\nstep_fn(steps.last());\n}";
+    let shown = "Consumed::Exact(e) => {\nc.advance(next);\nlet forced = step_fn(&step);\n}";
+    let late = "Consumed::Exact(e) => {\n(ctx.step_fn)(&step);\nc.advance(next);\n}";
+    let call = "Consumed::Exact(e) => {\nemit_replayed_token(\n    &mut constraint,\n);\n}";
+    let no_constraint = call.replace("&mut constraint,", "&mut None,");
+    let two_arms = format!("{call}\n{by_hand}");
+    assert!(shows_the_replayed_token_to_the_constraint(shown));
+    assert!(shows_the_replayed_token_to_the_constraint(call));
+    assert!(!shows_the_replayed_token_to_the_constraint(by_hand));
+    assert!(!shows_the_replayed_token_to_the_constraint(late));
+    assert!(!shows_the_replayed_token_to_the_constraint(&no_constraint));
+    assert!(!shows_the_replayed_token_to_the_constraint(&two_arms));
+
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let file = dir.path().join("loop.rs");
+    let source = format!(
+        "// emit_replayed_token(&mut constraint, ...)\nlet s = \"emit_replayed_token(\";\n{by_hand}\n"
+    );
+    std::fs::write(&file, source).expect("write the source");
+    let code = code_of(&file);
+    assert!(!code.contains("emit_replayed_token("), "{code}");
+    assert!(!shows_the_replayed_token_to_the_constraint(&code));
 }

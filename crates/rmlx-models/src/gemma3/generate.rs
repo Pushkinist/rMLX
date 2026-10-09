@@ -534,18 +534,21 @@ fn exact_hit_decode<'a>(
         "gemma3 generate_greedy: prompt cache EXACT HIT"
     );
 
-    step_fn(steps.push_mut(ProbeStep {
-        token_id: last_id,
-        piece: piece.into_boxed_str(),
-        max_abs_logit: 0.0,
-        nan_count: 0,
-        logprobs: None,
-    }));
-    // exact-hit token into history.
-    token_history.push(last_id);
-
-    // EOS-stop. If the cached first token is an EOS, no decode steps.
-    if eos_ids.contains(&last_id) {
+    let ends = crate::decode_loop::emit_replayed_token(
+        &mut constraint,
+        step_fn,
+        &mut steps,
+        token_history,
+        eos_ids,
+        ProbeStep {
+            token_id: last_id,
+            piece: piece.into_boxed_str(),
+            max_abs_logit: 0.0,
+            nan_count: 0,
+            logprobs: None,
+        },
+    );
+    if ends {
         return Ok(steps);
     }
 

@@ -16,7 +16,7 @@ use rmlx_core::apple_gpu::parse_apple_generation;
 
 use super::{
     contains_nax_kernel, evaluate, is_na_class, loaded_library_path, loaded_metallib_path,
-    loaded_metallib_scan, loaded_nax_capability, KernelScan, NaxFinding, LIBMLX_FILE,
+    loaded_metallib_scan, loaded_nax_capability, nax_fix, KernelScan, NaxFinding, LIBMLX_FILE,
     METALLIB_FILE, NAX_GEMM_KERNEL,
 };
 
@@ -474,4 +474,26 @@ fn metallib_path_is_the_sibling_of_the_loaded_libmlx() {
         metallib.file_name().and_then(|n| n.to_str()),
         Some(METALLIB_FILE)
     );
+}
+
+/// Each macOS band gets its own fix, and the band edges are the ones MLX's
+/// build gate and the Homebrew bottles set: 26.2 for a source build, 27 for
+/// the bottle.
+#[test]
+fn the_fix_named_follows_the_macos_version() {
+    for (macos, needle) in [
+        (Some((27, 0)), "brew upgrade mlx"),
+        (Some((28, 1)), "brew upgrade mlx"),
+        (
+            Some((26, 2)),
+            "xcodebuild -downloadComponent MetalToolchain",
+        ),
+        (Some((26, 6)), "26.2 deployment target"),
+        (Some((26, 1)), "no fix exists below macOS 26.2"),
+        (Some((15, 7)), "no fix exists below macOS 26.2"),
+        (None, "could not be read"),
+    ] {
+        let fix = nax_fix(macos);
+        assert!(fix.contains(needle), "{macos:?}: {fix}");
+    }
 }

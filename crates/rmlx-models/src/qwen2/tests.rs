@@ -24,13 +24,13 @@ fn integration_qwen2_readerlm() {
     let Some(model_dir_buf) =
         std::env::var_os("RMLX_TEST_MODEL_READERLM_V2").map(std::path::PathBuf::from)
     else {
-        eprintln!("integration_qwen2_readerlm: skipping: RMLX_TEST_MODEL_READERLM_V2 not set");
+        eprintln!("SKIP integration_qwen2_readerlm: RMLX_TEST_MODEL_READERLM_V2 not set");
         return;
     };
     let model_dir = model_dir_buf.as_path();
     if !model_dir.exists() {
         eprintln!(
-            "integration_qwen2_readerlm: snapshot absent at {}, skipping",
+            "SKIP integration_qwen2_readerlm: snapshot absent at {}",
             model_dir.display()
         );
         return;

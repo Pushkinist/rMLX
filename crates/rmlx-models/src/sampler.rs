@@ -24,7 +24,8 @@
 //! ```
 //!
 //! When only a constraint mask is present (no temperature):
-//! `apply_mask_argmax` keeps the argmax on-GPU with an additive -Inf bias.
+//! `apply_mask_argmax` keeps the argmax on-GPU and replaces each forbidden
+//! logit with -Inf.
 //!
 //! ## Host path: everything else
 //!
@@ -41,7 +42,7 @@
 //! 7. top_p (nucleus) — ascending cumsum, keep where cum > 1-p
 //! → min_p — keep where prob >= max_prob * min_p
 //! → top_k — keep top-k, zero rest
-//! 8. inverse-CDF sample — seeded PCG32; or argmax if temp==0 + penalties
+//! 8. inverse-CDF sample — seeded PCG32; at temp == 0, MLX argmax of the row
 //! ```
 //!
 //! Steps 2–5 are [`apply_penalties`] (mlx-lm `make_logits_processors` L106-126
@@ -62,17 +63,17 @@
 //!
 //! When `response_format ∈ {json_object, json_schema}` and `temp == 0`:
 //!
-//! 1. Build a F32 bias buffer on the host: `0.0` for allowed tokens,
-
-//! 2. Wrap as `[1, vocab]` F32 MLX array.
-//! 3. `add(logits, bias)` — GPU op; result is F32 regardless of input dtype.
-//! 4. `argmax` along axis -1 — produces `[1] I32`.
+//! 1. Build a U8 allow buffer on the host: `1` for allowed tokens, `0` for
+//!    forbidden ones.
+//! 2. Wrap as a `[1, vocab]` U8 MLX array.
+//! 3. `where_cond(allow, logits, -inf)` — GPU op, in the logit dtype.
+//! 4. `argmax` along axis -1 — produces `[1]`.
 //!
-//! The host-side bias fill is O(vocab) writes per step.
+//! The host-side fill is O(vocab) writes per step.
 
 #![allow(clippy::float_cmp)]
 use rmlx_core::error::{Error, Result};
-use rmlx_mlx::{add, argmax, Array, Device, Dtype};
+use rmlx_mlx::{argmax, scalar_f32, where_cond, Array, Device, Dtype};
 
 // ===========================================================================
 // Host-side categorical sampler
@@ -291,11 +292,15 @@ pub fn apply_penalties(
     }
 }
 
-/// Return a `[1] I32` Array containing the host-argmax of `logits_flat` after
-/// applying penalties. Used for the `temp == 0 AND penalties_active` path.
+/// Greedy token of `logits_flat` after the constraint mask and the penalties,
+/// as the `[1]` index array `argmax(&logits_flat, -1, device)` returns. Used
+/// for the `temp == 0 AND penalties_active` path.
 ///
-/// One GPU→host transfer per call; the penalty + argmax are done on the CPU.
-/// The result has the exact same shape/dtype as `argmax(&logits_flat, -1, device)`.
+/// The mask and the penalties are applied on the host, after one GPU→host
+/// transfer. The selection is MLX's `argmax` on `device`, the op the device
+/// greedy path runs, so the two paths choose the same token on every row. A
+/// host scan cannot do that for a row with a `NaN`: mlx 0.32.3 returns the
+/// first `NaN` (ml-explore/mlx#4291), and older versions skip it.
 #[allow(
     clippy::indexing_slicing,
     reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
@@ -307,7 +312,6 @@ pub fn argmax_with_penalties(
     recent_tokens: &[u32],
     device: Device,
 ) -> Result<Array> {
-    let _ = device; // kept for call-site symmetry with sample_token_array
     let vocab = match logits_flat.shape().last() {
         Some(&v) if v > 0 => v as usize,
         _ => {
@@ -350,11 +354,10 @@ pub fn argmax_with_penalties(
         &penalty_cfg.logit_bias,
     );
 
-    // Host argmax, under the same tie rule as the device reduction.
-    let chosen = host_argmax(&logits) as i32;
-
-    Array::from_bytes(&chosen.to_le_bytes(), &[1], Dtype::I32)
-        .map_err(|e| Error::Other(format!("argmax_with_penalties: id array build failed: {e}")))
+    let row = Array::from_f32_slice(&logits, &[1, vocab as i32])
+        .map_err(|e| Error::Other(format!("argmax_with_penalties: row build failed: {e}")))?;
+    argmax(&row, -1, device)
+        .map_err(|e| Error::Other(format!("argmax_with_penalties: argmax failed: {e}")))
 }
 
 /// An all-forbidden constraint mask is a constraint-engine defect, not a mode:
@@ -388,44 +391,6 @@ fn reject_all_forbidden(any_allowed: bool, site: &'static str, vocab: usize) -> 
         "{site}: constraint mask forbids every one of {vocab} tokens; \
          no token can satisfy the grammar at this step"
     )))
-}
-
-/// Index of the maximum of `logits`, resolving ties to the **lowest** index.
-///
-/// This is the host mirror of the MLX `argmax` reduction that every greedy
-/// decode path dispatches on the device. It accumulates with a strict `>` from
-/// a `-inf` seed, which gives three properties the device reduction also has:
-/// equal values never displace the earlier index, a `NaN` never displaces a
-/// real maximum, and an all-`-inf` row yields `0`.
-///
-/// The `-inf` seed is the **Metal** reduction's seed, which is the production
-/// stream. MLX's CPU backend seeds with element 0 instead, so the two disagree
-/// on exactly one shape — a `NaN` at index 0 — and no host rule can match both.
-/// Everywhere else the two MLX backends agree with each other and with this.
-///
-/// The all-`-inf` bullet is the weakest of the three, and the `#[ignore]`d
-/// `Device::Gpu` mirror is what checks it: it is the only row where the `-inf`
-/// seed is never displaced, so what a multi-threadgroup Metal arg-reduce
-/// returns is a property of the reduction's seeding rather than of its
-/// comparisons, and the CPU-stream test cannot fail it (MLX's CPU backend
-/// seeds with `in[0]`, so it returns 0 by construction whatever Metal does).
-/// The row is no longer reachable through a constraint mask — that case now
-/// errors — but it stays documented because the function still has to answer.
-///
-/// Greedy selection must not depend on which side of the FFI boundary it runs,
-/// so host greedy goes through here rather than `Iterator::max_by` — which
-/// returns the *last* maximum, and which lets a `NaN` reset the running best
-/// because `partial_cmp` is `None` on it.
-fn host_argmax(logits: &[f32]) -> usize {
-    let mut best_idx = 0usize;
-    let mut best_val = f32::NEG_INFINITY;
-    for (i, &l) in logits.iter().enumerate() {
-        if l > best_val {
-            best_val = l;
-            best_idx = i;
-        }
-    }
-    best_idx
 }
 
 // ===========================================================================
@@ -1203,14 +1168,14 @@ pub struct TokenLogprobs {
 /// partial selection sort over a `(prob, id)` vector — `O(vocab * k)`, fine for
 /// the `k <= 20` OpenAI cap.
 ///
-/// Equal logits rank by ascending token id, so rank 0 is the same token the
-/// device `argmax` would return and ranks `1..k` are reproducible rather than
-/// an artefact of the selection's swaps. The selection compares on
+/// Equal logits rank by ascending token id, so on a row without a `NaN` rank 0
+/// is the token the device `argmax` returns, and ranks `1..k` are reproducible
+/// rather than an artefact of the selection's swaps. The selection compares on
 /// `(logit, lowest id)`, which is a total order on the remaining candidates —
 /// it therefore does not care that `idx.swap` leaves the unscanned suffix in an
 /// arbitrary order, which a positional tiebreak would. It is seeded from
-/// outside the candidate set for the same reason [`host_argmax`] is, so a
-/// `NaN` never takes a rank ahead of a real logit.
+/// outside the candidate set, so a `NaN` never takes a rank ahead of a real
+/// logit. On a row with a `NaN` every logprob is `NaN`.
 #[allow(
     clippy::indexing_slicing,
     reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
@@ -1259,11 +1224,10 @@ pub fn compute_top_logprobs(
     let mut idx: Vec<usize> = (0..vocab).collect();
     let mut top: Vec<(u32, f32)> = Vec::with_capacity(k);
     for slot in 0..k {
-        // Seeded from OUTSIDE the candidate set, exactly as `host_argmax` is:
-        // `-inf` for the value, `usize::MAX` for the id. Seeding from the
-        // candidate at `slot` would let a `NaN` sitting there win the rank —
-        // every later `>` and `==` against it is false — and rank 0 would then
-        // disagree with the device `argmax`, which skips `NaN` entirely.
+        // Seeded from OUTSIDE the candidate set: `-inf` for the value,
+        // `usize::MAX` for the id. Seeding from the candidate at `slot` would
+        // let a `NaN` sitting there win the rank, because every later `>` and
+        // `==` against it is false.
         let mut best_pos = slot;
         let mut best_val = f32::NEG_INFINITY;
         let mut best_id = usize::MAX;
@@ -1287,20 +1251,16 @@ pub fn compute_top_logprobs(
     })
 }
 
-/// F32 negative infinity as a bit pattern. Used to fill forbidden positions.
-/// `0xFF800000` is the IEEE 754 bit pattern for F32 -Infinity.
-const NEG_INF_F32_BITS: u32 = 0xFF80_0000u32;
-
 /// Apply a boolean allow-mask to `logits` and return the argmax token id as
-/// a `[1]` I32 Array (same shape contract as the existing
-/// `argmax(&logits_flat, -1, device)` call site).
+/// the `[1]` index array `argmax(&logits_flat, -1, device)` returns.
 ///
 /// # Implementation
 ///
-/// Builds a F32 bias array (0.0 = allowed, -Inf = forbidden), adds it to the
-/// logits (casting to F32 if needed), then calls `argmax`. This keeps the
-/// heavy work on the GPU and avoids materialising the full logit buffer on
-/// the host.
+/// Builds a U8 allow array (1 = allowed, 0 = forbidden), replaces each
+/// forbidden logit with `-inf` on the GPU (`where_cond`), then calls `argmax`.
+/// A replacement, not an additive `-inf` bias: `NaN + -inf` is `NaN`, so a
+/// bias leaves a forbidden `NaN` in the row, and an `argmax` that returns the
+/// first `NaN` (mlx 0.32.3) chooses it.
 ///
 /// # Contract
 ///
@@ -1313,52 +1273,21 @@ const NEG_INF_F32_BITS: u32 = 0xFF80_0000u32;
 ///
 /// The `device` parameter selects the MLX stream for the GPU ops.
 #[inline(never)]
-#[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-)]
 pub fn apply_mask_argmax(logits_flat: &Array, mask: &[bool], device: Device) -> Result<Array> {
     let vocab = mask.len();
-
-    // ── 1. Build the F32 bias buffer on the host ────────────────────────────
-    // Allocate once; fill in one pass. Two hot values: 0.0 and -Inf.
-    let neg_inf_bytes = NEG_INF_F32_BITS.to_le_bytes();
-    let zero_bytes = 0f32.to_le_bytes();
-
-    let mut bias_bytes: Vec<u8> = vec![0u8; vocab * 4];
-    let mut any_allowed = false;
-    for (i, &allowed) in mask.iter().enumerate() {
-        if allowed {
-            any_allowed = true;
-        } else {
-            let off = i * 4;
-            bias_bytes[off..off + 4].copy_from_slice(&neg_inf_bytes);
-        }
-    }
-    reject_all_forbidden(any_allowed, "apply_mask_argmax", vocab)?;
-    // Allowed entries are already 0.0 (zero_bytes) from vec initialisation.
-    let _ = zero_bytes; // suppress unused warning
-
-    // ── 2. Wrap as [1, vocab] F32 MLX array ────────────────────────────────
-    let bias = Array::from_bytes(&bias_bytes, &[1, vocab as i32], Dtype::F32)?;
-
-    // ── 3. Validate dtype ──────────────────────────────────────────────────
+    reject_all_forbidden(mask.contains(&true), "apply_mask_argmax", vocab)?;
     let dtype = logits_flat.dtype();
     if dtype != Dtype::F32 && dtype != Dtype::Bf16 {
         return Err(Error::Other(format!(
             "apply_mask_argmax: unsupported logit dtype {dtype:?}; expected F32 or BF16"
         )));
     }
-
-    // ── 4. Add bias: forbidden tokens get -Inf, allowed stay unchanged ──────
-    // MLX promotes BF16+F32 to F32 automatically; the bias is F32 so the
-    // result of add is F32 regardless of input dtype.
-    let biased = add(logits_flat, &bias, device)
-        .map_err(|e| Error::Other(format!("apply_mask_argmax: add failed: {e}")))?;
-
-    // ── 5. Argmax along last axis ───────────────────────────────────────────
-    // axis = -1 selects the vocab dimension of [1, vocab], producing [1] I32.
-    argmax(&biased, -1, device)
+    let allow_bytes: Vec<u8> = mask.iter().map(|&allowed| u8::from(allowed)).collect();
+    let allow = Array::from_bytes(&allow_bytes, &[1, vocab as i32], Dtype::U8)?;
+    let neg_inf = scalar_f32(f32::NEG_INFINITY).astype(dtype, device)?;
+    let masked = where_cond(&allow, logits_flat, &neg_inf, device)
+        .map_err(|e| Error::Other(format!("apply_mask_argmax: where failed: {e}")))?;
+    argmax(&masked, -1, device)
         .map_err(|e| Error::Other(format!("apply_mask_argmax: argmax failed: {e}")))
 }
 

@@ -71,6 +71,7 @@ fn bonsai_golden_tokens_mixed() {
         return;
     };
     common::run_golden_test(
+        "bonsai_golden_tokens_mixed",
         "bonsai_8b_mixed_k8g64_v4g64_floor8",
         KvQuant::Mixed {
             k_bits: 8,
@@ -96,7 +97,12 @@ fn bonsai_golden_tokens_none() {
     let Some(model_path) = common::model_for(&MODEL, "bonsai_golden_tokens_none") else {
         return;
     };
-    common::run_golden_test("bonsai_8b_none", KvQuant::None, &model_path);
+    common::run_golden_test(
+        "bonsai_golden_tokens_none",
+        "bonsai_8b_none",
+        KvQuant::None,
+        &model_path,
+    );
 }
 
 /// thinking_budget forced injection on the Exact-hit decode path (Qwen3ForCausalLM).

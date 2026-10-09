@@ -14,6 +14,7 @@ use super::{
     is_keg_version, keg_version_from, parse_pin, pin_check, verdict, Library, LinkedPair, MlxPin,
     PinVerdict, PIN_SRC,
 };
+use crate::c_api::{CApi, CApiVerdict};
 use crate::nax::KernelScan;
 use crate::nax::{loaded_library_path, NAX_GEMM_KERNEL};
 
@@ -33,6 +34,7 @@ fn pin() -> MlxPin {
 /// about that one thing and not about the fixture.
 fn pinned_pair() -> LinkedPair {
     LinkedPair {
+        c_api: CApiVerdict::Match(CApi::V0_6),
         mlx: keg("mlx", "0.31.2", "libmlx.dylib"),
         mlx_c: keg("mlx-c", "0.6.0_2", "libmlxc.dylib"),
         kernels: KernelScan::Scanned {
@@ -109,9 +111,9 @@ fn parse_pin_rejects_a_repeated_formula() {
 
 #[test]
 fn parse_pin_rejects_versions_that_are_not_keg_names() {
-    // These strings name directories the restore script removes, copies over
-    // and repoints symlinks at. `..` is the one that matters: it reaches the
-    // whole Cellar. The rest close the same door from other directions.
+    // These strings name the Cellar directories the restore script moves kegs
+    // to and links. `..` is the one that matters: it reaches the whole Cellar.
+    // The rest close the same door from other directions.
     for hostile in ["..", ".", "../mlx", "a/b", "-rf", "$(id)", "", "\u{7f}"] {
         assert!(
             !is_keg_version(hostile),
@@ -379,6 +381,42 @@ fn an_unreadable_metallib_is_unverified_not_absent() {
     assert!(!no_path.classify(&pin()).is_match());
 }
 
+/// A binary compiled against the other mlx-c C API cannot run attention on
+/// the pinned kegs, so the pin gate must not read green for it. Only a
+/// library dyld never listed outranks it.
+#[test]
+fn a_c_api_mismatch_outranks_every_finding_about_the_pair() {
+    let mut observed = pinned_pair();
+    observed.c_api = CApiVerdict::Mismatch {
+        compiled: CApi::V0_6,
+        loaded: CApi::V0_7,
+    };
+    observed.kernels = KernelScan::Scanned {
+        present: false,
+        metallib: PathBuf::from("/keg/lib/mlx.metallib"),
+    };
+    let found = observed.classify(&pin());
+    assert_eq!(
+        found,
+        PinVerdict::CApiMismatch {
+            compiled: CApi::V0_6,
+            loaded: CApi::V0_7,
+            pair: Box::new(PinVerdict::KernelsMissing {
+                metallib: PathBuf::from("/keg/lib/mlx.metallib"),
+                mlx: Some("0.31.2".to_owned()),
+            }),
+        }
+    );
+    assert!(!found.is_match());
+    assert!(found.report().contains("mlx-c C API mismatch"));
+
+    observed.mlx = Library::NotLoaded;
+    assert!(matches!(
+        observed.classify(&pin()),
+        PinVerdict::NotLoaded { .. }
+    ));
+}
+
 #[test]
 fn no_two_verdicts_read_the_same() {
     // The point of spelling every failure as its own variant is that an
@@ -407,6 +445,11 @@ fn no_two_verdicts_read_the_same() {
         PinVerdict::KernelsUnverified { metallib: None },
         PinVerdict::KernelsUnverified {
             metallib: Some(PathBuf::from("/keg/lib/mlx.metallib")),
+        },
+        PinVerdict::CApiMismatch {
+            compiled: CApi::V0_6,
+            loaded: CApi::V0_7,
+            pair: Box::new(pinned_pair().classify(&pin())),
         },
     ];
     let mut seen: Vec<String> = Vec::new();
@@ -529,8 +572,9 @@ fn the_gate_can_tell_which_host_it_is_on() {
         apple_silicon_generation().is_some(),
         "the chip could not be identified, so the pin gate cannot tell whether it applies"
     );
-    assert!(
-        pin_check().enforcement.host_is_known(),
+    assert_ne!(
+        pin_check().enforcement,
+        super::PinEnforcement::UnknownHost,
         "the verdict must carry the same answer the probe gave"
     );
 }
@@ -554,12 +598,11 @@ fn host_class_maps_onto_whether_the_pin_binds() {
     );
     assert_eq!(enforcement_for(None), PinEnforcement::UnknownHost);
 
-    // "Does not bind" and "cannot tell" must not be the same answer, and only
-    // one of them is a host the gate may quietly pass.
-    assert!(!enforcement_for(Some(7)).is_binding());
-    assert!(!enforcement_for(None).is_binding());
-    assert!(enforcement_for(Some(7)).host_is_known());
-    assert!(!enforcement_for(None).host_is_known());
+    // "Does not bind" and "cannot tell" must not be the same answer: only an
+    // identified host the pin does not bind may run off the pinned pair.
+    assert!(enforcement_for(Some(10)).requires_the_pinned_pair());
+    assert!(!enforcement_for(Some(7)).requires_the_pinned_pair());
+    assert!(enforcement_for(None).requires_the_pinned_pair());
 
     // Each state says something different out loud.
     let described: Vec<String> = [Some(10), Some(7), None]
@@ -576,6 +619,108 @@ fn host_class_maps_onto_whether_the_pin_binds() {
     );
 }
 
+/// A measurement refuses on an mlx-c C API mismatch on every host, and on a
+/// pair mismatch everywhere but an identified host the pin does not bind,
+/// each with its own cause. Over constructed checks, so the cells this
+/// machine cannot be in are covered too.
+#[test]
+fn the_measurement_refusal_covers_every_cell() {
+    use super::{PinCheck, PinEnforcement, PinRefusal};
+
+    let check = |matches, c_api_matches, enforcement| PinCheck {
+        matches,
+        c_api_matches,
+        enforcement,
+        detail: String::new(),
+    };
+    let binding = PinEnforcement::Binding;
+    let not_applicable = PinEnforcement::NotApplicable { gpu_family: 7 };
+    let unknown = PinEnforcement::UnknownHost;
+    for enforcement in [binding, not_applicable, unknown] {
+        assert_eq!(
+            check(false, false, enforcement).refusal(),
+            Some(PinRefusal::CApiMismatch),
+            "a C API mismatch must refuse on {enforcement:?}"
+        );
+        assert_eq!(
+            check(true, true, enforcement).refusal(),
+            None,
+            "the pinned pair must measure on {enforcement:?}"
+        );
+    }
+    assert_eq!(
+        check(false, true, binding).refusal(),
+        Some(PinRefusal::PairNotPinned)
+    );
+    assert_eq!(check(false, true, not_applicable).refusal(), None);
+    assert_eq!(
+        check(false, true, unknown).refusal(),
+        Some(PinRefusal::PairNotPinned),
+        "a host that could not be identified must not measure off the pinned pair"
+    );
+}
+
+/// A C API mismatch names the restore only where it is part of the fix: on a
+/// host that requires the pinned pair, when the loaded pair is not the pinned
+/// one. There a rebuild against the loaded mlx-c gives a binary that is
+/// refused again. Elsewhere a restore does not change the binary, so the line
+/// does not name it.
+#[test]
+fn a_c_api_mismatch_names_the_restore_only_when_the_pair_also_needs_it() {
+    use super::{detail, PinEnforcement};
+
+    let mismatch = CApiVerdict::Mismatch {
+        compiled: CApi::V0_7,
+        loaded: CApi::V0_6,
+    };
+    let off_pin = LinkedPair {
+        c_api: mismatch,
+        mlx: keg("mlx", "0.32.0", "libmlx.dylib"),
+        ..pinned_pair()
+    }
+    .classify(&pin());
+    let on_pin = LinkedPair {
+        c_api: mismatch,
+        ..pinned_pair()
+    }
+    .classify(&pin());
+    let restore = "make mlx-restore-pin";
+    for enforcement in [PinEnforcement::Binding, PinEnforcement::UnknownHost] {
+        let line = detail(&off_pin, enforcement, false);
+        assert!(
+            line.contains(restore) && line.contains("dyld resolved mlx 0.32.0"),
+            "off the pin on {enforcement:?}, the line must name the restore and the pair: {line}"
+        );
+        let line = detail(&on_pin, enforcement, false);
+        assert!(
+            !line.contains(restore),
+            "on the pinned pair a restore does not change the binary: {line}"
+        );
+    }
+    let line = detail(
+        &off_pin,
+        PinEnforcement::NotApplicable { gpu_family: 9 },
+        false,
+    );
+    assert!(
+        !line.contains(restore),
+        "where the pin does not bind, a rebuild against the loaded mlx-c is the fix: {line}"
+    );
+    assert!(line.contains("mlx-c C API mismatch"), "{line}");
+}
+
+/// `pin_check` hands the C API verdict to its callers, which is how a mismatch
+/// reaches the hosts the pin does not bind. On a matched pair both sides are
+/// true; only a cross-pair run (docs/MLX_PAIR.md, "Two mlx-c C APIs") makes
+/// them false.
+#[test]
+fn the_pin_check_carries_the_c_api_verdict() {
+    assert_eq!(
+        pin_check().c_api_matches,
+        matches!(crate::c_api::verdict(), CApiVerdict::Match(_)),
+    );
+}
+
 /// The MLX this process loaded is the pair `mlx-pin.txt` declares, and its
 /// metallib carries the kernels the pin exists to buy.
 ///
@@ -583,17 +728,19 @@ fn host_class_maps_onto_whether_the_pin_binds() {
 /// `opt` symlink that both dylibs' install names point at can move after the
 /// build, and cargo cannot see it move backwards.
 ///
-/// Scoped to Neural-Accelerator-class hosts, derived from the chip rather than
-/// from a list of machines. Earlier Apple Silicon legitimately ships zero of
-/// these kernels at every MLX version, so the pinned pair buys nothing there
-/// and demanding it would be noise on the majority of Macs.
+/// Scoped to Neural-Accelerator-class hosts and to hosts the chip probe cannot
+/// identify, derived from the chip rather than from a list of machines.
+/// Earlier Apple Silicon legitimately ships zero of these kernels at every MLX
+/// version, so the pinned pair buys nothing there and demanding it would be
+/// noise on the majority of Macs.
 #[test]
 fn linked_mlx_matches_the_pinned_pair() {
     let found = pin_check();
-    if found.enforcement.is_binding() {
+    if found.enforcement.requires_the_pinned_pair() {
         assert!(
             found.matches,
-            "this Mac has a GPU Neural Accelerator and is not running the validated MLX pair: {}",
+            "the pin binds this Mac, or its chip is unknown, and it is not running the validated \
+             MLX pair: {}",
             found.detail
         );
         return;

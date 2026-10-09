@@ -360,7 +360,7 @@ come back at K's dtype, as with `mx.quantize`.
 It is not bit-exact with `mx.quantize`. The cause is the affine
 parameterisation, not a width. MLX's `affine_quantize` loads and reduces in
 `float` and casts only at the store
-(`mlx/backend/metal/kernels/quantized.h:2460-2489` in 0.31.2). MLX starts from
+(`mlx/backend/metal/kernels/quantized.h:2577-2641` in 0.32.3). MLX starts from
 `w_max = 0`, takes `scale = max((w_max - w_min)/n_bins, eps)`, flips its sign
 toward the larger end, then snaps the zero-point: `q0 = round(edge/scale)`,
 `scale = edge/q0`, `bias = at_zero ? 0 : edge`.

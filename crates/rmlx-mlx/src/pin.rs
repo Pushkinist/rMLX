@@ -26,6 +26,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::c_api::{self, CApi, CApiVerdict};
 use crate::nax::{loaded_library_path, loaded_metallib_scan, KernelScan, NAX_GEMM_KERNEL};
 
 /// The validated pair, as checked in. Read at compile time from the same file
@@ -88,11 +89,11 @@ pub(crate) fn parse_pin(src: &str) -> Option<MlxPin> {
 
 /// Whether a token is shaped like a Homebrew keg directory name.
 ///
-/// An allowlist, not a sanity check. These values name directories under the
-/// Cellar that `scripts/mlx_restore_pin.sh` removes, copies over and repoints
-/// symlinks at, so a token such as `..` would reach far outside a keg. Keeping
-/// the rule here as well as in the shell means neither parser can be the one
-/// that accepts it.
+/// An allowlist, not a sanity check. These values name the Cellar directories
+/// that `scripts/mlx_restore_pin.sh` moves kegs to and links, and go into the
+/// Ruby text it gives `brew ruby`, so a token such as `..` would reach far
+/// outside a keg. Keeping the rule here as well as in the shell means neither
+/// parser can be the one that accepts it.
 fn is_keg_version(token: &str) -> bool {
     let mut chars = token.chars();
     chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
@@ -126,6 +127,8 @@ pub(crate) struct LinkedPair {
     pub(crate) mlx_c: Library,
     /// What the metallib scan established.
     pub(crate) kernels: KernelScan,
+    /// The mlx-c C API compiled in against the one of the loaded `libmlxc`.
+    pub(crate) c_api: CApiVerdict,
 }
 
 /// One half of the pair, as dyld resolved it.
@@ -164,6 +167,17 @@ pub(crate) enum PinVerdict {
     /// dyld has no image with this file name. In a binary that links MLX this
     /// means the image list could not be read, not that MLX is absent.
     NotLoaded { library: &'static str },
+    /// The loaded `libmlxc.dylib` has another C API than the one this binary
+    /// was compiled against, so attention cannot run. Outranks every finding
+    /// about the pair. `pair` is the verdict on the pair alone: where the
+    /// pinned pair is required (the pin binds, or the chip is not identified),
+    /// a pair that is not the pinned one needs the restore as well as the
+    /// rebuild.
+    CApiMismatch {
+        compiled: CApi,
+        loaded: CApi,
+        pair: Box<PinVerdict>,
+    },
     /// The metallib was read and does not carry the kernels — the expensive
     /// failure, and the one a version number cannot detect.
     KernelsMissing {
@@ -193,17 +207,34 @@ impl LinkedPair {
     /// Pure, and total over the observation: the whole matrix is exercised
     /// without a Homebrew install to point at.
     ///
-    /// Precedence is by cost, not by the order the facts were read. A missing
-    /// kernel family is reported ahead of a version disagreement because it is
-    /// the failure that is both expensive and invisible; a version
-    /// disagreement is reported ahead of the inconclusive states because it is
-    /// the one that is actually known to be wrong.
+    /// Precedence is by cost, not by the order the facts were read. An mlx-c
+    /// C API mismatch comes first after an unloaded library: attention cannot
+    /// run at all. It carries the verdict on the pair, because the fix also
+    /// depends on the pair.
     pub(crate) fn classify(&self, pin: &MlxPin) -> PinVerdict {
         for (half, library) in [(&self.mlx, MLX_LIB), (&self.mlx_c, MLX_C_LIB)] {
             if matches!(half, Library::NotLoaded) {
                 return PinVerdict::NotLoaded { library };
             }
         }
+        let pair = self.classify_pair(pin);
+        match self.c_api {
+            CApiVerdict::Mismatch { compiled, loaded } => PinVerdict::CApiMismatch {
+                compiled,
+                loaded,
+                pair: Box::new(pair),
+            },
+            CApiVerdict::Match(_) => pair,
+        }
+    }
+
+    /// Judge the kegs and the metallib, with the C API left out.
+    ///
+    /// A missing kernel family is reported ahead of a version disagreement
+    /// because it is the failure that is both expensive and invisible; a
+    /// version disagreement is reported ahead of the inconclusive states
+    /// because it is the one that is actually known to be wrong.
+    fn classify_pair(&self, pin: &MlxPin) -> PinVerdict {
         let metallib = match &self.kernels {
             KernelScan::Scanned {
                 present: false,
@@ -301,10 +332,13 @@ impl PinVerdict {
                 "dyld lists no {library} in this process, so the loaded MLX cannot be \
                  identified at all"
             ),
+            Self::CApiMismatch {
+                compiled, loaded, ..
+            } => c_api::mismatch_message(*compiled, *loaded),
             Self::KernelsMissing { metallib, mlx } => format!(
                 "{} (mlx {}) carries no {NAX_GEMM_KERNEL} kernels — GPU matmul and prefill \
                  run slower without them, while output and decode look normal. Repoint both halves of the pair to {PIN_FILE_DISPLAY} \
-                 and see docs/FFI.md",
+                 and see docs/MLX_PAIR.md",
                 metallib.display(),
                 mlx.as_deref().unwrap_or("version unreadable")
             ),
@@ -314,7 +348,7 @@ impl PinVerdict {
                 pinned,
             } => format!(
                 "dyld resolved {formula} {resolved}, but {PIN_FILE_DISPLAY} pins {pinned}. \
-                 mlx and mlx-c are ABI-coupled and repoint as a pair; see docs/FFI.md"
+                 mlx and mlx-c are ABI-coupled and repoint as a pair; see docs/MLX_PAIR.md"
             ),
             Self::NotAKeg { formula, resolved } => format!(
                 "the loaded {formula} is {}, which is not a Homebrew keg, so its version \
@@ -340,13 +374,18 @@ impl PinVerdict {
 ///
 /// Flat and stringly on purpose: [`PinVerdict`] stays crate-private so the
 /// judgement has exactly one producer, and callers outside this crate get the
-/// two bits they can act on — is it a match, and does it have to be.
+/// bits they can act on — is it a match, does it have to be, and can
+/// attention run at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PinCheck {
     /// Whether the loaded MLX is the pair `mlx-pin.txt` declares, with a
     /// metallib that carries the kernels the pin exists to buy.
     pub matches: bool,
+    /// Whether the loaded `libmlxc.dylib` has the C API this binary was
+    /// compiled against. `false` is a failure on every host, whatever
+    /// [`Self::enforcement`] says: attention cannot run.
+    pub c_api_matches: bool,
     /// Whether the pin binds this host, and whether that could be established.
     pub enforcement: PinEnforcement,
     /// One line naming what was found, and what disagreed or could not be
@@ -379,16 +418,19 @@ pub enum PinEnforcement {
 }
 
 impl PinEnforcement {
-    /// Whether a mismatch is a failure on this host.
+    /// Whether a pair that is not the pinned one is a failure on this host:
+    /// where the pin binds, and where the host could not be identified, so
+    /// that an unknown host does not pass without a check.
     #[must_use]
-    pub const fn is_binding(self) -> bool {
-        matches!(self, Self::Binding)
+    pub const fn requires_the_pinned_pair(self) -> bool {
+        !matches!(self, Self::NotApplicable { .. })
     }
 
-    /// Whether the host class itself could be established.
+    /// Whether this host refuses the loaded pair: a pair that does not pass
+    /// the pin, on a host that requires the pinned pair.
     #[must_use]
-    pub const fn host_is_known(self) -> bool {
-        !matches!(self, Self::UnknownHost)
+    pub const fn refuses_the_pair(self, pair_matches: bool) -> bool {
+        !pair_matches && self.requires_the_pinned_pair()
     }
 
     fn describe(self) -> String {
@@ -400,9 +442,43 @@ impl PinEnforcement {
                 "Apple GPU family {gpu_family} has no Neural Accelerator, so the pinned \
                  kernels do not exist for it and the pin does not bind here"
             ),
-            Self::UnknownHost => "the chip could not be identified, so whether the pin binds \
-                                  here is unknown"
+            Self::UnknownHost => "the chip could not be identified, so the pinned pair is \
+                                  required here"
                 .to_owned(),
+        }
+    }
+}
+
+/// Why a measurement must not run in this process. Each cause has its own fix.
+#[allow(
+    clippy::exhaustive_enums,
+    reason = "closed set of refusal causes; each caller names the fix per cause, so a new cause must not compile until every caller names its fix"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinRefusal {
+    /// The loaded `libmlxc.dylib` has another C API than the one this binary
+    /// was compiled against, on any host. The fix is a rebuild, and also the
+    /// restore where the pinned pair is required (the pin binds, or the chip
+    /// is not identified) and the loaded pair is not the pinned one.
+    CApiMismatch,
+    /// The loaded pair is not the pinned one, on a host that
+    /// [`PinEnforcement::requires_the_pinned_pair`]. The fix is the pinned
+    /// pair.
+    PairNotPinned,
+}
+
+impl PinCheck {
+    /// Why a measurement must not run in this process, or `None` when it may.
+    /// The one verdict that `rmlx baseline`, `rmlx bench`,
+    /// `rmlx healthcheck` and the preflight apply.
+    #[must_use]
+    pub const fn refusal(&self) -> Option<PinRefusal> {
+        if !self.c_api_matches {
+            Some(PinRefusal::CApiMismatch)
+        } else if self.enforcement.refuses_the_pair(self.matches) {
+            Some(PinRefusal::PairNotPinned)
+        } else {
+            None
         }
     }
 }
@@ -412,14 +488,44 @@ impl PinEnforcement {
 pub fn pin_check() -> PinCheck {
     let found = verdict();
     let enforcement = enforcement_for(rmlx_core::apple_gpu::apple_silicon_generation());
+    let c_api_matches = matches!(c_api::verdict(), CApiVerdict::Match(_));
     PinCheck {
         matches: found.is_match(),
+        c_api_matches,
         enforcement,
-        // The host class is in the operator-facing line, not only in the
-        // status: without it an inapplicable gate and a gate that could not
-        // tell read identically.
-        detail: format!("{} ({})", found.report(), enforcement.describe()),
+        detail: detail(&found, enforcement, c_api_matches),
     }
+}
+
+/// The operator-facing line of a pin check.
+///
+/// The host class is in the line, not only in the status: without it an
+/// inapplicable gate and a gate that could not tell read identically.
+fn detail(found: &PinVerdict, enforcement: PinEnforcement, c_api_matches: bool) -> String {
+    let scope = if c_api_matches {
+        enforcement.describe()
+    } else {
+        format!(
+            "{}; the C API mismatch fails on every host",
+            enforcement.describe()
+        )
+    };
+    let restore = if let PinVerdict::CApiMismatch { pair, .. } = found {
+        if enforcement.refuses_the_pair(pair.is_match()) {
+            format!(
+                " On this host a rebuild against the loaded mlx-c is refused for the pair: \
+                 the loaded pair does not pass the pin either ({}). Run \
+                 `make mlx-restore-pin` first, then rebuild if this binary was not built \
+                 against the pinned pair.",
+                pair.report()
+            )
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+    format!("{} ({scope}){restore}", found.report())
 }
 
 /// Map the probed Apple GPU family onto whether the pin binds.
@@ -445,6 +551,7 @@ fn observe() -> LinkedPair {
         mlx: resolve_library(MLX_LIB, MLX_FORMULA),
         mlx_c: resolve_library(MLX_C_LIB, MLX_C_FORMULA),
         kernels: loaded_metallib_scan().clone(),
+        c_api: c_api::verdict(),
     }
 }
 

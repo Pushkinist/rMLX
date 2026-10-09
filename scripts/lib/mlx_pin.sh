@@ -10,9 +10,9 @@
 # together. A file the Rust gate calls unusable must not be one these scripts
 # quietly proceed on.
 #
-# The version shape is an allowlist, not a sanity check: these values are
-# interpolated into `rm -rf`, `cp -R` and `ln -sfn` targets under the Cellar,
-# so a value like `..` would delete or repoint far more than a keg.
+# The version shape is an allowlist, not a sanity check: the restore script
+# puts these values in the Cellar paths it moves kegs to and in the Ruby text
+# it gives `brew ruby`, so a value like `..` would reach far outside a keg.
 
 # One keg version. Anchored, and the first character must be alphanumeric so
 # `.`, `..` and anything that reads as an option are rejected outright.

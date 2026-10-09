@@ -85,6 +85,7 @@ use rmlx_mlx::Device;
 use rmlx_models::arch;
 use rmlx_models::{Pcg32, PenaltyConfig, SamplerConfig};
 
+pub mod attention_calls;
 pub mod round_stream;
 
 #[cfg(test)]
@@ -156,12 +157,16 @@ pub fn regen_requested() -> bool {
 /// therefore admits an exact tie at every magnitude and a one-ULP gap only in
 /// the lower octave.
 ///
-/// **One** measured case exists — bonsai, index 18, margin exactly 0.00000000 —
-/// so nothing in the tree distinguishes 0.10 from 0.01. A single exact tie is
-/// no evidence for any particular bound above zero. If a case ever lands
-/// between, **tighten rather than widen**: a genuine tie stays a tie under any
-/// smaller bound, while raising the bound buys nothing except the ability to
-/// absorb a real preference.
+/// **Two** measured cases exist: bonsai, index 18, margin exactly 0; and
+/// gemma-4-e4b, index 5, margin 0.0706. Gemma-4 logits pass through an f32
+/// softcap, so one bf16 ULP of the LM-head output (0.25 at 37) arrives as
+/// 0.0706; an independent implementation of that checkpoint has the same
+/// one-ULP gap. Elsewhere in that row the same reference differs from rMLX by
+/// up to 0.37, so it confirms a tie, not which id wins it. Nothing in the tree
+/// distinguishes 0.10 from 0.08. If a case ever lands between,
+/// **tighten rather than widen**: a genuine tie stays a tie under any smaller
+/// bound, while raising the bound buys nothing except the ability to absorb a
+/// real preference.
 pub const REGEN_MAX_TIE_MARGIN: f32 = 0.10;
 
 /// Index of the first differing token id. `None` when the sequences match.
@@ -617,16 +622,20 @@ fn resolve_bos_id(model_dir: &Path, tk: &tokenizers::Tokenizer) -> Option<u32> {
 
 /// Run the golden-token harness for one (arch, kv_quant) pair.
 ///
-/// `fixture_tag` names the committed golden file
-/// (`tests/fixtures/<fixture_tag>.golden.txt`). `kv_quant` pins the KV cache
-/// mode so the golden is reproducible regardless of the auto-resolver default.
-/// `model_path` comes from [`model_for`] — resolution happens once, at the
-/// caller, so there is exactly one place that decides whether a golden runs.
+/// `test` is the caller's test fn name, for its notices. `fixture_tag` names
+/// the committed golden file (`tests/fixtures/<fixture_tag>.golden.txt`).
+/// `kv_quant` pins the KV cache mode so the golden is reproducible regardless
+/// of the auto-resolver default. `model_path` comes from [`model_for`] —
+/// resolution happens once, at the caller, so there is exactly one place that
+/// decides whether a golden runs.
 ///
 /// Behaviour:
 /// * `RMLX_REGEN_GOLDENS=1` set → decode + WRITE the golden fixture, no assert.
-/// * otherwise → decode + ASSERT exact token-id equality.
-pub fn run_golden_test(fixture_tag: &str, kv_quant: KvQuant, model_path: &Path) {
+/// * otherwise → decode + ASSERT exact token-id equality. The fixture states
+///   the tokens of the pinned MLX pair. On another pair, a flip at a top-2
+///   margin at or below [`REGEN_MAX_TIE_MARGIN`] is not a defect: the test
+///   stands down with a `SKIP` notice that names the index and the margin.
+pub fn run_golden_test(test: &str, fixture_tag: &str, kv_quant: KvQuant, model_path: &Path) {
     let device = Device::Gpu;
     let model =
         arch::load_model(model_path, device, &arch::LoadOpts::default()).expect("arch::load_model");
@@ -697,8 +706,7 @@ pub fn run_golden_test(fixture_tag: &str, kv_quant: KvQuant, model_path: &Path) 
 
     let fixture_path = fixtures_dir().join(format!("{fixture_tag}.golden.txt"));
 
-    if regen_requested() {
-        let committed = read_golden(&fixture_path);
+    let verdict_against = |committed: Option<&[u32]>| {
         // Only pay for the margin measurement when the ids actually moved.
         // Decide the length case BEFORE measuring. `first_divergence` reports a
         // pure length change at the shorter sequence's end, which is out of
@@ -706,7 +714,6 @@ pub fn run_golden_test(fixture_tag: &str, kv_quant: KvQuant, model_path: &Path) 
         // designed refusal. `regen_verdict` refuses a length change at any
         // margin anyway, so measuring one is also a wasted GPU decode.
         let margin = committed
-            .as_deref()
             .filter(|c| c.len() == token_ids.len())
             .and_then(|c| first_divergence(&token_ids, c))
             .and_then(|i| {
@@ -721,12 +728,12 @@ pub fn run_golden_test(fixture_tag: &str, kv_quant: KvQuant, model_path: &Path) 
                     &token_ids,
                 )
             });
-        match regen_verdict(
-            &token_ids,
-            committed.as_deref(),
-            margin,
-            REGEN_MAX_TIE_MARGIN,
-        ) {
+        regen_verdict(&token_ids, committed, margin, REGEN_MAX_TIE_MARGIN)
+    };
+
+    if regen_requested() {
+        let committed = read_golden(&fixture_path);
+        match verdict_against(committed.as_deref()) {
             Regen::Write(why) => {
                 write_golden(
                     &fixture_path,
@@ -756,6 +763,21 @@ pub fn run_golden_test(fixture_tag: &str, kv_quant: KvQuant, model_path: &Path) 
             fixture_path.display()
         )
     });
+
+    if token_ids != golden {
+        let pin = rmlx_mlx::pin_check();
+        if !pin.matches {
+            if let Regen::Write(why) = verdict_against(Some(&golden)) {
+                eprintln!(
+                    "SKIP {test}: near-tie flip on an MLX pair that is not the pinned one, \
+                     not a defect: {why}. The fixture states the tokens of the pinned pair \
+                     (docs/TESTING.md). Loaded pair: {}",
+                    pin.detail
+                );
+                return;
+            }
+        }
+    }
 
     // A mismatch has two very different causes, and the fixture header tells
     // them apart: the same per-layer mixture decoding differently is a decode

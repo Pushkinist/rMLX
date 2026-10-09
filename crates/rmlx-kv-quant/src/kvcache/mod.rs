@@ -204,6 +204,11 @@ mod rollback_tests;
 #[path = "entry_routing_tests.rs"]
 mod entry_routing_tests;
 
+// An update writes into the buffer the cache holds, not into a copy.
+#[cfg(test)]
+#[path = "in_place_update_tests.rs"]
+mod in_place_update_tests;
+
 pub use core::KvCache;
 pub use fused_qk_dispatch::fused_qk_total_dispatch_count;
 pub use shared_kv::SharedKv;

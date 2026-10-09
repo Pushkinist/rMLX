@@ -53,7 +53,7 @@
 pub fn apple_silicon_generation() -> Option<u8> {
     #[cfg(target_os = "macos")]
     {
-        let brand = imp::query_cpu_brand_string()?;
+        let brand = imp::sysctl_string(c"machdep.cpu.brand_string")?;
         parse_apple_generation(&brand)
     }
     #[cfg(not(target_os = "macos"))]
@@ -111,24 +111,43 @@ pub fn parse_apple_generation(brand: &str) -> Option<u8> {
     family_for_m_number(m)
 }
 
+/// The running macOS version as `(major, minor)`, from `kern.osproductversion`
+/// (`"26.6.2"` -> `(26, 6)`). `None` off macOS or when it cannot be read.
+pub fn macos_version() -> Option<(u32, u32)> {
+    #[cfg(target_os = "macos")]
+    {
+        parse_macos_version(&imp::sysctl_string(c"kern.osproductversion")?)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// Parse `"<major>.<minor>[.<patch>]"`; a bare `"<major>"` has minor 0.
+pub fn parse_macos_version(s: &str) -> Option<(u32, u32)> {
+    let mut parts = s.trim().split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().map_or(Some(0), |m| m.parse().ok())?;
+    Some((major, minor))
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
-    /// Read `machdep.cpu.brand_string` via `sysctlbyname`.
+    /// Read a string sysctl via `sysctlbyname`, such as
+    /// `machdep.cpu.brand_string` (`"Apple M3 Max"`) or `kern.osproductversion`.
     ///
-    /// Returns the brand string (e.g. `"Apple M3 Max"`) or `None` on any
-    /// sysctl error. Buffer is 128 bytes — Apple Silicon brand strings are
-    /// short (`"Apple M3 Max"` = 12 bytes), so this is comfortably oversized.
-    pub(super) fn query_cpu_brand_string() -> Option<String> {
+    /// `None` on any sysctl error or a value over 128 bytes; both strings are
+    /// far shorter.
+    pub(super) fn sysctl_string(name: &std::ffi::CStr) -> Option<String> {
         // SAFETY contract:
-        // - `"machdep.cpu.brand_string\0"` is a valid C string; the MIB has
-        //   been stable on every macOS Apple Silicon release.
+        // - `name` is a valid NUL-terminated C string.
         // - First sysctlbyname call with NULL oldp + populated oldlenp asks
         //   the kernel for the required buffer size — standard probe.
         // - Second call fills the buffer; we cap `size` so even a malicious
         //   kernel cannot overflow `buf`.
         // - We treat any non-zero return as failure and bail.
         const MAX: usize = 128;
-        let name = c"machdep.cpu.brand_string";
         let mut size: usize = 0;
         let probe = unsafe {
             libc::sysctlbyname(

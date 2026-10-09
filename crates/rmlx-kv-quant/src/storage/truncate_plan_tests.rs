@@ -432,7 +432,7 @@ fn apply_plan_against_a_shorter_list_drops_rather_than_cuts_the_wrong_block() {
 fn retain_rows_in_leaves_an_empty_sideband_empty() {
     let mut empty: Vec<f32> = Vec::new();
     retain_rows_in(&mut empty, 5, 4);
-    assert!(empty.is_empty());
+    assert_eq!(empty, Vec::<f32>::new());
 }
 
 /// [`retain_rows_in`] keeps a row prefix at every count, at a stride > 1.

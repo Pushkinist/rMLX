@@ -2,7 +2,7 @@
 //!
 //! Exported surface (unchanged from the former `schema.rs`):
 //! - `SchemaError`, `EngagePolicy`, `SchemaNode` — types
-//! - `SchemaGrammar`, `is_only_fence_or_whitespace` — grammar
+//! - `SchemaGrammar` — grammar
 //! - `SchemaConstraint` — `ConstraintEngine` impl
 
 pub(super) mod compiler;
@@ -14,7 +14,6 @@ pub(super) mod types;
 mod tests;
 
 pub use constraint::SchemaConstraint;
-pub(crate) use grammar::is_only_fence_or_whitespace;
 #[cfg(test)]
 pub(crate) use grammar::SchemaGrammar;
 pub use types::{EngagePolicy, SchemaError, SchemaNode};

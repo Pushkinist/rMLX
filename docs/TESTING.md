@@ -47,6 +47,7 @@ Each test resolves its snapshot by one of these rules:
 | variable first | `tests/resolved_arch_class.rs`, `crates/rmlx-cli/src/commands/kv_calibrate_tests.rs` | a `RMLX_TEST_MODEL_*` variable, then the slug | falls through to the slug |
 | variable first, drafter | `resolve_drafter` in `tests/spec_sampled_distribution.rs` | `RMLX_DRAFT_TEST_MODEL`, then the slug; a directory with a `config.json` is enough | fails |
 | variable only | every other test that names a variable | the variable | skips |
+| slug and identity | `snapshot` in `crates/rmlx-server/tests/thread_boundary/mod.rs` | the slug only | fails |
 
 `common` is `crates/rmlx-models/tests/common/mod.rs`. Its two rules share one
 probe. It fails when `RMLX_O_MODELS_ROOT` is set but is not a directory, and
@@ -66,6 +67,16 @@ skips when nothing is configured, or when the root does not hold the slug.
 tokenizer, and mlx-community ships drafter snapshots without one. A download
 writes the JSON files before the shards, so a snapshot with no shard is a
 half-written one. The probe reads it as absent, and the test skips.
+
+`thread_boundary/mod.rs` in `rmlx-server` has its own resolver, because its
+snapshots do not fit the `common` probe: the Whisper snapshot ships
+`weights.npz` and no safetensors, and the Whisper tokenizer directory has no
+`config.json`. It has the same rules for a root. It fails when
+`RMLX_O_MODELS_ROOT` is set but is not a directory, and when the snapshot
+declares another identity than the test expects: `architectures[0]`, or
+`model_type` for a snapshot that names no architecture (Whisper, an MTP
+sidecar). It skips when the root is unset, when the root does not hold the
+slug, and when the snapshot holds no weight file (a half-written download).
 
 ## Model snapshot variables
 
@@ -210,6 +221,37 @@ A change in token count is refused at any margin. So is a margin it cannot
 measure. The margin is printed on the `WROTE` line on stderr; the fixture does
 not record it. Passing this gate does not
 make the new output correct. It shows only that the flip sat at a tie.
+
+### A fixture states the tokens of the pinned pair
+
+The ids in a fixture are the ids that the pinned MLX pair
+(`crates/rmlx-mlx/mlx-pin.txt`) decodes. Another pair can select another token
+at a step where the top two candidates are tied. On a pair that is not the
+pinned one, a flip at a top-2 margin at or below `REGEN_MAX_TIE_MARGIN` is not
+a defect.
+
+When the ids differ and the loaded pair is not the pinned one, the harness
+measures the margin at the first differing index, as a regeneration does
+(step 2 above). When the regeneration gate would accept the flip, the test
+stands down with a notice that names the index, both ids and the margin, so
+the run ends INCOMPLETE (`GPU_TESTS.md` § "A cell that stood down is reported,
+and it is not a pass"). On the pinned pair the test fails at any margin. On
+any pair it fails for a margin above the floor, a margin it cannot measure, or
+a change in token count.
+
+Measured on an M5 Max, macOS 26.6: `bonsai_golden_tokens_none`, built against
+mlx 0.32.1 / mlx-c 0.6.0_4 and run on that pair (`cargo test -p rmlx-models
+--test bonsai_golden_tokens -- --ignored --exact bonsai_golden_tokens_none`,
+with `DYLD_LIBRARY_PATH` on the `lib` directories of both kegs):
+
+```
+SKIP bonsai_golden_tokens_none: near-tie flip on an MLX pair that is not the
+pinned one, not a defect: divergence at index 18 (320 -> 1075) sits at a top-2
+margin of 0.06250000, at or below the 0.1 tie floor. …
+```
+
+The same fixture with id 0 changed fails on that pair, and the fixture with
+id 18 set to 1075 fails on the pinned pair.
 
 ## E2E harness model specs
 

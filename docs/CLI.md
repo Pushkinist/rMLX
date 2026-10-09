@@ -300,8 +300,9 @@ baseline: model=<name>  load=<ms>  ttft_ms=<ms>  decode_tps=<n>  overall_tps=<n>
 - `peak_rss` is host RSS from `ps`.
 - `metal_peak_mb` is the Metal allocator's peak during generation, weights
   included. `metal_gen_alloc_mb` is that peak minus what was live at the
-  start. Only `metal_gen_alloc_mb` compares between two runs. Both read `0`
-  with no Metal allocator.
+  start. Only `metal_gen_alloc_mb` compares between two runs, and its
+  start count is read unsettled ([`PROFILING.md`](PROFILING.md) § 9.2). Both
+  read `0` with no Metal allocator.
 - `kv_cache_bytes` is the filled prefix of the KV cache
   (`KvCache::resident_bytes`, [`METRICS_SCHEMA.md`](METRICS_SCHEMA.md) §4), not an
   allocator peak. When the reported count is zero it reads `n/a`, and the

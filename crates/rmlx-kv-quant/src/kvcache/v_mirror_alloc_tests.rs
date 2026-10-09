@@ -15,6 +15,17 @@
 //! `kv_h * kv_seq * head_dim * sizeof(bf16)` bytes, and the Metal allocator
 //! reports it.
 //!
+//! # Which allocator reading
+//!
+//! MLX frees the temporaries of a command buffer in that buffer's completion
+//! handler, and an evaluation can return before Metal calls it. So the live
+//! count right after an evaluation holds the copy or does not, by timing, and
+//! no test here reads it there. Every reading follows
+//! `rmlx_mlx::synchronize_gpu`, which waits for the handlers. From that settled
+//! state the copy is gone from the live count, so the instrument for the copy
+//! is the peak over one dispatch ([`bracket_from_settled`]), and the settled
+//! live count is the instrument for what the cache keeps.
+//!
 //! # What each test covers, and what it does not
 //!
 //! * [`every_flash_decode_dispatcher_strides_over_the_whole_v_mirror`] — all
@@ -23,9 +34,11 @@
 //!   reads the stride from the wrong place.
 //! * [`the_slice_the_dispatchers_no_longer_take_costs_a_measurable_prefix_copy`]
 //!   — the allocation oracle's power measurement. It pays a prefix copy on
-//!   purpose so the growth bounds below are shown to be able to see one.
+//!   purpose so the peak is shown to be able to see one.
 //! * [`iso_decode_does_not_copy_the_v_mirror`] and its rotor sibling — the
-//!   production seam, through `update_and_sdpa`.
+//!   production seam, through `update_and_sdpa`. A per-step copy smaller than
+//!   one packed K prefix, the norms plane for one, is below their step bound; a
+//!   whole K prefix and a V prefix are not.
 //!
 //! **Planar has no production-seam probe.** Its fused arm is warm-TTFT
 //! quiescent: after `exit_prefill` the bf16 K seed is live and the dispatcher
@@ -55,10 +68,15 @@ use crate::planarquant_msl::planar_quantize_v4_gpu;
 use crate::quant::KvQuant;
 use crate::rotor_flash_decode_msl::{rotor_flash_decode_dispatch_count, rotor_flash_decode_sdpa};
 use crate::rotorquant::{n_groups_for, rotor3_encode};
-use crate::storage::{iso_n_groups_for, KvStorage, QuantRotorK3, ISO_QUAT_BLOCK_SIZE};
+use crate::storage::{
+    iso_n_groups_for, KvStorage, QuantRotorK3, ISO_QUAT_BLOCK_SIZE, KV_PAGE_SIZE,
+};
 use crate::test_utils::{lcg_data, skip_if_no_gpu_env};
 use rmlx_core::DispatchPolicy;
-use rmlx_mlx::{mlx_active_memory_bytes, Array, Device, Dtype};
+use rmlx_mlx::{
+    mlx_active_memory_bytes, mlx_clear_cache, synchronize_gpu, Array, Device, Dtype, PeakBracket,
+    PeakReading,
+};
 
 /// One direct-dispatch fixture shape.
 #[derive(Debug, Clone, Copy)]
@@ -317,25 +335,47 @@ fn every_flash_decode_dispatcher_strides_over_the_whole_v_mirror() {
 
 // ── The copy is real, is visible, and the dispatchers no longer pay it ────────
 
-/// Measure the resident bytes an iso dispatch holds when V arrives whole
-/// against when it arrives as the `..kv_seq` cut, and hold both halves of the
-/// claim: the cut costs one full prefix copy, and the whole mirror costs none
-/// of it.
+/// Put the allocator in the one state a reading does not inherit from what ran
+/// before: no temporary of an earlier evaluation live, no cached buffer.
 ///
-/// The first half is the gate's power measurement. Without it, the second half
-/// could pass against a fixture that never allocated a copy in either arm.
+/// An evaluation returns before Metal calls the completion handlers that free
+/// its temporaries, so the live count right after one has two states and which
+/// one a reading sees is a race. `synchronize_gpu` waits for the handlers. MLX
+/// also gives a new array a cached buffer longer than the array when it has
+/// one, so `mlx_clear_cache` empties the cache.
+#[allow(clippy::expect_used, reason = "test helper: invariants documented")]
+fn settle() {
+    synchronize_gpu().expect("synchronize before a reading");
+    assert!(mlx_clear_cache(), "the allocator's cache was not cleared");
+}
+
+/// What `region` allocated, in a bracket that opens from the settled state.
+/// The peak inside it is then a property of `region` alone.
+fn bracket_from_settled(region: impl FnOnce()) -> PeakReading {
+    settle();
+    let bracket = PeakBracket::open();
+    region();
+    let reading = bracket.close();
+    assert!(
+        reading.measurable(),
+        "the peak mark was not reset, so nothing below is scoped to the region ({reading:?})"
+    );
+    reading
+}
+
+/// Measure the bytes one iso dispatch needs when V arrives whole against when
+/// it arrives as the `..kv_seq` cut, and hold both halves of the claim: the cut
+/// costs one full prefix copy, and the whole mirror costs none of it.
 ///
-/// Resident bytes rather than a peak bracket, because Metal releases a
-/// completed dispatch's buffers on the next dispatch: at steady state the copy
-/// is already live when a bracket opens and is replaced in place, so the peak
-/// never rises above the open reading and every delta derived from it is zero.
-/// What the copy does move is the settled live count, exactly and repeatably.
+/// The first half is the gate's power measurement. Without it, the bounds of
+/// the production-seam tests below could pass against a fixture that never
+/// allocated a copy in either arm.
+///
+/// A peak bracket from a settled state, not the live count after the dispatch:
+/// MLX frees the copy in a completion handler, so the live count holds it or
+/// does not, by timing. The peak holds it in both cases.
 #[test]
 #[ignore = "GPU Metal context — run explicitly"]
-#[allow(
-    clippy::expect_used,
-    reason = "test: every expect is on a fixture built immediately above"
-)]
 fn the_slice_the_dispatchers_no_longer_take_costs_a_measurable_prefix_copy() {
     if skip_if_no_gpu_env() {
         return;
@@ -344,35 +384,39 @@ fn the_slice_the_dispatchers_no_longer_take_costs_a_measurable_prefix_copy() {
     let (mirror, cut) = v_mirror_and_cut(shape);
     let iso = iso3_packed(shape);
 
-    // Repeat until the allocator settles: the first dispatch of a kernel
-    // compiles it, and each dispatch's buffers are released on the next one.
-    let settled_live = |v: &Array| -> u64 {
-        for _ in 0..4 {
+    // The first dispatch of a kernel compiles it; keep that out of the brackets.
+    let _ = iso3_dispatch(shape, &iso, &mirror);
+    let headroom = |v: &Array| {
+        bracket_from_settled(|| {
             let _ = iso3_dispatch(shape, &iso, v);
-        }
-        let live = mlx_active_memory_bytes()
-            .expect("no Metal allocator reading — the measurement below is vacuous");
-        assert!(live > 0, "the allocator reports nothing resident at all");
-        live
+        })
+        .headroom_bytes()
     };
 
-    let whole_before = settled_live(&mirror);
-    let sliced = settled_live(&cut);
-    let whole_after = settled_live(&mirror);
+    let whole_before = headroom(&mirror);
+    let sliced = headroom(&cut);
+    let whole_after = headroom(&mirror);
+    eprintln!(
+        "iso3: readings whole_before={whole_before} sliced={sliced} whole_after={whole_after}"
+    );
     assert_eq!(
         whole_before, whole_after,
-        "the whole-mirror arm must settle to the same resident bytes either side \
-         of the cut arm, or this is measuring drift rather than the copy"
+        "the whole-mirror arm must need the same bytes either side of the cut arm, \
+         or this is measuring drift rather than the copy"
     );
 
     let copy = shape.prefix_copy_bytes(shape.kv_seq);
+    assert!(
+        (1..copy).contains(&whole_before),
+        "the strided arm must allocate, and must need less than one prefix copy \
+         ({copy} B); measured {whole_before} B"
+    );
     let extra = sliced.saturating_sub(whole_before);
     assert!(
-        extra >= copy,
-        "the cut arm must hold one prefix copy ({copy} B) more than the strided \
-         arm; measured {extra} B (whole={whole_before}, sliced={sliced}). A smaller \
-         delta means this fixture no longer reproduces the copy, and the bounds \
-         below are blind."
+        (copy..2 * copy).contains(&extra),
+        "the cut arm must need exactly one prefix copy ({copy} B) more than the strided \
+         arm; measured {extra} B (whole={whole_before}, sliced={sliced}). A smaller delta \
+         means this fixture no longer reproduces the copy, and the bounds below are blind."
     );
 }
 
@@ -383,33 +427,95 @@ const PREFILL: i32 = 512;
 const SETTLE_STEPS: u64 = 256;
 const MEASURED_STEPS: u64 = 1024;
 
-/// How much resident memory a decode loop grew over a run of steps.
-#[derive(Debug)]
-struct GrowthProbe {
-    grown_bytes: u64,
-    tokens: i32,
+/// The VM page of Apple Silicon, the unit of MLX's Metal allocator.
+const ALLOCATOR_PAGE: u64 = 16 * 1024;
+
+/// The buffers a packed K ring holds: codes, scales, norms.
+const RING_PLANES: u64 = 3;
+
+/// How far the allocator's count of the ring can be above the ring's own bytes.
+///
+/// The allocator rounds a buffer larger than one page up to whole pages
+/// (`mlx/backend/metal/allocator.cpp`, "Align up memory"), which is less than
+/// one page more. It then gives the array a cached buffer of less than
+/// `min(2 * size, size + 2 pages)` when it has one
+/// (`mlx/backend/common/buffer_cache.h`, `reuse_from_cache`) and counts the
+/// length of that buffer. So a plane counts less than three pages above its
+/// size. A step can free a buffer and allocate a plane after it, so the cache
+/// is not always empty when a plane is allocated.
+const RING_COUNT_ALLOWANCE: u64 = RING_PLANES * 3 * ALLOCATOR_PAGE;
+
+/// Bytes the packed K store of `quant` holds for `positions` positions of
+/// [`MULTI_HEAD`], from the codec's own byte model: its per-layer estimate
+/// less the bf16 V buffer a K-only codec keeps, which is half of what `None`
+/// holds.
+fn packed_k_bytes(quant: KvQuant, positions: i32) -> u64 {
+    assert!(
+        !quant.feeds_bf16_k_at_decode(false),
+        "{quant}: the estimate also holds a bf16 K seed, so this is not the packed store alone"
+    );
+    let per_layer = |q: KvQuant| {
+        q.estimated_resident_bytes_per_layer(
+            positions as u64,
+            HEAD_DIM as u64,
+            MULTI_HEAD.kv_h as u64,
+            false,
+        )
+    };
+    per_layer(quant) - per_layer(KvQuant::None) / 2
 }
 
-/// Drive `update_and_sdpa` on `cache` and report how many bytes stay resident
-/// per token decoded.
+/// The capacity the ring policy gives `positions`: whole `KV_PAGE_SIZE` pages.
+/// Stated here on purpose, and not read from the ring, so that a ring that
+/// grows by more than the policy fails.
+fn paged(positions: i32) -> i32 {
+    (positions + KV_PAGE_SIZE - 1) / KV_PAGE_SIZE * KV_PAGE_SIZE
+}
+
+/// Drive `update_and_sdpa` on `cache` and hold what each decode step needed
+/// and what stayed allocated.
 ///
-/// A slope, not a level: every buffer sized at `max_seq` — the mirror, the
-/// packed ring — is allocated before the measurement starts and cancels out.
-/// What is left grows with the attended prefix, and a re-materialised V prefix
-/// is `kv_h * kv_seq * head_dim * 2` bytes of exactly that.
+/// Every reading is taken from a settled state (see [`settle`]), so none
+/// depends on when Metal calls a completion handler or on what an earlier test
+/// left in the allocator's cache.
 ///
-/// `dispatch_count` is the codec's own kernel counter: a run that did not
-/// advance it once per step never reached the kernel, and its slope would
-/// describe a CPU-dequant fallback instead.
+/// **The live count, at every reading.** Since the run opened, the settled
+/// live count grew by what the store grew by, to within
+/// [`RING_COUNT_ALLOWANCE`]. Every buffer sized at `max_seq` is allocated
+/// before the run opens and cancels out. This holds at the open of every step.
+/// The comparison is with the count at the open of the run, not with an
+/// absolute state. So a leftover that changes by the allowance or more since
+/// the run opened fails here, and it cannot pass as a smaller headroom of the
+/// next step. A leftover of constant size passes.
+/// `after_synchronize_gpu_the_live_count_holds_no_temporary` in `rmlx-mlx`
+/// compares two settled readings around one evaluation. A leftover of the same
+/// size at both readings passes there too. No test reads the absolute state.
+///
+/// **Each step.** The step's headroom, less the new ring of a step that regrows
+/// the store, is what the step allocated and freed again. With the allowance
+/// added, it must be less than one packed K prefix of the attended length. A
+/// re-materialised V prefix is at least `kv_h * kv_seq * head_dim * 2` bytes of
+/// exactly that (the mirror of this fixture is f32, twice that), and the packed
+/// K prefix is smaller than the bf16 V prefix, so the bound fails a V prefix
+/// copy and a K prefix copy both. Only a peak sees either: the copy is freed
+/// when the step is done.
+///
+/// **The store.** After every step it holds its layer-static tables plus whole
+/// pages of positions, by the codec's own byte model.
+///
+/// **The kernel.** `dispatch_count` is the codec's own kernel counter. It must
+/// advance by one for each step. A step that does not reach the kernel is a
+/// CPU-dequant fallback, and its readings describe another path.
 #[allow(clippy::expect_used, reason = "test helper: invariants documented")]
-fn resident_growth_over_decode(
-    codec: &str,
+fn assert_decode_allocates_no_prefix_copy(
+    quant: KvQuant,
     mut cache: KvCache,
     dispatch_count: fn() -> u64,
-) -> GrowthProbe {
+) {
     let device = Device::Gpu;
     let shape = MULTI_HEAD;
     let scale = 1.0_f32 / (HEAD_DIM as f32).sqrt();
+    let static_bytes = cache.storage.resident_bytes();
 
     let pf = (PREFILL * shape.kv_h * HEAD_DIM) as usize;
     let k = f32_array(&lcg_data(pf, 1), &[B, shape.kv_h, PREFILL, HEAD_DIM]);
@@ -431,86 +537,100 @@ fn resident_growth_over_decode(
             &lcg_data((shape.n_q_heads() * HEAD_DIM) as usize, 30 + seed),
             &[B, shape.n_q_heads(), 1, HEAD_DIM],
         );
+        let dispatches = dispatch_count();
         let out = cache
             .update_and_sdpa(&q1, &k1, &v1, scale, "", None, device)
             .expect("decode update_and_sdpa");
         out.eval().expect("decode out eval");
+        assert_eq!(
+            dispatch_count() - dispatches,
+            1,
+            "{quant}: the decode step at kv_seq={} must dispatch the flash-decode kernel once",
+            cache.offset()
+        );
+    };
+    let store_holds_whole_pages = |cache: &KvCache| {
+        let (held, positions) = (cache.storage.resident_bytes(), cache.offset());
+        let modelled = static_bytes + packed_k_bytes(quant, paged(positions));
+        assert_eq!(
+            held,
+            modelled,
+            "{quant}: the store holds {held} B at {positions} positions; its byte model gives \
+             {modelled} B for {} positions in whole pages plus {static_bytes} B of static tables",
+            paged(positions)
+        );
+        held
     };
 
     for s in 0..SETTLE_STEPS {
         step(&mut cache, s);
     }
+    settle();
     let live_before = mlx_active_memory_bytes()
         .expect("no Metal allocator reading — the bounds below would be vacuous");
+    let store_before = store_holds_whole_pages(&cache);
     let offset_before = cache.offset();
-    let dispatches_before = dispatch_count();
 
+    // How far a settled live count is from the opening count plus what the
+    // store grew by since.
+    let mut widest_gap = 0;
+    let mut live_is_the_store = |live: u64, store: u64, kv_seq: i32| {
+        let gap = (live + store_before).abs_diff(live_before + store);
+        assert!(
+            gap < RING_COUNT_ALLOWANCE,
+            "{quant}: at kv_seq={kv_seq} the settled live count is {live} B. It opened at \
+             {live_before} B and the store grew by {} B since, so {gap} B are not the store's, \
+             and the allowance is {RING_COUNT_ALLOWANCE} B: a buffer that the store does not \
+             account for is live",
+            store - store_before
+        );
+        widest_gap = widest_gap.max(gap);
+    };
+
+    let mut most_per_position = 0;
     for s in SETTLE_STEPS..SETTLE_STEPS + MEASURED_STEPS {
-        step(&mut cache, s);
+        let store_at_open = cache.storage.resident_bytes();
+        let reading = bracket_from_settled(|| step(&mut cache, s));
+        live_is_the_store(
+            reading.live_at_open_bytes,
+            store_at_open,
+            cache.offset() - 1,
+        );
+        let (headroom, kv_seq) = (reading.headroom_bytes(), cache.offset());
+        // A step that regrows the ring allocates the whole new ring while the
+        // old one is still live.
+        let store_now = store_holds_whole_pages(&cache);
+        let new_ring = if store_now == store_at_open {
+            0
+        } else {
+            store_now - static_bytes
+        };
+        let transient = headroom.saturating_sub(new_ring);
+        let k_prefix = packed_k_bytes(quant, kv_seq);
+        assert!(
+            transient + RING_COUNT_ALLOWANCE < k_prefix,
+            "{quant}: the decode step at kv_seq={kv_seq} allocated and freed {transient} B. \
+             One packed K prefix is {k_prefix} B and a bf16 V prefix, the narrowest a V \
+             mirror gets, is {} B: the step materialised a prefix (headroom {headroom} B)",
+            shape.prefix_copy_bytes(kv_seq)
+        );
+        most_per_position = most_per_position.max(transient / kv_seq as u64);
     }
+    settle();
     let live_after = mlx_active_memory_bytes().expect("no Metal allocator reading");
-    let tokens = cache.offset() - offset_before;
+    let store_after = store_holds_whole_pages(&cache);
+    live_is_the_store(live_after, store_after, cache.offset());
+    eprintln!(
+        "{quant}: readings grown={} store_grown={} widest_gap={widest_gap} \
+         most_transient_per_position={most_per_position}",
+        live_after.saturating_sub(live_before),
+        store_after - store_before
+    );
 
     assert_eq!(
-        tokens, MEASURED_STEPS as i32,
-        "{codec}: the cache advanced {tokens} positions over {MEASURED_STEPS} decode steps"
-    );
-    assert!(
-        dispatch_count() - dispatches_before >= MEASURED_STEPS,
-        "{codec}: the measured steps did not each reach the flash-decode kernel — \
-         the slope describes a CPU-dequant fallback, not the dispatch this gate is about"
-    );
-    assert!(
-        live_after > live_before,
-        "{codec}: resident memory did not grow at all over {MEASURED_STEPS} steps \
-         ({live_before} -> {live_after}); the bounds below would pass by measuring nothing"
-    );
-    GrowthProbe {
-        grown_bytes: live_after - live_before,
-        tokens,
-    }
-}
-
-/// A decode loop must not grow resident memory by a V prefix per step, and its
-/// clean floor must stay where it was measured.
-///
-/// Two bounds, deliberately.
-///
-/// The first is the defect bound: a re-materialised V prefix puts growth near
-/// 2900 per mille of one copy (the live one plus the previous step's, released
-/// a dispatch late — measured 2884 for iso3 and 3142 for rotor3), so 1500
-/// separates it from either clean floor with margin both ways.
-///
-/// The second pins that clean floor, which is not zero and is not a shared
-/// constant. What this loop grows by is the packed **K** view's own
-/// prefix-sized materialisation, and that term scales with the K codec's bit
-/// width and its sideband planes where the V term scales with `sizeof(bf16)` —
-/// so it differs per codec, measured at 574 per mille for iso3 against 676 for
-/// rotor3. `floor_band` is that measurement, per caller. Pinning it makes
-/// K-side drift a named failure here rather than silent margin eaten out of the
-/// bound above.
-fn assert_growth_holds_no_v_prefix(
-    codec: &str,
-    probe: &GrowthProbe,
-    floor_band: std::ops::RangeInclusive<u64>,
-) {
-    let copy = MULTI_HEAD.prefix_copy_bytes(probe.tokens);
-    let per_mille = probe.grown_bytes * 1000 / copy;
-    assert!(
-        probe.grown_bytes < copy * 3 / 2,
-        "{codec}: {} B stayed resident over {} decoded tokens — {per_mille} per mille of the \
-         {copy} B V-mirror prefix, where flattening a non-contiguous `..kv_seq` cut of the \
-         head-major mirror at kv_h={} would put it near 2900 ({probe:?})",
-        probe.grown_bytes,
-        probe.tokens,
-        MULTI_HEAD.kv_h
-    );
-    assert!(
-        floor_band.contains(&per_mille),
-        "{codec}: the clean floor moved — {per_mille} per mille of a V prefix copy, outside \
-         the measured band {floor_band:?}. Nothing about V changed (the bound above still \
-         holds), so the packed-K view's own per-token growth drifted; re-measure and re-pin, \
-         or the V bound above loses the margin it depends on ({probe:?})"
+        cache.offset() - offset_before,
+        MEASURED_STEPS as i32,
+        "{quant}: the cache did not advance one position per decode step"
     );
 }
 
@@ -521,9 +641,11 @@ fn iso_decode_does_not_copy_the_v_mirror() {
         return;
     }
     let cache = KvCache::with_quant_max_seq(KvQuant::IsoKOnly3, MAX_SEQ);
-    let probe = resident_growth_over_decode("iso3", cache, iso_flash_decode_dispatch_count);
-    // Measured 574 per mille of one V prefix copy.
-    assert_growth_holds_no_v_prefix("iso3", &probe, 500..=660);
+    assert_decode_allocates_no_prefix_copy(
+        KvQuant::IsoKOnly3,
+        cache,
+        iso_flash_decode_dispatch_count,
+    );
 }
 
 #[test]
@@ -555,10 +677,11 @@ fn rotor_decode_does_not_copy_the_v_mirror() {
         DispatchPolicy::default(),
         false,
     );
-    let probe = resident_growth_over_decode("rotor3", cache, rotor_flash_decode_dispatch_count);
-    // Measured 676 per mille — rotor3's packed view carries more per token
-    // than iso3's, which is why the band is per codec and not shared.
-    assert_growth_holds_no_v_prefix("rotor3", &probe, 600..=760);
+    assert_decode_allocates_no_prefix_copy(
+        KvQuant::RotorKOnly3,
+        cache,
+        rotor_flash_decode_dispatch_count,
+    );
 }
 
 // ── The mirror's valid length is checked in every profile ─────────────────────

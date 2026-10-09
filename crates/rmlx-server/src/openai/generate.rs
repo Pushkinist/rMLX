@@ -2,8 +2,6 @@
 //!
 //! - `generate_blocking` — collects all tokens then returns a single JSON response.
 //! - `generate_streaming` — returns an SSE stream; each token is a separate event.
-//! - `extract_top_level_json_value` — strip markdown fences from json_object output.
-//! - `try_extract_at` — attempt to extract a single JSON value at a given offset.
 
 #[cfg(test)]
 #[path = "generate_tests.rs"]
@@ -27,215 +25,13 @@ use crate::tool_parser::{ParsedToolCall, ToolCallFormat, ToolCallStreamParser};
 
 use super::chat::bare_json_to_tool_call;
 use super::errors::{engine_error_response, unix_now};
+use super::json_reply::{JsonReply, NOT_ENGAGED_MESSAGE, NOT_ENGAGED_TYPE};
 use super::response::{
     select_finish_reason, to_response_tool_call, ChatCompletionChunk, ChatCompletionsResponse,
     ChatLogprobContent, ChatLogprobs, Choice, DeltaContent, ResponseMessage, StreamChoice, Usage,
 };
 use super::state::{ApiErrorCounters, AppState, TtftSample, TtftStore, TTFT_RING_CAPACITY};
 use super::streaming::{handle_streaming_token, StreamState};
-
-// ── JSON extraction helpers ───────────────────────────────────────────────────
-
-/// Helper: locate the first JSON value in `text` (skipping any
-/// leading whitespace and/or a markdown code-fence header like ` ```json\n `),
-/// then extract the complete value and return it as an owned `String`.
-///
-/// Handles all JSON top-level value types:
-/// - `{…}` objects — balanced-brace scan (respects strings and escapes).
-/// - `[…]` arrays — balanced-bracket scan.
-/// - `"…"` strings — quoted string scan.
-/// - `true`, `false`, `null` — literal keyword scan.
-/// - numbers — run of `[0-9.eE+\-]` bytes.
-///
-/// Returns `None` only if no recognisable JSON value is found (empty input
-/// or pure-fence with no payload).
-///
-/// Used to strip markdown-fence wrappers from the model's output when
-/// `response_format = json_object` or `json_schema`. The constraint engine
-/// guarantees a syntactically valid JSON value exists from the engagement
-/// point; this routine extracts it without re-parsing the whole stream.
-#[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or validated before call"
-)]
-pub(super) fn extract_top_level_json_value(text: &str) -> Option<String> {
-    // Skip any leading whitespace and/or markdown code-fence header
-    // (` ```json\n ` or ` ``` `) before scanning for a JSON value. Without
-    // this, the `n` in ` ```json ` would match the `null` literal-start and
-    // cause an early false-positive.
-    let text = {
-        let trimmed = text.trim_start_matches(|c: char| c.is_ascii_whitespace());
-        if let Some(after_fence) = trimmed.strip_prefix("```") {
-            // strip optional `json` language tag, then trailing whitespace
-            let after_lang = after_fence.strip_prefix("json").unwrap_or(after_fence);
-            after_lang.trim_start_matches(|c: char| c.is_ascii_whitespace())
-        } else {
-            text
-        }
-    };
-    let bytes = text.as_bytes();
-    // Scan for a JSON value. We may need to skip over garbage bytes
-    // (e.g. `{"` prefix emitted by a scalar-root model before the real
-    // constraint kicks in). Loop: try each candidate start position in
-    // order; if the extraction at that position fails (truncated or
-    // syntactically bad), advance past it and try the next candidate.
-    let mut search_from = 0usize;
-    loop {
-        let off = bytes[search_from..].iter().position(|&b| {
-            matches!(
-                b,
-                b'{' | b'[' | b'"' | b't' | b'f' | b'n' | b'-' | b'0'..=b'9'
-            )
-        })?;
-        let start = search_from + off;
-
-        let result = try_extract_at(bytes, text, start);
-        if let Some(v) = result {
-            return Some(v);
-        }
-        // This start position didn't yield a complete value.
-        // Advance past it and try the next candidate.
-        search_from = start + 1;
-        if search_from >= bytes.len() {
-            return None;
-        }
-    }
-}
-
-/// Try to extract a single complete JSON value from `bytes` at offset `start`.
-/// Returns `None` if the value is incomplete or unrecognised. The `text`
-/// parameter is the &str whose bytes we're inspecting (for slicing).
-#[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or validated before call"
-)]
-fn try_extract_at(bytes: &[u8], text: &str, start: usize) -> Option<String> {
-    match bytes[start] {
-        // ── object ──────────────────────────────────────────────────────────
-        b'{' => {
-            let mut depth: u32 = 0;
-            let mut in_string = false;
-            let mut escape = false;
-            for (i, &b) in bytes.iter().enumerate().skip(start) {
-                if in_string {
-                    if escape {
-                        escape = false;
-                    } else if b == b'\\' {
-                        escape = true;
-                    } else if b == b'"' {
-                        in_string = false;
-                    }
-                    continue;
-                }
-                match b {
-                    b'"' => in_string = true,
-                    b'{' => depth += 1,
-                    b'}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            return Some(text[start..=i].to_owned());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            None
-        }
-        // ── array ────────────────────────────────────────────────────────────
-        b'[' => {
-            let mut depth: u32 = 0;
-            let mut in_string = false;
-            let mut escape = false;
-            for (i, &b) in bytes.iter().enumerate().skip(start) {
-                if in_string {
-                    if escape {
-                        escape = false;
-                    } else if b == b'\\' {
-                        escape = true;
-                    } else if b == b'"' {
-                        in_string = false;
-                    }
-                    continue;
-                }
-                match b {
-                    b'"' => in_string = true,
-                    b'[' => depth += 1,
-                    b']' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            return Some(text[start..=i].to_owned());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            None
-        }
-        // ── string ───────────────────────────────────────────────────────────
-        b'"' => {
-            let mut escape = false;
-            for (i, &b) in bytes.iter().enumerate().skip(start + 1) {
-                if escape {
-                    escape = false;
-                } else if b == b'\\' {
-                    escape = true;
-                } else if b == b'"' {
-                    return Some(text[start..=i].to_owned());
-                }
-            }
-            None
-        }
-        // ── keyword literals ─────────────────────────────────────────────────
-        b't' => {
-            let end = start + 4;
-            if bytes.get(start..end) == Some(b"true") {
-                Some("true".to_owned())
-            } else {
-                None
-            }
-        }
-        b'f' => {
-            let end = start + 5;
-            if bytes.get(start..end) == Some(b"false") {
-                Some("false".to_owned())
-            } else {
-                None
-            }
-        }
-        b'n' => {
-            let end = start + 4;
-            if bytes.get(start..end) == Some(b"null") {
-                Some("null".to_owned())
-            } else {
-                None
-            }
-        }
-        // ── number ───────────────────────────────────────────────────────────
-        _ => {
-            // b'-' or b'0'..=b'9'
-            // A leading `-` MUST be followed by at least one digit. Bare `-`
-            // (e.g. a Markdown bullet point "- item") is not a valid JSON number
-            // and must not be returned as a match — it would surface as content="-"
-            // to the client when the model outputs a prose bullet list before the
-            // constraint engages.
-            if bytes[start] == b'-' {
-                match bytes.get(start + 1) {
-                    Some(&b) if b.is_ascii_digit() => {}
-                    _ => return None,
-                }
-            }
-            let end = bytes[start..]
-                .iter()
-                .position(|&b| !matches!(b, b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-'))
-                .map_or(bytes.len(), |off| start + off);
-            if end > start {
-                Some(text[start..end].to_owned())
-            } else {
-                None
-            }
-        }
-    }
-}
 
 // ── Non-streaming path ────────────────────────────────────────────────────────
 
@@ -248,15 +44,13 @@ pub(super) async fn generate_blocking(
     replay_plan: Option<crate::retry::RequestPlan>,
     model_id: &str,
     parser_format: Option<ToolCallFormat>,
-    json_object_mode: bool,
-    // True when tool_choice=required/named drives the constraint; the
-    // text output (bare JSON) must be converted to a tool_calls envelope.
+    // Where the request's constraint engaged, cloned by the route before the
+    // engine was moved into the generator. `None` when the request built no
+    // constraint that reports it.
+    engagement: Option<Arc<rmlx_models::Engagement>>,
+    // True for a forced tool call (tool_choice=required/named); the text
+    // output (bare JSON) must be converted to a tool_calls envelope.
     bare_json_tool_call_mode: bool,
-    // Mirror of the `response_format` constraint's engaged state, cloned by the
-    // route before the engine was moved into the generator. `Some(false)` after
-    // the stream drains means the grammar was never applied to a single logit.
-    // `None` when the request asked for no `response_format` constraint.
-    response_format_engaged: Option<Arc<std::sync::atomic::AtomicBool>>,
     // Drainer handle + ctx_max for TTFT/token-count DB emission.
     request_start: Instant,
     metrics_drainer: Option<&DrainerHandle>,
@@ -323,6 +117,7 @@ pub(super) async fn generate_blocking(
     // the request set `logprobs:true` (the engine only attaches `logprobs`
     // to tokens then).
     let mut logprobs_accum: Vec<ChatLogprobContent> = Vec::new();
+    let mut json_reply = engagement.map(JsonReply::new);
 
     while let Some(item) = token_stream.next().await {
         match item {
@@ -375,9 +170,17 @@ pub(super) async fn generate_blocking(
                         });
                     }
                 }
+                let in_answer = !tok.is_thinking || bare_json_tool_call_mode;
+                if let (Some(reply), true) = (json_reply.as_mut(), in_answer) {
+                    reply.receive(completion_tokens + 1, &tok.piece);
+                }
                 // collect this token's logprob record (present only when
-                // `logprobs:true` was requested).
-                if let Some(lp) = tok.logprobs.clone() {
+                // `logprobs:true` was requested). An answer token before a
+                // `response_format` reply starts has no byte in the content.
+                let before_the_reply = in_answer
+                    && !bare_json_tool_call_mode
+                    && json_reply.as_ref().is_some_and(|r| r.start().is_none());
+                if let (Some(lp), false) = (tok.logprobs.clone(), before_the_reply) {
                     logprobs_accum.push(lp);
                 }
                 // Feed the parser regardless of think state.
@@ -410,13 +213,11 @@ pub(super) async fn generate_blocking(
                         }
                     }
                     None => {
-                        // bare_json_tool_call_mode — constrained output goes to
-                        // `text` regardless of is_thinking. When the prompt left
-                        // a `<think>` open, the JSON the constraint forced is
-                        // emitted while is_thinking == true. We need it in `text`
-                        // so the post-processor can extract it via
-                        // bare_json_to_tool_call.
-                        if tok.is_thinking && !bare_json_tool_call_mode {
+                        // A constrained forced tool call goes to `text`
+                        // regardless of is_thinking: when the prompt left a
+                        // `<think>` open, the JSON the constraint forced is
+                        // emitted while is_thinking == true.
+                        if tok.is_thinking && !(bare_json_tool_call_mode && json_reply.is_some()) {
                             reasoning_text.push_str(&tok.piece);
                         } else {
                             text.push_str(&tok.piece);
@@ -445,33 +246,6 @@ pub(super) async fn generate_blocking(
         tool_calls_accum.extend(p.take_parsed());
     }
 
-    // A `response_format` constraint that never engaged never masked a logit:
-    // this body is unchecked, and byte-for-byte indistinguishable from one the
-    // grammar inspected and permitted. Nothing has reached the client yet on
-    // this path — the whole stream was accumulated above — so refuse rather
-    // than return a 200 the caller has no way to tell apart from an enforced
-    // one. The streaming path cannot do this; its bytes are already out.
-    if response_format_engaged
-        .as_ref()
-        .is_some_and(|f| !f.load(std::sync::atomic::Ordering::Acquire))
-    {
-        tracing::warn!(
-            model_id,
-            request_id,
-            "refusing: response_format constraint never engaged, so the response \
-             was never checked against the requested schema"
-        );
-        error_counts.increment(ApiErrorCategory::Upstream);
-        requests_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return error_response(
-            StatusCode::BAD_GATEWAY,
-            "constraint_not_engaged",
-            "the model never emitted a value the requested `response_format` \
-             grammar could enforce, so the response is unchecked and was not \
-             returned. Retry, or drop `response_format`.",
-        );
-    }
-
     // Truncate the accumulated content at the first stop-sequence
     // boundary (stop string excluded) and force finish_reason="stop". Matching
     // is on the detokenized text, so a stop that straddled token boundaries is
@@ -488,6 +262,37 @@ pub(super) async fn generate_blocking(
             text.truncate(hit.offset);
             finish_reason = Some("stop".to_owned());
         }
+    }
+
+    // A `response_format` reply is the returned text from the engagement byte
+    // on. Text that ends before that byte was never checked: refuse it.
+    if let (Some(reply), false, true) = (
+        json_reply.as_mut(),
+        bare_json_tool_call_mode,
+        tool_calls_accum.is_empty(),
+    ) {
+        let dropped_bytes = reply.release(&text);
+        if !reply.engaged() {
+            tracing::warn!(
+                model_id,
+                request_id,
+                returned_bytes = text.len(),
+                "refusing: the returned text ends before the `response_format` grammar engaged"
+            );
+            error_counts.increment(ApiErrorCategory::Upstream);
+            requests_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                NOT_ENGAGED_TYPE,
+                NOT_ENGAGED_MESSAGE,
+            );
+        }
+        tracing::debug!(
+            model_id,
+            dropped_bytes,
+            "text before the engagement byte is not in the `response_format` reply"
+        );
+        text.drain(..dropped_bytes);
     }
 
     // Emit TTFT + token counts to SQLite via the SPSC drainer.
@@ -563,31 +368,28 @@ pub(super) async fn generate_blocking(
         Some(reasoning_text)
     };
 
-    // bare_json_tool_call_mode — the constraint forced the model to
-    // emit bare `{"name":"…","arguments":{…}}` JSON (no marker wrapper).
-    // Extract the JSON value from `text` and convert it to a ParsedToolCall so
-    // the response envelope has `tool_calls` and `content=""` (not raw JSON).
+    // A forced tool call with no marked call: the text is bare
+    // `{"name":"…","arguments":{…}}` JSON. Convert it, from the engagement
+    // byte on when a constraint reported one, to a ParsedToolCall so the
+    // response envelope has `tool_calls` and `content=""` (not raw JSON).
     let (text, tool_calls_accum) = if bare_json_tool_call_mode && tool_calls_accum.is_empty() {
-        let json_str = extract_top_level_json_value(&text).unwrap_or_default();
-        if let Some(tc) = bare_json_to_tool_call(&json_str) {
+        let json_str = match json_reply.as_mut() {
+            Some(reply) => &text[reply.release(&text)..],
+            None => &text,
+        };
+        if let Some(tc) = bare_json_to_tool_call(json_str) {
             tracing::debug!(
                 name = %tc.name,
-                "bare_json_tool_call_mode: synthesised tool call from constrained JSON output"
+                "bare_json_tool_call_mode: synthesised tool call from the bare JSON of a forced tool call"
             );
             (String::new(), vec![tc])
         } else {
             tracing::warn!(
                 json = %json_str,
-                "bare_json_tool_call_mode: could not parse constrained output as tool call; returning as content"
+                "bare_json_tool_call_mode: a forced tool call did not parse; returning as content"
             );
-            (text, tool_calls_accum)
+            (json_str.to_owned(), tool_calls_accum)
         }
-    } else if json_object_mode {
-        // Strip markdown fence wrapper for response_format=json_object/json_schema.
-        (
-            extract_top_level_json_value(&text).unwrap_or(text),
-            tool_calls_accum,
-        )
     } else {
         (text, tool_calls_accum)
     };
@@ -665,7 +467,7 @@ pub(super) async fn generate_blocking(
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::fn_params_excessive_bools,
-    reason = "generate_streaming takes several boolean mode flags (json_object_mode, bare_json_tool_call_mode, include_usage, is_cold_request) that are structurally distinct; a refactor to a request-opts struct is deferred to a follow-up"
+    reason = "generate_streaming takes several boolean mode flags (bare_json_tool_call_mode, include_usage, is_cold_request) that are structurally distinct; a refactor to a request-opts struct is deferred to a follow-up"
 )]
 #[allow(
     clippy::unwrap_used,
@@ -680,7 +482,8 @@ pub(super) async fn generate_streaming(
     request_start: Instant,
     state: &AppState,
     parser_format: Option<ToolCallFormat>,
-    json_object_mode: bool,
+    // Where the request's constraint engaged; see `generate_blocking`.
+    engagement: Option<Arc<rmlx_models::Engagement>>,
     // True when tool_choice=required/named drives the constraint.
     bare_json_tool_call_mode: bool,
     include_usage: bool,
@@ -846,9 +649,7 @@ pub(super) async fn generate_streaming(
             id,
             model,
             created,
-            json_object_mode,
-            json_fence_buf: String::new(),
-            json_fence_buf_done: false,
+            json_reply: engagement.map(JsonReply::new),
             prompt_tokens: prompt_token_count,
             completion_tokens: 0,
             include_usage,

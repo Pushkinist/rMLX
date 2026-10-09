@@ -54,7 +54,7 @@ fn build_profile_is_stamped_by_build_script() {
     // under — never the empty string, never "unknown" for a build cargo
     // itself understands.
     let p = build_profile();
-    assert!(!p.is_empty());
+    assert_ne!(p, "");
     assert!(
         matches!(p, "debug" | "release" | "release-perf" | "release-debug"),
         "unexpected build_profile: {p:?}"

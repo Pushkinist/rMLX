@@ -267,3 +267,142 @@ fn key_short_hex_is_8_chars() {
     let k = MmCacheKey::image_key(b"abc", 1, 1, 1, MmDtype::F32, SIG_A);
     assert_eq!(k.short_hex().len(), 8);
 }
+
+/// How an entry reaches the cache.
+#[derive(Clone, Copy)]
+enum Publish {
+    Put,
+    PutMany,
+    GetOrCompute,
+}
+
+/// Where the reader of a published entry runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reader {
+    /// On the writer's thread: the oracle.
+    WritersThread,
+    /// On a second thread while the writer's thread stays alive and idle, as a
+    /// blocking-pool worker does between requests.
+    AnotherThread,
+}
+
+/// Publish a lazy `a + a` built on `device`, never evaluate it on the writer's
+/// thread (a request that fails in prefill does not), then read the entry back.
+fn read_after_unevaluated_publish(
+    publish: Publish,
+    device: rmlx_mlx::Device,
+    reader: Reader,
+) -> rmlx_core::error::Result<Vec<u8>> {
+    let cache = Arc::new(MultimodalCache::new(1 << 20));
+    let key = MmCacheKey::image_key(b"px", 1, 1, 1, MmDtype::F32, SIG_A);
+    let write = {
+        let cache = Arc::clone(&cache);
+        move || {
+            let lazy = || {
+                let a = Array::from_f32_slice(&[1.0, 2.0], &[2])?;
+                rmlx_mlx::add(&a, &a, device)
+            };
+            match publish {
+                Publish::Put => {
+                    let array = lazy().expect("build the entry");
+                    let size = array_byte_size(&array).expect("array_byte_size");
+                    cache.put(key, array, size);
+                }
+                Publish::PutMany => {
+                    let array = lazy().expect("build the entry");
+                    let size = array_byte_size(&array).expect("array_byte_size");
+                    cache.put_many(key, vec![array], size);
+                }
+                Publish::GetOrCompute => {
+                    drop(get_or_compute(Some(&cache), key, lazy));
+                }
+            }
+        }
+    };
+    let read = move || {
+        let entry = match publish {
+            Publish::PutMany => cache.get_many(&key).and_then(|v| v.into_iter().next()),
+            Publish::Put | Publish::GetOrCompute => cache.get(&key),
+        };
+        entry
+            .expect("the reader must hit the entry the writer published")
+            .to_bytes()
+    };
+    if reader == Reader::WritersThread {
+        return std::thread::spawn(move || {
+            write();
+            read()
+        })
+        .join()
+        .expect("thread panicked");
+    }
+    let (written_tx, written_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let writer = std::thread::spawn(move || {
+        write();
+        written_tx.send(()).ok();
+        release_rx.recv().ok();
+    });
+    written_rx.recv().expect("writer published");
+    let (read_tx, read_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        read_tx.send(read()).ok();
+    });
+    let out = within_limit::within_limit(&read_rx, within_limit::LIMIT, "the cross-thread read")
+        .expect("reader panicked");
+    release_tx.send(()).ok();
+    writer.join().expect("writer panicked");
+    out
+}
+
+#[path = "../../rmlx-mlx/tests/common/within_limit.rs"]
+mod within_limit;
+
+/// A published entry must read on a thread that did not write it.
+fn assert_publish_crosses_threads(publish: Publish, device: rmlx_mlx::Device) {
+    let expected: Vec<u8> = [2.0f32, 4.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let oracle = read_after_unevaluated_publish(publish, device, Reader::WritersThread)
+        .expect("the one-thread oracle must read");
+    assert_eq!(
+        oracle, expected,
+        "the one-thread oracle read the wrong values"
+    );
+    let crossed = read_after_unevaluated_publish(publish, device, Reader::AnotherThread)
+        .unwrap_or_else(|e| {
+            panic!(
+                "an entry that the writer published unevaluated does not read on another \
+                 thread: {e}"
+            )
+        });
+    assert_eq!(
+        crossed, expected,
+        "the cross-thread read differs from the oracle"
+    );
+}
+
+#[test]
+fn a_put_entry_reads_on_another_thread() {
+    assert_publish_crosses_threads(Publish::Put, rmlx_mlx::Device::Cpu);
+}
+
+#[test]
+fn a_put_many_entry_reads_on_another_thread() {
+    assert_publish_crosses_threads(Publish::PutMany, rmlx_mlx::Device::Cpu);
+}
+
+#[test]
+fn a_get_or_compute_entry_reads_on_another_thread() {
+    assert_publish_crosses_threads(Publish::GetOrCompute, rmlx_mlx::Device::Cpu);
+}
+
+#[test]
+#[ignore = "requires Metal GPU; run with `make gpu-test`"]
+fn a_put_entry_built_on_the_gpu_reads_on_another_thread() {
+    assert_publish_crosses_threads(Publish::Put, rmlx_mlx::Device::Gpu);
+}
+
+#[test]
+#[ignore = "requires Metal GPU; run with `make gpu-test`"]
+fn a_put_many_entry_built_on_the_gpu_reads_on_another_thread() {
+    assert_publish_crosses_threads(Publish::PutMany, rmlx_mlx::Device::Gpu);
+}

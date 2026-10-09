@@ -64,7 +64,7 @@ fn plain_text_no_tool_call() {
     let input = "Hello there, this is just text with no tool call at all.";
     let mut p = run_whole(input);
     assert_eq!(p.passthrough_text, input);
-    assert!(p.take_parsed().is_empty());
+    assert_eq!(p.take_parsed(), Vec::<ParsedToolCall>::new());
     assert!(!p.in_tool_call());
 }
 
@@ -184,7 +184,7 @@ fn parser_pass_through_no_markers() {
     p.push("world, ");
     p.push("nothing to see here.");
     assert_eq!(p.passthrough_text, "hello world, nothing to see here.");
-    assert!(p.take_parsed().is_empty());
+    assert_eq!(p.take_parsed(), Vec::<ParsedToolCall>::new());
     assert!(!p.in_tool_call());
     assert!(!p.has_calls());
 }
@@ -299,7 +299,7 @@ fn hermes_json_stringified_arguments() {
 fn hermes_json_no_call_passthrough() {
     let mut p = run_json(&["just a plain answer, no tools."]);
     assert_eq!(p.passthrough_text, "just a plain answer, no tools.");
-    assert!(p.take_parsed().is_empty());
+    assert_eq!(p.take_parsed(), Vec::<ParsedToolCall>::new());
 }
 
 // ── Gemma format (GemmaToolCall) ─────────────────────────────────────
@@ -414,7 +414,7 @@ fn gemma_split_pieces_match_whole() {
 fn gemma_no_call_passthrough() {
     let mut p = run_gemma(&["plain Gemma answer with no tool call."]);
     assert_eq!(p.passthrough_text, "plain Gemma answer with no tool call.");
-    assert!(p.take_parsed().is_empty());
+    assert_eq!(p.take_parsed(), Vec::<ParsedToolCall>::new());
 }
 
 // ── detect_tool_call_format against the THREE real templates ─────────
@@ -585,7 +585,7 @@ fn finalize_recovers_truncated_hermes_call() {
     let mut p = ToolCallStreamParser::new(ToolCallFormat::Qwen3JsonToolCall);
     p.push(input);
     // Before finalize: no calls.
-    assert!(p.take_parsed().is_empty());
+    assert_eq!(p.take_parsed(), Vec::<ParsedToolCall>::new());
     // Finalize: EOF recovery runs.
     p.finalize();
     let calls = p.take_parsed();

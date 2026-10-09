@@ -26,6 +26,7 @@ pub(crate) mod chat;
 pub(crate) mod errors;
 pub(crate) mod generate;
 pub(crate) mod handlers;
+pub(crate) mod json_reply;
 pub(crate) mod lifecycle;
 pub(crate) mod metrics;
 pub(crate) mod request;

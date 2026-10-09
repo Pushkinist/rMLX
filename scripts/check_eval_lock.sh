@@ -3,31 +3,20 @@
 # `mlx::core::eval_impl` must be made under the process-wide evaluation lock,
 # and nothing that runs under that lock may take it again.
 #
-# THE BUG THIS PINS
-#   The linked MLX (0.31.x) resolves a CPU stream's `CommandEncoder` through a
-#   *process-global* `std::unordered_map<int, CommandEncoder>` that
-#   `mlx/backend/cpu/encoder.cpp::get_command_encoder` fills lazily, on the
-#   evaluating thread, with no synchronisation. Default CPU streams are
-#   per-thread, so every thread that evaluates mints its own stream index and
-#   performs its own insert into that one shared map. Two inserts in flight
-#   together rehash it under a third thread's bucket walk.
-#
-#   The result is a SIGSEGV (or SIGTRAP, or an infinite spin on a bucket chain
-#   that became circular) *inside MLX*, on a thread named after whichever test
-#   happened to be running. libtest names no failing test, because none failed
-#   — the process died. `cargo test` runs one OS thread per test, so this
-#   reached `make ci` as an intermittent crash of a whole test binary that
-#   never reproduced in isolation and was indistinguishable from a real
-#   regression in the branch under test.
-#
-#   `rmlx_mlx::with_eval_lock` contains it by serialising evaluation
-#   process-wide.
+# WHAT THIS HOLDS
+#   rMLX evaluates one graph at a time, and `rmlx_mlx::with_eval_lock` makes
+#   that a property of the crate: every evaluating FFI call runs on the MLX
+#   thread, under one process-wide lock (`docs/FFI.md` § "The MLX thread").
+#   An evaluating call outside `with_eval_lock` runs on the calling thread:
+#   MLX looks a stream's command encoder up in the evaluating thread only
+#   (`mlx/backend/cpu/encoder.cpp`), so it throws "There is no Stream(cpu, N)"
+#   or waits forever, and it runs at the same time as the MLX thread.
 #
 # WHY A GREP GATE AND NOT A TEST
-#   The reproducer for this (`concurrent_first_eval_reproducer`) is
-#   probabilistic — roughly one failure in twelve runs without the lock. Far
-#   too weak to gate on. The *structural* regressions are the ones a text gate
-#   catches deterministically, and they are the realistic ones:
+#   The end-to-end driver (`concurrent_first_eval_reproducer`) finds no
+#   defect on the linked MLX, so it cannot gate. The *structural* regressions
+#   are the ones a text gate catches deterministically, and they are the
+#   realistic ones:
 #
 #     1. Someone drops the lock from a guarded call site.
 #     2. Someone adds a call to one of the many other C entry points that
@@ -41,20 +30,21 @@
 #
 #   What it does NOT catch is a `with_eval_lock` that stopped locking: the
 #   lexical structure is unchanged, so this gate stays green. That half is
-#   covered by the unit test
-#   `with_eval_lock_serialises_concurrent_callers`. The two are complementary
-#   by construction, verified by mutation — neither alone covers this defect.
+#   covered by the unit tests `under_eval_lock_excludes_concurrent_callers`
+#   (the lock excludes two threads) and
+#   `with_eval_lock_holds_the_lock_while_its_job_runs`. The two are
+#   complementary by construction, verified by mutation — neither alone
+#   covers this defect.
 #
 # HOW THE REACH-SET WAS DERIVED — re-run this when the mlx / mlx-c pin moves
 #   It is not guesswork and must not become guesswork. TWO passes, because one
 #   of them is structurally blind to a quarter of the problem.
 #
-#   Pass 1 — automated, direct calls (yields 24 symbols):
+#   Pass 1 — automated, direct calls (24 symbols on the pinned pair):
 #     otool -tvV "$(brew --prefix mlx-c)/lib/libmlxc.dylib" > /tmp/mlxc.s
 #     otool -tvV "$(brew --prefix mlx)/lib/libmlx.dylib"    > /tmp/mlx.s
-#   Take the transitive closure of callers backwards from BOTH
-#   `mlx::core::eval_impl` and the hazard symbol itself,
-#   `mlx::core::cpu::get_command_encoder(Stream)`, then intersect with the
+#   Take the transitive closure of callers (`bl` / `b` targets, stubs
+#   included) backwards from `mlx::core::eval_impl`, then intersect with the
 #   exported `mlx_*` C ABI.
 #
 #   Pass 2 — by hand, INDIRECT dispatch (adds 1, for 25 total):
@@ -85,7 +75,7 @@
 #           `with_eval_lock` closure: either on the call line itself, or inside
 #           an enclosing block whose opening line calls it.
 #   RULE 3  No `Closure::from_fn` body may take the evaluation lock. Those
-#           bodies run on the calling thread *inside* `mlx_closure_apply`, with
+#           bodies run on the MLX thread *inside* `mlx_closure_apply`, with
 #           the lock already held, so taking it again self-deadlocks on a
 #           non-reentrant mutex — a hang, which is one of this defect's own
 #           symptoms. The ban is on *taking the lock*, which is broader than

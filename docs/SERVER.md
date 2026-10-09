@@ -242,9 +242,23 @@ on Gemma4, Gemma3, Qwen3.5-MoE and BitNet an exact hit emits no logprob for
 the replayed token, so `logprobs.content` is one entry short. See
 [`PROMPT_CACHE.md`](PROMPT_CACHE.md) § "First-token logprob on Exact hit".
 
-A `response_format` request whose grammar never engaged returns 502
-`constraint_not_engaged`; see [`SAMPLING.md`](SAMPLING.md) § "Non-enforcement
-is reported".
+An `eos_token_id` token ends a generation and adds no text.
+
+**JSON-mode reply.** With `response_format` `json_object` or `json_schema`,
+`content` is the answer text from the byte at which the grammar engaged
+([`SAMPLING.md`](SAMPLING.md) § "Non-enforcement is reported") to its end,
+streaming or not:
+
+- Text before that byte (prose, a fence) is not in `content` or
+  `logprobs`.
+- No byte after it is dropped or added: white space after the value stays,
+  and a value cut by `max_tokens` is returned cut (`finish_reason:"length"`).
+- `stop` is matched on the whole answer text first.
+- Text that ends before that byte is refused: 502 `constraint_not_engaged`;
+  streaming, that error event and no content delta.
+- Known limit: after its first byte (`-` or a digit) a number accepts `-` and
+  `+` at each place, and white space between a sign and the first digit; a
+  root number ends at the first token that holds a digit.
 
 **Streaming** (`stream:true`): each SSE event is a `data:` line holding a
 `ChatCompletionChunk`:
@@ -412,7 +426,7 @@ Errors use the OpenAI envelope:
 | 408 | `timeout` | The request timeout expired. |
 | 429 | `rate_limit_error` | The GPU admission queue is full. |
 | 500 | `internal_error` | A handler panic, a prompt-pipeline task panic, or an embeddings preprocessor or compute failure. The audio routes send 500 as `{"error":"…"}`. |
-| 502 | `constraint_not_engaged` | A non-streaming `response_format` request whose grammar never engaged. |
+| 502 | `constraint_not_engaged` | A `response_format` reply with no text at the engagement byte (streaming: error event). |
 | 503 | `service_unavailable` | Any load failure, OOM while loading included, and any other engine error. With `--require-smoke-probe` (off by default) a failed smoke probe at load lands here too. Counter: `upstream`. |
 | 503 | `admission_sla_exceeded` | The adaptive controller's anticipatory rejection, with `Retry-After: 5`. Counter: `admission_sla_503`. |
 
@@ -521,65 +535,8 @@ request finishes on the model it already holds.
 
 ## Tool Calling
 
-### Parser architecture
-
-`ToolCallStreamParser` parses tool calls out of the raw token stream. The
-format is detected once at registry build from markers in
-`chat_template.jinja`, with the architecture as the fallback, and cached in
-`ModelEntry`.
-
-| `ToolCallFormat` | Used by | Syntax |
-|---|---|---|
-| `Qwen3XmlFunction` | Qwen3.6 | `<tool_call><function=NAME><parameter=KEY>VALUE</parameter></function></tool_call>` |
-| `Qwen3JsonToolCall` | `Qwen3ForCausalLM` (Bonsai) | `<tool_call>{"name":"…","arguments":{…}}</tool_call>` |
-| `GemmaToolCall` | `Gemma4ForConditionalGeneration` | `<\|tool_call>call:NAME{key:val}<tool_call\|>` |
-
-Gemma registers `<|tool_call>`, `<tool_call|>` and `<|"|>` as special tokens,
-which `tokenizer.decode` strips. The engine rebuilds them from the token ids
-before the parser sees them.
-
-The parser is split-invariant: any BPE-aligned split of the stream parses the
-same as the whole string. Several `<tool_call>` blocks may follow each other.
-
-### Template support probe
-
-At registry build, `probe_tools_supported` renders each template with one
-tool and stores the result in `ModelEntry::tools_supported`. When it is
-`false`, the request runs without tools instead of failing.
-
-### Multi-turn tool loop
-
-The client drives the loop. It sends `tools`; the model emits tool-call
-blocks; the server returns them as `tool_calls` with
-`finish_reason:"tool_calls"`; the client runs the tools and sends the results
-as `tool` messages. The server renders the whole history through the chat
-template each turn.
-
-### `tool_choice=required` / `tool_choice=named` (constrained generation)
-
-A `"required"` or named `tool_choice` engages the constraint engine to force
-a valid call as bare JSON. `tool_choice_to_schema` builds the schema:
-
-- **Named**, or **required with one tool**:
-  `{"type":"object","properties":{"name":{"const":"<fn>"},"arguments":<fn-schema>},"required":["name","arguments"]}`.
-- **Required with several tools**: `{"oneOf":[…]}`, one such branch per tool.
-
-The `SchemaConstraint` runs with `EngagePolicy::Immediate`, so masking starts
-at the first token. The output has no `<tool_call>` wrapper, so the marker
-parser is bypassed: `bare_json_to_tool_call` turns the text into the
-`tool_calls` envelope. Streaming buffers the JSON and emits one `tool_calls`
-delta at the end. If the constraint cannot be built, for example because the
-named tool is not in `tools`, the request runs unconstrained and returns no
-error.
-
-### EOF recovery
-
-Streaming never completes a partial call. On the non-streaming path, a
-Bonsai-style JSON call cut off mid-body (for example at `max_tokens`) is
-repaired by closing its open strings and brackets; a truncated Gemma call is
-dropped.
-
-OpenAI `parameters` and Anthropic `input_schema` tools render identically.
+Split into [`SERVER_TOOLS.md`](SERVER_TOOLS.md) to keep this doc under the
+size cap.
 
 ---
 

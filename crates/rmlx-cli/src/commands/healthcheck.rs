@@ -632,32 +632,22 @@ fn check_mlx_pin() -> CheckLine {
     let check = rmlx_mlx::pin_check();
     CheckLine::new(
         "mlx_pin",
-        mlx_pin_status(check.matches, check.enforcement),
+        mlx_pin_status(check.refusal(), check.matches),
         check.detail,
     )
 }
 
 /// Map a pin verdict onto a check status.
 ///
-/// Pure, and separate from the probe, because on any one machine the probe
-/// only ever produces the cell that machine is in — asserting the mapping
-/// against a second copy of itself over that one cell is an assertion that
-/// cannot fail.
-///
-/// A mismatch is red only where the pinned kernels exist to be missed. On
-/// hardware without a Neural Accelerator they do not, so the finding is worth
-/// printing but is not a failure. On a host that could not be identified the
-/// answer is unknown either way, and an unknown that renders as a clean pass
-/// is how the host scoping becomes a way to succeed without checking — so it
-/// is red as well.
-const fn mlx_pin_status(matches: bool, enforcement: rmlx_mlx::PinEnforcement) -> Status {
-    if matches {
-        return Status::Green;
-    }
-    if enforcement.is_binding() || !enforcement.host_is_known() {
-        Status::Red
-    } else {
-        Status::Info
+/// Red is exactly a [`rmlx_mlx::PinCheck::refusal`], the verdict
+/// `rmlx baseline` and `rmlx bench` refuse on and `scripts/mlx_preflight.sh`
+/// stops on, so the line cannot disagree with them. A pair that is not the
+/// pinned one on a host the pin does not bind is printed as info.
+const fn mlx_pin_status(refusal: Option<rmlx_mlx::PinRefusal>, matches: bool) -> Status {
+    match refusal {
+        Some(_) => Status::Red,
+        None if matches => Status::Green,
+        None => Status::Info,
     }
 }
 

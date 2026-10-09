@@ -67,7 +67,6 @@ fn whisper_paths() -> Option<(PathBuf, PathBuf)> {
 
 fn load_transcriber() -> Option<Transcriber> {
     let (model_path, tok_path) = whisper_paths()?;
-    rmlx_mlx::ensure_gpu_default_stream().expect("GPU default stream");
     let model = WhisperModel::load(&model_path).expect("load whisper model");
     let tokenizer = WhisperTokenizer::from_path(&tok_path).expect("load tokenizer");
     Some(Transcriber::new(Arc::new(model), Arc::new(tokenizer)).expect("transcriber"))
@@ -219,12 +218,12 @@ fn transcribe_file(
 #[ignore = "GPU Metal context — run in isolation: cargo test say_clip -- --ignored --test-threads=1"]
 fn say_clip_deterministic() {
     let Some(t) = load_transcriber() else {
-        eprintln!("skip say_clip_deterministic: whisper snapshot not present");
+        eprintln!("SKIP say_clip_deterministic: whisper snapshot not present");
         return;
     };
     let sentence = "The quick brown fox jumps over the lazy dog.";
     let Some(wav) = synth_say_clip(sentence) else {
-        eprintln!("skip say_clip_deterministic: say/ffmpeg unavailable");
+        eprintln!("SKIP say_clip_deterministic: say/ffmpeg unavailable");
         return;
     };
 
@@ -264,11 +263,11 @@ fn say_clip_deterministic() {
 fn long_form_regression() {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     if !fixtures.exists() {
-        eprintln!("skip long_form_regression: no fixtures dir");
+        eprintln!("SKIP long_form_regression: no fixtures dir");
         return;
     }
     let Some(t) = load_transcriber() else {
-        eprintln!("skip long_form_regression: whisper snapshot not present");
+        eprintln!("SKIP long_form_regression: whisper snapshot not present");
         return;
     };
 
@@ -340,6 +339,6 @@ fn long_form_regression() {
     }
 
     if ran == 0 {
-        eprintln!("skip long_form_regression: no fixture audio+VTT pairs found");
+        eprintln!("SKIP long_form_regression: no fixture audio+VTT pairs found");
     }
 }

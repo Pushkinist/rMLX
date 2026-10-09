@@ -133,18 +133,117 @@ it to show that the two populations overlap.
 ## The second oracle: the repetition control
 
 The first oracle has nothing to read when both arms are degenerate: there is no
-healthy reference whose margins mean anything. So every run also checks that
-neither arm repeats at a short period across more than `MAX_CYCLE_FRACTION`
-(0.20) of its tokens. It checks the whole stream and each of the
-`TAIL_WINDOWS` (4) tail cuts, at every period up to `MAX_CYCLE_PERIOD` (64)
-that leaves `MIN_CYCLE_SAMPLES` (32) comparisons.
+healthy reference whose margins mean anything. So every run also reads how
+much of each arm repeats at a short period. It reads the whole stream and each
+of the `TAIL_WINDOWS` (4) tail cuts, at every period up to `MAX_CYCLE_PERIOD`
+(64) that leaves `MIN_CYCLE_SAMPLES` (32) comparisons.
 
-The ceiling holds only for prose. Healthy structured output, such as a
-markdown table, overlaps ragged loops on this measure, which is why the
-prompts ask for prose. The upper side is swept, not sampled: two arms in one
-period-8 loop are walked from 0% to 100% raggedness, and the control refuses
-every pair up to 60%. Past that the arms are more noise than loop, and nothing
-takes over.
+`MAX_CYCLE_FRACTION` (0.20) is the ceiling, and the only threshold. The two
+arms are read differently:
+
+- The reference arm is read as it is. Above the ceiling it is unjudgeable.
+- The speculative arm is read without the repeats the reference arm wrote
+  itself (`repeats_beyond`). Above the ceiling it is refused.
+
+What "wrote itself" means, exactly. At one period, the positions that repeat
+the token one period before them are read as runs. A run of consecutive
+repeats, together with the tokens of one period before it, is one stretch of
+the arm: a phrase and the place where the arm said it before. The run is not
+counted when the reference arm holds that whole stretch, token for token, in
+the tail cut the stretch starts in. A stretch that starts in the last quarter
+of the speculative arm is looked for in the last quarter of the reference
+arm; one that starts in the first quarter is looked for in all of it. A run
+is excused whole or not at all. In one reading, a repeat of the reference arm
+excuses one repeat of the speculative arm, once: a second copy of the same
+stretch needs a second place in the reference arm. A run is read inside the
+window of the reading, so a loop that begins before a cut is cut there. The
+reading is still the strongest one over every window and period, taken after
+the runs are excused.
+
+A run takes the first free place: the first one from the cut on that holds
+its stretch and whose repeats no run has taken. A later place is not tried
+first, and a place is not kept for a longer run. So the verdict can depend on
+the order of the runs. The measured pair is pinned
+(`a_run_takes_the_first_free_place_so_the_order_of_the_runs_can_decide`). A
+reference arm holds a burst of 9 tokens and then a burst of 5 tokens in its
+last window, 12 of 63. A speculative arm that holds the same two bursts and a
+6-token burst of its own reads 17 of 63 raw. In the reference order it is
+agreed, with 5 repeats counted. With the two bursts exchanged, the burst of 5
+takes the start of the 9-token place, the burst of 9 fits no free place, and
+the arm is refused at 13 of 63. This was found on burst arms only.
+
+The position bound exists because a judgeable reference arm can hold a long
+loop. Over the whole reference arm a 57-token loop at period 8 reads 49 of
+248, under the ceiling. The same loop at the tail of the speculative arm
+reads 49 of 56. A stretch matched anywhere would excuse it; the last quarter
+of the reference arm does not hold it
+(`a_loop_the_reference_arm_holds_somewhere_else_is_refused`).
+
+The reason is a measurement. An answer about one subject repeats that subject,
+in both arms. A healthy arm of a correct engine reads 9 of 39 at period 25 in
+its last window, where a period-8 loop at 58% raggedness can read 0.20. Five
+of the nine are one phrase, and the reference arm wrote the same phrase after
+the same 25 tokens. Without them the arm reads 4 of 39.
+`a_healthy_arm_that_repeats_no_more_than_its_reference_is_not_a_collapse`
+holds both arms as a fixture.
+
+What the tests hold, and against what:
+
+- Twenty-one constructed arms against judgeable reference arms are each
+  refused: eight whose reference arm reads near the ceiling, seven whose
+  reference arm holds the same loop somewhere else, and six that hold a burst
+  or a loop of the reference arm twice, in full or in part.
+- An exact loop at the end of the measured arm is refused past 13 tokens at
+  period 1 and past 19 at period 8. The test asserts that each of those
+  verdicts is the one a fixed ceiling gives on the raw reading of the last
+  window at the loop's period. At period 25 the loop is refused when it goes
+  one token past what the reference arm wrote, at 28 tokens. A fixed ceiling
+  refuses the measured arm itself, so there is no raw verdict to compare with
+  there.
+- A looping arm against a healthy reference arm, walked from 0% to 100%
+  raggedness, is refused under 58%, against synthetic prose and against two
+  reference arms that read near the ceiling. Each verdict of these sweeps is
+  asserted equal to a fixed ceiling on the raw reading.
+- Two arms in one period-8 loop, walked the same way, are refused under 60%,
+  with the same assertion on the two raw readings. Past that the arms are
+  more noise than loop, and nothing takes over.
+
+A healthy arm can still be refused. Only a run the reference arm wrote token
+for token is excused. A healthy arm that repeats its subject above the
+ceiling in other words, or by single-token coincidences alone, is refused:
+the measured arm against a reference arm with one token of that stretch
+changed is refused
+(`a_healthy_arm_above_the_ceiling_is_refused_when_the_reference_did_not_write_its_phrase`).
+Position is a cause too. A healthy arm whose reference arm said the phrase in
+an earlier tail cut is refused. The measured pair has 7 tokens of margin: its
+stretch starts at token 223, the reference arm holds it at token 199, and the
+last quarter starts at token 192. With the reference arm's phrase 7 tokens
+earlier the pair is agreed; at 8 tokens earlier it is refused
+(`the_measured_pair_is_agreed_with_seven_tokens_of_position_margin`).
+The declared blind spot is the converse: a loop that the reference arm also
+wrote in full, in the same tail cut. Its size is bounded. In one reading, the
+repeats left out of the speculative arm are at most the raw repeats of the
+reference arm from the same cut at the same period, and for a judgeable
+reference arm of the same length those are at most the ceiling. So the control
+admits a raw reading of at most twice the ceiling in one window. The edge is
+pinned: a reference arm holds at most 19 tokens of a period-8 loop in its last
+window (11 of 56); a speculative arm that holds that loop and a second one of
+its own, up to the ceiling again, reads 22 of 56 raw and is agreed; one more
+token of its own loop and it is refused
+(`the_control_admits_at_most_the_ceiling_twice_in_one_window`). One burst in
+the reference arm does not excuse two copies of itself; it excuses at most its
+own 12 repeats. A speculative arm that holds the reference arm's 13-token
+burst twice and one of its own reads 36 of 63 and is refused
+(`one_burst_in_the_reference_arm_excuses_one_burst_and_no_more`). A place is
+not one run: two 7-token bursts take 6 repeats each of that 13-token burst,
+and both are excused. The same test pins that row at 0, and pins the rows
+where the second burst needs one repeat more than is left. For two arms of
+different lengths the windows differ in length, and the bound is on the count
+of repeats, not on the fraction.
+
+The control reads only prose. Healthy structured output, such as a markdown
+table, overlaps ragged loops on this measure, which is why the prompts ask for
+prose.
 
 Its declared blind spot is its own sample floor. The narrowest window is
 `len / TAIL_WINDOWS`, so at the 256-token budget it can evidence no period
@@ -221,6 +320,6 @@ correction, the defect the pair exists to catch. Every run of the pair prints
 One limitation stands. `Rng::prose` is an i.i.d. word model with no
 autocorrelation, so it reads lower on a self-similarity measure than real
 prose. `prose_clears_the_control_at_every_length_the_gate_can_hand_it` is a
-hard gate on it and bounds `MAX_CYCLE_FRACTION` from below, so the synthetic
-headroom overstates the true headroom. The real arms are measured too, and
-the constant rests on those readings.
+hard gate on it and bounds `MAX_CYCLE_FRACTION` from below, but no synthetic
+healthy stream reaches the ceiling, and a real one does. So the excused
+repeat rests on one measured pair.

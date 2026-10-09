@@ -102,7 +102,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         check-spec-sampling check-spec-sampling-fixtures \
         check-spec-charge check-spec-charge-fixtures \
         check-published-samples check-published-samples-fixtures \
-        mlx-preflight mlx-restore-pin target-gc target-size-report profile-gputrace \
+        mlx-preflight mlx-preflight-selftest mlx-restore-pin mlx-restore-pin-selftest target-gc target-size-report profile-gputrace \
         profile-mst \
         build-capture test-capture gputrace-preflight traces-gc \
         ssd-canary ssd-canary-gate ssd-canary-selftest \
@@ -121,7 +121,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         check-no-decode-swallow check-gpu-tests-ignored \
         check-gpu-tests-ignored-fixtures gpu-runner-selftest \
         check-named-skip-notices check-named-skip-notices-fixtures \
-        check-eval-lock check-eval-lock-fixtures eval-lock-stress \
+        check-eval-lock check-eval-lock-fixtures eval-lock-stress miri \
         check-no-kernel-input-eval check-no-kernel-input-eval-fixtures \
         check-gpu-device-census check-gpu-device-census-library \
         check-gpu-device-census-selftest \
@@ -145,6 +145,9 @@ test:            ## cargo test --workspace
 
 mlx-preflight:   ## verify the linked MLX stack (and nax kernels on M5+) before benching
 	bash scripts/mlx_preflight.sh
+
+mlx-preflight-selftest: ## CI gate: recall test for mlx-preflight over throwaway prefixes, a stub chip and a stub built binary, each case asserting the exit code and the lines printed
+	bash scripts/mlx_preflight_selftest.sh
 
 target-gc:       ## report stale target/ profiles (APPLY=1 to prune; target/ has no size cap)
 	bash scripts/target_gc.sh $(if $(APPLY),--apply,) $(if $(ALL),--all,)
@@ -222,8 +225,11 @@ profile-mst: ## record a Metal System Trace of a live rmlx run and summarise GPU
 		$(if $(GEN),--max-tokens $(GEN),) \
 		$(if $(KEEP),--keep $(KEEP),)
 
-mlx-restore-pin: ## restore mlx 0.31.2 + mlx-c 0.6.0_2 (nax-capable pair) and relink
+mlx-restore-pin: ## restore the pinned mlx + mlx-c pair (crates/rmlx-mlx/mlx-pin.txt) from the Cellar or the durable store, then link and pin it
 	bash scripts/mlx_restore_pin.sh
+
+mlx-restore-pin-selftest: ## CI gate: recall test for mlx-restore-pin over throwaway prefixes and a stub brew, each case asserting the exit code, a reason and the records left
+	bash scripts/mlx_restore_pin_selftest.sh
 
 build-perf:      ## cargo build --profile release-perf (debug-assertions off, stripped)
 	cargo build --workspace --profile release-perf
@@ -370,7 +376,7 @@ ci-perf:         ## pre-push gate under release-perf + the serialized GPU/Metal 
 # train everyone to read a red run as noise.
 GPU_TEST_ARGS = $(GPU_HALF_ARG) $(if $(CRATE),--crate '$(CRATE)',) $(if $(FILTER),--filter '$(FILTER)',) \
 	$(if $(filter 0,$(VALIDATE)),--no-shader-validation,)
-gpu-test: claim-rmlx ## run the GPU/Metal #[ignore] tests serialized under Metal shader validation, holding the Metal claim (HALF=codec|rest, CRATE= FILTER= to narrow, VALIDATE=0 to skip instrumentation)
+gpu-test: claim-rmlx ## run the GPU/Metal #[ignore] tests serialized under Metal shader validation for the scan and uninstrumented for the verdict, holding the Metal claim (HALF=codec|rest, CRATE= FILTER= to narrow, VALIDATE=0 to skip instrumentation)
 	@bash scripts/run_gpu_tests.sh --build $(GPU_TEST_ARGS)
 	@$(CLAIM_RMLX) claim run -- bash scripts/run_gpu_tests.sh $(GPU_TEST_ARGS)
 
@@ -612,19 +618,33 @@ check-eval-lock-fixtures: ## CI gate: recall test for check-eval-lock (synthetic
 eval-lock-stress: ## run the evaluation-lock reproducer across RUNS fresh processes (default 60); not in `make ci`
 	@bash scripts/eval_lock_stress.sh $(RUNS)
 
+# The skipped tests call mlx-c or read files, which Miri refuses. A new test
+# that calls mlx-c fails here, so the skip list cannot hide one. The MLX thread
+# lives for the process and still runs when `main` ends, which Miri reports
+# without -Zmiri-ignore-leaks. cargo fails the target on a Miri error or a
+# failed test. The grep fails it when no test ran.
+miri: ## run the MLX-thread hand-off tests under Miri (nightly toolchain with the miri component); not in `make ci`
+	set -o pipefail; MIRIFLAGS=-Zmiri-ignore-leaks cargo +nightly miri test -p rmlx-mlx --lib -- \
+	  mlx_thread::mlx_thread_tests \
+	  --skip a_cpu_op_built_on_one_thread_evaluates_on_another \
+	  --skip a_gpu_op_built_on_one_thread_evaluates_on_another \
+	  --skip a_thread_that_built_an_op_defaults_to_the_mlx_threads_streams \
+	  --skip every_stream_comes_from_the_mlx_thread \
+	  2>&1 | tee /dev/stderr | grep '^test result: ok\. [1-9]' > /dev/null
+
 check-gpu-tests-ignored: ## CI gate: fail if a GPU-touching test in ANY workspace member lacks #[ignore] (would abort the whole test binary under parallel cargo test)
 	@bash scripts/check_gpu_tests_ignored.sh
 
 check-gpu-tests-ignored-fixtures: ## CI gate: the #[ignore] gate still fires on macro-generated and helper-reached GPU tests
 	@bash scripts/check_gpu_tests_ignored_fixtures.sh
 
-gpu-runner-selftest: ## CI gate: the GPU runner reports a failing test and a shader-validation hit in the same run, reports the access mix it saw, and reaches every census-pin verdict (stubbed crates, no GPU)
+gpu-runner-selftest: ## CI gate: the GPU runner reports a failing test and a shader-validation hit in the same run, reports the access mix it saw, reads the verdict from the uninstrumented run, and reaches every census-pin verdict (stubbed crates, no GPU)
 	@bash scripts/run_gpu_tests_selftest.sh
 
 check-named-skip-notices: ## CI gate: a classified GPU test that announces its own stand-down names itself, so the runner can attribute it
 	@bash scripts/check_named_skip_notices.sh
 
-check-named-skip-notices-fixtures: ## CI gate: recall test for the above, 23 cases, each asserting the reason as well as the exit code
+check-named-skip-notices-fixtures: ## CI gate: recall test for the above, 44 cases, each asserting the reason as well as the exit code
 	@bash scripts/check_named_skip_notices_fixtures.sh
 
 check-no-kernel-input-eval: ## CI gate: fail if a Metal-kernel dispatcher blocks on Array::eval() (serialises host vs GPU once per layer per decode step)
@@ -714,6 +734,8 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_claim_bypass_selftest.sh
 	@bash scripts/check_personal_data.sh
 	@bash scripts/check_personal_data_selftest.sh
+	@bash scripts/mlx_restore_pin_selftest.sh
+	@bash scripts/mlx_preflight_selftest.sh
 	@bash scripts/check_kernel_dtype_contract.sh
 	@bash scripts/check_kernel_dtype_contract_fixtures.sh
 	@bash scripts/perf_ab_selftest.sh

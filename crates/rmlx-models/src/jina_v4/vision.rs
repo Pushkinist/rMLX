@@ -186,7 +186,7 @@ impl Attention {
 
         // Additive mask is [1, seq, seq]; SDPA broadcasts over the head axis.
         // mlx-c uses `"array"` for a caller-supplied additive mask array
-        // (matches gemma4 layers.rs:314 — `"additive"` is rejected by 0.6.0).
+        // (matches gemma4 layers.rs:314 — MLX rejects `"additive"`).
         let out =
             scaled_dot_product_attention(&q, &k, &v, self.scale, "array", Some(mask), device)?;
         // [1, H, seq, D] -> [seq, H*D]

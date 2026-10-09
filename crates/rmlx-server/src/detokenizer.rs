@@ -150,7 +150,7 @@ impl TokenizerKind {
 ///
 /// Usage mirrors mlx-lm's contract:
 /// ```ignore
-/// let mut dt = StreamingDetokenizer::new(kind);
+/// let mut dt = StreamingDetokenizer::new(kind, eos_ids);
 /// for id in ids { let seg = dt.step(&tk, id)?; emit(seg); }
 /// let tail = dt.finalize(&tk, &all_ids)?; // lossy flush at true EOS
 /// ```
@@ -166,16 +166,30 @@ pub struct StreamingDetokenizer {
     /// True until the first non-empty segment is emitted (for the
     /// strict-SPM first-segment leading-space rule).
     first_segment_pending: bool,
+    /// The ids that end a generation. Such a token is a control token and
+    /// adds no text, also when the tokenizer file does not mark it special.
+    #[allow(
+        clippy::rc_buffer,
+        reason = "the generator's own list, shared with no copy for each request"
+    )]
+    eos_ids: std::sync::Arc<Vec<u32>>,
 }
 
 impl StreamingDetokenizer {
-    /// Create a new detokenizer for the given tokenizer family.
-    pub fn new(kind: TokenizerKind) -> Self {
+    /// Create a new detokenizer for the given tokenizer family. `eos_ids`
+    /// are the ids that end a generation: [`step`](Self::step) returns no
+    /// text for them.
+    #[allow(
+        clippy::rc_buffer,
+        reason = "the generator's own list, shared with no copy for each request"
+    )]
+    pub fn new(kind: TokenizerKind, eos_ids: std::sync::Arc<Vec<u32>>) -> Self {
         Self {
             kind,
             ids: Vec::new(),
             decoded: String::new(),
             first_segment_pending: true,
+            eos_ids,
         }
     }
 
@@ -196,6 +210,9 @@ impl StreamingDetokenizer {
         tk: &tokenizers::Tokenizer,
         id: u32,
     ) -> Result<String, tokenizers::Error> {
+        if self.eos_ids.contains(&id) {
+            return Ok(String::new());
+        }
         self.ids.push(id);
         let full = tk.decode(&self.ids, true)?;
         Ok(self.diff_emit(full))

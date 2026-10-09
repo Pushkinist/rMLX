@@ -40,11 +40,12 @@
 #
 #   Configuration, not ceiling: the exported metal-gpu-intervals table has no
 #   pipeline or function names, but the BUNDLE does — metal-shader-profiler-
-#   shader-list names every pipeline the run compiled (52 for rmlx in the
-#   bundles under <RMLX_HOME>/traces/mst). What is missing is a join key from a
-#   name to a timed row: the stock template ships Shader Timeline: Disabled, so
-#   metal-shader-profiler-intervals exports zero rows. Pair with
-#   scripts/gputrace_kernels.sh for identity until that changes.
+#   shader-list names each pipeline the process compiled, if the process lives
+#   a few seconds after its last GPU work (docs/PROFILING.md); 52 for rmlx in
+#   the bundles under <RMLX_HOME>/traces/mst. What is missing is a join key
+#   from a name to a timed row: the stock template ships Shader Timeline:
+#   Disabled, so metal-shader-profiler-intervals exports zero rows. A
+#   .gputrace does not name NAX pipelines reliably.
 #
 #   GRANULARITY IS PER ENCODER, one row each. Measured on the bundles above:
 #   14 140 rmlx rows carry 13 996 distinct encoder-ids, and the same run's

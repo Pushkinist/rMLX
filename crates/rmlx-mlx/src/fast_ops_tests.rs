@@ -1,4 +1,5 @@
 use super::*;
+use crate::c_api::{self, CApi};
 use crate::Dtype;
 
 /// Verify rope_dynamic (offset as 0-D i32 array) produces matching output
@@ -52,6 +53,159 @@ fn rope_dynamic_matches_static() {
         assert!(
             diff < 1e-5,
             "rope_dynamic vs rope mismatch at idx {i}: static={sv} dyn={dv} diff={diff}"
+        );
+    }
+}
+
+/// One query, two keys, head_dim 2, scale 1: the scores are [1, 0], so the
+/// output is `softmax([1, 0]) @ V` = [1 + 2w, 2 + 2w] with w = 1 / (1 + e).
+fn one_head_attention_inputs() -> Result<(Array, Array, Array)> {
+    let q = Array::from_f32_slice(&[1.0, 0.0], &[1, 1, 1, 2])?;
+    let k = Array::from_f32_slice(&[1.0, 0.0, 0.0, 1.0], &[1, 1, 2, 2])?;
+    let v = Array::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 2, 2])?;
+    Ok((q, k, v))
+}
+
+fn one_head_attention_reference() -> Vec<f32> {
+    let w = 1.0 / (1.0 + std::f32::consts::E);
+    vec![2.0f32.mul_add(w, 1.0), 2.0f32.mul_add(w, 2.0)]
+}
+
+/// The CPU stream runs MLX's composite SDPA graph, so this needs no Metal.
+/// A wrong argument list in the call does not compile, and `force_fused =
+/// true` fails here: the CPU stream has no fused kernel to force.
+///
+/// On a pair whose `libmlxc.dylib` has another C API than the compiled one,
+/// the call must be refused instead, with nothing passed to mlx-c.
+#[test]
+fn scaled_dot_product_attention_on_cpu_follows_the_c_api_verdict() {
+    let (q, k, v) = one_head_attention_inputs().expect("attention inputs");
+    let out = scaled_dot_product_attention(&q, &k, &v, 1.0, "", None, Device::Cpu);
+    match c_api::verdict() {
+        CApiVerdict::Match(_) => {
+            let got: Vec<f32> = out
+                .expect("sdpa on the CPU stream")
+                .to_bytes()
+                .expect("to_bytes")
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let want = one_head_attention_reference();
+            for (g, w) in got.iter().zip(&want) {
+                assert!((g - w).abs() < 1e-6, "sdpa {got:?} != reference {want:?}");
+            }
+            assert_eq!(got.len(), want.len());
+        }
+        CApiVerdict::Mismatch { .. } => {
+            let err = out.expect_err("a C API mismatch must refuse the call");
+            assert!(err.to_string().contains("mlx-c C API mismatch"), "{err}");
+        }
+    }
+}
+
+/// A mismatch verdict stops the call before mlx-c sees it. On a matched pair
+/// the mlx-c call itself would succeed, so an `Ok` here means the check is
+/// gone or comes after the call.
+#[test]
+fn a_c_api_mismatch_refuses_sdpa_before_the_mlx_c_call() {
+    let (q, k, v) = one_head_attention_inputs().expect("attention inputs");
+    let mismatch = CApiVerdict::Mismatch {
+        compiled: CApi::COMPILED,
+        loaded: CApi::COMPILED.other(),
+    };
+    let err = sdpa_under(mismatch, &q, &k, &v, 1.0, "", None, Device::Cpu)
+        .expect_err("a C API mismatch must refuse the call");
+    assert!(err.to_string().contains("mlx-c C API mismatch"), "{err}");
+}
+
+/// Uniform values in `[-1, 1)` from a fixed sequence, as bf16 on the GPU.
+fn uniform_bf16(state: &mut u64, shape: &[i32]) -> Array {
+    let len: i32 = shape.iter().product();
+    let data: Vec<f32> = (0..len)
+        .map(|_| {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            (*state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+        })
+        .collect();
+    Array::from_f32_slice(&data, shape)
+        .expect("host array")
+        .astype(Dtype::Bf16, Device::Gpu)
+        .expect("astype bf16")
+}
+
+fn f32_bits(a: &Array) -> Vec<u32> {
+    let f32_array = a.astype(Dtype::F32, Device::Gpu).expect("astype f32");
+    f32_array.eval().expect("materialise");
+    f32_array
+        .to_bytes()
+        .expect("to_bytes")
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect()
+}
+
+/// The call the rule pads, against the same call handed to MLX as it is.
+///
+/// Only this crate can build the unpadded node: every other caller passes the
+/// rule. The key rows are a multiple of 32, so the unpadded node is not in the
+/// configuration that fails under the instrument, and this test reads the
+/// same under the GPU runner's instrumented pass. The rule is on the query
+/// rows alone and pads these calls.
+///
+/// The bound is bit equality, and it is the measured result on these two
+/// shapes. MLX compiles the kernel for "query rows a multiple of 64" or not.
+/// That the two differ only in how the last partial block of query rows is
+/// loaded is a reading of the kernel, not checked in its source.
+#[test]
+#[ignore = "evaluates attention on the Metal GPU"]
+fn a_padded_call_returns_the_rows_of_the_unpadded_node() {
+    // (query rows, key rows, query heads, kv heads): the Qwen3.5 head layout,
+    // and one KV head with the query rows as long as the keys allow.
+    for (q_rows, k_rows, q_heads, kv_heads) in [(1025, 3072, 8, 2), (1296, 1312, 8, 1)] {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let q = uniform_bf16(&mut state, &[1, q_heads, q_rows, 256]);
+        let k = uniform_bf16(&mut state, &[1, kv_heads, k_rows, 256]);
+        let v = uniform_bf16(&mut state, &[1, kv_heads, k_rows, 256]);
+        let offset = (k_rows - q_rows) as usize;
+        let mut mask_host = vec![0.0f32; (q_rows * k_rows) as usize];
+        for (i, row) in mask_host.chunks_exact_mut(k_rows as usize).enumerate() {
+            for hidden in &mut row[offset + i + 1..] {
+                *hidden = -1e30;
+            }
+        }
+        let mask = Array::from_f32_slice(&mask_host, &[1, 1, q_rows, k_rows])
+            .expect("mask")
+            .astype(Dtype::Bf16, Device::Gpu)
+            .expect("mask bf16");
+
+        assert_eq!(
+            padded_query_rows(&q, &v, "array", Device::Gpu),
+            Some((q_rows, (q_rows + 63) / 64 * 64)),
+            "the rule must pad this call"
+        );
+        let unpadded = attention_node(&q, &k, &v, 0.5, "array", Some(&mask), Device::Gpu, None)
+            .expect("unpadded node");
+        let padded = sdpa_under(
+            c_api::verdict(),
+            &q,
+            &k,
+            &v,
+            0.5,
+            "array",
+            Some(&mask),
+            Device::Gpu,
+        )
+        .expect("padded call");
+        assert_eq!(padded.shape(), unpadded.shape());
+        let (padded, unpadded) = (f32_bits(&padded), f32_bits(&unpadded));
+        assert!(padded.iter().all(|x| f32::from_bits(*x).is_finite()));
+        let first = padded.iter().zip(&unpadded).position(|(a, b)| a != b);
+        assert_eq!(
+            first, None,
+            "{q_rows} query rows over {k_rows} keys: the padded call differs from the unpadded \
+             node at flat index {first:?}"
         );
     }
 }

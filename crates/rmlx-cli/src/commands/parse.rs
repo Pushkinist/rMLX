@@ -89,7 +89,7 @@ impl ClaimedDevice {
 pub(crate) fn parse_device(s: &str) -> anyhow::Result<ClaimedDevice> {
     let claimed = device_from_flag(s, || check_claim(claim_gpu()))?;
     if !claimed.holds_claim() {
-        rmlx_mlx::forbid_gpu();
+        rmlx_mlx::forbid_gpu()?;
     }
     Ok(claimed)
 }

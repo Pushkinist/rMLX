@@ -191,19 +191,21 @@ pub fn generate_greedy<'a>(
             token_id = last_id,
             "qwen3_5moe generate_greedy: prompt cache EXACT HIT"
         );
-        steps.push(ProbeStep {
-            token_id: last_id,
-            piece: piece.into_boxed_str(),
-            max_abs_logit: 0.0,
-            nan_count: 0,
-            logprobs: None,
-        });
-        step_fn(steps.last().unwrap());
-        // Exact-hit token into history.
-        token_history.push(last_id);
-
-        // EOS-stop. If prefill emitted an EOS already, no decode steps.
-        if eos_ids.contains(&last_id) {
+        let ends = crate::decode_loop::emit_replayed_token(
+            &mut constraint,
+            step_fn,
+            &mut steps,
+            token_history,
+            eos_ids,
+            ProbeStep {
+                token_id: last_id,
+                piece: piece.into_boxed_str(),
+                max_abs_logit: 0.0,
+                nan_count: 0,
+                logprobs: None,
+            },
+        );
+        if ends {
             return Ok(steps);
         }
 
@@ -625,15 +627,8 @@ pub fn generate_greedy<'a>(
             crate::prompt_cache::snapshot_clone(arch, &kv_caches, KvCache::try_deep_clone),
             crate::prompt_cache::snapshot_clone(arch, &lin_caches, LinearAttnCache::try_deep_clone),
         ) {
-            // Materialize GPU arrays on the current inference thread before
-            // storing in the prompt cache.  Each spawn_blocking request runs
-            // on its own tokio thread, which has its own Metal GPU stream
-            // (registered by ensure_gpu_default_stream() in arch::generate_greedy).
-            // If these lazy arrays are stored as-is and later evicted on a
-            // *different* inference thread (a subsequent request), that thread's
-            // eval_for_spill call will fail with "There is no Stream(gpu, N) in
-            // current thread" because stream N is only registered here.
-            // Pre-eval on this thread makes eval() a no-op from any future thread.
+            // Evaluate the copies before the store, so the entry holds its own
+            // buffers and not a graph over the live caches.
             match kvs
                 .iter()
                 .try_for_each(|c| c.eval_for_spill())

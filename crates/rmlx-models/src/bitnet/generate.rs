@@ -134,17 +134,21 @@ pub fn generate_greedy(
         // produced its logits, and the cache entry stores the id and piece only.
         // Decode steps below still carry them. Same shape as the other
         // exact-hit paths that do not persist a logprob payload.
-        steps.push(ProbeStep {
-            token_id: last_id,
-            piece: piece.into_boxed_str(),
-            max_abs_logit: 0.0,
-            nan_count: 0,
-            logprobs: None,
-        });
-        step_fn(steps.last().unwrap());
-        token_history.push(last_id);
-
-        if eos_ids.contains(&last_id) {
+        let ends = crate::decode_loop::emit_replayed_token(
+            &mut constraint,
+            step_fn,
+            &mut steps,
+            token_history,
+            eos_ids,
+            ProbeStep {
+                token_id: last_id,
+                piece: piece.into_boxed_str(),
+                max_abs_logit: 0.0,
+                nan_count: 0,
+                logprobs: None,
+            },
+        );
+        if ends {
             return Ok(steps);
         }
 

@@ -76,6 +76,54 @@ store builds the base's storage variant.
 The `update` entry of `Mixed` is `update_mixed`, which refuses. The `Mixed`
 per-step append is `update_and_sdpa_mixed` in `sdpa.rs`.
 
+## In-place update
+
+A step writes its K and V rows into buffers of many positions with
+`slice_update`. MLX writes in place only when nothing else owns the old buffer
+when MLX evaluates the update (`mlx/backend/common/copy.h:25-48` and
+`mlx/array.h:304-306`, MLX v0.32.3). If something owns it, MLX allocates a new
+buffer and copies the full buffer, at each step. Two kinds of owner cause this:
+
+- **A handle that the cache keeps.** The cache replaces its handle with the
+  result of `slice_update` before it evaluates that result. An evaluation
+  before the replacement copies the buffer at each step.
+  `crates/rmlx-kv-quant/src/kvcache/in_place_update_tests.rs` holds this on the
+  CPU for the bf16 mirror of each codec that decodes from it, for a cache
+  built without `with_shares_kv(true)`, for the raw prefill buffer and for the
+  ring. The `Mixed` / `RotK` mirror exists only in a cache built with it
+  (every Gemma 4 layer), and this test does not drive it.
+- **GPU work that is not complete.** MLX keeps the buffer of each input of a
+  command buffer until the GPU completes that command buffer: the completion
+  handler holds them (`mlx/backend/metal/eval.cpp:47-68`), and the queue makes
+  command buffers with unretained references (`device.cpp:323`, `:559`). The
+  last reader of a K/V buffer in step t is the attention of its layer and, on
+  a layer whose K/V later layers share, the attention of each of those layers.
+  If the CPU encodes the update of step t+1 before the GPU completes that last
+  reader, MLX copies.
+
+The second owner depends on how far the CPU is ahead of the GPU. The decode
+loop encodes step t+1 while the GPU runs step t. Metal stops the CPU when a
+queue holds 64 command buffers that are not complete
+(`mlx/backend/metal/device.cpp:315` makes the queue with the default limit),
+and each `async_eval` commits one or more command buffers. Thus the update
+stays in place when more than 64 command buffers separate the last reader from
+the update of step t+1. The cache evaluates the K buffer and the V buffer with
+one `async_eval` each. On Ternary-Bonsai-8B (36 layers) that distance is then
+one step, and each update stays in place. With one `async_eval` for both
+buffers, MLX copies them on that model: decode is 22 % slower and the Metal
+allocation is 497 MB larger (`scripts/perf_ab.sh`, 8 slots).
+
+On gemma-4-e2b, layers 15 to 34 read the K/V of layers 13 and 14. For those
+two layers the distance is shorter, and they copy. A per-layer tally of one
+100-token decode after a 4117-token prompt, at the default KV quant, with one
+`async_eval` per buffer, on mlx 0.32.3: layers 13 and 14 copied 353 of 392
+updates, and layers 0 to 12 copied none of 2548.
+
+No CPU test sees this owner, because it depends on GPU timing.
+`metal_gen_alloc_mb` sees the copies only when the copied buffers are large:
+on gemma-4-e2b it shows 1096.1 MB with 353 copies, and the same with one
+`async_eval` for both buffers (2546 copies).
+
 ## One body per store shape
 
 24 of the 27 `KvStorage` variants hold store slots. 19 hold a K

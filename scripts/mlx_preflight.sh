@@ -1,30 +1,35 @@
 #!/usr/bin/env bash
-# Verify the linked MLX stack is sane before benching, and — on hardware that
-# has a Neural Accelerator — that it is actually nax-capable.
+# Stop a measurement exactly where `rmlx baseline` and `rmlx bench` refuse:
+# an mlx-c C API mismatch on every host, and a pair that is not the pinned,
+# nax-capable one on M5 and later or on a host whose chip cannot be
+# identified. On an identified M1-M4 host the pin does not bind, so the
+# preflight passes there when the C API matches.
 #
-# Two separate concerns, deliberately not conflated:
+# A C API mismatch is fixed by a rebuild. The restore is named for it only
+# when the binary's line names it: where the pinned pair is required (the pin
+# binds, or the chip is not identified) and the loaded pair is not the pinned
+# one.
 #
-#   1. Portable checks (every Apple Silicon host): the `opt` symlinks resolve,
-#      Mach-O install names are relocated, and the built binary can launch.
-#      A broken stack here means `rmlx` does not run at all. These read the
-#      package manager's view, which is a pre-filter and not the truth — see
-#      step 4.
+# Two sources, never both:
 #
-#   2. NA-class hosts only (M5 and later): `mlx.metallib` must actually contain
-#      `steel_gemm_fused_nax` GEMM kernels, and the linked pair must be the one
-#      the pin names. Some homebrew-core `arm64_tahoe` bottles ship ZERO nax
-#      kernels, which slows GEMM-bound prefill. Decode is largely unaffected,
-#      so the failure is silent: benches still run and still look plausible.
-#      See docs/FFI.md.
+#   1. A built binary (target/release-perf/rmlx). It must launch, and its own
+#      `mlx_pin` healthcheck line decides: GREEN or INFO passes, anything else
+#      stops. That line is `PinCheck::refusal` in crates/rmlx-mlx/src/pin.rs,
+#      the verdict `rmlx baseline` and `rmlx bench` apply, read in the process
+#      that has the pair loaded. `MLX_PREFIX` / `MLX_C_PREFIX`
+#      (crates/rmlx-mlx/build.rs) can load a pair that the `opt` records do
+#      not name, so with a binary the records are not read.
 #
-# On M1-M4 both the nax check and the pinned-pair check are skipped, not failed
-# — those bottles legitimately contain no nax kernels because the hardware has
-# no Neural Accelerator, so the pinned pair buys nothing there.
+#   2. No binary yet: a pre-filter on the `opt` records, for the pair a build
+#      would load. The records must resolve to relocated dylibs. Unless the
+#      chip is an identified M1-M4, mlx.metallib must carry
+#      `steel_gemm_fused_nax` kernels and the pair must be the pinned one. The
+#      C API cannot be known without a binary.
 #
 # The pinned pair is read from crates/rmlx-mlx/mlx-pin.txt, never restated here.
 #
 # Run before any measurement. Exits non-zero and names the fix on failure.
-# Background: .rmlx/mlx-homebrew-nax-regression.md
+# Background: docs/MLX_PAIR.md
 
 set -uo pipefail
 
@@ -46,16 +51,59 @@ hint_restore() {
 	echo "  Restore the nax-capable pair:  make mlx-restore-pin" >&2
 }
 
-# --- host class -------------------------------------------------------------
-# The Neural Accelerator arrives with M5. Anything earlier legitimately has no
-# nax kernels, so requiring them there would be a false failure.
-brand=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "unknown")
-na_class=0
-if [[ "$brand" =~ Apple\ M([0-9]+) ]]; then
-	[ "${BASH_REMATCH[1]}" -ge 5 ] && na_class=1
+# --- 1. the built binary's own verdict ---------------------------------------
+bin="target/release-perf/rmlx"
+if [ -e "$bin" ] && [ ! -x "$bin" ]; then
+	fail "$bin is not executable, so its verdict cannot be read. Build it again" \
+		"(make build-perf), then run this again"
+	exit 1
+fi
+if [ -x "$bin" ]; then
+	if ! "$bin" --version >/dev/null 2>&1; then
+		fail "$bin cannot launch against the MLX it loads (dyld failure? ABI mismatch?)"
+		hint_restore
+		exit 1
+	fi
+	# Only the mlx_pin line: a red elsewhere in healthcheck (no registry, no
+	# metrics DB) is not this gate's business.
+	pin_line=$("$bin" healthcheck --human 2>/dev/null | grep '^mlx_pin:')
+	if [ -z "$pin_line" ]; then
+		fail "$bin reported no mlx_pin line — cannot confirm what the binary loaded"
+		exit 1
+	fi
+	case "$pin_line" in
+	"mlx_pin: GREEN "* | "mlx_pin: INFO "*)
+		echo "preflight ok: the built binary reports $pin_line"
+		exit 0
+		;;
+	esac
+	fail "the built binary refuses to measure: $pin_line"
+	# A restore does not change the binary, so a C API mismatch takes the
+	# restore only when its line names it.
+	case "$pin_line" in
+	*"C API mismatch"*"make mlx-restore-pin"*) hint_restore ;;
+	*"C API mismatch"*) ;;
+	*) hint_restore ;;
+	esac
+	exit 1
 fi
 
-# --- 1. portable: symlinks resolve -----------------------------------------
+# --- 2. no binary: pre-filter on the opt records -----------------------------
+echo "note: no $bin yet — the opt records are a pre-filter; the binary's own" \
+	"verdict is what gates the measurement (rmlx baseline / rmlx bench)."
+
+# The rule of rmlx_core::apple_gpu::parse_apple_generation: only an identified
+# M1-M4 is exempt. M5 and later, and a brand it cannot parse, need the pin.
+brand=$(sysctl -n machdep.cpu.brand_string 2>/dev/null)
+[ -n "$brand" ] || brand="unknown"
+exempt=0
+if [[ "$brand" =~ ^[[:space:]]*(Apple|apple|APPLE)\ [Mm]0*[1-4]([^0-9]|$) ]]; then
+	exempt=1
+	host="no Neural Accelerator, the pin does not bind"
+else
+	host="the pin binds, or the chip is not identified"
+fi
+
 for keg in mlx mlx-c; do
 	link="$PREFIX/opt/$keg"
 	if [ ! -e "$link" ]; then
@@ -68,7 +116,6 @@ done
 mlx_ver=$(basename "$(readlink "$PREFIX/opt/mlx")")
 mlxc_ver=$(basename "$(readlink "$PREFIX/opt/mlx-c")")
 
-# --- 2. portable: install names relocated ----------------------------------
 # A hand-poured bottle keeps Homebrew's @@HOMEBREW_PREFIX@@ placeholders, which
 # dyld cannot resolve.
 for lib in "$PREFIX/opt/mlx/lib/libmlx.dylib" "$PREFIX/opt/mlx-c/lib/libmlxc.dylib"; do
@@ -84,81 +131,41 @@ for lib in "$PREFIX/opt/mlx/lib/libmlx.dylib" "$PREFIX/opt/mlx-c/lib/libmlxc.dyl
 	fi
 done
 
-# --- 3. NA-class only: nax kernels must be present --------------------------
+if [ "$exempt" = 1 ]; then
+	echo "preflight ok: $brand ($host), mlx $mlx_ver + mlx-c $mlxc_ver, nax check skipped"
+	exit 0
+fi
+
 metallib="$PREFIX/opt/mlx/lib/mlx.metallib"
-nax="n/a"
-if [ "$na_class" = "1" ]; then
-	if [ ! -f "$metallib" ]; then
-		fail "$metallib missing"
-		hint_restore
-		exit 1
-	fi
-	# `grep -c` prints 0 whether the file has no kernels or `strings` could not
-	# read it at all, and the exit status that tells them apart is swallowed by
-	# the pipe. Take the reader's status first: "could not look" must not be
-	# reported as "ships none", which sends the operator to restore a bottle
-	# over a broken toolchain.
-	if ! symbols=$(strings "$metallib"); then
-		fail "cannot read $metallib (is \`strings\` present?) — the nax kernel check" \
-			"could not run, so this is not a finding about the bottle"
-		exit 1
-	fi
-	nax=$(printf '%s\n' "$symbols" | grep -c steel_gemm_fused_nax)
-	if [ "$nax" -lt 1 ]; then
-		fail "$brand has a Neural Accelerator but mlx $mlx_ver ships 0 nax GEMM kernels" \
-			"— GEMM-bound prefill would be ~2-3.8x slow (pinned: mlx $PIN_MLX + mlx-c $PIN_MLXC)"
-		hint_restore
-		exit 1
-	fi
-	# The pair is the validated unit even when the kernels are present: mlx and
-	# mlx-c are ABI-coupled, and any prefill number measured across the pin
-	# boundary is not comparable to one from the other side. On a host the pin
-	# binds, that is a refusal to measure, not a note.
-	if [ "$mlx_ver" != "$PIN_MLX" ] || [ "$mlxc_ver" != "$PIN_MLXC" ]; then
-		fail "linked mlx $mlx_ver + mlx-c $mlxc_ver is not the pinned pair" \
-			"(mlx $PIN_MLX + mlx-c $PIN_MLXC, crates/rmlx-mlx/mlx-pin.txt)"
-		hint_restore
-		exit 1
-	fi
+if [ ! -f "$metallib" ]; then
+	fail "$metallib missing"
+	hint_restore
+	exit 1
 fi
-
-# --- 4. the binary's own answer, which outranks everything above ------------
-# Steps 1-3 read the package manager's symlinks. That is a cheap pre-filter,
-# not the truth: `MLX_PREFIX` / `MLX_C_PREFIX` (crates/rmlx-mlx/build.rs) can
-# link a build against an install nothing above inspects. Only the binary can
-# say what dyld resolved for it, so when one exists it is the authority.
-#
-# `rmlx baseline` and `rmlx bench` refuse on their own if this is wrong; asking
-# here just moves the failure before the model load.
-bin="target/release-perf/rmlx"
-if [ -x "$bin" ]; then
-	if ! "$bin" --version >/dev/null 2>&1; then
-		fail "$bin cannot launch against the linked MLX (dyld failure? ABI mismatch?)"
-		hint_restore
-		exit 1
-	fi
-	# Only the mlx_pin line: a red elsewhere in healthcheck (no registry, no
-	# metrics DB) is not this gate's business.
-	pin_line=$("$bin" healthcheck --human 2>/dev/null | grep '^mlx_pin:')
-	if [ -z "$pin_line" ]; then
-		fail "$bin reported no mlx_pin line — cannot confirm what the binary loaded"
-		exit 1
-	fi
-	case "$pin_line" in
-	*"GREEN"*) echo "binary agrees: $pin_line" ;;
-	*)
-		fail "the built binary did not load the pinned pair: $pin_line"
-		hint_restore
-		exit 1
-		;;
-	esac
-else
-	echo "note: no $bin yet — the symlink checks above are a pre-filter; the binary's" \
-		"own verdict is what gates the measurement (rmlx baseline / rmlx bench)."
+# `grep -c` prints 0 whether the file has no kernels or `strings` could not
+# read it at all, and the exit status that tells them apart is swallowed by
+# the pipe. Take the reader's status first: "could not look" must not be
+# reported as "ships none", which sends the operator to restore a bottle
+# over a broken toolchain.
+if ! symbols=$(strings "$metallib"); then
+	fail "cannot read $metallib (is \`strings\` present?) — the nax kernel check" \
+		"could not run, so this is not a finding about the bottle"
+	exit 1
 fi
-
-if [ "$na_class" = "1" ]; then
-	echo "preflight ok: $brand (NA-class), pinned mlx $mlx_ver + mlx-c $mlxc_ver, $nax nax GEMM kernel occurrences"
-else
-	echo "preflight ok: $brand (no Neural Accelerator), mlx $mlx_ver + mlx-c $mlxc_ver, nax check skipped"
+nax=$(printf '%s\n' "$symbols" | grep -c steel_gemm_fused_nax)
+if [ "$nax" -lt 1 ]; then
+	fail "$brand ($host): mlx $mlx_ver ships 0 nax GEMM kernels" \
+		"— GEMM-bound prefill would be ~2-3.8x slow (pinned: mlx $PIN_MLX + mlx-c $PIN_MLXC)"
+	hint_restore
+	exit 1
 fi
+# The pair is the validated unit even when the kernels are present: mlx and
+# mlx-c are ABI-coupled, and any prefill number measured across the pin
+# boundary is not comparable to one from the other side.
+if [ "$mlx_ver" != "$PIN_MLX" ] || [ "$mlxc_ver" != "$PIN_MLXC" ]; then
+	fail "linked mlx $mlx_ver + mlx-c $mlxc_ver is not the pinned pair" \
+		"(mlx $PIN_MLX + mlx-c $PIN_MLXC, crates/rmlx-mlx/mlx-pin.txt)"
+	hint_restore
+	exit 1
+fi
+echo "preflight ok: $brand ($host), pinned mlx $mlx_ver + mlx-c $mlxc_ver, $nax nax GEMM kernel occurrences"

@@ -516,13 +516,12 @@ impl RotatingState {
         let vbuf = self.values.as_ref().unwrap();
         let k_updated = kbuf.slice_update(new_k, &start, &stop_k, &strides, device)?;
         let v_updated = vbuf.slice_update(new_v, &start, &stop_v, &strides, device)?;
-        self.keys = Some(k_updated);
-        self.values = Some(v_updated);
+        // Replace the old buffers before the evaluation: MLX copies a buffer
+        // that has another owner (docs/KV_UPDATE_PATH.md, "In-place update").
+        let _ = self.keys.insert(k_updated).async_eval();
+        let _ = self.values.insert(v_updated).async_eval();
         self.offset += s;
         self.idx += s;
-
-        let _ = self.keys.as_ref().unwrap().async_eval();
-        let _ = self.values.as_ref().unwrap().async_eval();
 
         if self.offset < self.max_size {
             let kshape = self.keys.as_ref().unwrap().shape();

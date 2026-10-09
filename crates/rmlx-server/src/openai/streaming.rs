@@ -16,11 +16,12 @@ use crate::openai::chat::bare_json_to_tool_call;
 use crate::openai::errors::engine_error_category;
 use crate::tool_parser::{ParsedToolCall, ToolCallStreamParser};
 
+use super::json_reply::{JsonReply, NOT_ENGAGED_MESSAGE, NOT_ENGAGED_TYPE};
 use super::response::{
     select_finish_reason, to_response_tool_call, ChatCompletionChunk, ChatLogprobs, DeltaContent,
     StreamChoice, ToolCall, Usage,
 };
-use super::state::ApiErrorCounters;
+use super::state::{ApiErrorCategory, ApiErrorCounters};
 
 // ── StreamState ───────────────────────────────────────────────────────────────
 
@@ -32,15 +33,10 @@ pub(crate) struct StreamState {
     pub(crate) id: String,
     pub(crate) model: String,
     pub(crate) created: u64,
-    /// When `true` (json_object / json_schema mode), pre-JSON tokens
-    /// are buffered here and discarded if they form a markdown-fence prefix.
-    /// Once the first JSON value byte is seen, `json_fence_buf_done` is set
-    /// and all subsequent pieces flow directly to content.
-    pub(crate) json_object_mode: bool,
-    /// Pre-engagement fence buffer for the streaming path (see above).
-    pub(crate) json_fence_buf: String,
-    /// Set once the fence-buffer phase is complete (first JSON byte seen).
-    pub(crate) json_fence_buf_done: bool,
+    /// `Some` when the request built a constraint that reports where its
+    /// grammar engaged (`response_format`, or a forced tool call). The reply
+    /// is the answer text from that byte on.
+    pub(crate) json_reply: Option<JsonReply>,
     /// Prompt token count captured before `generator.generate` consumes
     /// the `GenerationRequest`. Used for the usage-summary chunk.
     pub(crate) prompt_tokens: u32,
@@ -49,9 +45,9 @@ pub(crate) struct StreamState {
     pub(crate) completion_tokens: u32,
     /// Whether to emit a usage-summary chunk before `[DONE]`.
     pub(crate) include_usage: bool,
-    /// When true (tool_choice=required/named), the model is constrained
-    /// to emit bare JSON. At stream-end, the accumulated JSON is converted
-    /// into a tool_calls envelope rather than streamed as content.
+    /// True for a forced tool call (tool_choice=required/named). The content
+    /// is held and converted to a tool_calls envelope at stream-end. The call
+    /// is constrained to bare JSON when `json_reply` is `Some`.
     pub(crate) bare_json_tool_call_mode: bool,
     /// Accumulated content for bare_json_tool_call_mode. All non-empty
     /// content pieces are appended here; converted at done-token boundary.
@@ -178,11 +174,11 @@ pub(super) fn chunk_to_event(chunk: &ChatCompletionChunk) -> Event {
 /// Shape mirrors the blocking route's OpenAI error envelope
 /// (`{"error":{"message","type"}}`), so the same fault reads the same either
 /// way. `type` is the stable automation key, `message` is human.
-pub(super) fn error_event(e: &rmlx_core::Error) -> Event {
+pub(super) fn error_event(message: &str, kind: &str) -> Event {
     let body = serde_json::json!({
         "error": {
-            "message": e.to_string(),
-            "type": crate::openai::errors::engine_error_type(e),
+            "message": message,
+            "type": kind,
         }
     });
     Event::default().data(serde_json::to_string(&body).unwrap_or_default())
@@ -214,7 +210,10 @@ pub(crate) fn handle_streaming_token(
             // failure as a completion. The caller chains the terminating
             // `[DONE]` onto every stream, so emitting one here would duplicate
             // it.
-            return vec![Ok(error_event(&e))];
+            return vec![Ok(error_event(
+                &e.to_string(),
+                crate::openai::errors::engine_error_type(&e),
+            ))];
         }
         Ok(t) => t,
     };
@@ -243,12 +242,19 @@ pub(crate) fn handle_streaming_token(
 
     let mut out: Vec<Result<Event, std::convert::Infallible>> = Vec::new();
 
-    // bare_json_tool_call_mode — when tool_choice=required/named the
-    // constraint forces bare JSON output. For thinking models (Bonsai/Qwen3)
+    // A forced tool call is the text from the engagement byte on, in either
+    // channel.
+    let mut piece = piece;
+    if let (Some(reply), true) = (state.json_reply.as_mut(), state.bare_json_tool_call_mode) {
+        reply.receive(state.completion_tokens, &piece);
+        piece.drain(..reply.release(&piece));
+    }
+
+    // A constrained forced tool call: for thinking models (Bonsai/Qwen3)
     // whose template starts inside <think>, the constrained JSON is emitted
-    // while is_thinking == true. Route ALL pieces to bare_json_accum in this
-    // mode so the done-handler can extract and convert the tool call.
-    if is_thinking && state.bare_json_tool_call_mode {
+    // while is_thinking == true, so every piece goes to bare_json_accum. With
+    // no constraint the reasoning is reasoning, as for `tool_choice: auto`.
+    if is_thinking && state.bare_json_tool_call_mode && state.json_reply.is_some() {
         if !piece.is_empty() {
             state.bare_json_accum.push_str(&piece);
         }
@@ -299,42 +305,38 @@ pub(crate) fn handle_streaming_token(
             out.push(Ok(chunk_to_event(&chunk)));
         }
     } else {
-        // Fence suppression for streaming. When in json_object/json_schema
-        // mode and we have not yet seen the first JSON value byte, buffer the
-        // piece. Once a JSON-value-starter byte appears, discard everything
-        // before it (the fence) and emit only from that byte onward.
-        let piece = if state.json_object_mode && !state.json_fence_buf_done && !piece.is_empty() {
-            state.json_fence_buf.push_str(&piece);
-            // Scan for first JSON value-starter byte.
-            let start_idx = state.json_fence_buf.as_bytes().iter().position(|&b| {
-                matches!(
-                    b,
-                    b'{' | b'[' | b'"' | b't' | b'f' | b'n' | b'-' | b'0'..=b'9'
-                )
-            });
-            if let Some(idx) = start_idx {
-                state.json_fence_buf_done = true;
-                let pre = &state.json_fence_buf[..idx];
-                if !crate::constraint_json::schema::is_only_fence_or_whitespace(pre) {
+        // Stop strings are matched on the whole answer text, as on the
+        // non-streamed path; the reply is what they let through from the
+        // engagement byte on.
+        let piece = match state.json_reply.as_mut() {
+            Some(reply) if !state.bare_json_tool_call_mode => {
+                let started = reply.start().is_some();
+                reply.receive(state.completion_tokens, &piece);
+                if let (false, Some(dropped_bytes)) = (started, reply.start()) {
                     tracing::debug!(
-                        pre_text = %pre,
-                        "streaming json_object_mode: non-fence pre-text before JSON; kept"
-                    );
-                } else if !pre.is_empty() {
-                    tracing::debug!(
-                        "streaming json_object_mode: suppressed fence/whitespace prefix"
+                        dropped_bytes,
+                        "text before the engagement byte is not in the `response_format` reply"
                     );
                 }
-                // Take only from idx onward.
-                let flushed = state.json_fence_buf.split_off(idx);
-                state.json_fence_buf.clear();
-                flushed
-            } else {
-                // Not yet at a JSON byte — fully buffered, nothing to emit.
-                String::new()
+                let mut released = if state.stop_hit {
+                    String::new()
+                } else if state.stop_matcher.is_active() {
+                    let pushed = state.stop_matcher.push(&piece);
+                    if pushed.stopped {
+                        state.stop_hit = true;
+                        tracing::debug!(
+                            stop = ?pushed.matched,
+                            "stop sequence matched (streaming); suppressing rest"
+                        );
+                    }
+                    pushed.emit
+                } else {
+                    piece
+                };
+                released.drain(..reply.release(&released));
+                released
             }
-        } else {
-            piece
+            _ => piece,
         };
 
         // Drain parser-derived (passthrough_text, new_calls) without holding
@@ -363,6 +365,11 @@ pub(crate) fn handle_streaming_token(
             if state.bare_json_tool_call_mode {
                 // Accumulate rather than stream; converted at done boundary.
                 state.bare_json_accum.push_str(&text);
+            } else if state.json_reply.is_some() {
+                // The stop strings were matched before the cut.
+                let chunk =
+                    make_content_chunk(state, Some(text), None, false, None, tok_logprobs.take());
+                out.push(Ok(chunk_to_event(&chunk)));
             } else if state.stop_hit {
                 // A stop already matched; suppress all further content.
             } else if state.stop_matcher.is_active() && !state.any_tool_calls {
@@ -443,7 +450,12 @@ pub(crate) fn handle_streaming_token(
         // If a stop matcher is active and no stop matched, flush the
         // held-back tail (it cannot grow into a stop string at end-of-stream).
         if !state.stop_hit && state.stop_matcher.is_active() {
-            let tail = state.stop_matcher.finalize();
+            let mut tail = state.stop_matcher.finalize();
+            if let (Some(reply), false) =
+                (state.json_reply.as_mut(), state.bare_json_tool_call_mode)
+            {
+                tail.drain(..reply.release(&tail));
+            }
             if !tail.is_empty() {
                 let chunk = make_content_chunk(state, Some(tail), None, false, None, None);
                 out.push(Ok(chunk_to_event(&chunk)));
@@ -458,12 +470,16 @@ pub(crate) fn handle_streaming_token(
             out.push(Ok(chunk_to_event(&chunk)));
         }
 
-        // bare_json_tool_call_mode — convert accumulated JSON to tool call.
-        if state.bare_json_tool_call_mode && !state.any_tool_calls {
-            let json_str =
-                crate::openai::generate::extract_top_level_json_value(&state.bare_json_accum)
-                    .unwrap_or_default();
-            if let Some(tc_parsed) = bare_json_to_tool_call(&json_str) {
+        // A forced tool call: the held content is the call, or, around a
+        // marked call that the parser read, it is content.
+        if state.bare_json_tool_call_mode && state.any_tool_calls {
+            if !state.bare_json_accum.is_empty() {
+                let accum = std::mem::take(&mut state.bare_json_accum);
+                let chunk = make_content_chunk(state, Some(accum), None, false, None, None);
+                out.push(Ok(chunk_to_event(&chunk)));
+            }
+        } else if state.bare_json_tool_call_mode {
+            if let Some(tc_parsed) = bare_json_to_tool_call(&state.bare_json_accum) {
                 tracing::debug!(
                     name = %tc_parsed.name,
                     "streaming bare_json_tool_call_mode: synthesised tool call at done"
@@ -477,13 +493,33 @@ pub(crate) fn handle_streaming_token(
             } else if !state.bare_json_accum.is_empty() {
                 tracing::warn!(
                     json = %state.bare_json_accum,
-                    "bare_json_tool_call_mode: could not parse constrained output; returning as content"
+                    "bare_json_tool_call_mode: a forced tool call did not parse; returning as content"
                 );
                 // Fallback: emit accumulated text as content.
                 let accum = std::mem::take(&mut state.bare_json_accum);
                 let chunk = make_content_chunk(state, Some(accum), None, false, None, None);
                 out.push(Ok(chunk_to_event(&chunk)));
             }
+        }
+
+        // Released text that ends before the engagement byte was never
+        // checked. No content delta is out, so the error event replaces the
+        // `finish_reason` chunk, as the non-streamed path answers 502.
+        let unchecked = !state.bare_json_tool_call_mode
+            && !state.any_tool_calls
+            && state.json_reply.as_ref().is_some_and(|r| !r.engaged());
+        if unchecked {
+            state.error_counts.increment(ApiErrorCategory::Upstream);
+            state
+                .lifetime_requests_failed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                model_id = %state.model,
+                request_id = %state.id,
+                completion_tokens = state.completion_tokens,
+                "refusing: the streamed text ends before the `response_format` grammar engaged"
+            );
+            return vec![Ok(error_event(NOT_ENGAGED_MESSAGE, NOT_ENGAGED_TYPE))];
         }
 
         // A stop-sequence match forces finish_reason="stop", overriding

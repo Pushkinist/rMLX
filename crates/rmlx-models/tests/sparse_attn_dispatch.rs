@@ -353,15 +353,15 @@ fn sparse_attn_dispatches_on_seedless_planar_k() {
     let delta = after - before;
     eprintln!("seedless: sparse_attn aggregate delta = {delta}");
     if delta == 0 {
-        if strict {
-            panic!("RMLX_SPARSE_ATTN_STRICT=1: sparse_attn aggregate counter did not increment");
-        } else {
-            eprintln!(
-                "sparse_attn aggregate counter delta == 0 on seedless call \
-                 (non-strict; skipping)"
-            );
-            return;
-        }
+        assert!(
+            !strict,
+            "RMLX_SPARSE_ATTN_STRICT=1: sparse_attn aggregate counter did not increment"
+        );
+        eprintln!(
+            "SKIP sparse_attn_dispatches_on_seedless_planar_k: the aggregate counter \
+             did not move on the seedless call (non-strict)"
+        );
+        return;
     }
     assert_eq!(
         delta, 2,
@@ -503,7 +503,10 @@ fn sparse_attn_seedless_planar_k_v2_budgets_wire_through() {
     let v1_delta = after - before;
     if v1_delta == 0 {
         assert!(!strict, "strict: v1 sparse_attn counter did not increment");
-        eprintln!("v1 leg: counter did not move; skipping (non-strict)");
+        eprintln!(
+            "SKIP sparse_attn_seedless_planar_k_v2_budgets_wire_through: the v1 leg counter \
+             did not move (non-strict)"
+        );
         return;
     }
     let v1_vec = array_to_f32(&sparse_v1);
@@ -699,7 +702,10 @@ fn sparse_attn_seedless_planar_k_competing_keys_v2_vs_v1() {
             !strict,
             "strict: v1 competing sparse_attn counter did not increment"
         );
-        eprintln!("competing v1 leg: counter did not move; skipping (non-strict)");
+        eprintln!(
+            "SKIP sparse_attn_seedless_planar_k_competing_keys_v2_vs_v1: the competing v1 leg \
+             counter did not move (non-strict)"
+        );
         return;
     }
     let v1_vec = array_to_f32(&sparse_v1);

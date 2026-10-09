@@ -76,7 +76,12 @@ fn medgemma_golden_tokens_k8v8() {
     let Some(model_path) = common::model_for(&MODEL, "medgemma_golden_tokens_k8v8") else {
         return;
     };
-    common::run_golden_test("medgemma_4b_k8v8", GOLDEN_KV_QUANT, &model_path);
+    common::run_golden_test(
+        "medgemma_golden_tokens_k8v8",
+        "medgemma_4b_k8v8",
+        GOLDEN_KV_QUANT,
+        &model_path,
+    );
 }
 
 /// Loader sibling-parity invariant.

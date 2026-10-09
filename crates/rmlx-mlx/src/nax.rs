@@ -52,7 +52,7 @@ pub(crate) const NAX_GEMM_KERNEL: &str = "steel_gemm_fused_nax";
 /// would make every Mac NA-class.
 const NA_CLASS_GPU_FAMILY: u8 = 10;
 
-/// Read size for the metallib scan. The file is ~124-158 MB, which no startup
+/// Read size for the metallib scan. The file is ~150-200 MB, which no startup
 /// path should hold in memory at once.
 const SCAN_CHUNK: usize = 1 << 20;
 
@@ -158,6 +158,30 @@ fn evaluate(gpu_family: Option<u8>, scan: &KernelScan) -> NaxFinding {
     }
 }
 
+/// What gets the kernels onto this host, by macOS version.
+///
+/// MLX builds them only for a deployment target of macOS 26.2 or later. The
+/// Homebrew bottle for macOS 27 is built so; the one for macOS 26 is built for
+/// target 26 and has none.
+fn nax_fix(macos: Option<(u32, u32)>) -> &'static str {
+    match macos {
+        Some((major, _)) if major >= 27 => {
+            "the Homebrew bottle for this macOS carries them: run `brew upgrade mlx \
+             mlx-c`, or `brew reinstall mlx` at the same version"
+        }
+        Some((26, minor)) if minor >= 2 => {
+            "build mlx from source for a macOS 26.2 deployment target, after \
+             `xcodebuild -downloadComponent MetalToolchain`: docs/MLX_PAIR.md, \
+             \"Building the pinned pair\""
+        }
+        Some(_) => {
+            "no fix exists below macOS 26.2, because MLX builds these kernels only for \
+             a 26.2 deployment target: update macOS"
+        }
+        None => "the macOS version could not be read; see docs/MLX_PAIR.md",
+    }
+}
+
 /// Warn once when this host has a Neural Accelerator and the MLX it loaded
 /// cannot reach it.
 ///
@@ -171,22 +195,21 @@ pub(crate) fn warn_if_nax_kernels_missing() {
     let finding = evaluate(gpu_family, scan);
 
     if let Some(path) = finding.warning_target() {
+        let macos = rmlx_core::apple_gpu::macos_version();
         tracing::warn!(
             gpu_family = ?gpu_family,
+            macos = ?macos,
             metallib = %path.display(),
             kernel = NAX_GEMM_KERNEL,
             "this Mac has a GPU Neural Accelerator, but the MLX it loaded ships no \
              Neural-Accelerator GEMM kernels. Prefill / time-to-first-token measured \
              2.2-3.7x slower without them. Decode is bandwidth-bound, never reaches \
-             this path, and is unaffected — so output stays correct and only TTFT \
-             regresses, which is why the loss reads as a model-code defect rather than \
-             a toolchain one. Published rMLX prefill numbers assume these kernels are \
-             present; TTFT measured here is not comparable to them. Verify with \
-             `strings {} | grep -c {NAX_GEMM_KERNEL}` (want non-zero). Some package \
-             bottles omit the family entirely while a build of the same MLX version \
-             from another source carries it, so this is about the build, not the \
-             version number.",
+             this path, and is unaffected, so output stays correct and only TTFT \
+             regresses. Published rMLX prefill numbers assume these kernels; TTFT \
+             measured here is not comparable to them. Verify with \
+             `strings {} | grep -c {NAX_GEMM_KERNEL}` (want non-zero). Fix: {}.",
             path.display(),
+            nax_fix(macos),
         );
     } else {
         tracing::debug!(
@@ -231,7 +254,7 @@ impl KernelScan {
 /// Every reader — run identity, the startup warning, and the pin verdict —
 /// shares it. Three independent walks of dyld's image list would be three
 /// observations of a symlink this module exists to distrust, and could
-/// disagree with each other inside a single process; the file is also ~157 MB,
+/// disagree with each other inside a single process; the file is also ~150-200 MB,
 /// which no process should read three times.
 ///
 /// Ungated by host class: "does this MLX ship the kernels" has a true answer
@@ -366,11 +389,11 @@ fn has_needle(hay: &[u8], needle: &[u8], first: u8) -> bool {
 /// Each read is searched where it lands. Only the last needle-1 bytes are
 /// carried forward, and only they are ever copied — a match that begins any
 /// earlier was already either found or ruled out in the read it began in. The
-/// file is ~124-158 MB and the buffer this needs is 19 bytes, so nothing
+/// file is ~150-200 MB and the buffer this needs is 19 bytes, so nothing
 /// between those two sizes should be memcpy'd on a startup path.
 ///
 /// `chunk` is a parameter so the carry path — a match straddling two reads —
-/// is testable without a 124 MB fixture.
+/// is testable without a 150 MB fixture.
 fn contains_nax_kernel<R: Read>(mut reader: R, chunk: usize) -> std::io::Result<bool> {
     let needle = NAX_GEMM_KERNEL.as_bytes();
     let Some(&first) = needle.first() else {

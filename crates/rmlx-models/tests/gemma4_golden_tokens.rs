@@ -52,5 +52,10 @@ fn gemma4_golden_tokens_k8v8() {
     let Some(model_path) = common::model_for(&MODEL, "gemma4_golden_tokens_k8v8") else {
         return;
     };
-    common::run_golden_test("gemma4_e4b_k8v8", KvQuant::K8V8, &model_path);
+    common::run_golden_test(
+        "gemma4_golden_tokens_k8v8",
+        "gemma4_e4b_k8v8",
+        KvQuant::K8V8,
+        &model_path,
+    );
 }

@@ -42,7 +42,7 @@ fn main() -> anyhow::Result<()> {
     let (device, _claim) = if dev_str == "gpu" {
         (Device::Gpu, Some(rmlx_server::try_claim()?))
     } else {
-        rmlx_mlx::forbid_gpu();
+        rmlx_mlx::forbid_gpu()?;
         (Device::Cpu, None)
     };
     let n_gen: usize = args

@@ -1775,27 +1775,44 @@ const fn gpu_capture_requested(_cmd: &Cmd) -> bool {
 ///
 /// Checked here, in the process that is about to take the measurement, because
 /// that is the only place the answer describes the library actually loaded.
-/// `scripts/mlx_preflight.sh` reads the package manager's symlinks, which are
-/// not necessarily what this binary was linked against: `MLX_PREFIX` and
-/// `MLX_C_PREFIX` (`crates/rmlx-mlx/build.rs`) can point a build at an install
-/// the preflight never inspects.
+/// With no built binary, `scripts/mlx_preflight.sh` can read only the `opt`
+/// symlinks. With one, it reads this verdict through the binary's `mlx_pin`
+/// line.
+///
+/// An mlx-c C API mismatch refuses on every host, not only where the pin
+/// binds: attention cannot run, so the run would fail after the model load.
 fn refuse_to_measure_off_the_pin(command: &str) -> Result<()> {
     let check = rmlx_mlx::pin_check();
-    if check.matches || !check.enforcement.is_binding() {
-        tracing::debug!(
-            detail = %check.detail,
-            enforcement = ?check.enforcement,
-            command,
-            "MLX pin check cleared the measurement path"
-        );
-        return Ok(());
+    if let Some(refusal) = pin_refusal(command, check.refusal(), &check.detail) {
+        anyhow::bail!(refusal);
     }
-    anyhow::bail!(
-        "{command} refuses to measure: {}. Prefill and TTFT measured against an \
-         unvalidated MLX are not comparable to any recorded number. Restore the pair \
-         with `make mlx-restore-pin`, or see docs/FFI.md.",
-        check.detail
-    )
+    tracing::debug!(
+        detail = %check.detail,
+        enforcement = ?check.enforcement,
+        command,
+        "MLX pin check cleared the measurement path"
+    );
+    Ok(())
+}
+
+/// The refusal text for a pin verdict, or `None` when the measurement may run.
+///
+/// A C API mismatch names only the fixes its detail gives: a rebuild, and the
+/// restore when the host requires the pinned pair and the loaded pair is not
+/// the pinned one.
+fn pin_refusal(
+    command: &str,
+    refusal: Option<rmlx_mlx::PinRefusal>,
+    detail: &str,
+) -> Option<String> {
+    match refusal? {
+        rmlx_mlx::PinRefusal::CApiMismatch => Some(format!("{command} refuses to run: {detail}")),
+        rmlx_mlx::PinRefusal::PairNotPinned => Some(format!(
+            "{command} refuses to measure: {detail}. Prefill and TTFT measured against an \
+             unvalidated MLX are not comparable to any recorded number. Restore the pair \
+             with `make mlx-restore-pin`, or see docs/MLX_PAIR.md."
+        )),
+    }
 }
 
 fn main() -> Result<()> {

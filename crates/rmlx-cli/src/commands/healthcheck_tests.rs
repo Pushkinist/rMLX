@@ -327,34 +327,29 @@ fn j6_detail_escaping() {
 
 // ── MLX pin ─────────────────────────────────────────────────────────────────
 
-/// Every cell of the mapping, including the three this machine can never
-/// reach. Written as literal expectations rather than recomputed from the
-/// inputs: a second copy of the mapping would agree with the first no matter
-/// what either says.
+/// Every cell of the mapping. Written as literal expectations rather than
+/// recomputed from the inputs: a second copy of the mapping would agree with
+/// the first no matter what either says. Which host and pair refuse is
+/// `the_measurement_refusal_covers_every_cell` in `rmlx-mlx`.
 #[test]
 fn j6_mlx_pin_status_covers_every_cell() {
-    use rmlx_mlx::PinEnforcement;
+    use rmlx_mlx::PinRefusal;
 
-    let binding = PinEnforcement::Binding;
-    let not_applicable = PinEnforcement::NotApplicable { gpu_family: 7 };
-    let unknown = PinEnforcement::UnknownHost;
+    // A refusal is red, for either cause.
+    assert_eq!(
+        mlx_pin_status(Some(PinRefusal::CApiMismatch), false),
+        Status::Red
+    );
+    assert_eq!(
+        mlx_pin_status(Some(PinRefusal::PairNotPinned), false),
+        Status::Red
+    );
 
-    // A match is green wherever it is found, including on a host that could
-    // not be identified — nothing is wrong there regardless of who is bound.
-    assert_eq!(mlx_pin_status(true, binding), Status::Green);
-    assert_eq!(mlx_pin_status(true, not_applicable), Status::Green);
-    assert_eq!(mlx_pin_status(true, unknown), Status::Green);
+    // The pinned pair, not refused.
+    assert_eq!(mlx_pin_status(None, true), Status::Green);
 
-    // The failure the pin exists for.
-    assert_eq!(mlx_pin_status(false, binding), Status::Red);
-
-    // Identified pre-Neural-Accelerator hardware: the pinned kernels do not
-    // exist for it, so a mismatch is reportable but not a failure.
-    assert_eq!(mlx_pin_status(false, not_applicable), Status::Info);
-
-    // Unidentified host with a mismatch: whether it matters is unknown, and an
-    // unknown must not render as the clean pass the previous cell gets.
-    assert_eq!(mlx_pin_status(false, unknown), Status::Red);
+    // Another pair on a host the pin does not bind: printed, not failed.
+    assert_eq!(mlx_pin_status(None, false), Status::Info);
 }
 
 /// The check line carries the mapping's answer and a detail naming the host
@@ -364,10 +359,7 @@ fn j6_mlx_pin_line_reports_the_host_class() {
     let line = check_mlx_pin();
     assert_eq!(line.check, "mlx_pin");
     let check = rmlx_mlx::pin_check();
-    assert_eq!(
-        line.status,
-        mlx_pin_status(check.matches, check.enforcement)
-    );
+    assert_eq!(line.status, mlx_pin_status(check.refusal(), check.matches));
     assert!(
         line.detail.contains("Neural Accelerator")
             || line.detail.contains("could not be identified"),

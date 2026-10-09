@@ -454,7 +454,7 @@ fn a7_absent_fields_give_defaults() {
     assert_eq!(sp.repetition_penalty, 1.0);
     assert_eq!(sp.frequency_penalty, 0.0);
     assert_eq!(sp.presence_penalty, 0.0);
-    assert!(sp.logit_bias.is_empty());
+    assert_eq!(sp.logit_bias, Vec::<(u32, f32)>::new());
     assert!(sp.seed.is_none());
 }
 
@@ -809,9 +809,7 @@ fn streaming_emits_tool_calls_delta_and_upgrades_finish() {
         id: "chatcmpl-1".to_owned(),
         model: "qwen".to_owned(),
         created: 0,
-        json_object_mode: false,
-        json_fence_buf: String::new(),
-        json_fence_buf_done: false,
+        json_reply: None,
         prompt_tokens: 0,
         completion_tokens: 0,
         include_usage: false,
@@ -963,9 +961,7 @@ fn streaming_without_parser_passes_through_unchanged() {
         id: "chatcmpl-x".to_owned(),
         model: "m".to_owned(),
         created: 0,
-        json_object_mode: false,
-        json_fence_buf: String::new(),
-        json_fence_buf_done: false,
+        json_reply: None,
         prompt_tokens: 0,
         completion_tokens: 0,
         include_usage: false,
@@ -1303,9 +1299,7 @@ fn usage_stream_state(prompt_tokens: u32, include_usage: bool) -> StreamState {
         id: "chatcmpl-test".to_owned(),
         model: "m".to_owned(),
         created: 0,
-        json_object_mode: false,
-        json_fence_buf: String::new(),
-        json_fence_buf_done: false,
+        json_reply: None,
         prompt_tokens,
         completion_tokens: 0,
         include_usage,
@@ -1324,6 +1318,56 @@ fn usage_stream_state(prompt_tokens: u32, include_usage: bool) -> StreamState {
         // Inert stop matcher (no stop strings) in these tests.
         stop_matcher: crate::stop_matcher::StopMatcher::new(&[]),
         stop_hit: false,
+    }
+}
+
+/// A `response_format` content delta carries the logprobs of its own token,
+/// and a token before the engagement byte sends no event and no logprobs.
+#[test]
+fn json_mode_content_delta_carries_the_logprobs_of_its_own_token() {
+    let mut state = usage_stream_state(1, false);
+    let engagement = Arc::new(rmlx_models::Engagement::default());
+    engagement.report(2, 1);
+    state.json_reply = Some(json_reply::JsonReply::new(engagement));
+    let escaped = |json: &str| json.replace('"', "\\\"");
+    let mut sent: Vec<Vec<String>> = Vec::new();
+    for (piece, surface) in [("```", "FENCE"), ("\n{", "BRACE"), (" 1", "ONE")] {
+        let events = handle_streaming_token(
+            Ok(GenerationToken {
+                token_id: 1,
+                piece: piece.to_owned(),
+                done: false,
+                finish_reason: None,
+                is_thinking: false,
+                logprobs: Some(ChatLogprobContent {
+                    token: surface.to_owned(),
+                    logprob: -0.5,
+                    bytes: None,
+                    top_logprobs: vec![],
+                }),
+            }),
+            &mut state,
+        );
+        sent.push(
+            events
+                .iter()
+                .map(|e| format!("{:?}", e.as_ref().unwrap()))
+                .collect(),
+        );
+    }
+    assert!(sent[0].is_empty(), "the fence header sends no event");
+    for (events, content, surface) in [(&sent[1], "{", "BRACE"), (&sent[2], " 1", "ONE")] {
+        assert_eq!(events.len(), 1, "one delta for {surface}");
+        let delta = &events[0];
+        assert!(
+            delta.contains(&escaped(&format!(r#""content":"{content}""#))),
+            "{delta}"
+        );
+        assert!(
+            delta.contains(&escaped(&format!(r#""token":"{surface}""#))),
+            "{delta}"
+        );
+        assert_eq!(delta.matches(&escaped(r#""token":"#)).count(), 1, "{delta}");
     }
 }
 
@@ -1627,9 +1671,7 @@ fn f14_lifetime_counters_incremented_at_done_boundary() {
         id: "chatcmpl-f14".to_owned(),
         model: "m".to_owned(),
         created: 0,
-        json_object_mode: false,
-        json_fence_buf: String::new(),
-        json_fence_buf_done: false,
+        json_reply: None,
         prompt_tokens: 7,
         completion_tokens: 0,
         include_usage: false,
@@ -1925,9 +1967,7 @@ fn f8_successful_streaming_path_increments_no_error_counter() {
         id: "chatcmpl-f8".to_owned(),
         model: "m".to_owned(),
         created: 0,
-        json_object_mode: false,
-        json_fence_buf: String::new(),
-        json_fence_buf_done: false,
+        json_reply: None,
         prompt_tokens: 3,
         completion_tokens: 0,
         include_usage: false,
@@ -2006,9 +2046,7 @@ fn f8_engine_error_in_streaming_increments_counter() {
         id: "chatcmpl-f8err".to_owned(),
         model: "m".to_owned(),
         created: 0,
-        json_object_mode: false,
-        json_fence_buf: String::new(),
-        json_fence_buf_done: false,
+        json_reply: None,
         prompt_tokens: 1,
         completion_tokens: 0,
         include_usage: false,

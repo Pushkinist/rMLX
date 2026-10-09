@@ -763,17 +763,33 @@ fn tape_replay_run(
 ///
 /// **How close they can be is the model's own answer, and the run measures it.**
 /// The replay computes the prefix in a forward of its own length; the tape
-/// returns what the round's forward computed at those positions. On the dense
-/// hybrid the two are bit-identical, and the run says so. On the mixture the
-/// model does not reproduce itself that way — one forward over the round and the
-/// same tokens stepped one at a time part company by a couple of percent, which
-/// is a property of that stack and not of this change — so the bound the refold
-/// is held to is that same disagreement, measured beside it in the same process.
+/// returns what the round's forwards computed at those positions. A forward
+/// and the same tokens in forwards of another height do not agree bit for bit
+/// on every stack and every MLX. On MLX 0.31.2 the dense hybrid agrees and the
+/// mixture parts company by 4 %. MLX 0.32.1 and 0.32.3 sum a bf16 product of 2
+/// to 15 rows in a different order than a product of one row, and there the
+/// dense hybrid parts company by 1.5 % too. That is a property of the stack and
+/// of the MLX, not of the refold, so the bound the refold is held to is that
+/// same disagreement, measured beside it in the same process: each prefix of
+/// the round in one forward against the same prefix stepped, and the largest
+/// of those. The largest is not always the whole round. Measured with
+/// `cargo test -p rmlx-models --lib -- --ignored --nocapture
+/// a_round_tape_refolds` on MLX 0.32.3 / mlx-c 0.7.0, the dense hybrid reads
+/// 0.010378, 0.014533, 0.015036 and 0.014971 at two to five tokens.
+///
+/// For a round taken as a forward per token the bound is derived: the refold
+/// is the state the first `kept` of those forwards left, bit for bit, so its
+/// distance from the replay is the disagreement at that prefix, to the last
+/// digit. For a round taken as one verify forward the bound is empirical. The
+/// tested quantity is a prefix of a five-row forward against a forward of
+/// `kept` rows, which the run does not measure on its own, and the measured
+/// disagreement is used as its scale. On the mixture it reads up to 0.0369
+/// against a bound of 0.0450.
 ///
 /// The control is what gives the comparison power: the same refold against the
 /// replay one token short of the accepted length, which is where a refold that
-/// folded the wrong number of positions would sit. It reads about 0.5 against a
-/// refold-to-replay agreement of at most a few percent.
+/// folded the wrong number of positions would sit. It reads 0.53 to 0.76
+/// against a refold-to-replay agreement of at most a few percent.
 #[test]
 #[ignore = "requires Metal GPU context and a 27B snapshot"]
 #[allow(
@@ -798,21 +814,29 @@ fn a_round_tape_refolds_to_what_the_replay_produced() {
             "{model} must carry recurrent state or this test proves nothing"
         );
 
-        // What this model's own two regimes make of the same tokens: the round
-        // in one forward against the round stepped. It is the bound the refold
-        // is held to, because no rebuild of a prefix can be closer to a forward
-        // over that prefix than the model is to itself.
-        let (_kv, batched) = tape_replay_run(&arch, TAPE_REPLAY_PROMPT, &[round], false, device);
-        let (_kv, stepped) = tape_replay_run(&arch, TAPE_REPLAY_PROMPT, &per_token, false, device);
-        let regime = tape_replay_rel_err(
-            &tape_replay_state(&batched, device),
-            &tape_replay_state(&stepped, device),
-        );
-        eprintln!("[{NAME}/{model}] one forward against stepped: {regime:.6}");
+        // What this model's own two regimes make of the same tokens: each
+        // prefix of the round in one forward against the same prefix stepped.
+        // The largest is the bound the refold is held to, because no rebuild of
+        // a prefix can be closer to a forward over that prefix than the model
+        // is to itself.
+        let mut stepped_states = Vec::with_capacity(round.len());
+        let mut regime = 0.0f64;
+        for len in 1..=round.len() {
+            let prefix = round.get(..len).expect("round prefix");
+            let steps = per_token.get(..len).expect("stepped prefix");
+            let (_kv, batched) =
+                tape_replay_run(&arch, TAPE_REPLAY_PROMPT, &[prefix], false, device);
+            let (_kv, stepped) = tape_replay_run(&arch, TAPE_REPLAY_PROMPT, steps, false, device);
+            let stepped = tape_replay_state(&stepped, device);
+            let at_len = tape_replay_rel_err(&stepped, &tape_replay_state(&batched, device));
+            eprintln!("[{NAME}/{model}] one forward against stepped, {len} tokens: {at_len:.6}");
+            regime = regime.max(at_len);
+            stepped_states.push(stepped);
+        }
 
-        for (shape, chunks) in [
-            ("one verify forward", vec![round]),
-            ("a forward per token", per_token.clone()),
+        for (shape, chunks, stepped_round) in [
+            ("one verify forward", vec![round], false),
+            ("a forward per token", per_token.clone(), true),
         ] {
             for kept in 1..round.len() {
                 let (_kv, mut taped) =
@@ -843,6 +867,17 @@ fn a_round_tape_refolds_to_what_the_replay_produced() {
                     "[{NAME}/{shape}] kept={kept} agreement={agreement:.6} \
                      one-token-short={control:.6}"
                 );
+                if stepped_round {
+                    assert!(
+                        refolded.iter().map(|x| x.to_bits()).eq(stepped_states
+                            .get(kept - 1)
+                            .expect("stepped state")
+                            .iter()
+                            .map(|x| x.to_bits())),
+                        "{model}, {shape} at kept={kept}: the refold is not the state \
+                         the first {kept} forwards of the round left"
+                    );
+                }
                 assert!(
                     agreement <= regime,
                     "{model}, {shape} at kept={kept}: the refold and the replay of the \
