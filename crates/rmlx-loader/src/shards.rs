@@ -6,7 +6,7 @@
 #![allow(unsafe_code)]
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde_json::Value;
@@ -21,6 +21,27 @@ pub(crate) const MAX_TENSORS: usize = 65_536;
 // Bounded against malformed/adversarial model.safetensors.index.json.
 // HuggingFace repos typically use <100 shards; 512 is a generous but defensive ceiling.
 pub(crate) const MAX_SHARDS: usize = 512;
+
+/// The shard index of a multi-file snapshot.
+pub(crate) const SHARD_INDEX: &str = "model.safetensors.index.json";
+
+/// The shard file of a snapshot that has no index.
+pub(crate) const SINGLE_SHARD: &str = "model.safetensors";
+
+/// Returns `true` when `name` is one plain file name: no directory part, not
+/// absolute, not `.` or `..`, no NUL byte. A name read from a snapshot file
+/// must be one, or opening it would reach outside the snapshot directory.
+///
+/// The one component must be the whole name: `Path::components` drops a
+/// trailing `/` and an inner `.`, so `x/` and `x/.` give the component `x`.
+pub(crate) fn is_plain_file_name(name: &str) -> bool {
+    let mut parts = Path::new(name).components();
+    !name.contains('\0')
+        && matches!(
+            (parts.next(), parts.next()),
+            (Some(Component::Normal(part)), None) if part == name
+        )
+}
 
 // ── ShardHandle ──────────────────────────────────────────────────────────────
 
@@ -264,13 +285,13 @@ pub struct ShardIndex {
 /// a synthetic `ShardIndex` whose `weight_map` maps every tensor in that
 /// single shard to `"model.safetensors"`.
 pub fn load_shard_index(model_dir: &Path) -> Result<ShardIndex> {
-    let index_path = model_dir.join("model.safetensors.index.json");
-    let single_path = model_dir.join("model.safetensors");
+    let index_path = model_dir.join(SHARD_INDEX);
+    let single_path = model_dir.join(SINGLE_SHARD);
 
     if index_path.exists() {
         load_from_index_file(&index_path)
     } else if single_path.exists() {
-        load_synthetic_from_single(&single_path)
+        load_synthetic_from_single(model_dir, SINGLE_SHARD)
     } else {
         Err(Error::Loader(format!(
             "neither {} nor {} found in {}",
@@ -335,6 +356,13 @@ fn load_from_index_file(path: &Path) -> Result<ShardIndex> {
                 path.display()
             ))
         })?;
+        if !is_plain_file_name(shard) || !shard.ends_with(".safetensors") {
+            return Err(Error::Loader(format!(
+                "weight_map value for '{tensor}' is {shard:?}, not a .safetensors file name \
+                 in the snapshot directory, in {}",
+                path.display()
+            )));
+        }
         weight_map.insert(tensor.clone(), shard.to_owned());
     }
 
@@ -363,24 +391,16 @@ fn load_from_index_file(path: &Path) -> Result<ShardIndex> {
     })
 }
 
-fn load_synthetic_from_single(path: &Path) -> Result<ShardIndex> {
-    let data = std::fs::read(path)
-        .map_err(|e| Error::Loader(format!("cannot read {}: {e}", path.display())))?;
-
-    // Use safetensors to enumerate tensor names without loading tensor data.
-    let st = safetensors::SafeTensors::deserialize(&data)
-        .map_err(|e| Error::Loader(format!("cannot parse {}: {e}", path.display())))?;
-
-    let filename = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("model.safetensors")
-        .to_owned();
-
-    let weight_map = st
+/// The index of a one-file snapshot: every tensor of the shard's header maps
+/// to the shard. The shard is mapped, not read, so only its header pages are
+/// touched.
+fn load_synthetic_from_single(model_dir: &Path, filename: &str) -> Result<ShardIndex> {
+    let shard = ShardHandle::open(model_dir, filename)?;
+    let weight_map = shard
+        .safetensors()?
         .names()
         .into_iter()
-        .map(|name| (name.to_owned(), filename.clone()))
+        .map(|name| (name.to_owned(), filename.to_owned()))
         .collect();
 
     Ok(ShardIndex {

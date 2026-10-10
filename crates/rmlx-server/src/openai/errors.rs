@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
 
-use crate::generation_config_io::GenerationConfig;
+use rmlx_loader::GenerationConfig;
 
 use super::state::ApiErrorCategory;
 

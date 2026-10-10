@@ -22,6 +22,8 @@ use axum::http::header;
 use axum::Json;
 use serde::de::DeserializeOwned;
 
+use crate::chat_template::bounded_message;
+
 /// Maximum number of bytes of the raw body to include in the warning log.
 ///
 /// Prompts can be arbitrarily large; we never want to log the full body.
@@ -94,7 +96,7 @@ where
 
                 tracing::warn!(
                     route = %uri,
-                    error = %rejection,
+                    error = %bounded_message(&rejection.to_string()),
                     body_snippet = %snippet,
                     "JSON deserialisation rejected"
                 );

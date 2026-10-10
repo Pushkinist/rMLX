@@ -97,6 +97,36 @@ fn is_unified_arch_false_for_missing_dir() {
     assert!(!is_unified_arch(p));
 }
 
+/// Only a config that dispatches on the unified class is unified: not the
+/// tower family, not a Hadamard pack, not a config that does not parse.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test fixture setup; a failed write is a broken test, not a result"
+)]
+fn is_unified_arch_reads_the_dispatch_class() {
+    let cases = [
+        (
+            r#"{"architectures": ["Gemma4UnifiedForConditionalGeneration"]}"#,
+            true,
+        ),
+        (
+            r#"{"architectures": ["Gemma4ForConditionalGeneration"]}"#,
+            false,
+        ),
+        (
+            r#"{"hadamard_config": "hadamard.json", "base_model_type": "qwen3_5"}"#,
+            false,
+        ),
+        ("not json", false),
+    ];
+    for (config, want) in cases {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("config.json"), config).expect("write config.json");
+        assert_eq!(is_unified_arch(dir.path()), want, "{config}");
+    }
+}
+
 /// Build a solid-colour CHW `[1, 3, H, W]` pixel buffer (the shared
 /// preprocessor output: rescaled `[0,1]`, channels-first, RGB).
 #[allow(

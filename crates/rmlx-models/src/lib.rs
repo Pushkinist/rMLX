@@ -10,7 +10,7 @@
 //! `qwen3_5_moe` — Qwen3_5MoeForConditionalGeneration (hybrid GatedDeltaNet + full-attn, sparse MoE).
 //!
 //! `layers` — shared building blocks (RmsNorm, Linear, Embedding, Mlp, MoeBlock stub).
-//! `arch` — architecture dispatch: load_model() reads config.architectures[0].
+//! `arch` — architecture dispatch: load_model() reads `ModelConfig::dispatch_arch`.
 
 #![cfg_attr(
     test,
@@ -37,6 +37,7 @@ pub(crate) mod decode_loop;
 pub mod gated_delta_msl;
 pub mod gemma3;
 pub mod gemma4;
+pub mod hadamard;
 pub mod jina_v4;
 pub mod kv_bytes;
 pub mod kv_cache;

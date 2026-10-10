@@ -593,7 +593,7 @@ fn load_dflash(draft_dir: &Path, hidden_size: usize, device: Device) -> Result<D
 
     let cfg_raw = load_config(draft_dir)
         .map_err(|e| Error::Model(format!("DFlashDrafter: load_config: {e}")))?;
-    let arch = cfg_raw.architectures.first().map_or("", String::as_str);
+    let arch = cfg_raw.dispatch_arch().unwrap_or("");
     if !arch.contains("DFlash") {
         tracing::warn!(
             draft = %draft_dir.display(),

@@ -50,7 +50,8 @@ under `layers/`.
    arms in the methods that match on it (`forward_seq`, `Debug`,
    `config_summary` and the rest).
 7. **Registry**, `arch/registry.rs` and `arch/loader.rs`. Add
-   `architectures[0]` to `KNOWN_ARCHS` and a `load_model` arm. When one
+   the dispatch class (`architectures[0]`, see `ModelConfig::dispatch_arch`)
+   to `KNOWN_ARCHS` and a `load_model` arm. When one
    arch string covers several checkpoint shapes, branch on checkpoint facts
    such as `cfg.is_paroquant()`, not on the string.
 8. **SSD attach** (optional), `ssd_tier.rs`. Add one arm to `attach_at_load`

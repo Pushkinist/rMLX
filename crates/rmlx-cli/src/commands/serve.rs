@@ -33,7 +33,7 @@ use std::sync::Arc;
 use crate::commands::parse::ClaimedDevice;
 use rmlx_core::runinfo::make_run_id;
 use rmlx_core::DispatchPolicy;
-use rmlx_loader::{discover_kv_calibration, load_config, load_head_budgets};
+use rmlx_loader::{discover_kv_calibration, load_config, load_head_budgets, ModelConfig};
 use rmlx_metrics::events::EventRecorder;
 use rmlx_server::{
     register_ssd_prom_hooks, spawn_drainer, AppState, ArchGenerator, KeepAlivePolicy,
@@ -632,6 +632,11 @@ pub(crate) fn run_serve(
     // (greedy acceptance, re-prefill rollback). Single-model path runs
     // unchanged when --draft-model is absent.
     if let Some(p) = draft_model {
+        let draft_cfg = load_config(p).map_err(|e| anyhow::anyhow!("load_config: {e}"))?;
+        refuse_unservable_pack("--draft-model", &draft_cfg, p)?;
+        if let Some(m) = model {
+            refuse_restricted_head_over_a_pack(m, &draft_cfg, draft_kind)?;
+        }
         info!(
             draft_model = %p.display(),
             draft_kind = ?draft_kind,
@@ -678,6 +683,13 @@ pub(crate) fn run_serve(
     let registry: Arc<ModelRegistry> = if let Some(reg_path) = registry_file {
         let cfg = RegistryConfig::from_file(reg_path)
             .map_err(|e| anyhow::anyhow!("registry file: {e}"))?;
+        // A snapshot whose config.json does not load is skipped by the
+        // registry build, so it is skipped here too.
+        for entry in &cfg.models {
+            if let Ok(model_cfg) = load_config(&entry.path) {
+                refuse_unservable_pack("--registry", &model_cfg, &entry.path)?;
+            }
+        }
         info!(
             path = %reg_path.display(),
             n = cfg.models.len(),
@@ -686,13 +698,14 @@ pub(crate) fn run_serve(
         Arc::new(ModelRegistry::from_config(&cfg))
     } else if let Some(p) = model {
         // Early architecture validation — fail fast before registry/chat-template
-        // setup can mask the error. Reads config.json, checks architectures[0]
-        // against KNOWN_ARCHS, and exits non-zero if unsupported.
+        // setup can mask the error. Reads config.json, refuses a Hadamard
+        // pack rMLX cannot serve, checks the dispatch class against
+        // KNOWN_ARCHS, and exits non-zero if unsupported. A model that fails
+        // here would otherwise only fail its preload, which is not fatal, and
+        // the server would refuse every request.
         let model_cfg = load_config(p).map_err(|e| anyhow::anyhow!("load_config: {e}"))?;
-        let arch_name = model_cfg
-            .architectures
-            .first()
-            .map_or("(empty)", String::as_str);
+        refuse_unservable_pack("--model", &model_cfg, p)?;
+        let arch_name = model_cfg.dispatch_arch().unwrap_or("(empty)");
         if !rmlx_models::is_arch_supported(arch_name) {
             tracing::error!(
                 arch = arch_name,
@@ -1130,6 +1143,49 @@ pub(crate) fn run_serve(
 
         rmlx_server::serve(state, host, port).await
     })
+}
+
+/// Exit 1 at startup for a snapshot `check_hadamard_pack` refuses. Given as
+/// `flag`, it would otherwise fail only its preload, which is not fatal, and
+/// the server would refuse every request for it.
+fn refuse_unservable_pack(flag: &str, cfg: &ModelConfig, p: &Path) -> anyhow::Result<()> {
+    if let Err(e) = rmlx_models::arch::check_hadamard_pack(cfg, p) {
+        tracing::error!(flag, model = %p.display(), error = %e, "snapshot refused at startup");
+        eprintln!("error: {e}");
+        return Err(crate::exit::ExitWith(1).into());
+    }
+    Ok(())
+}
+
+/// Exit 1 at startup for an EAGLE-3 drafter with a reduced vocabulary over a
+/// `--model` that is a Hadamard pack. `Eagle3Drafter::load` refuses the pair
+/// at preload, which is not fatal, and then at every request. Reads the two
+/// configs only; the kind is the flag, else the draft's declaration.
+fn refuse_restricted_head_over_a_pack(
+    model: &Path,
+    draft_cfg: &ModelConfig,
+    flag: Option<rmlx_models::DraftKind>,
+) -> anyhow::Result<()> {
+    let Ok(model_cfg) = load_config(model) else {
+        return Ok(());
+    };
+    let model_type = draft_cfg
+        .extras
+        .get("model_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let declared =
+        rmlx_models::Declared::from_snapshot(draft_cfg.dispatch_arch().unwrap_or(""), model_type);
+    let eagle3 = flag.or(declared.kind()) == Some(rmlx_models::DraftKind::Eagle3);
+    let restricted = rmlx_models::speculative::eagle3::Eagle3Config::from_model_config(draft_cfg)
+        .restricted_vocab();
+    if model_cfg.is_hadamard_pack() && eagle3 && restricted {
+        let why = rmlx_models::arch::RESTRICTED_HEAD_OVER_A_PACK;
+        tracing::error!(model = %model.display(), why, "draft model refused at startup");
+        eprintln!("error: --draft-model: {why}");
+        return Err(crate::exit::ExitWith(1).into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

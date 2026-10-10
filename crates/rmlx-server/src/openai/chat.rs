@@ -14,7 +14,7 @@ use serde_json::Value;
 use tracing::Instrument;
 
 use crate::bounds;
-use crate::chat_template::{ChatMessageTpl, RenderOpts};
+use crate::chat_template::{request_variables, ChatMessageTpl, RenderError, RenderOpts};
 use crate::engine::{
     normalized_to_jinja_tool, GenerationRequest, NormalizedResponseFormat, NormalizedTool,
     NormalizedToolChoice,
@@ -146,7 +146,7 @@ pub(crate) fn bare_json_to_tool_call(json: &str) -> Option<crate::tool_parser::P
 pub(crate) async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
-    LoggedJson(req): LoggedJson<ChatCompletionsRequest>,
+    LoggedJson(mut req): LoggedJson<ChatCompletionsRequest>,
 ) -> Response {
     // Wall-clock anchor for TTFT. Captured immediately after header parse,
     // before any tokenization or model-load work.
@@ -328,7 +328,11 @@ pub(crate) async fn chat_completions(
     }
     // Per-message checks: tool_calls and content_parts.
     {
-        let mut total_text_bytes: usize = 0;
+        // The template can print `chat_template_kwargs`, so it counts as text.
+        let mut total_text_bytes: usize = req
+            .chat_template_kwargs
+            .as_ref()
+            .map_or(0, bounds::serialized_len);
         for (idx, msg) in req.messages.iter().enumerate() {
             if let Some(ref calls) = msg.tool_calls {
                 if let Err(e) = bounds::check_tool_calls(calls.len(), idx) {
@@ -467,12 +471,15 @@ pub(crate) async fn chat_completions(
         );
     }
 
-    // / : resolve effective enable_thinking once at the outer scope
-    // (request field > server default > absent = enabled). The prompt-pipeline
-    // match below uses this for template rendering; the GenerationRequest
-    // builder uses it to start the ThinkSplitter in the correct channel
-    // (PART 2: Some(false) → answer-mode so output routes to `content`).
-    let effective_enable_thinking = req.enable_thinking.or(state.default_enable_thinking);
+    // The one resolution of the template variables, thinking switch included.
+    // The think splitter, the budget and the reply split read the rendered
+    // prompt, not this map.
+    let template_variables = request_variables(
+        req.chat_template_kwargs.take(),
+        req.enable_thinking,
+        req.reasoning_effort.as_deref(),
+        state.default_enable_thinking,
+    );
 
     // resolve the thinking-end-token id ONCE, only when a thinking
     // budget is requested. Encoding with `add_special_tokens=false` mirrors
@@ -558,6 +565,12 @@ pub(crate) async fn chat_completions(
                 // BPE encode itself.
                 let tpl = Arc::clone(tpl);
                 let tk = Arc::clone(tk);
+                for name in tpl.dropped_variables(&template_variables) {
+                    tracing::warn!(
+                        variable = name,
+                        "chat_template_kwargs sets a variable that the server or the template provides; the request value is ignored"
+                    );
+                }
                 let messages_owned: Vec<OwnedTplMessage> = req
                     .messages
                     .iter()
@@ -569,11 +582,6 @@ pub(crate) async fn chat_completions(
                 // Capture jinja_tools for injection into RenderOpts.
                 // Vec<serde_json::Value> is Send + 'static.
                 let jinja_tools_capture = jinja_tools.clone();
-                // effective enable_thinking resolved at the outer scope
-                // (captured by the closure below). Precedence: request field >
-                // server default > absent (= enabled / undefined). Only
-                // Some(false) changes template behaviour; Some(true) and None
-                // both leave enable_thinking undefined in the Jinja context.
                 let result = tokio::task::spawn_blocking(move || {
                     let tpl_msgs: Vec<ChatMessageTpl<'_>> =
                         messages_owned.iter().map(OwnedTplMessage::as_tpl).collect();
@@ -582,11 +590,15 @@ pub(crate) async fn chat_completions(
                         eos_token: eos.as_str(),
                         add_generation_prompt: true,
                         tools: &jinja_tools_capture,
-                        enable_thinking: effective_enable_thinking,
+                        variables: Some(&template_variables),
                     };
-                    let rendered = tpl
-                        .render(&tpl_msgs, &opts)
-                        .map_err(|e| format!("chat template render failed: {e}"))?;
+                    let rendered = tpl.render(&tpl_msgs, &opts).map_err(|e| match e {
+                        RenderError::Rejected(_) => (ApiErrorCategory::BadRequest, e.to_string()),
+                        RenderError::Failed(_) => (
+                            ApiErrorCategory::Upstream,
+                            format!("chat template render failed: {e}"),
+                        ),
+                    })?;
                     // Read the initial think channel off the assistant-turn
                     // suffix ONLY. Message content is client-controlled and can
                     // contain a literal `<think>`; the suffix is emitted by the
@@ -622,9 +634,13 @@ pub(crate) async fn chat_completions(
                         &think_start_delim,
                         &think_end_delim,
                     );
-                    let ids = tokenizer_io::encode(&tk, &rendered.text)
-                        .map_err(|e| format!("tokenizer encode failed: {e}"))?;
-                    Ok::<(Vec<u32>, bool), String>((ids, think_open))
+                    let ids = tokenizer_io::encode(&tk, &rendered.text).map_err(|e| {
+                        (
+                            ApiErrorCategory::Upstream,
+                            format!("tokenizer encode failed: {e}"),
+                        )
+                    })?;
+                    Ok::<(Vec<u32>, bool), (ApiErrorCategory, String)>((ids, think_open))
                 })
                 .await;
 
@@ -634,10 +650,14 @@ pub(crate) async fn chat_completions(
                         state.error_counts.increment(ApiErrorCategory::Internal);
                         return internal_error("prompt pipeline task panicked");
                     }
-                    Ok(Err(e)) => {
+                    Ok(Err((category, e))) => {
                         tracing::warn!(model_id = %model_id_log, error = %e, "prompt pipeline failed");
-                        state.error_counts.increment(ApiErrorCategory::Upstream);
-                        return service_unavailable(&e);
+                        state.error_counts.increment(category);
+                        return if category == ApiErrorCategory::BadRequest {
+                            bad_request(&e)
+                        } else {
+                            service_unavailable(&e)
+                        };
                     }
                     Ok(Ok((ids, think_open))) => {
                         let token_count = ids.len();
@@ -850,11 +870,8 @@ pub(crate) async fn chat_completions(
             // tool_choice=required/named constraint (priority over response_format).
             let entry_opt = state.registry.get(&req.model);
             let tk_opt = entry_opt.and_then(|e| e.tokenizer.clone());
-            let path_opt = entry_opt.map(|e| e.abs_path.clone());
-            if let (Some(tk), Some(p)) = (tk_opt, path_opt) {
-                let eos_ids: Vec<u32> = rmlx_loader::load_config(&p)
-                    .map(|c| c.eos_token_ids())
-                    .unwrap_or_default();
+            let eos_opt = entry_opt.map(|e| e.stop_token_ids.clone());
+            if let (Some(tk), Some(eos_ids)) = (tk_opt, eos_opt) {
                 tracing::info!(
                     model_id = %req.model,
                     request_id = %rid,
@@ -892,7 +909,7 @@ pub(crate) async fn chat_completions(
             } else {
                 tracing::warn!(
                     model_id = %req.model,
-                    "tool_choice constraint requested but tokenizer/path \
+                    "tool_choice constraint requested but the registry entry or its tokenizer is \
                      missing — falling back to unconstrained"
                 );
                 (None, None)
@@ -904,11 +921,8 @@ pub(crate) async fn chat_completions(
             ) => {
                 let entry_opt = state.registry.get(&req.model);
                 let tk_opt = entry_opt.and_then(|e| e.tokenizer.clone());
-                let path_opt = entry_opt.map(|e| e.abs_path.clone());
-                if let (Some(tk), Some(p)) = (tk_opt, path_opt) {
-                    let eos_ids: Vec<u32> = rmlx_loader::load_config(&p)
-                        .map(|c| c.eos_token_ids())
-                        .unwrap_or_default();
+                let eos_opt = entry_opt.map(|e| e.stop_token_ids.clone());
+                if let (Some(tk), Some(eos_ids)) = (tk_opt, eos_opt) {
                     // Schema-driven constraint.
                     if let Some(NormalizedResponseFormat::JsonSchema {
                         name,
@@ -976,7 +990,7 @@ pub(crate) async fn chat_completions(
                 } else {
                     tracing::warn!(
                         model_id = %req.model,
-                        "response_format requested but tokenizer/path \
+                        "response_format requested but the registry entry or its tokenizer is \
                          missing — falling back to NoOpConstraint"
                     );
                     (Some(Box::new(rmlx_models::NoOpConstraint::new())), None)

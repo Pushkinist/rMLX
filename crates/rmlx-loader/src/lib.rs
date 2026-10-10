@@ -26,6 +26,7 @@
 pub mod calibration;
 pub mod calibration_writer;
 pub mod config;
+pub mod hadamard;
 pub mod head_budgets;
 pub mod shards;
 pub mod tensors;
@@ -38,7 +39,11 @@ pub use calibration_writer::{
     discover_kv_calibration, outlier_count_for, read_kv_calibration, recipe_to_internal,
     write_kv_calibration, CalibrationMeta, CodebookOverride, KvCalibration, LayerCalib,
 };
-pub use config::{load_config, ModelConfig, ParoQuantConfig, QuantConfig, TextConfig};
+pub use config::{
+    load_config, load_generation_config, stop_token_ids, GenerationConfig, ModelConfig,
+    ParoQuantConfig, QuantConfig, TextConfig,
+};
+pub use hadamard::{HadamardContract, HadamardContractError};
 pub use head_budgets::{load_head_budgets, write_head_budgets, HeadBudgetCalibration, HeadBudgets};
 pub use shards::{count_tensors_per_shard, load_shard_index, ShardHandle, ShardIndex, ShardSet};
 pub use tensors::{

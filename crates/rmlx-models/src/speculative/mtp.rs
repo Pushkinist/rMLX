@@ -322,7 +322,7 @@ fn load_mtp_head(draft_dir: &Path, hidden_size: usize) -> Result<(MtpHeadWeights
             draft_dir.display()
         ))
     })?;
-    let arch = cfg.architectures.first().map_or("", String::as_str);
+    let arch = cfg.dispatch_arch().unwrap_or("");
     let model_type = cfg
         .extras
         .get("model_type")

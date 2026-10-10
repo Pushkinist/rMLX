@@ -2,7 +2,7 @@
 // Known-architecture registry
 // ---------------------------------------------------------------------------
 
-/// Every `architectures[0]` value that rMLX can currently handle.
+/// Every dispatch class (`ModelConfig::dispatch_arch`) that rMLX can currently handle.
 ///
 /// Kept at module level (rather than inside `load_model`) so that the server
 /// startup path can validate a model's architecture before paying the full

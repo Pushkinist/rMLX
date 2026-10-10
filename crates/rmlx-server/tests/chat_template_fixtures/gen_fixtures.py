@@ -53,7 +53,8 @@ def bos_eos_from_config(snap_dir: Path):
     return extract(cfg.get("bos_token")), extract(cfg.get("eos_token"))
 
 
-def render(snap_dir: Path, messages: list, tools=None, add_generation_prompt=True) -> str:
+def render(snap_dir: Path, messages: list, tools=None, add_generation_prompt=True,
+           template_kwargs=None) -> str:
     """Apply HF chat template and return the rendered string."""
     from transformers import AutoTokenizer
 
@@ -62,6 +63,7 @@ def render(snap_dir: Path, messages: list, tools=None, add_generation_prompt=Tru
         "conversation": messages,
         "add_generation_prompt": add_generation_prompt,
         "tokenize": False,
+        **(template_kwargs or {}),
     }
     if tools is not None:
         kwargs["tools"] = tools
@@ -69,14 +71,27 @@ def render(snap_dir: Path, messages: list, tools=None, add_generation_prompt=Tru
 
 
 def write_fixture(name: str, snap_dir: Path, arch: str, messages: list,
-                  tools=None, add_generation_prompt=True):
-    """Render with HF oracle and write the fixture JSON file."""
+                  tools=None, add_generation_prompt=True, template_kwargs=None,
+                  refused=False):
+    """Render with HF oracle and write the fixture JSON file.
+
+    `template_kwargs` are the extra template variables the request sets
+    (`reasoning_effort`, `enable_thinking`). With `refused`, the template must
+    raise: the fixture records its message as `expected_error`.
+    """
     bos, eos = bos_eos_from_config(snap_dir)
+    outcome = {}
     try:
-        expected = render(snap_dir, messages, tools=tools,
-                          add_generation_prompt=add_generation_prompt)
+        outcome["expected"] = render(snap_dir, messages, tools=tools,
+                                     add_generation_prompt=add_generation_prompt,
+                                     template_kwargs=template_kwargs)
     except Exception as exc:
-        print(f"  ERROR rendering {name}: {exc}", file=sys.stderr)
+        if not refused:
+            print(f"  ERROR rendering {name}: {exc}", file=sys.stderr)
+            return False
+        outcome["expected_error"] = str(exc)
+    if refused and "expected" in outcome:
+        print(f"  ERROR {name}: the template did not refuse", file=sys.stderr)
         return False
 
     fixture = {
@@ -87,8 +102,10 @@ def write_fixture(name: str, snap_dir: Path, arch: str, messages: list,
         "add_generation_prompt": add_generation_prompt,
         "bos_token": bos,
         "eos_token": eos,
-        "expected": expected,
     }
+    if template_kwargs:
+        fixture["template_kwargs"] = template_kwargs
+    fixture.update(outcome)
     out_path = FIXTURE_DIR / f"{name}.json"
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(fixture, f, ensure_ascii=False, indent=2)
@@ -105,6 +122,7 @@ SNAPSHOTS = {
     "gemma3":     O_MODELS / "mlx-community__medgemma-1.5-4b-it-8bit",
     "qwen3":      O_MODELS / "prism-ml__Ternary-Bonsai-8B-mlx-2bit",
     "qwen2":      O_MODELS / "mlx-community__jinaai-ReaderLM-v2",
+    "bonsai2":    O_MODELS / "prism-ml__Ternary-Bonsai-2-27B-mlx-2bit",
 }
 
 ARCHES = {
@@ -113,6 +131,7 @@ ARCHES = {
     "gemma3":     "Gemma3ForConditionalGeneration",
     "qwen3":      "Qwen3ForCausalLM",
     "qwen2":      "Qwen2ForCausalLM",
+    "bonsai2":    "Qwen3_5ForConditionalGeneration",
 }
 
 # ── Tool spec used for tool-calling fixtures ───────────────────────────────────
@@ -220,6 +239,27 @@ def main():
             ):
                 generated += 1
 
+        elif key == "bonsai2":
+            # The template's reasoning_effort (default xhigh) and
+            # enable_thinking variables, and its refusal of another effort.
+            question = [{"role": "user", "content": "What is 2+2?"}]
+            for name, kwargs, tools in [
+                ("bonsai2_default", None, None),
+                ("bonsai2_effort_medium", {"reasoning_effort": "medium"}, None),
+                ("bonsai2_effort_low", {"reasoning_effort": "low"}, None),
+                ("bonsai2_no_thinking", {"enable_thinking": False}, None),
+                ("bonsai2_tools_effort_low", {"reasoning_effort": "low"},
+                 [GET_WEATHER_TOOL]),
+            ]:
+                if write_fixture(name, snap_dir, arch, question, tools=tools,
+                                 template_kwargs=kwargs):
+                    generated += 1
+            if write_fixture("bonsai2_effort_high_refused", snap_dir, arch,
+                             question,
+                             template_kwargs={"reasoning_effort": "high"},
+                             refused=True):
+                generated += 1
+
         elif key == "qwen2":
             # basic user msg
             if write_fixture(
@@ -229,10 +269,10 @@ def main():
                 generated += 1
 
     print(f"\nDone: {generated} fixtures written, {skipped} snapshots skipped.")
-    if generated < 7:
+    if generated < 15:
         print(
-            f"WARNING: only {generated} fixtures generated (expected ≥7). "
-            "Check that all 5 local snapshots are accessible.",
+            f"WARNING: only {generated} fixtures generated (expected ≥15). "
+            "Check that all 6 local snapshots are accessible.",
             file=sys.stderr,
         )
 

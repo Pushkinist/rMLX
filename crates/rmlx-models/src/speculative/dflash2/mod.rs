@@ -273,10 +273,10 @@ fn parse_config(
     cfg_raw: &rmlx_loader::ModelConfig,
     verifier_hidden: usize,
 ) -> Result<DFlash2Config> {
-    let arch = cfg_raw.architectures.first().map_or("", String::as_str);
+    let arch = cfg_raw.dispatch_arch().unwrap_or("");
     if !arch.contains("DFlash2") {
         return Err(Error::Model(format!(
-            "DFlash2Drafter: the snapshot declares architectures[0] {arch:?}, not \
+            "DFlash2Drafter: the snapshot dispatches on class {arch:?}, not \
              DFlash2DraftModel; this loader builds the DFlash 2 architecture and no other"
         )));
     }

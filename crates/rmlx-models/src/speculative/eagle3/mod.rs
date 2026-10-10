@@ -204,6 +204,82 @@ pub struct Eagle3Config {
     pub block_size: usize,
 }
 
+impl Eagle3Config {
+    /// Read the drafter's config from its `config.json`, with the defaults
+    /// of the mlx-vlm drafter for an absent key.
+    pub fn from_model_config(cfg_raw: &rmlx_loader::ModelConfig) -> Self {
+        let extras = &cfg_raw.extras;
+        let g_usize = |k: &str, default: usize| -> usize {
+            extras
+                .get(k)
+                .and_then(serde_json::Value::as_u64)
+                .map_or(default, |v| v as usize)
+        };
+        let g_f32 = |k: &str, default: f32| -> f32 {
+            extras
+                .get(k)
+                .and_then(serde_json::Value::as_f64)
+                .map_or(default, |v| v as f32)
+        };
+
+        // rope_theta lives under rope_parameters.rope_theta for this checkpoint,
+        // with a top-level rope_theta fallback.
+        let rope_theta = extras
+            .get("rope_parameters")
+            .and_then(|r| r.get("rope_theta"))
+            .and_then(serde_json::Value::as_f64)
+            .map_or_else(|| g_f32("rope_theta", 1.0e7), |v| v as f32);
+
+        // `eagle_aux_hidden_state_layer_ids` are the *target* layer ids; the verifier
+        // residual-stream capture happens one layer earlier, mirroring mlx-vlm
+        // `Eagle3Config.capture_layer_ids = [max(id - 1, 0) for id in target_layer_ids]`
+        // (config.py). rMLX's `forward_verify_capture` appends the residual stream
+        // AFTER layer i, so we pass the capture ids (id-1) directly. Capturing at the
+        // raw target ids [3,19,35] instead of [2,18,34] feeds the drafter the wrong
+        // residual slice and collapses accept-rate.
+        let aux_layer_ids: Vec<usize> = extras
+            .get("eagle_config")
+            .and_then(|d| d.get("eagle_aux_hidden_state_layer_ids"))
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_u64().map(|v| (v as usize).saturating_sub(1)))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // block_size: speculators_config.proposal_methods[0].speculative_tokens + 2,
+        // else mlx-vlm default 5.
+        let block_size = extras
+            .get("speculators_config")
+            .and_then(|s| s.get("proposal_methods"))
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|m| m.get("speculative_tokens"))
+            .and_then(serde_json::Value::as_u64)
+            .map_or(5, |v| v as usize + 2);
+
+        Self {
+            hidden_size: g_usize("hidden_size", 2048),
+            num_attention_heads: g_usize("num_attention_heads", 16),
+            num_key_value_heads: g_usize("num_key_value_heads", 2),
+            head_dim: g_usize("head_dim", 256),
+            rms_norm_eps: g_f32("rms_norm_eps", 1e-6),
+            rope_theta,
+            draft_vocab_size: g_usize("draft_vocab_size", 32000),
+            vocab_size: g_usize("vocab_size", 248320),
+            aux_layer_ids,
+            block_size,
+        }
+    }
+
+    /// Whether the drafter predicts over a reduced vocabulary, mapped to the
+    /// verifier's through `d2t`. Its restricted-vocabulary head is then active.
+    pub fn restricted_vocab(&self) -> bool {
+        self.draft_vocab_size != self.vocab_size
+    }
+}
+
 /// Loaded EAGLE-3 drafter weights + config.
 ///
 /// Construct with [`Eagle3Drafter::load`]. The drafter has a single decoder
@@ -260,26 +336,38 @@ pub struct Eagle3Drafter {
 }
 
 impl Eagle3Drafter {
-    /// Load an EAGLE-3 drafter from `draft_dir`, validating it against the
-    /// verifier's hidden size and vocabulary.
+    /// Load an EAGLE-3 drafter from `draft_dir`, validating it against
+    /// `verifier`.
     ///
     /// `draft_dir` is the standalone EAGLE-3 folder (`config.json` with
     /// `architectures: ["LlamaForCausalLMEagle3"]` + `eagle_config`, and a
-    /// `model.safetensors`). `hidden_size` is the verifier's model width; the
-    /// drafter `hidden_size` and `fc` input (`3*H`) must match it. `vocab_size`
-    /// is the verifier vocabulary; the drafter's `vocab_size` must match (the
-    /// `d2t`-mapped target ids index it). `eos_token_ids` are the verifier's
-    /// EOS token ids; they are appended to `hot_ids` so the restricted-vocab
-    /// argmax can select EOS at intermediate positions (mirrors mlx-vlm's
-    /// `_eagle3_hot_token_ids` which concatenates `eos_token_ids` onto `hot_ids`).
+    /// `model.safetensors`). The drafter `hidden_size` and `fc` input (`3*H`)
+    /// must match the verifier's model width, and the drafter's `vocab_size`
+    /// the verifier vocabulary (the `d2t`-mapped target ids index it). A
+    /// drafter with a restricted vocabulary is refused over a verifier whose
+    /// head cannot serve it
+    /// ([`crate::arch::Architecture::refuse_restricted_vocab_head`]).
+    /// `eos_token_ids` are the verifier's EOS token ids; they are appended to
+    /// `hot_ids` so the restricted-vocab argmax can select EOS at intermediate
+    /// positions (mirrors mlx-vlm's `_eagle3_hot_token_ids` which concatenates
+    /// `eos_token_ids` onto `hot_ids`).
     pub fn load(
         draft_dir: &Path,
-        hidden_size: usize,
-        vocab_size: usize,
+        verifier: &Architecture,
         eos_token_ids: &[u32],
         device: Device,
     ) -> Result<Self> {
-        let me = load_eagle3(draft_dir, hidden_size, vocab_size, eos_token_ids, device)?;
+        let hidden_size = verifier.hidden_size();
+        let me = load_eagle3(
+            draft_dir,
+            hidden_size,
+            verifier.vocab_size(),
+            eos_token_ids,
+            device,
+        )?;
+        if me.hot_path_active() {
+            verifier.refuse_restricted_vocab_head()?;
+        }
         tracing::info!(
             draft = %draft_dir.display(),
             hidden_size,
@@ -759,7 +847,7 @@ fn load_eagle3(
 
     let cfg_raw = load_config(draft_dir)
         .map_err(|e| Error::Model(format!("Eagle3Drafter: load_config: {e}")))?;
-    let arch = cfg_raw.architectures.first().map_or("", String::as_str);
+    let arch = cfg_raw.dispatch_arch().unwrap_or("");
     if !arch.contains("Eagle3") {
         tracing::warn!(
             draft = %draft_dir.display(),
@@ -768,69 +856,7 @@ fn load_eagle3(
         );
     }
 
-    let extras = &cfg_raw.extras;
-    let g_usize = |k: &str, default: usize| -> usize {
-        extras
-            .get(k)
-            .and_then(serde_json::Value::as_u64)
-            .map_or(default, |v| v as usize)
-    };
-    let g_f32 = |k: &str, default: f32| -> f32 {
-        extras
-            .get(k)
-            .and_then(serde_json::Value::as_f64)
-            .map_or(default, |v| v as f32)
-    };
-
-    // rope_theta lives under rope_parameters.rope_theta for this checkpoint,
-    // with a top-level rope_theta fallback.
-    let rope_theta = extras
-        .get("rope_parameters")
-        .and_then(|r| r.get("rope_theta"))
-        .and_then(serde_json::Value::as_f64)
-        .map_or_else(|| g_f32("rope_theta", 1.0e7), |v| v as f32);
-
-    // `eagle_aux_hidden_state_layer_ids` are the *target* layer ids; the verifier
-    // residual-stream capture happens one layer earlier, mirroring mlx-vlm
-    // `Eagle3Config.capture_layer_ids = [max(id - 1, 0) for id in target_layer_ids]`
-    // (config.py). rMLX's `forward_verify_capture` appends the residual stream
-    // AFTER layer i, so we pass the capture ids (id-1) directly. Capturing at the
-    // raw target ids [3,19,35] instead of [2,18,34] feeds the drafter the wrong
-    // residual slice and collapses accept-rate.
-    let aux_layer_ids: Vec<usize> = extras
-        .get("eagle_config")
-        .and_then(|d| d.get("eagle_aux_hidden_state_layer_ids"))
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_u64().map(|v| (v as usize).saturating_sub(1)))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // block_size: speculators_config.proposal_methods[0].speculative_tokens + 2,
-    // else mlx-vlm default 5.
-    let block_size = extras
-        .get("speculators_config")
-        .and_then(|s| s.get("proposal_methods"))
-        .and_then(|v| v.as_array())
-        .and_then(|a| a.first())
-        .and_then(|m| m.get("speculative_tokens"))
-        .and_then(serde_json::Value::as_u64)
-        .map_or(5, |v| v as usize + 2);
-
-    let cfg = Eagle3Config {
-        hidden_size: g_usize("hidden_size", 2048),
-        num_attention_heads: g_usize("num_attention_heads", 16),
-        num_key_value_heads: g_usize("num_key_value_heads", 2),
-        head_dim: g_usize("head_dim", 256),
-        rms_norm_eps: g_f32("rms_norm_eps", 1e-6),
-        rope_theta,
-        draft_vocab_size: g_usize("draft_vocab_size", 32000),
-        vocab_size: g_usize("vocab_size", 248320),
-        aux_layer_ids,
-        block_size,
-    };
+    let cfg = Eagle3Config::from_model_config(&cfg_raw);
 
     if cfg.hidden_size != hidden_size {
         return Err(Error::Model(format!(
@@ -965,9 +991,7 @@ fn load_eagle3(
     }
     let lm_head = Linear::Plain { weight: lm_head_w };
 
-    let d2t = if cfg.draft_vocab_size == cfg.vocab_size {
-        Vec::new()
-    } else {
+    let d2t = if cfg.restricted_vocab() {
         let d = load_d2t("d2t")?;
         if d.len() != cfg.draft_vocab_size {
             return Err(Error::Model(format!(
@@ -977,6 +1001,8 @@ fn load_eagle3(
             )));
         }
         d
+    } else {
+        Vec::new()
     };
 
     // Precompute hot_ids for the restricted-vocab hot-path.

@@ -4,7 +4,8 @@
 //! reached from a lib unit test, so the join is made here: the slug under
 //! `RMLX_O_MODELS_ROOT`, with a per-architecture variable as the override for a
 //! root that does not hold it. (`crates/rmlx-cli/src/commands/kv_calibrate_tests.rs`
-//! reads `RMLX_TEST_MODEL_BONSAI` first and the slug second.)
+//! reads `RMLX_TEST_MODEL_BONSAI` first and the slug second.) A cell with no
+//! such variable uses the slug alone (`snapshot_by_slug`).
 //!
 //! **An unset variable is not a stand-down.** A machine holding the snapshot
 //! runs the cell. Most of these cells are GPU tests that `make gpu-test`
@@ -30,13 +31,7 @@ const MODELS_ROOT_VAR: &str = "RMLX_O_MODELS_ROOT";
 /// silently is invisible to `scripts/run_gpu_tests.sh` and to the
 /// shader-validation census, and libtest reports it as a pass.
 pub(crate) fn snapshot(test: &str, var: &str, slug: &str, archs: &[&str]) -> Option<PathBuf> {
-    let by_slug = std::env::var(MODELS_ROOT_VAR)
-        .ok()
-        .filter(|root| !root.is_empty())
-        .map(|root| Path::new(&root).join(slug))
-        .filter(|dir| dir.is_dir());
-
-    let dir = match by_slug {
+    let dir = match under_root(slug) {
         Some(dir) => dir,
         None => match std::env::var(var).ok().filter(|v| !v.is_empty()) {
             Some(named) if Path::new(&named).is_dir() => PathBuf::from(named),
@@ -53,11 +48,35 @@ pub(crate) fn snapshot(test: &str, var: &str, slug: &str, archs: &[&str]) -> Opt
             }
         },
     };
+    declaring(test, dir, archs)
+}
 
-    let arch = declared_arch(&dir);
-    if !archs.contains(&arch.as_str()) {
+/// The snapshot `slug` names under `RMLX_O_MODELS_ROOT`, with no variable to
+/// override it, or `None` after announcing why this cell stood down. Same
+/// identity check and `SKIP` rule as [`snapshot`].
+pub(crate) fn snapshot_by_slug(test: &str, slug: &str, identities: &[&str]) -> Option<PathBuf> {
+    let Some(dir) = under_root(slug) else {
+        println!("SKIP {test}: {MODELS_ROOT_VAR} does not hold {slug}");
+        return None;
+    };
+    declaring(test, dir, identities)
+}
+
+fn under_root(slug: &str) -> Option<PathBuf> {
+    std::env::var(MODELS_ROOT_VAR)
+        .ok()
+        .filter(|root| !root.is_empty())
+        .map(|root| Path::new(&root).join(slug))
+        .filter(|dir| dir.is_dir())
+}
+
+/// `dir` when it declares one of `identities`, else `None` after a `SKIP`.
+fn declaring(test: &str, dir: PathBuf, identities: &[&str]) -> Option<PathBuf> {
+    let identity = declared_identity(&dir);
+    if !identities.contains(&identity.as_str()) {
         println!(
-            "SKIP {test}: {} declares arch {arch:?}, and this cell is written against {archs:?}",
+            "SKIP {test}: {} declares {identity:?}, and this cell is written against \
+             {identities:?}",
             dir.display()
         );
         return None;
@@ -65,10 +84,11 @@ pub(crate) fn snapshot(test: &str, var: &str, slug: &str, archs: &[&str]) -> Opt
     Some(dir)
 }
 
-/// The first entry of a snapshot's `architectures` array, or the empty string
+/// The first entry of a snapshot's `architectures` array, or its `model_type`
+/// when it names no architecture (a Prism Hadamard pack), or the empty string
 /// when the file is missing or unreadable — which no cell's list contains, so
 /// callers read it as a mismatch.
-fn declared_arch(dir: &Path) -> String {
+fn declared_identity(dir: &Path) -> String {
     let Ok(data) = std::fs::read(dir.join("config.json")) else {
         return String::new();
     };
@@ -77,6 +97,7 @@ fn declared_arch(dir: &Path) -> String {
     };
     v.get("architectures")
         .and_then(|a| a.get(0))
+        .or_else(|| v.get("model_type"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or("")
         .to_owned()

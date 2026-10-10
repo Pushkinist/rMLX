@@ -560,6 +560,38 @@ fn auto_kv_quant_resolves_to_bf16_for_every_arch_branch() {
     }
 }
 
+/// The arch invariants of `resolve_kv_quant` read the config's dispatch
+/// class: the Qwen MoE guard refuses a K-side 4-bit codec on a Qwen3.5 MoE
+/// config and takes it on a dense one, and a Hadamard pack on a Qwen3.5
+/// backbone is read as the dense class its base model type names.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "fixture JSON is a literal in this file; a parse failure is a test bug"
+)]
+fn the_kv_codec_guard_reads_the_dispatch_class() {
+    use rmlx_kv_quant::KvQuant;
+    for (body, refused) in [
+        (
+            r#"{"architectures":["Qwen3_5MoeForConditionalGeneration"]}"#,
+            true,
+        ),
+        (
+            r#"{"architectures":["Qwen3_5ForConditionalGeneration"]}"#,
+            false,
+        ),
+        (
+            r#"{"model_type":"prism_hadamard_qwen35","base_model_type":"qwen3_5",
+                "hadamard_config":"hadamard.json"}"#,
+            false,
+        ),
+    ] {
+        let cfg: rmlx_loader::ModelConfig = serde_json::from_str(body).unwrap();
+        let r = resolve_kv_quant(&cfg, Some(KvQuant::PlanarK), None);
+        assert_eq!(r.is_err(), refused, "{body}: {r:?}");
+    }
+}
+
 // ── --paged-kv against the resolved codec ────────────────────────────────────
 //
 // Paged KV pages a codec's packed store. Under the bf16 auto default there is

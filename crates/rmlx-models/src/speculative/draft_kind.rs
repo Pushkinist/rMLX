@@ -80,7 +80,7 @@ impl DraftKind {
 
 /// What a draft snapshot's `config.json` says about it.
 ///
-/// Read by [`Declared::from_snapshot`] from `architectures[0]` and
+/// Read by [`Declared::from_snapshot`] from the dispatch class and
 /// `model_type` — both, because export tools set one or the other: the Gemma4
 /// assistant carries `Gemma4AssistantForCausalLM` / `gemma4_assistant`, a
 /// Qwen3.5-family MTP sidecar carries `model_type = qwen3_5_mtp` and no
@@ -110,7 +110,7 @@ pub enum Declared {
 }
 
 impl Declared {
-    /// The declaration behind an `architectures[0]` / `model_type` pair.
+    /// The declaration behind a dispatch class / `model_type` pair.
     pub fn from_snapshot(arch: &str, model_type: &str) -> Self {
         if arch.contains("Eagle3") {
             Declared::Sidecar(DraftKind::Eagle3)

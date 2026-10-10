@@ -22,6 +22,8 @@ use tracing::error;
 
 use rmlx_core::{Error, Result};
 
+use crate::hadamard::HADAMARD_CONFIG;
+
 // Bounded against malformed/adversarial config.json tensor_overrides maps.
 // Production models typically have <10 overrides; 4096 is a generous but defensive ceiling.
 pub(crate) const MAX_OVERRIDES: usize = 4_096;
@@ -103,13 +105,13 @@ pub struct TextConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     /// Architecture identifiers from the HuggingFace config (`["Gemma4ForConditionalGeneration"]`, etc.).
+    /// Read through [`ModelConfig::dispatch_arch`].
     ///
     /// Defaults to empty when absent: some standalone sidecar configs (e.g. the
     /// Qwen3.5 `qwen3_5_mtp` MTP-drafter split) carry only `model_type` and no
-    /// `architectures` array. Callers that need an arch fall back to
-    /// `model_type` / tensor-name detection.
+    /// `architectures` array, and a Prism Hadamard pack carries none either.
     #[serde(default)]
-    pub architectures: Vec<String>,
+    architectures: Vec<String>,
     /// Default tensor dtype string (`"bfloat16"`, `"float16"`, etc.).
     pub dtype: Option<String>,
     /// MLX-native affine/mxfp quantization parameters (field name `quantization`).
@@ -135,6 +137,30 @@ impl ModelConfig {
             .is_some_and(|qc| qc.quant_method.as_deref() == Some("paroquant"))
     }
 
+    /// Returns `true` when `config.json` names a Hadamard contract file
+    /// (`hadamard_config`): the snapshot is a Prism Hadamard pack. Whether the
+    /// contract holds is [`crate::HadamardContract::read`]'s question.
+    pub fn is_hadamard_pack(&self) -> bool {
+        self.extras.contains_key(HADAMARD_CONFIG)
+    }
+
+    /// The architecture class this snapshot dispatches on: `architectures[0]`
+    /// when the config names one. A Prism Hadamard pack names none; it
+    /// dispatches on the class of the backbone its `base_model_type` names.
+    /// `None` when neither gives a class.
+    pub fn dispatch_arch(&self) -> Option<&str> {
+        if let Some(declared) = self.architectures.first() {
+            return Some(declared);
+        }
+        if !self.is_hadamard_pack() {
+            return None;
+        }
+        match self.extras.get("base_model_type")?.as_str()? {
+            "qwen3_5" => Some("Qwen3_5ForConditionalGeneration"),
+            _ => None,
+        }
+    }
+
     /// Resolve the **full-attention** head_dim from this config.
     ///
     /// Returns the value that downstream V-side codec validators (e.g. `tq4`
@@ -143,7 +169,7 @@ impl ModelConfig {
     /// **never** returned — SWA layers stay bf16.
     ///
     /// Resolution order:
-    /// 1. If `architectures[0]` is a Gemma3/Gemma4 variant, prefer
+    /// 1. If [`Self::dispatch_arch`] is a Gemma3/Gemma4 variant, prefer
     ///    `text_config.global_head_dim` (the FA head_dim).
     /// 2. Otherwise read `text_config.head_dim` if present.
     /// 3. Otherwise read top-level `head_dim` (for Qwen3-style configs that
@@ -156,7 +182,7 @@ impl ModelConfig {
     /// Returning `None` is a valid outcome — callers must not guess. The
     /// `--cache-type-*` resolver explicitly maps `None` to `HeadDimUnknown`.
     pub fn head_dim(&self) -> Option<usize> {
-        let arch = self.architectures.first().map_or("", String::as_str);
+        let arch = self.dispatch_arch().unwrap_or("");
         let is_gemma = matches!(
             arch,
             "Gemma3ForCausalLM"
@@ -231,53 +257,27 @@ impl ModelConfig {
         None
     }
 
-    /// Extract EOS token ids from the parsed config.
-    ///
-    /// HuggingFace `config.json` stores `eos_token_id` as either:
-    /// - a single integer (e.g. Bonsai: `"eos_token_id": 151645`)
-    /// - an array of integers (e.g. Gemma4: `"eos_token_id": [1, 106, 50]`,
-    ///   Qwen3.5MoE: `"eos_token_id": [248046, 248044]`)
-    ///
-    /// Returns an empty `Vec` if the field is absent, null, or malformed —
-    /// callers should treat empty as "no EOS-stop, run to max_tokens".
-    pub fn eos_token_ids(&self) -> Vec<u32> {
-        // Nested-config architectures (e.g. Qwen3-VL-MoE
-        // `Qwen3VLMoeForConditionalGeneration`) carry `eos_token_id` inside
-        // `text_config`, not at the top level. Fall back to that when the
-        // top-level field is absent — additive: archs with a top-level
-        // `eos_token_id` are unaffected.
-        // Prefer the top-level `eos_token_id`. Nested-config architectures (e.g.
-        // Qwen3-VL-MoE) set the top-level field to `null` and carry the real id
-        // inside `text_config.eos_token_id`; fall back to that whenever the
-        // top-level value is absent OR null. Additive: archs with a usable
-        // top-level `eos_token_id` are unaffected.
-        let top = self.extras.get("eos_token_id");
-        let nested = self
-            .text_config
-            .as_ref()
-            .and_then(|tc| tc.extras.get("eos_token_id"));
-        let v = match top {
-            Some(v) if !v.is_null() => v,
-            _ => match nested {
-                Some(v) if !v.is_null() => v,
-                _ => return Vec::new(),
-            },
+    /// The `eos_token_id` of `config.json`: the top-level value, or, when it
+    /// is absent or null, the `text_config` value (Qwen3-VL-MoE sets the top
+    /// level to null). The served stop set is [`ModelConfig::stop_token_ids`].
+    fn eos_token_ids(&self) -> Vec<u32> {
+        let top = self.extras.get("eos_token_id").filter(|v| !v.is_null());
+        let nested = || {
+            self.text_config
+                .as_ref()
+                .and_then(|tc| tc.extras.get("eos_token_id"))
         };
-        #[allow(
-            clippy::wildcard_enum_match_arm,
-            reason = "serde_json::Value has many variants; all non-Number/Array forms (Null, Bool, String, Object) are invalid here and should return empty"
-        )]
-        match v {
-            serde_json::Value::Number(n) => n
-                .as_u64()
-                .and_then(|u| u32::try_from(u).ok())
-                .map_or_else(Vec::new, |id| vec![id]),
-            serde_json::Value::Array(arr) => arr
-                .iter()
-                .filter_map(|x| x.as_u64().and_then(|u| u32::try_from(u).ok()))
-                .collect(),
-            _ => Vec::new(),
-        }
+        top.or_else(nested).map_or_else(Vec::new, token_ids)
+    }
+}
+
+/// The token ids an `eos_token_id` value names: one integer or an array of
+/// them. An entry that is not a `u32` is skipped; any other value names none.
+fn token_ids(value: &serde_json::Value) -> Vec<u32> {
+    let id = |v: &serde_json::Value| v.as_u64().and_then(|u| u32::try_from(u).ok());
+    match value.as_array() {
+        Some(entries) => entries.iter().filter_map(id).collect(),
+        None => id(value).into_iter().collect(),
     }
 }
 
@@ -310,6 +310,88 @@ pub fn load_config(model_dir: &Path) -> Result<ModelConfig> {
     }
 
     Ok(cfg)
+}
+
+/// Sampling defaults and end ids from `generation_config.json`. A key the file
+/// does not hold is `None` (no ids for `eos_token_id`); other keys are ignored.
+#[allow(
+    clippy::exhaustive_structs,
+    reason = "plain file record built by callers and tests; a new key is a new field at every site on purpose"
+)]
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GenerationConfig {
+    /// Default sampling temperature.
+    pub temperature: Option<f32>,
+    /// Default nucleus sampling probability.
+    pub top_p: Option<f32>,
+    /// Default top-k sampling cutoff.
+    pub top_k: Option<u32>,
+    /// Default repetition penalty multiplier.
+    pub repetition_penalty: Option<f32>,
+    /// Default maximum new tokens per request.
+    pub max_new_tokens: Option<u32>,
+    /// `false` asks for greedy decoding. Only the speech route reads it.
+    pub do_sample: Option<bool>,
+    /// Qwen3-TTS code predictor: `false` asks for greedy decoding.
+    pub subtalker_dosample: Option<bool>,
+    /// Qwen3-TTS code predictor: sampling temperature.
+    pub subtalker_temperature: Option<f32>,
+    /// Qwen3-TTS code predictor: nucleus sampling probability.
+    pub subtalker_top_p: Option<f32>,
+    /// Qwen3-TTS code predictor: top-k sampling cutoff.
+    pub subtalker_top_k: Option<u32>,
+    /// The token ids `eos_token_id` names: one integer or an array.
+    #[serde(default, rename = "eos_token_id", deserialize_with = "de_token_ids")]
+    pub eos_token_ids: Vec<u32>,
+}
+
+fn de_token_ids<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Vec<u32>, D::Error> {
+    serde_json::Value::deserialize(d).map(|v| token_ids(&v))
+}
+
+/// Load `<model_dir>/generation_config.json`. `Ok(None)` when the file does
+/// not exist; an error naming it when it exists and cannot be read or parsed.
+pub fn load_generation_config(model_dir: &Path) -> Result<Option<GenerationConfig>> {
+    let path = model_dir.join("generation_config.json");
+    let data = match std::fs::read(&path) {
+        Ok(data) => data,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(Error::Loader(format!(
+                "cannot read {}: {e}",
+                path.display()
+            )))
+        }
+    };
+    serde_json::from_slice(&data)
+        .map(Some)
+        .map_err(|e| Error::Loader(format!("malformed {}: {e}", path.display())))
+}
+
+impl ModelConfig {
+    /// The token ids that end a generation: the `config.json` ids in their
+    /// order, then each `generation_config.json` id they lack. Empty when
+    /// neither file names one.
+    ///
+    /// HuggingFace `generate` and mlx-lm stop at the `generation_config.json`
+    /// ids and read `config.json` only when that file names none. The union
+    /// keeps every id `config.json` names as well, so no stop is lost.
+    pub fn stop_token_ids(&self, generation: Option<&GenerationConfig>) -> Vec<u32> {
+        let mut ids = self.eos_token_ids();
+        for &id in generation.map_or(&[][..], |g| &g.eos_token_ids) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+}
+
+/// [`ModelConfig::stop_token_ids`] of the snapshot at `model_dir`, read from
+/// its `config.json` and [`load_generation_config`].
+pub fn stop_token_ids(model_dir: &Path) -> Result<Vec<u32>> {
+    let generation = load_generation_config(model_dir)?;
+    Ok(load_config(model_dir)?.stop_token_ids(generation.as_ref()))
 }
 
 #[cfg(test)]

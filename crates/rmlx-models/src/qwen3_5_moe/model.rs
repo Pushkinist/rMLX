@@ -1023,6 +1023,15 @@ impl Qwen3_5MoeText {
         }
     }
 
+    /// Whether the output head (`lm_head`, or the tied embedding) is
+    /// Hadamard-folded.
+    pub fn has_hadamard_head(&self) -> bool {
+        match &self.lm_head {
+            Some(lm) => matches!(lm, Linear::Hadamard { .. }),
+            None => matches!(self.embed_tokens, Embedding::Hadamard { .. }),
+        }
+    }
+
     /// Restricted-vocab logits for the EAGLE-3 hot-path.
     ///
     /// Computes `hidden @ W_hot.T` where `W_hot` contains only the `hot_ids`
@@ -1166,6 +1175,13 @@ fn build_cached_hot_head(
                         .into(),
                 ))
             }
+            // The gathered rows are folded: a matmul on the untransformed
+            // hidden state gives wrong logits with no error.
+            Linear::Hadamard { .. } => Err(rmlx_core::error::Error::Model(
+                "hot_logits_from_final_hidden: a Hadamard lm_head has no \
+                 restricted-vocab hot-path"
+                    .into(),
+            )),
         },
         None => {
             // Tied embedding: take draft-vocab rows from embed_tokens weight.
@@ -1173,6 +1189,11 @@ fn build_cached_hot_head(
             // unlike mlx-vlm which always uses `lm.model.embed_tokens`. Equivalent
             // for Qwen3.5-MoE which has tied weights.
             match embed_tokens {
+                Embedding::Hadamard { .. } => Err(rmlx_core::error::Error::Model(
+                    "hot_logits_from_final_hidden: a Hadamard embedding is not a tied \
+                     output head"
+                        .into(),
+                )),
                 Embedding::Plain { weight } => {
                     let w_hot = weight.take(hot_ids, 0, device)?;
                     w_hot.eval()?;
@@ -1219,3 +1240,7 @@ fn build_cached_hot_head(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "model_tests.rs"]
+mod model_tests;

@@ -3069,21 +3069,26 @@ fn resolve(slug: &str) -> common::Gate {
 /// or the other depending on the export tool — the same two fields the serve
 /// layer routes `--draft-kind mtp` on.
 fn is_gemma4_assistant(draft_path: &Path) -> bool {
-    draft_config(draft_path).is_some_and(|cfg| {
-        let model_type = cfg["model_type"].as_str().unwrap_or_default();
-        let arch_name = cfg["architectures"][0].as_str().unwrap_or_default();
+    draft_class(draft_path).is_some_and(|(arch_name, model_type)| {
         model_type == "gemma4_assistant" || arch_name.contains("Gemma4Assistant")
     })
 }
 
 /// The drafter kind a snapshot declares itself, by the serve layer's own rule.
 fn declared_kind(draft_path: &Path) -> Option<DraftKind> {
-    let cfg = draft_config(draft_path)?;
-    Declared::from_snapshot(
-        cfg["architectures"][0].as_str().unwrap_or_default(),
-        cfg["model_type"].as_str().unwrap_or_default(),
-    )
-    .kind()
+    let (arch_name, model_type) = draft_class(draft_path)?;
+    Declared::from_snapshot(&arch_name, &model_type).kind()
+}
+
+/// The dispatch class and `model_type` of a draft snapshot's config, read as
+/// the serve layer reads them.
+fn draft_class(draft_path: &Path) -> Option<(String, String)> {
+    let cfg = rmlx_loader::load_config(draft_path).ok()?;
+    let model_type = cfg.extras.get("model_type").and_then(|v| v.as_str());
+    Some((
+        cfg.dispatch_arch().unwrap_or_default().to_owned(),
+        model_type.unwrap_or_default().to_owned(),
+    ))
 }
 
 fn draft_config(draft_path: &Path) -> Option<serde_json::Value> {
@@ -3873,7 +3878,6 @@ fn engine_for(
     device: Device,
 ) -> Option<Engine> {
     let hidden = verifier.hidden_size();
-    let vocab = verifier.vocab_size();
     let verifier = Box::new(verifier);
     let engine = match round_loop {
         RoundLoop::Gemma4Assistant => {
@@ -3963,7 +3967,7 @@ fn engine_for(
             // The verifier's stop ids join the drafter's reduced vocabulary, so
             // the restricted argmax can still end a turn. They are the same ids
             // both arms stop on.
-            let drafter = Eagle3Drafter::load(draft_path, hidden, vocab, eos, device)
+            let drafter = Eagle3Drafter::load(draft_path, &verifier, eos, device)
                 .expect("load EAGLE-3 drafter");
             Engine::Sidecar {
                 verifier,

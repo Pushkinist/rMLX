@@ -317,6 +317,27 @@ pub fn check_total_input_tokens_estimate(total_text_bytes: usize) -> Result<(), 
     Ok(())
 }
 
+/// The bytes of `value` as compact JSON, counted without building the text.
+///
+/// It stands for the text a template can print from a request variable, for
+/// [`check_total_input_tokens_estimate`].
+pub fn serialized_len(value: &impl serde::Serialize) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    // Serialising a parsed `Value` cannot fail; a failure counts what was written.
+    let _ = serde_json::to_writer(&mut count, value);
+    count.0
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

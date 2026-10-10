@@ -271,7 +271,7 @@ fn run_head_budget(
 
     // Architecture gate: only Qwen3 (Bonsai is the smoke target) is currently wired.
     let cfg = load_config(model_dir).map_err(|e| anyhow::anyhow!("load_config: {e}"))?;
-    let arch_name = cfg.architectures.first().cloned().unwrap_or_default();
+    let arch_name = cfg.dispatch_arch().unwrap_or_default();
     if arch_name != "Qwen3ForCausalLM" {
         anyhow::bail!(
             "kv-calibrate --recipe head_budget: architecture '{arch_name}' is not supported \
@@ -470,7 +470,7 @@ fn run_softmax_mass(
     }
 
     let cfg = load_config(model_dir).map_err(|e| anyhow::anyhow!("load_config: {e}"))?;
-    let arch_name = cfg.architectures.first().cloned().unwrap_or_default();
+    let arch_name = cfg.dispatch_arch().unwrap_or_default();
     if arch_name != "Qwen3ForCausalLM" {
         anyhow::bail!(
             "kv-calibrate --recipe softmax_mass: architecture '{arch_name}' is not supported \

@@ -19,12 +19,11 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rmlx_loader::load_config;
+use rmlx_loader::{load_config, load_generation_config, GenerationConfig};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::chat_template::{self, ChatTemplate};
-use crate::generation_config_io::{self, GenerationConfig};
 use crate::tokenizer_io;
 
 // ── Registry config (JSON on-disk format) ─────────────────────────────────────
@@ -98,6 +97,9 @@ pub struct ModelEntry {
     /// Optional sampling defaults parsed from `generation_config.json`.
     /// `None` when the file is absent. Per-field `None` when the key is absent.
     pub generation_defaults: Option<Arc<GenerationConfig>>,
+    /// The ids that end a generation (`ModelConfig::stop_token_ids`), read
+    /// once here from `config.json` and `generation_config.json`.
+    pub stop_token_ids: Vec<u32>,
     /// True iff the compiled chat template can render a context that contains
     /// at least one tool without returning an error.
     ///
@@ -170,7 +172,7 @@ fn probe_tools_supported(tpl: &ChatTemplate) -> bool {
         eos_token: "",
         add_generation_prompt: false,
         tools: std::slice::from_ref(&dummy_tool),
-        enable_thinking: None,
+        variables: None,
     };
     tpl.render(&messages, &opts).is_ok()
 }
@@ -214,7 +216,9 @@ impl ModelRegistry {
     /// **best-effort**: a `tracing::warn!` is emitted but the entry is still
     /// added. This lets diagnostics work even for partial snapshots.
     ///
-    /// Paths where `config.json` itself fails to load are **skipped** entirely.
+    /// Paths where `config.json` fails to load, or `generation_config.json`
+    /// exists and fails to load, are **skipped** entirely: the model load
+    /// refuses the same files.
     pub fn from_paths(paths: &[PathBuf]) -> Self {
         let pairs: Vec<(String, PathBuf)> = paths
             .iter()
@@ -237,17 +241,18 @@ impl ModelRegistry {
             let id = id.clone();
             let abs_path = path.canonicalize().unwrap_or_else(|_| path.clone());
 
-            let arch = match load_config(&abs_path) {
-                Ok(cfg) => cfg
-                    .architectures
-                    .into_iter()
-                    .next()
-                    .unwrap_or_else(|| "unknown".to_owned()),
+            let (cfg, generation) = match load_config(&abs_path)
+                .and_then(|c| Ok((c, load_generation_config(&abs_path)?)))
+            {
+                Ok(files) => files,
                 Err(e) => {
                     warn!(path = %abs_path.display(), error = %e, "registry: skipping unreadable snapshot");
                     continue;
                 }
             };
+            let arch = cfg.dispatch_arch().unwrap_or("unknown").to_owned();
+            let stop_token_ids = cfg.stop_token_ids(generation.as_ref());
+            let generation_defaults = generation.map(Arc::new);
 
             // ── chat_template.jinja (best-effort) ───────────────────────────
             // Retain the raw source for tool-call format detection
@@ -317,21 +322,6 @@ impl ModelRegistry {
                     }
                 };
 
-            // ── generation_config.json (best-effort) ────────────────────────
-            let generation_defaults: Option<Arc<GenerationConfig>> =
-                match generation_config_io::load_generation_config(&abs_path) {
-                    Ok(Some(cfg)) => Some(Arc::new(cfg)),
-                    Ok(None) => None,
-                    Err(e) => {
-                        warn!(
-                            model_id = %id,
-                            error = %e,
-                            "registry: generation_config.json present but failed to parse; ignoring"
-                        );
-                        None
-                    }
-                };
-
             reg.entries.insert(
                 id.clone(),
                 ModelEntry {
@@ -345,6 +335,7 @@ impl ModelRegistry {
                     bos_token,
                     eos_token,
                     generation_defaults,
+                    stop_token_ids,
                     tools_supported,
                 },
             );

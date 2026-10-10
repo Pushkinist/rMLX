@@ -174,8 +174,6 @@ impl ArchGenerator {
 
         tracing::info!(model_id = %model_id, ?device, "ArchGenerator: loading model via arch dispatch");
 
-        // Load config.json once for both kv-quant resolution and EOS-id
-        // extraction.
         let cfg = rmlx_loader::load_config(model_dir)
             .map_err(|e| Error::Other(format!("load_config: {e}")))?;
 
@@ -185,15 +183,12 @@ impl ArchGenerator {
         let (kv_quant_resolved, kv_quant_user_explicit) =
             resolve_kv_quant_for_load(&cfg, load_cfg.kv_quant, &model_id);
 
-        // Extract EOS token ids from config.json. HuggingFace stores
-        // `eos_token_id` as either a single int or an array of ints (Gemma4
-        // uses [1, 106, 50] for <eos>, <end_of_turn>, ...). Empty Vec disables
-        // EOS-stop in generate_greedy.
-        let eos_ids = cfg.eos_token_ids();
+        let eos_ids = rmlx_loader::stop_token_ids(model_dir)
+            .map_err(|e| Error::Other(format!("stop token ids: {e}")))?;
         tracing::info!(
             model_id = %model_id,
             ?eos_ids,
-            "ArchGenerator: parsed EOS token ids from config.json"
+            "ArchGenerator: stop token ids from config.json and generation_config.json"
         );
 
         let model = rmlx_models::arch::load_model(
@@ -272,7 +267,7 @@ impl ArchGenerator {
         // have a vision arm below.
         let vision: Option<Arc<VisionBundle>> = match &model {
             // Gemma4 **unified** (12B): encoder-free vision embedder, no SigLIP
-            // tower. Distinguished from the tower family by `architectures[0]`.
+            // tower. Distinguished from the tower family by the dispatch class.
             rmlx_models::arch::Architecture::Gemma4(_)
                 if rmlx_models::gemma4::is_unified_arch(model_dir) =>
             {

@@ -787,7 +787,7 @@ impl std::fmt::Debug for JsonObjectConstraint {
 impl JsonObjectConstraint {
     /// Build a constraint by precomputing the token-bytes map.
     ///
-    /// `eos_ids` is the model's stop-token set from `config.json`; the mask
+    /// `eos_ids` is the model's stop-token set (`rmlx_loader::stop_token_ids`); the mask
     /// allows these only when the grammar reaches a terminal state.
     pub fn new(tokenizer: Arc<tokenizers::Tokenizer>, eos_ids: Vec<u32>) -> Self {
         let bytes_map = Arc::new(TokenBytesMap::new(&tokenizer));

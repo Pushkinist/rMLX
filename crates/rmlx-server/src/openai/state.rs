@@ -624,14 +624,14 @@ pub struct AppState {
     /// hard-coded 1.0. `None` = absent (behaviour unchanged).
     /// Configurable via `--default-temperature`.
     pub default_temperature: Option<f32>,
-    /// server-startup default for `enable_thinking` (thinking mode control).
+    /// Server-startup default for the template's `enable_thinking` variable.
     ///
-    /// `Some(false)` → suppress the open `<think>` block on Qwen3-family models
-    /// unless the request explicitly overrides with `enable_thinking: true`.
-    /// `None` = absent (behaviour unchanged — thinking enabled by template default).
-    /// Configurable via `--enable-thinking false` / `--enable-thinking true`.
+    /// `Some(false)` is passed to the template. `Some(true)` and `None` leave
+    /// the variable undefined, so the template default applies. Configurable
+    /// via `--enable-thinking false` / `--enable-thinking true`.
     ///
-    /// Precedence: request `enable_thinking` > this > absent (= enabled).
+    /// Precedence: request `enable_thinking`, then request
+    /// `chat_template_kwargs`, then this.
     pub default_enable_thinking: Option<bool>,
     /// Server-startup default image-token budget for Gemma4-unified vision.
     /// `Some(n)` raises the soft-token budget for dense images (clamped to the

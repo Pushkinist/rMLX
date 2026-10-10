@@ -467,11 +467,12 @@ pub struct ChatCompletionsRequest {
     #[serde(default)]
     pub echo: Option<bool>,
 
-    // per-request thinking control. `Some(false)` suppresses the open
-    // `<think>` block on Qwen3-family models (no-think mode); `Some(true)` or
-    // `None` leaves the template default in place (open `<think>` block).
-    // Precedence: request > AppState::default_enable_thinking > absent (= enabled).
-    /// Per-request thinking mode; `Some(false)` disables `<think>` block for Qwen3-family.
+    // per-request thinking control. `Some(false)` is passed to the template as
+    // `enable_thinking=false` (a Qwen3-family template closes its `<think>`
+    // block). `Some(true)` and `None` leave the template default in place; to
+    // pass `true`, send it in `chat_template_kwargs`.
+    // Precedence: this field > `chat_template_kwargs` > AppState::default_enable_thinking.
+    /// Per-request thinking switch; `false` selects the template's no-think branch.
     #[serde(default)]
     pub enable_thinking: Option<bool>,
 
@@ -483,6 +484,23 @@ pub struct ChatCompletionsRequest {
     /// Cap on reasoning-channel tokens; `None` = uncapped.
     #[serde(default)]
     pub thinking_budget: Option<u32>,
+
+    /// OpenAI `reasoning_effort`, passed to the chat template as its
+    /// `reasoning_effort` variable, as sent. `None` leaves the variable
+    /// undefined, so the template's own default applies. A value the template
+    /// refuses is HTTP 400 with the template's message; a template that does
+    /// not read the variable ignores it. Wins over the same key in
+    /// `chat_template_kwargs`.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+
+    /// Template variables, as vLLM's `chat_template_kwargs`. Every entry goes
+    /// to the chat template as sent. A key named like a variable the server
+    /// sets or a function of the template environment replaces nothing. The
+    /// top-level `enable_thinking` and `reasoning_effort` win over the same
+    /// keys here. Its size counts against the input text bound.
+    #[serde(default)]
+    pub chat_template_kwargs: Option<serde_json::Map<String, Value>>,
 
     // per-request delimiter overrides for the thinking-block splitter.
     // When present, redirects both the splitter pattern matching and the

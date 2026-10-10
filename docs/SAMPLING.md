@@ -315,9 +315,11 @@ Logprobs).
 
 ## Special tokens
 
-**EOS.** Each architecture reads `eos_token_id` from `config.json` through
-`eos_token_ids()`. An integer or an array both become `Vec<u32>`. The decode
-loop stops with `finish_reason = "stop"` on the first match.
+**EOS.** The stop set is `rmlx_loader::stop_token_ids`: the `eos_token_id`
+of `config.json`, then the ids `generation_config.json` adds
+([`MODELS.md`](MODELS.md) § "Overview", end of turn). An integer or an array both become
+`Vec<u32>`. The decode loop stops with `finish_reason = "stop"` on the first
+match.
 
 **BOS.** Used only when building a prompt.
 
@@ -360,6 +362,16 @@ id. The decode loop:
 The model continues from `</think>` with answer tokens. The forced token
 carries no logprobs. With no `thinking_budget`, `account_thinking_piece()`
 returns at once.
+
+`reasoning_effort` and `thinking_budget` are independent. The effort is a
+template variable: it changes the rendered prompt (the Qwen3.8 template adds
+an instruction for `xhigh` and `low`) and nothing else. The budget caps the
+pieces of the thinking channel, whatever the effort. The server reads the
+channel off the rendered prompt, so a request that closes the think block
+(`enable_thinking` `false`, at the top level or in `chat_template_kwargs`)
+starts the splitter closed and the budget never counts a piece. Only
+`Architecture::Qwen3` and `Architecture::Qwen3_5Moe` have a splitter
+(`supports_thinking()`); on any other architecture the budget has no effect.
 
 ---
 

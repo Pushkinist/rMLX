@@ -196,6 +196,28 @@ fn open_dir_empty_is_err() {
     assert!(result.is_err(), "no shards present must yield Err");
 }
 
+/// With no index, every tensor of `model.safetensors` maps to that file, and
+/// a `model.safetensors` whose header does not parse is an error.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: tempdir / index failures should abort the test loudly"
+)]
+fn a_single_shard_without_index_maps_each_tensor_to_it() {
+    let dir = tempfile::tempdir().unwrap();
+    write_shard(dir.path(), "model.safetensors", "tensor.a");
+    write_shard(dir.path(), "other.safetensors", "tensor.b");
+    let idx = load_shard_index(dir.path()).unwrap();
+    assert_eq!(
+        idx.weight_map.into_iter().collect::<Vec<_>>(),
+        vec![("tensor.a".to_owned(), "model.safetensors".to_owned())]
+    );
+    assert_eq!(idx.metadata, Value::Null);
+
+    std::fs::write(dir.path().join("model.safetensors"), b"not a header").unwrap();
+    assert!(load_shard_index(dir.path()).is_err());
+}
+
 #[test]
 fn count_tensors_per_shard_basic() {
     let mut weight_map = BTreeMap::new();
@@ -209,4 +231,71 @@ fn count_tensors_per_shard_basic() {
     let counts = count_tensors_per_shard(&idx);
     assert_eq!(counts["shard1.safetensors"], 2);
     assert_eq!(counts["shard2.safetensors"], 1);
+}
+
+/// An index names each shard by a plain `.safetensors` file name in the
+/// snapshot directory. A value with a directory part (a trailing `/`
+/// included), an absolute path, `.`, `..`, the empty name, a NUL byte or
+/// another extension is refused before any loader opens it.
+#[test]
+fn an_index_names_its_shards_by_plain_file_name() {
+    let cases = [
+        ("model-00001-of-00002.safetensors", true),
+        ("../x.safetensors", false),
+        ("/tmp/x.safetensors", false),
+        ("sub/x.safetensors", false),
+        ("./x.safetensors", false),
+        ("x.bin", false),
+        ("", false),
+        (".", false),
+        ("..", false),
+        ("x.safetensors/", false),
+        ("x.safetensors/.", false),
+        ("x\0y.safetensors", false),
+    ];
+    for (shard, accepted) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            make_index_json(&[("t.weight", shard)]),
+        )
+        .unwrap();
+        let r = load_shard_index(dir.path());
+        assert_eq!(r.is_ok(), accepted, "{shard}: {r:?}");
+        if let Err(e) = r {
+            assert!(
+                e.to_string().contains(&format!("{shard:?}")),
+                "{shard:?}: {e}"
+            );
+        }
+    }
+}
+
+/// Every shard index under `RMLX_O_MODELS_ROOT` is accepted.
+#[test]
+fn every_local_snapshot_index_is_accepted() {
+    const TEST: &str = "every_local_snapshot_index_is_accepted";
+    let Some(root) = std::env::var("RMLX_O_MODELS_ROOT")
+        .ok()
+        .filter(|r| !r.is_empty())
+        .map(PathBuf::from)
+        .filter(|r| r.is_dir())
+    else {
+        println!("SKIP {TEST}: RMLX_O_MODELS_ROOT names no directory");
+        return;
+    };
+    let mut indexed = 0;
+    let mut wrong = Vec::new();
+    for entry in std::fs::read_dir(&root).unwrap() {
+        let dir = entry.unwrap().path();
+        if !dir.join("model.safetensors.index.json").is_file() {
+            continue;
+        }
+        indexed += 1;
+        if let Err(e) = load_shard_index(&dir) {
+            wrong.push(format!("{}: {e}", dir.display()));
+        }
+    }
+    println!("{TEST}: {indexed} indexed snapshots");
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }

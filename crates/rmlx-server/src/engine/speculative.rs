@@ -46,7 +46,7 @@ enum MtpDraftFamily {
     Unsupported,
 }
 
-/// Classify an `--draft-kind mtp` draft by its `architectures[0]` and
+/// Classify an `--draft-kind mtp` draft by its dispatch class and
 /// `model_type`. Both fields are checked because mlx-community snapshots set the
 /// family on one or the other depending on the export tool.
 ///
@@ -169,7 +169,7 @@ fn decide_draft_kind(
         (Some(f), Declared::Sidecar(d)) if f != d => Err(Error::SpeculativePairing {
             reason: format!(
                 "--draft-kind {f} contradicts the draft snapshot, which declares itself \
-                 a {d} drafter (architectures[0] {arch:?}, model_type {model_type:?}); \
+                 a {d} drafter (class {arch:?}, model_type {model_type:?}); \
                  drop the flag or point --draft-model at a {f} snapshot"
             ),
         }),
@@ -183,7 +183,7 @@ fn decide_draft_kind(
             Declared::FullModel,
         ) => Err(Error::SpeculativePairing {
             reason: format!(
-                "--draft-kind {f} points at a registered full model (architectures[0] \
+                "--draft-kind {f} points at a registered full model (class \
                      {arch:?}, model_type {model_type:?}), which carries no {f} head; point \
                      --draft-model at a {f} sidecar, or drop the flag to run it as a \
                      two_model draft"
@@ -192,13 +192,47 @@ fn decide_draft_kind(
         (Some(f), Declared::Sidecar(_) | Declared::FullModel | Declared::Unknown) => Ok(f),
         (None, declared) => declared.kind().ok_or_else(|| Error::SpeculativePairing {
             reason: format!(
-                "the draft snapshot's config.json identifies no drafter (architectures[0] \
+                "the draft snapshot's config.json identifies no drafter (class \
                  {arch:?}, model_type {model_type:?}) — it is neither a sidecar head \
                  (mtp / dflash / eagle3) nor a registered generative architecture; pass \
                  --draft-kind to name it"
             ),
         }),
     }
+}
+
+/// The drafter kind of the snapshot in `draft_dir`, with the dispatch class
+/// and `model_type` its `config.json` declares. Reads the config and the
+/// shard headers only; no model loads.
+///
+/// # Errors
+/// [`Error::Other`] when the config cannot be read; [`Error::Model`] for a
+/// Hadamard pack rMLX cannot serve, whatever the flag; else as
+/// [`decide_draft_kind`].
+fn draft_kind_of(
+    flag: Option<rmlx_models::DraftKind>,
+    draft_dir: &Path,
+) -> rmlx_core::Result<(rmlx_models::DraftKind, String, String)> {
+    let draft_cfg = rmlx_loader::load_config(draft_dir)
+        .map_err(|e| Error::Other(format!("load_config (draft): {e}")))?;
+    rmlx_models::arch::check_hadamard_pack(&draft_cfg, draft_dir)?;
+    let arch = draft_cfg.dispatch_arch().unwrap_or("");
+    let model_type = draft_cfg
+        .extras
+        .get("model_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let declared = rmlx_models::Declared::from_snapshot(arch, model_type);
+    let kind = decide_draft_kind(flag, declared, arch, model_type)?;
+    tracing::info!(
+        draft = %draft_dir.display(),
+        arch,
+        model_type,
+        ?declared,
+        %kind,
+        "SpeculativeGenerator: drafter kind"
+    );
+    Ok((kind, arch.to_owned(), model_type.to_owned()))
 }
 
 /// The drafter a generator holds, one variant per round loop.
@@ -382,31 +416,16 @@ impl SpeculativeGenerator {
         let (kv_quant_resolved, _kv_quant_user_explicit) =
             resolve_kv_quant_for_load(&cfg, load_cfg.kv_quant, &model_id);
 
-        let eos_ids = cfg.eos_token_ids();
+        let eos_ids = rmlx_loader::stop_token_ids(verifier_dir)
+            .map_err(|e| Error::Other(format!("stop token ids (verifier): {e}")))?;
         tracing::info!(
             model_id = %model_id,
             ?eos_ids,
-            "SpeculativeGenerator: parsed EOS token ids from verifier config"
+            "SpeculativeGenerator: stop token ids of the verifier"
         );
 
-        let draft_cfg = rmlx_loader::load_config(draft_dir)
-            .map_err(|e| Error::Other(format!("load_config (draft): {e}")))?;
-        let draft_arch = draft_cfg.architectures.first().map_or("", String::as_str);
-        let draft_model_type = draft_cfg
-            .extras
-            .get("model_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let declared = rmlx_models::Declared::from_snapshot(draft_arch, draft_model_type);
-        let draft_kind = decide_draft_kind(draft_kind, declared, draft_arch, draft_model_type)?;
-        tracing::info!(
-            draft = %draft_dir.display(),
-            arch = draft_arch,
-            model_type = draft_model_type,
-            ?declared,
-            %draft_kind,
-            "SpeculativeGenerator: drafter kind"
-        );
+        let (draft_kind, draft_arch, draft_model_type) = draft_kind_of(draft_kind, draft_dir)?;
+        let (draft_arch, draft_model_type) = (draft_arch.as_str(), draft_model_type.as_str());
 
         // For a sidecar head the `--draft-model` folder is not a full model:
         // the dispatcher holds the verifier alone (`load_verifier_only`) and
@@ -416,12 +435,9 @@ impl SpeculativeGenerator {
             rmlx_models::DraftKind::Eagle3 => {
                 let dispatcher =
                     rmlx_models::SpeculativeDispatcher::load_verifier_only(verifier_dir, device)?;
-                let hidden_size = dispatcher.verifier.hidden_size();
-                let vocab_size = dispatcher.verifier.vocab_size();
                 let drafter = rmlx_models::speculative::eagle3::Eagle3Drafter::load(
                     draft_dir,
-                    hidden_size,
-                    vocab_size,
+                    &dispatcher.verifier,
                     &eos_ids,
                     device,
                 )?;

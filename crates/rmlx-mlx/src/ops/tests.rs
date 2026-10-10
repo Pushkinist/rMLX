@@ -163,3 +163,95 @@ fn activations_return_the_input_dtype() {
         );
     }
 }
+
+/// MLX transforms a last axis of `n = m * 2^k`, `m` in {1, 12, 20, 28}, only.
+/// It refuses some other sizes only at evaluation (17408) and silently
+/// mis-decomposes others (1000 = 20 * 50, 240 = 12 * 20). The wrapper must
+/// refuse every size that is not `m * 2^k` before it builds the graph. A
+/// refused array is never evaluated here.
+#[test]
+fn hadamard_transform_refuses_a_size_that_is_not_m_times_a_power_of_two() {
+    for n in [17_408, 1000, 240, 5 * 1024 + 1] {
+        let r = hadamard_transform(&f32_array(&vec![1.0; n]), None, Device::Cpu);
+        assert!(
+            matches!(&r, Err(rmlx_core::error::Error::Mlx(m)) if m.contains(&n.to_string())),
+            "last axis {n}: want Error::Mlx naming the size, got {:?}",
+            r.err()
+        );
+    }
+}
+
+/// The wrapper reads only the shape, so a lazy input that is never evaluated
+/// is enough. MLX decomposes `36 * 2^k` as `12 * (3 * 2^k)` and its CPU path
+/// then crashes the process; `k > 26` is past MLX's limit.
+#[test]
+fn hadamard_transform_checks_m_and_k_on_a_lazy_input() {
+    let lazy = |n: i32| zeros(&[1, n], Dtype::F32, Device::Cpu).expect("a lazy zeros node");
+    for n in [36 * 1024, 44 * 1024, 1 << 27, 12 << 27] {
+        assert!(
+            hadamard_transform(&lazy(n), None, Device::Cpu).is_err(),
+            "last axis {n} must be refused"
+        );
+    }
+    for n in [1 << 26, 28 << 26] {
+        assert!(
+            hadamard_transform(&lazy(n), None, Device::Cpu).is_ok(),
+            "last axis {n} must be accepted"
+        );
+    }
+}
+
+/// At every supported size `H / sqrt(n)` is orthogonal and its `[0][0]` entry
+/// is `+1 / sqrt(n)`. Both facts hold for MLX's unnormalised Sloane tables
+/// (`m` in {12, 20, 28}) as well as for the Sylvester ones, so the test does
+/// not depend on the table layout. Parseval on a fixed pseudo-random vector
+/// checks the orthogonality on more than one direction.
+fn check_hadamard_norm_and_first_entry(device: Device) {
+    for n in [1024, 12 * 512, 20 * 256, 28 * 1024] {
+        let ones = hadamard_transform(&f32_array(&vec![1.0; n]), None, device)
+            .expect("a supported size builds");
+        let sum_sq: f64 = to_vec(&ones).iter().map(|v| f64::from(*v).powi(2)).sum();
+        assert!(
+            (sum_sq - n as f64).abs() <= 1e-4 * n as f64,
+            "last axis {n}: |H 1 / sqrt(n)|^2 is {sum_sq}, want {n}"
+        );
+
+        let e0: Vec<f32> = (0..n).map(|i| if i == 0 { 1.0 } else { 0.0 }).collect();
+        let column =
+            hadamard_transform(&f32_array(&e0), None, device).expect("a supported size builds");
+        let first = f64::from(to_vec(&column).first().copied().unwrap_or(f32::NAN));
+        let want = 1.0 / (n as f64).sqrt();
+        assert!(
+            (first - want).abs() <= 1e-6 * want,
+            "last axis {n}: (H e_0 / sqrt(n))[0] is {first}, want {want}"
+        );
+
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15 ^ n as u64;
+        let x: Vec<f32> = (0..n)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((state >> 40) as f32 / (1u32 << 23) as f32) - 1.0
+            })
+            .collect();
+        let x_sq: f64 = x.iter().map(|v| f64::from(*v).powi(2)).sum();
+        let hx = hadamard_transform(&f32_array(&x), None, device).expect("a supported size builds");
+        let hx_sq: f64 = to_vec(&hx).iter().map(|v| f64::from(*v).powi(2)).sum();
+        assert!(
+            (hx_sq - x_sq).abs() <= 1e-5 * x_sq,
+            "last axis {n}: |H x / sqrt(n)|^2 is {hx_sq}, |x|^2 is {x_sq}"
+        );
+    }
+}
+
+#[test]
+fn hadamard_transform_keeps_the_norm_and_maps_e0_to_plus_one_over_sqrt_n() {
+    check_hadamard_norm_and_first_entry(Device::Cpu);
+}
+
+#[test]
+#[ignore = "Metal: GPU twin of hadamard_transform_keeps_the_norm_and_maps_e0_to_plus_one_over_sqrt_n; needs the Metal claim (make gpu-test)"]
+fn hadamard_transform_keeps_the_norm_and_maps_e0_to_plus_one_over_sqrt_n_on_gpu() {
+    check_hadamard_norm_and_first_entry(Device::Gpu);
+}

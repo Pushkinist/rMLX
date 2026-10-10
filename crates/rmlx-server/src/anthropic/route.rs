@@ -22,7 +22,7 @@ use tracing::Instrument;
 use rmlx_metrics::events::Measurement;
 
 use crate::bounds;
-use crate::chat_template::{ChatMessageTpl, RenderOpts};
+use crate::chat_template::{request_variables, ChatMessageTpl, RenderError, RenderOpts};
 use crate::engine::{
     normalized_to_jinja_tool, GenerationRequest, NormalizedTool, NormalizedToolChoice,
 };
@@ -364,18 +364,24 @@ pub(crate) async fn messages(
 
                 let bos = entry.bos_token.as_deref().unwrap_or("");
                 let eos = entry.eos_token.as_deref().unwrap_or("");
-                // Anthropic route has no per-request enable_thinking;
-                // use the server-startup default only.
+                // The Anthropic request has no template-variable fields, so
+                // only the server default for `enable_thinking` applies.
+                let variables = request_variables(None, None, None, state.default_enable_thinking);
                 let opts = RenderOpts {
                     bos_token: bos,
                     eos_token: eos,
                     add_generation_prompt: true,
                     tools: &jinja_tools,
-                    enable_thinking: state.default_enable_thinking,
+                    variables: Some(&variables),
                 };
 
                 let rendered = match tpl.render(&tpl_msgs, &opts) {
                     Ok(r) => r,
+                    Err(e @ RenderError::Rejected(_)) => {
+                        tracing::warn!(model_id = %req.model, error = %e, "chat_template refused the request");
+                        state.error_counts.increment(ApiErrorCategory::BadRequest);
+                        return bad_request(&e.to_string());
+                    }
                     Err(e) => {
                         tracing::warn!(model_id = %req.model, error = %e, "chat_template render failed");
                         state.error_counts.increment(ApiErrorCategory::Upstream);

@@ -116,7 +116,7 @@ pub(crate) fn resolve_kv_quant_for_load(
     if let Some(q) = kv_quant {
         (Some(q), true)
     } else {
-        let arch_class = cfg.architectures.first().map_or("(empty)", String::as_str);
+        let arch_class = cfg.dispatch_arch().unwrap_or("(empty)");
         let resolved = rmlx_models::kv_cache::DEFAULT_KV_QUANT;
         tracing::info!(
             model_id = %model_id,

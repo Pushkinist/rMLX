@@ -96,20 +96,22 @@ vocabulary (`restricted_read_back` is false).
 
 ### Which drafter a snapshot is
 
-`rmlx_models::Declared::from_snapshot` reads the draft's `architectures[0]`
-and `model_type`. It reads both because export tools set one or the other.
-The first row that matches decides:
+`rmlx_models::Declared::from_snapshot` reads the draft's dispatch class
+(`ModelConfig::dispatch_arch`) and `model_type`. It reads both because export
+tools set one or the other. Before this, `check_hadamard_pack` refuses a
+Prism Hadamard pack rMLX cannot serve, whatever `--draft-kind` says; a pack it
+serves reads as its Qwen3.5 class. The first row that matches decides:
 
 | Declaration | Kind |
 |---|---|
-| `architectures[0]` contains `Eagle3` (`LlamaForCausalLMEagle3`, over `model_type = llama`) | `eagle3` |
-| `architectures[0]` contains `DFlash2` (`DFlash2DraftModel`, over `model_type = qwen3`) | `dflash2` |
-| `architectures[0]` contains `DFlash` (`DFlashDraftModel`, over `model_type = qwen3`) | `dflash` |
-| `model_type = gemma4_assistant`, `architectures[0]` contains `Gemma4Assistant`, or either field contains `qwen3_5_mtp` | `mtp` |
+| the class contains `Eagle3` (`LlamaForCausalLMEagle3`, over `model_type = llama`) | `eagle3` |
+| the class contains `DFlash2` (`DFlash2DraftModel`, over `model_type = qwen3`) | `dflash2` |
+| the class contains `DFlash` (`DFlashDraftModel`, over `model_type = qwen3`) | `dflash` |
+| `model_type = gemma4_assistant`, the class contains `Gemma4Assistant`, or either field contains `qwen3_5_mtp` | `mtp` |
 | a registered generative architecture (`Gemma4ForConditionalGeneration`, `Qwen3_5ForConditionalGeneration`, …) | `two_model` |
 | anything else, a registered encoder included | none: `--draft-kind` is required |
 
-The architecture is read before `model_type` because DFlash and EAGLE-3 declare
+The class is read before `model_type` because DFlash and EAGLE-3 declare
 a plain family `model_type`. `DFlash2DraftModel` contains `DFlash`, so DFlash 2
 is read first.
 
@@ -130,11 +132,11 @@ is read; the verifier is already loaded by then.
 ### `mtp` dispatch (arch-family routing)
 
 `mtp` fronts two loaders. The server (`classify_mtp_draft`) routes by the
-draft's `architectures[0]` and `model_type`:
+draft's dispatch class and `model_type`:
 
 | Draft family | Drafter loaded |
 |---|---|
-| `model_type = gemma4_assistant`, or `architectures[0]` contains `Gemma4Assistant` | `Gemma4AssistantDrafter` |
+| `model_type = gemma4_assistant`, or the class contains `Gemma4Assistant` | `Gemma4AssistantDrafter` |
 | either field contains `qwen3_5_mtp` | `MtpDrafter` (MoE or dense sidecar) |
 | both fields empty | `MtpDrafter`, which loads by tensor name |
 | anything else | refused at load with `Error::SpeculativePairing`, naming the family |
@@ -178,8 +180,8 @@ branch refuses a checkpoint that omits it.
 
 The `mlx-community` snapshots store norm weights in MLX form, so they load
 verbatim and apply a plain `rms_norm`. The sidecar `config.json` carries
-`model_type` and no `architectures`; `ModelConfig::architectures` defaults to
-empty for it.
+`model_type` and no `architectures`, so it has no dispatch class
+(`ModelConfig::dispatch_arch` is `None`).
 
 `draft_n` runs one extra `forward_token` after the last proposal, so the last
 drafted token gets a KV slot. `MtpDrafter::truncate_to` warns when a layer is
@@ -344,7 +346,9 @@ position where the proposal and the restricted argmax differ, or at the bonus
 position. An accepted position therefore carries the drafter's argmax. The
 round reports its restricted prefix (`Verdict::restricted`), and the loop
 records a `DecidedBy` per committed token. `docs/SPEC_ANSWER_EQUIVALENCE.md`
-reads it.
+reads it. The read-back gathers raw output-head rows, so `Eagle3Drafter::load`
+refuses a reduced-vocabulary drafter over a Hadamard pack verifier, whose
+head rows are folded (`docs/WEIGHT_QUANTS.md` §10.3).
 
 **Prefill.** The verifier prefill runs `forward_verify_capture_chunked` in
 1024-token chunks and keeps every row, because the drafter prefill conditions on

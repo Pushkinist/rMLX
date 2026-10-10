@@ -144,7 +144,9 @@ on the request's tracing span. The response `id` is built from it:
 | `logprobs` | bool | Return the chosen token's logprob for each content token. |
 | `top_logprobs` | u32 | 0–20; requires `logprobs:true`. |
 | `stream_options` | object | `{include_usage:true}` appends a usage chunk before `[DONE]`. |
-| `enable_thinking` | bool | `false` selects the template's no-think branch. |
+| `enable_thinking` | bool | `false` is passed to the template as its `enable_thinking`; `true` leaves the template to its default. Wins over the same key in `chat_template_kwargs`, which wins over `--enable-thinking`. |
+| `reasoning_effort` | string | The template's `reasoning_effort` variable, as sent. Wins over the same key in `chat_template_kwargs`. Absent: the template's default. |
+| `chat_template_kwargs` | object | Template variables. Every entry goes to the template as sent. See "Chat Templates". |
 | `thinking_budget` | u32 | Caps the reasoning channel at N tokens. |
 | `thinking_start_token`, `thinking_end_token` | string | Replace `<think>` / `</think>` for the splitter and the budget injection. |
 | `kv_quant` | string | Per-request KV codec. See "Per-request KV config". |
@@ -250,7 +252,8 @@ on Gemma4, Gemma3, Qwen3.5-MoE and BitNet an exact hit emits no logprob for
 the replayed token, so `logprobs.content` is one entry short. See
 [`PROMPT_CACHE.md`](PROMPT_CACHE.md) § "First-token logprob on Exact hit".
 
-An `eos_token_id` token ends a generation and adds no text.
+A stop token ([`MODELS.md`](MODELS.md) § "Overview", end of turn) ends a generation
+and adds no text.
 
 **JSON-mode reply.** With `response_format` `json_object` or `json_schema`,
 `content` is the answer text from the byte at which the grammar engaged
@@ -551,11 +554,55 @@ size cap.
 ## Chat Templates
 
 Each model's `chat_template.jinja` renders every request. Tool specs render
-byte for byte as HuggingFace `apply_chat_template` does. A request's
-`enable_thinking` wins over `--enable-thinking`, which wins over the template
-default. A template may ignore the flag, so the server reads the thinking
-channel off the rendered prompt; see `docs/SAMPLING.md` § "Thinking-budget
-enforcement". Streamed deltas never split a UTF-8 code point.
+byte for byte as HuggingFace `apply_chat_template` does. A template may
+ignore the thinking switch, so the server reads the thinking channel off the
+rendered prompt; see `docs/SAMPLING.md` § "Thinking-budget enforcement".
+Streamed deltas never split a UTF-8 code point.
+
+**Template variables.** A value whose meaning the template defines goes to the
+template as the client sent it. The server keeps no list of the variables a
+template reads, and no list of the values it takes. The template's own error is
+the answer for a bad value.
+
+- `chat_template_kwargs` (`/v1/chat/completions` only): every entry becomes a
+  template variable, with its JSON type. No key is refused. Its serialised
+  size counts with the message text against the one input bound
+  (`total_input_tokens_estimate`, 413), because a template can print it.
+- A key named like a variable the server sets (`messages`, `tools`,
+  `add_generation_prompt`, `bos_token`, `eos_token`) or like a function of the
+  template environment (`raise_exception`, `range`, ...) replaces nothing: it
+  is dropped, with one `warn` log per key per request. The server must account
+  for the prompt it renders.
+- A top-level `enable_thinking` or `reasoning_effort` wins over the same key in
+  `chat_template_kwargs`, for every value. A top-level `enable_thinking: true`
+  removes the nested key, so the template's default applies.
+  `chat_template_kwargs` wins over `--enable-thinking`.
+- `chat_template_kwargs` is the pass-through: `{"enable_thinking": true}` there
+  reaches the template as `true`. The top-level `enable_thinking` and
+  `--enable-thinking` keep the meaning they had before `chat_template_kwargs`
+  existed: `false` is passed, and `true` leaves the template to its default.
+  With no `chat_template_kwargs` the rendered prompt is the one of that release.
+- The think channel at the start of the reply, the thinking budget and the
+  `reasoning_content` split are read off the rendered prompt, but only
+  `Architecture::Qwen3` and `Architecture::Qwen3_5Moe` have a think splitter
+  (`supports_thinking()`). On any other architecture, when a template variable
+  turns thinking on (the Gemma 4 template does for `enable_thinking: true`),
+  the thought text comes back in `content` and `thinking_budget` has no
+  effect. `usage` counts decode steps on every architecture.
+- A variable is defined only when a source sets it, so the template's own
+  default applies otherwise. A template that does not read a variable ignores
+  it.
+- A value the template refuses (a `raise_exception` call: an effort it does not
+  take, a role out of order) is 400 `invalid_request_error` with the template's
+  message, cut to 256 characters, and no server path. Any other render failure
+  is 503 with its message cut the same way. No value is rewritten.
+- A log event holds at most 256 characters of a template error or of the
+  parser's error for a rejected JSON body. The reply of a rejected JSON body is
+  not cut.
+
+`/v1/messages` takes no `chat_template_kwargs`: the Anthropic wire format has
+no such field, and the route renders with `--enable-thinking` only. The
+embeddings and audio routes render no chat template.
 
 ---
 
@@ -578,9 +625,13 @@ The `id` is optional and defaults to the directory name. Per snapshot:
   for tool-format detection.
 - `tokenizer.json`: the tokenizer.
 - `tokenizer_config.json`: `bos_token` and `eos_token`.
-- `generation_config.json`: the model's sampling defaults.
+- `generation_config.json`: the model's sampling defaults and end ids
+  (`rmlx_loader::load_generation_config`).
 
-Everything but `config.json` is best-effort: a missing file logs a `warn!`.
+A `config.json` that does not load, or a `generation_config.json` that exists
+and does not load, leaves the snapshot out with a `warn!`: the model load
+refuses the same files. The other files are best-effort: a missing file logs a
+`warn!`.
 `list()` returns the entries in id order.
 
 ### Claim file

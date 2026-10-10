@@ -329,7 +329,7 @@ fn openai_tools_absent_is_none() {
 
 // ── resolve_sampling_params ───────────────────────────────────────────────
 
-use crate::generation_config_io::GenerationConfig;
+use rmlx_loader::GenerationConfig;
 
 /// Convenience wrapper for tests: call resolve with all-None extended sampling and server-default fields.
 fn rsp(

@@ -7,13 +7,13 @@ Split out of [`SERVER.md`](SERVER.md) to keep that doc under the size cap.
 ### Parser architecture
 
 `ToolCallStreamParser` parses tool calls out of the raw token stream. The
-format is detected once at registry build from markers in
-`chat_template.jinja`, with the architecture as the fallback, and cached in
-`ModelEntry`.
+format is detected per request from markers in the `chat_template.jinja`
+source the registry caches (`ModelEntry::chat_template_src`), with the
+architecture as the fallback.
 
 | `ToolCallFormat` | Used by | Syntax |
 |---|---|---|
-| `Qwen3XmlFunction` | Qwen3.6 | `<tool_call><function=NAME><parameter=KEY>VALUE</parameter></function></tool_call>` |
+| `Qwen3XmlFunction` | Qwen3.6, Qwen3.8, Ternary-Bonsai-2 | `<tool_call><function=NAME><parameter=KEY>VALUE</parameter></function></tool_call>` |
 | `Qwen3JsonToolCall` | `Qwen3ForCausalLM` (Bonsai) | `<tool_call>{"name":"…","arguments":{…}}</tool_call>` |
 | `GemmaToolCall` | `Gemma4ForConditionalGeneration` | `<\|tool_call>call:NAME{key:val}<tool_call\|>` |
 

@@ -44,10 +44,15 @@ Each test resolves its snapshot by one of these rules:
 | golden | `common::model_for` | `RMLX_KV_TEST_MODEL` if it serves the test's architecture, then the slug | fails |
 | slug first | `common::slug_or_override` | the slug, then the variable the test names | fails when the slug is absent; ignored when it is present |
 | slug first, in `src/` | `rmlx_models::test_snapshot::snapshot` | the slug, then a `RMLX_TEST_MODEL_*` variable | skips |
+| slug only, in `src/` | `rmlx_models::test_snapshot::snapshot_by_slug` | the slug | skips |
 | variable first | `tests/resolved_arch_class.rs`, `crates/rmlx-cli/src/commands/kv_calibrate_tests.rs` | a `RMLX_TEST_MODEL_*` variable, then the slug | falls through to the slug |
 | variable first, drafter | `resolve_drafter` in `tests/spec_sampled_distribution.rs` | `RMLX_DRAFT_TEST_MODEL`, then the slug; a directory with a `config.json` is enough | fails |
 | variable only | every other test that names a variable | the variable | skips |
 | slug and identity | `snapshot` in `crates/rmlx-server/tests/thread_boundary/mod.rs` | the slug only | fails |
+
+The two `src/` rules stand down, with a `SKIP <test>: <why>` line, when the
+snapshot declares another identity than the cell lists: `architectures[0]`, or
+`model_type` for a snapshot that names no architecture (a Prism Hadamard pack).
 
 `common` is `crates/rmlx-models/tests/common/mod.rs`. Its two rules share one
 probe. It fails when `RMLX_O_MODELS_ROOT` is set but is not a directory, and

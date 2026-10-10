@@ -355,10 +355,7 @@ pub(crate) fn resolve_kv_quant(
         resolve_cache_type, validate_resolved_kv_quant, ResolverContext, DEFAULT_KV_QUANT,
     };
 
-    let arch_class = model_cfg
-        .architectures
-        .first()
-        .map_or("(empty)", String::as_str);
+    let arch_class = model_cfg.dispatch_arch().unwrap_or("(empty)");
     let head_dim_opt = model_cfg.head_dim();
     let auto = DEFAULT_KV_QUANT;
 

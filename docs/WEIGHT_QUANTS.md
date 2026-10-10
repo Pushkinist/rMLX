@@ -17,6 +17,7 @@ each one reaches a matmul. KV-cache codecs are a separate axis; see
 | affine `qN_gG` | 2, 3, 4, 5, 6, 8 | 32, 64, 128 | float (bf16 or f16 on disk), cast to bf16 | same as scale (additive) | MLX `quantized_matmul`, mode `affine` |
 | ternary (BitLinear) | 2 per trit | tensor-wide | bf16 scalar | — | unpacked to bf16 at load, plain matmul |
 | ParoQuant | 4 (affine) | per checkpoint | f16 | f16 | activation rotation, then `quantized_matmul` |
+| Prism Hadamard pack | 2 (affine) | 128 | f16, cast to bf16 | f16, cast to bf16 | signed block Hadamard of the input, then `quantized_matmul` (section 10) |
 
 ---
 
@@ -220,15 +221,8 @@ tensor I/O. An unsupported width fails the load with one error, instead of
 failing at the first prefill. See `docs/ADDING_A_MODEL.md` for how the gate
 composes with a new architecture.
 
-**Hadamard packs are refused.** A Prism Hadamard pack stores affine weights
-that need an input-side Hadamard transform. rMLX does not apply that transform,
-so the weights would load as plain affine weights and give wrong output.
-`load_model` refuses the snapshot before the architecture check when
-`config.json` carries `hadamard_config` or a shard carries a tensor whose name
-ends in `.signs` (`refuse_hadamard_pack` in
-`crates/rmlx-models/src/arch/loader.rs`). The error names the fact it found.
-The `.signs` scan skips hidden files, and it logs and skips a file it cannot
-parse. Sidecar drafter and embedding loaders do not run this check.
+**Hadamard packs.** A Prism Hadamard pack stores affine 2-bit weights folded
+with a signed block Hadamard transform. Section 10 covers it.
 
 Source: `crates/rmlx-quant/src/affine.rs`
 
@@ -357,3 +351,226 @@ Each weight has a sibling `*.weight_scale`, a BF16 scalar `[1]`. At load
 inference is a plain BF16 matmul with no special kernel.
 
 Source: `crates/rmlx-models/src/bitnet/loader.rs`
+
+---
+
+## 10. Prism Hadamard pack
+
+A Prism Hadamard pack (`model_type` `prism_hadamard_qwen35`) stores affine
+2-bit weights (section 4) of a dense Qwen3.5 model, folded with a signed
+block Walsh-Hadamard transform. Its `config.json` names no `architectures`;
+the pack dispatches on the class of its `base_model_type` (`docs/MODELS.md`,
+Overview).
+
+### 10.1 Contract
+
+- `config.json` names the contract file in `hadamard_config` and lists each
+  folded module in `modules` (`path`, `block`, `embedding`, `dtype`).
+- The contract file (keys `prism.hadamard.*`, version 1) names the transform
+  `normalized-sylvester-walsh-hadamard`, the axis `input-last-dimension`, the
+  sign mode `explicit` and `gdn_v_grouped` true. It gives the block size, one
+  `±1` sign vector per input width, the forward tensors (`weight_names`) and
+  the inverse tensors (`inverse_weight_names`, the embedding).
+- Each module has a `<module>.signs` tensor (F32, one value per input column)
+  equal to the contract's vector of its width.
+- A linear layer computes `y = W' . H(D x)`. The embedding computes
+  `e = D H dequant(E'[id])`. `H` is the block-diagonal normalized Sylvester
+  matrix and `D` the diagonal of the signs. Both directions compute in f32 and
+  round once to the input dtype. No layer has an output-side transform, so
+  the residual stream, the norms, the delta-net recurrence, RoPE, attention
+  and the KV cache see ordinary values.
+- Not folded: the norms, `A_log`, `dt_bias`, `conv1d` and the dense F32
+  `in_proj_a` / `in_proj_b`.
+
+### 10.2 Where it is applied
+
+`HadamardContract::read` (`crates/rmlx-loader/src/hadamard.rs`) parses and
+checks the contract. The Qwen3.5 loader (`load_from_path` in
+`crates/rmlx-models/src/qwen3_5_moe/loader.rs`) folds each contract module
+through `HadamardFold` (`crates/rmlx-models/src/qwen3_5_moe/layers.rs`): the
+quantized layer becomes `Linear::Hadamard` or `Embedding::Hadamard`, with one
+`SignedBlockHadamard` (`crates/rmlx-models/src/hadamard.rs`) per input width,
+over MLX's `hadamard_transform` (`rmlx_mlx::hadamard_transform`). The load
+fails on a contract module the loader built no layer for, and logs
+`Qwen3_5: Hadamard pack, folding its modules` with the module counts.
+
+### 10.3 What is checked
+
+`check_hadamard_pack` (`crates/rmlx-models/src/arch/loader.rs`) is the one
+check. `load_model`, the `serve` startup check (`--model`, `--draft-model`
+and each model a `--registry` file names) and the draft-model reader
+(`draft_kind_of`) call it. Embedding, Whisper and TTS loaders do not. The
+embedding route takes only the `JinaEmbeddingsV4Model` class, which a pack
+never resolves to; Whisper and TTS load only the snapshot their own flag
+names (`--whisper-model-path`, `--tts-model-path`).
+
+For a snapshot with no `hadamard_config` whose directory cannot be listed,
+the check returns a loader error that names the directory, not a pack
+refusal.
+
+A snapshot is a pack when `config.json` names `hadamard_config`, or when a
+visible `*.safetensors` file holds a tensor whose last name component is
+`signs`. rMLX serves a pack when all of these hold:
+
+- `base_model_type` is `qwen3_5` and the dispatch class is
+  `Qwen3_5ForConditionalGeneration`;
+- the checkpoint is not ParoQuant (`quantization_config.quant_method`);
+- `HadamardContract::read` accepts the contract: the version and the three
+  strings above, `gdn_v_grouped` true, a block of 512, 1024, 2048 or 4096
+  that divides every width, `±1` sign values of the length the widths need,
+  `modules` equal to the two contract lists, each record `float16` at the
+  contract block, each `.signs` tensor in exactly one shard of the load and
+  equal to the contract's vector, no `.signs` tensor without a module
+  record, no quantized linear under the contract's tensor prefix without a
+  module record, `components.mtp` and `tie_word_embeddings` false,
+  and `gdn_activation_layout` `grouped` when present.
+
+Any other pack is refused with one error that names the fact and the file
+that holds it. A `.signs` tensor with no `hadamard_config` is refused by its
+shard and its name. That scan skips hidden files, and it logs and skips a
+file it cannot parse.
+
+Two more refusals come later. The Qwen3.5 loader refuses a sparse MoE layer
+in a pack: a Hadamard linear has no expert dispatch. `Eagle3Drafter::load`
+refuses a drafter with an active restricted-vocabulary head over a pack
+verifier (`Architecture::refuse_restricted_vocab_head`): that head gathers
+folded output rows and multiplies them with an unrotated hidden state.
+`serve` makes the same refusal at startup, exit 1, for `--model` a pack and
+`--draft-model` an EAGLE-3 drafter whose config declares a reduced
+vocabulary (`Eagle3Config::restricted_vocab`), so the server does not start
+to refuse every request.
+
+### 10.4 Limits
+
+- Text only, as every Qwen3.5 snapshot: the loader does not read the vision
+  tower the checkpoint carries.
+- The EAGLE-3 restricted-vocabulary head, sparse MoE layers, a tied head and
+  an MTP component are refused (section 10.3).
+- Each module transforms its own input. One decode token runs 402 transforms
+  where 258 distinct inputs would do. The cost is not measured.
+
+### 10.5 Activation dtype and the noise floor
+
+The pack's `modules` records name `float16`. The vendor runtime (the
+`runtime/` directory of the snapshot) rounds the embedding output to f16 and
+keeps f16 scales, but its F32 norm weights promote the hidden state to f32
+after the first norm: the hidden state after layers 0 and 63, and the
+logits, are f32. rMLX accepts the record and computes the pack as every
+affine model: bf16 activations and bf16-cast scales (`bf16_scales` in
+`crates/rmlx-models/src/load_util.rs`).
+
+The noise floor is the error of bf16 activations alone. A change in
+precision is judged by its error as a multiple of that floor. Per
+projection, the root-gated CPU test
+`the_bf16_scale_cast_is_bounded_by_the_bf16_activation_floor`
+(`crates/rmlx-models/src/qwen3_5_moe/layers_tests.rs`) measures the scale
+cast against f16 activations, the dtype the record names, on real rows, in
+f64 with exact accumulation, and bounds rMLX's path by a fixed multiple of
+the floor. For the logits, see 10.6.
+
+`in_proj_a` and `in_proj_b` stay F32, as stored: the loader builds an
+unquantized linear in its stored dtype. With bf16 activations their outputs
+are f32, so `a + dt_bias` and the softplus run in f32. The root-gated CPU
+test `a_bf16_cast_of_the_gate_projections_raises_the_delta_net_gate_error_above_the_floor`
+(`crates/rmlx-models/src/qwen3_5_moe/layers_tests.rs`) is a design
+measurement, not a check of the loader. By the same method on four
+gated-delta-net layers, it shows the cost the F32 choice avoids: a
+`bf16_param` cast of the two weights with bf16 outputs would raise the
+log-gate error to 1.46 to 2.44 times the floor. The F32 arm is the floor plus
+one f32 rounding, so it stays at the floor by construction. The structure
+test of the synthetic pack checks that the loader builds both as plain F32
+layers.
+
+**The seam tests.** `load_model_serves_a_pack_as_the_plain_model_its_contract_unfolds`
+(`crates/rmlx-models/src/qwen3_5_moe/pack_serve_tests.rs`) loads a synthetic pack
+through `load_model` and compares its logits with the plain model the
+contract unfolds to, `D H dequant(W')` per module, at input widths 512 and
+1024 with block 512. On the CPU (GPU forbidden, attention layer only: the
+gated-delta-net recurrence is a Metal kernel) it is a wiring check, not a
+precision check. MLX's CPU `quantized_matmul` accumulates a bf16 input in
+bf16: the pack misses the F32 model by 0.283 of the largest logit, and by
+0.016 when the inner matmul is given an f32 input, so the accumulation is
+about 94 percent of the gap. A transform run in bf16 instead of f32 stays
+inside the CPU bound. The test requires the two controls, no transform and
+the other direction, to miss the bound by 2 times. Its GPU copy,
+`load_model_serves_a_pack_as_the_plain_model_its_contract_unfolds_on_gpu`,
+adds the gated-delta-net layer, compares with a bf16 oracle, and bounds the
+difference at 0.03 of the largest logit.
+
+### 10.6 Logits against the vendor runtime
+
+`crates/rmlx-models/tests/fixtures/hadamard_pack_vendor/logits.safetensors`
+holds the vendor runtime's logits, computed on the GPU, for three sequences
+of 64 token ids of `prism-ml__Ternary-Bonsai-2-27B-mlx-2bit` (a chat turn,
+Python code, a word problem). For each position it holds the 20 largest
+logits of the runtime as shipped, their ids and the log-sum-exp over the
+vocabulary (the reference). It also holds the same runtime after mlx-vlm's
+own bf16 cast, at those ids (the floor). That cast is the one
+`mlx_vlm.convert` applies: every floating parameter but `A_log`. The script
+`generate.py` beside the file writes it, with the pins of the runtime's
+`requirements.txt`.
+
+The GPU test
+`the_real_pack_meets_the_vendor_logits_and_misses_them_without_its_transforms_on_gpu`
+(`crates/rmlx-models/src/qwen3_5_moe/pack_reference_tests.rs`) loads the pack
+through `load_model` and runs two arms, each with fresh caches: one prefill
+forward over each sequence (192 positions), and a decode arm that prefills
+the first 48 ids and decodes the other 16 one at a time (positions 47 to 63,
+51 positions; the reference there is the vendor's prefill). It reads four
+statistics against the reference:
+
+- `reach_max`: the largest difference over the ranks a sampler reaches, the
+  ranks whose reference probability is at least 1e-4, and rank 0. A logit
+  error `d` moves the probability of its token by at most `p (e^d - 1)`, and
+  the KL statistic weighs the rest.
+- `top_rms`: the rms difference over the reference's top 20.
+- `kl`: a KL divergence on the top 20 plus one bucket for the rest of the
+  vocabulary.
+- the positions where the argmax over the vocabulary differs.
+
+Each arm passes when:
+
+- `reach_max`, `top_rms` and `kl` are each at most 2 times the floor's, over
+  the same positions;
+- the argmax agrees at each position whose reference top-2 margin is above
+  the floor's `reach_max` (the rule of the proof plan in the issue);
+- the argmax differs at no more than 2 times as many positions as the
+  floor's argmax. The proof plan has no such count; it only makes the gate
+  stricter.
+
+Controls, in the same run: the model with the transform of one module
+removed (the `down_proj` of layer 0, then of layer 63, each put back after)
+must break the gate, and the model with each Hadamard layer replaced by the
+folded layer it wraps must exceed each of the floor's three statistics by
+more than 10 times. The CPU tests in the same file check the gate on planted
+cases and check the fixture reader, and pin the committed floor's figures.
+
+**A change after measurement.** The gate first read the largest difference
+over all 20 ranks. Measured, that statistic sat at 1.91 of the 2 allowed. Its
+floor value was one logit at rank 20 with a reference probability of 9e-6,
+which no sampler draws, so the margin depended on a single unreachable
+logit. The statistic was then changed to `reach_max`, and the argmax rule
+was changed from twice the floor's largest difference to the proof plan's
+rule. The factor 2 did not change. The largest difference over all 20 ranks
+is still printed.
+
+The test prints its figures, as multiples of the floor's (`reach_max`,
+`top_rms`, `kl`):
+
+| arm | floor (absolute) | rMLX | argmax differs |
+|---|---|---|---|
+| prefill, 192 positions | 0.482, 0.0440, 1.75e-4 | 1.67, 1.29, 1.34 | 1 position, as the floor, margin 0.003 |
+| decode, 51 positions | 0.482, 0.0488, 2.11e-4 | 1.26, 1.22, 1.03 | none |
+| control: layer 0 `down_proj` | | 20.9, 24.9, 411 | 15 positions; gate broken |
+| control: layer 63 `down_proj` | | 23.1, 53.9, 1321 | 25 positions; gate broken |
+| control: no transform | | 66, 255, 70 000 | every position |
+
+The resolution of the gate: one transform missing out of 402 moves each
+statistic to more than 10 times its bound. An error smaller than 2 times
+the floor's is not seen. Over the full vocabulary (a run outside the tests),
+rMLX's prefill rms difference is 1.31 times the floor's, and its largest
+difference is below the floor's.
+
+Source: `crates/rmlx-loader/src/hadamard.rs`,
+`crates/rmlx-models/src/qwen3_5_moe/layers.rs`,
+`crates/rmlx-models/src/arch/loader.rs`

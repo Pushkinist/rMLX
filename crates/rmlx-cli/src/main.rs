@@ -693,16 +693,14 @@ enum Cmd {
         /// When absent (default), the model default and then 1.0 apply.
         #[arg(long)]
         default_temperature: Option<f32>,
-        /// Server-startup default for thinking mode on Qwen3-family models.
+        /// Server-startup default for the chat template's `enable_thinking`.
         ///
-        /// `--enable-thinking false` suppresses the open `<think>` block (no-think
-        /// mode) for all requests unless a per-request `enable_thinking` field
-        /// overrides it. `--enable-thinking true` is the explicit opt-in (same as
-        /// the default when the flag is absent).
+        /// `--enable-thinking false` passes `enable_thinking=false` to the
+        /// template: a Qwen3-family template closes its `<think>` block.
+        /// `--enable-thinking true` leaves the template to its own default.
         ///
-        /// Precedence: per-request `enable_thinking` > this > absent (= enabled).
-        /// When absent (default), the Qwen3.6 template default is preserved:
-        /// an open `<think>` block byte-identical to HF `apply_chat_template`.
+        /// Precedence: per-request `enable_thinking`, then the request's
+        /// `chat_template_kwargs`, then this.
         #[arg(long, value_name = "BOOL")]
         enable_thinking: Option<bool>,
         /// Server-startup default image-token budget for Gemma4-unified vision.

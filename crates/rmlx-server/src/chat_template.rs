@@ -115,7 +115,7 @@ pub struct ChatMessageTpl<'a> {
 /// Options forwarded to the Jinja template context.
 #[allow(
     clippy::exhaustive_structs,
-    reason = "internal closed options struct — four fields are the complete render-options contract; adding a field requires updating all RenderOpts construction sites and ChatTemplate::render"
+    reason = "internal closed options struct — its fields are the complete render-options contract; adding a field requires updating all RenderOpts construction sites and ChatTemplate::render"
 )]
 #[derive(Debug, Clone)]
 pub struct RenderOpts<'a> {
@@ -133,23 +133,115 @@ pub struct RenderOpts<'a> {
     /// An empty slice causes the Jinja `{% if tools %}` branch to evaluate
     /// false, so renders without tools are byte-identical to the tool-free render.
     pub tools: &'a [serde_json::Value],
-    /// Controls the Qwen3.6 `enable_thinking` template variable.
-    ///
-    /// `Some(false)` → inject `enable_thinking = false` into the Jinja context,
-    /// which triggers the `enable_thinking is defined and enable_thinking is false`
-    /// branch in the Qwen3.6 template and produces a closed `<think></think>` block
-    /// (no-think mode).
-    ///
-    /// `None` or `Some(true)` → leave the variable **undefined** in the context.
-    /// An undefined variable is indistinguishable from absent in Jinja's
-    /// `is defined` test, so the template falls through to its default behaviour:
-    /// an open `<think>\n` block, byte-identical to HF `apply_chat_template`.
-    ///
-    /// **Never** define the variable for `Some(true)` — doing so would cause
-    /// `enable_thinking is defined and enable_thinking is false` to evaluate
-    /// false (because the value is true), which is the same as the None/absent
-    /// path. Only `Some(false)` changes behaviour.
-    pub enable_thinking: Option<bool>,
+    /// The variables the request sets, as [`request_variables`] resolves them.
+    /// The template reads each one as sent and alone decides which values it
+    /// accepts: it refuses others with `raise_exception`
+    /// ([`RenderError::Rejected`]). A variable the server sets (`messages`,
+    /// `tools`, `add_generation_prompt`, `bos_token`, `eos_token`) replaces one
+    /// of the same name here.
+    pub variables: Option<&'a serde_json::Map<String, serde_json::Value>>,
+}
+
+/// The template variables of one request.
+///
+/// `chat_template_kwargs` goes to the template as sent, every key and value.
+/// The top-level `enable_thinking` and the server default keep their meaning:
+/// `false` is passed, and `true` leaves the template to its own default. A
+/// top-level `enable_thinking` wins over the same key in `chat_template_kwargs`
+/// for every value (top-level `true` removes it). `chat_template_kwargs` wins
+/// over the server default. `reasoning_effort` is passed as sent and wins over
+/// the same key in `chat_template_kwargs`.
+#[must_use]
+pub fn request_variables(
+    chat_template_kwargs: Option<serde_json::Map<String, serde_json::Value>>,
+    enable_thinking: Option<bool>,
+    reasoning_effort: Option<&str>,
+    default_enable_thinking: Option<bool>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut variables = chat_template_kwargs.unwrap_or_default();
+    match enable_thinking {
+        Some(false) => {
+            variables.insert("enable_thinking".to_owned(), serde_json::Value::Bool(false));
+        }
+        Some(true) => {
+            variables.remove("enable_thinking");
+        }
+        None if default_enable_thinking == Some(false) => {
+            variables
+                .entry("enable_thinking")
+                .or_insert(serde_json::Value::Bool(false));
+        }
+        None => {}
+    }
+    if let Some(effort) = reasoning_effort {
+        variables.insert(
+            "reasoning_effort".to_owned(),
+            serde_json::Value::String(effort.to_owned()),
+        );
+    }
+    variables
+}
+
+/// The variables the server sets from the request. A client variable of one of
+/// these names is dropped.
+const SERVER_VARIABLES: [&str; 5] = [
+    "messages",
+    "add_generation_prompt",
+    "bos_token",
+    "eos_token",
+    "tools",
+];
+
+/// Why [`ChatTemplate::render`] produced no prompt.
+#[allow(
+    clippy::exhaustive_enums,
+    reason = "closed outcome set: the template refused the request, or the render failed"
+)]
+#[derive(Debug)]
+pub enum RenderError {
+    /// The template called `raise_exception`: it refuses the request's
+    /// messages or options. Holds the template's own message, cut to 256
+    /// characters.
+    Rejected(String),
+    /// Any other failure: compile, lookup, an unsupported construct. Holds the
+    /// message cut to 256 characters, as it can copy request text.
+    Failed(String),
+}
+
+impl std::fmt::Display for RenderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RenderError::Rejected(msg) => write!(f, "the chat template refuses the request: {msg}"),
+            RenderError::Failed(msg) => write!(f, "template render failed: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for RenderError {}
+
+/// The message a template passed to `raise_exception`, carried as the source
+/// of the minijinja error so `render` can tell a refusal from a failure.
+#[derive(Debug)]
+struct TemplateRefusal(String);
+
+impl std::fmt::Display for TemplateRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TemplateRefusal {}
+
+/// The most characters of an error message that can hold request text that the
+/// server keeps. It goes into the reply and the log.
+const MESSAGE_MAX_CHARS: usize = 256;
+
+/// `msg` cut to [`MESSAGE_MAX_CHARS`] characters, with `…` when cut.
+pub(crate) fn bounded_message(msg: &str) -> String {
+    match msg.char_indices().nth(MESSAGE_MAX_CHARS) {
+        Some((cut, _)) => format!("{}…", &msg[..cut]),
+        None => msg.to_owned(),
+    }
 }
 
 /// Compiled chat template backed by a minijinja environment.
@@ -285,7 +377,7 @@ fn render_templated_seed(
         eos_token,
         add_generation_prompt: true,
         tools: &[],
-        enable_thinking: None,
+        variables: None,
     };
     let rendered = tpl
         .render(&messages, &opts)
@@ -314,8 +406,8 @@ impl ChatTemplate {
     /// - `dict.get(key)` → attribute access (returns `undefined` if missing)
     /// - `str.split(sep)` → split string into sequence
     ///
-    /// Also registers a `raise_exception` filter so templates that call it
-    /// surface the message as a render error rather than a silent no-op.
+    /// Also registers the `raise_exception(msg)` function HuggingFace gives
+    /// templates: a call ends the render with [`RenderError::Rejected`].
     pub fn new(source: String) -> Result<Self> {
         let mut env = Environment::<'static>::new();
 
@@ -394,15 +486,14 @@ impl ChatTemplate {
             }
         });
 
-        // ── raise_exception filter ────────────────────────────────────────────
-        // Some HF templates call `raise_exception(msg)`. Propagate as error.
-        env.add_filter(
+        env.add_function(
             "raise_exception",
             |msg: String| -> std::result::Result<String, MjError> {
                 Err(MjError::new(
                     ErrorKind::InvalidOperation,
-                    format!("template raised exception: {msg}"),
-                ))
+                    "the template raised an exception",
+                )
+                .with_source(TemplateRefusal(msg)))
             },
         );
 
@@ -434,6 +525,27 @@ impl ChatTemplate {
         Ok(ChatTemplate { env })
     }
 
+    /// Whether the server or the template environment provides `name`: a
+    /// variable the server sets, or a global of the environment (a function
+    /// such as `raise_exception`). A client variable of that name replaces
+    /// nothing; it is dropped.
+    fn provides(&self, name: &str) -> bool {
+        SERVER_VARIABLES.contains(&name) || self.env.globals().any(|(global, _)| global == name)
+    }
+
+    /// The names in `variables` that [`ChatTemplate::render`] drops. Each is a
+    /// server variable or an environment global, never client text.
+    pub fn dropped_variables<'v>(
+        &self,
+        variables: &'v serde_json::Map<String, serde_json::Value>,
+    ) -> Vec<&'v str> {
+        variables
+            .keys()
+            .map(String::as_str)
+            .filter(|name| self.provides(name))
+            .collect()
+    }
+
     /// Render the template with the given messages and options.
     ///
     /// The template context exposes:
@@ -442,17 +554,18 @@ impl ChatTemplate {
     /// - `bos_token` — string
     /// - `eos_token` — string
     /// - `tools` — list of OpenAI-shaped function specs (empty = no tools)
-    /// - `enable_thinking` — injected ONLY when `opts.enable_thinking == Some(false)`;
-    ///   absent (undefined) otherwise (= HF default behaviour, open `<think>` block).
+    /// - every entry of [`RenderOpts::variables`] that the server and the
+    ///   template environment do not provide
+    ///   ([`ChatTemplate::dropped_variables`] names the others).
     pub fn render(
         &self,
         messages: &[ChatMessageTpl<'_>],
         opts: &RenderOpts<'_>,
-    ) -> Result<RenderedPrompt> {
+    ) -> std::result::Result<RenderedPrompt, RenderError> {
         let tmpl = self
             .env
             .get_template("chat")
-            .map_err(|e| Error::Other(format!("template lookup failed: {e}")))?;
+            .map_err(|e| RenderError::Failed(format!("template lookup failed: {e}")))?;
 
         // Build the messages list as a minijinja Value.
         //
@@ -480,53 +593,36 @@ impl ChatTemplate {
             })
             .collect();
 
-        // inject `enable_thinking` into the Jinja context ONLY when
-        // `opts.enable_thinking == Some(false)`.
-        //
-        // Qwen3.6 chat_template.jinja tests:
-        // `enable_thinking is defined and enable_thinking is false`
-        //
-        // When this condition holds the template appends a closed
-        // `<think>\n\n</think>\n\n` block — no-think mode. When the variable
-        // is UNDEFINED (= absent from the context), the `is defined` check
-        // fails and the template falls through to the open `<think>\n` default,
-        // which is byte-identical to HF `apply_chat_template` output.
-        //
-        // CRITICAL: do NOT inject the variable for `Some(true)` or `None`.
-        // Injecting `enable_thinking = true` would make `is defined` true but
-        // `is false` false — the condition still fails and the template opens
-        // the think block, same as `None`. The undefined path is the contract;
-        // only `Some(false)` changes the rendered output.
+        let mut ctx: std::collections::BTreeMap<String, Value> = opts
+            .variables
+            .into_iter()
+            .flatten()
+            .filter(|(name, _)| !self.provides(name))
+            .map(|(name, value)| (name.clone(), Value::from_serialize(value)))
+            .collect();
+        // An empty tools slice serialises as an empty JSON array, which Jinja
+        // evaluates as falsy, so `{% if tools %}` is false when no tools are
+        // present and renders byte-identically to the tool-free render.
+        let server_values = [
+            Value::from(msgs_val),
+            Value::from(opts.add_generation_prompt),
+            Value::from(opts.bos_token),
+            Value::from(opts.eos_token),
+            Value::from_serialize(opts.tools),
+        ];
+        for (name, value) in SERVER_VARIABLES.into_iter().zip(server_values) {
+            ctx.insert(name.to_owned(), value);
+        }
 
-        // Convert the (possibly empty) tools slice into a minijinja
-        // Value. An empty slice serialises as an empty JSON array, which
-        // Jinja evaluates as falsy — so `{% if tools %}` is false when no
-        // tools are present and renders byte-identically to the tool-free render.
-        let tools_val = Value::from_serialize(opts.tools);
-
-        // build the base context; conditionally extend with enable_thinking.
-        let ctx = if opts.enable_thinking == Some(false) {
-            minijinja::context! {
-                messages => msgs_val,
-                add_generation_prompt => opts.add_generation_prompt,
-                bos_token => opts.bos_token,
-                eos_token => opts.eos_token,
-                tools => tools_val,
-                enable_thinking => false,
+        let text = tmpl.render(Value::from_iter(ctx)).map_err(|e| {
+            // minijinja wraps an error raised inside an include or a super block.
+            let refusal = std::iter::successors(std::error::Error::source(&e), |s| s.source())
+                .find_map(|s| s.downcast_ref::<TemplateRefusal>());
+            match refusal {
+                Some(TemplateRefusal(msg)) => RenderError::Rejected(bounded_message(msg)),
+                None => RenderError::Failed(bounded_message(&e.to_string())),
             }
-        } else {
-            minijinja::context! {
-                messages => msgs_val,
-                add_generation_prompt => opts.add_generation_prompt,
-                bos_token => opts.bos_token,
-                eos_token => opts.eos_token,
-                tools => tools_val,
-            }
-        };
-
-        let text = tmpl
-            .render(ctx)
-            .map_err(|e| Error::Other(format!("template render failed: {e}")))?;
+        })?;
 
         Ok(RenderedPrompt {
             text,

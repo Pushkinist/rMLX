@@ -220,6 +220,38 @@ fn run_head_budget_non_qwen3_arch_err() {
     );
 }
 
+/// The arch gate of each recipe names the class the config dispatches on: a
+/// Hadamard pack on a Qwen3.5 backbone is refused as
+/// `Qwen3_5ForConditionalGeneration`.
+#[test]
+fn each_recipe_names_the_dispatch_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let model_dir = dir.path();
+    let cfg = serde_json::json!({
+        "model_type": "prism_hadamard_qwen35",
+        "base_model_type": "qwen3_5",
+        "hadamard_config": "hadamard.json",
+    });
+    std::fs::write(
+        model_dir.join("config.json"),
+        serde_json::to_vec_pretty(&cfg).unwrap(),
+    )
+    .unwrap();
+    let prompts = serde_json::json!({"version": 1, "description": "test", "prompts": ["hello"]});
+    let prompts_path = model_dir.join("calibration_default.json");
+    std::fs::write(&prompts_path, serde_json::to_vec_pretty(&prompts).unwrap()).unwrap();
+
+    for recipe in ["head_budget", "softmax_mass"] {
+        let msg = run_kv_calibrate(model_dir, recipe, None, Some(&prompts_path), Some(0.95), 16)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("architecture 'Qwen3_5ForConditionalGeneration' is not supported"),
+            "{recipe}: unexpected error: {msg}"
+        );
+    }
+}
+
 #[test]
 fn run_kv_calibrate_bad_recipe_err() {
     let dir = tempfile::tempdir().unwrap();

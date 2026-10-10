@@ -123,7 +123,7 @@ fn build_mlp_detects_moe_layout() {
             weight: Array::from_f32_slice(&[1.0], &[1]).unwrap(),
         })
     };
-    let block = build_mlp(&w, "mlp", &moe_cfg(), &fake_lin).unwrap();
+    let block = build_mlp(&w, "mlp", &moe_cfg(), &fake_lin, false).unwrap();
     assert!(
         matches!(block, MlpBlock::Moe(_)),
         "switch_mlp present ⇒ build_mlp must return MlpBlock::Moe"
@@ -156,7 +156,7 @@ fn build_mlp_detects_dense_layout() {
             weight: Array::from_f32_slice(&[1.0], &[1]).unwrap(),
         })
     };
-    let block = build_mlp(&w, "mlp", &moe_cfg(), &fake_lin).unwrap();
+    let block = build_mlp(&w, "mlp", &moe_cfg(), &fake_lin, false).unwrap();
     assert!(
         matches!(block, MlpBlock::Dense(_)),
         "no switch_mlp router ⇒ build_mlp must return MlpBlock::Dense"

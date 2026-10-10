@@ -131,7 +131,7 @@ fn resolve_with(
     }
 }
 
-/// Map a config `architectures[0]` class name (e.g. `"Qwen3ForCausalLM"`) to
+/// Map a config dispatch class (e.g. `"Qwen3ForCausalLM"`) to
 /// the module-style key understood by [`prefill_chunk_for`]. Unknown classes
 /// return `""`, which `prefill_chunk_for` resolves to the conservative
 /// `FALLBACK` chunk — never the oversized gemma4 default.

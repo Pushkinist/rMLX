@@ -139,7 +139,7 @@ starts with an empty registry. The KV codec flags above apply too.
 | `--adaptive-prefill-chunk` | bool flag | off | Lets the controller set a process-wide prefill chunk in `[32, 2048]`. That override replaces every per-architecture default, including `RMLX_PREFILL_CHUNK*`, for the rest of the process. No effect without `--adaptive-admission`. |
 | `--require-smoke-probe` | bool flag | off | Runs the 8-token smoke probe on every model load; a broken verdict fails the load with HTTP 503. |
 | `--default-temperature` | f32 | — | Temperature for a request that omits it; in `[0.0, 2.0]`. Precedence: request, this flag, `generation_config.json`, `1.0`. |
-| `--enable-thinking` | bool | — | Default thinking mode for Qwen3-family models. A request's `enable_thinking` wins. |
+| `--enable-thinking` | bool | — | Default thinking switch. `false` is passed to the template as `enable_thinking`; `true` leaves the template's default. A request's `chat_template_kwargs` and `enable_thinking` win. |
 | `--image-max-tokens` | usize | `max_soft_tokens` from `processor_config.json` | Per-image soft-token budget for Gemma4-unified vision, clamped to 1120. `0` is refused. A request's `image_max_tokens` wins. |
 | `--mm-cache-bytes` | usize | `536870912` | Multimodal encoder-output cache budget, keyed on input content and model. `0` disables it. Env: `RMLX_MM_CACHE_BYTES`. |
 | `--whisper-model-path` | path | — | Whisper snapshot for `/v1/audio/transcriptions` and `/v1/audio/translations`. Env: `RMLX_WHISPER_MODEL_PATH`. |
@@ -598,8 +598,9 @@ qwen36_diag <model-dir> <device> <N>  # greedy generation of N tokens
 ```
 
 The device defaults to `cpu`. The mlx-lm reference is `argmax_id=8160`,
-`max_abs_logit=29.75`. It refuses a snapshot whose `architectures[0]` is not a
-Qwen3.5 class, and a Hadamard pack (`docs/WEIGHT_QUANTS.md` §4.4).
+`max_abs_logit=29.75`. It refuses a snapshot whose dispatch class is not a
+Qwen3.5 class, and a Hadamard pack rMLX cannot serve
+(`docs/WEIGHT_QUANTS.md` §10).
 
 ---
 

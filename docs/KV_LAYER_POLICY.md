@@ -307,8 +307,8 @@ decides whether the guard can fire.
 Both Qwen3.5 arch strings (`Qwen3_5MoeForConditionalGeneration` and the dense
 `Qwen3_5ForConditionalGeneration`) load into one `Architecture` variant. The
 loader selects dense or sparse MoE per layer from the tensor witness
-`mlp.switch_mlp.gate_proj.weight`, not from the declaration. So
-`architectures[0]` and the built model can disagree.
+`mlp.switch_mlp.gate_proj.weight`, not from the declaration. So the declared
+dispatch class (`ModelConfig::dispatch_arch`) and the built model can disagree.
 
 The enforcing check is therefore keyed on the **resolved** architecture:
 
@@ -335,8 +335,8 @@ The MTP and Eagle3 drafter caches use `KvQuant::None`, which every arch
 accepts. The two-model paths build the draft model's stack with the verifier's
 codec, and only the verifier is checked.
 
-The CLI resolver (`rmlx-cli` `resolve_kv_quant`) reads `architectures[0]`,
-because it runs before the model loads. It exits 78 on a rejected
+The CLI resolver (`rmlx-cli` `resolve_kv_quant`) reads the dispatch class
+(`ModelConfig::dispatch_arch`), because it runs before the model loads. It exits 78 on a rejected
 `--kv-quant`. The server's `resolve_kv_quant_for_load` validates nothing. The
 server's startup check is `ArchGenerator::from_snapshot_with_id` (or its
 speculative counterpart), on the loaded model. The per-request checks cover a

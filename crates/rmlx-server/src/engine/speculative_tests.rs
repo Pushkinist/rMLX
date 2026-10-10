@@ -7,8 +7,8 @@
 //! `text_config missing num_experts` error).
 
 use super::{
-    classify_mtp_draft, decide_draft_kind, dropped_sampling_fields, mtp_reject_reason, round_block,
-    MtpDraftFamily, MIN_DRAFT_BLOCK_SIZE,
+    classify_mtp_draft, decide_draft_kind, draft_kind_of, dropped_sampling_fields,
+    mtp_reject_reason, round_block, MtpDraftFamily, MIN_DRAFT_BLOCK_SIZE,
 };
 use crate::engine::types::SamplingParams;
 use rmlx_models::{Declared, DraftKind};
@@ -40,6 +40,55 @@ fn a_declaration_alone_selects_the_kind() {
         decide_draft_kind(None, Declared::FullModel, "arch", "type").ok(),
         Some(DraftKind::TwoModel)
     );
+}
+
+/// The kind a draft directory's `config.json` gives, read through its
+/// dispatch class. A Hadamard pack whose contract does not hold (here no
+/// contract file) is refused whatever the flag says, before any model loads.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture setup; a failed write is a broken test, not a result"
+)]
+fn a_draft_directory_gives_its_kind_and_a_hadamard_pack_is_refused() {
+    let pack = r#"{"model_type": "prism_hadamard_qwen35", "base_model_type": "qwen3_5",
+        "hadamard_config": "hadamard.json"}"#;
+    let cases: [(&str, Option<DraftKind>, Option<DraftKind>); 5] = [
+        (
+            r#"{"architectures": ["Qwen3ForCausalLM"]}"#,
+            None,
+            Some(DraftKind::TwoModel),
+        ),
+        (
+            r#"{"architectures": ["LlamaForCausalLMEagle3"]}"#,
+            None,
+            Some(DraftKind::Eagle3),
+        ),
+        (
+            r#"{"model_type": "qwen3_5_mtp"}"#,
+            None,
+            Some(DraftKind::Mtp),
+        ),
+        (pack, None, None),
+        (pack, Some(DraftKind::TwoModel), None),
+    ];
+    for (config, flag, want) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), config).unwrap();
+        let got = draft_kind_of(flag, dir.path());
+        assert_eq!(
+            got.as_ref().ok().map(|k| k.0),
+            want,
+            "{config} {flag:?}: {got:?}"
+        );
+        if want.is_none() {
+            let msg = got.err().map_or_else(String::new, |e| e.to_string());
+            assert!(
+                msg.contains("is a Hadamard pack") && msg.contains("hadamard.json"),
+                "{msg}"
+            );
+        }
+    }
 }
 
 /// The flag is for a snapshot that declares nothing.

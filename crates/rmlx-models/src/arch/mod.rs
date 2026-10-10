@@ -1,5 +1,6 @@
-//! Architecture dispatch: load any supported model snapshot by reading
-//! config.architectures[0] and routing to the right backend.
+//! Architecture dispatch: load any supported model snapshot by reading its
+//! dispatch class (`ModelConfig::dispatch_arch`) and routing to the right
+//! backend.
 //!
 //! Wired:
 //! Gemma4ForConditionalGeneration -> Architecture::Gemma4
@@ -23,12 +24,19 @@ pub(crate) mod loader;
 pub(crate) mod phases;
 pub(crate) mod registry;
 
-pub use loader::{load_model, run_smoke_probe, smoke_prompt_ids, LoadOpts, SMOKE_PROMPT};
+pub use loader::{
+    check_hadamard_pack, load_model, run_smoke_probe, smoke_prompt_ids, LoadOpts, SMOKE_PROMPT,
+};
 pub use phases::{read_load_phases, LoadPhases};
 pub use registry::{is_arch_supported, is_generative_arch, KNOWN_ARCHS};
 
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device};
+
+/// Why an EAGLE-3 drafter with a reduced vocabulary cannot run over a
+/// Hadamard pack verifier.
+pub const RESTRICTED_HEAD_OVER_A_PACK: &str = "the verifier is a Hadamard pack: its output \
+    head rows are folded, so the EAGLE-3 restricted-vocab head is refused";
 
 use crate::bitnet::BitNetText;
 use crate::decode_loop::SmokeVerdict;
@@ -498,6 +506,27 @@ impl Architecture {
         }
     }
 
+    /// Refuse the EAGLE-3 restricted-vocabulary head over this verifier.
+    ///
+    /// The head gathers output rows and multiplies them with the final hidden
+    /// state. A Hadamard pack's rows are folded, so that product is wrong with
+    /// no error.
+    ///
+    /// # Errors
+    /// `Error::Model` when the verifier's output head is Hadamard-folded.
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "only the Qwen3.5 family loads Hadamard packs; every other arch has an unfolded head"
+    )]
+    pub fn refuse_restricted_vocab_head(&self) -> Result<()> {
+        match self {
+            Architecture::Qwen3_5Moe(m) if m.has_hadamard_head() => {
+                Err(Error::Model(RESTRICTED_HEAD_OVER_A_PACK.to_owned()))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Raw input-token embedding for the DFlash drafter.
     ///
     /// Returns `[1, n, hidden]` with NO scale (the Qwen3.5 verifier's
@@ -889,10 +918,11 @@ impl Architecture {
     /// Re-check the arch invariants for `kv_quant` against the **resolved**
     /// architecture, immediately before it is used to build KV caches.
     ///
-    /// The startup resolvers validate against the checkpoint's declared
-    /// `architectures[0]`, which is model-side data: a snapshot whose
-    /// declaration disagrees with what the loader built passes those checks
-    /// while running the guarded code path. This is the enforcing copy — it
+    /// The startup resolvers validate against the dispatch class the
+    /// checkpoint's config declares (`ModelConfig::dispatch_arch`), which is
+    /// model-side data: a snapshot whose declaration disagrees with what the
+    /// loader built passes those checks while running the guarded code path.
+    /// This is the enforcing copy — it
     /// asks the loaded model, so no declaration can route around it, and it
     /// also covers quants that enter after startup (a per-request override).
     ///
@@ -1010,7 +1040,7 @@ impl Architecture {
 
         // Enforce the arch invariants against the resolved architecture before
         // a single KV cache is built. The startup resolvers key off the
-        // declared `architectures[0]`; this one asks the loaded model, so a
+        // config's dispatch class; this one asks the loaded model, so a
         // mismatched declaration cannot route around the guard, and a quant
         // supplied per-request is checked on the same terms as a launch flag.
         self.validate_kv_quant(kv_quant)?;

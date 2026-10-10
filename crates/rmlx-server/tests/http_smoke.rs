@@ -1334,7 +1334,7 @@ fn make_no_tools_registry() -> (ModelRegistry, tempfile::TempDir) {
     f.write_all(tkcfg.to_string().as_bytes()).unwrap();
 
     // chat_template.jinja — raises exception when tools is passed.
-    let tmpl = b"{% if tools %}{{ tools | raise_exception }}{% endif %}{% for m in messages %}<{{ m.role }}>{{ m.content }}</{{ m.role }}>{% endfor %}";
+    let tmpl = b"{% if tools %}{{ raise_exception('no tools') }}{% endif %}{% for m in messages %}<{{ m.role }}>{{ m.content }}</{{ m.role }}>{% endfor %}";
     let mut f = std::fs::File::create(snap.join("chat_template.jinja")).unwrap();
     f.write_all(tmpl).unwrap();
 
@@ -1390,6 +1390,126 @@ async fn a9_tools_unsupported_snapshot_returns_no_500() {
         status, 503,
         "expected 503 (missing tokenizer) after tools guard suppressed injection; body: {body}"
     );
+}
+
+// ── A template that refuses the request ───────────────────────────────────
+
+/// A snapshot whose template checks `reasoning_effort` the way the Qwen3.8 and
+/// Ternary-Bonsai-2 templates do, and refuses a message that starts with
+/// `refuse`, copying the message into its refusal. It has a tokenizer, so the
+/// route renders the prompt.
+fn make_refusing_registry() -> (ModelRegistry, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let snap = tmp.path().join("RefusingModel");
+    std::fs::create_dir_all(&snap).unwrap();
+    std::fs::write(
+        snap.join("config.json"),
+        r#"{"architectures": ["FakeForCausalLM"]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        snap.join("tokenizer.json"),
+        r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"x":0,"hi":1,"[UNK]":2},"unk_token":"[UNK]"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        snap.join("chat_template.jinja"),
+        "{%- if messages[-1].content.startswith('refuse') %}{{ raise_exception('This template refuses the message: ' ~ messages[-1].content) }}{% endif %}\
+         {%- set effort = reasoning_effort|default('xhigh') %}\
+         {%- if effort not in ('xhigh', 'medium', 'low') %}\
+         {{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ '. Supported types are xhigh (default), medium, and low.') }}\
+         {%- endif %}{% for m in messages %}{{ m.content }}{% endfor %}",
+    )
+    .unwrap();
+    let reg = ModelRegistry::from_paths(std::slice::from_ref(&snap));
+    (reg, tmp)
+}
+
+/// `reasoning_effort` reaches the template. A value the template refuses is
+/// 400 with the template's own message; one it takes, or none, renders and
+/// reaches the generator, which is not ready here (503).
+#[tokio::test]
+async fn a_reasoning_effort_the_template_refuses_is_400_with_its_message() {
+    let (reg, _tmp) = make_refusing_registry();
+    let port = start_server(reg).await;
+    let request = |effort: &str| {
+        format!(
+            r#"{{"model": "RefusingModel", "messages": [{{"role": "user", "content": "hi"}}],
+               "max_tokens": 4{effort}}}"#
+        )
+    };
+    let (status, body) = http(
+        port,
+        "POST",
+        "/v1/chat/completions",
+        Some(&request(r#", "reasoning_effort": "high""#)),
+    )
+    .await;
+    assert_eq!(status, 400, "body: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["error"]["type"], "invalid_request_error", "body: {body}");
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains(
+            "Unexpected reasoning effort high. Supported types are xhigh (default), medium, and low."
+        ),
+        "body: {body}"
+    );
+
+    for effort in [r#", "reasoning_effort": "medium""#, ""] {
+        let (status, body) =
+            http(port, "POST", "/v1/chat/completions", Some(&request(effort))).await;
+        assert_eq!(status, 503, "effort {effort:?}: body: {body}");
+    }
+}
+
+/// A message the template refuses is 400 on both routes, not 503.
+#[tokio::test]
+async fn a_message_the_template_refuses_is_400_on_both_routes() {
+    let (reg, _tmp) = make_refusing_registry();
+    let port = start_server(reg).await;
+    let body = r#"{"model": "RefusingModel", "max_tokens": 4,
+                   "messages": [{"role": "user", "content": "refuse me"}]}"#;
+    for route in ["/v1/chat/completions", "/v1/messages"] {
+        let (status, reply) = http(port, "POST", route, Some(body)).await;
+        assert_eq!(status, 400, "{route}: body: {reply}");
+        assert!(
+            reply.contains("This template refuses the message: refuse me"),
+            "{route}: body: {reply}"
+        );
+    }
+}
+
+/// A template that copies a 1 MiB message into its refusal gives a 400 with a
+/// small body on both routes: the refusal text is bounded before it reaches
+/// the reply or the log.
+#[tokio::test]
+async fn a_refusal_that_copies_a_huge_message_is_a_small_400_on_both_routes() {
+    let (reg, _tmp) = make_refusing_registry();
+    let port = start_server(reg).await;
+    let content = format!("refuse {}", "x".repeat(1 << 20));
+    let body = format!(
+        r#"{{"model": "RefusingModel", "max_tokens": 4,
+           "messages": [{{"role": "user", "content": "{content}"}}]}}"#
+    );
+    for route in ["/v1/chat/completions", "/v1/messages"] {
+        let (status, reply) = http(port, "POST", route, Some(&body)).await;
+        assert_eq!(
+            status,
+            400,
+            "{route}: body: {}",
+            &reply[..reply.len().min(200)]
+        );
+        assert!(
+            reply.len() < 1024,
+            "{route}: reply of {} bytes",
+            reply.len()
+        );
+        assert!(
+            reply.contains("This template refuses the message: refuse xxx"),
+            "{route}"
+        );
+    }
 }
 
 // ── Usage chunk in streaming path ────────────────────────────────────

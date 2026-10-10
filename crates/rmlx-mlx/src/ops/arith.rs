@@ -2,7 +2,7 @@
 
 #![allow(unsafe_code)]
 
-use rmlx_core::error::Result;
+use rmlx_core::error::{Error, Result};
 
 use crate::{check_status, install_error_handler, sys, with_stream, Array, Device, Dtype};
 
@@ -422,4 +422,48 @@ pub fn sum_axis_keepdims(a: &Array, axis: i32, device: Device) -> Result<Array> 
 /// Softplus: `log(1 + exp(x))`, computed as `log1p(exp(x))`.
 pub fn softplus(a: &Array, device: Device) -> Result<Array> {
     log1p(&exp(a, device)?, device)
+}
+
+/// Hadamard transform over the last axis, multiplied by `scale` (MLX's
+/// default `1 / sqrt(n)` when `None`). Wraps `mlx_hadamard_transform`. For a
+/// power-of-two `n` the matrix is the Sylvester one; for `n = m * 2^k`,
+/// `m` in {12, 20, 28}, MLX combines it with an unnormalised Sloane table.
+///
+/// MLX keeps its butterfly buffer in the input dtype: cast a low-precision
+/// input to f32 first when the result must carry f32 accuracy.
+///
+/// # Errors
+/// `Error::Mlx` when the last axis is not `m * 2^k` with `m` in {1, 12, 20, 28}
+/// and `k <= 26`. MLX itself checks the size only at evaluation: it refuses
+/// some wrong sizes there, mis-decomposes others with no error
+/// (1000 = 20 * 50), and crashes the process on others (`36 * 2^k` on CPU).
+pub fn hadamard_transform(a: &Array, scale: Option<f32>, device: Device) -> Result<Array> {
+    let n = a.shape().last().copied().unwrap_or(0);
+    if !is_hadamard_size(n) {
+        return Err(Error::Mlx(format!(
+            "hadamard_transform: last axis {n} is not m * 2^k with m in {{1, 12, 20, 28}} \
+             and k <= 26"
+        )));
+    }
+    install_error_handler();
+    let scale_opt = sys::mlx_optional_float {
+        value: scale.unwrap_or(0.0),
+        has_value: scale.is_some(),
+    };
+    let mut res = unsafe { sys::mlx_array_new() };
+    let status = unsafe {
+        with_stream(device, |s| {
+            sys::mlx_hadamard_transform(&raw mut res, a.inner, scale_opt, s)
+        })
+    }?;
+    unsafe { check_status(status, "hadamard_transform") }?;
+    Ok(Array { inner: res })
+}
+
+fn is_hadamard_size(n: i32) -> bool {
+    n > 0
+        && [1, 12, 20, 28].iter().any(|&m| {
+            let k_part = n / m;
+            n % m == 0 && k_part.count_ones() == 1 && k_part <= 1 << 26
+        })
 }

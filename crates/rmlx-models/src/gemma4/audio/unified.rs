@@ -97,8 +97,8 @@ impl UnifiedAudioConfig {
         }
     }
 
-    /// Read `audio_config` from a model dir when `architectures[0]` is the
-    /// unified arch. Returns `None` if there is no `audio_config` key.
+    /// Read `audio_config` from a model dir. Returns `None` if there is no
+    /// `audio_config` key.
     pub fn from_model_dir(model_dir: &Path) -> Result<Option<Self>> {
         let path = model_dir.join("config.json");
         let data = std::fs::read(&path).map_err(|e| {

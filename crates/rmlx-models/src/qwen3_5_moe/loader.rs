@@ -20,7 +20,7 @@
 use std::path::Path;
 
 use rmlx_core::error::{Error, Result};
-use rmlx_loader::{load_config, load_shard_index, ShardSet};
+use rmlx_loader::{load_config, load_shard_index, HadamardContract, ShardSet};
 use rmlx_mlx::Array;
 use rmlx_quant::awq::{f16_bits_to_f32, f32_to_f16_bits};
 use tracing::info;
@@ -34,7 +34,7 @@ use super::attention::FullAttention;
 use super::config::Qwen3_5MoeConfig;
 use super::decoder_layer::{AttnBlock, DecoderLayer, MlpBlock};
 use super::gated_delta_net::GatedDeltaNet;
-use super::layers::{Embedding, Linear, ParoRotation, RmsNorm};
+use super::layers::{Embedding, HadamardFold, Linear, ParoRotation, RmsNorm};
 use super::model::Qwen3_5MoeText;
 use super::moe::{DenseMlp, SharedExpert, SparseMoeBlock, SwitchMlp};
 
@@ -49,14 +49,22 @@ use super::moe::{DenseMlp, SharedExpert, SparseMoeBlock, SwitchMlp};
 ///
 /// `m` is the MLP base (`<prefix>.layers.<i>.mlp`). `lin` is the layer's
 /// shared linear builder (the `load_from_path` adapter that maps the shared
-/// `Linear` onto the arch-local one).
+/// `Linear` onto the arch-local one). `hadamard_pack` refuses a sparse MoE
+/// layer: a Hadamard linear has no expert dispatch.
 fn build_mlp(
     w: &Weights<'_>,
     m: &str,
     cfg: &Qwen3_5MoeConfig,
     lin: &impl Fn(&str) -> Result<Linear>,
+    hadamard_pack: bool,
 ) -> Result<MlpBlock> {
     if w.has(&format!("{m}.switch_mlp.gate_proj.weight"))? {
+        if hadamard_pack {
+            return Err(Error::Model(format!(
+                "{m}: Hadamard pack with a sparse MoE layer; a Hadamard linear has no \
+                 expert dispatch"
+            )));
+        }
         Ok(MlpBlock::Moe(Box::new(SparseMoeBlock {
             gate: lin(&format!("{m}.gate"))?,
             switch_mlp: SwitchMlp {
@@ -87,6 +95,21 @@ fn build_mlp(
 // load_from_path — standard MoE checkpoint
 // ---------------------------------------------------------------------------
 
+/// The `base_model_type` of the Hadamard packs this loader folds: the dense
+/// Qwen3.5 backbone.
+const HADAMARD_BASE_MODEL_TYPE: &str = "qwen3_5";
+
+/// Why this loader cannot fold a Hadamard pack on `base_model_type`, or
+/// `None` for the backbone it folds.
+pub(crate) fn unfolded_backbone(base_model_type: &str) -> Option<String> {
+    (base_model_type != HADAMARD_BASE_MODEL_TYPE).then(|| {
+        format!(
+            "config.json base_model_type is {base_model_type:?}; the Qwen3.5 loader folds \
+             a Hadamard pack on {HADAMARD_BASE_MODEL_TYPE:?} only"
+        )
+    })
+}
+
 /// Load a standard (non-PARO) Qwen3.5 model from a snapshot directory.
 ///
 /// Serves both arch strings — `Qwen3_5MoeForConditionalGeneration` (sparse MoE)
@@ -96,6 +119,11 @@ fn build_mlp(
 /// by which tensors are present, so a single loader covers the mxfp8 and affine
 /// checkpoints regardless of arch string. PARO checkpoints go through
 /// [`load_from_path_paro`] instead (selected upstream by `is_paroquant()`).
+///
+/// A Prism Hadamard pack (`config.json` names a `hadamard_config` contract)
+/// has each module the contract names folded through [`HadamardFold`]; a
+/// contract the loader cannot read, or a contract module it builds no layer
+/// for, is refused.
 #[allow(
     clippy::cognitive_complexity,
     reason = "single cohesive load sequence: prefix resolve + embedding/head + per-layer attn/MLP build. Splitting further would scatter the shared `lin`/`load_rms` closures across helpers for no readability gain — matches the laguna/gemma3 loader convention."
@@ -145,6 +173,24 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
 
     let defaults = QuantParams::global(cfg.quant_group_size, cfg.quant_bits, &cfg.quant_mode);
 
+    let contract = HadamardContract::read(model_dir)
+        .map_err(|e| Error::Model(format!("Hadamard pack: {e}")))?;
+    let fold = match contract {
+        Some(c) => {
+            if let Some(fact) = unfolded_backbone(&c.base_model_type) {
+                return Err(Error::Model(format!("Hadamard pack: {fact}")));
+            }
+            info!(
+                block = c.block,
+                forward = c.forward.len(),
+                inverse = c.inverse.len(),
+                "Qwen3_5: Hadamard pack, folding its modules"
+            );
+            Some(HadamardFold::new(c.block, &c.signs, c.forward, c.inverse)?)
+        }
+        None => None,
+    };
+
     // Thin adapter: calls the shared seam, then converts the shared
     // `crate::layers::Linear` (mode: QuantMode) to the arch-local
     // `Linear` (mode: String). OOM classification is inside `w.linear`
@@ -152,10 +198,10 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
     // (it only builds Plain/Quantized) but the match is exhaustive.
     let lin = |base: &str| -> Result<Linear> {
         use crate::layers::Linear as SharedLinear;
-        match w.linear(base, |hb| {
+        let built = match w.linear(base, |hb| {
             resolve_quant(base, hb, &defaults, &cfg.quant_overrides)
         })? {
-            SharedLinear::Plain { weight } => Ok(Linear::Plain { weight }),
+            SharedLinear::Plain { weight } => Linear::Plain { weight },
             SharedLinear::Quantized {
                 weight,
                 scales,
@@ -163,7 +209,7 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
                 group_size,
                 bits,
                 mode,
-            } => Ok(Linear::Quantized {
+            } => Linear::Quantized {
                 weight,
                 // mxfp8/mxfp4 ship uint8 E8M0 scales the dequant kernel
                 // requires verbatim; only float (affine) scales get the
@@ -174,10 +220,16 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
                 group_size,
                 bits,
                 mode: mode.as_str().to_owned(),
-            }),
-            SharedLinear::Paro { .. } => Err(Error::Loader(format!(
-                "{base}: unexpected Paro variant from w.linear"
-            ))),
+            },
+            SharedLinear::Paro { .. } => {
+                return Err(Error::Loader(format!(
+                    "{base}: unexpected Paro variant from w.linear"
+                )))
+            }
+        };
+        match &fold {
+            Some(fold) => fold.linear(base, built),
+            None => Ok(built),
         }
     };
 
@@ -193,7 +245,7 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
     let embed_tokens = {
         use crate::layers::Embedding as SharedEmbedding;
         let base = format!("{pfx}.embed_tokens");
-        match w.embedding(&base, |hb| {
+        let built = match w.embedding(&base, |hb| {
             resolve_quant(&base, hb, &defaults, &cfg.quant_overrides)
         })? {
             SharedEmbedding::Plain { weight } => Embedding::Plain { weight },
@@ -215,6 +267,10 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
                 bits,
                 mode: mode.as_str().to_owned(),
             },
+        };
+        match &fold {
+            Some(fold) => fold.embedding(&base, built)?,
+            None => built,
         }
     };
 
@@ -316,7 +372,7 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
             })
         };
 
-        let mlp = build_mlp(&w, &format!("{base}.mlp"), &cfg, &lin)?;
+        let mlp = build_mlp(&w, &format!("{base}.mlp"), &cfg, &lin, fold.is_some())?;
 
         layers.push(DecoderLayer {
             input_layernorm: load_rms(&format!("{base}.input_layernorm"))?,
@@ -324,6 +380,9 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
             attn,
             mlp,
         });
+    }
+    if let Some(fold) = fold {
+        fold.finish()?;
     }
 
     Ok(Qwen3_5MoeText {
@@ -341,6 +400,10 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
 #[cfg(test)]
 #[path = "loader_tests.rs"]
 mod loader_tests;
+
+#[cfg(test)]
+#[path = "pack_loader_tests.rs"]
+mod pack_loader_tests;
 
 // ---------------------------------------------------------------------------
 // load_from_path_paro — PARO dense checkpoint

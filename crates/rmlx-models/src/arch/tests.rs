@@ -143,15 +143,15 @@ fn load_model_rejects_empty_architectures() {
     );
 }
 
-/// A Prism Hadamard pack declares `hadamard_config`. Its weights need an
-/// input-side Hadamard transform that no loader applies, so `load_model`
-/// refuses it before the architecture check, whatever `architectures` says.
+/// A snapshot that declares `hadamard_config` is a Prism Hadamard pack
+/// whatever `architectures` says: `load_model` reads its contract before the
+/// architecture check, and refuses one that does not hold by its fact.
 #[test]
 #[allow(
     clippy::expect_used,
     reason = "test fixture setup; a failed write is a broken test, not a result"
 )]
-fn load_model_refuses_a_hadamard_config_whatever_the_architecture() {
+fn load_model_checks_a_hadamard_config_whatever_the_architecture() {
     for architectures in [r#"["Qwen3_5ForConditionalGeneration"]"#, "[]"] {
         let dir = TempDir::new().expect("tempdir");
         let json = format!(
@@ -163,12 +163,54 @@ fn load_model_refuses_a_hadamard_config_whatever_the_architecture() {
         let msg = load_model(dir.path(), Device::Cpu, &LoadOpts::default())
             .err()
             .map_or_else(String::new, |e| e.to_string());
-        assert!(msg.contains("hadamard_config"), "names the fact: {msg}");
+        assert!(msg.contains("is a Hadamard pack"), "names the pack: {msg}");
         assert!(
-            msg.contains("Hadamard transform"),
-            "names the reason: {msg}"
+            msg.contains("config.json has no `base_model_type`"),
+            "names the fact: {msg}"
         );
     }
+}
+
+/// A Prism Hadamard pack names no `architectures`. Its config dispatches on
+/// the Qwen3.5 class: the serve-time arch gate admits it, the drafter reader
+/// reads it as a full model, and it takes the Qwen3.5 prefill-chunk row.
+/// `load_model` reads its contract first, so a pack with no contract file is
+/// refused by that file, not as an unsupported architecture.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test fixture setup; a failed write is a broken test, not a result"
+)]
+fn a_hadamard_pack_dispatches_as_qwen3_5_and_load_model_reads_its_contract() {
+    let dir = TempDir::new().expect("tempdir");
+    let json = r#"{"model_type": "prism_hadamard_qwen35", "base_model_type": "qwen3_5",
+        "hadamard_config": "hadamard.json",
+        "quantization": {"group_size": 128, "bits": 2, "mode": "affine"}}"#;
+    fs::write(dir.path().join("config.json"), json).expect("write config.json");
+
+    let cfg = rmlx_loader::load_config(dir.path()).expect("config.json parses");
+    let arch = cfg.dispatch_arch();
+    assert_eq!(arch, Some("Qwen3_5ForConditionalGeneration"));
+    let arch = arch.unwrap_or("(empty)");
+    assert!(is_arch_supported(arch), "the serve gate admits {arch}");
+    assert_eq!(
+        crate::Declared::from_snapshot(arch, "prism_hadamard_qwen35"),
+        crate::Declared::FullModel
+    );
+    assert_eq!(
+        crate::prefill_chunk::module_key_for_class(arch),
+        "qwen3_5_moe"
+    );
+
+    let msg = load_model(dir.path(), Device::Cpu, &LoadOpts::default())
+        .err()
+        .map_or_else(String::new, |e| e.to_string());
+    assert!(msg.contains("is a Hadamard pack"), "names the pack: {msg}");
+    assert!(
+        msg.contains("cannot read hadamard.json"),
+        "names the file: {msg}"
+    );
+    assert!(!msg.contains("not yet supported"), "{msg}");
 }
 
 /// Write `model.safetensors` holding one tensor, `model.embed_tokens.signs`.
@@ -234,8 +276,8 @@ fn unparseable_strays_do_not_fail_the_hadamard_check() {
     assert!(msg.contains("missing hidden_size"), "{msg}");
 }
 
-/// A pack whose config says nothing is still refused when a shard carries a
-/// `.signs` tensor, the per-channel signs of the same Hadamard transform.
+/// A snapshot whose config names no contract is refused when a shard carries
+/// a `.signs` tensor, the per-channel signs of a Hadamard pack.
 #[test]
 #[allow(
     clippy::expect_used,
@@ -254,7 +296,7 @@ fn load_model_refuses_a_signs_tensor_in_a_shard() {
         "names the tensor: {msg}"
     );
     assert!(
-        msg.contains("Hadamard transform"),
+        msg.contains("names no `hadamard_config`"),
         "names the reason: {msg}"
     );
 }
@@ -316,4 +358,34 @@ fn read_load_phases_returns_none_when_all_zero() {
         read_load_phases().is_none(),
         "read_load_phases() should return None when total_load_ms == 0"
     );
+}
+
+/// A snapshot with no Hadamard fact whose directory cannot be listed is not
+/// called a Hadamard pack: the check names the directory it could not read,
+/// as a loader error.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test fixture setup; a failed write is a broken test, not a result"
+)]
+fn an_unlistable_directory_is_a_loader_error_not_a_hadamard_pack() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().expect("tempdir");
+    let model_path = write_config(&dir, &["Qwen3ForCausalLM"]);
+    let mode = |m: u32| {
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(m)).expect("chmod");
+    };
+    mode(0o100);
+    let result = load_model(&model_path, Device::Cpu, &LoadOpts::default());
+    mode(0o700);
+    let msg = result
+        .as_ref()
+        .err()
+        .map_or_else(String::new, ToString::to_string);
+    assert!(
+        matches!(result, Err(Error::Loader(_))),
+        "a loader error: {msg}"
+    );
+    assert!(msg.contains("Hadamard check of"), "{msg}");
+    assert!(!msg.contains("is a Hadamard pack"), "{msg}");
 }

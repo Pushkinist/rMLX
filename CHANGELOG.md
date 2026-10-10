@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Ternary-Bonsai-2-27B and other Prism Hadamard packs are served.** A pack
+  stores affine 2-bit weights folded with a signed block Hadamard transform,
+  and rMLX refused it. rMLX now serves a pack on the dense Qwen3.5 backbone,
+  text only. `rmlx serve` exits 1 at startup, naming the fact and the file,
+  for a pack it cannot serve: a block that is not 512, 1024, 2048 or 4096 or
+  does not divide every input width, a `.signs` tensor that differs from the
+  contract, `tie_word_embeddings`, an MTP component, a sparse MoE layer or a
+  `base_model_type` other than `qwen3_5`. It also exits 1 for an EAGLE-3
+  drafter with a reduced vocabulary over a pack. A pack names no
+  `architectures`; rMLX takes its class from `base_model_type`. The stop
+  tokens of a model are the `config.json` ids, then each
+  `generation_config.json` id that file lacks. A `generation_config.json`
+  that exists and cannot be parsed now refuses the load; the registry ignored
+  it before.
+
 ### Changed
 
 - **The transcription routes state their limits instead of passing them
@@ -25,6 +42,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`@ai-sdk/openai` with the model `whisper-1`, openai-python in strict mode)
   cannot read `verbose_json` yet. Fields such as `prompt` are taken and
   ignored as before, now with at most one `warn` event per request.
+- **`reasoning_effort` and `chat_template_kwargs` reach the chat template as
+  sent.** `/v1/chat/completions` takes `reasoning_effort` and
+  `chat_template_kwargs`. Each entry of `chat_template_kwargs` becomes a
+  template variable with its JSON type. The server keeps no list of the
+  variables or the values a template takes, and rewrites none: `high` stays
+  `high`. A template refusal (`raise_exception`) is 400 with the template's
+  message, cut to 256 characters, on `/v1/chat/completions` and
+  `/v1/messages`; any other render failure is 503 with its message cut the
+  same way. The Qwen3.8 and Ternary-Bonsai-2 template takes `xhigh` (its
+  default), `medium` and `low`, so OpenAI's `high` is 400. A key named like a
+  variable the server sets (`messages`, `tools`, `add_generation_prompt`,
+  `bos_token`, `eos_token`) or like a function of the template (`raise_exception`,
+  `range`, ...) replaces nothing; it is dropped with one `warn` log per key. The
+  size of `chat_template_kwargs` counts with the message text against the
+  input bound (413), because a template can print it. A top-level
+  `enable_thinking` or `reasoning_effort` wins over the same key in
+  `chat_template_kwargs`, which wins over `--enable-thinking`. Before,
+  `chat_template_kwargs` was accepted and ignored. `/v1/messages` takes no
+  `chat_template_kwargs`. No log event holds more than 256 characters of a
+  template error or of the parser's error for a rejected JSON body; the reply
+  of a rejected JSON body is not cut.
+- **`enable_thinking` in `chat_template_kwargs` is passed as sent; the
+  top-level field and `--enable-thinking` mean what they meant.** `false` in
+  the top-level field or in `--enable-thinking` is passed to the template;
+  `true` leaves the template to its default. In `chat_template_kwargs`, `true`
+  reaches the template as `true`. A top-level `enable_thinking: true` removes
+  a nested value, so the template default applies. The think splitter, which
+  splits `reasoning_content` from `content` and enforces `thinking_budget`,
+  exists only for the Qwen3 and Qwen3.5 architectures. On another
+  architecture, a template variable that turns thinking on (the Gemma 4
+  template does for `enable_thinking: true`) returns the thought text in
+  `content`, and `thinking_budget` has no effect.
 
 ### Fixed
 

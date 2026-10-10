@@ -126,8 +126,8 @@ impl UnifiedVisionConfig {
         }
     }
 
-    /// Read `vision_config` from a model dir when `architectures[0]` is the
-    /// unified arch. Returns `None` if there is no `vision_config` key.
+    /// Read `vision_config` from a model dir. Returns `None` if there is no
+    /// `vision_config` key.
     pub fn from_model_dir(model_dir: &Path) -> Result<Option<Self>> {
         let path = model_dir.join("config.json");
         let data = std::fs::read(&path).map_err(|e| {
@@ -146,25 +146,15 @@ impl UnifiedVisionConfig {
     }
 }
 
-/// Returns true when `architectures[0] == "Gemma4UnifiedForConditionalGeneration"`.
+/// Returns true when the config dispatches on `Gemma4UnifiedForConditionalGeneration`.
 ///
 /// The unified 12B loads through the same [`crate::arch::Architecture::Gemma4`]
 /// text path as the tower family; this string check is the dispatch that routes
 /// the vision/audio front-end to the encoder-free embedder instead of the
 /// SigLIP `vision_tower` loader.
 pub fn is_unified_arch(model_dir: &Path) -> bool {
-    let path = model_dir.join("config.json");
-    let Ok(data) = std::fs::read(&path) else {
-        return false;
-    };
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&data) else {
-        return false;
-    };
-    v.get("architectures")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|a| a.first())
-        .and_then(serde_json::Value::as_str)
-        == Some("Gemma4UnifiedForConditionalGeneration")
+    rmlx_loader::load_config(model_dir)
+        .is_ok_and(|cfg| cfg.dispatch_arch() == Some("Gemma4UnifiedForConditionalGeneration"))
 }
 
 // ---------------------------------------------------------------------------

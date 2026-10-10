@@ -102,7 +102,7 @@ pub enum ToolCallFormat {
     // Future: Llama3PythonTag, ...
 }
 
-/// Map a model architecture string (`config.architectures[0]`) to the
+/// Map a model's dispatch class (`ModelConfig::dispatch_arch`) to the
 /// tool-call output format that arch is known to emit, or `None` if rMLX has
 /// no parser for it.
 ///

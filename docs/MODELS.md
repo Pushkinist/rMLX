@@ -30,9 +30,20 @@ special layers, the modalities, the speculative role and the refusals.
 
 ## Overview
 
-**Dispatch.** `arch::load_model` keys on `architectures[0]` in `config.json`.
-A string outside `KNOWN_ARCHS` (`crates/rmlx-models/src/arch/registry.rs`) is
-refused before any tensor I/O. `serve` runs the same check at startup.
+**Dispatch.** `arch::load_model` keys on the dispatch class of `config.json`,
+`ModelConfig::dispatch_arch` (`crates/rmlx-loader/src/config.rs`): the
+`architectures[0]` string, or, for a Prism Hadamard pack, which names no
+`architectures`, the class of its `base_model_type` (`qwen3_5` gives
+`Qwen3_5ForConditionalGeneration`). Every reader of the class calls it: the
+`serve` startup check, the KV codec resolver, the registry, the drafter
+readers. A class outside `KNOWN_ARCHS`
+(`crates/rmlx-models/src/arch/registry.rs`) is refused before any tensor I/O.
+`serve` runs the same check at startup. Before this check, `load_model` runs
+`check_hadamard_pack`: a Hadamard pack on the dense Qwen3.5 backbone whose
+contract holds loads through the Qwen3.5 loader, and any other pack is
+refused by the fact that fails. `serve` runs the same pack check at startup
+on `--model`, `--draft-model` and each model of a `--registry` file
+(`docs/WEIGHT_QUANTS.md` §10).
 
 **Declared and resolved class.** One arch string can cover several checkpoint
 shapes. `Architecture::arch_class()` reports the class the loader built.
@@ -50,6 +61,23 @@ it needs an unreleased MLX kernel. See `docs/WEIGHT_QUANTS.md` §4.4.
 
 **Routes.** The generative architectures serve `/v1/chat/completions` and
 `/v1/messages`. `JinaEmbeddingsV4Model` serves `/v1/embeddings` only.
+
+**End of turn.** A generation stops at the ids `rmlx_loader::stop_token_ids`
+(`crates/rmlx-loader/src/config.rs`) reads from the snapshot: the
+`eos_token_id` of `config.json` (top level, else `text_config`) in its order,
+then each `eos_token_id` of `generation_config.json` that it lacks. HuggingFace
+`generate` and mlx-lm stop at the `generation_config.json` ids and read
+`config.json` only when that file names none. The union also keeps every
+`config.json` id, so no stop is lost. A `generation_config.json` that exists
+and cannot be read or parsed refuses the load, and the registry leaves the
+snapshot out. The `eos_token` of `tokenizer_config.json` is not
+read. The root-gated test
+`every_chat_snapshot_stops_at_the_eos_token_its_tokenizer_config_names`
+(`crates/rmlx-server/src/registry_tests.rs`) checks that the set holds it on
+every snapshot under the models root that has a dispatch class and a chat
+template. Example: the Ternary-Bonsai-2 pack names `<|endoftext|>` (248044) in
+`config.json` and `<|im_end|>` (248046) in `generation_config.json`, so it
+stops at both.
 
 **KV codec.** `auto` is unquantised bf16 on every architecture
 (`DEFAULT_KV_QUANT`); see `docs/KV_QUANT.md` § "The auto default". The
@@ -74,7 +102,7 @@ The per-arch prefill chunk is in `docs/KV_CACHE.md` § "Chunked prefill".
 
 ## Architecture support table
 
-| `architectures[0]` | Variant | `arch_class()` | Input | Positional capacity | Spec verifier |
+| Dispatch class | Variant | `arch_class()` | Input | Positional capacity | Spec verifier |
 |---|---|---|---|---|---|
 | `Qwen2ForCausalLM` | `Qwen2` | same | text | unknown (`0`) | no |
 | `Qwen3ForCausalLM` | `Qwen3` | same | text | mpe, YaRN-extended | no |
@@ -190,9 +218,11 @@ attention. The rest are GatedDeltaNet (GDN) linear-attention layers with
   Decode keeps the broadcast path.
 
 **Weights.** bf16, affine, mxfp8, mxfp4 and mixed checkpoints (global mxfp8
-with affine overrides on the router gates). `load_util::bf16_param` casts
-every float parameter to bf16 at load, GDN `conv1d_weight` and `norm_weight`
-included. `load_util::bf16_scales` casts quant scales only when they are
+with affine overrides on the router gates), and the Prism Hadamard pack
+(`docs/WEIGHT_QUANTS.md` §10). `load_util::bf16_param` casts the norms and
+the GDN `conv1d_weight` and `norm_weight` to bf16 at load. An unquantized
+linear keeps its stored dtype: the F32 `in_proj_a` and `in_proj_b` of a
+Hadamard pack stay F32. `load_util::bf16_scales` casts quant scales only when they are
 float, so uint8 E8M0 microscaling scales stay verbatim. See
 `docs/KV_LAYER_POLICY.md` "Qwen3.6 MoE KV is bf16 at `--kv-quant none`".
 
@@ -208,6 +238,16 @@ K below 8 bits on the MoE class. The dense class keeps them. See
 every drafter kind; see
 [Speculative verifier seams](#speculative-verifier-seams).
 
+**Chat template.** The Qwen3.8 and Ternary-Bonsai-2 snapshots ship the same
+template. With thinking on (`enable_thinking` absent or `true`), it reads
+`reasoning_effort`: `xhigh` (the default, when the request sends none),
+`medium` or `low`. Any other value raises, `high` and `minimal` included, and
+the request gets 400 with the template's own message. OpenAI clients send
+`high`: the server does not map it (`docs/SERVER.md` § "Chat Templates"). With
+`enable_thinking` `false` the template closes the think block and skips the
+effort check.
+Tool calls use the Qwen3 XML form (`Qwen3XmlFunction`).
+
 **Snapshots in use.** Read from each snapshot's `config.json`. Every one
 has `full_attention_interval` 4, `head_dim` 256 and a
 `max_position_embeddings` of 262144.
@@ -218,14 +258,32 @@ has `full_attention_interval` 4, `head_dim` 256 and a
 | `mlx-community__Qwen3.8-27B-mxfp8` | dense | 64 (16 / 48) | 24 / 4 | mxfp8 |
 | `z-lab__Qwen3.6-27B-PARO` | dense | 64 (16 / 48) | 24 / 4 | ParoQuant 4-bit |
 | `prism-ml__Ternary-Bonsai-27B-mlx-2bit` | dense | 64 (16 / 48) | 24 / 4 | affine g128 b2 |
+| `prism-ml__Ternary-Bonsai-2-27B-mlx-2bit` | dense | 64 (16 / 48) | 24 / 4 | Prism Hadamard pack, affine g128 b2 |
 
-All four configs declare one MTP layer (`mtp_num_hidden_layers` 1), and
-none of the four snapshots ships an `mtp.*` tensor. The `mtp` drafter is a
-separate sidecar snapshot, such as the one below.
+The first four configs declare one MTP layer (`mtp_num_hidden_layers` 1),
+and none of the four snapshots ships an `mtp.*` tensor. The Ternary-Bonsai-2
+pack declares none. The `mtp` drafter is a separate sidecar snapshot, such as
+the one below.
 
 The Qwen3.6-35B-A3B drafters: `mlx-community__Qwen3.6-35B-A3B-MTP-5bit`
 (`mtp`), `z-lab__Qwen3.6-35B-A3B-DFlash` (`dflash`) and
 `Dogacel__specdrift-qwen3.6-35b-a3b-eagle3` (`eagle3`).
+
+**Ternary-Bonsai-2-27B.** `prism-ml__Ternary-Bonsai-2-27B-mlx-2bit` is a
+Prism Hadamard pack (`docs/WEIGHT_QUANTS.md` §10): `model_type`
+`prism_hadamard_qwen35`, no `architectures`, dispatched as
+`Qwen3_5ForConditionalGeneration`. Its logits agree with the runtime the
+snapshot ships within 2 times the bf16 activation floor
+(`docs/WEIGHT_QUANTS.md` §10.6). Limits:
+
+- Text only. The checkpoint carries a vision tower; the loader does not
+  build it.
+- Activations are bf16, with bf16-cast scales. The vendor runtime rounds the
+  embedding output to f16 and then computes in f32
+  (`docs/WEIGHT_QUANTS.md` §10.5).
+- No MTP head. An EAGLE-3 drafter with a reduced-vocabulary (hot-vocab) head
+  is refused over the pack, and so are a tied head and a sparse MoE layer
+  (`docs/WEIGHT_QUANTS.md` §10.3).
 
 ---
 

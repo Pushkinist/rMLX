@@ -319,7 +319,7 @@ fn tokenize_chat_fixture(
         eos_token: &eos_token,
         add_generation_prompt: true,
         tools: &[],
-        enable_thinking: None,
+        variables: None,
     };
     let rendered = template
         .render(&tpl_messages, &opts)

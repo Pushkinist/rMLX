@@ -35,7 +35,6 @@ pub mod constraint_json;
 pub mod detokenizer;
 pub mod embeddings;
 pub mod engine;
-pub mod generation_config_io;
 pub mod image_io;
 pub mod keep_alive;
 pub mod logged_json;

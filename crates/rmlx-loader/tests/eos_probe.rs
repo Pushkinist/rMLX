@@ -1,7 +1,7 @@
 //! Nested-config `eos_token_id` resolution.
 //!
 //! Qwen3-VL-MoE sets the top-level `eos_token_id` to `null` and carries the
-//! real id (151645) inside `text_config.eos_token_id`. `eos_token_ids()` must
+//! real id (151645) inside `text_config.eos_token_id`. `stop_token_ids` must
 //! fall back to the nested value. Gated on the on-disk snapshot.
 
 #![allow(
@@ -20,7 +20,7 @@
     clippy::disallowed_methods,
 )]
 
-use rmlx_loader::load_config;
+use rmlx_loader::stop_token_ids;
 
 fn qwen3_vl_model_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("RMLX_TEST_MODEL_QWEN3_VL_30B").map(std::path::PathBuf::from)
@@ -37,8 +37,7 @@ fn nested_text_config_eos_resolves() {
         eprintln!("SKIP: Qwen3-VL snapshot absent at {p:?}");
         return;
     }
-    let cfg = load_config(p).unwrap();
-    let eos = cfg.eos_token_ids();
+    let eos = stop_token_ids(p).unwrap();
     assert!(
         eos.contains(&151645),
         "expected nested text_config eos 151645 in {eos:?}"

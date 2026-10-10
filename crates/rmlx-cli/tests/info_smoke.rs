@@ -44,7 +44,7 @@ fn info_smoke_gemma4_mxfp8() {
         .expect("load_shard_index should succeed for primary model");
 
     // arch must contain "Gemma4"
-    let arch_str = cfg.architectures.join(", ");
+    let arch_str = cfg.dispatch_arch().unwrap_or_default();
     assert!(
         arch_str.contains("Gemma4"),
         "expected arch containing 'Gemma4', got: {arch_str}"
@@ -88,7 +88,7 @@ mod rmlx_cli_test_helper {
 
         // Just assert we can derive the fields — the real println! output is
         // tested by the smoke run in OUTCOME.
-        assert_ne!(cfg.architectures.len(), 0);
+        assert!(cfg.dispatch_arch().is_some());
         assert!(total > 0);
     }
 }

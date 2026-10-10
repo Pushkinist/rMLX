@@ -6,7 +6,9 @@ use std::path::Path;
 use std::time::Instant;
 
 use rmlx_core::error::{Error, Result};
-use rmlx_loader::{load_config, load_shard_index, ModelConfig, ShardHandle, ShardSet};
+use rmlx_loader::{
+    load_config, load_shard_index, HadamardContract, HadamardContractError, ModelConfig, ShardSet,
+};
 use rmlx_mlx::{Array, Device};
 
 use super::phases::LAST_LOAD_PHASES;
@@ -37,7 +39,7 @@ pub struct LoadOpts {
 
 /// Load a model snapshot from `model_dir`.
 ///
-/// Reads `config.json`, dispatches on `architectures[0]`:
+/// Reads `config.json`, dispatches on `ModelConfig::dispatch_arch`:
 /// - an architecture in `KNOWN_ARCHS` -> its `Architecture` variant
 /// - anything else -> `Error::Model("architecture '...' not yet supported")`
 ///
@@ -51,8 +53,8 @@ pub struct LoadOpts {
 ///
 /// # Errors
 /// Returns `Error::Config` if `config.json` cannot be read or parsed.
-/// Returns `Error::Model` if the snapshot is a Hadamard pack (see
-/// [`refuse_hadamard_pack`]) or the architecture is not yet supported.
+/// Returns `Error::Model` if the snapshot is a Hadamard pack rMLX cannot serve
+/// (see [`check_hadamard_pack`]) or the architecture is not yet supported.
 /// Returns `Error::Quant` if the declared affine weight-quant bit-width (the
 /// global default or a `tensor_overrides` entry) is unsupported by this
 /// build's MLX/mlx-c.
@@ -62,9 +64,9 @@ pub fn load_model(model_dir: &Path, device: Device, opts: &LoadOpts) -> Result<A
     let t_total_start = Instant::now();
 
     let cfg = load_config(model_dir)?;
-    refuse_hadamard_pack(&cfg, model_dir)?;
+    check_hadamard_pack(&cfg, model_dir)?;
 
-    let arch_str = cfg.architectures.first().map_or("(empty)", String::as_str);
+    let arch_str = cfg.dispatch_arch().unwrap_or("(empty)");
 
     tracing::info!(
         model_dir = %model_dir.display(),
@@ -352,79 +354,73 @@ pub fn load_model(model_dir: &Path, device: Device, opts: &LoadOpts) -> Result<A
     Ok(arch)
 }
 
-/// Refuse a Prism Hadamard pack, found from file facts and not from
-/// `architectures`: `config.json` carries `hadamard_config`, or a shard carries
-/// a `.signs` tensor.
+/// The class a Hadamard pack is served on: its loader folds the pack's
+/// modules.
+const HADAMARD_CLASS: &str = "Qwen3_5ForConditionalGeneration";
+
+/// Refuse a Prism Hadamard pack rMLX cannot serve. Every other snapshot,
+/// a servable pack included, passes.
 ///
-/// The weights of such a pack need an input-side Hadamard transform that rMLX
-/// does not apply. Without this check they load as plain affine weights and
-/// give wrong output with no error.
+/// A pack is found from file facts, not from its dispatch class:
+/// `config.json` names `hadamard_config`, or a shard holds a `.signs` tensor.
+/// rMLX serves a pack on the dense Qwen3.5 backbone (`base_model_type`
+/// `qwen3_5`), dispatched on `Qwen3_5ForConditionalGeneration`, that is not a
+/// ParoQuant checkpoint and whose contract [`HadamardContract::read`] accepts.
+/// `load_model`, the `serve` startup check and the draft-model reader call
+/// this one check.
 ///
 /// # Errors
-/// `Error::Model` naming the fact found. `Error::Loader` if a shard in
-/// `model_dir` cannot be opened or its header cannot be parsed.
-fn refuse_hadamard_pack(cfg: &ModelConfig, model_dir: &Path) -> Result<()> {
-    let fact = if cfg.extras.contains_key("hadamard_config") {
-        Some("config.json carries `hadamard_config`".to_owned())
-    } else {
-        first_signs_tensor(model_dir)?.map(|name| format!("shard tensor `{name}`"))
-    };
-    let Some(fact) = fact else {
-        return Ok(());
-    };
+/// `Error::Model` naming the fact that does not hold and the file that holds
+/// it. `Error::Loader` when a snapshot with no `hadamard_config` cannot be
+/// checked for `.signs` tensors (its directory cannot be listed).
+pub fn check_hadamard_pack(cfg: &ModelConfig, model_dir: &Path) -> Result<()> {
+    let pack = cfg.is_hadamard_pack();
+    if let Some(fact) = pack.then(|| unservable_class(cfg)).flatten() {
+        return Err(refused_pack(model_dir, &fact));
+    }
+    match HadamardContract::read(model_dir) {
+        Ok(_) => Ok(()),
+        Err(e @ HadamardContractError::Unreadable { .. }) if !pack => Err(Error::Loader(format!(
+            "Hadamard check of {}: {e}",
+            model_dir.display()
+        ))),
+        Err(e) => Err(refused_pack(model_dir, &e.to_string())),
+    }
+}
+
+fn refused_pack(model_dir: &Path, fact: &str) -> Error {
     tracing::error!(
         model_dir = %model_dir.display(),
         fact = %fact,
         "arch: Hadamard pack refused"
     );
-    Err(Error::Model(format!(
-        "{} is a Hadamard pack ({fact}): its weights need an input-side Hadamard \
-         transform that rMLX does not apply, so they would give wrong output",
+    Error::Model(format!(
+        "{} is a Hadamard pack rMLX cannot serve: {fact}",
         model_dir.display()
-    )))
+    ))
 }
 
-/// The first tensor name ending in `.signs` across the `*.safetensors` shards
-/// in `model_dir`. Reads only the shard headers.
-///
-/// Skips hidden files (AppleDouble `._*` side files). A file that cannot be
-/// opened or parsed feeds no weights, so it is logged and skipped.
-fn first_signs_tensor(model_dir: &Path) -> Result<Option<String>> {
-    let entries = std::fs::read_dir(model_dir)
-        .map_err(|e| Error::Loader(format!("cannot read dir {}: {e}", model_dir.display())))?;
-    for entry in entries {
-        let entry = entry.map_err(|e| {
-            Error::Loader(format!("read_dir entry in {}: {e}", model_dir.display()))
-        })?;
-        let Ok(filename) = entry.file_name().into_string() else {
-            continue;
-        };
-        if filename.starts_with('.') || !filename.ends_with(".safetensors") {
-            continue;
-        }
-        let shard = match ShardHandle::open(model_dir, &filename) {
-            Ok(shard) => shard,
-            Err(e) => {
-                tracing::warn!(file = %filename, error = %e, "arch: Hadamard check skips a file it cannot open");
-                continue;
-            }
-        };
-        let header = match shard.safetensors() {
-            Ok(header) => header,
-            Err(e) => {
-                tracing::warn!(file = %filename, error = %e, "arch: Hadamard check skips a file it cannot parse");
-                continue;
-            }
-        };
-        if let Some(name) = header
-            .names()
-            .into_iter()
-            .find(|n| n.rsplit_once('.').is_some_and(|(_, last)| last == "signs"))
-        {
-            return Ok(Some(name.to_owned()));
-        }
+/// Why no loader serves the pack `cfg` describes, from `config.json` alone,
+/// or `None`. An absent `base_model_type` is the contract reader's fact.
+fn unservable_class(cfg: &ModelConfig) -> Option<String> {
+    let base = cfg.extras.get("base_model_type")?.as_str()?;
+    if let Some(fact) = crate::qwen3_5_moe::unfolded_backbone(base) {
+        return Some(fact);
     }
-    Ok(None)
+    if cfg.is_paroquant() {
+        return Some(
+            "config.json `quantization_config` names `paroquant`; the ParoQuant loader \
+             folds no Hadamard module"
+                .to_owned(),
+        );
+    }
+    match cfg.dispatch_arch() {
+        Some(HADAMARD_CLASS) => None,
+        class => Some(format!(
+            "config.json dispatches on {class:?}; rMLX serves a Hadamard pack on \
+             {HADAMARD_CLASS} only"
+        )),
+    }
 }
 
 /// Reject a declared weight-quant bit-width this build's mlx-c has no

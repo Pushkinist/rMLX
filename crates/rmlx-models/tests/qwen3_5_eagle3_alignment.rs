@@ -120,8 +120,6 @@ fn eagle3_greedy_tracks_plain_greedy_for_a_long_prefix() {
     let device = Device::Gpu;
     let verifier =
         arch::load_model(&model_path, device, &arch::LoadOpts::default()).expect("load verifier");
-    let hidden = verifier.hidden_size();
-    let vocab = verifier.vocab_size();
     let eos = eos_ids(&model_path);
     assert!(
         !eos.is_empty(),
@@ -129,7 +127,7 @@ fn eagle3_greedy_tracks_plain_greedy_for_a_long_prefix() {
          past the answer into maximum-entropy filler and the comparison is noise"
     );
     let mut drafter =
-        Eagle3Drafter::load(&draft_path, hidden, vocab, &eos, device).expect("load drafter");
+        Eagle3Drafter::load(&draft_path, &verifier, &eos, device).expect("load drafter");
 
     let tk =
         tokenizers::Tokenizer::from_file(model_path.join("tokenizer.json")).expect("tokenizer");

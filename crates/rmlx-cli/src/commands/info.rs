@@ -135,7 +135,7 @@ pub(crate) fn run_info(
         .unwrap_or_else(|_| model_path.to_path_buf());
     let abs_path_str = abs_path.to_string_lossy();
 
-    let arch = cfg.architectures.join(", ");
+    let arch = cfg.dispatch_arch().unwrap_or_default();
     let dtype = cfg.dtype.as_deref().unwrap_or("—");
 
     // quant_mode for metrics: "<mode> g<group_size>" or "none".

@@ -7,11 +7,10 @@
 use std::path::Path;
 
 use rmlx_audio::tts::{PickHead, TokenPick, TtsError};
+use rmlx_loader::{load_generation_config, GenerationConfig};
 use rmlx_mlx::{Array, Device};
 use rmlx_models::sampler::{select_token, Pcg32, PenaltyConfig, SamplerConfig};
 use serde::Deserialize;
-
-use crate::generation_config_io::{load_generation_config, GenerationConfig};
 
 /// Sampling fields that a speech request can set. The names are those of
 /// `/v1/chat/completions`.

@@ -39,7 +39,7 @@ fn minimal_template_renders_correctly() {
         eos_token: "<eos>",
         add_generation_prompt: true,
         tools: &[],
-        enable_thinking: None,
+        variables: None,
     };
     let rendered = tpl.render(&messages, &opts).expect("render");
     assert_eq!(
@@ -50,23 +50,281 @@ fn minimal_template_renders_correctly() {
     assert!(rendered.add_generation_prompt);
 }
 
-// ── raise_exception filter ────────────────────────────────────────────────
+// ── raise_exception and reasoning_effort ──────────────────────────────────
 
+const NO_OPTS: RenderOpts<'static> = RenderOpts {
+    bos_token: "",
+    eos_token: "",
+    add_generation_prompt: false,
+    tools: &[],
+    variables: None,
+};
+
+/// A template's `raise_exception(msg)` call, the form HuggingFace defines, is
+/// a rejection that carries the template's own message. Any other failure is
+/// not.
 #[test]
-fn raise_exception_returns_error() {
-    let src = r#"{{ "oops" | raise_exception }}"#.to_owned();
-    let tpl = ChatTemplate::new(src).expect("compile");
-    let result = tpl.render(
-        &[],
-        &RenderOpts {
-            bos_token: "",
-            eos_token: "",
-            add_generation_prompt: false,
-            tools: &[],
-            enable_thinking: None,
-        },
+fn raise_exception_is_a_rejection_carrying_the_template_message() {
+    let tpl = ChatTemplate::new("{{ raise_exception('Unexpected role ' ~ 'x' ~ '.') }}".to_owned())
+        .expect("compile");
+    match tpl.render(&[], &NO_OPTS) {
+        Err(RenderError::Rejected(msg)) => assert_eq!(msg, "Unexpected role x."),
+        other => panic!("want Rejected(\"Unexpected role x.\"), got {other:?}"),
+    }
+
+    let tpl = ChatTemplate::new("{{ messages.items() }}".to_owned()).expect("compile");
+    assert!(
+        matches!(tpl.render(&[], &NO_OPTS), Err(RenderError::Failed(_))),
+        "an unsupported construct is a render failure, not a rejection"
     );
-    assert!(result.is_err(), "raise_exception must produce an error");
+}
+
+/// A variable is defined in the template context only when the request sets
+/// it, so the template's own `default` applies otherwise.
+#[test]
+fn reasoning_effort_is_defined_only_when_the_request_names_one() {
+    let tpl = ChatTemplate::new(
+        "{{ reasoning_effort|default('template default') }}|\
+         {% if reasoning_effort is defined %}defined{% else %}undefined{% endif %}"
+            .to_owned(),
+    )
+    .expect("compile");
+    let render = |effort| {
+        let variables = request_variables(None, None, effort, None);
+        let opts = RenderOpts {
+            variables: Some(&variables),
+            ..NO_OPTS
+        };
+        tpl.render(&[], &opts).map(|r| r.text)
+    };
+    assert_eq!(
+        render(None).ok().as_deref(),
+        Some("template default|undefined")
+    );
+    assert_eq!(
+        render(Some("medium")).ok().as_deref(),
+        Some("medium|defined")
+    );
+}
+
+fn vars(json: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    let serde_json::Value::Object(map) = json else {
+        panic!("not an object");
+    };
+    map
+}
+
+/// Which `enable_thinking` the template gets. The top-level field and the
+/// server default keep the meaning they have always had: `false` is passed,
+/// `true` leaves the template to its default. `chat_template_kwargs` is passed
+/// as sent, `true` and values that are not bools included. A top-level field
+/// wins over the same key in `chat_template_kwargs` for every value, and
+/// `chat_template_kwargs` wins over the server default.
+#[test]
+fn enable_thinking_resolves_top_level_then_kwargs_then_default() {
+    use serde_json::json;
+    let resolved = |kw: Option<serde_json::Value>, top: Option<bool>, default: Option<bool>| {
+        let kw = kw.map(|v| vars(json!({ "enable_thinking": v })));
+        request_variables(kw, top, None, default)
+            .get("enable_thinking")
+            .cloned()
+    };
+    for nested in [json!(true), json!(false), json!("no")] {
+        for default in [None, Some(true), Some(false)] {
+            assert_eq!(
+                resolved(Some(nested.clone()), Some(true), default),
+                None,
+                "top true, nested {nested}, default {default:?}"
+            );
+            assert_eq!(
+                resolved(Some(nested.clone()), Some(false), default),
+                Some(json!(false)),
+                "top false, nested {nested}, default {default:?}"
+            );
+            assert_eq!(
+                resolved(Some(nested.clone()), None, default),
+                Some(nested.clone()),
+                "no top, nested {nested}, default {default:?}"
+            );
+        }
+    }
+    assert_eq!(resolved(None, None, Some(false)), Some(json!(false)));
+    assert_eq!(resolved(None, None, Some(true)), None);
+    assert_eq!(resolved(None, None, None), None);
+}
+
+/// With no `chat_template_kwargs`, the template sees the variable exactly as
+/// on the release before `chat_template_kwargs`: that release passed
+/// `enable_thinking` only when the top-level field, else the server default,
+/// was `false`. Checked on all nine pairs of (field, default).
+#[test]
+fn without_kwargs_enable_thinking_reaches_the_template_as_it_always_did() {
+    let tpl = ChatTemplate::new(
+        "{% if enable_thinking is defined %}defined:{{ enable_thinking }}\
+         {% else %}undefined{% endif %}"
+            .to_owned(),
+    )
+    .expect("compile");
+    for top in [None, Some(true), Some(false)] {
+        for default in [None, Some(true), Some(false)] {
+            let release_passes_false = top.or(default) == Some(false);
+            let want = if release_passes_false {
+                "defined:False"
+            } else {
+                "undefined"
+            };
+            let variables = request_variables(None, top, None, default);
+            let opts = RenderOpts {
+                variables: Some(&variables),
+                ..NO_OPTS
+            };
+            assert_eq!(
+                tpl.render(&[], &opts).map(|r| r.text).ok().as_deref(),
+                Some(want),
+                "field {top:?}, default {default:?}"
+            );
+        }
+    }
+}
+
+/// Same for `reasoning_effort`: the top-level field wins, and no value is
+/// rewritten.
+#[test]
+fn reasoning_effort_resolves_top_level_over_kwargs_and_is_not_rewritten() {
+    use serde_json::json;
+    let kwargs = vars(json!({ "reasoning_effort": "low", "other": [1, 2] }));
+    let resolved = request_variables(Some(kwargs.clone()), None, Some("high"), None);
+    assert_eq!(resolved.get("reasoning_effort"), Some(&json!("high")));
+    assert_eq!(resolved.get("other"), Some(&json!([1, 2])));
+    let nested_only = request_variables(Some(kwargs), None, None, None);
+    assert_eq!(nested_only.get("reasoning_effort"), Some(&json!("low")));
+}
+
+/// A client variable reaches the template with its JSON type.
+#[test]
+fn client_variables_reach_the_template_with_their_types() {
+    let tpl = ChatTemplate::new(
+        "{{ s }}|{{ n + 1 }}|{{ l|length }}|{{ o.k }}|{{ 'yes' if b else 'no' }}|\
+         {{ 'none' if z is none else 'set' }}"
+            .to_owned(),
+    )
+    .expect("compile");
+    let variables = vars(serde_json::json!({
+        "s": "text", "n": 41, "l": [1, 2, 3], "o": {"k": "v"}, "b": true, "z": null
+    }));
+    let opts = RenderOpts {
+        variables: Some(&variables),
+        ..NO_OPTS
+    };
+    assert_eq!(
+        tpl.render(&[], &opts).map(|r| r.text).ok().as_deref(),
+        Some("text|42|3|v|yes|none")
+    );
+}
+
+/// A client variable cannot replace one the server sets: the server must
+/// account for the prompt it renders.
+#[test]
+fn client_variables_cannot_replace_the_variables_the_server_sets() {
+    let tpl = ChatTemplate::new(
+        "{{ bos_token }}|{{ eos_token }}|{{ add_generation_prompt }}|{{ tools|length }}|\
+         {% for m in messages %}{{ m.content }}{% endfor %}"
+            .to_owned(),
+    )
+    .expect("compile");
+    let variables = vars(serde_json::json!({
+        "bos_token": "evil", "eos_token": "evil", "add_generation_prompt": true,
+        "tools": [1, 2, 3], "messages": [{"role": "user", "content": "evil"}]
+    }));
+    let messages = [ChatMessageTpl {
+        role: "user",
+        content: "real",
+        ..Default::default()
+    }];
+    let opts = RenderOpts {
+        bos_token: "BOS",
+        eos_token: "EOS",
+        variables: Some(&variables),
+        ..NO_OPTS
+    };
+    assert_eq!(
+        tpl.render(&messages, &opts).map(|r| r.text).ok().as_deref(),
+        Some("BOS|EOS|False|0|real")
+    );
+}
+
+/// minijinja wraps an error raised inside an include in a `BadInclude` error.
+/// The refusal under it is still a refusal, with the template's message.
+#[test]
+fn a_refusal_inside_an_include_is_still_a_rejection() {
+    let tpl = ChatTemplate::new(
+        "{% if inner is defined %}{{ raise_exception('refused inside') }}\
+         {% else %}{% set inner = true %}{% include 'chat' %}{% endif %}"
+            .to_owned(),
+    )
+    .expect("compile");
+    match tpl.render(&[], &NO_OPTS) {
+        Err(RenderError::Rejected(msg)) => assert_eq!(msg, "refused inside"),
+        other => panic!("want Rejected(\"refused inside\"), got {other:?}"),
+    }
+}
+
+/// A template can copy request text into its refusal (Qwen3.8 copies
+/// `reasoning_effort`). The message the server logs and replies with is
+/// bounded: a 1 MiB value leaves at most 257 characters, starting with the
+/// template's own text.
+#[test]
+fn a_refusal_message_is_bounded() {
+    let huge = "x".repeat(1 << 20);
+    let messages = [ChatMessageTpl {
+        role: "user",
+        content: &huge,
+        ..Default::default()
+    }];
+    let tpl = ChatTemplate::new(
+        "{{ raise_exception('Unexpected role ' ~ messages[0].content ~ '.') }}".to_owned(),
+    )
+    .expect("compile");
+    match tpl.render(&messages, &NO_OPTS) {
+        Err(RenderError::Rejected(msg)) => {
+            assert!(
+                msg.chars().count() <= 257,
+                "{} characters",
+                msg.chars().count()
+            );
+            assert!(msg.starts_with("Unexpected role xxxx"), "{}", &msg[..40]);
+        }
+        other => panic!(
+            "want Rejected, got {:?}",
+            other.map(|r| r.text.len()).map_err(|e| e.to_string().len())
+        ),
+    }
+}
+
+/// A render failure can copy request text too (a missing template named by a
+/// variable). Its message is bounded like a refusal.
+#[test]
+fn a_render_failure_message_is_bounded() {
+    let huge = "x".repeat(1 << 20);
+    let messages = [ChatMessageTpl {
+        role: "user",
+        content: &huge,
+        ..Default::default()
+    }];
+    let tpl = ChatTemplate::new("{% include messages[0].content %}".to_owned()).expect("compile");
+    match tpl.render(&messages, &NO_OPTS) {
+        Err(RenderError::Failed(msg)) => {
+            assert!(
+                msg.chars().count() <= 257,
+                "{} characters",
+                msg.chars().count()
+            );
+        }
+        other => panic!(
+            "want Failed, got {:?}",
+            other.map(|r| r.text.len()).map_err(|e| e.to_string().len())
+        ),
+    }
 }
 
 // ── Generic HF byte-compare across model snapshots ────────────────────────
@@ -104,7 +362,7 @@ fn render_matches_hf_or_skip(snap: &str, bos: &str, eos: &str, expected: &str) {
         eos_token: eos,
         add_generation_prompt: true,
         tools: &[],
-        enable_thinking: None,
+        variables: None,
     };
     let r = tpl.render(&messages, &opts).expect("render");
     assert_eq!(
@@ -203,7 +461,7 @@ fn real_gemma4_template_renders_basic_prompt() {
         eos_token: "<eos>",
         add_generation_prompt: true,
         tools: &[],
-        enable_thinking: None,
+        variables: None,
     };
     let rendered = tpl
         .render(&messages, &opts)
@@ -268,7 +526,7 @@ fn qwen36_render_matches_hf_reference_byte_for_byte() {
         eos_token: "<|im_end|>",
         add_generation_prompt: true,
         tools: &[],
-        enable_thinking: None,
+        variables: None,
     };
     let r = tpl.render(&messages, &opts).expect("render");
     let expected = "<|im_start|>system\nYou are a senior Python developer. DO NOT think out loud. DO NOT explain. Output exactly one ```python ... ``` block containing the full file. No prose before or after.<|im_end|>\n<|im_start|>user\nWrite a Python function add(a, b) returning a+b.\n\n/no_think<|im_end|>\n<|im_start|>assistant\n<think>\n";
@@ -279,15 +537,15 @@ fn qwen36_render_matches_hf_reference_byte_for_byte() {
     );
 }
 
-// ── enable_thinking=Some(false) closes the <think> block ────────────
+// ── enable_thinking=false closes the <think> block ────────────
 //
-// When `enable_thinking: Some(false)` is set in `RenderOpts`, the Qwen3.6
+// With `enable_thinking` set to `false` in `RenderOpts::variables`, the Qwen3.6
 // template branch `enable_thinking is defined and enable_thinking is false`
 // fires, producing a closed `<think>\n\n</think>\n\n` block (no-think mode).
 //
-// When `enable_thinking: None` (the default), the variable is absent from
-// the Jinja context, `is defined` evaluates false, and the template emits
-// the open `<think>\n` block — byte-identical to HF output (guarded by
+// With no `variables`, `enable_thinking` is absent from the Jinja context,
+// `is defined` evaluates false, and the template emits the open `<think>\n`
+// block, byte-identical to HF output (guarded by
 // `qwen36_render_matches_hf_reference_byte_for_byte` above).
 #[test]
 fn qwen36_enable_thinking_false_yields_closed_think_block() {
@@ -311,42 +569,43 @@ fn qwen36_enable_thinking_false_yields_closed_think_block() {
         ..Default::default()
     }];
 
-    // Some(false) → no-think mode: closed <think></think> block.
+    // enable_thinking=false → no-think mode: closed <think></think> block.
+    let no_think = request_variables(None, Some(false), None, None);
     let opts_no_think = RenderOpts {
         bos_token: "",
         eos_token: "<|im_end|>",
         add_generation_prompt: true,
         tools: &[],
-        enable_thinking: Some(false),
+        variables: Some(&no_think),
     };
     let r_no_think = tpl
         .render(&messages, &opts_no_think)
         .expect("render (no-think)");
     assert!(
         r_no_think.text.contains("<think>\n\n</think>"),
-        "enable_thinking=Some(false) must produce a closed <think></think> block; got: {:?}",
+        "enable_thinking=false must produce a closed <think></think> block; got: {:?}",
         r_no_think.text
     );
 
-    // None → HF default: open <think> block (thinking enabled).
+    // No variables → HF default: open <think> block (thinking enabled).
     let opts_default = RenderOpts {
         bos_token: "",
         eos_token: "<|im_end|>",
         add_generation_prompt: true,
         tools: &[],
-        enable_thinking: None,
+        variables: None,
     };
     let r_default = tpl
         .render(&messages, &opts_default)
         .expect("render (default)");
     assert!(
         r_default.text.ends_with("<think>\n"),
-        "enable_thinking=None must produce an open <think> block; got: {:?}",
+        "no variables must produce an open <think> block; got: {:?}",
         r_default.text
     );
     assert!(
         !r_default.text.contains("</think>"),
-        "enable_thinking=None must NOT close the think block; got: {:?}",
+        "no variables must NOT close the think block; got: {:?}",
         r_default.text
     );
 }
@@ -385,7 +644,7 @@ fn gemma4_render_matches_hf_reference_byte_for_byte() {
         eos_token: "<eos>",
         add_generation_prompt: true,
         tools: &[],
-        enable_thinking: None,
+        variables: None,
     };
     let rendered = tpl.render(&messages, &opts).expect("render");
     let expected = "<bos><|turn>user\nWhat is 2+2?<turn|>\n<|turn>model\n";
@@ -429,7 +688,7 @@ fn qwen3_empty_tools_no_tools_block() {
         eos_token: "<|im_end|>",
         add_generation_prompt: true,
         tools: &[],
-        enable_thinking: None,
+        variables: None,
     };
     let rendered = tpl.render(&messages, &opts).expect("render");
     assert!(
@@ -485,7 +744,7 @@ fn qwen3_template_emits_tools_block() {
         eos_token: "<|im_end|>",
         add_generation_prompt: true,
         tools: &tools,
-        enable_thinking: None,
+        variables: None,
     };
     let rendered = tpl.render(&messages, &opts).expect("render");
     assert!(
@@ -566,7 +825,7 @@ fn qwen3_renders_full_tool_conversation() {
         eos_token: "<|im_end|>",
         add_generation_prompt: true,
         tools: &[],
-        enable_thinking: None,
+        variables: None,
     };
     let r = tpl.render(&messages, &opts).expect("render");
     assert!(
@@ -624,7 +883,7 @@ fn qwen3_plain_render_byte_identical_after_tool_support() {
         eos_token: "<|im_end|>",
         add_generation_prompt: true,
         tools: &[],
-        enable_thinking: None,
+        variables: None,
     };
     let r = tpl.render(&messages, &opts).expect("render");
     let expected = "<|im_start|>system\nYou are a senior Python developer. DO NOT think out loud. DO NOT explain. Output exactly one ```python ... ``` block containing the full file. No prose before or after.<|im_end|>\n<|im_start|>user\nWrite a Python function add(a, b) returning a+b.\n\n/no_think<|im_end|>\n<|im_start|>assistant\n<think>\n";

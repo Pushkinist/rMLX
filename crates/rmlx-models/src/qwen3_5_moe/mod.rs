@@ -30,6 +30,7 @@ pub(crate) mod prompt_cache;
 
 pub use config::Qwen3_5MoeConfig;
 pub use generate::generate_greedy;
+pub(crate) use loader::unfolded_backbone;
 pub use loader::{load_from_path, load_from_path_paro};
 pub use model::Qwen3_5MoeText;
 pub(crate) use mtp_layer::{MtpLayer, MtpLayerDims};
@@ -41,6 +42,9 @@ pub use prompt_cache::read_cache_stats as qwen3_5_moe_cache_stats;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod pack_reference_tests;
 
 /// Qwen3.5-MoE's decoder layers each project their own K/V — no cross-layer-KV
 /// topology. This is the single producer of that fact for this arch: it is what

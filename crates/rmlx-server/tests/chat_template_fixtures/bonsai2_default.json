@@ -1,0 +1,15 @@
+{
+  "snapshot": "prism-ml__Ternary-Bonsai-2-27B-mlx-2bit",
+  "arch": "Qwen3_5ForConditionalGeneration",
+  "messages": [
+    {
+      "role": "user",
+      "content": "What is 2+2?"
+    }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "bos_token": "",
+  "eos_token": "<|im_end|>",
+  "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+}

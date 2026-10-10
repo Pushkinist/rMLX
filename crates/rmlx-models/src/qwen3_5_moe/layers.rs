@@ -1,4 +1,5 @@
-//! Local layer primitives: Linear (plain/quantized/PARO), Embedding, RmsNorm, helpers.
+//! Local layer primitives: Linear (plain/quantized/PARO/Hadamard), Embedding,
+//! RmsNorm, helpers.
 
 // unsafe_code: mlx-rs Array zero-copy view — slice::from_raw_parts byte-reinterpret for Array::from_bytes
 #![allow(unsafe_code)]
@@ -7,7 +8,11 @@ use rmlx_core::error::{Error, Result};
 use rmlx_mlx::compile::{compile_shapeless, Closure};
 use rmlx_mlx::{broadcast_to, expand_dims, rms_norm, Array, Device, Dtype};
 use rustc_hash::FxHashMap;
-use std::sync::{Mutex, OnceLock};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use crate::hadamard::SignedBlockHadamard;
 
 // ---------------------------------------------------------------------------
 // Local layer primitives
@@ -58,9 +63,71 @@ pub(super) enum Linear {
         scales: Array,
         biases: Array, // always present in PARO (derived from qzeros)
     },
+    /// A linear layer of a Prism Hadamard pack: `inner` is the quantized
+    /// folded weight `W' = W D H`, so `y = W' . transform.forward(x)`. Build
+    /// it with [`Linear::hadamard`].
+    Hadamard {
+        transform: Arc<SignedBlockHadamard>,
+        inner: Box<Linear>,
+    },
+}
+
+/// The input width of a quantized weight `[rows, width * bits / 32]` (U32).
+fn quantized_width(weight: &Array, bits: i32) -> Option<usize> {
+    let packed = usize::try_from(*weight.shape().last()?).ok()?;
+    let bits = usize::try_from(bits).ok().filter(|b| *b > 0)?;
+    (packed * 32)
+        .is_multiple_of(bits)
+        .then(|| packed * 32 / bits)
+}
+
+/// Refuse a folded weight that is not quantized (`None`) or whose input width
+/// is not the sign width of `transform`.
+fn check_folded(
+    what: &str,
+    transform: &SignedBlockHadamard,
+    weight: Option<(&Array, i32)>,
+) -> Result<()> {
+    let Some((weight, bits)) = weight else {
+        return Err(Error::Model(format!(
+            "Hadamard {what}: the folded weight is not quantized"
+        )));
+    };
+    if weight.ndim() != 2 {
+        return Err(Error::Model(format!(
+            "Hadamard {what}: the folded weight has {} axes; an expert stack \
+             [experts, rows, columns] has no fold",
+            weight.ndim()
+        )));
+    }
+    match quantized_width(weight, bits) {
+        Some(width) if width == transform.width() => Ok(()),
+        width => Err(Error::Model(format!(
+            "Hadamard {what}: weight input width {} is not the sign width {}",
+            width.map_or_else(|| "unknown".to_owned(), |w| w.to_string()),
+            transform.width()
+        ))),
+    }
 }
 
 impl Linear {
+    /// A Hadamard linear layer over the quantized folded weight `inner`.
+    ///
+    /// # Errors
+    /// `Error::Model` when `inner` is not quantized or its input width is not
+    /// the sign width of `transform`.
+    pub(super) fn hadamard(transform: Arc<SignedBlockHadamard>, inner: Linear) -> Result<Linear> {
+        let weight = match &inner {
+            Linear::Quantized { weight, bits, .. } => Some((weight, *bits)),
+            Linear::Plain { .. } | Linear::Paro { .. } | Linear::Hadamard { .. } => None,
+        };
+        check_folded("linear", &transform, weight)?;
+        Ok(Linear::Hadamard {
+            transform,
+            inner: Box::new(inner),
+        })
+    }
+
     pub(super) fn forward(&self, x: &Array, device: Device) -> Result<Array> {
         match self {
             Linear::Plain { weight } => {
@@ -126,6 +193,9 @@ impl Linear {
                     device,
                 )
             }
+            Linear::Hadamard { transform, inner } => {
+                inner.forward(&transform.forward(x, device)?, device)
+            }
         }
     }
 
@@ -145,6 +215,9 @@ impl Linear {
         device: Device,
     ) -> Result<Array> {
         match self {
+            Linear::Hadamard { .. } => Err(Error::Model(
+                "a Hadamard linear has no expert dispatch: Hadamard packs are dense".to_owned(),
+            )),
             // Paro layers do not appear as MoE expert projections (PARO 27B is dense).
             // Fall back to the standard quantized matmul after rotation.
             Linear::Paro { .. } => {
@@ -222,11 +295,41 @@ pub(super) enum Embedding {
         bits: i32,
         mode: String,
     },
+    /// The embedding of a Prism Hadamard pack: `inner` is the quantized folded
+    /// table `E' = E D H`, so a row is `transform.inverse(E'[id])`. Build it
+    /// with [`Embedding::hadamard`].
+    Hadamard {
+        transform: Arc<SignedBlockHadamard>,
+        inner: Box<Embedding>,
+    },
 }
 
 impl Embedding {
+    /// A Hadamard embedding over the quantized folded table `inner`.
+    ///
+    /// # Errors
+    /// `Error::Model` when `inner` is not quantized or its row width is not
+    /// the sign width of `transform`.
+    pub(super) fn hadamard(
+        transform: Arc<SignedBlockHadamard>,
+        inner: Embedding,
+    ) -> Result<Embedding> {
+        let weight = match &inner {
+            Embedding::Quantized { weight, bits, .. } => Some((weight, *bits)),
+            Embedding::Plain { .. } | Embedding::Hadamard { .. } => None,
+        };
+        check_folded("embedding", &transform, weight)?;
+        Ok(Embedding::Hadamard {
+            transform,
+            inner: Box::new(inner),
+        })
+    }
+
     pub(super) fn forward(&self, ids: &Array, device: Device) -> Result<Array> {
         match self {
+            Embedding::Hadamard { transform, inner } => {
+                transform.inverse(&inner.forward(ids, device)?, device)
+            }
             Embedding::Plain { weight } => weight.take(ids, 0, device),
             Embedding::Quantized {
                 weight,
@@ -250,6 +353,11 @@ impl Embedding {
 
     pub(super) fn as_linear(&self, x: &Array, device: Device) -> Result<Array> {
         match self {
+            // The pack contract refuses a tied head; it defines no forward use
+            // of the inverse-folded table.
+            Embedding::Hadamard { .. } => Err(Error::Model(
+                "a Hadamard embedding is not a tied output head".to_owned(),
+            )),
             Embedding::Plain { weight } => {
                 rmlx_mlx::matmul(x, &weight.transpose(&[1, 0], device)?, device)
             }
@@ -271,6 +379,107 @@ impl Embedding {
                 true,
                 device,
             ),
+        }
+    }
+}
+
+/// The Hadamard folding of one pack: one transform per input width, shared
+/// by every module of that width, and the modules the contract folds forward
+/// (linear layers) or inverse (the embedding), keyed by tensor name without
+/// `.weight`.
+///
+/// The loader passes each layer it builds through [`HadamardFold::linear`]
+/// or [`HadamardFold::embedding`], then calls [`HadamardFold::finish`],
+/// which refuses a contract module the loader built no layer for: that
+/// module's weights would otherwise stay unread or load unfolded.
+pub(super) struct HadamardFold {
+    transforms: BTreeMap<usize, Arc<SignedBlockHadamard>>,
+    forward: BTreeMap<String, usize>,
+    inverse: BTreeMap<String, usize>,
+    built: RefCell<BTreeSet<String>>,
+}
+
+impl HadamardFold {
+    /// # Errors
+    /// `Error::Model` when a sign vector builds no transform.
+    pub(super) fn new(
+        block: usize,
+        signs: &BTreeMap<usize, Vec<f32>>,
+        forward: BTreeMap<String, usize>,
+        inverse: BTreeMap<String, usize>,
+    ) -> Result<Self> {
+        let transforms = signs
+            .iter()
+            .map(|(width, s)| Ok((*width, Arc::new(SignedBlockHadamard::new(block, s)?))))
+            .collect::<Result<_>>()?;
+        Ok(Self {
+            transforms,
+            forward,
+            inverse,
+            built: RefCell::new(BTreeSet::new()),
+        })
+    }
+
+    /// The transform of contract module `name`, which this marks as built.
+    fn transform(&self, name: &str, width: usize) -> Result<Arc<SignedBlockHadamard>> {
+        self.built.borrow_mut().insert(name.to_owned());
+        self.transforms.get(&width).cloned().ok_or_else(|| {
+            Error::Model(format!(
+                "Hadamard module {name}: no sign vector of width {width}"
+            ))
+        })
+    }
+
+    /// `inner` folded when the contract names `name` a forward module, else
+    /// `inner` unchanged.
+    ///
+    /// # Errors
+    /// `Error::Model` when `name` is the contract's inverse module, or when
+    /// [`Linear::hadamard`] refuses `inner`.
+    pub(super) fn linear(&self, name: &str, inner: Linear) -> Result<Linear> {
+        if self.inverse.contains_key(name) {
+            return Err(Error::Model(format!(
+                "Hadamard module {name} is folded inverse; it is not a linear layer"
+            )));
+        }
+        match self.forward.get(name) {
+            Some(&width) => Linear::hadamard(self.transform(name, width)?, inner),
+            None => Ok(inner),
+        }
+    }
+
+    /// `inner` folded when the contract names `name` the inverse module, else
+    /// `inner` unchanged.
+    ///
+    /// # Errors
+    /// `Error::Model` when `name` is a forward module of the contract, or when
+    /// [`Embedding::hadamard`] refuses `inner`.
+    pub(super) fn embedding(&self, name: &str, inner: Embedding) -> Result<Embedding> {
+        if self.forward.contains_key(name) {
+            return Err(Error::Model(format!(
+                "Hadamard module {name} is folded forward; it is not an embedding"
+            )));
+        }
+        match self.inverse.get(name) {
+            Some(&width) => Embedding::hadamard(self.transform(name, width)?, inner),
+            None => Ok(inner),
+        }
+    }
+
+    /// # Errors
+    /// `Error::Model` naming the first contract module no layer was built for.
+    pub(super) fn finish(self) -> Result<()> {
+        let built = self.built.into_inner();
+        match self
+            .forward
+            .keys()
+            .chain(self.inverse.keys())
+            .find(|name| !built.contains(*name))
+        {
+            Some(name) => Err(Error::Model(format!(
+                "Hadamard pack: the loader built no layer for contract module {name}"
+            ))),
+            None => Ok(()),
         }
     }
 }
@@ -377,10 +586,9 @@ fn qk_norm_device_tag(d: Device) -> u8 {
     }
 }
 
-static QK_NORM_COMPILE_CACHE: OnceLock<Mutex<FxHashMap<QkNormKey, std::sync::Arc<Closure>>>> =
-    OnceLock::new();
+static QK_NORM_COMPILE_CACHE: OnceLock<Mutex<FxHashMap<QkNormKey, Arc<Closure>>>> = OnceLock::new();
 
-fn qk_norm_compile_cache() -> &'static Mutex<FxHashMap<QkNormKey, std::sync::Arc<Closure>>> {
+fn qk_norm_compile_cache() -> &'static Mutex<FxHashMap<QkNormKey, Arc<Closure>>> {
     QK_NORM_COMPILE_CACHE.get_or_init(|| Mutex::new(FxHashMap::default()))
 }
 
@@ -388,17 +596,13 @@ fn qk_norm_compile_cache() -> &'static Mutex<FxHashMap<QkNormKey, std::sync::Arc
     clippy::expect_used,
     reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
 )]
-fn qk_norm_get_or_compile(
-    key: QkNormKey,
-    eps: f32,
-    device: Device,
-) -> Result<std::sync::Arc<Closure>> {
+fn qk_norm_get_or_compile(key: QkNormKey, eps: f32, device: Device) -> Result<Arc<Closure>> {
     {
         let cache = qk_norm_compile_cache()
             .lock()
             .expect("qk_norm cache poisoned");
         if let Some(cls) = cache.get(&key) {
-            return Ok(std::sync::Arc::clone(cls));
+            return Ok(Arc::clone(cls));
         }
     }
     let raw = Closure::from_fn(move |inputs| -> Result<Vec<Array>> {
@@ -419,14 +623,12 @@ fn qk_norm_get_or_compile(
     });
     let compiled = compile_shapeless(raw)
         .map_err(|e| Error::Mlx(format!("qk_norm compile_shapeless: {e}")))?;
-    let arc = std::sync::Arc::new(compiled);
+    let arc = Arc::new(compiled);
     let mut cache = qk_norm_compile_cache()
         .lock()
         .expect("qk_norm cache poisoned");
-    Ok(std::sync::Arc::clone(
-        cache
-            .entry(key)
-            .or_insert_with(|| std::sync::Arc::clone(&arc)),
+    Ok(Arc::clone(
+        cache.entry(key).or_insert_with(|| Arc::clone(&arc)),
     ))
 }
 
@@ -464,3 +666,7 @@ pub(super) fn qk_norm_fused(
     let qn = outs.pop().expect("qn");
     Ok((qn, kn))
 }
+
+#[cfg(test)]
+#[path = "layers_tests.rs"]
+pub(super) mod layers_tests;
