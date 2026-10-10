@@ -536,9 +536,20 @@ pub(super) async fn generate_streaming(
                     loop {
                         match token_stream.next().await {
                             Some(Ok(tok)) => {
-                                output_tokens += 1;
+                                if tok.counts_toward_usage() {
+                                    output_tokens += 1;
+                                }
                                 if tok.done {
                                     finish_reason.clone_from(&tok.finish_reason);
+                                }
+                                // After a stop match the rest of the
+                                // generation is read and counted, and emits
+                                // nothing.
+                                if stop_hit {
+                                    if tok.done {
+                                        break;
+                                    }
+                                    continue;
                                 }
                                 // Skip empty pieces — they would
                                 // produce an empty delta, which Anthropic
@@ -640,19 +651,15 @@ pub(super) async fn generate_streaming(
                                     "sse(anthropic): handled token piece"
                                 );
 
-                                // Once a stop matched, drain whatever is
-                                // queued and then break to the epilogue — no
-                                // further tokens are processed.
+                                // A stop matched on this token: emit the
+                                // queued pre-stop events, then read on.
                                 if stop_hit {
                                     if let Some(ev) = queue.pop_front() {
-                                        // Emit the queued pre-stop delta, then
-                                        // re-enter with the rest pending and the
-                                        // token stream exhausted on next poll.
                                         pending = queue;
                                         return Some((
                                             ev,
                                             AnthropicState::Streaming {
-                                                token_stream: futures::stream::empty().boxed(),
+                                                token_stream,
                                                 parser,
                                                 output_tokens,
                                                 finish_reason,
@@ -677,7 +684,10 @@ pub(super) async fn generate_streaming(
                                             },
                                         ));
                                     }
-                                    break;
+                                    if tok.done {
+                                        break;
+                                    }
+                                    continue;
                                 }
 
                                 // If this token produced no visible events

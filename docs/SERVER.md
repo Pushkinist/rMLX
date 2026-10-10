@@ -255,6 +255,14 @@ the replayed token, so `logprobs.content` is one entry short. See
 A stop token ([`MODELS.md`](MODELS.md) § "Overview", end of turn) ends a generation
 and adds no text.
 
+`usage.completion_tokens` is the number of tokens the model generated, also
+in the usage chunk of a stream: each decode step counts once, a reasoning
+token and the end-of-turn token included. A reply that ends on `max_tokens`
+reports at most `max_tokens`. A `stop` string cuts the text, not the count:
+the engine runs to the end of the generation and every step counts. The
+`tokens_out` counter and the `completion_tokens_live` metric carry the same
+figure.
+
 **JSON-mode reply.** With `response_format` `json_object` or `json_schema`,
 `content` is the answer text from the byte at which the grammar engaged
 ([`SAMPLING.md`](SAMPLING.md) § "Non-enforcement is reported") to its end,
@@ -321,9 +329,15 @@ content at the first match, on both surfaces, streaming or not:
 - Matching runs on the detokenized text, so a stop string that straddles a
   token boundary is found.
 - Streaming holds back a tail that could still grow into a stop string, so a
-  straddling stop is never half-emitted, and nothing follows the stop.
+  straddling stop is never half-emitted, and no content follows the stop.
 - Only the content channel is matched; reasoning is not.
 - A response carrying tool calls is not truncated.
+- The engine does not know the stop strings. After a match it generates to the
+  end, up to `max_tokens` or the end-of-turn token, and `usage` counts every
+  step. Both streams send their finish events when the generation ends, not at
+  the match, so the client waits for the engine after a match. The Anthropic
+  stream emits nothing more after the match. The OpenAI stream still emits
+  reasoning and tool-call deltas.
 
 `rmlx_server::stop_matcher` holds the matcher: `find_stop_match` for
 non-streaming and `StopMatcher` for streaming. An empty stop string is
@@ -495,7 +509,8 @@ generator. See [Session cache](#session-cache).
 
 The `thinking` block appears only when the model produced reasoning text, the
 `tool_use` block only for a parsed tool call. `input` is a JSON object, not the
-JSON string OpenAI puts in `arguments`.
+JSON string OpenAI puts in `arguments`. `usage.output_tokens` counts as
+`completion_tokens` does, also in the `message_delta` event of a stream.
 
 **Streaming** follows the Anthropic protocol: `message_start`, a `ping`, then
 per block `content_block_start`, `content_block_delta` and

@@ -23,7 +23,7 @@ use super::audio::{build_audio_prompt, AudioBundle};
 use super::generator::Generator;
 use super::helpers::{
     compute_itl_stats, is_reconstructible_tool_marker, record_itl_percentiles,
-    resolve_kv_quant_for_load, spsc_ts,
+    resolve_kv_quant_for_load, spsc_ts, terminal_item,
 };
 use super::image::{build_image_prompt, run_qwen3vl_image, VisionBundle};
 use super::think::ThinkSplitter;
@@ -860,7 +860,7 @@ impl Generator for ArchGenerator {
             // Full-prefix decode → byte-diff with UTF-8 token-healing,
             // owned by `StreamingDetokenizer`. `step` returns "" when the
             // current token leaves a multi-byte codepoint incomplete; the
-            // tail is flushed once at end-of-stream into the `done` sentinel.
+            // tail is flushed once at end-of-stream onto the terminal item.
             // `step_fn` returns `Option<u32>` — the mlx-vlm
             // `ThinkingBudgetCriteria.__call__` contract. `Some(id)` asks
             // the decode loop to force `id` as the NEXT decode input,
@@ -1518,47 +1518,12 @@ impl Generator for ArchGenerator {
                     } else {
                         "length".to_owned()
                     };
-                    // Flush any withheld multi-byte tail before the
-                    // sentinel. Non-empty only when generation genuinely
-                    // ended mid-codepoint (lossy-replace per mlx-lm
-                    // `_try_flush(force=True)`); normally empty. Sent as a
-                    // regular content delta so the SSE/Anthropic handlers
-                    // include it; `is_thinking=false` is correct here
-                    // because the rMLX reasoning archs split on the
-                    // `</think>` tag, never mid-codepoint.
-                    if !cancelled {
-                        match detok.finalize(&tokenizer) {
-                            Ok(tail) if !tail.is_empty() => {
-                                let _ = tx.blocking_send(Ok(GenerationToken {
-                                    token_id: last_id,
-                                    piece: tail,
-                                    done: false,
-                                    finish_reason: None,
-                                    is_thinking: false,
-                                    logprobs: None,
-                                }));
-                            }
-                            Ok(_) => {}
-                            Err(e) => tracing::debug!(
-                                error = ?e,
-                                "detok.finalize error, dropping tail"
-                            ),
-                        }
-                    }
-                    // Send a done=true sentinel so the SSE consumer can set
-                    // finish_reason. piece is empty — no visible delta content.
-                    let done_tok = GenerationToken {
-                        token_id: last_id,
-                        piece: String::new(),
-                        done: true,
-                        finish_reason: Some(finish_reason),
-                        // Terminal sentinel always lives on the
-                        // content channel; SSE handlers skip empty pieces
-                        // anyway and only honour `finish_reason` here.
-                        is_thinking: false,
-                        logprobs: None,
-                    };
-                    let _ = tx.blocking_send(Ok(done_tok));
+                    let _ = tx.blocking_send(Ok(terminal_item(
+                        &mut detok,
+                        &tokenizer,
+                        last_id,
+                        finish_reason,
+                    )));
                     tracing::debug!(model_id = %model_id_for_log, "generate: blocking thread done");
                 }
             }

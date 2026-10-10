@@ -20,7 +20,7 @@ use crate::openai::ItlSample;
 use super::generator::Generator;
 use super::helpers::{
     compute_itl_stats, is_reconstructible_tool_marker, record_itl_percentiles,
-    resolve_kv_quant_for_load, spsc_ts,
+    resolve_kv_quant_for_load, spsc_ts, terminal_item,
 };
 use super::think::ThinkSplitter;
 use super::types::{GenerationRequest, GenerationToken, ModelLoadConfig};
@@ -1197,37 +1197,12 @@ impl Generator for SpeculativeGenerator {
                             });
                         }
                     }
-                    // Flush any withheld multi-byte tail (see
-                    // ArchGenerator site for rationale).
-                    if !cancelled {
-                        match detok.finalize(&tokenizer) {
-                            Ok(tail) if !tail.is_empty() => {
-                                let _ = tx.blocking_send(Ok(GenerationToken {
-                                    token_id: last_id,
-                                    piece: tail,
-                                    done: false,
-                                    finish_reason: None,
-                                    is_thinking: false,
-                                    logprobs: None,
-                                }));
-                            }
-                            Ok(_) => {}
-                            Err(e) => tracing::debug!(
-                                error = ?e,
-                                "detok.finalize error, dropping tail"
-                            ),
-                        }
-                    }
-                    let done_tok = GenerationToken {
-                        token_id: last_id,
-                        piece: String::new(),
-                        done: true,
-                        finish_reason: Some(finish_reason),
-                        // See ArchGenerator done-token comment.
-                        is_thinking: false,
-                        logprobs: None,
-                    };
-                    let _ = tx.blocking_send(Ok(done_tok));
+                    let _ = tx.blocking_send(Ok(terminal_item(
+                        &mut detok,
+                        &tokenizer,
+                        last_id,
+                        finish_reason,
+                    )));
                     tracing::debug!(model_id = %model_id_for_log, "spec generate: blocking thread done");
                 }
             }

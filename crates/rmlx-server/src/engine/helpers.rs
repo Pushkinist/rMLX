@@ -5,10 +5,13 @@
 //! - `is_reconstructible_tool_marker` — Gemma-4 tool protocol marker allowlist
 //! - `compute_itl_stats` — ITL percentile / mean / spike computation
 //! - `spsc_ts` — UTC timestamp string for SPSC metric events
+//! - `terminal_item` — the terminal item of a generation, with the detokenizer's tail
 
 use std::time::Instant;
 
 use rmlx_metrics::events::{EventRecorder, Measurement};
+
+use super::types::GenerationToken;
 
 // ── shared helper for ITL percentile events-table writes ───────────────
 
@@ -260,6 +263,23 @@ pub(crate) fn compute_itl_stats(timestamps: &[Instant]) -> Option<(f64, f64, f64
 /// Return an ISO-8601 UTC timestamp string for SPSC metric events.
 pub(crate) fn spsc_ts() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// The terminal item of a generation. The multi-byte character that the
+/// detokenizer still holds back rides on it (non-empty only when the
+/// generation ended inside one; lossy-replace per mlx-lm
+/// `_try_flush(force=True)`), on the content channel.
+pub(crate) fn terminal_item(
+    detok: &mut crate::detokenizer::StreamingDetokenizer,
+    tokenizer: &tokenizers::Tokenizer,
+    last_id: u32,
+    finish_reason: String,
+) -> GenerationToken {
+    let tail = detok.finalize(tokenizer).unwrap_or_else(|e| {
+        tracing::debug!(error = ?e, "detok.finalize error, dropping tail");
+        String::new()
+    });
+    GenerationToken::terminal(last_id, finish_reason, tail)
 }
 
 #[cfg(test)]

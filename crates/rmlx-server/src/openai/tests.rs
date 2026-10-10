@@ -1394,7 +1394,7 @@ fn h3_completion_tokens_counter_exact() {
         "completion_tokens must equal number of non-done tokens fed"
     );
 
-    // Done token (the 4th token).
+    // Terminal item after the third token.
     let done = GenerationToken {
         token_id: 3,
         piece: String::new(),
@@ -1405,13 +1405,13 @@ fn h3_completion_tokens_counter_exact() {
     };
     handle_streaming_token(Ok(done), &mut state);
     assert_eq!(
-        state.completion_tokens, 4,
-        "done token must also increment the counter"
+        state.completion_tokens, 3,
+        "the terminal item must not increment the counter"
     );
 }
 
 /// Proxy: completion_tokens accumulates correctly with
-/// `max_tokens` = 2 (only 2 non-done tokens + 1 done).
+/// `max_tokens` = 2 (2 non-done tokens, then the terminal item).
 #[test]
 fn h3_completion_tokens_two_tokens() {
     let mut state = usage_stream_state(7, false);
@@ -1439,7 +1439,7 @@ fn h3_completion_tokens_two_tokens() {
         }),
         &mut state,
     );
-    assert_eq!(state.completion_tokens, 3);
+    assert_eq!(state.completion_tokens, 2);
 }
 
 /// When `include_usage = true`, the `done` token produces TWO SSE
@@ -1490,7 +1490,7 @@ fn h4_usage_chunk_emitted_when_include_usage_true() {
     // comparing against the event's data bytes via the debug repr.
     // The debug repr escapes inner quotes as `\"`, so we check for the
     // escaped form of each expected substring.
-    let expected_completion: u32 = 3;
+    let expected_completion: u32 = 2;
     let expected_total = prompt_tokens + expected_completion;
     // Build the canonical expected chunk (same code path as production).
     let expected_usage_chunk = ChatCompletionChunk {
@@ -1730,11 +1730,11 @@ fn f14_lifetime_counters_incremented_at_done_boundary() {
         &mut state,
     );
 
-    // prompt_tokens=7, completion_tokens=4 (3 non-done + 1 done).
+    // prompt_tokens=7, completion_tokens=3 (the terminal item is not counted).
     assert_eq!(tokens_in.load(Ordering::Relaxed), 7, "tokens_in after done");
     assert_eq!(
         tokens_out.load(Ordering::Relaxed),
-        4,
+        3,
         "tokens_out after done"
     );
 }

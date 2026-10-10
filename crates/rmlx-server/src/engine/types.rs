@@ -578,7 +578,10 @@ pub struct GenerationToken {
     pub token_id: u32,
     /// Decoded text fragment for this token (may be empty for special tokens).
     pub piece: String,
-    /// `true` on the final token of the stream; subsequent tokens must not be consumed.
+    /// `true` on the terminal item of the stream, which follows the last
+    /// decode step. It carries the finish reason and the bytes left over when
+    /// the generation ended inside a multi-byte character (`piece`, empty
+    /// otherwise). It is no generated token; later items must not be consumed.
     pub done: bool,
     /// `"stop"` | `"length"` | `None` (only set when `done == true`)
     pub finish_reason: Option<String>,
@@ -592,4 +595,26 @@ pub struct GenerationToken {
     /// raw `ProbeStep` logprobs (token-id + logprob pairs) into token-surface
     /// strings inside the engine `step_fn`, where the tokenizer is in scope.
     pub logprobs: Option<crate::openai::ChatLogprobContent>,
+}
+
+impl GenerationToken {
+    /// The terminal item of a generation. `tail` is the text the detokenizer
+    /// still held back at the end of the stream (empty when none).
+    #[must_use]
+    pub fn terminal(token_id: u32, finish_reason: String, tail: String) -> Self {
+        Self {
+            token_id,
+            piece: tail,
+            done: true,
+            finish_reason: Some(finish_reason),
+            is_thinking: false,
+            logprobs: None,
+        }
+    }
+
+    /// `true` when this item is a generated token that `usage` counts. The
+    /// terminal item is not one, also when it carries text.
+    pub(crate) fn counts_toward_usage(&self) -> bool {
+        !self.done
+    }
 }

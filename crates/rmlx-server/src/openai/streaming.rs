@@ -218,6 +218,7 @@ pub(crate) fn handle_streaming_token(
         Ok(t) => t,
     };
     let done = tok.done;
+    let counts_toward_usage = tok.counts_toward_usage();
     let finish = tok.finish_reason.clone();
     let is_thinking = tok.is_thinking;
     // wrap this token's logprob record (if any) for the content chunk.
@@ -236,9 +237,11 @@ pub(crate) fn handle_streaming_token(
         "sse: handling token"
     );
 
-    // Count every token (including thinking tokens and the done marker)
-    // to mirror the non-streaming counter in `generate_blocking`.
-    state.completion_tokens += 1;
+    // Count every generated token, thinking tokens included, as
+    // `generate_blocking` does. The terminal item is not one.
+    if counts_toward_usage {
+        state.completion_tokens += 1;
+    }
 
     let mut out: Vec<Result<Event, std::convert::Infallible>> = Vec::new();
 

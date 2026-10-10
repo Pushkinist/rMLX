@@ -918,3 +918,38 @@ fn open_prefill_still_starts_the_splitter_in_reasoning_mode() {
         ]
     );
 }
+
+// ── Usage accounting ─────────────────────────────────────────
+
+fn token_item(piece: &str, done: bool) -> GenerationToken {
+    GenerationToken {
+        token_id: 7,
+        piece: piece.to_owned(),
+        done,
+        finish_reason: done.then(|| "stop".to_owned()),
+        is_thinking: false,
+        logprobs: None,
+    }
+}
+
+/// A decode step counts, also when it adds no text (the end-of-turn token);
+/// the terminal item does not, also when it carries text.
+#[test]
+fn the_terminal_item_alone_is_not_counted_toward_usage() {
+    assert!(token_item("hi", false).counts_toward_usage());
+    assert!(token_item("", false).counts_toward_usage());
+    assert!(!token_item("", true).counts_toward_usage());
+    assert!(!token_item("\u{FFFD}", true).counts_toward_usage());
+}
+
+/// The terminal item carries the finish reason and the withheld tail, on the
+/// content channel, and is not counted.
+#[test]
+fn the_terminal_item_carries_the_tail_and_the_finish_reason() {
+    let item = GenerationToken::terminal(7, "length".to_owned(), "\u{FFFD}".to_owned());
+    assert!(item.done);
+    assert_eq!(item.piece, "\u{FFFD}");
+    assert_eq!(item.finish_reason.as_deref(), Some("length"));
+    assert!(!item.is_thinking);
+    assert!(!item.counts_toward_usage());
+}

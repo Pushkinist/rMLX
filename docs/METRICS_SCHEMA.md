@@ -599,6 +599,24 @@ kinds. The rows are inside their bounds, so a predicate names each.
   ```sql
   SELECT * FROM observations WHERE decode_config LIKE 'eagle/%';
   ```
+- **`completion_tokens_live` one too high.** Every release up to 0.4.3 counted
+  the terminal item of a generation as a token, so each row is the generated
+  token count plus one, or plus two when the generation ended inside a
+  multi-byte character, except a `/v1/messages` stream whose `stop_sequences`
+  matched: that row is the number of steps up to the match, lower than the
+  generated count. The server now counts decode steps only. A build of
+  the fixed tree that has not been released still reports `0.4.3`, so the
+  predicate also finds its rows.
+
+  ```sql
+  SELECT * FROM observations
+  WHERE metric = 'completion_tokens_live'
+    AND backend = 'rmlx'
+    AND backend_version IN ('0.1.0', '0.1.1', '0.2.0', '0.2.1', '0.2.2',
+                            '0.2.3', '0.2.4', '0.2.5', '0.2.6', '0.2.7',
+                            '0.2.8', '0.3.0', '0.4.0', '0.4.1', '0.4.2',
+                            '0.4.3');
+  ```
 
 Read a recorded rate through `bests` or a `query::*` function; both apply
 the bound. A consumer that needs the raw distribution, such as a median over

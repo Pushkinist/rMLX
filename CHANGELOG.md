@@ -135,6 +135,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that held the text. The span now holds `text_len`, and `voice` once it
   names a speaker of the model. Eight requests with inputs up to 16 MiB
   write a 19.6 KB log with no input text.
+- **`completion_tokens` is the number of generated tokens.** The engine ends
+  every generation with a terminal item that is no token, and the server
+  counted it. A reply that ended on `max_tokens` reported `max_tokens + 1`,
+  and a reply that ended on the end-of-turn token reported one more than it
+  had tokens. This held for `usage.completion_tokens` of
+  `/v1/chat/completions`, `usage.output_tokens` of `/v1/messages`, streamed
+  or not, the `tokens_out` counter and the `completion_tokens_live` metric.
+  Each decode step now counts once, the end-of-turn token and the reasoning
+  tokens included. A `length` reply reports at most `max_tokens`, also when
+  it ends inside a multi-byte character: the leftover bytes now ride on the
+  terminal item and no longer arrive as an extra item. A `/v1/messages`
+  stream whose `stop_sequences` matched stopped counting at the match; it now
+  reads the generation to its end and counts it as the other paths do. The
+  engine does not know stop strings and runs to the end of the generation, so
+  that stream now sends `message_delta` and `message_stop` when the engine
+  ends (as the OpenAI stream and both non-streamed routes already did), not
+  at the match: the client waits longer after the match and receives no more
+  text. The text of a reply and its `finish_reason` do not change. Every
+  `completion_tokens_live` row that an earlier release recorded is too high
+  by one, or by two for a reply that ended inside a multi-byte character,
+  except a row of a `/v1/messages` stream whose `stop_sequences` matched:
+  that row is the number of steps up to the match, lower than the generated
+  count (`METRICS_SCHEMA.md` lists the predicate).
 
 ## [0.4.3] - 2026-10-09
 

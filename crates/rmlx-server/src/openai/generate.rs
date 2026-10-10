@@ -224,7 +224,9 @@ pub(super) async fn generate_blocking(
                         }
                     }
                 }
-                completion_tokens += 1;
+                if tok.counts_toward_usage() {
+                    completion_tokens += 1;
+                }
                 if tok.done {
                     finish_reason = tok.finish_reason;
                     break;

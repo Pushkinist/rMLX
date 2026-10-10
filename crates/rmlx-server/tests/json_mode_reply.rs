@@ -146,6 +146,7 @@ fn tokenizer_json() -> String {
 /// One generation: reasoning pieces, answer pieces, the terminal reason. A
 /// script with reasoning and an answer has one more token between the two:
 /// the token that closes the reasoning block, which carries no visible text.
+/// A `stop` script ends with the end-of-turn token, which carries none either.
 #[derive(Clone, Copy)]
 struct Script {
     thinking: &'static [&'static str],
@@ -163,7 +164,8 @@ impl Script {
 
     fn tokens(self) -> u64 {
         let close = usize::from(self.closes_its_reasoning());
-        (self.thinking.len() + close + self.answer.len() + 1) as u64
+        let end_of_turn = usize::from(self.finish == "stop");
+        (self.thinking.len() + close + self.answer.len() + end_of_turn) as u64
     }
 }
 
@@ -402,14 +404,14 @@ impl Generator for ScriptedGenerator {
             }
             seen.constraint_finished = Some(c.finished());
         }
-        toks.push(Ok(GenerationToken {
-            token_id: 0,
-            piece: String::new(),
-            done: true,
-            finish_reason: Some(self.script.finish.to_owned()),
-            is_thinking: false,
-            logprobs: None,
-        }));
+        if self.script.finish == "stop" {
+            toks.push(Ok(token(0, "", false)));
+        }
+        toks.push(Ok(GenerationToken::terminal(
+            0,
+            self.script.finish.to_owned(),
+            String::new(),
+        )));
 
         let Some(gate) = self.gate.clone() else {
             return Box::pin(stream::iter(toks));
