@@ -1216,6 +1216,23 @@ pub fn mlx_active_memory_bytes() -> Option<u64> {
     Some(res as u64)
 }
 
+/// Bytes of freed buffers that MLX's buffer allocator keeps for reuse.
+///
+/// Wraps `mlx_get_cache_memory`. Returns `None` if the C call reports an
+/// error. On this build the allocator serves the arrays of both devices, CPU
+/// arrays included. [`mlx_clear_cache`] frees them.
+pub fn mlx_cache_memory_bytes() -> Option<u64> {
+    install_error_handler();
+    let mut res: usize = 0;
+    // SAFETY: writing to a stack `usize` we own; `mlx_get_cache_memory` is
+    // thread-safe per mlx-c contract.
+    let status = unsafe { sys::mlx_get_cache_memory(&raw mut res) };
+    if status != 0 {
+        return None;
+    }
+    Some(res as u64)
+}
+
 /// Zero the Metal allocator's peak-memory high-water mark.
 ///
 /// Wraps `mlx_reset_peak_memory`. Returns `false` if the C call reports an
@@ -1237,7 +1254,8 @@ pub fn mlx_reset_peak_memory() -> bool {
 /// Free the buffers the Metal allocator keeps for reuse.
 ///
 /// Wraps `mlx_clear_cache`. Returns `false` if the C call reports an error.
-/// For memory measurement only; no engine path calls it. MLX gives a new array
+/// The speech frame loop calls it to bound the cache, and memory measurements
+/// call it to start from an empty one. MLX gives a new array
 /// a cached buffer of up to `min(2 * size, size + 2 pages)` bytes when it has
 /// one (`mlx/backend/common/buffer_cache.h`) and counts the length of that
 /// buffer, so what an earlier region freed moves the count of a later one.

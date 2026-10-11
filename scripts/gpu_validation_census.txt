@@ -107,11 +107,10 @@
 # `rmlx-mlx`'s `implicit_gemm_conv_tail_channel_reads_never_reach_the_output`
 # is bit-identical with the tail rows at NaN, +3e4 and -3e4.
 #
-# The hits in `rmlx-audio` and `rmlx-server` come from the Qwen3-TTS codec
-# decoder: 3 in `codec_decoder_debug`, and 3 per synthesis in the two
-# `rmlx-server` tests, which run their steps once on one thread for the oracle
-# and once across two threads (2 syntheses and 4). The offsets are the same two
-# in both crates (268800 and 279552, against an MTLBuffer of 262144 bytes).
+# The hits in `rmlx-server` come from the Qwen3-TTS codec decoder: 3 per
+# synthesis in the two `rmlx-server` tests, which run their steps once on one
+# thread for the oracle and once across two threads (2 syntheses and 4). The
+# offsets are two (268800 and 279552, against an MTLBuffer of 262144 bytes).
 #
 # WIDE GEMV, `gemv_wide_bfloat16_nv5_kl32_nc0_axpby0` and
 # `gemv_wide_bfloat16_nv4_kl32_nc0_axpby0` (MLX 0.32.1 and later). Two
@@ -167,7 +166,7 @@
 # diagnostic attributed to the test libtest last announced, on a host holding
 # every snapshot the suite resolves by slug, with threadgroup-memory validation
 # split per test (`scripts/gpu_test_threadgroup.sh`); every entry below comes
-# from a test that ran with it off. Totals: 3 conv in `rmlx-audio`, 4 conv in
+# from a test that ran with it off. Totals: 4 conv in
 # `rmlx-mlx`, 18 conv in `rmlx-server`, 4 gemv in `rmlx-models`.
 #
 # That run left thirteen cells standing down for want of `RMLX_KV_TEST_MODEL`
@@ -191,7 +190,6 @@
 # that announced in another form now use that form, so a whole run can list
 # more stand-downs than the seventeen above.
 implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s | device load | 4 | rmlx-mlx | implicit_gemm_conv_tail_channel_reads_never_reach_the_output | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
-implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s | device load | 3 | rmlx-audio | codec_decoder_debug | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
 implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s | device load | 6 | rmlx-server | tts_first_synthesis_runs_on_a_thread_that_did_not_load_it | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
 implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s | device load | 12 | rmlx-server | tts_synthesizes_on_a_thread_that_did_not_load_it | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
 gemv_wide_bfloat16_nv5_kl32_nc0_axpby0 | device load | <=10 | rmlx-models | the_assistant_round_loop_reproduces_plain_greedy | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/638

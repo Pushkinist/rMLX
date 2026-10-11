@@ -17,15 +17,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 const CHILD_MARKER: &str = "started-by-a-tts-device-parent-test";
-const CHILD_DONE: &str = "tts-device-child done";
+pub(super) const CHILD_DONE: &str = "tts-device-child done";
 /// Every key the loaders ask for is a one-element f32 tensor of this shape;
 /// the load-time transposes and codebook arithmetic accept it.
 const SHAPE: [usize; 3] = [1, 1, 1];
 
-fn run_child(name: &str) {
+/// Run the `#[ignore]`d child test `name` of the test module `module` in a
+/// process of its own.
+pub(super) fn run_child(module: &str, name: &str) {
     let out = Command::new(std::env::current_exe().unwrap())
         .args([
-            &format!("tts::tts_device_tests::{name}"),
+            &format!("tts::{module}::{name}"),
             CHILD_MARKER,
             "--exact",
             "--ignored",
@@ -44,7 +46,7 @@ fn run_child(name: &str) {
     );
 }
 
-fn started_by_parent() -> bool {
+pub(super) fn started_by_parent() -> bool {
     std::env::args().any(|arg| arg == CHILD_MARKER)
 }
 
@@ -148,7 +150,10 @@ fn loaded_cpu_model(dir: &Path) -> TtsModel {
 
 #[test]
 fn tts_codec_load_on_cpu_is_admitted() {
-    run_child("tts_codec_load_on_cpu_is_admitted_child");
+    run_child(
+        "tts_device_tests",
+        "tts_codec_load_on_cpu_is_admitted_child",
+    );
 }
 
 #[test]
@@ -166,7 +171,10 @@ fn tts_codec_load_on_cpu_is_admitted_child() {
 
 #[test]
 fn tts_synthesize_on_cpu_is_admitted() {
-    run_child("tts_synthesize_on_cpu_is_admitted_child");
+    run_child(
+        "tts_device_tests",
+        "tts_synthesize_on_cpu_is_admitted_child",
+    );
 }
 
 /// The synthetic weights are f32 where the talker's quantized linears expect

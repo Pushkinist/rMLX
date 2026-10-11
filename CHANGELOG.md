@@ -129,12 +129,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are now `{"error":{"message","type"}}`. A 500 has a fixed message: the
   cause, which named a local path before, is in the server log. The 422 no
   longer repeats the voice of the request.
+- **The text embeddings of a speech request no longer grow with the size of
+  its `input`.** `synthesize` embedded every token of the text, and the frame
+  loop reads at most 2048 of those rows, one per frame. One request that ran
+  to the frame cap peaked at 5.7 to 6.1 GiB for an `input` of 1 KiB to
+  256 KiB, 7.8 GiB at 1 MiB and 14.0 GiB at 4 MiB, and at 16 MiB the
+  footprint passed 48 GiB and the test server was stopped. `synthesize` now
+  embeds only the rows the loop can read. Eight such requests on one server,
+  1 KiB to 16 MiB, now peak at 5.68, 5.83, 4.62, 5.68, 6.33, 4.16, 5.40 and
+  4.73 GiB, with no trend with the size, and take 38.8 to 41.8 s each. A text
+  of up to 2048 tokens is embedded exactly as before, which is up to 2056
+  token ids with the chat template. A longer text embeds its first 2052
+  token ids, the same ids at the same rows. The audio bytes do not change.
+  The chat text and the tokenizer pass still grow with `input`.
 - **A speech request no longer writes its `input` to the server log.**
   `synthesize` opened a span that held the whole `input`, and every event
   inside the span printed it: one request with a 64 KiB `input` wrote 403 KB
   that held the text. The span now holds `text_len`, and `voice` once it
   names a speaker of the model. Eight requests with inputs up to 16 MiB
   write a 19.6 KB log with no input text.
+- **The buffer cache of a speech request no longer grows with the square of
+  its frame count, and the codec decode no longer takes all frames at once.**
+  The talker's key and value arrays were one position longer in each frame
+  and were copied again for the query heads. MLX serves a request from a
+  cached buffer only when that buffer is smaller than both twice the request
+  and the request plus two pages, so no buffer that a frame freed fitted a
+  later frame, and the cache grew with the square of the frame count. The
+  codec decoder was built for all frames at once. A request that ran to the
+  2048-frame cap took the footprint of the server past 70 GiB, and the test
+  server was stopped. The talker now keeps its keys and values in buffers
+  that grow by 256 rows and writes the rows of a frame into them in place,
+  and the attention reads them at their own head count. Between two growths
+  a frame asks for the buffer sizes of the frame before, so the cache serves
+  them and the frame leaves nothing behind. The frame loop releases the MLX
+  buffer cache after a frame in which the buffers grew and when it ends,
+  also after an error, and the key and value buffers end with the loop. The
+  live keys and values still grow with the frames, in steps of 256 rows. The
+  codec decode follows the reference: a sequence of up to 300 frames is one
+  pass, as before; a longer one is decoded in windows of 300 frames with 25
+  frames of left context, and each stage is evaluated and the cache released
+  before the next. Measured on Metal: a request that runs to the cap now
+  peaks at 4.34 and 4.36 GiB; its frame loop takes 34.7 s in both runs
+  (before: 42.1 and 42.6 s, in two runs that the host survived) and its codec
+  decode 3.4 s. A default request of 86 frames peaks at 3.0 GiB (before: 8.0
+  GiB). The frame loop of a request of 407 frames takes 6837 and 6887 ms
+  (before: 7144 and 7147 ms), and that of 421 frames 7032 and 7065 ms
+  (before: 7665 and 7668 ms). The codec decode of those two requests is
+  slower: 740 to 772 ms (before: 411 to 468 ms), in two windows with each
+  stage evaluated.
+  Seven fixed requests of 49 to 105 frames give the same WAV bytes as before.
+  Behaviour change: the audio of a request longer than 300 frames can differ
+  from the one-pass audio after the first window join, as in the reference
+  (`docs/AUDIO.md`, "Codec decoder"); its sample count does not change.
 - **`completion_tokens` is the number of generated tokens.** The engine ends
   every generation with a terminal item that is no token, and the server
   counted it. A reply that ended on `max_tokens` reported `max_tokens + 1`,

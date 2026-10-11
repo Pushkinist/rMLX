@@ -325,7 +325,8 @@ A Qwen3 transformer over the `talker.*` weights. Its dimensions come from
   space.
 - Attention: grouped-query, per-head Q/K RMSNorm, RoPE over sequential
   positions.
-- The KV cache grows by concatenation each step, unquantized.
+- The KV cache is unquantized. Each layer keeps its keys and values in two
+  buffers that grow by 256 rows (see "Memory").
 - `codec_head` predicts codec group 0.
 
 ### CodePredictor
@@ -335,7 +336,8 @@ last hidden state and group 0. None of its dimensions comes from the
 snapshot. Hidden size (1024) and layer count (5) are serde defaults of flat
 `talker_config` keys; the nested `code_predictor_config` block is not read.
 Heads (16), KV heads (8), head dim (128) and MLP width (3072) are constants in
-`load_talker_weights`. Its KV cache resets every frame.
+`load_talker_weights`. Its KV cache resets every frame and grows by
+concatenation, one step at a time.
 
 ### Generation loop
 
@@ -359,6 +361,74 @@ If the loop reaches the cap before the end token, `Synthesis::truncated` is
 `true`, and the audio is cut off. The speech route then sets the
 `x-rmlx-tts-truncated: true` header and logs a `warn` event with the frame
 count and the cap (`docs/SERVER_AUDIO.md`, "Text-to-speech").
+
+### Memory
+
+Each talker layer keeps its keys and its values in a buffer of shape
+`[1, kv_heads, capacity, head_dim]`. `KvSlot::update_and_fetch` writes the
+rows of a step into the buffers (`slice_update`) and returns views of the live
+rows. The attention reads the views with K and V at their own head count, so
+nothing is copied for the query heads. When the rows of a step do not fit, the
+capacity grows to the next multiple of `TALKER_KV_BLOCK_ROWS` (256) rows. The
+slot drops its handle of the old buffer before the step is evaluated and no
+other handle of it lives then, so MLX writes the rows in place. Rows of
+another dtype than the buffer are an error: `slice_update` would cast them.
+
+The buffers grow in blocks because of MLX's buffer cache. MLX serves a
+request from a cached buffer only when that buffer is at least as large and
+smaller than both twice the request and the request plus two pages (32 KiB).
+While the capacity stays, a frame asks for the buffer sizes that the frame
+before asked for, so the cache serves them and the frame leaves nothing
+behind. An array that is one row longer in each frame is never served from the
+cache: the freed ones pile up, the cache grows with the square of the frame
+count, and the live arrays stay small.
+
+A growth frees the buffers of the old capacity, and no later frame asks for
+that size. `run_frames` releases the cache (`mlx_clear_cache`) after a frame
+in which the capacity grew, once in 256 frames, and when the loop ends, by the
+end token, the cap or an error. There is no other release in the loop. The
+closure that `synthesize` gives it owns the key/value slots of the talker and
+of the code predictor, and `run_frames` drops it before that last release, so
+the codec decode starts with no key/value buffer and an empty cache. The live
+keys and values still grow with the frames, in steps of 256 rows; the cache
+does not. A growth logs a `debug` event with the new capacity and the live
+rows, and a release logs one with its reason. A request of 421 frames grows
+twice (to 256 rows at frame 0, to 512 rows at frame 248) and releases three
+times. The call takes the allocator's lock and evaluates nothing, so it runs
+on the calling thread. The cache is process-wide: a release also empties what
+a text model on the same server had cached, so that model allocates fresh
+buffers for its next steps instead of reusing those. The codec decode releases
+it much more often: after each stage of each pass (about twenty times a pass).
+
+The code predictor's slots start empty in every frame and hold at most 16
+rows. They grow by one row (`PREDICTOR_KV_BLOCK_ROWS`), which is a
+concatenation at each step, so their buffers have the same sizes in every
+frame.
+
+The codec decode bounds its memory by the window, not by the frame count; see
+"Codec decoder".
+
+The text embeddings are bounded by the frame cap, not by the length of
+`input`. Frame `i` reads row `i` of the trailing text: the text tokens after
+the first one, then the `tts_eos` row, then the `tts_pad` row. With at most
+`MAX_FRAMES` frames, a row at index 2048 or later is never read, and
+`text_rows` says which ids to embed. A text with up to 2047 trailing tokens is
+embedded whole: up to 2056 token ids, the five tail tokens included, and
+`tts_eos` follows its trailing rows. A longer text is cut to its first 2052
+token ids (three role tokens, the first text token and 2048 trailing ones) and
+has no `tts_eos` row, which no frame would reach. The chat text and the
+tokenizer pass still grow with the length of `input`.
+
+Measured on Metal (M5, 128 GB, `release-perf`,
+Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit):
+
+| Request | Peak footprint | Time |
+|---|---|---|
+| Default, 86 frames | 3.0 GiB | |
+| 407 frames | | frame loop 6837 and 6887 ms; request 8.24 and 8.30 s |
+| 421 frames | | frame loop 7032 and 7065 ms; request 7.78 and 7.84 s |
+| To the cap, 2048 frames, temperature 0 | 4.34 and 4.36 GiB | frame loop 34.7 s in both; request 38.8 s in both; codec decode 3.4 s |
+| To the cap, `input` of 1 KiB to 16 MiB, eight requests on one server | 5.68, 5.83, 4.62, 5.68, 6.33, 4.16, 5.40 and 4.73 GiB, no trend with the size | 38.8 to 41.8 s each |
 
 ### Sampling
 
@@ -444,6 +514,34 @@ The codes run at 12.5 Hz. The total upsample is 2·2·8·5·4·3 = 1920, and
 - **Conv weights** are stored in PyTorch layout and transposed on load:
   Conv1d `[out, in, k]` by axes `[0, 2, 1]`, ConvTranspose1d `[in, out, k]`
   by axes `[1, 2, 0]`, both to MLX `[out, k, in]`.
+
+**Windows.** `decode_in_chunks` decodes at most 300 codes (`DECODE_CHUNK_FRAMES`)
+in one pass. A sequence of up to 300 frames is one pass over all its codes. A
+longer one is decoded in windows of 300 frames. Each window after the first
+starts 25 frames early (`DECODE_LEFT_CONTEXT_FRAMES`), as left context, and
+the samples of those 25 frames are dropped, so the samples kept are those of
+the window's own frames and the total is frames x 1920. This is the rule of
+the reference, `chunked_decode` in mlx-audio `qwen3_tts/speech_tokenizer.py`,
+which uses a chunk of 300 frames and a left context of 25. A window sees only
+its own codes, so the audio of a sequence longer than 300 frames can differ
+from a one-pass decode near the joins. Measured on Metal at 407 and 421 frames
+(two passes each): the sample count and the transcription equal those of a
+one-pass decode, and there is no step at the join (the sample step at the join
+is 0.0017 of full scale, against a local median step of 0.0023). Before the
+join the two decodes agree within 1 LSB of 16-bit audio; after it the
+waveforms differ (rms of the difference 0.007 to 0.009, against a signal rms
+of 0.05 over the first 25 frames, lower after). A request of up to 300 frames
+gives the same samples as one pass. An empty sequence is an error.
+
+**Memory.** Inside a window, `decode_window` evaluates each stage (the
+pre-transformer, each upsample stage, the initial convolution, the decoder
+groups' upsample and each of their residual blocks, the output snake) and
+releases the MLX buffer cache before the next one, and the cache is released
+after every window and after a failed one. The memory of a decode is that of
+one window, not of the sequence. Evaluating an intermediate array does not
+change the arithmetic. The evaluations and releases cost time: measured on
+Metal at 407 and 421 frames, this decode takes 740 to 772 ms, and one pass
+with no release takes 411 to 468 ms.
 
 ---
 

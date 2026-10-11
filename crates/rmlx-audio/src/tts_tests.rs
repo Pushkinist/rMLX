@@ -1,9 +1,10 @@
 //! Qwen3-TTS unit tests.
 
 use super::{
-    load_codec_decoder, run_frames, synthesize, talker_allow_mask, FrameStep, PickHead, TokenPick,
-    TtsConfig, TtsError, TtsModel, TtsTokenizer, MAX_FRAMES,
+    run_frames, synthesize, talker_allow_mask, FrameStep, PickHead, TokenPick, TtsConfig, TtsError,
+    TtsModel, TtsTokenizer, MAX_FRAMES,
 };
+use super::{text_rows, TextRows, TEXT_HEAD_TOKENS, TEXT_TAIL_TOKENS};
 use rmlx_mlx::Array;
 
 /// A pick for synthesis calls that must fail before the first token.
@@ -41,9 +42,13 @@ fn talker_mask_blocks_specials_and_keeps_the_end_token() {
     }
 }
 
-fn frame(id: u32) -> FrameStep {
-    FrameStep::Frame(vec![id; 16])
+/// A step that made a frame and grew no key/value buffer.
+fn frame(id: u32) -> (FrameStep, bool) {
+    (FrameStep::Frame(vec![id; 16]), false)
 }
+
+/// A step in which the talker picked the end token.
+const END: (FrameStep, bool) = (FrameStep::End, false);
 
 /// A talker that never picks the end token runs to the cap, and the loop says so.
 #[test]
@@ -66,7 +71,7 @@ fn run_frames_stops_at_the_cap_and_reports_truncation() {
 /// The end token stops the loop at once and is not a frame.
 #[test]
 fn run_frames_stops_at_the_end_token() {
-    let frames = run_frames(|step| Ok(if step == 5 { FrameStep::End } else { frame(7) })).unwrap();
+    let frames = run_frames(|step| Ok(if step == 5 { END } else { frame(7) })).unwrap();
     assert_eq!(frames.codes.len(), 5);
     assert!(
         !frames.truncated,
@@ -79,7 +84,7 @@ fn run_frames_stops_at_the_end_token() {
 fn run_frames_end_token_on_the_last_step_is_not_truncated() {
     let frames = run_frames(|step| {
         Ok(if step == MAX_FRAMES - 1 {
-            FrameStep::End
+            END
         } else {
             frame(1)
         })
@@ -308,51 +313,242 @@ fn synthesize_records_a_known_voice_and_not_the_text() {
     );
 }
 
-/// Debug codec decoder: loads real weights and runs with fixed codes.
-/// Prints intermediate values so they can be compared with reference Python.
-/// Run with: cargo test -p rmlx-audio codec_decoder_debug -- --nocapture 2>&1 | grep -v "^running\|^test "
+/// Why the frame loop released the MLX buffer cache while `f` ran, one entry
+/// for each release, in order.
+fn release_reasons(f: impl FnOnce()) -> Vec<String> {
+    fields_recorded_by(f)
+        .into_iter()
+        .filter(|(name, _)| name == "reason")
+        .map(|(_, reason)| reason)
+        .collect()
+}
+
+const GROWTH_FRAMES: [usize; 3] = [0, 4, 9];
+
+/// A step that made a frame, and grew a key/value buffer in the frames of
+/// [`GROWTH_FRAMES`].
+fn frame_with_growth(step: usize) -> (FrameStep, bool) {
+    (FrameStep::Frame(vec![0; 16]), GROWTH_FRAMES.contains(&step))
+}
+
+/// The loop releases the cache once after each frame that grew a buffer and
+/// once when it ends, and at no other time.
 #[test]
-#[ignore = "requires real model weights at Open Models path; run manually for debugging"]
-fn codec_decoder_debug() {
-    // `<RMLX_O_MODELS_ROOT>/<slug>`, the join every other model-gated cell makes.
-    // The path this used to carry was relative to the process's working
-    // directory and resolved under no configuration this repo has, so the cell
-    // stood down on every host including the ones holding the snapshot.
-    let Some(root) = std::env::var_os("RMLX_O_MODELS_ROOT") else {
-        eprintln!("SKIP codec_decoder_debug: RMLX_O_MODELS_ROOT is unset");
-        return;
+fn run_frames_releases_the_cache_after_each_growth_frame_and_at_the_end() {
+    for frames in [1, 5, 12] {
+        let reasons = release_reasons(|| {
+            let got = run_frames(|step| {
+                Ok(if step == frames {
+                    END
+                } else {
+                    frame_with_growth(step)
+                })
+            })
+            .unwrap();
+            assert_eq!(got.codes.len(), frames);
+        });
+        let growths = GROWTH_FRAMES.iter().filter(|&&g| g < frames).count();
+        let mut want = vec!["capacity growth"; growths];
+        want.push("end of the loop");
+        assert_eq!(reasons, want, "{frames} frames");
+    }
+}
+
+/// A loop that runs to the cap releases as one that ends on the end token.
+#[test]
+fn run_frames_at_the_cap_releases_after_each_growth_frame_and_at_the_end() {
+    let reasons = release_reasons(|| {
+        let got = run_frames(|step| Ok(frame_with_growth(step))).unwrap();
+        assert!(got.truncated);
+    });
+    assert_eq!(
+        reasons,
+        [
+            "capacity growth",
+            "capacity growth",
+            "capacity growth",
+            "end of the loop"
+        ]
+    );
+}
+
+/// The end token in a step that grew a buffer: the release at the end covers it.
+#[test]
+fn run_frames_releases_once_when_the_last_step_grew_a_buffer() {
+    let reasons = release_reasons(|| {
+        run_frames(|_| Ok((FrameStep::End, true))).unwrap();
+    });
+    assert_eq!(reasons, ["end of the loop"]);
+}
+
+/// A failed step still releases the cache.
+#[test]
+fn run_frames_releases_the_cache_when_a_step_fails() {
+    let reasons = release_reasons(|| {
+        let result = run_frames(|step| {
+            if step == 2 {
+                Err(TtsError::Mlx("step failed".into()))
+            } else {
+                Ok(frame_with_growth(step))
+            }
+        });
+        assert!(result.is_err());
+    });
+    assert_eq!(reasons, ["capacity growth", "end of the loop"]);
+}
+
+/// Tokens of a chat text that holds `trailing` trailing text tokens: three role
+/// tokens, the first text token, the trailing ones and five tail tokens.
+const fn chat_tokens(trailing: usize) -> usize {
+    trailing + 9
+}
+
+/// A text of one token embeds whole and keeps no text row, only `tts_eos`.
+#[test]
+fn text_rows_keep_every_row_of_a_short_text() {
+    assert_eq!(
+        text_rows(chat_tokens(0)),
+        TextRows {
+            embed: 9,
+            trailing: 0,
+            eos: true
+        }
+    );
+    assert_eq!(
+        text_rows(chat_tokens(100)),
+        TextRows {
+            embed: 109,
+            trailing: 100,
+            eos: true
+        }
+    );
+}
+
+/// Frame `i` reads row `i`: one row less than the cap leaves room for `tts_eos`
+/// at index `cap - 1`; at the cap `tts_eos` would be row `cap`, which no frame
+/// reads.
+#[test]
+fn text_rows_drop_tts_eos_only_when_no_frame_reaches_it() {
+    assert_eq!(
+        text_rows(chat_tokens(MAX_FRAMES - 1)),
+        TextRows {
+            embed: chat_tokens(MAX_FRAMES - 1),
+            trailing: MAX_FRAMES - 1,
+            eos: true
+        }
+    );
+    let at_cap = TextRows {
+        embed: 4 + MAX_FRAMES,
+        trailing: MAX_FRAMES,
+        eos: false,
     };
-    let codec_path = std::path::Path::new(&root)
-        .join("mlx-community__Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit")
-        .join("speech_tokenizer");
-    if !codec_path.exists() {
-        eprintln!(
-            "SKIP codec_decoder_debug: no codec decoder at {}",
-            codec_path.display()
+    assert_eq!(text_rows(chat_tokens(MAX_FRAMES)), at_cap);
+    assert_eq!(text_rows(chat_tokens(MAX_FRAMES + 1)), at_cap);
+}
+
+/// The rows kept do not grow with the length of the text.
+#[test]
+fn text_rows_of_a_very_long_text_stay_at_the_cap() {
+    let long = text_rows(chat_tokens(4_000_000));
+    assert_eq!(long.embed, 4 + MAX_FRAMES);
+    assert_eq!(long.trailing, MAX_FRAMES);
+    assert!(!long.eos);
+}
+
+/// A chat text of fewer than nine tokens has no trailing text token. The chat
+/// template rules it out with the model's tokenizer; another `tokenizer.json`
+/// can give it. `text_rows` keeps the whole text and no trailing row, with
+/// `tts_eos` as the first row the loop reads. `synthesize` does not refuse
+/// such a text: it embeds the ids it was given, and its trailing slice, from
+/// row `TEXT_HEAD_TOKENS` on, is empty. `tts_synthesize_on_cpu_is_admitted`
+/// runs it on such a text, the stub tokenizer's, up to the embedding.
+#[test]
+fn text_rows_of_a_text_shorter_than_the_template_keep_it_whole() {
+    let d = rmlx_mlx::Device::Cpu;
+    let template_tokens = TEXT_HEAD_TOKENS + TEXT_TAIL_TOKENS;
+    let head = TEXT_HEAD_TOKENS as i32;
+    for tokens in 0..template_tokens {
+        let rows = text_rows(tokens);
+        assert_eq!(
+            rows,
+            TextRows {
+                embed: tokens,
+                trailing: 0,
+                eos: true
+            },
+            "{tokens} tokens"
         );
-        return;
+        let embedded = Array::from_f32_slice(&vec![0.0; tokens], &[1, tokens as i32, 1]).unwrap();
+        let trailing_end = head + rows.trailing as i32;
+        let kept = embedded.slice(&[0, head, 0], &[1, trailing_end, 1], &[1, 1, 1], d);
+        assert_eq!(kept.unwrap().shape(), [1, 0, 1], "{tokens} tokens");
     }
+    let stub_chat_text = TtsTokenizer::stub()
+        .encode("<|im_start|>assistant\nhello<|im_end|>\n<|im_start|>assistant\n")
+        .unwrap();
+    assert!(
+        stub_chat_text.len() < template_tokens,
+        "{} tokens",
+        stub_chat_text.len()
+    );
+}
 
-    let d = rmlx_mlx::Device::Gpu;
-    let decoder = load_codec_decoder(&codec_path, d).expect("load codec decoder");
+/// Where the text row that frame `frame` reads comes from.
+#[derive(Debug, PartialEq, Eq)]
+enum RowSource {
+    Token(usize),
+    Eos,
+    Pad,
+}
 
-    // codes: [1, 16, 12] — code 100 for semantic, 50 for acoustic (same as Python reference)
-    let t = 12i32;
-    let mut codes_data = vec![0i32; 16 * 12];
-    for item in codes_data.iter_mut().take(12) {
-        *item = 100; // semantic code
+/// The loop's read of the full trailing layout: text tokens `4 .. tokens - 5`,
+/// then `tts_eos`, then the pad row.
+fn row_read_in_full_layout(frame: usize, tokens: usize) -> RowSource {
+    let trailing = tokens - 9;
+    match frame {
+        f if f < trailing => RowSource::Token(4 + f),
+        f if f == trailing => RowSource::Eos,
+        _ => RowSource::Pad,
     }
-    for i in 1..16 {
-        for j in 0..12 {
-            codes_data[i * 12 + j] = 50; // acoustic codes
+}
+
+/// The same read of the kept layout.
+fn row_read_in_kept_layout(frame: usize, rows: &TextRows) -> RowSource {
+    match frame {
+        f if f < rows.trailing => RowSource::Token(4 + f),
+        f if f == rows.trailing && rows.eos => RowSource::Eos,
+        _ => RowSource::Pad,
+    }
+}
+
+/// For every length of text, every frame the loop runs reads the same row from
+/// the kept layout as from the full one, and the kept layout holds the ids it
+/// names.
+#[test]
+fn text_rows_leave_every_row_a_frame_reads_unchanged() {
+    let lengths = (9..=MAX_FRAMES + 40).chain([10_000, 1_000_000]);
+    for tokens in lengths {
+        let rows = text_rows(tokens);
+        assert!(4 + rows.trailing <= rows.embed, "{tokens}: {rows:?}");
+        assert!(rows.embed <= tokens, "{tokens}: {rows:?}");
+        for frame in 0..MAX_FRAMES {
+            assert_eq!(
+                row_read_in_kept_layout(frame, &rows),
+                row_read_in_full_layout(frame, tokens),
+                "{tokens} tokens, frame {frame}"
+            );
         }
     }
-    let codes = Array::from_i32_slice(&codes_data, &[1, 16, t]).expect("build codes array");
+}
 
-    let samples = decoder.debug_decode(&codes, d).expect("debug decode");
-    eprintln!(
-        "samples len={} rms={:.6}",
-        samples.len(),
-        (samples.iter().map(|x| x * x).sum::<f32>() / samples.len() as f32).sqrt()
-    );
+/// A text whose trailing rows and `tts_eos` fit is embedded whole, ids and
+/// count unchanged, so its rows are the ones that a full embed gives.
+#[test]
+fn text_rows_embed_a_text_that_fits_whole() {
+    for tokens in 9..(MAX_FRAMES + 9) {
+        let rows = text_rows(tokens);
+        assert_eq!(rows.embed, tokens);
+        assert_eq!(rows.trailing, tokens - 9);
+        assert!(rows.eos);
+    }
 }

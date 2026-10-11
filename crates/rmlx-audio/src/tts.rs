@@ -38,13 +38,14 @@ use std::time::Instant;
 
 use rmlx_loader::{load_shard_index, view, ShardSet};
 use rmlx_mlx::{
-    add, concatenate, conv1d, conv_transpose1d, cos, divide, exp, gelu, matmul, maximum, multiply,
-    negative, quantized_matmul, rms_norm, scalar_f32, scaled_dot_product_attention, silu, sin,
-    sqrt, subtract, sum_axis_keepdims, tanh, Array, Device,
+    add, concatenate, conv1d, conv_transpose1d, cos, divide, exp, gelu, matmul, maximum,
+    mlx_clear_cache, multiply, negative, quantized_matmul, rms_norm, scalar_f32,
+    scaled_dot_product_attention, silu, sin, sqrt, subtract, sum_axis_keepdims, tanh, zeros, Array,
+    Device,
 };
 use thiserror::Error;
 use tracing::field::Empty;
-use tracing::{debug, info, info_span, instrument};
+use tracing::{debug, info, info_span, instrument, warn};
 
 // ── Error ─────────────────────────────────────────────────────────────────────
 
@@ -288,36 +289,124 @@ impl RmsNormLayer {
     }
 }
 
-// ── KV slot (simple slice-based cache for short TTS sequences) ────────────────
+// ── KV slot ───────────────────────────────────────────────────────────────────
 
+/// Rows that a talker key/value buffer grows by.
+///
+/// While the capacity stays, every buffer a frame asks for has the size the
+/// frame before asked for, so MLX's buffer cache serves it and the frame
+/// leaves nothing behind. Only a growth frees buffers that no later frame can
+/// use, and the frame loop releases the cache then: once in 256 frames. A
+/// buffer holds at most 255 unused rows. mlx-lm's `KVCache` grows by the same
+/// step.
+const TALKER_KV_BLOCK_ROWS: i32 = 256;
+
+/// Rows that a code predictor key/value buffer grows by.
+///
+/// The code predictor starts every frame from an empty cache and holds at most
+/// [`CODE_GROUPS`] rows, so a step of one row gives every frame the same
+/// buffer sizes and each update is one concatenation. A larger step was
+/// measured to leave a buffer in the cache every few frames.
+const PREDICTOR_KV_BLOCK_ROWS: i32 = 1;
+
+/// The keys and values of one attention layer: `[B, kv_heads, capacity, D]`
+/// buffers of which the first `rows` rows are live.
 struct KvSlot {
     k: Option<Array>,
     v: Option<Array>,
+    rows: i32,
+    capacity: i32,
+    block_rows: i32,
 }
 
 impl KvSlot {
-    fn new() -> Self {
-        Self { k: None, v: None }
+    fn new(block_rows: i32) -> Self {
+        Self {
+            k: None,
+            v: None,
+            rows: 0,
+            capacity: 0,
+            block_rows,
+        }
     }
 
+    /// Append `new_k` and `new_v`, of any row count, and return the live rows
+    /// of both.
+    ///
+    /// Rows that fit the capacity are written into the buffer. The slot drops
+    /// its handle of the old buffer before it returns, so the write is in
+    /// place when the caller holds no other handle of it at evaluation. Rows
+    /// that do not fit grow the capacity to the next multiple of the block.
+    /// Rows that fit and have another dtype than the buffer are an error.
     fn update_and_fetch(
         &mut self,
         new_k: &Array,
         new_v: &Array,
         d: Device,
     ) -> Result<(Array, Array), TtsError> {
-        let k = match &self.k {
-            None => new_k.try_clone()?,
-            Some(prev) => concatenate(&[prev, new_k], 2, d)?,
+        let rows = self.rows + new_k.shape()[2];
+        let capacity = if rows > self.capacity {
+            (rows + self.block_rows - 1) / self.block_rows * self.block_rows
+        } else {
+            self.capacity
         };
-        let v = match &self.v {
-            None => new_v.try_clone()?,
-            Some(prev) => concatenate(&[prev, new_v], 2, d)?,
-        };
-        self.k = Some(k.try_clone()?);
-        self.v = Some(v.try_clone()?);
-        Ok((k, v))
+        let k = self.appended(self.k.as_ref(), new_k, rows, capacity, d)?;
+        let v = self.appended(self.v.as_ref(), new_v, rows, capacity, d)?;
+        let live = (live_rows(&k, rows, d)?, live_rows(&v, rows, d)?);
+        self.k = Some(k);
+        self.v = Some(v);
+        self.rows = rows;
+        self.capacity = capacity;
+        Ok(live)
     }
+
+    /// `buffer` with `new` after its live rows, `rows` live rows in all, in a
+    /// buffer of `capacity` rows.
+    fn appended(
+        &self,
+        buffer: Option<&Array>,
+        new: &Array,
+        rows: i32,
+        capacity: i32,
+        d: Device,
+    ) -> Result<Array, TtsError> {
+        let mut shape = new.shape();
+        match buffer {
+            Some(buffer) if capacity == self.capacity => {
+                // `slice_update` casts the rows to the dtype of the buffer, so
+                // rows of another dtype would be narrowed with no error.
+                if new.dtype() != buffer.dtype() {
+                    return Err(TtsError::Mlx(format!(
+                        "key/value rows of dtype {:?} cannot be written into a buffer of dtype {:?}",
+                        new.dtype(),
+                        buffer.dtype()
+                    )));
+                }
+                shape[2] = rows;
+                Ok(buffer.slice_update(new, &[0, 0, self.rows, 0], &shape, &[1; 4], d)?)
+            }
+            _ => {
+                let live = buffer
+                    .map(|buffer| live_rows(buffer, self.rows, d))
+                    .transpose()?;
+                let unused = if capacity > rows {
+                    shape[2] = capacity - rows;
+                    Some(zeros(&shape, new.dtype(), d)?)
+                } else {
+                    None
+                };
+                let parts: Vec<&Array> = live.iter().chain([new]).chain(&unused).collect();
+                Ok(concatenate(&parts, 2, d)?)
+            }
+        }
+    }
+}
+
+/// The first `rows` rows of a `[B, kv_heads, capacity, D]` buffer, as a view.
+fn live_rows(buffer: &Array, rows: i32, d: Device) -> Result<Array, TtsError> {
+    let mut stop = buffer.shape();
+    stop[2] = rows;
+    Ok(buffer.slice(&[0; 4], &stop, &[1; 4], d)?)
 }
 
 // ── RoPE helpers ─────────────────────────────────────────────────────────────
@@ -443,45 +532,12 @@ impl TalkerAttn {
         let q = apply_rope(&q, &cos_, &sin_, d)?;
         let k = apply_rope(&k, &cos_, &sin_, d)?;
 
-        // KV cache: concat along seq dim (axis=2)
         let (k, v) = kv.update_and_fetch(&k, &v, d)?;
 
-        // GQA: repeat k/v n_groups times along the head axis.
-        let n_groups = (self.n_heads / self.n_kv_heads) as usize;
-        let total_s = k.shape()[2];
-        let (k_rep, v_rep) = if n_groups > 1 {
-            // [B, kh, S, D] → [B, kh, 1, S, D] → concatenate ng times → [B, kh*ng, S, D]
-            let k_4 = k.reshape(&[b, kh, 1, total_s, hd], d)?;
-            let v_4 = v.reshape(&[b, kh, 1, total_s, hd], d)?;
-            let mut k_rows: Vec<Array> = Vec::with_capacity(n_groups);
-            let mut v_rows: Vec<Array> = Vec::with_capacity(n_groups);
-            for _ in 0..n_groups {
-                k_rows.push(k_4.slice(
-                    &[0, 0, 0, 0, 0],
-                    &[b, kh, 1, total_s, hd],
-                    &[1, 1, 1, 1, 1],
-                    d,
-                )?);
-                v_rows.push(v_4.slice(
-                    &[0, 0, 0, 0, 0],
-                    &[b, kh, 1, total_s, hd],
-                    &[1, 1, 1, 1, 1],
-                    d,
-                )?);
-            }
-            let k_refs: Vec<&Array> = k_rows.iter().collect();
-            let v_refs: Vec<&Array> = v_rows.iter().collect();
-            let k5 = concatenate(&k_refs, 2, d)?.reshape(&[b, h, total_s, hd], d)?;
-            let v5 = concatenate(&v_refs, 2, d)?.reshape(&[b, h, total_s, hd], d)?;
-            (k5, v5)
-        } else {
-            (k.try_clone()?, v.try_clone()?)
-        };
-
-        // SDPA with causal masking — required for correct prefill of the autoregressive talker.
-        // "causal" mode applies triangular attention mask internally; safe for single-token
-        // decode steps too (trivially causal).
-        let out = scaled_dot_product_attention(&q, &k_rep, &v_rep, self.scale, "causal", None, d)?;
+        // K and V keep their own head count: the attention pairs each of their
+        // heads with its group of query heads. The causal mask is needed for
+        // the prefill; a decode step has one query row, which reads every key.
+        let out = scaled_dot_product_attention(&q, &k, &v, self.scale, "causal", None, d)?;
         // [B, H, S, D] → [B, S, H*D]
         let out = out
             .transpose(&[0, 2, 1, 3], d)?
@@ -951,13 +1007,79 @@ struct DecoderGroup {
 
 impl DecoderGroup {
     fn forward(&self, x: &Array, d: Device) -> Result<Array, TtsError> {
-        let mut h = self.snake_in.forward(x, d)?;
-        h = self.upsample.forward(&h, d)?;
+        let mut h = settle(self.upsample.forward(&self.snake_in.forward(x, d)?, d)?)?;
         for rb in &self.res_blocks {
-            h = rb.forward(&h, d)?;
+            h = settle(rb.forward(&h, d)?)?;
         }
         Ok(h)
     }
+}
+
+/// Codes decoded in one pass, and codes of left context that each later pass
+/// also decodes and drops. Both are the reference's:
+/// `chunked_decode` and `streaming_decode` in mlx-audio
+/// `qwen3_tts/speech_tokenizer.py` (chunk 300, left context 25).
+const DECODE_CHUNK_FRAMES: usize = 300;
+const DECODE_LEFT_CONTEXT_FRAMES: usize = 25;
+
+/// Evaluate `x` and release the MLX buffer cache.
+fn settle(x: Array) -> Result<Array, TtsError> {
+    x.eval()?;
+    release_buffer_cache();
+    Ok(x)
+}
+
+/// Decode `codes: [1, 16, T]` with `window` in passes of at most
+/// [`DECODE_CHUNK_FRAMES`] frames. A pass after the first starts
+/// [`DECODE_LEFT_CONTEXT_FRAMES`] frames early, or at frame 0 when fewer
+/// precede it, and its first samples, the context's, are dropped. `window`
+/// maps `[1, 16, W]` codes to a multiple of `W` samples. A sequence of at most
+/// one chunk is one pass, as a decode of the whole sequence. The MLX buffer
+/// cache is released after every pass, and after a failed one.
+///
+/// No frame is an error, as the decoder's first convolution refuses it.
+/// `synthesize` never reaches it: the end token is masked before `MIN_FRAMES`.
+fn decode_in_chunks(
+    codes: &Array,
+    d: Device,
+    window: impl FnMut(&Array) -> Result<Vec<f32>, TtsError>,
+) -> Result<Vec<f32>, TtsError> {
+    decode_passes(codes, d, window).inspect_err(|_| release_buffer_cache())
+}
+
+fn decode_passes(
+    codes: &Array,
+    d: Device,
+    mut window: impl FnMut(&Array) -> Result<Vec<f32>, TtsError>,
+) -> Result<Vec<f32>, TtsError> {
+    let groups = codes.shape()[1];
+    let total = codes.shape()[2] as usize;
+    if total == 0 {
+        return Err(TtsError::Mlx(
+            "the codec decoder needs at least one frame".into(),
+        ));
+    }
+    let mut samples = Vec::new();
+    let mut start = 0;
+    while start < total {
+        let end = (start + DECODE_CHUNK_FRAMES).min(total);
+        let context = start.min(DECODE_LEFT_CONTEXT_FRAMES);
+        let first = (start - context) as i32;
+        let codes_window = codes.slice(&[0, 0, first], &[1, groups, end as i32], &[1, 1, 1], d)?;
+        let frames = end - start + context;
+        let decoded = window(&codes_window)?;
+        if decoded.len() % frames != 0 {
+            return Err(TtsError::Mlx(format!(
+                "a window of {frames} frames decoded to {} samples, not a multiple of {frames}",
+                decoded.len()
+            )));
+        }
+        let per_frame = decoded.len() / frames;
+        samples.extend_from_slice(&decoded[context * per_frame..]);
+        release_buffer_cache();
+        start = end;
+    }
+    Ok(samples)
 }
 
 /// Full codec decoder.
@@ -988,7 +1110,16 @@ pub(crate) struct CodecDecoder {
 
 impl CodecDecoder {
     /// Decode `codes: [1, 16, T]` (16 codec groups) to audio `[T * upsample]`.
+    /// A long sequence is decoded in overlapping windows ([`decode_in_chunks`]).
     fn decode(&self, codes: &Array, d: Device) -> Result<Vec<f32>, TtsError> {
+        decode_in_chunks(codes, d, |window| self.decode_window(window, d))
+    }
+
+    /// Decode one window of `codes: [1, 16, W]` in one pass. Each stage is
+    /// evaluated and the MLX buffer cache released before the next one is
+    /// built, so a window holds one stage's buffers at a time, not the whole
+    /// decoder's.
+    fn decode_window(&self, codes: &Array, d: Device) -> Result<Vec<f32>, TtsError> {
         // Step 1: VQ dequantization → [1, T, 512]
         let t = codes.shape()[2];
         let first_codes = codes.slice(&[0, 0, 0], &[1, 1, t], &[1, 1, 1], d)?;
@@ -1021,7 +1152,7 @@ impl CodecDecoder {
         let mut hidden = add(&first_q, &rest_q, d)?;
 
         // Step 2: pre_conv k=3 causal (padding=2) → [1, T, 1024]
-        hidden = self.pre_conv.forward(&hidden, 1, d)?;
+        hidden = settle(self.pre_conv.forward(&hidden, 1, d)?)?;
 
         // Step 3: pre_transformer: input_proj → 8 layers → norm → output_proj
         let h_proj = {
@@ -1037,27 +1168,26 @@ impl CodecDecoder {
             h = layer.forward(&h, 0, d)?;
         }
         h = self.pre_trans_norm.forward(&h, d)?;
-        hidden = {
+        hidden = settle({
             let y = matmul(&h, &self.pre_trans_output.w.transpose(&[1, 0], d)?, d)?;
             if let Some(b) = &self.pre_trans_output.b {
                 add(&y, b, d)?
             } else {
                 y
             }
-        };
+        })?;
 
         // Step 4: 2× upsample (ConvT1d stride=2 + ConvNeXt)
         for (conv_t, conv_next) in &self.upsample {
-            hidden = conv_t.forward(&hidden, d)?;
-            hidden = conv_next.forward(&hidden, d)?;
+            hidden = settle(conv_next.forward(&conv_t.forward(&hidden, d)?, d)?)?;
         }
 
         // Step 5: initial_conv (k=7 causal, 1024→1536) → 4 groups → output_snake → output_conv
-        hidden = self.initial_conv.forward(&hidden, 1, d)?;
+        hidden = settle(self.initial_conv.forward(&hidden, 1, d)?)?;
         for group in &self.groups {
             hidden = group.forward(&hidden, d)?;
         }
-        hidden = self.output_snake.forward(&hidden, d)?;
+        hidden = settle(self.output_snake.forward(&hidden, d)?)?;
         hidden = self.output_conv.forward(&hidden, 1, d)?;
 
         // Step 6: tanh clip → extract samples
@@ -1072,102 +1202,6 @@ impl CodecDecoder {
                 f32::from_le_bytes(audio_bytes[i * 4..i * 4 + 4].try_into().unwrap_or([0u8; 4]))
             })
             .collect();
-        Ok(samples)
-    }
-    /// Debug decode: dumps intermediate values to stderr for comparison with reference Python.
-    /// Only compiled in test builds.
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn debug_decode(&self, codes: &Array, d: Device) -> Result<Vec<f32>, TtsError> {
-        fn dump(label: &str, x: &Array) {
-            x.eval().ok();
-            let bytes = x.to_bytes().unwrap_or_default();
-            let n = (bytes.len() / 4).min(5);
-            let first5: Vec<f32> = (0..n)
-                .map(|i| f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap_or([0u8; 4])))
-                .collect();
-            let shape: Vec<i32> = (0..x.ndim()).map(|i| x.shape()[i]).collect();
-            eprintln!("{label}: shape={shape:?} first5={first5:.6?}");
-        }
-
-        let t = codes.shape()[2];
-        let first_codes = codes.slice(&[0, 0, 0], &[1, 1, t], &[1, 1, 1], d)?;
-        let first_codes_2d = first_codes.reshape(&[1, t], d)?;
-        let first_emb = self.rvq_first_cb.decode(&first_codes_2d, d)?;
-        let first_q = self.rvq_first_output.forward(&first_emb, 1, d)?;
-
-        let mut rest_sum = {
-            let c = codes.slice(&[0, 1, 0], &[1, 2, t], &[1, 1, 1], d)?;
-            let c2d = c.reshape(&[1, t], d)?;
-            self.rvq_rest_cbs[0].decode(&c2d, d)?
-        };
-        for i in 1..15usize {
-            let c = codes.slice(&[0, i as i32 + 1, 0], &[1, i as i32 + 2, t], &[1, 1, 1], d)?;
-            let c2d = c.reshape(&[1, t], d)?;
-            let emb = self.rvq_rest_cbs[i].decode(&c2d, d)?;
-            rest_sum = add(&rest_sum, &emb, d)?;
-        }
-        let rest_q = self.rvq_rest_output.forward(&rest_sum, 1, d)?;
-        let mut hidden = add(&first_q, &rest_q, d)?;
-        dump("VQ combined NLC", &hidden);
-
-        hidden = self.pre_conv.forward(&hidden, 1, d)?;
-        dump("pre_conv", &hidden);
-
-        let h_proj = {
-            let y = matmul(&hidden, &self.pre_trans_input.w.transpose(&[1, 0], d)?, d)?;
-            if let Some(b) = &self.pre_trans_input.b {
-                add(&y, b, d)?
-            } else {
-                y
-            }
-        };
-        let mut h = h_proj;
-        for layer in &self.pre_trans_layers {
-            h = layer.forward(&h, 0, d)?;
-        }
-        h = self.pre_trans_norm.forward(&h, d)?;
-        hidden = {
-            let y = matmul(&h, &self.pre_trans_output.w.transpose(&[1, 0], d)?, d)?;
-            if let Some(b) = &self.pre_trans_output.b {
-                add(&y, b, d)?
-            } else {
-                y
-            }
-        };
-        dump("pre_transformer", &hidden);
-
-        for (i, (conv_t, conv_next)) in self.upsample.iter().enumerate() {
-            hidden = conv_t.forward(&hidden, d)?;
-            dump(&format!("upsample[{i}][0]"), &hidden);
-            hidden = conv_next.forward(&hidden, d)?;
-            dump(&format!("upsample[{i}][1]"), &hidden);
-        }
-
-        hidden = self.initial_conv.forward(&hidden, 1, d)?;
-        dump("initial_conv", &hidden);
-        for (i, group) in self.groups.iter().enumerate() {
-            hidden = group.forward(&hidden, d)?;
-            dump(&format!("decoder_group[{i}]"), &hidden);
-        }
-        hidden = self.output_snake.forward(&hidden, d)?;
-        dump("output_snake", &hidden);
-        hidden = self.output_conv.forward(&hidden, 1, d)?;
-        dump("output_conv", &hidden);
-
-        let audio = tanh(&hidden, d)?;
-        audio.eval()?;
-        let audio_bytes = audio.to_bytes()?;
-        let n = audio_bytes.len() / 4;
-        let samples: Vec<f32> = (0..n)
-            .map(|i| {
-                f32::from_le_bytes(audio_bytes[i * 4..i * 4 + 4].try_into().unwrap_or([0u8; 4]))
-            })
-            .collect();
-        eprintln!("Final samples: len={} rms={:.6}", samples.len(), {
-            let sq: f32 = samples.iter().map(|x| x * x).sum::<f32>() / samples.len() as f32;
-            sq.sqrt()
-        });
         Ok(samples)
     }
 }
@@ -2068,6 +2102,50 @@ pub fn talker_allow_mask(vocab: usize, eos_id: u32) -> Vec<bool> {
         .collect()
 }
 
+/// Role tokens at the start of the chat text.
+const TEXT_ROLE_TOKENS: usize = 3;
+
+/// Chat-template tokens before the trailing text: the role tokens and the
+/// first text token.
+const TEXT_HEAD_TOKENS: usize = TEXT_ROLE_TOKENS + 1;
+
+/// Chat-template tokens after the text.
+const TEXT_TAIL_TOKENS: usize = 5;
+
+/// What `synthesize` embeds of the chat text: the rows the frame loop can read.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct TextRows {
+    /// Leading token ids to embed.
+    pub(crate) embed: usize,
+    /// Trailing text rows kept, starting at token [`TEXT_HEAD_TOKENS`].
+    pub(crate) trailing: usize,
+    /// The `tts_eos` row follows the trailing rows.
+    pub(crate) eos: bool,
+}
+
+/// The rows of a chat text of `token_count` ids that the frame loop can read.
+///
+/// Frame `i` reads row `i` of the trailing text (the text rows, then the
+/// `tts_eos` row), and there are at most [`MAX_FRAMES`] frames, so a row at
+/// index [`MAX_FRAMES`] or later is never read. A text whose trailing rows and
+/// `tts_eos` fit in [`MAX_FRAMES`] rows is embedded whole.
+pub(crate) fn text_rows(token_count: usize) -> TextRows {
+    let trailing = token_count.saturating_sub(TEXT_HEAD_TOKENS + TEXT_TAIL_TOKENS);
+    if trailing < MAX_FRAMES {
+        TextRows {
+            embed: token_count,
+            trailing,
+            eos: true,
+        }
+    } else {
+        TextRows {
+            embed: TEXT_HEAD_TOKENS + MAX_FRAMES,
+            trailing: MAX_FRAMES,
+            eos: false,
+        }
+    }
+}
+
 /// The result of one talker step.
 #[derive(Debug)]
 pub(crate) enum FrameStep {
@@ -2085,13 +2163,43 @@ pub(crate) struct Frames {
     pub(crate) truncated: bool,
 }
 
+fn release_buffer_cache() {
+    if !mlx_clear_cache() {
+        warn!("releasing the MLX buffer cache failed");
+    }
+}
+
+/// Release the MLX buffer cache from the frame loop and log why.
+fn release_frame_cache(reason: &'static str) {
+    debug!(reason, "the frame loop releases the MLX buffer cache");
+    release_buffer_cache();
+}
+
 /// Run `step` until it returns [`FrameStep::End`] or [`MAX_FRAMES`] frames exist.
+///
+/// `step` returns its frame and whether a talker key/value buffer grew its
+/// capacity in it. A growth frees buffers of a size that no later frame asks
+/// for, so the MLX buffer cache is released after such a frame, and once when
+/// the loop ends, by the end token, the cap or an error.
+///
+/// `step` is dropped before that last release: the buffers it owns are freed
+/// into the cache first, and the release returns them with the rest.
 pub(crate) fn run_frames(
-    mut step: impl FnMut(usize) -> Result<FrameStep, TtsError>,
+    mut step: impl FnMut(usize) -> Result<(FrameStep, bool), TtsError>,
+) -> Result<Frames, TtsError> {
+    let frames = frame_loop(&mut step);
+    drop(step);
+    release_frame_cache("end of the loop");
+    frames
+}
+
+fn frame_loop(
+    step: &mut impl FnMut(usize) -> Result<(FrameStep, bool), TtsError>,
 ) -> Result<Frames, TtsError> {
     let mut codes = Vec::new();
     for index in 0..MAX_FRAMES {
-        match step(index)? {
+        let (outcome, kv_grew) = step(index)?;
+        match outcome {
             FrameStep::Frame(frame) => codes.push(frame),
             FrameStep::End => {
                 return Ok(Frames {
@@ -2099,6 +2207,9 @@ pub(crate) fn run_frames(
                     truncated: false,
                 })
             }
+        }
+        if kv_grew {
+            release_frame_cache("capacity growth");
         }
     }
     Ok(Frames {
@@ -2258,12 +2369,15 @@ pub fn synthesize(
     // Chat template: <|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n
     let chat_text = format!("<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n");
     let text_ids = tokenizer.encode(&chat_text)?;
-    let text_ids_arr = Array::from_i32_slice(
-        &text_ids.iter().map(|&x| x as i32).collect::<Vec<_>>(),
-        &[1, text_ids.len() as i32],
-    )?;
+    let rows = text_rows(text_ids.len());
+    let embedded_ids: Vec<i32> = text_ids
+        .iter()
+        .take(rows.embed)
+        .map(|&x| x as i32)
+        .collect();
+    let text_ids_arr = Array::from_i32_slice(&embedded_ids, &[1, rows.embed as i32])?;
 
-    // text_embed: [1, S, hidden]
+    // text_embed: [1, rows.embed, hidden]
     let text_embed = talker.embed_text(&text_ids_arr, d)?;
 
     // TTS special tokens: [bos, eos, pad]
@@ -2328,11 +2442,14 @@ pub fn synthesize(
         codec_embed_full.slice(&[0, 0, 0], &[1, prefix_len - 1, h], &[1, 1, 1], d)?;
     let combined = add(&combined, &codec_prefix_slice, d)?;
 
+    let role_end = TEXT_ROLE_TOKENS as i32;
+    let head_end = TEXT_HEAD_TOKENS as i32;
+
     // role_embed: text_embed[:, :3, :]
-    let role_embed = text_embed.slice(&[0, 0, 0], &[1, 3, h], &[1, 1, 1], d)?;
+    let role_embed = text_embed.slice(&[0, 0, 0], &[1, role_end, h], &[1, 1, 1], d)?;
 
     // first text token: text_embed[:, 3:4, :] + codec_embed_full[:, -1:, :]
-    let first_text = text_embed.slice(&[0, 3, 0], &[1, 4, h], &[1, 1, 1], d)?;
+    let first_text = text_embed.slice(&[0, role_end, 0], &[1, head_end, h], &[1, 1, 1], d)?;
     let codec_last =
         codec_embed_full.slice(&[0, prefix_len - 1, 0], &[1, prefix_len, h], &[1, 1, 1], d)?;
     let first_text_combined = add(&first_text, &codec_last, d)?;
@@ -2340,12 +2457,17 @@ pub fn synthesize(
     // input_embeds: role + combined + first_text_combined
     let input_embeds = concatenate(&[&role_embed, &combined, &first_text_combined], 1, d)?;
 
-    // trailing_text_hidden: text_embed[:, 4:-5, :] + tts_eos
-    let text_len = text_embed.shape()[1];
-    let trailing_text = text_embed.slice(&[0, 4, 0], &[1, text_len - 5, h], &[1, 1, 1], d)?;
-    // tts_eos needs to be 3D: [1, 1, h]
-    let tts_eos_3d = tts_eos.slice(&[0, 0, 0], &[1, 1, h], &[1, 1, 1], d)?;
-    let trailing_text_hidden = concatenate(&[&trailing_text, &tts_eos_3d], 1, d)?;
+    // trailing_text_hidden: text_embed[:, 4:-5, :] + tts_eos, cut to the rows the loop reads
+    let trailing_end = head_end + rows.trailing as i32;
+    let trailing_text =
+        text_embed.slice(&[0, head_end, 0], &[1, trailing_end, h], &[1, 1, 1], d)?;
+    let trailing_text_hidden = if rows.eos {
+        // tts_eos needs to be 3D: [1, 1, h]
+        let tts_eos_3d = tts_eos.slice(&[0, 0, 0], &[1, 1, h], &[1, 1, 1], d)?;
+        concatenate(&[&trailing_text, &tts_eos_3d], 1, d)?
+    } else {
+        trailing_text
+    };
 
     // ── Generation loop ────────────────────────────────────────────────────────
 
@@ -2355,8 +2477,12 @@ pub fn synthesize(
     // KV caches: one per talker layer, one set per CP layer
     let n_talker = tcfg.num_hidden_layers;
     let n_cp = tcfg.code_predictor_num_hidden_layers;
-    let mut talker_kv: Vec<KvSlot> = (0..n_talker).map(|_| KvSlot::new()).collect();
-    let mut cp_kv: Vec<KvSlot> = (0..n_cp).map(|_| KvSlot::new()).collect();
+    let mut talker_kv: Vec<KvSlot> = (0..n_talker)
+        .map(|_| KvSlot::new(TALKER_KV_BLOCK_ROWS))
+        .collect();
+    let mut cp_kv: Vec<KvSlot> = (0..n_cp)
+        .map(|_| KvSlot::new(PREDICTOR_KV_BLOCK_ROWS))
+        .collect();
 
     let mut history: Vec<u32> = Vec::new();
     let mut trailing_idx = 0usize;
@@ -2369,10 +2495,26 @@ pub fn synthesize(
         "starting Qwen3-TTS generation loop"
     );
 
-    let frames = run_frames(|step| {
+    // The closure owns the key/value slots and the other state of the loop,
+    // so `run_frames` frees them before the codec decode starts.
+    let frames = run_frames(move |step| {
         let seq_len = cur_input.shape()[1];
+        // Every talker slot takes the same rows, so the first one stands for all.
+        let capacity_before = talker_kv.first().map_or(0, |slot| slot.capacity);
         let (logits, hidden) = talker.forward(&cur_input, &mut talker_kv, talker_offset, d)?;
         talker_offset += seq_len;
+        let kv_grew = match talker_kv.first() {
+            Some(slot) if slot.capacity > capacity_before => {
+                debug!(
+                    step,
+                    capacity = slot.capacity,
+                    live_rows = slot.rows,
+                    "the talker key/value buffers grew"
+                );
+                true
+            }
+            _ => false,
+        };
         let talker_row = last_position(&logits, d)?;
 
         let mut cp_offset = 0i32;
@@ -2385,10 +2527,7 @@ pub fn synthesize(
             |code_idx, previous| {
                 let cp_input = if code_idx == 0 {
                     // Each frame starts the CodePredictor from an empty cache.
-                    for kv in &mut cp_kv {
-                        kv.k = None;
-                        kv.v = None;
-                    }
+                    cp_kv.fill_with(|| KvSlot::new(PREDICTOR_KV_BLOCK_ROWS));
                     // Project talker hidden [1,1,2048] → CP hidden [1,1,1024] via small_to_mtp.
                     let hidden_proj = talker
                         .code_pred
@@ -2424,7 +2563,7 @@ pub fn synthesize(
 
         let FrameStep::Frame(code_tokens) = &outcome else {
             debug!(step, "TTS EOS received");
-            return Ok(outcome);
+            return Ok((outcome, kv_grew));
         };
 
         // Build next input_embeds for talker
@@ -2461,7 +2600,7 @@ pub fn synthesize(
         if step % 50 == 0 && step > 0 {
             debug!(step, "TTS generation step");
         }
-        Ok(outcome)
+        Ok((outcome, kv_grew))
     })?;
 
     let n_frames = frames.codes.len();
@@ -2506,3 +2645,15 @@ mod tts_device_tests;
 #[cfg(test)]
 #[path = "tts_frame_tests.rs"]
 mod tts_frame_tests;
+
+#[cfg(test)]
+#[path = "tts_kv_tests.rs"]
+mod tts_kv_tests;
+
+#[cfg(test)]
+#[path = "tts_memory_tests.rs"]
+mod tts_memory_tests;
+
+#[cfg(test)]
+#[path = "tts_chunk_tests.rs"]
+mod tts_chunk_tests;
