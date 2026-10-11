@@ -35,7 +35,7 @@ pub(crate) mod state;
 pub(crate) mod streaming;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 // ── Public API surface (frozen — matches lib.rs pub use) ─────────────────────
 

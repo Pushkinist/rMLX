@@ -9,6 +9,7 @@
     reason = "test assertions: a failed setup step is a test failure"
 )]
 
+use super::tts_tests::NoPick;
 use super::{synthesize, TtsConfig, TtsError, TtsModel, TtsTokenizer};
 use rmlx_mlx::Device;
 
@@ -181,7 +182,13 @@ fn tts_synthesize_on_cpu_is_admitted_child() {
     rmlx_mlx::forbid_gpu().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let mut model = loaded_cpu_model(dir.path());
-    let result = synthesize("hello", "serena", &mut model, &TtsTokenizer::stub());
+    let result = synthesize(
+        "hello",
+        "serena",
+        &mut model,
+        &TtsTokenizer::stub(),
+        &mut NoPick,
+    );
     match result {
         Err(TtsError::Mlx(msg))
             if msg.contains("[quantized_matmul] The weight matrix should be uint32") => {}

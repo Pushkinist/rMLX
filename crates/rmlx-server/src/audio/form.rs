@@ -6,23 +6,16 @@ use axum::http::StatusCode;
 use rmlx_audio::transcribe::requested_language;
 use tracing::warn;
 
-use super::{too_large, unprocessable, Refusal, MAX_AUDIO_BYTES, MAX_REQUEST_BYTES};
+use super::{
+    cut, too_large, unprocessable, Refusal, LOGGED_NAME_BYTES, MAX_AUDIO_BYTES, MAX_REQUEST_BYTES,
+};
 
 /// The most parts a form may hold, the file included.
 const MAX_FORM_PARTS: usize = 64;
 
-/// The most bytes of an ignored field's name the log keeps.
-const LOGGED_NAME_BYTES: usize = 64;
-
 /// The most bytes the route keeps of a field other than `file`: more than any
 /// value it takes, so the refusals that echo a value stay short.
 const SHORT_FIELD_BYTES: usize = 64;
-
-/// The first `max` bytes of `text`, cut at a character boundary.
-pub(super) fn cut(text: &str, max: usize) -> &str {
-    text.get(..text.floor_char_boundary(max))
-        .unwrap_or_default()
-}
 
 /// The fields of a form the route does not read: how many, and the first
 /// names, each cut, for one log event of bounded size.

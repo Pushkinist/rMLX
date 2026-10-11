@@ -1,5 +1,6 @@
-//! Audio routes: `POST /v1/audio/transcriptions`, `/v1/audio/translations` and
-//! `/v1/audio/speech`. The fields, limits and statuses are in `docs/AUDIO.md`.
+//! Whisper routes: `POST /v1/audio/transcriptions` and `/v1/audio/translations`.
+//! The fields, limits and statuses are in `docs/AUDIO.md`. The speech route is
+//! in `speech`, the form reader in `form`.
 //!
 //! A transcription holds the GPU. It passes `admit_request`, then decodes the
 //! upload under the permit and before the model cache is read: decodes run one
@@ -21,15 +22,17 @@ use rmlx_audio::tokenizer::{TokenizerError, WhisperTask, WhisperTokenizer};
 use rmlx_audio::transcribe::{TranscribeOptions, Transcriber};
 use rmlx_audio::wav::{WavDecoder, WavError, MAX_AUDIO_SECS};
 use rmlx_audio::whisper::{WhisperError, WhisperModel};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info, instrument, warn};
 
 mod form;
+mod speech;
 
 use form::{parse_multipart, ResponseFormat};
+pub use speech::{audio_speech, LoadedTts, SpeechRequest};
 
 use crate::engine::{admit_request, Admission, GpuAdmission};
 use crate::openai::state::ApiErrorCategory;
@@ -41,6 +44,16 @@ const MAX_AUDIO_BYTES: usize = 25 * 1024 * 1024;
 /// The largest request body the server reads: an audio file at the cap, and
 /// 1 MiB for the other form fields and the multipart framing.
 pub(crate) const MAX_REQUEST_BYTES: usize = MAX_AUDIO_BYTES + 1024 * 1024;
+
+/// The most bytes the log keeps of a name the client gave: an ignored field's
+/// name, or a voice.
+const LOGGED_NAME_BYTES: usize = 64;
+
+/// The first `max` bytes of `text`, cut at a character boundary.
+fn cut(text: &str, max: usize) -> &str {
+    text.get(..text.floor_char_boundary(max))
+        .unwrap_or_default()
+}
 
 /// A refused request: its status, the text of its `{"error": …}` body, and
 /// whether the fault stays until the operator acts.
@@ -89,7 +102,7 @@ enum JobError {
 }
 
 /// The answer to a failed job. The file is the client's fault: 422. The rest is
-/// the server's: 503, the status `docs/SERVER.md` gives a load failure and
+/// the server's: 503, the status `docs/SERVER_AUDIO.md` gives a load failure and
 /// every other engine error. A load or init failure stays until the operator
 /// acts; an engine failure during the transcription may not recur.
 fn job_refusal(e: &JobError) -> Refusal {
@@ -459,260 +472,6 @@ fn build_response(
             text: text.to_owned(),
         })
         .into_response(),
-    }
-}
-
-// ── POST /v1/audio/speech (TTS) ───────────────────────────────────────────────
-//
-// Accepted body fields:
-//   model          — model identifier (e.g. "qwen3-tts", "tts-1")
-//   input          — text to synthesize
-//   voice          — voice name (see talker_config.spk_id in config.json)
-//                    Available: serena, vivian, ryan, aiden, eric, dylan, ono_anna, sohee, uncle_fu
-//   response_format — "wav" | "pcm" (default: "wav")
-//   speed           — 0.25–4.0 (default: 1.0; unused at v1 — codec speed is fixed)
-//
-// Output sample rate: 24 000 Hz (12.5 Hz token rate × 1920 upsample).
-
-/// Request body for `POST /v1/audio/speech`.
-#[derive(Debug, Deserialize)]
-pub struct SpeechRequest {
-    /// Model identifier (e.g. `"qwen3-tts"` or `"tts-1"`).
-    model: String,
-    /// Text to synthesize.
-    input: String,
-    /// Voice name. Available: serena, vivian, ryan, aiden, eric, dylan, ono_anna, sohee, uncle_fu.
-    #[serde(default = "default_voice")]
-    voice: String,
-    /// Output format: `"wav"` (default) or `"pcm"`.
-    #[serde(default = "default_response_format_speech")]
-    response_format: String,
-    /// Playback speed multiplier (0.25–4.0). Accepted but not applied at v1.
-    #[serde(default = "default_speed")]
-    #[allow(dead_code)]
-    speed: f32,
-}
-
-fn default_voice() -> String {
-    "serena".to_owned()
-}
-
-fn default_response_format_speech() -> String {
-    "wav".to_owned()
-}
-
-fn default_speed() -> f32 {
-    1.0
-}
-
-/// `POST /v1/audio/speech` — Qwen3-TTS speech synthesis.
-///
-/// Synthesizes mono 24 kHz PCM from text via the Qwen3-TTS talker + codec decoder.
-/// Returns `audio/wav` bytes on success.
-#[allow(clippy::cognitive_complexity)]
-#[instrument(skip_all, name = "audio_speech", level = "info")]
-pub async fn audio_speech(
-    State(state): State<AppState>,
-    Json(req): Json<SpeechRequest>,
-) -> Response {
-    info!(
-        model = req.model,
-        voice = req.voice,
-        input_len = req.input.len(),
-        "audio/speech request"
-    );
-
-    // 1. Check if TTS paths are configured at all.
-    let (Some(tts_model_path), Some(tts_tok_path)) =
-        (&state.tts_model_path, &state.tts_tokenizer_path)
-    else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "error": {
-                    "type": "not_supported",
-                    "message": "TTS not configured; set --tts-model-path and --tts-tokenizer-path"
-                }
-            })),
-        )
-            .into_response();
-    };
-
-    // 2. GPU admission — TTS holds Metal; go through the same FIFO gate as LLM/Whisper.
-    let guard =
-        match admit_request(&state.gpu_queue, &state.gpu_pending, state.max_queue_depth).await {
-            Admission::QueueFull => {
-                state.error_counts.increment(ApiErrorCategory::RateLimit);
-                return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(
-                    json!({"error": {"type": "rate_limit_error", "message": "server queue full"}}),
-                ),
-            )
-                .into_response();
-            }
-            Admission::Admitted {
-                guard,
-                depth,
-                wait_ms,
-            } => {
-                debug!(depth, wait_ms, "TTS request admitted");
-                guard
-            }
-        };
-
-    // 3. Move fields into the blocking closure.
-    let tts_model_cache = Arc::clone(&state.tts_model);
-    let tts_model_path = tts_model_path.clone();
-    let tts_tok_path = tts_tok_path.clone();
-    let voice = req.voice.clone();
-    let input = req.input.clone();
-    let response_format = req.response_format.clone();
-    let metrics_arc = state.metrics.clone();
-    let device = state.device;
-    let model_path_str = tts_model_path.to_string_lossy().into_owned();
-
-    let result = run_admitted(guard, move |_cancel| {
-        // Load or retrieve cached (model, tokenizer).
-        let t_load_start = std::time::Instant::now();
-        let mut load_ms_opt: Option<f64> = None;
-
-        let (model_mutex, tokenizer): (
-            Arc<parking_lot::Mutex<rmlx_audio::tts::TtsModel>>,
-            Arc<rmlx_audio::tts::TtsTokenizer>,
-        ) = {
-            let read_guard = tts_model_cache.read();
-            if let Some((ref m, ref t)) = *read_guard {
-                (Arc::clone(m), Arc::clone(t))
-            } else {
-                drop(read_guard);
-                let mut write_guard = tts_model_cache.write();
-                if let Some((ref m, ref t)) = *write_guard {
-                    (Arc::clone(m), Arc::clone(t))
-                } else {
-                    let m = rmlx_audio::tts::TtsModel::load_config(
-                        &tts_model_path,
-                        &tts_tok_path,
-                        device,
-                    )
-                    .map_err(|e| format!("tts config load: {e}"))?;
-                    // Text tokenizer lives in the talker model snapshot (vocab.json +
-                    // merges.txt), not in the codec-decoder path.
-                    let t = rmlx_audio::tts::TtsTokenizer::from_path(&tts_model_path)
-                        .map_err(|e| format!("tts tokenizer: {e}"))?;
-                    let m = Arc::new(parking_lot::Mutex::new(m));
-                    let t = Arc::new(t);
-                    *write_guard = Some((Arc::clone(&m), Arc::clone(&t)));
-                    load_ms_opt = Some(t_load_start.elapsed().as_secs_f64() * 1_000.0);
-                    (m, t)
-                }
-            }
-        };
-
-        // Synthesize.
-        let t_synth_start = std::time::Instant::now();
-        let (samples, sample_rate) = {
-            let mut model = model_mutex.lock();
-            rmlx_audio::tts::synthesize(&input, &voice, &mut model, &tokenizer)
-                .map_err(|e| format!("tts synthesize: {e}"))?
-        };
-        let synth_ms = t_synth_start.elapsed().as_secs_f64() * 1_000.0;
-
-        // Audio duration in seconds (for RTF).
-        let audio_dur_secs = samples.len() as f64 / f64::from(sample_rate);
-        let rtf = if audio_dur_secs > 0.0 {
-            synth_ms / 1_000.0 / audio_dur_secs
-        } else {
-            0.0
-        };
-
-        info!(
-            synth_ms = synth_ms as u64,
-            samples = samples.len(),
-            sample_rate,
-            rtf,
-            "TTS synthesis complete"
-        );
-
-        // Encode output.
-        let output_bytes: Vec<u8> = if response_format == "pcm" {
-            // Raw f32-LE PCM.
-            samples.iter().flat_map(|s| s.to_le_bytes()).collect()
-        } else {
-            // WAV (default).
-            rmlx_audio::wav::WavEncoder::encode(&samples, sample_rate, 1)
-                .map_err(|e| format!("wav encode: {e}"))?
-        };
-
-        // Emit metrics.
-        if let Some(sink) = &metrics_arc {
-            let metrics_to_record: &[(&str, &str, f64)] = &[
-                ("audio_synth_ms", "ms", synth_ms),
-                ("audio_rtf", "ratio", rtf),
-            ];
-            for (op, unit, value) in metrics_to_record {
-                if let Err(e) = sink.record(&rmlx_metrics::events::Measurement {
-                    model_path: &model_path_str,
-                    quant_mode: "none",
-                    stage: "tts",
-                    op,
-                    value_unit: unit,
-                    value: *value,
-                    notes: "",
-                }) {
-                    warn!(error = %e, op, "TTS metrics record failed (non-fatal)");
-                }
-            }
-            if let Some(load_ms) = load_ms_opt {
-                if let Err(e) = sink.record(&rmlx_metrics::events::Measurement {
-                    model_path: &model_path_str,
-                    quant_mode: "none",
-                    stage: "tts",
-                    op: "audio_load_ms",
-                    value_unit: "ms",
-                    value: load_ms,
-                    notes: "",
-                }) {
-                    warn!(error = %e, "TTS audio_load_ms record failed (non-fatal)");
-                }
-            }
-        }
-
-        Ok::<(Vec<u8>, String), String>((output_bytes, response_format))
-    })
-    .await;
-
-    match result {
-        Ok(Ok((bytes, fmt))) => {
-            let content_type = if fmt == "pcm" {
-                "audio/pcm"
-            } else {
-                "audio/wav"
-            };
-            (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, content_type)],
-                bytes,
-            )
-                .into_response()
-        }
-        Ok(Err(msg)) => {
-            warn!(error = msg, "TTS synthesis failed");
-            let status = if msg.contains("unknown voice") || msg.contains("UnknownVoice") {
-                StatusCode::UNPROCESSABLE_ENTITY
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            (status, Json(json!({"error": msg}))).into_response()
-        }
-        Err(e) => {
-            warn!(error = %e, "TTS task panicked");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal error"})),
-            )
-                .into_response()
-        }
     }
 }
 

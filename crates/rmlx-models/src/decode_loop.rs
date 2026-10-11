@@ -36,14 +36,14 @@
 
 use std::time::Instant;
 
-use rmlx_mlx::{argmax, Array, Device, Dtype};
+use rmlx_mlx::{Array, Device, Dtype};
 use tracing::info_span;
 
 use rmlx_core::error::{Error, Result};
 
 use crate::constraint::ConstraintEngine;
 use crate::sampler::{
-    apply_mask_argmax, compute_top_logprobs, Pcg32, PenaltyConfig, SamplerConfig, TokenLogprobs,
+    compute_top_logprobs, select_token, Pcg32, PenaltyConfig, SamplerConfig, TokenLogprobs,
 };
 use rmlx_kv_quant::KvCache;
 
@@ -320,10 +320,8 @@ pub(crate) fn capture_logprobs(
     compute_top_logprobs(logits_flat, chosen_id, k).ok()
 }
 
-/// Shared sampling fork: penalties → temperature/top-k/top-p OR argmax, with the
-/// optional constraint mask. Transplant of the ~60-line if/else duplicated at
-/// every prefill tail and inside every decode loop. Returns the chosen-token
-/// Array (possibly still lazy).
+/// Choose the next token with the request's sampler, under the optional
+/// constraint mask. Returns the chosen-token Array (possibly still lazy).
 ///
 /// `mask_active` is computed by the caller ONCE per iteration, BEFORE the
 /// pre-drain `constraint.advance()`. It MUST NOT be recomputed here:
@@ -338,7 +336,6 @@ pub(crate) fn capture_logprobs(
 /// `ctx.rng`). This function does NOT push to `token_history` — the caller
 /// materializes the id and pushes it (the loop's drain site, or the prefill
 /// tail). Never push in two places.
-#[allow(clippy::collapsible_else_if)]
 #[allow(
     clippy::indexing_slicing,
     reason = "win_start = len.saturating_sub(20) is <= len by construction, so [win_start..] never panics"
@@ -352,51 +349,23 @@ pub(crate) fn choose_token(
     logits_flat: &Array,
     mask_active: bool,
 ) -> Result<Array> {
-    let sampling_active = ctx.sampler_cfg.sampling_active();
-    let penalties_active = ctx.penalty_cfg.penalties_active();
     let vocab = ctx.vocab;
-    let device = ctx.device;
-    // trailing-20 window for penalty context. Borrowed read-only here; disjoint
-    // from the `&mut ctx.constraint` / `&mut ctx.rng` field borrows below.
     let win_start = ctx.token_history.len().saturating_sub(20);
     let recent: &[u32] = &ctx.token_history[win_start..];
-    if sampling_active {
-        let mask_opt: Option<&[bool]> = if mask_active {
-            Some(ctx.constraint.as_mut().unwrap().step_mask(vocab as usize))
-        } else {
-            None
-        };
-        crate::sampler::sample_token_array(
-            logits_flat,
-            ctx.sampler_cfg,
-            mask_opt,
-            ctx.penalty_cfg,
-            recent,
-            ctx.rng,
-            device,
-        )
+    let mask: Option<&[bool]> = if mask_active {
+        Some(ctx.constraint.as_mut().unwrap().step_mask(vocab as usize))
     } else {
-        if penalties_active {
-            let mask_opt: Option<&[bool]> = if mask_active {
-                Some(ctx.constraint.as_mut().unwrap().step_mask(vocab as usize))
-            } else {
-                None
-            };
-            crate::sampler::argmax_with_penalties(
-                logits_flat,
-                mask_opt,
-                ctx.penalty_cfg,
-                recent,
-                device,
-            )
-        } else if mask_active {
-            let c = ctx.constraint.as_mut().unwrap();
-            let m = c.step_mask(vocab as usize);
-            apply_mask_argmax(logits_flat, m, device)
-        } else {
-            argmax(logits_flat, -1, device)
-        }
-    }
+        None
+    };
+    select_token(
+        logits_flat,
+        ctx.sampler_cfg,
+        mask,
+        ctx.penalty_cfg,
+        recent,
+        ctx.rng,
+        ctx.device,
+    )
 }
 
 /// THE pipelined decode loop. Wraps the whole loop in `info_span!("decode")`.

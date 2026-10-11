@@ -30,16 +30,8 @@ use crate::session_cache::SessionCache;
 
 // ── TTS model cache type ──────────────────────────────────────────────────────
 
-/// Cached TTS model pair: `(Arc<Mutex<TtsModel>>, Arc<TtsTokenizer>)`.
-///
-/// The inner `TtsModel` is wrapped in a `Mutex` because `synthesize()` takes
-/// `&mut TtsModel` for lazy weight loading on the first synthesis call.
-type TtsCache = PLRwLock<
-    Option<(
-        Arc<PLMutex<rmlx_audio::tts::TtsModel>>,
-        Arc<rmlx_audio::tts::TtsTokenizer>,
-    )>,
->;
+/// The speech stack, loaded by the first `/v1/audio/speech` request.
+type TtsCache = PLRwLock<Option<Arc<crate::audio::LoadedTts>>>;
 
 // ── Type alias for the loader closure ────────────────────────────────────────
 

@@ -1,7 +1,7 @@
 //! The multipart form of the transcription routes: field bounds and buffer
 //! sizing, on forms built in the test.
 
-use super::{cut, parse_multipart, AudioFormFields, IgnoredFields};
+use super::{parse_multipart, AudioFormFields, IgnoredFields};
 
 /// The ignored-field log event is bounded: a count, at most eight names, each
 /// at most 64 bytes, cut at a character boundary.
@@ -29,13 +29,6 @@ fn ignored_fields_are_counted_and_their_names_bounded() {
             names: vec!["prompt".to_owned(), "include[]".to_owned()],
         }
     );
-}
-
-#[test]
-fn cut_keeps_whole_characters() {
-    assert_eq!(cut("abc", 64), "abc");
-    assert_eq!(cut("aé", 2), "a");
-    assert_eq!(cut("", 4), "");
 }
 
 /// The form `parse_multipart` reads from `body`, a multipart body with the

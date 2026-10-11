@@ -18,7 +18,7 @@ use rmlx_audio::transcribe::{Segment, Transcription};
 use rmlx_audio::wav::WavError;
 
 use super::form::ResponseFormat;
-use super::{build_response, job_refusal, refused, run_admitted, JobError};
+use super::{build_response, cut, job_refusal, refused, run_admitted, JobError};
 use crate::engine::{admit_request, Admission, GpuAdmission};
 
 /// How long a scripted job waits for the flag before it gives up and reports
@@ -389,4 +389,11 @@ fn only_a_permanent_refusal_says_no_retry() {
         rmlx_audio::whisper::WhisperError::Mlx("x".to_owned()),
     )));
     assert!(passing.headers().get("x-should-retry").is_none());
+}
+
+#[test]
+fn cut_keeps_whole_characters() {
+    assert_eq!(cut("abc", 64), "abc");
+    assert_eq!(cut("aé", 2), "a");
+    assert_eq!(cut("", 4), "");
 }

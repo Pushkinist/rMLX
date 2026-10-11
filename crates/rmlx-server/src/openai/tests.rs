@@ -1112,7 +1112,7 @@ fn n_model_registry(n: usize) -> (ModelRegistry, tempfile::TempDir) {
 /// `AppState` with a `NotReadyGenerator` stub loader and the given
 /// `max_loaded_models`. Generation would 503, but the slot-vec
 /// load/evict/find logic in `ensure_loaded`/`unload` is fully exercised.
-fn slot_test_state(registry: ModelRegistry, max_loaded_models: usize) -> AppState {
+pub(crate) fn slot_test_state(registry: ModelRegistry, max_loaded_models: usize) -> AppState {
     let loader: ModelLoader =
         Arc::new(|_path, _id| Ok(Box::new(NotReadyGenerator) as Box<dyn Generator>));
     AppState {

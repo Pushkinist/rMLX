@@ -633,6 +633,13 @@ Sizes come from flat `talker_config` keys; the nested `code_predictor_config`
 block is not read (see `docs/AUDIO.md` § "CodePredictor"). Voices are the
 keys of `talker_config.spk_id`.
 
+Both heads sample with the shared sampler. The defaults come from the
+snapshot's `generation_config.json` (`do_sample`, `temperature`, `top_k`,
+`top_p`, `repetition_penalty` and the `subtalker_*` keys), and a request can
+set `temperature`, `top_k`, `repetition_penalty` and `seed`. Generation stops
+at the codec end token or at 2048 frames; the response headers say which.
+See `docs/AUDIO.md` § "Generation loop" and `docs/AUDIO.md` § "Sampling".
+
 ---
 
 ## See also

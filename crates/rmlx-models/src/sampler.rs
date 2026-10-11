@@ -935,6 +935,39 @@ pub fn sample_token_array(
         .map_err(|e| Error::Other(format!("sample_token: id array build failed: {e}")))
 }
 
+/// Choose the next token of `logits_flat` with the request's sampler.
+///
+/// The fork that `decode_loop::choose_token` and the speech route's token pick
+/// call: greedy device `argmax` when the sampler is greedy and no penalty or
+/// mask is set; [`apply_mask_argmax`] for a mask alone;
+/// [`argmax_with_penalties`] for greedy with penalties; otherwise
+/// [`sample_token_array`], which draws once from `rng`. The BitNet, Laguna and
+/// Qwen2 generate loops and the Qwen3-VL MoE token pick still carry their own
+/// copies of this fork. The mask is applied
+/// before the penalties and before any top-p, min-p or top-k cut. `recent` is
+/// the penalty context, already trimmed by the caller. Returns the `[1]` id
+/// array that `argmax(&logits_flat, -1, device)` returns.
+pub fn select_token(
+    logits_flat: &Array,
+    sp: &SamplerConfig,
+    mask: Option<&[bool]>,
+    penalty_cfg: &PenaltyConfig,
+    recent: &[u32],
+    rng: &mut Pcg32,
+    device: Device,
+) -> Result<Array> {
+    if sp.sampling_active() {
+        return sample_token_array(logits_flat, sp, mask, penalty_cfg, recent, rng, device);
+    }
+    if penalty_cfg.penalties_active() {
+        return argmax_with_penalties(logits_flat, mask, penalty_cfg, recent, device);
+    }
+    match mask {
+        Some(m) => apply_mask_argmax(logits_flat, m, device),
+        None => argmax(logits_flat, -1, device),
+    }
+}
+
 // ===========================================================================
 // — speculative stochastic acceptance (Leviathan 2023, §2.3)
 // ===========================================================================
@@ -1296,3 +1329,7 @@ pub fn apply_mask_argmax(logits_flat: &Array, mask: &[bool], device: Device) -> 
 #[cfg(test)]
 #[path = "sampler_tests.rs"]
 mod sampler_tests;
+
+#[cfg(test)]
+#[path = "sampler_select_tests.rs"]
+mod sampler_select_tests;

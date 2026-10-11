@@ -59,6 +59,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timestamp, so the whole window was consumed, and the loop text prompted the
   next window, which looped too. A loop is a window text with a zlib
   compression ratio above 2.4 (openai-whisper's bound).
+- **`/v1/audio/speech` stops at the end of the speech.** The talker and the
+  code predictor decoded greedily, and greedy decoding did not pick the
+  codec end token: every request ran to the 2048-frame cap and returned
+  163.84 s of audio, mostly silence, and could drop the end of the input.
+  Both heads now sample with the shared sampler. The defaults come from the
+  talker snapshot's `generation_config.json`, then from the Qwen3-TTS
+  reference defaults. A request can set `temperature`, `top_k`,
+  `repetition_penalty` and `seed`. Two response headers report how the
+  generation ended: `x-rmlx-tts-frames` and `x-rmlx-tts-truncated`.
+  Behaviour change: the audio of a request is no longer the greedy audio. A
+  request without a seed uses one fixed seed, so it gives the same audio each
+  time. The old greedy decoding needs `temperature: 0` and
+  `repetition_penalty: 1.0`; `temperature: 0` alone keeps the checkpoint's
+  repetition penalty. A sampling field of the wrong JSON type is now refused.
+  A `temperature` or a `repetition_penalty` out of bounds is 400:
+  `temperature` is 0 or in `[1e-6, 2]`, and `repetition_penalty` is finite
+  and at least `1e-6` (`docs/AUDIO.md`, "Sampling"). An empty `input` is 400;
+  before, it was 500. The 422 of an unknown voice and every 500 of the route
+  are now `{"error":{"message","type"}}`. A 500 has a fixed message: the
+  cause, which named a local path before, is in the server log. The 422 no
+  longer repeats the voice of the request.
+- **A speech request no longer writes its `input` to the server log.**
+  `synthesize` opened a span that held the whole `input`, and every event
+  inside the span printed it: one request with a 64 KiB `input` wrote 403 KB
+  that held the text. The span now holds `text_len`, and `voice` once it
+  names a speaker of the model. Eight requests with inputs up to 16 MiB
+  write a 19.6 KB log with no input text.
 
 ## [0.4.3] - 2026-10-09
 

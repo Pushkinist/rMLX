@@ -31,10 +31,11 @@ use std::sync::Arc;
 
 use rmlx_audio::tokenizer::{WhisperTask, WhisperTokenizer};
 use rmlx_audio::transcribe::{TranscribeOptions, Transcriber};
-use rmlx_audio::tts::{synthesize, TtsModel, TtsTokenizer};
+use rmlx_audio::tts::{synthesize, PickHead, TokenPick, TtsError, TtsModel, TtsTokenizer};
 use rmlx_audio::whisper::WhisperModel;
-use rmlx_mlx::Device;
+use rmlx_mlx::{Array, Device};
 use rmlx_models::jina_v4::{self, JinaV4};
+use rmlx_models::sampler::{select_token, Pcg32, PenaltyConfig, SamplerConfig};
 use thread_boundary::{
     f32_bits, hand_over, snapshot, spoken_wav, Split, RED_PNG_BASE64, SPOKEN_TEXT,
 };
@@ -267,11 +268,46 @@ fn tts_config(model_dir: &Path, codec_dir: &Path, device: Device) -> (TtsModel, 
     (model, tokenizer)
 }
 
+/// Greedy decoding with no penalty: one token stream per input on any thread.
+struct Greedy;
+
+impl TokenPick for Greedy {
+    fn pick(
+        &mut self,
+        _head: PickHead,
+        logits: &Array,
+        allow: Option<&[bool]>,
+        _history: &[u32],
+    ) -> Result<u32, TtsError> {
+        let greedy = SamplerConfig {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            min_p: 0.0,
+            seed: None,
+            top_logprobs_k: 0,
+        };
+        let vocab = *logits.shape().last().unwrap();
+        let row = logits.reshape(&[1, vocab], Device::Gpu)?;
+        let id = select_token(
+            &row,
+            &greedy,
+            allow,
+            &PenaltyConfig::default(),
+            &[],
+            &mut Pcg32::new(0),
+            Device::Gpu,
+        )?;
+        id.eval()?;
+        Ok(u32::from_le_bytes(id.to_bytes()?[..4].try_into().unwrap()))
+    }
+}
+
 fn speak(
     (mut model, tokenizer): (TtsModel, TtsTokenizer),
 ) -> (Result<Vec<u32>, String>, (TtsModel, TtsTokenizer)) {
-    let samples = synthesize(SPOKEN_TEXT, "serena", &mut model, &tokenizer)
-        .map(|(samples, _rate)| f32_bits(&samples))
+    let samples = synthesize(SPOKEN_TEXT, "serena", &mut model, &tokenizer, &mut Greedy)
+        .map(|synthesis| f32_bits(&synthesis.samples))
         .map_err(|e| e.to_string());
     (samples, (model, tokenizer))
 }

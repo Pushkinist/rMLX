@@ -47,6 +47,7 @@ pub mod session_cache;
 pub mod stop_matcher;
 pub mod tokenizer_io;
 pub mod tool_parser;
+pub(crate) mod tts_sampling;
 
 pub use claim::{probe_claim, try_claim, ClaimError, MetalClaim};
 

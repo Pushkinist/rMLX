@@ -32,18 +32,19 @@
               weights, which is an acceptable abort condition"
 )]
 
+use std::borrow::Cow;
 use std::path::Path;
 use std::time::Instant;
 
 use rmlx_loader::{load_shard_index, view, ShardSet};
 use rmlx_mlx::{
-    add, argmax, broadcast_to, concatenate, conv1d, conv_transpose1d, cos, divide, exp, gelu,
-    matmul, maximum, multiply, negative, quantized_matmul, rms_norm, scalar_f32,
-    scaled_dot_product_attention, silu, sin, sqrt, subtract, sum_axis_keepdims, tanh, Array,
-    Device,
+    add, concatenate, conv1d, conv_transpose1d, cos, divide, exp, gelu, matmul, maximum, multiply,
+    negative, quantized_matmul, rms_norm, scalar_f32, scaled_dot_product_attention, silu, sin,
+    sqrt, subtract, sum_axis_keepdims, tanh, Array, Device,
 };
 use thiserror::Error;
-use tracing::{debug, info, instrument};
+use tracing::field::Empty;
+use tracing::{debug, info, info_span, instrument};
 
 // ── Error ─────────────────────────────────────────────────────────────────────
 
@@ -66,6 +67,9 @@ pub enum TtsError {
     /// Empty input.
     #[error("empty text input")]
     Empty,
+    /// A [`TokenPick`] returned an id that the mask or the vocabulary excludes.
+    #[error("token pick error: {0}")]
+    Pick(String),
 }
 
 impl From<rmlx_core::error::Error> for TtsError {
@@ -148,8 +152,8 @@ pub struct TalkerConfig {
     #[serde(default = "default_rms_eps")]
     pub rms_norm_eps: f32,
     /// Codec (audio) vocabulary size — despite the name, this is not the
-    /// text vocabulary. Sets the suppression start for codec-token
-    /// generation (`suppress_start = vocab_size - 1024`).
+    /// text vocabulary. Its last 1024 ids are special tokens that
+    /// [`talker_allow_mask`] blocks.
     #[serde(default = "default_vocab_size")]
     pub vocab_size: usize,
     /// Intermediate size for talker MLP (gate/up). Default = 4 * hidden_size.
@@ -2012,66 +2016,176 @@ impl TtsTokenizer {
 
 // ── synthesize ────────────────────────────────────────────────────────────────
 
-/// Greedy argmax over last position, returns scalar i32 bytes.
-/// `suppress`: if `Some((start, eos_id))`, tokens in `[start, vocab_size)`
-///   except `eos_id` are suppressed (set to -inf) before argmax, with
-///   `vocab_size` read from the logits shape. Matches the reference:
-///   suppress_tokens = [vocab_size-1024..vocab_size) except eos.
-fn argmax_last(
-    logits: &Array,
-    suppress: Option<(i32, i32)>, // (suppress_start, eos_id) — vocab_size from logits shape
-    d: Device,
-) -> Result<u32, TtsError> {
-    // logits: [1, S, vocab] → take last position → [1, vocab] → argmax → [1]
-    let s = logits.shape()[1];
-    let vocab = logits.shape()[2];
-    let last = logits.slice(&[0, s - 1, 0], &[1, s, vocab], &[1, 1, 1], d)?;
-    let last_2d = last.reshape(&[1, vocab], d)?;
+/// Upper bound on the codec frames that one request generates.
+/// At 12.5 frames per second, 2048 frames are 163.84 s of audio.
+pub const MAX_FRAMES: usize = 2048;
 
-    // Suppress special tokens: set [suppress_start, vocab) except eos to -inf.
-    let last_2d = if let Some((suppress_start, eos_id)) = suppress {
-        let neg_inf = broadcast_to(
-            &scalar_f32(f32::NEG_INFINITY).reshape(&[1, 1], d)?,
-            &[1, vocab],
-            d,
-        )?;
-        // Suppress [suppress_start, eos_id) — tokens before EOS in the suppress range
-        let logits_s = if suppress_start < eos_id {
-            last_2d.slice_update(
-                &neg_inf.slice(&[0, suppress_start], &[1, eos_id], &[1, 1], d)?,
-                &[0, suppress_start],
-                &[1, eos_id],
-                &[1, 1],
-                d,
-            )?
-        } else {
-            last_2d.try_clone()?
-        };
-        // Suppress (eos_id, vocab) — tokens after EOS in the suppress range
-        if eos_id + 1 < vocab {
-            logits_s.slice_update(
-                &neg_inf.slice(&[0, eos_id + 1], &[1, vocab], &[1, 1], d)?,
-                &[0, eos_id + 1],
-                &[1, vocab],
-                &[1, 1],
-                d,
-            )?
-        } else {
-            logits_s
+/// The talker may not pick the end token before this many frames exist.
+pub const MIN_FRAMES: usize = 2;
+
+/// Codec codes per frame: group 0 from the talker, groups 1 to 15 from the
+/// code predictor.
+const CODE_GROUPS: usize = 16;
+
+/// The model head that a token is picked for.
+#[allow(
+    clippy::exhaustive_enums,
+    reason = "a picker handles every head; a new head must break its match"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickHead {
+    /// The talker: codec group 0, under the special-token mask.
+    Talker,
+    /// The code predictor: codec groups 1 to 15.
+    CodePredictor,
+}
+
+/// Chooses the next token id from one logit row.
+///
+/// The caller owns the sampling policy. This crate owns the mask and the
+/// history, because both come from the model layout.
+pub trait TokenPick {
+    /// Pick one token id.
+    ///
+    /// - `logits` holds exactly one position; its last axis is the vocabulary.
+    /// - `allow` is the allow-mask over that vocabulary: `false` is never chosen.
+    /// - `history` is the ids this head generated before, oldest first.
+    fn pick(
+        &mut self,
+        head: PickHead,
+        logits: &Array,
+        allow: Option<&[bool]>,
+        history: &[u32],
+    ) -> Result<u32, TtsError>;
+}
+
+/// Allow-mask of the talker vocabulary. The last 1024 ids are special tokens
+/// and are never chosen, except the codec end token `eos_id`.
+pub fn talker_allow_mask(vocab: usize, eos_id: u32) -> Vec<bool> {
+    let special_start = vocab.saturating_sub(1024);
+    (0..vocab)
+        .map(|id| id < special_start || id == eos_id as usize)
+        .collect()
+}
+
+/// The result of one talker step.
+#[derive(Debug)]
+pub(crate) enum FrameStep {
+    /// One frame of codec codes, group 0 first.
+    Frame(Vec<u32>),
+    /// The talker picked the codec end token.
+    End,
+}
+
+/// The frames of one generation and how the loop ended.
+#[derive(Debug)]
+pub(crate) struct Frames {
+    pub(crate) codes: Vec<Vec<u32>>,
+    /// `true` when the loop stopped at [`MAX_FRAMES`] before the end token.
+    pub(crate) truncated: bool,
+}
+
+/// Run `step` until it returns [`FrameStep::End`] or [`MAX_FRAMES`] frames exist.
+pub(crate) fn run_frames(
+    mut step: impl FnMut(usize) -> Result<FrameStep, TtsError>,
+) -> Result<Frames, TtsError> {
+    let mut codes = Vec::new();
+    for index in 0..MAX_FRAMES {
+        match step(index)? {
+            FrameStep::Frame(frame) => codes.push(frame),
+            FrameStep::End => {
+                return Ok(Frames {
+                    codes,
+                    truncated: false,
+                })
+            }
         }
-    } else {
-        last_2d
-    };
-
-    let tok = argmax(&last_2d, 1, d)?;
-    // Materialise before reading bytes — MLX is lazy; to_bytes on an unevaluated
-    // array dereferences a null data pointer and crashes.
-    tok.eval()?;
-    let bytes = tok.to_bytes()?;
-    if bytes.len() < 4 {
-        return Err(TtsError::Mlx("argmax_last: unexpected byte length".into()));
     }
-    Ok(i32::from_le_bytes(bytes[..4].try_into().unwrap_or([0u8; 4])) as u32)
+    Ok(Frames {
+        codes,
+        truncated: true,
+    })
+}
+
+/// One frame: the talker picks group 0 from `talker_row` under `mask`, then the
+/// code predictor picks groups 1 to 15, each from `cp_row(group_index, previous_code)`.
+///
+/// `history` holds every group-0 code of the earlier frames, so its length is
+/// the frame index; before [`MIN_FRAMES`] the end token is masked too. The new
+/// group-0 code is pushed to it, the end token never is. Every row must hold
+/// one position. A talker id that the mask blocks, and a code-predictor id
+/// outside the vocabulary of its row, are errors.
+pub(crate) fn frame_step(
+    pick: &mut dyn TokenPick,
+    talker_row: &Array,
+    mask: &[bool],
+    eos: u32,
+    history: &mut Vec<u32>,
+    mut cp_row: impl FnMut(usize, u32) -> Result<Array, TtsError>,
+) -> Result<FrameStep, TtsError> {
+    ensure_one_position(talker_row)?;
+    let allow = if history.len() < MIN_FRAMES {
+        Cow::Owned(without_id(mask, eos))
+    } else {
+        Cow::Borrowed(mask)
+    };
+    let group0 = pick.pick(PickHead::Talker, talker_row, Some(&allow), history)?;
+    if !allow.get(group0 as usize).copied().unwrap_or(false) {
+        return Err(TtsError::Pick(format!(
+            "the talker picked id {group0}, which the mask blocks"
+        )));
+    }
+    if group0 == eos {
+        return Ok(FrameStep::End);
+    }
+    let mut codes = Vec::with_capacity(CODE_GROUPS);
+    codes.push(group0);
+    let mut previous = group0;
+    for group in 0..CODE_GROUPS - 1 {
+        let row = cp_row(group, previous)?;
+        ensure_one_position(&row)?;
+        // The row width stands in for the size of the embedding table and of
+        // the codebook that the id indexes next.
+        let vocab = row.shape().last().copied().unwrap_or(0);
+        previous = pick.pick(PickHead::CodePredictor, &row, None, &[])?;
+        if i64::from(previous) >= i64::from(vocab) {
+            return Err(TtsError::Pick(format!(
+                "the code predictor picked id {previous}, outside its vocabulary of {vocab}"
+            )));
+        }
+        codes.push(previous);
+    }
+    history.push(group0);
+    Ok(FrameStep::Frame(codes))
+}
+
+/// `mask` with `id` blocked too.
+fn without_id(mask: &[bool], id: u32) -> Vec<bool> {
+    let mut blocked = mask.to_vec();
+    if let Some(allowed) = blocked.get_mut(id as usize) {
+        *allowed = false;
+    }
+    blocked
+}
+
+/// Refuse a logit row unless every axis before the vocabulary has length 1.
+fn ensure_one_position(row: &Array) -> Result<(), TtsError> {
+    let shape = row.shape();
+    let leading = shape.len().saturating_sub(1);
+    if shape.iter().take(leading).all(|&n| n == 1) {
+        Ok(())
+    } else {
+        Err(TtsError::Mlx(format!(
+            "a logit row must hold one position, got shape {shape:?}"
+        )))
+    }
+}
+
+/// The last position of a `[1, S, n]` array, as `[1, 1, n]`.
+fn last_position(a: &Array, d: Device) -> Result<Array, TtsError> {
+    let shape = a.shape();
+    let (s, n) = (shape[1], shape[2]);
+    Ok(a.slice(&[0, s - 1, 0], &[1, s, n], &[1, 1, 1], d)?)
 }
 
 /// Look up embedding for a single token id in a table. Returns [1, 1, hidden].
@@ -2080,16 +2194,39 @@ fn lookup_embed(table: &Embedding, token_id: u32, d: Device) -> Result<Array, Tt
     table.forward(&ids, d)
 }
 
-/// Synthesize speech from `text` using `voice`.
-/// Returns `(samples, sample_rate)` where samples is mono f32 PCM at 24000 Hz.
+/// The audio of one request and how its generation ended.
+#[allow(
+    clippy::exhaustive_structs,
+    reason = "a plain result record: a new field must reach every reader"
+)]
+#[derive(Debug)]
+pub struct Synthesis {
+    /// Mono f32 PCM.
+    pub samples: Vec<f32>,
+    /// Sample rate of `samples`, in Hz.
+    pub sample_rate: u32,
+    /// Codec frames generated.
+    pub frames: usize,
+    /// `true` when generation stopped at [`MAX_FRAMES`] before the end token,
+    /// so the audio is cut off.
+    pub truncated: bool,
+}
+
+/// Synthesize speech from `text` using `voice`. `pick` chooses every codec
+/// token; the talker picks under [`talker_allow_mask`].
+///
+/// The log carries the length of `text`, never the text, and `voice` only once
+/// it names a speaker of the model.
 #[allow(clippy::cognitive_complexity)]
-#[instrument(skip(model, tokenizer), fields(voice, text_len = text.len()))]
 pub fn synthesize(
     text: &str,
     voice: &str,
     model: &mut TtsModel,
     tokenizer: &TtsTokenizer,
-) -> Result<(Vec<f32>, u32), TtsError> {
+    pick: &mut dyn TokenPick,
+) -> Result<Synthesis, TtsError> {
+    let span = info_span!("synthesize", voice = Empty, text_len = text.len());
+    let _in_span = span.enter();
     if text.trim().is_empty() {
         return Err(TtsError::Empty);
     }
@@ -2097,6 +2234,7 @@ pub fn synthesize(
         .config
         .speaker_id(voice)
         .ok_or_else(|| TtsError::UnknownVoice(voice.to_owned()))?;
+    span.record("voice", voice);
 
     // Load weights on first call
     if model.talker.is_none() {
@@ -2211,12 +2349,8 @@ pub fn synthesize(
 
     // ── Generation loop ────────────────────────────────────────────────────────
 
-    let max_tokens = 2048usize;
     let eos_id = tcfg.codec_eos_token_id;
-    // Suppress special tokens [vocab_size-1024, vocab_size) except EOS.
-    // Reference: suppress_tokens = [vocab_size-1024..vocab_size) - {eos_id}
-    let suppress_start = tcfg.vocab_size as i32 - 1024;
-    let suppress = Some((suppress_start, eos_id as i32));
+    let mask = talker_allow_mask(tcfg.vocab_size, eos_id);
 
     // KV caches: one per talker layer, one set per CP layer
     let n_talker = tcfg.num_hidden_layers;
@@ -2224,88 +2358,74 @@ pub fn synthesize(
     let mut talker_kv: Vec<KvSlot> = (0..n_talker).map(|_| KvSlot::new()).collect();
     let mut cp_kv: Vec<KvSlot> = (0..n_cp).map(|_| KvSlot::new()).collect();
 
-    let mut generated_codes: Vec<Array> = Vec::with_capacity(max_tokens);
+    let mut history: Vec<u32> = Vec::new();
     let mut trailing_idx = 0usize;
     let mut talker_offset = 0i32;
 
     let mut cur_input = input_embeds;
 
-    debug!("starting Qwen3-TTS generation loop, max_tokens={max_tokens}");
+    debug!(
+        max_frames = MAX_FRAMES,
+        "starting Qwen3-TTS generation loop"
+    );
 
-    for step in 0..max_tokens {
+    let frames = run_frames(|step| {
         let seq_len = cur_input.shape()[1];
-
-        // Talker forward
         let (logits, hidden) = talker.forward(&cur_input, &mut talker_kv, talker_offset, d)?;
         talker_offset += seq_len;
+        let talker_row = last_position(&logits, d)?;
 
-        // Argmax with special-token suppression (tokens [vocab-1024, vocab) except EOS).
-        let next_tok_id = argmax_last(&logits, suppress, d)?;
-
-        if next_tok_id == eos_id {
-            debug!(step, "TTS EOS received");
-            break;
-        }
-
-        // CodePredictor: generate groups 1..15
-        let hidden_last = hidden.slice(
-            &[0, hidden.shape()[1] - 1, 0],
-            &[1, hidden.shape()[1], h],
-            &[1, 1, 1],
-            d,
-        )?;
-
-        // Project talker hidden [1,1,2048] → CP hidden [1,1,1024] via small_to_mtp.
-        let hidden_proj = talker.code_pred.small_to_mtp.forward(&hidden_last, d)?;
-
-        // Group-0 codec embedding: use talker.codec_embed (same table as next-step input build),
-        // NOT cp.codec_embeddings[0]. Then project 2048→1024 via small_to_mtp.
-        // Reference: code_0_embed = self.talker.get_input_embeddings()(next_token)
-        let code_0_emb_raw = lookup_embed(&talker.codec_embed, next_tok_id, d)?; // [1,1,2048]
-        let code_0_emb_cp = talker.code_pred.small_to_mtp.forward(&code_0_emb_raw, d)?; // [1,1,1024]
-
-        // Reset CP KV cache each step
-        for kv in &mut cp_kv {
-            kv.k = None;
-            kv.v = None;
-        }
-
-        let mut code_tokens: Vec<u32> = vec![next_tok_id];
         let mut cp_offset = 0i32;
-
-        for code_idx in 0..15usize {
-            let cp_input = if code_idx == 0 {
-                // Step 0: concat(hidden_proj [1,1,1024], code_0_emb_cp [1,1,1024]) → [1,2,1024]
-                // (small_to_mtp applied to both halves individually = same as applying to the
-                //  concatenated [1,2,2048] input, since projection distributes over axis 1)
-                concatenate(&[&hidden_proj, &code_0_emb_cp], 1, d)?
-            } else {
-                // For groups 1..14: embed previous group token via CP codec_embedding[code_idx-1]
-                // (2048-dim), then project to CP space.
-                // Reference: cp.codec_embedding[code_idx - 1](last_token)
-                let last_code = *code_tokens.last().ok_or_else(|| {
-                    TtsError::Mlx("code_tokens empty during predictor step".into())
-                })?;
-                let emb_ids = Array::from_i32_slice(&[last_code as i32], &[1, 1])?;
-                let raw = talker.code_pred.codec_embeddings[code_idx - 1].forward(&emb_ids, d)?; // [1,1,2048]
-                talker.code_pred.small_to_mtp.forward(&raw, d)? // [1,1,1024]
-            };
-
-            let cp_logits = talker
-                .code_pred
-                .forward(&cp_input, &mut cp_kv, cp_offset, code_idx, d)?;
-            cp_offset += cp_input.shape()[1];
-            // CP vocab = 2048, all valid audio tokens — no suppression needed.
-            let next_code = argmax_last(&cp_logits, None, d)?;
-            code_tokens.push(next_code);
-        }
-
-        // Stack all 16 codec group tokens for this step: [1, 16]
-        let code_arr = Array::from_i32_slice(
-            &code_tokens.iter().map(|&t| t as i32).collect::<Vec<_>>(),
-            &[1, 16],
+        let outcome = frame_step(
+            &mut *pick,
+            &talker_row,
+            &mask,
+            eos_id,
+            &mut history,
+            |code_idx, previous| {
+                let cp_input = if code_idx == 0 {
+                    // Each frame starts the CodePredictor from an empty cache.
+                    for kv in &mut cp_kv {
+                        kv.k = None;
+                        kv.v = None;
+                    }
+                    // Project talker hidden [1,1,2048] → CP hidden [1,1,1024] via small_to_mtp.
+                    let hidden_proj = talker
+                        .code_pred
+                        .small_to_mtp
+                        .forward(&last_position(&hidden, d)?, d)?;
+                    // Group-0 codec embedding: use talker.codec_embed (same table as next-step input build),
+                    // NOT cp.codec_embeddings[0]. Then project 2048→1024 via small_to_mtp.
+                    // Reference: code_0_embed = self.talker.get_input_embeddings()(next_token)
+                    let code_0_emb_raw = lookup_embed(&talker.codec_embed, previous, d)?;
+                    let code_0_emb_cp =
+                        talker.code_pred.small_to_mtp.forward(&code_0_emb_raw, d)?;
+                    // concat(hidden_proj, code_0_emb_cp) → [1,2,1024]. small_to_mtp applied to
+                    // each half equals applying it to the concatenated [1,2,2048] input.
+                    concatenate(&[&hidden_proj, &code_0_emb_cp], 1, d)?
+                } else {
+                    // For groups 1..14: embed previous group token via CP codec_embedding[code_idx-1]
+                    // (2048-dim), then project to CP space.
+                    // Reference: cp.codec_embedding[code_idx - 1](last_token)
+                    let raw = lookup_embed(
+                        &talker.code_pred.codec_embeddings[code_idx - 1],
+                        previous,
+                        d,
+                    )?; // [1,1,2048]
+                    talker.code_pred.small_to_mtp.forward(&raw, d)? // [1,1,1024]
+                };
+                let cp_logits = talker
+                    .code_pred
+                    .forward(&cp_input, &mut cp_kv, cp_offset, code_idx, d)?;
+                cp_offset += cp_input.shape()[1];
+                last_position(&cp_logits, d)
+            },
         )?;
-        generated_codes.push(code_arr);
+
+        let FrameStep::Frame(code_tokens) = &outcome else {
+            debug!(step, "TTS EOS received");
+            return Ok(outcome);
+        };
 
         // Build next input_embeds for talker
         let text_emb = if trailing_idx < trailing_text_hidden.shape()[1] as usize {
@@ -2326,12 +2446,14 @@ pub fn synthesize(
         // Groups 1..15: cp.codec_embeddings[i-1] (vocab=2048, dim=2048) — each group has
         //               its own embedding table in the CodePredictor.
         // Reference: talker.get_input_embeddings()(group_0) + sum(cp.codec_embedding[i](group_i+1))
-        let codec_emb_0 = lookup_embed(&talker.codec_embed, code_tokens[0], d)?;
-        let mut codec_emb = codec_emb_0;
-        for (i, &ct) in code_tokens[1..].iter().enumerate() {
-            let extra = talker.code_pred.codec_embeddings[i]
-                .forward(&Array::from_i32_slice(&[ct as i32], &[1, 1])?, d)?;
-            codec_emb = add(&codec_emb, &extra, d)?;
+        let mut codec_emb = lookup_embed(&talker.codec_embed, code_tokens[0], d)?;
+        for (table, &ct) in talker
+            .code_pred
+            .codec_embeddings
+            .iter()
+            .zip(&code_tokens[1..])
+        {
+            codec_emb = add(&codec_emb, &lookup_embed(table, ct, d)?, d)?;
         }
 
         cur_input = add(&text_emb, &codec_emb, d)?;
@@ -2339,32 +2461,20 @@ pub fn synthesize(
         if step % 50 == 0 && step > 0 {
             debug!(step, "TTS generation step");
         }
-    }
+        Ok(outcome)
+    })?;
 
-    let gen_ms = t_start.elapsed().as_millis();
-    let n_frames = generated_codes.len();
+    let n_frames = frames.codes.len();
     info!(
         frames = n_frames,
-        elapsed_ms = gen_ms,
+        truncated = frames.truncated,
+        elapsed_ms = t_start.elapsed().as_millis(),
         "TTS generation done"
     );
 
-    if generated_codes.is_empty() {
-        return Err(TtsError::Mlx(
-            "no audio generated (EOS on first step)".into(),
-        ));
-    }
-
-    // Decode: stack codes [1, T, 16] → transpose → [1, 16, T]
-    // Each generated_codes[i] is [1, 16] (2D). Reshape to [1, 1, 16] then concatenate
-    // along axis 1 → [1, T, 16], then transpose → [1, 16, T].
-    let codes_3d_parts: Vec<Array> = generated_codes
-        .iter()
-        .map(|a| a.reshape(&[1, 1, 16], d))
-        .collect::<Result<Vec<_>, _>>()?;
-    let codes_3d_refs: Vec<&Array> = codes_3d_parts.iter().collect();
-    let codes_3d = concatenate(&codes_3d_refs, 1, d)?; // [1, T, 16]
-                                                       // Transpose → [1, 16, T] for codec decoder
+    // Codes [1, T, 16] → transpose → [1, 16, T] for the codec decoder.
+    let flat: Vec<i32> = frames.codes.iter().flatten().map(|&c| c as i32).collect();
+    let codes_3d = Array::from_i32_slice(&flat, &[1, n_frames as i32, CODE_GROUPS as i32])?;
     let codes_t = codes_3d.transpose(&[0, 2, 1], d)?;
 
     let t_dec = Instant::now();
@@ -2375,7 +2485,12 @@ pub fn synthesize(
         "codec decode done"
     );
 
-    Ok((samples, 24000))
+    Ok(Synthesis {
+        samples,
+        sample_rate: 24000,
+        frames: n_frames,
+        truncated: frames.truncated,
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -2387,3 +2502,7 @@ mod tts_tests;
 #[cfg(test)]
 #[path = "tts_device_tests.rs"]
 mod tts_device_tests;
+
+#[cfg(test)]
+#[path = "tts_frame_tests.rs"]
+mod tts_frame_tests;

@@ -28,6 +28,16 @@ pub struct GenerationConfig {
     pub repetition_penalty: Option<f32>,
     /// Default maximum new tokens per request.
     pub max_new_tokens: Option<u32>,
+    /// `false` asks for greedy decoding. Only the speech route reads it.
+    pub do_sample: Option<bool>,
+    /// Qwen3-TTS code predictor: `false` asks for greedy decoding.
+    pub subtalker_dosample: Option<bool>,
+    /// Qwen3-TTS code predictor: sampling temperature.
+    pub subtalker_temperature: Option<f32>,
+    /// Qwen3-TTS code predictor: nucleus sampling probability.
+    pub subtalker_top_p: Option<f32>,
+    /// Qwen3-TTS code predictor: top-k sampling cutoff.
+    pub subtalker_top_k: Option<u32>,
 }
 
 /// Load and parse `<model_dir>/generation_config.json`.

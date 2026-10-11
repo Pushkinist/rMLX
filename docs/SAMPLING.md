@@ -181,16 +181,19 @@ After the filters, one pass rescales the survivors to sum to 1.
 
 ### Repetition penalty
 
-Mirrors mlx-lm `make_repetition_penalty`, over the last 20 generated tokens:
+Mirrors mlx-lm `make_repetition_penalty`, over the token ids that the caller
+passes. The text decode loop passes the last 20 generated tokens:
 
 ```
 if logit[id] < 0:  logit[id] *= rep_penalty
 else:              logit[id] /= rep_penalty
 ```
 
-It applies once per unique id in the window. The identity is `1.0`. The
-window is 20 tokens (`context_size=20` in mlx-lm), not OpenAI's full context:
-a repeat older than 20 tokens is not penalised.
+It applies once per unique id in the window. The identity is `1.0`. For the
+text routes the window is 20 tokens (`context_size=20` in mlx-lm), not
+OpenAI's full context: a repeat older than 20 tokens is not penalised. The
+speech route passes the talker's full group-0 history (`docs/AUDIO.md`,
+"Sampling").
 
 ### Presence penalty
 
@@ -525,6 +528,7 @@ Consequences:
 | `SamplerConfig` | `rmlx-models::sampler` | Temperature, top-p, top-k, min-p, seed, `top_logprobs_k` |
 | `PenaltyConfig` | `rmlx-models::sampler` | Repetition, presence and frequency penalties, `logit_bias` |
 | `Pcg32` | `rmlx-models::sampler` | Per-request RNG |
+| `select_token` | `rmlx-models::sampler` | Chooses device `argmax`, `apply_mask_argmax`, `argmax_with_penalties` or `sample_token_array`. Called by `decode_loop::choose_token` and the speech route's `TtsPicker` |
 | `sample_token_array` | `rmlx-models::sampler` | Host sampling entry point |
 | `argmax_with_penalties` | `rmlx-models::sampler` | Greedy with penalties (host mask and penalties, then `argmax`) |
 | `apply_mask_argmax` | `rmlx-models::sampler` | Greedy with a constraint mask (GPU argmax) |

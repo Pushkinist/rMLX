@@ -46,6 +46,7 @@ areas before touching code:
 | [`docs/CLI_ENV_VARS.md`](docs/CLI_ENV_VARS.md) | Environment variables `CLI.md` reads, split out for size |
 | [`docs/SERVER.md`](docs/SERVER.md) | HTTP server: OpenAI/Anthropic compat, routes, tool calling, retry envelope |
 | [`docs/SERVER_TOOLS.md`](docs/SERVER_TOOLS.md) | Tool calling in the HTTP server, split out of `SERVER.md` for size: parsers, template probe, multi-turn loop, forced tool calls, EOF recovery |
+| [`docs/SERVER_AUDIO.md`](docs/SERVER_AUDIO.md) | Audio routes of the HTTP server, split out of `SERVER.md` for size: speech-to-text (form, upload, admission, cancel, model cache) and text-to-speech (fields, sampling defaults, response headers, errors) |
 | [`docs/MODELS.md`](docs/MODELS.md) | Per-architecture model reference (Qwen, Gemma, Laguna, Jina, etc.) |
 | [`docs/ADDING_A_MODEL.md`](docs/ADDING_A_MODEL.md) | New-arch integration surface: shared seams + per-arch points + verification ritual |
 | [`docs/WEIGHT_QUANTS.md`](docs/WEIGHT_QUANTS.md) | Weight quantization formats (bf16, MXFP, affine, ParoQuant, ternary BitLinear), where they are decoded, adding a format |
