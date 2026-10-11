@@ -199,7 +199,7 @@ filter_real_calls() {
         text="${hit#*:}"
         line="${text%%:*}"
         stripped="$(sed -n "${line}p" "${file}" | awk "${STRIP_FN}"'{ print strip($0) }')"
-        if printf '%s\n' "${stripped}" | grep -qE "${re}"; then
+        if grep -qE "${re}" <<<"${stripped}"; then
             printf '%s:%s:%s\n' "${file}" "${line}" "${stripped}"
         fi
     done

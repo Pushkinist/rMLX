@@ -17,14 +17,15 @@
 # other process started is not the harness's to stop: `rmlx serve` refuses with
 # exit 11 and names the holder, and the harness stops with that status.
 
-# Wait for the server with PID $1 to be ready (polls /v1/models). A server that
-# exits first returns its own exit status, so a refused claim (exit 11) stops
-# the harness with the status the server gave.
+# Wait for the server with PID $1 to be ready (polls /v1/models) for at most two
+# minutes of real time. A server that exits first returns its own exit status,
+# so a refused claim (exit 11) stops the harness with the status the server gave.
+# The limit is read from the shell's own clock, so a `sleep` that a self-test
+# shortens does not shorten it.
 wait_for_server() {
     local pid="$1"
     local url="http://127.0.0.1:${PORT}/v1/models"
-    local attempts=0
-    local max_attempts=60
+    local limit=120 started=${SECONDS}
     echo "  [wait] polling ${url} ..." >&2
     while true; do
         if curl -sf "${url}" > /dev/null 2>&1; then
@@ -38,9 +39,8 @@ wait_for_server() {
             [[ ${status} -eq 0 ]] && status=1
             return "${status}"
         fi
-        attempts=$((attempts + 1))
-        if [[ ${attempts} -ge ${max_attempts} ]]; then
-            echo "ERROR: server did not start within $((max_attempts * 2))s" >&2
+        if (( SECONDS - started >= limit )); then
+            echo "ERROR: server did not start within ${limit}s" >&2
             return 1
         fi
         sleep 2

@@ -100,7 +100,7 @@ PASSED=0
 check() {
     local name="$1" what="$2" mode="$3" needle="$4" hay="$5"
     local found=1
-    printf '%s' "${!hay}" | grep -qF -- "$needle" && found=0
+    grep -qF -- "$needle" <<<"${!hay}" && found=0
     if { [ "$mode" = "contains" ] && [ "$found" -eq 0 ]; } ||
         { [ "$mode" = "absent" ] && [ "$found" -ne 0 ]; }; then
         PASSED=$((PASSED + 1))

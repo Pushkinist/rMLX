@@ -94,7 +94,7 @@ for case in "${CASES[@]}"; do
     ok=1
     [ "$got" -eq "$want_exit" ] || ok=0
     if [ "$want_rule" != "-" ]; then
-        printf '%s\n' "$out" | grep -q "$want_rule" || ok=0
+        grep -q "$want_rule" <<<"$out" || ok=0
     fi
 
     if [ "$ok" -eq 1 ]; then

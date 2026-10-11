@@ -40,6 +40,9 @@ FAKE_ROOT="$WORK/repo"
 mkdir -p "$FAKE_ROOT/target/release-perf"
 ln -s "$REPO_ROOT/scripts" "$FAKE_ROOT/scripts"
 
+# shellcheck source=scripts/lib/selftest_support.sh
+. "$REPO_ROOT/scripts/lib/selftest_support.sh"
+
 # ── Shims ─────────────────────────────────────────────────────────────────────
 #
 # The script's inter-request sleeps are 5 s of nothing when the server is a stub.
@@ -54,12 +57,15 @@ SERVER_PY="$WORK/stub_server.py"
 cat >"$SERVER_PY" <<'PYEOF'
 """Canned OpenAI-compatible server for the spec_bench selftest.
 
-Streams STUB_TOKENS content chunks STUB_GAP_S apart, after a STUB_PREFILL_S
-pause that stands in for prompt prefill, then a usage block. It times its own
-sends and publishes the aggregate at /metrics/cache in the shape the real
-server's ITL ring has, so the engine-side figure the bench reads and the client
-window it cross-checks against describe the same gaps. STUB_ITL_MEAN_MS
-overrides that aggregate, which is how a disagreement is staged;
+Streams STUB_TOKENS content chunks STUB_GAP_S apart, starting STUB_PREFILL_S
+after the role chunk, then a usage block. It does not wait between chunks: each
+content chunk is preceded by `: sent-at=<seconds>`, the time the chunk is due on
+that schedule, and the client reads the stamp instead of its own clock, so no
+scheduling delay can move the window. It publishes the aggregate of the same
+schedule at /metrics/cache in the shape the real server's ITL ring has, so the
+engine-side figure the bench reads and the client window it cross-checks against
+describe the same gaps. STUB_ITL_MEAN_MS overrides that aggregate, which is how
+a disagreement is staged;
 STUB_ITL_SUPPRESS leaves the ring untouched, as the real server does for a
 response too short to have an interval.
 
@@ -77,14 +83,34 @@ servers answer differently. STUB_SAMPLER appends the engine's per-request
 `host categorical sampler active` event, and STUB_SAMPLER_AFTER stops appending
 it partway through, which is the run whose requests did not share one sampling
 setup.
+
+Arguments after the port. The stub binary reads them from the file `stub_args` in
+the case's RMLX_HOME, so a case sets them and no environment variable carries
+them:
+
+  --marks DIR          before each streamed request, note in DIR/seen whether the
+                       client that sent it had already left DIR/mark.N (N counts
+                       the streamed requests over every server of the case)
+  --hold PREFIX        after its role chunk, the first streamed request creates
+                       PREFIX.held and waits for PREFIX.release, so a case can
+                       act while a request is in flight
+  --hold-wait SECONDS  how long that wait lasts at most (300)
 """
 
+import argparse
 import json
 import os
 import statistics
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
+parser = argparse.ArgumentParser()
+parser.add_argument("port", type=int)
+parser.add_argument("--marks", default="")
+parser.add_argument("--hold", default="")
+parser.add_argument("--hold-wait", type=float, default=300.0)
+ARGS = parser.parse_args()
 
 TOKENS = int(os.environ["STUB_TOKENS"])
 GAP_S = float(os.environ["STUB_GAP_S"])
@@ -257,25 +283,34 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
 
-        def chunk(payload):
+        def chunk(payload, sent_at=None):
+            if sent_at is not None:
+                self.wfile.write(f": sent-at={sent_at}\n".encode())
             self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode())
             self.wfile.flush()
 
+        if ARGS.marks:
+            seen = os.path.join(ARGS.marks, "seen")
+            number = 1
+            if os.path.exists(seen):
+                with open(seen, encoding="utf-8") as handle:
+                    number += len(handle.readlines())
+            up = os.path.exists(os.path.join(ARGS.marks, f"mark.{number}"))
+            with open(seen, "a", encoding="utf-8") as handle:
+                handle.write("up\n" if up else "down\n")
+        chunk({"choices": [{"delta": {"role": "assistant"}, "index": 0}]}, 0.0)
+        if ARGS.hold:
+            open(ARGS.hold + ".held", "w").close()
+            # A poll for the file the case creates; the limit ends a stub whose
+            # case has died.
+            deadline = time.monotonic() + ARGS.hold_wait
+            while not os.path.exists(ARGS.hold + ".release") and time.monotonic() < deadline:
+                time.sleep(0.05)
         sends = []
-        chunk({"choices": [{"delta": {"role": "assistant"}, "index": 0}]})
-        time.sleep(PREFILL_S)
-        # Send against a fixed schedule rather than sleeping between chunks:
-        # the per-chunk framing cost then falls inside the gap instead of being
-        # added to it, so the stub really does stream at 1/GAP_S and the rate it
-        # reports is the rate the client can observe.
-        start = time.monotonic()
         for i in range(TOKENS):
-            due = start + i * GAP_S
-            remaining = due - time.monotonic()
-            if remaining > 0:
-                time.sleep(remaining)
-            chunk({"choices": [{"delta": {"content": token_text(i)}, "index": 0}]})
-            sends.append(time.monotonic())
+            due = PREFILL_S + i * GAP_S
+            chunk({"choices": [{"delta": {"content": token_text(i)}, "index": 0}]}, due)
+            sends.append(due)
         reported = USAGE_TOKENS if USAGE_TOKENS >= 0 else TOKENS
         usage = {"completion_tokens": reported}
         if PROMPT_TOKENS >= 0:
@@ -295,7 +330,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
-server = HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler)
+server = HTTPServer(("127.0.0.1", ARGS.port), Handler)
 if BOUND_FLAG:
     with open(BOUND_FLAG, "a", encoding="utf-8") as handle:
         handle.write(f"{os.getpid()}\n")
@@ -356,7 +391,8 @@ serve)
 		printf '%s\n' "{\"timestamp\":\"2026-09-03T00:00:00Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"cache-type resolved\",\"arch\":\"Stub\",\"kv_quant\":\"\${STUB_KV_QUANT:-mixed_k8g64_v4g64}\"}}" >>"\$log"
 	fi
 	export STUB_LOG="\$log" STUB_SPECULATIVE="\$speculative"
-	exec python3 "$SERVER_PY" "\$port"
+	# The case's own arguments for the stub server, one line, if it left any.
+	exec python3 "$SERVER_PY" "\$port" \$(cat "\$RMLX_HOME/stub_args" 2>/dev/null)
 	;;
 esac
 STUBEOF
@@ -396,6 +432,8 @@ sys.exit("no free port in 18000-19999")
 # ── Case driver ───────────────────────────────────────────────────────────────
 
 # run_case <name> <want-exit> <what-it-proves> [KEY=VALUE ...] [ARGS:flag ...]
+#          [CLIENT_SHIM:N] [NO_STAMPS:1] [READER_CLOCK:<step>]
+#          [STUB:<stub server arguments>]
 #          [GREP:pat ...]
 #
 # Stub defaults describe a run streaming eight tokens 50 ms apart, so the rate
@@ -411,20 +449,27 @@ run_case() {
 	CASE_HOME="$WORK/home_$CASE_NAME"
 	mkdir -p "$CASE_HOME/logs" "$CASE_HOME/metrics/buffer/pending"
 
-	local env_pairs=() greps=() extra_args=() a
+	local env_pairs=() greps=() extra_args=() a delayed=0 stamps=true stub_args="" step=""
 	for a in "$@"; do
 		case "$a" in
 		GREP:*) greps+=("${a#GREP:}") ;;
 		ARGS:*) extra_args+=("${a#ARGS:}") ;;
+		CLIENT_SHIM:*) delayed="${a#CLIENT_SHIM:}" ;;
+		NO_STAMPS:*) stamps=false ;;
+		READER_CLOCK:*) step="${a#READER_CLOCK:}" ;;
+		STUB:*) stub_args="$stub_args ${a#STUB:}" ;;
 		*) env_pairs+=("$a") ;;
 		esac
 	done
+	$stamps && extra_args+=(--server-stamps)
+	write_client_shim "$CASE_HOME/client" "$delayed" "$step"
+	printf '%s\n' "--marks $CASE_HOME/client$stub_args" >"$CASE_HOME/stub_args"
 
 	CASE_OUT="$WORK/$CASE_NAME.log"
 	local got=0
 	set +e
 	env -i \
-		PATH="$SHIM_DIR:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+		PATH="$CASE_HOME/client/bin:$SHIM_DIR:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
 		HOME="$WORK" \
 		RMLX_HOME="$CASE_HOME" \
 		VERIFIER_MODEL="$VERIFIER_DIR" \
@@ -445,7 +490,7 @@ run_case() {
 	set -e
 
 	CASE_BAD=""
-	[ "$got" -ne "$want" ] && CASE_BAD="exit=$got (want $want)"
+	[ "$want" != "-" ] && [ "$got" -ne "$want" ] && CASE_BAD="exit=$got (want $want)"
 	# However the run ended, it stopped the server it started: a server left
 	# alive holds the Metal claim after the harness is gone.
 	note_survivors "$CASE_HOME/stub_bound"
@@ -492,12 +537,14 @@ verdict() {
 
 # record_of <config> — the buffer path this case ingested, or the empty string.
 record_of() {
-	local hits
-	hits=$(echo "$CASE_HOME"/metrics/buffer/pending/*-"$1".json)
-	case "$hits" in
-	*'*'*) echo "" ;;
-	*) echo "${hits%% *}" ;;
-	esac
+	local f
+	for f in "$CASE_HOME"/tmp/stamped_records/*-"$1".json "$CASE_HOME"/metrics/buffer/pending/*-"$1".json; do
+		if [ -e "$f" ]; then
+			echo "$f"
+			return 0
+		fi
+	done
+	echo ""
 }
 
 # metric_of <config> <field> — `value` or `stddev` of decode_tps_warm.
@@ -663,6 +710,70 @@ run_case normal_arm_excludes_prefill 0 \
 	'GREP:.normal. cross-check ok'
 got="$(metric_of normal value)"
 close_to "$got" 20.0 0.15 || note_bad "normal decode_tps_warm=$got (want ~20, not ~4.3)"
+verdict
+
+# The client sends the request itself. A client fed by a separate `curl` could
+# start after the stream had begun and stamp the chunks it had missed all at its
+# own start, so the window shrank and the rate read high. The client shim here
+# starts the second client a second late, and every request of both servers must
+# still find its own client already running.
+run_case every_request_comes_from_a_running_client 0 \
+	"a client that starts late has not missed any of the stream" \
+	CLIENT_SHIM:2 \
+	'GREP:.normal. cross-check ok'
+[ "$(wc -l <"$CASE_HOME/client/seen" 2>/dev/null | tr -d ' ')" = "8" ] ||
+	note_bad "the stub saw $(wc -l <"$CASE_HOME/client/seen" 2>/dev/null | tr -d ' ') streamed requests (want 8, four on each of two servers)"
+[ "$(sort -u "$CASE_HOME/client/seen" 2>/dev/null)" = "up" ] ||
+	note_bad "a request reached a server before its client existed: $(sort -u "$CASE_HOME/client/seen" 2>/dev/null | tr '\n' ' ')"
+[ "$(grep -c -- '--server-stamps' "$CASE_HOME/client/reader_argv" 2>/dev/null)" = "8" ] ||
+	note_bad "not every client was asked to read the stub's stamps"
+verdict
+
+# The harness asks the client for the stub's stamps only when it is asked to.
+# Without the argument the stamps are comments, the client times the chunks, and
+# the run is whatever this host makes of an instant stub, so the exit code is not
+# asserted. What is asserted is what the client was told.
+run_case stamps_are_not_used_unless_asked - \
+	"the harness does not pass the stamps on by itself" \
+	NO_STAMPS:1
+[ -s "$CASE_HOME/client/reader_argv" ] || note_bad "no client ran"
+if grep -q -- '--server-stamps' "$CASE_HOME/client/reader_argv" 2>/dev/null; then
+	note_bad "a client was asked for stamps although the harness was not"
+fi
+verdict
+
+# A row made from the stub's stamps is not a measurement. The run keeps its rows
+# out of the queue `rmlx metrics record` reads and never calls it.
+run_case stamped_rows_are_not_filed 0 \
+	"a run timed by a stub's stamps files no row" \
+	'GREP:not filed'
+[ -n "$(record_of normal)" ] || note_bad "the run wrote no row to look at"
+if [ -n "$(ls -A "$CASE_HOME/metrics/buffer/pending" 2>/dev/null)" ]; then
+	note_bad "a stamped row is in the ingest queue: $(ls "$CASE_HOME/metrics/buffer/pending" | tr '\n' ' ')"
+fi
+if grep -q 'stub: recorded' "$CASE_OUT"; then
+	note_bad "a stamped run called the recorder"
+fi
+verdict
+
+# The other direction: a run on the client clock files its rows. The stub still
+# sends its stamp comments, which the client reads as lines, so each chunk is
+# three lines. The client clock here moves a third of the stub's 50 ms gap with
+# each line, so the client rate is exactly the engine's 20 tok/s and the
+# cross-check cannot refuse the run. The verdict is where the rows go, not a
+# rate, and no host clock is read.
+run_case unstamped_rows_go_to_the_queue_and_the_recorder 0 \
+	"a run timed by the client clock files its rows through the recorder" \
+	NO_STAMPS:1 READER_CLOCK:0.0166666667 \
+	'GREP:.normal. cross-check ok'
+for config in normal mtp; do
+	case "$(record_of "$config")" in
+	"$CASE_HOME"/metrics/buffer/pending/*) ;;
+	*) note_bad "the $config row is not in the ingest queue: $(record_of "$config")" ;;
+	esac
+done
+[ "$(grep -c 'stub: recorded' "$CASE_OUT")" = "2" ] ||
+	note_bad "the recorder was called $(grep -c 'stub: recorded' "$CASE_OUT") times (want once for each arm)"
 verdict
 
 # Two readings of one window that disagree are a finding, not a choice. The stub
@@ -1139,6 +1250,7 @@ sigterm_case() {
 	CASE_OUT="$WORK/$CASE_NAME.log"
 	CASE_BAD=""
 	mkdir -p "$CASE_HOME/logs" "$CASE_HOME/metrics/buffer/pending"
+	printf '%s\n' "--hold $CASE_HOME/hold" >"$CASE_HOME/stub_args"
 
 	env -i \
 		PATH="$SHIM_DIR:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
@@ -1148,28 +1260,34 @@ sigterm_case() {
 		DRAFTER_MODEL="$WORK/drafter" \
 		STUB_TOKENS=8 \
 		STUB_GAP_S=0.05 \
-		STUB_PREFILL_S=5 \
+		STUB_PREFILL_S=0.05 \
 		STUB_EMITTED=128 \
 		STUB_ELAPSED_MS=2560 \
 		STUB_DECODE_TPS_SEQ='"Some(20.0)"' \
 		STUB_PROMPT_TOKENS=1234 \
 		STUB_BOUND_FLAG="$CASE_HOME/stub_bound" \
-		bash "$FAKE_ROOT/scripts/spec_bench.sh" --port "$PORT" >"$CASE_OUT" 2>&1 &
+		bash "$FAKE_ROOT/scripts/spec_bench.sh" --port "$PORT" --server-stamps >"$CASE_OUT" 2>&1 &
 	local harness=$!
 
-	local waited=0
-	while [ ! -s "$CASE_HOME/stub_bound" ] && [ "$waited" -lt 200 ]; do
-		/bin/sleep 0.1
-		waited=$((waited + 1))
-	done
-	if [ ! -s "$CASE_HOME/stub_bound" ]; then
-		note_bad "the stub never bound; nothing was stopped"
+	request_held_or_harness_gone() {
+		[ -e "$CASE_HOME/hold.held" ] || ! kill -0 "$harness" 2>/dev/null
+	}
+	harness_gone() { ! kill -0 "$harness" 2>/dev/null; }
+
+	if ! wait_until 300 request_held_or_harness_gone || [ ! -e "$CASE_HOME/hold.held" ]; then
+		note_bad "no request was held within 300 s, or the harness ended before it sent one; nothing was stopped"
 		kill "$harness" 2>/dev/null || true
 		wait "$harness" 2>/dev/null || true
+		stop_stubs "$CASE_HOME/stub_bound"
 		return 0
 	fi
 
 	kill -TERM "$harness" 2>/dev/null || true
+	: >"$CASE_HOME/hold.release"
+	if ! wait_until 300 harness_gone; then
+		note_bad "the harness was still running 300 s after SIGTERM"
+		kill -9 "$harness" 2>/dev/null || true
+	fi
 	wait "$harness" 2>/dev/null || true
 	note_survivors "$CASE_HOME/stub_bound"
 	stop_stubs "$CASE_HOME/stub_bound"

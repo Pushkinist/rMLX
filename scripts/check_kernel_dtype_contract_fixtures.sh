@@ -50,7 +50,7 @@ for case in "${CASES[@]}"; do
     IFS='|' read -r name min want want_msg what <<<"$case"
     out=$("$GATE" "$FIX/$name" "$min" 2>&1)
     got=$?
-    if [ "$got" -eq "$want" ] && printf '%s' "$out" | grep -qF -- "$want_msg"; then
+    if [ "$got" -eq "$want" ] && grep -qF -- "$want_msg" <<<"$out"; then
         PASSED=$((PASSED + 1))
         printf '  ok   %-26s min=%s exit=%s — %s\n' "$name" "$min" "$got" "$what"
     else

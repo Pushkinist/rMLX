@@ -188,7 +188,7 @@ log "Waiting for server readiness on ${HEALTH_URL} ..."
 MAX_WAIT=120   # seconds
 POLL_INTERVAL=2
 elapsed=0
-until curl -s --max-time 2 "${HEALTH_URL}" | grep -q '"ok"'; do
+until curl -s --max-time 2 "${HEALTH_URL}" | grep '"ok"' >/dev/null; do
     if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
         log "Server process exited unexpectedly. Tail of log:"
         tail -20 "${SERVE_LOG}" >&2
@@ -385,7 +385,7 @@ _BUF_TS="$(date -u +%Y%m%d%H%M%S)"
 
 # Generate a short random hex suffix (lowercase 8 chars) for the buffer filename.
 if command -v uuidgen >/dev/null 2>&1; then
-    _BUF_UUID="$(uuidgen | tr 'A-Z' 'a-z' | tr -d '-' | head -c 8)"
+    _BUF_UUID="$(uuidgen | tr 'A-Z' 'a-z' | tr -d '-' | cut -c1-8)"
 else
     _BUF_UUID="$(python3 -c 'import uuid; print(uuid.uuid4().hex[:8])')"
 fi

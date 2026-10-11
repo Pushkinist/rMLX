@@ -95,7 +95,7 @@ if [ "${cargo_status}" -ne 0 ]; then
 fi
 
 grep -E '^KV(BYTES|FLOOR)	' "${WORK}/manifest.raw" >"${WORK}/rust.tsv" || true
-declared=$(grep '^KVBYTES-END	' "${WORK}/manifest.raw" | head -1 | cut -f2)
+declared=$(grep -m1 '^KVBYTES-END	' "${WORK}/manifest.raw" | cut -f2)
 actual=$(awk 'END { print NR }' "${WORK}/rust.tsv")
 
 [ -n "${declared}" ] || die_env "the manifest printed no END sentinel"

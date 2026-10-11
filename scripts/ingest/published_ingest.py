@@ -411,6 +411,15 @@ def gate(result: dict[str, Any], args: argparse.Namespace) -> None:
             "and its numbers measure nothing. There is no waiver for this: "
             "re-run against a real server."
         )
+    # A result without the key comes from a harness that had only the client clock.
+    clock = (result.get("protocol") or {}).get("client_clock", "client")
+    if clock != "client":
+        raise Refused(
+            f"the client rates of this run were timed by {clock!r}, not by the "
+            "client clock. A stub's own stamps make the cross-check compare the "
+            "stub with itself. There is no waiver for this: re-run against a real "
+            "server."
+        )
     if result.get("unverified_samples"):
         raise Refused(
             "the run measured a sample root that is not the pinned one "

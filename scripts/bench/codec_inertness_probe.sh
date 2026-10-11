@@ -217,15 +217,15 @@ for codec in "${CODECS[@]}"; do
 	# result — the exit code column is what tells the two apart.
 	ids_sha=""
 	if grep -q '^baseline: token_ids=' "$raw"; then
-		ids_sha="$(sed -n 's/^baseline: token_ids=//p' "$raw" | head -1 | shasum -a 256 | cut -c1-16)"
+		ids_sha="$(sed -n 's/^baseline: token_ids=//p' "$raw" | sed -n 1p | shasum -a 256 | cut -c1-16)"
 	fi
 
 	summary="$(grep -m1 '^baseline: model=' "$raw" || true)"
-	kv_bytes="$(sed -n 's/.*kv_cache_bytes=\([0-9]*\).*/\1/p' <<<"$summary" | head -1)"
-	measured="$(sed -n 's/.*prompt_tokens=\([0-9]*\).*/\1/p' <<<"$summary" | head -1)"
-	ttft="$(sed -n 's/.*ttft_ms=\([0-9.]*\).*/\1/p' <<<"$summary" | head -1)"
-	dtps="$(sed -n 's/.*decode_tps=\([0-9.]*\).*/\1/p' <<<"$summary" | head -1)"
-	ptps="$(sed -n 's/.*prefill_tps=\([0-9.]*\).*/\1/p' <<<"$summary" | head -1)"
+	kv_bytes="$(sed -n 's/.*kv_cache_bytes=\([0-9]*\).*/\1/p' <<<"$summary")"
+	measured="$(sed -n 's/.*prompt_tokens=\([0-9]*\).*/\1/p' <<<"$summary")"
+	ttft="$(sed -n 's/.*ttft_ms=\([0-9.]*\).*/\1/p' <<<"$summary")"
+	dtps="$(sed -n 's/.*decode_tps=\([0-9.]*\).*/\1/p' <<<"$summary")"
+	ptps="$(sed -n 's/.*prefill_tps=\([0-9.]*\).*/\1/p' <<<"$summary")"
 
 	skipped=0
 	if grep -q 'packed store skipped' "$raw"; then

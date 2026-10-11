@@ -215,10 +215,10 @@ if [ "$_CT_MODE" -eq 1 ]; then
       echo "[$(date +%T)] CELL FAIL no-baseline-line iter=$_i log=$_ITER_LOG" >&2
       exit 7
     fi
-    _LOAD_MS=$(echo "$_LINE" | grep -oE "load=[0-9.]+ms" | head -1 | sed -E 's/load=([0-9.]+)ms/\1/')
-    _TTFT_MS=$(echo "$_LINE" | grep -oE "TTFT=[0-9.]+ms" | head -1 | sed -E 's/TTFT=([0-9.]+)ms/\1/')
-    _TPS=$(echo "$_LINE" | grep -oE "TPS=[0-9.]+" | head -1 | sed -E 's/TPS=([0-9.]+)/\1/')
-    _RSS=$(echo "$_LINE" | grep -oE "peak_rss=[0-9.]+MB" | head -1 | sed -E 's/peak_rss=([0-9.]+)MB/\1/')
+    _LOAD_MS=$(echo "$_LINE" | grep -oE "load=[0-9.]+ms" | sed -nE '1s/load=([0-9.]+)ms/\1/p')
+    _TTFT_MS=$(echo "$_LINE" | grep -oE "TTFT=[0-9.]+ms" | sed -nE '1s/TTFT=([0-9.]+)ms/\1/p')
+    _TPS=$(echo "$_LINE" | grep -oE "TPS=[0-9.]+" | sed -nE '1s/TPS=([0-9.]+)/\1/p')
+    _RSS=$(echo "$_LINE" | grep -oE "peak_rss=[0-9.]+MB" | sed -nE '1s/peak_rss=([0-9.]+)MB/\1/p')
 
     if [ "$_i" -le "$_WARMUP_EFF" ]; then
       echo "[$(date +%T)] CT iter=$_i (warmup) tps=$_TPS" >&2
@@ -643,7 +643,7 @@ BACKEND_PID="$SERVER_PID"
 if [ "$BACKEND" != "rmlx" ]; then
   BACKEND_PID=""
   for _ in 1 2 3 4 5 6 7 8 9 10; do
-    BACKEND_PID="$(pgrep -P "$SERVER_PID" | head -1)"
+    BACKEND_PID="$(pgrep -P "$SERVER_PID" | sed -n 1p)"
     [ -n "$BACKEND_PID" ] && break
     kill -0 "$SERVER_PID" 2>/dev/null || break
     sleep 0.5
@@ -737,11 +737,11 @@ fi
 COLD_LINE=$(echo "$LINES" | sed -n '1p')
 WARM_LINE=$(echo "$LINES" | sed -n '2p')
 if [ -n "$COLD_LINE" ]; then
-  COLD_MS=$(echo "$COLD_LINE" | grep -oE "ttft=[0-9.]+ms" | head -1 | sed -E 's/ttft=([0-9.]+)ms/\1/')
+  COLD_MS=$(echo "$COLD_LINE" | grep -oE "ttft=[0-9.]+ms" | sed -nE '1s/ttft=([0-9.]+)ms/\1/p')
 fi
 if [ -n "$WARM_LINE" ]; then
-  WARM_MS=$(echo "$WARM_LINE" | grep -oE "ttft=[0-9.]+ms" | head -1 | sed -E 's/ttft=([0-9.]+)ms/\1/')
-  DECODE_TPS=$(echo "$WARM_LINE" | grep -oE "decode=[0-9.]+tps" | head -1 | sed -E 's/decode=([0-9.]+)tps/\1/')
+  WARM_MS=$(echo "$WARM_LINE" | grep -oE "ttft=[0-9.]+ms" | sed -nE '1s/ttft=([0-9.]+)ms/\1/p')
+  DECODE_TPS=$(echo "$WARM_LINE" | grep -oE "decode=[0-9.]+tps" | sed -nE '1s/decode=([0-9.]+)tps/\1/p')
 fi
 # Prefill TPS is deliberately NOT computed here. The formula this line used to
 # carry -- 8192000 / warm_ttft_ms -- was fabricated twice over: the 8192 was
@@ -754,11 +754,11 @@ fi
 PREFILL_TPS="n/a"
 
 # Success check per harness output.
-if echo "$LINES" | grep -q "success=False"; then SUCCESS=false; fi
-if echo "$LINES" | grep -q "err=other"; then SUCCESS=false; fi
+if grep -q "success=False" <<<"$LINES"; then SUCCESS=false; fi
+if grep -q "err=other" <<<"$LINES"; then SUCCESS=false; fi
 
 # Coherence: harness output_first_64 is in jsonl, examine.
-LATEST_JSONL=$(ls -t "$CBB"/metrics/runs/${BACKEND}_*.jsonl 2>/dev/null | head -1)
+LATEST_JSONL=$(ls -t "$CBB"/metrics/runs/${BACKEND}_*.jsonl 2>/dev/null | sed -n 1p)
 if [ -n "$LATEST_JSONL" ]; then
   FIRST64=$(python3 -c "import json; lines=open('$LATEST_JSONL').readlines(); rec=json.loads(lines[-1]); print((rec.get('output_first_64') or '')[:64])" 2>/dev/null)
   if [ -z "$FIRST64" ]; then COH=false; fi

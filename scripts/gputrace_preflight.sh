@@ -153,7 +153,7 @@ fi
 # turns into a confusing Xcode-side failure. Advisory, not fatal: capture
 # itself does not need it.
 if xcrun -sdk macosx metal --version >/dev/null 2>&1; then
-	pass "Metal toolchain present: $(xcrun -sdk macosx metal --version 2>&1 | head -1)"
+	pass "Metal toolchain present: $(xcrun -sdk macosx metal --version 2>&1 | sed -n 1p)"
 else
 	warn "Metal toolchain not installed — anything recompiling captured shaders will fail."
 	warn "Install it with:  xcodebuild -downloadComponent MetalToolchain"

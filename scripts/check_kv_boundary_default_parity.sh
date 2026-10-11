@@ -32,7 +32,7 @@ CLI_MAIN="${REPO_ROOT}/crates/rmlx-cli/src/main.rs"
 CLI_DOC="${REPO_ROOT}/docs/CLI.md"
 
 const_of() { # $1 = HEAD | TAIL
-	sed -n "s/^pub const DEFAULT_BOUNDARY_$1_N: usize = \([0-9]*\);.*/\1/p" "${SOURCE}" | head -1
+	sed -n "s/^pub const DEFAULT_BOUNDARY_$1_N: usize = \([0-9]*\);.*/\1/p" "${SOURCE}" | sed -n 1p
 }
 
 HEAD_N="$(const_of HEAD)"

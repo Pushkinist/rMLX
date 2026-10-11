@@ -17,31 +17,23 @@
 # exit code, and every refusal asserts the reason as well: a guard that refuses
 # for the wrong reason stops refusing when that reason moves.
 #
-# The host is supplied by a `ps` shim, so no case reads this machine's process
-# table and no verdict here depends on what else it is doing.
+# The host is supplied by a `ps` shim and the clock by a `date` shim, so no case
+# reads this machine's process table or its time and no verdict here depends on
+# what else it is doing.
 # `--synthetic-arms` is the boundary between a run that measures and a run that
 # exercises this logic, and it is pinned in both directions: the host gates
 # still fire without it, and with it a hostile host and a quiet host reach the
 # same verdict.
 #
-# ONE THING HERE IS STILL WALL-CLOCK SENSITIVE, and it is bounded rather than
-# claimed away. The harness cross-checks the engine's decode rate against the
-# same window timed at the client, and the client is `curl | python3`, so a cold
-# interpreter start can slide the first content chunk's stamp forward and shrink
-# the window. The stub therefore holds its first content chunk behind a prefill
-# pause an order of magnitude longer than an interpreter start; the pause is
-# outside the measured window by construction, so it costs wall time and biases
-# nothing. Under two concurrent suites the observed slip was ~30 ms against a
-# 150 ms pause.
-#
-# The other direction — a scheduling delay stretching the window itself, past
-# the first chunk — is the one a busy `make ci` was seen tripping: a plain
-# run's window widened from 200 ms to 360 ms (see `_PLAIN_TOKENS`) for the same
-# reason, more room for the same absolute delay to be a smaller fraction of.
-# The 10% cross-check band this is timed against is not touched by either
-# mitigation, and neither makes the dependency go away: every plain-arm case
-# still drives a real streamed response and reads this host's real clock over
-# it, by construction, not only under load.
+# NO VERDICT HERE READS THIS HOST'S CLOCK. The harness cross-checks the
+# engine's decode rate against the same window read at the client. The stub
+# stamps every content chunk with the time it is due (`: sent-at=`) and every
+# case passes `--server-stamps`, so the client reads those stamps and the window
+# is exact whatever else the machine is doing. A stamped result is not a
+# measurement: it says `client_clock: server_stamps`, and the ingest refuses it.
+# The path with no stamps, which is the one a real server takes, is held by
+# cases that feed the reader a stream whose clock moves only as lines are
+# delivered, and by a case that shows the client sends the request itself.
 #
 # No GPU, no model, no DB.
 #
@@ -56,6 +48,9 @@ AGGREGATE="${REPO_ROOT}/scripts/lib/published_aggregate.py"
 PUBLISHED="${REPO_ROOT}/prompts/published"
 
 [ -r "${HARNESS}" ] || { echo "ERROR: missing ${HARNESS}" >&2; exit 2; }
+
+# shellcheck source=scripts/lib/selftest_support.sh
+. "${REPO_ROOT}/scripts/lib/selftest_support.sh"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/rmlx_published_selftest.XXXXXX")" || exit 2
 trap 'rm -rf "${WORK}"' EXIT
@@ -163,12 +158,10 @@ printf '%s\n' '{"temperature": 0.0, "top_p": 1.0, "top_k": 0}' \
 
 # ── Shims ─────────────────────────────────────────────────────────────────────
 #
-# `sleep` turns the harness's waits into nothing.
+# `sleep` shortens the harness's waits to 50 ms. Nothing reads their length: the
+# host windows come from the `ps` shim and the pass length from the `date` shim.
 SHIMS="${WORK}/shims"
 mkdir -p "${SHIMS}"
-# Not a no-op: the harness starts a fresh server on the same port every pass and
-# its own 3 s settle is what keeps the next bind off the previous listener. 50 ms
-# keeps that ordering while costing the suite seconds rather than minutes.
 printf '#!/bin/sh\nexec /bin/sleep 0.05\n' >"${SHIMS}/sleep"
 # The thermal reading is a machine reading, so it is shimmed for the same reason
 # the process table is: no verdict here may depend on what this Mac's thermal
@@ -178,7 +171,21 @@ cat >"${SHIMS}/pmset" <<'PMSETEOF'
 #!/bin/sh
 echo "Note: No thermal warning level has been recorded"
 PMSETEOF
-chmod +x "${SHIMS}/sleep" "${SHIMS}/pmset"
+# The harness measures a pass in whole seconds with `date +%s`. Against a stub
+# that answers at once a pass takes under a second and its host window would be
+# empty, so `+%s` reads a counter that moves one second per call, kept in a file
+# beside the shim. Any other format is the real date.
+cat >"${SHIMS}/date" <<'DATEEOF'
+#!/bin/sh
+if [ "$1" = "+%s" ]; then
+	n=$(cat "$0.count" 2>/dev/null || echo 1000000)
+	echo $((n + 1)) >"$0.count"
+	echo "$n"
+else
+	exec /bin/date "$@"
+fi
+DATEEOF
+chmod +x "${SHIMS}/sleep" "${SHIMS}/pmset" "${SHIMS}/date"
 
 # A Mac that posted a level and is at full speed, one that is being held back,
 # and one where the tool is not there to ask.
@@ -228,19 +235,35 @@ SERVER_PY="${WORK}/stub_server.py"
 cat >"${SERVER_PY}" <<'PYEOF'
 """Canned OpenAI-compatible server for the published-harness selftest.
 
-Streams STUB_TOKENS content chunks a nominal gap apart, after a prefill pause,
-then a usage block. STUB_GAP_MS is a gap matrix: `;` separates passes, `,`
-separates requests within a pass, and the last entry of each list repeats. The
-chunks go out on a fixed schedule so the per-chunk framing cost falls inside the
-gap rather than being added to it — the wire really does carry 1000/gap tok/s,
-which is what the client cross-check compares against.
+Streams STUB_TOKENS content chunks a nominal gap apart, then a usage block.
+STUB_GAP_MS is a gap matrix: `;` separates passes, `,` separates requests within
+a pass, and the last entry of each list repeats. The stub does not wait between
+chunks. Each content chunk is preceded by `: sent-at=<seconds>`, the time the
+chunk is due on a fixed schedule, and the client reads that stamp instead of its
+own clock. The wire really does carry 1000/gap tok/s, which is what the client
+cross-check compares against, and no scheduling delay can move it.
 
-STUB_PREFILL_S is long on purpose. The client is `curl | python3`, and the
-window is timed from the moment PYTHON stamps the first content chunk; a cold
-interpreter start would slide that forward and shrink the window. The pause is
-outside the window by construction, so holding the first content chunk behind
-one an order of magnitude longer than an interpreter start costs wall time and
-biases nothing.
+Arguments after the port. The stub binary reads them from the file `stub_args`
+in the case's RMLX_HOME, so a case sets them and no environment variable carries
+them:
+
+  --marks DIR          before each streamed request, note in DIR/seen whether the
+                       client that sent it had already left DIR/mark.N (N counts
+                       the streamed requests over every server of the case)
+  --hold PREFIX        after its role chunk, the first streamed request creates
+                       PREFIX.held and waits for PREFIX.release, so a case can
+                       act while a request is in flight
+  --hold-wait SECONDS  how long that wait lasts at most (300)
+  --sample-wait SECONDS  how long the fixed-prompt request waits for a /metrics
+                       reading that arrives while it is in flight (120)
+  --inflight-log FILE  note each /metrics reading served while a request is in
+                       flight
+
+`/metrics` answers PHYS_BYTES while a streamed request is in flight and half of
+it otherwise, so a resident peak read outside the request is a different number.
+The server takes requests on threads, as the real one does. On the plain arm the
+second streamed request of a server is the fixed prompt, and it waits for one
+in-flight /metrics reading: the harness's poller always has a sample to file.
 
 Per request it appends to the run log the events the harness reads back:
 
@@ -258,11 +281,22 @@ window agrees with it. STUB_ITL_MEAN_MS overrides the first, which is how a
 disagreement is staged.
 """
 
+import argparse
 import json
 import os
 import sys
+import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+parser = argparse.ArgumentParser()
+parser.add_argument("port", type=int)
+parser.add_argument("--marks", default="")
+parser.add_argument("--hold", default="")
+parser.add_argument("--hold-wait", type=float, default=300.0)
+parser.add_argument("--sample-wait", type=float, default=120.0)
+parser.add_argument("--inflight-log", default="")
+ARGS = parser.parse_args()
 
 
 def gap_matrix(raw):
@@ -273,25 +307,12 @@ def gap_matrix(raw):
     ]
 
 
-# The round-loop math below (`emitted = TOKENS`) is written against a fixed
-# token count, so the speculative arm keeps the short default. A plain run has
-# no such fixed expectation, and its engine-vs-client cross-check is exactly
-# the one a busy host was seen tripping: `mean_ms` (the engine's declared
-# rate) is a config value the wire's real pacing cannot move, so a scheduling
-# delay only stretches the *client's* measured window. A longer wire — more
-# chunks at the same nominal gap, so the declared rate is unchanged — gives
-# that same delay a bigger window to be a small fraction of. The window is
-# `(TOKENS - 1) * gap`: six chunks at the default 40 ms gap is 200 ms, ten is
-# 360 ms — 1.8x, not the round number the chunk count suggests. Against the
-# two recorded trips (10.2%, 11.0% past the band on the 200 ms window) that
-# leaves roughly 5.7% and 6.1%, comfortably inside the 10% band without
-# touching it. This mitigates the same absolute delay; it does not make the
-# window immune to a larger one.
-_PLAIN_TOKENS = "6" if os.environ.get("STUB_SPECULATIVE", "") == "1" else "10"
-TOKENS = int(os.environ.get("STUB_TOKENS", _PLAIN_TOKENS))
+TOKENS = int(os.environ.get("STUB_TOKENS", "6"))
 GAP_MS = gap_matrix(os.environ.get("STUB_GAP_MS", "") or "40")
 PASS = int(os.environ.get("STUB_PASS", "1"))
-PREFILL_S = float(os.environ.get("STUB_PREFILL_S", "0.15"))
+# The first content chunk is stamped this long after the role chunk, so a client
+# that timed from the role chunk would read a rate lower than the wire's.
+PREFILL_S = 0.15
 PROMPT_TOKENS = int(os.environ.get("STUB_PROMPT_TOKENS", "1234"))
 USAGE_TOKENS = int(os.environ.get("STUB_USAGE_TOKENS", "-1"))
 # A pass that generates a different length than the others. Every request
@@ -329,6 +350,9 @@ BODIES = os.environ.get("STUB_BODIES", "")
 BOUND_FLAG = os.environ.get("STUB_BOUND_FLAG", "")
 
 served = 0
+FLIGHT = threading.Condition()
+in_flight = 0
+metrics_in_flight = 0
 
 
 def pick(values, index):
@@ -423,11 +447,22 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def do_GET(self):
+        global metrics_in_flight
         if self.path == "/metrics":
+            with FLIGHT:
+                flying = in_flight > 0
+                if flying:
+                    metrics_in_flight += 1
+                    FLIGHT.notify_all()
+            if flying and ARGS.inflight_log:
+                with open(ARGS.inflight_log, "a", encoding="utf-8") as handle:
+                    handle.write("in-flight reading\n")
             if MEM_SUPPRESS:
                 self._text("rmlx_uptime_seconds 1\n")
                 return
-            phys, rss = (0, 0) if MEM_ZERO else (PHYS_BYTES, RSS_BYTES)
+            phys, rss = (PHYS_BYTES, RSS_BYTES) if flying else (PHYS_BYTES // 2, RSS_BYTES // 2)
+            if MEM_ZERO:
+                phys, rss = 0, 0
             self._text(
                 f"rmlx_process_rss_bytes {rss}\n"
                 f"rmlx_process_phys_footprint_bytes {phys}\n"
@@ -436,7 +471,7 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"object": "list", "data": []})
 
     def do_POST(self):
-        global served
+        global in_flight
         body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
         if BODIES:
             with open(BODIES, "ab") as handle:
@@ -454,24 +489,52 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
 
+        with FLIGHT:
+            in_flight += 1
+            readings_before = metrics_in_flight
+        try:
+            self._stream(request, readings_before)
+        finally:
+            with FLIGHT:
+                in_flight -= 1
+
+    def _stream(self, request, readings_before):
+        global served
         this_gap_ms = gap_ms()
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
 
-        def chunk(payload):
+        def chunk(payload, sent_at=None):
+            if sent_at is not None:
+                self.wfile.write(f": sent-at={sent_at}\n".encode())
             self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode())
             self.wfile.flush()
 
-        chunk({"choices": [{"delta": {"role": "assistant"}, "index": 0}]})
-        time.sleep(PREFILL_S)
-        start = time.monotonic()
+        if ARGS.marks:
+            seen = os.path.join(ARGS.marks, "seen")
+            number = 1
+            if os.path.exists(seen):
+                with open(seen, encoding="utf-8") as handle:
+                    number += len(handle.readlines())
+            up = os.path.exists(os.path.join(ARGS.marks, f"mark.{number}"))
+            with open(seen, "a", encoding="utf-8") as handle:
+                handle.write("up\n" if up else "down\n")
+        chunk({"choices": [{"delta": {"role": "assistant"}, "index": 0}]}, 0.0)
+        if ARGS.hold:
+            open(ARGS.hold + ".held", "w").close()
+            # A poll for the file the case creates; the limit ends a stub whose
+            # case has died.
+            deadline = time.monotonic() + ARGS.hold_wait
+            while not os.path.exists(ARGS.hold + ".release") and time.monotonic() < deadline:
+                time.sleep(0.05)
+        if not SPECULATIVE and served == 1:
+            with FLIGHT:
+                FLIGHT.wait_for(lambda: metrics_in_flight > readings_before,
+                                timeout=ARGS.sample_wait)
         for i in range(TOKENS):
-            due = start + i * this_gap_ms / 1000.0
-            remaining = due - time.monotonic()
-            if remaining > 0:
-                time.sleep(remaining)
-            chunk({"choices": [{"delta": {"content": f"t{i} "}, "index": 0}]})
+            chunk({"choices": [{"delta": {"content": f"t{i} "}, "index": 0}]},
+                  PREFILL_S + i * this_gap_ms / 1000.0)
         usage = {}
         if not OMIT_COMPLETION_TOKENS:
             count = USAGE_TOKENS if USAGE_TOKENS >= 0 else TOKENS
@@ -509,7 +572,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
-server = HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler)
+server = ThreadingHTTPServer(("127.0.0.1", ARGS.port), Handler)
+server.daemon_threads = True
 if BOUND_FLAG:
     with open(BOUND_FLAG, "a", encoding="utf-8") as handle:
         handle.write(f"{os.getpid()}\n")
@@ -567,7 +631,7 @@ serve)
 	echo "\$started" >"\$RMLX_HOME/pass.cnt"
 	pass=\$started
 	[ "\$speculative" = 0 ] && pass=\$((started - 1))
-	log="\$RMLX_HOME/logs/\$(date +%s)-\$\$-p\$pass.jsonl"
+	log="\$RMLX_HOME/logs/stub-\$\$-p\$pass.jsonl"
 	: >"\$log"
 	if [ -z "\${STUB_PID_SUPPRESS:-}" ]; then
 		printf '%s\n' "{\"timestamp\":\"2026-09-06T00:00:00Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"rmlx start\",\"version\":\"9.9.9\",\"run_id\":\"stub\",\"pid\":\$\$}}" >>"\$log"
@@ -580,7 +644,8 @@ serve)
 		printf '%s\n' "{\"timestamp\":\"2026-09-06T00:00:00Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"cache-type resolved\",\"arch\":\"Stub\",\"kv_quant\":\"\$kv\"}}" >>"\$log"
 	fi
 	export STUB_LOG="\$log" STUB_SPECULATIVE="\$speculative" STUB_PASS="\$pass"
-	exec python3 "${SERVER_PY}" "\$port"
+	# The case's own arguments for the stub server, one line, if it left any.
+	exec python3 "${SERVER_PY}" "\$port" \$(cat "\$RMLX_HOME/stub_args" 2>/dev/null)
 	;;
 esac
 STUBEOF
@@ -621,7 +686,10 @@ sys.exit("no free port in 18000-19999")
 # run_case <name> <want-exit> <what-it-proves> [KEY=VALUE ...] [ARGS:flag ...]
 #          [HOST:quiet|hostile|flaky] [THERM:nominal|throttled|unreadable]
 #          [VERIFIER:dir] [MEASURED:1] [CANONICAL:1] [MARKERLESS:1]
+#          [CLIENT_SHIM:N] [NO_STAMPS:1] [STUB:<stub server arguments>]
 #          [GREP:pat ...] [NOGREP:pat ...]
+#
+# <want-exit> `-` accepts any exit code.
 #
 # Defaults: a quiet host, --synthetic-arms, the healthy verifier snapshot, and
 # the shrunken sample sets reached through --samples-root — the unverified
@@ -630,10 +698,8 @@ sys.exit("no free port in 18000-19999")
 # whose prompts/published IS the shrunken copy, which is how the default path is
 # shown to verify.
 #
-# The stub streams tokens 40 ms apart behind a 150 ms prefill — 25 tok/s on the
-# wire and 25 reported by the engine, at any token count. A plain run streams
-# ten (see `_PLAIN_TOKENS` in the stub source above); the speculative arm
-# keeps six, because its round-loop fixtures are written against that count.
+# The stub streams six tokens 40 ms apart, stamped behind a 150 ms prefill — 25
+# tok/s on the wire and 25 reported by the engine, at any token count.
 # Its prompt count is four characters per token above a base of 100, so the
 # fixed-length prompt's fit is a real search over the corpus rather than a
 # fixed answer handed back.
@@ -648,7 +714,7 @@ run_case() {
 
     local env_pairs=() greps=() nogreps=() extra_args=() host="quiet" a
     local synthetic=true verifier="${VERIFIER}" canonical=false
-    local therm="${SHIMS}" markerless=false
+    local therm="${SHIMS}" markerless=false delayed=0 stamps=true stub_args=""
     for a in "$@"; do
         case "$a" in
         GREP:*) greps+=("${a#GREP:}") ;;
@@ -658,12 +724,18 @@ run_case() {
         MEASURED:*) synthetic=false ;;
         CANONICAL:*) canonical=true ;;
         MARKERLESS:*) markerless=true ;;
+        CLIENT_SHIM:*) delayed="${a#CLIENT_SHIM:}" ;;
+        NO_STAMPS:*) stamps=false ;;
+        STUB:*) stub_args="${stub_args} ${a#STUB:}" ;;
         THERM:*) therm="${WORK}/therm_${a#THERM:}" ;;
         VERIFIER:*) verifier="${a#VERIFIER:}" ;;
         *) env_pairs+=("$a") ;;
         esac
     done
     $synthetic && extra_args+=(--synthetic-arms)
+    $stamps && extra_args+=(--server-stamps)
+    write_client_shim "${CASE_HOME}/client" "${delayed}"
+    printf '%s\n' "--marks ${CASE_HOME}/client${stub_args}" >"${CASE_HOME}/stub_args"
     local root="${FAKE_ROOT}"
     if $canonical; then
         root="${CANON_ROOT}"
@@ -675,7 +747,7 @@ run_case() {
     CASE_OUT="${WORK}/${CASE_NAME}.log"
     local got=0
     env -i \
-        PATH="${WORK}/${host}:${therm}:${SHIMS}:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+        PATH="${CASE_HOME}/client/bin:${WORK}/${host}:${therm}:${SHIMS}:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
         HOME="${WORK}" \
         RMLX_HOME="${CASE_HOME}" \
         STUB_BOUND_FLAG="${CASE_HOME}/stub_bound" \
@@ -689,7 +761,7 @@ run_case() {
     stop_stubs "${CASE_HOME}/stub_bound"
 
     CASE_BAD=""
-    [ "${got}" -ne "${want}" ] && CASE_BAD="exit=${got} (want ${want})"
+    [ "${want}" != "-" ] && [ "${got}" -ne "${want}" ] && CASE_BAD="exit=${got} (want ${want})"
     if grep -q '\[server\] pid=' "${CASE_OUT}"; then
         [ -s "${CASE_HOME}/stub_bound" ] ||
             note_bad "the stub never bound port ${PORT} — something else answered"
@@ -778,12 +850,10 @@ run_case three_passes_of_every_sample 0 \
     "the result holds three passes of every sample and nothing else"
 [ "$(jq_of "len(r['samples'])")" = "24" ] ||
     note_bad "the result holds $(jq_of "len(r['samples'])") rows (want 3 x 8)"
-# A plain run's completion length is the window the engine-vs-client
-# cross-check is timed over, not the speculative arm's fixed six — pinned here
-# so a revert of the widening that mitigates the load flake fails a case
-# rather than only losing margin silently.
-[ "$(jq_of "sorted({s['completion_tokens'] for s in r['samples']})")" = "[10]" ] ||
-    note_bad "completion_tokens=$(jq_of "sorted({s['completion_tokens'] for s in r['samples']})") (want [10])"
+# Every request of the stub streams six tokens, plain arm or speculative; the
+# round-loop fixtures are written against that count.
+[ "$(jq_of "sorted({s['completion_tokens'] for s in r['samples']})")" = "[6]" ] ||
+    note_bad "completion_tokens=$(jq_of "sorted({s['completion_tokens'] for s in r['samples']})") (want [6])"
 [ "$(jq_of "sorted({s['pass'] for s in r['samples']})")" = "[1, 2, 3]" ] ||
     note_bad "passes=$(jq_of "sorted({s['pass'] for s in r['samples']})")"
 verdict
@@ -1514,6 +1584,287 @@ run_case synthetic_arms_consults_no_thermometer 0 \
     note_bad "a run that consulted nothing filed a reading: $(jq_of "r['host']['thermal']")"
 verdict
 
+# ── The client ────────────────────────────────────────────────────────────────
+#
+# The client sends the request itself. A client fed by a separate `curl` could
+# start after the stream had begun and stamp the chunks it had missed all at its
+# own start, so the window shrank and the rate read high. The client shim here
+# starts the second client a second late, and every request of every server of
+# the case must still find its own client already running.
+run_case every_request_comes_from_a_running_client 0 \
+    "a client that starts late has not missed any of the stream" \
+    CLIENT_SHIM:2
+[ "$(wc -l <"${CASE_HOME}/client/seen" 2>/dev/null | tr -d ' ')" = "30" ] ||
+    note_bad "the stub saw $(wc -l <"${CASE_HOME}/client/seen" 2>/dev/null | tr -d ' ') streamed requests (want 30, ten on each of three servers)"
+[ "$(sort -u "${CASE_HOME}/client/seen" 2>/dev/null)" = "up" ] ||
+    note_bad "a request reached a server before its client existed: $(sort -u "${CASE_HOME}/client/seen" 2>/dev/null | tr '\n' ' ')"
+[ "$(grep -c -- '--server-stamps' "${CASE_HOME}/client/reader_argv" 2>/dev/null)" = "30" ] ||
+    note_bad "not every client was asked to read the stub's stamps"
+[ "$(jq_of "r['protocol']['client_clock']")" = "server_stamps" ] ||
+    note_bad "the result does not say its clock: $(jq_of "r['protocol']['client_clock']")"
+verdict
+
+# The harness asks the client for the stub's stamps only when it is asked to.
+# Without the argument the stamps are comments, the client times the chunks, and
+# the run is whatever this host makes of an instant stub, so the exit code is
+# not asserted. What is asserted is what the client was told.
+run_case stamps_are_not_used_unless_asked - \
+    "the harness does not pass the stamps on by itself" \
+    NO_STAMPS:1
+[ -s "${CASE_HOME}/client/reader_argv" ] || note_bad "no client ran"
+if grep -q -- '--server-stamps' "${CASE_HOME}/client/reader_argv" 2>/dev/null; then
+    note_bad "a client was asked for stamps although the harness was not"
+fi
+verdict
+
+# The reader on the path a real server takes: no stamps, so every chunk is timed
+# by the reader's own clock when it is read. These cases give it a response whose
+# clock moves only as lines are handed over, so they read no host clock. A reader
+# that took the whole response and then split it would stamp every chunk with one
+# instant and have no window.
+READER_CASES="${WORK}/reader_cases.py"
+cat >"${READER_CASES}" <<'PYEOF'
+import contextlib
+import importlib.util
+import io
+import json
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+
+READER = sys.argv[2]
+spec = importlib.util.spec_from_file_location("sse", READER)
+sse = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(sse)
+
+CHUNK = b'data: {"choices": [{"delta": {"content": "t"}}]}\n'
+BLANK = b"\n"
+DONE = b"data: [DONE]\n"
+
+
+def stamp(seconds):
+    return f": sent-at={seconds}\n".encode()
+
+
+class Delivery:
+    """A response whose clock moves half a second for each line handed over."""
+
+    chunked = False
+    length = None
+
+    def __init__(self, lines):
+        self.lines = list(lines)
+        self.now = 10.0
+
+    def readline(self):
+        if not self.lines:
+            return b""
+        self.now += 0.5
+        return self.lines.pop(0)
+
+    def read(self):
+        self.now += 0.5
+        rest = b"".join(self.lines)
+        self.lines = []
+        return rest
+
+
+def run(lines, *flags):
+    delivery = Delivery(lines)
+    sse.post = lambda url, body: delivery
+    sse.time.monotonic = lambda: delivery.now
+    with tempfile.NamedTemporaryFile(delete=False) as body:
+        body.write(b"{}")
+    out, err = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = sse.main(["--url", "http://x/y", "--body-file", body.name, *flags])
+    finally:
+        os.unlink(body.name)
+    return code, out.getvalue(), err.getvalue()
+
+
+def expect(what, got, want):
+    assert got == want, f"{what}: got {got!r}, want {want!r}"
+
+
+def case_delivery():
+    plain = [CHUNK, BLANK, CHUNK, BLANK, CHUNK, BLANK, DONE]
+    code, out, _ = run(plain)
+    expect("exit", code, 0)
+    assert "clock=client\n" in out and "decode_tps=1.000000\n" in out, out
+
+    stamped = [stamp(0.0), CHUNK, BLANK, stamp(0.1), CHUNK, BLANK, stamp(0.2), CHUNK, BLANK, DONE]
+    code, out, _ = run(stamped, "--server-stamps")
+    expect("exit with stamps", code, 0)
+    assert "clock=server_stamps\n" in out and "decode_tps=10.000000\n" in out, out
+
+    code, out, _ = run(stamped)
+    expect("exit without the argument", code, 0)
+    assert "clock=client\n" in out and "decode_tps=0.666667\n" in out, out
+
+
+def case_stamps():
+    def stamped(*seconds):
+        lines = []
+        for value in seconds:
+            lines += [] if value is None else [stamp(value)]
+            lines += [CHUNK, BLANK]
+        return lines + [DONE]
+
+    for what, seconds, named in (
+        ("inf", (0.0, "inf", 0.3), "sent-at=inf is not a finite time"),
+        ("nan", (0.0, "nan", 0.3), "sent-at=nan is not a finite time"),
+        ("not a number", (0.0, "soon", 0.3), "not a number"),
+        ("equal", (0.0, 0.1, 0.1), "content chunk 3: sent-at=0.1 does not come after chunk 2"),
+        ("decreasing", (0.0, 0.2, 0.1), "content chunk 3: sent-at=0.1 does not come after chunk 2"),
+        ("missing on one chunk", (0.0, None, 0.2), "content chunk 2 has no sent-at stamp"),
+    ):
+        code, out, err = run(stamped(*seconds), "--server-stamps")
+        expect(f"{what}: exit", code, 5)
+        expect(f"{what}: output", out, "")
+        assert named in err, f"{what}: the error does not say {named!r}: {err!r}"
+
+
+def event(i):
+    return ("data: " + json.dumps({"choices": [{"delta": {"content": f"t{i} "}}]}) + "\n\n").encode()
+
+
+def chunked(body):
+    return f"{len(body):x}\r\n".encode() + body + b"\r\n"
+
+
+CHUNKED_HEAD = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"
+EVENTS = [chunked(event(i)) for i in range(3)]
+DONE_CHUNK = chunked(b"data: [DONE]\n\n")
+
+# name: (what the server sends, exit code the client has to give)
+SERVERS = {
+    "chunked, complete": (CHUNKED_HEAD + b"".join(EVENTS) + DONE_CHUNK + b"0\r\n\r\n", 0),
+    "chunked, stops at a chunk boundary": (CHUNKED_HEAD + b"".join(EVENTS), 4),
+    "chunked, stops after [DONE] with no last chunk": (CHUNKED_HEAD + b"".join(EVENTS) + DONE_CHUNK, 4),
+    "chunked, stops inside a chunk": (CHUNKED_HEAD + b"".join(EVENTS) + b'40\r\ndata: {"cho', 4),
+    "length, body short": (
+        b"HTTP/1.1 200 OK\r\nContent-Length: 500\r\n\r\n" + event(0) + event(1),
+        4,
+    ),
+    "close-delimited, complete": (
+        b"HTTP/1.0 200 OK\r\n\r\n" + event(0) + event(1) + b"data: [DONE]\n\n",
+        0,
+    ),
+}
+
+
+def serve_once(reply):
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+
+    def answer():
+        connection, _ = listener.accept()
+        with connection:
+            # Read the whole request, body included, before the reply: a close
+            # with request bytes unread resets the connection and the client
+            # loses the reply.
+            seen = b""
+            while b"\r\n\r\n" not in seen:
+                seen += connection.recv(4096)
+            head, _, body = seen.partition(b"\r\n\r\n")
+            owed = int(head.lower().split(b"content-length:")[1].split(b"\r\n")[0])
+            while len(body) < owed:
+                body += connection.recv(4096)
+            connection.sendall(reply)
+        listener.close()
+
+    threading.Thread(target=answer, daemon=True).start()
+    return listener.getsockname()[1]
+
+
+# The client runs under a launcher that holds the body back 50 ms after the
+# headers, so the server always has to deal with a request that arrives in two
+# parts.
+SPLIT_REQUEST = (
+    "import http.client, runpy, sys, time\n"
+    "send = http.client.HTTPConnection.send\n"
+    "def late(self, data):\n"
+    "    if not bytes(data).startswith(b'POST'):\n"
+    "        time.sleep(0.05)\n"
+    "    return send(self, data)\n"
+    "http.client.HTTPConnection.send = late\n"
+    "sys.argv = sys.argv[1:]\n"
+    "runpy.run_path(sys.argv[0], run_name='__main__')\n"
+)
+
+
+def read_response(port, raw_path):
+    with tempfile.NamedTemporaryFile(delete=False) as body:
+        body.write(b"{}")
+    try:
+        done = subprocess.run(
+            [sys.executable, "-c", SPLIT_REQUEST, READER,
+             "--url", f"http://127.0.0.1:{port}/v1/x",
+             "--body-file", body.name, "--raw", raw_path],
+            capture_output=True, text=True, timeout=120,
+        )
+    finally:
+        os.unlink(body.name)
+    return done
+
+
+def case_cut():
+    for name, (reply, want) in SERVERS.items():
+        with tempfile.TemporaryDirectory() as scratch:
+            raw = os.path.join(scratch, "raw.txt")
+            with open(raw, "w") as old:
+                old.write("0.000001 data: ANOTHER REQUEST\n")
+            done = read_response(serve_once(reply), raw)
+            expect(f"{name}: exit ({done.stderr.strip()})", done.returncode, want)
+            if want:
+                assert "did not end as a complete response" in done.stderr, (name, done.stderr)
+            with open(raw) as handle:
+                kept = handle.read()
+            assert "ANOTHER REQUEST" not in kept, f"{name}: --raw still holds an earlier request"
+            assert kept.count("data:") >= 1, f"{name}: --raw holds none of this response: {kept!r}"
+
+    # A request that never reaches a server leaves no data of an earlier one.
+    refused = socket.socket()
+    refused.bind(("127.0.0.1", 0))
+    port = refused.getsockname()[1]
+    refused.close()
+    with tempfile.TemporaryDirectory() as scratch:
+        raw = os.path.join(scratch, "raw.txt")
+        with open(raw, "w") as old:
+            old.write("0.000001 data: ANOTHER REQUEST\n")
+        done = read_response(port, raw)
+        expect("refused: exit", done.returncode, 4)
+        with open(raw) as handle:
+            expect("refused: --raw", handle.read(), "")
+
+
+globals()["case_" + sys.argv[1]]()
+PYEOF
+reader_case() { # reader_case <name> <what> <case-fn>
+    CASE_NAME="$1"
+    CASE_WHAT="$2"
+    CASE_OUT="${WORK}/${CASE_NAME}.log"
+    python3 "${READER_CASES}" "$3" "${REPO_ROOT}/scripts/lib/sse_decode_window.py" >"${CASE_OUT}" 2>&1
+    local got=$?
+    CASE_BAD=""
+    [ "${got}" -ne 0 ] && CASE_BAD="exit=${got} (want 0)"
+}
+reader_case reader_times_chunks_as_they_are_delivered \
+    "the client's own clock times each chunk as it arrives; stamps count only when asked" delivery
+verdict
+reader_case reader_refuses_unusable_stamps \
+    "a stamp that is not finite, not increasing or missing is an error that names it" stamps
+verdict
+reader_case reader_fails_on_a_response_cut_short \
+    "a stream that does not end as a complete response fails, and --raw is this request's alone" cut
+verdict
+
 # ── The fixed-length prompt ───────────────────────────────────────────────────
 #
 # The stub charges one token per four characters above a base of 100, so the fit
@@ -1553,6 +1904,24 @@ verdict
 # The protocol's fixed-prompt figure is the AUTOREGRESSIVE one. A rate a drafter
 # produced is not that, and publishing it under that name is the comparison this
 # whole harness exists to make honest.
+# The stub answers /metrics with the full figure only while a streamed request is
+# in flight, and with half of it otherwise, and the fixed-prompt request waits for
+# one such reading. A harness that stops polling gets no in-flight reading and
+# the request waits out --sample-wait before the run is refused; one that reads
+# the gauge before or after the request files half the peak.
+run_case memory_is_read_while_the_request_is_in_flight 0 \
+    "the fixed prompt's resident peak has a reading taken during the request" \
+    "STUB:--inflight-log ${WORK}/home_memory_is_read_while_the_request_is_in_flight/inflight"
+[ "$(wc -l <"${CASE_HOME}/inflight" 2>/dev/null | tr -d ' ')" -ge 3 ] 2>/dev/null ||
+    note_bad "fewer than one in-flight reading for each of the three passes: $(wc -l <"${CASE_HOME}/inflight" 2>/dev/null | tr -d ' ')"
+verdict
+run_case resident_peak_is_the_in_flight_reading 0 \
+    "the resident peak is the figure read during the request, not the idle one"
+[ "$(jq_of "r['fixed_prompt']['phys_footprint_bytes']['min']")" = "31000000000" ] ||
+    note_bad "phys lowest peak=$(jq_of "r['fixed_prompt']['phys_footprint_bytes']['min']") (idle reads 15500000000)"
+[ "$(jq_of "r['fixed_prompt']['rss_bytes']['min']")" = "29000000000" ] ||
+    note_bad "rss lowest peak=$(jq_of "r['fixed_prompt']['rss_bytes']['min']") (idle reads 14500000000)"
+verdict
 run_case fixed_prompt_not_measured_on_a_speculative_arm 0 \
     "a drafter's rate is not filed as the autoregressive one" \
     ARGS:--draft-model "ARGS:${WORK}/drafter" \
@@ -1638,43 +2007,47 @@ sigterm_case() {
     CASE_OUT="${WORK}/${CASE_NAME}.log"
     CASE_BAD=""
     mkdir -p "${CASE_HOME}/logs"
+    printf '%s\n' "--hold ${CASE_HOME}/hold" >"${CASE_HOME}/stub_args"
 
     env -i \
         PATH="${WORK}/quiet:${SHIMS}:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
         HOME="${WORK}" \
         RMLX_HOME="${CASE_HOME}" \
         STUB_BOUND_FLAG="${CASE_HOME}/stub_bound" \
-        STUB_PREFILL_S=5 \
+        STUB_TOKEN_BASE=100 \
         bash "${FAKE_ROOT}/scripts/spec_bench_published.sh" \
         "${VERIFIER}" --port "${PORT}" --samples-root "${SAMPLES}" \
-        --synthetic-arms >"${CASE_OUT}" 2>&1 &
+        --synthetic-arms --server-stamps >"${CASE_OUT}" 2>&1 &
     local harness=$!
 
-    local waited=0
-    while [ ! -s "${CASE_HOME}/stub_bound" ] && [ "${waited}" -lt 200 ]; do
-        /bin/sleep 0.1
-        waited=$((waited + 1))
-    done
-    if [ ! -s "${CASE_HOME}/stub_bound" ]; then
-        note_bad "the stub never bound; nothing was killed"
+    request_held_or_harness_gone() {
+        [ -e "${CASE_HOME}/hold.held" ] || ! kill -0 "${harness}" 2>/dev/null
+    }
+    harness_gone() { ! kill -0 "${harness}" 2>/dev/null; }
+
+    if ! wait_until 300 request_held_or_harness_gone || [ ! -e "${CASE_HOME}/hold.held" ]; then
+        note_bad "no request was held within 300 s, or the harness ended before it sent one; nothing was killed"
         kill "${harness}" 2>/dev/null
+        wait "${harness}" 2>/dev/null
+        stop_stubs "${CASE_HOME}/stub_bound"
         return
     fi
-    local server
-    server="$(head -1 "${CASE_HOME}/stub_bound")"
 
     kill -TERM "${harness}" 2>/dev/null
+    : >"${CASE_HOME}/hold.release"
+    if ! wait_until 300 harness_gone; then
+        note_bad "the harness was still running 300 s after SIGTERM"
+        kill -9 "${harness}" 2>/dev/null
+    fi
     wait "${harness}" 2>/dev/null
 
-    waited=0
-    while kill -0 "${server}" 2>/dev/null && [ "${waited}" -lt 50 ]; do
-        /bin/sleep 0.1
-        waited=$((waited + 1))
-    done
-    if kill -0 "${server}" 2>/dev/null; then
-        note_bad "server ${server} outlived the harness"
-        kill -9 "${server}" 2>/dev/null
-    fi
+    local server
+    while read -r server; do
+        if kill -0 "${server}" 2>/dev/null; then
+            note_bad "server ${server} outlived the harness"
+            kill -9 "${server}" 2>/dev/null
+        fi
+    done <"${CASE_HOME}/stub_bound"
 }
 sigterm_case
 verdict

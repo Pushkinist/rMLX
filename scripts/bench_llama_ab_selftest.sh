@@ -16,6 +16,9 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 AB="$ROOT/scripts/bench_llama_ab.sh"
 
+# shellcheck source=scripts/lib/selftest_support.sh
+. "$ROOT/scripts/lib/selftest_support.sh"
+
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/rmlx_llama_ab_selftest.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -224,7 +227,7 @@ write_ps_shim "$WORK/quietbin" "$IDLE_ROWS"
 check_verdict() {
 	local label="$1" want="$2" needle="$3"
 	local verdict_ok=0
-	printf '%s' "$OUT" | grep -q "^verdict    $needle" && verdict_ok=1
+	grep -q "^verdict    $needle" <<<"$OUT" && verdict_ok=1
 	if [ "$verdict_ok" -eq 1 ] && [ "$CODE" -eq "$want" ]; then
 		echo "  PASS  $label (verdict matched, exit $CODE)"
 		PASS=$((PASS + 1))
@@ -241,7 +244,7 @@ check_verdict() {
 
 check() {
 	local label="$1" want="$2" needle="$3"
-	if [ "$CODE" -eq "$want" ] && printf '%s' "$OUT" | grep -q -- "$needle"; then
+	if [ "$CODE" -eq "$want" ] && grep -q -- "$needle" <<<"$OUT"; then
 		echo "  PASS  $label"
 		PASS=$((PASS + 1))
 	else
@@ -281,7 +284,13 @@ class H(BaseHTTPRequestHandler):
 HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
 SQUAT
 SQUATTER=$!
-sleep 1
+squatter_answers_or_is_gone() {
+	curl -fsS -m 3 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1 || ! kill -0 "$SQUATTER" 2>/dev/null
+}
+if ! wait_until 300 squatter_answers_or_is_gone; then
+	echo "  FAIL  the squatter server did not answer within 300 s"
+	FAIL=$((FAIL + 1))
+fi
 run_ab --bin-a "$STUB_A" --bin-b "$STUB_B" --pairs 2 --allow-busy-host
 check "an occupied port is refused up front" 125 "already answers /health"
 kill "$SQUATTER" 2>/dev/null
@@ -397,7 +406,7 @@ if [ -n "$SYNTH_RESULT" ] && [ -r "$SYNTH_RESULT" ]; then
 		--weight-quant mxfp8 --arm-a-backend llama.cpp --arm-b-backend llama.cpp \
 		--arm-a-kv-quant none --arm-b-kv-quant none 2>&1)"
 	INGEST_CODE=$?
-	if [ "$INGEST_CODE" -eq 2 ] && printf '%s' "$INGEST_OUT" | grep -q "no waiver for this"; then
+	if [ "$INGEST_CODE" -eq 2 ] && grep -q "no waiver for this" <<<"$INGEST_OUT"; then
 		echo "  PASS  a --synthetic-arms result is refused by the promoter, with no waiver"
 		PASS=$((PASS + 1))
 	else
@@ -411,7 +420,7 @@ else
 fi
 
 # --- the harness must never write runs.db ------------------------------------
-if find "$WORK/home" -name 'runs.db*' -print -quit 2>/dev/null | grep -q .; then
+if find "$WORK/home" -name 'runs.db*' -print -quit 2>/dev/null | grep . >/dev/null; then
 	echo "  FAIL  harness wrote a metrics DB"
 	FAIL=$((FAIL + 1))
 else

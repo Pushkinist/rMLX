@@ -648,7 +648,7 @@ sleep 3
 
 # The KV codec the servers run, in the engine's own spelling, read from the
 # populate server's log once it has stopped: it is part of the records' cell key.
-KV_LOG="$(ls -t "${RUN_DIR}"/logs/*.jsonl 2>/dev/null | head -1)" || KV_LOG=""
+KV_LOG="$(ls -t "${RUN_DIR}"/logs/*.jsonl 2>/dev/null | sed -n 1p)" || KV_LOG=""
 KV_QUANT="$(python3 "${REPO_ROOT}/scripts/lib/server_kv_quant.py" "${KV_LOG}" \
     | sed -n 's/^kv_quant=//p')" || KV_QUANT=""
 if [[ -z "${KV_QUANT}" ]]; then

@@ -475,7 +475,7 @@ run() {
     failures=$((failures + 1))
     return
   fi
-  if [ -n "$want_reason" ] && ! printf '%s' "$out" | grep -qF -- "$want_reason"; then
+  if [ -n "$want_reason" ] && ! grep -qF -- "$want_reason" <<<"$out"; then
     printf 'FAIL %s: exit %s was right but the reason was not.\n  wanted: %s\n  got:\n%s\n' \
       "$name" "$rc" "$want_reason" "$out"
     failures=$((failures + 1))
@@ -497,7 +497,7 @@ run_env() {
     failures=$((failures + 1))
     return
   fi
-  if [ -n "$want_reason" ] && ! printf '%s' "$out" | grep -qF -- "$want_reason"; then
+  if [ -n "$want_reason" ] && ! grep -qF -- "$want_reason" <<<"$out"; then
     printf 'FAIL %s: exit %s was right but the reason was not.\n  wanted: %s\n  got:\n%s\n' \
       "$name" "$rc" "$want_reason" "$out"
     failures=$((failures + 1))

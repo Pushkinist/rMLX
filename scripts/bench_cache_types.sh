@@ -285,7 +285,7 @@ run_smoke_probe() {
   # succeeded syntactically but produced no real decode (e.g. Gemma4 Shared-KV
   # rejects Mixed codec, emits TPS=0.000). Treat this as a runtime failure.
   local smoke_tps
-  smoke_tps=$(grep -E "^baseline: " "$smoke_log" | tail -1 | grep -oE "TPS=[0-9.]+" | head -1 | sed -E 's/TPS=([0-9.]+)/\1/')
+  smoke_tps=$(grep -E "^baseline: " "$smoke_log" | tail -1 | grep -oE "TPS=[0-9.]+" | sed -nE '1s/TPS=([0-9.]+)/\1/p')
   if [ -n "$smoke_tps" ]; then
     local _tps_fail
     _tps_fail=$(awk -v t="$smoke_tps" 'BEGIN { print (t+0 < 0.5) ? "1" : "0" }')
@@ -418,9 +418,9 @@ for entry in "${COMBOS[@]}"; do
     0)
       # Parse the final CELL DONE line for median/stddev.
       DONE_LINE=$(grep -E "CELL DONE" "$CELL_LOG" | tail -1)
-      MEDIAN=$(echo "$DONE_LINE" | grep -oE "median=[0-9.]+" | head -1 | sed -E 's/median=([0-9.]+)/\1/')
-      STDDEV=$(echo "$DONE_LINE" | grep -oE "stddev=[0-9.]+" | head -1 | sed -E 's/stddev=([0-9.]+)/\1/')
-      KV_FROM=$(echo "$DONE_LINE" | grep -oE "kv=[A-Za-z0-9_]+" | head -1 | sed -E 's/kv=(.+)/\1/')
+      MEDIAN=$(echo "$DONE_LINE" | grep -oE "median=[0-9.]+" | sed -nE '1s/median=([0-9.]+)/\1/p')
+      STDDEV=$(echo "$DONE_LINE" | grep -oE "stddev=[0-9.]+" | sed -nE '1s/stddev=([0-9.]+)/\1/p')
+      KV_FROM=$(echo "$DONE_LINE" | grep -oE "kv=[A-Za-z0-9_]+" | sed -nE '1s/kv=(.+)/\1/p')
       [ -n "$KV_FROM" ] && KV_CANON="$KV_FROM"
       echo "[$(date +%T)] CELL OK label=$LABEL kv=$KV_CANON median=${MEDIAN:-?} stddev=${STDDEV:-?}" >&2
       printf "%s\t%s\t%s\t%s\t%s\n" "$LABEL" "$KV_CANON" "${MEDIAN:-}" "${STDDEV:-}" "ok" >>"$SUMMARY_FILE"

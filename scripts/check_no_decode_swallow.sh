@@ -103,7 +103,7 @@ check_swallow() {
         limit=$((a_ind - 4))
         win="$(sed -n "${ln},$((ln + CONTEXT))p" "${f}")"
         while IFS= read -r l; do
-            printf '%s' "${l}" | grep -q 'return Ok(\|_ok = false' || continue
+            grep -q 'return Ok(\|_ok = false' <<<"${l}" || continue
             l_ind="$(indent_of "${l}")"
             [ "${l_ind}" -ge "${limit}" ] || continue
             echo "VIOLATION: ${f}:${ln} — failure-log site swallows the cause."
@@ -125,7 +125,7 @@ check_decode() {
         f="${site%%:*}"
         ln="${site##*:}"
         win="$(sed -n "${ln},$((ln + CONTEXT))p" "${f}")"
-        if ! printf '%s' "${win}" | grep -q 'return Err'; then
+        if ! grep -q 'return Err' <<<"${win}"; then
             echo "VIOLATION: ${f}:${ln} — 'decode step failed' is not followed by 'return Err' within ${CONTEXT} lines."
             printf '%s\n' "${win}" | sed 's/^/    | /'
             violations=$((violations + 1))
@@ -165,13 +165,13 @@ check_sweep() {
         *) continue ;;
         esac
         win="$(sed -n "${ln},$((ln + CONTEXT))p" "${f}")"
-        if printf '%s' "${win}" | grep -q 'return Err'; then
+        if grep -q 'return Err' <<<"${win}"; then
             echo "VIOLATION: ${f}:${ln} — '${anchor}' returns Err inline, skipping the exit_prefill sweep."
             echo "    Every cache that entered prefill must run exit_prefill before this"
             echo "    function leaves. Capture the cause ('= Some(e)') and let the sweep run."
             printf '%s\n' "${win}" | sed 's/^/    | /'
             violations=$((violations + 1))
-        elif ! printf '%s' "${win}" | grep -q '= Some(e)'; then
+        elif ! grep -q '= Some(e)' <<<"${win}"; then
             echo "VIOLATION: ${f}:${ln} — '${anchor}' neither captures the cause ('= Some(e)')"
             echo "    for propagation after the exit_prefill sweep, nor propagates it at all."
             printf '%s\n' "${win}" | sed 's/^/    | /'
@@ -244,7 +244,7 @@ guard_call_sites() {
 # script runs under `set -e`/`pipefail` and aborts silently with exit 1, which
 # would look exactly like a passing gate that printed nothing.
 first_offset() {
-    printf '%s\n' "$2" | grep -nE "$1" | head -1 | cut -d: -f1 || true
+    grep -m1 -nE "$1" <<<"$2" | cut -d: -f1 || true
 }
 
 check_nan_detect() {

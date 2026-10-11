@@ -112,7 +112,7 @@ from_store() {
 	[ -f "$sums" ] || return 1
 	while read -r sha file; do
 		[ -f "$STORE/$file" ] || continue
-		top=$(tar -tzf "$STORE/$file" 2>/dev/null | head -1)
+		top=$(tar -tzf "$STORE/$file" 2>/dev/null | sed -n 1p)
 		[ "$top" = "$f/$v/" ] || continue
 		got=$(shasum -a 256 "$STORE/$file" | awk '{print $1}')
 		[ "$got" = "$sha" ] ||

@@ -530,7 +530,7 @@ run_case() {
     if [[ -z "$bad_rm" ]]; then
         pass "$name: every removal lies inside the run's own directory"
     else
-        fail "$name: removed outside the run's own directory:$(printf '%s\n' $bad_rm | sort -u | head -3 | tr '\n' ' ')"
+        fail "$name: removed outside the run's own directory:$(printf '%s\n' $bad_rm | sort -u | sed -n 1,3p | tr '\n' ' ')"
     fi
 
     # measure
@@ -558,7 +558,7 @@ run_case() {
     else
         fail "$name: POPULATE record ssd_hydrate_mb_per_s presence = $got (stub measured a hydrate)"
     fi
-    if grep -q -- '--max-ctx 8192' "$cdir/log/serve.log" && ! grep -v -- '--max-ctx 8192' "$cdir/log/serve.log" | grep -q .; then
+    if grep -q -- '--max-ctx 8192' "$cdir/log/serve.log" && ! grep -v -- '--max-ctx 8192' "$cdir/log/serve.log" | grep . >/dev/null; then
         pass "$name: every phase server was given --max-ctx 8192"
     else
         fail "$name: a phase server ran without --max-ctx 8192"
@@ -586,7 +586,7 @@ run_case() {
     # Every record must fall under the prefix the gate scopes itself to, and
     # each phase must be its own prompt (prompts are content-addressed).
     local prefix prompts_ok
-    prefix="$(sed -n 's/.*--prompt-prefix \([^ ]*\).*/\1/p' "$tree/Makefile" | head -1)"
+    prefix="$(sed -n 's/.*--prompt-prefix \([^ ]*\).*/\1/p' "$tree/Makefile" | sed -n 1p)"
     prompts_ok="$(python3 - "$cdir/log/records.jsonl" "$prefix" <<'PY' 2>&1
 import json, sys
 recs = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]

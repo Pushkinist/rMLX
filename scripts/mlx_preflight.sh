@@ -124,7 +124,7 @@ for lib in "$PREFIX/opt/mlx/lib/libmlx.dylib" "$PREFIX/opt/mlx-c/lib/libmlxc.dyl
 		hint_restore
 		exit 1
 	fi
-	if otool -L "$lib" 2>/dev/null | grep -q '@@HOMEBREW_PREFIX@@'; then
+	if otool -L "$lib" 2>/dev/null | grep '@@HOMEBREW_PREFIX@@' >/dev/null; then
 		fail "$lib still carries @@HOMEBREW_PREFIX@@ placeholders (unrelocated pour)"
 		hint_restore
 		exit 1

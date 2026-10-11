@@ -477,7 +477,7 @@ guard_count=0
 while IFS=$'\t' read -r file name ncalls nmissing missing; do
   [ -n "$name" ] || continue
   [ "$ncalls" != "0" ] || continue
-  printf '%s\n' "$population" | grep -qx -- "$name" && continue
+  grep -qx -- "$name" <<<"$population" && continue
   rel="${file#"$root"/}"
   guard_count=$((guard_count + 1))
   if [ "$nmissing" != "0" ]; then

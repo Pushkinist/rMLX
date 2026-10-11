@@ -834,7 +834,7 @@ while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec _nlow _nemit _ntarget _
   [ -n "$fn" ] || continue
   rel="${file#"$root"/}"
   count=$(printf '%s\n' "$tokens" | tr ' ' '\n' | grep -c '[^[:space:]]')
-  if printf '%s\n' "$tokens" | tr ' ' '\n' | grep -qx '?' || [ "$count" != "1" ]; then
+  if printf '%s\n' "$tokens" | tr ' ' '\n' | grep -x '?' >/dev/null || [ "$count" != "1" ]; then
     note "check-spec-charge: $rel: \`$fn\` rolls a round back on a \`charge\` this gate"
     note "  could not read back — $tokens. An unread site is not a checked site, and it"
     note "  is the one that would carry the other decision."
@@ -865,7 +865,7 @@ while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec _nlow _nemit _ntarget _
     continue
   fi
   if [ "$owner" = "$tokens" ] ||
-    ! printf '%s\n' "$params" | tr ' ' '\n' | grep -qx -- "$owner"; then
+    ! printf '%s\n' "$params" | tr ' ' '\n' | grep -x -- "$owner" >/dev/null; then
     note "check-spec-charge: $rel: \`$fn\` rolls a round back on \`$tokens\`, which is not a"
     note "  field of one of its own parameters. A drafter's rollback carries the decision"
     note "  the loop handed it; a literal or a fresh \`phases_charged()\` here is a second"
@@ -888,7 +888,7 @@ while IFS=$'\t' read -r file fn _sig _stats _nroll nrec _nlow _nemit _ntarget _c
     fail=1
     continue
   fi
-  if printf '%s\n' "$tokens" | tr ' ' '\n' | grep -qx '?'; then
+  if printf '%s\n' "$tokens" | tr ' ' '\n' | grep -x '?' >/dev/null; then
     note "check-spec-charge: $rel: \`$fn\` has a charge site this gate could not read"
     note "  the value of. An unread site is not a checked site, and it is the one that"
     note "  would carry the other decision."
@@ -915,7 +915,7 @@ while IFS=$'\t' read -r file fn _sig _stats _nroll nrec _nlow _nemit _ntarget _c
     continue
   fi
   if [ "$tokens" = "charge_phases" ] &&
-    ! printf '%s' "$bind" | grep -Eq '^ok:([A-Za-z_0-9]+::)*phases_charged\(\)$'; then
+    ! grep -Eq '^ok:([A-Za-z_0-9]+::)*phases_charged\(\)$' <<<"$bind"; then
     note "check-spec-charge: $rel: \`$fn\` charges on \`charge_phases\` and does not bind it"
     note "  to \`phases_charged()\` alone. The census would then be reading a spelling: an"
     note "  entry that binds the name to a literal, or ORs a second condition into the"
@@ -938,7 +938,7 @@ while IFS=$'\t' read -r file fn _sig _stats nroll nrec _nlow nemit _ntarget cfg 
     classic_count=$((classic_count + 1))
   fi
 
-  if printf '%s\n' "$tokens" | tr ' ' '\n' | grep -qx '?'; then
+  if printf '%s\n' "$tokens" | tr ' ' '\n' | grep -x '?' >/dev/null; then
     note "check-spec-charge: $rel: \`$fn\` has a charge site this gate could not read"
     note "  the value of. An unread site is not a checked site, and it is the one that"
     note "  would carry the other decision."
@@ -1040,7 +1040,7 @@ while IFS=$'\t' read -r file fn _sig _stats nroll nrec _nlow nemit _ntarget cfg 
     continue
   fi
   if [ "$tokens" = "charge_phases" ] &&
-    ! printf '%s' "$bind" | grep -Eq '^ok:([A-Za-z_0-9]+::)*phases_charged\(\)$'; then
+    ! grep -Eq '^ok:([A-Za-z_0-9]+::)*phases_charged\(\)$' <<<"$bind"; then
     note "check-spec-charge: $rel: \`$fn\` charges on \`charge_phases\` and does not bind it"
     note "  to \`phases_charged()\` alone. The census would then be reading a spelling: a"
     note "  loop that binds the name to a literal, or ORs a second condition into the"

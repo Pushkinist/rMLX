@@ -281,7 +281,7 @@ fi
 # plain info! event, so it is in the run's own log at the default level even
 # though `xctrace --launch` swallowed the child's stdout.
 if [ -z "$SKIP_MS" ]; then
-	log_file=$(ls -1t "$RMLX_HOME_DIR"/logs/*.jsonl 2>/dev/null | head -1)
+	log_file=$(ls -1t "$RMLX_HOME_DIR"/logs/*.jsonl 2>/dev/null | sed -n 1p)
 	if [ -n "$log_file" ]; then
 		SKIP_MS=$(python3 "$REPO_ROOT/scripts/lib/prefill_ms.py" "$log_file")
 	fi

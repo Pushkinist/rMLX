@@ -14,6 +14,7 @@
 #     --samples-root DIR       measure an unpinned copy instead; not recordable
 #     --allow-busy-host        measure anyway, and taint the result
 #     --synthetic-arms         the server is a stub, so this run measures nothing
+#     --server-stamps          time the stream by the stub's own stamps; self-tests only
 #
 # WHAT IT MEASURES
 #
@@ -115,6 +116,11 @@
 # `synthetic_arms` in the result file. Every guard that reads the run instead of
 # the machine is untouched by it.
 #
+# `--server-stamps` is the other declaration a self-test makes. The client rate
+# is then read from the stub's own stamps, which makes the cross-check compare
+# the stub with itself. The result says so in `protocol.client_clock`, and
+# `ingest/published_ingest.py` refuses any result whose clock is not `client`.
+#
 # Exit codes:
 #   0   — three passes ran and every mean is within the range band
 #   1   — a precondition failed, or a reading could not be attributed
@@ -168,6 +174,10 @@ PUBLISHED_ROOT="${REPO_ROOT}/prompts/published"
 SAMPLES_ROOT=""
 ALLOW_BUSY_HOST=false
 SYNTHETIC_ARMS=false
+# Which clock times the stream at the client. `client` is the only value a
+# measurement can have; `--server-stamps` is for a stub that stamps its chunks.
+CLIENT_CLOCK=client
+SERVER_STAMPS_ARG=()
 
 need_value() { [[ -n "${2:-}" ]] || { echo "ERROR: $1 requires a value" >&2; exit 1; }; }
 
@@ -182,6 +192,7 @@ while [[ $# -gt 0 ]]; do
         --samples-root) need_value "$1" "${2:-}"; SAMPLES_ROOT="$2"; shift 2 ;;
         --allow-busy-host) ALLOW_BUSY_HOST=true; shift ;;
         --synthetic-arms) SYNTHETIC_ARMS=true; shift ;;
+        --server-stamps) CLIENT_CLOCK=server_stamps; SERVER_STAMPS_ARG=(--server-stamps); shift ;;
         -*) echo "ERROR: unknown flag: $1" >&2; exit 1 ;;
         *)
             [[ -z "${VERIFIER_MODEL}" ]] || {
@@ -416,7 +427,7 @@ host_window() {
 thermal_sample() {
     local raw limit
     raw="$(pmset -g therm 2>/dev/null)" || { echo "unreadable"; return; }
-    limit="$(printf '%s\n' "${raw}" | awk -F'= *' '/CPU_Speed_Limit/ { print $2; exit }')"
+    limit="$(awk -F'= *' '/CPU_Speed_Limit/ { print $2; exit }' <<<"${raw}")"
     if [[ -z "${limit}" ]]; then
         echo "unrecorded"
     elif (( limit < 100 )); then
@@ -488,9 +499,14 @@ fi
 
 # send <payload-file> <kv-out> — one chat request, timed at the client.
 send() {
-    curl -s -H "Content-Type: application/json" --data-binary @"$1" \
-        "http://127.0.0.1:${PORT}/v1/chat/completions" --no-buffer \
-        | python3 "${REPO_ROOT}/scripts/lib/sse_decode_window.py" > "$2"
+    python3 "${REPO_ROOT}/scripts/lib/sse_decode_window.py" \
+        --url "http://127.0.0.1:${PORT}/v1/chat/completions" --body-file "$1" \
+        ${SERVER_STAMPS_ARG[@]+"${SERVER_STAMPS_ARG[@]}"} > "$2" || return $?
+    if [[ "$(sed -n 's/^clock=//p' "$2")" != "${CLIENT_CLOCK}" ]]; then
+        echo "ERROR: a client reading says it was timed by something other than" \
+             "the ${CLIENT_CLOCK} clock" >&2
+        return 1
+    fi
 }
 
 # ── Resident memory ──────────────────────────────────────────────────────────
@@ -762,7 +778,7 @@ done
 # ── Report ───────────────────────────────────────────────────────────────────
 
 META="${WORK}/meta.json"
-SYNTHETIC_ARMS="${SYNTHETIC_ARMS}" ARM="${ARM}" \
+SYNTHETIC_ARMS="${SYNTHETIC_ARMS}" ARM="${ARM}" CLIENT_CLOCK="${CLIENT_CLOCK}" \
 MODEL_NAMESPACE="${MODEL_NAMESPACE}" MODEL_NAME="${MODEL_NAME}" \
 WEIGHT_QUANT="${WEIGHT_QUANT}" KV_QUANT_SEEN="${KV_QUANT_SEEN}" \
 MAX_CTX="${MAX_CTX}" SAMPLING_SEEN="${SAMPLING_SEEN}" \
@@ -800,6 +816,9 @@ print(json.dumps({
         # null means the checkpoint is greedy and resolved no sampler.
         "sampling_resolved": json.loads(os.environ["SAMPLING_SEEN"]),
         "thinking": "on, counted as output",
+        # Which clock timed the stream at the client. Anything but `client` is
+        # a stub's own stamps, and the ingest refuses such a result.
+        "client_clock": os.environ["CLIENT_CLOCK"],
         # Stated because the protocol does not, and because it is what the
         # run-to-run range means: the request sends no seed, the engine
         # substitutes its fixed default and seeds one RNG per request from it,

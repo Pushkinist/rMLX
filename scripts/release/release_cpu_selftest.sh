@@ -62,7 +62,7 @@ case_run() {
     if [ "$status" != "$want" ]; then
         FAILED=$((FAILED + 1))
         printf '  FAIL %-34s (want exit %s, got %s) — %s\n%s\n' "$name" "$want" "$status" "$what" "$out"
-    elif ! printf '%s' "$out" | grep -qF -- "$needle"; then
+    elif ! grep -qF -- "$needle" <<<"$out"; then
         FAILED=$((FAILED + 1))
         printf '  FAIL %-34s (missing %q) — %s\n%s\n' "$name" "$needle" "$what" "$out"
     else

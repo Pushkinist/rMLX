@@ -231,7 +231,7 @@ for case in "${CASES[@]}"; do
     out=$(bash "$gate" "$dir" 2>&1)
     got=$?
 
-    if [ "$got" -eq "$want_exit" ] && printf '%s' "$out" | grep -qF -- "$want_msg"; then
+    if [ "$got" -eq "$want_exit" ] && grep -qF -- "$want_msg" <<<"$out"; then
         PASSED=$((PASSED + 1))
         printf '  ok   %-38s exit=%s — %s\n' "$name" "$got" "$what"
     else

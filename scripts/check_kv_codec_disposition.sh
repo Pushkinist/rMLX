@@ -185,7 +185,7 @@ done
 # `"${BANNER_DOCS[@]}"` is not, so the count is read first.
 [ "${#BANNER_DOCS[@]}" -gt 0 ] ||
     die_env "BANNER_DOCS is empty: the gate would read no INERT banner (RULE 10)"
-duplicate=$(printf '%s\n' "${BANNER_DOCS[@]}" | sort | uniq -d | head -1)
+duplicate=$(printf '%s\n' "${BANNER_DOCS[@]}" | sort | uniq -d | sed -n 1p)
 [ -z "${duplicate}" ] ||
     die_env "BANNER_DOCS lists ${duplicate} twice (RULE 10)"
 DOC_LIST_LABEL=""
@@ -239,7 +239,7 @@ if [ "${cargo_status}" -ne 0 ]; then
 fi
 
 grep '^KVQUANT-DISPOSITION	' "${WORK}/manifest.raw" >"${WORK}/manifest" || true
-declared=$(grep '^KVQUANT-DISPOSITION-END	' "${WORK}/manifest.raw" | head -1 | cut -f2)
+declared=$(grep -m1 '^KVQUANT-DISPOSITION-END	' "${WORK}/manifest.raw" | cut -f2)
 actual=$(grep -c '^KVQUANT-DISPOSITION	' "${WORK}/manifest.raw")
 
 [ -n "${declared}" ] || die_env "the manifest printed no END sentinel"
@@ -275,7 +275,7 @@ extract_const() {
 # Which file defines it, for an error message that can be acted on.
 const_home() {
     grep -lE "^[[:space:]]*(pub(\([a-z]+\))?[[:space:]]+)?const $1: &str = " \
-        $(cat "${WORK}/cli_sources") 2>/dev/null | head -1
+        $(cat "${WORK}/cli_sources") 2>/dev/null | sed -n 1p
 }
 
 # RULE 8: the scope is derived, not declared.

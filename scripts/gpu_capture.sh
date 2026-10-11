@@ -121,7 +121,7 @@ if [ ! -x "$BIN" ]; then
 	echo "    $BUILD_HINT" >&2
 	exit 1
 fi
-if ! "$BIN" baseline --help 2>/dev/null | grep -q -- '--gpu-capture'; then
+if ! "$BIN" baseline --help 2>/dev/null | grep -- '--gpu-capture' >/dev/null; then
 	echo "ERROR: $BIN was built WITHOUT the metal-capture feature." >&2
 	echo "  It has no --gpu-capture flag and cannot write a trace. Rebuild with:" >&2
 	echo "    $BUILD_HINT" >&2

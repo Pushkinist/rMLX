@@ -4,7 +4,12 @@
 # Usage:
 #   bash scripts/spec_bench.sh [--port N] [--dry-run]
 #       [--draft-kind KIND] [--draft-block-size N]
-#       [--kv-quant Q] [--max-ctx N] [--tag T]
+#       [--kv-quant Q] [--max-ctx N] [--tag T] [--server-stamps]
+#
+# `--server-stamps` is for a self-test. The client rate is then read from the
+# stub server's own stamps, which makes the cross-check compare the stub with
+# itself, so the rows are written under `stamped_records/` in the scratch
+# directory and are never passed to `rmlx metrics record`.
 #
 # Requires:
 #   - Built binary at target/release-perf/rmlx  (run: make build-perf)
@@ -126,12 +131,15 @@ HARDWARE_TAG="${RMLX_HARDWARE_TAG:-m5_max_128gb}"
 CROSS_CHECK_BAND_PCT=10
 
 DRY_RUN=false
+SERVER_STAMPS_ARG=()
+CLIENT_CLOCK=client
 BENCH_TAG=""
 KV_QUANT_ARGS=()
 DRAFT_BLOCK_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run) DRY_RUN=true; shift ;;
+        --server-stamps) SERVER_STAMPS_ARG=(--server-stamps); CLIENT_CLOCK=server_stamps; shift ;;
         --port=*) PORT="${1#--port=}"; shift ;;
         --port) shift; PORT="${1:?--port requires a value}"; shift ;;
         --tag=*) BENCH_TAG="${1#--tag=}"; shift ;;
@@ -200,8 +208,8 @@ fi
 MODEL_ID="$(basename "${VERIFIER_MODEL%/}")"
 
 # JSON-escape PROMPT_CONTENT via python3 so quotes/backslashes in canonical
-# prompt files don't corrupt the curl payload.
-CURL_PAYLOAD=$(
+# prompt files don't corrupt the request body.
+REQUEST_BODY=$(
     MODEL_ID="${MODEL_ID}" PROMPT_CONTENT="${PROMPT_CONTENT}" \
     MAX_TOKENS="${MAX_TOKENS}" TEMPERATURE="${TEMPERATURE}" SEED="${SEED}" \
     python3 -c '
@@ -251,7 +259,12 @@ if [[ ! -d "${DRAFTER_MODEL}" ]]; then
     exit 1
 fi
 
+if [[ "${CLIENT_CLOCK}" != "client" ]]; then
+    BUFFER_DIR="${SCRATCH_DIR}/stamped_records"
+fi
 mkdir -p "${LOG_DIR}" "${BUFFER_DIR}" "${SCRATCH_DIR}"
+REQUEST_BODY_FILE="${SCRATCH_DIR}/request_body.json"
+printf '%s\n' "${REQUEST_BODY}" > "${REQUEST_BODY_FILE}"
 
 echo "==> spec_bench.sh"
 echo "    verifier : ${VERIFIER_MODEL}"
@@ -273,16 +286,20 @@ echo ""
 # Prints the `key=value` block of scripts/lib/sse_decode_window.py: `tokens`,
 # `preview`, `answer_sha256` and `decode_tps` over the first-content-token to
 # last-content-token window. A rate over the whole request instead would count
-# the prefill and the curl spawn and read low, and would not be comparable with
+# the prefill and the client spawn and read low, and would not be comparable with
 # the rate the engine logs for the speculative arm.
 measured_request() {
-    local raw_file="$1"
-    curl -s \
-        -H "Content-Type: application/json" \
-        -d "${CURL_PAYLOAD}" \
-        "http://127.0.0.1:${PORT}/v1/chat/completions" \
-        --no-buffer 2>/dev/null \
-        | python3 "${REPO_ROOT}/scripts/lib/sse_decode_window.py" --raw "${raw_file}"
+    local raw_file="$1" block
+    block="$(python3 "${REPO_ROOT}/scripts/lib/sse_decode_window.py" \
+        --url "http://127.0.0.1:${PORT}/v1/chat/completions" \
+        --body-file "${REQUEST_BODY_FILE}" --raw "${raw_file}" \
+        ${SERVER_STAMPS_ARG[@]+"${SERVER_STAMPS_ARG[@]}"})" || return $?
+    if [[ "$(field_of "${block}" clock)" != "${CLIENT_CLOCK}" ]]; then
+        echo "ERROR: a client reading says it was timed by something other than" \
+             "the ${CLIENT_CLOCK} clock" >&2
+        return 1
+    fi
+    printf '%s\n' "${block}"
 }
 
 # How many ITL samples the server has recorded so far.
@@ -590,6 +607,12 @@ PYEOF
     fi
 
     echo "${record_json}" > "${buf_file}"
+    if [[ "${CLIENT_CLOCK}" != "client" ]]; then
+        echo "  [not filed] --server-stamps: the client rate is the stub's own stamps, so" \
+             "this row is not a measurement: ${buf_file}" >&2
+        echo "${buf_file}"
+        return 0
+    fi
     echo "  [ingest] buffer: ${buf_file}" >&2
 
     RMLX_HOME="${RMLX_HOME}" "${BINARY}" metrics record --file "${buf_file}" >&2

@@ -149,6 +149,7 @@ out.write_text(json.dumps({
         "sampling_resolved": {"temperature": 0.6, "top_p": 0.95, "top_k": 20,
                               "min_p": 0.0, "seed": 42919},
         "thinking": "on, counted as output",
+        "client_clock": "client",
         "seed_policy": "engine default, identical in all three passes",
     },
     "binary": {
@@ -464,6 +465,20 @@ ingest_case synthetic_arms_is_refused_with_no_waiver 2 \
     "a run against a stub server has no measurement in it to accept" \
     "There is no waiver for this" \
     'MUTATE:result["synthetic_arms"] = True'
+verdict
+
+ingest_case server_stamped_clock_is_refused_with_no_waiver 2 \
+    "a rate timed by a stub's own stamps is not a client reading" \
+    "timed by 'server_stamps'" \
+    'MUTATE:result["protocol"]["client_clock"] = "server_stamps"'
+verdict
+
+# A harness older than the stamp option wrote no clock, and it had only the client
+# clock. Its result is ingested as one.
+ingest_case result_without_a_clock_key_is_ingested_as_client 0 \
+    "a result from before the stamp option timed its rates by the client clock" \
+    "^5 records$" ARGS:--dry-run \
+    'MUTATE:del result["protocol"]["client_clock"]'
 verdict
 
 ingest_case unverified_samples_is_refused_with_no_waiver 2 \

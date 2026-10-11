@@ -137,7 +137,7 @@ for raw in "$@"; do
 	meta=$(plutil -p "$bundle/metadata" 2>&1)
 	if [ $? -ne 0 ] || [ -z "$meta" ]; then
 		echo "ERROR: $bundle/metadata is not a readable property list:" >&2
-		printf '%s\n' "$meta" | head -3 | sed 's/^/    /' >&2
+		head -3 <<<"$meta" | sed 's/^/    /' >&2
 		rc=3
 		echo ""
 		continue

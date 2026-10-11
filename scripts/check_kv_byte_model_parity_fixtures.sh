@@ -88,13 +88,13 @@ check() { # check LABEL MANIFEST WANT_EXIT WANT_PATTERN
     rc=$?
     if [ "${rc}" -ne "${want_exit}" ]; then
         echo "FAIL  ${label}: exit ${rc}, expected ${want_exit}" >&2
-        echo "${out}" | head -5 >&2
+        head -5 >&2 <<<"${out}"
         failures=$((failures + 1))
         return
     fi
     if ! grep -qE -- "${want_pat}" <<<"${out}"; then
         echo "FAIL  ${label}: exit ${rc} as expected but no reason matching /${want_pat}/" >&2
-        echo "${out}" | head -5 >&2
+        head -5 >&2 <<<"${out}"
         failures=$((failures + 1))
         return
     fi

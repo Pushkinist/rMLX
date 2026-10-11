@@ -177,7 +177,7 @@ PASSED=0
 
 verdict() { # verdict <name> <want-exit> <needle> <what> <got-exit> <output>
     local name="$1" want="$2" needle="$3" what="$4" got="$5" out="$6"
-    if [ "${got}" = "${want}" ] && printf '%s' "${out}" | grep -qF -- "${needle}"; then
+    if [ "${got}" = "${want}" ] && grep -qF -- "${needle}" <<<"${out}"; then
         PASSED=$((PASSED + 1))
         printf '  ok   %-38s — %s\n' "${name}" "${what}"
     else
@@ -430,7 +430,7 @@ list_out="$(python3 "${TOOL}" --root "${BASE}" --list 2>&1)"
 # list_case <name> <present|absent> <extended regex over --list lines> <what it proves>
 list_case() {
     local name="$1" mode="$2" pattern="$3" what="$4" got=absent
-    printf '%s\n' "${list_out}" | grep -qE -- "${pattern}" && got=present
+    grep -qE -- "${pattern}" <<<"${list_out}" && got=present
     if [ "${got}" = "${mode}" ]; then
         PASSED=$((PASSED + 1))
         printf '  ok   %-38s — %s\n' "${name}" "${what}"

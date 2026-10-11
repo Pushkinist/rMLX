@@ -351,7 +351,7 @@ for METAL_DIR in "${METAL_DIRS[@]}"; do
             if ! err="$(xcrun -sdk macosx metal "-std=${std}" -c "${probe}" \
                     -o "${TMP}/out.air" 2>&1)"; then
                 echo "FAIL: ${rel_dir}/${body} at -std=${std}" >&2
-                echo "${err}" | head -20 >&2
+                head -20 >&2 <<<"${err}"
                 echo >&2
                 failed+=("${rel_dir}/${body} (-std=${std})")
             fi
