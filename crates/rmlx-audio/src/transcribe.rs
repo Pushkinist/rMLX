@@ -1,8 +1,3 @@
-// LOC-exempt: the long-form transcription engine (window seek loop + timestamp
-// segmentation + previous-text conditioning + subtitle formatting) is one
-// cohesive sequential pipeline; splitting the seek loop from the formatters
-// would scatter the timestamp arithmetic without cohesion gain.
-
 //! Long-form Whisper transcription engine.
 //!
 //! This is the single transcription core shared by the HTTP
@@ -10,7 +5,7 @@
 //! runs a sliding-window seek loop modelled on `openai-whisper` / `mlx_whisper` `transcribe()`:
 //!
 //! 1. Decode the input container to 16 kHz mono f32 (caller's responsibility;
-//!    see [`crate::wav::WavDecoder`] + [`resample_to_16k`]).
+//!    see [`crate::wav::WavDecoder::decode_resampled`]).
 //! 2. Walk the audio in 30 s windows. For each window, run the decoder in
 //!    **timestamp mode** with the full [`crate::whisper::DecodeFilters`] chain.
 //! 3. Parse the emitted timestamp tokens into segments with real cumulative
@@ -24,24 +19,22 @@
 //! Determinism: temperature is fixed at 0 (greedy argmax), so the same audio
 //! produces byte-identical output across runs.
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use rmlx_mlx::Device;
 use tracing::{debug, info, warn};
 
-use crate::mel::{MelExtractor, HOP_LENGTH, N_SAMPLES, SAMPLE_RATE};
-use crate::tokenizer::{WhisperTask, WhisperTokenizer, TOK_EOT, TOK_SOT_PREV, TOK_TIMESTAMP_BEGIN};
+use crate::mel::{MelExtractor, N_SAMPLES, SAMPLE_RATE};
+use crate::tokenizer::{
+    language_name, language_token, WhisperTask, WhisperTokenizer, TOK_EOT, TOK_SOT_PREV,
+    TOK_TIMESTAMP_BEGIN,
+};
 use crate::whisper::{DecodeFilters, WhisperError, WhisperModel};
 
-/// Seconds of audio represented by one timestamp-token step (Whisper uses 0.02 s).
-const TIME_PRECISION: f32 = 0.02;
+mod seek;
 
-/// Samples of audio represented by one timestamp-token step.
-const SAMPLES_PER_TIMESTAMP: usize = SAMPLE_RATE as usize / 50;
-
-/// How far past the real end of a window a segment may open before it counts as
-/// zero-pad filler (0.5 s).
-const PAD_TAIL_MARGIN_SAMPLES: usize = SAMPLE_RATE as usize / 2;
+use seek::{plan_window, walk_windows, window_segments, SeekRule, WalkEnd};
 
 /// Compression ratio above which a window's text is a repetition loop
 /// (openai-whisper's `compression_ratio_threshold`).
@@ -77,12 +70,20 @@ fn window_token_budget(n_text_ctx: usize, prefix_len: usize) -> usize {
 #[derive(Debug, Clone)]
 #[allow(clippy::exhaustive_structs, reason = "stable public segment shape")]
 pub struct Segment {
+    /// Start of the window that holds the segment, in 10 ms mel frames, as
+    /// openai-whisper's `seek`.
+    pub seek: usize,
     /// Segment start time in seconds from the beginning of the audio.
     pub start: f32,
     /// Segment end time in seconds.
     pub end: f32,
     /// Decoded text (specials / timestamps stripped, trimmed).
     pub text: String,
+    /// The segment's slice of the window's tokens, its timestamps included.
+    pub tokens: Vec<u32>,
+    /// Compression ratio of the window's kept decode: every segment of a
+    /// window has the same, as in openai-whisper.
+    pub compression_ratio: f32,
 }
 
 /// Full transcription result.
@@ -93,7 +94,8 @@ pub struct Transcription {
     pub text: String,
     /// Per-segment breakdown with timestamps.
     pub segments: Vec<Segment>,
-    /// Resolved language (BCP-47 code or `lang_tok=N` when auto-detected).
+    /// Language of the decode: the lower-case English name, for example
+    /// `english`, whether the request named it or the model detected it.
     pub language: String,
     /// Total audio duration in seconds.
     pub duration: f32,
@@ -103,7 +105,8 @@ pub struct Transcription {
 #[derive(Debug, Clone)]
 #[allow(clippy::exhaustive_structs, reason = "small, stable options bag")]
 pub struct TranscribeOptions {
-    /// Language: a BCP-47 code (`"en"`, `"fr"`, …) or `"auto"` for detection.
+    /// Language: an ISO code (`"en"`), an English name (`"French"`), in any
+    /// letter case, or `"auto"` for detection.
     pub language: String,
     /// Transcribe (same language) or translate (force English).
     pub task: WhisperTask,
@@ -173,6 +176,10 @@ impl Transcriber {
     }
 
     /// Transcribe a full 16 kHz mono f32 waveform of any length.
+    ///
+    /// `cancel` is read before each 30 s window. Once it is set, no further
+    /// window opens and the call returns [`WhisperError::Cancelled`]; a flag
+    /// that is never set runs the whole audio.
     #[allow(
         clippy::too_many_lines,
         reason = "the seek loop + segment accumulation is one cohesive long-form pass"
@@ -182,19 +189,20 @@ impl Transcriber {
         samples: &[f32],
         opts: &TranscribeOptions,
         device: Device,
+        cancel: &AtomicBool,
     ) -> Result<Transcription, WhisperError> {
         let total_samples = samples.len();
         let duration = total_samples as f32 / SAMPLE_RATE as f32;
 
-        // Resolve language once on the first window (auto-detect needs an encode).
-        let mut resolved_lang: Option<(u32, String)> = None;
+        // A named language is known now; `auto` is detected on the first window.
+        let mut resolved_lang = requested_language(&opts.language)?;
 
         let mut segments: Vec<Segment> = Vec::new();
         let mut prompt_tokens: Vec<u32> = Vec::new();
 
         let filters = DecodeFilters::new(self.suppress.clone(), self.blank_ids.clone(), true);
 
-        walk_windows(total_samples, |seek, window_samples| {
+        let end = walk_windows(total_samples, cancel, |seek, window_samples| {
             #[allow(
                 clippy::indexing_slicing,
                 reason = "walk_windows yields seek + window_samples <= total_samples"
@@ -211,26 +219,9 @@ impl Transcriber {
                 .map_err(|e| WhisperError::Mlx(format!("mel: {e}")))?;
             let encoder_out = self.model.encode_mel(&mel_frames, device)?;
 
-            // Resolve language on first window.
-            if resolved_lang.is_none() {
-                let (lang_tok, lang_str) = if opts.language == "auto" {
-                    let t = self
-                        .model
-                        .detect_language(&encoder_out, device)
-                        .unwrap_or(crate::tokenizer::TOK_EN);
-                    (t, format!("lang_tok={t}"))
-                } else {
-                    (
-                        crate::tokenizer::language_token(&opts.language),
-                        opts.language.clone(),
-                    )
-                };
-                debug!(lang_tok, "language resolved");
-                resolved_lang = Some((lang_tok, lang_str));
-            }
-            let lang_tok = resolved_lang
-                .as_ref()
-                .map_or(crate::tokenizer::TOK_EN, |(t, _)| *t);
+            let lang_tok = resolve_language(&mut resolved_lang, || {
+                self.model.detect_language(&encoder_out, device)
+            })?;
 
             // Build the SOT sequence (timestamp mode → no <|notimestamps|>), with
             // optional previous-text prompt.
@@ -282,9 +273,9 @@ impl Transcriber {
                 Err(e) => return Err(e),
             };
             decoded.log(seek, window_start_time);
-            let tokens = decoded.tokens;
+            let tokens = &decoded.tokens;
 
-            let plan = plan_window(&tokens, window_samples);
+            let plan = plan_window(tokens, window_samples);
             if plan.rule == SeekRule::ZeroFallback {
                 warn!(
                     seek,
@@ -292,19 +283,9 @@ impl Transcriber {
                     "last closed segment ends at the window start; consuming the whole window"
                 );
             }
-            let window_segments: Vec<Segment> = plan
-                .segments
-                .iter()
-                .filter_map(|raw| {
-                    let text = self.tokenizer.decode(&raw.tokens).unwrap_or_default();
-                    let trimmed = text.trim();
-                    (!trimmed.is_empty()).then(|| Segment {
-                        start: window_start_time + raw.start,
-                        end: window_start_time + raw.end,
-                        text: trimmed.to_owned(),
-                    })
-                })
-                .collect();
+            let window_segments = window_segments(&plan.segments, seek, &decoded, |tokens| {
+                self.tokenizer.decode(tokens).unwrap_or_default()
+            });
 
             debug!(
                 seek,
@@ -334,6 +315,17 @@ impl Transcriber {
             segments.extend(window_segments);
             Ok(plan.advance_samples)
         })?;
+        if let WalkEnd::Cancelled { window, seek } = end {
+            info!(
+                window,
+                seek,
+                seek_secs = seek as f32 / SAMPLE_RATE as f32,
+                total_samples,
+                n_segments = segments.len(),
+                "long-form transcription cancelled before the window opened"
+            );
+            return Err(WhisperError::Cancelled { window, seek });
+        }
 
         let text = segments
             .iter()
@@ -344,7 +336,7 @@ impl Transcriber {
             .collect::<Vec<_>>()
             .join(" ");
 
-        let language = resolved_lang.map_or_else(|| "en".to_owned(), |(_, s)| s);
+        let language = reported_language(resolved_lang).to_owned();
 
         info!(
             n_segments = segments.len(),
@@ -358,6 +350,42 @@ impl Transcriber {
             duration,
         })
     }
+}
+
+/// The language token a request names, or `None` for `auto`. A language that
+/// Whisper does not know is an error that names it.
+pub fn requested_language(language: &str) -> Result<Option<u32>, WhisperError> {
+    if language.eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
+    language_token(language)
+        .map(Some)
+        .ok_or_else(|| WhisperError::UnknownLanguage(language.to_owned()))
+}
+
+/// The language token of a window. `resolved` holds the token of an earlier
+/// window or of a named language; otherwise `detect` runs once and its token
+/// is stored, so the first window decides the language of the whole file.
+fn resolve_language(
+    resolved: &mut Option<u32>,
+    detect: impl FnOnce() -> Result<u32, WhisperError>,
+) -> Result<u32, WhisperError> {
+    if let Some(token) = *resolved {
+        return Ok(token);
+    }
+    let token = detect()?;
+    debug!(lang_tok = token, "language detected");
+    *resolved = Some(token);
+    Ok(token)
+}
+
+/// The language a transcription reports for the token its decode used. No
+/// window ran when there is no token: the audio is shorter than one mel hop.
+fn reported_language(token: Option<u32>) -> &'static str {
+    token.and_then(language_name).unwrap_or_else(|| {
+        warn!("no window ran, so no language was detected; reporting english");
+        "english"
+    })
 }
 
 /// The tokens kept for one window, and whether their text may prompt the next
@@ -478,159 +506,6 @@ fn compression_ratio(text: &str) -> f32 {
     bytes.len() as f32 / compressed.len() as f32
 }
 
-/// One segment cut from a window's token stream, before text decode. Times are
-/// seconds from the window start.
-#[derive(Debug, Clone, PartialEq)]
-struct RawSegment {
-    start: f32,
-    end: f32,
-    tokens: Vec<u32>,
-}
-
-/// Which rule set the seek advance of a window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SeekRule {
-    /// A timestamp pair in the stream and one timestamp at the end: the whole
-    /// window.
-    SingleEnding,
-    /// A timestamp pair and no single ending: the end of the last closed
-    /// segment.
-    LastClosed { end_samples: usize },
-    /// No timestamp pair: one segment and the whole window.
-    NoPair,
-    /// The last closed segment ends at the window start, so the seek would not
-    /// move: the whole window.
-    ZeroFallback,
-}
-
-/// What one decoded window yields: its segments and how far the seek moves.
-#[derive(Debug, Clone, PartialEq)]
-struct WindowPlan {
-    segments: Vec<RawSegment>,
-    advance_samples: usize,
-    rule: SeekRule,
-}
-
-/// Split one window's sampled tokens into timestamped segments and decide the
-/// seek advance. `tokens` are the tokens after the decoder prefix, with the end
-/// token stripped. `window_samples` is the real (un-padded) length of the window.
-///
-/// A timestamp pair (two timestamps in a row) closes one segment and opens the
-/// next. With a pair in the stream:
-/// - a stream that ends in one timestamp has no speech after it, so the whole
-///   window is consumed;
-/// - otherwise the unfinished segment is dropped and the seek goes to the end
-///   of the last closed segment.
-///
-/// With no pair the stream is one segment from the window start, and the whole
-/// window is consumed.
-fn plan_window(tokens: &[u32], window_samples: usize) -> WindowPlan {
-    let window_dur = window_samples as f32 / SAMPLE_RATE as f32;
-    let is_timestamp = |tok: u32| tok >= TOK_TIMESTAMP_BEGIN;
-    let ticks = |tok: u32| tok.saturating_sub(TOK_TIMESTAMP_BEGIN);
-    let to_secs = |tok: u32| ticks(tok) as f32 * TIME_PRECISION;
-    // A segment that opens more than 0.5 s past the real audio is in the
-    // zero-pad tail, where Whisper prints filler ("you", "thank you").
-    let opens_in_speech = |tok: u32| {
-        ticks(tok) as usize * SAMPLES_PER_TIMESTAMP <= window_samples + PAD_TAIL_MARGIN_SAMPLES
-    };
-    let text_of = |slice: &[u32]| -> Vec<u32> {
-        slice
-            .iter()
-            .copied()
-            .filter(|&t| !is_timestamp(t))
-            .collect()
-    };
-
-    let ends_in_one_timestamp = matches!(
-        tokens,
-        [.., before, last] if !is_timestamp(*before) && is_timestamp(*last)
-    );
-    // Index of the second token of every timestamp pair: where one slice ends
-    // and the next begins.
-    let mut cuts: Vec<usize> = tokens
-        .windows(2)
-        .enumerate()
-        .filter(|(_, pair)| pair.iter().all(|&t| is_timestamp(t)))
-        .map(|(i, _)| i + 1)
-        .collect();
-
-    let mut segments: Vec<RawSegment> = Vec::new();
-    let rule = if cuts.is_empty() {
-        let end = match tokens.iter().rev().find(|&&t| is_timestamp(t)) {
-            Some(&last) if last != TOK_TIMESTAMP_BEGIN => to_secs(last),
-            _ => window_dur,
-        };
-        segments.push(RawSegment {
-            start: 0.0,
-            end,
-            tokens: text_of(tokens),
-        });
-        SeekRule::NoPair
-    } else {
-        let rule = if ends_in_one_timestamp {
-            cuts.push(tokens.len());
-            SeekRule::SingleEnding
-        } else {
-            let end_samples = cuts
-                .last()
-                .and_then(|&cut| tokens.get(cut - 1))
-                .map_or(0, |&tok| ticks(tok) as usize * SAMPLES_PER_TIMESTAMP);
-            if end_samples == 0 {
-                SeekRule::ZeroFallback
-            } else {
-                SeekRule::LastClosed { end_samples }
-            }
-        };
-        let mut from = 0;
-        for &cut in &cuts {
-            let slice = tokens.get(from..cut).unwrap_or_default();
-            if let (Some(&first), Some(&last)) = (slice.first(), slice.last()) {
-                if opens_in_speech(first) {
-                    segments.push(RawSegment {
-                        start: to_secs(first),
-                        end: to_secs(last),
-                        tokens: text_of(slice),
-                    });
-                }
-            }
-            from = cut;
-        }
-        rule
-    };
-    segments.retain(|s| !s.tokens.is_empty());
-
-    let advance_samples = match rule {
-        SeekRule::LastClosed { end_samples } => end_samples.min(window_samples),
-        SeekRule::SingleEnding | SeekRule::NoPair | SeekRule::ZeroFallback => window_samples,
-    };
-    WindowPlan {
-        segments,
-        advance_samples,
-        rule,
-    }
-}
-
-/// Walk the audio window by window. `on_window(seek, window_samples)` decodes
-/// the window that starts at sample `seek` and returns how many samples to
-/// advance; an advance of 0 consumes the whole window, so the walk always ends.
-/// The walk stops when fewer than one mel hop of audio is left, as the
-/// reference does at its 10 ms frame grid.
-fn walk_windows<E>(
-    total_samples: usize,
-    mut on_window: impl FnMut(usize, usize) -> Result<usize, E>,
-) -> Result<(), E> {
-    let mut seek = 0;
-    while total_samples.saturating_sub(seek) >= HOP_LENGTH {
-        let window_samples = (total_samples - seek).min(N_SAMPLES);
-        seek += match on_window(seek, window_samples)? {
-            0 => window_samples,
-            advance => advance,
-        };
-    }
-    Ok(())
-}
-
 // ── Output formatters ───────────────────────────────────────────────────────
 
 /// Output format for a transcription.
@@ -739,47 +614,6 @@ fn render_vtt(segments: &[Segment]) -> String {
             fmt_time(s.end, false),
             s.text
         );
-    }
-    out
-}
-
-// ── 48 kHz / stereo → 16 kHz mono resampler ─────────────────────────────────
-
-/// Resample mono f32 `samples` from `src_rate` Hz to 16 kHz using linear
-/// interpolation.
-///
-/// Whisper is forgiving of resampler quality (its mel front-end is robust), so a
-/// linear resampler is sufficient and avoids a new dependency. Stereo downmix is
-/// already handled by [`crate::wav::WavDecoder`] (channel average → mono).
-#[must_use]
-pub fn resample_to_16k(samples: &[f32], src_rate: u32) -> Vec<f32> {
-    if src_rate == SAMPLE_RATE || samples.is_empty() {
-        return samples.to_vec();
-    }
-    let ratio = f64::from(SAMPLE_RATE) / f64::from(src_rate);
-    let out_len = ((samples.len() as f64) * ratio).round() as usize;
-    let mut out = Vec::with_capacity(out_len);
-    let last = samples.len() - 1;
-    for i in 0..out_len {
-        // Position in the source signal.
-        let src_pos = i as f64 / ratio;
-        let idx = src_pos.floor() as usize;
-        if idx >= last {
-            out.push(*samples.last().unwrap_or(&0.0));
-            continue;
-        }
-        let frac = (src_pos - idx as f64) as f32;
-        #[allow(
-            clippy::indexing_slicing,
-            reason = "idx < last guaranteed by the branch above; idx+1 <= last"
-        )]
-        let a = samples[idx];
-        #[allow(
-            clippy::indexing_slicing,
-            reason = "idx + 1 <= last (idx < last) is in bounds"
-        )]
-        let b = samples[idx + 1];
-        out.push(a + (b - a) * frac);
     }
     out
 }

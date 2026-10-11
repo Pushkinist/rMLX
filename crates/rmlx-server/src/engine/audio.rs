@@ -107,12 +107,74 @@ fn load_gemma4_feature_extractor(
     }
 }
 
+/// Mel frames per Conformer output frame: `num_output_frames` applies two
+/// stride-2 convolutions.
+const CONFORMER_MEL_FRAMES_PER_TOKEN: usize = 4;
+
+/// The longest `input_audio` clip, in whole seconds, whose audio tokens fit
+/// the `context_tokens` left after the `prompt_tokens` and the two audio
+/// markers, at `samples_per_token` samples of 16 kHz audio a token; at most
+/// `MAX_AUDIO_SECS`.
+pub(crate) fn audio_secs_budget(
+    context_tokens: usize,
+    prompt_tokens: usize,
+    samples_per_token: usize,
+) -> u32 {
+    let tokens = context_tokens.saturating_sub(prompt_tokens.saturating_add(2));
+    let samples = tokens.saturating_mul(samples_per_token);
+    let secs = samples / GEMMA4_AUDIO_SAMPLE_RATE as usize;
+    u32::try_from(secs)
+        .unwrap_or(u32::MAX)
+        .min(rmlx_audio::wav::MAX_AUDIO_SECS)
+}
+
+/// The 16 kHz mono samples of one `input_audio` part (bare base64, or a
+/// `data:audio/...;base64,` URL) and the clip's own sample rate. The decode
+/// refuses more than `max_secs` of audio, before the decode when the file
+/// declares its length, and asks `cancelled` before each packet. A
+/// `max_secs` under `MAX_AUDIO_SECS` is the context budget at
+/// `samples_per_token` samples a token, and a refusal says so.
+pub(crate) fn decode_input_audio(
+    audio_b64: &str,
+    max_secs: u32,
+    samples_per_token: usize,
+    cancelled: &dyn Fn() -> bool,
+) -> rmlx_core::Result<(Vec<f32>, u32)> {
+    // Tolerate a `data:audio/...;base64,` prefix even though the OpenAI shape
+    // carries the bare base64 in `input_audio.data`.
+    let b64 = audio_b64
+        .rsplit_once(',')
+        .map_or(audio_b64, |(_, tail)| tail);
+    let bytes = crate::image_io::base64_decode(b64)
+        .map_err(|e| Error::Other(format!("input_audio base64 decode failed: {e}")))?;
+    let audio = rmlx_audio::wav::WavDecoder::decode_resampled(
+        &bytes,
+        GEMMA4_AUDIO_SAMPLE_RATE,
+        max_secs,
+        cancelled,
+    )
+    .map_err(|e| {
+        let over_context_budget = max_secs < rmlx_audio::wav::MAX_AUDIO_SECS
+            && matches!(e, rmlx_audio::wav::WavError::TooLong { .. });
+        if over_context_budget {
+            let tokens_per_sec = GEMMA4_AUDIO_SAMPLE_RATE as usize / samples_per_token.max(1);
+            Error::Other(format!(
+                "input_audio holds more than the {max_secs} s of audio the context leaves \
+                 after the prompt ({tokens_per_sec} tokens a second)"
+            ))
+        } else {
+            Error::Other(format!("input_audio decode failed: {e}"))
+        }
+    })?;
+    Ok((audio.samples, audio.sample_rate))
+}
+
 /// Decode + preprocess `input_audio` clips, expand the prompt with per-clip
 /// audio soft-token blocks, run the Conformer tower, and build the
 /// scatter-merged `inputs_embeds`.
 ///
 /// Pipeline (mirrors mlx-vlm `processing_gemma4` + `get_input_embeddings`):
-/// 1. base64 → bytes → `WavDecoder` (mono f32, native rate) → resample 16 kHz.
+/// 1. base64 → [`decode_input_audio`] → mono f32 at 16 kHz.
 /// 2. `Gemma4AudioFeatureExtractor::extract` → log-mel `[T, 128]`.
 /// 3. `encoder.num_output_frames(T)` → `T_sub`; splice the audio block
 ///    `<|audio>` + `T_sub` × `<|audio|>` + `<audio|>` after the leading token.
@@ -132,7 +194,9 @@ pub(crate) fn build_audio_prompt(
     ab: &AudioBundle,
     audio_b64: &[String],
     prompt_tokens: &[u32],
+    context_tokens: usize,
     device: rmlx_mlx::Device,
+    cancelled: &dyn Fn() -> bool,
 ) -> rmlx_core::Result<(Vec<u32>, rmlx_mlx::Array, rmlx_mlx::Array)> {
     if audio_b64.len() != 1 {
         return Err(Error::Other(format!(
@@ -153,13 +217,20 @@ pub(crate) fn build_audio_prompt(
         audio_token_id,
     } = ab
     {
+        let max_secs = audio_secs_budget(
+            context_tokens,
+            prompt_tokens.len(),
+            embedder.config().audio_samples_per_token,
+        );
         return build_unified_audio_prompt(
             model,
             embedder,
             *audio_token_id,
             &audio_b64[0],
             prompt_tokens,
+            max_secs,
             device,
+            cancelled,
         );
     }
 
@@ -176,22 +247,22 @@ pub(crate) fn build_audio_prompt(
         ));
     };
 
-    // 1. base64 → bytes → mono f32 @ 16 kHz.
-    let raw = audio_b64[0].as_str();
-    // Tolerate a `data:audio/...;base64,` prefix even though the OpenAI shape
-    // carries the bare base64 in `input_audio.data`.
-    let b64 = raw.rsplit_once(',').map_or(raw, |(_, tail)| tail);
-    let bytes = crate::image_io::base64_decode(b64)
-        .map_err(|e| Error::Other(format!("input_audio base64 decode failed: {e}")))?;
-    let (samples, sample_rate) = rmlx_audio::wav::WavDecoder::decode(&bytes)
-        .map_err(|e| Error::Other(format!("input_audio decode failed: {e}")))?;
-    let samples = rmlx_audio::transcribe::resample_to_16k(&samples, sample_rate);
-    let dur_secs = samples.len() as f64 / f64::from(GEMMA4_AUDIO_SAMPLE_RATE);
+    // 1. base64 → bytes → mono f32 @ 16 kHz, no longer than the context holds.
+    let samples_per_token = feature_extractor.hop_length() * CONFORMER_MEL_FRAMES_PER_TOKEN;
+    let max_secs = audio_secs_budget(context_tokens, prompt_tokens.len(), samples_per_token);
+    let (samples, sample_rate) =
+        decode_input_audio(&audio_b64[0], max_secs, samples_per_token, cancelled)?;
+    let n_samples = samples.len();
+    let dur_secs = n_samples as f64 / f64::from(GEMMA4_AUDIO_SAMPLE_RATE);
 
     // 2. log-mel features [T, 128].
     let mel = feature_extractor
         .extract(&samples)
         .map_err(|e| Error::Other(format!("input_audio mel extraction failed: {e}")))?;
+    drop(samples);
+    if cancelled() {
+        return Err(input_audio_cancelled());
+    }
     let t_mel = mel.len();
     if t_mel == 0 {
         return Err(Error::Other(
@@ -210,7 +281,7 @@ pub(crate) fn build_audio_prompt(
 
     tracing::info!(
         sample_rate,
-        samples = samples.len(),
+        samples = n_samples,
         duration_secs = dur_secs,
         mel_frames = t_mel,
         feature_size,
@@ -224,6 +295,7 @@ pub(crate) fn build_audio_prompt(
     for frame in &mel {
         flat.extend_from_slice(frame);
     }
+    drop(mel);
     let mel_arr = rmlx_mlx::Array::from_f32_slice(&flat, &[1, t_mel as i32, feature_size as i32])?;
     let mask_arr = rmlx_mlx::Array::from_f32_slice(&vec![0.0_f32; t_mel], &[1, t_mel as i32])?;
 
@@ -266,7 +338,7 @@ pub(crate) fn build_audio_prompt(
 /// `embed_audio`, and scatter at the `<|audio|>` positions.
 ///
 /// Pipeline (mirrors HF `Gemma4UnifiedProcessor` + the unified vision splice):
-/// 1. base64 → bytes → `WavDecoder` (mono f32, native rate) → resample 16 kHz.
+/// 1. base64 → [`decode_input_audio`] → mono f32 at 16 kHz.
 /// 2. `extract_waveform_frames` → `[num_tokens, audio_embed_dim]` raw frames,
 ///    `num_tokens = ceil(num_samples / audio_samples_per_token)`.
 /// 3. splice the audio block `<|audio>` + `num_tokens` × `<|audio|>` + `<audio|>`
@@ -282,32 +354,33 @@ fn build_unified_audio_prompt(
     audio_token_id: u32,
     audio_b64: &str,
     prompt_tokens: &[u32],
+    max_secs: u32,
     device: rmlx_mlx::Device,
+    cancelled: &dyn Fn() -> bool,
 ) -> rmlx_core::Result<(Vec<u32>, rmlx_mlx::Array, rmlx_mlx::Array)> {
-    // 1. base64 → bytes → mono f32 @ 16 kHz (shared decode/resample helpers).
-    let b64 = audio_b64
-        .rsplit_once(',')
-        .map_or(audio_b64, |(_, tail)| tail);
-    let bytes = crate::image_io::base64_decode(b64)
-        .map_err(|e| Error::Other(format!("input_audio base64 decode failed: {e}")))?;
-    let (samples, sample_rate) = rmlx_audio::wav::WavDecoder::decode(&bytes)
-        .map_err(|e| Error::Other(format!("input_audio decode failed: {e}")))?;
-    let samples = rmlx_audio::transcribe::resample_to_16k(&samples, sample_rate);
-    let dur_secs = samples.len() as f64 / f64::from(GEMMA4_AUDIO_SAMPLE_RATE);
+    // 1. base64 → bytes → mono f32 @ 16 kHz, no longer than the context holds.
+    let cfg = embedder.config();
+    let (samples, sample_rate) =
+        decode_input_audio(audio_b64, max_secs, cfg.audio_samples_per_token, cancelled)?;
+    let n_samples = samples.len();
+    let dur_secs = n_samples as f64 / f64::from(GEMMA4_AUDIO_SAMPLE_RATE);
 
     // 2. chunk raw waveform into fixed-length frames (encoder-free front-end).
-    let cfg = embedder.config();
     let (frames, num_tokens) =
         rmlx_models::gemma4::extract_waveform_frames(&samples, cfg.audio_samples_per_token);
+    drop(samples);
     if num_tokens == 0 {
         return Err(Error::Other(
             "input_audio produced zero audio soft tokens (clip empty)".to_owned(),
         ));
     }
+    if cancelled() {
+        return Err(input_audio_cancelled());
+    }
 
     tracing::info!(
         sample_rate,
-        samples = samples.len(),
+        samples = n_samples,
         duration_secs = dur_secs,
         audio_embed_dim = cfg.audio_embed_dim,
         audio_samples_per_token = cfg.audio_samples_per_token,
@@ -346,6 +419,12 @@ fn build_unified_audio_prompt(
         device,
     )?;
     Ok((aug_ids, embeds, masked_ids))
+}
+
+/// The error of an `input_audio` preparation stopped because the client is
+/// gone.
+fn input_audio_cancelled() -> Error {
+    Error::Other("input_audio preparation cancelled: the client is gone".to_owned())
 }
 
 #[cfg(test)]

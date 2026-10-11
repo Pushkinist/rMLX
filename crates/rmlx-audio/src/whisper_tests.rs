@@ -9,14 +9,12 @@
 
 use super::{DecodeFilters, WhisperConfig};
 use crate::npz::{extract_npy_dtype, extract_npy_shape};
-use crate::tokenizer::{TOK_EOT, TOK_NO_TIMESTAMPS, TOK_TIMESTAMP_BEGIN};
+use crate::tokenizer::{N_VOCAB, TOK_EOT, TOK_NO_TIMESTAMPS, TOK_TIMESTAMP_BEGIN};
 use rmlx_mlx::Dtype;
-
-const VOCAB: usize = 51_866;
 
 fn fresh_logits() -> Vec<f32> {
     // All zeros so we can see exactly which entries get masked to -inf.
-    vec![0.0_f32; VOCAB]
+    vec![0.0_f32; N_VOCAB]
 }
 
 /// SuppressBlank masks EOT + blank ids at the first step only.
@@ -42,7 +40,7 @@ fn no_timestamps_mode_masks_all_timestamps() {
     let mut l = fresh_logits();
     f.apply(&mut l, &[5_u32], false);
     assert!(l[TOK_TIMESTAMP_BEGIN as usize].is_infinite());
-    assert!(l[VOCAB - 1].is_infinite());
+    assert!(l[N_VOCAB - 1].is_infinite());
     // A plain text token stays finite.
     assert!(l[100].is_finite());
 }
@@ -100,6 +98,132 @@ fn parse_config_large_v3() {
     assert_eq!(cfg.n_audio_state, 1280);
     assert_eq!(cfg.n_vocab, 51866);
     assert_eq!(cfg.n_text_ctx, 448);
+}
+
+/// A `config.json` with the large-v3 sizes except the four given.
+fn config_json(n_mels: usize, n_vocab: usize, n_audio_ctx: usize, n_text_layer: usize) -> String {
+    serde_json::json!({
+        "n_mels": n_mels,
+        "n_audio_ctx": n_audio_ctx,
+        "n_audio_state": 1280,
+        "n_audio_head": 20,
+        "n_audio_layer": 32,
+        "n_vocab": n_vocab,
+        "n_text_ctx": 448,
+        "n_text_state": 1280,
+        "n_text_head": 20,
+        "n_text_layer": n_text_layer,
+    })
+    .to_string()
+}
+
+fn config_refusal(json: &str) -> String {
+    let err = WhisperConfig::from_json(json)
+        .expect_err("the config must be refused")
+        .to_string();
+    assert!(
+        err.contains("config.json"),
+        "the error names no file: {err}"
+    );
+    err
+}
+
+fn assert_names(err: &str, words: &[&str]) {
+    for word in words {
+        assert!(err.contains(word), "the error does not name {word}: {err}");
+    }
+}
+
+/// large-v3, large-v3-turbo (4 decoder layers) and distil-large-v3 (2) share
+/// the large-v3 vocabulary (mlx-community `config.json` of each).
+#[test]
+fn the_large_v3_family_configs_load() {
+    for n_text_layer in [32, 4, 2] {
+        WhisperConfig::from_json(&config_json(128, 51_866, 1500, n_text_layer))
+            .unwrap_or_else(|e| panic!("n_text_layer {n_text_layer}: {e}"));
+    }
+}
+
+/// tiny, base, small, medium, large-v1 and large-v2 state `n_vocab` 51865 and
+/// 80 mel bins; their `.en` models state 51864 (mlx-community `config.json`).
+#[test]
+fn a_config_of_another_vocabulary_is_refused_naming_n_vocab() {
+    for n_vocab in [51_865, 51_864] {
+        let err = config_refusal(&config_json(80, n_vocab, 1500, 4));
+        assert_names(&err, &["n_vocab", &n_vocab.to_string(), "51866"]);
+    }
+}
+
+/// The decode's 30 s window is 3000 mel frames, which the encoder halves to
+/// 1500 positions.
+#[test]
+fn an_audio_context_other_than_1500_is_refused() {
+    let err = config_refusal(&config_json(128, 51_866, 750, 32));
+    assert_names(&err, &["n_audio_ctx", "750", "1500"]);
+}
+
+/// The refusal comes before `weights.npz` is read: a directory with a large-v2
+/// `config.json` and no weights fails on `n_vocab`, and one with a large-v3
+/// `config.json` and no weights fails on the weight file.
+#[test]
+fn load_refuses_the_config_before_it_reads_the_weights() {
+    let dir = tempfile::tempdir().unwrap();
+    let load_error = |json: String| {
+        std::fs::write(dir.path().join("config.json"), json).unwrap();
+        match super::WhisperModel::load(dir.path()) {
+            Ok(_) => panic!("a directory with no weights must not load"),
+            Err(e) => e.to_string(),
+        }
+    };
+    let refused = load_error(config_json(80, 51_865, 1500, 32));
+    assert_names(&refused, &["config.json", "n_vocab", "51865"]);
+    let no_weights = load_error(config_json(128, 51_866, 1500, 32));
+    assert_names(&no_weights, &["weight file error"]);
+}
+
+/// The server sends a load error to the client: it names the file, never the
+/// directory the operator configured.
+#[test]
+fn a_load_error_names_the_file_and_no_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().display().to_string();
+    let load_error = || match super::WhisperModel::load(dir.path()) {
+        Ok(_) => panic!("a directory with no weights must not load"),
+        Err(e) => e.to_string(),
+    };
+    let no_config = load_error();
+    assert_names(&no_config, &["config.json", "No such file"]);
+    assert!(!no_config.contains(&path), "{no_config}");
+    std::fs::write(
+        dir.path().join("config.json"),
+        config_json(128, 51_866, 1500, 32),
+    )
+    .unwrap();
+    let no_weights = load_error();
+    assert_names(&no_weights, &["weights.npz", "No such file"]);
+    assert!(!no_weights.contains(&path), "{no_weights}");
+}
+
+/// The local large-v3 `config.json` passes the check. Runs on the CPU when
+/// `RMLX_O_MODELS_ROOT` holds `mlx-community__whisper-large-v3-mlx`; no weight
+/// is read.
+#[test]
+fn the_local_large_v3_config_loads() {
+    let Some(root) = std::env::var_os("RMLX_O_MODELS_ROOT") else {
+        eprintln!("SKIP the_local_large_v3_config_loads: RMLX_O_MODELS_ROOT is unset");
+        return;
+    };
+    let path = std::path::Path::new(&root)
+        .join("mlx-community__whisper-large-v3-mlx")
+        .join("config.json");
+    let Ok(json) = std::fs::read_to_string(&path) else {
+        eprintln!(
+            "SKIP the_local_large_v3_config_loads: no mlx-community__whisper-large-v3-mlx config.json under the root"
+        );
+        return;
+    };
+    let cfg = WhisperConfig::from_json(&json).expect("the large-v3 config must load");
+    assert_eq!(cfg.n_vocab, 51_866);
 }
 
 /// NPY dtype extraction for f2 (float16).

@@ -107,7 +107,9 @@ the only admission path.
 The timeout middleware reads an optional `X-Request-Timeout-Seconds` header
 and caps it at `--max-timeout-secs` (default 600). A cap of 0 disables the
 timeout. A header that is not a positive integer gets 400. An expired request
-gets HTTP 408 `timeout`.
+gets HTTP 408 `timeout`. The 408 drops the request; blocking work that already
+runs is not stopped by it, except a Whisper transcription, which stops before
+its next 30 s window (see the speech-to-text routes below).
 
 `X-Request-Id`, when present, becomes the request's correlation id (trimmed,
 printable ASCII, at most 128 characters). Otherwise the server makes a
@@ -191,8 +193,10 @@ prompt at the placeholder positions, and decode runs from the fused
 | `input_image` | `{type:"input_image", image_url:"<url>"}` (mlx-vlm shape) | SigLIP vision | same |
 | `input_audio` | `{type:"input_audio", input_audio:{data:"<base64>", format:"wav"}}` | Conformer or encoder-free | Gemma4 |
 
-**Audio.** The `rmlx-audio` decoder (Symphonia: WAV, MP3, M4A and others)
-downmixes to mono and resamples to 16 kHz. The Gemma4 Conformer checkpoints
+**Audio.** The `rmlx-audio` decoder (Symphonia: WAV, MP3, M4A, ADTS AAC)
+downmixes to mono and resamples to 16 kHz. It refuses a file that lost more
+audio than the limit for its length, or whose reader fails
+([`AUDIO.md`](AUDIO.md), "WAV I/O"). The Gemma4 Conformer checkpoints
 run the USM log-mel front-end and the Conformer `audio_tower`. The unified
 encoder-free checkpoint (`Gemma4UnifiedForConditionalGeneration`) cuts the
 waveform into 640-sample frames and projects each with `embed_audio`, one soft
@@ -206,7 +210,10 @@ positions.
   accept audio input (no audio tower)". Images sent to a model with no vision
   tower get the matching "no vision tower" 503.
 - Each `input_audio` part is capped at 16 MiB decoded
-  (`bounds::MAX_INPUT_AUDIO_BYTES`); a larger clip is 400.
+  (`bounds::MAX_INPUT_AUDIO_BYTES`); a larger clip is 400. Its audio is
+  capped at what the context holds after the prompt, at most 3 h (`docs/AUDIO.md`
+  § "WAV I/O"). Its decode stops when the client is gone (the token channel
+  closes); the audio tower and the prefill are not cut.
 
 ### Responses
 
@@ -425,7 +432,7 @@ Errors use the OpenAI envelope:
 | 404 | `not_found_error` | Chat or embeddings model not in the registry (`model_not_found` on the lifecycle routes). |
 | 408 | `timeout` | The request timeout expired. |
 | 429 | `rate_limit_error` | The GPU admission queue is full. |
-| 500 | `internal_error` | A handler panic, a prompt-pipeline task panic, or an embeddings preprocessor or compute failure. The audio routes send 500 as `{"error":"…"}`. |
+| 500 | `internal_error` | A handler panic, a prompt-pipeline task panic, or an embeddings preprocessor or compute failure. The audio routes send every status but 400, 408 and 429 as a bare `{"error":"…"}` ([`AUDIO.md`](AUDIO.md) § "HTTP route"). |
 | 502 | `constraint_not_engaged` | A `response_format` reply with no text at the engagement byte (streaming: error event). |
 | 503 | `service_unavailable` | Any load failure, OOM while loading included, and any other engine error. With `--require-smoke-probe` (off by default) a failed smoke probe at load lands here too. Counter: `upstream`. |
 | 503 | `admission_sla_exceeded` | The adaptive controller's anticipatory rejection, with `Retry-After: 5`. Counter: `admission_sla_503`. |
@@ -761,30 +768,25 @@ A rolling request summary in the mlx-vlm shape: `uptime_s`,
 
 ### Speech-to-text: `/v1/audio/transcriptions` and `/v1/audio/translations`
 
-Both take a multipart form. `translations` translates to English.
+Both take the OpenAI multipart form; `translations` translates to English.
+The fields, the bodies and each status are in [`AUDIO.md`](AUDIO.md) §
+"HTTP route". `file` is at most 25 MiB (413 above it, naming the cap and
+the size); `language`, `response_format` and `temperature` (no effect:
+decoding is greedy) are read; `timestamp_granularities=word` and
+`stream=true` are 422; `prompt` and any other field are ignored, counted in
+at most one `warn` event. A `verbose_json` segment has the keys OpenAI's schema
+requires except `avg_logprob` and `no_speech_prob`, which are not computed:
+a client that requires them, `@ai-sdk/openai` with the model `whisper-1` or
+openai-python in strict mode, cannot read it.
+A Whisper load failure is 503 with `x-should-retry: false` and names no
+server directory; an engine failure during the transcription is 503.
 
-| Field | Required | Default | Description |
-|---|---|---|---|
-| `file` | yes | — | Audio in any Symphonia container (WAV, MP3, FLAC, OGG, AAC/`.m4a`, …). Downmixed to mono and resampled to 16 kHz. |
-| `model` | no | `whisper-large-v3` | Logged only; the configured snapshot serves every request. |
-| `language` | no | `auto` | A language code, or `auto` to detect it. An unknown code is 422. |
-| `response_format` | no | `json` | `json`, `text`, `verbose_json`, `srt` or `vtt`. Anything else is 422. |
-| `temperature` | no | `0.0` | A non-finite or negative value is 422. A value above 1.0 is accepted and has no effect: decoding is always greedy argmax. |
-| `prompt` | no | — | Accepted and ignored. |
-
-| `response_format` | Body |
-|---|---|
-| `json` | `{"text": "..."}` |
-| `text` | Plain text. |
-| `verbose_json` | `{"task","language","duration","text","segments":[{"id","start","end","text"},…]}` |
-| `srt` | SRT, one cue per segment. |
-| `vtt` | WebVTT, one cue per segment. |
-
-- Without `--whisper-model-path` and `--whisper-tokenizer-path`, every request
-  is 503 `{"error":"audio model not configured; set --whisper-model-path"}`.
-- A file over 25 MiB is 422; the transport limit is 26 MiB.
-- A malformed form is 422.
-- No streaming and no word timestamps; timing is per segment.
+The upload is one buffer, sized from `Content-Length` up to the cap; a
+chunked upload, or one over the cap, grows it. The file is decoded
+after admission, under the GPU permit and before the Whisper model loads:
+decodes run one at a time, a waiting request holds only its upload, and a
+file the decoder refuses (422 `audio decode: …`) loads no model. The decode
+holds the file and its 16 kHz output, then drops the file.
 
 `rmlx_audio::transcribe::Transcriber`, shared with `rmlx transcribe`, walks
 the audio in 30 s windows. Each window decodes in timestamp mode with the
@@ -797,14 +799,33 @@ as a `<|startofprev|>` prompt; a window that loops under it is decoded again
 without it ([`AUDIO.md`](AUDIO.md), "Repetition guard"). The only filler guard
 drops a segment that opens after the window's own length plus 0.5 s.
 
-With `language` absent or `auto`, `WhisperModel::detect_language()` runs one
-SOT decoder step and takes the argmax over the language tokens. On error it
-falls back to English.
+`language` is an ISO code or an English name, in any case; the reply names the
+language as the English name. With `language` absent or `auto`, the language
+is detected once, on the first window, and holds for the whole file, as in
+openai-whisper ([`AUDIO.md`](AUDIO.md), "Language forms" and "Language
+detection").
 
 The Whisper model and tokenizer load on the first request and stay for the
-life of the process; changing the snapshot needs a restart. Audio requests
-pass the same admission gate as chat, and hold the GPU permit for the encode
-and decode.
+life of the process; changing the snapshot needs a restart. The tokenizer
+loads first. A tokenizer or a `config.json` of another vocabulary than
+large-v3's is refused before the weights load, and every request is 503 with
+the refusal text (`docs/AUDIO.md` § "Supported variants"). Audio requests
+pass the same admission gate as chat, and hold the GPU permit for the audio
+file decode, the encode and the Whisper decode.
+
+When the request is gone, because the 408 fired or the client closed the
+connection, the transcription stops before its next 30 s window and releases
+the permit. An `info` event in the request's span,
+`long-form transcription cancelled before the window opened`, gives the
+window number and its `seek` in samples. The stop is not immediate:
+
+- The window in flight runs to its end: one encode and at most two decodes of
+  `n_text_ctx / 2` tokens each (224 for large-v3).
+- The audio decode stops before its next packet. The model load of the
+  first request is not cut.
+- Only a 408 or a closed connection stops the walk. A graceful shutdown
+  (SIGINT, SIGTERM) waits for the request and never stops it. With
+  `--max-timeout-secs 0`, only a closed connection stops it.
 
 ### Text-to-speech: `/v1/audio/speech`
 
@@ -821,7 +842,8 @@ Qwen3-TTS synthesizes mono 24 kHz audio from a JSON body:
 Without `--tts-model-path` and `--tts-tokenizer-path` the route is 503 with
 type `not_supported`. Another synthesis failure is 500. The model loads on the
 first request, stays for the life of the process, and holds the GPU permit
-while it synthesizes.
+while it synthesizes. A request that times out does not stop the synthesis:
+it holds the permit until the synthesis ends.
 
 ---
 

@@ -135,20 +135,12 @@ pub fn build_router(state: AppState) -> Router {
         // Catches any handler panic and returns 500 instead of
         // dropping the connection or crashing the worker.
         .layer(catch_unwind::CatchUnwindLayer::new())
-        // Transport-level body limit.
-        //
-        // Gate ordering:
-        //   1. This transport limit (outermost axum layer) rejects bodies before
-        //      they reach any handler or inner middleware.
-        //   2. The audio handler has a per-field 25 MiB check (MAX_AUDIO_BYTES).
-        //   3. Bounds checks in bounds.rs apply per-field caps for chat/embed routes.
-        //
-        // Sizing: the audio route advertises a 25 MiB audio payload cap. Multipart
-        // framing (boundary markers, field headers) and the base64 overhead for
-        // chat/embed image inputs both consume additional bytes.  26 MiB = 25 MiB
-        // audio cap + 1 MiB framing slack — the tightest limit that guarantees a
-        // valid 25 MiB audio upload is never dropped by the transport gate.
-        .layer(DefaultBodyLimit::max(26 * 1024 * 1024))
+        // Transport-level body limit, sized for one audio upload at its cap.
+        // A JSON body over it is refused by its extractor; a multipart body
+        // over it fails while the audio handler reads it, and the handler
+        // answers 413. bounds.rs then applies the per-field caps of the chat
+        // and embeddings routes.
+        .layer(DefaultBodyLimit::max(audio::MAX_REQUEST_BYTES))
         .with_state(state)
 }
 

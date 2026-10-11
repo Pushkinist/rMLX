@@ -561,6 +561,15 @@ Whisper serves `/v1/audio/transcriptions`, `/v1/audio/translations` and
 `<|notimestamps|>` = 50364. Timestamps run 50365 to 51865 in 0.02 s steps
 (`crates/rmlx-audio/src/tokenizer.rs`).
 
+**Supported variants.** The load accepts the large-v3 vocabulary only:
+large-v3, large-v3-turbo and distil-large-v3 (`n_vocab` 51866). tiny, base,
+small, medium, large-v1, large-v2 (51865) and the `.en` models (51864) are
+refused at `config.json`, and their tokenizers at `tokenizer.json`, because
+their special-token ids differ. `docs/AUDIO.md` § "Supported variants" has
+the rule and the error text. `mlx-community/whisper-large-v3-turbo` ships
+`weights.safetensors`, which the loader does not read; a snapshot with
+`weights.npz` (for example `mlx-community/whisper-turbo`) is needed.
+
 **Model.** Encoder: two Conv1d stems (the second at stride 2), sinusoidal
 positions, attention blocks, a final LayerNorm. Decoder: token and learned
 position embeddings, cross-attention blocks, a tied output projection. Sizes
@@ -569,8 +578,8 @@ come from `config.json`.
 **Inference.** The server and the CLI share
 `rmlx_audio::transcribe::Transcriber`:
 
-1. Decode with Symphonia (any container, AAC included), downmix, resample to
-   16 kHz.
+1. Decode with Symphonia (WAV, MP3, M4A, ADTS AAC), downmix and resample to
+   16 kHz packet by packet.
 2. Walk the audio in 30 s windows: log-mel (`MelExtractor`), `encode_mel`,
    then greedy decode in timestamp mode.
 3. Each step applies the openai-whisper filter chain: `SuppressBlank`,

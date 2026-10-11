@@ -213,8 +213,12 @@ Plus the KV codec flags, without `--kv-boundary-layers`.
 
 Transcribes one audio file with the engine behind `POST
 /v1/audio/transcriptions`. The backend is chosen from the snapshot's
-`config.json`; Whisper is the only one. Any container Symphonia reads is
-decoded and resampled to 16 kHz mono. Decoding is greedy at temperature 0.
+`config.json`; Whisper is the only one. A WAV, MP3, M4A or ADTS AAC file is
+decoded and resampled to 16 kHz mono, before the model loads, and only the
+16 kHz samples stay while the model runs; a file that
+lost more audio than the limit for its length, or whose reader fails, is an
+`audio decode:` error, at any length ([`AUDIO.md`](AUDIO.md),
+"WAV I/O"). Decoding is greedy at temperature 0.
 
 ```bash
 rmlx transcribe meeting.m4a --model <whisper-snapshot> --tokenizer <tok-dir> \
@@ -227,7 +231,7 @@ rmlx transcribe meeting.m4a --model <whisper-snapshot> --tokenizer <tok-dir> \
 | `--model` | path | required | Whisper snapshot. Env: `RMLX_WHISPER_MODEL_PATH`. |
 | `--tokenizer` | path | the model directory | Directory with `tokenizer.json`; Whisper snapshots ship none. Env: `RMLX_WHISPER_TOKENIZER_PATH`. |
 | `--format` | `txt \| json \| srt \| vtt` | `txt` | Output format; `json`, `srt` and `vtt` carry per-segment times. |
-| `--language` | string | `auto` | Language code, or `auto` to detect it. |
+| `--language` | string | `auto` | ISO code or English name (`fr`, `French`), or `auto` to detect it once, on the first 30 s window, for the whole file ([`AUDIO.md`](AUDIO.md), "Language forms"). An unknown language is refused, naming it. |
 | `--translate` | bool flag | off | Translate to English. |
 | `--output` | path | stdout | Output file. |
 | `--device` | `cpu \| gpu` | `gpu` | Device. |

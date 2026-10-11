@@ -1,11 +1,12 @@
 //! Unit tests for the long-form transcription engine helpers (no model needed).
 
 use super::{
-    compression_ratio, decode_window, fmt_time, next_prompt, plan_window, previous_text_cap,
-    render_srt, render_vtt, resample_to_16k, walk_windows, window_token_budget, OutputFormat,
-    RawSegment, SeekRule, Segment, WindowDecode, COMPRESSION_RATIO_LOOP,
+    compression_ratio, decode_window, fmt_time, next_prompt, previous_text_cap, render_srt,
+    render_vtt, reported_language, requested_language, resolve_language, window_token_budget,
+    OutputFormat, Segment, WindowDecode, COMPRESSION_RATIO_LOOP,
 };
-use crate::tokenizer::TOK_TIMESTAMP_BEGIN;
+use crate::tokenizer::{TOK_EN, TOK_TIMESTAMP_BEGIN};
+use crate::whisper::WhisperError;
 
 /// Tokens prepended by the seek loop before the previous-text prompt: the
 /// `<|startofprev|>` marker (1) plus the timestamp-mode SOT prefix
@@ -110,14 +111,20 @@ fn time_formatting_srt_vtt() {
 fn srt_vtt_multi_segment() {
     let segs = vec![
         Segment {
+            seek: 0,
             start: 0.0,
             end: 2.5,
             text: "hello world".to_owned(),
+            tokens: Vec::new(),
+            compression_ratio: 1.0,
         },
         Segment {
+            seek: 0,
             start: 2.5,
             end: 5.0,
             text: "second line".to_owned(),
+            tokens: Vec::new(),
+            compression_ratio: 1.0,
         },
     ];
     let srt = render_srt(&segs);
@@ -128,471 +135,6 @@ fn srt_vtt_multi_segment() {
     assert!(vtt.starts_with("WEBVTT\n\n"));
     assert!(vtt.contains("00:00:00.000 --> 00:00:02.500\nhello world"));
     assert!(vtt.contains("00:00:02.500 --> 00:00:05.000\nsecond line"));
-}
-
-#[test]
-fn resample_identity_when_already_16k() {
-    let s = vec![0.1_f32, 0.2, 0.3, 0.4];
-    assert_eq!(resample_to_16k(&s, 16_000), s);
-}
-
-#[test]
-fn resample_downsamples_48k_to_16k() {
-    // 48k -> 16k should produce ~1/3 the samples.
-    let s: Vec<f32> = (0..4800).map(|i| i as f32 / 4800.0).collect();
-    let out = resample_to_16k(&s, 48_000);
-    // 4800 * 16000/48000 = 1600.
-    assert!((out.len() as i64 - 1600).abs() <= 1, "len = {}", out.len());
-    // Monotone ramp preserved roughly.
-    assert!(out.first().copied().unwrap_or(1.0) < 0.05);
-    assert!(out.last().copied().unwrap_or(0.0) > 0.9);
-}
-
-#[test]
-fn resample_empty() {
-    assert_eq!(resample_to_16k(&[], 48_000), Vec::<f32>::new());
-}
-
-// ── Window plan: segments and seek advance from a window's sampled tokens ────
-//
-// Oracle: the seek decision block of openai-whisper `transcribe()`
-// (https://github.com/openai/whisper/blob/86098128c0b4f24f0e2aa2994de830614b474227/whisper/transcribe.py#L339-L399).
-// The reference counts in 10 ms mel frames and rounds to whole frames; the
-// sample counts below are the translation of its rule to samples at 16 kHz
-// (one timestamp step is 320 samples). Rules:
-//   - a stream that ends in ONE timestamp (`[text, ts]`) means no speech follows
-//     the last timestamp: the whole real window is consumed;
-//   - a stream with a timestamp pair that does not end in one timestamp drops
-//     the unfinished segment and seeks to the end of the last closed segment;
-//   - a stream with no timestamp pair is one segment that starts at the window
-//     start (not at its first timestamp) and consumes the whole real window.
-// Not part of the reference: a segment that opens more than 0.5 s past the end
-// of a short window is dropped (see `segment_opening_past_the_real_audio_is_dropped`).
-
-const SAMPLES_PER_WINDOW: usize = 480_000;
-const A: u32 = 1_000;
-const B: u32 = 1_001;
-
-fn ts(secs: f32) -> u32 {
-    TOK_TIMESTAMP_BEGIN + (secs / 0.02).round() as u32
-}
-
-fn seg(start: f32, end: f32, tokens: &[u32]) -> RawSegment {
-    RawSegment {
-        start,
-        end,
-        tokens: tokens.to_vec(),
-    }
-}
-
-#[track_caller]
-fn assert_plan(
-    tokens: &[u32],
-    window_samples: usize,
-    want_segments: &[RawSegment],
-    want_advance: usize,
-) {
-    let plan = plan_window(tokens, window_samples);
-    assert_eq!(
-        plan.advance_samples, want_advance,
-        "seek advance in samples for a {window_samples}-sample window"
-    );
-    assert_eq!(
-        plan.segments.len(),
-        want_segments.len(),
-        "{:?}",
-        plan.segments
-    );
-    for (got, want) in plan.segments.iter().zip(want_segments) {
-        assert!(
-            (got.start - want.start).abs() < 1e-3 && (got.end - want.end).abs() < 1e-3,
-            "segment times: got {got:?}, want {want:?}"
-        );
-        assert_eq!(got.tokens, want.tokens);
-    }
-}
-
-/// Two spoken sentences, 5.4 s of audio, one timestamp at the end: one pass
-/// over the clip. Seeking to the last timestamp would open two tail windows
-/// over the last 0.09 s.
-#[test]
-fn window_ending_in_one_timestamp_consumes_whole_short_window() {
-    let tokens = [ts(0.0), A, A, ts(2.28), ts(2.66), B, B, ts(5.32)];
-    assert_plan(
-        &tokens,
-        86_551,
-        &[seg(0.0, 2.28, &[A, A]), seg(2.66, 5.32, &[B, B])],
-        86_551,
-    );
-}
-
-/// The same rule on a full window: a last timestamp at 29.40 s does not move the
-/// next window to 29.40 s.
-#[test]
-fn window_ending_in_one_timestamp_consumes_whole_full_window() {
-    assert_plan(
-        &[ts(0.0), A, ts(29.40)],
-        SAMPLES_PER_WINDOW,
-        &[seg(0.0, 29.40, &[A])],
-        SAMPLES_PER_WINDOW,
-    );
-    assert_plan(
-        &[ts(0.0), A, ts(10.0), ts(10.5), B, ts(29.40)],
-        SAMPLES_PER_WINDOW,
-        &[seg(0.0, 10.0, &[A]), seg(10.5, 29.40, &[B])],
-        SAMPLES_PER_WINDOW,
-    );
-}
-
-#[test]
-fn short_window_ending_in_one_timestamp_consumes_whole_window() {
-    assert_plan(
-        &[ts(0.0), A, ts(1.5)],
-        32_000,
-        &[seg(0.0, 1.5, &[A])],
-        32_000,
-    );
-}
-
-/// A stream that ends in a timestamp pair seeks to the end of the last closed
-/// segment.
-#[test]
-fn window_ending_in_equal_timestamp_pair_seeks_to_the_pair() {
-    assert_plan(
-        &[ts(0.0), A, ts(12.0), ts(12.0)],
-        SAMPLES_PER_WINDOW,
-        &[seg(0.0, 12.0, &[A])],
-        192_000,
-    );
-}
-
-/// A pair whose second stamp is later: the seek goes to the first stamp (the
-/// end of the closed segment), not to the second.
-#[test]
-fn window_ending_in_unequal_timestamp_pair_seeks_to_the_closed_segment() {
-    assert_plan(
-        &[ts(0.0), A, ts(12.0), ts(12.4)],
-        SAMPLES_PER_WINDOW,
-        &[seg(0.0, 12.0, &[A])],
-        192_000,
-    );
-}
-
-/// Text after the last closed segment is an unfinished segment: it is not
-/// emitted, and the seek returns to the end of the closed segment so the next
-/// window decodes that speech once.
-#[test]
-fn unfinished_tail_segment_is_dropped_and_seek_returns_to_closed_segment() {
-    assert_plan(
-        &[ts(0.0), A, ts(2.0), ts(2.5), B],
-        SAMPLES_PER_WINDOW,
-        &[seg(0.0, 2.0, &[A])],
-        32_000,
-    );
-}
-
-/// Text with no timestamp at all: one segment, the whole window consumed.
-#[test]
-fn text_without_timestamps_consumes_whole_window() {
-    assert_plan(
-        &[A, B],
-        SAMPLES_PER_WINDOW,
-        &[seg(0.0, 30.0, &[A, B])],
-        SAMPLES_PER_WINDOW,
-    );
-    assert_plan(&[A, B], 48_000, &[seg(0.0, 3.0, &[A, B])], 48_000);
-}
-
-/// No text and no closing timestamp: nothing is emitted, the window is
-/// consumed, and the seek always moves forward.
-#[test]
-fn empty_stream_and_lone_opening_timestamp_consume_whole_window() {
-    assert_plan(&[], SAMPLES_PER_WINDOW, &[], SAMPLES_PER_WINDOW);
-    assert_plan(&[ts(0.0)], SAMPLES_PER_WINDOW, &[], SAMPLES_PER_WINDOW);
-    assert_plan(&[], 1_434, &[], 1_434);
-}
-
-/// Consuming the whole window must advance by exactly the window's sample
-/// count for every length, on both whole-window branches. Windows under 160
-/// samples are tested here through `plan_window`; the walk never opens them.
-#[test]
-fn whole_window_consumption_leaves_no_sample_behind() {
-    for window_samples in 1..=SAMPLES_PER_WINDOW {
-        let no_timestamps = plan_window(&[A, B], window_samples);
-        assert_eq!(
-            no_timestamps.advance_samples, window_samples,
-            "no timestamps, window of {window_samples} samples"
-        );
-        let one_timestamp = plan_window(&[ts(0.0), A, ts(0.02)], window_samples);
-        assert_eq!(
-            one_timestamp.advance_samples, window_samples,
-            "one closing timestamp, window of {window_samples} samples"
-        );
-        let pair_then_one_timestamp = plan_window(
-            &[ts(0.0), A, ts(0.02), ts(0.04), B, ts(0.06)],
-            window_samples,
-        );
-        assert_eq!(
-            pair_then_one_timestamp.advance_samples, window_samples,
-            "timestamp pair, then one closing timestamp, window of {window_samples} samples"
-        );
-    }
-}
-
-/// Several closed segments: the seek goes to the end of the LAST closed
-/// segment, not the first, and the unfinished text after it is dropped.
-#[test]
-fn several_closed_segments_seek_to_the_last_one() {
-    assert_plan(
-        &[ts(0.0), A, ts(2.0), ts(2.5), B, ts(4.0), ts(4.5), A],
-        SAMPLES_PER_WINDOW,
-        &[seg(0.0, 2.0, &[A]), seg(2.5, 4.0, &[B])],
-        64_000,
-    );
-}
-
-/// One opening timestamp and text, nothing else: no timestamp pair, so one
-/// segment over the whole window and the whole window consumed.
-#[test]
-fn opening_timestamp_and_text_without_closing_is_one_whole_window_segment() {
-    assert_plan(
-        &[ts(0.0), A, B],
-        SAMPLES_PER_WINDOW,
-        &[seg(0.0, 30.0, &[A, B])],
-        SAMPLES_PER_WINDOW,
-    );
-}
-
-/// A pair at the very start closes nothing, so the seek would not move: the
-/// window is consumed instead of looping on it.
-#[test]
-fn seek_always_moves_forward() {
-    assert_plan(
-        &[ts(0.0), ts(0.0)],
-        SAMPLES_PER_WINDOW,
-        &[],
-        SAMPLES_PER_WINDOW,
-    );
-    assert_plan(&[ts(0.0), ts(0.0)], 1_434, &[], 1_434);
-}
-
-/// With no timestamp pair the segment starts at the window start, as in the
-/// reference, even when the first timestamp is later.
-#[test]
-fn single_segment_starts_at_the_window_start() {
-    assert_plan(
-        &[ts(1.0), A, ts(3.0)],
-        SAMPLES_PER_WINDOW,
-        &[seg(0.0, 3.0, &[A])],
-        SAMPLES_PER_WINDOW,
-    );
-}
-
-/// Not part of the reference rule: a segment that opens more than 0.5 s past
-/// the real end of a short window sits in the zero-pad tail and is dropped, to
-/// stop filler there. A segment that opens inside that margin is kept.
-#[test]
-fn segment_opening_past_the_real_audio_is_dropped() {
-    assert_plan(
-        &[ts(0.0), A, ts(0.5), ts(2.0), B, ts(2.5)],
-        16_000,
-        &[seg(0.0, 0.5, &[A])],
-        16_000,
-    );
-    assert_plan(
-        &[ts(0.0), A, ts(0.5), ts(1.4), B, ts(1.6)],
-        16_000,
-        &[seg(0.0, 0.5, &[A]), seg(1.4, 1.6, &[B])],
-        16_000,
-    );
-}
-
-/// The margin is exactly 0.5 s: a segment opening at the real end plus 0.5 s is
-/// kept, one step later is dropped.
-#[test]
-fn pad_tail_guard_margin_is_half_a_second() {
-    assert_plan(
-        &[ts(0.0), A, ts(0.5), ts(1.5), B, ts(1.8)],
-        16_000,
-        &[seg(0.0, 0.5, &[A]), seg(1.5, 1.8, &[B])],
-        16_000,
-    );
-    assert_plan(
-        &[ts(0.0), A, ts(0.5), ts(1.52), B, ts(1.8)],
-        16_000,
-        &[seg(0.0, 0.5, &[A])],
-        16_000,
-    );
-    // 16,100 is not a multiple of 320: the limit is 24,100 samples, and a start
-    // at 1.52 s is 24,320.
-    assert_plan(
-        &[ts(0.0), A, ts(0.5), ts(1.52), B, ts(1.8)],
-        16_100,
-        &[seg(0.0, 0.5, &[A])],
-        16_100,
-    );
-}
-
-/// With a timestamp pair, the first segment starts at its own first timestamp
-/// (the reference takes `sliced_tokens[0]`), not at the window start.
-#[test]
-fn pair_branch_first_segment_starts_at_its_timestamp() {
-    assert_plan(
-        &[ts(1.0), A, ts(2.0), ts(2.5), B, ts(4.0)],
-        SAMPLES_PER_WINDOW,
-        &[seg(1.0, 2.0, &[A]), seg(2.5, 4.0, &[B])],
-        SAMPLES_PER_WINDOW,
-    );
-}
-
-/// The last closed segment may end past the real audio of a short window; the
-/// advance is clamped to the window.
-#[test]
-fn seek_never_passes_the_end_of_the_window() {
-    assert_plan(
-        &[ts(0.0), A, ts(2.0), ts(2.0)],
-        16_000,
-        &[seg(0.0, 2.0, &[A])],
-        16_000,
-    );
-}
-
-/// Text before the first timestamp is not a panic: its start is the window start.
-#[test]
-fn text_before_the_first_timestamp_starts_at_the_window_start() {
-    assert_plan(
-        &[A, ts(2.0), ts(2.5), B, ts(4.0)],
-        SAMPLES_PER_WINDOW,
-        &[seg(0.0, 2.0, &[A]), seg(2.5, 4.0, &[B])],
-        SAMPLES_PER_WINDOW,
-    );
-}
-
-/// Each branch names the rule that set the advance.
-#[test]
-fn plan_names_the_seek_rule() {
-    let rule = |tokens: &[u32]| plan_window(tokens, SAMPLES_PER_WINDOW).rule;
-    assert_eq!(
-        rule(&[ts(0.0), A, ts(2.0), ts(2.5), B, ts(4.0)]),
-        SeekRule::SingleEnding
-    );
-    assert_eq!(
-        rule(&[ts(0.0), A, ts(12.0), ts(12.4)]),
-        SeekRule::LastClosed {
-            end_samples: 192_000
-        }
-    );
-    assert_eq!(
-        rule(&[ts(0.0), A, ts(0.02), ts(0.02)]),
-        SeekRule::LastClosed { end_samples: 320 }
-    );
-    assert_eq!(rule(&[A, B]), SeekRule::NoPair);
-    assert_eq!(rule(&[ts(0.0), ts(0.0)]), SeekRule::ZeroFallback);
-}
-
-// ── Window walk: which windows are opened, from scripted token streams ───────
-
-const MAX_SCRIPTED_WINDOWS: usize = 8;
-
-/// Run `walk_windows` over `total_samples`, answering window `k` with
-/// `scripts[k]`. Any window past the script gets a one-timestamp filler stream.
-/// Returns every `(seek, window_samples)` the walk asked for.
-fn walk(total_samples: usize, scripts: &[&[u32]]) -> Vec<(usize, usize)> {
-    let filler = [ts(0.0), A, ts(0.04)];
-    let mut calls: Vec<(usize, usize)> = Vec::new();
-    let result: Result<(), ()> = walk_windows(total_samples, |seek, window_samples| {
-        // No scripted walk opens this many windows: a walk that does not end
-        // fails here and does not hang the test binary.
-        if calls.len() >= MAX_SCRIPTED_WINDOWS {
-            return Err(());
-        }
-        let tokens = scripts.get(calls.len()).copied().unwrap_or(&filler);
-        calls.push((seek, window_samples));
-        Ok(plan_window(tokens, window_samples).advance_samples)
-    });
-    assert_eq!(result, Ok(()), "walk did not end; windows: {calls:?}");
-    calls
-}
-
-/// Two sentences in 5.4 s with one timestamp at the end: one window.
-#[test]
-fn clip_with_a_single_ending_is_one_window() {
-    let clip = [ts(0.0), A, A, ts(2.28), ts(2.66), B, B, ts(5.32)];
-    assert_eq!(walk(86_551, &[&clip]), [(0, 86_551)]);
-}
-
-/// A window that ends in a pair at 5.40 s leaves 151 samples, less than one mel
-/// hop (the reference counts 540 whole frames in 86,551 samples): one window.
-#[test]
-fn pair_ending_less_than_a_hop_before_the_end_is_one_window() {
-    let clip = [ts(0.0), A, ts(2.0), ts(2.5), B, ts(5.40), ts(5.40)];
-    assert_eq!(walk(86_551, &[&clip]), [(0, 86_551)]);
-}
-
-/// 30 s and 5 ms: after the full window, 80 samples are left, less than one hop.
-#[test]
-fn input_of_a_window_plus_five_milliseconds_is_one_window() {
-    let window = [ts(0.0), A, ts(29.40)];
-    assert_eq!(walk(480_080, &[&window]), [(0, 480_000)]);
-}
-
-/// Exactly one hop of audio opens a window; one sample less does not.
-#[test]
-fn walk_opens_a_window_from_one_hop_of_audio() {
-    assert_eq!(walk(159, &[]), []);
-    assert_eq!(walk(160, &[]), [(0, 160)]);
-    assert_eq!(walk(0, &[]), []);
-}
-
-/// 40 s, the first window ends in one timestamp at 29.40 s: the second window
-/// starts at 30 s, not at 29.40 s.
-#[test]
-fn single_ending_at_29_4_starts_the_next_window_at_30_s() {
-    let first = [ts(0.0), A, ts(29.40)];
-    let second = [ts(0.0), B, ts(9.98)];
-    assert_eq!(
-        walk(640_000, &[&first, &second]),
-        [(0, 480_000), (480_000, 160_000)]
-    );
-}
-
-/// 40 s, the first window ends in a pair at 12.0 s: the second window starts
-/// at 12.0 s.
-#[test]
-fn pair_at_12_s_starts_the_next_window_at_12_s() {
-    let first = [ts(0.0), A, ts(12.0), ts(12.0)];
-    let second = [ts(0.0), B, ts(27.9)];
-    assert_eq!(
-        walk(640_000, &[&first, &second]),
-        [(0, 480_000), (192_000, 448_000)]
-    );
-}
-
-/// A window that reports an advance of 0 is consumed whole, so the walk ends.
-#[test]
-fn walk_consumes_a_window_that_reports_no_advance() {
-    let mut calls: Vec<(usize, usize)> = Vec::new();
-    let result: Result<(), ()> = walk_windows(640_000, |seek, window_samples| {
-        if calls.len() >= MAX_SCRIPTED_WINDOWS {
-            return Err(());
-        }
-        calls.push((seek, window_samples));
-        Ok(0)
-    });
-    assert_eq!(result, Ok(()));
-    assert_eq!(calls, [(0, 480_000), (480_000, 160_000)]);
-}
-
-/// An error from a window stops the walk and is returned.
-#[test]
-fn walk_stops_on_the_first_error() {
-    let mut calls = 0;
-    let result = walk_windows(640_000, |_, _| {
-        calls += 1;
-        Err("decode failed")
-    });
-    assert_eq!(result, Err("decode failed"));
-    assert_eq!(calls, 1);
 }
 
 // ── Window decode: the repetition guard, from scripted decodes ───────────────
@@ -863,4 +405,99 @@ fn of_two_loops_with_the_same_ratio_the_retry_is_kept() {
     retry.push(TOK_TIMESTAMP_BEGIN + 1450);
     let (decoded, _) = guarded(&PROMPT, &looping(8), &retry);
     assert_eq!(kept(decoded), (retry, false, true));
+}
+
+/// `auto` asks for detection; a code or an English name, in any case, names a
+/// token.
+#[test]
+fn a_requested_language_is_auto_or_a_token() {
+    for auto in ["auto", "AUTO", "Auto"] {
+        assert!(matches!(requested_language(auto), Ok(None)), "{auto}");
+    }
+    for (spelling, token) in [("en", TOK_EN), ("EN", TOK_EN), ("French", TOK_EN + 6)] {
+        assert!(
+            matches!(requested_language(spelling), Ok(Some(t)) if t == token),
+            "{spelling}"
+        );
+    }
+}
+
+/// A language Whisper does not know is an error that names the value; it is
+/// never English.
+#[test]
+fn an_unknown_requested_language_is_an_error_naming_it() {
+    for unknown in ["xx", "klingon", "", "en-US"] {
+        let error = requested_language(unknown).expect_err(unknown);
+        assert!(
+            matches!(&error, WhisperError::UnknownLanguage(value) if value == unknown),
+            "{error:?}"
+        );
+        assert!(
+            error.to_string().contains(&format!("'{unknown}'")),
+            "{error}"
+        );
+    }
+}
+
+/// The language a transcription reports is the English name of the token the
+/// decode used, whether the request named it or the model detected it. The
+/// text `lang_tok=` is in no report.
+#[test]
+fn the_reported_language_is_the_english_name_of_the_token() {
+    assert_eq!(reported_language(Some(TOK_EN)), "english");
+    assert_eq!(reported_language(Some(TOK_EN + 6)), "french");
+    assert_eq!(reported_language(Some(TOK_EN + 99)), "cantonese");
+    for token in TOK_EN..=TOK_EN + 99 {
+        assert!(!reported_language(Some(token)).contains("lang_tok"));
+    }
+}
+
+/// The first window detects the language and stores it; a later window reads
+/// the stored token and does not detect again.
+#[test]
+fn the_first_window_decides_the_language_of_the_file() {
+    let mut resolved = requested_language("auto").unwrap();
+    let mut detections = 0;
+    let mut detect = |token| {
+        detections += 1;
+        Ok(token)
+    };
+    assert_eq!(
+        resolve_language(&mut resolved, || detect(TOK_EN + 6)).unwrap(),
+        TOK_EN + 6
+    );
+    assert_eq!(resolved, Some(TOK_EN + 6));
+    assert_eq!(
+        resolve_language(&mut resolved, || detect(TOK_EN + 1)).unwrap(),
+        TOK_EN + 6
+    );
+    assert_eq!(detections, 1);
+    assert_eq!(reported_language(resolved), "french");
+}
+
+/// A named language is never detected.
+#[test]
+fn a_named_language_is_not_detected() {
+    let mut resolved = requested_language("Russian").unwrap();
+    let got = resolve_language(&mut resolved, || panic!("a named language is not detected"));
+    assert_eq!(got.unwrap(), TOK_EN + 4);
+    assert_eq!(reported_language(resolved), "russian");
+}
+
+/// A failed detection fails the window; no English is stored.
+#[test]
+fn a_failed_detection_is_an_error_and_stores_nothing() {
+    let mut resolved = None;
+    let got = resolve_language(&mut resolved, || {
+        Err(WhisperError::Mlx("op failed".to_owned()))
+    });
+    assert!(matches!(got, Err(WhisperError::Mlx(_))), "{got:?}");
+    assert_eq!(resolved, None);
+}
+
+/// With `auto` and audio shorter than one mel hop, no window runs and no token
+/// exists; the report names english.
+#[test]
+fn a_report_with_no_detected_language_names_english() {
+    assert_eq!(reported_language(None), "english");
 }

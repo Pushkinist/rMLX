@@ -11,6 +11,9 @@
 //!    runs at temp=0. Skips when `say`/`ffmpeg` are unavailable.
 //!    `two_sentence_clip_is_two_segments` does the same for two sentences and
 //!    asserts two segments with no repeat and no trailing filler.
+//!    `long_synthetic_clip_is_transcribed_once_in_order` speaks 28 sentences
+//!    with gaps (about 112 s, several windows) and asserts each sentence once,
+//!    in order, with segment times inside the clip.
 //!
 //! 2. `long_form_regression` — scans the gitignored fixtures dir
 //!    (`crates/rmlx-audio/tests/fixtures/`) for any `*.{m4a,wav,mp3,…}` paired
@@ -37,12 +40,13 @@
 )]
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use rmlx_audio::tokenizer::{WhisperTask, WhisperTokenizer};
 use rmlx_audio::transcribe::{TranscribeOptions, Transcriber};
 use rmlx_audio::wav::WavDecoder;
-use rmlx_audio::whisper::WhisperModel;
+use rmlx_audio::whisper::{WhisperError, WhisperModel};
 use rmlx_mlx::Device;
 
 // ── Snapshot resolution ─────────────────────────────────────────────────────
@@ -200,15 +204,17 @@ fn transcribe_file(
     language: &str,
 ) -> rmlx_audio::transcribe::Transcription {
     let bytes = std::fs::read(path).expect("read audio");
-    let (raw, rate) = WavDecoder::decode(&bytes).expect("decode audio");
-    let samples = rmlx_audio::transcribe::resample_to_16k(&raw, rate);
+    let samples =
+        WavDecoder::decode_resampled(&bytes, 16_000, rmlx_audio::wav::MAX_AUDIO_SECS, &|| false)
+            .expect("decode audio")
+            .samples;
     let opts = TranscribeOptions {
         language: language.to_owned(),
         task: WhisperTask::Transcribe,
         temperature: 0.0,
         condition_on_previous_text: true,
     };
-    t.transcribe(&samples, &opts, Device::Gpu)
+    t.transcribe(&samples, &opts, Device::Gpu, &AtomicBool::new(false))
         .expect("transcribe")
 }
 
@@ -232,6 +238,10 @@ fn say_clip_deterministic() {
     let r1 = transcribe_file(&t, &wav, "en");
     let r2 = transcribe_file(&t, &wav, "en");
 
+    assert_eq!(
+        r1.language, "english",
+        "a named language is reported as its English name"
+    );
     // Determinism: identical text across runs at temp=0.
     assert_eq!(
         r1.text, r2.text,
@@ -266,6 +276,7 @@ fn two_sentence_clip_is_two_segments() {
 
     let r = transcribe_file(&t, &wav, "en");
     println!("two-sentence text: {:?}", r.text);
+    assert_eq!(r.language, "english");
     assert_eq!(r.segments.len(), 2, "segments: {:?}", r.segments);
     let words = normalize(&r.text);
     assert_eq!(
@@ -279,6 +290,231 @@ fn two_sentence_clip_is_two_segments() {
         "filler after the speech: {:?}",
         r.text
     );
+}
+
+/// Sentences of the synthetic long clip. Each holds one keyword that no other
+/// sentence holds.
+const LONG_CLIP: [(&str, &str); 28] = [
+    (
+        "violin",
+        "The violin rested on the wooden table near the open window.",
+    ),
+    (
+        "harbor",
+        "Small boats drifted slowly across the quiet harbor at dawn.",
+    ),
+    (
+        "lantern",
+        "She carried a brass lantern down the narrow stone stairs.",
+    ),
+    (
+        "glacier",
+        "The glacier moved a few inches every single winter.",
+    ),
+    (
+        "orchard",
+        "Children picked ripe apples in the orchard after school.",
+    ),
+    (
+        "compass",
+        "He checked the compass twice before leaving the trail.",
+    ),
+    (
+        "bakery",
+        "The bakery on the corner opens long before sunrise.",
+    ),
+    (
+        "telescope",
+        "Through the telescope the rings of the planet looked sharp.",
+    ),
+    (
+        "meadow",
+        "Wild flowers covered the meadow behind the old farmhouse.",
+    ),
+    (
+        "blanket",
+        "A thick wool blanket kept the travelers warm all night.",
+    ),
+    (
+        "canyon",
+        "Their voices echoed from the walls of the deep canyon.",
+    ),
+    (
+        "pianist",
+        "The pianist bowed once and left the stage in silence.",
+    ),
+    (
+        "volcano",
+        "Smoke rose from the volcano for three days in a row.",
+    ),
+    (
+        "library",
+        "The library keeps rare maps in a locked room upstairs.",
+    ),
+    (
+        "tortoise",
+        "An old tortoise crossed the garden path very slowly.",
+    ),
+    (
+        "lighthouse",
+        "The keeper climbed the lighthouse to clean the great lamp.",
+    ),
+    (
+        "carpenter",
+        "A carpenter fixed the broken door with a single hinge.",
+    ),
+    (
+        "waterfall",
+        "Mist from the waterfall soaked everyone on the bridge.",
+    ),
+    (
+        "chessboard",
+        "The chessboard was set up and waiting for the next game.",
+    ),
+    (
+        "satellite",
+        "Engineers tracked the satellite as it passed overhead.",
+    ),
+    (
+        "museum",
+        "The museum moved its oldest statues to the new wing.",
+    ),
+    (
+        "bicycle",
+        "He rode his bicycle along the river every morning.",
+    ),
+    (
+        "thunder",
+        "Distant thunder rolled across the hills before the rain.",
+    ),
+    ("pottery", "She sold her pottery at the market on weekends."),
+    (
+        "submarine",
+        "The submarine surfaced near the coast just after noon.",
+    ),
+    (
+        "parrot",
+        "A green parrot repeated every word the sailor said.",
+    ),
+    ("kettle", "The kettle whistled loudly in the empty kitchen."),
+    (
+        "vineyard",
+        "Workers in the vineyard finished the harvest early this year.",
+    ),
+];
+
+/// Silence after each sentence of the long clip, in seconds. No gap reaches a
+/// whole window, so every window holds speech.
+const LONG_CLIP_GAPS: [f32; 28] = [
+    0.4, 1.2, 0.3, 2.5, 0.6, 4.0, 0.5, 1.0, 0.3, 3.0, 0.8, 0.4, 5.0, 0.6, 1.5, 0.3, 2.0, 0.7, 0.4,
+    3.5, 0.5, 1.1, 0.3, 4.5, 0.6, 0.9, 2.2, 0.0,
+];
+
+/// The long clip as 16 kHz mono samples: every sentence of [`LONG_CLIP`]
+/// spoken by `say`, each followed by its gap.
+fn synth_long_clip() -> Option<Vec<f32>> {
+    let mut samples = Vec::new();
+    for ((_, sentence), gap) in LONG_CLIP.iter().zip(LONG_CLIP_GAPS) {
+        let wav = synth_say_clip(sentence)?;
+        let speech = WavDecoder::decode(&std::fs::read(wav).ok()?).ok()?;
+        assert_eq!(speech.sample_rate, 16_000, "say clip rate");
+        samples.extend(speech.samples);
+        samples.extend(std::iter::repeat_n(0.0, (gap * 16_000.0) as usize));
+    }
+    Some(samples)
+}
+
+/// A clip of several windows: every sentence is transcribed once, in order,
+/// with segment times that move forward and stay inside the clip. A window
+/// that ends inside a sentence must hand that sentence to the next window
+/// without losing or repeating it. A cancel flag set before the call opens no
+/// window and returns `Cancelled`.
+///
+/// Not covered: the previous-text prompt. The clean clip decodes the same
+/// words with no prompt, so a prompt that is dropped or built from the wrong
+/// window passes.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test long_synthetic_clip -- --ignored --test-threads=1"]
+fn long_synthetic_clip_is_transcribed_once_in_order() {
+    let Some(t) = load_transcriber() else {
+        eprintln!(
+            "SKIP long_synthetic_clip_is_transcribed_once_in_order: whisper snapshot not present"
+        );
+        return;
+    };
+    let Some(samples) = synth_long_clip() else {
+        eprintln!("SKIP long_synthetic_clip_is_transcribed_once_in_order: say/ffmpeg unavailable");
+        return;
+    };
+    let opts = TranscribeOptions {
+        language: "en".to_owned(),
+        task: WhisperTask::Transcribe,
+        temperature: 0.0,
+        condition_on_previous_text: true,
+    };
+    let cancelled = t.transcribe(&samples, &opts, Device::Gpu, &AtomicBool::new(true));
+    assert!(
+        matches!(
+            cancelled,
+            Err(WhisperError::Cancelled { window: 0, seek: 0 })
+        ),
+        "a flag set before the call opens no window: {cancelled:?}"
+    );
+    let r = t
+        .transcribe(&samples, &opts, Device::Gpu, &AtomicBool::new(false))
+        .expect("transcribe");
+    println!(
+        "long clip: duration={:.2}s segments={} text={:?}",
+        r.duration,
+        r.segments.len(),
+        r.text
+    );
+    assert!(
+        r.duration > 90.0,
+        "the clip must span several windows: {:.2}s",
+        r.duration
+    );
+    assert_eq!(r.language, "english");
+
+    let words = normalize(&r.text);
+    let counts: Vec<(&str, usize)> = LONG_CLIP
+        .iter()
+        .map(|(keyword, _)| (*keyword, words.iter().filter(|w| w == keyword).count()))
+        .collect();
+    assert!(
+        counts.iter().all(|&(_, n)| n == 1),
+        "every sentence once; keyword counts: {counts:?}"
+    );
+    let positions: Vec<usize> = LONG_CLIP
+        .iter()
+        .filter_map(|(keyword, _)| words.iter().position(|w| w == keyword))
+        .collect();
+    assert!(
+        positions.windows(2).all(|p| p[0] < p[1]),
+        "sentences out of order: {positions:?}"
+    );
+
+    let script: String = LONG_CLIP
+        .iter()
+        .map(|(_, s)| *s)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let w = wer(&normalize(&script), &words);
+    assert!(w <= 0.03, "long clip WER {w:.4} above 0.03");
+
+    for pair in r.segments.windows(2) {
+        assert!(
+            pair[1].start >= pair[0].start,
+            "segment starts go back: {pair:?}"
+        );
+    }
+    for s in &r.segments {
+        assert!(
+            s.end >= s.start && s.end <= r.duration + 0.02,
+            "segment outside the clip ({:.2}s): {s:?}",
+            r.duration
+        );
+    }
 }
 
 /// Long-form regression: transcribe every fixture audio with a sibling VTT and
@@ -317,6 +553,7 @@ fn long_form_regression() {
         let t0 = std::time::Instant::now();
         let result = transcribe_file(&t, &path, "en");
         let elapsed = t0.elapsed().as_secs_f64();
+        assert_eq!(result.language, "english");
         let rtf = if result.duration > 0.0 {
             elapsed / f64::from(result.duration)
         } else {

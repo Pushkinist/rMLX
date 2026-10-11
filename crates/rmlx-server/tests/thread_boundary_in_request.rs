@@ -26,6 +26,7 @@ mod thread_boundary;
 
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use rmlx_audio::tokenizer::{WhisperTask, WhisperTokenizer};
@@ -195,7 +196,7 @@ fn transcribe(
         condition_on_previous_text: true,
     };
     Transcriber::new(Arc::clone(model), Arc::clone(tokenizer))
-        .and_then(|t| t.transcribe(samples, &opts, device))
+        .and_then(|t| t.transcribe(samples, &opts, device, &AtomicBool::new(false)))
         .map(|t| t.text)
         .map_err(|e| e.to_string())
 }
@@ -204,8 +205,15 @@ fn transcribe(
 fn whisper_inputs(test: &str) -> Option<(PathBuf, PathBuf, Arc<[f32]>)> {
     let model_dir = snapshot(test, WHISPER.0, WHISPER.1)?;
     let tok_dir = snapshot(test, WHISPER_TOKENIZER.0, WHISPER_TOKENIZER.1)?;
-    let (raw, rate) = rmlx_audio::wav::WavDecoder::decode(&spoken_wav()).expect("decode wav");
-    let samples: Arc<[f32]> = rmlx_audio::transcribe::resample_to_16k(&raw, rate).into();
+    let samples: Arc<[f32]> = rmlx_audio::wav::WavDecoder::decode_resampled(
+        &spoken_wav(),
+        16_000,
+        rmlx_audio::wav::MAX_AUDIO_SECS,
+        &|| false,
+    )
+    .expect("decode wav")
+    .samples
+    .into();
     Some((model_dir, tok_dir, samples))
 }
 

@@ -30,7 +30,6 @@ rustc-hash   = { workspace = true }
 twox-hash    = { workspace = true }
 image        = { workspace = true }
 
-symphonia = { workspace = true }
 rustfft   = { workspace = true }
 
 [features]

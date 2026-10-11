@@ -1,56 +1,10 @@
-//! Audio API endpoints: POST /v1/audio/transcriptions, /v1/audio/translations,
-//! and POST /v1/audio/speech (Qwen3-TTS).
+//! Audio routes: `POST /v1/audio/transcriptions`, `/v1/audio/translations` and
+//! `/v1/audio/speech`. The fields, limits and statuses are in `docs/AUDIO.md`.
 //!
-//! ## API shape (OpenAI-compatible)
-//!
-//! `POST /v1/audio/transcriptions` — Multipart form with:
-//! - `file` — audio file bytes (any Symphonia-supported container, any sample
-//!   rate — downmixed to mono and resampled to 16 kHz).
-//! - `model` — model identifier (e.g. `whisper-large-v3`).
-//! - `language` — optional BCP-47 language code (default: `"auto"`, which
-//!   triggers language detection). Unknown codes receive HTTP 422.
-//! - `response_format` — `json` | `text` | `verbose_json` | `srt` | `vtt` (default: `json`).
-//! - `temperature` — sampling temperature in `[0.0, 1.0]` (default: `0.0`).
-//!   A non-finite or negative value receives HTTP 422; a value above 1.0 is
-//!   accepted and has no effect (greedy decode ignores it — see `whisper.rs`).
-//! - `prompt` — optional text to guide the decoder (not yet implemented).
-//!
-//! `POST /v1/audio/translations` — same shape; forces English output (translate task).
-//!
-//! ## v1 constraints
-//!
-//! - Any Symphonia-supported container at any sample rate is accepted (WAV,
-//!   MP3, FLAC, …); non-16 kHz audio is resampled, never rejected.
-//! - No streaming (SSE timestamps) — deferred to v2.
-//! - 25 MiB audio file size cap (enforced by server body limit; additional
-//!   per-field check here). The transport `DefaultBodyLimit` is set to 26 MiB
-//!   (25 MiB payload + 1 MiB multipart framing slack).
-//!
-//! ## Model loading and caching
-//!
-//! The Whisper model and tokenizer are loaded on the **first** audio request
-//! and cached in `AppState::audio_model` for the lifetime of the server.
-//! Subsequent requests `read()` the cache and `Arc::clone` — no re-parse,
-//! no re-upload. A server restart is required to change the snapshot path.
-//!
-//! ## Admission
-//!
-//! Audio decode holds the GPU; this handler goes through the same
-//! `admit_request` → `gpu_queue` FIFO semaphore path as the LLM chat routes.
-//! This ensures:
-//! - Audio is counted toward `max_queue_depth` (HTTP 429 backpressure applies).
-//! - Audio waits in FIFO order with chat requests — no queue-jumping.
-//! - The admission guard (`GpuAdmission`) is moved into the blocking closure
-//!   and dropped when the closure returns, releasing the semaphore permit.
-//!
-//! ## No-tokenizer mode
-//!
-//! The mlx-community Whisper snapshot does NOT ship a `tokenizer.json`. The
-//! handler looks for a companion tokenizer directory (`whisper_tokenizer_path`
-//! in `AppState`, set via `--whisper-tokenizer-path` CLI flag). If either path
-//! is absent the handler returns 503 with a clear message.
-//! For production use: place the `openai/whisper-large-v3` tokenizer files
-//! alongside the snapshot, or set `RMLX_WHISPER_TOKENIZER_PATH`.
+//! A transcription holds the GPU. It passes `admit_request`, then decodes the
+//! upload under the permit and before the model cache is read: decodes run one
+//! at a time, a waiting request holds only its upload, and a refused file loads
+//! no model.
 
 #![allow(
     clippy::items_after_statements,
@@ -60,89 +14,121 @@
 )]
 
 use axum::extract::{Multipart, State};
-use axum::http::StatusCode;
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use rmlx_audio::tokenizer::{WhisperTask, WhisperTokenizer};
+use rmlx_audio::tokenizer::{TokenizerError, WhisperTask, WhisperTokenizer};
 use rmlx_audio::transcribe::{TranscribeOptions, Transcriber};
-use rmlx_audio::wav::WavDecoder;
-use rmlx_audio::whisper::WhisperModel;
+use rmlx_audio::wav::{WavDecoder, WavError, MAX_AUDIO_SECS};
+use rmlx_audio::whisper::{WhisperError, WhisperModel};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info, instrument, warn};
 
-use crate::engine::{admit_request, Admission};
+mod form;
+
+use form::{parse_multipart, ResponseFormat};
+
+use crate::engine::{admit_request, Admission, GpuAdmission};
 use crate::openai::state::ApiErrorCategory;
 use crate::openai::AppState;
 
-// ── Request body fields ───────────────────────────────────────────────────────
+/// The largest audio file a transcription request takes: OpenAI's cap.
+const MAX_AUDIO_BYTES: usize = 25 * 1024 * 1024;
 
-/// Parsed multipart form fields for both transcription and translation.
-struct AudioFormFields {
-    /// Raw audio bytes.
-    audio_bytes: Vec<u8>,
-    /// Model identifier (for logging / routing).
-    model: String,
-    /// Optional language code.
-    language: String,
-    /// Response format.
-    response_format: ResponseFormat,
-    /// Sampling temperature.
-    temperature: f32,
+/// The largest request body the server reads: an audio file at the cap, and
+/// 1 MiB for the other form fields and the multipart framing.
+pub(crate) const MAX_REQUEST_BYTES: usize = MAX_AUDIO_BYTES + 1024 * 1024;
+
+/// A refused request: its status, the text of its `{"error": …}` body, and
+/// whether the fault stays until the operator acts.
+#[derive(Debug, PartialEq, Eq)]
+struct Refusal {
+    status: StatusCode,
+    message: String,
+    /// Sends `x-should-retry: false`, which OpenAI's SDKs obey before their
+    /// own retry of a 5xx.
+    permanent: bool,
 }
 
-/// Response format for audio transcriptions.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-enum ResponseFormat {
-    /// JSON object with `{"text": "..."}`.
-    #[default]
-    Json,
-    /// Plain text only.
-    Text,
-    /// JSON with segments, language, duration.
-    VerboseJson,
-    /// SRT subtitle format.
-    Srt,
-    /// WebVTT format.
-    Vtt,
-}
-
-impl ResponseFormat {
-    /// Parse a response format string; returns an error string on unrecognised values
-    /// so callers can return HTTP 422 rather than silently defaulting.
-    fn parse_or_default(s: &str) -> Result<Self, String> {
-        match s {
-            "json" => Ok(Self::Json),
-            "text" => Ok(Self::Text),
-            "verbose_json" => Ok(Self::VerboseJson),
-            "srt" => Ok(Self::Srt),
-            "vtt" => Ok(Self::Vtt),
-            other => Err(format!(
-                "unsupported response_format '{other}'; must be one of: json, text, verbose_json, srt, vtt"
-            )),
-        }
+fn unprocessable(message: String) -> Refusal {
+    Refusal {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        message,
+        permanent: false,
     }
 }
 
-// ── Response types ────────────────────────────────────────────────────────────
+fn too_large(message: String) -> Refusal {
+    Refusal {
+        status: StatusCode::PAYLOAD_TOO_LARGE,
+        message,
+        permanent: false,
+    }
+}
 
-/// `json` response: `{"text": "..."}`.
+fn refused(refusal: Refusal) -> Response {
+    let body = Json(json!({ "error": refusal.message }));
+    if refusal.permanent {
+        (refusal.status, [("x-should-retry", "false")], body).into_response()
+    } else {
+        (refusal.status, body).into_response()
+    }
+}
+
+/// Where a transcription job failed.
+#[derive(Debug)]
+enum JobError {
+    Decode(WavError),
+    Tokenizer(TokenizerError),
+    Model(WhisperError),
+    Init(WhisperError),
+    Transcribe(WhisperError),
+}
+
+/// The answer to a failed job. The file is the client's fault: 422. The rest is
+/// the server's: 503, the status `docs/SERVER.md` gives a load failure and
+/// every other engine error. A load or init failure stays until the operator
+/// acts; an engine failure during the transcription may not recur.
+fn job_refusal(e: &JobError) -> Refusal {
+    let server = |message: String, permanent: bool| Refusal {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        message,
+        permanent,
+    };
+    match e {
+        JobError::Decode(e) => unprocessable(format!("audio decode: {e}")),
+        JobError::Tokenizer(e) => server(format!("tokenizer: {e}"), true),
+        JobError::Model(e) => server(format!("whisper load: {e}"), true),
+        JobError::Init(e) => server(format!("transcriber init: {e}"), true),
+        JobError::Transcribe(e) => server(format!("transcribe: {e}"), false),
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct TranscriptionResponse {
     text: String,
 }
 
-/// One segment in a `verbose_json` response.
+/// One segment in a `verbose_json` response: the keys of the OpenAI
+/// `TranscriptionSegment` schema the decode computes. `avg_logprob` and
+/// `no_speech_prob` are left out: no log-probability is kept and no no-speech
+/// gate runs, and a `null` would make a typed client throw.
 #[derive(Debug, Serialize)]
 struct SegmentJson {
     id: usize,
+    seek: usize,
     start: f32,
     end: f32,
     text: String,
+    tokens: Vec<u32>,
+    /// Every decode is greedy, whatever the request's `temperature`.
+    temperature: f32,
+    compression_ratio: f32,
 }
 
-/// `verbose_json` response with metadata.
 #[derive(Debug, Serialize)]
 struct VerboseTranscriptionResponse {
     task: String,
@@ -152,48 +138,51 @@ struct VerboseTranscriptionResponse {
     segments: Vec<SegmentJson>,
 }
 
-// ── Handlers ──────────────────────────────────────────────────────────────────
-
 /// `POST /v1/audio/transcriptions` — Whisper STT.
 #[instrument(skip_all, name = "audio_transcriptions", level = "info")]
-pub async fn audio_transcriptions(State(state): State<AppState>, multipart: Multipart) -> Response {
-    handle_audio(state, multipart, WhisperTask::Transcribe).await
+pub async fn audio_transcriptions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> Response {
+    handle_audio(state, &headers, multipart, WhisperTask::Transcribe).await
 }
 
 /// `POST /v1/audio/translations` — Whisper STT with English output.
 #[instrument(skip_all, name = "audio_translations", level = "info")]
-pub async fn audio_translations(State(state): State<AppState>, multipart: Multipart) -> Response {
-    handle_audio(state, multipart, WhisperTask::Translate).await
+pub async fn audio_translations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> Response {
+    handle_audio(state, &headers, multipart, WhisperTask::Translate).await
 }
-
-// ── Core handler ──────────────────────────────────────────────────────────────
 
 #[allow(
     clippy::cognitive_complexity,
     clippy::too_many_lines,
     reason = "audio handler is a sequential pipeline: parse → validate → admit → spawn_blocking → metrics → build response; splitting would obscure the control flow"
 )]
-async fn handle_audio(state: AppState, mut multipart: Multipart, task: WhisperTask) -> Response {
-    // 1. Parse multipart form.
-    let fields = match parse_multipart(&mut multipart).await {
+async fn handle_audio(
+    state: AppState,
+    headers: &HeaderMap,
+    mut multipart: Multipart,
+    task: WhisperTask,
+) -> Response {
+    let body_len = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    let fields = match parse_multipart(&mut multipart, body_len).await {
         Ok(f) => f,
-        Err(msg) => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({"error": msg})),
-            )
-                .into_response();
-        }
+        Err(refusal) => return refused(refusal),
     };
 
-    // 2. Validate audio size (25 MiB cap).
-    const MAX_AUDIO_BYTES: usize = 25 * 1024 * 1024;
     if fields.audio_bytes.len() > MAX_AUDIO_BYTES {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({"error": format!("audio file too large ({} bytes, max 25 MiB)", fields.audio_bytes.len())})),
-        )
-            .into_response();
+        return refused(too_large(format!(
+            "audio file is {} bytes, over the cap of {MAX_AUDIO_BYTES} bytes (25 MiB)",
+            fields.audio_bytes.len()
+        )));
     }
 
     info!(
@@ -204,17 +193,15 @@ async fn handle_audio(state: AppState, mut multipart: Multipart, task: WhisperTa
         "audio request"
     );
 
-    // 3. Resolve model and tokenizer paths from AppState.
     let Some((model_path, tok_path)) = state.audio_paths() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "audio model not configured; set --whisper-model-path"})),
-        )
-            .into_response();
+        return refused(Refusal {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "audio model not configured; set --whisper-model-path".to_owned(),
+            permanent: true,
+        });
     };
 
-    // 4. Admission gate — audio holds the GPU; go through the same FIFO
-    //    semaphore as LLM chat routes for fairness + 429 backpressure.
+    // Audio queues in the chat routes' FIFO, which also gives the 429 back-pressure.
     let guard =
         match admit_request(&state.gpu_queue, &state.gpu_pending, state.max_queue_depth).await {
             Admission::QueueFull => {
@@ -237,55 +224,45 @@ async fn handle_audio(state: AppState, mut multipart: Multipart, task: WhisperTa
             }
         };
 
-    // 5. Clone the audio_model cache Arc for the blocking closure.
     let audio_model_cache = Arc::clone(&state.audio_model);
 
-    // 6. Move audio bytes (not clone) into the blocking closure.
     let audio_bytes = fields.audio_bytes;
     let language = fields.language.clone();
     let temperature = fields.temperature;
     let response_format = fields.response_format;
 
-    // 7. Clone metrics sink for the blocking closure.
     let metrics_arc = state.metrics.clone();
     let device = state.device;
     let model_path_str = model_path.to_string_lossy().into_owned();
 
-    // NOTE: the per-request multimodal encoder cache (`state.mm_cache`) is not
-    // used by the long-form path — the transcription engine re-encodes per 30 s
-    // window internally, so a single full-file encoder-output cache entry no
-    // longer applies. Per-window caching can be reintroduced inside the engine
-    // if profiling shows it pays off.
+    let result = run_admitted(guard, move |cancel| {
+        // Decode under the permit, one at a time, and before the model cache:
+        // a file the decoder refuses loads no model.
+        let samples = decode_upload(&audio_bytes, cancel)?;
+        drop(audio_bytes);
 
-    let result = tokio::task::spawn_blocking(move || {
-        // Hold the GPU admission guard for the duration of Whisper decode.
-        // Dropping it releases the semaphore permit and decrements gpu_pending.
-        let _guard = guard;
-
-        // Resolve model + tokenizer from cache, loading on first call.
-        //
-        // Read path (fast): no allocation, just Arc::clone while holding the
-        // read lock for as long as needed to extract the two Arcs.
         let t_load_start = std::time::Instant::now();
         let mut load_ms_opt: Option<f64> = None;
 
         let (model, tokenizer): (Arc<WhisperModel>, Arc<WhisperTokenizer>) = {
-            // Try the read path first (no allocation on the fast path).
             let read_guard = audio_model_cache.read();
             if let Some((ref m, ref t)) = *read_guard {
                 (Arc::clone(m), Arc::clone(t))
             } else {
                 drop(read_guard);
-                // Write path: load and populate the cache.
                 let mut write_guard = audio_model_cache.write();
-                // Double-checked: another thread may have loaded while we waited.
+                // Another request may have loaded the model while this one waited for the lock.
                 if let Some((ref m, ref t)) = *write_guard {
                     (Arc::clone(m), Arc::clone(t))
                 } else {
-                    let m = WhisperModel::load(&model_path)
-                        .map_err(|e| format!("whisper load: {e}"))?;
-                    let t = WhisperTokenizer::from_path(&tok_path)
-                        .map_err(|e| format!("tokenizer: {e}"))?;
+                    let t = WhisperTokenizer::from_path(&tok_path).map_err(|e| {
+                        warn!(path = %tok_path.display(), error = %e, "Whisper tokenizer load failed");
+                        JobError::Tokenizer(e)
+                    })?;
+                    let m = WhisperModel::load(&model_path).map_err(|e| {
+                        warn!(path = %model_path.display(), error = %e, "Whisper model load failed");
+                        JobError::Model(e)
+                    })?;
                     let m = Arc::new(m);
                     let t = Arc::new(t);
                     *write_guard = Some((Arc::clone(&m), Arc::clone(&t)));
@@ -295,17 +272,10 @@ async fn handle_audio(state: AppState, mut multipart: Multipart, task: WhisperTa
             }
         };
 
-        // Decode audio → mono f32 at native rate, then resample to 16 kHz if needed.
-        let (raw_samples, sample_rate) =
-            WavDecoder::decode(&audio_bytes).map_err(|e| format!("audio decode: {e}"))?;
-        let samples = rmlx_audio::transcribe::resample_to_16k(&raw_samples, sample_rate);
-
-        // Audio duration in seconds (for RTF calculation).
         let audio_dur_secs = samples.len() as f64 / f64::from(rmlx_audio::mel::SAMPLE_RATE);
 
-        // Build the long-form transcriber (shared engine with `rmlx transcribe`).
         let transcriber = Transcriber::new(Arc::clone(&model), Arc::clone(&tokenizer))
-            .map_err(|e| format!("transcriber init: {e}"))?;
+            .map_err(JobError::Init)?;
 
         let opts = TranscribeOptions {
             language: language.clone(),
@@ -316,8 +286,8 @@ async fn handle_audio(state: AppState, mut multipart: Multipart, task: WhisperTa
 
         let t_decode_start = std::time::Instant::now();
         let transcription = transcriber
-            .transcribe(&samples, &opts, device)
-            .map_err(|e| format!("transcribe: {e}"))?;
+            .transcribe(&samples, &opts, device, cancel)
+            .map_err(JobError::Transcribe)?;
         let decode_ms = t_decode_start.elapsed().as_secs_f64() * 1_000.0;
 
         let rtf = if audio_dur_secs > 0.0 {
@@ -334,7 +304,6 @@ async fn handle_audio(state: AppState, mut multipart: Multipart, task: WhisperTa
             "audio inference timing"
         );
 
-        // Emit metrics to the events DB.
         if let Some(sink) = &metrics_arc {
             let notes = format!("task={task:?}");
             let metrics_to_record: &[(&str, &str, f64)] = &[
@@ -354,7 +323,6 @@ async fn handle_audio(state: AppState, mut multipart: Multipart, task: WhisperTa
                     warn!(error = %e, op, "audio metrics record failed (non-fatal)");
                 }
             }
-            // Record load_ms only on first call (when we actually loaded the model).
             if let Some(load_ms) = load_ms_opt {
                 if let Err(e) = sink.record(&rmlx_metrics::events::Measurement {
                     model_path: &model_path_str,
@@ -370,7 +338,7 @@ async fn handle_audio(state: AppState, mut multipart: Multipart, task: WhisperTa
             }
         }
 
-        Ok::<rmlx_audio::transcribe::Transcription, String>(transcription)
+        Ok::<rmlx_audio::transcribe::Transcription, JobError>(transcription)
     })
     .await;
 
@@ -383,17 +351,14 @@ async fn handle_audio(state: AppState, mut multipart: Multipart, task: WhisperTa
             );
             build_response(&transcription, task, response_format)
         }
-        Ok(Err(msg)) => {
-            warn!(error = msg, "transcription failed");
-            if msg.contains("silence") {
-                (StatusCode::OK, Json(json!({"text": ""}))).into_response()
-            } else {
-                (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(json!({"error": msg})),
-                )
-                    .into_response()
-            }
+        Ok(Err(e)) => {
+            let refusal = job_refusal(&e);
+            warn!(
+                status = refusal.status.as_u16(),
+                error = refusal.message,
+                "transcription failed"
+            );
+            refused(refusal)
         }
         Err(e) => {
             warn!(error = %e, "transcription task panicked");
@@ -406,92 +371,47 @@ async fn handle_audio(state: AppState, mut multipart: Multipart, task: WhisperTa
     }
 }
 
-// ── Multipart parser ──────────────────────────────────────────────────────────
-
-async fn parse_multipart(multipart: &mut Multipart) -> Result<AudioFormFields, String> {
-    let mut audio_bytes: Option<Vec<u8>> = None;
-    let mut model = "whisper-large-v3".to_owned();
-    // Default: "auto" triggers language detection via model.detect_language().
-    // Explicit "en", "fr", etc. use that language directly.
-    let mut language = "auto".to_owned();
-    let mut response_format = ResponseFormat::Json;
-    let mut temperature = 0.0_f32;
-
-    while let Some(field) = multipart.next_field().await.map_err(|e| e.to_string())? {
-        let name = field.name().unwrap_or("").to_owned();
-        match name.as_str() {
-            "file" => {
-                let bytes = field.bytes().await.map_err(|e| e.to_string())?;
-                audio_bytes = Some(bytes.to_vec());
-            }
-            "model" => {
-                let text = field.text().await.map_err(|e| e.to_string())?;
-                model = text;
-            }
-            "language" => {
-                let text = field.text().await.map_err(|e| e.to_string())?;
-                if text.is_empty() || text == "auto" {
-                    language.clear();
-                    language.push_str("auto");
-                } else {
-                    // Validate: must be a known language code.
-                    let tok = rmlx_audio::tokenizer::language_token(&text);
-                    // language_token falls back to English for unknown codes.
-                    // Reject anything that resolves to EN when the caller passed
-                    // a non-EN code (unknown language).
-                    use rmlx_audio::tokenizer::TOK_EN;
-                    if tok == TOK_EN && text != "en" {
-                        return Err(format!(
-                            "unknown language code '{text}'; pass 'auto' for language detection, \
-                             or see Whisper language table for supported codes"
-                        ));
-                    }
-                    language = text;
-                }
-            }
-            "response_format" => {
-                let text = field.text().await.map_err(|e| e.to_string())?;
-                response_format = ResponseFormat::parse_or_default(&text)?;
-            }
-            "temperature" => {
-                let text = field.text().await.map_err(|e| e.to_string())?;
-                let t = text.parse::<f32>().map_err(|_| {
-                    format!("invalid temperature '{text}'; must be a finite float >= 0.0")
-                })?;
-                if !t.is_finite() || t < 0.0 {
-                    return Err(format!(
-                        "temperature {t} is out of range; must be a finite float >= 0.0"
-                    ));
-                }
-                temperature = t;
-            }
-            "prompt" => {
-                // Accepted but ignored at v1.
-                debug!("prompt field received (not yet implemented)");
-                let _ = field.bytes().await;
-            }
-            other => {
-                debug!(field = other, "unknown multipart field; ignoring");
-                let _ = field.bytes().await;
-            }
-        }
-    }
-
-    let audio_bytes = audio_bytes.ok_or_else(|| "missing required field: file".to_owned())?;
-    if audio_bytes.is_empty() {
-        return Err("audio file is empty".to_owned());
-    }
-
-    Ok(AudioFormFields {
-        audio_bytes,
-        model,
-        language,
-        response_format,
-        temperature,
+/// The 16 kHz samples of the uploaded file, up to `MAX_AUDIO_SECS`. The decode
+/// stops before its next packet once `cancel` is set.
+fn decode_upload(bytes: &[u8], cancel: &AtomicBool) -> Result<Vec<f32>, JobError> {
+    WavDecoder::decode_resampled(bytes, rmlx_audio::mel::SAMPLE_RATE, MAX_AUDIO_SECS, &|| {
+        cancel.load(Ordering::Relaxed)
     })
+    .map(|audio| audio.samples)
+    .map_err(JobError::Decode)
 }
 
-// ── Response builder ──────────────────────────────────────────────────────────
+/// Run `job` on the blocking pool, inside the caller's span, while `guard`
+/// holds the GPU permit. The flag handed to `job` is set when the returned
+/// future is dropped: the request timed out or the client went away. A job
+/// that reads the flag can stop early. The permit is released when `job`
+/// returns, so the next request never shares the GPU with a job that is still
+/// stopping.
+// cancel-safe: a drop sets the flag; the job keeps the permit until it returns.
+// After a normal return the flag is set with no reader.
+async fn run_admitted<T, F>(guard: GpuAdmission, job: F) -> Result<T, tokio::task::JoinError>
+where
+    T: Send + 'static,
+    F: FnOnce(&AtomicBool) -> T + Send + 'static,
+{
+    let cancel_on_drop = CancelOnDrop(Arc::new(AtomicBool::new(false)));
+    let flag = Arc::clone(&cancel_on_drop.0);
+    let span = tracing::Span::current();
+    tokio::task::spawn_blocking(move || {
+        let _entered = span.enter();
+        let _guard = guard;
+        job(&flag)
+    })
+    .await
+}
+
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
 
 fn build_response(
     transcription: &rmlx_audio::transcribe::Transcription,
@@ -517,9 +437,13 @@ fn build_response(
                     .enumerate()
                     .map(|(id, s)| SegmentJson {
                         id,
+                        seek: s.seek,
                         start: s.start,
                         end: s.end,
                         text: s.text.clone(),
+                        tokens: s.tokens.clone(),
+                        temperature: 0.0,
+                        compression_ratio: s.compression_ratio,
                     })
                     .collect(),
             };
@@ -648,9 +572,7 @@ pub async fn audio_speech(
     let device = state.device;
     let model_path_str = tts_model_path.to_string_lossy().into_owned();
 
-    let result = tokio::task::spawn_blocking(move || {
-        let _guard = guard; // hold GPU admission for the duration of synthesis
-
+    let result = run_admitted(guard, move |_cancel| {
         // Load or retrieve cached (model, tokenizer).
         let t_load_start = std::time::Instant::now();
         let mut load_ms_opt: Option<f64> = None;
@@ -769,7 +691,7 @@ pub async fn audio_speech(
             };
             (
                 StatusCode::OK,
-                [(axum::http::header::CONTENT_TYPE, content_type)],
+                [(header::CONTENT_TYPE, content_type)],
                 bytes,
             )
                 .into_response()
@@ -793,3 +715,7 @@ pub async fn audio_speech(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "audio_tests.rs"]
+mod audio_tests;

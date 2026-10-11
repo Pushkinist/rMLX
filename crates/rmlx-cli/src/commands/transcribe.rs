@@ -8,25 +8,28 @@
 //!
 //! The input container is decoded and resampled to 16 kHz mono internally (via
 //! the shared `rmlx-audio` decode + linear-resample path), so a user can point
-//! `transcribe` straight at an arbitrary `.m4a` / `.wav` / `.mp3` / `.flac`.
+//! `transcribe` straight at a `.m4a`, `.wav`, `.mp3` or `.aac` file.
 
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
 use rmlx_audio::tokenizer::{WhisperTask, WhisperTokenizer};
-use rmlx_audio::transcribe::{render, OutputFormat, TranscribeOptions, Transcriber};
+use rmlx_audio::transcribe::{
+    render, requested_language, OutputFormat, TranscribeOptions, Transcriber,
+};
 use rmlx_audio::wav::WavDecoder;
 use rmlx_audio::whisper::WhisperModel;
 use rmlx_mlx::Device;
 
 use crate::commands::parse::ClaimedDevice;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tracing::info;
 
 /// Arguments for `rmlx transcribe`.
 #[allow(clippy::struct_excessive_bools, reason = "small CLI argument bag")]
 pub(crate) struct TranscribeArgs<'a> {
-    /// Input audio file (any Symphonia-supported container).
+    /// Input audio file: WAV, MP3, M4A or ADTS AAC.
     pub audio: &'a Path,
     /// Model snapshot directory.
     pub model: &'a Path,
@@ -36,7 +39,7 @@ pub(crate) struct TranscribeArgs<'a> {
     pub tokenizer: Option<&'a Path>,
     /// Output format: `txt | json | srt | vtt`.
     pub format: &'a str,
-    /// Language code (`en`, `fr`, …) or `auto`.
+    /// ISO code (`en`), English name (`French`) or `auto`.
     pub language: &'a str,
     /// `true` => translate to English; `false` => transcribe in source language.
     pub translate: bool,
@@ -73,6 +76,7 @@ pub(crate) fn run_transcribe(args: &TranscribeArgs, claimed: &ClaimedDevice) -> 
 /// Whisper backend for `rmlx transcribe`.
 fn run_whisper(args: &TranscribeArgs, device: Device) -> Result<String> {
     let out_fmt = OutputFormat::parse(args.format).map_err(|e| anyhow!(e))?;
+    requested_language(args.language)?;
 
     // Resolve the tokenizer directory: explicit flag, else the model dir.
     let tok_dir = args.tokenizer.unwrap_or(args.model);
@@ -83,7 +87,11 @@ fn run_whisper(args: &TranscribeArgs, device: Device) -> Result<String> {
         "rmlx transcribe (whisper)"
     );
 
-    let model = WhisperModel::load(args.model).context("load whisper model")?;
+    // Decode first: a file the decoder refuses costs no model load. The file's
+    // bytes are dropped here; only the 16 kHz samples stay for the model.
+    let samples = read_audio_16k(args.audio)?;
+
+    // The tokenizer first: one of another vocabulary is refused before the weights load.
     let tokenizer = WhisperTokenizer::from_path(tok_dir).with_context(|| {
         format!(
             "load whisper tokenizer from {} (Whisper snapshots ship no tokenizer.json; \
@@ -91,15 +99,10 @@ fn run_whisper(args: &TranscribeArgs, device: Device) -> Result<String> {
             tok_dir.display()
         )
     })?;
+    let model = WhisperModel::load(args.model).context("load whisper model")?;
 
     let transcriber = Transcriber::new(Arc::new(model), Arc::new(tokenizer))
         .map_err(|e| anyhow!("transcriber init: {e}"))?;
-
-    // Decode + resample to 16 kHz mono.
-    let bytes = std::fs::read(args.audio)
-        .with_context(|| format!("read audio {}", args.audio.display()))?;
-    let (raw, src_rate) = WavDecoder::decode(&bytes).map_err(|e| anyhow!("audio decode: {e}"))?;
-    let samples = rmlx_audio::transcribe::resample_to_16k(&raw, src_rate);
 
     let task = if args.translate {
         WhisperTask::Translate
@@ -115,7 +118,7 @@ fn run_whisper(args: &TranscribeArgs, device: Device) -> Result<String> {
 
     let t0 = std::time::Instant::now();
     let transcription = transcriber
-        .transcribe(&samples, &opts, device)
+        .transcribe(&samples, &opts, device, &AtomicBool::new(false))
         .map_err(|e| anyhow!("transcribe: {e}"))?;
     let elapsed = t0.elapsed().as_secs_f64();
     let rtf = if transcription.duration > 0.0 {
@@ -132,6 +135,16 @@ fn run_whisper(args: &TranscribeArgs, device: Device) -> Result<String> {
     );
 
     Ok(render(&transcription, out_fmt))
+}
+
+/// The 16 kHz mono samples of the audio file at `path`. The operator's own
+/// file has no duration cap: the server's cap guards it from its clients.
+fn read_audio_16k(path: &Path) -> Result<Vec<f32>> {
+    let bytes = std::fs::read(path).with_context(|| format!("read audio {}", path.display()))?;
+    let audio =
+        WavDecoder::decode_resampled(&bytes, rmlx_audio::mel::SAMPLE_RATE, u32::MAX, &|| false)
+            .map_err(|e| anyhow!("audio decode: {e}"))?;
+    Ok(audio.samples)
 }
 
 #[cfg(test)]

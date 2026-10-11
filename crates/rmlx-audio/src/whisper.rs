@@ -58,9 +58,10 @@ use rmlx_mlx::{
 use thiserror::Error;
 use tracing::{debug, info, instrument, warn};
 
+use crate::mel::N_FRAMES;
 use crate::npz::WeightMap;
 use crate::tokenizer::{
-    TOK_EN, TOK_EOT, TOK_LANG_LAST, TOK_NOSPEECH, TOK_NO_TIMESTAMPS, TOK_TIMESTAMP_BEGIN,
+    N_VOCAB, TOK_EN, TOK_EOT, TOK_LANG_LAST, TOK_NOSPEECH, TOK_NO_TIMESTAMPS, TOK_TIMESTAMP_BEGIN,
 };
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -81,20 +82,41 @@ pub enum WhisperError {
     /// Config JSON parse error.
     #[error("config parse error: {0}")]
     Config(String),
+    /// `config.json` states a size the decode does not support.
+    #[error(
+        "config.json: {field} is {found}, the decode supports {expected} only \
+         (Whisper large-v3, large-v3-turbo and distil-large-v3)"
+    )]
+    UnsupportedConfig {
+        /// The `config.json` field.
+        field: &'static str,
+        /// The value it states.
+        found: usize,
+        /// The value the decode supports.
+        expected: usize,
+    },
+    /// The requested language is not one Whisper knows.
+    #[error(
+        "unknown language '{0}'; use a Whisper language code, an English language name or 'auto'"
+    )]
+    UnknownLanguage(String),
     /// No transcription produced.
     #[error("no transcription (model detected silence)")]
     Silence,
+    /// The caller's cancel flag was set; window number `window` (from 0), at
+    /// sample `seek` of the 16 kHz audio, was not decoded.
+    #[error("transcription cancelled before window {window} (sample {seek})")]
+    Cancelled {
+        /// The first window not decoded.
+        window: usize,
+        /// Its start, in 16 kHz samples.
+        seek: usize,
+    },
 }
 
 impl From<rmlx_core::error::Error> for WhisperError {
     fn from(e: rmlx_core::error::Error) -> Self {
         Self::Mlx(e.to_string())
-    }
-}
-
-impl From<crate::npz::NpzError> for WhisperError {
-    fn from(e: crate::npz::NpzError) -> Self {
-        Self::WeightFile(e.to_string())
     }
 }
 
@@ -109,7 +131,7 @@ impl From<crate::npz::NpzError> for WhisperError {
 pub struct WhisperConfig {
     /// Number of mel bins (80 or 128).
     pub n_mels: usize,
-    /// Audio context length in tokens (1500 for large-v3).
+    /// Audio context length in encoder positions: 1500, one 30 s window.
     pub n_audio_ctx: usize,
     /// Audio hidden state dimension.
     pub n_audio_state: usize,
@@ -117,7 +139,7 @@ pub struct WhisperConfig {
     pub n_audio_head: usize,
     /// Number of audio encoder layers.
     pub n_audio_layer: usize,
-    /// Vocabulary size (51 866 for large-v3).
+    /// Vocabulary size: [`N_VOCAB`], the vocabulary the decode's token ids are for.
     pub n_vocab: usize,
     /// Text context length (448 for large-v3).
     pub n_text_ctx: usize,
@@ -130,9 +152,25 @@ pub struct WhisperConfig {
 }
 
 impl WhisperConfig {
-    /// Load from a JSON string.
+    /// Load from a JSON string. Refuse an `n_vocab` other than [`N_VOCAB`] and
+    /// an `n_audio_ctx` other than the encoder positions of one 30 s window.
     pub fn from_json(s: &str) -> Result<Self, WhisperError> {
-        serde_json::from_str(s).map_err(|e| WhisperError::Config(e.to_string()))
+        let cfg: Self = serde_json::from_str(s).map_err(|e| WhisperError::Config(e.to_string()))?;
+        // The encoder's second conv has stride 2: two mel frames per position.
+        let supported = [
+            ("n_vocab", cfg.n_vocab, N_VOCAB),
+            ("n_audio_ctx", cfg.n_audio_ctx, N_FRAMES / 2),
+        ];
+        for (field, found, expected) in supported {
+            if found != expected {
+                return Err(WhisperError::UnsupportedConfig {
+                    field,
+                    found,
+                    expected,
+                });
+            }
+        }
+        Ok(cfg)
     }
 }
 
@@ -143,9 +181,14 @@ impl WhisperConfig {
 /// Whisper snapshots from mlx-community ship as `weights.npz` (NumPy
 /// compressed array archive = ZIP of `.npy` entries). ZIP64 archives
 /// (≥ 4 GiB, as produced by the large-v3 snapshot) are fully supported via
-/// the central-directory parser in `crate::npz`.
+/// the central-directory parser in `crate::npz`. An error names the file, not
+/// its directory: the server sends it to the client.
 pub fn load_npz(path: impl AsRef<Path>) -> Result<WeightMap, WhisperError> {
-    crate::npz::load_npz(path).map_err(WhisperError::from)
+    let path = path.as_ref();
+    crate::npz::load_npz(path).map_err(|e| {
+        let file = path.file_name().unwrap_or_default().to_string_lossy();
+        WhisperError::WeightFile(format!("{file}: {e}"))
+    })
 }
 
 // ── Weight helpers ────────────────────────────────────────────────────────────
@@ -673,7 +716,8 @@ pub struct WhisperModel {
 impl WhisperModel {
     /// Load a Whisper model from a snapshot directory.
     ///
-    /// Expects `config.json` and `weights.npz` in the directory.
+    /// Expects `config.json` and `weights.npz` in the directory. A config that
+    /// [`WhisperConfig::from_json`] refuses is refused before the weights are read.
     ///
     /// `path` must be an operator-controlled, validated absolute path. It is
     /// set once at server startup via `--whisper-model-path` / `RMLX_WHISPER_MODEL_PATH`
@@ -710,7 +754,6 @@ impl WhisperModel {
     ///
     /// Runs a single SOT decoder step and returns the argmax over the 100
     /// language tokens (`<|en|>` … `<|yue|>`, ids `TOK_EN ..= TOK_LANG_LAST`).
-    /// Falls back to English (`TOK_EN`) on error.
     ///
     /// Call after `encode_mel`. The returned token id can be passed directly to
     /// `WhisperTokenizer::sot_sequence_from_tok`.
@@ -741,10 +784,11 @@ impl WhisperModel {
         let bytes = best
             .to_bytes()
             .map_err(|e| WhisperError::Mlx(e.to_string()))?;
-        let Some(b4) = bytes.get(..4) else {
-            return Ok(TOK_EN); // fallback to English
-        };
-        let idx = i32::from_le_bytes(b4.try_into().unwrap_or([0u8; 4]));
+        let idx = bytes
+            .get(..4)
+            .and_then(|b4| <[u8; 4]>::try_from(b4).ok())
+            .map(i32::from_le_bytes)
+            .ok_or_else(|| WhisperError::Mlx("language argmax is not an i32".to_owned()))?;
         Ok((lang_start + idx) as u32)
     }
 

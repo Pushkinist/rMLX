@@ -28,7 +28,6 @@
 )]
 
 pub mod arch;
-pub mod audio_io;
 pub mod bitnet;
 pub mod block_manager;
 pub mod calibration_sink;

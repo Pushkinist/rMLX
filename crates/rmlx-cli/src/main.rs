@@ -1001,11 +1001,11 @@ enum Cmd {
     ///
     /// Arch-dispatched on the snapshot's `config.json` (Whisper today; the
     /// dispatch is a seam for future ASR architectures). The input container is
-    /// decoded and resampled to 16 kHz mono internally, so any
-    /// `.m4a`/`.wav`/`.mp3`/`.flac`/… works directly. Output goes to stdout, or
-    /// to `--output` when given.
+    /// decoded and resampled to 16 kHz mono internally, so a `.m4a`, `.wav`,
+    /// `.mp3` or `.aac` file works directly. Output goes to stdout, or to
+    /// `--output` when given.
     Transcribe {
-        /// Input audio file (any Symphonia-supported container).
+        /// Input audio file: WAV, MP3, M4A or ADTS AAC.
         #[arg(value_name = "AUDIO")]
         audio: PathBuf,
         /// Model snapshot directory (Whisper). Env: `RMLX_WHISPER_MODEL_PATH`.
@@ -1020,7 +1020,7 @@ enum Cmd {
         /// Output format: txt | json | srt | vtt.
         #[arg(long, default_value = "txt")]
         format: String,
-        /// Language code (`en`, `fr`, …) or `auto` for detection.
+        /// Language: an ISO code (`en`), an English name (`French`) or `auto` for detection.
         #[arg(long, default_value = "auto")]
         language: String,
         /// Translate to English instead of transcribing in the source language.

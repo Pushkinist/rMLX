@@ -7,8 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The transcription routes state their limits instead of passing them
+  silently.** A file over 25 MiB, or a request body over 26 MiB, is now 413
+  and names the cap and the size (it was 422, and over 26 MiB the cap was not
+  named). `timestamp_granularities` holding `word` is now 422, also when it
+  holds `segment` too (before, the field was dropped and the request was
+  served per segment). `stream` true is now 422. A form of more than 64
+  parts, or a field other than `file` and `model` of more than 64 bytes, is
+  422. A Whisper model or tokenizer that does not load is now 503 with
+  `x-should-retry: false` (it was 422), and the body names the file, not the
+  server's directory. An engine failure during the transcription is now 503
+  (it was 422). A `verbose_json` segment now holds `seek`, `tokens`,
+  `temperature` and `compression_ratio`; `avg_logprob` and `no_speech_prob`
+  are not computed and are left out, so a client that requires them
+  (`@ai-sdk/openai` with the model `whisper-1`, openai-python in strict mode)
+  cannot read `verbose_json` yet. Fields such as `prompt` are taken and
+  ignored as before, now with at most one `warn` event per request.
+
 ### Fixed
 
+- **A language that Whisper does not know is an error, and `verbose_json`
+  names the language in a form a client can read.** `rmlx transcribe
+  --language xx` was decoded as English with no error. It now stops before the
+  audio is read, naming the value. The route takes the same two forms: an ISO
+  code or an English name, in any letter case (`ru`, `Russian`). A failure of
+  the language detection step also fails the request now; it fell back to
+  English. The `language` of a `verbose_json` reply, and of `rmlx transcribe
+  --format json`, was `lang_tok=50259` for a detected language. It is now the
+  lower-case English name (`english`), also for a language the request named,
+  as the OpenAI reference and the `whisper.cpp` server give it.
 - **Speech-to-text no longer opens extra windows over the last fraction of a
   second after the speech, which repeated a segment and added filler.** After
   each 30 s window, the seek went to the last timestamp. When the speech

@@ -132,7 +132,15 @@ whose outputs are identical, since the comparison would prove nothing.
 `mlx-community__whisper-large-v3-mlx` and `openai__whisper-large-v3-tokenizer`
 under `RMLX_O_MODELS_ROOT`. Its long-form case reads audio files with a
 sibling `*.transcript.vtt` from the git-ignored
-`crates/rmlx-audio/tests/fixtures/`.
+`crates/rmlx-audio/tests/fixtures/`. Its synthetic long clip needs no
+fixture: it speaks 28 sentences with macOS `say`, converts them with
+`ffmpeg`, and skips when either is missing.
+
+Two CPU tests in `crates/rmlx-audio/src/wav_tests.rs` need `ffmpeg` and no
+model: `an_m4a_decodes_and_a_cut_copy_is_refused` and
+`a_fragmented_m4a_declares_no_length` encode an M4A with it. Each prints
+`SKIP <test>: ffmpeg unavailable` and passes when `ffmpeg` cannot run. Every
+other decode test builds its audio from bytes in the test.
 
 ## Speculative-decoding suites
 

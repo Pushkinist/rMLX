@@ -621,6 +621,10 @@ impl Generator for ArchGenerator {
         }
         // Capture effective_max_ctx for drainer MetricEvent.ctx_max field.
         let effective_max_ctx_val = self.effective_max_ctx as i64;
+        // An `input_audio` clip is refused before its mel when its audio
+        // tokens cannot fit the context this request generates in: the same
+        // limits and `max_ctx_override` the generation resolves below.
+        let context_limits = self.context_limits;
         // Route handler sets effective_prompt_cache_slots = base + active_sessions
         // when an X-Session-Id header is present. Use the override if supplied.
         let prompt_cache_slots = req
@@ -1054,9 +1058,32 @@ impl Generator for ArchGenerator {
                 && !qvl_image
             {
                 if let Some(ab) = audio.as_ref() {
-                    match build_audio_prompt(model.as_ref(), ab, &req_audio, &prompt_tokens, device)
-                    {
+                    let context_tokens = match rmlx_models::context::resolve_context(
+                        &context_limits,
+                        max_ctx_override,
+                    ) {
+                        Ok(resolved) => resolved.ceiling_tokens(),
+                        Err(e) => {
+                            let _ = tx.blocking_send(Err(e));
+                            return;
+                        }
+                    };
+                    // The client is gone when the token channel is closed: the
+                    // decode stops at the next packet.
+                    match build_audio_prompt(
+                        model.as_ref(),
+                        ab,
+                        &req_audio,
+                        &prompt_tokens,
+                        context_tokens,
+                        device,
+                        &|| tx.is_closed(),
+                    ) {
                         Ok(triple) => Some(triple),
+                        Err(e) if tx.is_closed() => {
+                            tracing::debug!(error = %e, "client gone during audio preprocessing");
+                            return;
+                        }
                         Err(e) => {
                             tracing::warn!(error = %e, "audio preprocessing failed");
                             let _ = tx.blocking_send(Err(e));

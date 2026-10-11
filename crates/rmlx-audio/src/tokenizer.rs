@@ -8,18 +8,15 @@
 //! whisper-large-v3-mlx` snapshot ships only `weights.npz` and `config.json`
 //! — no tokenizer files.
 //!
-//! To avoid downloading files at runtime, we use the `tokenizers` crate to
-//! load from a Hugging Face repo path, OR we bundle the mapping of Whisper
-//! special tokens (which are stable, version-locked to `openai/whisper-large-v3`).
+//! ## Special token ids (large-v3 vocabulary only)
 //!
-//! ## Special token IDs (locked to `openai/whisper-large-v3`)
-//!
-//! All values verified against the shipped `tokenizer.json` `added_tokens`
-//! table. **large-v3 has 100 language slots** (`<|en|>`=50259 … `<|yue|>`=50358),
-//! one more than v1/v2 — this shifts every special after the language block up
-//! by one vs the v2 layout. Getting these wrong made the decoder emit the wrong
-//! task token and treat `<|notimestamps|>` as the timestamp-begin sentinel,
-//! producing empty / garbage transcripts.
+//! The decode uses the ids of the large-v3 vocabulary: 51 866 tokens, 50 257
+//! BPE tokens and 1 609 special tokens, 100 of them languages. v1, v2 and the
+//! smaller multilingual models have 99 languages, so every special after
+//! `<|su|>` sits one id lower; the English-only models start one id lower
+//! still. [`WhisperTokenizer::from_path`] refuses a `tokenizer.json` whose
+//! special tokens or size differ, and `WhisperConfig::from_json` refuses an
+//! `n_vocab` other than [`N_VOCAB`].
 //!
 //! | Token | ID |
 //! |---|---|
@@ -34,15 +31,13 @@
 //! | `<|nospeech|>` | 50 363 |
 //! | `<|notimestamps|>` | 50 364 |
 //! | `<|0.00|>` (timestamp_begin) | 50 365 |
-//!
-//! Total vocabulary: 51 866 tokens (50 257 base GPT-2 + 1 609 added; the last
-//! timestamp `<|30.00|>` is 51 865).
+//! | `<|30.00|>` (last timestamp) | 51 865 |
 //!
 //! ## Tokenizer loading
 //!
-//! At transcription time we load the tokenizer from the HuggingFace cache or
-//! from the snapshot directory. The `tokenizers` crate handles BPE decode/encode
-//! natively; we only layer the Whisper-specific special-token protocol on top.
+//! The tokenizer loads from a directory that holds `tokenizer.json`. The
+//! `tokenizers` crate does the BPE encode and decode; this module adds the
+//! Whisper special-token protocol on top.
 
 use std::path::Path;
 
@@ -50,141 +45,241 @@ use thiserror::Error;
 use tokenizers::Tokenizer;
 use tracing::{debug, instrument};
 
-// ── Special token IDs (large-v3 multilingual) ────────────────────────────────
+// ── Special token ids (large-v3 vocabulary) ──────────────────────────────────
+//
+// openai-whisper `get_encoding` (`whisper/tokenizer.py`) gives each special
+// token the next id after the BPE vocabulary, in the order below.
 
-/// End of text (`<|endoftext|>`).
+/// End of text (`<|endoftext|>`): the first id after the 50 257 BPE tokens.
 pub const TOK_EOT: u32 = 50_257;
 /// Start of transcript (`<|startoftranscript|>`).
-pub const TOK_SOT: u32 = 50_258;
-/// English language token (`<|en|>`).
-pub const TOK_EN: u32 = 50_259;
-/// Last language token (`<|yue|>`). large-v3 has 100 languages (50259..=50358).
-pub const TOK_LANG_LAST: u32 = 50_358;
+pub const TOK_SOT: u32 = TOK_EOT + 1;
+/// English language token (`<|en|>`), the first of the [`LANGUAGES`] tokens.
+pub const TOK_EN: u32 = TOK_SOT + 1;
+/// Last language token (`<|yue|>`).
+pub const TOK_LANG_LAST: u32 = TOK_EN + N_LANGUAGES - 1;
 /// Translate task token (`<|translate|>`).
-pub const TOK_TRANSLATE: u32 = 50_359;
+pub const TOK_TRANSLATE: u32 = TOK_LANG_LAST + 1;
 /// Transcribe task token (`<|transcribe|>`).
-pub const TOK_TRANSCRIBE: u32 = 50_360;
+pub const TOK_TRANSCRIBE: u32 = TOK_TRANSLATE + 1;
 /// Start-of-LM token (`<|startoflm|>`).
-pub const TOK_SOT_LM: u32 = 50_361;
+pub const TOK_SOT_LM: u32 = TOK_TRANSCRIBE + 1;
 /// Start-of-previous-context token (`<|startofprev|>`), for prompt conditioning.
-pub const TOK_SOT_PREV: u32 = 50_362;
+pub const TOK_SOT_PREV: u32 = TOK_SOT_LM + 1;
 /// No-speech token (`<|nospeech|>`).
-pub const TOK_NOSPEECH: u32 = 50_363;
+pub const TOK_NOSPEECH: u32 = TOK_SOT_PREV + 1;
 /// No-timestamps token (`<|notimestamps|>`).
-pub const TOK_NO_TIMESTAMPS: u32 = 50_364;
-/// First timestamp token `<|0.00|>`. Timestamps run 50365..=51865 in 0.02 s steps.
-pub const TOK_TIMESTAMP_BEGIN: u32 = 50_365;
+pub const TOK_NO_TIMESTAMPS: u32 = TOK_NOSPEECH + 1;
+/// First timestamp token `<|0.00|>`; one token per 0.02 s step.
+pub const TOK_TIMESTAMP_BEGIN: u32 = TOK_NO_TIMESTAMPS + 1;
+/// Timestamp tokens, `<|0.00|>` to `<|30.00|>`.
+pub const N_TIMESTAMPS: u32 = 1501;
+/// Size of the vocabulary these ids are for: the `n_vocab` a `config.json`
+/// must state and the token count a `tokenizer.json` must hold.
+pub const N_VOCAB: usize = (TOK_TIMESTAMP_BEGIN + N_TIMESTAMPS) as usize;
 
-/// Language token IDs for the 100 supported languages (50 259..=50 358).
-///
-/// Offset from `<|en|>` (50 259): language codes in alphabetical order as
-/// stored in the Whisper vocab. For unknown codes, fall back to `<|en|>`.
-pub const fn language_token(lang_code: &str) -> u32 {
-    // Compile-time lookup over all 100 Whisper language codes; an unknown
-    // code falls back to `<|en|>`.
-    match lang_code.as_bytes() {
-        b"en" => 50_259,
-        b"zh" => 50_260,
-        b"de" => 50_261,
-        b"es" => 50_262,
-        b"ru" => 50_263,
-        b"ko" => 50_264,
-        b"fr" => 50_265,
-        b"ja" => 50_266,
-        b"pt" => 50_267,
-        b"tr" => 50_268,
-        b"pl" => 50_269,
-        b"ca" => 50_270,
-        b"nl" => 50_271,
-        b"ar" => 50_272,
-        b"sv" => 50_273,
-        b"it" => 50_274,
-        b"id" => 50_275,
-        b"hi" => 50_276,
-        b"fi" => 50_277,
-        b"vi" => 50_278,
-        b"he" => 50_279,
-        b"uk" => 50_280,
-        b"el" => 50_281,
-        b"ms" => 50_282,
-        b"cs" => 50_283,
-        b"ro" => 50_284,
-        b"da" => 50_285,
-        b"hu" => 50_286,
-        b"ta" => 50_287,
-        b"no" => 50_288,
-        b"th" => 50_289,
-        b"ur" => 50_290,
-        b"hr" => 50_291,
-        b"bg" => 50_292,
-        b"lt" => 50_293,
-        b"la" => 50_294,
-        b"mi" => 50_295,
-        b"ml" => 50_296,
-        b"cy" => 50_297,
-        b"sk" => 50_298,
-        b"te" => 50_299,
-        b"fa" => 50_300,
-        b"lv" => 50_301,
-        b"bn" => 50_302,
-        b"sr" => 50_303,
-        b"az" => 50_304,
-        b"sl" => 50_305,
-        b"kn" => 50_306,
-        b"et" => 50_307,
-        b"mk" => 50_308,
-        b"br" => 50_309,
-        b"eu" => 50_310,
-        b"is" => 50_311,
-        b"hy" => 50_312,
-        b"ne" => 50_313,
-        b"mn" => 50_314,
-        b"bs" => 50_315,
-        b"kk" => 50_316,
-        b"sq" => 50_317,
-        b"sw" => 50_318,
-        b"gl" => 50_319,
-        b"mr" => 50_320,
-        b"pa" => 50_321,
-        b"si" => 50_322,
-        b"km" => 50_323,
-        b"sn" => 50_324,
-        b"yo" => 50_325,
-        b"so" => 50_326,
-        b"af" => 50_327,
-        b"oc" => 50_328,
-        b"ka" => 50_329,
-        b"be" => 50_330,
-        b"tg" => 50_331,
-        b"sd" => 50_332,
-        b"gu" => 50_333,
-        b"am" => 50_334,
-        b"yi" => 50_335,
-        b"lo" => 50_336,
-        b"uz" => 50_337,
-        b"fo" => 50_338,
-        b"ht" => 50_339,
-        b"ps" => 50_340,
-        b"tk" => 50_341,
-        b"nn" => 50_342,
-        b"mt" => 50_343,
-        b"sa" => 50_344,
-        b"lb" => 50_345,
-        b"my" => 50_346,
-        b"bo" => 50_347,
-        b"tl" => 50_348,
-        b"mg" => 50_349,
-        b"as" => 50_350,
-        b"tt" => 50_351,
-        b"haw" => 50_352,
-        b"ln" => 50_353,
-        b"ha" => 50_354,
-        b"ba" => 50_355,
-        b"jw" => 50_356,
-        b"su" => 50_357,
-        b"yue" => 50_358,
-        _ => TOK_EN, // fallback to English
+const N_LANGUAGES: u32 = 100;
+
+/// Each language as (ISO code, lower-case English name), in vocabulary order
+/// (openai-whisper `LANGUAGES`): `<|en|>` is [`TOK_EN`] and each next entry has
+/// the next id. The loader accepts the large-v3 vocabulary only, so this is
+/// the one table.
+pub const LANGUAGES: [(&str, &str); N_LANGUAGES as usize] = [
+    ("en", "english"),
+    ("zh", "chinese"),
+    ("de", "german"),
+    ("es", "spanish"),
+    ("ru", "russian"),
+    ("ko", "korean"),
+    ("fr", "french"),
+    ("ja", "japanese"),
+    ("pt", "portuguese"),
+    ("tr", "turkish"),
+    ("pl", "polish"),
+    ("ca", "catalan"),
+    ("nl", "dutch"),
+    ("ar", "arabic"),
+    ("sv", "swedish"),
+    ("it", "italian"),
+    ("id", "indonesian"),
+    ("hi", "hindi"),
+    ("fi", "finnish"),
+    ("vi", "vietnamese"),
+    ("he", "hebrew"),
+    ("uk", "ukrainian"),
+    ("el", "greek"),
+    ("ms", "malay"),
+    ("cs", "czech"),
+    ("ro", "romanian"),
+    ("da", "danish"),
+    ("hu", "hungarian"),
+    ("ta", "tamil"),
+    ("no", "norwegian"),
+    ("th", "thai"),
+    ("ur", "urdu"),
+    ("hr", "croatian"),
+    ("bg", "bulgarian"),
+    ("lt", "lithuanian"),
+    ("la", "latin"),
+    ("mi", "maori"),
+    ("ml", "malayalam"),
+    ("cy", "welsh"),
+    ("sk", "slovak"),
+    ("te", "telugu"),
+    ("fa", "persian"),
+    ("lv", "latvian"),
+    ("bn", "bengali"),
+    ("sr", "serbian"),
+    ("az", "azerbaijani"),
+    ("sl", "slovenian"),
+    ("kn", "kannada"),
+    ("et", "estonian"),
+    ("mk", "macedonian"),
+    ("br", "breton"),
+    ("eu", "basque"),
+    ("is", "icelandic"),
+    ("hy", "armenian"),
+    ("ne", "nepali"),
+    ("mn", "mongolian"),
+    ("bs", "bosnian"),
+    ("kk", "kazakh"),
+    ("sq", "albanian"),
+    ("sw", "swahili"),
+    ("gl", "galician"),
+    ("mr", "marathi"),
+    ("pa", "punjabi"),
+    ("si", "sinhala"),
+    ("km", "khmer"),
+    ("sn", "shona"),
+    ("yo", "yoruba"),
+    ("so", "somali"),
+    ("af", "afrikaans"),
+    ("oc", "occitan"),
+    ("ka", "georgian"),
+    ("be", "belarusian"),
+    ("tg", "tajik"),
+    ("sd", "sindhi"),
+    ("gu", "gujarati"),
+    ("am", "amharic"),
+    ("yi", "yiddish"),
+    ("lo", "lao"),
+    ("uz", "uzbek"),
+    ("fo", "faroese"),
+    ("ht", "haitian creole"),
+    ("ps", "pashto"),
+    ("tk", "turkmen"),
+    ("nn", "nynorsk"),
+    ("mt", "maltese"),
+    ("sa", "sanskrit"),
+    ("lb", "luxembourgish"),
+    ("my", "myanmar"),
+    ("bo", "tibetan"),
+    ("tl", "tagalog"),
+    ("mg", "malagasy"),
+    ("as", "assamese"),
+    ("tt", "tatar"),
+    ("haw", "hawaiian"),
+    ("ln", "lingala"),
+    ("ha", "hausa"),
+    ("ba", "bashkir"),
+    ("jw", "javanese"),
+    ("su", "sundanese"),
+    ("yue", "cantonese"),
+];
+
+/// Names that openai-whisper `TO_LANGUAGE_CODE` takes beside those of
+/// [`LANGUAGES`], with the code each stands for.
+const LANGUAGE_ALIASES: [(&str, &str); 12] = [
+    ("burmese", "my"),
+    ("valencian", "ca"),
+    ("flemish", "nl"),
+    ("haitian", "ht"),
+    ("letzeburgesch", "lb"),
+    ("pushto", "ps"),
+    ("panjabi", "pa"),
+    ("moldavian", "ro"),
+    ("moldovan", "ro"),
+    ("sinhalese", "si"),
+    ("castilian", "es"),
+    ("mandarin", "zh"),
+];
+
+/// The language token of a code (`fr`) or an English name (`french`), in any
+/// letter case, as openai-whisper `get_tokenizer` reads a language. `None`
+/// for any other text.
+#[must_use]
+pub fn language_token(language: &str) -> Option<u32> {
+    let wanted = language.to_ascii_lowercase();
+    let wanted = LANGUAGE_ALIASES
+        .iter()
+        .find_map(|&(alias, code)| (alias == wanted).then_some(code))
+        .unwrap_or(&wanted);
+    (TOK_EN..)
+        .zip(LANGUAGES)
+        .find_map(|(id, (code, name))| (code == wanted || name == wanted).then_some(id))
+}
+
+/// The lower-case English name of a language token, or `None` for an id that is
+/// not one of the [`LANGUAGES`] tokens.
+#[must_use]
+pub fn language_name(token: u32) -> Option<&'static str> {
+    let slot = usize::try_from(token.checked_sub(TOK_EN)?).ok()?;
+    LANGUAGES.get(slot).map(|&(_, name)| name)
+}
+
+/// Every special token the ids above name, with its id: openai-whisper
+/// `get_encoding`'s list for the large-v3 vocabulary.
+fn special_tokens() -> Vec<(String, u32)> {
+    let mut tokens = vec![
+        ("<|endoftext|>".to_owned(), TOK_EOT),
+        ("<|startoftranscript|>".to_owned(), TOK_SOT),
+    ];
+    tokens.extend(
+        (TOK_EN..)
+            .zip(LANGUAGES)
+            .map(|(id, (code, _))| (format!("<|{code}|>"), id)),
+    );
+    tokens.extend(
+        [
+            ("<|translate|>", TOK_TRANSLATE),
+            ("<|transcribe|>", TOK_TRANSCRIBE),
+            ("<|startoflm|>", TOK_SOT_LM),
+            ("<|startofprev|>", TOK_SOT_PREV),
+            ("<|nospeech|>", TOK_NOSPEECH),
+            ("<|notimestamps|>", TOK_NO_TIMESTAMPS),
+        ]
+        .map(|(token, id)| (token.to_owned(), id)),
+    );
+    tokens.extend((0..N_TIMESTAMPS).map(|i| {
+        (
+            format!("<|{:.2}|>", f64::from(i) * 0.02),
+            TOK_TIMESTAMP_BEGIN + i,
+        )
+    }));
+    tokens
+}
+
+/// Refuse a tokenizer whose special-token ids or size differ from the ids the
+/// decode uses.
+fn check_vocabulary(tokenizer: &Tokenizer) -> Result<(), TokenizerError> {
+    for (token, expected) in special_tokens() {
+        let found = tokenizer.token_to_id(&token);
+        if found != Some(expected) {
+            return Err(TokenizerError::SpecialToken {
+                token,
+                found: found.map_or_else(|| "absent".to_owned(), |id| format!("id {id}")),
+                expected,
+            });
+        }
     }
+    let size = tokenizer.get_vocab_size(true);
+    if size != N_VOCAB {
+        return Err(TokenizerError::VocabSize {
+            found: size,
+            expected: N_VOCAB,
+        });
+    }
+    Ok(())
 }
 
 // ── WhisperTokenizer ──────────────────────────────────────────────────────────
@@ -202,6 +297,30 @@ pub enum TokenizerError {
     /// Decode failure.
     #[error("tokenizer decode error: {0}")]
     Decode(String),
+    /// A special token is absent or has another id than the decode uses.
+    #[error(
+        "tokenizer.json: {token} is {found}, the decode expects id {expected}; \
+         only the Whisper large-v3 vocabulary is supported"
+    )]
+    SpecialToken {
+        /// The token, for example `<|transcribe|>`.
+        token: String,
+        /// `id N`, or `absent`.
+        found: String,
+        /// The id the decode uses.
+        expected: u32,
+    },
+    /// The vocabulary has another size than the decode's.
+    #[error(
+        "tokenizer.json holds {found} tokens, the decode expects {expected}; \
+         only the Whisper large-v3 vocabulary is supported"
+    )]
+    VocabSize {
+        /// Tokens in the file, added tokens included.
+        found: usize,
+        /// [`N_VOCAB`].
+        expected: usize,
+    },
 }
 
 /// Whisper BPE tokenizer wrapper.
@@ -224,11 +343,15 @@ impl WhisperTokenizer {
     /// The Whisper snapshot from `mlx-community` does not ship a tokenizer;
     /// use the companion `openai/whisper-large-v3` HuggingFace repo path, or
     /// any local directory that contains a Whisper-compatible `tokenizer.json`.
+    /// A tokenizer of another vocabulary than large-v3's is refused. An error
+    /// names `tokenizer.json`, not its directory: the server sends it to the
+    /// client.
     #[instrument(skip(path), fields(path = %path.as_ref().display()), level = "debug")]
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, TokenizerError> {
         let tok_path = path.as_ref().join("tokenizer.json");
         let inner = Tokenizer::from_file(&tok_path)
-            .map_err(|e| TokenizerError::Load(format!("{}: {e}", tok_path.display())))?;
+            .map_err(|e| TokenizerError::Load(format!("tokenizer.json: {e}")))?;
+        check_vocabulary(&inner)?;
         debug!("WhisperTokenizer loaded");
         Ok(Self { inner })
     }
@@ -315,30 +438,11 @@ impl WhisperTokenizer {
             .map_err(|e| TokenizerError::Decode(e.to_string()))
     }
 
-    /// Build the initial decoder token sequence for the given task and language.
+    /// Build the initial decoder token sequence for a language token (from
+    /// [`language_token`] or `detect_language`) and a task.
     ///
-    /// Sequence: `[SOT, lang_token, task_token, no_timestamps]`.
-    pub fn sot_sequence(
-        &self,
-        language: &str,
-        task: WhisperTask,
-        with_timestamps: bool,
-    ) -> Vec<u32> {
-        let lang_tok = language_token(language);
-        let task_tok = match task {
-            WhisperTask::Transcribe => TOK_TRANSCRIBE,
-            WhisperTask::Translate => TOK_TRANSLATE,
-        };
-        let mut seq = vec![TOK_SOT, lang_tok, task_tok];
-        if !with_timestamps {
-            seq.push(TOK_NO_TIMESTAMPS);
-        }
-        seq
-    }
-
-    /// Build the SOT sequence given a raw language token id (e.g. from `detect_language`).
-    ///
-    /// Useful when the language was detected at runtime rather than specified as a string.
+    /// Sequence: `[SOT, lang_token, task_token, no_timestamps]`; the last
+    /// token is present only without timestamps.
     pub fn sot_sequence_from_tok(
         &self,
         lang_tok: u32,
