@@ -790,10 +790,12 @@ Both take a multipart form. `translations` translates to English.
 the audio in 30 s windows. Each window decodes in timestamp mode with the
 openai-whisper logit filters (`SuppressBlank`, `SuppressTokens`,
 `ApplyTimestampRules`). The emitted timestamps become segments with real
-times. The seek advances to the last timestamp, and the previous window's text
-is fed back as a `<|startofprev|>` prompt. The only filler guard drops a
-segment that opens after the window's own length plus 0.5 s — in a short
-tail window, filler that opens at `<|0.00|>` still passes.
+times. The seek consumes the whole window when the tokens end in a single
+timestamp, and otherwise goes to the end of the last closed segment
+([`AUDIO.md`](AUDIO.md), "Seek rule"). The previous window's text is fed back
+as a `<|startofprev|>` prompt; a window that loops under it is decoded again
+without it ([`AUDIO.md`](AUDIO.md), "Repetition guard"). The only filler guard
+drops a segment that opens after the window's own length plus 0.5 s.
 
 With `language` absent or `auto`, `WhisperModel::detect_language()` runs one
 SOT decoder step and takes the argmax over the language tokens. On error it

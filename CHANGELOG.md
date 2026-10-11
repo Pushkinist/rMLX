@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Speech-to-text no longer opens extra windows over the last fraction of a
+  second after the speech, which repeated a segment and added filler.** After
+  each 30 s window, the seek went to the last timestamp. When the speech
+  ended before the window did, the next window held only the last fraction of
+  a second of audio and was decoded with the previous text as its prompt. A
+  5.4 s clip of two sentences gave the second sentence twice, then "Thank
+  you.". Now the seek follows openai-whisper: the whole window is consumed
+  when the tokens end in a single timestamp, and otherwise the seek goes to
+  the end of the last closed segment. The walk stops when less than 10 ms of
+  audio is left. An unfinished segment is no longer emitted and decoded again,
+  and a whole-window advance no longer leaves one sample behind for some
+  window lengths. A segment that has no timestamp pair now starts at the
+  window start, as in openai-whisper. No no-speech gate and no temperature
+  fallback exist yet.
+- **A repetition loop no longer spreads from one window to the next: a window
+  that loops under its prompt is decoded once more without it, and a loop that
+  remains does not prompt the next window.** Greedy decode under the previous
+  window's text could repeat one sentence to the token budget with no closing
+  timestamp, so the whole window was consumed, and the loop text prompted the
+  next window, which looped too. A loop is a window text with a zlib
+  compression ratio above 2.4 (openai-whisper's bound).
+
 ## [0.4.3] - 2026-10-09
 
 This release makes rMLX build and run on the MLX that Homebrew ships today:

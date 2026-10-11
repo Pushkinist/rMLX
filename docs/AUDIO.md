@@ -22,29 +22,54 @@ dimension comes from `config.json`. The mel filterbank matches its `n_mels`:
 audio bytes → WavDecoder (mono f32, native rate) → resample_to_16k
 → per 30 s window: MelExtractor → encode_mel → greedy decode in timestamp mode
 → timestamp tokens → segments with cumulative times
-→ seek to the last timestamp
+→ seek: the whole window, or the end of the last closed segment
 ```
 
 With `condition_on_previous_text` set, the previous window's text is fed back
-after `<|startofprev|>`. The server and `rmlx transcribe` always set it.
+after `<|startofprev|>`, unless that text was a repetition loop (see
+"Repetition guard"). The server and `rmlx transcribe` always set it.
 
 Each window decodes with the openai-whisper logit filters (`DecodeFilters`).
 Temperature is 0, so one input gives one output. The only filler guard drops
-a segment that opens after the window's own length plus 0.5 s; in a short
-tail window this bound is small, so filler that opens at `<|0.00|>` still
-passes.
+a segment that opens after the window's own length plus 0.5 s. The
+openai-whisper reference has no such guard.
 
 Long audio is walked window by window. No voice-activity detection runs.
 
-**Seek defect.** rMLX always seeks to the last emitted timestamp. The
-reference consumes the whole window when the tokens end in a single
-trailing timestamp (no speech after it). When speech ends before the window
-does, rMLX opens one or more extra tail windows over the remaining
-near-silent audio; each one decodes with the previous window's text fed
-back as a `<|startofprev|>` prompt, which is where the trailing filler
-("you", "thank you") and repeated segments come from. No no-speech gate
-exists to skip a near-silent window, and `temperature` has no fallback
-effect (decoding is always greedy).
+**Seek rule.** It follows openai-whisper `transcribe()`, in samples:
+
+- Tokens with a timestamp pair (two timestamps in a row) and a single
+  timestamp at the end: no speech follows, so the whole real window is
+  consumed.
+- Tokens with a timestamp pair that do not end in a single timestamp: the
+  unfinished segment is dropped, and the seek goes to the end of the last
+  closed segment.
+- Tokens with no timestamp pair: one segment from the window start, and the
+  whole window is consumed.
+
+The advance is never zero, and a window that is consumed whole advances by its
+exact sample count. The walk stops when less than one mel hop (160 samples,
+10 ms) of audio is left, so a few samples at the end of a clip open no window.
+A window that ends in a timestamp pair still leaves real audio for the next
+window, and that window can print filler.
+No no-speech gate exists to skip a near-silent window. `temperature` has no
+effect: every decode, the repetition retry below included, is greedy.
+
+**Repetition guard.** Greedy decode under a previous-text prompt can loop: one
+sentence repeated until the token budget, with no closing timestamp, so the
+whole window is consumed and its speech is lost. The loop text then prompts the
+next window, which loops too. A window's text whose zlib compression ratio is
+above 2.4 (openai-whisper's `compression_ratio_threshold`) is a loop. When it
+was decoded with a prompt, the window is decoded again with no prompt. Of the
+two decodes, the one with the lower ratio is kept (the retry on a tie). If the
+kept one is still a loop, it stays in the transcript, a `warn` event names the
+window and both ratios, and it does not prompt the next window. The ratio is
+the stripped text's bytes over a zlib stream, as openai-whisper's
+`compression_ratio`; the encoder is miniz at level 6, not zlib, so a short text
+near 2.4 can fall on the other side of the bound. openai-whisper re-decodes at temperatures 0.2 to 1.0 instead and drops
+the prompt after a fallback above 0.5; whisper.cpp decodes its fallbacks at 0.5
+and above with no prompt. rMLX has no sampler, so its one retry is greedy and
+prompt-free.
 
 ### Language detection
 

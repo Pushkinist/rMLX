@@ -7,8 +7,10 @@
 //!
 //! 1. `say_clip_deterministic` — portable, asset-free: synthesise a known English
 //!    sentence with macOS `say` + `ffmpeg`, transcribe it, assert it matches the
-//!    sentence (low WER, case/punct-insensitive) and is byte-identical across two
+//!    sentence (WER 0, case/punct-insensitive) and is byte-identical across two
 //!    runs at temp=0. Skips when `say`/`ffmpeg` are unavailable.
+//!    `two_sentence_clip_is_two_segments` does the same for two sentences and
+//!    asserts two segments with no repeat and no trailing filler.
 //!
 //! 2. `long_form_regression` — scans the gitignored fixtures dir
 //!    (`crates/rmlx-audio/tests/fixtures/`) for any `*.{m4a,wav,mp3,…}` paired
@@ -241,18 +243,41 @@ fn say_clip_deterministic() {
     let hyp = normalize(&r1.text);
     let w = wer(&reference, &hyp);
     println!("say-clip text: {:?}  WER={w:.3}", r1.text);
-    // Threshold 0.25: the sentence content must be correct. A filler token
-    // ("you", "thank you") can appear on the trailing-silence boundary of a
-    // very short clip: the seek rule re-prompts an extra near-silent window
-    // after a single trailing timestamp instead of consuming the whole
-    // window, which is a real decode defect (see `docs/AUDIO.md`), not
-    // benign Whisper behavior. The 0.25 bound tolerates up to two such
-    // words over a 9-word sentence. Determinism (above) is the stricter
-    // property being asserted.
+    // The clip is one short sentence: any extra word, such as filler after the
+    // speech, fails.
+    assert_eq!(w, 0.0, "say-clip WER {w:.3} above 0; got {:?}", r1.text);
+}
+
+/// Two spoken sentences in a 5.4 s clip are two segments and one pass over the
+/// clip: no repeated sentence and no filler after the speech.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test two_sentence_clip -- --ignored --test-threads=1"]
+fn two_sentence_clip_is_two_segments() {
+    let Some(t) = load_transcriber() else {
+        eprintln!("SKIP two_sentence_clip_is_two_segments: whisper snapshot not present");
+        return;
+    };
+    let Some(wav) = synth_say_clip(
+        "The quick brown fox jumps over the lazy dog. Paper was invented in China about two thousand years ago.",
+    ) else {
+        eprintln!("SKIP two_sentence_clip_is_two_segments: say/ffmpeg unavailable");
+        return;
+    };
+
+    let r = transcribe_file(&t, &wav, "en");
+    println!("two-sentence text: {:?}", r.text);
+    assert_eq!(r.segments.len(), 2, "segments: {:?}", r.segments);
+    let words = normalize(&r.text);
+    assert_eq!(
+        words.iter().filter(|w| w.as_str() == "paper").count(),
+        1,
+        "second sentence repeated: {:?}",
+        r.text
+    );
     assert!(
-        w <= 0.25,
-        "say-clip WER {w:.3} too high (>0.25); got {:?}",
-        r1.text
+        !words.iter().any(|w| w == "you"),
+        "filler after the speech: {:?}",
+        r.text
     );
 }
 

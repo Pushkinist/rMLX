@@ -576,8 +576,12 @@ come from `config.json`.
 3. Each step applies the openai-whisper filter chain: `SuppressBlank`,
    `SuppressTokens` (derived from the loaded tokenizer) and
    `ApplyTimestampRules`.
-4. Timestamps become segments. The next window seeks to the last timestamp
-   and is conditioned on the previous text through `<|startofprev|>`.
+4. Timestamps become segments. The seek follows openai-whisper: the whole
+   window when the tokens end in a single timestamp, otherwise the end of the
+   last closed segment (`docs/AUDIO.md`, "Seek rule"). The next window is
+   conditioned on the previous text through `<|startofprev|>`. A window that
+   loops under that prompt is decoded again without it (`docs/AUDIO.md`,
+   "Repetition guard").
 5. Render `txt`, `json`, `srt` or `vtt`.
 
 Decoding is greedy at temperature 0.
@@ -585,7 +589,9 @@ Decoding is greedy at temperature 0.
 **Tests.** `crates/rmlx-audio/tests/transcribe.rs` resolves the snapshot and
 tokenizer under `RMLX_O_MODELS_ROOT` and skips when they are absent.
 `say_clip_deterministic` synthesises a sentence with `say` and `ffmpeg` and
-checks WER and run-to-run identity. `long_form_regression` transcribes every
+checks WER 0 and run-to-run identity. `two_sentence_clip_is_two_segments`
+synthesises two sentences and checks two segments, no repeat and no trailing
+filler. `long_form_regression` transcribes every
 audio file with a sibling `*.transcript.vtt` in the git-ignored
 `crates/rmlx-audio/tests/fixtures/` and requires normalised WER ≤ 0.30.
 
