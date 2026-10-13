@@ -56,6 +56,10 @@ fn load(test: &str, var: &str) -> Option<(arch::Architecture, tokenizers::Tokeni
         return None;
     };
     let path = PathBuf::from(p);
+    // The tests of this binary share one process, and MLX keeps the buffers of a
+    // dropped model for reuse. Without this release, each model's buffers stay in
+    // memory under the next model.
+    assert!(rmlx_mlx::mlx_clear_cache(), "mlx_clear_cache failed");
     let model =
         arch::load_model(&path, Device::Gpu, &arch::LoadOpts::default()).expect("arch::load_model");
     let tokenizer =

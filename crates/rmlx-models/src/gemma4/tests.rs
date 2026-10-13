@@ -414,6 +414,7 @@ fn forward_seq_multi_token_gives_different_argmax() {
         return;
     }
 
+    crate::test_snapshot::release_cached_buffers();
     let model = load_from_path(model_path).expect("load_from_path");
 
     let bos: u32 = 2;
@@ -483,6 +484,7 @@ fn forward_hidden_states_matches_reference_extraction() {
         eprintln!("[forward_hidden_states_test] snapshot absent — skipping");
         return;
     }
+    crate::test_snapshot::release_cached_buffers();
     let model = load_from_path(model_path).expect("load_from_path");
     let device = Device::Cpu;
 
@@ -578,6 +580,7 @@ fn integration_paro_forward_gemma4() {
         return;
     }
 
+    crate::test_snapshot::release_cached_buffers();
     let model = load_from_path_paro(model_path).expect("load_from_path_paro");
 
     let seq: &[u32] = &[2, 105];
@@ -636,6 +639,7 @@ fn build_inputs_embeds_aligns_and_shapes() {
     }
     let device = Device::Cpu;
 
+    crate::test_snapshot::release_cached_buffers();
     let model = load_from_path(model_path).expect("load text model");
     let vcfg = Gemma4VisionConfig::from_model_dir(model_path)
         .expect("read vision_config")

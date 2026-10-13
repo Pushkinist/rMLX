@@ -7,6 +7,9 @@
 //! reads `RMLX_TEST_MODEL_BONSAI` first and the slug second.) A cell with no
 //! such variable uses the slug alone (`snapshot_by_slug`).
 //!
+//! A resolver that returns a snapshot also calls [`release_cached_buffers`],
+//! because a caller normally loads that snapshot right after.
+//!
 //! **An unset variable is not a stand-down.** A machine holding the snapshot
 //! runs the cell. Most of these cells are GPU tests that `make gpu-test`
 //! selects; a few (for example `quantize_paro_embed_row760`,
@@ -19,6 +22,14 @@ use std::path::{Path, PathBuf};
 
 /// Root holding every snapshot, addressed by slug.
 const MODELS_ROOT_VAR: &str = "RMLX_O_MODELS_ROOT";
+
+/// Free the device buffers MLX keeps for reuse after a model is dropped.
+///
+/// The library tests share one process. Without this call, the buffers of each
+/// dropped model stay in memory under the next model.
+pub(crate) fn release_cached_buffers() {
+    assert!(rmlx_mlx::mlx_clear_cache(), "mlx_clear_cache failed");
+}
 
 /// The snapshot `slug` names, or `None` after announcing why this cell stood
 /// down.
@@ -53,7 +64,7 @@ pub(crate) fn snapshot(test: &str, var: &str, slug: &str, archs: &[&str]) -> Opt
 
 /// The snapshot `slug` names under `RMLX_O_MODELS_ROOT`, with no variable to
 /// override it, or `None` after announcing why this cell stood down. Same
-/// identity check and `SKIP` rule as [`snapshot`].
+/// identity check, `SKIP` rule and cache release as [`snapshot`].
 pub(crate) fn snapshot_by_slug(test: &str, slug: &str, identities: &[&str]) -> Option<PathBuf> {
     let Some(dir) = under_root(slug) else {
         println!("SKIP {test}: {MODELS_ROOT_VAR} does not hold {slug}");
@@ -81,6 +92,7 @@ fn declaring(test: &str, dir: PathBuf, identities: &[&str]) -> Option<PathBuf> {
         );
         return None;
     }
+    release_cached_buffers();
     Some(dir)
 }
 

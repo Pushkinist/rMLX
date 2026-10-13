@@ -99,6 +99,7 @@ fn integration_laguna_xs2() {
         return;
     }
 
+    crate::test_snapshot::release_cached_buffers();
     let model = super::loader::load_from_path(model_dir).expect("load_from_path failed");
 
     let logits = model

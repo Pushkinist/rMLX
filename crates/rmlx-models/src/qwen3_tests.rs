@@ -74,6 +74,7 @@ fn integration_qwen3_dr_venus() {
         return;
     }
 
+    crate::test_snapshot::release_cached_buffers();
     let model = load_from_path(model_dir, None).expect("load_from_path failed");
 
     let logits = model

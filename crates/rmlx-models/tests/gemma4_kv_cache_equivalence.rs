@@ -35,6 +35,14 @@
     clippy::needless_pass_by_value
 )]
 
+/// The tests of this binary share one process, and MLX keeps the buffers of a
+/// dropped model for reuse. Without this release, each model's buffers stay in
+/// memory under the next model.
+fn load_model(model_path: &std::path::Path) -> rmlx_models::gemma4::Gemma4Text {
+    assert!(rmlx_mlx::mlx_clear_cache(), "mlx_clear_cache failed");
+    rmlx_models::gemma4::load_from_path(model_path).expect("load model")
+}
+
 // ── K8V4 variant ────────────────────────────────────────────────────────
 //
 // With KvQuant::K8V4 the quantization is lossy. We cannot require argmax
@@ -54,10 +62,9 @@ fn kv_cache_k8v4_prefill_decode_sane() {
 
     use rmlx_kv_quant::{KvCache, KvQuant};
     use rmlx_mlx::Device;
-    use rmlx_models::gemma4;
 
     let device = Device::Gpu;
-    let model = gemma4::load_from_path(&model_path).expect("load model");
+    let model = load_model(&model_path);
     let n_layers = model.cfg.num_hidden_layers;
 
     let prompt: &[u32] = &[2, 1024, 512, 256];
@@ -153,10 +160,9 @@ fn kv_cache_planar_prefill_decode_sane() {
 
     use rmlx_kv_quant::{KvCache, KvQuant};
     use rmlx_mlx::Device;
-    use rmlx_models::gemma4;
 
     let device = Device::Gpu;
-    let model = gemma4::load_from_path(&model_path).expect("load model");
+    let model = load_model(&model_path);
     let n_layers = model.cfg.num_hidden_layers;
 
     let prompt: &[u32] = &[2, 1024, 512, 256];
@@ -261,11 +267,11 @@ fn gemma4_partial_prefix_reuse_cold_equal() {
 
     use rmlx_kv_quant::{KvCache, KvQuant};
     use rmlx_mlx::Device;
-    use rmlx_models::gemma4::{self, LayerType};
+    use rmlx_models::gemma4::LayerType;
 
     const BLOCK_TOKENS: usize = 256;
     let device = Device::Gpu;
-    let model = gemma4::load_from_path(&model_path).expect("load model");
+    let model = load_model(&model_path);
     let n_layers = model.cfg.num_hidden_layers;
     let sliding_window = model.cfg.sliding_window as i32;
 
@@ -484,10 +490,10 @@ fn gemma4_b1_swa_snapshot_restore_multiturn_token_identical() {
 
     use rmlx_kv_quant::{KvCache, KvQuant};
     use rmlx_mlx::Device;
-    use rmlx_models::gemma4::{self, LayerType};
+    use rmlx_models::gemma4::LayerType;
 
     let device = Device::Gpu;
-    let model = gemma4::load_from_path(&model_path).expect("load model");
+    let model = load_model(&model_path);
     let n_layers = model.cfg.num_hidden_layers;
     let sliding_window = model.cfg.sliding_window as i32;
     let n_decode = 16usize;

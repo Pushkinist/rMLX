@@ -105,11 +105,15 @@ const CONTROL_SEEDS: [u64; 2] = [7, 8];
 const CONTROL_TOKENS: usize = 256;
 
 /// A snapshot by slug, or the reason this test stands down. A misconfigured
-/// root is a failure — see `tests/common/mod.rs`.
+/// root is a failure — see `tests/common/mod.rs`. A resolved snapshot is loaded
+/// right after, so this also calls [`common::release_cached_buffers`].
 fn snapshot(slug: &str) -> Result<PathBuf, String> {
     let root = std::env::var(common::MODELS_ROOT_VAR).ok();
     match common::slug_snapshot(root.as_deref(), slug, common::Role::Standalone) {
-        common::Snapshot::Found { path, .. } => Ok(path),
+        common::Snapshot::Found { path, .. } => {
+            common::release_cached_buffers();
+            Ok(path)
+        }
         common::Snapshot::Absent(why) => Err(why),
         common::Snapshot::Misconfigured(why) => panic!("{why}"),
     }

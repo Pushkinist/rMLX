@@ -36,6 +36,7 @@ fn integration_qwen2_readerlm() {
         return;
     }
 
+    crate::test_snapshot::release_cached_buffers();
     let model = load_from_path(model_dir).expect("load_from_path failed");
 
     // Qwen2 BOS = 151643.

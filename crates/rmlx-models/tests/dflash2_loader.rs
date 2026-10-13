@@ -45,6 +45,9 @@ const TENSOR_COUNT: usize = 81;
 /// The drafter snapshot by slug, or `None` once this test has announced why it
 /// stands down.
 ///
+/// A resolved snapshot is loaded right after, so this also calls
+/// [`common::release_cached_buffers`].
+///
 /// A drafter sidecar ships no `tokenizer.json` — it is decoded with the
 /// verifier's — so the probe asks for a [`common::Role::Sidecar`], the shape
 /// that requires only the files such a checkpoint carries. The three outcomes
@@ -68,7 +71,9 @@ fn snapshot(test: &str) -> Option<PathBuf> {
         }
         common::Snapshot::Misconfigured(why) => common::Gate::Fail(why),
     };
-    common::apply(gate, test)
+    let path = common::apply(gate, test)?;
+    common::release_cached_buffers();
+    Some(path)
 }
 
 fn linear_shape(l: &Linear) -> Vec<i32> {

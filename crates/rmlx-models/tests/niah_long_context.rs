@@ -256,6 +256,7 @@ fn run_one(
     kind: FlashKind,
 ) -> NiahResult {
     let device = Device::Gpu;
+    common::release_cached_buffers();
     let model =
         arch::load_model(model_path, device, &arch::LoadOpts::default()).expect("arch::load_model");
     let tk_path = model_path.join("tokenizer.json");

@@ -563,7 +563,18 @@ pub fn skip_if_arch_mismatch(model_dir: &Path, test_name: &str, expected: &[&str
     true
 }
 
+/// Free the device buffers MLX keeps for reuse after a model is dropped.
+///
+/// The tests of one binary share one process. Without this call, the buffers of
+/// each dropped model stay in memory under the next model.
+pub fn release_cached_buffers() {
+    assert!(rmlx_mlx::mlx_clear_cache(), "mlx_clear_cache failed");
+}
+
 /// Resolve the snapshot for one golden, or `None` when this machine has none.
+///
+/// A resolved snapshot is loaded right after, so this also calls
+/// [`release_cached_buffers`].
 ///
 /// Panics on a configuration that is present and wrong — a variable pointing at
 /// a directory that is not a snapshot, or at a snapshot of the wrong
@@ -574,7 +585,9 @@ pub fn model_for(model: &GoldenModel, test_name: &str) -> Option<PathBuf> {
     let root = std::env::var(MODELS_ROOT_VAR).ok();
     let over = override_snapshot(single.as_deref(), Role::Standalone);
     let slug = slug_snapshot(root.as_deref(), model.slug, Role::Standalone);
-    apply(choose(over, slug, model, regen_requested()), test_name)
+    let path = apply(choose(over, slug, model, regen_requested()), test_name)?;
+    release_cached_buffers();
+    Some(path)
 }
 
 /// Number of decode tokens to compare. 32 is enough to catch a divergence

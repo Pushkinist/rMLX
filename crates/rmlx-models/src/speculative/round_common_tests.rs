@@ -808,6 +808,7 @@ fn a_round_tape_refolds_to_what_the_replay_produced() {
 
     for path in tape_replay_models(NAME) {
         let model = path.file_name().unwrap_or_default().to_string_lossy();
+        crate::test_snapshot::release_cached_buffers();
         let arch = load_model(&path, device, &LoadOpts::default()).expect("load verifier");
         assert!(
             arch.needs_lin_caches(),

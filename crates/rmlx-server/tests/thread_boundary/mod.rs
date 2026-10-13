@@ -275,12 +275,21 @@ pub enum Split {
     BeforeLastRequest,
 }
 
+/// Free the device buffers MLX keeps for reuse after a model is dropped.
+///
+/// The tests of one binary share one process. Without this call, the buffers of
+/// each dropped model stay in memory under the next model.
+fn release_cached_buffers() {
+    assert!(rmlx_mlx::mlx_clear_cache(), "mlx_clear_cache failed");
+}
+
 /// Run `first`, then `second` on the state `first` returns.
 ///
 /// Unless `split` is [`Split::None`], `second` runs on a new thread while the
 /// thread that ran `first` stays alive and idle. `first` holds the load for
 /// [`Split::AfterLoad`], and the load and the earlier requests for
-/// [`Split::BeforeLastRequest`].
+/// [`Split::BeforeLastRequest`]. `first` loads a model, so this first frees the
+/// buffers of the models dropped before.
 pub fn hand_over<S, A, B>(
     split: Split,
     first: impl FnOnce() -> (S, A) + Send + 'static,
@@ -291,6 +300,7 @@ where
     A: Send + 'static,
     B: Send + 'static,
 {
+    release_cached_buffers();
     if split == Split::None {
         return std::thread::spawn(move || {
             let (state, a) = first();
@@ -406,12 +416,14 @@ pub type Load = Arc<dyn Fn() -> Arc<dyn Generator> + Send + Sync>;
 /// Build a generator with `load` and serve `requests` in order.
 ///
 /// A `recorder` sees every event of the thread that serves the last request.
+/// This first frees the buffers of the models dropped before the load.
 pub fn serve(
     split: Split,
     load: &Load,
     requests: Vec<GenerationRequest>,
     recorder: Option<&Arc<RoundStreamRecorder>>,
 ) -> Vec<Result<Vec<u32>, String>> {
+    release_cached_buffers();
     let pool = one_thread_pool();
     let (generator, parked) = if split == Split::AfterLoad {
         let (gen_tx, gen_rx) = mpsc::channel();

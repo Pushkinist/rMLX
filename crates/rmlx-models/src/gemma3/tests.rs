@@ -89,6 +89,7 @@ fn integration_medgemma_forward() {
         return;
     }
 
+    crate::test_snapshot::release_cached_buffers();
     let model = super::loader::load_from_path(model_dir).expect("load_from_path failed");
 
     // BOS token id=2 for Gemma3.

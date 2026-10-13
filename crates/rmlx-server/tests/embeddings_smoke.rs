@@ -130,8 +130,13 @@ async fn send(port: u16, method: &str, path: &str, body: &str) -> (u16, String) 
     (status, text[bs..].to_owned())
 }
 
+/// The registry holding the jina snapshot. The first request loads it, so this
+/// first frees the buffers MLX keeps for reuse after a model is dropped: the
+/// tests of this binary share one process, and without this call the buffers of
+/// each dropped model stay in memory under the next model.
 fn jina_registry() -> Option<ModelRegistry> {
     let p = jina_snapshot_dir()?;
+    assert!(rmlx_mlx::mlx_clear_cache(), "mlx_clear_cache failed");
     Some(ModelRegistry::from_paths(std::slice::from_ref(&p)))
 }
 

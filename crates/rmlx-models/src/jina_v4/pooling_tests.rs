@@ -23,6 +23,7 @@ fn load() -> Option<(JinaV4, Device)> {
         eprintln!("SKIP: jina-v4 snapshot absent at {}", dir.display());
         return None;
     }
+    crate::test_snapshot::release_cached_buffers();
     let m = load_from_path(dir).expect("load jina-v4");
     // CPU keeps the test free of the single-MLX-process Metal claim.
     Some((m, Device::Cpu))

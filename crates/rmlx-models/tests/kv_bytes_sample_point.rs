@@ -130,6 +130,10 @@ fn process_rss_bytes() -> u64 {
 
 fn load(test: &str) -> Option<(arch::Architecture, tokenizers::Tokenizer)> {
     let path = model_path(test)?;
+    // The tests of this binary share one process, and MLX keeps the buffers of a
+    // dropped model for reuse. Without this release, each model's buffers stay in
+    // memory under the next model.
+    assert!(rmlx_mlx::mlx_clear_cache(), "mlx_clear_cache failed");
     let device = Device::Gpu;
     let model =
         arch::load_model(&path, device, &arch::LoadOpts::default()).expect("arch::load_model");
