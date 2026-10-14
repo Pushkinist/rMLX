@@ -187,6 +187,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loaded is. On the chat and messages routes the load events carry the
   `request_id` of their request, and a failed load logs `slots: model load
   failed`.
+- **The `alignment_heads` entry of a Whisper `weights.npz` loads.** Every load
+  of the large-v3 snapshot logged a warning that the entry was skipped,
+  because the entry is int64 and the reader knew no int64. The reader now
+  reads int64 and the model holds the 10 (layer, head) pairs
+  (`WhisperModel::alignment_heads`). An entry that is not usable pairs gives
+  one warning and `None`; the load goes on. Nothing reads the pairs yet.
+- **A `weights.npz` entry that the reader cannot read is an error that names
+  the entry.** The reader skipped such an entry with a warning, so a model
+  could run with a weight missing. An unknown dtype, a big-endian multi-byte
+  dtype (read as little-endian before, with wrong values), `'fortran_order':
+  True` (read as rows before), a shape that does not parse (a bad dimension
+  was dropped before), truncated data, a `.npy` member of no bytes, a deflate
+  stream that fails or is larger than its declared size, a bad signature in
+  the directory (the load stopped there before) and a size or offset that
+  overflows now fail the load. A header that lied about its shape could panic
+  the reader. A member that is not an `.npy` file is skipped with a debug
+  event.
 - **A language that Whisper does not know is an error, and `verbose_json`
   names the language in a form a client can read.** `rmlx transcribe
   --language xx` was decoded as English with no error. It now stops before the

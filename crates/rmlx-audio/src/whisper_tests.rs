@@ -8,11 +8,11 @@
 //! parsing logic, and weight-map helpers.
 
 use super::{DecodeFilters, TextDecoder, WhisperConfig, WhisperError};
-use crate::npz::{extract_npy_dtype, extract_npy_shape, WeightMap};
+use crate::npz::{extract_npy_shape, WeightMap};
 use crate::tokenizer::{
     N_VOCAB, TOK_EN, TOK_EOT, TOK_NO_TIMESTAMPS, TOK_SOT, TOK_TIMESTAMP_BEGIN, TOK_TRANSCRIBE,
 };
-use rmlx_mlx::{Array, Device, Dtype};
+use rmlx_mlx::{Array, Device};
 
 fn fresh_logits() -> Vec<f32> {
     // All zeros so we can see exactly which entries get masked to -inf.
@@ -226,22 +226,6 @@ fn the_local_large_v3_config_loads() {
     };
     let cfg = WhisperConfig::from_json(&json).expect("the large-v3 config must load");
     assert_eq!(cfg.n_vocab, 51_866);
-}
-
-/// NPY dtype extraction for f2 (float16).
-#[test]
-fn npy_dtype_f2() {
-    let header = "{'descr': '<f2', 'fortran_order': False, 'shape': (1280, 1280), }";
-    let dtype = extract_npy_dtype(header);
-    assert_eq!(dtype, Some(Dtype::F16));
-}
-
-/// NPY dtype extraction for f4 (float32).
-#[test]
-fn npy_dtype_f4() {
-    let header = "{'descr': '<f4', 'fortran_order': False, 'shape': (100,), }";
-    let dtype = extract_npy_dtype(header);
-    assert_eq!(dtype, Some(Dtype::F32));
 }
 
 /// NPY shape extraction for 2D array.

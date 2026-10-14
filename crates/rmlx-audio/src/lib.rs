@@ -60,6 +60,9 @@ pub mod vad;
 pub mod wav;
 pub mod whisper;
 
+#[cfg(test)]
+mod test_events;
+
 pub use transcribe::{
     render, OutputFormat, Segment, TranscribeOptions, Transcriber, Transcription,
 };

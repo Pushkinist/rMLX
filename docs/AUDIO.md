@@ -44,6 +44,38 @@ ids from `tokenizer.json` would let them load; that is not built.
 The check reads ids and sizes only. A model or a tokenizer that states the
 large-v3 ids but was trained on another vocabulary is not detected.
 
+**Alignment heads.** The `alignment_heads` entry of `weights.npz` names the
+decoder cross-attention heads that line text tokens up with audio frames, as
+int32 or int64 (layer, head) pairs of shape `(N, 2)` (the large-v3 snapshot:
+`<i8`, shape `(10, 2)`). `WhisperModel::alignment_heads` gives the pairs. It
+gives `None` for a snapshot with no entry, and for an entry that the reader
+reads but that is not usable pairs: a dtype other than int32 or int64 (`<u4`,
+float, a one-byte mask), another shape, a negative value, or a layer or head
+outside the decoder. The load warns of that once, with the dtype and shape or
+the pair, and goes on. An entry that the reader cannot read is an error of the
+archive (next paragraph). Nothing reads the pairs yet; word timestamps are not
+built.
+
+**Members the reader reads.** A member whose name ends in `.npy` is a weight,
+and it is read or the load fails. A directory member (its name ends in `/`) is
+skipped. Any other member, such as a text file or a `__MACOSX/` member of a zip
+tool, is not a weight: it is skipped with one debug event that names it, and it
+has no key. So `weights.npz` loads whole or not at all.
+
+**Errors of the archive.** Each of these fails the load with an error that
+names the entry and the cause:
+- a dtype that the reader does not know, or a multi-byte dtype with the `>`
+  mark; the marks `<`, `=` and `|` read as little-endian (`=` is native order,
+  little-endian on Apple Silicon), and a one-byte dtype loads with any mark;
+- `'fortran_order': True`, a shape that does not parse, a byte count that
+  overflows, a dimension beyond int32, data shorter than the shape, or an int64
+  value outside int32;
+- a `.npy` member of no bytes or with a bad header;
+- an unsupported compression method, a deflate stream that fails or that is
+  larger than its declared size, a record that is truncated or has a bad
+  signature, a member name that is not UTF-8, and a size or offset that
+  overflows.
+
 ### Pipeline
 
 `rmlx_audio::transcribe::Transcriber` is the one transcription path. The
@@ -341,7 +373,7 @@ multipart form of the OpenAI reference (`CreateTranscriptionRequest`);
 | `language` | `auto` | An ISO code or an English name, in any case, or `auto` to detect it on the first window that is decoded (see "Language forms" and "Language detection"). Anything else is 422. |
 | `response_format` | `json` | `json`, `text`, `verbose_json`, `srt` or `vtt`. Anything else, `diarized_json` included, is 422. |
 | `temperature` | `0.0` | A non-finite or negative value is 422, and so is a value above 0 and below `1e-6`: the sampler divides a logit by the temperature, and the result is not finite for a smaller one. Any other value is the temperature of the first decode of each window (see "Window decision"). |
-| `timestamp_granularities[]` | `segment` | `segment` is taken: every response is timed per segment. `word` is 422: word timestamps need the alignment heads and a DTW pass, which are not built. The name without `[]` is read the same way. |
+| `timestamp_granularities[]` | `segment` | `segment` is taken: every response is timed per segment. `word` is 422: word timestamps need a DTW pass over the alignment heads, which is not built. The name without `[]` is read the same way. |
 | `stream` | `false` | Read in any case. `false`, `0` or empty is taken. `true` or `1` is 422: the transcription is sent whole when it ends. Any other value is 422. |
 | `prompt` | — | Taken and ignored. The decoder's prompt is the previous window's text only. |
 | any other | — | Taken and ignored (`include[]`, `chunking_strategy`, …). |

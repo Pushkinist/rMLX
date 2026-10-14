@@ -40,6 +40,8 @@
 //!    `a_window_that_needs_a_fallback_is_decoded_again_and_repeats` holds the
 //!    temperature fallback: a spoken repetition is decoded again above
 //!    temperature 0, and a second run gives the same tokens.
+//!    `the_large_v3_load_holds_ten_alignment_heads` holds that a load keeps the
+//!    ten alignment heads of the snapshot.
 //!
 //! 2. `long_form_regression` — scans the gitignored fixtures dir
 //!    (`crates/rmlx-audio/tests/fixtures/`) for any `*.{m4a,wav,mp3,…}` paired
@@ -393,6 +395,38 @@ fn two_sentence_clip_is_two_segments() {
         "filler after the speech: {:?}",
         r.text
     );
+}
+
+/// The (layer, head) pairs of the `alignment_heads` entry of the large-v3 snapshot.
+const LARGE_V3_ALIGNMENT_HEADS: [(usize, usize); 10] = [
+    (7, 0),
+    (10, 17),
+    (12, 18),
+    (13, 12),
+    (16, 1),
+    (17, 14),
+    (19, 11),
+    (21, 4),
+    (24, 1),
+    (25, 6),
+];
+
+/// A load of the large-v3 snapshot holds the ten alignment heads of its entry.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test the_large_v3_load_holds_ten_alignment_heads -- --ignored --test-threads=1"]
+fn the_large_v3_load_holds_ten_alignment_heads() {
+    let Some((model_path, _)) = whisper_paths() else {
+        eprintln!("SKIP the_large_v3_load_holds_ten_alignment_heads: whisper snapshot not present");
+        return;
+    };
+    let model = WhisperModel::load(&model_path).expect("load whisper model");
+
+    assert_eq!(model.alignment_heads(), Some(&LARGE_V3_ALIGNMENT_HEADS[..]));
+
+    // The encode puts this test under the GPU gate: a CPU test would load the
+    // snapshot in every `make test`. Its output is not what the test checks.
+    let window = vec![vec![0.0_f32; model.cfg.n_mels]; 3000];
+    model.encode_mel(&window, Device::Gpu).expect("encode");
 }
 
 /// One full window of digital silence gives no segment and no text. The

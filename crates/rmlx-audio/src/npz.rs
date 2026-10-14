@@ -43,14 +43,14 @@
 //!
 //! - Method 0 (Stored): verbatim copy.
 //! - Method 8 (Deflate): decompress with `miniz_oxide`.
-//! - Other methods: skip with a warning.
+//! - Other methods: an error that names the entry.
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use rmlx_mlx::{Array, Dtype};
 use thiserror::Error;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, info, instrument};
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -141,7 +141,7 @@ pub fn parse_npz(data: &[u8]) -> Result<WeightMap, NpzError> {
     let mut map = WeightMap::new();
 
     for entry_idx in 0..total_entries {
-        if pos + 46 > data.len() {
+        if end_of(pos, 46, "central directory entry").map_err(NpzError::Zip)? > data.len() {
             return Err(NpzError::Zip(format!(
                 "central directory entry {entry_idx}: truncated at offset {pos}"
             )));
@@ -153,8 +153,9 @@ pub fn parse_npz(data: &[u8]) -> Result<WeightMap, NpzError> {
         )]
         let sig = u32_le(&data[pos..pos + 4]);
         if sig != SIG_CENTRAL {
-            // Hit end-of-central-directory or padding; stop.
-            break;
+            return Err(NpzError::Zip(format!(
+                "central directory entry {entry_idx}: bad signature {sig:#010x} at offset {pos}"
+            )));
         }
 
         // All offsets pos+10..pos+46 are within bounds: checked pos + 46 <= data.len() above.
@@ -209,10 +210,9 @@ pub fn parse_npz(data: &[u8]) -> Result<WeightMap, NpzError> {
             reason = "fname_start + fname_len = extra_start, both bounded by entry_end <= data.len()"
         )]
         let fname_bytes = &data[fname_start..extra_start];
-        let fname = std::str::from_utf8(fname_bytes)
-            .map_err(|_| NpzError::Zip(format!("entry {entry_idx}: filename is not valid UTF-8")))?
-            .trim_end_matches(".npy")
-            .to_owned();
+        let member = std::str::from_utf8(fname_bytes).map_err(|_| {
+            NpzError::Zip(format!("entry {entry_idx}: filename is not valid UTF-8"))
+        })?;
 
         // 3. Parse ZIP64 extra field (if present) from central directory.
         #[allow(
@@ -228,40 +228,32 @@ pub fn parse_npz(data: &[u8]) -> Result<WeightMap, NpzError> {
 
         pos = entry_end;
 
-        // Skip directory entries and empty placeholder entries.
-        if comp_size == 0 && uncomp_size == 0 {
+        if member.ends_with('/') {
             continue;
         }
-        if fname.ends_with('/') {
+        let Some(fname) = member.strip_suffix(".npy") else {
+            debug!(member, "skipping a member that is not an .npy file");
             continue;
-        }
-
-        // 4. Read compressed data from local header.
-        let raw = match read_local_entry(data, local_hdr_offset, comp_size, comp_method) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(entry = fname, error = %e, "skipping unreadable NPZ entry");
-                continue;
-            }
         };
 
-        if fname.is_empty() {
-            continue;
-        }
+        // 4. Read compressed data from local header.
+        let raw = read_local_entry(data, local_hdr_offset, comp_size, uncomp_size, comp_method)
+            .map_err(|cause| NpzError::Zip(format!("entry {fname}: {cause}")))?;
 
         // 5. Parse the .npy payload.
-        match parse_npy_array(&fname, &raw) {
-            Ok(arr) => {
-                map.insert(fname, arr);
-            }
-            Err(e) => {
-                warn!(error = %e, "skipping npy entry");
-            }
-        }
+        let array = parse_npy_array(fname, &raw)?;
+        map.insert(fname.to_owned(), array);
     }
 
     info!(n_weights = map.len(), "NPZ loaded via central directory");
     Ok(map)
+}
+
+/// `base + len` for an offset or a size that the archive states; an overflow
+/// is a corrupt archive.
+fn end_of(base: usize, len: usize, what: &str) -> Result<usize, String> {
+    base.checked_add(len)
+        .ok_or_else(|| format!("{what}: offset {base:#x} + {len} overflows"))
 }
 
 // ── EOCD locator ─────────────────────────────────────────────────────────────
@@ -344,7 +336,7 @@ fn read_eocd64(data: &[u8], eocd_pos: usize) -> Result<(usize, usize), NpzError>
     )]
     let eocd64_offset = u64_le(&data[loc_pos + 8..loc_pos + 16]) as usize;
 
-    if eocd64_offset + 56 > data.len() {
+    if end_of(eocd64_offset, 56, "ZIP64 EOCD record").map_err(NpzError::Zip)? > data.len() {
         return Err(NpzError::Zip(format!(
             "ZIP64 EOCD64 at {eocd64_offset:#x}: truncated"
         )));
@@ -487,17 +479,18 @@ fn parse_zip64_extra(
 /// Read and decompress a single entry from the local header at `offset`.
 ///
 /// Uses `comp_size` from the **central directory** (more reliable than the local
-/// header in ZIP64 archives where local sizes may be `0xFFFFFFFF`).
+/// header in ZIP64 archives where local sizes may be `0xFFFFFFFF`). A deflate
+/// stream that inflates to more than `uncomp_size` bytes is an error.
 fn read_local_entry(
     data: &[u8],
     offset: usize,
     comp_size: usize,
+    uncomp_size: usize,
     comp_method: u16,
-) -> Result<Vec<u8>, NpzError> {
-    if offset + 30 > data.len() {
-        return Err(NpzError::Zip(format!(
-            "local header at {offset:#x}: truncated"
-        )));
+) -> Result<Vec<u8>, String> {
+    let header_end = end_of(offset, 30, "local header")?;
+    if header_end > data.len() {
+        return Err(format!("local header at {offset:#x}: truncated"));
     }
 
     #[allow(
@@ -506,9 +499,9 @@ fn read_local_entry(
     )]
     let sig = u32_le(&data[offset..offset + 4]);
     if sig != SIG_LOCAL {
-        return Err(NpzError::Zip(format!(
+        return Err(format!(
             "local header at {offset:#x}: bad signature {sig:#010x}"
-        )));
+        ));
     }
 
     #[allow(
@@ -521,13 +514,13 @@ fn read_local_entry(
         reason = "offset + 30 <= data.len() checked above"
     )]
     let extra_len = u16_le(&data[offset + 28..offset + 30]) as usize;
-    let data_start = offset + 30 + fname_len + extra_len;
+    let data_start = header_end + fname_len + extra_len;
 
-    let data_end = data_start + comp_size;
+    let data_end = end_of(data_start, comp_size, "local entry data")?;
     if data_end > data.len() {
-        return Err(NpzError::Zip(format!(
+        return Err(format!(
             "local entry data at {data_start:#x}+{comp_size}: exceeds file size"
-        )));
+        ));
     }
 
     #[allow(
@@ -538,15 +531,10 @@ fn read_local_entry(
 
     match comp_method {
         0 => Ok(entry_data.to_vec()),
-        8 => miniz_oxide::inflate::decompress_to_vec(entry_data)
-            .map_err(|e| NpzError::Zip(format!("deflate decompress failed: {e:?}"))),
-        other => {
-            warn!(
-                method = other,
-                "unsupported ZIP compression method; skipping"
-            );
-            Ok(Vec::new())
-        }
+        8 => miniz_oxide::inflate::decompress_to_vec_with_limit(entry_data, uncomp_size).map_err(
+            |e| format!("deflate decompress failed (declared size {uncomp_size} bytes): {e}"),
+        ),
+        other => Err(format!("unsupported ZIP compression method {other}")),
     }
 }
 
@@ -555,7 +543,13 @@ fn read_local_entry(
 /// Parse a `.npy` byte slice into an [`Array`].
 ///
 /// Supports NPY format version 1.0 (2-byte header length) and 2.0+ (4-byte
-/// header length). Only `f2` (float16) and `f4` (float32) dtypes are accepted.
+/// header length). The dtypes are `f2`, `f4`, `b1`, `u1`, `i1` (as `U8`), `u4`,
+/// `i4`, and `i8` (int64), which is stored as `I32`. Everything else is an
+/// error that names the entry: another dtype, a multi-byte dtype with the `>`
+/// mark (the marks `<`, `=` and `|` read as little-endian; `=` is native order,
+/// little-endian on Apple Silicon), `'fortran_order': True`, a shape that does
+/// not parse or whose byte count overflows, a dimension beyond int32, data
+/// shorter than the shape, and an `i8` value that int32 cannot hold.
 #[allow(
     clippy::indexing_slicing,
     reason = "bounds explicitly checked via offset arithmetic before each access"
@@ -598,52 +592,108 @@ pub fn parse_npy_array(name: &str, data: &[u8]) -> Result<Array, NpzError> {
     let header_str = std::str::from_utf8(&data[header_start..header_end])
         .map_err(|_| npy_err("header is not valid UTF-8"))?;
 
-    let dtype = extract_npy_dtype(header_str).ok_or_else(|| npy_err("cannot parse dtype"))?;
     let shape = extract_npy_shape(header_str).ok_or_else(|| npy_err("cannot parse shape"))?;
-
-    let raw = &data[header_end..];
-    let n_elems: usize = shape.iter().product();
-    let elem_bytes = match dtype {
-        Dtype::U8 => 1,
-        Dtype::F16 => 2,
-        Dtype::F32 | Dtype::U32 | Dtype::I32 => 4,
-        Dtype::Bf16 => {
-            // extract_npy_dtype never yields Bf16, but the match must be total.
-            return Err(npy_err(&format!("unsupported dtype {dtype:?}")));
-        }
-    };
-    let needed = n_elems * elem_bytes;
-    if raw.len() < needed {
+    let (mark, code) = npy_descr(header_str).ok_or_else(|| npy_err("cannot parse dtype"))?;
+    if is_big_endian(mark, code) {
         return Err(npy_err(&format!(
-            "data truncated (need {needed}, have {})",
-            raw.len()
+            "big-endian dtype '>{code}' is not supported (byte order)"
         )));
     }
+    if is_fortran_order(header_str) {
+        return Err(npy_err(
+            "'fortran_order': True is not supported (column-major data)",
+        ));
+    }
+    let is_int64 = code == "i8";
+    let (dtype, elem_bytes) = if is_int64 {
+        (Dtype::I32, 8)
+    } else {
+        let dtype = dtype_of(code).ok_or_else(|| {
+            npy_err(&format!(
+                "unknown dtype '{}{code}'",
+                mark.map_or(String::new(), String::from)
+            ))
+        })?;
+        let width = match dtype {
+            Dtype::U8 => 1,
+            Dtype::F16 => 2,
+            Dtype::F32 | Dtype::U32 | Dtype::I32 => 4,
+            Dtype::Bf16 => return Err(npy_err(&format!("unsupported dtype {dtype:?}"))),
+        };
+        (dtype, width)
+    };
 
-    let shape_i32: Vec<i32> = shape.iter().map(|&s| s as i32).collect();
-    Array::from_bytes(&raw[..needed], &shape_i32, dtype).map_err(|e| NpzError::Mlx(e.to_string()))
+    let needed = shape
+        .iter()
+        .try_fold(elem_bytes, |bytes: usize, &dim| bytes.checked_mul(dim))
+        .ok_or_else(|| npy_err("shape is too large: its byte count overflows"))?;
+    let raw = &data[header_end..];
+    let bytes = raw.get(..needed).ok_or_else(|| {
+        npy_err(&format!(
+            "data truncated (need {needed}, have {})",
+            raw.len()
+        ))
+    })?;
+    let dims = shape
+        .iter()
+        .map(|&dim| i32::try_from(dim))
+        .collect::<Result<Vec<i32>, _>>()
+        .map_err(|_| npy_err("a dimension does not fit in int32"))?;
+
+    let array = if is_int64 {
+        let narrowed = int64_to_i32_bytes(bytes)
+            .map_err(|value| npy_err(&format!("int64 value {value} does not fit in int32")))?;
+        Array::from_bytes(&narrowed, &dims, dtype)
+    } else {
+        Array::from_bytes(bytes, &dims, dtype)
+    };
+    array.map_err(|e| NpzError::Mlx(e.to_string()))
 }
 
 // ── NPY header field extractors (pub for tests) ───────────────────────────────
 
-/// Extract the numpy dtype descriptor from a `.npy` header string.
-///
-/// Whisper `weights.npz` carries float weights (`f2`/`f4`) plus a small
-/// `alignment_heads` mask. That mask is stored as a NumPy boolean (`b1`) or
-/// small-int array; older parsers hard-errored on it with
-/// "cannot parse dtype". We map booleans / 1-byte ints to `U8` and 4-byte ints
-/// to `U32`/`I32` so the mask loads instead of aborting the whole archive.
-pub fn extract_npy_dtype(header: &str) -> Option<Dtype> {
+/// The byte-order mark (`<`, `>`, `=` or `|`, if the descriptor has one) and
+/// the type code of the dtype descriptor of a `.npy` header, as in
+/// `(Some('<'), "i8")` for `'<i8'`.
+fn npy_descr(header: &str) -> Option<(Option<char>, &str)> {
     let start = header.find("'descr'")?;
     let rest = &header[start + 7..];
     let rest = rest.trim_start_matches([' ', ':'].as_ref());
     let rest = rest.trim_start_matches(['\'', '"'].as_ref());
     let end = rest.find(['\'', '"']).unwrap_or(rest.len());
-    let s = rest[..end].trim_start_matches(['<', '>', '=', '|'].as_ref());
-    match s {
+    let descr = &rest[..end];
+    let mark = descr
+        .chars()
+        .next()
+        .filter(|c| matches!(c, '<' | '>' | '=' | '|'));
+    Some((
+        mark,
+        descr.trim_start_matches(['<', '>', '=', '|'].as_ref()),
+    ))
+}
+
+/// Whether the header says the data is stored column-major.
+fn is_fortran_order(header: &str) -> bool {
+    header.find("'fortran_order'").is_some_and(|start| {
+        header[start + 15..]
+            .trim_start_matches([' ', ':'].as_ref())
+            .starts_with("True")
+    })
+}
+
+/// A multi-byte dtype with the `>` mark. Byte order has no meaning for one
+/// byte (`b1`, `u1`, `i1`).
+fn is_big_endian(mark: Option<char>, code: &str) -> bool {
+    mark == Some('>') && !matches!(code, "b1" | "u1" | "i1")
+}
+
+/// The dtype that a type code stores as: `f2`, `f4`, the booleans and 1-byte
+/// ints (`b1`, `u1`, `i1`) as `U8`, and `u4` and `i4`. `i8` has no MLX dtype;
+/// [`parse_npy_array`] reads it as `I32`.
+fn dtype_of(code: &str) -> Option<Dtype> {
+    match code {
         "f2" => Some(Dtype::F16),
         "f4" => Some(Dtype::F32),
-        // boolean + 1-byte ints → U8 (alignment_heads mask).
         "b1" | "u1" | "i1" => Some(Dtype::U8),
         "u4" => Some(Dtype::U32),
         "i4" => Some(Dtype::I32),
@@ -651,18 +701,33 @@ pub fn extract_npy_dtype(header: &str) -> Option<Dtype> {
     }
 }
 
-/// Extract the shape tuple from a `.npy` header string.
+/// Little-endian int64 `bytes` as little-endian int32. The error is the first
+/// value that int32 cannot hold.
+fn int64_to_i32_bytes(bytes: &[u8]) -> Result<Vec<u8>, i64> {
+    let mut narrowed = Vec::with_capacity(bytes.len() / 2);
+    for chunk in bytes.chunks_exact(8) {
+        let mut word = [0_u8; 8];
+        word.copy_from_slice(chunk);
+        let value = i64::from_le_bytes(word);
+        let small = i32::try_from(value).map_err(|_| value)?;
+        narrowed.extend_from_slice(&small.to_le_bytes());
+    }
+    Ok(narrowed)
+}
+
+/// Extract the shape tuple from a `.npy` header string. `None` when a
+/// dimension is not a non-negative integer that fits in `usize`.
 pub fn extract_npy_shape(header: &str) -> Option<Vec<usize>> {
     let start = header.find("'shape'")?;
     let rest = &header[start + 7..];
     let p0 = rest.find('(')?;
     let p1 = rest.find(')')?;
     let inner = &rest[p0 + 1..p1];
-    let dims: Vec<usize> = inner
-        .split(',')
-        .filter_map(|s| s.trim().parse::<usize>().ok())
-        .collect();
-    Some(dims)
+    let fields: Vec<&str> = inner.split(',').map(str::trim).collect();
+    // `(n,)` ends in an empty field; any other empty field is a bad dimension.
+    let (last, before) = fields.split_last()?;
+    let dims = if last.is_empty() { before } else { &fields };
+    dims.iter().map(|field| field.parse().ok()).collect()
 }
 
 // ── Little-endian read helpers ────────────────────────────────────────────────

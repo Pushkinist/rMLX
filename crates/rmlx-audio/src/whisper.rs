@@ -65,6 +65,7 @@ use tracing::{debug, info, instrument, warn};
 use crate::mel::N_FRAMES;
 use crate::npz::WeightMap;
 use crate::tokenizer::{N_VOCAB, TOK_EOT, TOK_NO_TIMESTAMPS, TOK_TIMESTAMP_BEGIN};
+use alignment_heads::read_alignment_heads;
 use decode_loop::{decode_loop, window_start, writes_at_most, Decoded, WindowStart};
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -175,6 +176,9 @@ impl WhisperConfig {
 }
 
 // ── Weight map ────────────────────────────────────────────────────────────────
+
+/// The weight file of a Whisper snapshot.
+const WEIGHTS_FILE: &str = "weights.npz";
 
 /// Load all weights from a `.npz` file into a weight map.
 ///
@@ -890,8 +894,7 @@ fn build_causal_mask(n_ctx: usize) -> Result<Array, WhisperError> {
 /// Loaded Whisper model (encoder + decoder).
 #[allow(
     missing_debug_implementations,
-    clippy::exhaustive_structs,
-    reason = "WhisperModel fields are the encoder, decoder, and config — the complete struct for this model type"
+    reason = "AudioEncoder and TextDecoder do not implement Debug"
 )]
 pub struct WhisperModel {
     /// Audio encoder.
@@ -900,9 +903,19 @@ pub struct WhisperModel {
     pub decoder: TextDecoder,
     /// Model configuration.
     pub cfg: WhisperConfig,
+    alignment_heads: Option<Vec<(usize, usize)>>,
 }
 
 impl WhisperModel {
+    /// The decoder cross-attention heads that line text tokens up with audio
+    /// frames, as (layer, head) pairs. `None` when the snapshot has no
+    /// `alignment_heads` entry, or when the entry is not usable pairs (the load
+    /// warns of that). Nothing reads them yet.
+    #[must_use]
+    pub fn alignment_heads(&self) -> Option<&[(usize, usize)]> {
+        self.alignment_heads.as_deref()
+    }
+
     /// Load a Whisper model from a snapshot directory.
     ///
     /// Expects `config.json` and `weights.npz` in the directory. A config that
@@ -925,17 +938,19 @@ impl WhisperModel {
             n_vocab = cfg.n_vocab,
             "loading Whisper"
         );
-        let weights_path = path.join("weights.npz");
+        let weights_path = path.join(WEIGHTS_FILE);
         let weights_size = std::fs::metadata(&weights_path).map_or(0, |m| m.len());
         tracing::debug!(stage = "weights", path = %weights_path.display(), bytes = weights_size, "loading Whisper weights.npz");
         let weights = load_npz(&weights_path)?;
 
         let encoder = AudioEncoder::load(&weights, &cfg)?;
         let decoder = TextDecoder::load(&weights, &cfg)?;
+        let alignment_heads = read_alignment_heads(&weights, &cfg)?;
         Ok(Self {
             encoder,
             decoder,
             cfg,
+            alignment_heads,
         })
     }
 
@@ -1146,6 +1161,8 @@ fn logits_to_f32(logits: &Array, n_vocab: usize, device: Device) -> Result<Vec<f
 }
 
 pub(crate) mod decode_loop;
+
+mod alignment_heads;
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
