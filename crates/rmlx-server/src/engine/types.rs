@@ -402,7 +402,7 @@ pub struct GenerationRequest {
     /// The FIFO admission guard for this request.
     ///
     /// The route handler acquires the single `AppState::gpu_queue` permit
-    /// (FIFO order) and an RAII pending-count decrement, packs both into a
+    /// (FIFO order) and counts the request in `gpu_pending`, packs both into a
     /// [`GpuAdmission`], and moves it here. `Generator::generate` moves the
     /// whole `GenerationRequest` into its `spawn_blocking` closure, so the
     /// permit lives for the entire decode and is released — and
@@ -445,37 +445,78 @@ pub struct GenerationRequest {
     pub image_max_tokens: Option<usize>,
 }
 
-/// RAII admission guard moved into [`GenerationRequest`].
+/// One count in the in-flight gauge `AppState::gpu_pending`.
 ///
-/// Holds the single owned FIFO permit from `AppState::gpu_queue` plus a
-/// clone of `AppState::gpu_pending`. Dropping it (when the spawned decode
-/// task finishes, OR if the request is dropped before generation starts)
-/// releases the permit so the next FIFO waiter is admitted AND decrements
-/// the in-flight gauge — so both the success and the error/timeout/drop
-/// paths balance the `fetch_add` performed at admission.
+/// The count is added when the slot is reserved and given back when the slot
+/// drops, so every exit path balances it. This is the only place that adds
+/// to or subtracts from the gauge.
 #[derive(Debug)]
-#[allow(
-    clippy::exhaustive_structs,
-    reason = "internal RAII type — field set is the complete admission contract; adding a field requires reviewing admit_request and Drop"
-)]
-pub struct GpuAdmission {
-    _permit: tokio::sync::OwnedSemaphorePermit,
+struct PendingSlot {
     pending: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-impl GpuAdmission {
-    /// Wrap an acquired owned permit + the shared pending counter. The
-    /// caller must have already `fetch_add`ed `pending` (at the depth check)
-    /// before constructing this; `Drop` performs the matching `fetch_sub`.
-    pub fn new(
-        permit: tokio::sync::OwnedSemaphorePermit,
-        pending: Arc<std::sync::atomic::AtomicUsize>,
-    ) -> Self {
-        Self {
-            _permit: permit,
-            pending,
-        }
+impl PendingSlot {
+    /// Count one more request unless the gauge has reached `max_queue_depth`
+    /// (`0` = no bound). The check and the add are one atomic step, so
+    /// requests that arrive together cannot pass the bound. Returns the slot
+    /// and the gauge value with this request included.
+    fn reserve(
+        pending: &Arc<std::sync::atomic::AtomicUsize>,
+        max_queue_depth: usize,
+    ) -> Option<(Self, u64)> {
+        let before = pending
+            .try_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |n| {
+                    n.checked_add(1)
+                        .filter(|_| max_queue_depth == 0 || n < max_queue_depth)
+                },
+            )
+            .ok()?;
+        let slot = Self {
+            pending: Arc::clone(pending),
+        };
+        Some((slot, before as u64 + 1))
     }
+}
+
+impl Drop for PendingSlot {
+    fn drop(&mut self) {
+        // saturating: the gauge is a pub field of AppState, so a store from
+        // outside the slot can leave it below the slots held. fetch_sub on
+        // usize would wrap.
+        let prev = self
+            .pending
+            .try_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |v| Some(v.saturating_sub(1)),
+            )
+            .unwrap_or(0);
+        tracing::trace!(
+            gpu_pending_after = prev.saturating_sub(1),
+            "pending slot dropped — gpu_pending decremented"
+        );
+    }
+}
+
+/// RAII admission guard moved into [`GenerationRequest`].
+///
+/// Holds the single owned FIFO permit from `AppState::gpu_queue` and the
+/// request's count in `AppState::gpu_pending`. Dropping it (when the spawned
+/// decode task finishes, OR if the request is dropped before generation
+/// starts) gives the count back and releases the permit so the next FIFO
+/// waiter is admitted.
+#[derive(Debug)]
+#[allow(
+    clippy::exhaustive_structs,
+    reason = "internal RAII type — field set is the complete admission contract; adding a field requires reviewing admit_request"
+)]
+pub struct GpuAdmission {
+    // Declared first so the count is given back before the permit is released.
+    _slot: PendingSlot,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 /// Result of an admission attempt.
@@ -508,62 +549,44 @@ pub enum Admission {
 ///
 /// 1. If `max_queue_depth > 0` and `gpu_pending >= max_queue_depth`, reject
 ///    the request immediately.
-/// 2. Otherwise `fetch_add(1)` the in-flight gauge, then `acquire_owned`
-///    the GPU semaphore.
+/// 2. Otherwise count the request in the in-flight gauge, then `acquire_owned`
+///    the GPU semaphore. Step 1 and the count are one atomic step.
 ///
-/// The semaphore is never closed in normal operation; `acquire_owned`
-/// only errors if it were closed, in which case we treat it as `QueueFull`
-/// (the decrement is handled by an inline guard so the gauge stays
-/// balanced).
+/// The count is held by a [`PendingSlot`] from before the wait, so a request
+/// future dropped during the wait (timeout, closed connection, unwind) gives
+/// it back. The semaphore is never closed in normal operation; `acquire_owned`
+/// only errors if it were closed, in which case we treat it as `QueueFull`.
+// cancel-safe: the count is held by a `PendingSlot` from before the wait; a
+// drop at the wait gives it back.
 pub async fn admit_request(
     queue: &Arc<tokio::sync::Semaphore>,
     pending: &Arc<std::sync::atomic::AtomicUsize>,
     max_queue_depth: usize,
 ) -> Admission {
-    use std::sync::atomic::Ordering;
-    if max_queue_depth > 0 && pending.load(Ordering::Acquire) >= max_queue_depth {
+    // Reserve a slot in the in-flight gauge BEFORE awaiting the permit so
+    // concurrent depth checks see this request. `depth` = post-increment
+    // value (this request inclusive).
+    let Some((slot, depth)) = PendingSlot::reserve(pending, max_queue_depth) else {
         tracing::warn!(
             max_queue_depth,
             "admission rejected — server queue full (429)"
         );
         return Admission::QueueFull;
-    }
-    // Reserve a slot in the in-flight gauge BEFORE awaiting the permit so
-    // concurrent depth checks see this request. `depth` = post-increment
-    // value (this request inclusive).
-    let depth = pending.fetch_add(1, Ordering::AcqRel) as u64 + 1;
+    };
     let t_wait = Instant::now();
     if let Ok(permit) = Arc::clone(queue).acquire_owned().await {
         let wait_ms = t_wait.elapsed().as_millis() as u64;
         Admission::Admitted {
-            guard: GpuAdmission::new(permit, Arc::clone(pending)),
+            guard: GpuAdmission {
+                _slot: slot,
+                _permit: permit,
+            },
             depth,
             wait_ms,
         }
     } else {
-        // Semaphore closed (shutdown). Balance the fetch_add and reject.
-        pending.fetch_sub(1, Ordering::AcqRel);
         tracing::warn!("gpu_queue semaphore closed during acquire — rejecting");
         Admission::QueueFull
-    }
-}
-
-impl Drop for GpuAdmission {
-    fn drop(&mut self) {
-        // saturating: never wrap below zero even if a future refactor
-        // double-drops. fetch_sub on usize would wrap; guard explicitly.
-        let prev = self
-            .pending
-            .try_update(
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-                |v| Some(v.saturating_sub(1)),
-            )
-            .unwrap_or(0);
-        tracing::trace!(
-            gpu_pending_after = prev.saturating_sub(1),
-            "GpuAdmission dropped — permit released, pending decremented"
-        );
     }
 }
 

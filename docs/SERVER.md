@@ -51,8 +51,12 @@ Metal context each.
 `engine::admit_request` refuses a request with HTTP 429 `rate_limit_error`
 when `max_queue_depth` is non-zero and `gpu_pending` has reached it. Otherwise
 it counts the request and waits for the permit. `--max-queue-depth` defaults
-to 64. An RAII guard releases the permit on every exit path: success, error,
-timeout and stream abort. Chat, messages and audio requests pass this gate.
+to 64. An RAII slot holds the request's count from before the wait for the
+permit. The slot gives the count back on every exit path: success, error,
+timeout and stream abort, and also a closed connection or a closed queue while
+the request still waits for the permit. An RAII guard holds the permit from the
+moment the request gets it and releases it when the request ends. Chat,
+messages and audio requests pass this gate.
 `/v1/embeddings` does not: it never returns 429, and it waits instead on the
 `gpu_gate` mutex that a running generation also holds.
 

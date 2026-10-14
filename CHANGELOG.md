@@ -129,6 +129,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A request that times out, or whose client closes the connection, while it
+  waits for the GPU no longer keeps a place in the queue.** The server counted
+  a request in the queue depth (`in_flight` of `/v1/metrics`) before it waited
+  for the GPU permit, and gave the count back only when the request had the
+  permit. A request that left the wait early (the 408 of
+  `X-Request-Timeout-Seconds` or of the server cap, a closed connection, or a
+  panic) kept its count. After `--max-queue-depth` such requests (64 by
+  default, as low as 1 under `--adaptive-admission`), every chat, messages and
+  audio request got 429 `rate_limit_error` until the server restarted. The count is now given back
+  on every exit path. The depth check and the count are also one atomic step:
+  requests that arrived together one place below `--max-queue-depth` could all
+  pass the check and take the count above the bound.
 - **A language that Whisper does not know is an error, and `verbose_json`
   names the language in a form a client can read.** `rmlx transcribe
   --language xx` was decoded as English with no error. It now stops before the

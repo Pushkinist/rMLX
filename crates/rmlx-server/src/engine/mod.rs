@@ -35,6 +35,8 @@ pub(crate) mod think;
 pub(crate) mod types;
 
 #[cfg(test)]
+mod admission_tests;
+#[cfg(test)]
 mod tests;
 
 // ── Public API surface (frozen — matches lib.rs pub use) ─────────────────────
