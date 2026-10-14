@@ -131,9 +131,10 @@ pub(crate) fn audio_secs_budget(
 /// The 16 kHz mono samples of one `input_audio` part (bare base64, or a
 /// `data:audio/...;base64,` URL) and the clip's own sample rate. The decode
 /// refuses more than `max_secs` of audio, before the decode when the file
-/// declares its length, and asks `cancelled` before each packet. A
-/// `max_secs` under `MAX_AUDIO_SECS` is the context budget at
-/// `samples_per_token` samples a token, and a refusal says so.
+/// declares its length. It asks `cancelled` before each packet and returns
+/// [`Error::Cancelled`] when the answer is yes. A `max_secs` under
+/// `MAX_AUDIO_SECS` is the context budget at `samples_per_token` samples a
+/// token, and a refusal says so.
 pub(crate) fn decode_input_audio(
     audio_b64: &str,
     max_secs: u32,
@@ -154,6 +155,9 @@ pub(crate) fn decode_input_audio(
         cancelled,
     )
     .map_err(|e| {
+        if matches!(e, rmlx_audio::wav::WavError::Cancelled { .. }) {
+            return Error::Cancelled;
+        }
         let over_context_budget = max_secs < rmlx_audio::wav::MAX_AUDIO_SECS
             && matches!(e, rmlx_audio::wav::WavError::TooLong { .. });
         if over_context_budget {
@@ -261,7 +265,7 @@ pub(crate) fn build_audio_prompt(
         .map_err(|e| Error::Other(format!("input_audio mel extraction failed: {e}")))?;
     drop(samples);
     if cancelled() {
-        return Err(input_audio_cancelled());
+        return Err(Error::Cancelled);
     }
     let t_mel = mel.len();
     if t_mel == 0 {
@@ -375,7 +379,7 @@ fn build_unified_audio_prompt(
         ));
     }
     if cancelled() {
-        return Err(input_audio_cancelled());
+        return Err(Error::Cancelled);
     }
 
     tracing::info!(
@@ -419,12 +423,6 @@ fn build_unified_audio_prompt(
         device,
     )?;
     Ok((aug_ids, embeds, masked_ids))
-}
-
-/// The error of an `input_audio` preparation stopped because the client is
-/// gone.
-fn input_audio_cancelled() -> Error {
-    Error::Other("input_audio preparation cancelled: the client is gone".to_owned())
 }
 
 #[cfg(test)]

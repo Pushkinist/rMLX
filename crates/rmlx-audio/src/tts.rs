@@ -34,8 +34,10 @@
 
 use std::borrow::Cow;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
+use rmlx_core::cancel::ensure_not_cancelled;
 use rmlx_loader::{load_shard_index, view, ShardSet};
 use rmlx_mlx::{
     add, concatenate, conv1d, conv_transpose1d, cos, divide, exp, gelu, matmul, maximum,
@@ -71,11 +73,18 @@ pub enum TtsError {
     /// A [`TokenPick`] returned an id that the mask or the vocabulary excludes.
     #[error("token pick error: {0}")]
     Pick(String),
+    /// The request is gone: the synthesis stopped at the stop flag. Not a failure.
+    #[error("the synthesis was cancelled")]
+    Cancelled,
 }
 
 impl From<rmlx_core::error::Error> for TtsError {
     fn from(e: rmlx_core::error::Error) -> Self {
-        Self::Mlx(e.to_string())
+        if matches!(e, rmlx_core::error::Error::Cancelled) {
+            Self::Cancelled
+        } else {
+            Self::Mlx(e.to_string())
+        }
     }
 }
 
@@ -1035,21 +1044,27 @@ fn settle(x: Array) -> Result<Array, TtsError> {
 /// precede it, and its first samples, the context's, are dropped. `window`
 /// maps `[1, 16, W]` codes to a multiple of `W` samples. A sequence of at most
 /// one chunk is one pass, as a decode of the whole sequence. The MLX buffer
-/// cache is released after every pass, and after a failed one.
+/// cache is released after every pass, and after a failed or stopped one.
+/// `cancel` is read before each pass; a set flag ends the decode with
+/// [`TtsError::Cancelled`]. A pass has no read inside it, so a stop that
+/// arrives during a pass waits for that pass: at most [`DECODE_CHUNK_FRAMES`]
+/// frames plus [`DECODE_LEFT_CONTEXT_FRAMES`] of left context.
 ///
 /// No frame is an error, as the decoder's first convolution refuses it.
 /// `synthesize` never reaches it: the end token is masked before `MIN_FRAMES`.
 fn decode_in_chunks(
     codes: &Array,
     d: Device,
+    cancel: &AtomicBool,
     window: impl FnMut(&Array) -> Result<Vec<f32>, TtsError>,
 ) -> Result<Vec<f32>, TtsError> {
-    decode_passes(codes, d, window).inspect_err(|_| release_buffer_cache())
+    decode_passes(codes, d, cancel, window).inspect_err(|_| release_buffer_cache())
 }
 
 fn decode_passes(
     codes: &Array,
     d: Device,
+    cancel: &AtomicBool,
     mut window: impl FnMut(&Array) -> Result<Vec<f32>, TtsError>,
 ) -> Result<Vec<f32>, TtsError> {
     let groups = codes.shape()[1];
@@ -1062,6 +1077,7 @@ fn decode_passes(
     let mut samples = Vec::new();
     let mut start = 0;
     while start < total {
+        ensure_not_cancelled(cancel)?;
         let end = (start + DECODE_CHUNK_FRAMES).min(total);
         let context = start.min(DECODE_LEFT_CONTEXT_FRAMES);
         let first = (start - context) as i32;
@@ -1111,8 +1127,8 @@ pub(crate) struct CodecDecoder {
 impl CodecDecoder {
     /// Decode `codes: [1, 16, T]` (16 codec groups) to audio `[T * upsample]`.
     /// A long sequence is decoded in overlapping windows ([`decode_in_chunks`]).
-    fn decode(&self, codes: &Array, d: Device) -> Result<Vec<f32>, TtsError> {
-        decode_in_chunks(codes, d, |window| self.decode_window(window, d))
+    fn decode(&self, codes: &Array, d: Device, cancel: &AtomicBool) -> Result<Vec<f32>, TtsError> {
+        decode_in_chunks(codes, d, cancel, |window| self.decode_window(window, d))
     }
 
     /// Decode one window of `codes: [1, 16, W]` in one pass. Each stage is
@@ -2180,24 +2196,30 @@ fn release_frame_cache(reason: &'static str) {
 /// `step` returns its frame and whether a talker key/value buffer grew its
 /// capacity in it. A growth frees buffers of a size that no later frame asks
 /// for, so the MLX buffer cache is released after such a frame, and once when
-/// the loop ends, by the end token, the cap or an error.
+/// the loop ends, by the end token, the cap, an error or a stop.
+///
+/// `cancel` is read before each frame; a set flag ends the loop with
+/// [`TtsError::Cancelled`].
 ///
 /// `step` is dropped before that last release: the buffers it owns are freed
 /// into the cache first, and the release returns them with the rest.
 pub(crate) fn run_frames(
+    cancel: &AtomicBool,
     mut step: impl FnMut(usize) -> Result<(FrameStep, bool), TtsError>,
 ) -> Result<Frames, TtsError> {
-    let frames = frame_loop(&mut step);
+    let frames = frame_loop(cancel, &mut step);
     drop(step);
     release_frame_cache("end of the loop");
     frames
 }
 
 fn frame_loop(
+    cancel: &AtomicBool,
     step: &mut impl FnMut(usize) -> Result<(FrameStep, bool), TtsError>,
 ) -> Result<Frames, TtsError> {
     let mut codes = Vec::new();
     for index in 0..MAX_FRAMES {
+        ensure_not_cancelled(cancel)?;
         let (outcome, kv_grew) = step(index)?;
         match outcome {
             FrameStep::Frame(frame) => codes.push(frame),
@@ -2328,6 +2350,10 @@ pub struct Synthesis {
 ///
 /// The log carries the length of `text`, never the text, and `voice` only once
 /// it names a speaker of the model.
+///
+/// `cancel` is the stop flag of the request. The frame loop and the codec
+/// decode read it before each frame and each pass; a set flag ends the
+/// synthesis with [`TtsError::Cancelled`].
 #[allow(clippy::cognitive_complexity)]
 pub fn synthesize(
     text: &str,
@@ -2335,6 +2361,7 @@ pub fn synthesize(
     model: &mut TtsModel,
     tokenizer: &TtsTokenizer,
     pick: &mut dyn TokenPick,
+    cancel: &AtomicBool,
 ) -> Result<Synthesis, TtsError> {
     let span = info_span!("synthesize", voice = Empty, text_len = text.len());
     let _in_span = span.enter();
@@ -2497,7 +2524,7 @@ pub fn synthesize(
 
     // The closure owns the key/value slots and the other state of the loop,
     // so `run_frames` frees them before the codec decode starts.
-    let frames = run_frames(move |step| {
+    let frames = run_frames(cancel, move |step| {
         let seq_len = cur_input.shape()[1];
         // Every talker slot takes the same rows, so the first one stands for all.
         let capacity_before = talker_kv.first().map_or(0, |slot| slot.capacity);
@@ -2617,7 +2644,7 @@ pub fn synthesize(
     let codes_t = codes_3d.transpose(&[0, 2, 1], d)?;
 
     let t_dec = Instant::now();
-    let samples = codec.decode(&codes_t, d)?;
+    let samples = codec.decode(&codes_t, d, cancel)?;
     info!(
         samples = samples.len(),
         codec_ms = t_dec.elapsed().as_millis(),

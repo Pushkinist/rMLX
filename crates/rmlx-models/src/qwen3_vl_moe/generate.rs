@@ -39,6 +39,9 @@
 // shape moves — but it invalidates this arch's blocks on a policy change that
 // cannot affect them.
 
+use std::sync::atomic::AtomicBool;
+
+use rmlx_core::cancel::ensure_not_cancelled;
 use rmlx_core::error::Result;
 use rmlx_mlx::{Array, Device, Dtype};
 use rmlx_runtime::{count_nan_in_bytes, max_abs_from_bytes};
@@ -206,6 +209,7 @@ pub fn generate_greedy(
     rng: &mut Pcg32,
     penalty_cfg: &PenaltyConfig,
     token_history: &mut Vec<u32>,
+    cancel: &AtomicBool,
 ) -> Result<Vec<ProbeStep>> {
     tracing::info!(
         arch = "Qwen3VLMoeForConditionalGeneration",
@@ -281,6 +285,7 @@ pub fn generate_greedy(
             rng,
             penalty_cfg,
             token_history,
+            cancel,
         )?;
         let kv_bytes: u64 = kv.iter().map(|c| c.resident_bytes()).sum();
         model.kv_bytes.store(kv_bytes, post);
@@ -306,6 +311,7 @@ pub fn generate_greedy(
         prefill_chunk,
         device,
         "Qwen3VLMoeForConditionalGeneration",
+        cancel,
         |chunk, kv| model.forward_seq_with_cache(chunk, Some(kv), device),
     )?;
     guard_prefill_logits(&logits, prompt_ids.len())?;
@@ -396,6 +402,7 @@ pub fn generate_greedy(
         rng,
         penalty_cfg,
         token_history,
+        cancel,
     )?;
     // Store KV-cache bytes post-decode: the decode ring is resident now, so the
     // sample includes it on ring-backed codecs. Same lifecycle point as the
@@ -417,6 +424,9 @@ pub fn generate_greedy(
 /// Each step: token push, constraint advance, `step_fn` (which can force the
 /// next input), EOS break, `pick_token`. The step-0 piece is the same string on
 /// both paths (`piece_for`).
+///
+/// `cancel` is the stop flag of the request. Each pass reads it before it emits
+/// its token, and a stopped decode returns [`rmlx_core::Error::Cancelled`].
 #[allow(clippy::too_many_arguments)]
 fn decode_from(
     model: &Qwen3VlMoeText,
@@ -435,10 +445,13 @@ fn decode_from(
     rng: &mut Pcg32,
     penalty_cfg: &PenaltyConfig,
     token_history: &mut Vec<u32>,
+    cancel: &AtomicBool,
 ) -> Result<crate::decode_loop::PostDecode> {
     let mut next = first;
     let mut first_piece = first_piece;
     for _ in 0..n_tokens {
+        ensure_not_cancelled(cancel)?;
+
         token_history.push(next);
         let step = match first_piece.take() {
             Some(piece) => ProbeStep {
@@ -480,6 +493,10 @@ fn decode_from(
 /// passed as `vision`. The caller also supplies the augmented prompt ids
 /// (`aug_ids`) containing the image-token spans, and the per-image
 /// `image_grids` `(t,h,w)` (patch units) for the 3D M-RoPE index.
+///
+/// `cancel` is the stop flag of the request. Each prefill chunk reads it before
+/// its forward and each decode pass reads it before it emits its token. A
+/// stopped request returns [`rmlx_core::Error::Cancelled`].
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::indexing_slicing,
@@ -504,6 +521,7 @@ pub fn generate_image(
     rng: &mut Pcg32,
     penalty_cfg: &PenaltyConfig,
     token_history: &mut Vec<u32>,
+    cancel: &AtomicBool,
 ) -> Result<Vec<ProbeStep>> {
     tracing::info!(
         arch = "Qwen3VLMoeForConditionalGeneration",
@@ -558,7 +576,7 @@ pub fn generate_image(
     // Metal command buffer (the ~10s GPU watchdog). The chunk size comes from
     // the per-arch prefill-chunk table (512 for this plain-GQA MoE arch).
     let prefill_chunk = crate::prefill_chunk::prefill_chunk_for("qwen3_vl_moe");
-    let logits = model.forward_embeds_chunked(
+    let prefill = model.forward_embeds_chunked(
         &inputs_embeds,
         seq,
         &pos,
@@ -567,9 +585,23 @@ pub fn generate_image(
         prefill_chunk,
         &mut kv,
         device,
-    )?;
+        cancel,
+    );
+    // Every cache entered prefill above, so the exit sweep is owed on every
+    // outcome of the prefill, a stop included.
+    let mut exit_err = None;
     for c in &mut kv {
-        c.exit_prefill(device)?;
+        if let Err(e) = c.exit_prefill(device) {
+            tracing::error!(
+                error = %e,
+                "qwen3_vl_moe generate_image: exit_prefill quantization failed, aborting generation"
+            );
+            exit_err.get_or_insert(e);
+        }
+    }
+    let logits = prefill?;
+    if let Some(e) = exit_err {
+        return Err(e);
     }
 
     guard_prefill_logits(&logits, aug_ids.len())?;
@@ -601,6 +633,8 @@ pub fn generate_image(
 
     let mut next = first;
     for g in 0..n_tokens {
+        ensure_not_cancelled(cancel)?;
+
         let pos_val = decode_base + g as i64;
         token_history.push(next);
         let step = make_step(next, tokenizer);

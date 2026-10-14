@@ -24,6 +24,8 @@
 
 mod thread_boundary;
 
+use thread_boundary::{JINA_V4, TTS, TTS_CODEC, WHISPER, WHISPER_TOKENIZER};
+
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -38,16 +40,8 @@ use rmlx_models::jina_v4::{self, JinaV4};
 use rmlx_models::sampler::{select_token, Pcg32, PenaltyConfig, SamplerConfig};
 use rmlx_server::audio::transcribe_request;
 use thread_boundary::{
-    f32_bits, hand_over, snapshot, spoken_wav, Split, RED_PNG_BASE64, SPOKEN_TEXT, WHISPER,
-    WHISPER_TOKENIZER,
+    f32_bits, hand_over, snapshot, spoken_wav, Split, RED_PNG_BASE64, SPOKEN_TEXT,
 };
-
-const JINA_V4: (&str, &str) = ("jinaai__jina-embeddings-v4", "JinaEmbeddingsV4Model");
-const TTS: (&str, &str) = (
-    "mlx-community__Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit",
-    "Qwen3TTSForConditionalGeneration",
-);
-const TTS_CODEC: (&str, &str) = ("Qwen__Qwen3-TTS-Tokenizer-12Hz", "Qwen3TTSTokenizerV2Model");
 
 /// Run `first`, then `second` on its state: on one thread (the oracle), then
 /// across `split`. Both steps must return what the oracle's steps returned.
@@ -310,9 +304,16 @@ impl TokenPick for Greedy {
 fn speak(
     (mut model, tokenizer): (TtsModel, TtsTokenizer),
 ) -> (Result<Vec<u32>, String>, (TtsModel, TtsTokenizer)) {
-    let samples = synthesize(SPOKEN_TEXT, "serena", &mut model, &tokenizer, &mut Greedy)
-        .map(|synthesis| f32_bits(&synthesis.samples))
-        .map_err(|e| e.to_string());
+    let samples = synthesize(
+        SPOKEN_TEXT,
+        "serena",
+        &mut model,
+        &tokenizer,
+        &mut Greedy,
+        &AtomicBool::new(false),
+    )
+    .map(|synthesis| f32_bits(&synthesis.samples))
+    .map_err(|e| e.to_string());
     (samples, (model, tokenizer))
 }
 

@@ -12,6 +12,7 @@
 use super::tts_tests::NoPick;
 use super::{synthesize, TtsConfig, TtsError, TtsModel, TtsTokenizer};
 use rmlx_mlx::Device;
+use std::sync::atomic::AtomicBool;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -196,6 +197,7 @@ fn tts_synthesize_on_cpu_is_admitted_child() {
         &mut model,
         &TtsTokenizer::stub(),
         &mut NoPick,
+        &AtomicBool::new(false),
     );
     match result {
         Err(TtsError::Mlx(msg))

@@ -31,6 +31,7 @@ pub const BEHAVIOUR_SWITCH_TARGETS: [&str; 2] = [PHASE_SWITCH_TARGET, EAGLE3_STE
 #[derive(Clone, Debug)]
 pub struct CapturedEvent {
     pub target: String,
+    pub level: tracing::Level,
     pub message: String,
     pub fields: Vec<(String, String)>,
 }
@@ -243,6 +244,7 @@ impl tracing::Subscriber for RoundStreamRecorder {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(CapturedEvent {
                 target: event.metadata().target().to_owned(),
+                level: *event.metadata().level(),
                 message: r.message,
                 fields: r.fields,
             });

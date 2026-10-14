@@ -99,3 +99,15 @@ fn is_migratable_classifies_transient_and_permanent() {
     assert!(!Error::SmokeProbe("NaN".to_owned()).is_migratable());
     assert!(!Error::Config("bad".to_owned()).is_migratable());
 }
+
+/// A stop is not replayed, and its `Debug` form opens with the name of the
+/// variant: the source rules on the stop read that name.
+#[test]
+fn a_stop_is_not_migratable_and_names_its_variant() {
+    assert!(!Error::Cancelled.is_migratable());
+    assert_eq!(format!("{:?}", Error::Cancelled), "Cancelled");
+    assert_eq!(
+        Error::Cancelled.to_string(),
+        "cancelled: the request is gone"
+    );
+}

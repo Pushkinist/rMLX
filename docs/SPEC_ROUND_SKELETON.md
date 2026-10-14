@@ -29,14 +29,18 @@ both before any cache stack exists. It then builds a `RoundCfg` and calls
 
 1. builds the verifier's cache stack and, on a hybrid, its recurrent stack;
 2. calls `prefill`, and emits the seed if the drafter drew one;
-3. per round: narrows the block (`block`), proposes (`propose`), refuses an
+3. per round: reads the stop of the request (`ensure_not_cancelled`), narrows
+   the block (`block`), proposes (`propose`), refuses an
    empty chain, arms the recurrent tape, verifies (`verify`), bounds the
    reduced-vocabulary prefix, emits the commit, rolls the verifier back to the
    accepted prefix, then calls the drafter's `rollback`, `condition` and
    `carry`, and writes one round event;
 4. writes one request record and reports the verifier's resident KV.
 
-It returns the emitted steps and the widest block any round ran.
+It returns the emitted steps and the widest block any round ran. A request
+that is gone returns `Error::Cancelled` from a chunk of the prefill or from the
+head of a round, so a round that started runs to its end. It writes no request
+record and no resident-KV report.
 
 The loop owns every step that is the same for all drafters. The rollback
 target is always computed from the offset read before the verify forward
@@ -150,7 +154,7 @@ the round fed; see "What the interface cannot express".
 **`prefill_ns`.** Each drafter times its own prefill, because what the span
 covers differs. The loop does not time the call.
 
-**The resident-KV report.** The loop has two early exits. The seed exit returns
+**The resident-KV report.** The loop has two early exits on an EOS. The seed exit returns
 when the seed is an EOS. The in-round exit returns when a round emits an EOS.
 Each drafter skips the report at exactly one of them, and declares which.
 
@@ -205,7 +209,9 @@ Five observables, each blind to something different:
   shape. It is blind to the values inside a round, to `charged` (every pinned
   run is uncharged), to the resident-KV figure, and to a request that ran no
   round.
-- **The request record**, one `done` line per request. It is the only
+- **The request record**, one `done` line per request. A request that is gone
+  and stops in its prefill or at the head of a round writes none
+  ([`SERVER_SHUTDOWN.md`](SERVER_SHUTDOWN.md)). It is the only
   observable that covers a request that stopped on its seed, and the only one
   that carries `conditioned_rows`. It cannot say which round moved anything.
   `RoundStats::conditioning_violation` and `emission_violation` pass on `None`.

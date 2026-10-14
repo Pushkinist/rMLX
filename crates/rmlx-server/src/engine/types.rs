@@ -4,12 +4,14 @@
 //! - ModelLoadConfig
 //! - NormalizedResponseFormat
 //! - SamplingParams, GenerationRequest
-//! - GpuAdmission, Admission, admit_request
+//! - GpuAdmission, Admission, admit_request, run_admitted, job_stream
 //! - GenerationToken
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
 
+use futures::stream::{self, Stream};
 use rmlx_metrics::events::EventRecorder;
 
 use crate::metrics_drainer::DrainerHandle;
@@ -403,12 +405,13 @@ pub struct GenerationRequest {
     ///
     /// The route handler acquires the single `AppState::gpu_queue` permit
     /// (FIFO order) and counts the request in `gpu_pending`, packs both into a
-    /// [`GpuAdmission`], and moves it here. `Generator::generate` moves the
-    /// whole `GenerationRequest` into its `spawn_blocking` closure, so the
-    /// permit lives for the entire decode and is released — and
-    /// `gpu_pending` decremented — exactly when the blocking work finishes
-    /// (success, error, or task completion after stream drop). `None` in
-    /// unit-test / non-route paths that never went through admission.
+    /// [`GpuAdmission`], and moves it here. `Generator::generate` moves it
+    /// into its blocking job, so the permit lives for the entire decode and
+    /// is released — and `gpu_pending` decremented — exactly when the
+    /// blocking work finishes (success, error, or a stop after the stream
+    /// was dropped). `None` for a retry attempt, which runs without the
+    /// permit of the first attempt, and in unit-test paths that never went
+    /// through admission.
     pub gpu_admission: Option<GpuAdmission>,
 
     /// Per-request KV-quant codec override. `Some(q)` switches the
@@ -588,6 +591,99 @@ pub async fn admit_request(
         tracing::warn!("gpu_queue semaphore closed during acquire — rejecting");
         Admission::QueueFull
     }
+}
+
+/// Start `job` on the blocking pool, inside the caller's span, while `guard`
+/// holds the GPU permit, and return the future of its result. The job starts
+/// at this call, not at the first poll of the future. `guard` is `None` for a
+/// request that did not pass admission: a retry attempt or a test.
+///
+/// The flag handed to `job` is set when the returned future is dropped: the
+/// request timed out, the client went away or a server shutdown dropped it. A
+/// job that reads the flag can stop early. The permit is released when `job`
+/// returns, so the next request never shares the GPU with a job that is still
+/// stopping.
+// cancel-safe: a drop sets the flag; the job keeps the permit until it returns.
+// After a normal return the flag is set with no reader.
+pub(crate) fn run_admitted<T, F>(
+    guard: Option<GpuAdmission>,
+    job: F,
+) -> impl Future<Output = Result<T, tokio::task::JoinError>>
+where
+    T: Send + 'static,
+    F: FnOnce(&std::sync::atomic::AtomicBool) -> T + Send + 'static,
+{
+    let cancel_on_drop = CancelOnDrop(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    let flag = Arc::clone(&cancel_on_drop.0);
+    let span = tracing::Span::current();
+    let handle = tokio::task::spawn_blocking(move || {
+        let _entered = span.enter();
+        let _guard = guard;
+        job(&flag)
+    });
+    async move {
+        let _cancel_on_drop = cancel_on_drop;
+        handle.await
+    }
+}
+
+struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The reply stream of a job of [`run_admitted`]: the items that the job sends
+/// to `rx`, until the job drops its sender. The stream owns `rx` and `job` in
+/// one value and does not poll `job`, so one drop of the stream closes the
+/// channel and sets the stop flag of the job. A send of the job that fails
+/// needs no flag of its own.
+pub(crate) fn job_stream<T: Send + 'static>(
+    rx: tokio::sync::mpsc::Receiver<T>,
+    job: impl Future + Send + 'static,
+) -> impl Stream<Item = T> + Send {
+    stream::unfold((rx, job), |(mut rx, job)| async move {
+        rx.recv().await.map(|item| (item, (rx, job)))
+    })
+}
+
+/// Log the one event of a job that stopped because its request is gone.
+/// `emitted` is the count of tokens that were given to the step callback.
+pub(crate) fn log_stopped(emitted: usize) {
+    tracing::info!(emitted, "the request is gone; the generation stopped");
+}
+
+/// The result of a generation as its job reports it. A stop logs the one stop
+/// event and gives `None`, so the job sends nothing and writes no row. Any
+/// other result is the job's to report: a generation that ran to its end keeps
+/// its rows also when its request went away after it.
+pub(crate) fn unless_stopped<T>(
+    result: rmlx_core::Result<T>,
+    emitted: usize,
+) -> Option<rmlx_core::Result<T>> {
+    if matches!(result, Err(rmlx_core::Error::Cancelled)) {
+        log_stopped(emitted);
+        return None;
+    }
+    Some(result)
+}
+
+/// End a chat job whose prompt could not be prepared, at `stage`. A stop logs
+/// the one stop event and sends nothing: the request is gone. Any other error
+/// is logged at `warn` and sent to the reply.
+pub(crate) fn end_prompt_preparation(
+    tx: &tokio::sync::mpsc::Sender<rmlx_core::Result<GenerationToken>>,
+    error: rmlx_core::Error,
+    stage: &str,
+) {
+    if matches!(error, rmlx_core::Error::Cancelled) {
+        log_stopped(0);
+        return;
+    }
+    tracing::warn!(error = %error, stage, "the preparation of the prompt failed");
+    let _ = tx.blocking_send(Err(error));
 }
 
 /// One produced token with completion state.

@@ -187,8 +187,8 @@ struct Job {
 const JOB_REPLY: &str = "job reply";
 
 /// A job as a transcription runs it when `reads_the_drop`: it decodes
-/// "windows" of 1 ms and stops when its request is dropped. Else a job as a
-/// chat decode or a speech synthesis runs: it does not read the drop.
+/// "windows" of 1 ms and stops when its request is dropped. Else a job that
+/// does not read the drop, as an embeddings job, runs.
 fn job(reads_the_drop: bool) -> Job {
     let (started_tx, started) = mpsc::channel();
     let (release, release_rx) = mpsc::channel::<()>();

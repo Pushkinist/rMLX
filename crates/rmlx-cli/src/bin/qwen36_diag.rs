@@ -154,6 +154,7 @@ fn main() -> anyhow::Result<()> {
         &mut diag_rng,
         &diag_penalty_cfg,
         &mut diag_token_history,
+        &std::sync::atomic::AtomicBool::new(false),
     )
     .map_err(|e| anyhow::anyhow!("generate_greedy: {e}"))?;
 

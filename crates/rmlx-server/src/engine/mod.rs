@@ -6,7 +6,8 @@
 //!
 //! Submodules:
 //! - `types`         — Phase, NormalizedTool, SamplingParams, GenerationRequest,
-//!   GpuAdmission, Admission, admit_request, GenerationToken
+//!   GpuAdmission, Admission, admit_request, run_admitted, job_stream,
+//!   GenerationToken
 //! - `think`         — ThinkSplitter `<think>...</think>` state machine
 //! - `generator`     — Generator trait + NotReadyGenerator placeholder
 //! - `image`         — VisionBundle, build_image_prompt, run_qwen3vl_image
@@ -37,7 +38,9 @@ pub(crate) mod types;
 #[cfg(test)]
 mod admission_tests;
 #[cfg(test)]
-mod tests;
+mod stop_tests;
+#[cfg(test)]
+pub(crate) mod tests;
 
 // ── Public API surface (frozen — matches lib.rs pub use) ─────────────────────
 
@@ -53,6 +56,7 @@ pub use types::{
 // ── Crate-internal re-exports ─────────────────────────────────────────────────
 
 pub(crate) use helpers::{parse_request_kv_quant, record_ttft_and_prefill};
+pub(crate) use types::run_admitted;
 
 // ── Test-visible re-exports ───────────────────────────────────────────────────
 

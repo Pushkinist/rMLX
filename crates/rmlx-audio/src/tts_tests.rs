@@ -7,6 +7,7 @@ use super::{
 use super::{text_rows, TextRows, TEXT_HEAD_TOKENS, TEXT_TAIL_TOKENS};
 use crate::test_events::fields_recorded_by;
 use rmlx_mlx::Array;
+use std::sync::atomic::AtomicBool;
 
 /// A pick for synthesis calls that must fail before the first token.
 pub(super) struct NoPick;
@@ -55,7 +56,7 @@ const END: (FrameStep, bool) = (FrameStep::End, false);
 #[test]
 fn run_frames_stops_at_the_cap_and_reports_truncation() {
     let mut calls = 0usize;
-    let frames = run_frames(|step| {
+    let frames = run_frames(&AtomicBool::new(false), |step| {
         calls += 1;
         Ok(frame(step as u32))
     })
@@ -72,7 +73,10 @@ fn run_frames_stops_at_the_cap_and_reports_truncation() {
 /// The end token stops the loop at once and is not a frame.
 #[test]
 fn run_frames_stops_at_the_end_token() {
-    let frames = run_frames(|step| Ok(if step == 5 { END } else { frame(7) })).unwrap();
+    let frames = run_frames(&AtomicBool::new(false), |step| {
+        Ok(if step == 5 { END } else { frame(7) })
+    })
+    .unwrap();
     assert_eq!(frames.codes.len(), 5);
     assert!(
         !frames.truncated,
@@ -83,7 +87,7 @@ fn run_frames_stops_at_the_end_token() {
 /// The end token on the last step the cap allows is a finished generation.
 #[test]
 fn run_frames_end_token_on_the_last_step_is_not_truncated() {
-    let frames = run_frames(|step| {
+    let frames = run_frames(&AtomicBool::new(false), |step| {
         Ok(if step == MAX_FRAMES - 1 {
             END
         } else {
@@ -98,7 +102,7 @@ fn run_frames_end_token_on_the_last_step_is_not_truncated() {
 /// A step error ends the loop with that error, not with a short WAV.
 #[test]
 fn run_frames_propagates_a_step_error() {
-    let result = run_frames(|step| {
+    let result = run_frames(&AtomicBool::new(false), |step| {
         if step == 3 {
             Err(TtsError::Mlx("step failed".into()))
         } else {
@@ -174,7 +178,14 @@ fn synthesize_unknown_voice_returns_error() {
     let mut model = serena_only_model();
     let tok = TtsTokenizer::stub();
 
-    let result = synthesize("hello", "nonexistent_voice", &mut model, &tok, &mut NoPick);
+    let result = synthesize(
+        "hello",
+        "nonexistent_voice",
+        &mut model,
+        &tok,
+        &mut NoPick,
+        &AtomicBool::new(false),
+    );
     match result {
         Err(TtsError::UnknownVoice(v)) => assert_eq!(v, "nonexistent_voice"),
         other => panic!("expected UnknownVoice, got {other:?}"),
@@ -189,7 +200,14 @@ fn synthesize_valid_voice_returns_load_error() {
     let mut model = serena_only_model();
     let tok = TtsTokenizer::stub();
 
-    let result = synthesize("hello", "serena", &mut model, &tok, &mut NoPick);
+    let result = synthesize(
+        "hello",
+        "serena",
+        &mut model,
+        &tok,
+        &mut NoPick,
+        &AtomicBool::new(false),
+    );
     assert!(
         matches!(result, Err(TtsError::Load(_))),
         "expected Load error when weights missing, got {result:?}"
@@ -212,6 +230,7 @@ fn synthesize_logs_neither_the_text_nor_an_unknown_voice() {
             &mut model,
             &TtsTokenizer::stub(),
             &mut NoPick,
+            &AtomicBool::new(false),
         );
         assert!(
             matches!(result, Err(TtsError::UnknownVoice(_))),
@@ -246,6 +265,7 @@ fn synthesize_records_a_known_voice_and_not_the_text() {
             &mut model,
             &TtsTokenizer::stub(),
             &mut NoPick,
+            &AtomicBool::new(false),
         );
         assert!(matches!(result, Err(TtsError::Load(_))), "{result:?}");
     });
@@ -287,7 +307,7 @@ fn frame_with_growth(step: usize) -> (FrameStep, bool) {
 fn run_frames_releases_the_cache_after_each_growth_frame_and_at_the_end() {
     for frames in [1, 5, 12] {
         let reasons = release_reasons(|| {
-            let got = run_frames(|step| {
+            let got = run_frames(&AtomicBool::new(false), |step| {
                 Ok(if step == frames {
                     END
                 } else {
@@ -308,7 +328,7 @@ fn run_frames_releases_the_cache_after_each_growth_frame_and_at_the_end() {
 #[test]
 fn run_frames_at_the_cap_releases_after_each_growth_frame_and_at_the_end() {
     let reasons = release_reasons(|| {
-        let got = run_frames(|step| Ok(frame_with_growth(step))).unwrap();
+        let got = run_frames(&AtomicBool::new(false), |step| Ok(frame_with_growth(step))).unwrap();
         assert!(got.truncated);
     });
     assert_eq!(
@@ -326,7 +346,7 @@ fn run_frames_at_the_cap_releases_after_each_growth_frame_and_at_the_end() {
 #[test]
 fn run_frames_releases_once_when_the_last_step_grew_a_buffer() {
     let reasons = release_reasons(|| {
-        run_frames(|_| Ok((FrameStep::End, true))).unwrap();
+        run_frames(&AtomicBool::new(false), |_| Ok((FrameStep::End, true))).unwrap();
     });
     assert_eq!(reasons, ["end of the loop"]);
 }
@@ -335,7 +355,7 @@ fn run_frames_releases_once_when_the_last_step_grew_a_buffer() {
 #[test]
 fn run_frames_releases_the_cache_when_a_step_fails() {
     let reasons = release_reasons(|| {
-        let result = run_frames(|step| {
+        let result = run_frames(&AtomicBool::new(false), |step| {
             if step == 2 {
                 Err(TtsError::Mlx("step failed".into()))
             } else {
@@ -502,3 +522,6 @@ fn text_rows_embed_a_text_that_fits_whole() {
         assert!(rows.eos);
     }
 }
+
+#[path = "tts_stop_tests.rs"]
+mod tts_stop_tests;

@@ -1,17 +1,17 @@
-//! The cancel flag and the GPU permit of a blocking audio job, with scripted
-//! jobs in place of a Whisper walk (no model, no GPU).
+//! The stop of a blocking audio job: an upload decode that reads the flag of
+//! its request, and a client that disconnects while the job runs (no model, no
+//! GPU). The flag and the permit of a job are held in `engine/tests.rs`.
 //!
 //! Not covered here: `handle_audio` handing the flag to `decode_upload` and to
 //! `Transcriber::transcribe`. That needs a loaded Whisper model; only a
 //! real-server run covers it.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Semaphore;
 
 use rmlx_audio::tokenizer::WhisperTask;
 use rmlx_audio::transcribe::{Segment, Transcription};
@@ -19,118 +19,7 @@ use rmlx_audio::wav::WavError;
 
 use super::form::ResponseFormat;
 use super::{build_response, cut, job_answer, job_refusal, refused, run_admitted, JobError};
-use crate::engine::{admit_request, Admission, GpuAdmission};
-
-/// How long a scripted job waits for the flag before it gives up and reports
-/// that it never saw it. A job that never stops would hang the test binary.
-const FLAG_WAIT: Duration = Duration::from_secs(2);
-
-/// How long the test waits for a message from a scripted job.
-const REPORT_WAIT: Duration = Duration::from_secs(5);
-
-/// The one-permit GPU queue and its in-flight gauge.
-fn gpu_queue() -> (Arc<Semaphore>, Arc<AtomicUsize>) {
-    (Arc::new(Semaphore::new(1)), Arc::new(AtomicUsize::new(0)))
-}
-
-async fn admitted(queue: &Arc<Semaphore>, pending: &Arc<AtomicUsize>) -> GpuAdmission {
-    match admit_request(queue, pending, 64).await {
-        Admission::Admitted { guard, .. } => guard,
-        Admission::QueueFull => panic!("an empty queue admits"),
-    }
-}
-
-/// A scripted walk: it decodes "windows" of 1 ms until the flag is set or
-/// `FLAG_WAIT` passes, and returns whether it saw the flag.
-fn wait_for_flag(cancel: &AtomicBool) -> bool {
-    let start = std::time::Instant::now();
-    while !cancel.load(Ordering::Relaxed) && start.elapsed() < FLAG_WAIT {
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    cancel.load(Ordering::Relaxed)
-}
-
-/// Wait on a std channel from async code without blocking the runtime.
-async fn report<T: Send + 'static>(rx: mpsc::Receiver<T>) -> Result<T, mpsc::RecvTimeoutError> {
-    tokio::task::spawn_blocking(move || rx.recv_timeout(REPORT_WAIT))
-        .await
-        .expect("the report task does not panic")
-}
-
-/// The request timeout drops the request future, as `timeout_mw` does: the
-/// job sees the flag and stops.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_request_timeout_sets_the_flag_and_the_job_stops() {
-    let (queue, pending) = gpu_queue();
-    let guard = admitted(&queue, &pending).await;
-    let (tx, rx) = mpsc::channel();
-    let request = run_admitted(guard, move |cancel| {
-        tx.send(wait_for_flag(cancel)).ok();
-    });
-    let timed_out = tokio::time::timeout(Duration::from_millis(50), request).await;
-    assert!(timed_out.is_err(), "the scripted job outlives the timeout");
-    assert_eq!(report(rx).await, Ok(true), "the job did not see the flag");
-}
-
-/// After the timeout the permit stays with the job until the job returns;
-/// then it is free and the gauge is back to 0.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_permit_stays_held_until_the_stopped_job_returns() {
-    let (queue, pending) = gpu_queue();
-    let guard = admitted(&queue, &pending).await;
-    let (saw_tx, saw_rx) = mpsc::channel();
-    let (release_tx, release_rx) = mpsc::channel::<()>();
-    let request = run_admitted(guard, move |cancel| {
-        saw_tx.send(wait_for_flag(cancel)).ok();
-        release_rx.recv_timeout(REPORT_WAIT).ok();
-    });
-    let timed_out = tokio::time::timeout(Duration::from_millis(50), request).await;
-    assert!(timed_out.is_err());
-    assert_eq!(
-        report(saw_rx).await,
-        Ok(true),
-        "the job did not see the flag"
-    );
-
-    assert_eq!(
-        queue.available_permits(),
-        0,
-        "the permit was freed while the job still runs"
-    );
-    assert_eq!(pending.load(Ordering::Acquire), 1);
-
-    release_tx.send(()).expect("the job waits for the release");
-    let permit = tokio::time::timeout(REPORT_WAIT, queue.acquire()).await;
-    assert!(
-        matches!(permit, Ok(Ok(_))),
-        "the permit is not free after the job returned"
-    );
-    assert_eq!(pending.load(Ordering::Acquire), 0);
-}
-
-/// A job that runs to its end never sees the flag, gives its result, and
-/// frees the permit.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_job_that_ends_sees_no_flag_and_frees_the_permit() {
-    let (queue, pending) = gpu_queue();
-    let guard = admitted(&queue, &pending).await;
-    let saw_flag = run_admitted(guard, |cancel| cancel.load(Ordering::Relaxed)).await;
-    assert!(matches!(saw_flag, Ok(false)), "{saw_flag:?}");
-    assert_eq!(queue.available_permits(), 1);
-    assert_eq!(pending.load(Ordering::Acquire), 0);
-}
-
-/// A job that panics frees the permit, and the caller gets the panic as an
-/// error.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_job_that_panics_frees_the_permit() {
-    let (queue, pending) = gpu_queue();
-    let guard = admitted(&queue, &pending).await;
-    let result = run_admitted(guard, |_| -> u8 { panic!("scripted job panic") }).await;
-    assert!(result.as_ref().is_err_and(tokio::task::JoinError::is_panic));
-    assert_eq!(queue.available_permits(), 1);
-    assert_eq!(pending.load(Ordering::Acquire), 0);
-}
+use crate::engine::tests::{admitted, gpu_queue, report, wait_for_flag, REPORT_WAIT};
 
 /// A request that is gone while its upload decodes: `decode_upload` under
 /// `run_admitted`'s flag reads it before each packet and stops, and the permit
@@ -148,7 +37,7 @@ async fn a_request_gone_during_the_decode_stops_it_and_frees_the_permit() {
     let guard = admitted(&queue, &pending).await;
     let (go_tx, go_rx) = mpsc::channel::<()>();
     let (done_tx, done_rx) = mpsc::channel();
-    let request = run_admitted(guard, move |cancel| {
+    let request = run_admitted(Some(guard), move |cancel| {
         go_rx.recv_timeout(REPORT_WAIT).ok();
         done_tx.send(super::decode_upload(&upload, cancel)).ok();
     });
@@ -182,7 +71,7 @@ async fn a_client_that_disconnects_sets_the_flag() {
         let (running_tx, saw_tx) = (running_tx.clone(), saw_tx.clone());
         async move {
             let guard = admitted(&queue, &pending).await;
-            let result = run_admitted(guard, move |cancel| {
+            let result = run_admitted(Some(guard), move |cancel| {
                 running_tx.send(()).ok();
                 saw_tx.send(wait_for_flag(cancel)).ok();
             })
@@ -454,7 +343,7 @@ async fn each_job_failure_is_answered_in_the_error_envelope() {
 async fn a_panicked_job_is_answered_in_the_error_envelope() {
     let (queue, pending) = gpu_queue();
     let guard = admitted(&queue, &pending).await;
-    let result = run_admitted(guard, |_| -> Result<Transcription, JobError> {
+    let result = run_admitted(Some(guard), |_| -> Result<Transcription, JobError> {
         panic!("scripted panic, secret cause");
     })
     .await;

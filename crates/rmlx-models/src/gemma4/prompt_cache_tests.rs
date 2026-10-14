@@ -568,6 +568,7 @@ fn gemma4_consume_engine_migration_golden() {
             &mut rng,
             &penalty_cfg,
             &mut token_history,
+            &std::sync::atomic::AtomicBool::new(false),
             None,
         )
         .expect("generate_greedy")

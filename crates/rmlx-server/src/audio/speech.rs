@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 
 use super::{cut, run_admitted, LOGGED_NAME_BYTES};
+use crate::engine::types::log_stopped;
 use crate::engine::{admit_request, Admission};
 use crate::openai::errors::error_response;
 use crate::openai::state::ApiErrorCategory;
@@ -97,6 +98,8 @@ enum SpeechFailure {
     UnknownVoice(String),
     /// A fixed message. The cause is in the log, because it can name a local path.
     Internal(&'static str),
+    /// The request is gone. The synthesis stopped, and nothing is sent.
+    Stopped,
 }
 
 impl SpeechFailure {
@@ -117,6 +120,7 @@ impl SpeechFailure {
 
     /// The failure of a `synthesize` error. An unknown voice is the client's
     /// error: the reply lists the voices of `config` and does not repeat `voice`.
+    /// A stop logs the one stop event: no audio was delivered, so `emitted` is 0.
     fn from_synthesis(
         error: &TtsError,
         voice: &str,
@@ -124,6 +128,10 @@ impl SpeechFailure {
         model_path: &std::path::Path,
     ) -> Self {
         match error {
+            TtsError::Cancelled => {
+                log_stopped(0);
+                Self::Stopped
+            }
             TtsError::UnknownVoice(_) => {
                 info!(
                     voice_len = voice.len(),
@@ -151,10 +159,12 @@ impl SpeechFailure {
         }
     }
 
-    fn category(&self) -> ApiErrorCategory {
+    /// The error count of the failure. A stop is no error of the server.
+    fn category(&self) -> Option<ApiErrorCategory> {
         match self {
-            Self::UnknownVoice(_) => ApiErrorCategory::BadRequest,
-            Self::Internal(_) => ApiErrorCategory::Internal,
+            Self::UnknownVoice(_) => Some(ApiErrorCategory::BadRequest),
+            Self::Internal(_) => Some(ApiErrorCategory::Internal),
+            Self::Stopped => None,
         }
     }
 
@@ -166,6 +176,7 @@ impl SpeechFailure {
                 &message,
             ),
             Self::Internal(message) => crate::openai::errors::internal_error(message),
+            Self::Stopped => StatusCode::REQUEST_TIMEOUT.into_response(),
         }
     }
 }
@@ -251,7 +262,7 @@ pub async fn audio_speech(
     let device = state.device;
     let model_path_str = tts_model_path.to_string_lossy().into_owned();
 
-    let result = run_admitted(guard, move |_cancel| {
+    let result = run_admitted(Some(guard), move |cancel| {
         let t_load_start = std::time::Instant::now();
         let mut load_ms_opt: Option<f64> = None;
 
@@ -306,7 +317,15 @@ pub async fn audio_speech(
         let t_synth_start = std::time::Instant::now();
         let synthesis = {
             let mut model = loaded.model.lock();
-            synthesize(&input, &voice, &mut model, &loaded.tokenizer, &mut picker).map_err(|e| {
+            synthesize(
+                &input,
+                &voice,
+                &mut model,
+                &loaded.tokenizer,
+                &mut picker,
+                cancel,
+            )
+            .map_err(|e| {
                 SpeechFailure::from_synthesis(&e, &voice, &model.config, &tts_model_path)
             })?
         };
@@ -373,7 +392,9 @@ pub async fn audio_speech(
     match result {
         Ok(Ok(response)) => response,
         Ok(Err(failure)) => {
-            state.error_counts.increment(failure.category());
+            if let Some(category) = failure.category() {
+                state.error_counts.increment(category);
+            }
             failure.into_response()
         }
         Err(e) => {

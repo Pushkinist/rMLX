@@ -13,6 +13,7 @@ use std::time::Instant;
 use parking_lot::Mutex;
 
 use futures::stream::{self, Stream};
+use rmlx_core::cancel::ensure_not_cancelled;
 use rmlx_core::Error;
 use rmlx_kv_quant::kv_quant_label;
 use rmlx_metrics::events::Measurement;
@@ -27,7 +28,10 @@ use super::helpers::{
 };
 use super::image::{build_image_prompt, run_qwen3vl_image, VisionBundle};
 use super::think::ThinkSplitter;
-use super::types::{GenerationRequest, GenerationToken, ModelLoadConfig};
+use super::types::{
+    end_prompt_preparation, job_stream, run_admitted, unless_stopped, GenerationRequest,
+    GenerationToken, ModelLoadConfig,
+};
 
 /// Reject the unsupported image + audio combination in a single request.
 ///
@@ -633,12 +637,6 @@ impl Generator for ArchGenerator {
         // per-event DB recorder for events-table ITL/kv_cache writes.
         // TTFT is written by the HTTP handler layer off-runtime.
         let event_recorder = req.event_recorder;
-        // Hold the FIFO admission guard (permit + pending-count
-        // RAII) for the lifetime of the blocking decode. Moving it into the
-        // spawn_blocking closure releases the permit — and decrements
-        // `gpu_pending` — exactly when generation finishes (success/error).
-        // `None` for non-route callers (unit tests, internal probes).
-        let gpu_admission = req.gpu_admission;
         // Optional sampler constraint engine (the route's json_object or
         // json_schema grammar). `None` skips the mask entirely in the
         // `generate_greedy` decode loops.
@@ -744,17 +742,13 @@ impl Generator for ArchGenerator {
             }
         }
 
-        // Run generation in tokio's blocking-task pool so the async runtime is not
-        // stalled for the full generate_greedy wall-clock time.
+        // Run generation in the one job runner, on tokio's blocking-task pool,
+        // so the async runtime is not stalled for the full generate_greedy
+        // wall-clock time. The runner holds the FIFO admission guard until the
+        // job returns, carries the route's span (and its `request_id`) to the
+        // job's thread, and hands the job the stop flag of this request.
         //
-        // Use tokio::task::spawn_blocking instead of std::thread::spawn.
-        // Raw std::thread::spawn bypassed tokio's blocking-thread pool — under
-        // request bursts threads pile up waiting for the serialisation lock, each
-        // consuming 2 MiB stack. tokio caps the pool at 512 threads and reuses
-        // them across requests, eliminating per-request thread creation overhead
-        // and integrating with tokio shutdown.
-        //
-        // The thread:
+        // The job:
         // 1. Acquires the serialisation lock (warns on contention).
         // 2. Calls generate_greedy (returns Vec<ProbeStep> — all tokens at once
         // but with real compute between each one at decode time).
@@ -773,14 +767,10 @@ impl Generator for ArchGenerator {
         // model id is the stable identity; same id ⇒ same sig ⇒ cache still
         // hits for repeat same-model requests.
         let model_sig = rmlx_models::multimodal_cache::model_sig(&self.model_id);
-        // The decode runs on a blocking-pool thread. `spawn_blocking` does not
-        // propagate the caller's tracing span, so every event emitted below —
-        // including the never-engaged report — would otherwise lose the route's
-        // `request_id`. Carry the span across explicitly.
-        let decode_span = tracing::Span::current();
-        tokio::task::spawn_blocking(move || {
-            let _decode_span_guard = decode_span.enter();
-            // Acquire the serialisation lock.
+        let job = run_admitted(req.gpu_admission, move |cancel| {
+            // Acquire the serialisation lock. With the 1-permit semaphore
+            // upstream only one request is ever in this job, so `try_lock`
+            // always succeeds; the lock stays as the cross-model defense.
             let _guard = {
                 let try_result = lock.try_lock();
                 if let Some(g) = try_result {
@@ -794,15 +784,6 @@ impl Generator for ArchGenerator {
                     lock.lock()
                 }
             };
-
-            // Keep the FIFO admission guard alive for the whole
-            // blocking decode. Dropping it here (closure exit) releases the
-            // semaphore permit to the next FIFO waiter AND decrements
-            // `gpu_pending`, on every exit path (return, panic-unwind, normal
-            // completion). With the 1-permit semaphore upstream only one
-            // request is ever in this closure, so the `try_lock` above always
-            // succeeds — the gpu_gate stays as the cross-model defense.
-            let _gpu_admission = gpu_admission;
 
             tracing::debug!(model_id = %model_id_for_log, "generate: blocking thread started");
 
@@ -837,15 +818,10 @@ impl Generator for ArchGenerator {
             // Timestamps are collected in step_fn and converted to intervals post-decode.
             let mut step_timestamps: Vec<Instant> = Vec::with_capacity(n_tokens);
 
-            // cancelled: set by the step callback when the SSE receiver has gone
-            // away; generate_greedy will still push to `steps` but the sends are
-            // skipped by the early-return below.
-            let mut cancelled = false;
             // think_splitter is `None` for non-reasoning archs; the
             // step_fn closure pattern-matches on the ref and short-circuits.
             let mut think_splitter = think_splitter;
             let tx_ref = &tx;
-            let cancelled_ref = &mut cancelled;
             let detok_ref = &mut detok;
             let timestamps_ref = &mut step_timestamps;
             let think_splitter_ref = &mut think_splitter;
@@ -874,9 +850,6 @@ impl Generator for ArchGenerator {
                 // Instant::now() on macOS is a single rdtsc-equivalent syscall,
                 // ~3 ns; negligible vs the 8–15 ms decode step.
                 timestamps_ref.push(Instant::now());
-                if *cancelled_ref {
-                    return None;
-                }
                 let mut text = match detok_ref.step(&tokenizer_ref, s.token_id) {
                     Ok(seg) => seg,
                     Err(e) => {
@@ -945,10 +918,7 @@ impl Generator for ArchGenerator {
                     is_thinking = tok.is_thinking,
                     "generate: step_fn sending token"
                 );
-                if tx_ref.blocking_send(Ok(tok)).is_err() {
-                    tracing::debug!("generate: receiver dropped, cancelling further sends");
-                    *cancelled_ref = true;
-                }
+                let _ = tx_ref.blocking_send(Ok(tok));
                 // if the budget was just exceeded, ask the decode loop
                 // to force `</think>` next. `take_force_close()` returns
                 // `false` (and `thinking_end_token_id` is unused) on every
@@ -1003,11 +973,11 @@ impl Generator for ArchGenerator {
                             mm_cache.as_deref(),
                             model_sig,
                             image_max_tokens,
+                            cancel,
                         ) {
                             Ok(triple) => Some(triple),
                             Err(e) => {
-                                tracing::warn!(error = %e, "image preprocessing failed");
-                                let _ = tx.blocking_send(Err(e));
+                                end_prompt_preparation(&tx, e, "image preprocessing");
                                 return;
                             }
                         }
@@ -1047,53 +1017,45 @@ impl Generator for ArchGenerator {
             // (mirroring vision's no-tower rejection) — never a silent drop.
             // Image + audio in one request was already rejected above, so here
             // `image_inputs` is `None` whenever `req_audio` is non-empty.
-            let audio_inputs: Option<(Vec<u32>, rmlx_mlx::Array, rmlx_mlx::Array)> = if !req_audio
-                .is_empty()
-                && image_inputs.is_none()
-                && !qvl_image
-            {
-                if let Some(ab) = audio.as_ref() {
-                    let context_tokens = match rmlx_models::context::resolve_context(
-                        &context_limits,
-                        max_ctx_override,
-                    ) {
-                        Ok(resolved) => resolved.ceiling_tokens(),
-                        Err(e) => {
-                            let _ = tx.blocking_send(Err(e));
-                            return;
+            let audio_inputs: Option<(Vec<u32>, rmlx_mlx::Array, rmlx_mlx::Array)> =
+                if !req_audio.is_empty() && image_inputs.is_none() && !qvl_image {
+                    if let Some(ab) = audio.as_ref() {
+                        let context_tokens = match rmlx_models::context::resolve_context(
+                            &context_limits,
+                            max_ctx_override,
+                        ) {
+                            Ok(resolved) => resolved.ceiling_tokens(),
+                            Err(e) => {
+                                let _ = tx.blocking_send(Err(e));
+                                return;
+                            }
+                        };
+                        // The audio decode stops at the next packet of a request
+                        // that is gone.
+                        match build_audio_prompt(
+                            model.as_ref(),
+                            ab,
+                            &req_audio,
+                            &prompt_tokens,
+                            context_tokens,
+                            device,
+                            &|| ensure_not_cancelled(cancel).is_err(),
+                        ) {
+                            Ok(triple) => Some(triple),
+                            Err(e) => {
+                                end_prompt_preparation(&tx, e, "audio preprocessing");
+                                return;
+                            }
                         }
-                    };
-                    // The client is gone when the token channel is closed: the
-                    // decode stops at the next packet.
-                    match build_audio_prompt(
-                        model.as_ref(),
-                        ab,
-                        &req_audio,
-                        &prompt_tokens,
-                        context_tokens,
-                        device,
-                        &|| tx.is_closed(),
-                    ) {
-                        Ok(triple) => Some(triple),
-                        Err(e) if tx.is_closed() => {
-                            tracing::debug!(error = %e, "client gone during audio preprocessing");
-                            return;
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "audio preprocessing failed");
-                            let _ = tx.blocking_send(Err(e));
-                            return;
-                        }
+                    } else {
+                        let _ = tx.blocking_send(Err(Error::Other(
+                            "this model does not accept audio input (no audio tower)".to_owned(),
+                        )));
+                        return;
                     }
                 } else {
-                    let _ = tx.blocking_send(Err(Error::Other(
-                        "this model does not accept audio input (no audio tower)".to_owned(),
-                    )));
-                    return;
-                }
-            } else {
-                None
-            };
+                    None
+                };
 
             // Image and audio are mutually exclusive per request (combined input
             // rejected above), so at most one of these is `Some`.
@@ -1152,6 +1114,7 @@ impl Generator for ArchGenerator {
                     &mut token_history,
                     mm_cache.as_deref(),
                     model_sig,
+                    cancel,
                 )
             } else {
                 match multimodal_inputs {
@@ -1172,6 +1135,7 @@ impl Generator for ArchGenerator {
                         &mut sampler_rng,
                         &penalty_cfg,
                         &mut token_history,
+                        cancel,
                     ),
                     None => model.generate_greedy(
                         &tokenizer,
@@ -1188,14 +1152,14 @@ impl Generator for ArchGenerator {
                         &mut sampler_rng,
                         &penalty_cfg,
                         &mut token_history,
+                        cancel,
                     ),
                 }
             };
 
-            if cancelled {
-                // Receiver gone — no point sending the done sentinel.
+            let Some(steps_result) = unless_stopped(steps_result, step_timestamps.len()) else {
                 return;
-            }
+            };
 
             // Emit per-request prompt-cache stats to tracing after generation.
             // Reads the arch-specific global static (no lock contention with inference
@@ -1529,14 +1493,9 @@ impl Generator for ArchGenerator {
             }
         });
 
-        // Convert the mpsc receiver into a futures::Stream.
-        // stream::unfold drives the receiver: each poll awaits exactly one token,
-        // giving axum SSE the opportunity to flush between tokens.
-        let token_stream = stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
-        });
-
-        Box::pin(token_stream)
+        // Each poll of the stream awaits exactly one token, giving axum SSE
+        // the opportunity to flush between tokens.
+        Box::pin(job_stream(rx, job))
     }
 }
 

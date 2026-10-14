@@ -17,6 +17,7 @@
     clippy::too_many_lines
 )]
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use rmlx_core::error::{Error, Result};
@@ -140,6 +141,7 @@ pub fn generate_greedy<'a>(
     // Logit-penalty configuration + per-request token history.
     penalty_cfg: &'a crate::sampler::PenaltyConfig,
     token_history: &'a mut Vec<u32>,
+    cancel: &AtomicBool,
     // optional precomputed multimodal prefill. `Some(embeds)` carries
     // the scatter-merged `inputs_embeds` `[1, seq, hidden]` from
     // `gemma3::build_inputs_embeds`. When present the prompt cache is bypassed
@@ -222,6 +224,7 @@ pub fn generate_greedy<'a>(
                 rng,
                 penalty_cfg,
                 token_history,
+                cancel,
             );
         }
     }
@@ -311,6 +314,7 @@ pub fn generate_greedy<'a>(
             prefill_chunk,
             device,
             "Gemma3ForConditionalGeneration",
+            cancel,
             |chunk, caches| model.forward_seq_with_cache(chunk, Some(caches), device),
         )?
     };
@@ -466,7 +470,7 @@ pub fn generate_greedy<'a>(
     // pipeline ordering (choose_token → async_eval → drain previous pending →
     // feed) overlaps host sampling with the in-flight GPU forward; see
     // decode_loop.rs. gemma3 is pure-KV, so the closure threads only `caches`.
-    let (stats, post) = pipelined_decode(&mut ctx, last_id, &mut steps, |y| {
+    let (stats, post) = pipelined_decode(&mut ctx, last_id, &mut steps, cancel, |y| {
         model.forward_arr(y, 1, Some(&mut caches), device)
     })?;
 
@@ -517,6 +521,7 @@ fn exact_hit_decode<'a>(
     rng: &'a mut crate::sampler::Pcg32,
     penalty_cfg: &'a crate::sampler::PenaltyConfig,
     token_history: &'a mut Vec<u32>,
+    cancel: &AtomicBool,
 ) -> Result<Vec<crate::decode_loop::ProbeStep>> {
     use crate::decode_loop::ProbeStep;
 
@@ -568,7 +573,7 @@ fn exact_hit_decode<'a>(
             arch: "Gemma3ForConditionalGeneration",
             resolve_pieces: true,
         };
-        pipelined_decode(&mut ctx, last_id, &mut steps, |y| {
+        pipelined_decode(&mut ctx, last_id, &mut steps, cancel, |y| {
             model.forward_arr(y, 1, Some(&mut caches), device)
         })?
     };

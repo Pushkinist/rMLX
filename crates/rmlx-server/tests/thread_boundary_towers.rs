@@ -19,6 +19,8 @@
 
 mod thread_boundary;
 
+use thread_boundary::{GEMMA4_E2B, GEMMA4_UNIFIED_12B, MEDGEMMA, QWEN3_VL};
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -29,23 +31,6 @@ use thread_boundary::{
     arch_generator, assert_hand_over, audio_request, image_request, serve, snapshot, spoken_wav,
     Split,
 };
-
-const GEMMA4_E2B: (&str, &str) = (
-    "mlx-community__gemma-4-e2b-it-mxfp8",
-    "Gemma4ForConditionalGeneration",
-);
-const GEMMA4_UNIFIED_12B: (&str, &str) = (
-    "mlx-community__gemma-4-12B-it-mxfp8",
-    "Gemma4UnifiedForConditionalGeneration",
-);
-const MEDGEMMA: (&str, &str) = (
-    "mlx-community__medgemma-1.5-4b-it-8bit",
-    "Gemma3ForConditionalGeneration",
-);
-const QWEN3_VL: (&str, &str) = (
-    "mlx-community__Qwen3-VL-30B-A3B-Instruct-4bit",
-    "Qwen3VLMoeForConditionalGeneration",
-);
 
 // ── A tower loaded with the generator runs on another thread ────────────────
 

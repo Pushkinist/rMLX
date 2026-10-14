@@ -642,7 +642,7 @@ observed, and the header of the pin names those runs. An exact entry beside it
 on the same kernel stays a floor, on the sum: the hits of the `<=N` test can
 stand in for missing hits of the exact one. A `<=N` entry has no stale verdict.
 It still refuses a store, another kernel, another crate or test, and a count
-above N. The selftest holds the tracked pin to two such entries.
+above N. The selftest holds the tracked pin to four such entries.
 
 A hit in another crate than its entry names reads as `not pinned` there and
 `no longer fires` where it was pinned.

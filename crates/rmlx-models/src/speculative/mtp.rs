@@ -578,6 +578,7 @@ fn load_mtp_head(draft_dir: &Path, hidden_size: usize) -> Result<(MtpHeadWeights
 // ---------------------------------------------------------------------------
 
 use crate::decode_loop::ProbeStep;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 /// The block a request runs at: what it asked for, bounded by what one verify
@@ -646,7 +647,12 @@ impl RoundDrafter for SidecarRound<'_> {
     const KV_REPORT_SKIPPED_BY: ReportSkippedBy = ReportSkippedBy::TheSeedExit;
     const VERIFIER_OFFSET_BASIS: VerifierOffsetBasis = VerifierOffsetBasis::AfterTheForward;
 
-    fn prefill(&mut self, ctx: &mut RoundCtx<'_>, prompt: &[u32]) -> Result<Prefilled> {
+    fn prefill(
+        &mut self,
+        ctx: &mut RoundCtx<'_>,
+        prompt: &[u32],
+        cancel: &AtomicBool,
+    ) -> Result<Prefilled> {
         let device = ctx.device;
         let Some((&last_prompt, head)) = prompt.split_last() else {
             return Err(Error::Model(
@@ -661,6 +667,7 @@ impl RoundDrafter for SidecarRound<'_> {
             &mut ctx.kv,
             ctx.lin.as_deref_mut(),
             device,
+            cancel,
         )?;
         let prefill_ns = prefill_t0.elapsed().as_nanos();
 
@@ -836,6 +843,8 @@ impl RoundDrafter for SidecarRound<'_> {
 /// checked, and every round narrows the block again against the remaining token
 /// budget.
 ///
+/// `cancel` is the stop flag of the request, handed to [`run_rounds`].
+///
 /// # Errors
 /// [`Error::Model`] for a prompt under two tokens or a verifier that carries no
 /// recurrent state, and whatever the round loop refuses.
@@ -853,6 +862,7 @@ pub fn mtp_generate(
     step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
     sampler_cfg: &crate::sampler::SamplerConfig,
     device: Device,
+    cancel: &AtomicBool,
 ) -> Result<(Vec<ProbeStep>, usize)> {
     if prompt_ids.len() < 2 {
         return Err(Error::Model(
@@ -890,6 +900,7 @@ pub fn mtp_generate(
         // whole vocabulary, so its tokens need no per-token attribution.
         None,
         device,
+        cancel,
     )
 }
 

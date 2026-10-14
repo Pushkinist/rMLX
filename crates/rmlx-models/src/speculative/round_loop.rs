@@ -31,8 +31,10 @@
 //! edge-marker reading of this file in `round_skeleton_tests.rs`, and the text
 //! scans `make check-spec-charge` and `make check-spec-sampling`.
 
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
+use rmlx_core::cancel::ensure_not_cancelled;
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device};
 
@@ -313,11 +315,18 @@ pub(crate) trait RoundDrafter {
     const VERIFIER_OFFSET_BASIS: VerifierOffsetBasis;
 
     /// Prefill the prompt and produce the token the request emits before its
-    /// first round.
+    /// first round. `cancel` is the stop flag of the request; each chunked
+    /// prefill reads it before a chunk.
     ///
     /// # Errors
-    /// Whatever the verifier's prefill or the seed draw refuses.
-    fn prefill(&mut self, ctx: &mut RoundCtx<'_>, prompt: &[u32]) -> Result<Prefilled>;
+    /// [`Error::Cancelled`] when the request is gone, and whatever the
+    /// verifier's prefill or the seed draw refuses.
+    fn prefill(
+        &mut self,
+        ctx: &mut RoundCtx<'_>,
+        prompt: &[u32],
+        cancel: &AtomicBool,
+    ) -> Result<Prefilled>;
 
     /// The block this round runs, narrowed against the remaining budget.
     fn block(&self, block_total: usize, remaining: usize) -> usize {
@@ -401,8 +410,14 @@ pub(crate) trait RoundDrafter {
 /// here: the entry clears it before its own refusals, which is what its public
 /// signature promises a caller.
 ///
+/// `cancel` is the stop flag of the request. The loop reads it at the head of
+/// each round only, so a round that started runs to its end and leaves the
+/// verifier and the drafter at a committed prefix.
+///
 /// # Errors
 ///
+/// [`Error::Cancelled`] when the request is gone: in the prefill, or at the
+/// head of a round. A stopped request writes no request record.
 /// [`Error::Model`] when a drafter proposes nothing, and whatever the verifier's
 /// forwards, the acceptance walk or the rollback refuse.
 pub(crate) fn run_rounds<D: RoundDrafter>(
@@ -413,6 +428,7 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
     cfg: &RoundCfg<'_>,
     mut decided_by: Option<&mut Vec<DecidedBy>>,
     device: Device,
+    cancel: &AtomicBool,
 ) -> Result<(Vec<ProbeStep>, usize)> {
     let charge = cfg.charged;
     let n_tokens = cfg.n_tokens;
@@ -441,7 +457,7 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
     let mut draft_ns: u128 = 0;
     let mut verifier_ns: u128 = 0;
 
-    let prefilled = drafter.prefill(&mut ctx, prompt_ids)?;
+    let prefilled = drafter.prefill(&mut ctx, prompt_ids, cancel)?;
     let prefill_ns = prefilled.prefill_ns;
     let mut conditioned_rows = prefilled.projects_conditioning.then_some(0usize);
     let restricted_read_back = prefilled.restricted_read_back;
@@ -506,6 +522,7 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
     let mut stopped_in_round = false;
     let round_loop_t0 = Instant::now();
     while emitted.len() < n_tokens {
+        ensure_not_cancelled(cancel)?;
         let round_t0 = Instant::now();
         rounds += 1;
         let remaining = n_tokens - emitted.len();

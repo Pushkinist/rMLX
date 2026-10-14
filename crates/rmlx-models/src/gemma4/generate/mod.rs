@@ -25,6 +25,7 @@
     clippy::semicolon_if_nothing_returned,
     clippy::too_many_lines
 )]
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 pub(super) mod classify;
@@ -36,6 +37,7 @@ pub use classify::classify_smoke;
 use types::{count_nan_in_bytes, max_abs_from_bytes};
 pub use types::{ProbeStep, SmokeVerdict};
 
+use rmlx_core::cancel::ensure_not_cancelled;
 use rmlx_mlx::{Array, Device};
 use tracing::info_span;
 
@@ -103,6 +105,7 @@ pub fn generate_greedy<'a>(
     // keeps the temp=0 pure-GPU argmax path byte-for-byte untouched.
     penalty_cfg: &'a crate::sampler::PenaltyConfig,
     token_history: &'a mut Vec<u32>,
+    cancel: &AtomicBool,
     // optional precomputed multimodal prefill. `Some((embeds,
     // masked_ids))` carries the scatter-merged `inputs_embeds` `[1, seq,
     // hidden]` (text + vision features at image-token positions) and the
@@ -277,7 +280,7 @@ pub fn generate_greedy<'a>(
                 arch: "Gemma4ForConditionalGeneration",
                 resolve_pieces: true,
             };
-            pipelined_decode(&mut ctx, last_id, &mut steps, |y| {
+            pipelined_decode(&mut ctx, last_id, &mut steps, cancel, |y| {
                 model.forward_arr(y, 1, Some(&mut kv_caches), device)
             })?
         };
@@ -513,11 +516,12 @@ pub fn generate_greedy<'a>(
         // (NOT `eval_prefill_state`); there is nothing to quantize on exit.
         //
         // No enter_prefill above means no exit_prefill sweep is owed here, so a
-        // failure returns its cause immediately (unlike the shared helper, which
-        // must capture and sweep first).
+        // failure or a stop returns its cause immediately (unlike the shared
+        // helper, which must capture and sweep first).
         let mut last_logits: Option<Array> = None;
         let n_chunks = prefill_ids.len().div_ceil(prefill_chunk.0);
         for (chunk_idx, chunk) in prefill_ids.chunks(prefill_chunk.0).enumerate() {
+            ensure_not_cancelled(cancel)?;
             let is_last = chunk_idx + 1 == n_chunks;
             match model.forward_seq_with_cache(chunk, Some(&mut caches), device) {
                 Ok(logits) => {
@@ -565,6 +569,7 @@ pub fn generate_greedy<'a>(
             prefill_chunk,
             device,
             "Gemma4ForConditionalGeneration",
+            cancel,
             |chunk, caches| model.forward_seq_with_cache(chunk, Some(caches), device),
         )?
     };
@@ -729,7 +734,7 @@ pub fn generate_greedy<'a>(
     // async_eval → drain previous pending → feed) overlaps host sampling with
     // the in-flight GPU forward; see decode_loop.rs. gemma4 is pure-KV, so the
     // closure threads only `caches`.
-    let (stats, post) = pipelined_decode(&mut ctx, last_id, &mut steps, |y| {
+    let (stats, post) = pipelined_decode(&mut ctx, last_id, &mut steps, cancel, |y| {
         model.forward_arr(y, 1, Some(&mut caches), device)
     })?;
 

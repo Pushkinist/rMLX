@@ -30,6 +30,8 @@ pub use loader::{
 pub use phases::{read_load_phases, LoadPhases};
 pub use registry::{is_arch_supported, is_generative_arch, KNOWN_ARCHS};
 
+use std::sync::atomic::AtomicBool;
+
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device};
 
@@ -452,6 +454,8 @@ impl Architecture {
     /// Avoids materialising a `[1, n, vocab]` logit tensor in a single Metal
     /// command buffer, eliminating GPU timeouts for n > ~1k on Qwen3.6-MoE.
     /// Qwen3.5MoE only.
+    ///
+    /// `cancel` is the stop flag of the request; each chunk reads it.
     #[allow(clippy::type_complexity)]
     #[allow(
         clippy::wildcard_enum_match_arm,
@@ -466,6 +470,7 @@ impl Architecture {
         chunk_size: usize,
         keep_last: Option<usize>,
         device: Device,
+        cancel: &AtomicBool,
     ) -> Result<(Array, Array)> {
         match self {
             Architecture::Qwen3_5Moe(m) => m.forward_verify_capture_chunked(
@@ -476,6 +481,7 @@ impl Architecture {
                 chunk_size,
                 keep_last,
                 device,
+                cancel,
             ),
             _ => Err(Error::Model(
                 "forward_verify_capture_chunked: Qwen3.5MoE only".into(),
@@ -994,6 +1000,11 @@ impl Architecture {
     /// is pushed to the result vector) so callers can stream tokens as produced.
     /// Pass `&mut |_| {}` to discard per-step notifications.
     ///
+    /// `cancel` is the stop flag of the request. A loop that reads it returns
+    /// [`Error::Cancelled`] soon after the flag is set. A caller with no
+    /// request passes a flag that is never set. The prefill and the decode of
+    /// every architecture read it.
+    ///
     /// Returns `Vec<ProbeStep>` -- one entry per generated token.
     #[tracing::instrument(skip_all, fields(n_tokens, prompt_len = prompt_ids.len()))]
     #[allow(clippy::too_many_arguments)]
@@ -1029,6 +1040,7 @@ impl Architecture {
         // to the trailing-20 window before each `apply_penalties` call.
         penalty_cfg: &'a crate::sampler::PenaltyConfig,
         token_history: &'a mut Vec<u32>,
+        cancel: &AtomicBool,
     ) -> Result<Vec<crate::decode_loop::ProbeStep>> {
         use crate::kv_cache::DEFAULT_KV_QUANT;
         use rmlx_kv_quant::KvQuant;
@@ -1070,6 +1082,7 @@ impl Architecture {
                 rng,
                 penalty_cfg,
                 token_history,
+                cancel,
                 // text path -- no precomputed image embeds.
                 None,
             ),
@@ -1089,6 +1102,7 @@ impl Architecture {
                 rng,
                 penalty_cfg,
                 token_history,
+                cancel,
                 // text path -- no precomputed image embeds.
                 None,
             ),
@@ -1108,6 +1122,7 @@ impl Architecture {
                 rng,
                 penalty_cfg,
                 token_history,
+                cancel,
             ),
             Architecture::Qwen3(m) => crate::qwen3::generate_greedy(
                 m,
@@ -1125,6 +1140,7 @@ impl Architecture {
                 rng,
                 penalty_cfg,
                 token_history,
+                cancel,
             ),
             Architecture::Laguna(m) => crate::laguna::generate_greedy(
                 m,
@@ -1142,6 +1158,7 @@ impl Architecture {
                 rng,
                 penalty_cfg,
                 token_history,
+                cancel,
             ),
             Architecture::Qwen3_5Moe(m) => crate::qwen3_5_moe::generate_greedy(
                 m,
@@ -1159,6 +1176,7 @@ impl Architecture {
                 rng,
                 penalty_cfg,
                 token_history,
+                cancel,
             ),
             Architecture::Qwen3VlMoe(m) => crate::qwen3_vl_moe::generate_greedy(
                 &m.text,
@@ -1176,6 +1194,7 @@ impl Architecture {
                 rng,
                 penalty_cfg,
                 token_history,
+                cancel,
             ),
             Architecture::BitNet(m) => crate::bitnet::generate_greedy(
                 m,
@@ -1193,6 +1212,7 @@ impl Architecture {
                 rng,
                 penalty_cfg,
                 token_history,
+                cancel,
             ),
         }
     }
@@ -1232,6 +1252,7 @@ impl Architecture {
         rng: &'a mut crate::sampler::Pcg32,
         penalty_cfg: &'a crate::sampler::PenaltyConfig,
         token_history: &'a mut Vec<u32>,
+        cancel: &AtomicBool,
     ) -> Result<Vec<crate::decode_loop::ProbeStep>> {
         use crate::kv_cache::DEFAULT_KV_QUANT;
         use rmlx_kv_quant::KvQuant;
@@ -1264,6 +1285,7 @@ impl Architecture {
                     rng,
                     penalty_cfg,
                     token_history,
+                    cancel,
                     Some((embeds, masked_ids)),
                 )
             }
@@ -1293,6 +1315,7 @@ impl Architecture {
                     rng,
                     penalty_cfg,
                     token_history,
+                    cancel,
                     Some(embeds),
                 )
             }

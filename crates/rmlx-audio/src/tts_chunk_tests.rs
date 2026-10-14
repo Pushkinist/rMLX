@@ -10,6 +10,7 @@ use super::{
     decode_in_chunks, TtsError, DECODE_CHUNK_FRAMES as CHUNK, DECODE_LEFT_CONTEXT_FRAMES as CONTEXT,
 };
 use rmlx_mlx::{Array, Device};
+use std::sync::atomic::AtomicBool;
 
 const SAMPLES_PER_FRAME: usize = 3;
 
@@ -48,7 +49,13 @@ fn expected(frames: usize) -> Vec<f32> {
 fn a_sequence_of_at_most_one_chunk_is_one_pass_over_all_its_codes() {
     for frames in [1, CONTEXT, CHUNK - 1, CHUNK] {
         let mut windows = Vec::new();
-        let samples = decode_in_chunks(&codes(frames), Device::Cpu, pass(&mut windows)).unwrap();
+        let samples = decode_in_chunks(
+            &codes(frames),
+            Device::Cpu,
+            &AtomicBool::new(false),
+            pass(&mut windows),
+        )
+        .unwrap();
         assert_eq!(windows, [(0, frames)], "{frames} frames");
         assert_eq!(samples, expected(frames), "{frames} frames");
     }
@@ -58,7 +65,13 @@ fn a_sequence_of_at_most_one_chunk_is_one_pass_over_all_its_codes() {
 fn a_later_pass_starts_one_context_early_and_drops_the_context_samples() {
     for frames in [CHUNK + 1, 2 * CHUNK + 100] {
         let mut windows = Vec::new();
-        let samples = decode_in_chunks(&codes(frames), Device::Cpu, pass(&mut windows)).unwrap();
+        let samples = decode_in_chunks(
+            &codes(frames),
+            Device::Cpu,
+            &AtomicBool::new(false),
+            pass(&mut windows),
+        )
+        .unwrap();
 
         let mut want_windows = vec![(0, CHUNK)];
         let mut start = CHUNK;
@@ -75,14 +88,16 @@ fn a_later_pass_starts_one_context_early_and_drops_the_context_samples() {
 
 #[test]
 fn a_pass_that_returns_a_partial_frame_is_an_error() {
-    let result = decode_in_chunks(&codes(10), Device::Cpu, |_| Ok(vec![0.0; 7]));
+    let result = decode_in_chunks(&codes(10), Device::Cpu, &AtomicBool::new(false), |_| {
+        Ok(vec![0.0; 7])
+    });
     assert!(matches!(result, Err(TtsError::Mlx(_))), "{result:?}");
 }
 
 #[test]
 fn a_sequence_of_no_frame_is_an_error() {
     let mut passes = 0;
-    let result = decode_in_chunks(&codes(0), Device::Cpu, |_| {
+    let result = decode_in_chunks(&codes(0), Device::Cpu, &AtomicBool::new(false), |_| {
         passes += 1;
         Ok(Vec::new())
     });

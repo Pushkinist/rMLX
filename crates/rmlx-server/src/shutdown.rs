@@ -9,8 +9,9 @@
 //!    gets 503; a response that streams ends there, with no terminal item.
 //! 3. The time between the two bounds is for the 503 to reach its client and
 //!    for a blocking job that reads the drop of its request to return. A
-//!    transcription walk reads it, before each window. A chat decode and a
-//!    speech synthesis are not known to return in that time.
+//!    transcription walk reads it, before each window, and a chat job on the
+//!    shared loops reads it before each step. The jobs that do not read it
+//!    yet are in `docs/SERVER_SHUTDOWN.md`.
 //! 4. At [`EXIT_BOUND`], or that same time after a second signal, the process
 //!    exits. A job that still runs ends with it, and the Metal claim stays
 //!    held until the process is gone.

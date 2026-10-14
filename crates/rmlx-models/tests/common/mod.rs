@@ -706,6 +706,7 @@ pub fn run_golden_test(test: &str, fixture_tag: &str, kv_quant: KvQuant, model_p
             &mut rng,
             &penalty_cfg,
             &mut token_history,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .expect("generate_greedy");
 
@@ -867,6 +868,7 @@ fn measure_top2_margin(
             &mut rng,
             penalty_cfg,
             &mut token_history,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .ok()?;
 

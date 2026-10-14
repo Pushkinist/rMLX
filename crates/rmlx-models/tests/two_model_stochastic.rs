@@ -179,6 +179,7 @@ fn generate_n(
             &mut step_fn,
             None,
             cfg,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .expect("speculative generate");
     ids

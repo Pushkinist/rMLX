@@ -1886,6 +1886,7 @@ fn integration_paro_generate_greedy() {
         &mut test_rng,
         &test_penalty_cfg,
         &mut test_token_history,
+        &std::sync::atomic::AtomicBool::new(false),
     )
     .expect("generate_greedy");
 
@@ -2273,6 +2274,7 @@ fn hydrated_tail_produces_identical_output() {
             &mut rng,
             &penalty_cfg,
             &mut token_history,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .expect("cold generate_greedy");
         steps.into_iter().map(|s| s.token_id).collect()
@@ -2326,6 +2328,7 @@ fn hydrated_tail_produces_identical_output() {
             &mut rng,
             &penalty_cfg,
             &mut token_history,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .expect("warm generate_greedy");
         steps.into_iter().map(|s| s.token_id).collect()
@@ -2397,6 +2400,7 @@ fn hydrated_tail_produces_identical_output() {
             &mut rng,
             &penalty_cfg,
             &mut token_history,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .expect("divergent generate_greedy");
         steps.into_iter().map(|s| s.token_id).collect()
@@ -2527,6 +2531,7 @@ fn a_hydrated_tail_issues_no_attention_call_in_the_faulty_configuration() {
                 &mut rng,
                 &penalty_cfg,
                 &mut token_history,
+                &std::sync::atomic::AtomicBool::new(false),
             )
         });
         drop(chunk_override);
@@ -2681,6 +2686,7 @@ fn hydrated_exact_block_no_tail_not_placeholder() {
             &mut rng,
             &penalty_cfg,
             &mut token_history,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .expect("cold generate_greedy");
         steps.into_iter().map(|s| s.token_id).collect()
@@ -2819,6 +2825,7 @@ fn hydrated_exact_block_no_tail_not_placeholder() {
             &mut rng,
             &penalty_cfg,
             &mut token_history,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .expect("warm generate_greedy");
         steps.into_iter().map(|s| s.token_id).collect()
@@ -2954,6 +2961,7 @@ fn hydrated_tail_k8v8_equivalence() {
             &mut rng,
             &penalty_cfg,
             &mut token_history,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .expect("cold generate_greedy (K8V8)");
         steps.into_iter().map(|s| s.token_id).collect()
@@ -3065,6 +3073,7 @@ fn hydrated_tail_k8v8_equivalence() {
             &mut rng,
             &penalty_cfg,
             &mut token_history,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .expect("warm generate_greedy (K8V8)");
         steps.into_iter().map(|s| s.token_id).collect()
@@ -3214,6 +3223,7 @@ fn qwen3_5_moe_consume_engine_migration_golden() {
             &mut rng,
             &penalty_cfg,
             &mut token_history,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .expect("generate_greedy")
         .into_iter()

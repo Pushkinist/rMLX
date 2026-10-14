@@ -100,7 +100,9 @@
 // declaration.
 
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 
+use rmlx_core::cancel::ensure_not_cancelled;
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{add, argmax, concatenate, rope, Array, Device};
 
@@ -738,6 +740,9 @@ impl Eagle3Drafter {
     /// Returns `(h_seed[1,1,H], seed_tok)` — same contract as the pre-
     /// single-shot path. For short prompts (n ≤ DRAFTER_PREFILL_CHUNK) this
     /// is a single `forward_tokens_conditioned` call — no overhead.
+    ///
+    /// `cancel` is the stop flag of the request. Each chunk reads it before its
+    /// forward, and a stopped prefill returns [`Error::Cancelled`].
     #[allow(
         clippy::expect_used,
         reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
@@ -752,6 +757,7 @@ impl Eagle3Drafter {
         shifted_tokens: &[u32],
         verifier_aux_hidden: &Array,
         device: Device,
+        cancel: &AtomicBool,
     ) -> Result<(Array, u32)> {
         if shifted_tokens.is_empty() {
             return Err(Error::Model(
@@ -773,6 +779,7 @@ impl Eagle3Drafter {
         let mut h_seed_out: Option<Array> = None;
 
         while pos < total {
+            ensure_not_cancelled(cancel)?;
             let end = (pos + DRAFTER_PREFILL_CHUNK).min(total);
             let chunk_toks = &shifted_tokens[pos..end];
             let chunk_n = chunk_toks.len() as i32;

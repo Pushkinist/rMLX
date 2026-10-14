@@ -167,10 +167,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   correct, and a stream that had not sent its terminal item has no `[DONE]`,
   no `finish_reason`, no `message_stop` and no error event, so a client must
   check for the terminal item. A transcription stops before its next
-  window. A chat or speech job is not stopped; one that still runs 2 s later
-  ends with the process, and the Metal claim stays held until the process is
-  gone. A second SIGINT or SIGTERM ends the 8 s wait at once, and the exit
-  follows 2 s after it; before, it did nothing. A shutdown with no request in
+  window. A job that is not stopped and still runs 2 s later ends with the
+  process, and the Metal claim stays held until the process is gone. A second
+  SIGINT or SIGTERM ends the 8 s wait at once, and the exit follows 2 s after
+  it; before, it did nothing. A shutdown with no request in
   flight is as fast as before. See `docs/SERVER_SHUTDOWN.md`.
 - **A model load no longer stops the server.** A chat, messages or
   model-load request for a model that was not loaded ran the load on an
@@ -204,6 +204,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   overflows now fail the load. A header that lied about its shape could panic
   the reader. A member that is not an `.npy` file is skipped with a debug
   event.
+- **A chat or speech request that is gone stops and frees the GPU.** After a
+  408, a closed connection or the reply bound of a shutdown, a chat or
+  messages generation or a speech synthesis ran to its end and held the one
+  GPU permit, so the next request waited. Now the job reads the stop of its
+  request before each decode step and before each chunk of a prefill, and
+  returns. This is true on every architecture, for a full prefill and for the
+  tail prefill after a prompt-cache prefix hit on Gemma 4 or after an
+  SSD-restored prefix on Qwen3.5. An image request on Gemma 4 and Gemma 3
+  reads the stop before the load of each image. An image request on Qwen3-VL
+  also reads the stop before each block of its vision tower and before each
+  chunk of its image prefill. A request with a draft model reads the stop
+  before each round and before each chunk of the prefills of the verifier and
+  the drafter; a round that started runs to its end. A tower error on Qwen3-VL
+  keeps its own class, so a tower error of the `Model` class is no longer run
+  again; an error that is not a stop is logged once with its cause. A job
+  decides that its request stopped from the result of the generation, not from
+  the flag: a generation that ran to its end keeps its completed-request
+  record and its rows, also when its request went away after it. A job whose
+  generation stopped in its prefill, before a decode step or at the head of a
+  round logs one `info` event, `the request is gone; the generation stopped`,
+  with the count `emitted` of the tokens that were given to the step callback
+  (a token that the last forward picked is not counted where the stop drops
+  it; a stop in the load of an image or the decode of an audio clip logs it
+  with 0 and no `warn` event), and writes no row of a completed generation and
+  no completed-request record. The rows of the first token stay: a route
+  writes them when the first token comes, and they are a measurement of an
+  event that occurred. A request that stops in its prefill stores no
+  prompt-cache entry from that prefill. On Qwen3.5 with the SSD tier, the
+  prefix that the request restored from the SSD tier is put into a memory slot
+  before the first read of the stop, as a complete entry, and it can evict the
+  oldest slot. A speech request reads the stop before each talker frame and
+  before each pass of the codec decode; it sends no body and writes no row.
+  An embeddings job has no stop. The load of one image
+  (a remote fetch takes up to 20 s), the vision tower of Gemma 4 and Gemma 3,
+  the audio tower of Gemma 4 and the prefill of their image or audio prompt
+  have no stop inside them: they run to their end, and the job stops at its
+  next read of the stop after them. See `docs/SERVER_SHUTDOWN.md` § "What
+  stops, and what does not".
 - **A language that Whisper does not know is an error, and `verbose_json`
   names the language in a form a client can read.** `rmlx transcribe
   --language xx` was decoded as English with no error. It now stops before the

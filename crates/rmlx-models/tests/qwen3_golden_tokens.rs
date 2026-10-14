@@ -134,6 +134,7 @@ fn thinking_budget_exact_hit_qwen3_5_moe() {
                 &mut rng,
                 &penalty_cfg,
                 &mut token_history,
+                &std::sync::atomic::AtomicBool::new(false),
             )
             .expect("warm call");
     }
@@ -169,6 +170,7 @@ fn thinking_budget_exact_hit_qwen3_5_moe() {
             &mut rng,
             &penalty_cfg,
             &mut token_history,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .expect("exact-hit call with budget");
 

@@ -630,6 +630,7 @@ fn run_arm(
             &mut step,
             cfg,
             device,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .expect("the assistant arm must run");
     }

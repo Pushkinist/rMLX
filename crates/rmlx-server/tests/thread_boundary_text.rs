@@ -18,24 +18,10 @@
 
 mod thread_boundary;
 
+use thread_boundary::{BITNET, BONSAI_8B, GEMMA4_E2B, QWEN36_MOE, READERLM_V2, TERNARY_BONSAI_27B};
+
 use rmlx_mlx::Device;
 use thread_boundary::{chat_prompt, greedy, hand_over, load_model, long_prompt, snapshot, Split};
-
-const BONSAI_8B: (&str, &str) = ("prism-ml__Ternary-Bonsai-8B-mlx-2bit", "Qwen3ForCausalLM");
-const TERNARY_BONSAI_27B: (&str, &str) = (
-    "prism-ml__Ternary-Bonsai-27B-mlx-2bit",
-    "Qwen3_5ForConditionalGeneration",
-);
-const READERLM_V2: (&str, &str) = ("mlx-community__jinaai-ReaderLM-v2", "Qwen2ForCausalLM");
-const BITNET: (&str, &str) = ("mlx-community__bitnet-b1.58-2B-4T", "BitNetForCausalLM");
-const GEMMA4_E2B: (&str, &str) = (
-    "mlx-community__gemma-4-e2b-it-mxfp8",
-    "Gemma4ForConditionalGeneration",
-);
-const QWEN36_MOE: (&str, &str) = (
-    "mlx-community__Qwen3.6-35B-A3B-8bit",
-    "Qwen3_5MoeForConditionalGeneration",
-);
 
 // ── A loaded model decodes on another thread ────────────────────────────────
 

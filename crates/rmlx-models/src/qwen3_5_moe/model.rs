@@ -13,6 +13,9 @@
 // unsafe_code: mlx-rs Array zero-copy view — slice::from_raw_parts byte-reinterpret for Array::from_bytes
 #![allow(unsafe_code)]
 #![allow(clippy::redundant_closure_for_method_calls, clippy::ref_option)]
+use std::sync::atomic::AtomicBool;
+
+use rmlx_core::cancel::ensure_not_cancelled;
 use rmlx_core::error::Result;
 use rmlx_mlx::{Array, Device, Dtype};
 
@@ -893,6 +896,10 @@ impl Qwen3_5MoeText {
     ///
     /// When `ids.len() <= chunk_size` the entire prompt is a single chunk
     /// (no concatenation overhead).
+    ///
+    /// `cancel` is the stop flag of the request. Each chunk reads it before its
+    /// forward, and a stopped prefill returns
+    /// [`rmlx_core::error::Error::Cancelled`].
     #[allow(clippy::type_complexity)]
     #[allow(
         clippy::indexing_slicing,
@@ -907,6 +914,7 @@ impl Qwen3_5MoeText {
         chunk_size: usize,
         keep_last: Option<usize>,
         device: Device,
+        cancel: &AtomicBool,
     ) -> Result<(Array, Array)> {
         let n = ids.len();
         if n == 0 {
@@ -926,6 +934,7 @@ impl Qwen3_5MoeText {
         let mut pos = 0usize;
 
         while pos < n {
+            ensure_not_cancelled(cancel)?;
             let end = (pos + chunk_size).min(n);
             let chunk = &ids[pos..end];
             let chunk_n = chunk.len();

@@ -34,11 +34,13 @@
 //! per-step `debug!` (gemma4/qwen2/qwen3 = true) vs. an empty `Box<str>` piece
 //! with no per-step debug (qwen3_5_moe = false). Both are preserved byte-for-byte.
 
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use rmlx_mlx::{Array, Device, Dtype};
 use tracing::info_span;
 
+use rmlx_core::cancel::ensure_not_cancelled;
 use rmlx_core::error::{Error, Result};
 
 use crate::constraint::ConstraintEngine;
@@ -374,6 +376,10 @@ pub(crate) fn choose_token(
 /// and `token_history` by the caller; this fn drives steps `1..n_tokens`.
 /// `forward_step` is the ONLY per-arch hole — it is `impl FnMut` (monomorphized,
 /// zero dispatch); never accept a `Box<dyn>` here.
+///
+/// `cancel` is the stop flag of the request. Each pass reads it before its
+/// forward. A stopped decode returns [`Error::Cancelled`]: it does not emit the
+/// token that its last forward picked, and it mints no [`PostDecode`] witness.
 #[allow(
     clippy::unwrap_used,
     reason = "the remaining unwraps are the 4-byte `try_into` on a [..4] slice of a [1] I32 Array — length is structural, not data-dependent"
@@ -391,6 +397,7 @@ pub(crate) fn pipelined_decode(
     ctx: &mut DecodeCtx<'_>,
     first_id: u32,
     steps: &mut Vec<ProbeStep>,
+    cancel: &AtomicBool,
     mut forward_step: impl FnMut(&Array) -> Result<Array>,
 ) -> Result<(DecodeStats, PostDecode)> {
     let mut stats = DecodeStats::default();
@@ -429,6 +436,8 @@ pub(crate) fn pipelined_decode(
     let mut forced_next: Option<u32> = None;
 
     for step_idx in 1..ctx.n_tokens {
+        ensure_not_cancelled(cancel)?;
+
         // Debug-only GPU-trace window. Compiled out entirely without the
         // `metal-capture` feature, so an ordinary build has no branch here.
         // Ticked before the step's work so the trace brackets whole steps, and
@@ -790,14 +799,19 @@ fn log_prefill_plan(
 }
 
 /// Fresh chunked prefill: `enter_prefill` → per-chunk forward + `eval_prefill_state`
-/// → `exit_prefill`. Returns the final-position logits, or the cause of the
-/// failure that prevented them.
+/// → `exit_prefill`. Returns the final-position logits, or the cause that
+/// prevented them.
 ///
-/// A prefill that does not produce logits is a **failure, not an outcome**: the
-/// caller has no logits to sample from, so every path out of here that is not a
-/// final-position `Array` carries an `Err` naming why. Returning the cause is
-/// what keeps a rejected prefill from surfacing as a successful run reporting
-/// zeros — a bench harness reads throughput fields, not the log.
+/// A prefill that does not produce logits is a **failure or a stop, not an
+/// outcome**: the caller has no logits to sample from, so every path out of
+/// here that is not a final-position `Array` carries an `Err` naming why.
+/// Returning the cause is what keeps a rejected prefill from surfacing as a
+/// successful run reporting zeros — a bench harness reads throughput fields,
+/// not the log.
+///
+/// `cancel` is the stop flag of the request. Each chunk reads it before its
+/// forward. A stopped prefill returns [`Error::Cancelled`] after the exit
+/// sweep, so its caller picks no first token and stores no prompt.
 ///
 /// `resolved_chunk` is the `(size, source)` pair from
 /// [`crate::prefill_chunk::resolve`], threaded in rather than re-derived here.
@@ -826,54 +840,56 @@ pub(crate) fn chunked_prefill(
     resolved_chunk: (usize, &'static str),
     device: Device,
     arch: &'static str,
+    cancel: &AtomicBool,
     mut forward_chunk: impl FnMut(&[u32], &mut Vec<KvCache>) -> Result<Array>,
 ) -> Result<Array> {
     let (chunk_size, chunk_source) = resolved_chunk;
     for c in caches.iter_mut() {
         c.enter_prefill();
     }
-    let mut last_logits: Option<Array> = None;
-    let mut first_err: Option<Error> = None;
     let n_chunks = ids.len().div_ceil(chunk_size.max(1));
     log_prefill_plan(arch, chunk_size, chunk_source, ids.len(), n_chunks);
-    for (chunk_idx, chunk) in ids.chunks(chunk_size.max(1)).enumerate() {
-        let is_last = chunk_idx + 1 == n_chunks;
-        match forward_chunk(chunk, caches) {
-            Ok(logits) => {
-                if is_last {
-                    last_logits = Some(logits);
-                } else {
-                    // Eval only the cache prefill state, skip the lm_head matmul
-                    // for non-final chunks via lazy-graph pruning. Stops at the
-                    // first failing cache.
-                    if let Some(e) = caches.iter().find_map(|c| c.eval_prefill_state().err()) {
-                        tracing::error!(
-                            arch,
-                            error = %e,
-                            chunk_len = chunk.len(),
-                            "prefill chunk cache eval failed, aborting generation"
-                        );
-                        // Cause captured, not returned: the exit_prefill sweep
-                        // below is mandatory for every cache that entered
-                        // prefill. It runs, then this error propagates.
-                        first_err = Some(e);
-                        break;
+    // A closure, so that `?` ends the chunk loop and not this fn: the
+    // exit_prefill sweep below is owed on every outcome, a stop included.
+    let mut run_chunks = |caches: &mut Vec<KvCache>| -> Result<Option<Array>> {
+        let mut last_logits: Option<Array> = None;
+        for (chunk_idx, chunk) in ids.chunks(chunk_size.max(1)).enumerate() {
+            ensure_not_cancelled(cancel)?;
+            let is_last = chunk_idx + 1 == n_chunks;
+            match forward_chunk(chunk, caches) {
+                Ok(logits) => {
+                    if is_last {
+                        last_logits = Some(logits);
+                    } else {
+                        // Eval only the cache prefill state, skip the lm_head matmul
+                        // for non-final chunks via lazy-graph pruning. Stops at the
+                        // first failing cache.
+                        if let Some(e) = caches.iter().find_map(|c| c.eval_prefill_state().err()) {
+                            tracing::error!(
+                                arch,
+                                error = %e,
+                                chunk_len = chunk.len(),
+                                "prefill chunk cache eval failed, aborting generation"
+                            );
+                            return Err(e);
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                tracing::error!(
-                    arch,
-                    error = %e,
-                    prompt_len = ids.len(),
-                    "prefill chunk failed, aborting generation"
-                );
-                // Cause captured, not returned — see above.
-                first_err = Some(e);
-                break;
+                Err(e) => {
+                    tracing::error!(
+                        arch,
+                        error = %e,
+                        prompt_len = ids.len(),
+                        "prefill chunk failed, aborting generation"
+                    );
+                    return Err(e);
+                }
             }
         }
-    }
+        Ok(last_logits)
+    };
+    let chunks = run_chunks(caches);
+    let mut exit_err: Option<Error> = None;
     for c in caches.iter_mut() {
         if let Err(e) = c.exit_prefill(device) {
             tracing::error!(arch, error = %e, "prefill: exit_prefill quantization failed, aborting generation");
@@ -882,12 +898,11 @@ pub(crate) fn chunked_prefill(
             // remaining caches with un-finalized prefill state (no decode
             // seed / un-quantized storage) that corrupts any later reuse of
             // this Vec.
-            if first_err.is_none() {
-                first_err = Some(e);
-            }
+            exit_err.get_or_insert(e);
         }
     }
-    if let Some(e) = first_err {
+    let last_logits = chunks?;
+    if let Some(e) = exit_err {
         return Err(e);
     }
     // Model, not Other: an empty prompt is deterministic, so the retry envelope

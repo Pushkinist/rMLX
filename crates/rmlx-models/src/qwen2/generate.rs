@@ -12,8 +12,10 @@
     clippy::indexing_slicing
 )]
 
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
+use rmlx_core::cancel::ensure_not_cancelled;
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{argmax, Array, Device, Dtype};
 
@@ -121,6 +123,7 @@ pub fn generate_greedy(
     // Logit-penalty configuration + per-request token history.
     penalty_cfg: &crate::sampler::PenaltyConfig,
     token_history: &mut Vec<u32>,
+    cancel: &AtomicBool,
 ) -> Result<Vec<crate::decode_loop::ProbeStep>> {
     use crate::decode_loop::ProbeStep;
 
@@ -221,6 +224,7 @@ pub fn generate_greedy(
             rng,
             penalty_cfg,
             token_history,
+            cancel,
             &mut forward_total_ns,
             &mut eval_total_ns,
             &mut step_total_ns,
@@ -276,46 +280,58 @@ pub fn generate_greedy(
     // which names nothing — the real cause (a Metal fault, a store refusing an
     // append) is erased. Propagate it verbatim.
     let prefill_logits = {
-        let mut last_logits: Option<Array> = None;
         let n_chunks = prompt_ids.len().div_ceil(prefill_chunk);
-        for (chunk_idx, chunk) in prompt_ids.chunks(prefill_chunk).enumerate() {
-            let is_last = chunk_idx + 1 == n_chunks;
-            match model.forward_seq_with_cache(chunk, Some(&mut caches), device) {
-                Ok(logits) => {
-                    if is_last {
-                        last_logits = Some(logits);
-                    } else {
-                        for c in &caches {
-                            if let Err(e) = c.eval_prefill_state() {
-                                tracing::error!(
-                                    error = %e,
-                                    chunk_len = chunk.len(),
-                                    "qwen2 generate_greedy: prefill chunk cache eval failed, \
-                                     aborting generation"
-                                );
-                                return Err(e);
+        // A closure, so that `?` ends the chunk loop and not this fn: the
+        // exit_prefill sweep below is owed on every outcome, a stop included.
+        let run_chunks = |caches: &mut [KvCache]| -> Result<Option<Array>> {
+            let mut last_logits: Option<Array> = None;
+            for (chunk_idx, chunk) in prompt_ids.chunks(prefill_chunk).enumerate() {
+                ensure_not_cancelled(cancel)?;
+                let is_last = chunk_idx + 1 == n_chunks;
+                match model.forward_seq_with_cache(chunk, Some(&mut *caches), device) {
+                    Ok(logits) => {
+                        if is_last {
+                            last_logits = Some(logits);
+                        } else {
+                            for c in caches.iter() {
+                                if let Err(e) = c.eval_prefill_state() {
+                                    tracing::error!(
+                                        error = %e,
+                                        chunk_len = chunk.len(),
+                                        "qwen2 generate_greedy: prefill chunk cache eval failed, \
+                                         aborting generation"
+                                    );
+                                    return Err(e);
+                                }
                             }
                         }
                     }
-                }
-                Err(e) => {
-                    tracing::error!(
-                        error = %e,
-                        prompt_len = prompt_ids.len(),
-                        "qwen2 generate_greedy: prefill chunk failed, aborting generation"
-                    );
-                    return Err(e);
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            prompt_len = prompt_ids.len(),
+                            "qwen2 generate_greedy: prefill chunk failed, aborting generation"
+                        );
+                        return Err(e);
+                    }
                 }
             }
-        }
+            Ok(last_logits)
+        };
+        let chunks = run_chunks(&mut caches);
+        let mut exit_err: Option<Error> = None;
         for c in &mut caches {
             if let Err(e) = c.exit_prefill(device) {
                 tracing::error!(
                     error = %e,
                     "qwen2 generate_greedy: exit_prefill quantization failed, aborting generation"
                 );
-                return Err(e);
+                exit_err.get_or_insert(e);
             }
+        }
+        let last_logits = chunks?;
+        if let Some(e) = exit_err {
+            return Err(e);
         }
         let Some(l) = last_logits else {
             return Err(Error::Other(
@@ -498,6 +514,7 @@ pub fn generate_greedy(
         rng,
         penalty_cfg,
         token_history,
+        cancel,
         &mut forward_total_ns,
         &mut eval_total_ns,
         &mut step_total_ns,
@@ -535,6 +552,10 @@ pub fn generate_greedy(
 /// background; GPU sync only happens on the *previous* step's `pending` via
 /// `to_bytes()`. The `last_id` u32 is only used to build the initial Array for
 /// the very first decode step.
+///
+/// `cancel` is the stop flag of the request. Each pass reads it before its
+/// forward. A stopped decode returns [`Error::Cancelled`] and does not emit the
+/// token that its last forward picked.
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::indexing_slicing,
@@ -560,6 +581,7 @@ fn decode_loop(
     rng: &mut crate::sampler::Pcg32,
     penalty_cfg: &crate::sampler::PenaltyConfig,
     token_history: &mut Vec<u32>,
+    cancel: &AtomicBool,
     forward_total_ns: &mut u128,
     eval_total_ns: &mut u128,
     step_total_ns: &mut u128,
@@ -577,6 +599,8 @@ fn decode_loop(
     let mut early_stop = false;
 
     for step_idx in 1..n_tokens {
+        ensure_not_cancelled(cancel)?;
+
         let step_t0 = Instant::now();
         let fwd_t0 = Instant::now();
         // A failed forward aborts the request: returning the tokens produced so

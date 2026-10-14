@@ -650,6 +650,90 @@ async fn replay_stream_client_drop_aborts_engine_task() {
     );
 }
 
+/// A generator whose reply is the stream of a job of the job runner, as the
+/// chat generator's is. The job holds its sender, sends `tokens` items, tells
+/// the test it runs, waits for the stop flag, and reports whether it saw it.
+struct JobGen {
+    tokens: u32,
+    running: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    saw_flag: std::sync::Mutex<Option<std::sync::mpsc::Sender<bool>>>,
+}
+
+impl Generator for JobGen {
+    fn generate(
+        &self,
+        _req: GenerationRequest,
+    ) -> Pin<Box<dyn futures::stream::Stream<Item = rmlx_core::Result<GenerationToken>> + Send>>
+    {
+        let (tx, rx) = tokio::sync::mpsc::channel::<rmlx_core::Result<GenerationToken>>(4);
+        let tokens = self.tokens;
+        let running = self.running.lock().expect("the lock").take();
+        let saw_flag = self.saw_flag.lock().expect("the lock").take();
+        let job = crate::engine::run_admitted(None, move |cancel| {
+            for token_id in 0..tokens {
+                tx.blocking_send(Ok(GenerationToken {
+                    token_id,
+                    piece: format!("t{token_id}"),
+                    done: false,
+                    finish_reason: None,
+                    is_thinking: false,
+                    logprobs: None,
+                }))
+                .ok();
+            }
+            if let Some(running) = running {
+                running.send(()).ok();
+            }
+            let saw = crate::engine::tests::wait_for_flag(cancel);
+            if let Some(saw_flag) = saw_flag {
+                saw_flag.send(saw).ok();
+            }
+        });
+        Box::pin(crate::engine::types::job_stream(rx, job))
+    }
+}
+
+/// Drop a replay stream after it has read `read` tokens of a job, and report
+/// whether the job saw its stop flag.
+async fn job_sees_the_drop_of_a_replay_stream(read: u32) -> bool {
+    let (running_tx, running_rx) = std::sync::mpsc::channel();
+    let (saw_tx, saw_rx) = std::sync::mpsc::channel();
+    let gen = Arc::new(JobGen {
+        tokens: read,
+        running: std::sync::Mutex::new(Some(running_tx)),
+        saw_flag: std::sync::Mutex::new(Some(saw_tx)),
+    });
+    let mut s = drive(gen, vec![0u32], 100, 0);
+    assert_eq!(
+        crate::engine::tests::report(running_rx).await,
+        Ok(()),
+        "the job did not start"
+    );
+    for _ in 0..read {
+        assert!(s.next().await.is_some_and(|item| item.is_ok()));
+    }
+    // The task of the stream is now parked on the read of the token stream.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    drop(s);
+    crate::engine::tests::report(saw_rx)
+        .await
+        .expect("the job reports")
+}
+
+/// A drop of the replay stream aborts the task of the attempt, which drops
+/// the reply stream of its job and sets the stop flag of the job. A bare
+/// `JoinHandle` detaches the task and the job never sees the flag.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_replay_stream_stops_the_job_of_its_attempt() {
+    assert!(job_sees_the_drop_of_a_replay_stream(0).await);
+}
+
+/// The same, after the client has read a token.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replay_stream_dropped_after_a_token_stops_the_job_of_its_attempt() {
+    assert!(job_sees_the_drop_of_a_replay_stream(1).await);
+}
+
 // ── generate-call count tests (proxy for single-emit invariant) ───
 //
 // The real kv_cache_bytes / itl_p*_ms writes happen inside the blocking

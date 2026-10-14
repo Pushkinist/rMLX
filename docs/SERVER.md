@@ -113,10 +113,9 @@ the only admission path.
 The timeout middleware reads an optional `X-Request-Timeout-Seconds` header
 and caps it at `--max-timeout-secs` (default 600). A cap of 0 disables the
 timeout. A header that is not a positive integer gets 400. An expired request
-gets HTTP 408 `timeout`. The 408 drops the request; blocking work that already
-runs is not stopped by it, except a Whisper transcription, which stops before
-its next 30 s window (see the speech-to-text routes in
-[`SERVER_AUDIO.md`](SERVER_AUDIO.md)).
+gets HTTP 408 `timeout`. The 408 drops the request. The work that then stops
+is in [`SERVER_SHUTDOWN.md`](SERVER_SHUTDOWN.md) § "What stops, and what does
+not".
 
 `X-Request-Id`, when present, becomes the request's correlation id (trimmed,
 printable ASCII, at most 128 characters). Otherwise the server makes a
@@ -221,8 +220,8 @@ positions.
 - Each `input_audio` part is capped at 16 MiB decoded
   (`bounds::MAX_INPUT_AUDIO_BYTES`); a larger clip is 400. Its audio is
   capped at what the context holds after the prompt, at most 3 h (`docs/AUDIO.md`
-  § "WAV I/O"). Its decode stops when the client is gone (the token channel
-  closes); the audio tower and the prefill are not cut.
+  § "WAV I/O"). Its decode stops when the request is gone; the audio tower
+  and the prefill are not cut.
 
 ### Responses
 
@@ -682,14 +681,15 @@ through `RmlxError::is_migratable` (`crates/rmlx-core/src/error.rs`):
 | Class | Variants | Action |
 |---|---|---|
 | `Migratable` | `Mlx`, `Other` | Replay. |
-| `Fatal` | every other variant: `Io`, `Config`, `Loader`, `Quant`, `Model`, `SmokeProbe`, `Oom`, `ArchUnsupported`, `KvStorageMismatch`, `SsdTierAlreadyInstalled`, `Unimplemented`, `KvHardCapExceeded`, `KvCeilingExceeded`, `ContextCeilingExceeded`, `SpeculativePairing` | Surface the error. |
+| `Fatal` | every other variant: `Io`, `Config`, `Loader`, `Quant`, `Model`, `SmokeProbe`, `Oom`, `ArchUnsupported`, `KvStorageMismatch`, `SsdTierAlreadyInstalled`, `Unimplemented`, `KvHardCapExceeded`, `KvCeilingExceeded`, `ContextCeilingExceeded`, `SpeculativePairing`, `GpuForbidden`, `Cancelled` | Surface the error. |
 
 The match has no wildcard arm and lives in `rmlx-core`, where `RmlxError` is
 defined. A new variant fails the build until it is classified.
 
 A NaN logit row at prefill is `Other`, so it is replayed; a deterministic one
 surfaces after three attempts as 503 `service_unavailable`. An empty prompt is
-`Model`, so it fails at once.
+`Model`, so it fails at once. `Cancelled` is the stop of a request that is
+gone.
 
 ### Skip conditions
 
@@ -720,7 +720,7 @@ Without replay, the handler calls `generator.generate(req)` directly.
 the clonable fields. It leaves out `constraint`, which already disables replay,
 and `gpu_admission`, which the first attempt releases when its blocking task
 exits. Dropping the `ReplayStream` (a client cancel) aborts the task at its
-next `tx.send().await`.
+next await, which stops the job of the attempt.
 
 ---
 

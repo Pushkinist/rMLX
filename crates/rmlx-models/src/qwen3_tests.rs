@@ -465,6 +465,7 @@ fn qwen3_hydrated_exact_no_tail_not_placeholder() {
             &mut rng,
             &penalty_cfg,
             &mut token_history,
+            &AtomicBool::new(false),
         )
         .expect("cold generate_greedy");
         steps.into_iter().map(|s| s.token_id).collect()
@@ -566,6 +567,7 @@ fn qwen3_hydrated_exact_no_tail_not_placeholder() {
             &mut rng,
             &penalty_cfg,
             &mut token_history,
+            &AtomicBool::new(false),
         )
         .expect("warm generate_greedy");
         steps.into_iter().map(|s| s.token_id).collect()
@@ -697,6 +699,7 @@ fn qwen3_consume_engine_migration_golden() {
             &mut rng,
             &penalty_cfg,
             &mut token_history,
+            &AtomicBool::new(false),
         )
         .expect("generate_greedy")
     };

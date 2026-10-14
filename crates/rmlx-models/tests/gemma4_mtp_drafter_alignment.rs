@@ -157,6 +157,7 @@ fn mtp_assistant_accept_rate_is_high() {
         &mut step_fn,
         &sampler_cfg,
         device,
+        &std::sync::atomic::AtomicBool::new(false),
     )
     .expect("mtp generate");
 
@@ -207,8 +208,15 @@ fn assert_round0_first_token_aligns(
         .collect();
 
     let prefill = &prompt_ids[..prompt_ids.len() - 1];
-    rmlx_models::speculative::prefill_chunked(verifier, prefill, &mut caches, None, device)
-        .expect("prefill");
+    rmlx_models::speculative::prefill_chunked(
+        verifier,
+        prefill,
+        &mut caches,
+        None,
+        device,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .expect("prefill");
     let last = *prompt_ids.last().unwrap();
     let (hidden_raw, sliding_kv, full_kv, kv_offset) = verifier
         .forward_hidden_states_shared_kv(&[last], 1, &mut caches, device)

@@ -3381,6 +3381,7 @@ fn plain_greedy(
                 &mut rng,
                 &penalty_cfg,
                 &mut history,
+                &std::sync::atomic::AtomicBool::new(false),
             )
             .expect("plain greedy generate");
     }
@@ -3582,6 +3583,7 @@ impl Loaded {
                             &mut step,
                             &GREEDY,
                             device,
+                            &std::sync::atomic::AtomicBool::new(false),
                         )
                         .expect("assistant speculative generate")
                         .1
@@ -3603,6 +3605,7 @@ impl Loaded {
                             &mut step,
                             &GREEDY,
                             device,
+                            &std::sync::atomic::AtomicBool::new(false),
                         )
                         .expect("mtp speculative generate")
                         .1
@@ -3625,6 +3628,7 @@ impl Loaded {
                             &mut step,
                             &GREEDY,
                             device,
+                            &std::sync::atomic::AtomicBool::new(false),
                         )
                         .expect("dflash speculative generate")
                         .1
@@ -3647,6 +3651,7 @@ impl Loaded {
                             &mut step,
                             &GREEDY,
                             device,
+                            &std::sync::atomic::AtomicBool::new(false),
                         )
                         .expect("dflash2 speculative generate")
                         .1
@@ -3666,6 +3671,7 @@ impl Loaded {
                             &mut decided_by,
                             &GREEDY,
                             device,
+                            &std::sync::atomic::AtomicBool::new(false),
                         )
                         .expect("eagle3 speculative generate")
                         .1
@@ -3690,6 +3696,7 @@ impl Loaded {
                             &mut step,
                             None,
                             &GREEDY,
+                            &std::sync::atomic::AtomicBool::new(false),
                         )
                         .expect("two-model speculative generate")
                         .1

@@ -61,8 +61,9 @@ its next 30 s window and releases the permit. An `info` event in the request's s
 `long-form transcription cancelled before the window opened`, gives the
 window number and its `seek` in samples. The stop is not immediate:
 
-- The window in flight runs to its end: one encode and at most two decodes of
-  `n_text_ctx / 2` tokens each (224 for large-v3).
+- The window in flight runs to its end: the encode, the gate and at most
+  seven decodes of `n_text_ctx / 2` tokens each (224 for large-v3). See
+  "Worst-case latency" in [`AUDIO.md`](AUDIO.md).
 - The audio decode stops before its next packet. The model load of the
   first request is not cut.
 - Only a 408, a closed connection or a server shutdown stops the walk. After
@@ -120,5 +121,7 @@ value out of bounds or an empty input, the 422 of an unknown voice and every
 is 400 or 422 with a plain-text message. The model and its
 sampling defaults load on the first request, stay for the life of the
 process, and the model holds the GPU permit while it synthesizes. A request
-that times out does not stop the synthesis: it holds the permit until the
-synthesis ends.
+that times out, or whose client goes away, stops the synthesis: it reads the
+stop before each talker frame and before each pass of the codec decode, and
+the permit is free when the job returns (`docs/SERVER_SHUTDOWN.md` § "What
+stops, and what does not").

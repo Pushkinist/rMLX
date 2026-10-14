@@ -113,6 +113,7 @@ fn smoke_probe_gemma4_mxfp8_is_clean() {
             &mut smoke_rng,
             &smoke_penalty_cfg,
             &mut smoke_token_history,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .expect("generate_greedy should not error");
 

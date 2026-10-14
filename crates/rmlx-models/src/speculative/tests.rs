@@ -2,6 +2,7 @@
 
 use super::*;
 
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 /// Compile-check: ensure the public type and methods exist with
@@ -166,7 +167,8 @@ fn spec_prefill_chunked_runs_exit_sweep_on_failure() {
             "simulated spec first-chunk failure".to_owned(),
         ))
     };
-    let _ = prefill_chunked_with(&tokens, &mut caches, 4, Device::Cpu, forward);
+    let never = AtomicBool::new(false);
+    let _ = prefill_chunked_with(&tokens, &mut caches, 4, Device::Cpu, &never, forward);
     for (i, c) in caches.iter_mut().enumerate() {
         assert!(
             !c.in_prefill(),
@@ -203,7 +205,8 @@ fn spec_prefill_chunked_reports_first_cause() {
     let forward = |_chunk: &[u32], _caches: &mut [KvCache]| -> Result<()> {
         Err(Error::Other("simulated spec prefill cause".to_owned()))
     };
-    let err = prefill_chunked_with(&tokens, &mut caches, 4, Device::Cpu, forward)
+    let never = AtomicBool::new(false);
+    let err = prefill_chunked_with(&tokens, &mut caches, 4, Device::Cpu, &never, forward)
         .expect_err("a rejected spec prefill must surface as Err, not a silent Ok");
     assert!(
         err.to_string().contains("simulated spec prefill cause"),
@@ -374,6 +377,7 @@ fn verifier_prefill_cuts_the_prompt_at_the_architectures_chunk() {
         return;
     }
 
+    let never = AtomicBool::new(false);
     for class in ["Qwen3ForCausalLM", "Gemma3ForConditionalGeneration"] {
         let key = crate::prefill_chunk::module_key_for_class(class);
         // A per-arch override outranks the arch default, so under one the
@@ -387,11 +391,17 @@ fn verifier_prefill_cuts_the_prompt_at_the_architectures_chunk() {
         let chunk = crate::prefill_chunk::arch_default(key).unwrap_or(64);
         let tokens: Vec<u32> = (0..(chunk * 2 + 3) as u32).collect();
         let mut seen: Vec<usize> = Vec::new();
-        let result =
-            prefill_chunked_for_class(class, &tokens, &mut [], Device::Cpu, |slice, _caches| {
+        let result = prefill_chunked_for_class(
+            class,
+            &tokens,
+            &mut [],
+            Device::Cpu,
+            &never,
+            |slice, _caches| {
                 seen.push(slice.len());
                 Ok(())
-            });
+            },
+        );
         assert!(result.is_ok(), "{class}: {result:?}");
         assert_eq!(
             seen,
@@ -1184,3 +1194,6 @@ fn each_two_model_entry_names_its_own_rule_its_own_loop_kind_and_its_own_block()
         }
     }
 }
+
+#[path = "prefill_stop_tests.rs"]
+mod prefill_stop_tests;

@@ -46,8 +46,10 @@
 #   1. SWALLOW (shape-keyed, arch layer): no failure-log site may return Ok or
 #      set a `*_ok = false` swallow flag from inside its own failure arm.
 #   2. DECODE (message-keyed): every `decode step failed` site must `return Err`.
-#   3. SWEEP (message-keyed): the shared chunked_prefill must CAPTURE its cause
-#      (`= Some(e)`), not `return Err` inline — see RULE 3 below.
+#   3. SWEEP (message-keyed): the shared chunked_prefill must run its
+#      exit_prefill sweep on every outcome: capture the cause (`= Some(e)`), or
+#      `return Err` only inside the `run_chunks` closure, whose sweep follows
+#      the call — see RULE 3 below.
 #   4. DETECT (shape-keyed, arch layer): a site that COUNTS NaN in a logit row
 #      must propagate the finding. RULE 1 cannot see this shape at all: it keys
 #      on `error = %e`, and a detection that logs nothing has no anchor.
@@ -134,14 +136,21 @@ check_decode() {
         | grep -v '_tests\.rs:' | cut -d: -f1,2 || true)
 }
 
-# ── RULE 3: the shared chunked_prefill must capture, not return inline ───────
+# ── RULE 3: the shared chunked_prefill must run its sweep on every outcome ───
 #
 # These two sites are the ONLY ones that owe a cleanup sweep: chunked_prefill
 # calls `enter_prefill` on every cache up front, so it must run `exit_prefill`
-# on every cache before it leaves. A `return Err` at the log site skips the
-# sweep for the remaining caches, stranding them `in_prefill = true` — the next
-# decode on a stuck cache errors or corrupts KV. So here, and only here, the
-# correct form is to capture the cause and let the post-loop sweep run first.
+# on every cache before it leaves. A `return Err` that leaves the function at
+# the log site skips the sweep for the remaining caches, stranding them
+# `in_prefill = true` — the next decode on a stuck cache errors or corrupts KV.
+#
+# Two forms keep the sweep. Either the site captures the cause (`= Some(e)`,
+# no `return Err`) and the post-loop sweep runs first, or the site sits inside
+# the closure `run_chunks`, where `return Err` and the stop check
+# (`ensure_not_cancelled(cancel)?`) end only the closure, and the sweep runs
+# right after the closure is called, before its result is read with `?`. The
+# closure body is found by rustfmt indentation: from the `let mut run_chunks = |`
+# line to the first later line that is the same indent followed by `};`.
 #
 # Message-keyed on purpose: "owes a sweep" is a property of this one function,
 # not a shape visible to grep. RULE 1 still covers these sites against the
@@ -152,8 +161,32 @@ SWEEP_ANCHORS=(
     'prefill chunk cache eval failed'
 )
 
+# Prints "<first> <last>" line numbers of the `run_chunks` closure body in $1,
+# or nothing when the closure is absent or never closes.
+run_chunks_range() {
+    awk '
+        !start && /let mut run_chunks = \|/ {
+            match($0, /[^ ]/); close_re = "^" sprintf("%" (RSTART - 1) "s", "") "};$"
+            start = NR; next
+        }
+        start && $0 ~ close_re { print start, NR; exit }
+    ' "$1"
+}
+
+# True when, after the first call of `run_chunks(` past line $2, the
+# `exit_prefill(` sweep appears before any `?` or `return` on the result.
+sweep_follows_call() {
+    awk -v from="$2" '
+        NR <= from { next }
+        !called && /run_chunks\(/ { called = 1 }
+        called && /exit_prefill\(/ { ok = 1; exit }
+        called && /\?|return/ { exit }
+        END { exit !ok }
+    ' "$1"
+}
+
 check_sweep() {
-    local anchor="$1" site f ln win
+    local anchor="$1" site f ln win range first last
     while IFS= read -r site; do
         [ -z "${site}" ] && continue
         f="${site%%:*}"
@@ -165,18 +198,30 @@ check_sweep() {
         *) continue ;;
         esac
         win="$(sed -n "${ln},$((ln + CONTEXT))p" "${f}")"
-        if grep -q 'return Err' <<<"${win}"; then
-            echo "VIOLATION: ${f}:${ln} — '${anchor}' returns Err inline, skipping the exit_prefill sweep."
-            echo "    Every cache that entered prefill must run exit_prefill before this"
-            echo "    function leaves. Capture the cause ('= Some(e)') and let the sweep run."
-            printf '%s\n' "${win}" | sed 's/^/    | /'
-            violations=$((violations + 1))
-        elif ! grep -q '= Some(e)' <<<"${win}"; then
-            echo "VIOLATION: ${f}:${ln} — '${anchor}' neither captures the cause ('= Some(e)')"
-            echo "    for propagation after the exit_prefill sweep, nor propagates it at all."
-            printf '%s\n' "${win}" | sed 's/^/    | /'
-            violations=$((violations + 1))
+        if grep -q '= Some(e)' <<<"${win}" && ! grep -q 'return Err' <<<"${win}"; then
+            continue
         fi
+        range="$(run_chunks_range "${f}")"
+        if [ -z "${range}" ]; then
+            echo "VIOLATION: ${f}:${ln} — '${anchor}' does not capture the cause ('= Some(e)')"
+            echo "    and the 'run_chunks' closure (let mut run_chunks = |...| { ... };) is missing."
+        else
+            read -r first last <<<"${range}"
+            if [ "${ln}" -lt "${first}" ] || [ "${ln}" -gt "${last}" ]; then
+                echo "VIOLATION: ${f}:${ln} — '${anchor}' is outside the 'run_chunks' closure"
+                echo "    (lines ${first}-${last}) and does not capture the cause ('= Some(e)'): a"
+                echo "    return there skips the exit_prefill sweep."
+            elif ! grep -q 'return Err' <<<"${win}"; then
+                echo "VIOLATION: ${f}:${ln} — '${anchor}' inside 'run_chunks' does not 'return Err'."
+            elif ! sweep_follows_call "${f}" "${last}"; then
+                echo "VIOLATION: ${f}:${ln} — after the 'run_chunks(' call the exit_prefill sweep does not"
+                echo "    come before the result is read with '?' or 'return'."
+            else
+                continue
+            fi
+        fi
+        printf '%s\n' "${win}" | sed 's/^/    | /'
+        violations=$((violations + 1))
     done < <(grep -rn --include='*.rs' -F "${anchor}" crates/ \
         | grep -v '_tests\.rs:' | cut -d: -f1,2 || true)
 }

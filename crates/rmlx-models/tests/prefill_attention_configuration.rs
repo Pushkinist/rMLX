@@ -1068,6 +1068,7 @@ fn generate_one(
                 &mut rng,
                 &penalty_cfg,
                 &mut token_history,
+                &std::sync::atomic::AtomicBool::new(false),
             )
             .expect("generate_greedy")
     });
@@ -1112,6 +1113,7 @@ fn speculative_prefill_calls(model: &Architecture, prompt: &[u32]) -> Vec<Attent
             &mut kv,
             lin.as_deref_mut(),
             DEVICE,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .expect("speculative prefill");
     });
@@ -1483,6 +1485,7 @@ fn tail_rows_after_prefill(model: &Architecture, ids: &[u32], prefill_len: usize
         &mut kv,
         lin.as_deref_mut(),
         DEVICE,
+        &std::sync::atomic::AtomicBool::new(false),
     )
     .expect("prefill");
     let logits = model

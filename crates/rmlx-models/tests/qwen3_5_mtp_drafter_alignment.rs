@@ -207,6 +207,7 @@ fn mtp_greedy_tracks_plain_greedy_for_a_long_prefix() {
             &mut step_fn,
             &sampler_cfg,
             device,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .expect("mtp generate");
         assert_eq!(ran, block_size, "the loop must run the block it was handed");
@@ -237,6 +238,7 @@ fn mtp_greedy_tracks_plain_greedy_for_a_long_prefix() {
                 &mut rng,
                 &penalty_cfg,
                 &mut history,
+                &std::sync::atomic::AtomicBool::new(false),
             )
             .expect("plain greedy generate");
     }
@@ -343,6 +345,7 @@ fn the_round_loop_runs_a_block_deeper_than_the_sidecar_declares() {
         &mut step_fn,
         &sampler_cfg,
         device,
+        &std::sync::atomic::AtomicBool::new(false),
     )
     .expect("mtp generate");
 

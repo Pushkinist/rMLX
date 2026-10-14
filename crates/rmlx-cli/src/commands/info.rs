@@ -537,6 +537,7 @@ pub(crate) fn run_info(
                 &mut smoke_rng,
                 &smoke_penalty_cfg,
                 &mut smoke_token_history,
+                &std::sync::atomic::AtomicBool::new(false),
             )
             .map_err(|e| anyhow::anyhow!("smoke_probe: generate_greedy: {e}"))?;
 

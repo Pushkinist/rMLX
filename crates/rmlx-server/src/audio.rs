@@ -23,9 +23,10 @@ use rmlx_audio::tokenizer::{TokenizerError, WhisperTask, WhisperTokenizer};
 use rmlx_audio::transcribe::{TranscribeOptions, Transcriber, Transcription};
 use rmlx_audio::wav::{WavDecoder, WavError, MAX_AUDIO_SECS};
 use rmlx_audio::whisper::{WhisperError, WhisperModel};
+use rmlx_core::cancel::ensure_not_cancelled;
 use rmlx_models::sampler::RowPicker;
 use serde::Serialize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tracing::{debug, info, instrument, warn};
 
@@ -35,7 +36,7 @@ mod speech;
 use form::{parse_multipart, rejected_form, ResponseFormat};
 pub use speech::{audio_speech, LoadedTts, SpeechRequest};
 
-use crate::engine::{admit_request, Admission, GpuAdmission};
+use crate::engine::{admit_request, run_admitted, Admission};
 use crate::openai::errors::{error_response, error_response_with_param, internal_error};
 use crate::openai::state::ApiErrorCategory;
 use crate::openai::AppState;
@@ -308,7 +309,7 @@ async fn handle_audio(
     let device = state.device;
     let model_path_str = model_path.to_string_lossy().into_owned();
 
-    let result = run_admitted(guard, move |cancel| {
+    let result = run_admitted(Some(guard), move |cancel| {
         // Decode under the permit, one at a time, and before the model cache:
         // a file the decoder refuses loads no model.
         let samples = decode_upload(&audio_bytes, cancel)?;
@@ -482,42 +483,10 @@ pub fn transcribe_request(
 /// stops before its next packet once `cancel` is set.
 fn decode_upload(bytes: &[u8], cancel: &AtomicBool) -> Result<Vec<f32>, JobError> {
     WavDecoder::decode_resampled(bytes, rmlx_audio::mel::SAMPLE_RATE, MAX_AUDIO_SECS, &|| {
-        cancel.load(Ordering::Relaxed)
+        ensure_not_cancelled(cancel).is_err()
     })
     .map(|audio| audio.samples)
     .map_err(JobError::Decode)
-}
-
-/// Run `job` on the blocking pool, inside the caller's span, while `guard`
-/// holds the GPU permit. The flag handed to `job` is set when the returned
-/// future is dropped: the request timed out, the client went away or a
-/// server shutdown dropped it. A job that reads the flag can stop early. The
-/// permit is released when `job` returns, so the next request never shares
-/// the GPU with a job that is still stopping.
-// cancel-safe: a drop sets the flag; the job keeps the permit until it returns.
-// After a normal return the flag is set with no reader.
-async fn run_admitted<T, F>(guard: GpuAdmission, job: F) -> Result<T, tokio::task::JoinError>
-where
-    T: Send + 'static,
-    F: FnOnce(&AtomicBool) -> T + Send + 'static,
-{
-    let cancel_on_drop = CancelOnDrop(Arc::new(AtomicBool::new(false)));
-    let flag = Arc::clone(&cancel_on_drop.0);
-    let span = tracing::Span::current();
-    tokio::task::spawn_blocking(move || {
-        let _entered = span.enter();
-        let _guard = guard;
-        job(&flag)
-    })
-    .await
-}
-
-struct CancelOnDrop(Arc<AtomicBool>);
-
-impl Drop for CancelOnDrop {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
-    }
 }
 
 fn build_response(

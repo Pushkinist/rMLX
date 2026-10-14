@@ -180,6 +180,7 @@ fn two_model_greedy_tracks_plain_greedy_for_a_long_prefix() {
                 &mut step_fn,
                 None,
                 &sampler_cfg,
+                &std::sync::atomic::AtomicBool::new(false),
             )
             .expect("speculative generate");
     }
@@ -210,6 +211,7 @@ fn two_model_greedy_tracks_plain_greedy_for_a_long_prefix() {
                 &mut rng,
                 &penalty_cfg,
                 &mut history,
+                &std::sync::atomic::AtomicBool::new(false),
             )
             .expect("plain greedy generate");
     }

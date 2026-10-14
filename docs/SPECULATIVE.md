@@ -477,7 +477,10 @@ records none.
 
 Every entry closes a request with one `done` line at `info`, including a request
 whose seed token was a stop token. The event is `<entry>: done`, for example
-`mtp_generate: done` or `spec_generate_greedy_cached: done`.
+`mtp_generate: done` or `spec_generate_greedy_cached: done`. A request that is
+gone and stops in its prefill or at the head of a round writes no `done` line
+([`SERVER_SHUTDOWN.md`](SERVER_SHUTDOWN.md) § "A chat job whose request is
+gone").
 `crates/rmlx-models/src/speculative/round_stats.rs` holds the counters, the
 derivation and the log site.
 

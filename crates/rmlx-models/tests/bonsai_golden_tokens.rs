@@ -175,6 +175,7 @@ fn thinking_budget_exact_hit_qwen3() {
                 &mut rng,
                 &penalty_cfg,
                 &mut token_history,
+                &std::sync::atomic::AtomicBool::new(false),
             )
             .expect("warm call");
     }
@@ -211,6 +212,7 @@ fn thinking_budget_exact_hit_qwen3() {
             &mut rng,
             &penalty_cfg,
             &mut token_history,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .expect("exact-hit call with budget");
 
@@ -306,6 +308,7 @@ fn thinking_budget_forced_token_no_logprobs() {
                 &mut rng,
                 &penalty_cfg,
                 &mut token_history,
+                &std::sync::atomic::AtomicBool::new(false),
             )
             .expect("warm call");
     }
@@ -338,6 +341,7 @@ fn thinking_budget_forced_token_no_logprobs() {
             &mut rng,
             &penalty_cfg,
             &mut token_history,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .expect("exact-hit call with logprobs + budget");
 
@@ -441,6 +445,7 @@ fn cache_hit_first_token_logprob_parity() {
                 &mut rng,
                 &penalty_cfg,
                 &mut token_history,
+                &std::sync::atomic::AtomicBool::new(false),
             )
             .expect("generate")
     };

@@ -45,7 +45,9 @@
 
 use std::mem::size_of_val;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 
+use rmlx_core::cancel::ensure_not_cancelled;
 use rmlx_core::error::{Error, Result};
 use rmlx_loader::{load_shard_index, ShardSet};
 use rmlx_mlx::{
@@ -436,6 +438,9 @@ impl Qwen3VlMoeVision {
     /// `grid_thw`: `(t, h, w)` patch grid (h, w divisible by spatial_merge_size).
     /// Returns the merged image embeddings + deepstack embeds (all
     /// `[num_merged, out_hidden]`).
+    ///
+    /// `cancel` is the stop flag of the request. Each block reads it before its
+    /// forward, and a stopped tower returns [`Error::Cancelled`].
     #[allow(
         clippy::indexing_slicing,
         reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
@@ -445,6 +450,7 @@ impl Qwen3VlMoeVision {
         pixel_values: &[f32],
         grid_thw: (usize, usize, usize),
         device: Device,
+        cancel: &AtomicBool,
     ) -> Result<VisionOutput> {
         let (gt, gh, gw) = grid_thw;
         let merge = self.cfg.spatial_merge_size;
@@ -494,6 +500,7 @@ impl Qwen3VlMoeVision {
 
         let mut deepstack_embeds = Vec::with_capacity(self.cfg.deepstack_visual_indexes.len());
         for (layer_num, blk) in self.blocks.iter().enumerate() {
+            ensure_not_cancelled(cancel)?;
             h = blk.forward(&h, &cos, &sin, mask.as_ref(), device)?;
             // Flush each block's command buffer. The ViT runs full attention over
             // every patch (native tiling → tens of thousands of patches for a

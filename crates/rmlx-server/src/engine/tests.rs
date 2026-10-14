@@ -43,8 +43,8 @@ use std::sync::atomic::Ordering;
 /// configured max — and does NOT increment the gauge on rejection.
 #[tokio::test]
 async fn admission_rejects_at_depth() {
-    let queue = Arc::new(tokio::sync::Semaphore::new(1));
-    let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let queue = Arc::new(Semaphore::new(1));
+    let pending = Arc::new(AtomicUsize::new(0));
 
     // Admit one (holds the only permit) — pending == 1.
     let a1 = admit_request(&queue, &pending, 2).await;
@@ -71,8 +71,8 @@ async fn admission_rejects_at_depth() {
 /// `max_queue_depth == 0` means unlimited — never rejects.
 #[tokio::test]
 async fn admission_unlimited_when_zero() {
-    let queue = Arc::new(tokio::sync::Semaphore::new(1));
-    let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let queue = Arc::new(Semaphore::new(1));
+    let pending = Arc::new(AtomicUsize::new(0));
     // Pre-load pending well past any sane bound.
     pending.store(1000, Ordering::Release);
     let a = admit_request(&queue, &pending, 0).await;
@@ -88,8 +88,8 @@ async fn admission_unlimited_when_zero() {
 /// drop — covering the success/normal completion path.
 #[tokio::test]
 async fn admission_guard_drop_decrements_and_releases() {
-    let queue = Arc::new(tokio::sync::Semaphore::new(1));
-    let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let queue = Arc::new(Semaphore::new(1));
+    let pending = Arc::new(AtomicUsize::new(0));
 
     let a = admit_request(&queue, &pending, 64).await;
     let guard = match a {
@@ -120,8 +120,8 @@ async fn admission_guard_drop_decrements_and_releases() {
 /// (the guard lives in the request; dropping the request drops it).
 #[tokio::test]
 async fn admission_guard_drop_via_request_balances_gauge() {
-    let queue = Arc::new(tokio::sync::Semaphore::new(1));
-    let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let queue = Arc::new(Semaphore::new(1));
+    let pending = Arc::new(AtomicUsize::new(0));
 
     let a = admit_request(&queue, &pending, 64).await;
     let guard = match a {
@@ -148,8 +148,8 @@ async fn admission_guard_drop_via_request_balances_gauge() {
 /// must not be admitted before the first releases.
 #[tokio::test]
 async fn admission_is_fifo() {
-    let queue = Arc::new(tokio::sync::Semaphore::new(1));
-    let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let queue = Arc::new(Semaphore::new(1));
+    let pending = Arc::new(AtomicUsize::new(0));
     let order = Arc::new(Mutex::new(Vec::<u32>::new()));
 
     // First admission takes the only permit.
@@ -168,7 +168,7 @@ async fn admission_is_fifo() {
     });
     // Ensure A is enqueued on the semaphore before B arrives.
     tokio::task::yield_now().await;
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
 
     let (qb, pb, ob) = (Arc::clone(&queue), Arc::clone(&pending), Arc::clone(&order));
     let wb = tokio::spawn(async move {
@@ -176,7 +176,7 @@ async fn admission_is_fifo() {
         ob.lock().push(2);
         a
     });
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
 
     // Neither A nor B admitted yet (g1 holds the permit).
     assert!(order.lock().is_empty());
@@ -185,7 +185,7 @@ async fn admission_is_fifo() {
     drop(g1);
     let ra = wa.await.unwrap();
     // A holds the permit now; B still blocked.
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(*order.lock(), vec![1], "A must resolve first");
 
     // Drop A's guard → B resolves.
@@ -952,4 +952,197 @@ fn the_terminal_item_carries_the_tail_and_the_finish_reason() {
     assert_eq!(item.finish_reason.as_deref(), Some("length"));
     assert!(!item.is_thinking);
     assert!(!item.counts_toward_usage());
+}
+
+/// The reply stream of a job owns the job: the stop flag of the job is clear
+/// while the reply is read, and a drop of the stream sets it. A stream that
+/// lets go of the job at once stops every request before its first token.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_reply_stream_of_a_job_sets_the_stop_flag_only_when_it_is_dropped() {
+    use std::sync::atomic::Ordering::Relaxed;
+    use std::time::Duration;
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<bool>(4);
+    let (saw_tx, saw_rx) = mpsc::channel();
+    let job = run_admitted(None, move |cancel| {
+        for _ in 0..3 {
+            tx.blocking_send(cancel.load(Relaxed)).ok();
+        }
+        let waited = Instant::now();
+        while !cancel.load(Relaxed) && waited.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        saw_tx.send(cancel.load(Relaxed)).ok();
+    });
+    let mut reply = Box::pin(types::job_stream(rx, job));
+    for item in 0..3 {
+        assert_eq!(
+            reply.next().await,
+            Some(false),
+            "item {item}: the stop flag of a job whose reply is read"
+        );
+    }
+    drop(reply);
+    let saw = tokio::task::spawn_blocking(move || saw_rx.recv_timeout(Duration::from_secs(5)))
+        .await
+        .expect("the report task does not panic");
+    assert_eq!(saw, Ok(true), "the job did not see the stop of its reply");
+}
+
+/// The reply stream ends when its job ends: it gives each item the job sent,
+/// then `None`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_reply_stream_of_a_job_ends_when_the_job_ends() {
+    let (tx, rx) = tokio::sync::mpsc::channel::<u32>(4);
+    let job = run_admitted(None, move |_cancel| {
+        for item in 0..2 {
+            tx.blocking_send(item).ok();
+        }
+    });
+    let reply: Vec<u32> = types::job_stream(rx, job).collect().await;
+    assert_eq!(reply, [0, 1]);
+}
+
+// ── run_admitted: the stop flag and the GPU permit of a blocking job ─────────
+
+use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::mpsc;
+use std::time::Duration;
+
+use tokio::sync::Semaphore;
+
+/// How long a scripted job waits for the flag before it gives up and reports
+/// that it never saw it. A job that never stops would hang the test binary.
+pub(crate) const FLAG_WAIT: Duration = Duration::from_secs(2);
+
+/// How long the test waits for a message from a scripted job.
+pub(crate) const REPORT_WAIT: Duration = Duration::from_secs(5);
+
+/// The one-permit GPU queue and its in-flight gauge.
+pub(crate) fn gpu_queue() -> (Arc<Semaphore>, Arc<AtomicUsize>) {
+    (Arc::new(Semaphore::new(1)), Arc::new(AtomicUsize::new(0)))
+}
+
+pub(crate) async fn admitted(queue: &Arc<Semaphore>, pending: &Arc<AtomicUsize>) -> GpuAdmission {
+    match admit_request(queue, pending, 64).await {
+        Admission::Admitted { guard, .. } => guard,
+        Admission::QueueFull => panic!("an empty queue admits"),
+    }
+}
+
+/// A scripted walk: it decodes "windows" of 1 ms until the flag is set or
+/// `FLAG_WAIT` passes, and returns whether it saw the flag.
+pub(crate) fn wait_for_flag(cancel: &AtomicBool) -> bool {
+    let start = Instant::now();
+    while !cancel.load(Ordering::Relaxed) && start.elapsed() < FLAG_WAIT {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    cancel.load(Ordering::Relaxed)
+}
+
+/// Wait on a std channel from async code without blocking the runtime.
+pub(crate) async fn report<T: Send + 'static>(
+    rx: mpsc::Receiver<T>,
+) -> Result<T, mpsc::RecvTimeoutError> {
+    tokio::task::spawn_blocking(move || rx.recv_timeout(REPORT_WAIT))
+        .await
+        .expect("the report task does not panic")
+}
+
+/// The request timeout drops the request future, as `timeout_mw` does: the
+/// job sees the flag and stops.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_timeout_sets_the_flag_and_the_job_stops() {
+    let (queue, pending) = gpu_queue();
+    let guard = admitted(&queue, &pending).await;
+    let (tx, rx) = mpsc::channel();
+    let request = run_admitted(Some(guard), move |cancel| {
+        tx.send(wait_for_flag(cancel)).ok();
+    });
+    let timed_out = tokio::time::timeout(Duration::from_millis(50), request).await;
+    assert!(timed_out.is_err(), "the scripted job outlives the timeout");
+    assert_eq!(report(rx).await, Ok(true), "the job did not see the flag");
+}
+
+/// After the timeout the permit stays with the job until the job returns;
+/// then it is free and the gauge is back to 0.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_permit_stays_held_until_the_stopped_job_returns() {
+    let (queue, pending) = gpu_queue();
+    let guard = admitted(&queue, &pending).await;
+    let (saw_tx, saw_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let request = run_admitted(Some(guard), move |cancel| {
+        saw_tx.send(wait_for_flag(cancel)).ok();
+        release_rx.recv_timeout(REPORT_WAIT).ok();
+    });
+    let timed_out = tokio::time::timeout(Duration::from_millis(50), request).await;
+    assert!(timed_out.is_err());
+    assert_eq!(
+        report(saw_rx).await,
+        Ok(true),
+        "the job did not see the flag"
+    );
+
+    assert_eq!(
+        queue.available_permits(),
+        0,
+        "the permit was freed while the job still runs"
+    );
+    assert_eq!(pending.load(Ordering::Acquire), 1);
+
+    release_tx.send(()).expect("the job waits for the release");
+    let permit = tokio::time::timeout(REPORT_WAIT, queue.acquire()).await;
+    assert!(
+        matches!(permit, Ok(Ok(_))),
+        "the permit is not free after the job returned"
+    );
+    assert_eq!(pending.load(Ordering::Acquire), 0);
+}
+
+/// A job that runs to its end never sees the flag, gives its result, and
+/// frees the permit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_that_ends_sees_no_flag_and_frees_the_permit() {
+    let (queue, pending) = gpu_queue();
+    let guard = admitted(&queue, &pending).await;
+    let saw_flag = run_admitted(Some(guard), |cancel| cancel.load(Ordering::Relaxed)).await;
+    assert!(matches!(saw_flag, Ok(false)), "{saw_flag:?}");
+    assert_eq!(queue.available_permits(), 1);
+    assert_eq!(pending.load(Ordering::Acquire), 0);
+}
+
+/// The stop of a request that is gone is not the stop of the next request: the
+/// next job starts with its flag clear and runs to its end.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_stop_of_one_request_is_not_the_stop_of_the_next() {
+    let (queue, pending) = gpu_queue();
+    let guard = admitted(&queue, &pending).await;
+    let (saw_tx, saw_rx) = mpsc::channel();
+    let gone = run_admitted(Some(guard), move |cancel| {
+        saw_tx.send(wait_for_flag(cancel)).ok();
+    });
+    let timed_out = tokio::time::timeout(Duration::from_millis(50), gone).await;
+    assert!(timed_out.is_err());
+    assert_eq!(
+        report(saw_rx).await,
+        Ok(true),
+        "the first job did not see its flag"
+    );
+
+    let guard = admitted(&queue, &pending).await;
+    let next = run_admitted(Some(guard), |cancel| cancel.load(Ordering::Relaxed)).await;
+    assert!(matches!(next, Ok(false)), "{next:?}");
+}
+
+/// A job that panics frees the permit, and the caller gets the panic as an
+/// error.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_that_panics_frees_the_permit() {
+    let (queue, pending) = gpu_queue();
+    let guard = admitted(&queue, &pending).await;
+    let result = run_admitted(Some(guard), |_| -> u8 { panic!("scripted job panic") }).await;
+    assert!(result.as_ref().is_err_and(tokio::task::JoinError::is_panic));
+    assert_eq!(queue.available_permits(), 1);
+    assert_eq!(pending.load(Ordering::Acquire), 0);
 }

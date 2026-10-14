@@ -23,7 +23,9 @@ use super::helpers::{
     resolve_kv_quant_for_load, spsc_ts, terminal_item,
 };
 use super::think::ThinkSplitter;
-use super::types::{GenerationRequest, GenerationToken, ModelLoadConfig};
+use super::types::{
+    job_stream, run_admitted, unless_stopped, GenerationRequest, GenerationToken, ModelLoadConfig,
+};
 
 // ── MTP draft dispatch ────────────────────────────────────────────────────────
 
@@ -698,9 +700,6 @@ impl Generator for SpeculativeGenerator {
         // per-event DB recorder (TTFT is written by the HTTP handler
         // layer off-runtime; only ITL/kv_cache_bytes are written here).
         let event_recorder = req.event_recorder;
-        // Hold the FIFO admission guard for the lifetime of the
-        // blocking decode (mirrors ArchGenerator). Released on completion.
-        let gpu_admission = req.gpu_admission;
         // Speculative decode cannot honor a stateful grammar: the K+1
         // verifier argmax has no per-token mask hook that aligns with
         // `ConstraintEngine::step_mask`. The request is refused, not run
@@ -786,9 +785,11 @@ impl Generator for SpeculativeGenerator {
         // ArchGenerator site for rationale).
         let emit_tool_markers = req.emit_tool_markers;
 
-        // Use spawn_blocking instead of std::thread::spawn (same rationale
-        // as ArchGenerator above).
-        tokio::task::spawn_blocking(move || {
+        // Run the rounds in the one job runner, as ArchGenerator does: it holds
+        // the FIFO admission guard until the job returns, carries the route's
+        // span to the job's thread, and hands the job the stop flag of this
+        // request.
+        let job = run_admitted(req.gpu_admission, move |cancel| {
             let _guard = {
                 let try_result = lock.try_lock();
                 if let Some(g) = try_result {
@@ -801,10 +802,6 @@ impl Generator for SpeculativeGenerator {
                     lock.lock()
                 }
             };
-
-            // Hold the FIFO admission guard for the whole decode
-            // (mirrors ArchGenerator). Released on closure exit.
-            let _gpu_admission = gpu_admission;
 
             tracing::debug!(model_id = %model_id_for_log, block_size, "spec generate: blocking thread started");
 
@@ -822,11 +819,9 @@ impl Generator for SpeculativeGenerator {
                 crate::detokenizer::StreamingDetokenizer::new(tokenizer_kind, Arc::clone(&eos_ids));
             // Pre-allocated per-step timestamps for ITL computation.
             let mut step_timestamps: Vec<Instant> = Vec::with_capacity(n_tokens);
-            let mut cancelled = false;
             // Same shape as ArchGenerator — `None` for non-reasoning archs.
             let mut think_splitter = think_splitter;
             let tx_ref = &tx;
-            let cancelled_ref = &mut cancelled;
             let detok_ref = &mut detok;
             let timestamps_ref = &mut step_timestamps;
             let think_splitter_ref = &mut think_splitter;
@@ -838,9 +833,6 @@ impl Generator for SpeculativeGenerator {
             let mut step_fn = |s: &rmlx_models::ProbeStep| -> Option<u32> {
                 // Record step arrival time for ITL computation.
                 timestamps_ref.push(Instant::now());
-                if *cancelled_ref {
-                    return None;
-                }
                 let mut text = match detok_ref.step(&tokenizer_ref, s.token_id) {
                     Ok(seg) => seg,
                     Err(e) => {
@@ -884,9 +876,7 @@ impl Generator for SpeculativeGenerator {
                     is_thinking,
                     logprobs,
                 };
-                if tx_ref.blocking_send(Ok(tok)).is_err() {
-                    *cancelled_ref = true;
-                }
+                let _ = tx_ref.blocking_send(Ok(tok));
                 // forced-close on budget overflow (see standard path).
                 if let Some(sm) = think_splitter_ref.as_mut() {
                     if sm.take_force_close() {
@@ -930,6 +920,7 @@ impl Generator for SpeculativeGenerator {
                         &mut decided_by,
                         &spec_sampler_cfg,
                         dispatcher.device(),
+                        cancel,
                     )
                 }
                 Drafter::DFlash(drafter) => rmlx_models::speculative::dflash::dflash_generate(
@@ -945,6 +936,7 @@ impl Generator for SpeculativeGenerator {
                     &mut step_fn,
                     &spec_sampler_cfg,
                     dispatcher.device(),
+                    cancel,
                 ),
                 Drafter::DFlash2(drafter) => rmlx_models::speculative::dflash2::dflash2_generate(
                     &dispatcher.verifier,
@@ -959,6 +951,7 @@ impl Generator for SpeculativeGenerator {
                     &mut step_fn,
                     &spec_sampler_cfg,
                     dispatcher.device(),
+                    cancel,
                 ),
                 Drafter::MtpAssistant(assistant) => {
                     rmlx_models::speculative::gemma4_assistant::mtp_assistant_generate(
@@ -974,6 +967,7 @@ impl Generator for SpeculativeGenerator {
                         &mut step_fn,
                         &spec_sampler_cfg,
                         dispatcher.device(),
+                        cancel,
                     )
                 }
                 Drafter::MtpSidecar(drafter_arc) => {
@@ -991,6 +985,7 @@ impl Generator for SpeculativeGenerator {
                         &mut step_fn,
                         &spec_sampler_cfg,
                         dispatcher.device(),
+                        cancel,
                     )
                 }
                 // Greedy at temperature 0, Leviathan stochastic above it; the
@@ -1007,15 +1002,16 @@ impl Generator for SpeculativeGenerator {
                     &mut step_fn,
                     None,
                     &spec_sampler_cfg,
+                    cancel,
                 ),
             }
             // Every driver reports the block its rounds ran; the served path
             // reads it off the round loop's own `done` line instead.
             .map(|(emitted, _block)| emitted);
 
-            if cancelled {
+            let Some(result) = unless_stopped(result, step_timestamps.len()) else {
                 return;
-            }
+            };
 
             // Compute ITL stats from step timestamps and emit (same as ArchGenerator).
             {
@@ -1208,11 +1204,9 @@ impl Generator for SpeculativeGenerator {
             }
         });
 
-        let token_stream = stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
-        });
-
-        Box::pin(token_stream)
+        // Each poll of the stream awaits exactly one token, giving axum SSE
+        // the opportunity to flush between tokens.
+        Box::pin(job_stream(rx, job))
     }
 }
 

@@ -23,43 +23,16 @@
 
 mod thread_boundary;
 
+use thread_boundary::{
+    GEMMA4_E2B, GEMMA4_E2B_ASSISTANT, ORNITH_9B, QWEN36_DFLASH, QWEN36_EAGLE3, QWEN36_MOE,
+    QWEN38_4BIT, QWEN38_DFLASH2, QWEN38_MTP_4BIT, QWEN38_MXFP8,
+};
+
 use rmlx_mlx::Device;
 use thread_boundary::round_stream::{round_events, RoundStreamRecorder};
 use thread_boundary::{
     assert_crossed, assert_oracle, serve, snapshot, speculative_generator, text_request, Split,
 };
-
-const GEMMA4_E2B: (&str, &str) = (
-    "mlx-community__gemma-4-e2b-it-mxfp8",
-    "Gemma4ForConditionalGeneration",
-);
-const GEMMA4_E2B_ASSISTANT: (&str, &str) = (
-    "mlx-community__gemma-4-E2B-it-assistant-bf16",
-    "Gemma4AssistantForCausalLM",
-);
-const QWEN36_MOE: (&str, &str) = (
-    "mlx-community__Qwen3.6-35B-A3B-8bit",
-    "Qwen3_5MoeForConditionalGeneration",
-);
-const QWEN36_DFLASH: (&str, &str) = ("z-lab__Qwen3.6-35B-A3B-DFlash", "DFlashDraftModel");
-const QWEN36_EAGLE3: (&str, &str) = (
-    "Dogacel__specdrift-qwen3.6-35b-a3b-eagle3",
-    "LlamaForCausalLMEagle3",
-);
-const QWEN38_4BIT: (&str, &str) = (
-    "mlx-community__Qwen3.8-27B-4bit",
-    "Qwen3_5ForConditionalGeneration",
-);
-const QWEN38_MTP_4BIT: (&str, &str) = ("mlx-community__Qwen3.8-27B-MTP-4bit", "qwen3_5_mtp");
-const QWEN38_DFLASH2: (&str, &str) = ("z-lab__Qwen3.8-27B-DFlash2", "DFlash2DraftModel");
-const QWEN38_MXFP8: (&str, &str) = (
-    "mlx-community__Qwen3.8-27B-mxfp8",
-    "Qwen3_5ForConditionalGeneration",
-);
-const ORNITH_9B: (&str, &str) = (
-    "sahilchachra__ornith-1.0-9b-mxfp8-mlx",
-    "Qwen3_5ForConditionalGeneration",
-);
 
 /// Tokens drafted over the round events `recorder` captured.
 fn drafted(recorder: &RoundStreamRecorder) -> u64 {

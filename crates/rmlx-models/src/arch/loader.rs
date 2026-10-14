@@ -654,6 +654,7 @@ pub fn run_smoke_probe(
         &mut rng,
         &penalty_cfg,
         &mut token_history,
+        &std::sync::atomic::AtomicBool::new(false),
     )?;
 
     Ok(Architecture::classify_smoke(&steps))

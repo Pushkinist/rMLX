@@ -94,3 +94,7 @@ pub use kv_bytes::{classify_kv_bytes, KvBytesSample, KvBytesVerdict};
 pub use prompt_cache::CacheStats;
 pub use sampler::{Pcg32, PenaltyConfig, SamplerConfig, TokenLogprobs};
 pub use speculative::{Declared, DraftKind, SpeculativeDispatcher};
+
+#[cfg(test)]
+#[path = "../tests/common/stop_scan.rs"]
+mod stop_scan;

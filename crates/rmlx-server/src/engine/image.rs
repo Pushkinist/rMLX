@@ -5,6 +5,9 @@
 //! - `run_qwen3vl_image` — Qwen3-VL-MoE full image decode
 //! - `rmlx_server_load_image` — thin wrapper mapping load_image errors
 
+use std::sync::atomic::AtomicBool;
+
+use rmlx_core::cancel::ensure_not_cancelled;
 use rmlx_core::Error;
 
 // ── image-prompt construction ─────────────────────────────────────────
@@ -139,6 +142,10 @@ pub(crate) enum VisionBundle {
 /// 4. `gemma4::build_inputs_embeds` runs the vision tower + multimodal
 ///    projector and returns the fused embedding tensor.
 ///
+/// `cancel` is the stop flag of the request. Each pass over the image sources
+/// reads it first, so a request that is gone loads no further image. One image
+/// has no stop inside it.
+///
 /// Returns `(augmented_ids, inputs_embeds [1, seq, hidden], masked_ids [seq])`.
 #[allow(
     clippy::indexing_slicing,
@@ -153,6 +160,7 @@ pub(crate) fn build_image_prompt(
     mm_cache: Option<&rmlx_models::multimodal_cache::MultimodalCache>,
     model_sig: u64,
     image_max_tokens: Option<usize>,
+    cancel: &AtomicBool,
 ) -> rmlx_core::Result<(Vec<u32>, rmlx_mlx::Array, rmlx_mlx::Array)> {
     match vb {
         VisionBundle::Gemma4 {
@@ -172,6 +180,7 @@ pub(crate) fn build_image_prompt(
 
             let mut pixels = Vec::with_capacity(sources.len());
             for (i, src) in sources.iter().enumerate() {
+                ensure_not_cancelled(cancel)?;
                 let bytes = rmlx_server_load_image(src)?;
                 let pv = processor
                     .preprocess(&bytes)
@@ -231,6 +240,7 @@ pub(crate) fn build_image_prompt(
 
             let mut pixels = Vec::with_capacity(sources.len());
             for (i, src) in sources.iter().enumerate() {
+                ensure_not_cancelled(cancel)?;
                 let bytes = rmlx_server_load_image(src)?;
                 let pv = processor
                     .preprocess(&bytes)
@@ -291,6 +301,7 @@ pub(crate) fn build_image_prompt(
 
             let mut pixels = Vec::with_capacity(sources.len());
             for (i, src) in sources.iter().enumerate() {
+                ensure_not_cancelled(cancel)?;
                 let bytes = rmlx_server_load_image(src)?;
                 let pv = processor
                     .preprocess(&bytes)
@@ -361,6 +372,9 @@ pub(crate) const QWEN3VL_USER_TURN_OPENER: [u32; 3] = [151_644, 872, 198];
 /// `<|vision_end|>`) after the prompt's leading token, then decode via the
 /// model's image branch (scatter at image_pad positions + 3D M-RoPE +
 /// deepstack injection).
+///
+/// `cancel` is the stop flag of the request. The tower, the prefill and the
+/// decode read it, and a stopped request returns [`Error::Cancelled`].
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::indexing_slicing,
@@ -389,6 +403,7 @@ pub(crate) fn run_qwen3vl_image(
     token_history: &mut Vec<u32>,
     mm_cache: Option<&rmlx_models::multimodal_cache::MultimodalCache>,
     model_sig: u64,
+    cancel: &AtomicBool,
 ) -> rmlx_core::Result<Vec<rmlx_models::ProbeStep>> {
     let (vision, processor) = match vb {
         VisionBundle::Qwen3VlMoe { vision, processor } => (vision, processor),
@@ -447,10 +462,21 @@ pub(crate) fn run_qwen3vl_image(
     // Short-circuit on a cache hit. Qwen3-VL returns a multi-array
     // VisionOutput (image_embeds + deepstack_embeds[]); cache them together
     // via `put_many` so a hit skips the entire ViT pass.
-    let forward = || -> Result<rmlx_models::qwen3_vl_moe::VisionOutput, Error> {
+    //
+    // The error of the tower keeps its class: a wrapper would make a `Model`
+    // error `Other`, which the retry envelope runs again. A stop is not logged.
+    let forward = || {
         vision
-            .forward(&pv.pixel_values, pv.grid_thw, device)
-            .map_err(|e| Error::Other(format!("Qwen3-VL vision tower failed: {e}")))
+            .forward(&pv.pixel_values, pv.grid_thw, device, cancel)
+            .inspect_err(|e| {
+                if !matches!(e, Error::Cancelled) {
+                    tracing::error!(
+                        error = %e,
+                        grid_thw = ?pv.grid_thw,
+                        "Qwen3-VL vision tower failed"
+                    );
+                }
+            })
     };
     let vout = if let Some(cache) = mm_cache {
         let key_bytes = rmlx_models::multimodal_cache::pixel_f32_bytes(&pv.pixel_values);
@@ -585,6 +611,7 @@ pub(crate) fn run_qwen3vl_image(
         rng,
         penalty_cfg,
         token_history,
+        cancel,
     )
 }
 

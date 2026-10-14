@@ -694,6 +694,7 @@ fn load_assistant(
 
 use crate::decode_loop::ProbeStep;
 use rmlx_kv_quant::KvQuant;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use super::round_loop::{
@@ -785,7 +786,12 @@ impl RoundDrafter for AssistantRound<'_> {
     const KV_REPORT_SKIPPED_BY: ReportSkippedBy = ReportSkippedBy::TheSeedExit;
     const VERIFIER_OFFSET_BASIS: VerifierOffsetBasis = VerifierOffsetBasis::BeforeTheForward;
 
-    fn prefill(&mut self, ctx: &mut RoundCtx<'_>, prompt: &[u32]) -> Result<Prefilled> {
+    fn prefill(
+        &mut self,
+        ctx: &mut RoundCtx<'_>,
+        prompt: &[u32],
+        cancel: &AtomicBool,
+    ) -> Result<Prefilled> {
         let device = ctx.device;
         let Some((&last_prompt, head)) = prompt.split_last() else {
             return Err(Error::Model(
@@ -799,6 +805,7 @@ impl RoundDrafter for AssistantRound<'_> {
             &mut ctx.kv,
             ctx.lin.as_deref_mut(),
             device,
+            cancel,
         )?;
         let prefill_ns = prefill_t0.elapsed().as_nanos();
 
@@ -968,6 +975,8 @@ impl RoundDrafter for AssistantRound<'_> {
 /// checked, and every round narrows the block again against the remaining token
 /// budget.
 ///
+/// `cancel` is the stop flag of the request, handed to [`run_rounds`].
+///
 /// # Errors
 /// [`Error::Model`] for a prompt under two tokens, a block under two, or a
 /// verifier this drafter cannot be paired with; and whatever the round loop
@@ -986,6 +995,7 @@ pub fn mtp_assistant_generate(
     step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
     sampler_cfg: &crate::sampler::SamplerConfig,
     device: Device,
+    cancel: &AtomicBool,
 ) -> Result<(Vec<ProbeStep>, usize)> {
     if prompt_ids.len() < 2 {
         return Err(Error::Model(
@@ -1029,6 +1039,7 @@ pub fn mtp_assistant_generate(
         // whole vocabulary, so its tokens need no per-token attribution.
         None,
         device,
+        cancel,
     )
 }
 

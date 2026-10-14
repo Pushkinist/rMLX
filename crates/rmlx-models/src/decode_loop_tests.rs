@@ -3,6 +3,7 @@ use super::*;
 use std::cell::Cell;
 use std::fmt::Write as _;
 use std::str::FromStr as _;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use rmlx_core::error::Error;
@@ -434,7 +435,14 @@ fn pipelined_decode_stops_on_eos() {
         &mut hist,
         true,
     );
-    let (stats, _post) = pipelined_decode(&mut c, 0, &mut steps, scripted(&rows, &calls)).unwrap();
+    let (stats, _post) = pipelined_decode(
+        &mut c,
+        0,
+        &mut steps,
+        &AtomicBool::new(false),
+        scripted(&rows, &calls),
+    )
+    .unwrap();
     let ids: Vec<u32> = steps.iter().map(|s| s.token_id).collect();
     // emitted stream: first_id 0, then 1, then EOS 3.
     assert_eq!(ids, vec![0, 1, 3], "decode stops once EOS is emitted");
@@ -485,7 +493,14 @@ fn pipelined_decode_honors_forced_next() {
         &mut hist,
         true,
     );
-    pipelined_decode(&mut c, 0, &mut steps, scripted(&rows, &calls)).unwrap();
+    pipelined_decode(
+        &mut c,
+        0,
+        &mut steps,
+        &AtomicBool::new(false),
+        scripted(&rows, &calls),
+    )
+    .unwrap();
     let ids: Vec<u32> = steps.iter().map(|s| s.token_id).collect();
     // 0 (prefill), 1 (decode), then forced 4 injected as the next emit.
     assert!(
@@ -531,7 +546,14 @@ fn pipelined_decode_resolve_pieces_toggle() {
             &mut hist,
             true,
         );
-        pipelined_decode(&mut c, 0, &mut steps, scripted(&rows, &calls)).unwrap();
+        pipelined_decode(
+            &mut c,
+            0,
+            &mut steps,
+            &AtomicBool::new(false),
+            scripted(&rows, &calls),
+        )
+        .unwrap();
         assert!(
             steps.iter().all(|s| !s.piece.is_empty()),
             "resolve_pieces=true emits non-empty pieces"
@@ -563,7 +585,14 @@ fn pipelined_decode_resolve_pieces_toggle() {
             &mut hist,
             false,
         );
-        pipelined_decode(&mut c, 0, &mut steps, scripted(&rows, &calls)).unwrap();
+        pipelined_decode(
+            &mut c,
+            0,
+            &mut steps,
+            &AtomicBool::new(false),
+            scripted(&rows, &calls),
+        )
+        .unwrap();
         assert!(
             steps.iter().all(|s| s.piece.is_empty()),
             "resolve_pieces=false emits empty pieces"
@@ -602,7 +631,14 @@ fn pipelined_decode_lp_k_captures() {
         &mut hist,
         true,
     );
-    pipelined_decode(&mut c, 0, &mut steps, scripted(&rows, &calls)).unwrap();
+    pipelined_decode(
+        &mut c,
+        0,
+        &mut steps,
+        &AtomicBool::new(false),
+        scripted(&rows, &calls),
+    )
+    .unwrap();
     // The decode-emitted tokens (not the caller's first_id) carry logprobs.
     let decode_steps_with_lp = steps.iter().filter(|s| s.logprobs.is_some()).count();
     assert!(
@@ -706,7 +742,14 @@ fn pipelined_decode_host_path_emits_the_argmax_stream() {
             &mut hist,
             true,
         );
-        pipelined_decode(&mut c, 0, &mut steps, scripted(&rows, &calls)).unwrap();
+        pipelined_decode(
+            &mut c,
+            0,
+            &mut steps,
+            &AtomicBool::new(false),
+            scripted(&rows, &calls),
+        )
+        .unwrap();
         steps.iter().map(|s| s.token_id).collect()
     };
 
@@ -804,8 +847,14 @@ fn pipelined_decode_propagates_step_failure() {
         true,
     );
     // Two clean steps, then the third forward fails.
-    let err = pipelined_decode(&mut c, 0, &mut steps, scripted_failing(&rows, &calls, 2))
-        .expect_err("a failed decode step must surface as Err, not a short Ok generation");
+    let err = pipelined_decode(
+        &mut c,
+        0,
+        &mut steps,
+        &AtomicBool::new(false),
+        scripted_failing(&rows, &calls, 2),
+    )
+    .expect_err("a failed decode step must surface as Err, not a short Ok generation");
     assert!(
         err.to_string().contains("simulated decode step failure"),
         "the underlying cause must reach the caller verbatim, got: {err}"
@@ -846,6 +895,7 @@ fn chunked_prefill_propagates_chunk_failure() {
         (4, "arch_default"),
         Device::Cpu,
         "test",
+        &AtomicBool::new(false),
         forward_chunk,
     )
     .expect_err("a rejected prefill must surface as Err, not a zero-token Ok run");
@@ -887,6 +937,7 @@ fn chunked_prefill_runs_exit_sweep_on_failure() {
         (4, "arch_default"),
         Device::Cpu,
         "test",
+        &AtomicBool::new(false),
         forward_chunk,
     );
     for (i, c) in caches.iter().enumerate() {
@@ -920,6 +971,7 @@ fn chunked_prefill_rejects_empty_prompt() {
         (4, "arch_default"),
         Device::Cpu,
         "test",
+        &AtomicBool::new(false),
         forward_chunk,
     )
     .expect_err("an empty prompt must surface as Err, not a zero-token Ok run");
@@ -1137,6 +1189,7 @@ fn chunked_prefill_logs_the_chunk_it_cut_at() {
             (4, "arch_default"),
             Device::Cpu,
             "Qwen3ForCausalLM",
+            &AtomicBool::new(false),
             forward_chunk,
         );
     });
@@ -1230,28 +1283,6 @@ fn a_replayed_eos_token_ends_the_generation_and_no_constraint_is_needed() {
     assert!(ends);
     assert_eq!(seen, [9]);
     assert_eq!(history, [9]);
-}
-
-/// The code of a Rust source file: `//` comments removed and the body of each
-/// string literal blanked, by the readers of `scripts/lib/awk_text.sh`.
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    reason = "test-only: a panic names the source file that cannot be read"
-)]
-fn code_of(path: &std::path::Path) -> String {
-    let readers =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/lib/awk_text.sh");
-    let out = std::process::Command::new("bash")
-        .arg("-c")
-        .arg(r#". "$1"; awk "${AWK_TEXT_FNS}"'{ print blank_strings(decomment($0)) }' "$2""#)
-        .arg("code_of")
-        .arg(&readers)
-        .arg(path)
-        .output()
-        .expect("bash must run");
-    assert!(out.status.success(), "{}: {out:?}", path.display());
-    String::from_utf8(out.stdout).unwrap()
 }
 
 /// The code of each decode loop that takes an exact prompt-cache hit.
@@ -1361,3 +1392,8 @@ fn the_source_rule_reads_calls_and_order_and_not_comments_or_strings() {
     assert!(!code.contains("emit_replayed_token("), "{code}");
     assert!(!shows_the_replayed_token_to_the_constraint(&code));
 }
+
+use crate::stop_scan::code_of;
+
+#[path = "decode_stop_tests.rs"]
+mod decode_stop_tests;

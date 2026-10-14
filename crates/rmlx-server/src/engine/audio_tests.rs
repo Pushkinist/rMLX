@@ -4,6 +4,8 @@
 //! (`RMLX_TEST_MODEL_GEMMA4_E4B`) and skips gracefully when absent. The
 //! base64-prefix-stripping logic is covered model-free.
 
+use rmlx_core::Error;
+
 use super::{
     audio_secs_budget, build_audio_prompt, decode_input_audio, load_gemma4_audio_bundle,
     AudioBundle, GEMMA4_BOA_TOKEN_ID, GEMMA4_EOA_TOKEN_ID,
@@ -226,26 +228,27 @@ fn an_input_audio_clip_over_the_duration_cap_is_refused_up_front() {
     );
 }
 
-/// The chat path's sign that the client is gone is a closed token channel; a
-/// decode asked through it stops before the first packet.
+/// A decode asked with a set stop flag stops before the first packet and
+/// returns the stop outcome, not a decode failure: the retry envelope does not
+/// replay it.
 #[test]
-fn an_input_audio_decode_stops_when_the_token_channel_is_closed() {
+fn an_input_audio_decode_stops_with_the_stop_outcome_when_the_flag_is_set() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     let b64 = base64_encode(&wav_declaring(200));
-    let (tx, rx) = tokio::sync::mpsc::channel::<()>(1);
+    let flag = AtomicBool::new(false);
     let (samples, _) = decode_input_audio(&b64, rmlx_audio::wav::MAX_AUDIO_SECS, 640, &|| {
-        tx.is_closed()
+        flag.load(Ordering::Relaxed)
     })
-    .expect("open channel");
+    .expect("clear flag");
     assert_eq!(samples.len(), 100);
-    drop(rx);
+    flag.store(true, Ordering::Relaxed);
     let err = decode_input_audio(&b64, rmlx_audio::wav::MAX_AUDIO_SECS, 640, &|| {
-        tx.is_closed()
+        flag.load(Ordering::Relaxed)
     })
-    .expect_err("closed channel");
-    assert_eq!(
-        err.to_string(),
-        "other: input_audio decode failed: audio decode cancelled at 0.00 s"
-    );
+    .expect_err("set flag");
+    assert!(matches!(err, Error::Cancelled), "{err:?}");
+    assert!(!err.is_migratable());
 }
 
 /// The audio-token budget in seconds: 25 tokens a second at 640 samples a

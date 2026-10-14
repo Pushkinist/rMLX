@@ -653,6 +653,7 @@ fn an_unknown_voice_logs_one_bounded_info_event() {
                 assert_eq!(message, "unknown voice; valid voices: serena");
             }
             SpeechFailure::Internal(message) => panic!("expected an unknown voice: {message}"),
+            SpeechFailure::Stopped => panic!("expected an unknown voice, got a stop"),
         }
     });
     assert_eq!(events.len(), 1, "{events:?}");
@@ -715,4 +716,34 @@ async fn a_full_queue_is_429_rate_limit_error() {
         bytes,
         br#"{"error":{"message":"server queue full","type":"rate_limit_error"}}"#
     );
+}
+
+/// The error of a synthesis that stopped because its request is gone: the
+/// error that the stop helper returns for a set flag, as a synthesis hands it on.
+fn the_stop_of_a_synthesis() -> Option<TtsError> {
+    rmlx_core::cancel::ensure_not_cancelled(&std::sync::atomic::AtomicBool::new(true))
+        .err()
+        .map(TtsError::from)
+}
+
+/// A stopped synthesis is not a failure of the server: the route logs no
+/// error for it and does not count it as an internal error.
+#[test]
+fn a_stopped_synthesis_is_not_a_failure() {
+    let Some(stop) = the_stop_of_a_synthesis() else {
+        panic!("a synthesis has no stop outcome");
+    };
+    let config = TtsConfig::from_json(TALKER_CONFIG).unwrap();
+    let path = std::path::Path::new("snapshots/talker");
+    let events = events_of(|| {
+        let failure = SpeechFailure::from_synthesis(&stop, "serena", &config, path);
+        assert!(matches!(failure, SpeechFailure::Stopped), "{failure:?}");
+        assert!(
+            failure.category().is_none(),
+            "a stop is counted as an error"
+        );
+    });
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(field(&events[0], "level"), Some("INFO"));
+    assert_eq!(field(&events[0], "emitted"), Some("0"));
 }

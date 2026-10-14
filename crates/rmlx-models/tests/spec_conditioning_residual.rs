@@ -207,6 +207,7 @@ fn dflash1_carried_projection_against_one_call_at_full_height() {
             top_logprobs_k: 0,
         },
         device,
+        &std::sync::atomic::AtomicBool::new(false),
     )
     .expect("dflash generate");
     assert!(
@@ -319,6 +320,7 @@ fn dflash2_carried_projection_against_one_call_at_full_height() {
             top_logprobs_k: 0,
         },
         device,
+        &std::sync::atomic::AtomicBool::new(false),
     )
     .expect("dflash2 generate");
     assert!(

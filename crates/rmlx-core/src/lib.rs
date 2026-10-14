@@ -25,6 +25,7 @@ pub mod apple_gpu;
 // `build.rs` uses. See `src/build_info.rs` for why this exists.
 #[cfg(test)]
 mod build_info;
+pub mod cancel;
 pub mod dispatch_policy;
 pub mod error;
 pub mod kv_boundary;

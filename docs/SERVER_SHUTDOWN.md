@@ -1,9 +1,10 @@
 # Server shutdown
 
-What `rmlx serve` does after SIGINT or SIGTERM. Split out of
-[`SERVER.md`](SERVER.md) to keep that doc under the size cap. The rule is in
-`crates/rmlx-server/src/shutdown.rs`, and it is the same for every route and
-for every value of `--max-timeout-secs`, `0` included.
+What `rmlx serve` does after SIGINT or SIGTERM, and which work stops when a
+request is gone. Split out of [`SERVER.md`](SERVER.md) to keep that doc under
+the size cap. The shutdown rule is in `crates/rmlx-server/src/shutdown.rs`, and
+it is the same for every route and for every value of `--max-timeout-secs`,
+`0` included.
 
 ## The rule
 
@@ -31,15 +32,94 @@ process within 10 s of the panic.
 
 ## What stops, and what does not
 
-The drop of a request is the only stop signal a blocking job gets.
+The drop of a request is the only stop signal a blocking job gets. The 408 of
+the request timeout and a closed connection drop a request as the shutdown
+does, so this section is true for all three. A job that stops releases the GPU
+permit when it returns, and the next request starts then. A job that is not
+stopped holds the permit to its end; after a shutdown it ends with the
+process.
 
-- A transcription reads it before each 30 s window, so it stops when the
-  window in flight ends ([`SERVER_AUDIO.md`](SERVER_AUDIO.md)).
-- A chat, messages, embeddings or speech job is not stopped. It runs on and
-  ends with the process.
+- A transcription reads the stop before each 30 s window, so it stops when
+  the window in flight ends ([`SERVER_AUDIO.md`](SERVER_AUDIO.md)). That
+  window can take longer than the 2 s allowance: see "Worst-case latency" in
+  [`AUDIO.md`](AUDIO.md).
+- A chat or messages job with no draft model reads the stop before each
+  decode step and before each chunk of a prefill, on every architecture. The
+  step or the chunk in flight runs to its end. A prefill is the full prefill
+  of a prompt, or the prefill of the tail after a prompt-cache prefix hit on
+  Gemma 4 and after a prefix that the SSD tier restored on Qwen3.5.
+- An image request on Gemma 4 and Gemma 3 reads the stop before the load of
+  each image. An image request on Qwen3-VL also reads the stop before each
+  block of its vision tower and before each chunk of its image prefill.
+- A chat or messages job with a draft model (speculative decoding) reads the
+  stop before each round and before each chunk of a prefill: the chunked
+  prefill of the verifier and of a draft model, the capture prefill of the
+  verifier, and the prefill of the EAGLE-3 drafter. A round that started runs
+  to its end (draft, verify, accept, rollback), so the verifier and the
+  drafter stop at a committed prefix. The forward of the last prompt token
+  that seeds an MTP, DFlash or assistant drafter has no stop inside it.
+- These parts of a chat or messages job have no stop inside them: the load of
+  one image (a remote fetch takes up to 20 s, the timeout of the fetch), the
+  vision tower of Gemma 4 and Gemma 3, the audio tower of Gemma 4, and the
+  prefill of their image or audio prompt, which is one forward. They run to
+  their end, and the job stops at its next read of the stop after them. The
+  decode of an `input_audio` file stops before its next packet.
+- A speech job reads the stop before each talker frame and before each pass
+  of the codec decode. The frame or the pass in flight runs to its end. A
+  pass decodes at most 300 frames plus 25 frames of left context, and has no
+  read of the stop inside it.
+- An embeddings job is not stopped.
 - A model load is not stopped. The request that started it, and each request
   that waits for it, gets the 503. The load runs on and ends with the
   process.
+
+### A chat job whose request is gone
+
+A chat job decides that its request stopped from the result of the
+generation, not from the flag. A generation that ran to its end is reported
+as one that ended, also when its request went away after it: it keeps its
+completed-request record and its rows, and the send of its terminal item to a
+closed reply fails with no effect. A generation that stopped in its prefill,
+before a decode step or at the head of a round returns `Error::Cancelled`. Its
+job sends no terminal item and writes no row of a completed generation and no
+completed-request record; with a draft model that includes the request record
+of the round loop, and the round events of the rounds that ran stay. It logs
+one `info` event in the span of the request, `the request is gone; the
+generation stopped`. A stop in the load of an image or in the decode of an
+`input_audio` file, before the first decode step, logs the same event with
+`emitted` 0, and no `warn` or `error` event. The field `emitted` is the count
+of tokens that were given to the step callback. A token that the last forward
+picked is not counted on the paths where the stop drops it.
+
+The rows of the first token stay. A route writes the time-to-first-token rows
+when the first token comes, and they are a measurement of an event that
+occurred.
+
+A request that stops in its prefill stores no prompt-cache entry from that
+prefill. On the Qwen3.5 family with the SSD tier, one entry can come from the
+request all the same: the prefix that the request restored from the SSD tier
+is put into a memory slot before the first read of the stop, and it can evict
+the oldest slot. That entry is complete, and the stop does not cut it. A
+request that stops in its decode leaves the entry that its whole prefill
+stored ([`PROMPT_CACHE.md`](PROMPT_CACHE.md)). A job with a draft model
+stores no prompt-cache entry, so its stop leaves none.
+
+The engine returns the stop as `Error::Cancelled`. The retry envelope does not
+replay it ([`SERVER.md`](SERVER.md) § "Classification"). A drop of the replay
+stream aborts the task of the envelope at its next await; in a prefill that is
+the read of the token stream. The abort drops the reply stream of the attempt,
+which sets the stop flag of its job.
+
+### A speech job whose request is gone
+
+A speech job that stops returns the error `Cancelled` from the synthesis. The
+job sends no reply body and writes no metrics row. It logs one `info` event in
+the span of the request, `the request is gone; the generation stopped`, with
+`emitted` 0, because no audio was delivered, and no `warn` or `error` event.
+The MLX buffer cache is released once at the end of the frame loop on a stop,
+as on every other end of the loop, and once more when a stop ends the codec
+decode. A synthesis that ran to its end before its request went away is
+reported as one that ended.
 
 ## The exit at the deadline
 

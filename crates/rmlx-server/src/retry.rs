@@ -28,8 +28,9 @@
 //!
 //! The returned [`ReplayStream`] owns a `JoinHandle` and calls
 //! `handle.abort()` on drop. Dropping the stream (HTTP client cancel)
-//! stops the spawned engine task at the next `tx.send().await` yield point
-//! with no further engine work.
+//! aborts the spawned task at its next await; in a prefill that is the read
+//! of the token stream. The abort drops the reply stream of the attempt, which
+//! sets the stop flag of its job.
 //!
 //! ## RequestPlan
 //!
@@ -125,8 +126,9 @@ pub enum RetryClass {
 ///   refusal, so a request in the second group is retried and fails the
 ///   same way every time.
 /// - Fatal: every other variant — structural, configuration, OOM, smoke-probe,
-///   and the KV ceiling / hard-cap rejections (the bound is the same on every
-///   attempt, whichever phase crossed it).
+///   the KV ceiling / hard-cap rejections (the bound is the same on every
+///   attempt, whichever phase crossed it), and the stop of a request that is
+///   gone (a replay has no reader).
 pub fn classify(err: &RmlxError) -> RetryClass {
     if err.is_migratable() {
         RetryClass::Migratable
@@ -336,8 +338,8 @@ impl RequestPlan {
 ///
 /// Tokio's `JoinHandle` detaches the task on drop. Wrapping it here ensures
 /// that dropping the returned [`ReplayStream`] (e.g. HTTP client cancel)
-/// stops the spawned engine task at the next `tx.send().await` yield point,
-/// releasing GPU resources promptly.
+/// aborts the spawned task at its next await, which drops the reply stream of
+/// the attempt and sets the stop flag of its job.
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
 impl Drop for AbortOnDrop {

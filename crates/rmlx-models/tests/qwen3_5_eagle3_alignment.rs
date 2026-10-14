@@ -169,6 +169,7 @@ fn eagle3_greedy_tracks_plain_greedy_for_a_long_prefix() {
             &mut decided_by,
             &sampler_cfg,
             device,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .expect("eagle3 generate");
     }
@@ -198,6 +199,7 @@ fn eagle3_greedy_tracks_plain_greedy_for_a_long_prefix() {
                 &mut rng,
                 &penalty_cfg,
                 &mut history,
+                &std::sync::atomic::AtomicBool::new(false),
             )
             .expect("plain greedy generate");
     }

@@ -9,7 +9,9 @@
 
 #![allow(clippy::redundant_closure_for_method_calls)]
 use std::mem::size_of_val;
+use std::sync::atomic::AtomicBool;
 
+use rmlx_core::cancel::ensure_not_cancelled;
 use rmlx_core::error::Result;
 use rmlx_mlx::{Array, Device, Dtype};
 
@@ -267,6 +269,11 @@ impl Qwen3VlMoeText {
     ///
     /// `prefill_chunk` must be ≥ 1; a value ≥ `seq` collapses to a single
     /// forward.
+    ///
+    /// `cancel` is the stop flag of the request. Each chunk reads it before its
+    /// forward, and a stopped prefill returns
+    /// [`rmlx_core::Error::Cancelled`]. The caller owns the prefill state of
+    /// the caches and takes them out of it.
     #[allow(clippy::too_many_arguments)]
     #[allow(
         clippy::indexing_slicing,
@@ -282,6 +289,7 @@ impl Qwen3VlMoeText {
         prefill_chunk: usize,
         kv_caches: &mut [KvCache],
         device: Device,
+        cancel: &AtomicBool,
     ) -> Result<Array> {
         let chunk = prefill_chunk.max(1) as i32;
         let n_deep = deepstack_embeds.len();
@@ -294,6 +302,7 @@ impl Qwen3VlMoeText {
         let mut last_logits: Option<Array> = None;
         let mut start = 0_i32;
         while start < seq {
+            ensure_not_cancelled(cancel)?;
             let end = (start + chunk).min(seq);
             let clen = end - start;
 

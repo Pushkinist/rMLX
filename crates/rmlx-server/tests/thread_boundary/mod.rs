@@ -151,6 +151,69 @@ pub const STEP_LIMIT: Duration = Duration::from_secs(600);
 
 // ── Snapshots ───────────────────────────────────────────────────────────────
 
+pub const BONSAI_8B: (&str, &str) = ("prism-ml__Ternary-Bonsai-8B-mlx-2bit", "Qwen3ForCausalLM");
+pub const TERNARY_BONSAI_27B: (&str, &str) = (
+    "prism-ml__Ternary-Bonsai-27B-mlx-2bit",
+    "Qwen3_5ForConditionalGeneration",
+);
+pub const READERLM_V2: (&str, &str) = ("mlx-community__jinaai-ReaderLM-v2", "Qwen2ForCausalLM");
+pub const BITNET: (&str, &str) = ("mlx-community__bitnet-b1.58-2B-4T", "BitNetForCausalLM");
+pub const GEMMA4_E2B: (&str, &str) = (
+    "mlx-community__gemma-4-e2b-it-mxfp8",
+    "Gemma4ForConditionalGeneration",
+);
+pub const QWEN36_MOE: (&str, &str) = (
+    "mlx-community__Qwen3.6-35B-A3B-8bit",
+    "Qwen3_5MoeForConditionalGeneration",
+);
+pub const GEMMA4_E2B_ASSISTANT: (&str, &str) = (
+    "mlx-community__gemma-4-E2B-it-assistant-bf16",
+    "Gemma4AssistantForCausalLM",
+);
+pub const QWEN36_DFLASH: (&str, &str) = ("z-lab__Qwen3.6-35B-A3B-DFlash", "DFlashDraftModel");
+pub const QWEN36_EAGLE3: (&str, &str) = (
+    "Dogacel__specdrift-qwen3.6-35b-a3b-eagle3",
+    "LlamaForCausalLMEagle3",
+);
+pub const QWEN38_4BIT: (&str, &str) = (
+    "mlx-community__Qwen3.8-27B-4bit",
+    "Qwen3_5ForConditionalGeneration",
+);
+pub const QWEN38_MTP_4BIT: (&str, &str) = ("mlx-community__Qwen3.8-27B-MTP-4bit", "qwen3_5_mtp");
+pub const QWEN38_DFLASH2: (&str, &str) = ("z-lab__Qwen3.8-27B-DFlash2", "DFlash2DraftModel");
+pub const QWEN38_MXFP8: (&str, &str) = (
+    "mlx-community__Qwen3.8-27B-mxfp8",
+    "Qwen3_5ForConditionalGeneration",
+);
+pub const ORNITH_9B: (&str, &str) = (
+    "sahilchachra__ornith-1.0-9b-mxfp8-mlx",
+    "Qwen3_5ForConditionalGeneration",
+);
+pub const GEMMA4_UNIFIED_12B: (&str, &str) = (
+    "mlx-community__gemma-4-12B-it-mxfp8",
+    "Gemma4UnifiedForConditionalGeneration",
+);
+pub const MEDGEMMA: (&str, &str) = (
+    "mlx-community__medgemma-1.5-4b-it-8bit",
+    "Gemma3ForConditionalGeneration",
+);
+pub const QWEN3_VL: (&str, &str) = (
+    "mlx-community__Qwen3-VL-30B-A3B-Instruct-4bit",
+    "Qwen3VLMoeForConditionalGeneration",
+);
+pub const JINA_V4: (&str, &str) = ("jinaai__jina-embeddings-v4", "JinaEmbeddingsV4Model");
+pub const TTS: (&str, &str) = (
+    "mlx-community__Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit",
+    "Qwen3TTSForConditionalGeneration",
+);
+pub const TTS_CODEC: (&str, &str) = ("Qwen__Qwen3-TTS-Tokenizer-12Hz", "Qwen3TTSTokenizerV2Model");
+/// The second generation of the 27B ternary pack. It names no architecture
+/// and declares its `model_type`.
+pub const TERNARY_BONSAI_2_27B: (&str, &str) = (
+    "prism-ml__Ternary-Bonsai-2-27B-mlx-2bit",
+    "prism_hadamard_qwen35",
+);
+
 /// The snapshot `slug` names under `RMLX_O_MODELS_ROOT`, or `None` after a
 /// named `SKIP`.
 ///
@@ -282,7 +345,7 @@ pub enum Split {
 ///
 /// The tests of one binary share one process. Without this call, the buffers of
 /// each dropped model stay in memory under the next model.
-fn release_cached_buffers() {
+pub fn release_cached_buffers() {
     assert!(rmlx_mlx::mlx_clear_cache(), "mlx_clear_cache failed");
 }
 
@@ -370,6 +433,7 @@ pub fn greedy(
         &mut rng,
         &PenaltyConfig::default(),
         &mut token_history,
+        &std::sync::atomic::AtomicBool::new(false),
     )?;
     Ok(steps.iter().map(|s| s.token_id).collect())
 }
@@ -391,7 +455,7 @@ pub fn one_thread_pool() -> tokio::runtime::Runtime {
 /// Make `recorder` the tracing dispatcher of `pool`'s one blocking thread for
 /// the rest of that thread's life, so it sees every event the decode emits
 /// there and nothing from any other thread.
-fn record_on(pool: &tokio::runtime::Runtime, recorder: &Arc<RoundStreamRecorder>) {
+pub fn record_on(pool: &tokio::runtime::Runtime, recorder: &Arc<RoundStreamRecorder>) {
     let recorder = Arc::clone(recorder);
     pool.block_on(pool.spawn_blocking(move || {
         std::mem::forget(tracing::subscriber::set_default(recorder));

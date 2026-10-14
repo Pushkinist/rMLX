@@ -34,6 +34,7 @@
 //! one sampling stream. What routes a request to one rule or the other is the
 //! entry guard above both.
 
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use rmlx_core::error::{Error, Result};
@@ -136,7 +137,12 @@ impl RoundDrafter for TwoModelRound<'_> {
     /// Neither model has scored it, so it is what the first round's verify input
     /// opens with and what the first drafting pass feeds — and the request emits
     /// nothing until a round commits a token of its own.
-    fn prefill(&mut self, ctx: &mut RoundCtx<'_>, prompt: &[u32]) -> Result<Prefilled> {
+    fn prefill(
+        &mut self,
+        ctx: &mut RoundCtx<'_>,
+        prompt: &[u32],
+        cancel: &AtomicBool,
+    ) -> Result<Prefilled> {
         let device = ctx.device;
         let Some((&last, head)) = prompt.split_last() else {
             return Err(Error::Model(
@@ -158,6 +164,7 @@ impl RoundDrafter for TwoModelRound<'_> {
             &mut ctx.kv,
             ctx.lin.as_deref_mut(),
             device,
+            cancel,
         )?;
         prefill_chunked(
             self.draft,
@@ -165,6 +172,7 @@ impl RoundDrafter for TwoModelRound<'_> {
             &mut self.kv,
             self.lin.as_deref_mut(),
             device,
+            cancel,
         )?;
         self.seed = vec![last];
         Ok(Prefilled {

@@ -52,8 +52,10 @@ pub(crate) mod text_scan;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
+use rmlx_core::cancel::ensure_not_cancelled;
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{argmax, subtract, Array, Device, Dtype};
 use rmlx_runtime::{count_nan_in_bytes, max_abs_from_bytes};
@@ -555,6 +557,9 @@ impl SpeculativeDispatcher {
         // residual `normalize((p−q)+)`. This preserves the verifier's output
         // distribution exactly (Leviathan 2023 Thm 1).
         sampler_cfg: &crate::sampler::SamplerConfig,
+        // The stop flag of the request, read at the head of each round and
+        // before each prefill chunk.
+        cancel: &AtomicBool,
     ) -> Result<(Vec<ProbeStep>, usize)> {
         if k == 0 {
             return Err(Error::Model("spec_generate_greedy: k must be >= 1".into()));
@@ -594,6 +599,7 @@ impl SpeculativeDispatcher {
                 eos_ids,
                 step_fn,
                 sampler_cfg,
+                cancel,
             )
         } else {
             // Greedy (temperature == 0).
@@ -607,6 +613,7 @@ impl SpeculativeDispatcher {
                 eos_ids,
                 step_fn,
                 sampler_cfg,
+                cancel,
             )
         }
         // The inner loops count drafts; every other loop here counts the block
@@ -651,6 +658,7 @@ impl SpeculativeDispatcher {
         eos_ids: &[u32],
         step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
         sampler_cfg: &crate::sampler::SamplerConfig,
+        cancel: &AtomicBool,
     ) -> Result<(Vec<ProbeStep>, usize)> {
         if prompt_ids.len() < 2 {
             return Err(Error::Model(
@@ -678,6 +686,7 @@ impl SpeculativeDispatcher {
             },
             None,
             self.device,
+            cancel,
         )?;
         Ok((emitted, drafts_per_round(widest_block)))
     }
@@ -724,6 +733,7 @@ impl SpeculativeDispatcher {
         eos_ids: &[u32],
         step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
         sampler_cfg: &crate::sampler::SamplerConfig,
+        cancel: &AtomicBool,
     ) -> Result<(Vec<ProbeStep>, usize)> {
         if prompt_ids.len() < 2 {
             return Err(Error::Model(
@@ -753,6 +763,7 @@ impl SpeculativeDispatcher {
             },
             None,
             self.device,
+            cancel,
         )?;
         Ok((emitted, drafts_per_round(widest_block)))
     }
@@ -869,18 +880,22 @@ pub(crate) fn emit_step(
 /// Used at the top of `spec_generate_greedy_cached` once per model.
 /// `pub` for the MTP drafter-alignment integration test (it replays
 /// round-0 prefill explicitly to assert drafter↔verifier first-token match).
+///
+/// `cancel` is the stop flag of the request: see [`prefill_chunked_with`].
 pub fn prefill_chunked(
     arch: &Architecture,
     tokens: &[u32],
     caches: &mut [KvCache],
     mut lin_caches: Option<&mut [LinearAttnCache]>,
     device: Device,
+    cancel: &AtomicBool,
 ) -> Result<()> {
     prefill_chunked_for_class(
         arch.arch_class(),
         tokens,
         caches,
         device,
+        cancel,
         |chunk, caches| {
             // Single-position last_k=1 forward — we only need cache update, not
             // logits. The lazy graph drops the lm_head matmul on non-final chunks;
@@ -905,6 +920,7 @@ fn prefill_chunked_for_class(
     tokens: &[u32],
     caches: &mut [KvCache],
     device: Device,
+    cancel: &AtomicBool,
     forward: impl FnMut(&[u32], &mut [KvCache]) -> Result<()>,
 ) -> Result<()> {
     let (chunk_size, chunk_source) =
@@ -917,7 +933,7 @@ fn prefill_chunked_for_class(
         n_chunks = tokens.len().div_ceil(chunk_size.max(1)),
         "prefill: chunking prompt"
     );
-    prefill_chunked_with(tokens, caches, chunk_size, device, forward)
+    prefill_chunked_with(tokens, caches, chunk_size, device, cancel, forward)
 }
 
 /// Bracket-and-sweep engine behind [`prefill_chunked`]: `enter_prefill` on every
@@ -931,6 +947,10 @@ fn prefill_chunked_for_class(
 /// un-quantized storage), and the next decode on it errors or corrupts KV — so
 /// stranding even one cache poisons any later reuse of this slice.
 ///
+/// `cancel` is the stop flag of the request. Each chunk reads it before its
+/// forward. A stopped prefill returns [`Error::Cancelled`] after the sweep and
+/// logs no error.
+///
 /// The forward is injected so the invariant is unit-testable without a live
 /// model: a test drives a failing forward and asserts no cache is left
 /// `in_prefill`.
@@ -939,6 +959,7 @@ fn prefill_chunked_with(
     caches: &mut [KvCache],
     prefill_chunk: usize,
     device: Device,
+    cancel: &AtomicBool,
     mut forward: impl FnMut(&[u32], &mut [KvCache]) -> Result<()>,
 ) -> Result<()> {
     if tokens.is_empty() {
@@ -947,26 +968,30 @@ fn prefill_chunked_with(
     for c in caches.iter_mut() {
         c.enter_prefill();
     }
-    let mut first_err: Option<Error> = None;
     let n_chunks = tokens.len().div_ceil(prefill_chunk);
-    'chunks: for (chunk_idx, chunk) in tokens.chunks(prefill_chunk).enumerate() {
-        let is_last = chunk_idx + 1 == n_chunks;
-        if let Err(e) = forward(chunk, caches) {
-            tracing::error!(error = %e, "spec prefill chunk forward failed, aborting generation");
-            first_err = Some(e);
-            break 'chunks;
-        }
-        // Flush command buffer between chunks via cache eval.
-        if !is_last {
-            for c in caches.iter() {
-                if let Err(e) = c.eval_prefill_state() {
-                    tracing::error!(error = %e, "spec prefill chunk cache eval failed, aborting generation");
-                    first_err = Some(e);
-                    break 'chunks;
+    // A closure, so that `?` ends the chunk loop and not this fn: the sweep
+    // below is owed on every outcome, a stop included.
+    let mut run_chunks = |caches: &mut [KvCache]| -> Result<()> {
+        for (chunk_idx, chunk) in tokens.chunks(prefill_chunk).enumerate() {
+            ensure_not_cancelled(cancel)?;
+            let is_last = chunk_idx + 1 == n_chunks;
+            if let Err(e) = forward(chunk, caches) {
+                tracing::error!(error = %e, "spec prefill chunk forward failed, aborting generation");
+                return Err(e);
+            }
+            // Flush command buffer between chunks via cache eval.
+            if !is_last {
+                for c in caches.iter() {
+                    if let Err(e) = c.eval_prefill_state() {
+                        tracing::error!(error = %e, "spec prefill chunk cache eval failed, aborting generation");
+                        return Err(e);
+                    }
                 }
             }
         }
-    }
+        Ok(())
+    };
+    let mut first_err = run_chunks(caches).err();
     // Mandatory cleanup: every cache entered prefill above and must run
     // exit_prefill, even after a failure — no break, no early `?`. Skipping it
     // strands the remaining caches with un-finalized prefill state that

@@ -47,7 +47,7 @@
 #             | but on the sum per (crate, kind, kernel): hits of the `<=N`
 #             | test can stand in for missing hits of the exact one. A `<=N`
 #             | entry has no stale verdict, so the runner's selftest holds
-#             | the number of them in this file (2).
+#             | the number of them in this file (4).
 #             | A `<=N` entry is a waiver, not an analysis of a cause. It
 #             | still refuses a store, a kernel it does not name, a hit in
 #             | another crate or from another test, and a count above N.
@@ -107,10 +107,18 @@
 # `rmlx-mlx`'s `implicit_gemm_conv_tail_channel_reads_never_reach_the_output`
 # is bit-identical with the tail rows at NaN, +3e4 and -3e4.
 #
-# The hits in `rmlx-server` come from the Qwen3-TTS codec decoder: 3 per
-# synthesis in the two `rmlx-server` tests, which run their steps once on one
-# thread for the oracle and once across two threads (2 syntheses and 4). The
-# offsets are two (268800 and 279552, against an MTLBuffer of 262144 bytes).
+# The hits in `rmlx-server` come from the Qwen3-TTS codec decoder, 3 for each
+# codec pass. A pass decodes at most 300 frames, so a synthesis of up to 300
+# frames is one pass and 3 hits. The two thread-boundary tests speak a text of
+# one pass: they run their steps once on one thread for the oracle and once
+# across two threads (2 syntheses and 6 hits, 4 syntheses and 12). The offsets
+# are two (268800 and 279552, against an MTLBuffer of 262144 bytes).
+#
+# The gone-request test makes four requests: a short text of 31 frames (1 pass,
+# 3 hits), a long text that runs to its end with 926 frames (4 passes: 300,
+# 300, 300 and 26 frames, 12 hits), the same long text with a client that goes
+# away (0 hits: it stops in its frame loop, before any codec pass) and the
+# short text again (3 hits). 3 + 12 + 0 + 3 = 18, as in each of three runs.
 #
 # WIDE GEMV, `gemv_wide_bfloat16_nv5_kl32_nc0_axpby0` and
 # `gemv_wide_bfloat16_nv4_kl32_nc0_axpby0` (MLX 0.32.1 and later). Two
@@ -153,9 +161,21 @@
 # of the four validated runs and in the unvalidated runs, so the report
 # changed no drawn token.
 #
+# Two more tests drive the nv5 call on gemma-4-e2b, and their counts are not
+# reproducible either. `a_gone_request_frees_the_gpu_on_the_round_loop_with_the_assistant`
+# in `rmlx-server` (the assistant pair through the server) gave 5, 1 and 0 in
+# three runs, so its entry is `<=5`; the test passed in each validated and
+# each unvalidated run, and it holds the tokens after the stop equal to the
+# tokens of the cold run. `print_the_seeded_stochastic_streams_for_a_cross_commit_diff`
+# in `rmlx-models` (the sampled two-model pair) gave 1 in one run of the
+# branch that added the stop of a request, then 0 and 0 on that branch and 0
+# and 0 on its base, so its entry is `<=1`. The 16 seeded streams it prints are
+# identical in the run with the report, in its unvalidated run and in the four
+# later validated runs, so the report changed no drawn token.
+#
 # What produces these reports inside the validation layer is not known. It is
 # not known if they show a defect of the MLX kernel or an artifact of the
-# instrument, or if the same access occurs without the instrument. The two
+# instrument, or if the same access occurs without the instrument. The four
 # entries waive a count that is not reproducible; they explain nothing.
 #
 # The buffer length beside each diagnostic is the MTLBuffer MLX allocated from a
@@ -192,5 +212,8 @@
 implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s | device load | 4 | rmlx-mlx | implicit_gemm_conv_tail_channel_reads_never_reach_the_output | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
 implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s | device load | 6 | rmlx-server | tts_first_synthesis_runs_on_a_thread_that_did_not_load_it | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
 implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s | device load | 12 | rmlx-server | tts_synthesizes_on_a_thread_that_did_not_load_it | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
+implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s | device load | 18 | rmlx-server | a_gone_speech_request_frees_the_gpu_and_the_next_one_speaks_the_same_audio | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
 gemv_wide_bfloat16_nv5_kl32_nc0_axpby0 | device load | <=10 | rmlx-models | the_assistant_round_loop_reproduces_plain_greedy | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/638
 gemv_wide_bfloat16_nv4_kl32_nc0_axpby0 | device load | <=1 | rmlx-models | a_sampled_sidecar_arm_draws_from_the_verifiers_distribution | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/638
+gemv_wide_bfloat16_nv5_kl32_nc0_axpby0 | device load | <=1 | rmlx-models | print_the_seeded_stochastic_streams_for_a_cross_commit_diff | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/638
+gemv_wide_bfloat16_nv5_kl32_nc0_axpby0 | device load | <=5 | rmlx-server | a_gone_request_frees_the_gpu_on_the_round_loop_with_the_assistant | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/638

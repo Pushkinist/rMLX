@@ -40,6 +40,7 @@
 //! here this one is greedy, and the serve layer routes a sidecar request to it
 //! whatever the request's temperature.
 
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use rmlx_core::error::{Error, Result};
@@ -130,7 +131,12 @@ impl RoundDrafter for BlockRound<'_> {
         clippy::indexing_slicing,
         reason = "every index is axis 1 of a rank-3 buffer whose rank the seam that produced it checked: the trim and the row it takes the probe from"
     )]
-    fn prefill(&mut self, ctx: &mut RoundCtx<'_>, prompt: &[u32]) -> Result<Prefilled> {
+    fn prefill(
+        &mut self,
+        ctx: &mut RoundCtx<'_>,
+        prompt: &[u32],
+        cancel: &AtomicBool,
+    ) -> Result<Prefilled> {
         let device = ctx.device;
         let keep_rows = self.drafter.conditioning_rows();
         // Defence in depth: `check_config` refuses a window under 2 or wider
@@ -151,6 +157,7 @@ impl RoundDrafter for BlockRound<'_> {
             PREFILL_CHUNK_SIZE,
             Some(keep),
             device,
+            cancel,
         )?;
         guard_verifier_prefill_logits(ctx.verifier, &bonus_logits, prompt.len())?;
         let prompt_ctx = self.drafter.trim_conditioning(&prompt_hidden)?;
@@ -348,6 +355,8 @@ impl RoundDrafter for BlockRound<'_> {
 /// checked, and every round narrows the block again against the remaining token
 /// budget.
 ///
+/// `cancel` is the stop flag of the request, handed to [`run_rounds`].
+///
 /// # Errors
 ///
 /// [`Error::Model`] when the prompt is too short to seed a round, when the
@@ -367,6 +376,7 @@ pub fn dflash2_generate(
     step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
     sampler_cfg: &crate::sampler::SamplerConfig,
     device: Device,
+    cancel: &AtomicBool,
 ) -> Result<(Vec<ProbeStep>, usize)> {
     if prompt_ids.len() < 2 {
         return Err(Error::Model(
@@ -414,6 +424,7 @@ pub fn dflash2_generate(
         // whole vocabulary, so its tokens need no per-token attribution.
         None,
         device,
+        cancel,
     )
 }
 

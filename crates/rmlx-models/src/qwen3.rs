@@ -51,6 +51,7 @@
 )]
 use rustc_hash::FxHashMap;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -1887,6 +1888,7 @@ pub fn generate_greedy<'a>(
     // Logit-penalty configuration + per-request token history.
     penalty_cfg: &'a crate::sampler::PenaltyConfig,
     token_history: &'a mut Vec<u32>,
+    cancel: &AtomicBool,
 ) -> Result<Vec<crate::decode_loop::ProbeStep>> {
     use crate::decode_loop::ProbeStep;
 
@@ -1995,7 +1997,7 @@ pub fn generate_greedy<'a>(
                 arch: "Qwen3ForCausalLM",
                 resolve_pieces: true,
             };
-            pipelined_decode(&mut ctx, last_id, &mut steps, |y| {
+            pipelined_decode(&mut ctx, last_id, &mut steps, cancel, |y| {
                 model.forward_arr(y, 1, Some(&mut kv_caches), device)
             })?
         };
@@ -2082,6 +2084,7 @@ pub fn generate_greedy<'a>(
         prefill_chunk,
         device,
         "Qwen3ForCausalLM",
+        cancel,
         |chunk, caches| model.forward_seq_with_cache(chunk, Some(caches), device),
     )?;
 
@@ -2255,7 +2258,7 @@ pub fn generate_greedy<'a>(
     // The pipeline ordering (choose_token → async_eval → drain previous pending →
     // feed) overlaps host sampling with the in-flight GPU forward; see
     // decode_loop.rs.
-    let (stats, post) = pipelined_decode(&mut ctx, last_id, &mut steps, |y| {
+    let (stats, post) = pipelined_decode(&mut ctx, last_id, &mut steps, cancel, |y| {
         model.forward_arr(y, 1, Some(&mut caches), device)
     })?;
 

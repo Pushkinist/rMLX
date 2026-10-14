@@ -8,7 +8,8 @@
 //! # Public API
 //!
 //! - [`Error`] — non-exhaustive enum covering I/O, config, loader, quant,
-//!   model, MLX FFI, OOM, and generic failures.
+//!   model, MLX FFI, OOM, and generic failures, and the stop of a request
+//!   that is gone.
 //! - [`OomPhase`] — allocation phase tag inside [`Error::Oom`], used to
 //!   distinguish load-time OOM (evict + retry) from mid-generation OOM
 //!   (abort stream).
@@ -188,6 +189,12 @@ pub enum Error {
         /// The operation that asked for the GPU.
         op: &'static str,
     },
+
+    /// The request is gone and its work stopped: a timeout, a closed
+    /// connection or a server shutdown dropped it. A stop is an outcome, not
+    /// a failure. A loop reads it with [`crate::cancel::ensure_not_cancelled`].
+    #[error("cancelled: the request is gone")]
+    Cancelled,
 }
 
 impl Error {
@@ -201,7 +208,8 @@ impl Error {
     /// `false` — the failure is permanent, structural, or a policy rejection;
     /// replaying would reproduce it. This includes the KV ceiling / hard-cap
     /// rejections: the bound is identical on every attempt, whichever phase
-    /// (prefill or decode) crossed it, so a retry is futile.
+    /// (prefill or decode) crossed it, so a retry is futile. A stop is also
+    /// `false`: its request is gone, so a replay has no reader.
     ///
     /// The match is exhaustive on purpose — **no wildcard arm**. This enum is
     /// `#[non_exhaustive]`, which only relaxes exhaustiveness for *downstream*
@@ -231,7 +239,8 @@ impl Error {
             | Error::KvCeilingExceeded { .. }
             | Error::ContextCeilingExceeded { .. }
             | Error::SpeculativePairing { .. }
-            | Error::GpuForbidden { .. } => false,
+            | Error::GpuForbidden { .. }
+            | Error::Cancelled => false,
         }
     }
 }

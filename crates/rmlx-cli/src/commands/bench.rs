@@ -754,6 +754,7 @@ fn measure_one(
             &mut rng,
             &penalty_cfg,
             &mut token_history,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .map_err(|e| anyhow::anyhow!("generate_greedy: {e}"))?;
 

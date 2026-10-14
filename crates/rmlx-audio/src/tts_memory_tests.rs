@@ -20,6 +20,7 @@ use super::{
     TALKER_KV_BLOCK_ROWS as BLOCK,
 };
 use rmlx_mlx::{add, mlx_cache_memory_bytes, Array, Device, PeakBracket};
+use std::sync::atomic::AtomicBool;
 
 const HIDDEN: i32 = 256;
 const HEAD_DIM: i32 = 128;
@@ -103,7 +104,7 @@ fn the_buffer_cache_stays_small_with_a_release_only_after_a_growth_child() {
     let mut peak_cache = 0;
     let mut live_rise_inside_a_block = 0;
 
-    let frames = run_frames(|index| {
+    let frames = run_frames(&AtomicBool::new(false), |index| {
         if index == FRAMES {
             return Ok((FrameStep::End, false));
         }
@@ -160,7 +161,7 @@ fn the_buffer_cache_stays_small_with_a_release_only_after_a_growth_child() {
     // freed before the last release, or they are in the cache after it.
     for fails in [false, true] {
         let mut owned = Talker::new();
-        let result = run_frames(move |index| {
+        let result = run_frames(&AtomicBool::new(false), move |index| {
             let grew = owned.step(if index == 0 { PREFILL_ROWS } else { 1 });
             match (index == LAST_OWNED_FRAME, fails) {
                 (false, _) => Ok((FrameStep::Frame(vec![0; 16]), grew)),
@@ -260,7 +261,7 @@ fn the_buffer_cache_is_released_between_the_passes_of_a_long_decode_child() {
     let codes = Array::from_i32_slice(&vec![0; 16 * frames], &[1, 16, frames as i32]).unwrap();
     let mut cache_at_entry = Vec::new();
 
-    decode_in_chunks(&codes, Device::Cpu, |window| {
+    decode_in_chunks(&codes, Device::Cpu, &AtomicBool::new(false), |window| {
         cache_at_entry.push(mlx_cache_memory_bytes().unwrap());
         let width = window.shape()[2] as usize;
         let scratch = Array::from_f32_slice(
@@ -284,7 +285,7 @@ fn the_buffer_cache_is_released_between_the_passes_of_a_long_decode_child() {
     assert_eq!(mlx_cache_memory_bytes().unwrap(), 0);
 
     let mut passes = 0;
-    let failed = decode_in_chunks(&codes, Device::Cpu, |window| {
+    let failed = decode_in_chunks(&codes, Device::Cpu, &AtomicBool::new(false), |window| {
         passes += 1;
         let scratch = Array::from_f32_slice(
             &vec![1.0; PASS_SCRATCH_ELEMENTS],
@@ -306,6 +307,30 @@ fn the_buffer_cache_is_released_between_the_passes_of_a_long_decode_child() {
         mlx_cache_memory_bytes().unwrap(),
         0,
         "the cache must be empty after a pass failed"
+    );
+
+    let scratch = Array::from_f32_slice(
+        &vec![1.0; PASS_SCRATCH_ELEMENTS],
+        &[PASS_SCRATCH_ELEMENTS as i32],
+    )
+    .unwrap();
+    add(&scratch, &scratch, Device::Cpu)
+        .unwrap()
+        .eval()
+        .unwrap();
+    drop(scratch);
+    assert!(
+        mlx_cache_memory_bytes().unwrap() >= MIB,
+        "no power: the buffers of the scratch did not reach the cache"
+    );
+    let stopped = decode_in_chunks(&codes, Device::Cpu, &AtomicBool::new(true), |_| {
+        panic!("a decode whose request is gone ran a pass")
+    });
+    assert!(matches!(stopped, Err(TtsError::Cancelled)), "{stopped:?}");
+    assert_eq!(
+        mlx_cache_memory_bytes().unwrap(),
+        0,
+        "the cache must be empty after a stop ended the decode"
     );
     println!("{CHILD_DONE}");
 }

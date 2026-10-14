@@ -106,6 +106,7 @@ fn generate_and_read_bytes(
             &mut rng,
             &penalty_cfg,
             &mut token_history,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .expect("generate_greedy");
 

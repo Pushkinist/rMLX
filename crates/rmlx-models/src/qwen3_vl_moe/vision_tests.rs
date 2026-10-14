@@ -1,22 +1,15 @@
 use super::*;
 
-/// Synthetic-weight ViT forward: build a tiny tower with deterministic
-/// weights and check the output shape + finiteness. No model needed.
-#[test]
-#[allow(
-    clippy::expect_used,
-    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
-)]
-#[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-)]
+/// The patch grid of the one image that the tiny tower is run on.
+const TINY_GRID: (usize, usize, usize) = (1, 4, 4);
+
+/// A tiny tower with deterministic weights, and the pixel values of one image
+/// on [`TINY_GRID`]. No model needed.
 #[allow(
     clippy::unwrap_used,
-    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    reason = "test fixture: all unwraps are on values constructed locally in this fn"
 )]
-fn qwen3_vl_moe_vision_tower_shape() {
-    let device = Device::Cpu;
+fn tiny_tower() -> (Qwen3VlMoeVision, Vec<f32>) {
     let cfg = Qwen3VlMoeVisionConfig {
         depth: 2,
         hidden_size: 8,
@@ -102,15 +95,37 @@ fn qwen3_vl_moe_vision_tower_shape() {
         num_grid_per_side: ngps,
     };
 
-    let (gt, gh, gw) = (1usize, 4usize, 4usize);
-    let num_patches = gt * gh * gw;
-    let pv = vec![0.05f32; num_patches * feat_len];
+    let (gt, gh, gw) = TINY_GRID;
+    let pv = vec![0.05f32; gt * gh * gw * feat_len];
+    (vis, pv)
+}
+
+/// Synthetic-weight ViT forward: run the tiny tower and check the output
+/// shape + finiteness.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: all unwraps are on values constructed locally in this fn"
+)]
+fn qwen3_vl_moe_vision_tower_shape() {
+    let (vis, pv) = tiny_tower();
+    let cfg = vis.config();
+    let (gt, gh, gw) = TINY_GRID;
     let out = vis
-        .forward(&pv, (gt, gh, gw), device)
+        .forward(&pv, TINY_GRID, Device::Cpu, &AtomicBool::new(false))
         .expect("vision forward");
     Array::eval(&out.image_embeds).expect("eval");
 
-    let expect_merged = num_patches / merge_unit;
+    let merge_unit = cfg.spatial_merge_size * cfg.spatial_merge_size;
+    let expect_merged = gt * gh * gw / merge_unit;
     assert_eq!(
         out.image_embeds.shape(),
         vec![expect_merged as i32, cfg.out_hidden_size as i32],
@@ -130,6 +145,20 @@ fn qwen3_vl_moe_vision_tower_shape() {
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
         .collect();
     assert_eq!(vals.iter().filter(|v| !v.is_finite()).count(), 0);
+}
+
+/// The tower of a request that is gone returns the stop outcome as it is, and
+/// not a failure that the retry envelope would run again. The same tower with a
+/// clear flag gives its output, which `qwen3_vl_moe_vision_tower_shape` holds.
+#[test]
+fn a_stopped_tower_returns_the_stop_outcome() {
+    let (vis, pv) = tiny_tower();
+    let stopped = vis.forward(&pv, TINY_GRID, Device::Cpu, &AtomicBool::new(true));
+    assert!(
+        matches!(stopped, Err(Error::Cancelled)),
+        "{:?}",
+        stopped.err()
+    );
 }
 
 /// Query-tiled ViT attention must equal one SDPA over all queries: each query

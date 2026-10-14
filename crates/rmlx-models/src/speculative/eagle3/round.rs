@@ -42,6 +42,7 @@
 //! round line is read back off the cache afterwards rather than computed — so it
 //! is a cross-check on the verifier's target rather than a restatement of it.
 
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use rmlx_core::error::{Error, Result};
@@ -262,7 +263,12 @@ impl RoundDrafter for Eagle3Round<'_> {
     /// The span covers all three: the drafter's prefill is conditioned on the
     /// verifier's capture and is part of what this request paid before its first
     /// round.
-    fn prefill(&mut self, ctx: &mut RoundCtx<'_>, prompt: &[u32]) -> Result<Prefilled> {
+    fn prefill(
+        &mut self,
+        ctx: &mut RoundCtx<'_>,
+        prompt: &[u32],
+        cancel: &AtomicBool,
+    ) -> Result<Prefilled> {
         let device = ctx.device;
         // A sampled request cannot take the reduced read-back — see this module's
         // header — so it is the request's draw and not the drafter alone that
@@ -291,6 +297,7 @@ impl RoundDrafter for Eagle3Round<'_> {
             // so no capture row can be released early.
             None,
             device,
+            cancel,
         )?;
         guard_verifier_prefill_logits(ctx.verifier, &bonus_logits, n)?;
         let bonus = ctx.draw.seed_token(&bonus_logits, device)?;
@@ -306,6 +313,7 @@ impl RoundDrafter for Eagle3Round<'_> {
             &shifted,
             &all_hidden,
             device,
+            cancel,
         )?;
         tracing::debug!(
             prompt_len = n,
@@ -471,6 +479,8 @@ impl RoundDrafter for Eagle3Round<'_> {
 /// checked, and every loop here narrows the block again per round against the
 /// remaining token budget.
 ///
+/// `cancel` is the stop flag of the request, handed to [`run_rounds`].
+///
 /// # Errors
 ///
 /// [`Error::Model`] when the prompt is too short to seed a round, when the
@@ -490,6 +500,7 @@ pub fn eagle3_generate(
     decided_by: &mut Vec<DecidedBy>,
     sampler_cfg: &crate::sampler::SamplerConfig,
     device: Device,
+    cancel: &AtomicBool,
 ) -> Result<(Vec<ProbeStep>, usize)> {
     decided_by.clear();
 
@@ -528,6 +539,7 @@ pub fn eagle3_generate(
         },
         Some(decided_by),
         device,
+        cancel,
     )
 }
 

@@ -9,8 +9,10 @@
     reason = "greedy decode loop: large branchy state machine over sampler/penalty/mask combos; splitting hides the per-step decision tree"
 )]
 
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
+use rmlx_core::cancel::ensure_not_cancelled;
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{argmax, Array, Device, Dtype};
 use rmlx_runtime::{count_nan_in_bytes, max_abs_from_bytes};
@@ -65,6 +67,7 @@ pub fn generate_greedy(
     rng: &mut crate::sampler::Pcg32,
     penalty_cfg: &crate::sampler::PenaltyConfig,
     token_history: &mut Vec<u32>,
+    cancel: &AtomicBool,
 ) -> Result<Vec<crate::decode_loop::ProbeStep>> {
     use crate::decode_loop::ProbeStep;
 
@@ -168,6 +171,7 @@ pub fn generate_greedy(
             rng,
             penalty_cfg,
             token_history,
+            cancel,
             &mut forward_total_ns,
             &mut decode_steps_count,
         )?;
@@ -212,47 +216,58 @@ pub fn generate_greedy(
     // instead reaches the operator as the engine's generic zero-token backstop,
     // which names nothing — the real cause (a Metal fault, a store refusing an
     // append) is erased. Propagate it verbatim.
-    let mut last_logits: Option<Array> = None;
     let n_chunks = prompt_ids.len().div_ceil(prefill_chunk);
-    for (chunk_idx, chunk) in prompt_ids.chunks(prefill_chunk).enumerate() {
-        let is_last = chunk_idx + 1 == n_chunks;
-        match model.forward_seq_with_cache(chunk, Some(&mut caches), device) {
-            Ok(logits) => {
-                if is_last {
-                    last_logits = Some(logits);
-                } else {
-                    for c in &caches {
-                        if let Err(e) = c.eval_prefill_state() {
-                            tracing::error!(
-                                error = %e,
-                                chunk_len = chunk.len(),
-                                "bitnet generate_greedy: prefill chunk cache evaluation failed, \
-                                 aborting generation"
-                            );
-                            return Err(e);
+    // A closure, so that `?` ends the chunk loop and not this fn: the
+    // exit_prefill sweep below is owed on every outcome, a stop included.
+    let run_chunks = |caches: &mut [KvCache]| -> Result<Option<Array>> {
+        let mut last_logits: Option<Array> = None;
+        for (chunk_idx, chunk) in prompt_ids.chunks(prefill_chunk).enumerate() {
+            ensure_not_cancelled(cancel)?;
+            let is_last = chunk_idx + 1 == n_chunks;
+            match model.forward_seq_with_cache(chunk, Some(&mut *caches), device) {
+                Ok(logits) => {
+                    if is_last {
+                        last_logits = Some(logits);
+                    } else {
+                        for c in caches.iter() {
+                            if let Err(e) = c.eval_prefill_state() {
+                                tracing::error!(
+                                    error = %e,
+                                    chunk_len = chunk.len(),
+                                    "bitnet generate_greedy: prefill chunk cache evaluation failed, \
+                                     aborting generation"
+                                );
+                                return Err(e);
+                            }
                         }
                     }
                 }
-            }
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    prompt_len = prompt_ids.len(),
-                    "bitnet generate_greedy: prefill chunk failed, aborting generation"
-                );
-                return Err(e);
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        prompt_len = prompt_ids.len(),
+                        "bitnet generate_greedy: prefill chunk failed, aborting generation"
+                    );
+                    return Err(e);
+                }
             }
         }
-    }
-
+        Ok(last_logits)
+    };
+    let chunks = run_chunks(&mut caches);
+    let mut exit_err: Option<Error> = None;
     for c in &mut caches {
         if let Err(e) = c.exit_prefill(device) {
             tracing::error!(
                 error = %e,
                 "bitnet generate_greedy: exit_prefill quantization failed, aborting generation"
             );
-            return Err(e);
+            exit_err.get_or_insert(e);
         }
+    }
+    let last_logits = chunks?;
+    if let Some(e) = exit_err {
+        return Err(e);
     }
 
     let Some(prefill_logits) = last_logits else {
@@ -450,6 +465,7 @@ pub fn generate_greedy(
         rng,
         penalty_cfg,
         token_history,
+        cancel,
         &mut forward_total_ns,
         &mut decode_steps_count,
     )?;
@@ -485,6 +501,9 @@ pub fn generate_greedy(
 ///
 /// The per-step decode math is byte-identical to the original inline loop; only
 /// the wrapping (function boundary + accumulated counters) differs.
+///
+/// `cancel` is the stop flag of the request. Each pass reads it before its
+/// forward, and a stopped decode returns [`Error::Cancelled`].
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::indexing_slicing,
@@ -510,6 +529,7 @@ fn decode_loop(
     rng: &mut crate::sampler::Pcg32,
     penalty_cfg: &crate::sampler::PenaltyConfig,
     token_history: &mut Vec<u32>,
+    cancel: &AtomicBool,
     forward_total_ns: &mut u128,
     decode_steps_count: &mut u32,
 ) -> Result<crate::decode_loop::PostDecode> {
@@ -523,6 +543,8 @@ fn decode_loop(
     y.eval()?;
 
     for step_idx in 1..n_tokens {
+        ensure_not_cancelled(cancel)?;
+
         let fwd_t0 = Instant::now();
         // A failed forward aborts the request: returning the tokens produced so
         // far reports as a normal short generation and hides the failure from

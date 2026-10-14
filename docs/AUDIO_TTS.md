@@ -69,6 +69,12 @@ concatenation, one step at a time.
 4. The group-0 code goes into the history. The talker's repetition penalty
    reads the full history.
 
+`synthesize` takes the stop flag of the request. `run_frames` reads it before
+each frame, and `decode_in_chunks` reads it before each pass of the codec
+decode. A set flag ends the synthesis with `TtsError::Cancelled`, which is no
+failure. The frame loop still releases the MLX buffer cache once at its end.
+The frame in flight runs to its end.
+
 If the loop reaches the cap before the end token, `Synthesis::truncated` is
 `true`, and the audio is cut off. The speech route then sets the
 `x-rmlx-tts-truncated: true` header and logs a `warn` event with the frame

@@ -509,6 +509,7 @@ pub(crate) fn run_baseline(
             &mut baseline_rng,
             &baseline_penalty_cfg,
             &mut baseline_token_history,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .map_err(|e| anyhow::anyhow!("generate_greedy: {e}"))?;
     let generate_elapsed = ts_generate_start.elapsed();

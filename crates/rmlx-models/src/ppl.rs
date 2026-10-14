@@ -45,6 +45,8 @@
 
 #![allow(clippy::cognitive_complexity)]
 #![allow(trivial_casts)]
+use std::sync::atomic::AtomicBool;
+
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device, Dtype};
 use thiserror::Error;
@@ -332,6 +334,8 @@ fn score_window_through_cache(
         crate::prefill_chunk::resolve(arch),
         device,
         arch,
+        // The perplexity command has no request, so it has no stop.
+        &AtomicBool::new(false),
         &mut forward,
     )?;
     // `&host[..vocab]`, not `host`: the buffer is the caller's and outlives this

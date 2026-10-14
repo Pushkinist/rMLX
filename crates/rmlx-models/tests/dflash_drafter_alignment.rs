@@ -123,6 +123,7 @@ fn dflash_round0_first_token_aligns() {
         &mut caches,
         Some(&mut lin),
         device,
+        &std::sync::atomic::AtomicBool::new(false),
     )
     .expect("prefill");
 
@@ -248,6 +249,7 @@ fn dflash_live_loop_emits_coherent() {
             top_logprobs_k: 0,
         },
         device,
+        &std::sync::atomic::AtomicBool::new(false),
     )
     .expect("dflash generate");
 

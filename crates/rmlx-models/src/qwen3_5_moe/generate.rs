@@ -16,8 +16,10 @@
     clippy::redundant_closure_for_method_calls,
     clippy::too_many_lines
 )]
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
+use rmlx_core::cancel::ensure_not_cancelled;
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device};
 use rmlx_runtime::{count_nan_in_bytes, max_abs_from_bytes};
@@ -74,6 +76,7 @@ pub fn generate_greedy<'a>(
     // Logit-penalty configuration + per-request token history.
     penalty_cfg: &'a crate::sampler::PenaltyConfig,
     token_history: &'a mut Vec<u32>,
+    cancel: &AtomicBool,
 ) -> Result<Vec<crate::decode_loop::ProbeStep>> {
     use crate::decode_loop::ProbeStep;
 
@@ -229,7 +232,7 @@ pub fn generate_greedy<'a>(
                 arch: arch_label,
                 resolve_pieces: false,
             };
-            pipelined_decode(&mut ctx, last_id, &mut steps, |y| {
+            pipelined_decode(&mut ctx, last_id, &mut steps, cancel, |y| {
                 model.forward_arr(y, 1, Some(&mut kv_caches), Some(&mut lin_caches), device)
             })?
         };
@@ -280,14 +283,15 @@ pub fn generate_greedy<'a>(
         let prefill_chunk = crate::prefill_chunk::prefill_chunk_for("qwen3_5_moe");
 
         // No enter_prefill above (see the note on resumed caches) means no
-        // exit_prefill sweep is owed here, so a failure returns its cause
-        // immediately (unlike the shared helper, which must capture and sweep
-        // first).
+        // exit_prefill sweep is owed here, so a failure or a stop returns its
+        // cause immediately (unlike the shared helper, which must capture and
+        // sweep first).
         let prefill_logits = {
             let mut last_logits: Option<Array> = None;
             let tail = &prompt_ids[prefix_len..];
             let n_chunks = tail.len().div_ceil(prefill_chunk);
             for (chunk_idx, chunk) in tail.chunks(prefill_chunk).enumerate() {
+                ensure_not_cancelled(cancel)?;
                 let is_last = chunk_idx + 1 == n_chunks;
                 match model.forward_seq_with_cache(
                     chunk,
@@ -466,7 +470,7 @@ pub fn generate_greedy<'a>(
 
         // Shared pipelined decode loop. GDN `lin_caches` are closure-captured —
         // the loop never learns they exist.
-        let (_, post) = pipelined_decode(&mut ctx, last_id, &mut steps, |y| {
+        let (_, post) = pipelined_decode(&mut ctx, last_id, &mut steps, cancel, |y| {
             model.forward_arr(y, 1, Some(&mut kv_caches), Some(&mut lin_caches), device)
         })?;
 
@@ -545,6 +549,7 @@ pub fn generate_greedy<'a>(
         prefill_chunk,
         device,
         arch_label,
+        cancel,
         |chunk, kv| model.forward_seq_with_cache(chunk, Some(kv), Some(&mut lin_caches), device),
     )?;
 
@@ -710,7 +715,7 @@ pub fn generate_greedy<'a>(
     // Miss funnel is just "caches + last_id → decode"; the loop is the call
     // site. The GDN `lin_caches` are closure-captured — the loop never learns
     // they exist.
-    let (stats, post) = pipelined_decode(&mut ctx, last_id, &mut steps, |y| {
+    let (stats, post) = pipelined_decode(&mut ctx, last_id, &mut steps, cancel, |y| {
         model.forward_arr(y, 1, Some(&mut kv_caches), Some(&mut lin_caches), device)
     })?;
 
