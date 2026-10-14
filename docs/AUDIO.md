@@ -93,6 +93,74 @@ greedy, one build twice per clip to show the noise: 0 words):
 
 The window maximum stays.
 
+**Short-window pad.** A window shorter than 30 s is a short file or the last
+window of a long file. A window of `n` samples has `n / 160` content frames.
+Such a window has two inputs, as in openai-whisper:
+
+- The decode input, which the no-speech gate reads too: the frames after the
+  content are 0.0 in each mel bin (`pad_after_content` in
+  `crates/rmlx-audio/src/mel.rs`). The content frames are those of the audio
+  with zero samples after it, clamped at the window maximum.
+- The detection input: the mel of the audio padded with zero samples to 30 s
+  (`MelExtractor::extract`). A frame reads 400 samples around its centre, so
+  the frames from index `(n + 200) / 160`, rounded up, read zero samples only.
+  Each of these has the floor of the window in each mel bin,
+  `(max(window maximum - 8.0, -10.0) + 4.0) / 4.0`. The -10.0 is the `1e-10`
+  clamp of the power: it gives -1.5 for digital silence. The two or three
+  frames between the content and that index read samples of both.
+
+The detection input costs a second encoder pass and one decoder step
+(`detection_input_needed` in `crates/rmlx-audio/src/transcribe.rs`). The
+count of encoder passes is for each window:
+
+| Window | Encoder passes |
+|---|---|
+| 30 s | One |
+| Shorter, the request states a language | One |
+| Shorter, `auto`, a window of the file was decoded before it | One |
+| Shorter, `auto`, no window of the file was decoded before it | Two |
+
+A file shorter than 30 s can have a second window, when the first one ends at
+its last closed segment. A skipped window is not a decoded window, so a short
+window after it has two passes again. A window of exactly 30 s has one input:
+the detection reads the decode input.
+
+The siblings do not agree. Each row was read on GitHub at the commit in
+brackets:
+
+| Sibling | Frames after the content of a short window | Where |
+|---|---|---|
+| openai-whisper (`openai/whisper`, `86098128`) | Decode: 0.0, the mel of the file is cut at `n / 160` frames, then padded. Detection: the floor of the file, from 30 s of zero samples after the audio | `whisper/transcribe.py:283-286` and `:151`, `whisper/audio.py:65-87` |
+| mlx-whisper (`ml-explore/mlx-examples`, `796f5b53`) | The same two inputs | `whisper/mlx_whisper/transcribe.py:289-294` and `:172` |
+| faster-whisper (`SYSTRAN/faster-whisper`, `a52b026a`) | 0.0 for the decode and for the detection | `faster_whisper/transcribe.py:1178-1185` and `:1829-1832`, `faster_whisper/audio.py:117-129` |
+| whisper.cpp (`ggml-org/whisper.cpp`, `0c7be696`) | The floor of the file for both: 30 s of zero samples are added to the audio, and the encoder reads the mel across them | `src/whisper.cpp:3252-3261`, `:3296-3310` and `:2434-2444` |
+| WhisperKit (`argmaxinc/WhisperKit`, `9f99b5cb`) | Zero samples for both: each window is padded with zero samples, then the mel model runs on it | `Sources/WhisperKit/Core/TranscribeTask.swift:120-137`, `Sources/WhisperKit/Core/Audio/AudioProcessor.swift:188-208` |
+| rMLX | Decode: 0.0. Detection: the floor of the window | `pad_after_content`, `MelExtractor::extract` |
+
+rMLX differs from openai-whisper in three points. Its floor is that of the
+window, not of the file (see "Log-mel floor"). Its detection reads the first
+window that the gate does not skip, not the first 30 s of the file (see
+"Language detection"). And it computes the mel of each window alone, so the
+frames at the two edges of a window read a reflect pad of that window, where
+openai-whisper makes one STFT of the file and reads the samples of the
+adjacent window.
+
+The model tests of `crates/rmlx-audio/tests/transcribe.rs` hold why a short
+window has two inputs, on large-v3 and synthetic audio:
+
+- With zero samples for the decode input too, a short window of noise is not
+  skipped and gives a stock phrase.
+  `a_short_window_of_noise_gives_no_segment` holds 5 windows of noise or of a
+  hum from 2.8 s to 10 s, each alone and after a spoken window.
+- With 0.0 for the detection input too, zeros of a few seconds in an `auto`
+  request are not skipped and give text: the bounded decode of the gate
+  writes the stock phrase of the language that the detection read, and that
+  one is longer than the bound.
+  `zeros_of_a_few_seconds_under_auto_give_no_segment` holds 4 lengths from
+  2 s to 7 s.
+- `a_file_of_a_few_spoken_words_keeps_its_words` holds that a file of one
+  word and a file of three words keep their text, with `en` and with `auto`.
+
 Long audio is walked window by window. No voice-activity detection runs.
 
 **Seek rule.** It follows openai-whisper `transcribe()`, in samples:
@@ -147,7 +215,7 @@ Measured on large-v3 (greedy, `en`, no prompt, synthetic audio):
 |---|---|---|
 | 15 with no speech: zeros (0.1 s to 30 s), noise at -80 to -10 dBFS (30 s), a hum, a tone | 0.71 to 0.92 | 1 or 3 (` you`, ` Thank you.`) |
 | Speech: sentences, one word, quiet speech, speech in noise, the 5 windows of a long clip | 0.06 or less | 2 to 69 |
-| Spoken repetitions shorter than 30 s | 0.33 to 0.53 | 2 to 223 |
+| Spoken repetitions of 7.3 s, 19.2 s and 22.4 s | 0.43, 0.65 and 0.72 | 2, 82 and 223 |
 | 30 s of four spoken words in a loop | 0.92 | 223, the token budget |
 | 30 s of one spoken word in a loop | 0.88 | 2 (` Hello?`) |
 
@@ -161,11 +229,18 @@ Known limits:
 - A window of speech above 0.6 that the model itself decodes into no more
   than 8 text tokens is dropped. 30 s of one repeated word is such a window:
   the greedy decode of the model is one word, and the reply loses that word.
-- Condition 1 does not find each window with no speech: white noise at
-  -74 dBFS in a window of 2.8 s reads 0.5757, is not skipped and gives a
-  stock phrase.
-- The margin of condition 1 to a spoken repetition is small: the highest
-  speech windows below the bound read 0.53, 0.46 and 0.44.
+- Condition 1 does not find each window with no speech. In one measurement
+  on generated white noise, made once with a harness that is not in the
+  tree, 27 of 28 windows from 0.2 s to 29 s were skipped. The one of 29 s at
+  -74 dBFS read 0.5617 and gave `Thank you.`, or a subtitle credit in
+  Portuguese for an `auto` request.
+- With `auto`, the bounded decode of condition 2 writes the stock phrase of
+  the detected language, which can be longer than that of `en`. In the same
+  measurement it was 5 or 6 text tokens for noise that was read as Norwegian
+  Nynorsk, against 3 at most for `en`: the room to the bound of 8 is small.
+- A spoken repetition can read above the bound when it is shorter than 30 s
+  too: 0.65 for 19.2 s and 0.72 for 22.4 s (the clips of the two repetition
+  tests). Condition 2 keeps each one, and its bounded decode runs for them.
 - Not measured: a second model or language, music, room noise.
 
 **Window decision.** A decode has two scores: the compression ratio of its
@@ -201,7 +276,9 @@ window not opened. It returns no partial transcript. A flag set during the
 last window has no effect.
 
 Worst-case latency: the window in flight runs to its end, that is, one mel and
-encode, the gate (its step and a bounded decode of at most 26 steps), and at
+encode (two encodes and one more decoder step for a short window whose
+language is detected), the gate (its step and a bounded decode of at most 26
+steps), and at
 most seven decodes (six temperatures, one more with no prompt), each of at
 most `n_text_ctx / 2` tokens (224 for large-v3). Before window 0,
 the caller's model load runs to its end. The audio decode before it asks the
@@ -214,8 +291,11 @@ routes in `docs/SERVER_AUDIO.md`); `rmlx transcribe` never sets it.
 ### Language detection
 
 With `language` absent or `"auto"`, the language is the argmax over the 100
-language tokens of the row that the no-speech gate reads, so detection adds no
-decoder step. It is read once, on the first window that the gate does not
+language tokens of the start row of a window. For a window of 30 s that is the
+row that the no-speech gate reads, so detection adds no step. For a shorter
+window it is the start row of a second input, which costs one encoder pass and
+one decoder step (see "Short-window
+pad"). It is read once, on the first window that the gate does not
 skip. An error of that step fails the request; an error does not give
 English.
 

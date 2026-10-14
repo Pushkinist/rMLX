@@ -29,7 +29,7 @@ use std::sync::Arc;
 use rmlx_mlx::Device;
 use tracing::{debug, info, warn};
 
-use crate::mel::{MelExtractor, SAMPLE_RATE};
+use crate::mel::{pad_after_content, MelExtractor, N_SAMPLES, SAMPLE_RATE};
 use crate::tokenizer::{
     language_name, language_token, WhisperTask, WhisperTokenizer, TOK_EOT, TOK_SOT_PREV,
     TOK_TIMESTAMP_BEGIN,
@@ -237,18 +237,30 @@ impl Transcriber {
                 let window_dur = window_samples as f32 / SAMPLE_RATE as f32;
                 let projected_before = self.model.decoder.cross_projections();
 
-                // mel + encode (mel pads to 30 s internally).
-                let mel_frames = self
+                let mut mel_frames = self
                     .extractor
                     .extract(window)
                     .map_err(|e| WhisperError::Mlx(format!("mel: {e}")))?;
+                // A short window has two inputs, as in openai-whisper: the
+                // language is read from the mel of the zero-padded audio, and
+                // the gate and the decode read the mel padded with 0.0.
+                let detected_on_padded_audio =
+                    if detection_input_needed(resolved_lang, window_samples) {
+                        let padded_audio = self.model.encode_mel(&mel_frames, device)?;
+                        let (start, _) = self.model.decoder.open_window(&padded_audio, device)?;
+                        Some(start.language)
+                    } else {
+                        None
+                    };
+                pad_after_content(&mut mel_frames, window_samples);
                 let encoder_out = self.model.encode_mel(&mel_frames, device)?;
 
                 let (start, opened) = self.model.decoder.open_window(&encoder_out, device)?;
+                let detected = detected_on_padded_audio.unwrap_or(start.language);
                 // The language of the file is that of the first window that is
                 // decoded: the bounded decode of the gate reads the language of
                 // the window and does not store it.
-                let window_lang = resolved_lang.unwrap_or(start.language);
+                let window_lang = resolved_lang.unwrap_or(detected);
                 // Timestamp mode: no <|notimestamps|> in the SOT sequence.
                 let sot = self
                     .tokenizer
@@ -273,7 +285,7 @@ impl Transcriber {
                     )
                 };
                 let decode = |prompt: &[u32], temperature: f32| {
-                    resolve_language(&mut resolved_lang, start.language);
+                    resolve_language(&mut resolved_lang, detected);
                     let mut full_prefix: Vec<u32> = Vec::new();
                     if !prompt.is_empty() {
                         full_prefix.push(TOK_SOT_PREV);
@@ -327,6 +339,7 @@ impl Transcriber {
                     window_dur,
                     no_speech_prob = start.no_speech_prob,
                     skipped = outcome.skipped,
+                    detection_pass = detected_on_padded_audio.is_some(),
                     decodes = outcome.attempts.len(),
                     cross_projections = self.model.decoder.cross_projections() - projected_before,
                     n_tokens = outcome.tokens.len(),
@@ -400,6 +413,15 @@ pub fn requested_language(language: &str) -> Result<Option<u32>, WhisperError> {
     language_token(language)
         .map(Some)
         .ok_or_else(|| WhisperError::UnknownLanguage(language.to_owned()))
+}
+
+/// Whether a window of `window_samples` samples gets a second encoder pass, on
+/// the mel of its zero-padded audio, to read its language. Only a window
+/// shorter than 30 s has that second input, and it is read only while the file
+/// has no language: `resolved` holds the token of a named language or of an
+/// earlier decoded window.
+fn detection_input_needed(resolved: Option<u32>, window_samples: usize) -> bool {
+    resolved.is_none() && window_samples < N_SAMPLES
 }
 
 /// The language token of a window that is decoded. `resolved` holds the token

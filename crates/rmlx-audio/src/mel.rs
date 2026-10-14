@@ -147,7 +147,9 @@ impl MelExtractor {
             return Err(MelError::Empty);
         }
 
-        // Pad or trim to N_SAMPLES.
+        // The frames after a short window come from zero samples here: this is
+        // the language-detection input. `pad_after_content` makes the decode
+        // input from it (docs/AUDIO.md, "Short-window pad").
         let audio = pad_or_trim(samples);
         let n = audio.len(); // == N_SAMPLES
 
@@ -276,6 +278,16 @@ pub fn pad_or_trim(samples: &[f32]) -> Vec<f32> {
     let mut out = samples.to_vec();
     out.resize(N_SAMPLES, 0.0_f32);
     out
+}
+
+/// Set each frame after the content of a window of `n_samples` samples to 0.0
+/// in each mel bin. The content is `n_samples / HOP_LENGTH` frames, as
+/// openai-whisper counts them, and 0.0 is its pad of the mel. A window of
+/// `N_SAMPLES` or more is all content.
+pub(crate) fn pad_after_content(frames: &mut [Vec<f32>], n_samples: usize) {
+    for frame in frames.iter_mut().skip(n_samples / HOP_LENGTH) {
+        frame.fill(0.0);
+    }
 }
 
 // ── Mel filterbank (Slaney/librosa reference, embedded binary) ───────────────

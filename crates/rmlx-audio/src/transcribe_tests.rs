@@ -1,10 +1,11 @@
 //! Unit tests for the long-form transcription engine helpers (no model needed).
 
 use super::{
-    compression_ratio, fmt_time, next_prompt, previous_text_cap, render_srt, render_vtt,
-    reported_language, requested_language, resolve_language, window_token_budget, OutputFormat,
-    Segment, WindowOutcome, COMPRESSION_RATIO_LOOP,
+    compression_ratio, detection_input_needed, fmt_time, next_prompt, previous_text_cap,
+    render_srt, render_vtt, reported_language, requested_language, resolve_language,
+    window_token_budget, OutputFormat, Segment, WindowOutcome, COMPRESSION_RATIO_LOOP,
 };
+use crate::mel::N_SAMPLES;
 use crate::tokenizer::{TOK_EN, TOK_TIMESTAMP_BEGIN};
 use crate::whisper::WhisperError;
 
@@ -333,6 +334,24 @@ fn a_named_language_is_not_detected() {
     let mut resolved = requested_language("Russian").unwrap();
     assert_eq!(resolve_language(&mut resolved, TOK_EN + 6), TOK_EN + 4);
     assert_eq!(reported_language(resolved, 0), "russian");
+}
+
+/// The second encoder pass of a window, for its language, runs only for a
+/// window shorter than 30 s of a file that has no language yet.
+#[test]
+fn only_a_short_window_of_a_file_with_no_language_has_a_detection_input() {
+    let short = N_SAMPLES - 1;
+    let stated = requested_language("fr").unwrap();
+    assert!(!detection_input_needed(stated, short));
+    assert!(!detection_input_needed(stated, 1600));
+
+    let mut auto = requested_language("auto").unwrap();
+    assert!(detection_input_needed(auto, short));
+    assert!(detection_input_needed(auto, 1600));
+    assert!(!detection_input_needed(auto, N_SAMPLES));
+
+    resolve_language(&mut auto, TOK_EN + 6);
+    assert!(!detection_input_needed(auto, short));
 }
 
 /// With `auto`, no token exists when no window was decoded: each window was

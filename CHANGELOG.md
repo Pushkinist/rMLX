@@ -54,6 +54,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   window and no window that is still a loop when it is decoded without the
   prompt (such a window now goes up the ladder).
 
+- **Whisper no longer writes text for a short window of noise.** A window
+  shorter than 30 s (a short file, or the last window of a long file) was
+  padded with zero samples before the mel. With that input, a window of noise
+  or of a hum read below the no-speech bound and gave `.` or `Thank you.` on
+  large-v3. The decode and the no-speech gate now read the mel with 0.0 in
+  the frames after the content, as openai-whisper does. The model tests hold
+  5 such windows from 2.8 s to 10 s, each alone and after speech, and the
+  text of each spoken test clip is the same. With `language` absent, the
+  language of a short window is read from a second input, the mel of the
+  zero-padded audio, as openai-whisper detects: this costs a second encoder
+  pass for a short window while the file has no language. A request with a
+  stated language, and a window of 30 s, have one pass as before. Behaviour
+  change:
+  the tokens of a file shorter than 30 s, and of the last window of a longer
+  file, can differ from those of the release before. See `docs/AUDIO.md`,
+  "Short-window pad".
+
 - **A Whisper segment no longer ends after the end of the audio.** In a short
   last window the decoder can close a segment in the zero pad: a segment of a
   112.05 s clip ended at 112.68 s. The start and the end of a segment are now

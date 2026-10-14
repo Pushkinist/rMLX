@@ -690,7 +690,8 @@ impl TextDecoder {
 
     /// How many times a decoder block projected the cross-attention keys and
     /// values of an encoder output since the load: one for each block of each
-    /// window.
+    /// encoder output. A window has one encoder output, or two when its
+    /// language is read from a detection input.
     pub(crate) fn cross_projections(&self) -> usize {
         self.blocks
             .iter()

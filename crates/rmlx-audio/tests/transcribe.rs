@@ -24,6 +24,11 @@
 //!    hold the no-speech gate: a window of zeros, noise or a tone gives no
 //!    text, alone and behind the prompt of a spoken window, and a spoken
 //!    window keeps its text.
+//!    `a_short_window_of_noise_gives_no_segment` and
+//!    `zeros_of_a_few_seconds_under_auto_give_no_segment` hold the gate for a
+//!    window shorter than 30 s, where the pad of the mel and the input of the
+//!    language detection decide. `a_file_of_a_few_spoken_words_keeps_its_words`
+//!    holds that the gate does not drop a short file with one or three words.
 //!    `a_spoken_repetition_above_the_no_speech_bound_is_not_skipped` and
 //!    `thirty_seconds_of_one_repeated_word_are_skipped` hold the second
 //!    condition of the gate: a window above the probability bound is skipped
@@ -618,6 +623,125 @@ fn a_window_with_no_speech_gives_no_segment_and_speech_keeps_its_text() {
     }
 }
 
+// ── Windows shorter than 30 s with no speech ────────────────────────────────
+
+/// A window of noise or of a hum that is shorter than 30 s gives no segment,
+/// alone and after a spoken window. With zero samples after the noise in the
+/// audio, the first of these windows gives a stock phrase; with 0.0 after the
+/// content in the mel, the gate skips each one.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test a_short_window_of_noise -- --ignored --test-threads=1"]
+fn a_short_window_of_noise_gives_no_segment() {
+    let Some(t) = load_transcriber() else {
+        eprintln!("SKIP a_short_window_of_noise_gives_no_segment: whisper snapshot not present");
+        return;
+    };
+    let Some(fox) = say_samples(FOX) else {
+        eprintln!(
+            "SKIP a_short_window_of_noise_gives_no_segment: say, its voice or ffmpeg unavailable"
+        );
+        return;
+    };
+    let fox_secs = fox.len() as f32 / 16_000.0;
+    let fox_window = to_window(&fox);
+    let windows: [(&str, Vec<f32>); 5] = [
+        ("noise -80 dBFS 2.8 s", noise(44_800, -80.0)),
+        ("noise -74 dBFS 2.8 s", noise(44_800, -74.0)),
+        ("noise -74 dBFS 10 s", noise(160_000, -74.0)),
+        ("noise -40 dBFS 10 s", noise(160_000, -40.0)),
+        ("hum 50 Hz -50 dBFS 5 s", tone(80_000, 50.0, -50.0)),
+    ];
+    for (label, window) in &windows {
+        let alone = transcribe_samples(&t, window, "en");
+        assert!(
+            alone.segments.is_empty(),
+            "{label}, alone: {:?}",
+            alone.segments
+        );
+        let after_speech = transcribe_samples(&t, &[fox_window.as_slice(), window].concat(), "en");
+        for s in &after_speech.segments {
+            assert!(
+                s.end <= fox_secs + 0.5,
+                "{label}, after speech: segment outside the speech: {s:?}"
+            );
+        }
+        let w = wer(&normalize(FOX), &normalize(&after_speech.text));
+        assert_eq!(w, 0.0, "{label}, after speech: {:?}", after_speech.text);
+    }
+}
+
+/// Zeros of a few seconds in an `auto` request give no segment. The language
+/// of a short window is read from the mel of the zero-padded audio. Read from
+/// the mel padded with 0.0, the bounded decode of the gate writes the stock
+/// phrase of another language, which is longer than the bound, and the window
+/// is not skipped: the first assertion is the one that holds the rule.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test zeros_of_a_few_seconds -- --ignored --test-threads=1"]
+fn zeros_of_a_few_seconds_under_auto_give_no_segment() {
+    let Some(t) = load_transcriber() else {
+        eprintln!(
+            "SKIP zeros_of_a_few_seconds_under_auto_give_no_segment: whisper snapshot not present"
+        );
+        return;
+    };
+    for samples in [32_000_usize, 44_800, 80_000, 112_000] {
+        let r = transcribe_samples(&t, &vec![0.0; samples], "auto");
+        assert!(
+            r.segments.is_empty(),
+            "{samples} samples of zeros: the window is not skipped: {:?}",
+            r.segments
+        );
+        assert_eq!(
+            r.language, "english",
+            "{samples} samples of zeros: a reply with no decoded window names english, \
+             whatever the detection read"
+        );
+    }
+}
+
+// ── Short speech ────────────────────────────────────────────────────────────
+
+/// A file of one spoken word, and one of three, give their words in one
+/// segment, with the language named and with `auto`. The gate skips a window
+/// above the no-speech bound whose bounded decode writes at most 8 text
+/// tokens, and a short file with a few words has fewer: these files must read
+/// below the bound.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test a_file_of_a_few_spoken_words -- --ignored --test-threads=1"]
+fn a_file_of_a_few_spoken_words_keeps_its_words() {
+    let Some(t) = load_transcriber() else {
+        eprintln!(
+            "SKIP a_file_of_a_few_spoken_words_keeps_its_words: whisper snapshot not present"
+        );
+        return;
+    };
+    for script in ["Hello.", "Good morning everyone."] {
+        let Some(samples) = say_samples(script) else {
+            eprintln!("SKIP a_file_of_a_few_spoken_words_keeps_its_words: say, its voice or ffmpeg unavailable");
+            return;
+        };
+        assert!(samples.len() < WINDOW_SAMPLES, "{script:?} is a short file");
+        for language in ["en", "auto"] {
+            let r = transcribe_samples(&t, &samples, language);
+            assert_eq!(
+                normalize(&r.text),
+                normalize(script),
+                "{script:?} with {language}: {:?}",
+                r.text
+            );
+            assert_eq!(
+                r.segments.len(),
+                1,
+                "{script:?} with {language}: {:?}",
+                r.segments
+            );
+            if language == "auto" {
+                assert_eq!(r.language, "english", "{script:?} with {language}");
+            }
+        }
+    }
+}
+
 // ── Speech above the no-speech bound ────────────────────────────────────────
 
 /// Thirty seconds of four spoken words in a loop read a no-speech probability
@@ -914,11 +1038,13 @@ fn a_window_that_needs_a_fallback_is_decoded_again_and_repeats() {
     assert_eq!(temperatures_again, temperatures);
     assert_eq!(again, segments, "a second run gives the same tokens");
 
+    // When the window reads above the no-speech bound, the bounded decode of
+    // the gate comes first, and each pick of it is at temperature 0.
     let (_, from_the_request, _) = run(0.4);
     assert_eq!(
-        from_the_request.first(),
+        from_the_request.iter().find(|tenths| **tenths != 0),
         Some(&4),
-        "the request temperature is the first step: {from_the_request:?}"
+        "the first pick of the decode is at the request temperature: {from_the_request:?}"
     );
 }
 
