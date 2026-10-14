@@ -364,9 +364,9 @@ async fn a_reply_that_streams_ends_when_the_requests_are_dropped() {
     assert!(feed_dropped.load(Ordering::Acquire), "the feed still runs");
 }
 
-/// A handler inside a synchronous call on its async worker, as a model load
-/// runs, cannot be dropped: its connection stays open after the requests are
-/// dropped. The serve future returns at the exit deadline, not before it and
+/// A handler inside a synchronous call on its async worker cannot be
+/// dropped: its connection stays open after the requests are dropped. No
+/// route of the server makes such a call for the time of a model load. The serve future returns at the exit deadline, not before it and
 /// not when the call returns.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_handler_that_cannot_be_dropped_holds_the_exit_to_the_deadline_only() {

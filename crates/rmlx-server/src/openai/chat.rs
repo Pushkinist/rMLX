@@ -1093,9 +1093,10 @@ pub(crate) async fn chat_completions(
     };
 
     // Ensure the requested model is loaded (auto-swap if needed).
-    // `is_cold_request` is true when the model was just loaded now
-    // (first request after load), used to emit `ttft_cold_ms` vs `ttft_warm_ms`.
-    let (generator, is_cold_request) = match state.ensure_loaded(&req.model) {
+    // `is_cold_request` is true when the model was not resident when this
+    // request asked for it, used to emit `ttft_cold_ms` vs `ttft_warm_ms`.
+    let loaded = state.ensure_loaded_in(&req.model, &req_span).await;
+    let (generator, is_cold_request) = match loaded {
         Ok(pair) => pair,
         Err(e) => {
             state.error_counts.increment(ApiErrorCategory::Upstream);

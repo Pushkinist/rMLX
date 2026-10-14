@@ -415,8 +415,8 @@ controller tick with `stage = 'admission_ctrl'`:
 | `decode_tps_cold` | `tps` | `higher_better` | Decode tokens/s on the first run after load. |
 | `prefill_tps` | `tps` | `higher_better` | Prefill tokens/s. |
 | `overall_tps` | `tps` | `higher_better` | Generated tokens over the whole request, prefill included. |
-| `ttft_cold_ms` | `ms` | `lower_better` | Time to first token, first request after load. |
-| `ttft_warm_ms` | `ms` | `lower_better` | Time to first token, later requests. |
+| `ttft_cold_ms` | `ms` | `lower_better` | Time to first token of a request that found its model not resident: it loaded the model or waited for a load, so the figure contains load time. |
+| `ttft_warm_ms` | `ms` | `lower_better` | Time to first token of a request that found its model resident. The first request after an eager preload is warm. |
 | `itl_p50_ms` | `ms` | `lower_better` | Inter-token latency, median. |
 | `itl_p95_ms` | `ms` | `lower_better` | Inter-token latency, 95th percentile. |
 | `itl_p99_ms` | `ms` | `lower_better` | Inter-token latency, 99th percentile. |

@@ -305,6 +305,7 @@ async fn start_server(case: Case) -> Server {
         max_queue_depth: 64,
         max_loaded_models: 1,
         loader,
+        load_gate: Arc::default(),
         metrics: None,
         idle_policy: rmlx_server::KeepAlivePolicy::Pin,
         max_tokens_cap: u32::MAX,

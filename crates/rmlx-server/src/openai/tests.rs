@@ -1088,25 +1088,30 @@ fn timeout_max_zero_disables_timeout() {
 use crate::engine::NotReadyGenerator;
 
 /// Build a tempdir-backed registry with `n` minimal model snapshots
-/// (`m0`..`m{n-1}`), each just a `config.json`. The stub loader ignores
-/// the path so the snapshots only need to satisfy `load_config`. Returns
-/// the registry plus the live `TempDir` (must stay alive for the test).
-fn n_model_registry(n: usize) -> (ModelRegistry, tempfile::TempDir) {
-    use std::io::Write as _;
+/// (`m0`..`m{n-1}`), each a `config.json` and the files of `extra`. The stub
+/// loader ignores the path so the snapshots only need to satisfy
+/// `load_config`. Returns the registry plus the live `TempDir` (must stay
+/// alive for the test).
+pub(crate) fn snapshot_registry(
+    n: usize,
+    extra: &[(&str, &str)],
+) -> (ModelRegistry, tempfile::TempDir) {
     let root = tempfile::tempdir().unwrap();
+    let config = r#"{"architectures":["LlamaForCausalLM"],"dtype":"bfloat16"}"#;
     let mut paths = Vec::new();
     for i in 0..n {
         let dir = root.path().join(format!("m{i}"));
         std::fs::create_dir_all(&dir).unwrap();
-        let cfg = serde_json::json!({
-            "architectures": ["LlamaForCausalLM"],
-            "dtype": "bfloat16"
-        });
-        let mut f = std::fs::File::create(dir.join("config.json")).unwrap();
-        f.write_all(cfg.to_string().as_bytes()).unwrap();
+        for (name, text) in [("config.json", config)].iter().chain(extra) {
+            std::fs::write(dir.join(name), text).unwrap();
+        }
         paths.push(dir);
     }
     (ModelRegistry::from_paths(&paths), root)
+}
+
+fn n_model_registry(n: usize) -> (ModelRegistry, tempfile::TempDir) {
+    snapshot_registry(n, &[])
 }
 
 /// `AppState` with a `NotReadyGenerator` stub loader and the given
@@ -1127,6 +1132,7 @@ pub(crate) fn slot_test_state(registry: ModelRegistry, max_loaded_models: usize)
         max_queue_depth: 64,
         max_loaded_models,
         loader,
+        load_gate: Arc::default(),
         metrics: None,
         idle_policy: crate::KeepAlivePolicy::Pin,
         max_tokens_cap: u32::MAX,
@@ -1170,7 +1176,7 @@ fn slots_insert_n_all_resident_and_findable() {
     let state = slot_test_state(reg, 3);
 
     for id in ["m0", "m1", "m2"] {
-        state.ensure_loaded(id).expect("load must succeed");
+        state.ensure_loaded_blocking(id).expect("load must succeed");
     }
     let ids = resident_ids(&state);
     assert_eq!(ids.len(), 3, "all 3 models must be resident at cap 3");
@@ -1178,7 +1184,7 @@ fn slots_insert_n_all_resident_and_findable() {
         assert!(ids.contains(&id.to_owned()), "{id} must be findable");
     }
     // Re-requesting an already-resident model must NOT grow the Vec.
-    state.ensure_loaded("m1").unwrap();
+    state.ensure_loaded_blocking("m1").unwrap();
     assert_eq!(
         state.slots.read().len(),
         3,
@@ -1192,15 +1198,15 @@ fn slots_lru_eviction_at_cap() {
     let (reg, _tmp) = n_model_registry(3);
     let state = slot_test_state(reg, 2);
 
-    state.ensure_loaded("m0").unwrap();
+    state.ensure_loaded_blocking("m0").unwrap();
     std::thread::sleep(std::time::Duration::from_millis(5));
-    state.ensure_loaded("m1").unwrap();
+    state.ensure_loaded_blocking("m1").unwrap();
     std::thread::sleep(std::time::Duration::from_millis(5));
     // Touch m0 so m1 becomes the LRU entry.
-    state.ensure_loaded("m0").unwrap();
+    state.ensure_loaded_blocking("m0").unwrap();
     std::thread::sleep(std::time::Duration::from_millis(5));
     // Load m2 — at cap 2, the LRU (m1) must be evicted.
-    state.ensure_loaded("m2").unwrap();
+    state.ensure_loaded_blocking("m2").unwrap();
 
     let ids = resident_ids(&state);
     assert_eq!(ids.len(), 2, "cap 2 must hold exactly 2 models");
@@ -1215,7 +1221,7 @@ fn slots_lru_eviction_at_cap() {
 fn is_resident_follows_the_generation_slots() {
     let (registry, _root) = n_model_registry(2);
     let state = slot_test_state(registry, 1);
-    state.ensure_loaded("m0").unwrap();
+    state.ensure_loaded_blocking("m0").unwrap();
     assert!(state.is_resident("m0"));
     assert!(!state.is_resident("m1"));
     assert!(state.unload("m0"));
@@ -1229,7 +1235,7 @@ fn slots_unload_removes_one() {
     let state = slot_test_state(reg, 3);
 
     for id in ["m0", "m1", "m2"] {
-        state.ensure_loaded(id).unwrap();
+        state.ensure_loaded_blocking(id).unwrap();
     }
     assert!(
         state.unload("m1"),
@@ -1245,25 +1251,6 @@ fn slots_unload_removes_one() {
     );
 }
 
-/// `ensure_loaded` returns `(gen, true)` (cold) on first load and
-/// `(gen, false)` (warm) on a subsequent request for the already-resident model.
-#[test]
-fn ensure_loaded_cold_flag() {
-    let (reg, _tmp) = n_model_registry(1);
-    let state = slot_test_state(reg, 1);
-
-    let (_, is_cold) = state.ensure_loaded("m0").expect("first load must succeed");
-    assert!(is_cold, "first load must report cold=true");
-
-    let (_, is_warm) = state
-        .ensure_loaded("m0")
-        .expect("second request must succeed");
-    assert!(
-        !is_warm,
-        "re-request of resident model must report cold=false (warm)"
-    );
-}
-
 /// max_loaded_models == 1 parity: loading a different model evicts the
 /// single existing entry (byte-equivalent to the old swap-on-different-id).
 #[test]
@@ -1271,12 +1258,12 @@ fn slots_max_one_evicts_single_entry_parity() {
     let (reg, _tmp) = n_model_registry(2);
     let state = slot_test_state(reg, 1);
 
-    state.ensure_loaded("m0").unwrap();
+    state.ensure_loaded_blocking("m0").unwrap();
     assert_eq!(resident_ids(&state), vec!["m0".to_owned()]);
 
     // Loading a different model with cap 1 must evict the only entry and
     // leave exactly the new one — identical to the pre-C4 swap path.
-    state.ensure_loaded("m1").unwrap();
+    state.ensure_loaded_blocking("m1").unwrap();
     assert_eq!(
         resident_ids(&state),
         vec!["m1".to_owned()],
@@ -1284,7 +1271,7 @@ fn slots_max_one_evicts_single_entry_parity() {
     );
 
     // Re-requesting the resident model at cap 1 must not evict/reload.
-    state.ensure_loaded("m1").unwrap();
+    state.ensure_loaded_blocking("m1").unwrap();
     assert_eq!(resident_ids(&state), vec!["m1".to_owned()]);
 }
 
@@ -1781,7 +1768,7 @@ fn effective_max_ctx_for_resident_and_absent() {
         usize::MAX,
         "absent model → usize::MAX (503 path catches real overflow)"
     );
-    state.ensure_loaded("m0").unwrap();
+    state.ensure_loaded_blocking("m0").unwrap();
     // NotReadyGenerator's default effective_max_ctx is usize::MAX, so the
     // resident lookup also yields MAX here — what matters is that the
     // resident branch is taken (no panic, found by id).

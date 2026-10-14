@@ -160,8 +160,7 @@ pub(crate) async fn load_model(
     let override_policy: Option<KeepAlivePolicy> =
         body.and_then(|Json(b)| policy_from_request_field(b.keep_alive));
 
-    // ensure_loaded acquires slot lock, does implicit unload+load if needed.
-    match state.ensure_loaded(&id) {
+    match state.ensure_loaded(&id).await {
         Ok(_pair) => {
             info!(model_id = %id, "load: model ready in slot");
             // If the body supplied a keep_alive override, rewrite

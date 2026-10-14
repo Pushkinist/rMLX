@@ -22,9 +22,8 @@ schema: field names, SSE event types and block shape.
 ## Architecture
 
 After SIGINT or SIGTERM the server exits within 10 s, or 2 s after a second
-signal. An open request has 8 s to reply, then gets 503; one inside a model
-load gets none. A stream that is cut can lack `[DONE]`, `finish_reason`
-or `message_stop`. See [`SERVER_SHUTDOWN.md`](SERVER_SHUTDOWN.md). The claim file
+signal. An open request has 8 s to reply, then gets 503. A stream that is
+cut can lack `[DONE]`, `finish_reason` or `message_stop`. See [`SERVER_SHUTDOWN.md`](SERVER_SHUTDOWN.md). The claim file
 is never removed. A handler panic returns 500.
 The request body limit is 26 MiB.
 
@@ -427,7 +426,11 @@ true for a generation slot or the embedding slot.
 **Slots and eviction.** Up to `--max-loaded-models` (default 1) models stay
 resident. When the slots are full, `ensure_loaded` for another model evicts
 the least recently used one first. Any request can trigger this, not only
-`/load`.
+`/load`. One load runs at a time, on the blocking pool, under one gate for
+all models: a request for a model that is not resident waits for any load
+in progress. A load that never returns holds every later load until each
+request times out. A dropped request does not stop its load. A request that
+waits for a load is not counted in `--max-queue-depth`.
 
 **Keep-alive on the compat routes.** `/v1/chat/completions` and
 `/v1/messages` take no `keep_alive` field. Each successful `ensure_loaded`

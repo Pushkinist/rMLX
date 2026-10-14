@@ -212,10 +212,9 @@ stream, and an evaluation looks for the encoder only in the evaluating thread:
 streams are per thread too (`mlx/stream.cpp`). An op records its stream when it
 is built. So, without more, an array built on one thread fails when another
 thread evaluates it, or the evaluation waits forever. `rmlx serve` builds
-model state on one thread and uses it on another: a model loads on the preload
-thread, on an async worker or inside a request, and generates on a
-blocking-pool worker; a cache entry is written by one request and read by a
-later one.
+model state on one thread and uses it on another: a model loads on one
+blocking-pool thread and generates on any; a cache entry is written by one
+request and read by a later one.
 
 `crates/rmlx-mlx/src/mlx_thread.rs` starts one thread, the MLX thread, at the
 first op. It creates one CPU and one GPU stream (its own default streams),

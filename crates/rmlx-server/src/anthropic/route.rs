@@ -619,7 +619,8 @@ pub(crate) async fn messages(
     };
 
     // Ensure the requested model is loaded (auto-swap if needed).
-    let (generator, is_cold_request) = match state.ensure_loaded(&req.model) {
+    let loaded = state.ensure_loaded_in(&req.model, &req_span).await;
+    let (generator, is_cold_request) = match loaded {
         Ok(pair) => pair,
         Err(e) => {
             state.error_counts.increment(ApiErrorCategory::Upstream);

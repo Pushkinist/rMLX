@@ -37,17 +37,15 @@ The drop of a request is the only stop signal a blocking job gets.
   window in flight ends ([`SERVER_AUDIO.md`](SERVER_AUDIO.md)).
 - A chat, messages, embeddings or speech job is not stopped. It runs on and
   ends with the process.
-- A request inside a model load gets no 503 and is not dropped: a load of the
-  chat, messages or model-load route runs on its async worker, and nothing
-  can interrupt it. Its connection closes when the process exits. While all
-  four workers are inside such a load, the server reads no signal and no
-  timer, so the bounds start to count when one load returns.
+- A model load is not stopped. The request that started it, and each request
+  that waits for it, gets the 503. The load runs on and ends with the
+  process.
 
 ## The exit at the deadline
 
 The server ends its runtime at the exit deadline. When the runtime has not
-ended by then, the process leaves with work still in it: a job that was not
-stopped, a request inside a model load, or a connection that is still open.
+ended by then, the process leaves with work still in it: a job or a model
+load that was not stopped, or a connection that is still open.
 The server cannot tell these apart, so it treats each as a job that can
 still use the GPU:
 

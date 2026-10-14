@@ -166,13 +166,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shutting down`. A reply that streams is ended there: its chunked body is
   correct, and a stream that had not sent its terminal item has no `[DONE]`,
   no `finish_reason`, no `message_stop` and no error event, so a client must
-  check for the terminal item. A request
-  inside a model load gets no 503. A transcription stops before its next
+  check for the terminal item. A transcription stops before its next
   window. A chat or speech job is not stopped; one that still runs 2 s later
   ends with the process, and the Metal claim stays held until the process is
   gone. A second SIGINT or SIGTERM ends the 8 s wait at once, and the exit
   follows 2 s after it; before, it did nothing. A shutdown with no request in
   flight is as fast as before. See `docs/SERVER_SHUTDOWN.md`.
+- **A model load no longer stops the server.** A chat, messages or
+  model-load request for a model that was not loaded ran the load on an
+  async worker of the server. With four such requests, `rmlx serve`
+  answered no other request, could not answer 408 at the request timeout
+  and read no SIGINT or SIGTERM until a load ended. Each of the requests
+  also started its own load of the same model, so one model could be
+  resident more than once. Now one load runs at a time, off the async
+  workers. A request for a model that loads waits for that load and then
+  uses it. A request that waits, and the request that started the load, get
+  the 408 of the request timeout and the 503 of a shutdown. A load whose
+  request is gone runs to its end and leaves the model resident. A request
+  that waited for a load is recorded as `ttft_cold_ms`, as the request that
+  loaded is. On the chat and messages routes the load events carry the
+  `request_id` of their request, and a failed load logs `slots: model load
+  failed`.
 - **A language that Whisper does not know is an error, and `verbose_json`
   names the language in a form a client can read.** `rmlx transcribe
   --language xx` was decoded as English with no error. It now stops before the

@@ -149,6 +149,7 @@ async fn start_server_with_gemma4(gen: ArchGenerator) -> u16 {
         max_queue_depth: 64,
         max_loaded_models: 1,
         loader,
+        load_gate: Arc::default(),
         metrics: None,
         idle_policy: rmlx_server::KeepAlivePolicy::Pin,
         max_tokens_cap: u32::MAX,
@@ -743,6 +744,7 @@ async fn ensure_loaded_preserves_the_context_refusal_variant() {
 
     let err = state
         .ensure_loaded("refusing-model")
+        .await
         .err()
         .expect("the loader refuses");
     assert!(
@@ -1178,6 +1180,7 @@ async fn start_timeout_test_server(max_timeout_secs: u64) -> u16 {
         max_queue_depth: 64,
         max_loaded_models: 1,
         loader,
+        load_gate: Arc::default(),
         metrics: None,
         idle_policy: rmlx_server::KeepAlivePolicy::Pin,
         max_tokens_cap: u32::MAX,
@@ -1920,7 +1923,10 @@ async fn idle_ttl_unloads_after_timeout() {
     let mut state = not_ready_state(registry);
     state.idle_policy = KeepAlivePolicy::Idle(Duration::from_millis(150));
 
-    let _ = state.ensure_loaded("kp-test").expect("load must succeed");
+    let _ = state
+        .ensure_loaded("kp-test")
+        .await
+        .expect("load must succeed");
     assert_eq!(state.slots.read().len(), 1, "model loaded");
 
     tokio::time::sleep(Duration::from_millis(400)).await;
@@ -1943,7 +1949,10 @@ async fn decode_lease_suppresses_unload() {
     let mut state = not_ready_state(registry);
     state.idle_policy = KeepAlivePolicy::Idle(Duration::from_millis(120));
 
-    let _ = state.ensure_loaded("kp-busy").expect("load must succeed");
+    let _ = state
+        .ensure_loaded("kp-busy")
+        .await
+        .expect("load must succeed");
     let _guard = state.decode_lease_guard("kp-busy").expect("model resident");
 
     tokio::time::sleep(Duration::from_millis(450)).await;
@@ -1966,7 +1975,10 @@ async fn pin_policy_no_unload() {
     let mut state = not_ready_state(registry);
     state.idle_policy = KeepAlivePolicy::Pin;
 
-    let _ = state.ensure_loaded("kp-pin").expect("load must succeed");
+    let _ = state
+        .ensure_loaded("kp-pin")
+        .await
+        .expect("load must succeed");
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(state.slots.read().len(), 1, "pin: never unload");
 }
@@ -1983,6 +1995,7 @@ async fn request_field_promotes_to_pin() {
 
     let _ = state
         .ensure_loaded("kp-promote")
+        .await
         .expect("load must succeed");
     state.reset_keep_alive("kp-promote", Some(KeepAlivePolicy::Pin));
 
@@ -2005,10 +2018,13 @@ async fn cooperative_evict_on_conflicting_load() {
     state.idle_policy = KeepAlivePolicy::Pin;
     state.max_loaded_models = 1;
 
-    let _ = state.ensure_loaded("kp-a").expect("A loads");
+    let _ = state.ensure_loaded("kp-a").await.expect("A loads");
     assert_eq!(state.slots.read().first().unwrap().id, "kp-a");
 
-    let _ = state.ensure_loaded("kp-b").expect("B loads + evicts A");
+    let _ = state
+        .ensure_loaded("kp-b")
+        .await
+        .expect("B loads + evicts A");
     let slots = state.slots.read();
     assert_eq!(slots.len(), 1, "single-slot post-evict");
     assert_eq!(slots.first().unwrap().id, "kp-b", "B is now resident");
@@ -2036,7 +2052,7 @@ async fn stale_ttl_fire_after_reset_does_not_unload() {
     state.idle_policy = KeepAlivePolicy::Idle(Duration::from_millis(80));
 
     // Load the model. Spawned timer T1 starts sleeping for 80 ms.
-    let _ = state.ensure_loaded("kp-race").expect("initial load");
+    let _ = state.ensure_loaded("kp-race").await.expect("initial load");
 
     // Wait past the TTL boundary. The timer task has already passed its
     // sleep().await and is about to enter the identity-check critical
@@ -2051,6 +2067,7 @@ async fn stale_ttl_fire_after_reset_does_not_unload() {
     let _ = state.unload("kp-race");
     let _ = state
         .ensure_loaded("kp-race")
+        .await
         .expect("reload after explicit unload");
 
     let lease_after_reload = state
@@ -2104,7 +2121,10 @@ async fn stale_ttl_fire_after_warm_reset_does_not_unload() {
     state.idle_policy = KeepAlivePolicy::Idle(Duration::from_millis(200));
 
     // Load the model. Spawned timer T1 starts sleeping for 200 ms.
-    let _ = state.ensure_loaded("kp-warm-race").expect("initial load");
+    let _ = state
+        .ensure_loaded("kp-warm-race")
+        .await
+        .expect("initial load");
 
     let lease_before_reset = state
         .slots
@@ -2123,6 +2143,7 @@ async fn stale_ttl_fire_after_warm_reset_does_not_unload() {
     // and arms a fresh timer T2 (cancelling T1 via abort()).
     let _ = state
         .ensure_loaded("kp-warm-race")
+        .await
         .expect("warm-reset hit must succeed");
 
     let lease_after_reset = state

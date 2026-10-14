@@ -37,6 +37,10 @@ pub(crate) mod streaming;
 #[cfg(test)]
 pub(crate) mod tests;
 
+#[cfg(test)]
+#[path = "load_tests.rs"]
+mod load_tests;
+
 // ── Public API surface (frozen — matches lib.rs pub use) ─────────────────────
 
 pub use errors::{compute_effective_timeout, timeout_mw};

@@ -555,6 +555,10 @@ pub struct AppState {
     /// Signature: `(path, id) -> Result<Box<dyn Generator>>`.
     /// Production uses `ArchGenerator::from_snapshot`; tests inject a stub.
     pub loader: ModelLoader,
+    /// Held by the one load that [`AppState::ensure_loaded`] runs. A request
+    /// for a model that is not resident waits here, so two requests never
+    /// load at the same time and never load the same model twice.
+    pub load_gate: Arc<tokio::sync::Mutex<()>>,
     /// Optional metrics sink. `None` in unit tests; `Some` in production runs.
     pub metrics: Option<Arc<EventRecorder>>,
     /// Server-startup keep-alive policy applied to every freshly
@@ -797,77 +801,134 @@ impl AppState {
             .and_then(|m| m.context_limits)
     }
 
-    /// Load model `id` into a resident slot.
+    /// Make model `model_id` resident and return its generator.
+    ///
+    /// Returns a clone of the `Arc<dyn Generator>` for the caller to use,
+    /// plus a `bool` that is `false` when this call found the model resident
+    /// (warm) and `true` when it did not (cold): the call loaded the model,
+    /// or it waited for the load of another call. The time of a cold call
+    /// contains load time, and the cold and warm time-to-first-token series
+    /// exist to keep load time out of the warm one.
+    ///
+    /// A resident model is returned at once. A load runs on the blocking
+    /// pool, one at a time: the async worker of the caller stays free, and a
+    /// caller that waits can be dropped.
+    ///
+    /// The error type is `rmlx_core::Error`, not a formatted string: a load
+    /// failure the operator can only fix by changing a flag —
+    /// [`rmlx_core::error::Error::ContextCeilingExceeded`] — must stay
+    /// distinguishable from a transient one, so the eager preload can fail
+    /// startup on the first and warn on the second.
+    ///
+    /// # Panics
+    /// A panic of the loader continues in the caller.
+    // cancel-safe: a drop while this waits for another load starts nothing. A
+    // drop after the load started leaves it to run to its end on the blocking
+    // pool: the model becomes resident, its keep-alive timer is armed, and
+    // the next load waits until then.
+    pub async fn ensure_loaded(
+        &self,
+        model_id: &str,
+    ) -> Result<(Arc<dyn Generator>, bool), rmlx_core::error::Error> {
+        self.ensure_loaded_in(model_id, &tracing::Span::none())
+            .await
+    }
+
+    /// [`AppState::ensure_loaded`] for a request: the events of the load are
+    /// emitted inside `request`, the span of that request, so a load is found
+    /// from the request that started it.
+    // cancel-safe: as `ensure_loaded`.
+    pub(crate) async fn ensure_loaded_in(
+        &self,
+        model_id: &str,
+        request: &tracing::Span,
+    ) -> Result<(Arc<dyn Generator>, bool), rmlx_core::error::Error> {
+        if let Some(generator) = self.touch_resident(model_id) {
+            return Ok((generator, false));
+        }
+        let gate = Arc::clone(&self.load_gate).lock_owned().await;
+        let (state, id, span) = (self.clone(), model_id.to_owned(), request.clone());
+        let load = tokio::task::spawn_blocking(move || {
+            let _entered = span.enter();
+            let _gate = gate;
+            state.ensure_loaded_blocking(&id).inspect_err(|e| {
+                tracing::error!(model_id = %id, error = %e, "slots: model load failed");
+            })
+        });
+        match load.await.map_err(tokio::task::JoinError::try_into_panic) {
+            Ok(loaded) => loaded.map(|generator| (generator, true)),
+            Err(Ok(panic)) => std::panic::resume_unwind(panic),
+            Err(Err(e)) => Err(rmlx_core::error::Error::Model(format!(
+                "the load of model '{model_id}' did not run: {e}"
+            ))),
+        }
+    }
+
+    /// The generator of `model_id` when it is resident, with its `last_used`
+    /// and its keep-alive timer reset.
+    fn touch_resident(&self, model_id: &str) -> Option<Arc<dyn Generator>> {
+        let mut slots = self.slots.write();
+        let loaded = slots.iter_mut().find(|m| m.id == model_id)?;
+        loaded.last_used = Instant::now();
+        // Swap the slot's decode_lease so the previous
+        // timer's identity token (Arc::as_ptr of the old lease) no
+        // longer matches the slot's lease pointer. Any stale TTL
+        // fire from the prior arm that already passed its sleep
+        // boundary will detect the mismatch under the write lock
+        // and bail (see `arm_or_reset_timer` for the check).
+        //
+        // Safe to swap here: at this point no decode_lease_guard
+        // for THIS request has been acquired yet — the handler
+        // calls `decode_lease_guard` only after `ensure_loaded`
+        // returns. Pending guards from prior in-flight requests
+        // retain their own `Arc` clones (the swap only changes the
+        // slot's "live" lease pointer; old guards still decrement
+        // the captured `Arc` they hold). The new timer's busy
+        // check uses the new lease — it cannot observe in-flight
+        // decodes that still hold the old `Arc`, but those decodes
+        // are kept alive by `Arc<dyn Generator>` already in the
+        // handler's hand: even if a stale unload runs, the
+        // in-flight response still completes correctly.
+        loaded.decode_lease = Arc::new(AtomicUsize::new(0));
+        let gen = Arc::clone(&loaded.model);
+        let policy = loaded.keep_alive;
+        let lease = Arc::clone(&loaded.decode_lease);
+        let handle_slot = Arc::clone(&loaded.unload_handle);
+        drop(slots);
+        // Reset the timer on every request (cancel + respawn).
+        self.arm_or_reset_timer(model_id, policy, &lease, &handle_slot, /*reset=*/ true);
+        Some(gen)
+    }
+
+    /// Load model `model_id` into a resident slot on the calling thread, for
+    /// the whole time of the load. [`AppState::ensure_loaded`] is its one
+    /// caller in the server.
     ///
     /// If the model is already resident, updates its `last_used` and returns
     /// without reloading. Otherwise, if there is free slot capacity it is
     /// loaded and pushed; if the slots are full the least-recently-used entry
     /// is evicted (mirroring the old single-slot swap at `max_loaded_models
     /// == 1`) before the new model is loaded.
-    ///
-    /// Returns a clone of the `Arc<dyn Generator>` for the caller to use,
-    /// plus a `bool` that is `true` when the model was just loaded (cold) and
-    /// `false` when it was already resident (warm).
-    /// The error type is `rmlx_core::Error`, not a formatted string: a load
-    /// failure the operator can only fix by changing a flag —
-    /// [`rmlx_core::error::Error::ContextCeilingExceeded`] — must stay
-    /// distinguishable from a transient one, so the eager preload can fail
-    /// startup on the first and warn on the second.
-    pub fn ensure_loaded(
+    pub(crate) fn ensure_loaded_blocking(
         &self,
         model_id: &str,
-    ) -> Result<(Arc<dyn Generator>, bool), rmlx_core::error::Error> {
+    ) -> Result<Arc<dyn Generator>, rmlx_core::error::Error> {
         let entry = self.registry.get(model_id).ok_or_else(|| {
             rmlx_core::error::Error::Model(format!("model '{model_id}' not found in registry"))
         })?;
 
-        // First, check resident / collect any LRU eviction target under the
-        // slots write lock. We finalize the eviction OUTSIDE the lock so
+        if let Some(generator) = self.touch_resident(model_id) {
+            return Ok(generator);
+        }
+
+        // Collect any LRU eviction target under the slots write lock. We
+        // finalize the eviction OUTSIDE the lock so
         // (a) the slots lock isn't held across the finalize_unload session-
         // cache lock acquisition, and (b) the evicted slot's
         // `Arc<dyn Generator>` is dropped BEFORE the new model loader runs,
         // releasing GPU residency first.
         let evicted_for_cleanup: Option<LoadedModel> = {
             let mut slots = self.slots.write();
-
-            // Already resident?
-            if let Some(loaded) = slots.iter_mut().find(|m| m.id == model_id) {
-                loaded.last_used = Instant::now();
-                // Swap the slot's decode_lease so the previous
-                // timer's identity token (Arc::as_ptr of the old lease) no
-                // longer matches the slot's lease pointer. Any stale TTL
-                // fire from the prior arm that already passed its sleep
-                // boundary will detect the mismatch under the write lock
-                // and bail (see `arm_or_reset_timer` for the check).
-                //
-                // Safe to swap here: at this point no decode_lease_guard
-                // for THIS request has been acquired yet — the handler
-                // calls `decode_lease_guard` only after `ensure_loaded`
-                // returns. Pending guards from prior in-flight requests
-                // retain their own `Arc` clones (the swap only changes the
-                // slot's "live" lease pointer; old guards still decrement
-                // the captured `Arc` they hold). The new timer's busy
-                // check uses the new lease — it cannot observe in-flight
-                // decodes that still hold the old `Arc`, but those decodes
-                // are kept alive by `Arc<dyn Generator>` already in the
-                // handler's hand: even if a stale unload runs, the
-                // in-flight response still completes correctly.
-                loaded.decode_lease = Arc::new(AtomicUsize::new(0));
-                let gen = Arc::clone(&loaded.model);
-                let policy = loaded.keep_alive;
-                let lease = Arc::clone(&loaded.decode_lease);
-                let handle_slot = Arc::clone(&loaded.unload_handle);
-                drop(slots);
-                // Reset the timer on every request (cancel + respawn).
-                self.arm_or_reset_timer(
-                    model_id,
-                    policy,
-                    &lease,
-                    &handle_slot,
-                    /*reset=*/ true,
-                );
-                return Ok((gen, false));
-            }
 
             // Not resident. If at capacity, evict the LRU entry first (this is
             // the swap path; at max_loaded_models == 1 it evicts the single
@@ -896,7 +957,8 @@ impl AppState {
         if let Some(evicted) = evicted_for_cleanup {
             self.finalize_unload(&evicted, UnloadReason::CooperativeEvict, Some(model_id));
             // Explicit drop: the Arc<dyn Generator> is released here so its
-            // GPU residency is freed before the new model loader runs below.
+            // GPU residency is freed before the new model loader runs below,
+            // unless a decode still holds the generator.
             drop(evicted);
         }
 
@@ -1002,7 +1064,7 @@ impl AppState {
             &unload_handle,
             /*reset=*/ false,
         );
-        Ok((gen, true))
+        Ok(gen)
     }
 
     /// Arm (or reset) the per-model unload timer.
@@ -1012,14 +1074,14 @@ impl AppState {
     /// `policy` is `Pin`, no timer is armed (and any prior timer is cleared).
     ///
     /// Safe to call from sync contexts that are themselves running inside a
-    /// tokio runtime (request handlers, the `spawn_blocking` eager preload).
+    /// tokio runtime (request handlers, the blocking-pool thread of a load).
     /// Outside any runtime (unit tests that construct `AppState` directly
     /// without `block_on`), this becomes a no-op so tests don't crash —
     /// real production always runs inside `rt.block_on`.
     ///
     /// Contract: the caller controls whether the slot's
     /// `decode_lease` Arc is swapped before this call. The swap MUST happen
-    /// at request-triggered reset sites (`ensure_loaded` warm branch and
+    /// at request-triggered reset sites (`touch_resident` and
     /// `reset_keep_alive`) so the identity check in the spawned task can
     /// also detect warm-reset races. The swap MUST NOT happen at the
     /// internal busy re-arm tail (this function's own re-entry after the
@@ -1082,7 +1144,7 @@ impl AppState {
         //        `ensure_loaded`, so the slot's lease pointer differs.
         //   warm-reset — every `arm_or_reset_timer(reset=true)` call
         //        is paired with a swap of the slot's `decode_lease` Arc at
-        //        the caller site (`ensure_loaded` warm branch + the busy
+        //        the caller site (`touch_resident` + the busy
         //        re-arm tail + `reset_keep_alive`), so the slot's lease
         //        pointer differs after a request reset even when the same
         //        `LoadedModel` continues to occupy the slot.
@@ -1200,7 +1262,7 @@ impl AppState {
             }
             // Swap the slot's decode_lease so the previous
             // timer's identity token no longer matches — see the matching
-            // swap in `ensure_loaded` warm-reset branch for full rationale.
+            // swap in `touch_resident` for full rationale.
             // This path is reached from `/v1/models/{id}/load` with a body
             // `keep_alive` override; the caller has not acquired any decode
             // lease guard yet (that endpoint does not decode).
@@ -1223,7 +1285,7 @@ impl AppState {
     ///
     /// The prior "benign churn" race (timer fire between
     /// `ensure_loaded` and this call evicts the slot) is closed by the
-    /// lease-swap at `ensure_loaded`'s warm branch. After a warm reset, the
+    /// lease-swap in `touch_resident`. After a warm reset, the
     /// slot's lease pointer differs from the previous timer's captured
     /// pointer, and the identity check in `arm_or_reset_timer`'s spawned
     /// task bails before evicting. The fresh timer's full TTL window

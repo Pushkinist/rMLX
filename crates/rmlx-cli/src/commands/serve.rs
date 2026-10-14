@@ -979,6 +979,7 @@ pub(crate) fn run_serve(
             max_queue_depth,
             max_loaded_models,
             loader,
+            load_gate: Arc::default(),
             metrics: Some(serve_sink),
             idle_policy,
             max_tokens_cap,
@@ -1040,8 +1041,8 @@ pub(crate) fn run_serve(
         // it is pure load-cost + transient memory pressure with nothing kept.
         // The rest stay lazy — the documented load-on-demand / idle-unload path
         // handles them on first request.
-        // `ensure_loaded` is synchronous (CPU-bound disk + dequant); run it in
-        // the blocking-thread pool so we do not stall the async runtime.
+        // `ensure_loaded` runs each load on the blocking pool. The task
+        // around it keeps a panic of the loader out of the startup.
         // Best-effort for a *transient* failure: it logs a warning and does not
         // abort startup, since the first real request will attempt the load
         // again and surface a 503 if it still fails. A context-ceiling refusal
@@ -1058,11 +1059,11 @@ pub(crate) fn run_serve(
                 .map(|e| e.id.clone())
                 .collect();
             let state_ref = state.clone();
-            let fatal: Option<String> = tokio::task::spawn_blocking(move || {
+            let fatal: Option<String> = tokio::spawn(async move {
                 for id in &ids {
                     tracing::info!(model_id = %id, "eager preload starting");
                     let t = std::time::Instant::now();
-                    match state_ref.ensure_loaded(id) {
+                    match state_ref.ensure_loaded(id).await {
                         Ok(_) => tracing::info!(
                             model_id = %id,
                             load_ms = t.elapsed().as_millis(),
@@ -1088,7 +1089,7 @@ pub(crate) fn run_serve(
             })
             .await
             .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "eager preload: spawn_blocking panicked");
+                tracing::warn!(error = %e, "eager preload panicked");
                 None
             });
             if let Some(msg) = fatal {

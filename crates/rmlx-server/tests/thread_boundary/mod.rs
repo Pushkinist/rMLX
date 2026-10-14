@@ -12,10 +12,10 @@
 //!
 //! `rmlx serve` builds model state on one thread and uses it on another:
 //!
-//! - A chat model loads on the eager-preload thread, on an async worker (the
-//!   on-demand load and the load route), or inside a request. It generates on
-//!   a blocking-pool thread. Its vision tower, audio tower and speculative
-//!   drafter load with it.
+//! - A chat model loads on a blocking-pool thread: at the eager preload, on
+//!   demand and at the load route. It generates on the blocking-pool thread
+//!   that tokio picks for its request. Its vision tower, audio tower and
+//!   speculative drafter load with it.
 //! - The embedding, Whisper and TTS models load inside a request and serve
 //!   later requests on the blocking-pool thread that tokio picks. A request
 //!   that fails after the load leaves a model that no forward has evaluated.
