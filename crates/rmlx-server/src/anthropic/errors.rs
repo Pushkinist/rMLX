@@ -11,15 +11,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
 
-pub(super) fn error_response(status: StatusCode, error_type: &str, message: &str) -> Response {
-    let body = json!({
-        "error": {
-            "message": message,
-            "type": error_type,
-        }
-    });
-    (status, Json(body)).into_response()
-}
+use crate::openai::errors::error_response;
 
 pub(super) fn bad_request(message: &str) -> Response {
     error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message)

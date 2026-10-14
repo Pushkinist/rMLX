@@ -78,6 +78,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the end of the real audio is not in the reply; before, only a segment that
   opened more than 0.5 s after it was dropped. The seek does not change.
 
+- **Every error of the transcription routes is in the OpenAI error
+  envelope.** `POST /v1/audio/transcriptions` and `/v1/audio/translations`
+  sent a bare `{"error":"…"}` for 413, 422, 500 and 503, and axum's plain
+  text for a form with no boundary. They now send
+  `{"error":{"message","type"}}`, as the other routes do, so a client that
+  reads `error.type` or `error.param` gets a value. `type` is
+  `invalid_request_error` for 400, 413 and 422, `service_unavailable` for 503
+  and `internal_error` for 500. A refused request field is named in
+  `param` (`language`, `response_format`, `temperature`, `stream`,
+  `timestamp_granularities` or `timestamp_granularities[]`, `file`). The
+  status codes and the message texts do not change, except that on these
+  routes the text Whisper reports as an MLX error is replaced by a fixed text
+  (it can hold a path of the MLX install; the log keeps it). The JSON value of the 408 and of the 429 does not change.
+  Replies made before the route runs still have no body, for example the 405
+  of the router, the 400 for a request head that does not parse, and the 431
+  for a `Content-Length` of 18446744073709551615.
 - **The transcription routes state their limits instead of passing them
   silently.** A file over 25 MiB, or a request body over 26 MiB, is now 413
   and names the cap and the size (it was 422, and over 26 MiB the cap was not

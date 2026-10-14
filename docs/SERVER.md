@@ -454,7 +454,7 @@ Errors use the OpenAI envelope:
 | 404 | `not_found_error` | Chat or embeddings model not in the registry (`model_not_found` on the lifecycle routes). |
 | 408 | `timeout` | The request timeout expired. |
 | 429 | `rate_limit_error` | The GPU admission queue is full. |
-| 500 | `internal_error` | A handler panic, a prompt-pipeline task panic, or an embeddings preprocessor or compute failure. The transcription routes send every status but 400, 408 and 429 as a bare `{"error":"…"}` ([`AUDIO.md`](AUDIO.md) § "HTTP route"); `/v1/audio/speech` sends the envelope, except for a request that the JSON extractor refuses, which gets axum's plain text ([`SERVER_AUDIO.md`](SERVER_AUDIO.md)). |
+| 500 | `internal_error` | A handler panic, a prompt-pipeline task panic, or an embeddings preprocessor or compute failure. The transcription routes send the envelope for every reply they make, with `"param"` for a refused request field; replies made before the route runs, by the router or the HTTP layer, have no body ([`AUDIO.md`](AUDIO.md) § "HTTP route"); `/v1/audio/speech` sends it too, except for a request that the JSON extractor refuses, which gets axum's plain text ([`SERVER_AUDIO.md`](SERVER_AUDIO.md)). |
 | 502 | `constraint_not_engaged` | A `response_format` reply with no text at the engagement byte (streaming: error event). |
 | 503 | `service_unavailable` | Any load failure, OOM while loading included, and any other engine error. With `--require-smoke-probe` (off by default) a failed smoke probe at load lands here too. Counter: `upstream`. |
 | 503 | `admission_sla_exceeded` | The adaptive controller's anticipatory rejection, with `Retry-After: 5`. Counter: `admission_sla_503`. |

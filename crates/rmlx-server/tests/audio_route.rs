@@ -9,6 +9,7 @@
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
+    clippy::panic,
     clippy::print_stderr,
     reason = "test assertions, and each case prints the status and body it got"
 )]
@@ -80,6 +81,9 @@ fn form(parts: &[(&str, &[u8])]) -> Vec<u8> {
 /// The `Content-Type` line of every form `form` builds.
 const FORM_TYPE: &str = "Content-Type: multipart/form-data; boundary=XBOUNDARY\r\n";
 
+const TRANSCRIPTIONS: &str = "/v1/audio/transcriptions";
+const TRANSLATIONS: &str = "/v1/audio/translations";
+
 /// What the server answered.
 struct Answer {
     status: u16,
@@ -93,8 +97,13 @@ struct Answer {
 /// server may answer before it has read the whole upload, and a write it
 /// refuses is not an error here.
 async fn exchange(port: u16, headers: &str, body: Vec<u8>) -> Answer {
+    exchange_to(port, TRANSCRIPTIONS, headers, body).await
+}
+
+/// `exchange` to the route `path`.
+async fn exchange_to(port: u16, path: &str, headers: &str, body: Vec<u8>) -> Answer {
     let head = format!(
-        "POST /v1/audio/transcriptions HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\
          {headers}\r\n"
     );
     let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
@@ -135,6 +144,60 @@ async fn post_form(port: u16, parts: &[(&str, &[u8])]) -> Answer {
     exchange(port, &headers, body).await
 }
 
+/// POST the form `parts` to the route `path`.
+async fn post_form_to(port: u16, path: &str, parts: &[(&str, &[u8])]) -> Answer {
+    let body = form(parts);
+    let headers = format!("{FORM_TYPE}Content-Length: {}\r\n", body.len());
+    exchange_to(port, path, &headers, body).await
+}
+
+/// The `error` object of an answer, which must be the OpenAI envelope: JSON,
+/// an `error` object with a string `message`, the string `type` given, a
+/// `param` equal to the one given (absent or null when `None`), and no other
+/// key. Returns the message.
+fn envelope(answer: &Answer, status: u16, error_type: &str, param: Option<&str>) -> String {
+    assert_eq!(answer.status, status, "{}", answer.body);
+    let json: serde_json::Value = serde_json::from_str(&answer.body)
+        .unwrap_or_else(|e| panic!("not JSON ({e}): {}", answer.body));
+    let error = json
+        .get("error")
+        .and_then(serde_json::Value::as_object)
+        .unwrap_or_else(|| panic!("`error` is not an object: {}", answer.body));
+    assert_eq!(json.as_object().map(serde_json::Map::len), Some(1));
+    assert_eq!(
+        error.get("type").and_then(serde_json::Value::as_str),
+        Some(error_type),
+        "{}",
+        answer.body
+    );
+    assert_eq!(
+        error.get("param").and_then(serde_json::Value::as_str),
+        param,
+        "{}",
+        answer.body
+    );
+    for key in error.keys() {
+        assert!(
+            ["message", "type", "param"].contains(&key.as_str()),
+            "unexpected key {key}: {}",
+            answer.body
+        );
+    }
+    assert!(
+        answer
+            .head
+            .to_ascii_lowercase()
+            .contains("\r\ncontent-type: application/json"),
+        "{}",
+        answer.head
+    );
+    error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("no string `message`: {}", answer.body))
+        .to_owned()
+}
+
 /// POST `audio` as the only field of the form.
 async fn post_audio(port: u16, audio: &[u8]) -> Answer {
     post_form(port, &[("file", audio)]).await
@@ -158,11 +221,11 @@ async fn a_refused_audio_file_is_422_before_the_model_loads() {
     let (state, _dir) = missing_whisper_state();
     let port = start_server_with_state(state).await;
 
-    let Answer { status, body, .. } = post_audio(port, &aac).await;
-    assert_eq!(status, 422, "{body}");
+    let answer = post_audio(port, &aac).await;
+    let message = envelope(&answer, 422, "invalid_request_error", Some("file"));
     assert!(
-        body.contains("audio decode: audio read failed at 1.28 s"),
-        "{body}"
+        message.starts_with("audio decode: audio read failed at 1.28 s"),
+        "{message}"
     );
 }
 
@@ -207,11 +270,11 @@ async fn a_file_over_the_cap_is_413_naming_the_cap_and_its_size() {
     let (state, _dir) = missing_whisper_state();
     let port = start_server_with_state(state).await;
     for size in [CAP + 1, 26_720_078] {
-        let Answer { status, body, .. } = post_audio(port, &vec![0x55; size]).await;
-        eprintln!("CASE file {size} B: {status} {body}");
-        assert_eq!(status, 413, "{size}: {body}");
-        assert!(body.contains(&CAP.to_string()), "{size}: {body}");
-        assert!(body.contains(&size.to_string()), "{size}: {body}");
+        let answer = post_audio(port, &vec![0x55; size]).await;
+        eprintln!("CASE file {size} B: {} {}", answer.status, answer.body);
+        let message = envelope(&answer, 413, "invalid_request_error", Some("file"));
+        assert!(message.contains(&CAP.to_string()), "{size}: {message}");
+        assert!(message.contains(&size.to_string()), "{size}: {message}");
     }
 }
 
@@ -224,20 +287,16 @@ async fn a_body_over_the_transport_limit_is_413_naming_the_cap_and_its_size() {
     let port = start_server_with_state(state).await;
     let body = form(&[("file", &vec![0x55; 28_800_078])]);
     let declared = body.len();
-    let Answer {
-        status,
-        body: answer,
-        ..
-    } = exchange(
+    let answer = exchange(
         port,
         &format!("{FORM_TYPE}Content-Length: {declared}\r\n"),
         body,
     )
     .await;
-    eprintln!("CASE body {declared} B: {status} {answer}");
-    assert_eq!(status, 413, "{answer}");
-    assert!(answer.contains(&CAP.to_string()), "{answer}");
-    assert!(answer.contains(&declared.to_string()), "{answer}");
+    eprintln!("CASE body {declared} B: {} {}", answer.status, answer.body);
+    let message = envelope(&answer, 413, "invalid_request_error", None);
+    assert!(message.contains(&CAP.to_string()), "{message}");
+    assert!(message.contains(&declared.to_string()), "{message}");
 }
 
 /// A chunked body states no length; over the transport limit it is 413
@@ -254,46 +313,42 @@ async fn a_chunked_body_over_the_transport_limit_is_413_naming_the_cap() {
         chunked.extend_from_slice(b"\r\n");
     }
     chunked.extend_from_slice(b"0\r\n\r\n");
-    let Answer {
-        status,
-        body: answer,
-        ..
-    } = exchange(
+    let answer = exchange(
         port,
         &format!("{FORM_TYPE}Transfer-Encoding: chunked\r\n"),
         chunked,
     )
     .await;
-    eprintln!("CASE chunked body: {status} {answer}");
-    assert_eq!(status, 413, "{answer}");
-    assert!(answer.contains(&CAP.to_string()), "{answer}");
+    eprintln!("CASE chunked body: {} {}", answer.status, answer.body);
+    let message = envelope(&answer, 413, "invalid_request_error", None);
+    assert!(message.contains(&CAP.to_string()), "{message}");
 }
 
 /// A `Content-Length` far over the cap on a short body is 4xx, and the server
 /// answers the next request: the file's buffer is sized from the header only
-/// up to the cap. hyper answers 431 to `u64::MAX`; the two others reach the
-/// route.
+/// up to the cap. hyper answers 431, with no body, to `u64::MAX`; the two
+/// others reach the route, which refuses the file in the error envelope.
 #[tokio::test]
 async fn a_content_length_far_over_the_cap_is_4xx_and_the_server_lives() {
     let (state, _dir) = missing_whisper_state();
     let port = start_server_with_state(state).await;
     let body = form(&[("file", &[0x55; 1000])]);
     for declared in [u64::MAX, 1 << 63, 4 << 30] {
-        let Answer {
-            status,
-            body: answer,
-            ..
-        } = exchange(
+        let answer = exchange(
             port,
             &format!("{FORM_TYPE}Content-Length: {declared}\r\n"),
             body.clone(),
         )
         .await;
-        eprintln!("CASE Content-Length {declared}: {status} {answer}");
-        assert!(
-            (400..500).contains(&status),
-            "{declared}: {status} {answer}"
+        eprintln!(
+            "CASE Content-Length {declared}: {} {}",
+            answer.status, answer.body
         );
+        if declared == u64::MAX {
+            assert_eq!((answer.status, answer.body.as_str()), (431, ""));
+        } else {
+            envelope(&answer, 422, "invalid_request_error", Some("file"));
+        }
     }
     let Answer {
         status,
@@ -310,31 +365,40 @@ async fn word_timestamps_are_422_naming_the_field() {
     let (state, _dir) = missing_whisper_state();
     let port = start_server_with_state(state).await;
     let wav = short_wav();
-    for parts in [
-        vec![
-            ("file", wav.as_slice()),
-            ("timestamp_granularities[]", b"word".as_slice()),
-        ],
-        vec![
-            ("file", wav.as_slice()),
-            ("timestamp_granularities", b"word".as_slice()),
-        ],
-        vec![
-            ("timestamp_granularities[]", b"segment".as_slice()),
-            ("timestamp_granularities[]", b"word".as_slice()),
-            ("file", wav.as_slice()),
-        ],
+    for (param, parts) in [
+        (
+            "timestamp_granularities[]",
+            vec![
+                ("file", wav.as_slice()),
+                ("timestamp_granularities[]", b"word".as_slice()),
+            ],
+        ),
+        (
+            "timestamp_granularities",
+            vec![
+                ("file", wav.as_slice()),
+                ("timestamp_granularities", b"word".as_slice()),
+            ],
+        ),
+        (
+            "timestamp_granularities[]",
+            vec![
+                ("timestamp_granularities[]", b"segment".as_slice()),
+                ("timestamp_granularities[]", b"word".as_slice()),
+                ("file", wav.as_slice()),
+            ],
+        ),
     ] {
-        let Answer { status, body, .. } = post_form(port, &parts).await;
+        let answer = post_form(port, &parts).await;
         let named: Vec<String> = parts
             .iter()
             .filter(|(name, _)| *name != "file")
             .map(|(name, value)| format!("{name}={}", String::from_utf8_lossy(value)))
             .collect();
-        eprintln!("CASE {named:?}: {status} {body}");
-        assert_eq!(status, 422, "{body}");
-        assert!(body.contains("timestamp_granularities"), "{body}");
-        assert!(body.contains("word"), "{body}");
+        eprintln!("CASE {named:?}: {} {}", answer.status, answer.body);
+        let message = envelope(&answer, 422, "invalid_request_error", Some(param));
+        assert!(message.contains(param), "{message}");
+        assert!(message.contains("word"), "{message}");
     }
 }
 
@@ -344,11 +408,10 @@ async fn word_timestamps_are_422_naming_the_field() {
 async fn stream_true_is_422_naming_the_field() {
     let (state, _dir) = missing_whisper_state();
     let port = start_server_with_state(state).await;
-    let Answer { status, body, .. } =
-        post_form(port, &[("file", &short_wav()), ("stream", b"true")]).await;
-    eprintln!("CASE stream=true: {status} {body}");
-    assert_eq!(status, 422, "{body}");
-    assert!(body.contains("stream"), "{body}");
+    let answer = post_form(port, &[("file", &short_wav()), ("stream", b"true")]).await;
+    eprintln!("CASE stream=true: {} {}", answer.status, answer.body);
+    let message = envelope(&answer, 422, "invalid_request_error", Some("stream"));
+    assert!(message.contains("stream"), "{message}");
 }
 
 /// A field the route serves or ignores does not refuse the request: each of
@@ -390,7 +453,8 @@ async fn served_and_ignored_fields_reach_the_model_load() {
     }
 }
 
-/// Each of these refused field values answers 422 with a fixed body.
+/// Each of these refused field values answers 422 with a fixed envelope that
+/// names the field in `param`.
 #[tokio::test]
 async fn a_refused_field_value_answers_422_with_its_fixed_body() {
     let (state, _dir) = missing_whisper_state();
@@ -400,47 +464,46 @@ async fn a_refused_field_value_answers_422_with_its_fixed_body() {
         (
             "language",
             b"xx",
-            r#"{"error":"unknown language 'xx'; use a Whisper language code, an English language name or 'auto'"}"#,
+            "unknown language 'xx'; use a Whisper language code, an English language name or 'auto'",
         ),
         (
             "response_format",
             b"diarized_json",
-            r#"{"error":"unsupported response_format 'diarized_json'; must be one of: json, text, verbose_json, srt, vtt"}"#,
+            "unsupported response_format 'diarized_json'; must be one of: json, text, verbose_json, srt, vtt",
         ),
         (
             "temperature",
             b"-1",
-            r#"{"error":"temperature -1 is out of range; must be 0 or a finite float >= 1e-6"}"#,
+            "temperature -1 is out of range; must be 0 or a finite float >= 1e-6",
         ),
         (
             "temperature",
             b"0.0000001",
-            r#"{"error":"temperature 0.0000001 is out of range; must be 0 or a finite float >= 1e-6"}"#,
+            "temperature 0.0000001 is out of range; must be 0 or a finite float >= 1e-6",
         ),
         (
             "temperature",
             b"hot",
-            r#"{"error":"invalid temperature 'hot'; must be 0 or a finite float >= 1e-6"}"#,
+            "invalid temperature 'hot'; must be 0 or a finite float >= 1e-6",
         ),
     ];
     for (name, value, expected) in cases {
-        let Answer { status, body, .. } = post_form(port, &[("file", &wav), (name, value)]).await;
+        let answer = post_form(port, &[("file", &wav), (name, value)]).await;
         eprintln!(
-            "CASE {name}={}: {status} {body}",
-            String::from_utf8_lossy(value)
+            "CASE {name}={}: {} {}",
+            String::from_utf8_lossy(value),
+            answer.status,
+            answer.body
         );
-        assert_eq!((status, body.as_str()), (422, expected), "{name}");
+        let message = envelope(&answer, 422, "invalid_request_error", Some(name));
+        assert_eq!(message, expected, "{name}");
     }
-    let Answer { status, body, .. } = post_form(port, &[("model", b"whisper-1")]).await;
-    assert_eq!(
-        (status, body.as_str()),
-        (422, r#"{"error":"missing required field: file"}"#)
-    );
-    let Answer { status, body, .. } = post_audio(port, b"").await;
-    assert_eq!(
-        (status, body.as_str()),
-        (422, r#"{"error":"audio file is empty"}"#)
-    );
+    let answer = post_form(port, &[("model", b"whisper-1")]).await;
+    let message = envelope(&answer, 422, "invalid_request_error", Some("file"));
+    assert_eq!(message, "missing required field: file");
+    let answer = post_audio(port, b"").await;
+    let message = envelope(&answer, 422, "invalid_request_error", Some("file"));
+    assert_eq!(message, "audio file is empty");
 }
 
 /// A Whisper load failure is the server's, not the request's: 503, and the
@@ -449,14 +512,14 @@ async fn a_refused_field_value_answers_422_with_its_fixed_body() {
 async fn a_whisper_load_failure_is_503_and_names_no_directory() {
     let (state, dir) = missing_whisper_state();
     let port = start_server_with_state(state).await;
-    let Answer { status, body, .. } = post_audio(port, &short_wav()).await;
-    eprintln!("CASE load failure: {status} {body}");
-    assert_eq!(status, 503, "{body}");
-    assert!(body.contains("tokenizer.json"), "{body}");
-    assert!(body.contains("No such file"), "{body}");
+    let answer = post_audio(port, &short_wav()).await;
+    eprintln!("CASE load failure: {} {}", answer.status, answer.body);
+    let message = envelope(&answer, 503, "service_unavailable", None);
+    assert!(message.contains("tokenizer.json"), "{message}");
+    assert!(message.contains("No such file"), "{message}");
     let dir = dir.path().display().to_string();
-    assert!(!body.contains(&dir), "{body}");
-    assert!(!body.contains('/'), "{body}");
+    assert!(!answer.body.contains(&dir), "{}", answer.body);
+    assert!(!answer.body.contains('/'), "{}", answer.body);
 }
 
 /// The same for the model: with the local large-v3 tokenizer and a snapshot
@@ -481,13 +544,13 @@ async fn a_whisper_model_load_failure_is_503_and_names_no_directory() {
     let (mut state, dir) = missing_whisper_state();
     state.whisper_tokenizer_path = Some(tokenizer);
     let port = start_server_with_state(state).await;
-    let Answer { status, body, .. } = post_audio(port, &short_wav()).await;
-    eprintln!("CASE model load failure: {status} {body}");
-    assert_eq!(status, 503, "{body}");
-    assert!(body.contains("config.json"), "{body}");
+    let answer = post_audio(port, &short_wav()).await;
+    eprintln!("CASE model load failure: {} {}", answer.status, answer.body);
+    let message = envelope(&answer, 503, "service_unavailable", None);
+    assert!(message.contains("config.json"), "{message}");
     let dir = dir.path().display().to_string();
-    assert!(!body.contains(&dir), "{body}");
-    assert!(!body.contains('/'), "{body}");
+    assert!(!answer.body.contains(&dir), "{}", answer.body);
+    assert!(!answer.body.contains('/'), "{}", answer.body);
 }
 
 /// A load failure is permanent until the operator acts: the 503 carries
@@ -528,14 +591,17 @@ async fn stream_is_read_as_a_boolean_in_any_case() {
         ("1", true),
         ("maybe", true),
     ] {
-        let Answer { status, body, .. } =
-            post_form(port, &[("file", &wav), ("stream", value.as_bytes())]).await;
-        eprintln!("CASE stream={value}: {status} {body}");
+        let answer = post_form(port, &[("file", &wav), ("stream", value.as_bytes())]).await;
+        eprintln!("CASE stream={value}: {} {}", answer.status, answer.body);
         if refused {
-            assert_eq!(status, 422, "{value}: {body}");
-            assert!(body.contains("stream"), "{value}: {body}");
+            let message = envelope(&answer, 422, "invalid_request_error", Some("stream"));
+            assert!(message.contains("stream"), "{value}: {message}");
         } else {
-            assert!(body.contains("tokenizer"), "{value}: {status} {body}");
+            assert!(
+                answer.body.contains("tokenizer"),
+                "{value}: {}",
+                answer.body
+            );
         }
     }
 }
@@ -549,13 +615,17 @@ async fn a_form_of_more_than_64_parts_is_422_naming_the_limit() {
     for (parts, refused) in [(64, false), (65, true)] {
         let mut form: Vec<(&str, &[u8])> = vec![("file", &wav)];
         form.resize(parts, ("x", b"".as_slice()));
-        let Answer { status, body, .. } = post_form(port, &form).await;
-        eprintln!("CASE {parts} parts: {status} {body}");
+        let answer = post_form(port, &form).await;
+        eprintln!("CASE {parts} parts: {} {}", answer.status, answer.body);
         if refused {
-            assert_eq!(status, 422, "{parts}: {body}");
-            assert!(body.contains("64"), "{parts}: {body}");
+            let message = envelope(&answer, 422, "invalid_request_error", None);
+            assert_eq!(message, "the form has more than 64 parts", "{parts}");
         } else {
-            assert!(body.contains("tokenizer"), "{parts}: {status} {body}");
+            assert!(
+                answer.body.contains("tokenizer"),
+                "{parts}: {}",
+                answer.body
+            );
         }
     }
 }
@@ -578,18 +648,21 @@ async fn an_ignored_field_with_a_long_name_is_read() {
 async fn an_ignored_field_over_the_transport_limit_is_413_naming_the_cap() {
     let (state, _dir) = missing_whisper_state();
     let port = start_server_with_state(state).await;
-    let Answer { status, body, .. } = post_form(
+    let answer = post_form(
         port,
         &[("prompt", &vec![b'x'; 28_800_078]), ("file", &short_wav())],
     )
     .await;
-    eprintln!("CASE 28.8 MB ignored field: {status} {body}");
-    assert_eq!(status, 413, "{body}");
-    assert!(body.contains(&CAP.to_string()), "{body}");
+    eprintln!(
+        "CASE 28.8 MB ignored field: {} {}",
+        answer.status, answer.body
+    );
+    let message = envelope(&answer, 413, "invalid_request_error", None);
+    assert!(message.contains(&CAP.to_string()), "{message}");
 }
 
 /// A multipart request with no boundary is refused by axum's extractor before
-/// the route runs: 400, plain text.
+/// the handler's body runs: 400 in the error envelope, on both routes.
 #[tokio::test]
 async fn a_form_with_no_boundary_is_400() {
     let (state, _dir) = missing_whisper_state();
@@ -599,10 +672,12 @@ async fn a_form_with_no_boundary_is_400() {
         "Content-Type: multipart/form-data\r\nContent-Length: {}\r\n",
         body.len()
     );
-    let answer = exchange(port, &headers, body).await;
-    eprintln!("CASE no boundary: {} {}", answer.status, answer.body);
-    assert_eq!(answer.status, 400, "{}", answer.body);
-    assert!(answer.body.contains("boundary"), "{}", answer.body);
+    for path in [TRANSCRIPTIONS, TRANSLATIONS] {
+        let answer = exchange_to(port, path, &headers, body.clone()).await;
+        eprintln!("CASE no boundary {path}: {} {}", answer.status, answer.body);
+        let message = envelope(&answer, 400, "invalid_request_error", None);
+        assert!(message.contains("boundary"), "{path}: {message}");
+    }
 }
 
 /// A server with no Whisper paths answers every request 503 and tells the
@@ -612,12 +687,10 @@ async fn an_unconfigured_route_is_503_and_says_no_retry() {
     let state = not_ready_state(ModelRegistry::default());
     let port = start_server_with_state(state).await;
     let answer = post_audio(port, &short_wav()).await;
+    let message = envelope(&answer, 503, "service_unavailable", None);
     assert_eq!(
-        (answer.status, answer.body.as_str()),
-        (
-            503,
-            r#"{"error":"audio model not configured; set --whisper-model-path"}"#
-        )
+        message,
+        "audio model not configured; set --whisper-model-path"
     );
     assert!(
         answer
@@ -645,16 +718,17 @@ async fn a_long_value_is_refused_without_its_echo() {
         "timestamp_granularities[]",
         "stream",
     ] {
-        let Answer { status, body, .. } =
-            post_form(port, &[(name, long.as_slice()), ("file", &wav)]).await;
+        let answer = post_form(port, &[(name, long.as_slice()), ("file", &wav)]).await;
+        let body = &answer.body;
         eprintln!(
-            "CASE 1 MiB {name}: {status}, {} B: {}",
+            "CASE 1 MiB {name}: {}, {} B: {}",
+            answer.status,
             body.len(),
-            body.get(..120).unwrap_or(&body)
+            body.get(..120).unwrap_or(body)
         );
-        assert_eq!(status, 422, "{name}");
+        let message = envelope(&answer, 422, "invalid_request_error", Some(name));
         assert!(body.len() < 200, "{name}: a {} B body", body.len());
-        assert!(body.contains(name), "{name}: {body}");
+        assert!(message.contains(name), "{name}: {message}");
     }
 }
 
@@ -666,17 +740,168 @@ async fn a_short_field_holds_at_most_64_bytes() {
     let port = start_server_with_state(state).await;
     let wav = short_wav();
     let at_limit = "q".repeat(64);
-    let Answer { status, body, .. } =
-        post_form(port, &[("language", at_limit.as_bytes()), ("file", &wav)]).await;
-    assert_eq!(status, 422, "{body}");
-    assert!(body.contains(&at_limit), "{body}");
+    let answer = post_form(port, &[("language", at_limit.as_bytes()), ("file", &wav)]).await;
+    let message = envelope(&answer, 422, "invalid_request_error", Some("language"));
+    assert!(message.contains(&at_limit), "{message}");
     let over = "q".repeat(65);
-    let Answer { status, body, .. } =
-        post_form(port, &[("language", over.as_bytes()), ("file", &wav)]).await;
-    eprintln!("CASE 65-byte language: {status} {body}");
-    assert_eq!(status, 422, "{body}");
-    assert!(!body.contains(&at_limit), "{body}");
-    assert!(body.contains("64 bytes"), "{body}");
+    let answer = post_form(port, &[("language", over.as_bytes()), ("file", &wav)]).await;
+    eprintln!("CASE 65-byte language: {} {}", answer.status, answer.body);
+    let message = envelope(&answer, 422, "invalid_request_error", Some("language"));
+    assert!(!message.contains(&at_limit), "{message}");
+    assert!(message.contains("64 bytes"), "{message}");
+}
+
+/// The refusals the other tests do not reach, on both routes: a bad field
+/// value, a missing file, the 503 of a Whisper load.
+#[tokio::test]
+async fn every_refusal_is_the_error_envelope_on_both_routes() {
+    let (state, _dir) = missing_whisper_state();
+    let port = start_server_with_state(state).await;
+    let wav = short_wav();
+    for path in [TRANSCRIPTIONS, TRANSLATIONS] {
+        let answer = post_form_to(port, path, &[("file", &wav), ("language", b"xx")]).await;
+        envelope(&answer, 422, "invalid_request_error", Some("language"));
+
+        let answer = post_form_to(
+            port,
+            path,
+            &[("file", &wav), ("timestamp_granularities[]", b"phrase")],
+        )
+        .await;
+        let message = envelope(
+            &answer,
+            422,
+            "invalid_request_error",
+            Some("timestamp_granularities[]"),
+        );
+        assert!(message.contains("phrase"), "{message}");
+
+        let answer = post_form_to(
+            port,
+            path,
+            &[("file", &wav), ("timestamp_granularities", b"phrase")],
+        )
+        .await;
+        let message = envelope(
+            &answer,
+            422,
+            "invalid_request_error",
+            Some("timestamp_granularities"),
+        );
+        assert!(message.contains("phrase"), "{message}");
+
+        let answer = post_form_to(port, path, &[("model", b"whisper-1")]).await;
+        envelope(&answer, 422, "invalid_request_error", Some("file"));
+
+        let answer = post_form_to(port, path, &[("file", &wav)]).await;
+        envelope(&answer, 503, "service_unavailable", None);
+    }
+}
+
+/// A form the multipart reader cannot parse is 422 in the error envelope, with
+/// no `param`: no one request field is at fault.
+#[tokio::test]
+async fn an_unreadable_form_is_422_in_the_error_envelope() {
+    let (state, _dir) = missing_whisper_state();
+    let port = start_server_with_state(state).await;
+    let body =
+        b"--XBOUNDARY\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-1".to_vec();
+    let headers = format!("{FORM_TYPE}Content-Length: {}\r\n", body.len());
+    let answer = exchange(port, &headers, body).await;
+    eprintln!("CASE unreadable form: {} {}", answer.status, answer.body);
+    let message = envelope(&answer, 422, "invalid_request_error", None);
+    assert_eq!(message, "Error parsing `multipart/form-data` request");
+}
+
+/// The 429 of a full queue keeps its envelope and its text.
+#[tokio::test]
+async fn a_full_queue_answer_is_the_rate_limit_envelope() {
+    let (mut state, _dir) = missing_whisper_state();
+    state.max_queue_depth = 1;
+    state
+        .gpu_pending
+        .store(1, std::sync::atomic::Ordering::Release);
+    let port = start_server_with_state(state).await;
+    let answer = post_audio(port, &short_wav()).await;
+    let message = envelope(&answer, 429, "rate_limit_error", None);
+    assert_eq!(message, "server queue full");
+}
+
+/// The 408 of the request timeout keeps its envelope: a client that sends the
+/// head of a form and stalls is cut at the deadline of its own header.
+#[tokio::test]
+async fn a_stalled_upload_is_the_timeout_envelope() {
+    let (state, _dir) = missing_whisper_state();
+    let port = start_server_with_state(state).await;
+    let head = format!(
+        "POST {TRANSCRIPTIONS} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\
+         X-Request-Timeout-Seconds: 1\r\n{FORM_TYPE}Content-Length: 100000\r\n\r\n\
+         --XBOUNDARY\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\r\nRIFF"
+    );
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    stream.write_all(head.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        stream.read_to_end(&mut response),
+    )
+    .await;
+    assert!(read.is_ok(), "no answer within 10 s");
+    let text = String::from_utf8_lossy(&response).into_owned();
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let answer = Answer {
+        status,
+        head: head.to_owned(),
+        body: body.to_owned(),
+    };
+    envelope(&answer, 408, "timeout", None);
+}
+
+/// Replies made before the route runs have no body: the 405 of the router for
+/// a method other than POST and the 400 of the HTTP layer for a request head
+/// it cannot parse. The 431 for an absurd `Content-Length` is held by the
+/// Content-Length test above.
+#[tokio::test]
+async fn a_reply_made_before_the_route_has_no_body() {
+    let (state, _dir) = missing_whisper_state();
+    let port = start_server_with_state(state).await;
+    for (request, status) in [
+        (
+            format!(
+                "GET {TRANSCRIPTIONS} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            ),
+            405,
+        ),
+        ("NOT AN HTTP REQUEST\r\n\r\n".to_owned(), 400),
+    ] {
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stream.read_to_end(&mut response),
+        )
+        .await;
+        assert!(read.is_ok(), "no answer within 10 s to {request:?}");
+        let text = String::from_utf8_lossy(&response).into_owned();
+        eprintln!("CASE {request:?}: {text:?}");
+        let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+        let got = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u16>().ok());
+        assert_eq!(got, Some(status), "{text:?}");
+        assert_eq!(body, "", "{text:?}");
+    }
 }
 
 // ── The token pick of a request, on the model ────────────────────────────────

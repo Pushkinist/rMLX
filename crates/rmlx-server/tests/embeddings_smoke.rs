@@ -178,6 +178,24 @@ async fn truncate_prompt_tokens_is_400_before_the_model_lookup() {
     assert!(b.contains("truncate_prompt_tokens"), "body: {b}");
 }
 
+/// The bytes of a refusal are the error envelope with `message` before `type`
+/// and nothing else.
+#[tokio::test]
+async fn a_refusal_body_is_the_envelope_bytes() {
+    let port = start(state(ModelRegistry::default(), Device::Cpu)).await;
+    let (status, body) = post(
+        port,
+        "/v1/embeddings",
+        r#"{"model":"x","input":"hi","truncate_prompt_tokens":8}"#,
+    )
+    .await;
+    assert_eq!(status, 400, "body: {body}");
+    assert_eq!(
+        body,
+        r#"{"error":{"message":"truncate_prompt_tokens (8) is not supported: removing tokens from the start of a jina sequence removes its task prefix. Truncate the input text before the request.","type":"invalid_request_error"}}"#
+    );
+}
+
 /// `encoding_format` outside {float,base64} → 400.
 #[tokio::test]
 async fn invalid_encoding_format_is_400() {

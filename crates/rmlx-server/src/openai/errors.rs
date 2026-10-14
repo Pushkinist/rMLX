@@ -17,13 +17,24 @@ use super::state::ApiErrorCategory;
 // ── Error helpers ─────────────────────────────────────────────────────────────
 
 pub(crate) fn error_response(status: StatusCode, error_type: &str, message: &str) -> Response {
-    let body = json!({
-        "error": {
-            "message": message,
-            "type": error_type,
-        }
-    });
-    (status, Json(body)).into_response()
+    error_response_with_param(status, error_type, None, message)
+}
+
+/// The error envelope. `param` names the request field at fault; the key is
+/// absent when there is none.
+pub(crate) fn error_response_with_param(
+    status: StatusCode,
+    error_type: &str,
+    param: Option<&str>,
+    message: &str,
+) -> Response {
+    let mut error = serde_json::Map::new();
+    error.insert("message".to_owned(), json!(message));
+    error.insert("type".to_owned(), json!(error_type));
+    if let Some(param) = param {
+        error.insert("param".to_owned(), json!(param));
+    }
+    (status, Json(json!({ "error": error }))).into_response()
 }
 
 pub(crate) fn bad_request(message: &str) -> Response {

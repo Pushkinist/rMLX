@@ -62,14 +62,20 @@ fn a_speech_request_without_sampling_fields_leaves_them_unset() {
     assert_eq!(req.sampling.seed, None);
 }
 
-/// Status and JSON body of one speech request against `state`.
-async fn speak(state: crate::openai::AppState, body: &str) -> (StatusCode, serde_json::Value) {
+/// Status and body bytes of one speech request against `state`.
+async fn speak_raw(state: crate::openai::AppState, body: &str) -> (StatusCode, Vec<u8>) {
     let req: SpeechRequest = serde_json::from_str(body).unwrap();
     let resp = audio_speech(State(state), Json(req)).await;
     let status = resp.status();
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
+    (status, bytes.to_vec())
+}
+
+/// Status and JSON body of one speech request against `state`.
+async fn speak(state: crate::openai::AppState, body: &str) -> (StatusCode, serde_json::Value) {
+    let (status, bytes) = speak_raw(state, body).await;
     (status, serde_json::from_slice(&bytes).unwrap())
 }
 
@@ -682,4 +688,31 @@ async fn a_long_model_name_is_logged_cut_to_64_bytes() {
         Some(format!("{:?}", "m".repeat(64)).as_str())
     );
     assert_eq!(field(request, "model_len"), Some("1048576"));
+}
+
+/// Without `--tts-model-path` the route is 503 `not_supported`, in the error
+/// envelope with `message` before `type`.
+#[tokio::test]
+async fn an_unconfigured_route_is_503_not_supported() {
+    let (status, bytes) = speak_raw(no_tts_state(), r#"{"model":"tts","input":"hello"}"#).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        bytes,
+        br#"{"error":{"message":"TTS not configured; set --tts-model-path and --tts-tokenizer-path","type":"not_supported"}}"#
+    );
+}
+
+/// A full queue is 429 `rate_limit_error`, in the error envelope with
+/// `message` before `type`.
+#[tokio::test]
+async fn a_full_queue_is_429_rate_limit_error() {
+    let (_snapshot, mut state) = snapshot_state(&[]);
+    state.max_queue_depth = 1;
+    state.gpu_pending.store(1, Ordering::Release);
+    let (status, bytes) = speak_raw(state, r#"{"model":"tts","input":"hello"}"#).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        bytes,
+        br#"{"error":{"message":"server queue full","type":"rate_limit_error"}}"#
+    );
 }

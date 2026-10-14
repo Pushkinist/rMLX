@@ -1,4 +1,5 @@
 use super::*;
+use crate::openai::errors::error_response;
 
 fn parse(json: &str) -> Result<MessagesRequest, serde_json::Error> {
     serde_json::from_str(json)
@@ -710,4 +711,19 @@ fn a7_anthropic_top_k_parses() {
     )
     .unwrap();
     assert_eq!(req.top_k, Some(15));
+}
+
+/// The bytes of an Anthropic error are the error envelope with `message`
+/// before `type` and nothing else.
+#[tokio::test]
+async fn an_error_body_is_the_envelope_bytes() {
+    let resp = error_response(StatusCode::BAD_REQUEST, "invalid_request_error", "m");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        bytes.as_ref(),
+        br#"{"error":{"message":"m","type":"invalid_request_error"}}"#
+    );
 }

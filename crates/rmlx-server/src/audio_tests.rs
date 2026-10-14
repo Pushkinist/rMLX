@@ -18,7 +18,7 @@ use rmlx_audio::transcribe::{Segment, Transcription};
 use rmlx_audio::wav::WavError;
 
 use super::form::ResponseFormat;
-use super::{build_response, cut, job_refusal, refused, run_admitted, JobError};
+use super::{build_response, cut, job_answer, job_refusal, refused, run_admitted, JobError};
 use crate::engine::{admit_request, Admission, GpuAdmission};
 
 /// How long a scripted job waits for the flag before it gives up and reports
@@ -399,4 +399,122 @@ fn cut_keeps_whole_characters() {
     assert_eq!(cut("abc", 64), "abc");
     assert_eq!(cut("aé", 2), "a");
     assert_eq!(cut("", 4), "");
+}
+
+/// The JSON of a response's body.
+async fn json_of(response: axum::response::Response) -> serde_json::Value {
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("the body reads");
+    serde_json::from_slice(&bytes).expect("the body is JSON")
+}
+
+/// Each job failure is answered in the error envelope: the file is a bad
+/// request that names `file`; every other fault is the server's, and names no
+/// request field.
+#[tokio::test]
+async fn each_job_failure_is_answered_in_the_error_envelope() {
+    use rmlx_audio::tokenizer::TokenizerError;
+    use rmlx_audio::whisper::WhisperError;
+
+    let mlx = || WhisperError::Mlx("op failed".to_owned());
+    let cases = [
+        (
+            JobError::Decode(WavError::Empty),
+            "invalid_request_error",
+            Some("file"),
+        ),
+        (
+            JobError::Tokenizer(TokenizerError::Load("tokenizer.json: gone".to_owned())),
+            "service_unavailable",
+            None,
+        ),
+        (JobError::Model(mlx()), "service_unavailable", None),
+        (JobError::Init(mlx()), "service_unavailable", None),
+        (JobError::Transcribe(mlx()), "service_unavailable", None),
+    ];
+    for (error, error_type, param) in cases {
+        let refusal = job_refusal(&error);
+        let message = refusal.message.clone();
+        let json = json_of(refused(refusal)).await;
+        let expected = match param {
+            Some(param) => serde_json::json!({
+                "error": {"message": message, "type": error_type, "param": param}
+            }),
+            None => serde_json::json!({"error": {"message": message, "type": error_type}}),
+        };
+        assert_eq!(json, expected, "{error:?}");
+    }
+}
+
+/// A job that panics on the blocking pool is answered as a 500 in the error
+/// envelope, and the text names no cause. The panic is real: `run_admitted`
+/// returns the `JoinError` that `job_answer` gets in the handler.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_panicked_job_is_answered_in_the_error_envelope() {
+    let (queue, pending) = gpu_queue();
+    let guard = admitted(&queue, &pending).await;
+    let result = run_admitted(guard, |_| -> Result<Transcription, JobError> {
+        panic!("scripted panic, secret cause");
+    })
+    .await;
+    assert!(result.is_err(), "the scripted job panics");
+    let response = job_answer(result, WhisperTask::Transcribe, ResponseFormat::Json);
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        json_of(response).await,
+        serde_json::json!({"error": {"message": "internal error", "type": "internal_error"}})
+    );
+    assert_eq!(queue.available_permits(), 1, "the panic frees the permit");
+}
+
+/// An MLX error message can hold a path of the server's MLX install (the
+/// metallib load error does), so no reply carries it, whichever Whisper error
+/// carries it. The weight-file case is built from the audio crate's own
+/// `NpzError` message, so a change of that message turns the test red. The
+/// file and the step stay in the reply. Another Whisper error text is sent as
+/// it is.
+#[test]
+fn an_mlx_error_text_is_not_sent_in_a_reply() {
+    use rmlx_audio::npz::NpzError;
+    use rmlx_audio::whisper::WhisperError;
+
+    let secret = "eval: Failed to load the default metallib. /opt/lib/mlx/mlx.metallib";
+    let mlx = || WhisperError::Mlx(secret.to_owned());
+    let weight_file =
+        || WhisperError::WeightFile(format!("weights.npz: {}", NpzError::Mlx(secret.to_owned())));
+    let cases = [
+        (JobError::Model(mlx()), "whisper load: "),
+        (JobError::Init(mlx()), "transcriber init: "),
+        (JobError::Transcribe(mlx()), "transcribe: "),
+        (
+            JobError::Model(weight_file()),
+            "whisper load: weight file error: weights.npz: ",
+        ),
+        (
+            JobError::Transcribe(weight_file()),
+            "transcribe: weight file error: weights.npz: ",
+        ),
+    ];
+    for (error, kept) in cases {
+        let message = job_refusal(&error).message;
+        assert!(message.starts_with(kept), "{message}");
+        assert!(!message.contains('/'), "{message}");
+        assert!(!message.contains("metallib"), "{message}");
+        assert!(!message.contains("eval"), "{message}");
+        assert!(message.contains("MLX error"), "{message}");
+    }
+    let message = job_refusal(&JobError::Transcribe(WhisperError::Config("x".to_owned()))).message;
+    assert_eq!(message, "transcribe: config parse error: x");
+    let message = job_refusal(&JobError::Model(WhisperError::WeightFile(
+        "weights.npz: file I/O: No such file or directory (os error 2)".to_owned(),
+    )))
+    .message;
+    assert_eq!(
+        message,
+        "whisper load: weight file error: weights.npz: file I/O: No such file or directory (os error 2)"
+    );
 }

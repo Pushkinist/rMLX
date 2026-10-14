@@ -35,10 +35,11 @@ use crate::tokenizer_io;
 use crate::tool_parser::{detect_tool_call_format, ParsedToolCall, ToolCallFormat};
 
 use super::blocking::generate_blocking;
-use super::errors::{bad_request, error_response, service_unavailable};
+use super::errors::{bad_request, service_unavailable};
 use super::request::{AnthropicContent, MessagesRequest};
 use super::response::ContentBlock;
 use super::streaming::generate_streaming;
+use crate::openai::errors::error_response;
 
 // No fields in the Anthropic extra-rejection list — tools + tool_choice are
 // parsed fields.

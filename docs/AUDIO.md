@@ -390,18 +390,28 @@ Clients known to read it: openai-python by default (`None` for the two) and
 openai-dotnet (0 for the two). `language` is the English name of the language
 of the decode, for example `french` (see "Language forms").
 
-An error body is `{"error": "…"}`, except the 408 and the 429, which are
-the OpenAI envelope `{"error":{"message","type"}}`, and the 400, which is
-axum's plain text.
+Every error the route sends is the OpenAI envelope
+`{"error":{"message","type"}}` (`docs/SERVER.md` § "Error responses").
+Replies made before the route runs have no body, for example the 405 of the
+router for a method other than POST, the 400 of the HTTP layer for a request
+head that does not parse, and the 431 for a `Content-Length` of
+18446744073709551615. When one request field is at fault,
+the envelope also holds `"param"`, the name of the field: `language`,
+`response_format`, `temperature`, `stream`, the array name the request used
+(`timestamp_granularities` or `timestamp_granularities[]`), or `file` for a
+missing, empty, oversize or undecodable file. A fault of the form as a whole
+has no `param`. The `type` is `invalid_request_error` for 400, 413 and 422,
+`service_unavailable` for 503, `internal_error` for 500, `rate_limit_error`
+for 429 and `timeout` for 408.
 
 | Status | When |
 |---|---|
-| 400 | A `multipart/form-data` request with no boundary: axum refuses it before the route runs, ``Invalid `boundary` for `multipart/form-data` request``. |
+| 400 | A `multipart/form-data` request with no boundary: axum refuses it before the route reads the form, and the message is ``Invalid `boundary` for `multipart/form-data` request``. |
 | 413 | The file is over 25 MiB (26,214,400 bytes): `audio file is <N> bytes, over the cap of 26214400 bytes (25 MiB)`. A request body over 26 MiB (27,262,976 bytes) stops while it is read: `request body is <N> bytes, over the limit of 27262976 bytes: …`, without `<N> bytes,` when the request sent no `Content-Length`. OpenAI answers 413 for a request over 26,214,400 bytes. |
 | 422 | A malformed form, more than 64 parts, no `file` or an empty one, a field value over 64 bytes, a refused field value, or a file the decoder refuses (`audio decode: …`, see "WAV I/O"). |
 | 408 | The request timeout expired (`docs/SERVER.md` § "Error responses"). |
 | 429 | The admission queue is full. |
-| 503 | The server's fault. With `x-should-retry: false`, which OpenAI's SDKs obey before their own retry of a 5xx: `--whisper-model-path` or `--whisper-tokenizer-path` is not set; the tokenizer, `config.json` or `weights.npz` does not load or is refused (see "Supported variants"); or the transcriber cannot be built on the loaded model (`transcriber init: …`). The body names the file and the fact, never a directory; the server log gives the path. Without that header: an engine failure during the transcription (`transcribe: …`), which a retry may pass. |
+| 503 | The server's fault. With `x-should-retry: false`, which OpenAI's SDKs obey before their own retry of a 5xx: `--whisper-model-path` or `--whisper-tokenizer-path` is not set; the tokenizer, `config.json` or `weights.npz` does not load or is refused (see "Supported variants"); or the transcriber cannot be built on the loaded model (`transcriber init: …`). The body names the file and the fact, never a directory; the server log gives the path. On these routes, text that Whisper reports as an MLX error (it starts at `MLX op error:` or `MLX:`) is replaced by `MLX error; the server log has the cause`, because it can hold a path of the MLX install; the file or step before it stays. That covers mel extractor failures, an empty audio after processing and every engine error the audio crate converts, not only MLX ops. Without that header: an engine failure during the transcription (`transcribe: …`), which a retry may pass. |
 | 500 | The job panicked. |
 
 A file that loses audio under the limit for its length is not refused, and

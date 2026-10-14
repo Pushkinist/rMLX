@@ -1,6 +1,6 @@
 //! The multipart form of the transcription and translation routes.
 
-use axum::extract::multipart::{Field, MultipartError};
+use axum::extract::multipart::{Field, MultipartError, MultipartRejection};
 use axum::extract::Multipart;
 use axum::http::StatusCode;
 use rmlx_audio::transcribe::requested_language;
@@ -9,7 +9,8 @@ use tracing::warn;
 use crate::tts_sampling::MIN_SAMPLING_VALUE;
 
 use super::{
-    cut, too_large, unprocessable, Refusal, LOGGED_NAME_BYTES, MAX_AUDIO_BYTES, MAX_REQUEST_BYTES,
+    bad_field, cut, too_large, unprocessable, Refusal, LOGGED_NAME_BYTES, MAX_AUDIO_BYTES,
+    MAX_REQUEST_BYTES,
 };
 
 /// The most parts a form may hold, the file included.
@@ -124,7 +125,7 @@ pub(super) async fn parse_multipart(
             "language" => {
                 let text = short_value(&name, read_short(&mut field, body_len).await?)?;
                 if !text.is_empty() {
-                    requested_language(&text).map_err(|e| unprocessable(e.to_string()))?;
+                    requested_language(&text).map_err(|e| bad_field("language", e.to_string()))?;
                 }
                 language = if text.is_empty() {
                     "auto".to_owned()
@@ -134,20 +135,27 @@ pub(super) async fn parse_multipart(
             }
             "response_format" => {
                 let text = short_value(&name, read_short(&mut field, body_len).await?)?;
-                response_format = ResponseFormat::parse_or_default(&text).map_err(unprocessable)?;
+                response_format = ResponseFormat::parse_or_default(&text)
+                    .map_err(|message| bad_field("response_format", message))?;
             }
             "temperature" => {
                 let text = short_value(&name, read_short(&mut field, body_len).await?)?;
                 let t = text.parse::<f32>().map_err(|_| {
-                    unprocessable(format!(
-                        "invalid temperature '{text}'; must be 0 or a finite float >= 1e-6"
-                    ))
+                    bad_field(
+                        "temperature",
+                        format!(
+                            "invalid temperature '{text}'; must be 0 or a finite float >= 1e-6"
+                        ),
+                    )
                 })?;
                 // Below the bound the sampler's scaled logit is not finite.
                 if !t.is_finite() || t < 0.0 || (t > 0.0 && t < MIN_SAMPLING_VALUE) {
-                    return Err(unprocessable(format!(
-                        "temperature {t} is out of range; must be 0 or a finite float >= 1e-6"
-                    )));
+                    return Err(bad_field(
+                        "temperature",
+                        format!(
+                            "temperature {t} is out of range; must be 0 or a finite float >= 1e-6"
+                        ),
+                    ));
                 }
                 temperature = t;
             }
@@ -157,14 +165,16 @@ pub(super) async fn parse_multipart(
                 match text.as_str() {
                     "segment" => {}
                     "word" => {
-                        return Err(unprocessable(format!(
-                            "{name} 'word' is not supported: timing is per segment"
-                        )));
+                        return Err(bad_field(
+                            &name,
+                            format!("{name} 'word' is not supported: timing is per segment"),
+                        ));
                     }
                     other => {
-                        return Err(unprocessable(format!(
-                            "unknown {name} '{other}'; must be 'segment'"
-                        )));
+                        return Err(bad_field(
+                            &name,
+                            format!("unknown {name} '{other}'; must be 'segment'"),
+                        ));
                     }
                 }
             }
@@ -173,16 +183,18 @@ pub(super) async fn parse_multipart(
                 match text.to_ascii_lowercase().as_str() {
                     "false" | "0" | "" => {}
                     "true" | "1" => {
-                        return Err(unprocessable(
+                        return Err(bad_field(
+                            "stream",
                             "stream=true is not supported: the transcription is sent whole \
                              when it ends"
                                 .to_owned(),
                         ));
                     }
                     _ => {
-                        return Err(unprocessable(format!(
-                            "invalid stream '{text}'; must be true or false"
-                        )));
+                        return Err(bad_field(
+                            "stream",
+                            format!("invalid stream '{text}'; must be true or false"),
+                        ));
                     }
                 }
             }
@@ -203,9 +215,9 @@ pub(super) async fn parse_multipart(
     }
 
     let audio_bytes =
-        audio_bytes.ok_or_else(|| unprocessable("missing required field: file".to_owned()))?;
+        audio_bytes.ok_or_else(|| bad_field("file", "missing required field: file".to_owned()))?;
     if audio_bytes.is_empty() {
-        return Err(unprocessable("audio file is empty".to_owned()));
+        return Err(bad_field("file", "audio file is empty".to_owned()));
     }
 
     Ok(AudioFormFields {
@@ -244,11 +256,21 @@ async fn read_short(
 /// of it.
 fn short_value(name: &str, (text, len): (String, usize)) -> Result<String, Refusal> {
     if len > SHORT_FIELD_BYTES {
-        return Err(unprocessable(format!(
-            "{name} is over {SHORT_FIELD_BYTES} bytes"
-        )));
+        return Err(bad_field(
+            name,
+            format!("{name} is over {SHORT_FIELD_BYTES} bytes"),
+        ));
     }
     Ok(text)
+}
+
+/// A request that the multipart extractor refused before the form was read:
+/// its status and text, in the error envelope.
+pub(super) fn rejected_form(rejection: &MultipartRejection) -> Refusal {
+    Refusal {
+        status: rejection.status(),
+        ..unprocessable(rejection.body_text())
+    }
 }
 
 /// A form the server could not read. A body over the transport limit is 413

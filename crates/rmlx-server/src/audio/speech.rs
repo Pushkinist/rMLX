@@ -8,12 +8,12 @@ use rmlx_audio::tts::{
     synthesize, Synthesis, TtsConfig, TtsError, TtsModel, TtsTokenizer, MAX_FRAMES,
 };
 use serde::Deserialize;
-use serde_json::json;
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 
 use super::{cut, run_admitted, LOGGED_NAME_BYTES};
 use crate::engine::{admit_request, Admission};
+use crate::openai::errors::error_response;
 use crate::openai::state::ApiErrorCategory;
 use crate::openai::AppState;
 use crate::tts_sampling::{resolve_tts_sampling, TtsPicker, TtsSampling, TtsSamplingRequest};
@@ -160,7 +160,7 @@ impl SpeechFailure {
 
     fn into_response(self) -> Response {
         match self {
-            Self::UnknownVoice(message) => crate::openai::errors::error_response(
+            Self::UnknownVoice(message) => error_response(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "invalid_request_error",
                 &message,
@@ -212,16 +212,11 @@ pub async fn audio_speech(
     let (Some(tts_model_path), Some(tts_tok_path)) =
         (&state.tts_model_path, &state.tts_tokenizer_path)
     else {
-        return (
+        return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "error": {
-                    "type": "not_supported",
-                    "message": "TTS not configured; set --tts-model-path and --tts-tokenizer-path"
-                }
-            })),
-        )
-            .into_response();
+            "not_supported",
+            "TTS not configured; set --tts-model-path and --tts-tokenizer-path",
+        );
     };
 
     // TTS holds the GPU: it queues in the FIFO of the chat routes.
@@ -229,13 +224,11 @@ pub async fn audio_speech(
         match admit_request(&state.gpu_queue, &state.gpu_pending, state.max_queue_depth).await {
             Admission::QueueFull => {
                 state.error_counts.increment(ApiErrorCategory::RateLimit);
-                return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(
-                    json!({"error": {"type": "rate_limit_error", "message": "server queue full"}}),
-                ),
-            )
-                .into_response();
+                return error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limit_error",
+                    "server queue full",
+                );
             }
             Admission::Admitted {
                 guard,

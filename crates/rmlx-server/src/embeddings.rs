@@ -211,8 +211,7 @@ fn err(
     msg: &str,
 ) -> Response {
     state.error_counts.increment(cat);
-    let body = json!({ "error": { "message": msg, "type": ty } });
-    (status, Json(body)).into_response()
+    crate::openai::errors::error_response(status, ty, msg)
 }
 
 /// The 400 message for a request field this route refuses, or `None`.

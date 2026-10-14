@@ -14,8 +14,9 @@
     reason = "audio handler is a sequential pipeline; splitting would obscure the control flow"
 )]
 
+use axum::extract::multipart::MultipartRejection;
 use axum::extract::{Multipart, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use rmlx_audio::tokenizer::{TokenizerError, WhisperTask, WhisperTokenizer};
@@ -24,7 +25,6 @@ use rmlx_audio::wav::{WavDecoder, WavError, MAX_AUDIO_SECS};
 use rmlx_audio::whisper::{WhisperError, WhisperModel};
 use rmlx_models::sampler::RowPicker;
 use serde::Serialize;
-use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info, instrument, warn};
@@ -32,10 +32,11 @@ use tracing::{debug, info, instrument, warn};
 mod form;
 mod speech;
 
-use form::{parse_multipart, ResponseFormat};
+use form::{parse_multipart, rejected_form, ResponseFormat};
 pub use speech::{audio_speech, LoadedTts, SpeechRequest};
 
 use crate::engine::{admit_request, Admission, GpuAdmission};
+use crate::openai::errors::{error_response, error_response_with_param, internal_error};
 use crate::openai::state::ApiErrorCategory;
 use crate::openai::AppState;
 
@@ -56,40 +57,72 @@ fn cut(text: &str, max: usize) -> &str {
         .unwrap_or_default()
 }
 
-/// A refused request: its status, the text of its `{"error": …}` body, and
-/// whether the fault stays until the operator acts.
+/// A refused request: its status, the `type` and `message` of its error
+/// envelope, the request field at fault, and whether the fault stays until the
+/// operator acts.
 #[derive(Debug, PartialEq, Eq)]
 struct Refusal {
     status: StatusCode,
+    error_type: &'static str,
     message: String,
+    /// The `param` of the envelope: the request field at fault, if one is.
+    param: Option<String>,
     /// Sends `x-should-retry: false`, which OpenAI's SDKs obey before their
     /// own retry of a 5xx.
     permanent: bool,
 }
 
+/// A request that the route cannot take, with no one field at fault.
 fn unprocessable(message: String) -> Refusal {
     Refusal {
         status: StatusCode::UNPROCESSABLE_ENTITY,
+        error_type: "invalid_request_error",
         message,
+        param: None,
         permanent: false,
+    }
+}
+
+/// A request that the route cannot take because of the field `param`.
+fn bad_field(param: &str, message: String) -> Refusal {
+    Refusal {
+        param: Some(param.to_owned()),
+        ..unprocessable(message)
     }
 }
 
 fn too_large(message: String) -> Refusal {
     Refusal {
         status: StatusCode::PAYLOAD_TOO_LARGE,
+        ..unprocessable(message)
+    }
+}
+
+/// The server cannot serve the request. `permanent`: the fault stays until the
+/// operator acts.
+fn unavailable(message: String, permanent: bool) -> Refusal {
+    Refusal {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        error_type: "service_unavailable",
         message,
-        permanent: false,
+        param: None,
+        permanent,
     }
 }
 
 fn refused(refusal: Refusal) -> Response {
-    let body = Json(json!({ "error": refusal.message }));
+    let mut response = error_response_with_param(
+        refusal.status,
+        refusal.error_type,
+        refusal.param.as_deref(),
+        &refusal.message,
+    );
     if refusal.permanent {
-        (refusal.status, [("x-should-retry", "false")], body).into_response()
-    } else {
-        (refusal.status, body).into_response()
+        response
+            .headers_mut()
+            .insert("x-should-retry", HeaderValue::from_static("false"));
     }
+    response
 }
 
 /// Where a transcription job failed.
@@ -107,17 +140,36 @@ enum JobError {
 /// every other engine error. A load or init failure stays until the operator
 /// acts; an engine failure during the transcription may not recur.
 fn job_refusal(e: &JobError) -> Refusal {
-    let server = |message: String, permanent: bool| Refusal {
-        status: StatusCode::SERVICE_UNAVAILABLE,
-        message,
-        permanent,
-    };
     match e {
-        JobError::Decode(e) => unprocessable(format!("audio decode: {e}")),
-        JobError::Tokenizer(e) => server(format!("tokenizer: {e}"), true),
-        JobError::Model(e) => server(format!("whisper load: {e}"), true),
-        JobError::Init(e) => server(format!("transcriber init: {e}"), true),
-        JobError::Transcribe(e) => server(format!("transcribe: {e}"), false),
+        JobError::Decode(e) => bad_field("file", format!("audio decode: {e}")),
+        JobError::Tokenizer(e) => unavailable(format!("tokenizer: {e}"), true),
+        JobError::Model(e) => unavailable(format!("whisper load: {}", reply_text(e)), true),
+        JobError::Init(e) => unavailable(format!("transcriber init: {}", reply_text(e)), true),
+        JobError::Transcribe(e) => unavailable(format!("transcribe: {}", reply_text(e)), false),
+    }
+}
+
+/// What starts text from MLX in the message of a Whisper failure: the
+/// `WhisperError::Mlx` message, and the `NpzError::Mlx` message inside a
+/// `WhisperError::WeightFile` one.
+const MLX_TEXT_MARKS: [&str; 2] = ["MLX op error: ", "MLX: "];
+
+/// The text of a Whisper failure for a reply. An MLX error message can hold a
+/// path of the server's MLX install. The reply keeps the message up to the
+/// first MLX mark (the file or the step) and gets a fixed text in place of the
+/// rest; the log keeps the cause.
+fn reply_text(e: &WhisperError) -> String {
+    let text = e.to_string();
+    match MLX_TEXT_MARKS
+        .iter()
+        .filter_map(|mark| text.find(mark))
+        .min()
+    {
+        Some(at) => format!(
+            "{}MLX error; the server log has the cause",
+            text.get(..at).unwrap_or_default()
+        ),
+        None => text,
     }
 }
 
@@ -160,7 +212,7 @@ struct VerboseTranscriptionResponse {
 pub async fn audio_transcriptions(
     State(state): State<AppState>,
     headers: HeaderMap,
-    multipart: Multipart,
+    multipart: Result<Multipart, MultipartRejection>,
 ) -> Response {
     handle_audio(state, &headers, multipart, WhisperTask::Transcribe).await
 }
@@ -170,7 +222,7 @@ pub async fn audio_transcriptions(
 pub async fn audio_translations(
     State(state): State<AppState>,
     headers: HeaderMap,
-    multipart: Multipart,
+    multipart: Result<Multipart, MultipartRejection>,
 ) -> Response {
     handle_audio(state, &headers, multipart, WhisperTask::Translate).await
 }
@@ -183,23 +235,30 @@ pub async fn audio_translations(
 async fn handle_audio(
     state: AppState,
     headers: &HeaderMap,
-    mut multipart: Multipart,
+    multipart: Result<Multipart, MultipartRejection>,
     task: WhisperTask,
 ) -> Response {
     let body_len = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<usize>().ok());
+    let mut multipart = match multipart {
+        Ok(multipart) => multipart,
+        Err(rejection) => return refused(rejected_form(&rejection)),
+    };
     let fields = match parse_multipart(&mut multipart, body_len).await {
         Ok(f) => f,
         Err(refusal) => return refused(refusal),
     };
 
     if fields.audio_bytes.len() > MAX_AUDIO_BYTES {
-        return refused(too_large(format!(
-            "audio file is {} bytes, over the cap of {MAX_AUDIO_BYTES} bytes (25 MiB)",
-            fields.audio_bytes.len()
-        )));
+        return refused(Refusal {
+            param: Some("file".to_owned()),
+            ..too_large(format!(
+                "audio file is {} bytes, over the cap of {MAX_AUDIO_BYTES} bytes (25 MiB)",
+                fields.audio_bytes.len()
+            ))
+        });
     }
 
     info!(
@@ -211,11 +270,10 @@ async fn handle_audio(
     );
 
     let Some((model_path, tok_path)) = state.audio_paths() else {
-        return refused(Refusal {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            message: "audio model not configured; set --whisper-model-path".to_owned(),
-            permanent: true,
-        });
+        return refused(unavailable(
+            "audio model not configured; set --whisper-model-path".to_owned(),
+            true,
+        ));
     };
 
     // Audio queues in the chat routes' FIFO, which also gives the 429 back-pressure.
@@ -223,13 +281,11 @@ async fn handle_audio(
         match admit_request(&state.gpu_queue, &state.gpu_pending, state.max_queue_depth).await {
             Admission::QueueFull => {
                 state.error_counts.increment(ApiErrorCategory::RateLimit);
-                return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(
-                    json!({"error": {"type": "rate_limit_error", "message": "server queue full"}}),
-                ),
-            )
-                .into_response();
+                return error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limit_error",
+                    "server queue full",
+                );
             }
             Admission::Admitted {
                 guard,
@@ -358,6 +414,16 @@ async fn handle_audio(
     })
     .await;
 
+    job_answer(result, task, response_format)
+}
+
+/// The answer to a finished transcription job: the transcript, the refusal of
+/// a job that failed, or the 500 of a job that panicked.
+fn job_answer(
+    result: Result<Result<Transcription, JobError>, tokio::task::JoinError>,
+    task: WhisperTask,
+    format: ResponseFormat,
+) -> Response {
     match result {
         Ok(Ok(transcription)) => {
             info!(
@@ -365,24 +431,28 @@ async fn handle_audio(
                 segments = transcription.segments.len(),
                 "transcription complete"
             );
-            build_response(&transcription, task, response_format)
+            build_response(&transcription, task, format)
         }
         Ok(Err(e)) => {
             let refusal = job_refusal(&e);
+            let cause: &dyn std::fmt::Display = match &e {
+                JobError::Decode(cause) => cause,
+                JobError::Tokenizer(cause) => cause,
+                JobError::Model(cause) | JobError::Init(cause) | JobError::Transcribe(cause) => {
+                    cause
+                }
+            };
             warn!(
                 status = refusal.status.as_u16(),
-                error = refusal.message,
+                error = %cause,
+                reply = refusal.message.as_str(),
                 "transcription failed"
             );
             refused(refusal)
         }
         Err(e) => {
             warn!(error = %e, "transcription task panicked");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal error"})),
-            )
-                .into_response()
+            internal_error("internal error")
         }
     }
 }
