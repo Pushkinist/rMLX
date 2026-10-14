@@ -1,4 +1,4 @@
-// LOC-exempt: encoder + decoder + greedy_decode form one tightly coupled MLX graph;
+// LOC-exempt: encoder + decoder + the decoder pass form one tightly coupled MLX graph;
 // the attention + residual + FFN blocks are inseparable (shared KV-cache lifetimes).
 // The NPZ loader was extracted to crates/rmlx-audio/src/npz.rs.
 
@@ -45,24 +45,27 @@
 //!
 //! ## Inference loop
 //!
-//! Uses greedy decoding (argmax) only. `temperature` is accepted for API
-//! parity but `argmax_f32` ignores it — no temperature-scaled softmax path
-//! exists. KV-cache is maintained per-block for O(n) decode.
+//! [`decode_loop`] holds the host side of a decode: the logit filters, the
+//! token pick, which the caller supplies, and the average log-probability.
+//! [`TextDecoder::open_window`] is the model side: it projects the
+//! cross-attention keys and values of an encoder output one time, and each
+//! pass over that window is one forward for each token with a self-attention
+//! KV-cache per block.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rmlx_mlx::{
-    add, argmax, concatenate, conv1d, divide, gelu, matmul, multiply, scalar_f32, softmax_precise,
-    sqrt, subtract, sum_axis_keepdims, Array, Device,
+    add, concatenate, conv1d, divide, gelu, matmul, multiply, scalar_f32, softmax_precise, sqrt,
+    subtract, sum_axis_keepdims, Array, Device,
 };
 use thiserror::Error;
 use tracing::{debug, info, instrument, warn};
 
 use crate::mel::N_FRAMES;
 use crate::npz::WeightMap;
-use crate::tokenizer::{
-    N_VOCAB, TOK_EN, TOK_EOT, TOK_LANG_LAST, TOK_NOSPEECH, TOK_NO_TIMESTAMPS, TOK_TIMESTAMP_BEGIN,
-};
+use crate::tokenizer::{N_VOCAB, TOK_EOT, TOK_NO_TIMESTAMPS, TOK_TIMESTAMP_BEGIN};
+use decode_loop::{decode_loop, window_start, writes_at_most, Decoded, WindowStart};
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
@@ -100,9 +103,6 @@ pub enum WhisperError {
         "unknown language '{0}'; use a Whisper language code, an English language name or 'auto'"
     )]
     UnknownLanguage(String),
-    /// No transcription produced.
-    #[error("no transcription (model detected silence)")]
-    Silence,
     /// The caller's cancel flag was set; window number `window` (from 0), at
     /// sample `seek` of the 16 kHz audio, was not decoded.
     #[error("transcription cancelled before window {window} (sample {seek})")]
@@ -285,6 +285,9 @@ struct MultiHeadAttention {
     value: Linear,
     out: Linear,
     n_head: usize,
+    /// How many times this attention projected keys and values from a cross
+    /// input (an encoder output), and did not read them from a cache.
+    cross_projections: AtomicUsize,
 }
 
 impl MultiHeadAttention {
@@ -295,6 +298,7 @@ impl MultiHeadAttention {
             value: Linear::load(map, &format!("{prefix}.value"), true)?,
             out: Linear::load(map, &format!("{prefix}.out"), true)?,
             n_head,
+            cross_projections: AtomicUsize::new(0),
         })
     }
 
@@ -312,6 +316,7 @@ impl MultiHeadAttention {
             if let Some((ck, cv)) = kv_cache {
                 (ck.try_clone()?, cv.try_clone()?)
             } else {
+                self.cross_projections.fetch_add(1, Ordering::Relaxed);
                 (
                     self.key.forward(xa_ref, device)?,
                     self.value.forward(xa_ref, device)?,
@@ -593,6 +598,8 @@ pub struct TextDecoder {
     ln: LayerNorm,
     causal_mask: Array,
     n_state: usize,
+    n_vocab: usize,
+    n_text_ctx: usize,
 }
 
 impl TextDecoder {
@@ -617,6 +624,8 @@ impl TextDecoder {
             ln,
             causal_mask,
             n_state: cfg.n_text_state,
+            n_vocab: cfg.n_vocab,
+            n_text_ctx: cfg.n_text_ctx,
         })
     }
 
@@ -677,6 +686,185 @@ impl TextDecoder {
         let emb_t = self.token_embedding.transpose(&[1, 0], device)?;
         let logits = matmul(&x, &emb_t, device)?;
         Ok((logits, new_self_kvs, new_cross_kvs))
+    }
+
+    /// How many times a decoder block projected the cross-attention keys and
+    /// values of an encoder output since the load: one for each block of each
+    /// window.
+    pub(crate) fn cross_projections(&self) -> usize {
+        self.blocks
+            .iter()
+            .map(|block| block.cross_attn.cross_projections.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// Open an encoded window: read its start with one decoder forward of the
+    /// start token alone, and keep the cross-attention keys and values that
+    /// forward projected. They depend on the encoder output only, so every
+    /// decode of the window reads them.
+    pub(crate) fn open_window<'a>(
+        &'a self,
+        encoder_out: &'a Array,
+        device: Device,
+    ) -> Result<(WindowStart, WindowDecoder<'a>), WhisperError> {
+        let mut pass = DecoderPass {
+            decoder: self,
+            encoder_out,
+            device,
+            self_kvs: Vec::new(),
+            cross_kvs: Vec::new(),
+            fed: 0,
+        };
+        let start = window_start(|input: &[u32]| pass.forward(input))?;
+        let window = WindowDecoder {
+            decoder: self,
+            encoder_out,
+            device,
+            cross_kvs: pass.cross_kvs,
+        };
+        Ok((start, window))
+    }
+}
+
+/// One decoder pass over an encoded window: the attention state of the tokens
+/// fed so far.
+struct DecoderPass<'a> {
+    decoder: &'a TextDecoder,
+    encoder_out: &'a Array,
+    device: Device,
+    self_kvs: Vec<(Array, Array)>,
+    cross_kvs: Vec<(Array, Array)>,
+    fed: usize,
+}
+
+impl DecoderPass<'_> {
+    /// Feed `input` after the tokens fed before it and return the logit row
+    /// of its last position.
+    fn forward(&mut self, input: &[u32]) -> Result<Vec<f32>, WhisperError> {
+        let one;
+        let many;
+        let ids: &[i32] = if let [token] = input {
+            one = [*token as i32];
+            &one
+        } else {
+            many = input.iter().map(|&t| t as i32).collect::<Vec<i32>>();
+            &many
+        };
+        let Some(last) = ids.len().checked_sub(1) else {
+            return Err(WhisperError::Mlx(
+                "decoder forward with no input token".to_owned(),
+            ));
+        };
+        let ids = Array::from_i32_slice(ids, &[1, ids.len() as i32])
+            .map_err(|e| WhisperError::Mlx(e.to_string()))?;
+        let (logits, new_self, new_cross) = self.decoder.forward(
+            &ids,
+            self.encoder_out,
+            self.fed,
+            &self.self_kvs,
+            &self.cross_kvs,
+            self.device,
+        )?;
+        self.self_kvs = new_self;
+        self.cross_kvs = new_cross;
+        self.fed += input.len();
+        let n_vocab = self.decoder.n_vocab;
+        let row = logits.slice(
+            &[0, last as i32, 0],
+            &[1, last as i32 + 1, n_vocab as i32],
+            &[1, 1, 1],
+            self.device,
+        )?;
+        logits_to_f32(&row, n_vocab, self.device)
+    }
+}
+
+/// The decoder side of one encoded window, from [`TextDecoder::open_window`].
+#[allow(missing_debug_implementations)]
+pub(crate) struct WindowDecoder<'a> {
+    decoder: &'a TextDecoder,
+    encoder_out: &'a Array,
+    device: Device,
+    /// The cross-attention keys and values of each block for this window.
+    cross_kvs: Vec<(Array, Array)>,
+}
+
+impl WindowDecoder<'_> {
+    /// A decoder pass over the window that was fed nothing and reads the
+    /// window's cross-attention keys and values.
+    fn pass(&self) -> Result<DecoderPass<'_>, WhisperError> {
+        let cross_kvs = self
+            .cross_kvs
+            .iter()
+            .map(|(k, v)| Ok((k.try_clone()?, v.try_clone()?)))
+            .collect::<Result<Vec<_>, WhisperError>>()?;
+        Ok(DecoderPass {
+            decoder: self.decoder,
+            encoder_out: self.encoder_out,
+            device: self.device,
+            self_kvs: Vec::new(),
+            cross_kvs,
+            fed: 0,
+        })
+    }
+
+    /// Whether a decode of the window from `prefix` writes at most
+    /// `text_bound` text tokens. It ends when the text passes the bound.
+    pub(crate) fn writes_at_most(
+        &self,
+        text_bound: usize,
+        prefix: &[u32],
+        max_tokens: usize,
+        filters: &DecodeFilters,
+        pick: impl FnMut(&[f32]) -> Result<u32, WhisperError>,
+    ) -> Result<bool, WhisperError> {
+        let mut pass = self.pass()?;
+        let within = writes_at_most(
+            text_bound,
+            prefix,
+            max_tokens,
+            self.decoder.n_text_ctx,
+            filters,
+            |input: &[u32]| pass.forward(input),
+            pick,
+        )?;
+        debug!(
+            text_bound,
+            within,
+            decoder_steps = pass.fed.saturating_sub(prefix.len()) + 1,
+            "bounded window decode done"
+        );
+        Ok(within)
+    }
+
+    /// Decode the window from `prefix` (an optional previous-text prompt,
+    /// then the SOT sequence) for at most `max_tokens` tokens. `pick` chooses
+    /// each token from its filtered logit row.
+    ///
+    /// The tokens hold the timestamp tokens: the long-form chunker needs them
+    /// for segmentation. `filters` masks the special and non-speech tokens.
+    pub(crate) fn decode(
+        &self,
+        prefix: &[u32],
+        max_tokens: usize,
+        filters: &DecodeFilters,
+        pick: impl FnMut(&[f32]) -> Result<u32, WhisperError>,
+    ) -> Result<Decoded, WhisperError> {
+        let mut pass = self.pass()?;
+        let decoded = decode_loop(
+            prefix,
+            max_tokens,
+            self.decoder.n_text_ctx,
+            filters,
+            |input: &[u32]| pass.forward(input),
+            pick,
+        )?;
+        debug!(
+            n_tokens = decoded.tokens.len(),
+            stop = ?decoded.stop,
+            "window decode done"
+        );
+        Ok(decoded)
     }
 }
 
@@ -750,48 +938,6 @@ impl WhisperModel {
         })
     }
 
-    /// Detect the spoken language from encoder output.
-    ///
-    /// Runs a single SOT decoder step and returns the argmax over the 100
-    /// language tokens (`<|en|>` … `<|yue|>`, ids `TOK_EN ..= TOK_LANG_LAST`).
-    ///
-    /// Call after `encode_mel`. The returned token id can be passed directly to
-    /// `WhisperTokenizer::sot_sequence_from_tok`.
-    pub fn detect_language(
-        &self,
-        encoder_out: &Array,
-        device: Device,
-    ) -> Result<u32, WhisperError> {
-        use crate::tokenizer::TOK_SOT;
-        // Single-token SOT input → decoder forward.
-        let sot_arr = Array::from_i32_slice(&[TOK_SOT as i32], &[1, 1])
-            .map_err(|e| WhisperError::Mlx(e.to_string()))?;
-        let (logits, _, _) = self
-            .decoder
-            .forward(&sot_arr, encoder_out, 0, &[], &[], device)?;
-        // logits: [1, 1, vocab] → slice language range → argmax
-        let lang_start: i32 = TOK_EN as i32;
-        let lang_end: i32 = TOK_LANG_LAST as i32 + 1; // exclusive — 100 language tokens
-        let lang_logits =
-            logits.slice(&[0, 0, lang_start], &[1, 1, lang_end], &[1, 1, 1], device)?;
-        let best = argmax(
-            &lang_logits.reshape(&[1, lang_end - lang_start], device)?,
-            1,
-            device,
-        )?;
-        // Materialise before reading bytes — same pattern as sample_next.
-        best.eval().map_err(|e| WhisperError::Mlx(e.to_string()))?;
-        let bytes = best
-            .to_bytes()
-            .map_err(|e| WhisperError::Mlx(e.to_string()))?;
-        let idx = bytes
-            .get(..4)
-            .and_then(|b4| <[u8; 4]>::try_from(b4).ok())
-            .map(i32::from_le_bytes)
-            .ok_or_else(|| WhisperError::Mlx("language argmax is not an i32".to_owned()))?;
-        Ok((lang_start + idx) as u32)
-    }
-
     /// Encode mel frames → encoder output `[1, n_audio_ctx, n_state]`.
     ///
     /// `mel_frames`: `[T_frames][n_mels]` from `MelExtractor::extract()`.
@@ -816,128 +962,6 @@ impl WhisperModel {
         let mel = Array::from_f32_slice(&data, &[1, n_frames as i32, n_mels as i32])
             .map_err(|e| WhisperError::Mlx(e.to_string()))?;
         self.encoder.forward(&mel, device)
-    }
-
-    /// Greedy decode loop given encoder output and SOT sequence.
-    ///
-    /// `sot_sequence`: initial tokens (SOT + lang + task + no_timestamps).
-    /// `max_tokens`: cap on generated tokens.
-    /// `temperature`: accepted for API parity; `argmax_f32` ignores it, so
-    /// every value decodes as greedy argmax — no temperature-scaled softmax
-    /// path exists.
-    /// `filters`: per-step logit suppression set (`DecodeFilters`).
-    ///
-    /// Returns the full token sequence **including** any timestamp tokens — the
-    /// caller (long-form chunker) needs them for segmentation. Special / non-speech
-    /// content tokens are masked out by `filters`, never emitted.
-    #[allow(
-        clippy::explicit_counter_loop,
-        reason = "offset tracks KV-cache position starting from sot_len; not a pure iteration counter"
-    )]
-    #[allow(
-        clippy::cognitive_complexity,
-        reason = "greedy_decode is a sequential decode loop with KV-cache state; splitting would obscure the prefill→decode flow"
-    )]
-    pub fn greedy_decode(
-        &self,
-        encoder_out: &Array,
-        sot_sequence: &[u32],
-        max_tokens: usize,
-        temperature: f32,
-        filters: &DecodeFilters,
-        device: Device,
-    ) -> Result<Vec<u32>, WhisperError> {
-        let mut self_kvs: Vec<(Array, Array)> = Vec::new();
-        let mut cross_kvs: Vec<(Array, Array)> = Vec::new();
-        // Sampled tokens (the suffix after the SOT prefix) — these are what the
-        // timestamp rules and the caller operate on.
-        let mut sampled: Vec<u32> = Vec::new();
-
-        // Prefill the SOT sequence.
-        let sot_i32: Vec<i32> = sot_sequence.iter().map(|&t| t as i32).collect();
-        let sot_arr = Array::from_i32_slice(&sot_i32, &[1, sot_i32.len() as i32])
-            .map_err(|e| WhisperError::Mlx(e.to_string()))?;
-
-        let (logits, new_self, new_cross) =
-            self.decoder
-                .forward(&sot_arr, encoder_out, 0, &self_kvs, &cross_kvs, device)?;
-        self_kvs = new_self;
-        cross_kvs = new_cross;
-
-        // Pick token from last position of prefill output.
-        let sot_len = sot_sequence.len();
-        let last_logits = logits.slice(
-            &[0, sot_len as i32 - 1, 0],
-            &[1, sot_len as i32, self.cfg.n_vocab as i32],
-            &[1, 1, 1],
-            device,
-        )?;
-        let mut offset = sot_len;
-
-        // First sampled position: apply SuppressBlank (in addition to the standing
-        // suppression set + timestamp rules).
-        let mut logit_vec = logits_to_f32(&last_logits, self.cfg.n_vocab, device)?;
-        filters.apply(&mut logit_vec, &sampled, true);
-        let mut next_tok = argmax_f32(&logit_vec, temperature);
-        debug!(
-            next_tok,
-            tok_eot = TOK_EOT,
-            tok_nospeech = TOK_NOSPEECH,
-            tok_ts_begin = TOK_TIMESTAMP_BEGIN,
-            "prefill first token (after filters)"
-        );
-        if next_tok == TOK_NOSPEECH {
-            return Err(WhisperError::Silence);
-        }
-        sampled.push(next_tok);
-
-        while sampled.len() < max_tokens {
-            if next_tok == TOK_EOT {
-                break;
-            }
-            // Belt-and-suspenders: never request a positional-embedding row
-            // `>= n_text_ctx`. The next decode step would slice the positional
-            // table at `[offset, offset+1)`; once `offset == n_text_ctx` that row
-            // is off the `[n_text_ctx, n_state]` table and `forward` would abort
-            // the whole transcription. The caller already bounds `max_tokens`, but
-            // this guard makes the decode loop self-contained regardless of caller.
-            if offset >= self.cfg.n_text_ctx {
-                debug!(
-                    offset,
-                    n_text_ctx = self.cfg.n_text_ctx,
-                    "stopping decode: positional-embedding ceiling reached"
-                );
-                break;
-            }
-
-            let tok_i32 = [next_tok as i32];
-            let tok_arr = Array::from_i32_slice(&tok_i32, &[1, 1])
-                .map_err(|e| WhisperError::Mlx(e.to_string()))?;
-
-            let (step_logits, new_self, new_cross) = self.decoder.forward(
-                &tok_arr,
-                encoder_out,
-                offset,
-                &self_kvs,
-                &cross_kvs,
-                device,
-            )?;
-            self_kvs = new_self;
-            cross_kvs = new_cross;
-            offset += 1;
-
-            let mut lv = logits_to_f32(&step_logits, self.cfg.n_vocab, device)?;
-            filters.apply(&mut lv, &sampled, false);
-            next_tok = argmax_f32(&lv, temperature);
-            sampled.push(next_tok);
-        }
-
-        // Drop trailing EOT — it is a stop marker, not content.
-        while sampled.last() == Some(&TOK_EOT) {
-            sampled.pop();
-        }
-        debug!(n_tokens = sampled.len(), "greedy decode done");
-        Ok(sampled)
     }
 }
 
@@ -1120,24 +1144,7 @@ fn logits_to_f32(logits: &Array, n_vocab: usize, device: Device) -> Result<Vec<f
     Ok(out)
 }
 
-/// Greedy argmax over a host f32 logit vector.
-///
-/// `temperature` is accepted for parity with the API; at temp == 0 (the only
-/// deterministic mode rMLX serves) this is a plain argmax. Temperature scaling
-/// changes the softmax distribution but not the argmax, so for greedy decode the
-/// result is identical — we keep the param to avoid an API break and document
-/// that sampling (temp > 0) is not yet a stochastic path.
-fn argmax_f32(logits: &[f32], _temperature: f32) -> u32 {
-    let mut best_idx = 0usize;
-    let mut best_val = f32::NEG_INFINITY;
-    for (i, &v) in logits.iter().enumerate() {
-        if v > best_val {
-            best_val = v;
-            best_idx = i;
-        }
-    }
-    best_idx as u32
-}
+pub(crate) mod decode_loop;
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

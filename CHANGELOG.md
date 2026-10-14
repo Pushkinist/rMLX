@@ -26,6 +26,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Whisper no longer writes text for a window with no speech, and decodes a
+  weak window again.** A window of silence, noise or a tone gave a stock
+  phrase (`you`, `Thank you.`), and after speech it gave an invented sentence.
+  Before a window is decoded, rMLX now reads the no-speech probability from
+  the start token with no previous-text prompt before it. It skips the window
+  when that probability is above 0.6 and the greedy decode of the window
+  with no prompt writes at most 8 text tokens: no segment, and the seek moves
+  by the whole window. The rule of openai-whisper (the probability behind the
+  prompt, and a low average log-probability too) skipped none of 15 such
+  windows on large-v3, so rMLX differs on purpose (`docs/AUDIO.md`,
+  "No-speech gate"). A window of speech above 0.6 that the model itself
+  decodes into no more than 8 text tokens is dropped: 30 s of one repeated
+  word is such a window, and the reply loses the one word that the model
+  writes for it. Each decode
+  now keeps its average log-probability. A decode whose text is a repetition
+  loop, or whose average is below -1.0, is decoded again up a temperature
+  ladder: the request `temperature`, then steps of 0.2 up to 1.0. Behaviour
+  change: `temperature` on the transcription routes had no effect and is now
+  the first step of that ladder, and the `temperature` of a `verbose_json`
+  segment is that of the decode its window kept, not always 0. A decode
+  above 0 draws from the shared sampler with one seeded generator for each
+  request, so a repeated request gives the same text. With `language` absent,
+  the language is now that of the first window that is not skipped. A
+  `temperature` above 0 and below `1e-6` is now 422. A request at temperature
+  0 gives the same tokens as before on audio with no silent window, no weak
+  window and no window that is still a loop when it is decoded without the
+  prompt (such a window now goes up the ladder).
+
+- **A Whisper segment no longer ends after the end of the audio.** In a short
+  last window the decoder can close a segment in the zero pad: a segment of a
+  112.05 s clip ended at 112.68 s. The start and the end of a segment are now
+  bounded by the duration of the file, and a segment that opens at or after
+  the end of the real audio is not in the reply; before, only a segment that
+  opened more than 0.5 s after it was dropped. The seek does not change.
+
 - **The transcription routes state their limits instead of passing them
   silently.** A file over 25 MiB, or a request body over 26 MiB, is now 413
   and names the cap and the size (it was 422, and over 26 MiB the cap was not
@@ -124,7 +159,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   repetition penalty. A sampling field of the wrong JSON type is now refused.
   A `temperature` or a `repetition_penalty` out of bounds is 400:
   `temperature` is 0 or in `[1e-6, 2]`, and `repetition_penalty` is finite
-  and at least `1e-6` (`docs/AUDIO.md`, "Sampling"). An empty `input` is 400;
+  and at least `1e-6` (`docs/AUDIO_TTS.md`, "Sampling"). An empty `input` is 400;
   before, it was 500. The 422 of an unknown voice and every 500 of the route
   are now `{"error":{"message","type"}}`. A 500 has a fixed message: the
   cause, which named a local path before, is in the server log. The 422 no
@@ -180,7 +215,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Seven fixed requests of 49 to 105 frames give the same WAV bytes as before.
   Behaviour change: the audio of a request longer than 300 frames can differ
   from the one-pass audio after the first window join, as in the reference
-  (`docs/AUDIO.md`, "Codec decoder"); its sample count does not change.
+  (`docs/AUDIO_TTS.md`, "Codec decoder"); its sample count does not change.
 - **`completion_tokens` is the number of generated tokens.** The engine ends
   every generation with a terminal item that is no token, and the server
   counted it. A reply that ended on `max_tokens` reported `max_tokens + 1`,

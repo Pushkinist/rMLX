@@ -3,7 +3,7 @@
 use super::{plan_window, walk_windows, window_segments, RawSegment, SeekRule, WalkEnd};
 use crate::mel::HOP_LENGTH;
 use crate::tokenizer::TOK_TIMESTAMP_BEGIN;
-use crate::transcribe::WindowDecode;
+use crate::transcribe::fallback::{Attempt, Verdict};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 // ── Window plan: segments and seek advance from a window's sampled tokens ────
@@ -19,8 +19,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 //     the unfinished segment and seeks to the end of the last closed segment;
 //   - a stream with no timestamp pair is one segment that starts at the window
 //     start (not at its first timestamp) and consumes the whole real window.
-// Not part of the reference: a segment that opens more than 0.5 s past the end
-// of a short window is dropped (see `segment_opening_past_the_real_audio_is_dropped`).
+// Not part of the reference: the reply has no segment that opens at or after
+// the end of the real audio (see "Segment times against the real audio").
 
 const SAMPLES_PER_WINDOW: usize = 480_000;
 const A: u32 = 1_000;
@@ -30,10 +30,11 @@ fn ts(secs: f32) -> u32 {
     TOK_TIMESTAMP_BEGIN + (secs / 0.02).round() as u32
 }
 
+/// A segment from `start` to `end`, in seconds from the window start.
 fn seg(start: f32, end: f32, tokens: &[u32]) -> RawSegment {
     RawSegment {
-        start,
-        end,
+        start_samples: (start * 16_000.0).round() as usize,
+        end_samples: (end * 16_000.0).round() as usize,
         tokens: tokens.to_vec(),
     }
 }
@@ -58,7 +59,8 @@ fn assert_plan(
     );
     for (got, want) in plan.segments.iter().zip(want_segments) {
         assert!(
-            (got.start - want.start).abs() < 1e-3 && (got.end - want.end).abs() < 1e-3,
+            got.start_samples.abs_diff(want.start_samples) <= 16
+                && got.end_samples.abs_diff(want.end_samples) <= 16,
             "segment times: got {got:?}, want {want:?}"
         );
         let text: Vec<u32> = got
@@ -276,51 +278,6 @@ fn single_segment_starts_at_the_window_start() {
     );
 }
 
-/// Not part of the reference rule: a segment that opens more than 0.5 s past
-/// the real end of a short window sits in the zero-pad tail and is dropped, to
-/// stop filler there. A segment that opens inside that margin is kept.
-#[test]
-fn segment_opening_past_the_real_audio_is_dropped() {
-    assert_plan(
-        &[ts(0.0), A, ts(0.5), ts(2.0), B, ts(2.5)],
-        16_000,
-        &[seg(0.0, 0.5, &[A])],
-        16_000,
-    );
-    assert_plan(
-        &[ts(0.0), A, ts(0.5), ts(1.4), B, ts(1.6)],
-        16_000,
-        &[seg(0.0, 0.5, &[A]), seg(1.4, 1.6, &[B])],
-        16_000,
-    );
-}
-
-/// The margin is exactly 0.5 s: a segment opening at the real end plus 0.5 s is
-/// kept, one step later is dropped.
-#[test]
-fn pad_tail_guard_margin_is_half_a_second() {
-    assert_plan(
-        &[ts(0.0), A, ts(0.5), ts(1.5), B, ts(1.8)],
-        16_000,
-        &[seg(0.0, 0.5, &[A]), seg(1.5, 1.8, &[B])],
-        16_000,
-    );
-    assert_plan(
-        &[ts(0.0), A, ts(0.5), ts(1.52), B, ts(1.8)],
-        16_000,
-        &[seg(0.0, 0.5, &[A])],
-        16_000,
-    );
-    // 16,100 is not a multiple of 320: the limit is 24,100 samples, and a start
-    // at 1.52 s is 24,320.
-    assert_plan(
-        &[ts(0.0), A, ts(0.5), ts(1.52), B, ts(1.8)],
-        16_100,
-        &[seg(0.0, 0.5, &[A])],
-        16_100,
-    );
-}
-
 /// With a timestamp pair, the first segment starts at its own first timestamp
 /// (the reference takes `sliced_tokens[0]`), not at the window start.
 #[test]
@@ -376,6 +333,172 @@ fn plan_names_the_seek_rule() {
     );
     assert_eq!(rule(&[A, B]), SeekRule::NoPair);
     assert_eq!(rule(&[ts(0.0), ts(0.0)]), SeekRule::ZeroFallback);
+}
+
+// ── Segment times against the real audio ─────────────────────────────────────
+//
+// The decoder can close a segment after the real end of a short window: the
+// timestamp is in the zero pad. A short window is the last window of a file,
+// so the real end of its audio is the end of the file. openai-whisper does
+// not bound the timestamp (`transcribe.py#L361-L362` and `#L379-L394` at the
+// commit above give a segment `time_offset` plus the timestamp), so its
+// segment can end after the audio. Here no segment of a reply starts or ends
+// after the duration of the file, and a segment that is left with no length
+// is not in the reply.
+
+/// A tail window of 3.37 s that starts at 108.68 s of a file of 112.05 s.
+const TAIL_SEEK: usize = 1_738_880;
+const TAIL_SAMPLES: usize = 53_920;
+
+fn accepted() -> Attempt {
+    Attempt {
+        temperature: 0.0,
+        with_prompt: true,
+        compression_ratio: 1.0,
+        avg_logprob: -0.3,
+        verdict: Verdict::Accepted,
+    }
+}
+
+/// The duration of a file that ends with the window, and the start and the
+/// end of each segment that the reply has for the window's `tokens`.
+fn reply(tokens: &[u32], seek: usize, window_samples: usize) -> (f32, Vec<(f32, f32)>) {
+    let duration = (seek + window_samples) as f32 / 16_000.0;
+    let plan = plan_window(tokens, window_samples);
+    let total_samples = seek + window_samples;
+    let segments = window_segments(&plan.segments, seek, total_samples, &accepted(), |_| {
+        "text".to_owned()
+    });
+    let times = segments.iter().map(|s| (s.start, s.end)).collect();
+    (duration, times)
+}
+
+/// A closing timestamp of 4.00 s in a tail window of 3.37 s ends the segment
+/// at the duration of the file, with a timestamp pair and with none. The seek
+/// advance is the whole window, as before.
+#[test]
+#[allow(clippy::float_cmp, reason = "the bound is exact")]
+fn a_closing_timestamp_after_the_real_audio_ends_the_segment_with_the_file() {
+    let no_pair = [ts(0.0), A, ts(4.0)];
+    let pair = [ts(0.0), A, ts(2.0), ts(2.0), B, ts(4.0)];
+    for (tokens, segments) in [(&no_pair[..], 1), (&pair[..], 2)] {
+        let (duration, times) = reply(tokens, TAIL_SEEK, TAIL_SAMPLES);
+        assert_eq!(times.len(), segments, "{times:?}");
+        assert_eq!(times.last().map(|t| t.1), Some(duration), "{times:?}");
+        assert!(times.iter().all(|(start, end)| start < end), "{times:?}");
+        assert_eq!(
+            plan_window(tokens, TAIL_SAMPLES).advance_samples,
+            TAIL_SAMPLES
+        );
+    }
+}
+
+/// A segment that opens exactly at the end of the real audio is not in the
+/// reply, for each timestamp at which a tail window can end and at two seek
+/// positions: the opening timestamp and the end of the file are the same
+/// sample. A sum of seconds in `f32` can put that start one step before the
+/// duration and keep a segment whose two times print the same millisecond.
+#[test]
+fn a_segment_that_opens_at_the_end_of_the_real_audio_is_not_in_the_reply() {
+    let at_the_end = [ts(0.0), A, ts(0.3), ts(0.3), B, ts(1.0)];
+    assert_eq!(reply(&at_the_end, 0, 4_800).1.len(), 1);
+
+    for seek in [0, 1_738_880] {
+        for tick in 1..=1_500_u32 {
+            let opens = TOK_TIMESTAMP_BEGIN + tick;
+            let tokens = [ts(0.0), A, opens, opens, B, opens + 35];
+            let window_samples = tick as usize * 320;
+            let (duration, times) = reply(&tokens, seek, window_samples);
+            assert_eq!(times.len(), 1, "seek {seek}, tick {tick}: {times:?}");
+            assert!(
+                times
+                    .iter()
+                    .all(|(start, end)| start < end && *end <= duration),
+                "seek {seek}, tick {tick}: {times:?} in {duration} s"
+            );
+        }
+    }
+}
+
+/// Three hours into a file, one sample is less than one step of `f32`
+/// seconds. A segment that opens one sample before the end of the file has
+/// two equal times; it is not in the reply, and each segment that is in it
+/// starts before it ends.
+#[test]
+fn a_segment_shorter_than_one_step_of_seconds_is_not_in_the_reply() {
+    let three_hours = 3 * 3_600 * 16_000;
+    for tick in 1..=1_500_u32 {
+        let opens = TOK_TIMESTAMP_BEGIN + tick;
+        let tokens = [ts(0.0), A, opens, opens, B, opens + 35];
+        let (duration, times) = reply(&tokens, three_hours, tick as usize * 320 + 1);
+        assert_eq!(times.len(), 1, "tick {tick}: {times:?}");
+        assert!(
+            times
+                .iter()
+                .all(|(start, end)| start < end && *end <= duration),
+            "tick {tick}: {times:?} in {duration} s"
+        );
+    }
+}
+
+/// A segment that opens after the real audio is not in the reply: its text is
+/// from the zero pad. This holds a little after the real end and far after
+/// it. The seek
+/// reads the tokens, not the reply: the advance is the whole window, and the
+/// end of the last closed segment is still the uncut timestamp.
+#[test]
+#[allow(clippy::float_cmp, reason = "the bound is exact")]
+fn a_segment_that_opens_after_the_real_audio_is_not_in_the_reply() {
+    for opens in [3.6, 3.9, 3.38] {
+        let tokens = [ts(0.0), A, ts(opens), ts(opens), B, ts(4.0)];
+        let (duration, times) = reply(&tokens, TAIL_SEEK, TAIL_SAMPLES);
+        assert_eq!(times.len(), 1, "opens at {opens}: {times:?}");
+        assert_eq!(times[0].1, duration, "opens at {opens}");
+        assert_eq!(
+            plan_window(&tokens, TAIL_SAMPLES).advance_samples,
+            TAIL_SAMPLES
+        );
+    }
+
+    let closed_late = [ts(0.0), A, ts(4.0), ts(4.0), B];
+    let plan = plan_window(&closed_late, TAIL_SAMPLES);
+    assert_eq!(
+        plan.rule,
+        SeekRule::LastClosed {
+            end_samples: 64_000
+        }
+    );
+    assert_eq!(plan.advance_samples, TAIL_SAMPLES);
+    let (duration, times) = reply(&closed_late, TAIL_SEEK, TAIL_SAMPLES);
+    assert_eq!(times.len(), 1);
+    assert_eq!(times[0].1, duration);
+}
+
+/// No segment of a reply starts or ends after the duration of the file, with
+/// no tolerance. The window start and a time in the window are added in
+/// `f32`, and for some windows that sum is above the duration of the file:
+/// the inputs here hold such windows.
+#[test]
+fn no_segment_of_a_reply_ends_after_the_duration_of_the_file() {
+    let mut sums_above_the_duration = 0;
+    for seek in (0..40).map(|k| 480_000 * k + 7_919 * (k % 5)) {
+        for window_samples in (1..60).map(|k| 160 + 7_993 * k) {
+            let (duration, times) = reply(&[ts(0.0), A], seek, window_samples);
+            let sum = seek as f32 / 16_000.0 + window_samples as f32 / 16_000.0;
+            sums_above_the_duration += usize::from(sum > duration);
+            assert_eq!(times.len(), 1);
+            for (start, end) in times {
+                assert!(
+                    start < end && end <= duration,
+                    "{start} to {end} in a file of {duration} s (seek {seek}, window {window_samples})"
+                );
+            }
+        }
+    }
+    assert!(
+        sums_above_the_duration > 0,
+        "no input rounds above the duration"
+    );
 }
 
 // ── Window walk: which windows are opened, from scripted token streams ───────
@@ -563,27 +686,14 @@ fn an_hour_of_windows_tiles_the_audio_and_ends() {
 /// A window that starts at 30 s (sample 480000, mel frame 3000): each segment
 /// time is 30 s plus its time in the window, the text is decoded from the
 /// text tokens only and trimmed, a segment with blank text is dropped, and
-/// each kept segment carries the window's frame, its own slice and the
-/// compression ratio of the decode the window kept: on a retry, the retry's,
-/// not the first decode's.
+/// each kept segment carries the window's frame, its own slice, and the
+/// temperature and the compression ratio of the decode the window kept.
 #[test]
 fn window_segments_are_offset_by_the_window_start() {
     let raw = [
-        RawSegment {
-            start: 0.0,
-            end: 2.28,
-            tokens: vec![ts(0.0), 1, ts(2.28)],
-        },
-        RawSegment {
-            start: 2.66,
-            end: 5.32,
-            tokens: vec![ts(2.66), 2, ts(5.32)],
-        },
-        RawSegment {
-            start: 6.0,
-            end: 7.0,
-            tokens: vec![ts(6.0), 3, ts(7.0)],
-        },
+        seg(0.0, 2.28, &[ts(0.0), 1, ts(2.28)]),
+        seg(2.66, 5.32, &[ts(2.66), 2, ts(5.32)]),
+        seg(6.0, 7.0, &[ts(6.0), 3, ts(7.0)]),
     ];
     let text = |tokens: &[u32]| match tokens {
         [1] => " First sentence. ".to_owned(),
@@ -591,17 +701,18 @@ fn window_segments_are_offset_by_the_window_start() {
         [3] => "  ".to_owned(),
         other => panic!("decoded tokens other than one segment's text: {other:?}"),
     };
-    let retried = WindowDecode {
-        tokens: Vec::new(),
-        carry_text: true,
-        ratio: 2.9,
-        kept_ratio: 1.25,
-        retried: true,
+    let kept = Attempt {
+        temperature: 0.4,
+        with_prompt: false,
+        compression_ratio: 1.25,
+        avg_logprob: -0.3,
+        verdict: Verdict::Accepted,
     };
-    let segments = window_segments(&raw, 480_000, &retried, text);
+    let segments = window_segments(&raw, 480_000, 960_000, &kept, text);
     for (segment, raw) in segments.iter().zip(&raw) {
         assert_eq!(segment.seek, 3000);
         assert_eq!(segment.tokens, raw.tokens);
+        assert!((segment.temperature - 0.4).abs() < f32::EPSILON);
         assert!((segment.compression_ratio - 1.25).abs() < f32::EPSILON);
     }
     let got: Vec<(f32, f32, &str)> = segments

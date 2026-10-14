@@ -8,33 +8,45 @@
 //!    see [`crate::wav::WavDecoder::decode_resampled`]).
 //! 2. Walk the audio in 30 s windows. For each window, run the decoder in
 //!    **timestamp mode** with the full [`crate::whisper::DecodeFilters`] chain.
+//!    A window is skipped when its no-speech probability is above 0.6 and
+//!    its greedy decode with no prompt writes no more than a stock phrase
+//!    (`fallback`). A decode that is a repetition loop or has a low average
+//!    log-probability is decoded again, up a temperature ladder (`fallback`).
 //! 3. Parse the emitted timestamp tokens into segments with real cumulative
 //!    times. Consume the whole window when the tokens end in a single
 //!    timestamp; otherwise seek to the end of the last closed segment. Feed the
-//!    previous window's text back as a prompt (`<|startofprev|>`). No
-//!    temperature fallback: a window that loops gets one greedy retry without
-//!    the prompt.
+//!    previous window's text back as a prompt (`<|startofprev|>`).
 //! 4. Emit multi-segment output (`vtt` / `srt` / `json` / `txt`).
 //!
-//! Determinism: temperature is fixed at 0 (greedy argmax), so the same audio
-//! produces byte-identical output across runs.
+//! Determinism: the caller supplies the token pick ([`RowPick`]). A pick that
+//! draws from one seeded generator for each request gives the same output for
+//! the same audio on every run, also when a fallback above temperature 0 ran.
 
+use std::cell::RefCell;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use rmlx_mlx::Device;
 use tracing::{debug, info, warn};
 
-use crate::mel::{MelExtractor, N_SAMPLES, SAMPLE_RATE};
+use crate::mel::{MelExtractor, SAMPLE_RATE};
 use crate::tokenizer::{
     language_name, language_token, WhisperTask, WhisperTokenizer, TOK_EOT, TOK_SOT_PREV,
     TOK_TIMESTAMP_BEGIN,
 };
 use crate::whisper::{DecodeFilters, WhisperError, WhisperModel};
 
+mod fallback;
 mod seek;
 
+use fallback::{decode_with_fallback, WindowOutcome};
 use seek::{plan_window, walk_windows, window_segments, SeekRule, WalkEnd};
+
+/// Chooses one token id from a filtered logit row at a temperature: the
+/// largest logit at 0, a draw from `softmax(row / temperature)` above it. A
+/// masked id has the logit `-inf`. One pick serves every window of a request,
+/// so its generator is seeded once for the request.
+pub type RowPick<'a> = &'a mut dyn FnMut(&[f32], f32) -> rmlx_core::error::Result<u32>;
 
 /// Compression ratio above which a window's text is a repetition loop
 /// (openai-whisper's `compression_ratio_threshold`).
@@ -81,6 +93,9 @@ pub struct Segment {
     pub text: String,
     /// The segment's slice of the window's tokens, its timestamps included.
     pub tokens: Vec<u32>,
+    /// Temperature of the window's kept decode: above the request temperature
+    /// when a fallback ran. Every segment of a window has the same.
+    pub temperature: f32,
     /// Compression ratio of the window's kept decode: every segment of a
     /// window has the same, as in openai-whisper.
     pub compression_ratio: f32,
@@ -110,7 +125,9 @@ pub struct TranscribeOptions {
     pub language: String,
     /// Transcribe (same language) or translate (force English).
     pub task: WhisperTask,
-    /// Sampling temperature. 0 = deterministic greedy (the only supported path).
+    /// Temperature of the first decode of each window. A decode that is a
+    /// repetition loop or is weak is decoded again at this value plus 0.2,
+    /// and so on up to 1.0; a value above 1.0 gives one decode.
     pub temperature: f32,
     /// Feed the previous window's text back as a decoder prompt.
     pub condition_on_previous_text: bool,
@@ -177,9 +194,10 @@ impl Transcriber {
 
     /// Transcribe a full 16 kHz mono f32 waveform of any length.
     ///
-    /// `cancel` is read before each 30 s window. Once it is set, no further
-    /// window opens and the call returns [`WhisperError::Cancelled`]; a flag
-    /// that is never set runs the whole audio.
+    /// `pick` chooses every token of the request. `cancel` is read before each
+    /// 30 s window. Once it is set, no further window opens and the call
+    /// returns [`WhisperError::Cancelled`]; a flag that is never set runs the
+    /// whole audio.
     #[allow(
         clippy::too_many_lines,
         reason = "the seek loop + segment accumulation is one cohesive long-form pass"
@@ -188,133 +206,154 @@ impl Transcriber {
         &self,
         samples: &[f32],
         opts: &TranscribeOptions,
+        pick: RowPick<'_>,
         device: Device,
         cancel: &AtomicBool,
     ) -> Result<Transcription, WhisperError> {
         let total_samples = samples.len();
         let duration = total_samples as f32 / SAMPLE_RATE as f32;
 
-        // A named language is known now; `auto` is detected on the first window.
+        // A named language is known now; `auto` is detected on the first
+        // window that is decoded.
         let mut resolved_lang = requested_language(&opts.language)?;
 
         let mut segments: Vec<Segment> = Vec::new();
         let mut prompt_tokens: Vec<u32> = Vec::new();
+        let mut skipped_windows = 0_usize;
 
         let filters = DecodeFilters::new(self.suppress.clone(), self.blank_ids.clone(), true);
 
-        let end = walk_windows(total_samples, cancel, |seek, window_samples| {
-            #[allow(
-                clippy::indexing_slicing,
-                reason = "walk_windows yields seek + window_samples <= total_samples"
-            )]
-            let window = &samples[seek..seek + window_samples];
-            let window_start_time = seek as f32 / SAMPLE_RATE as f32;
-            // Real audio length of this (un-padded) window, in seconds.
-            let window_dur = window_samples as f32 / SAMPLE_RATE as f32;
+        let end = walk_windows(
+            total_samples,
+            cancel,
+            |seek, window_samples| -> Result<usize, WhisperError> {
+                #[allow(
+                    clippy::indexing_slicing,
+                    reason = "walk_windows yields seek + window_samples <= total_samples"
+                )]
+                let window = &samples[seek..seek + window_samples];
+                let window_start_time = seek as f32 / SAMPLE_RATE as f32;
+                // Real audio length of this (un-padded) window, in seconds.
+                let window_dur = window_samples as f32 / SAMPLE_RATE as f32;
+                let projected_before = self.model.decoder.cross_projections();
 
-            // mel + encode (mel pads to 30 s internally).
-            let mel_frames = self
-                .extractor
-                .extract(window)
-                .map_err(|e| WhisperError::Mlx(format!("mel: {e}")))?;
-            let encoder_out = self.model.encode_mel(&mel_frames, device)?;
+                // mel + encode (mel pads to 30 s internally).
+                let mel_frames = self
+                    .extractor
+                    .extract(window)
+                    .map_err(|e| WhisperError::Mlx(format!("mel: {e}")))?;
+                let encoder_out = self.model.encode_mel(&mel_frames, device)?;
 
-            let lang_tok = resolve_language(&mut resolved_lang, || {
-                self.model.detect_language(&encoder_out, device)
-            })?;
+                let (start, opened) = self.model.decoder.open_window(&encoder_out, device)?;
+                // The language of the file is that of the first window that is
+                // decoded: the bounded decode of the gate reads the language of
+                // the window and does not store it.
+                let window_lang = resolved_lang.unwrap_or(start.language);
+                // Timestamp mode: no <|notimestamps|> in the SOT sequence.
+                let sot = self
+                    .tokenizer
+                    .sot_sequence_from_tok(window_lang, opts.task, true);
+                let n_text_ctx = self.model.cfg.n_text_ctx;
+                // The two closures of the window pick in turn, never at once.
+                let pick = RefCell::new(&mut *pick);
+                let prompt: &[u32] = if opts.condition_on_previous_text {
+                    &prompt_tokens
+                } else {
+                    &[]
+                };
+                // The greedy decode with no prompt, until its text passes the bound.
+                let writes_at_most = |text_bound: usize| {
+                    let max_tokens = window_token_budget(n_text_ctx, sot.len());
+                    opened.writes_at_most(
+                        text_bound,
+                        &sot,
+                        max_tokens,
+                        &filters,
+                        |row: &[f32]| (pick.borrow_mut())(row, 0.0).map_err(WhisperError::from),
+                    )
+                };
+                let decode = |prompt: &[u32], temperature: f32| {
+                    resolve_language(&mut resolved_lang, start.language);
+                    let mut full_prefix: Vec<u32> = Vec::new();
+                    if !prompt.is_empty() {
+                        full_prefix.push(TOK_SOT_PREV);
+                        full_prefix.extend(prompt.iter().copied());
+                    }
+                    full_prefix.extend(sot.iter().copied());
 
-            // Build the SOT sequence (timestamp mode → no <|notimestamps|>), with
-            // optional previous-text prompt.
-            let sot = self
-                .tokenizer
-                .sot_sequence_from_tok(lang_tok, opts.task, true);
-            let prompt: &[u32] = if opts.condition_on_previous_text {
-                &prompt_tokens
-            } else {
-                &[]
-            };
-            let decode = |prompt: &[u32]| {
-                let mut full_prefix: Vec<u32> = Vec::new();
-                if !prompt.is_empty() {
-                    full_prefix.push(TOK_SOT_PREV);
-                    full_prefix.extend(prompt.iter().copied());
-                }
-                full_prefix.extend(sot.iter().copied());
+                    // Bounded so the decoder position stays `< n_text_ctx`.
+                    let max_tokens = window_token_budget(n_text_ctx, full_prefix.len());
+                    opened.decode(&full_prefix, max_tokens, &filters, |row: &[f32]| {
+                        (pick.borrow_mut())(row, temperature).map_err(WhisperError::from)
+                    })
+                };
+                let text_of = |tokens: &[u32]| {
+                    let text: Vec<u32> = tokens
+                        .iter()
+                        .copied()
+                        .filter(|&t| t < TOK_TIMESTAMP_BEGIN)
+                        .collect();
+                    self.tokenizer.decode(&text).unwrap_or_default()
+                };
 
-                // Per-window generation budget, derived from `n_text_ctx` at runtime
-                // (no fixed literal); bounded so the decoder position stays `< n_text_ctx`.
-                // greedy_decode additionally refuses any positional row `>= n_text_ctx`
-                // as a belt-and-suspenders guard.
-                let max_tokens = window_token_budget(self.model.cfg.n_text_ctx, full_prefix.len());
-                self.model.greedy_decode(
-                    &encoder_out,
-                    &full_prefix,
-                    max_tokens,
+                let outcome = decode_with_fallback(
+                    start.no_speech_prob,
+                    writes_at_most,
+                    prompt,
                     opts.temperature,
-                    &filters,
-                    device,
-                )
-            };
-            let text_of = |tokens: &[u32]| {
-                let text: Vec<u32> = tokens
-                    .iter()
-                    .copied()
-                    .filter(|&t| t < TOK_TIMESTAMP_BEGIN)
-                    .collect();
-                self.tokenizer.decode(&text).unwrap_or_default()
-            };
+                    decode,
+                    text_of,
+                )?;
+                outcome.log(seek, start.no_speech_prob);
+                skipped_windows += usize::from(outcome.skipped);
 
-            let decoded = match decode_window(prompt, decode, text_of) {
-                Ok(d) => d,
-                Err(WhisperError::Silence) => {
-                    // Whole window is silence — skip ahead a full window.
-                    return Ok(N_SAMPLES);
+                let plan = plan_window(&outcome.tokens, window_samples);
+                if plan.rule == SeekRule::ZeroFallback {
+                    warn!(
+                        seek,
+                        window_samples,
+                        "last closed segment ends at the window start; consuming the whole window"
+                    );
                 }
-                Err(e) => return Err(e),
-            };
-            decoded.log(seek, window_start_time);
-            let tokens = &decoded.tokens;
+                let window_segments = outcome.kept().map_or_else(Vec::new, |kept| {
+                    window_segments(&plan.segments, seek, total_samples, kept, |tokens| {
+                        self.tokenizer.decode(tokens).unwrap_or_default()
+                    })
+                });
 
-            let plan = plan_window(tokens, window_samples);
-            if plan.rule == SeekRule::ZeroFallback {
-                warn!(
+                debug!(
                     seek,
-                    window_samples,
-                    "last closed segment ends at the window start; consuming the whole window"
+                    window_start_time,
+                    window_dur,
+                    no_speech_prob = start.no_speech_prob,
+                    skipped = outcome.skipped,
+                    decodes = outcome.attempts.len(),
+                    cross_projections = self.model.decoder.cross_projections() - projected_before,
+                    n_tokens = outcome.tokens.len(),
+                    n_segments = window_segments.len(),
+                    seek_rule = ?plan.rule,
+                    advance_samples = plan.advance_samples,
+                    "long-form window done"
                 );
-            }
-            let window_segments = window_segments(&plan.segments, seek, &decoded, |tokens| {
-                self.tokenizer.decode(tokens).unwrap_or_default()
-            });
 
-            debug!(
-                seek,
-                window_start_time,
-                window_dur,
-                n_tokens = tokens.len(),
-                n_segments = window_segments.len(),
-                seek_rule = ?plan.rule,
-                advance_samples = plan.advance_samples,
-                "long-form window done"
-            );
+                let window_text: String = window_segments
+                    .iter()
+                    .map(|s| s.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                prompt_tokens = next_prompt(
+                    std::mem::take(&mut prompt_tokens),
+                    &outcome,
+                    opts.condition_on_previous_text,
+                    &window_text,
+                    |text| self.tokenizer.encode(text).unwrap_or_default(),
+                    previous_text_cap(self.model.cfg.n_text_ctx),
+                );
 
-            let window_text: String = window_segments
-                .iter()
-                .map(|s| s.text.as_str())
-                .collect::<Vec<_>>()
-                .join(" ");
-            prompt_tokens = next_prompt(
-                std::mem::take(&mut prompt_tokens),
-                decoded.carry_text,
-                opts.condition_on_previous_text,
-                &window_text,
-                |text| self.tokenizer.encode(text).unwrap_or_default(),
-                previous_text_cap(self.model.cfg.n_text_ctx),
-            );
-
-            segments.extend(window_segments);
-            Ok(plan.advance_samples)
-        })?;
+                segments.extend(window_segments);
+                Ok(plan.advance_samples)
+            },
+        )?;
         if let WalkEnd::Cancelled { window, seek } = end {
             info!(
                 window,
@@ -336,7 +375,7 @@ impl Transcriber {
             .collect::<Vec<_>>()
             .join(" ");
 
-        let language = reported_language(resolved_lang).to_owned();
+        let language = reported_language(resolved_lang, skipped_windows).to_owned();
 
         info!(
             n_segments = segments.len(),
@@ -363,129 +402,50 @@ pub fn requested_language(language: &str) -> Result<Option<u32>, WhisperError> {
         .ok_or_else(|| WhisperError::UnknownLanguage(language.to_owned()))
 }
 
-/// The language token of a window. `resolved` holds the token of an earlier
-/// window or of a named language; otherwise `detect` runs once and its token
-/// is stored, so the first window decides the language of the whole file.
-fn resolve_language(
-    resolved: &mut Option<u32>,
-    detect: impl FnOnce() -> Result<u32, WhisperError>,
-) -> Result<u32, WhisperError> {
-    if let Some(token) = *resolved {
-        return Ok(token);
-    }
-    let token = detect()?;
-    debug!(lang_tok = token, "language detected");
-    *resolved = Some(token);
-    Ok(token)
+/// The language token of a window that is decoded. `resolved` holds the token
+/// of a named language or of an earlier decoded window; otherwise `detected`,
+/// the language of this window, is stored. So the first window that is
+/// decoded gives the language of the whole file.
+fn resolve_language(resolved: &mut Option<u32>, detected: u32) -> u32 {
+    *resolved.get_or_insert_with(|| {
+        debug!(lang_tok = detected, "language detected");
+        detected
+    })
 }
 
-/// The language a transcription reports for the token its decode used. No
-/// window ran when there is no token: the audio is shorter than one mel hop.
-fn reported_language(token: Option<u32>) -> &'static str {
+/// The language a transcription reports for the token its decode used. With
+/// no token, no window was decoded: each window was skipped
+/// (`skipped_windows` is their count), or the audio is shorter than one mel
+/// hop and no window opened.
+fn reported_language(token: Option<u32>, skipped_windows: usize) -> &'static str {
     token.and_then(language_name).unwrap_or_else(|| {
-        warn!("no window ran, so no language was detected; reporting english");
+        if skipped_windows > 0 {
+            debug!(
+                skipped_windows,
+                "no window was decoded, so no language was detected; reporting english"
+            );
+        } else {
+            warn!("no window was decoded, so no language was detected; reporting english");
+        }
         "english"
     })
 }
 
-/// The tokens kept for one window, and whether their text may prompt the next
-/// window.
-#[derive(Debug, Clone, PartialEq)]
-struct WindowDecode {
-    tokens: Vec<u32>,
-    carry_text: bool,
-    /// Compression ratio of the first decode's text.
-    ratio: f32,
-    /// Compression ratio of the kept tokens' text.
-    kept_ratio: f32,
-    /// A second decode without the prompt ran.
-    retried: bool,
-}
-
-impl WindowDecode {
-    /// Record a repetition loop of the window that starts at sample `seek`.
-    fn log(&self, seek: usize, window_start_time: f32) {
-        if !self.carry_text {
-            warn!(
-                seek,
-                window_start_time,
-                ratio = self.ratio,
-                kept_ratio = self.kept_ratio,
-                retried = self.retried,
-                "repetition loop kept in the transcript; it does not prompt the next window"
-            );
-        } else if self.retried {
-            debug!(
-                seek,
-                window_start_time,
-                ratio = self.ratio,
-                kept_ratio = self.kept_ratio,
-                "repetition loop under the prompt; decoded again without it"
-            );
-        }
-    }
-}
-
-/// Decode one window. `decode(prompt)` runs the decoder with that previous-text
-/// prompt (empty for none); `text_of` gives the text of a token stream.
-///
-/// A decode whose text is a repetition loop under a prompt is decoded again
-/// with no prompt, as whisper.cpp does for its fallbacks at temperature 0.5 and
-/// above: greedy decode has no temperature fallback here, and a looping prompt
-/// makes the next window loop too. Of two looping decodes, the one with the
-/// lower ratio is kept; it does not prompt the next window.
-fn decode_window<E>(
-    prompt: &[u32],
-    mut decode: impl FnMut(&[u32]) -> Result<Vec<u32>, E>,
-    text_of: impl Fn(&[u32]) -> String,
-) -> Result<WindowDecode, E> {
-    let ratio_of = |tokens: &[u32]| compression_ratio(&text_of(tokens));
-    let tokens = decode(prompt)?;
-    let ratio = ratio_of(&tokens);
-    if ratio <= COMPRESSION_RATIO_LOOP {
-        return Ok(WindowDecode {
-            tokens,
-            carry_text: true,
-            ratio,
-            kept_ratio: ratio,
-            retried: false,
-        });
-    }
-    let retried = !prompt.is_empty();
-    let (tokens, kept_ratio) = if retried {
-        let retry = decode(&[])?;
-        let retry_ratio = ratio_of(&retry);
-        if retry_ratio <= ratio {
-            (retry, retry_ratio)
-        } else {
-            (tokens, ratio)
-        }
-    } else {
-        (tokens, ratio)
-    };
-    Ok(WindowDecode {
-        tokens,
-        carry_text: kept_ratio <= COMPRESSION_RATIO_LOOP,
-        ratio,
-        kept_ratio,
-        retried,
-    })
-}
-
-/// The previous-text prompt for the next window. A window whose text may not
-/// be carried clears it. Otherwise, with `condition` set and some text in the
-/// window, it is `encode(text)` cut to its last `cap` tokens, as openai-whisper
-/// cuts its prompt; else the prompt is kept as it is.
+/// The previous-text prompt for the next window. A window whose `outcome`
+/// may not be carried (its kept decode is not accepted, or is accepted above
+/// temperature 0.5) clears it. Otherwise, with `condition` set and some text in
+/// the window, it is `encode(text)` cut to its last `cap` tokens, as
+/// openai-whisper cuts its prompt; else the prompt is kept as it is.
 fn next_prompt(
     prompt: Vec<u32>,
-    carry_text: bool,
+    outcome: &WindowOutcome,
     condition: bool,
     window_text: &str,
     encode: impl FnOnce(&str) -> Vec<u32>,
     cap: usize,
 ) -> Vec<u32> {
     let text = window_text.trim();
-    if !carry_text {
+    if !outcome.carry_text {
         return Vec::new();
     }
     if !condition || text.is_empty() {

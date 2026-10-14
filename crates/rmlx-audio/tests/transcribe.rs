@@ -1,3 +1,7 @@
+// LOC-exempt: the model tests of the transcription are one test binary. They share the
+// snapshot loader, the word-error helpers and the `say` clip helpers, and the script of the
+// long clip is 110 lines of data.
+
 //! Real-model Whisper transcription integration tests.
 //!
 //! These tests resolve the Whisper snapshot + tokenizer from `RMLX_O_MODELS_ROOT`
@@ -14,6 +18,23 @@
 //!    `long_synthetic_clip_is_transcribed_once_in_order` speaks 28 sentences
 //!    with gaps (about 112 s, several windows) and asserts each sentence once,
 //!    in order, with segment times inside the clip.
+//!    `digital_silence_gives_no_segment`,
+//!    `silence_around_speech_adds_no_segment` and
+//!    `a_window_with_no_speech_gives_no_segment_and_speech_keeps_its_text`
+//!    hold the no-speech gate: a window of zeros, noise or a tone gives no
+//!    text, alone and behind the prompt of a spoken window, and a spoken
+//!    window keeps its text.
+//!    `a_spoken_repetition_above_the_no_speech_bound_is_not_skipped` and
+//!    `thirty_seconds_of_one_repeated_word_are_skipped` hold the second
+//!    condition of the gate: a window above the probability bound is skipped
+//!    only when the model writes no more than a stock phrase for it.
+//!    `the_gate_picks_at_temperature_0_for_a_request_above_0` holds that the
+//!    gate draws nothing at a request temperature above 0.
+//!    `the_language_of_auto_is_that_of_the_first_window_that_is_not_skipped`
+//!    holds the language of an `auto` request behind a silent window.
+//!    `a_window_that_needs_a_fallback_is_decoded_again_and_repeats` holds the
+//!    temperature fallback: a spoken repetition is decoded again above
+//!    temperature 0, and a second run gives the same tokens.
 //!
 //! 2. `long_form_regression` — scans the gitignored fixtures dir
 //!    (`crates/rmlx-audio/tests/fixtures/`) for any `*.{m4a,wav,mp3,…}` paired
@@ -39,6 +60,9 @@
     clippy::needless_range_loop
 )]
 
+mod say_voice;
+
+use say_voice::{voice_is_installed, ENGLISH_VOICE};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -163,15 +187,23 @@ fn have_cmd(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Synthesise a known sentence to a 16 kHz mono WAV via `say` + `ffmpeg`.
+/// Synthesise a known sentence to a 16 kHz mono WAV via `say` + `ffmpeg`,
+/// with [`ENGLISH_VOICE`]: the same samples on each run.
 fn synth_say_clip(sentence: &str) -> Option<PathBuf> {
-    if !have_cmd("say") || !have_cmd("ffmpeg") {
+    synth_voice_clip(ENGLISH_VOICE, sentence)
+}
+
+/// [`synth_say_clip`] with the `say` voice `voice`. `None` when `say`,
+/// `ffmpeg` or the voice is not installed; nothing is spoken then.
+fn synth_voice_clip(voice: &str, sentence: &str) -> Option<PathBuf> {
+    if !have_cmd("ffmpeg") || !voice_is_installed(voice) {
         return None;
     }
     let dir = std::env::temp_dir();
     let aiff = dir.join("rmlx_say_clip.aiff");
     let wav = dir.join("rmlx_say_clip.wav");
     let say_ok = std::process::Command::new("say")
+        .args(["-v", voice])
         .args(["-o", aiff.to_str()?, sentence])
         .status()
         .map(|s| s.success())
@@ -208,17 +240,83 @@ fn transcribe_file(
         WavDecoder::decode_resampled(&bytes, 16_000, rmlx_audio::wav::MAX_AUDIO_SECS, &|| false)
             .expect("decode audio")
             .samples;
+    transcribe_samples(t, &samples, language)
+}
+
+/// The first largest logit of `row`: the greedy pick.
+fn largest_logit(row: &[f32]) -> u32 {
+    let mut best = 0;
+    for (id, logit) in row.iter().enumerate() {
+        if logit > &row[best] {
+            best = id;
+        }
+    }
+    best as u32
+}
+
+/// Transcribe with the greedy pick at each temperature. `cancelled` is the
+/// state of the cancel flag for the whole call.
+fn transcribe_greedy(
+    t: &Transcriber,
+    samples: &[f32],
+    opts: &TranscribeOptions,
+    cancelled: bool,
+) -> Result<rmlx_audio::transcribe::Transcription, WhisperError> {
+    t.transcribe(
+        samples,
+        opts,
+        &mut |row, _| Ok(largest_logit(row)),
+        Device::Gpu,
+        &AtomicBool::new(cancelled),
+    )
+}
+
+fn english(temperature: f32) -> TranscribeOptions {
+    TranscribeOptions {
+        language: "en".to_owned(),
+        task: WhisperTask::Transcribe,
+        temperature,
+        condition_on_previous_text: true,
+    }
+}
+
+fn transcribe_samples(
+    t: &Transcriber,
+    samples: &[f32],
+    language: &str,
+) -> rmlx_audio::transcribe::Transcription {
     let opts = TranscribeOptions {
         language: language.to_owned(),
-        task: WhisperTask::Transcribe,
-        temperature: 0.0,
-        condition_on_previous_text: true,
+        ..english(0.0)
     };
-    t.transcribe(&samples, &opts, Device::Gpu, &AtomicBool::new(false))
-        .expect("transcribe")
+    transcribe_greedy(t, samples, &opts, false).expect("transcribe")
+}
+
+/// `secs` seconds of digital silence at 16 kHz.
+fn silence(secs: usize) -> Vec<f32> {
+    vec![0.0; secs * 16_000]
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
+
+/// A voice that `say` does not have is not available: no clip is spoken, so a
+/// test stands down and does not run on the default voice of the host. Needs
+/// no model.
+#[test]
+fn a_voice_that_is_not_installed_gives_no_clip() {
+    const NO_VOICE: &str = "NoSuchVoiceXyz";
+    if !have_cmd("say") {
+        eprintln!("SKIP a_voice_that_is_not_installed_gives_no_clip: say unavailable");
+        return;
+    }
+    assert!(!voice_is_installed(NO_VOICE));
+    assert!(!voice_is_installed(""));
+    assert!(synth_voice_clip(NO_VOICE, "hello").is_none());
+    // The name of a voice is the whole name: a prefix of one is not a voice.
+    if voice_is_installed(ENGLISH_VOICE) {
+        assert!(!voice_is_installed(&ENGLISH_VOICE[..4]));
+    }
+}
 
 /// Portable smoke: a known `say` sentence transcribes correctly and is
 /// deterministic across two runs at temp=0.
@@ -231,7 +329,7 @@ fn say_clip_deterministic() {
     };
     let sentence = "The quick brown fox jumps over the lazy dog.";
     let Some(wav) = synth_say_clip(sentence) else {
-        eprintln!("SKIP say_clip_deterministic: say/ffmpeg unavailable");
+        eprintln!("SKIP say_clip_deterministic: say, its voice or ffmpeg unavailable");
         return;
     };
 
@@ -270,7 +368,7 @@ fn two_sentence_clip_is_two_segments() {
     let Some(wav) = synth_say_clip(
         "The quick brown fox jumps over the lazy dog. Paper was invented in China about two thousand years ago.",
     ) else {
-        eprintln!("SKIP two_sentence_clip_is_two_segments: say/ffmpeg unavailable");
+        eprintln!("SKIP two_sentence_clip_is_two_segments: say, its voice or ffmpeg unavailable");
         return;
     };
 
@@ -289,6 +387,538 @@ fn two_sentence_clip_is_two_segments() {
         !words.iter().any(|w| w == "you"),
         "filler after the speech: {:?}",
         r.text
+    );
+}
+
+/// One full window of digital silence gives no segment and no text. The
+/// language is named, so no detection runs on the silence.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test digital_silence -- --ignored --test-threads=1"]
+fn digital_silence_gives_no_segment() {
+    let Some(t) = load_transcriber() else {
+        eprintln!("SKIP digital_silence_gives_no_segment: whisper snapshot not present");
+        return;
+    };
+    let r = transcribe_samples(&t, &silence(30), "en");
+    println!("silence text: {:?}", r.text);
+    assert!(r.segments.is_empty(), "segments: {:?}", r.segments);
+    assert_eq!(r.text, "");
+}
+
+/// A silent window before the speech, a silent window after it and a short
+/// silent tail give no segment: every segment is in the window that holds the
+/// speech, and the text is the spoken text.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test silence_around_speech -- --ignored --test-threads=1"]
+fn silence_around_speech_adds_no_segment() {
+    let Some(t) = load_transcriber() else {
+        eprintln!("SKIP silence_around_speech_adds_no_segment: whisper snapshot not present");
+        return;
+    };
+    let script = FOX;
+    let Some(speech) = say_samples(script) else {
+        eprintln!(
+            "SKIP silence_around_speech_adds_no_segment: say, its voice or ffmpeg unavailable"
+        );
+        return;
+    };
+    let speech_secs = speech.len() as f32 / 16_000.0;
+    assert!(speech_secs < 25.0, "the speech must fit one window");
+    let mut samples = silence(30);
+    samples.extend(speech);
+    samples.extend(silence(65));
+
+    let r = transcribe_samples(&t, &samples, "en");
+    println!("silence around speech: {:?}", r.text);
+    for s in &r.segments {
+        assert!(
+            s.start >= 30.0 && s.end <= 30.0 + speech_secs + 0.5,
+            "segment outside the speech (30.00 to {:.2}): {s:?}",
+            30.0 + speech_secs
+        );
+    }
+    let w = wer(&normalize(script), &normalize(&r.text));
+    assert_eq!(w, 0.0, "WER {w:.3} above 0; got {:?}", r.text);
+}
+
+// ── Synthetic windows with no speech ────────────────────────────────────────
+
+const WINDOW_SAMPLES: usize = 30 * 16_000;
+const FOX: &str = "The quick brown fox jumps over the lazy dog.";
+const LANTERN: &str = "She carried a brass lantern down the narrow stone stairs.";
+
+/// The RMS of `samples` in dBFS.
+fn rms_dbfs(samples: &[f32]) -> f64 {
+    let squares: f64 = samples.iter().map(|&x| f64::from(x) * f64::from(x)).sum();
+    10.0 * (squares / samples.len().max(1) as f64).log10()
+}
+
+/// `samples` scaled to an RMS of `dbfs`.
+fn at_level(mut samples: Vec<f32>, dbfs: f64) -> Vec<f32> {
+    let gain = 10f64.powf((dbfs - rms_dbfs(&samples)) / 20.0) as f32;
+    for sample in &mut samples {
+        *sample *= gain;
+    }
+    samples
+}
+
+/// White noise at an RMS of `dbfs`, from a linear congruential generator with
+/// a fixed seed: the same samples on every run.
+fn noise(len: usize, dbfs: f64) -> Vec<f32> {
+    let mut state: u64 = 0x5EED;
+    let uniform = (0..len)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 40) as f32 / (1u32 << 23) as f32 - 1.0
+        })
+        .collect();
+    at_level(uniform, dbfs)
+}
+
+/// A sine tone of `hz` at an RMS of `dbfs`.
+fn tone(len: usize, hz: f64, dbfs: f64) -> Vec<f32> {
+    let sine = (0..len)
+        .map(|i| (std::f64::consts::TAU * hz * i as f64 / 16_000.0).sin() as f32)
+        .collect();
+    at_level(sine, dbfs)
+}
+
+/// `sentence` spoken by `say`, as 16 kHz mono samples.
+fn say_samples(sentence: &str) -> Option<Vec<f32>> {
+    let wav = synth_say_clip(sentence)?;
+    Some(WavDecoder::decode(&std::fs::read(wav).ok()?).ok()?.samples)
+}
+
+/// `samples`, then zeros to the end of one window.
+fn to_window(samples: &[f32]) -> Vec<f32> {
+    let mut window = samples.to_vec();
+    window.resize(WINDOW_SAMPLES, 0.0);
+    window
+}
+
+/// Each window with no speech gives no segment: digital silence, white noise
+/// from -80 to -30 dBFS, a hum, a tone, and two tails of 0.1 s. It gives none
+/// alone, where it is decoded with no prompt, and none after a spoken window,
+/// where the text of that window is the previous-text prompt. Each spoken
+/// window keeps its text: quiet speech, speech in noise, speech next to
+/// silence, one word, and speech behind a prompt.
+///
+/// The speech is that of one `say` voice ([`ENGLISH_VOICE`]), and the text of
+/// each spoken window is that of large-v3 for that voice: another voice or
+/// model can fail a row of this test with no defect in the gate.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test a_window_with_no_speech -- --ignored --test-threads=1"]
+fn a_window_with_no_speech_gives_no_segment_and_speech_keeps_its_text() {
+    let Some(t) = load_transcriber() else {
+        eprintln!("SKIP a_window_with_no_speech_gives_no_segment_and_speech_keeps_its_text: whisper snapshot not present");
+        return;
+    };
+    let (Some(fox), Some(lantern), Some(word)) = (
+        say_samples(FOX),
+        say_samples(LANTERN),
+        say_samples("Hello."),
+    ) else {
+        eprintln!("SKIP a_window_with_no_speech_gives_no_segment_and_speech_keeps_its_text: say, its voice or ffmpeg unavailable");
+        return;
+    };
+    let fox_secs = fox.len() as f32 / 16_000.0;
+    let fox_window = to_window(&fox);
+
+    let mut no_speech: Vec<(String, Vec<f32>)> =
+        vec![("zeros 30 s".to_owned(), vec![0.0; WINDOW_SAMPLES])];
+    for dbfs in [-80.0, -70.0, -60.0, -50.0, -40.0, -30.0] {
+        no_speech.push((format!("noise {dbfs} dBFS"), noise(WINDOW_SAMPLES, dbfs)));
+    }
+    no_speech.extend([
+        (
+            "hum 50 Hz -50 dBFS".to_owned(),
+            tone(WINDOW_SAMPLES, 50.0, -50.0),
+        ),
+        (
+            "tone 1 kHz -40 dBFS".to_owned(),
+            tone(WINDOW_SAMPLES, 1000.0, -40.0),
+        ),
+        ("zeros 0.1 s".to_owned(), vec![0.0; 1600]),
+        (
+            "last 0.1 s of the speech".to_owned(),
+            fox[fox.len() - 1600..].to_vec(),
+        ),
+    ]);
+    for (label, window) in &no_speech {
+        let alone = transcribe_samples(&t, window, "en");
+        assert!(
+            alone.segments.is_empty(),
+            "{label}, alone: {:?}",
+            alone.segments
+        );
+        let after_speech = transcribe_samples(&t, &[fox_window.as_slice(), window].concat(), "en");
+        for s in &after_speech.segments {
+            assert!(
+                s.end <= fox_secs + 0.5,
+                "{label}, behind a prompt: segment outside the speech: {s:?}"
+            );
+        }
+        let w = wer(&normalize(FOX), &normalize(&after_speech.text));
+        assert_eq!(w, 0.0, "{label}, behind a prompt: {:?}", after_speech.text);
+    }
+
+    // White noise at `below` dB under the level of the speech.
+    let mixed = |below: f64| -> Vec<f32> {
+        fox.iter()
+            .zip(noise(fox.len(), rms_dbfs(&fox) - below))
+            .map(|(x, y)| x + y)
+            .collect()
+    };
+    // Each row: the label, the samples, the spoken text and the word errors
+    // that the row allows. At 22 dB the window must give its sentence with at
+    // most one other word: a skipped window gives no text and fails the row.
+    let speech: [(&str, Vec<f32>, String, usize); 10] = [
+        ("the sentence", fox.clone(), FOX.to_owned(), 0),
+        (
+            "at -40 dBFS",
+            at_level(fox.clone(), -40.0),
+            FOX.to_owned(),
+            0,
+        ),
+        (
+            "at -55 dBFS",
+            at_level(fox.clone(), -55.0),
+            FOX.to_owned(),
+            0,
+        ),
+        ("in noise 32 dB below it", mixed(32.0), FOX.to_owned(), 0),
+        ("in noise 26 dB below it", mixed(26.0), FOX.to_owned(), 0),
+        ("in noise 22 dB below it", mixed(22.0), FOX.to_owned(), 1),
+        ("before zeros to 30 s", fox_window, FOX.to_owned(), 0),
+        (
+            "after 25 s of zeros",
+            [silence(25).as_slice(), fox.as_slice()].concat(),
+            FOX.to_owned(),
+            0,
+        ),
+        ("one word", word, "Hello.".to_owned(), 0),
+        (
+            "behind a prompt",
+            [to_window(&lantern).as_slice(), fox.as_slice()].concat(),
+            format!("{LANTERN} {FOX}"),
+            0,
+        ),
+    ];
+    for (label, samples, script, allowed) in &speech {
+        let r = transcribe_samples(&t, samples, "en");
+        let words = normalize(&r.text);
+        let errors = edit_distance(&normalize(script), &words);
+        assert!(
+            !words.is_empty() && errors <= *allowed,
+            "speech {label}: {errors} word errors, {allowed} allowed: {:?}",
+            r.text
+        );
+    }
+}
+
+// ── Speech above the no-speech bound ────────────────────────────────────────
+
+/// Thirty seconds of four spoken words in a loop read a no-speech probability
+/// above the bound (0.92 for this voice), and the model transcribes them. The
+/// window is not skipped: the reply has the counted words, in the digits that
+/// the model writes, from the start of the clip.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test a_spoken_repetition -- --ignored --test-threads=1"]
+fn a_spoken_repetition_above_the_no_speech_bound_is_not_skipped() {
+    let Some(t) = load_transcriber() else {
+        eprintln!("SKIP a_spoken_repetition_above_the_no_speech_bound_is_not_skipped: whisper snapshot not present");
+        return;
+    };
+    let Some(samples) = say_samples(&"one two three four ".repeat(45)) else {
+        eprintln!("SKIP a_spoken_repetition_above_the_no_speech_bound_is_not_skipped: say, its voice or ffmpeg unavailable");
+        return;
+    };
+    assert!(
+        samples.len() > WINDOW_SAMPLES,
+        "the clip is over one window"
+    );
+    // A request above temperature 1.0 is one decode for each window, and each
+    // pick of it is at that temperature. A pick at temperature 0 is a pick of
+    // the bounded decode of the gate, which runs only above the bound.
+    let mut temperatures: Vec<f32> = Vec::new();
+    let r = t
+        .transcribe(
+            &samples,
+            &english(1.5),
+            &mut |row, temperature| {
+                temperatures.push(temperature);
+                Ok(largest_logit(row))
+            },
+            Device::Gpu,
+            &AtomicBool::new(false),
+        )
+        .expect("transcribe");
+    assert_eq!(
+        temperatures.first(),
+        Some(&0.0),
+        "precondition: the first window of the clip reads above the no-speech bound for this \
+         voice, so the gate decodes it"
+    );
+    let first_window: String = r
+        .segments
+        .iter()
+        .filter(|s| s.start < 30.0)
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    println!("repetition, first window: {first_window:?}");
+    let words = normalize(&first_window);
+    assert!(
+        words.starts_with(&["1", "2", "3", "4", "1", "2", "3", "4"].map(str::to_owned)),
+        "the first window has the spoken count: {first_window:?}"
+    );
+    for digit in ["1", "2", "3", "4"] {
+        let count = words.iter().filter(|w| w.as_str() == digit).count();
+        assert!(
+            count >= 20,
+            "{digit} is written {count} times: {first_window:?}"
+        );
+    }
+}
+
+/// The bounded decode of the gate picks at temperature 0 also when the
+/// request temperature is above 0, so the gate draws nothing from the
+/// generator of the request. A window of zeros comes before the speech: each
+/// pick of that window is a pick of the gate, and it is at 0. The picks of the
+/// spoken window are at the request temperature.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test the_gate_picks_at_temperature_0 -- --ignored --test-threads=1"]
+fn the_gate_picks_at_temperature_0_for_a_request_above_0() {
+    let Some(t) = load_transcriber() else {
+        eprintln!("SKIP the_gate_picks_at_temperature_0_for_a_request_above_0: whisper snapshot not present");
+        return;
+    };
+    let Some(speech) = say_samples(FOX) else {
+        eprintln!("SKIP the_gate_picks_at_temperature_0_for_a_request_above_0: say, its voice or ffmpeg unavailable");
+        return;
+    };
+    let mut samples = silence(30);
+    samples.extend(speech);
+    let mut temperatures: Vec<f32> = Vec::new();
+    let r = t
+        .transcribe(
+            &samples,
+            &english(0.4),
+            &mut |row, temperature| {
+                temperatures.push(temperature);
+                Ok(largest_logit(row))
+            },
+            Device::Gpu,
+            &AtomicBool::new(false),
+        )
+        .expect("transcribe");
+    assert!(
+        r.segments.iter().all(|s| s.start >= 30.0) && !r.segments.is_empty(),
+        "the window of zeros is skipped and the speech is decoded: {:?}",
+        r.segments
+    );
+    let of_the_gate = temperatures.iter().take_while(|t| **t == 0.0).count();
+    assert!(of_the_gate > 0, "the gate picks at 0: {temperatures:?}");
+    assert!(
+        temperatures[of_the_gate..].iter().all(|t| *t == 0.4),
+        "each pick after the gate is at the request temperature: {temperatures:?}"
+    );
+    assert!(temperatures.len() > of_the_gate, "the speech is decoded");
+}
+
+/// Thirty seconds of ONE repeated word also read above the bound (0.88 for
+/// this voice), and for them the greedy decode of the model with no prompt is
+/// one word (two text tokens). The gate cannot tell that from a stock phrase:
+/// the window is skipped, and the reply loses that one word. This test holds
+/// the stated limit of the gate, not a wanted result.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test thirty_seconds_of_one_repeated_word -- --ignored --test-threads=1"]
+fn thirty_seconds_of_one_repeated_word_are_skipped() {
+    let Some(t) = load_transcriber() else {
+        eprintln!(
+            "SKIP thirty_seconds_of_one_repeated_word_are_skipped: whisper snapshot not present"
+        );
+        return;
+    };
+    let Some(samples) = say_samples(&"hello, ".repeat(60)) else {
+        eprintln!("SKIP thirty_seconds_of_one_repeated_word_are_skipped: say, its voice or ffmpeg unavailable");
+        return;
+    };
+    assert!(
+        samples.len() > WINDOW_SAMPLES,
+        "the clip is over one window"
+    );
+    let r = transcribe_samples(&t, &samples[..WINDOW_SAMPLES], "en");
+    assert!(
+        r.segments.is_empty(),
+        "this test holds a stated limit of the no-speech gate, not a wanted result: a better \
+         rule can give this window a segment. Change the test and `docs/AUDIO.md`, \
+         \"Known limits\", with the rule. Segments: {:?}",
+        r.segments
+    );
+}
+
+// ── The language of an `auto` request ───────────────────────────────────────
+
+/// With `language: "auto"`, the language of a file is that of the first window
+/// that the gate does not skip: 30 s of zeros before a German sentence do not
+/// set it. A file in which each window is skipped has no decoded window, and
+/// the reply names `english`.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test the_language_of_auto -- --ignored --test-threads=1"]
+fn the_language_of_auto_is_that_of_the_first_window_that_is_not_skipped() {
+    let Some(t) = load_transcriber() else {
+        eprintln!("SKIP the_language_of_auto_is_that_of_the_first_window_that_is_not_skipped: whisper snapshot not present");
+        return;
+    };
+    let german = "Der schnelle braune Fuchs springt über den faulen Hund.";
+    let Some(wav) = synth_voice_clip("Anna", german) else {
+        eprintln!("SKIP the_language_of_auto_is_that_of_the_first_window_that_is_not_skipped: the say voice Anna or ffmpeg is unavailable");
+        return;
+    };
+    let speech = WavDecoder::decode(&std::fs::read(wav).expect("read clip"))
+        .expect("decode clip")
+        .samples;
+    let alone = transcribe_samples(&t, &speech, "auto");
+    assert_eq!(
+        alone.language, "german",
+        "precondition: the model detects the speech of the voice as German; text {:?}",
+        alone.text
+    );
+
+    let mut samples = silence(30);
+    samples.extend(&speech);
+    let r = transcribe_samples(&t, &samples, "auto");
+    println!("auto after silence: {} {:?}", r.language, r.text);
+    assert_eq!(r.language, "german", "text {:?}", r.text);
+    assert!(
+        r.segments.iter().all(|s| s.start >= 30.0),
+        "segments: {:?}",
+        r.segments
+    );
+    assert_eq!(r.text, alone.text);
+
+    let silent = transcribe_samples(&t, &silence(60), "auto");
+    assert!(
+        silent.segments.is_empty(),
+        "segments: {:?}",
+        silent.segments
+    );
+    assert_eq!(silent.language, "english");
+}
+
+// ── The temperature fallback ────────────────────────────────────────────────
+
+/// The pick of the fallback test and what it was given. It is not a sampler:
+/// it has no generator. At temperature 0 it gives the largest logit. Above 0,
+/// each pick whose number is a multiple of `20 / tenths` gives the second
+/// largest logit that is not masked, so a decode differs at each temperature.
+#[derive(Default)]
+struct SteppedPick {
+    picks_above_zero: usize,
+    /// Each temperature it was given, in tenths, in order, without repeats.
+    temperatures: Vec<u32>,
+}
+
+impl SteppedPick {
+    fn pick(&mut self, row: &[f32], temperature: f32) -> u32 {
+        let tenths = (temperature * 10.0).round() as u32;
+        if self.temperatures.last() != Some(&tenths) {
+            self.temperatures.push(tenths);
+        }
+        let first = largest_logit(row);
+        if tenths == 0 {
+            return first;
+        }
+        self.picks_above_zero += 1;
+        if !self.picks_above_zero.is_multiple_of((20 / tenths) as usize) {
+            return first;
+        }
+        let mut second = first;
+        for (id, logit) in row.iter().enumerate() {
+            let better = second == first || logit > &row[second as usize];
+            if id as u32 != first && logit.is_finite() && better {
+                second = id as u32;
+            }
+        }
+        second
+    }
+}
+
+/// Four words spoken 20 times are a true repetition, and the greedy decode of
+/// that window is not accepted. The engine decodes the window again above
+/// temperature 0 and keeps that decode, and a second run of the request gives
+/// the same tokens from the same decodes. A request temperature above 0 is the
+/// temperature of the first decode.
+///
+/// The first assertion is the precondition, not the rule: one greedy decode
+/// (a request above temperature 1.0 is one step) must be a loop for this `say`
+/// voice and this model.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test a_window_that_needs_a_fallback -- --ignored --test-threads=1"]
+fn a_window_that_needs_a_fallback_is_decoded_again_and_repeats() {
+    let Some(t) = load_transcriber() else {
+        eprintln!("SKIP a_window_that_needs_a_fallback_is_decoded_again_and_repeats: whisper snapshot not present");
+        return;
+    };
+    let Some(samples) = say_samples(&"one two three four ".repeat(20)) else {
+        eprintln!("SKIP a_window_that_needs_a_fallback_is_decoded_again_and_repeats: say, its voice or ffmpeg unavailable");
+        return;
+    };
+    let run = |temperature: f32| {
+        let mut pick = SteppedPick::default();
+        let r = t
+            .transcribe(
+                &samples,
+                &english(temperature),
+                &mut |row, temperature| Ok(pick.pick(row, temperature)),
+                Device::Gpu,
+                &AtomicBool::new(false),
+            )
+            .expect("transcribe");
+        let segments: Vec<(Vec<u32>, f32)> = r
+            .segments
+            .iter()
+            .map(|s| (s.tokens.clone(), s.temperature))
+            .collect();
+        (segments, pick.temperatures, r.text)
+    };
+    let greedy = transcribe_greedy(&t, &samples, &english(1.5), false).expect("transcribe");
+    assert!(
+        greedy.segments.iter().any(|s| s.compression_ratio > 2.4),
+        "precondition: the greedy decode of the clip is refused as a loop; its ratios are \
+         {:?} (the `say` voice or the greedy text of the model changed)",
+        greedy
+            .segments
+            .iter()
+            .map(|s| s.compression_ratio)
+            .collect::<Vec<_>>()
+    );
+
+    let (segments, temperatures, text) = run(0.0);
+    println!(
+        "fallback: temperatures of the picks {temperatures:?}, of the segments {:?}, text {text:?}",
+        segments.iter().map(|(_, t)| *t).collect::<Vec<_>>()
+    );
+    assert!(
+        temperatures.starts_with(&[0, 2]),
+        "the fallback goes up the ladder: {temperatures:?}"
+    );
+    assert!(
+        segments.iter().any(|(_, temperature)| *temperature > 0.0),
+        "a decode above temperature 0 is kept"
+    );
+    let (again, temperatures_again, _) = run(0.0);
+    assert_eq!(temperatures_again, temperatures);
+    assert_eq!(again, segments, "a second run gives the same tokens");
+
+    let (_, from_the_request, _) = run(0.4);
+    assert_eq!(
+        from_the_request.first(),
+        Some(&4),
+        "the request temperature is the first step: {from_the_request:?}"
     );
 }
 
@@ -443,16 +1073,11 @@ fn long_synthetic_clip_is_transcribed_once_in_order() {
         return;
     };
     let Some(samples) = synth_long_clip() else {
-        eprintln!("SKIP long_synthetic_clip_is_transcribed_once_in_order: say/ffmpeg unavailable");
+        eprintln!("SKIP long_synthetic_clip_is_transcribed_once_in_order: say, its voice or ffmpeg unavailable");
         return;
     };
-    let opts = TranscribeOptions {
-        language: "en".to_owned(),
-        task: WhisperTask::Transcribe,
-        temperature: 0.0,
-        condition_on_previous_text: true,
-    };
-    let cancelled = t.transcribe(&samples, &opts, Device::Gpu, &AtomicBool::new(true));
+    let opts = english(0.0);
+    let cancelled = transcribe_greedy(&t, &samples, &opts, true);
     assert!(
         matches!(
             cancelled,
@@ -460,9 +1085,7 @@ fn long_synthetic_clip_is_transcribed_once_in_order() {
         ),
         "a flag set before the call opens no window: {cancelled:?}"
     );
-    let r = t
-        .transcribe(&samples, &opts, Device::Gpu, &AtomicBool::new(false))
-        .expect("transcribe");
+    let r = transcribe_greedy(&t, &samples, &opts, false).expect("transcribe");
     println!(
         "long clip: duration={:.2}s segments={} text={:?}",
         r.duration,

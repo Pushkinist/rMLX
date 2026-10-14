@@ -439,7 +439,7 @@ impl WhisperTokenizer {
     }
 
     /// Build the initial decoder token sequence for a language token (from
-    /// [`language_token`] or `detect_language`) and a task.
+    /// [`language_token`] or language detection) and a task.
     ///
     /// Sequence: `[SOT, lang_token, task_token, no_timestamps]`; the last
     /// token is present only without timestamps.

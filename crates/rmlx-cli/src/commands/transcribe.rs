@@ -117,9 +117,14 @@ fn run_whisper(args: &TranscribeArgs, device: Device) -> Result<String> {
     };
 
     let t0 = std::time::Instant::now();
-    let transcription = transcriber
-        .transcribe(&samples, &opts, device, &AtomicBool::new(false))
-        .map_err(|e| anyhow!("transcribe: {e}"))?;
+    let transcription = rmlx_server::audio::transcribe_request(
+        &transcriber,
+        &samples,
+        &opts,
+        device,
+        &AtomicBool::new(false),
+    )
+    .map_err(|e| anyhow!("transcribe: {e}"))?;
     let elapsed = t0.elapsed().as_secs_f64();
     let rtf = if transcription.duration > 0.0 {
         elapsed / f64::from(transcription.duration)

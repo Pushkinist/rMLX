@@ -1,9 +1,9 @@
 //! Unit tests for the long-form transcription engine helpers (no model needed).
 
 use super::{
-    compression_ratio, decode_window, fmt_time, next_prompt, previous_text_cap, render_srt,
-    render_vtt, reported_language, requested_language, resolve_language, window_token_budget,
-    OutputFormat, Segment, WindowDecode, COMPRESSION_RATIO_LOOP,
+    compression_ratio, fmt_time, next_prompt, previous_text_cap, render_srt, render_vtt,
+    reported_language, requested_language, resolve_language, window_token_budget, OutputFormat,
+    Segment, WindowOutcome, COMPRESSION_RATIO_LOOP,
 };
 use crate::tokenizer::{TOK_EN, TOK_TIMESTAMP_BEGIN};
 use crate::whisper::WhisperError;
@@ -116,6 +116,7 @@ fn srt_vtt_multi_segment() {
             end: 2.5,
             text: "hello world".to_owned(),
             tokens: Vec::new(),
+            temperature: 0.0,
             compression_ratio: 1.0,
         },
         Segment {
@@ -124,6 +125,7 @@ fn srt_vtt_multi_segment() {
             end: 5.0,
             text: "second line".to_owned(),
             tokens: Vec::new(),
+            temperature: 0.0,
             compression_ratio: 1.0,
         },
     ];
@@ -137,7 +139,7 @@ fn srt_vtt_multi_segment() {
     assert!(vtt.contains("00:00:02.500 --> 00:00:05.000\nsecond line"));
 }
 
-// ── Window decode: the repetition guard, from scripted decodes ───────────────
+// ── Scripted token streams for the window tests ──────────────────────────────
 
 /// Sentence `k` is the text of token `k`; timestamps have no text.
 const SENTENCES: [&str; 8] = [
@@ -151,9 +153,9 @@ const SENTENCES: [&str; 8] = [
     "And then we write the summary for the next item.",
 ];
 const REPEATED: u32 = 7;
-const PROMPT: [u32; 2] = [3, 4];
+pub(super) const PROMPT: [u32; 2] = [3, 4];
 
-fn sentences(tokens: &[u32]) -> String {
+pub(super) fn sentences(tokens: &[u32]) -> String {
     tokens
         .iter()
         .filter_map(|&t| SENTENCES.get(t as usize).copied())
@@ -163,13 +165,13 @@ fn sentences(tokens: &[u32]) -> String {
 
 /// Four varied sentences, then one sentence `repeats` times, with no closing
 /// timestamp: the shape of a greedy repetition loop.
-fn looping(repeats: usize) -> Vec<u32> {
+pub(super) fn looping(repeats: usize) -> Vec<u32> {
     let mut tokens = vec![TOK_TIMESTAMP_BEGIN, 0, 1, 2, 3];
     tokens.extend(std::iter::repeat_n(REPEATED, repeats));
     tokens
 }
 
-fn clean() -> Vec<u32> {
+pub(super) fn clean() -> Vec<u32> {
     vec![
         TOK_TIMESTAMP_BEGIN,
         0,
@@ -181,114 +183,6 @@ fn clean() -> Vec<u32> {
         6,
         TOK_TIMESTAMP_BEGIN + 1450,
     ]
-}
-
-/// Run `decode_window` with a decoder that returns `with_prompt` when it is
-/// given a prompt and `without_prompt` when it is not. Returns the result and
-/// every prompt the decoder was given.
-fn guarded(
-    prompt: &[u32],
-    with_prompt: &[u32],
-    without_prompt: &[u32],
-) -> (WindowDecode, Vec<Vec<u32>>) {
-    let mut calls: Vec<Vec<u32>> = Vec::new();
-    let result: Result<WindowDecode, ()> = decode_window(
-        prompt,
-        |p: &[u32]| {
-            calls.push(p.to_vec());
-            Ok(if p.is_empty() {
-                without_prompt
-            } else {
-                with_prompt
-            }
-            .to_vec())
-        },
-        sentences,
-    );
-    match result {
-        Ok(decoded) => (decoded, calls),
-        Err(()) => panic!("scripted decode failed; calls: {calls:?}"),
-    }
-}
-
-/// The kept tokens, whether they may prompt the next window, and whether a
-/// decode without the prompt ran.
-fn kept(decoded: WindowDecode) -> (Vec<u32>, bool, bool) {
-    (decoded.tokens, decoded.carry_text, decoded.retried)
-}
-
-/// A window that loops under the previous-text prompt is decoded again without
-/// it; the clean result is kept and may prompt the next window.
-#[test]
-fn a_loop_under_the_prompt_is_decoded_again_without_it() {
-    let (decoded, calls) = guarded(&PROMPT, &looping(8), &clean());
-    assert_eq!(calls, [PROMPT.to_vec(), Vec::new()]);
-    assert_eq!(kept(decoded), (clean(), true, true));
-}
-
-/// A window that does not loop is decoded once, with its prompt.
-#[test]
-fn a_clean_window_is_decoded_once() {
-    let (decoded, calls) = guarded(&PROMPT, &clean(), &looping(8));
-    assert_eq!(calls, [PROMPT.to_vec()]);
-    assert_eq!(kept(decoded), (clean(), true, false));
-}
-
-/// A loop that remains without the prompt is kept, but it does not prompt the
-/// next window.
-#[test]
-fn a_loop_that_remains_without_the_prompt_is_not_carried() {
-    let (decoded, calls) = guarded(&PROMPT, &looping(8), &looping(6));
-    assert_eq!(calls, [PROMPT.to_vec(), Vec::new()]);
-    assert_eq!(kept(decoded), (looping(6), false, true));
-}
-
-/// A loop decoded with no prompt has no prompt to drop: it is decoded once and
-/// not carried.
-#[test]
-fn a_loop_with_no_prompt_is_decoded_once_and_not_carried() {
-    let (decoded, calls) = guarded(&[], &clean(), &looping(8));
-    assert_eq!(calls, [Vec::<u32>::new()]);
-    assert_eq!(kept(decoded), (looping(8), false, false));
-}
-
-/// The loop bound is the reference compression ratio, 2.4: one sentence four
-/// times after four others compresses to about 2.3 and is kept; five times, to
-/// about 2.6, and is decoded again.
-#[test]
-fn the_loop_bound_is_a_compression_ratio_of_2_4() {
-    let (_, calls) = guarded(&PROMPT, &looping(4), &clean());
-    assert_eq!(calls.len(), 1, "four repeats are not a loop");
-    let (_, calls) = guarded(&PROMPT, &looping(5), &clean());
-    assert_eq!(calls.len(), 2, "five repeats are a loop");
-}
-
-/// A decode error on the second decode is returned.
-#[test]
-fn an_error_on_the_decode_without_the_prompt_is_returned() {
-    let mut calls = 0;
-    let result = decode_window(
-        &PROMPT,
-        |p: &[u32]| {
-            calls += 1;
-            if p.is_empty() {
-                Err("decode failed")
-            } else {
-                Ok(looping(8))
-            }
-        },
-        sentences,
-    );
-    assert_eq!(result, Err("decode failed"));
-    assert_eq!(calls, 2);
-}
-
-/// When both decodes loop, the one that compresses less is kept.
-#[test]
-fn when_both_decodes_loop_the_one_with_the_lower_ratio_is_kept() {
-    let (decoded, calls) = guarded(&PROMPT, &looping(6), &looping(8));
-    assert_eq!(calls, [PROMPT.to_vec(), Vec::new()]);
-    assert_eq!(kept(decoded), (looping(6), false, true));
 }
 
 // ── The compression ratio at the loop bound ──────────────────────────────────
@@ -315,32 +209,6 @@ fn compression_ratio_is_zlib_bytes_over_trimmed_text_bytes() {
     assert_eq!(compression_ratio(""), 0.0);
 }
 
-/// A ratio of exactly 2.4 is not a loop; the next byte makes one.
-#[test]
-fn a_ratio_of_exactly_2_4_is_not_a_loop() {
-    let text = sentences(&looping(5));
-    for (len, loops) in [(372, false), (373, true)] {
-        let window = text.get(..len).unwrap_or_default().to_owned();
-        let mut calls = 0;
-        let result: Result<WindowDecode, ()> = decode_window(
-            &PROMPT,
-            |_: &[u32]| {
-                calls += 1;
-                Ok(vec![calls])
-            },
-            |tokens: &[u32]| {
-                if tokens == [1] {
-                    window.clone()
-                } else {
-                    sentences(&clean())
-                }
-            },
-        );
-        assert!(result.is_ok());
-        assert_eq!(calls, if loops { 2 } else { 1 }, "{len} bytes");
-    }
-}
-
 // ── The prompt for the next window ───────────────────────────────────────────
 
 /// Encodes text as one token per byte, so the cap is easy to read.
@@ -348,10 +216,30 @@ fn bytes_as_tokens(text: &str) -> Vec<u32> {
     text.bytes().map(u32::from).collect()
 }
 
-/// A window whose text may not be carried clears the prompt.
+/// The outcome of a window whose kept decode may, or may not, prompt the
+/// next window.
+fn outcome(carry_text: bool) -> WindowOutcome {
+    WindowOutcome {
+        tokens: Vec::new(),
+        attempts: Vec::new(),
+        kept: 0,
+        skipped: false,
+        carry_text,
+    }
+}
+
+/// A window whose kept decode may not be carried clears the prompt: the next
+/// prompt reads the outcome of the window, not a value the caller chooses.
 #[test]
 fn a_window_that_may_not_be_carried_clears_the_prompt() {
-    let next = next_prompt(PROMPT.to_vec(), false, true, "loop", bytes_as_tokens, 10);
+    let next = next_prompt(
+        PROMPT.to_vec(),
+        &outcome(false),
+        true,
+        "loop",
+        bytes_as_tokens,
+        10,
+    );
     assert_eq!(next, Vec::<u32>::new());
 }
 
@@ -359,52 +247,28 @@ fn a_window_that_may_not_be_carried_clears_the_prompt() {
 /// its last `cap` tokens.
 #[test]
 fn a_carried_window_replaces_the_prompt_cut_to_the_cap() {
-    let next = next_prompt(PROMPT.to_vec(), true, true, " abcdef ", bytes_as_tokens, 4);
+    let carried = outcome(true);
+    let next = next_prompt(
+        PROMPT.to_vec(),
+        &carried,
+        true,
+        " abcdef ",
+        bytes_as_tokens,
+        4,
+    );
     assert_eq!(next, bytes_as_tokens("cdef"));
-    let next = next_prompt(PROMPT.to_vec(), true, true, "ab", bytes_as_tokens, 4);
+    let next = next_prompt(PROMPT.to_vec(), &carried, true, "ab", bytes_as_tokens, 4);
     assert_eq!(next, bytes_as_tokens("ab"));
 }
 
 /// With conditioning off, or a window with no text, the prompt is kept.
 #[test]
 fn the_prompt_is_kept_with_conditioning_off_or_no_text() {
-    let next = next_prompt(PROMPT.to_vec(), true, false, "abc", bytes_as_tokens, 4);
+    let carried = outcome(true);
+    let next = next_prompt(PROMPT.to_vec(), &carried, false, "abc", bytes_as_tokens, 4);
     assert_eq!(next, PROMPT.to_vec());
-    let next = next_prompt(PROMPT.to_vec(), true, true, "  ", bytes_as_tokens, 4);
+    let next = next_prompt(PROMPT.to_vec(), &carried, true, "  ", bytes_as_tokens, 4);
     assert_eq!(next, PROMPT.to_vec());
-}
-
-/// A retry whose ratio is exactly 2.4 is not a loop: it is kept and prompts the
-/// next window.
-#[test]
-fn a_retry_at_a_ratio_of_exactly_2_4_is_carried() {
-    let text = sentences(&looping(5));
-    let at_bound = text.get(..372).unwrap_or_default().to_owned();
-    let one_more = text.get(..373).unwrap_or_default().to_owned();
-    let result: Result<WindowDecode, ()> = decode_window(
-        &PROMPT,
-        |p: &[u32]| Ok(vec![u32::from(p.is_empty())]),
-        |tokens: &[u32]| {
-            if tokens == [1] {
-                at_bound.clone()
-            } else {
-                one_more.clone()
-            }
-        },
-    );
-    let Ok(decoded) = result else {
-        panic!("scripted decode failed");
-    };
-    assert_eq!(kept(decoded), (vec![1], true, true));
-}
-
-/// When both decodes loop with the same ratio, the retry is kept.
-#[test]
-fn of_two_loops_with_the_same_ratio_the_retry_is_kept() {
-    let mut retry = looping(8);
-    retry.push(TOK_TIMESTAMP_BEGIN + 1450);
-    let (decoded, _) = guarded(&PROMPT, &looping(8), &retry);
-    assert_eq!(kept(decoded), (retry, false, true));
 }
 
 /// `auto` asks for detection; a code or an English name, in any case, names a
@@ -444,60 +308,38 @@ fn an_unknown_requested_language_is_an_error_naming_it() {
 /// text `lang_tok=` is in no report.
 #[test]
 fn the_reported_language_is_the_english_name_of_the_token() {
-    assert_eq!(reported_language(Some(TOK_EN)), "english");
-    assert_eq!(reported_language(Some(TOK_EN + 6)), "french");
-    assert_eq!(reported_language(Some(TOK_EN + 99)), "cantonese");
+    assert_eq!(reported_language(Some(TOK_EN), 0), "english");
+    assert_eq!(reported_language(Some(TOK_EN + 6), 0), "french");
+    assert_eq!(reported_language(Some(TOK_EN + 99), 3), "cantonese");
     for token in TOK_EN..=TOK_EN + 99 {
-        assert!(!reported_language(Some(token)).contains("lang_tok"));
+        assert!(!reported_language(Some(token), 0).contains("lang_tok"));
     }
 }
 
-/// The first window detects the language and stores it; a later window reads
-/// the stored token and does not detect again.
+/// The first window that is decoded gives its language and stores it; a later
+/// window reads the stored token, whatever its own language is.
 #[test]
-fn the_first_window_decides_the_language_of_the_file() {
+fn the_first_decoded_window_decides_the_language_of_the_file() {
     let mut resolved = requested_language("auto").unwrap();
-    let mut detections = 0;
-    let mut detect = |token| {
-        detections += 1;
-        Ok(token)
-    };
-    assert_eq!(
-        resolve_language(&mut resolved, || detect(TOK_EN + 6)).unwrap(),
-        TOK_EN + 6
-    );
+    assert_eq!(resolve_language(&mut resolved, TOK_EN + 6), TOK_EN + 6);
     assert_eq!(resolved, Some(TOK_EN + 6));
-    assert_eq!(
-        resolve_language(&mut resolved, || detect(TOK_EN + 1)).unwrap(),
-        TOK_EN + 6
-    );
-    assert_eq!(detections, 1);
-    assert_eq!(reported_language(resolved), "french");
+    assert_eq!(resolve_language(&mut resolved, TOK_EN + 1), TOK_EN + 6);
+    assert_eq!(reported_language(resolved, 0), "french");
 }
 
-/// A named language is never detected.
+/// A named language is never replaced by the language of a window.
 #[test]
 fn a_named_language_is_not_detected() {
     let mut resolved = requested_language("Russian").unwrap();
-    let got = resolve_language(&mut resolved, || panic!("a named language is not detected"));
-    assert_eq!(got.unwrap(), TOK_EN + 4);
-    assert_eq!(reported_language(resolved), "russian");
+    assert_eq!(resolve_language(&mut resolved, TOK_EN + 6), TOK_EN + 4);
+    assert_eq!(reported_language(resolved, 0), "russian");
 }
 
-/// A failed detection fails the window; no English is stored.
-#[test]
-fn a_failed_detection_is_an_error_and_stores_nothing() {
-    let mut resolved = None;
-    let got = resolve_language(&mut resolved, || {
-        Err(WhisperError::Mlx("op failed".to_owned()))
-    });
-    assert!(matches!(got, Err(WhisperError::Mlx(_))), "{got:?}");
-    assert_eq!(resolved, None);
-}
-
-/// With `auto` and audio shorter than one mel hop, no window runs and no token
-/// exists; the report names english.
+/// With `auto`, no token exists when no window was decoded: each window was
+/// skipped, or the audio is shorter than one mel hop. The report names
+/// english in both cases.
 #[test]
 fn a_report_with_no_detected_language_names_english() {
-    assert_eq!(reported_language(None), "english");
+    assert_eq!(reported_language(None, 0), "english");
+    assert_eq!(reported_language(None, 4), "english");
 }

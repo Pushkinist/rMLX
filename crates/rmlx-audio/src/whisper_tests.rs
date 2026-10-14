@@ -7,10 +7,12 @@
 //! absent — no bespoke env var. The tests here verify config parsing, NPZ
 //! parsing logic, and weight-map helpers.
 
-use super::{DecodeFilters, WhisperConfig};
-use crate::npz::{extract_npy_dtype, extract_npy_shape};
-use crate::tokenizer::{N_VOCAB, TOK_EOT, TOK_NO_TIMESTAMPS, TOK_TIMESTAMP_BEGIN};
-use rmlx_mlx::Dtype;
+use super::{DecodeFilters, TextDecoder, WhisperConfig, WhisperError};
+use crate::npz::{extract_npy_dtype, extract_npy_shape, WeightMap};
+use crate::tokenizer::{
+    N_VOCAB, TOK_EN, TOK_EOT, TOK_NO_TIMESTAMPS, TOK_SOT, TOK_TIMESTAMP_BEGIN, TOK_TRANSCRIBE,
+};
+use rmlx_mlx::{Array, Device, Dtype};
 
 fn fresh_logits() -> Vec<f32> {
     // All zeros so we can see exactly which entries get masked to -inf.
@@ -277,3 +279,110 @@ fn npy_shape_scalar() {
 // NOTE: Full smoke-probe + long-form regression tests (WhisperModel::load →
 // transcribe) live in crates/rmlx-audio/tests/transcribe.rs and resolve the
 // snapshot from RMLX_O_MODELS_ROOT auto-discovery (skip-if-absent).
+
+// ── The decoder of one window, on a decoder of two small blocks ──────────────
+
+const TINY_STATE: usize = 4;
+const TINY_BLOCKS: usize = 2;
+
+/// An array of `shape` with small values that differ from one element to the
+/// next and from one `seed` to the next.
+fn values(shape: &[i32], seed: u32) -> Result<Array, WhisperError> {
+    let len: i32 = shape.iter().product();
+    let data: Vec<f32> = (0..len as u32)
+        .map(|i| ((i.wrapping_mul(2_654_435_761).wrapping_add(seed) >> 20) as f32 / 4096.0) - 0.5)
+        .collect();
+    Ok(Array::from_f32_slice(&data, shape)?)
+}
+
+/// A text decoder of two blocks with a state of four, the large-v3 vocabulary
+/// and a context of 16 positions.
+fn tiny_decoder() -> Result<TextDecoder, WhisperError> {
+    let state = TINY_STATE as i32;
+    let mut map = WeightMap::new();
+    let mut seed = 0;
+    let mut put = |key: String, shape: &[i32]| -> Result<(), WhisperError> {
+        seed += 1;
+        map.insert(key, values(shape, seed)?);
+        Ok(())
+    };
+    put(
+        "decoder.token_embedding.weight".to_owned(),
+        &[N_VOCAB as i32, state],
+    )?;
+    put("decoder.positional_embedding".to_owned(), &[16, state])?;
+    for norm in ["decoder.ln.weight", "decoder.ln.bias"] {
+        put(norm.to_owned(), &[state])?;
+    }
+    for block in 0..TINY_BLOCKS {
+        let prefix = format!("decoder.blocks.{block}");
+        for attention in ["attn", "cross_attn"] {
+            for linear in ["query", "key", "value", "out"] {
+                put(
+                    format!("{prefix}.{attention}.{linear}.weight"),
+                    &[state, state],
+                )?;
+            }
+        }
+        for norm in ["attn_ln", "cross_attn_ln", "mlp_ln"] {
+            put(format!("{prefix}.{norm}.weight"), &[state])?;
+            put(format!("{prefix}.{norm}.bias"), &[state])?;
+        }
+        put(format!("{prefix}.mlp1.weight"), &[8, state])?;
+        put(format!("{prefix}.mlp2.weight"), &[state, 8])?;
+    }
+    let cfg = WhisperConfig {
+        n_mels: 128,
+        n_audio_ctx: 1500,
+        n_audio_state: TINY_STATE,
+        n_audio_head: 2,
+        n_audio_layer: 0,
+        n_vocab: N_VOCAB,
+        n_text_ctx: 16,
+        n_text_state: TINY_STATE,
+        n_text_head: 2,
+        n_text_layer: TINY_BLOCKS,
+    };
+    TextDecoder::load(&map, &cfg)
+}
+
+fn first_largest(row: &[f32]) -> u32 {
+    let mut best = 0;
+    for (id, logit) in row.iter().enumerate() {
+        if row.get(best).is_some_and(|largest| logit > largest) {
+            best = id;
+        }
+    }
+    best as u32
+}
+
+/// The cross-attention keys and values of a window are projected one time,
+/// by the forward that reads the start of the window: one projection for each
+/// decoder block. Each decode of the window reads them and projects nothing,
+/// whatever the number of decodes. A second window projects its own.
+#[test]
+fn the_cross_attention_of_a_window_is_projected_one_time() -> Result<(), WhisperError> {
+    let decoder = tiny_decoder()?;
+    let encoder_out = values(&[1, 3, TINY_STATE as i32], 99)?;
+    let filters = DecodeFilters::new(Vec::new(), Vec::new(), true);
+    let prefix = [TOK_SOT, TOK_EN, TOK_TRANSCRIBE];
+
+    assert_eq!(decoder.cross_projections(), 0);
+    let (_, window) = decoder.open_window(&encoder_out, Device::Cpu)?;
+    assert_eq!(decoder.cross_projections(), TINY_BLOCKS);
+    let mut decodes = Vec::new();
+    for decode in 1..=3 {
+        decodes.push(window.decode(&prefix, 4, &filters, |row: &[f32]| Ok(first_largest(row)))?);
+        assert_eq!(
+            decoder.cross_projections(),
+            TINY_BLOCKS,
+            "after decode {decode} of the window"
+        );
+    }
+    assert!(decodes.iter().all(|decoded| !decoded.tokens.is_empty()));
+    assert!(decodes.windows(2).all(|pair| pair[0] == pair[1]));
+
+    decoder.open_window(&encoder_out, Device::Cpu)?;
+    assert_eq!(decoder.cross_projections(), 2 * TINY_BLOCKS);
+    Ok(())
+}

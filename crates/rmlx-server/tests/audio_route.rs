@@ -14,10 +14,25 @@
 )]
 
 mod stub_server;
+#[allow(
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::print_stdout,
+    reason = "the helpers of the model tests, written for test files that allow these"
+)]
+mod thread_boundary;
 
-use rmlx_audio::wav::WavEncoder;
+use rmlx_audio::tokenizer::{WhisperTask, WhisperTokenizer};
+use rmlx_audio::transcribe::{TranscribeOptions, Transcriber};
+use rmlx_audio::wav::{WavDecoder, WavEncoder, MAX_AUDIO_SECS};
+use rmlx_audio::whisper::WhisperModel;
+use rmlx_mlx::Device;
+use rmlx_models::sampler::RowPicker;
 use rmlx_server::{AppState, ModelRegistry};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use stub_server::{not_ready_state, start_server_with_state};
+use thread_boundary::{say_voice, snapshot, WHISPER, WHISPER_TOKENIZER};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -343,7 +358,7 @@ async fn served_and_ignored_fields_reach_the_model_load() {
     let (state, _dir) = missing_whisper_state();
     let port = start_server_with_state(state).await;
     let wav = short_wav();
-    let fields: [(&str, &[u8]); 19] = [
+    let fields: [(&str, &[u8]); 20] = [
         ("model", b"whisper-1"),
         ("language", b"ru"),
         ("language", b"Russian"),
@@ -355,6 +370,7 @@ async fn served_and_ignored_fields_reach_the_model_load() {
         ("response_format", b"vtt"),
         ("response_format", b"verbose_json"),
         ("temperature", b"0"),
+        ("temperature", b"0.000001"),
         ("temperature", b"0.2"),
         ("temperature", b"1.5"),
         ("prompt", b"Glossary: rMLX, Whisper."),
@@ -380,7 +396,7 @@ async fn a_refused_field_value_answers_422_with_its_fixed_body() {
     let (state, _dir) = missing_whisper_state();
     let port = start_server_with_state(state).await;
     let wav = short_wav();
-    let cases: [(&str, &[u8], &str); 4] = [
+    let cases: [(&str, &[u8], &str); 5] = [
         (
             "language",
             b"xx",
@@ -394,12 +410,17 @@ async fn a_refused_field_value_answers_422_with_its_fixed_body() {
         (
             "temperature",
             b"-1",
-            r#"{"error":"temperature -1 is out of range; must be a finite float >= 0.0"}"#,
+            r#"{"error":"temperature -1 is out of range; must be 0 or a finite float >= 1e-6"}"#,
+        ),
+        (
+            "temperature",
+            b"0.0000001",
+            r#"{"error":"temperature 0.0000001 is out of range; must be 0 or a finite float >= 1e-6"}"#,
         ),
         (
             "temperature",
             b"hot",
-            r#"{"error":"invalid temperature 'hot'; must be a finite float >= 0.0"}"#,
+            r#"{"error":"invalid temperature 'hot'; must be 0 or a finite float >= 1e-6"}"#,
         ),
     ];
     for (name, value, expected) in cases {
@@ -656,4 +677,158 @@ async fn a_short_field_holds_at_most_64_bytes() {
     assert_eq!(status, 422, "{body}");
     assert!(!body.contains(&at_limit), "{body}");
     assert!(body.contains("64 bytes"), "{body}");
+}
+
+// ── The token pick of a request, on the model ────────────────────────────────
+
+/// A clip of two windows, as a 16 kHz mono WAV file: four words spoken 12
+/// times by `say` with the English test voice, 20 s of zeros, and the same
+/// speech again. Each window holds one true repetition.
+fn repetition_wav() -> Option<Vec<u8>> {
+    let wav = std::env::temp_dir().join("rmlx_route_repetition.wav");
+    if !say_voice::say_english_wav(&wav, &"one two three four ".repeat(12)) {
+        return None;
+    }
+    let speech = WavDecoder::decode(&std::fs::read(&wav).ok()?).ok()?.samples;
+    let pause = vec![0.0; 20 * 16_000];
+    let samples = [speech.as_slice(), pause.as_slice(), speech.as_slice()].concat();
+    WavEncoder::encode(&samples, 16_000, 1).ok()
+}
+
+/// The window (`seek`), the tokens and the temperature of each segment.
+type Segments = Vec<(usize, Vec<u32>, f32)>;
+
+/// The keys of a `verbose_json` reply that the test reads.
+#[derive(serde::Deserialize)]
+struct Reply {
+    segments: Vec<ReplySegment>,
+}
+
+#[derive(serde::Deserialize)]
+struct ReplySegment {
+    seek: usize,
+    tokens: Vec<u32>,
+    temperature: f32,
+}
+
+/// How many windows have a segment whose decode was drawn.
+fn windows_with_a_drawn_decode(segments: &Segments) -> usize {
+    let mut seeks: Vec<usize> = segments
+        .iter()
+        .filter(|(_, _, temperature)| *temperature > 0.0)
+        .map(|(seek, _, _)| *seek)
+        .collect();
+    seeks.dedup();
+    seeks.len()
+}
+
+/// A voice that `say` does not have is not available: no clip is spoken, so a
+/// model test stands down and does not run on the default voice of the host.
+#[test]
+fn a_voice_that_is_not_installed_gives_no_clip() {
+    const NO_VOICE: &str = "NoSuchVoiceXyz";
+    if !say_voice::voice_is_installed(say_voice::ENGLISH_VOICE) {
+        eprintln!(
+            "SKIP a_voice_that_is_not_installed_gives_no_clip: say or its voice is unavailable"
+        );
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("no_voice.wav");
+    assert!(!say_voice::voice_is_installed(NO_VOICE));
+    // The name of a voice is the whole name: a prefix of one is not a voice.
+    assert!(!say_voice::voice_is_installed("Eddy"));
+    assert!(!say_voice::say_wav(NO_VOICE, &path, "hello"));
+    assert!(!path.exists(), "a clip was spoken with another voice");
+}
+
+/// The route draws every token of a request from ONE generator with the
+/// sampler's default seed. The clip has a spoken repetition in each of two
+/// windows: the greedy decode of each is a loop, so each goes up the
+/// temperature ladder and its kept decode is drawn. The tokens that the route answers are those of
+/// `Transcriber::transcribe` with one `RowPicker::default()` for the whole
+/// call. A picker made for each pick, for each decode or for each window
+/// starts its stream again and gives other tokens in the second window;
+/// another seed gives other tokens in both. `rmlx transcribe` calls the same
+/// `transcribe_request`.
+///
+/// The first assertion is the precondition, not the rule: for this `say`
+/// voice and this model, two windows keep a drawn decode.
+#[tokio::test]
+#[ignore = "GPU Metal context — run in isolation: cargo test -p rmlx-server --test audio_route the_route_draws -- --ignored --test-threads=1"]
+async fn the_route_draws_a_request_from_one_seeded_generator() {
+    const TEST: &str = "the_route_draws_a_request_from_one_seeded_generator";
+    let Some(model_path) = snapshot(TEST, WHISPER.0, WHISPER.1) else {
+        return;
+    };
+    let Some(tokenizer_path) = snapshot(TEST, WHISPER_TOKENIZER.0, WHISPER_TOKENIZER.1) else {
+        return;
+    };
+    let Some(wav) = repetition_wav() else {
+        eprintln!("SKIP the_route_draws_a_request_from_one_seeded_generator: say or its voice is unavailable");
+        return;
+    };
+
+    let reference: Segments = {
+        let samples = WavDecoder::decode_resampled(&wav, 16_000, MAX_AUDIO_SECS, &|| false)
+            .expect("decode the clip")
+            .samples;
+        let model = WhisperModel::load(&model_path).expect("load whisper model");
+        let tokenizer = WhisperTokenizer::from_path(&tokenizer_path).expect("load tokenizer");
+        let transcriber =
+            Transcriber::new(Arc::new(model), Arc::new(tokenizer)).expect("transcriber");
+        let opts = TranscribeOptions {
+            language: "en".to_owned(),
+            task: WhisperTask::Transcribe,
+            temperature: 0.0,
+            condition_on_previous_text: true,
+        };
+        let mut picker = RowPicker::default();
+        let transcription = transcriber
+            .transcribe(
+                &samples,
+                &opts,
+                &mut |row, temperature| picker.pick(row, temperature),
+                Device::Gpu,
+                &AtomicBool::new(false),
+            )
+            .expect("transcribe");
+        transcription
+            .segments
+            .into_iter()
+            .map(|s| (s.seek, s.tokens, s.temperature))
+            .collect()
+    };
+    assert!(
+        windows_with_a_drawn_decode(&reference) >= 2,
+        "precondition: two windows of the clip keep a decode above temperature 0; \
+         windows and temperatures {:?}",
+        reference
+            .iter()
+            .map(|(seek, _, t)| (*seek, *t))
+            .collect::<Vec<_>>()
+    );
+
+    let mut state = not_ready_state(ModelRegistry::default());
+    state.whisper_model_path = Some(model_path);
+    state.whisper_tokenizer_path = Some(tokenizer_path);
+    state.device = Device::Gpu;
+    let port = start_server_with_state(state).await;
+    let Answer { status, body, .. } = post_form(
+        port,
+        &[
+            ("file", &wav),
+            ("language", b"en"),
+            ("response_format", b"verbose_json"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let reply: Reply = serde_json::from_str(&body).expect("a verbose_json reply");
+    let from_the_route: Segments = reply
+        .segments
+        .into_iter()
+        .map(|segment| (segment.seek, segment.tokens, segment.temperature))
+        .collect();
+    assert_eq!(from_the_route, reference);
 }

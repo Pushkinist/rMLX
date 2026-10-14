@@ -122,6 +122,9 @@ use rmlx_server::{
     ArchGenerator, GenerationRequest, Generator, ModelLoadConfig, SpeculativeGenerator,
 };
 
+#[path = "../../../rmlx-audio/tests/say_voice/mod.rs"]
+pub mod say_voice;
+
 #[path = "../../../rmlx-models/tests/common/round_stream.rs"]
 pub mod round_stream;
 
@@ -134,6 +137,11 @@ use round_stream::RoundStreamRecorder;
 pub const RED_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAb0lEQVR4nO3PAQkAAAyEwO9feoshgnABdLep8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3IPanc8OLDQitxAAAAAElFTkSuQmCC";
 
 pub const SPOKEN_TEXT: &str = "The capital of France is Paris.";
+
+/// The Whisper snapshot and its tokenizer: the slug and what `config.json`
+/// declares, for [`snapshot`].
+pub const WHISPER: (&str, &str) = ("mlx-community__whisper-large-v3-mlx", "whisper");
+pub const WHISPER_TOKENIZER: (&str, &str) = ("openai__whisper-large-v3-tokenizer", "");
 
 pub const N_TOKENS: u32 = 24;
 
@@ -225,18 +233,13 @@ pub fn long_prompt(dir: &Path) -> Vec<u32> {
     ids
 }
 
-/// `SPOKEN_TEXT` spoken by the system voice, as a 16 kHz mono 16-bit WAV.
-pub fn spoken_wav() -> Vec<u8> {
+/// `SPOKEN_TEXT` spoken by the English test voice, as a 16 kHz mono 16-bit
+/// WAV. `None` when `say` or the voice is not available.
+pub fn spoken_wav() -> Option<Vec<u8>> {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("spoken.wav");
-    let status = std::process::Command::new("say")
-        .arg("-o")
-        .arg(&path)
-        .args(["--data-format=LEI16@16000", SPOKEN_TEXT])
-        .status()
-        .expect("run say");
-    assert!(status.success(), "say failed: {status}");
-    std::fs::read(&path).expect("read spoken.wav")
+    say_voice::say_english_wav(&path, SPOKEN_TEXT)
+        .then(|| std::fs::read(&path).expect("read spoken.wav"))
 }
 
 /// Standard base64. The server's own encoders are private to the crate, and

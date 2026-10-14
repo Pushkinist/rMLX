@@ -36,13 +36,13 @@ use rmlx_audio::whisper::WhisperModel;
 use rmlx_mlx::{Array, Device};
 use rmlx_models::jina_v4::{self, JinaV4};
 use rmlx_models::sampler::{select_token, Pcg32, PenaltyConfig, SamplerConfig};
+use rmlx_server::audio::transcribe_request;
 use thread_boundary::{
-    f32_bits, hand_over, snapshot, spoken_wav, Split, RED_PNG_BASE64, SPOKEN_TEXT,
+    f32_bits, hand_over, snapshot, spoken_wav, Split, RED_PNG_BASE64, SPOKEN_TEXT, WHISPER,
+    WHISPER_TOKENIZER,
 };
 
 const JINA_V4: (&str, &str) = ("jinaai__jina-embeddings-v4", "JinaEmbeddingsV4Model");
-const WHISPER: (&str, &str) = ("mlx-community__whisper-large-v3-mlx", "whisper");
-const WHISPER_TOKENIZER: (&str, &str) = ("openai__whisper-large-v3-tokenizer", "");
 const TTS: (&str, &str) = (
     "mlx-community__Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit",
     "Qwen3TTSForConditionalGeneration",
@@ -197,7 +197,7 @@ fn transcribe(
         condition_on_previous_text: true,
     };
     Transcriber::new(Arc::clone(model), Arc::clone(tokenizer))
-        .and_then(|t| t.transcribe(samples, &opts, device, &AtomicBool::new(false)))
+        .and_then(|t| transcribe_request(&t, samples, &opts, device, &AtomicBool::new(false)))
         .map(|t| t.text)
         .map_err(|e| e.to_string())
 }
@@ -206,8 +206,12 @@ fn transcribe(
 fn whisper_inputs(test: &str) -> Option<(PathBuf, PathBuf, Arc<[f32]>)> {
     let model_dir = snapshot(test, WHISPER.0, WHISPER.1)?;
     let tok_dir = snapshot(test, WHISPER_TOKENIZER.0, WHISPER_TOKENIZER.1)?;
+    let Some(wav) = spoken_wav() else {
+        println!("SKIP {test}: say or its voice is unavailable");
+        return None;
+    };
     let samples: Arc<[f32]> = rmlx_audio::wav::WavDecoder::decode_resampled(
-        &spoken_wav(),
+        &wav,
         16_000,
         rmlx_audio::wav::MAX_AUDIO_SECS,
         &|| false,

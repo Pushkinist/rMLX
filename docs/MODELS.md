@@ -639,19 +639,21 @@ come from `config.json`.
 1. Decode with Symphonia (WAV, MP3, M4A, ADTS AAC), downmix and resample to
    16 kHz packet by packet.
 2. Walk the audio in 30 s windows: log-mel (`MelExtractor`), `encode_mel`,
-   then greedy decode in timestamp mode.
+   the no-speech gate (`docs/AUDIO.md`, "No-speech gate"), then decode in
+   timestamp mode.
 3. Each step applies the openai-whisper filter chain: `SuppressBlank`,
    `SuppressTokens` (derived from the loaded tokenizer) and
    `ApplyTimestampRules`.
 4. Timestamps become segments. The seek follows openai-whisper: the whole
    window when the tokens end in a single timestamp, otherwise the end of the
    last closed segment (`docs/AUDIO.md`, "Seek rule"). The next window is
-   conditioned on the previous text through `<|startofprev|>`. A window that
-   loops under that prompt is decoded again without it (`docs/AUDIO.md`,
-   "Repetition guard").
+   conditioned on the previous text through `<|startofprev|>`. A decode that
+   is a repetition loop or has a low average log-probability is decoded again
+   (`docs/AUDIO.md`, "Window decision").
 5. Render `txt`, `json`, `srt` or `vtt`.
 
-Decoding is greedy at temperature 0.
+A decode at temperature 0 takes the largest logit; a decode above 0 draws
+from the shared sampler.
 
 **Tests.** `crates/rmlx-audio/tests/transcribe.rs` resolves the snapshot and
 tokenizer under `RMLX_O_MODELS_ROOT` and skips when they are absent.
@@ -688,7 +690,7 @@ snapshot).
 | Codec decoder | Split RVQ (1 semantic + 15 acoustic codebooks), a pre-transformer and a convolutional upsampler to 24 kHz. |
 
 Sizes come from flat `talker_config` keys; the nested `code_predictor_config`
-block is not read (see `docs/AUDIO.md` § "CodePredictor"). Voices are the
+block is not read (see `docs/AUDIO_TTS.md` § "CodePredictor"). Voices are the
 keys of `talker_config.spk_id`.
 
 Both heads sample with the shared sampler. The defaults come from the
@@ -696,7 +698,7 @@ snapshot's `generation_config.json` (`do_sample`, `temperature`, `top_k`,
 `top_p`, `repetition_penalty` and the `subtalker_*` keys), and a request can
 set `temperature`, `top_k`, `repetition_penalty` and `seed`. Generation stops
 at the codec end token or at 2048 frames; the response headers say which.
-See `docs/AUDIO.md` § "Generation loop" and `docs/AUDIO.md` § "Sampling".
+See `docs/AUDIO_TTS.md` § "Generation loop" and `docs/AUDIO_TTS.md` § "Sampling".
 
 ---
 

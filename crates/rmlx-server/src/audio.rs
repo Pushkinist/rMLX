@@ -19,9 +19,10 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use rmlx_audio::tokenizer::{TokenizerError, WhisperTask, WhisperTokenizer};
-use rmlx_audio::transcribe::{TranscribeOptions, Transcriber};
+use rmlx_audio::transcribe::{TranscribeOptions, Transcriber, Transcription};
 use rmlx_audio::wav::{WavDecoder, WavError, MAX_AUDIO_SECS};
 use rmlx_audio::whisper::{WhisperError, WhisperModel};
+use rmlx_models::sampler::RowPicker;
 use serde::Serialize;
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -126,9 +127,12 @@ struct TranscriptionResponse {
 }
 
 /// One segment in a `verbose_json` response: the keys of the OpenAI
-/// `TranscriptionSegment` schema the decode computes. `avg_logprob` and
-/// `no_speech_prob` are left out: no log-probability is kept and no no-speech
-/// gate runs, and a `null` would make a typed client throw.
+/// `TranscriptionSegment` schema that a [`Segment`] holds. `avg_logprob` and
+/// `no_speech_prob` are left out: the engine reads both for its window
+/// decision and puts neither on a segment, and a `null` would make a typed
+/// client throw.
+///
+/// [`Segment`]: rmlx_audio::transcribe::Segment
 #[derive(Debug, Serialize)]
 struct SegmentJson {
     id: usize,
@@ -137,7 +141,7 @@ struct SegmentJson {
     end: f32,
     text: String,
     tokens: Vec<u32>,
-    /// Every decode is greedy, whatever the request's `temperature`.
+    /// Temperature of the decode the segment's window kept.
     temperature: f32,
     compression_ratio: f32,
 }
@@ -298,8 +302,7 @@ async fn handle_audio(
         };
 
         let t_decode_start = std::time::Instant::now();
-        let transcription = transcriber
-            .transcribe(&samples, &opts, device, cancel)
+        let transcription = transcribe_request(&transcriber, &samples, &opts, device, cancel)
             .map_err(JobError::Transcribe)?;
         let decode_ms = t_decode_start.elapsed().as_secs_f64() * 1_000.0;
 
@@ -351,7 +354,7 @@ async fn handle_audio(
             }
         }
 
-        Ok::<rmlx_audio::transcribe::Transcription, JobError>(transcription)
+        Ok::<Transcription, JobError>(transcription)
     })
     .await;
 
@@ -382,6 +385,27 @@ async fn handle_audio(
                 .into_response()
         }
     }
+}
+
+/// Transcribe the samples of one request. One [`RowPicker`] with the sampler's
+/// default seed picks every token of the request, so a repeated request gives
+/// the same tokens also when a decode above temperature 0 ran. The
+/// transcription routes and `rmlx transcribe` both call this.
+pub fn transcribe_request(
+    transcriber: &Transcriber,
+    samples: &[f32],
+    opts: &TranscribeOptions,
+    device: rmlx_mlx::Device,
+    cancel: &AtomicBool,
+) -> Result<Transcription, WhisperError> {
+    let mut picker = RowPicker::default();
+    transcriber.transcribe(
+        samples,
+        opts,
+        &mut |row, temperature| picker.pick(row, temperature),
+        device,
+        cancel,
+    )
 }
 
 /// The 16 kHz samples of the uploaded file, up to `MAX_AUDIO_SECS`. The decode
@@ -427,7 +451,7 @@ impl Drop for CancelOnDrop {
 }
 
 fn build_response(
-    transcription: &rmlx_audio::transcribe::Transcription,
+    transcription: &Transcription,
     task: WhisperTask,
     format: ResponseFormat,
 ) -> Response {
@@ -455,7 +479,7 @@ fn build_response(
                         end: s.end,
                         text: s.text.clone(),
                         tokens: s.tokens.clone(),
-                        temperature: 0.0,
+                        temperature: s.temperature,
                         compression_ratio: s.compression_ratio,
                     })
                     .collect(),

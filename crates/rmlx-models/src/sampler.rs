@@ -435,14 +435,17 @@ impl SamplerConfig {
         self.temperature > 0.0
     }
 
-    /// Resolve the effective RNG seed. `seed.unwrap_or(0xA7A7)` — absent-seed
+    /// Resolve the effective RNG seed. `seed.unwrap_or(DEFAULT_SEED)` — absent-seed
     /// runs are deterministic per process. Documented contract; do NOT swap
     /// to entropy without updating callers/tests that assert reproducibility.
     #[inline]
     pub fn seed_or_default(&self) -> u64 {
-        self.seed.unwrap_or(0xA7A7)
+        self.seed.unwrap_or(DEFAULT_SEED)
     }
 }
+
+/// The RNG seed of a request that names none.
+const DEFAULT_SEED: u64 = 0xA7A7;
 
 /// Minimal PCG32 (O'Neill, 2014) — hand-rolled, no `rand` dependency
 /// (CLAUDE.md forbids casual deps). One instance per request, threaded
@@ -1323,6 +1326,9 @@ pub fn apply_mask_argmax(logits_flat: &Array, mask: &[bool], device: Device) -> 
     argmax(&masked, -1, device)
         .map_err(|e| Error::Other(format!("apply_mask_argmax: argmax failed: {e}")))
 }
+
+mod row_pick;
+pub use row_pick::RowPicker;
 
 // ───── tests ────────────────────────────────────────────────────────────────
 

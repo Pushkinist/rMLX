@@ -44,7 +44,7 @@ impl TtsSamplingRequest {
 /// finite f32 (the limit is about `3.4e38`), and a talker logit is far below
 /// that. A smaller value only moves the result toward infinity, where the
 /// sampler refuses the row.
-const MIN_SAMPLING_VALUE: f32 = 1e-6;
+pub(crate) const MIN_SAMPLING_VALUE: f32 = 1e-6;
 
 // The bounds below hold for a request field and for a `generation_config.json`
 // key. Their upper ends are those of `/v1/chat/completions`.

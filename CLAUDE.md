@@ -76,7 +76,8 @@ areas before touching code:
 | [`docs/PROJECTS_CONFIG.md`](docs/PROJECTS_CONFIG.md) | Per-project cap defaults via `<RMLX_HOME>/projects.toml` |
 | [`docs/TESTING.md`](docs/TESTING.md) | Test snapshot resolution (RMLX_O_MODELS_ROOT, RMLX_TEST_MODEL_*), test variables, golden-token fixtures, CPU numeric gates, NIAH and codec smoke matrix |
 | [`docs/GPU_TESTS.md`](docs/GPU_TESTS.md) | GPU/Metal tests: the `#[ignore]` rule and its gate, `make gpu-test`, stand-downs, halves, `make ci-perf`, shader validation, census pin |
-| [`docs/AUDIO.md`](docs/AUDIO.md) | Audio: Whisper transcription, Qwen3-TTS, WAV I/O, Whisper token ids |
+| [`docs/AUDIO.md`](docs/AUDIO.md) | Audio: Whisper transcription, WAV I/O, Whisper token ids |
+| [`docs/AUDIO_TTS.md`](docs/AUDIO_TTS.md) | Qwen3-TTS: the speech model (loading, talker, code predictor, generation loop, memory of a request), sampling of the codec tokens, the codec decoder |
 | [`docs/E2E_TEST_PLAN.md`](docs/E2E_TEST_PLAN.md) | End-to-end feature-proof harness: modality, tool-calling and speculative-decoding cases |
 | [`docs/RELEASING.md`](docs/RELEASING.md) | Release flow: single-source version, `make tag` / `release-package` / `tap-sync`, Homebrew formula + tap, `CHANGELOG.md`, branch model (one PR per issue into `main`, squash-merged), post-release retrospective |
 

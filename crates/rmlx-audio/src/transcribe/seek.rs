@@ -4,27 +4,21 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::{Segment, WindowDecode};
+use super::fallback::Attempt;
+use super::Segment;
 use crate::mel::{HOP_LENGTH, N_SAMPLES, SAMPLE_RATE};
 use crate::tokenizer::TOK_TIMESTAMP_BEGIN;
 
-/// Seconds of audio represented by one timestamp-token step (Whisper uses 0.02 s).
-const TIME_PRECISION: f32 = 0.02;
-
-/// Samples of audio represented by one timestamp-token step.
+/// Samples of audio represented by one timestamp-token step (0.02 s).
 const SAMPLES_PER_TIMESTAMP: usize = SAMPLE_RATE as usize / 50;
 
-/// How far past the real end of a window a segment may open before it counts as
-/// zero-pad filler (0.5 s).
-const PAD_TAIL_MARGIN_SAMPLES: usize = SAMPLE_RATE as usize / 2;
-
-/// One segment cut from a window's token stream, before text decode. Times are
-/// seconds from the window start; `tokens` is the segment's slice, its
-/// timestamps included.
+/// One segment cut from a window's token stream, before text decode. Its
+/// start and its end are in samples from the window start; `tokens` is the
+/// segment's slice, its timestamps included.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct RawSegment {
-    start: f32,
-    end: f32,
+    start_samples: usize,
+    end_samples: usize,
     tokens: Vec<u32>,
 }
 
@@ -65,16 +59,14 @@ pub(super) struct WindowPlan {
 ///
 /// With no pair the stream is one segment from the window start, and the whole
 /// window is consumed.
+///
+/// The start and the end of a segment are those of its timestamps, also when
+/// the decoder put one in the zero pad after a short window:
+/// [`window_segments`] bounds the times of the reply.
 pub(super) fn plan_window(tokens: &[u32], window_samples: usize) -> WindowPlan {
-    let window_dur = window_samples as f32 / SAMPLE_RATE as f32;
     let is_timestamp = |tok: u32| tok >= TOK_TIMESTAMP_BEGIN;
     let ticks = |tok: u32| tok.saturating_sub(TOK_TIMESTAMP_BEGIN);
-    let to_secs = |tok: u32| ticks(tok) as f32 * TIME_PRECISION;
-    // A segment that opens more than 0.5 s past the real audio is in the
-    // zero-pad tail, where Whisper prints filler ("you", "thank you").
-    let opens_in_speech = |tok: u32| {
-        ticks(tok) as usize * SAMPLES_PER_TIMESTAMP <= window_samples + PAD_TAIL_MARGIN_SAMPLES
-    };
+    let to_samples = |tok: u32| ticks(tok) as usize * SAMPLES_PER_TIMESTAMP;
     let ends_in_one_timestamp = matches!(
         tokens,
         [.., before, last] if !is_timestamp(*before) && is_timestamp(*last)
@@ -90,13 +82,13 @@ pub(super) fn plan_window(tokens: &[u32], window_samples: usize) -> WindowPlan {
 
     let mut segments: Vec<RawSegment> = Vec::new();
     let rule = if cuts.is_empty() {
-        let end = match tokens.iter().rev().find(|&&t| is_timestamp(t)) {
-            Some(&last) if last != TOK_TIMESTAMP_BEGIN => to_secs(last),
-            _ => window_dur,
+        let end_samples = match tokens.iter().rev().find(|&&t| is_timestamp(t)) {
+            Some(&last) if last != TOK_TIMESTAMP_BEGIN => to_samples(last),
+            _ => window_samples,
         };
         segments.push(RawSegment {
-            start: 0.0,
-            end,
+            start_samples: 0,
+            end_samples,
             tokens: tokens.to_vec(),
         });
         SeekRule::NoPair
@@ -108,7 +100,7 @@ pub(super) fn plan_window(tokens: &[u32], window_samples: usize) -> WindowPlan {
             let end_samples = cuts
                 .last()
                 .and_then(|&cut| tokens.get(cut - 1))
-                .map_or(0, |&tok| ticks(tok) as usize * SAMPLES_PER_TIMESTAMP);
+                .map_or(0, |&tok| to_samples(tok));
             if end_samples == 0 {
                 SeekRule::ZeroFallback
             } else {
@@ -119,13 +111,11 @@ pub(super) fn plan_window(tokens: &[u32], window_samples: usize) -> WindowPlan {
         for &cut in &cuts {
             let slice = tokens.get(from..cut).unwrap_or_default();
             if let (Some(&first), Some(&last)) = (slice.first(), slice.last()) {
-                if opens_in_speech(first) {
-                    segments.push(RawSegment {
-                        start: to_secs(first),
-                        end: to_secs(last),
-                        tokens: slice.to_vec(),
-                    });
-                }
+                segments.push(RawSegment {
+                    start_samples: to_samples(first),
+                    end_samples: to_samples(last),
+                    tokens: slice.to_vec(),
+                });
             }
             from = cut;
         }
@@ -144,21 +134,38 @@ pub(super) fn plan_window(tokens: &[u32], window_samples: usize) -> WindowPlan {
     }
 }
 
-/// The segments of the window that starts at sample `seek`, with times from
-/// the start of the audio: the window start plus each raw time.
+/// The segments of the reply for the window that starts at sample `seek`, in
+/// a file of `total_samples`. The start and the end of a segment are sample
+/// positions in the file, and each time of the reply is one such position in
+/// seconds, so a later position is never an earlier time. An end is bounded
+/// by the end of the file: a short window is the last one of a file, so a
+/// position that the decoder put in its zero pad is the end of the file. A
+/// segment whose start is not before its bounded end is dropped: it opens at
+/// or after the end of the real audio, in the zero pad, where Whisper prints
+/// filler ("you", "thank you"). So each segment of the reply starts before it
+/// ends, and ends in the file.
+///
 /// `decode_text` gives the text of a segment's text tokens; a segment whose
-/// trimmed text is empty is dropped. Each segment's compression ratio is that
-/// of the decode the window kept, as openai-whisper gives the ratio of the
-/// result it kept after a fallback.
+/// trimmed text is empty is dropped. Each segment's temperature and compression
+/// ratio are those of `kept`, the decode the window kept, as openai-whisper
+/// gives the values of the result it kept after a fallback. Its tokens are its
+/// slice of the window's tokens, with the timestamps as the decoder gave them.
 pub(super) fn window_segments(
     raw: &[RawSegment],
     seek: usize,
-    decoded: &WindowDecode,
+    total_samples: usize,
+    kept: &Attempt,
     decode_text: impl Fn(&[u32]) -> String,
 ) -> Vec<Segment> {
-    let window_start_time = seek as f32 / SAMPLE_RATE as f32;
+    let secs = |samples: usize| samples as f32 / SAMPLE_RATE as f32;
     raw.iter()
         .filter_map(|raw| {
+            let start = secs(seek + raw.start_samples);
+            let end = secs((seek + raw.end_samples).min(total_samples));
+            // Also a segment that is shorter than one step of `f32` seconds.
+            if start >= end {
+                return None;
+            }
             let text_tokens: Vec<u32> = raw
                 .tokens
                 .iter()
@@ -169,11 +176,12 @@ pub(super) fn window_segments(
             let trimmed = text.trim();
             (!trimmed.is_empty()).then(|| Segment {
                 seek: seek / HOP_LENGTH,
-                start: window_start_time + raw.start,
-                end: window_start_time + raw.end,
+                start,
+                end,
                 text: trimmed.to_owned(),
                 tokens: raw.tokens.clone(),
-                compression_ratio: decoded.kept_ratio,
+                temperature: kept.temperature,
+                compression_ratio: kept.compression_ratio,
             })
         })
         .collect()

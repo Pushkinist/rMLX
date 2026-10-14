@@ -218,7 +218,9 @@ decoded and resampled to 16 kHz mono, before the model loads, and only the
 16 kHz samples stay while the model runs; a file that
 lost more audio than the limit for its length, or whose reader fails, is an
 `audio decode:` error, at any length ([`AUDIO.md`](AUDIO.md),
-"WAV I/O"). Decoding is greedy at temperature 0.
+"WAV I/O"). The first decode of each window is greedy at temperature 0; a
+window that loops or is weak is decoded again ([`AUDIO.md`](AUDIO.md),
+"Window decision").
 
 ```bash
 rmlx transcribe meeting.m4a --model <whisper-snapshot> --tokenizer <tok-dir> \

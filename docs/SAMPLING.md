@@ -192,7 +192,7 @@ else:              logit[id] /= rep_penalty
 It applies once per unique id in the window. The identity is `1.0`. For the
 text routes the window is 20 tokens (`context_size=20` in mlx-lm), not
 OpenAI's full context: a repeat older than 20 tokens is not penalised. The
-speech route passes the talker's full group-0 history (`docs/AUDIO.md`,
+speech route passes the talker's full group-0 history (`docs/AUDIO_TTS.md`,
 "Sampling").
 
 ### Presence penalty

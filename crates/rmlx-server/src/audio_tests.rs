@@ -224,6 +224,7 @@ fn two_segments() -> Transcription {
                 end: 2.5,
                 text: "The first sentence.".to_owned(),
                 tokens: vec![50_365, 440, 700, 13, 50_490],
+                temperature: 0.0,
                 compression_ratio: 0.9,
             },
             Segment {
@@ -232,6 +233,7 @@ fn two_segments() -> Transcription {
                 end: 5.04,
                 text: "The second one.".to_owned(),
                 tokens: vec![50_490, 440, 1_150, 13, 50_617],
+                temperature: 0.5,
                 compression_ratio: 1.1,
             },
         ],
@@ -271,10 +273,11 @@ async fn the_plain_formats_answer_unchanged_bytes() {
 }
 
 /// A `verbose_json` segment holds the keys of the OpenAI
-/// `TranscriptionSegment` schema that the decode computes, each with a value of
-/// the schema's type, and leaves out the two it does not compute
+/// `TranscriptionSegment` schema that a segment of the engine holds, each with
+/// a value of the schema's type, and leaves out the two that no segment holds
 /// (`avg_logprob`, `no_speech_prob`). A `null` would make a typed client throw
-/// (openai-dotnet reads them with `GetSingle`).
+/// (openai-dotnet reads them with `GetSingle`). The temperature is that of the
+/// segment, not a constant.
 #[tokio::test]
 async fn verbose_json_segments_carry_the_computed_openai_keys() {
     let body: serde_json::Value =
@@ -310,7 +313,7 @@ async fn verbose_json_segments_carry_the_computed_openai_keys() {
     assert_eq!(segment["start"], 2.5);
     assert_eq!(segment["end"], 5.04);
     assert_eq!(segment["text"], "The second one.");
-    assert_eq!(segment["temperature"], 0.0);
+    assert_eq!(segment["temperature"], 0.5);
     assert_eq!(segment["seek"], 3_000);
     assert_eq!(segment["compression_ratio"], 1.1);
     assert_eq!(

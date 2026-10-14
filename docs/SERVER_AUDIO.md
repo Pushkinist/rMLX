@@ -9,11 +9,11 @@ Split out of [`SERVER.md`](SERVER.md) to keep that doc under the size cap.
 Both take the OpenAI multipart form; `translations` translates to English.
 The fields, the bodies and each status are in [`AUDIO.md`](AUDIO.md) §
 "HTTP route". `file` is at most 25 MiB (413 above it, naming the cap and
-the size); `language`, `response_format` and `temperature` (no effect:
-decoding is greedy) are read; `timestamp_granularities=word` and
+the size); `language`, `response_format` and `temperature` (the first step of
+each window's temperature ladder) are read; `timestamp_granularities=word` and
 `stream=true` are 422; `prompt` and any other field are ignored, counted in
 at most one `warn` event. A `verbose_json` segment has the keys OpenAI's schema
-requires except `avg_logprob` and `no_speech_prob`, which are not computed:
+requires except `avg_logprob` and `no_speech_prob`, which no segment holds:
 a client that requires them, `@ai-sdk/openai` with the model `whisper-1` or
 openai-python in strict mode, cannot read it.
 A Whisper load failure is 503 with `x-should-retry: false` and names no
@@ -32,15 +32,19 @@ openai-whisper logit filters (`SuppressBlank`, `SuppressTokens`,
 `ApplyTimestampRules`). The emitted timestamps become segments with real
 times. The seek consumes the whole window when the tokens end in a single
 timestamp, and otherwise goes to the end of the last closed segment
-([`AUDIO.md`](AUDIO.md), "Seek rule"). The previous window's text is fed back
-as a `<|startofprev|>` prompt; a window that loops under it is decoded again
-without it ([`AUDIO.md`](AUDIO.md), "Repetition guard"). The only filler guard
-drops a segment that opens after the window's own length plus 0.5 s.
+([`AUDIO.md`](AUDIO.md), "Seek rule"). A window is skipped when its
+no-speech probability is above 0.6 and the model writes no more than a stock
+phrase for it ([`AUDIO.md`](AUDIO.md), "No-speech gate"). The previous window's text is fed back as a `<|startofprev|>` prompt.
+A decode that is a repetition loop or has a low average log-probability is
+decoded again, first without the prompt for a loop, then up a temperature
+ladder ([`AUDIO.md`](AUDIO.md), "Window decision"). No segment
+starts or ends after the duration of the file, and a segment that opens at or
+after the end of the real audio is not in the reply.
 
 `language` is an ISO code or an English name, in any case; the reply names the
 language as the English name. With `language` absent or `auto`, the language
-is detected once, on the first window, and holds for the whole file, as in
-openai-whisper ([`AUDIO.md`](AUDIO.md), "Language forms" and "Language
+is detected once, on the first window that is not skipped, and holds for the
+whole file ([`AUDIO.md`](AUDIO.md), "Language forms" and "Language
 detection").
 
 The Whisper model and tokenizer load on the first request and stay for the
@@ -83,7 +87,7 @@ Qwen3-TTS synthesizes mono 24 kHz audio from a JSON body:
 
 A field that the request does not set comes from the talker snapshot's
 `generation_config.json`, then from the Qwen3-TTS reference default
-(`docs/AUDIO.md`, "Sampling"). The checkpoint samples at temperature 0.9 with
+(`docs/AUDIO_TTS.md`, "Sampling"). The checkpoint samples at temperature 0.9 with
 top-k 50 and a talker repetition penalty of 1.05. `temperature: 0` alone keeps
 that penalty; greedy decoding with no penalty needs `temperature: 0` and
 `repetition_penalty: 1.0`. A sampling field of the wrong JSON type is refused

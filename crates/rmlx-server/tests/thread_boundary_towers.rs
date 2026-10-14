@@ -112,7 +112,10 @@ fn assert_audio_tower(test: &str, snapshot_of: (&str, &str), device: Device) {
     let Some(dir) = snapshot(test, snapshot_of.0, snapshot_of.1) else {
         return;
     };
-    let wav = spoken_wav();
+    let Some(wav) = spoken_wav() else {
+        println!("SKIP {test}: say or its voice is unavailable");
+        return;
+    };
     let load = arch_generator(dir.clone(), device, None);
     assert_hand_over(test, Split::AfterLoad, &load, || {
         vec![audio_request(&dir, &wav)]

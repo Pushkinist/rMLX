@@ -6,6 +6,8 @@ use axum::http::StatusCode;
 use rmlx_audio::transcribe::requested_language;
 use tracing::warn;
 
+use crate::tts_sampling::MIN_SAMPLING_VALUE;
+
 use super::{
     cut, too_large, unprocessable, Refusal, LOGGED_NAME_BYTES, MAX_AUDIO_BYTES, MAX_REQUEST_BYTES,
 };
@@ -138,12 +140,13 @@ pub(super) async fn parse_multipart(
                 let text = short_value(&name, read_short(&mut field, body_len).await?)?;
                 let t = text.parse::<f32>().map_err(|_| {
                     unprocessable(format!(
-                        "invalid temperature '{text}'; must be a finite float >= 0.0"
+                        "invalid temperature '{text}'; must be 0 or a finite float >= 1e-6"
                     ))
                 })?;
-                if !t.is_finite() || t < 0.0 {
+                // Below the bound the sampler's scaled logit is not finite.
+                if !t.is_finite() || t < 0.0 || (t > 0.0 && t < MIN_SAMPLING_VALUE) {
                     return Err(unprocessable(format!(
-                        "temperature {t} is out of range; must be a finite float >= 0.0"
+                        "temperature {t} is out of range; must be 0 or a finite float >= 1e-6"
                     )));
                 }
                 temperature = t;
