@@ -490,10 +490,10 @@ fn decode_upload(bytes: &[u8], cancel: &AtomicBool) -> Result<Vec<f32>, JobError
 
 /// Run `job` on the blocking pool, inside the caller's span, while `guard`
 /// holds the GPU permit. The flag handed to `job` is set when the returned
-/// future is dropped: the request timed out or the client went away. A job
-/// that reads the flag can stop early. The permit is released when `job`
-/// returns, so the next request never shares the GPU with a job that is still
-/// stopping.
+/// future is dropped: the request timed out, the client went away or a
+/// server shutdown dropped it. A job that reads the flag can stop early. The
+/// permit is released when `job` returns, so the next request never shares
+/// the GPU with a job that is still stopping.
 // cancel-safe: a drop sets the flag; the job keeps the permit until it returns.
 // After a normal return the flag is set with no reader.
 async fn run_admitted<T, F>(guard: GpuAdmission, job: F) -> Result<T, tokio::task::JoinError>

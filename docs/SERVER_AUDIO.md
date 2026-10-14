@@ -55,9 +55,9 @@ the refusal text (`docs/AUDIO.md` § "Supported variants"). Audio requests
 pass the same admission gate as chat, and hold the GPU permit for the audio
 file decode, the encode and the Whisper decode.
 
-When the request is gone, because the 408 fired or the client closed the
-connection, the transcription stops before its next 30 s window and releases
-the permit. An `info` event in the request's span,
+When the request is gone, because the 408 fired, the client closed the
+connection or a server shutdown dropped it, the transcription stops before
+its next 30 s window and releases the permit. An `info` event in the request's span,
 `long-form transcription cancelled before the window opened`, gives the
 window number and its `seek` in samples. The stop is not immediate:
 
@@ -65,9 +65,13 @@ window number and its `seek` in samples. The stop is not immediate:
   `n_text_ctx / 2` tokens each (224 for large-v3).
 - The audio decode stops before its next packet. The model load of the
   first request is not cut.
-- Only a 408 or a closed connection stops the walk. A graceful shutdown
-  (SIGINT, SIGTERM) waits for the request and never stops it. With
-  `--max-timeout-secs 0`, only a closed connection stops it.
+- Only a 408, a closed connection or a server shutdown stops the walk. After
+  SIGINT or SIGTERM a transcription has 8 s to end and return its text. At
+  8 s, or at a second signal, the request gets 503 in the OpenAI envelope,
+  `the server is shutting down`, also while it waits for the GPU, and the
+  walk stops. A window that still runs 2 s later ends with the process
+  ([`SERVER_SHUTDOWN.md`](SERVER_SHUTDOWN.md)). With `--max-timeout-secs 0`,
+  only a closed connection or the shutdown stops it.
 
 ### Text-to-speech: `/v1/audio/speech`
 

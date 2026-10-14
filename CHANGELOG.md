@@ -157,6 +157,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on every exit path. The depth check and the count are also one atomic step:
   requests that arrived together one place below `--max-queue-depth` could all
   pass the check and take the count above the bound.
+- **`rmlx serve` exits within 10 s of a SIGINT or SIGTERM.** The server
+  waited for every open request, and then for every blocking job. With
+  `--max-timeout-secs 0` a long transcription or generation held the exit
+  until it ended. Now every open request, on every route, has 8 s to send
+  its reply; a reply that ends in that time is complete. At 8 s a request
+  with no response yet gets 503 `service_unavailable`, `the server is
+  shutting down`. A reply that streams is ended there: its chunked body is
+  correct, and a stream that had not sent its terminal item has no `[DONE]`,
+  no `finish_reason`, no `message_stop` and no error event, so a client must
+  check for the terminal item. A request
+  inside a model load gets no 503. A transcription stops before its next
+  window. A chat or speech job is not stopped; one that still runs 2 s later
+  ends with the process, and the Metal claim stays held until the process is
+  gone. A second SIGINT or SIGTERM ends the 8 s wait at once, and the exit
+  follows 2 s after it; before, it did nothing. A shutdown with no request in
+  flight is as fast as before. See `docs/SERVER_SHUTDOWN.md`.
 - **A language that Whisper does not know is an error, and `verbose_json`
   names the language in a form a client can read.** `rmlx transcribe
   --language xx` was decoded as English with no error. It now stops before the

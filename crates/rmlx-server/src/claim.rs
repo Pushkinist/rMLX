@@ -18,7 +18,7 @@
 
 use std::fs::{File, OpenOptions, Permissions, TryLockError};
 use std::io::{self, Read as _};
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, IntoRawFd as _, OwnedFd};
 use std::os::unix::fs::{FileExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
@@ -72,6 +72,21 @@ pub enum ClaimError {
 #[derive(Debug)]
 pub struct MetalClaim {
     file: File,
+}
+
+impl MetalClaim {
+    /// Keep the claim past this guard, until the process is gone. For an exit
+    /// that leaves a job on the GPU: the next process must not get the claim
+    /// while this one still runs.
+    ///
+    /// # Errors
+    /// The OS could not duplicate the fd; the claim then ends with the guard.
+    pub fn hold_until_process_exit(&self) -> io::Result<()> {
+        // The flock belongs to the open file, so a second fd that is never
+        // closed keeps it.
+        let _never_closed = self.file.try_clone()?.into_raw_fd();
+        Ok(())
+    }
 }
 
 impl AsFd for MetalClaim {

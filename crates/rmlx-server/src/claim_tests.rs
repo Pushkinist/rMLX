@@ -554,3 +554,85 @@ fn probe_refuses_a_hard_link_at_the_claim_path() {
         "refused for another reason: {source}"
     );
 }
+
+/// A claim that is held until the process is gone outlives its guard: the
+/// lock stays, as it does for a holder that still runs.
+#[test]
+fn a_claim_held_until_process_exit_outlives_its_guard() {
+    let dir = TempDir::new().expect("temp dir");
+    let lock = lock_in(&dir);
+    let claim = claim_at(&lock).expect("first claim");
+    claim.hold_until_process_exit().expect("duplicate the fd");
+    drop(claim);
+    assert!(
+        is_held(&claim_at(&lock)),
+        "the claim was released with its guard"
+    );
+}
+
+/// End a runtime through `block_on_serve` as `rmlx serve` does, with `claim`
+/// and one blocking job that runs until the returned sender is dropped.
+/// `exit_in` is the deadline the serve future returns.
+fn serve_to_the_exit(claim: &MetalClaim, exit_in: Duration) -> mpsc::Sender<()> {
+    use crate::shutdown::shutdown_tests::{held_job, runtime, serving};
+    use crate::shutdown::{block_on_serve_within, ExitDeadline};
+
+    let job = held_job();
+    let deadline = move || Ok(ExitDeadline(std::time::Instant::now() + exit_in));
+    block_on_serve_within(
+        runtime(),
+        Some(claim),
+        serving(job.run, job.started, deadline),
+        exit_in,
+    )
+    .expect("the shutdown is not an error");
+    assert!(
+        !job.finished.load(std::sync::atomic::Ordering::Acquire),
+        "the job ended before the runtime did"
+    );
+    job.release
+}
+
+/// A shutdown that leaves a job on the blocking pool at the exit deadline
+/// keeps the claim after the guard of its caller is dropped: the next process
+/// cannot get it while this one still runs.
+#[test]
+fn a_job_left_at_the_exit_deadline_keeps_the_claim_past_its_guard() {
+    let dir = TempDir::new().expect("temp dir");
+    let lock = lock_in(&dir);
+    let claim = claim_at(&lock).expect("first claim");
+
+    let release = serve_to_the_exit(&claim, Duration::from_millis(100));
+
+    drop(claim);
+    let next = claim_at(&lock);
+    drop(release);
+    assert!(
+        is_held(&next),
+        "the claim was released with a job still running"
+    );
+}
+
+/// A shutdown whose runtime ended before the deadline holds nothing: the
+/// claim is free when the guard of its caller is dropped.
+#[test]
+fn a_shutdown_with_no_job_left_frees_the_claim_with_its_guard() {
+    use crate::shutdown::{block_on_serve_within, ExitDeadline};
+
+    let _no_spawn = no_spawn();
+    let dir = TempDir::new().expect("temp dir");
+    let lock = lock_in(&dir);
+    let claim = claim_at(&lock).expect("first claim");
+    let far = Duration::from_secs(120);
+
+    block_on_serve_within(
+        crate::shutdown::shutdown_tests::runtime(),
+        Some(&claim),
+        async move { Ok(ExitDeadline(std::time::Instant::now() + far)) },
+        far,
+    )
+    .expect("the shutdown is not an error");
+
+    drop(claim);
+    drop(claim_at(&lock).expect("the claim is free after a clean shutdown"));
+}

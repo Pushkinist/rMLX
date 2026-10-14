@@ -69,6 +69,10 @@ impl ClaimedDevice {
         self.claim.is_some()
     }
 
+    pub(crate) fn claim(&self) -> Option<&MetalClaim> {
+        self.claim.as_ref()
+    }
+
     /// `Ok` when every codec in `quants` can run on this device.
     ///
     /// # Errors

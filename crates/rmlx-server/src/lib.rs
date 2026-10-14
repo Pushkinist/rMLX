@@ -43,6 +43,7 @@ pub mod openai;
 pub mod registry;
 pub mod retry;
 pub mod session_cache;
+pub mod shutdown;
 pub mod stop_matcher;
 pub mod tokenizer_io;
 pub mod tool_parser;
@@ -55,10 +56,11 @@ use std::net::SocketAddr;
 use axum::extract::DefaultBodyLimit;
 use axum::middleware;
 use axum::routing::{get, post};
-use axum::serve::ListenerExt;
 use axum::Router;
 use serde_json::json;
 use tracing::{info, warn};
+
+use shutdown::PhaseWatch;
 
 pub use admission::{
     spawn_controller_task, AdmissionHandle, ControllerConfig, ControllerHandle, DecisionReason,
@@ -79,6 +81,7 @@ pub use openai::{
 };
 pub use registry::{ModelEntry, ModelRegistry, RegistryConfig, RegistryConfigEntry};
 pub use session_cache::{effective_prompt_cache_slots, SessionCache, SessionKey};
+pub use shutdown::{block_on_serve, ExitDeadline};
 
 /// Build the axum `Router` for the full API surface.
 ///
@@ -100,6 +103,17 @@ pub use session_cache::{effective_prompt_cache_slots, SessionCache, SessionKey};
 /// `GET /metrics` — Prometheus text exposition v0.0.4 — same data as /metrics/cache
 /// `GET /v1/metrics` — rolling request-level JSON summary — mlx-vlm compatible
 pub fn build_router(state: AppState) -> Router {
+    routes(state, PhaseWatch::never())
+}
+
+/// The API surface under the layers of the server.
+fn routes(state: AppState, phase: PhaseWatch) -> Router {
+    with_layers(api(), state, phase)
+}
+
+/// Every route of the server. A route is added here and nowhere else, so that
+/// `with_layers` covers it.
+fn api() -> Router<AppState> {
     Router::new()
         // Liveness probe.
         .route("/health", get(health))
@@ -128,6 +142,16 @@ pub fn build_router(state: AppState) -> Router {
         .route("/metrics", get(openai::metrics_prometheus))
         // Metrics: rolling request-level JSON summary (mlx-vlm compatible).
         .route("/v1/metrics", get(openai::metrics_v1_summary))
+}
+
+/// The layers every route carries.
+fn with_layers(api: Router<AppState>, state: AppState, phase: PhaseWatch) -> Router {
+    api
+        // Inside the timeout, so the 408 drops a request as before.
+        .layer(middleware::from_fn_with_state(
+            phase,
+            shutdown::stop_at_shutdown,
+        ))
         // Per-request HTTP timeout middleware.
         // Applied after routing so it sees every handler (including /health).
         // Reads X-Request-Timeout-Seconds header; caps at AppState::max_timeout_secs.
@@ -144,65 +168,74 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Bind to `host:port` and serve until the process is interrupted.
+/// Bind to `host:port` and serve until SIGINT or SIGTERM, then stop within the
+/// bounds of [`shutdown`]. Run it through [`block_on_serve`], which ends the
+/// runtime at the deadline this returns.
 ///
-/// Caller is responsible for owning the tokio runtime.
-pub async fn serve(state: AppState, host: &str, port: u16) -> anyhow::Result<()> {
+/// # Errors
+/// The address is not valid, the bind failed, or the accept loop failed.
+pub async fn serve(state: AppState, host: &str, port: u16) -> anyhow::Result<ExitDeadline> {
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid address {host}:{port}: {e}"))?;
 
-    let router = build_router(state);
+    let gpu_pending = std::sync::Arc::clone(&state.gpu_pending);
+    let (phase, phase_watch) = shutdown::phase_channel();
+    let router = routes(state, phase_watch);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
 
-    // axum 0.8 removed implicit TCP_NODELAY. With Nagle's algorithm enabled by
-    // default, small SSE frames (one chunked-encoding event per token, ~100
-    // bytes) interact with macOS delayed-ACK and add per-token
-    // server→client latency. Setting TCP_NODELAY on every accepted socket is
-    // what oMLX/mlx-lm/uvicorn already do via Python's default.
-    let listener = listener.tap_io(|tcp_stream| {
-        if let Err(err) = tcp_stream.set_nodelay(true) {
-            tracing::trace!("failed to set TCP_NODELAY on incoming connection: {err:#}");
-        }
-    });
-
     info!(address = %addr, "rmlx-server listening");
 
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .map_err(|e| anyhow::anyhow!("serve: {e}"))
+    shutdown::serve_until(
+        listener,
+        router,
+        phase,
+        shutdown_signals(),
+        shutdown::Bounds::SERVER,
+        gpu_pending,
+    )
+    .await
 }
 
-/// Resolve when the process receives SIGINT (Ctrl-C) or SIGTERM (`kill`).
-/// Used as the axum graceful-shutdown trigger so normal teardown runs on
-/// signalled exit.
-// cancel-safe: only awaits signal-notification futures; no partial state on drop.
-async fn shutdown_signal() {
+/// One message for each SIGINT (Ctrl-C) and SIGTERM (`kill`) the process
+/// receives. The first starts the shutdown of [`shutdown`]; the second ends
+/// its wait for the open requests.
+fn shutdown_signals() -> tokio::sync::mpsc::Receiver<()> {
     use tokio::signal::unix::{signal, SignalKind};
 
-    let mut sigterm = match signal(SignalKind::terminate()) {
-        Ok(s) => s,
+    // A signal whose handler cannot be installed keeps its default
+    // disposition: the process ends at once, and the kernel frees the claim.
+    let listen = |kind: SignalKind, name: &'static str| match signal(kind) {
+        Ok(listener) => Some(listener),
         Err(e) => {
-            // If we cannot install the SIGTERM handler, fall back to Ctrl-C
-            // only; the default disposition (immediate exit) still applies to
-            // SIGTERM and the next start reclaims the stale claim.
-            warn!(error = %e, "failed to install SIGTERM handler; graceful shutdown limited to SIGINT");
-            tokio::signal::ctrl_c().await.ok();
-            return;
+            warn!(error = %e, signal = name, "failed to install the signal handler");
+            None
         }
     };
+    let mut sigint = listen(SignalKind::interrupt(), "SIGINT");
+    let mut sigterm = listen(SignalKind::terminate(), "SIGTERM");
+    let (received, signals) = tokio::sync::mpsc::channel(2);
+    tokio::spawn(async move {
+        loop {
+            let name = tokio::select! {
+                Some(()) = next_signal(&mut sigint) => "SIGINT",
+                Some(()) = next_signal(&mut sigterm) => "SIGTERM",
+                else => return,
+            };
+            info!(signal = name, "received a shutdown signal");
+            if received.send(()).await.is_err() {
+                return;
+            }
+        }
+    });
+    signals
+}
 
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            info!("received SIGINT — shutting down gracefully");
-        }
-        _ = sigterm.recv() => {
-            info!("received SIGTERM — shutting down gracefully");
-        }
-    }
+// cancel-safe: it only awaits the signal listener.
+async fn next_signal(listener: &mut Option<tokio::signal::unix::Signal>) -> Option<()> {
+    listener.as_mut()?.recv().await
 }
 
 // ── Health handler ────────────────────────────────────────────────────────────

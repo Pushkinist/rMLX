@@ -959,7 +959,7 @@ pub(crate) fn run_serve(
         .enable_all()
         .build()
         .map_err(|e| anyhow::anyhow!("tokio runtime: {e}"))?;
-    rt.block_on(async {
+    rmlx_server::block_on_serve(rt, claimed.claim(), async {
         // Spawn the SPSC metrics drainer task.
         // Must be inside block_on so tokio::spawn is available.
         let drainer_handle = spawn_drainer(drainer_db_path);
