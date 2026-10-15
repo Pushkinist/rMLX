@@ -11,15 +11,18 @@
 #![allow(clippy::needless_pass_by_value)]
 use std::path::Path;
 
-use minijinja::{value::ValueKind, Environment, Error as MjError, ErrorKind, Value};
+use minijinja::{
+    value::{Serde, ValueKind},
+    Environment, Error as MjError, ErrorKind, Value,
+};
 
 use rmlx_core::{Error, Result};
 
 // ── Python-compatible JSON serialiser ─────────────────────────────────────────
 //
 // Python's `json.dumps` uses `": "` (colon + space) and `", "` (comma +
-// space) separators by default. minijinja's built-in `tojson` filter calls
-// `serde_json::to_string` which produces compact JSON (no spaces).
+// space) separators by default and does not escape HTML characters.
+// minijinja's built-in `tojson` filter escapes `<`, `>`, `&` and `'`.
 //
 // Chat templates (Qwen3, Qwen3.5MoE, …) pass tool specs through `| tojson`
 // and the rendered string must be byte-identical to HF's output. We register
@@ -500,7 +503,7 @@ impl ChatTemplate {
         // ── tojson override — Python-compatible spacing ───────────────────────
         // HF `apply_chat_template` renders tool specs via Jinja `| tojson`
         // which uses Python's `json.dumps` (separators `": "` / `", "`).
-        // minijinja's built-in `tojson` uses compact format (no spaces).
+        // minijinja's built-in `tojson` escapes `<`, `>`, `&` and `'`.
         // We override the filter so the rendered string is byte-identical to
         // HF output on templates that pass tool specs through `| tojson`.
         env.add_filter(
@@ -581,7 +584,7 @@ impl ChatTemplate {
                 map.insert("role", Value::from(m.role));
                 map.insert("content", Value::from(m.content));
                 if let Some(tc) = m.tool_calls {
-                    map.insert("tool_calls", Value::from_serialize(tc));
+                    map.insert("tool_calls", Value::from(Serde(tc)));
                 }
                 if let Some(id) = m.tool_call_id {
                     map.insert("tool_call_id", Value::from(id));
@@ -589,7 +592,7 @@ impl ChatTemplate {
                 if let Some(name) = m.name {
                     map.insert("name", Value::from(name));
                 }
-                Value::from_serialize(map)
+                Value::from(Serde(map))
             })
             .collect();
 
@@ -598,7 +601,7 @@ impl ChatTemplate {
             .into_iter()
             .flatten()
             .filter(|(name, _)| !self.provides(name))
-            .map(|(name, value)| (name.clone(), Value::from_serialize(value)))
+            .map(|(name, value)| (name.clone(), Value::from(Serde(value))))
             .collect();
         // An empty tools slice serialises as an empty JSON array, which Jinja
         // evaluates as falsy, so `{% if tools %}` is false when no tools are
@@ -608,13 +611,13 @@ impl ChatTemplate {
             Value::from(opts.add_generation_prompt),
             Value::from(opts.bos_token),
             Value::from(opts.eos_token),
-            Value::from_serialize(opts.tools),
+            Value::from(Serde(opts.tools)),
         ];
         for (name, value) in SERVER_VARIABLES.into_iter().zip(server_values) {
             ctx.insert(name.to_owned(), value);
         }
 
-        let text = tmpl.render(Value::from_iter(ctx)).map_err(|e| {
+        let text = tmpl.render(Value::from(ctx)).map_err(|e| {
             // minijinja wraps an error raised inside an include or a super block.
             let refusal = std::iter::successors(std::error::Error::source(&e), |s| s.source())
                 .find_map(|s| s.downcast_ref::<TemplateRefusal>());
