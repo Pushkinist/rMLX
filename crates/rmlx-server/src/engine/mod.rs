@@ -56,7 +56,7 @@ pub use types::{
 // ── Crate-internal re-exports ─────────────────────────────────────────────────
 
 pub(crate) use helpers::{parse_request_kv_quant, record_ttft_and_prefill};
-pub(crate) use types::run_admitted;
+pub(crate) use types::{job_stream, run_admitted};
 
 // ── Test-visible re-exports ───────────────────────────────────────────────────
 

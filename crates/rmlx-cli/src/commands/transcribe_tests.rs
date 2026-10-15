@@ -22,6 +22,8 @@ fn rejects_non_whisper_arch() {
         format: "txt",
         language: "auto",
         translate: false,
+        prompt: "",
+        words: false,
     };
     let err = run_transcribe(&args, &ClaimedDevice::cpu()).unwrap_err();
     let msg = format!("{err}");
@@ -42,6 +44,8 @@ fn missing_config_is_error() {
         format: "txt",
         language: "auto",
         translate: false,
+        prompt: "",
+        words: false,
     };
     assert!(run_transcribe(&args, &ClaimedDevice::cpu()).is_err());
 }
@@ -73,6 +77,8 @@ fn a_refused_audio_file_is_refused_before_the_model_loads() {
         format: "txt",
         language: "auto",
         translate: false,
+        prompt: "",
+        words: false,
     };
     let msg = format!(
         "{}",
@@ -102,6 +108,8 @@ fn an_unknown_language_is_refused_naming_the_value() {
         format: "txt",
         language: "xx",
         translate: false,
+        prompt: "",
+        words: false,
     };
     let msg = format!(
         "{}",
@@ -111,4 +119,76 @@ fn an_unknown_language_is_refused_naming_the_value() {
         msg,
         "unknown language 'xx'; use a Whisper language code, an English language name or 'auto'"
     );
+}
+
+/// A prompt that holds the text of a special token is refused before the audio
+/// is read and before the model loads: the audio path does not exist and the
+/// model directory holds no weight. Runs on the CPU when `RMLX_O_MODELS_ROOT`
+/// holds `openai__whisper-large-v3-tokenizer`.
+#[test]
+fn a_prompt_with_special_token_text_is_refused_before_the_audio_is_read() {
+    let Some(root) = std::env::var_os("RMLX_O_MODELS_ROOT") else {
+        eprintln!(
+            "SKIP a_prompt_with_special_token_text_is_refused_before_the_audio_is_read: RMLX_O_MODELS_ROOT is unset"
+        );
+        return;
+    };
+    let tokenizer = Path::new(&root).join("openai__whisper-large-v3-tokenizer");
+    if !tokenizer.join("tokenizer.json").exists() {
+        eprintln!(
+            "SKIP a_prompt_with_special_token_text_is_refused_before_the_audio_is_read: no openai__whisper-large-v3-tokenizer under the root"
+        );
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.json"),
+        r#"{"model_type": "whisper"}"#,
+    )
+    .unwrap();
+    let args = TranscribeArgs {
+        audio: Path::new("/nonexistent/audio.wav"),
+        model: dir.path(),
+        tokenizer: Some(&tokenizer),
+        format: "txt",
+        language: "auto",
+        translate: false,
+        prompt: "Names: <|endoftext|>",
+        words: false,
+    };
+    let msg = format!(
+        "{}",
+        run_transcribe(&args, &ClaimedDevice::cpu()).unwrap_err()
+    );
+    assert!(msg.starts_with("invalid prompt: "), "{msg}");
+}
+
+/// `--words` with a format other than `json` is refused before the audio is
+/// read and before the model loads: the audio path does not exist and the model
+/// directory holds no weight. `srt`, `vtt` and `txt` have no place for words.
+#[test]
+fn words_with_a_format_other_than_json_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.json"),
+        r#"{"model_type": "whisper"}"#,
+    )
+    .unwrap();
+    for format in ["txt", "srt", "vtt"] {
+        let args = TranscribeArgs {
+            audio: Path::new("/nonexistent/audio.wav"),
+            model: dir.path(),
+            tokenizer: None,
+            format,
+            language: "en",
+            translate: false,
+            prompt: "",
+            words: true,
+        };
+        let msg = format!(
+            "{}",
+            run_transcribe(&args, &ClaimedDevice::cpu()).unwrap_err()
+        );
+        assert_eq!(msg, "--words needs --format json", "{format}");
+    }
 }

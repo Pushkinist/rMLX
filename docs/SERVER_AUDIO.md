@@ -10,12 +10,13 @@ Both take the OpenAI multipart form; `translations` translates to English.
 The fields, the bodies and each status are in [`AUDIO.md`](AUDIO.md) §
 "HTTP route". `file` is at most 25 MiB (413 above it, naming the cap and
 the size); `language`, `response_format` and `temperature` (the first step of
-each window's temperature ladder) are read; `timestamp_granularities=word` and
-`stream=true` are 422; `prompt` and any other field are ignored, counted in
-at most one `warn` event. A `verbose_json` segment has the keys OpenAI's schema
-requires except `avg_logprob` and `no_speech_prob`, which no segment holds:
-a client that requires them, `@ai-sdk/openai` with the model `whisper-1` or
-openai-python in strict mode, cannot read it.
+each window's temperature ladder) are read; `timestamp_granularities=word`
+adds word times to `verbose_json` and is 422 with any other format
+([`AUDIO.md`](AUDIO.md) § "Word timestamps"); `stream=true` sends a `json`
+reply as server-sent events and is 422 with any other format (see "Streamed
+transcription"); `prompt` is read ([`AUDIO.md`](AUDIO.md) § "Prompt"),
+and any other field is ignored, counted in at most one `warn` event. A `verbose_json` segment has the ten keys OpenAI's schema
+requires ([`AUDIO.md`](AUDIO.md) § "HTTP route").
 A Whisper load failure is 503 with `x-should-retry: false` and names no
 server directory; an engine failure during the transcription is 503.
 
@@ -34,7 +35,8 @@ times. The seek consumes the whole window when the tokens end in a single
 timestamp, and otherwise goes to the end of the last closed segment
 ([`AUDIO.md`](AUDIO.md), "Seek rule"). A window is skipped when its
 no-speech probability is above 0.6 and the model writes no more than a stock
-phrase for it ([`AUDIO.md`](AUDIO.md), "No-speech gate"). The previous window's text is fed back as a `<|startofprev|>` prompt.
+phrase for it ([`AUDIO.md`](AUDIO.md), "No-speech gate"). The request's `prompt`, then the previous window's text, are fed back as a
+`<|startofprev|>` prompt.
 A decode that is a repetition loop or has a low average log-probability is
 decoded again, first without the prompt for a loop, then up a temperature
 ladder ([`AUDIO.md`](AUDIO.md), "Window decision"). No segment
@@ -60,7 +62,9 @@ When the request is gone, because the 408 fired, the client closed the
 connection or a server shutdown dropped it, the transcription stops before
 its next 30 s window and releases the permit. An `info` event in the request's span,
 `long-form transcription cancelled before the window opened`, gives the
-window number and its `seek` in samples. The stop is not immediate:
+window number, its `seek` in samples and the cause, `stop`: `flag` for the
+flag of the request, `reader_gone` for a streamed reply whose client is gone.
+The stop is not immediate:
 
 - The window in flight runs to its end: the encode, the gate and at most
   seven decodes of `n_text_ctx / 2` tokens each (224 for large-v3). See
@@ -74,6 +78,54 @@ window number and its `seek` in samples. The stop is not immediate:
   walk stops. A window that still runs 2 s later ends with the process
   ([`SERVER_SHUTDOWN.md`](SERVER_SHUTDOWN.md)). With `--max-timeout-secs 0`,
   only a closed connection or the shutdown stops it.
+
+#### Streamed transcription
+
+`stream=true` (or `True`, or `1`) with `response_format` `json`, named or by
+default, gives a reply of server-sent events (`text/event-stream`), on
+`/v1/audio/transcriptions` and on `/v1/audio/translations`. With any other
+`response_format` the request is 422 with `param: stream`: OpenAI's streamed
+models give `json` only. `stream=false`, `0` and an empty value give the
+reply of a request with no `stream` field.
+
+Each event is one `data:` line that holds a JSON object with a `type`, as the
+chat routes send their chunks. No event has an `event:` name.
+
+| Event | When |
+|---|---|
+| `{"type":"transcript.text.delta","delta":"…"}` | A 30 s window closed and its segments hold text. A window with no text sends no event. |
+| `{"type":"transcript.text.done","text":"…"}` | The transcription ended. This is the last event. |
+
+The segments of a window are final when the window closes, so no later event
+changes the text of a delta. A `delta` is the text of the segments of its
+window, with each run of white space made one space. Each delta but the first
+starts with one space. The deltas, joined with nothing, are the `text` of the
+done event, and that is the `text` of the reply with no `stream`. The done
+event holds no `usage`, and no `data: [DONE]` line follows it. The server
+sends no keep-alive event, and one window can take seconds.
+
+The reply starts when the prompt is encoded, the audio is decoded and the
+model is loaded. A failure before that point, for example a file that the
+decoder refuses, is the JSON error reply of a request with no `stream`, with
+its status. A failure after the first event is one error event,
+`{"error":{"message","type"}}`, with the message and the type of that error
+reply. Then the stream ends with no done event, and no `[DONE]` line follows.
+A panic after the first event ends the stream with no event; the server log
+has it. A client must look for `transcript.text.done` to know that it has the whole
+text.
+
+A client that closes the connection stops the transcription before its next
+window, as for a request with no `stream`: the job cannot send the next delta,
+or it reads the flag of its request. The GPU permit is free when the window in
+flight ends. A client that does not read can hold the permit: when the
+connection's buffers are full and four events wait, the job waits until the
+client reads, closes, or the server shuts down.
+
+The request timeout (`--max-timeout-secs`, `X-Request-Timeout-Seconds`) bounds
+the time to the start of the reply, that is the prompt, the audio decode and
+the model load. It does not bound the stream after the start: then only a
+closed connection, the server shutdown or the end of the audio ends it: the
+timeout layer stops its clock when the route returns the response head.
 
 ### Text-to-speech: `/v1/audio/speech`
 

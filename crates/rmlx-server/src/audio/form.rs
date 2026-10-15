@@ -47,6 +47,12 @@ pub(super) struct AudioFormFields {
     pub(super) language: String,
     pub(super) response_format: ResponseFormat,
     pub(super) temperature: f32,
+    /// The `prompt` text, whole: the transport limit of the form bounds it.
+    pub(super) prompt: String,
+    /// `timestamp_granularities` holds `word`: the reply holds word times.
+    pub(super) words: bool,
+    /// `stream` is true: the reply is server-sent events. Only `json` streams.
+    pub(super) stream: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -80,8 +86,8 @@ impl ResponseFormat {
 /// the upload is one allocation and is never copied. Every other field is read
 /// chunk by chunk: a field the route reads keeps its first
 /// `SHORT_FIELD_BYTES` bytes, and one longer than that is refused, so no
-/// refusal echoes more of the client's text; a field the route ignores keeps
-/// nothing. After a form that is not refused, one `warn` event counts and names
+/// refusal echoes more of the client's text, except `prompt`, which is kept
+/// whole; a field the route ignores keeps nothing. After a form that is not refused, one `warn` event counts and names
 /// the ignored fields.
 pub(super) async fn parse_multipart(
     multipart: &mut Multipart,
@@ -93,6 +99,9 @@ pub(super) async fn parse_multipart(
     let mut language = "auto".to_owned();
     let mut response_format = ResponseFormat::Json;
     let mut temperature = 0.0_f32;
+    let mut prompt = String::new();
+    let mut words = false;
+    let mut stream = false;
     let mut ignored = IgnoredFields::default();
     let mut parts = 0_usize;
     // Bytes of the fields read before the file: not the file's.
@@ -159,21 +168,25 @@ pub(super) async fn parse_multipart(
                 }
                 temperature = t;
             }
+            "prompt" => {
+                let mut bytes = Vec::new();
+                while let Some(chunk) = field.chunk().await.map_err(unreadable)? {
+                    bytes.extend_from_slice(&chunk);
+                }
+                read_before_file += bytes.len();
+                prompt = String::from_utf8(bytes)
+                    .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+            }
             // OpenAI's SDKs send an array field under its name with `[]`.
             "timestamp_granularities" | "timestamp_granularities[]" => {
                 let text = short_value(&name, read_short(&mut field, body_len).await?)?;
                 match text.as_str() {
                     "segment" => {}
-                    "word" => {
-                        return Err(bad_field(
-                            &name,
-                            format!("{name} 'word' is not supported: timing is per segment"),
-                        ));
-                    }
+                    "word" => words = true,
                     other => {
                         return Err(bad_field(
                             &name,
-                            format!("unknown {name} '{other}'; must be 'segment'"),
+                            format!("unknown {name} '{other}'; must be 'word' or 'segment'"),
                         ));
                     }
                 }
@@ -181,15 +194,8 @@ pub(super) async fn parse_multipart(
             "stream" => {
                 let text = short_value(&name, read_short(&mut field, body_len).await?)?;
                 match text.to_ascii_lowercase().as_str() {
-                    "false" | "0" | "" => {}
-                    "true" | "1" => {
-                        return Err(bad_field(
-                            "stream",
-                            "stream=true is not supported: the transcription is sent whole \
-                             when it ends"
-                                .to_owned(),
-                        ));
-                    }
+                    "false" | "0" | "" => stream = false,
+                    "true" | "1" => stream = true,
                     _ => {
                         return Err(bad_field(
                             "stream",
@@ -219,6 +225,21 @@ pub(super) async fn parse_multipart(
     if audio_bytes.is_empty() {
         return Err(bad_field("file", "audio file is empty".to_owned()));
     }
+    if words && response_format != ResponseFormat::VerboseJson {
+        return Err(bad_field(
+            "timestamp_granularities",
+            "timestamp_granularities 'word' needs response_format verbose_json".to_owned(),
+        ));
+    }
+
+    if stream && response_format != ResponseFormat::Json {
+        return Err(bad_field(
+            "stream",
+            "stream=true needs response_format json; the other formats are sent whole when \
+             the transcription ends"
+                .to_owned(),
+        ));
+    }
 
     Ok(AudioFormFields {
         audio_bytes,
@@ -226,6 +247,9 @@ pub(super) async fn parse_multipart(
         language,
         response_format,
         temperature,
+        prompt,
+        words,
+        stream,
     })
 }
 

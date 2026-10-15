@@ -3,7 +3,7 @@
 
 use std::convert::Infallible;
 
-use super::{decode_loop, window_start, writes_at_most, Decoded, Stop, WindowStart};
+use super::{decode_loop, window_start, writes_at_most, Decoded, NonFiniteRow, Stop, WindowStart};
 use crate::tokenizer::{
     N_VOCAB, TOK_EN, TOK_EOT, TOK_NOSPEECH, TOK_NO_TIMESTAMPS, TOK_SOT, TOK_TIMESTAMP_BEGIN,
     TOK_TRANSCRIBE, TOK_TRANSLATE,
@@ -212,17 +212,61 @@ fn start_row(share: f32, language: u32) -> Vec<f32> {
     row
 }
 
-/// What `window_start` read and every input it fed to the decoder.
-fn start_of(row: &[f32]) -> (WindowStart, Vec<Vec<u32>>) {
+/// The failure of a scripted start read: only a row that is not finite.
+#[derive(Debug, PartialEq, Eq)]
+struct NotFinite(NonFiniteRow);
+
+impl From<NonFiniteRow> for NotFinite {
+    fn from(row: NonFiniteRow) -> Self {
+        Self(row)
+    }
+}
+
+/// What `window_start` read of `row`, or why it refused, and every input it
+/// fed to the decoder.
+fn read_start(row: &[f32]) -> (Result<WindowStart, NotFinite>, Vec<Vec<u32>>) {
     let mut inputs: Vec<Vec<u32>> = Vec::new();
-    let result: Result<WindowStart, Infallible> = window_start(|input: &[u32]| {
+    let result = window_start(|input: &[u32]| {
         inputs.push(input.to_vec());
         Ok(row.to_vec())
     });
-    match result {
-        Ok(start) => (start, inputs),
-        Err(never) => match never {},
+    (result, inputs)
+}
+
+/// What `window_start` read and every input it fed to the decoder.
+fn start_of(row: &[f32]) -> (WindowStart, Vec<Vec<u32>>) {
+    match read_start(row) {
+        (Ok(start), inputs) => (start, inputs),
+        (Err(refused), _) => panic!("the start row was refused: {refused:?}"),
     }
+}
+
+/// A start row with a `NaN` or `+inf` logit is an error, wherever the logit is:
+/// the no-speech probability would be `NaN` and the language would be the
+/// first one with no message.
+#[test]
+fn a_start_row_that_is_not_finite_is_an_error() {
+    for bad in [f32::NAN, f32::INFINITY] {
+        for at in [0, TOK_EN as usize, TOK_NOSPEECH as usize, N_VOCAB - 1] {
+            let mut row = start_row(NO_SPEECH_AT_START, TOK_EN);
+            row[at] = bad;
+            let (read, inputs) = read_start(&row);
+            assert_eq!(
+                read,
+                Err(NotFinite(NonFiniteRow { len: row.len() })),
+                "{bad} at {at}"
+            );
+            assert_eq!(inputs, [vec![TOK_SOT]]);
+        }
+    }
+}
+
+/// A masked logit is not a fault: the start row may hold `-inf`.
+#[test]
+fn a_start_row_with_a_masked_logit_is_read() {
+    let mut row = start_row(NO_SPEECH_AT_START, TOK_EN);
+    row[0] = f32::NEG_INFINITY;
+    assert!(read_start(&row).0.is_ok());
 }
 
 /// The no-speech row is read with one forward whose whole input is the start

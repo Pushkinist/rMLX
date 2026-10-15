@@ -189,9 +189,20 @@ fn transcribe(
         task: WhisperTask::Transcribe,
         temperature: 0.0,
         condition_on_previous_text: true,
+        prompt_tokens: Vec::new(),
+        words: false,
     };
     Transcriber::new(Arc::clone(model), Arc::clone(tokenizer))
-        .and_then(|t| transcribe_request(&t, samples, &opts, device, &AtomicBool::new(false)))
+        .and_then(|t| {
+            transcribe_request(
+                &t,
+                samples,
+                &opts,
+                device,
+                &AtomicBool::new(false),
+                &mut |_| Ok(()),
+            )
+        })
         .map(|t| t.text)
         .map_err(|e| e.to_string())
 }

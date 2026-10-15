@@ -1,9 +1,10 @@
 //! Unit tests for the long-form transcription engine helpers (no model needed).
 
 use super::{
-    compression_ratio, detection_input_needed, fmt_time, next_prompt, previous_text_cap,
-    render_srt, render_vtt, reported_language, requested_language, resolve_language,
-    window_token_budget, OutputFormat, Segment, WindowOutcome, COMPRESSION_RATIO_LOOP,
+    compression_ratio, detection_input_needed, fmt_time, joined_text, next_prompt,
+    previous_text_cap, render, render_srt, render_vtt, reported_language, requested_language,
+    resolve_language, window_token_budget, OutputFormat, Prompt, Segment, TextDeltas,
+    Transcription, WindowOutcome, COMPRESSION_RATIO_LOOP,
 };
 use crate::mel::N_SAMPLES;
 use crate::tokenizer::{TOK_EN, TOK_TIMESTAMP_BEGIN};
@@ -118,7 +119,9 @@ fn srt_vtt_multi_segment() {
             text: "hello world".to_owned(),
             tokens: Vec::new(),
             temperature: 0.0,
+            avg_logprob: -0.5,
             compression_ratio: 1.0,
+            no_speech_prob: 0.02,
         },
         Segment {
             seek: 0,
@@ -127,7 +130,9 @@ fn srt_vtt_multi_segment() {
             text: "second line".to_owned(),
             tokens: Vec::new(),
             temperature: 0.0,
+            avg_logprob: -0.5,
             compression_ratio: 1.0,
+            no_speech_prob: 0.02,
         },
     ];
     let srt = render_srt(&segs);
@@ -138,6 +143,83 @@ fn srt_vtt_multi_segment() {
     assert!(vtt.starts_with("WEBVTT\n\n"));
     assert!(vtt.contains("00:00:00.000 --> 00:00:02.500\nhello world"));
     assert!(vtt.contains("00:00:02.500 --> 00:00:05.000\nsecond line"));
+}
+
+/// `rmlx transcribe --format json` shows each segment with the ten keys of the
+/// OpenAI `TranscriptionSegment` schema and the values of the segment, the id
+/// being its place in the transcription.
+#[test]
+fn json_segments_carry_the_ten_openai_keys() {
+    let transcription = Transcription {
+        text: "hello world".to_owned(),
+        segments: vec![Segment {
+            seek: 3_000,
+            start: 30.0,
+            end: 32.5,
+            text: "hello world".to_owned(),
+            tokens: vec![50_365, 440, 50_490],
+            temperature: 0.25,
+            avg_logprob: -0.75,
+            compression_ratio: 1.25,
+            no_speech_prob: 0.125,
+        }],
+        language: "english".to_owned(),
+        duration: 62.5,
+        words: None,
+    };
+    let json: serde_json::Value =
+        serde_json::from_str(&render(&transcription, OutputFormat::Json).expect("renders"))
+            .expect("JSON");
+    assert_eq!(json["text"], "hello world");
+    assert_eq!(json["language"], "english");
+    assert_eq!(json["duration"], 62.5);
+    let mut top: Vec<&str> = json
+        .as_object()
+        .expect("the output is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    top.sort_unstable();
+    assert_eq!(
+        top,
+        ["duration", "language", "segments", "text"],
+        "no task and no words with no request for words"
+    );
+    let segments = json["segments"].as_array().expect("segments");
+    assert_eq!(segments.len(), 1);
+    let mut keys: Vec<&str> = segments[0]
+        .as_object()
+        .expect("a segment is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "avg_logprob",
+            "compression_ratio",
+            "end",
+            "id",
+            "no_speech_prob",
+            "seek",
+            "start",
+            "temperature",
+            "text",
+            "tokens",
+        ]
+    );
+    let segment = &segments[0];
+    assert_eq!(segment["id"], 0);
+    assert_eq!(segment["seek"], 3_000);
+    assert_eq!(segment["start"], 30.0);
+    assert_eq!(segment["end"], 32.5);
+    assert_eq!(segment["text"], "hello world");
+    assert_eq!(segment["tokens"], serde_json::json!([50_365, 440, 50_490]));
+    assert_eq!(segment["temperature"], 0.25);
+    assert_eq!(segment["avg_logprob"], -0.75);
+    assert_eq!(segment["compression_ratio"], 1.25);
+    assert_eq!(segment["no_speech_prob"], 0.125);
 }
 
 // ── Scripted token streams for the window tests ──────────────────────────────
@@ -224,8 +306,35 @@ fn outcome(carry_text: bool) -> WindowOutcome {
         tokens: Vec::new(),
         attempts: Vec::new(),
         kept: 0,
+        no_speech_prob: 0.0,
         skipped: false,
         carry_text,
+    }
+}
+
+/// The outcome of a window that was skipped: it gives no text and may be
+/// carried.
+fn skipped_outcome() -> WindowOutcome {
+    WindowOutcome {
+        skipped: true,
+        ..outcome(true)
+    }
+}
+
+/// A prompt of the carried text of earlier windows only: a request with no
+/// client prompt.
+fn carried_only(tokens: &[u32]) -> Prompt {
+    Prompt {
+        client: Vec::new(),
+        carried: tokens.to_vec(),
+    }
+}
+
+/// A prompt of the client's tokens, then carried ones.
+fn client_then_carried(client: &[u32], carried: &[u32]) -> Prompt {
+    Prompt {
+        client: client.to_vec(),
+        carried: carried.to_vec(),
     }
 }
 
@@ -234,42 +343,165 @@ fn outcome(carry_text: bool) -> WindowOutcome {
 #[test]
 fn a_window_that_may_not_be_carried_clears_the_prompt() {
     let next = next_prompt(
-        PROMPT.to_vec(),
+        carried_only(&PROMPT),
         &outcome(false),
         true,
         "loop",
         bytes_as_tokens,
         10,
     );
-    assert_eq!(next, Vec::<u32>::new());
+    assert_eq!(next, Prompt::default());
+    assert_eq!(next.tokens(10), Vec::<u32>::new());
 }
 
-/// With conditioning on, the window's trimmed text replaces the prompt, cut to
-/// its last `cap` tokens.
+/// With conditioning on, the window's trimmed text replaces the carried text,
+/// cut to its last `cap` tokens. With no client prompt the window prompt is
+/// that text alone, as before the client could send one.
 #[test]
 fn a_carried_window_replaces_the_prompt_cut_to_the_cap() {
     let carried = outcome(true);
     let next = next_prompt(
-        PROMPT.to_vec(),
+        carried_only(&PROMPT),
         &carried,
         true,
         " abcdef ",
         bytes_as_tokens,
         4,
     );
-    assert_eq!(next, bytes_as_tokens("cdef"));
-    let next = next_prompt(PROMPT.to_vec(), &carried, true, "ab", bytes_as_tokens, 4);
-    assert_eq!(next, bytes_as_tokens("ab"));
+    assert_eq!(next.tokens(4), bytes_as_tokens("cdef"));
+    let next = next_prompt(
+        carried_only(&PROMPT),
+        &carried,
+        true,
+        "ab",
+        bytes_as_tokens,
+        4,
+    );
+    assert_eq!(next.tokens(4), bytes_as_tokens("ab"));
 }
 
-/// With conditioning off, or a window with no text, the prompt is kept.
+/// With conditioning off, or a window with no text, a prompt with no client
+/// tokens is kept.
 #[test]
 fn the_prompt_is_kept_with_conditioning_off_or_no_text() {
     let carried = outcome(true);
-    let next = next_prompt(PROMPT.to_vec(), &carried, false, "abc", bytes_as_tokens, 4);
-    assert_eq!(next, PROMPT.to_vec());
-    let next = next_prompt(PROMPT.to_vec(), &carried, true, "  ", bytes_as_tokens, 4);
-    assert_eq!(next, PROMPT.to_vec());
+    let next = next_prompt(
+        carried_only(&PROMPT),
+        &carried,
+        false,
+        "abc",
+        bytes_as_tokens,
+        4,
+    );
+    assert_eq!(next.tokens(4), PROMPT.to_vec());
+    let next = next_prompt(
+        carried_only(&PROMPT),
+        &carried,
+        true,
+        "  ",
+        bytes_as_tokens,
+        4,
+    );
+    assert_eq!(next.tokens(4), PROMPT.to_vec());
+}
+
+/// With conditioning off, a decoded window drops the client tokens and keeps
+/// the carried ones.
+#[test]
+fn with_conditioning_off_a_decoded_window_drops_the_client_tokens_only() {
+    let next = next_prompt(
+        client_then_carried(&[1, 2], &PROMPT),
+        &outcome(true),
+        false,
+        "abc",
+        bytes_as_tokens,
+        10,
+    );
+    assert_eq!(next.tokens(10), PROMPT.to_vec());
+}
+
+/// The tokens of the client come first, then the carried text.
+#[test]
+fn the_client_tokens_come_before_the_carried_text() {
+    let prompt = client_then_carried(&[1, 2], &[3, 4]);
+    assert_eq!(prompt.tokens(10), [1, 2, 3, 4]);
+    let next = next_prompt(prompt, &outcome(true), true, "ab", bytes_as_tokens, 10);
+    assert_eq!(next.tokens(10), [1, 2, 97, 98]);
+}
+
+/// A prompt longer than the cap loses its left end: the client tokens go
+/// first, then the first carried ones.
+#[test]
+fn the_cut_keeps_the_right_end() {
+    let prompt = client_then_carried(&[1, 2], &[3, 4]);
+    assert_eq!(prompt.tokens(3), [2, 3, 4]);
+    assert_eq!(prompt.tokens(2), [3, 4]);
+    assert_eq!(prompt.tokens(1), [4]);
+    assert_eq!(prompt.tokens(0), Vec::<u32>::new());
+    let next = next_prompt(prompt, &outcome(true), true, "abc", bytes_as_tokens, 4);
+    assert_eq!(next.tokens(4), [2_u32, 97, 98, 99]);
+}
+
+/// A window that may not be carried drops the client tokens with the carried
+/// text.
+#[test]
+fn a_reset_drops_the_client_tokens_too() {
+    let next = next_prompt(
+        client_then_carried(&[1, 2], &[3, 4]),
+        &outcome(false),
+        true,
+        "abc",
+        bytes_as_tokens,
+        10,
+    );
+    assert_eq!(next.tokens(10), Vec::<u32>::new());
+}
+
+/// A skipped window changes nothing, with conditioning on or off.
+#[test]
+fn a_skipped_window_keeps_both() {
+    for condition in [true, false] {
+        let prompt = client_then_carried(&[1, 2], &[3, 4]);
+        let next = next_prompt(
+            prompt.clone(),
+            &skipped_outcome(),
+            condition,
+            "",
+            |_: &str| vec![99],
+            10,
+        );
+        assert_eq!(next, prompt, "conditioning {condition}");
+    }
+}
+
+/// A window with no text, with conditioning on, changes nothing.
+#[test]
+fn a_window_with_no_text_keeps_both() {
+    let prompt = client_then_carried(&[1, 2], &[3, 4]);
+    let next = next_prompt(
+        prompt.clone(),
+        &outcome(true),
+        true,
+        "  ",
+        bytes_as_tokens,
+        10,
+    );
+    assert_eq!(next, prompt);
+}
+
+/// With conditioning off, the client tokens serve the first decoded window
+/// only.
+#[test]
+fn with_conditioning_off_the_client_tokens_serve_one_decoded_window() {
+    let next = next_prompt(
+        client_then_carried(&[1, 2], &[]),
+        &outcome(true),
+        false,
+        "abc",
+        bytes_as_tokens,
+        10,
+    );
+    assert_eq!(next, Prompt::default());
 }
 
 /// `auto` asks for detection; a code or an English name, in any case, names a
@@ -361,4 +593,66 @@ fn only_a_short_window_of_a_file_with_no_language_has_a_detection_input() {
 fn a_report_with_no_detected_language_names_english() {
     assert_eq!(reported_language(None, 0), "english");
     assert_eq!(reported_language(None, 4), "english");
+}
+
+// ── The text delta of each closed window ────────────────────────────────────
+
+/// A segment with the text `text`; no other key is read here.
+pub(super) fn text_segment(text: &str) -> Segment {
+    Segment {
+        seek: 0,
+        start: 0.0,
+        end: 1.0,
+        text: text.to_owned(),
+        tokens: Vec::new(),
+        temperature: 0.0,
+        avg_logprob: -0.5,
+        compression_ratio: 1.0,
+        no_speech_prob: 0.02,
+    }
+}
+
+/// The windows of `texts`, each a list of segment texts.
+fn windows(texts: &[&[&str]]) -> Vec<Vec<Segment>> {
+    texts
+        .iter()
+        .map(|window| window.iter().map(|text| text_segment(text)).collect())
+        .collect()
+}
+
+/// The deltas of the windows, joined with nothing, are the text of the
+/// transcription: for one window, for several windows, around a window with no
+/// segment or with white space only, and with white space inside a segment.
+#[test]
+fn the_window_deltas_join_to_the_text_of_the_transcription() {
+    let cases: [(&[&[&str]], &[&str]); 5] = [
+        (&[&["Hello world."]], &["Hello world."]),
+        (&[&["One.", "Two."], &["Three."]], &["One. Two.", " Three."]),
+        (&[&[], &["One."], &[], &["Two."]], &["One.", " Two."]),
+        (
+            &[&["  one   two "], &["\tthree\n four", " five"]],
+            &["one two", " three four five"],
+        ),
+        (&[&[" "], &["", "One."], &["  "]], &["One."]),
+    ];
+    for (texts, expected) in cases {
+        let windows = windows(texts);
+        let mut deltas = TextDeltas::default();
+        let got: Vec<String> = windows.iter().filter_map(|w| deltas.delta(w)).collect();
+        assert_eq!(got, expected, "{texts:?}");
+        let all: Vec<Segment> = windows.into_iter().flatten().collect();
+        assert_eq!(got.concat(), joined_text(&all), "{texts:?}");
+    }
+}
+
+/// A window with no segment adds no text, before and after the first delta.
+#[test]
+fn a_window_with_no_segment_has_no_delta() {
+    let mut deltas = TextDeltas::default();
+    assert_eq!(deltas.delta(&[]), None);
+    assert_eq!(
+        deltas.delta(&[text_segment("One.")]).as_deref(),
+        Some("One.")
+    );
+    assert_eq!(deltas.delta(&[]), None);
 }

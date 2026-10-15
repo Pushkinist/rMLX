@@ -1,9 +1,15 @@
 //! Unit tests for the window plan and the window walk (no model needed).
 
-use super::{plan_window, walk_windows, window_segments, RawSegment, SeekRule, WalkEnd};
+use super::{
+    plan_window, walk_windows, window_segments, RawSegment, SeekRule, StopCause, Walk, WalkEnd,
+};
 use crate::mel::HOP_LENGTH;
 use crate::tokenizer::TOK_TIMESTAMP_BEGIN;
-use crate::transcribe::fallback::{Attempt, Verdict};
+use crate::transcribe::fallback::{decode_with_fallback, Attempt, Verdict, WindowOutcome};
+use crate::transcribe::tests::text_segment;
+use crate::transcribe::Segment;
+use crate::whisper::decode_loop::{Decoded, Stop};
+use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 // ── Window plan: segments and seek advance from a window's sampled tokens ────
@@ -350,14 +356,29 @@ fn plan_names_the_seek_rule() {
 const TAIL_SEEK: usize = 1_738_880;
 const TAIL_SAMPLES: usize = 53_920;
 
-fn accepted() -> Attempt {
-    Attempt {
-        temperature: 0.0,
-        with_prompt: true,
-        compression_ratio: 1.0,
-        avg_logprob: -0.3,
-        verdict: Verdict::Accepted,
+/// The outcome of a window that kept `attempt` as its only decode.
+fn outcome_keeping(attempt: Attempt, no_speech_prob: f32) -> WindowOutcome {
+    WindowOutcome {
+        tokens: Vec::new(),
+        attempts: vec![attempt],
+        kept: 0,
+        no_speech_prob,
+        skipped: false,
+        carry_text: true,
     }
+}
+
+fn accepted() -> WindowOutcome {
+    outcome_keeping(
+        Attempt {
+            temperature: 0.0,
+            with_prompt: true,
+            compression_ratio: 1.0,
+            avg_logprob: -0.3,
+            verdict: Verdict::Accepted,
+        },
+        0.01,
+    )
 }
 
 /// The duration of a file that ends with the window, and the start and the
@@ -505,6 +526,28 @@ fn no_segment_of_a_reply_ends_after_the_duration_of_the_file() {
 
 const MAX_SCRIPTED_WINDOWS: usize = 8;
 
+/// The error of a scripted walk.
+#[derive(Debug, PartialEq, Eq)]
+enum Scripted {
+    /// The walk opened more windows than the script allows.
+    TooManyWindows,
+    /// A scripted window decode failed.
+    Failed(&'static str),
+    /// The window sink failed with an error that is not the stop.
+    Sink(String),
+}
+
+impl From<rmlx_core::error::Error> for Scripted {
+    fn from(e: rmlx_core::error::Error) -> Self {
+        Self::Sink(e.to_string())
+    }
+}
+
+/// How a walk ended, without its segments.
+fn end_of(walk: Result<Walk, Scripted>) -> Result<WalkEnd, Scripted> {
+    walk.map(|walk| walk.end)
+}
+
 /// Run `walk_windows` over `total_samples`, answering window `k` with
 /// `scripts[k]`. Any window past the script gets a one-timestamp filler stream.
 /// Returns every `(seek, window_samples)` the walk asked for.
@@ -512,18 +555,26 @@ fn walk(total_samples: usize, scripts: &[&[u32]]) -> Vec<(usize, usize)> {
     let filler = [ts(0.0), A, ts(0.04)];
     let mut calls: Vec<(usize, usize)> = Vec::new();
     let never = AtomicBool::new(false);
-    let result = walk_windows(total_samples, &never, |seek, window_samples| {
-        // No scripted walk opens this many windows: a walk that does not end
-        // fails here and does not hang the test binary.
-        if calls.len() >= MAX_SCRIPTED_WINDOWS {
-            return Err(());
-        }
-        let tokens = scripts.get(calls.len()).copied().unwrap_or(&filler);
-        calls.push((seek, window_samples));
-        Ok(plan_window(tokens, window_samples).advance_samples)
-    });
+    let result = walk_windows(
+        total_samples,
+        &never,
+        |seek, window_samples, _| {
+            // No scripted walk opens this many windows: a walk that does not end
+            // fails here and does not hang the test binary.
+            if calls.len() >= MAX_SCRIPTED_WINDOWS {
+                return Err(Scripted::TooManyWindows);
+            }
+            let tokens = scripts.get(calls.len()).copied().unwrap_or(&filler);
+            calls.push((seek, window_samples));
+            Ok((
+                plan_window(tokens, window_samples).advance_samples,
+                Vec::new(),
+            ))
+        },
+        &mut |_| Ok(()),
+    );
     assert_eq!(
-        result,
+        end_of(result),
         Ok(WalkEnd::Finished),
         "walk did not end; windows: {calls:?}"
     );
@@ -589,14 +640,19 @@ fn pair_at_12_s_starts_the_next_window_at_12_s() {
 fn walk_consumes_a_window_that_reports_no_advance() {
     let mut calls: Vec<(usize, usize)> = Vec::new();
     let never = AtomicBool::new(false);
-    let result = walk_windows(640_000, &never, |seek, window_samples| {
-        if calls.len() >= MAX_SCRIPTED_WINDOWS {
-            return Err(());
-        }
-        calls.push((seek, window_samples));
-        Ok(0)
-    });
-    assert_eq!(result, Ok(WalkEnd::Finished));
+    let result = walk_windows(
+        640_000,
+        &never,
+        |seek, window_samples, _| {
+            if calls.len() >= MAX_SCRIPTED_WINDOWS {
+                return Err(Scripted::TooManyWindows);
+            }
+            calls.push((seek, window_samples));
+            Ok((0, Vec::new()))
+        },
+        &mut |_| Ok(()),
+    );
+    assert_eq!(end_of(result), Ok(WalkEnd::Finished));
     assert_eq!(calls, [(0, 480_000), (480_000, 160_000)]);
 }
 
@@ -605,11 +661,16 @@ fn walk_consumes_a_window_that_reports_no_advance() {
 fn walk_stops_on_the_first_error() {
     let mut calls = 0;
     let never = AtomicBool::new(false);
-    let result = walk_windows(640_000, &never, |_, _| {
-        calls += 1;
-        Err("decode failed")
-    });
-    assert_eq!(result, Err("decode failed"));
+    let result = walk_windows(
+        640_000,
+        &never,
+        |_, _, _| {
+            calls += 1;
+            Err(Scripted::Failed("decode failed"))
+        },
+        &mut |_| Ok(()),
+    );
+    assert_eq!(end_of(result), Err(Scripted::Failed("decode failed")));
     assert_eq!(calls, 1);
 }
 
@@ -636,20 +697,25 @@ fn an_hour_of_windows_tiles_the_audio_and_ends() {
     let max_windows = HOUR / 320;
     let mut windows: Vec<(usize, usize, usize)> = Vec::new();
     let never = AtomicBool::new(false);
-    let result = walk_windows(HOUR, &never, |seek, window_samples| {
-        if windows.len() >= max_windows {
-            return Err(());
-        }
-        let tokens = cycle
-            .get(windows.len() % cycle.len())
-            .copied()
-            .unwrap_or(&[]);
-        let advance = plan_window(tokens, window_samples).advance_samples;
-        windows.push((seek, window_samples, advance));
-        Ok(advance)
-    });
+    let result = walk_windows(
+        HOUR,
+        &never,
+        |seek, window_samples, _| {
+            if windows.len() >= max_windows {
+                return Err(Scripted::TooManyWindows);
+            }
+            let tokens = cycle
+                .get(windows.len() % cycle.len())
+                .copied()
+                .unwrap_or(&[]);
+            let advance = plan_window(tokens, window_samples).advance_samples;
+            windows.push((seek, window_samples, advance));
+            Ok((advance, Vec::new()))
+        },
+        &mut |_| Ok(()),
+    );
     assert_eq!(
-        result,
+        end_of(result),
         Ok(WalkEnd::Finished),
         "walk did not end after {} windows",
         windows.len()
@@ -701,19 +767,24 @@ fn window_segments_are_offset_by_the_window_start() {
         [3] => "  ".to_owned(),
         other => panic!("decoded tokens other than one segment's text: {other:?}"),
     };
-    let kept = Attempt {
-        temperature: 0.4,
-        with_prompt: false,
-        compression_ratio: 1.25,
-        avg_logprob: -0.3,
-        verdict: Verdict::Accepted,
-    };
+    let kept = outcome_keeping(
+        Attempt {
+            temperature: 0.4,
+            with_prompt: false,
+            compression_ratio: 1.25,
+            avg_logprob: -0.3,
+            verdict: Verdict::Accepted,
+        },
+        0.125,
+    );
     let segments = window_segments(&raw, 480_000, 960_000, &kept, text);
     for (segment, raw) in segments.iter().zip(&raw) {
         assert_eq!(segment.seek, 3000);
         assert_eq!(segment.tokens, raw.tokens);
         assert!((segment.temperature - 0.4).abs() < f32::EPSILON);
         assert!((segment.compression_ratio - 1.25).abs() < f32::EPSILON);
+        assert!((segment.avg_logprob + 0.3).abs() < f32::EPSILON);
+        assert!((segment.no_speech_prob - 0.125).abs() < f32::EPSILON);
     }
     let got: Vec<(f32, f32, &str)> = segments
         .iter()
@@ -731,6 +802,77 @@ fn window_segments_are_offset_by_the_window_start() {
     }
 }
 
+/// The window outcome for no-speech probability `no_speech_prob` when the
+/// decoder returns `averages` in order, one decode at each step of the
+/// temperature ladder from 0. Decode `k` writes the text tokens `10 + k` and
+/// `20 + k` as two segments.
+fn scripted_outcome(no_speech_prob: f32, averages: &[f32]) -> WindowOutcome {
+    let mut calls = 0_usize;
+    let result: Result<WindowOutcome, Infallible> = decode_with_fallback(
+        no_speech_prob,
+        |_| Ok(true),
+        &[],
+        0.0,
+        |_, _| {
+            let k = calls as u32;
+            let avg_logprob = averages.get(calls).copied().unwrap_or(f32::NAN);
+            calls += 1;
+            Ok(Decoded {
+                tokens: vec![ts(0.0), 10 + k, ts(2.0), ts(2.0), 20 + k, ts(4.0)],
+                avg_logprob,
+                stop: Stop::EndToken,
+            })
+        },
+        |tokens| format!("{tokens:?}"),
+    );
+    match result {
+        Ok(outcome) => outcome,
+        Err(never) => match never {},
+    }
+}
+
+fn segments_of(outcome: &WindowOutcome) -> Vec<Segment> {
+    let plan = plan_window(&outcome.tokens, SAMPLES_PER_WINDOW);
+    window_segments(&plan.segments, 0, SAMPLES_PER_WINDOW, outcome, |tokens| {
+        format!("{tokens:?}")
+    })
+}
+
+/// A window of two segments whose decodes are all weak keeps the one with the
+/// highest average, which is not the last one: both segments carry the average
+/// and the temperature of that kept decode and the window's no-speech
+/// probability.
+#[test]
+fn both_segments_of_a_window_carry_the_kept_decodes_averages() {
+    let outcome = scripted_outcome(0.375, &[-1.5, -1.25, -1.75, -1.625, -1.875, -2.0]);
+    assert_eq!(outcome.kept, 1, "the second decode is the best weak one");
+    let segments = segments_of(&outcome);
+    assert_eq!(segments.len(), 2);
+    for (segment, text) in segments.iter().zip(["[11]", "[21]"]) {
+        assert_eq!(segment.text, text, "the text is that of the kept decode");
+        assert!(
+            (segment.avg_logprob + 1.25).abs() < f32::EPSILON,
+            "{segment:?}"
+        );
+        assert!((segment.temperature - 0.2).abs() < 1e-6, "{segment:?}");
+        assert!(
+            (segment.no_speech_prob - 0.375).abs() < f32::EPSILON,
+            "{segment:?}"
+        );
+    }
+}
+
+/// A window that is skipped has no kept decode: it gives no segment, also for
+/// tokens that would make some.
+#[test]
+fn a_skipped_window_gives_no_segment() {
+    let skipped = scripted_outcome(0.9, &[-0.25]);
+    assert!(skipped.skipped);
+    let raw = [seg(0.0, 2.0, &[ts(0.0), 7, ts(2.0)])];
+    let segments = window_segments(&raw, 0, SAMPLES_PER_WINDOW, &skipped, |_| "text".to_owned());
+    assert!(segments.is_empty(), "{segments:?}");
+}
+
 // ── Window walk: the cancel flag, set from inside a scripted window ──────────
 
 /// Four full windows of audio.
@@ -743,21 +885,26 @@ fn walk_cancelled_in(
     total_samples: usize,
     cancel_in: usize,
     advance: impl Fn(usize, usize) -> usize,
-) -> (Vec<usize>, Result<WalkEnd, ()>) {
+) -> (Vec<usize>, Result<WalkEnd, Scripted>) {
     let cancel = AtomicBool::new(false);
     let mut seeks: Vec<usize> = Vec::new();
-    let end = walk_windows(total_samples, &cancel, |seek, window_samples| {
-        if seeks.len() >= MAX_SCRIPTED_WINDOWS {
-            return Err(());
-        }
-        if seeks.len() == cancel_in {
-            cancel.store(true, Ordering::Relaxed);
-        }
-        let step = advance(seeks.len(), window_samples);
-        seeks.push(seek);
-        Ok(step)
-    });
-    (seeks, end)
+    let end = walk_windows(
+        total_samples,
+        &cancel,
+        |seek, window_samples, _| {
+            if seeks.len() >= MAX_SCRIPTED_WINDOWS {
+                return Err(Scripted::TooManyWindows);
+            }
+            if seeks.len() == cancel_in {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            let step = advance(seeks.len(), window_samples);
+            seeks.push(seek);
+            Ok((step, Vec::new()))
+        },
+        &mut |_| Ok(()),
+    );
+    (seeks, end_of(end))
 }
 
 /// The flag set while window 1 decodes: window 1 ends, window 2 never opens.
@@ -769,7 +916,8 @@ fn a_flag_set_in_window_1_stops_the_walk_before_window_2() {
         end,
         Ok(WalkEnd::Cancelled {
             window: 2,
-            seek: 2 * SAMPLES_PER_WINDOW
+            seek: 2 * SAMPLES_PER_WINDOW,
+            cause: StopCause::Flag
         })
     );
 }
@@ -779,12 +927,24 @@ fn a_flag_set_in_window_1_stops_the_walk_before_window_2() {
 fn a_flag_set_before_the_walk_opens_no_window() {
     let cancel = AtomicBool::new(true);
     let mut opened = 0;
-    let end: Result<WalkEnd, ()> = walk_windows(FOUR_WINDOWS, &cancel, |_, whole| {
-        opened += 1;
-        Ok(whole)
-    });
+    let end = walk_windows(
+        FOUR_WINDOWS,
+        &cancel,
+        |_, whole, _| {
+            opened += 1;
+            Ok((whole, Vec::new()))
+        },
+        &mut |_| Ok(()),
+    );
     assert_eq!(opened, 0);
-    assert_eq!(end, Ok(WalkEnd::Cancelled { window: 0, seek: 0 }));
+    assert_eq!(
+        end_of(end),
+        Ok(WalkEnd::Cancelled {
+            window: 0,
+            seek: 0,
+            cause: StopCause::Flag
+        })
+    );
 }
 
 /// The flag set in the last window: no window is left to skip, so the walk
@@ -807,7 +967,87 @@ fn a_cancelled_walk_reports_the_planned_seek() {
         end,
         Ok(WalkEnd::Cancelled {
             window: 1,
-            seek: twelve_s
+            seek: twelve_s,
+            cause: StopCause::Flag
         })
+    );
+}
+
+// ── Window walk: the window sink ─────────────────────────────────────────────
+
+/// Walk four windows, each closing with one segment, through the sink
+/// `on_closed`. Returns the count of earlier segments each window was given,
+/// the texts the sink got, and how the walk ended with how many segments.
+fn walk_into(
+    mut on_closed: impl FnMut(usize) -> rmlx_core::error::Result<()>,
+) -> (Vec<usize>, Vec<String>, Result<(WalkEnd, usize), Scripted>) {
+    let never = AtomicBool::new(false);
+    let mut earlier = Vec::new();
+    let mut texts = Vec::new();
+    let walk = walk_windows(
+        FOUR_WINDOWS,
+        &never,
+        |_, whole, before| {
+            if earlier.len() >= MAX_SCRIPTED_WINDOWS {
+                return Err(Scripted::TooManyWindows);
+            }
+            earlier.push(before);
+            Ok((
+                whole,
+                vec![text_segment(&format!("window {}", earlier.len() - 1))],
+            ))
+        },
+        &mut |segments| {
+            texts.extend(segments.iter().map(|s| s.text.clone()));
+            on_closed(texts.len() - 1)
+        },
+    );
+    (
+        earlier,
+        texts,
+        walk.map(|walk| (walk.end, walk.segments.len())),
+    )
+}
+
+/// The sink gets the segments of each window when it closes, in order, and
+/// the window decoder gets the count of the earlier segments.
+#[test]
+fn the_sink_gets_each_closed_window_in_order() {
+    let (earlier, texts, end) = walk_into(|_| Ok(()));
+    assert_eq!(earlier, [0, 1, 2, 3]);
+    assert_eq!(texts, ["window 0", "window 1", "window 2", "window 3"]);
+    assert_eq!(end, Ok((WalkEnd::Finished, 4)));
+}
+
+/// A sink that reports its reader gone at window 0 stops the walk before
+/// window 1, as the flag does: one sink call, and a stop that names the
+/// reader as its cause.
+#[test]
+fn a_sink_whose_reader_is_gone_stops_the_walk_before_the_next_window() {
+    let (earlier, texts, end) = walk_into(|_| Err(rmlx_core::error::Error::Cancelled));
+    assert_eq!(earlier, [0]);
+    assert_eq!(texts, ["window 0"]);
+    assert_eq!(
+        end,
+        Ok((
+            WalkEnd::Cancelled {
+                window: 1,
+                seek: SAMPLES_PER_WINDOW,
+                cause: StopCause::ReaderGone
+            },
+            1
+        ))
+    );
+}
+
+/// A sink error that is not the stop ends the walk with that error.
+#[test]
+fn a_sink_error_that_is_not_the_stop_ends_the_walk_with_it() {
+    let (earlier, _, end) =
+        walk_into(|_| Err(rmlx_core::error::Error::Other("sink broke".to_owned())));
+    assert_eq!(earlier, [0]);
+    assert!(
+        matches!(&end, Err(Scripted::Sink(text)) if text.contains("sink broke")),
+        "{end:?}"
     );
 }

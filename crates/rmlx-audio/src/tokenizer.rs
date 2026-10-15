@@ -223,8 +223,19 @@ pub fn language_token(language: &str) -> Option<u32> {
 /// not one of the [`LANGUAGES`] tokens.
 #[must_use]
 pub fn language_name(token: u32) -> Option<&'static str> {
+    language_entry(token).map(|(_, name)| name)
+}
+
+/// The code of a language token (`fr`), or `None` for an id that is not one of
+/// the [`LANGUAGES`] tokens.
+#[must_use]
+pub(crate) fn language_code(token: u32) -> Option<&'static str> {
+    language_entry(token).map(|(code, _)| code)
+}
+
+fn language_entry(token: u32) -> Option<(&'static str, &'static str)> {
     let slot = usize::try_from(token.checked_sub(TOK_EN)?).ok()?;
-    LANGUAGES.get(slot).map(|&(_, name)| name)
+    LANGUAGES.get(slot).copied()
 }
 
 /// Every special token the ids above name, with its id: openai-whisper
@@ -297,6 +308,10 @@ pub enum TokenizerError {
     /// Decode failure.
     #[error("tokenizer decode error: {0}")]
     Decode(String),
+    /// A prompt holds the text of a special token, for example
+    /// `<|endoftext|>`, which would encode as a control token of the decode.
+    #[error("the prompt holds the text of a special token (<|...|>)")]
+    SpecialTokenText,
     /// A special token is absent or has another id than the decode uses.
     #[error(
         "tokenizer.json: {token} is {found}, the decode expects id {expected}; \
@@ -321,6 +336,15 @@ pub enum TokenizerError {
         /// [`N_VOCAB`].
         expected: usize,
     },
+}
+
+/// The most bytes of a prompt that are encoded: its end.
+pub const PROMPT_TAIL_BYTES: usize = 16 * 1024;
+
+/// The last [`PROMPT_TAIL_BYTES`] bytes of `text`, cut at a character boundary.
+fn prompt_tail(text: &str) -> &str {
+    let start = text.ceil_char_boundary(text.len().saturating_sub(PROMPT_TAIL_BYTES));
+    text.get(start..).unwrap_or_default()
 }
 
 /// Whisper BPE tokenizer wrapper.
@@ -363,6 +387,26 @@ impl WhisperTokenizer {
             .encode(text, false)
             .map_err(|e| TokenizerError::Encode(e.to_string()))?;
         Ok(enc.get_ids().to_vec())
+    }
+
+    /// Encode the text of a decoder prompt: a space and the last
+    /// [`PROMPT_TAIL_BYTES`] bytes of `prompt.trim()` (Unicode White_Space
+    /// characters are trimmed). The decoder keeps the last tokens of a prompt
+    /// only, and this tail holds far more of them, so a longer text is never
+    /// encoded whole. An empty or white-space text gives no token. The text of
+    /// a special token (`<|endoftext|>`, `<|en|>`, `<|0.00|>`, ...) in the
+    /// tail is an error: the tokenizer would turn it into a control token. The
+    /// text before the tail is not read.
+    pub fn encode_prompt(&self, prompt: &str) -> Result<Vec<u32>, TokenizerError> {
+        let text = prompt_tail(prompt.trim());
+        if text.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = self.encode(&format!(" {text}"))?;
+        if ids.iter().any(|&id| id >= TOK_EOT) {
+            return Err(TokenizerError::SpecialTokenText);
+        }
+        Ok(ids)
     }
 
     /// Derive the Whisper non-speech / special suppression token set from the

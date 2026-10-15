@@ -94,6 +94,9 @@ pub(super) struct WindowOutcome {
     pub(super) attempts: Vec<Attempt>,
     /// Index in `attempts` of the kept decode.
     pub(super) kept: usize,
+    /// The no-speech probability that the gate read for the window, with no
+    /// prompt.
+    pub(super) no_speech_prob: f32,
     /// The no-speech probability of the window is above 0.6 and the model
     /// writes no more than a stock phrase for it: no decode of the ladder ran,
     /// the window gives no segment, all its samples are consumed and the
@@ -112,9 +115,13 @@ impl WindowOutcome {
     }
 
     /// Record the decision for the window that starts at sample `seek`.
-    pub(super) fn log(&self, seek: usize, no_speech_prob: f32) {
+    pub(super) fn log(&self, seek: usize) {
         let Some(kept) = self.kept() else {
-            debug!(seek, no_speech_prob, "no speech in the window; skipped");
+            debug!(
+                seek,
+                no_speech_prob = self.no_speech_prob,
+                "no speech in the window; skipped"
+            );
             return;
         };
         if kept.verdict != Verdict::Accepted {
@@ -140,7 +147,7 @@ impl WindowOutcome {
 }
 
 /// Decide one window. `no_speech_prob` is the no-speech probability of the
-/// window, read with no previous-text prompt. `writes_at_most(n)` says whether
+/// window, read with no prompt. `writes_at_most(n)` says whether
 /// the greedy decode of the window with no prompt writes at most `n` text
 /// tokens. `decode(prompt, temperature)` runs the decoder with that
 /// previous-text prompt (empty for none) at that temperature; `text_of` gives
@@ -180,6 +187,7 @@ pub(super) fn decode_with_fallback<E>(
         tokens: Vec::new(),
         attempts: Vec::new(),
         kept: 0,
+        no_speech_prob,
         skipped: no_speech_prob > NO_SPEECH_THRESHOLD && writes_at_most(STOCK_PHRASE_TEXT_TOKENS)?,
         carry_text: true,
     };

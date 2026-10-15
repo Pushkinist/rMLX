@@ -202,7 +202,7 @@ prompt at the placeholder positions, and decode runs from the fused
 | `input_audio` | `{type:"input_audio", input_audio:{data:"<base64>", format:"wav"}}` | Conformer or encoder-free | Gemma4 |
 
 **Audio.** The `rmlx-audio` decoder (Symphonia: WAV, MP3, M4A, ADTS AAC)
-downmixes to mono and resamples to 16 kHz ([`AUDIO.md`](AUDIO.md), "WAV I/O").
+downmixes to mono and resamples to 16 kHz ([`AUDIO_WAV.md`](AUDIO_WAV.md)).
 The Gemma4 Conformer checkpoints run the USM log-mel front-end and the Conformer `audio_tower`. The unified
 encoder-free checkpoint (`Gemma4UnifiedForConditionalGeneration`) cuts the
 waveform into 640-sample frames and projects each with `embed_audio`, one soft
@@ -218,9 +218,9 @@ positions.
   answered 404", or "the image URL could not be fetched".
 - Each `input_audio` part is capped at 16 MiB decoded
   (`bounds::MAX_INPUT_AUDIO_BYTES`); a larger clip is 400. Its audio is
-  capped at what the context holds after the prompt, at most 3 h (`docs/AUDIO.md`
-  § "WAV I/O"). The decode of the clip reads the stop of the request before
-  each packet and ends with it. The audio tower and the one prefill forward of
+  capped at what the context holds after the prompt, at most 3 h
+  (`docs/AUDIO_WAV.md`). The decode of the clip reads the stop of the request
+  before each packet and ends with it. The audio tower and the one prefill forward of
   the audio prompt run to their end; the job stops at its next read of the
   stop after them.
 

@@ -174,7 +174,7 @@ pub(super) fn chunk_to_event(chunk: &ChatCompletionChunk) -> Event {
 /// Shape mirrors the blocking route's OpenAI error envelope
 /// (`{"error":{"message","type"}}`), so the same fault reads the same either
 /// way. `type` is the stable automation key, `message` is human.
-pub(super) fn error_event(message: &str, kind: &str) -> Event {
+pub(crate) fn error_event(message: &str, kind: &str) -> Event {
     let body = serde_json::json!({
         "error": {
             "message": message,

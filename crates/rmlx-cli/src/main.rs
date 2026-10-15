@@ -1024,6 +1024,15 @@ enum Cmd {
         /// Translate to English instead of transcribing in the source language.
         #[arg(long, default_value_t = false)]
         translate: bool,
+        /// Text that guides the style or the spelling of the transcription, as
+        /// the `prompt` field of the OpenAI API. Text of a special token
+        /// (`<|endoftext|>`) is refused.
+        #[arg(long, default_value = "")]
+        prompt: String,
+        /// Add the start and end time of each word, as a top-level `words`
+        /// array of `--format json`. Needs `--format json`.
+        #[arg(long, default_value_t = false)]
+        words: bool,
         /// Write output to this file instead of stdout.
         #[arg(long, value_name = "PATH")]
         output: Option<PathBuf>,
@@ -2418,6 +2427,8 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
             format,
             language,
             translate,
+            prompt,
+            words,
             output,
             device,
         } => {
@@ -2429,6 +2440,8 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
                 format: &format,
                 language: &language,
                 translate,
+                prompt: &prompt,
+                words,
             };
             let rendered = commands::transcribe::run_transcribe(&args, &claimed)?;
             match output {

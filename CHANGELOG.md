@@ -23,6 +23,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `generation_config.json` id that file lacks. A `generation_config.json`
   that exists and cannot be parsed now refuses the load; the registry ignored
   it before.
+- **Word timestamps for Whisper.** `timestamp_granularities[]=word` with
+  `response_format=verbose_json` adds a top-level `words` array of
+  `{word, start, end}` to the reply, and `rmlx transcribe --words` adds the same
+  array to `--format json`. The method is that of openai-whisper: one
+  forward of the window's text over its cached cross-attention keys and values,
+  the scores of the alignment heads, a median filter and DTW. The words are
+  added only: the text, the segments and the seek are those of a request with
+  no words, and a word time outside its segment is clamped into it.
+  `timestamp_granularities[]=word` was 422 before; with a format other than
+  `verbose_json`, or for a model with no alignment heads, it is still 422, with
+  `param: timestamp_granularities`. A request with no words runs as before.
+- **A transcription streams with `stream=true`.** A `json` request with
+  `stream=true` on `/v1/audio/transcriptions` or `/v1/audio/translations` gets
+  server-sent events: one `transcript.text.delta` when a 30 s window closes
+  and adds text, then one `transcript.text.done` with the whole text. The
+  deltas, joined with nothing, are the text of a request with no `stream`.
+  `stream=true` was 422 before; with a `response_format` other than `json` it
+  is still 422, with `param: stream`. A file that the decoder refuses, a bad
+  prompt and a load failure are the JSON error reply as before; a failure
+  after the first event is an error event that ends the stream. A client that
+  closes the connection stops the transcription before its next window. A
+  request with no `stream`, or with `stream=false`, gets the same bytes as
+  before.
 
 ### Changed
 
@@ -104,12 +127,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   422. A Whisper model or tokenizer that does not load is now 503 with
   `x-should-retry: false` (it was 422), and the body names the file, not the
   server's directory. An engine failure during the transcription is now 503
-  (it was 422). A `verbose_json` segment now holds `seek`, `tokens`,
-  `temperature` and `compression_ratio`; `avg_logprob` and `no_speech_prob`
-  are not computed and are left out, so a client that requires them
-  (`@ai-sdk/openai` with the model `whisper-1`, openai-python in strict mode)
-  cannot read `verbose_json` yet. Fields such as `prompt` are taken and
-  ignored as before, now with at most one `warn` event per request.
+  (it was 422). Fields such as `include[]` are taken and ignored as before,
+  now with at most one `warn` event per request.
 - **`reasoning_effort` and `chat_template_kwargs` reach the chat template as
   sent.** `/v1/chat/completions` takes `reasoning_effort` and
   `chat_template_kwargs`. Each entry of `chat_template_kwargs` becomes a
@@ -142,6 +161,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   architecture, a template variable that turns thinking on (the Gemma 4
   template does for `enable_thinking: true`) returns the thought text in
   `content`, and `thinking_budget` has no effect.
+- **`Transcriber::transcribe` and `transcribe_request` take one more
+  argument,** a window sink that gets the segments of each window when it
+  closes. A sink that returns `Error::Cancelled` stops the walk before the
+  next window, as the cancel flag does. A caller with no use for the windows
+  passes `&mut |_| Ok(())`; `rmlx_audio::transcribe::TextDeltas` gives the
+  text that each closed window adds.
+- **The `prompt` field of the transcription routes is read, and `rmlx transcribe`
+  takes `--prompt`.** The route took `prompt` and dropped it. It is now
+  encoded as `" " + prompt.trim()` and prompts every window before the
+  previous window's text: the last 223 tokens of the two, so a long previous
+  text cuts the prompt from the left. A window whose decode may not prompt
+  the next one drops the prompt, and a skipped window keeps it. An empty or
+  white-space prompt is no prompt, and a request with no prompt decodes as
+  before. A prompt whose last 16 KiB holds the text of a special token
+  (`<|endoftext|>`) is 422 with `param: prompt`, and an error from
+  `rmlx transcribe`; the check comes before the audio is decoded and before
+  the model loads. The no-speech gate still reads the window with no prompt.
+  The prompt is read whole: only the limit of the form bounds it, and only its
+  last 16 KiB is encoded. A greedy pick refuses a logit row that holds a `NaN`
+  or `+inf`, as a pick above temperature 0 did, and so does the read of the
+  start row of a window, so a reply never has an average log-probability or a
+  no-speech probability that is not a number.
+- **A `verbose_json` segment holds all ten keys of the OpenAI
+  `TranscriptionSegment` schema, and `rmlx transcribe --format json` shows
+  the same keys.** A segment now has `seek`, `tokens`, `temperature`,
+  `avg_logprob`, `compression_ratio` and `no_speech_prob` beside `id`,
+  `start`, `end` and `text`, so a client that requires them
+  (`@ai-sdk/openai` with the model `whisper-1`, openai-python in strict
+  mode) can read it, and a client can filter the weak segments by
+  `avg_logprob` (a value below -1.0 is a failed decode in the OpenAI schema).
+  `avg_logprob` is that of the decode the window kept, and `no_speech_prob`
+  is the value that the no-speech gate read for the window; every segment of
+  a window has the same two. `rmlx transcribe --format json` showed only
+  `id`, `start`, `end` and `text` for a segment. One item now writes the
+  JSON of a segment for the route and for the command, and the command prints
+  an error and exits non-zero if the JSON does not render. No text, token,
+  segment time or seek changes.
 
 ### Fixed
 

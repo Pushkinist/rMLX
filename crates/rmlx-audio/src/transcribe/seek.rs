@@ -4,8 +4,8 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::fallback::Attempt;
-use super::Segment;
+use super::fallback::WindowOutcome;
+use super::{Segment, WindowSink};
 use crate::mel::{HOP_LENGTH, N_SAMPLES, SAMPLE_RATE};
 use crate::tokenizer::TOK_TIMESTAMP_BEGIN;
 
@@ -146,17 +146,22 @@ pub(super) fn plan_window(tokens: &[u32], window_samples: usize) -> WindowPlan {
 /// ends, and ends in the file.
 ///
 /// `decode_text` gives the text of a segment's text tokens; a segment whose
-/// trimmed text is empty is dropped. Each segment's temperature and compression
-/// ratio are those of `kept`, the decode the window kept, as openai-whisper
-/// gives the values of the result it kept after a fallback. Its tokens are its
-/// slice of the window's tokens, with the timestamps as the decoder gave them.
+/// trimmed text is empty is dropped. A skipped window has no kept decode and
+/// gives no segment. Each segment's temperature, compression ratio and
+/// average log-probability are those of the decode `outcome` kept, as
+/// openai-whisper gives the values of the result it kept after a fallback; its
+/// no-speech probability is the window's. Its tokens are its slice of the
+/// window's tokens, with the timestamps as the decoder gave them.
 pub(super) fn window_segments(
     raw: &[RawSegment],
     seek: usize,
     total_samples: usize,
-    kept: &Attempt,
+    outcome: &WindowOutcome,
     decode_text: impl Fn(&[u32]) -> String,
 ) -> Vec<Segment> {
+    let Some(kept) = outcome.kept() else {
+        return Vec::new();
+    };
     let secs = |samples: usize| samples as f32 / SAMPLE_RATE as f32;
     raw.iter()
         .filter_map(|raw| {
@@ -181,10 +186,31 @@ pub(super) fn window_segments(
                 text: trimmed.to_owned(),
                 tokens: raw.tokens.clone(),
                 temperature: kept.temperature,
+                avg_logprob: kept.avg_logprob,
                 compression_ratio: kept.compression_ratio,
+                no_speech_prob: outcome.no_speech_prob,
             })
         })
         .collect()
+}
+
+/// Why a walk stopped before the end of the audio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StopCause {
+    /// The flag of the request was set.
+    Flag,
+    /// The window sink reported that its reader is gone.
+    ReaderGone,
+}
+
+impl StopCause {
+    /// The name of the cause in the log.
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::Flag => "flag",
+            Self::ReaderGone => "reader_gone",
+        }
+    }
 }
 
 /// How a window walk ended.
@@ -192,36 +218,80 @@ pub(super) fn window_segments(
 pub(super) enum WalkEnd {
     /// No audio is left to open a window.
     Finished,
-    /// The cancel flag was set: window number `window` (from 0), which starts
-    /// at sample `seek`, was not opened.
-    Cancelled { window: usize, seek: usize },
+    /// The walk stopped: window number `window` (from 0), which starts at
+    /// sample `seek`, was not opened.
+    Cancelled {
+        window: usize,
+        seek: usize,
+        cause: StopCause,
+    },
 }
 
-/// Walk the audio window by window. `on_window(seek, window_samples)` decodes
-/// the window that starts at sample `seek` and returns how many samples to
-/// advance; an advance of 0 consumes the whole window, so the walk always ends.
-/// The walk stops when fewer than one mel hop of audio is left, as the
-/// reference does at its 10 ms frame grid. `cancel` is read before each window
-/// opens; once it is set, the walk opens no further window.
-pub(super) fn walk_windows<E>(
+/// A walk that ended: how, and the segments of every window it closed.
+pub(super) struct Walk {
+    pub(super) end: WalkEnd,
+    pub(super) segments: Vec<Segment>,
+}
+
+/// Walk the audio window by window. `on_window(seek, window_samples,
+/// earlier_segments)` decodes the window that starts at sample `seek`, after
+/// `earlier_segments` segments of the earlier windows, and returns how many
+/// samples to advance and the window's segments; an advance of 0 consumes the
+/// whole window, so the walk always ends. The walk hands the segments of each
+/// window to `on_closed` when the window closes. The walk stops when fewer
+/// than one mel hop of audio is left, as the reference does at its 10 ms frame
+/// grid.
+///
+/// Before each window opens, the walk reads `cancel` and what `on_closed`
+/// last returned: once the flag is set, or once `on_closed` returned
+/// `Error::Cancelled` (its reader is gone), the walk opens no further window.
+/// Any other error of `on_closed` ends the walk with that error.
+pub(super) fn walk_windows<E: From<rmlx_core::error::Error>>(
     total_samples: usize,
     cancel: &AtomicBool,
-    mut on_window: impl FnMut(usize, usize) -> Result<usize, E>,
-) -> Result<WalkEnd, E> {
+    mut on_window: impl FnMut(usize, usize, usize) -> Result<(usize, Vec<Segment>), E>,
+    on_closed: WindowSink<'_>,
+) -> Result<Walk, E> {
     let mut seek = 0;
     let mut window = 0;
+    let mut segments = Vec::new();
+    let mut reader_gone = false;
     while total_samples.saturating_sub(seek) >= HOP_LENGTH {
-        if cancel.load(Ordering::Relaxed) {
-            return Ok(WalkEnd::Cancelled { window, seek });
+        let stop = if cancel.load(Ordering::Relaxed) {
+            Some(StopCause::Flag)
+        } else if reader_gone {
+            Some(StopCause::ReaderGone)
+        } else {
+            None
+        };
+        if let Some(cause) = stop {
+            return Ok(Walk {
+                end: WalkEnd::Cancelled {
+                    window,
+                    seek,
+                    cause,
+                },
+                segments,
+            });
         }
         let window_samples = (total_samples - seek).min(N_SAMPLES);
-        seek += match on_window(seek, window_samples)? {
+        let (advance, closed) = on_window(seek, window_samples, segments.len())?;
+        match on_closed(&closed) {
+            Ok(()) => {}
+            Err(rmlx_core::error::Error::Cancelled) => reader_gone = true,
+            Err(e) => return Err(e.into()),
+        }
+        segments.extend(closed);
+        seek += match advance {
             0 => window_samples,
             advance => advance,
         };
         window += 1;
     }
-    Ok(WalkEnd::Finished)
+    Ok(Walk {
+        end: WalkEnd::Finished,
+        segments,
+    })
 }
 
 #[cfg(test)]

@@ -358,60 +358,120 @@ async fn a_content_length_far_over_the_cap_is_4xx_and_the_server_lives() {
     assert!(answer.contains("tokenizer"), "{status} {answer}");
 }
 
-/// Word timestamps are not built: a request for them is 422 naming the field,
-/// under the array name OpenAI's SDKs send and under the bare name.
+/// A request for word times needs `verbose_json`: with any other format it is
+/// 422 naming `timestamp_granularities`, under the array name OpenAI's SDKs
+/// send and under the bare name. With `verbose_json`, before or after the
+/// granularity and beside `segment`, it reaches the tokenizer load.
 #[tokio::test]
-async fn word_timestamps_are_422_naming_the_field() {
+async fn word_timestamps_need_verbose_json() {
     let (state, _dir) = missing_whisper_state();
     let port = start_server_with_state(state).await;
     let wav = short_wav();
-    for (param, parts) in [
-        (
-            "timestamp_granularities[]",
+    for name in ["timestamp_granularities[]", "timestamp_granularities"] {
+        for format in [None, Some("json"), Some("text"), Some("srt"), Some("vtt")] {
+            let mut parts = vec![(name, b"word".as_slice()), ("file", wav.as_slice())];
+            if let Some(format) = format {
+                parts.push(("response_format", format.as_bytes()));
+            }
+            let answer = post_form(port, &parts).await;
+            eprintln!(
+                "CASE {name}=word, {format:?}: {} {}",
+                answer.status, answer.body
+            );
+            let message = envelope(
+                &answer,
+                422,
+                "invalid_request_error",
+                Some("timestamp_granularities"),
+            );
+            assert!(message.contains("verbose_json"), "{message}");
+        }
+        for parts in [
             vec![
+                ("response_format", b"verbose_json".as_slice()),
+                (name, b"word".as_slice()),
                 ("file", wav.as_slice()),
-                ("timestamp_granularities[]", b"word".as_slice()),
             ],
-        ),
-        (
-            "timestamp_granularities",
             vec![
+                (name, b"segment".as_slice()),
+                (name, b"word".as_slice()),
                 ("file", wav.as_slice()),
-                ("timestamp_granularities", b"word".as_slice()),
+                ("response_format", b"verbose_json".as_slice()),
             ],
-        ),
-        (
-            "timestamp_granularities[]",
-            vec![
-                ("timestamp_granularities[]", b"segment".as_slice()),
-                ("timestamp_granularities[]", b"word".as_slice()),
-                ("file", wav.as_slice()),
-            ],
-        ),
-    ] {
-        let answer = post_form(port, &parts).await;
-        let named: Vec<String> = parts
-            .iter()
-            .filter(|(name, _)| *name != "file")
-            .map(|(name, value)| format!("{name}={}", String::from_utf8_lossy(value)))
-            .collect();
-        eprintln!("CASE {named:?}: {} {}", answer.status, answer.body);
-        let message = envelope(&answer, 422, "invalid_request_error", Some(param));
-        assert!(message.contains(param), "{message}");
-        assert!(message.contains("word"), "{message}");
+        ] {
+            let Answer { status, body, .. } = post_form(port, &parts).await;
+            eprintln!("CASE {name}=word, verbose_json: {status} {body}");
+            assert!(body.contains("tokenizer"), "{name}: {status} {body}");
+        }
     }
 }
 
-/// The transcription is returned whole when it ends: `stream=true` is 422
-/// naming the field.
+/// Only `json` streams: `stream=true` with any other format is 422 naming
+/// `stream`, whichever field comes first. With `json`, named or by default, the
+/// request reaches the tokenizer load, and its failure there is the JSON error
+/// reply, not a stream.
 #[tokio::test]
-async fn stream_true_is_422_naming_the_field() {
+async fn only_json_streams() {
     let (state, _dir) = missing_whisper_state();
     let port = start_server_with_state(state).await;
-    let answer = post_form(port, &[("file", &short_wav()), ("stream", b"true")]).await;
-    eprintln!("CASE stream=true: {} {}", answer.status, answer.body);
-    let message = envelope(&answer, 422, "invalid_request_error", Some("stream"));
-    assert!(message.contains("stream"), "{message}");
+    let wav = short_wav();
+    for format in ["text", "srt", "vtt", "verbose_json"] {
+        for parts in [
+            [
+                ("stream", b"true".as_slice()),
+                ("response_format", format.as_bytes()),
+                ("file", wav.as_slice()),
+            ],
+            [
+                ("file", wav.as_slice()),
+                ("response_format", format.as_bytes()),
+                ("stream", b"true".as_slice()),
+            ],
+        ] {
+            let answer = post_form(port, &parts).await;
+            eprintln!(
+                "CASE stream=true, {format}: {} {}",
+                answer.status, answer.body
+            );
+            let message = envelope(&answer, 422, "invalid_request_error", Some("stream"));
+            assert!(message.contains("json"), "{format}: {message}");
+        }
+    }
+    for parts in [
+        vec![("file", wav.as_slice()), ("stream", b"true".as_slice())],
+        vec![
+            ("stream", b"true".as_slice()),
+            ("response_format", b"json".as_slice()),
+            ("file", wav.as_slice()),
+        ],
+    ] {
+        let answer = post_form(port, &parts).await;
+        eprintln!("CASE stream=true, json: {} {}", answer.status, answer.body);
+        let message = envelope(&answer, 503, "service_unavailable", None);
+        assert!(message.contains("tokenizer"), "{message}");
+    }
+}
+
+/// A file the decoder refuses is a 422 JSON reply under `stream=true` too: the
+/// reply waits for the audio decode and the model load before it starts.
+#[tokio::test]
+async fn a_refused_audio_file_under_stream_is_a_422_reply() {
+    const SILENT: [u8; 11] = [
+        0xFF, 0xF1, 0x60, 0x40, 0x01, 0x7F, 0xFC, 0x00, 0xC8, 0x00, 0x07,
+    ];
+    let mut aac = SILENT.repeat(20);
+    aac.extend_from_slice(&[0xFF, 0xF1, 0x7C, 0x40, 0x01, 0x7F, 0xFC]);
+    aac.extend(SILENT.repeat(20));
+
+    let (state, _dir) = missing_whisper_state();
+    let port = start_server_with_state(state).await;
+    let answer = post_form(port, &[("file", &aac), ("stream", b"true")]).await;
+    eprintln!(
+        "CASE refused file, stream=true: {} {}",
+        answer.status, answer.body
+    );
+    let message = envelope(&answer, 422, "invalid_request_error", Some("file"));
+    assert!(message.starts_with("audio decode: "), "{message}");
 }
 
 /// A field the route serves or ignores does not refuse the request: each of
@@ -553,6 +613,51 @@ async fn a_whisper_model_load_failure_is_503_and_names_no_directory() {
     assert!(!answer.body.contains('/'), "{}", answer.body);
 }
 
+/// A prompt that holds the text of a special token is 422 naming `prompt`,
+/// before the audio is decoded and before the model loads: the file is not a
+/// sound and the snapshot directory does not exist, and neither is read. A plain
+/// prompt passes and the request ends at the model load. Runs on the CPU when
+/// `RMLX_O_MODELS_ROOT` holds `openai__whisper-large-v3-tokenizer`; no weight is
+/// read.
+#[tokio::test]
+async fn a_prompt_with_special_token_text_is_422_before_the_audio_and_the_model() {
+    const TEST: &str = "a_prompt_with_special_token_text_is_422_before_the_audio_and_the_model";
+    let Some(root) = std::env::var_os("RMLX_O_MODELS_ROOT") else {
+        eprintln!(
+            "SKIP a_prompt_with_special_token_text_is_422_before_the_audio_and_the_model: RMLX_O_MODELS_ROOT is unset"
+        );
+        return;
+    };
+    let tokenizer = std::path::Path::new(&root).join("openai__whisper-large-v3-tokenizer");
+    if !tokenizer.join("tokenizer.json").exists() {
+        eprintln!(
+            "SKIP a_prompt_with_special_token_text_is_422_before_the_audio_and_the_model: no openai__whisper-large-v3-tokenizer under the root"
+        );
+        return;
+    }
+    let (mut state, _dir) = missing_whisper_state();
+    state.whisper_tokenizer_path = Some(tokenizer);
+    let port = start_server_with_state(state).await;
+
+    let not_a_sound: &[u8] = b"this is not audio";
+    for prompt in ["Names: <|endoftext|>", "<|en|>", "a <|0.00|> b"] {
+        for file in [not_a_sound, &short_wav()] {
+            let answer = post_form(port, &[("file", file), ("prompt", prompt.as_bytes())]).await;
+            eprintln!("CASE {TEST} {prompt:?}: {} {}", answer.status, answer.body);
+            let message = envelope(&answer, 422, "invalid_request_error", Some("prompt"));
+            assert!(message.starts_with("invalid prompt: "), "{message}");
+        }
+    }
+
+    let answer = post_form(
+        port,
+        &[("file", &short_wav()), ("prompt", b"Glossary: rMLX.")],
+    )
+    .await;
+    let message = envelope(&answer, 503, "service_unavailable", None);
+    assert!(message.contains("config.json"), "{message}");
+}
+
 /// A load failure is permanent until the operator acts: the 503 carries
 /// `x-should-retry: false`, which OpenAI's SDKs obey before their own retry of
 /// a 5xx.
@@ -574,8 +679,9 @@ async fn a_load_failure_tells_the_client_not_to_retry() {
 }
 
 /// `stream` is read as a boolean whatever its case: `False` (Python's
-/// `str(False)`), `0` and an empty value are false; `True` and `1` are true and
-/// refused; any other value is 422 naming the field.
+/// `str(False)`), `0` and an empty value are false, and `True` and `1` are
+/// true; each reaches the tokenizer load. Any other value is 422 naming the
+/// field.
 #[tokio::test]
 async fn stream_is_read_as_a_boolean_in_any_case() {
     let (state, _dir) = missing_whisper_state();
@@ -586,9 +692,9 @@ async fn stream_is_read_as_a_boolean_in_any_case() {
         ("False", false),
         ("0", false),
         ("", false),
-        ("true", true),
-        ("True", true),
-        ("1", true),
+        ("true", false),
+        ("True", false),
+        ("1", false),
         ("maybe", true),
     ] {
         let answer = post_form(port, &[("file", &wav), ("stream", value.as_bytes())]).await;
@@ -910,7 +1016,8 @@ async fn a_reply_made_before_the_route_has_no_body() {
 /// times by `say` with the English test voice, 20 s of zeros, and the same
 /// speech again. Each window holds one true repetition.
 fn repetition_wav() -> Option<Vec<u8>> {
-    let wav = std::env::temp_dir().join("rmlx_route_repetition.wav");
+    let dir = tempfile::tempdir().ok()?;
+    let wav = dir.path().join("repetition.wav");
     if !say_voice::say_english_wav(&wav, &"one two three four ".repeat(12)) {
         return None;
     }
@@ -1007,6 +1114,8 @@ async fn the_route_draws_a_request_from_one_seeded_generator() {
             task: WhisperTask::Transcribe,
             temperature: 0.0,
             condition_on_previous_text: true,
+            prompt_tokens: Vec::new(),
+            words: false,
         };
         let mut picker = RowPicker::default();
         let transcription = transcriber
@@ -1016,6 +1125,7 @@ async fn the_route_draws_a_request_from_one_seeded_generator() {
                 &mut |row, temperature| picker.pick(row, temperature),
                 Device::Gpu,
                 &AtomicBool::new(false),
+                &mut |_| Ok(()),
             )
             .expect("transcribe");
         transcription
@@ -1056,4 +1166,237 @@ async fn the_route_draws_a_request_from_one_seeded_generator() {
         .map(|segment| (segment.seek, segment.tokens, segment.temperature))
         .collect();
     assert_eq!(from_the_route, reference);
+}
+
+// ── A streamed transcription, on the model ──────────────────────────────────
+
+/// The sentences of [`windows_wav`], one for each window.
+const WINDOW_SENTENCES: [&str; 8] = [
+    "Apples grow on the old trees in the orchard.",
+    "The train leaves the station at noon.",
+    "A small boat crossed the quiet lake.",
+    "She painted the garden fence a bright blue.",
+    "The library opens early on Mondays.",
+    "Rain fell softly on the tin roof.",
+    "He fixed the bicycle with a wrench.",
+    "The market sells fresh bread every day.",
+];
+
+/// The 16 kHz samples of `sentence` spoken by `say` with the English test
+/// voice; `None` when `say` or the voice is not available.
+fn spoken(sentence: &str) -> Option<Vec<f32>> {
+    let dir = tempfile::tempdir().ok()?;
+    let wav = dir.path().join("sentence.wav");
+    if !say_voice::say_english_wav(&wav, sentence) {
+        return None;
+    }
+    Some(WavDecoder::decode(&std::fs::read(&wav).ok()?).ok()?.samples)
+}
+
+/// A clip of `sentences.len()` windows as a 16 kHz mono WAV file: each
+/// sentence, then zeros to 29 s.
+fn windows_wav(sentences: &[&str]) -> Option<Vec<u8>> {
+    const SLOT: usize = 29 * 16_000;
+    let mut samples = Vec::new();
+    for sentence in sentences {
+        let speech = spoken(sentence)?;
+        let pause = SLOT.saturating_sub(speech.len());
+        samples.extend(speech);
+        samples.extend(std::iter::repeat_n(0.0, pause));
+    }
+    WavEncoder::encode(&samples, 16_000, 1).ok()
+}
+
+/// The longest wait for the next bytes of a streamed reply.
+const STREAM_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A streamed reply as the client read it: the status, the header lines, and
+/// each event with the time its bytes arrived.
+struct Streamed {
+    status: u16,
+    head: String,
+    events: Vec<(std::time::Instant, serde_json::Value)>,
+}
+
+impl Streamed {
+    fn deltas(&self) -> Vec<&str> {
+        self.events
+            .iter()
+            .filter(|(_, event)| event["type"] == "transcript.text.delta")
+            .filter_map(|(_, event)| event["delta"].as_str())
+            .collect()
+    }
+}
+
+/// POST `wav` with `stream=true` and read the events as they arrive. With
+/// `close_after_first_delta`, the client closes the connection once a delta
+/// has arrived. Every `data:` line is one JSON event; the chunk-size lines of
+/// the transfer encoding are not `data:` lines.
+async fn stream_transcription(port: u16, wav: &[u8], close_after_first_delta: bool) -> Streamed {
+    let body = form(&[("file", wav), ("language", b"en"), ("stream", b"true")]);
+    let head = format!(
+        "POST {TRANSCRIPTIONS} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\
+         {FORM_TYPE}Content-Length: {}\r\n\r\n",
+        body.len()
+    );
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    stream.write_all(head.as_bytes()).await.unwrap();
+    stream.write_all(&body).await.unwrap();
+
+    let mut raw: Vec<u8> = Vec::new();
+    let mut read_to = 0;
+    let mut events = Vec::new();
+    let mut buf = vec![0_u8; 1 << 16];
+    loop {
+        let n = tokio::time::timeout(STREAM_WAIT, stream.read(&mut buf))
+            .await
+            .expect("the reply stalls")
+            .expect("the reply reads");
+        if n == 0 {
+            break;
+        }
+        let now = std::time::Instant::now();
+        raw.extend_from_slice(buf.get(..n).unwrap_or_default());
+        while let Some(end) = raw
+            .get(read_to..)
+            .and_then(|rest| rest.iter().position(|&b| b == b'\n'))
+        {
+            let line = String::from_utf8_lossy(raw.get(read_to..read_to + end).unwrap_or_default())
+                .into_owned();
+            read_to += end + 1;
+            if let Some(data) = line.trim_end_matches('\r').strip_prefix("data: ") {
+                let event: serde_json::Value = serde_json::from_str(data)
+                    .unwrap_or_else(|e| panic!("an event that is not JSON ({e}): {data}"));
+                events.push((now, event));
+            }
+        }
+        if close_after_first_delta
+            && events
+                .iter()
+                .any(|(_, event)| event["type"] == "transcript.text.delta")
+        {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&raw);
+    let head_end = text.find("\r\n\r\n").unwrap_or(text.len());
+    let status = text
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    Streamed {
+        status,
+        head: text[..head_end].to_owned(),
+        events,
+    }
+}
+
+/// The `text` of a `json` reply to `wav`, and how long the reply took.
+async fn plain_text(port: u16, wav: &[u8]) -> (String, std::time::Duration) {
+    let started = std::time::Instant::now();
+    let Answer { status, body, .. } = post_form(port, &[("file", wav), ("language", b"en")]).await;
+    let took = started.elapsed();
+    assert_eq!(status, 200, "{body}");
+    let reply: serde_json::Value = serde_json::from_str(&body).expect("a json reply");
+    let text = reply.get("text").and_then(serde_json::Value::as_str);
+    (text.expect("a text").to_owned(), took)
+}
+
+/// A streamed transcription of a clip of eight windows, through the route on
+/// the model. The first delta arrives before half the time of the whole
+/// transcription has passed; the deltas, joined with nothing, are the text of
+/// the done event and the text of the same clip without `stream`; the done
+/// event is the last event. A client that closes the connection after the
+/// first delta stops the job: the next request, of one sentence, has its reply
+/// before half the time from the first delta to the done event of a whole
+/// stream has passed, so the walk did not go on to the end of the clip.
+#[tokio::test]
+#[ignore = "GPU Metal context — run in isolation: cargo test -p rmlx-server --test audio_route a_streamed_transcription -- --ignored --test-threads=1"]
+async fn a_streamed_transcription_sends_each_window_as_it_closes() {
+    const TEST: &str = "a_streamed_transcription_sends_each_window_as_it_closes";
+    let Some(model_path) = snapshot(TEST, WHISPER.0, WHISPER.1) else {
+        return;
+    };
+    let Some(tokenizer_path) = snapshot(TEST, WHISPER_TOKENIZER.0, WHISPER_TOKENIZER.1) else {
+        return;
+    };
+    let (Some(clip), Some(sentence)) = (
+        windows_wav(&WINDOW_SENTENCES),
+        windows_wav(&WINDOW_SENTENCES[..1]),
+    ) else {
+        eprintln!(
+            "SKIP a_streamed_transcription_sends_each_window_as_it_closes: say or its voice is unavailable"
+        );
+        return;
+    };
+
+    let mut state = not_ready_state(ModelRegistry::default());
+    state.whisper_model_path = Some(model_path);
+    state.whisper_tokenizer_path = Some(tokenizer_path);
+    state.device = Device::Gpu;
+    let port = start_server_with_state(state).await;
+
+    // The first request loads the model; the timed ones find it loaded.
+    plain_text(port, &sentence).await;
+    let (text, plain_took) = plain_text(port, &clip).await;
+
+    let started = std::time::Instant::now();
+    let whole = stream_transcription(port, &clip, false).await;
+    assert_eq!(whole.status, 200, "{}", whole.head);
+    assert!(
+        whole
+            .head
+            .to_ascii_lowercase()
+            .contains("\r\ncontent-type: text/event-stream"),
+        "{}",
+        whole.head
+    );
+    let deltas = whole.deltas();
+    eprintln!(
+        "streamed: {} events, {} deltas, plain reply {plain_took:?}",
+        whole.events.len(),
+        deltas.len()
+    );
+    assert!(deltas.len() >= 2, "one delta for each window: {deltas:?}");
+    let (first_at, _) = whole
+        .events
+        .iter()
+        .find(|(_, event)| event["type"] == "transcript.text.delta")
+        .expect("a delta");
+    let (done_at, done) = whole.events.last().expect("an event");
+    assert_eq!(done["type"], "transcript.text.done", "{done}");
+    assert_eq!(
+        whole
+            .events
+            .iter()
+            .filter(|(_, event)| event["type"] == "transcript.text.done")
+            .count(),
+        1
+    );
+    assert!(
+        first_at.duration_since(started) < plain_took / 2,
+        "the first delta came {:?} after the request; the whole transcription takes {plain_took:?}",
+        first_at.duration_since(started)
+    );
+    assert_eq!(deltas.concat(), done["text"].as_str().expect("a text"));
+    assert_eq!(deltas.concat(), text);
+    let span = done_at.duration_since(*first_at);
+
+    let gone = stream_transcription(port, &clip, true).await;
+    assert_eq!(gone.deltas().len(), 1, "the client closes after one delta");
+    let closed = std::time::Instant::now();
+    plain_text(port, &sentence).await;
+    let next_after = closed.elapsed();
+    eprintln!(
+        "first delta to done {span:?}; the next request ended {next_after:?} after the close"
+    );
+    assert!(
+        next_after < span / 2,
+        "the next request ended {next_after:?} after the close; a whole stream runs {span:?} \
+         from its first delta to its done event"
+    );
 }

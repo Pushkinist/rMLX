@@ -43,6 +43,20 @@
 //!    `say_clip_deterministic` and `say_clip_turbo_deterministic` also hold that
 //!    a load keeps the alignment heads of the snapshot (ten for large-v3, six
 //!    for large-v3-turbo, which ships `weights.safetensors`).
+//!    `every_segment_of_a_spoken_clip_carries_its_confidence` holds the range of
+//!    the average log-probability and of the no-speech probability of each
+//!    segment.
+//!    `a_prompt_sets_the_spelling_of_a_made_up_name` holds that the `prompt`
+//!    field changes the spelling of a made-up name, that a blank prompt changes
+//!    nothing, and that the text of a special token in a prompt is refused.
+//!    `every_word_of_a_spoken_clip_is_in_order_inside_its_segment`,
+//!    `two_words_around_a_pause_are_timed_on_their_own_sides` and
+//!    `the_word_times_of_a_spoken_clip_agree_with_mlx_whisper` hold the word
+//!    timestamps; `words_move_no_segment` holds that a request with no words
+//!    gives what it gave before word times were built, and that the words do
+//!    not change the segments.
+//!    `words_across_a_window_boundary_point_at_their_own_segments` holds the
+//!    words of a clip of two or more windows.
 //!
 //! 2. `long_form_regression` — scans the gitignored fixtures dir
 //!    (`crates/rmlx-audio/tests/fixtures/`) for any `*.{m4a,wav,mp3,…}` paired
@@ -70,13 +84,16 @@
 
 mod say_voice;
 
-use say_voice::{voice_is_installed, ENGLISH_VOICE};
+use say_voice::{run_bounded, voice_is_installed, ENGLISH_VOICE};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Instant;
+use tempfile::TempDir;
 
-use rmlx_audio::tokenizer::{WhisperTask, WhisperTokenizer};
-use rmlx_audio::transcribe::{TranscribeOptions, Transcriber};
+use rmlx_audio::tokenizer::{TokenizerError, WhisperTask, WhisperTokenizer};
+use rmlx_audio::transcribe::{TextDeltas, TranscribeOptions, Transcriber, Word};
 use rmlx_audio::wav::WavDecoder;
 use rmlx_audio::whisper::{WhisperError, WhisperModel};
 use rmlx_mlx::Device;
@@ -189,7 +206,7 @@ fn parse_vtt_reference(path: &Path) -> String {
 // ── say-clip helpers ────────────────────────────────────────────────────────
 
 fn have_cmd(cmd: &str) -> bool {
-    std::process::Command::new("which")
+    Command::new("which")
         .arg(cmd)
         .output()
         .map(|o| o.status.success())
@@ -198,45 +215,44 @@ fn have_cmd(cmd: &str) -> bool {
 
 /// Synthesise a known sentence to a 16 kHz mono WAV via `say` + `ffmpeg`,
 /// with [`ENGLISH_VOICE`]: the same samples on each run.
-fn synth_say_clip(sentence: &str) -> Option<PathBuf> {
+fn synth_say_clip(sentence: &str) -> Option<(TempDir, PathBuf)> {
     synth_voice_clip(ENGLISH_VOICE, sentence)
 }
 
-/// [`synth_say_clip`] with the `say` voice `voice`. `None` when `say`,
-/// `ffmpeg` or the voice is not installed; nothing is spoken then.
-fn synth_voice_clip(voice: &str, sentence: &str) -> Option<PathBuf> {
+/// [`synth_say_clip`] with the `say` voice `voice`: the WAV file and the
+/// directory that holds it, which is removed when the caller drops it. `None`
+/// when `say`, `ffmpeg` or the voice is not installed, or a tool fails;
+/// nothing is spoken then.
+fn synth_voice_clip(voice: &str, sentence: &str) -> Option<(TempDir, PathBuf)> {
     if !have_cmd("ffmpeg") || !voice_is_installed(voice) {
         return None;
     }
-    let dir = std::env::temp_dir();
-    let aiff = dir.join("rmlx_say_clip.aiff");
-    let wav = dir.join("rmlx_say_clip.wav");
-    let say_ok = std::process::Command::new("say")
-        .args(["-v", voice])
-        .args(["-o", aiff.to_str()?, sentence])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !say_ok {
-        return None;
-    }
-    let ff_ok = std::process::Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-i",
-            aiff.to_str()?,
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-c:a",
-            "pcm_s16le",
-            wav.to_str()?,
-        ])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    ff_ok.then_some(wav)
+    let dir = tempfile::tempdir().ok()?;
+    let aiff = dir.path().join("clip.aiff");
+    let wav = dir.path().join("clip.wav");
+    let said = run_bounded(
+        "say",
+        Command::new("say")
+            .args(["-v", voice])
+            .args(["-o", aiff.to_str()?, sentence]),
+    );
+    let converted = said
+        && run_bounded(
+            "ffmpeg",
+            Command::new("ffmpeg").args([
+                "-y",
+                "-i",
+                aiff.to_str()?,
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-c:a",
+                "pcm_s16le",
+                wav.to_str()?,
+            ]),
+        );
+    converted.then_some((dir, wav))
 }
 
 fn transcribe_file(
@@ -277,6 +293,7 @@ fn transcribe_greedy(
         &mut |row, _| Ok(largest_logit(row)),
         Device::Gpu,
         &AtomicBool::new(cancelled),
+        &mut |_| Ok(()),
     )
 }
 
@@ -286,6 +303,8 @@ fn english(temperature: f32) -> TranscribeOptions {
         task: WhisperTask::Transcribe,
         temperature,
         condition_on_previous_text: true,
+        prompt_tokens: Vec::new(),
+        words: false,
     }
 }
 
@@ -393,7 +412,7 @@ fn say_clip_deterministic() {
         eprintln!("SKIP say_clip_deterministic: whisper snapshot not present");
         return;
     };
-    let Some(wav) = synth_say_clip(SAY_SENTENCE) else {
+    let Some((_dir, wav)) = synth_say_clip(SAY_SENTENCE) else {
         eprintln!("SKIP say_clip_deterministic: say, its voice or ffmpeg unavailable");
         return;
     };
@@ -409,7 +428,7 @@ fn say_clip_turbo_deterministic() {
         eprintln!("SKIP say_clip_turbo_deterministic: turbo snapshot not present");
         return;
     };
-    let Some(wav) = synth_say_clip(SAY_SENTENCE) else {
+    let Some((_dir, wav)) = synth_say_clip(SAY_SENTENCE) else {
         eprintln!("SKIP say_clip_turbo_deterministic: say, its voice or ffmpeg unavailable");
         return;
     };
@@ -425,7 +444,7 @@ fn two_sentence_clip_is_two_segments() {
         eprintln!("SKIP two_sentence_clip_is_two_segments: whisper snapshot not present");
         return;
     };
-    let Some(wav) = synth_say_clip(
+    let Some((_dir, wav)) = synth_say_clip(
         "The quick brown fox jumps over the lazy dog. Paper was invented in China about two thousand years ago.",
     ) else {
         eprintln!("SKIP two_sentence_clip_is_two_segments: say, its voice or ffmpeg unavailable");
@@ -547,8 +566,8 @@ fn tone(len: usize, hz: f64, dbfs: f64) -> Vec<f32> {
 
 /// `sentence` spoken by `say`, as 16 kHz mono samples.
 fn say_samples(sentence: &str) -> Option<Vec<f32>> {
-    let wav = synth_say_clip(sentence)?;
-    Some(WavDecoder::decode(&std::fs::read(wav).ok()?).ok()?.samples)
+    let (_dir, wav) = synth_say_clip(sentence)?;
+    Some(WavDecoder::decode(&std::fs::read(&wav).ok()?).ok()?.samples)
 }
 
 /// `samples`, then zeros to the end of one window.
@@ -797,6 +816,366 @@ fn a_file_of_a_few_spoken_words_keeps_its_words() {
     }
 }
 
+/// Each segment of a spoken clip carries the average log-probability of the
+/// decode its window kept, in (-1.0, 0.0] because that decode is not weak, and
+/// the no-speech probability of its window, in [0.0, 1.0] and low for speech.
+/// The text is the spoken text.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test every_segment_of_a_spoken_clip -- --ignored --test-threads=1"]
+fn every_segment_of_a_spoken_clip_carries_its_confidence() {
+    let Some(t) = load_transcriber() else {
+        eprintln!(
+            "SKIP every_segment_of_a_spoken_clip_carries_its_confidence: whisper snapshot not present"
+        );
+        return;
+    };
+    let script = format!("{FOX} {LANTERN}");
+    let Some(samples) = say_samples(&script) else {
+        eprintln!(
+            "SKIP every_segment_of_a_spoken_clip_carries_its_confidence: say, its voice or ffmpeg unavailable"
+        );
+        return;
+    };
+    let r = transcribe_samples(&t, &samples, "en");
+    println!("confidence of the segments: {:?}", r.segments);
+    assert_eq!(normalize(&r.text), normalize(&script), "{:?}", r.text);
+    assert!(!r.segments.is_empty());
+    for segment in &r.segments {
+        assert!(
+            segment.avg_logprob > -1.0 && segment.avg_logprob <= 0.0,
+            "avg_logprob: {segment:?}"
+        );
+        assert!(
+            (0.0..=1.0).contains(&segment.no_speech_prob),
+            "no_speech_prob: {segment:?}"
+        );
+    }
+}
+
+/// A clip that says a made-up name, which large-v3 spells another way with no
+/// prompt: with the name as the prompt, the text spells it as the prompt does.
+/// The text with no prompt is the text that the same clip gave before the
+/// prompt was read, and a white-space prompt gives the same tokens as no
+/// prompt. A prompt that holds the text of a special token is refused when it
+/// is encoded, before any window is decoded.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test a_prompt_sets_the_spelling -- --ignored --test-threads=1"]
+fn a_prompt_sets_the_spelling_of_a_made_up_name() {
+    let Some(t) = load_transcriber() else {
+        eprintln!(
+            "SKIP a_prompt_sets_the_spelling_of_a_made_up_name: whisper snapshot not present"
+        );
+        return;
+    };
+    let Some(samples) =
+        say_samples("Yesterday I met Zyrtanvel at the station, and Zyrtanvel said hello.")
+    else {
+        eprintln!(
+            "SKIP a_prompt_sets_the_spelling_of_a_made_up_name: say, its voice or ffmpeg unavailable"
+        );
+        return;
+    };
+    let (_, tokenizer_dir) = snapshot_paths(WHISPER_SLUG).expect("the snapshot was found above");
+    let tokenizer = WhisperTokenizer::from_path(&tokenizer_dir).expect("load tokenizer");
+    let with_prompt = |prompt: &str| {
+        let opts = TranscribeOptions {
+            prompt_tokens: tokenizer.encode_prompt(prompt).expect("encode the prompt"),
+            ..english(0.0)
+        };
+        transcribe_greedy(&t, &samples, &opts, false)
+    };
+
+    let plain = with_prompt("").expect("transcribe");
+    println!("text with no prompt: {:?}", plain.text);
+    assert_eq!(
+        plain.text,
+        "Yesterday I met Zert Anvil at the station, and Zert Anvil said hello."
+    );
+
+    let prompted = with_prompt("Glossary: Zyrtanvel.").expect("transcribe");
+    println!("text with the name in the prompt: {:?}", prompted.text);
+    assert_eq!(
+        prompted.text,
+        "Yesterday I met Zyrtanvel at the station, and Zyrtanvel said hello."
+    );
+
+    let blank = with_prompt(" \n\t ").expect("transcribe");
+    let tokens = |r: &rmlx_audio::transcribe::Transcription| {
+        r.segments
+            .iter()
+            .map(|s| s.tokens.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(tokens(&blank), tokens(&plain));
+
+    assert!(matches!(
+        tokenizer.encode_prompt("Names: <|endoftext|>"),
+        Err(TokenizerError::SpecialTokenText)
+    ));
+}
+
+// ── Word timestamps ─────────────────────────────────────────────────────────
+
+const PAPER: &str = "Paper was invented in China about two thousand years ago.";
+
+/// The script of the clip that the word tests transcribe: three sentences.
+fn three_sentences() -> String {
+    format!("{FOX} {LANTERN} {PAPER}")
+}
+
+fn with_words() -> TranscribeOptions {
+    TranscribeOptions {
+        words: true,
+        ..english(0.0)
+    }
+}
+
+/// The words of segment `index`.
+fn words_of(words: &[Word], index: usize) -> Vec<&Word> {
+    words.iter().filter(|w| w.segment == index).collect()
+}
+
+/// In each segment of a spoken clip of three sentences, the words are in
+/// order, each ends at or after its start, each is inside its segment, and
+/// together they spell the segment's text. No word ends after the end of the
+/// file.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test every_word_of_a_spoken_clip -- --ignored --test-threads=1"]
+fn every_word_of_a_spoken_clip_is_in_order_inside_its_segment() {
+    let Some(t) = load_transcriber() else {
+        eprintln!(
+            "SKIP every_word_of_a_spoken_clip_is_in_order_inside_its_segment: whisper snapshot not present"
+        );
+        return;
+    };
+    let Some(samples) = say_samples(&three_sentences()) else {
+        eprintln!(
+            "SKIP every_word_of_a_spoken_clip_is_in_order_inside_its_segment: say, its voice or ffmpeg unavailable"
+        );
+        return;
+    };
+    let duration = samples.len() as f32 / 16_000.0;
+    let r = transcribe_greedy(&t, &samples, &with_words(), false).expect("transcribe");
+    let words = r.words.as_deref().expect("words were asked for");
+    for word in words {
+        println!(
+            "word {:>2} {:6.2} {:6.2} {:?}",
+            word.segment, word.start, word.end, word.word
+        );
+    }
+    assert!(!r.segments.is_empty());
+    assert!(
+        words
+            .windows(2)
+            .all(|pair| pair[0].segment <= pair[1].segment),
+        "the words are in the order of their segments"
+    );
+    for (index, segment) in r.segments.iter().enumerate() {
+        let mine = words_of(words, index);
+        assert!(!mine.is_empty(), "segment {index} has words: {segment:?}");
+        for pair in mine.windows(2) {
+            assert!(pair[0].start <= pair[1].start, "{pair:?}");
+        }
+        for word in &mine {
+            assert!(word.start <= word.end, "{word:?}");
+            assert!(
+                segment.start <= word.start && word.end <= segment.end,
+                "{word:?} is outside {segment:?}"
+            );
+            assert!(word.end <= duration, "{word:?} ends after {duration} s");
+        }
+        let joined: String = mine.iter().map(|w| w.word.as_str()).collect();
+        assert_eq!(joined.trim(), segment.text);
+    }
+}
+
+/// A word, 2.0 s of silence, then a second word: the first word ends no later
+/// than the end of its samples and the second starts no earlier than the start
+/// of its samples, each within a tolerance.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test two_words_around_a_pause -- --ignored --test-threads=1"]
+fn two_words_around_a_pause_are_timed_on_their_own_sides() {
+    // Measured on large-v3: the first word ends 0.69 s before the end of its
+    // samples, and the second starts 0.01 s before the start of its samples.
+    const TOLERANCE: f32 = 0.1;
+    let Some(t) = load_transcriber() else {
+        eprintln!(
+            "SKIP two_words_around_a_pause_are_timed_on_their_own_sides: whisper snapshot not present"
+        );
+        return;
+    };
+    let (Some(first), Some(second)) = (say_samples("Hello"), say_samples("Goodbye")) else {
+        eprintln!(
+            "SKIP two_words_around_a_pause_are_timed_on_their_own_sides: say, its voice or ffmpeg unavailable"
+        );
+        return;
+    };
+    let first_end = first.len() as f32 / 16_000.0;
+    let second_start = first_end + 2.0;
+    let mut samples = first;
+    samples.extend(silence(2));
+    samples.extend(second);
+    let r = transcribe_greedy(&t, &samples, &with_words(), false).expect("transcribe");
+    let words = r.words.as_deref().expect("words were asked for");
+    println!("words: {words:?}");
+    let spoken: Vec<Vec<String>> = words.iter().map(|w| normalize(&w.word)).collect();
+    assert_eq!(
+        spoken,
+        [vec!["hello".to_owned()], vec!["goodbye".to_owned()]],
+        "{words:?}"
+    );
+    println!(
+        "margins: the first word ends {:.2} s before the end of its samples; the second \
+         starts {:.2} s after the start of its samples",
+        first_end - words[0].end,
+        words[1].start - second_start
+    );
+    assert!(words[0].end <= first_end + TOLERANCE, "{:?}", words[0]);
+    assert!(words[1].start >= second_start - TOLERANCE, "{:?}", words[1]);
+}
+
+/// The words of the three-sentence clip as mlx-whisper 0.4.3 gives them: (segment, word, start,
+/// end). Made on this clip and the large-v3 snapshot, with the alignment heads set from the
+/// snapshot's `alignment_heads` entry, `language="en"`, `temperature=0.0` and
+/// `word_timestamps=True`. Its segments hold the same tokens as rMLX's.
+const MLX_WHISPER_WORDS: [(usize, &str, f32, f32); 29] = [
+    (0, " The", 0.0, 0.08),
+    (0, " quick", 0.08, 0.26),
+    (0, " brown", 0.26, 0.58),
+    (0, " fox", 0.58, 0.94),
+    (0, " jumps", 0.94, 1.36),
+    (0, " over", 1.36, 1.76),
+    (0, " the", 1.76, 1.98),
+    (0, " lazy", 1.98, 2.26),
+    (0, " dog.", 2.26, 2.66),
+    (1, " She", 2.96, 3.5),
+    (1, " carried", 3.5, 3.98),
+    (1, " a", 3.98, 4.16),
+    (1, " brass", 4.16, 4.42),
+    (1, " lantern", 4.42, 4.8),
+    (1, " down", 4.8, 5.18),
+    (1, " the", 5.18, 5.44),
+    (1, " narrow", 5.44, 5.72),
+    (1, " stone", 5.72, 6.06),
+    (1, " stairs.", 6.06, 6.52),
+    (2, " Paper", 6.92, 7.52),
+    (2, " was", 7.52, 7.78),
+    (2, " invented", 7.78, 8.16),
+    (2, " in", 8.16, 8.52),
+    (2, " China", 8.52, 8.74),
+    (2, " about", 8.74, 9.14),
+    (2, " 2", 9.14, 9.36),
+    (2, ",000", 9.36, 9.92),
+    (2, " years", 9.92, 10.18),
+    (2, " ago.", 10.18, 10.58),
+];
+
+/// The words of the three-sentence clip have the texts and the segments that
+/// mlx-whisper gives, and each time is within 0.04 s of its time. mlx-whisper
+/// moves the start of a segment to its first word; rMLX clamps the word into
+/// the segment instead, so the reference time is clamped into rMLX's segment
+/// before the compare (" She" and " Paper" start at their segment).
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test the_word_times_of_a_spoken_clip -- --ignored --test-threads=1"]
+fn the_word_times_of_a_spoken_clip_agree_with_mlx_whisper() {
+    let Some(t) = load_transcriber() else {
+        eprintln!(
+            "SKIP the_word_times_of_a_spoken_clip_agree_with_mlx_whisper: whisper snapshot not present"
+        );
+        return;
+    };
+    let Some(samples) = say_samples(&three_sentences()) else {
+        eprintln!(
+            "SKIP the_word_times_of_a_spoken_clip_agree_with_mlx_whisper: say, its voice or ffmpeg unavailable"
+        );
+        return;
+    };
+    let r = transcribe_greedy(&t, &samples, &with_words(), false).expect("transcribe");
+    let words = r.words.as_deref().expect("words were asked for");
+    let found: Vec<(usize, &str)> = words.iter().map(|w| (w.segment, w.word.as_str())).collect();
+    let expected: Vec<(usize, &str)> = MLX_WHISPER_WORDS
+        .iter()
+        .map(|&(segment, word, _, _)| (segment, word))
+        .collect();
+    assert_eq!(found, expected);
+    for (word, &(segment, _, start, end)) in words.iter().zip(&MLX_WHISPER_WORDS) {
+        let bounds = &r.segments[segment];
+        let clamp = |time: f32| time.clamp(bounds.start, bounds.end);
+        let (start_diff, end_diff) = (word.start - clamp(start), word.end - clamp(end));
+        println!(
+            "{:<10} rMLX {:5.2} {:5.2}  mlx-whisper {start:5.2} {end:5.2}  diff {start_diff:+.2} {end_diff:+.2}",
+            word.word, word.start, word.end
+        );
+        assert!(
+            start_diff.abs() <= 0.04 && end_diff.abs() <= 0.04,
+            "{word:?} against ({start}, {end}) in {bounds:?}"
+        );
+    }
+}
+
+/// The three-sentence clip with no request for words gives the text, the
+/// segment times and the tokens that it gave before word times were built,
+/// and no words. With words, the segments are the same: the words do not
+/// feed back.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test words_move_no_segment -- --ignored --test-threads=1"]
+fn words_move_no_segment() {
+    const SEGMENTS: [(f32, f32, &[u32]); 3] = [
+        (
+            0.0,
+            2.92,
+            &[
+                50365, 440, 1702, 6292, 21026, 16704, 670, 264, 14847, 3000, 13, 50511,
+            ],
+        ),
+        (
+            3.46,
+            6.84,
+            &[
+                50538, 1240, 9094, 257, 26257, 34031, 760, 264, 9432, 7581, 13471, 13, 50707,
+            ],
+        ),
+        (
+            7.36,
+            10.78,
+            &[
+                50733, 24990, 390, 14479, 294, 3533, 466, 568, 11, 1360, 924, 2057, 13, 50904,
+            ],
+        ),
+    ];
+    let Some(t) = load_transcriber() else {
+        eprintln!("SKIP words_move_no_segment: whisper snapshot not present");
+        return;
+    };
+    let Some(samples) = say_samples(&three_sentences()) else {
+        eprintln!("SKIP words_move_no_segment: say, its voice or ffmpeg unavailable");
+        return;
+    };
+    let shape = |r: &rmlx_audio::transcribe::Transcription| -> Vec<(f32, f32, Vec<u32>)> {
+        r.segments
+            .iter()
+            .map(|s| (s.start, s.end, s.tokens.clone()))
+            .collect()
+    };
+    let expected: Vec<(f32, f32, Vec<u32>)> = SEGMENTS
+        .iter()
+        .map(|&(start, end, tokens)| (start, end, tokens.to_vec()))
+        .collect();
+
+    let plain = transcribe_samples(&t, &samples, "en");
+    assert_eq!(
+        plain.text,
+        "The quick brown fox jumps over the lazy dog. She carried a brass lantern down the \
+         narrow stone stairs. Paper was invented in China about 2,000 years ago."
+    );
+    assert_eq!(shape(&plain), expected);
+    assert!(plain.words.is_none(), "{:?}", plain.words);
+
+    let worded = transcribe_greedy(&t, &samples, &with_words(), false).expect("transcribe");
+    assert_eq!(worded.text, plain.text);
+    assert_eq!(shape(&worded), expected);
+}
+
 // ── Speech above the no-speech bound ────────────────────────────────────────
 
 /// Thirty seconds of four spoken words in a loop read a no-speech probability
@@ -832,6 +1211,7 @@ fn a_spoken_repetition_above_the_no_speech_bound_is_not_skipped() {
             },
             Device::Gpu,
             &AtomicBool::new(false),
+            &mut |_| Ok(()),
         )
         .expect("transcribe");
     assert_eq!(
@@ -891,6 +1271,7 @@ fn the_gate_picks_at_temperature_0_for_a_request_above_0() {
             },
             Device::Gpu,
             &AtomicBool::new(false),
+            &mut |_| Ok(()),
         )
         .expect("transcribe");
     assert!(
@@ -953,11 +1334,11 @@ fn the_language_of_auto_is_that_of_the_first_window_that_is_not_skipped() {
         return;
     };
     let german = "Der schnelle braune Fuchs springt über den faulen Hund.";
-    let Some(wav) = synth_voice_clip("Anna", german) else {
+    let Some((_dir, wav)) = synth_voice_clip("Anna", german) else {
         eprintln!("SKIP the_language_of_auto_is_that_of_the_first_window_that_is_not_skipped: the say voice Anna or ffmpeg is unavailable");
         return;
     };
-    let speech = WavDecoder::decode(&std::fs::read(wav).expect("read clip"))
+    let speech = WavDecoder::decode(&std::fs::read(&wav).expect("read clip"))
         .expect("decode clip")
         .samples;
     let alone = transcribe_samples(&t, &speech, "auto");
@@ -1055,6 +1436,7 @@ fn a_window_that_needs_a_fallback_is_decoded_again_and_repeats() {
                 &mut |row, temperature| Ok(pick.pick(row, temperature)),
                 Device::Gpu,
                 &AtomicBool::new(false),
+                &mut |_| Ok(()),
             )
             .expect("transcribe");
         let segments: Vec<(Vec<u32>, f32)> = r
@@ -1221,13 +1603,13 @@ const LONG_CLIP_GAPS: [f32; 28] = [
     3.5, 0.5, 1.1, 0.3, 4.5, 0.6, 0.9, 2.2, 0.0,
 ];
 
-/// The long clip as 16 kHz mono samples: every sentence of [`LONG_CLIP`]
-/// spoken by `say`, each followed by its gap.
-fn synth_long_clip() -> Option<Vec<f32>> {
+/// The first `sentences` sentences of [`LONG_CLIP`] as 16 kHz mono samples,
+/// each spoken by `say` and followed by its gap.
+fn synth_long_clip(sentences: usize) -> Option<Vec<f32>> {
     let mut samples = Vec::new();
-    for ((_, sentence), gap) in LONG_CLIP.iter().zip(LONG_CLIP_GAPS) {
-        let wav = synth_say_clip(sentence)?;
-        let speech = WavDecoder::decode(&std::fs::read(wav).ok()?).ok()?;
+    for ((_, sentence), gap) in LONG_CLIP.iter().zip(LONG_CLIP_GAPS).take(sentences) {
+        let (_dir, wav) = synth_say_clip(sentence)?;
+        let speech = WavDecoder::decode(&std::fs::read(&wav).ok()?).ok()?;
         assert_eq!(speech.sample_rate, 16_000, "say clip rate");
         samples.extend(speech.samples);
         samples.extend(std::iter::repeat_n(0.0, (gap * 16_000.0) as usize));
@@ -1235,11 +1617,73 @@ fn synth_long_clip() -> Option<Vec<f32>> {
     Some(samples)
 }
 
+/// The words of a clip of two or more windows: each lies in the interval of
+/// its segment, a word that starts in a later window points at a segment of
+/// that window and not of the first, and the words are in time order across
+/// the window boundary.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test words_across_a_window_boundary -- --ignored --test-threads=1"]
+fn words_across_a_window_boundary_point_at_their_own_segments() {
+    let Some(t) = load_transcriber() else {
+        eprintln!(
+            "SKIP words_across_a_window_boundary_point_at_their_own_segments: whisper snapshot not present"
+        );
+        return;
+    };
+    let Some(samples) = synth_long_clip(12) else {
+        eprintln!(
+            "SKIP words_across_a_window_boundary_point_at_their_own_segments: say, its voice or ffmpeg unavailable"
+        );
+        return;
+    };
+    let r = transcribe_greedy(&t, &samples, &with_words(), false).expect("transcribe");
+    let words = r.words.as_deref().expect("words were asked for");
+    let mut window_starts: Vec<usize> = r.segments.iter().map(|s| s.seek).collect();
+    window_starts.dedup();
+    println!(
+        "{:.2} s, {} windows (seek {window_starts:?}), {} segments, {} words",
+        r.duration,
+        window_starts.len(),
+        r.segments.len(),
+        words.len()
+    );
+    assert!(window_starts.len() >= 2, "{window_starts:?}");
+    let first_window_segments = r
+        .segments
+        .iter()
+        .take_while(|s| s.seek == window_starts[0])
+        .count();
+    let second_window_start = window_starts[1] as f32 / 100.0;
+    for word in words {
+        let segment = &r.segments[word.segment];
+        assert!(
+            segment.start <= word.start && word.end <= segment.end,
+            "{word:?} is outside {segment:?}"
+        );
+        if word.start >= second_window_start {
+            assert!(
+                word.segment >= first_window_segments,
+                "{word:?} starts in a later window and points at a segment of the first"
+            );
+        }
+    }
+    assert!(
+        words.iter().any(|w| w.start >= second_window_start),
+        "a word starts in a later window"
+    );
+    assert!(
+        words.windows(2).all(|pair| pair[0].start <= pair[1].start),
+        "the words are in time order"
+    );
+}
+
 /// A clip of several windows: every sentence is transcribed once, in order,
 /// with segment times that move forward and stay inside the clip. A window
 /// that ends inside a sentence must hand that sentence to the next window
 /// without losing or repeating it. A cancel flag set before the call opens no
-/// window and returns `Cancelled`.
+/// window and returns `Cancelled`. A window sink that reports a gone reader,
+/// with a flag that is never set, stops the walk before the second window. The
+/// text deltas of the closed windows join to the text.
 ///
 /// Not covered: the previous-text prompt. The clean clip decodes the same
 /// words with no prompt, so a prompt that is dropped or built from the wrong
@@ -1253,7 +1697,7 @@ fn long_synthetic_clip_is_transcribed_once_in_order() {
         );
         return;
     };
-    let Some(samples) = synth_long_clip() else {
+    let Some(samples) = synth_long_clip(LONG_CLIP.len()) else {
         eprintln!("SKIP long_synthetic_clip_is_transcribed_once_in_order: say, its voice or ffmpeg unavailable");
         return;
     };
@@ -1266,7 +1710,41 @@ fn long_synthetic_clip_is_transcribed_once_in_order() {
         ),
         "a flag set before the call opens no window: {cancelled:?}"
     );
-    let r = transcribe_greedy(&t, &samples, &opts, false).expect("transcribe");
+    let mut sink_calls = 0;
+    let gone = t.transcribe(
+        &samples,
+        &opts,
+        &mut |row, _| Ok(largest_logit(row)),
+        Device::Gpu,
+        &AtomicBool::new(false),
+        &mut |_| {
+            sink_calls += 1;
+            Err(rmlx_core::error::Error::Cancelled)
+        },
+    );
+    assert_eq!(sink_calls, 1, "the walk went on after its reader was gone");
+    assert!(
+        matches!(gone, Err(WhisperError::Cancelled { window: 1, .. })),
+        "a gone reader stops the walk before window 1: {gone:?}"
+    );
+
+    let mut producer = TextDeltas::default();
+    let mut deltas: Vec<String> = Vec::new();
+    let r = t
+        .transcribe(
+            &samples,
+            &opts,
+            &mut |row, _| Ok(largest_logit(row)),
+            Device::Gpu,
+            &AtomicBool::new(false),
+            &mut |window| {
+                deltas.extend(producer.delta(window));
+                Ok(())
+            },
+        )
+        .expect("transcribe");
+    assert!(deltas.len() >= 2, "one delta for each window: {deltas:?}");
+    assert_eq!(deltas.concat(), r.text);
     println!(
         "long clip: duration={:.2}s segments={} text={:?}",
         r.duration,
@@ -1354,7 +1832,7 @@ fn long_form_regression() {
             continue;
         }
 
-        let t0 = std::time::Instant::now();
+        let t0 = Instant::now();
         let result = transcribe_file(&t, &path, "en");
         let elapsed = t0.elapsed().as_secs_f64();
         assert_eq!(result.language, "english");

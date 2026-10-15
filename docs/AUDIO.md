@@ -62,8 +62,8 @@ reads but that is not usable pairs: a dtype other than int32 or int64 (`<u4`,
 float, a one-byte mask), another shape, a negative value, or a layer or head
 outside the decoder. The load warns of that once, with the dtype and shape or
 the pair, and goes on. An entry that the reader cannot read is an error of the
-archive (next paragraph). Nothing reads the pairs yet; word timestamps are not
-built.
+archive (next paragraph). The word timestamps read the pairs (see "Word
+timestamps").
 
 **Members the reader reads.** A member whose name ends in `.npy` is a weight,
 and it is read or the load fails. A directory member (its name ends in `/`) is
@@ -95,12 +95,32 @@ names the entry and the cause:
 audio bytes → WavDecoder::decode_resampled (mono f32, resampled to 16 kHz as the packets decode; refuses a file that lost too much)
 → per 30 s window: MelExtractor → encode_mel → no-speech gate → decode in timestamp mode (temperature fallback)
 → timestamp tokens → segments with cumulative times
+→ when words are asked: one alignment pass over the window's text → word times
 → seek: the whole window, or the end of the last closed segment
 ```
 
 With `condition_on_previous_text` set, the previous window's text is fed back
 after `<|startofprev|>`, unless the decode that window kept may not prompt
 (see "Window decision"). The server and `rmlx transcribe` always set it.
+
+**Prompt.** The `prompt` of a request is encoded as a space and the last 16 KiB
+of its trimmed text; the trim removes the Unicode White_Space characters. The
+decoder keeps 223 tokens at most, which the tail holds many times over, so a
+longer prompt is not encoded whole. An empty or white-space prompt is no
+prompt. The caller encodes it once, after the tokenizer loads and before the
+audio is decoded and the model loads, and hands the tokens to the engine. The
+prompt of a window is the last `n_text_ctx / 2 - 1` tokens (223 for large-v3)
+of the prompt's tokens followed by the carried text, so a long carried text
+cuts the prompt from the left. A window whose kept decode may not prompt the
+next one drops both, a skipped window changes neither, and a request with no
+`prompt` has the decoder prefix it had before the field was read. The
+no-speech gate reads the window with no prompt. A prompt whose last 16 KiB
+holds the text of a special token (`<|endoftext|>`, `<|en|>`, `<|0.00|>`, …)
+is refused, because the tokenizer would turn it into a control token: 422 with
+`param: prompt` on the route, an error from `rmlx transcribe`. The text before
+the tail is not read, and no other check reads the text. With
+`condition_on_previous_text` off, the prompt serves the first decoded window
+only.
 
 Each window decodes with the openai-whisper logit filters (`DecodeFilters`).
 No segment of a reply starts or ends after the duration of the file. The
@@ -244,7 +264,9 @@ with a long text it is 10 to 26 steps, before its normal decode starts.
 openai-whisper reads the probability behind the previous-text prompt and skips
 only when the average log-probability is not above -1.0 too. rMLX reads it
 with no prompt and does not read the average, on purpose: the reference rule
-skips none of 15 synthetic windows with no speech. Condition 2 has no
+skips none of 15 synthetic windows with no speech. So the `no_speech_prob` of
+a segment, which is this value, differs from the openai-whisper value for a
+window that has a prompt; it is the value that explains a skip. Condition 2 has no
 counterpart in openai-whisper. Behind a prompt they read
 0.02 to 0.18, and with no prompt their average is -0.21 to -0.93, because the
 model is sure of its stock text. In the 108 speech windows of a long private
@@ -297,7 +319,7 @@ it is one draw from `softmax(row / temperature)` by the shared sampler
 (`rmlx_models::sampler::RowPicker`), one generator for each request at the
 default seed: a repeated request gives the same tokens. No `best_of`, no beam.
 
-Four rules differ from openai-whisper:
+Seven rules differ from openai-whisper:
 
 - A loop under the prompt is first decoded again at the same temperature with
   no prompt, which stays dropped for that window: a prompt can cause the
@@ -309,6 +331,15 @@ Four rules differ from openai-whisper:
   below. The reference has the temperature bound only.
 - An average that is not finite is weak. The reference tests
   `avg_logprob < -1.0` only, which is false for a value that is not a number.
+- The carried text is the text of the last window only, encoded again with no
+  timestamp tokens. The reference carries the tokens of every kept segment
+  since the last reset, timestamp tokens included.
+- An empty or white-space prompt is no prompt. In openai-whisper `86098128` it
+  is the one-token prompt `encode(" ")`.
+- The prompt of the request stays at the head of the prompt of each window
+  until a reset, and the carried text cuts it from the left. In openai-whisper
+  (`carry_initial_prompt` off, its default) the initial prompt leaves the
+  223-token tail as soon as the text since the last reset is longer.
 
 **Cancel.** `Transcriber::transcribe` takes a cancel flag and reads it before
 each window opens. Once the flag is set, no further window opens, and the call
@@ -321,13 +352,65 @@ encode (two encodes and one more decoder step for a short window whose
 language is detected), the gate (its step and a bounded decode of at most 26
 steps), and at
 most seven decodes (six temperatures, one more with no prompt), each of at
-most `n_text_ctx / 2` tokens (224 for large-v3). Before window 0,
+most `n_text_ctx / 2` tokens (224 for large-v3), and, when words are asked,
+one alignment forward of at most `n_text_ctx / 2 + 5` tokens and its CPU
+steps (see "Word timestamps"). Before window 0,
 the caller's model load runs to its end. The audio decode before it asks the
 caller before each packet and stops there (`WavError::Cancelled`); the server
 passes the request's cancel flag to the decode and to the window walk.
 
 The server sets the flag when the request is gone (see the speech-to-text
 routes in `docs/SERVER_AUDIO.md`); `rmlx transcribe` never sets it.
+
+### Word timestamps
+
+A request for words (`timestamp_granularities[]=word` on the route, `--words`
+in `rmlx transcribe`) gets the start and the end of each word, by the method of
+openai-whisper `86098128` (`whisper/timing.py`). After the segments of a
+decoded window are made, one decoder forward runs over
+`<|startoftranscript|>`, the language, the task, `<|notimestamps|>`, the text
+tokens of all segments of the window and `<|endoftext|>`. It reads the
+cross-attention keys and values of the window: no second encoder pass and no
+second projection. It keeps the scores before the softmax of the alignment
+heads (see "Alignment heads"), cut to the encoder frames of the real audio
+(`n / 320` for a window of `n` samples). The other steps run on the CPU
+(`crates/rmlx-audio/src/transcribe/words.rs`): a softmax over the frames, each
+frame standardised over the tokens, a median filter of width 7, the mean over
+the heads, DTW, the split into words (at spaces, or at each whole character
+for `zh`, `ja`, `th`, `lo`, `my` and `yue`), the time at which the path enters
+each token (50 frames a second), the rules that cut a long word at a sentence
+mark and a long first word after a pause, and the merge of punctuation into
+the next or the previous word. Times are rounded to 0.01 s. A skipped window
+and a window with no text get no pass. A request with no words runs none of
+this.
+
+The words are added only: the text, the segments, their times and tokens,
+and the seek are those of the same request with no words. Differences from
+openai-whisper:
+
+- openai-whisper moves the start or the end of a segment to its first or last
+  word, and the seek to the end of the last word. rMLX moves none of them; a
+  word time outside its segment is clamped into the segment.
+- The last speech of the long-first-word rule is the end of the segment
+  before, not the end of its last word.
+- A frame with a standard deviation of 0 over the tokens becomes 0.0;
+  openai-whisper divides by 0.
+- The standardisation computes in f64 (torch: f32), and the rounding to
+  0.01 s takes a half away from zero (Python `round(x, 2)` takes a half of
+  the binary value to even: 0.125 gives 0.13 here and 0.12 there).
+- A segment that rMLX drops (no length, or in the zero pad after the end of
+  the file) is not aligned, and a window shorter than one encoder frame
+  (0.02 s) gets no words.
+- No word probability: the OpenAI word object has `word`, `start` and `end`
+  only. No `hallucination_silence_threshold`, which is off by default in
+  openai-whisper.
+
+A model with no usable `alignment_heads` entry refuses a request for words:
+422 with `param: timestamp_granularities` on the route, an error from
+`rmlx transcribe`. A translation with words is taken, but, as openai-whisper
+warns, word times of a translation may not be reliable. Alignment scores that
+are not numbers fail the request with an engine error, as a logit row that is
+not a number does.
 
 ### Language detection
 
@@ -382,54 +465,54 @@ multipart form of the OpenAI reference (`CreateTranscriptionRequest`);
 | `language` | `auto` | An ISO code or an English name, in any case, or `auto` to detect it on the first window that is decoded (see "Language forms" and "Language detection"). Anything else is 422. |
 | `response_format` | `json` | `json`, `text`, `verbose_json`, `srt` or `vtt`. Anything else, `diarized_json` included, is 422. |
 | `temperature` | `0.0` | A non-finite or negative value is 422, and so is a value above 0 and below `1e-6`: the sampler divides a logit by the temperature, and the result is not finite for a smaller one. Any other value is the temperature of the first decode of each window (see "Window decision"). |
-| `timestamp_granularities[]` | `segment` | `segment` is taken: every response is timed per segment. `word` is 422: word timestamps need a DTW pass over the alignment heads, which is not built. The name without `[]` is read the same way. |
-| `stream` | `false` | Read in any case. `false`, `0` or empty is taken. `true` or `1` is 422: the transcription is sent whole when it ends. Any other value is 422. |
-| `prompt` | — | Taken and ignored. The decoder's prompt is the previous window's text only. |
+| `timestamp_granularities[]` | `segment` | `segment` and `word`. Every response is timed per segment; `word` adds the times of each word to `verbose_json` (see "Word timestamps") and is 422 with any other `response_format`. Any other value is 422. The name without `[]` is read the same way. |
+| `stream` | `false` | Read in any case. `false`, `0` or empty is taken. `true` or `1` sends a `json` reply as server-sent events, one event for each window that adds text, then a done event (`docs/SERVER_AUDIO.md` § "Streamed transcription"); with another `response_format` it is 422. Any other value is 422. |
+| `prompt` | — | Text that prompts the decoder before the previous window's text (see "Prompt"). Read whole: the limit of the form bounds it, and its last 16 KiB is encoded. Text of a special token in that tail is 422. |
 | any other | — | Taken and ignored (`include[]`, `chunking_strategy`, …). |
 
-A field the route reads, other than `file`, holds at most 64 bytes: a longer
-value is 422, `<field> is over 64 bytes`, and the refusal does not echo it.
+A field the route reads, other than `file` and `prompt`, holds at most 64
+bytes: a longer value is 422, `<field> is over 64 bytes`, and the refusal does not echo it.
 An ignored field is read and dropped as it arrives; it is never held. At
 most one `warn` event per request, `form fields ignored`, gives their count
 and the first eight names, each cut to 64 bytes; there is none when the form
 is refused. A form of more than 64 parts, the file included, is 422.
 
-OpenAI ignores `stream` for `whisper-1`; the route refuses it, so a client
-that waits for events gets an error and not a body it cannot read as events.
-`prompt` is ignored, not refused: it guides the style of the text, and a
-client that sends it still gets a transcript.
+OpenAI ignores `stream` for `whisper-1`, and its streamed models give `json`
+only. The route streams `json` and refuses `stream` with any other format, so
+a client that waits for events gets events or an error, and not a body it
+cannot read as events.
 
 | `response_format` | Body |
 |---|---|
 | `json` | `{"text": "..."}` |
 | `text` | Plain text. |
-| `verbose_json` | `{"task","language","duration","text","segments":[…]}`, no `words`. |
+| `verbose_json` | `{"task","language","duration","text","segments":[…]}`, and `"words":[…]` when `word` is asked. |
 | `srt` | SRT, one cue per segment. |
 | `vtt` | WebVTT, one cue per segment. |
 
-A `verbose_json` segment holds eight of the ten keys the OpenAI
+A `verbose_json` segment holds the ten keys the OpenAI
 `TranscriptionSegment` schema requires, each with a value as openai-whisper
-`transcribe()` gives it:
+`transcribe()` gives it, except `no_speech_prob`. For a window with no
+accepted decode, the values come from the decode that the engine keeps, the
+best one and not the last:
 
 | Key | Value |
 |---|---|
 | `id`, `start`, `end`, `text` | The segment. |
 | `seek` | The start of the 30 s window that holds the segment, in 10 ms mel frames. |
 | `tokens` | The segment's slice of the window's tokens, its timestamp tokens included (large-v3 ids). |
-| `temperature`, `compression_ratio` | The window's: those of the decode the window kept, the same for each segment of the window. |
+| `temperature`, `avg_logprob`, `compression_ratio` | The window's: those of the decode the window kept, the same for each segment of the window. An `avg_logprob` below -1.0 is a decode that failed. |
+| `no_speech_prob` | The window's: the value the no-speech gate read (see "No-speech gate"), the same for each segment of the window. |
 
-`avg_logprob` and `no_speech_prob` are left out: the engine reads both for its
-window decision and no segment holds them. A `null` in their place would make a typed client
-throw (openai-dotnet reads them as numbers). A client that requires the two
-cannot read rMLX's `verbose_json` until they exist:
+A word is `{"word","start","end"}` (the OpenAI `TranscriptionWord` schema): its
+text with the leading space removed and with the punctuation that the merge
+joined to it, and its times in seconds, inside its segment.
 
-- `@ai-sdk/openai` (the Vercel AI SDK): it asks for `verbose_json` itself when
-  the model is `whisper-1`, and its schema requires both as numbers;
-- openai-python with `_strict_response_validation`.
-
-Clients known to read it: openai-python by default (`None` for the two) and
-openai-dotnet (0 for the two). `language` is the English name of the language
-of the decode, for example `french` (see "Language forms").
+`rmlx transcribe --format json` writes the same ten keys for each segment, and
+with `--words` the same `words`, from the same code:
+`rmlx_audio::transcribe::TranscriptionRecord`. `language` is the
+English name of the language of the decode, for example `french` (see
+"Language forms").
 
 Every error the route sends is the OpenAI envelope
 `{"error":{"message","type"}}` (`docs/SERVER.md` § "Error responses").
@@ -439,7 +522,9 @@ head that does not parse, and the 431 for a `Content-Length` of
 18446744073709551615. When one request field is at fault,
 the envelope also holds `"param"`, the name of the field: `language`,
 `response_format`, `temperature`, `stream`, the array name the request used
-(`timestamp_granularities` or `timestamp_granularities[]`), or `file` for a
+(`timestamp_granularities` or `timestamp_granularities[]`) for a value it
+does not know, `timestamp_granularities` for words that the format or the
+model cannot give, or `file` for a
 missing, empty, oversize or undecodable file. A fault of the form as a whole
 has no `param`. The `type` is `invalid_request_error` for 400, 413 and 422,
 `service_unavailable` for 503, `internal_error` for 500, `rate_limit_error`
@@ -449,7 +534,7 @@ for 429 and `timeout` for 408.
 |---|---|
 | 400 | A `multipart/form-data` request with no boundary: axum refuses it before the route reads the form, and the message is ``Invalid `boundary` for `multipart/form-data` request``. |
 | 413 | The file is over 25 MiB (26,214,400 bytes): `audio file is <N> bytes, over the cap of 26214400 bytes (25 MiB)`. A request body over 26 MiB (27,262,976 bytes) stops while it is read: `request body is <N> bytes, over the limit of 27262976 bytes: …`, without `<N> bytes,` when the request sent no `Content-Length`. OpenAI answers 413 for a request over 26,214,400 bytes. |
-| 422 | A malformed form, more than 64 parts, no `file` or an empty one, a field value over 64 bytes, a refused field value, or a file the decoder refuses (`audio decode: …`, see "WAV I/O"). |
+| 422 | A malformed form, more than 64 parts, no `file` or an empty one, a field value over 64 bytes, a refused field value, words with a `response_format` other than `verbose_json` or from a model with no alignment heads, or a file the decoder refuses (`audio decode: …`, see [`AUDIO_WAV.md`](AUDIO_WAV.md)). |
 | 408 | The request timeout expired (`docs/SERVER.md` § "Error responses"). |
 | 429 | The admission queue is full. |
 | 503 | The server's fault. With `x-should-retry: false`, which OpenAI's SDKs obey before their own retry of a 5xx: `--whisper-model-path` or `--whisper-tokenizer-path` is not set; the tokenizer, `config.json` or the weight file (`weights.safetensors` or `weights.npz`) does not load or is refused (see "Supported variants"); or the transcriber cannot be built on the loaded model (`transcriber init: …`). The body names the file and the fact, never a directory; the server log gives the path. On these routes, text that Whisper reports as an MLX error (it starts at `MLX op error:` or `MLX:`) is replaced by `MLX error; the server log has the cause`, because it can hold a path of the MLX install; the file or step before it stays. That covers mel extractor failures, an empty audio after processing and every engine error the audio crate converts, not only MLX ops. Without that header: an engine failure during the transcription (`transcribe: …`), which a retry may pass. |
@@ -497,164 +582,4 @@ See [`AUDIO_TTS.md`](AUDIO_TTS.md).
 
 ## WAV I/O
 
-`WavDecoder::decode` is Symphonia-backed. It reads WAV (PCM), MP3, MP4/M4A
-(AAC) and ADTS (AAC). FLAC, Ogg and the other Symphonia formats are not
-compiled in, and their probe fails. It returns `DecodedAudio`: mono f32 at the
-input's own sample rate, the length the file declares, the end of the last
-packet read, how the reader stopped, and the audio lost (`AudioLoss`).
-`WavDecoder::decode_resampled(bytes, rate, max_secs, cancelled)` returns the
-same with the samples at `rate`; Whisper and the Gemma4 audio input take it
-at 16 kHz. `max_secs` is `MAX_AUDIO_SECS` on the transcription routes, no cap
-for `rmlx transcribe`, and on the chat `input_audio` path what the context
-holds (see "Duration cap"). `cancelled` is asked before each packet; when it
-says the caller is gone the decode stops with `WavError::Cancelled`.
-
-**Resample and memory.** The channels are averaged and the result is
-resampled by linear interpolation packet by packet. The samples are the same,
-bit for bit, as a linear resample of the whole mono stream. More than two
-channels are a plain average, each channel 1/n, the LFE included; `ffmpeg
--ac 1` uses a downmix matrix that drops the LFE (an LFE-only 5.1 file is
-silence there and 1/6 of its level here; ffmpeg 9.0.2).
-
-The decoder takes a file rate, and a resample rate, of 4 kHz to 768 kHz
-(`SAMPLE_RATES`) and refuses any other (`WavError::SampleRate`). The floor
-bounds a resample to 16 kHz at four outputs an input: an 8-bit mono WAV at
-4 kHz gives 16 bytes of output a byte of file.
-
-Beside the file's bytes, a decode holds its output and about one packet: no
-copy of the bytes, no buffer of all channels, no buffer at the file's own
-rate. The output is sized from the length the file declares or Symphonia
-guesses, never past the frames the bytes can hold: one a sample's bytes for
-a WAV (a WAV whose data length is a placeholder is sized from that alone),
-256 a byte for a compressed stream (an AAC-LC frame of 1024 samples takes at
-least 4 bytes). For a well-formed file the declared length is the smaller.
-When the stream holds more, the buffer grows, and holds its old and its new
-copy while it moves. The silence for dropped packets is at most 5 s
-(`LOST_CAP_SECS`): see "Lost audio".
-
-The output at 16 kHz is 64,000 bytes per second of audio: 3.84 MB a minute,
-230.4 MB an hour.
-
-**Duration cap.** The server's 25 MiB upload cap is a size, not a length,
-and compressed audio of that size holds more than 7 hours. The duration cap,
-`MAX_AUDIO_SECS`, bounds the audio itself on the server; `rmlx transcribe`
-decodes a local file of any length:
-
-| Bound | Value | What reaches it | Memory at the bound |
-|---|---|---|---|
-| Upload cap (server only) | 25 MiB (26,214,400 bytes) of file | 13.7 min of 16 kHz mono PCM-16 WAV, 2.3 min of 48 kHz stereo PCM-16 WAV, 27.3 min of MP3 at 128 kbit/s, 54.6 min at 64 kbit/s, 7.3 h at 8 kbit/s | the file |
-| Duration cap | 3 h (10,800 s) of audio | every file the server decodes, of any size | 691.2 MB of 16 kHz f32 output, beside the file |
-
-A file that declares more than the cap is refused before any packet decodes
-(`WavError::TooLong`, `the file declares … s of audio, over the 10800 s the
-decoder takes`; 422 `audio decode: …` on the server). A stream that declares
-no length (ADTS, an MP3 with no LAME tag, a WAV through a pipe) is refused
-before its output passes the cap. The end padding a LAME tag declares is read
-before the trim and is not counted; the cap applies to what the trim leaves,
-so an MP3 that ends before its padding is refused if it holds more than the
-cap. A one-hour 16 kHz mono WAV is 115 MB and
-is refused by the upload cap, not by the duration cap.
-
-A chat `input_audio` clip (Gemma4) is capped lower: at the whole seconds
-whose audio tokens fit the context left after the prompt and the two audio
-markers, 25 tokens a second (640 samples a token on both audio branches),
-and at most `MAX_AUDIO_SECS`. With an 8192-token context and a 100-token
-prompt that is 323 s. A clip over it is a 400, refused before the mel.
-
-The peak of a read and a decode to 16 kHz, counted on the
-heap with the file's bytes: 3.0 times the file for a 16 kHz mono PCM-16 WAV
-(the f32 output alone is twice the file), 1.33 times for a 48 kHz stereo
-PCM-16 WAV, and the file plus 230.9 MB for an hour of 48 kHz stereo MP3 at
-64 kbit/s.
-
-**Declared length.** A WAV header, an MP4 track and the LAME tag of an MP3
-declare the stream length; a length of 0 (a fragmented MP4) is no length.
-Symphonia also fills a length for an ADTS stream and for an MP3 with no LAME
-tag, as a guess from the bitrate; the decoder does not take a guess as a
-declared length. A Xing or VBRI frame count with no LAME tag is exact, but
-Symphonia does not say whether it read one or guessed, so it is not used
-either.
-
-A WAV data length of `0x7FFF0000` or more is a placeholder, not a length,
-and the stream is not held to it. Writers that cannot seek back to patch the
-header leave one: `0xFFFFFFFF` (ffmpeg to a pipe), `0x7FFFF000` rounded down
-to the block (sox 14.4.2 to a pipe), `0x80000000` (arecord to stdout). Below
-the bound, the length is held to: a WAV cut short of it loses the rest, and
-the shortfall counts as lost audio.
-
-Known limits:
-
-- A real WAV with a data length of `0x7FFF0000` (2 GiB) or more that is cut
-  decodes as a complete shorter file.
-- The header shapes some writers leave on a pipe fail Symphonia's probe, as
-  they did before this check: sox after 14.4.2 (RIFF length 36, data
-  `0xFFFFFFFF`) and libsndfile (RIFF length 8, data 0).
-
-**Trim.** The MP3 encoder delay (frames before time 0) is left out. The
-padding a LAME tag declares is cut when the stream ends where the tag says.
-When the stream holds more than the tag declares (two MP3 files joined, or a
-frame count that is low), all of it is kept and a `warn` says so; `ffmpeg`
-also decodes the frames past the count.
-
-**Lost audio.** Two things lose audio:
-
-- A packet that does not decode is dropped: a `DecodeError`, an `IoError` (the
-  AAC decoder reads past the end of a mangled packet) or `Unsupported` (a
-  feature bit set by damage). Its length of silence takes its place, so the
-  audio after it stays at its time on the stream and the segment times hold.
-- The stream ends short of its declared length.
-
-`AudioLoss` gives the dropped packets, their seconds, the first and last
-position, the first error and the shortfall. The limit scales with the
-stream: `lost_limit_secs` is 1 % (`LOST_FRACTION`) of the stream's length
-(the declared length, or the end reached when that is later), never below
-0.2 s (`LOST_FLOOR_SECS`, more than one frame of any compiled codec at
-8 kHz) and never above 5 s (`LOST_CAP_SECS`). A 5 s clip may lose 0.2 s, a
-100 s file 1 s, a file of 500 s or more 5 s. Up to the limit the decode goes
-on and a `warn` event, `audio lost under the limit`, carries `lost_secs`,
-`limit_secs`, `dropped_packets`, `dropped_secs`, `short_secs` and
-`first_drop_at_secs` as fields. Above it, the decode is refused. The limit
-does not depend on where in the file the loss is: one bad frame at the end
-and one in the middle are treated the same. The three numbers are a default
-the owner may change.
-
-Dropped packets that hold more than `LOST_CAP_SECS`, the largest limit, are
-refused when that point is reached, before their silence is written; the
-message then gives the limit of the declared length, or of the length read
-so far when the file declares none.
-
-**Refusals.** Each is a `WavError`; the message gives the time in seconds.
-
-- `LostAudio`: more lost than the limit for the stream's length. For example
-  an MP3 cut short of its LAME length, or a second MP3 at another sample rate
-  appended to the first.
-- `ReadFailed`: the container reader returns an error other than running out
-  of bytes. An MP4 cut inside its media data, an ADTS header that is damaged.
-- `PacketFailed`: the decoder fails in a way a damaged packet does not
-  explain (it needs a reset, or it hit a limit), or no packet of the stream
-  decodes (a feature the decoder does not support); the error is the
-  decoder's on the first packet.
-- `Empty`: the stream holds no packet.
-
-A `warn` event comes before each refusal, with the declared and reached
-seconds and the end. A `debug` event, `audio stream read`, gives the same for
-every decode, with the end: `EndOfStream` (the reader reported it) or
-`EndOfBytes` (the bytes ran out inside a packet). When the bytes run out
-inside a packet of a stream that declares no length and is not a WAV, a
-`warn` event, `the bytes end inside a packet; the file may be cut`, gives
-`reached_secs`.
-
-An M4A decodes 1000 to 3000 samples more than `ffmpeg` gives (measured 1152 to
-2816): Symphonia does not read the MP4 edit list, so the AAC encoder's
-priming at the start and its padding at the end stay in the samples.
-
-**What no check sees.** A stream that declares no length ends where its bytes
-end: a WAV written to a pipe, an MP3 with no LAME tag, an ADTS stream. Such a
-file, cut short, decodes as a complete shorter file. The MP3 and ADTS readers
-also skip bytes that are not a frame, with no error and no timestamp gap:
-frames that garbage replaced in the middle of such a stream are missing from
-the samples and from the count. With a LAME tag the missing frames show as a
-shortfall at the end and count as lost.
-
-`WavEncoder::encode` writes a 44-byte RIFF PCM-16 LE header, then the samples.
-Each f32 in `[-1, 1]` is clamped and rounded to `i16`.
+See [`AUDIO_WAV.md`](AUDIO_WAV.md).

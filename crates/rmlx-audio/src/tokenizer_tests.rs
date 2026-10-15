@@ -2,12 +2,13 @@
 //! logic, and the vocabulary check at load on `tokenizer.json` files built in
 //! the test.
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 use super::{
-    language_name, language_token, WhisperTask, WhisperTokenizer, N_VOCAB, TOK_EN, TOK_EOT,
-    TOK_LANG_LAST, TOK_NOSPEECH, TOK_NO_TIMESTAMPS, TOK_SOT, TOK_SOT_LM, TOK_SOT_PREV,
-    TOK_TIMESTAMP_BEGIN, TOK_TRANSCRIBE, TOK_TRANSLATE,
+    language_name, language_token, prompt_tail, TokenizerError, WhisperTask, WhisperTokenizer,
+    N_VOCAB, PROMPT_TAIL_BYTES, TOK_EN, TOK_EOT, TOK_LANG_LAST, TOK_NOSPEECH, TOK_NO_TIMESTAMPS,
+    TOK_SOT, TOK_SOT_LM, TOK_SOT_PREV, TOK_TIMESTAMP_BEGIN, TOK_TRANSCRIBE, TOK_TRANSLATE,
 };
 
 /// Language token IDs — spot-check against verified HuggingFace values.
@@ -225,7 +226,7 @@ fn write_tokenizer(base: u32, specials: &[(String, u32)]) -> tempfile::TempDir {
         "padding": null,
         "added_tokens": added,
         "normalizer": null,
-        "pre_tokenizer": null,
+        "pre_tokenizer": { "type": "Whitespace" },
         "post_processor": null,
         "decoder": null,
         "model": { "type": "WordLevel", "vocab": vocab, "unk_token": "t0" },
@@ -349,20 +350,184 @@ fn every_reference_language_maps_to_its_slot() {
     }
 }
 
+/// The local large-v3 tokenizer, when `RMLX_O_MODELS_ROOT` holds it; a
+/// tokenizer that fails the vocabulary check is a panic. `name` is the test that
+/// asks for it, for the stand-down notice.
+fn local_large_v3(name: &str) -> Option<WhisperTokenizer> {
+    let Some(root) = std::env::var_os("RMLX_O_MODELS_ROOT") else {
+        eprintln!("SKIP {name}: RMLX_O_MODELS_ROOT is unset");
+        return None;
+    };
+    let dir = Path::new(&root).join("openai__whisper-large-v3-tokenizer");
+    if !dir.join("tokenizer.json").exists() {
+        eprintln!("SKIP {name}: no openai__whisper-large-v3-tokenizer under the root");
+        return None;
+    }
+    Some(WhisperTokenizer::from_path(&dir).expect("the large-v3 tokenizer must load"))
+}
+
 /// The local large-v3 tokenizer passes the check. Runs on the CPU when
 /// `RMLX_O_MODELS_ROOT` holds `openai__whisper-large-v3-tokenizer`.
 #[test]
 fn the_local_large_v3_tokenizer_loads() {
-    let Some(root) = std::env::var_os("RMLX_O_MODELS_ROOT") else {
-        eprintln!("SKIP the_local_large_v3_tokenizer_loads: RMLX_O_MODELS_ROOT is unset");
+    local_large_v3("the_local_large_v3_tokenizer_loads");
+}
+
+// ── The text of a decoder prompt ─────────────────────────────────────────────
+
+/// The text of special tokens of the reference layout: the end of text, a
+/// language, the task, a timestamp and the control tokens.
+const SPECIAL_TEXTS: [&str; 8] = [
+    "<|endoftext|>",
+    "<|startoftranscript|>",
+    "<|en|>",
+    "<|translate|>",
+    "<|startofprev|>",
+    "<|nospeech|>",
+    "<|notimestamps|>",
+    "<|0.00|>",
+];
+
+/// The text of a special token in a prompt is refused, alone and inside other
+/// text. The tokenizer matches added special tokens inside the text whatever
+/// its `add_special_tokens` argument is, so without the refusal a prompt would
+/// carry a control token into the decoder prefix.
+#[test]
+fn the_text_of_a_special_token_in_a_prompt_is_refused() {
+    let dir = write_tokenizer(50_257, &reference_specials(50_257, 100));
+    let tokenizer = WhisperTokenizer::from_path(dir.path()).unwrap();
+    for text in SPECIAL_TEXTS {
+        for prompt in [
+            text.to_owned(),
+            format!("t5 {text} t6"),
+            format!("  {text}\n"),
+        ] {
+            let ids = tokenizer.encode(&prompt).unwrap();
+            assert!(ids.iter().any(|&id| id >= TOK_EOT), "{prompt:?}: {ids:?}");
+            assert!(
+                matches!(
+                    tokenizer.encode_prompt(&prompt),
+                    Err(TokenizerError::SpecialTokenText)
+                ),
+                "{prompt:?}"
+            );
+        }
+    }
+}
+
+/// An empty or white-space prompt is no prompt; any other text without the text
+/// of a special token gives tokens.
+#[test]
+fn an_empty_or_white_space_prompt_gives_no_token() {
+    let dir = write_tokenizer(50_257, &reference_specials(50_257, 100));
+    let tokenizer = WhisperTokenizer::from_path(dir.path()).unwrap();
+    for blank in ["", " ", "  \n\t ", "\u{a0}\u{2003}"] {
+        assert_eq!(tokenizer.encode_prompt(blank).unwrap(), Vec::<u32>::new());
+    }
+    let ids = tokenizer.encode_prompt("t5").unwrap();
+    assert!(
+        !ids.is_empty() && ids.iter().all(|&id| id < TOK_EOT),
+        "{ids:?}"
+    );
+}
+
+/// On the real vocabulary, the text of each special token comes out as a
+/// control id and is refused; a prompt encodes as a space and its trimmed
+/// text, and text that only looks like a special token is plain text.
+#[test]
+fn the_large_v3_tokenizer_encodes_a_prompt_as_a_space_and_its_trimmed_text() {
+    let Some(tokenizer) =
+        local_large_v3("the_large_v3_tokenizer_encodes_a_prompt_as_a_space_and_its_trimmed_text")
+    else {
         return;
     };
-    let dir = Path::new(&root).join("openai__whisper-large-v3-tokenizer");
-    if !dir.join("tokenizer.json").exists() {
-        eprintln!(
-            "SKIP the_local_large_v3_tokenizer_loads: no openai__whisper-large-v3-tokenizer under the root"
+    for text in SPECIAL_TEXTS {
+        let ids = tokenizer.encode(text).unwrap();
+        assert!(ids.iter().all(|&id| id >= TOK_EOT), "{text}: {ids:?}");
+        assert!(
+            matches!(
+                tokenizer.encode_prompt(&format!("Glossary {text}")),
+                Err(TokenizerError::SpecialTokenText)
+            ),
+            "{text}"
         );
-        return;
     }
-    WhisperTokenizer::from_path(&dir).expect("the large-v3 tokenizer must load");
+    assert_eq!(
+        tokenizer.encode_prompt("  Glossary: rMLX.  \n").unwrap(),
+        tokenizer.encode(" Glossary: rMLX.").unwrap()
+    );
+    assert_eq!(tokenizer.encode_prompt(" \n").unwrap(), Vec::<u32>::new());
+    assert!(tokenizer.encode_prompt("<| not special |>").is_ok());
+    assert!(tokenizer.encode_prompt("<|endoftext").is_ok());
+}
+
+// ── The tail of a long prompt ────────────────────────────────────────────────
+
+/// A text of `bytes` or more bytes of words `t0`, `t1`, ... that differ along
+/// the text, so the head and the tail of it encode to other tokens.
+fn many_words(bytes: usize) -> String {
+    let mut text = String::new();
+    let mut i = 0;
+    while text.len() < bytes {
+        let _ = write!(text, "t{} ", i % 5000);
+        i += 1;
+    }
+    text
+}
+
+/// A text of up to the tail is encoded whole; a longer one is cut to its last
+/// `PROMPT_TAIL_BYTES` bytes, at a character boundary.
+#[test]
+fn the_tail_of_a_prompt_is_its_last_bytes_at_a_character_boundary() {
+    let short = "x".repeat(PROMPT_TAIL_BYTES);
+    assert_eq!(prompt_tail(&short), short);
+    assert_eq!(prompt_tail(""), "");
+
+    let long = "x".repeat(3 * PROMPT_TAIL_BYTES);
+    assert_eq!(prompt_tail(&long).len(), PROMPT_TAIL_BYTES);
+
+    // Two bytes and three bytes for each character: the cut falls inside one.
+    for ch in ['é', '€', '🙂'] {
+        let text = ch.to_string().repeat(PROMPT_TAIL_BYTES);
+        let tail = prompt_tail(&text);
+        assert!(tail.len() <= PROMPT_TAIL_BYTES, "{ch}");
+        assert!(tail.len() > PROMPT_TAIL_BYTES - ch.len_utf8(), "{ch}");
+        assert!(text.ends_with(tail), "{ch}");
+        assert!(tail.chars().all(|c| c == ch), "{ch}");
+    }
+}
+
+/// A prompt of 1 MiB gives the tokens of its last 16 KiB: the head is not
+/// encoded.
+#[test]
+fn a_prompt_of_1_mib_gives_the_tokens_of_its_tail() {
+    let dir = write_tokenizer(50_257, &reference_specials(50_257, 100));
+    let tokenizer = WhisperTokenizer::from_path(dir.path()).unwrap();
+    let text = many_words(1 << 20);
+    let trimmed = text.trim();
+    let tail = &trimmed[trimmed.len() - PROMPT_TAIL_BYTES..];
+    let want = tokenizer.encode(&format!(" {tail}")).unwrap();
+    let got = tokenizer.encode_prompt(&text).unwrap();
+    assert_eq!(got, want);
+    assert!(got.len() > 1000, "{} tokens", got.len());
+    let head = tokenizer
+        .encode(&format!(" {}", &trimmed[..PROMPT_TAIL_BYTES]))
+        .unwrap();
+    assert_ne!(got, head);
+}
+
+/// The text of a special token before the tail is not read; inside the tail it
+/// is refused.
+#[test]
+fn only_the_tail_of_a_prompt_is_read_for_special_token_text() {
+    let dir = write_tokenizer(50_257, &reference_specials(50_257, 100));
+    let tokenizer = WhisperTokenizer::from_path(dir.path()).unwrap();
+    let filler = many_words(2 * PROMPT_TAIL_BYTES);
+    let before = format!("<|endoftext|> {filler}");
+    assert!(tokenizer.encode_prompt(&before).is_ok());
+    let inside = format!("{filler} <|endoftext|>");
+    assert!(matches!(
+        tokenizer.encode_prompt(&inside),
+        Err(TokenizerError::SpecialTokenText)
+    ));
 }

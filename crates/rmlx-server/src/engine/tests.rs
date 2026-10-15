@@ -974,7 +974,7 @@ async fn the_reply_stream_of_a_job_sets_the_stop_flag_only_when_it_is_dropped() 
         }
         saw_tx.send(cancel.load(Relaxed)).ok();
     });
-    let mut reply = Box::pin(types::job_stream(rx, job));
+    let mut reply = Box::pin(job_stream(rx, job));
     for item in 0..3 {
         assert_eq!(
             reply.next().await,
@@ -999,7 +999,7 @@ async fn the_reply_stream_of_a_job_ends_when_the_job_ends() {
             tx.blocking_send(item).ok();
         }
     });
-    let reply: Vec<u32> = types::job_stream(rx, job).collect().await;
+    let reply: Vec<u32> = job_stream(rx, job).collect().await;
     assert_eq!(reply, [0, 1]);
 }
 

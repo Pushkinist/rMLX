@@ -19,22 +19,28 @@ use axum::extract::{Multipart, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use parking_lot::RwLock as PLRwLock;
 use rmlx_audio::tokenizer::{TokenizerError, WhisperTask, WhisperTokenizer};
-use rmlx_audio::transcribe::{TranscribeOptions, Transcriber, Transcription};
+use rmlx_audio::transcribe::{TranscribeOptions, Transcriber, Transcription, WindowSink};
 use rmlx_audio::wav::{WavDecoder, WavError, MAX_AUDIO_SECS};
 use rmlx_audio::whisper::{WhisperError, WhisperModel};
 use rmlx_core::cancel::ensure_not_cancelled;
+use rmlx_metrics::events::EventRecorder;
 use rmlx_models::sampler::RowPicker;
 use serde::Serialize;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, instrument, warn};
 
 mod form;
 mod speech;
+mod stream;
 
 use form::{parse_multipart, rejected_form, ResponseFormat};
 pub use speech::{audio_speech, LoadedTts, SpeechRequest};
+use stream::{stream_job, stream_reply, STREAM_EVENTS};
 
 use crate::engine::{admit_request, run_admitted, Admission};
 use crate::openai::errors::{error_response, error_response_with_param, internal_error};
@@ -130,22 +136,29 @@ fn refused(refusal: Refusal) -> Response {
 #[derive(Debug)]
 enum JobError {
     Decode(WavError),
+    /// The prompt holds the text of a special token.
+    Prompt(TokenizerError),
     Tokenizer(TokenizerError),
     Model(WhisperError),
     Init(WhisperError),
     Transcribe(WhisperError),
 }
 
-/// The answer to a failed job. The file is the client's fault: 422. The rest is
-/// the server's: 503, the status `docs/SERVER_AUDIO.md` gives a load failure and
+/// The answer to a failed job. The file, the prompt and a request for word
+/// times from a model with no alignment heads are the client's fault: 422. The
+/// rest is the server's: 503, the status `docs/SERVER_AUDIO.md` gives a load failure and
 /// every other engine error. A load or init failure stays until the operator
 /// acts; an engine failure during the transcription may not recur.
 fn job_refusal(e: &JobError) -> Refusal {
     match e {
         JobError::Decode(e) => bad_field("file", format!("audio decode: {e}")),
+        JobError::Prompt(e) => bad_field("prompt", format!("invalid prompt: {e}")),
         JobError::Tokenizer(e) => unavailable(format!("tokenizer: {e}"), true),
         JobError::Model(e) => unavailable(format!("whisper load: {}", reply_text(e)), true),
         JobError::Init(e) => unavailable(format!("transcriber init: {}", reply_text(e)), true),
+        JobError::Transcribe(e @ WhisperError::NoAlignmentHeads) => {
+            bad_field("timestamp_granularities", e.to_string())
+        }
         JobError::Transcribe(e) => unavailable(format!("transcribe: {}", reply_text(e)), false),
     }
 }
@@ -179,35 +192,6 @@ struct TranscriptionResponse {
     text: String,
 }
 
-/// One segment in a `verbose_json` response: the keys of the OpenAI
-/// `TranscriptionSegment` schema that a [`Segment`] holds. `avg_logprob` and
-/// `no_speech_prob` are left out: the engine reads both for its window
-/// decision and puts neither on a segment, and a `null` would make a typed
-/// client throw.
-///
-/// [`Segment`]: rmlx_audio::transcribe::Segment
-#[derive(Debug, Serialize)]
-struct SegmentJson {
-    id: usize,
-    seek: usize,
-    start: f32,
-    end: f32,
-    text: String,
-    tokens: Vec<u32>,
-    /// Temperature of the decode the segment's window kept.
-    temperature: f32,
-    compression_ratio: f32,
-}
-
-#[derive(Debug, Serialize)]
-struct VerboseTranscriptionResponse {
-    task: String,
-    language: String,
-    duration: f32,
-    text: String,
-    segments: Vec<SegmentJson>,
-}
-
 /// `POST /v1/audio/transcriptions` — Whisper STT.
 #[instrument(skip_all, name = "audio_transcriptions", level = "info")]
 pub async fn audio_transcriptions(
@@ -228,11 +212,6 @@ pub async fn audio_translations(
     handle_audio(state, &headers, multipart, WhisperTask::Translate).await
 }
 
-#[allow(
-    clippy::cognitive_complexity,
-    clippy::too_many_lines,
-    reason = "audio handler is a sequential pipeline: parse → validate → admit → spawn_blocking → metrics → build response; splitting would obscure the control flow"
-)]
 async fn handle_audio(
     state: AppState,
     headers: &HeaderMap,
@@ -266,6 +245,7 @@ async fn handle_audio(
         model = fields.model,
         lang = fields.language,
         audio_bytes = fields.audio_bytes.len(),
+        prompt_bytes = fields.prompt.len(),
         task = ?task,
         "audio request"
     );
@@ -298,69 +278,168 @@ async fn handle_audio(
             }
         };
 
-    let audio_model_cache = Arc::clone(&state.audio_model);
+    let input = JobInput {
+        audio_model: Arc::clone(&state.audio_model),
+        model_path,
+        tok_path,
+        audio_bytes: fields.audio_bytes,
+        prompt: fields.prompt,
+        language: fields.language,
+        temperature: fields.temperature,
+        words: fields.words,
+        task,
+        metrics: state.metrics.clone(),
+        device: state.device,
+    };
 
-    let audio_bytes = fields.audio_bytes;
-    let language = fields.language.clone();
-    let temperature = fields.temperature;
+    if fields.stream {
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (events_tx, events_rx) = mpsc::channel(STREAM_EVENTS);
+        let job = run_admitted(Some(guard), move |cancel| {
+            stream_job(input, cancel, ready_tx, &events_tx);
+        });
+        return stream_reply(ready_rx, events_rx, job).await;
+    }
+
     let response_format = fields.response_format;
-
-    let metrics_arc = state.metrics.clone();
-    let device = state.device;
-    let model_path_str = model_path.to_string_lossy().into_owned();
-
     let result = run_admitted(Some(guard), move |cancel| {
-        // Decode under the permit, one at a time, and before the model cache:
-        // a file the decoder refuses loads no model.
-        let samples = decode_upload(&audio_bytes, cancel)?;
-        drop(audio_bytes);
+        prepare(input, cancel)?.run(cancel, &mut |_| Ok(()))
+    })
+    .await;
+    job_answer(result, task, response_format)
+}
 
-        let t_load_start = std::time::Instant::now();
-        let mut load_ms_opt: Option<f64> = None;
+/// What a transcription job reads, moved into the job.
+struct JobInput {
+    audio_model: AudioModelCache,
+    model_path: PathBuf,
+    tok_path: PathBuf,
+    audio_bytes: Vec<u8>,
+    prompt: String,
+    language: String,
+    temperature: f32,
+    words: bool,
+    task: WhisperTask,
+    metrics: Option<Arc<EventRecorder>>,
+    device: rmlx_mlx::Device,
+}
 
-        let (model, tokenizer): (Arc<WhisperModel>, Arc<WhisperTokenizer>) = {
-            let read_guard = audio_model_cache.read();
-            if let Some((ref m, ref t)) = *read_guard {
+/// The Whisper model and tokenizer of the server, loaded by the first request.
+type AudioModelCache = Arc<PLRwLock<Option<(Arc<WhisperModel>, Arc<WhisperTokenizer>)>>>;
+
+/// A job whose prompt is encoded, whose audio is decoded and whose model is
+/// loaded: what is left is the walk over the windows.
+struct ReadyJob {
+    transcriber: Transcriber,
+    samples: Vec<f32>,
+    opts: TranscribeOptions,
+    device: rmlx_mlx::Device,
+    metrics: Option<Arc<EventRecorder>>,
+    model_path: String,
+    load_ms: Option<f64>,
+}
+
+/// Encode the prompt, decode the audio and load the model. A failure here is
+/// the error reply of the request, for a streamed request too.
+fn prepare(input: JobInput, cancel: &AtomicBool) -> Result<ReadyJob, JobError> {
+    let JobInput {
+        audio_model,
+        model_path,
+        tok_path,
+        audio_bytes,
+        prompt,
+        language,
+        temperature,
+        words,
+        task,
+        metrics,
+        device,
+    } = input;
+
+    // The prompt first: a prompt that cannot be used is refused before the
+    // audio is decoded and before the model loads.
+    let cached_tokenizer = audio_model
+        .read()
+        .as_ref()
+        .map(|(_, tokenizer)| Arc::clone(tokenizer));
+    let (prompt_tokens, mut loaded_tokenizer) =
+        encode_prompt(cached_tokenizer, &tok_path, &prompt)?;
+    drop(prompt);
+
+    // Decode under the permit, one at a time, and before the model cache:
+    // a file the decoder refuses loads no model.
+    let samples = decode_upload(&audio_bytes, cancel)?;
+    drop(audio_bytes);
+
+    let t_load_start = std::time::Instant::now();
+    let mut load_ms: Option<f64> = None;
+
+    let (model, tokenizer): (Arc<WhisperModel>, Arc<WhisperTokenizer>) = {
+        let read_guard = audio_model.read();
+        if let Some((ref m, ref t)) = *read_guard {
+            (Arc::clone(m), Arc::clone(t))
+        } else {
+            drop(read_guard);
+            let mut write_guard = audio_model.write();
+            // Another request may have loaded the model while this one waited for the lock.
+            if let Some((ref m, ref t)) = *write_guard {
                 (Arc::clone(m), Arc::clone(t))
             } else {
-                drop(read_guard);
-                let mut write_guard = audio_model_cache.write();
-                // Another request may have loaded the model while this one waited for the lock.
-                if let Some((ref m, ref t)) = *write_guard {
-                    (Arc::clone(m), Arc::clone(t))
-                } else {
-                    let t = WhisperTokenizer::from_path(&tok_path).map_err(|e| {
-                        warn!(path = %tok_path.display(), error = %e, "Whisper tokenizer load failed");
-                        JobError::Tokenizer(e)
-                    })?;
-                    let m = WhisperModel::load(&model_path).map_err(|e| {
-                        warn!(path = %model_path.display(), error = %e, "Whisper model load failed");
-                        JobError::Model(e)
-                    })?;
-                    let m = Arc::new(m);
-                    let t = Arc::new(t);
-                    *write_guard = Some((Arc::clone(&m), Arc::clone(&t)));
-                    load_ms_opt = Some(t_load_start.elapsed().as_secs_f64() * 1_000.0);
-                    (m, t)
-                }
+                let t = match loaded_tokenizer.take() {
+                    Some(t) => t,
+                    None => Arc::new(load_tokenizer(&tok_path)?),
+                };
+                let m = WhisperModel::load(&model_path).map_err(|e| {
+                    warn!(path = %model_path.display(), error = %e, "Whisper model load failed");
+                    JobError::Model(e)
+                })?;
+                let m = Arc::new(m);
+                *write_guard = Some((Arc::clone(&m), Arc::clone(&t)));
+                load_ms = Some(t_load_start.elapsed().as_secs_f64() * 1_000.0);
+                (m, t)
             }
-        };
+        }
+    };
 
-        let audio_dur_secs = samples.len() as f64 / f64::from(rmlx_audio::mel::SAMPLE_RATE);
+    let transcriber = Transcriber::new(model, tokenizer).map_err(JobError::Init)?;
 
-        let transcriber = Transcriber::new(Arc::clone(&model), Arc::clone(&tokenizer))
-            .map_err(JobError::Init)?;
-
-        let opts = TranscribeOptions {
-            language: language.clone(),
+    Ok(ReadyJob {
+        transcriber,
+        samples,
+        opts: TranscribeOptions {
+            language,
             task,
             temperature,
             condition_on_previous_text: true,
-        };
+            prompt_tokens,
+            words,
+        },
+        device,
+        metrics,
+        model_path: model_path.to_string_lossy().into_owned(),
+        load_ms,
+    })
+}
 
+impl ReadyJob {
+    /// Walk the windows, handing each closed window to `on_window`, and record
+    /// the metrics of a walk that ran to its end.
+    fn run(
+        self,
+        cancel: &AtomicBool,
+        on_window: WindowSink<'_>,
+    ) -> Result<Transcription, JobError> {
+        let audio_dur_secs = self.samples.len() as f64 / f64::from(rmlx_audio::mel::SAMPLE_RATE);
         let t_decode_start = std::time::Instant::now();
-        let transcription = transcribe_request(&transcriber, &samples, &opts, device, cancel)
-            .map_err(JobError::Transcribe)?;
+        let transcription = transcribe_request(
+            &self.transcriber,
+            &self.samples,
+            &self.opts,
+            self.device,
+            cancel,
+            on_window,
+        )
+        .map_err(JobError::Transcribe)?;
         let decode_ms = t_decode_start.elapsed().as_secs_f64() * 1_000.0;
 
         let rtf = if audio_dur_secs > 0.0 {
@@ -374,48 +453,36 @@ async fn handle_audio(
             audio_dur_secs,
             rtf,
             n_segments = transcription.segments.len(),
-            "audio inference timing"
+            chars = transcription.text.len(),
+            "transcription complete"
         );
 
-        if let Some(sink) = &metrics_arc {
-            let notes = format!("task={task:?}");
-            let metrics_to_record: &[(&str, &str, f64)] = &[
+        if let Some(sink) = &self.metrics {
+            let notes = format!("task={:?}", self.opts.task);
+            let mut measurements = vec![
                 ("audio_decode_ms", "ms", decode_ms),
                 ("audio_rtf", "ratio", rtf),
             ];
-            for (op, unit, value) in metrics_to_record {
+            if let Some(load_ms) = self.load_ms {
+                measurements.push(("audio_load_ms", "ms", load_ms));
+            }
+            for (op, unit, value) in measurements {
                 if let Err(e) = sink.record(&rmlx_metrics::events::Measurement {
-                    model_path: &model_path_str,
+                    model_path: &self.model_path,
                     quant_mode: "none",
                     stage: "audio",
                     op,
                     value_unit: unit,
-                    value: *value,
+                    value,
                     notes: &notes,
                 }) {
                     warn!(error = %e, op, "audio metrics record failed (non-fatal)");
                 }
             }
-            if let Some(load_ms) = load_ms_opt {
-                if let Err(e) = sink.record(&rmlx_metrics::events::Measurement {
-                    model_path: &model_path_str,
-                    quant_mode: "none",
-                    stage: "audio",
-                    op: "audio_load_ms",
-                    value_unit: "ms",
-                    value: load_ms,
-                    notes: &notes,
-                }) {
-                    warn!(error = %e, "audio_load_ms record failed (non-fatal)");
-                }
-            }
         }
 
-        Ok::<Transcription, JobError>(transcription)
-    })
-    .await;
-
-    job_answer(result, task, response_format)
+        Ok(transcription)
+    }
 }
 
 /// The answer to a finished transcription job: the transcript, the refusal of
@@ -426,48 +493,55 @@ fn job_answer(
     format: ResponseFormat,
 ) -> Response {
     match result {
-        Ok(Ok(transcription)) => {
-            info!(
-                chars = transcription.text.len(),
-                segments = transcription.segments.len(),
-                "transcription complete"
-            );
-            build_response(&transcription, task, format)
-        }
-        Ok(Err(e)) => {
-            let refusal = job_refusal(&e);
-            let cause: &dyn std::fmt::Display = match &e {
-                JobError::Decode(cause) => cause,
-                JobError::Tokenizer(cause) => cause,
-                JobError::Model(cause) | JobError::Init(cause) | JobError::Transcribe(cause) => {
-                    cause
-                }
-            };
-            warn!(
-                status = refusal.status.as_u16(),
-                error = %cause,
-                reply = refusal.message.as_str(),
-                "transcription failed"
-            );
-            refused(refusal)
-        }
-        Err(e) => {
-            warn!(error = %e, "transcription task panicked");
-            internal_error("internal error")
-        }
+        Ok(Ok(transcription)) => build_response(&transcription, task, format),
+        Ok(Err(e)) => refused(failed(&e, false)),
+        Err(e) => panicked(&e),
     }
 }
 
-/// Transcribe the samples of one request. One [`RowPicker`] with the sampler's
-/// default seed picks every token of the request, so a repeated request gives
-/// the same tokens also when a decode above temperature 0 ran. The
-/// transcription routes and `rmlx transcribe` both call this.
+/// The refusal of a failed job, logged with its cause. `streamed`: the reply
+/// is a stream that started, so the client gets the refusal as an error event
+/// in a reply of status 200, and the log gives that status.
+fn failed(e: &JobError, streamed: bool) -> Refusal {
+    let refusal = job_refusal(e);
+    let cause: &dyn std::fmt::Display = match e {
+        JobError::Decode(cause) => cause,
+        JobError::Prompt(cause) | JobError::Tokenizer(cause) => cause,
+        JobError::Model(cause) | JobError::Init(cause) | JobError::Transcribe(cause) => cause,
+    };
+    let status = if streamed {
+        StatusCode::OK
+    } else {
+        refusal.status
+    };
+    warn!(
+        status = status.as_u16(),
+        streamed,
+        error_type = refusal.error_type,
+        error = %cause,
+        reply = refusal.message.as_str(),
+        "transcription failed"
+    );
+    refusal
+}
+
+fn panicked(e: &tokio::task::JoinError) -> Response {
+    warn!(error = %e, "transcription task panicked");
+    internal_error("internal error")
+}
+
+/// Transcribe the samples of one request, handing each closed window to
+/// `on_window`. One [`RowPicker`] with the sampler's default seed picks every
+/// token of the request, so a repeated request gives the same tokens also when
+/// a decode above temperature 0 ran. The transcription routes and
+/// `rmlx transcribe` both call this.
 pub fn transcribe_request(
     transcriber: &Transcriber,
     samples: &[f32],
     opts: &TranscribeOptions,
     device: rmlx_mlx::Device,
     cancel: &AtomicBool,
+    on_window: WindowSink<'_>,
 ) -> Result<Transcription, WhisperError> {
     let mut picker = RowPicker::default();
     transcriber.transcribe(
@@ -476,7 +550,47 @@ pub fn transcribe_request(
         &mut |row, temperature| picker.pick(row, temperature),
         device,
         cancel,
+        on_window,
     )
+}
+
+/// Load the Whisper tokenizer; a failure stays until the operator acts.
+fn load_tokenizer(tok_path: &std::path::Path) -> Result<WhisperTokenizer, JobError> {
+    WhisperTokenizer::from_path(tok_path).map_err(|e| {
+        warn!(path = %tok_path.display(), error = %e, "Whisper tokenizer load failed");
+        JobError::Tokenizer(e)
+    })
+}
+
+/// The tokens of the request's `prompt`, and the tokenizer when this call
+/// loaded it, for the model load to keep. `cached` is the tokenizer of the
+/// model cache, if the cache is filled. A blank prompt loads nothing.
+fn encode_prompt(
+    cached: Option<Arc<WhisperTokenizer>>,
+    tok_path: &std::path::Path,
+    prompt: &str,
+) -> Result<(Vec<u32>, Option<Arc<WhisperTokenizer>>), JobError> {
+    if prompt.trim().is_empty() {
+        return Ok((Vec::new(), None));
+    }
+    let (tokenizer, loaded) = if let Some(tokenizer) = cached {
+        (tokenizer, None)
+    } else {
+        let tokenizer = Arc::new(load_tokenizer(tok_path)?);
+        (Arc::clone(&tokenizer), Some(tokenizer))
+    };
+    let tokens = tokenizer.encode_prompt(prompt).map_err(prompt_error)?;
+    Ok((tokens, loaded))
+}
+
+/// Only the text of a special token is the client's fault; any other failure
+/// of the tokenizer is the server's.
+fn prompt_error(e: TokenizerError) -> JobError {
+    if matches!(e, TokenizerError::SpecialTokenText) {
+        JobError::Prompt(e)
+    } else {
+        JobError::Tokenizer(e)
+    }
 }
 
 /// The 16 kHz samples of the uploaded file, up to `MAX_AUDIO_SECS`. The decode
@@ -494,42 +608,16 @@ fn build_response(
     task: WhisperTask,
     format: ResponseFormat,
 ) -> Response {
-    use rmlx_audio::transcribe::{render, OutputFormat};
+    use rmlx_audio::transcribe::{render_srt, render_vtt};
     let text = transcription.text.trim();
     match format {
         ResponseFormat::Text => (StatusCode::OK, text.to_owned()).into_response(),
-        ResponseFormat::VerboseJson => {
-            let body = VerboseTranscriptionResponse {
-                task: match task {
-                    WhisperTask::Transcribe => "transcribe".to_owned(),
-                    WhisperTask::Translate => "translate".to_owned(),
-                },
-                language: transcription.language.clone(),
-                duration: transcription.duration,
-                text: text.to_owned(),
-                segments: transcription
-                    .segments
-                    .iter()
-                    .enumerate()
-                    .map(|(id, s)| SegmentJson {
-                        id,
-                        seek: s.seek,
-                        start: s.start,
-                        end: s.end,
-                        text: s.text.clone(),
-                        tokens: s.tokens.clone(),
-                        temperature: s.temperature,
-                        compression_ratio: s.compression_ratio,
-                    })
-                    .collect(),
-            };
-            Json(body).into_response()
-        }
+        ResponseFormat::VerboseJson => Json(transcription.record(Some(task))).into_response(),
         ResponseFormat::Srt => {
-            (StatusCode::OK, render(transcription, OutputFormat::Srt)).into_response()
+            (StatusCode::OK, render_srt(&transcription.segments)).into_response()
         }
         ResponseFormat::Vtt => {
-            (StatusCode::OK, render(transcription, OutputFormat::Vtt)).into_response()
+            (StatusCode::OK, render_vtt(&transcription.segments)).into_response()
         }
         ResponseFormat::Json => Json(TranscriptionResponse {
             text: text.to_owned(),
@@ -541,3 +629,6 @@ fn build_response(
 #[cfg(test)]
 #[path = "audio_tests.rs"]
 mod audio_tests;
+
+#[cfg(test)]
+mod test_events;

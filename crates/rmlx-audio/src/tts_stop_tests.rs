@@ -253,10 +253,11 @@ const SPEECH_LOOPS: [&str; 2] = [
     "tts.rs::frame_loop: for index in 0..MAX_FRAMES {",
 ];
 
-/// The walk of a transcription. It reads the flag of its request by a rule of
-/// its own, which its own tests hold: it reads the flag before each window and
+/// The walk of a transcription. It reads the stop of its request by a rule of
+/// its own, which its own tests hold: it reads the stop before each window and
 /// returns the window and the sample it stopped at, as a value and not as an
-/// error. The one stop helper is not asked of it.
+/// error. The stop is the flag of the request, or a window sink whose reader
+/// is gone. The one stop helper is not asked of it.
 const OWN_RULE_LOOPS: [&str; 1] = [
     "transcribe/seek.rs::walk_windows: while total_samples.saturating_sub(seek) >= HOP_LENGTH {",
 ];

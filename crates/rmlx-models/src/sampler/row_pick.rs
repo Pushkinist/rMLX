@@ -28,22 +28,26 @@ impl RowPicker {
     }
 
     /// Pick one token id from `row`. A masked id has the logit `-inf` and is
-    /// never picked: a row with no logit above `-inf` is an error, which
-    /// names a logit that is not a number when the row has one. A
-    /// temperature of 0 gives the first largest logit and draws nothing. A
-    /// temperature above 0 draws one value from the generator and gives the id
-    /// at that point of the cumulative distribution of
-    /// `softmax(row / temperature)`; a row with a `NaN` or `+inf` logit is an
-    /// error.
+    /// never picked: a row with no logit above `-inf` is an error. A row with
+    /// a `NaN` or `+inf` logit is an error at every temperature: its
+    /// log-probabilities are not numbers. A temperature of 0 gives the first
+    /// largest logit and draws nothing. A temperature above 0 draws one value
+    /// from the generator and gives the id at that point of the cumulative
+    /// distribution of `softmax(row / temperature)`.
     pub fn pick(&mut self, row: &[f32], temperature: f32) -> Result<u32> {
-        if !row.iter().any(|&logit| logit > f32::NEG_INFINITY) {
-            let cause = if row.iter().any(|logit| logit.is_nan()) {
-                "a logit is not a number and no logit is finite"
-            } else {
-                "each logit is masked"
-            };
+        if row
+            .iter()
+            .any(|&logit| logit.is_nan() || logit == f32::INFINITY)
+        {
             return Err(Error::Other(format!(
-                "row pick: {cause} in a row of {} logits; no token can be picked",
+                "row pick: a logit is not a number or is +inf in a row of {} logits; \
+                 no token can be picked",
+                row.len()
+            )));
+        }
+        if !row.iter().any(|&logit| logit > f32::NEG_INFINITY) {
+            return Err(Error::Other(format!(
+                "row pick: each logit is masked in a row of {} logits; no token can be picked",
                 row.len()
             )));
         }

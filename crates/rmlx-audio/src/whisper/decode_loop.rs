@@ -15,18 +15,34 @@ use crate::tokenizer::{TOK_EN, TOK_EOT, TOK_LANG_LAST, TOK_NOSPEECH, TOK_SOT};
 pub(crate) struct WindowStart {
     /// The language token with the largest logit.
     pub(crate) language: u32,
-    /// The softmax share of `<|nospeech|>` in the unfiltered row. A
-    /// previous-text prompt before the start token moves this value, so the
-    /// row is read with none.
+    /// The softmax share of `<|nospeech|>` in the unfiltered row. A prompt
+    /// before the start token moves this value, so the row is read with none.
     pub(crate) no_speech_prob: f32,
 }
 
+/// A logit row with a `NaN` or `+inf` logit: its probabilities are not numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "window start: a logit is not a number or is +inf in a row of {len} logits; \
+     the no-speech probability and the language cannot be read"
+)]
+pub(crate) struct NonFiniteRow {
+    pub(crate) len: usize,
+}
+
 /// Read the start of a window with one decoder forward of the start token
-/// alone, on a decoder that was fed nothing.
-pub(crate) fn window_start<E>(
+/// alone, on a decoder that was fed nothing. A row with a `NaN` or `+inf`
+/// logit is an error, as it is for the pick of a token.
+pub(crate) fn window_start<E: From<NonFiniteRow>>(
     forward: impl FnOnce(&[u32]) -> Result<Vec<f32>, E>,
 ) -> Result<WindowStart, E> {
     let row = forward(&[TOK_SOT])?;
+    if row
+        .iter()
+        .any(|&logit| logit.is_nan() || logit == f32::INFINITY)
+    {
+        return Err(NonFiniteRow { len: row.len() }.into());
+    }
     let languages = row
         .get(TOK_EN as usize..=TOK_LANG_LAST as usize)
         .unwrap_or_default();

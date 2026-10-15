@@ -4,8 +4,9 @@
 //! (`<i8` in `weights.npz`, `I64` in `weights.safetensors`), which both readers
 //! give as `I32`.
 //!
-//! Nothing reads the heads yet, so an entry in another form, or with a pair
-//! outside the decoder, gives one warning and no heads, and the load goes on.
+//! Only the word timestamps read the heads, so an entry in another form, or
+//! with a pair outside the decoder, gives one warning and no heads, and the
+//! load goes on; a request for word times is then refused.
 
 use tracing::{info, warn};
 

@@ -108,6 +108,12 @@ pub enum WhisperError {
         "unknown language '{0}'; use a Whisper language code, an English language name or 'auto'"
     )]
     UnknownLanguage(String),
+    /// Word times were asked of a model with no usable `alignment_heads`.
+    #[error(
+        "the model has no alignment heads, so it cannot give word timestamps; \
+         ask for segment timestamps only"
+    )]
+    NoAlignmentHeads,
     /// The caller's cancel flag was set; window number `window` (from 0), at
     /// sample `seek` of the 16 kHz audio, was not decoded.
     #[error("transcription cancelled before window {window} (sample {seek})")]
@@ -117,6 +123,12 @@ pub enum WhisperError {
         /// Its start, in 16 kHz samples.
         seek: usize,
     },
+}
+
+impl From<decode_loop::NonFiniteRow> for WhisperError {
+    fn from(e: decode_loop::NonFiniteRow) -> Self {
+        Self::Mlx(e.to_string())
+    }
 }
 
 impl From<rmlx_core::error::Error> for WhisperError {
@@ -326,14 +338,18 @@ impl MultiHeadAttention {
         })
     }
 
+    /// The output, the keys and values, and with `keep_qk` the attention
+    /// scores before the softmax, `[batch, heads, queries, keys]`.
+    #[allow(clippy::type_complexity)]
     fn forward(
         &self,
         x: &Array,
         xa: Option<&Array>,
         kv_cache: Option<(&Array, &Array)>,
         mask: Option<&Array>,
+        keep_qk: bool,
         device: Device,
-    ) -> Result<(Array, (Array, Array)), WhisperError> {
+    ) -> Result<(Array, (Array, Array), Option<Array>), WhisperError> {
         let q = self.query.forward(x, device)?;
 
         let (k, v) = if let Some(xa_ref) = xa {
@@ -359,9 +375,9 @@ impl MultiHeadAttention {
             }
         };
 
-        let wv = self.qkv_attention(&q, &k, &v, mask, device)?;
+        let (wv, qk) = self.qkv_attention(&q, &k, &v, mask, keep_qk, device)?;
         let out = self.out.forward(&wv, device)?;
-        Ok((out, (k, v)))
+        Ok((out, (k, v), qk))
     }
 
     #[allow(
@@ -374,8 +390,9 @@ impl MultiHeadAttention {
         k: &Array,
         v: &Array,
         mask: Option<&Array>,
+        keep_qk: bool,
         device: Device,
-    ) -> Result<Array, WhisperError> {
+    ) -> Result<(Array, Option<Array>), WhisperError> {
         let q_shape = q.shape();
         let n_batch = q_shape[0];
         let n_ctx = q_shape[1];
@@ -412,12 +429,13 @@ impl MultiHeadAttention {
             qk = add(&qk, &m_slice, device)?;
         }
 
+        let kept_qk = if keep_qk { Some(qk.try_clone()?) } else { None };
         // Use precise softmax (matching Python's `mx.softmax(qk, axis=-1, precise=True)`).
         let w = softmax_precise(&qk, -1, device)?;
         let out = matmul(&w, &v, device)?;
         let out = out.transpose(&[0, 2, 1, 3], device)?;
-        out.reshape(&[n_batch, n_ctx, n_state], device)
-            .map_err(WhisperError::from)
+        let out = out.reshape(&[n_batch, n_ctx, n_state], device)?;
+        Ok((out, kept_qk))
     }
 }
 
@@ -445,7 +463,7 @@ impl EncoderBlock {
 
     fn forward(&self, x: &Array, device: Device) -> Result<Array, WhisperError> {
         let norm = self.attn_ln.forward(x, device)?;
-        let (attn_out, _) = self.attn.forward(&norm, None, None, None, device)?;
+        let (attn_out, _, _) = self.attn.forward(&norm, None, None, None, false, device)?;
         let x = add(x, &attn_out, device)?;
 
         let norm2 = self.mlp_ln.forward(&x, device)?;
@@ -482,6 +500,8 @@ impl DecoderBlock {
         })
     }
 
+    /// The block output, its self- and cross-attention keys and values, and
+    /// with `keep_cross_qk` the cross-attention scores before the softmax.
     #[allow(clippy::type_complexity)]
     fn forward(
         &self,
@@ -490,16 +510,19 @@ impl DecoderBlock {
         self_kv: Option<(&Array, &Array)>,
         cross_kv: Option<(&Array, &Array)>,
         mask: Option<&Array>,
+        keep_cross_qk: bool,
         device: Device,
-    ) -> Result<(Array, (Array, Array), (Array, Array)), WhisperError> {
+    ) -> Result<(Array, (Array, Array), (Array, Array), Option<Array>), WhisperError> {
         let norm = self.attn_ln.forward(x, device)?;
-        let (attn_out, new_self_kv) = self.attn.forward(&norm, None, self_kv, mask, device)?;
+        let (attn_out, new_self_kv, _) = self
+            .attn
+            .forward(&norm, None, self_kv, mask, false, device)?;
         let x = add(x, &attn_out, device)?;
 
         let norm2 = self.cross_attn_ln.forward(&x, device)?;
-        let (cross_out, new_cross_kv) =
+        let (cross_out, new_cross_kv, cross_qk) =
             self.cross_attn
-                .forward(&norm2, Some(xa), cross_kv, None, device)?;
+                .forward(&norm2, Some(xa), cross_kv, None, keep_cross_qk, device)?;
         let x = add(&x, &cross_out, device)?;
 
         let norm3 = self.mlp_ln.forward(&x, device)?;
@@ -508,7 +531,7 @@ impl DecoderBlock {
             .forward(&gelu(&self.mlp1.forward(&norm3, device)?, device)?, device)?;
         let x = add(&x, &ff, device)?;
 
-        Ok((x, new_self_kv, new_cross_kv))
+        Ok((x, new_self_kv, new_cross_kv, cross_qk))
     }
 }
 
@@ -655,10 +678,10 @@ impl TextDecoder {
 
     /// Forward one step.
     ///
-    /// `tokens [1, T_new]`, `xa [1, T_audio, D]`, `offset` = tokens decoded so far.
-    /// Returns `(logits [1, T_new, n_vocab], new_self_kvs, new_cross_kvs)`.
+    /// `tokens [1, T_new]`, `xa [1, T_audio, D]`, `offset` = tokens decoded so
+    /// far. The step keeps the cross-attention scores of the blocks in
+    /// `cross_qk_layers` only.
     #[allow(
-        clippy::type_complexity,
         clippy::indexing_slicing,
         reason = "tok_shape[1]: tokens is always shaped [1, T] by construction; T is at index 1"
     )]
@@ -669,8 +692,9 @@ impl TextDecoder {
         offset: usize,
         self_kvs: &[(Array, Array)],
         cross_kvs: &[(Array, Array)],
+        cross_qk_layers: &[usize],
         device: Device,
-    ) -> Result<(Array, Vec<(Array, Array)>, Vec<(Array, Array)>), WhisperError> {
+    ) -> Result<DecoderStep, WhisperError> {
         let tok_shape = tokens.shape();
         let seq_len = tok_shape[1] as usize;
 
@@ -694,22 +718,36 @@ impl TextDecoder {
 
         let mut new_self_kvs: Vec<(Array, Array)> = Vec::with_capacity(self.blocks.len());
         let mut new_cross_kvs: Vec<(Array, Array)> = Vec::with_capacity(self.blocks.len());
+        let mut cross_qk = Vec::new();
 
         for (i, block) in self.blocks.iter().enumerate() {
             let self_kv = self_kvs.get(i).map(|(k, v)| (k, v));
             let cross_kv = cross_kvs.get(i).map(|(k, v)| (k, v));
-            let (out, ns, nc) =
-                block.forward(&x, xa, self_kv, cross_kv, Some(&self.causal_mask), device)?;
+            let (out, ns, nc, qk) = block.forward(
+                &x,
+                xa,
+                self_kv,
+                cross_kv,
+                Some(&self.causal_mask),
+                cross_qk_layers.contains(&i),
+                device,
+            )?;
             x = out;
             new_self_kvs.push(ns);
             new_cross_kvs.push(nc);
+            cross_qk.extend(qk.map(|qk| (i, qk)));
         }
 
         let x = self.ln.forward(&x, device)?;
         // Weight-tied projection: logits = x @ token_embedding.T
         let emb_t = self.token_embedding.transpose(&[1, 0], device)?;
         let logits = matmul(&x, &emb_t, device)?;
-        Ok((logits, new_self_kvs, new_cross_kvs))
+        Ok(DecoderStep {
+            logits,
+            self_kvs: new_self_kvs,
+            cross_kvs: new_cross_kvs,
+            cross_qk,
+        })
     }
 
     /// How many times a decoder block projected the cross-attention keys and
@@ -751,6 +789,18 @@ impl TextDecoder {
     }
 }
 
+/// What one decoder forward gives.
+struct DecoderStep {
+    /// `[1, T_new, n_vocab]`.
+    logits: Array,
+    self_kvs: Vec<(Array, Array)>,
+    cross_kvs: Vec<(Array, Array)>,
+    /// (block, the cross-attention scores of the block before the softmax,
+    /// `[1, n_head, T_new, n_audio_ctx]`), for each block the forward was
+    /// asked to keep.
+    cross_qk: Vec<(usize, Array)>,
+}
+
 /// One decoder pass over an encoded window: the attention state of the tokens
 /// fed so far.
 struct DecoderPass<'a> {
@@ -782,25 +832,28 @@ impl DecoderPass<'_> {
         };
         let ids = Array::from_i32_slice(ids, &[1, ids.len() as i32])
             .map_err(|e| WhisperError::Mlx(e.to_string()))?;
-        let (logits, new_self, new_cross) = self.decoder.forward(
+        let step = self.decoder.forward(
             &ids,
             self.encoder_out,
             self.fed,
             &self.self_kvs,
             &self.cross_kvs,
+            &[],
             self.device,
         )?;
-        self.self_kvs = new_self;
-        self.cross_kvs = new_cross;
+        self.self_kvs = step.self_kvs;
+        self.cross_kvs = step.cross_kvs;
         self.fed += input.len();
         let n_vocab = self.decoder.n_vocab;
-        let row = logits.slice(
+        let row = step.logits.slice(
             &[0, last as i32, 0],
             &[1, last as i32 + 1, n_vocab as i32],
             &[1, 1, 1],
             self.device,
         )?;
-        logits_to_f32(&row, n_vocab, self.device)
+        let mut row = host_f32(&row, self.device)?;
+        row.resize(n_vocab, f32::NEG_INFINITY);
+        Ok(row)
     }
 }
 
@@ -891,6 +944,103 @@ impl WindowDecoder<'_> {
         );
         Ok(decoded)
     }
+
+    /// The scores of the alignment `heads`, (layer, head) pairs, for each
+    /// position of one forward of all `tokens` at once, cut to the first
+    /// `frames` encoder frames. The forward reads the window's cross-attention
+    /// keys and values, so it projects none and runs no encoder.
+    pub(crate) fn align(
+        &self,
+        tokens: &[u32],
+        heads: &[(usize, usize)],
+        frames: usize,
+    ) -> Result<HeadScores, WhisperError> {
+        let n_text_ctx = self.decoder.n_text_ctx;
+        if tokens.len() > n_text_ctx {
+            return Err(WhisperError::Mlx(format!(
+                "an alignment pass of {} tokens is longer than the decoder context of {n_text_ctx}",
+                tokens.len()
+            )));
+        }
+        let device = self.device;
+        let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let ids = Array::from_i32_slice(&ids, &[1, ids.len() as i32])
+            .map_err(|e| WhisperError::Mlx(e.to_string()))?;
+        let mut layers: Vec<usize> = heads.iter().map(|&(layer, _)| layer).collect();
+        layers.sort_unstable();
+        layers.dedup();
+        let step = self.decoder.forward(
+            &ids,
+            self.encoder_out,
+            0,
+            &[],
+            &self.cross_kvs,
+            &layers,
+            device,
+        )?;
+        let n_tokens = tokens.len() as i32;
+        let per_head = heads
+            .iter()
+            .map(|&(layer, head)| {
+                let (_, qk) = step
+                    .cross_qk
+                    .iter()
+                    .find(|(kept, _)| *kept == layer)
+                    .ok_or_else(|| WhisperError::Mlx(format!("no scores of block {layer}")))?;
+                let head = head as i32;
+                qk.slice(
+                    &[0, head, 0, 0],
+                    &[1, head + 1, n_tokens, frames as i32],
+                    &[1, 1, 1, 1],
+                    device,
+                )
+                .map_err(WhisperError::from)
+            })
+            .collect::<Result<Vec<Array>, WhisperError>>()?;
+        let stacked = concatenate(&per_head.iter().collect::<Vec<_>>(), 1, device)?;
+        HeadScores::new(
+            heads.len(),
+            tokens.len(),
+            frames,
+            host_f32(&stacked, device)?,
+        )
+    }
+}
+
+/// The scores of the alignment heads for each position of an alignment pass,
+/// before the softmax: `values[(head * tokens + token) * frames + frame]`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct HeadScores {
+    pub(crate) heads: usize,
+    pub(crate) tokens: usize,
+    pub(crate) frames: usize,
+    pub(crate) values: Vec<f32>,
+}
+
+impl HeadScores {
+    /// The scores of `heads` x `tokens` x `frames` `values`; any other count of
+    /// values is an error.
+    pub(crate) fn new(
+        heads: usize,
+        tokens: usize,
+        frames: usize,
+        values: Vec<f32>,
+    ) -> Result<Self, WhisperError> {
+        let expected = heads * tokens * frames;
+        if values.len() != expected {
+            return Err(WhisperError::Mlx(format!(
+                "the alignment scores hold {} values, not {heads} heads x {tokens} tokens x \
+                 {frames} frames = {expected}",
+                values.len()
+            )));
+        }
+        Ok(Self {
+            heads,
+            tokens,
+            frames,
+            values,
+        })
+    }
 }
 
 /// Build causal mask `[n_ctx, n_ctx]` (upper-triangular -1e9).
@@ -928,9 +1078,9 @@ pub struct WhisperModel {
 
 impl WhisperModel {
     /// The decoder cross-attention heads that line text tokens up with audio
-    /// frames, as (layer, head) pairs. `None` when the snapshot has no
-    /// `alignment_heads` entry, or when the entry is not usable pairs (the load
-    /// warns of that). Nothing reads them yet.
+    /// frames, as (layer, head) pairs: the word timestamps read them. `None`
+    /// when the snapshot has no `alignment_heads` entry, or when the entry is
+    /// not usable pairs (the load warns of that).
     #[must_use]
     pub fn alignment_heads(&self) -> Option<&[(usize, usize)]> {
         self.alignment_heads.as_deref()
@@ -1157,25 +1307,22 @@ fn logsumexp(xs: &[f32]) -> f32 {
     max + sum.ln()
 }
 
-/// Materialise a `[1, 1, n_vocab]` (or `[1, n_vocab]`) logit tensor (F16/F32/Bf16)
-/// into a host-side f32 vector of length `n_vocab`.
-fn logits_to_f32(logits: &Array, n_vocab: usize, device: Device) -> Result<Vec<f32>, WhisperError> {
+/// Materialise a tensor (F16/F32/Bf16), in row-major order, into host-side
+/// f32 values.
+fn host_f32(array: &Array, device: Device) -> Result<Vec<f32>, WhisperError> {
     use rmlx_mlx::Dtype;
-    let flat = logits.reshape(&[-1], device)?.astype(Dtype::F32, device)?;
+    let flat = array.reshape(&[-1], device)?.astype(Dtype::F32, device)?;
     flat.eval().map_err(WhisperError::from)?;
     let bytes = flat.to_bytes().map_err(WhisperError::from)?;
-    let mut out = Vec::with_capacity(n_vocab);
     #[allow(
         clippy::indexing_slicing,
-        reason = "chunks_exact(4) yields exactly 4 bytes; take(n_vocab) bounds the count"
+        reason = "chunks_exact(4) yields exactly 4 bytes"
     )]
-    for chunk in bytes.chunks_exact(4).take(n_vocab) {
-        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-    }
-    if out.len() < n_vocab {
-        out.resize(n_vocab, f32::NEG_INFINITY);
-    }
-    Ok(out)
+    let values = bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect();
+    Ok(values)
 }
 
 pub(crate) mod decode_loop;

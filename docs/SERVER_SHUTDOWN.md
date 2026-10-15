@@ -18,7 +18,8 @@ it is the same for every route and for every value of `--max-timeout-secs`,
      route, also while it waits for the GPU.
    - A reply that already streams is ended. The client reads a correct
      chunked body. A stream that had not sent its terminal item has none: no
-     `[DONE]`, no `finish_reason`, no `message_stop` and no error event. A
+     `[DONE]`, no `finish_reason`, no `message_stop`, no
+     `transcript.text.done` and no error event. A
      client that does not check for the terminal item reads a short answer as
      a complete one.
 3. **Exit.** The process is gone within 10 s of the first signal, or

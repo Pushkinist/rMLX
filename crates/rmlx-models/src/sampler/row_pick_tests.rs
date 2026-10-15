@@ -144,6 +144,26 @@ fn a_row_that_is_not_a_number_is_an_error() {
     assert!(pick_at(&[0.0, f32::NAN, 1.0], 1.0, 0.5).is_err());
 }
 
+/// A row with a `NaN` or `+inf` logit is an error at every temperature, also
+/// when another logit is finite: the greedy pick would take that logit, and the
+/// average log-probability of the decode, which a reply states, would not be a
+/// number.
+#[test]
+fn a_row_with_a_logit_that_is_not_a_number_is_an_error_at_every_temperature() {
+    let mut picker = RowPicker::new(SEED);
+    for bad in [f32::NAN, f32::INFINITY] {
+        for row in [vec![0.0, bad, 1.0], vec![bad, 2.0], vec![3.0, MASKED, bad]] {
+            for temperature in [0.0, 0.7] {
+                let picked = picker.pick(&row, temperature);
+                assert!(
+                    matches!(&picked, Err(error) if error.to_string().contains("not a number")),
+                    "{row:?} at temperature {temperature}: {picked:?}"
+                );
+            }
+        }
+    }
+}
+
 /// A row in which every id is masked has no token to pick: it is an error at
 /// each temperature, not a masked id. A row with no finite logit and a logit
 /// that is not a number is an error that names that cause, not a mask.

@@ -43,6 +43,10 @@ pub(crate) struct TranscribeArgs<'a> {
     pub language: &'a str,
     /// `true` => translate to English; `false` => transcribe in source language.
     pub translate: bool,
+    /// Text that prompts the decoder; empty for none.
+    pub prompt: &'a str,
+    /// Add the time of each word to the JSON output.
+    pub words: bool,
 }
 
 /// Dispatch on the snapshot's architecture and run transcription.
@@ -76,6 +80,9 @@ pub(crate) fn run_transcribe(args: &TranscribeArgs, claimed: &ClaimedDevice) -> 
 /// Whisper backend for `rmlx transcribe`.
 fn run_whisper(args: &TranscribeArgs, device: Device) -> Result<String> {
     let out_fmt = OutputFormat::parse(args.format).map_err(|e| anyhow!(e))?;
+    if args.words && out_fmt != OutputFormat::Json {
+        return Err(anyhow!("--words needs --format json"));
+    }
     requested_language(args.language)?;
 
     // Resolve the tokenizer directory: explicit flag, else the model dir.
@@ -87,18 +94,27 @@ fn run_whisper(args: &TranscribeArgs, device: Device) -> Result<String> {
         "rmlx transcribe (whisper)"
     );
 
+    // A prompt that cannot be used is refused before the audio is read and
+    // before the model loads; a blank prompt loads no tokenizer yet.
+    let (prompt_tokens, early_tokenizer) = if args.prompt.trim().is_empty() {
+        (Vec::new(), None)
+    } else {
+        let tokenizer = load_tokenizer(tok_dir)?;
+        let tokens = tokenizer
+            .encode_prompt(args.prompt)
+            .map_err(|e| anyhow!("invalid prompt: {e}"))?;
+        (tokens, Some(tokenizer))
+    };
+
     // Decode first: a file the decoder refuses costs no model load. The file's
     // bytes are dropped here; only the 16 kHz samples stay for the model.
     let samples = read_audio_16k(args.audio)?;
 
-    // The tokenizer first: one of another vocabulary is refused before the weights load.
-    let tokenizer = WhisperTokenizer::from_path(tok_dir).with_context(|| {
-        format!(
-            "load whisper tokenizer from {} (Whisper snapshots ship no tokenizer.json; \
-             pass --tokenizer pointing at the openai/whisper-large-v3 tokenizer dir)",
-            tok_dir.display()
-        )
-    })?;
+    // The tokenizer next: one of another vocabulary is refused before the weights load.
+    let tokenizer = match early_tokenizer {
+        Some(tokenizer) => tokenizer,
+        None => load_tokenizer(tok_dir)?,
+    };
     let model = WhisperModel::load(args.model).context("load whisper model")?;
 
     let transcriber = Transcriber::new(Arc::new(model), Arc::new(tokenizer))
@@ -114,6 +130,8 @@ fn run_whisper(args: &TranscribeArgs, device: Device) -> Result<String> {
         task,
         temperature: 0.0,
         condition_on_previous_text: true,
+        prompt_tokens,
+        words: args.words,
     };
 
     let t0 = std::time::Instant::now();
@@ -123,6 +141,7 @@ fn run_whisper(args: &TranscribeArgs, device: Device) -> Result<String> {
         &opts,
         device,
         &AtomicBool::new(false),
+        &mut |_| Ok(()),
     )
     .map_err(|e| anyhow!("transcribe: {e}"))?;
     let elapsed = t0.elapsed().as_secs_f64();
@@ -139,7 +158,18 @@ fn run_whisper(args: &TranscribeArgs, device: Device) -> Result<String> {
         "transcribe complete"
     );
 
-    Ok(render(&transcription, out_fmt))
+    render(&transcription, out_fmt).context("render the transcription")
+}
+
+/// The tokenizer in `tok_dir`.
+fn load_tokenizer(tok_dir: &Path) -> Result<WhisperTokenizer> {
+    WhisperTokenizer::from_path(tok_dir).with_context(|| {
+        format!(
+            "load whisper tokenizer from {} (Whisper snapshots ship no tokenizer.json; \
+             pass --tokenizer pointing at the openai/whisper-large-v3 tokenizer dir)",
+            tok_dir.display()
+        )
+    })
 }
 
 /// The 16 kHz mono samples of the audio file at `path`. The operator's own

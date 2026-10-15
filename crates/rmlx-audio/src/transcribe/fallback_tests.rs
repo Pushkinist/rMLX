@@ -9,7 +9,7 @@ use super::{
 use crate::tokenizer::TOK_TIMESTAMP_BEGIN;
 use crate::transcribe::seek::plan_window;
 use crate::transcribe::tests::{clean, looping, sentences, PROMPT};
-use crate::transcribe::{compression_ratio, next_prompt};
+use crate::transcribe::{compression_ratio, next_prompt, Prompt};
 use crate::whisper::decode_loop::{Decoded, Stop};
 
 /// The average log-probability of a sure decode.
@@ -614,13 +614,17 @@ fn a_skipped_window_gives_no_segment_consumes_the_window_and_leaves_the_prompt()
         assert!(plan.segments.is_empty(), "segments: {:?}", plan.segments);
         assert_eq!(plan.advance_samples, window_samples);
     }
+    let prompt = Prompt {
+        client: vec![1],
+        carried: PROMPT.to_vec(),
+    };
     let next = next_prompt(
-        PROMPT.to_vec(),
+        prompt.clone(),
         &got.outcome,
         true,
-        "",
+        "text that the skip must not carry",
         |_: &str| vec![99],
         10,
     );
-    assert_eq!(next, PROMPT.to_vec());
+    assert_eq!(next, prompt);
 }

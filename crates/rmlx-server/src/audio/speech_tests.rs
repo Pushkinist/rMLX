@@ -13,6 +13,7 @@ use axum::Json;
 use rmlx_audio::tts::{Synthesis, TtsConfig, TtsError, MAX_FRAMES};
 
 use super::{audio_speech, speech_outcome_headers, speech_response, SpeechFailure, SpeechRequest};
+use crate::audio::test_events::{capture, events_of, field, problems};
 use crate::openai::tests::slot_test_state;
 use crate::registry::ModelRegistry;
 
@@ -357,7 +358,7 @@ async fn an_unknown_voice_is_refused_without_an_echo() {
             "an unknown voice is not a server problem: {:?}",
             problems(&events)
         );
-        for event in events.0.lock().unwrap().iter() {
+        for event in events.captured.lock().unwrap().iter() {
             let logged = field(event, "voice").unwrap_or_default();
             assert!(logged.len() <= 66, "a log field has {} bytes", logged.len());
         }
@@ -497,77 +498,6 @@ fn wav_pcm16_mono_24k(samples: &[f32]) -> Vec<u8> {
     out
 }
 
-/// The fields of every event that this thread emits while it is installed.
-#[derive(Default)]
-struct Events(std::sync::Mutex<Vec<Vec<(String, String)>>>);
-
-struct Fields(Vec<(String, String)>);
-
-impl tracing::field::Visit for Fields {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        self.0.push((field.name().to_owned(), format!("{value:?}")));
-    }
-}
-
-impl tracing::Subscriber for Events {
-    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-        true
-    }
-    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        tracing::span::Id::from_u64(1)
-    }
-    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-    fn event(&self, event: &tracing::Event<'_>) {
-        let mut fields = Fields(vec![(
-            "level".to_owned(),
-            event.metadata().level().to_string(),
-        )]);
-        event.record(&mut fields);
-        self.0.lock().unwrap().push(fields.0);
-    }
-    fn enter(&self, _: &tracing::span::Id) {}
-    fn exit(&self, _: &tracing::span::Id) {}
-}
-
-/// Capture the events of this thread until the returned guards drop.
-fn capture() -> (
-    Arc<Events>,
-    (tracing::Dispatch, tracing::subscriber::DefaultGuard),
-) {
-    let events = Arc::new(Events::default());
-    // A second live dispatcher keeps a callsite that another thread registers
-    // now from being cached as always on, which would bypass the scoped one.
-    let keep = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
-    let guard = tracing::subscriber::set_default(Arc::clone(&events));
-    (events, (keep, guard))
-}
-
-/// The events of `f`, each as its level and its fields.
-fn events_of(f: impl FnOnce()) -> Vec<Vec<(String, String)>> {
-    let (events, guards) = capture();
-    f();
-    drop(guards);
-    let captured = events.0.lock().unwrap().clone();
-    captured
-}
-
-/// The events at warn or error among `events`.
-fn problems(events: &Events) -> Vec<Vec<(String, String)>> {
-    let all = events.0.lock().unwrap();
-    all.iter()
-        .filter(|e| matches!(field(e, "level"), Some("WARN" | "ERROR")))
-        .cloned()
-        .collect()
-}
-
-fn field<'a>(event: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    event
-        .iter()
-        .find(|(key, _)| key == name)
-        .map(|(_, value)| value.as_str())
-}
-
 #[test]
 fn a_truncated_synthesis_logs_a_warn_event_with_the_frames_and_the_cap() {
     let events = events_of(|| {
@@ -679,7 +609,7 @@ async fn a_long_model_name_is_logged_cut_to_64_bytes() {
     let (status, _) = speak(no_tts_state(), &body).await;
     drop(guards);
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    let captured = events.0.lock().unwrap().clone();
+    let captured = events.captured.lock().unwrap().clone();
     let request = captured
         .iter()
         .find(|e| field(e, "message") == Some("audio/speech request"))

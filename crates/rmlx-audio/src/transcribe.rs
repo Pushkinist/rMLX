@@ -16,7 +16,10 @@
 //!    times. Consume the whole window when the tokens end in a single
 //!    timestamp; otherwise seek to the end of the last closed segment. Feed the
 //!    previous window's text back as a prompt (`<|startofprev|>`).
-//! 4. Emit multi-segment output (`vtt` / `srt` / `json` / `txt`).
+//! 4. When words are asked, time each word of the window's segments from the
+//!    cross-attention of the alignment heads (`words`). The words do not
+//!    change the segments or the seek.
+//! 5. Emit multi-segment output (`vtt` / `srt` / `json` / `txt`).
 //!
 //! Determinism: the caller supplies the token pick ([`RowPick`]). A pick that
 //! draws from one seeded generator for each request gives the same output for
@@ -27,26 +30,36 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use rmlx_mlx::Device;
+use serde::Serialize;
 use tracing::{debug, info, warn};
 
-use crate::mel::{pad_after_content, MelExtractor, N_SAMPLES, SAMPLE_RATE};
+use crate::mel::{pad_after_content, MelExtractor, HOP_LENGTH, N_FRAMES, N_SAMPLES, SAMPLE_RATE};
 use crate::tokenizer::{
-    language_name, language_token, WhisperTask, WhisperTokenizer, TOK_EOT, TOK_SOT_PREV,
-    TOK_TIMESTAMP_BEGIN,
+    language_code, language_name, language_token, WhisperTask, WhisperTokenizer, TOK_EOT,
+    TOK_SOT_PREV, TOK_TIMESTAMP_BEGIN,
 };
 use crate::whisper::{DecodeFilters, WhisperError, WhisperModel};
 
 mod fallback;
 mod seek;
+mod words;
 
 use fallback::{decode_with_fallback, WindowOutcome};
 use seek::{plan_window, walk_windows, window_segments, SeekRule, WalkEnd};
+use words::{text_tokens, window_words};
 
 /// Chooses one token id from a filtered logit row at a temperature: the
 /// largest logit at 0, a draw from `softmax(row / temperature)` above it. A
 /// masked id has the logit `-inf`. One pick serves every window of a request,
 /// so its generator is seeded once for the request.
 pub type RowPick<'a> = &'a mut dyn FnMut(&[f32], f32) -> rmlx_core::error::Result<u32>;
+
+/// Takes the segments of each window when the window closes, in order; a
+/// window with no segment gives an empty slice. The segments of a closed window
+/// are final. [`rmlx_core::error::Error::Cancelled`] tells the walk that the
+/// reader of the request is gone: no further window opens. Any other error ends
+/// the transcription with that error.
+pub type WindowSink<'a> = &'a mut dyn FnMut(&[Segment]) -> rmlx_core::error::Result<()>;
 
 /// Compression ratio above which a window's text is a repetition loop
 /// (openai-whisper's `compression_ratio_threshold`).
@@ -79,7 +92,7 @@ fn window_token_budget(n_text_ctx: usize, prefix_len: usize) -> usize {
 }
 
 /// One transcribed segment with real wall-clock times (seconds from start).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 #[allow(clippy::exhaustive_structs, reason = "stable public segment shape")]
 pub struct Segment {
     /// Start of the window that holds the segment, in 10 ms mel frames, as
@@ -96,9 +109,81 @@ pub struct Segment {
     /// Temperature of the window's kept decode: above the request temperature
     /// when a fallback ran. Every segment of a window has the same.
     pub temperature: f32,
+    /// Average log-probability of the window's kept decode: every segment of a
+    /// window has the same, as in openai-whisper. Below -1.0 the decode is
+    /// weak.
+    pub avg_logprob: f32,
     /// Compression ratio of the window's kept decode: every segment of a
     /// window has the same, as in openai-whisper.
     pub compression_ratio: f32,
+    /// The no-speech probability that the window's gate read, with no
+    /// prompt: every segment of a window has the same.
+    pub no_speech_prob: f32,
+}
+
+/// One word of a transcription, with its times in seconds from the start of
+/// the audio. Both times are inside the word's segment.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::exhaustive_structs, reason = "stable public word shape")]
+pub struct Word {
+    /// The text of the word as the tokenizer gives it, with its leading
+    /// space, and with the punctuation that was joined to it.
+    pub word: String,
+    /// Start time in seconds.
+    pub start: f32,
+    /// End time in seconds.
+    pub end: f32,
+    /// Index of the word's segment in [`Transcription::segments`].
+    pub segment: usize,
+}
+
+/// A segment with its position in the transcription: the JSON object of one
+/// segment, with the ten keys of the OpenAI `TranscriptionSegment` schema. The
+/// HTTP route and `rmlx transcribe --format json` both write it.
+#[derive(Debug, Serialize)]
+#[allow(clippy::exhaustive_structs, reason = "stable public segment shape")]
+pub struct SegmentRecord<'a> {
+    /// Index of the segment in [`Transcription::segments`].
+    pub id: usize,
+    /// The segment's own keys.
+    #[serde(flatten)]
+    pub segment: &'a Segment,
+}
+
+/// A word as the JSON object of the OpenAI `TranscriptionWord` schema: its
+/// text with no leading space, its start and its end. The HTTP route and
+/// `rmlx transcribe --format json` both write it.
+#[derive(Debug, Serialize)]
+#[allow(clippy::exhaustive_structs, reason = "stable public word shape")]
+pub struct WordRecord<'a> {
+    /// The word's text, its leading white space removed.
+    pub word: &'a str,
+    /// Start time in seconds.
+    pub start: f32,
+    /// End time in seconds.
+    pub end: f32,
+}
+
+/// A transcription as one JSON object: the HTTP route's `verbose_json` reply
+/// and the output of `rmlx transcribe --format json`. `task` is in the reply
+/// of the route only, and `words` only when word times were asked.
+#[derive(Debug, Serialize)]
+#[allow(clippy::exhaustive_structs, reason = "stable public result shape")]
+pub struct TranscriptionRecord<'a> {
+    /// `transcribe` or `translate`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<&'static str>,
+    /// See [`Transcription::language`].
+    pub language: &'a str,
+    /// See [`Transcription::duration`].
+    pub duration: f32,
+    /// See [`Transcription::text`].
+    pub text: &'a str,
+    /// The segments with their ids.
+    pub segments: Vec<SegmentRecord<'a>>,
+    /// The words of all segments, in order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub words: Option<Vec<WordRecord<'a>>>,
 }
 
 /// Full transcription result.
@@ -114,6 +199,46 @@ pub struct Transcription {
     pub language: String,
     /// Total audio duration in seconds.
     pub duration: f32,
+    /// The words of all segments, in order, when
+    /// [`TranscribeOptions::words`] was set; `None` otherwise.
+    pub words: Option<Vec<Word>>,
+}
+
+impl Transcription {
+    /// The segments with their ids, in order.
+    #[must_use]
+    pub fn segment_records(&self) -> Vec<SegmentRecord<'_>> {
+        self.segments
+            .iter()
+            .enumerate()
+            .map(|(id, segment)| SegmentRecord { id, segment })
+            .collect()
+    }
+
+    /// The transcription as one JSON object; `task` names it when given.
+    #[must_use]
+    pub fn record(&self, task: Option<WhisperTask>) -> TranscriptionRecord<'_> {
+        TranscriptionRecord {
+            task: task.map(|task| match task {
+                WhisperTask::Transcribe => "transcribe",
+                WhisperTask::Translate => "translate",
+            }),
+            language: &self.language,
+            duration: self.duration,
+            text: self.text.trim(),
+            segments: self.segment_records(),
+            words: self.words.as_ref().map(|words| {
+                words
+                    .iter()
+                    .map(|word| WordRecord {
+                        word: word.word.trim_start(),
+                        start: word.start,
+                        end: word.end,
+                    })
+                    .collect()
+            }),
+        }
+    }
 }
 
 /// Options for a transcription run.
@@ -131,6 +256,21 @@ pub struct TranscribeOptions {
     pub temperature: f32,
     /// Feed the previous window's text back as a decoder prompt.
     pub condition_on_previous_text: bool,
+    /// The tokens of the client's `prompt` text, from
+    /// [`WhisperTokenizer::encode_prompt`]: a style or a spelling to follow.
+    /// They prompt the decoder before the text of the previous window. The
+    /// prompt of a window is the last tokens of these and the previous
+    /// window's text, so a long previous text cuts these from the left. A
+    /// window that is not accepted, or an accepted one above temperature 0.5,
+    /// drops them, and so does any decoded window when
+    /// `condition_on_previous_text` is off. The no-speech gate does not read
+    /// them.
+    pub prompt_tokens: Vec<u32>,
+    /// Give the start and the end of each word ([`Transcription::words`]).
+    /// The words do not change the segments, the text or the seek. A model
+    /// with no alignment heads refuses it with
+    /// [`WhisperError::NoAlignmentHeads`].
+    pub words: bool,
 }
 
 impl Default for TranscribeOptions {
@@ -140,6 +280,8 @@ impl Default for TranscribeOptions {
             task: WhisperTask::Transcribe,
             temperature: 0.0,
             condition_on_previous_text: true,
+            prompt_tokens: Vec::new(),
+            words: false,
         }
     }
 }
@@ -195,9 +337,10 @@ impl Transcriber {
     /// Transcribe a full 16 kHz mono f32 waveform of any length.
     ///
     /// `pick` chooses every token of the request. `cancel` is read before each
-    /// 30 s window. Once it is set, no further window opens and the call
-    /// returns [`WhisperError::Cancelled`]; a flag that is never set runs the
-    /// whole audio.
+    /// 30 s window. Once it is set, or once `on_window` reports that the
+    /// reader is gone, no further window opens and the call returns
+    /// [`WhisperError::Cancelled`]; a flag that is never set runs the whole
+    /// audio.
     #[allow(
         clippy::too_many_lines,
         reason = "the seek loop + segment accumulation is one cohesive long-form pass"
@@ -209,24 +352,50 @@ impl Transcriber {
         pick: RowPick<'_>,
         device: Device,
         cancel: &AtomicBool,
+        on_window: WindowSink<'_>,
     ) -> Result<Transcription, WhisperError> {
         let total_samples = samples.len();
         let duration = total_samples as f32 / SAMPLE_RATE as f32;
+        let alignment_heads = if opts.words {
+            match self.model.alignment_heads() {
+                Some(heads) if !heads.is_empty() => Some(heads),
+                _ => return Err(WhisperError::NoAlignmentHeads),
+            }
+        } else {
+            None
+        };
+        let mut words: Vec<Word> = Vec::new();
+        let mut last_speech = 0.0_f64;
 
         // A named language is known now; `auto` is detected on the first
         // window that is decoded.
         let mut resolved_lang = requested_language(&opts.language)?;
 
-        let mut segments: Vec<Segment> = Vec::new();
-        let mut prompt_tokens: Vec<u32> = Vec::new();
+        let prompt_cap = previous_text_cap(self.model.cfg.n_text_ctx);
+        let client_kept = opts
+            .prompt_tokens
+            .get(opts.prompt_tokens.len().saturating_sub(prompt_cap)..)
+            .unwrap_or_default();
+        debug!(
+            client_prompt_tokens = opts.prompt_tokens.len(),
+            client_prompt_kept = client_kept.len(),
+            "long-form transcription started"
+        );
+        let mut prompt_state = Prompt {
+            client: client_kept.to_vec(),
+            carried: Vec::new(),
+        };
         let mut skipped_windows = 0_usize;
 
         let filters = DecodeFilters::new(self.suppress.clone(), self.blank_ids.clone(), true);
 
-        let end = walk_windows(
+        let walk = walk_windows(
             total_samples,
             cancel,
-            |seek, window_samples| -> Result<usize, WhisperError> {
+            |seek,
+             window_samples,
+             earlier_segments|
+             -> Result<(usize, Vec<Segment>), WhisperError> {
                 #[allow(
                     clippy::indexing_slicing,
                     reason = "walk_windows yields seek + window_samples <= total_samples"
@@ -268,11 +437,8 @@ impl Transcriber {
                 let n_text_ctx = self.model.cfg.n_text_ctx;
                 // The two closures of the window pick in turn, never at once.
                 let pick = RefCell::new(&mut *pick);
-                let prompt: &[u32] = if opts.condition_on_previous_text {
-                    &prompt_tokens
-                } else {
-                    &[]
-                };
+                let window_prompt = prompt_state.tokens(prompt_cap);
+                let prompt: &[u32] = &window_prompt;
                 // The greedy decode with no prompt, until its text passes the bound.
                 let writes_at_most = |text_bound: usize| {
                     let max_tokens = window_token_budget(n_text_ctx, sot.len());
@@ -316,7 +482,7 @@ impl Transcriber {
                     decode,
                     text_of,
                 )?;
-                outcome.log(seek, start.no_speech_prob);
+                outcome.log(seek);
                 skipped_windows += usize::from(outcome.skipped);
 
                 let plan = plan_window(&outcome.tokens, window_samples);
@@ -327,11 +493,44 @@ impl Transcriber {
                         "last closed segment ends at the window start; consuming the whole window"
                     );
                 }
-                let window_segments = outcome.kept().map_or_else(Vec::new, |kept| {
-                    window_segments(&plan.segments, seek, total_samples, kept, |tokens| {
+                let window_segments =
+                    window_segments(&plan.segments, seek, total_samples, &outcome, |tokens| {
                         self.tokenizer.decode(tokens).unwrap_or_default()
-                    })
-                });
+                    });
+                if let Some(heads) = alignment_heads {
+                    let text = text_tokens(&window_segments);
+                    // One encoder frame is two mel frames: the frames of the
+                    // real audio of the window.
+                    let frames = (window_samples / HOP_LENGTH).min(N_FRAMES) / 2;
+                    let mut window_word_count = 0;
+                    if !text.is_empty() && frames > 0 {
+                        let mut align_tokens =
+                            self.tokenizer
+                                .sot_sequence_from_tok(window_lang, opts.task, false);
+                        let prefix_len = align_tokens.len();
+                        align_tokens.extend(&text);
+                        align_tokens.push(TOK_EOT);
+                        let scores = opened.align(&align_tokens, heads, frames)?;
+                        let found = window_words(
+                            &scores,
+                            prefix_len,
+                            &window_segments,
+                            language_code(window_lang).unwrap_or_default(),
+                            |tokens| self.tokenizer.decode(tokens).unwrap_or_default(),
+                            earlier_segments,
+                            &mut last_speech,
+                        )?;
+                        window_word_count = found.len();
+                        words.extend(found);
+                    }
+                    debug!(
+                        seek,
+                        n_words = window_word_count,
+                        align_text_tokens = text.len(),
+                        align_frames = frames,
+                        "window words aligned"
+                    );
+                }
 
                 debug!(
                     seek,
@@ -342,6 +541,7 @@ impl Transcriber {
                     detection_pass = detected_on_padded_audio.is_some(),
                     decodes = outcome.attempts.len(),
                     cross_projections = self.model.decoder.cross_projections() - projected_before,
+                    prompt_tokens = window_prompt.len(),
                     n_tokens = outcome.tokens.len(),
                     n_segments = window_segments.len(),
                     seek_rule = ?plan.rule,
@@ -354,39 +554,39 @@ impl Transcriber {
                     .map(|s| s.text.as_str())
                     .collect::<Vec<_>>()
                     .join(" ");
-                prompt_tokens = next_prompt(
-                    std::mem::take(&mut prompt_tokens),
+                prompt_state = next_prompt(
+                    std::mem::take(&mut prompt_state),
                     &outcome,
                     opts.condition_on_previous_text,
                     &window_text,
                     |text| self.tokenizer.encode(text).unwrap_or_default(),
-                    previous_text_cap(self.model.cfg.n_text_ctx),
+                    prompt_cap,
                 );
 
-                segments.extend(window_segments);
-                Ok(plan.advance_samples)
+                Ok((plan.advance_samples, window_segments))
             },
+            on_window,
         )?;
-        if let WalkEnd::Cancelled { window, seek } = end {
+        let segments = walk.segments;
+        if let WalkEnd::Cancelled {
+            window,
+            seek,
+            cause,
+        } = walk.end
+        {
             info!(
                 window,
                 seek,
                 seek_secs = seek as f32 / SAMPLE_RATE as f32,
                 total_samples,
                 n_segments = segments.len(),
+                stop = cause.name(),
                 "long-form transcription cancelled before the window opened"
             );
             return Err(WhisperError::Cancelled { window, seek });
         }
 
-        let text = segments
-            .iter()
-            .map(|s| s.text.as_str())
-            .collect::<Vec<_>>()
-            .join(" ")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+        let text = joined_text(&segments);
 
         let language = reported_language(resolved_lang, skipped_windows).to_owned();
 
@@ -400,7 +600,44 @@ impl Transcriber {
             segments,
             language,
             duration,
+            words: alignment_heads.map(|_| words),
         })
+    }
+}
+
+/// The text of `segments`: their texts joined, with each run of white space
+/// collapsed to one space and none at the ends.
+fn joined_text(segments: &[Segment]) -> String {
+    segments
+        .iter()
+        .flat_map(|s| s.text.split_whitespace())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The text that each closed window adds to a transcription, window by
+/// window. Each delta but the first starts with one space, so the deltas of
+/// all windows, joined with nothing, are [`Transcription::text`].
+#[derive(Debug, Default)]
+pub struct TextDeltas {
+    started: bool,
+}
+
+impl TextDeltas {
+    /// The text that the closed window `window` adds, or `None` when it adds
+    /// none.
+    pub fn delta(&mut self, window: &[Segment]) -> Option<String> {
+        let text = joined_text(window);
+        if text.is_empty() {
+            return None;
+        }
+        let delta = if self.started {
+            format!(" {text}")
+        } else {
+            text
+        };
+        self.started = true;
+        Some(delta)
     }
 }
 
@@ -453,29 +690,62 @@ fn reported_language(token: Option<u32>, skipped_windows: usize) -> &'static str
     })
 }
 
-/// The previous-text prompt for the next window. A window whose `outcome`
-/// may not be carried (its kept decode is not accepted, or is accepted above
-/// temperature 0.5) clears it. Otherwise, with `condition` set and some text in
-/// the window, it is `encode(text)` cut to its last `cap` tokens, as
-/// openai-whisper cuts its prompt; else the prompt is kept as it is.
+/// The prompt of a request: the tokens of the client's `prompt` text, then the
+/// tokens of the text of the last window that was carried.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Prompt {
+    client: Vec<u32>,
+    carried: Vec<u32>,
+}
+
+impl Prompt {
+    /// The tokens of the next window's prompt: the last `cap` of the client's
+    /// tokens followed by the carried ones, as openai-whisper cuts its prompt.
+    fn tokens(&self, cap: usize) -> Vec<u32> {
+        let skip = (self.client.len() + self.carried.len()).saturating_sub(cap);
+        self.client
+            .iter()
+            .chain(&self.carried)
+            .skip(skip)
+            .copied()
+            .collect()
+    }
+}
+
+/// The prompt for the next window. A window whose `outcome` may not be carried
+/// (its kept decode is not accepted, or is accepted above temperature 0.5)
+/// clears all of it. A skipped window, or one with no text while `condition` is
+/// set, changes nothing. With `condition` off, a decoded window drops the
+/// client's tokens, which served the first decoded window only. Otherwise the
+/// carried tokens become `encode(text)` cut to its last `cap` tokens, as
+/// openai-whisper cuts its prompt, and the client's tokens stay.
 fn next_prompt(
-    prompt: Vec<u32>,
+    prompt: Prompt,
     outcome: &WindowOutcome,
     condition: bool,
     window_text: &str,
     encode: impl FnOnce(&str) -> Vec<u32>,
     cap: usize,
-) -> Vec<u32> {
+) -> Prompt {
     let text = window_text.trim();
     if !outcome.carry_text {
-        return Vec::new();
+        return Prompt::default();
     }
-    if !condition || text.is_empty() {
+    if outcome.skipped || (condition && text.is_empty()) {
         return prompt;
     }
-    let mut tokens = encode(text);
-    let start = tokens.len().saturating_sub(cap);
-    tokens.split_off(start)
+    if !condition {
+        return Prompt {
+            client: Vec::new(),
+            carried: prompt.carried,
+        };
+    }
+    let mut carried = encode(text);
+    let start = carried.len().saturating_sub(cap);
+    Prompt {
+        client: prompt.client,
+        carried: carried.split_off(start),
+    }
 }
 
 /// Compression ratio of `text`, as openai-whisper's `compression_ratio`
@@ -523,38 +793,19 @@ impl OutputFormat {
     }
 }
 
-/// Render a transcription to the requested format string.
-#[must_use]
-pub fn render(t: &Transcription, fmt: OutputFormat) -> String {
+/// Render a transcription to the requested format string. Only `Json` can
+/// fail.
+pub fn render(t: &Transcription, fmt: OutputFormat) -> Result<String, serde_json::Error> {
     match fmt {
-        OutputFormat::Txt => t.text.clone(),
+        OutputFormat::Txt => Ok(t.text.clone()),
         OutputFormat::Json => render_json(t),
-        OutputFormat::Srt => render_srt(&t.segments),
-        OutputFormat::Vtt => render_vtt(&t.segments),
+        OutputFormat::Srt => Ok(render_srt(&t.segments)),
+        OutputFormat::Vtt => Ok(render_vtt(&t.segments)),
     }
 }
 
-fn render_json(t: &Transcription) -> String {
-    let segs: Vec<serde_json::Value> = t
-        .segments
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            serde_json::json!({
-                "id": i,
-                "start": s.start,
-                "end": s.end,
-                "text": s.text,
-            })
-        })
-        .collect();
-    serde_json::json!({
-        "text": t.text,
-        "language": t.language,
-        "duration": t.duration,
-        "segments": segs,
-    })
-    .to_string()
+fn render_json(t: &Transcription) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&t.record(None))
 }
 
 /// Format seconds as `HH:MM:SS,mmm` (SRT) or `HH:MM:SS.mmm` (VTT).
@@ -569,7 +820,9 @@ fn fmt_time(secs: f32, comma: bool) -> String {
     format!("{h:02}:{m:02}:{s:02}{sep}{ms:03}")
 }
 
-fn render_srt(segments: &[Segment]) -> String {
+/// SubRip subtitles, one cue per segment.
+#[must_use]
+pub fn render_srt(segments: &[Segment]) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     for (i, s) in segments.iter().enumerate() {
@@ -585,7 +838,9 @@ fn render_srt(segments: &[Segment]) -> String {
     out
 }
 
-fn render_vtt(segments: &[Segment]) -> String {
+/// WebVTT subtitles, one cue per segment.
+#[must_use]
+pub fn render_vtt(segments: &[Segment]) -> String {
     use std::fmt::Write as _;
     let mut out = String::from("WEBVTT\n\n");
     for s in segments {

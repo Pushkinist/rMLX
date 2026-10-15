@@ -65,7 +65,7 @@ pub mod whisper;
 mod test_events;
 
 pub use transcribe::{
-    render, OutputFormat, Segment, TranscribeOptions, Transcriber, Transcription,
+    render, OutputFormat, Segment, SegmentRecord, TranscribeOptions, Transcriber, Transcription,
 };
 pub use vad::{voiced_segments, SileroVad, VadState};
 pub use wav::{WavDecoder, WavEncoder};

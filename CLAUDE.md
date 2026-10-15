@@ -44,6 +44,7 @@ areas before touching code:
 |---|---|
 | [`docs/CLI.md`](docs/CLI.md) | rmlx CLI: subcommands, flags, claim file |
 | [`docs/CLI_ENV_VARS.md`](docs/CLI_ENV_VARS.md) | Environment variables `CLI.md` reads, split out for size |
+| [`docs/CLI_BASELINE.md`](docs/CLI_BASELINE.md) | `rmlx baseline`, split out of `CLI.md` for size: flags, summary line, refusals, prompt files, prompt-length cap, GPU capture flags |
 | [`docs/SERVER.md`](docs/SERVER.md) | HTTP server: OpenAI/Anthropic compat, routes, tool calling, retry envelope |
 | [`docs/SERVER_TOOLS.md`](docs/SERVER_TOOLS.md) | Tool calling in the HTTP server, split out of `SERVER.md` for size: parsers, template probe, multi-turn loop, forced tool calls, EOF recovery |
 | [`docs/SERVER_AUDIO.md`](docs/SERVER_AUDIO.md) | Audio routes of the HTTP server, split out of `SERVER.md` for size: speech-to-text (form, upload, admission, cancel, model cache) and text-to-speech (fields, sampling defaults, response headers, errors) |
@@ -78,7 +79,8 @@ areas before touching code:
 | [`docs/PROJECTS_CONFIG.md`](docs/PROJECTS_CONFIG.md) | Per-project cap defaults via `<RMLX_HOME>/projects.toml` |
 | [`docs/TESTING.md`](docs/TESTING.md) | Test snapshot resolution (RMLX_O_MODELS_ROOT, RMLX_TEST_MODEL_*), test variables, golden-token fixtures, CPU numeric gates, NIAH and codec smoke matrix |
 | [`docs/GPU_TESTS.md`](docs/GPU_TESTS.md) | GPU/Metal tests: the `#[ignore]` rule and its gate, `make gpu-test`, stand-downs, halves, `make ci-perf`, shader validation, census pin |
-| [`docs/AUDIO.md`](docs/AUDIO.md) | Audio: Whisper transcription, WAV I/O, Whisper token ids |
+| [`docs/AUDIO.md`](docs/AUDIO.md) | Audio: Whisper transcription (word timestamps, prompt, window decision, HTTP route), Whisper token ids |
+| [`docs/AUDIO_WAV.md`](docs/AUDIO_WAV.md) | WAV I/O, split out of `AUDIO.md` for size: the decoder (formats, resample and memory, duration cap, declared length, trim, lost audio, refusals) and `WavEncoder` |
 | [`docs/AUDIO_TTS.md`](docs/AUDIO_TTS.md) | Qwen3-TTS: the speech model (loading, talker, code predictor, generation loop, memory of a request), sampling of the codec tokens, the codec decoder |
 | [`docs/E2E_TEST_PLAN.md`](docs/E2E_TEST_PLAN.md) | End-to-end feature-proof harness: modality, tool-calling and speculative-decoding cases |
 | [`docs/RELEASING.md`](docs/RELEASING.md) | Release flow: single-source version, `make tag` / `release-package` / `tap-sync`, Homebrew formula + tap, `CHANGELOG.md`, branch model (one PR per issue into `main`, squash-merged), post-release retrospective |

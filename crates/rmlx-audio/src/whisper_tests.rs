@@ -7,13 +7,14 @@
 //! absent — no bespoke env var. The tests here verify config parsing, NPZ
 //! parsing logic, and weight-map helpers.
 
-use super::snapshot_fixture::{config_json, decoder_tensors, tiny_config_json, weight_map};
+use super::snapshot_fixture::{config_json, decoder_tensors, tiny_config_json, weight_map, Tensor};
 use super::{DecodeFilters, TextDecoder, WhisperConfig, WhisperError};
 use crate::npz::extract_npy_shape;
 use crate::tokenizer::{
     N_VOCAB, TOK_EN, TOK_EOT, TOK_NO_TIMESTAMPS, TOK_SOT, TOK_TIMESTAMP_BEGIN, TOK_TRANSCRIBE,
 };
 use rmlx_mlx::{Array, Device};
+use std::collections::HashMap;
 
 fn fresh_logits() -> Vec<f32> {
     // All zeros so we can see exactly which entries get masked to -inf.
@@ -289,21 +290,50 @@ fn npy_shape_scalar() {
 const TINY_STATE: usize = 4;
 const TINY_BLOCKS: usize = 2;
 
-/// An array of `shape` with small values that differ from one element to the
-/// next and from one `seed` to the next.
+/// `len` small values in [-0.5, 0.5) from a hash (the murmur3 finaliser) of
+/// each index and `seed`. A multiplicative sequence would make each row of
+/// four a shifted copy of the next, which a layer norm maps to one row.
+fn host_values(len: usize, seed: u32) -> Vec<f32> {
+    (0..len as u32)
+        .map(|i| {
+            let mut h = i ^ seed.wrapping_mul(0x9E37_79B9);
+            h = (h ^ (h >> 16)).wrapping_mul(0x85EB_CA6B);
+            h = (h ^ (h >> 13)).wrapping_mul(0xC2B2_AE35);
+            h ^= h >> 16;
+            (h >> 20) as f32 / 4096.0 - 0.5
+        })
+        .collect()
+}
+
+/// An array of `shape` holding [`host_values`].
 fn values(shape: &[i32], seed: u32) -> Result<Array, WhisperError> {
     let len: i32 = shape.iter().product();
-    let data: Vec<f32> = (0..len as u32)
-        .map(|i| ((i.wrapping_mul(2_654_435_761).wrapping_add(seed) >> 20) as f32 / 4096.0) - 0.5)
-        .collect();
-    Ok(Array::from_f32_slice(&data, shape)?)
+    Ok(Array::from_f32_slice(
+        &host_values(len as usize, seed),
+        shape,
+    )?)
+}
+
+/// The tensors of [`tiny_decoder`]: the names, shapes and biases of the shared
+/// fixture, with [`host_values`] in place of its values. The fixture fills each
+/// tensor with a linear ramp, and a layer norm maps most token rows of a ramp
+/// to the same row; the hash fill gives each token its own scores.
+fn tiny_decoder_tensors() -> Vec<Tensor> {
+    let mut tensors = decoder_tensors(TINY_BLOCKS);
+    for (seed, tensor) in (1..).zip(&mut tensors) {
+        tensor.bytes = host_values(tensor.bytes.len() / 4, seed)
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+    }
+    tensors
 }
 
 /// A text decoder of two blocks with a state of four, the large-v3 vocabulary
 /// and a context of 16 positions.
 fn tiny_decoder() -> Result<TextDecoder, WhisperError> {
     let cfg = WhisperConfig::from_json(&tiny_config_json(0, TINY_BLOCKS).to_string())?;
-    TextDecoder::load(&weight_map(&decoder_tensors(TINY_BLOCKS)), &cfg)
+    TextDecoder::load(&weight_map(&tiny_decoder_tensors()), &cfg)
 }
 
 fn first_largest(row: &[f32]) -> u32 {
@@ -345,4 +375,216 @@ fn the_cross_attention_of_a_window_is_projected_one_time() -> Result<(), Whisper
     decoder.open_window(&encoder_out, Device::Cpu)?;
     assert_eq!(decoder.cross_projections(), 2 * TINY_BLOCKS);
     Ok(())
+}
+
+/// The tensors of [`tiny_decoder`] by name, as `f64`.
+fn tiny_tensors() -> HashMap<String, Vec<f64>> {
+    tiny_decoder_tensors()
+        .into_iter()
+        .map(|tensor| {
+            let values = tensor
+                .bytes
+                .chunks_exact(4)
+                .map(|b| f64::from(f32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+                .collect();
+            (tensor.name, values)
+        })
+        .collect()
+}
+
+/// `x @ wᵀ + b` for the linear `name` of [`tiny_tensors`], a weight `[out][in]`
+/// of four by four and a bias when the tensors hold one.
+fn linear(tensors: &HashMap<String, Vec<f64>>, name: &str, x: &[f64]) -> Vec<f64> {
+    let weight = &tensors[&format!("{name}.weight")];
+    let bias = tensors.get(&format!("{name}.bias"));
+    weight
+        .chunks_exact(TINY_STATE)
+        .enumerate()
+        .map(|(out, row)| {
+            let sum: f64 = row.iter().zip(x).map(|(a, b)| a * b).sum();
+            sum + bias.map_or(0.0, |bias| bias[out])
+        })
+        .collect()
+}
+
+/// Layer norm `name` of [`tiny_tensors`] over the four values of `x`,
+/// population variance, eps 1e-5.
+fn layer_norm(tensors: &HashMap<String, Vec<f64>>, name: &str, x: &[f64]) -> Vec<f64> {
+    let (weight, bias) = (
+        &tensors[&format!("{name}.weight")],
+        &tensors[&format!("{name}.bias")],
+    );
+    let mean = x.iter().sum::<f64>() / TINY_STATE as f64;
+    let var = x.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / TINY_STATE as f64;
+    x.iter()
+        .zip(weight.iter().zip(bias))
+        .map(|(v, (w, b))| (v - mean) / (var + 1e-5).sqrt() * w + b)
+        .collect()
+}
+
+/// The cross-attention scores of block 0 before the softmax, worked out on the
+/// host from the tensors of [`tiny_decoder`]. The key projections have no bias.
+/// Two heads of two dimensions: the scores of head `h` are `q_h · k_hᵀ`, with q
+/// and k each scaled by `2^-0.25`, so the product is scaled by `2^-0.5`.
+/// Returns `[token][frame]` for `head`.
+fn tiny_block_0_cross_scores(tokens: &[u32], encoder: &[f64], head: usize) -> Vec<Vec<f64>> {
+    let tensors = tiny_tensors();
+    let embedding = &tensors["decoder.token_embedding.weight"];
+    let position = &tensors["decoder.positional_embedding"];
+    let x0: Vec<Vec<f64>> = tokens
+        .iter()
+        .enumerate()
+        .map(|(at, &token)| {
+            (0..TINY_STATE)
+                .map(|i| embedding[token as usize * TINY_STATE + i] + position[at * TINY_STATE + i])
+                .collect()
+        })
+        .collect();
+    let scale = 2.0_f64.powf(-0.25);
+    let block = "decoder.blocks.0";
+    let n1: Vec<Vec<f64>> = x0
+        .iter()
+        .map(|x| layer_norm(&tensors, &format!("{block}.attn_ln"), x))
+        .collect();
+    let project = |rows: &[Vec<f64>], name: &str| -> Vec<Vec<f64>> {
+        let name = format!("{block}.{name}");
+        rows.iter().map(|x| linear(&tensors, &name, x)).collect()
+    };
+    let (q, k, v) = (
+        project(&n1, "attn.query"),
+        project(&n1, "attn.key"),
+        project(&n1, "attn.value"),
+    );
+    let mut attended = vec![vec![0.0; TINY_STATE]; tokens.len()];
+    for h in 0..2 {
+        let dims = 2 * h..2 * h + 2;
+        for t in 0..tokens.len() {
+            let scores: Vec<f64> = (0..=t)
+                .map(|u| {
+                    dims.clone()
+                        .map(|d| q[t][d] * scale * k[u][d] * scale)
+                        .sum::<f64>()
+                })
+                .collect();
+            let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let total: f64 = scores.iter().map(|s| (s - max).exp()).sum();
+            for (u, score) in scores.iter().enumerate() {
+                let weight = (score - max).exp() / total;
+                for d in dims.clone() {
+                    attended[t][d] += weight * v[u][d];
+                }
+            }
+        }
+    }
+    let attention = project(&attended, "attn.out");
+    let x1: Vec<Vec<f64>> = x0
+        .iter()
+        .zip(&attention)
+        .map(|(x, a)| x.iter().zip(a).map(|(x, a)| x + a).collect())
+        .collect();
+    let n2: Vec<Vec<f64>> = x1
+        .iter()
+        .map(|x| layer_norm(&tensors, &format!("{block}.cross_attn_ln"), x))
+        .collect();
+    let cross_q = project(&n2, "cross_attn.query");
+    let frames: Vec<Vec<f64>> = encoder
+        .chunks_exact(TINY_STATE)
+        .map(<[f64]>::to_vec)
+        .collect();
+    let cross_k = project(&frames, "cross_attn.key");
+    let dims = 2 * head..2 * head + 2;
+    cross_q
+        .iter()
+        .map(|q| {
+            cross_k
+                .iter()
+                .map(|k| dims.clone().map(|d| q[d] * k[d]).sum::<f64>() * scale * scale)
+                .collect()
+        })
+        .collect()
+}
+
+/// The alignment pass of a window reads the window's cross-attention keys and
+/// values and projects none. It gives heads x tokens x frames scores, those of
+/// head 1 of block 0 are the hand-worked `q · kᵀ · head_dim^-0.5`, and a decode
+/// of the window after it gives the tokens of a decode of a twin window that
+/// was not aligned. Every two token rows of the expected scores differ by more
+/// than 10 times the bound, so a mix-up of any two rows fails the compare.
+#[test]
+fn the_alignment_pass_reads_the_cached_cross_attention() -> Result<(), WhisperError> {
+    const BOUND: f64 = 1e-4;
+    let decoder = tiny_decoder()?;
+    let encoder = host_values(3 * TINY_STATE, 99);
+    let encoder_out = Array::from_f32_slice(&encoder, &[1, 3, TINY_STATE as i32])?;
+    let filters = DecodeFilters::new(Vec::new(), Vec::new(), true);
+    let prefix = [TOK_SOT, TOK_EN, TOK_TRANSCRIBE];
+    let tokens = [
+        TOK_SOT,
+        TOK_EN,
+        TOK_TRANSCRIBE,
+        TOK_NO_TIMESTAMPS,
+        440,
+        TOK_EOT,
+    ];
+    let heads = [(0, 1), (1, 0)];
+    let frames = 2;
+
+    let (_, window) = decoder.open_window(&encoder_out, Device::Cpu)?;
+    let projected = decoder.cross_projections();
+    let scores = window.align(&tokens, &heads, frames)?;
+    assert_eq!(decoder.cross_projections(), projected);
+    assert_eq!(
+        (
+            scores.heads,
+            scores.tokens,
+            scores.frames,
+            scores.values.len()
+        ),
+        (2, 6, 2, 2 * 6 * 2)
+    );
+
+    let encoder: Vec<f64> = encoder.into_iter().map(f64::from).collect();
+    let expected = tiny_block_0_cross_scores(&tokens, &encoder, 1);
+    for (token, row) in expected.iter().enumerate() {
+        for (other, other_row) in expected.iter().enumerate().skip(token + 1) {
+            let apart = row
+                .iter()
+                .zip(other_row)
+                .take(frames)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f64::max);
+            assert!(
+                apart > 10.0 * BOUND,
+                "the expected rows of tokens {token} and {other} are {apart} apart"
+            );
+        }
+        for (frame, value) in row.iter().take(frames).enumerate() {
+            let found = f64::from(scores.values[token * frames + frame]);
+            assert!(
+                (found - value).abs() < BOUND,
+                "token {token}, frame {frame}: {found} against {value}"
+            );
+        }
+    }
+
+    let pick = |row: &[f32]| Ok(first_largest(row));
+    let after = window.decode(&prefix, 4, &filters, pick)?;
+    let (_, twin) = decoder.open_window(&encoder_out, Device::Cpu)?;
+    let plain = twin.decode(&prefix, 4, &filters, pick)?;
+    assert_eq!(after.tokens, plain.tokens);
+    Ok(())
+}
+
+/// Alignment scores of another count than heads x tokens x frames are an
+/// error, never filled.
+#[test]
+fn alignment_scores_of_the_wrong_count_are_an_error() {
+    assert!(super::HeadScores::new(2, 3, 4, vec![0.0; 24]).is_ok());
+    for len in [23, 25, 0] {
+        let error = super::HeadScores::new(2, 3, 4, vec![0.0; len]).map(|_| ());
+        assert!(
+            matches!(&error, Err(WhisperError::Mlx(message)) if message.contains("2 heads x 3 tokens x 4 frames = 24")),
+            "{len}: {error:?}"
+        );
+    }
 }

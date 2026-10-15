@@ -82,3 +82,25 @@ async fn the_file_buffer_leaves_out_the_names_before_it() {
         fields.audio_bytes.capacity()
     );
 }
+
+/// `prompt` is read whole, not cut like the fields that are only logged: a
+/// 1 MiB value reaches the engine, and the buffer of the file after it is not
+/// sized from those bytes.
+#[tokio::test]
+async fn the_prompt_is_read_whole() {
+    let fields = parsed(form_before_file("prompt", &vec![b'p'; 1 << 20])).await;
+    assert_eq!(fields.prompt.len(), 1 << 20);
+    assert_eq!(fields.audio_bytes, b"RIFF");
+    assert!(
+        fields.audio_bytes.capacity() < 4096,
+        "a {} B buffer",
+        fields.audio_bytes.capacity()
+    );
+}
+
+/// A form with no `prompt` has an empty one.
+#[tokio::test]
+async fn a_form_with_no_prompt_has_an_empty_one() {
+    let fields = parsed(form_before_file("model", b"whisper-1")).await;
+    assert_eq!(fields.prompt, "");
+}

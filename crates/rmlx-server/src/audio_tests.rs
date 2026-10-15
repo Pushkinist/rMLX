@@ -14,11 +14,13 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
 use rmlx_audio::tokenizer::WhisperTask;
-use rmlx_audio::transcribe::{Segment, Transcription};
+use rmlx_audio::transcribe::{render, OutputFormat, Segment, Transcription, Word};
 use rmlx_audio::wav::WavError;
 
 use super::form::ResponseFormat;
-use super::{build_response, cut, job_answer, job_refusal, refused, run_admitted, JobError};
+use super::{
+    build_response, cut, job_answer, job_refusal, prompt_error, refused, run_admitted, JobError,
+};
 use crate::engine::tests::{admitted, gpu_queue, report, wait_for_flag, REPORT_WAIT};
 
 /// A request that is gone while its upload decodes: `decode_upload` under
@@ -114,7 +116,9 @@ fn two_segments() -> Transcription {
                 text: "The first sentence.".to_owned(),
                 tokens: vec![50_365, 440, 700, 13, 50_490],
                 temperature: 0.0,
+                avg_logprob: -0.25,
                 compression_ratio: 0.9,
+                no_speech_prob: 0.03,
             },
             Segment {
                 seek: 3_000,
@@ -123,16 +127,44 @@ fn two_segments() -> Transcription {
                 text: "The second one.".to_owned(),
                 tokens: vec![50_490, 440, 1_150, 13, 50_617],
                 temperature: 0.5,
+                avg_logprob: -0.75,
                 compression_ratio: 1.1,
+                no_speech_prob: 0.125,
             },
         ],
         language: "english".to_owned(),
         duration: 5.04,
+        words: None,
+    }
+}
+
+/// [`two_segments`] with the words of a request for word times.
+fn two_segments_with_words() -> Transcription {
+    let word = |word: &str, start: f32, end: f32, segment: usize| Word {
+        word: word.to_owned(),
+        start,
+        end,
+        segment,
+    };
+    Transcription {
+        words: Some(vec![
+            word(" The", 0.0, 0.32, 0),
+            word(" first", 0.32, 0.9, 0),
+            word(" sentence.", 0.9, 2.5, 0),
+            word(" The", 2.5, 2.88, 1),
+            word(" second", 2.88, 3.4, 1),
+            word(" one.", 3.4, 5.04, 1),
+        ]),
+        ..two_segments()
     }
 }
 
 async fn body_of(format: ResponseFormat) -> String {
-    let response = build_response(&two_segments(), WhisperTask::Transcribe, format);
+    body_of_transcription(&two_segments(), format).await
+}
+
+async fn body_of_transcription(transcription: &Transcription, format: ResponseFormat) -> String {
+    let response = build_response(transcription, WhisperTask::Transcribe, format);
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("the body reads");
@@ -161,14 +193,14 @@ async fn the_plain_formats_answer_unchanged_bytes() {
     }
 }
 
-/// A `verbose_json` segment holds the keys of the OpenAI
-/// `TranscriptionSegment` schema that a segment of the engine holds, each with
-/// a value of the schema's type, and leaves out the two that no segment holds
-/// (`avg_logprob`, `no_speech_prob`). A `null` would make a typed client throw
-/// (openai-dotnet reads them with `GetSingle`). The temperature is that of the
-/// segment, not a constant.
+/// A `verbose_json` segment holds the ten keys of the OpenAI
+/// `TranscriptionSegment` schema, each with the value of the engine's segment
+/// and the type of the schema. A `null` would make a typed client throw
+/// (openai-dotnet reads them with `GetSingle`). The temperature, the average
+/// log-probability and the no-speech probability are those of the segment, not
+/// constants.
 #[tokio::test]
-async fn verbose_json_segments_carry_the_computed_openai_keys() {
+async fn verbose_json_segments_carry_the_ten_openai_keys() {
     let body: serde_json::Value =
         serde_json::from_str(&body_of(ResponseFormat::VerboseJson).await).expect("JSON");
     assert_eq!(body["task"], "transcribe");
@@ -188,9 +220,11 @@ async fn verbose_json_segments_carry_the_computed_openai_keys() {
     assert_eq!(
         keys,
         [
+            "avg_logprob",
             "compression_ratio",
             "end",
             "id",
+            "no_speech_prob",
             "seek",
             "start",
             "temperature",
@@ -203,12 +237,90 @@ async fn verbose_json_segments_carry_the_computed_openai_keys() {
     assert_eq!(segment["end"], 5.04);
     assert_eq!(segment["text"], "The second one.");
     assert_eq!(segment["temperature"], 0.5);
+    assert_eq!(segment["avg_logprob"], -0.75);
     assert_eq!(segment["seek"], 3_000);
     assert_eq!(segment["compression_ratio"], 1.1);
+    assert_eq!(segment["no_speech_prob"], 0.125);
     assert_eq!(
         segment["tokens"],
         serde_json::json!([50_490, 440, 1_150, 13, 50_617])
     );
+}
+
+/// `rmlx transcribe --format json` writes the segments that the route writes
+/// in `verbose_json`, key for key and value for value: one producer builds
+/// both.
+#[tokio::test]
+async fn the_cli_json_segments_are_the_verbose_json_segments() {
+    let transcription = two_segments();
+    let cli: serde_json::Value =
+        serde_json::from_str(&render(&transcription, OutputFormat::Json).expect("renders"))
+            .expect("JSON");
+    let route: serde_json::Value =
+        serde_json::from_str(&body_of(ResponseFormat::VerboseJson).await).expect("JSON");
+    assert_eq!(cli["segments"], route["segments"]);
+}
+
+/// A `verbose_json` reply with no request for word times has the five keys
+/// it had before word times were read: no `words`.
+#[tokio::test]
+async fn verbose_json_without_words_has_no_words_key() {
+    let body: serde_json::Value =
+        serde_json::from_str(&body_of(ResponseFormat::VerboseJson).await).expect("JSON");
+    let mut keys: Vec<&str> = body
+        .as_object()
+        .expect("the reply is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["duration", "language", "segments", "task", "text"]);
+}
+
+/// A `verbose_json` reply with word times holds a top-level `words` array
+/// beside `segments`. Each word has the three keys of the OpenAI
+/// `TranscriptionWord` schema, and its text has no leading space.
+#[tokio::test]
+async fn verbose_json_with_words_holds_the_words_beside_the_segments() {
+    let body: serde_json::Value = serde_json::from_str(
+        &body_of_transcription(&two_segments_with_words(), ResponseFormat::VerboseJson).await,
+    )
+    .expect("JSON");
+    assert_eq!(body["segments"].as_array().expect("segments").len(), 2);
+    let words = body["words"].as_array().expect("words");
+    let texts: Vec<&str> = words.iter().filter_map(|w| w["word"].as_str()).collect();
+    assert_eq!(
+        texts,
+        ["The", "first", "sentence.", "The", "second", "one."]
+    );
+    for word in words {
+        let mut keys: Vec<&str> = word
+            .as_object()
+            .expect("a word is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["end", "start", "word"]);
+    }
+    assert_eq!(words[1]["start"], 0.32);
+    assert_eq!(words[5]["end"], 5.04);
+}
+
+/// `rmlx transcribe --format json` writes the words that the route writes in
+/// `verbose_json`: one producer builds both.
+#[tokio::test]
+async fn the_cli_json_words_are_the_verbose_json_words() {
+    let transcription = two_segments_with_words();
+    let cli: serde_json::Value =
+        serde_json::from_str(&render(&transcription, OutputFormat::Json).expect("renders"))
+            .expect("JSON");
+    let route: serde_json::Value = serde_json::from_str(
+        &body_of_transcription(&transcription, ResponseFormat::VerboseJson).await,
+    )
+    .expect("JSON");
+    assert_eq!(cli["words"], route["words"]);
+    assert!(cli["words"].is_array());
 }
 
 /// Each job failure and its answer: the file is the client's (422); a load,
@@ -261,6 +373,47 @@ fn each_job_failure_has_its_status_and_retry() {
         assert_eq!(refusal.permanent, permanent, "{error:?}");
         assert!(refusal.message.starts_with(prefix), "{refusal:?}");
     }
+}
+
+/// The text of a special token in the prompt is the client's fault: 422 naming
+/// the field. Any other failure of the tokenizer on the prompt is the server's:
+/// 503, as for each other tokenizer failure.
+#[test]
+fn only_special_token_text_in_a_prompt_is_a_422() {
+    use axum::http::StatusCode;
+    use rmlx_audio::tokenizer::TokenizerError;
+
+    let refusal = job_refusal(&prompt_error(TokenizerError::SpecialTokenText));
+    assert_eq!(refusal.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(refusal.param.as_deref(), Some("prompt"));
+    assert!(!refusal.permanent);
+    assert!(
+        refusal.message.starts_with("invalid prompt: "),
+        "{refusal:?}"
+    );
+
+    let refusal = job_refusal(&prompt_error(TokenizerError::Encode("gone".to_owned())));
+    assert_eq!(refusal.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(refusal.param, None);
+    assert!(refusal.message.starts_with("tokenizer: "), "{refusal:?}");
+}
+
+/// A request for word times on a model with no alignment heads is the
+/// client's fault: 422 naming `timestamp_granularities`, with a message that
+/// says why, and no retry header.
+#[test]
+fn words_from_a_model_with_no_alignment_heads_are_a_422() {
+    use axum::http::StatusCode;
+    use rmlx_audio::whisper::WhisperError;
+
+    let refusal = job_refusal(&JobError::Transcribe(WhisperError::NoAlignmentHeads));
+    assert_eq!(refusal.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(refusal.param.as_deref(), Some("timestamp_granularities"));
+    assert!(!refusal.permanent);
+    assert!(
+        refusal.message.contains("no alignment heads"),
+        "{refusal:?}"
+    );
 }
 
 /// A permanent refusal carries `x-should-retry: false`; another carries no
