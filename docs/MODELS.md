@@ -624,9 +624,10 @@ large-v3, large-v3-turbo and distil-large-v3 (`n_vocab` 51866). tiny, base,
 small, medium, large-v1, large-v2 (51865) and the `.en` models (51864) are
 refused at `config.json`, and their tokenizers at `tokenizer.json`, because
 their special-token ids differ. `docs/AUDIO.md` § "Supported variants" has
-the rule and the error text. `mlx-community/whisper-large-v3-turbo` ships
-`weights.safetensors`, which the loader does not read; a snapshot with
-`weights.npz` (for example `mlx-community/whisper-turbo`) is needed.
+the rule and the error text. The loader reads `weights.safetensors` when the
+snapshot has it (`mlx-community/whisper-large-v3-turbo`), else `weights.npz`
+(`mlx-community/whisper-large-v3-mlx`). A quantized snapshot (a `quantization`
+key in `config.json`) is refused at load.
 
 **Model.** Encoder: two Conv1d stems (the second at stride 2), sinusoidal
 positions, attention blocks, a final LayerNorm. Decoder: token and learned

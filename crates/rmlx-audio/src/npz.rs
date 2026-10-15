@@ -703,7 +703,7 @@ fn dtype_of(code: &str) -> Option<Dtype> {
 
 /// Little-endian int64 `bytes` as little-endian int32. The error is the first
 /// value that int32 cannot hold.
-fn int64_to_i32_bytes(bytes: &[u8]) -> Result<Vec<u8>, i64> {
+pub(crate) fn int64_to_i32_bytes(bytes: &[u8]) -> Result<Vec<u8>, i64> {
     let mut narrowed = Vec::with_capacity(bytes.len() / 2);
     for chunk in bytes.chunks_exact(8) {
         let mut word = [0_u8; 8];
@@ -763,4 +763,4 @@ fn u64_le(b: &[u8]) -> u64 {
 
 #[cfg(test)]
 #[path = "npz_tests.rs"]
-mod npz_tests;
+pub(crate) mod npz_tests;

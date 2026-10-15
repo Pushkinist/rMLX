@@ -40,8 +40,9 @@
 //!    `a_window_that_needs_a_fallback_is_decoded_again_and_repeats` holds the
 //!    temperature fallback: a spoken repetition is decoded again above
 //!    temperature 0, and a second run gives the same tokens.
-//!    `the_large_v3_load_holds_ten_alignment_heads` holds that a load keeps the
-//!    ten alignment heads of the snapshot.
+//!    `say_clip_deterministic` and `say_clip_turbo_deterministic` also hold that
+//!    a load keeps the alignment heads of the snapshot (ten for large-v3, six
+//!    for large-v3-turbo, which ships `weights.safetensors`).
 //!
 //! 2. `long_form_regression` — scans the gitignored fixtures dir
 //!    (`crates/rmlx-audio/tests/fixtures/`) for any `*.{m4a,wav,mp3,…}` paired
@@ -83,6 +84,7 @@ use rmlx_mlx::Device;
 // ── Snapshot resolution ─────────────────────────────────────────────────────
 
 const WHISPER_SLUG: &str = "mlx-community__whisper-large-v3-mlx";
+const TURBO_SLUG: &str = "mlx-community__whisper-large-v3-turbo";
 const TOKENIZER_SLUG: &str = "openai__whisper-large-v3-tokenizer";
 
 fn models_root() -> Option<PathBuf> {
@@ -91,9 +93,9 @@ fn models_root() -> Option<PathBuf> {
     pb.exists().then_some(pb)
 }
 
-fn whisper_paths() -> Option<(PathBuf, PathBuf)> {
+fn snapshot_paths(slug: &str) -> Option<(PathBuf, PathBuf)> {
     let root = models_root()?;
-    let model = root.join(WHISPER_SLUG);
+    let model = root.join(slug);
     let tok = root.join(TOKENIZER_SLUG);
     if model.join("config.json").exists() && tok.join("tokenizer.json").exists() {
         Some((model, tok))
@@ -103,7 +105,7 @@ fn whisper_paths() -> Option<(PathBuf, PathBuf)> {
 }
 
 fn load_transcriber() -> Option<Transcriber> {
-    let (model_path, tok_path) = whisper_paths()?;
+    let (model_path, tok_path) = snapshot_paths(WHISPER_SLUG)?;
     let model = WhisperModel::load(&model_path).expect("load whisper model");
     let tokenizer = WhisperTokenizer::from_path(&tok_path).expect("load tokenizer");
     Some(Transcriber::new(Arc::new(model), Arc::new(tokenizer)).expect("transcriber"))
@@ -325,23 +327,41 @@ fn a_voice_that_is_not_installed_gives_no_clip() {
     }
 }
 
-/// Portable smoke: a known `say` sentence transcribes correctly and is
-/// deterministic across two runs at temp=0.
-#[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test say_clip -- --ignored --test-threads=1"]
-fn say_clip_deterministic() {
-    let Some(t) = load_transcriber() else {
-        eprintln!("SKIP say_clip_deterministic: whisper snapshot not present");
-        return;
-    };
-    let sentence = "The quick brown fox jumps over the lazy dog.";
-    let Some(wav) = synth_say_clip(sentence) else {
-        eprintln!("SKIP say_clip_deterministic: say, its voice or ffmpeg unavailable");
-        return;
-    };
+const SAY_SENTENCE: &str = "The quick brown fox jumps over the lazy dog.";
 
-    let r1 = transcribe_file(&t, &wav, "en");
-    let r2 = transcribe_file(&t, &wav, "en");
+/// The (layer, head) pairs of the `alignment_heads` entry of the large-v3 snapshot.
+const LARGE_V3_ALIGNMENT_HEADS: [(usize, usize); 10] = [
+    (7, 0),
+    (10, 17),
+    (12, 18),
+    (13, 12),
+    (16, 1),
+    (17, 14),
+    (19, 11),
+    (21, 4),
+    (24, 1),
+    (25, 6),
+];
+
+/// The same of the large-v3-turbo snapshot, which ships `weights.safetensors`.
+const TURBO_ALIGNMENT_HEADS: [(usize, usize); 6] =
+    [(2, 4), (2, 11), (3, 3), (3, 6), (3, 11), (3, 14)];
+
+/// The load of a snapshot holds the alignment heads of its entry, and the
+/// loaded model transcribes the spoken `wav` of [`SAY_SENTENCE`] word for word,
+/// with the same text on a second run at temp=0.
+fn check_heads_and_say_clip(
+    (model_path, tok_path): (PathBuf, PathBuf),
+    wav: &Path,
+    alignment_heads: &[(usize, usize)],
+) {
+    let model = WhisperModel::load(&model_path).expect("load whisper model");
+    assert_eq!(model.alignment_heads(), Some(alignment_heads));
+    let tokenizer = WhisperTokenizer::from_path(&tok_path).expect("load tokenizer");
+    let t = Transcriber::new(Arc::new(model), Arc::new(tokenizer)).expect("transcriber");
+
+    let r1 = transcribe_file(&t, wav, "en");
+    let r2 = transcribe_file(&t, wav, "en");
 
     assert_eq!(
         r1.language, "english",
@@ -354,13 +374,46 @@ fn say_clip_deterministic() {
         r1.text, r2.text
     );
 
-    let reference = normalize(sentence);
+    let reference = normalize(SAY_SENTENCE);
     let hyp = normalize(&r1.text);
     let w = wer(&reference, &hyp);
     println!("say-clip text: {:?}  WER={w:.3}", r1.text);
     // The clip is one short sentence: any extra word, such as filler after the
     // speech, fails.
     assert_eq!(w, 0.0, "say-clip WER {w:.3} above 0; got {:?}", r1.text);
+}
+
+/// Portable smoke on large-v3: a known `say` sentence transcribes correctly and
+/// is deterministic across two runs at temp=0, and the load holds the ten
+/// alignment heads of the snapshot.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test say_clip -- --ignored --test-threads=1"]
+fn say_clip_deterministic() {
+    let Some(snapshot) = snapshot_paths(WHISPER_SLUG) else {
+        eprintln!("SKIP say_clip_deterministic: whisper snapshot not present");
+        return;
+    };
+    let Some(wav) = synth_say_clip(SAY_SENTENCE) else {
+        eprintln!("SKIP say_clip_deterministic: say, its voice or ffmpeg unavailable");
+        return;
+    };
+    check_heads_and_say_clip(snapshot, &wav, &LARGE_V3_ALIGNMENT_HEADS);
+}
+
+/// The same on large-v3-turbo, which ships `weights.safetensors`: the load
+/// holds its six alignment heads and the model transcribes the clip.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test say_clip_turbo -- --ignored --test-threads=1"]
+fn say_clip_turbo_deterministic() {
+    let Some(snapshot) = snapshot_paths(TURBO_SLUG) else {
+        eprintln!("SKIP say_clip_turbo_deterministic: turbo snapshot not present");
+        return;
+    };
+    let Some(wav) = synth_say_clip(SAY_SENTENCE) else {
+        eprintln!("SKIP say_clip_turbo_deterministic: say, its voice or ffmpeg unavailable");
+        return;
+    };
+    check_heads_and_say_clip(snapshot, &wav, &TURBO_ALIGNMENT_HEADS);
 }
 
 /// Two spoken sentences in a 5.4 s clip are two segments and one pass over the
@@ -395,38 +448,6 @@ fn two_sentence_clip_is_two_segments() {
         "filler after the speech: {:?}",
         r.text
     );
-}
-
-/// The (layer, head) pairs of the `alignment_heads` entry of the large-v3 snapshot.
-const LARGE_V3_ALIGNMENT_HEADS: [(usize, usize); 10] = [
-    (7, 0),
-    (10, 17),
-    (12, 18),
-    (13, 12),
-    (16, 1),
-    (17, 14),
-    (19, 11),
-    (21, 4),
-    (24, 1),
-    (25, 6),
-];
-
-/// A load of the large-v3 snapshot holds the ten alignment heads of its entry.
-#[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test the_large_v3_load_holds_ten_alignment_heads -- --ignored --test-threads=1"]
-fn the_large_v3_load_holds_ten_alignment_heads() {
-    let Some((model_path, _)) = whisper_paths() else {
-        eprintln!("SKIP the_large_v3_load_holds_ten_alignment_heads: whisper snapshot not present");
-        return;
-    };
-    let model = WhisperModel::load(&model_path).expect("load whisper model");
-
-    assert_eq!(model.alignment_heads(), Some(&LARGE_V3_ALIGNMENT_HEADS[..]));
-
-    // The encode puts this test under the GPU gate: a CPU test would load the
-    // snapshot in every `make test`. Its output is not what the test checks.
-    let window = vec![vec![0.0_f32; model.cfg.n_mels]; 3000];
-    model.encode_mel(&window, Device::Gpu).expect("encode");
 }
 
 /// One full window of digital silence gives no segment and no text. The

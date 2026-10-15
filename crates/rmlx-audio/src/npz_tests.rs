@@ -423,7 +423,7 @@ fn truncated_eocd_returns_error() {
 const PAIRS: [(i64, i64); 4] = [(1, 0), (2, 3), (5, 7), (9, 11)];
 
 /// An NPY v1.0 file of `descr`, `shape` (as written in the header) and `payload`.
-fn npy_bytes(descr: &str, shape: &str, payload: &[u8]) -> Vec<u8> {
+pub(crate) fn npy_bytes(descr: &str, shape: &str, payload: &[u8]) -> Vec<u8> {
     npy_bytes_with_order(descr, "False", shape, payload)
 }
 
@@ -669,7 +669,7 @@ fn offsets_and_sizes_that_overflow_are_errors() {
 
 /// A ZIP32 archive of stored members, in order. A member whose name ends in `/`
 /// is a directory member and holds no data.
-fn build_zip32_members(members: &[(&str, &[u8])]) -> Vec<u8> {
+pub(crate) fn build_zip32_members(members: &[(&str, &[u8])]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut offsets = Vec::new();
     for (name, data) in members {

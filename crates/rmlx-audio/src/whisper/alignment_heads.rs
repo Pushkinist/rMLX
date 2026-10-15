@@ -1,7 +1,8 @@
-//! The `alignment_heads` entry of `weights.npz`: the decoder cross-attention
+//! The `alignment_heads` entry of the weight file: the decoder cross-attention
 //! heads whose weights line up text tokens with audio frames, as integer
-//! (layer, head) pairs of shape `(N, 2)`. The large-v3 snapshot stores them as
-//! `<i8`, which the npy reader gives as `I32`.
+//! (layer, head) pairs of shape `(N, 2)`. A snapshot stores them as int64
+//! (`<i8` in `weights.npz`, `I64` in `weights.safetensors`), which both readers
+//! give as `I32`.
 //!
 //! Nothing reads the heads yet, so an entry in another form, or with a pair
 //! outside the decoder, gives one warning and no heads, and the load goes on.

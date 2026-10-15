@@ -369,6 +369,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   except a row of a `/v1/messages` stream whose `stop_sequences` matched:
   that row is the number of steps up to the match, lower than the generated
   count (`METRICS_SCHEMA.md` lists the predicate).
+- **A Whisper snapshot with `weights.safetensors` loads.** The loader read
+  `weights.npz` only, so `mlx-community/whisper-large-v3-turbo` failed to load
+  with a missing-file error. It now reads `weights.safetensors` when the
+  directory has it, else `weights.npz`, and the `alignment_heads` entry (int64
+  in both files) reaches the same accessor. With neither file the error names
+  both file names. A quantized Whisper snapshot (a `quantization` key in
+  `config.json`) loaded without error and failed in the first matmul; the load
+  now refuses it and names the key.
 
 ## [0.4.3] - 2026-10-09
 

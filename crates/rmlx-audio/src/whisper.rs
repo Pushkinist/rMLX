@@ -14,9 +14,9 @@
 //!   "n_text_head": 20, "n_text_layer": 32 }
 //! ```
 //!
-//! ## Weight layout (`weights.npz`)
+//! ## Weight layout (`weights.safetensors` or `weights.npz`)
 //!
-//! Keys follow the mlx-community naming convention:
+//! Tensor names follow the mlx-community naming convention:
 //! - `encoder.conv1.{weight,bias}` — Conv1d stem (k=3, stride=1, pad=1)
 //! - `encoder.conv2.{weight,bias}` — Conv1d stem (k=3, stride=2, pad=1)
 //! - `encoder.blocks.N.attn.{query,key,value,out}.{weight,bias}` — MHA
@@ -33,9 +33,8 @@
 //!
 //! ## Conv1d weight layout
 //!
-//! The `.npz` stores Conv1d weights as `[out_channels, kernel, in_channels]`.
-//! MLX `conv1d` expects `[out, in, kernel]`. We transpose on load:
-//! `(out, k, in) → (out, in, k)`.
+//! The weight file stores Conv1d weights as `[out, kernel, in]`, the layout MLX
+//! `conv1d` reads. The load does not transpose them.
 //!
 //! ## Positional embedding
 //!
@@ -67,6 +66,7 @@ use crate::npz::WeightMap;
 use crate::tokenizer::{N_VOCAB, TOK_EOT, TOK_NO_TIMESTAMPS, TOK_TIMESTAMP_BEGIN};
 use alignment_heads::read_alignment_heads;
 use decode_loop::{decode_loop, window_start, writes_at_most, Decoded, WindowStart};
+use weight_file::load_weights;
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
@@ -99,6 +99,10 @@ pub enum WhisperError {
         /// The value the decode supports.
         expected: usize,
     },
+    /// `config.json` has a `quantization` key: the weights are packed, and the
+    /// decode reads them as plain matrices.
+    #[error("config.json: the key `quantization` is set, and the decode does not support a quantized snapshot")]
+    QuantizedSnapshot,
     /// The requested language is not one Whisper knows.
     #[error(
         "unknown language '{0}'; use a Whisper language code, an English language name or 'auto'"
@@ -152,11 +156,23 @@ pub struct WhisperConfig {
     pub n_text_layer: usize,
 }
 
+/// The `quantization` key of `config.json`, whatever it holds.
+#[derive(serde::Deserialize)]
+struct QuantizationKey {
+    quantization: Option<serde::de::IgnoredAny>,
+}
+
 impl WhisperConfig {
-    /// Load from a JSON string. Refuse an `n_vocab` other than [`N_VOCAB`] and
-    /// an `n_audio_ctx` other than the encoder positions of one 30 s window.
+    /// Load from a JSON string. Refuse an `n_vocab` other than [`N_VOCAB`], an
+    /// `n_audio_ctx` other than the encoder positions of one 30 s window, and a
+    /// `quantization` key.
     pub fn from_json(s: &str) -> Result<Self, WhisperError> {
         let cfg: Self = serde_json::from_str(s).map_err(|e| WhisperError::Config(e.to_string()))?;
+        let quantization: QuantizationKey =
+            serde_json::from_str(s).map_err(|e| WhisperError::Config(e.to_string()))?;
+        if quantization.quantization.is_some() {
+            return Err(WhisperError::QuantizedSnapshot);
+        }
         // The encoder's second conv has stride 2: two mel frames per position.
         let supported = [
             ("n_vocab", cfg.n_vocab, N_VOCAB),
@@ -177,12 +193,9 @@ impl WhisperConfig {
 
 // ── Weight map ────────────────────────────────────────────────────────────────
 
-/// The weight file of a Whisper snapshot.
-const WEIGHTS_FILE: &str = "weights.npz";
-
 /// Load all weights from a `.npz` file into a weight map.
 ///
-/// Whisper snapshots from mlx-community ship as `weights.npz` (NumPy
+/// Older Whisper snapshots from mlx-community ship as `weights.npz` (NumPy
 /// compressed array archive = ZIP of `.npy` entries). ZIP64 archives
 /// (≥ 4 GiB, as produced by the large-v3 snapshot) are fully supported via
 /// the central-directory parser in `crate::npz`. An error names the file, not
@@ -918,7 +931,8 @@ impl WhisperModel {
 
     /// Load a Whisper model from a snapshot directory.
     ///
-    /// Expects `config.json` and `weights.npz` in the directory. A config that
+    /// Expects `config.json` and `weights.safetensors` or `weights.npz` in the
+    /// directory; `weights.safetensors` is read when both exist. A config that
     /// [`WhisperConfig::from_json`] refuses is refused before the weights are read.
     ///
     /// `path` must be an operator-controlled, validated absolute path. It is
@@ -938,10 +952,7 @@ impl WhisperModel {
             n_vocab = cfg.n_vocab,
             "loading Whisper"
         );
-        let weights_path = path.join(WEIGHTS_FILE);
-        let weights_size = std::fs::metadata(&weights_path).map_or(0, |m| m.len());
-        tracing::debug!(stage = "weights", path = %weights_path.display(), bytes = weights_size, "loading Whisper weights.npz");
-        let weights = load_npz(&weights_path)?;
+        let weights = load_weights(path)?;
 
         let encoder = AudioEncoder::load(&weights, &cfg)?;
         let decoder = TextDecoder::load(&weights, &cfg)?;
@@ -1163,6 +1174,11 @@ fn logits_to_f32(logits: &Array, n_vocab: usize, device: Device) -> Result<Vec<f
 pub(crate) mod decode_loop;
 
 mod alignment_heads;
+
+mod weight_file;
+
+#[cfg(test)]
+mod snapshot_fixture;
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

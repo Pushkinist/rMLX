@@ -9,8 +9,12 @@ admission, cancel and model cache, and the speech route, are in
 
 ### Model
 
-`WhisperModel::load` reads `config.json` and `weights.npz` from an
-`mlx-community` Whisper snapshot (`crates/rmlx-audio/src/whisper.rs`). Every
+`WhisperModel::load` reads `config.json` and the weight file from an
+`mlx-community` Whisper snapshot (`crates/rmlx-audio/src/whisper.rs`). The weight
+file is `weights.safetensors` when the directory has it, else `weights.npz`; with
+neither, the error names both files. A safetensors tensor of another
+dtype than F16, BF16, F32, U8, I8, BOOL, U32, I32 or I64 is refused, and the
+error names the tensor. Every
 dimension comes from `config.json`. The mel filterbank matches its `n_mels`:
 80 or 128. The special-token ids are large-v3's (see "Token ids").
 
@@ -33,7 +37,9 @@ ids from `tokenizer.json` would let them load; that is not built.
 
 - `WhisperConfig::from_json` refuses an `n_vocab` other than 51866 and an
   `n_audio_ctx` other than 1500 (the encoder positions of one 30 s window).
-  `WhisperModel::load` refuses before it reads `weights.npz`.
+  `WhisperModel::load` refuses before it reads the weight file. It also
+  refuses a `quantization` key: a quantized snapshot stores packed weights,
+  and the decode does not unpack them.
 - `WhisperTokenizer::from_path` refuses a `tokenizer.json` in which one of the
   1609 special tokens (end of text, start of transcript, the 100 languages,
   the task and control tokens, the 1501 timestamps) is absent or has another
@@ -44,10 +50,10 @@ ids from `tokenizer.json` would let them load; that is not built.
 The check reads ids and sizes only. A model or a tokenizer that states the
 large-v3 ids but was trained on another vocabulary is not detected.
 
-**Alignment heads.** The `alignment_heads` entry of `weights.npz` names the
+**Alignment heads.** The `alignment_heads` entry of the weight file names the
 decoder cross-attention heads that line text tokens up with audio frames, as
-int32 or int64 (layer, head) pairs of shape `(N, 2)` (the large-v3 snapshot:
-`<i8`, shape `(10, 2)`). `WhisperModel::alignment_heads` gives the pairs. It
+int32 or int64 (layer, head) pairs of shape `(N, 2)` (the large-v3 `.npz`:
+`<i8`, shape `(10, 2)`; the turbo `.safetensors`: `I64`, shape `(6, 2)`). `WhisperModel::alignment_heads` gives the pairs. It
 gives `None` for a snapshot with no entry, and for an entry that the reader
 reads but that is not usable pairs: a dtype other than int32 or int64 (`<u4`,
 float, a one-byte mask), another shape, a negative value, or a layer or head
@@ -443,7 +449,7 @@ for 429 and `timeout` for 408.
 | 422 | A malformed form, more than 64 parts, no `file` or an empty one, a field value over 64 bytes, a refused field value, or a file the decoder refuses (`audio decode: …`, see "WAV I/O"). |
 | 408 | The request timeout expired (`docs/SERVER.md` § "Error responses"). |
 | 429 | The admission queue is full. |
-| 503 | The server's fault. With `x-should-retry: false`, which OpenAI's SDKs obey before their own retry of a 5xx: `--whisper-model-path` or `--whisper-tokenizer-path` is not set; the tokenizer, `config.json` or `weights.npz` does not load or is refused (see "Supported variants"); or the transcriber cannot be built on the loaded model (`transcriber init: …`). The body names the file and the fact, never a directory; the server log gives the path. On these routes, text that Whisper reports as an MLX error (it starts at `MLX op error:` or `MLX:`) is replaced by `MLX error; the server log has the cause`, because it can hold a path of the MLX install; the file or step before it stays. That covers mel extractor failures, an empty audio after processing and every engine error the audio crate converts, not only MLX ops. Without that header: an engine failure during the transcription (`transcribe: …`), which a retry may pass. |
+| 503 | The server's fault. With `x-should-retry: false`, which OpenAI's SDKs obey before their own retry of a 5xx: `--whisper-model-path` or `--whisper-tokenizer-path` is not set; the tokenizer, `config.json` or the weight file (`weights.safetensors` or `weights.npz`) does not load or is refused (see "Supported variants"); or the transcriber cannot be built on the loaded model (`transcriber init: …`). The body names the file and the fact, never a directory; the server log gives the path. On these routes, text that Whisper reports as an MLX error (it starts at `MLX op error:` or `MLX:`) is replaced by `MLX error; the server log has the cause`, because it can hold a path of the MLX install; the file or step before it stays. That covers mel extractor failures, an empty audio after processing and every engine error the audio crate converts, not only MLX ops. Without that header: an engine failure during the transcription (`transcribe: …`), which a retry may pass. |
 | 500 | The job panicked. |
 
 A file that loses audio under the limit for its length is not refused, and

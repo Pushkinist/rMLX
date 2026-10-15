@@ -19,12 +19,13 @@
 //! 1. Audio processing is a distinct subsystem with its own data types (PCM
 //!    samples, mel frames, Whisper token sequences) that do not appear in the
 //!    LLM text-generation path.
-//! 2. The Whisper model lifecycle (load from `.npz`, encode, decode loop) is
-//!    architecturally orthogonal to the chat-LLM `Generator` trait.
+//! 2. The Whisper model lifecycle (load from `.safetensors` or `.npz`, encode,
+//!    decode loop) is architecturally orthogonal to the chat-LLM `Generator` trait.
 //! 3. Audio models (TTS, VAD) share the same WAV I/O and mel primitives.
 //!
 //! - `npz`       — ZIP/NPZ central-directory parser with ZIP64 support.
-//!   Used by `whisper` to load `weights.npz` and by `tts` to load codec weights.
+//!   Used by `whisper` to load `weights.npz` or `weights.safetensors` and by
+//!   `tts` to load codec weights.
 //! - `tts`       — Qwen3-TTS synthesis pipeline.
 //!
 //! ## Out of scope (v1)

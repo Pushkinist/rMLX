@@ -3,6 +3,7 @@
 use super::read_alignment_heads;
 use crate::npz::WeightMap;
 use crate::test_events::fields_recorded_by;
+use crate::whisper::snapshot_fixture::config_json;
 use crate::whisper::WhisperConfig;
 use rmlx_mlx::{Array, Dtype};
 
@@ -13,22 +14,7 @@ const N_HEADS: usize = 20;
 const PAIRS: [(usize, usize); 3] = [(0, 0), (3, 19), (31, 1)];
 
 fn cfg() -> WhisperConfig {
-    WhisperConfig::from_json(
-        &serde_json::json!({
-            "n_mels": 128,
-            "n_audio_ctx": 1500,
-            "n_audio_state": 1280,
-            "n_audio_head": 20,
-            "n_audio_layer": 32,
-            "n_vocab": 51_866,
-            "n_text_ctx": 448,
-            "n_text_state": 1280,
-            "n_text_head": N_HEADS,
-            "n_text_layer": N_LAYERS,
-        })
-        .to_string(),
-    )
-    .unwrap()
+    WhisperConfig::from_json(&config_json(128, 51_866, 1500, N_LAYERS).to_string()).unwrap()
 }
 
 fn weights_with(entry: Array) -> WeightMap {

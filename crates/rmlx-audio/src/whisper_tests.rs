@@ -7,8 +7,9 @@
 //! absent — no bespoke env var. The tests here verify config parsing, NPZ
 //! parsing logic, and weight-map helpers.
 
+use super::snapshot_fixture::{config_json, decoder_tensors, tiny_config_json, weight_map};
 use super::{DecodeFilters, TextDecoder, WhisperConfig, WhisperError};
-use crate::npz::{extract_npy_shape, WeightMap};
+use crate::npz::extract_npy_shape;
 use crate::tokenizer::{
     N_VOCAB, TOK_EN, TOK_EOT, TOK_NO_TIMESTAMPS, TOK_SOT, TOK_TIMESTAMP_BEGIN, TOK_TRANSCRIBE,
 };
@@ -102,23 +103,6 @@ fn parse_config_large_v3() {
     assert_eq!(cfg.n_text_ctx, 448);
 }
 
-/// A `config.json` with the large-v3 sizes except the four given.
-fn config_json(n_mels: usize, n_vocab: usize, n_audio_ctx: usize, n_text_layer: usize) -> String {
-    serde_json::json!({
-        "n_mels": n_mels,
-        "n_audio_ctx": n_audio_ctx,
-        "n_audio_state": 1280,
-        "n_audio_head": 20,
-        "n_audio_layer": 32,
-        "n_vocab": n_vocab,
-        "n_text_ctx": 448,
-        "n_text_state": 1280,
-        "n_text_head": 20,
-        "n_text_layer": n_text_layer,
-    })
-    .to_string()
-}
-
 fn config_refusal(json: &str) -> String {
     let err = WhisperConfig::from_json(json)
         .expect_err("the config must be refused")
@@ -141,7 +125,7 @@ fn assert_names(err: &str, words: &[&str]) {
 #[test]
 fn the_large_v3_family_configs_load() {
     for n_text_layer in [32, 4, 2] {
-        WhisperConfig::from_json(&config_json(128, 51_866, 1500, n_text_layer))
+        WhisperConfig::from_json(&config_json(128, 51_866, 1500, n_text_layer).to_string())
             .unwrap_or_else(|e| panic!("n_text_layer {n_text_layer}: {e}"));
     }
 }
@@ -151,7 +135,7 @@ fn the_large_v3_family_configs_load() {
 #[test]
 fn a_config_of_another_vocabulary_is_refused_naming_n_vocab() {
     for n_vocab in [51_865, 51_864] {
-        let err = config_refusal(&config_json(80, n_vocab, 1500, 4));
+        let err = config_refusal(&config_json(80, n_vocab, 1500, 4).to_string());
         assert_names(&err, &["n_vocab", &n_vocab.to_string(), "51866"]);
     }
 }
@@ -160,13 +144,32 @@ fn a_config_of_another_vocabulary_is_refused_naming_n_vocab() {
 /// 1500 positions.
 #[test]
 fn an_audio_context_other_than_1500_is_refused() {
-    let err = config_refusal(&config_json(128, 51_866, 750, 32));
+    let err = config_refusal(&config_json(128, 51_866, 750, 32).to_string());
     assert_names(&err, &["n_audio_ctx", "750", "1500"]);
 }
 
-/// The refusal comes before `weights.npz` is read: a directory with a large-v2
-/// `config.json` and no weights fails on `n_vocab`, and one with a large-v3
-/// `config.json` and no weights fails on the weight file.
+/// A quantized snapshot stores packed weights that the load would read as
+/// plain matrices, and the first window would fail in a matmul: the load
+/// refuses the `quantization` key and names it.
+#[test]
+fn a_quantized_config_is_refused_naming_the_key() {
+    let mut config = config_json(128, 51_866, 1500, 4);
+    config["quantization"] = serde_json::json!({ "group_size": 64, "bits": 4 });
+    let err = config_refusal(&config.to_string());
+    assert_names(&err, &["quantization"]);
+}
+
+/// A `quantization` key of `null` states no quantization.
+#[test]
+fn a_null_quantization_key_loads() {
+    let mut config = config_json(128, 51_866, 1500, 4);
+    config["quantization"] = serde_json::Value::Null;
+    WhisperConfig::from_json(&config.to_string()).expect("a null key states no quantization");
+}
+
+/// The refusal comes before the weight file is read: a directory with a
+/// large-v2 or a quantized `config.json` and no weights fails on the config,
+/// and one with a large-v3 `config.json` and no weights fails on the weight file.
 #[test]
 fn load_refuses_the_config_before_it_reads_the_weights() {
     let dir = tempfile::tempdir().unwrap();
@@ -177,9 +180,12 @@ fn load_refuses_the_config_before_it_reads_the_weights() {
             Err(e) => e.to_string(),
         }
     };
-    let refused = load_error(config_json(80, 51_865, 1500, 32));
+    let refused = load_error(config_json(80, 51_865, 1500, 32).to_string());
     assert_names(&refused, &["config.json", "n_vocab", "51865"]);
-    let no_weights = load_error(config_json(128, 51_866, 1500, 32));
+    let mut quantized = config_json(128, 51_866, 1500, 32);
+    quantized["quantization"] = serde_json::json!({ "group_size": 64, "bits": 8 });
+    assert_names(&load_error(quantized.to_string()), &["quantization"]);
+    let no_weights = load_error(config_json(128, 51_866, 1500, 32).to_string());
     assert_names(&no_weights, &["weight file error"]);
 }
 
@@ -198,11 +204,11 @@ fn a_load_error_names_the_file_and_no_directory() {
     assert!(!no_config.contains(&path), "{no_config}");
     std::fs::write(
         dir.path().join("config.json"),
-        config_json(128, 51_866, 1500, 32),
+        config_json(128, 51_866, 1500, 32).to_string(),
     )
     .unwrap();
     let no_weights = load_error();
-    assert_names(&no_weights, &["weights.npz", "No such file"]);
+    assert_names(&no_weights, &["weights.safetensors", "weights.npz"]);
     assert!(!no_weights.contains(&path), "{no_weights}");
 }
 
@@ -282,52 +288,8 @@ fn values(shape: &[i32], seed: u32) -> Result<Array, WhisperError> {
 /// A text decoder of two blocks with a state of four, the large-v3 vocabulary
 /// and a context of 16 positions.
 fn tiny_decoder() -> Result<TextDecoder, WhisperError> {
-    let state = TINY_STATE as i32;
-    let mut map = WeightMap::new();
-    let mut seed = 0;
-    let mut put = |key: String, shape: &[i32]| -> Result<(), WhisperError> {
-        seed += 1;
-        map.insert(key, values(shape, seed)?);
-        Ok(())
-    };
-    put(
-        "decoder.token_embedding.weight".to_owned(),
-        &[N_VOCAB as i32, state],
-    )?;
-    put("decoder.positional_embedding".to_owned(), &[16, state])?;
-    for norm in ["decoder.ln.weight", "decoder.ln.bias"] {
-        put(norm.to_owned(), &[state])?;
-    }
-    for block in 0..TINY_BLOCKS {
-        let prefix = format!("decoder.blocks.{block}");
-        for attention in ["attn", "cross_attn"] {
-            for linear in ["query", "key", "value", "out"] {
-                put(
-                    format!("{prefix}.{attention}.{linear}.weight"),
-                    &[state, state],
-                )?;
-            }
-        }
-        for norm in ["attn_ln", "cross_attn_ln", "mlp_ln"] {
-            put(format!("{prefix}.{norm}.weight"), &[state])?;
-            put(format!("{prefix}.{norm}.bias"), &[state])?;
-        }
-        put(format!("{prefix}.mlp1.weight"), &[8, state])?;
-        put(format!("{prefix}.mlp2.weight"), &[state, 8])?;
-    }
-    let cfg = WhisperConfig {
-        n_mels: 128,
-        n_audio_ctx: 1500,
-        n_audio_state: TINY_STATE,
-        n_audio_head: 2,
-        n_audio_layer: 0,
-        n_vocab: N_VOCAB,
-        n_text_ctx: 16,
-        n_text_state: TINY_STATE,
-        n_text_head: 2,
-        n_text_layer: TINY_BLOCKS,
-    };
-    TextDecoder::load(&map, &cfg)
+    let cfg = WhisperConfig::from_json(&tiny_config_json(0, TINY_BLOCKS).to_string())?;
+    TextDecoder::load(&weight_map(&decoder_tensors(TINY_BLOCKS)), &cfg)
 }
 
 fn first_largest(row: &[f32]) -> u32 {
