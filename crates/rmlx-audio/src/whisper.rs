@@ -61,7 +61,7 @@ use rmlx_mlx::{
 use thiserror::Error;
 use tracing::{debug, info, instrument, warn};
 
-use crate::mel::N_FRAMES;
+use crate::mel::{check_n_mels, supported_n_mels, N_FRAMES};
 use crate::npz::WeightMap;
 use crate::tokenizer::{N_VOCAB, TOK_EOT, TOK_NO_TIMESTAMPS, TOK_TIMESTAMP_BEGIN};
 use alignment_heads::read_alignment_heads;
@@ -96,8 +96,8 @@ pub enum WhisperError {
         field: &'static str,
         /// The value it states.
         found: usize,
-        /// The value the decode supports.
-        expected: usize,
+        /// The value or values the decode supports, as text.
+        expected: String,
     },
     /// `config.json` has a `quantization` key: the weights are packed, and the
     /// decode reads them as plain matrices.
@@ -163,15 +163,22 @@ struct QuantizationKey {
 }
 
 impl WhisperConfig {
-    /// Load from a JSON string. Refuse an `n_vocab` other than [`N_VOCAB`], an
-    /// `n_audio_ctx` other than the encoder positions of one 30 s window, and a
-    /// `quantization` key.
+    /// Load from a JSON string. Refuse a `quantization` key, an `n_mels` other
+    /// than 80 or 128, an `n_vocab` other than [`N_VOCAB`] and an `n_audio_ctx`
+    /// other than the encoder positions of one 30 s window.
     pub fn from_json(s: &str) -> Result<Self, WhisperError> {
         let cfg: Self = serde_json::from_str(s).map_err(|e| WhisperError::Config(e.to_string()))?;
         let quantization: QuantizationKey =
             serde_json::from_str(s).map_err(|e| WhisperError::Config(e.to_string()))?;
         if quantization.quantization.is_some() {
             return Err(WhisperError::QuantizedSnapshot);
+        }
+        if check_n_mels(cfg.n_mels).is_err() {
+            return Err(WhisperError::UnsupportedConfig {
+                field: "n_mels",
+                found: cfg.n_mels,
+                expected: supported_n_mels(),
+            });
         }
         // The encoder's second conv has stride 2: two mel frames per position.
         let supported = [
@@ -183,7 +190,7 @@ impl WhisperConfig {
                 return Err(WhisperError::UnsupportedConfig {
                     field,
                     found,
-                    expected,
+                    expected: expected.to_string(),
                 });
             }
         }

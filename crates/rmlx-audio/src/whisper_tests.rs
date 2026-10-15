@@ -140,6 +140,17 @@ fn a_config_of_another_vocabulary_is_refused_naming_n_vocab() {
     }
 }
 
+/// Whisper has an 80-mel and a 128-mel filterbank only.
+#[test]
+fn an_n_mels_other_than_80_or_128_is_refused_naming_n_mels() {
+    let err = config_refusal(&config_json(64, 51_866, 1500, 32).to_string());
+    assert_eq!(
+        err,
+        "config.json: n_mels is 64, the decode supports 80 or 128 only \
+         (Whisper large-v3, large-v3-turbo and distil-large-v3)"
+    );
+}
+
 /// The decode's 30 s window is 3000 mel frames, which the encoder halves to
 /// 1500 positions.
 #[test]
@@ -168,8 +179,9 @@ fn a_null_quantization_key_loads() {
 }
 
 /// The refusal comes before the weight file is read: a directory with a
-/// large-v2 or a quantized `config.json` and no weights fails on the config,
-/// and one with a large-v3 `config.json` and no weights fails on the weight file.
+/// large-v2, a 64-mel or a quantized `config.json` and no weights fails on the
+/// config, and one with a large-v3 `config.json` and no weights fails on the
+/// weight file.
 #[test]
 fn load_refuses_the_config_before_it_reads_the_weights() {
     let dir = tempfile::tempdir().unwrap();
@@ -182,6 +194,8 @@ fn load_refuses_the_config_before_it_reads_the_weights() {
     };
     let refused = load_error(config_json(80, 51_865, 1500, 32).to_string());
     assert_names(&refused, &["config.json", "n_vocab", "51865"]);
+    let refused = load_error(config_json(64, 51_866, 1500, 32).to_string());
+    assert_names(&refused, &["config.json", "n_mels", "64"]);
     let mut quantized = config_json(128, 51_866, 1500, 32);
     quantized["quantization"] = serde_json::json!({ "group_size": 64, "bits": 8 });
     assert_names(&load_error(quantized.to_string()), &["quantization"]);

@@ -192,8 +192,7 @@ fn constants_sanity() {
 /// Our Rust `filters[fft_bin][mel_bin]` is the transpose.
 #[test]
 fn filterbank_matches_librosa_reference() {
-    let n_fft_bins = N_FFT / 2 + 1; // 201
-    let filters = super::build_mel_filters(n_fft_bins, 128);
+    let filters = super::build_mel_filters(128).unwrap();
     // librosa reference: filters[mel=0, fft=1] = 0.012374
     //                   filters[mel=1, fft=1] = 0.030393
     //                   filters[mel=2, fft=2] = 0.024748
@@ -220,4 +219,85 @@ fn filterbank_matches_librosa_reference() {
         "filters[2][3] = {}, expected ~0.018019",
         filters[2][3]
     );
+}
+
+/// Whisper has two filterbanks: openai-whisper refuses any other `n_mels`.
+#[test]
+fn an_n_mels_other_than_80_or_128_is_refused_naming_the_value() {
+    for n_mels in [0_usize, 1, 79, 81, 127, 129, 256] {
+        let err = MelExtractor::new(n_mels)
+            .expect_err("the n_mels must be refused")
+            .to_string();
+        for word in [format!("n_mels is {n_mels},"), "80 or 128".to_owned()] {
+            assert!(err.contains(&word), "the error does not name {word}: {err}");
+        }
+    }
+    for n_mels in [80_usize, 128] {
+        MelExtractor::new(n_mels).unwrap();
+    }
+}
+
+/// Each filterbank is the embedded librosa table, value for value, in the
+/// `[fft_bin][mel_bin]` layout.
+#[test]
+fn each_filterbank_is_its_embedded_table() {
+    let tables: [(usize, &[u8]); 2] = [
+        (80, include_bytes!("mel_filters_80.bin")),
+        (128, include_bytes!("mel_filters_128.bin")),
+    ];
+    for (n_mels, bytes) in tables {
+        let filters = super::build_mel_filters(n_mels).unwrap();
+        let flat: Vec<f32> = filters.into_iter().flatten().collect();
+        let table: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        assert_eq!(flat.len(), 201 * n_mels);
+        assert!(
+            flat.iter()
+                .zip(&table)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "{n_mels} mels: the filterbank is not the embedded table"
+        );
+    }
+}
+
+/// Reference values of both filterbanks, `filters[fft_bin][mel_bin]`, computed
+/// from the librosa Slaney formula (sr 16000, n_fft 400, norm slaney), not
+/// from the embedded tables. The first two 80-mel points are in the linear
+/// region of the mel scale, the others in the log region.
+#[test]
+fn filterbanks_match_the_slaney_formula() {
+    let points: [(usize, [(usize, usize, f32); 3]); 2] = [
+        (
+            80,
+            [
+                (1, 0, 0.024_862_594),
+                (100, 62, 0.006_172_718),
+                (190, 79, 0.002_232_055),
+            ],
+        ),
+        (
+            128,
+            [
+                (100, 99, 0.007_789_165),
+                (150, 116, 0.006_443_683),
+                (190, 126, 0.004_740_612),
+            ],
+        ),
+    ];
+    for (n_mels, rows) in points {
+        let filters = super::build_mel_filters(n_mels).unwrap();
+        assert_eq!(filters.len(), 201);
+        for (bin, mel, expected) in rows {
+            let got = filters[bin][mel];
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "{n_mels} mels: filters[{bin}][{mel}] = {got}, expected ~{expected}"
+            );
+        }
+    }
+    let filters = super::build_mel_filters(80).unwrap();
+    assert!((filters[2][1] - 0.022_871_772).abs() < 1e-6);
+    assert!((filters[150][72] - 0.002_193_423).abs() < 1e-6);
 }

@@ -47,13 +47,14 @@ is detected once, on the first window that is not skipped, and holds for the
 whole file ([`AUDIO.md`](AUDIO.md), "Language forms" and "Language
 detection").
 
-The Whisper model and tokenizer load on the first request and stay for the
-life of the process; changing the snapshot needs a restart. The tokenizer
-loads first. A tokenizer or a `config.json` of another vocabulary than
-large-v3's is refused before the weights load, and every request is 503 with
-the refusal text (`docs/AUDIO.md` § "Supported variants"). Audio requests
-pass the same admission gate as chat, and hold the GPU permit for the audio
-file decode, the encode and the Whisper decode.
+The Whisper model and tokenizer load on the first request and stay for the life
+of the process; changing the snapshot needs a restart. The tokenizer loads
+first. A tokenizer or a `config.json` of another vocabulary than large-v3's, or
+with an `n_mels` other than 80 or 128, or with a `quantization` key, is refused
+before the weights load, and every request is 503 with the refusal text
+(`docs/AUDIO.md` § "Supported variants"). Audio requests pass the same admission
+gate as chat, and hold the GPU permit for the audio file decode, the encode and
+the Whisper decode.
 
 When the request is gone, because the 408 fired, the client closed the
 connection or a server shutdown dropped it, the transcription stops before

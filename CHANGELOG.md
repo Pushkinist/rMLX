@@ -377,6 +377,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both file names. A quantized Whisper snapshot (a `quantization` key in
   `config.json`) loaded without error and failed in the first matmul; the load
   now refuses it and names the key.
+- **A Whisper `config.json` with an `n_mels` other than 80 or 128 is refused
+  at load.** `MelExtractor::new` accepted any `n_mels` above 0 and built a
+  filterbank that Whisper was not trained on, with no error. The load now
+  refuses the value before it reads the weights, and `MelExtractor::new`
+  refuses it too. Both errors name the value and the two allowed values. The
+  fallback filterbank is deleted.
 
 ## [0.4.3] - 2026-10-09
 

@@ -98,11 +98,9 @@ impl std::fmt::Debug for MelExtractor {
 impl MelExtractor {
     /// Create a new extractor.
     ///
-    /// `n_mels` should be 80 (small/medium Whisper) or 128 (large-v2/v3).
+    /// `n_mels` must be 80 (small/medium Whisper) or 128 (large-v2/v3); any
+    /// other value is refused, as openai-whisper refuses it.
     pub fn new(n_mels: usize) -> Result<Self, MelError> {
-        if n_mels == 0 {
-            return Err(MelError::Config("n_mels must be > 0".to_owned()));
-        }
         let n_fft_bins = N_FFT / 2 + 1; // 201
 
         // Build Hann window of length N_FFT (periodic, matches torch.hann_window).
@@ -113,9 +111,7 @@ impl MelExtractor {
             })
             .collect();
 
-        // Mel filterbank: precomputed librosa Slaney filterbank (exact match to
-        // mlx_whisper training). Loaded from embedded binary for n_mels ∈ {80,128}.
-        let filters = build_mel_filters(n_fft_bins, n_mels);
+        let filters = build_mel_filters(n_mels)?;
 
         // FFT plan of length N_FFT.
         let mut planner = FftPlanner::<f32>::new();
@@ -292,23 +288,47 @@ pub(crate) fn pad_after_content(frames: &mut [Vec<f32>], n_samples: usize) {
 
 // ── Mel filterbank (Slaney/librosa reference, embedded binary) ───────────────
 //
-// The filterbank is pre-computed from librosa.filters.mel(sr=16000, n_fft=400,
-// n_mels={80,128}, htk=False, norm='slaney') — the exact filter used by
-// mlx_whisper (mlx_whisper/assets/mel_filters.npz). Computing it from scratch
-// with the HTK formula diverges from the librosa Slaney scale and causes
-// incorrect mel spectrogram values, leading to wrong encoder output.
+// Each table is pre-computed from librosa.filters.mel(sr=16000, n_fft=400,
+// n_mels=N, htk=False, norm='slaney') — the exact filter used by mlx_whisper
+// (mlx_whisper/assets/mel_filters.npz).
 //
 // Binary layout: flat row-major float32 array, shape [n_fft_bins][n_mels],
 // i.e. filters[fft_bin * n_mels + mel_bin] = weight for that (bin, mel) pair.
-// This matches our internal `Vec<Vec<f32>>` structure.
 
-/// Load precomputed librosa mel filterbank for n_mels=128.
-/// Shape: `[n_fft_bins=201][n_mels=128]`.
-fn build_mel_filters_128() -> Vec<Vec<f32>> {
-    const DATA: &[u8] = include_bytes!("mel_filters_128.bin");
-    let n_fft_bins = 201_usize;
-    let n_mels = 128_usize;
-    let floats: Vec<f32> = DATA
+/// The `n_mels` values Whisper has a filterbank for, each with its embedded table.
+const FILTER_TABLES: [(usize, &[u8]); 2] = [
+    (80, include_bytes!("mel_filters_80.bin")),
+    (128, include_bytes!("mel_filters_128.bin")),
+];
+
+fn filter_table(n_mels: usize) -> Result<&'static [u8], MelError> {
+    FILTER_TABLES
+        .iter()
+        .find(|(supported, _)| *supported == n_mels)
+        .map(|(_, table)| *table)
+        .ok_or_else(|| {
+            MelError::Config(format!(
+                "n_mels is {n_mels}, Whisper has {} only",
+                supported_n_mels()
+            ))
+        })
+}
+
+/// The allowed `n_mels` values as text, for example `80 or 128`.
+pub(crate) fn supported_n_mels() -> String {
+    let supported: Vec<String> = FILTER_TABLES.iter().map(|(n, _)| n.to_string()).collect();
+    supported.join(" or ")
+}
+
+/// Refuse an `n_mels` that Whisper has no filterbank for (80 and 128 only).
+pub(crate) fn check_n_mels(n_mels: usize) -> Result<(), MelError> {
+    filter_table(n_mels).map(|_| ())
+}
+
+/// Load the precomputed librosa mel filterbank for `n_mels`.
+/// Shape: `[201][n_mels]`, one row per FFT bin.
+pub(crate) fn build_mel_filters(n_mels: usize) -> Result<Vec<Vec<f32>>, MelError> {
+    let floats: Vec<f32> = filter_table(n_mels)?
         .chunks_exact(4)
         .map(|b| {
             // `chunks_exact(4)` guarantees b.len() == 4; try_into never fails here.
@@ -319,103 +339,7 @@ fn build_mel_filters_128() -> Vec<Vec<f32>> {
             f32::from_le_bytes(b.try_into().unwrap())
         })
         .collect();
-    let mut filters = vec![vec![0.0_f32; n_mels]; n_fft_bins];
-    for k in 0..n_fft_bins {
-        for m in 0..n_mels {
-            #[allow(
-                clippy::indexing_slicing,
-                reason = "k < n_fft_bins and m < n_mels are loop bounds; flat index k*n_mels+m < n_fft_bins*n_mels"
-            )]
-            {
-                filters[k][m] = floats[k * n_mels + m];
-            }
-        }
-    }
-    filters
-}
-
-/// Load precomputed librosa mel filterbank for n_mels=80.
-/// Shape: `[n_fft_bins=201][n_mels=80]`.
-fn build_mel_filters_80() -> Vec<Vec<f32>> {
-    const DATA: &[u8] = include_bytes!("mel_filters_80.bin");
-    let n_fft_bins = 201_usize;
-    let n_mels = 80_usize;
-    let floats: Vec<f32> = DATA
-        .chunks_exact(4)
-        .map(|b| {
-            // `chunks_exact(4)` guarantees b.len() == 4; try_into never fails here.
-            #[allow(
-                clippy::unwrap_used,
-                reason = "chunks_exact(4) guarantees exactly 4 bytes; try_into cannot fail"
-            )]
-            f32::from_le_bytes(b.try_into().unwrap())
-        })
-        .collect();
-    let mut filters = vec![vec![0.0_f32; n_mels]; n_fft_bins];
-    for k in 0..n_fft_bins {
-        for m in 0..n_mels {
-            #[allow(
-                clippy::indexing_slicing,
-                reason = "k < n_fft_bins and m < n_mels are loop bounds; flat index k*n_mels+m < n_fft_bins*n_mels"
-            )]
-            {
-                filters[k][m] = floats[k * n_mels + m];
-            }
-        }
-    }
-    filters
-}
-
-/// Build mel filterbank matrix of shape `[n_fft_bins][n_mels]`.
-///
-/// Returns the exact librosa filterbank for n_mels ∈ {80, 128}. For other
-/// values, falls back to a runtime-computed Slaney HTK filterbank (not
-/// compatible with Whisper models, which were trained on the librosa filter).
-#[allow(
-    clippy::indexing_slicing,
-    reason = "all indices bounded by n_fft_bins and n_mels which are validated at construction"
-)]
-pub(crate) fn build_mel_filters(n_fft_bins: usize, n_mels: usize) -> Vec<Vec<f32>> {
-    // Use the exact pre-computed librosa filterbank for the two standard sizes.
-    if n_mels == 128 {
-        return build_mel_filters_128();
-    }
-    if n_mels == 80 {
-        return build_mel_filters_80();
-    }
-
-    // Fallback: runtime-computed Slaney HTK filterbank (not training-compatible
-    // but supports arbitrary n_mels for non-Whisper use cases).
-    let sr = f64::from(SAMPLE_RATE);
-    let f_max = sr / 2.0;
-    let mel_max = 2595.0 * (1.0 + f_max / 700.0).log10();
-    let n_pts = n_mels + 2;
-    let freq_pts: Vec<f64> = (0..n_pts)
-        .map(|i| {
-            let mel = mel_max * i as f64 / (n_pts - 1) as f64;
-            700.0 * (10.0_f64.powf(mel / 2595.0) - 1.0)
-        })
-        .collect();
-    let fft_freqs: Vec<f64> = (0..n_fft_bins)
-        .map(|k| k as f64 * sr / (2.0 * (n_fft_bins - 1) as f64))
-        .collect();
-    let mut filters = vec![vec![0.0_f32; n_mels]; n_fft_bins];
-    for m in 0..n_mels {
-        let lower = freq_pts[m];
-        let center = freq_pts[m + 1];
-        let upper = freq_pts[m + 2];
-        let norm = 2.0 / (upper - lower).max(1e-12);
-        let rise_denom = (center - lower).max(1e-12);
-        let fall_denom = (upper - center).max(1e-12);
-        for k in 0..n_fft_bins {
-            let f = fft_freqs[k];
-            let rising = (f - lower) / rise_denom;
-            let falling = (upper - f) / fall_denom;
-            let weight = rising.min(falling).max(0.0) * norm;
-            filters[k][m] = weight as f32;
-        }
-    }
-    filters
+    Ok(floats.chunks_exact(n_mels).map(<[f32]>::to_vec).collect())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

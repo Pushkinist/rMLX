@@ -16,7 +16,9 @@ neither, the error names both files. A safetensors tensor of another
 dtype than F16, BF16, F32, U8, I8, BOOL, U32, I32 or I64 is refused, and the
 error names the tensor. Every
 dimension comes from `config.json`. The mel filterbank matches its `n_mels`:
-80 or 128. The special-token ids are large-v3's (see "Token ids").
+80 or 128. The load refuses any other `n_mels` before it reads the weights,
+and so does `MelExtractor::new`. The special-token ids are large-v3's (see
+"Token ids").
 
 **Supported variants.** Only the large-v3 vocabulary loads. The load refuses
 anything else, and the error names the file, the token or field, its value
@@ -35,8 +37,9 @@ id lower; the English-only models start at `<|endoftext|>` = 50256. Decoded
 with the large-v3 ids, they would give wrong text and no error. Deriving the
 ids from `tokenizer.json` would let them load; that is not built.
 
-- `WhisperConfig::from_json` refuses an `n_vocab` other than 51866 and an
-  `n_audio_ctx` other than 1500 (the encoder positions of one 30 s window).
+- `WhisperConfig::from_json` refuses an `n_mels` other than 80 or 128, an
+  `n_vocab` other than 51866 and an `n_audio_ctx` other than 1500 (the
+  encoder positions of one 30 s window).
   `WhisperModel::load` refuses before it reads the weight file. It also
   refuses a `quantization` key: a quantized snapshot stores packed weights,
   and the decode does not unpack them.
