@@ -201,17 +201,14 @@ pub(crate) fn handle_streaming_token(
             state
                 .lifetime_requests_failed
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::error!(
-                error = %e,
-                "generation stream failed mid-flight, emitting error event"
-            );
+            crate::openai::errors::log_stream_failure(&e);
             // Emit the error and nothing else. No `finish_reason` chunk: this
             // stream has no finish reason, and claiming one would report the
             // failure as a completion. The caller chains the terminating
             // `[DONE]` onto every stream, so emitting one here would duplicate
             // it.
             return vec![Ok(error_event(
-                &e.to_string(),
+                &crate::openai::errors::engine_error_message(&e),
                 crate::openai::errors::engine_error_type(&e),
             ))];
         }

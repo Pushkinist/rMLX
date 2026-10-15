@@ -11,8 +11,10 @@
 )]
 
 use super::{
-    resolve_gemma4_processor, splice_image_block, GEMMA4_USER_TURN_OPENER, QWEN3VL_USER_TURN_OPENER,
+    preprocess_failure, resolve_gemma4_processor, rmlx_server_load_image, splice_image_block,
+    GEMMA4_USER_TURN_OPENER, QWEN3VL_USER_TURN_OPENER,
 };
+use rmlx_core::Error;
 
 /// A minimal image block placeholder (real blocks are `<boi> + N×img + <eoi>`;
 /// the placement logic is independent of the block contents).
@@ -203,4 +205,72 @@ fn qwen3vl_single_turn_splice_matches_last_opener() {
         "vision block lands right after the user-turn opener"
     );
     assert_eq!(aug[opener_end + blk.len()], 999, "user text follows");
+}
+
+/// A source the server cannot read (bad base64, a missing file) is the
+/// client's input: `InvalidInput`, which names the fact.
+#[test]
+fn an_image_source_that_cannot_be_loaded_is_invalid_input() {
+    let bad_base64 = rmlx_server_load_image("!!not base64!!").expect_err("bad base64");
+    assert!(
+        matches!(bad_base64, Error::InvalidInput(_)),
+        "{bad_base64:?}"
+    );
+    assert!(
+        bad_base64.to_string().contains("image load failed"),
+        "{bad_base64}"
+    );
+
+    let home_file = rmlx_server_load_image("~/rmlx-no-such-dir/image.png").expect_err("no file");
+    assert!(matches!(home_file, Error::InvalidInput(_)), "{home_file:?}");
+    assert_eq!(
+        home_file.to_string(),
+        "image load failed: cannot read image file ~/rmlx-no-such-dir/image.png"
+    );
+    assert!(!home_file.is_migratable());
+}
+
+/// Bytes that load but are not an image the processor takes are the client's:
+/// `InvalidInput`, which names the image.
+#[test]
+fn an_image_the_processor_refuses_is_invalid_input() {
+    let processor = rmlx_models::gemma4::Gemma4ImageProcessor::with_defaults();
+    let err = processor
+        .preprocess(b"not an image")
+        .map_err(|e| preprocess_failure(2, &e))
+        .expect_err("not an image");
+    assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+    assert!(
+        err.to_string().contains("image 2 preprocess failed"),
+        "{err}"
+    );
+    assert!(
+        !err.to_string().contains("model:") && !err.to_string().contains("gemma4"),
+        "the text holds an error class or architecture prefix: {err}"
+    );
+    assert!(!err.is_migratable());
+}
+
+/// Every call of an image processor in `image.rs` maps its error through
+/// `preprocess_failure`, so none of them leaves the client's bad image as a
+/// retryable `Other`. The four calls are the three Gemma loops and Qwen3-VL.
+#[test]
+fn every_image_processor_call_maps_its_error_through_preprocess_failure() {
+    let code: String = include_str!("image.rs")
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let statements: Vec<&str> = [".preprocess(", "qwen3_vl_moe::preprocess("]
+        .iter()
+        .flat_map(|call| code.match_indices(call).map(|(at, _)| at))
+        .filter_map(|at| code.get(at..)?.split(';').next())
+        .collect();
+    assert_eq!(statements.len(), 4, "{statements:?}");
+    for statement in statements {
+        assert!(
+            statement.contains(".map_err(|e| preprocess_failure("),
+            "an image processor call does not map its error through preprocess_failure: {statement}"
+        );
+    }
 }

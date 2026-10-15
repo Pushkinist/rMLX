@@ -184,7 +184,7 @@ pub(crate) fn build_image_prompt(
                 let bytes = rmlx_server_load_image(src)?;
                 let pv = processor
                     .preprocess(&bytes)
-                    .map_err(|e| Error::Other(format!("image {i} preprocess failed: {e}")))?;
+                    .map_err(|e| preprocess_failure(i, &e))?;
                 tracing::info!(
                     image_idx = i,
                     width = pv.width,
@@ -244,7 +244,7 @@ pub(crate) fn build_image_prompt(
                 let bytes = rmlx_server_load_image(src)?;
                 let pv = processor
                     .preprocess(&bytes)
-                    .map_err(|e| Error::Other(format!("image {i} preprocess failed: {e}")))?;
+                    .map_err(|e| preprocess_failure(i, &e))?;
                 let n_soft = rmlx_models::gemma4::unified_num_soft_tokens(
                     pv.height,
                     pv.width,
@@ -305,7 +305,7 @@ pub(crate) fn build_image_prompt(
                 let bytes = rmlx_server_load_image(src)?;
                 let pv = processor
                     .preprocess(&bytes)
-                    .map_err(|e| Error::Other(format!("image {i} preprocess failed: {e}")))?;
+                    .map_err(|e| preprocess_failure(i, &e))?;
                 tracing::info!(
                     image_idx = i,
                     width = pv.width,
@@ -422,7 +422,7 @@ pub(crate) fn run_qwen3vl_image(
     // out of scope here; reject >1 with a clear error rather than silently
     // mis-scattering.
     if sources.len() != 1 {
-        return Err(Error::Other(format!(
+        return Err(Error::InvalidInput(format!(
             "Qwen3-VL image path currently serves exactly one image per request (got {})",
             sources.len()
         )));
@@ -451,7 +451,7 @@ pub(crate) fn run_qwen3vl_image(
 
     let bytes = rmlx_server_load_image(&sources[0])?;
     let pv = rmlx_models::qwen3_vl_moe::preprocess(&bytes, processor)
-        .map_err(|e| Error::Other(format!("Qwen3-VL image preprocess failed: {e}")))?;
+        .map_err(|e| preprocess_failure(0, &e))?;
     tracing::info!(
         grid_thw = ?pv.grid_thw,
         num_soft_tokens = pv.num_soft_tokens,
@@ -615,11 +615,24 @@ pub(crate) fn run_qwen3vl_image(
     )
 }
 
+/// The refusal of image `index` by its processor. The bytes are the client's,
+/// so a processor that cannot read them is [`Error::InvalidInput`]. The text is
+/// the fact the processor states, without the `model:` prefix of its error class.
+fn preprocess_failure(index: usize, cause: &Error) -> Error {
+    let fact = if let Error::Model(fact) = cause {
+        fact.clone()
+    } else {
+        cause.to_string()
+    };
+    Error::InvalidInput(format!("image {index} preprocess failed: {fact}"))
+}
+
 /// thin wrapper mapping `image_io::load_image`'s `String` error into the
-/// crate `Error`, with a fixed 20s fetch timeout for remote sources.
+/// crate `Error`, with a fixed 20s fetch timeout for remote sources. The
+/// source is the client's, so a failure to read it is [`Error::InvalidInput`].
 pub(crate) fn rmlx_server_load_image(source: &str) -> rmlx_core::Result<Vec<u8>> {
     crate::image_io::load_image(source, std::time::Duration::from_secs(20))
-        .map_err(|e| Error::Other(format!("image load failed: {e}")))
+        .map_err(|e| Error::InvalidInput(format!("image load failed: {e}")))
 }
 
 #[cfg(test)]

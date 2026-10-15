@@ -559,7 +559,7 @@ A chat `input_audio` clip (Gemma4) is capped lower: at the whole seconds
 whose audio tokens fit the context left after the prompt and the two audio
 markers, 25 tokens a second (640 samples a token on both audio branches),
 and at most `MAX_AUDIO_SECS`. With an 8192-token context and a 100-token
-prompt that is 323 s. A clip over it is refused before the mel.
+prompt that is 323 s. A clip over it is a 400, refused before the mel.
 
 The peak of a read and a decode to 16 kHz, counted on the
 heap with the file's bytes: 3.0 times the file for a 16 kHz mono PCM-16 WAV

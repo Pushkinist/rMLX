@@ -8,9 +8,10 @@
 
 use super::{
     classify_mtp_draft, decide_draft_kind, draft_kind_of, dropped_sampling_fields,
-    mtp_reject_reason, round_block, MtpDraftFamily, MIN_DRAFT_BLOCK_SIZE,
+    mtp_reject_reason, round_block, unsupported_request, MtpDraftFamily, MIN_DRAFT_BLOCK_SIZE,
 };
 use crate::engine::types::SamplingParams;
+use rmlx_core::Error;
 use rmlx_models::{Declared, DraftKind};
 
 // ── decide_draft_kind ────────────────────────────────────────────────────────
@@ -436,4 +437,25 @@ fn a_request_for_logprobs_names_logprobs() {
         ..SamplingParams::default()
     };
     assert_eq!(dropped_sampling_fields(&sampling), vec!["logprobs"]);
+}
+
+// ── unsupported_request ──────────────────────────────────────────────────────
+
+/// A grammar or media the round loops cannot serve is the client's request: a
+/// 400-class `InvalidInput` that is not replayed. A plain request is served.
+#[test]
+fn a_grammar_or_media_request_is_refused_as_invalid_input() {
+    let grammar = unsupported_request(true, false).expect("a grammar is refused");
+    assert!(matches!(grammar, Error::InvalidInput(_)), "{grammar:?}");
+    assert!(grammar.to_string().contains("response_format"), "{grammar}");
+
+    let media = unsupported_request(false, true).expect("media is refused");
+    assert!(matches!(media, Error::InvalidInput(_)), "{media:?}");
+    assert_eq!(
+        media.to_string(),
+        "this server decodes with a draft model, which takes no image or audio input"
+    );
+    assert!(!media.is_migratable());
+
+    assert!(unsupported_request(false, false).is_none());
 }

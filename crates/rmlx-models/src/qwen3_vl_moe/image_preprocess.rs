@@ -158,9 +158,7 @@ fn smart_resize(
     let (h, w) = (height as f64, width as f64);
     let ratio = h.max(w) / h.min(w);
     if ratio > 200.0 {
-        return Err(Error::Model(format!(
-            "qwen3_vl preprocess: aspect ratio {ratio:.1} exceeds 200"
-        )));
+        return Err(Error::Model(format!("aspect ratio {ratio:.1} exceeds 200")));
     }
     let f = factor as f64;
     let round_by = |x: f64| -> usize { ((x / f).round() * f) as usize };
@@ -184,11 +182,11 @@ fn smart_resize(
 /// Decode bytes to RGB u8 HWC. Returns `(rgb_hwc, height, width)`.
 fn decode_rgb(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize)> {
     let img = image::load_from_memory(bytes)
-        .map_err(|e| Error::Model(format!("qwen3_vl: image decode failed: {e}")))?;
+        .map_err(|e| Error::Model(format!("image decode failed: {e}")))?;
     let rgb = img.to_rgb8();
     let (w, h) = (rgb.width() as usize, rgb.height() as usize);
     if w == 0 || h == 0 {
-        return Err(Error::Model("qwen3_vl: zero-size image".into()));
+        return Err(Error::Model("zero-size image".into()));
     }
     Ok((rgb.into_raw(), h, w))
 }

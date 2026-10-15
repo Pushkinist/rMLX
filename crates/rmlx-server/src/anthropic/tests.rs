@@ -58,6 +58,11 @@ fn engine_error_cases() -> Vec<rmlx_core::Error> {
         // wildcard arm — the common case for a mid-decode engine fault.
         rmlx_core::Error::Mlx("device error".to_owned()),
         rmlx_core::Error::Other("engine panic".to_owned()),
+        rmlx_core::Error::InvalidInput("input_audio decode failed: no audio track".to_owned()),
+        rmlx_core::Error::KvCeilingExceeded {
+            requested: 641,
+            ceiling: 640,
+        },
     ]
 }
 
@@ -80,6 +85,48 @@ async fn engine_error_type_matches_response() {
             "anthropic engine_error_type drifted from anthropic engine_error_response for {e:?}"
         );
     }
+}
+
+/// Input the client got wrong is a 400 `invalid_request_error` whose message is
+/// the fact, not a retryable 503; a fault of the server stays a 503.
+#[tokio::test]
+async fn invalid_input_is_400_invalid_request_error_with_its_fact() {
+    let e = rmlx_core::Error::InvalidInput(
+        "input_audio decode failed: the file holds no audio track".to_owned(),
+    );
+    let (status, retry, body) = oom_parts(&e).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(
+        body["error"]["message"],
+        "input_audio decode failed: the file holds no audio track"
+    );
+    assert_eq!(retry, None);
+    assert_eq!(errors::engine_error_type(&e), "invalid_request_error");
+
+    let server_fault = rmlx_core::Error::Other("the audio tower did not answer".to_owned());
+    let (status, _, body) = oom_parts(&server_fault).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["type"], "service_unavailable_error");
+}
+
+/// A sequence past the KV ceiling is the 400 `context_length_exceeded` the
+/// route gives a prompt over `max_ctx`; the type keeps the OpenAI spelling.
+#[tokio::test]
+async fn kv_ceiling_exceeded_is_400_context_length_exceeded() {
+    let e = rmlx_core::Error::KvCeilingExceeded {
+        requested: 641,
+        ceiling: 640,
+    };
+    let (status, retry, body) = oom_parts(&e).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["type"], "context_length_exceeded");
+    assert_eq!(
+        body["error"]["message"],
+        "the request needs 641 tokens of context, max_ctx is 640"
+    );
+    assert_eq!(retry, None);
+    assert_eq!(errors::engine_error_type(&e), "context_length_exceeded");
 }
 
 /// The Anthropic type strings deliberately diverge from OpenAI's: this surface

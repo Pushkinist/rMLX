@@ -7,8 +7,8 @@
 use rmlx_core::Error;
 
 use super::{
-    audio_secs_budget, build_audio_prompt, decode_input_audio, load_gemma4_audio_bundle,
-    AudioBundle, GEMMA4_BOA_TOKEN_ID, GEMMA4_EOA_TOKEN_ID,
+    audio_secs_budget, build_audio_prompt, decode_input_audio, extract_mel,
+    load_gemma4_audio_bundle, AudioBundle, GEMMA4_BOA_TOKEN_ID, GEMMA4_EOA_TOKEN_ID,
 };
 
 /// Minimal standard-alphabet base64 encoder (mirror of the crate decoder), so
@@ -198,6 +198,7 @@ fn audio_prompt_multi_clip_rejected() {
         &|| false,
     )
     .expect_err("two clips must be rejected");
+    assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
     assert!(
         err.to_string().contains("one audio clip"),
         "clear multi-clip error: {err}"
@@ -221,11 +222,44 @@ fn an_input_audio_clip_over_the_duration_cap_is_refused_up_front() {
     let b64 = base64_encode(&wav_declaring(10_801 * 16_000 * 2));
     let err = decode_input_audio(&b64, rmlx_audio::wav::MAX_AUDIO_SECS, 640, &|| false)
         .expect_err("over the cap");
+    assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
     assert_eq!(
         err.to_string(),
-        "other: input_audio decode failed: the file declares 10801.000 s of audio, \
+        "input_audio decode failed: the file declares 10801.000 s of audio, \
          over the 10800 s the decoder takes"
     );
+}
+
+/// Bytes that are not base64, and base64 that holds no known container, are
+/// the client's: each is `InvalidInput` and names the fact.
+#[test]
+fn an_input_audio_clip_the_decoder_refuses_is_invalid_input() {
+    let not_base64 =
+        decode_input_audio("!!not base64!!", 60, 640, &|| false).expect_err("not base64");
+    assert!(
+        matches!(not_base64, Error::InvalidInput(_)),
+        "{not_base64:?}"
+    );
+    assert!(
+        not_base64
+            .to_string()
+            .contains("input_audio base64 decode failed"),
+        "{not_base64}"
+    );
+
+    let not_audio = decode_input_audio(
+        &base64_encode(b"this is not an audio file"),
+        60,
+        640,
+        &|| false,
+    )
+    .expect_err("not a container");
+    assert!(matches!(not_audio, Error::InvalidInput(_)), "{not_audio:?}");
+    assert!(
+        not_audio.to_string().contains("input_audio decode failed"),
+        "{not_audio}"
+    );
+    assert!(!not_audio.is_migratable());
 }
 
 /// A decode asked with a set stop flag stops before the first packet and
@@ -282,9 +316,10 @@ fn an_input_audio_clip_over_the_context_budget_is_refused_up_front() {
     let b64 = base64_encode(&wav_declaring(400 * 16_000 * 2));
     let err = decode_input_audio(&b64, audio_secs_budget(8192, 100, 640), 640, &|| false)
         .expect_err("over the budget");
+    assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
     assert_eq!(
         err.to_string(),
-        "other: input_audio holds more than the 323 s of audio the context leaves \
+        "input_audio holds more than the 323 s of audio the context leaves \
          after the prompt (25 tokens a second)"
     );
 }
@@ -300,9 +335,26 @@ fn an_input_audio_stream_over_the_context_budget_names_the_context() {
     wav.splice(40..44, [0xFF; 4]);
     let b64 = base64_encode(&wav);
     let err = decode_input_audio(&b64, 2, 320, &|| false).expect_err("over the budget");
+    assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
     assert_eq!(
         err.to_string(),
-        "other: input_audio holds more than the 2 s of audio the context leaves \
+        "input_audio holds more than the 2 s of audio the context leaves \
          after the prompt (50 tokens a second)"
     );
+}
+
+/// A clip shorter than one mel frame is the client's: `InvalidInput`.
+#[test]
+fn an_input_audio_clip_shorter_than_one_frame_is_invalid_input() {
+    use rmlx_models::gemma4::{AudioFeatureExtractorConfig, Gemma4AudioFeatureExtractor};
+
+    let config: AudioFeatureExtractorConfig = serde_json::from_str("{}").expect("default config");
+    let extractor = Gemma4AudioFeatureExtractor::from_config(config);
+    let err = extract_mel(&extractor, &[0.0; 10]).expect_err("ten samples are under one frame");
+    assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        "input_audio is too short: 10 samples, need at least 161"
+    );
+    assert!(!err.is_migratable());
 }

@@ -94,6 +94,8 @@ pub(super) fn oom_response(
 /// Map an `rmlx_core::Error` to an HTTP error response (Anthropic error types).
 ///
 /// `SmokeProbe` (NaN logits) → 500 internal_server_error.
+/// `InvalidInput` (media the client got wrong) → 400 invalid_request_error.
+/// `KvCeilingExceeded` → 400 context_length_exceeded.
 /// `Oom` → 507 / 503 typed body with `Retry-After` per phase. No production
 /// request reaches this fn with an `Oom`: `ensure_loaded` failures (the only
 /// place an `Oom` is constructed) are mapped to a plain 503 before this fn
@@ -108,6 +110,12 @@ pub(crate) fn engine_error_response(e: &rmlx_core::Error) -> Response {
         rmlx_core::Error::SmokeProbe(msg) => {
             internal_error(&format!("NaN logits during generation: {msg}"))
         }
+        rmlx_core::Error::InvalidInput(msg) => bad_request(msg),
+        rmlx_core::Error::KvCeilingExceeded { .. } => error_response(
+            StatusCode::BAD_REQUEST,
+            "context_length_exceeded",
+            &crate::openai::errors::engine_error_message(e),
+        ),
         rmlx_core::Error::Oom {
             phase,
             requested_bytes,
@@ -139,6 +147,8 @@ pub(super) fn engine_error_type(e: &rmlx_core::Error) -> &'static str {
     use rmlx_core::OomPhase;
     match e {
         rmlx_core::Error::SmokeProbe(_) => "internal_server_error",
+        rmlx_core::Error::InvalidInput(_) => "invalid_request_error",
+        rmlx_core::Error::KvCeilingExceeded { .. } => "context_length_exceeded",
         rmlx_core::Error::Oom { phase, .. } => match phase {
             OomPhase::LoadWeights => "oom_during_load",
             OomPhase::LoadKvCache => "oom_kv_cache",

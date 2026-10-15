@@ -87,7 +87,8 @@ vocabulary (`restricted_read_back` is false).
   refused: `response_format` with `json_object` or `json_schema`, and
   `tool_choice` set to required or to a named tool. The error names
   `speculative_decode_with_response_format_unsupported`, and the server
-  answers HTTP 503 `service_unavailable`.
+  answers HTTP 400 `invalid_request_error`. A server with a draft model also
+  refuses `image_url` and `input_audio` parts, and an empty prompt, with a 400.
 - **Logprobs.** The speculative path returns no logprobs. A request that sets
   `logprobs: true` (with or without `top_logprobs`) gets a response with no
   `logprobs`, and the server logs the same `warn`, which names `logprobs`.

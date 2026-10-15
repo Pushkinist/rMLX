@@ -47,7 +47,8 @@ areas before touching code:
 | [`docs/SERVER.md`](docs/SERVER.md) | HTTP server: OpenAI/Anthropic compat, routes, tool calling, retry envelope |
 | [`docs/SERVER_TOOLS.md`](docs/SERVER_TOOLS.md) | Tool calling in the HTTP server, split out of `SERVER.md` for size: parsers, template probe, multi-turn loop, forced tool calls, EOF recovery |
 | [`docs/SERVER_AUDIO.md`](docs/SERVER_AUDIO.md) | Audio routes of the HTTP server, split out of `SERVER.md` for size: speech-to-text (form, upload, admission, cancel, model cache) and text-to-speech (fields, sampling defaults, response headers, errors) |
-| [`docs/SERVER_SHUTDOWN.md`](docs/SERVER_SHUTDOWN.md) | Shutdown of the HTTP server, split out of `SERVER.md` for size: the rule after SIGINT or SIGTERM, the two bounds, the 503, what stops and what does not, the Metal claim at the exit, log events, the claim file |
+| [`docs/SERVER_SHUTDOWN.md`](docs/SERVER_SHUTDOWN.md) | Shutdown of the HTTP server, split out of `SERVER.md` for size: the rule after SIGINT or SIGTERM, the two bounds, the 503, what stops and what does not, the Metal claim at the exit, log events |
+| [`docs/SERVER_CLAIM.md`](docs/SERVER_CLAIM.md) | The Metal claim file of the HTTP server, split out of `SERVER.md` for size: `try_claim`, the `flock`, the holder record, the legacy per-port claim |
 | [`docs/MODELS.md`](docs/MODELS.md) | Per-architecture model reference (Qwen, Gemma, Laguna, Jina, etc.) |
 | [`docs/ADDING_A_MODEL.md`](docs/ADDING_A_MODEL.md) | New-arch integration surface: shared seams + per-arch points + verification ritual |
 | [`docs/WEIGHT_QUANTS.md`](docs/WEIGHT_QUANTS.md) | Weight quantization formats (bf16, MXFP, affine, ParoQuant, ternary BitLinear), where they are decoded, adding a format |

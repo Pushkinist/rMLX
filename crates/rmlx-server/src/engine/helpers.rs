@@ -13,6 +13,13 @@ use rmlx_metrics::events::{EventRecorder, Measurement};
 
 use super::types::GenerationToken;
 
+/// The refusal of a request whose prompt holds no token. A template that
+/// renders nothing for the client's messages gives the same prompt on every
+/// attempt, so it is the client's input and is not replayed.
+pub(crate) fn empty_prompt() -> rmlx_core::Error {
+    rmlx_core::Error::InvalidInput("the messages render to an empty prompt".to_owned())
+}
+
 // ── shared helper for ITL percentile events-table writes ───────────────
 
 /// Write p50/p95/p99 ITL measurements to the events table.

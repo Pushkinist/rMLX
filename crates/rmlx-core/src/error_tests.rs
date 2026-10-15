@@ -100,6 +100,15 @@ fn is_migratable_classifies_transient_and_permanent() {
     assert!(!Error::Config("bad".to_owned()).is_migratable());
 }
 
+/// Input the client got wrong fails the same way on every attempt: it is not
+/// replayed, and its message is the fact the client reads.
+#[test]
+fn invalid_input_is_not_migratable_and_names_its_fact() {
+    let e = Error::InvalidInput("input_audio decode failed: no audio track".to_owned());
+    assert!(!e.is_migratable());
+    assert_eq!(e.to_string(), "input_audio decode failed: no audio track");
+}
+
 /// A stop is not replayed, and its `Debug` form opens with the name of the
 /// variant: the source rules on the stop read that name.
 #[test]

@@ -296,7 +296,7 @@ pub fn generate_greedy(
     // effective `--max-ctx` (lazy start + growth ceiling) so a prompt longer
     // than the lazy KV_MAX_SEQ_DEFAULT=4096 start grows to fit instead of
     // overflowing the fixed decode buffer; an over-cap prompt is rejected
-    // cleanly with KvCeilingExceeded (→ context_overflow). The shared
+    // cleanly with KvCeilingExceeded (a 400 context_length_exceeded). The shared
     // chunked_prefill helper brackets enter_prefill()/exit_prefill() and flushes
     // each chunk's command buffer under the ~10s Metal GPU watchdog — a
     // single-shot forward over a multi-thousand-token prompt trips it. Mirrors
@@ -561,7 +561,7 @@ pub fn generate_image(
     // far above the lazy KV_MAX_SEQ_DEFAULT=4096 start. Size the KV ring from
     // the effective `--max-ctx`: `ctx.initial_max_seq` is the lazy start and
     // `ctx.ceiling` caps lazy growth and rejects an over-cap prompt with a
-    // clean `KvCeilingExceeded` (→ context_overflow) instead of a cryptic
+    // clean `KvCeilingExceeded` (a 400 context_length_exceeded) instead of a cryptic
     // `slice_update` broadcast. Bracketing the chunked forward with
     // enter_prefill()/exit_prefill() routes the prefill through the lazy-grow
     // raw buffer (mirrors the Gemma4 image path) so it grows to fit.

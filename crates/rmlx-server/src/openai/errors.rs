@@ -292,9 +292,23 @@ pub(super) fn oom_response(
     (status, headers, Json(body)).into_response()
 }
 
+/// The message a client reads for an engine error, in a reply and in the error
+/// event of a stream. A sequence past the KV ceiling is crossed in prefill or
+/// in decode, so its text names neither.
+pub(crate) fn engine_error_message(e: &rmlx_core::Error) -> String {
+    if let rmlx_core::Error::KvCeilingExceeded { requested, ceiling } = e {
+        format!("the request needs {requested} tokens of context, max_ctx is {ceiling}")
+    } else {
+        e.to_string()
+    }
+}
+
 /// Map an `rmlx_core::Error` to an HTTP error response.
 ///
 /// `SmokeProbe` (NaN logits, broken snapshot) → 500 internal_error.
+/// `InvalidInput` (media the client got wrong) → 400 invalid_request_error.
+/// `KvCeilingExceeded` (a prompt, image and audio tokens included, or a
+/// generation past `max_ctx`) → 400 context_length_exceeded.
 /// `Oom` → 507 / 503 typed body with `Retry-After` per phase. No production
 /// request reaches this fn with an `Oom`: `ensure_loaded` failures (the only
 /// place an `Oom` is constructed) are mapped to a plain 503 before this fn
@@ -309,6 +323,12 @@ pub(crate) fn engine_error_response(e: &rmlx_core::Error) -> Response {
         rmlx_core::Error::SmokeProbe(msg) => {
             internal_error(&format!("NaN logits during generation: {msg}"))
         }
+        rmlx_core::Error::InvalidInput(msg) => bad_request(msg),
+        rmlx_core::Error::KvCeilingExceeded { .. } => error_response(
+            StatusCode::BAD_REQUEST,
+            "context_length_exceeded",
+            &engine_error_message(e),
+        ),
         rmlx_core::Error::Oom {
             phase,
             requested_bytes,
@@ -338,12 +358,29 @@ pub(crate) fn engine_error_type(e: &rmlx_core::Error) -> &'static str {
     use rmlx_core::OomPhase;
     match e {
         rmlx_core::Error::SmokeProbe(_) => "internal_error",
+        rmlx_core::Error::InvalidInput(_) => "invalid_request_error",
+        rmlx_core::Error::KvCeilingExceeded { .. } => "context_length_exceeded",
         rmlx_core::Error::Oom { phase, .. } => match phase {
             OomPhase::LoadWeights => "oom_during_load",
             OomPhase::LoadKvCache => "oom_kv_cache",
             OomPhase::Generation => "oom_mid_stream",
         },
         _ => "service_unavailable",
+    }
+}
+
+/// Log a generation stream that failed after its first item. A request the
+/// client got wrong, input or a sequence past `max_ctx`, is a warning; a fault
+/// of the server is an error.
+pub(crate) fn log_stream_failure(e: &rmlx_core::Error) {
+    const MESSAGE: &str = "generation stream failed mid-flight, emitting error event";
+    if matches!(
+        e,
+        rmlx_core::Error::InvalidInput(_) | rmlx_core::Error::KvCeilingExceeded { .. }
+    ) {
+        tracing::warn!(error = %e, "{MESSAGE}");
+    } else {
+        tracing::error!(error = %e, "{MESSAGE}");
     }
 }
 
@@ -359,6 +396,8 @@ pub(crate) fn engine_error_category(e: &rmlx_core::Error) -> ApiErrorCategory {
     use rmlx_core::OomPhase;
     match e {
         rmlx_core::Error::SmokeProbe(_) => ApiErrorCategory::Internal,
+        rmlx_core::Error::InvalidInput(_) => ApiErrorCategory::BadRequest,
+        rmlx_core::Error::KvCeilingExceeded { .. } => ApiErrorCategory::ContextOverflow,
         rmlx_core::Error::Oom { phase, .. } => match phase {
             OomPhase::LoadWeights => ApiErrorCategory::OomLoad,
             OomPhase::LoadKvCache => ApiErrorCategory::OomKvCache,

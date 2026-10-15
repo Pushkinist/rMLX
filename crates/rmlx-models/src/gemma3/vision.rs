@@ -498,7 +498,7 @@ impl Gemma3ImageProcessor {
     )]
     pub fn preprocess(&self, bytes: &[u8]) -> Result<Gemma3PixelValues> {
         let img = image::load_from_memory(bytes)
-            .map_err(|e| Error::Model(format!("gemma3: image decode failed: {e}")))?;
+            .map_err(|e| Error::Model(format!("image decode failed: {e}")))?;
         let sz = self.image_size as u32;
         // resample=2 (PIL BILINEAR) ~= image crate Triangle filter.
         let resized = img.resize_exact(sz, sz, image::imageops::FilterType::Triangle);

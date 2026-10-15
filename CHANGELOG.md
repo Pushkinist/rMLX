@@ -383,6 +383,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refuses the value before it reads the weights, and `MelExtractor::new`
   refuses it too. Both errors name the value and the two allowed values. The
   fallback filterbank is deleted.
+- **A prompt that image or audio tokens push past `--max-ctx` is a 400
+  `context_length_exceeded`, not a retryable 503.** The soft tokens are
+  spliced in after the route checks the prompt, so the prompt crossed
+  `max_ctx` in prefill and the engine answered `KvCeilingExceeded`. That error
+  is now the 400 `context_length_exceeded` on `/v1/chat/completions` and
+  `/v1/messages`, also in the error event of a stream that has started, and it
+  counts as `context_overflow`. `ContextCeilingExceeded` and
+  `KvHardCapExceeded` stay 503.
+- **A media input the client got wrong is a 400, not a retryable 503.** On
+  `/v1/chat/completions`, a clip the decoder refuses, audio over what the
+  context holds, a second clip, image and audio together, an image that does
+  not load or decode, a remote image the server cannot fetch, input for a
+  model with no audio or vision tower, and image or audio sent to a server
+  that decodes with a draft model were a 503 that an OpenAI SDK sends again.
+  Each is now a 400 `invalid_request_error` that names the fact, also in the
+  error event of a stream that has started; a file or fetch failure gives one
+  fixed text and never a server path. A `response_format` or a required
+  `tool_choice` on a draft-model server and an empty prompt are the same 400.
+  A fault of the server stays a 503. The engine reports these with a new
+  error, `InvalidInput`, which is not run again. `/v1/messages` passes no
+  media to the engine, and maps the same error the same way.
 
 ## [0.4.3] - 2026-10-09
 

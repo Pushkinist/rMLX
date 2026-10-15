@@ -8,8 +8,8 @@
 //! # Public API
 //!
 //! - [`Error`] — non-exhaustive enum covering I/O, config, loader, quant,
-//!   model, MLX FFI, OOM, and generic failures, and the stop of a request
-//!   that is gone.
+//!   model, MLX FFI, OOM, and generic failures, input the client got wrong,
+//!   and the stop of a request that is gone.
 //! - [`OomPhase`] — allocation phase tag inside [`Error::Oom`], used to
 //!   distinguish load-time OOM (evict + retry) from mid-generation OOM
 //!   (abort stream).
@@ -82,6 +82,13 @@ pub enum Error {
     /// Catch-all for errors that do not fit a more specific variant.
     #[error("other: {0}")]
     Other(String),
+
+    /// The client's input is wrong: a clip or image the decoder refuses, input
+    /// the model has no tower for, more media than the model takes in one
+    /// request. The message names the fact. The same input fails the same way
+    /// on every attempt, so a server answers with a 4xx and never replays it.
+    #[error("{0}")]
+    InvalidInput(String),
 
     /// Architecture not supported by the requested operation or dispatch path.
     ///
@@ -230,6 +237,7 @@ impl Error {
             | Error::Quant(_)
             | Error::Model(_)
             | Error::SmokeProbe(_)
+            | Error::InvalidInput(_)
             | Error::Oom { .. }
             | Error::ArchUnsupported { .. }
             | Error::KvStorageMismatch { .. }

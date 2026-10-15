@@ -6,7 +6,7 @@
 //! rejected with a CLEAR error (never a silent drop), while the audio-only,
 //! image-only, and text-only paths route unchanged (no rejection).
 
-use super::reject_combined_image_audio;
+use super::{no_tower_for, reject_combined_image_audio};
 use rmlx_core::Error;
 
 #[test]
@@ -17,10 +17,10 @@ use rmlx_core::Error;
 fn combined_image_and_audio_is_rejected_with_clear_error() {
     let err = reject_combined_image_audio(true, true)
         .expect("combined image + audio must be rejected, not silently dropped");
-    // Must surface as a request-level `Other` error (proper HTTP error, not a panic).
+    // Must surface as the client's invalid input (a 4xx), not a retryable 503.
     assert!(
-        matches!(err, Error::Other(_)),
-        "expected Error::Other request-level rejection, got {err:?}"
+        matches!(err, Error::InvalidInput(_)),
+        "expected Error::InvalidInput request-level rejection, got {err:?}"
     );
     let msg = err.to_string();
     assert!(
@@ -55,4 +55,19 @@ fn text_only_request_is_not_rejected() {
         reject_combined_image_audio(false, false).is_none(),
         "text-only request must route to the plain path, not be rejected"
     );
+}
+
+/// Image or audio sent to a model with no tower for it is the client's input:
+/// `InvalidInput`, which names the input and the missing tower.
+#[test]
+fn input_for_a_model_without_the_tower_is_invalid_input() {
+    for (input, tower) in [("image", "vision"), ("audio", "audio")] {
+        let err = no_tower_for(input, tower);
+        assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            format!("this model does not accept {input} input (no {tower} tower)")
+        );
+        assert!(!err.is_migratable());
+    }
 }

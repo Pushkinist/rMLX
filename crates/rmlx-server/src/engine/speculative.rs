@@ -289,6 +289,32 @@ impl Drafter {
     }
 }
 
+/// The refusal of a request the speculative path cannot serve, or `None`.
+///
+/// A grammar (`response_format`, a required or named `tool_choice`) has no
+/// per-token mask hook that aligns with the verifier's block argmax. No round
+/// loop reads an image or an `input_audio` clip, so serving the request would
+/// answer without the media. Both are refused: the client asked for what this
+/// server does not do.
+fn unsupported_request(has_constraint: bool, has_media: bool) -> Option<Error> {
+    if has_constraint {
+        return Some(Error::InvalidInput(
+            "speculative_decode_with_response_format_unsupported: `response_format` \
+             (json_object / json_schema) or a required/named `tool_choice` is not \
+             supported on the speculative-decoding path. Retry the request without \
+             speculative draft, or drop the constraint."
+                .to_owned(),
+        ));
+    }
+    if has_media {
+        return Some(Error::InvalidInput(
+            "this server decodes with a draft model, which takes no image or audio input"
+                .to_owned(),
+        ));
+    }
+    None
+}
+
 /// The sampling and logprob fields a speculative request sets that no
 /// speculative arm applies, named so the run log can be read back against what was asked for.
 ///
@@ -645,9 +671,7 @@ impl Generator for SpeculativeGenerator {
         }
 
         if req.prompt_tokens.is_empty() {
-            return Box::pin(stream::once(async {
-                Err(Error::Other("empty prompt".to_owned()))
-            }));
+            return Box::pin(stream::once(async { Err(super::helpers::empty_prompt()) }));
         }
 
         let (tx, rx) = tokio::sync::mpsc::channel::<rmlx_core::Result<GenerationToken>>(4);
@@ -700,30 +724,22 @@ impl Generator for SpeculativeGenerator {
         // per-event DB recorder (TTFT is written by the HTTP handler
         // layer off-runtime; only ITL/kv_cache_bytes are written here).
         let event_recorder = req.event_recorder;
-        // Speculative decode cannot honor a stateful grammar: the K+1
-        // verifier argmax has no per-token mask hook that aligns with
-        // `ConstraintEngine::step_mask`. The request is refused, not run
-        // unconstrained. The refusal is an `Error::Other`, which the OpenAI
-        // route maps to HTTP 503; the Anthropic route always sets
-        // `constraint: None`, so it can never reach this refusal.
-        // `req.constraint` is also set for `tool_choice: required` / a
-        // named tool, not only `response_format`.
-        if req.constraint.is_some() {
+        // The refusal is `Error::InvalidInput`, a 400 on both routes. The
+        // Anthropic route always sets `constraint: None` and passes no media, so
+        // it can never reach it. `req.constraint` is also set for
+        // `tool_choice: required` / a named tool, not only `response_format`.
+        if let Some(refusal) = unsupported_request(
+            req.constraint.is_some(),
+            !req.images.is_empty() || !req.audio_b64.is_empty(),
+        ) {
             tracing::warn!(
                 model_id = %req.model_id,
-                "SpeculativeGenerator: refusing request — response_format \
-                 or tool_choice + speculative decode not supported"
+                constraint = req.constraint.is_some(),
+                images = req.images.len(),
+                audio_clips = req.audio_b64.len(),
+                "SpeculativeGenerator: refusing a request the speculative path cannot serve"
             );
-            return Box::pin(stream::once(async {
-                Err(Error::Other(
-                    "speculative_decode_with_response_format_unsupported: \
-                     `response_format` (json_object / json_schema) or a \
-                     required/named `tool_choice` is not supported on the \
-                     speculative-decoding path. Retry the request without \
-                     speculative draft, or drop the constraint."
-                        .to_owned(),
-                ))
-            }));
+            return Box::pin(stream::once(async move { Err(refusal) }));
         }
         let _ = req.constraint;
         // Every speculative arm honours `temperature > 0`. The two-model arm runs

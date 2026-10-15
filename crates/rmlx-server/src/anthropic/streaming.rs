@@ -745,10 +745,7 @@ pub(super) async fn generate_streaming(
                                 // count mid-stream failures as failed requests.
                                 lifetime_requests_failed
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                tracing::error!(
-                                    error = %e,
-                                    "generation stream failed mid-flight, emitting error event"
-                                );
+                                crate::openai::errors::log_stream_failure(&e);
                                 // Hand the error to the epilogue. Breaking
                                 // without it would run the normal terminal
                                 // triplet, whose stop_reason resolves through
@@ -778,7 +775,7 @@ pub(super) async fn generate_streaming(
                             "type": "error",
                             "error": {
                                 "type": super::errors::engine_error_type(&e),
-                                "message": e.to_string(),
+                                "message": crate::openai::errors::engine_error_message(&e),
                             }
                         });
                         return Some((

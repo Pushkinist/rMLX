@@ -431,9 +431,7 @@ pub fn aspect_ratio_preserving_resize(
     cfg: &Gemma4ImageProcessorConfig,
 ) -> Result<(usize, usize)> {
     if height == 0 || width == 0 {
-        return Err(Error::Model(format!(
-            "gemma4 preprocess: zero-size image ({height}x{width})"
-        )));
+        return Err(Error::Model(format!("zero-size image ({height}x{width})")));
     }
 
     let max_patches = cfg.max_patches();
@@ -449,8 +447,8 @@ pub fn aspect_ratio_preserving_resize(
     // Edge case: both zero → error (matches Python ValueError).
     if target_h == 0 && target_w == 0 {
         return Err(Error::Model(format!(
-            "gemma4 preprocess: aspect_ratio_preserving_resize would produce 0x0 \
-             image from {height}x{width} with max_soft_tokens={}, patch_size={patch_size}",
+            "the image gives a 0x0 target \
+             size from {height}x{width} with max_soft_tokens={}, patch_size={patch_size}",
             cfg.max_soft_tokens
         )));
     }
@@ -487,11 +485,11 @@ pub fn aspect_ratio_preserving_resize(
 /// Returns `(rgb_hwc, height, width)` with `rgb_hwc` row-major `[h * w * 3]`.
 fn decode_rgb(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize)> {
     let img = image::load_from_memory(bytes)
-        .map_err(|e| Error::Model(format!("gemma4: image decode failed: {e}")))?;
+        .map_err(|e| Error::Model(format!("image decode failed: {e}")))?;
     let rgb = img.to_rgb8();
     let (w, h) = (rgb.width() as usize, rgb.height() as usize);
     if w == 0 || h == 0 {
-        return Err(Error::Model("gemma4: zero-size image".into()));
+        return Err(Error::Model("zero-size image".into()));
     }
     Ok((rgb.into_raw(), h, w))
 }

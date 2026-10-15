@@ -62,6 +62,46 @@ fn file_path_missing_returns_err() {
     assert!(load_image("/no/such/file.png", DEFAULT_HTTP_TIMEOUT).is_err());
 }
 
+/// A `~/` source that does not exist names the source as sent: no home
+/// directory of the server, no OS error text.
+#[test]
+fn a_missing_home_file_message_holds_no_server_path() {
+    let source = "~/rmlx-no-such-dir/img.png";
+    let msg = load_image(source, DEFAULT_HTTP_TIMEOUT).unwrap_err();
+    assert_eq!(msg, "cannot read image file ~/rmlx-no-such-dir/img.png");
+    let home = std::env::var("HOME").expect("HOME is set");
+    assert!(!msg.contains(&home), "{msg}");
+    assert!(!msg.contains("os error"), "{msg}");
+}
+
+/// A file that is missing and a path that cannot be read as a file give the
+/// same text, so the message does not tell the two apart.
+#[test]
+fn every_file_read_failure_has_one_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let directory = dir.path().to_str().unwrap();
+    let missing = dir.path().join("none.png");
+    let missing = missing.to_str().unwrap();
+    for source in [directory, missing] {
+        let msg = load_image(source, DEFAULT_HTTP_TIMEOUT).unwrap_err();
+        assert_eq!(msg, format!("cannot read image file {source}"));
+    }
+}
+
+/// A source longer than the quoted limit is cut, not repeated whole.
+#[test]
+fn a_long_source_is_cut_in_the_message() {
+    let source = format!("/{}", "a".repeat(500));
+    let msg = load_image(&source, DEFAULT_HTTP_TIMEOUT).unwrap_err();
+    assert_eq!(
+        msg,
+        format!(
+            "cannot read image file /{}...",
+            "a".repeat(QUOTED_SOURCE_CHARS - 1)
+        )
+    );
+}
+
 // ── 4. HTTP URL (localhost) ────────────────────────────────────────────────
 
 /// Spin up a bare-bones HTTP/1.1 server on a random port, serve a single
@@ -92,11 +132,34 @@ fn url_fetch_localhost() {
     assert_eq!(bytes, tiny_png_bytes());
 }
 
+/// A transport failure has one fixed text: no host, no port, no cause.
 #[test]
-fn url_error_on_connection_refused() {
-    // Port 1 is reserved and will be refused on macOS.
-    let result = load_image("http://127.0.0.1:1/img.png", Duration::from_millis(200));
-    assert!(result.is_err(), "expected connection error");
+fn url_transport_failure_has_one_text() {
+    let port = {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let url = format!("http://127.0.0.1:{port}/img.png");
+    let msg = load_image(&url, Duration::from_millis(500)).unwrap_err();
+    assert_eq!(msg, "the image URL could not be fetched");
+}
+
+/// A status the server got is named.
+#[test]
+fn url_status_is_named() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = std::io::Read::read(&mut stream, &mut buf);
+        stream
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .unwrap();
+    });
+    let url = format!("http://127.0.0.1:{port}/img.png");
+    let msg = load_image(&url, DEFAULT_HTTP_TIMEOUT).unwrap_err();
+    assert_eq!(msg, "the image URL answered 404");
 }
 
 /// Serve a fake response whose Content-Length exceeds the cap.

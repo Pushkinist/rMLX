@@ -147,7 +147,7 @@ pub(crate) fn decode_input_audio(
         .rsplit_once(',')
         .map_or(audio_b64, |(_, tail)| tail);
     let bytes = crate::image_io::base64_decode(b64)
-        .map_err(|e| Error::Other(format!("input_audio base64 decode failed: {e}")))?;
+        .map_err(|e| Error::InvalidInput(format!("input_audio base64 decode failed: {e}")))?;
     let audio = rmlx_audio::wav::WavDecoder::decode_resampled(
         &bytes,
         GEMMA4_AUDIO_SAMPLE_RATE,
@@ -162,15 +162,36 @@ pub(crate) fn decode_input_audio(
             && matches!(e, rmlx_audio::wav::WavError::TooLong { .. });
         if over_context_budget {
             let tokens_per_sec = GEMMA4_AUDIO_SAMPLE_RATE as usize / samples_per_token.max(1);
-            Error::Other(format!(
+            Error::InvalidInput(format!(
                 "input_audio holds more than the {max_secs} s of audio the context leaves \
                  after the prompt ({tokens_per_sec} tokens a second)"
             ))
         } else {
-            Error::Other(format!("input_audio decode failed: {e}"))
+            Error::InvalidInput(format!("input_audio decode failed: {e}"))
         }
     })?;
     Ok((audio.samples, audio.sample_rate))
+}
+
+/// The log-mel features of a decoded clip. A clip shorter than one frame is the
+/// client's; any other extractor failure is the server's.
+fn extract_mel(
+    feature_extractor: &rmlx_models::gemma4::Gemma4AudioFeatureExtractor,
+    samples: &[f32],
+) -> rmlx_core::Result<Vec<Vec<f32>>> {
+    feature_extractor.extract(samples).map_err(|e| {
+        if let rmlx_models::gemma4::AudioFeatError::TooShort {
+            n_samples,
+            min_samples,
+        } = e
+        {
+            Error::InvalidInput(format!(
+                "input_audio is too short: {n_samples} samples, need at least {min_samples}"
+            ))
+        } else {
+            Error::Other(format!("input_audio mel extraction failed: {e}"))
+        }
+    })
 }
 
 /// Decode + preprocess `input_audio` clips, expand the prompt with per-clip
@@ -203,7 +224,7 @@ pub(crate) fn build_audio_prompt(
     cancelled: &dyn Fn() -> bool,
 ) -> rmlx_core::Result<(Vec<u32>, rmlx_mlx::Array, rmlx_mlx::Array)> {
     if audio_b64.len() != 1 {
-        return Err(Error::Other(format!(
+        return Err(Error::InvalidInput(format!(
             "audio input currently serves exactly one audio clip per request (got {})",
             audio_b64.len()
         )));
@@ -260,16 +281,14 @@ pub(crate) fn build_audio_prompt(
     let dur_secs = n_samples as f64 / f64::from(GEMMA4_AUDIO_SAMPLE_RATE);
 
     // 2. log-mel features [T, 128].
-    let mel = feature_extractor
-        .extract(&samples)
-        .map_err(|e| Error::Other(format!("input_audio mel extraction failed: {e}")))?;
+    let mel = extract_mel(feature_extractor, &samples)?;
     drop(samples);
     if cancelled() {
         return Err(Error::Cancelled);
     }
     let t_mel = mel.len();
     if t_mel == 0 {
-        return Err(Error::Other(
+        return Err(Error::InvalidInput(
             "input_audio produced zero mel frames (clip too short)".to_owned(),
         ));
     }
@@ -278,7 +297,7 @@ pub(crate) fn build_audio_prompt(
     // 3. number of audio soft tokens this clip yields (encoder output frames).
     let t_sub = encoder.num_output_frames(t_mel);
     if t_sub == 0 {
-        return Err(Error::Other(
+        return Err(Error::InvalidInput(
             "input_audio produced zero audio soft tokens (clip too short)".to_owned(),
         ));
     }
@@ -374,7 +393,7 @@ fn build_unified_audio_prompt(
         rmlx_models::gemma4::extract_waveform_frames(&samples, cfg.audio_samples_per_token);
     drop(samples);
     if num_tokens == 0 {
-        return Err(Error::Other(
+        return Err(Error::InvalidInput(
             "input_audio produced zero audio soft tokens (clip empty)".to_owned(),
         ));
     }

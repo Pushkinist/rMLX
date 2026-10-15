@@ -18,6 +18,10 @@ use tracing::{debug, instrument};
 /// Maximum number of bytes accepted from an HTTP response (50 MiB).
 const HTTP_MAX_BYTES: usize = 50 * 1024 * 1024;
 
+/// The one message for a fetch that failed below HTTP: DNS, connect, TLS,
+/// timeout, a body that broke off. The cause is in the debug log only.
+const FETCH_FAILED: &str = "the image URL could not be fetched";
+
 /// Default HTTP timeout used by [`load_image`].
 pub const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -63,12 +67,28 @@ pub fn load_image(source: &str, timeout: Duration) -> Result<Vec<u8>, String> {
         } else {
             std::path::PathBuf::from(s)
         };
-        return std::fs::read(&p)
-            .map_err(|e| format!("cannot read image file {}: {e}", p.display()));
+        return std::fs::read(&p).map_err(|e| {
+            debug!(error = %e, "image file read failed");
+            format!("cannot read image file {}", quoted(s))
+        });
     }
 
     // ── 4. Raw base64 ─────────────────────────────────────────────────────────
     base64_decode(s).map_err(|e| format!("base64 decode: {e} (not a data URI or readable path)"))
+}
+
+/// The longest source text a message repeats.
+const QUOTED_SOURCE_CHARS: usize = 120;
+
+/// `source` as the client sent it, cut at [`QUOTED_SOURCE_CHARS`].
+fn quoted(source: &str) -> String {
+    let mut chars = source.chars();
+    let head: String = chars.by_ref().take(QUOTED_SOURCE_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{head}...")
+    } else {
+        head
+    }
 }
 
 /// One-word label for tracing field (no I/O).
@@ -102,10 +122,14 @@ fn fetch_url(url: &str, timeout: Duration) -> Result<Vec<u8>, String> {
         .build()
         .into();
 
-    let mut response = agent
-        .get(url)
-        .call()
-        .map_err(|e| format!("HTTP fetch {url}: {e}"))?;
+    let mut response = agent.get(url).call().map_err(|e| {
+        debug!(error = %e, "image fetch failed");
+        if let ureq::Error::StatusCode(code) = e {
+            format!("the image URL answered {code}")
+        } else {
+            FETCH_FAILED.to_owned()
+        }
+    })?;
 
     // Honour Content-Length pre-check to refuse clearly oversized payloads
     // before reading the body.
@@ -125,7 +149,14 @@ fn fetch_url(url: &str, timeout: Duration) -> Result<Vec<u8>, String> {
         .with_config()
         .limit(HTTP_MAX_BYTES as u64)
         .read_to_vec()
-        .map_err(|e| format!("reading HTTP body from {url}: {e}"))?;
+        .map_err(|e| {
+            debug!(error = %e, "image fetch body read failed");
+            if matches!(e, ureq::Error::BodyExceedsLimit(_)) {
+                format!("image response too large: over {HTTP_MAX_BYTES} bytes")
+            } else {
+                FETCH_FAILED.to_owned()
+            }
+        })?;
 
     debug!(url, bytes = bytes.len(), "image fetch complete");
     Ok(bytes)

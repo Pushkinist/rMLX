@@ -12,7 +12,7 @@
 //! `rmlx-cli`'s `auto_kv_quant_resolves_to_bf16_for_every_arch_branch`. Split on
 //! purpose — a value that appears on both sides of an assertion checks nothing.
 
-use super::{kv_quant_for_request, resolve_kv_quant_for_load};
+use super::{empty_prompt, kv_quant_for_request, resolve_kv_quant_for_load};
 use rmlx_kv_quant::KvQuant;
 use rmlx_models::kv_cache::DEFAULT_KV_QUANT;
 
@@ -147,4 +147,13 @@ fn no_launch_codec_and_no_request_codec_stays_unset() {
     // arch's own default", which is the same constant. Manufacturing a codec
     // here would hide a resolver that failed to run.
     assert_eq!(kv_quant_for_request(None, None), None);
+}
+
+/// An empty prompt is the client's input and fails the same way on every
+/// attempt: `InvalidInput`, which is not replayed.
+#[test]
+fn an_empty_prompt_is_invalid_input() {
+    let err = empty_prompt();
+    assert!(matches!(err, rmlx_core::Error::InvalidInput(_)), "{err:?}");
+    assert!(!err.is_migratable());
 }

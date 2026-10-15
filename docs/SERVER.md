@@ -2,7 +2,7 @@
 
 Reference for the rMLX HTTP server (`crates/rmlx-server`): routes, the OpenAI
 and Anthropic surfaces, streaming, tool calling, embeddings, audio, chat
-templates, admission, model lifecycle, the claim file and the retry envelope.
+templates, admission, model lifecycle and the retry envelope.
 
 ---
 
@@ -24,7 +24,7 @@ schema: field names, SSE event types and block shape.
 After SIGINT or SIGTERM the server exits within 10 s, or 2 s after a second
 signal. An open request has 8 s to reply, then gets 503. A stream that is
 cut can lack `[DONE]`, `finish_reason` or `message_stop`. See [`SERVER_SHUTDOWN.md`](SERVER_SHUTDOWN.md). The claim file
-is never removed. A handler panic returns 500.
+([`SERVER_CLAIM.md`](SERVER_CLAIM.md)) is never removed. A handler panic returns 500.
 The request body limit is 26 MiB.
 
 ### Compute placement
@@ -202,26 +202,27 @@ prompt at the placeholder positions, and decode runs from the fused
 | `input_audio` | `{type:"input_audio", input_audio:{data:"<base64>", format:"wav"}}` | Conformer or encoder-free | Gemma4 |
 
 **Audio.** The `rmlx-audio` decoder (Symphonia: WAV, MP3, M4A, ADTS AAC)
-downmixes to mono and resamples to 16 kHz. It refuses a file that lost more
-audio than the limit for its length, or whose reader fails
-([`AUDIO.md`](AUDIO.md), "WAV I/O"). The Gemma4 Conformer checkpoints
-run the USM log-mel front-end and the Conformer `audio_tower`. The unified
+downmixes to mono and resamples to 16 kHz ([`AUDIO.md`](AUDIO.md), "WAV I/O").
+The Gemma4 Conformer checkpoints run the USM log-mel front-end and the Conformer `audio_tower`. The unified
 encoder-free checkpoint (`Gemma4UnifiedForConditionalGeneration`) cuts the
 waveform into 640-sample frames and projects each with `embed_audio`, one soft
 token per 40 ms; see [`MODELS.md`](MODELS.md). The prompt gets `<|audio>`,
 N × `<|audio|>` and `<audio|>`, and the soft tokens land on the `<|audio|>`
 positions.
 
-- One clip per request; more is an error.
-- Image and audio together in one request is an error.
-- Audio sent to a model with no audio tower is 503 "this model does not
-  accept audio input (no audio tower)". Images sent to a model with no vision
-  tower get the matching "no vision tower" 503.
+- Media the client got wrong is 400 `invalid_request_error` with the fact: a
+  second clip, image and audio together, a clip the decoder refuses, an image
+  that does not load or decode, input for a model with no audio or vision
+  tower, any media on a server with a draft model. A remote image the server
+  cannot fetch is a 400 too, as the URL is the client's input: "the image URL
+  answered 404", or "the image URL could not be fetched".
 - Each `input_audio` part is capped at 16 MiB decoded
   (`bounds::MAX_INPUT_AUDIO_BYTES`); a larger clip is 400. Its audio is
   capped at what the context holds after the prompt, at most 3 h (`docs/AUDIO.md`
-  § "WAV I/O"). Its decode stops when the request is gone; the audio tower
-  and the prefill are not cut.
+  § "WAV I/O"). The decode of the clip reads the stop of the request before
+  each packet and ends with it. The audio tower and the one prefill forward of
+  the audio prompt run to their end; the job stops at its next read of the
+  stop after them.
 
 ### Responses
 
@@ -454,8 +455,8 @@ Errors use the OpenAI envelope:
 
 | HTTP | `type` | Condition |
 |---|---|---|
-| 400 | `invalid_request_error` | Bad field, out-of-range value, `echo:true`, `functions`, over-cap `max_tokens`. |
-| 400 | `context_length_exceeded` | The prompt exceeds the effective `max_ctx`, or a per-request `max_ctx` exceeds the positional capacity. |
+| 400 | `invalid_request_error` | Bad field, out-of-range value, `echo:true`, `functions`, over-cap `max_tokens`, refused media input. |
+| 400 | `context_length_exceeded` | The prompt exceeds the effective `max_ctx`, or a per-request `max_ctx` exceeds the positional capacity. Image or audio tokens spliced in after the prompt check can push a prompt past `max_ctx`: the engine answers the same 400, counter `context_overflow`, also as the error event of a stream. |
 | 404 | `not_found_error` | Chat or embeddings model not in the registry (`model_not_found` on the lifecycle routes). |
 | 408 | `timeout` | The request timeout expired. |
 | 429 | `rate_limit_error` | The GPU admission queue is full. |
@@ -658,11 +659,6 @@ refuses the same files. The other files are best-effort: a missing file logs a
 `warn!`.
 `list()` returns the entries in id order.
 
-### Claim file
-
-Split into [`SERVER_SHUTDOWN.md`](SERVER_SHUTDOWN.md) § "Claim file" to keep this doc
-under the size cap.
-
 ---
 
 ## Retry Envelope
@@ -681,14 +677,14 @@ through `RmlxError::is_migratable` (`crates/rmlx-core/src/error.rs`):
 | Class | Variants | Action |
 |---|---|---|
 | `Migratable` | `Mlx`, `Other` | Replay. |
-| `Fatal` | every other variant: `Io`, `Config`, `Loader`, `Quant`, `Model`, `SmokeProbe`, `Oom`, `ArchUnsupported`, `KvStorageMismatch`, `SsdTierAlreadyInstalled`, `Unimplemented`, `KvHardCapExceeded`, `KvCeilingExceeded`, `ContextCeilingExceeded`, `SpeculativePairing`, `GpuForbidden`, `Cancelled` | Surface the error. |
+| `Fatal` | every other variant: `Io`, `Config`, `Loader`, `Quant`, `Model`, `SmokeProbe`, `Oom`, `ArchUnsupported`, `KvStorageMismatch`, `SsdTierAlreadyInstalled`, `Unimplemented`, `KvHardCapExceeded`, `KvCeilingExceeded`, `ContextCeilingExceeded`, `SpeculativePairing`, `GpuForbidden`, `Cancelled`, `InvalidInput` | Surface the error. |
 
 The match has no wildcard arm and lives in `rmlx-core`, where `RmlxError` is
 defined. A new variant fails the build until it is classified.
 
 A NaN logit row at prefill is `Other`, so it is replayed; a deterministic one
 surfaces after three attempts as 503 `service_unavailable`. An empty prompt is
-`Model`, so it fails at once. `Cancelled` is the stop of a request that is
+`InvalidInput`, so it fails at once. `Cancelled` is the stop of a request that is
 gone.
 
 ### Skip conditions

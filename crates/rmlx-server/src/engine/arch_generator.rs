@@ -42,7 +42,7 @@ use super::types::{
 /// the audio-only / image-only / text-only paths route unchanged.
 fn reject_combined_image_audio(has_image: bool, has_audio: bool) -> Option<Error> {
     if has_image && has_audio {
-        Some(Error::Other(
+        Some(Error::InvalidInput(
             "combined image + audio input in one request is not supported; \
              send them in separate turns"
                 .to_owned(),
@@ -50,6 +50,14 @@ fn reject_combined_image_audio(has_image: bool, has_audio: bool) -> Option<Error
     } else {
         None
     }
+}
+
+/// The refusal of `input` (image, audio) sent to a model with no `tower`
+/// (vision, audio) for it.
+fn no_tower_for(input: &str, tower: &str) -> Error {
+    Error::InvalidInput(format!(
+        "this model does not accept {input} input (no {tower} tower)"
+    ))
 }
 
 // ── ArchGenerator ─────────────────────────────────────────────────────────────
@@ -548,9 +556,7 @@ impl Generator for ArchGenerator {
         }
 
         if req.prompt_tokens.is_empty() {
-            return Box::pin(stream::once(async {
-                Err(Error::Other("empty prompt".to_owned()))
-            }));
+            return Box::pin(stream::once(async { Err(super::helpers::empty_prompt()) }));
         }
 
         // Per-request channel: the blocking generation thread sends one
@@ -982,9 +988,7 @@ impl Generator for ArchGenerator {
                             }
                         }
                     } else {
-                        let _ = tx.blocking_send(Err(Error::Other(
-                            "this model does not accept image input (no vision tower)".to_owned(),
-                        )));
+                        let _ = tx.blocking_send(Err(no_tower_for("image", "vision")));
                         return;
                     }
                 } else {
@@ -1048,9 +1052,7 @@ impl Generator for ArchGenerator {
                             }
                         }
                     } else {
-                        let _ = tx.blocking_send(Err(Error::Other(
-                            "this model does not accept audio input (no audio tower)".to_owned(),
-                        )));
+                        let _ = tx.blocking_send(Err(no_tower_for("audio", "audio")));
                         return;
                     }
                 } else {

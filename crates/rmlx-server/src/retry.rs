@@ -119,16 +119,16 @@ pub enum RetryClass {
 /// a catch-all here silently defaulting an unclassified error to `Fatal`.
 ///
 /// - Migratable: [`RmlxError::Mlx`] (any Metal-level fault) and
-///   [`RmlxError::Other`]. `Other` also wraps permanent, request-shape
-///   refusals (model id mismatch, empty prompt, the speculative-decode
-///   constraint refusal), which this classifies as retryable too — the
+///   [`RmlxError::Other`]. `Other` also wraps permanent refusals (a model
+///   id mismatch), which this classifies as retryable too — the
 ///   variant does not distinguish a recovered panic from a permanent
 ///   refusal, so a request in the second group is retried and fails the
 ///   same way every time.
 /// - Fatal: every other variant — structural, configuration, OOM, smoke-probe,
-///   the KV ceiling / hard-cap rejections (the bound is the same on every
-///   attempt, whichever phase crossed it), and the stop of a request that is
-///   gone (a replay has no reader).
+///   input the client got wrong ([`RmlxError::InvalidInput`]), the KV
+///   ceiling / hard-cap rejections (the bound is the same on every attempt,
+///   whichever phase crossed it), and the stop of a request that is gone (a
+///   replay has no reader).
 pub fn classify(err: &RmlxError) -> RetryClass {
     if err.is_migratable() {
         RetryClass::Migratable

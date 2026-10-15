@@ -618,8 +618,7 @@ size cap. Where a variable has a flag, the flag wins.
 Metal allows one GPU context per process. rMLX takes one machine-wide claim,
 an exclusive `flock` on `/var/tmp/rmlx.claim`, before it uses the GPU. The
 file is never deleted; the kernel releases the lock when the holder exits,
-is killed, or crashes. Internals are in [`SERVER.md`](SERVER.md)
-§ "Claim file".
+is killed, or crashes. Internals are in [`SERVER_CLAIM.md`](SERVER_CLAIM.md).
 
 A second process that asks for the GPU while the claim is held is refused
 with exit code `11`, naming the recorded holder's PID and command (the

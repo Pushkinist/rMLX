@@ -62,6 +62,11 @@ async fn engine_error_type_matches_response() {
         // wildcard arm — the common case for a mid-decode engine fault.
         rmlx_core::Error::Mlx("device error".to_owned()),
         rmlx_core::Error::Other("engine panic".to_owned()),
+        rmlx_core::Error::InvalidInput("input_audio decode failed: no audio track".to_owned()),
+        rmlx_core::Error::KvCeilingExceeded {
+            requested: 641,
+            ceiling: 640,
+        },
     ];
     for e in &cases {
         let (_status, _retry, body) = oom_parts(e).await;
@@ -74,6 +79,126 @@ async fn engine_error_type_matches_response() {
             "engine_error_type drifted from engine_error_response for {e:?} — \
              a streamed client would see a different `type` than a blocking one"
         );
+    }
+}
+
+/// Input the client got wrong is a 400 `invalid_request_error` whose message is
+/// the fact, not a retryable 503; a fault of the server stays a 503.
+#[tokio::test]
+async fn invalid_input_is_400_invalid_request_error_with_its_fact() {
+    let e = rmlx_core::Error::InvalidInput(
+        "input_audio decode failed: the file holds no audio track".to_owned(),
+    );
+    let (status, retry, body) = oom_parts(&e).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(
+        body["error"]["message"],
+        "input_audio decode failed: the file holds no audio track"
+    );
+    assert_eq!(retry, None);
+    assert_eq!(errors::engine_error_type(&e), "invalid_request_error");
+    assert!(matches!(
+        errors::engine_error_category(&e),
+        ApiErrorCategory::BadRequest
+    ));
+
+    let server_fault = rmlx_core::Error::Other("the audio tower did not answer".to_owned());
+    let (status, _, body) = oom_parts(&server_fault).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["type"], "service_unavailable");
+    assert!(matches!(
+        errors::engine_error_category(&server_fault),
+        ApiErrorCategory::Upstream
+    ));
+}
+
+/// A subscriber that keeps the level of every event.
+struct LevelRecorder(std::sync::Mutex<Vec<tracing::Level>>);
+
+impl tracing::Subscriber for &'static LevelRecorder {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        self.0.lock().unwrap().push(*event.metadata().level());
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// A stream that fails because of the client's input logs a warning; a fault of
+/// the server logs an error.
+#[test]
+fn a_stream_failure_logs_a_client_fault_as_warn_and_a_server_fault_as_error() {
+    let recorder: &'static LevelRecorder =
+        Box::leak(Box::new(LevelRecorder(std::sync::Mutex::default())));
+    tracing::subscriber::with_default(recorder, || {
+        errors::log_stream_failure(&rmlx_core::Error::InvalidInput("a bad clip".to_owned()));
+        errors::log_stream_failure(&rmlx_core::Error::KvCeilingExceeded {
+            requested: 641,
+            ceiling: 640,
+        });
+        errors::log_stream_failure(&rmlx_core::Error::Other("tower down".to_owned()));
+    });
+    assert_eq!(
+        *recorder.0.lock().unwrap(),
+        [
+            tracing::Level::WARN,
+            tracing::Level::WARN,
+            tracing::Level::ERROR
+        ]
+    );
+}
+
+/// A sequence past the KV ceiling, image and audio tokens included, is the
+/// 400 `context_length_exceeded` the route gives a prompt over `max_ctx`, and
+/// it is counted as `ContextOverflow`. The operator's limits stay 503.
+#[tokio::test]
+async fn kv_ceiling_exceeded_is_400_context_length_exceeded() {
+    let e = rmlx_core::Error::KvCeilingExceeded {
+        requested: 641,
+        ceiling: 640,
+    };
+    let (status, retry, body) = oom_parts(&e).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["type"], "context_length_exceeded");
+    assert_eq!(
+        body["error"]["message"],
+        "the request needs 641 tokens of context, max_ctx is 640"
+    );
+    assert_eq!(retry, None);
+    assert_eq!(errors::engine_error_type(&e), "context_length_exceeded");
+    assert!(matches!(
+        errors::engine_error_category(&e),
+        ApiErrorCategory::ContextOverflow
+    ));
+    assert!(!e.is_migratable());
+
+    for operator_limit in [
+        rmlx_core::Error::KvHardCapExceeded {
+            requested: 641,
+            cap: 640,
+        },
+        rmlx_core::Error::ContextCeilingExceeded {
+            requested: 9,
+            positional_max: 8,
+            trained_max: 8,
+            lift: String::new(),
+        },
+    ] {
+        let (status, _, body) = oom_parts(&operator_limit).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{operator_limit:?}"
+        );
+        assert_eq!(body["error"]["type"], "service_unavailable");
     }
 }
 
