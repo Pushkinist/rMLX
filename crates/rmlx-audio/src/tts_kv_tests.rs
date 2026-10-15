@@ -1,8 +1,8 @@
 //! The key/value slot and the attention over it: the live rows a slot returns
 //! are the plain concatenation of what it was given, its capacity grows only
 //! when the rows pass it, and the attention over K and V at their own head
-//! count equals the attention over K and V repeated for every query head.
-//! CPU only, no weights.
+//! count equals the attention over K and V repeated for every query head. The
+//! talker's RoPE agrees with the reference's table RoPE. CPU only, no weights.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -10,16 +10,18 @@
 )]
 
 use super::{
-    apply_rope, build_rope, KvSlot, Linear, Plain, RmsNormLayer, TalkerAttn, TtsError,
-    PREDICTOR_KV_BLOCK_ROWS, TALKER_KV_BLOCK_ROWS as BLOCK,
+    plain_rope, KvSlot, Linear, Plain, RmsNormLayer, TalkerAttn, TtsError, PREDICTOR_KV_BLOCK_ROWS,
+    TALKER_KV_BLOCK_ROWS as BLOCK,
 };
-use rmlx_mlx::{concatenate, scaled_dot_product_attention, Array, Device, Dtype};
+use rmlx_mlx::{
+    add, concatenate, multiply, negative, scaled_dot_product_attention, Array, Device, Dtype,
+};
 
 const D: Device = Device::Cpu;
-const HIDDEN: i32 = 32;
+pub(super) const HIDDEN: i32 = 32;
 const HEADS: i32 = 16;
 pub(super) const KV_HEADS: i32 = 8;
-const HEAD_DIM: i32 = 8;
+pub(super) const HEAD_DIM: i32 = 8;
 /// Rows of the first call of a talker's sequence; every later call has one.
 pub(super) const PREFILL_ROWS: i32 = 9;
 
@@ -29,19 +31,24 @@ pub(super) fn first_call_past(blocks: i32) -> usize {
     (blocks * BLOCK - PREFILL_ROWS + 1) as usize
 }
 
+/// A plain linear layer of weight `w`, with no bias.
+pub(super) fn plain(w: &Array) -> Linear {
+    Linear::Plain(Plain {
+        w: w.try_clone().unwrap(),
+        b: None,
+    })
+}
+
 /// An attention layer of [`HEADS`] query heads over [`KV_HEADS`] key/value
-/// heads. `weight` gives the array of every weight, by its shape.
+/// heads. `weight` gives the array of every weight, by its shape, and
+/// `as_linear` makes a projection of a weight.
 pub(super) fn attention(
     hidden: i32,
     head_dim: i32,
     mut weight: impl FnMut(&[i32]) -> Array,
+    as_linear: impl Fn(&Array) -> Linear,
 ) -> TalkerAttn {
-    let mut linear = |out: i32, inp: i32| {
-        Linear::Plain(Plain {
-            w: weight(&[out, inp]),
-            b: None,
-        })
-    };
+    let mut linear = |out: i32, inp: i32| as_linear(&weight(&[out, inp]));
     let q_proj = linear(HEADS * head_dim, hidden);
     let k_proj = linear(KV_HEADS * head_dim, hidden);
     let v_proj = linear(KV_HEADS * head_dim, hidden);
@@ -66,7 +73,7 @@ pub(super) fn attention(
 }
 
 /// A fixed sequence of values in `[-1, 1)`.
-struct Values(u64);
+pub(super) struct Values(pub(super) u64);
 
 impl Values {
     fn next(&mut self) -> f32 {
@@ -77,7 +84,7 @@ impl Values {
         ((self.0 >> 40) as f32 / (1u64 << 23) as f32) - 1.0
     }
 
-    fn array(&mut self, shape: &[i32]) -> Array {
+    pub(super) fn array(&mut self, shape: &[i32]) -> Array {
         let len = shape.iter().product::<i32>() as usize;
         let data: Vec<f32> = (0..len).map(|_| self.next()).collect();
         Array::from_f32_slice(&data, shape).unwrap()
@@ -172,15 +179,22 @@ fn a_code_predictor_slot_holds_no_unused_row() {
     );
 }
 
-/// Rows that fit the capacity and have another dtype than the buffer are
-/// refused, for the keys and for the values, and the slot keeps its rows.
-/// `slice_update` would cast them to the dtype of the buffer.
+/// Rows of another dtype than the buffer are refused, for the keys and for
+/// the values, and the slot keeps its rows: rows that fit the capacity
+/// (`slice_update` would cast them to the dtype of the buffer) and rows that
+/// grow it (the concatenation would promote the buffer to their dtype).
 #[test]
 fn rows_of_another_dtype_than_the_buffer_are_refused() {
+    for block in [BLOCK, PREDICTOR_KV_BLOCK_ROWS] {
+        refuses_rows_of_another_dtype(block);
+    }
+}
+
+fn refuses_rows_of_another_dtype(block: i32) {
     let mut values = Values(0xd7e);
     let shape = [1, KV_HEADS, 1, HEAD_DIM];
     let half = |values: &mut Values| values.array(&shape).astype(Dtype::Bf16, D).unwrap();
-    let mut slot = KvSlot::new(BLOCK);
+    let mut slot = KvSlot::new(block);
     slot.update_and_fetch(&half(&mut values), &half(&mut values), D)
         .unwrap();
 
@@ -196,7 +210,10 @@ fn rows_of_another_dtype_than_the_buffer_are_refused() {
                     "the error must name both dtypes: {message}"
                 );
             }
-            other => panic!("expected the dtype error, got {:?}", other.map(|_| ())),
+            other => panic!(
+                "block of {block} rows: expected the dtype error, got {:?}",
+                other.map(|_| ())
+            ),
         }
         assert_eq!(slot.rows, 1);
     }
@@ -218,12 +235,14 @@ fn repeated_for_the_query_heads(x: &Array) -> Array {
 }
 
 /// The attention of `attn` over `x` with K and V kept by concatenation in
-/// `history` and repeated for every query head.
+/// `history` and repeated for every query head, with `rope(x, offset)` applied
+/// to the normed queries and keys.
 fn attention_over_repeated_kv(
     attn: &TalkerAttn,
     x: &Array,
     history: &mut Option<(Array, Array)>,
     offset: i32,
+    rope: impl Fn(&Array, i32) -> Array,
 ) -> Array {
     let rows = x.shape()[1];
     let heads = |projected: Array, heads: i32| {
@@ -243,9 +262,8 @@ fn attention_over_repeated_kv(
     let q = heads(attn.q_proj.forward(x, D).unwrap(), HEADS);
     let k = heads(attn.k_proj.forward(x, D).unwrap(), KV_HEADS);
     let v = heads(attn.v_proj.forward(x, D).unwrap(), KV_HEADS);
-    let (cos, sin) = build_rope(offset, rows, HEAD_DIM, attn.rope_theta, D).unwrap();
-    let q = apply_rope(&normed(&q, &attn.q_norm, HEADS), &cos, &sin, D).unwrap();
-    let k = apply_rope(&normed(&k, &attn.k_norm, KV_HEADS), &cos, &sin, D).unwrap();
+    let q = rope(&normed(&q, &attn.q_norm, HEADS), offset);
+    let k = rope(&normed(&k, &attn.k_norm, KV_HEADS), offset);
 
     let (k, v) = match history.take() {
         None => (k, v),
@@ -277,19 +295,133 @@ fn attention_over_repeated_kv(
 #[test]
 fn attention_at_the_kv_head_count_equals_attention_over_repeated_kv() {
     let mut values = Values(0xa77e);
-    let attn = attention(HIDDEN, HEAD_DIM, |shape| values.array(shape));
+    let attn = attention(HIDDEN, HEAD_DIM, |shape| values.array(shape), plain);
     let mut slot = KvSlot::new(BLOCK);
     let mut history = None;
     let mut offset = 0;
     for rows in [PREFILL_ROWS, 1, 1, 1, 1, 1, 1] {
         let x = values.array(&[1, rows, HIDDEN]);
         let got = attn.forward(&x, &mut slot, offset, D).unwrap();
-        let want = attention_over_repeated_kv(&attn, &x, &mut history, offset);
+        let want = attention_over_repeated_kv(&attn, &x, &mut history, offset, |x, offset| {
+            plain_rope(x, HEAD_DIM, attn.rope_theta, offset, D).unwrap()
+        });
         offset += rows;
         assert_eq!(got.shape(), want.shape(), "{offset} live rows");
         assert!(
             got.to_bytes().unwrap() == want.to_bytes().unwrap(),
             "the outputs differ at {rows} query rows, {offset} live rows"
+        );
+    }
+}
+
+/// RoPE as the reference applies it to `x: [1, heads, S, head_dim]` at
+/// positions `offset..offset + S`: `x * cos + rotate_half(x) * sin`, where
+/// element `i` of a row turns by `position * theta^(-2 (i mod half) / head_dim)`.
+/// The tables are computed on the host in f64.
+fn table_rope(x: &Array, offset: i32, theta: f32) -> Array {
+    let shape = x.shape();
+    let (heads, rows, dim) = (shape[1], shape[2], shape[3]);
+    let half = dim / 2;
+    let angles: Vec<f64> = (offset..offset + rows)
+        .flat_map(|position| {
+            (0..dim).map(move |i| {
+                let exponent = -2.0 * f64::from(i % half) / f64::from(dim);
+                f64::from(position) * f64::from(theta).powf(exponent)
+            })
+        })
+        .collect();
+    let table = |f: fn(f64) -> f64| {
+        let values: Vec<f32> = angles.iter().map(|&a| f(a) as f32).collect();
+        Array::from_f32_slice(&values, &[1, 1, rows, dim]).unwrap()
+    };
+    let first = x
+        .slice(&[0, 0, 0, 0], &[1, heads, rows, half], &[1; 4], D)
+        .unwrap();
+    let second = x
+        .slice(&[0, 0, 0, half], &[1, heads, rows, dim], &[1; 4], D)
+        .unwrap();
+    let rotated = concatenate(&[&negative(&second, D).unwrap(), &first], 3, D).unwrap();
+    add(
+        &multiply(x, &table(f64::cos), D).unwrap(),
+        &multiply(&rotated, &table(f64::sin), D).unwrap(),
+        D,
+    )
+    .unwrap()
+}
+
+/// The largest absolute difference of two arrays of one shape. A value that
+/// is not finite in either is a failure: the fold would drop a NaN.
+fn max_abs_diff(a: &Array, b: &Array) -> f32 {
+    assert_eq!(a.shape(), b.shape());
+    let floats = |x: &Array| -> Vec<f32> {
+        let values: Vec<f32> = x
+            .astype(Dtype::F32, D)
+            .unwrap()
+            .to_bytes()
+            .unwrap()
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert!(
+            values.iter().all(|v| v.is_finite()),
+            "an array holds a value that is not finite"
+        );
+        values
+    };
+    floats(a)
+        .iter()
+        .zip(floats(b))
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max)
+}
+
+/// A position past the last one a talker reaches: the prefill and
+/// [`MAX_FRAMES`](super::MAX_FRAMES) frames.
+const FAR_OFFSET: i32 = 2100;
+
+/// The fused op computes the angle of a position in f32, which moves a value
+/// by up to about 2e-4 at [`FAR_OFFSET`] and by less than 1e-6 at position 0.
+/// One bf16 step at 1.0 is 7.8e-3.
+const ROPE_TOLERANCE: f32 = 1e-3;
+
+/// The shapes of the RoPE in the checkpoints: the talker and the code
+/// predictor (head dim 128, base 1e6) and the codec decoder's pre-transformer
+/// (16 heads, head dim 64, base 1e4), as `(heads, head_dim, theta)`.
+const ROPE_SHAPES: [(i32, i32, f32); 2] = [(KV_HEADS, 128, 1e6), (16, 64, 1e4)];
+
+/// On f32 input, the fused RoPE agrees with the reference's table RoPE: the
+/// same variant (halves rotated, not traditional), base and rotated width. A
+/// mismatch in any of them moves the values by far more than the tolerance.
+#[test]
+fn the_fused_rope_matches_the_table_rope_of_the_reference() {
+    let mut values = Values(0x2073);
+    for (heads, head_dim, theta) in ROPE_SHAPES {
+        for offset in [0, 1, FAR_OFFSET] {
+            let x = values.array(&[1, heads, PREFILL_ROWS, head_dim]);
+            let diff = max_abs_diff(
+                &plain_rope(&x, head_dim, theta, offset, D).unwrap(),
+                &table_rope(&x, offset, theta),
+            );
+            assert!(
+                diff < ROPE_TOLERANCE,
+                "head dim {head_dim}, base {theta}, offset {offset}: the RoPEs differ by {diff}"
+            );
+        }
+    }
+
+    let attn = attention(HIDDEN, HEAD_DIM, |shape| values.array(shape), plain);
+    let mut slot = KvSlot::new(BLOCK);
+    let mut history = None;
+    for (rows, offset) in [(PREFILL_ROWS, 0), (1, PREFILL_ROWS), (1, FAR_OFFSET)] {
+        let x = values.array(&[1, rows, HIDDEN]);
+        let got = attn.forward(&x, &mut slot, offset, D).unwrap();
+        let want = attention_over_repeated_kv(&attn, &x, &mut history, offset, |x, offset| {
+            table_rope(x, offset, attn.rope_theta)
+        });
+        let diff = max_abs_diff(&got, &want);
+        assert!(
+            diff < ROPE_TOLERANCE,
+            "attention, {rows} rows at offset {offset}: the outputs differ by {diff}"
         );
     }
 }

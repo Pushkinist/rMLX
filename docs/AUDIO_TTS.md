@@ -36,7 +36,16 @@ A Qwen3 transformer over the `talker.*` weights. Its dimensions come from
 - `text_projection` (fc1, fc2) maps text embeddings into the talker's hidden
   space.
 - Attention: grouped-query, per-head Q/K RMSNorm, RoPE over sequential
-  positions.
+  positions. The config declares an interleaved M-RoPE (`mrope_section`), but
+  each talker token has the same position in all three sections, so it is
+  plain RoPE: the fused MLX op over the whole head, with the halves rotated
+  (not traditional), at base `rope_theta`. The code predictor has the same
+  layer type and the same RoPE.
+- The stream keeps the dtype of the checkpoint. The fused RoPE returns the
+  dtype of its input, so with bf16 weights the hidden stream, the queries,
+  the keys, the values and the KV cache are bf16. One position of the cache
+  of the 28 talker layers (K and V, 8 KV heads, head dim 128) is
+  2 × 28 × 1024 × 2 B = 114,688 B (112 KiB), by arithmetic on the config.
 - The KV cache is unquantized. Each layer keeps its keys and values in two
   buffers that grow by 256 rows (see "Memory").
 - `codec_head` predicts codec group 0.
@@ -90,7 +99,9 @@ nothing is copied for the query heads. When the rows of a step do not fit, the
 capacity grows to the next multiple of `TALKER_KV_BLOCK_ROWS` (256) rows. The
 slot drops its handle of the old buffer before the step is evaluated and no
 other handle of it lives then, so MLX writes the rows in place. Rows of
-another dtype than the buffer are an error: `slice_update` would cast them.
+another dtype than the buffer are an error, in place and at a growth:
+`slice_update` would cast them, and the concatenation of a growth would
+promote the buffer to their dtype.
 
 The buffers grow in blocks because of MLX's buffer cache. MLX serves a
 request from a cached buffer only when that buffer is at least as large and
@@ -136,17 +147,6 @@ embedded whole: up to 2056 token ids, the five tail tokens included, and
 token ids (three role tokens, the first text token and 2048 trailing ones) and
 has no `tts_eos` row, which no frame would reach. The chat text and the
 tokenizer pass still grow with the length of `input`.
-
-Measured on Metal (M5, 128 GB, `release-perf`,
-Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit):
-
-| Request | Peak footprint | Time |
-|---|---|---|
-| Default, 86 frames | 3.0 GiB | |
-| 407 frames | | frame loop 6837 and 6887 ms; request 8.24 and 8.30 s |
-| 421 frames | | frame loop 7032 and 7065 ms; request 7.78 and 7.84 s |
-| To the cap, 2048 frames, temperature 0 | 4.34 and 4.36 GiB | frame loop 34.7 s in both; request 38.8 s in both; codec decode 3.4 s |
-| To the cap, `input` of 1 KiB to 16 MiB, eight requests on one server | 5.68, 5.83, 4.62, 5.68, 6.33, 4.16, 5.40 and 4.73 GiB, no trend with the size | 38.8 to 41.8 s each |
 
 ### Sampling
 
@@ -227,6 +227,8 @@ codes [1, 16, T] (16 groups × T steps)
 The codes run at 12.5 Hz. The total upsample is 2·2·8·5·4·3 = 1920, and
 12.5 Hz × 1920 = 24 kHz.
 
+- **Pre-transformer RoPE**: the fused RoPE of the talker, at head dim 64 and
+  base 10000. The decoder's weights and stream are f32.
 - **SnakeBeta**: `x + (1 / exp(β)) · sin²(exp(α) · x)`.
 - **Codebook**: `embedding_sum / max(cluster_usage, 1e-5)`, applied on load.
 - **Conv weights** are stored in PyTorch layout and transposed on load:

@@ -8,7 +8,7 @@
 //! Synthesizes mono 24 kHz PCM from text via two stages:
 //!
 //! **Talker** (`talker.*` weights, `mlx-community__Qwen3-TTS-*-CustomVoice-8bit`):
-//! - 28-layer Qwen3 transformer with MRoPE, per-head q/k RMSNorm, affine-8bit weights
+//! - 28-layer Qwen3 transformer with RoPE, per-head q/k RMSNorm, affine-8bit weights
 //! - `text_projection` (fc1/fc2): projects text embeddings into talker hidden space
 //! - `codec_head`: affine-8bit LM head over audio token vocabulary
 //! - `code_predictor`: 5-layer mini-Qwen3, generates 16 codec groups per step
@@ -40,8 +40,8 @@ use std::time::Instant;
 use rmlx_core::cancel::ensure_not_cancelled;
 use rmlx_loader::{load_shard_index, view, ShardSet};
 use rmlx_mlx::{
-    add, concatenate, conv1d, conv_transpose1d, cos, divide, exp, gelu, matmul, maximum,
-    mlx_clear_cache, multiply, negative, quantized_matmul, rms_norm, scalar_f32,
+    add, concatenate, conv1d, conv_transpose1d, divide, exp, gelu, matmul, maximum,
+    mlx_clear_cache, multiply, quantized_matmul, rms_norm, rope, scalar_f32,
     scaled_dot_product_attention, silu, sin, sqrt, subtract, sum_axis_keepdims, tanh, zeros, Array,
     Device,
 };
@@ -346,7 +346,7 @@ impl KvSlot {
     /// its handle of the old buffer before it returns, so the write is in
     /// place when the caller holds no other handle of it at evaluation. Rows
     /// that do not fit grow the capacity to the next multiple of the block.
-    /// Rows that fit and have another dtype than the buffer are an error.
+    /// Rows of another dtype than the buffers are an error.
     fn update_and_fetch(
         &mut self,
         new_k: &Array,
@@ -379,18 +379,19 @@ impl KvSlot {
         capacity: i32,
         d: Device,
     ) -> Result<Array, TtsError> {
+        // `slice_update` casts the rows to the dtype of the buffer and
+        // `concatenate` promotes both to a common one, so rows of another
+        // dtype would change the stored values or the buffer with no error.
+        if let Some(buffer) = buffer.filter(|buffer| buffer.dtype() != new.dtype()) {
+            return Err(TtsError::Mlx(format!(
+                "key/value rows of dtype {:?} cannot be written into a buffer of dtype {:?}",
+                new.dtype(),
+                buffer.dtype()
+            )));
+        }
         let mut shape = new.shape();
         match buffer {
             Some(buffer) if capacity == self.capacity => {
-                // `slice_update` casts the rows to the dtype of the buffer, so
-                // rows of another dtype would be narrowed with no error.
-                if new.dtype() != buffer.dtype() {
-                    return Err(TtsError::Mlx(format!(
-                        "key/value rows of dtype {:?} cannot be written into a buffer of dtype {:?}",
-                        new.dtype(),
-                        buffer.dtype()
-                    )));
-                }
                 shape[2] = rows;
                 Ok(buffer.slice_update(new, &[0, 0, self.rows, 0], &shape, &[1; 4], d)?)
             }
@@ -418,66 +419,23 @@ fn live_rows(buffer: &Array, rows: i32, d: Device) -> Result<Array, TtsError> {
     Ok(buffer.slice(&[0; 4], &stop, &[1; 4], d)?)
 }
 
-// ── RoPE helpers ─────────────────────────────────────────────────────────────
+// ── RoPE ─────────────────────────────────────────────────────────────────────
 
-/// Build positional cos/sin tables for `seq_len` positions starting at `offset`.
-/// Returns `(cos, sin)` each `[1, seq_len, head_dim]`.
-fn build_rope(
-    offset: i32,
-    seq_len: i32,
+/// RoPE of `x: [B, heads, S, head_dim]` at positions `offset..offset + S`:
+/// over the whole head, with the halves rotated (`rotate_half`, not
+/// traditional), at base `theta`. The fused op keeps the dtype of `x`.
+///
+/// This is the RoPE of the talker, the code predictor and the codec decoder's
+/// pre-transformer. The talker's M-RoPE gives its three sections the same
+/// position for every token, so it is this plain one.
+fn plain_rope(
+    x: &Array,
     head_dim: i32,
     theta: f32,
+    offset: i32,
     d: Device,
-) -> Result<(Array, Array), TtsError> {
-    // inv_freq: [head_dim/2] — 1 / (theta^(2i/head_dim))
-    let half = head_dim / 2;
-    let inv_freq: Vec<f32> = (0..half)
-        .map(|i| 1.0_f32 / theta.powf(2.0 * i as f32 / head_dim as f32))
-        .collect();
-    let inv_f = Array::from_f32_slice(&inv_freq, &[1, half])?;
-
-    // positions: [1, seq_len]
-    let positions: Vec<f32> = (offset..offset + seq_len).map(|p| p as f32).collect();
-    let pos = Array::from_f32_slice(&positions, &[seq_len, 1])?;
-
-    // freqs: [seq_len, half]  = pos @ inv_f (outer product)
-    let freqs = matmul(&pos, &inv_f, d)?;
-
-    // emb: [seq_len, head_dim] by doubling
-    let emb = concatenate(&[&freqs, &freqs], 1, d)?;
-
-    // cos/sin: [1, seq_len, head_dim]
-    let c = cos(&emb, d)?.reshape(&[1, seq_len, head_dim], d)?;
-    let s = sin(&emb, d)?.reshape(&[1, seq_len, head_dim], d)?;
-
-    Ok((c, s))
-}
-
-/// Apply RoPE to `x` of shape `[B, H, S, D]` using `[1, S, D]` cos/sin.
-fn apply_rope(x: &Array, cos_: &Array, sin_: &Array, d: Device) -> Result<Array, TtsError> {
-    // cos_/sin_ are [1, S, D]; need [1, 1, S, D] for broadcasting with [B, H, S, D]
-    let cos_4d = cos_.reshape(&[1, 1, cos_.shape()[1], cos_.shape()[2]], d)?;
-    let sin_4d = sin_.reshape(&[1, 1, sin_.shape()[1], sin_.shape()[2]], d)?;
-
-    let half_d = x.shape()[3] / 2;
-    let s = x.shape()[2];
-    let h = x.shape()[1];
-    let b = x.shape()[0];
-
-    // rotate_half: split last dim, negate second half, concat
-    let x1 = x.slice(&[0, 0, 0, 0], &[b, h, s, half_d], &[1, 1, 1, 1], d)?;
-    let x2 = x.slice(
-        &[0, 0, 0, half_d],
-        &[b, h, s, x.shape()[3]],
-        &[1, 1, 1, 1],
-        d,
-    )?;
-    let neg_x2 = negative(&x2, d)?;
-    let rotated = concatenate(&[&neg_x2, &x1], 3, d)?;
-
-    let xcos = multiply(x, &cos_4d, d)?;
-    let xsin = multiply(&rotated, &sin_4d, d)?;
-    Ok(add(&xcos, &xsin, d)?)
+) -> Result<Array, TtsError> {
+    Ok(rope(x, head_dim, false, theta, 1.0, offset, d)?)
 }
 
 // ── Talker attention layer ────────────────────────────────────────────────────
@@ -536,10 +494,8 @@ impl TalkerAttn {
             normed.reshape(&[b, kh, s, hd], d)?
         };
 
-        // RoPE on q and k
-        let (cos_, sin_) = build_rope(offset, s, hd, self.rope_theta, d)?;
-        let q = apply_rope(&q, &cos_, &sin_, d)?;
-        let k = apply_rope(&k, &cos_, &sin_, d)?;
+        let q = plain_rope(&q, hd, self.rope_theta, offset, d)?;
+        let k = plain_rope(&k, hd, self.rope_theta, offset, d)?;
 
         let (k, v) = kv.update_and_fetch(&k, &v, d)?;
 
@@ -925,9 +881,8 @@ impl PreTransAttn {
             .reshape(&[b, s, h, hd], d)?
             .transpose(&[0, 2, 1, 3], d)?;
 
-        let (cos_, sin_) = build_rope(offset, s, hd, self.rope_theta, d)?;
-        let q = apply_rope(&q, &cos_, &sin_, d)?;
-        let k = apply_rope(&k, &cos_, &sin_, d)?;
+        let q = plain_rope(&q, hd, self.rope_theta, offset, d)?;
+        let k = plain_rope(&k, hd, self.rope_theta, offset, d)?;
 
         // Causal attention for the codec pre-transformer.
         // The decoder was trained with causal masking even in non-streaming mode.
@@ -2680,6 +2635,10 @@ mod tts_kv_tests;
 #[cfg(test)]
 #[path = "tts_memory_tests.rs"]
 mod tts_memory_tests;
+
+#[cfg(test)]
+#[path = "tts_dtype_tests.rs"]
+mod tts_dtype_tests;
 
 #[cfg(test)]
 #[path = "tts_chunk_tests.rs"]

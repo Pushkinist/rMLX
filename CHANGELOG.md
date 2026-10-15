@@ -404,6 +404,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A fault of the server stays a 503. The engine reports these with a new
   error, `InvalidInput`, which is not run again. `/v1/messages` passes no
   media to the engine, and maps the same error the same way.
+- **The Qwen3-TTS talker and code predictor compute in the dtype of the
+  checkpoint (bf16).** The RoPE cos and sin tables were f32, so RoPE made the
+  queries and keys f32. From the end of the first layer, the hidden stream,
+  the attention, the MLP and the key/value cache were f32. RoPE now uses the
+  fused MLX op, which keeps the dtype of its input, in the talker, the code
+  predictor and the codec decoder's pre-transformer (which stays f32, the
+  dtype of its weights). The RoPE variant does not change: plain RoPE over
+  the whole head, with the halves rotated, at base `rope_theta`. By
+  arithmetic on the config, one position of the 28-layer talker cache (K and
+  V) is now 112 KiB, not 222 KiB. The codes of a request are not the same as
+  before, because the arithmetic is different. A key/value row of another
+  dtype than its buffer is now an error also when it grows the buffer; the
+  growth promoted the buffer with no error.
 
 ## [0.4.3] - 2026-10-09
 

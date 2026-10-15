@@ -14,7 +14,7 @@
 )]
 
 use super::tts_device_tests::{run_child, started_by_parent, CHILD_DONE};
-use super::tts_kv_tests::{attention, first_call_past, KV_HEADS, PREFILL_ROWS};
+use super::tts_kv_tests::{attention, first_call_past, plain, KV_HEADS, PREFILL_ROWS};
 use super::{
     decode_in_chunks, run_frames, FrameStep, KvSlot, TalkerAttn, TtsError, DECODE_CHUNK_FRAMES,
     TALKER_KV_BLOCK_ROWS as BLOCK,
@@ -56,7 +56,7 @@ impl Talker {
             Array::from_f32_slice(&vec![0.01; len], shape).unwrap()
         };
         Self {
-            attn: attention(HIDDEN, HEAD_DIM, weight),
+            attn: attention(HIDDEN, HEAD_DIM, weight, plain),
             kv: (0..LAYERS).map(|_| KvSlot::new(BLOCK)).collect(),
             offset: 0,
         }

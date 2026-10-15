@@ -686,7 +686,7 @@ snapshot).
 
 | Component | What it does |
 |---|---|
-| Talker | A Qwen3 decoder with MRoPE and per-head q/k RMSNorm; emits the first codec group per step. |
+| Talker | A Qwen3 decoder with RoPE (an M-RoPE whose three sections share one position) and per-head q/k RMSNorm, in the dtype of the checkpoint; emits the first codec group per step. |
 | Code predictor | A small Qwen3 stack; predicts codec groups 1–15 from the talker hidden. |
 | Codec decoder | Split RVQ (1 semantic + 15 acoustic codebooks), a pre-transformer and a convolutional upsampler to 24 kHz. |
 

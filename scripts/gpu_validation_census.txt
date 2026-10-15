@@ -114,11 +114,11 @@
 # across two threads (2 syntheses and 6 hits, 4 syntheses and 12). The offsets
 # are two (268800 and 279552, against an MTLBuffer of 262144 bytes).
 #
-# The gone-request test makes four requests: a short text of 31 frames (1 pass,
-# 3 hits), a long text that runs to its end with 926 frames (4 passes: 300,
-# 300, 300 and 26 frames, 12 hits), the same long text with a client that goes
+# The gone-request test makes four requests: a short text of 33 frames (1 pass,
+# 3 hits), a long text that runs to its end with 762 frames (3 passes: 300,
+# 300 and 162 frames, 9 hits), the same long text with a client that goes
 # away (0 hits: it stops in its frame loop, before any codec pass) and the
-# short text again (3 hits). 3 + 12 + 0 + 3 = 18, as in each of three runs.
+# short text again (3 hits). 3 + 9 + 0 + 3 = 15, as in each of three runs.
 #
 # WIDE GEMV, `gemv_wide_bfloat16_nv5_kl32_nc0_axpby0` and
 # `gemv_wide_bfloat16_nv4_kl32_nc0_axpby0` (MLX 0.32.1 and later). Two
@@ -212,7 +212,7 @@
 implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s | device load | 4 | rmlx-mlx | implicit_gemm_conv_tail_channel_reads_never_reach_the_output | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
 implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s | device load | 6 | rmlx-server | tts_first_synthesis_runs_on_a_thread_that_did_not_load_it | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
 implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s | device load | 12 | rmlx-server | tts_synthesizes_on_a_thread_that_did_not_load_it | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
-implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s | device load | 18 | rmlx-server | a_gone_speech_request_frees_the_gpu_and_the_next_one_speaks_the_same_audio | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
+implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s | device load | 15 | rmlx-server | a_gone_speech_request_frees_the_gpu_and_the_next_one_speaks_the_same_audio | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
 gemv_wide_bfloat16_nv5_kl32_nc0_axpby0 | device load | <=10 | rmlx-models | the_assistant_round_loop_reproduces_plain_greedy | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/638
 gemv_wide_bfloat16_nv4_kl32_nc0_axpby0 | device load | <=1 | rmlx-models | a_sampled_sidecar_arm_draws_from_the_verifiers_distribution | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/638
 gemv_wide_bfloat16_nv5_kl32_nc0_axpby0 | device load | <=1 | rmlx-models | print_the_seeded_stochastic_streams_for_a_cross_commit_diff | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/638
