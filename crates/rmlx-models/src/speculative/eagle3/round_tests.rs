@@ -48,8 +48,9 @@ const ROUND_SRC: &str = include_str!("round.rs");
 /// requests that may not have it while the decision line still reads correctly;
 /// the branch alone is blind to a decision that stopped consulting the draw.
 ///
-/// Mutation: drop the `!` in the decision; drop its `&& !ctx.draw.sampling()`
-/// term; negate the branch — `if !self.restricted_read_back`.
+/// Mutation: drop the `!` in the decision; drop its
+/// `&& !ctx.draw.needs_full_rows()` term; negate the branch —
+/// `if !self.restricted_read_back`.
 #[test]
 #[allow(
     clippy::expect_used,
@@ -73,8 +74,8 @@ fn the_request_draw_decides_the_read_back_and_the_branch_reads_it() {
     );
     assert_eq!(
         *line,
-        "self.restricted_read_back = self.drafter.hot_path_active() && !ctx.draw.sampling();",
-        "a sampled request cannot take the reduced read-back, and this request \
+        "self.restricted_read_back = self.drafter.hot_path_active() && !ctx.draw.needs_full_rows();",
+        "a request that samples or asks for logprobs cannot take the reduced read-back, and this request \
          decides it by `{line}` — a dropped negation hands a sampled request an \
          argmax over a subset of the row, and the answer is still fluent"
     );

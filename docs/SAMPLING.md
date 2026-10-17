@@ -479,7 +479,9 @@ logprob(i) = logits[i] - lse
 
 The top `k` come from a partial selection, `O(vocab × k)`. Logprobs come from
 the raw logits, before temperature, penalties and filters, as in OpenAI's
-contract. With `k == 0` no log-softmax runs and nothing is allocated.
+contract. With `k == 0` no log-softmax runs and nothing is allocated. The
+speculative round loops build the same record from the verifier's block rows
+(`docs/SPECULATIVE.md` § "Logprobs").
 
 `TokenLogprobs` carries:
 
@@ -525,11 +527,14 @@ Consequences:
   is one device reduction over the verified block. A draw is a host round
   trip and a full-vocabulary softmax per position, rejected tail included.
   EAGLE-3's restricted read-back covers only the drafter's vocabulary and
-  cannot be normalised, so sampled requests take the full-vocabulary branch.
+  cannot be normalised, so sampled requests, and requests that ask for
+  logprobs, take the full-vocabulary branch.
 - **Penalties and `logit_bias` reach no speculative arm.** No round loop
   rebuilds the penalty window over each drafted prefix. A request that sets
   one gets a `warn` naming the fields it did not get.
-- **No speculative arm captures logprobs.**
+- **Every speculative arm reports logprobs.** Each emitted token carries the
+  raw log-softmax of the verifier's row at its position (see
+  `docs/SPECULATIVE.md` § "Logprobs").
 
 ---
 

@@ -428,15 +428,52 @@ fn a_default_request_names_no_dropped_field() {
     );
 }
 
-/// The speculative path captures no logprobs, so a request that asks for them
-/// is named in the warning.
+/// Every round loop reports logprobs, so a request that asks for them runs
+/// with them and is not named in the warning.
 #[test]
-fn a_request_for_logprobs_names_logprobs() {
+fn a_request_for_logprobs_is_not_a_dropped_field() {
     let sampling = SamplingParams {
         top_logprobs_k: 1,
         ..SamplingParams::default()
     };
-    assert_eq!(dropped_sampling_fields(&sampling), vec!["logprobs"]);
+    assert_eq!(dropped_sampling_fields(&sampling), Vec::<&str>::new());
+}
+
+/// The sampler the speculative loops draw with carries the request's
+/// `top_logprobs`: a count of zero there is a request that asked and got none.
+#[test]
+fn the_sampler_config_carries_the_requests_top_logprobs() {
+    let sampling = SamplingParams {
+        top_logprobs_k: 5,
+        ..SamplingParams::default()
+    };
+    assert_eq!(sampling.sampler_config().top_logprobs_k, 5);
+}
+
+/// `generate` hands every round loop the sampler the request built, and edits
+/// nothing in it.
+///
+/// A struct-update over the helper that zeroes one field compiles, passes the
+/// helper's own test, and serves every request without its logprobs. `generate`
+/// needs a loaded verifier, so no CPU test can drive it; this reads the one
+/// line, and is blind to anything done to the value after it. The call itself is
+/// held by the cells of `tests/spec_logprobs.rs`, which serve a request through
+/// `SpeculativeGenerator::generate` on real pairs.
+///
+/// Mutation: `SamplerConfig { top_logprobs_k: 0, ..req.sampling.sampler_config() }`.
+#[test]
+fn generate_builds_the_loop_sampler_from_the_request_alone() {
+    let source = include_str!("speculative.rs");
+    let lines: Vec<&str> = source
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.contains("spec_sampler_cfg ="))
+        .collect();
+    assert_eq!(
+        lines,
+        vec!["let spec_sampler_cfg = req.sampling.sampler_config();"],
+        "the loops' sampler is built once, from the request, and bound nowhere else"
+    );
 }
 
 // ── unsupported_request ──────────────────────────────────────────────────────

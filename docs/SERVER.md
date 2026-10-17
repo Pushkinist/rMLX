@@ -258,6 +258,11 @@ on Gemma4, Gemma3, Qwen3.5-MoE and BitNet an exact hit emits no logprob for
 the replayed token, so `logprobs.content` is one entry short. See
 [`PROMPT_CACHE.md`](PROMPT_CACHE.md) § "First-token logprob on Exact hit".
 
+With a draft model every emitted token carries its logprob, one entry per
+completion token. The value is the verifier's raw log-softmax at the token's
+position, also for a token the drafter proposed
+([`SPECULATIVE.md`](SPECULATIVE.md) § "Logprobs").
+
 A stop token ([`MODELS.md`](MODELS.md) § "Overview", end of turn) ends a generation
 and adds no text.
 

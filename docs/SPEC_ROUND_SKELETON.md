@@ -122,12 +122,22 @@ drafter. The loop never sees a capture.
 
 **The reduced-vocabulary read-back.** EAGLE-3 can score accepted positions over
 its draft vocabulary. It decides once per request, in `prefill`: the drafter's
-hot path is active and the draw is not sampling. The loop logs that decision on
+hot path is active and the request needs no whole row (`VerifierDraw::needs_full_rows`: it
+samples or asks for logprobs). The loop logs that decision on
 its starting line. `Verdict::restricted` is the reduced prefix length.
 `guard_restricted_prefix` refuses a round whose prefix exceeds its acceptance,
 or that reports one on a request that declared none. The loop writes one
 `DecidedBy` entry per emitted token, and attributes the seed to the full
 vocabulary.
+
+**Logprobs.** A drafter that reads the verifier's rows through
+`VerifierDraw::seed_token`, `block_tokens` or `block_distributions` has them
+kept when the request asks for logprobs. The loop takes
+them once after the prefill (a `Seed::Emitted` seed) and once after each
+`verify`, and `emit_seed_token` and `emit_round_tokens` build the record of the
+`i`-th emitted token from row `i`. A drafter that scores a block by another
+route leaves nothing to take, and the loop fails the request instead of
+answering without the record.
 
 **The adaptive block.** DFlash 1 overrides `block` with
 `dflash_next_block_size`. Its history of `(accepted, drafted)` pairs is written

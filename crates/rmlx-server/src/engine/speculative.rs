@@ -315,8 +315,8 @@ fn unsupported_request(has_constraint: bool, has_media: bool) -> Option<Error> {
     None
 }
 
-/// The sampling and logprob fields a speculative request sets that no
-/// speculative arm applies, named so the run log can be read back against what was asked for.
+/// The sampling fields a speculative request sets that no speculative arm
+/// applies, named so the run log can be read back against what was asked for.
 ///
 /// Empty for a request that set none of them, which is the common case and the
 /// one that must stay silent.
@@ -333,9 +333,6 @@ fn dropped_sampling_fields(sampling: &crate::engine::types::SamplingParams) -> V
     }
     if !sampling.logit_bias.is_empty() {
         named.push("logit_bias");
-    }
-    if sampling.top_logprobs_k > 0 {
-        named.push("logprobs");
     }
     named
 }
@@ -745,19 +742,10 @@ impl Generator for SpeculativeGenerator {
         // token at each verified position and accept the prefix that agrees —
         // the same law with a point-mass proposal. `temperature == 0` keeps every
         // arm on the argmax path it had, byte for byte.
-        let spec_sampler_cfg = rmlx_models::SamplerConfig {
-            temperature: req.sampling.temperature,
-            top_p: req.sampling.top_p,
-            top_k: req.sampling.top_k,
-            min_p: req.sampling.min_p,
-            seed: req.sampling.seed,
-            // Speculative path does not capture per-token logprobs (verifier
-            // emits ProbeStep without logprobs); keep disabled.
-            top_logprobs_k: 0,
-        };
+        let spec_sampler_cfg = req.sampling.sampler_config();
         // Penalties and logit bias reach no speculative arm: a round scores its
         // whole block in one forward, and no loop carries a per-position penalty
-        // window. No arm captures logprobs either. Name each dropped field.
+        // window. Name each dropped field.
         let dropped = dropped_sampling_fields(&req.sampling);
         if !dropped.is_empty() {
             tracing::warn!(
@@ -871,10 +859,8 @@ impl Generator for SpeculativeGenerator {
                     Some(sm) => sm.step(&text),
                     None => (text, false),
                 };
-                // resolve raw decode logprobs into the OpenAI wire shape
-                // (tokenizer in scope). `None` on the disabled path, and also
-                // on every speculative round: `emit_step` hard-codes
-                // `logprobs: None` for every architecture, not just Gemma4.
+                // Resolve the step's raw logprobs into the OpenAI wire shape
+                // (tokenizer in scope). `None` when the request asked for none.
                 let logprobs = s.logprobs.as_ref().map(|lp| {
                     let chosen_surface = tokenizer_ref
                         .id_to_token(s.token_id)

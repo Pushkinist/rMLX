@@ -27,9 +27,11 @@
 //! normalising constant, so softmaxing the subset spreads the missing mass over
 //! the ids that survived and top-p and top-k then cut a different set. An argmax
 //! is indifferent to that, which is why the reduction is sound at temperature 0
-//! and only there. `verify` therefore reads the round's draw before it chooses a
-//! read-back, and a sampled request pays the full-vocabulary projection at every
-//! verified position.
+//! and only there. A request that asks for logprobs cannot take it either: a
+//! logprob is a log-softmax over the whole row, and the restricted row has no
+//! such constant. The prefill reads the round's draw before it chooses a
+//! read-back, and a sampled request or one that asks for logprobs pays the
+//! full-vocabulary projection at every verified position.
 //!
 //! # The rollback re-runs rather than truncates
 //!
@@ -270,11 +272,11 @@ impl RoundDrafter for Eagle3Round<'_> {
         cancel: &AtomicBool,
     ) -> Result<Prefilled> {
         let device = ctx.device;
-        // A sampled request cannot take the reduced read-back — see this module's
-        // header — so it is the request's draw and not the drafter alone that
-        // decides it, and it is decided once, here, for the round line and for
-        // every round's verify pass.
-        self.restricted_read_back = self.drafter.hot_path_active() && !ctx.draw.sampling();
+        // A request that samples or asks for logprobs cannot take the reduced
+        // read-back — see this module's header — so it is the request's draw
+        // and not the drafter alone that decides it, and it is decided once,
+        // here, for the round line and for every round's verify pass.
+        self.restricted_read_back = self.drafter.hot_path_active() && !ctx.draw.needs_full_rows();
         // The drafter advances one row per committed token beside the verifier,
         // so its cache is sized to the ceiling the verifier's stack was built
         // at and cannot overflow first.

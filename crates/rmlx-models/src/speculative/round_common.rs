@@ -22,7 +22,7 @@ use rmlx_kv_quant::{GdnTape, GdnTapeSegment, KvCache, KvQuant, LinearAttnCache};
 use rmlx_mlx::{concatenate, Array, Device};
 
 use super::round_loop::DecidedBy;
-use super::{DecodeWindow, RoundStats, SpecLoop};
+use super::{DecodeWindow, RoundStats, ScoredBlock, SpecLoop};
 use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
 
@@ -223,11 +223,20 @@ pub(crate) fn log_request_record(
 /// drafter's own, confirmed by a restricted argmax; the rest were taken over
 /// the whole vocabulary. One entry per emitted token, and every other loop
 /// passes `None`.
+///
+/// `scored` is the verifier's block when the request asks for logprobs: token
+/// `i` of the round is reported from its row `i`, and a token the budget or a
+/// stop token cuts is never read.
+///
+/// # Errors
+/// A logprob record cannot be built for a token. It is raised before that token
+/// reaches the sink.
 #[must_use = "the stop signal is the caller's: a round whose token ended the request \
                   must not run another one"]
 pub(crate) fn emit_round_tokens(
     tokenizer: &tokenizers::Tokenizer,
     round_tokens: &[u32],
+    scored: Option<&ScoredBlock>,
     n_tokens: usize,
     eos_ids: &[u32],
     step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
@@ -235,7 +244,7 @@ pub(crate) fn emit_round_tokens(
     emitted_in_rounds: &mut usize,
     window: &mut DecodeWindow,
     decided_by: Option<(&mut Vec<DecidedBy>, usize)>,
-) -> RoundEmit {
+) -> Result<RoundEmit> {
     let (mut decided_by, restricted) = match decided_by {
         Some((buf, restricted)) => (Some(buf), restricted),
         None => (None, 0),
@@ -245,7 +254,8 @@ pub(crate) fn emit_round_tokens(
         if emitted.len() >= n_tokens {
             break;
         }
-        super::emit_step(tokenizer, id, step_fn, emitted, window);
+        let logprobs = scored.map(|s| s.token_logprobs(i, id)).transpose()?;
+        super::emit_step(tokenizer, id, logprobs, step_fn, emitted, window);
         if let Some(buf) = decided_by.as_mut() {
             buf.push(if i < restricted {
                 DecidedBy::RestrictedVocab
@@ -256,16 +266,16 @@ pub(crate) fn emit_round_tokens(
         *emitted_in_rounds += 1;
         committed += 1;
         if eos_ids.contains(&id) {
-            return RoundEmit {
+            return Ok(RoundEmit {
                 committed,
                 hit_eos: true,
-            };
+            });
         }
     }
-    RoundEmit {
+    Ok(RoundEmit {
         committed,
         hit_eos: false,
-    }
+    })
 }
 
 /// What [`emit_round_tokens`] did with a round's tokens.
@@ -598,23 +608,32 @@ pub(crate) fn rollback_round(
 /// it.
 ///
 /// The two-model loops do not call this: they emit nothing before a round.
+///
+/// `scored` is the prefill row the seed was drawn from, when the request asks
+/// for logprobs.
+///
+/// # Errors
+/// The seed's logprob record cannot be built. It is raised before the seed
+/// reaches the sink.
 #[must_use = "the stop signal is the caller's: a seed that ended the request must not \
                   be followed by a round"]
 pub(crate) fn emit_seed_token(
     tokenizer: &tokenizers::Tokenizer,
     seed: u32,
+    scored: Option<&ScoredBlock>,
     step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
     emitted: &mut Vec<ProbeStep>,
     window: &mut DecodeWindow,
     eos_ids: &[u32],
     totals: &RoundTotals,
-) -> bool {
-    super::emit_step(tokenizer, seed, step_fn, emitted, window);
+) -> Result<bool> {
+    let logprobs = scored.map(|s| s.token_logprobs(0, seed)).transpose()?;
+    super::emit_step(tokenizer, seed, logprobs, step_fn, emitted, window);
     if !eos_ids.contains(&seed) {
-        return false;
+        return Ok(false);
     }
     log_request_record(totals, emitted, emitted.len(), window);
-    true
+    Ok(true)
 }
 
 /// Report a verifier's resident KV after one speculative request.

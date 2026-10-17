@@ -851,6 +851,9 @@ impl DecodeWindow {
 /// [`DecodeWindow::tps`] honest — a loop that pushed to `emitted` directly
 /// would leave the window short and the rate wrong.
 ///
+/// `logprobs` is the token's record when the request asked for them, built by
+/// the caller from the verifier's row at the position this token fills.
+///
 /// The `Option<u32>` force-next signal `step_fn` may return is **discarded**:
 /// the ordinary decode loop folds it into `forced_next` to close an
 /// over-budget thinking block, so that force-close is inert on every
@@ -858,6 +861,7 @@ impl DecodeWindow {
 pub(crate) fn emit_step(
     tokenizer: &tokenizers::Tokenizer,
     id: u32,
+    logprobs: Option<crate::sampler::TokenLogprobs>,
     step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
     emitted: &mut Vec<ProbeStep>,
     window: &mut DecodeWindow,
@@ -870,7 +874,7 @@ pub(crate) fn emit_step(
         piece: piece.into_boxed_str(),
         max_abs_logit: 0.0,
         nan_count: 0,
-        logprobs: None,
+        logprobs,
     };
     window.mark();
     step_fn(&step);
@@ -1083,6 +1087,9 @@ pub(crate) struct VerifierDraw {
     cfg: crate::sampler::SamplerConfig,
     penalties: crate::sampler::PenaltyConfig,
     rng: crate::sampler::Pcg32,
+    /// The last block or seed row this draw read, kept only when the request
+    /// asks for logprobs. Handed to the loop by [`Self::take_scored`].
+    scored: Option<ScoredBlock>,
 }
 
 impl VerifierDraw {
@@ -1096,7 +1103,19 @@ impl VerifierDraw {
             // loop carries.
             penalties: crate::sampler::PenaltyConfig::default(),
             rng: crate::sampler::Pcg32::new(cfg.seed_or_default()),
+            scored: None,
         }
+    }
+
+    fn logprobs_requested(&self) -> bool {
+        self.cfg.top_logprobs_k > 0
+    }
+
+    /// Whether every emitted position needs the verifier's whole row: the
+    /// request samples from it, or reports logprobs over it. A drafter that
+    /// scores accepted positions over a reduced vocabulary must not do so.
+    pub(crate) fn needs_full_rows(&self) -> bool {
+        self.sampling() || self.logprobs_requested()
     }
 
     /// Whether this request samples. `false` keeps every loop on the argmax
@@ -1108,6 +1127,7 @@ impl VerifierDraw {
     /// One token from a single-position logits array (`[1, 1, vocab]` or
     /// `[1, vocab]`) — the seed a loop emits straight after prefill.
     pub(crate) fn seed_token(&mut self, logits: &Array, device: Device) -> Result<u32> {
+        self.keep_scored(logits, device)?;
         if !self.sampling() {
             let am = argmax(logits, -1, device)?;
             am.eval()?;
@@ -1128,6 +1148,7 @@ impl VerifierDraw {
         v_k: usize,
         device: Device,
     ) -> Result<Vec<u32>> {
+        self.keep_scored(logits, device)?;
         if !self.sampling() {
             let am = argmax(logits, -1, device)?;
             am.eval()?;
@@ -1150,11 +1171,12 @@ impl VerifierDraw {
     /// [`Self::block_tokens`] hands back the draw alone. Both build the same
     /// rows through the same pipeline; this one keeps them.
     pub(crate) fn block_distributions(
-        &self,
+        &mut self,
         logits: &Array,
         v_k: usize,
         device: Device,
     ) -> Result<Vec<Vec<f32>>> {
+        self.keep_scored(logits, device)?;
         let vocab = vocab_axis(logits)?;
         let mut dists = Vec::with_capacity(v_k);
         for i in 0..v_k {
@@ -1186,6 +1208,39 @@ impl VerifierDraw {
         &mut self.rng
     }
 
+    /// Keep `logits` as the rows the next emission reports logprobs from, when
+    /// the request asks for them. Keeps nothing otherwise, so a request that
+    /// does not ask pays no read-back for them.
+    fn keep_scored(&mut self, logits: &Array, device: Device) -> Result<()> {
+        if self.logprobs_requested() {
+            self.scored = Some(ScoredBlock::new(
+                logits,
+                self.cfg.top_logprobs_k as usize,
+                device,
+            )?);
+        }
+        Ok(())
+    }
+
+    /// The rows the last read kept, or `None` when the request asks for no
+    /// logprobs. Taken, not borrowed: an emission that finds no read of its own
+    /// is refused rather than served the previous round's rows.
+    ///
+    /// # Errors
+    /// The request asks for logprobs and nothing was read since the last take.
+    pub(crate) fn take_scored(&mut self) -> Result<Option<ScoredBlock>> {
+        if !self.logprobs_requested() {
+            return Ok(None);
+        }
+        self.scored.take().map(Some).ok_or_else(|| {
+            Error::Model(
+                "the request asks for logprobs but the verifier's rows were not kept for this \
+                 emission, so no token can be reported with one"
+                    .into(),
+            )
+        })
+    }
+
     /// One row's post-sampling distribution, from a `[1, vocab]` or
     /// `[1, 1, vocab]` logits array.
     fn row_dist(&self, row: &Array) -> Result<Vec<f32>> {
@@ -1195,6 +1250,59 @@ impl VerifierDraw {
     fn draw_row(&mut self, row: &Array) -> Result<usize> {
         let probs = self.row_dist(row)?;
         Ok(crate::sampler::sample_index(&probs, &mut self.rng))
+    }
+}
+
+/// The verifier's rows for one emission, read back into per-token logprobs.
+///
+/// Row `i` is the position the `i`-th emitted token fills: the seed is row 0 of
+/// the prefill logits, and a round's `i`-th committed token is row `i` of the
+/// verified block. The logprob is the raw log-softmax of that row, the same
+/// quantity the ordinary decode path reports.
+pub(crate) struct ScoredBlock {
+    /// `[1, rows, vocab]`.
+    logits: Array,
+    rows: usize,
+    vocab: i32,
+    top_k: usize,
+    device: Device,
+}
+
+impl ScoredBlock {
+    fn new(logits: &Array, top_k: usize, device: Device) -> Result<Self> {
+        let vocab = vocab_axis(logits)?;
+        let rows = logits
+            .shape()
+            .iter()
+            .map(|&d| d as usize)
+            .product::<usize>()
+            / vocab as usize;
+        Ok(Self {
+            logits: logits.reshape(&[1, rows as i32, vocab], device)?,
+            rows,
+            vocab,
+            top_k,
+            device,
+        })
+    }
+
+    /// The record for `token` as the `row`-th emitted token of this block.
+    ///
+    /// # Errors
+    /// `row` is past the rows the verifier scored, or the row cannot be read.
+    pub(crate) fn token_logprobs(
+        &self,
+        row: usize,
+        token: u32,
+    ) -> Result<crate::sampler::TokenLogprobs> {
+        if row >= self.rows {
+            return Err(Error::Model(format!(
+                "a round emitted its token {row} but the verifier scored {} position(s)",
+                self.rows
+            )));
+        }
+        let row = block_row(&self.logits, row, self.vocab, self.device)?;
+        crate::sampler::compute_top_logprobs(&row, token, self.top_k)
     }
 }
 

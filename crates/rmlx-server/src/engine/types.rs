@@ -245,6 +245,21 @@ impl Default for SamplingParams {
     }
 }
 
+impl SamplingParams {
+    /// The knobs the model crate's samplers read, which it takes without
+    /// depending on this one. `top_logprobs_k == 0` keeps logprob capture off.
+    pub(crate) fn sampler_config(&self) -> rmlx_models::SamplerConfig {
+        rmlx_models::SamplerConfig {
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: self.top_k,
+            min_p: self.min_p,
+            seed: self.seed,
+            top_logprobs_k: self.top_logprobs_k,
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// One token-generation request, fully parsed/validated.

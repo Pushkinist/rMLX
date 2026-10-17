@@ -299,7 +299,7 @@ fn emit_step_advances_the_window_once_per_token() {
     };
 
     for id in [1_u32, 2, 3, 4, 5] {
-        emit_step(&tk, id, &mut step_fn, &mut emitted, &mut window);
+        emit_step(&tk, id, None, &mut step_fn, &mut emitted, &mut window);
     }
 
     assert_eq!(emitted.len(), 5, "every call must push a step");
@@ -933,14 +933,14 @@ fn a_snapshot_a_loader_only_half_reads_is_refused_and_a_whole_one_is_not() {
     clippy::expect_used,
     reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
 )]
-fn logits_block(rows: &[[f32; 4]]) -> Array {
+pub(super) fn logits_block(rows: &[[f32; 4]]) -> Array {
     let flat: Vec<f32> = rows.iter().flatten().copied().collect();
     let bytes: Vec<u8> = flat.iter().flat_map(|v| v.to_le_bytes()).collect();
     Array::from_bytes(&bytes, &[1, rows.len() as i32, 4], Dtype::F32)
         .expect("a well-formed logits block")
 }
 
-fn greedy_cfg() -> crate::sampler::SamplerConfig {
+pub(super) fn greedy_cfg() -> crate::sampler::SamplerConfig {
     crate::sampler::SamplerConfig {
         temperature: 0.0,
         top_p: 1.0,
@@ -1017,6 +1017,210 @@ fn the_seed_draw_is_the_block_draw_at_one_position() {
             cfg.temperature
         );
     }
+}
+
+pub(super) fn logprob_cfg(
+    base: crate::sampler::SamplerConfig,
+    k: u32,
+) -> crate::sampler::SamplerConfig {
+    crate::sampler::SamplerConfig {
+        top_logprobs_k: k,
+        ..base
+    }
+}
+
+const LOGPROB_ROWS: [[f32; 4]; 3] = [
+    [0.1, 9.0, 0.2, 0.3],
+    [4.0, 0.0, 0.5, 8.5],
+    [7.0, 1.0, 2.0, 3.0],
+];
+
+/// The record a plain decode step would build for `token` from `row` alone.
+fn plain_record(row: [f32; 4], token: u32, k: usize) -> crate::sampler::TokenLogprobs {
+    crate::sampler::compute_top_logprobs(&logits_block(&[row]), token, k)
+        .unwrap_or_else(|e| panic!("plain record: {e}"))
+}
+
+/// Exact equality: the same row through the same producer gives the same bits.
+fn same_record(a: &crate::sampler::TokenLogprobs, b: &crate::sampler::TokenLogprobs) -> bool {
+    a.token_id == b.token_id
+        && a.token_logprob.to_bits() == b.token_logprob.to_bits()
+        && a.top.len() == b.top.len()
+        && a.top
+            .iter()
+            .zip(&b.top)
+            .all(|(x, y)| x.0 == y.0 && x.1.to_bits() == y.1.to_bits())
+}
+
+/// A block read with logprobs on is kept, and row `i` of it reports exactly
+/// what a one-row decode of that row reports.
+///
+/// Mutation: keep no block in `keep_scored`; index the row by `i + 1`.
+#[test]
+fn a_block_read_keeps_the_rows_a_plain_step_would_score() {
+    let block = logits_block(&LOGPROB_ROWS);
+    let mut draw = VerifierDraw::new(&logprob_cfg(greedy_cfg(), 2));
+    let tokens = draw
+        .block_tokens(&block, 3, Device::Cpu)
+        .unwrap_or_else(|e| panic!("block: {e}"));
+    let scored = draw
+        .take_scored()
+        .unwrap_or_else(|e| panic!("take: {e}"))
+        .unwrap_or_else(|| panic!("a request for logprobs kept no block"));
+    for (i, (&token, &row)) in tokens.iter().zip(&LOGPROB_ROWS).enumerate() {
+        let got = scored
+            .token_logprobs(i, token)
+            .unwrap_or_else(|e| panic!("row {i}: {e}"));
+        assert!(
+            same_record(&got, &plain_record(row, token, 2)),
+            "row {i} must report what a one-row decode reports: {got:?}"
+        );
+        assert_eq!(
+            got.top.first().map(|&(id, _)| id),
+            Some(token),
+            "at temperature 0 the token is the top-ranked id of its own row"
+        );
+    }
+}
+
+/// A request that asks for none keeps nothing and reports nothing, so no
+/// readback or retained logits come with it.
+///
+/// Mutation: keep the block whatever `top_logprobs_k` says.
+#[test]
+fn a_request_without_logprobs_keeps_no_block() {
+    let block = logits_block(&LOGPROB_ROWS);
+    let mut draw = VerifierDraw::new(&greedy_cfg());
+    draw.block_tokens(&block, 3, Device::Cpu)
+        .unwrap_or_else(|e| panic!("block: {e}"));
+    assert!(draw.scored.is_none(), "nothing may be retained at k == 0");
+    assert!(
+        draw.take_scored()
+            .unwrap_or_else(|e| panic!("take: {e}"))
+            .is_none(),
+        "k == 0 reports no block"
+    );
+}
+
+/// The seed is row 0 of a prefill row, whichever rank that row arrives at.
+///
+/// Mutation: skip the keep in `seed_token`.
+#[test]
+fn a_seed_read_keeps_its_row_at_either_rank() {
+    for shape in [vec![1, 1, 4], vec![1, 4]] {
+        let row = LOGPROB_ROWS[1];
+        let bytes: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let logits = Array::from_bytes(&bytes, &shape, Dtype::F32)
+            .unwrap_or_else(|e| panic!("seed row: {e}"));
+        let mut draw = VerifierDraw::new(&logprob_cfg(greedy_cfg(), 3));
+        let seed = draw
+            .seed_token(&logits, Device::Cpu)
+            .unwrap_or_else(|e| panic!("seed: {e}"));
+        let scored = draw
+            .take_scored()
+            .unwrap_or_else(|e| panic!("take: {e}"))
+            .unwrap_or_else(|| panic!("the seed read kept no row at shape {shape:?}"));
+        let got = scored
+            .token_logprobs(0, seed)
+            .unwrap_or_else(|e| panic!("seed row: {e}"));
+        assert!(
+            same_record(&got, &plain_record(row, seed, 3)),
+            "shape {shape:?}: {got:?}"
+        );
+    }
+}
+
+/// The record is the raw log-softmax, not the post-sampling distribution.
+///
+/// With `top_k = 1` the post-sampling distribution is a point mass, so a record
+/// built from it gives the chosen token a logprob of 0.
+///
+/// Mutation: build the record from `sampling_distribution`.
+#[test]
+fn a_sampled_request_reports_the_raw_row_not_the_sampling_distribution() {
+    let cfg = crate::sampler::SamplerConfig {
+        top_k: 1,
+        ..logprob_cfg(sampled_cfg(), 2)
+    };
+    let block = logits_block(&LOGPROB_ROWS);
+    let mut draw = VerifierDraw::new(&cfg);
+    let tokens = draw
+        .block_tokens(&block, 3, Device::Cpu)
+        .unwrap_or_else(|e| panic!("block: {e}"));
+    let scored = draw
+        .take_scored()
+        .unwrap_or_else(|e| panic!("take: {e}"))
+        .unwrap_or_else(|| panic!("no block kept"));
+    for (i, (&token, &row)) in tokens.iter().zip(&LOGPROB_ROWS).enumerate() {
+        let got = scored
+            .token_logprobs(i, token)
+            .unwrap_or_else(|e| panic!("row {i}: {e}"));
+        assert!(same_record(&got, &plain_record(row, token, 2)), "row {i}");
+        assert!(
+            got.token_logprob < -1e-4,
+            "row {i}: the raw logprob of a top-1 token is below 0, got {}",
+            got.token_logprob
+        );
+    }
+}
+
+/// The two-model arm that judges whole distributions reads its block through
+/// `block_distributions`, and that read is kept too.
+///
+/// Mutation: skip the keep in `block_distributions`.
+#[test]
+fn a_distribution_read_keeps_the_block() {
+    let block = logits_block(&LOGPROB_ROWS);
+    let mut draw = VerifierDraw::new(&logprob_cfg(sampled_cfg(), 1));
+    draw.block_distributions(&block, 3, Device::Cpu)
+        .unwrap_or_else(|e| panic!("distributions: {e}"));
+    assert!(
+        draw.take_scored()
+            .unwrap_or_else(|e| panic!("take: {e}"))
+            .is_some(),
+        "the distribution read kept no block"
+    );
+}
+
+/// A take with no read since the last one is refused, never answered with the
+/// previous round's rows; a row past the block is refused too.
+///
+/// Mutation: `take_scored` clones the block instead of taking it; drop the
+/// bound check in `token_logprobs`.
+#[test]
+fn a_stale_or_out_of_range_row_is_refused() {
+    let block = logits_block(&LOGPROB_ROWS);
+    let mut draw = VerifierDraw::new(&logprob_cfg(greedy_cfg(), 1));
+    draw.block_tokens(&block, 3, Device::Cpu)
+        .unwrap_or_else(|e| panic!("block: {e}"));
+    let scored = draw
+        .take_scored()
+        .unwrap_or_else(|e| panic!("take: {e}"))
+        .unwrap_or_else(|| panic!("no block kept"));
+    assert!(
+        draw.take_scored().is_err(),
+        "a second take with no read in between must be refused"
+    );
+    let Err(past) = scored.token_logprobs(3, 0) else {
+        panic!("the block holds three rows, so a fourth token has none");
+    };
+    assert!(
+        past.to_string().contains("verifier scored 3 position"),
+        "the refusal names the rows the verifier scored: {past}"
+    );
+}
+
+/// A request that samples or asks for logprobs needs the whole row at every
+/// position, and one that does neither does not.
+///
+/// Mutation: drop the logprobs arm of `needs_full_rows`; the EAGLE-3 prefill
+/// then keeps its reduced read-back for a request that wants logprobs and the
+/// loop finds no block to report from.
+#[test]
+fn a_request_for_logprobs_needs_the_full_row() {
+    assert!(!VerifierDraw::new(&greedy_cfg()).needs_full_rows());
+    assert!(VerifierDraw::new(&sampled_cfg()).needs_full_rows());
+    assert!(VerifierDraw::new(&logprob_cfg(greedy_cfg(), 1)).needs_full_rows());
 }
 
 /// A sampled draw reaches past the argmax, and reproduces itself from its seed.

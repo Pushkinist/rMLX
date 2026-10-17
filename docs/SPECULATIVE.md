@@ -75,7 +75,12 @@ argmax over the drafter's reduced vocabulary equals the full argmax whenever the
 full argmax is in that vocabulary. A distribution needs the whole row's
 normalising constant, and top-p and top-k over a subset cut a different set. A
 sampled EAGLE-3 request therefore scores every position over the full
-vocabulary (`restricted_read_back` is false).
+vocabulary (`restricted_read_back` is false). A request that asks for logprobs
+does the same: a log-softmax needs the whole row too
+(`VerifierDraw::needs_full_rows`). So a temperature-0 EAGLE-3 request that asks
+for logprobs takes the full-vocabulary branch, and it can emit a token that the
+same request without logprobs would not, at a position where the reduced argmax
+is not the verifier's argmax.
 
 ### What the speculative path does not apply
 
@@ -89,9 +94,27 @@ vocabulary (`restricted_read_back` is false).
   `speculative_decode_with_response_format_unsupported`, and the server
   answers HTTP 400 `invalid_request_error`. A server with a draft model also
   refuses `image_url` and `input_audio` parts, and an empty prompt, with a 400.
-- **Logprobs.** The speculative path returns no logprobs. A request that sets
-  `logprobs: true` (with or without `top_logprobs`) gets a response with no
-  `logprobs`, and the server logs the same `warn`, which names `logprobs`.
+
+## Logprobs
+
+Every drafter path reports `logprobs` and `top_logprobs`. The value of a token is
+the raw log-softmax of the verifier's own row at the position that token fills,
+the same quantity the ordinary decode path reports. It is not the
+post-sampling distribution, and it is not the drafter's. A token a round emits
+because the drafter proposed it is reported from the verifier's row, like the
+verifier's own correction.
+
+`VerifierDraw` keeps the block or seed row it read only when the request asks
+(`top_logprobs_k > 0`). The round loop takes it once per emission and builds the
+record of the `i`-th emitted token from row `i`. A token the request's budget or
+a stop token cuts is never read. A request that asks for none keeps no row and
+reads nothing back. A round that finds no kept row for a request that asked
+fails loudly instead of answering with no record.
+
+The rows come from a block verify forward, where the ordinary path scores one
+token per forward. The two are one computation in two chunkings, so a logprob
+can differ from the ordinary path's by bf16 noise. At temperature 0 the emitted
+token is the top-ranked id of its own row.
 
 ## Drafters
 

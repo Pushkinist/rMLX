@@ -782,6 +782,63 @@ fn the_seeds_attribution_is_written_only_where_a_seed_is_emitted() {
     );
 }
 
+/// The loop takes the verifier's kept rows once per emission and hands them to
+/// that emission, and to no other.
+///
+/// A request that asks for logprobs is served from `VerifierDraw::take_scored`.
+/// Taken after the prefill for the seed and after each `verify` for the round,
+/// and passed on as `.as_ref()`: a loop that passes `None`, takes nothing, or
+/// hands the seed's rows to the round answers every request without its
+/// records, and no CPU test sees it because `run_rounds` needs a model.
+///
+/// Mutation: pass `None` to either emitter; delete either take; swap the two
+/// names.
+#[test]
+fn the_loop_takes_the_kept_rows_once_per_emission() {
+    let src = LOOP_SOURCES
+        .iter()
+        .find(|(f, _)| *f == SHARED_LOOP)
+        .map(|(_, s)| *s)
+        .unwrap_or_default();
+    let at = |needle: &str| -> Vec<usize> {
+        src.lines()
+            .enumerate()
+            .filter(|(_, l)| is_code(l) && l.contains(needle))
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let seed_take = at("let seed_scored = ctx.draw.take_scored()?;");
+    let seed_emit = at("if emit_seed_token(");
+    let seed_pass = at("seed_scored.as_ref(),");
+    let round_take = at("let round_scored = ctx.draw.take_scored()?;");
+    let round_emit = at("let emit = emit_round_tokens(");
+    let round_pass = at("round_scored.as_ref(),");
+    let takes = at("take_scored()");
+    assert_eq!(
+        (
+            seed_take.len(),
+            seed_emit.len(),
+            seed_pass.len(),
+            round_take.len(),
+            round_emit.len(),
+            round_pass.len(),
+            takes.len()
+        ),
+        (1, 1, 1, 1, 1, 1, 2),
+        "the loop takes once for the seed and once for the round, and passes each to its \
+         own emitter"
+    );
+    assert!(
+        seed_take < seed_emit && seed_emit < seed_pass && seed_pass < round_take,
+        "the seed's rows are taken before the seed is emitted and passed to it"
+    );
+    assert!(
+        round_take < round_emit && round_emit < round_pass,
+        "the round's rows are taken after its verify, before its tokens are emitted, and \
+         passed to that emission"
+    );
+}
+
 /// One generator serves a speculative request, and it is the round's draw.
 ///
 /// `VerifierDraw` holds the request's `Pcg32` and every draw of the request goes

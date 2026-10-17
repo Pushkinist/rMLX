@@ -659,15 +659,7 @@ impl Generator for ArchGenerator {
         // per-request `Pcg32` is created ONCE here and threaded through every
         // decode step so the random stream is contiguous and reproducible.
         // `temperature <= 0.0` keeps the untouched GPU argmax greedy path.
-        let sampler_cfg = rmlx_models::SamplerConfig {
-            temperature: req.sampling.temperature,
-            top_p: req.sampling.top_p,
-            top_k: req.sampling.top_k,
-            min_p: req.sampling.min_p,
-            seed: req.sampling.seed,
-            // 0 = logprob capture disabled (hot-loop zero-overhead).
-            top_logprobs_k: req.sampling.top_logprobs_k,
-        };
+        let sampler_cfg = req.sampling.sampler_config();
         let mut sampler_rng = rmlx_models::Pcg32::new(sampler_cfg.seed_or_default());
         if sampler_cfg.sampling_active() {
             tracing::debug!(

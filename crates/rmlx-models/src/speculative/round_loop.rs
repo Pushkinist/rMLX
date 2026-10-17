@@ -474,9 +474,11 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
         if let Some(buf) = decided_by.as_deref_mut() {
             buf.push(DecidedBy::FullVocab);
         }
+        let seed_scored = ctx.draw.take_scored()?;
         if emit_seed_token(
             cfg.tokenizer,
             seed,
+            seed_scored.as_ref(),
             step_fn,
             &mut emitted,
             &mut window,
@@ -497,7 +499,7 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
                 round_loop_ns: 0,
                 t_total,
             },
-        ) {
+        )? {
             if !matches!(D::KV_REPORT_SKIPPED_BY, ReportSkippedBy::TheSeedExit) {
                 report_verifier_kv_bytes(ctx.verifier, &ctx.kv, ctx.lin.as_deref());
             }
@@ -572,9 +574,11 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
             verdict.restricted,
             verdict.accept,
         )?;
+        let round_scored = ctx.draw.take_scored()?;
         let emit = emit_round_tokens(
             cfg.tokenizer,
             &verdict.commit,
+            round_scored.as_ref(),
             n_tokens,
             cfg.eos_ids,
             step_fn,
@@ -584,7 +588,7 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
             decided_by
                 .as_deref_mut()
                 .map(|buf| (buf, verdict.restricted)),
-        );
+        )?;
         if emit.hit_eos {
             stopped_in_round = true;
             break;

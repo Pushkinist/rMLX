@@ -162,6 +162,10 @@ pub const GEMMA4_E2B: (&str, &str) = (
     "mlx-community__gemma-4-e2b-it-mxfp8",
     "Gemma4ForConditionalGeneration",
 );
+pub const GEMMA4_E4B: (&str, &str) = (
+    "mlx-community__gemma-4-e4b-it-mxfp8",
+    "Gemma4ForConditionalGeneration",
+);
 pub const QWEN36_MOE: (&str, &str) = (
     "mlx-community__Qwen3.6-35B-A3B-8bit",
     "Qwen3_5MoeForConditionalGeneration",

@@ -27,8 +27,8 @@ use super::{
 };
 use crate::arch::{load_model, Architecture, LoadOpts};
 use crate::decode_loop::ProbeStep;
-use crate::speculative::tests::tiny_tokenizer;
-use crate::speculative::{arm_lin_tapes, DecodeWindow, SpecLoop};
+use crate::speculative::tests::{greedy_cfg, logits_block, logprob_cfg, tiny_tokenizer};
+use crate::speculative::{arm_lin_tapes, DecodeWindow, ScoredBlock, SpecLoop, VerifierDraw};
 
 /// How far back the fixture's request started.
 ///
@@ -985,6 +985,7 @@ fn a_round_clipped_by_the_budget_reports_what_it_emitted() {
     let emit = super::emit_round_tokens(
         &tokenizer,
         &[1, 2, 3, 4],
+        None,
         2,
         &[],
         &mut step,
@@ -992,7 +993,8 @@ fn a_round_clipped_by_the_budget_reports_what_it_emitted() {
         &mut emitted_in_rounds,
         &mut window,
         None,
-    );
+    )
+    .unwrap_or_else(|e| panic!("emit: {e}"));
     assert!(!emit.hit_eos, "no stop token was in the round");
     assert_eq!(
         emit.committed, 2,
@@ -1013,6 +1015,7 @@ fn a_round_stopped_by_its_own_token_reports_what_it_emitted() {
     let emit = super::emit_round_tokens(
         &tokenizer,
         &[1, 2, 3, 4],
+        None,
         8,
         &[3],
         &mut step,
@@ -1020,12 +1023,244 @@ fn a_round_stopped_by_its_own_token_reports_what_it_emitted() {
         &mut emitted_in_rounds,
         &mut window,
         None,
-    );
+    )
+    .unwrap_or_else(|e| panic!("emit: {e}"));
     assert!(emit.hit_eos, "the third token is the stop token");
     assert_eq!(
         emit.committed, 3,
         "the stop token is emitted and the round ends on it"
     );
+}
+
+/// Four vocabulary-4 rows, and the block a draw that asks for logprobs keeps
+/// after reading them. The verifier's token at row `i` is its argmax.
+fn scored_rows(rows: &[[f32; 4]]) -> (ScoredBlock, Vec<u32>) {
+    let mut draw = VerifierDraw::new(&logprob_cfg(greedy_cfg(), 2));
+    let tokens = draw
+        .block_tokens(&logits_block(rows), rows.len(), Device::Cpu)
+        .unwrap_or_else(|e| panic!("block: {e}"));
+    let scored = draw
+        .take_scored()
+        .unwrap_or_else(|e| panic!("take: {e}"))
+        .unwrap_or_else(|| panic!("no block kept"));
+    (scored, tokens)
+}
+
+const FOUR_ROWS: [[f32; 4]; 4] = [
+    [0.1, 9.0, 0.2, 0.3],
+    [4.0, 0.0, 0.5, 8.5],
+    [7.0, 1.0, 2.0, 3.0],
+    [0.0, 0.0, 6.0, 1.0],
+];
+
+/// Each emitted token carries the record of its own row, counted from the
+/// round's first token and not from what the request already holds: the seed is
+/// in `emitted` and a round already emitted one token, so the first token of
+/// this round is row 0 of a request whose `emitted` is one long.
+///
+/// Mutation: pass the round's index shifted by one; index the row by
+/// `emitted.len()` or by `*emitted_in_rounds`; hand `emit_step` `None`.
+#[test]
+fn a_round_reports_a_record_for_each_token_it_emits() {
+    let tokenizer = tiny_tokenizer();
+    let (scored, tokens) = scored_rows(&FOUR_ROWS);
+    let mut emitted: Vec<ProbeStep> = Vec::new();
+    let mut window = DecodeWindow::new();
+    let mut held = |_: &ProbeStep| -> Option<u32> { None };
+    crate::speculative::emit_step(&tokenizer, 7, None, &mut held, &mut emitted, &mut window);
+    let mut emitted_in_rounds = 1usize;
+    let mut seen: Vec<Option<u32>> = Vec::new();
+    let mut step = |s: &ProbeStep| -> Option<u32> {
+        seen.push(s.logprobs.as_ref().map(|lp| lp.token_id));
+        None
+    };
+
+    let emit = super::emit_round_tokens(
+        &tokenizer,
+        &tokens,
+        Some(&scored),
+        3,
+        &[],
+        &mut step,
+        &mut emitted,
+        &mut emitted_in_rounds,
+        &mut window,
+        None,
+    )
+    .unwrap_or_else(|e| panic!("emit: {e}"));
+
+    assert_eq!(emit.committed, 2, "the budget owed two more tokens");
+    assert_eq!(
+        seen,
+        tokens.iter().take(2).map(|&t| Some(t)).collect::<Vec<_>>(),
+        "the sink saw one record per emitted token, each for its own token"
+    );
+    assert!(
+        emitted.first().is_some_and(|s| s.logprobs.is_none()),
+        "the earlier token keeps what it was emitted with"
+    );
+    for (i, (step, &token)) in emitted.iter().skip(1).zip(&tokens).enumerate() {
+        let want = scored
+            .token_logprobs(i, token)
+            .unwrap_or_else(|e| panic!("row {i}: {e}"));
+        let got = step
+            .logprobs
+            .as_ref()
+            .unwrap_or_else(|| panic!("round token {i} carries no record"));
+        assert_eq!(
+            (got.token_id, got.token_logprob, &got.top),
+            (want.token_id, want.token_logprob, &want.top),
+            "round token {i} must carry the record of row {i}"
+        );
+    }
+}
+
+/// A stop token ends the round, and no record is read past it: the verifier
+/// scored two rows, the round committed three tokens and the second is the stop
+/// token, so a read for the third finds no row and fails.
+///
+/// Mutation: read the records for the whole commit before the walk.
+#[test]
+fn a_round_stopped_by_its_token_reads_no_record_past_it() {
+    let tokenizer = tiny_tokenizer();
+    let (scored, tokens) = scored_rows(&FOUR_ROWS[..2]);
+    let &[t0, t1] = tokens.as_slice() else {
+        panic!("two rows give two tokens");
+    };
+    let mut emitted: Vec<ProbeStep> = Vec::new();
+    let mut emitted_in_rounds = 0usize;
+    let mut window = DecodeWindow::new();
+    let mut step = |_: &ProbeStep| -> Option<u32> { None };
+
+    let emit = super::emit_round_tokens(
+        &tokenizer,
+        &[t0, t1, 1],
+        Some(&scored),
+        8,
+        &[t1],
+        &mut step,
+        &mut emitted,
+        &mut emitted_in_rounds,
+        &mut window,
+        None,
+    )
+    .unwrap_or_else(|e| panic!("emit: {e}"));
+
+    assert!(emit.hit_eos);
+    assert_eq!(emitted.len(), 2, "the stop token is the second emission");
+    assert!(
+        emitted.iter().all(|s| s.logprobs.is_some()),
+        "both emitted tokens carry a record"
+    );
+}
+
+/// A token the budget cuts is not read, even when it has no row: the round
+/// commits three tokens over two scored rows and the request owes two.
+///
+/// Mutation: build the record before the budget check.
+#[test]
+fn a_token_the_budget_cuts_needs_no_row() {
+    let tokenizer = tiny_tokenizer();
+    let (scored, tokens) = scored_rows(&FOUR_ROWS[..2]);
+    let &[t0, t1] = tokens.as_slice() else {
+        panic!("two rows give two tokens");
+    };
+    let mut emitted: Vec<ProbeStep> = Vec::new();
+    let mut emitted_in_rounds = 0usize;
+    let mut window = DecodeWindow::new();
+    let mut step = |_: &ProbeStep| -> Option<u32> { None };
+
+    let emit = super::emit_round_tokens(
+        &tokenizer,
+        &[t0, t1, 1],
+        Some(&scored),
+        2,
+        &[],
+        &mut step,
+        &mut emitted,
+        &mut emitted_in_rounds,
+        &mut window,
+        None,
+    )
+    .unwrap_or_else(|e| panic!("emit: {e}"));
+
+    assert_eq!(emit.committed, 2, "the budget owed two of the three");
+}
+
+/// A round that outruns the rows the verifier scored is refused before the
+/// token reaches the sink.
+///
+/// Mutation: fall back to `None` on a missing row.
+#[test]
+fn a_token_with_no_scored_row_is_refused_before_the_sink() {
+    let tokenizer = tiny_tokenizer();
+    let (scored, tokens) = scored_rows(&FOUR_ROWS[..2]);
+    let mut emitted: Vec<ProbeStep> = Vec::new();
+    let mut emitted_in_rounds = 0usize;
+    let mut window = DecodeWindow::new();
+    let mut seen = 0usize;
+    let mut step = |_: &ProbeStep| -> Option<u32> {
+        seen += 1;
+        None
+    };
+    let &[t0, t1] = tokens.as_slice() else {
+        panic!("two rows give two tokens");
+    };
+    let three = [t0, t1, 1];
+
+    let emit = super::emit_round_tokens(
+        &tokenizer,
+        &three,
+        Some(&scored),
+        8,
+        &[],
+        &mut step,
+        &mut emitted,
+        &mut emitted_in_rounds,
+        &mut window,
+        None,
+    );
+
+    assert!(emit.is_err(), "the third token has no row to report");
+    assert_eq!(seen, 2, "the two tokens that had rows reached the sink");
+}
+
+/// The seed carries the record of the prefill row it was drawn from, and a
+/// request that asks for none carries none.
+///
+/// Mutation: build the seed's record from row 1; always pass `None`.
+#[test]
+fn the_seed_reports_its_own_record_only_when_asked() {
+    let tokenizer = tiny_tokenizer();
+    let (scored, tokens) = scored_rows(&FOUR_ROWS[..1]);
+    let &[seed] = tokens.as_slice() else {
+        panic!("one row gives one token");
+    };
+    for with_scored in [true, false] {
+        let mut emitted: Vec<ProbeStep> = Vec::new();
+        let mut window = DecodeWindow::new();
+        let mut step = |_: &ProbeStep| -> Option<u32> { None };
+        let stopped = super::emit_seed_token(
+            &tokenizer,
+            seed,
+            with_scored.then_some(&scored),
+            &mut step,
+            &mut emitted,
+            &mut window,
+            &[],
+            &totals(false),
+        )
+        .unwrap_or_else(|e| panic!("seed: {e}"));
+        assert!(!stopped);
+        let logprobs = emitted.first().and_then(|s| s.logprobs.as_ref());
+        assert_eq!(logprobs.is_some(), with_scored);
+        if let Some(lp) = logprobs {
+            let want = scored
+                .token_logprobs(0, seed)
+                .unwrap_or_else(|e| panic!("row 0: {e}"));
+            assert_eq!((lp.token_id, lp.token_logprob), (seed, want.token_logprob));
+        }
+    }
 }
 
 /// A stack that is not empty and holds nothing to refold answers `false`.
