@@ -141,7 +141,12 @@ bypass — the ruleset's target is `main` alone, so a tag ref is outside it.
 9. **Tap.** `make tap-sync` copies the formula into
    `Pushkinist/homebrew-rmlx` as `Formula/rmlx.rb` and pushes it.
 10. **Verify** the install paths (§Verify the install paths).
-11. **Retrospective** over the diff from the previous tag to the new one
+11. **Restore the pin.** The install check can move this host off the pinned
+    MLX pair: Homebrew upgrades `mlx` and `mlx-c` to bottles that lack the
+    NAX GEMM kernels. Run `make mlx-restore-pin`, then `make mlx-preflight`.
+    Preflight prints the pinned pair. Check it before any GPU run on this
+    host. See [Restoring the pair: `make mlx-restore-pin`](MLX_PAIR.md#restoring-the-pair-make-mlx-restore-pin).
+12. **Retrospective** over the diff from the previous tag to the new one
     (§Retrospective).
 
 ### No Homebrew bottle
