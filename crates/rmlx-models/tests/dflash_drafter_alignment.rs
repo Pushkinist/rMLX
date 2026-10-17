@@ -42,6 +42,7 @@ use rmlx_mlx::{argmax, Device};
 use rmlx_models::arch;
 use rmlx_models::kv_cache::DEFAULT_KV_QUANT;
 use rmlx_models::speculative::dflash::{dflash_generate, DFlashDrafter};
+use rmlx_models::speculative::VerifierTrunk;
 
 mod common;
 
@@ -88,7 +89,8 @@ fn dflash_round0_first_token_aligns() {
         "DFlash verifier must be the Qwen3.5/3.6-MoE hybrid"
     );
     let hidden = verifier.hidden_size();
-    let drafter = DFlashDrafter::load(&draft_path, hidden, device).expect("load drafter");
+    let drafter = DFlashDrafter::load(&draft_path, VerifierTrunk::of(&verifier), device)
+        .expect("load drafter");
     let tlids = drafter.target_layer_ids().to_vec();
 
     let tk =
@@ -208,8 +210,8 @@ fn dflash_live_loop_emits_coherent() {
     let device = Device::Gpu;
     let verifier =
         arch::load_model(&model_path, device, &arch::LoadOpts::default()).expect("load verifier");
-    let hidden = verifier.hidden_size();
-    let drafter = DFlashDrafter::load(&draft_path, hidden, device).expect("load drafter");
+    let drafter = DFlashDrafter::load(&draft_path, VerifierTrunk::of(&verifier), device)
+        .expect("load drafter");
 
     let tk =
         tokenizers::Tokenizer::from_file(model_path.join("tokenizer.json")).expect("tokenizer");

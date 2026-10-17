@@ -42,6 +42,7 @@ pub mod gemma4_assistant;
 pub mod mtp;
 
 pub(crate) mod draft_kind;
+mod pairing;
 pub(crate) mod round_common;
 pub(crate) mod round_loop;
 pub(crate) mod round_stats;
@@ -63,6 +64,8 @@ use rmlx_runtime::{count_nan_in_bytes, max_abs_from_bytes};
 use crate::arch::{load_model, Architecture, LoadOpts};
 use crate::decode_loop::ProbeStep;
 pub use draft_kind::{Declared, DraftKind};
+pub(crate) use pairing::TrunkKeys;
+pub use pairing::VerifierTrunk;
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 use round_loop::{run_rounds, RoundCfg};
 pub(crate) use round_stats::{

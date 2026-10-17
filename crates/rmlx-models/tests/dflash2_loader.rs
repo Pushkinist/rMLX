@@ -32,12 +32,20 @@ use std::path::PathBuf;
 use rmlx_mlx::Device;
 use rmlx_models::layers::Linear;
 use rmlx_models::speculative::dflash2::DFlash2Drafter;
+use rmlx_models::speculative::VerifierTrunk;
 
 const DRAFT_SLUG: &str = "z-lab__Qwen3.8-27B-DFlash2";
 
 /// The width of `mlx-community/Qwen3.8-27B-4bit`, the verifier this drafter is
 /// published against. The drafter's `fc` reads that verifier's hidden states.
 const VERIFIER_HIDDEN: usize = 5120;
+
+/// The same verifier's trunk, as its `config.json` declares it.
+const VERIFIER: VerifierTrunk = VerifierTrunk {
+    hidden_size: VERIFIER_HIDDEN,
+    num_hidden_layers: 64,
+    vocab_size: 248_320,
+};
 
 /// Every tensor the checkpoint ships, and nothing else.
 const TENSOR_COUNT: usize = 81;
@@ -152,7 +160,7 @@ fn the_published_checkpoint_loads_whole() {
         names.len()
     );
 
-    let drafter = DFlash2Drafter::load(&dir, VERIFIER_HIDDEN, Device::Gpu)
+    let drafter = DFlash2Drafter::load(&dir, VERIFIER, Device::Gpu)
         .expect("the published DFlash 2 checkpoint must load whole");
 
     let cfg = &drafter.cfg;
@@ -223,10 +231,9 @@ fn the_dflash_1_loader_still_refuses_this_checkpoint() {
         return;
     };
 
-    let err =
-        rmlx_models::speculative::dflash::DFlashDrafter::load(&dir, VERIFIER_HIDDEN, Device::Gpu)
-            .err()
-            .map_or_else(String::new, |e| e.to_string());
+    let err = rmlx_models::speculative::dflash::DFlashDrafter::load(&dir, VERIFIER, Device::Gpu)
+        .err()
+        .map_or_else(String::new, |e| e.to_string());
 
     assert!(
         err.contains("DFlashDrafter") && err.contains("23"),
@@ -248,9 +255,16 @@ fn a_mismatched_verifier_width_is_refused_on_the_real_config() {
         return;
     };
 
-    let err = DFlash2Drafter::load(&dir, 2048, Device::Gpu)
-        .err()
-        .map_or_else(String::new, |e| e.to_string());
+    let err = DFlash2Drafter::load(
+        &dir,
+        VerifierTrunk {
+            hidden_size: 2048,
+            ..VERIFIER
+        },
+        Device::Gpu,
+    )
+    .err()
+    .map_or_else(String::new, |e| e.to_string());
     assert!(
         err.contains("5120") && err.contains("2048"),
         "the refusal must name both widths: {err}"
@@ -378,7 +392,7 @@ fn the_forward_reproduces_the_reference_on_the_published_weights() {
     else {
         return;
     };
-    let drafter = DFlash2Drafter::load(&dir, VERIFIER_HIDDEN, Device::Gpu)
+    let drafter = DFlash2Drafter::load(&dir, VERIFIER, Device::Gpu)
         .expect("the published DFlash 2 checkpoint must load whole");
 
     let hidden = VERIFIER_HIDDEN as i32;
@@ -502,7 +516,7 @@ fn the_selector_reproduces_the_reference_on_the_published_weights() {
     else {
         return;
     };
-    let drafter = DFlash2Drafter::load(&dir, VERIFIER_HIDDEN, Device::Gpu)
+    let drafter = DFlash2Drafter::load(&dir, VERIFIER, Device::Gpu)
         .expect("the published DFlash 2 checkpoint must load whole");
 
     let hidden_width = VERIFIER_HIDDEN as i32;

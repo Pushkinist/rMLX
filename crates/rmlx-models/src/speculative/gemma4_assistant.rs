@@ -78,7 +78,7 @@ use rmlx_mlx::{
     Array, Device, Dtype,
 };
 
-use super::MAX_BLOCK_SIZE;
+use super::{TrunkKeys, VerifierTrunk, MAX_BLOCK_SIZE};
 use crate::arch::Architecture;
 use crate::gemma4::LayerType;
 use crate::layers::{Embedding, Linear, Mlp, RmsNorm};
@@ -139,9 +139,15 @@ impl Gemma4AssistantDrafter {
         self.backbone_hidden
     }
 
-    /// Load a Gemma4-assistant drafter from `draft_dir`, validate vs verifier.
-    pub fn load(draft_dir: &Path, backbone_hidden: usize, device: Device) -> Result<Self> {
-        load_assistant(draft_dir, backbone_hidden, device)
+    /// Load a Gemma4-assistant drafter from `draft_dir`. The config's
+    /// `backbone_hidden_size` must equal the verifier's hidden size and its
+    /// `text_config.vocab_size` the verifier's vocabulary; a disagreement is
+    /// [`Error::SpeculativePairing`]. The `hidden_size` in `text_config` is the
+    /// drafter's own width and is not compared. The widths of `pre_projection`
+    /// and `post_projection` must carry the verifier's hidden size as well, so a
+    /// config that does not declare its backbone is still checked.
+    pub fn load(draft_dir: &Path, verifier: VerifierTrunk, device: Device) -> Result<Self> {
+        load_assistant(draft_dir, verifier, device)
     }
 
     /// Autoregressive K-step greedy draft (port of `draft_block`).
@@ -440,23 +446,14 @@ fn bytes_to_i32(a: &Array) -> Result<Vec<i32>> {
 )]
 fn load_assistant(
     draft_dir: &Path,
-    backbone_hidden: usize,
+    verifier: VerifierTrunk,
     device: Device,
 ) -> Result<Gemma4AssistantDrafter> {
     use rmlx_loader::{load_config, load_shard_index, ShardSet};
 
+    let backbone_hidden = verifier.hidden_size;
     let cfg = load_config(draft_dir)
         .map_err(|e| Error::Model(format!("Gemma4Assistant: load_config: {e}")))?;
-    let backbone_hidden_size = cfg
-        .extras
-        .get("backbone_hidden_size")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(backbone_hidden as u64) as usize;
-    if backbone_hidden_size != backbone_hidden {
-        return Err(Error::Model(format!(
-            "Gemma4Assistant: backbone_hidden_size {backbone_hidden_size} != verifier hidden {backbone_hidden}"
-        )));
-    }
     let num_centroids = cfg
         .extras
         .get("num_centroids")
@@ -473,6 +470,16 @@ fn load_assistant(
         .as_ref()
         .ok_or_else(|| Error::Model("Gemma4Assistant: missing text_config".into()))?;
     let te = &tc.extras;
+    verifier.refuse_another_base(
+        draft_dir,
+        "the Gemma4 assistant's config.json",
+        &[te, &cfg.extras],
+        TrunkKeys {
+            hidden_size: "backbone_hidden_size",
+            num_hidden_layers: None,
+            vocab_size: "vocab_size",
+        },
+    )?;
     // `g`/`gf` read from `extras`; some keys (hidden_size, num_hidden_layers,
     // num_attention_heads, sliding_window, layer_types) are *typed* fields on
     // `TextConfig` and must be read from `tc.*` (not extras — they are not
@@ -562,8 +569,27 @@ fn load_assistant(
     let embed_tokens = Embedding::Plain {
         weight: load("model.embed_tokens.weight")?,
     };
-    let pre_projection = lin("pre_projection.weight")?;
-    let post_projection = lin("post_projection.weight")?;
+    let pre_weight = load("pre_projection.weight")?;
+    let post_weight = load("post_projection.weight")?;
+    for (name, weight, axis, expected) in [
+        ("pre_projection.weight", &pre_weight, 1, 2 * backbone_hidden),
+        ("post_projection.weight", &post_weight, 0, backbone_hidden),
+    ] {
+        let shape = weight.shape();
+        if shape.get(axis).copied() != i32::try_from(expected).ok() {
+            return Err(Error::SpeculativePairing {
+                reason: format!(
+                    "the Gemma4 assistant's {name} has shape {shape:?} and the verifier's hidden \
+                     size {backbone_hidden} needs {expected} on axis {axis}; the drafter was \
+                     built for another base model"
+                ),
+            });
+        }
+    }
+    let pre_projection = Linear::Plain { weight: pre_weight };
+    let post_projection = Linear::Plain {
+        weight: post_weight,
+    };
     let final_norm = norm("model.norm.weight")?;
 
     // LM-head variant detection by tensor presence (NOT config — `num_centroids`

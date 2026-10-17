@@ -32,6 +32,7 @@
 use rmlx_mlx::Device;
 use rmlx_models::arch;
 use rmlx_models::speculative::gemma4_assistant::{mtp_assistant_generate, Gemma4AssistantDrafter};
+use rmlx_models::speculative::VerifierTrunk;
 
 mod common;
 
@@ -109,9 +110,8 @@ fn mtp_assistant_accept_rate_is_high() {
     let device = Device::Gpu;
     let verifier =
         arch::load_model(&model_path, device, &arch::LoadOpts::default()).expect("load verifier");
-    let backbone_hidden = verifier.hidden_size();
-    let drafter =
-        Gemma4AssistantDrafter::load(&draft_path, backbone_hidden, device).expect("load drafter");
+    let drafter = Gemma4AssistantDrafter::load(&draft_path, VerifierTrunk::of(&verifier), device)
+        .expect("load drafter");
 
     let tk =
         tokenizers::Tokenizer::from_file(model_path.join("tokenizer.json")).expect("tokenizer");

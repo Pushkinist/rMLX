@@ -210,7 +210,7 @@ const MIN_ANSWER_TOKENS: usize = 160;
 /// prefix would otherwise score 1.0.
 const MIN_LENGTH_RATIO: f64 = 0.60;
 
-use rmlx_models::speculative::{default_block_for, drafts_per_round};
+use rmlx_models::speculative::{default_block_for, drafts_per_round, VerifierTrunk};
 
 /// Context both arms run under. Above the 4k prompt plus the budget, and the
 /// same on both sides — a different cap on either would make this a measurement
@@ -3905,12 +3905,12 @@ fn engine_for(
                 );
                 return None;
             }
+            let drafter =
+                Gemma4AssistantDrafter::load(draft_path, VerifierTrunk::of(&verifier), device)
+                    .expect("load assistant drafter");
             Engine::Sidecar {
                 verifier,
-                drafter: Drafter::Assistant(Box::new(
-                    Gemma4AssistantDrafter::load(draft_path, hidden, device)
-                        .expect("load assistant drafter"),
-                )),
+                drafter: Drafter::Assistant(Box::new(drafter)),
             }
         }
         RoundLoop::MtpSidecar => {
@@ -3922,11 +3922,11 @@ fn engine_for(
                 );
                 return None;
             }
+            let drafter = MtpDrafter::load(draft_path, VerifierTrunk::of(&verifier), device)
+                .expect("load MTP sidecar");
             Engine::Sidecar {
                 verifier,
-                drafter: Drafter::Mtp(Box::new(
-                    MtpDrafter::load(draft_path, hidden, device).expect("load MTP sidecar"),
-                )),
+                drafter: Drafter::Mtp(Box::new(drafter)),
             }
         }
         RoundLoop::DFlash1 => {
@@ -3938,11 +3938,11 @@ fn engine_for(
                 );
                 return None;
             }
+            let drafter = DFlashDrafter::load(draft_path, VerifierTrunk::of(&verifier), device)
+                .expect("load DFlash 1 drafter");
             Engine::Sidecar {
                 verifier,
-                drafter: Drafter::DFlash1(Box::new(
-                    DFlashDrafter::load(draft_path, hidden, device).expect("load DFlash 1 drafter"),
-                )),
+                drafter: Drafter::DFlash1(Box::new(drafter)),
             }
         }
         RoundLoop::DFlash2 => {
@@ -3954,12 +3954,11 @@ fn engine_for(
                 );
                 return None;
             }
+            let drafter = DFlash2Drafter::load(draft_path, VerifierTrunk::of(&verifier), device)
+                .expect("load DFlash 2 drafter");
             Engine::Sidecar {
                 verifier,
-                drafter: Drafter::DFlash2(Box::new(
-                    DFlash2Drafter::load(draft_path, hidden, device)
-                        .expect("load DFlash 2 drafter"),
-                )),
+                drafter: Drafter::DFlash2(Box::new(drafter)),
             }
         }
         RoundLoop::Eagle3 => {

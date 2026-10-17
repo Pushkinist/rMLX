@@ -27,10 +27,17 @@ use std::path::Path;
 use rmlx_mlx::{concatenate, Array, Device};
 
 use super::DFlashDrafter;
-use crate::speculative::{committed_rows, PROJECTION_TOL};
+use crate::speculative::{committed_rows, VerifierTrunk, PROJECTION_TOL};
 
 /// The synthetic drafter's width.
 const HIDDEN: usize = 32;
+/// The verifier the synthetic drafter is paired with. The drafter's config
+/// declares `vocab_size` and no layer count.
+const VERIFIER: VerifierTrunk = VerifierTrunk {
+    hidden_size: HIDDEN,
+    num_hidden_layers: IDS,
+    vocab_size: 16,
+};
 /// Verifier layers it conditions on, so a conditioning row is `IDS * HIDDEN`.
 const IDS: usize = 3;
 /// Per-head width, and with it the head counts below.
@@ -141,7 +148,7 @@ fn fixture_drafter(dir: &Path) -> DFlashDrafter {
     )
     .expect("write shard");
 
-    DFlashDrafter::load(dir, HIDDEN, Device::Cpu).expect("the synthetic drafter loads")
+    DFlashDrafter::load(dir, VERIFIER, Device::Cpu).expect("the synthetic drafter loads")
 }
 
 #[allow(

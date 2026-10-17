@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use rmlx_mlx::Dtype;
 
 use super::super::round::PREFILL_CHUNK_SIZE;
+use super::super::tests::SCALE_VERIFIER;
 use super::*;
 use crate::layers::Linear;
 use crate::qwen3_5_moe::capture_tail::CaptureTail;
@@ -124,7 +125,7 @@ fn reference_file() -> PathBuf {
 )]
 fn scale_drafter(sliding_window: Option<u64>) -> (DFlash2Drafter, Option<tempfile::TempDir>) {
     let Some(window) = sliding_window else {
-        let d = DFlash2Drafter::load(Path::new(FIXTURE), SCALE_HIDDEN, Device::Cpu)
+        let d = DFlash2Drafter::load(Path::new(FIXTURE), SCALE_VERIFIER, Device::Cpu)
             .expect("the fixture snapshot loads");
         return (d, None);
     };
@@ -141,7 +142,7 @@ fn scale_drafter(sliding_window: Option<u64>) -> (DFlash2Drafter, Option<tempfil
         dir.path().join("model.safetensors"),
     )
     .expect("copy weights");
-    let d = DFlash2Drafter::load(dir.path(), SCALE_HIDDEN, Device::Cpu)
+    let d = DFlash2Drafter::load(dir.path(), SCALE_VERIFIER, Device::Cpu)
         .expect("the fixture snapshot loads at another window");
     (d, Some(dir))
 }

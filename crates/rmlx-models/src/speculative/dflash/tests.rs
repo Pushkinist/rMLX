@@ -67,3 +67,104 @@ fn dflash_module_compiles() {
     let _bs: fn(&[(usize, usize)], usize, usize) -> usize = dflash_next_block_size;
     let _ = (_load, _bs);
 }
+
+/// The verifier the config-only drafters below are paired with: Qwen3.6-35B-A3B.
+const VERIFIER: VerifierTrunk = VerifierTrunk {
+    hidden_size: 2048,
+    num_hidden_layers: 40,
+    vocab_size: 248_320,
+};
+
+/// The three facts a DFlash config restates about its base, as the verifier
+/// has them.
+const MATCHED: [(&str, usize); 3] = [
+    ("hidden_size", VERIFIER.hidden_size),
+    ("num_target_layers", VERIFIER.num_hidden_layers),
+    ("vocab_size", VERIFIER.vocab_size),
+];
+
+/// A drafter folder holding nothing but a `config.json` that declares `facts`
+/// beside the keys the loader reads first.
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: the tempdir is this process's own, so a failure to write into it names a broken environment"
+)]
+fn config_only_drafter(facts: &[(&str, usize)]) -> tempfile::TempDir {
+    let mut config = serde_json::json!({
+        "architectures": ["DFlashDraftModel"],
+        "dflash_config": { "mask_token_id": 248_070, "target_layer_ids": [1, 10, 19, 28, 37] },
+    });
+    let keys = config.as_object_mut().expect("config is an object");
+    for &(key, value) in facts {
+        keys.insert(key.to_owned(), serde_json::json!(value));
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("config.json"), config.to_string()).expect("write config.json");
+    dir
+}
+
+/// The error the loader stops with on a folder that has no weights.
+fn load_error(dir: &tempfile::TempDir) -> Error {
+    match DFlashDrafter::load(dir.path(), VERIFIER, Device::Cpu) {
+        Ok(_) => Error::Other("a config-only drafter loaded".to_owned()),
+        Err(e) => e,
+    }
+}
+
+/// A drafter whose config restates a base other than the verifier is refused
+/// before a weight is read, naming the key and both values. One case per fact,
+/// so dropping any one of them from the comparison turns its case red.
+#[test]
+fn a_drafter_built_for_another_base_is_refused_naming_both_values() {
+    for (key, foreign) in [
+        ("hidden_size", 4096),
+        ("num_target_layers", 64),
+        ("vocab_size", 262_144),
+    ] {
+        let facts: Vec<(&str, usize)> = MATCHED
+            .iter()
+            .map(|&(k, v)| (k, if k == key { foreign } else { v }))
+            .collect();
+        let held = MATCHED
+            .iter()
+            .find_map(|&(k, v)| (k == key).then_some(v))
+            .unwrap_or_default();
+        let err = load_error(&config_only_drafter(&facts));
+        let Error::SpeculativePairing { reason } = &err else {
+            panic!("{key}={foreign}: expected a pairing refusal, got: {err}");
+        };
+        assert!(
+            reason.contains(key)
+                && reason.contains(&foreign.to_string())
+                && reason.contains(&held.to_string()),
+            "the refusal must name {key}, the drafter's {foreign} and the verifier's {held}: \
+             {reason}"
+        );
+    }
+}
+
+/// A drafter that agrees with the verifier on every fact it declares goes on to
+/// its weights, as does one that declares only some of them.
+#[test]
+fn a_drafter_that_agrees_or_declares_some_goes_on_to_its_weights() {
+    let hidden_only = [MATCHED[0]];
+    for facts in [&MATCHED[..], &hidden_only[..]] {
+        let err = load_error(&config_only_drafter(facts));
+        let msg = err.to_string();
+        assert!(
+            !matches!(err, Error::SpeculativePairing { .. }) && msg.contains("shard index"),
+            "declared {facts:?}: expected the load to reach the weights, got: {msg}"
+        );
+    }
+}
+
+/// A config with no `hidden_size` is refused rather than read at a default
+/// width that a verifier of that width would then pair with.
+#[test]
+fn a_config_without_hidden_size_is_refused() {
+    let err = load_error(&config_only_drafter(&[]));
+    assert!(
+        matches!(err, Error::Model(_)) && err.to_string().contains("hidden_size"),
+        "expected a refusal naming hidden_size, got: {err}"
+    );
+}

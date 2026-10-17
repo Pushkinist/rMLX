@@ -146,6 +146,40 @@ A plain Gemma4 model (`Gemma4ForConditionalGeneration`) has no MTP head. Given
 bare, it drafts as `two_model`. Given with `--draft-kind mtp`, it is refused,
 and the message points at the `*-it-assistant-bf16` snapshot.
 
+### Pairing a drafter with its verifier
+
+A drafter reads the verifier's embeddings or hidden states, so it is useful on
+the base it was trained against. Under greedy verification a drafter built for
+another base does not fail: the output stays the verifier's own and only the
+accept rate falls. The loaders of every drafter that reads the verifier's
+trunk (the MTP sidecar, DFlash, DFlash 2, EAGLE-3 and the Gemma4 assistant)
+therefore compare the facts the drafter's config restates about its base with the
+verifier's (`VerifierTrunk::refuse_another_base`):
+
+| Fact | MTP sidecar, in `text_config` | DFlash and DFlash 2, in `config.json` | EAGLE-3, in `config.json` | Gemma4 assistant, in `config.json` |
+|---|---|---|---|---|
+| hidden size | `hidden_size` | `hidden_size` | `hidden_size` | `backbone_hidden_size` |
+| layer count | `num_hidden_layers` | `num_target_layers` | not restated | not restated |
+| vocabulary | `vocab_size` | `vocab_size` | `vocab_size` | `text_config.vocab_size` |
+
+A disagreement is `Error::SpeculativePairing`, naming the key and both values,
+raised before a weight is read. A key that is absent or not an integer is not
+compared, and a config with none of the keys loads with a warning that names
+the draft directory. Three loaders require some of these keys and refuse a
+config that lacks them, with `Error::Model`: DFlash requires `hidden_size`;
+DFlash 2 requires every key it reads, among them `hidden_size` and
+`vocab_size`; EAGLE-3 requires `hidden_size` and `vocab_size`
+(`Eagle3Config::from_model_config`, which `rmlx serve` also calls at startup when
+the model is a Hadamard pack). The `num_hidden_layers` of a DFlash or EAGLE-3 config and the
+`hidden_size` in the `text_config` of a Gemma4 assistant are the drafter's own
+depth and width and are not compared. Each loader also checks a projection
+weight against the verifier's width; for the Gemma4 assistant these are
+`pre_projection.weight` (twice the width) and `post_projection.weight`, so a
+config that does not declare `backbone_hidden_size` is still checked.
+
+No key names the base model, so two bases with the same trunk shape cannot be
+told apart: a drafter for one loads on the other.
+
 ### MTP sidecar (Qwen3.5 family)
 
 Source: `speculative/mtp.rs`, `qwen3_5_moe/mtp_layer.rs`.

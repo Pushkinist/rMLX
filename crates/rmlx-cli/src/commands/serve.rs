@@ -1161,7 +1161,8 @@ fn refuse_unservable_pack(flag: &str, cfg: &ModelConfig, p: &Path) -> anyhow::Re
 /// Exit 1 at startup for an EAGLE-3 drafter with a reduced vocabulary over a
 /// `--model` that is a Hadamard pack. `Eagle3Drafter::load` refuses the pair
 /// at preload, which is not fatal, and then at every request. Reads the two
-/// configs only; the kind is the flag, else the draft's declaration.
+/// configs only; the kind is the flag, else the draft's declaration. An EAGLE-3
+/// draft whose config cannot be read is an error too, since the load refuses it.
 fn refuse_restricted_head_over_a_pack(
     model: &Path,
     draft_cfg: &ModelConfig,
@@ -1178,9 +1179,12 @@ fn refuse_restricted_head_over_a_pack(
     let declared =
         rmlx_models::Declared::from_snapshot(draft_cfg.dispatch_arch().unwrap_or(""), model_type);
     let eagle3 = flag.or(declared.kind()) == Some(rmlx_models::DraftKind::Eagle3);
-    let restricted = rmlx_models::speculative::eagle3::Eagle3Config::from_model_config(draft_cfg)
-        .restricted_vocab();
-    if model_cfg.is_hadamard_pack() && eagle3 && restricted {
+    if !(model_cfg.is_hadamard_pack() && eagle3) {
+        return Ok(());
+    }
+    if rmlx_models::speculative::eagle3::Eagle3Config::from_model_config(draft_cfg)?
+        .restricted_vocab()
+    {
         let why = rmlx_models::arch::RESTRICTED_HEAD_OVER_A_PACK;
         tracing::error!(model = %model.display(), why, "draft model refused at startup");
         eprintln!("error: --draft-model: {why}");

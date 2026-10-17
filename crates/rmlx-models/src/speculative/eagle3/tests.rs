@@ -659,3 +659,101 @@ fn eagle3_drafter_cache_sized_from_max_seq_decodes_past_4096() {
         "cache must decode past 4096 without error"
     );
 }
+
+// -----------------------------------------------------------------------
+// Pairing with the verifier: config-only drafters, no weights.
+// -----------------------------------------------------------------------
+
+/// The verifier the config-only drafters below are paired with: Qwen3.6-35B-A3B.
+/// Its width and vocabulary are the ones the config reader falls back to for an
+/// absent key.
+const PAIRED_VERIFIER: VerifierTrunk = VerifierTrunk {
+    hidden_size: 2048,
+    num_hidden_layers: 40,
+    vocab_size: 248_320,
+};
+
+/// A drafter folder holding nothing but a `config.json` with the EAGLE-3 keys
+/// the loader reads before its weights. `hidden_size` and `vocab_size` are left
+/// out when `None`.
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: the tempdir is this process's own, so a failure to write into it names a broken environment"
+)]
+fn config_only_drafter(hidden_size: Option<usize>, vocab_size: Option<usize>) -> tempfile::TempDir {
+    let mut config = serde_json::json!({
+        "architectures": ["LlamaForCausalLMEagle3"],
+        "num_hidden_layers": 1,
+        "draft_vocab_size": 32_000,
+        "eagle_config": { "eagle_aux_hidden_state_layer_ids": [3, 19, 35] },
+    });
+    let keys = config.as_object_mut().expect("config is an object");
+    if let Some(width) = hidden_size {
+        keys.insert("hidden_size".to_owned(), serde_json::json!(width));
+    }
+    if let Some(vocab) = vocab_size {
+        keys.insert("vocab_size".to_owned(), serde_json::json!(vocab));
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("config.json"), config.to_string()).expect("write config.json");
+    dir
+}
+
+/// The error the loader stops with on a folder that has no weights.
+fn load_error(dir: &tempfile::TempDir) -> Error {
+    match load_eagle3(dir.path(), PAIRED_VERIFIER, &[], Device::Cpu) {
+        Ok(_) => Error::Other("a config-only drafter loaded".to_owned()),
+        Err(e) => e,
+    }
+}
+
+/// A drafter whose config restates a hidden size or vocabulary other than the
+/// verifier's is refused before a weight is read, as a pairing refusal naming
+/// the key and both values.
+#[test]
+fn a_drafter_built_for_another_base_is_refused_naming_both_values() {
+    for (key, hidden_size, vocab_size, foreign, held) in [
+        ("hidden_size", Some(4096), Some(248_320), 4096, 2048),
+        ("vocab_size", Some(2048), Some(262_144), 262_144, 248_320),
+    ] {
+        let err = load_error(&config_only_drafter(hidden_size, vocab_size));
+        let Error::SpeculativePairing { reason } = &err else {
+            panic!("{key}={foreign}: expected a pairing refusal, got: {err}");
+        };
+        assert!(
+            reason.contains(key)
+                && reason.contains(&foreign.to_string())
+                && reason.contains(&held.to_string()),
+            "the refusal must name {key}, the drafter's {foreign} and the verifier's {held}: \
+             {reason}"
+        );
+    }
+}
+
+/// A drafter that agrees with the verifier goes on to its weights. Its own
+/// `num_hidden_layers` is its depth, not its base's, and is not compared.
+#[test]
+fn a_drafter_that_agrees_goes_on_to_its_weights() {
+    let err = load_error(&config_only_drafter(Some(2048), Some(248_320)));
+    let msg = err.to_string();
+    assert!(
+        !matches!(err, Error::SpeculativePairing { .. }) && msg.contains("shard index"),
+        "expected the load to reach the weights, got: {msg}"
+    );
+}
+
+/// A config that omits `hidden_size` or `vocab_size` is refused, not read at the
+/// fallback value, which would pair it with any verifier that has that value.
+#[test]
+fn a_config_without_hidden_size_or_vocab_size_is_refused() {
+    for (key, hidden_size, vocab_size) in [
+        ("hidden_size", None, Some(248_320)),
+        ("vocab_size", Some(2048), None),
+    ] {
+        let err = load_error(&config_only_drafter(hidden_size, vocab_size));
+        assert!(
+            matches!(err, Error::Model(_)) && err.to_string().contains(key),
+            "expected a refusal naming {key}, got: {err}"
+        );
+    }
+}

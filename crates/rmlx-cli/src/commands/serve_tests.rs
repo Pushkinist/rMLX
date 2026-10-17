@@ -1,8 +1,9 @@
 use super::{
-    resolve_dispatch_policy, FusedQkMode, PlanarFlashDecodeMode, RotKFusedMode, SparseAttnMode,
-    TurboFlashMode,
+    refuse_restricted_head_over_a_pack, resolve_dispatch_policy, FusedQkMode,
+    PlanarFlashDecodeMode, RotKFusedMode, SparseAttnMode, TurboFlashMode,
 };
 use rmlx_core::DispatchPolicy;
+use rmlx_models::DraftKind;
 
 // ── SSD recorder wiring smoke ─────────────────────────────
 //
@@ -356,4 +357,94 @@ fn each_gate_is_wired_to_its_own_flag() {
             ..base
         }
     );
+}
+
+// -- EAGLE-3 reduced vocabulary over a Hadamard pack -----------------------
+
+/// A snapshot folder holding nothing but the given `config.json`.
+fn config_only_snapshot(config: &serde_json::Value) -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(dir.path().join("config.json"), config.to_string()).expect("write config.json");
+    dir
+}
+
+fn load(dir: &tempfile::TempDir) -> rmlx_loader::ModelConfig {
+    rmlx_loader::load_config(dir.path()).expect("load_config")
+}
+
+fn eagle3_config(keys: &[(&str, usize)]) -> serde_json::Value {
+    let mut config = serde_json::json!({ "architectures": ["LlamaForCausalLMEagle3"] });
+    let map = config.as_object_mut().expect("config is an object");
+    for &(key, value) in keys {
+        map.insert(key.to_owned(), serde_json::json!(value));
+    }
+    config
+}
+
+fn pack() -> tempfile::TempDir {
+    config_only_snapshot(&serde_json::json!({ "hadamard_config": {} }))
+}
+
+/// A reduced-vocabulary EAGLE-3 draft over a pack stops the server at startup.
+#[test]
+fn a_restricted_eagle3_draft_over_a_pack_is_refused() {
+    let draft = config_only_snapshot(&eagle3_config(&[
+        ("hidden_size", 2048),
+        ("vocab_size", 248_320),
+        ("draft_vocab_size", 32_000),
+    ]));
+    let err = refuse_restricted_head_over_a_pack(pack().path(), &load(&draft), None)
+        .expect_err("a restricted head over a pack is refused");
+    assert!(
+        err.downcast_ref::<crate::exit::ExitWith>().is_some(),
+        "expected the startup exit, got: {err}"
+    );
+}
+
+/// A full-vocabulary EAGLE-3 draft over a pack is allowed.
+#[test]
+fn a_full_vocabulary_eagle3_draft_over_a_pack_is_allowed() {
+    let draft = config_only_snapshot(&eagle3_config(&[
+        ("hidden_size", 2048),
+        ("vocab_size", 248_320),
+        ("draft_vocab_size", 248_320),
+    ]));
+    refuse_restricted_head_over_a_pack(pack().path(), &load(&draft), None)
+        .expect("a full head is allowed");
+}
+
+/// An EAGLE-3 draft that does not declare its vocabulary is not read as some
+/// other model's: the startup check names the missing key.
+#[test]
+fn an_eagle3_draft_without_vocab_size_over_a_pack_names_the_key() {
+    let draft = config_only_snapshot(&eagle3_config(&[
+        ("hidden_size", 2048),
+        ("draft_vocab_size", 32_000),
+    ]));
+    let err = refuse_restricted_head_over_a_pack(pack().path(), &load(&draft), None)
+        .expect_err("a draft without vocab_size is refused");
+    assert!(
+        err.downcast_ref::<crate::exit::ExitWith>().is_none()
+            && err.to_string().contains("vocab_size"),
+        "expected a refusal naming vocab_size, got: {err}"
+    );
+}
+
+/// A draft that is not EAGLE-3 is never read as one.
+#[test]
+fn a_draft_of_another_kind_over_a_pack_is_not_read_as_eagle3() {
+    let draft = config_only_snapshot(&serde_json::json!({ "architectures": ["DFlashDraftModel"] }));
+    refuse_restricted_head_over_a_pack(pack().path(), &load(&draft), Some(DraftKind::DFlash))
+        .expect("another kind passes");
+}
+
+/// A model that is not a pack never meets the check.
+#[test]
+fn an_eagle3_draft_over_a_plain_model_is_allowed() {
+    let model = config_only_snapshot(
+        &serde_json::json!({ "architectures": ["Qwen3_5MoeForConditionalGeneration"] }),
+    );
+    let draft = config_only_snapshot(&eagle3_config(&[("draft_vocab_size", 32_000)]));
+    refuse_restricted_head_over_a_pack(model.path(), &load(&draft), None)
+        .expect("a plain model is allowed");
 }

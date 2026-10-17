@@ -223,3 +223,179 @@ fn the_round_block_is_bounded_above_and_refused_below_two() {
         assert!(block_from_request(requested).is_err(), "{requested}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Pairing with the verifier: config-only drafters, no weights.
+// ---------------------------------------------------------------------------
+
+/// The verifier the config-only drafters below are paired with: Gemma4 E2B.
+const PAIRED_VERIFIER: VerifierTrunk = VerifierTrunk {
+    hidden_size: 1536,
+    num_hidden_layers: 35,
+    vocab_size: 262_144,
+};
+
+/// A drafter folder holding nothing but a `config.json` shaped like a shipped
+/// assistant's: the backbone width at the top level, the drafter's own width and
+/// the vocabulary in `text_config`. `backbone_hidden_size` is left out when `None`.
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: the tempdir is this process's own, so a failure to write into it names a broken environment"
+)]
+fn config_only_drafter(
+    backbone_hidden_size: Option<usize>,
+    vocab_size: usize,
+) -> tempfile::TempDir {
+    let mut config = serde_json::json!({
+        "architectures": ["Gemma4AssistantForCausalLM"],
+        "num_centroids": 2048,
+        "text_config": { "hidden_size": 256, "num_hidden_layers": 4, "vocab_size": vocab_size },
+    });
+    if let Some(width) = backbone_hidden_size {
+        config
+            .as_object_mut()
+            .expect("config is an object")
+            .insert("backbone_hidden_size".to_owned(), serde_json::json!(width));
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("config.json"), config.to_string()).expect("write config.json");
+    dir
+}
+
+/// The error the loader stops with on a folder that has no weights.
+fn load_error(dir: &tempfile::TempDir) -> Error {
+    match Gemma4AssistantDrafter::load(dir.path(), PAIRED_VERIFIER, Device::Cpu) {
+        Ok(_) => Error::Other("a config-only drafter loaded".to_owned()),
+        Err(e) => e,
+    }
+}
+
+/// A drafter that restates a backbone width or a vocabulary other than the
+/// verifier's is refused before a weight is read, as a pairing refusal naming
+/// the key and both values.
+#[test]
+fn a_drafter_built_for_another_base_is_refused_naming_both_values() {
+    for (key, backbone, vocab, foreign, held) in [
+        ("backbone_hidden_size", Some(2560), 262_144, 2560, 1536),
+        ("vocab_size", Some(1536), 256_000, 256_000, 262_144),
+    ] {
+        let err = load_error(&config_only_drafter(backbone, vocab));
+        let Error::SpeculativePairing { reason } = &err else {
+            panic!("{key}={foreign}: expected a pairing refusal, got: {err}");
+        };
+        assert!(
+            reason.contains(key)
+                && reason.contains(&foreign.to_string())
+                && reason.contains(&held.to_string()),
+            "the refusal must name {key}, the drafter's {foreign} and the verifier's {held}: \
+             {reason}"
+        );
+    }
+}
+
+/// A drafter that agrees with the verifier goes on to its weights, and so does
+/// one that does not declare its backbone.
+#[test]
+fn a_drafter_that_agrees_or_declares_no_backbone_goes_on_to_its_weights() {
+    for backbone in [Some(1536), None] {
+        let err = load_error(&config_only_drafter(backbone, 262_144));
+        let msg = err.to_string();
+        assert!(
+            !matches!(err, Error::SpeculativePairing { .. }) && msg.contains("shard index"),
+            "backbone {backbone:?}: expected the load to reach the weights, got: {msg}"
+        );
+    }
+}
+
+/// Serialise a zero-filled bf16 safetensors file. Offsets follow the header's
+/// key order, which the format requires to be contiguous.
+fn safetensors_bytes(tensors: &[(&str, Vec<usize>)]) -> Vec<u8> {
+    let mut header = serde_json::Map::new();
+    let mut sorted: Vec<&(&str, Vec<usize>)> = tensors.iter().collect();
+    sorted.sort_by_key(|(name, _)| *name);
+    let mut offset = 0usize;
+    for (name, shape) in sorted {
+        let bytes = shape.iter().product::<usize>() * 2;
+        header.insert(
+            (*name).to_owned(),
+            serde_json::json!({
+                "dtype": "BF16",
+                "shape": shape,
+                "data_offsets": [offset, offset + bytes],
+            }),
+        );
+        offset += bytes;
+    }
+    let header = serde_json::Value::Object(header).to_string();
+    let mut out = Vec::with_capacity(8 + header.len() + offset);
+    out.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    out.extend_from_slice(header.as_bytes());
+    out.resize(out.len() + offset, 0);
+    out
+}
+
+/// A drafter folder whose config declares no backbone and whose weights hold the
+/// embedding and the two projections at the given shapes, and nothing else.
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: the tempdir is this process's own, so a failure to write into it names a broken environment"
+)]
+fn drafter_with_projections(pre: Vec<usize>, post: Vec<usize>) -> tempfile::TempDir {
+    let dir = config_only_drafter(None, 262_144);
+    let tensors = [
+        ("model.embed_tokens.weight", vec![8, 256]),
+        ("pre_projection.weight", pre),
+        ("post_projection.weight", post),
+    ];
+    std::fs::write(
+        dir.path().join("model.safetensors"),
+        safetensors_bytes(&tensors),
+    )
+    .expect("write model.safetensors");
+    dir
+}
+
+/// A projection sized for another backbone is refused whether or not the config
+/// declares the backbone: the weights carry the width. The case is an E4B-sized
+/// assistant (backbone 2560) over the E2B-sized verifier (1536).
+#[test]
+fn a_projection_sized_for_another_backbone_is_refused_naming_both_sizes() {
+    for (name, pre, post, found, needed) in [
+        (
+            "pre_projection.weight",
+            vec![256, 5120],
+            vec![1536, 256],
+            5120,
+            3072,
+        ),
+        (
+            "post_projection.weight",
+            vec![256, 3072],
+            vec![2560, 256],
+            2560,
+            1536,
+        ),
+    ] {
+        let err = load_error(&drafter_with_projections(pre, post));
+        let Error::SpeculativePairing { reason } = &err else {
+            panic!("{name}: expected a pairing refusal, got: {err}");
+        };
+        assert!(
+            reason.contains(name)
+                && reason.contains(&found.to_string())
+                && reason.contains(&needed.to_string()),
+            "the refusal must name {name}, the found {found} and the needed {needed}: {reason}"
+        );
+    }
+}
+
+/// Projections sized for the verifier go on to the next tensor.
+#[test]
+fn projections_sized_for_the_verifier_go_on_to_the_next_tensor() {
+    let err = load_error(&drafter_with_projections(vec![256, 3072], vec![1536, 256]));
+    let msg = err.to_string();
+    assert!(
+        !matches!(err, Error::SpeculativePairing { .. }) && msg.contains("model.norm.weight"),
+        "expected the load to go on to model.norm.weight, got: {msg}"
+    );
+}

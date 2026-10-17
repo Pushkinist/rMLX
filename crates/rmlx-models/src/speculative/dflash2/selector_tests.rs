@@ -36,6 +36,7 @@ use std::path::Path;
 
 use rmlx_mlx::{Array, Device, Dtype};
 
+use super::super::tests::SCALE_VERIFIER;
 use super::*;
 use crate::layers::{Linear, RmsNorm};
 use crate::speculative::dflash2::{DFlash2Config, DFlash2Selector};
@@ -546,7 +547,8 @@ fn to_u32(a: &Array) -> Vec<u32> {
 
 /// The drafter the scale snapshot describes, loaded from the committed fixture.
 fn scale_drafter() -> DFlash2Drafter {
-    DFlash2Drafter::load(Path::new(FIXTURE), 64, Device::Cpu).expect("the scale snapshot loads")
+    DFlash2Drafter::load(Path::new(FIXTURE), SCALE_VERIFIER, Device::Cpu)
+        .expect("the scale snapshot loads")
 }
 
 /// The selector reproduces the reference implementation's chain on the scale

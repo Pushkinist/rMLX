@@ -474,10 +474,9 @@ impl SpeculativeGenerator {
             rmlx_models::DraftKind::DFlash => {
                 let dispatcher =
                     rmlx_models::SpeculativeDispatcher::load_verifier_only(verifier_dir, device)?;
-                let hidden_size = dispatcher.verifier.hidden_size();
                 let drafter = rmlx_models::speculative::dflash::DFlashDrafter::load(
                     draft_dir,
-                    hidden_size,
+                    rmlx_models::speculative::VerifierTrunk::of(&dispatcher.verifier),
                     device,
                 )?;
                 (dispatcher, Drafter::DFlash(Arc::new(drafter)))
@@ -485,10 +484,9 @@ impl SpeculativeGenerator {
             rmlx_models::DraftKind::DFlash2 => {
                 let dispatcher =
                     rmlx_models::SpeculativeDispatcher::load_verifier_only(verifier_dir, device)?;
-                let hidden_size = dispatcher.verifier.hidden_size();
                 let drafter = rmlx_models::speculative::dflash2::DFlash2Drafter::load(
                     draft_dir,
-                    hidden_size,
+                    rmlx_models::speculative::VerifierTrunk::of(&dispatcher.verifier),
                     device,
                 )?;
                 (dispatcher, Drafter::DFlash2(Arc::new(drafter)))
@@ -496,7 +494,6 @@ impl SpeculativeGenerator {
             rmlx_models::DraftKind::Mtp => {
                 let dispatcher =
                     rmlx_models::SpeculativeDispatcher::load_verifier_only(verifier_dir, device)?;
-                let hidden_size = dispatcher.verifier.hidden_size();
                 // `mtp` fronts two loaders, told apart by the draft's family; a
                 // third family is refused here rather than handed to the Qwen3.5
                 // loader, whose failure would name a missing MoE config instead
@@ -506,7 +503,7 @@ impl SpeculativeGenerator {
                         let drafter =
                             rmlx_models::speculative::gemma4_assistant::Gemma4AssistantDrafter::load(
                                 draft_dir,
-                                hidden_size,
+                                rmlx_models::speculative::VerifierTrunk::of(&dispatcher.verifier),
                                 device,
                             )?;
                         (dispatcher, Drafter::MtpAssistant(Arc::new(drafter)))
@@ -514,7 +511,7 @@ impl SpeculativeGenerator {
                     MtpDraftFamily::Qwen35Mtp => {
                         let drafter = rmlx_models::speculative::mtp::MtpDrafter::load(
                             draft_dir,
-                            hidden_size,
+                            rmlx_models::speculative::VerifierTrunk::of(&dispatcher.verifier),
                             device,
                         )?;
                         (

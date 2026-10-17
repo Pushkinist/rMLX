@@ -42,6 +42,7 @@ use rmlx_mlx::{concatenate, Array, Device};
 use rmlx_models::arch;
 use rmlx_models::speculative::dflash::{dflash_generate, DFlashDrafter};
 use rmlx_models::speculative::dflash2::{dflash2_generate, DFlash2Drafter};
+use rmlx_models::speculative::VerifierTrunk;
 
 /// Tokens the generation runs for before its rows are measured.
 ///
@@ -172,7 +173,8 @@ fn dflash1_carried_projection_against_one_call_at_full_height() {
     let verifier =
         arch::load_model(&model_path, device, &arch::LoadOpts::default()).expect("load verifier");
     let hidden = verifier.hidden_size();
-    let drafter = DFlashDrafter::load(&draft_path, hidden, device).expect("load drafter");
+    let drafter = DFlashDrafter::load(&draft_path, VerifierTrunk::of(&verifier), device)
+        .expect("load drafter");
     let target_layer_ids = drafter.target_layer_ids().to_vec();
 
     let tk =
@@ -285,7 +287,8 @@ fn dflash2_carried_projection_against_one_call_at_full_height() {
     let verifier =
         arch::load_model(&model_path, device, &arch::LoadOpts::default()).expect("load verifier");
     let hidden = verifier.hidden_size();
-    let drafter = DFlash2Drafter::load(&draft_path, hidden, device).expect("load drafter");
+    let drafter = DFlash2Drafter::load(&draft_path, VerifierTrunk::of(&verifier), device)
+        .expect("load drafter");
     let target_layer_ids = drafter.cfg.target_layer_ids.clone();
 
     let tk =

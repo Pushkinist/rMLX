@@ -52,6 +52,7 @@
 use rmlx_mlx::Device;
 use rmlx_models::arch;
 use rmlx_models::speculative::mtp::{mtp_generate, MtpDrafter};
+use rmlx_models::speculative::VerifierTrunk;
 
 mod common;
 
@@ -119,7 +120,7 @@ fn mtp_sidecar_loads_whatever_ffn_it_carries() {
         arch::load_model(&model_path, device, &arch::LoadOpts::default()).expect("load verifier");
     let hidden = verifier.hidden_size();
 
-    let drafter = MtpDrafter::load(&draft_path, hidden, device)
+    let drafter = MtpDrafter::load(&draft_path, VerifierTrunk::of(&verifier), device)
         .expect("MTP sidecar must load regardless of whether its layers.0 FFN is dense or MoE");
 
     assert!(
@@ -160,8 +161,8 @@ fn mtp_greedy_tracks_plain_greedy_for_a_long_prefix() {
     let device = Device::Gpu;
     let verifier =
         arch::load_model(&model_path, device, &arch::LoadOpts::default()).expect("load verifier");
-    let hidden = verifier.hidden_size();
-    let mut drafter = MtpDrafter::load(&draft_path, hidden, device).expect("load sidecar");
+    let mut drafter =
+        MtpDrafter::load(&draft_path, VerifierTrunk::of(&verifier), device).expect("load sidecar");
     let block_size = rmlx_models::speculative::default_block_for(drafter.block_size());
 
     let tk =
@@ -310,7 +311,7 @@ fn the_round_loop_runs_a_block_deeper_than_the_sidecar_declares() {
     let verifier =
         arch::load_model(&model_path, device, &arch::LoadOpts::default()).expect("load verifier");
     let mut drafter =
-        MtpDrafter::load(&draft_path, verifier.hidden_size(), device).expect("load sidecar");
+        MtpDrafter::load(&draft_path, VerifierTrunk::of(&verifier), device).expect("load sidecar");
     let declared = drafter.block_size();
     let requested = declared.map_or(8, |d| d + 5);
 

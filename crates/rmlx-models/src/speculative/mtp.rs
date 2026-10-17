@@ -50,7 +50,7 @@ use std::path::Path;
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{argmax, concatenate, Array, Device};
 
-use super::MAX_BLOCK_SIZE;
+use super::{TrunkKeys, VerifierTrunk, MAX_BLOCK_SIZE};
 use crate::arch::Architecture;
 use crate::layers::{Linear, RmsNorm};
 use crate::qwen3_5_moe::{MtpLayer, MtpLayerDims};
@@ -108,15 +108,21 @@ pub struct MtpDrafter {
 }
 
 impl MtpDrafter {
-    /// Load an MTP-head sidecar from `draft_dir` and validate it against the
-    /// verifier's hidden size.
+    /// Load an MTP-head sidecar from `draft_dir` and validate it against
+    /// `verifier`.
     ///
     /// `draft_dir` is the standalone drafter folder produced by
     /// `qwen3_5_mtp/split.py`: a `config.json` (`model_type: "qwen3_5_mtp"`) and
-    /// a `model.safetensors` with the `mtp.`-stripped tensors. `hidden_size` is
-    /// the verifier's model width — `fc` must be `[hidden, 2*hidden]`.
-    pub fn load(draft_dir: &Path, hidden_size: usize, device: Device) -> Result<Self> {
-        let (weights, block_size) = load_mtp_head(draft_dir, hidden_size)?;
+    /// a `model.safetensors` with the `mtp.`-stripped tensors. `fc` must be
+    /// `[hidden, 2*hidden]` at the verifier's width.
+    ///
+    /// # Errors
+    /// [`Error::SpeculativePairing`] when the sidecar's `text_config` declares a
+    /// `hidden_size`, `num_hidden_layers` or `vocab_size` the verifier does not
+    /// have; [`Error::Model`] for a sidecar that cannot be read or built.
+    pub fn load(draft_dir: &Path, verifier: VerifierTrunk, device: Device) -> Result<Self> {
+        let hidden_size = verifier.hidden_size;
+        let (weights, block_size) = load_mtp_head(draft_dir, verifier)?;
         let caches = (0..weights.layers.len())
             .map(|_| KvCache::with_quant(KvQuant::None))
             .collect();
@@ -299,7 +305,7 @@ impl MtpDrafter {
 ///
 /// Reads `model.safetensors` (qwen3.5 split layout) and constructs the `fc`
 /// linear + three RMSNorms + the reused Qwen3.5-MoE decoder layer(s). Validates
-/// `fc` shape `[hidden, 2*hidden]` against the verifier `hidden_size`. Returns
+/// `fc` shape `[hidden, 2*hidden]` against the verifier's width. Returns
 /// `(weights, block_size)`, the second `None` when the config names no
 /// `block_size`.
 ///
@@ -313,8 +319,13 @@ impl MtpDrafter {
     clippy::indexing_slicing,
     reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
 )]
-fn load_mtp_head(draft_dir: &Path, hidden_size: usize) -> Result<(MtpHeadWeights, Option<usize>)> {
+fn load_mtp_head(
+    draft_dir: &Path,
+    verifier: VerifierTrunk,
+) -> Result<(MtpHeadWeights, Option<usize>)> {
     use rmlx_loader::{load_config, load_shard_index, ShardSet};
+
+    let hidden_size = verifier.hidden_size;
 
     let cfg = load_config(draft_dir).map_err(|e| {
         Error::Model(format!(
@@ -361,6 +372,12 @@ fn load_mtp_head(draft_dir: &Path, hidden_size: usize) -> Result<(MtpHeadWeights
                     .to_owned(),
             )
         })?;
+    verifier.refuse_another_base(
+        draft_dir,
+        "the MTP sidecar's text_config",
+        &[tc],
+        TrunkKeys::named(Some("num_hidden_layers")),
+    )?;
     // Critical dims are required (no default): a wrong head/expert count is a
     // silent corruption, so absence must error.
     let tc_u64_req = |k: &str| {

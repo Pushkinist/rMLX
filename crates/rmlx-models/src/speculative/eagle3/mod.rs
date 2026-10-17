@@ -106,6 +106,7 @@ use rmlx_core::cancel::ensure_not_cancelled;
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{add, argmax, concatenate, rope, Array, Device};
 
+use super::{TrunkKeys, VerifierTrunk};
 use crate::arch::Architecture;
 use crate::layers::{Activation, Linear, Mlp, RmsNorm};
 use rmlx_kv_quant::{KvCache, KvQuant};
@@ -214,9 +215,23 @@ pub struct Eagle3Config {
 
 impl Eagle3Config {
     /// Read the drafter's config from its `config.json`, with the defaults
-    /// of the mlx-vlm drafter for an absent key.
-    pub fn from_model_config(cfg_raw: &rmlx_loader::ModelConfig) -> Self {
+    /// of the mlx-vlm drafter for an absent key. `hidden_size` and `vocab_size`
+    /// have no default: they say which base the drafter was built for, and a
+    /// default would pair a config that omits them with whichever verifier has
+    /// that value.
+    ///
+    /// # Errors
+    /// [`Error::Model`] naming the key when `hidden_size` or `vocab_size` is
+    /// absent or not an integer.
+    pub fn from_model_config(cfg_raw: &rmlx_loader::ModelConfig) -> Result<Self> {
         let extras = &cfg_raw.extras;
+        let required = |key: &str| -> Result<usize> {
+            extras
+                .get(key)
+                .and_then(serde_json::Value::as_u64)
+                .map(|v| v as usize)
+                .ok_or_else(|| Error::Model(format!("Eagle3Config: config.json has no {key}")))
+        };
         let g_usize = |k: &str, default: usize| -> usize {
             extras
                 .get(k)
@@ -267,18 +282,18 @@ impl Eagle3Config {
             .and_then(serde_json::Value::as_u64)
             .map_or(5, |v| v as usize + 2);
 
-        Self {
-            hidden_size: g_usize("hidden_size", 2048),
+        Ok(Self {
+            hidden_size: required("hidden_size")?,
             num_attention_heads: g_usize("num_attention_heads", 16),
             num_key_value_heads: g_usize("num_key_value_heads", 2),
             head_dim: g_usize("head_dim", 256),
             rms_norm_eps: g_f32("rms_norm_eps", 1e-6),
             rope_theta,
             draft_vocab_size: g_usize("draft_vocab_size", 32000),
-            vocab_size: g_usize("vocab_size", 248320),
+            vocab_size: required("vocab_size")?,
             aux_layer_ids,
             block_size,
-        }
+        })
     }
 
     /// Whether the drafter predicts over a reduced vocabulary, mapped to the
@@ -349,9 +364,10 @@ impl Eagle3Drafter {
     ///
     /// `draft_dir` is the standalone EAGLE-3 folder (`config.json` with
     /// `architectures: ["LlamaForCausalLMEagle3"]` + `eagle_config`, and a
-    /// `model.safetensors`). The drafter `hidden_size` and `fc` input (`3*H`)
-    /// must match the verifier's model width, and the drafter's `vocab_size`
-    /// the verifier vocabulary (the `d2t`-mapped target ids index it). A
+    /// `model.safetensors`). The config must declare `hidden_size` and
+    /// `vocab_size`, and they must equal the verifier's (the `d2t`-mapped target
+    /// ids index its vocabulary); a disagreement is
+    /// [`Error::SpeculativePairing`]. The `fc` input is `3*H`. A
     /// drafter with a restricted vocabulary is refused over a verifier whose
     /// head cannot serve it
     /// ([`crate::arch::Architecture::refuse_restricted_vocab_head`]).
@@ -365,20 +381,14 @@ impl Eagle3Drafter {
         eos_token_ids: &[u32],
         device: Device,
     ) -> Result<Self> {
-        let hidden_size = verifier.hidden_size();
-        let me = load_eagle3(
-            draft_dir,
-            hidden_size,
-            verifier.vocab_size(),
-            eos_token_ids,
-            device,
-        )?;
+        let trunk = VerifierTrunk::of(verifier);
+        let me = load_eagle3(draft_dir, trunk, eos_token_ids, device)?;
         if me.hot_path_active() {
             verifier.refuse_restricted_vocab_head()?;
         }
         tracing::info!(
             draft = %draft_dir.display(),
-            hidden_size,
+            hidden_size = trunk.hidden_size,
             draft_vocab_size = me.cfg.draft_vocab_size,
             vocab_size = me.cfg.vocab_size,
             aux_layer_ids = ?me.cfg.aux_layer_ids,
@@ -849,8 +859,7 @@ impl Eagle3Drafter {
 )]
 fn load_eagle3(
     draft_dir: &Path,
-    hidden_size: usize,
-    vocab_size: usize,
+    verifier: VerifierTrunk,
     eos_token_ids: &[u32],
     device: Device,
 ) -> Result<Eagle3Drafter> {
@@ -867,22 +876,14 @@ fn load_eagle3(
         );
     }
 
-    let cfg = Eagle3Config::from_model_config(&cfg_raw);
+    let cfg = Eagle3Config::from_model_config(&cfg_raw)?;
 
-    if cfg.hidden_size != hidden_size {
-        return Err(Error::Model(format!(
-            "Eagle3Drafter: drafter hidden_size {} != verifier hidden_size {} \
-             (wrong draft model?)",
-            cfg.hidden_size, hidden_size
-        )));
-    }
-    if cfg.vocab_size != vocab_size {
-        return Err(Error::Model(format!(
-            "Eagle3Drafter: drafter vocab_size {} != verifier vocab_size {} \
-             (d2t-mapped target ids would be invalid)",
-            cfg.vocab_size, vocab_size
-        )));
-    }
+    verifier.refuse_another_base(
+        draft_dir,
+        "the EAGLE-3 drafter's config.json",
+        &[&cfg_raw.extras],
+        TrunkKeys::named(None),
+    )?;
     if cfg.aux_layer_ids.is_empty() {
         return Err(Error::Model(
             "Eagle3Drafter: config missing eagle_config.eagle_aux_hidden_state_layer_ids".into(),

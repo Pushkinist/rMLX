@@ -68,6 +68,7 @@ use rmlx_mlx::{
 
 use crate::arch::Architecture;
 use crate::layers::{Activation, Linear, Mlp, RmsNorm};
+use crate::speculative::{TrunkKeys, VerifierTrunk};
 use rmlx_kv_quant::{KvCache, LinearAttnCache};
 
 pub(super) mod round;
@@ -223,19 +224,18 @@ pub struct DFlashConfig {
 }
 
 impl DFlashDrafter {
-    /// Load a DFlash drafter from `draft_dir` and validate it against the
-    /// verifier's hidden size.
+    /// Load a DFlash drafter from `draft_dir` and validate it against
+    /// `verifier`.
     ///
     /// `draft_dir` is the standalone drafter folder (`config.json` with
     /// `architectures: ["DFlashDraftModel"]` + a `dflash_config` block, and a
-    /// `model.safetensors`). `hidden_size` is the verifier's model width — the
-    /// drafter `hidden_size` and `fc` input (`len(target_layer_ids)*H`) must
-    /// match it.
-    pub fn load(draft_dir: &Path, hidden_size: usize, device: Device) -> Result<Self> {
-        let me = load_dflash(draft_dir, hidden_size, device)?;
+    /// `model.safetensors`). The drafter `hidden_size` and `fc` input
+    /// (`len(target_layer_ids)*H`) must match the verifier's width.
+    pub fn load(draft_dir: &Path, verifier: VerifierTrunk, device: Device) -> Result<Self> {
+        let me = load_dflash(draft_dir, verifier, device)?;
         tracing::info!(
             draft = %draft_dir.display(),
-            hidden_size,
+            hidden_size = verifier.hidden_size,
             num_layers = me.cfg.num_hidden_layers,
             block_size = me.cfg.block_size,
             target_layer_ids = ?me.cfg.target_layer_ids,
@@ -588,7 +588,7 @@ impl DFlashDrafter {
     clippy::indexing_slicing,
     reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
 )]
-fn load_dflash(draft_dir: &Path, hidden_size: usize, device: Device) -> Result<DFlashDrafter> {
+fn load_dflash(draft_dir: &Path, verifier: VerifierTrunk, device: Device) -> Result<DFlashDrafter> {
     use rmlx_loader::{load_config, load_shard_index, ShardSet};
 
     let cfg_raw = load_config(draft_dir)
@@ -636,8 +636,13 @@ fn load_dflash(draft_dir: &Path, hidden_size: usize, device: Device) -> Result<D
         .and_then(serde_json::Value::as_f64)
         .map(|v| v as f32);
 
+    let hidden_size = extras
+        .get("hidden_size")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| Error::Model("DFlashDrafter: config.json has no hidden_size".into()))?
+        as usize;
     let cfg = DFlashConfig {
-        hidden_size: g_usize("hidden_size", 2048),
+        hidden_size,
         num_hidden_layers: g_usize("num_hidden_layers", 8),
         num_attention_heads: g_usize("num_attention_heads", 32),
         num_key_value_heads: g_usize("num_key_value_heads", 4),
@@ -650,14 +655,12 @@ fn load_dflash(draft_dir: &Path, hidden_size: usize, device: Device) -> Result<D
         final_logit_softcapping,
     };
 
-    // Validate against the verifier hidden size.
-    if cfg.hidden_size != hidden_size {
-        return Err(Error::Model(format!(
-            "DFlashDrafter: drafter hidden_size {} != verifier hidden_size {} \
-             (wrong draft model?)",
-            cfg.hidden_size, hidden_size
-        )));
-    }
+    verifier.refuse_another_base(
+        draft_dir,
+        "the DFlash drafter's config.json",
+        &[extras],
+        TrunkKeys::named(Some("num_target_layers")),
+    )?;
     if cfg.target_layer_ids.is_empty() {
         return Err(Error::Model(
             "DFlashDrafter: config missing dflash_config.target_layer_ids".into(),

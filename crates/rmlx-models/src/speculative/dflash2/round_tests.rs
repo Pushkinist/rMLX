@@ -13,6 +13,7 @@
 
 use rmlx_mlx::{concatenate, Array, Device};
 
+use crate::speculative::dflash2::tests::SCALE_VERIFIER;
 use crate::speculative::dflash2::DFlash2Drafter;
 use crate::speculative::{committed_rows, PROJECTION_TOL};
 
@@ -25,7 +26,7 @@ const SCALE_HIDDEN: usize = 64;
 )]
 fn fixture_drafter() -> DFlash2Drafter {
     let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/dflash2_scale");
-    DFlash2Drafter::load(std::path::Path::new(fixture), SCALE_HIDDEN, Device::Cpu)
+    DFlash2Drafter::load(std::path::Path::new(fixture), SCALE_VERIFIER, Device::Cpu)
         .expect("the fixture snapshot loads")
 }
 

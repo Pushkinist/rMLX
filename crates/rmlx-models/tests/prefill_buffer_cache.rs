@@ -55,6 +55,7 @@ use rmlx_models::speculative::eagle3::{
     eagle3_generate, Eagle3Drafter, DRAFTER_PREFILL_CHUNK, VERIFIER_PREFILL_CHUNK,
 };
 use rmlx_models::speculative::mtp::{mtp_generate, MtpDrafter};
+use rmlx_models::speculative::VerifierTrunk;
 use rmlx_models::{arch, Pcg32, PenaltyConfig, SamplerConfig};
 
 const GEMMA4_E2B: common::GoldenModel = common::GoldenModel {
@@ -429,8 +430,8 @@ fn qwen38_mtp_prefill_reaches_every_chunk_boundary() {
         return;
     };
     let verifier = load(&model_path);
-    let mut drafter =
-        MtpDrafter::load(&draft_path, verifier.hidden_size(), Device::Gpu).expect("load sidecar");
+    let mut drafter = MtpDrafter::load(&draft_path, VerifierTrunk::of(&verifier), Device::Gpu)
+        .expect("load sidecar");
     let tokenizer = tokenizer_of(&model_path);
     let eos = eos_ids(&model_path);
 

@@ -51,6 +51,7 @@ use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device};
 
 use crate::layers::{Activation, Linear, Mlp, RmsNorm};
+use crate::speculative::{TrunkKeys, VerifierTrunk};
 
 mod forward;
 pub(super) mod round;
@@ -214,8 +215,8 @@ pub struct DFlash2Drafter {
 }
 
 impl DFlash2Drafter {
-    /// Load a DFlash 2 drafter from `draft_dir` and validate it against the
-    /// verifier's hidden size.
+    /// Load a DFlash 2 drafter from `draft_dir` and validate it against
+    /// `verifier`.
     ///
     /// # Errors
     ///
@@ -223,11 +224,11 @@ impl DFlash2Drafter {
     /// when any config key the drafter needs is absent, when a tensor is
     /// missing or carries a shape the config does not predict, or when the
     /// snapshot ships a tensor this loader does not read.
-    pub fn load(draft_dir: &Path, hidden_size: usize, device: Device) -> Result<Self> {
-        let me = load_dflash2(draft_dir, hidden_size, device)?;
+    pub fn load(draft_dir: &Path, verifier: VerifierTrunk, device: Device) -> Result<Self> {
+        let me = load_dflash2(draft_dir, verifier, device)?;
         tracing::info!(
             draft = %draft_dir.display(),
-            hidden_size,
+            hidden_size = verifier.hidden_size,
             num_layers = me.cfg.num_hidden_layers,
             block_size = me.cfg.block_size,
             conv_group_size = me.cfg.conv_group_size,
@@ -263,15 +264,18 @@ fn missing(path: &str, key: &str) -> Error {
 
 /// Parse the DFlash 2 drafter config, refusing rather than defaulting.
 ///
-/// `verifier_hidden` is the width the drafter must match; the conditioning
+/// `verifier` is the trunk the drafter must match; the conditioning
 /// projection reads the verifier's hidden states directly.
 ///
 /// # Errors
 ///
-/// [`Error::Model`] naming the first key that is absent or inconsistent.
+/// [`Error::SpeculativePairing`] when the config restates another base;
+/// otherwise [`Error::Model`] naming the first key that is absent or
+/// inconsistent.
 fn parse_config(
+    draft_dir: &Path,
     cfg_raw: &rmlx_loader::ModelConfig,
-    verifier_hidden: usize,
+    verifier: VerifierTrunk,
 ) -> Result<DFlash2Config> {
     let arch = cfg_raw.dispatch_arch().unwrap_or("");
     if !arch.contains("DFlash2") {
@@ -385,7 +389,7 @@ fn parse_config(
         target_layer_ids,
     };
 
-    check_config(&cfg, cfg_raw, verifier_hidden)?;
+    check_config(draft_dir, &cfg, cfg_raw, verifier)?;
     check_scalars_at_reference_defaults(cfg_raw)?;
     Ok(cfg)
 }
@@ -458,17 +462,17 @@ fn check_scalars_at_reference_defaults(cfg_raw: &rmlx_loader::ModelConfig) -> Re
 /// three-tap kernel convolved with two taps, a group size that does not divide
 /// the channels, a full-attention layer masked as a sliding one.
 fn check_config(
+    draft_dir: &Path,
     cfg: &DFlash2Config,
     cfg_raw: &rmlx_loader::ModelConfig,
-    verifier_hidden: usize,
+    verifier: VerifierTrunk,
 ) -> Result<()> {
-    if cfg.hidden_size != verifier_hidden {
-        return Err(Error::Model(format!(
-            "DFlash2Drafter: drafter hidden_size {} != verifier hidden_size {verifier_hidden} \
-             (wrong draft model?)",
-            cfg.hidden_size
-        )));
-    }
+    verifier.refuse_another_base(
+        draft_dir,
+        "the DFlash 2 drafter's config.json",
+        &[&cfg_raw.extras],
+        TrunkKeys::named(Some("num_target_layers")),
+    )?;
     if cfg.is_causal {
         return Err(Error::Model(
             "DFlash2Drafter: config.json sets is_causal to true; this drafter denoises \
@@ -599,12 +603,16 @@ fn check_config(
 // ---------------------------------------------------------------------------
 
 /// Load the DFlash 2 drafter config + tensors from `draft_dir`.
-fn load_dflash2(draft_dir: &Path, hidden_size: usize, device: Device) -> Result<DFlash2Drafter> {
+fn load_dflash2(
+    draft_dir: &Path,
+    verifier: VerifierTrunk,
+    device: Device,
+) -> Result<DFlash2Drafter> {
     use rmlx_loader::{load_config, load_shard_index, ShardSet};
 
     let cfg_raw = load_config(draft_dir)
         .map_err(|e| Error::Model(format!("DFlash2Drafter: load_config: {e}")))?;
-    let cfg = parse_config(&cfg_raw, hidden_size)?;
+    let cfg = parse_config(draft_dir, &cfg_raw, verifier)?;
 
     let idx = load_shard_index(draft_dir)
         .map_err(|e| Error::Model(format!("DFlash2Drafter: shard index: {e}")))?;

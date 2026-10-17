@@ -118,6 +118,7 @@ use rmlx_mlx::{Array, Device};
 use rmlx_models::arch;
 use rmlx_models::sampler::{sampling_distribution, Pcg32, PenaltyConfig, SamplerConfig};
 use rmlx_models::speculative::gemma4_assistant::{mtp_assistant_generate, Gemma4AssistantDrafter};
+use rmlx_models::speculative::VerifierTrunk;
 
 /// The published sampling parameters for this class of model, which is the
 /// configuration the gate exists to make runnable through the fast path.
@@ -652,9 +653,8 @@ fn a_sampled_sidecar_arm_draws_from_the_verifiers_distribution() {
 
     let verifier = arch::load_model(&model_path, device, &arch::LoadOpts::default())
         .expect("load the verifier");
-    let hidden = verifier.hidden_size();
-    let drafter =
-        Gemma4AssistantDrafter::load(&draft_path, hidden, device).expect("load the drafter");
+    let drafter = Gemma4AssistantDrafter::load(&draft_path, VerifierTrunk::of(&verifier), device)
+        .expect("load the drafter");
     let tokenizer =
         tokenizers::Tokenizer::from_file(model_path.join("tokenizer.json")).expect("tokenizer");
     let eos = eos_ids(&model_path);

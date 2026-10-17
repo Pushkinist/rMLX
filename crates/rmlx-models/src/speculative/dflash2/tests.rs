@@ -64,8 +64,12 @@ const DFLASH2_CONFIG_JSON: &str = r#"{
   "vocab_size": 248320
 }"#;
 
-/// The verifier this drafter is published against.
-const VERIFIER_HIDDEN: usize = 5120;
+/// The verifier this drafter is published against: Qwen3.8-27B.
+const VERIFIER: VerifierTrunk = VerifierTrunk {
+    hidden_size: 5120,
+    num_hidden_layers: 64,
+    vocab_size: 248_320,
+};
 
 #[allow(
     clippy::expect_used,
@@ -100,7 +104,11 @@ fn parsed_with(path: &str, key: &str, value: Option<serde_json::Value>) -> Resul
             obj.remove(key);
         }
     }
-    parse_config(&model_config(&root.to_string()), VERIFIER_HIDDEN)
+    parse_config(
+        Path::new("draft"),
+        &model_config(&root.to_string()),
+        VERIFIER,
+    )
 }
 
 /// The published config parses to the values the checkpoint carries — every one
@@ -117,8 +125,12 @@ fn parsed_with(path: &str, key: &str, value: Option<serde_json::Value>) -> Resul
     reason = "test assertions: the fixture is the published config and an Err or a moved value is the assertion failing"
 )]
 fn the_published_config_parses_to_the_checkpoints_own_values() {
-    let cfg = parse_config(&model_config(DFLASH2_CONFIG_JSON), VERIFIER_HIDDEN)
-        .expect("the published config must parse");
+    let cfg = parse_config(
+        Path::new("draft"),
+        &model_config(DFLASH2_CONFIG_JSON),
+        VERIFIER,
+    )
+    .expect("the published config must parse");
     assert_eq!(cfg.block_size, 8, "block_size is 8, not DFlash 1's 16");
     assert_eq!(cfg.rope_theta, 1.0e7);
     assert_eq!(cfg.conv_group_size, 16);
@@ -201,7 +213,11 @@ fn the_rope_base_is_read_from_rope_parameters_only() {
         panic!("root is an object")
     };
     obj.insert("rope_theta".to_owned(), serde_json::json!(1.0e7));
-    let err = match parse_config(&model_config(&root.to_string()), VERIFIER_HIDDEN) {
+    let err = match parse_config(
+        Path::new("draft"),
+        &model_config(&root.to_string()),
+        VERIFIER,
+    ) {
         Ok(cfg) => panic!("a top-level rope_theta must not stand in, parsed to {cfg:?}"),
         Err(e) => e.to_string(),
     };
@@ -234,7 +250,7 @@ fn a_scaled_rope_is_refused() {
 fn another_architecture_is_refused_by_name() {
     for arch in ["DFlashDraftModel", "Qwen3ForCausalLM", ""] {
         let json = DFLASH2_CONFIG_JSON.replace("DFlash2DraftModel", arch);
-        let err = match parse_config(&model_config(&json), VERIFIER_HIDDEN) {
+        let err = match parse_config(Path::new("draft"), &model_config(&json), VERIFIER) {
             Ok(cfg) => panic!("{arch:?} must refuse, parsed to {cfg:?}"),
             Err(e) => e.to_string(),
         };
@@ -457,14 +473,91 @@ fn a_causal_checkpoint_is_refused_and_a_bidirectional_one_is_not() {
 /// the verifier's hidden states directly.
 #[test]
 fn a_width_the_verifier_does_not_share_is_refused() {
-    let err = match parse_config(&model_config(DFLASH2_CONFIG_JSON), 2048) {
-        Ok(cfg) => panic!("a 2048-wide verifier must refuse, parsed to {cfg:?}"),
-        Err(e) => e.to_string(),
+    let err = parse_config(
+        Path::new("draft"),
+        &model_config(DFLASH2_CONFIG_JSON),
+        VerifierTrunk {
+            hidden_size: 2048,
+            ..VERIFIER
+        },
+    )
+    .err();
+    let Some(Error::SpeculativePairing { reason }) = err else {
+        panic!("a 2048-wide verifier must be refused as a pairing, got {err:?}");
     };
     assert!(
-        err.contains("5120") && err.contains("2048"),
-        "the refusal must name both widths: {err}"
+        reason.contains("5120") && reason.contains("2048"),
+        "the refusal must name both widths: {reason}"
     );
+}
+
+/// A drafter that restates the base it was trained on is refused on another,
+/// naming the key and both values. The published config declares the layer
+/// count and the vocabulary of its base, so each is moved on the verifier side.
+#[test]
+fn a_drafter_built_for_another_base_is_refused_naming_both_values() {
+    for (key, verifier, declared, held) in [
+        (
+            "num_target_layers",
+            VerifierTrunk {
+                num_hidden_layers: 40,
+                ..VERIFIER
+            },
+            64,
+            40,
+        ),
+        (
+            "vocab_size",
+            VerifierTrunk {
+                vocab_size: 262_144,
+                ..VERIFIER
+            },
+            248_320,
+            262_144,
+        ),
+    ] {
+        let err = parse_config(
+            Path::new("draft"),
+            &model_config(DFLASH2_CONFIG_JSON),
+            verifier,
+        )
+        .err();
+        let Some(Error::SpeculativePairing { reason }) = err else {
+            panic!("{key}: expected a pairing refusal, got {err:?}");
+        };
+        assert!(
+            reason.contains(key)
+                && reason.contains(&declared.to_string())
+                && reason.contains(&held.to_string()),
+            "the refusal must name {key}, the drafter's {declared} and the verifier's {held}: \
+             {reason}"
+        );
+    }
+}
+
+/// A config that does not restate its base's layer count is not refused for
+/// it: the drafter's own `num_hidden_layers` is its depth, not its base's.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test assertion: the verifier agrees on every declared fact, so an Err is the assertion failing"
+)]
+fn a_config_without_the_base_layer_count_is_not_refused_for_it() {
+    let verifier = VerifierTrunk {
+        num_hidden_layers: 40,
+        ..VERIFIER
+    };
+    let mut root: serde_json::Value =
+        serde_json::from_str(DFLASH2_CONFIG_JSON).expect("fixture parses");
+    root.as_object_mut()
+        .expect("root is an object")
+        .remove("num_target_layers");
+    parse_config(
+        Path::new("draft"),
+        &model_config(&root.to_string()),
+        verifier,
+    )
+    .expect("a drafter's own depth of 5 is not compared with a verifier's 40");
 }
 
 /// The three scalars the reference applies to the drafter's logit path are
@@ -569,6 +662,13 @@ const SCALE_CONFIG_JSON: &str = r#"{
 
 const SCALE_HIDDEN: usize = 64;
 
+/// The verifier the scale-model snapshot is paired with in every loader test.
+pub(crate) const SCALE_VERIFIER: VerifierTrunk = VerifierTrunk {
+    hidden_size: SCALE_HIDDEN,
+    num_hidden_layers: 2,
+    vocab_size: 40,
+};
+
 /// Every tensor the scale-model snapshot ships, at the shape the config above
 /// predicts.
 fn scale_tensors() -> Vec<(String, Vec<usize>)> {
@@ -666,7 +766,7 @@ fn write_snapshot(tensors: &[(String, Vec<usize>)]) -> tempfile::TempDir {
 )]
 fn a_whole_snapshot_loads_and_reports_what_it_read() {
     let dir = write_snapshot(&scale_tensors());
-    let drafter = DFlash2Drafter::load(dir.path(), SCALE_HIDDEN, Device::Cpu)
+    let drafter = DFlash2Drafter::load(dir.path(), SCALE_VERIFIER, Device::Cpu)
         .expect("a snapshot carrying every tensor must load");
     assert_eq!(drafter.cfg.block_size, 4);
     assert_eq!(drafter.cfg.selector_rank, 8);
@@ -696,7 +796,7 @@ fn a_snapshot_with_a_tensor_this_loader_cannot_build_is_refused() {
     ));
     let dir = write_snapshot(&tensors);
 
-    let err = match DFlash2Drafter::load(dir.path(), SCALE_HIDDEN, Device::Cpu) {
+    let err = match DFlash2Drafter::load(dir.path(), SCALE_VERIFIER, Device::Cpu) {
         Ok(_) => panic!("a snapshot carrying an unread tensor must be refused"),
         Err(e) => e.to_string(),
     };
@@ -719,7 +819,7 @@ fn a_missing_tensor_is_refused_by_name() {
         .collect();
     let dir = write_snapshot(&tensors);
 
-    let err = match DFlash2Drafter::load(dir.path(), SCALE_HIDDEN, Device::Cpu) {
+    let err = match DFlash2Drafter::load(dir.path(), SCALE_VERIFIER, Device::Cpu) {
         Ok(_) => panic!("a snapshot missing a tensor must be refused"),
         Err(e) => e.to_string(),
     };
@@ -745,7 +845,7 @@ fn a_tensor_at_the_wrong_shape_is_refused_naming_both() {
         .collect();
     let dir = write_snapshot(&tensors);
 
-    let err = match DFlash2Drafter::load(dir.path(), SCALE_HIDDEN, Device::Cpu) {
+    let err = match DFlash2Drafter::load(dir.path(), SCALE_VERIFIER, Device::Cpu) {
         Ok(_) => panic!("a tensor at the wrong shape must be refused"),
         Err(e) => e.to_string(),
     };
