@@ -301,6 +301,22 @@ async fn test_total_tokens_estimate_over_limit_returns_413() {
     assert_eq!(json["error"]["field"], "total_input_tokens_estimate");
 }
 
+// `reasoning_content` is rendered into the prompt, so it counts toward the same
+// estimate as `content`.
+#[tokio::test]
+async fn test_reasoning_content_counts_toward_total_tokens_estimate() {
+    let port = start().await;
+    let big_text = "x".repeat(MAX_TOTAL_INPUT_TOKENS_ESTIMATE * 3 + 16);
+    let body = format!(
+        r#"{{"model":"test","messages":[{{"role":"assistant","content":"a","reasoning_content":"{big_text}"}}],"max_tokens":1}}"#
+    );
+    let (status, body_text) = post(port, "/v1/chat/completions", &body).await;
+    assert_eq!(status, 413, "expected 413, got {status}");
+    let json: serde_json::Value = serde_json::from_str(&body_text).unwrap();
+    assert_eq!(json["error"]["code"], "input_too_large");
+    assert_eq!(json["error"]["field"], "total_input_tokens_estimate");
+}
+
 // ── Test 8: MAX_MESSAGES via Anthropic /v1/messages → 413 ────────────────────
 
 #[tokio::test]

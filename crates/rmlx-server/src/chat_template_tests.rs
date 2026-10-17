@@ -50,6 +50,26 @@ fn minimal_template_renders_correctly() {
     assert!(rendered.add_generation_prompt);
 }
 
+/// `reasoning_content` is a context key only when the message carries it: absent
+/// is undefined to the template, an empty string is defined.
+#[test]
+fn reasoning_content_is_a_context_key_only_when_present() {
+    let src = "{% for m in messages %}{% if m.reasoning_content is defined %}D[{{ m.reasoning_content }}]{% else %}U{% endif %}{% endfor %}".to_owned();
+    let tpl = ChatTemplate::new(src).expect("compile");
+    let render = |reasoning_content| {
+        let messages = [ChatMessageTpl {
+            role: "assistant",
+            content: "a",
+            reasoning_content,
+            ..Default::default()
+        }];
+        tpl.render(&messages, &NO_OPTS).expect("render").text
+    };
+    assert_eq!(render(None), "U");
+    assert_eq!(render(Some("")), "D[]");
+    assert_eq!(render(Some("x")), "D[x]");
+}
+
 // ── raise_exception and reasoning_effort ──────────────────────────────────
 
 const NO_OPTS: RenderOpts<'static> = RenderOpts {

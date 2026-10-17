@@ -340,6 +340,9 @@ pub(crate) async fn chat_completions(
                     return e.into_response();
                 }
             }
+            if let Some(reasoning) = &msg.reasoning_content {
+                total_text_bytes = total_text_bytes.saturating_add(reasoning.len());
+            }
             match &msg.content {
                 Some(MessageContent::Parts(parts)) => {
                     if let Err(e) = bounds::check_content_parts(parts.len(), idx) {

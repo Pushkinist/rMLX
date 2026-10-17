@@ -135,7 +135,7 @@ on the request's tracing span. The response `id` is built from it:
 | Field | Type | Notes |
 |---|---|---|
 | `model` | string (required) | Registry model id. |
-| `messages` | array (required) | `role` and `content`; also `tool_calls`, `tool_call_id`, `name`. |
+| `messages` | array (required) | `role` and `content`; also `tool_calls`, `tool_call_id`, `name`, `reasoning_content`. `reasoning_content` is passed on any role and reaches the chat template as sent (absent when not sent, `null` reads as absent); it counts toward the total input-size bound. A template that reads it on assistant turns (Qwen3.8, Ternary-Bonsai-2) renders an earlier turn's reasoning in its think block, not an empty one. `POST /v1/messages` does not carry it. |
 | `stream` | bool | Default false. |
 | `temperature`, `top_p`, `top_k`, `min_p` | number | Resolution order in [`SAMPLING.md`](SAMPLING.md) § "Defaults and resolution order". |
 | `repetition_penalty`, `frequency_penalty`, `presence_penalty` | f32 | Same. |

@@ -2618,6 +2618,7 @@ fn owned_tpl_message_parses_arguments_string_to_object() {
         }]),
         tool_call_id: None,
         name: None,
+        reasoning_content: None,
     };
     let owned = OwnedTplMessage::from_request(&m);
     let tc = owned.tool_calls_json.expect("tool_calls json built");
@@ -2628,6 +2629,101 @@ fn owned_tpl_message_parses_arguments_string_to_object() {
     );
     assert_eq!(args["path"], "a.py");
     assert_eq!(tc[0]["function"]["name"], "write");
+}
+
+// An assistant message's `reasoning_content` survives deserialisation and
+// reaches the template message; absent stays absent.
+#[test]
+fn reasoning_content_reaches_the_template_message() {
+    let req = parse(
+        r#"{"model":"m","messages":[
+            {"role":"user","content":"q"},
+            {"role":"assistant","content":"a","reasoning_content":"thought"},
+            {"role":"assistant","content":"b"}]}"#,
+    )
+    .expect("request must deserialize");
+    let owned: Vec<OwnedTplMessage> = req
+        .messages
+        .iter()
+        .map(OwnedTplMessage::from_request)
+        .collect();
+    assert_eq!(owned[1].as_tpl().reasoning_content, Some("thought"));
+    assert_eq!(owned[0].as_tpl().reasoning_content, None);
+    assert_eq!(owned[2].as_tpl().reasoning_content, None);
+}
+
+#[test]
+fn null_reasoning_content_reads_as_absent() {
+    let req = parse(
+        r#"{"model":"m","messages":[{"role":"assistant","content":"a","reasoning_content":null}]}"#,
+    )
+    .expect("request must deserialize");
+    assert!(req.messages[0].reasoning_content.is_none());
+}
+
+// A multi-turn request whose earlier assistant turn carries `reasoning_content`
+// renders that reasoning in the turn's think block under the Qwen3.8 template;
+// the same request without the field renders an empty think block.
+#[test]
+fn reasoning_content_renders_in_the_qwen38_think_block() {
+    const SNAPSHOT: &str = "mlx-community__Qwen3.8-27B-4bit";
+    const TEST: &str = "reasoning_content_renders_in_the_qwen38_think_block";
+    let Some(root) = std::env::var_os("RMLX_O_MODELS_ROOT").filter(|r| !r.is_empty()) else {
+        println!("SKIP {TEST}: RMLX_O_MODELS_ROOT is not set");
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    assert!(
+        root.is_dir(),
+        "{TEST}: RMLX_O_MODELS_ROOT is set but is not a directory"
+    );
+    let dir = root.join(SNAPSHOT);
+    if !dir.is_dir() {
+        println!("SKIP {TEST}: RMLX_O_MODELS_ROOT does not hold {SNAPSHOT}");
+        return;
+    }
+    let source = crate::chat_template::load_template_source(&dir)
+        .unwrap_or_else(|e| panic!("{TEST}: {SNAPSHOT} is present but its template fails: {e}"));
+    let tpl = crate::chat_template::ChatTemplate::new(source).expect("template compiles");
+
+    let render = |assistant: &str| -> String {
+        let body = format!(
+            r#"{{"model":"m","messages":[
+                {{"role":"user","content":"first question"}},
+                {assistant},
+                {{"role":"user","content":"second question"}}]}}"#
+        );
+        let req = parse(&body).expect("request must deserialize");
+        let owned: Vec<OwnedTplMessage> = req
+            .messages
+            .iter()
+            .map(OwnedTplMessage::from_request)
+            .collect();
+        let msgs: Vec<crate::chat_template::ChatMessageTpl<'_>> =
+            owned.iter().map(OwnedTplMessage::as_tpl).collect();
+        let opts = crate::chat_template::RenderOpts {
+            bos_token: "",
+            eos_token: "",
+            add_generation_prompt: true,
+            tools: &[],
+            variables: None,
+        };
+        tpl.render(&msgs, &opts).expect("render").text
+    };
+
+    let with =
+        render(r#"{"role":"assistant","content":"the answer","reasoning_content":"plan the sum"}"#);
+    assert!(
+        with.contains("<think>\nplan the sum\n</think>\n\nthe answer"),
+        "reasoning must render in the earlier turn: {with}"
+    );
+
+    let without = render(r#"{"role":"assistant","content":"the answer"}"#);
+    assert!(
+        without.contains("<think>\n\n</think>\n\nthe answer"),
+        "a turn without reasoning keeps the empty think block: {without}"
+    );
+    assert!(!without.contains("plan the sum"));
 }
 
 // ── content-part extraction ──────────────────────────────────────

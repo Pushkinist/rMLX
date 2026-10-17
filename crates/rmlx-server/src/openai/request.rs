@@ -155,6 +155,10 @@ pub struct ChatMessage {
     /// Optional function name (tool-role turns / named messages).
     #[serde(default)]
     pub name: Option<String>,
+    /// Reasoning text of an `assistant` turn, echoed back by the client from a
+    /// previous response. Reaches the chat template as sent.
+    #[serde(default)]
+    pub reasoning_content: Option<String>,
 }
 
 impl ChatMessage {
@@ -187,6 +191,7 @@ pub(crate) struct OwnedTplMessage {
     pub(crate) tool_calls_json: Option<Value>,
     pub(crate) tool_call_id: Option<String>,
     pub(crate) name: Option<String>,
+    pub(crate) reasoning_content: Option<String>,
 }
 
 impl OwnedTplMessage {
@@ -215,6 +220,7 @@ impl OwnedTplMessage {
             tool_calls_json,
             tool_call_id: m.tool_call_id.clone(),
             name: m.name.clone(),
+            reasoning_content: m.reasoning_content.clone(),
         }
     }
 
@@ -225,6 +231,7 @@ impl OwnedTplMessage {
             tool_calls: self.tool_calls_json.as_ref(),
             tool_call_id: self.tool_call_id.as_deref(),
             name: self.name.as_deref(),
+            reasoning_content: self.reasoning_content.as_deref(),
         }
     }
 }

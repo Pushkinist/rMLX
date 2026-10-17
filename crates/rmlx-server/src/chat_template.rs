@@ -97,7 +97,7 @@ pub struct RenderedPrompt {
 /// invariant: `{% if message.tool_calls %}` stays falsy).
 #[allow(
     clippy::exhaustive_structs,
-    reason = "internal closed template-context struct — five fields are the complete per-message Jinja context contract; adding a field requires updating all ChatMessageTpl construction sites"
+    reason = "internal closed template-context struct — six fields are the complete per-message Jinja context contract; adding a field requires updating all ChatMessageTpl construction sites"
 )]
 #[derive(Debug, Clone, Default)]
 pub struct ChatMessageTpl<'a> {
@@ -113,6 +113,9 @@ pub struct ChatMessageTpl<'a> {
     pub tool_call_id: Option<&'a str>,
     /// Optional message/function name (`None` ⇒ key omitted).
     pub name: Option<&'a str>,
+    /// `assistant`-turn reasoning text as the client sent it (`None` ⇒ key
+    /// omitted, so a template testing `is string` sees it undefined).
+    pub reasoning_content: Option<&'a str>,
 }
 
 /// Options forwarded to the Jinja template context.
@@ -591,6 +594,9 @@ impl ChatTemplate {
                 }
                 if let Some(name) = m.name {
                     map.insert("name", Value::from(name));
+                }
+                if let Some(reasoning) = m.reasoning_content {
+                    map.insert("reasoning_content", Value::from(reasoning));
                 }
                 Value::from(Serde(map))
             })
