@@ -293,7 +293,8 @@ variable therefore does not stand such a cell down. The golden-token suites
 rank `RMLX_KV_TEST_MODEL` first when it serves their architecture; see
 `TESTING.md` § "Golden-token suites: how their snapshot resolves". In the
 integration harness, a root that is set but missing fails, an absent slug
-skips, and a fallback that is used prints `NOTE <test>: …`.
+skips, and both a fallback that is used and a variable that the slug outranked
+print `NOTE <test>: …`.
 
 Cells that read only a variable still stand down without it. Examples:
 `RMLX_KV_TEST_MODEL` in `gemma4_kv_cache_equivalence.rs` and

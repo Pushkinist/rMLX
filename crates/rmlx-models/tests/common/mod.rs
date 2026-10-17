@@ -466,7 +466,9 @@ pub fn choose(over: Option<Snapshot>, slug: Snapshot, model: &GoldenModel, regen
 ///
 /// Reaching the fallback means the root does not hold the slug, which disarms
 /// every other cell resolving from that root in the same run. [`apply`] prints
-/// the note so that cost is on the operator's screen.
+/// the note so that cost is on the operator's screen. The same note says when a
+/// present slug outranked an override the operator named, so a cell never loads
+/// a snapshot other than the one named without the run saying so.
 ///
 /// Which outcome is a skip and which a failure is [`slug_snapshot`]'s and
 /// [`override_snapshot`]'s, not a second copy of their rules. `blame` is the
@@ -474,7 +476,21 @@ pub fn choose(over: Option<Snapshot>, slug: Snapshot, model: &GoldenModel, regen
 /// [`SINGLE_MODEL_VAR`], and a drafter is overridden by a different one.
 pub fn choose_by_slug(over: Option<Snapshot>, slug: Snapshot, blame: &str) -> Gate {
     match slug {
-        Snapshot::Found { path, .. } => Gate::Run { path, note: None },
+        Snapshot::Found { path, .. } => {
+            let note = match over {
+                None => None,
+                Some(Snapshot::Found { path: named, .. }) if same_dir(&named, &path) => None,
+                Some(Snapshot::Found { path: named, .. }) => Some(format!(
+                    "{blame}={} names another snapshot, and the slug is present",
+                    named.display()
+                )),
+                Some(Snapshot::Misconfigured(why) | Snapshot::Absent(why)) => Some(format!(
+                    "{}, so it is ignored beside the present slug",
+                    why.replace(SINGLE_MODEL_VAR, blame)
+                )),
+            };
+            Gate::Run { path, note }
+        }
         Snapshot::Misconfigured(why) => Gate::Fail(why),
         Snapshot::Absent(why) => match over {
             None => Gate::Skip(why.replace(SINGLE_MODEL_VAR, blame)),
@@ -487,6 +503,14 @@ pub fn choose_by_slug(over: Option<Snapshot>, slug: Snapshot, blame: &str) -> Ga
             }
         },
     }
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (a.canonicalize(), b.canonicalize()),
+            (Ok(x), Ok(y)) if x == y
+        )
 }
 
 /// Resolve one snapshot a cell names by slug, overridden by `var`.

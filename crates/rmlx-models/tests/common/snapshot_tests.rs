@@ -819,24 +819,100 @@ fn an_unset_override_leaves_the_slug_to_arm_the_cell() {
 }
 
 /// The ranking. An override naming another runnable snapshot does not take the
-/// cell away from its own slug — that is the mispairing this order prevents.
+/// cell away from its own slug — that is the mispairing this order prevents —
+/// and the run says that the variable the operator named was not used.
 #[test]
-fn the_slug_outranks_an_override_that_also_resolves() {
+fn the_slug_outranks_an_override_that_also_resolves_and_says_so() {
     let root = tempfile::tempdir().expect("tempdir");
     let mine = make_snapshot(root.path(), SLUG, ARCH);
     let theirs = make_snapshot(root.path(), "vendor__someone-elses-drafter", ARCH);
 
-    assert_eq!(
-        choose_by_slug(
-            override_snapshot(Some(as_str(&theirs)), Role::Standalone),
-            slug_snapshot(Some(as_str(root.path())), SLUG, Role::Standalone),
-            DRAFT_VAR,
-        ),
-        Gate::Run {
-            path: mine,
-            note: None
-        }
-    );
+    let Gate::Run { path, note } = choose_by_slug(
+        override_snapshot(Some(as_str(&theirs)), Role::Standalone),
+        slug_snapshot(Some(as_str(root.path())), SLUG, Role::Standalone),
+        DRAFT_VAR,
+    ) else {
+        panic!("a present slug must run");
+    };
+    assert_eq!(path, mine);
+    let note = note.expect("an override that was not used must be announced");
+    assert!(note.contains(DRAFT_VAR), "{note}");
+    assert!(note.contains(as_str(&theirs)), "{note}");
+}
+
+/// An override that names the slug's own snapshot — through a symlink, as the
+/// docs allow a root to hold — contradicts nothing, so it adds no note.
+#[test]
+fn an_override_naming_the_slugs_own_snapshot_adds_no_note() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let elsewhere = tempfile::tempdir().expect("tempdir");
+    let real = make_snapshot(elsewhere.path(), "real-copy", ARCH);
+    std::os::unix::fs::symlink(&real, root.path().join(SLUG)).expect("symlink the slug");
+
+    let Gate::Run { note, .. } = choose_by_slug(
+        override_snapshot(Some(as_str(&real)), Role::Standalone),
+        slug_snapshot(Some(as_str(root.path())), SLUG, Role::Standalone),
+        DRAFT_VAR,
+    ) else {
+        panic!("a present slug must run");
+    };
+    assert_eq!(note, None);
+}
+
+/// The variable spelled exactly as the slug's own path is the same snapshot.
+#[test]
+fn an_override_spelled_as_the_slugs_own_path_adds_no_note() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mine = make_snapshot(root.path(), SLUG, ARCH);
+
+    let Gate::Run { note, .. } = choose_by_slug(
+        override_snapshot(Some(as_str(&mine)), Role::Standalone),
+        slug_snapshot(Some(as_str(root.path())), SLUG, Role::Standalone),
+        DRAFT_VAR,
+    ) else {
+        panic!("a present slug must run");
+    };
+    assert_eq!(note, None);
+}
+
+/// The same directory spelled through a `..` is still the same snapshot.
+#[test]
+fn an_override_spelled_with_a_parent_component_adds_no_note() {
+    let root = tempfile::tempdir().expect("tempdir");
+    make_snapshot(root.path(), SLUG, ARCH);
+    std::fs::create_dir(root.path().join("detour")).expect("create the detour dir");
+    let spelled = root.path().join("detour").join("..").join(SLUG);
+
+    let Gate::Run { note, .. } = choose_by_slug(
+        override_snapshot(Some(as_str(&spelled)), Role::Standalone),
+        slug_snapshot(Some(as_str(root.path())), SLUG, Role::Standalone),
+        DRAFT_VAR,
+    ) else {
+        panic!("a present slug must run");
+    };
+    assert_eq!(note, None);
+}
+
+/// A variable the operator named and got wrong is not dropped in silence just
+/// because the slug is present: the run names the variable and what is wrong
+/// with its value.
+#[test]
+fn an_unrunnable_override_beside_a_present_slug_is_announced() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mine = make_snapshot(root.path(), SLUG, ARCH);
+    let nowhere = root.path().join("was-moved-away");
+
+    let Gate::Run { path, note } = choose_by_slug(
+        override_snapshot(Some(as_str(&nowhere)), Role::Standalone),
+        slug_snapshot(Some(as_str(root.path())), SLUG, Role::Standalone),
+        DRAFT_VAR,
+    ) else {
+        panic!("a present slug must run");
+    };
+    assert_eq!(path, mine);
+    let note = note.expect("an unusable override must be announced");
+    assert!(note.contains(DRAFT_VAR), "{note}");
+    assert!(!note.contains(super::SINGLE_MODEL_VAR), "{note}");
 }
 
 /// The fallback, and that it says so. A root that does not hold the slug is the

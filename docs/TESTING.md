@@ -42,11 +42,10 @@ Each test resolves its snapshot by one of these rules:
 | Rule | Code | Order | A set but wrong value |
 |---|---|---|---|
 | golden | `common::model_for` | `RMLX_KV_TEST_MODEL` if it serves the test's architecture, then the slug | fails |
-| slug first | `common::slug_or_override` | the slug, then the variable the test names | fails when the slug is absent; ignored when it is present |
+| slug first | `common::slug_or_override` | the slug, then the variable the test names | fails when the slug is absent; when the slug is present it runs, and a `NOTE <test>:` line names the variable it outranked |
 | slug first, in `src/` | `rmlx_models::test_snapshot::snapshot` | the slug, then a `RMLX_TEST_MODEL_*` variable | skips |
 | slug only, in `src/` | `rmlx_models::test_snapshot::snapshot_by_slug` | the slug | skips |
 | variable first | `tests/resolved_arch_class.rs`, `crates/rmlx-cli/src/commands/kv_calibrate_tests.rs` | a `RMLX_TEST_MODEL_*` variable, then the slug | falls through to the slug |
-| variable first, drafter | `resolve_drafter` in `tests/spec_sampled_distribution.rs` | `RMLX_DRAFT_TEST_MODEL`, then the slug; a directory with a `config.json` is enough | fails |
 | variable only | every other test that names a variable | the variable | skips |
 | slug and identity | `snapshot` in `crates/rmlx-server/tests/thread_boundary/mod.rs` | the slug only | fails |
 
@@ -56,8 +55,10 @@ snapshot declares another identity than the cell lists: `architectures[0]`, or
 
 `common` is `crates/rmlx-models/tests/common/mod.rs`. Its two rules share one
 probe. It fails when `RMLX_O_MODELS_ROOT` is set but is not a directory, and
-when a variable it consults names a path that is not a runnable snapshot. It
-skips when nothing is configured, or when the root does not hold the slug.
+when a variable it consults names a path that is not a runnable snapshot. The
+slug-first rule has one exception: a present slug runs, and a `NOTE <test>:`
+line names the variable it outranked. Both rules skip when nothing is
+configured, or when the root does not hold the slug.
 
 "Runnable" depends on what the caller opens. The probe takes a `Role`:
 
@@ -120,8 +121,7 @@ it, only snapshot-gated tests check. Deleting one of those calls leaves
 |---|---|---|
 | `RMLX_KV_TEST_MODEL` | the golden-token suites, `bitnet_logprobs.rs`, `qwen3_5_moe_forward_seq_last_k.rs`, the verifiers of the alignment suites, `spec_conditioning_residual.rs`, `spec_greedy_equivalence.rs` and `spec_sampled_distribution.rs` | golden |
 | `RMLX_KV_TEST_MODEL` | `gemma4_kv_cache_equivalence.rs`, `kv_bytes_sample_point.rs`, `cli_flags_e2e.rs`, `projects_toml_e2e.rs` | variable only |
-| `RMLX_DRAFT_TEST_MODEL` | the drafters of the alignment suites, `spec_conditioning_residual.rs` and `spec_greedy_equivalence.rs` | slug first |
-| `RMLX_DRAFT_TEST_MODEL` | the drafter of `spec_sampled_distribution.rs` | variable first, drafter |
+| `RMLX_DRAFT_TEST_MODEL` | the drafters of the alignment suites, `spec_conditioning_residual.rs`, `spec_greedy_equivalence.rs` and `spec_sampled_distribution.rs` | slug first |
 | `RMLX_VL_TEST_MODEL` | `qwen3_vl_moe_text_parity.rs` | variable only |
 | `RMLX_PROMPT_CACHE_TEST_MODEL_A`, `_B` | `prompt_cache_cross_model.rs` | variable only |
 | `RMLX_TEST_MODEL` | `crates/rmlx-server/tests/ssd_cache_restart.rs` | variable only |
@@ -151,8 +151,7 @@ other decode test builds its audio from bytes in the test.
 
 Every suite below names its verifier and its drafter by slug, as constants in
 the test file. The verifier resolves by the golden rule. The drafter resolves
-by the slug-first rule, except in `spec_sampled_distribution.rs`, where the
-variable comes first. A machine that holds both snapshots runs the suite with
+by the slug-first rule. A machine that holds both snapshots runs the suite with
 no variable set.
 
 | File | What it asserts |

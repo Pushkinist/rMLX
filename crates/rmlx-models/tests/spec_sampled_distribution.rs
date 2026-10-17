@@ -89,9 +89,11 @@
 //! | drawn at temperature 1.0 for a request that asked 0.7 | +7.13 | 0.0000 | surprise |
 //! | drawn without the request's `top_k` | +4.84 | 0.1000 | support |
 //!
-//! Server-free. `RMLX_KV_TEST_MODEL` / `RMLX_DRAFT_TEST_MODEL` override either
-//! half of the pair; without them the pair resolves by slug from
-//! `RMLX_O_MODELS_ROOT`.
+//! Server-free. The verifier resolves by the golden rule: `RMLX_KV_TEST_MODEL`
+//! when it names an architecture the pair covers, else the slug under
+//! `RMLX_O_MODELS_ROOT`. The drafter resolves by slug, and `RMLX_DRAFT_TEST_MODEL`
+//! overrides it only where the models root does not hold its slug, as in
+//! `spec_greedy_equivalence.rs`.
 //!
 //!     cargo test -p rmlx-models --test spec_sampled_distribution -- --ignored --nocapture
 
@@ -109,7 +111,7 @@
     clippy::float_cmp
 )]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 mod common;
 
@@ -511,42 +513,6 @@ fn softmax(logits: &[f32], inv_temp: f32) -> Vec<f32> {
 
 // ── the pair ─────────────────────────────────────────────────────────────────
 
-/// Resolve the drafter: `RMLX_DRAFT_TEST_MODEL` first (any directory with a
-/// `config.json`), else the slug under the models root. The equivalence gate
-/// resolves through `common::slug_or_override(.., Role::Sidecar)` instead, so
-/// the two do not always pick the same snapshot.
-fn resolve_drafter() -> common::Gate {
-    if let Some(named) = std::env::var(DRAFT_MODEL_VAR)
-        .ok()
-        .filter(|v| !v.is_empty())
-    {
-        let path = PathBuf::from(&named);
-        return if path.join("config.json").is_file() {
-            common::Gate::Run { path, note: None }
-        } else {
-            common::Gate::Fail(format!("{DRAFT_MODEL_VAR}={named} holds no config.json"))
-        };
-    }
-    let Some(root) = std::env::var(common::MODELS_ROOT_VAR)
-        .ok()
-        .filter(|r| !r.is_empty())
-    else {
-        return common::Gate::Skip(format!(
-            "no drafter configured — set {} (holding {DRAFTER_SLUG}) or {DRAFT_MODEL_VAR}",
-            common::MODELS_ROOT_VAR
-        ));
-    };
-    let path = Path::new(&root).join(DRAFTER_SLUG);
-    if path.join("config.json").is_file() {
-        common::Gate::Run { path, note: None }
-    } else {
-        common::Gate::Skip(format!(
-            "{}={root} does not hold a runnable {DRAFTER_SLUG}",
-            common::MODELS_ROOT_VAR
-        ))
-    }
-}
-
 fn sampler(temperature: f32, seed: u64) -> SamplerConfig {
     SamplerConfig {
         temperature,
@@ -644,7 +610,10 @@ fn a_sampled_sidecar_arm_draws_from_the_verifiers_distribution() {
     const TEST: &str = "a_sampled_sidecar_arm_draws_from_the_verifiers_distribution";
     let device = Device::Gpu;
 
-    let Some(draft_path) = common::apply(resolve_drafter(), TEST) else {
+    let Some(draft_path) = common::apply(
+        common::slug_or_override(DRAFT_MODEL_VAR, DRAFTER_SLUG, common::Role::Sidecar),
+        TEST,
+    ) else {
         return;
     };
     let Some(model_path) = common::model_for(&VERIFIER, TEST) else {
