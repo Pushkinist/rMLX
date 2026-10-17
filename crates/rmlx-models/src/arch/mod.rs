@@ -128,6 +128,21 @@ impl std::fmt::Debug for Architecture {
     }
 }
 
+/// Check `kv_quant` against the invariants of the architecture class a loaded
+/// model resolved to. [`Architecture::validate_kv_quant`] is this on its own
+/// class; a pair of models asks it once per class.
+pub(crate) fn validate_arch_kv_quant(
+    arch_class: &str,
+    kv_quant: rmlx_kv_quant::KvQuant,
+) -> Result<()> {
+    crate::kv_cache::validate_resolved_kv_quant(arch_class, &kv_quant).map_err(|e| {
+        Error::Config(format!(
+            "KV codec rejected for the architecture this snapshot actually resolves to \
+             ({arch_class}): {e}"
+        ))
+    })
+}
+
 impl Architecture {
     /// Run a full-sequence forward pass, return logits for the last position.
     ///
@@ -935,13 +950,7 @@ impl Architecture {
     /// Arch-agnostic: it delegates to the one shared invariant table, so a
     /// codec that is legal on this architecture costs a single enum match.
     pub fn validate_kv_quant(&self, kv_quant: rmlx_kv_quant::KvQuant) -> Result<()> {
-        crate::kv_cache::validate_resolved_kv_quant(self.arch_class(), &kv_quant).map_err(|e| {
-            Error::Config(format!(
-                "KV codec rejected for the architecture this snapshot actually resolves to \
-                 ({}): {e}",
-                self.arch_class()
-            ))
-        })
+        validate_arch_kv_quant(self.arch_class(), kv_quant)
     }
 
     /// One-line summary string for diagnostics and tracing.

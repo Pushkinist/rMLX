@@ -384,6 +384,140 @@ fn the_reduced_vocabulary_prefix_is_bounded_by_the_acceptance() {
     );
 }
 
+/// The loop hands the verifier's stack offsets and the fed count to the advance
+/// check, and runs it before the round emits a token.
+///
+/// The call is what makes the check reachable. Handed the wrong pair of reads,
+/// or the fed count of another vector, it refuses a sound round or passes a
+/// broken one, and it must come before `emit_round_tokens` because a round that
+/// was refused after its tokens reached the client has already answered from a
+/// stack the loop does not trust. Read as text off the shared loop's own source.
+///
+/// Mutation: delete the call; swap the two offsets; pass `draft_tokens.len()`;
+/// move the call below `emit_round_tokens`.
+#[test]
+fn the_loop_checks_every_rounds_advance_before_it_emits() {
+    let src = LOOP_SOURCES
+        .iter()
+        .find(|(f, _)| *f == SHARED_LOOP)
+        .map(|(_, s)| *s)
+        .unwrap_or_default();
+    let code: Vec<&str> = src.lines().map(str::trim).filter(|l| is_code(l)).collect();
+    let calls: Vec<usize> = code
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.starts_with("guard_round_advance("))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        calls.len(),
+        1,
+        "the shared loop checks each round's advance once and it calls the check {} \
+         time(s)",
+        calls.len()
+    );
+    let at = calls.first().copied().unwrap_or_default();
+    let args: Vec<&str> = code
+        .iter()
+        .skip(at + 1)
+        .take_while(|l| !l.starts_with(")?"))
+        .copied()
+        .collect();
+    assert_eq!(
+        args,
+        vec![
+            "cfg.loop_kind,",
+            "rounds,",
+            "pre_round_offset,",
+            "post_round_offset,",
+            "fed.len(),",
+        ],
+        "the check reads the loop's kind and round, the offset before the forward, the \
+         offset after it and the count the round fed"
+    );
+    let emits = code
+        .iter()
+        .position(|l| l.starts_with("let emit = emit_round_tokens("));
+    assert!(
+        emits.is_some_and(|e| at < e),
+        "the check runs before the round's tokens are emitted: check at {at}, emit at \
+         {emits:?}"
+    );
+    // The two reads fall on either side of the forward, and the check follows
+    // the second: a pre-read taken after `verify`, or a post-read that is the
+    // pre-read, compares the stack with itself.
+    let at_line = |needle: &str, exact: bool| {
+        let found: Vec<usize> = code
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| {
+                if exact {
+                    **l == needle
+                } else {
+                    l.contains(needle)
+                }
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "`{needle}` is written {} time(s)",
+            found.len()
+        );
+        found.first().copied().unwrap_or_default()
+    };
+    let pre = at_line("let pre_round_offset = stack_offset(&ctx.kv)?;", true);
+    let verify = at_line("drafter.verify(", false);
+    let post = at_line("let post_round_offset = stack_offset(&ctx.kv)?;", true);
+    assert!(
+        pre < verify && verify < post && post < at,
+        "the loop reads the stack, runs the forward, reads the stack again and then \
+         checks: pre at {pre}, verify at {verify}, post at {post}, check at {at}"
+    );
+}
+
+/// No round loop reads a stack's offset for itself.
+///
+/// [`stack_offset`](super::round_common::stack_offset) is the one producer, and
+/// it refuses a stack whose layers part. A loop that took a `.max()` over the
+/// layers again would read the highest one and drop a short layer without a
+/// word, and the check on the other side of the forward would pass on it.
+///
+/// A cache's offset is not read in either file at all, and no line holds both
+/// an offset and a `.max()`, so a closure spelling of the same read fails too.
+///
+/// Mutation: read either offset of the shared loop, or the draft cache of the
+/// two-model drafter, with `KvCache::offset` or `|c| c.offset()` in a `.map(..)`.
+#[test]
+fn every_stack_offset_has_one_producer() {
+    let two_model = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/speculative/two_model.rs"
+    ));
+    for (file, src) in LOOP_SOURCES
+        .iter()
+        .copied()
+        .chain([("two_model.rs", two_model)])
+    {
+        let reads: Vec<&str> = src
+            .lines()
+            .map(str::trim)
+            .filter(|l| {
+                is_code(l)
+                    && (l.contains("KvCache::offset")
+                        || l.contains(".offset()")
+                        || (l.contains("offset") && l.contains(".max()")))
+            })
+            .collect();
+        assert!(
+            reads.is_empty(),
+            "{file} reads a stack offset itself where `stack_offset` is the one producer: \
+             {reads:?}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // What the seven loops declare at their edges
 // ---------------------------------------------------------------------------
@@ -409,7 +543,7 @@ enum ChainRefusedBy {
 /// the tail's record, guard and report. What a migrated drafter declares is
 /// checked against its constant instead, by the test below.
 const SHARED_LOOP: &str = "round_loop.rs";
-const SHARED_LOOP_PATTERN: &str = "SPEWGRIP";
+const SHARED_LOOP_PATTERN: &str = "SPEWGARIP";
 
 /// What each round loop declares at its edges, and the file that holds it.
 ///
@@ -496,13 +630,14 @@ const LOOP_SOURCES: [(&str, &str); 1] = [(
     )),
 )];
 
-/// The seven edge markers, each as the character the reading below renders it
+/// The eight edge markers, each as the character the reading below renders it
 /// as.
 ///
 /// `S` and `I` are the shared loop's two guards on the drafter's declared
 /// resident-KV exit, `E` is the early exit, `W` the head of the round loop, `G`
-/// either spelling of the empty-chain refusal, `R` the request record a loop
-/// closes on, `P` the report of the verifier's resident KV.
+/// either spelling of the empty-chain refusal, `A` the check that the verify
+/// forward advanced the verifier's stack by what the round fed, `R` the request
+/// record a loop closes on, `P` the report of the verifier's resident KV.
 ///
 /// `R` is what makes the reading see a report moved *into* the round loop: with
 /// four markers a report placed after the refusal reads the same as one at the
@@ -523,7 +658,7 @@ const LOOP_SOURCES: [(&str, &str); 1] = [(
 /// safe direction, and it is why the exactness is confined to these two: the
 /// other six markers name a call or a keyword that a loop may legitimately
 /// write in more than one shape.
-const MARKERS: [(char, &str); 7] = [
+const MARKERS: [(char, &str); 8] = [
     (
         'S',
         "if !matches!(D::KV_REPORT_SKIPPED_BY, ReportSkippedBy::TheSeedExit) {",
@@ -535,6 +670,7 @@ const MARKERS: [(char, &str); 7] = [
     ('E', "return Ok((emitted"),
     ('W', "while emitted.len() < n_tokens"),
     ('G', "draft_tokens.is_empty()"),
+    ('A', "guard_round_advance("),
     ('R', "log_request_record("),
     ('P', "report_verifier_kv_bytes("),
 ];
@@ -590,10 +726,11 @@ fn marks_line(line: &str, mark: char, needle: &str) -> bool {
 /// return, or below the head of its round loop, or delete it.
 ///
 /// Mutations on the shared loop's two declared-exit guards, each measured
-/// against `SPEWGRIP`: drop the `!` on the seed guard and it reads `PEWGRIP`;
-/// drop the `!` on the tail guard, `SPEWGRP`; swap the two arm names between
-/// the exits, `PEWGRP`; append `|| true` to either guard, the same as dropping
-/// its `!`, because the marker is the whole line.
+/// against `SPEWGARIP`: drop the `!` on the seed guard and it reads `PEWGARIP`;
+/// drop the `!` on the tail guard, `SPEWGARP`; swap the two arm names between
+/// the exits, `PEWGARP`; append `|| true` to either guard, the same as dropping
+/// its `!`, because the marker is the whole line. Delete the round-advance
+/// check and it reads `SPEWGRIP`.
 #[test]
 fn every_loop_reports_the_verifiers_resident_kv_at_the_exit_it_declares() {
     // Every row names a file this test reads. Without this, a row pointing at a
@@ -612,9 +749,10 @@ fn every_loop_reports_the_verifiers_resident_kv_at_the_exit_it_declares() {
             marker_sequence(src),
             SHARED_LOOP_PATTERN,
             "{SHARED_LOOP}: the two declared-exit guards (S, I), the early exit (E), \
-             the round loop (W), the empty-chain refusal (G), the request record (R) \
-             and the resident-KV report (P) do not fall in the order the loop that \
-             carries every row's exits is declared to write them in"
+             the round loop (W), the empty-chain refusal (G), the round-advance check \
+             (A), the request record (R) and the resident-KV report (P) do not fall \
+             in the order the loop that carries every row's exits is declared to \
+             write them in"
         );
     }
     // A migrated loop states its disposition rather than spelling it out, and a

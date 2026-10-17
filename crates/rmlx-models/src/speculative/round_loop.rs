@@ -39,8 +39,8 @@ use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device};
 
 use super::round_common::{
-    emit_round_tokens, emit_seed_token, lin_cache_stack, log_request_record,
-    report_verifier_kv_bytes, rollback_round, verifier_cache_stack, RoundTotals,
+    emit_round_tokens, emit_seed_token, guard_round_advance, lin_cache_stack, log_request_record,
+    report_verifier_kv_bytes, rollback_round, stack_offset, verifier_cache_stack, RoundTotals,
 };
 use super::{guard_restricted_prefix, DecodeWindow, SpecLoop, VerifierDraw};
 use crate::arch::Architecture;
@@ -551,19 +551,26 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
 
         // The rollback returns to the position the round started at, so the
         // target is computed from this read and never from the one after the
-        // forward, which is a function of how far each layer happened to
-        // advance.
-        let pre_round_offset = ctx.kv.iter().map(KvCache::offset).max().unwrap_or(0);
+        // forward.
+        let pre_round_offset = stack_offset(&ctx.kv)?;
 
         // Armed here rather than in each `verify`: the loop owns the recurrent
         // stack and is the tape's only consumer, through the rollback below. A
         // stack with no recurrent layer arms nothing.
         super::arm_lin_tapes(ctx.lin.as_deref_mut());
         let verdict = drafter.verify(&mut ctx, &fed, remaining)?;
-        // Read again for the round line alone: a drafter that counts its
-        // rollback back from the tail reports this number, and it is the same
-        // position as the one above.
-        let post_round_offset = ctx.kv.iter().map(KvCache::offset).max().unwrap_or(0);
+        // The round line reports this read for a drafter that counts its
+        // rollback back from the tail. The forward must have advanced the stack
+        // by exactly what the round fed, or the target above and the refold
+        // below describe a position the stack is not at.
+        let post_round_offset = stack_offset(&ctx.kv)?;
+        guard_round_advance(
+            cfg.loop_kind,
+            rounds,
+            pre_round_offset,
+            post_round_offset,
+            fed.len(),
+        )?;
         verifier_ns += verdict.verify_ns;
         total_accept += verdict.accept;
 

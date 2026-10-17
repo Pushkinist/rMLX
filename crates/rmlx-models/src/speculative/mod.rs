@@ -330,6 +330,39 @@ pub fn vocab_pairing(verifier_dir: &Path, draft_dir: &Path) -> Result<()> {
     vocab_pairing_verdict(&snapshot_vocab(verifier_dir)?, &snapshot_vocab(draft_dir)?)
 }
 
+/// Check `kv_quant` against the architecture class of each model of a pair.
+///
+/// The draft model of a two-model pair builds its cache stack at the verifier's
+/// codec, so the codec has to be legal for both. `draft_class` is `None` for a
+/// sidecar drafter, whose own caches hold no quantised codec.
+///
+/// # Errors
+/// [`Error::Config`] naming the verifier's class, or the draft's class and the
+/// reason the draft stack refuses the verifier's codec.
+pub(crate) fn validate_pair_kv_quant(
+    verifier_class: &str,
+    draft_class: Option<&str>,
+    kv_quant: KvQuant,
+) -> Result<()> {
+    crate::arch::validate_arch_kv_quant(verifier_class, kv_quant)?;
+    draft_class.map_or(Ok(()), |class| validate_draft_kv_quant(class, kv_quant))
+}
+
+/// Check `kv_quant` against the architecture class of a two-model pair's draft
+/// model, before the draft stack is built at that codec.
+///
+/// # Errors
+/// [`Error::Config`] naming the draft's class and the reason it refuses the
+/// codec.
+pub(crate) fn validate_draft_kv_quant(draft_class: &str, kv_quant: KvQuant) -> Result<()> {
+    crate::kv_cache::validate_resolved_kv_quant(draft_class, &kv_quant).map_err(|e| {
+        Error::Config(format!(
+            "the draft model of a two-model pair ({draft_class}) builds its KV caches at \
+             the verifier's codec and refuses it: {e}"
+        ))
+    })
+}
+
 /// Holds a verifier and, for the two-model path, a draft `Architecture`.
 ///
 /// When a draft is present:
@@ -473,6 +506,19 @@ impl SpeculativeDispatcher {
     /// Vocabulary size shared by both models (asserted at construction).
     pub fn vocab_size(&self) -> usize {
         self.verifier.vocab_size()
+    }
+
+    /// Check `kv_quant` against every model whose caches carry it: the
+    /// verifier's, and the draft model's when the pair is two-model.
+    ///
+    /// # Errors
+    /// [`Error::Config`] naming the model that refuses the codec.
+    pub fn validate_kv_quant(&self, kv_quant: KvQuant) -> Result<()> {
+        validate_pair_kv_quant(
+            self.verifier.arch_class(),
+            self.draft.as_ref().map(Architecture::arch_class),
+            kv_quant,
+        )
     }
 
     /// The draft model, or an error when this dispatcher holds only a verifier.

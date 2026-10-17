@@ -274,9 +274,10 @@ impl KvCache {
         // write+read round-trip that dominates decode-step bandwidth.
         //
         // The decode-only gate (q_seq == 1) is checked HERE — not inside the
-        // helper — because the helper mutates cache state (`ks.append`,
-        // `update_decode_fp16`) before it knows whether it can complete the
-        // SDPA, and the legacy fallback would then double-append.
+        // helper — because the helper returns `None` only before any mutation.
+        // After its append (`ks.append`, `update_decode_fp16`) it either
+        // completes or returns an error, so a fallback to the legacy path
+        // would double-append.
         //
         // Warm-TTFT gate: when `exit_prefill` left a bf16 K seed in
         // `decode_fp16_k`, PlanarK decodes from it like every other
@@ -312,8 +313,8 @@ impl KvCache {
             )? {
                 tracing::Span::current().record("path", "planar_k_fused");
                 return Ok(out);
-                // Falls through to legacy when fused path is not yet eligible
-                // (e.g. prefill chunk before any GPU buffer exists, or CPU device).
+                // Falls through to legacy only when the helper declined before
+                // it mutated anything; the gate above screens prefill and CPU.
             }
         }
 
@@ -1302,8 +1303,9 @@ impl KvCache {
     /// Fused-QK + manual SV dispatch for `KvStorage::PlanarK`.
     ///
     /// Returns `Some(out)` when the fused path runs successfully, `None` when
-    /// the caller should fall through to the legacy dequant + SDPA path
-    /// (e.g. GPU buffers not yet populated — first prefill chunk).
+    /// the caller should fall through to the legacy dequant + SDPA path. `None`
+    /// comes back only before any mutation; the caller's gate (GPU, one query
+    /// row, no live bf16 K seed) screens prefill chunks and the CPU device.
     ///
     /// Steps:
     ///   1. Append `new_k` into the `QuantPlanarK` buffer (no dequant).
@@ -1359,10 +1361,15 @@ impl KvCache {
         let k_f32_empty: Vec<f32> = Vec::new();
         ks.append(&k_f32_empty, &new_shape, new_k, device, max_seq)?;
 
-        // GPU buffers not populated (CPU path or very first call corner cases):
-        // fall through to legacy BEFORE any further mutation.
+        // The append leaves the packed view in place on the GPU device this path
+        // is gated to. `Ok(None)` here would send the caller into the legacy
+        // `update()`, which appends a second time.
         if ks.gpu_packed_view(device)?.is_none() {
-            return Ok(None);
+            return Err(Error::Mlx(
+                "planar_k_fused: GPU packed view absent after a maintained append — internal \
+                 invariant violated"
+                    .to_owned(),
+            ));
         }
         let k_shape = ks.shape.clone();
         // k_shape = [B, kv_h, S, head_dim].
@@ -1395,11 +1402,10 @@ impl KvCache {
         // pattern from `update_iso_k_only_3`/`_4`.
         let (v_slab, v_valid) = self.update_decode_fp16_v_slab(new_v, max_seq, device)?;
 
-        // Past this point the cache is already mutated (store appended, offset
-        // advanced, bf16 V accumulated), so `Ok(None)` is no longer available —
-        // it would send the caller into the legacy `update()` path, which
-        // appends a second time. Every not-eligible condition is screened
-        // above.
+        // Past the append the cache is mutated (store appended, offset advanced,
+        // bf16 V accumulated), so this helper returns `Some` or an error and
+        // never `None`: `None` would send the caller into the legacy `update()`
+        // path, which appends a second time.
         let out = self.planar_k_flash_over_store(
             queries,
             VMirror::new(&v_slab, v_valid),

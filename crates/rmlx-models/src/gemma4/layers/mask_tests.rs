@@ -1,12 +1,11 @@
 //! Regression tests for the Gemma4 verify-step attention mask sizing.
 //!
-//! At a speculative verify-block step (`query_len > 1`, prompt long enough to
-//! take the masked branch), an array-mode SWA / chunked-prefill mask sized from
-//! the model-wide `cache_base_offset` instead of the cache-holding producer
-//! layer's own `offset()` desyncs by one position across a partial-accept
-//! rollback: the mask comes out one key too long (`(1,1,5,kv+1)`) vs the K the
-//! SDPA attends (`(1,8,5,kv)`), tripping the opaque mlx-c
-//! `scaled_dot_product_attention` broadcast error.
+//! At a multi-token step (`query_len > 1`, prompt long enough to take the
+//! masked branch), an array-mode SWA / chunked-prefill mask must have the key
+//! dim of the K the SDPA attends. A wrapped ring caps that K at the window, so
+//! a mask sized from an offset above the cache-holding producer layer's own
+//! capped one comes out too long (`(1,1,5,kv+1)` vs `(1,8,5,kv)`), tripping the
+//! opaque mlx-c `scaled_dot_product_attention` broadcast error.
 //!
 //! These tests pin the invariant: for a verify-block step the
 //! mask built from the *producer* offset has its key dim equal to
@@ -143,8 +142,8 @@ fn sliding_attn_verify_block_mask_matches_capped_k_len() {
     reason = "test asserts on known-good shapes; unwrap/expect failures are the assertion"
 )]
 fn guard_invariant_producer_offset_matches_k_seq() {
-    // Reproduce the crash magnitudes: partial-accept rollback left producer
-    // cache at offset 4121 while the model-wide base_offset is 4122.
+    // Reproduce the crash magnitudes: the producer cache stands at offset 4121
+    // while an offset one above it is 4122.
     let seq = 5;
     let producer_offset = 4121;
     let window = 512usize;
@@ -185,10 +184,10 @@ fn guard_invariant_producer_offset_matches_k_seq() {
 /// `consumer_effective_offset(total_kv_len, seq)` where
 /// `total_kv_len = k.shape()[2]`.
 ///
-/// Here we simulate a desynced verify round: the producer cache was rolled back
-/// (delta = 4 accepted tokens), so the shared K it hands the consumer has
-/// length `k_seq = base_offset - delta + seq`, while the model-wide `offset`
-/// (`base_offset`, the un-rolled-back full-attention cache) is `delta` higher.
+/// Here the shared K the producer hands the consumer is `delta` = 4 positions
+/// shorter than the model-wide `offset` implies, as a wrapped ring's capped K is:
+/// `k_seq = base_offset - delta + seq`, while the model-wide `offset`
+/// (`base_offset`) is `delta` higher.
 /// Sizing the mask from `base_offset` would make it `delta` keys too wide and
 /// broadcast-fail against the shared K. Sizing from `consumer_effective_offset`
 /// keeps it exactly `k_seq`.
@@ -207,14 +206,13 @@ fn guard_invariant_producer_offset_matches_k_seq() {
 )]
 fn guard_invariant_consumer_mask_matches_shared_k_len() {
     // Reproduce the consumer-branch crash magnitudes: base_offset 3221 (the
-    // un-rolled-back full-attention cache), producer rolled back by delta=4
-    // (round-1 accepted tokens), verify block seq=5.
+    // model-wide offset), a shared K shorter by delta=4, verify block seq=5.
     let seq = 5;
-    let base_offset = 3221; // model-wide `offset` (NOT rolled back).
-    let delta = 4; // tokens accepted in the prior round → producer rollback.
+    let base_offset = 3221; // model-wide `offset`.
+    let delta = 4; // positions the shared K is shorter than `offset` implies.
     let window = 512usize;
 
-    // The shared K the producer hands the consumer reflects the rollback:
+    // The shared K the producer hands the consumer is `delta` shorter:
     //   k_seq = (base_offset - delta) + seq
     let k_seq = (base_offset - delta) + seq;
 
@@ -227,7 +225,7 @@ fn guard_invariant_consumer_mask_matches_shared_k_len() {
     assert_eq!(
         effective_offset,
         base_offset - delta,
-        "consumer effective offset must follow the producer's rolled-back K, \
+        "consumer effective offset must follow the producer's K, \
          not the model-wide offset"
     );
 
@@ -332,7 +330,7 @@ fn shared_kv_len_reproduces_k_shape_sizing() {
 )]
 fn guard_invariant_regressed_consumer_offset_inflates_mask() {
     let seq = 5;
-    let base_offset = 3221; // model-wide offset (NOT rolled back).
+    let base_offset = 3221; // model-wide offset.
     let delta = 4;
     let window = 512usize;
     let k_seq = (base_offset - delta) + seq; // actual shared K length.
@@ -381,7 +379,7 @@ fn guard_invariant_regressed_consumer_offset_inflates_mask() {
 fn guard_invariant_regressed_base_offset_inflates_mask() {
     let seq = 5;
     let producer_offset = 4121;
-    let base_offset_desynced = producer_offset + 1; // model-wide offset after rollback desync.
+    let offset_above_producer = producer_offset + 1; // one above the producer's own offset.
     let window = 512usize;
 
     // Simulate what a reverted `Attention::forward` would do: pass base_offset
@@ -390,8 +388,8 @@ fn guard_invariant_regressed_base_offset_inflates_mask() {
     let (mask, _) = build_attn_mask(
         LayerType::FullAttention,
         seq,
-        base_offset_desynced,
-        base_offset_desynced + seq,
+        offset_above_producer,
+        offset_above_producer + seq,
         false,
         window,
         None, // bidi_overlay: tests cover causal/SWA mask sizing, not the image overlay
@@ -403,7 +401,8 @@ fn guard_invariant_regressed_base_offset_inflates_mask() {
     assert_eq!(
         mask.expect("array mode must carry a mask array").shape()[3],
         k_seq + 1,
-        "base_offset-desynced mask is one key too long — the guard trigger"
+        "a mask sized from an offset one above the producer's is one key too long \
+         — the guard trigger"
     );
 }
 

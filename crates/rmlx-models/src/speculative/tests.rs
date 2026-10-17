@@ -1415,5 +1415,97 @@ fn each_two_model_entry_names_its_own_rule_its_own_loop_kind_and_its_own_block()
     }
 }
 
+const DENSE_CLASS: &str = "Qwen3_5ForConditionalGeneration";
+const MOE_CLASS: &str = "Qwen3_5MoeForConditionalGeneration";
+
+/// The codecs that build a K store below eight bits, which Qwen MoE refuses.
+///
+/// A codec that decodes from the bf16 mirror and builds no store of its own
+/// cannot tell a pair check that runs from one that does not, so every row here
+/// is a codec whose K store the draft stack would build.
+fn low_k_store_codecs() -> [KvQuant; 4] {
+    [
+        KvQuant::IsoKOnly4,
+        KvQuant::Iso4Sym,
+        KvQuant::Rotor3Sym,
+        KvQuant::Mixed {
+            k_bits: 4,
+            v_bits: 4,
+            k_group_size: 64,
+            v_group_size: 64,
+        },
+    ]
+}
+
+/// A two-model pair is refused when the draft model refuses the verifier's
+/// codec, and the refusal names the draft.
+///
+/// The draft stack is built at the verifier's codec, so a dense verifier that
+/// accepts a low-bit K codec does not make it legal for a Qwen MoE draft.
+///
+/// Mutation: ignore `draft_class`; check the draft against the wrong codec.
+#[test]
+fn a_draft_model_that_refuses_the_codec_refuses_the_pair() {
+    for kq in low_k_store_codecs() {
+        assert!(
+            validate_pair_kv_quant(DENSE_CLASS, None, kq).is_ok(),
+            "control: the dense verifier alone accepts {kq:?}"
+        );
+        let err = validate_pair_kv_quant(DENSE_CLASS, Some(MOE_CLASS), kq)
+            .err()
+            .map_or_else(String::new, |e| e.to_string());
+        assert!(
+            err.contains("draft model") && err.contains(MOE_CLASS),
+            "a Qwen MoE draft behind a dense verifier must refuse {kq:?} naming the draft; \
+             got {err:?}"
+        );
+    }
+}
+
+/// A pair whose models both accept the codec is not refused, and the verifier
+/// is still asked first.
+///
+/// Mutation: refuse every two-model pair; stop asking the verifier.
+#[test]
+fn a_pair_whose_models_accept_the_codec_is_accepted() {
+    for kq in [KvQuant::None, KvQuant::K8V8, KvQuant::K8V4] {
+        assert!(validate_pair_kv_quant(DENSE_CLASS, Some(MOE_CLASS), kq).is_ok());
+        assert!(validate_pair_kv_quant(DENSE_CLASS, Some(DENSE_CLASS), kq).is_ok());
+    }
+    for kq in low_k_store_codecs() {
+        assert!(validate_pair_kv_quant(DENSE_CLASS, Some(DENSE_CLASS), kq).is_ok());
+        let err = validate_pair_kv_quant(MOE_CLASS, Some(DENSE_CLASS), kq)
+            .err()
+            .map_or_else(String::new, |e| e.to_string());
+        assert!(
+            err.contains(MOE_CLASS) && !err.contains("draft model"),
+            "a Qwen MoE verifier refuses {kq:?} on its own account; got {err:?}"
+        );
+    }
+}
+
+/// The dispatcher hands the pair check its draft model's class.
+///
+/// A dispatcher holds two `Architecture` values, which only loaded weights
+/// build, so the CPU tests above read the pair check on class names. What joins
+/// the two is this one statement, inside the dispatcher's own method: a method
+/// that passed `None` for the draft would check the verifier alone, and every
+/// test of the pair check would stay green.
+///
+/// Mutation: pass `None` for the draft class; move the statement out of
+/// `validate_kv_quant`.
+#[test]
+fn the_dispatcher_asks_the_pair_check_about_its_draft_model() {
+    let found =
+        text_scan::lines_in_fns(MOD_SRC, "self.draft.as_ref().map(Architecture::arch_class)");
+    let owners: Vec<&str> = found.iter().map(|(_, owner)| owner.as_str()).collect();
+    assert_eq!(
+        owners,
+        vec!["validate_kv_quant"],
+        "the dispatcher's codec check reads the draft model's class once and nothing \
+         else does: {found:?}"
+    );
+}
+
 #[path = "prefill_stop_tests.rs"]
 mod prefill_stop_tests;

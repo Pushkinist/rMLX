@@ -19,16 +19,23 @@
 
 use std::time::{Duration, Instant};
 
+use rmlx_core::error::Result;
+use rmlx_core::DispatchPolicy;
+use rmlx_kv_quant::storage::KvStorage;
 use rmlx_kv_quant::{GdnTapeSegment, KvCache, KvQuant, LinearAttnCache};
 use rmlx_mlx::{Array, Device, Dtype};
 
 use super::{
-    refold_lin_tapes, rollback_round, rollback_round_caches, round_stats, seq_range, RoundTotals,
+    guard_round_advance, refold_lin_tapes, rollback_round, rollback_round_caches, round_stats,
+    seq_range, stack_offset, RoundTotals,
 };
 use crate::arch::{load_model, Architecture, LoadOpts};
 use crate::decode_loop::ProbeStep;
 use crate::speculative::tests::{greedy_cfg, logits_block, logprob_cfg, tiny_tokenizer};
-use crate::speculative::{arm_lin_tapes, DecodeWindow, ScoredBlock, SpecLoop, VerifierDraw};
+use crate::speculative::{
+    arm_lin_tapes, rollback_target_from_head, truncate_kv_to, DecodeWindow, ScoredBlock, SpecLoop,
+    VerifierDraw,
+};
 
 /// How far back the fixture's request started.
 ///
@@ -1297,4 +1304,223 @@ fn a_partial_rollback_over_a_stack_with_nothing_to_refold_says_so() {
         "two full-attention slots are two slots and no recurrent state, and the \
          answer is about the state"
     );
+}
+
+/// A cache stack whose layers stand at `offsets`, one entry per layer.
+fn stack_at(offsets: &[i32]) -> Vec<KvCache> {
+    offsets
+        .iter()
+        .enumerate()
+        .map(|(layer, &offset)| {
+            KvCache::from_storage(
+                KvStorage::None {},
+                4096,
+                KvQuant::None,
+                offset,
+                layer,
+                DispatchPolicy::default(),
+                false,
+            )
+        })
+        .collect()
+}
+
+/// A stack whose layers agree has one position, and an empty one stands at the
+/// start.
+///
+/// Mutation: return `0` for every stack, or the first layer's offset where the
+/// first layer is one that never advances.
+#[test]
+fn a_stack_whose_layers_agree_stands_where_they_stand() {
+    assert_eq!(stack_offset(&stack_at(&[])).ok(), Some(0));
+    assert_eq!(stack_offset(&stack_at(&[7])).ok(), Some(7));
+    assert_eq!(
+        stack_offset(&stack_at(&[4096, 4096, 4096])).ok(),
+        Some(4096)
+    );
+}
+
+/// A layer that never advances stands at 0 beside layers that do, and is not a
+/// disagreement.
+///
+/// Recurrent layers keep their state outside the cache, and a shared-KV
+/// consumer layer owns no cache, so both stay at 0 for the whole request. A
+/// refusal that counted them would refuse every hybrid and every Gemma4 round.
+///
+/// Mutation: drop the `offset == 0` exemption.
+#[test]
+fn layers_that_never_advance_do_not_split_the_stack() {
+    assert_eq!(stack_offset(&stack_at(&[0, 7, 0, 7])).ok(), Some(7));
+    assert_eq!(stack_offset(&stack_at(&[0, 0, 0])).ok(), Some(0));
+    assert_eq!(stack_offset(&stack_at(&[0, 0, 9])).ok(), Some(9));
+}
+
+/// One layer off the stack's position is refused, whichever side it is on, and
+/// the refusal names both layers and both positions.
+///
+/// A `.max()` over the layers reports the highest one and drops the short layer
+/// without a word: the round then rolls back a stack that is not where the loop
+/// thinks it is.
+///
+/// Mutation: read the stack with `.max()` again; report only one of the two
+/// layers.
+#[test]
+fn a_layer_off_the_stacks_position_is_refused_with_both_layers_named() {
+    // (offsets, the layer the stack was first read at, the layer that parts)
+    let cases: [(&[i32], (usize, i32), (usize, i32)); 4] = [
+        (&[7, 7, 6, 7], (0, 7), (2, 6)),
+        (&[7, 7, 8, 7], (0, 7), (2, 8)),
+        (&[0, 5, 5, 4], (1, 5), (3, 4)),
+        (&[5, 6], (0, 5), (1, 6)),
+    ];
+    for (offsets, (first, at), (other, there)) in cases {
+        let err = stack_offset(&stack_at(offsets))
+            .err()
+            .map_or_else(String::new, |e| e.to_string());
+        for want in [
+            format!("layer {first} stands at {at}"),
+            format!("layer {other} at {there}"),
+        ] {
+            assert!(
+                err.contains(&want),
+                "the stack {offsets:?} must be refused naming `{want}`; got {err:?}"
+            );
+        }
+    }
+}
+
+/// A round must leave the stack where it started plus the positions it fed.
+///
+/// The rollback target, the recurrent refold and the round line all count from
+/// that relation, and a forward that advanced by anything else leaves the stack
+/// somewhere none of them describe.
+///
+/// Mutation: accept `post == pre + fed + 1`; compare `post` against `pre` alone;
+/// delete the check.
+#[test]
+fn a_round_must_advance_the_stack_by_what_it_fed() {
+    use crate::speculative::SpecLoop::MtpSidecar;
+    assert!(guard_round_advance(MtpSidecar, 3, 100, 105, 5).is_ok());
+    assert!(guard_round_advance(MtpSidecar, 1, 0, 2, 2).is_ok());
+    for post in [100, 104, 106, 99] {
+        let err = guard_round_advance(MtpSidecar, 3, 100, post, 5)
+            .err()
+            .map_or_else(String::new, |e| e.to_string());
+        for want in [
+            "MtpSidecar".to_owned(),
+            "round 3".to_owned(),
+            "fed 5".to_owned(),
+            "offset 100".to_owned(),
+            format!("left it at {post}"),
+            "expected 105".to_owned(),
+        ] {
+            assert!(
+                err.contains(&want),
+                "a post-forward offset of {post} after feeding 5 from 100 must be refused \
+                 naming `{want}`; got {err:?}"
+            );
+        }
+    }
+}
+
+/// `n` positions of K or V, `[1, 1, n, 2]`.
+fn rows(n: i32) -> Result<Array> {
+    let data: Vec<f32> = (0..n * 2).map(|i| i as f32).collect();
+    Array::from_f32_slice(&data, &[1, 1, n, 2])
+}
+
+/// A full cache beside a window-4 ring, the shape of a sliding-window model's
+/// attention layers.
+fn full_and_ring() -> Vec<KvCache> {
+    vec![
+        KvCache::with_quant_max_seq_window(KvQuant::None, 64, None),
+        KvCache::with_quant_max_seq_window(KvQuant::None, 64, Some(4)),
+    ]
+}
+
+/// Feed `n` positions to every layer, as one verify forward does.
+fn feed(stack: &mut [KvCache], n: i32) -> Result<()> {
+    for cache in stack.iter_mut() {
+        cache.update(&rows(n)?, &rows(n)?, Device::Cpu)?;
+    }
+    Ok(())
+}
+
+/// Rounds over a real ring keep the stack at one position, across the wrap.
+///
+/// Each step reads the stack through [`stack_offset`], runs the advance check
+/// on what the forward did, and rolls back through [`truncate_kv_to`] to the
+/// position [`rollback_target_from_head`] names. The blocks are 3, 5 and 3
+/// positions on a window of 4, so the ring wraps in the second round and a
+/// partial accept, a full accept and a partial accept run on both sides of it.
+///
+/// Mutation: make the ring report a position other than the logical one, or
+/// make `truncate_kv_to` skip a layer.
+#[test]
+fn a_ring_and_a_full_cache_stay_at_one_position_across_rounds_past_the_wrap() -> Result<()> {
+    let mut stack = full_and_ring();
+    feed(&mut stack, 6)?;
+    assert_eq!(stack_offset(&stack)?, 6, "after the prefill");
+
+    // (positions fed, proposals accepted or None for a full accept)
+    let rounds: [(i32, Option<usize>); 3] = [(3, Some(1)), (5, None), (3, Some(0))];
+    let mut expected = 6;
+    for (round, (fed, accept)) in rounds.into_iter().enumerate() {
+        let pre = stack_offset(&stack)?;
+        assert_eq!(pre, expected, "round {}: before the forward", round + 1);
+        feed(&mut stack, fed)?;
+        let post = stack_offset(&stack)?;
+        guard_round_advance(SpecLoop::MtpAssistant, round + 1, pre, post, fed as usize)?;
+        expected = pre + fed;
+        assert_eq!(post, expected, "round {}: after the forward", round + 1);
+        if let Some(accept) = accept {
+            let target = rollback_target_from_head(pre, accept);
+            truncate_kv_to(&mut stack, target)?;
+            expected = target;
+        }
+        assert_eq!(
+            stack_offset(&stack)?,
+            expected,
+            "round {}: after the rollback",
+            round + 1
+        );
+    }
+    Ok(())
+}
+
+/// A ring that cannot give the rejected tail back refuses the rollback and
+/// moves no layer.
+///
+/// Single-token steps past the wrap rotate the ring in place, so the newest
+/// slots hold the positions they overwrote. The full cache beside it could roll
+/// back, and must not: a stack left half rolled back is how a partial accept
+/// stops reproducing plain greedy.
+///
+/// Mutation: roll the layers that can move before asking the others.
+#[test]
+fn a_ring_that_cannot_roll_back_moves_no_layer() -> Result<()> {
+    let mut stack = full_and_ring();
+    feed(&mut stack, 6)?;
+    for _ in 0..3 {
+        feed(&mut stack, 1)?;
+    }
+    assert_eq!(stack_offset(&stack)?, 9);
+    assert!(
+        stack.get(1).is_some_and(|ring| !ring.can_truncate_to(7)),
+        "fixture: the ring rotated in place must refuse to give two positions back"
+    );
+
+    let err = truncate_kv_to(&mut stack, 7)
+        .err()
+        .map_or_else(String::new, |e| e.to_string());
+    assert!(
+        err.contains("layer 1 holds 9 positions") && err.contains("no layer was"),
+        "the refusal names the layer that cannot move; got {err:?}"
+    );
+    assert_eq!(
+        stack.iter().map(KvCache::offset).collect::<Vec<_>>(),
+        vec![9, 9],
+        "a refused rollback moves no layer"
+    );
+    Ok(())
 }

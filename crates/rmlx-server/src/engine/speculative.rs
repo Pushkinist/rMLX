@@ -561,14 +561,14 @@ impl SpeculativeGenerator {
         let effective_max_ctx: usize = resolved_ctx.ceiling_tokens();
         let context_limits = dispatcher.verifier.context_limits();
 
-        // Fail fast on a codec the verifier's resolved architecture refuses.
-        // The round loop builds the verifier's KV caches itself rather than
-        // going through `Architecture::generate_greedy`, so without this the
-        // only enforcing check would run per request — every request failing
-        // after a fully successful startup. The verifier is the model whose
-        // caches carry the codec, so it is the one to ask.
+        // Fail fast on a codec a model of the pair refuses. The round loop
+        // builds the KV caches itself rather than going through
+        // `Architecture::generate_greedy`, so without this the only enforcing
+        // check would run per request — every request failing after a fully
+        // successful startup. A two-model draft stack runs the verifier's codec,
+        // so the dispatcher asks the draft model too.
         if let Some(kq) = kv_quant_resolved {
-            dispatcher.verifier.validate_kv_quant(kq)?;
+            dispatcher.validate_kv_quant(kq)?;
         }
 
         let declared_block = drafter.declared_block_size();
@@ -691,13 +691,13 @@ impl Generator for SpeculativeGenerator {
             ?kv_quant_override,
             "speculative generate: KV codec for this request"
         );
-        // The round loop below builds the verifier's KV caches directly, so
+        // The round loop below builds the KV caches directly, so
         // this is the enforcing check for the speculative path — the seam in
         // `Architecture::generate_greedy` is never reached from here. It covers
         // the per-request override, which arrives after startup and is
         // otherwise unvalidated.
         if let Some(kq) = kv_quant_override {
-            if let Err(e) = self.dispatcher.verifier.validate_kv_quant(kq) {
+            if let Err(e) = self.dispatcher.validate_kv_quant(kq) {
                 return Box::pin(stream::once(async move { Err(e) }));
             }
         }

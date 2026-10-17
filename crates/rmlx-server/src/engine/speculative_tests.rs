@@ -496,3 +496,40 @@ fn a_grammar_or_media_request_is_refused_as_invalid_input() {
 
     assert!(unsupported_request(false, false).is_none());
 }
+
+/// The server's two codec checks ask the dispatcher, and neither asks the
+/// verifier alone.
+///
+/// The start-up check and the per-request one are the two places a codec enters
+/// a speculative generator. Both must reach the draft model of a two-model pair,
+/// which only the dispatcher holds; a call on `dispatcher.verifier` is the
+/// verifier-only check this replaced, and it would pass every request a draft
+/// model refuses. Read as text off the module's own source, because a generator
+/// cannot be built without two loaded models.
+///
+/// Mutation: restore `dispatcher.verifier.validate_kv_quant(` at either site;
+/// delete either call.
+#[test]
+fn both_codec_checks_ask_the_dispatcher_not_the_verifier_alone() {
+    let code: Vec<&str> = include_str!("speculative.rs")
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with("//"))
+        .collect();
+    let through_dispatcher = code
+        .iter()
+        .filter(|l| l.contains("dispatcher.validate_kv_quant("))
+        .count();
+    assert_eq!(
+        through_dispatcher, 2,
+        "the start-up check and the per-request check each call the dispatcher once"
+    );
+    let verifier_alone: Vec<&&str> = code
+        .iter()
+        .filter(|l| l.contains("verifier.validate_kv_quant("))
+        .collect();
+    assert!(
+        verifier_alone.is_empty(),
+        "a codec check on the verifier alone skips the draft model: {verifier_alone:?}"
+    );
+}

@@ -306,16 +306,8 @@ impl Attention {
             // The post-update K length is `producer_offset + seq` (non-rotating)
             // or the ring-capped `min(max_size-1, producer_offset) + seq`
             // (rotating). `producer_offset` is the **cache-holding layer's own**
-            // `offset()`, which can drift from the model-wide `offset`
-            // (`cache_base_offset`, picked from the first full-attention cache)
-            // by one position across a speculative verify-block rollback: the
-            // rotating sliding cache that drives the round's `v_target` rolls
-            // back with no-op semantics once it wraps, desyncing its reported
-            // offset from the non-rotating producer. RoPE still uses the
-            // model-wide `offset` (absolute position); only the mask's key dim
-            // is bound to the producer's own K length. See
-            // `update_and_sdpa_shared_source` (rotating short-circuit) for the
-            // sibling Mixed-path fix this generalises.
+            // `offset()`. RoPE uses the model-wide `offset` (absolute position);
+            // only the mask's key dim is bound to the producer's own K length.
             if let Some(c) = cache {
                 let producer_offset = c.offset();
                 let effective_offset = producer_effective_offset(
@@ -432,25 +424,17 @@ impl Attention {
             // length (`share.kv_len()`) is the ground truth for how many keys
             // SDPA attends — it is `k.shape()[2]` for a bf16 share and the
             // store's accumulated length for a store-backed one.
-            // Size the mask's key dim from that actual K length, NOT
-            // from the model-wide `offset`: across a speculative
-            // partial-accept verify rollback the producer cache is rolled back
-            // while the model-wide `offset` (`cache_base_offset`, taken from the
-            // first full-attention cache that was NOT rolled back) is not, so
-            // `offset` can be one-or-more positions above the real K length.
-            // Sizing the band from `offset` then yields a mask one key too wide
-            // → the opaque mlx-c SDPA broadcast crash.
+            // Size the mask's key dim from that actual K length, NOT from the
+            // model-wide `offset`: a rotating producer's K length is capped at
+            // `window - 1` plus the new tokens, so `offset + seq` over-sizes the
+            // band once the ring has wrapped → the opaque mlx-c SDPA broadcast
+            // crash.
             //
             // `effective_offset = total_kv_len - seq` (K length minus the
             // newly-projected query tokens) is the symmetric counterpart of the
-            // producer-branch `producer_effective_offset`. In the non-spec path
-            // (no rollback) `total_kv_len == offset + seq` exactly (rotating:
-            // `total_kv_len == offset.min(window-1) + seq`), so
-            // `total_kv_len - seq` reproduces the IDENTICAL effective offset the
-            // old `offset`-based sizing produced — including the rotating cap,
-            // which is already baked into the producer's K length. No regression
-            // on ordinary prefill/decode; the value only diverges (correctly)
-            // when a rollback desynced `offset` from the K it shares.
+            // producer-branch `producer_effective_offset`: `total_kv_len ==
+            // offset + seq` for a non-rotating producer and `offset.min(window-1)
+            // + seq` for a rotating one, so the ring cap is already baked in.
             let (share, producer) = shared_kv.ok_or_else(|| {
                 Error::Model(
                     "Gemma4 attention reached the consumer branch with no shared KV — a layer \
@@ -506,10 +490,7 @@ impl Attention {
 /// Compute the effective mask offset from a **producer cache's own offset**
 /// (not the model-wide `cache_base_offset`).
 ///
-/// This is the single place that sizes it: at a speculative
-/// verify-block step the rotating sliding cache that drove the round's
-/// `v_target` can desync from the non-rotating full-attention producer by one
-/// position across a partial-accept rollback. Using the producer's `c.offset()`
+/// This is the single place that sizes it. Using the producer's `c.offset()`
 /// (not the model-wide `offset` argument) and capping it for rotating caches
 /// keeps the mask key dim equal to the post-update K seq dim.
 ///
@@ -535,8 +516,8 @@ pub(super) fn producer_effective_offset(
 /// is the ground truth. `total_kv_len - seq` is the effective offset: how many
 /// keys precede the newly-projected query tokens. In the non-spec path
 /// (`total_kv_len == offset + seq`) this reproduces the same value as the
-/// old `offset`-based sizing; it only diverges — correctly — when a
-/// partial-accept rollback desynced `offset` from the actual K length.
+/// old `offset`-based sizing; it only diverges — correctly — when the source
+/// cache is a wrapped ring, whose K length is capped at the window.
 ///
 /// Extracted as a named helper symmetric to `producer_effective_offset` so
 /// `mask_tests::guard_invariant_consumer_*` can call it directly and go RED

@@ -40,14 +40,14 @@ use std::time::Instant;
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::Array;
 
-use super::round_common::{cache_stack, lin_cache_stack, rollback_round};
+use super::round_common::{cache_stack, lin_cache_stack, rollback_round, stack_offset};
 use super::round_loop::{
     CacheSpan, Conditioning, Prefilled, ReportSkippedBy, RoundCtx, RoundDrafter, RoundOutcome,
     Seed, Verdict, VerifierOffsetBasis,
 };
 use super::{
     accept_prefix, arm_lin_tapes, draft_decode_n, draft_decode_n_stochastic, draft_rows_to_drop,
-    drafts_per_round, fill_fed, prefill_chunked,
+    drafts_per_round, fill_fed, prefill_chunked, validate_draft_kv_quant,
 };
 use crate::arch::Architecture;
 use crate::sampler::{sample_index, stochastic_accept, AcceptDecision, Pcg32};
@@ -120,10 +120,10 @@ impl<'a> TwoModelRound<'a> {
     }
 
     /// The draft cache's logical position, over the layers that carry one: a
-    /// recurrent layer's `KvCache` never advances, so the maximum is the round's
-    /// and a layer-zero read is not.
-    fn cache_offset(&self) -> i32 {
-        self.kv.iter().map(KvCache::offset).max().unwrap_or(0)
+    /// recurrent layer's `KvCache` never advances, so a layer-zero read is not
+    /// the round's.
+    fn cache_offset(&self) -> Result<i32> {
+        stack_offset(&self.kv)
     }
 }
 
@@ -151,6 +151,7 @@ impl RoundDrafter for TwoModelRound<'_> {
                     .into(),
             ));
         };
+        validate_draft_kv_quant(self.draft.arch_class(), ctx.kv_quant)?;
         self.kv = cache_stack(self.draft, ctx.kv_quant, ctx.max_seq);
         self.lin = self
             .draft
@@ -301,7 +302,7 @@ impl RoundDrafter for TwoModelRound<'_> {
         verdict: &Verdict,
         outcome: RoundOutcome,
     ) -> Result<Option<CacheSpan>> {
-        let before = self.cache_offset();
+        let before = self.cache_offset()?;
         // The drafter's own arm, whose answer is not the round's: `refolded` is
         // reported beside the verifier's target and reads the verifier.
         let _ = rollback_round(
@@ -329,7 +330,7 @@ impl RoundDrafter for TwoModelRound<'_> {
             // Read back off the cache the rollback left rather than restated
             // from the figure it was handed, so the line cross-checks the
             // verifier's target instead of repeating this side's arithmetic.
-            target: self.cache_offset(),
+            target: self.cache_offset()?,
         }))
     }
 

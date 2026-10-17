@@ -323,17 +323,17 @@ The enforcing check is therefore keyed on the **resolved** architecture:
   Gemma4-unified) logs at `debug!` instead.
 
 The check covers the cache of the model that serves the request, or of the
-verifier on a speculative path. There are two production families, and they do
-not share a call graph:
+verifier, and of the draft model of a two-model pair, on a speculative path.
+There are two production families, and they do not share a call graph:
 
 | Path | Cache built by | Enforced at |
 |---|---|---|
 | Non-speculative | per-arch `generate_greedy` (`gemma4`, `gemma3`, `qwen2`, `qwen3`, `qwen3_5_moe`, `qwen3_vl_moe`, `laguna`, `bitnet`), reached on production paths from `Architecture::generate_greedy` / `generate_image` | those two methods, and `ArchGenerator::from_snapshot_with_id` at startup |
-| Speculative | `speculative::round_common::cache_stack` builds the verifier's caches; `Architecture::generate_greedy` is never called | `SpeculativeGenerator::from_snapshots_with_id` at startup, and its per-request `generate` |
+| Speculative | `speculative::round_common::cache_stack` builds the verifier's caches, and the draft model's on a two-model pair; `Architecture::generate_greedy` is never called | `SpeculativeGenerator::from_snapshots_with_id` at startup, and its per-request `generate`, through `SpeculativeDispatcher::validate_kv_quant` |
 
 The MTP and Eagle3 drafter caches use `KvQuant::None`, which every arch
 accepts. The two-model paths build the draft model's stack with the verifier's
-codec, and only the verifier is checked.
+codec, so the check asks the draft model's resolved class too.
 
 The CLI resolver (`rmlx-cli` `resolve_kv_quant`) reads the dispatch class
 (`ModelConfig::dispatch_arch`), because it runs before the model loads. It exits 78 on a rejected

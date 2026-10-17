@@ -171,7 +171,7 @@ fn the_drafter_rolls_its_own_caches_back_and_reads_its_target_back() {
          loop times its rollback across the call, and one inside `verify` runs before \
          the round's acceptance is committed"
     );
-    let targets = lines_in_fns(ROUND_SRC, "target: self.cache_offset(),");
+    let targets = lines_in_fns(ROUND_SRC, "target: self.cache_offset()?,");
     assert_eq!(
         targets.len(),
         1,
@@ -366,7 +366,7 @@ fn the_span_opens_on_the_read_taken_before_the_rollback() {
     );
     let (first, _) = reads.first().expect("two reads, asserted above");
     assert_eq!(
-        *first, "let before = self.cache_offset();",
+        *first, "let before = self.cache_offset()?;",
         "the first read is the one the span opens on, taken before anything is \
          dropped, and this drafter takes `{first}` — a read taken after the rollback \
          reports a span of nothing on every partial round"
@@ -506,5 +506,40 @@ fn the_stochastic_rule_commits_the_prefix_and_one_token_the_verifier_stands_behi
         stochastic_prefix(&[spread(0), spread(1), point(3)], &[], &[0, 1], &mut rng).is_err(),
         "a round whose proposal distributions were already taken has nothing to test \
          its proposals against"
+    );
+}
+
+/// The draft model is asked about the request's codec in `prefill`, before its
+/// cache stack is built at that codec.
+///
+/// The server's start-up and per-request checks go through the dispatcher and
+/// cover the requests that reach the server. A library caller reaches this
+/// drafter directly, and the draft stack is the one place the codec lands on the
+/// draft model; a refusal after the stack is built would be a refusal after the
+/// verifier's prefill had already run.
+///
+/// Mutation: delete the check; move it below `cache_stack`.
+#[test]
+fn the_draft_model_is_asked_about_the_codec_before_its_stack_is_built() {
+    let checks = lines_in_fns(ROUND_SRC, "validate_draft_kv_quant(self.draft.arch_class()");
+    assert_eq!(
+        checks
+            .iter()
+            .map(|(_, owner)| owner.as_str())
+            .collect::<Vec<_>>(),
+        vec!["prefill"],
+        "the draft model's codec check is `prefill`'s alone: {checks:?}"
+    );
+    let line_of = |needle: &str| {
+        ROUND_SRC
+            .lines()
+            .position(|l| is_code(l) && l.contains(needle))
+    };
+    let check = line_of("validate_draft_kv_quant(self.draft.arch_class(), ctx.kv_quant)?;");
+    let stack = line_of("self.kv = cache_stack(self.draft");
+    assert!(
+        check.is_some() && stack.is_some() && check < stack,
+        "the check takes the request's resolved codec and runs before the draft stack \
+         is built at it: check at {check:?}, stack at {stack:?}"
     );
 }

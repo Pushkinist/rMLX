@@ -30,8 +30,9 @@ both before any cache stack exists. It then builds a `RoundCfg` and calls
 1. builds the verifier's cache stack and, on a hybrid, its recurrent stack;
 2. calls `prefill`, and emits the seed if the drafter drew one;
 3. per round: reads the stop of the request (`ensure_not_cancelled`), narrows
-   the block (`block`), proposes (`propose`), refuses an
-   empty chain, arms the recurrent tape, verifies (`verify`), bounds the
+   the block (`block`), proposes (`propose`), refuses an empty chain, arms the
+   recurrent tape, verifies (`verify`), refuses a forward that did not advance
+   the verifier's stack by the positions the round fed, bounds the
    reduced-vocabulary prefix, emits the commit, rolls the verifier back to the
    accepted prefix, then calls the drafter's `rollback`, `condition` and
    `carry`, and writes one round event;
@@ -44,10 +45,14 @@ record and no resident-KV report.
 
 The loop owns every step that is the same for all drafters. The rollback
 target is always computed from the offset read before the verify forward
-(`rollback_target_from_head`). The carry token for the next round has one
-producer: the loop reads it off the commit and hands it over in
-`RoundOutcome::carry`. The recurrent tape is armed by the loop, because the
-loop's own rollback is the tape's only consumer.
+(`rollback_target_from_head`). Both reads of the verifier's offset come from
+one function, `stack_offset`: layers that never advance (recurrent layers and
+shared-KV consumers, which stand at 0) are skipped, and layers that advance
+must all stand at one position, or the read is an error naming the first two
+that part. The carry token for the next round has one producer: the loop reads
+it off the commit and hands it over in `RoundOutcome::carry`. The recurrent
+tape is armed by the loop, because the loop's own rollback is the tape's only
+consumer.
 
 ## The interface
 
@@ -159,7 +164,9 @@ declared it would not.
 before the verify forward; the others report the read after it. The loop
 computes the target from the pre-forward read in either case. The two reads
 name the same position only if the forward advanced the offset by exactly what
-the round fed; see "What the interface cannot express".
+the round fed, that is `post == pre + fed`. `guard_round_advance` enforces it
+after `verify` and before the round emits a token, and refuses the round with
+the offsets it saw.
 
 **`prefill_ns`.** Each drafter times its own prefill, because what the span
 covers differs. The loop does not time the call.
@@ -186,12 +193,6 @@ the request.
 
 ## What the interface cannot express
 
-- **An offset check.** Nothing asserts that the verify forward advanced the
-  verifier's offset by exactly the positions the round fed, and the loop does
-  not refuse a round whose pre- and post-forward reads disagree. A drafter
-  that reports the post-forward read then reports a position the rollback did
-  not use. `the_rollback_target_retains_the_carry_and_the_accepted_prefix` in
-  `round_skeleton_tests.rs` pins the target arithmetic only.
 - **A fresh resident-KV figure on every request.** The report has one writer,
   so a request that skips it leaves the previous request's figure readable.
 - **The widest block on the seed exit.** The seed exit returns the resolved
@@ -244,10 +245,10 @@ A byte-identical greedy answer is not evidence for a draft-side change; see
 `crates/rmlx-models/src/speculative/round_skeleton_tests.rs` reads the loop's
 source. `DISPOSITIONS` states, per drafter, which exit skips the report, how the
 empty chain is refused and which offset the round line reports. The marker
-reading holds `round_loop.rs` to the pattern `SPEWGRIP`: the seed guard, the
+reading holds `round_loop.rs` to the pattern `SPEWGARIP`: the seed guard, the
 seed exit's report and return, the round loop, the empty-chain refusal, the
-tail record, its guard and its report. It reads statement order, not
-reachability or arguments.
+round-advance check, the tail record, its guard and its report. It reads
+statement order, not reachability or arguments.
 
 ## What no runtime check sees
 
@@ -263,6 +264,7 @@ Each row is a defect that leaves every observable above green.
 | The empty-chain refusal lost | The acceptance walk answers an empty chain instead of refusing it, and the round emits one token. The marker reading catches the deleted text, not the behaviour |
 | The loop times `prefill` itself | The drafters' spans differ, so records move, and the figure has no bound |
 | The seed attributed to the reduced vocabulary | The seed is the verifier's own argmax on both arms, and no reader checks `decided_by[0]` |
+| A verifier layer that should advance but stands at 0 for the whole request | `stack_offset` skips layers at 0, because a recurrent layer and a shared-KV consumer stand there by design. Only a layer plan could tell the two apart. The converse also holds: a verifier stack with no advancing layer stands at 0 before and after the forward, so `guard_round_advance` would refuse every round of it |
 
 The resident-KV row would need a request-level test with two loaded models,
 under `make gpu-test`.

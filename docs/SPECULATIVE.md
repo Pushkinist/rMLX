@@ -451,8 +451,10 @@ weight is read:
 stochastic rule indexes `p` and `q` by one id.
 
 The draft model's cache stack is built at the verifier's codec and context
-ceiling (`round_common::cache_stack`). Only the verifier's codec goes through
-the server's KV codec validation.
+ceiling (`round_common::cache_stack`). The server checks that codec against the
+architecture class of both models, at start-up and for a per-request override,
+through `SpeculativeDispatcher::validate_kv_quant`. A pair whose draft model
+refuses the codec is refused, and the error names the draft's class.
 
 `crates/rmlx-models/tests/two_model_stochastic.rs` checks that the stochastic
 rule runs: one seed reproduces one sequence, and a second seed and temperature 0

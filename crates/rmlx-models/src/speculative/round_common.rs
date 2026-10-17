@@ -84,6 +84,65 @@ pub(crate) fn cache_stack(arch: &Architecture, kv_quant: KvQuant, max_seq: i32) 
         .collect()
 }
 
+/// The position a cache stack stands at: the one offset its layers share.
+///
+/// A layer at 0 is skipped. A recurrent layer keeps its state outside the cache
+/// and a shared-KV consumer layer owns none, so neither ever advances. Every
+/// other layer must stand where the first of them does; a layer that does not
+/// is a stack the loop cannot roll back as one, and a `.max()` would hide it.
+///
+/// # Errors
+///
+/// [`Error::Model`] naming the first advancing layer and the first layer that
+/// stands elsewhere.
+pub(crate) fn stack_offset(kv: &[KvCache]) -> Result<i32> {
+    let mut shared: Option<(usize, i32)> = None;
+    for (layer, cache) in kv.iter().enumerate() {
+        let offset = cache.offset();
+        if offset == 0 {
+            continue;
+        }
+        match shared {
+            None => shared = Some((layer, offset)),
+            Some((first, at)) if offset != at => {
+                return Err(Error::Model(format!(
+                    "the KV stack's layers disagree on the position: layer {first} stands at \
+                     {at} and layer {layer} at {offset}"
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(shared.map_or(0, |(_, at)| at))
+}
+
+/// Refuse a round whose verify forward did not advance the verifier's stack by
+/// the positions the round fed.
+///
+/// The rollback target, the recurrent refold and the round line all count from
+/// `pre_round_offset + fed`, so a forward that left the stack anywhere else
+/// leaves them describing a position the stack is not at.
+///
+/// # Errors
+///
+/// [`Error::Model`] when `post_round_offset` is not `pre_round_offset + fed`.
+pub(crate) fn guard_round_advance(
+    loop_kind: SpecLoop,
+    round: usize,
+    pre_round_offset: i32,
+    post_round_offset: i32,
+    fed: usize,
+) -> Result<()> {
+    let expected = pre_round_offset + fed as i32;
+    if post_round_offset != expected {
+        return Err(Error::Model(format!(
+            "{loop_kind:?}: round {round} fed {fed} positions to the verifier at offset \
+             {pre_round_offset} and left it at {post_round_offset}, expected {expected}"
+        )));
+    }
+    Ok(())
+}
+
 /// One model's recurrent linear-attention state, one entry per layer.
 ///
 /// Empty at the start of a request and grown by the forward: the state has no
