@@ -39,11 +39,17 @@ DTYPE_LABELS = {"bfloat16": "bf16", "float16": "fp16"}
 
 
 def split_model_dir(name):
-    """`ns__model` → (ns, model); a bare name is namespaced `local`."""
-    if "__" in name:
-        namespace, model = name.split("__", 1)
-        return namespace, model
-    return "local", name
+    """`ns__model` → (ns, model); a bare name is namespaced `local`.
+
+    The namespace is a free-form label recorded as given; an empty part is
+    refused with ValueError, as the Rust `identity::split_model_path` does.
+    """
+    if "__" not in name:
+        return "local", name
+    namespace, model = name.split("__", 1)
+    if not namespace or not model:
+        raise ValueError(f"{name!r}: model_namespace and model must not be empty")
+    return namespace, model
 
 
 def weight_quant(config):
@@ -74,7 +80,11 @@ def main():
     args = parser.parse_args()
 
     path = args.snapshot.rstrip("/")
-    namespace, model = split_model_dir(os.path.basename(path))
+    try:
+        namespace, model = split_model_dir(os.path.basename(path))
+    except ValueError as exc:
+        print(f"snapshot_identity: {exc}", file=sys.stderr)
+        return 2
 
     try:
         with open(os.path.join(path, "config.json"), encoding="utf-8") as handle:

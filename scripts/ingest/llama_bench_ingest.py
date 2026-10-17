@@ -70,6 +70,8 @@ from typing import Any
 
 # rMLX repo root: this file lives at scripts/ingest/llama_bench_ingest.py.
 _SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(_SCRIPT_DIR.parent / "lib"))
+from snapshot_identity import split_model_dir  # noqa: E402
 RMLX_REPO_ROOT = Path(os.environ.get("RMLX_REPO_ROOT", str(_SCRIPT_DIR.parents[1])))
 _BUFFER_PENDING = RMLX_REPO_ROOT / "metrics" / "buffer" / "pending"
 _BUFFER_FAILED = RMLX_REPO_ROOT / "metrics" / "buffer" / "failed"
@@ -145,12 +147,6 @@ def _map_kv_quant(type_k: str, type_v: str) -> str:
 
 # ── Model path parsing (§5.1) ──────────────────────────────────────────────────
 
-_NAMESPACE_WHITELIST = frozenset([
-    "mlx-community", "z-lab", "prism-ml", "paramind", "paro-team",
-    "ollama", "hf", "local",
-])
-
-
 def _split_model_path(model_filename: str) -> tuple[str, str]:
     """Split a model_filename into (model_namespace, model) per §5.1 rules.
 
@@ -162,20 +158,14 @@ def _split_model_path(model_filename: str) -> tuple[str, str]:
     p = Path(model_filename.strip())
 
     if p.is_absolute() or model_filename.startswith("~"):
-        # Filesystem path: inspect the parent directory name (the model dir),
-        # or the file stem if directly a .gguf in root.
-        # Walk up to find a directory name containing '__'.
-        for part in reversed(p.parts):
-            if "__" in part:
-                ns, mdl = part.split("__", 1)
-                # Strip GGUF extension from mdl if present.
-                mdl = mdl.removesuffix(".gguf")
-                if ns in _NAMESPACE_WHITELIST:
-                    return ns, mdl
-                # Unknown namespace → fall through to local.
-                break
-        # No namespaced directory found: use basename without extension.
-        stem = p.stem if p.suffix else p.name
+        # Only the file's own name and its immediate parent (the snapshot
+        # directory) are read, never an ancestor: a path such as
+        # `/tmp/run__3/snap/model.gguf` must not file the run under `run`.
+        stem = p.name.removesuffix(".gguf")
+        names = [stem, p.parent.name] if p.name.endswith(".gguf") else [stem]
+        for name in names:
+            if "__" in name:
+                return split_model_dir(name)
         return "local", stem
 
     # HF id: one slash, no leading slash.

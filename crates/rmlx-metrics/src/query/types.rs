@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 pub struct Cell {
     /// Canonical backend identifier (e.g. `"rmlx"`, `"mlx_lm"`).
     pub backend: String,
-    /// Model namespace from the identity whitelist.
+    /// Model namespace: a free-form label.
     pub model_namespace: String,
     /// Model repository name within the namespace.
     pub model: String,

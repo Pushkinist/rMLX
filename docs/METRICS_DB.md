@@ -62,19 +62,27 @@ ollama tag:
 | ollama tag `llama3.2:3b` | `ollama` | `llama3.2:3b` |
 | HF id `meta-llama/Llama-3.2-3B-Instruct` | `hf` | `meta-llama/Llama-3.2-3B-Instruct` |
 
-A path's namespace must be in `identity::NAMESPACE_WHITELIST`:
-`mlx-community`, `z-lab`, `prism-ml`, `paramind`, `paro-team`, `ollama`,
-`hf`, `local`. Any other input is an error. `rmlx baseline`, `rmlx eval` and
-`rmlx metrics migrate` use this strict form, because their caller can fix
-the path.
+A path's namespace is a free-form label, recorded as given: a host this
+binary has never heard of records under its own name. Only an empty part is an
+error; a space inside a label is kept. `rmlx baseline`, `rmlx eval` and
+`rmlx metrics migrate` use this form, because their caller can fix the path.
+`rmlx baseline --record` and `rmlx eval ppl --corpus` resolve the identity
+(`model_namespace`, `model` and the §5.2 `weight_quant`) before loading the
+model, so a refusal costs seconds and not the run.
+
+The Python ingesters (`scripts/ingest/llama_bench_ingest.py`,
+`codec_inertness_ingest.py`) split with `split_model_dir` in
+`scripts/lib/snapshot_identity.py`, reading only the snapshot directory name
+and never an ancestor. Before this rule they filed an unlisted namespace as
+`local/<name>`; new rows file as `<namespace>/<model>`, a separate `bests`
+cell. `observations` is append-only, so the old rows stay where they are.
 
 `identity::split_model_id` is the lenient form that `RunRecordBuilder::rmlx`
 uses. It splits a snapshot name on its first `__` and falls back to `local`.
 
-**Ingest does not check either field against a list.** They are free-form
-labels, like `kv_quant` (§5.3), so a new host or a renamed fine-tune still
-records. `rmlx metrics doctor` does sweep `model_namespace` against
-`NAMESPACE_WHITELIST` and reports a value outside it as an error (§10.4).
+**Neither field is checked against a list**, by ingest or by `rmlx metrics
+doctor`. They are free-form labels, like `kv_quant` (§5.3), so a new host or a
+renamed fine-tune still records.
 
 ### 5.2 `weight_quant` canonicalization
 
@@ -643,8 +651,8 @@ do not fail it.
 3b. `bests` against the `METRICS_SCHEMA.md` §4 registry. The view is generated, so a DB at the
     latest version can still hold one built from an older registry. Warning;
     `--fix` rebuilds it.
-4. Whitelist sweep of `observations`: `backend`, `model_namespace` and
-   `weight_quant` against their §5 lists, and `metric` against the registry.
+4. Whitelist sweep of `observations`: `backend` and `weight_quant`
+   against their §5 lists, and `metric` against the registry.
    Error, naming the value and a row id. The `kv_quant` sweep cannot fail,
    because the field is free-form (§5.3).
 5. `direction` against the registry. Error; `--fix` corrects it, and the

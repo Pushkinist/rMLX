@@ -146,11 +146,10 @@ fn build_record_git_sha_survives_stamp_json() {
 
     let rec = build_run_record(
         "20260526-120000-0.2.8",
-        &model_dir,
+        &resolve_record_identity(&model_dir).expect("identity"),
         &args,
         "fallback-label",
         "prompt text",
-        "bf16",
         16,
         8,
         4096,
@@ -190,11 +189,10 @@ fn build_record_git_sha_absent_is_null() {
 
     let rec = build_run_record(
         "20260526-120000-0.2.8",
-        &model_dir,
+        &resolve_record_identity(&model_dir).expect("identity"),
         &args,
         "fallback-label",
         "prompt text",
-        "bf16",
         16,
         8,
         4096,
@@ -231,11 +229,10 @@ fn build_record_git_sha_blank_string_is_null() {
 
     let rec = build_run_record(
         "20260526-120000-0.2.8",
-        &model_dir,
+        &resolve_record_identity(&model_dir).expect("identity"),
         &args,
         "fallback-label",
         "prompt text",
-        "bf16",
         16,
         8,
         4096,
@@ -647,4 +644,60 @@ fn raw_text_branch_is_byte_identical_to_direct_encode() {
         .get_ids()
         .to_vec();
     assert_eq!(actual, expected);
+}
+
+/// `run_baseline` with `--record` resolves the identity before reading the
+/// prompt or loading a model: neither exists here, so reaching either would
+/// fail with a different message.
+fn run_baseline_recording(model_dir: &Path, root: &Path) -> anyhow::Result<()> {
+    let sink = EventRecorder::open_at(&root.join("events.db"), "run").expect("event db");
+    run_baseline(
+        model_dir,
+        &root.join("no-such-prompt.txt"),
+        &ClaimedDevice::cpu(),
+        "cpu",
+        8,
+        "20260526-120000-deadbeef",
+        "label",
+        None,
+        None,
+        None,
+        false,
+        None,
+        false,
+        &sink,
+        Some(BaselineRecordArgs {
+            label: None,
+            prompt_id: None,
+            prompt_body: None,
+            kv_quant: rmlx_kv_quant::KvQuant::None,
+            git_sha: None,
+        }),
+    )
+}
+
+#[test]
+fn baseline_refuses_an_unrecordable_identity_before_any_work() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let err = run_baseline_recording(&tmp.path().join("__m"), tmp.path())
+        .expect_err("identity is refused");
+    let msg = err.to_string();
+    assert!(msg.contains("model_namespace"), "{msg}");
+    assert!(!msg.contains("cannot read prompt file"), "{msg}");
+}
+
+#[test]
+fn baseline_refuses_an_unrecordable_weight_quant_before_any_work() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model_dir = tmp.path().join("host__m");
+    std::fs::create_dir_all(&model_dir).expect("mkdir snapshot");
+    std::fs::write(
+        model_dir.join("config.json"),
+        r#"{"quantization": {"group_size": 64, "bits": 7}}"#,
+    )
+    .expect("write config.json");
+    let err = run_baseline_recording(&model_dir, tmp.path()).expect_err("weight_quant is refused");
+    let msg = err.to_string();
+    assert!(msg.contains("weight_quant"), "{msg}");
+    assert!(!msg.contains("cannot read prompt file"), "{msg}");
 }

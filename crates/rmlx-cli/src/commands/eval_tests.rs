@@ -13,7 +13,7 @@ fn build_record_includes_ppl_op_name() {
     };
     let rec = build_ppl_run_record(
         "20260526-120000-deadbeef",
-        &model_dir,
+        &resolve_record_identity(&model_dir).expect("identity"),
         "wikitext-2",
         4096,
         2048,
@@ -21,7 +21,6 @@ fn build_record_includes_ppl_op_name() {
         &report,
         123.4,
         7777.0,
-        "2bit",
         None,
         None,
         None,
@@ -60,7 +59,7 @@ fn build_record_stamps_identity_from_the_single_source() {
     };
     let rec = build_ppl_run_record(
         "20260526-120000-0.2.8",
-        &model_dir,
+        &resolve_record_identity(&model_dir).expect("identity"),
         "wikitext-2",
         16,
         8,
@@ -68,7 +67,6 @@ fn build_record_stamps_identity_from_the_single_source() {
         &report,
         0.0,
         0.0,
-        "bf16",
         Some("cafebabe"),
         None,
         None,
@@ -100,7 +98,7 @@ fn build_record_git_sha_absent_is_null() {
     };
     let rec = build_ppl_run_record(
         "20260526-120000-0.2.8",
-        &model_dir,
+        &resolve_record_identity(&model_dir).expect("identity"),
         "wikitext-2",
         16,
         8,
@@ -108,7 +106,6 @@ fn build_record_git_sha_absent_is_null() {
         &report,
         0.0,
         0.0,
-        "bf16",
         None,
         None,
         None,
@@ -133,7 +130,7 @@ fn build_record_git_sha_blank_string_is_null() {
     };
     let rec = build_ppl_run_record(
         "20260526-120000-0.2.8",
-        &model_dir,
+        &resolve_record_identity(&model_dir).expect("identity"),
         "wikitext-2",
         16,
         8,
@@ -141,7 +138,6 @@ fn build_record_git_sha_blank_string_is_null() {
         &report,
         0.0,
         0.0,
-        "bf16",
         Some(""),
         None,
         None,
@@ -169,7 +165,7 @@ fn build_record_reports_the_codec_and_boundary_it_scored_at() {
     let build = |kv: Option<rmlx_kv_quant::KvQuant>, dc: Option<&str>| {
         build_ppl_run_record(
             "20260526-120000-0.2.8",
-            &model_dir,
+            &resolve_record_identity(&model_dir).expect("identity"),
             "wikitext-2",
             16,
             8,
@@ -177,7 +173,6 @@ fn build_record_reports_the_codec_and_boundary_it_scored_at() {
             &report,
             0.0,
             0.0,
-            "bf16",
             None,
             kv,
             dc,
@@ -237,7 +232,7 @@ fn the_scorer_mode_is_not_a_decode_config_term() {
     };
     let rec = build_ppl_run_record(
         "20260526-120000-0.2.8",
-        &model_dir,
+        &resolve_record_identity(&model_dir).expect("identity"),
         "wikitext-2",
         16,
         8,
@@ -245,7 +240,6 @@ fn the_scorer_mode_is_not_a_decode_config_term() {
         &report,
         0.0,
         0.0,
-        "bf16",
         None,
         Some(rmlx_kv_quant::KvQuant::Iso3Sym),
         None,
@@ -261,5 +255,80 @@ fn the_scorer_mode_is_not_a_decode_config_term() {
     assert!(
         names.contains(&"ppl_wikitext2_cached"),
         "the cached scorer names its own metric: {names:?}"
+    );
+}
+
+/// An identity that cannot be recorded stops the run before the corpus is read
+/// or a model is loaded: the corpus path and the model directory here do not
+/// exist, so reaching either would fail with a different message.
+#[test]
+fn ppl_refuses_an_unrecordable_identity_before_any_work() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model_dir = tmp.path().join("__m");
+    let err = run_ppl(
+        &model_dir,
+        &tmp.path().join("no-such-corpus.txt"),
+        4096,
+        2048,
+        "wikitext-2",
+        &ClaimedDevice::cpu(),
+        0,
+        "20260526-120000-deadbeef",
+        None,
+        None,
+    )
+    .expect_err("identity is refused");
+    let msg = err.to_string();
+    assert!(msg.contains("model_namespace"), "{msg}");
+    assert!(!msg.contains("cannot read text file"), "{msg}");
+}
+
+fn snapshot_with_quant_bits(root: &Path, name: &str, bits: u8) -> PathBuf {
+    let dir = root.join(name);
+    std::fs::create_dir_all(&dir).expect("mkdir snapshot");
+    std::fs::write(
+        dir.join("config.json"),
+        format!(r#"{{"quantization": {{"group_size": 64, "bits": {bits}}}}}"#),
+    )
+    .expect("write config.json");
+    dir
+}
+
+/// A bit width the metrics DB has no label for would be refused at ingest,
+/// after the run: it must stop the run before the corpus is read.
+#[test]
+fn ppl_refuses_an_unrecordable_weight_quant_before_any_work() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model_dir = snapshot_with_quant_bits(tmp.path(), "host__m", 7);
+    let err = run_ppl(
+        &model_dir,
+        &tmp.path().join("no-such-corpus.txt"),
+        4096,
+        2048,
+        "wikitext-2",
+        &ClaimedDevice::cpu(),
+        0,
+        "20260526-120000-deadbeef",
+        None,
+        None,
+    )
+    .expect_err("weight_quant is refused");
+    let msg = err.to_string();
+    assert!(msg.contains("weight_quant"), "{msg}");
+    assert!(!msg.contains("cannot read text file"), "{msg}");
+}
+
+#[test]
+fn record_identity_carries_the_snapshot_weight_quant() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model_dir = snapshot_with_quant_bits(tmp.path(), "host__m", 4);
+    let id = resolve_record_identity(&model_dir).expect("identity");
+    assert_eq!(
+        (
+            id.namespace.as_str(),
+            id.model.as_str(),
+            id.weight_quant.as_str()
+        ),
+        ("host", "m", "4bit")
     );
 }

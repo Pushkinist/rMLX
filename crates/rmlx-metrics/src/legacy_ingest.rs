@@ -64,7 +64,7 @@ pub struct LegacyRunRecord {
     /// Semver string of the backend binary, if present.
     #[serde(default)]
     pub backend_version: Option<String>,
-    /// Model namespace from the identity whitelist.
+    /// Model namespace: a free-form label.
     pub model_namespace: String,
     /// Old field name. §8.5 uses `model`.
     pub model_name: String,
@@ -254,7 +254,7 @@ pub struct LegacyCbbRecord {
     /// Backend version string, if present.
     #[serde(default)]
     pub backend_version: Option<String>,
-    /// Model namespace from the identity whitelist.
+    /// Model namespace: a free-form label.
     pub model_namespace: String,
     /// Model repository name within the namespace.
     pub model: String,

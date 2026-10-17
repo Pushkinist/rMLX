@@ -55,29 +55,55 @@ fn split_model_path_local_finetune() {
 }
 
 #[test]
-fn split_model_path_unknown_namespace_errors() {
-    let err = split_model_path("/x/foo__bar").unwrap_err();
-    match err {
-        Error::IdentityNotInWhitelist { field, value, .. } => {
-            assert_eq!(field, "model_namespace");
-            assert_eq!(value, "foo");
-        }
-        Error::MissingBackendVersion { .. }
-        | Error::Sqlite(_)
-        | Error::Io(_)
-        | Error::Schema(_)
-        | Error::IdentityModelPath(_)
-        | Error::UnknownMetric(_)
-        | Error::ImplausibleValue { .. }
-        | Error::UnknownDirection(_)
-        | Error::InvalidTimestamp(_)
-        | Error::InvalidPrompt(_)
-        | Error::NoMeasurements
-        | Error::InvalidIngestField { .. }
-        | Error::Recorder(_)
-        | Error::Query(_)
-        | Error::Scope(_) => panic!("unexpected error: {err}"),
+fn split_model_path_records_an_unlisted_namespace_as_given() {
+    let (ns, model) =
+        split_model_path("/opt/open-models/lmstudio-community__Qwen3.8-27B-MLX-5bit").unwrap();
+    assert_eq!(ns, "lmstudio-community");
+    assert_eq!(model, "Qwen3.8-27B-MLX-5bit");
+}
+
+#[test]
+fn split_model_path_refuses_an_empty_label() {
+    for path in ["/x/__model", "/x/ns__"] {
+        let err = split_model_path(path).unwrap_err();
+        assert!(
+            matches!(err, Error::IdentityModelPath(_)),
+            "{path}: unexpected error {err}"
+        );
     }
+}
+
+#[test]
+fn a_label_with_a_space_is_recorded_in_both_branches() {
+    assert_eq!(
+        split_model_path("/x/my host__my model").unwrap(),
+        ("my host".to_string(), "my model".to_string())
+    );
+    assert_eq!(
+        split_model_path("/x/my finetune").unwrap(),
+        ("local".to_string(), "my finetune".to_string())
+    );
+}
+
+#[test]
+fn snapshot_identity_resolves_an_unlisted_namespace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("brand-new-host__m-4bit");
+    std::fs::create_dir(&dir).unwrap();
+    let (ns, model) = snapshot_identity(&dir).unwrap();
+    assert_eq!(ns, "brand-new-host");
+    assert_eq!(model, "m-4bit");
+}
+
+#[test]
+fn snapshot_identity_refuses_an_unrecordable_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("__m");
+    std::fs::create_dir(&dir).unwrap();
+    assert!(matches!(
+        snapshot_identity(&dir).unwrap_err(),
+        Error::IdentityModelPath(_)
+    ));
 }
 
 // --- canonicalize ---

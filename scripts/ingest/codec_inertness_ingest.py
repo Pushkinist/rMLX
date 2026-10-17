@@ -53,6 +53,7 @@ from typing import Any
 _SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPT_DIR.parent / "lib"))
 from kv_boundary_default import kv_boundary_default  # noqa: E402
+from snapshot_identity import split_model_dir  # noqa: E402
 RMLX_REPO_ROOT = Path(os.environ.get("RMLX_REPO_ROOT", str(_SCRIPT_DIR.parents[1])))
 # Runtime state lives under a single root (CLAUDE.md). `RMLX_HOME` wins; the
 # in-repo `.rmlx/` is the dev default.
@@ -63,10 +64,8 @@ BUFFER_PENDING = RMLX_HOME / "metrics" / "buffer" / "pending"
 # `--replay-pending` sweep will claim and quarantine if it cannot ingest.
 STAGING = RMLX_HOME / "bench" / "codec_inertness" / "records"
 
-# The probe's model column is a snapshot directory name. Split it the way the
-# identity columns want it: `<namespace>__<model>`.
-NAMESPACES = {"mlx-community", "z-lab", "prism-ml", "paramind", "paro-team"}
-
+# The probe's model column is a snapshot directory name, split by
+# `split_model_dir` into the identity columns `<namespace>__<model>`.
 # §5.2 whitelist tokens, most specific first — same order as
 # `rmlx_metrics::identity::infer_weight_quant`, which this mirrors on purpose so
 # a row ingested here lands in the same cell as one the binary recorded.
@@ -74,15 +73,6 @@ WEIGHT_QUANT_TOKENS = [
     "mxfp8", "mxfp4", "nvfp4", "q4_k_m", "q8_0",
     "8bit", "4bit", "2bit", "3bit", "5bit", "6bit", "fp16", "bf16", "paro",
 ]
-
-
-def split_model(dirname: str) -> tuple[str, str]:
-    """`mlx-community__gemma-4-e2b-it-mxfp8` -> (`mlx-community`, `gemma-...`)."""
-    if "__" in dirname:
-        ns, model = dirname.split("__", 1)
-        if ns in NAMESPACES:
-            return ns, model
-    return "local", dirname
 
 
 def weight_quant_of(model: str) -> str:
@@ -143,7 +133,7 @@ def prompt_for(fixture_tokens: int, prompts_dir: Path) -> tuple[str, str]:
 
 
 def build_record(row: dict[str, str], args: argparse.Namespace, prompts_dir: Path) -> dict[str, Any]:
-    namespace, model = split_model(row["model"])
+    namespace, model = split_model_dir(row["model"])
     fixture_tokens = int(row["prompt_tokens"])
     # The fixture NAME is not a token count: the chat template pushes a
     # `longctx_32k` prompt to 34 355 tokens on gemma-4. Recording the name in

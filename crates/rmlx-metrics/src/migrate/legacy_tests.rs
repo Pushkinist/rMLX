@@ -327,17 +327,17 @@ fn migrate_csv_skips_failed_runs() {
 }
 
 #[test]
-fn migrate_unknown_namespace_logs_and_skips_row() {
+fn migrate_empty_namespace_logs_and_skips_row() {
     let prompt_dir = make_prompt_dir();
     let opts = default_opts_with_prompt_dir(prompt_dir.path());
     let prompt = load_prompt_file(&prompt_dir.path().join("longctx_4k.json")).unwrap();
     let mut conn = test_conn();
 
-    // `unknown-ns` is not in the namespace whitelist.
+    // An empty namespace is not a recordable label.
     let line = json!({
         "run_id": "20260510-030329-abc1234",
         "ts_utc": "2026-05-10T03:03:29Z",
-        "model_path": "/x/unknown-ns__some-model-mxfp8",
+        "model_path": "/x/__some-model-mxfp8",
         "kv_quant": "k8v8",
         "decode_tps_mean": 50.0,
         "decode_tps_stddev": 1.0,
@@ -355,12 +355,12 @@ fn migrate_unknown_namespace_logs_and_skips_row() {
         &opts,
         &mut MigrateReport::default(),
     );
-    assert!(result.is_err(), "unknown namespace must return Err");
+    assert!(result.is_err(), "empty namespace must return Err");
 
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM observations", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(count, 0, "no observations added for unknown namespace");
+    assert_eq!(count, 0, "no observations added for empty namespace");
 }
 
 #[test]

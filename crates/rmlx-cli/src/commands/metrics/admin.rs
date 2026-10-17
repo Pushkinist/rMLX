@@ -132,11 +132,6 @@ pub(super) fn cmd_doctor(db_path: &Path, fix: bool) -> anyhow::Result<()> {
         let checks: &[(&str, &str, &[&str])] = &[
             ("backend", "backend", identity::BACKEND_WHITELIST),
             (
-                "model_namespace",
-                "model_namespace",
-                identity::NAMESPACE_WHITELIST,
-            ),
-            (
                 "weight_quant",
                 "weight_quant",
                 identity::WEIGHT_QUANT_WHITELIST,

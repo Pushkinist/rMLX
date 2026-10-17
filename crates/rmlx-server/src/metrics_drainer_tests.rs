@@ -86,7 +86,7 @@ fn split_model_id_with_separator() {
 #[test]
 fn split_model_id_no_separator() {
     let (ns, name) = rmlx_metrics::identity::split_model_id("my-model");
-    assert_eq!(ns, "local"); // "local" is always in NAMESPACE_WHITELIST
+    assert_eq!(ns, "local");
     assert_eq!(name, "my-model");
 }
 

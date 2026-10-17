@@ -379,6 +379,12 @@ pub(crate) fn run_baseline(
     record_args: Option<BaselineRecordArgs<'_>>,
 ) -> anyhow::Result<()> {
     let device = claimed.device();
+    // Resolved before any work: a run whose identity cannot be recorded stops here.
+    let identity = if record_args.is_some() && rmlx_metrics::mode::observations_enabled() {
+        Some(resolve_record_identity(model_path)?)
+    } else {
+        None
+    };
     // -- Read prompt file -------------------------------------------------------
     let prompt_text = std::fs::read_to_string(prompt_path)
         .map_err(|e| anyhow::anyhow!("cannot read prompt file {}: {e}", prompt_path.display()))?;
@@ -850,37 +856,22 @@ pub(crate) fn run_baseline(
 
     // -- §8.5 universal record (Phase-8 bench harness) ------------------------
     if let Some(record_args) = record_args.as_ref() {
-        // Checked before building anything: `--metrics off` means a no-op at
-        // the producer, not "build the record, then throw it away".
-        if !rmlx_metrics::mode::observations_enabled() {
+        // `--metrics off` means a no-op at the producer, not "build the record,
+        // then throw it away".
+        let Some(identity) = identity else {
             info!("baseline: observations disabled, no record written");
             return Ok(());
-        }
-
-        let weight_quant_str = cfg
-            .as_ref()
-            .and_then(|c| c.quantization.as_ref())
-            .map_or_else(
-                || "bf16".to_string(),
-                |q| match q.mode_or_default() {
-                    // Existing whitelist values: "mxfp8", "mxfp4", "nvfp4", "8bit",
-                    // "6bit", "4bit", "3bit", "2bit". Pass through the quant mode
-                    // if it already matches; otherwise fall back to a bit-only tag.
-                    "mxfp8" | "mxfp4" | "nvfp4" => q.mode_or_default().to_string(),
-                    _ => format!("{}bit", q.bits),
-                },
-            );
+        };
 
         // First-64-char preview for the `output_first_64` column.
         let preview_64: String = preview_full.chars().take(64).collect();
 
         let record = build_run_record(
             run_id,
-            model_path,
+            &identity,
             record_args,
             prompt_label,
             &prompt_text,
-            &weight_quant_str,
             prompt_token_count as i64,
             i64::from(max_tokens),
             i64::from(resolved_ctx.ceiling),
@@ -938,6 +929,42 @@ pub(crate) fn run_baseline(
     }
 
     Ok(())
+}
+
+/// The identity columns a recorded run is filed under.
+pub(crate) struct RecordIdentity {
+    pub namespace: String,
+    pub model: String,
+    pub weight_quant: String,
+}
+
+/// Resolve and check the identity of a run before it does any work.
+///
+/// `weight_quant` is derived from the snapshot's quantization config and
+/// checked against the metrics DB's list here, so a value the DB would refuse
+/// stops the run now and not after the measurement.
+pub(crate) fn resolve_record_identity(model_path: &Path) -> anyhow::Result<RecordIdentity> {
+    let (namespace, model) = rmlx_metrics::identity::snapshot_identity(model_path)?;
+    let weight_quant = rmlx_loader::load_config(model_path)
+        .ok()
+        .and_then(|c| c.quantization)
+        .map_or_else(
+            || "bf16".to_string(),
+            |q| match q.mode_or_default() {
+                "mxfp8" | "mxfp4" | "nvfp4" => q.mode_or_default().to_string(),
+                _ => format!("{}bit", q.bits),
+            },
+        );
+    let weight_quant = rmlx_metrics::identity::canonicalize(
+        "weight_quant",
+        &weight_quant,
+        rmlx_metrics::identity::WEIGHT_QUANT_WHITELIST,
+    )?;
+    Ok(RecordIdentity {
+        namespace,
+        model,
+        weight_quant,
+    })
 }
 
 /// Arguments needed to emit one §8.5 universal `RunRecord` to the metrics
@@ -1010,11 +1037,10 @@ pub(crate) fn resolve_prompt_tokens_file(
 #[allow(clippy::too_many_arguments)]
 fn build_run_record(
     run_id: &str,
-    model_path: &Path,
+    identity: &RecordIdentity,
     args: &BaselineRecordArgs<'_>,
     prompt_label_fallback: &str,
     prompt_text: &str,
-    weight_quant: &str,
     prompt_tokens: i64,
     max_tokens: i64,
     ctx_max: i64,
@@ -1028,15 +1054,6 @@ fn build_run_record(
     preview_first_64: &str,
     kv_cache_bytes: u64,
 ) -> anyhow::Result<serde_json::Value> {
-    // Identity: namespace + model name from the snapshot directory basename.
-    let snapshot_str = model_path
-        .canonicalize()
-        .unwrap_or_else(|_| model_path.to_path_buf())
-        .to_string_lossy()
-        .to_string();
-    let (ns, model) = rmlx_metrics::identity::split_model_path(&snapshot_str)
-        .map_err(|e| anyhow::anyhow!("split_model_path({snapshot_str}): {e}"))?;
-
     let ts_utc = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
     // Prompt: prefer the canonical longctx body when known, else embed the
@@ -1086,9 +1103,9 @@ fn build_run_record(
 
     let mut record = serde_json::json!({
         "schema_version": rmlx_metrics::ingest::RECORD_SCHEMA_VERSION,
-        "model_namespace": ns,
-        "model": model,
-        "weight_quant": weight_quant,
+        "model_namespace": identity.namespace,
+        "model": identity.model,
+        "weight_quant": identity.weight_quant,
         "kv_quant": kv_quant_str,
         // Cell identity for a run that moved the boundary-layer counts off
         // their default; `None` at the default, which is what keeps a default

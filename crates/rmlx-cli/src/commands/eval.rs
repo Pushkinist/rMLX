@@ -16,6 +16,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use crate::commands::baseline::{resolve_record_identity, RecordIdentity};
 use crate::commands::parse::ClaimedDevice;
 use anyhow::Result;
 use rmlx_metrics::identity::RunIdentity;
@@ -58,6 +59,12 @@ pub(crate) fn run_ppl(
     kv_quant: Option<rmlx_kv_quant::KvQuant>,
 ) -> Result<()> {
     let device = claimed.device();
+    // Resolved before any work: a run whose identity cannot be recorded stops here.
+    let identity = if !corpus.is_empty() && rmlx_metrics::mode::observations_enabled() {
+        Some(resolve_record_identity(model_path)?)
+    } else {
+        None
+    };
     // -- Read corpus + tokenize ------------------------------------------------
     let corpus_text = std::fs::read_to_string(text_file)
         .map_err(|e| anyhow::anyhow!("cannot read text file {}: {e}", text_file.display()))?;
@@ -153,9 +160,13 @@ pub(crate) fn run_ppl(
         );
         return Ok(());
     }
+    let Some(identity) = identity else {
+        info!("ppl: observations disabled, no record written");
+        return Ok(());
+    };
     record_ppl_run(&PplRecordArgs {
         run_id,
-        model_path,
+        identity: &identity,
         corpus,
         ctx_window,
         stride,
@@ -195,7 +206,7 @@ fn ppl_metric_name(corpus: &str, kv_quant: Option<rmlx_kv_quant::KvQuant>) -> St
 /// Everything [`record_ppl_run`] needs to emit one §8.5 record.
 struct PplRecordArgs<'a> {
     run_id: &'a str,
-    model_path: &'a Path,
+    identity: &'a RecordIdentity,
     corpus: &'a str,
     ctx_window: usize,
     stride: usize,
@@ -213,30 +224,9 @@ struct PplRecordArgs<'a> {
 /// A failed ingest leaves the buffer file behind for a later replay sweep
 /// rather than losing the measurement.
 fn record_ppl_run(args: &PplRecordArgs<'_>) -> Result<()> {
-    // Checked before building anything: `--metrics off` means a no-op at
-    // the producer, not "build the record, then throw it away".
-    if !rmlx_metrics::mode::observations_enabled() {
-        info!("ppl: observations disabled, no record written");
-        return Ok(());
-    }
-
-    // Derive a metrics-DB-accepted `weight_quant` tag from the snapshot
-    // config. Mirrors the mapping in `run_baseline`.
-    let cfg = rmlx_loader::load_config(args.model_path).ok();
-    let weight_quant = cfg
-        .as_ref()
-        .and_then(|c| c.quantization.as_ref())
-        .map_or_else(
-            || "bf16".to_string(),
-            |q| match q.mode_or_default() {
-                "mxfp8" | "mxfp4" | "nvfp4" => q.mode_or_default().to_string(),
-                _ => format!("{}bit", q.bits),
-            },
-        );
-
     let record = build_ppl_run_record(
         args.run_id,
-        args.model_path,
+        args.identity,
         args.corpus,
         args.ctx_window,
         args.stride,
@@ -244,7 +234,6 @@ fn record_ppl_run(args: &PplRecordArgs<'_>) -> Result<()> {
         args.report,
         args.load_ms,
         args.score_ms,
-        &weight_quant,
         args.git_sha,
         args.kv_quant,
         args.decode_config,
@@ -296,7 +285,7 @@ fn record_ppl_run(args: &PplRecordArgs<'_>) -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 fn build_ppl_run_record(
     run_id: &str,
-    model_path: &Path,
+    identity: &RecordIdentity,
     corpus: &str,
     ctx_window: usize,
     stride: usize,
@@ -304,17 +293,10 @@ fn build_ppl_run_record(
     report: &ppl::PplReport,
     load_ms: f64,
     score_ms: f64,
-    weight_quant: &str,
     git_sha: Option<&str>,
     kv_quant: Option<rmlx_kv_quant::KvQuant>,
     decode_config: Option<&str>,
 ) -> Result<serde_json::Value> {
-    let snapshot = model_path
-        .canonicalize()
-        .map_err(|e| anyhow::anyhow!("canonicalize {}: {e}", model_path.display()))?;
-    let snapshot_str = snapshot.to_string_lossy().to_string();
-    let (ns, model_name) = rmlx_metrics::identity::split_model_path(&snapshot_str)
-        .map_err(|e| anyhow::anyhow!("split_model_path({snapshot_str}): {e}"))?;
     let ts_utc = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
     let op_name = ppl_metric_name(corpus, kv_quant);
@@ -332,9 +314,9 @@ fn build_ppl_run_record(
 
     let mut record = serde_json::json!({
         "schema_version": rmlx_metrics::ingest::RECORD_SCHEMA_VERSION,
-        "model_namespace": ns,
-        "model": model_name,
-        "weight_quant": weight_quant,
+        "model_namespace": identity.namespace,
+        "model": identity.model,
+        "weight_quant": identity.weight_quant,
         // The codec the scorer actually ran the cache at. A cacheless run
         // stores nothing, so `none` is the truth for it and not a placeholder.
         "kv_quant": kv_quant.map_or_else(|| "none".to_string(), |q| q.to_string()),

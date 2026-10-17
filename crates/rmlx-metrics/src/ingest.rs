@@ -95,7 +95,7 @@ pub struct RunRecord {
     /// Semver string of the backend binary, if known. Read via [`RunRecord::backend_version`].
     #[serde(default)]
     pub(crate) backend_version: Option<String>,
-    /// Model namespace from the whitelist (e.g. `"mlx-community"`).
+    /// Model namespace, a free-form label (e.g. `"mlx-community"`).
     pub model_namespace: String,
     /// Model repository name within the namespace.
     ///
@@ -409,12 +409,8 @@ impl RunRecord {
             }
         }
 
-        // model_namespace / model: free-form recorded labels, same as
-        // kv_quant (see `identity::canonicalize_kv_quant`) — not validated
-        // against `NAMESPACE_WHITELIST`. An unrecognized namespace (a new
-        // model host, a typo, a local finetune) must still record, not
-        // silently drop into `metrics/buffer/failed/`. `model` was already
-        // unchecked here; `model_namespace` now matches it.
+        // model_namespace / model are free-form labels like kv_quant, so they
+        // are not validated against a list.
 
         // weight_quant
         identity::canonicalize(

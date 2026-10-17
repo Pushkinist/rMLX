@@ -225,8 +225,8 @@ impl RunIdentity {
 /// Split a snapshot id or path into `(model_namespace, model)`.
 ///
 /// Accepts `"<ns>__<model>"` (the on-disk snapshot layout) and bare names.
-/// Falls back to the `"local"` namespace — always whitelisted — rather than
-/// failing, because a metrics row with an approximate namespace beats no row.
+/// Falls back to the `"local"` namespace rather than failing, because a
+/// metrics row with an approximate namespace beats no row.
 ///
 /// Lenient by design; [`split_model_path`] is the strict, erroring variant used
 /// where the caller can act on a bad path.
@@ -295,18 +295,6 @@ pub const BACKEND_WHITELIST: &[&str] = &[
     "vllm",
     "llama_cpp",
     "llama_cpp_tq",
-];
-
-/// Allowed values for the `model_namespace` identity column (see docs/METRICS_DB.md §5.1).
-pub const NAMESPACE_WHITELIST: &[&str] = &[
-    "mlx-community",
-    "z-lab",
-    "prism-ml",
-    "paramind",
-    "paro-team",
-    "ollama",
-    "hf",
-    "local",
 ];
 
 /// Allowed values for the `weight_quant` identity column (see docs/METRICS_DB.md §5.2).
@@ -393,6 +381,28 @@ pub fn canonicalize(field: &str, value: &str, whitelist: &[&str]) -> Result<Stri
     }
 }
 
+/// Reject an empty recorded label.
+fn check_label(field: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(Error::IdentityModelPath(format!(
+            "{field} must not be empty"
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve the `(model_namespace, model)` a run of `model_dir` records under.
+///
+/// A command that records after long work calls this before the work, so an
+/// identity that cannot be recorded costs seconds instead of the run.
+pub fn snapshot_identity(model_dir: &Path) -> Result<(String, String)> {
+    let resolved = model_dir
+        .canonicalize()
+        .unwrap_or_else(|_| model_dir.to_path_buf());
+    let path = resolved.to_string_lossy();
+    split_model_path(&path)
+}
+
 /// Split a filesystem path / HF id / ollama tag into `(namespace, model)`.
 ///
 /// Rule set (docs/METRICS_DB.md §5.1):
@@ -401,8 +411,8 @@ pub fn canonicalize(field: &str, value: &str, whitelist: &[&str]) -> Result<Stri
 ///    [`Path::is_absolute`]. Strip trailing `/`, take the last path segment
 ///    (basename).
 ///    - If the basename contains `__`, split on the *first* `__` →
-///      `(ns, model)`. Validate `ns` against [`NAMESPACE_WHITELIST`]. Return
-///      `Error::IdentityNotInWhitelist` if unknown.
+///      `(ns, model)`. The namespace is a free-form label recorded as given;
+///      an empty part is `Error::IdentityModelPath`.
 ///    - Otherwise → `("local", basename)`.
 ///
 /// 2. **Ollama tag** — no `/`, contains `:` → `("ollama", input)`.
@@ -431,19 +441,9 @@ pub fn split_model_path(input: &str) -> Result<(String, String)> {
         if let Some(pos) = basename.find("__") {
             let ns = &basename[..pos];
             let model = &basename[pos + 2..];
-            // Validate namespace against whitelist.
-            if NAMESPACE_WHITELIST.contains(&ns) {
-                Ok((ns.to_string(), model.to_string()))
-            } else {
-                Err(Error::IdentityNotInWhitelist {
-                    field: "model_namespace".to_string(),
-                    value: ns.to_string(),
-                    allowed: NAMESPACE_WHITELIST
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect(),
-                })
-            }
+            check_label("model_namespace", ns)?;
+            check_label("model", model)?;
+            Ok((ns.to_string(), model.to_string()))
         } else {
             Ok(("local".to_string(), basename.to_string()))
         }
