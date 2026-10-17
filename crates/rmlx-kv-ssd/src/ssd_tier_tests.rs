@@ -330,6 +330,37 @@ fn wipe_removes_the_word_per_group_code_plane_namespace() {
     );
 }
 
+/// The v8 → v9 transition specifically: a namespace written before a block
+/// recorded the position of its recurrent state must be reclaimed.
+///
+/// Such a block hits under an unchanged key and is refused on every lookup, so
+/// it would sit in the index serving nothing.
+///
+/// Mutation check: put `SCHEMA_VERSION` back to 8 and the seeded namespace is
+/// `found == SCHEMA_VERSION`, so the pass skips it and the directory survives.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "fixture setup under a temp dir this test owns; a failure is a broken fixture, not a condition under test"
+)]
+fn wipe_removes_the_namespace_that_records_no_recurrent_position() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let kv_root = tmp.path().to_path_buf();
+    let pre_change = seed_namespace_at_version(&kv_root, "wipe-v8", 8);
+    let current = seed_current_schema_namespace(&kv_root, "keep-current");
+
+    wipe_stale_schema_namespaces(&kv_root);
+
+    assert!(
+        !pre_change.exists(),
+        "a namespace whose blocks record no recurrent position must be removed, not kept to be refused"
+    );
+    assert!(
+        current.exists(),
+        "current-schema namespace must survive the same pass"
+    );
+}
+
 /// The v3 → v4 transition specifically: a namespace written before the
 /// bf16-mirror codecs moved their block payload must be reclaimed.
 ///

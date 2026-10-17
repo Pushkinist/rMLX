@@ -106,6 +106,8 @@ const META_KV_QUANT: &str = "kv_quant";
 const META_N_LAYERS: &str = "n_layers";
 const META_SEQ_LEN: &str = "seq_len";
 const META_N_LINEAR: &str = "n_linear";
+/// Token the recurrent state was spilled at; present when `n_linear > 0`.
+const META_LIN_POS: &str = "lin_pos";
 
 /// Per-layer geometry JSON key, `l{idx}.geom`.
 fn geom_key(idx: usize) -> String {
@@ -150,6 +152,41 @@ impl From<BlockIoError> for Error {
     fn from(e: BlockIoError) -> Self {
         Error::Mlx(e.to_string())
     }
+}
+
+/// Why a well-formed block cannot be brought to the prefix its digest names.
+///
+/// Not corruption: the block is intact, it just cannot serve this claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum ClaimMismatch {
+    /// The block's K/V is shorter than the claimed prefix.
+    #[error("K/V holds {held} tokens, shorter than the claimed {claim}")]
+    KvShorter {
+        /// Tokens the block's K/V holds.
+        held: i32,
+        /// Tokens the digest names.
+        claim: i32,
+    },
+    /// The block carries a recurrent state but not the position it sits at.
+    #[error("recurrent state carries no recorded position")]
+    StateUnrecorded,
+    /// The recurrent state sits at another token than the claim and cannot be
+    /// rewound.
+    #[error("recurrent state is at token {state}, the claim is {claim}, and it cannot be rewound")]
+    StateNotAtClaim {
+        /// Token the recurrent state was spilled at.
+        state: i32,
+        /// Tokens the digest names.
+        claim: i32,
+    },
+    /// K/V longer than the claim could not be brought to it.
+    #[error("layer {layer} cannot be cut back to the claimed {claim} tokens")]
+    CutRefused {
+        /// Layer whose store or bf16 seed refused the cut.
+        layer: usize,
+        /// Tokens the digest names.
+        claim: i32,
+    },
 }
 
 // ── Owned tensor view for safetensors serialization ───────────────────────────
@@ -405,6 +442,14 @@ fn none_bf16_payloads(kv_caches: &[KvCache]) -> Result<Vec<NoneBf16Seed>> {
 ///   write + implicit fsync on most platforms).
 ///
 /// The split happens inside [`serialize_block_refs_timed`].
+///
+/// `state_len` is the token the recurrent state sits at; it is recorded in the
+/// header when `lin_caches` is not empty, so a hydrate reads the state's
+/// position instead of inferring it from the K/V.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the spill drain's whole argument set, one value per header field it writes"
+)]
 pub(crate) fn write_caches_timed(
     path: &Path,
     device: Device,
@@ -412,11 +457,19 @@ pub(crate) fn write_caches_timed(
     kv_quant: KvQuant,
     kv_caches: &[KvCache],
     lin_caches: &[LinearAttnCache],
+    state_len: i32,
 ) -> Result<(u64, u64, u64)> {
     let layers = spill_layers(kv_caches);
     let none_bf16 = none_bf16_payloads(kv_caches)?;
     serialize_block_refs_timed(
-        path, device, model_id, kv_quant, &layers, &none_bf16, lin_caches,
+        path,
+        device,
+        model_id,
+        kv_quant,
+        &layers,
+        &none_bf16,
+        lin_caches,
+        Some(state_len),
     )
 }
 
@@ -444,7 +497,7 @@ pub(crate) fn read_caches(
     policy: DispatchPolicy,
     shares_kv: bool,
 ) -> Result<(Vec<KvCache>, Vec<LinearAttnCache>)> {
-    let (kv_caches, lin_caches, _, _, _, _) = read_caches_inner(
+    match read_caches_inner(
         path,
         device,
         model_id,
@@ -452,18 +505,38 @@ pub(crate) fn read_caches(
         layer_quants,
         policy,
         shares_kv,
-    )?
-    .ok_or_else(|| Error::Mlx(format!("KV block read: {} not found", path.display())))?;
-    Ok((kv_caches, lin_caches))
+        None,
+    )? {
+        BlockRead::Caches((kv_caches, lin_caches, ..)) => Ok((kv_caches, lin_caches)),
+        BlockRead::Gone => Err(Error::Mlx(format!(
+            "KV block read: {} not found",
+            path.display()
+        ))),
+        BlockRead::Unusable(why) => Err(Error::Mlx(format!("KV block read: {why}"))),
+    }
 }
 
 /// Reconstructed caches plus the hydrate phase timings:
 /// `(kv_caches, lin_caches, bytes_read, dur_read_us, dur_dequant_us, dur_finalize_us)`.
 type TimedCaches = (Vec<KvCache>, Vec<LinearAttnCache>, u64, u64, u64, u64);
 
-/// Timed variant of [`read_caches`] for SSD-tier hydrate observability.
+/// What reading a block for a claimed prefix produced.
+pub(crate) enum BlockRead {
+    /// The file is no longer on disk: the routine outcome of an LRU eviction
+    /// landing between the index lookup and the read.
+    Gone,
+    /// The block is intact but cannot be brought to the claim. Decided from the
+    /// header before any tensor is read, except for a cut a store refuses.
+    Unusable(ClaimMismatch),
+    /// Caches at exactly the claim, with the hydrate phase timings.
+    Caches(TimedCaches),
+}
+
+/// Timed variant of [`read_caches`] for SSD-tier hydrate observability, bringing
+/// every cache to exactly `claim` tokens.
 ///
-/// Returns `(kv_caches, lin_caches, bytes_read, dur_read_us, dur_dequant_us, dur_finalize_us)`:
+/// The [`BlockRead::Caches`] payload is
+/// `(kv_caches, lin_caches, bytes_read, dur_read_us, dur_dequant_us, dur_finalize_us)`:
 /// - `bytes_read` — file size in bytes (via `fs::metadata` before the mmap
 ///   open; 0 if the metadata call fails).
 /// - `dur_read_us` — time for `KvBlockReader::open` (mmap + safetensors header
@@ -471,11 +544,14 @@ type TimedCaches = (Vec<KvCache>, Vec<LinearAttnCache>, u64, u64, u64, u64);
 /// - `dur_dequant_us` — time for `KvBlockReader::hydrate` (CPU-side storage
 ///   reconstruction / dequant).
 /// - `dur_finalize_us` — time to wrap each reconstructed [`KvStorage`] into a
-///   decode-ready [`KvCache`]; CPU-only struct construction, not a GPU upload.
+///   decode-ready [`KvCache`] and cut it back to `claim`.
 ///
-/// `Ok(None)` means the file is no longer on disk — the routine outcome of an
-/// LRU eviction landing between the index lookup and the read. The caller
-/// distinguishes it from `Err` (a genuinely bad block) on the type.
+/// The caller distinguishes [`BlockRead::Gone`] and [`BlockRead::Unusable`] from
+/// `Err` (a genuinely bad block) on the type.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the block's identity (path, model, codec), the caller's layer vector and dispatch facts, and the claim"
+)]
 pub(crate) fn read_caches_timed(
     path: &Path,
     device: Device,
@@ -484,7 +560,8 @@ pub(crate) fn read_caches_timed(
     layer_quants: &[KvQuant],
     policy: DispatchPolicy,
     shares_kv: bool,
-) -> Result<Option<TimedCaches>> {
+    claim: i32,
+) -> Result<BlockRead> {
     read_caches_inner(
         path,
         device,
@@ -493,14 +570,108 @@ pub(crate) fn read_caches_timed(
         layer_quants,
         policy,
         shares_kv,
+        Some(claim),
     )
+}
+
+/// Decide from the header alone whether a block can be brought to `claim`.
+///
+/// K/V longer than the claim is cut at hydrate. K/V shorter cannot be grown. A
+/// recurrent state has no sequence axis, so it must already sit at the claim,
+/// and its position must be recorded: a block without one (an older binary's)
+/// is not reused.
+fn check_claim(reader: &KvBlockReader, claim: i32) -> Result<ClaimCheck> {
+    let held = reader.seq_len()?;
+    if held < claim {
+        return Ok(Err(ClaimMismatch::KvShorter { held, claim }));
+    }
+    if reader.n_linear()? == 0 {
+        return Ok(Ok(()));
+    }
+    Ok(match reader.lin_pos()? {
+        None => Err(ClaimMismatch::StateUnrecorded),
+        Some(state) if state != claim => Err(ClaimMismatch::StateNotAtClaim { state, claim }),
+        Some(_) => Ok(()),
+    })
+}
+
+/// A block's verdict on a claim, inside the `Result` of reading it.
+type ClaimCheck = std::result::Result<(), ClaimMismatch>;
+
+/// Cut `seed` (bf16 `[B, kv_h, seq, D]`) to its first `claim` positions.
+fn cut_seed(seed: &Array, claim: i32, device: Device) -> Result<Array> {
+    let mut stop = seed.shape();
+    match (stop.len(), stop.get_mut(2)) {
+        (4, Some(seq)) => *seq = claim,
+        _ => {
+            return Err(Error::Mlx(format!(
+                "KV block read: bf16 seed has shape {stop:?}, expected [B, kv_h, seq, D]"
+            )))
+        }
+    }
+    seed.slice(&[0; 4], &stop, &[1; 4], device)?
+        .contiguous(device)
+}
+
+/// Wrap one hydrated layer as a [`KvCache`] holding exactly `claim` tokens.
+///
+/// `offset` is the block's recorded length. Past `claim`, the store is cut with
+/// [`KvCache::truncate_to`] and the bf16 seed (which on a mirror-fed layer IS
+/// the K/V) is cut with it, so a re-spill sees the buffer and the offset agree.
+/// A store reports a refused cut only by leaving its CPU payload inconsistent
+/// with its shape, so a cut cache is read back through both dequant probes
+/// before it is trusted.
+fn finish_layer(
+    (storage, max_seq, seed): HydratedLayer,
+    layer: (usize, KvQuant),
+    offset: i32,
+    claim: i32,
+    ctx: (DispatchPolicy, bool, Device),
+) -> Result<std::result::Result<KvCache, ClaimMismatch>> {
+    let (layer_idx, quant) = layer;
+    let (policy, shares_kv, device) = ctx;
+    let refused = ClaimMismatch::CutRefused {
+        layer: layer_idx,
+        claim,
+    };
+    let mut cache = KvCache::from_storage(
+        storage, max_seq, quant, offset, layer_idx, policy, shares_kv,
+    );
+    if let Some((k, v)) = seed {
+        let (k, v) = if offset > claim {
+            (cut_seed(&k, claim, device)?, cut_seed(&v, claim, device)?)
+        } else {
+            (k, v)
+        };
+        cache = cache.with_decode_fp16_seed(k, v);
+    }
+    if offset > claim {
+        if cache.truncate_to(claim).is_err() {
+            return Ok(Err(refused));
+        }
+        let probes = [cache.probe_k_dequant(device), cache.probe_v_dequant(device)];
+        if probes.iter().flatten().any(Result::is_err) {
+            return Ok(Err(refused));
+        }
+    }
+    let seed_len = cache
+        .decode_fp16_kv()
+        .map(|(k, _)| k.shape().get(2).copied());
+    if cache.offset() != claim || seed_len.is_some_and(|len| len != Some(claim)) {
+        return Ok(Err(refused));
+    }
+    Ok(Ok(cache))
 }
 
 /// Shared core for [`read_caches`] and [`read_caches_timed`].
 ///
-/// Returns `(kv_caches, lin_caches, bytes_read, dur_read_us, dur_dequant_us, dur_finalize_us)`,
-/// or `Ok(None)` when the block file does not exist.
+/// `claim` is the prefix every cache must end at; `None` restores the block
+/// at its recorded length, unchecked.
 /// Mirrors the write-side `serialize_block_refs` pattern.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the block's identity (path, model, codec), the caller's layer vector and dispatch facts, and the claim"
+)]
 fn read_caches_inner(
     path: &Path,
     device: Device,
@@ -509,14 +680,15 @@ fn read_caches_inner(
     layer_quants: &[KvQuant],
     policy: DispatchPolicy,
     shares_kv: bool,
-) -> Result<Option<TimedCaches>> {
+    claim: Option<i32>,
+) -> Result<BlockRead> {
     use std::time::Instant;
 
     let bytes_read = std::fs::metadata(path).map_or(0, |m| m.len());
 
     let t_read = Instant::now();
     let Some(reader) = KvBlockReader::open_existing(path)? else {
-        return Ok(None);
+        return Ok(BlockRead::Gone);
     };
     let dur_read_us = t_read.elapsed().as_micros() as u64;
 
@@ -528,9 +700,14 @@ fn read_caches_inner(
         )));
     }
 
+    let offset = reader.seq_len()?;
+    let claim = claim.unwrap_or(offset);
+    if let Err(why) = check_claim(&reader, claim)? {
+        return Ok(BlockRead::Unusable(why));
+    }
+
     let t_dequant = Instant::now();
     let (layers, lin_caches) = reader.hydrate(model_id, kv_quant, device)?;
-    let offset = reader.seq_len()?;
     let dur_dequant_us = t_dequant.elapsed().as_micros() as u64;
 
     let t_finalize = Instant::now();
@@ -538,22 +715,22 @@ fn read_caches_inner(
     // layer-ordered at spill — see `write_caches` contract. A `None`-storage
     // layer that carried an off-storage bf16 prefix re-seeds the decode buffers
     // so an exact-hit replay reads the real K/V instead of zeros.
-    let kv_caches: Vec<KvCache> = layers
-        .into_iter()
-        .zip(layer_quants)
-        .enumerate()
-        .map(|(layer_idx, ((s, max_seq, bf16), &quant))| {
-            let cache =
-                KvCache::from_storage(s, max_seq, quant, offset, layer_idx, policy, shares_kv);
-            match bf16 {
-                Some((k, v)) => cache.with_decode_fp16_seed(k, v),
-                None => cache,
-            }
-        })
-        .collect();
+    let mut kv_caches = Vec::with_capacity(layers.len());
+    for (layer_idx, (hydrated, &quant)) in layers.into_iter().zip(layer_quants).enumerate() {
+        match finish_layer(
+            hydrated,
+            (layer_idx, quant),
+            offset,
+            claim,
+            (policy, shares_kv, device),
+        )? {
+            Ok(cache) => kv_caches.push(cache),
+            Err(why) => return Ok(BlockRead::Unusable(why)),
+        }
+    }
     let dur_finalize_us = t_finalize.elapsed().as_micros() as u64;
 
-    Ok(Some((
+    Ok(BlockRead::Caches((
         kv_caches,
         lin_caches,
         bytes_read,
@@ -593,14 +770,23 @@ fn serialize_block_refs(
     none_bf16: &[NoneBf16Seed],
     linear: &[LinearAttnCache],
 ) -> Result<()> {
-    serialize_block_refs_timed(path, device, model_id, kv_quant, layers, none_bf16, linear)
-        .map(|_| ())
+    serialize_block_refs_timed(
+        path, device, model_id, kv_quant, layers, none_bf16, linear, None,
+    )
+    .map(|_| ())
 }
 
 /// Timed serialization core — splits the work into a tensor-build phase
 /// (CPU eval / `to_bytes`) and an FS-write phase (`serialize_to_file`).
 ///
 /// Returns `(bytes_written, dur_serialize_us, dur_write_us)`.
+///
+/// `state_len` is the position recorded for the recurrent state. `None` records
+/// the K/V length, for callers that hold no other record of it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one value per header field the block writes; a parameter struct would be built once per call site"
+)]
 fn serialize_block_refs_timed(
     path: &Path,
     device: Device,
@@ -609,6 +795,7 @@ fn serialize_block_refs_timed(
     layers: &[(&KvStorage, i32)],
     none_bf16: &[NoneBf16Seed],
     linear: &[LinearAttnCache],
+    state_len: Option<i32>,
 ) -> Result<(u64, u64, u64)> {
     use std::time::Instant;
 
@@ -632,6 +819,10 @@ fn serialize_block_refs_timed(
 
     // Linear-attn recurrent state (whole, untruncated — GDN has no seq axis).
     meta.insert(META_N_LINEAR.into(), linear.len().to_string());
+    if !linear.is_empty() {
+        let lin_pos = state_len.unwrap_or(max_seq_len);
+        meta.insert(META_LIN_POS.into(), lin_pos.to_string());
+    }
     for (idx, lac) in linear.iter().enumerate() {
         if let Some(conv) = &lac.conv_state {
             tensors.push((
@@ -1947,6 +2138,35 @@ impl KvBlockReader {
             .map_err(|e| BlockIoError::Header(format!("bad seq_len: {e}")).into())
     }
 
+    /// Read the `n_linear` header: the number of GDN layers (`0` on pure
+    /// attention, and on a block that predates the key).
+    pub fn n_linear(&self) -> Result<usize> {
+        let header = self.header()?;
+        match header
+            .metadata()
+            .as_ref()
+            .and_then(|m| m.get(META_N_LINEAR))
+        {
+            None => Ok(0),
+            Some(raw) => raw
+                .parse()
+                .map_err(|e| BlockIoError::Header(format!("bad n_linear: {e}")).into()),
+        }
+    }
+
+    /// Read the token the recurrent state was spilled at, or `None` when the
+    /// block does not record one.
+    pub fn lin_pos(&self) -> Result<Option<i32>> {
+        let header = self.header()?;
+        match header.metadata().as_ref().and_then(|m| m.get(META_LIN_POS)) {
+            None => Ok(None),
+            Some(raw) => raw
+                .parse()
+                .map(Some)
+                .map_err(|e| BlockIoError::Header(format!("bad lin_pos: {e}")).into()),
+        }
+    }
+
     fn parse(&self) -> Result<SafeTensors<'_>> {
         SafeTensors::deserialize(&self.bytes)
             .map_err(|e| Error::Mlx(format!("KV block deserialize: {e}")))
@@ -2012,12 +2232,7 @@ impl KvBlockReader {
             layers.push((storage, max_seq, bf16));
         }
 
-        let n_linear: usize = header
-            .metadata()
-            .as_ref()
-            .and_then(|m| m.get(META_N_LINEAR))
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        let n_linear = self.n_linear()?;
         let mut linear = Vec::with_capacity(n_linear);
         for idx in 0..n_linear {
             let mut lac = LinearAttnCache::new();

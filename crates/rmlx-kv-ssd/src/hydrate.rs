@@ -23,6 +23,8 @@
 //!    `model_id` + `kv_quant` header. On success the index row is `touch`ed and
 //!    the reconstructed `(Vec<KvCache>, Vec<LinearAttnCache>)` + matched
 //!    `prompt_ids` prefix are returned to the arch impl to wrap as an entry.
+//!    Every returned cache sits at exactly the length of that prefix; a block
+//!    that cannot be brought there is a miss (see `block_io::read_caches_timed`).
 //! 4. On corrupt / metadata-mismatch / read error: the `.kvb` file and the
 //!    index row are deleted, a `warn!` is logged, and the lookup returns a miss
 //!    (the prompt-cache falls through to a full prefill). Never panics.
@@ -46,7 +48,7 @@ use rmlx_kv_quant::kvcache::KvCache;
 use rmlx_kv_quant::linear_attn::LinearAttnCache;
 use rmlx_kv_quant::KvQuant;
 
-use crate::block_io::read_caches_timed;
+use crate::block_io::{read_caches_timed, BlockRead};
 use crate::hashing::{chained_block_hashes_seeded, BLOCK_TOKENS};
 use crate::hooks::{call_ssd_hydrate_prom_hook, ssd_event_recorder};
 use crate::ssd_index::{KvBlockRow, SsdKvIndex};
@@ -63,6 +65,7 @@ use crate::ssd_index::{KvBlockRow, SsdKvIndex};
 )]
 pub struct HydratedBlock {
     /// Token IDs of the matched block-aligned prefix (`block_count * 256`).
+    /// Every cache below sits at exactly this length.
     pub prompt_ids: Vec<u32>,
     /// Reconstructed attention KV caches (one per layer).
     pub kv_caches: Vec<KvCache>,
@@ -306,6 +309,7 @@ impl SsdHydrator {
         // cannot produce a codec-B digest. Checking an attach-time codec here
         // instead would reject perfectly good rows written by a hot-swapped
         // request, and delete them as corrupt.
+        let prefix_len = block_count * BLOCK_TOKENS;
         match read_caches_timed(
             &row.path,
             self.device,
@@ -314,8 +318,9 @@ impl SsdHydrator {
             layer_quants,
             policy,
             shares_kv,
+            i32::try_from(prefix_len).unwrap_or(i32::MAX),
         ) {
-            Ok(Some((
+            Ok(BlockRead::Caches((
                 kv_caches,
                 lin_caches,
                 bytes_read,
@@ -336,7 +341,6 @@ impl SsdHydrator {
                 let dur_touch_us = t_touch.elapsed().as_micros() as u64;
                 let dur_us = t0.elapsed().as_micros() as u64;
 
-                let prefix_len = block_count * BLOCK_TOKENS;
                 tracing::info!(
                     hash = %row.hash,
                     path = %row.path.display(),
@@ -394,7 +398,7 @@ impl SsdHydrator {
                     lin_caches,
                 }))
             }
-            Ok(None) => {
+            Ok(BlockRead::Gone) => {
                 // The block was evicted between this lookup and the read. LRU
                 // eviction deletes the row first, so the row is normally gone
                 // already; dropping it here covers an evictor that did not get
@@ -405,6 +409,20 @@ impl SsdHydrator {
                     "ssd-hydrate: block evicted under the read, falling back to prefill"
                 );
                 self.drop_row(&row);
+                Ok(None)
+            }
+            Ok(BlockRead::Unusable(why)) => {
+                // Intact, but it can never serve this claim, and left in the
+                // index it would shadow every shorter block on the next lookup.
+                tracing::warn!(
+                    hash = %row.hash,
+                    path = %row.path.display(),
+                    prefix_len,
+                    reason = %why,
+                    "ssd-hydrate: block cannot be brought to its claimed prefix, \
+                     deleting index row + file, falling back to prefill"
+                );
+                self.discard(&row);
                 Ok(None)
             }
             // A `layer_quants` of the wrong length is the caller's error, not a
@@ -419,26 +437,40 @@ impl SsdHydrator {
                     error = %e,
                     "ssd-hydrate: corrupt block, deleting index row + file, falling back to prefill"
                 );
-                // Row before file, the same order LRU eviction uses: it makes an
-                // interrupted cleanup leave an unreferenced row, which
-                // `prune_missing` reclaims, instead of an unreferenced file,
-                // which nothing does.
-                self.drop_row(&row);
-                let _ = std::fs::remove_file(&row.path);
+                self.discard(&row);
                 Ok(None)
             }
         }
     }
 
-    /// Drop `row`'s index entry after a read that could not be served.
-    fn drop_row(&self, row: &KvBlockRow) {
-        if let Err(e) = self.index.delete(&row.hash, row.layout_key) {
-            tracing::warn!(
-                hash = %row.hash,
-                layout_key = row.layout_key,
-                error = %e,
-                "ssd-hydrate: index row delete failed"
-            );
+    /// Drop `row`'s index entry after a read that could not be served, unless a
+    /// spill of the same key replaced it since the lookup. Returns whether this
+    /// call deleted the row.
+    fn drop_row(&self, row: &KvBlockRow) -> bool {
+        match self.index.delete_if_unchanged(row) {
+            Ok(deleted) => deleted,
+            Err(e) => {
+                tracing::warn!(
+                    hash = %row.hash,
+                    layout_key = row.layout_key,
+                    error = %e,
+                    "ssd-hydrate: index row delete failed"
+                );
+                false
+            }
+        }
+    }
+
+    /// Delete a block that cannot be served: its row, then its file.
+    ///
+    /// Row before file, the same order LRU eviction uses: it makes an
+    /// interrupted cleanup leave an unreferenced row, which `prune_missing`
+    /// reclaims, instead of an unreferenced file, which nothing does. The file
+    /// goes only when this call took the row, so a block spilled over the same
+    /// key since the lookup keeps its file.
+    fn discard(&self, row: &KvBlockRow) {
+        if self.drop_row(row) {
+            let _ = std::fs::remove_file(&row.path);
         }
     }
 }

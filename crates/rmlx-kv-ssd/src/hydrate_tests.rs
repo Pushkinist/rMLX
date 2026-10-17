@@ -1385,3 +1385,7 @@ fn probe_k(c: &KvCache, device: Device) -> Vec<f32> {
 // hydrated cache is the path on which the CPU block payload is load-bearing.
 #[path = "hydrate_truncate_tests.rs"]
 mod truncate;
+
+// A hydrated block sits at the prefix its ids claim.
+#[path = "hydrate_claim_tests.rs"]
+mod claim;

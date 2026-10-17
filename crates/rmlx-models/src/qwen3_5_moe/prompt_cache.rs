@@ -127,7 +127,9 @@ impl PromptCacheEntry for Qwen35MoeEntry {
     /// hydrated KV + GDN `lin_caches` are the recurrent state at exactly
     /// `t = prefix_len` of THIS same prompt, so re-prefilling only
     /// `prompt_ids[prefix_len..]` on top is sequentially correct (identical to
-    /// pausing/resuming the original prefill at the block boundary).
+    /// pausing/resuming the original prefill at the block boundary). The SSD
+    /// hydrate guarantees that position: a block whose recurrent state is past
+    /// `prefix_len` is a miss there and never reaches this hook.
     ///
     /// All three guards must hold:
     /// 1. The entry was promoted from the SSD tier (`is_ssd_hydrated`).

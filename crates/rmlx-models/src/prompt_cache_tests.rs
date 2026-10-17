@@ -2868,3 +2868,27 @@ fn snapshot_clone_refuses_a_paged_layer_with_pages_and_logs_it() {
         "a paged layer with no pages must be snapshotted"
     );
 }
+
+/// An entry with a recurrent state is spilled only when its prompt ends on a
+/// block boundary; a pure-attention entry is spilled at any length once it holds
+/// a full block.
+#[test]
+fn spill_key_withholds_a_recurrent_entry_that_ends_inside_a_block() {
+    let ids = |n: usize| (0..n as u32).collect::<Vec<_>>();
+    let key = |n: usize, n_lin: usize| spill_key(&RealEntry::new(ids(n), 0, 0, n_lin));
+
+    assert!(
+        key(2 * BLOCK_TOKENS + 44, 1).is_none(),
+        "recurrent state past the last full block"
+    );
+    assert!(
+        key(2 * BLOCK_TOKENS, 1).is_some(),
+        "recurrent state on a boundary"
+    );
+    assert!(
+        key(2 * BLOCK_TOKENS + 44, 0).is_some(),
+        "pure attention rewinds to the boundary at hydrate"
+    );
+    assert!(key(44, 1).is_none(), "no full block, no key");
+    assert!(key(44, 0).is_none(), "no full block, no key");
+}

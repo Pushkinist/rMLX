@@ -1140,6 +1140,69 @@ fn a_block_does_not_hydrate_under_a_different_layout_key() {
     );
 }
 
+/// The spill rule and the hydrate agree: an entry is spilled exactly when its
+/// block would hydrate.
+///
+/// Each case writes the block the entry would produce, whether or not the rule
+/// would spill it, and hydrates it for a longer request. A recurrent entry that
+/// ends inside a block is the one case the rule withholds, and the one a hydrate
+/// refuses; the same prompt on a pure-attention entry is spilled and hydrates
+/// at the last full block.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test: hydrate must not error on a block the fixture just wrote"
+)]
+fn the_spill_rule_withholds_exactly_the_blocks_a_hydrate_refuses() {
+    let cases = [
+        (BLOCK_TOKENS, false),
+        (BLOCK_TOKENS + 44, false),
+        (BLOCK_TOKENS, true),
+        (BLOCK_TOKENS + 44, true),
+        (2 * BLOCK_TOKENS, true),
+    ];
+    for (len, recurrent) in cases {
+        let ns = Namespace::new("spill-rule");
+        let prompt = ids(len);
+        let kv = [kv_layer(len as i32, 2, 0xC0DE)];
+        let lin: Vec<LinearAttnCache> = recurrent.then(|| lin_layer(0xBEEF)).into_iter().collect();
+        let s = spill(&ns, LAYOUT_KEY, &prompt, &kv, &lin);
+
+        let entry = Qwen35MoeEntry {
+            prompt_token_ids: prompt.clone(),
+            block_hashes: chained_block_hashes_seeded(&prompt, s.seed),
+            kv_caches: Vec::new(),
+            lin_caches: lin,
+            first_id: 0,
+            first_piece: String::new(),
+            kv_quant: Some(QUANT),
+            is_ssd_hydrated: false,
+        };
+        let hydrated: Option<Qwen35MoeEntry> = hydrator(&ns, LAYOUT_KEY)
+            .hydrate(
+                &request_longer_than(&prompt),
+                s.seed,
+                QUANT,
+                &s.layer_quants,
+                DispatchPolicy::default(),
+            )
+            .expect("hydrate must not error");
+
+        assert_eq!(
+            crate::prompt_cache::spill_key(&entry).is_some(),
+            hydrated.is_some(),
+            "{len} tokens, recurrent {recurrent}: spilled iff it hydrates"
+        );
+        if let Some(entry) = hydrated {
+            let claim = entry.prompt_token_ids().len() as i32;
+            assert!(
+                entry.kv_caches().iter().all(|c| c.offset() == claim),
+                "{len} tokens, recurrent {recurrent}: every cache sits at the claimed {claim}"
+            );
+        }
+    }
+}
+
 /// Boundary layers whose codec differs from the base, through the same tier.
 #[path = "ssd_boundary_codec_tests.rs"]
 mod ssd_boundary_codec_tests;

@@ -85,6 +85,10 @@ pub struct SpillJob {
     pub kv_caches: Vec<KvCache>,
     /// GDN linear-attention recurrent state (empty for pure-attention archs).
     pub lin_caches: Vec<LinearAttnCache>,
+    /// Token the recurrent state sits at: the length of the evicted entry's
+    /// prompt. Recorded in the block so a hydrate reads the state's position
+    /// instead of inferring it. Unused when `lin_caches` is empty.
+    pub state_len: i32,
 }
 
 /// Fire-and-forget SSD spiller: a bounded sender + a background drain thread.
@@ -316,26 +320,34 @@ fn drain_one_inner(
         kv_quant,
         kv_caches,
         lin_caches,
+        state_len,
     } = job;
     let hex = hash_to_hex(hash);
     let path: PathBuf = dir.join(format!("{hex}.kvb"));
 
     // ── Phase 1+2: serialize (CPU eval) + write (FS) ─────────────────────────
     let t0 = Instant::now();
-    let (byte_size, dur_serialize_us, dur_write_us) =
-        match write_caches_timed(&path, device, &model_id, kv_quant, &kv_caches, &lin_caches) {
-            Ok(timings) => timings,
-            Err(e) => {
-                tracing::warn!(
-                    hash = %hex,
-                    path = %path.display(),
-                    error = %e,
-                    "kv-spill: serialize failed, dropping job"
-                );
-                let _ = std::fs::remove_file(&path);
-                return false;
-            }
-        };
+    let (byte_size, dur_serialize_us, dur_write_us) = match write_caches_timed(
+        &path,
+        device,
+        &model_id,
+        kv_quant,
+        &kv_caches,
+        &lin_caches,
+        state_len,
+    ) {
+        Ok(timings) => timings,
+        Err(e) => {
+            tracing::warn!(
+                hash = %hex,
+                path = %path.display(),
+                error = %e,
+                "kv-spill: serialize failed, dropping job"
+            );
+            let _ = std::fs::remove_file(&path);
+            return false;
+        }
+    };
 
     // ── Phase 3: index record ─────────────────────────────────────────────────
     let t_idx = Instant::now();

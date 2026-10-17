@@ -15,6 +15,34 @@ fn open() -> SsdKvIndex {
 
 // ── CRUD ──────────────────────────────────────────────────────────────────
 
+/// A row that a spill replaced since it was read is not the row the caller
+/// judged: `delete_if_unchanged` spares it, even at the same size.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test: a row this test just recorded is present"
+)]
+#[allow(clippy::unwrap_used, reason = "test: an in-memory index cannot fail")]
+fn delete_if_unchanged_spares_a_row_a_spill_replaced() {
+    let idx = open();
+    let hash = hash_to_hex(0x1234_5678_9abc_def0);
+    let path = PathBuf::from("/tmp/test.kvb");
+    idx.record(&hash, LK_A, &path, "Arch/snap", "k8v8", 1024)
+        .unwrap();
+    let judged = idx.lookup(&hash, LK_A).unwrap().expect("row");
+
+    idx.record(&hash, LK_A, &path, "Arch/snap", "k8v8", 1024)
+        .unwrap();
+
+    assert!(!idx.delete_if_unchanged(&judged).unwrap());
+    let fresh = idx
+        .lookup(&hash, LK_A)
+        .unwrap()
+        .expect("replaced row stays");
+    assert!(idx.delete_if_unchanged(&fresh).unwrap());
+    assert!(idx.lookup(&hash, LK_A).unwrap().is_none());
+}
+
 #[test]
 #[allow(
     clippy::expect_used,

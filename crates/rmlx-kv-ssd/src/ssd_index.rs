@@ -172,13 +172,20 @@ type Result<T> = std::result::Result<T, SsdKvIndexError>;
 ///   exact string equality, so the rename is a stored-format change on the same
 ///   schedule.
 ///
+/// - v8 → v9: a block that carries a recurrent state now records the token it
+///   sits at (the `lin_pos` header), and a hydrate reuses such a block only when
+///   that token is the prefix the digest names. A v8 block records none, so it
+///   would be refused on every lookup; the bump wipes those instead of leaving
+///   files that can never serve. `layout_key` cannot carry this: it folds arch,
+///   layer count, kv_heads, head_dim and the codec vector, none of which move.
+///
 /// v2 rows are **convertible** — `UPDATE kv_blocks SET last_used = last_used *
 /// 1000000` is the whole migration. They are wiped anyway, and that is a
 /// choice, not a constraint: rMLX is unreleased, the tier is a pure cache
 /// whose worst loss is one re-prefill per block, and carrying migration code
 /// (plus the branch in the wipe pass that has to let a v2 DB through so it can
 /// be converted) buys nothing a warm cache does not rebuild in minutes.
-pub(crate) const SCHEMA_VERSION: i64 = 8;
+pub(crate) const SCHEMA_VERSION: i64 = 9;
 
 const SCHEMA_PRAGMAS: &str = "
 PRAGMA journal_mode = WAL;
@@ -392,6 +399,24 @@ impl SsdKvIndex {
             params![hash, layout_key as i64],
         )?;
         Ok(())
+    }
+
+    /// Delete `row` only if the index still holds it as it was read: the same
+    /// size and `last_used` stamp. A spill of the same key that landed since
+    /// replaced the row (`record` stamps a fresh `last_used`), and that row is
+    /// not the one the caller judged. Returns whether a row was deleted.
+    pub fn delete_if_unchanged(&self, row: &KvBlockRow) -> Result<bool> {
+        let deleted = self.conn.execute(
+            "DELETE FROM kv_blocks WHERE hash = ?1 AND layout_key = ?2 \
+             AND byte_size = ?3 AND last_used = ?4",
+            params![
+                row.hash,
+                row.layout_key as i64,
+                row.byte_size as i64,
+                row.last_used as i64
+            ],
+        )?;
+        Ok(deleted > 0)
     }
 
     // ── Write ─────────────────────────────────────────────────────────────────

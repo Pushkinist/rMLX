@@ -214,14 +214,36 @@ On a RAM miss it runs on the request thread:
 2. **Read.** `block_io::read_caches` checks the block's `model_id` (the
    namespace) and `kv_quant` metadata before reading tensors. Every rebuilt
    `KvCache` takes the request's `DispatchPolicy`.
-3. **Touch.** `index.touch(hash, layout_key)` updates `last_used`.
+3. **Claim.** A block holds the whole entry that was spilled: K/V and
+   recurrent state at the end of its prompt, which is past the last full block
+   unless the prompt length is a multiple of `BLOCK_TOKENS`. The returned
+   `prompt_ids` name only the matched blocks, so every cache must sit at that
+   length. The header decides first, before any tensor is read:
+   - K/V shorter than the claim cannot be grown;
+   - a recurrent state cannot be rewound, so the position the block records for
+     it (`lin_pos`) must equal the claim, and a block that records none is not
+     used.
+
+   Then K/V longer than the claim is cut back: the store with
+   `KvCache::truncate_to`, and the bf16 mirror along its sequence axis. On a
+   mirror-fed layer the mirror IS the K/V, and the writer refuses a mirror that
+   is not as long as the offset, so a cut that left it long would lose the block
+   at the next spill. A store reports a refused cut only by leaving its CPU
+   payload inconsistent with its shape, so a cut cache is read back through the
+   K and V dequant probes, and every cache must end at the claim.
+4. **Touch.** `index.touch(hash, layout_key)` updates `last_used`.
 
 It returns a `HydratedBlock`: the matched block-aligned token prefix, the
-`KvCache`s and the `LinearAttnCache`s.
+`KvCache`s and the `LinearAttnCache`s, all at the length of that prefix.
 
 A corrupt block (bad read, metadata mismatch) is a miss: the row, then the
-file, are deleted with a `warn!`. A missing file is the normal result of an
-eviction racing the read. It drops the row with a `debug!` and is a miss. The
+file, are deleted with a `warn!`. So is a block that cannot be brought to its
+claim (`ClaimMismatch`): the `warn!` names the reason, and the row and file go
+too, because the row would otherwise shadow every shorter block on the next
+lookup. The row is deleted only if it still has the size and `last_used` it was
+read with, and the file only when the row was, so a spill of the same key that
+landed since the lookup keeps its block. A missing file is the normal result of
+an eviction racing the read. It drops the row with a `debug!` and is a miss. The
 hydrator never panics and never returns an error to the caller.
 
 ### The per-arch entry impls
@@ -294,7 +316,12 @@ and `docs/SSD_CANARY.md`.
 When `PromptCache::push` evicts an entry:
 
 1. **Request thread.** An entry with no full block, or no known codec, is not
-   spilled. Otherwise the spill sink deep-clones the caches and evaluates the
+   spilled. Nor is an entry with a recurrent state whose prompt ends inside a
+   block: a hydrate cannot rewind that state to the last full block, so the
+   block would never be used, and it would sit under the key an entry ending on
+   that block boundary is spilled under (`spill_key` logs the skip at `debug!`).
+   A hybrid model therefore round-trips only block-aligned prompts, until a
+   block-boundary state is spilled instead of the end state. Otherwise the spill sink deep-clones the caches and evaluates the
    clones (`eval_for_spill`) while the Metal context is its own. It then
    `try_send`s a `SpillJob` on a bounded channel of depth 16. A full channel
    drops the job with a `warn!`; decode never waits.
@@ -386,22 +413,21 @@ A `.kvb` is a safetensors file. Its `__metadata__`:
 | `model_id` | the namespace: `--project`, or the model id |
 | `kv_quant` | `KvQuant` Display string |
 | `n_layers` | attention layers serialised |
-| `seq_len` | tokens at serialisation |
+| `seq_len` | tokens at serialisation: the entry's whole prompt, not a block multiple |
 | `n_linear` | GDN layers (`0` on pure attention) |
+| `lin_pos` | token the recurrent state sits at; present when `n_linear > 0` |
 | `l{idx}.geom` | per-layer geometry: storage tag, `max_seq`, shape |
 
 A reader whose `model_id` or `kv_quant` differs fails with
 `BlockIoError::ModelIdMismatch` or `KvQuantMismatch` before any tensor read.
 
 Each hydrated layer gets the codec the arch builder gives that layer
-(`ArchPromptCache::layer_quants`: `kv_layer_quants`, or the base codec on
-every layer for an arch declared `with_uniform_layers`), not the block's base
-codec. The caller passes that vector
-to `SsdHydrator::lookup`, and a vector whose length is not the block's layer
-count is an error, which the tier treats as a corrupt block. A boundary layer
-holds the boundary floor, not the base codec
-(`docs/KV_LAYER_POLICY.md` § "Layer-adaptive overrides"), and decode reads its
-widths from the codec.
+(`ArchPromptCache::layer_quants`: `kv_layer_quants`, or the base codec on every
+layer for an arch declared `with_uniform_layers`), not the block's base codec.
+The caller passes that vector to `SsdHydrator::lookup`. A vector whose length is
+not the block's layer count is an error, and the block is kept. A boundary layer
+holds the boundary floor, not the base codec (`docs/KV_LAYER_POLICY.md`
+§ "Layer-adaptive overrides"), and decode reads its widths from the codec.
 
 **What a layer writes follows what it holds.**
 `KvStorage::is_geometry_only()` decides:

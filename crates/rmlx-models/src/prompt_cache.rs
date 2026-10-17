@@ -465,6 +465,29 @@ pub(crate) trait SpillSink<E>: Send {
     fn spill(&self, entry: &E);
 }
 
+/// The block digest an entry is spilled under, or `None` when it must not be.
+///
+/// No full block means no stable key. An entry with a recurrent state is spilled
+/// only when its prompt ends on a block boundary: the state sits at the end of
+/// the prompt and cannot be rewound to the last full block, so a hydrate could
+/// never reuse it, and its key is the one a boundary-aligned entry with the same
+/// leading blocks would be spilled under.
+pub(crate) fn spill_key<E: PromptCacheEntry>(entry: &E) -> Option<u64> {
+    let key = *entry.block_hashes().last()?;
+    let prompt_len = entry.prompt_token_ids().len();
+    let block_end = entry.block_hashes().len() * BLOCK_TOKENS;
+    if prompt_len != block_end && !entry.lin_caches().is_empty() {
+        tracing::debug!(
+            prompt_len,
+            block_end,
+            "kv-spill: recurrent state is past the last full block and cannot be \
+             rewound to it, skipping spill"
+        );
+        return None;
+    }
+    Some(key)
+}
+
 /// Blanket spill impl over any `PromptCacheEntry`.
 ///
 /// Replaces the per-arch `impl SpillSink<…Entry> for SsdSpiller` blocks: the
@@ -479,8 +502,8 @@ pub(crate) trait SpillSink<E>: Send {
 /// eviction never blocks on disk I/O and never panics.
 impl<E: PromptCacheEntry> SpillSink<E> for SsdSpiller {
     fn spill(&self, entry: &E) {
-        let Some(&hash) = entry.block_hashes().last() else {
-            return; // no full block → no stable spill key
+        let Some(hash) = spill_key(entry) else {
+            return;
         };
         let Some(kv_quant) = entry.kv_quant() else {
             return; // unknown quant → cannot tag the block
@@ -525,6 +548,7 @@ impl<E: PromptCacheEntry> SpillSink<E> for SsdSpiller {
             kv_quant,
             kv_caches,
             lin_caches,
+            state_len: i32::try_from(entry.prompt_token_ids().len()).unwrap_or(i32::MAX),
         });
     }
 }

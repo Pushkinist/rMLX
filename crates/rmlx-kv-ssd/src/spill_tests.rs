@@ -25,6 +25,7 @@ fn job(hash: u64) -> SpillJob {
         kv_quant: KvQuant::None,
         kv_caches: vec![KvCache::with_quant(KvQuant::None)],
         lin_caches: Vec::new(),
+        state_len: 0,
     }
 }
 

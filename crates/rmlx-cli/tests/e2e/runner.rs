@@ -1463,8 +1463,9 @@ fn assert_thinking(port: u16, id: &str, mk: &dyn Fn(Verdict, String) -> CaseResu
 /// A long, prefix-stable prompt that forms at least one full 256-token
 /// prompt-cache block so both the SSD spill (whole-block-only) and the
 /// ExactOnly prompt-cache hit (Bonsai/Qwen3) have a stable cache key. ~520
-/// words of English ≈ ≳600 tokens ≈ 2+ full 256-token blocks. Mirrors the
-/// PROMPT_A used by `crates/rmlx-server/tests/ssd_cache_restart.rs`.
+/// words of English ≈ ≳600 tokens ≈ 2+ full 256-token blocks. It does not end on
+/// a block boundary, so it round-trips on a pure-attention model only: a hybrid
+/// model's recurrent state is spilled only at a boundary (`docs/SSD_TIER.md`).
 const CACHE_PROMPT_LONG: &str = "You are a meticulous senior systems engineer reviewing a \
 design specification. Read the following description carefully and then produce a single concise \
 summary paragraph that faithfully preserves every stated constraint. The system under review \
