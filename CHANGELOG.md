@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-10-17
+
+This release serves Ternary-Bonsai-2-27B and the other Prism Hadamard packs.
+It adds word timestamps and a streamed reply to the Whisper routes.
+
+Most other changes are fixes. Whisper writes no text for a window with no
+speech. `/v1/audio/speech` stops at the end of the speech, and its memory no
+longer grows with the square of the frame count. A request that is gone frees
+the GPU. A model load no longer stops the server. `rmlx serve` exits within
+10 s of a SIGINT or SIGTERM. A media input that the client got wrong is a 400.
+A long prompt no longer grows the memory of the process with the square of its
+length.
+
+Three changes to read before upgrading: the audio of a speech request is no
+longer the greedy audio (**Fixed**); `reasoning_effort` and
+`chat_template_kwargs` reach the chat template as sent (**Changed**);
+`completion_tokens` no longer counts the end item of a generation
+(**Fixed**).
+
 ### Added
 
 - **Ternary-Bonsai-2-27B and other Prism Hadamard packs are served.** A pack
@@ -485,6 +504,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   full clear frees. A short prompt trims nothing, so its prefill speed does
   not change. A long prompt pays the time to return the memory: on
   gemma-4-e2b at 34 349 tokens the prefill is 2.9% slower.
+
+### Dependencies
+
+- `minijinja` 2.24.0 -> 3.0.0. The `serde` feature is now on, and the render
+  context is built from a map. Every local chat template renders the same as
+  with 2.24.
+- Five minor and patch updates: `toml` 1.1.8, `tokio` 1.53.2, `libc` 0.2.190,
+  `twox-hash` 2.1.5 and `uuid` 1.28.0.
+
+### Retrospective
+
+- [#673](https://github.com/Pushkinist/rMLX/issues/673): models(refactor): eight decode loops each carry the exact-hit arm and the store step; 0.4.3 made one edit in seven of them
+- [#674](https://github.com/Pushkinist/rMLX/issues/674): server(refactor): the two JSON constraint engines each carry the same engagement state; 0.4.3 added it to both
+- [#676](https://github.com/Pushkinist/rMLX/issues/676): test(refactor): the counting global allocator is copied in two test binaries of rmlx-mlx
+- [#677](https://github.com/Pushkinist/rMLX/issues/677): docs: cut the five docs that 0.4.3 grew or added to current truth (GPU_TESTS, SPEC_ANSWER_EQUIVALENCE, PROFILING, MLX_PAIR, SERVER_TOOLS)
 
 ## [0.4.3] - 2026-10-09
 
@@ -3535,7 +3569,8 @@ inference + conversion backend for Apple Silicon — no Python at runtime.
 - Speculative drafters validated against their verifiers: Qwen 3.6 MTP sidecar
   and the Gemma 4 assistant drafter.
 
-[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.4.3...HEAD
+[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.4.4...HEAD
+[0.4.4]: https://github.com/Pushkinist/rMLX/releases/tag/v0.4.4
 [0.4.3]: https://github.com/Pushkinist/rMLX/releases/tag/v0.4.3
 [0.4.2]: https://github.com/Pushkinist/rMLX/releases/tag/v0.4.2
 [0.4.1]: https://github.com/Pushkinist/rMLX/releases/tag/v0.4.1
