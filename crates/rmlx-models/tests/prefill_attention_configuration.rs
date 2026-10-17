@@ -966,7 +966,7 @@ fn assert_within_one_bf16_unit(
 }
 
 /// A mask the rule cannot pad is refused, not padded wrongly: its query axis
-/// holds neither one row nor the query rows.
+/// holds none of one row, the query rows and the padded rows.
 #[ignore = "builds attention nodes on the Metal GPU stream"]
 #[test]
 fn a_mask_with_another_row_count_is_refused() {

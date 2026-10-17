@@ -385,12 +385,16 @@ fn sdpa_under(
                 Some(axis) if mask_shape.get(axis) == Some(&query_rows) => {
                     Some(padded(mask, &mask_shape, axis)?)
                 }
-                // One row, or no row axis: MLX broadcasts it over the query
-                // rows, the padded rows included.
-                Some(axis) if mask_shape.get(axis) != Some(&1) => {
+                // One row, a mask already at the padded rows, or no row axis:
+                // MLX takes it as it is.
+                Some(axis)
+                    if mask_shape.get(axis) != Some(&1)
+                        && mask_shape.get(axis) != Some(&padded_rows) =>
+                {
                     return Err(Error::Mlx(format!(
                         "scaled_dot_product_attention: the mask has shape {mask_shape:?}, and \
-                         its query axis is neither 1 nor the {query_rows} query rows"
+                         its query axis is none of 1, the {query_rows} query rows and the \
+                         {padded_rows} padded rows"
                     )));
                 }
                 _ => None,
@@ -417,9 +421,19 @@ fn sdpa_under(
 
 const QUERY_ROW_AXIS: usize = 2;
 const HEAD_DIM_AXIS: usize = 3;
+const PADDED_HEAD_DIM: i32 = 256;
+const MIN_PADDED_QUERY_ROWS: i32 = 1024;
+const QUERY_BLOCK: i32 = 64;
 
-/// `(query rows, padded query rows)` when this call must reach MLX with more
-/// query rows than it has.
+/// Whether a call with `query_rows` rows is one the row rule can pad, before
+/// its mask mode, device and head dims are looked at.
+const fn rows_may_be_padded(query_rows: i32) -> bool {
+    query_rows >= MIN_PADDED_QUERY_ROWS && query_rows % QUERY_BLOCK != 0
+}
+
+/// The query rows of the attention node a call with `query_rows` rows reaches
+/// MLX as: `query_rows` itself, or the next multiple of 64 when the row rule
+/// pads the call.
 ///
 /// This rule is for MLX 0.32.3, the pinned version. MLX 0.32.3 runs an
 /// attention call at head dim 256, with an array mask and at least 1024 query
@@ -444,26 +458,51 @@ const HEAD_DIM_AXIS: usize = 3;
 /// the mlx-c C API a binary is built against is not the MLX version it runs
 /// on, and the padding changes no real row on an MLX without the fault.
 ///
-/// A call under the row floor returns after one dim read, with no
-/// allocation: a decode step has one query row.
+/// A caller that builds the array mask for the node's rows hands it over with
+/// that many rows, and the call then copies nothing but the query. A mask with
+/// the call's own rows is padded here. Rows of a mask past the call's query
+/// rows are never read, so a consumer that adds the mask to its own scores
+/// takes the first query rows of it.
+///
+/// Integer arithmetic only: it allocates nothing, so a decode step pays no
+/// more than the dim reads of its caller.
+#[must_use]
+pub fn attention_node_query_rows(
+    query_rows: i32,
+    head_dim: i32,
+    v_head_dim: i32,
+    mask_mode: &str,
+    device: Device,
+) -> i32 {
+    if mask_mode != "array"
+        || device != Device::Gpu
+        || !rows_may_be_padded(query_rows)
+        || head_dim != PADDED_HEAD_DIM
+        || v_head_dim != PADDED_HEAD_DIM
+    {
+        return query_rows;
+    }
+    query_rows + QUERY_BLOCK - query_rows % QUERY_BLOCK
+}
+
+/// `(query rows, padded query rows)` when this call must reach MLX with more
+/// query rows than it has.
 fn padded_query_rows(q: &Array, v: &Array, mask_mode: &str, device: Device) -> Option<(i32, i32)> {
-    const HEAD_DIM: i32 = 256;
-    const MIN_QUERY_ROWS: i32 = 1024;
-    const QUERY_BLOCK: i32 = 64;
     if mask_mode != "array" || device != Device::Gpu {
         return None;
     }
     let query_rows = q.dim(QUERY_ROW_AXIS).ok()?;
-    if query_rows < MIN_QUERY_ROWS || query_rows % QUERY_BLOCK == 0 {
+    if !rows_may_be_padded(query_rows) {
         return None;
     }
-    if q.dim(HEAD_DIM_AXIS).ok()? != HEAD_DIM || v.dim(HEAD_DIM_AXIS).ok()? != HEAD_DIM {
-        return None;
-    }
-    Some((
+    let node_rows = attention_node_query_rows(
         query_rows,
-        query_rows + QUERY_BLOCK - query_rows % QUERY_BLOCK,
-    ))
+        q.dim(HEAD_DIM_AXIS).ok()?,
+        v.dim(HEAD_DIM_AXIS).ok()?,
+        mask_mode,
+        device,
+    );
+    (node_rows != query_rows).then_some((query_rows, node_rows))
 }
 
 /// Hand one attention node to mlx-c. Only [`sdpa_under`] calls this.

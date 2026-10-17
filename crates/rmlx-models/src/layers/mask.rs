@@ -10,6 +10,11 @@
 //! of transient host memory, which on a loaded machine exhausts free RAM and
 //! turns repeated in-process generations into a monotonic slowdown.
 //!
+//! `build_chunked_prefill_mask_rows` builds the mask for more query rows than
+//! the chunk has, for a caller whose attention node is padded by the row rule
+//! (`rmlx_mlx::attention_node_query_rows`): the mask then needs no copy at the
+//! call. Its extra rows are open and read by no real row.
+//!
 //! `build_swa_decode_mask` deliberately keeps its host fill. It is the
 //! `seq == 1` path, so it is O(`kv_len`) rather than O(`seq` × `kv_len`), and
 //! it is unreachable whenever the SWA cache rotates — which every shipped
@@ -37,7 +42,7 @@
 //! *reduces* total bytes allocated. Do not restate a mechanism for it here
 //! without measuring one.
 
-use rmlx_core::error::Result;
+use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{arange, greater_equal, multiply, scalar_f32, where_cond, Array, Device, Dtype};
 
 /// Additive bias applied to a blocked (query, key) pair.
@@ -84,24 +89,43 @@ pub fn pick_attn_mask_mode(pre_offset: i32, new_seq: i32) -> &'static str {
 /// MLX's valid `mask_mode` values: `""`, `"causal"`, `"array"`.
 /// `"additive"` is NOT accepted by mlx-c — always use `"array"` with this mask.
 pub fn build_chunked_prefill_mask(offset: i32, new_seq: i32, device: Device) -> Result<Array> {
+    build_chunked_prefill_mask_rows(offset, new_seq, new_seq, device)
+}
+
+/// [`build_chunked_prefill_mask`] with `query_rows >= new_seq` rows, for an
+/// attention call whose node has more query rows than the chunk
+/// (`rmlx_mlx::attention_node_query_rows`).
+///
+/// The first `new_seq` rows are the chunk's own. A row past them sits at a
+/// position beyond every key, so it is open: finite, and read by no real row.
+pub fn build_chunked_prefill_mask_rows(
+    offset: i32,
+    new_seq: i32,
+    query_rows: i32,
+    device: Device,
+) -> Result<Array> {
+    if query_rows < new_seq {
+        return Err(Error::Model(format!(
+            "build_chunked_prefill_mask_rows: {query_rows} query rows for a chunk of {new_seq}"
+        )));
+    }
     // Query absolute positions as a column, key absolute positions as a row:
     // the mask is their broadcast comparison.
-    let (q_pos, k_pos) = position_axes(offset, new_seq, device)?;
+    let (q_pos, k_pos) = position_axes(offset, query_rows, offset + new_seq, device)?;
     let allowed = greater_equal(&q_pos, &k_pos, device)?;
     let (open, blocked) = mask_scalars(device)?;
     where_cond(&allowed, &open, &blocked, device)
 }
 
-/// Build the `[1, 1, new_seq, offset + new_seq]` query / key position axes the
-/// prefill masks compare.
+/// Build the `[1, 1, rows, cols]` query / key position axes the prefill masks
+/// compare.
 ///
-/// `q_pos` holds absolute query positions `offset .. offset + new_seq` as a
-/// column; `k_pos` holds absolute key positions `0 .. offset + new_seq` as a
-/// row. Both are F32: every position a mask can address is an exact integer in
-/// F32 far below the 2^24 mantissa limit.
-fn position_axes(offset: i32, new_seq: i32, device: Device) -> Result<(Array, Array)> {
-    let cols = offset + new_seq;
-    let q_pos = position_column(i64::from(offset), new_seq, device)?;
+/// `q_pos` holds absolute query positions `offset .. offset + rows` as a
+/// column; `k_pos` holds absolute key positions `0 .. cols` as a row. Both are
+/// F32: every position a mask can address is an exact integer in F32 far below
+/// the 2^24 mantissa limit.
+fn position_axes(offset: i32, rows: i32, cols: i32, device: Device) -> Result<(Array, Array)> {
+    let q_pos = position_column(i64::from(offset), rows, device)?;
     let k_pos = arange(0.0, f64::from(cols), 1.0, device)?.reshape(&[1, 1, 1, cols], device)?;
     Ok((q_pos, k_pos))
 }
@@ -153,7 +177,7 @@ pub fn build_swa_prefill_mask(
     window: usize,
     device: Device,
 ) -> Result<Array> {
-    let (q_pos, k_pos) = position_axes(offset, new_seq, device)?;
+    let (q_pos, k_pos) = position_axes(offset, new_seq, offset + new_seq, device)?;
     // Not in the future: k_abs <= q_abs.
     let causal = greater_equal(&q_pos, &k_pos, device)?;
     // Within the window: q_abs - k_abs < window, i.e. k_abs >= q_abs - window + 1.

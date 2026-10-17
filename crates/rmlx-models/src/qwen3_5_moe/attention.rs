@@ -5,7 +5,10 @@
 //! q/k have per-head RMSNorm. Partial RoPE (rope_dims << head_dim).
 
 use rmlx_core::error::Result;
-use rmlx_mlx::{multiply, rope, scaled_dot_product_attention, sigmoid, Array, Device};
+use rmlx_mlx::{
+    attention_node_query_rows, multiply, rope, scaled_dot_product_attention, sigmoid, Array,
+    Device, Dtype,
+};
 
 use rmlx_kv_quant::KvCache;
 
@@ -25,6 +28,29 @@ pub(super) struct FullAttention {
     pub(super) scale: f32,
     pub(super) rope_theta: f32,
     pub(super) rope_dims: usize,
+}
+
+/// The array mask of a chunked prefill for the full-attention layers, or
+/// `None` when the step needs none.
+///
+/// It has the rows of the attention node the call reaches MLX as, so no layer
+/// copies it, and `dtype`, the hidden state's dtype. A layer whose queries
+/// have another dtype casts it, which MLX requires of a mask.
+pub(super) fn prefill_attention_mask(
+    head_dim: usize,
+    offset: i32,
+    seq: i32,
+    dtype: Dtype,
+    device: Device,
+) -> Result<Option<Array>> {
+    let mask_mode = crate::layers::pick_attn_mask_mode(offset, seq);
+    if mask_mode != "array" {
+        return Ok(None);
+    }
+    let head_dim = head_dim as i32;
+    let rows = attention_node_query_rows(seq, head_dim, head_dim, mask_mode, device);
+    let mask = crate::layers::build_chunked_prefill_mask_rows(offset, seq, rows, device)?;
+    Ok(Some(mask.astype(dtype, device)?))
 }
 
 impl FullAttention {
@@ -102,39 +128,24 @@ impl FullAttention {
         // avoid a broadcast+reshape that materialises the repeated cache.
         let _ = repeat_kv;
         let mask_mode = crate::layers::pick_attn_mask_mode(offset, seq);
-        // Mask sharing across layers: caller (forward_arr) builds the array
-        // mask once per chunk and threads it down; FullAttention only
-        // builds its own as a fallback. 60→6 mask constructions for a
-        // 7-chunk, 10-FA-layer prefill.
-        let owned_mask: Option<Array> = if mask_mode == "array" && prebuilt_mask.is_none() {
-            Some(crate::layers::build_chunked_prefill_mask(
-                offset, seq, device,
-            )?)
+        // The caller (forward_arr) builds the array mask once per forward and
+        // threads it down; this layer builds its own only without one.
+        let owned_mask = if prebuilt_mask.is_none() {
+            prefill_attention_mask(self.head_dim, offset, seq, queries.dtype(), device)?
         } else {
             None
         };
-        // MLX SDPA requires mask dtype to be promotable to Q/K/V dtype.
-        // The prebuilt mask is Bf16 (built for Bf16 models); for F16 models
-        // (e.g. PARO INT4 affine), cast the mask to F16 to match.
-        let q_dtype = queries.dtype();
-        let mask_owned: Option<Array> = if mask_mode == "array" {
-            let raw = prebuilt_mask.or(owned_mask.as_ref());
-            match raw {
-                Some(m) if m.dtype() != q_dtype => Some(m.astype(q_dtype, device)?),
-                _ => None,
-            }
+        let shared_mask = if mask_mode == "array" {
+            prebuilt_mask.or(owned_mask.as_ref())
         } else {
             None
         };
-        // Final mask reference: prefer cast copy, then owned, then prebuilt.
-        let additive_mask = if mask_mode == "array" {
-            mask_owned
-                .as_ref()
-                .or(prebuilt_mask)
-                .or(owned_mask.as_ref())
-        } else {
-            None
+        let query_dtype = queries.dtype();
+        let cast_mask = match shared_mask {
+            Some(m) if m.dtype() != query_dtype => Some(m.astype(query_dtype, device)?),
+            _ => None,
         };
+        let additive_mask = cast_mask.as_ref().or(shared_mask);
 
         // Route through `KvCache::update_and_sdpa` —
         // the universal wrapper that fuses cache update + SDPA and dispatches
@@ -173,3 +184,7 @@ impl FullAttention {
         self.o_proj.forward(&attn_gated, device)
     }
 }
+
+#[cfg(test)]
+#[path = "attention_tests.rs"]
+mod attention_tests;

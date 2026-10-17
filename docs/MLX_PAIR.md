@@ -298,7 +298,8 @@ The cause is the instrumented compile of that kernel; no run without the
 instrument has shown the fault, and mlx 0.31.2 and 0.32.1 do not show it.
 
 `sdpa_under` in `crates/rmlx-mlx/src/fast_ops.rs` keeps every call away from
-it: it pads the query rows of such a call to the next multiple of 64
+it: it pads the query rows of such a call to the next multiple of 64 and takes
+a mask that already has those rows as it is
 (`FFI.md`, "`scaled_dot_product_attention`"). The rule is on the query rows
 alone: a call with aligned key rows was measured clean, and a clean cell is
 only a bound on a rate. It has no `cfg` and runs on both mlx-c C API arms,
@@ -308,36 +309,27 @@ asked for. `crates/rmlx-models/tests/prefill_attention_configuration.rs`,
 `crates/rmlx-mlx/tests/attention_check_allocations.rs` and the padded-against-
 unpadded cell in `crates/rmlx-mlx/src/fast_ops_tests.rs` hold the rule.
 
-The cost of the copies (`FFI.md`, same section) was measured with
-`rmlx baseline --kv-quant none` on Qwen3.6-35B-A3B-8bit against a build
-without the rule, in alternating runs: 12 for each build at 4,000 and at
-32,518 prompt tokens, 8 at 130,790. The last prefill chunk is padded in each
-of the 10 full-attention layers, so a prefill has 10 padded nodes. The limits
-were declared before the runs. The figures are the build with the rule against
-the build without it.
+The copy of the mask is the cost that grows with the context: `padded rows x
+key rows` elements in each padded layer, 1792 x 130,790 x bf16 = 469 MB at
+130,790 prompt tokens, which sets the peak of the generation. A caller that
+builds its mask at `attention_node_query_rows` rows (Qwen3.5 does, once per
+forward) pays none of it. `a_padded_call_needs_no_mask_copy_when_the_mask_is_at_the_padded_rows`
+measures one Qwen3.8 layer (24 query heads, 4 KV heads, head dim 256, 1766
+query rows, bf16) with `PeakBracket`, the output evaluated inside the bracket:
 
-| Prompt tokens | Prefill rate | Verdict | `metal_gen_alloc_mb` | Verdict |
-|---:|---:|---|---:|---|
-| 4,000 | -0.39 % | PASS | -12.3 MB (-0.67 %) | PASS |
-| 32,518 | +0.82 % | PASS | 0.0 MB | PASS |
-| 130,790 | -1.59 % | INCONCLUSIVE | +268.8 MB (+5.43 %) | FAIL |
+| Key rows | Copying call | Pre-padded call | Difference | Mask copy |
+|---:|---:|---:|---:|---:|
+| 16,102 | 101,761,024 B | 44,040,192 B | 57,720,832 B | 57,709,568 B |
+| 32,486 | 160,481,280 B | 44,040,192 B | 116,441,088 B | 116,429,824 B |
 
-- Prefill rate: PASS is a median within 1 % and no run under 95 % of the
-  median of the other build; FAIL is a median under 97 %. The 130,790 cell has
-  one run at 92.3 %. Two sets of runs of one build at 32,518 tokens differ by
-  0.64 % in the median, with one run at 94.5 %, and 8 runs for each build do
-  not separate the 130,790 cell from that.
-- `metal_gen_alloc_mb` (`CLI.md`): PASS is within 1 % and FAIL is more than
-  3 %. Each build gave one value in all its runs. At 130,790 tokens the padded
-  mask copy, 1792 x 130790 x bf16 = 469 MB in each padded layer, sets the peak
-  of the generation. At 32,518 tokens the copy is 121 MB and stays below a
-  peak that another step sets. `metal_peak_mb`, which includes the weights,
-  and the peak RSS are PASS in the three cells.
-- Decode rate, 200 tokens after 4,000 prompt tokens: PASS on Qwen3.6
-  (+0.65 %), gemma-4-e4b (-0.24 %) and Ternary-Bonsai-8B (+0.11 %).
+The bounds were declared before the run: the difference is at least 95 % of
+the mask copy at both key counts, and the pre-padded headroom of the two key
+counts differs by less than 5 % of the copy's growth. What remains of the rule
+at 130,790 keys is the copy of Q, 22.0 MB in each padded layer, and 26 more
+mask rows built once per forward, 6.8 MB.
 
-Not measured: the HTTP server path, speculative prefill, and
-`metal_gen_alloc_mb` with a settled start count.
+Not measured: the prefill rate and `metal_gen_alloc_mb` of a whole prefill with
+the mask at the padded rows, the HTTP server path, and speculative prefill.
 
 ## Moving the pin
 

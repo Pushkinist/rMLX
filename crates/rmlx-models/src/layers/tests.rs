@@ -373,6 +373,46 @@ fn chunked_prefill_mask_lower_triangular() {
     assert_eq!(vals[14], 0.0);
 }
 
+/// A mask built for more query rows than the chunk has keeps the chunk's own
+/// rows as they are, and every row past them is open: its position is beyond
+/// every key, so the row is finite and no real row reads it.
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: the lengths are asserted before each index"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "every unwrap is on an MLX op over a fixture of known shape; a failure is a broken fixture"
+)]
+fn chunked_prefill_mask_rows_past_new_seq_are_open() {
+    let exact = build_chunked_prefill_mask(2, 3, Device::Cpu).unwrap();
+    let extended = build_chunked_prefill_mask_rows(2, 3, 6, Device::Cpu).unwrap();
+    assert_eq!(extended.shape(), vec![1, 1, 6, 5]);
+    extended.eval().unwrap();
+    exact.eval().unwrap();
+    let (exact, extended) = (mask_bf16_to_f32(&exact), mask_bf16_to_f32(&extended));
+    assert_eq!(extended.len(), 30);
+    assert_eq!(extended[..15], exact[..]);
+    assert!(
+        extended[15..].iter().all(|v| *v == 0.0),
+        "rows past the chunk must be open and finite: {:?}",
+        &extended[15..]
+    );
+}
+
+/// A mask asked for fewer query rows than the chunk has is refused.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "expect_err on a call that must fail; the message names the case"
+)]
+fn chunked_prefill_mask_rows_refuses_fewer_rows_than_the_chunk() {
+    let err = build_chunked_prefill_mask_rows(2, 3, 2, Device::Cpu)
+        .expect_err("2 query rows for a 3-row chunk");
+    assert!(err.to_string().contains("query rows"), "{err}");
+}
+
 /// SWA decode mask: window=1024, total_kv_len=512 → None (all attend).
 #[test]
 #[allow(

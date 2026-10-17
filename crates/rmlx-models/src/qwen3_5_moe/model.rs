@@ -19,6 +19,7 @@ use rmlx_core::cancel::ensure_not_cancelled;
 use rmlx_core::error::Result;
 use rmlx_mlx::{Array, Device, Dtype};
 
+use super::attention::prefill_attention_mask;
 use super::capture_tail::CaptureTail;
 use super::config::Qwen3_5MoeConfig;
 use super::decoder_layer::{DecoderLayer, MlpBlock};
@@ -168,22 +169,12 @@ impl Qwen3_5MoeText {
             .and_then(|cs| cs.get(fa_idx))
             .map_or(0, |c| c.offset());
 
-        // Build the chunked-prefill array mask ONCE per forward call (when
-        // applicable) and share it across all 10 FullAttention layers.
-        // Saves N-1 redundant mask Vec allocs + GPU uploads per chunk.
-        let shared_mask: Option<Array> =
-            if crate::layers::pick_attn_mask_mode(base_offset, seq) == "array" {
-                Some(crate::layers::build_chunked_prefill_mask(
-                    base_offset,
-                    seq,
-                    device,
-                )?)
-            } else {
-                None
-            };
-
         let h = self.embed_tokens.forward(ids_arr, device)?;
         let h = h.reshape(&[1, seq, self.cfg.hidden_size as i32], device)?;
+        // One chunked-prefill array mask per forward, shared by every
+        // full-attention layer.
+        let shared_mask =
+            prefill_attention_mask(self.cfg.head_dim, base_offset, seq, h.dtype(), device)?;
 
         let mut h = h;
         // We index into both caches by layer; using two `Option<&mut [...]>`
@@ -356,19 +347,10 @@ impl Qwen3_5MoeText {
         let fa_idx = self.cfg.full_attention_interval.saturating_sub(1);
         let base_offset = kv_caches.get(fa_idx).map_or(0, |c| c.offset());
 
-        let shared_mask: Option<Array> =
-            if crate::layers::pick_attn_mask_mode(base_offset, seq) == "array" {
-                Some(crate::layers::build_chunked_prefill_mask(
-                    base_offset,
-                    seq,
-                    device,
-                )?)
-            } else {
-                None
-            };
-
         let h = self.embed_tokens.forward(ids_arr, device)?;
         let h = h.reshape(&[1, seq, self.cfg.hidden_size as i32], device)?;
+        let shared_mask =
+            prefill_attention_mask(self.cfg.head_dim, base_offset, seq, h.dtype(), device)?;
 
         let mut h = h;
         match lin_caches {
@@ -460,19 +442,10 @@ impl Qwen3_5MoeText {
         let fa_idx = self.cfg.full_attention_interval.saturating_sub(1);
         let base_offset = kv_caches.get(fa_idx).map_or(0, |c| c.offset());
 
-        let shared_mask: Option<Array> =
-            if crate::layers::pick_attn_mask_mode(base_offset, seq) == "array" {
-                Some(crate::layers::build_chunked_prefill_mask(
-                    base_offset,
-                    seq,
-                    device,
-                )?)
-            } else {
-                None
-            };
-
         let h = self.embed_tokens.forward(&ids_arr, device)?;
         let mut h = h.reshape(&[1, seq, self.cfg.hidden_size as i32], device)?;
+        let shared_mask =
+            prefill_attention_mask(self.cfg.head_dim, base_offset, seq, h.dtype(), device)?;
 
         let hidden = self.cfg.hidden_size as i32;
         // Capture the last-k slice of the residual stream output of each
@@ -581,19 +554,10 @@ impl Qwen3_5MoeText {
         let fa_idx = self.cfg.full_attention_interval.saturating_sub(1);
         let base_offset = kv_caches.get(fa_idx).map_or(0, |c| c.offset());
 
-        let shared_mask: Option<Array> =
-            if crate::layers::pick_attn_mask_mode(base_offset, seq) == "array" {
-                Some(crate::layers::build_chunked_prefill_mask(
-                    base_offset,
-                    seq,
-                    device,
-                )?)
-            } else {
-                None
-            };
-
         let h = self.embed_tokens.forward(&ids_arr, device)?;
         let mut h = h.reshape(&[1, seq, hidden], device)?;
+        let shared_mask =
+            prefill_attention_mask(self.cfg.head_dim, base_offset, seq, h.dtype(), device)?;
 
         let capture_set: std::collections::HashSet<usize> =
             capture_layer_ids.iter().copied().collect();
@@ -691,19 +655,10 @@ impl Qwen3_5MoeText {
         let fa_idx = self.cfg.full_attention_interval.saturating_sub(1);
         let base_offset = kv_caches.get(fa_idx).map_or(0, |c| c.offset());
 
-        let shared_mask: Option<Array> =
-            if crate::layers::pick_attn_mask_mode(base_offset, seq) == "array" {
-                Some(crate::layers::build_chunked_prefill_mask(
-                    base_offset,
-                    seq,
-                    device,
-                )?)
-            } else {
-                None
-            };
-
         let h = self.embed_tokens.forward(&ids_arr, device)?;
         let mut h = h.reshape(&[1, seq, hidden], device)?;
+        let shared_mask =
+            prefill_attention_mask(self.cfg.head_dim, base_offset, seq, h.dtype(), device)?;
 
         let capture_set: std::collections::HashSet<usize> =
             capture_layer_ids.iter().copied().collect();
@@ -796,19 +751,10 @@ impl Qwen3_5MoeText {
         let fa_idx = self.cfg.full_attention_interval.saturating_sub(1);
         let base_offset = kv_caches.get(fa_idx).map_or(0, |c| c.offset());
 
-        let shared_mask: Option<Array> =
-            if crate::layers::pick_attn_mask_mode(base_offset, seq_i) == "array" {
-                Some(crate::layers::build_chunked_prefill_mask(
-                    base_offset,
-                    seq_i,
-                    device,
-                )?)
-            } else {
-                None
-            };
-
         let h_embed = self.embed_tokens.forward(&ids_arr, device)?;
         let mut h = h_embed.reshape(&[1, seq_i, hidden], device)?;
+        let shared_mask =
+            prefill_attention_mask(self.cfg.head_dim, base_offset, seq_i, h.dtype(), device)?;
 
         let capture_set: std::collections::HashSet<usize> =
             capture_layer_ids.iter().copied().collect();

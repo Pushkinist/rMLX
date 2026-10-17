@@ -9,7 +9,8 @@ use crate::rot_k_msl::rot_k_fwht_rotate_gpu;
 use rmlx_core::error::{Error, Result};
 use rmlx_core::DispatchPolicy;
 use rmlx_mlx::{
-    add, expand_dims, multiply, quantized_matmul, scalar_f32, softmax_precise, Array, Device,
+    add, attention_node_query_rows, expand_dims, multiply, quantized_matmul, scalar_f32,
+    softmax_precise, Array, Device,
 };
 
 use super::state::MixedTuple;
@@ -118,6 +119,24 @@ pub fn mixed_quantized_sdpa(
 
     let scores_masked = match additive_mask {
         Some(m) => {
+            // A prefill mask built for a padded attention node carries rows
+            // past the call's query rows; none of them is read. Any other row
+            // count is passed on, and the add refuses it.
+            let node_rows = attention_node_query_rows(l, d, d, "array", device);
+            let m_shape = m.shape();
+            let m_first_rows;
+            let m = match m_shape.len().checked_sub(2) {
+                Some(axis) if node_rows != l && m_shape.get(axis) == Some(&node_rows) => {
+                    let mut stop = m_shape;
+                    if let Some(rows) = stop.get_mut(axis) {
+                        *rows = l;
+                    }
+                    m_first_rows =
+                        m.slice(&vec![0; stop.len()], &stop, &vec![1; stop.len()], device)?;
+                    &m_first_rows
+                }
+                _ => m,
+            };
             let mask = if m.dtype() == scores.dtype() {
                 m.try_clone()?
             } else {

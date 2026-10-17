@@ -25,7 +25,8 @@ mod quant;
 pub use embedding::Embedding;
 pub use linear::{Linear, ParoRotation};
 pub use mask::{
-    build_chunked_prefill_mask, build_swa_decode_mask, build_swa_prefill_mask, pick_attn_mask_mode,
+    build_chunked_prefill_mask, build_chunked_prefill_mask_rows, build_swa_decode_mask,
+    build_swa_prefill_mask, pick_attn_mask_mode,
 };
 pub use mlp::{Activation, Mlp, MoeBlock};
 pub use norm::RmsNorm;

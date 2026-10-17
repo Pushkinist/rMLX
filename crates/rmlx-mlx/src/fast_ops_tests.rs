@@ -168,21 +168,14 @@ fn a_padded_call_returns_the_rows_of_the_unpadded_node() {
         let q = uniform_bf16(&mut state, &[1, q_heads, q_rows, 256]);
         let k = uniform_bf16(&mut state, &[1, kv_heads, k_rows, 256]);
         let v = uniform_bf16(&mut state, &[1, kv_heads, k_rows, 256]);
-        let offset = (k_rows - q_rows) as usize;
-        let mut mask_host = vec![0.0f32; (q_rows * k_rows) as usize];
-        for (i, row) in mask_host.chunks_exact_mut(k_rows as usize).enumerate() {
-            for hidden in &mut row[offset + i + 1..] {
-                *hidden = -1e30;
-            }
-        }
-        let mask = Array::from_f32_slice(&mask_host, &[1, 1, q_rows, k_rows])
-            .expect("mask")
-            .astype(Dtype::Bf16, Device::Gpu)
-            .expect("mask bf16");
+        let first_query = k_rows - q_rows;
+        let padded_rows = (q_rows + 63) / 64 * 64;
+        let mask = causal_mask_bf16(q_rows, k_rows, first_query);
+        let mask_at_padded_rows = causal_mask_bf16(padded_rows, k_rows, first_query);
 
         assert_eq!(
             padded_query_rows(&q, &v, "array", Device::Gpu),
-            Some((q_rows, (q_rows + 63) / 64 * 64)),
+            Some((q_rows, padded_rows)),
             "the rule must pad this call"
         );
         let unpadded = attention_node(&q, &k, &v, 0.5, "array", Some(&mask), Device::Gpu, None)
@@ -198,8 +191,24 @@ fn a_padded_call_returns_the_rows_of_the_unpadded_node() {
             Device::Gpu,
         )
         .expect("padded call");
+        let pre_padded = sdpa_under(
+            c_api::verdict(),
+            &q,
+            &k,
+            &v,
+            0.5,
+            "array",
+            Some(&mask_at_padded_rows),
+            Device::Gpu,
+        )
+        .expect("pre-padded call");
         assert_eq!(padded.shape(), unpadded.shape());
-        let (padded, unpadded) = (f32_bits(&padded), f32_bits(&unpadded));
+        assert_eq!(pre_padded.shape(), unpadded.shape());
+        let (padded, pre_padded, unpadded) = (
+            f32_bits(&padded),
+            f32_bits(&pre_padded),
+            f32_bits(&unpadded),
+        );
         assert!(padded.iter().all(|x| f32::from_bits(*x).is_finite()));
         let first = padded.iter().zip(&unpadded).position(|(a, b)| a != b);
         assert_eq!(
@@ -207,5 +216,229 @@ fn a_padded_call_returns_the_rows_of_the_unpadded_node() {
             "{q_rows} query rows over {k_rows} keys: the padded call differs from the unpadded \
              node at flat index {first:?}"
         );
+        let first = pre_padded.iter().zip(&unpadded).position(|(a, b)| a != b);
+        assert_eq!(
+            first, None,
+            "{q_rows} query rows over {k_rows} keys: the call with a mask at the padded rows \
+             differs from the unpadded node at flat index {first:?}"
+        );
     }
+}
+
+/// Evaluate `a` now, so a later bracket does not count its allocation.
+fn materialised(a: Array) -> Array {
+    a.eval().expect("materialise");
+    a
+}
+
+/// The boolean causal mask `[1, 1, rows, key_rows]` (true = attend) for query
+/// rows at key positions `first_query_position + i`. Rows past the last key
+/// are open.
+fn causal_allowed(rows: i32, key_rows: i32, first_query_position: i32) -> Array {
+    let q_pos = crate::arange(
+        f64::from(first_query_position),
+        f64::from(first_query_position + rows),
+        1.0,
+        Device::Gpu,
+    )
+    .expect("query positions")
+    .reshape(&[1, 1, rows, 1], Device::Gpu)
+    .expect("query column");
+    let k_pos = crate::arange(0.0, f64::from(key_rows), 1.0, Device::Gpu)
+        .expect("key positions")
+        .reshape(&[1, 1, 1, key_rows], Device::Gpu)
+        .expect("key row");
+    materialised(crate::greater_equal(&q_pos, &k_pos, Device::Gpu).expect("allowed"))
+}
+
+/// [`causal_allowed`] as an additive bf16 mask.
+fn causal_mask_bf16(rows: i32, key_rows: i32, first_query_position: i32) -> Array {
+    let allowed = causal_allowed(rows, key_rows, first_query_position);
+    let open = crate::scalar_f32(0.0)
+        .astype(Dtype::Bf16, Device::Gpu)
+        .expect("open");
+    let blocked = crate::scalar_f32(-1e30)
+        .astype(Dtype::Bf16, Device::Gpu)
+        .expect("blocked");
+    materialised(crate::where_cond(&allowed, &open, &blocked, Device::Gpu).expect("mask"))
+}
+
+/// MLX frees the inputs of a command buffer when it completes, which can be
+/// after the evaluation that waited on it returned. Wait until the live byte
+/// count has not moved for 100 ms (at most 5 s), so a bracket opens on a
+/// settled count.
+fn wait_for_buffers_to_be_released() {
+    let step = std::time::Duration::from_millis(100);
+    let mut last = crate::mlx_active_memory_bytes();
+    for _ in 0..50 {
+        std::thread::sleep(step);
+        let now = crate::mlx_active_memory_bytes();
+        if now == last {
+            return;
+        }
+        last = now;
+    }
+    panic!("the live byte count did not settle in 5 s");
+}
+
+/// Bytes above the live bytes at open that one call needed, the output
+/// evaluated inside the bracket. The output is returned so the caller can
+/// compare it; it is evaluated before the bracket closes.
+fn headroom_of_call(call: impl FnOnce() -> Array) -> (u64, Array) {
+    wait_for_buffers_to_be_released();
+    let bracket = crate::PeakBracket::open();
+    let out = materialised(call());
+    let reading = bracket.close();
+    assert!(
+        reading.measurable(),
+        "the peak mark could not be reset, so there is no reading"
+    );
+    (reading.headroom_bytes(), out)
+}
+
+/// The mask copy of the row rule is gone when the caller hands the mask at the
+/// padded rows. One Qwen3.8 layer (24 query heads, 4 KV heads, head dim 256,
+/// 1766 query rows of a 2048-row chunk) at two key counts.
+///
+/// The bound is declared before the measurement: the call that copies the mask
+/// needs at least 95 % of the copy's bytes (`1792 x key rows x 2`) more than
+/// the call whose mask is already at 1792 rows, at both key counts; and the
+/// headroom of the pre-padded call does not grow with the key rows (the two
+/// counts differ by less than 5 % of the copy's growth). The two outputs are
+/// bit-equal. Neither key count is a multiple of 32, so the unpadded node is
+/// the configuration that fails under the shader-validation instrument: it is
+/// compared in the padded-against-unpadded cell, at aligned key rows.
+#[test]
+#[ignore = "evaluates attention on the Metal GPU"]
+fn a_padded_call_needs_no_mask_copy_when_the_mask_is_at_the_padded_rows() {
+    const QUERY_ROWS: i32 = 1766;
+    const PADDED_ROWS: i32 = 1792;
+    let mut pre_padded_headroom = Vec::new();
+    for key_rows in [16_102i32, 32_486] {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let q = materialised(uniform_bf16(&mut state, &[1, 24, QUERY_ROWS, 256]));
+        let k = materialised(uniform_bf16(&mut state, &[1, 4, key_rows, 256]));
+        let v = materialised(uniform_bf16(&mut state, &[1, 4, key_rows, 256]));
+        let first_query = key_rows - QUERY_ROWS;
+        let mask = causal_mask_bf16(QUERY_ROWS, key_rows, first_query);
+        let mask_at_padded_rows = causal_mask_bf16(PADDED_ROWS, key_rows, first_query);
+        let call = |mask: &Array| {
+            sdpa_under(
+                c_api::verdict(),
+                &q,
+                &k,
+                &v,
+                0.0625,
+                "array",
+                Some(mask),
+                Device::Gpu,
+            )
+            .expect("padded call")
+        };
+
+        let (copy_headroom, copy_out) = headroom_of_call(|| call(&mask));
+        let (pre_padded, pre_padded_out) = headroom_of_call(|| call(&mask_at_padded_rows));
+        let mask_copy_bytes = (PADDED_ROWS as u64) * (key_rows as u64) * 2;
+        assert!(
+            copy_headroom.saturating_sub(pre_padded) >= mask_copy_bytes * 95 / 100,
+            "{key_rows} keys: the copying call needed {copy_headroom} B and the pre-padded call \
+             {pre_padded} B; the mask copy is {mask_copy_bytes} B"
+        );
+        println!(
+            "headroom at {key_rows} keys: copying call {copy_headroom} B, pre-padded call \
+             {pre_padded} B, difference {} B, mask copy {mask_copy_bytes} B",
+            copy_headroom.saturating_sub(pre_padded)
+        );
+        pre_padded_headroom.push(pre_padded);
+
+        assert_eq!(
+            f32_bits(&copy_out),
+            f32_bits(&pre_padded_out),
+            "{key_rows} keys: the two calls differ"
+        );
+    }
+    let growth = pre_padded_headroom[0].abs_diff(pre_padded_headroom[1]);
+    let copy_growth = (PADDED_ROWS as u64) * (32_486 - 16_102) * 2;
+    assert!(
+        growth < copy_growth / 20,
+        "the pre-padded call's headroom grew by {growth} B between 16102 and 32486 keys \
+         ({pre_padded_headroom:?}); a mask copy would grow it by {copy_growth} B"
+    );
+}
+
+/// The node's rows are the next multiple of 64 for exactly the calls the rule
+/// pads, and the call's own rows for every other.
+// gpu-test-gate: exempt
+#[test]
+fn the_node_rows_are_padded_for_exactly_the_calls_the_rule_pads() {
+    let rows = |query_rows, head_dim, v_head_dim, mode, device| {
+        attention_node_query_rows(query_rows, head_dim, v_head_dim, mode, device)
+    };
+    assert_eq!(rows(1766, 256, 256, "array", Device::Gpu), 1792);
+    assert_eq!(rows(1025, 256, 256, "array", Device::Gpu), 1088);
+    assert_eq!(rows(2047, 256, 256, "array", Device::Gpu), 2048);
+    assert_eq!(rows(1024, 256, 256, "array", Device::Gpu), 1024);
+    assert_eq!(rows(2048, 256, 256, "array", Device::Gpu), 2048);
+    assert_eq!(rows(1023, 256, 256, "array", Device::Gpu), 1023);
+    assert_eq!(rows(1, 256, 256, "array", Device::Gpu), 1);
+    assert_eq!(rows(1766, 256, 256, "causal", Device::Gpu), 1766);
+    assert_eq!(rows(1766, 256, 256, "", Device::Gpu), 1766);
+    assert_eq!(rows(1766, 256, 256, "array", Device::Cpu), 1766);
+    assert_eq!(rows(1766, 128, 256, "array", Device::Gpu), 1766);
+    assert_eq!(rows(1766, 256, 128, "array", Device::Gpu), 1766);
+}
+
+/// A mask with one row more or fewer than the padded rows is refused, as is
+/// any other row count: the wrapper pads only the call's own rows.
+#[test]
+#[ignore = "builds attention nodes on the Metal GPU stream"]
+fn a_padded_call_refuses_a_mask_one_row_off_the_padded_rows() {
+    let (q_rows, k_rows) = (1025, 3072);
+    let q = crate::zeros(&[1, 8, q_rows, 256], Dtype::Bf16, Device::Gpu).expect("q");
+    let kv = crate::zeros(&[1, 2, k_rows, 256], Dtype::Bf16, Device::Gpu).expect("kv");
+    for rows in [1087, 1089] {
+        let mask = causal_mask_bf16(rows, k_rows, k_rows - q_rows);
+        let err = sdpa_under(
+            c_api::verdict(),
+            &q,
+            &kv,
+            &kv,
+            0.5,
+            "array",
+            Some(&mask),
+            Device::Gpu,
+        )
+        .expect_err("a mask that is neither the query rows nor the padded rows");
+        assert!(err.to_string().contains("query axis"), "{rows} rows: {err}");
+    }
+}
+
+/// A boolean mask already at the padded rows goes to MLX as it is and gives
+/// the rows of the call with the mask at its own rows.
+#[test]
+#[ignore = "evaluates attention on the Metal GPU"]
+fn a_padded_call_takes_a_boolean_mask_at_the_padded_rows_as_it_is() {
+    let (q_rows, k_rows, padded_rows) = (1025, 3072, 1088);
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let q = uniform_bf16(&mut state, &[1, 8, q_rows, 256]);
+    let k = uniform_bf16(&mut state, &[1, 2, k_rows, 256]);
+    let v = uniform_bf16(&mut state, &[1, 2, k_rows, 256]);
+    let first_query = k_rows - q_rows;
+    let call = |mask: &Array| {
+        sdpa_under(
+            c_api::verdict(),
+            &q,
+            &k,
+            &v,
+            0.5,
+            "array",
+            Some(mask),
+            Device::Gpu,
+        )
+        .expect("call")
+    };
+    let own_rows = f32_bits(&call(&causal_allowed(q_rows, k_rows, first_query)));
+    let padded = f32_bits(&call(&causal_allowed(padded_rows, k_rows, first_query)));
+    assert_eq!(own_rows.len(), 8 * q_rows as usize * 256);
+    assert!(own_rows == padded, "the two calls differ");
 }

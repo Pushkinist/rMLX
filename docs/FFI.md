@@ -502,22 +502,22 @@ One function, `sdpa_under`, builds every attention node, and it holds one rule
 on the query rows. On the GPU, with `"array"`, `head_dim` 256 for Q and V, and
 at least 1024 query rows that are not a multiple of 64, the node reaches MLX
 with its query rows padded to the next multiple of 64. The padding is the
-first rows of Q and of the mask, so the mask keeps its dtype and layout. A
-one-row mask is broadcast and not padded; a mask with another row count is
-refused. The padded rows are sliced off the output. Why: [`MLX_PAIR.md`](MLX_PAIR.md) §
-"The attention row rule".
+first rows of Q and, for a mask with the call's own rows, of the mask, so the
+mask keeps its dtype and layout. A one-row mask is broadcast and not padded; a
+mask that already has the padded rows goes to MLX as it is; any other row count
+is refused. The padded rows are sliced off the output. Why:
+[`MLX_PAIR.md`](MLX_PAIR.md) § "The attention row rule".
 
-An affected call costs, in each attention layer that issues one:
+`attention_node_query_rows` is the rule as integer arithmetic. A caller that
+builds its array mask with that many rows makes the wrapper copy no mask. The
+fused-over-store decode arms (one query row) never see the mask; every other KV
+arm goes through `scaled_dot_product_attention`. Only Mixed and RotK add the
+mask to their own scores, and take its first query rows: no real row reads the
+extra ones.
 
-- up to 63 more query rows in the kernel;
-- one copy of Q, `batch × heads × padded rows × 256` elements;
-- one copy of the mask, `padded rows × key rows` elements. A model shares one
-  mask across its layers, and the wrapper pads it again in each layer: about
-  131 MB a layer at 2000 query rows over 32,000 keys in bf16.
-
-The output slice is a view. The copies are lazy nodes; that section has the
-measured cost. Every other call pays the check: under 1024 query rows it is
-one dim read with no Rust allocation, and a decode step has one query row.
+An affected call costs, per layer, up to 63 more query rows, one copy of Q and,
+only when the mask has the call's own rows, one copy of the mask (`padded rows
+× key rows`). Every other call pays at most three dim reads.
 
 It is not always a FlashAttention kernel. `head_dim` decides, silently,
 whether the call reaches a fused kernel or a composite graph.

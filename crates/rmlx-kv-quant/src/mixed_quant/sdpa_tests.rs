@@ -335,6 +335,120 @@ fn mixed_decode_matches_dequant_oracle_across_context() {
     );
 }
 
+/// `mixed_quantized_sdpa` over random quantized K/V at `head_dim`, with the
+/// mask `mask_of(key_rows)` (or none), for `q_rows` query rows over `k_rows`
+/// keys.
+#[allow(
+    clippy::unwrap_used,
+    reason = "every unwrap is on a fixture this fn just built at a known shape; a failure is a broken fixture"
+)]
+fn mixed_output(
+    device: Device,
+    head_dim: i32,
+    q_rows: i32,
+    k_rows: i32,
+    mask_of: impl Fn(i32) -> Option<Array>,
+) -> Result<Vec<f32>> {
+    let (kv_heads, repeats) = (2i32, 2i32);
+    let n_q_heads = kv_heads * repeats;
+    let (group, k_bits, v_bits) = (64i32, 8i32, 4i32);
+    let q = from_vec(
+        &gaussian_data((n_q_heads * q_rows * head_dim) as usize, TEST_SEED),
+        &[1, n_q_heads, q_rows, head_dim],
+    );
+    let kv_n = (kv_heads * k_rows * head_dim) as usize;
+    let kv_shape = [1, kv_heads, k_rows, head_dim];
+    let k = from_vec(&gaussian_data(kv_n, TEST_SEED ^ 0xA5A5), &kv_shape);
+    let v = from_vec(&gaussian_data(kv_n, TEST_SEED ^ 0x5A5A), &kv_shape);
+    let (kc, ks, kb) = rmlx_mlx::quantize(&k, group, k_bits, device).unwrap();
+    let (vc, vs, vb) = rmlx_mlx::quantize(&v, group, v_bits, device).unwrap();
+    let mask = mask_of(k_rows);
+    let out = mixed_quantized_sdpa(
+        &q,
+        &MixedTuple {
+            codes: kc,
+            scales: ks,
+            biases: kb,
+        },
+        &MixedTuple {
+            codes: vc,
+            scales: vs,
+            biases: vb,
+        },
+        0.125,
+        mask.as_ref(),
+        group,
+        k_bits,
+        group,
+        v_bits,
+        None,
+        device,
+        DispatchPolicy::default(),
+    )?;
+    Ok(to_vec(&out))
+}
+
+/// A causal additive mask `[1, 1, rows, k_rows]` for `q_rows` query rows at
+/// the end of `k_rows` keys; rows past `q_rows` are open.
+fn causal_mask(rows: i32, q_rows: i32, k_rows: i32) -> Array {
+    let data: Vec<f32> = (0..rows)
+        .flat_map(|i| (0..k_rows).map(move |j| if j > k_rows - q_rows + i { -1e30 } else { 0.0 }))
+        .collect();
+    from_vec(&data, &[1, 1, rows, k_rows])
+}
+
+/// A mask at the rows of the padded attention node gives the result of the
+/// exact mask: the consumer reads the first query rows of it.
+#[test]
+#[ignore = "pads the attention node, which the rule does only on the Metal GPU"]
+#[allow(
+    clippy::expect_used,
+    reason = "expect on calls that must succeed; the message names the case"
+)]
+fn mixed_sdpa_reads_the_query_rows_of_a_mask_at_the_padded_rows() {
+    let (q_rows, k_rows, node_rows) = (1025, 1100, 1088);
+    let run = |rows| {
+        mixed_output(Device::Gpu, 256, q_rows, k_rows, |k| {
+            Some(causal_mask(rows, q_rows, k))
+        })
+    };
+    let exact = run(q_rows).expect("exact mask");
+    assert_eq!(run(node_rows).expect("padded mask"), exact);
+}
+
+/// A mask with another row count than the call's or the node's is passed on
+/// and refused, not cut.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "expect_err on a call that must fail; the message names the case"
+)]
+fn mixed_sdpa_refuses_a_mask_with_other_rows() {
+    let (q_rows, k_rows) = (3, 8);
+    let err = mixed_output(Device::Cpu, 64, q_rows, k_rows, |k| {
+        Some(causal_mask(2 * q_rows, q_rows, k))
+    })
+    .expect_err("a mask of twice the query rows");
+    assert!(err.to_string().contains("broadcast"), "{err}");
+}
+
+/// A mask with no row axis is broadcast, not cut on its key axis.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "expect on fixtures and calls that must succeed; the message names the case"
+)]
+fn mixed_sdpa_does_not_cut_a_rank_one_mask() {
+    let (q_rows, k_rows) = (3, 8);
+    let open = from_vec(&vec![0.0; k_rows as usize], &[k_rows]);
+    let with_mask = mixed_output(Device::Cpu, 64, q_rows, k_rows, |_| {
+        Some(open.try_clone().expect("clone"))
+    })
+    .expect("rank-1 mask");
+    let without = mixed_output(Device::Cpu, 64, q_rows, k_rows, |_| None).expect("no mask");
+    assert_eq!(with_mask, without);
+}
+
 // ── Mixed cosine-similarity gate ─────────────────────────────────────────────
 //
 // Each test quantizes a [1, 4, 64, 128] V-tensor with `mx.quantize` (affine
