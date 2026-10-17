@@ -101,6 +101,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         check-spec-metric-parity check-spec-metric-parity-fixtures \
         check-spec-sampling check-spec-sampling-fixtures \
         check-spec-charge check-spec-charge-fixtures \
+        spec-round-stream-selftest \
         check-published-samples check-published-samples-fixtures \
         mlx-preflight mlx-preflight-selftest mlx-restore-pin mlx-restore-pin-selftest target-gc target-size-report profile-gputrace \
         profile-mst \
@@ -540,6 +541,10 @@ check-spec-charge: ## CI gate: fail if a speculative round loop names more than 
 check-spec-charge-fixtures: ## CI gate: recall test for the above — 76 cases over three tree shapes, each asserting the reason as well as exit 1 vs exit 2
 	@bash scripts/check_spec_charge_fixtures.sh
 
+.PHONY: spec-round-stream-selftest
+spec-round-stream-selftest: ## CI gate: recall test for the round-stream manifest reader — 17 cases, a stale pin and a true one among them
+	@bash scripts/spec_round_stream_compare_selftest.sh
+
 .PHONY: check-published-samples
 check-published-samples: ## CI gate: fail if the checked-in published sample sets do not re-derive from their recorded seeds, digests and templates
 	@python3 scripts/published_samples.py verify
@@ -712,6 +717,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_spec_sampling_fixtures.sh
 	@bash scripts/check_spec_charge.sh
 	@bash scripts/check_spec_charge_fixtures.sh
+	@bash scripts/spec_round_stream_compare_selftest.sh
 	@python3 scripts/published_samples.py verify
 	@bash scripts/check_published_samples_fixtures.sh
 	@bash scripts/check_doc_source_citations.sh

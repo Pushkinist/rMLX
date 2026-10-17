@@ -901,6 +901,46 @@ run_case
 expect_status 1
 expect_out "src/alpha_tests.rs:4 — gpu_alpha returns from an environment guard with no stand-down notice"
 
+# ---------------------------------------------------------------------------
+# A waiver, `WAIVED <test>: <why>`, is held to the same name rule over every fn
+# of a classified test's file: the caller's name through the exact `{test}`
+# placeholder, or the enclosing fn's own name.
+waiver_case() {
+    new_case "$1"
+    classify rmlx-models src/alpha_tests.rs gpu_alpha
+    source_file rmlx-models src/alpha_tests.rs <<RS
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    check("gpu_alpha");
+}
+
+fn check(test: &str) {
+    eprintln!("$2");
+}
+RS
+    run_case
+}
+
+waiver_case waiver_with_placeholder_passes 'WAIVED {test}: the streams were not compared'
+expect_status 0
+
+waiver_case waiver_bare 'WAIVED: the streams were not compared'
+expect_status 1
+expect_out "src/alpha_tests.rs:8 — rmlx-models check: the waiver names no test"
+
+waiver_case waiver_wrong_placeholder 'WAIVED {name}: the streams were not compared'
+expect_status 1
+expect_out "src/alpha_tests.rs:8 — rmlx-models check: the waiver names no test"
+
+waiver_case waiver_two_spaces 'WAIVED  check: the streams were not compared'
+expect_status 1
+expect_out "src/alpha_tests.rs:8 — rmlx-models check: the waiver names no test"
+
+waiver_case waiver_names_another 'WAIVED gpu_beta: the streams were not compared'
+expect_status 1
+expect_out "src/alpha_tests.rs:8 — rmlx-models check: the waiver names gpu_beta, not itself"
+
 if [ "${failures}" -gt 0 ]; then
     echo "check_named_skip_notices_fixtures: ${failures} case(s) failed" >&2
     exit 1

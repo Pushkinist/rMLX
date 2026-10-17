@@ -31,3 +31,13 @@ ANY_SKIP='(^|[^A-Za-z0-9_])SKIP([^A-Za-z0-9_]|$)'
 # other placeholder is a name the source gate cannot check, and `{other}` reads
 # identically while naming a cell that ran.
 NAMED_SKIP_PLACEHOLDER='SKIP \{test\}:'
+
+# A test that ran and judged its answers, and did not make one of its checks on
+# this host, announces `WAIVED <test>: <why>`. It is not a stand-down: the test
+# asserted, so the runner keeps its census entries. The check it did not make
+# still marks the run INCOMPLETE.
+NAMED_WAIVED='WAIVED [A-Za-z_][A-Za-z0-9_]*:'
+
+# Any waiver, named or not, and its form in a Rust format string. As for SKIP.
+ANY_WAIVED='(^|[^A-Za-z0-9_])WAIVED([^A-Za-z0-9_]|$)'
+NAMED_WAIVED_PLACEHOLDER='WAIVED \{test\}:'

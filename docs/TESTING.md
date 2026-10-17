@@ -158,7 +158,7 @@ no variable set.
 | File | What it asserts |
 |---|---|
 | `dflash_drafter_alignment.rs`, `gemma4_mtp_drafter_alignment.rs`, `qwen3_5_mtp_drafter_alignment.rs`, `qwen3_5_eagle3_alignment.rs`, `qwen3_5_two_model_alignment.rs` | the drafter loads and aligns with its verifier over a first round or a prefix |
-| `spec_greedy_equivalence.rs` | each of its ten pairs produces the verifier's own answer at temperature 0 |
+| `spec_greedy_equivalence.rs` | each of its ten pairs produces the verifier's own answer at temperature 0, and on the pinned MLX pair the six at the served block write the round streams `crates/rmlx-models/tests/fixtures/spec_round_baseline/MANIFEST.sha256` pins |
 | `spec_sampled_distribution.rs` | the sidecar arm draws from the verifier's distribution above temperature 0 |
 | `two_model_stochastic.rs` | the two-model loop samples at temperature 1.0, and one seed reproduces one stream |
 | `dflash2_loader.rs` | the DFlash2 checkpoint loads, and its forward matches a committed reference |

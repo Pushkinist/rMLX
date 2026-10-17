@@ -681,8 +681,10 @@ different:
 The per-round event streams of all six pairs over their six prompts are pinned,
 timing fields dropped, in
 `crates/rmlx-models/tests/fixtures/spec_round_baseline/MANIFEST.sha256`. Every
-pinned run is uncharged. The fixture's `README.md` says what the digests pin
-and what they do not.
+pinned run is uncharged. Each of the six tests holds the cells it wrote to the
+manifest after it judges the answers: on the pinned MLX pair a moved cell
+fails the test, and on another pair the comparison is waived. The fixture's `README.md`
+says what the digests pin and what they do not.
 
 ## CLI
 

@@ -305,6 +305,22 @@ architecture (`TESTING.md` § "The resolvers"): set at gemma-4-e4b, it hands
 that snapshot to the cells that name gemma-4-e2b. Arm its variable-only cells
 in a run narrowed to them.
 
+### A check a test did not make is reported as waived
+
+A test that ran and asserted, and did not make one of its checks on this host,
+prints `WAIVED <test>: <why>`. The six pinned tests of
+`spec_greedy_equivalence.rs` do this off the pinned MLX pair: they judge the
+answers and waive the round-stream comparison. A waived test is not a
+stand-down, so the census keeps its entries. The runner reads the notice from
+the uninstrumented run, lists it under `waived —`, and puts `INCOMPLETE: N
+selected GPU test(s) ran and waived a check` on the final line. A waiver in
+another form, or one naming another test or a test the classifier did not
+report, is counted with the notices that named no test.
+`make check-named-skip-notices` holds every waiver in a classified test's file
+to its enclosing fn's name or the exact `WAIVED {test}:` placeholder. The
+patterns are `NAMED_WAIVED`, `ANY_WAIVED` and `NAMED_WAIVED_PLACEHOLDER` in
+`scripts/lib/skip_notice_patterns.sh`.
+
 `spec_greedy_equivalence.rs` refuses a mis-paired drafter before either model
 loads, with a named notice. `declared_kind` checks that the sidecar declares the
 kind the pair's loop drives. `declared_quant_mode` checks that the sidecar is

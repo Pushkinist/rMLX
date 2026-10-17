@@ -97,6 +97,12 @@
 #   `crates/rmlx-models/src/test_snapshot.rs`. Review holds their stand-downs
 #   to `SKIP {test}:`.
 #
+# WHAT IS ALSO REFUSED: A WAIVER THAT NAMES NO TEST
+#   `WAIVED <test>: <why>` is the notice of a test that ran and did not make one
+#   of its checks. In every fn of the declaring files it names the enclosing fn
+#   or the caller through the exact `{test}` placeholder; any other waiver is
+#   one the runner counts and lists nowhere.
+#
 #   The notice's SHAPE is not defined here. `scripts/lib/skip_notice_patterns.sh`
 #   holds it, and `scripts/run_gpu_tests.sh` reads the same file — a source gate
 #   that accepted `SKIP  foo:` while the runner counted it as nameless would pass
@@ -311,6 +317,42 @@ done <<< "$(printf '%s\n' "${gpu_files}" | while IFS= read -r f; do
     ' "${f}"
 done)"
 
+# Every waiver, `WAIVED <test>: <why>`, in every fn of the classified tests'
+# files. It names the caller through the exact `{test}` placeholder or names
+# its enclosing fn; anything else is one record `<file>\t<line>\t<fn>\t<why>\t<text>`.
+waivers=""
+n_waivers=0
+while IFS=$'\t' read -r w_file w_line w_fn w_why w_text; do
+    [ -n "${w_file:-}" ] || continue
+    rel="${w_file#"${ROOT}"/crates/}"
+    waivers="${waivers}    ${rel}:${w_line} — ${rel%%/*} ${w_fn}: the waiver ${w_why}"$'\n'
+    waivers="${waivers}        ${w_text}"$'\n'
+    n_waivers=$((n_waivers + 1))
+done <<< "$(printf '%s\n' "${gpu_files}" | while IFS= read -r f; do
+    [ -n "${f}" ] || continue
+    awk -v FILE="${f}" -v ANY="${ANY_WAIVED}" -v NAMED="${NAMED_WAIVED}" \
+        -v PLACEHOLDER="${NAMED_WAIVED_PLACEHOLDER}" '
+        match($0, /^[[:space:]]*(pub[[:space:]]+(\([^)]*\)[[:space:]]*)?)?(async[[:space:]]+)?fn[[:space:]]+[A-Za-z_][A-Za-z0-9_]*/) {
+            head = substr($0, RSTART, RLENGTH)
+            sub(/^.*fn[[:space:]]+/, "", head)
+            cur = head
+        }
+        $0 ~ /"/ && $0 ~ ANY && !match($0, PLACEHOLDER) {
+            why = "names no test"
+            if (match($0, NAMED)) {
+                named = substr($0, RSTART, RLENGTH)
+                sub(/^WAIVED /, "", named)
+                sub(/:$/, "", named)
+                if (named == cur) next
+                why = "names " named ", not itself"
+            }
+            text = $0
+            sub(/^[[:space:]]+/, "", text)
+            printf "%s\t%d\t%s\t%s\t%s\n", FILE, NR, cur, why, text
+        }
+    ' "${f}"
+done)"
+
 # Every kind is printed before the single exit at the end. They co-occur — a
 # suite half-converted has one of each — and a gate that exits inside the first
 # block sends the reader back for the second one run later.
@@ -353,6 +395,16 @@ if [ "${n}" -gt 0 ]; then
     echo "is INCOMPLETE with a number and no name. Write it as" >&2
     echo "  SKIP <this test fn>: <why>" >&2
     echo "See docs/GPU_TESTS.md." >&2
+    red=1
+fi
+
+if [ "${n_waivers}" -gt 0 ]; then
+    echo "ERROR: ${n_waivers} waiver(s) in classified GPU tests' files do not name their test:" >&2
+    printf '%s' "${waivers}" >&2
+    echo >&2
+    echo "scripts/run_gpu_tests.sh counts such a waiver and lists it nowhere. Write it as" >&2
+    echo "  WAIVED <this test fn>: <why>" >&2
+    echo "or, in a helper, \`WAIVED {test}: <why>\`. See docs/GPU_TESTS.md." >&2
     red=1
 fi
 

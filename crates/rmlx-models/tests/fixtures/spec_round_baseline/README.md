@@ -11,7 +11,7 @@
 
 The round loop closes every round with one `tracing` event. The manifest pins
 the **whole sequence of those events** for one run of each of the six pairs
-over each of the six prompts — 36 cells, 3862 rounds — in the timing-free form
+over each of the six prompts — 36 cells, 3927 rounds — in the timing-free form
 the run writes beside the full stream: the same JSON objects with every
 wall-clock `*_ms` field dropped, because those move between two runs of one
 engine and a digest over them compares two machines' load.
@@ -42,6 +42,11 @@ exactly, so a cell that moved is a change, not noise. A cell that
 moved for a legitimate reason is re-blessed by regenerating the line and saying
 in the commit message which loop changed and why.
 
+**It is one MLX pair.** The same source on another MLX can move every cell
+with no round loop changed. Capture and verify on the pair
+`crates/rmlx-mlx/mlx-pin.txt` names, and re-pin in the commit that moves that
+pin.
+
 ## Reproducing a cell
 
 One pair at a time, with the machine to itself. Verifier and drafter resolve by
@@ -56,7 +61,22 @@ RMLX_O_MODELS_ROOT=<models root> \
 ```
 
 The run writes both files per cell under `<RMLX_HOME>/tmp/` and prints each
-path with its round count and the timing-free file's byte length. Then:
+path with its round count and the timing-free file's byte length. After it has
+judged the answers, the test holds its own six cells to this manifest with
+`verify <RMLX_HOME>/tmp --pair <test name>`, which reads no other file in that
+directory. On the pinned MLX pair (`crates/rmlx-mlx/mlx-pin.txt`) a moved cell
+fails the test. The other four tests of the file are not pinned and do no
+comparison.
+
+**Off the pinned pair, every moved cell is waived.** The test prints
+`WAIVED <test>: <why>` and passes, and `make gpu-test` reports the run
+INCOMPLETE. There is no near-tie check here, unlike the golden-token suites
+(`docs/TESTING.md`, "A fixture states the tokens of the pinned pair"): a cell
+that a round-loop defect moved reads the same as one another MLX moved. The
+answers are still judged on every pair, and the census keeps the test's
+entries, because the test ran.
+
+To hold a whole capture to the manifest:
 
 ```sh
 python3 scripts/spec_round_stream_compare.py verify <RMLX_HOME>/tmp
@@ -67,6 +87,11 @@ did not run and exits **3**, `INCOMPLETE`: a cell that could not run is not a
 cell that agreed, and 0 would say it was. A cell that ran and disagrees is exit
 1, naming the cell and both digests. Exit 2 is a comparison that could not be
 made at all — a missing directory, or a file still carrying a wall-clock field.
+
+Every mode reads the cells of the six pinned pairs and no other. The four
+unpinned tests write their cells into the same directory, and the script names
+them on stderr as not read. So `verify`, `compare` and `manifest` work on the
+directory a normal `make gpu-test` run leaves (`<RMLX_HOME>/tmp`).
 
 To compare two captures field by field rather than by digest — which is what
 says *what* moved:

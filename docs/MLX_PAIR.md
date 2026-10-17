@@ -361,3 +361,7 @@ Not measured: the HTTP server path, speculative prefill, and
    `sdpa_under` ([above](#the-attention-row-rule)) and its tests. If the
    faulty shapes changed, change the rule and the table together.
 6. Re-run a prefill cell and compare its prefill rate with the old pair's.
+7. Capture the six pinned speculative pairs on the new pair and re-pin
+   `crates/rmlx-models/tests/fixtures/spec_round_baseline/MANIFEST.sha256`
+   (its `README.md`, "Regenerating"), in the commit that moves the pin. On
+   the pinned pair the six tests fail on every moved cell until then.

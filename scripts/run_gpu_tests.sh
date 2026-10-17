@@ -621,6 +621,8 @@ scan_cut=""
 stood_down=""
 n_stood_down=0
 n_unattributed=0
+waived=""
+n_waived=0
 
 # The names libtest lists as failed in one log. libtest prints the region
 # twice: a captured-output block per failure, then the plain name list.
@@ -935,6 +937,39 @@ for crate in "${crates[@]}"; do
     done
     n_unattributed=$((n_unattributed + crate_unattributed))
 
+    # A test that ran but did not make one of its checks names itself as
+    # `WAIVED <test>: <why>`. It asserted, so the census keeps its entries. It
+    # is read from the verdict run alone and listed once.
+    while IFS=$'\t' read -r attributed notice; do
+        [ -z "${notice}" ] && continue
+        waived_test="${notice%%:*}"
+        waived_test="${waived_test#WAIVED }"
+        if [ "${attributed}" != "A" ]; then
+            n_unattributed=$((n_unattributed + 1))
+            continue
+        fi
+        case $'\n'"${listing}"$'\n' in
+            *$'\n'"${crate}"$'\t'"${waived_test}"$'\n'*) ;;
+            *) n_unattributed=$((n_unattributed + 1)); continue ;;
+        esac
+        case $'\n'"${waived}" in
+            *$'\n'"  ${crate} ${waived_test}:"*) continue ;;
+        esac
+        waived="${waived}  ${crate} ${waived_test}: ${notice#*: }"$'\n'
+        n_waived=$((n_waived + 1))
+    done <<< "$(awk -v named="${NAMED_WAIVED}" '
+        /^test [^ ]+ \.\.\. / { cur = $2; sub(/.*::/, "", cur) }
+        match($0, named) {
+            notice = substr($0, RSTART)
+            name = substr($0, RSTART + 7, RLENGTH - 8)
+            print (name == cur ? "A" : "U") "\t" notice
+        }' "${log}" | sed -E 's/Invalid (device|threadgroup).*$//; s/[[:space:]]+$//')"
+    # A waiver in no named form — `WAIVED:`, two spaces, an unformatted
+    # placeholder — is counted too, as a nameless SKIP is.
+    any_waived="$(grep -Eo "${ANY_WAIVED}" "${log}" | grep -c '')"
+    named_waived="$(grep -Eo "${NAMED_WAIVED}" "${log}" | grep -c '')"
+    n_unattributed=$((n_unattributed + any_waived - named_waived))
+
     # A test the instrumented run failed and the uninstrumented run did not:
     # the instrument changed its result. That is a failure. A defect that the
     # instrument's timing exposes looks the same as an artifact of it, and the
@@ -1023,6 +1058,12 @@ if [ "${n_stood_down}" -gt 0 ] || [ "${n_unattributed}" -gt 0 ]; then
         echo "  A cell that stands down must print 'SKIP <its own test fn>: <why>', or its"
         echo "  absence is invisible here and to the census pin. See docs/GPU_TESTS.md."
     fi
+    echo
+fi
+
+if [ "${n_waived}" -gt 0 ]; then
+    echo "waived — these selected GPU tests ran and did not make one of their checks:"
+    printf '%s' "${waived}"
     echo
 fi
 
@@ -1264,6 +1305,9 @@ if [ -n "${snapshot_root_note}" ]; then
 fi
 if [ "${n_stood_down}" -gt 0 ] || [ "${n_unattributed}" -gt 0 ]; then
     incomplete="${incomplete} — INCOMPLETE: ${n_stood_down} selected GPU test(s) stood down and $((n_unattributed)) further notice(s) named no test; they asserted nothing (listed above)"
+fi
+if [ "${n_waived}" -gt 0 ]; then
+    incomplete="${incomplete} — INCOMPLETE: ${n_waived} selected GPU test(s) ran and waived a check (listed above)"
 fi
 tg_note=" (threadgroup validation on for ${n_tg_on} test(s), off for ${n_tg_off})"
 if [ "${SHADER_VALIDATION}" = "1" ] && [ -n "${census_notes}" ]; then

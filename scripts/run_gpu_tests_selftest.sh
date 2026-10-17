@@ -2308,6 +2308,79 @@ expect_out "ci-perf codec-half ok — NOT the whole gate"
 expect_no_out "ci-perf ok"
 
 # ---------------------------------------------------------------------------
+# A test that ran, asserted, and did not make one of its checks says
+# `WAIVED <test>: <why>`. It ran, so its census entry stays expected and its
+# hits match. The check it did not make still reaches the final line.
+# waived_log <root> <notice> [test] — <test> (default kv_gpu_alpha) prints
+# <notice> and produces the four pinned hits.
+waived_log() {
+    local root="$1" notice="$2" test="${3:-kv_gpu_alpha}" i=0 line=""
+    while [ "${i}" -lt 4 ]; do
+        line="${line}Invalid device load at offset $((4096 + i * 64)), executing kernel function: \"${CENSUS_KERNEL}\""
+        i=$((i + 1))
+    done
+    crate_log "${root}" rmlx-kv-quant 0 <<LOG
+Metal GPU Validation Enabled
+running 1 test
+test kv::${test} ... ${notice} the streams were not compared on this pair${line}
+ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+}
+
+new_case waived_check_keeps_the_census_entry || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+census_pin "${CASE_ROOT}" 4
+waived_log "${CASE_ROOT}" "WAIVED kv_gpu_alpha:"
+run_case "${CASE_ROOT}"
+expect_status 0
+expect_out "census matches the pin"
+expect_out "waived — these selected GPU tests ran and did not make one of their checks:"
+expect_out "rmlx-kv-quant kv_gpu_alpha: the streams were not compared on this pair"
+expect_out "INCOMPLETE: 1 selected GPU test(s) ran and waived a check"
+expect_no_out "stood down"
+expect_no_out "named no test"
+
+# The control: the same test announcing a stand-down after its hits drops its
+# census entry, and the hits it did produce read as a count that moved up.
+new_case waived_check_spelled_as_a_stand_down || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+census_pin "${CASE_ROOT}" 4
+waived_log "${CASE_ROOT}" "SKIP kv_gpu_alpha:"
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "count moved up"
+expect_out "stood down — these selected GPU tests announced they did not run:"
+expect_no_out "waived — these selected"
+
+# A waiver that cannot be attributed is counted, not listed, and the entry of
+# the test that printed it stays expected: naming another test, naming no test,
+# two spaces, a placeholder left unformatted, or a test name the classifier did
+# not report.
+waived_unattributed() {
+    run_case "${CASE_ROOT}"
+    expect_status 0
+    expect_out "census matches the pin"
+    expect_no_out "waived — these selected"
+    expect_out "INCOMPLETE: 0 selected GPU test(s) stood down and 1 further notice(s) named no test"
+}
+for form in naming_another:"WAIVED kv_gpu_beta:" bare:"WAIVED:" two_spaces:"WAIVED  kv_gpu_alpha:" \
+            placeholder:"WAIVED {test}:"; do
+    new_case "waived_check_${form%%:*}" || exit 1
+    classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+    census_pin "${CASE_ROOT}" 4
+    waived_log "${CASE_ROOT}" "${form#*:}"
+    waived_unattributed
+done
+new_case waived_check_by_an_unclassified_test || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+census_pin "${CASE_ROOT}" 4
+waived_log "${CASE_ROOT}" "WAIVED kv_gpu_unlisted:" kv_gpu_unlisted
+run_case "${CASE_ROOT}"
+expect_no_out "waived — these selected"
+expect_out "1 further notice(s) named no test"
+
+# ---------------------------------------------------------------------------
 # The harness's own positive control: with nothing wrong, the same stubs produce
 # a green run. Without this, every case above could be passing because the stub
 # crates never ran at all.

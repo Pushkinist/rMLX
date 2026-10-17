@@ -92,7 +92,8 @@ follows it with a 4- or 6-wide one, a sequence the served block never reaches.
 The per-round event stream of the six pairs at the served block is pinned
 separately, in `crates/rmlx-models/tests/fixtures/spec_round_baseline/`, and
 compared by `scripts/spec_round_stream_compare.py`. This gate reads the
-answer; that comparison reads which round moved.
+answer; that comparison reads which round moved. The same six tests run it on
+their own cells after the answers are judged.
 
 ## The oracle: where a correct pair diverges
 

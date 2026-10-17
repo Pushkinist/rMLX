@@ -4089,6 +4089,167 @@ fn write_round_stream(test: &str, prompt: &str, rounds: &[CapturedEvent]) {
     );
 }
 
+/// The pinned per-round streams: one line per (pair, prompt) cell.
+const ROUND_STREAM_MANIFEST: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/spec_round_baseline/MANIFEST.sha256"
+));
+
+/// The one reader of [`ROUND_STREAM_MANIFEST`].
+const ROUND_STREAM_COMPARE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../scripts/spec_round_stream_compare.py"
+);
+
+/// Whether the manifest pins any cell of `test`. The pairs run past their
+/// declared block are not pinned.
+fn round_stream_is_pinned(test: &str) -> bool {
+    let prefix = format!("{test}.");
+    ROUND_STREAM_MANIFEST
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(2))
+        .any(|cell| cell.starts_with(&prefix))
+}
+
+/// What a pinned pair's run does with the answer of
+/// `spec_round_stream_compare.py verify --pair`.
+#[derive(Debug, PartialEq, Eq)]
+enum RoundStreamVerdict {
+    Matched,
+    /// A cell moved on the pinned MLX pair: a round loop changed, or the pin is
+    /// stale.
+    Moved,
+    /// A cell moved on another MLX pair, where a different kernel can resolve a
+    /// near-tie the other way. The manifest states the pinned pair's streams, so
+    /// the comparison is waived; the answers were still judged.
+    Waived,
+    /// The comparison was not made.
+    NotCompared,
+}
+
+fn round_stream_verdict(exit: Option<i32>, pinned_mlx_pair: bool) -> RoundStreamVerdict {
+    match (exit, pinned_mlx_pair) {
+        (Some(0), _) => RoundStreamVerdict::Matched,
+        (Some(1), true) => RoundStreamVerdict::Moved,
+        (Some(1), false) => RoundStreamVerdict::Waived,
+        _ => RoundStreamVerdict::NotCompared,
+    }
+}
+
+/// Hold the six cells this run just wrote to the pinned manifest.
+fn check_round_streams(test: &str) {
+    if !round_stream_is_pinned(test) {
+        return;
+    }
+    let dir = rmlx_core::paths::tmp_dir();
+    let out = std::process::Command::new("python3")
+        .arg(ROUND_STREAM_COMPARE)
+        .arg("verify")
+        .arg(&dir)
+        .args(["--pair", test])
+        .output()
+        .expect("run spec_round_stream_compare.py");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let pin = rmlx_mlx::pin_check();
+    match round_stream_verdict(out.status.code(), pin.matches) {
+        RoundStreamVerdict::Matched => eprintln!("[{test}] round streams: {}", said.trim()),
+        RoundStreamVerdict::Waived => eprintln!(
+            "WAIVED {test}: the round streams differ from the manifest on an MLX pair \
+             that is not the pinned one, and the manifest states the pinned pair's \
+             streams. The answers were judged above. Loaded pair: {}\n{said}",
+            pin.detail
+        ),
+        RoundStreamVerdict::Moved => panic!(
+            "{test}: the round streams differ from \
+             crates/rmlx-models/tests/fixtures/spec_round_baseline/MANIFEST.sha256 on the \
+             pinned MLX pair. A cell moves when a round loop changes, so find what moved \
+             it before re-pinning (see that directory's README.md).\n{said}"
+        ),
+        RoundStreamVerdict::NotCompared => panic!(
+            "{test}: the round streams were not compared ({:?}).\n{said}",
+            out.status
+        ),
+    }
+}
+
+/// Mutation: answer `Waived` for a moved cell on the pinned pair, or `Matched`
+/// for any exit but 0.
+#[test]
+fn a_moved_round_stream_fails_on_the_pinned_pair_and_is_waived_off_it() {
+    use RoundStreamVerdict::{Matched, Moved, NotCompared, Waived};
+    assert_eq!(round_stream_verdict(Some(0), true), Matched);
+    assert_eq!(round_stream_verdict(Some(0), false), Matched);
+    assert_eq!(round_stream_verdict(Some(1), true), Moved);
+    assert_eq!(round_stream_verdict(Some(1), false), Waived);
+    for exit in [Some(2), Some(3), None] {
+        for pinned in [true, false] {
+            assert_eq!(
+                round_stream_verdict(exit, pinned),
+                NotCompared,
+                "{exit:?} {pinned}"
+            );
+        }
+    }
+}
+
+/// Every pair the manifest pins is a test of this file, every test of this
+/// file at its served block is pinned and checked, and no other is. Each test
+/// hands `run_gate` its own name, which is the name the check is keyed on.
+///
+/// Mutation: rename a pinned test, change the name it hands `run_gate`, drop its
+/// cells from the manifest, or answer `false` from `round_stream_is_pinned`.
+#[test]
+fn the_manifest_pins_the_tests_this_file_runs_at_the_served_block() {
+    const SELF: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/spec_greedy_equivalence.rs"
+    ));
+    let pinned: std::collections::BTreeSet<&str> = ROUND_STREAM_MANIFEST
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(2))
+        .filter_map(|cell| cell.split('.').next())
+        .collect();
+    let lines: Vec<&str> = SELF.lines().collect();
+    let gates: Vec<&str> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(at, line)| Some((at, line.strip_prefix("fn ")?.strip_suffix("() {")?)))
+        .filter(|(_, name)| name.starts_with("the_") && name.contains("_reproduces_plain_greedy"))
+        .map(|(at, name)| {
+            assert_eq!(
+                lines[at + 1].trim().strip_suffix('('),
+                Some("run_gate"),
+                "{name}"
+            );
+            assert_eq!(
+                lines[at + 2].trim(),
+                format!("\"{name}\","),
+                "{name} hands run_gate another name"
+            );
+            name
+        })
+        .collect();
+    let served: std::collections::BTreeSet<&str> = gates
+        .iter()
+        .copied()
+        .filter(|name| name.ends_with("_reproduces_plain_greedy"))
+        .collect();
+    assert_eq!(pinned.len(), 6, "{pinned:?}");
+    assert_eq!(pinned, served);
+    assert_eq!(gates.len(), 10, "{gates:?}");
+    for name in gates {
+        assert_eq!(
+            round_stream_is_pinned(name),
+            served.contains(name),
+            "{name}"
+        );
+    }
+}
+
 /// A round in the shape every loop emits, one from a loop that keeps no phase
 /// split, the `error!` a round with a broken phase timer emits beside its own
 /// line, and a request-level line that is not a round.
@@ -4531,4 +4692,5 @@ fn run_gate(test: &str, pair: &Pair) {
         refusals.len(),
         refusals.join("\n  ")
     );
+    check_round_streams(test);
 }

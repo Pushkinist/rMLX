@@ -21,7 +21,19 @@ USAGE
                                field-by-field over every cell in both, or over
                                the named fields only
     manifest <dir>             emit a MANIFEST.sha256 for one capture
-    verify   <dir> [manifest]  hold one capture to a manifest
+    verify   <dir> [manifest] [--pair <test>]
+                               hold one capture to a manifest, or only the six
+                               cells of one pinned pair
+
+CELLS READ
+    Only the cells of the pinned pairs. The unpinned tests of the same file
+    write theirs into the same directory, so every mode leaves those unread and
+    names them on stderr.
+
+--pair
+    Holds the six cells of one pinned pair and reads no other file in <dir>.
+    The equivalence test of each pinned pair runs this on its own cells after
+    every run.
 
 --fields
     Two captures either side of a change that renamed, added or dropped a field
@@ -89,7 +101,7 @@ PROMPTS = (
     "virtual-memory",
 )
 EXPECTED_CELLS = {f"{p}.{q}.stable.jsonl" for p in PAIRS for q in PROMPTS}
-TOTAL_ROUNDS = 3862
+TOTAL_ROUNDS = 3927
 
 # What every round event carries.
 # Mirrors `ROUND_EVENT_FIELDS` in `crates/rmlx-models/tests/common/round_stream.rs`,
@@ -101,8 +113,28 @@ TOTAL_ROUNDS = 3862
 ROUND_EVENT_FIELDS = ("round", "accept", "num_draft", "emitted_total")
 
 
-def cells(directory: pathlib.Path) -> dict[str, pathlib.Path]:
-    return {p.name: p for p in sorted(directory.glob("*.stable.jsonl"))}
+def test_of(name: str) -> str:
+    return name.split(".", 1)[0]
+
+
+def cells(directory: pathlib.Path, pair: str | None = None) -> dict[str, pathlib.Path]:
+    """The timing-free cells of the pinned pairs in `directory`, or of `pair` alone.
+
+    The unpinned tests of the same file write their cells into the same
+    directory, so a cell of a test outside `PAIRS` is not read."""
+    return {
+        p.name: p
+        for p in sorted(directory.glob("*.stable.jsonl"))
+        if test_of(p.name) in PAIRS and (pair is None or test_of(p.name) == pair)
+    }
+
+
+def report_unread(directory: pathlib.Path) -> None:
+    """Name the tests whose cells `cells` did not read."""
+    unread = sorted({test_of(p.name) for p in directory.glob("*.stable.jsonl")} - set(PAIRS))
+    if unread:
+        print(f"  not read: the cells of {len(unread)} test(s) the manifest is not over "
+              f"({', '.join(unread)})", file=sys.stderr)
 
 
 def rounds(path: pathlib.Path) -> list[dict]:
@@ -175,6 +207,8 @@ def compare_fields(name: str, i: int, x: dict, y: dict, fields: list[list[str]],
 def compare(a_dir: pathlib.Path, b_dir: pathlib.Path,
             fields: list[list[str]] | None = None) -> int:
     a, b = cells(a_dir), cells(b_dir)
+    report_unread(a_dir)
+    report_unread(b_dir)
     if not a or not b:
         print(f"no `*.stable.jsonl` cell in {a_dir if not a else b_dir}", file=sys.stderr)
         return 2
@@ -286,9 +320,9 @@ def report_skipped(skipped: set[str]) -> None:
               f"carried by a capture and outside --fields")
 
 
-def manifest_lines(directory: pathlib.Path) -> list[str]:
+def manifest_lines(directory: pathlib.Path, pair: str | None = None) -> list[str]:
     out = []
-    for name, path in cells(directory).items():
+    for name, path in cells(directory, pair).items():
         n = len(rounds(path))
         out.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {n:>5}  {name}")
     return out
@@ -324,6 +358,7 @@ def main(argv: list[str]) -> int:
 
     if mode == "manifest":
         lines = manifest_lines(directory)
+        report_unread(directory)
         if not lines:
             print(f"no `*.stable.jsonl` cell in {directory}", file=sys.stderr)
             return 2
@@ -351,7 +386,23 @@ def main(argv: list[str]) -> int:
         return 0
 
     if mode == "verify":
-        path = pathlib.Path(argv[3]) if len(argv) > 3 else DEFAULT_MANIFEST
+        rest = argv[3:]
+        pair = None
+        if "--pair" in rest:
+            at = rest.index("--pair")
+            if at + 1 >= len(rest):
+                print("--pair takes one pinned test name", file=sys.stderr)
+                return 2
+            pair = rest[at + 1]
+            del rest[at:at + 2]
+            if pair not in PAIRS:
+                print(f"--pair {pair}: not one of the {len(PAIRS)} pinned pairs "
+                      f"({', '.join(PAIRS)})", file=sys.stderr)
+                return 2
+        if len(rest) > 1:
+            print(__doc__, file=sys.stderr)
+            return 2
+        path = pathlib.Path(rest[0]) if rest else DEFAULT_MANIFEST
         if not path.is_file():
             print(f"no manifest at {path}", file=sys.stderr)
             return 2
@@ -380,12 +431,17 @@ def main(argv: list[str]) -> int:
             print("A manifest that is not over the whole baseline cannot say a capture "
                   "agreed with it.", file=sys.stderr)
             return 2
+        if pair is None:
+            report_unread(directory)
+        else:
+            want = {name: v for name, v in want.items() if test_of(name) == pair}
         have = {
             line.split()[2]: (line.split()[0], line.split()[1])
-            for line in manifest_lines(directory)
+            for line in manifest_lines(directory, pair)
         }
         if not have:
-            print(f"no `*.stable.jsonl` cell in {directory}", file=sys.stderr)
+            print(f"no `*.stable.jsonl` cell{f' of {pair}' if pair else ''} in {directory}",
+                  file=sys.stderr)
             return 2
         bad = 0
         matched = 0

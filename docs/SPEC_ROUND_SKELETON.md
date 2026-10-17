@@ -215,10 +215,11 @@ Five observables, each blind to something different:
 
 - **The per-round event stream**, against
   `crates/rmlx-models/tests/fixtures/spec_round_baseline/MANIFEST.sha256`,
-  compared by `scripts/spec_round_stream_compare.py`. It sees each round's
-  shape. It is blind to the values inside a round, to `charged` (every pinned
-  run is uncharged), to the resident-KV figure, and to a request that ran no
-  round.
+  compared by `scripts/spec_round_stream_compare.py`. Each of the six pinned
+  equivalence tests runs that comparison on the cells it wrote, and fails on a
+  moved cell on the pinned MLX pair. It sees each round's shape. It is blind to
+  the values inside a round, to `charged` (every pinned run is uncharged), to
+  the resident-KV figure, and to a request that ran no round.
 - **The request record**, one `done` line per request. A request that is gone
   and stops in its prefill or at the head of a round writes none
   ([`SERVER_SHUTDOWN.md`](SERVER_SHUTDOWN.md)). It is the only
