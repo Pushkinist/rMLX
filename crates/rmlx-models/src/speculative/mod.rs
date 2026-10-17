@@ -923,17 +923,18 @@ fn prefill_chunked_for_class(
     cancel: &AtomicBool,
     forward: impl FnMut(&[u32], &mut [KvCache]) -> Result<()>,
 ) -> Result<()> {
+    let arch = crate::prefill_chunk::event_name(arch_class);
     let (chunk_size, chunk_source) =
         crate::prefill_chunk::resolve(crate::prefill_chunk::module_key_for_class(arch_class));
     tracing::debug!(
-        arch = arch_class,
+        arch,
         prefill_chunk = chunk_size,
         prefill_chunk_source = chunk_source,
         prompt_len = tokens.len(),
         n_chunks = tokens.len().div_ceil(chunk_size.max(1)),
         "prefill: chunking prompt"
     );
-    prefill_chunked_with(tokens, caches, chunk_size, device, cancel, forward)
+    prefill_chunked_with(arch, tokens, caches, chunk_size, device, cancel, forward)
 }
 
 /// Bracket-and-sweep engine behind [`prefill_chunked`]: `enter_prefill` on every
@@ -954,7 +955,10 @@ fn prefill_chunked_for_class(
 /// The forward is injected so the invariant is unit-testable without a live
 /// model: a test drives a failing forward and asserts no cache is left
 /// `in_prefill`.
+///
+/// `arch` is the key of [`crate::prefill_chunk::event_name`].
 fn prefill_chunked_with(
+    arch: &str,
     tokens: &[u32],
     caches: &mut [KvCache],
     prefill_chunk: usize,
@@ -987,6 +991,7 @@ fn prefill_chunked_with(
                         return Err(e);
                     }
                 }
+                crate::decode_loop::release_chunk_buffers(arch, chunk_idx);
             }
         }
         Ok(())

@@ -1254,19 +1254,97 @@ pub fn mlx_reset_peak_memory() -> bool {
 /// Free the buffers the Metal allocator keeps for reuse.
 ///
 /// Wraps `mlx_clear_cache`. Returns `false` if the C call reports an error.
-/// The speech frame loop calls it to bound the cache, and memory measurements
-/// call it to start from an empty one. MLX gives a new array
-/// a cached buffer of up to `min(2 * size, size + 2 pages)` bytes when it has
-/// one (`mlx/backend/common/buffer_cache.h`) and counts the length of that
-/// buffer, so what an earlier region freed moves the count of a later one.
-/// After this call the next allocations are new buffers, until a later free
-/// puts a buffer back in the cache.
+/// Memory measurements call it to start from an empty cache; a loop that
+/// bounds the growth of the cache calls [`release_buffer_cache`]. MLX gives a
+/// new array a cached buffer of up to `min(2 * size, size + 2 pages)` bytes
+/// when it has one (`mlx/backend/common/buffer_cache.h`) and counts the length
+/// of that buffer, so what an earlier region freed moves the count of a later
+/// one. After this call the next allocations are new buffers, until a later
+/// free puts a buffer back in the cache.
 pub fn mlx_clear_cache() -> bool {
     install_error_handler();
     // SAFETY: no arguments, no out-params; `mlx_clear_cache` takes the
     // allocator's own mutex.
     let status = unsafe { sys::mlx_clear_cache() };
     status == 0
+}
+
+/// Free the buffer cache and warn if the call fails.
+///
+/// The speech frame loop calls it to bound the cache. The chunked prefill loops
+/// call it, through `release_chunk_buffers`, when MLX reports no memory figure.
+/// Returns `true` when the cache was freed.
+pub fn release_buffer_cache() -> bool {
+    let freed = mlx_clear_cache();
+    if !freed {
+        tracing::warn!("releasing the MLX buffer cache failed");
+    }
+    freed
+}
+
+/// Free the oldest cached buffers until the cache holds at most `keep_bytes`.
+///
+/// The buffers freed last stay. A loop that allocates buffers of the same
+/// sizes again at its next step finds them in the cache, which a full
+/// [`mlx_clear_cache`] would have freed. Returns `true` when the trim ran and
+/// the cache limit is back.
+///
+/// MLX has no call that trims. The Metal allocator trims on every `malloc`:
+/// when the cache is over its limit, `release_cached_buffers` frees from the
+/// oldest end until the excess is gone, and clears the whole cache when the
+/// excess is at least 0.9 of it (`mlx/backend/metal/allocator.cpp`,
+/// `mlx/backend/common/buffer_cache.h`). So, in this order:
+///
+/// 1. set the cache limit to `keep_bytes`, saving the old limit;
+/// 2. allocate one small array, which makes `malloc` trim to the new limit;
+/// 3. set the limit to 0, so that `free` releases a buffer instead of caching it;
+/// 4. drop the small array, which keeps its buffer out of the cache;
+/// 5. set the saved limit back.
+///
+/// A buffer is freed whole, so the cache can end below `keep_bytes`. That is
+/// why step 4 runs at limit 0: at the limit `keep_bytes` the small buffer
+/// would often be recycled into the room the trim left.
+///
+/// The cache limit is process-global, and while it is low every `malloc` in
+/// the process trims to it and every `free` skips the cache. The sequence runs
+/// in [`with_eval_lock`]: on the MLX thread, under the evaluation lock, so no
+/// evaluation and no other trim overlaps it, and two trims cannot save each
+/// other's low limit as the one to restore. The lock is not reentrant, so do
+/// not call this from a compiled closure body, which already holds it.
+///
+/// An MLX upgrade breaks this if `malloc` stops trimming or if
+/// `release_cached_buffers` stops freeing the oldest buffer first.
+/// `trim_frees_the_oldest_buffer_and_keeps_the_newest` fails in both cases.
+pub fn trim_buffer_cache(keep_bytes: u64) -> bool {
+    install_error_handler();
+    let keep = usize::try_from(keep_bytes).unwrap_or(usize::MAX);
+    with_eval_lock(|| {
+        // Sets the cache limit and returns the one it replaced.
+        let set_limit = |limit: usize| {
+            let mut previous: usize = 0;
+            // SAFETY: writing to a stack `usize` we own; `mlx_set_cache_limit`
+            // takes the allocator's own mutex.
+            let status = unsafe { sys::mlx_set_cache_limit(&raw mut previous, limit) };
+            (status == 0).then_some(previous)
+        };
+        let Some(saved_limit) = set_limit(keep) else {
+            return false;
+        };
+        let probe = Array::from_f32_slice(&[0.0], &[1]);
+        let allocated = probe.is_ok();
+        let zeroed = set_limit(0).is_some();
+        drop(probe);
+        let restored = set_limit(saved_limit).is_some();
+        if !restored {
+            tracing::error!(
+                keep_bytes,
+                saved_limit,
+                "restoring the MLX cache limit failed; the cache stays at the low limit"
+            );
+        }
+        allocated && zeroed && restored
+    })
+    .unwrap_or(false)
 }
 
 /// A scoped Metal-allocator measurement: reset the peak, run a region, read it.
@@ -1552,6 +1630,9 @@ mod lib_tests;
 
 #[cfg(test)]
 mod gpu_latch_tests;
+
+#[cfg(test)]
+mod buffer_cache_tests;
 
 #[cfg(test)]
 #[path = "../tests/common/within_limit.rs"]

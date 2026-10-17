@@ -304,10 +304,11 @@ pub fn generate_greedy<'a>(
                             last_logits = Some(logits);
                         } else {
                             // Force-evaluate the KV cache state between chunks
-                            // (avoids lazy-graph explosion, mirrors Path C).
+                            // (avoids lazy-graph explosion). These caches are
+                            // past `exit_prefill`: `eval_prefill_state` reads
+                            // the prefill buffers, which are empty here.
                             // Stops at the first failing cache.
-                            if let Some(e) =
-                                kv_caches.iter().find_map(|c| c.eval_prefill_state().err())
+                            if let Some(e) = kv_caches.iter().find_map(|c| c.eval_gpu_state().err())
                             {
                                 tracing::error!(
                                     error = %e,
@@ -316,6 +317,7 @@ pub fn generate_greedy<'a>(
                                 );
                                 return Err(e);
                             }
+                            crate::decode_loop::release_chunk_buffers("qwen3_5_moe", chunk_idx);
                         }
                     }
                     Err(e) => {
@@ -548,7 +550,7 @@ pub fn generate_greedy<'a>(
         prompt_ids,
         prefill_chunk,
         device,
-        arch_label,
+        "qwen3_5_moe",
         cancel,
         |chunk, kv| model.forward_seq_with_cache(chunk, Some(kv), Some(&mut lin_caches), device),
     )?;

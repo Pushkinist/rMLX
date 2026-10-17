@@ -116,7 +116,13 @@ pub(super) mod round;
 /// because it is in [`round::eagle3_generate`]'s public signature and this is the
 /// only drafter that fills it.
 pub use crate::speculative::round_loop::DecidedBy;
-pub use round::eagle3_generate;
+pub use round::{eagle3_generate, VERIFIER_PREFILL_CHUNK};
+
+/// Maximum tokens per drafter-prefill chunk. The drafter's single attention
+/// layer dispatches one fused kernel over the full chunk; at 512 the peak
+/// attention grid is 512×512 = 262k entries, which completes well within the
+/// Metal 4-5 s watchdog on Qwen3.6-MoE.
+pub const DRAFTER_PREFILL_CHUNK: usize = 512;
 
 /// Target of this loop's per-position step trace.
 pub(crate) const STEP_TARGET: &str = "rmlx_models::speculative::eagle3";
@@ -765,12 +771,6 @@ impl Eagle3Drafter {
             ));
         }
 
-        // Maximum tokens per drafter-prefill chunk. The drafter's single
-        // attention layer dispatches one fused kernel over the full chunk;
-        // at chunk_size = 512, peak attention grid is 512×512 = 262k entries
-        // which completes well within the Metal 4-5 s watchdog on Qwen3.6-MoE.
-        const DRAFTER_PREFILL_CHUNK: usize = 512;
-
         let total = shifted_tokens.len();
         let h = self.cfg.hidden_size as i32;
         let aux_h = verifier_aux_hidden.shape()[2]; // 3 * hidden_size
@@ -806,6 +806,10 @@ impl Eagle3Drafter {
             } else {
                 // Intermediate chunks: materialise to release Metal intermediates.
                 out.eval()?;
+                crate::decode_loop::release_chunk_buffers(
+                    crate::prefill_chunk::event_name(verifier.arch_class()),
+                    pos / DRAFTER_PREFILL_CHUNK,
+                );
             }
 
             pos = end;

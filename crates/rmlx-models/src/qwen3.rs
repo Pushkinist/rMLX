@@ -2083,7 +2083,7 @@ pub fn generate_greedy<'a>(
         prompt_ids,
         prefill_chunk,
         device,
-        "Qwen3ForCausalLM",
+        "qwen3",
         cancel,
         |chunk, caches| model.forward_seq_with_cache(chunk, Some(caches), device),
     )?;

@@ -1188,7 +1188,7 @@ fn chunked_prefill_logs_the_chunk_it_cut_at() {
             &ids,
             (4, "arch_default"),
             Device::Cpu,
-            "Qwen3ForCausalLM",
+            "qwen3",
             &AtomicBool::new(false),
             forward_chunk,
         );
@@ -1206,7 +1206,7 @@ fn chunked_prefill_logs_the_chunk_it_cut_at() {
     );
     assert_eq!(field("prompt_len").as_deref(), Some("9"));
     assert_eq!(field("n_chunks").as_deref(), Some("3"));
-    assert_eq!(field("arch").as_deref(), Some("Qwen3ForCausalLM"));
+    assert_eq!(field("arch").as_deref(), Some("qwen3"));
     assert_eq!(seen, vec![4], "prefill did not cut at the chunk it logged");
 }
 
@@ -1391,6 +1391,21 @@ fn the_source_rule_reads_calls_and_order_and_not_comments_or_strings() {
     let code = code_of(&file);
     assert!(!code.contains("emit_replayed_token("), "{code}");
     assert!(!shows_the_replayed_token_to_the_constraint(&code));
+}
+
+#[test]
+fn the_prefill_cache_is_released_only_above_the_live_memory() {
+    assert!(prefill_cache_over_bound(Some(100), Some(101)));
+    assert!(!prefill_cache_over_bound(Some(100), Some(100)));
+    assert!(!prefill_cache_over_bound(Some(100), Some(99)));
+    assert!(!prefill_cache_over_bound(Some(100), Some(0)));
+}
+
+#[test]
+fn the_prefill_cache_is_released_when_mlx_reports_no_number() {
+    assert!(prefill_cache_over_bound(None, Some(1)));
+    assert!(prefill_cache_over_bound(Some(100), None));
+    assert!(prefill_cache_over_bound(None, None));
 }
 
 use crate::stop_scan::code_of;

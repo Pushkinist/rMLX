@@ -473,6 +473,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before, because the arithmetic is different. A key/value row of another
   dtype than its buffer is now an error also when it grows the buffer; the
   growth promoted the buffer with no error.
+- **One long prompt no longer makes the MLX buffer cache grow with the square
+  of its length.** MLX reuses a cached buffer only for a request of nearly the
+  same size. Each prefill chunk attends over a longer key length than the
+  chunk before, so its buffers are larger and the buffers of the earlier
+  chunks stayed in the cache while the live memory stayed flat. A prompt of
+  98 304 tokens on gemma-4-e2b took the footprint of the process to 84 GiB.
+  Each chunked prefill loop now trims the cache after a chunk, oldest
+  buffers first, to the live memory when the cache holds more than the live
+  memory. The buffers that the next chunk reuses stay in the cache, which a
+  full clear frees. A short prompt trims nothing, so its prefill speed does
+  not change. A long prompt pays the time to return the memory: on
+  gemma-4-e2b at 34 349 tokens the prefill is 2.9% slower.
 
 ## [0.4.3] - 2026-10-09
 

@@ -387,6 +387,7 @@ impl Qwen3VlMoeText {
                 for c in kv_caches.iter() {
                     c.eval_prefill_state()?;
                 }
+                crate::decode_loop::release_chunk_buffers("qwen3_vl_moe", (start / chunk) as usize);
             } else {
                 let h = self.final_norm.forward(&h, device)?;
                 let last = h.slice(&[0, clen - 1, 0], &[1, clen, hid], &[1, 1, 1], device)?;

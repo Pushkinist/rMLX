@@ -984,6 +984,14 @@ impl Qwen3_5MoeText {
                 return Ok((last_logits, hidden));
             }
 
+            // The hidden above reaches only up to the last captured layer.
+            // Evaluating the caches also evaluates the layers after it: the K/V
+            // of the last layer depends on them, and a linear-attention layer
+            // writes its recurrent state in the same kernel as its output.
+            for c in kv_caches.iter() {
+                c.eval_gpu_state()?;
+            }
+            crate::decode_loop::release_chunk_buffers("qwen3_5_moe", pos / chunk_size);
             pos = end;
         }
 

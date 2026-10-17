@@ -40,14 +40,13 @@ use std::time::Instant;
 use rmlx_core::cancel::ensure_not_cancelled;
 use rmlx_loader::{load_shard_index, view, ShardSet};
 use rmlx_mlx::{
-    add, concatenate, conv1d, conv_transpose1d, divide, exp, gelu, matmul, maximum,
-    mlx_clear_cache, multiply, quantized_matmul, rms_norm, rope, scalar_f32,
-    scaled_dot_product_attention, silu, sin, sqrt, subtract, sum_axis_keepdims, tanh, zeros, Array,
-    Device,
+    add, concatenate, conv1d, conv_transpose1d, divide, exp, gelu, matmul, maximum, multiply,
+    quantized_matmul, rms_norm, rope, scalar_f32, scaled_dot_product_attention, silu, sin, sqrt,
+    subtract, sum_axis_keepdims, tanh, zeros, Array, Device,
 };
 use thiserror::Error;
 use tracing::field::Empty;
-use tracing::{debug, info, info_span, instrument, warn};
+use tracing::{debug, info, info_span, instrument};
 
 // ── Error ─────────────────────────────────────────────────────────────────────
 
@@ -989,7 +988,7 @@ const DECODE_LEFT_CONTEXT_FRAMES: usize = 25;
 /// Evaluate `x` and release the MLX buffer cache.
 fn settle(x: Array) -> Result<Array, TtsError> {
     x.eval()?;
-    release_buffer_cache();
+    rmlx_mlx::release_buffer_cache();
     Ok(x)
 }
 
@@ -1013,7 +1012,9 @@ fn decode_in_chunks(
     cancel: &AtomicBool,
     window: impl FnMut(&Array) -> Result<Vec<f32>, TtsError>,
 ) -> Result<Vec<f32>, TtsError> {
-    decode_passes(codes, d, cancel, window).inspect_err(|_| release_buffer_cache())
+    decode_passes(codes, d, cancel, window).inspect_err(|_| {
+        rmlx_mlx::release_buffer_cache();
+    })
 }
 
 fn decode_passes(
@@ -1047,7 +1048,7 @@ fn decode_passes(
         }
         let per_frame = decoded.len() / frames;
         samples.extend_from_slice(&decoded[context * per_frame..]);
-        release_buffer_cache();
+        rmlx_mlx::release_buffer_cache();
         start = end;
     }
     Ok(samples)
@@ -2134,16 +2135,10 @@ pub(crate) struct Frames {
     pub(crate) truncated: bool,
 }
 
-fn release_buffer_cache() {
-    if !mlx_clear_cache() {
-        warn!("releasing the MLX buffer cache failed");
-    }
-}
-
 /// Release the MLX buffer cache from the frame loop and log why.
 fn release_frame_cache(reason: &'static str) {
     debug!(reason, "the frame loop releases the MLX buffer cache");
-    release_buffer_cache();
+    rmlx_mlx::release_buffer_cache();
 }
 
 /// Run `step` until it returns [`FrameStep::End`] or [`MAX_FRAMES`] frames exist.

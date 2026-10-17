@@ -313,7 +313,7 @@ pub fn generate_greedy<'a>(
             prompt_ids,
             prefill_chunk,
             device,
-            "Gemma3ForConditionalGeneration",
+            "gemma3",
             cancel,
             |chunk, caches| model.forward_seq_with_cache(chunk, Some(caches), device),
         )?

@@ -19,7 +19,7 @@ fn spec_prefill(
     stop: &AtomicBool,
     forward: impl FnMut(&[u32], &mut [KvCache]) -> Result<()>,
 ) -> Result<()> {
-    prefill_chunked_with(tokens, caches, 4, Device::Cpu, stop, forward)
+    prefill_chunked_with("test", tokens, caches, 4, Device::Cpu, stop, forward)
 }
 
 /// What one scripted prefill did.

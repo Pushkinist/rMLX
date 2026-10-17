@@ -64,7 +64,7 @@ use rmlx_kv_quant::KvQuant;
 /// Verifier prefill window. The capture forward materialises one hidden row per
 /// prompt position, and a whole long prompt in one command buffer exceeds the
 /// Metal watchdog.
-const PREFILL_CHUNK_SIZE: usize = 1024;
+pub const VERIFIER_PREFILL_CHUNK: usize = 1024;
 
 /// One request's EAGLE-3 drafting state.
 ///
@@ -283,7 +283,7 @@ impl RoundDrafter for Eagle3Round<'_> {
         let n = prompt.len();
         tracing::debug!(
             prompt_len = n,
-            chunk_size = PREFILL_CHUNK_SIZE,
+            chunk_size = VERIFIER_PREFILL_CHUNK,
             "eagle3: verifier prefill (chunked)"
         );
         let prefill_t0 = Instant::now();
@@ -292,7 +292,7 @@ impl RoundDrafter for Eagle3Round<'_> {
             &self.aux_layer_ids,
             &mut ctx.kv,
             ctx.lin.as_deref_mut(),
-            PREFILL_CHUNK_SIZE,
+            VERIFIER_PREFILL_CHUNK,
             // This drafter's own KV prefill conditions on every prompt position,
             // so no capture row can be released early.
             None,

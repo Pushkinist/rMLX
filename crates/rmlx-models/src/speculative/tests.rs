@@ -168,7 +168,15 @@ fn spec_prefill_chunked_runs_exit_sweep_on_failure() {
         ))
     };
     let never = AtomicBool::new(false);
-    let _ = prefill_chunked_with(&tokens, &mut caches, 4, Device::Cpu, &never, forward);
+    let _ = prefill_chunked_with(
+        "test",
+        &tokens,
+        &mut caches,
+        4,
+        Device::Cpu,
+        &never,
+        forward,
+    );
     for (i, c) in caches.iter_mut().enumerate() {
         assert!(
             !c.in_prefill(),
@@ -206,8 +214,16 @@ fn spec_prefill_chunked_reports_first_cause() {
         Err(Error::Other("simulated spec prefill cause".to_owned()))
     };
     let never = AtomicBool::new(false);
-    let err = prefill_chunked_with(&tokens, &mut caches, 4, Device::Cpu, &never, forward)
-        .expect_err("a rejected spec prefill must surface as Err, not a silent Ok");
+    let err = prefill_chunked_with(
+        "test",
+        &tokens,
+        &mut caches,
+        4,
+        Device::Cpu,
+        &never,
+        forward,
+    )
+    .expect_err("a rejected spec prefill must surface as Err, not a silent Ok");
     assert!(
         err.to_string().contains("simulated spec prefill cause"),
         "the underlying cause must reach the caller verbatim, got: {err}"

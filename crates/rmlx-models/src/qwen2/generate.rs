@@ -304,6 +304,7 @@ pub fn generate_greedy(
                                     return Err(e);
                                 }
                             }
+                            crate::decode_loop::release_chunk_buffers("qwen2", chunk_idx);
                         }
                     }
                     Err(e) => {

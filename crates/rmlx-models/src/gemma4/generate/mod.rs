@@ -541,6 +541,7 @@ pub fn generate_greedy<'a>(
                             );
                             return Err(e);
                         }
+                        crate::decode_loop::release_chunk_buffers("gemma4", chunk_idx);
                     }
                 }
                 Err(e) => {
@@ -568,7 +569,7 @@ pub fn generate_greedy<'a>(
             prompt_ids,
             prefill_chunk,
             device,
-            "Gemma4ForConditionalGeneration",
+            "gemma4",
             cancel,
             |chunk, caches| model.forward_seq_with_cache(chunk, Some(caches), device),
         )?

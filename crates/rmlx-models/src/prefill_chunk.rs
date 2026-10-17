@@ -151,6 +151,15 @@ pub fn module_key_for_class(arch_class: &str) -> &'static str {
     }
 }
 
+/// The name a prefill event carries for `arch_class`: its
+/// [`module_key_for_class`] key, or the class name when it has none.
+pub fn event_name(arch_class: &str) -> &str {
+    match module_key_for_class(arch_class) {
+        "" => arch_class,
+        key => key,
+    }
+}
+
 pub(crate) fn arch_default(arch: &str) -> Option<usize> {
     match arch {
         // qwen3 default 1024. A real-model kv-none sweep over

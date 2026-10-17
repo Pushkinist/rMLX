@@ -74,6 +74,47 @@ Resolution order: the adaptive-admission runtime override, then
 `RMLX_PREFILL_CHUNK_<ARCH>`, then `RMLX_PREFILL_CHUNK`, then the table. The
 runtime override is clamped to `[32, 2048]`.
 
+After the cache state of each chunk but the last is evaluated, the prefill
+calls `decode_loop::release_chunk_buffers`. It reads the live bytes and the
+cached bytes of MLX. When the cache holds more than the live memory, it trims
+the MLX buffer cache to the live bytes (`rmlx_mlx::trim_buffer_cache`). When MLX
+reports either number as unknown, it clears the cache
+(`rmlx_mlx::release_buffer_cache`). It logs one `debug!` event at every such
+chunk boundary, with `active_bytes`, `cached_bytes`, `active_after_bytes` and `cached_after_bytes` (the
+live and cached bytes read after the decision) and `released`.
+
+MLX reuses a cached buffer only for a request of nearly the same size. Each
+chunk attends over a longer key length than the chunk before, so its attention
+buffers are larger and the buffers of the earlier chunks are never reused.
+Without a bound, the cache of one long prompt grows with the square of the
+prompt length while the live memory stays flat. A full clear also frees the
+buffers of the activations and projections, which have the same size in every
+chunk and which the next chunk must allocate again; a full clear after every
+chunk would cost 9% of the prefill speed of an 8 483-token prompt on
+gemma-4-e2b. A trim frees the oldest buffers first. The buffers that were freed
+last, which the next chunk reuses, stay. So the next chunk finds its buffers in
+the cache, and a short prompt trims nothing.
+
+The trim sets the MLX cache limit to the live bytes, makes one small
+allocation so that the allocator trims, sets the limit to 0, drops the small
+array so that its buffer is freed and not cached, and sets the first limit back.
+The whole sequence runs under the evaluation lock, because the limit is
+process-wide. MLX frees a buffer whole, so the cache can end below the live
+bytes. When the live bytes are at most a tenth of the cache, MLX clears the
+whole cache.
+
+A buffer that an in-flight command buffer still holds is freed after the trim
+and enters the cache. So the cache alone can end above the live bytes, but the
+sum of live and cached bytes does not grow past the live bytes before the trim
+plus the bytes the trim keeps.
+
+The trim costs the time MLX takes to return the memory. On gemma-4-e2b at
+34 349 prompt tokens, the trim fires at every chunk from chunk 13 and frees
+about 17 GB in total, and the prefill is 2.9% slower than with no bound. At
+about 8 000 tokens on gemma-4-e2b, Ternary-Bonsai-8B and Qwen3.8-27B, and at
+31 548 tokens on Ternary-Bonsai-8B, the difference is inside the noise of the
+measurement.
+
 ---
 
 ## 4. Supported types

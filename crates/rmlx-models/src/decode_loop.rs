@@ -798,6 +798,65 @@ fn log_prefill_plan(
     );
 }
 
+/// Trim the MLX buffer cache to the live memory after the state of a prefill
+/// chunk is evaluated, when the cache holds more than the live memory.
+///
+/// MLX reuses a cached buffer only for a request of nearly the same size. Each
+/// chunk attends over a longer key length than the chunk before, so its
+/// attention buffers are larger and the buffers of the chunks before are never
+/// reused. Without a bound, the cache of one long prompt grows with the
+/// square of the prompt length while the live memory stays flat.
+///
+/// A full clear also frees the buffers that the next chunk reuses: the
+/// activations and projections have the same size in every chunk, and the
+/// chunk must allocate them again. So the cache is trimmed, not cleared: the
+/// oldest buffers go first, and the buffers freed last, which the next chunk
+/// reuses, stay. The trim runs only when the cache holds more than the live
+/// memory, which costs a short prompt nothing. When MLX reports no figure for
+/// the live or the cached bytes, the cache is cleared, so an unknown state
+/// keeps the memory bound.
+///
+/// `arch` is the name from [`crate::prefill_chunk::event_name`]. The event is
+/// emitted at every chunk boundary and carries the live bytes and the cached
+/// bytes read before the decision, and the live bytes and cached bytes read
+/// after it, when MLX reports them.
+///
+/// Buffers that an in-flight command buffer still holds are freed after the
+/// trim and enter the cache, so the cache alone can end above the live bytes
+/// by those buffers. The sum of live and cached bytes does not grow past the
+/// live bytes before plus the bytes the trim keeps.
+pub(crate) fn release_chunk_buffers(arch: &str, chunk_idx: usize) {
+    let active_bytes = rmlx_mlx::mlx_active_memory_bytes();
+    let cached_bytes = rmlx_mlx::mlx_cache_memory_bytes();
+    let released = prefill_cache_over_bound(active_bytes, cached_bytes)
+        && match (active_bytes, cached_bytes) {
+            (Some(active), Some(_)) => rmlx_mlx::trim_buffer_cache(active),
+            _ => rmlx_mlx::release_buffer_cache(),
+        };
+    let active_after_bytes = rmlx_mlx::mlx_active_memory_bytes();
+    let cached_after_bytes = rmlx_mlx::mlx_cache_memory_bytes();
+    tracing::debug!(
+        arch,
+        chunk_idx,
+        active_bytes,
+        cached_bytes,
+        active_after_bytes,
+        cached_after_bytes,
+        released,
+        "prefill: chunk boundary, MLX buffer cache"
+    );
+}
+
+/// Whether the buffer cache holds more than the live memory. A number MLX does
+/// not report counts as over the bound, so an unknown state keeps the memory
+/// bound.
+fn prefill_cache_over_bound(active: Option<u64>, cached: Option<u64>) -> bool {
+    match (active, cached) {
+        (Some(active), Some(cached)) => cached > active,
+        _ => true,
+    }
+}
+
 /// Fresh chunked prefill: `enter_prefill` → per-chunk forward + `eval_prefill_state`
 /// → `exit_prefill`. Returns the final-position logits, or the cause that
 /// prevented them.
@@ -819,6 +878,9 @@ fn log_prefill_plan(
 /// controller can install a process-wide override between two walks, so a
 /// second one can disagree with the size this prefill is actually using and
 /// would log the wrong provenance for an ordinary adaptive run.
+///
+/// `arch` is the key of [`crate::prefill_chunk::event_name`], the
+/// one name every prefill loop uses in its events.
 ///
 /// `caches` is borrowed `&mut` by this fn (it brackets enter/exit and evals
 /// non-final chunk state) AND re-borrowed into `forward_chunk` per chunk — the
@@ -873,6 +935,7 @@ pub(crate) fn chunked_prefill(
                             );
                             return Err(e);
                         }
+                        release_chunk_buffers(arch, chunk_idx);
                     }
                 }
                 Err(e) => {

@@ -310,7 +310,7 @@ pub fn generate_greedy(
         prompt_ids,
         prefill_chunk,
         device,
-        "Qwen3VLMoeForConditionalGeneration",
+        "qwen3_vl_moe",
         cancel,
         |chunk, kv| model.forward_seq_with_cache(chunk, Some(kv), device),
     )?;
