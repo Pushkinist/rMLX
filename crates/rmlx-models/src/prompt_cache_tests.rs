@@ -328,6 +328,7 @@ struct RealEntry {
     hashes: Vec<u64>,
     kv_caches: Vec<KvCache>,
     lin_caches: Vec<LinearAttnCache>,
+    anchor: Option<Anchor>,
     kv_quant: Option<KvQuant>,
 }
 
@@ -353,8 +354,22 @@ impl RealEntry {
             hashes,
             kv_caches,
             lin_caches,
+            anchor: None,
             kv_quant: Some(REAL_QUANT),
         }
+    }
+
+    /// The same entry with a recurrent state saved at `pos` tokens.
+    fn with_anchor(mut self, pos: usize) -> Self {
+        self.anchor = Some(Anchor {
+            pos,
+            lin_caches: self
+                .lin_caches
+                .iter()
+                .map(|_| LinearAttnCache::new())
+                .collect(),
+        });
+        self
     }
 }
 
@@ -385,6 +400,7 @@ impl PromptCacheEntry for RealEntry {
                 .iter()
                 .map(|c| c.try_deep_clone().unwrap())
                 .collect(),
+            anchor: self.anchor.as_ref().map(|a| a.try_deep_clone().unwrap()),
             kv_quant: self.kv_quant,
         })
     }
@@ -403,6 +419,10 @@ impl PromptCacheEntry for RealEntry {
 
     fn lin_caches(&self) -> &[LinearAttnCache] {
         &self.lin_caches
+    }
+
+    fn anchor(&self) -> Option<&Anchor> {
+        self.anchor.as_ref()
     }
     // truncate_kv_to / truncate_kv_to_block / kv_bytes: inherited from trait.
 }
@@ -2869,26 +2889,274 @@ fn snapshot_clone_refuses_a_paged_layer_with_pages_and_logs_it() {
     );
 }
 
-/// An entry with a recurrent state is spilled only when its prompt ends on a
-/// block boundary; a pure-attention entry is spilled at any length once it holds
-/// a full block.
+/// What a spill writes for an entry.
+///
+/// A pure-attention entry is spilled at any length once it holds a full block.
+/// A recurrent entry is spilled as it is when its prompt ends on a block
+/// boundary, and otherwise as its anchor: keyed by the block the anchor ends,
+/// carrying the anchor as the state. With no anchor it is withheld.
 #[test]
-fn spill_key_withholds_a_recurrent_entry_that_ends_inside_a_block() {
+fn spill_plan_names_the_block_and_the_state_a_hydrate_can_reuse() {
     let ids = |n: usize| (0..n as u32).collect::<Vec<_>>();
-    let key = |n: usize, n_lin: usize| spill_key(&RealEntry::new(ids(n), 0, 0, n_lin));
+    let plan = |entry: &RealEntry| spill_plan(entry).map(|p| (p.hash, p.state_len));
+    let block = |entry: &RealEntry, k: usize| entry.block_hashes().get(k).copied();
 
-    assert!(
-        key(2 * BLOCK_TOKENS + 44, 1).is_none(),
-        "recurrent state past the last full block"
+    let inside = RealEntry::new(ids(2 * BLOCK_TOKENS + 44), 0, 0, 1);
+    assert_eq!(plan(&inside), None, "no anchor, state past the last block");
+
+    let anchored =
+        RealEntry::new(ids(2 * BLOCK_TOKENS + 44), 0, 0, 1).with_anchor(2 * BLOCK_TOKENS);
+    assert_eq!(
+        plan(&anchored),
+        block(&anchored, 1).map(|h| (h, 2 * BLOCK_TOKENS)),
+        "spilled as its anchor, keyed by the block the anchor ends"
     );
-    assert!(
-        key(2 * BLOCK_TOKENS, 1).is_some(),
-        "recurrent state on a boundary"
+
+    let aligned = RealEntry::new(ids(2 * BLOCK_TOKENS), 0, 0, 1).with_anchor(BLOCK_TOKENS);
+    assert_eq!(
+        plan(&aligned),
+        block(&aligned, 1).map(|h| (h, 2 * BLOCK_TOKENS)),
+        "a prompt ending on a boundary is spilled whole, not as its anchor"
     );
-    assert!(
-        key(2 * BLOCK_TOKENS + 44, 0).is_some(),
+
+    let attention = RealEntry::new(ids(2 * BLOCK_TOKENS + 44), 0, 0, 0);
+    assert_eq!(
+        plan(&attention),
+        block(&attention, 1).map(|h| (h, 2 * BLOCK_TOKENS + 44)),
         "pure attention rewinds to the boundary at hydrate"
     );
-    assert!(key(44, 1).is_none(), "no full block, no key");
-    assert!(key(44, 0).is_none(), "no full block, no key");
+
+    // A sliding-window ring that has wrapped cannot give a block back; one short
+    // of its wrap can. Both hold the same prompt and the same anchor.
+    let ringed = |window: i32, fill: i32| {
+        let mut entry = RealEntry::new(ids(BLOCK_TOKENS + 44), 0, 0, 1).with_anchor(BLOCK_TOKENS);
+        entry.kv_caches = vec![windowed_cache(window, fill)];
+        entry
+    };
+    let wrapped = ringed(128, 512);
+    assert_eq!(
+        plan(&wrapped),
+        None,
+        "a wrapped ring cannot be cut back to the anchor"
+    );
+    let unwrapped = ringed(512, 300);
+    assert_eq!(
+        plan(&unwrapped),
+        block(&unwrapped, 0).map(|h| (h, BLOCK_TOKENS)),
+        "positive control: a ring short of its wrap is spilled as the anchor"
+    );
+
+    assert_eq!(
+        plan(&RealEntry::new(ids(44), 0, 0, 1)),
+        None,
+        "no full block, no key"
+    );
+    assert_eq!(
+        plan(&RealEntry::new(ids(44), 0, 0, 0)),
+        None,
+        "no full block, no key"
+    );
+}
+
+/// A sliding-window cache of `window` positions after a prefill of `fill` and two
+/// decode steps, the shape a stored entry has.
+#[allow(
+    clippy::unwrap_used,
+    reason = "test-only: the CPU update path is infallible on a correctly-shaped fixture"
+)]
+fn windowed_cache(window: i32, fill: i32) -> KvCache {
+    let kv = |n: i32| {
+        let data: Vec<f32> = (0..n * 2).map(|i| i as f32).collect();
+        Array::from_f32_slice(&data, &[1, 1, n, 2]).unwrap()
+    };
+    let mut cache = KvCache::with_quant_max_seq_window(KvQuant::None, 8192, Some(window));
+    cache.update(&kv(fill), &kv(fill), Device::Cpu).unwrap();
+    for _ in 0..2 {
+        cache.update(&kv(1), &kv(1), Device::Cpu).unwrap();
+    }
+    cache
+}
+
+// ── The slot loop of the consume engine, through the canned hooks of TestEntry ──
+//
+// `RealEntry` supplies no reuse hook, so it cannot offer a reuse; `TestEntry`
+// carries the canned hook the matrix tests above use, and mirrors the predicates
+// of the real ones.
+
+/// `entries` pushed in order into a fresh cache of the given policy.
+#[allow(
+    clippy::unwrap_used,
+    reason = "test-only: the cache is installed inside the same closure just above the pushes"
+)]
+fn arch_with(policy: ReusePolicy, entries: Vec<TestEntry>) -> ArchPromptCache<TestEntry> {
+    let arch: ArchPromptCache<TestEntry> = ArchPromptCache::new("test", policy, false);
+    arch.with_inner_mut(|g| {
+        *g = Some(PromptCache::new(8));
+        for entry in entries {
+            g.as_mut().unwrap().push(entry);
+        }
+    });
+    arch
+}
+
+fn serve(arch: &ArchPromptCache<TestEntry>, prompt: &[u32]) -> Consumed<TestEntry> {
+    arch.consume(prompt, TEST_QUANT, TEST_LAYERS, false, TEST_SIG)
+}
+
+/// The first `keep` tokens of `base`, then `extra` tokens it does not hold.
+fn diverging(base: &[u32], keep: usize, extra: usize) -> Vec<u32> {
+    base.iter()
+        .copied()
+        .take(keep)
+        .chain((0..extra as u32).map(|i| 9_000_000 + i))
+        .collect()
+}
+
+#[test]
+fn an_exact_hit_on_a_later_slot_wins_over_a_longer_slot_that_ties() {
+    // Both slots share two blocks with the request; the longer is first.
+    let arch = arch_with(
+        ReusePolicy::ExactOnly,
+        vec![
+            TestEntry::for_quant(make_ids(800), TEST_QUANT),
+            TestEntry::for_quant(make_ids(700), TEST_QUANT),
+        ],
+    );
+    assert_eq!(tag(&serve(&arch, &make_ids(700))), ConsumedTag::Exact);
+}
+
+#[test]
+fn a_block_truncate_on_a_later_slot_serves_when_the_best_slot_declines() {
+    let base = make_ids(4 * BLOCK_TOKENS);
+    let request = diverging(&base, 3 * BLOCK_TOKENS, BLOCK_TOKENS);
+    let best = TestEntry::for_quant(base.clone(), TEST_QUANT);
+    let later = TestEntry::for_quant(diverging(&base, 2 * BLOCK_TOKENS, BLOCK_TOKENS), TEST_QUANT)
+        .with_reuse_kind(ReuseKind::BlockTruncate {
+            effective_blocks: 2,
+        });
+    let arch = arch_with(ReusePolicy::Partial, vec![best, later]);
+    assert_eq!(
+        tag(&serve(&arch, &request)),
+        ConsumedTag::Reuse(ReuseKind::BlockTruncate {
+            effective_blocks: 2
+        })
+    );
+}
+
+#[test]
+fn the_longest_reuse_serves_not_the_best_matching_slot() {
+    // A shares three blocks with the request and resumes at 512; B shares two and
+    // resumes at 700.
+    let base = make_ids(800);
+    let request = diverging(&base, 790, 60);
+    let a = TestEntry::for_quant(base, TEST_QUANT).with_reuse_kind(ReuseKind::BlockTruncate {
+        effective_blocks: 2,
+    });
+    let b = TestEntry::for_quant(make_ids(700), TEST_QUANT)
+        .with_reuse_kind(ReuseKind::StrictPrefix { prefix_len: 700 });
+    let arch = arch_with(ReusePolicy::Partial, vec![a, b]);
+    assert_eq!(
+        tag(&serve(&arch, &request)),
+        ConsumedTag::Reuse(ReuseKind::StrictPrefix { prefix_len: 700 })
+    );
+}
+
+#[test]
+fn the_slot_that_served_is_counted_and_stamped_not_the_best_match() {
+    let base = make_ids(800);
+    let request = diverging(&base, 790, 60);
+    let a = TestEntry::for_quant(base, TEST_QUANT).with_reuse_kind(ReuseKind::BlockTruncate {
+        effective_blocks: 2,
+    });
+    let b = TestEntry::for_quant(make_ids(700), TEST_QUANT)
+        .with_reuse_kind(ReuseKind::StrictPrefix { prefix_len: 700 });
+    let unrelated = TestEntry::for_quant(
+        (0..2 * BLOCK_TOKENS as u32)
+            .map(|i| 5_000_000 + i)
+            .collect(),
+        TEST_QUANT,
+    );
+    let arch = arch_with(ReusePolicy::Partial, vec![a, b, unrelated]);
+    assert_eq!(
+        tag(&serve(&arch, &request)),
+        ConsumedTag::Reuse(ReuseKind::StrictPrefix { prefix_len: 700 })
+    );
+    arch.with_inner_mut(|g| {
+        let Some(cache) = g.as_ref() else {
+            return;
+        };
+        assert_eq!(cache.stats.hits, 1);
+        assert_eq!(
+            cache.stats.block_hits, 2,
+            "the two blocks of the slot that served, not the three of the best match"
+        );
+        assert_eq!(cache.stats.partial_hits, 1);
+        let lru = cache
+            .slots
+            .get(cache.lru_slot_index())
+            .map(|slot| slot.entry.ids.len());
+        assert_eq!(
+            lru,
+            Some(800),
+            "the slot that declined to serve is the least recently used, the one that served is not"
+        );
+    });
+}
+
+#[test]
+fn a_quant_mismatched_second_slot_is_evicted_and_skipped() {
+    let base = make_ids(4 * BLOCK_TOKENS);
+    let request = diverging(&base, 3 * BLOCK_TOKENS, BLOCK_TOKENS);
+    let best = TestEntry::for_quant(base.clone(), TEST_QUANT);
+    let mut mismatched =
+        TestEntry::for_quant(diverging(&base, 2 * BLOCK_TOKENS, BLOCK_TOKENS), TEST_QUANT);
+    mismatched.kv_quant = Some(KvQuant::K8V4);
+    let arch = arch_with(ReusePolicy::Partial, vec![best, mismatched]);
+    assert!(matches!(
+        serve(&arch, &request),
+        Consumed::Miss(reason) if reason.label() == "non_reusable"
+    ));
+    arch.with_inner_mut(|g| {
+        let Some(cache) = g.as_ref() else {
+            return;
+        };
+        assert_eq!(cache.slots.len(), 1, "the mismatched slot is gone");
+        assert_eq!(cache.stats.evictions, 1);
+    });
+}
+
+#[test]
+fn a_mismatched_best_slot_is_evicted_and_a_later_one_serves() {
+    let base = make_ids(4 * BLOCK_TOKENS);
+    let request = diverging(&base, 3 * BLOCK_TOKENS, BLOCK_TOKENS);
+    let mut mismatched = TestEntry::for_quant(base.clone(), TEST_QUANT);
+    mismatched.kv_quant = Some(KvQuant::K8V4);
+    let later = TestEntry::for_quant(diverging(&base, 2 * BLOCK_TOKENS, BLOCK_TOKENS), TEST_QUANT)
+        .with_reuse_kind(ReuseKind::BlockTruncate {
+            effective_blocks: 2,
+        });
+    let arch = arch_with(ReusePolicy::Partial, vec![mismatched, later]);
+    assert_eq!(
+        tag(&serve(&arch, &request)),
+        ConsumedTag::Reuse(ReuseKind::BlockTruncate {
+            effective_blocks: 2
+        })
+    );
+}
+
+#[test]
+fn every_slot_declining_is_one_miss_event_with_the_best_slots_reason() {
+    let base = make_ids(4 * BLOCK_TOKENS);
+    let request = diverging(&base, 3 * BLOCK_TOKENS, BLOCK_TOKENS);
+    let arch = arch_with(
+        ReusePolicy::Partial,
+        vec![
+            TestEntry::for_quant(base.clone(), TEST_QUANT),
+            TestEntry::for_quant(diverging(&base, 2 * BLOCK_TOKENS, BLOCK_TOKENS), TEST_QUANT),
+        ],
+    );
+    let mut out = None;
+    let branches = capture_branches(|| out = Some(serve(&arch, &request)));
+    assert!(matches!(out, Some(Consumed::Miss(_))));
+    assert_eq!(branches, vec!["non_reusable".to_owned()]);
 }

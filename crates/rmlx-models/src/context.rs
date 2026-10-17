@@ -38,6 +38,7 @@
 //! operator always has a way through.
 
 use rmlx_core::error::{Error, Result};
+use rmlx_kv_quant::KvCache;
 
 /// Where an active RoPE scaling came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -260,6 +261,40 @@ pub fn resolve_context(
         ceiling,
         initial_max_seq: default.min(ceiling),
     })
+}
+
+/// Bind the K/V of a reused prompt-cache prefix to the context ceiling of the
+/// request that reuses it.
+///
+/// A stored entry's caches carry the ceiling of the request that filled them.
+/// A request under another ceiling has to succeed or fail as a cold run of the
+/// same prompt would under its own: a lower ceiling refuses a prompt above it,
+/// and a higher one lets the tail and the decode grow past the stored ceiling.
+/// A request is never turned into a miss by a differing ceiling.
+///
+/// # Errors
+///
+/// [`Error::KvCeilingExceeded`] when `prompt_len` is above `ceiling`, the typed
+/// refusal a cold prefill of that prompt raises. Its `requested` is the prompt
+/// length, where a cold prefill reports the length at the chunk that crossed.
+pub(crate) fn rebind_to_ceiling(
+    kv_caches: Vec<KvCache>,
+    ceiling: i32,
+    prompt_len: usize,
+) -> Result<Vec<KvCache>> {
+    if usize::try_from(ceiling).is_ok_and(|c| prompt_len > c) {
+        let requested = i32::try_from(prompt_len).unwrap_or(i32::MAX);
+        tracing::warn!(
+            requested,
+            ceiling,
+            "KV max-ctx ceiling exceeded — rejecting reused prefix"
+        );
+        return Err(Error::KvCeilingExceeded { requested, ceiling });
+    }
+    Ok(kv_caches
+        .into_iter()
+        .map(|cache| cache.with_max_seq_ceiling(ceiling))
+        .collect())
 }
 
 #[cfg(test)]

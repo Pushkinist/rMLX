@@ -11,6 +11,7 @@
 //! [`rmlx_quant::awq`]; the PARO/embedding `Array`-side assembly lives in
 //! [`crate::load_util`].
 
+pub(super) mod anchor_capture;
 pub(super) mod attention;
 pub(crate) mod capture_tail;
 pub(super) mod config;

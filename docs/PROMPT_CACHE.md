@@ -130,7 +130,7 @@ Each architecture owns one process-global `static` of type
 |---|---|---|---|
 | `Gemma4ForConditionalGeneration` | `gemma4::prompt_cache::PROMPT_CACHE` | `Gemma4Entry` | `Partial` |
 | `Gemma3ForConditionalGeneration` | `gemma3::prompt_cache::PROMPT_CACHE` | `Gemma3Entry` | `ExactOnly` |
-| `Qwen3_5MoeForConditionalGeneration` | `qwen3_5_moe::prompt_cache::PROMPT_CACHE` | `Qwen35MoeEntry` | `ExactOnly` |
+| `Qwen3_5MoeForConditionalGeneration` | `qwen3_5_moe::prompt_cache::PROMPT_CACHE` | `Qwen35MoeEntry` | `Partial` |
 | `Qwen3VLMoeForConditionalGeneration` | `qwen3_vl_moe::prompt_cache::PROMPT_CACHE` | `Qwen3VlMoeEntry` | `ExactOnly` |
 | `Qwen3ForCausalLM` | `QWEN3_PROMPT_CACHE` (in `qwen3.rs`) | `Qwen3Entry` | `ExactOnly` |
 | `Qwen2ForCausalLM` | `qwen2::prompt_cache::PROMPT_CACHE` | `Qwen2Entry` | `ExactOnly` |
@@ -144,8 +144,9 @@ post-prefill `kv_caches`, the first decode token, and the `KvQuant` in effect
 when the snapshot was taken.
 
 - **`Qwen35MoeEntry`** also holds `lin_caches`, the GatedDeltaNet recurrent
-  states. They are never truncated: recurrent state cannot be rebuilt from a
-  block-truncated prefix. That is why the arch is `ExactOnly`.
+  states, and an `anchor`: a second set of them, saved inside the prompt (see
+  "Qwen3.5 resume and the anchor"). A recurrent state is never truncated, since
+  it has no sequence axis; the entry resumes from one it holds.
 - **`Qwen3Entry`** also holds `first_logprobs`.
 
 **First-token logprob on Exact hit.** An Exact hit replays the cached first
@@ -260,12 +261,26 @@ or `Consumed::Miss(reason)`:
    complete; a RAM entry only under `Partial`. The entry's
    `is_reusable_prefix_of` picks the `ReuseKind`, and `prepare_reuse` clones
    (and trims).
-7. Anything else misses.
+7. A slot that declines is not the end. Every other slot that shares a block is
+   asked in turn, most blocks first. An Exact hit wins outright; otherwise the
+   longest reuse any slot allows is taken, the first of equals. The lookup is
+   counted, and the slot stamped most recently used, for the slot that served.
+   The SSD tier is not asked again after the RAM slots decline: a decline is the
+   common outcome of a partial match, and the tier would be read on each one.
+8. Anything else misses, with the best slot's reason.
 
 Every miss carries a `MissReason` and logs one `debug!` event whose `branch`
 field is the reason's label: `has_image`, `no_cache`, `no_match`,
 `quant_mismatch`, `deep_clone_err`, `incomplete_hydrate`, `non_reusable`,
 `hydrated_declined_to_exact`.
+
+**Context ceiling.** The K/V of an entry carries the `--max-ctx` ceiling of the
+request that filled it. Gemma4, Qwen3.5, Qwen3 dense and Qwen3-VL-MoE bind a
+reused entry, Exact hits included, to the ceiling of the request that reuses it
+(`context::rebind_to_ceiling`), so that request succeeds or fails as a cold run
+of the same prompt would under its own ceiling: a prompt above it is refused
+with `KvCeilingExceeded`, and a ceiling higher than the stored one lets the tail
+and the decode grow. A ceiling that differs is never a miss.
 
 A paged KV cache (`--paged-kv`) whose slots hold pages refuses its deep clone,
 because the pages have no copy. The post-prefill snapshot of such a cache is
@@ -275,7 +290,7 @@ skips it with a `warn!`. A paged cache with no pages clones.
 
 `ReuseKind` is `StrictPrefix { prefix_len }` (reuse the whole cached prefix,
 prefill the rest) or `BlockTruncate { effective_blocks }` (trim to a block
-boundary, prefill the rest).
+boundary, prefill the rest: Gemma4's block truncate and the Qwen3.5 anchor).
 
 ---
 
@@ -290,13 +305,12 @@ pub(crate) enum ReusePolicy {
 }
 ```
 
-**`Partial`** (Gemma4): a RAM entry may be reused as a prefix. See the
-Gemma4 section below.
+**`Partial`** (Gemma4, Qwen3.5): a RAM entry may be reused as a prefix. The
+entry's hook decides which prefix. See the Gemma4 and Qwen3.5 sections below.
 
 **`ExactOnly`** (every other arch): a RAM entry is reused only on an Exact
 hit; any partial match misses. A hydrated entry is still reused as a strict
-prefix where the arch's hook allows it. `Qwen35MoeEntry` allows it when the
-stored tokens are a strict prefix of the request.
+prefix where the arch's hook allows it.
 
 ### Judging a resume arm
 
@@ -354,6 +368,64 @@ full prefill.
 
 Gemma4's SWA rings are not written to the SSD tier. A hydrated entry with a
 payload-less attended layer fails `is_hydrate_complete` and misses.
+
+---
+
+## Qwen3.5 resume and the anchor
+
+A recurrent state has no sequence axis, so it cannot be cut back to a shorter
+prefix the way K/V can. `Qwen35MoeEntry::is_reusable_prefix_of` therefore
+resumes a request only from a state the entry holds. It tries two, in this
+order.
+
+**Strict prefix**: the stored prompt is shorter than the request and equal to
+its first tokens. The entry is reused whole, its end state included, and only
+the tail is prefilled. A RAM entry and an SSD-hydrated one are alike here, since
+a hydrated block's caches sit exactly at the prefix it claims. The strict
+less-than leaves an equal prompt to the Exact arm.
+
+**Anchor**: the entry also keeps one recurrent state saved inside its prompt, at
+`Anchor::pos_for(len)` = `floor((len - 1) / 256) * 256`, the last full block
+that leaves a non-empty tail. A prompt under one block saves none. The request
+resumes there when it agrees with the stored prompt up to the anchor, has a
+token past it, and every K/V cache passes `can_truncate_to_block`.
+`prepare_reuse` then clones the entry, cuts its K/V to the anchor with
+`truncate_kv_to_block` and puts the anchor's state in place of the end state
+(`ReuseKind::BlockTruncate`). A request that first differs from the stored prompt
+at its last token resumes here. A chat does that when its template renders the
+previous generation prompt differently in the next request. A request that
+differs before the anchor misses (`non_reusable`).
+
+**Capture.** The anchor is taken while the prompt is prefilled
+(`qwen3_5_moe/anchor_capture.rs`). The chunk that holds the anchor position is
+forwarded in two parts, with the recurrent state cloned and evaluated between
+them. That moves where the cold prefill splits, so its logits can differ from
+those of a prefill that does not split there by bf16 noise. A resumed request
+stores an entry of its own. It takes the anchor of its prompt from its tail when
+the tail reaches that block, and inherits the resumed entry's anchor otherwise.
+
+**Cost.** One anchor per entry, the newest. The K/V is shared with the entry and
+cut on reuse, not copied. The state is a fixed size per model whatever the
+prompt length, and it counts in `kv_bytes`, so the RAM cap and the eviction see
+it. The engine logs a `debug!` event `qwen3_5moe: saved the recurrent state at
+the anchor` per capture, and an `info!` event `qwen3_5moe: prompt-cache resume`
+with `kind` (`strict_prefix` or `anchor`), `prefix_len` and `tail_len` per
+resume.
+
+`crates/rmlx-models/src/qwen3_5_moe/anchor_resume_tests.rs` judges each arm as
+"Judging a resume arm" says, on the dense checkpoint: the consume branch first,
+then the forwards that built the resumed state against the forwards of the cold
+baseline, read off the attention calls and required equal (and equal to the
+pieces the chunk size and the anchor position predict), then the argmax at every
+tail position and a tail-logit difference of exactly zero between the two.
+One forward over the whole prompt is compared as well, within the noise bound.
+
+**Not covered.** The sparse MoE arch (`Qwen3_5MoeForConditionalGeneration`) shares
+the hook, the capture and the split, and has no cell in the resume gate. The
+Qwen3.6 checkpoint is no longer a test target, and it was measured to disagree
+with itself across forward lengths where the dense checkpoint is bit-identical,
+so a resume on it can differ from a cold prefill by more than the dense gate
+would show.
 
 ---
 
@@ -463,9 +535,10 @@ serves every arch.
 
 - **`SpillSink<E>`** (`impl SpillSink<E> for SsdSpiller` in
   `prompt_cache.rs`) — called on every eviction. It refcount-clones the
-  entry's `kv_caches` and `lin_caches`, evaluates them on the inference
-  thread, and `try_send`s a job to a drain thread that writes the `.kvb` and
-  its index row. A full channel drops the job with a `warn!`; eviction always
+  entry's `kv_caches` and `lin_caches` (a hybrid entry whose prompt ends
+  inside a block spills its anchor instead of its end state, see
+  `docs/SSD_TIER.md`), evaluates them on the inference thread, and `try_send`s
+  a job to a drain thread that writes the `.kvb` and its index row. A full channel drops the job with a `warn!`; eviction always
   proceeds.
 - **`SsdHydrate<E>`** (`impl SsdHydrate<E> for SsdHydrator` in
   `rmlx-kv-ssd`) — called on a RAM miss. It finds the longest matching block

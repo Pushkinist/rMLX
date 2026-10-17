@@ -214,11 +214,12 @@ On a RAM miss it runs on the request thread:
 2. **Read.** `block_io::read_caches` checks the block's `model_id` (the
    namespace) and `kv_quant` metadata before reading tensors. Every rebuilt
    `KvCache` takes the request's `DispatchPolicy`.
-3. **Claim.** A block holds the whole entry that was spilled: K/V and
-   recurrent state at the end of its prompt, which is past the last full block
-   unless the prompt length is a multiple of `BLOCK_TOKENS`. The returned
-   `prompt_ids` name only the matched blocks, so every cache must sit at that
-   length. The header decides first, before any tensor is read:
+3. **Claim.** A block holds the K/V of the entry that was spilled and a
+   recurrent state at the position the spill recorded: the end of the prompt
+   when that is a multiple of `BLOCK_TOKENS`, otherwise the entry's anchor (see
+   "Spill path"). The K/V can be longer than that position, by under a block.
+   The returned `prompt_ids` name only the matched blocks, so every cache must
+   sit at that length. The header decides first, before any tensor is read:
    - K/V shorter than the claim cannot be grown;
    - a recurrent state cannot be rewound, so the position the block records for
      it (`lin_pos`) must equal the claim, and a block that records none is not
@@ -316,22 +317,39 @@ and `docs/SSD_CANARY.md`.
 When `PromptCache::push` evicts an entry:
 
 1. **Request thread.** An entry with no full block, or no known codec, is not
-   spilled. Nor is an entry with a recurrent state whose prompt ends inside a
-   block: a hydrate cannot rewind that state to the last full block, so the
-   block would never be used, and it would sit under the key an entry ending on
-   that block boundary is spilled under (`spill_key` logs the skip at `debug!`).
-   A hybrid model therefore round-trips only block-aligned prompts, until a
-   block-boundary state is spilled instead of the end state. Otherwise the spill sink deep-clones the caches and evaluates the
-   clones (`eval_for_spill`) while the Metal context is its own. It then
-   `try_send`s a `SpillJob` on a bounded channel of depth 16. A full channel
-   drops the job with a `warn!`; decode never waits.
+   spilled. `spill_plan` then decides which block a recurrent entry is spilled
+   as, because a hydrate reuses a block only when its state sits exactly at the
+   prefix its key names:
+   - an entry with no recurrent state, or whose prompt ends on a block
+     boundary, is spilled as it is, keyed by its last block;
+   - an entry whose prompt ends inside a block cannot rewind its state to the
+     last full block, so it is spilled as its anchor (`docs/PROMPT_CACHE.md`
+     § "Qwen3.5 resume and the anchor"): keyed by the block the anchor ends,
+     with the anchor as the recurrent state and its position as `lin_pos`. The
+     K/V is written whole, so it is under a block longer than the claim, and a
+     hydrate cuts it;
+   - such an entry with no anchor, or whose K/V cannot be cut back to the
+     anchor, is withheld. Its block would never be used,
+     and it would sit under the key an entry ending on that boundary is spilled
+     under (`spill_plan` logs the skip at `debug!`).
+
+   A hybrid model therefore round-trips a prompt longer than 256 tokens, from
+   its anchor when it ends inside a block. A prompt that ends on a boundary is
+   spilled as its end state and not as its anchor, since the end state serves a
+   request that extends it. A prompt of 256 tokens has no anchor and spills its
+   end state; a shorter one has no full block and spills nothing. Otherwise the
+   spill sink deep-clones the caches
+   and evaluates the clones (`eval_for_spill`) while the Metal context is its
+   own. It then `try_send`s a `SpillJob` on a bounded channel of depth 16. A
+   full channel drops the job with a `warn!`; decode never waits.
 2. **Drain thread (`rmlx-kv-spill`).** `block_io::write_caches` serialises the
    job to `<namespace>/<hash>.kvb` and `index.record` adds the row. On error
    it logs, removes any partial file and drops the job. After a recorded block
    it runs evict-to-budget.
 
-The job carries the last chained digest of the entry's prompt as `hash`, plus
-`layout_key`, `model_id`, `kv_quant` and the cloned caches. An
+The job carries the digest of the block the plan names as `hash`, plus
+`layout_key`, `model_id`, `kv_quant`, the cloned caches and the position of the
+recurrent state (`state_len`). An
 `SsdSpillEvent` per job records the serialise, write and index times and the
 byte size. If the drain thread cannot open the index, it drains the channel
 and exits, and spill is off for that namespace.

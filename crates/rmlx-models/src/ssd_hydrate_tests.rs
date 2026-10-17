@@ -75,14 +75,14 @@ use rmlx_mlx::{Array, Device};
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 use rmlx_kv_ssd::{
     cache_seed, chained_block_hashes_seeded, hash_to_hex, write_caches, HydratedEntry, SsdHydrate,
-    SsdHydrator, SsdKvIndex, BLOCK_TOKENS,
+    SsdHydrator, SsdKvIndex, SsdSpiller, BLOCK_TOKENS,
 };
 
 use crate::bitnet::prompt_cache::BitNetEntry;
 use crate::gemma3::prompt_cache::Gemma3Entry;
 use crate::gemma4::prompt_cache::Gemma4Entry;
 use crate::laguna::prompt_cache::LagunaEntry;
-use crate::prompt_cache::PromptCacheEntry;
+use crate::prompt_cache::{Anchor, PromptCacheEntry, SpillSink};
 use crate::qwen2::prompt_cache::Qwen2Entry;
 use crate::qwen3::Qwen3Entry;
 use crate::qwen3_5_moe::prompt_cache::Qwen35MoeEntry;
@@ -1173,6 +1173,7 @@ fn the_spill_rule_withholds_exactly_the_blocks_a_hydrate_refuses() {
             block_hashes: chained_block_hashes_seeded(&prompt, s.seed),
             kv_caches: Vec::new(),
             lin_caches: lin,
+            anchor: None,
             first_id: 0,
             first_piece: String::new(),
             kv_quant: Some(QUANT),
@@ -1189,7 +1190,7 @@ fn the_spill_rule_withholds_exactly_the_blocks_a_hydrate_refuses() {
             .expect("hydrate must not error");
 
         assert_eq!(
-            crate::prompt_cache::spill_key(&entry).is_some(),
+            crate::prompt_cache::spill_plan(&entry).is_some(),
             hydrated.is_some(),
             "{len} tokens, recurrent {recurrent}: spilled iff it hydrates"
         );
@@ -1201,6 +1202,97 @@ fn the_spill_rule_withholds_exactly_the_blocks_a_hydrate_refuses() {
             );
         }
     }
+}
+
+/// A recurrent entry whose prompt ends inside a block is spilled as its anchor,
+/// and a hydrate for a longer request restores the anchor's state at the anchor.
+///
+/// This drives the production spill sink rather than a restated key: the
+/// spiller writes the block under the key and the position `spill_plan` names,
+/// and the hydrator reads it back from the same namespace. The K/V is spilled at
+/// the entry's whole length, one block past the anchor at most, and comes back
+/// cut to the claim.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test: the fixture entry, the spill and the hydrate must succeed, and a failure is the result under test"
+)]
+fn an_entry_that_ends_inside_a_block_hydrates_at_its_anchor() {
+    let ns = Namespace::new("anchor-spill");
+    let anchor_pos = 2 * BLOCK_TOKENS;
+    let prompt = ids(anchor_pos + 44);
+    let layer_quants = vec![QUANT];
+    let seed = cache_seed(LAYOUT_KEY, QUANT, &layer_quants, MODEL_SIG);
+
+    let (end_state, anchor_state) = (lin_layer(0xBEEF), lin_layer(0xA9C0));
+    let (end_digest, anchor_digest) = (digest_lin(&end_state), digest_lin(&anchor_state));
+    assert_ne!(
+        end_digest, anchor_digest,
+        "positive control: the two states must be distinguishable"
+    );
+    let entry = Qwen35MoeEntry {
+        prompt_token_ids: prompt.clone(),
+        block_hashes: chained_block_hashes_seeded(&prompt, seed),
+        kv_caches: vec![kv_layer(prompt.len() as i32, 2, 0xC0DE)],
+        lin_caches: vec![end_state],
+        anchor: Some(Anchor {
+            pos: anchor_pos,
+            lin_caches: vec![anchor_state],
+        }),
+        first_id: 0,
+        first_piece: String::new(),
+        kv_quant: Some(QUANT),
+        is_ssd_hydrated: false,
+    };
+
+    let spiller = SsdSpiller::spawn(ns.name.clone(), LAYOUT_KEY, Device::Cpu);
+    SpillSink::spill(&spiller, &entry);
+
+    // The drain thread creates the index while this one reads it, so an open
+    // that finds it half-built is retried with the read.
+    let request = request_longer_than(&prompt);
+    let hydrated: Qwen35MoeEntry = (0..200)
+        .find_map(|_| {
+            let hit = SsdHydrator::open(&ns.name, LAYOUT_KEY, Device::Cpu)
+                .ok()
+                .and_then(|h| {
+                    h.hydrate(
+                        &request,
+                        seed,
+                        QUANT,
+                        &layer_quants,
+                        DispatchPolicy::default(),
+                    )
+                    .expect("hydrate must not error")
+                });
+            if hit.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            hit
+        })
+        .expect("the spilled anchor must hydrate within the wait");
+
+    assert_eq!(
+        hydrated.prompt_token_ids(),
+        prompt.get(..anchor_pos).unwrap_or_default(),
+        "the block names the prefix the anchor ends"
+    );
+    assert!(
+        hydrated
+            .kv_caches()
+            .iter()
+            .all(|c| c.offset() == anchor_pos as i32),
+        "the K/V comes back cut to the anchor"
+    );
+    assert_eq!(
+        hydrated
+            .lin_caches()
+            .iter()
+            .map(digest_lin)
+            .collect::<Vec<_>>(),
+        vec![anchor_digest],
+        "the recurrent state is the anchor's, not the end state"
+    );
 }
 
 /// Boundary layers whose codec differs from the base, through the same tier.

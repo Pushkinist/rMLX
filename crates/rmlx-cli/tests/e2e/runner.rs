@@ -1464,8 +1464,9 @@ fn assert_thinking(port: u16, id: &str, mk: &dyn Fn(Verdict, String) -> CaseResu
 /// prompt-cache block so both the SSD spill (whole-block-only) and the
 /// ExactOnly prompt-cache hit (Bonsai/Qwen3) have a stable cache key. ~520
 /// words of English ≈ ≳600 tokens ≈ 2+ full 256-token blocks. It does not end on
-/// a block boundary, so it round-trips on a pure-attention model only: a hybrid
-/// model's recurrent state is spilled only at a boundary (`docs/SSD_TIER.md`).
+/// a block boundary, so it round-trips byte for byte on a pure-attention model
+/// only: a hybrid model resumes from the recurrent state it saved at the last
+/// full block, which agrees with a cold prefill to bf16 noise (`docs/SSD_TIER.md`).
 const CACHE_PROMPT_LONG: &str = "You are a meticulous senior systems engineer reviewing a \
 design specification. Read the following description carefully and then produce a single concise \
 summary paragraph that faithfully preserves every stated constraint. The system under review \

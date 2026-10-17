@@ -1311,8 +1311,9 @@ fn check_speculative_prefill(loaded: &Loaded, label: &str, report: &mut Report) 
 struct Paths {
     /// `speculative::prefill_chunked` serves this architecture as a verifier.
     speculative: bool,
-    /// The prompt cache resumes a stored prompt that the request extends. The
-    /// other architectures reuse a RAM entry on an exact match only.
+    /// The prompt cache resumes a stored prompt that the request extends: gemma-4
+    /// and the Qwen3.5 family. The other architectures reuse a RAM entry on an
+    /// exact match only.
     resumes_an_extended_prompt: bool,
     /// No call of this model is one a rule may change.
     plain_split: bool,
@@ -1383,7 +1384,7 @@ fn qwen3_6_moe_prefill_stays_off_the_faulty_attention_configuration() {
         TEST,
         Paths {
             speculative: true,
-            resumes_an_extended_prompt: false,
+            resumes_an_extended_prompt: true,
             plain_split: false,
         },
     );
@@ -1404,7 +1405,7 @@ fn qwen3_5_dense_prefill_stays_off_the_faulty_attention_configuration() {
         TEST,
         Paths {
             speculative: true,
-            resumes_an_extended_prompt: false,
+            resumes_an_extended_prompt: true,
             plain_split: false,
         },
     );

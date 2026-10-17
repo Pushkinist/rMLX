@@ -5,13 +5,12 @@
 //! [`crate::prompt_cache::ArchPromptCache`]. This file keeps only the genuinely
 //! Qwen3.5-MoE-specific bits:
 //!
-//! - `Qwen35MoeEntry`: `Vec<KvCache>` + `Vec<LinearAttnCache>` (hybrid GDN).
-//! - `impl PromptCacheEntry for Qwen35MoeEntry`: deep_clone + KV/lin accessors.
-//!   The trait-default `truncate_kv_to` trims only the KV caches; `lin_caches`
-//!   are NOT truncated — they hold sequence-end recurrent state re-run on the
-//!   tail (the default body structurally cannot reach them). The SSD spill path
-//!   is the blanket `SpillSink<E> for SsdSpiller` in `crate::prompt_cache`,
-//!   which spills both `kv_caches()` and `lin_caches()` (hybrid).
+//! - `Qwen35MoeEntry`: `Vec<KvCache>` + `Vec<LinearAttnCache>` (hybrid GDN),
+//!   and the [`Anchor`] it saved inside its prompt.
+//! - `impl PromptCacheEntry for Qwen35MoeEntry`: deep_clone + KV/lin accessors,
+//!   and the reuse hook. The SSD spill path is the blanket
+//!   `SpillSink<E> for SsdSpiller` in `crate::prompt_cache`, which spills both
+//!   `kv_caches()` and `lin_caches()` (hybrid).
 //! - `impl HydratedEntry for Qwen35MoeEntry`: what an SSD-restored block
 //!   becomes here. This is the one entry that keeps the block's `lin_caches`;
 //!   the pure-attention entries drop them. The probe itself is the blanket
@@ -21,20 +20,27 @@
 //! delegation to `ArchPromptCache`; SSD attach is invoked directly on the
 //! static from `ssd_tier.rs`.
 //!
-//! ## Reuse policy — Exact-only (hard runtime gate, )
+//! ## Reuse
 //!
-//! Qwen3.5-MoE uses [`ReusePolicy::ExactOnly`]. Block-truncated partial-prefix
-//! reuse is **unsafe** here: `truncate_kv_to_block` deliberately leaves
-//! `lin_caches` untouched (recurrent state cannot be reconstructed from a
-//! block-truncated KV — re-running the GDN over the original prompt's tail and
-//! then a different new tail would produce wrong state), so partial hits must
-//! degrade to a full re-prefill (Miss). The Exact path is full-token-equality
-//! reuse (skips re-prefill entirely), keyed off `prompt_token_ids()`.
+//! A recurrent state has no sequence axis, so it cannot be cut back to a
+//! shorter prefix the way K/V can. The entry therefore resumes a request from a
+//! state it actually holds:
+//!
+//! - its own, at the end of its prompt, when the request extends the whole
+//!   stored prompt (`StrictPrefix`);
+//! - its [`Anchor`], at the last full block of the stored prompt that leaves a
+//!   non-empty tail, when the request first differs at or after that block
+//!   (`BlockTruncate`; the K/V is cut back to the anchor).
+//!
+//! Anything else misses. The arch is `Partial`: the engine leaves a RAM entry's
+//! reuse to the entry's hook, which holds both rules.
 
 #![allow(clippy::redundant_closure_for_method_calls)]
-use rmlx_core::error::Result;
+use rmlx_core::error::{Error, Result};
 
-use crate::prompt_cache::{ArchPromptCache, CacheStats, PromptCacheEntry, ReuseKind, ReusePolicy};
+use crate::prompt_cache::{
+    Anchor, ArchPromptCache, CacheStats, PromptCacheEntry, ReuseKind, ReusePolicy, BLOCK_TOKENS,
+};
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 use rmlx_kv_ssd::{HydratedBlock, HydratedEntry};
 
@@ -54,6 +60,10 @@ pub(crate) struct Qwen35MoeEntry {
     /// Post-prefill linear-attention recurrent states (GDN layers populated;
     /// full-attention layers have empty `LinearAttnCache`).
     pub(crate) lin_caches: Vec<LinearAttnCache>,
+    /// The recurrent state at the last full block of the prompt that leaves a
+    /// non-empty tail ([`Anchor::pos_for`]); `None` below one block, and on an
+    /// entry restored from the SSD tier.
+    pub(crate) anchor: Option<Anchor>,
     /// Argmax token from the first decode step after prefill.
     pub(crate) first_id: u32,
     /// Decoded piece for `first_id`.
@@ -63,9 +73,10 @@ pub(crate) struct Qwen35MoeEntry {
     /// True when this entry was reconstructed from the SSD tier and therefore
     /// stores only the BLOCK-ALIGNED prefix (`prompt_token_ids.len()` is a
     /// multiple of `BLOCK_TOKENS`). The tail tokens of the original request
-    /// were never prefilled into these caches. The generate loop detects this
-    /// flag to take the `HydratedTail` path: it re-prefills only the missing
-    /// tail on top of the restored KV/lin state, then decodes normally.
+    /// were never prefilled into these caches, and `first_id` is a placeholder:
+    /// the engine never serves such an entry as an Exact hit, and the reuse hook
+    /// resumes it, re-prefilling only the tail on top of the restored KV/lin
+    /// state.
     ///
     /// MUST be set only in `HydratedEntry::from_hydrated`; never set by the normal
     /// RAM-cache push path. Do NOT use the `first_id == 0` heuristic as a
@@ -91,6 +102,11 @@ impl PromptCacheEntry for Qwen35MoeEntry {
             block_hashes: self.block_hashes.clone(),
             kv_caches: kv_caches?,
             lin_caches: lin_caches?,
+            anchor: self
+                .anchor
+                .as_ref()
+                .map(Anchor::try_deep_clone)
+                .transpose()?,
             first_id: self.first_id,
             first_piece: self.first_piece.clone(),
             kv_quant: self.kv_quant,
@@ -120,50 +136,68 @@ impl PromptCacheEntry for Qwen35MoeEntry {
     fn lin_caches(&self) -> &[LinearAttnCache] {
         &self.lin_caches
     }
+    fn anchor(&self) -> Option<&Anchor> {
+        self.anchor.as_ref()
+    }
     // truncate_kv_to / truncate_kv_to_block / kv_bytes: trait defaults.
 
-    /// HydratedTail seam: an SSD-hydrated entry whose stored block-aligned
-    /// prefix is a STRICT prefix of the incoming prompt may be reused — the
-    /// hydrated KV + GDN `lin_caches` are the recurrent state at exactly
-    /// `t = prefix_len` of THIS same prompt, so re-prefilling only
-    /// `prompt_ids[prefix_len..]` on top is sequentially correct (identical to
-    /// pausing/resuming the original prefill at the block boundary). The SSD
-    /// hydrate guarantees that position: a block whose recurrent state is past
-    /// `prefix_len` is a miss there and never reaches this hook.
+    /// Which state of this entry a request may resume from.
     ///
-    /// All three guards must hold:
-    /// 1. The entry was promoted from the SSD tier (`is_ssd_hydrated`).
-    /// 2. Stored ids are STRICTLY shorter than the incoming prompt. The strict
-    ///    less-than is load-bearing: it excludes the block-aligned EQUAL-length
-    ///    hydrated entry (no tail), which must fall through to Miss so its
-    ///    placeholder first token is recomputed rather than replayed.
-    /// 3. Stored ids are byte-identical to the matching leading subsequence of
-    ///    `prompt_ids` (guarantees the tail is the same prompt's continuation,
-    ///    not a divergent one).
+    /// Both rules compare token ids, so they hold for a RAM entry and an
+    /// SSD-hydrated one alike: a hydrated block's caches sit exactly at its
+    /// claimed prefix.
     ///
-    /// A non-hydrated partial match never reaches this hook (the ExactOnly
-    /// policy gates it out in the engine). Unlike gemma4, there is no
-    /// `>= BLOCK_TOKENS` floor: a hydrated entry is block-aligned by
-    /// construction, so the strict less-than alone is the correct gate.
+    /// 1. The stored prompt is a STRICT prefix of the request: resume the whole
+    ///    entry at `stored.len()`. The strict less-than is load-bearing: it
+    ///    leaves the equal-length case to the Exact arm, and a hydrated
+    ///    equal-length entry (placeholder first token) to a re-prefill.
+    /// 2. Otherwise the [`Anchor`], when the request agrees with the stored
+    ///    prompt up to it, leaves a non-empty tail past it, and every K/V cache
+    ///    can be cut back to it.
     fn is_reusable_prefix_of(
         &self,
         prompt_ids: &[u32],
-        is_ssd_hydrated: bool,
+        _is_ssd_hydrated: bool,
         _matched_blocks: usize,
     ) -> Option<ReuseKind> {
         let stored = self.prompt_token_ids();
-        if is_ssd_hydrated && stored.len() < prompt_ids.len() && prompt_ids.starts_with(stored) {
-            Some(ReuseKind::StrictPrefix {
+        if stored.len() < prompt_ids.len() && prompt_ids.starts_with(stored) {
+            return Some(ReuseKind::StrictPrefix {
                 prefix_len: stored.len(),
-            })
-        } else {
-            None
+            });
         }
+        let anchor = self.anchor.as_ref()?;
+        let effective_blocks = anchor.pos / BLOCK_TOKENS;
+        (prompt_ids != stored
+            && anchor.pos < prompt_ids.len()
+            && prompt_ids.starts_with(stored.get(..anchor.pos)?)
+            && self.can_truncate_to_block(effective_blocks))
+        .then_some(ReuseKind::BlockTruncate { effective_blocks })
     }
-    // is_hydrate_complete / prepare_reuse: trait defaults. The GDN `lin_caches`
-    // recurrent state is carried by `deep_clone` (the default `prepare_reuse`)
-    // and is NEVER block-truncated — moe only ever yields `StrictPrefix`, and
-    // the default `truncate_kv_to` structurally cannot reach `lin_caches`.
+
+    /// `StrictPrefix` clones the entry as it is. `BlockTruncate` clones it, cuts
+    /// the K/V back to the anchor and puts the anchor's state in place of the
+    /// end state. The anchor the clone keeps is never used after a
+    /// `BlockTruncate`: the resumed request captures the anchor of its own entry
+    /// from the resume point on (`anchor_target`), the resume point included.
+    fn prepare_reuse(&self, kind: ReuseKind) -> Result<Self> {
+        let ReuseKind::BlockTruncate { effective_blocks } = kind else {
+            return self.deep_clone();
+        };
+        let anchor = self
+            .anchor
+            .as_ref()
+            .filter(|a| a.pos == effective_blocks * BLOCK_TOKENS)
+            .ok_or_else(|| {
+                Error::Model(format!(
+                    "qwen3_5moe prompt cache: no anchor at {effective_blocks} blocks to resume from"
+                ))
+            })?;
+        let mut cloned = self.deep_clone()?;
+        cloned.truncate_kv_to_block(effective_blocks)?;
+        cloned.lin_caches = anchor.try_deep_clone()?.lin_caches;
+        Ok(cloned)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -191,12 +225,11 @@ impl HydratedEntry for Qwen35MoeEntry {
             block_hashes,
             kv_caches,
             lin_caches,
+            anchor: None,
             first_id: 0,
             first_piece: String::new(),
             kv_quant: Some(kv_quant),
-            // SSD-hydrated entries store only the block-aligned prefix.
-            // The generate loop uses this flag to re-prefill the tail tokens
-            // before decoding (HydratedTail path). See `Qwen35MoeEntry::is_ssd_hydrated`.
+            // Block-aligned prefix only; see `Qwen35MoeEntry::is_ssd_hydrated`.
             is_ssd_hydrated: true,
         }
     }
@@ -206,16 +239,11 @@ impl HydratedEntry for Qwen35MoeEntry {
 // Global cache instance — unified ArchPromptCache shell.
 // ---------------------------------------------------------------------------
 
-/// per-arch shell with hard-gated `ReusePolicy::ExactOnly`. Partial /
-/// block-aligned reuse is unsafe for the hybrid GDN arch (the recurrent
-/// `lin_caches` cannot be reconstructed from a block-truncated KV) — the shared
-/// consume engine enforces this at runtime: under `ExactOnly` a non-hydrated
-/// partial match is forbidden, and the only permitted reuse is a hydrated
-/// strict-prefix (HydratedTail) via `is_reusable_prefix_of`; everything else
-/// degrades to a full re-prefill (Miss).
+/// Per-arch shell. `Partial`: the engine leaves a RAM entry's reuse to
+/// [`Qwen35MoeEntry`]'s hook, which only ever offers a state the entry holds.
 pub(crate) static PROMPT_CACHE: ArchPromptCache<Qwen35MoeEntry> = ArchPromptCache::new(
     "Qwen3_5MoeForConditionalGeneration",
-    ReusePolicy::ExactOnly,
+    ReusePolicy::Partial,
     crate::qwen3_5_moe::SHARES_KV_ACROSS_LAYERS,
 );
 

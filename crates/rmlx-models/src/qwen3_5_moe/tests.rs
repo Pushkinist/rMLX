@@ -79,9 +79,8 @@ fn moe_push_seed(model: &Qwen3_5MoeText, kv_quant: rmlx_kv_quant::KvQuant) -> u6
 /// The consume-engine branch the moe prompt cache reaches for `prompt_ids` in
 /// its current state, as a label a failure message can name.
 ///
-/// Every hydrated-resume test here compares a warm run against a cold one, and
-/// a warm run that never reached `HydratedTail` agrees with that baseline for
-/// free — a Miss re-prefills the same prompt and decodes the same tokens. The
+/// Every resume test here compares a warm run against a cold one, and a warm
+/// run that never reached its resume arm agrees with that baseline for free — a Miss re-prefills the same prompt and decodes the same tokens. The
 /// branch is therefore measured rather than inferred from the tokens: a stored
 /// digest the query cannot reproduce (a push seeded differently from
 /// `request_cache_seed`) makes every such test pass while exercising nothing.
@@ -110,21 +109,42 @@ fn moe_consume_branch(
         Consumed::Reuse {
             kind: ReuseKind::StrictPrefix { prefix_len },
             ..
-        } => format!("HydratedTail{{prefix_len={prefix_len}}}"),
-        Consumed::Reuse { kind, .. } => format!("Reuse{kind:?}"),
+        } => format!("StrictPrefix{{prefix_len={prefix_len}}}"),
+        Consumed::Reuse {
+            kind: ReuseKind::BlockTruncate { effective_blocks },
+            ..
+        } => format!("Anchor{{prefix_len={}}}", effective_blocks * BLOCK_TOKENS),
         Consumed::Miss(reason) => reason.label().to_owned(),
     }
 }
 
 /// The caches a fresh prefill leaves for `prefix`: `enter_prefill`, the prefix
 /// in production chunks, `exit_prefill`, then evaluated for a hand-over.
+fn prefilled_prefix_caches(
+    model: &Qwen3_5MoeText,
+    prefix: &[u32],
+    kv_quant: rmlx_kv_quant::KvQuant,
+    max_seq: i32,
+) -> (
+    Vec<rmlx_kv_quant::KvCache>,
+    Vec<rmlx_kv_quant::LinearAttnCache>,
+) {
+    let chunk = crate::prefill_chunk::prefill_chunk_for("qwen3_5_moe");
+    let ends: Vec<usize> = (1..=prefix.len().div_ceil(chunk))
+        .map(|i| (i * chunk).min(prefix.len()))
+        .collect();
+    prefilled_in_pieces(model, prefix, &ends, kv_quant, max_seq)
+}
+
+/// The same, with the prefix forwarded in the pieces that end at `ends`.
 #[allow(
     clippy::expect_used,
     reason = "test helper: a failed prefill is a failed test"
 )]
-fn prefilled_prefix_caches(
+fn prefilled_in_pieces(
     model: &Qwen3_5MoeText,
     prefix: &[u32],
+    ends: &[usize],
     kv_quant: rmlx_kv_quant::KvQuant,
     max_seq: i32,
 ) -> (
@@ -146,19 +166,20 @@ fn prefilled_prefix_caches(
     for c in &mut kv_caches {
         c.enter_prefill();
     }
-    let prefill_chunk = crate::prefill_chunk::prefill_chunk_for("qwen3_5_moe");
-    let n_chunks = prefix.len().div_ceil(prefill_chunk);
-    for (chunk_idx, chunk) in prefix.chunks(prefill_chunk).enumerate() {
+    let mut start = 0;
+    for (piece_idx, &end) in ends.iter().enumerate() {
+        let chunk = prefix.get(start..end).expect("piece inside the prefix");
         let logits = model
             .forward_seq_with_cache(chunk, Some(&mut kv_caches), Some(&mut lin_caches), device)
             .expect("prefix prefill chunk");
-        if chunk_idx + 1 == n_chunks {
+        if piece_idx + 1 == ends.len() {
             logits.eval().expect("eval last-chunk logits");
         } else {
             for c in &kv_caches {
                 c.eval_prefill_state().expect("eval_prefill_state");
             }
         }
+        start = end;
     }
     for c in &mut kv_caches {
         c.exit_prefill(device).expect("exit_prefill");
@@ -206,6 +227,7 @@ fn push_hydrated_prefix(
                 block_hashes,
                 kv_caches: kv_snap.expect("kv clone"),
                 lin_caches: lin_snap.expect("lin clone"),
+                anchor: None,
                 first_id: 0,
                 first_piece: String::new(),
                 kv_quant: Some(kv_quant),
@@ -395,6 +417,7 @@ fn moe_entry(prompt_token_ids: Vec<u32>) -> Qwen35MoeEntry {
         block_hashes,
         kv_caches: vec![],
         lin_caches: vec![],
+        anchor: None,
         first_id: 0,
         first_piece: String::new(),
         kv_quant: Some(rmlx_kv_quant::KvQuant::K8V8),
@@ -2302,7 +2325,7 @@ fn hydrated_tail_produces_identical_output() {
 
     assert_eq!(
         moe_consume_branch(&model, &prompt_ids, kv_quant),
-        format!("HydratedTail{{prefix_len={prefix_len}}}"),
+        format!("StrictPrefix{{prefix_len={prefix_len}}}"),
         "the hydrated prefix must reach HydratedTail — a Miss re-prefills the same prompt \
          and agrees with the cold baseline while exercising nothing"
     );
@@ -2505,7 +2528,7 @@ fn a_hydrated_tail_issues_no_attention_call_in_the_faulty_configuration() {
         );
         assert_eq!(
             moe_consume_branch(&model, &prompt_ids, kv_quant),
-            format!("HydratedTail{{prefix_len={prefix_len}}}"),
+            format!("StrictPrefix{{prefix_len={prefix_len}}}"),
             "the hydrated prefix must reach HydratedTail: a Miss prefills the whole prompt \
              through another chunk loop"
         );
@@ -2770,6 +2793,7 @@ fn hydrated_exact_block_no_tail_not_placeholder() {
                 block_hashes,
                 kv_caches: kv_snap,
                 lin_caches: lin_snap,
+                anchor: None,
                 // Placeholder values — exactly what HydratedEntry::from_hydrated emits.
                 first_id: 0,
                 first_piece: String::new(),
@@ -2793,7 +2817,7 @@ fn hydrated_exact_block_no_tail_not_placeholder() {
     };
     assert_eq!(
         moe_consume_branch(&model, &extended_prompt, kv_quant),
-        format!("HydratedTail{{prefix_len={}}}", prompt_ids.len()),
+        format!("StrictPrefix{{prefix_len={}}}", prompt_ids.len()),
         "the stored hydrated entry must be findable — otherwise the Miss below says nothing \
          about the strict-< guard"
     );
@@ -3037,6 +3061,7 @@ fn hydrated_tail_k8v8_equivalence() {
                 block_hashes,
                 kv_caches: kv_snap,
                 lin_caches: lin_snap,
+                anchor: None,
                 first_id: 0,
                 first_piece: String::new(),
                 kv_quant: Some(kv_quant),
@@ -3047,7 +3072,7 @@ fn hydrated_tail_k8v8_equivalence() {
 
     assert_eq!(
         moe_consume_branch(&model, &prompt_ids, kv_quant),
-        format!("HydratedTail{{prefix_len={prefix_len}}}"),
+        format!("StrictPrefix{{prefix_len={prefix_len}}}"),
         "the K8V8 hydrated prefix must reach HydratedTail — a Miss re-prefills the same \
          prompt and agrees with the cold baseline while exercising nothing"
     );
@@ -3120,15 +3145,16 @@ fn hydrated_tail_k8v8_equivalence() {
 ///
 /// Pins that routing qwen3.5-moe through the shared `consume()` engine is
 /// behavior-identical to the pre-migration inline dispatch across all three
-/// outcomes reachable for this hybrid GDN arch under `ReusePolicy::ExactOnly`.
+/// outcomes reachable for this hybrid GDN arch for an entry that holds no
+/// anchor (the cases with one are `anchor_resume_tests`).
 /// Every arm asserts the branch the engine actually reached, then its own
 /// outcome; a degrade arm decodes token-identically to a cold (Miss) baseline
 /// of the SAME prompt, and the resume arm is judged on its logits:
-///   (a) ExactOnly forbids a RAM (non-hydrated) PARTIAL match: a 512-token RAM
-///       snapshot whose first block is shared with a divergent 512-token request
-///       (1 shared full block, then diverges) → the ExactOnly policy gate
-///       degrades it to Miss → full re-prefill → WARM == COLD(divergent). The
-///       GDN `lin_caches` are never block-truncated.
+///   (a) A RAM entry that saved no anchor offers nothing at a partial match: a
+///       512-token RAM snapshot whose first block is shared with a divergent
+///       512-token request (1 shared full block, then diverges) → the hook
+///       declines → Miss → full re-prefill → WARM == COLD(divergent). The GDN
+///       `lin_caches` hold the end state only and are never block-truncated.
 ///   (b) hydrated strict-prefix HydratedTail resume: an SSD-hydrated 512-token
 ///       block-aligned prefix that the request extends to 520 tokens →
 ///       `Reuse{StrictPrefix}` → restore + tail-only re-prefill. Judged on the
@@ -3315,6 +3341,7 @@ fn qwen3_5_moe_consume_engine_migration_golden() {
                     block_hashes,
                     kv_caches: kv,
                     lin_caches: lin,
+                    anchor: None,
                     first_id,
                     first_piece: String::new(),
                     kv_quant: Some(kv_quant),
@@ -3331,10 +3358,10 @@ fn qwen3_5_moe_consume_engine_migration_golden() {
             .collect()
     };
 
-    // ── (a) ExactOnly forbids a RAM (non-hydrated) PARTIAL match → Miss ──────
-    // Cache a 512-token RAM snapshot; request a divergent 512-token prompt that
-    // shares only the first full block. find_best_prefix matches 1 block, but
-    // the ExactOnly policy gate forbids the non-hydrated partial → Miss → full
+    // ── (a) a RAM entry with no anchor offers nothing at a partial match ─────
+    // Cache a 512-token RAM snapshot with no anchor; request a divergent
+    // 512-token prompt that shares only the first full block. find_best_prefix
+    // matches 1 block, but the entry holds no state at it → Miss → full
     // re-prefill of the divergent prompt → WARM == COLD(divergent).
     let p512 = make_ids(2 * BLOCK_TOKENS, 0);
     let p512_div: Vec<u32> = {
@@ -3355,14 +3382,14 @@ fn qwen3_5_moe_consume_engine_migration_golden() {
     push_entry(&p512, kv512, lin512, false, 7u32);
     assert_eq!(
         moe_consume_branch(&model, &p512_div, kv_quant),
-        "hydrated_declined_to_exact",
-        "(a) ExactOnly must refuse a matched non-hydrated partial — not fail to match it"
+        "non_reusable",
+        "(a) an entry holding no anchor must refuse a matched partial — not fail to match it"
     );
     let warm_partial = run(&p512_div);
     println!("(a) RAM-partial degrade: cold={cold_div:?} warm={warm_partial:?}");
     assert_eq!(
         warm_partial, cold_div,
-        "(a) ExactOnly must forbid a non-hydrated partial match → Miss → full re-prefill \
+        "(a) an entry with no anchor must decline a partial match → Miss → full re-prefill \
          equal to the cold baseline for the divergent prompt"
     );
 
@@ -3480,7 +3507,7 @@ fn qwen3_5_moe_consume_engine_migration_golden() {
     let branch = moe_consume_branch(&model, &p520, kv_quant);
     assert_eq!(
         branch,
-        format!("HydratedTail{{prefix_len={}}}", p512.len()),
+        format!("StrictPrefix{{prefix_len={}}}", p512.len()),
         "(b) the engine must reach HydratedTail for a hydrated strict prefix"
     );
     let warm_tail = run(&p520);
@@ -3523,7 +3550,7 @@ fn qwen3_5_moe_consume_engine_migration_golden() {
     // strict-`<` guard, not an invisible digest.
     assert_eq!(
         moe_consume_branch(&model, &p520, kv_quant),
-        format!("HydratedTail{{prefix_len={}}}", p512.len()),
+        format!("StrictPrefix{{prefix_len={}}}", p512.len()),
         "(c) the stored hydrated entry must be findable — otherwise the Miss below says \
          nothing about the strict-< guard"
     );
@@ -3551,3 +3578,7 @@ fn qwen3_5_moe_consume_engine_migration_golden() {
          HydratedTail matches the cold reference logits"
     );
 }
+
+/// A request resumed from a RAM entry's saved state, on the dense checkpoint.
+#[path = "anchor_resume_tests.rs"]
+mod anchor_resume_tests;

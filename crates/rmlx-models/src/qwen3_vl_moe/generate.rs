@@ -248,17 +248,21 @@ pub fn generate_greedy(
     // The text path never carries image ids (images route to generate_image), so
     // has_image is always false here; the engine's bypass is belt-and-suspenders.
     let has_image = false;
+    // Resolved before the lookup, as a cold run does: a reused entry is bound to
+    // this request's ceiling, whatever ceiling it was filled under.
+    let ctx = resolved_context(model, max_ctx_override)?;
     let consumed = PROMPT_CACHE.consume(prompt_ids, kv_quant, n_layers, has_image, model.model_sig);
 
     // Path A: exact cache hit — skip re-prefill, replay the stored first token,
     // then run the shared decode loop on the cloned caches.
     if let Consumed::Exact(cloned) = consumed {
         let Qwen3VlMoeEntry {
-            kv_caches: mut kv,
+            kv_caches,
             first_id: first,
             first_piece,
             ..
         } = cloned;
+        let mut kv = crate::context::rebind_to_ceiling(kv_caches, ctx.ceiling, prompt_ids.len())?;
         tracing::debug!(
             prompt_len = prompt_ids.len(),
             token_id = first,
@@ -301,7 +305,6 @@ pub fn generate_greedy(
     // each chunk's command buffer under the ~10s Metal GPU watchdog — a
     // single-shot forward over a multi-thousand-token prompt trips it. Mirrors
     // the other arch text paths (qwen3_5_moe / gemma4).
-    let ctx = resolved_context(model, max_ctx_override)?;
     let mut kv = kv_stack(n_layers, kv_quant, &ctx);
 
     let prefill_chunk = crate::prefill_chunk::resolve("qwen3_vl_moe");

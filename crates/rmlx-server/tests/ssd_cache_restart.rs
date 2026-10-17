@@ -52,13 +52,14 @@ use tokio::net::TcpStream;
 
 // ── Test parameters ───────────────────────────────────────────────────────────
 
-/// Blocks of 256 tokens in prompt A.
+/// Tokens in prompt A: three blocks of 256 and a partial one.
 ///
-/// The prompt is built to an exact multiple of the block size. A hybrid model
-/// (Qwen3.5 family) carries a recurrent state at the end of its prompt that a
-/// hydrate cannot rewind to a block boundary, so the tier spills and serves it
-/// only when the prompt ends on one; a pure-attention model hydrates either way.
-const PROMPT_A_BLOCKS: usize = 3;
+/// The prompt ends inside a block on purpose. A hybrid model (Qwen3.5 family)
+/// carries a recurrent state at the end of its prompt that a hydrate cannot
+/// rewind to a block boundary, so the tier spills the state it saved at the last
+/// full block instead, and the restarted prompt resumes from it. A
+/// pure-attention model hydrates the last full block either way.
+const PROMPT_A_TOKENS: usize = 3 * 256 + 44;
 
 /// One token of filler. Its count is `usage.prompt_tokens` minus the chat
 /// template's fixed overhead, so a prompt of `n` of them is `n` tokens long.
@@ -222,16 +223,16 @@ fn prompt_tokens(body: &str) -> usize {
         .unwrap_or_else(|| panic!("response has no usage.prompt_tokens: {body}")) as usize
 }
 
-/// A prompt of exactly `blocks * 256` tokens: the chat template's overhead is
-/// read off a one-filler prompt, which is under a block and so caches nothing
-/// the real prompts could match.
-async fn aligned_prompt(port: u16, model: &str, blocks: usize) -> String {
+/// A prompt of exactly `tokens` tokens: the chat template's overhead is read off
+/// a one-filler prompt, which is under a block and so caches nothing the real
+/// prompts could match.
+async fn prompt_of_tokens(port: u16, model: &str, tokens: usize) -> String {
     let (status, body, _) = chat_ttft(port, model, FILLER)
         .await
         .expect("calibration request");
     assert_eq!(status, 200, "calibration request must return 200: {body}");
     let overhead = prompt_tokens(&body) - 1;
-    vec![FILLER; blocks * 256 - overhead].join(" ")
+    vec![FILLER; tokens - overhead].join(" ")
 }
 
 /// Scrape `/metrics` (Prometheus text) and sum every
@@ -337,15 +338,15 @@ async fn ssd_cache_survives_server_restart() {
     );
 
     // Prompt A — cold prefill, record TTFT.
-    let prompt_a = aligned_prompt(port, &model_id, PROMPT_A_BLOCKS).await;
+    let prompt_a = prompt_of_tokens(port, &model_id, PROMPT_A_TOKENS).await;
     let (sa, ba, ttft_cold) = chat_ttft(port, &model_id, &prompt_a)
         .await
         .expect("phase-1 prompt A request");
     assert_eq!(sa, 200, "phase-1 prompt A must return 200");
     assert_eq!(
         prompt_tokens(&ba),
-        PROMPT_A_BLOCKS * 256,
-        "prompt A must end on a block boundary or a hybrid model's block is not spilled"
+        PROMPT_A_TOKENS,
+        "prompt A must be the length the calibration built"
     );
 
     // Prompt B — different prefix → evicts A from the single RAM slot → A spills.
@@ -399,11 +400,9 @@ async fn ssd_cache_survives_server_restart() {
     );
 
     // Prompt A again — RAM is empty (fresh process) so this is a RAM miss that
-    // must hydrate from the surviving .kvb. The request equals the spilled
-    // prompt, which has no tail to resume from, so it is prefilled again and the
-    // warm TTFT is reported, not asserted: a chat request cannot extend a
-    // spilled prompt past its end, because the template's closing tokens are
-    // part of that prompt.
+    // must hydrate from the surviving .kvb. The block holds the last full block
+    // of A, so the hydrated prefix is a strict prefix of the request and only the
+    // 44 tokens past it are prefilled. The warm TTFT is reported, not asserted.
     let (sa2, _ba2, ttft_warm) = chat_ttft(port, &model_id, &prompt_a)
         .await
         .expect("phase-2 prompt A request");

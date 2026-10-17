@@ -246,6 +246,52 @@ pub struct CacheStats {
 }
 
 // ---------------------------------------------------------------------------
+// Anchor — a recurrent state saved inside an entry's prompt
+// ---------------------------------------------------------------------------
+
+/// A recurrent state an entry keeps at a block boundary inside its prompt.
+///
+/// An entry's own recurrent state sits at the end of its prompt and cannot be
+/// rewound, so a request that diverges from the prompt inside its last block
+/// has nothing to resume from. The anchor is a second state, captured while the
+/// prompt was prefilled, at the last full block that leaves a non-empty tail.
+/// On reuse the entry's K/V is cut back to it.
+#[allow(missing_debug_implementations)]
+pub(crate) struct Anchor {
+    /// Tokens the state has consumed: a positive multiple of [`BLOCK_TOKENS`].
+    pub(crate) pos: usize,
+    /// One recurrent cache per layer, as the entry's `lin_caches` at `pos`.
+    pub(crate) lin_caches: Vec<LinearAttnCache>,
+}
+
+impl Anchor {
+    /// Where an anchor is captured for a prompt of `prompt_len` tokens: the last
+    /// full block that leaves a non-empty tail. `None` below one block.
+    pub(crate) fn pos_for(prompt_len: usize) -> Option<usize> {
+        let pos = prompt_len.saturating_sub(1) / BLOCK_TOKENS * BLOCK_TOKENS;
+        (pos > 0).then_some(pos)
+    }
+
+    pub(crate) fn try_deep_clone(&self) -> Result<Self> {
+        Ok(Self {
+            pos: self.pos,
+            lin_caches: self
+                .lin_caches
+                .iter()
+                .map(LinearAttnCache::try_deep_clone)
+                .collect::<Result<_>>()?,
+        })
+    }
+
+    fn resident_bytes(&self) -> u64 {
+        self.lin_caches
+            .iter()
+            .map(LinearAttnCache::resident_bytes)
+            .sum()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PromptCacheEntry trait
 // ---------------------------------------------------------------------------
 
@@ -338,6 +384,15 @@ pub(crate) trait PromptCacheEntry: Sized {
     /// [`kv_bytes`]: PromptCacheEntry::kv_bytes
     fn lin_caches(&self) -> &[LinearAttnCache];
 
+    /// The recurrent state the entry saved at a block boundary inside its
+    /// prompt, if any. Counted by [`kv_bytes`] and spilled in place of the end
+    /// state when the prompt ends inside a block (see [`spill_plan`]).
+    ///
+    /// [`kv_bytes`]: PromptCacheEntry::kv_bytes
+    fn anchor(&self) -> Option<&Anchor> {
+        None
+    }
+
     /// Truncate KV caches to `prefix_len` sequence positions in-place.
     ///
     /// Called on a cloned entry before re-prefilling the tail. The default
@@ -347,48 +402,76 @@ pub(crate) trait PromptCacheEntry: Sized {
     /// `KvCache::can_truncate_to` and degrade to a re-prefill, so the failure
     /// path here is the gate having gone out of step with the caches.
     ///
-    /// The recurrent GDN [`lin_caches`] are deliberately NOT reachable
-    /// from this default — that "never truncate linear state" invariant is now
-    /// structural: linear state is re-run on the tail, never sliced. Override
-    /// only for a mock or a genuinely different per-arch policy.
+    /// The recurrent GDN [`lin_caches`] are not reachable from this default: a
+    /// state has no sequence axis and cannot be sliced. A hybrid entry that
+    /// truncates its K/V in `prepare_reuse` swaps in the state it saved at
+    /// that position ([`anchor`]).
     ///
     /// [`lin_caches`]: PromptCacheEntry::lin_caches
+    /// [`anchor`]: PromptCacheEntry::anchor
     fn truncate_kv_to(&mut self, prefix_len: usize) -> Result<()> {
         for kv in self.kv_caches_mut() {
             if kv.offset() > 0 {
                 kv.truncate_to(prefix_len as i32)?;
             }
         }
-        // lin caches deliberately untouched: recurrent GDN state is re-run on
-        // the tail, never truncated. Structural now — the default body cannot
-        // reach them.
         Ok(())
     }
 
     /// Block-aligned truncation: trim KV caches to `block_count` full blocks.
     ///
     /// Default delegation to `truncate_kv_to(block_count * BLOCK_TOKENS)`.
-    /// The live caller is the gemma4 prefix-reuse path (`Consumed::Reuse` in
-    /// `gemma4/generate/mod.rs`), gated on `Gemma4Entry::can_truncate_to_block`
-    /// (every layer cache trimmable — no wrapped-SWA desync). Qwen3.5-MoE never
-    /// calls it: its recurrent GDN `lin_caches` cannot be reconstructed from a
-    /// block-truncated KV, so MoE is gated to full-token-equality (Exact) reuse.
+    /// Callers gate on [`can_truncate_to_block`]: the gemma4 block-truncate
+    /// path and the Qwen3.5 anchor resume.
+    ///
+    /// [`can_truncate_to_block`]: PromptCacheEntry::can_truncate_to_block
     fn truncate_kv_to_block(&mut self, block_count: usize) -> Result<()> {
         self.truncate_kv_to(block_count * BLOCK_TOKENS)
     }
 
+    /// True iff a block-aligned truncation to `block_count` blocks would be
+    /// lossless on EVERY layer cache (mlx-lm `can_trim_prompt_cache`:
+    /// `all(c.is_trimmable())`, `cache.py:88-92`).
+    ///
+    /// A sliding-window layer backed by a `RotatingKvCache` that has wrapped can
+    /// only be rolled back while it still holds the window the shorter prefix
+    /// attends over, and a cached prompt long enough to wrap it never does over
+    /// a whole block. `truncate_kv_to_block` would then fail on the SWA layers
+    /// after truncating the full-attention ones, desyncing the caches (this was
+    /// the original broken gemma4 Prefix path: longctx 22 -> 0 tokens). When
+    /// this returns `false` the caller MUST fall back to a full re-prefill.
+    ///
+    /// Same population `truncate_kv_to` acts on: a never-filled layer — the
+    /// KV-shared tail or a recurrent layer, whose offset stays 0 — is skipped by
+    /// the truncation and must not veto it either.
+    fn can_truncate_to_block(&self, block_count: usize) -> bool {
+        debug_assert!(
+            block_count >= 1,
+            "block_count must be >= 1 for a prefix hit"
+        );
+        let target = (block_count * BLOCK_TOKENS) as i32;
+        self.kv_caches()
+            .iter()
+            .filter(|c| c.offset() > 0)
+            .all(|c| c.can_truncate_to(target))
+    }
+
     /// Approximate RAM held by this entry's KV/recurrent state, in bytes.
     ///
-    /// Default body sums KV `resident_bytes` plus linear-attn `resident_bytes`
-    /// (the latter is empty for pure-attention archs). Used by
+    /// Default body sums KV `resident_bytes`, linear-attn `resident_bytes`
+    /// (empty for pure-attention archs) and the saved [`anchor`]. Used by
     /// `PromptCache::stats()` to populate `CacheStats::bytes` and by the
     /// RAM-cap eviction policy in `push`. Best-effort estimate — does not
     /// guarantee byte-exact Metal accounting.
+    ///
+    /// [`anchor`]: PromptCacheEntry::anchor
     fn kv_bytes(&self) -> u64 {
-        self.kv_caches()
-            .iter()
-            .map(KvCache::resident_bytes)
-            .sum::<u64>()
+        self.anchor().map_or(0, Anchor::resident_bytes)
+            + self
+                .kv_caches()
+                .iter()
+                .map(KvCache::resident_bytes)
+                .sum::<u64>()
             + self
                 .lin_caches()
                 .iter()
@@ -433,8 +516,8 @@ pub(crate) trait PromptCacheEntry: Sized {
     /// Atomic: on `Err` the engine yields `Miss` and the source slot is left
     /// untouched. Default body is a plain [`deep_clone`] (correct for
     /// `StrictPrefix`, where the whole cached prefix is reused verbatim). gemma4
-    /// overrides `BlockTruncate` to deep-clone then trim the KV to the block
-    /// boundary.
+    /// and qwen3.5 override `BlockTruncate` to deep-clone then trim the KV to
+    /// the block boundary (qwen3.5 also swaps in its anchor's state).
     ///
     /// [`deep_clone`]: PromptCacheEntry::deep_clone
     fn prepare_reuse(&self, _kind: ReuseKind) -> Result<Self> {
@@ -465,27 +548,70 @@ pub(crate) trait SpillSink<E>: Send {
     fn spill(&self, entry: &E);
 }
 
-/// The block digest an entry is spilled under, or `None` when it must not be.
+/// What a spill writes for an entry: the digest of the block it is keyed under,
+/// and the recurrent state it carries, with the token that state sits at.
+pub(crate) struct SpillPlan<'a> {
+    pub(crate) hash: u64,
+    pub(crate) state_len: usize,
+    pub(crate) lin_caches: &'a [LinearAttnCache],
+}
+
+/// The block an entry is spilled as, or `None` when it must not be.
 ///
-/// No full block means no stable key. An entry with a recurrent state is spilled
-/// only when its prompt ends on a block boundary: the state sits at the end of
-/// the prompt and cannot be rewound to the last full block, so a hydrate could
-/// never reuse it, and its key is the one a boundary-aligned entry with the same
-/// leading blocks would be spilled under.
-pub(crate) fn spill_key<E: PromptCacheEntry>(entry: &E) -> Option<u64> {
-    let key = *entry.block_hashes().last()?;
+/// No full block means no stable key. A hydrate reuses a block only when its
+/// recurrent state sits exactly at the prefix its key names, so:
+///
+/// - an entry with no recurrent state, or whose prompt ends on a block boundary,
+///   is spilled as it is, keyed by its last block;
+/// - an entry whose prompt ends inside a block cannot rewind its state to the
+///   last full block, so it is spilled as its anchor: keyed by the block the
+///   anchor ends and carrying the anchor as the state;
+/// - such an entry with no anchor, or whose K/V cannot be cut back to its anchor
+///   (the cut the RAM reuse also needs), is withheld, since its key would be the
+///   one a boundary-aligned entry with the same leading blocks is spilled under.
+///
+/// The K/V is written whole. A hydrate cuts it back to the claim, which for an
+/// anchor is at most one block short of the K/V.
+pub(crate) fn spill_plan<E: PromptCacheEntry>(entry: &E) -> Option<SpillPlan<'_>> {
+    let last_block = *entry.block_hashes().last()?;
     let prompt_len = entry.prompt_token_ids().len();
     let block_end = entry.block_hashes().len() * BLOCK_TOKENS;
-    if prompt_len != block_end && !entry.lin_caches().is_empty() {
+    if prompt_len == block_end || entry.lin_caches().is_empty() {
+        return Some(SpillPlan {
+            hash: last_block,
+            state_len: prompt_len,
+            lin_caches: entry.lin_caches(),
+        });
+    }
+    let Some(anchor) = entry.anchor() else {
         tracing::debug!(
             prompt_len,
             block_end,
-            "kv-spill: recurrent state is past the last full block and cannot be \
-             rewound to it, skipping spill"
+            "kv-spill: recurrent state is past the last full block and no anchor was \
+             saved to spill instead, skipping spill"
+        );
+        return None;
+    };
+    let anchor_blocks = anchor.pos / BLOCK_TOKENS;
+    if !entry.can_truncate_to_block(anchor_blocks) {
+        tracing::debug!(
+            prompt_len,
+            anchor_pos = anchor.pos,
+            "kv-spill: the K/V cannot be cut back to the anchor, skipping spill"
         );
         return None;
     }
-    Some(key)
+    let hash = *entry.block_hashes().get(anchor_blocks.checked_sub(1)?)?;
+    tracing::debug!(
+        prompt_len,
+        anchor_pos = anchor.pos,
+        "kv-spill: spilling the recurrent state saved at the anchor, not the end state"
+    );
+    Some(SpillPlan {
+        hash,
+        state_len: anchor.pos,
+        lin_caches: &anchor.lin_caches,
+    })
 }
 
 /// Blanket spill impl over any `PromptCacheEntry`.
@@ -502,7 +628,7 @@ pub(crate) fn spill_key<E: PromptCacheEntry>(entry: &E) -> Option<u64> {
 /// eviction never blocks on disk I/O and never panics.
 impl<E: PromptCacheEntry> SpillSink<E> for SsdSpiller {
     fn spill(&self, entry: &E) {
-        let Some(hash) = spill_key(entry) else {
+        let Some(plan) = spill_plan(entry) else {
             return;
         };
         let Some(kv_quant) = entry.kv_quant() else {
@@ -513,8 +639,8 @@ impl<E: PromptCacheEntry> SpillSink<E> for SsdSpiller {
             .iter()
             .map(KvCache::try_deep_clone)
             .collect();
-        let lin: Result<Vec<LinearAttnCache>> = entry
-            .lin_caches()
+        let lin: Result<Vec<LinearAttnCache>> = plan
+            .lin_caches
             .iter()
             .map(LinearAttnCache::try_deep_clone)
             .collect();
@@ -542,13 +668,13 @@ impl<E: PromptCacheEntry> SpillSink<E> for SsdSpiller {
             return;
         }
         self.try_spill(SpillJob {
-            hash,
+            hash: plan.hash,
             layout_key: self.layout_key(),
             model_id: self.model_id().to_string(),
             kv_quant,
             kv_caches,
             lin_caches,
-            state_len: i32::try_from(entry.prompt_token_ids().len()).unwrap_or(i32::MAX),
+            state_len: i32::try_from(plan.state_len).unwrap_or(i32::MAX),
         });
     }
 }
@@ -801,97 +927,114 @@ impl<E: PromptCacheEntry> PromptCache<E> {
     /// Increments `stats.hits` on a match, `stats.misses` on `None`.
     ///
     /// Eviction is NOT performed here — call `push` afterwards if needed.
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-    )]
+    #[cfg(test)]
     pub(crate) fn find_best_prefix(
         &mut self,
         prompt_ids: &[u32],
         seed: u64,
     ) -> Option<(usize, usize)> {
-        // `seed` salts the query digest stream so it partitions by the same
-        // `(model, layout, codec)` the push side seeds with — see `cache_seed`.
-        // A different model of this arch, a different KV codec, or a different
-        // SSD layout produces a disjoint digest stream for the same tokens and
-        // never matches another's slots. Pass `FNV_OFFSET` for the legacy
-        // un-salted stream (tests only).
-        let want = chained_block_hashes_seeded(prompt_ids, seed);
+        let (want, best) = self.best_match(prompt_ids, seed);
+        self.record_lookup(best, want.len());
+        best
+    }
 
-        let (best_idx, best_blocks) = match self.prefix_index_kind {
+    /// The best match of `find_best_prefix`, without its bookkeeping, and the
+    /// prompt's digests it was found against.
+    ///
+    /// `seed` salts the query digest stream so it partitions by the same
+    /// `(model, layout, codec)` the push side seeds with — see `cache_seed`.
+    /// A different model of this arch, a different KV codec, or a different
+    /// SSD layout produces a disjoint digest stream for the same tokens and
+    /// never matches another's slots. Pass `FNV_OFFSET` for the legacy
+    /// un-salted stream (tests only).
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    fn best_match(&self, prompt_ids: &[u32], seed: u64) -> (Vec<u64>, Option<(usize, usize)>) {
+        let want = chained_block_hashes_seeded(prompt_ids, seed);
+        let linear_scan = |want: &[u64]| {
+            let mut best: Option<(usize, usize)> = None;
+            for (i, slot) in self.slots.iter().enumerate() {
+                let matched = leading_matches(want, slot.entry.block_hashes());
+                // a hit requires >= 1 block; the first slot wins a tie
+                if matched > best.map_or(0, |(_, blocks)| blocks) {
+                    best = Some((i, matched));
+                }
+            }
+            best
+        };
+
+        let best = match self.prefix_index_kind {
             // Linear path is byte-identical to the pre-scan;
             // the parallel `prefix_index` is maintained (so the bench
             // harness can swap it in) but unused on lookup.
-            PrefixIndexKind::Linear => {
-                let mut best_idx: Option<usize> = None;
-                let mut best_blocks = 0usize; // hit requires >= 1 block
-                for (i, slot) in self.slots.iter().enumerate() {
-                    let have = slot.entry.block_hashes();
-                    let matched = want
-                        .iter()
-                        .zip(have.iter())
-                        .take_while(|(a, b)| a == b)
-                        .count();
-                    if matched > best_blocks {
-                        best_blocks = matched;
-                        best_idx = Some(i);
-                    }
-                }
-                (best_idx, best_blocks)
-            }
+            PrefixIndexKind::Linear => linear_scan(&want),
             // Radix path — query the tree, then convert the returned
             // `slot_uid` payload back to a slot index via a linear scan
             // (small N, dominated by the radix lookup's O(n_blocks) cost).
             PrefixIndexKind::Radix => match self.prefix_index.match_best(&want, 0) {
                 Some((slot_uid, blocks)) => {
-                    let idx = self.slots.iter().position(|s| s.slot_uid == slot_uid);
-                    // Stale uid (defensive — index/slots desync should be
-                    // unreachable but we fall back to Linear scan instead
-                    // of panicking).
-                    if let Some(i) = idx {
-                        (Some(i), blocks)
+                    if let Some(i) = self.slots.iter().position(|s| s.slot_uid == slot_uid) {
+                        Some((i, blocks))
                     } else {
+                        // Stale uid (defensive — index/slots desync should be
+                        // unreachable but we fall back to Linear scan instead
+                        // of panicking).
                         tracing::warn!(
                             slot_uid,
                             "radix returned a stale slot_uid; falling back to linear scan"
                         );
-                        let mut best_idx: Option<usize> = None;
-                        let mut best_blocks = 0usize;
-                        for (i, slot) in self.slots.iter().enumerate() {
-                            let matched = want
-                                .iter()
-                                .zip(slot.entry.block_hashes().iter())
-                                .take_while(|(a, b)| a == b)
-                                .count();
-                            if matched > best_blocks {
-                                best_blocks = matched;
-                                best_idx = Some(i);
-                            }
-                        }
-                        (best_idx, best_blocks)
+                        linear_scan(&want)
                     }
                 }
-                None => (None, 0),
+                None => None,
             },
         };
+        (want, best)
+    }
 
-        let want_blocks = want.len();
-        if let Some(i) = best_idx {
-            // Bump MRU: advance seq and stamp the winning slot.
+    /// Count a lookup that matched `matched` (slot index, blocks), or nothing.
+    ///
+    /// On a hit, bumps `last_used_seq` of the slot to mark it MRU. Increments
+    /// `stats.hits` on a match, `stats.misses` on `None`. `want_blocks` is the
+    /// prompt's whole-block count.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "the index comes from a match over the current slots"
+    )]
+    fn record_lookup(&mut self, matched: Option<(usize, usize)>, want_blocks: usize) {
+        if let Some((i, blocks)) = matched {
+            // Bump MRU: advance seq and stamp the slot.
             self.seq += 1;
             self.slots[i].last_used_seq = self.seq;
             self.stats.hits += 1;
-            self.stats.block_hits += best_blocks as u64;
-            self.stats.block_misses += (want_blocks - best_blocks) as u64;
-            if best_blocks > 0 && best_blocks < want_blocks {
+            self.stats.block_hits += blocks as u64;
+            self.stats.block_misses += (want_blocks - blocks) as u64;
+            if blocks > 0 && blocks < want_blocks {
                 self.stats.partial_hits += 1;
             }
         } else {
             self.stats.misses += 1;
             self.stats.block_misses += want_blocks as u64;
         }
+    }
 
-        best_idx.map(|i| (i, best_blocks))
+    /// The slots other than `skip_uid` that share at least one leading block with
+    /// the prompt whose digests are `want`, as `(slot_uid, matched blocks)`, most
+    /// blocks first. Slot order breaks a tie, as it does for the best match.
+    fn other_matches(&self, want: &[u64], skip_uid: u64) -> Vec<(u64, usize)> {
+        let mut matches: Vec<(u64, usize)> = self
+            .slots
+            .iter()
+            .filter(|slot| slot.slot_uid != skip_uid)
+            .filter_map(|slot| {
+                let matched = leading_matches(want, slot.entry.block_hashes());
+                (matched > 0).then_some((slot.slot_uid, matched))
+            })
+            .collect();
+        matches.sort_by_key(|&(_, blocks)| std::cmp::Reverse(blocks));
+        matches
     }
 
     /// Push a new entry, evicting LRU slot(s) as needed.
@@ -1084,6 +1227,63 @@ impl MissReason {
     }
 }
 
+/// How many leading digests of `have` equal those of `want`: the number of whole
+/// blocks the two prompts share.
+fn leading_matches(want: &[u64], have: &[u64]) -> usize {
+    want.iter().zip(have).take_while(|(a, b)| a == b).count()
+}
+
+/// Why one slot did not serve a request, kept until every candidate has been
+/// asked so that a miss is reported once. The detail is data, formatted only for
+/// the decline that is reported.
+struct Decline {
+    reason: MissReason,
+    note: &'static str,
+    detail: DeclineDetail,
+}
+
+enum DeclineDetail {
+    None,
+    Quant {
+        stored: Option<KvQuant>,
+        runtime: KvQuant,
+    },
+    Hydrated(bool),
+    Blocks(usize),
+    Error(String),
+}
+
+impl std::fmt::Display for DeclineDetail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => Ok(()),
+            Self::Quant { stored, runtime } => write!(f, "stored={stored:?} runtime={runtime:?}"),
+            Self::Hydrated(hydrated) => write!(f, "is_ssd_hydrated={hydrated}"),
+            Self::Blocks(blocks) => write!(f, "block_count={blocks}"),
+            Self::Error(error) => f.write_str(error),
+        }
+    }
+}
+
+/// What one slot offers a request.
+enum Verdict {
+    /// The slot's prompt is the request's.
+    Exact,
+    /// A prefix of the slot to resume from.
+    Reuse(ReuseKind),
+    Declined(Decline),
+}
+
+impl Decline {
+    fn new(reason: MissReason, note: &'static str, detail: DeclineDetail) -> Self {
+        Self {
+            reason,
+            note,
+            detail,
+        }
+    }
+}
+
 /// Deep-clone the caches of a post-prefill snapshot. `None` when one clone
 /// refuses (for example a paged cache that holds pages): the refusal is one
 /// `debug!` event, and the arch stores no entry.
@@ -1120,9 +1320,8 @@ pub(crate) enum Consumed<E> {
     /// Prefix reuse: the cloned entry covers a leading prefix of the request
     /// prompt; the arch re-prefills the remaining tail on top of it.
     ///
-    /// Only constructed for `Partial`-policy arches (Gemma4 matches it) and
-    /// the SSD-hydrated strict-prefix case; an ExactOnly arch never produces
-    /// it.
+    /// A RAM entry is reused only under a `Partial` policy (Gemma4, Qwen3.5); an
+    /// SSD-hydrated entry is reused under any policy once its hook allows it.
     #[allow(dead_code)]
     Reuse { entry: E, kind: ReuseKind },
     /// No usable entry — re-prefill from scratch, for the reason given.
@@ -1140,22 +1339,31 @@ pub(crate) enum Consumed<E> {
 
 /// How a `Consumed::Reuse` prefix relates to the request prompt.
 ///
-/// Constructed only by prefix-reusing arches (a `StrictPrefix` for the
-/// SSD-hydrated strict-prefix / SWA-snapshot case, a `BlockTruncate` for the
-/// block-aligned gemma4 path). The dense ExactOnly arch never builds either, so
-/// the variants read as dead until such an arch is routed through the engine.
+/// Constructed only by prefix-reusing arches: a `StrictPrefix` for a stored
+/// prompt that the request extends, a `BlockTruncate` for the block-aligned
+/// gemma4 path and the Qwen3.5 anchor resume.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) enum ReuseKind {
     /// Reuse the entry's full cached prefix verbatim. `prefix_len` is the
     /// cached token length (NOT necessarily block-aligned). The arch forwards
-    /// `prompt_ids[prefix_len..]`. gemma4 B1 (SWA snapshot/restore), qwen3.5-moe
-    /// HydratedTail.
+    /// `prompt_ids[prefix_len..]`. gemma4 B1 (SWA snapshot/restore), qwen3.5
+    /// (a RAM or SSD-hydrated entry the request extends).
     StrictPrefix { prefix_len: usize },
-    /// Block-aligned truncate then tail re-prefill (gemma4 only). The reuse
-    /// prefix is `effective_blocks * BLOCK_TOKENS` tokens; `prepare_reuse`
-    /// truncates the cloned KV to that boundary and asserts the invariant.
+    /// Block-aligned truncate then tail re-prefill (gemma4, and the qwen3.5
+    /// anchor). The reuse prefix is `effective_blocks * BLOCK_TOKENS` tokens;
+    /// `prepare_reuse` truncates the cloned KV to that boundary.
     BlockTruncate { effective_blocks: usize },
+}
+
+impl ReuseKind {
+    /// Tokens of the request this reuse covers; the arch forwards the rest.
+    pub(crate) const fn prefix_len(self) -> usize {
+        match self {
+            Self::StrictPrefix { prefix_len } => prefix_len,
+            Self::BlockTruncate { effective_blocks } => effective_blocks * BLOCK_TOKENS,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1169,24 +1377,23 @@ pub(crate) enum ReuseKind {
 /// the generate loop's lookup logic to decide whether a partial / strict-prefix
 /// hit may be taken or must degrade to a Miss.
 ///
-/// - [`ReusePolicy::Partial`] — pure-attention arch with trimmable KV (Gemma4).
-///   Block-aligned partial-prefix reuse + B1 strict-prefix SWA snapshot/restore
-///   are both legal. The arch still has to gate per-slot via
-///   `Gemma4Entry::can_truncate_to_block` (SWA ring-buffer wrap).
+/// - [`ReusePolicy::Partial`] — an arch whose entry hook can resume a partial
+///   match: Gemma4 (block-aligned partial-prefix reuse + B1 strict-prefix SWA
+///   snapshot/restore) and Qwen3.5 (the whole stored prompt, or the recurrent
+///   state the entry saved inside it). The hook still gates per slot, through
+///   `PromptCacheEntry::can_truncate_to_block` (SWA ring-buffer wrap, a K/V that
+///   cannot be cut back to the anchor).
 /// - [`ReusePolicy::ExactOnly`] — full-token-equality reuse only. Block-aligned
-///   partial hits MUST degrade to a Miss. Required for any arch that holds
-///   non-truncatable state alongside the attention KV — today the only
-///   production user is **Qwen3.5-MoE** (recurrent GatedDeltaNet `lin_caches`
-///   cannot be reconstructed from a block-truncated prefix). Qwen3-dense also
-///   uses this for simplicity (its Exact-hit warm-TTFT case is the dominant
-///   one and the bench winner; the partial path was never worth the complexity
-///   for an arch with no Prefix consumers).
+///   partial hits MUST degrade to a Miss. For every arch without a hook that
+///   can resume a partial match: its Exact-hit warm-TTFT case is the dominant
+///   one, and the partial path was never worth the complexity for an arch with
+///   no Prefix consumers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReusePolicy {
-    /// Block-aligned partial-prefix reuse allowed (Gemma4 — full-attn + SWA).
+    /// The entry's hook decides which prefix of a partial match is reused
+    /// (Gemma4, Qwen3.5).
     Partial,
-    /// Full-token-equality reuse only; partial hits must degrade to Miss
-    /// (Qwen3-MoE — GDN recurrent state cannot be block-truncated).
+    /// Full-token-equality reuse only; partial hits must degrade to Miss.
     ExactOnly,
 }
 
@@ -1217,7 +1424,7 @@ pub(crate) struct AttachParams {
 ///
 /// The genuinely per-arch parts that stay outside this struct:
 /// - the `Entry` struct (for example Gemma4 and Qwen3 = KV only, Qwen3.5-MoE
-///   = KV + LinearAttn);
+///   = KV + LinearAttn + the recurrent state it saved inside its prompt);
 /// - the `impl HydratedEntry for Entry` block, which states what a restored
 ///   block becomes and what topology the arch reads. The probe itself is the
 ///   blanket `impl SsdHydrate<E> for SsdHydrator` in `rmlx-kv-ssd`, and the
@@ -1225,7 +1432,7 @@ pub(crate) struct AttachParams {
 ///   are shared by every arch.
 /// - the arch's match on the [`Consumed`] outcome (Exact / Reuse / Miss), which
 ///   queries [`ArchPromptCache::policy`] to enforce [`ReusePolicy::ExactOnly`]
-///   as a hard runtime check.
+///   as a hard runtime check where the arch is on it.
 ///
 /// Risk-mitigation contract:
 /// - The constructor takes a `ReusePolicy`. The `policy()` getter is the
@@ -1238,7 +1445,7 @@ pub(crate) struct AttachParams {
 pub(crate) struct ArchPromptCache<E: PromptCacheEntry> {
     /// Human-readable arch tag used in tracing events.
     arch_name: &'static str,
-    /// Reuse policy: `Partial` (Gemma4) or `ExactOnly` (Qwen3, Qwen3.5-MoE).
+    /// Reuse policy: `Partial` (Gemma4, Qwen3.5) or `ExactOnly` (the rest).
     policy: ReusePolicy,
     /// The arch's cross-layer-KV topology — its `SHARES_KV_ACROSS_LAYERS`.
     ///
@@ -1470,10 +1677,14 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
     ///    entry holds (e.g. qwen3's `first_logprobs`).
     /// 6. Reuse gate ([`ReusePolicy`] + `is_hydrate_complete`): a hydrated
     ///    strict-prefix is permitted under any policy; a non-hydrated partial
-    ///    match only under `Partial`. When permitted, the entry's
+    ///    match only under `Partial` (Gemma4, Qwen3.5). When permitted, the entry's
     ///    `is_reusable_prefix_of` hook decides the [`ReuseKind`]; `prepare_reuse`
     ///    clones (+ truncates) for reuse. Hook `None` or an incomplete hydrate
-    ///    degrades to `Miss`.
+    ///    declines the slot.
+    /// 7. A slot that declines is not the end: every other slot sharing a block is
+    ///    asked in turn, most blocks first. An Exact hit wins outright, otherwise
+    ///    the longest reuse any slot allows. Only when all decline does the
+    ///    request `Miss`, with the best slot's reason.
     ///
     /// Every arm that resolves to `Miss` emits exactly one
     /// `debug!{branch, reason}`, including the two that carry no degrade — the
@@ -1556,18 +1767,25 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
     }
 
     /// The find → hydrate-retry → quant-guard → Exact → reuse-gate decision,
-    /// run while holding the cache lock. Split out of [`consume`] so the single
-    /// cohesive decision keeps one home (the `cognitive_complexity` allow scopes
-    /// to it, not the lock-management wrapper).
+    /// run while holding the cache lock. Split out of [`consume`] so the decision
+    /// keeps one home away from the lock management.
+    ///
+    /// Every slot that shares a block is asked, the best-matching first. An Exact
+    /// hit wins outright. Otherwise the longest reuse any slot allows is taken
+    /// (the first of equals), so a slot with fewer matched blocks that resumes
+    /// further in beats one that resumes sooner. The lookup is counted, and the
+    /// slot stamped most recently used, for the slot that served. When none
+    /// serves, the miss reports the best slot's reason in one event.
+    ///
+    /// Not retried: the SSD tier after every RAM slot declined. A decline is the
+    /// common outcome of a partial match, so the tier would be read, and its block
+    /// pushed, on each such request, and a hydrated entry that declines (the
+    /// equal-length case) would be read again by the next one.
     ///
     /// [`consume`]: ArchPromptCache::consume
     #[allow(
         clippy::indexing_slicing,
-        reason = "slot_idx is returned by find_best_prefix as a valid index into `cache.slots` and is not mutated before use"
-    )]
-    #[allow(
-        clippy::cognitive_complexity,
-        reason = "one cohesive consume decision (find/guard/exact/reuse arms) — splitting the arms across helpers would scatter a single decision and hurt readability"
+        reason = "slot indices come from a position lookup over the current slots"
     )]
     fn decide_locked(
         arch: &'static str,
@@ -1580,20 +1798,20 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
         dispatch_policy: DispatchPolicy,
     ) -> Consumed<E> {
         // (3) RAM find, then SSD-hydrate retry. A hydrate hit promotes the
-        // block into RAM; re-run find_best_prefix so the promoted slot is
-        // matched + quant-checked by the path below.
-        let mut raw_match = cache.find_best_prefix(prompt_ids, seed);
-        if raw_match.is_none()
-            && cache
+        // block into RAM; look again so the promoted slot is matched +
+        // quant-checked by the path below.
+        let (mut want, mut raw_match) = cache.best_match(prompt_ids, seed);
+        if raw_match.is_none() {
+            cache.record_lookup(None, want.len());
+            if cache
                 .hydrate_from_ssd(prompt_ids, seed, kv_quant, layer_quants, dispatch_policy)
                 .is_some()
-        {
-            raw_match = cache.find_best_prefix(prompt_ids, seed);
+            {
+                (want, raw_match) = cache.best_match(prompt_ids, seed);
+            }
         }
 
-        // (4) Quant-mismatch guard. The snapshot is only safe to
-        // reuse when the stored KvQuant equals the runtime quant.
-        let Some((slot_idx, block_count)) = raw_match else {
+        let Some((best_idx, best_blocks)) = raw_match else {
             let reason = MissReason::NoMatch;
             tracing::debug!(
                 arch,
@@ -1603,18 +1821,109 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
             );
             return Consumed::Miss(reason);
         };
+        let best_uid = cache.slots[best_idx].slot_uid;
+        let mut candidates = vec![(best_uid, best_blocks)];
+        candidates.extend(cache.other_matches(&want, best_uid));
+
+        let mut first_decline: Option<Decline> = None;
+        let mut offers: Vec<(u64, usize, ReuseKind)> = Vec::new();
+        for (uid, blocks) in candidates {
+            let Some(idx) = cache.slots.iter().position(|s| s.slot_uid == uid) else {
+                continue;
+            };
+            match Self::judge_slot(arch, policy, cache, idx, prompt_ids, kv_quant, blocks) {
+                Verdict::Exact => match cache.slots[idx].entry.deep_clone() {
+                    Ok(cloned) => {
+                        cache.record_lookup(Some((idx, blocks)), want.len());
+                        return Consumed::Exact(cloned);
+                    }
+                    Err(e) => {
+                        first_decline.get_or_insert(Decline::new(
+                            MissReason::DeepCloneErr,
+                            "Exact deep_clone failed — re-prefill (source slot untouched)",
+                            DeclineDetail::Error(e.to_string()),
+                        ));
+                    }
+                },
+                Verdict::Reuse(kind) => offers.push((uid, blocks, kind)),
+                Verdict::Declined(decline) => {
+                    first_decline.get_or_insert(decline);
+                }
+            }
+        }
+
+        // The longest reuse first; the stable sort keeps the better match of equals.
+        offers.sort_by_key(|&(_, _, kind)| std::cmp::Reverse(kind.prefix_len()));
+        for (uid, blocks, kind) in offers {
+            let Some(idx) = cache.slots.iter().position(|s| s.slot_uid == uid) else {
+                continue;
+            };
+            match cache.slots[idx].entry.prepare_reuse(kind) {
+                Ok(prepared) => {
+                    cache.record_lookup(Some((idx, blocks)), want.len());
+                    return Consumed::Reuse {
+                        entry: prepared,
+                        kind,
+                    };
+                }
+                Err(e) => {
+                    first_decline.get_or_insert(Decline::new(
+                        MissReason::DeepCloneErr,
+                        "prepare_reuse failed — re-prefill (source slot untouched)",
+                        DeclineDetail::Error(e.to_string()),
+                    ));
+                }
+            }
+        }
+
+        // No slot served; the lookup still found the best one.
+        let best_now = cache
+            .slots
+            .iter()
+            .position(|s| s.slot_uid == best_uid)
+            .map(|idx| (idx, best_blocks));
+        cache.record_lookup(best_now, want.len());
+        let decline = first_decline.unwrap_or_else(|| {
+            Decline::new(
+                MissReason::NonReusable,
+                "matched slot is not a reusable prefix for this prompt — re-prefill",
+                DeclineDetail::None,
+            )
+        });
+        tracing::debug!(
+            arch,
+            branch = decline.reason.label(),
+            reason = decline.note,
+            detail = %decline.detail,
+            prompt_len = prompt_ids.len(),
+        );
+        Consumed::Miss(decline.reason)
+    }
+
+    /// One slot's verdict: the quant guard, the Exact arm, then the reuse gate.
+    /// Nothing is cloned here.
+    ///
+    /// A decline is left unlogged for the caller to report once. A slot whose
+    /// codec differs from the request's is evicted here, as it always was.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "slot_idx is a valid index into `cache.slots`: the caller found it there and nothing has removed a slot since"
+    )]
+    fn judge_slot(
+        arch: &'static str,
+        policy: ReusePolicy,
+        cache: &mut PromptCache<E>,
+        slot_idx: usize,
+        prompt_ids: &[u32],
+        kv_quant: KvQuant,
+        block_count: usize,
+    ) -> Verdict {
+        // (4) Quant-mismatch guard. The snapshot is only safe to
+        // reuse when the stored KvQuant equals the runtime quant.
         let stored = cache.slots[slot_idx].entry.kv_quant();
         if stored != Some(kv_quant) {
-            let reason = MissReason::QuantMismatch;
-            tracing::debug!(
-                arch,
-                branch = reason.label(),
-                reason = "stored KV quant differs from runtime — evict + re-prefill",
-                stored = ?stored,
-                runtime = ?kv_quant,
-                prompt_len = prompt_ids.len(),
-            );
             tracing::warn!(
+                arch,
                 stored = ?stored,
                 runtime = ?kv_quant,
                 prompt_len = prompt_ids.len(),
@@ -1622,7 +1931,14 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
                  degrading to re-prefill"
             );
             cache.evict_slot(slot_idx);
-            return Consumed::Miss(reason);
+            return Verdict::Declined(Decline::new(
+                MissReason::QuantMismatch,
+                "stored KV quant differs from runtime — evict + re-prefill",
+                DeclineDetail::Quant {
+                    stored,
+                    runtime: kv_quant,
+                },
+            ));
         }
 
         let entry = &cache.slots[slot_idx].entry;
@@ -1632,88 +1948,36 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
         // first decode token. An SSD-hydrated entry is excluded — its
         // first_id is the placeholder 0, replaying it poisons generation.
         if !is_ssd_hydrated && entry.prompt_token_ids() == prompt_ids {
-            return match entry.deep_clone() {
-                Ok(cloned) => Consumed::Exact(cloned),
-                Err(e) => {
-                    let reason = MissReason::DeepCloneErr;
-                    tracing::debug!(
-                        arch,
-                        branch = reason.label(),
-                        reason = "Exact deep_clone failed — re-prefill (source slot untouched)",
-                        error = %e,
-                        prompt_len = prompt_ids.len(),
-                    );
-                    Consumed::Miss(reason)
-                }
-            };
+            return Verdict::Exact;
         }
 
         // (6) Reuse gate. A hydrated strict-prefix is permitted under any
-        // policy (moe HydratedTail); a non-hydrated partial match only under
-        // `Partial` (gemma4). Either way the hydrated entry must be COMPLETE
-        // (gemma4 SWA: a payload-less attended layer is not reusable).
-        let reuse_eligible = if is_ssd_hydrated {
-            if entry.is_hydrate_complete() {
-                true
-            } else {
-                let reason = MissReason::IncompleteHydrate;
-                tracing::debug!(
-                    arch,
-                    branch = reason.label(),
-                    reason = "hydrated entry has a payload-less attended layer — re-prefill",
-                    prompt_len = prompt_ids.len(),
-                );
-                return Consumed::Miss(reason);
-            }
-        } else {
-            policy == ReusePolicy::Partial
-        };
-
-        if reuse_eligible {
-            if let Some(kind) =
-                entry.is_reusable_prefix_of(prompt_ids, is_ssd_hydrated, block_count)
-            {
-                return match entry.prepare_reuse(kind) {
-                    Ok(prepared) => Consumed::Reuse {
-                        entry: prepared,
-                        kind,
-                    },
-                    Err(e) => {
-                        let reason = MissReason::DeepCloneErr;
-                        tracing::debug!(
-                            arch,
-                            branch = reason.label(),
-                            reason = "prepare_reuse failed — re-prefill (source slot untouched)",
-                            error = %e,
-                            prompt_len = prompt_ids.len(),
-                        );
-                        Consumed::Miss(reason)
-                    }
-                };
-            }
-            let reason = MissReason::NonReusable;
-            tracing::debug!(
-                arch,
-                branch = reason.label(),
-                reason = "matched slot is not a reusable prefix for this prompt — re-prefill",
-                prompt_len = prompt_ids.len(),
-                block_count,
-            );
-            return Consumed::Miss(reason);
+        // policy; a non-hydrated partial match only under `Partial` (gemma4,
+        // qwen3.5). Either way the hydrated entry must be COMPLETE (gemma4
+        // SWA: a payload-less attended layer is not reusable).
+        if is_ssd_hydrated && !entry.is_hydrate_complete() {
+            return Verdict::Declined(Decline::new(
+                MissReason::IncompleteHydrate,
+                "hydrated entry has a payload-less attended layer — re-prefill",
+                DeclineDetail::None,
+            ));
         }
-
-        // A matched non-hydrated partial under a non-Partial policy, or a
-        // hydrated entry that declined the strict-prefix hook (e.g. the
-        // block-aligned equal-length case) — re-prefill.
-        let reason = MissReason::HydratedDeclinedToExact;
-        tracing::debug!(
-            arch,
-            branch = reason.label(),
-            reason = "matched slot is not Exact-eligible and reuse is not permitted — re-prefill",
-            is_ssd_hydrated,
-            prompt_len = prompt_ids.len(),
-        );
-        Consumed::Miss(reason)
+        if !is_ssd_hydrated && policy != ReusePolicy::Partial {
+            // A matched non-hydrated partial under a non-Partial policy — re-prefill.
+            return Verdict::Declined(Decline::new(
+                MissReason::HydratedDeclinedToExact,
+                "matched slot is not Exact-eligible and reuse is not permitted — re-prefill",
+                DeclineDetail::Hydrated(is_ssd_hydrated),
+            ));
+        }
+        match entry.is_reusable_prefix_of(prompt_ids, is_ssd_hydrated, block_count) {
+            Some(kind) => Verdict::Reuse(kind),
+            None => Verdict::Declined(Decline::new(
+                MissReason::NonReusable,
+                "matched slot is not a reusable prefix for this prompt — re-prefill",
+                DeclineDetail::Blocks(block_count),
+            )),
+        }
     }
 
     /// Read the current hit/miss/bytes stats, or `None` if the cache has not

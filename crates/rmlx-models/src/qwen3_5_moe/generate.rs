@@ -32,9 +32,10 @@ use crate::decode_loop::{
 use crate::kv_cache::{kv_layer_quants, warn_if_kv_codec_net_negative, KvLayerShape};
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
+use super::anchor_capture::{anchor_target, entry_is_storable, AnchorCapture};
 use super::model::Qwen3_5MoeText;
 use super::prompt_cache::{ensure_prompt_cache, Qwen35MoeEntry, PROMPT_CACHE};
-use crate::prompt_cache::{Consumed, ReuseKind, ReusePolicy};
+use crate::prompt_cache::{Anchor, Consumed, ReuseKind, BLOCK_TOKENS};
 
 /// Greedy autoregressive generation using KV-cache prefill + decode.
 ///
@@ -100,40 +101,28 @@ pub fn generate_greedy<'a>(
     let mut steps = Vec::with_capacity(n_tokens);
 
     ensure_prompt_cache(prompt_cache_slots);
+    let storable = entry_is_storable(prompt_cache_slots, rmlx_kv_quant::paged::paged_kv_enabled());
 
-    // ------------------------------------------------------------------
-    // Prompt cache lookup via the shared consume() engine. Qwen3.5-MoE is a
-    // hybrid GDN arch and uses `ReusePolicy::ExactOnly`. The reachable outcomes:
+    // Prompt cache lookup via the shared consume() engine. The outcomes:
     //   - `Exact`  = cached prompt token-for-token equal to this prompt (full
     //                reuse, no re-prefill).
-    //   - `Reuse{StrictPrefix}` = HydratedTail: an SSD-hydrated entry that is a
-    //                STRICT PREFIX of the incoming prompt. Its block-aligned KV +
-    //                GDN `lin_caches` are the recurrent state at t=prefix_len of
-    //                THIS same prompt, so re-prefilling only the tail on top is
-    //                sequentially correct (the engine's policy gate permits a
-    //                hydrated strict-prefix even under ExactOnly).
-    //   - `Miss`   = no usable entry — a non-hydrated partial match (forbidden by
-    //                ExactOnly for the GDN `lin_caches`), the block-aligned
-    //                equal-length hydrated case (placeholder first token — must
-    //                recompute), an incomplete hydrate, or a quant mismatch.
-    // `BlockTruncate` is never produced by moe (the GDN `lin_caches` cannot be
-    // reconstructed from a block-truncated KV), so that arm is unreachable here.
+    //   - `Reuse`  = a state of THIS prompt's own prefix, resumed at
+    //                `prefix_len`: the whole stored prompt (`StrictPrefix`) or
+    //                the stored anchor (`BlockTruncate`, K/V cut back to it).
+    //                Only the tail is forwarded on top.
+    //   - `Miss`   = no usable entry.
     // The engine owns find → SSD-hydrate retry → quant-mismatch guard →
     // SSD-hydrated Exact exclusion → reuse-gate, and traces every degrade branch.
-    // ------------------------------------------------------------------
 
-    // hard runtime gate: Qwen3.5-MoE must be on the ExactOnly policy. A wrong
-    // policy here would expose the unsafe partial-prefix path on the GDN
-    // `lin_caches` (see Qwen35MoeEntry docs). Compile-time would also fail at
-    // HydratedEntry impl resolution, but this catches a misconfigured arch table
-    // before any cache lookup happens. A real (not debug_) assert so the
-    // tripwire fires under release-perf too.
-    assert_eq!(
-        PROMPT_CACHE.policy(),
-        ReusePolicy::ExactOnly,
-        "qwen3_5_moe ArchPromptCache must use ReusePolicy::ExactOnly — \
-         partial-prefix reuse is unsafe for GDN lin_caches",
-    );
+    // `--max-ctx` is a virtual ceiling the KV ring grows lazily up
+    // to, not an eager allocation. `initial_max_seq` is the lazy start;
+    // `max_seq_ceiling` caps growth and rejects over-long prompts. It is
+    // resolved before the lookup, as a cold run does, so that a reused entry is
+    // bound to this request's ceiling, whatever ceiling it was filled under.
+    let resolved_ctx = crate::context::resolve_context(&model.cfg.context, max_ctx_override)?;
+    let (initial_max_seq, max_seq_ceiling) = (resolved_ctx.initial_max_seq, resolved_ctx.ceiling);
+    let bind =
+        |kv_caches| crate::context::rebind_to_ceiling(kv_caches, max_seq_ceiling, prompt_ids.len());
 
     // image prompts never reach this arch (text path only), so `has_image` is
     // always false here; the engine bypass is belt-and-suspenders.
@@ -145,44 +134,37 @@ pub fn generate_greedy<'a>(
         model.model_sig,
     );
 
-    // `exact_hit` carries the Path-A locals; `hydrated_tail` carries the Path-B
-    // tail-re-prefill locals. `Consumed::Miss` leaves both `None` and falls
+    // `exact_hit` carries the Path-A locals; `resumed` carries the Path-B
+    // tail-forward locals. `Consumed::Miss` leaves both `None` and falls
     // through to Path C (full re-prefill).
     let mut exact_hit: Option<(Vec<KvCache>, Vec<LinearAttnCache>, u32, String)> = None;
-    let mut hydrated_tail: Option<(Vec<KvCache>, Vec<LinearAttnCache>, usize)> = None;
+    let mut resumed: Option<Resumed> = None;
     match consumed {
         Consumed::Exact(cloned) => {
             exact_hit = Some((
-                cloned.kv_caches,
+                bind(cloned.kv_caches)?,
                 cloned.lin_caches,
                 cloned.first_id,
                 cloned.first_piece,
             ));
         }
-        // HydratedTail: SSD-hydrated block-aligned prefix that is a strict
-        // prefix of the incoming prompt; tail re-prefills on top of the
-        // restored KV + GDN lin state (no truncation — recurrent state is
-        // resumed at the block boundary).
         Consumed::Reuse {
             entry: cloned,
-            kind: ReuseKind::StrictPrefix { prefix_len },
+            kind,
         } => {
-            hydrated_tail = Some((cloned.kv_caches, cloned.lin_caches, prefix_len));
-        }
-        // Unreachable for moe: the ExactOnly policy never permits a non-hydrated
-        // partial match, and the hydrated-prefix hook only ever yields
-        // `StrictPrefix` (block-truncating a GDN `lin_caches` is unsafe and
-        // structurally forbidden). Treat defensively as a Miss (full re-prefill)
-        // rather than panicking, since a Miss is always correctness-safe.
-        Consumed::Reuse {
-            kind: ReuseKind::BlockTruncate { .. },
-            ..
-        } => {
-            tracing::warn!(
-                prompt_len = prompt_ids.len(),
-                "qwen3_5moe generate_greedy: unexpected BlockTruncate reuse for a GDN arch — \
-                 degrading to full re-prefill"
-            );
+            let (prefix_len, kind) = match kind {
+                ReuseKind::StrictPrefix { prefix_len } => (prefix_len, "strict_prefix"),
+                ReuseKind::BlockTruncate { effective_blocks } => {
+                    (effective_blocks * BLOCK_TOKENS, "anchor")
+                }
+            };
+            resumed = Some(Resumed {
+                kv_caches: bind(cloned.kv_caches)?,
+                lin_caches: cloned.lin_caches,
+                anchor: cloned.anchor,
+                prefix_len,
+                kind,
+            });
         }
         Consumed::Miss(_) => {}
     }
@@ -243,9 +225,9 @@ pub fn generate_greedy<'a>(
         return Ok(steps);
     }
 
-    // Path B: HydratedTail — SSD block-aligned prefix in RAM, tail needs forwarding.
+    // Path B: resume — the caches hold a prefix of this prompt, the tail needs forwarding.
     //
-    // The hydrated caches are in POST-exit_prefill (decode) mode: the prefix
+    // The resumed caches are in POST-exit_prefill (decode) mode: the prefix
     // K/V at positions 0..prefix_len are already stored in the quantised
     // payload buffers with `offset == prefix_len`. Running
     // `forward_seq_with_cache(tail, ...)` in this state (WITHOUT calling
@@ -271,16 +253,31 @@ pub fn generate_greedy<'a>(
     // Chunking (same prefill_chunk as Path C): bounds the per-chunk forward
     // (KV write + GDN kernel) so long tails stay under the Metal
     // command-buffer budget.
-    if let Some((mut kv_caches, mut lin_caches, prefix_len)) = hydrated_tail {
+    if let Some(Resumed {
+        mut kv_caches,
+        mut lin_caches,
+        anchor: inherited_anchor,
+        prefix_len,
+        kind,
+    }) = resumed
+    {
         let tail_len = prompt_ids.len() - prefix_len;
         tracing::info!(
             arch = arch_label,
+            kind,
             prefix_len,
             tail_len,
-            "qwen3_5moe: hydrated-tail hit — forwarding tail from SSD-restored KV"
+            "qwen3_5moe: prompt-cache resume — forwarding the tail on the saved state"
         );
 
         let prefill_chunk = crate::prefill_chunk::prefill_chunk_for("qwen3_5_moe");
+
+        // The new entry's anchor is taken from this tail when the tail reaches
+        // it; otherwise the resumed entry's own anchor is the right one.
+        let mut anchor_capture = AnchorCapture::new(
+            anchor_target(prompt_ids.len(), storable, prefix_len),
+            KvCache::eval_gpu_state,
+        );
 
         // No enter_prefill above (see the note on resumed caches) means no
         // exit_prefill sweep is owed here, so a failure or a stop returns its
@@ -293,10 +290,12 @@ pub fn generate_greedy<'a>(
             for (chunk_idx, chunk) in tail.chunks(prefill_chunk).enumerate() {
                 ensure_not_cancelled(cancel)?;
                 let is_last = chunk_idx + 1 == n_chunks;
-                match model.forward_seq_with_cache(
+                match anchor_capture.forward(
+                    model,
                     chunk,
-                    Some(&mut kv_caches),
-                    Some(&mut lin_caches),
+                    prefix_len + chunk_idx * prefill_chunk,
+                    &mut kv_caches,
+                    &mut lin_caches,
                     device,
                 ) {
                     Ok(logits) => {
@@ -313,7 +312,7 @@ pub fn generate_greedy<'a>(
                                 tracing::error!(
                                     error = %e,
                                     chunk_len = chunk.len(),
-                                    "qwen3_5moe generate_greedy (hydrated-tail): tail chunk eval failed, aborting generation"
+                                    "qwen3_5moe generate_greedy (resume): tail chunk eval failed, aborting generation"
                                 );
                                 return Err(e);
                             }
@@ -325,7 +324,7 @@ pub fn generate_greedy<'a>(
                             error = %e,
                             prefix_len,
                             tail_len,
-                            "qwen3_5moe generate_greedy (hydrated-tail): tail chunk failed, aborting generation"
+                            "qwen3_5moe generate_greedy (resume): tail chunk failed, aborting generation"
                         );
                         return Err(e);
                     }
@@ -334,8 +333,7 @@ pub fn generate_greedy<'a>(
 
             last_logits.ok_or_else(|| {
                 Error::Model(
-                    "qwen3_5moe generate_greedy (hydrated-tail): tail produced no logits"
-                        .to_owned(),
+                    "qwen3_5moe generate_greedy (resume): tail produced no logits".to_owned(),
                 )
             })?
         };
@@ -395,62 +393,17 @@ pub fn generate_greedy<'a>(
             .id_to_token(last_id)
             .unwrap_or_else(|| format!("<unk:{last_id}>"));
 
-        // Push the completed full-length snapshot (both prefix + tail) so
-        // future requests can serve this prompt as an Exact hit from RAM.
-        {
-            let arch = PROMPT_CACHE.arch_name();
-            if let (Some(kvs), Some(lins)) = (
-                crate::prompt_cache::snapshot_clone(arch, &kv_caches, KvCache::try_deep_clone),
-                crate::prompt_cache::snapshot_clone(
-                    arch,
-                    &lin_caches,
-                    LinearAttnCache::try_deep_clone,
-                ),
-            ) {
-                match kvs
-                    .iter()
-                    .try_for_each(|c| c.eval_for_spill())
-                    .and_then(|()| lins.iter().try_for_each(|c| c.eval_for_spill()))
-                {
-                    Ok(()) => {
-                        PROMPT_CACHE.with_inner_mut(|guard| {
-                            if let Some(cache) = guard.as_mut() {
-                                let lk = crate::qwen3_5_moe::prompt_cache::active_layout_key();
-                                let stored = cache.push(Qwen35MoeEntry {
-                                    prompt_token_ids: prompt_ids.to_vec(),
-                                    block_hashes: crate::prompt_cache::chained_block_hashes_seeded(
-                                    prompt_ids,
-                                    crate::prompt_cache::request_cache_seed(
-                            lk,
-                            kv_quant,
-                            model.cfg.num_hidden_layers,
-                            crate::qwen3_5_moe::SHARES_KV_ACROSS_LAYERS,
-                            model.model_sig,
-                        ),
-                                ),
-                                    kv_caches: kvs,
-                                    lin_caches: lins,
-                                    first_id: last_id,
-                                    first_piece: piece.clone(),
-                                    kv_quant: Some(kv_quant),
-                                    is_ssd_hydrated: false,
-                                });
-                                if stored.is_some() {
-                                    tracing::debug!(
-                                        prompt_len = prompt_ids.len(),
-                                        token_id = last_id,
-                                        n_slots = cache.slots.len(),
-                                        "qwen3_5moe generate_greedy: hydrated-tail — saved full snapshot"
-                                    );
-                                }
-                            }
-                        });
-                    }
-                    Err(e) => tracing::warn!(error = %e,
-                        "qwen3_5moe generate_greedy (hydrated-tail): pre-eval failed, skipping prompt cache store"),
-                }
-            }
-        }
+        // Save the completed full-length snapshot (prefix + tail) so future
+        // requests can serve this prompt as an Exact hit from RAM.
+        store_snapshot(
+            model,
+            prompt_ids,
+            kv_quant,
+            (&kv_caches, &lin_caches),
+            anchor_capture.into_anchor().or(inherited_anchor),
+            (last_id, &piece),
+            "resume",
+        );
 
         let prefill_logprobs = if lp_k > 0 {
             capture_logprobs(&logits_flat, &top, lp_k)
@@ -482,11 +435,6 @@ pub fn generate_greedy<'a>(
         return Ok(steps);
     }
 
-    // `--max-ctx` is a virtual ceiling the KV ring grows lazily up
-    // to, not an eager allocation. `initial_max_seq` is the lazy start;
-    // `max_seq_ceiling` caps growth and rejects over-long prompts.
-    let resolved_ctx = crate::context::resolve_context(&model.cfg.context, max_ctx_override)?;
-    let (initial_max_seq, max_seq_ceiling) = (resolved_ctx.initial_max_seq, resolved_ctx.ceiling);
     // Prefill chunk for qwen3_5_moe comes from `arch_default` in
     // `prefill_chunk.rs`, which records the sweep behind it. The GDN recurrence runs the
     // `gated_delta_step_gpu` kernel at any T, so a large chunk does NOT route to
@@ -545,6 +493,11 @@ pub fn generate_greedy<'a>(
     // enter_prefill() / exit_prefill(), evals only the cache state on non-final
     // chunks, and propagates the cause on rejection. The GDN `lin_caches` are
     // closure-captured — the helper only owns `kv_caches`.
+    let mut anchor_capture = AnchorCapture::new(
+        anchor_target(prompt_ids.len(), storable, 0),
+        KvCache::eval_prefill_state,
+    );
+    let mut chunk_start = 0usize;
     let prefill_logits = chunked_prefill(
         &mut kv_caches,
         prompt_ids,
@@ -552,7 +505,11 @@ pub fn generate_greedy<'a>(
         device,
         "qwen3_5_moe",
         cancel,
-        |chunk, kv| model.forward_seq_with_cache(chunk, Some(kv), Some(&mut lin_caches), device),
+        |chunk, kv| {
+            let start = chunk_start;
+            chunk_start += chunk.len();
+            anchor_capture.forward(model, chunk, start, kv, &mut lin_caches, device)
+        },
     )?;
 
     let logits_flat = prefill_logits.reshape(&[1, vocab], device)?;
@@ -628,60 +585,15 @@ pub fn generate_greedy<'a>(
         "qwen3_5moe generate_greedy prefill (fast path)"
     );
 
-    {
-        let arch = PROMPT_CACHE.arch_name();
-        if let (Some(kvs), Some(lins)) = (
-            crate::prompt_cache::snapshot_clone(arch, &kv_caches, KvCache::try_deep_clone),
-            crate::prompt_cache::snapshot_clone(arch, &lin_caches, LinearAttnCache::try_deep_clone),
-        ) {
-            // Evaluate the copies before the store, so the entry holds its own
-            // buffers and not a graph over the live caches.
-            match kvs
-                .iter()
-                .try_for_each(|c| c.eval_for_spill())
-                .and_then(|()| lins.iter().try_for_each(|c| c.eval_for_spill()))
-            {
-                Ok(()) => {
-                    PROMPT_CACHE.with_inner_mut(|guard| {
-                        if let Some(cache) = guard.as_mut() {
-                            // salt chained walk with the active layout_key. When
-                            // tier is OFF, helper returns 0 ⇒ legacy un-salted digests.
-                            let lk = crate::qwen3_5_moe::prompt_cache::active_layout_key();
-                            let stored = cache.push(Qwen35MoeEntry {
-                                prompt_token_ids: prompt_ids.to_vec(),
-                                block_hashes: crate::prompt_cache::chained_block_hashes_seeded(
-                                    prompt_ids,
-                                    crate::prompt_cache::request_cache_seed(
-                                        lk,
-                                        kv_quant,
-                                        model.cfg.num_hidden_layers,
-                                        crate::qwen3_5_moe::SHARES_KV_ACROSS_LAYERS,
-                                        model.model_sig,
-                                    ),
-                                ),
-                                kv_caches: kvs,
-                                lin_caches: lins,
-                                first_id: last_id,
-                                first_piece: piece.clone(),
-                                kv_quant: Some(kv_quant),
-                                is_ssd_hydrated: false,
-                            });
-                            if stored.is_some() {
-                                tracing::debug!(
-                                    prompt_len = prompt_ids.len(),
-                                    token_id = last_id,
-                                    n_slots = cache.slots.len(),
-                                    "qwen3_5moe generate_greedy: prompt cache MISS — saved snapshot"
-                                );
-                            }
-                        }
-                    });
-                }
-                Err(e) => tracing::warn!(error = %e,
-                    "qwen3_5moe generate_greedy: pre-eval of KV/lin caches failed, skipping prompt cache store"),
-            }
-        }
-    }
+    store_snapshot(
+        model,
+        prompt_ids,
+        kv_quant,
+        (&kv_caches, &lin_caches),
+        anchor_capture.into_anchor(),
+        (last_id, &piece),
+        "miss",
+    );
 
     // prefill is non-pipelined (last_id already materialised), so the
     // prefill token's logprobs come straight from this step's logits.
@@ -745,4 +657,88 @@ pub fn generate_greedy<'a>(
     model.kv_bytes.store(kv_bytes, post);
 
     Ok(steps)
+}
+
+/// What a prompt-cache reuse hands the tail path: caches that hold a prefix of
+/// the request's prompt, and the anchor the stored entry carried.
+struct Resumed {
+    kv_caches: Vec<KvCache>,
+    lin_caches: Vec<LinearAttnCache>,
+    anchor: Option<Anchor>,
+    prefix_len: usize,
+    /// Which reuse arm produced it, for the resume event.
+    kind: &'static str,
+}
+
+/// Save the state a prefill left, so a later request can reuse it.
+///
+/// `caches` are copied and evaluated first, so the entry holds its own buffers
+/// and not a graph over the live caches. `first` is the first decoded token and
+/// its piece; `path` names the prefill that produced the state, for the event.
+fn store_snapshot(
+    model: &Qwen3_5MoeText,
+    prompt_ids: &[u32],
+    kv_quant: KvQuant,
+    caches: (&[KvCache], &[LinearAttnCache]),
+    anchor: Option<Anchor>,
+    first: (u32, &str),
+    path: &'static str,
+) {
+    let (kv_caches, lin_caches) = caches;
+    let (first_id, first_piece) = first;
+    let arch = PROMPT_CACHE.arch_name();
+    let (Some(kvs), Some(lins)) = (
+        crate::prompt_cache::snapshot_clone(arch, kv_caches, KvCache::try_deep_clone),
+        crate::prompt_cache::snapshot_clone(arch, lin_caches, LinearAttnCache::try_deep_clone),
+    ) else {
+        return;
+    };
+    if let Err(e) = kvs
+        .iter()
+        .try_for_each(|c| c.eval_for_spill())
+        .and_then(|()| lins.iter().try_for_each(|c| c.eval_for_spill()))
+    {
+        tracing::warn!(error = %e, path,
+            "qwen3_5moe generate_greedy: pre-eval of KV/lin caches failed, skipping prompt cache store");
+        return;
+    }
+    PROMPT_CACHE.with_inner_mut(|guard| {
+        let Some(cache) = guard.as_mut() else {
+            return;
+        };
+        // Salt the chained walk with the active layout_key. With the tier off
+        // the helper returns 0, which keeps the digests un-salted.
+        let lk = crate::qwen3_5_moe::prompt_cache::active_layout_key();
+        let anchor_pos = anchor.as_ref().map(|a| a.pos);
+        let stored = cache.push(Qwen35MoeEntry {
+            prompt_token_ids: prompt_ids.to_vec(),
+            block_hashes: crate::prompt_cache::chained_block_hashes_seeded(
+                prompt_ids,
+                crate::prompt_cache::request_cache_seed(
+                    lk,
+                    kv_quant,
+                    model.cfg.num_hidden_layers,
+                    crate::qwen3_5_moe::SHARES_KV_ACROSS_LAYERS,
+                    model.model_sig,
+                ),
+            ),
+            kv_caches: kvs,
+            lin_caches: lins,
+            anchor,
+            first_id,
+            first_piece: first_piece.to_owned(),
+            kv_quant: Some(kv_quant),
+            is_ssd_hydrated: false,
+        });
+        if stored.is_some() {
+            tracing::debug!(
+                path,
+                prompt_len = prompt_ids.len(),
+                token_id = first_id,
+                anchor_pos,
+                n_slots = cache.slots.len(),
+                "qwen3_5moe generate_greedy: prompt cache saved snapshot"
+            );
+        }
+    });
 }

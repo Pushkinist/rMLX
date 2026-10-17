@@ -13,8 +13,9 @@
 //! - `impl HydratedEntry for Gemma4Entry`: what an SSD-restored block becomes
 //!   here (pure-attention: the block's `lin_caches` are discarded). The probe
 //!   itself is the blanket `SsdHydrate<E> for SsdHydrator` in `rmlx-kv-ssd`.
-//! - SWA helpers `can_truncate_to_block` / `is_strict_prefix_of` consumed by
-//!   `gemma4/generate.rs`'s `consume()` dispatch (/ B1 snapshot/restore).
+//! - The SWA helper `is_strict_prefix_of` and the trait-default gate
+//!   `can_truncate_to_block`, consumed by `gemma4/generate.rs`'s `consume()`
+//!   dispatch (/ B1 snapshot/restore).
 //!
 //! The per-arch shell (`PROMPT_CACHE` static, ensure/stats wrappers) is
 //! pure delegation to `ArchPromptCache`; SSD attach is invoked directly on the
@@ -72,33 +73,6 @@ pub(crate) struct Gemma4Entry {
 }
 
 impl Gemma4Entry {
-    /// True iff a block-aligned truncation to `block_count` blocks would be
-    /// lossless on EVERY layer cache (mlx-lm `can_trim_prompt_cache`:
-    /// `all(c.is_trimmable())`, `cache.py:88-92`).
-    ///
-    /// Gemma4 has SWA layers backed by a `RotatingKvCache`. A ring that has
-    /// wrapped can only be rolled back while it still holds the window the
-    /// shorter prefix attends over, and a cached prompt long enough to wrap it
-    /// never does over a whole block. `truncate_kv_to_block` would then fail on
-    /// the SWA layers after truncating the full-attention ones, desyncing the
-    /// caches (this was the original broken gemma4 Prefix path: longctx
-    /// 22 -> 0 tokens). When this returns `false` the caller MUST fall back to
-    /// a full re-prefill (Miss).
-    pub(crate) fn can_truncate_to_block(&self, block_count: usize) -> bool {
-        debug_assert!(
-            block_count >= 1,
-            "block_count must be >= 1 for a prefix hit"
-        );
-        let target = (block_count * BLOCK_TOKENS) as i32;
-        // Same population `truncate_kv_to` acts on: a never-filled layer — the
-        // KV-shared tail, whose offset stays 0 — is skipped by the truncation
-        // and must not veto it either.
-        self.kv_caches
-            .iter()
-            .filter(|c| c.offset() > 0)
-            .all(|c| c.can_truncate_to(target))
-    }
-
     /// True iff this entry's full token sequence is a STRICT prefix of
     /// `prompt_ids` (i.e. `prompt_ids` extends the cached prompt by ≥1 token).
     ///

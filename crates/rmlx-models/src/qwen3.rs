@@ -1926,6 +1926,10 @@ pub fn generate_greedy<'a>(
         "Qwen3 prompt cache must be ExactOnly — pure-attention with no GDN recurrent state \
          cannot safely reuse a partial prefix whose residual state is not stored",
     );
+    // Resolved before the lookup, as a cold run does: a reused entry is bound to
+    // this request's ceiling, whatever ceiling it was filled under.
+    let resolved_ctx = crate::context::resolve_context(&model.cfg.context, max_ctx_override)?;
+    let (initial_max_seq, max_seq_ceiling) = (resolved_ctx.initial_max_seq, resolved_ctx.ceiling);
     let consumed = QWEN3_PROMPT_CACHE.consume(
         prompt_ids,
         kv_quant,
@@ -1937,12 +1941,14 @@ pub fn generate_greedy<'a>(
     // Path A: exact cache hit — skip re-prefill, jump straight to decode.
     if let Consumed::Exact(cloned) = consumed {
         let Qwen3Entry {
-            mut kv_caches,
+            kv_caches,
             first_id: last_id,
             first_piece: piece,
             first_logprobs,
             ..
         } = cloned;
+        let mut kv_caches =
+            crate::context::rebind_to_ceiling(kv_caches, max_seq_ceiling, prompt_ids.len())?;
         tracing::debug!(
             prompt_len = prompt_ids.len(),
             token_id = last_id,
@@ -2029,13 +2035,6 @@ pub fn generate_greedy<'a>(
 
     // Path B (Miss): full re-prefill from scratch.
     let prefill_t0 = Instant::now();
-
-    // Derive initial ring size + virtual ceiling: `--max-ctx` is a
-    // ceiling the ring grows lazily up to, not an eager allocation.
-    // `initial_max_seq` is the small lazy start; `max_seq_ceiling` caps growth
-    // and rejects over-long prompts.
-    let resolved_ctx = crate::context::resolve_context(&model.cfg.context, max_ctx_override)?;
-    let (initial_max_seq, max_seq_ceiling) = (resolved_ctx.initial_max_seq, resolved_ctx.ceiling);
 
     // Allocate one KvCache per decoder layer using the selected quant mode.
     // Force K8V8 for boundary layers (first head_n + last tail_n).

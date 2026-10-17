@@ -181,6 +181,16 @@ pub fn generate_greedy<'a>(
     // falls through to Path C (full re-prefill).
     let mut exact_hit: Option<(Vec<KvCache>, u32, String)> = None;
     let mut prefix_hit: Option<(Vec<KvCache>, usize)> = None;
+    // Derive the initial ring size and the virtual ceiling:
+    // `--max-ctx` is a ceiling the ring grows lazily up to, not an eager
+    // allocation. `initial_max_seq` is the small lazy start; `max_seq_ceiling`
+    // caps growth and rejects over-long prompts. It is resolved before the
+    // lookup, as a cold run does, so that a reused prefix, which carries the
+    // ceiling of the request that filled it, is bound to this request's own.
+    let resolved_ctx = crate::context::resolve_context(&model.cfg.context, max_ctx_override)?;
+    let (initial_max_seq, max_seq_ceiling) = (resolved_ctx.initial_max_seq, resolved_ctx.ceiling);
+    let bind =
+        |kv_caches| crate::context::rebind_to_ceiling(kv_caches, max_seq_ceiling, prompt_ids.len());
     match PROMPT_CACHE.consume(
         prompt_ids,
         kv_quant,
@@ -194,7 +204,7 @@ pub fn generate_greedy<'a>(
                 token_id = cloned.first_id,
                 "gemma4 generate_greedy: prompt cache EXACT HIT"
             );
-            exact_hit = Some((cloned.kv_caches, cloned.first_id, cloned.first_piece));
+            exact_hit = Some((bind(cloned.kv_caches)?, cloned.first_id, cloned.first_piece));
         }
         // SWA snapshot/restore: restore the cloned snapshot verbatim at
         // absolute position `prefix_len == cached_len` and tail-forward only
@@ -210,7 +220,7 @@ pub fn generate_greedy<'a>(
                 "gemma4 generate_greedy: prompt cache PREFIX-EXACT HIT \
                  (B1 SWA snapshot/restore — restore + tail-only re-prefill)"
             );
-            prefix_hit = Some((cloned.kv_caches, prefix_len));
+            prefix_hit = Some((bind(cloned.kv_caches)?, prefix_len));
         }
         // Block-aligned partial hit: `prepare_reuse` already trimmed the cloned
         // KV to the block boundary; the tail re-prefills from
@@ -227,17 +237,10 @@ pub fn generate_greedy<'a>(
                 "gemma4 generate_greedy: prompt cache PREFIX HIT \
                  (block-truncate + tail re-prefill)"
             );
-            prefix_hit = Some((cloned.kv_caches, prefix_len));
+            prefix_hit = Some((bind(cloned.kv_caches)?, prefix_len));
         }
         Consumed::Miss(_) => {}
     }
-
-    // Derive the initial ring size and the virtual ceiling:
-    // `--max-ctx` is a ceiling the ring grows lazily up to, not an eager
-    // allocation. `initial_max_seq` is the small lazy start; `max_seq_ceiling`
-    // caps growth and rejects over-long prompts.
-    let resolved_ctx = crate::context::resolve_context(&model.cfg.context, max_ctx_override)?;
-    let (initial_max_seq, max_seq_ceiling) = (resolved_ctx.initial_max_seq, resolved_ctx.ceiling);
 
     // ------------------------------------------------------------------
     // Path A: exact cache hit — skip prefill entirely. The exact-hit funnel

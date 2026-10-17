@@ -5,9 +5,10 @@
     reason = "unit-test scaffolding: a panic is how an assertion failure surfaces"
 )]
 
-use super::{resolve_context, ContextLimits, ContextScaling, ScalingSource};
+use super::{rebind_to_ceiling, resolve_context, ContextLimits, ContextScaling, ScalingSource};
 use rmlx_core::error::Error;
-use rmlx_kv_quant::KV_MAX_SEQ_DEFAULT;
+use rmlx_kv_quant::{KvCache, KvQuant, KV_MAX_SEQ_DEFAULT};
+use rmlx_mlx::{Array, Device};
 
 /// Bonsai-8B's shape: a 65 536 trained window declared as YaRN ×4 over 16 384.
 fn bonsai_limits() -> ContextLimits {
@@ -397,4 +398,140 @@ fn raw_positional_limit_has_no_unlisted_readers() {
          the architecture's config parser and route context bounds through resolve_context \
          instead of clamping to the raw field by hand"
     );
+}
+
+// ── A reused prefix under another request's ceiling ──────────────────────────
+
+/// A cache holding `n` positions, filled under `ceiling`.
+#[allow(
+    clippy::unwrap_used,
+    reason = "unit-test fixture: the CPU update path is infallible on a correctly-shaped array"
+)]
+fn cache_filled_under(ceiling: i32, n: i32) -> KvCache {
+    let data: Vec<f32> = (0..n * 2).map(|i| i as f32).collect();
+    let kv = Array::from_f32_slice(&data, &[1, 1, n, 2]).unwrap();
+    let mut cache = KvCache::with_quant_max_seq(KvQuant::None, 1024).with_max_seq_ceiling(ceiling);
+    cache.update(&kv, &kv, Device::Cpu).unwrap();
+    cache
+}
+
+/// `n` more positions appended, as a resumed tail or a decode step does.
+#[allow(
+    clippy::unwrap_used,
+    reason = "unit-test fixture: the CPU update path is infallible on a correctly-shaped array"
+)]
+fn append(cache: &mut KvCache, n: i32) -> rmlx_core::error::Result<()> {
+    let data: Vec<f32> = (0..n * 2).map(|i| i as f32).collect();
+    let kv = Array::from_f32_slice(&data, &[1, 1, n, 2]).unwrap();
+    cache.update(&kv, &kv, Device::Cpu).map(|_| ())
+}
+
+/// A request under a higher ceiling than the stored one is not held to the stored
+/// one: its tail grows past it, as a cold run under its own ceiling would.
+#[test]
+fn a_reused_prefix_grows_past_the_ceiling_it_was_stored_under() {
+    let mut stored = cache_filled_under(500, 400);
+    assert!(
+        append(&mut stored, 150).is_err(),
+        "control: the stored ceiling refuses 550 positions"
+    );
+
+    let mut rebound = rebind_to_ceiling(vec![cache_filled_under(500, 400)], 4096, 400)
+        .expect("a prompt under the new ceiling");
+    let cache = rebound.first_mut().expect("one cache");
+    assert!(
+        append(cache, 150).is_ok(),
+        "the request's own, higher ceiling lets the tail grow"
+    );
+}
+
+/// A request under a lower ceiling than the stored one is refused when its
+/// prompt is above it, as a cold prefill of that prompt is, and is held to it
+/// when the prompt is under it.
+#[test]
+fn a_reused_prefix_obeys_a_lower_ceiling_than_the_one_it_was_stored_under() {
+    let refused = rebind_to_ceiling(vec![cache_filled_under(4096, 400)], 300, 400);
+    assert!(
+        matches!(
+            refused,
+            Err(Error::KvCeilingExceeded {
+                requested: 400,
+                ceiling: 300
+            })
+        ),
+        "a prompt above the ceiling is refused with the typed ceiling error"
+    );
+
+    let mut rebound = rebind_to_ceiling(vec![cache_filled_under(4096, 400)], 450, 400)
+        .expect("a prompt under the new ceiling");
+    let cache = rebound.first_mut().expect("one cache");
+    assert!(
+        append(cache, 100).is_err(),
+        "the request's own, lower ceiling stops its growth"
+    );
+}
+
+/// A cache of codec `quant` with `max_seq` positions of capacity, filled to `n`
+/// under `ceiling`, optionally a sliding window of `window` positions.
+#[allow(
+    clippy::unwrap_used,
+    reason = "unit-test fixture: the CPU update path is infallible on a correctly-shaped array"
+)]
+fn grown_cache(quant: KvQuant, max_seq: i32, ceiling: i32, n: i32, window: Option<i32>) -> KvCache {
+    let data: Vec<f32> = (0..n * 128).map(|i| (i % 97) as f32).collect();
+    let kv = Array::from_f32_slice(&data, &[1, 1, n, 128]).unwrap();
+    let mut cache =
+        KvCache::with_quant_max_seq_window(quant, max_seq, window).with_max_seq_ceiling(ceiling);
+    cache.update(&kv, &kv, Device::Cpu).unwrap();
+    cache
+}
+
+#[allow(
+    clippy::unwrap_used,
+    reason = "unit-test fixture: the CPU update path is infallible on a correctly-shaped array"
+)]
+fn append_wide(cache: &mut KvCache, n: i32) -> rmlx_core::error::Result<()> {
+    let data: Vec<f32> = (0..n * 128).map(|i| (i % 89) as f32).collect();
+    let kv = Array::from_f32_slice(&data, &[1, 1, n, 128]).unwrap();
+    cache.update(&kv, &kv, Device::Cpu).map(|_| ())
+}
+
+/// The capacity, not only the ceiling, follows the new request: a cache filled to
+/// 400 of a 500-position capacity under a 500 ceiling, rebound to 4096, takes
+/// 200 more positions. Stored under each codec family and as a sliding window.
+#[test]
+fn a_rebound_cache_grows_its_capacity_past_the_stored_ceiling() {
+    for (label, quant, window) in [
+        ("none", KvQuant::None, None),
+        ("k8v8", KvQuant::K8V8, None),
+        ("none window", KvQuant::None, Some(128)),
+    ] {
+        let mut stored = grown_cache(quant, 500, 500, 400, window);
+        let stored_refuses = append_wide(&mut stored, 200).is_err();
+        assert!(
+            window.is_some() || stored_refuses,
+            "{label}: control: the stored ceiling refuses 600 positions"
+        );
+
+        let mut rebound =
+            rebind_to_ceiling(vec![grown_cache(quant, 500, 500, 400, window)], 4096, 400)
+                .expect("a prompt under the new ceiling");
+        let cache = rebound.first_mut().expect("one cache");
+        assert_eq!(
+            cache.offset(),
+            400,
+            "{label}: rebinding leaves the content alone"
+        );
+        assert!(
+            append_wide(cache, 200).is_ok(),
+            "{label}: the request's higher ceiling lets the capacity grow past 500"
+        );
+        assert_eq!(cache.offset(), 600, "{label}");
+        // A window holds `window` positions however long the sequence runs.
+        assert!(
+            window.is_some() || cache.max_seq() >= 600,
+            "{label}: capacity {} must cover the 600 positions held",
+            cache.max_seq()
+        );
+    }
 }
