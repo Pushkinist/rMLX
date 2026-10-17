@@ -1206,12 +1206,9 @@ tags = ["run2d", "gemma4", "swa"]
 # must FIRE (accept_rate > 0 in the round-loop's jsonl summary) AND the
 # output must stay coherent.
 #
-# `scrape_spec_accept` matches a `_generate: done` suffix. The two two-model
-# rows below never emit that suffix (their event ends `_cached: done`), so
-# `scrape_spec_accept` returns `Err`. `assert_spec_decode` maps that `Err` to
-# `Verdict::Fail` (`runner.rs:2752-2755`). These two rows therefore always
-# FAIL: on coherence when the output is wrong, and on the `Err` mapping
-# otherwise. They can never PASS.
+# `scrape_spec_accept` reads each loop's `: done` summary line, the two-model
+# loops included. A two-model row fails only on a real defect: no summary
+# line, a zero accept rate, or incoherent output.
 #
 # Verifier = Qwen3.6-35B-A3B-8bit (alias
 # QWEN36). Drafters carry their snapshot slug directly in `draft_model` (resolved

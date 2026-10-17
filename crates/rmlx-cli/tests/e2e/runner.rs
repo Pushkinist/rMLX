@@ -974,7 +974,7 @@ fn run_serve_case(
 
     // Speculative decoding owns a verbose-logging serve with the drafter flags
     // (`--draft-model`/`--draft-kind`) so it can scrape the round-loop's
-    // `<kind>_generate: done` accept_rate from the run jsonl. Hand off
+    // summary line's accept_rate from the run jsonl. Hand off
     // before the shared spawn (which pins no draft model and RUST_LOG=warn).
     if kind == "spec_decode" {
         return assert_spec_decode(case, model, &id, port, mk);
@@ -2636,7 +2636,7 @@ fn assert_tool_call(
 /// Serves the verifier (`model`) with a real drafter (`--draft-model` resolved
 /// from `case.draft_model`, `--draft-kind` from `case.draft_kind`) under verbose
 /// logging, drives one generation, and scrapes the round-loop summary
-/// (`<kind>_generate: done`) from the run jsonl. PASS = the round-loop
+/// (its `: done` line) from the run jsonl. PASS = the round-loop
 /// fired with `accept_rate > 0` AND the output is coherent (mentions the
 /// expected token in `content` or, for a thinking model, `reasoning_content`).
 /// Proves the drafter actually proposes accepted tokens end-to-end, not just
@@ -2758,11 +2758,9 @@ fn assert_spec_decode(
 
 /// Scrape the speculative round-loop summary from the newest run jsonl under
 /// `<home>/logs/`. Returns the LAST summary's `(accept_rate, rounds)`.
-/// Matches `fields.message.ends_with("_generate: done")`, then reads
-/// `fields.accept_rate` and `fields.rounds`. The engine's own contract is
-/// only that the message ends `: done` (`round_stats.rs::done_event`); this
-/// narrower suffix misses both two-model loops, whose event ends
-/// `"_cached: done"`.
+/// A summary is a `: done` line that carries `loop_kind` and a numeric
+/// `accept_rate`. Every loop's closing line has both (`round_stats.rs::log_done`);
+/// no per-round or accounting line has both.
 fn scrape_spec_accept(home: &std::path::Path) -> Result<(f64, u64), String> {
     let logs = home.join("logs");
     let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
@@ -2790,13 +2788,16 @@ fn scrape_spec_accept(home: &std::path::Path) -> Result<(f64, u64), String> {
         };
         let fields = &v["fields"];
         let msg = fields["message"].as_str().unwrap_or_default();
-        if msg.ends_with("_generate: done") {
+        let is_summary = msg.ends_with(": done")
+            && fields.get("loop_kind").is_some()
+            && fields["accept_rate"].is_number();
+        if is_summary {
             let ar = fields["accept_rate"].as_f64().unwrap_or(-1.0);
             let rounds = fields["rounds"].as_u64().unwrap_or(0);
             found = Some((ar, rounds));
         }
     }
-    found.ok_or_else(|| "no `<kind>_generate: done` summary line".to_owned())
+    found.ok_or_else(|| "no round-loop summary line (`: done` with `loop_kind`)".to_owned())
 }
 
 /// **REAL** arch-guard refusal proof (`serve_refused`).
@@ -2941,3 +2942,7 @@ fn trunc(s: &str) -> String {
 pub fn report_dir() -> PathBuf {
     e2e_home().join("e2e")
 }
+
+#[cfg(test)]
+#[path = "runner_tests.rs"]
+mod runner_tests;
