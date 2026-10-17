@@ -281,6 +281,7 @@ fn serve_refuses_an_eagle3_drafter_with_hot_ids_over_a_pack_at_startup() {
         std::fs::create_dir_all(&draft).unwrap();
         let config = serde_json::json!({
             "architectures": ["LlamaForCausalLMEagle3"],
+            "hidden_size": 16,
             "draft_vocab_size": draft_vocab, "vocab_size": 8
         });
         std::fs::write(draft.join("config.json"), config.to_string()).unwrap();
