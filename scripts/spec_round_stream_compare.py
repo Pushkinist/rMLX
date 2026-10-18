@@ -101,7 +101,7 @@ PROMPTS = (
     "virtual-memory",
 )
 EXPECTED_CELLS = {f"{p}.{q}.stable.jsonl" for p in PAIRS for q in PROMPTS}
-TOTAL_ROUNDS = 3927
+TOTAL_ROUNDS = 3843
 
 # What every round event carries.
 # Mirrors `ROUND_EVENT_FIELDS` in `crates/rmlx-models/tests/common/round_stream.rs`,
