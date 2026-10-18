@@ -1,4 +1,5 @@
 use super::*;
+use crate::prompt_cache::entry_is_storable;
 
 fn capture(target: Option<usize>) -> AnchorCapture {
     AnchorCapture::new(target, KvCache::eval_prefill_state)

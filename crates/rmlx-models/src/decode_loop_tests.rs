@@ -62,7 +62,7 @@ fn id_of(a: &Array) -> u32 {
 /// vocab map to `ahash::AHashMap`, which is not a direct dependency of this
 /// crate. The JSON path is behaviour-identical and dependency-free.
 #[allow(clippy::expect_used)]
-fn tiny_tokenizer(n: u32) -> Tokenizer {
+pub(crate) fn tiny_tokenizer(n: u32) -> Tokenizer {
     let mut vocab = String::from("{");
     for i in 0..n {
         if i > 0 {
@@ -684,8 +684,8 @@ const ARCH_GENERATE_SOURCES: &[(&str, &str)] = &[
 /// every emitted step carries one. Those need a live decode;
 /// `pipelined_decode_lp_k_captures` above covers the shared loop on CPU, and an
 /// arch driving its own loop is only covered against this structural floor.
-/// Exact-cache-hit replays legitimately emit `None` — the hit skips the prefill
-/// that would have produced the logits.
+/// An exact prompt-cache hit replays its first token from the entry; that record
+/// is held by `every_entry_type_stores_and_replays_its_first_logprobs`.
 #[test]
 fn every_arch_generate_path_honours_top_logprobs_k() {
     for (arch, src) in ARCH_GENERATE_SOURCES {
@@ -700,6 +700,54 @@ fn every_arch_generate_path_honours_top_logprobs_k() {
              stays None however large top_logprobs_k is"
         );
     }
+}
+
+/// A `[1]` I32 Array holding one chosen token id.
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: a one-element I32 array always builds"
+)]
+fn chosen(id: i32) -> Array {
+    Array::from_bytes(&id.to_le_bytes(), &[1], Dtype::I32).unwrap()
+}
+
+/// The first-token record a cache entry stores is captured at the OpenAI
+/// ceiling and replayed cut to the replaying request, whatever width the
+/// storing request used.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    reason = "test assertions: the capture of a 32-wide row yields a record, and its 20 entries are indexed"
+)]
+fn first_logprobs_are_stored_at_the_ceiling_and_replayed_cut_to_the_request() {
+    let _g = mlx_guard();
+    let row: Vec<f32> = (0..32u16).map(|i| f32::from(i) * 0.25).collect();
+    let stored = capture_first_logprobs(&logits(&row), &chosen(31)).unwrap();
+    assert_eq!(stored.token_id, 31);
+    assert_eq!(stored.top.len(), 20);
+
+    let cut = replay_first_logprobs(Some(stored.clone()), 3).unwrap();
+    assert_eq!(cut.token_id, stored.token_id);
+    assert_eq!(cut.token_logprob, stored.token_logprob);
+    assert_eq!(cut.top, stored.top[..3]);
+
+    let wide = replay_first_logprobs(Some(stored.clone()), 25).unwrap();
+    assert_eq!(wide.top, stored.top, "a replay never widens the record");
+}
+
+/// A request that asked for no logprobs replays none, and an entry without a
+/// record (SSD-hydrated) replays none whatever was asked.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test assertion: capturing a 4-wide row yields a record"
+)]
+fn first_logprobs_replay_is_none_when_off_or_not_stored() {
+    let _g = mlx_guard();
+    let stored = capture_first_logprobs(&logits(&[0.0, 1.0, 2.0, 3.0]), &chosen(3)).unwrap();
+    assert!(replay_first_logprobs(Some(stored), 0).is_none());
+    assert!(replay_first_logprobs(None, 3).is_none());
 }
 
 /// The host-selection paths (temperature, penalties) hoist the logits eval out
@@ -1412,3 +1460,6 @@ use crate::stop_scan::code_of;
 
 #[path = "decode_stop_tests.rs"]
 mod decode_stop_tests;
+
+#[path = "first_logprobs_wiring_tests.rs"]
+mod first_logprobs_wiring_tests;

@@ -41,6 +41,7 @@ use rmlx_core::error::{Error, Result};
 use crate::prompt_cache::{
     Anchor, ArchPromptCache, CacheStats, PromptCacheEntry, ReuseKind, ReusePolicy, BLOCK_TOKENS,
 };
+use crate::sampler::TokenLogprobs;
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 use rmlx_kv_ssd::{HydratedBlock, HydratedEntry};
 
@@ -68,6 +69,9 @@ pub(crate) struct Qwen35MoeEntry {
     pub(crate) first_id: u32,
     /// Decoded piece for `first_id`.
     pub(crate) first_piece: String,
+    /// Logprobs of `first_id`, replayed on an exact hit. `None` on an entry
+    /// restored from the SSD tier.
+    pub(crate) first_logprobs: Option<TokenLogprobs>,
     /// Runtime `KvQuant` discriminant in effect when this snapshot was written.
     pub(crate) kv_quant: Option<KvQuant>,
     /// True when this entry was reconstructed from the SSD tier and therefore
@@ -109,6 +113,7 @@ impl PromptCacheEntry for Qwen35MoeEntry {
                 .transpose()?,
             first_id: self.first_id,
             first_piece: self.first_piece.clone(),
+            first_logprobs: self.first_logprobs.clone(),
             kv_quant: self.kv_quant,
             is_ssd_hydrated: self.is_ssd_hydrated,
         })
@@ -228,6 +233,7 @@ impl HydratedEntry for Qwen35MoeEntry {
             anchor: None,
             first_id: 0,
             first_piece: String::new(),
+            first_logprobs: None,
             kv_quant: Some(kv_quant),
             // Block-aligned prefix only; see `Qwen35MoeEntry::is_ssd_hydrated`.
             is_ssd_hydrated: true,

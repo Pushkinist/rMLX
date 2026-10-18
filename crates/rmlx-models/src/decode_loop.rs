@@ -322,6 +322,29 @@ pub(crate) fn capture_logprobs(
     compute_top_logprobs(logits_flat, chosen_id, k).ok()
 }
 
+/// Width at which a prompt-cache entry stores its first token's logprobs: the
+/// OpenAI `top_logprobs` ceiling, so any later request can replay them whatever
+/// width the storing request asked for.
+const PROMPT_CACHE_LOGPROBS_K: usize = 20;
+
+/// Logprobs for the first token of a prompt, in the form a cache entry stores.
+pub(crate) fn capture_first_logprobs(logits_flat: &Array, chosen: &Array) -> Option<TokenLogprobs> {
+    capture_logprobs(logits_flat, chosen, PROMPT_CACHE_LOGPROBS_K)
+}
+
+/// The stored first-token logprobs of an exact prompt-cache hit, cut to the
+/// replaying request's `top_logprobs_k`. `None` when that request asked for
+/// none, so the disabled path stays free of logprob work.
+pub(crate) fn replay_first_logprobs(
+    stored: Option<TokenLogprobs>,
+    top_logprobs_k: u32,
+) -> Option<TokenLogprobs> {
+    let k = top_logprobs_k as usize;
+    let mut lp = stored.filter(|_| k > 0)?;
+    lp.top.truncate(k);
+    Some(lp)
+}
+
 /// Choose the next token with the request's sampler, under the optional
 /// constraint mask. Returns the chosen-token Array (possibly still lazy).
 ///
@@ -980,4 +1003,4 @@ pub(crate) fn chunked_prefill(
 
 #[cfg(test)]
 #[path = "decode_loop_tests.rs"]
-mod decode_loop_tests;
+pub(crate) mod decode_loop_tests;

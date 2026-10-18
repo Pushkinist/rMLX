@@ -68,6 +68,7 @@ fn entry_of(ids: Vec<u32>, anchor_pos: Option<usize>, kv_caches: Vec<KvCache>) -
         }),
         first_id: 7,
         first_piece: String::new(),
+        first_logprobs: None,
         kv_quant: Some(TEST_QUANT),
         is_ssd_hydrated: false,
     }

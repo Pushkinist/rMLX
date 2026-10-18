@@ -26,16 +26,17 @@ use rmlx_runtime::{count_nan_in_bytes, max_abs_from_bytes};
 
 use crate::constraint::ConstraintEngine;
 use crate::decode_loop::{
-    capture_logprobs, choose_token, chunked_prefill, pipelined_decode, reject_nan_prefill,
-    DecodeCtx,
+    capture_first_logprobs, capture_logprobs, choose_token, chunked_prefill, pipelined_decode,
+    reject_nan_prefill, replay_first_logprobs, DecodeCtx,
 };
 use crate::kv_cache::{kv_layer_quants, warn_if_kv_codec_net_negative, KvLayerShape};
+use crate::sampler::TokenLogprobs;
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
-use super::anchor_capture::{anchor_target, entry_is_storable, AnchorCapture};
+use super::anchor_capture::{anchor_target, AnchorCapture};
 use super::model::Qwen3_5MoeText;
 use super::prompt_cache::{ensure_prompt_cache, Qwen35MoeEntry, PROMPT_CACHE};
-use crate::prompt_cache::{Anchor, Consumed, ReuseKind, BLOCK_TOKENS};
+use crate::prompt_cache::{entry_is_storable, Anchor, Consumed, ReuseKind, BLOCK_TOKENS};
 
 /// Greedy autoregressive generation using KV-cache prefill + decode.
 ///
@@ -137,16 +138,17 @@ pub fn generate_greedy<'a>(
     // `exact_hit` carries the Path-A locals; `resumed` carries the Path-B
     // tail-forward locals. `Consumed::Miss` leaves both `None` and falls
     // through to Path C (full re-prefill).
-    let mut exact_hit: Option<(Vec<KvCache>, Vec<LinearAttnCache>, u32, String)> = None;
+    let mut exact_hit: Option<ExactHit> = None;
     let mut resumed: Option<Resumed> = None;
     match consumed {
         Consumed::Exact(cloned) => {
-            exact_hit = Some((
-                bind(cloned.kv_caches)?,
-                cloned.lin_caches,
-                cloned.first_id,
-                cloned.first_piece,
-            ));
+            exact_hit = Some(ExactHit {
+                kv_caches: bind(cloned.kv_caches)?,
+                lin_caches: cloned.lin_caches,
+                first_id: cloned.first_id,
+                first_piece: cloned.first_piece,
+                first_logprobs: cloned.first_logprobs,
+            });
         }
         Consumed::Reuse {
             entry: cloned,
@@ -170,7 +172,14 @@ pub fn generate_greedy<'a>(
     }
 
     // Path A: exact match
-    if let Some((mut kv_caches, mut lin_caches, last_id, piece)) = exact_hit {
+    if let Some(ExactHit {
+        mut kv_caches,
+        mut lin_caches,
+        first_id: last_id,
+        first_piece: piece,
+        first_logprobs,
+    }) = exact_hit
+    {
         tracing::debug!(
             prompt_len = prompt_ids.len(),
             token_id = last_id,
@@ -187,7 +196,7 @@ pub fn generate_greedy<'a>(
                 piece: piece.into_boxed_str(),
                 max_abs_logit: 0.0,
                 nan_count: 0,
-                logprobs: None,
+                logprobs: replay_first_logprobs(first_logprobs, sampler_cfg.top_logprobs_k),
             },
         );
         if ends {
@@ -395,13 +404,16 @@ pub fn generate_greedy<'a>(
 
         // Save the completed full-length snapshot (prefix + tail) so future
         // requests can serve this prompt as an Exact hit from RAM.
+        let first_logprobs = storable
+            .then(|| capture_first_logprobs(&logits_flat, &top))
+            .flatten();
         store_snapshot(
             model,
             prompt_ids,
             kv_quant,
             (&kv_caches, &lin_caches),
             anchor_capture.into_anchor().or(inherited_anchor),
-            (last_id, &piece),
+            (last_id, &piece, first_logprobs),
             "resume",
         );
 
@@ -585,13 +597,16 @@ pub fn generate_greedy<'a>(
         "qwen3_5moe generate_greedy prefill (fast path)"
     );
 
+    let first_logprobs = storable
+        .then(|| capture_first_logprobs(&logits_flat, &top))
+        .flatten();
     store_snapshot(
         model,
         prompt_ids,
         kv_quant,
         (&kv_caches, &lin_caches),
         anchor_capture.into_anchor(),
-        (last_id, &piece),
+        (last_id, &piece, first_logprobs),
         "miss",
     );
 
@@ -659,6 +674,16 @@ pub fn generate_greedy<'a>(
     Ok(steps)
 }
 
+/// What an exact prompt-cache hit hands the decode path: the saved caches and
+/// the first token with its logprobs.
+struct ExactHit {
+    kv_caches: Vec<KvCache>,
+    lin_caches: Vec<LinearAttnCache>,
+    first_id: u32,
+    first_piece: String,
+    first_logprobs: Option<TokenLogprobs>,
+}
+
 /// What a prompt-cache reuse hands the tail path: caches that hold a prefix of
 /// the request's prompt, and the anchor the stored entry carried.
 struct Resumed {
@@ -673,19 +698,20 @@ struct Resumed {
 /// Save the state a prefill left, so a later request can reuse it.
 ///
 /// `caches` are copied and evaluated first, so the entry holds its own buffers
-/// and not a graph over the live caches. `first` is the first decoded token and
-/// its piece; `path` names the prefill that produced the state, for the event.
+/// and not a graph over the live caches. `first` is the first decoded token, its
+/// piece and its logprobs; `path` names the prefill that produced the state, for
+/// the event.
 fn store_snapshot(
     model: &Qwen3_5MoeText,
     prompt_ids: &[u32],
     kv_quant: KvQuant,
     caches: (&[KvCache], &[LinearAttnCache]),
     anchor: Option<Anchor>,
-    first: (u32, &str),
+    first: (u32, &str, Option<TokenLogprobs>),
     path: &'static str,
 ) {
     let (kv_caches, lin_caches) = caches;
-    let (first_id, first_piece) = first;
+    let (first_id, first_piece, first_logprobs) = first;
     let arch = PROMPT_CACHE.arch_name();
     let (Some(kvs), Some(lins)) = (
         crate::prompt_cache::snapshot_clone(arch, kv_caches, KvCache::try_deep_clone),
@@ -727,6 +753,7 @@ fn store_snapshot(
             anchor,
             first_id,
             first_piece: first_piece.to_owned(),
+            first_logprobs,
             kv_quant: Some(kv_quant),
             is_ssd_hydrated: false,
         });

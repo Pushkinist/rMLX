@@ -67,36 +67,19 @@ use tracing::{debug, info};
 use crate::calibration_sink::CalibrationSink;
 use crate::constraint::ConstraintEngine;
 use crate::decode_loop::{
-    capture_logprobs, choose_token, chunked_prefill, pipelined_decode, reject_nan_prefill,
-    DecodeCtx,
+    capture_first_logprobs, capture_logprobs, choose_token, chunked_prefill, pipelined_decode,
+    reject_nan_prefill, replay_first_logprobs, DecodeCtx,
 };
 use crate::kv_cache::{kv_layer_quants, warn_if_kv_codec_net_negative, KvLayerShape};
 use crate::layers::{resolve_quant, QuantParams};
 use crate::load_util::{bf16_param, bf16_scales, Weights};
 use crate::prompt_cache::{
-    chained_block_hashes_seeded, ArchPromptCache, Consumed, PromptCacheEntry, ReusePolicy,
+    chained_block_hashes_seeded, entry_is_storable, ArchPromptCache, Consumed, PromptCacheEntry,
+    ReusePolicy,
 };
 use crate::sampler::TokenLogprobs;
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 use rmlx_kv_ssd::{HydratedBlock, HydratedEntry};
-
-/// OpenAI `top_logprobs` ceiling (`0..=20`, enforced server-side). The
-/// prompt-cache entry captures the first-token logprobs at this width so any
-/// later exact-hit can replay them truncated to that request's `top_logprobs_k`
-/// — independent of the storing request's `top_logprobs_k` (which may be 0).
-const PROMPT_CACHE_LOGPROBS_K: usize = 20;
-
-/// Truncate a stored [`TokenLogprobs`] to the first `k` `top` entries.
-///
-/// `top` is already sorted descending by logprob (see `compute_top_logprobs`),
-/// so the first `k` are the request's top-`k` alternatives. `token_id` and
-/// `token_logprob` are width-independent and pass through unchanged.
-fn truncate_logprobs_top(mut lp: TokenLogprobs, k: usize) -> TokenLogprobs {
-    if lp.top.len() > k {
-        lp.top.truncate(k);
-    }
-    lp
-}
 
 // ---------------------------------------------------------------------------
 // Prompt cache — Qwen3 entry type + global
@@ -1954,19 +1937,6 @@ pub fn generate_greedy<'a>(
             token_id = last_id,
             "qwen3 generate_greedy: prompt cache EXACT HIT"
         );
-        // The cached first token was produced by a prior request's
-        // prefill, but its raw-logit top-k logprobs were captured and stored
-        // alongside `first_id` at store time. Replay the same true logprob the
-        // Miss path emits, truncated to this request's `top_logprobs_k`. The
-        // gate keeps the disabled path (`lp_k == 0`) emitting `None` so the
-        // zero-overhead decode stays byte-identical. This guarantees exactly
-        // one `logprobs.content` entry per emitted token on both cache paths.
-        let lp_k = sampler_cfg.top_logprobs_k as usize;
-        let first_lp = if lp_k > 0 {
-            first_logprobs.map(|lp| truncate_logprobs_top(lp, lp_k))
-        } else {
-            None
-        };
         let ends = crate::decode_loop::emit_replayed_token(
             &mut constraint,
             step_fn,
@@ -1978,7 +1948,7 @@ pub fn generate_greedy<'a>(
                 piece: piece.into_boxed_str(),
                 max_abs_logit: 0.0,
                 nan_count: 0,
-                logprobs: first_lp,
+                logprobs: replay_first_logprobs(first_logprobs, sampler_cfg.top_logprobs_k),
             },
         );
         if ends {
@@ -2180,7 +2150,7 @@ pub fn generate_greedy<'a>(
     // snapshot, before the decode loop allocates its ring, so a sample here
     // would omit the ring on ring-backed codecs. It is recorded post-decode
     // below, gated by the `PostDecode` witness.
-    {
+    if entry_is_storable(prompt_cache_slots, rmlx_kv_quant::paged::paged_kv_enabled()) {
         if let Some(kv_snapshot) = crate::prompt_cache::snapshot_clone(
             QWEN3_PROMPT_CACHE.arch_name(),
             &caches,
@@ -2206,14 +2176,7 @@ pub fn generate_greedy<'a>(
                             model.model_sig,
                         ),
                     );
-                    // Capture the first-token logprobs at the OpenAI ceiling so
-                    // a later exact-hit replays a true logprob (truncated to its own
-                    // `top_logprobs_k`) regardless of whether THIS request asked for
-                    // logprobs. `logits_flat` is already host-evaluated above; this is
-                    // one extra host log-softmax + top-k per cache store (per unique
-                    // prompt), not per token.
-                    let first_logprobs =
-                        capture_logprobs(&logits_flat, &top, PROMPT_CACHE_LOGPROBS_K);
+                    let first_logprobs = capture_first_logprobs(&logits_flat, &top);
                     let entry = Qwen3Entry {
                         prompt_token_ids: prompt_ids.to_vec(),
                         block_hashes,

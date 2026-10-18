@@ -9,7 +9,8 @@
 //! - `Qwen3VlMoeEntry`: `Vec<KvCache>` only. The Qwen3-VL text decoder is a
 //!   plain GQA stack — the MoE is in the FFN and never touches the KV cache, so
 //!   the entry is the same pure-attention shape as Qwen2 / Qwen3 dense (no
-//!   GatedDeltaNet `lin_caches`, no qwen3-only `first_logprobs`).
+//!   GatedDeltaNet `lin_caches`, no `first_logprobs`; see `docs/PROMPT_CACHE.md`
+//!   § "First-token logprob on Exact hit").
 //! - `impl PromptCacheEntry for Qwen3VlMoeEntry`: deep_clone + KV accessors. All
 //!   three reuse hooks (`is_hydrate_complete`, `is_reusable_prefix_of`,
 //!   `prepare_reuse`) take the trait defaults, which give correct

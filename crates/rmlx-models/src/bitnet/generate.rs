@@ -19,9 +19,11 @@ use rmlx_runtime::{count_nan_in_bytes, max_abs_from_bytes};
 use tracing::info;
 
 use crate::constraint::ConstraintEngine;
-use crate::decode_loop::{capture_logprobs, reject_nan_prefill};
+use crate::decode_loop::{
+    capture_first_logprobs, capture_logprobs, reject_nan_prefill, replay_first_logprobs,
+};
 use crate::kv_cache::kv_layer_quants;
-use crate::prompt_cache::{chained_block_hashes_seeded, Consumed, ReusePolicy};
+use crate::prompt_cache::{chained_block_hashes_seeded, entry_is_storable, Consumed, ReusePolicy};
 use crate::sampler::apply_mask_argmax;
 use rmlx_kv_quant::{KvCache, KV_MAX_SEQ_DEFAULT};
 
@@ -126,6 +128,7 @@ pub fn generate_greedy(
             kv_caches: mut caches,
             first_id: last_id,
             first_piece: piece,
+            first_logprobs,
             ..
         } = cloned;
         tracing::debug!(
@@ -133,10 +136,6 @@ pub fn generate_greedy(
             token_id = last_id,
             "bitnet generate_greedy: prompt cache EXACT HIT"
         );
-        // No logprobs on the replayed token: the exact hit skips the prefill that
-        // produced its logits, and the cache entry stores the id and piece only.
-        // Decode steps below still carry them. Same shape as the other
-        // exact-hit paths that do not persist a logprob payload.
         let ends = crate::decode_loop::emit_replayed_token(
             &mut constraint,
             step_fn,
@@ -148,7 +147,7 @@ pub fn generate_greedy(
                 piece: piece.into_boxed_str(),
                 max_abs_logit: 0.0,
                 nan_count: 0,
-                logprobs: None,
+                logprobs: replay_first_logprobs(first_logprobs, sampler_cfg.top_logprobs_k),
             },
         );
         if ends {
@@ -391,7 +390,7 @@ pub fn generate_greedy(
     //
     // `kv_cache_bytes` is NOT sampled here — this is the prefill snapshot,
     // before the decode ring is allocated. It is recorded post-decode below.
-    {
+    if entry_is_storable(prompt_cache_slots, rmlx_kv_quant::paged::paged_kv_enabled()) {
         if let Some(kv_snapshot) = crate::prompt_cache::snapshot_clone(
             PROMPT_CACHE.arch_name(),
             &caches,
@@ -421,6 +420,7 @@ pub fn generate_greedy(
                         // Last use of `piece` — move it (the prefill ProbeStep
                         // above already consumed its own clone via into_boxed_str).
                         first_piece: piece,
+                        first_logprobs: capture_first_logprobs(&logits_flat, &top),
                         kv_quant: Some(kv_quant),
                         is_ssd_hydrated: false,
                     };

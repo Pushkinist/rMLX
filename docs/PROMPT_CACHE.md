@@ -141,26 +141,26 @@ Each architecture owns one process-global `static` of type
 
 Every entry holds the full prompt token ids, the chained block digests, the
 post-prefill `kv_caches`, the first decode token, and the `KvQuant` in effect
-when the snapshot was taken.
+when the snapshot was taken. Every arch that emits logprobs also holds
+`first_logprobs`, the first token's record.
 
 - **`Qwen35MoeEntry`** also holds `lin_caches`, the GatedDeltaNet recurrent
   states, and an `anchor`: a second set of them, saved inside the prompt (see
   "Qwen3.5 resume and the anchor"). A recurrent state is never truncated, since
   it has no sequence axis; the entry resumes from one it holds.
-- **`Qwen3Entry`** also holds `first_logprobs`.
 
 **First-token logprob on Exact hit.** An Exact hit replays the cached first
 token without recomputing the prefix's last-position logits. To keep the
-OpenAI contract of one `logprobs.content` entry per emitted token,
-`Qwen3Entry` stores the first token's top `PROMPT_CACHE_LOGPROBS_K` (20)
-logprobs at store time, whatever the storing request asked for. A
-hit replays the record truncated to the replaying request's `top_logprobs`, so
-it emits the same `token_logprob` a Miss would. With logprobs off it emits
-`None`. An SSD-hydrated entry stores placeholder id 0 as its first token and
-has no `first_logprobs`.
-
-On Gemma4, Gemma3, Qwen3.5-MoE and BitNet an Exact hit emits no logprob for
-the replayed token, while a Miss emits the prefill logprobs.
+OpenAI contract of one `logprobs.content` entry per emitted token, the entry
+stores the first token's top 20 logprobs when the snapshot is saved, whatever
+the storing request asked for (`capture_first_logprobs` in `decode_loop.rs`).
+A hit replays the record truncated to the replaying request's `top_logprobs`
+(`replay_first_logprobs`), so it emits the same `token_logprob` a Miss would.
+With logprobs off it emits `None`. On Qwen3.5 the resume path stores the record
+too. An SSD-hydrated entry stores placeholder id 0 as its first token and has no
+`first_logprobs`; it is never an Exact hit, so a repeat of its prompt prefills
+again and emits its logprobs as a Miss does. The Laguna, Qwen2 and Qwen3-VL-MoE
+entries hold no `first_logprobs`: those arches emit no logprobs on any path.
 
 ### `PromptCacheEntry` trait contract
 

@@ -230,6 +230,7 @@ fn push_hydrated_prefix(
                 anchor: None,
                 first_id: 0,
                 first_piece: String::new(),
+                first_logprobs: None,
                 kv_quant: Some(kv_quant),
                 is_ssd_hydrated: true,
             });
@@ -420,6 +421,7 @@ fn moe_entry(prompt_token_ids: Vec<u32>) -> Qwen35MoeEntry {
         anchor: None,
         first_id: 0,
         first_piece: String::new(),
+        first_logprobs: None,
         kv_quant: Some(rmlx_kv_quant::KvQuant::K8V8),
         is_ssd_hydrated: false,
     }
@@ -2797,6 +2799,7 @@ fn hydrated_exact_block_no_tail_not_placeholder() {
                 // Placeholder values — exactly what HydratedEntry::from_hydrated emits.
                 first_id: 0,
                 first_piece: String::new(),
+                first_logprobs: None,
                 kv_quant: Some(kv_quant),
                 // KEY: is_ssd_hydrated=true on a full-length entry (no tail).
                 // Before the fix, Exact arm fires → emits first_id=0.
@@ -3064,6 +3067,7 @@ fn hydrated_tail_k8v8_equivalence() {
                 anchor: None,
                 first_id: 0,
                 first_piece: String::new(),
+                first_logprobs: None,
                 kv_quant: Some(kv_quant),
                 is_ssd_hydrated: true,
             });
@@ -3344,6 +3348,7 @@ fn qwen3_5_moe_consume_engine_migration_golden() {
                     anchor: None,
                     first_id,
                     first_piece: String::new(),
+                    first_logprobs: None,
                     kv_quant: Some(kv_quant),
                     is_ssd_hydrated: hydrated,
                 });

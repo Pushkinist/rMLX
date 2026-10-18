@@ -35,6 +35,7 @@ use rmlx_core::error::Result;
 use crate::prompt_cache::{
     ArchPromptCache, CacheStats, PromptCacheEntry, ReuseKind, ReusePolicy, BLOCK_TOKENS,
 };
+use crate::sampler::TokenLogprobs;
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 use rmlx_kv_ssd::{HydratedBlock, HydratedEntry};
 
@@ -55,6 +56,9 @@ pub(crate) struct Gemma4Entry {
     pub(crate) first_id: u32,
     /// Decoded piece for `first_id`.
     pub(crate) first_piece: String,
+    /// Logprobs of `first_id`, replayed on an exact hit. `None` on an entry
+    /// restored from the SSD tier.
+    pub(crate) first_logprobs: Option<TokenLogprobs>,
     /// Runtime `KvQuant` discriminant in effect when this snapshot was
     /// written. A lookup evicts a slot whose stored codec differs from the
     /// runtime one. `None` means the codec is unknown: the SSD spill skips
@@ -142,6 +146,7 @@ impl PromptCacheEntry for Gemma4Entry {
             kv_caches: kv_caches?,
             first_id: self.first_id,
             first_piece: self.first_piece.clone(),
+            first_logprobs: self.first_logprobs.clone(),
             kv_quant: self.kv_quant,
             is_ssd_hydrated: self.is_ssd_hydrated,
         })
@@ -294,6 +299,7 @@ impl HydratedEntry for Gemma4Entry {
             kv_caches,
             first_id: 0,
             first_piece: String::new(),
+            first_logprobs: None,
             kv_quant: Some(kv_quant),
             // Block-aligned prefix only; the placeholder first_id must not be
             // replayed — the generate loop re-prefills to recompute it.

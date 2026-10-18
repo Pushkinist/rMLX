@@ -8,7 +8,8 @@
 //!
 //! - `Qwen2Entry`: `Vec<KvCache>` only (pure-attention dense arch, no
 //!   GatedDeltaNet / linear-attention recurrent state — the entry is the same
-//!   shape as Qwen3 dense minus the qwen3-only `first_logprobs`).
+//!   shape as Qwen3 dense, without `first_logprobs`; see `docs/PROMPT_CACHE.md`
+//!   § "First-token logprob on Exact hit").
 //! - `impl PromptCacheEntry for Qwen2Entry`: deep_clone + KV accessors. All
 //!   three reuse hooks (`is_hydrate_complete`, `is_reusable_prefix_of`,
 //!   `prepare_reuse`) take the trait defaults, which give correct
@@ -45,8 +46,8 @@ use rmlx_kv_ssd::{HydratedBlock, HydratedEntry};
 /// Post-prefill snapshot for one Qwen2 request.
 ///
 /// Pure-attention dense arch: only `kv_caches` needs snapshotting (no GDN
-/// recurrent state). Same shape as `Qwen3Entry` minus the qwen3-only
-/// `first_logprobs`.
+/// recurrent state). Same shape as `Qwen3Entry`, without `first_logprobs`; see
+/// `docs/PROMPT_CACHE.md` § "First-token logprob on Exact hit".
 pub(crate) struct Qwen2Entry {
     /// Full prompt token IDs used to fill this slot.
     pub(crate) prompt_token_ids: Vec<u32>,

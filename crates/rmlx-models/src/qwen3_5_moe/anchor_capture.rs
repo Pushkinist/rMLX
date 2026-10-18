@@ -12,23 +12,10 @@ use rmlx_mlx::{Array, Device};
 use super::model::Qwen3_5MoeText;
 use crate::prompt_cache::Anchor;
 
-/// Whether the entry a request goes on to store is kept at all.
-///
-/// A cache of no slots refuses every entry, and with paged KV the snapshot clone
-/// refuses a cache that holds pages, so a capture would split the prefill and pay
-/// a synchronisation for a state nothing reads.
-///
-/// One refusal is not seen here: an entry larger than the cache's byte cap is
-/// refused at the push. The only byte estimate in reach is the per-layer K/V one
-/// that feeds a resolve-time warning, and it omits the recurrent states, so it
-/// cannot say what the entry will weigh; the capture is paid for such a prompt.
-pub(crate) fn entry_is_storable(cache_slots: usize, paged_kv: bool) -> bool {
-    cache_slots > 0 && !paged_kv
-}
-
 /// Where a prompt of `prompt_len` tokens captures its anchor when it is forwarded
 /// from `resume_from`: the anchor position of its length, if that is not behind
-/// the resume point and the entry can be stored ([`entry_is_storable`]).
+/// the resume point and the entry can be stored
+/// ([`crate::prompt_cache::entry_is_storable`]).
 pub(crate) fn anchor_target(
     prompt_len: usize,
     storable: bool,

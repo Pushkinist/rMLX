@@ -32,6 +32,7 @@ fn mock_ram_entry(n_layers: usize, prompt: &[u32], first_id: u32) -> Gemma3Entry
             .collect(),
         first_id,
         first_piece: "hello".to_string(),
+        first_logprobs: None,
         kv_quant: Some(KvQuant::K8V8),
         is_ssd_hydrated: false,
     }
@@ -117,6 +118,7 @@ fn ssd_hydrated_entry_field_invariants() {
         kv_caches: vec![KvCache::with_quant(KvQuant::K8V8)],
         first_id: 0,
         first_piece: String::new(),
+        first_logprobs: None,
         kv_quant: Some(KvQuant::K8V8),
         is_ssd_hydrated: true,
     };
@@ -162,6 +164,7 @@ fn is_hydrate_complete_false_for_payloadless_swa_layer() {
         kv_caches,
         first_id: 0,
         first_piece: String::new(),
+        first_logprobs: None,
         kv_quant: Some(KvQuant::None),
         is_ssd_hydrated: true,
     };

@@ -452,8 +452,8 @@ fn laguna_entry_restores_every_layer_in_order_at_kv_h_1() {
 /// `kv_h > 1`, on the entry that carries an extra field beyond the shared
 /// seven.
 ///
-/// `Qwen3Entry` sets `first_logprobs: None` on top of what the other
-/// pure-attention entries set. A shared body has to keep that field's hydrate
+/// `Qwen3Entry` sets `first_logprobs: None` on top of what the Laguna, Qwen2
+/// and Qwen3-VL-MoE entries set. A shared body has to keep that field's hydrate
 /// value.
 #[test]
 fn qwen3_entry_restores_every_layer_in_order_at_kv_h_4() {
@@ -1176,6 +1176,7 @@ fn the_spill_rule_withholds_exactly_the_blocks_a_hydrate_refuses() {
             anchor: None,
             first_id: 0,
             first_piece: String::new(),
+            first_logprobs: None,
             kv_quant: Some(QUANT),
             is_ssd_hydrated: false,
         };
@@ -1241,6 +1242,7 @@ fn an_entry_that_ends_inside_a_block_hydrates_at_its_anchor() {
         }),
         first_id: 0,
         first_piece: String::new(),
+        first_logprobs: None,
         kv_quant: Some(QUANT),
         is_ssd_hydrated: false,
     };

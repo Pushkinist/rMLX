@@ -162,7 +162,7 @@ candidate for the Qwen3 architecture and affine 8-bit weights.
 
 | Variable | Read by | Rule |
 |---|---|---|
-| `RMLX_KV_TEST_MODEL` | the golden-token suites, `bitnet_logprobs.rs`, `qwen3_5_moe_forward_seq_last_k.rs`, the verifiers of the alignment suites, `spec_conditioning_residual.rs`, `spec_greedy_equivalence.rs` and `spec_sampled_distribution.rs` | golden |
+| `RMLX_KV_TEST_MODEL` | the golden-token suites, `bitnet_logprobs.rs`, `prompt_cache_first_logprobs.rs`, `qwen3_5_moe_forward_seq_last_k.rs`, the verifiers of the alignment suites, `spec_conditioning_residual.rs`, `spec_greedy_equivalence.rs` and `spec_sampled_distribution.rs` | golden |
 | `RMLX_KV_TEST_MODEL` | `gemma4_kv_cache_equivalence.rs`, `kv_bytes_sample_point.rs`, `cli_flags_e2e.rs`, `projects_toml_e2e.rs` | variable only |
 | `RMLX_DRAFT_TEST_MODEL` | the drafters of the alignment suites, `spec_conditioning_residual.rs`, `spec_greedy_equivalence.rs` and `spec_sampled_distribution.rs` | slug first |
 | `RMLX_VL_TEST_MODEL` | `qwen3_vl_moe_text_parity.rs` | variable only |

@@ -43,15 +43,25 @@ use tracing::info_span;
 
 use crate::constraint::ConstraintEngine;
 use crate::decode_loop::{
-    capture_logprobs, choose_token, chunked_prefill, pipelined_decode, reject_nan_prefill,
-    DecodeCtx,
+    capture_first_logprobs, capture_logprobs, choose_token, chunked_prefill, pipelined_decode,
+    reject_nan_prefill, replay_first_logprobs, DecodeCtx,
 };
 use crate::kv_cache::{kv_layer_quants, warn_if_kv_codec_net_negative, KvLayerShape};
-use crate::prompt_cache::{Consumed, ReuseKind, ReusePolicy, BLOCK_TOKENS};
+use crate::prompt_cache::{entry_is_storable, Consumed, ReuseKind, ReusePolicy, BLOCK_TOKENS};
+use crate::sampler::TokenLogprobs;
 use rmlx_kv_quant::{KvCache, KvQuant};
 
 use super::model::Gemma4Text;
 use super::prompt_cache::{ensure_prompt_cache, Gemma4Entry, PROMPT_CACHE};
+
+/// What an exact prompt-cache hit hands the decode path: the saved caches and
+/// the first token with its logprobs.
+struct ExactHit {
+    kv_caches: Vec<KvCache>,
+    first_id: u32,
+    first_piece: String,
+    first_logprobs: Option<TokenLogprobs>,
+}
 
 // ---------------------------------------------------------------------------
 // Generate
@@ -179,7 +189,7 @@ pub fn generate_greedy<'a>(
     // `exact_hit` carries the Path-A early-return locals; `prefix_hit` carries
     // the Path-B tail-re-prefill locals. `Consumed::Miss` leaves both `None` and
     // falls through to Path C (full re-prefill).
-    let mut exact_hit: Option<(Vec<KvCache>, u32, String)> = None;
+    let mut exact_hit: Option<ExactHit> = None;
     let mut prefix_hit: Option<(Vec<KvCache>, usize)> = None;
     // Derive the initial ring size and the virtual ceiling:
     // `--max-ctx` is a ceiling the ring grows lazily up to, not an eager
@@ -204,7 +214,12 @@ pub fn generate_greedy<'a>(
                 token_id = cloned.first_id,
                 "gemma4 generate_greedy: prompt cache EXACT HIT"
             );
-            exact_hit = Some((bind(cloned.kv_caches)?, cloned.first_id, cloned.first_piece));
+            exact_hit = Some(ExactHit {
+                kv_caches: bind(cloned.kv_caches)?,
+                first_id: cloned.first_id,
+                first_piece: cloned.first_piece,
+                first_logprobs: cloned.first_logprobs,
+            });
         }
         // SWA snapshot/restore: restore the cloned snapshot verbatim at
         // absolute position `prefix_len == cached_len` and tail-forward only
@@ -248,7 +263,13 @@ pub fn generate_greedy<'a>(
     // site. GDN linear state does not exist for gemma4 (pure KV), so the
     // closure threads only `kv_caches`.
     // ------------------------------------------------------------------
-    if let Some((mut kv_caches, last_id, piece)) = exact_hit {
+    if let Some(ExactHit {
+        mut kv_caches,
+        first_id: last_id,
+        first_piece: piece,
+        first_logprobs,
+    }) = exact_hit
+    {
         let ends = crate::decode_loop::emit_replayed_token(
             &mut constraint,
             step_fn,
@@ -260,7 +281,7 @@ pub fn generate_greedy<'a>(
                 piece: piece.into_boxed_str(),
                 max_abs_logit: 0.0,
                 nan_count: 0,
-                logprobs: None,
+                logprobs: replay_first_logprobs(first_logprobs, sampler_cfg.top_logprobs_k),
             },
         );
         if ends {
@@ -649,7 +670,8 @@ pub fn generate_greedy<'a>(
 
     // Save snapshot after full prefill (: never for image prompts —
     // their K/V is not reconstructible from the token-id cache key).
-    if !has_image {
+    if !has_image && entry_is_storable(prompt_cache_slots, rmlx_kv_quant::paged::paged_kv_enabled())
+    {
         if let Some(kvs) = crate::prompt_cache::snapshot_clone(
             PROMPT_CACHE.arch_name(),
             &caches,
@@ -661,6 +683,7 @@ pub fn generate_greedy<'a>(
             // clone, which shares the same buffers, so that eval is a no-op.
             match kvs.iter().try_for_each(|c| c.eval_for_spill()) {
                 Ok(()) => {
+                    let first_logprobs = capture_first_logprobs(&logits_flat, &top);
                     PROMPT_CACHE.with_inner_mut(|guard| {
                         if let Some(cache) = guard.as_mut() {
                             // salt the chained walk with the active layout_key so
@@ -689,6 +712,7 @@ pub fn generate_greedy<'a>(
                                 kv_caches: kvs,
                                 first_id: last_id,
                                 first_piece: piece.clone(),
+                                first_logprobs,
                                 kv_quant: Some(kv_quant),
                                 is_ssd_hydrated: false,
                             });

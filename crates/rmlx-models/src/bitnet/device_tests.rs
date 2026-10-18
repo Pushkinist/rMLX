@@ -52,7 +52,7 @@ fn bitlinear(base: &str, out: usize, cols: usize) -> [Tensor; 2] {
     ]
 }
 
-fn write_snapshot(dir: &Path) {
+pub(super) fn write_snapshot(dir: &Path) {
     let config = serde_json::json!({
         "architectures": ["BitNetForCausalLM"],
         "model_type": "bitnet",

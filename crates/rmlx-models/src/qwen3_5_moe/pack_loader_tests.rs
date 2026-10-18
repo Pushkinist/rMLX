@@ -626,3 +626,7 @@ fn a_hadamard_verifier_refuses_the_restricted_vocab_head() -> Result<()> {
 #[cfg(test)]
 #[path = "pack_serve_tests.rs"]
 mod pack_serve_tests;
+
+#[cfg(test)]
+#[path = "first_logprobs_tests.rs"]
+mod first_logprobs_tests;

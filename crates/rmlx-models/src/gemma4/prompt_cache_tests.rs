@@ -18,6 +18,7 @@ fn entry_with(kv_caches: Vec<KvCache>, ids: Vec<u32>) -> Gemma4Entry {
         kv_caches,
         first_id: 0,
         first_piece: String::new(),
+        first_logprobs: None,
         kv_quant: Some(KvQuant::K8V8),
         is_ssd_hydrated: false,
     }
@@ -35,6 +36,7 @@ fn entry_with_quant(
         kv_caches,
         first_id: 0,
         first_piece: String::new(),
+        first_logprobs: None,
         kv_quant,
         is_ssd_hydrated: false,
     }
@@ -632,6 +634,7 @@ fn gemma4_consume_engine_migration_golden() {
                 kv_caches,
                 first_id: 0,
                 first_piece: String::new(),
+                first_logprobs: None,
                 kv_quant: Some(kv_quant),
                 is_ssd_hydrated: true,
             });

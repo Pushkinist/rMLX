@@ -23,6 +23,7 @@ fn mock_ram_entry(n_layers: usize, prompt: &[u32], first_id: u32) -> BitNetEntry
             .collect(),
         first_id,
         first_piece: "hello".to_string(),
+        first_logprobs: None,
         kv_quant: Some(KvQuant::None),
         is_ssd_hydrated: false,
     }
@@ -105,6 +106,7 @@ fn ssd_hydrated_entry_field_invariants() {
         kv_caches: vec![KvCache::with_quant(KvQuant::None)],
         first_id: 0,
         first_piece: String::new(),
+        first_logprobs: None,
         kv_quant: Some(KvQuant::None),
         is_ssd_hydrated: true,
     };
@@ -157,6 +159,7 @@ fn exact_repeat_of_a_paged_entry_with_pages_is_a_miss() {
                 kv_caches: vec![paged_layer(with_page)],
                 first_id: 7,
                 first_piece: "x".to_string(),
+                first_logprobs: None,
                 kv_quant: Some(KvQuant::K8V4),
                 is_ssd_hydrated: false,
             });

@@ -1284,6 +1284,19 @@ impl Decline {
     }
 }
 
+/// Whether the entry a request goes on to store is kept at all.
+///
+/// A cache of no slots refuses every entry, and with paged KV the snapshot clone
+/// refuses a cache that holds pages, so taking the snapshot would be work nothing
+/// reads.
+///
+/// One refusal is not seen here: an entry larger than the cache's byte cap is
+/// refused at the push, and what the entry will weigh is not known before it is
+/// built; the snapshot is paid for such a prompt.
+pub(crate) fn entry_is_storable(cache_slots: usize, paged_kv: bool) -> bool {
+    cache_slots > 0 && !paged_kv
+}
+
 /// Deep-clone the caches of a post-prefill snapshot. `None` when one clone
 /// refuses (for example a paged cache that holds pages): the refusal is one
 /// `debug!` event, and the arch stores no entry.
@@ -1312,7 +1325,7 @@ pub(crate) fn snapshot_clone<T>(
 /// variant onto its own decode path: `Exact` skips prefill and replays the
 /// stored first token; `Reuse` restores the cloned prefix and the arch forwards
 /// the tail; `Miss` falls back to a full re-prefill. The cloned `E` carries
-/// whatever per-arch extras the entry holds (e.g. qwen3's `first_logprobs`).
+/// whatever per-arch extras the entry holds (e.g. `first_logprobs`).
 pub(crate) enum Consumed<E> {
     /// Full-token-equality hit: the cloned entry's prompt equals the request
     /// prompt and it is not an SSD placeholder. Reuse the snapshot as-is.
@@ -1674,7 +1687,7 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
     ///    — evict the slot, `warn!`, degrade to `Miss`.
     /// 5. Exact arm: `!is_ssd_hydrated() && prompt_token_ids() == prompt_ids` →
     ///    `Exact(deep_clone())`. The clone preserves whatever per-arch extras the
-    ///    entry holds (e.g. qwen3's `first_logprobs`).
+    ///    entry holds (e.g. `first_logprobs`).
     /// 6. Reuse gate ([`ReusePolicy`] + `is_hydrate_complete`): a hydrated
     ///    strict-prefix is permitted under any policy; a non-hydrated partial
     ///    match only under `Partial` (Gemma4, Qwen3.5). When permitted, the entry's

@@ -251,12 +251,10 @@ positions.
 
 `reasoning_content` is omitted when the model produced no thinking text,
 `tool_calls` when no call was parsed, and `logprobs` unless requested. When
-present, `logprobs.content` has one entry per completion token on a
-prompt-cache miss. Only `Qwen3Entry` stores the first token's logprobs, so an
-exact hit on that arch replays them and returns as many entries as a miss;
-on Gemma4, Gemma3, Qwen3.5-MoE and BitNet an exact hit emits no logprob for
-the replayed token, so `logprobs.content` is one entry short. See
-[`PROMPT_CACHE.md`](PROMPT_CACHE.md) § "First-token logprob on Exact hit".
+present, `logprobs.content` has one entry per completion token, on a
+prompt-cache hit as on a miss: the cache entry stores the first token's
+logprobs and an exact hit replays them. See [`PROMPT_CACHE.md`](PROMPT_CACHE.md)
+§ "First-token logprob on Exact hit".
 
 With a draft model every emitted token carries its logprob, one entry per
 completion token. The value is the verifier's raw log-softmax at the token's

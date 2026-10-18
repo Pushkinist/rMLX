@@ -27,11 +27,11 @@ use tracing::{info, warn};
 
 use crate::constraint::ConstraintEngine;
 use crate::decode_loop::{
-    capture_logprobs, choose_token, chunked_prefill, pipelined_decode, reject_nan_prefill,
-    DecodeCtx,
+    capture_first_logprobs, capture_logprobs, choose_token, chunked_prefill, pipelined_decode,
+    reject_nan_prefill, replay_first_logprobs, DecodeCtx,
 };
 use crate::kv_cache::kv_layer_quants;
-use crate::prompt_cache::{chained_block_hashes_seeded, Consumed, ReusePolicy};
+use crate::prompt_cache::{chained_block_hashes_seeded, entry_is_storable, Consumed, ReusePolicy};
 use rmlx_kv_quant::{KvCache, KV_MAX_SEQ_DEFAULT};
 
 use super::loader::load_from_path;
@@ -394,7 +394,8 @@ pub fn generate_greedy<'a>(
     // Materialize the GPU arrays on the current inference thread first so a
     // later eviction on a different tokio/Metal thread can re-eval them as a
     // no-op (see gemma4/generate/mod.rs).
-    if !has_image {
+    if !has_image && entry_is_storable(prompt_cache_slots, rmlx_kv_quant::paged::paged_kv_enabled())
+    {
         if let Some(kvs) = crate::prompt_cache::snapshot_clone(
             PROMPT_CACHE.arch_name(),
             &caches,
@@ -422,6 +423,7 @@ pub fn generate_greedy<'a>(
                         kv_caches: kvs,
                         first_id: last_id,
                         first_piece: piece.clone(),
+                        first_logprobs: capture_first_logprobs(&logits_flat, &top),
                         kv_quant: Some(kv_quant),
                         is_ssd_hydrated: false,
                     };
@@ -529,6 +531,7 @@ fn exact_hit_decode<'a>(
         kv_caches: mut caches,
         first_id: last_id,
         first_piece: piece,
+        first_logprobs,
         ..
     } = cloned;
     let mut steps = Vec::with_capacity(n_tokens);
@@ -550,7 +553,7 @@ fn exact_hit_decode<'a>(
             piece: piece.into_boxed_str(),
             max_abs_logit: 0.0,
             nan_count: 0,
-            logprobs: None,
+            logprobs: replay_first_logprobs(first_logprobs, sampler_cfg.top_logprobs_k),
         },
     );
     if ends {
