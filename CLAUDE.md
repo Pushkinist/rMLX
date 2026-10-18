@@ -45,7 +45,8 @@ areas before touching code:
 | [`docs/CLI.md`](docs/CLI.md) | rmlx CLI: subcommands, flags, claim file |
 | [`docs/CLI_ENV_VARS.md`](docs/CLI_ENV_VARS.md) | Environment variables `CLI.md` reads, split out for size |
 | [`docs/CLI_BASELINE.md`](docs/CLI_BASELINE.md) | `rmlx baseline`, split out of `CLI.md` for size: flags, summary line, refusals, prompt files, prompt-length cap, GPU capture flags |
-| [`docs/SERVER.md`](docs/SERVER.md) | HTTP server: OpenAI/Anthropic compat, routes, tool calling, retry envelope |
+| [`docs/SERVER.md`](docs/SERVER.md) | HTTP server: OpenAI compat, routes, embeddings, retry envelope |
+| [`docs/SERVER_ANTHROPIC.md`](docs/SERVER_ANTHROPIC.md) | Anthropic routes of the HTTP server, split out of `SERVER.md` for size: `/v1/messages` fields, message blocks, input bounds, response and stream shape, the `stop_reason` mapping |
 | [`docs/SERVER_TOOLS.md`](docs/SERVER_TOOLS.md) | Tool calling in the HTTP server, split out of `SERVER.md` for size: parsers, template probe, multi-turn loop, forced tool calls, EOF recovery |
 | [`docs/SERVER_AUDIO.md`](docs/SERVER_AUDIO.md) | Audio routes of the HTTP server, split out of `SERVER.md` for size: speech-to-text (form, upload, admission, cancel, model cache) and text-to-speech (fields, sampling defaults, response headers, errors) |
 | [`docs/SERVER_SHUTDOWN.md`](docs/SERVER_SHUTDOWN.md) | Shutdown of the HTTP server, split out of `SERVER.md` for size: the rule after SIGINT or SIGTERM, the two bounds, the 503, what stops and what does not, the Metal claim at the exit, log events |

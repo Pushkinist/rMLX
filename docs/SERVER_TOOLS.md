@@ -41,7 +41,7 @@ template each turn.
 On `/v1/messages` the model's calls are `tool_use` blocks and the client sends
 the results as `tool_result` blocks. The route renders the `thinking`,
 `tool_use` and `tool_result` blocks of earlier turns as it renders the OpenAI
-fields; see [`SERVER.md`](SERVER.md) "Message blocks".
+fields; see [`SERVER_ANTHROPIC.md`](SERVER_ANTHROPIC.md) "Message blocks".
 
 ### `tool_choice=required` / `tool_choice=named` (constrained generation)
 
