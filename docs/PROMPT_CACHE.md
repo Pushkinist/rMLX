@@ -442,11 +442,14 @@ with itself across forward lengths by more than the dense checkpoint did.
 The dense checkpoint is not exact across forward lengths either. On the
 pinned MLX the speculative refold test measures a disagreement between one
 verify forward and stepped decode
-(`crates/rmlx-models/src/speculative/round_common_tests.rs`). A
-forward of several rows and a one-row decode step can take different MLX
-kernels for the same product, and those sum in a different order. A resume on
-the sparse arch can therefore differ from a cold prefill by more than the
-dense gate shows.
+(`crates/rmlx-models/src/speculative/round_common_tests.rs`). On the pinned
+MLX, attention over several query rows takes a different kernel once the rows
+pass a limit that depends on the row count and the head grouping. The
+quantized matmul takes a different kernel from two rows on. Each kernel
+differs from the one-row result by the same order. So a
+forward of several rows is not the same function as the same rows stepped one
+at a time. A resume on the sparse arch can therefore differ from a cold
+prefill by more than the dense gate shows.
 
 ---
 

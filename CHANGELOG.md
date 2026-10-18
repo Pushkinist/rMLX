@@ -37,6 +37,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   test to `rmlx_models::answer_equivalence`, so the test and the command share
   one rule.
 
+- **The published-protocol harness reports the Metal peak, a perplexity section
+  and labelled campaigns.** `scripts/spec_bench_published.sh` reports the
+  Metal allocator peak beside the physical footprint of the fixed-length
+  prompt. `make published-table` renders a perplexity section from an
+  `rmlx eval ppl` record of the same checkpoint and corpus. A run needs a
+  `--label` and files its raw material in its own campaign directory under
+  `<RMLX_HOME>/bench/published/<label>/`. Every row it ingests carries the
+  label in its notes. `--record` ends by re-querying the rows it wrote, and it
+  refuses a result that they do not reproduce. The old fixed result directory
+  and the fixed staging path of the ingest are gone.
+
 ### Changed
 
 - **`scripts/spec_bench.sh` files a near-tie flip and still stops on a real
@@ -101,6 +112,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not changed. A client that reads a stream to its end must look for the
   terminal item (`[DONE]`, `finish_reason`, `message_stop` or
   `transcript.text.done`) to know that it has the whole answer.
+
+- **The speculative equivalence gate excuses a short arm that parted at a near
+  tie.** The gate refused every speculative arm shorter than the answer floor
+  while the reference ran on. That rule was written for an arm cut short with
+  the reference's own text. A verifier can part from the reference at a near
+  tie and then end sooner on its own stop id, and the gate refused that run.
+  Such an arm is now unjudgeable, the mirror of the rule for a short
+  reference. A cell may take this excuse on at most one prompt. No threshold
+  moves. `docs/SPEC_ANSWER_EQUIVALENCE.md` names the class of defect that this
+  gives up, and the broken-engine counts there are re-read under the new rule.
+- **The long-context round streams of the recurrent-verifier pairs are
+  re-pinned.** The single prefill plan below moves the state that enters round
+  0 by bf16 noise on prompts long enough to reach an anchor. The `longctx-4k`
+  streams of the adaptive, block, recurrent, restricted-vocabulary and
+  two-model cells moved; the other 31 pinned cells are unchanged. The
+  prefill-boundary tests of EAGLE-3 and MTP derive their counts from the
+  engine's split plan.
 
 ### Fixed
 
@@ -248,6 +276,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   BitNet, Qwen2, Gemma3 and Laguna had no ceiling on a generation; they now
   stop at the resolved `--max-ctx`.
 
+- **A cold prefill of a recurrent architecture takes one split plan.** The
+  engine cut the prefill at the 256-token anchor, where it saves the recurrent
+  state, only when the request could store a cache entry. So the output of a
+  cold request at temperature 0 depended on `--prompt-cache-slots`,
+  `--paged-kv` and on whether the request took a speculative path, and the
+  plain and speculative arms of an equivalence pair prefilled in different
+  pieces. `prefill_chunk::prefill_pieces` is now the one producer of the plan.
+  The plain path, the resume tail, every speculative prefill and the capturing
+  verifier prefill of DFlash 2 and EAGLE-3 cut at the anchor whether or not
+  anything is stored. Storing only decides whether the state is copied.
+  Architectures without recurrent state are unchanged, and the perplexity
+  scorer stays outside the plan so that its rows stay comparable.
+
 ### Performance
 
 - **The padded prefill mask is built once per forward.** A prefill-sized
@@ -270,6 +311,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and 6 rows. A speed-up is the tokens per round over the round cost in plain
   steps, and the round cost differs by weight format. The doc also holds what
   `SPECULATIVE.md` § "Reading a run" held, split out for size.
+
+- **`docs/SERVER_ANTHROPIC.md` holds the Anthropic routes.** The `/v1/messages`
+  fields, message blocks, input bounds, response and stream shape, and the
+  `stop_reason` mapping moved out of `docs/SERVER.md`, which was over the size
+  cap. `SERVER.md` keeps a pointer.
+- **Four claims about kernels and devices are corrected.** The dense checkpoint
+  is not exact across forward lengths: a several-row verify forward and a
+  one-row decode step can take different MLX kernels
+  (`docs/SPEC_ANSWER_EQUIVALENCE.md`, `docs/PROMPT_CACHE.md`). The MoE
+  broadcast and sorted routes agree in exact arithmetic, not in bf16.
+  `--device cpu` is a correctness device with no speed promise, because the CPU
+  quantized matmul of MLX uses one thread per stream and has no SIMD path for a
+  bf16 activation (`docs/CLI.md`). The refusal of a 1-bit affine model now says
+  that it needs an MLX with 1-bit affine kernels, MLX 0.32.4 or later, and no
+  longer calls the kernel unreleased.
 
 ## [0.4.4] - 2026-10-17
 

@@ -8,8 +8,13 @@ The divergence oracle it applies, and the constants that set it, live in
 `crates/rmlx-models/src/answer_equivalence.rs`.
 
 It is not bit-identity. The verify pass scores a whole block in one forward,
-where plain decode steps one token at a time: a different reduction order. No
-correct speculative arm is byte-identical to plain greedy in general.
+where plain decode steps one token at a time. On the pinned MLX, attention
+over several query rows takes a different kernel past a row and head limit,
+and the quantized matmul takes a different kernel from two rows on. Both
+differ from the one-row result by the same order. So a verify forward is not
+the same function as decode steps, and no correct speculative arm is
+byte-identical to plain greedy in general. That is why the gate judges a first
+difference by the divergence-confidence oracle and not by equality.
 
 **This is not the bench's answer check.** `scripts/spec_bench.sh` digests each
 measured completion. Equal digests file a speculative row as `matches_plain`.
