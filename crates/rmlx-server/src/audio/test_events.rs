@@ -7,8 +7,8 @@ use std::sync::Arc;
 /// Each event holds its level, its own fields, and then the fields of each
 /// span it is in, each named `span.<field>`.
 #[derive(Default)]
-pub(super) struct Events {
-    pub(super) captured: std::sync::Mutex<Vec<Vec<(String, String)>>>,
+pub(crate) struct Events {
+    pub(crate) captured: std::sync::Mutex<Vec<Vec<(String, String)>>>,
     /// The fields of each span, at the index of its id less one.
     spans: std::sync::Mutex<Vec<Vec<(String, String)>>>,
     /// The ids of the spans this thread is in, innermost last.
@@ -66,7 +66,7 @@ impl tracing::Subscriber for Events {
 }
 
 /// Capture the events of this thread until the returned guards drop.
-pub(super) fn capture() -> (
+pub(crate) fn capture() -> (
     Arc<Events>,
     (tracing::Dispatch, tracing::subscriber::DefaultGuard),
 ) {
@@ -97,7 +97,7 @@ pub(super) fn problems(events: &Events) -> Vec<Vec<(String, String)>> {
 }
 
 /// The value of the field `name` of `event`.
-pub(super) fn field<'a>(event: &'a [(String, String)], name: &str) -> Option<&'a str> {
+pub(crate) fn field<'a>(event: &'a [(String, String)], name: &str) -> Option<&'a str> {
     event
         .iter()
         .find(|(key, _)| key == name)

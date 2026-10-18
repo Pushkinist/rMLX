@@ -631,4 +631,4 @@ fn build_response(
 mod audio_tests;
 
 #[cfg(test)]
-mod test_events;
+pub(crate) mod test_events;

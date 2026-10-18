@@ -16,7 +16,8 @@ it is the same for every route and for every value of `--max-timeout-secs`,
    - A request with no response yet gets 503 in the OpenAI envelope, type
      `service_unavailable`, message `the server is shutting down`, on every
      route, also while it waits for the GPU.
-   - A reply that already streams is ended. The client reads a correct
+   - A reply that already streams is ended, whether or not the client reads,
+     and the stream that fed it is dropped. The client reads a correct
      chunked body. A stream that had not sent its terminal item has none: no
      `[DONE]`, no `finish_reason`, no `message_stop`, no
      `transcript.text.done` and no error event. A
@@ -34,11 +35,12 @@ process within 10 s of the panic.
 ## What stops, and what does not
 
 The drop of a request is the only stop signal a blocking job gets. The 408 of
-the request timeout and a closed connection drop a request as the shutdown
-does, so this section is true for all three. A job that stops releases the GPU
-permit when it returns, and the next request starts then. A job that is not
-stopped holds the permit to its end; after a shutdown it ends with the
-process.
+the request timeout, the end of a streamed reply at the request timeout (the
+same end as the one at the shutdown) and a closed connection drop a request as
+the shutdown does, so this section is true for all of them. A job that stops
+releases the GPU permit when it returns, and the next request starts then. A
+job that is not stopped holds the permit to its end; after a shutdown it ends
+with the process.
 
 - A transcription reads the stop before each 30 s window, so it stops when
   the window in flight ends ([`SERVER_AUDIO.md`](SERVER_AUDIO.md)). That

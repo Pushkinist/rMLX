@@ -13,6 +13,7 @@ use serde_json::json;
 use rmlx_loader::GenerationConfig;
 
 use super::state::ApiErrorCategory;
+use crate::stream_cut::end_stream_at;
 
 // ── Error helpers ─────────────────────────────────────────────────────────────
 
@@ -503,18 +504,20 @@ pub fn compute_effective_timeout(
 
 /// Axum middleware: per-request HTTP timeout.
 ///
-/// Wraps the downstream handler in `tokio::time::timeout(effective_dur)`.
-/// This bounds the **whole** request — including SSE streams (when
-/// `stream: true` is set on `/v1/chat/completions` or `/v1/messages`).
-/// A running SSE stream that has already started emitting bytes will be
-/// dropped when the deadline fires; the client will see a mid-stream
-/// disconnect. This is the intended behaviour: it caps runaway generations.
+/// The effective timeout is the lesser of the `X-Request-Timeout-Seconds`
+/// header value and `AppState::max_timeout_secs` (the server-startup cap). See
+/// `compute_effective_timeout` for the full resolution rules. It bounds the
+/// **whole** request, counted from its arrival:
 ///
-/// Effective timeout: the lesser of the `X-Request-Timeout-Seconds` header
-/// value and `AppState::max_timeout_secs` (the server-startup cap). See
-/// `compute_effective_timeout` for the full resolution rules.
+/// - A handler that has not returned its response at the deadline is dropped,
+///   and the request gets HTTP 408 with
+///   `{"error":{"type":"timeout","message":"..."}}`.
+/// - A response that streams (SSE, a streamed transcription) ends at the
+///   deadline, with no terminal item, whether or not the client reads. The
+///   stream that feeds it is dropped, so a job that sends into it stops.
+/// - A response of a known length is sent as it is.
 ///
-/// On timeout → HTTP 408 with `{"error":{"type":"timeout","message":"..."}}`.
+/// Both cuts count one `timeout` error.
 pub async fn timeout_mw(
     axum::extract::State(state): axum::extract::State<super::state::AppState>,
     req: axum::extract::Request,
@@ -529,20 +532,36 @@ pub async fn timeout_mw(
         }
     };
 
-    match effective {
-        None => next.run(req).await,
-        Some(dur) => match tokio::time::timeout(dur, next.run(req)).await {
-            Ok(resp) => resp,
-            Err(_elapsed) => {
-                let secs = dur.as_secs();
-                state.error_counts.increment(ApiErrorCategory::Timeout);
-                error_response(
-                    StatusCode::REQUEST_TIMEOUT,
-                    "timeout",
-                    &format!("request exceeded {secs} second timeout"),
-                )
+    // A cap too large for the clock is no cap, as `0` is.
+    let Some((dur, deadline)) = effective.and_then(|dur| {
+        let deadline = tokio::time::Instant::now().checked_add(dur)?;
+        Some((dur, deadline))
+    }) else {
+        return next.run(req).await;
+    };
+    let (method, uri) = (req.method().clone(), req.uri().clone());
+    match tokio::time::timeout_at(deadline, next.run(req)).await {
+        Ok(resp) => end_stream_at(resp, {
+            let error_counts = state.error_counts.clone();
+            async move {
+                tokio::time::sleep_until(deadline).await;
+                error_counts.increment(ApiErrorCategory::Timeout);
+                tracing::warn!(
+                    %method,
+                    path = uri.path(),
+                    "streaming reply ended by the request timeout; it can lack its terminal item"
+                );
             }
-        },
+        }),
+        Err(_elapsed) => {
+            let secs = dur.as_secs();
+            state.error_counts.increment(ApiErrorCategory::Timeout);
+            error_response(
+                StatusCode::REQUEST_TIMEOUT,
+                "timeout",
+                &format!("request exceeded {secs} second timeout"),
+            )
+        }
     }
 }
 

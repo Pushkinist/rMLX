@@ -579,8 +579,8 @@ pub struct AppState {
     /// Server-startup cap on per-request wall-clock timeout, in seconds.
     ///
     /// Default `600`. Configurable via `--max-timeout-secs`. Applied by the
-    /// `timeout_mw` axum middleware on every request: the middleware wraps the
-    /// whole handler future (including SSE stream) in `tokio::time::timeout`.
+    /// `timeout_mw` axum middleware on every request: the cap bounds the whole
+    /// request, so a streamed reply (SSE) ends at the cap too.
     /// Per-request `X-Request-Timeout-Seconds` header can lower the effective
     /// timeout, but never exceed this cap. 0 = no timeout (disabled).
     pub max_timeout_secs: u64,

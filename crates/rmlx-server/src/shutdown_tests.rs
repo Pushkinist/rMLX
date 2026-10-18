@@ -58,6 +58,7 @@ struct Served {
     port: u16,
     signals: tokio::sync::mpsc::Sender<()>,
     phase: PhaseWatch,
+    state: AppState,
     exit: JoinHandle<anyhow::Result<ExitDeadline>>,
 }
 
@@ -84,16 +85,21 @@ impl Served {
 
 /// Serve `api` under the layers of the server.
 async fn start(api: Router<AppState>, bounds: Bounds) -> Served {
+    let state = slot_test_state(ModelRegistry::from_paths(&[]), 1);
+    start_with(api, bounds, state).await
+}
+
+/// Serve `api` under the layers of the server, with `state`.
+async fn start_with(api: Router<AppState>, bounds: Bounds, state: AppState) -> Served {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind a local port");
     let port = listener.local_addr().expect("local address").port();
     let (signals, received) = tokio::sync::mpsc::channel(2);
     let (set_phase, phase) = phase_channel();
-    let state = slot_test_state(ModelRegistry::from_paths(&[]), 1);
     let exit = tokio::spawn(serve_until(
         listener,
-        crate::with_layers(api, state, phase.clone()),
+        crate::with_layers(api, state.clone(), phase.clone()),
         set_phase,
         received,
         bounds,
@@ -103,6 +109,7 @@ async fn start(api: Router<AppState>, bounds: Bounds) -> Served {
         port,
         signals,
         phase,
+        state,
         exit,
     }
 }
@@ -439,6 +446,289 @@ async fn the_request_timeout_still_answers_408_under_the_layers() {
     assert!(reply.starts_with("HTTP/1.1 408"), "{reply}");
     assert_eq!(report(job.stopped_on_drop).await, Ok(true), "not stopped");
     drop((served, job.release));
+}
+
+/// Poll `flag` until it is set. `false` when it did not set inside `WAIT`.
+async fn set_within_the_wait(flag: &AtomicBool) -> bool {
+    let start = Instant::now();
+    while !flag.load(Ordering::Acquire) {
+        if start.elapsed() >= WAIT {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    true
+}
+
+/// A route that streams events of text. Event `n` comes `delays[n - 1]` after
+/// the one before. The flag is set when the stream that feeds the reply is
+/// dropped.
+fn events_route(delays: &[Duration], feed_dropped: &Arc<AtomicBool>) -> Router<AppState> {
+    let (delays, feed_dropped) = (delays.to_vec(), Arc::clone(feed_dropped));
+    let route = post(move || {
+        let feed = SetOnDrop(Arc::clone(&feed_dropped));
+        let delays = delays.clone();
+        async move {
+            let feed = futures::stream::unfold((0_usize, feed), move |(n, feed)| {
+                let delay = delays.get(n).copied();
+                async move {
+                    tokio::time::sleep(delay?).await;
+                    Some((
+                        Ok::<_, Infallible>(format!("event {}\n\n", n + 1)),
+                        (n + 1, feed),
+                    ))
+                }
+            });
+            axum::body::Body::from_stream(feed)
+        }
+    });
+    Router::new().route("/stream", route)
+}
+
+/// The events at warn or error that `events` captured.
+fn warnings_of(events: &crate::audio::test_events::Events) -> Vec<Vec<(String, String)>> {
+    events
+        .captured
+        .lock()
+        .expect("the lock")
+        .iter()
+        .filter(|event| {
+            matches!(
+                crate::audio::test_events::field(event, "level"),
+                Some("WARN" | "ERROR")
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+/// The request timeout ends a reply that already streams. The head comes at
+/// once, the first event soon after, the second long after the 1 s cap. The
+/// client gets the first event, a whole chunked body and no second event, the
+/// feed is dropped, the server counts one `timeout` error and logs one `warn`.
+/// The test runs on one thread, so the events of the spawned cut are captured.
+#[tokio::test]
+async fn the_request_timeout_ends_a_reply_that_streams() {
+    let (events, _capture) = crate::audio::test_events::capture();
+    let feed_dropped = Arc::new(AtomicBool::new(false));
+    let delays = [Duration::from_millis(50), Duration::from_millis(2500)];
+    let served = start(events_route(&delays, &feed_dropped), FAR).await;
+
+    let sent = Instant::now();
+    let reply = request(served.port, "/stream", "X-Request-Timeout-Seconds: 1\r\n");
+    let reply = reply_of(reply).await;
+
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    assert!(reply.contains("event 1\n\n"), "{reply}");
+    assert!(!reply.contains("event 2"), "{reply}");
+    assert!(reply.ends_with("0\r\n\r\n"), "{reply}");
+    assert!(
+        sent.elapsed() >= Duration::from_secs(1),
+        "ended before the cap"
+    );
+    assert!(
+        set_within_the_wait(&feed_dropped).await,
+        "the feed still runs"
+    );
+    assert_eq!(served.state.error_counts.timeout.load(Ordering::Relaxed), 1);
+    let warns = warnings_of(&events);
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert_eq!(
+        crate::audio::test_events::field(&warns[0], "message"),
+        Some("streaming reply ended by the request timeout; it can lack its terminal item")
+    );
+}
+
+/// A reply that streams and ends inside the cap is whole, and the cap counts
+/// no error and logs nothing.
+#[tokio::test]
+async fn a_reply_that_streams_and_ends_inside_the_cap_is_whole() {
+    let (events, _capture) = crate::audio::test_events::capture();
+    let feed_dropped = Arc::new(AtomicBool::new(false));
+    let delays = [Duration::from_millis(20); 3];
+    let served = start(events_route(&delays, &feed_dropped), FAR).await;
+
+    let reply = request(served.port, "/stream", "X-Request-Timeout-Seconds: 1\r\n");
+    let reply = reply_of(reply).await;
+
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    for n in 1..=3 {
+        assert!(reply.contains(&format!("event {n}\n\n")), "{reply}");
+    }
+    assert!(reply.ends_with("0\r\n\r\n"), "{reply}");
+    assert!(
+        set_within_the_wait(&feed_dropped).await,
+        "the feed still runs"
+    );
+    assert_eq!(served.state.error_counts.timeout.load(Ordering::Relaxed), 0);
+    let warns = warnings_of(&events);
+    assert_eq!(warns.len(), 0, "{warns:?}");
+}
+
+/// A reply of a known length goes through both cuts as it is, with its length.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reply_of_a_known_length_is_not_changed() {
+    let api = Router::new().route("/known", post(|| async { JOB_REPLY }));
+    let served = start(api, FAR).await;
+
+    let reply = request(served.port, "/known", "X-Request-Timeout-Seconds: 1\r\n");
+    let reply = reply_of(reply).await;
+
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    assert!(reply.contains("content-length: 9\r\n"), "{reply}");
+    assert!(!reply.contains("transfer-encoding"), "{reply}");
+    assert!(reply.ends_with(JOB_REPLY), "{reply}");
+    assert_eq!(served.state.error_counts.timeout.load(Ordering::Relaxed), 0);
+}
+
+/// A cap too large for the clock is no cap: a reply that streams and a reply
+/// of a known length are both served whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cap_too_large_for_the_clock_is_no_cap() {
+    let feed_dropped = Arc::new(AtomicBool::new(false));
+    let delays = [Duration::from_millis(20); 3];
+    let api = events_route(&delays, &feed_dropped).route("/known", post(|| async { JOB_REPLY }));
+    let mut state = slot_test_state(ModelRegistry::from_paths(&[]), 1);
+    state.max_timeout_secs = u64::MAX;
+    let served = start_with(api, FAR, state).await;
+
+    let streamed = reply_of(request(served.port, "/stream", "")).await;
+    let known = reply_of(request(served.port, "/known", "")).await;
+
+    assert!(streamed.starts_with("HTTP/1.1 200"), "{streamed}");
+    assert!(streamed.contains("event 3\n\n"), "{streamed}");
+    assert!(streamed.ends_with("0\r\n\r\n"), "{streamed}");
+    assert!(known.starts_with("HTTP/1.1 200"), "{known}");
+    assert!(known.ends_with(JOB_REPLY), "{known}");
+}
+
+/// The size of each item of a job whose client reads nothing: a few of them
+/// fill the buffers between the job and its client.
+const UNREAD_ITEM: usize = 256 * 1024;
+
+/// How many items the job of a client that reads nothing would send.
+const UNREAD_ITEMS: usize = 10_000;
+
+/// A real admitted job behind `POST /unread`, as a chat job runs: it sends its
+/// items on a channel of 4 with `blocking_send`, holds the GPU permit, and
+/// stops when a send fails or its stop flag is set.
+struct UnreadJob {
+    api: Router<AppState>,
+    queue: Arc<tokio::sync::Semaphore>,
+    pending: Arc<AtomicUsize>,
+    sent: Arc<AtomicUsize>,
+    /// Gets a message when the job returns.
+    returned: mpsc::Receiver<()>,
+}
+
+fn unread_job() -> UnreadJob {
+    let (queue, pending) = crate::engine::tests::gpu_queue();
+    let sent = Arc::new(AtomicUsize::new(0));
+    let (returned_tx, returned) = mpsc::channel();
+    let route = {
+        let (queue, pending, sent) = (Arc::clone(&queue), Arc::clone(&pending), Arc::clone(&sent));
+        post(move || {
+            let (queue, pending, sent) =
+                (Arc::clone(&queue), Arc::clone(&pending), Arc::clone(&sent));
+            let returned_tx = returned_tx.clone();
+            async move {
+                let guard = crate::engine::tests::admitted(&queue, &pending).await;
+                let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+                let job = crate::engine::run_admitted(Some(guard), move |cancel| {
+                    for _ in 0..UNREAD_ITEMS {
+                        if cancel.load(Ordering::Relaxed)
+                            || tx.blocking_send(vec![b'x'; UNREAD_ITEM]).is_err()
+                        {
+                            break;
+                        }
+                        sent.fetch_add(1, Ordering::Relaxed);
+                    }
+                    returned_tx.send(()).ok();
+                });
+                let items = crate::engine::job_stream(rx, job).map(Ok::<_, Infallible>);
+                axum::body::Body::from_stream(items)
+            }
+        })
+    };
+    UnreadJob {
+        api: Router::new().route("/unread", route),
+        queue,
+        pending,
+        sent,
+        returned,
+    }
+}
+
+/// Wait on a std channel from async code, for at most `bound`.
+async fn report_within<T: Send + 'static>(rx: mpsc::Receiver<T>, bound: Duration) -> Option<T> {
+    tokio::task::spawn_blocking(move || rx.recv_timeout(bound).ok())
+        .await
+        .expect("the report task does not panic")
+}
+
+/// Open a connection, send the request and read nothing.
+async fn client_that_reads_nothing(port: u16, headers: &str) -> tokio::net::TcpStream {
+    let mut client = connect(port).await;
+    let head = head_of("/unread", headers);
+    client.write_all(head.as_bytes()).await.expect("send");
+    client
+}
+
+/// The job has started and is blocked in a send, with the permit.
+async fn assert_job_is_held(job: &UnreadJob) {
+    let start = Instant::now();
+    while job.sent.load(Ordering::Relaxed) == 0 && start.elapsed() < Duration::from_millis(800) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let sent = job.sent.load(Ordering::Relaxed);
+    assert!(sent > 0 && sent < UNREAD_ITEMS, "the job sent {sent} items");
+    assert_eq!(job.queue.available_permits(), 0, "the job holds the permit");
+    assert_eq!(job.pending.load(Ordering::Acquire), 1, "the job is pending");
+}
+
+/// The job returned although its client reads nothing, not before `at_least`
+/// after `since` and within `WAIT` after that. The permit is back and nothing
+/// waits on the GPU queue.
+async fn assert_job_is_gone(job: UnreadJob, since: Instant, at_least: Duration) {
+    let bound = (at_least + WAIT).saturating_sub(since.elapsed());
+    assert_eq!(
+        report_within(job.returned, bound).await,
+        Some(()),
+        "the job still runs {WAIT:?} after the end of its request"
+    );
+    assert!(since.elapsed() >= at_least, "the job ended before the end");
+    let permit = tokio::time::timeout(WAIT, job.queue.acquire()).await;
+    assert!(matches!(permit, Ok(Ok(_))), "the permit is not back");
+    assert_eq!(job.pending.load(Ordering::Acquire), 0, "a job is pending");
+}
+
+/// A client that reads nothing cannot hold a job past the cap: the cap ends
+/// the reply, which drops the stream of the job, whether or not the client
+/// reads.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_that_reads_nothing_cannot_hold_a_job_past_the_cap() {
+    let job = unread_job();
+    let served = start(job.api.clone(), FAR).await;
+    let sent = Instant::now();
+    let _client = client_that_reads_nothing(served.port, "X-Request-Timeout-Seconds: 1\r\n").await;
+    assert_job_is_held(&job).await;
+
+    assert_job_is_gone(job, sent, Duration::from_secs(1)).await;
+}
+
+/// The same at the shutdown: a client that reads nothing cannot hold a job
+/// past the reply bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_that_reads_nothing_cannot_hold_a_job_past_the_reply_bound() {
+    let job = unread_job();
+    let served = start(job.api.clone(), NEAR).await;
+    let _client = client_that_reads_nothing(served.port, "").await;
+    assert_job_is_held(&job).await;
+
+    served.signal().await;
+    let signalled = Instant::now();
+
+    assert_job_is_gone(job, signalled, NEAR.reply).await;
 }
 
 /// The two bounds of the server are the ones `docs/SERVER_SHUTDOWN.md` states.

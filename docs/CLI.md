@@ -131,7 +131,7 @@ starts with an empty registry. The KV codec flags above apply too.
 | `--draft-kind` | `mtp \| dflash \| dflash2 \| eagle3 \| two_model` | from the snapshot | Drafter kind for a snapshot whose `config.json` names none. Refused when it contradicts the snapshot. Requires `--draft-model`. Env: `MLX_VLM_DRAFT_KIND`. |
 | `--draft-block-size` | usize | `5`, capped by the drafter's declared depth | Tokens the verifier scores per round, its own included. Refused below 2 or above 1024. A DFlash 1, DFlash 2 or EAGLE-3 checkpoint's `block_size` also caps it. Env: `MLX_VLM_DRAFT_BLOCK_SIZE`. |
 | `--max-tokens-cap` | u32 | `1048576` | Per-request `max_tokens` ceiling; a request above it gets HTTP 400. |
-| `--max-timeout-secs` | u64 | `600` | Per-request wall-clock cap in seconds. `X-Request-Timeout-Seconds` can lower it. `0` disables it. |
+| `--max-timeout-secs` | u64 | `600` | Per-request wall-clock cap in seconds, counted from the arrival of the request. It bounds the whole request: a streamed reply that has started ends at the cap, with no terminal item. `X-Request-Timeout-Seconds` can lower it. `0` disables it. |
 | `--max-loaded-models` | usize | `1` | Models held resident; the least recently used one is evicted past the cap. |
 | `--max-queue-depth` | usize | `64` | Admission queue depth; a request past it gets HTTP 429. `0` is unlimited. |
 | `--adaptive-admission` | bool flag | off | Adaptive admission controller: adjusts the queue depth and answers 503 with `Retry-After` when the predicted step time exceeds twice `--step-target-ms`. See [`SERVER.md`](SERVER.md) § "Adaptive admission controller". |

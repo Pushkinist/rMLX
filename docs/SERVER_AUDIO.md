@@ -58,8 +58,8 @@ before the weights load, and every request is 503 with the refusal text
 gate as chat, and hold the GPU permit for the audio file decode, the encode and
 the Whisper decode.
 
-When the request is gone, because the 408 fired, the client closed the
-connection or a server shutdown dropped it, the transcription stops before
+When the request is gone, because the request timeout fired, the client closed
+the connection or a server shutdown dropped it, the transcription stops before
 its next 30 s window and releases the permit. An `info` event in the request's span,
 `long-form transcription cancelled before the window opened`, gives the
 window number, its `seek` in samples and the cause, `stop`: `flag` for the
@@ -117,15 +117,18 @@ text.
 A client that closes the connection stops the transcription before its next
 window, as for a request with no `stream`: the job cannot send the next delta,
 or it reads the flag of its request. The GPU permit is free when the window in
-flight ends. A client that does not read can hold the permit: when the
-connection's buffers are full and four events wait, the job waits until the
-client reads, closes, or the server shuts down.
+flight ends. A client that does not read holds the permit until the request
+timeout or the server shutdown ends the reply: when the buffers between the
+job and the client are full, the job waits in its send, and the end of the
+reply drops the stream that holds it.
 
 The request timeout (`--max-timeout-secs`, `X-Request-Timeout-Seconds`) bounds
-the time to the start of the reply, that is the prompt, the audio decode and
-the model load. It does not bound the stream after the start: then only a
-closed connection, the server shutdown or the end of the audio ends it: the
-timeout layer stops its clock when the route returns the response head.
+the whole request. Before the start of the reply, that is the prompt, the
+audio decode and the model load, it gives 408. After the start it ends the
+stream at the cap, with no `transcript.text.done` and no error event, whether
+or not the client reads, and the transcription stops before its next window.
+With `--max-timeout-secs 0` only a closed connection, the server shutdown or
+the end of the audio ends the stream.
 
 ### Text-to-speech: `/v1/audio/speech`
 

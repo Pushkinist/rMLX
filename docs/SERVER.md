@@ -112,10 +112,26 @@ the only admission path.
 
 The timeout middleware reads an optional `X-Request-Timeout-Seconds` header
 and caps it at `--max-timeout-secs` (default 600). A cap of 0 disables the
-timeout. A header that is not a positive integer gets 400. An expired request
-gets HTTP 408 `timeout`. The 408 drops the request. The work that then stops
-is in [`SERVER_SHUTDOWN.md`](SERVER_SHUTDOWN.md) § "What stops, and what does
-not".
+timeout, and so does a cap too large for the clock. A header that is not a positive integer gets 400. The cap counts
+from the arrival of the request and bounds the whole request, a streamed reply
+included:
+
+- A request with no response at the cap gets HTTP 408 `timeout`. The 408 drops
+  the request.
+- A reply that already streams (chat, messages and transcription with
+  `stream`) ends at the cap, with no terminal item, whether or not the client
+  reads. The stream that feeds the reply is dropped, so a job that sends into
+  it stops and gives back the GPU permit and the generation lock. A client
+  that reads nothing gets the end of the body when it next reads. The server
+  logs one `warn`, `streaming reply ended by the request timeout; it can lack
+  its terminal item`, with `method` and `path`, and counts one `timeout`
+  error.
+- A reply of a known length is sent as it is.
+
+The work that stops is in [`SERVER_SHUTDOWN.md`](SERVER_SHUTDOWN.md) § "What
+stops, and what does not". With `--max-timeout-secs 0` a client that keeps its
+connection open and reads nothing holds its job until it reads, closes, or
+the server shuts down.
 
 `X-Request-Id`, when present, becomes the request's correlation id (trimmed,
 printable ASCII, at most 128 characters). Otherwise the server makes a

@@ -87,6 +87,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `INCOMPLETE` instead of `ok`. The manifest is re-pinned on MLX 0.32.3 and
   mlx-c 0.7.0, and the steps for moving the pin re-pin it. `make
   spec-round-stream-selftest` is part of `make ci`.
+- **The request time cap ends a reply that has started to stream.** The cap
+  (`--max-timeout-secs`, `X-Request-Timeout-Seconds`) bounded only the time to
+  the head of the reply. A chat, messages or transcription stream then ran on
+  until its generation ended, with no clock. The cap now counts from the arrival
+  of the request and ends the stream at the deadline, with no terminal item, and
+  the server logs one `warn` and counts one `timeout` error. A client that
+  keeps its connection open and reads nothing no longer holds the generation,
+  the GPU permit and the generation lock past the cap. The same end now serves
+  the shutdown: a reply that streams to a client that reads nothing ended
+  only when the client read or the process exited, and now ends at the reply
+  bound. `--max-timeout-secs 0` still sets no cap. A reply of a known length is
+  not changed. A client that reads a stream to its end must look for the
+  terminal item (`[DONE]`, `finish_reason`, `message_stop` or
+  `transcript.text.done`) to know that it has the whole answer.
 
 ### Fixed
 

@@ -26,19 +26,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use axum::body::{Body, HttpBody};
 use axum::extract::{Request, State};
 use axum::http::{Method, Uri};
 use axum::middleware::Next;
 use axum::response::Response;
 use axum::serve::ListenerExt;
 use axum::Router;
-use futures::StreamExt;
 use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
 use crate::claim::MetalClaim;
 use crate::openai::errors::service_unavailable;
+use crate::stream_cut::end_stream_at;
 
 /// How long the open requests have, from the first signal, to send their
 /// reply.
@@ -131,20 +130,14 @@ pub(crate) async fn stop_at_shutdown(
 /// A body of a known length is sent as it is. A body that streams ends at
 /// [`Phase::Stopping`], and the stream that fed it is dropped.
 fn end_stream_at_stop(response: Response, phase: PhaseWatch, method: Method, uri: Uri) -> Response {
-    if response.body().size_hint().exact().is_some() {
-        return response;
-    }
-    let (parts, body) = response.into_parts();
-    let cut = Box::pin(async move {
+    end_stream_at(response, async move {
         phase.reached(Phase::Stopping).await;
         warn!(
             %method,
             path = uri.path(),
             "streaming reply ended by the server shutdown; it can lack its terminal item"
         );
-    });
-    let body = Body::from_stream(body.into_data_stream().take_until(cut));
-    Response::from_parts(parts, body)
+    })
 }
 
 /// Serve `router` until the first of `signals`, then follow the rule of this
