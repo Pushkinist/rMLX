@@ -144,7 +144,10 @@ fn resolve_with(
 /// The perplexity scorer (`ppl.rs`) stays outside this plan. It passes no cut,
 /// because its rows must stay comparable with the rows already in the metrics
 /// DB.
-pub(crate) fn prefill_pieces(
+///
+/// `pub` for the prefill-boundary integration test, which derives the boundary
+/// count it expects from this plan.
+pub fn prefill_pieces(
     start: usize,
     end: usize,
     chunk: usize,

@@ -51,6 +51,8 @@ mod common;
 use std::sync::atomic::AtomicBool;
 
 use rmlx_mlx::Device;
+use rmlx_models::prefill_chunk::prefill_pieces;
+use rmlx_models::prompt_cache::anchor_target;
 use rmlx_models::speculative::eagle3::{
     eagle3_generate, Eagle3Drafter, DRAFTER_PREFILL_CHUNK, VERIFIER_PREFILL_CHUNK,
 };
@@ -227,6 +229,26 @@ fn event_released(event: &common::round_stream::CapturedEvent) -> bool {
         .field("released")
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| panic!("a boundary event carries no boolean `released`: {event:?}"))
+}
+
+/// The chunk boundaries a prefill of `head` tokens makes when the full prompt has
+/// `prompt_len` tokens: the plan the engine cuts the prompt by.
+///
+/// The engine cuts at the prompt-cache anchor only when the model carries
+/// recurrent state (`has_recurrent_state`); without it the plan is the chunk
+/// edges alone.
+fn planned_boundaries(
+    head: usize,
+    prompt_len: usize,
+    chunk: usize,
+    has_recurrent_state: bool,
+) -> usize {
+    let cut = if has_recurrent_state {
+        anchor_target(prompt_len, 0)
+    } else {
+        None
+    };
+    prefill_pieces(0, head, chunk, cut).len() - 1
 }
 
 /// Hold the boundary events of a request to the rules of this file.
@@ -474,7 +496,12 @@ fn qwen38_mtp_prefill_reaches_every_chunk_boundary() {
         )
         .expect("mtp generate");
     });
-    assert_boundary_events(test, CHUNKS - 1, false, &events);
+    assert_boundary_events(
+        test,
+        planned_boundaries(prompt_len - 1, prompt_len, chunk, true),
+        false,
+        &events,
+    );
 }
 
 /// The EAGLE-3 round loop prefills the verifier through
@@ -522,7 +549,14 @@ fn qwen36_eagle3_prefill_reaches_every_chunk_boundary() {
         )
         .expect("eagle3 generate");
     });
-    let verifier_boundaries = prompt_len.div_ceil(VERIFIER_PREFILL_CHUNK) - 1;
+    // Qwen3.6-35B-A3B carries recurrent state, so the plan cuts at the anchor
+    // (16128 of 16384 tokens) inside the last chunk: 15 chunk edges and the cut.
+    let verifier_boundaries =
+        planned_boundaries(prompt_len, prompt_len, VERIFIER_PREFILL_CHUNK, true);
+    assert_eq!(
+        verifier_boundaries, 16,
+        "{test}: the plan for {prompt_len} tokens at chunk {VERIFIER_PREFILL_CHUNK} moved"
+    );
     let drafter_boundaries = prompt_len.div_ceil(DRAFTER_PREFILL_CHUNK) - 1;
     assert_boundary_events(
         test,

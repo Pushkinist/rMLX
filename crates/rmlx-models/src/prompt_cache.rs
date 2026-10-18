@@ -297,7 +297,10 @@ impl Anchor {
 ///
 /// The split does not depend on whether the entry is stored
 /// ([`entry_is_storable`]): a prompt is forwarded in the same pieces either way.
-pub(crate) fn anchor_target(prompt_len: usize, resume_from: usize) -> Option<usize> {
+///
+/// `pub` for the prefill-boundary integration test, which derives the boundary
+/// count it expects from this plan.
+pub fn anchor_target(prompt_len: usize, resume_from: usize) -> Option<usize> {
     Anchor::pos_for(prompt_len).filter(|&pos| pos >= resume_from)
 }
 

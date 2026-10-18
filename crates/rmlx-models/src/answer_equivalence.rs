@@ -30,9 +30,9 @@ pub const MIN_LENGTH_RATIO: f64 = 0.60;
 /// | assistant pair, as shipped | 0.0000 to 0.0820 |
 /// | recurrent pair, as shipped | 0.0000 to 0.0234 |
 /// | block pair, as shipped | 0.0000 to 0.0273 |
-/// | adaptive pair, as shipped, at the block it is served | 0.0000 to 0.0234 |
-/// | adaptive pair, as shipped, over its whole schedule | 0.0000 to 0.0703 |
-/// | restricted-vocabulary pair, as shipped | 0.0000 to 0.0703 |
+/// | adaptive pair, as shipped, at the block it is served | 0.0000 to 0.0703 judged; 0.0827 on the unjudgeable 4k cell |
+/// | adaptive pair, as shipped, over its whole schedule | 0.0000 to 0.0703 judged; 0.0827 on the unjudgeable 4k cell |
+/// | restricted-vocabulary pair, as shipped | 0.0000 to 0.0827 |
 /// | two-model pair, as shipped | 0.0000 to 0.0234 |
 /// | assistant pair, SWA ring keeping its rejected block tail | 0.4219 to 0.9258 |
 /// | recurrent pair, acceptance walk without the final norm | 0.0000 to 0.5000 |
@@ -43,21 +43,26 @@ pub const MIN_LENGTH_RATIO: f64 = 0.60;
 /// | two-model pair, one rejected draft kept every partial round | 0.0000 to 0.6680 |
 ///
 /// The measurement leaves a band, and the value sits inside it: above the worst
-/// correct cell (0.0820, 1.46x) and under the lowest broken cell above it
-/// (0.1445, 1.20x). It clears every correct cell, and every broken engine here
-/// is refused on at least four of the prompts the gate judged for it — which is
-/// what running every prompt rather than one buys, since no broken engine is
-/// refused on all of them by this oracle alone.
+/// correct cell (0.0827, 1.45x) and under the lowest broken cell above it
+/// (0.1445, 1.20x). It clears every correct cell. Every broken engine here was
+/// refused on at least four of the prompts the gate judged for it — which is what
+/// running every prompt rather than one buys, since no broken engine is refused
+/// on all of them by this oracle alone. **That count was taken before the
+/// short-arm excuse existed**; the re-read of every broken engine under the
+/// current rule is pending, and until it is done the count stands as measured
+/// under the previous rule.
 ///
-/// **The adaptive pair's two rows are the same engine at two blocks**, and the
-/// wider one reads three times the narrower. Both clear the ceiling and both are
-/// refused on none of the prompts the gate judges, against at least four for
-/// every broken engine here — but 0.0703 is also where the broken adaptive row
-/// starts, so the two populations touch on that pair at that block, and the
-/// margin the ceiling has over a correct reading there is 1.71x rather than the
-/// 1.46x the paragraph above quotes. The narrower row was measured before this
-/// pair was split in two and its block is not recorded; the served block
-/// reproduces it exactly.
+/// **The adaptive pair's two rows are the same engine at two blocks.** Judged,
+/// each reads up to 0.0703. On the 4k document each reads 0.0827 at a cell the
+/// gate reports as unjudgeable: the speculative arm answers in 52 tokens against
+/// the reference's 254. The restricted-vocabulary pair reads the same 0.0827 on
+/// that document at 256 tokens against 254, a judged cell, and that is the worst
+/// correct cell above. Both adaptive rows clear the ceiling and both are refused
+/// on none of the prompts the gate judges. The broken adaptive row starts at
+/// 0.0703, so on that pair the judged correct readings and the broken ones touch
+/// at 0.0703. An earlier tip read 0.1220 on a judged adaptive cell; its plain arm
+/// prefilled in different pieces from the speculative arm, a defect since fixed,
+/// so that reading is not a correct reading and is left out of the rows above.
 ///
 /// One broken engine is outside that statement, and that is a property of the
 /// defect rather than of the ceiling: leaving the correction on the restricted

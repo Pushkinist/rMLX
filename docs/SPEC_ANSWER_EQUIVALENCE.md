@@ -272,7 +272,53 @@ unjudgeable, not failed. Plain greedy is the control.
   reference answer and ran on: the loop did not stop where the verifier
   stopped, and that is refused.
 - The speculative arm under the floor while the reference ran on: the round
-  loop cut its own run. Refused.
+  loop cut its own run. Refused, with one exception below.
+
+The exception mirrors the short reference arm. A speculative arm under the
+floor is excused, not refused, when all four hold:
+
+1. The reference is not under the floor.
+2. The arms first differ before the speculative arm's last token.
+3. The oracle reads that first difference as a near tie. The gaps must be
+   present: a caller with none keeps the refusal.
+4. The speculative arm ends on one of the verifier's own stop ids. The harness
+   passes them to `judge`.
+
+Such an arm parted from the reference where the verifier was undecided, and
+then stopped where the verifier stopped. It is a different answer, and the
+shorter of the two is one the gate cannot read. A true prefix, a confident
+divergence, a divergence at the last token and an arm that ended on anything
+but a stop id stay refused. The rule reads only the two arms, the gaps and the
+stop ids: the restricted-vocabulary declaration is not consulted for a short
+arm. `read_divergence` and the thresholds are unchanged.
+
+**The excuse is bounded per cell.** It is a second route to "not judged", and a
+broken engine could take it on every prompt and pass on `judged > 0`. So a
+cell is refused when more than `MAX_SHORT_ARM_EXCUSES` (1) of its prompts take
+it. Both sides are measured:
+
+- Correct side: in the three gate logs this was measured on, every correct cell
+  takes the excuse at most once. The adaptive pair takes it once per cell, on the
+  4k document (52 tokens against 254), at both its blocks. No other correct cell
+  takes it.
+- Broken side: a broken engine refused on `k` prompts without the excuse is
+  refused on at least `k - 1` with it, since the bound lets at most one prompt
+  through. Every broken engine measured before the excuse existed was refused on
+  four prompts or more, so it keeps at least three. To pass, a broken engine would
+  have to be refused on one prompt at most, which none measured is. The re-read
+  of every broken engine under the current rule is pending.
+
+**The class this gives up:** a round loop that ends early on a stop id because
+of a state defect, after a legitimate near tie. The first difference is
+correct, the stop is not, and the gate does not read that prompt. Another prompt
+of the same cell catches such a loop only if that prompt refuses, and the bound
+caps the prompts the loop can hide behind the excuse at one. The per-round
+stream is a change detector against a pinned baseline, not an oracle, and does
+not cover this class.
+`only_a_short_arm_that_parted_at_a_near_tie_and_ended_on_a_stop_id_is_excused`
+sweeps the parting position and the arm length, and
+`a_cell_over_the_short_arm_excuse_bound_is_refused` sweeps the number of excused
+prompts.
 
 `MIN_LENGTH_RATIO` (0.60) refuses two arms whose lengths differ that much;
 `lcs_ratio` divides by the shorter arm and would otherwise score a truncated

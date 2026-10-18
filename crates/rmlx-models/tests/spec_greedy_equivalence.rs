@@ -199,13 +199,16 @@ const N_TOKENS: usize = 256;
 /// How much answer both arms must have produced for the comparison to have
 /// power.
 ///
-/// **One number, and both sides of it are measured.** Every arm the gate judged
-/// across two pairs and six prompts ran to the full [`N_TOKENS`] budget, so the
-/// floor is not what any correct pair is up against. What it decides is where
-/// the line falls between two different verdicts: one arm short while the other
-/// ran on is the round loop's doing and is refused, and *both* arms short is the
-/// prompt's — the recurrent pair answers the 4k summary in 13 and 26 tokens —
-/// and is reported rather than failed.
+/// **One number, and both sides of it are measured.** Nearly every arm the gate
+/// judged ran to the full [`N_TOKENS`] budget. The exceptions are answers that
+/// end on a stop id: the reference arm answers the 4k document in 254 tokens on
+/// the Qwen3.6 verifier, still above the floor. So the floor is not what a
+/// correct pair is up against. What it decides is where the line falls between
+/// two different verdicts: one arm short while the other ran on is the round
+/// loop's doing and is refused, unless the short arm parted at a near tie and
+/// ended on a stop id. *Both* arms short is the prompt's — the recurrent pair
+/// answers the 4k summary in 13 and 26 tokens — and is reported rather than
+/// failed.
 ///
 /// It is above `TAIL_WINDOWS * MIN_CYCLE_SAMPLES`, which is what the last tail
 /// window needs before it can evidence a cycle at all, and under the budget, so
@@ -559,6 +562,12 @@ enum Verdict {
     /// the round loop. Reported, not failed: a gate that turns red on an input
     /// it cannot read teaches its operator to ignore it.
     Unjudgeable(String),
+    /// A speculative arm under the answer floor that parted from the reference at
+    /// a near tie and ended on a stop id. Unjudgeable like the above, but counted
+    /// on its own: [`MAX_SHORT_ARM_EXCUSES`] bounds how many prompts of one cell
+    /// may take it, because a second route to "not judged" is a route a broken
+    /// engine could take on every prompt.
+    ShortArmExcused(String),
     /// The round loop did not reproduce plain greedy.
     Refused(String),
 }
@@ -571,11 +580,15 @@ enum Verdict {
 ///
 /// `restriction` is `None` for every pair whose loop scores each position over
 /// the verifier's whole vocabulary, which is all of them but one.
+///
+/// `stop_ids` are the verifier's own stop ids. A speculative arm that ended on
+/// one of them stopped where the verifier chose to stop.
 fn judge(
     spec: &[u32],
     plain: &[u32],
     margins: &[f32],
     restriction: Option<&Restriction<'_>>,
+    stop_ids: &[u32],
 ) -> Verdict {
     let longer = spec.len().max(plain.len());
 
@@ -641,6 +654,16 @@ fn judge(
         ));
     }
     if spec.len() < MIN_ANSWER_TOKENS {
+        if let Some(at) = parted_then_stopped_by_the_verifier(spec, plain, margins, stop_ids) {
+            return Verdict::ShortArmExcused(format!(
+                "the speculative arm parted from the reference at token {at}, a decision \
+                 the verifier was nearly tied on, and went on to end on a stop id at {} \
+                 tokens, under {MIN_ANSWER_TOKENS}, while the reference ran to {} — two \
+                 different answers, and the shorter of them is one the gate cannot read",
+                spec.len(),
+                plain.len()
+            ));
+        }
         return Verdict::Refused(format!(
             "one arm stopped early — spec={} plain={}, under {MIN_ANSWER_TOKENS} while \
              the other ran on; a short run is a comparison with no power, not a pass",
@@ -679,14 +702,78 @@ fn judge(
     }
 }
 
+/// Where a short speculative arm parted from the reference, when it parted at a
+/// decision the verifier was nearly tied on and then ended on a stop id before
+/// its own last token. `None` for every other short arm.
+///
+/// A true prefix, a divergence at the arm's last token, an arm that ended on
+/// anything but a stop id and a caller with no margins all give `None`: there
+/// the arm was cut, or the oracle has nothing to read.
+fn parted_then_stopped_by_the_verifier(
+    spec: &[u32],
+    plain: &[u32],
+    margins: &[f32],
+    stop_ids: &[u32],
+) -> Option<usize> {
+    let (at, rank) = divergence_confidence(spec, plain, margins)?;
+    let ended_on_stop_id = spec.last().is_some_and(|id| stop_ids.contains(id));
+    (rank <= MAX_DIVERGENCE_CONFIDENCE && at + 1 < spec.len() && ended_on_stop_id).then_some(at)
+}
+
 impl Verdict {
     /// The refusal text, or `None` for anything the gate does not fail on.
     fn refusal(&self) -> Option<String> {
         match self {
             Self::Refused(why) => Some(why.clone()),
-            Self::Agreed | Self::Unjudgeable(_) => None,
+            Self::Agreed | Self::Unjudgeable(_) | Self::ShortArmExcused(_) => None,
         }
     }
+}
+
+/// How many prompts of one cell may take the short-arm excuse before the cell is
+/// refused.
+///
+/// Measured: in the three cited gate logs every correct cell takes the excuse at
+/// most once (the adaptive pair, on the 4k document, 52 tokens against 254). A
+/// broken engine that is refused on `k` prompts without the excuse stays refused
+/// on at least `k - 1` with it, so this bound is what keeps the excuse from
+/// turning a broken cell into a pass. `docs/SPEC_ANSWER_EQUIVALENCE.md` gives
+/// both sides.
+const MAX_SHORT_ARM_EXCUSES: usize = 1;
+
+/// What the verdicts of one cell's prompts add up to.
+struct Tally {
+    /// Prompts the oracle read: agreed or refused.
+    judged: usize,
+    /// One line per refusal, and one for a cell that took the short-arm excuse
+    /// on more prompts than [`MAX_SHORT_ARM_EXCUSES`].
+    refusals: Vec<String>,
+}
+
+fn tally<'a>(verdicts: impl IntoIterator<Item = (&'a str, Verdict)>) -> Tally {
+    let mut judged = 0;
+    let mut refusals = Vec::new();
+    let mut excused: Vec<&str> = Vec::new();
+    for (prompt, verdict) in verdicts {
+        match verdict {
+            Verdict::Agreed => judged += 1,
+            Verdict::Unjudgeable(_) => {}
+            Verdict::ShortArmExcused(_) => excused.push(prompt),
+            Verdict::Refused(why) => {
+                judged += 1;
+                refusals.push(format!("{prompt}: {why}"));
+            }
+        }
+    }
+    if excused.len() > MAX_SHORT_ARM_EXCUSES {
+        refusals.push(format!(
+            "{} prompts ended short on a stop id after a near tie ({}), over the bound of \
+             {MAX_SHORT_ARM_EXCUSES} per cell — a correct cell takes that excuse once at most",
+            excused.len(),
+            excused.join(", ")
+        ));
+    }
+    Tally { judged, refusals }
 }
 
 // ── Oracle tests (no model, no GPU) ──────────────────────────────────────────
@@ -737,7 +824,9 @@ fn a_single_flip_passes_and_a_confident_flip_does_not() {
     let mut tied = vec![5.0f32; N_TOKENS];
     tied[66] = 0.01;
     assert!(
-        judge(&one_flip, &plain, &tied, None).refusal().is_none(),
+        judge(&one_flip, &plain, &tied, None, &[])
+            .refusal()
+            .is_none(),
         "a flip at the arm's own least-confident decision must pass"
     );
 
@@ -746,7 +835,7 @@ fn a_single_flip_passes_and_a_confident_flip_does_not() {
         *m = 0.001;
     }
     confident[66] = 5.0;
-    let failure = judge(&one_flip, &plain, &confident, None)
+    let failure = judge(&one_flip, &plain, &confident, None, &[])
         .refusal()
         .expect("must refuse");
     assert!(failure.contains("nearly tied"), "{failure}");
@@ -815,6 +904,7 @@ fn a_divergence_the_restricted_vocabulary_forced_is_not_a_refusal() {
             vocab: &vocab,
             decided_by: &decided_by,
         }),
+        &[],
     );
     assert!(verdict.refusal().is_none(), "{verdict:?}");
     let Verdict::Unjudgeable(why) = &verdict else {
@@ -841,6 +931,7 @@ fn the_same_divergence_at_the_correction_is_refused() {
             vocab: &vocab,
             decided_by: &decided_by,
         }),
+        &[],
     )
     .refusal()
     .expect("the correction reads the whole vocabulary, so the restriction cannot excuse it");
@@ -863,6 +954,7 @@ fn a_divergence_the_drafter_could_have_named_is_judged_as_before() {
                 vocab: &vocab,
                 decided_by: &decided_by,
             }),
+            &[],
         )
         .refusal()
         .unwrap_or_else(|| panic!("a nameable divergence must still refuse, at {decided:?}"));
@@ -870,7 +962,7 @@ fn a_divergence_the_drafter_could_have_named_is_judged_as_before() {
 
         // And a pair that declares no reduced vocabulary reads the same pair the
         // same way, which is what "judged as before" means.
-        let plain_rule = judge(&spec, &plain, &margins, None)
+        let plain_rule = judge(&spec, &plain, &margins, None, &[])
             .refusal()
             .expect("no restriction, no waiver");
         assert_eq!(plain_rule, failure);
@@ -892,12 +984,12 @@ fn the_boundary_excuses_no_other_refusal() {
     let mut collapsed: Vec<u32> = plain[..66].to_vec();
     collapsed.extend(std::iter::repeat_n([7_u32, 8].into_iter(), N_TOKENS).flatten());
     collapsed.truncate(N_TOKENS);
-    let failure = judge(&collapsed, &plain, &margins, Some(&restriction))
+    let failure = judge(&collapsed, &plain, &margins, Some(&restriction), &[])
         .refusal()
         .expect("a collapsed speculative arm is refused whatever parted the arms");
     assert!(failure.contains("repetition loop"), "{failure}");
 
-    let failure = judge(&plain[..16], &plain, &margins, Some(&restriction))
+    let failure = judge(&plain[..16], &plain, &margins, Some(&restriction), &[])
         .refusal()
         .expect("a short speculative arm is refused whatever parted the arms");
     assert!(failure.contains("stopped early"), "{failure}");
@@ -957,7 +1049,7 @@ fn every_shape_of_repetition_loop_is_refused() {
                 .collect(),
         ),
     ] {
-        let failure = judge(&stream, &healthy, &[], None)
+        let failure = judge(&stream, &healthy, &[], None, &[])
             .refusal()
             .unwrap_or_else(|| panic!("{shape} was not refused"));
         assert!(failure.contains("repeats at period"), "{shape}: {failure}");
@@ -976,7 +1068,7 @@ fn a_collapsed_reference_arm_is_reported_as_an_input_the_gate_cannot_judge() {
     let healthy: Vec<u32> = (0..N_TOKENS as u32).collect();
     let looping = vec![7u32; N_TOKENS];
 
-    let spec_side = judge(&looping, &healthy, &[], None);
+    let spec_side = judge(&looping, &healthy, &[], None, &[]);
     let why = spec_side
         .refusal()
         .expect("a degenerate spec arm must be refused");
@@ -986,7 +1078,7 @@ fn a_collapsed_reference_arm_is_reported_as_an_input_the_gate_cannot_judge() {
         "{why}"
     );
 
-    let plain_side = judge(&healthy, &looping, &[], None);
+    let plain_side = judge(&healthy, &looping, &[], None, &[]);
     assert!(
         matches!(plain_side, Verdict::Unjudgeable(ref why) if why.contains("reference arm")),
         "a collapsed reference arm is an input the gate cannot read, not a \
@@ -1084,7 +1176,7 @@ fn a_healthy_arm_that_repeats_no_more_than_its_reference_is_not_a_collapse() {
         31
     );
     assert_eq!(
-        judge(&MEASURED_SPEC_ARM, &MEASURED_PLAIN_ARM, &[], None),
+        judge(&MEASURED_SPEC_ARM, &MEASURED_PLAIN_ARM, &[], None, &[]),
         Verdict::Agreed
     );
 }
@@ -1097,7 +1189,7 @@ fn the_same_measured_arm_collapsed_over_its_last_window_is_refused() {
     let last = N_TOKENS - N_TOKENS / TAIL_WINDOWS;
     let mut collapsed = MEASURED_SPEC_ARM[..last].to_vec();
     collapsed.extend((0..N_TOKENS - last).map(|i| MEASURED_SPEC_ARM[last + i % 25]));
-    let failure = judge(&collapsed, &MEASURED_PLAIN_ARM, &[], None)
+    let failure = judge(&collapsed, &MEASURED_PLAIN_ARM, &[], None, &[])
         .refusal()
         .expect("an exact loop over the last window must be refused");
     assert!(failure.contains("repeats at period 25"), "{failure}");
@@ -1108,7 +1200,7 @@ fn the_same_measured_arm_collapsed_over_its_last_window_is_refused() {
 /// reference, and a reference the control cannot read is not agreement.
 #[test]
 fn the_measured_arms_exchanged_are_an_input_the_gate_cannot_judge() {
-    let verdict = judge(&MEASURED_PLAIN_ARM, &MEASURED_SPEC_ARM, &[], None);
+    let verdict = judge(&MEASURED_PLAIN_ARM, &MEASURED_SPEC_ARM, &[], None, &[]);
     assert!(
         matches!(verdict, Verdict::Unjudgeable(ref why) if why.contains("reference arm")),
         "{verdict:?}"
@@ -1125,7 +1217,7 @@ fn a_collapsed_arm_is_refused_when_the_reference_gives_no_reading() {
         0,
         "the reference arm must be too short to read"
     );
-    let failure = judge(&quarter_collapse(0x55, 8), &plain, &[], None)
+    let failure = judge(&quarter_collapse(0x55, 8), &plain, &[], None, &[])
         .refusal()
         .expect("a collapsed arm must be refused when there is no reference reading");
     assert!(failure.contains("repeats at period"), "{failure}");
@@ -1158,14 +1250,14 @@ fn a_speculative_arm_in_a_ragged_loop_is_refused_against_a_healthy_reference() {
                 // The verdict is the one a fixed ceiling gives on the raw reading:
                 // the reference arm did not write the loop, so nothing is excused.
                 let raw = strongest_windowed_cycle(&spec).fraction() > MAX_CYCLE_FRACTION;
-                let verdict = judge(&spec, &plain, &[], None);
+                let verdict = judge(&spec, &plain, &[], None, &[]);
                 assert_eq!(verdict.refusal().is_some(), raw, "{noise}%, seed {seed:#x}");
                 match verdict {
                     Verdict::Agreed => first_admitted = first_admitted.or(Some(noise)),
                     Verdict::Refused(why) => {
                         assert!(why.contains("repeats at period"), "{noise}%: {why}");
                     }
-                    Verdict::Unjudgeable(why) => {
+                    Verdict::Unjudgeable(why) | Verdict::ShortArmExcused(why) => {
                         panic!("{noise}%: the reference arm is healthy prose: {why}")
                     }
                 }
@@ -1432,7 +1524,7 @@ fn a_loop_the_reference_arm_did_not_write_is_refused_whatever_the_reference_read
         ),
     ];
     for (shape, spec, plain) in cases {
-        let failure = judge(&spec, plain, &[], None)
+        let failure = judge(&spec, plain, &[], None, &[])
             .refusal()
             .unwrap_or_else(|| panic!("{shape} was not refused"));
         assert!(failure.contains("repeats at period"), "{shape}: {failure}");
@@ -1503,7 +1595,7 @@ fn a_loop_the_reference_arm_holds_somewhere_else_is_refused() {
             strongest_windowed_cycle(&spec).fraction() > MAX_CYCLE_FRACTION,
             "{shape}: the raw reading must be above the ceiling"
         );
-        match judge(&spec, &plain, &[], None).refusal() {
+        match judge(&spec, &plain, &[], None, &[]).refusal() {
             Some(failure) => assert!(failure.contains("repeats at period"), "{shape}: {failure}"),
             None => admitted.push(shape),
         }
@@ -1524,7 +1616,7 @@ fn a_stretch_the_reference_arm_holds_in_another_order_is_not_excused() {
         strongest_windowed_cycle(&MEASURED_PLAIN_ARM),
         "the reading of the reference arm must not move"
     );
-    let failure = judge(&MEASURED_SPEC_ARM, &plain, &[], None)
+    let failure = judge(&MEASURED_SPEC_ARM, &plain, &[], None, &[])
         .refusal()
         .expect("the reference arm holds the tokens and not the stretch");
     assert!(failure.contains("repeats at period 25"), "{failure}");
@@ -1666,7 +1758,7 @@ fn one_burst_in_the_reference_arm_excuses_one_burst_and_no_more() {
             },
             "{shape}: the raw reading"
         );
-        if judge(spec, plain, &[], None).refusal().is_none() {
+        if judge(spec, plain, &[], None, &[]).refusal().is_none() {
             admitted.push(shape);
         }
     }
@@ -1775,8 +1867,8 @@ fn a_run_takes_the_first_free_place_so_the_order_of_the_runs_can_decide() {
         assert_eq!(repeats_beyond(spec, 192, 1, &plain), counted, "{shape}");
         assert_the_excused_repeats_are_the_reference_arms_own(shape, spec, &plain);
     }
-    assert_eq!(judge(&in_order, &plain, &[], None), Verdict::Agreed);
-    let failure = judge(&exchanged, &plain, &[], None)
+    assert_eq!(judge(&in_order, &plain, &[], None, &[]), Verdict::Agreed);
+    let failure = judge(&exchanged, &plain, &[], None, &[])
         .refusal()
         .expect("the burst of 9 fits no free place");
     assert!(failure.contains("repeats at period 1"), "{failure}");
@@ -1814,7 +1906,7 @@ fn the_control_admits_at_most_the_ceiling_twice_in_one_window() {
         (192, 8, 22, 56),
         "the raw reading of the arm the control admits"
     );
-    assert_eq!(judge(&at_the_edge, &plain, &[], None), Verdict::Agreed);
+    assert_eq!(judge(&at_the_edge, &plain, &[], None, &[]), Verdict::Agreed);
     assert_the_excused_repeats_are_the_reference_arms_own("the edge", &at_the_edge, &plain);
     assert_the_excused_repeats_are_the_reference_arms_own(
         "the measured pair",
@@ -1822,7 +1914,7 @@ fn the_control_admits_at_most_the_ceiling_twice_in_one_window() {
         &MEASURED_PLAIN_ARM,
     );
 
-    let failure = judge(&own_loop(&plain, 20), &plain, &[], None)
+    let failure = judge(&own_loop(&plain, 20), &plain, &[], None, &[])
         .refusal()
         .expect("one more token of its own loop is above the ceiling");
     assert!(failure.contains("repeats at period 8"), "{failure}");
@@ -1830,7 +1922,7 @@ fn the_control_admits_at_most_the_ceiling_twice_in_one_window() {
     let longer_reference = prose_with_a_loop(&prose, 200, 20, 8);
     assert!(
         matches!(
-            judge(&longer_reference, &longer_reference, &[], None),
+            judge(&longer_reference, &longer_reference, &[], None, &[]),
             Verdict::Unjudgeable(_)
         ),
         "a reference arm with one more token of the loop is not judgeable"
@@ -1860,7 +1952,7 @@ fn the_measured_pair_is_agreed_with_seven_tokens_of_position_margin() {
     let at_the_cut = earlier(7);
     assert_eq!(holds_at(&at_the_cut), Some(192));
     assert_eq!(
-        judge(&MEASURED_SPEC_ARM, &at_the_cut, &[], None),
+        judge(&MEASURED_SPEC_ARM, &at_the_cut, &[], None, &[]),
         Verdict::Agreed
     );
 
@@ -1870,7 +1962,7 @@ fn the_measured_pair_is_agreed_with_seven_tokens_of_position_margin() {
         strongest_windowed_cycle(&before_the_cut).fraction() <= MAX_CYCLE_FRACTION,
         "the reference arm is healthy"
     );
-    let failure = judge(&MEASURED_SPEC_ARM, &before_the_cut, &[], None)
+    let failure = judge(&MEASURED_SPEC_ARM, &before_the_cut, &[], None, &[])
         .refusal()
         .expect("the stretch starts one token before the last cut of the reference arm");
     assert!(failure.contains("repeats at period 25"), "{failure}");
@@ -1888,7 +1980,7 @@ fn an_exact_loop_at_the_end_of_the_measured_arm_is_refused_past_a_pinned_length(
     for (period, longest_admitted) in [(1, 13), (8, 19), (25, 27)] {
         for len in period + 1..=N_TOKENS / 2 {
             let spec = exact_tail_loop(&MEASURED_SPEC_ARM, len, period);
-            let refused = judge(&spec, &MEASURED_PLAIN_ARM, &[], None)
+            let refused = judge(&spec, &MEASURED_PLAIN_ARM, &[], None, &[])
                 .refusal()
                 .is_some();
             assert_eq!(
@@ -1929,7 +2021,7 @@ fn a_healthy_arm_above_the_ceiling_is_refused_when_the_reference_did_not_write_i
         strongest_windowed_cycle(&MEASURED_PLAIN_ARM),
         "the reading of the reference arm must not move"
     );
-    let failure = judge(&MEASURED_SPEC_ARM, &plain, &[], None)
+    let failure = judge(&MEASURED_SPEC_ARM, &plain, &[], None, &[])
         .refusal()
         .expect("the reference arm no longer holds the phrase");
     assert!(failure.contains("repeats at period 25"), "{failure}");
@@ -1961,7 +2053,7 @@ fn a_reference_arm_near_the_ceiling_does_not_move_the_ragged_loop_edge() {
                 // The verdict is the one a fixed ceiling gives on the raw reading:
                 // the reference arm did not write the loop, so nothing is excused.
                 let raw = strongest_windowed_cycle(&spec).fraction() > MAX_CYCLE_FRACTION;
-                let verdict = judge(&spec, plain, &[], None);
+                let verdict = judge(&spec, plain, &[], None, &[]);
                 assert_eq!(
                     verdict.refusal().is_some(),
                     raw,
@@ -1975,7 +2067,9 @@ fn a_reference_arm_near_the_ceiling_does_not_move_the_ragged_loop_edge() {
                     Verdict::Refused(why) => {
                         assert!(why.contains("repeats at period"), "{noise}%: {why}");
                     }
-                    Verdict::Unjudgeable(why) => panic!("{name}, {noise}%: {why}"),
+                    Verdict::Unjudgeable(why) | Verdict::ShortArmExcused(why) => {
+                        panic!("{name}, {noise}%: {why}")
+                    }
                 }
             }
         }
@@ -1993,12 +2087,12 @@ fn a_reference_arm_near_the_ceiling_does_not_move_the_ragged_loop_edge() {
 fn a_prompt_that_produced_no_answer_is_reported_rather_than_failed() {
     let short: Vec<u32> = Rng(0x5170_0000).prose(MIN_ANSWER_TOKENS - 1);
     assert!(
-        matches!(judge(&short, &short, &[], None), Verdict::Unjudgeable(ref why) if why.contains("both arms")),
+        matches!(judge(&short, &short, &[], None, &[]), Verdict::Unjudgeable(ref why) if why.contains("both arms")),
         "two arms that both stopped short say nothing about the round loop"
     );
 
     let long: Vec<u32> = Rng(0x5170_0000).prose(N_TOKENS);
-    let why = judge(&short, &long, &[], None)
+    let why = judge(&short, &long, &[], None, &[])
         .refusal()
         .expect("one short arm against one long one must be refused");
     assert!(why.contains("one arm stopped early"), "{why}");
@@ -2200,11 +2294,11 @@ fn two_arms_in_the_same_ragged_loop_are_refused_until_they_are_no_longer_one_loo
                 .max(strongest_windowed_cycle(&b).fraction())
                 > MAX_CYCLE_FRACTION;
             assert_eq!(
-                judge(&a, &b, &[], None) != Verdict::Agreed,
+                judge(&a, &b, &[], None, &[]) != Verdict::Agreed,
                 raw,
                 "{noise}%, seeds {sa:#x} and {sb:#x}"
             );
-            if judge(&a, &b, &[], None) != Verdict::Agreed {
+            if judge(&a, &b, &[], None, &[]) != Verdict::Agreed {
                 continue;
             }
             first_admitted = first_admitted.or(Some(noise));
@@ -2253,13 +2347,14 @@ fn the_worst_correct_tail_is_the_worst_of_the_tails_measured() {
         // Block pair, six prompts. The worst reading of the whole population is
         // here, and it was outside this list until the pairs below were built.
         0.4323, 0.4844, 0.3021, 0.6562, 0.1094, 0.5938,
-        // Adaptive pair, the five it judged — its verifier answers the 4k
-        // document in 52 tokens, and both arms reproduce that answer exactly.
+        // Adaptive pair, the five it judged — on the 4k document the speculative
+        // arm answers in 52 tokens against the reference's 254, and that prompt is
+        // reported unjudgeable.
         0.2969, 0.2188, 0.4115, 0.3906, 0.2656,
-        // Restricted-vocabulary pair, the five it judged — same verifier, and on
-        // the 4k document its arms part at the one lowest-margin token in that
-        // 52-token answer.
-        0.1406, 0.2656, 0.3594, 0.4844, 0.3984,
+        // Restricted-vocabulary pair, the six it judged — same verifier. The last
+        // reading is the 4k document, where both arms ran past the floor (256
+        // tokens against 254) and parted at token 7.
+        0.1406, 0.2656, 0.3594, 0.4844, 0.3984, 0.2362,
         // Two-model pair, the five it judged. Its verifier is the recurrent
         // pair's, and on this measure the two loops read alike.
         0.3281, 1.0000, 1.0000, 0.6354, 1.0000,
@@ -2296,7 +2391,7 @@ fn a_speculative_arm_collapsing_over_its_last_quarter_is_refused_by_the_control(
     let healthy = Rng(0xC0DE).prose(N_TOKENS);
     for period in [8usize, 16, 24] {
         let spec = quarter_collapse(0x55, period);
-        let failure = judge(&spec, &healthy, &[], None)
+        let failure = judge(&spec, &healthy, &[], None, &[])
             .refusal()
             .unwrap_or_else(|| {
                 panic!(
@@ -2398,14 +2493,14 @@ fn the_ratio_is_over_the_shorter_arm_and_the_length_guard_covers_it() {
         "a true prefix must score 1.0 over the shorter arm; it read {}",
         lcs_ratio(truncated, &plain)
     );
-    let failure = judge(truncated, &plain, &[], None)
+    let failure = judge(truncated, &plain, &[], None, &[])
         .refusal()
         .expect("the length guard must refuse it");
     assert!(failure.contains("stopped well before"), "{failure}");
 
     // Just inside the guard the same shape scores 1.0 and passes, which is what
     // makes the guard — not the ratio — the thing doing the work above.
-    assert!(judge(&plain[..N_TOKENS * 3 / 2], &plain, &[], None)
+    assert!(judge(&plain[..N_TOKENS * 3 / 2], &plain, &[], None, &[])
         .refusal()
         .is_none());
 }
@@ -2419,20 +2514,23 @@ fn the_ratio_is_over_the_shorter_arm_and_the_length_guard_covers_it() {
 fn the_length_floor_admits_every_answer_the_prompts_produce() {
     let at_floor = Rng(0x00F1_7EDD).prose(MIN_ANSWER_TOKENS);
     assert!(
-        judge(&at_floor, &at_floor, &[], None).refusal().is_none(),
+        judge(&at_floor, &at_floor, &[], None, &[])
+            .refusal()
+            .is_none(),
         "two arms exactly at the floor must pass"
     );
     let under = &at_floor[..MIN_ANSWER_TOKENS - 1];
     assert!(
-        judge(under, under, &[], None) != Verdict::Agreed,
+        judge(under, under, &[], None, &[]) != Verdict::Agreed,
         "two arms one token under the floor must not be returned as agreement"
     );
 
-    // Every arm the gate judged ran to the budget, so the floor is under all of
-    // them. Driven through `judge` rather than compared as constants.
+    // Every arm the gate judged in the cited logs ran to at least 254 tokens, so
+    // the floor is under all of them. Driven through `judge` rather than
+    // compared as constants.
     let budget = Rng(0x2181_2181).prose(N_TOKENS);
     assert!(
-        judge(&budget, &budget, &[], None).refusal().is_none(),
+        judge(&budget, &budget, &[], None, &[]).refusal().is_none(),
         "a pair that answers in full must clear the floor"
     );
     // Both sides of the floor, at compile time, and each is the tightest form
@@ -2461,7 +2559,7 @@ fn the_length_floor_admits_every_answer_the_prompts_produce() {
 #[test]
 fn a_truncated_run_is_refused_rather_than_judged() {
     let plain: Vec<u32> = (0..N_TOKENS as u32).collect();
-    let failure = judge(&plain[..16], &plain, &[], None)
+    let failure = judge(&plain[..16], &plain, &[], None, &[])
         .refusal()
         .expect("must refuse");
     assert!(failure.contains("stopped early"), "{failure}");
@@ -2471,7 +2569,8 @@ fn a_truncated_run_is_refused_rather_than_judged() {
 /// shapes are pinned.
 ///
 /// A *speculative* arm under the floor while the reference ran on is the round
-/// loop cutting its own run, and is refused. A *reference* arm under the floor
+/// loop cutting its own run, and is refused; the one exception has its own test
+/// below. A *reference* arm under the floor
 /// is the prompt — plain greedy is the control, and the same asymmetry the
 /// repetition control already applies is what the divergence oracle needs here.
 /// The one shape that is still about the loop is a speculative arm that
@@ -2479,17 +2578,18 @@ fn a_truncated_run_is_refused_rather_than_judged() {
 /// that did not stop where the verifier stopped, and it is separable from a loop
 /// that parted inside the answer and wrote a different, longer one.
 ///
-/// This is the case the restricted-vocabulary pair brought: on its verifier the
-/// 4k document is answered in 52 tokens, and two other round loops reproduce
-/// that answer exactly while EAGLE-3 flips the single lowest-margin token in it
-/// and writes on.
+/// The restricted-vocabulary pair brought the shape: on an earlier tip its
+/// verifier answered the 4k document in 52 tokens, two round loops reproduced
+/// that answer and EAGLE-3 flipped the lowest-margin token in it and wrote on.
+/// At the current tip the verifier answers that document in 254 tokens, so no
+/// measured cell takes this branch and this test is its only cover.
 #[test]
 fn a_short_reference_arm_is_the_prompt_unless_the_other_arm_only_ran_past_it() {
     let plain: Vec<u32> = Rng(0x5AFE_5AFE).prose(MIN_ANSWER_TOKENS - 1);
 
     let mut ran_on = plain.clone();
     ran_on.extend(Rng(0x0BAD_0BAD).prose(N_TOKENS));
-    let failure = judge(&ran_on, &plain, &[], None)
+    let failure = judge(&ran_on, &plain, &[], None, &[])
         .refusal()
         .expect("an arm that reproduced the whole reference answer and kept going must be refused");
     assert!(
@@ -2499,18 +2599,217 @@ fn a_short_reference_arm_is_the_prompt_unless_the_other_arm_only_ran_past_it() {
 
     let mut parted = plain[..4].to_vec();
     parted.extend(Rng(0x0F1F_0F1F).prose(N_TOKENS));
-    match judge(&parted, &plain, &[], None) {
+    match judge(&parted, &plain, &[], None, &[]) {
         Verdict::Unjudgeable(why) => assert!(why.contains("parted inside that answer"), "{why}"),
-        other @ (Verdict::Agreed | Verdict::Refused(_)) => {
+        other @ (Verdict::Agreed | Verdict::Refused(_) | Verdict::ShortArmExcused(_)) => {
             panic!("a reference arm under the floor is the prompt, not the loop: {other:?}")
         }
     }
 
     let long_plain: Vec<u32> = Rng(0x1C1C_1C1C).prose(N_TOKENS);
-    let failure = judge(&long_plain[..16], &long_plain, &[], None)
+    let failure = judge(&long_plain[..16], &long_plain, &[], None, &[])
         .refusal()
         .expect("a speculative arm under the floor while the reference ran on must be refused");
     assert!(failure.contains("stopped early"), "{failure}");
+}
+
+/// A stop id outside the range `Rng::prose` draws from.
+const FIXTURE_STOP: u32 = 151_645;
+
+/// A speculative arm of `len` tokens that shares the first `parted_at` tokens of
+/// a reference answer that ran the whole budget, then writes a different tail
+/// ending on `ending`. With `parted_at == len` the arm is a true prefix and the
+/// reference carries `FIXTURE_STOP` at the cut when the arm is to end on a stop
+/// id, so that the prefix is the one shape a stop id alone cannot tell from a
+/// parted arm.
+fn short_arm_pair(parted_at: usize, len: usize, ending: u32) -> (Vec<u32>, Vec<u32>) {
+    let mut plain = Rng(0x57_0B_57_0B).prose(N_TOKENS);
+    if parted_at == len {
+        if ending == FIXTURE_STOP {
+            plain[len - 1] = FIXTURE_STOP;
+        }
+        return (plain[..len].to_vec(), plain);
+    }
+    let mut spec = plain[..parted_at].to_vec();
+    let mut tail = vec![60_000_u32];
+    tail.extend(Rng(0x7A11_7A11).prose(len - parted_at - 1));
+    if let Some(last) = tail.last_mut() {
+        *last = ending;
+    }
+    spec.extend(tail);
+    (spec, plain)
+}
+
+/// The reference arm's top-two gaps with one position tied and every other one
+/// sure, or the reverse: the oracle reads the first as a near tie at `at` and
+/// the second as a confident decision.
+fn gaps_tied_at(at: usize, tied: bool) -> Vec<f32> {
+    let (rest, here) = if tied { (5.0, 0.01) } else { (0.01, 5.0) };
+    let mut gaps = vec![rest; N_TOKENS];
+    gaps[at] = here;
+    gaps
+}
+
+/// A speculative arm under the floor against a reference that ran on is the
+/// round loop cutting its own run, except in one shape: the arm parted from the
+/// reference at a decision the verifier was nearly tied on, and went on to end on
+/// one of the verifier's own stop ids before its last token. That arm is a
+/// different answer and not a cut one, and it is excused.
+///
+/// Swept over the position the arms part at and over the arm's length, so the
+/// sweep and not a chosen point decides where the excuse stops. The four
+/// conditions of the excuse are held apart from one another, and so are the
+/// shapes that must stay refused: a true prefix that ends on a stop id, a
+/// confident divergence, a divergence at the arm's last token, an arm that ended
+/// on anything else, a caller with no stop ids and a caller with no gaps. At and
+/// above the answer floor the same arms are read by the oracle and agreed.
+#[test]
+fn only_a_short_arm_that_parted_at_a_near_tie_and_ended_on_a_stop_id_is_excused() {
+    const NOT_A_STOP: u32 = 61_000;
+    let lengths = (2..MIN_ANSWER_TOKENS)
+        .step_by(13)
+        .chain([MIN_ANSWER_TOKENS - 1]);
+    for len in (MIN_ANSWER_TOKENS..=N_TOKENS).step_by(23).chain([N_TOKENS]) {
+        for parted_at in (0..len.min(N_TOKENS - 1)).step_by(7) {
+            let (spec, plain) = short_arm_pair(parted_at, len, FIXTURE_STOP);
+            assert_eq!(
+                judge(
+                    &spec,
+                    &plain,
+                    &gaps_tied_at(parted_at, true),
+                    None,
+                    &[FIXTURE_STOP]
+                ),
+                Verdict::Agreed,
+                "len={len} parted_at={parted_at}: a full-length arm is read by the oracle, \
+                 not excused"
+            );
+        }
+    }
+    for len in lengths {
+        for parted_at in 0..=len {
+            for (ending, tied, stop_ids, with_gaps) in [
+                (FIXTURE_STOP, true, &[FIXTURE_STOP][..], true),
+                (FIXTURE_STOP, false, &[FIXTURE_STOP][..], true),
+                (NOT_A_STOP, true, &[FIXTURE_STOP][..], true),
+                (FIXTURE_STOP, true, &[][..], true),
+                (FIXTURE_STOP, true, &[FIXTURE_STOP][..], false),
+            ] {
+                let (spec, plain) = short_arm_pair(parted_at, len, ending);
+                assert_eq!(spec.len(), len);
+                let gaps = if with_gaps {
+                    gaps_tied_at(parted_at, tied)
+                } else {
+                    Vec::new()
+                };
+                let excused = tied
+                    && with_gaps
+                    && ending == FIXTURE_STOP
+                    && !stop_ids.is_empty()
+                    && parted_at + 1 < len;
+                let verdict = judge(&spec, &plain, &gaps, None, stop_ids);
+                let case = format!(
+                    "len={len} parted_at={parted_at} ending_on_stop={} tied={tied} \
+                     stop_ids={} gaps={with_gaps}: {verdict:?}",
+                    ending == FIXTURE_STOP,
+                    stop_ids.len()
+                );
+                if excused {
+                    let Verdict::ShortArmExcused(why) = &verdict else {
+                        panic!("must be excused, {case}");
+                    };
+                    assert!(why.contains("two different answers"), "{case}");
+                } else {
+                    let why = verdict
+                        .refusal()
+                        .unwrap_or_else(|| panic!("must be refused, {case}"));
+                    assert!(why.contains("stopped early"), "{case}");
+                }
+            }
+        }
+    }
+}
+
+/// An arm ends on a stop id only when its last token is one: a stop id written
+/// earlier in the tail, with the arm running on past it, is not an ending.
+#[test]
+fn a_stop_id_inside_a_short_arm_is_not_where_it_ended() {
+    let (mut spec, plain) = short_arm_pair(10, 40, 61_000);
+    spec[20] = FIXTURE_STOP;
+    let failure = judge(
+        &spec,
+        &plain,
+        &gaps_tied_at(10, true),
+        None,
+        &[FIXTURE_STOP],
+    )
+    .refusal()
+    .expect("an arm whose last token is not a stop id is cut, whatever it wrote before");
+    assert!(failure.contains("stopped early"), "{failure}");
+}
+
+/// The ceiling itself reads as a near tie, as in [`read_divergence`]: a rank
+/// equal to [`MAX_DIVERGENCE_CONFIDENCE`] is excused and one step above it is not.
+#[test]
+fn a_short_arm_parted_exactly_at_the_ceiling_is_read_as_a_near_tie() {
+    let parted_at = 10;
+    let (spec, plain) = short_arm_pair(parted_at, 40, FIXTURE_STOP);
+    // 3 of 25 gaps under the one at the divergence: 3/25 is the ceiling.
+    let mut gaps = vec![5.0_f32; 25];
+    gaps[..3].fill(0.001);
+    gaps[parted_at] = 0.01;
+    assert_eq!(
+        divergence_confidence(&spec, &plain, &gaps),
+        Some((parted_at, MAX_DIVERGENCE_CONFIDENCE))
+    );
+    assert!(matches!(
+        judge(&spec, &plain, &gaps, None, &[FIXTURE_STOP]),
+        Verdict::ShortArmExcused(_)
+    ));
+
+    gaps[3] = 0.001;
+    let failure = judge(&spec, &plain, &gaps, None, &[FIXTURE_STOP])
+        .refusal()
+        .expect("a rank above the ceiling is a confident decision");
+    assert!(failure.contains("stopped early"), "{failure}");
+}
+
+/// The excuse is a second route to "not judged", so a cell is bounded in how
+/// many prompts take it. Swept over the number of excused prompts: at the bound
+/// the cell passes, one over it the cell is refused, and an excused prompt is
+/// never counted as judged.
+#[test]
+fn a_cell_over_the_short_arm_excuse_bound_is_refused() {
+    for excused in 0..=PROMPTS.len() {
+        let verdicts = PROMPTS.iter().enumerate().map(|(i, prompt)| {
+            let verdict = if i < excused {
+                Verdict::ShortArmExcused("ended short on a stop id".to_owned())
+            } else {
+                Verdict::Agreed
+            };
+            (prompt.name, verdict)
+        });
+        let Tally { judged, refusals } = tally(verdicts);
+        assert_eq!(judged, PROMPTS.len() - excused, "{excused} excused");
+        assert_eq!(
+            refusals.is_empty(),
+            excused <= 1,
+            "{excused} of {} prompts excused: {refusals:?}",
+            PROMPTS.len()
+        );
+    }
+
+    let one_excused_one_refused = tally([
+        ("a", Verdict::ShortArmExcused("short".to_owned())),
+        ("b", Verdict::Refused("different state".to_owned())),
+        ("c", Verdict::Agreed),
+    ]);
+    assert_eq!(one_excused_one_refused.judged, 2);
+    assert_eq!(
+        one_excused_one_refused.refusals,
+        ["b: different state".to_owned()],
+        "an excused prompt must not hide a refusal beside it"
+    );
 }
 
 /// A divergence that begins in the last quarter and never comes back.
@@ -2538,7 +2837,7 @@ fn a_late_onset_divergence_is_judged_where_it_begins() {
 
     let mut confident = vec![0.01f32; N_TOKENS];
     confident[onset] = 5.0;
-    let failure = judge(&late, &plain, &confident, None)
+    let failure = judge(&late, &plain, &confident, None, &[])
         .refusal()
         .expect("must refuse");
     assert!(
@@ -2550,18 +2849,22 @@ fn a_late_onset_divergence_is_judged_where_it_begins() {
     // the benign case, and passes at exactly the same subsequence ratio.
     let mut tied = vec![5.0f32; N_TOKENS];
     tied[onset] = 0.01;
-    assert!(judge(&late, &plain, &tied, None).refusal().is_none());
+    assert!(judge(&late, &plain, &tied, None, &[]).refusal().is_none());
 }
 
 /// The two measured regimes put through `judge` itself, so the test fails when
 /// the oracle's composition changes and not only when a constant moves.
 ///
 /// Correct: the worst reading a shipped pair produced, a first divergence at the
-/// 8.2nd percentile of the reference arm's own margins. Broken: the lowest
-/// reading a broken engine produced above the ceiling, the 14.5th — the cell the
-/// recorded recall stands or falls on.
+/// 8.3rd percentile of the reference arm's own margins, on a reference arm that
+/// answered in 254 tokens. Broken: the lowest reading a broken engine produced
+/// above the ceiling, the 14.5th — the cell the recorded recall stands or falls
+/// on.
 #[test]
 fn the_gate_admits_the_worst_correct_regime_and_refuses_the_lowest_broken_one() {
+    // 0.0827 is 21/254: the restricted-vocabulary pair on the 4k document, whose
+    // reference arm stopped at 254 tokens.
+    const WORST_CORRECT_LEN: usize = 254;
     let plain: Vec<u32> = (0..N_TOKENS as u32).map(|t| t % 97).collect();
     let mut spec = plain.clone();
     spec[64] = 60_000;
@@ -2570,34 +2873,38 @@ fn the_gate_admits_the_worst_correct_regime_and_refuses_the_lowest_broken_one() 
     // the arm's length, so the count is what the regime is reconstructed from —
     // a percentage of it lands on whichever reading integer division reaches,
     // which is how a ceiling under the worst correct cell used to pass here.
-    let margins_reading = |below: usize| -> Vec<f32> {
-        let mut m: Vec<f32> = (0..N_TOKENS)
+    let margins_reading = |below: usize, len: usize| -> Vec<f32> {
+        let mut m: Vec<f32> = (0..len)
             .map(|i| if i < below { 0.01 } else { 5.0 })
             .collect();
         m[64] = 0.02;
         m
     };
 
-    let correct = margins_reading(21);
-    let (_, worst_correct) = divergence_confidence(&spec, &plain, &correct).expect("a divergence");
+    let (spec_254, plain_254) = (&spec[..WORST_CORRECT_LEN], &plain[..WORST_CORRECT_LEN]);
+    let correct = margins_reading(21, WORST_CORRECT_LEN);
+    let (_, worst_correct) =
+        divergence_confidence(spec_254, plain_254, &correct).expect("a divergence");
     assert!(
-        (worst_correct - 0.0820).abs() < 0.0005,
-        "the reconstructed correct regime reads {worst_correct:.4}, not the measured 0.0820"
+        (worst_correct - 0.0827).abs() < 0.0005,
+        "the reconstructed correct regime reads {worst_correct:.4}, not the measured 0.0827"
     );
     assert!(
-        judge(&spec, &plain, &correct, None).refusal().is_none(),
+        judge(spec_254, plain_254, &correct, None, &[])
+            .refusal()
+            .is_none(),
         "the worst correct regime must pass"
     );
 
     // 0.1445 is 37/256 — the two-model pair's rollback mutation on the
     // congestion prompt, whose reference arm ran the full budget.
-    let broken = margins_reading(37);
+    let broken = margins_reading(37, N_TOKENS);
     let (_, lowest_broken) = divergence_confidence(&spec, &plain, &broken).expect("a divergence");
     assert!(
         (lowest_broken - 0.1445).abs() < 0.002,
         "the reconstructed broken regime reads {lowest_broken:.4}, not the measured 0.1445"
     );
-    let failure = judge(&spec, &plain, &broken, None)
+    let failure = judge(&spec, &plain, &broken, None, &[])
         .refusal()
         .expect("the lowest broken regime must be refused");
     assert!(failure.contains("nearly tied"), "{failure}");
@@ -4460,8 +4767,7 @@ fn run_gate(test: &str, pair: &Pair) {
         return;
     };
     let draft_vocab = loaded.draft_vocab();
-    let mut refusals: Vec<String> = Vec::new();
-    let mut judged = 0usize;
+    let mut verdicts: Vec<(&str, Verdict)> = Vec::new();
     for prompt in PROMPTS {
         let (block, spec, plain, margins, decided_by, rounds) = loaded.arms(prompt, device);
         // Written before it is judged: an empty stream is the case worth having
@@ -4495,7 +4801,7 @@ fn run_gate(test: &str, pair: &Pair) {
             vocab,
             decided_by: &decided_by,
         });
-        let verdict = judge(&spec, &plain, &margins, restriction.as_ref());
+        let verdict = judge(&spec, &plain, &margins, restriction.as_ref(), &loaded.eos);
         report(
             test,
             prompt,
@@ -4508,15 +4814,9 @@ fn run_gate(test: &str, pair: &Pair) {
             restriction.as_ref(),
             &verdict,
         );
-        match verdict {
-            Verdict::Agreed => judged += 1,
-            Verdict::Unjudgeable(_) => {}
-            Verdict::Refused(why) => {
-                judged += 1;
-                refusals.push(format!("{}: {why}", prompt.name));
-            }
-        }
+        verdicts.push((prompt.name, verdict));
     }
+    let Tally { judged, refusals } = tally(verdicts);
     assert!(
         judged > 0,
         "{test}: no prompt produced a pair this gate could judge, so it asserted \
@@ -4524,8 +4824,8 @@ fn run_gate(test: &str, pair: &Pair) {
     );
     assert!(
         refusals.is_empty(),
-        "{test}: the round loop did not reproduce plain greedy on {} of {judged} \
-         judged prompts\n  {}",
+        "{test}: the round loop did not reproduce plain greedy ({} refusals over {judged} \
+         judged prompts)\n  {}",
         refusals.len(),
         refusals.join("\n  ")
     );
@@ -4620,8 +4920,8 @@ fn the_4bit_checkpoint_is_not_collapsed_or_truncated_against_mxfp8() {
     for (i, prompt) in PROMPTS.iter().enumerate() {
         let (ref_ids, ref_margins) = &reference.answers[i];
         let (ids, margins) = &other.answers[i];
-        let controls = judge(ids, ref_ids, &[], None);
-        let ceiling = judge(ids, ref_ids, ref_margins, None);
+        let controls = judge(ids, ref_ids, &[], None, &[]);
+        let ceiling = judge(ids, ref_ids, ref_margins, None, &[]);
         let (div, ref_confidence) = divergence_confidence(ids, ref_ids, ref_margins)
             .unwrap_or((common_prefix_len(ids, ref_ids), 0.0));
         let other_confidence = divergence_confidence(ref_ids, ids, margins).map(|(_, c)| c);
@@ -4643,7 +4943,7 @@ fn the_4bit_checkpoint_is_not_collapsed_or_truncated_against_mxfp8() {
         );
         match controls {
             Verdict::Agreed => judged += 1,
-            Verdict::Unjudgeable(_) => {}
+            Verdict::Unjudgeable(_) | Verdict::ShortArmExcused(_) => {}
             Verdict::Refused(why) => {
                 judged += 1;
                 refusals.push(format!("{}: {why}", prompt.name));
