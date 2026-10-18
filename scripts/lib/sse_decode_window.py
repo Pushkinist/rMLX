@@ -6,7 +6,7 @@ the rate over the same window the engine reports: first content token to last,
 `(n - 1) / (t_last - t_first)`. Prefill, connection setup and the process spawn
 all land before the first content chunk and are outside it, which is what makes
 this number comparable with `rmlx baseline`'s `decode_tps` and with the
-`decode_tps` a speculative round loop logs (docs/SPECULATIVE.md). Dividing the
+`decode_tps` a speculative round loop logs (docs/SPEC_READING_A_RUN.md). Dividing the
 completion tokens by the whole request duration measures something else and
 reads low by the prefill.
 

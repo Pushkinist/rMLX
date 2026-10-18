@@ -634,7 +634,7 @@ Drafter kinds per verifier:
 
 The drafters themselves, their loaders and refusals are in
 `docs/SPECULATIVE.md`. Accept rate and decode rate depend on the pair and the
-prompt; `docs/SPECULATIVE.md` § "Reading a run" says how they are measured.
+prompt; `docs/SPEC_READING_A_RUN.md` says how they are measured.
 
 ---
 

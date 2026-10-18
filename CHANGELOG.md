@@ -7,6 +7,201 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A Qwen3.5-family request resumes from a saved recurrent state.** A
+  prompt-cache entry of Qwen3.8 or Ternary-Bonsai-2 served an exact replay
+  only: the recurrent state cannot be cut back, so a longer or diverging prompt
+  prefilled from token 0. Two shapes now resume. A request that extends the
+  whole stored prompt resumes at the stored length. An entry also keeps one
+  saved recurrent state at the last full 256-token block that does not reach
+  the end of its prompt, and a request whose first differing token is at or
+  after that block resumes there, with the K/V cut to it. An entry whose stores
+  refuse the cut does not offer it. The saved state counts in the entry's
+  `kv_bytes`: at 4,096 tokens on Qwen3.8-27B-4bit the entry grows by 36%
+  (153,944,064 B). A cold prefill pays one clone of the state, 0.01% of the
+  time to first token at 4,096 tokens and 0.09% at 32,768. At 32,768 tokens
+  the entry is above the default 2 GiB RAM cap of the prompt cache, so it is
+  not stored and the clone buys nothing. The engine now judges every slot that
+  shares a block, best match first, and the longest reuse any slot allows
+  serves. The SSD tier spills the anchor of such an entry, so the tier serves
+  these prompts across restarts; before, an entry whose prompt ended inside a
+  block was withheld. See `docs/PROMPT_CACHE.md` and `docs/SSD_TIER.md`.
+- **`rmlx eval spec-answer --plain F --spec F` judges a speculative answer
+  against a plain one.** It reads two non-streamed chat-completion bodies that
+  carry `logprobs`, applies the divergence-confidence oracle of
+  `docs/SPEC_ANSWER_EQUIVALENCE.md` and prints the verdict, the position, the
+  margin, the rank and the reason. Exit 0 is a near tie, 1 a divergence the
+  oracle refuses, 2 an input it cannot judge. It loads no model, takes no
+  claim and opens no metrics recorder. The oracle moved from the equivalence
+  test to `rmlx_models::answer_equivalence`, so the test and the command share
+  one rule.
+
+### Changed
+
+- **`scripts/spec_bench.sh` files a near-tie flip and still stops on a real
+  divergence.** The script stopped the run when a speculative arm's answer
+  differed from the plain arm's in any byte. Greedy verification emits the
+  verifier's own argmax, but a near tie in bf16 can flip between two equally
+  right streams, so every Qwen3.8-27B 4-bit arm that met one was refused. After
+  its warmup each phase now sends one unstreamed request with `logprobs` and
+  `top_logprobs` 2, binds the answer to its arm's digest, and pauses 15 s. A
+  difference with no sampler is judged by `rmlx eval spec-answer`. A near tie
+  is filed as `answer_check=near_tie@<token>`, with `divergence_rank` and
+  `divergence_margin` in the notes. A divergence the oracle refuses, an arm
+  that ran past or stopped far short of the reference, measured speculative
+  runs that differ from each other, a pass that does not bind to its digest,
+  an unanswered pass and a judge whose exit status does not match its verdict
+  stop the run with no row. When its digest differs, EAGLE-3 is refused unless
+  its logprob pass binds.
+- **Every speculative drafter is tied to its verifier by one pairing check.**
+  The MTP sidecar was matched by the hidden size alone, DFlash and DFlash 2
+  never read the layer count of the base they were built for, and EAGLE-3 and
+  the Gemma4 assistant each kept a check of their own, so a drafter built for
+  another base loaded without a refusal. The hidden size, the layer count and
+  the vocabulary size that the drafter's config declares are now compared with
+  the verifier's in one place for all five drafters. A mismatch is
+  `Error::SpeculativePairing` and names the key and both values. A config that
+  declares none of the keys loads with a warning that names the drafter
+  directory. Behaviour change: an EAGLE-3 `config.json` must declare
+  `hidden_size` and `vocab_size`; the fallbacks 2048 and 248320 are gone. The
+  Gemma4 assistant is checked by the widths of `pre_projection.weight` and
+  `post_projection.weight`, so one without `backbone_hidden_size` is still
+  refused on a verifier of another width. No config key names the base model,
+  so two bases with the same trunk shape cannot be told apart
+  (`docs/SPECULATIVE.md`).
+- **The test targets are gemma-4-e4b, Qwen3.8-27B-4bit and
+  Ternary-Bonsai-2-27B.** `scripts/perf_canary.sh` and `scripts/perf_ab.sh`
+  default to them, as do `make model-check-full`, `perf-iter` and the
+  autoresearch defaults. The first-generation Bonsai, Qwen3.6 and medgemma
+  cells stay in the tree and run under `make gpu-test`. The codec-matrix
+  runner reads each command's own exit status (it read the status of
+  `|| true`, so a held Metal claim failed a row as an output mismatch), ends
+  `INCOMPLETE` with exit 3, and exits 1 for a failed row or a run that ran
+  nothing. `docs/TESTING.md` lists the targets and the features no target
+  covers.
+- **A moved round-stream cell is a failure only on the pinned MLX pair.** Each
+  of the six pinned speculative equivalence tests checks its own per-round
+  cells against `MANIFEST.sha256` after it has judged the answers. On another
+  MLX pair it prints `WAIVED <test>: <why>`, and `make gpu-test` ends
+  `INCOMPLETE` instead of `ok`. The manifest is re-pinned on MLX 0.32.3 and
+  mlx-c 0.7.0, and the steps for moving the pin re-pin it. `make
+  spec-round-stream-selftest` is part of `make ci`.
+
+### Fixed
+
+- **A speculative request that asks for `logprobs` gets them.** The response
+  carried no `logprobs` key. Every drafter path now reports one record per
+  emitted token: the verifier's raw log-softmax at the position that produced
+  the token, the same quantity the plain path reports. At temperature 0 the top
+  entry is the emitted token. A request that asks for none keeps no row and
+  reads nothing back. A temperature-0 EAGLE-3 request that asks for logprobs
+  scores the full vocabulary, and it can emit a token that the same request
+  without logprobs would not (`docs/SPECULATIVE.md`).
+- **A repeated prompt that asks for `logprobs` gets one record per token on
+  Qwen3.5, Gemma4, Gemma3 and BitNet.** An exact prompt-cache hit replays the
+  cached first token without recomputing its logits, and only Qwen3 stored that
+  token's record, so the other four returned one record fewer than tokens.
+  Each now stores the record in the entry and replays it cut to the request's
+  `top_logprobs`. Laguna, Qwen2 and Qwen3-VL-MoE emit no logprobs on any path,
+  a miss included. An entry that comes back from the SSD tier is never an exact
+  hit; its repeat prefills again. Qwen3, Gemma3, Gemma4 and BitNet no longer
+  clone and evaluate the whole KV snapshot on a miss when the cache cannot
+  store the entry (no cache slots, or paged KV).
+- **An assistant message's `reasoning_content` reaches the chat template.**
+  `/v1/chat/completions` dropped the field, so a template that reads it
+  (Qwen3.8, Ternary-Bonsai-2) rendered every earlier assistant turn with an
+  empty think block, and the prompt of turn N+1 never extended the prompt of
+  turn N. The field now travels as the client sent it, on any role. Absent and
+  `null` stay absent, and an empty string is defined and empty. It counts
+  toward the input bound like `content`. `/v1/messages` has no such field.
+- **A reused or exact-hit prompt-cache entry is bound to the context ceiling of
+  the new request.** The entry kept the ceiling of the request that stored it.
+  Gemma4, Qwen3.5, Qwen3 and Qwen3-VL-MoE now resolve the context before the
+  cache lookup and rebind the cache to the new ceiling; a prompt above it is
+  the typed `KvCeilingExceeded`.
+- **An SSD-tier hit on a Qwen3.5-family model no longer feeds tokens twice.**
+  The spill wrote an entry's caches at the prompt length L, and the hydrate
+  restored them at L but labelled the entry with the block-aligned prefix, so
+  the tokens between that prefix and L entered the K/V and the recurrent state
+  twice, with no error. A hydrated block is now brought to exactly the prefix
+  its digest names: the K/V past the claim is cut, together with the bf16
+  decode seed, and a recurrent state is reused only when it sits at the claim.
+  A block that records no position is a miss. An unusable block is deleted by
+  its row only if the row still has the size and `last_used` it was read with,
+  so a spill of the same key that landed since keeps its block.
+  `SCHEMA_VERSION` is 9: the SSD cache of an older version is wiped on first
+  open and starts empty after the upgrade.
+- **Two first opens of one SSD index both succeed.** `SsdKvIndex::open_at`
+  failed for the loser of two concurrent first opens of a namespace: SQLite
+  does not call the busy handler for the switch to WAL, and the choice between
+  a new and an existing file read `Path::exists()`, so the loser saw the
+  winner's file and refused it as schema version 1. A spiller thread that lost
+  the race logged one warning and then dropped every spill job for the life of
+  the process. The pragmas now retry on `SQLITE_BUSY` up to one busy-wait
+  bound, and the schema is created or checked in one `BEGIN IMMEDIATE`
+  transaction, decided by which tables are present. A 0-byte index file left by
+  a crash opens as new. A failed index open in the spiller thread, or a failed
+  hydrator open at start-up, is an `error!` event that names the namespace.
+- **`rmlx eval ppl` and `rmlx baseline --record` record any model namespace and
+  refuse a bad identity before the work.** `rmlx eval ppl` scored a whole
+  corpus for 18 minutes and then refused to record, because the namespace of
+  the snapshot was not on a fixed list. The namespace is a free-form label
+  like `kv_quant`, refused only when empty. The command now resolves the
+  namespace, the model and the checked weight format before any work, so a
+  refusal costs seconds. The ingest scripts take the snapshot directory name
+  only, never a parent directory, and file a row as `<namespace>/<model>`.
+  Rows that an earlier release filed as `local/<name>` for an unlisted
+  namespace stay as they are, in a separate `bests` cell.
+- **A speculative round that does not advance the verifier by what it fed is an
+  error.** The loop read the position of the KV stack before and after the
+  verify forward as the largest offset over the layers and never compared the
+  two reads. The stack position now comes from one producer that refuses a
+  stack whose advancing layers disagree and names two of them. After every
+  verify forward a round whose new position is not the old one plus the rows
+  fed is refused. Both are plain errors that hold under `release-perf`, read
+  host-side integers only, and add no evaluation per round. A two-model pair
+  asked only the verifier whether a KV codec is legal, so a draft model that
+  refuses the codec was built at it: the server reached `ready` with a Qwen3.5
+  MoE draft model at `k_iso4`. Both models are now asked at start-up, per
+  request and before the draft model's cache is built.
+- **Bench scripts attribute a shared run log by pid and file a row under the
+  commit of the run identity.** The run id has a granularity of one second, so
+  an `rmlx` process that started in the same second as the previous one
+  appended to its log. `bench_server.sh` kept only log files that were new
+  since its snapshot, did not find the server's log, and lost the run after
+  its first arm had been filed. A log that is new or has grown is now a
+  candidate, the one with an `rmlx start` event from the server's pid wins, and
+  a phase whose bytes carry another pid's start is refused.
+  `scripts/spec_bench.sh` overwrote the `git_sha` of the identity with the
+  checkout's HEAD, so a binary measured from a checkout at another commit was
+  filed under the wrong commit. The commit is now the identity's, shortened
+  when it resolves in the checkout, else the checkout's HEAD, else `unknown`,
+  in the six scripts that file a row.
+
+### Performance
+
+- **The padded prefill mask is built once per forward.** A prefill-sized
+  attention call whose query rows the row rule pads copied the mask to the
+  padded rows on every layer: about 469 MB per padded layer on Qwen3.8-27B at
+  130,790 tokens. The Qwen3.5-family prefill mask is now built once, at the
+  rows of the attention node and in the query dtype, and `sdpa_under` takes a
+  mask that is already at the padded rows as it is. On a Qwen3.8-shaped layer
+  at 1,766 query rows the copying call needed 57,720,832 B more peak than the
+  pre-padded call at 16,102 keys and 116,441,088 B more at 32,486. On
+  Qwen3.8-27B-4bit the token ids at 7,910, 8,192 and 32,486 tokens are
+  identical, the generation allocation is equal, and the prefill rate is
+  within 1%.
+
+### Documentation
+
+- **`docs/SPEC_READING_A_RUN.md` states what a round costs.** Each extra fed row
+  costs about 0.095 of a plain step on Qwen3.8-27B-4bit and 0.113 on
+  gemma-4-e4b-it-mxfp8, from the quantised matmul itself, with a step between 5
+  and 6 rows. A speed-up is the tokens per round over the round cost in plain
+  steps, and the round cost differs by weight format. The doc also holds what
+  `SPECULATIVE.md` § "Reading a run" held, split out for size.
+
 ## [0.4.4] - 2026-10-17
 
 This release serves Ternary-Bonsai-2-27B and the other Prism Hadamard packs.

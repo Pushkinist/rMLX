@@ -12,7 +12,7 @@ a 4k prompt reads roughly half the real one. There is one decode rate on that
 line, the engine computed it, and this is the only place it is read.
 
 `decode_tps` is an `Option<f64>` rendered through `Debug`, so the JSON field is
-the string `Some(20.98)` or `None` (docs/SPECULATIVE.md). `None` means the run
+the string `Some(20.98)` or `None` (docs/SPEC_READING_A_RUN.md). `None` means the run
 emitted fewer than two tokens and has no interval to measure — not a rate of
 zero, and not something to substitute another number for.
 

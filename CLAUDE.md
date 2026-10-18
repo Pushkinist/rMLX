@@ -65,7 +65,8 @@ areas before touching code:
 | [`docs/SSD_TIER.md`](docs/SSD_TIER.md) | SSD KV tier (layout_key, ssd_index schema, hydrate, spill, cross-namespace LRU) |
 | [`docs/SSD_CANARY.md`](docs/SSD_CANARY.md) | SSD KV cross-restart smoke probe |
 | [`docs/PROMPT_CACHE.md`](docs/PROMPT_CACHE.md) | Prompt cache + automatic prefix caching (block hashing, ReusePolicy, prefix index) |
-| [`docs/SPECULATIVE.md`](docs/SPECULATIVE.md) | Speculative decoding: the drafters (MTP, DFlash, EAGLE-3, two full models), the round loop, reading a run, judging a draft-side change, CLI |
+| [`docs/SPECULATIVE.md`](docs/SPECULATIVE.md) | Speculative decoding: the drafters (MTP, DFlash, EAGLE-3, two full models), the round loop, judging a draft-side change, CLI |
+| [`docs/SPEC_READING_A_RUN.md`](docs/SPEC_READING_A_RUN.md) | Reading a speculative run, split out of `SPECULATIVE.md` for size: the request record, the round event, charged and uncharged phases, benching an arm, and what a round costs (the verify cost of one more fed row, the step at 6 rows, the round cost by weight format) |
 | [`docs/SPEC_ANSWER_EQUIVALENCE.md`](docs/SPEC_ANSWER_EQUIVALENCE.md) | Answer equivalence for speculative decoding: the divergence-confidence oracle, why agreement cannot be thresholded |
 | [`docs/SPEC_ROUND_SKELETON.md`](docs/SPEC_ROUND_SKELETON.md) | The speculative round loop `run_rounds` and the `RoundDrafter` interface: what each drafter declares, what differs per drafter, the two two-model entries kept apart, the oracle, what no runtime check sees |
 | [`docs/SAMPLING.md`](docs/SAMPLING.md) | Per-token sampling (temperature, top-k/p, penalties, thinking budget, constrained decoding) |

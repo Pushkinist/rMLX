@@ -92,7 +92,7 @@ loop refuses a round whose drafter returned without calling it.
 | two-model, both rules | carried | in-round exit | after | no | the draft model's stacks | `None` | default | no |
 
 "Charges phases" is the entry's `charged` field: `phases_charged()` where yes,
-`false` where no. `docs/SPECULATIVE.md` § "Charged and uncharged phases" says
+`false` where no. `docs/SPEC_READING_A_RUN.md` § "Charged and uncharged phases" says
 what a charged phase is.
 
 ### Why the report fields are paired
