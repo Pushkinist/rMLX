@@ -44,13 +44,17 @@ pub const MIN_LENGTH_RATIO: f64 = 0.60;
 ///
 /// The measurement leaves a band, and the value sits inside it: above the worst
 /// correct cell (0.0827, 1.45x) and under the lowest broken cell above it
-/// (0.1445, 1.20x). It clears every correct cell. Every broken engine here was
-/// refused on at least four of the prompts the gate judged for it — which is what
-/// running every prompt rather than one buys, since no broken engine is refused
-/// on all of them by this oracle alone. **That count was taken before the
-/// short-arm excuse existed**; the re-read of every broken engine under the
-/// current rule is pending, and until it is done the count stands as measured
-/// under the previous rule.
+/// (0.1445, 1.20x). It clears every correct cell. Every broken engine here is
+/// refused on at least four of the prompts the gate judges for it, except one
+/// (named below) — which is what running every prompt rather than one buys, since
+/// no broken engine is refused on all of them by this oracle alone. Re-read under
+/// the current rule, the one-rejected-draft engine is refused on 5 of 6 prompts
+/// on the block pair (6 of 6 at its declared block), 6 of 6 on the adaptive pair
+/// (5 of 5 over its whole schedule, the sixth prompt excused as a short arm) and 5
+/// of 5 on the two-model pair. On the restricted-vocabulary pair it is refused on
+/// 5 prompts; that run stopped on its trace-switch guard before the 4k prompt was
+/// judged. Some of these refusals come from the repetition control and not from
+/// this oracle.
 ///
 /// **The adaptive pair's two rows are the same engine at two blocks.** Judged,
 /// each reads up to 0.0703. On the 4k document each reads 0.0827 at a cell the
@@ -64,11 +68,11 @@ pub const MIN_LENGTH_RATIO: f64 = 0.60;
 /// prefilled in different pieces from the speculative arm, a defect since fixed,
 /// so that reading is not a correct reading and is left out of the rows above.
 ///
-/// One broken engine is outside that statement, and that is a property of the
-/// defect rather than of the ceiling: leaving the correction on the restricted
-/// argmax only changes an answer where that vocabulary falls short of the
-/// verifier's, which the runs measure at one to five tokens per answer. It is
-/// refused on one of the five prompts the gate judges, at a token the
+/// One broken engine is below four, and that is a property of the defect rather
+/// than of the ceiling: leaving the correction on the restricted argmax only
+/// changes an answer where that vocabulary falls short of the verifier's, which
+/// the runs measure at one to five tokens per answer. It is refused on one of the
+/// six prompts the gate judges (five read as agreed), at a token the
 /// drafter's vocabulary cannot name — and at the round's **correction**, which
 /// is the only thing that keeps it refused now that the declared
 /// restricted-vocabulary boundary at an accepted position is not.

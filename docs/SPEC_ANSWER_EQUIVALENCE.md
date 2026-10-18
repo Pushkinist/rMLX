@@ -303,10 +303,16 @@ it. Both sides are measured:
   takes it.
 - Broken side: a broken engine refused on `k` prompts without the excuse is
   refused on at least `k - 1` with it, since the bound lets at most one prompt
-  through. Every broken engine measured before the excuse existed was refused on
-  four prompts or more, so it keeps at least three. To pass, a broken engine would
-  have to be refused on one prompt at most, which none measured is. The re-read
-  of every broken engine under the current rule is pending.
+  through. Re-read under the current rule with `scripts/spec_broken_engine.sh`,
+  the `rejected-draft-kept` engine is refused on 5 of 6 judged prompts on the
+  block pair (6 of 6 at its declared block), 6 of 6 on the adaptive pair (5 of 5
+  over its whole schedule, the sixth prompt excused), and 5 of 5 on the two-model
+  pair. On the restricted-vocabulary pair it is refused on 5 prompts; the run then
+  stopped on its trace-switch guard before the 4k prompt was judged. The
+  `correction-restricted` engine is refused on 1 of 6 judged prompts, on a
+  full-length arm, which the excuse does not reach. Every engine but that one is
+  refused on at least five prompts, and an engine passes only if every refusal is
+  hidden.
 
 **The class this gives up:** a round loop that ends early on a stop id because
 of a state defect, after a legitimate near tie. The first difference is
