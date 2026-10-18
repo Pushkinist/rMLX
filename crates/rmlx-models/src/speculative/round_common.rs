@@ -1,8 +1,9 @@
 //! What every speculative round loop sets up, and closes out, the same way.
 //!
-//! The two cache-stack functions cannot have a unit test: an [`Architecture`]
-//! is only reachable by loading weights. What gates them is a round-loop run
-//! against a real pair — `the_assistant_round_loop_reproduces_plain_greedy` in
+//! The two cache-stack functions need an [`Architecture`]. `round_loop_tests.rs`
+//! runs them against a tiny synthetic verifier, for the ceiling only. What
+//! gates their codec and geometry is a round-loop run against a real pair —
+//! `the_assistant_round_loop_reproduces_plain_greedy` in
 //! `crates/rmlx-models/tests/spec_greedy_equivalence.rs` is the cheapest — and
 //! the per-round event stream that run writes.
 //!
@@ -24,9 +25,10 @@ use rmlx_mlx::{concatenate, Array, Device};
 use super::round_loop::DecidedBy;
 use super::{DecodeWindow, RoundStats, ScoredBlock, SpecLoop};
 use crate::arch::Architecture;
+use crate::context::{resolve_context, ResolvedContext};
 use crate::decode_loop::ProbeStep;
 
-/// The KV codec, context ceiling and per-layer cache stack a round loop runs
+/// The KV codec, resolved context and per-layer cache stack a round loop runs
 /// its verifier on.
 ///
 /// The codec is the request's override or the same constant the verifier's own
@@ -38,7 +40,8 @@ use crate::decode_loop::ProbeStep;
 /// through [`crate::context::resolve_context`] keeps the speculative path on
 /// the one resolution every other context cap reads, and gives it the same
 /// refusal: a `--max-ctx` above the verifier's positional capacity used to be
-/// taken verbatim here and only surfaced as a cache overflow mid-round.
+/// taken verbatim here and only surfaced as a cache overflow mid-round. The
+/// loop takes its token budget from the returned context.
 ///
 /// # Errors
 ///
@@ -48,11 +51,11 @@ pub(crate) fn verifier_cache_stack(
     verifier: &Architecture,
     kv_quant_override: Option<KvQuant>,
     max_ctx_override: Option<i32>,
-) -> Result<(KvQuant, i32, Vec<KvCache>)> {
+) -> Result<(KvQuant, ResolvedContext, Vec<KvCache>)> {
     let kv_quant = kv_quant_override.unwrap_or(crate::kv_cache::DEFAULT_KV_QUANT);
-    let max_seq =
-        crate::context::resolve_context(&verifier.context_limits(), max_ctx_override)?.ceiling;
-    Ok((kv_quant, max_seq, cache_stack(verifier, kv_quant, max_seq)))
+    let resolved = resolve_context(&verifier.context_limits(), max_ctx_override)?;
+    let kv = cache_stack(verifier, kv_quant, resolved.ceiling);
+    Ok((kv_quant, resolved, kv))
 }
 
 /// One model's per-layer cache stack for one speculative request.

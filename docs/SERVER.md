@@ -157,7 +157,7 @@ on the request's tracing span. The response `id` is built from it:
 | `repetition_penalty`, `frequency_penalty`, `presence_penalty` | f32 | Same. |
 | `logit_bias` | object | Token id (string key) → finite bias. A bad key or a non-finite value is 400. |
 | `seed` | u64 | |
-| `max_tokens` | u32 | Default 512. Capped at `--max-tokens-cap`, itself bounded by 1 048 576. Over the cap is 400, never clamped. |
+| `max_tokens` | u32 | Default 512. Capped at `--max-tokens-cap`, itself bounded by 1 048 576. Over the cap is 400, never clamped. A value above the room that the context ceiling leaves after the prompt is not refused: the generation stops at the ceiling, keeps its output and ends with `finish_reason:"length"`. |
 | `stop` | string or array | Stop sequences. |
 | `tools` | array | OpenAI function specs. |
 | `tool_choice` | string or object | `"auto"`, `"none"`, `"required"` or `{type:"function",function:{name:…}}`. |
@@ -198,7 +198,10 @@ can sweep codec and context cells, or run a different KV policy per request.
   `rmlx_models::context::resolve_context`, the same function as the launch
   `--max-ctx`. A value above the checkpoint's positional capacity is 400
   `context_length_exceeded`, never clamped. The prompt-length guard then uses
-  the resolved ceiling.
+  the resolved ceiling. The engine generates at most `ceiling - prompt`
+  tokens, with the prompt counted after image expansion, for every
+  architecture and every drafter. A prompt that leaves no room is the same
+  400, also when it is equal to the ceiling.
 - `/v1/messages` does not take these fields; it uses the launch defaults.
 - There is no per-request SSD-tier switch; see `docs/SSD_TIER.md`
   § "Live reconfiguration".
@@ -283,8 +286,9 @@ and adds no text.
 `usage.completion_tokens` is the number of tokens the model generated, also
 in the usage chunk of a stream: each decode step counts once, a reasoning
 token and the end-of-turn token included. A reply that ends on `max_tokens`
-reports at most `max_tokens`. A `stop` string cuts the text, not the count:
-the engine runs to the end of the generation and every step counts. The
+reports at most `max_tokens`, and at most the room under `max_ctx`. A `stop`
+string cuts the text, not the count: the engine runs to the end of the
+generation and every step counts. The
 `tokens_out` counter and the `completion_tokens_live` metric carry the same
 figure.
 
@@ -475,7 +479,7 @@ Errors use the OpenAI envelope:
 | HTTP | `type` | Condition |
 |---|---|---|
 | 400 | `invalid_request_error` | Bad field, out-of-range value, `echo:true`, `functions`, over-cap `max_tokens`, refused media input. |
-| 400 | `context_length_exceeded` | The prompt exceeds the effective `max_ctx`, or a per-request `max_ctx` exceeds the positional capacity. Image or audio tokens spliced in after the prompt check can push a prompt past `max_ctx`: the engine answers the same 400, counter `context_overflow`, also as the error event of a stream. |
+| 400 | `context_length_exceeded` | The prompt leaves no room under the effective `max_ctx`, or a per-request `max_ctx` exceeds the positional capacity. Image or audio tokens spliced in after the prompt check can push a prompt past `max_ctx`: the engine answers the same 400, counter `context_overflow`, also as the error event of a stream. |
 | 404 | `not_found_error` | Chat or embeddings model not in the registry (`model_not_found` on the lifecycle routes). |
 | 408 | `timeout` | The request timeout expired. |
 | 429 | `rate_limit_error` | The GPU admission queue is full. |
@@ -508,8 +512,8 @@ generator. See [Session cache](#session-cache).
 | Field | Type | Notes |
 |---|---|---|
 | `model` | string (required) | Registry model id. |
-| `max_tokens` | u32 (required) | Missing is 400. |
-| `messages` | array (required) | `role` and `content` (string or block array). See "Message blocks" below. |
+| `max_tokens` | u32 (required) | Missing is 400. A value above the room under the context ceiling ends the reply with `stop_reason:"max_tokens"` at the ceiling. |
+| `messages` | array (required) | `role` and `content` (string or block array). `input_audio` blocks carry `source:{type:"base64",data:…}`. See "Message blocks" below. |
 | `system` | string or array | System prompt, rendered through the chat template. |
 | `temperature`, `top_p`, `top_k` | number | Same resolution order as the OpenAI route. |
 | `stop_sequences` | array | Stop sequences. |

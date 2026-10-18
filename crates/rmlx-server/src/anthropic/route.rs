@@ -630,20 +630,23 @@ pub(crate) async fn messages(
     gen_req.event_recorder = state.metrics.clone();
 
     // Enforce per-request prompt length ceiling. Mirror of the OpenAI
-    // route guard — see `openai.rs` for full rationale. Slot=None or a
-    // generator that does not override `effective_max_ctx` returns usize::MAX,
-    // letting the existing 503 path catch real runtime overflows.
+    // route guard. Slot=None or a generator that does not override
+    // `effective_max_ctx` returns usize::MAX, leaving the engine's own check as
+    // the guard there.
     {
         let effective_max_ctx = state.effective_max_ctx_for(&req.model);
         let prompt_len = gen_req.prompt_tokens.len();
-        if prompt_len > effective_max_ctx {
+        if prompt_len >= effective_max_ctx {
             state
                 .error_counts
                 .increment(ApiErrorCategory::ContextOverflow);
             return error_response(
                 StatusCode::BAD_REQUEST,
                 "context_length_exceeded",
-                &format!("prompt has {prompt_len} tokens, max_ctx is {effective_max_ctx}"),
+                &format!(
+                    "prompt has {prompt_len} tokens and leaves no room to generate, \
+                     max_ctx is {effective_max_ctx}"
+                ),
             );
         }
     }

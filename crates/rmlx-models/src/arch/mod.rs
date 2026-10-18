@@ -994,6 +994,37 @@ impl Architecture {
         }
     }
 
+    /// The number of tokens a request may generate: `n_tokens`, cut to the room
+    /// the request's context ceiling leaves after the prompt.
+    ///
+    /// Every generation entry of this type takes its token count from here, so
+    /// an architecture whose own loop reads no ceiling is bounded too.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ContextCeilingExceeded`] when `max_ctx_override` is above the
+    /// checkpoint's positional capacity, and [`Error::KvCeilingExceeded`] when
+    /// the prompt leaves no room for a token.
+    fn decode_budget(
+        &self,
+        prompt_len: usize,
+        n_tokens: usize,
+        max_ctx_override: Option<i32>,
+    ) -> Result<usize> {
+        let ctx = crate::context::resolve_ceiling(&self.context_limits(), max_ctx_override)?;
+        let budget = ctx.decode_budget(prompt_len, n_tokens)?;
+        if budget < n_tokens {
+            tracing::info!(
+                prompt_len,
+                requested = n_tokens,
+                budget,
+                ceiling = ctx.ceiling,
+                "generation cut to the room the context ceiling leaves"
+            );
+        }
+        Ok(budget)
+    }
+
     /// Greedy generation using KV-cache prefill + decode (all architectures).
     ///
     /// `kv_quant` selects the KV cache quantization mode. Pass `None` for the
@@ -1003,8 +1034,11 @@ impl Architecture {
     /// `max_ctx_override` sets the KV buffer size. Pass `None` to use the
     /// model's `max_position_embeddings` (capped at `KV_MAX_SEQ_DEFAULT`).
     /// Pass `Some(n)` to use `n` as the KV ceiling of the request: the cache
-    /// grows lazily up to it and a longer prompt is refused. Typically
-    /// sourced from the `--max-ctx` CLI flag.
+    /// grows lazily up to it and a longer prompt is refused. The generation
+    /// stops at the ceiling: `n_tokens` is cut to the room the prompt leaves
+    /// and the cut output is returned, the same as a stop at `n_tokens`. A
+    /// prompt that leaves no room is refused with [`Error::KvCeilingExceeded`].
+    /// Typically sourced from the `--max-ctx` CLI flag.
     ///
     /// `step_fn` is called once per generated token (immediately after the step
     /// is pushed to the result vector) so callers can stream tokens as produced.
@@ -1066,6 +1100,8 @@ impl Architecture {
         // mismatched declaration cannot route around the guard, and a quant
         // supplied per-request is checked on the same terms as a launch flag.
         self.validate_kv_quant(kv_quant)?;
+
+        let n_tokens = self.decode_budget(prompt_ids.len(), n_tokens, max_ctx_override)?;
 
         tracing::info!(
             arch = arch_name,
@@ -1279,6 +1315,7 @@ impl Architecture {
         match self {
             Architecture::Gemma4(m) => {
                 let kv_quant: KvQuant = kv_quant_override.unwrap_or(DEFAULT_KV_QUANT);
+                let n_tokens = self.decode_budget(prompt_ids.len(), n_tokens, max_ctx_override)?;
                 crate::gemma4::generate_greedy(
                     m,
                     tokenizer,
@@ -1301,6 +1338,7 @@ impl Architecture {
             }
             Architecture::Gemma3(m) => {
                 let kv_quant: KvQuant = kv_quant_override.unwrap_or(DEFAULT_KV_QUANT);
+                let n_tokens = self.decode_budget(prompt_ids.len(), n_tokens, max_ctx_override)?;
                 // Gemma3 has no per-layer-input gating, so `masked_ids` is
                 // unused (the scatter-merged embeds carry everything). The
                 // prompt cache is bypassed internally for an image prompt

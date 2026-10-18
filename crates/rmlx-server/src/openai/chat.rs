@@ -1109,11 +1109,11 @@ pub(crate) async fn chat_completions(
     // routes — but the lease still protects in-flight decodes.
     let decode_lease_guard = state.decode_lease_guard(&req.model);
 
-    // Enforce the per-request prompt-length ceiling. Without this guard a
-    // prompt that overflows the KV-cache capacity bottoms out as either a 503
-    // "generation produced zero tokens" or a 200 with completion_tokens=0.
+    // Enforce the per-request prompt-length ceiling before any work. The engine
+    // cuts the generation to the room the ceiling leaves after the prompt, and
+    // refuses a prompt with no room with the same 400.
     // Slot=None (cold-start race) or NotReadyGenerator default → usize::MAX,
-    // letting the existing 503 path catch real runtime overflows there.
+    // leaving the engine's own check as the guard there.
     {
         // A per-request `max_ctx` override re-sizes the KV-ring
         // ceiling for this one request, so it becomes the guard's ceiling —
@@ -1141,14 +1141,17 @@ pub(crate) async fn chat_completions(
             None => state.effective_max_ctx_for(&req.model),
         };
         let prompt_len = gen_req.prompt_tokens.len();
-        if prompt_len > effective_max_ctx {
+        if prompt_len >= effective_max_ctx {
             state
                 .error_counts
                 .increment(ApiErrorCategory::ContextOverflow);
             return error_response(
                 StatusCode::BAD_REQUEST,
                 "context_length_exceeded",
-                &format!("prompt has {prompt_len} tokens, max_ctx is {effective_max_ctx}"),
+                &format!(
+                    "prompt has {prompt_len} tokens and leaves no room to generate, \
+                     max_ctx is {effective_max_ctx}"
+                ),
             );
         }
     }

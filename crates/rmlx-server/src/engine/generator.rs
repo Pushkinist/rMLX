@@ -57,8 +57,7 @@ pub trait Generator: Send + Sync {
     /// `context_length_exceeded` when the prompt overflows.
     ///
     /// Default `usize::MAX` makes the guard a no-op for generators that don't
-    /// participate in KV-cache sizing (e.g. `NotReadyGenerator`); the
-    /// fall-through 503 path still catches actual runtime overflows there.
+    /// participate in KV-cache sizing (e.g. `NotReadyGenerator`).
     fn effective_max_ctx(&self) -> usize {
         usize::MAX
     }

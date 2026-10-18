@@ -208,6 +208,51 @@ fn the_round_block_is_one_function_of_the_block_and_the_budget() {
     assert_eq!(dflash_next_block_size(&[(0, 7), (0, 7)], 16, 16), 4);
 }
 
+/// A round never writes a KV position past `prompt + n_tokens`, which is the
+/// ceiling the decode budget leaves.
+///
+/// A round starts with the verifier's cache at `prompt + emitted - 1`: the
+/// carry token is not yet in it, whether the seed was emitted (`emitted >= 1`)
+/// or is the prompt's own last token (`emitted == 0`). It feeds the carry and
+/// every draft, so it writes `block` positions. The sum stays at or under
+/// `prompt + n_tokens` when `emitted + block <= n_tokens + 1`.
+///
+/// The block comes from the shared narrowing and from DFlash 1's schedule, the
+/// one drafter that overrides it.
+///
+/// Mutation: change `round_block` to `block_total.min(remaining + 2)`.
+#[test]
+fn a_round_never_writes_past_the_request_budget() {
+    let histories: [&[(usize, usize)]; 5] = [
+        &[],
+        &[(0, 7), (0, 7)],
+        &[(3, 7), (3, 7), (2, 7)],
+        &[(7, 7), (7, 7), (7, 7), (7, 7)],
+        &[(6, 7), (7, 7), (7, 7), (5, 7)],
+    ];
+    for block_total in 2..=16usize {
+        for n_tokens in 1..=64usize {
+            for emitted in 0..n_tokens {
+                let remaining = n_tokens - emitted;
+                let shared = round_block(block_total, remaining);
+                assert!(
+                    emitted + shared <= n_tokens + 1,
+                    "shared narrowing at block {block_total}: emitted {emitted} of \
+                     {n_tokens} runs a block of {shared}"
+                );
+                for recent in histories {
+                    let adaptive = dflash_next_block_size(recent, block_total, remaining);
+                    assert!(
+                        emitted + adaptive <= n_tokens + 1,
+                        "DFlash schedule at block {block_total}: emitted {emitted} of \
+                         {n_tokens} runs a block of {adaptive} after {recent:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// The verifier's rollback target keeps the carry and the accepted prefix, and
 /// names the position the post-forward read names.
 ///

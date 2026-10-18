@@ -308,8 +308,8 @@ pub(crate) fn engine_error_message(e: &rmlx_core::Error) -> String {
 ///
 /// `SmokeProbe` (NaN logits, broken snapshot) → 500 internal_error.
 /// `InvalidInput` (media the client got wrong) → 400 invalid_request_error.
-/// `KvCeilingExceeded` (a prompt, image and audio tokens included, or a
-/// generation past `max_ctx`) → 400 context_length_exceeded.
+/// `KvCeilingExceeded` (a prompt, image and audio tokens included, that
+/// leaves no room under `max_ctx`) → 400 context_length_exceeded.
 /// `Oom` → 507 / 503 typed body with `Retry-After` per phase. No production
 /// request reaches this fn with an `Oom`: `ensure_loaded` failures (the only
 /// place an `Oom` is constructed) are mapped to a plain 503 before this fn

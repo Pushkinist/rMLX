@@ -1891,7 +1891,7 @@ fn effective_max_ctx_for_resident_and_absent() {
     assert_eq!(
         state.effective_max_ctx_for("m0"),
         usize::MAX,
-        "absent model → usize::MAX (503 path catches real overflow)"
+        "absent model → usize::MAX (the engine's own check answers)"
     );
     state.ensure_loaded_blocking("m0").unwrap();
     // NotReadyGenerator's default effective_max_ctx is usize::MAX, so the

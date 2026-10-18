@@ -405,6 +405,9 @@ mod loader_tests;
 #[path = "pack_loader_tests.rs"]
 mod pack_loader_tests;
 
+#[cfg(test)]
+pub(crate) use pack_loader_tests::attention_only_architecture;
+
 // ---------------------------------------------------------------------------
 // load_from_path_paro — PARO dense checkpoint
 // ---------------------------------------------------------------------------

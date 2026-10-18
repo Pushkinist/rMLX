@@ -36,6 +36,8 @@
 //!   `end_of_turn` and `after_reasoning`.
 //! - a reasoning step stops counting: `usage_counts_the_decode_steps` fails on
 //!   `after_reasoning`.
+//! - a generation cut below `max_tokens` reaches the client as `stop`, or with
+//!   a count other than the cut: `a_cut_at_the_ceiling_reports_length_and_the_cut`.
 //! - a path keeps the old figure for the process counter or the metrics
 //!   observation: `counter_and_metrics_equal_usage`.
 //! - the terminal item counts when it carries text (the predicate reads the
@@ -205,8 +207,24 @@ const STOP_STRING_AT_A_STEP_START: Case = Case {
     stop: Some("b"),
 };
 
-const CASES: [Case; 6] = [
+/// The engine stops at the context ceiling before `max_tokens`: three steps of
+/// a request for 64, ended with `length`. The reply must say `length` and
+/// count the three.
+const CUT_AT_THE_CEILING: Case = Case {
+    name: "cut_at_the_ceiling",
+    steps: &[answer("a"), answer("b"), answer("c")],
+    finish: "length",
+    max_tokens: 64,
+    expected: 3,
+    content: "abc",
+    reasoning: "",
+    tail: "",
+    stop: None,
+};
+
+const CASES: [Case; 7] = [
     LENGTH,
+    CUT_AT_THE_CEILING,
     END_OF_TURN,
     AFTER_REASONING,
     MID_CHARACTER,
@@ -484,6 +502,9 @@ fn sse_events(raw: &str) -> Vec<Value> {
 /// the two other outputs that carry the figure.
 struct Observed {
     usage: u64,
+    /// The finish reason on the wire: `finish_reason` of an OpenAI reply or
+    /// `stop_reason` of an Anthropic one.
+    finish: String,
     content: String,
     reasoning: String,
     tokens_out: u64,
@@ -493,12 +514,16 @@ struct Observed {
 async fn observe(route: Route, case: Case) -> Observed {
     let server = start_server(case).await;
     let raw = post(server.port, route.path(), &route.body(case)).await;
-    let (usage, content, reasoning) = match route {
+    let (usage, finish, content, reasoning) = match route {
         Route::OpenAi => {
             let v: Value = serde_json::from_str(&raw).unwrap();
             let message = &v["choices"][0]["message"];
             (
                 v["usage"]["completion_tokens"].as_u64().unwrap(),
+                v["choices"][0]["finish_reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
                 message["content"].as_str().unwrap_or_default().to_owned(),
                 message["reasoning_content"]
                     .as_str()
@@ -518,7 +543,12 @@ async fn observe(route: Route, case: Case) -> Observed {
                 .iter()
                 .find_map(|e| e["usage"]["completion_tokens"].as_u64())
                 .unwrap_or_else(|| panic!("no usage chunk in: {raw}"));
-            (usage, delta("content"), delta("reasoning_content"))
+            let finish = events
+                .iter()
+                .find_map(|e| e["choices"][0]["finish_reason"].as_str())
+                .unwrap_or_default()
+                .to_owned();
+            (usage, finish, delta("content"), delta("reasoning_content"))
         }
         Route::Anthropic => {
             let v: Value = serde_json::from_str(&raw).unwrap();
@@ -533,6 +563,7 @@ async fn observe(route: Route, case: Case) -> Observed {
             };
             (
                 v["usage"]["output_tokens"].as_u64().unwrap(),
+                v["stop_reason"].as_str().unwrap_or_default().to_owned(),
                 block("text", "text"),
                 block("thinking", "thinking"),
             )
@@ -551,8 +582,15 @@ async fn observe(route: Route, case: Case) -> Observed {
                 .find(|e| e["type"] == "message_delta")
                 .and_then(|e| e["usage"]["output_tokens"].as_u64())
                 .unwrap_or_else(|| panic!("no message_delta usage in: {raw}"));
+            let finish = events
+                .iter()
+                .find(|e| e["type"] == "message_delta")
+                .and_then(|e| e["delta"]["stop_reason"].as_str())
+                .unwrap_or_default()
+                .to_owned();
             (
                 usage,
+                finish,
                 delta("text_delta", "text"),
                 delta("thinking_delta", "thinking"),
             )
@@ -561,6 +599,7 @@ async fn observe(route: Route, case: Case) -> Observed {
     let metrics = completion_tokens_observed(&server.metrics_db).await;
     Observed {
         usage,
+        finish,
         content,
         reasoning,
         tokens_out: server.tokens_out.load(Ordering::Relaxed),
@@ -622,6 +661,38 @@ async fn a_length_reply_never_exceeds_max_tokens() {
                     case.max_tokens
                 ));
             }
+        }
+    }
+    assert_no_rows_wrong(&wrong);
+}
+
+/// A generation that the engine ends below `max_tokens`, at the context
+/// ceiling, reaches the client as a length stop on every route, with the cut
+/// as its token count.
+#[tokio::test]
+async fn a_cut_at_the_ceiling_reports_length_and_the_cut() {
+    let mut wrong = Vec::new();
+    for route in ROUTES {
+        let seen = observe(route, CUT_AT_THE_CEILING).await;
+        let want = if route.is_anthropic() {
+            "max_tokens"
+        } else {
+            "length"
+        };
+        if seen.finish != want {
+            wrong.push(format!(
+                "{}: finish {:?}, expected {want:?}",
+                route.label(),
+                seen.finish
+            ));
+        }
+        if seen.usage != CUT_AT_THE_CEILING.expected {
+            wrong.push(format!(
+                "{}: usage {}, expected {}",
+                route.label(),
+                seen.usage,
+                CUT_AT_THE_CEILING.expected
+            ));
         }
     }
     assert_no_rows_wrong(&wrong);

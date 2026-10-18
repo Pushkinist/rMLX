@@ -196,9 +196,43 @@ impl ResolvedContext {
     pub fn positional_tokens(&self) -> Option<usize> {
         usize::try_from(self.positional_max).ok().filter(|n| *n > 0)
     }
+
+    /// How many tokens a request may generate: `n_tokens`, cut to the room the
+    /// ceiling leaves after the prompt.
+    ///
+    /// The cut is `ceiling - prompt_len` tokens. The plain decode loop needs one
+    /// position less than that. A speculative round writes its carry token and
+    /// every draft in one forward, and the widest round of a request ends on
+    /// position `prompt_len + n_tokens`, so this is the largest budget that
+    /// keeps every writer under the ceiling.
+    ///
+    /// A request for no tokens always gets `Ok(0)`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::KvCeilingExceeded`] when the request asks for tokens and the
+    /// prompt leaves no room for the first one. Its `requested` is the length
+    /// that one token needs.
+    pub fn decode_budget(&self, prompt_len: usize, n_tokens: usize) -> Result<usize> {
+        let room = self.ceiling_tokens().saturating_sub(prompt_len);
+        if room == 0 && n_tokens > 0 {
+            let requested = i32::try_from(prompt_len.saturating_add(1)).unwrap_or(i32::MAX);
+            tracing::warn!(
+                requested,
+                ceiling = self.ceiling,
+                "KV max-ctx ceiling exceeded — the prompt leaves no room to generate"
+            );
+            return Err(Error::KvCeilingExceeded {
+                requested,
+                ceiling: self.ceiling,
+            });
+        }
+        Ok(n_tokens.min(room))
+    }
 }
 
-/// Resolve the context bounds for one run.
+/// Resolve the context bounds for one run, and warn of an override or a
+/// scaling that the operator should know about.
 ///
 /// `max_ctx_override` is the operator's `--max-ctx` (or a per-request
 /// `max_ctx` field). `None`, or a non-positive value, falls back to
@@ -210,6 +244,41 @@ impl ResolvedContext {
 /// checkpoint's positional capacity. The engine never clamps: a request it
 /// cannot honour is refused with the numbers and the lifting flag named.
 pub fn resolve_context(
+    limits: &ContextLimits,
+    max_ctx_override: Option<i32>,
+) -> Result<ResolvedContext> {
+    let resolved = resolve_ceiling(limits, max_ctx_override)?;
+    if let Some(n) = max_ctx_override.filter(|n| *n <= 0) {
+        tracing::warn!(
+            max_ctx_override = n,
+            "max_ctx_override <= 0 treated as unset; using arch default"
+        );
+    }
+    if let Some(s) = limits.scaling {
+        if s.source == ScalingSource::Operator && resolved.ceiling > limits.trained_max {
+            tracing::warn!(
+                ceiling = resolved.ceiling,
+                trained_max = limits.trained_max,
+                factor = s.factor,
+                original_max = s.original_max,
+                "context extends past the checkpoint's trained window on operator-requested \
+                 YaRN scaling; output quality past the trained window is the operator's risk"
+            );
+        }
+    }
+    Ok(resolved)
+}
+
+/// The bounds [`resolve_context`] resolves, without its warnings.
+///
+/// A caller that reads the ceiling of a request a second time, to cut its
+/// generation to the room under it, calls this one, so the request logs each
+/// warning once.
+///
+/// # Errors
+///
+/// As [`resolve_context`].
+pub(crate) fn resolve_ceiling(
     limits: &ContextLimits,
     max_ctx_override: Option<i32>,
 ) -> Result<ResolvedContext> {
@@ -233,28 +302,8 @@ pub fn resolve_context(
             }
             n
         }
-        Some(n) => {
-            tracing::warn!(
-                max_ctx_override = n,
-                "max_ctx_override <= 0 treated as unset; using arch default"
-            );
-            fallback
-        }
-        None => fallback,
+        Some(_) | None => fallback,
     };
-
-    if let Some(s) = limits.scaling {
-        if s.source == ScalingSource::Operator && ceiling > limits.trained_max {
-            tracing::warn!(
-                ceiling,
-                trained_max = limits.trained_max,
-                factor = s.factor,
-                original_max = s.original_max,
-                "context extends past the checkpoint's trained window on operator-requested \
-                 YaRN scaling; output quality past the trained window is the operator's risk"
-            );
-        }
-    }
 
     Ok(ResolvedContext {
         positional_max,

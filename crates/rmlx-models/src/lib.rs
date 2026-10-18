@@ -66,6 +66,9 @@ mod test_child;
 #[cfg(test)]
 mod test_snapshot;
 
+#[cfg(test)]
+mod test_warnings;
+
 /// Oracle for the per-arch SSD-hydrate entry impls.
 #[cfg(test)]
 #[path = "ssd_hydrate_tests.rs"]

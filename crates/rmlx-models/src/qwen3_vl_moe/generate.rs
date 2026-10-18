@@ -537,6 +537,8 @@ pub fn generate_image(
     if n_tokens == 0 {
         return Ok(vec![]);
     }
+    let ctx = resolved_context(model, max_ctx_override)?;
+    let n_tokens = ctx.decode_budget(aug_ids.len(), n_tokens)?;
     let vocab = model.cfg.vocab_size;
     let seq = aug_ids.len() as i32;
 
@@ -569,7 +571,6 @@ pub fn generate_image(
     // `slice_update` broadcast. Bracketing the chunked forward with
     // enter_prefill()/exit_prefill() routes the prefill through the lazy-grow
     // raw buffer (mirrors the Gemma4 image path) so it grows to fit.
-    let ctx = resolved_context(model, max_ctx_override)?;
     let n_layers = model.cfg.num_hidden_layers;
     let mut kv = kv_stack(n_layers, kv_quant, &ctx);
     for c in &mut kv {

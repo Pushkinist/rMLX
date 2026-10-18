@@ -411,6 +411,14 @@ impl TinyPack {
     }
 }
 
+/// The attention-only snapshot as a loaded verifier, for a test of code that
+/// holds an [`crate::arch::Architecture`] and never runs its forward.
+pub(crate) fn attention_only_architecture() -> Result<crate::arch::Architecture> {
+    Ok(crate::arch::Architecture::Qwen3_5Moe(
+        ATTENTION_ONLY.load()?,
+    ))
+}
+
 /// The text of the error `pack` loads with, or the empty string.
 fn load_error(pack: TinyPack) -> String {
     pack.load()

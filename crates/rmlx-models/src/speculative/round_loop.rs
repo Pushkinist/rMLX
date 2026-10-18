@@ -20,10 +20,10 @@
 //! See `docs/SPEC_ROUND_SKELETON.md` for the interface's rationale and for the
 //! per-loop behaviour it is required to preserve.
 //!
-//! [`run_rounds`] cannot have a unit test, for the reason `round_common.rs`
-//! gives about its own cache-stack functions: it takes an [`Architecture`],
-//! which is only reachable by loading weights. Four readings hold it instead,
-//! each blind to something different — the equivalence pair
+//! [`run_rounds`] has a CPU test at the context ceiling, in
+//! `round_loop_tests.rs`: a scripted drafter over a tiny synthetic verifier.
+//! The model-dependent behaviour has four readings, each blind to something
+//! different — the equivalence pair
 //! `the_assistant_round_loop_reproduces_plain_greedy` in
 //! `crates/rmlx-models/tests/spec_greedy_equivalence.rs`, the per-round event
 //! stream that run writes against
@@ -431,9 +431,10 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
     cancel: &AtomicBool,
 ) -> Result<(Vec<ProbeStep>, usize)> {
     let charge = cfg.charged;
-    let n_tokens = cfg.n_tokens;
-    let (kv_quant, max_seq, kv) =
+    let (kv_quant, resolved_ctx, kv) =
         verifier_cache_stack(verifier, cfg.kv_quant_override, cfg.max_ctx_override)?;
+    let max_seq = resolved_ctx.ceiling;
+    let n_tokens = resolved_ctx.decode_budget(prompt_ids.len(), cfg.n_tokens)?;
     let lin = verifier
         .needs_lin_caches()
         .then(|| lin_cache_stack(verifier));
@@ -723,3 +724,7 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
     }
     Ok((emitted, widest_bs))
 }
+
+#[cfg(test)]
+#[path = "round_loop_tests.rs"]
+mod round_loop_tests;

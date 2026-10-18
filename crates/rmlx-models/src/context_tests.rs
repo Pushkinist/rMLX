@@ -5,7 +5,11 @@
     reason = "unit-test scaffolding: a panic is how an assertion failure surfaces"
 )]
 
-use super::{rebind_to_ceiling, resolve_context, ContextLimits, ContextScaling, ScalingSource};
+use super::{
+    rebind_to_ceiling, resolve_ceiling, resolve_context, ContextLimits, ContextScaling,
+    ResolvedContext, ScalingSource,
+};
+use crate::test_warnings::warnings_during;
 use rmlx_core::error::Error;
 use rmlx_kv_quant::{KvCache, KvQuant, KV_MAX_SEQ_DEFAULT};
 use rmlx_mlx::{Array, Device};
@@ -243,6 +247,8 @@ fn absurd_scaling_saturates() {
 /// it off is not. The list is what makes "one resolution" checkable: a reviewer
 /// reads it and sees every place a context bound is arrived at.
 const CEILING_CONSUMERS: &[&str] = &[
+    // The token budget of every generation entry, for all architectures.
+    "crates/rmlx-models/src/arch/mod.rs",
     // KV ring sizing, one per architecture generate path.
     "crates/rmlx-models/src/gemma4/generate/mod.rs",
     "crates/rmlx-models/src/qwen3.rs",
@@ -374,6 +380,7 @@ fn files_containing(needle: &str) -> Vec<String> {
 #[test]
 fn ceiling_consumers_are_enumerated() {
     let mut found = files_containing("resolve_context(");
+    found.extend(files_containing("resolve_ceiling("));
     found.sort();
     found.dedup();
     let mut expected: Vec<String> = CEILING_CONSUMERS.iter().map(|s| (*s).to_owned()).collect();
@@ -534,4 +541,117 @@ fn a_rebound_cache_grows_its_capacity_past_the_stored_ceiling() {
             cache.max_seq()
         );
     }
+}
+
+// ── Decode budget ────────────────────────────────────────────────────────────
+
+fn context_with_ceiling(ceiling: i32) -> ResolvedContext {
+    ResolvedContext {
+        positional_max: 0,
+        ceiling,
+        initial_max_seq: ceiling.min(KV_MAX_SEQ_DEFAULT),
+    }
+}
+
+/// A request that fits in the room keeps its token count.
+#[test]
+fn the_budget_is_the_request_when_the_room_holds_it() {
+    let ctx = context_with_ceiling(100);
+    assert_eq!(ctx.decode_budget(40, 10).expect("room for 60"), 10);
+    assert_eq!(ctx.decode_budget(40, 60).expect("room for 60"), 60);
+}
+
+/// A request that asks for more than the room is cut to the room.
+#[test]
+fn the_budget_is_the_room_when_the_request_is_longer() {
+    let ctx = context_with_ceiling(100);
+    assert_eq!(ctx.decode_budget(40, 500).expect("room for 60"), 60);
+    assert_eq!(ctx.decode_budget(99, 500).expect("room for 1"), 1);
+}
+
+/// A prompt at or past the ceiling leaves no room: the typed error carries the
+/// length the first token needs and the ceiling.
+#[test]
+fn a_prompt_with_no_room_is_refused_with_its_values() {
+    let ctx = context_with_ceiling(100);
+    let at = ctx.decode_budget(100, 10);
+    assert!(
+        matches!(
+            at,
+            Err(Error::KvCeilingExceeded {
+                requested: 101,
+                ceiling: 100
+            })
+        ),
+        "prompt at the ceiling: {at:?}"
+    );
+    let past = ctx.decode_budget(150, 10);
+    assert!(
+        matches!(
+            past,
+            Err(Error::KvCeilingExceeded {
+                requested: 151,
+                ceiling: 100
+            })
+        ),
+        "prompt past the ceiling: {past:?}"
+    );
+}
+
+/// A request for no tokens is not a request that needs room.
+#[test]
+fn a_request_for_no_tokens_needs_no_room() {
+    let ctx = context_with_ceiling(100);
+    assert_eq!(ctx.decode_budget(40, 0).expect("nothing asked"), 0);
+    assert_eq!(ctx.decode_budget(100, 0).expect("nothing asked"), 0);
+}
+
+// ── Warnings ─────────────────────────────────────────────────────────────────
+
+/// Qwen3-8B's window stretched past its trained size by an operator flag.
+fn operator_yarn_limits() -> ContextLimits {
+    ContextLimits {
+        trained_max: 40_960,
+        scaling: Some(ContextScaling {
+            factor: 4.0,
+            original_max: 16_384.0,
+            source: ScalingSource::Operator,
+        }),
+        scaling_supported: true,
+    }
+}
+
+/// A request that resolves its context for the arch and again for its token
+/// budget warns of the operator's YaRN once: `resolve_ceiling` is the quiet
+/// reading.
+#[test]
+fn one_request_warns_of_operator_yarn_once() {
+    let limits = operator_yarn_limits();
+    let warnings = warnings_during(|| {
+        let loud = resolve_context(&limits, Some(60_000)).expect("within the scaled window");
+        let quiet = resolve_ceiling(&limits, Some(60_000)).expect("within the scaled window");
+        assert_eq!(loud, quiet, "the quiet reading resolves the same bounds");
+    });
+    assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+    assert!(
+        warnings.first().is_some_and(|w| w.contains("YaRN")),
+        "warnings: {warnings:?}"
+    );
+}
+
+/// A non-positive override warns once per request the same way.
+#[test]
+fn one_request_warns_of_a_non_positive_override_once() {
+    let limits = unscaled_qwen3_limits();
+    let warnings = warnings_during(|| {
+        resolve_context(&limits, Some(0)).expect("treated as unset");
+        resolve_ceiling(&limits, Some(0)).expect("treated as unset");
+    });
+    assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+    assert!(
+        warnings
+            .first()
+            .is_some_and(|w| w.contains("max_ctx_override")),
+        "warnings: {warnings:?}"
+    );
 }

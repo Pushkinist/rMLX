@@ -214,6 +214,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both chat routes. A failure that does not depend on the request (a missing
   compiled template, or a filter, test or function the engine does not have) is
   500 `internal_error` with a fixed message, and the log holds the error.
+- **A generation that reaches the context ceiling stops there and keeps its
+  output.** The route compared only the prompt with the ceiling. When the
+  prompt and the generated tokens reached it, the next decode step failed. A
+  blocking request lost every token. A streamed request got an error event
+  and no finish reason. The engine now runs at most as many decode steps as
+  the ceiling leaves after the prompt, for every architecture, for the
+  speculative round loops and for the image paths, and the reply ends with
+  `finish_reason: "length"` (`stop_reason: "max_tokens"` on `/v1/messages`).
+  A prompt that leaves no room is still a 400 `context_length_exceeded`.
+  BitNet, Qwen2, Gemma3 and Laguna had no ceiling on a generation; they now
+  stop at the resolved `--max-ctx`.
 
 ### Performance
 

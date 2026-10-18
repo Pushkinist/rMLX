@@ -17,6 +17,8 @@
 //!   `a_client_fault_after_the_first_token_keeps_its_type` fails on that
 //!   surface's stream row.
 //! - the server fault maps to 400: `a_server_fault_stays_503`.
+//! - a route lets a prompt that fills the ceiling through to the engine:
+//!   `a_prompt_that_fills_the_ceiling_is_400_before_any_stream`.
 
 // Test harness: panics/unwraps are acceptable in test bodies.
 #![allow(
@@ -96,6 +98,15 @@ impl Generator for FailingGenerator {
 }
 
 async fn start_server(generator: FailingGenerator) -> (u16, tempfile::TempDir) {
+    start_server_under(generator, usize::MAX).await
+}
+
+/// A server whose resident model reports `effective_max_ctx`, the ceiling the
+/// route compares a prompt with.
+async fn start_server_under(
+    generator: FailingGenerator,
+    effective_max_ctx: usize,
+) -> (u16, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let snap = tmp.path().join("scripted");
     std::fs::create_dir_all(&snap).unwrap();
@@ -167,7 +178,7 @@ async fn start_server(generator: FailingGenerator) -> (u16, tempfile::TempDir) {
         model: Arc::new(generator),
         loaded_at: now,
         last_used: now,
-        effective_max_ctx: usize::MAX,
+        effective_max_ctx,
         context_limits: None,
         decode_lease: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         unload_handle: Arc::new(parking_lot::Mutex::new(None)),
@@ -390,6 +401,56 @@ async fn a_sequence_past_the_ceiling_is_400_context_length_exceeded() {
             if err["message"] != "the request needs 641 tokens of context, max_ctx is 640" {
                 wrong.push(format!("{at}: message {}", err["message"]));
             }
+        }
+    }
+    assert_no_rows_wrong(&wrong);
+}
+
+/// The prompt of the request body is one token. A prompt that fills the ceiling
+/// leaves no room for a token, so every route refuses it with a 400 before the
+/// engine runs or a stream starts. The control, a ceiling one token higher,
+/// reaches the engine, which fails with a server fault.
+#[tokio::test]
+async fn a_prompt_that_fills_the_ceiling_is_400_before_any_stream() {
+    let mut wrong = Vec::new();
+    for route in ROUTES {
+        let (port, _tmp) = start_server_under(
+            FailingGenerator {
+                fault: Fault::Server,
+                tokens_before: 0,
+            },
+            1,
+        )
+        .await;
+        let (status, body) = post(port, route.path(), &route.body()).await;
+        if status != 400 {
+            wrong.push(format!("{route:?}: status {status}, expected 400: {body}"));
+            continue;
+        }
+        let err = error_of_json(&body);
+        if err["type"] != route.type_of(Fault::Ceiling) {
+            wrong.push(format!("{route:?}: type {}, body {body}", err["type"]));
+        }
+        if !err["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("max_ctx is 1"))
+        {
+            wrong.push(format!("{route:?}: message {}", err["message"]));
+        }
+
+        let (port, _tmp) = start_server_under(
+            FailingGenerator {
+                fault: Fault::Server,
+                tokens_before: 0,
+            },
+            2,
+        )
+        .await;
+        let (status, body) = post(port, route.path(), &route.body()).await;
+        if status != 503 {
+            wrong.push(format!(
+                "{route:?}: control status {status}, expected 503 from the engine: {body}"
+            ));
         }
     }
     assert_no_rows_wrong(&wrong);

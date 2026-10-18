@@ -31,6 +31,8 @@ pub(crate) mod prompt_cache;
 
 pub use config::Qwen3_5MoeConfig;
 pub use generate::generate_greedy;
+#[cfg(test)]
+pub(crate) use loader::attention_only_architecture;
 pub(crate) use loader::unfolded_backbone;
 pub use loader::{load_from_path, load_from_path_paro};
 pub use model::Qwen3_5MoeText;
