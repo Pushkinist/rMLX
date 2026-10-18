@@ -41,8 +41,12 @@
 //! (a token is emitted in the pass after the one that picked it) adds no step:
 //! only an emitted token is a step.
 //!
-//! The prompt cache. The first request of each plain cell is the stopped one,
-//! so it is the request that stores its prompt. The plain decode stores the
+//! The prompt cache. The cache stores and matches whole blocks of 256 tokens
+//! (`docs/PROMPT_CACHE.md`), so a prompt shorter than a block is never a hit, for
+//! any request. The cell pads the user message past [`BLOCK_TOKENS`] tokens, puts
+//! the counting instruction last, and asserts the prompt length the server
+//! reports. The first request of each plain cell is the stopped one, so it is
+//! the request that stores its prompt. The plain decode stores the
 //! entry after the prefill and before the first token reaches the callback
 //! (`gemma4/generate/mod.rs` stores `kv_caches` as the prefill left them), so
 //! the length of the decode, and an end inside it, cannot change the entry. The
@@ -88,6 +92,17 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const PROMPT: &str = "Count from 1 to 1000, separated by commas.";
+
+/// Filler that lifts the prompt past one block of the prompt cache.
+const NOTES: &str = "Background notes for the task. ";
+
+/// Tokens in one block of the prompt cache.
+const BLOCK_TOKENS: u64 = 256;
+
+/// The user message: the filler, then the instruction.
+fn message() -> String {
+    format!("{}\n\n{PROMPT}", NOTES.repeat(80))
+}
 const STOP: &str = "10,";
 const MAX_TOKENS: u64 = 256;
 
@@ -159,13 +174,15 @@ struct Reply {
     usage: u64,
     /// The `step_count` of the sample the engine wrote for this request.
     engine_steps: u64,
+    /// `usage.prompt_tokens`.
+    prompt_tokens: u64,
 }
 
 impl Served {
     async fn ask(&self, max_tokens: u64, stop: Option<&str>) -> Reply {
         let mut body = json!({
             "model": self.model,
-            "messages": [{"role": "user", "content": PROMPT}],
+            "messages": [{"role": "user", "content": message()}],
             "max_tokens": max_tokens,
             "temperature": 0,
             "chat_template_kwargs": {"enable_thinking": false},
@@ -195,6 +212,7 @@ impl Served {
                 .to_owned(),
             usage: reply["usage"]["completion_tokens"].as_u64().unwrap(),
             engine_steps,
+            prompt_tokens: reply["usage"]["prompt_tokens"].as_u64().unwrap(),
         }
     }
 
@@ -294,6 +312,12 @@ async fn assert_a_stop_string_ends_the_decode(
 
     let lookups = |from: (u64, u64), to: (u64, u64)| (to.0 - from.0, to.1 - from.1);
     if stores_an_entry {
+        assert!(
+            stopped.prompt_tokens > BLOCK_TOKENS,
+            "{test}: the prompt is {} tokens, under one block of the prompt cache, so no \
+             request for it can hit",
+            stopped.prompt_tokens
+        );
         assert_eq!(
             lookups(after_first, after_second),
             (1, 0),
