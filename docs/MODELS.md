@@ -57,7 +57,9 @@ differ. `Gemma4UnifiedForConditionalGeneration` is a known alias of
 **Weight-quant preflight.** Before tensor I/O, `preflight_weight_quant`
 refuses an affine `bits` outside `{2,3,4,5,6,8}`, globally or in any
 `tensor_overrides` entry. A 1-bit checkpoint is refused there with a hint that
-it needs an unreleased MLX kernel. See `docs/WEIGHT_QUANTS.md` §4.4.
+it needs an MLX with 1-bit affine kernels (MLX 0.32.4 and later). The pinned MLX
+pair (`crates/rmlx-mlx/mlx-pin.txt`) is older and has none. See
+`docs/WEIGHT_QUANTS.md` §4.4.
 
 **Routes.** The generative architectures serve `/v1/chat/completions` and
 `/v1/messages`. `JinaEmbeddingsV4Model` serves `/v1/embeddings` only.
@@ -228,7 +230,7 @@ float, so uint8 E8M0 microscaling scales stay verbatim. See
 `docs/KV_LAYER_POLICY.md` "Qwen3.6 MoE KV is bf16 at `--kv-quant none`".
 
 `prism-ml__Bonsai-27B-mlx-1bit` declares `quantization.bits = 1` and is
-refused by the preflight. Its 2-bit sibling,
+refused by the preflight: the pinned MLX has no 1-bit affine kernel. Its 2-bit sibling,
 `prism-ml__Ternary-Bonsai-27B-mlx-2bit`, loads.
 
 **KV.** The Qwen MoE guard (`validate_resolved`) refuses every codec with

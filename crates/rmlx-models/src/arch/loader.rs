@@ -493,7 +493,7 @@ fn check_affine_bits(mode: &str, bits: u8, tensor: Option<&str>, arch_str: &str)
         .collect::<Vec<_>>()
         .join(",");
     let hint = if bits == 1 {
-        "; 1-bit needs ml-explore/mlx#3161 (unreleased)"
+        "; 1-bit needs an MLX with 1-bit affine kernels (ml-explore/mlx#3161)"
     } else {
         ""
     };

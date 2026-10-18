@@ -60,7 +60,8 @@ impl SwitchMlp {
 
     /// Broadcast (per-token gather) expert forward. Used for the decode /
     /// single-token case; also the equivalence reference for `forward_sorted`.
-    /// Result is mathematically identical to `forward_sorted` for any input.
+    /// Equal to `forward_sorted` in exact arithmetic for any input. In bf16 the
+    /// two can round differently.
     #[allow(
         clippy::indexing_slicing,
         reason = "bounds established by construction: index buffers sized from x/indices shapes"
@@ -111,8 +112,9 @@ impl SwitchMlp {
     /// Sorts the flattened `[n*tk]` expert indices ascending, gathers the
     /// matching x rows into expert-contiguous order, runs the three gathered
     /// quantized matmuls with `sorted_indices=true`, then scatters the result
-    /// back to token order. Math is identical to the broadcast path; only the
-    /// memory-access order into the expert weights changes.
+    /// back to token order. In exact arithmetic it equals the broadcast path;
+    /// only the memory-access order into the expert weights changes. In bf16 the
+    /// two can round differently.
     #[allow(
         clippy::indexing_slicing,
         reason = "bounds established by construction: index buffers sized from x/indices shapes"
@@ -217,7 +219,7 @@ impl SparseMoeBlock {
 
         let x_flat = x.reshape(&[n_tokens, hidden], device)?;
 
-        // Task 10: MoE router debug span — captures per-step routing cost.
+        // Debug span for the router: captures per-step routing cost.
         let router_out = {
             let _router_span = tracing::debug_span!(
                 "moe_router",

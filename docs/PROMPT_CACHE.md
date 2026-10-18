@@ -437,10 +437,16 @@ One forward over the whole prompt is compared as well, within the noise bound.
 
 **Not covered.** The sparse MoE arch (`Qwen3_5MoeForConditionalGeneration`) shares
 the hook, the capture and the split, and has no cell in the resume gate. The
-Qwen3.6 checkpoint is no longer a test target, and it was measured to disagree
-with itself across forward lengths where the dense checkpoint is bit-identical,
-so a resume on it can differ from a cold prefill by more than the dense gate
-would show.
+Qwen3.6 checkpoint is no longer a test target. It was measured to disagree
+with itself across forward lengths by more than the dense checkpoint did.
+The dense checkpoint is not exact across forward lengths either. On the
+pinned MLX the speculative refold test measures a disagreement between one
+verify forward and stepped decode
+(`crates/rmlx-models/src/speculative/round_common_tests.rs`). A
+forward of several rows and a one-row decode step can take different MLX
+kernels for the same product, and those sum in a different order. A resume on
+the sparse arch can therefore differ from a cold prefill by more than the
+dense gate shows.
 
 ---
 

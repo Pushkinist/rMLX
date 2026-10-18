@@ -112,7 +112,7 @@ starts with an empty registry. The KV codec flags above apply too.
 | `--profile` | name | — | `[profile.<name>]` from `<RMLX_HOME>/profiles.toml`. A flag on the command line wins over the profile. |
 | `--port` | u16 | `8080` | TCP port. |
 | `--host` | string | `127.0.0.1` | Bind address. |
-| `--device` | `cpu \| gpu` | `gpu` | Inference device. |
+| `--device` | `cpu \| gpu` | `gpu` | Inference device. `cpu` is a correctness device with no speed promise; see "Claim file". |
 | `--kv-boundary-layers` | `HEAD,TAIL` | `2,8` | See "KV codec flags". |
 | `--max-ctx` | u32 | `min(capacity, 4096)` | Context ceiling in tokens. The KV ring grows up to it on demand; see [`KV_CACHE.md`](KV_CACHE.md) §4.6. A value above the positional capacity is refused; see "Context ceiling". Must be ≥ 256. |
 | `--yarn-factor` | f32 | — | YaRN RoPE factor; raises the positional capacity. Env: `RMLX_YARN_FACTOR`. See "Context ceiling". |
@@ -569,6 +569,15 @@ see another user's process), then `kill <PID>`. Never delete the claim file.
 model load. `cpu` takes no claim; it refuses every KV codec but `none`
 (`--kv-quant auto` resolves to `none`) and every later GPU stream or Metal
 call. `--gpu-capture` needs `--device gpu`.
+
+`--device cpu` is a correctness device. It makes no speed promise. MLX runs
+the CPU ops of one stream on one thread, and its CPU quantized matmul does
+not split the work across threads. For a transposed affine weight it uses a
+SIMD kernel only when the SIMD width of the activation type is a multiple of
+the number of weights in a 32-bit word. A bf16 activation has SIMD width 1, so
+it always takes the scalar kernel. An mxfp8 weight needs a SIMD width that is
+a multiple of 8, so it takes the scalar kernel too. rMLX cannot change this:
+the kernel is in MLX.
 
 `rmlx claim run -- <command>` holds the claim for `<command>` and exits with
 its status — the command's own code, or `128 + <signal>` if a signal killed
