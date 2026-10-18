@@ -201,24 +201,28 @@ const SERVER_VARIABLES: [&str; 5] = [
 /// Why [`ChatTemplate::render`] produced no prompt.
 #[allow(
     clippy::exhaustive_enums,
-    reason = "closed outcome set: the template refused the request, or the render failed"
+    reason = "closed outcome set: the template cannot be used for any request, or this request's render ended in an error"
 )]
 #[derive(Debug)]
 pub enum RenderError {
-    /// The template called `raise_exception`: it refuses the request's
-    /// messages or options. Holds the template's own message, cut to 256
-    /// characters.
+    /// The failure does not depend on the request: the compiled template is
+    /// missing, or it names a filter, test or function the engine does not
+    /// have. It is a defect of the server or of the template. Holds the
+    /// engine's message, cut to 256 characters.
+    Defect(String),
+    /// The render of this request's data ended in an error: the template
+    /// called `raise_exception`, or an operation failed on a value the request
+    /// supplied. A runtime error of the engine cannot be told from a template
+    /// bug that only some values reach, so it counts as the request's. Holds
+    /// the message, cut to 256 characters, as it can copy request text.
     Rejected(String),
-    /// Any other failure: compile, lookup, an unsupported construct. Holds the
-    /// message cut to 256 characters, as it can copy request text.
-    Failed(String),
 }
 
 impl std::fmt::Display for RenderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            RenderError::Defect(msg) => write!(f, "chat template defect: {msg}"),
             RenderError::Rejected(msg) => write!(f, "the chat template refuses the request: {msg}"),
-            RenderError::Failed(msg) => write!(f, "template render failed: {msg}"),
         }
     }
 }
@@ -571,7 +575,7 @@ impl ChatTemplate {
         let tmpl = self
             .env
             .get_template("chat")
-            .map_err(|e| RenderError::Failed(format!("template lookup failed: {e}")))?;
+            .map_err(|e| RenderError::Defect(format!("template lookup failed: {e}")))?;
 
         // Build the messages list as a minijinja Value.
         //
@@ -627,9 +631,14 @@ impl ChatTemplate {
             // minijinja wraps an error raised inside an include or a super block.
             let refusal = std::iter::successors(std::error::Error::source(&e), |s| s.source())
                 .find_map(|s| s.downcast_ref::<TemplateRefusal>());
-            match refusal {
-                Some(TemplateRefusal(msg)) => RenderError::Rejected(bounded_message(msg)),
-                None => RenderError::Failed(bounded_message(&e.to_string())),
+            match (refusal, e.kind()) {
+                (Some(TemplateRefusal(msg)), _) => RenderError::Rejected(bounded_message(msg)),
+                // A name the engine cannot resolve is the same for every request.
+                (
+                    None,
+                    ErrorKind::UnknownFilter | ErrorKind::UnknownTest | ErrorKind::UnknownFunction,
+                ) => RenderError::Defect(bounded_message(&e.to_string())),
+                (None, _) => RenderError::Rejected(bounded_message(&e.to_string())),
             }
         })?;
 

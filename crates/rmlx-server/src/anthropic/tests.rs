@@ -1,5 +1,6 @@
 use super::*;
 use crate::openai::errors::error_response;
+use crate::openai::request::OwnedTplMessage;
 
 fn parse(json: &str) -> Result<MessagesRequest, serde_json::Error> {
     serde_json::from_str(json)
@@ -773,4 +774,307 @@ async fn an_error_body_is_the_envelope_bytes() {
         bytes.as_ref(),
         br#"{"error":{"message":"m","type":"invalid_request_error"}}"#
     );
+}
+
+// ── Template messages of earlier turns ────────────────────────────────────
+
+fn tpl_messages(messages: &str) -> Vec<OwnedTplMessage> {
+    let req = parse(&format!(
+        r#"{{"model":"m","max_tokens":1,"messages":{messages}}}"#
+    ))
+    .unwrap();
+    req.messages
+        .iter()
+        .flat_map(OwnedTplMessage::from_anthropic)
+        .collect()
+}
+
+/// Thinking text, text and every tool call of an assistant turn make one
+/// template message, with each value as the client sent it.
+#[test]
+fn an_assistant_turn_keeps_thinking_text_and_tool_calls() {
+    let msgs = tpl_messages(
+        r#"[{"role":"assistant","content":[
+            {"type":"thinking","thinking":"plan","signature":"sig"},
+            {"type":"redacted_thinking","data":"opaque"},
+            {"type":"text","text":"ok"},
+            {"type":"tool_use","id":"t1","name":"get_weather","input":{"city":"Paris","days":2}},
+            {"type":"tool_use","id":"t2","name":"get_time","input":{}}]}]"#,
+    );
+    assert_eq!(msgs.len(), 1);
+    let m = &msgs[0];
+    assert_eq!(m.role, "assistant");
+    assert_eq!(m.content, "ok");
+    assert_eq!(m.reasoning_content.as_deref(), Some("plan"));
+    assert_eq!(
+        m.tool_calls_json,
+        Some(serde_json::json!([
+            {"id":"t1","type":"function",
+             "function":{"name":"get_weather","arguments":{"city":"Paris","days":2}}},
+            {"id":"t2","type":"function","function":{"name":"get_time","arguments":{}}}
+        ]))
+    );
+}
+
+/// Each tool result is a `tool` message with its call id, string content or
+/// text blocks. The remaining text is one `user` message after them.
+#[test]
+fn a_user_turn_gives_one_tool_message_per_tool_result_then_its_text() {
+    let msgs = tpl_messages(
+        r#"[{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"t1","content":"sunny","is_error":true},
+            {"type":"tool_result","tool_use_id":"t2","content":[
+                {"type":"text","text":"late"},
+                {"type":"image","source":{"type":"base64","data":"AAEC"}},
+                {"type":"text","text":" night"}]},
+            {"type":"text","text":"thanks"}]}]"#,
+    );
+    let got: Vec<(&str, &str, Option<&str>)> = msgs
+        .iter()
+        .map(|m| {
+            (
+                m.role.as_str(),
+                m.content.as_str(),
+                m.tool_call_id.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("tool", "sunny", Some("t1")),
+            ("tool", "late night", Some("t2")),
+            ("user", "thanks", None),
+        ]
+    );
+}
+
+/// A user turn of tool results alone gives no empty `user` message.
+#[test]
+fn a_user_turn_of_tool_results_alone_gives_tool_messages_only() {
+    let msgs =
+        tpl_messages(r#"[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1"}]}]"#);
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(
+        (msgs[0].role.as_str(), msgs[0].content.as_str()),
+        ("tool", "")
+    );
+}
+
+/// A string content is one message as before; text blocks join with nothing.
+#[test]
+fn plain_content_is_one_message_with_no_extra_fields() {
+    let msgs = tpl_messages(
+        r#"[{"role":"user","content":"hi"},
+            {"role":"assistant","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}]"#,
+    );
+    assert_eq!(msgs.len(), 2);
+    for (m, role, content) in [(&msgs[0], "user", "hi"), (&msgs[1], "assistant", "ab")] {
+        assert_eq!((m.role.as_str(), m.content.as_str()), (role, content));
+        assert!(m.reasoning_content.is_none() && m.tool_calls_json.is_none());
+        assert!(m.tool_call_id.is_none() && m.name.is_none());
+    }
+}
+
+/// Blocks with no template field leave no message and no field.
+#[test]
+fn redacted_thinking_leaves_no_field() {
+    let msgs = tpl_messages(
+        r#"[{"role":"assistant","content":[
+            {"type":"redacted_thinking","data":"opaque"},
+            {"type":"text","text":"ok"}]}]"#,
+    );
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].content, "ok");
+    assert!(msgs[0].reasoning_content.is_none());
+    assert!(msgs[0].tool_calls_json.is_none());
+}
+
+/// Thinking blocks of one message join with nothing, an empty one still gives
+/// the field, and a message without one gives none.
+#[test]
+fn thinking_blocks_join_and_an_empty_one_gives_the_field() {
+    let msgs = tpl_messages(
+        r#"[{"role":"assistant","content":[
+                {"type":"thinking","thinking":"a"},{"type":"thinking","thinking":"b"}]},
+            {"role":"assistant","content":[{"type":"thinking","thinking":""}]},
+            {"role":"assistant","content":[{"type":"text","text":"t"}]}]"#,
+    );
+    let got: Vec<Option<&str>> = msgs
+        .iter()
+        .map(|m| m.reasoning_content.as_deref())
+        .collect();
+    assert_eq!(got, [Some("ab"), Some(""), None]);
+}
+
+/// A message that holds a tool result and a thinking block or a tool call
+/// gives the tool message and then its own message with that field. The own
+/// message has no text.
+#[test]
+fn a_tool_result_beside_thinking_or_a_tool_call_gives_both_messages() {
+    let msgs = tpl_messages(
+        r#"[{"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"t1","content":"r"},
+                {"type":"thinking","thinking":"plan"}]},
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"t2","content":"r"},
+                {"type":"tool_use","id":"t3","name":"n","input":{}}]}]"#,
+    );
+    let roles: Vec<&str> = msgs.iter().map(|m| m.role.as_str()).collect();
+    assert_eq!(roles, ["tool", "user", "tool", "user"]);
+    assert_eq!(msgs[1].reasoning_content.as_deref(), Some("plan"));
+    assert!(msgs[1].tool_calls_json.is_none() && msgs[1].content.is_empty());
+    assert!(msgs[3].tool_calls_json.is_some() && msgs[3].reasoning_content.is_none());
+    assert_eq!(msgs[3].content, "");
+}
+
+/// A turn of tool calls alone is one message with no text. A turn with no
+/// block the template reads is one empty message, as a string content "" is.
+#[test]
+fn a_tool_call_turn_and_an_empty_turn_are_one_message_each() {
+    let msgs = tpl_messages(
+        r#"[{"role":"assistant","content":[
+                {"type":"tool_use","id":"t1","name":"n","input":{"a":1}}]},
+            {"role":"user","content":[]},
+            {"role":"user","content":[{"type":"image","source":{"type":"base64","data":"AAEC"}}]}]"#,
+    );
+    assert_eq!(msgs.len(), 3);
+    assert!(msgs[0].content.is_empty() && msgs[0].tool_calls_json.is_some());
+    for m in &msgs[1..] {
+        assert_eq!(m.role, "user");
+        assert!(m.content.is_empty() && m.tool_calls_json.is_none());
+    }
+}
+
+/// A tool result with no id has no call id, and a tool call with no id or
+/// with a `null` input is passed on as sent. An absent input is an empty
+/// object.
+#[test]
+fn missing_ids_and_odd_inputs_are_passed_on_as_sent() {
+    let msgs = tpl_messages(
+        r#"[{"role":"user","content":[{"type":"tool_result","content":"r"}]},
+            {"role":"assistant","content":[
+                {"type":"tool_use","name":"a","input":null},
+                {"type":"tool_use","id":"t","name":"b"}]}]"#,
+    );
+    assert_eq!(msgs[0].tool_call_id, None);
+    assert_eq!(
+        msgs[1].tool_calls_json,
+        Some(serde_json::json!([
+            {"id":null,"type":"function","function":{"name":"a","arguments":null}},
+            {"id":"t","type":"function","function":{"name":"b","arguments":{}}}
+        ]))
+    );
+}
+
+/// Blocks inside a tool result are read for text only: an audio block there
+/// is neither text nor audio for the engine.
+#[test]
+fn an_audio_block_inside_a_tool_result_is_ignored() {
+    let req = parse(
+        r#"{"model":"m","max_tokens":1,"messages":[{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"t1","content":[
+                {"type":"input_audio","source":{"type":"base64","data":"AAEC"}},
+                {"type":"text","text":"heard"}]}]}]}"#,
+    )
+    .unwrap();
+    assert_eq!(req.messages[0].audio_b64().count(), 0);
+    let msgs = OwnedTplMessage::from_anthropic(&req.messages[0]);
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].content, "heard");
+}
+
+/// One history sent to `/v1/messages` and to `/v1/chat/completions` gives the
+/// Qwen3.8 template the same input: the rendered text is equal, and it holds
+/// the reasoning, the calls and the results.
+#[test]
+fn the_qwen38_template_renders_one_history_alike_from_both_routes() {
+    const SNAPSHOT: &str = "mlx-community__Qwen3.8-27B-4bit";
+    const TEST: &str = "the_qwen38_template_renders_one_history_alike_from_both_routes";
+    let Some(root) = std::env::var_os("RMLX_O_MODELS_ROOT").filter(|r| !r.is_empty()) else {
+        println!("SKIP {TEST}: RMLX_O_MODELS_ROOT is not set");
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    assert!(
+        root.is_dir(),
+        "{TEST}: RMLX_O_MODELS_ROOT is set but is not a directory"
+    );
+    let dir = root.join(SNAPSHOT);
+    if !dir.is_dir() {
+        println!("SKIP {TEST}: RMLX_O_MODELS_ROOT does not hold {SNAPSHOT}");
+        return;
+    }
+    let source = crate::chat_template::load_template_source(&dir)
+        .unwrap_or_else(|e| panic!("{TEST}: {SNAPSHOT} is present but its template fails: {e}"));
+    let tpl = crate::chat_template::ChatTemplate::new(source).unwrap();
+
+    let anthropic: Vec<OwnedTplMessage> = tpl_messages(
+        r#"[{"role":"user","content":"weather?"},
+            {"role":"assistant","content":[
+                {"type":"thinking","thinking":"plan the lookup","signature":"sig"},
+                {"type":"text","text":"checking"},
+                {"type":"tool_use","id":"t1","name":"get_weather","input":{"city":"Paris"}},
+                {"type":"tool_use","id":"t2","name":"get_time","input":{"city":"Rome"}}]},
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"t1","content":"sunny"},
+                {"type":"tool_result","tool_use_id":"t2","content":[{"type":"text","text":"late"}]},
+                {"type":"text","text":"thanks"}]}]"#,
+    );
+    let openai_req: crate::openai::request::ChatCompletionsRequest = serde_json::from_str(
+        r#"{"model":"m","messages":[
+            {"role":"user","content":"weather?"},
+            {"role":"assistant","content":"checking","reasoning_content":"plan the lookup",
+             "tool_calls":[
+                {"id":"t1","type":"function",
+                 "function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}},
+                {"id":"t2","type":"function",
+                 "function":{"name":"get_time","arguments":"{\"city\":\"Rome\"}"}}]},
+            {"role":"tool","tool_call_id":"t1","content":"sunny"},
+            {"role":"tool","tool_call_id":"t2","content":"late"},
+            {"role":"user","content":"thanks"}]}"#,
+    )
+    .unwrap();
+    let openai: Vec<OwnedTplMessage> = openai_req
+        .messages
+        .iter()
+        .map(OwnedTplMessage::from_request)
+        .collect();
+
+    let render = |owned: &[OwnedTplMessage]| -> String {
+        let msgs: Vec<crate::chat_template::ChatMessageTpl<'_>> =
+            owned.iter().map(OwnedTplMessage::as_tpl).collect();
+        let opts = crate::chat_template::RenderOpts {
+            bos_token: "",
+            eos_token: "",
+            add_generation_prompt: true,
+            tools: &[],
+            variables: None,
+        };
+        tpl.render(&msgs, &opts).unwrap().text
+    };
+    let from_anthropic = render(&anthropic);
+    assert_eq!(from_anthropic, render(&openai));
+    for held in ["plan the lookup", "get_weather", "Paris", "sunny", "late"] {
+        assert!(from_anthropic.contains(held), "{held}: {from_anthropic}");
+    }
+}
+
+/// The audio blocks of a message are listed in order; a plain string has none.
+#[test]
+fn input_audio_blocks_are_listed_in_order() {
+    let req = parse(
+        r#"{"model":"m","max_tokens":1,"messages":[
+            {"role":"user","content":[
+                {"type":"input_audio","source":{"type":"base64","data":"AAEC"}},
+                {"type":"text","text":"x"},
+                {"type":"input_audio","source":{"type":"base64","data":"AwQF"}}]},
+            {"role":"user","content":"plain"}]}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        req.messages[0].audio_b64().collect::<Vec<_>>(),
+        ["AAEC", "AwQF"]
+    );
+    assert_eq!(req.messages[1].audio_b64().count(), 0);
 }

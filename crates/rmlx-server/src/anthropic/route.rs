@@ -27,6 +27,7 @@ use crate::engine::{
     normalized_to_jinja_tool, GenerationRequest, NormalizedTool, NormalizedToolChoice,
 };
 use crate::logged_json::LoggedJson;
+use crate::openai::request::OwnedTplMessage;
 use crate::openai::{
     enforce_max_tokens_cap, resolve_request_id, resolve_sampling_params, ApiErrorCategory, AppState,
 };
@@ -35,8 +36,8 @@ use crate::tokenizer_io;
 use crate::tool_parser::{detect_tool_call_format, ParsedToolCall, ToolCallFormat};
 
 use super::blocking::generate_blocking;
-use super::errors::{bad_request, service_unavailable};
-use super::request::{AnthropicContent, MessagesRequest};
+use super::errors::{bad_request, internal_error, service_unavailable};
+use super::request::{input_audio_data, AnthropicContent, AnthropicMessage, MessagesRequest};
 use super::response::ContentBlock;
 use super::streaming::generate_streaming;
 use crate::openai::errors::error_response;
@@ -208,52 +209,39 @@ pub(crate) async fn messages(
             return e.into_response();
         }
     }
-    // Per-message checks: content_parts, audio bytes, total token estimate.
-    {
-        let mut total_text_bytes: usize = 0;
-        for (idx, msg) in req.messages.iter().enumerate() {
-            match &msg.content {
-                AnthropicContent::Blocks(blocks) => {
-                    if let Err(e) = bounds::check_content_parts(blocks.len(), idx) {
+    // Per-message checks: content_parts and audio bytes.
+    for (idx, msg) in req.messages.iter().enumerate() {
+        if let AnthropicContent::Blocks(blocks) = &msg.content {
+            if let Err(e) = bounds::check_content_parts(blocks.len(), idx) {
+                state.error_counts.increment(ApiErrorCategory::BadRequest);
+                return e.into_response();
+            }
+            for (pidx, block) in blocks.iter().enumerate() {
+                if let Some(b64) = input_audio_data(block) {
+                    let decoded_estimate = b64.len() * 3 / 4;
+                    if let Err(e) = bounds::check_input_audio_bytes(decoded_estimate, pidx) {
                         state.error_counts.increment(ApiErrorCategory::BadRequest);
                         return e.into_response();
                     }
-                    for (pidx, block) in blocks.iter().enumerate() {
-                        // Anthropic audio: {type:"input_audio", source:{type:"base64",data:"..."}}
-                        if block.get("type").and_then(|t| t.as_str()) == Some("input_audio") {
-                            if let Some(b64) = block
-                                .get("source")
-                                .and_then(|s| s.get("data"))
-                                .and_then(|d| d.as_str())
-                            {
-                                let decoded_estimate = b64.len() * 3 / 4;
-                                if let Err(e) =
-                                    bounds::check_input_audio_bytes(decoded_estimate, pidx)
-                                {
-                                    state.error_counts.increment(ApiErrorCategory::BadRequest);
-                                    return e.into_response();
-                                }
-                            }
-                        }
-                        if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                            if let Some(s) = block.get("text").and_then(|t| t.as_str()) {
-                                total_text_bytes = total_text_bytes.saturating_add(s.len());
-                            }
-                        }
-                    }
-                }
-                AnthropicContent::Text(s) => {
-                    total_text_bytes = total_text_bytes.saturating_add(s.len());
                 }
             }
-        }
-        if let Err(e) = bounds::check_total_input_tokens_estimate(total_text_bytes) {
-            state.error_counts.increment(ApiErrorCategory::BadRequest);
-            return e.into_response();
         }
     }
 
     let system: Option<String> = req.system.as_ref().map(|s| s.as_text().into_owned());
+
+    // The bounds count what the template can print: the rendered messages and
+    // the system prompt. A message with many `tool_result` blocks renders as
+    // many messages, so the message cap applies to the rendered history.
+    let history: Vec<OwnedTplMessage> = req
+        .messages
+        .iter()
+        .flat_map(OwnedTplMessage::from_anthropic)
+        .collect();
+    if let Err(e) = bounds::check_messages(history.len()) {
+        state.error_counts.increment(ApiErrorCategory::BadRequest);
+        return e.into_response();
+    }
 
     // Normalise Anthropic tools → route-agnostic NormalizedTool.
     // Moved before the prompt pipeline so `jinja_tools` is available for
@@ -305,6 +293,16 @@ pub(crate) async fn messages(
         .map(normalized_to_jinja_tool)
         .collect();
 
+    let system_bytes = system.as_ref().map_or(0, |s| "system".len() + s.len());
+    let total_text_bytes = history.iter().fold(
+        bounds::serialized_len(&jinja_tools).saturating_add(system_bytes),
+        |sum, m| sum.saturating_add(m.rendered_bytes()),
+    );
+    if let Err(e) = bounds::check_total_input_tokens_estimate(total_text_bytes) {
+        state.error_counts.increment(ApiErrorCategory::BadRequest);
+        return e.into_response();
+    }
+
     if !jinja_tools.is_empty() {
         tracing::debug!(
             model_id = %req.model,
@@ -345,22 +343,14 @@ pub(crate) async fn messages(
         }
         Some(entry) => {
             if let (Some(tpl), Some(tk)) = (&entry.chat_template, &entry.tokenizer) {
-                // Build full message list (system message first if present).
-                let mut all_msgs: Vec<(String, String)> = Vec::new();
-                if let Some(sys) = &system {
-                    all_msgs.push(("system".to_owned(), sys.clone()));
-                }
-                for m in &req.messages {
-                    all_msgs.push((m.role.clone(), m.content.as_text().into_owned()));
-                }
-
-                let tpl_msgs: Vec<ChatMessageTpl<'_>> = all_msgs
+                let tpl_msgs: Vec<ChatMessageTpl<'_>> = system
                     .iter()
-                    .map(|(role, content)| ChatMessageTpl {
-                        role: role.as_str(),
-                        content: content.as_str(),
+                    .map(|sys| ChatMessageTpl {
+                        role: "system",
+                        content: sys.as_str(),
                         ..Default::default()
                     })
+                    .chain(history.iter().map(OwnedTplMessage::as_tpl))
                     .collect();
 
                 let bos = entry.bos_token.as_deref().unwrap_or("");
@@ -383,10 +373,10 @@ pub(crate) async fn messages(
                         state.error_counts.increment(ApiErrorCategory::BadRequest);
                         return bad_request(&e.to_string());
                     }
-                    Err(e) => {
-                        tracing::warn!(model_id = %req.model, error = %e, "chat_template render failed");
-                        state.error_counts.increment(ApiErrorCategory::Upstream);
-                        return service_unavailable(&format!("chat template render failed: {e}"));
+                    Err(e @ RenderError::Defect(_)) => {
+                        tracing::error!(model_id = %req.model, error = %e, "chat_template cannot be used");
+                        state.error_counts.increment(ApiErrorCategory::Internal);
+                        return internal_error("the chat template failed on the server");
                     }
                 };
 
@@ -609,9 +599,14 @@ pub(crate) async fn messages(
         // KV-config overrides (stricter wire spec); always launch default here.
         kv_quant_override: None,
         max_ctx_override: None,
-        // Anthropic route has no multimodal content-part extraction yet.
+        // Image blocks are not read on this route.
         images: vec![],
-        audio_b64: vec![],
+        audio_b64: req
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .flat_map(AnthropicMessage::audio_b64)
+            .collect(),
         // The Anthropic surface has no image input yet, but carry the
         // server-startup `--image-max-tokens` default so a future image path
         // honours it; a no-op while `images` is empty.

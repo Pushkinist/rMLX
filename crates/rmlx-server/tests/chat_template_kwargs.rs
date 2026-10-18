@@ -43,6 +43,19 @@ const VOCAB: &[&str] = &[
     "thinking_on",
     "thinking_off",
     "tools_present",
+    "question",
+    "ok",
+    "reasoning_plan",
+    "call_id1",
+    "call_id2",
+    "get_weather",
+    "get_time",
+    "arg_Paris",
+    "arg_Rome",
+    "sunny",
+    "late",
+    "result_id1",
+    "result_id2",
     "<",
     "></",
     "think",
@@ -57,8 +70,14 @@ const VOCAB: &[&str] = &[
 const TEMPLATE: &str = "\
 {%- if messages[-1].content.startswith('refuse') %}{{ raise_exception('refused ' ~ messages[-1].content) }}{% endif %}\
 {%- if messages[-1].content.startswith('fail') %}{% include messages[-1].content %}{% endif %}\
+{%- if messages[-1].content.startswith('defect') %}{{ messages|no_such_filter }}{% endif %}\
 {{ bos_token }} \
-{%- for m in messages %} {{ m.content }}{% endfor %} {{ eos_token }} \
+{%- for m in messages %} {{ m.content }}\
+{%- if m.reasoning_content %} reasoning_{{ m.reasoning_content }}{% endif %}\
+{%- for c in m.tool_calls or [] %} call_{{ c.id }} {{ c.function.name }} arg_{{ c.function.arguments.city }}\
+{%- for k, v in c.function.arguments|items %}{% endfor %}{% endfor %}\
+{%- if m.tool_call_id %} result_{{ m.tool_call_id }}{% endif %}\
+{%- endfor %} {{ eos_token }} \
 {%- if tools %} tools_present{% endif %} \
 {%- if foo is defined %} foo_{{ foo }}{% endif %} \
 {%- if reasoning_effort is defined %}\
@@ -98,7 +117,7 @@ impl tracing::Subscriber for Recorder {
         if event.metadata().target().starts_with("axum") {
             return;
         }
-        let mut text = FieldText(String::new());
+        let mut text = FieldText(format!("{} ", event.metadata().level()));
         event.record(&mut text);
         self.0.lock().push(text.0);
     }
@@ -122,6 +141,7 @@ struct Seen {
     prompt_think_open: bool,
     thinking_budget: Option<u32>,
     thinking_end_token_id: Option<u32>,
+    audio_b64: Vec<String>,
 }
 
 /// Records the request. Its reply puts the first piece in the reasoning
@@ -143,6 +163,7 @@ impl Generator for RecordingGenerator {
             prompt_think_open: req.prompt_think_open,
             thinking_budget: req.thinking_budget,
             thinking_end_token_id: req.thinking_end_token_id,
+            audio_b64: req.audio_b64.clone(),
         });
         let piece = |text: &str, is_thinking: bool| {
             Ok(GenerationToken {
@@ -236,11 +257,31 @@ async fn start(default_enable_thinking: Option<bool>) -> Server {
 }
 
 async fn post(port: u16, path: &str, body: &str) -> (u16, String) {
+    request(port, "POST", path, body).await
+}
+
+/// The error counters of the server, as `/metrics/cache` reports them.
+async fn error_counts(port: u16) -> Value {
+    let (status, text) = request(port, "GET", "/metrics/cache", "").await;
+    assert_eq!(status, 200, "{text}");
+    serde_json::from_str::<Value>(&text).unwrap()["error_counts"].clone()
+}
+
+/// How many recorded events have `level` and hold `needle`.
+fn logged(level: &str, needle: &str) -> usize {
+    events()
+        .lock()
+        .iter()
+        .filter(|e| e.starts_with(level) && e.contains(needle))
+        .count()
+}
+
+async fn request(port: u16, method: &str, path: &str, body: &str) -> (u16, String) {
     let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
         .await
         .unwrap();
     let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     );
@@ -492,6 +533,204 @@ async fn the_anthropic_route_renders_with_the_server_default() {
     }
 }
 
+/// An earlier assistant turn with thinking and tool calls, and a user turn
+/// with tool results, as an Anthropic client sends them back.
+fn anthropic_history() -> Value {
+    json!([
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "plan", "signature": "sig"},
+            {"type": "redacted_thinking", "data": "hidden"},
+            {"type": "text", "text": "ok"},
+            {"type": "tool_use", "id": "id1", "name": "get_weather", "input": {"city": "Paris"}},
+            {"type": "tool_use", "id": "id2", "name": "get_time", "input": {"city": "Rome"}}
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "id1", "content": "sunny", "is_error": false},
+            {"type": "tool_result", "tool_use_id": "id2",
+             "content": [{"type": "text", "text": "late"}]},
+            {"type": "text", "text": "hi"}
+        ]}
+    ])
+}
+
+const HISTORY_PROMPT: &str = "BOS question ok reasoning_plan call_id1 get_weather arg_Paris \
+    call_id2 get_time arg_Rome sunny result_id1 late result_id2 hi EOS < think >";
+
+/// The route gives the template the thinking text, each tool call and each
+/// tool result of the earlier turns, in order. Signature, redacted thinking
+/// and `is_error` have no template field and are not rendered.
+#[tokio::test]
+async fn the_anthropic_route_renders_earlier_thinking_and_tool_blocks() {
+    let server = start(None).await;
+    let body = json!({"model": MODEL, "max_tokens": 8, "messages": anthropic_history()});
+    let (status, reply) = post(server.port, "/v1/messages", &body.to_string()).await;
+    assert_eq!(status, 200, "{reply}");
+    let seen = server.seen.lock().first().cloned().unwrap();
+    assert_eq!(seen.prompt, HISTORY_PROMPT);
+}
+
+/// A tool call whose arguments the template cannot read reaches the template
+/// as sent, and the template's own error is the answer: 400
+/// `invalid_request_error` on both routes, not a retryable 503. The control
+/// request with an object as arguments renders.
+#[tokio::test]
+async fn a_tool_call_the_template_cannot_read_is_a_400_with_its_error() {
+    let anthropic = |input: Value| {
+        (
+            "/v1/messages",
+            json!({"model": MODEL, "max_tokens": 8, "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "id1", "name": "get_weather", "input": input}]},
+                {"role": "user", "content": "hi"}]}),
+        )
+    };
+    let openai = |arguments: &str| {
+        (
+            "/v1/chat/completions",
+            json!({"model": MODEL, "max_tokens": 8, "messages": [
+                {"role": "assistant", "content": "ok", "tool_calls": [
+                    {"id": "id1", "type": "function",
+                     "function": {"name": "get_weather", "arguments": arguments}}]},
+                {"role": "user", "content": "hi"}]}),
+        )
+    };
+    let server = start(None).await;
+    for (route, body) in [
+        anthropic(json!([1])),
+        anthropic(json!(null)),
+        openai("[1]"),
+        openai("null"),
+    ] {
+        let (status, reply) = post(server.port, route, &body.to_string()).await;
+        assert_eq!(status, 400, "{route} {body}: {reply}");
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["error"]["type"], "invalid_request_error", "{route}");
+        let message = reply["error"]["message"].as_str().unwrap();
+        assert!(
+            message.starts_with("the chat template refuses the request: "),
+            "{route}: {message}"
+        );
+    }
+    assert!(server.seen.lock().is_empty());
+    let counts = error_counts(server.port).await;
+    assert_eq!(
+        (&counts["bad_request"], &counts["internal"]),
+        (&json!(4), &json!(0))
+    );
+    for (route, body) in [
+        anthropic(json!({"city": "Paris"})),
+        openai("{\"city\":\"Paris\"}"),
+    ] {
+        let (status, reply) = post(server.port, route, &body.to_string()).await;
+        assert_eq!(status, 200, "{route}: {reply}");
+    }
+}
+
+const CHAT_ROUTES: [&str; 2] = ["/v1/chat/completions", "/v1/messages"];
+
+fn one_message(content: &str) -> String {
+    json!({"model": MODEL, "max_tokens": 8,
+           "messages": [{"role": "user", "content": content}]})
+    .to_string()
+}
+
+/// A failure that does not depend on the request, here a filter the engine
+/// does not have, is a server defect on both routes: 500 with a fixed message,
+/// counted as an internal error, and logged at `error` with the engine's text.
+/// The reply does not carry that text.
+#[tokio::test]
+async fn a_template_defect_is_a_500_and_a_server_error_on_both_routes() {
+    for route in CHAT_ROUTES {
+        let server = start(None).await;
+        let before = logged("ERROR", "no_such_filter");
+        let (status, reply) = post(server.port, route, &one_message("defect")).await;
+        assert_eq!(status, 500, "{route}: {reply}");
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(
+            reply["error"]["message"], "the chat template failed on the server",
+            "{route}"
+        );
+        let counts = error_counts(server.port).await;
+        assert_eq!(
+            (&counts["internal"], &counts["bad_request"]),
+            (&json!(1), &json!(0)),
+            "{route}"
+        );
+        assert_eq!(logged("ERROR", "no_such_filter") - before, 1, "{route}");
+        assert!(server.seen.lock().is_empty(), "{route}");
+    }
+}
+
+/// A refusal by `raise_exception` is 400 with the template's own text, counted
+/// as a bad request, and logged at `warn` with that text.
+#[tokio::test]
+async fn a_template_refusal_is_a_400_with_its_text_on_both_routes() {
+    for route in CHAT_ROUTES {
+        let server = start(None).await;
+        let marker = format!("refuse marker{}", route.len());
+        let before = logged("WARN", &marker);
+        let (status, reply) = post(server.port, route, &one_message(&marker)).await;
+        assert_eq!(status, 400, "{route}: {reply}");
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["error"]["type"], "invalid_request_error", "{route}");
+        assert_eq!(
+            reply["error"]["message"],
+            format!("the chat template refuses the request: refused {marker}"),
+            "{route}"
+        );
+        let counts = error_counts(server.port).await;
+        assert_eq!(
+            (&counts["bad_request"], &counts["internal"]),
+            (&json!(1), &json!(0)),
+            "{route}"
+        );
+        assert_eq!(logged("WARN", &marker) - before, 1, "{route}");
+    }
+}
+
+/// The `input_audio` blocks of user messages reach the engine in order, and
+/// the text around them is the prompt. An audio block of an assistant message
+/// is not carried.
+#[tokio::test]
+async fn the_anthropic_route_carries_input_audio_blocks() {
+    let audio =
+        |data: &str| json!({"type": "input_audio", "source": {"type": "base64", "data": data}});
+    let server = start(None).await;
+    let body = json!({"model": MODEL, "max_tokens": 8, "messages": [
+        {"role": "user", "content": [audio("AAEC"), {"type": "text", "text": "hi"}, audio("AwQF")]},
+        {"role": "assistant", "content": [audio("BgcI")]},
+        {"role": "user", "content": "hi"}
+    ]});
+    let (status, reply) = post(server.port, "/v1/messages", &body.to_string()).await;
+    assert_eq!(status, 200, "{reply}");
+    let seen = server.seen.lock().first().cloned().unwrap();
+    assert_eq!(seen.audio_b64, ["AAEC", "AwQF"]);
+}
+
+/// The same history on the OpenAI route renders the same prompt.
+#[tokio::test]
+async fn both_routes_render_the_same_history() {
+    let openai = json!([
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "ok", "reasoning_content": "plan", "tool_calls": [
+            {"id": "id1", "type": "function",
+             "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}},
+            {"id": "id2", "type": "function",
+             "function": {"name": "get_time", "arguments": "{\"city\":\"Rome\"}"}}
+        ]},
+        {"role": "tool", "tool_call_id": "id1", "content": "sunny"},
+        {"role": "tool", "tool_call_id": "id2", "content": "late"},
+        {"role": "user", "content": "hi"}
+    ]);
+    let server = start(None).await;
+    let body = json!({"model": MODEL, "max_tokens": 8, "messages": openai});
+    let (status, reply) = post(server.port, "/v1/chat/completions", &body.to_string()).await;
+    assert_eq!(status, 200, "{reply}");
+    let seen = server.seen.lock().first().cloned().unwrap();
+    assert_eq!(seen.prompt, HISTORY_PROMPT);
+}
+
 // ── reasoning_effort ────────────────────────────────────────────────────────
 
 /// An effort the template takes reaches it as sent, at the top level and in
@@ -622,6 +861,38 @@ async fn a_client_value_in_an_error_is_cut_in_the_log_and_in_a_template_error_re
             "a log event holds {} characters of a request value: {}",
             event.len(),
             &event[..event.len().min(120)]
+        );
+    }
+}
+
+/// The tools the template renders count against the same bound as the message
+/// text, on both routes: one tool with a long description is refused, and the
+/// same tool with a short one renders.
+#[tokio::test]
+async fn tools_count_against_the_input_text_bound() {
+    let tool = |route: &str, description: &str| -> (String, String) {
+        let tools = if route == "/v1/messages" {
+            json!([{"name": "n", "description": description, "input_schema": {}}])
+        } else {
+            json!([{"type": "function",
+                    "function": {"name": "n", "description": description, "parameters": {}}}])
+        };
+        let body = json!({"model": MODEL, "max_tokens": 8, "tools": tools,
+                          "messages": [{"role": "user", "content": "hi"}]});
+        (route.to_owned(), body.to_string())
+    };
+    let server = start(None).await;
+    for route in CHAT_ROUTES {
+        let (route, small) = tool(route, "short");
+        let (status, reply) = post(server.port, &route, &small).await;
+        assert_eq!(status, 200, "{route}: {reply}");
+        let (route, big) = tool(&route, &"a".repeat(4 << 20));
+        let (status, reply) = post(server.port, &route, &big).await;
+        assert_eq!(status, 413, "{route}: {reply:.200}");
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(
+            reply["error"]["field"], "total_input_tokens_estimate",
+            "{route}"
         );
     }
 }

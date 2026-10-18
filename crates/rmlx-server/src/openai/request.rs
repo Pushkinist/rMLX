@@ -36,20 +36,19 @@ impl MessageContent {
     pub fn as_text(&self) -> std::borrow::Cow<'_, str> {
         match self {
             MessageContent::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-            MessageContent::Parts(parts) => std::borrow::Cow::Owned(
-                parts
-                    .iter()
-                    .filter_map(|p| {
-                        if p.get("type")?.as_str()? == "text" {
-                            p.get("text")?.as_str().map(str::to_owned)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<String>(),
-            ),
+            MessageContent::Parts(parts) => std::borrow::Cow::Owned(text_of_parts(parts)),
         }
     }
+}
+
+/// The `text` parts of a content array, joined with nothing. OpenAI parts and
+/// Anthropic blocks share this shape.
+pub(crate) fn text_of_parts(parts: &[Value]) -> String {
+    parts
+        .iter()
+        .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|p| p.get("text").and_then(Value::as_str))
+        .collect()
 }
 
 /// extract image URLs from a content-parts array.
@@ -172,7 +171,9 @@ impl ChatMessage {
     }
 }
 
-/// Owned, `'static` projection of a [`ChatMessage`] for the chat template.
+/// Owned, `'static` message for the chat template, built from an OpenAI
+/// [`ChatMessage`] or from an Anthropic message. Both routes render and count
+/// their input through it.
 ///
 /// The render+tokenize step runs in `spawn_blocking`, so the data it borrows
 /// must outlive the request future — hence owned `String`s here, with
@@ -183,8 +184,10 @@ impl ChatMessage {
 /// templates expect: `[{"id","type":"function","function":{"name","arguments"}}]`
 /// where `arguments` is the **parsed object** (Qwen3.6's template iterates it
 /// with `|items`; Ternary-Bonsai's `else`/`tojson` branch also accepts an
-/// object). The OpenAI wire `arguments` is a JSON string; a parse failure
-/// degrades to `{}` so `|items` stays safe.
+/// object). The OpenAI wire `arguments` is a JSON string; text that is not
+/// JSON degrades to `{}`. Valid JSON that is not an object reaches the
+/// template as sent.
+#[derive(Default)]
 pub(crate) struct OwnedTplMessage {
     pub(crate) role: String,
     pub(crate) content: String,
@@ -192,6 +195,24 @@ pub(crate) struct OwnedTplMessage {
     pub(crate) tool_call_id: Option<String>,
     pub(crate) name: Option<String>,
     pub(crate) reasoning_content: Option<String>,
+}
+
+/// One entry of a template message's `tool_calls`, in the shape both routes
+/// give the chat template. `arguments` is the parsed object.
+pub(crate) fn tool_call_json(
+    id: Option<&str>,
+    kind: Option<&str>,
+    name: &str,
+    arguments: &Value,
+) -> Value {
+    serde_json::json!({
+        "id": id,
+        "type": kind.unwrap_or("function"),
+        "function": {
+            "name": name,
+            "arguments": arguments,
+        }
+    })
 }
 
 impl OwnedTplMessage {
@@ -202,14 +223,12 @@ impl OwnedTplMessage {
                 .map(|tc| {
                     let args_val: Value = serde_json::from_str(&tc.function.arguments)
                         .unwrap_or_else(|_| serde_json::json!({}));
-                    serde_json::json!({
-                        "id": tc.id,
-                        "type": tc.kind.clone().unwrap_or_else(|| "function".to_owned()),
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": args_val,
-                        }
-                    })
+                    tool_call_json(
+                        tc.id.as_deref(),
+                        tc.kind.as_deref(),
+                        &tc.function.name,
+                        &args_val,
+                    )
                 })
                 .collect();
             Value::Array(arr)
@@ -222,6 +241,24 @@ impl OwnedTplMessage {
             name: m.name.clone(),
             reasoning_content: m.reasoning_content.clone(),
         }
+    }
+
+    /// The bytes of every string this message gives the template, for the
+    /// input-size bound. The calls count as their compact JSON.
+    pub(crate) fn rendered_bytes(&self) -> usize {
+        let optional = |s: &Option<String>| s.as_ref().map_or(0, String::len);
+        [
+            self.role.len(),
+            self.content.len(),
+            self.tool_calls_json
+                .as_ref()
+                .map_or(0, crate::bounds::serialized_len),
+            optional(&self.tool_call_id),
+            optional(&self.name),
+            optional(&self.reasoning_content),
+        ]
+        .into_iter()
+        .fold(0, usize::saturating_add)
     }
 
     pub(crate) fn as_tpl(&self) -> ChatMessageTpl<'_> {

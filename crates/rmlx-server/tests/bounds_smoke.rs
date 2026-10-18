@@ -338,3 +338,179 @@ async fn test_anthropic_messages_over_limit_returns_413() {
     assert_eq!(json["error"]["code"], "input_too_large");
     assert_eq!(json["error"]["field"], "messages");
 }
+
+// Every block of an earlier turn that the template renders counts toward the
+// same estimate as text: a thinking block, the input of a tool call and the
+// content of a tool result, as a string or as text blocks.
+#[tokio::test]
+async fn test_anthropic_rendered_blocks_count_toward_total_tokens_estimate() {
+    let port = start().await;
+    let big = "x".repeat(MAX_TOTAL_INPUT_TOKENS_ESTIMATE * 3 + 16);
+    let blocks = [
+        (
+            "assistant",
+            format!(r#"{{"type":"thinking","thinking":"{big}","signature":"s"}}"#),
+        ),
+        (
+            "assistant",
+            format!(r#"{{"type":"tool_use","id":"t","name":"n","input":{{"a":"{big}"}}}}"#),
+        ),
+        (
+            "user",
+            format!(r#"{{"type":"tool_result","tool_use_id":"t","content":"{big}"}}"#),
+        ),
+        (
+            "user",
+            format!(
+                r#"{{"type":"tool_result","tool_use_id":"t","content":[{{"type":"text","text":"{big}"}}]}}"#
+            ),
+        ),
+    ];
+    for (role, block) in blocks {
+        let body = format!(
+            r#"{{"model":"test","messages":[{{"role":"{role}","content":[{block}]}}],"max_tokens":1}}"#
+        );
+        let (status, body_text) = post(port, "/v1/messages", &body).await;
+        assert_eq!(status, 413, "{block:.60}: {body_text:.200}");
+        let json: serde_json::Value = serde_json::from_str(&body_text).unwrap();
+        assert_eq!(json["error"]["code"], "input_too_large");
+        assert_eq!(json["error"]["field"], "total_input_tokens_estimate");
+    }
+}
+
+// Blocks with no template field do not count: an oversize signature and an
+// oversize redacted block pass the estimate.
+#[tokio::test]
+async fn test_anthropic_unrendered_blocks_do_not_count_toward_the_estimate() {
+    let port = start().await;
+    let big = "x".repeat(MAX_TOTAL_INPUT_TOKENS_ESTIMATE * 3 + 16);
+    let body = format!(
+        r#"{{"model":"test","messages":[{{"role":"assistant","content":[{{"type":"thinking","thinking":"t","signature":"{big}"}},{{"type":"redacted_thinking","data":"{big}"}}]}}],"max_tokens":1}}"#
+    );
+    let (status, body_text) = post(port, "/v1/messages", &body).await;
+    assert_ne!(status, 413, "{body_text:.200}");
+}
+
+/// Post `body` and expect the 413 `input_too_large` of `field`.
+async fn assert_refused(port: u16, route: &str, body: String, field: &str) {
+    let (status, text) = post(port, route, &body).await;
+    assert_eq!(status, 413, "{field}: {text:.200}");
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["error"]["code"], "input_too_large", "{field}");
+    assert_eq!(json["error"]["field"], field, "{text:.200}");
+}
+
+// A `tool_result` block renders as a message of its own, so the message cap
+// applies to the rendered history, not to the wire messages: five wire
+// messages of 1024 empty results render 5120 messages. Four render 4096.
+#[tokio::test]
+async fn test_anthropic_message_cap_counts_rendered_messages() {
+    let port = start().await;
+    let result = r#"{"type":"tool_result","tool_use_id":"t"}"#;
+    let message = format!(
+        r#"{{"role":"user","content":[{}]}}"#,
+        vec![result; MAX_CONTENT_PARTS].join(",")
+    );
+    let body = |n: usize| {
+        format!(
+            r#"{{"model":"test","messages":[{}],"max_tokens":1}}"#,
+            vec![message.as_str(); n].join(",")
+        )
+    };
+    let wire = MAX_MESSAGES / MAX_CONTENT_PARTS;
+    assert_refused(port, "/v1/messages", body(wire + 1), "messages").await;
+    let (status, text) = post(port, "/v1/messages", &body(wire)).await;
+    assert_ne!(status, 413, "{text:.200}");
+}
+
+// Every string the template can print counts toward the same estimate, not
+// only the text: the system prompt, a call id, a tool name, a message name.
+#[tokio::test]
+async fn test_anthropic_system_counts_toward_total_tokens_estimate() {
+    let port = start().await;
+    let big = "x".repeat(MAX_TOTAL_INPUT_TOKENS_ESTIMATE * 3 + 16);
+    let user = r#""messages":[{"role":"user","content":"hi"}]"#;
+    for system in [
+        format!(r#""{big}""#),
+        format!(r#"[{{"type":"text","text":"{big}"}}]"#),
+    ] {
+        let body = format!(r#"{{"model":"test",{user},"system":{system},"max_tokens":1}}"#);
+        assert_refused(port, "/v1/messages", body, "total_input_tokens_estimate").await;
+    }
+}
+
+#[tokio::test]
+async fn test_anthropic_tool_use_id_counts_toward_total_tokens_estimate() {
+    let port = start().await;
+    let big = "x".repeat(MAX_TOTAL_INPUT_TOKENS_ESTIMATE * 3 + 16);
+    let body = format!(
+        r#"{{"model":"test","messages":[{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{big}"}}]}}],"max_tokens":1}}"#
+    );
+    assert_refused(port, "/v1/messages", body, "total_input_tokens_estimate").await;
+}
+
+#[tokio::test]
+async fn test_anthropic_tool_call_id_and_name_count_toward_total_tokens_estimate() {
+    let port = start().await;
+    let big = "x".repeat(MAX_TOTAL_INPUT_TOKENS_ESTIMATE * 3 + 16);
+    for (id, name) in [(big.as_str(), "n"), ("t", big.as_str())] {
+        let body = format!(
+            r#"{{"model":"test","messages":[{{"role":"assistant","content":[{{"type":"tool_use","id":"{id}","name":"{name}","input":{{}}}}]}}],"max_tokens":1}}"#
+        );
+        assert_refused(port, "/v1/messages", body, "total_input_tokens_estimate").await;
+    }
+}
+
+#[tokio::test]
+async fn test_openai_tool_call_id_counts_toward_total_tokens_estimate() {
+    let port = start().await;
+    let big = "x".repeat(MAX_TOTAL_INPUT_TOKENS_ESTIMATE * 3 + 16);
+    let body = format!(
+        r#"{{"model":"test","messages":[{{"role":"tool","content":"r","tool_call_id":"{big}"}}],"max_tokens":1}}"#
+    );
+    assert_refused(
+        port,
+        "/v1/chat/completions",
+        body,
+        "total_input_tokens_estimate",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_openai_message_name_and_call_arguments_count_toward_total_tokens_estimate() {
+    let port = start().await;
+    let big = "x".repeat(MAX_TOTAL_INPUT_TOKENS_ESTIMATE * 3 + 16);
+    let named = format!(
+        r#"{{"model":"test","messages":[{{"role":"user","content":"hi","name":"{big}"}}],"max_tokens":1}}"#
+    );
+    assert_refused(
+        port,
+        "/v1/chat/completions",
+        named,
+        "total_input_tokens_estimate",
+    )
+    .await;
+    let call = format!(
+        r#"{{"model":"test","messages":[{{"role":"assistant","content":"a","tool_calls":[{{"id":"t","type":"function","function":{{"name":"n","arguments":"{{\"a\":\"{big}\"}}"}}}}]}}],"max_tokens":1}}"#
+    );
+    assert_refused(
+        port,
+        "/v1/chat/completions",
+        call,
+        "total_input_tokens_estimate",
+    )
+    .await;
+}
+
+// The audio size check is on `/v1/messages` too: a clip over the cap is
+// refused with the field `input_audio`, not dropped and not passed on.
+#[tokio::test]
+async fn test_anthropic_input_audio_over_limit_returns_413() {
+    let port = start().await;
+    let fake_b64 = "A".repeat(MAX_INPUT_AUDIO_BYTES * 4 / 3 + 8);
+    let body = format!(
+        r#"{{"model":"test","messages":[{{"role":"user","content":[{{"type":"input_audio","source":{{"type":"base64","data":"{fake_b64}"}}}}]}}],"max_tokens":1}}"#
+    );
+    assert_refused(port, "/v1/messages", body, "input_audio").await;
+}

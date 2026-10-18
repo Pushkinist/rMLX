@@ -135,7 +135,7 @@ on the request's tracing span. The response `id` is built from it:
 | Field | Type | Notes |
 |---|---|---|
 | `model` | string (required) | Registry model id. |
-| `messages` | array (required) | `role` and `content`; also `tool_calls`, `tool_call_id`, `name`, `reasoning_content`. `reasoning_content` is passed on any role and reaches the chat template as sent (absent when not sent, `null` reads as absent); it counts toward the total input-size bound. A template that reads it on assistant turns (Qwen3.8, Ternary-Bonsai-2) renders an earlier turn's reasoning in its think block, not an empty one. `POST /v1/messages` does not carry it. |
+| `messages` | array (required) | `role` and `content`; also `tool_calls`, `tool_call_id`, `name`, `reasoning_content`. `reasoning_content` is passed on any role and reaches the chat template as sent (absent when not sent, `null` reads as absent); it counts toward the total input-size bound. A template that reads it on assistant turns (Qwen3.8, Ternary-Bonsai-2) renders an earlier turn's reasoning in its think block, not an empty one. `POST /v1/messages` fills it from `thinking` blocks. |
 | `stream` | bool | Default false. |
 | `temperature`, `top_p`, `top_k`, `min_p` | number | Resolution order in [`SAMPLING.md`](SAMPLING.md) § "Defaults and resolution order". |
 | `repetition_penalty`, `frequency_penalty`, `presence_penalty` | f32 | Same. |
@@ -217,7 +217,7 @@ positions.
   cannot fetch is a 400 too, as the URL is the client's input: "the image URL
   answered 404", or "the image URL could not be fetched".
 - Each `input_audio` part is capped at 16 MiB decoded
-  (`bounds::MAX_INPUT_AUDIO_BYTES`); a larger clip is 400. Its audio is
+  (`bounds::MAX_INPUT_AUDIO_BYTES`); a larger clip is 413. Its audio is
   capped at what the context holds after the prompt, at most 3 h
   (`docs/AUDIO_WAV.md`). The decode of the clip reads the stop of the request
   before each packet and ends with it. The audio tower and the one prefill forward of
@@ -493,7 +493,7 @@ generator. See [Session cache](#session-cache).
 |---|---|---|
 | `model` | string (required) | Registry model id. |
 | `max_tokens` | u32 (required) | Missing is 400. |
-| `messages` | array (required) | `role` and `content` (string or block array). `input_audio` blocks carry `source:{type:"base64",data:…}`. |
+| `messages` | array (required) | `role` and `content` (string or block array). See "Message blocks" below. |
 | `system` | string or array | System prompt, rendered through the chat template. |
 | `temperature`, `top_p`, `top_k` | number | Same resolution order as the OpenAI route. |
 | `stop_sequences` | array | Stop sequences. |
@@ -501,6 +501,38 @@ generator. See [Session cache](#session-cache).
 | `tools` | array | `name`, `description`, `input_schema`. |
 | `tool_choice` | object | `{type:"auto"\|"any"\|"tool", name?:"…"}`. |
 | `metadata` | object | Accepted and ignored. |
+
+**Message blocks.** The route gives the chat template the blocks of every
+message, with the values as the client sent them. It builds the same template
+messages as the OpenAI route, so one history renders to the same prompt on both
+routes.
+
+| Block | Reaches the template as |
+|---|---|
+| `text` | `content`; the text blocks of a message join with nothing. |
+| `thinking` | `reasoning_content` of the message. |
+| `tool_use` | An entry of `tool_calls` (`id`, `name`, and `input` as the `arguments` object). |
+| `tool_result` | A `tool` message with `tool_call_id` from `tool_use_id`. Its content is the string, or the joined `text` blocks of an array. |
+| `input_audio` | `source:{type:"base64",data:…}` of a `user` message goes to the audio tower, as for the OpenAI route. It is not template text. |
+
+A `tool_result` message comes before the message of its turn that holds the
+other blocks, in block order. A turn of `tool_result` blocks alone gives no
+`user` message.
+
+These blocks have no template field and are not rendered: `signature`,
+`redacted_thinking`, `is_error`, and the image blocks of a `tool_result`.
+Image blocks are not read on this route.
+
+Both input bounds read the rendered messages. The message cap (413, field
+`messages`) counts them, so a message with many `tool_result` blocks counts
+once per block. The size bound (`total_input_tokens_estimate`, 413) counts
+every string of them: the text, the thinking text, the serialised `tool_use`
+calls, the `tool_result` content and call id, the `system` prompt, and the
+serialised `tools` array. A block that is not rendered does not count. The
+OpenAI route counts the same strings of its messages, with `tool_call_id`,
+`name` and the call arguments among them, and its `tools` and
+`chat_template_kwargs`. Tools that the route drops because the template cannot
+render them do not count.
 
 **Non-streaming response**:
 
@@ -622,8 +654,16 @@ the answer for a bad value.
   it.
 - A value the template refuses (a `raise_exception` call: an effort it does not
   take, a role out of order) is 400 `invalid_request_error` with the template's
-  message, cut to 256 characters, and no server path. Any other render failure
-  is 503 with its message cut the same way. No value is rewritten.
+  message, cut to 256 characters, and no server path. An error of the engine
+  while it renders the request is 400 too, with the error cut the same way: the
+  template could not use what the request holds, for example a `tool_calls`
+  `arguments` that is not an object, and a retry gives the same answer. The
+  engine cannot tell such an error from a template bug that only some values
+  reach, so it is logged at `warn` with its text. A failure that does not depend
+  on the request (the compiled template is missing, or it uses a filter, test or
+  function the engine does not have) is a server defect: 500 `internal_error`
+  with a fixed message, counted as an internal error, and logged at `error` with
+  the engine's text. No value is rewritten.
 - A log event holds at most 256 characters of a template error or of the
   parser's error for a rejected JSON body. The reply of a rejected JSON body is
   not cut.

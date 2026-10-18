@@ -102,9 +102,27 @@ fn raise_exception_is_a_rejection_carrying_the_template_message() {
 
     let tpl = ChatTemplate::new("{{ messages.items() }}".to_owned()).expect("compile");
     assert!(
-        matches!(tpl.render(&[], &NO_OPTS), Err(RenderError::Failed(_))),
-        "an unsupported construct is a render failure, not a rejection"
+        matches!(tpl.render(&[], &NO_OPTS), Err(RenderError::Rejected(_))),
+        "an engine error on a value is the request's, as it cannot be told from a template bug"
     );
+}
+
+/// A filter, test or function the engine does not have fails every request
+/// alike. That is a defect, not a rejection, even in a branch that only some
+/// requests reach.
+#[test]
+fn an_unknown_name_is_a_defect() {
+    for source in [
+        "{{ messages|no_such_filter }}",
+        "{% if messages is no_such_test %}{% endif %}",
+        "{{ no_such_function() }}",
+    ] {
+        let tpl = ChatTemplate::new(source.to_owned()).expect("compile");
+        match tpl.render(&[], &NO_OPTS) {
+            Err(RenderError::Defect(msg)) => assert!(msg.contains("no_such"), "{source}: {msg}"),
+            other => panic!("{source}: want Defect, got {other:?}"),
+        }
+    }
 }
 
 /// A variable is defined in the template context only when the request sets
@@ -341,7 +359,7 @@ fn a_render_failure_message_is_bounded() {
     }];
     let tpl = ChatTemplate::new("{% include messages[0].content %}".to_owned()).expect("compile");
     match tpl.render(&messages, &NO_OPTS) {
-        Err(RenderError::Failed(msg)) => {
+        Err(RenderError::Rejected(msg)) => {
             assert!(
                 msg.chars().count() <= 257,
                 "{} characters",
@@ -349,7 +367,7 @@ fn a_render_failure_message_is_bounded() {
             );
         }
         other => panic!(
-            "want Failed, got {:?}",
+            "want Rejected, got {:?}",
             other.map(|r| r.text.len()).map_err(|e| e.to_string().len())
         ),
     }

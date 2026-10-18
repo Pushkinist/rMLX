@@ -2652,6 +2652,23 @@ fn reasoning_content_reaches_the_template_message() {
     assert_eq!(owned[2].as_tpl().reasoning_content, None);
 }
 
+// The input bound counts every string a message gives the template: each
+// field below is a different length, so a field left out changes the sum.
+#[test]
+fn rendered_bytes_counts_every_string_of_the_message() {
+    let m = OwnedTplMessage {
+        role: "r".to_owned(),
+        content: "c".repeat(10),
+        tool_calls_json: Some(serde_json::json!({"k": "v"})),
+        tool_call_id: Some("i".repeat(100)),
+        name: Some("n".repeat(1000)),
+        reasoning_content: Some("t".repeat(10_000)),
+    };
+    let calls = r#"{"k":"v"}"#.len();
+    assert_eq!(m.rendered_bytes(), 1 + 10 + calls + 100 + 1000 + 10_000);
+    assert_eq!(OwnedTplMessage::default().rendered_bytes(), 0);
+}
+
 #[test]
 fn null_reasoning_content_reads_as_absent() {
     let req = parse(

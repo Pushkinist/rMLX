@@ -326,65 +326,43 @@ pub(crate) async fn chat_completions(
             return e.into_response();
         }
     }
-    // Per-message checks: tool_calls and content_parts.
-    {
-        // The template can print `chat_template_kwargs`, so it counts as text.
-        let mut total_text_bytes: usize = req
-            .chat_template_kwargs
-            .as_ref()
-            .map_or(0, bounds::serialized_len);
-        for (idx, msg) in req.messages.iter().enumerate() {
-            if let Some(ref calls) = msg.tool_calls {
-                if let Err(e) = bounds::check_tool_calls(calls.len(), idx) {
-                    state.error_counts.increment(ApiErrorCategory::BadRequest);
-                    return e.into_response();
-                }
-            }
-            if let Some(reasoning) = &msg.reasoning_content {
-                total_text_bytes = total_text_bytes.saturating_add(reasoning.len());
-            }
-            match &msg.content {
-                Some(MessageContent::Parts(parts)) => {
-                    if let Err(e) = bounds::check_content_parts(parts.len(), idx) {
-                        state.error_counts.increment(ApiErrorCategory::BadRequest);
-                        return e.into_response();
-                    }
-                    for (pidx, part) in parts.iter().enumerate() {
-                        // audio: base64 byte estimate (base64 is ≈4/3 of binary)
-                        if part.get("type").and_then(|t| t.as_str()) == Some("input_audio") {
-                            if let Some(b64) = part
-                                .get("input_audio")
-                                .and_then(|a| a.get("data"))
-                                .and_then(|d| d.as_str())
-                            {
-                                let decoded_estimate = b64.len() * 3 / 4;
-                                if let Err(e) =
-                                    bounds::check_input_audio_bytes(decoded_estimate, pidx)
-                                {
-                                    state.error_counts.increment(ApiErrorCategory::BadRequest);
-                                    return e.into_response();
-                                }
-                            }
-                        }
-                        // accumulate text bytes for the token-estimate check
-                        if part.get("type").and_then(|t| t.as_str()) == Some("text") {
-                            if let Some(s) = part.get("text").and_then(|t| t.as_str()) {
-                                total_text_bytes = total_text_bytes.saturating_add(s.len());
-                            }
-                        }
-                    }
-                }
-                Some(MessageContent::Text(s)) => {
-                    total_text_bytes = total_text_bytes.saturating_add(s.len());
-                }
-                None => {}
+    // Per-message checks: tool_calls, content_parts and audio bytes.
+    for (idx, msg) in req.messages.iter().enumerate() {
+        if let Some(ref calls) = msg.tool_calls {
+            if let Err(e) = bounds::check_tool_calls(calls.len(), idx) {
+                state.error_counts.increment(ApiErrorCategory::BadRequest);
+                return e.into_response();
             }
         }
-        if let Err(e) = bounds::check_total_input_tokens_estimate(total_text_bytes) {
-            state.error_counts.increment(ApiErrorCategory::BadRequest);
-            return e.into_response();
+        if let Some(MessageContent::Parts(parts)) = &msg.content {
+            if let Err(e) = bounds::check_content_parts(parts.len(), idx) {
+                state.error_counts.increment(ApiErrorCategory::BadRequest);
+                return e.into_response();
+            }
+            for (pidx, part) in parts.iter().enumerate() {
+                // audio: base64 byte estimate (base64 is ≈4/3 of binary)
+                if part.get("type").and_then(|t| t.as_str()) == Some("input_audio") {
+                    if let Some(b64) = part
+                        .get("input_audio")
+                        .and_then(|a| a.get("data"))
+                        .and_then(|d| d.as_str())
+                    {
+                        let decoded_estimate = b64.len() * 3 / 4;
+                        if let Err(e) = bounds::check_input_audio_bytes(decoded_estimate, pidx) {
+                            state.error_counts.increment(ApiErrorCategory::BadRequest);
+                            return e.into_response();
+                        }
+                    }
+                }
+            }
         }
     }
+
+    let messages_owned: Vec<OwnedTplMessage> = req
+        .messages
+        .iter()
+        .map(OwnedTplMessage::from_request)
+        .collect();
 
     // Extract the first system-role message (if any) as the canonical system
     // prompt. It is stripped from the prompt-message list so the engine
@@ -445,6 +423,21 @@ pub(crate) async fn chat_completions(
             );
             jinja_tools.clear();
         }
+    }
+
+    // The bound counts what the template can print: every string of the
+    // rendered messages, the tools and `chat_template_kwargs`.
+    let total_text_bytes = messages_owned.iter().fold(
+        bounds::serialized_len(&jinja_tools).saturating_add(
+            req.chat_template_kwargs
+                .as_ref()
+                .map_or(0, bounds::serialized_len),
+        ),
+        |sum, m| sum.saturating_add(m.rendered_bytes()),
+    );
+    if let Err(e) = bounds::check_total_input_tokens_estimate(total_text_bytes) {
+        state.error_counts.increment(ApiErrorCategory::BadRequest);
+        return e.into_response();
     }
 
     if !jinja_tools.is_empty() {
@@ -574,11 +567,6 @@ pub(crate) async fn chat_completions(
                         "chat_template_kwargs sets a variable that the server or the template provides; the request value is ignored"
                     );
                 }
-                let messages_owned: Vec<OwnedTplMessage> = req
-                    .messages
-                    .iter()
-                    .map(OwnedTplMessage::from_request)
-                    .collect();
                 let bos = entry.bos_token.clone().unwrap_or_default();
                 let eos = entry.eos_token.clone().unwrap_or_default();
                 let model_id_log = req.model.clone();
@@ -597,10 +585,7 @@ pub(crate) async fn chat_completions(
                     };
                     let rendered = tpl.render(&tpl_msgs, &opts).map_err(|e| match e {
                         RenderError::Rejected(_) => (ApiErrorCategory::BadRequest, e.to_string()),
-                        RenderError::Failed(_) => (
-                            ApiErrorCategory::Upstream,
-                            format!("chat template render failed: {e}"),
-                        ),
+                        RenderError::Defect(_) => (ApiErrorCategory::Internal, e.to_string()),
                     })?;
                     // Read the initial think channel off the assistant-turn
                     // suffix ONLY. Message content is client-controlled and can
@@ -654,11 +639,15 @@ pub(crate) async fn chat_completions(
                         return internal_error("prompt pipeline task panicked");
                     }
                     Ok(Err((category, e))) => {
-                        tracing::warn!(model_id = %model_id_log, error = %e, "prompt pipeline failed");
                         state.error_counts.increment(category);
                         return if category == ApiErrorCategory::BadRequest {
+                            tracing::warn!(model_id = %model_id_log, error = %e, "chat_template refused the request");
                             bad_request(&e)
+                        } else if category == ApiErrorCategory::Internal {
+                            tracing::error!(model_id = %model_id_log, error = %e, "chat_template cannot be used");
+                            internal_error("the chat template failed on the server")
                         } else {
+                            tracing::warn!(model_id = %model_id_log, error = %e, "prompt pipeline failed");
                             service_unavailable(&e)
                         };
                     }

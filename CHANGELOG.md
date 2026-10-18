@@ -178,6 +178,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   filed under the wrong commit. The commit is now the identity's, shortened
   when it resolves in the checkout, else the checkout's HEAD, else `unknown`,
   in the six scripts that file a row.
+- **`/v1/messages` renders the earlier `thinking`, `tool_use` and
+  `tool_result` blocks.** The route kept the `text` blocks of a message and
+  dropped the rest. A chat template saw an earlier turn with an empty think
+  block, and no tool call and no tool result of a multi-turn tool loop. The
+  route now gives the template the thinking text, each tool call and each tool
+  result as the client sent them, as the OpenAI route does. The input-size
+  bound counts them. `input_audio` blocks of a `user` message, which the route
+  size-checked and then dropped, reach the audio tower. `signature`,
+  `redacted_thinking`, `is_error` and the image blocks of a tool result have no
+  template field and are not rendered.
+- **The input bounds count every string the template renders.** The size bound
+  on both chat routes counted the text only. It now counts also the `system`
+  prompt of `/v1/messages`, the call id, the name, the tool-call arguments and
+  the `tools` array. On `/v1/messages`, the message cap counts the rendered
+  messages: each `tool_result` block is one.
+- **A chat template that fails to render is 400 or 500, not 503.** A template
+  that failed on a request gave a retryable 503 `service_unavailable`. An error
+  while it renders the request's values (for example `tool_calls` arguments
+  that are not an object) is now 400 `invalid_request_error` with the error, on
+  both chat routes. A failure that does not depend on the request (a missing
+  compiled template, or a filter, test or function the engine does not have) is
+  500 `internal_error` with a fixed message, and the log holds the error.
 
 ### Performance
 
