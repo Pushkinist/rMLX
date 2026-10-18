@@ -44,6 +44,13 @@ Usage: `sse_decode_window.py --url URL --body-file FILE [--raw FILE]`. The file
 holds the JSON request body, which is POSTed with `Content-Type:
 application/json`.
 
+With `--complete FILE` the request is not timed and not streamed: the body asks
+for a whole response, this process writes it to `FILE` and prints the digest of
+its text, reasoning first and then content, computed by the same function as
+the streamed digest. For a response whose reasoning comes before its content,
+which is how a model writes them, the two digests of one answer are equal. The
+output is `answer_sha256=<hex>`.
+
 Output (stdout), one `key=value` per line:
 
     clock=<source>      `client` when this process timed the chunks,
@@ -70,10 +77,12 @@ answered differently.
 `--raw` is truncated before the request is sent and holds this request's lines
 only, also when the request fails.
 
-Exit codes: 0 — read; 2 — `--raw` could not be written; 3 — more content chunks
-arrived than the completion had tokens; 4 — the request could not be sent, or
-the response did not end as a complete response (a chunked body without its last
-chunk, a body shorter than its length); 5 — a server stamp is unusable.
+Exit codes: 0 — read; 2 — `--raw` or the `--complete` file could not be
+written; 3 — more content chunks arrived than the completion had tokens; 4 — the
+request could not be sent, the response did not end as a complete response (a
+chunked body without its last chunk, a body shorter than its length), or a
+`--complete` response was not a 200; 5 — a server stamp is unusable; 6 — a
+`--complete` response is not a chat completion.
 """
 
 import argparse
@@ -206,6 +215,11 @@ def parse(stamped, server_stamps=False):
     return arrivals, "".join(text), usage_tokens, prompt_tokens
 
 
+def answer_digest(text):
+    """The digest of a whole completion, the one every caller compares."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def report(arrivals, text, usage_tokens, prompt_tokens, clock):
     """The `key=value` lines for one response."""
     if usage_tokens is not None and len(arrivals) > usage_tokens:
@@ -224,7 +238,7 @@ def report(arrivals, text, usage_tokens, prompt_tokens, clock):
         window = arrivals[-1] - arrivals[0]
         if window > 0:
             lines.append(f"decode_tps={(len(arrivals) - 1) / window:.6f}")
-    lines.append(f"answer_sha256={hashlib.sha256(text.encode('utf-8')).hexdigest()}")
+    lines.append(f"answer_sha256={answer_digest(text)}")
     preview = text[:PREVIEW_CHARS].replace("\n", " ").replace("\r", " ")
     lines.append(f"preview={preview}")
     return lines
@@ -275,6 +289,42 @@ def run(args, raw):
     return 0
 
 
+def run_complete(args):
+    """Send the request, keep the whole response, print its digest. Returns the exit code."""
+    try:
+        with open(args.body_file, "rb") as handle:
+            body = handle.read()
+        response = post(args.url, body)
+        data = response.read()
+    except (OSError, http.client.HTTPException) as exc:
+        print(f"sse_decode_window: request to {args.url} failed: {exc}", file=sys.stderr)
+        return 4
+    if response.status != 200:
+        print(
+            f"sse_decode_window: {args.url} answered {response.status}, not 200",
+            file=sys.stderr,
+        )
+        return 4
+    try:
+        with open(args.complete, "wb") as handle:
+            handle.write(data)
+    except OSError as exc:
+        print(f"sse_decode_window: cannot write {args.complete}: {exc}", file=sys.stderr)
+        return 2
+    try:
+        completion = json.loads(data)
+        message = completion["choices"][0]["message"]
+        text = (message.get("reasoning_content") or "") + (message.get("content") or "")
+    except (ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
+        print(
+            f"sse_decode_window: the response is not a chat completion: {exc!r}",
+            file=sys.stderr,
+        )
+        return 6
+    print(f"answer_sha256={answer_digest(text)}")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", required=True, help="chat-completions endpoint")
@@ -287,11 +337,20 @@ def main(argv=None):
         help="also write the arrival-stamped body here, for triage",
     )
     parser.add_argument(
+        "--complete",
+        default=None,
+        metavar="FILE",
+        help="send an unstreamed request, write the response to FILE and print its digest",
+    )
+    parser.add_argument(
         "--server-stamps",
         action="store_true",
         help="time the chunks by the server's `: sent-at=` stamps (self-tests only)",
     )
     args = parser.parse_args(argv)
+
+    if args.complete:
+        return run_complete(args)
 
     raw_handle = None
     if args.raw:

@@ -950,7 +950,7 @@ canary-ab-ingest-selftest: ## mutation-check the A/B -> runs.db promoter (no GPU
 llama-ab-selftest: ## mutation-check the llama-server A/B harness against a stub server (no GPU, no GGUF)
 	bash scripts/bench_llama_ab_selftest.sh
 
-spec-bench-selftest: ## mutation-check the spec-decode bench against a stub server (no GPU, no model, no DB write)
+spec-bench-selftest: ## mutation-check the spec-decode bench against a stub server (no GPU, no model, no DB write; builds the dev rmlx, which judges a near-tie flip)
 	bash scripts/spec_bench_selftest.sh
 
 bench-identity-selftest: ## mutation-check the commit and run-log sources of perf_canary.sh, bench_decode_tps.sh and lib/identity.sh against stub binaries (no GPU, no model, no DB write)

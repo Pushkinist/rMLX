@@ -661,14 +661,21 @@ prompt:
 - Both use the window from the first emitted token to the last.
   `scripts/lib/sse_decode_window.py` times the same window client-side. A
   disagreement past `CROSS_CHECK_BAND_PCT` (10) stops the run.
-- Each measured completion is digested. Without a sampler, a speculative run
-  whose answer differs from the plain arm's stops the run before any median.
+- Each measured completion is digested. Without a sampler, equal digests file
+  `answer_check=matches_plain`. A speculative answer that differs is judged by
+  `rmlx eval spec-answer` over one unstreamed logprob pass per arm, each held
+  to its arm's digest. A first divergence at a near tie files
+  `answer_check=near_tie@<token>` with `divergence_rank` and
+  `divergence_margin`. Any other difference stops the run before any median.
   Whether a sampler ran is read from the engine's own event
   (`scripts/lib/server_sampling.py`). Under a sampler both rows record
   `answer_check=sampled`.
 
 The bench's answer check decides whether to file a row. It does not judge
-correctness; that is the next section.
+correctness; that is the next section. Its ceiling (0.12) was set on 256-token
+prose, so at 128 tokens a broken loop can pass on one prompt. It has no
+repetition control. When its digest differs, EAGLE-3 is refused unless its
+logprob pass binds, and it is judged with no restricted-vocabulary excuse.
 
 ## Judging a draft-side change
 

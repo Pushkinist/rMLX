@@ -4,17 +4,21 @@
 decoding emits the verifier's own argmax at every position. So at temperature
 0 a speculative run and a plain run of the same verifier are two ways of
 computing one answer. This gate checks that a round loop keeps it that way.
+The divergence oracle it applies, and the constants that set it, live in
+`crates/rmlx-models/src/answer_equivalence.rs`.
 
 It is not bit-identity. The verify pass scores a whole block in one forward,
 where plain decode steps one token at a time: a different reduction order. No
 correct speculative arm is byte-identical to plain greedy in general.
 
-**This is not the bench's arm-equality refusal.** `scripts/spec_bench.sh`
-digests each measured completion and refuses to file a speculative row whose
-answer differs from the plain arm's at all. That decides whether a throughput
-row is worth recording, and it is right to be absolute. This gate answers what
-byte equality cannot: whether a difference is a near-tie the arithmetic
-permits or a defect in the round loop.
+**This is not the bench's answer check.** `scripts/spec_bench.sh` digests each
+measured completion. Equal digests file a speculative row as `matches_plain`.
+A difference goes to `rmlx eval spec-answer`, which applies the oracle below
+to one unstreamed logprob pass of each arm at 128 tokens, with the length
+ratio and no repetition control. A near-tie flip files the row as
+`near_tie@<token>`; anything else stops the run. That decides whether a
+throughput row is worth recording, and it is a filter: this gate is what judges
+the round loop, on 256-token prose, with the repetition control.
 
 The thresholds below are set from runs of the gate against the shipped
 engine and against deliberately broken ones. `scripts/spec_broken_engine.sh`

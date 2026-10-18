@@ -15,6 +15,7 @@ pub(crate) mod parse;
 pub(crate) mod preset_table;
 pub(crate) mod profile;
 pub(crate) mod serve;
+pub(crate) mod spec_answer;
 pub(crate) mod transcribe;
 
 pub(crate) use baseline::run_baseline;
@@ -30,3 +31,4 @@ pub(crate) use parse::{
 };
 pub(crate) use profile::run_profile_list;
 pub(crate) use serve::run_serve;
+pub(crate) use spec_answer::run_spec_answer;

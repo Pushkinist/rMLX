@@ -20,6 +20,8 @@
 #
 # No GPU, no model, no DB: the stub answers `metrics record` without writing
 # anything, and the assertions read the §8.5 buffer file the script emits.
+# `eval spec-answer` is the exception that proves the oracle is the real one: the
+# stub binary hands it to the dev build of `rmlx`, which this suite builds first.
 #
 # Exit codes: 0 — every case behaved; 1 — at least one did not.
 
@@ -51,9 +53,11 @@ HEAD_SHA="$(git -C "$FAKE_ROOT" rev-parse --short HEAD)"
 # ── Shims ─────────────────────────────────────────────────────────────────────
 #
 # The script's inter-request sleeps are 5 s of nothing when the server is a stub.
+# Each one is noted in $SLEEP_LOG, when a case sets it, so a case can read which
+# pauses the script asked for.
 SHIM_DIR="$WORK/shims"
 mkdir -p "$SHIM_DIR"
-printf '#!/bin/sh\nexit 0\n' >"$SHIM_DIR/sleep"
+printf '#!/bin/sh\necho "$1" >>"${SLEEP_LOG:-/dev/null}"\nexit 0\n' >"$SHIM_DIR/sleep"
 chmod +x "$SHIM_DIR/sleep"
 
 # ── Stub server ───────────────────────────────────────────────────────────────
@@ -89,17 +93,39 @@ servers answer differently. STUB_SAMPLER appends the engine's per-request
 it partway through, which is the run whose requests did not share one sampling
 setup.
 
+Every request of a server must carry the messages, max_tokens, temperature and
+seed of the first one, or it is answered 400: a request that is not the measured
+one is not a pass over the measured answer. A request with `"stream": false` gets
+the whole answer back with one logprob record per token when it asks for
+`logprobs`, listing `min(top_logprobs, STUB_TOP_LOGPROBS)` candidates, the pieces being the ones the streamed request sends, and the
+same per-request events the streamed one leaves. It is not counted in `served`:
+the knobs indexed by that count keep addressing the streamed requests. Its
+margins are 1.0 apart everywhere but where STUB_MARGIN_AT (`position=gap,...`)
+says otherwise; the speculative server reads STUB_SPEC_MARGIN_AT instead.
+STUB_TOP_LOGPROBS is how many candidates each record lists (2),
+STUB_RECORDS_SHORT drops that many records from the end, STUB_NO_LOGPROBS
+leaves the field out, STUB_UNTIMED_DIFFERS (`plain` or `spec`) makes that
+server's unstreamed answer a different one from its streamed answer, and
+STUB_SAME_PIECES makes the records name the pieces of the undiverged answer
+whatever the text says, and STUB_UNSTREAMED_STATUS is the HTTP status it answers
+with and STUB_UNSTREAMED_BODY=junk makes it answer 200 with something that is not a
+chat completion. STUB_SPEC_EXTRA_TOKENS gives the speculative server that many more tokens
+than STUB_TOKENS (fewer when negative), and STUB_SPEC_VARY makes only its streamed
+answers differ from request to request.
+
 Arguments after the port. The stub binary reads them from the file `stub_args` in
 the case's RMLX_HOME, so a case sets them and no environment variable carries
 them:
 
-  --marks DIR          before each streamed request, note in DIR/seen whether the
+  --marks DIR          before each request, note in DIR/seen whether the
                        client that sent it had already left DIR/mark.N (N counts
-                       the streamed requests over every server of the case)
+                       the requests over every server of the case)
   --hold PREFIX        after its role chunk, the first streamed request creates
                        PREFIX.held and waits for PREFIX.release, so a case can
                        act while a request is in flight
   --hold-wait SECONDS  how long that wait lasts at most (300)
+  --requests FILE      append `<arm> stream` or `<arm> unstreamed` to FILE for each
+                       request, `arm` being `spec` on the speculative server
 """
 
 import argparse
@@ -115,15 +141,18 @@ parser.add_argument("port", type=int)
 parser.add_argument("--marks", default="")
 parser.add_argument("--hold", default="")
 parser.add_argument("--hold-wait", type=float, default=300.0)
+parser.add_argument("--requests", default="")
 ARGS = parser.parse_args()
 
-TOKENS = int(os.environ["STUB_TOKENS"])
+SPECULATIVE = os.environ.get("STUB_SPECULATIVE", "") == "1"
+TOKENS = int(os.environ["STUB_TOKENS"]) + (
+    int(os.environ.get("STUB_SPEC_EXTRA_TOKENS", "0")) if SPECULATIVE else 0
+)
 GAP_S = float(os.environ["STUB_GAP_S"])
 PREFILL_S = float(os.environ["STUB_PREFILL_S"])
 EMITTED = int(os.environ["STUB_EMITTED"])
 ELAPSED_MS = float(os.environ["STUB_ELAPSED_MS"])
 LOG_PATH = os.environ.get("STUB_LOG", "")
-SPECULATIVE = os.environ.get("STUB_SPECULATIVE", "") == "1"
 SEQ = [s for s in os.environ.get("STUB_DECODE_TPS_SEQ", "").split(",") if s]
 DONE_LINES = int(os.environ.get("STUB_DONE_LINES", "-1"))
 ITL_MEAN_OVERRIDE = os.environ.get("STUB_ITL_MEAN_MS", "")
@@ -136,6 +165,24 @@ DIVERGE_FROM = int(os.environ.get("STUB_SPEC_DIVERGE_FROM", "-1"))
 VARY_PER_REQUEST = os.environ.get("STUB_VARY_PER_REQUEST", "") == "1"
 SAMPLER = os.environ.get("STUB_SAMPLER", "") == "1"
 SAMPLER_AFTER = int(os.environ.get("STUB_SAMPLER_AFTER", "-1"))
+
+
+def margin_table(name):
+    """`position=gap` pairs of an environment variable as a dict."""
+    pairs = [p.split("=") for p in os.environ.get(name, "").split(",") if p]
+    return {int(position): float(gap) for position, gap in pairs}
+
+
+MARGIN_AT = margin_table("STUB_SPEC_MARGIN_AT" if SPECULATIVE else "STUB_MARGIN_AT")
+TOP_LOGPROBS = int(os.environ.get("STUB_TOP_LOGPROBS", "2"))
+RECORDS_SHORT = int(os.environ.get("STUB_RECORDS_SHORT", "0"))
+NO_LOGPROBS = os.environ.get("STUB_NO_LOGPROBS", "") == "1"
+UNTIMED_DIFFERS = os.environ.get("STUB_UNTIMED_DIFFERS", "")
+SAME_PIECES = os.environ.get("STUB_SAME_PIECES", "") == "1"
+UNSTREAMED_STATUS = int(os.environ.get("STUB_UNSTREAMED_STATUS", "200"))
+UNSTREAMED_BODY = os.environ.get("STUB_UNSTREAMED_BODY", "")
+CONTRACT = {}
+SPEC_VARY = os.environ.get("STUB_SPEC_VARY", "") == "1"
 
 served = 0
 itl_ring = []
@@ -167,14 +214,17 @@ DERIVED_OVERRIDE = os.environ.get("STUB_DERIVED_OVERRIDE", "")
 DROP_FIELDS = [f for f in os.environ.get("STUB_DROP_FIELDS", "").split(",") if f]
 
 
-def done_line():
+def done_line(raw=None):
     """One round-loop `done` record, as tracing's JSON layer renders it.
 
     Carries the raw counters and the per-round figures the engine derives from
     them, consistent with each other. STUB_DERIVED_OVERRIDE (`name=value`)
-    breaks one of them, which is how the reader's cross-check is staged.
+    breaks one of them, which is how the reader's cross-check is staged. `raw`
+    is the line's `decode_tps` as a JSON value; left out, the next entry of
+    STUB_DECODE_TPS_SEQ.
     """
-    raw = SEQ[min(served, len(SEQ) - 1)] if SEQ else ""
+    if raw is None:
+        raw = SEQ[min(served, len(SEQ) - 1)] if SEQ else ""
     # The engine counts this at its own emit site, independently of the seed —
     # which is the whole point: a drifting seed must break the sum rather than
     # be absorbed by it. So the default is the healthy round count, not
@@ -215,14 +265,14 @@ def done_line():
     )
 
 
-def token_text(index):
+def token_text(index, diverged=True):
     """The index-th content piece this request streams.
 
     Every piece is the same length whatever it says, so a diverging arm changes
     the answer without changing the token count or the window it was timed over.
     """
-    stem = "x" if SPECULATIVE and 0 <= DIVERGE_FROM <= index else "t"
-    request = f"r{served}-" if VARY_PER_REQUEST else ""
+    stem = "x" if diverged and SPECULATIVE and 0 <= DIVERGE_FROM <= index else "t"
+    request = f"r{served}-" if VARY_PER_REQUEST or (SPEC_VARY and SPECULATIVE) else ""
     return f"{request}{stem}{index} "
 
 
@@ -263,6 +313,65 @@ def push_itl(sends):
     )
 
 
+def write_request_events(raw_rate=None):
+    """The events the engine leaves for one served request: its sampler line
+    and, on the speculative server, its round-loop `done` line."""
+    if SAMPLER and LOG_PATH:
+        with open(LOG_PATH, "a", encoding="utf-8") as handle:
+            handle.write(sampler_line() + "\n")
+    if SPECULATIVE and LOG_PATH:
+        with open(LOG_PATH, "a", encoding="utf-8") as handle:
+            handle.write(done_line(raw_rate) + "\n")
+
+
+def note_client_mark():
+    """Note in the marks directory whether the client that sent this request
+    was already running."""
+    seen = os.path.join(ARGS.marks, "seen")
+    number = 1
+    if os.path.exists(seen):
+        with open(seen, encoding="utf-8") as handle:
+            number += len(handle.readlines())
+    up = os.path.exists(os.path.join(ARGS.marks, f"mark.{number}"))
+    with open(seen, "a", encoding="utf-8") as handle:
+        handle.write("up\n" if up else "down\n")
+
+
+def same_request_as_before(request):
+    """Whether this request asks for the answer the first one asked for."""
+    fields = {k: request.get(k) for k in ("messages", "max_tokens", "temperature", "seed")}
+    if not CONTRACT:
+        CONTRACT.update(fields)
+    return fields == CONTRACT
+
+
+def completion_body(request):
+    """The whole answer of one unstreamed request, with its logprob records."""
+    pieces = [token_text(i) for i in range(TOKENS)]
+    if UNTIMED_DIFFERS == ("spec" if SPECULATIVE else "plain"):
+        pieces = [f"u{piece}" for piece in pieces]
+    named = [token_text(i, diverged=not SAME_PIECES) for i in range(TOKENS)]
+    records = []
+    listed = min(request.get("top_logprobs") or 0, TOP_LOGPROBS)
+    for i, piece in enumerate(named[: TOKENS - RECORDS_SHORT]):
+        candidates = [
+            {"token": piece, "logprob": -0.5},
+            {"token": "other", "logprob": -0.5 - MARGIN_AT.get(i, 1.0)},
+        ]
+        records.append({"token": piece, "logprob": -0.5, "top_logprobs": candidates[:listed]})
+    choice = {
+        "index": 0,
+        "message": {"role": "assistant", "content": "".join(pieces)},
+        "finish_reason": "length",
+    }
+    if request.get("logprobs") and not NO_LOGPROBS:
+        choice["logprobs"] = {"content": records}
+    usage = {"completion_tokens": TOKENS}
+    if PROMPT_TOKENS >= 0:
+        usage["prompt_tokens"] = PROMPT_TOKENS
+    return {"object": "chat.completion", "choices": [choice], "usage": usage}
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_args):
         pass
@@ -283,7 +392,23 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         global served
-        self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        request = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+        if ARGS.marks:
+            note_client_mark()
+        if not same_request_as_before(request):
+            self.send_error(400)
+            return
+        if ARGS.requests:
+            kind = "stream" if request.get("stream", True) else "unstreamed"
+            with open(ARGS.requests, "a", encoding="utf-8") as handle:
+                handle.write(f"{'spec' if SPECULATIVE else 'plain'} {kind}\n")
+        if not request.get("stream", True):
+            if UNSTREAMED_STATUS != 200:
+                self.send_error(UNSTREAMED_STATUS)
+                return
+            write_request_events('"Some(20.0)"')
+            self._json({"detail": "not a completion"} if UNSTREAMED_BODY == "junk" else completion_body(request))
+            return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
@@ -294,15 +419,6 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode())
             self.wfile.flush()
 
-        if ARGS.marks:
-            seen = os.path.join(ARGS.marks, "seen")
-            number = 1
-            if os.path.exists(seen):
-                with open(seen, encoding="utf-8") as handle:
-                    number += len(handle.readlines())
-            up = os.path.exists(os.path.join(ARGS.marks, f"mark.{number}"))
-            with open(seen, "a", encoding="utf-8") as handle:
-                handle.write("up\n" if up else "down\n")
         chunk({"choices": [{"delta": {"role": "assistant"}, "index": 0}]}, 0.0)
         if ARGS.hold:
             open(ARGS.hold + ".held", "w").close()
@@ -353,6 +469,17 @@ stop_stubs() {
 	done <"$1"
 }
 
+# ── The real judge ────────────────────────────────────────────────────────────
+#
+# `eval spec-answer` is the one subcommand the stub binary hands to the real dev
+# binary, so the cases exercise the oracle itself on the wire shape the stub
+# serves. In `make ci` the build is already done by `test`.
+DEV_RMLX="$REPO_ROOT/target/debug/rmlx"
+if ! (cd "$REPO_ROOT" && cargo build -q -p rmlx-cli --bin rmlx) || [ ! -x "$DEV_RMLX" ]; then
+	echo "spec_bench_selftest: cannot build the dev rmlx at $DEV_RMLX" >&2
+	exit 2
+fi
+
 # ── Stub binary ───────────────────────────────────────────────────────────────
 
 STUB="$FAKE_ROOT/target/release-perf/rmlx"
@@ -369,6 +496,30 @@ metrics)
 		echo "stub: recorded \$4" >&2
 		;;
 	esac
+	;;
+eval)
+	if [ "\$2" = spec-answer ]; then
+		printf '%s\n' "\$@" >"\$RMLX_HOME/spec_answer_argv"
+		prev=""
+		for arg in "\$@"; do
+			case "\$prev" in
+			--plain) /bin/cp -f "\$arg" "\$RMLX_HOME/spec_answer_plain.json" ;;
+			--spec) /bin/cp -f "\$arg" "\$RMLX_HOME/spec_answer_spec.json" ;;
+			esac
+			prev="\$arg"
+		done
+		case "\${STUB_JUDGE:-}" in
+		silent)
+			echo "error: unrecognized subcommand 'spec-answer'" >&2
+			exit 2
+			;;
+		status1)
+			"$DEV_RMLX" "\$@" || true
+			exit 1
+			;;
+		esac
+		exec "$DEV_RMLX" "\$@"
+	fi
 	;;
 serve)
 	if [ -n "\${STUB_ARGV:-}" ]; then
@@ -503,7 +654,7 @@ LOGEOF
 			>"$CASE_HOME/logs/$stale"
 		env_pairs+=("STUB_REWRITE_PID_IN=$stale")
 	fi
-	printf '%s\n' "--marks $CASE_HOME/client$stub_args" >"$CASE_HOME/stub_args"
+	printf '%s\n' "--marks $CASE_HOME/client --requests $CASE_HOME/requests$stub_args" >"$CASE_HOME/stub_args"
 
 	CASE_OUT="$WORK/$CASE_NAME.log"
 	local got=0
@@ -512,6 +663,7 @@ LOGEOF
 		PATH="$CASE_HOME/client/bin:$SHIM_DIR:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
 		HOME="$WORK" \
 		RMLX_HOME="$CASE_HOME" \
+		SLEEP_LOG="$CASE_HOME/sleeps" \
 		VERIFIER_MODEL="$VERIFIER_DIR" \
 		DRAFTER_MODEL="$WORK/drafter" \
 		STUB_TOKENS=8 \
@@ -634,6 +786,12 @@ no_row() {
 	return 0
 }
 
+# no_judge — `eval spec-answer` was never run.
+no_judge() {
+	[ -e "$CASE_HOME/spec_answer_argv" ] && note_bad "the judge ran on a run that needed none"
+	return 0
+}
+
 echo "spec_bench_selftest: stub server on 127.0.0.1:$PORT"
 echo
 
@@ -680,25 +838,26 @@ got="$(metric_of mtp value)"
 close_to "$got" 20.0 0.001 || note_bad "mtp decode_tps_warm=$got (want 20.0, not 20.5)"
 verdict
 
-# One done event where four requests ran. Taking the last three of one event
-# leaves a single reading, whose sample stddev is the 0.0 that the rows this
+# Two done events where five requests ran: the warmup's and the logprob pass's,
+# which the stub always writes. Taking the last three of two events leaves two
+# readings, and a single reading's sample stddev is the 0.0 that the rows this
 # whole change is about are identified by — with n_measure=3 recorded beside it.
 run_case truncated_log_refused 1 \
 	"a log holding fewer events than requests served is refused" \
 	'STUB_DONE_LINES=1' \
-	'GREP:holds 1 round-loop' \
-	'GREP:expected 4'
+	'GREP:holds 2 round-loop' \
+	'GREP:expected 5'
 no_row mtp
 verdict
 
-# Three events where four requests ran: the count check is what catches this,
-# because the three that survive are the warmup and the first two measured runs
-# and nothing in the line distinguishes them.
+# Four events where five requests ran: the count check is what catches this,
+# because the four that survive are the warmup, the logprob pass and the first two
+# measured runs and nothing in the line distinguishes them.
 run_case dropped_last_event_refused 1 \
 	"a log missing the last request's event is refused" \
 	'STUB_DONE_LINES=3' \
-	'GREP:holds 3 round-loop' \
-	'GREP:expected 4'
+	'GREP:holds 4 round-loop' \
+	'GREP:expected 5'
 no_row mtp
 verdict
 
@@ -755,18 +914,18 @@ verdict
 # The client sends the request itself. A client fed by a separate `curl` could
 # start after the stream had begun and stamp the chunks it had missed all at its
 # own start, so the window shrank and the rate read high. The client shim here
-# starts the second client a second late, and every request of both servers must
-# still find its own client already running.
+# starts the third reader a second late, the first measured run, and every request
+# of both servers must still find its own client already running.
 run_case every_request_comes_from_a_running_client 0 \
 	"a client that starts late has not missed any of the stream" \
-	CLIENT_SHIM:2 \
+	CLIENT_SHIM:3 \
 	'GREP:.normal. cross-check ok'
-[ "$(wc -l <"$CASE_HOME/client/seen" 2>/dev/null | tr -d ' ')" = "8" ] ||
-	note_bad "the stub saw $(wc -l <"$CASE_HOME/client/seen" 2>/dev/null | tr -d ' ') streamed requests (want 8, four on each of two servers)"
+[ "$(wc -l <"$CASE_HOME/client/seen" 2>/dev/null | tr -d ' ')" = "10" ] ||
+	note_bad "the stub saw $(wc -l <"$CASE_HOME/client/seen" 2>/dev/null | tr -d ' ') requests (want 10, five on each of two servers)"
 [ "$(sort -u "$CASE_HOME/client/seen" 2>/dev/null)" = "up" ] ||
 	note_bad "a request reached a server before its client existed: $(sort -u "$CASE_HOME/client/seen" 2>/dev/null | tr '\n' ' ')"
 [ "$(grep -c -- '--server-stamps' "$CASE_HOME/client/reader_argv" 2>/dev/null)" = "8" ] ||
-	note_bad "not every client was asked to read the stub's stamps"
+	note_bad "not every streamed request's client was asked to read the stub's stamps"
 verdict
 
 # The harness asks the client for the stub's stamps only when it is asked to.
@@ -1282,16 +1441,18 @@ run_case agreeing_arms_are_recorded 0 \
 	note_bad "mtp answer_check=$(answer_check_of mtp)"
 [ -n "$(answer_of mtp)" ] && [ "$(answer_of mtp)" = "$(answer_of normal)" ] ||
 	note_bad "rows carry answers $(answer_of normal) and $(answer_of mtp)"
+no_judge
 verdict
 
 # The defect this exists for: a drafter that changed the answer at temperature 0
 # has had a throughput row filed for it. The arms stream the same token count at
 # the same rate, so nothing but the text separates them.
 run_case divergent_answer_refused 1 \
-	"a speculative arm that answered differently files no row" \
-	'STUB_SPEC_DIVERGE_FROM=3' \
-	'GREP:answered differently from the no-drafter arm' \
-	'GREP:emits the verifier.s own argmax'
+	"a speculative arm that answered differently, at a decision the verifier was sure of, files no row" \
+	'STUB_SPEC_DIVERGE_FROM=3' 'STUB_MARGIN_AT=3=5.0' \
+	'GREP:the difference is not a near tie' \
+	'GREP:first differs from the no-drafter arm at token 3' \
+	'GREP:surer than 0\.[0-9]+ of its own decisions'
 no_row mtp
 verdict
 
@@ -1299,8 +1460,196 @@ verdict
 # the first 18 tokens. Comparing previews would call this one answer.
 run_case divergence_past_the_preview_refused 1 \
 	"a divergence past the preview's 64 characters is still refused" \
-	'STUB_TOKENS=40' 'STUB_SPEC_DIVERGE_FROM=30' \
-	'GREP:answered differently from the no-drafter arm'
+	'STUB_TOKENS=40' 'STUB_SPEC_DIVERGE_FROM=30' 'STUB_MARGIN_AT=30=5.0' \
+	'GREP:first differs from the no-drafter arm at token 30'
+no_row mtp
+verdict
+
+
+# ── A near-tie flip ───────────────────────────────────────────────────────────
+
+# judged_pair <plain-token> <spec-token> — the recorded argv handed the judge the
+# no-drafter pass as --plain and the speculative pass as --spec: the plain body
+# holds the token the plain arm wrote at the divergence and the speculative one
+# the token the loop wrote there.
+judged_pair() {
+	local plain="$CASE_HOME/spec_answer_plain.json" spec="$CASE_HOME/spec_answer_spec.json"
+	if [ ! -s "$plain" ] || [ ! -s "$spec" ]; then
+		note_bad "the judge was not handed two bodies"
+		return 0
+	fi
+	grep -q "\"token\": \"$1 \"" "$plain" || note_bad "--plain does not hold the no-drafter pass ($1 missing)"
+	grep -q "\"token\": \"$2 \"" "$spec" || note_bad "--spec does not hold the speculative pass ($2 missing)"
+	grep -q "\"token\": \"$2 \"" "$plain" && note_bad "--plain holds a speculative token ($2)"
+	return 0
+}
+
+# The pass sits between the warmup and the measured runs of each phase, so it is
+# in the state the measured runs are in, and its read-back is paused off before
+# they start. The stub notes each request and the sleep shim each pause.
+run_case logprob_pass_follows_the_warmup_and_is_paused 0 \
+	"each phase sends warmup, pass, measured runs, with a 15 s pause after the pass"
+want="plain stream,plain unstreamed,plain stream,plain stream,plain stream"
+want="$want,spec stream,spec unstreamed,spec stream,spec stream,spec stream"
+got="$(paste -sd, "$CASE_HOME/requests" 2>/dev/null)"
+[ "$got" = "$want" ] || note_bad "requests were '$got' (want '$want')"
+awk '{ l[NR] = $0 }
+	END {
+		for (i = 1; i <= NR; i++)
+			if (l[i] == "15") { n++; if (l[i - 1] != "5" || l[i + 1] != "5") bad = 1 }
+		exit !(n == 2 && !bad)
+	}' "$CASE_HOME/sleeps" ||
+	note_bad "the sleeps were '$(paste -sd' ' "$CASE_HOME/sleeps")': want one 15 s pause after each pass, between 5 s sleeps"
+verdict
+
+# A judge that is not the one this script was written for: a binary that predates
+# the subcommand prints nothing, and a status that disagrees with the verdict is a
+# judge nobody has read.
+run_case judge_without_a_verdict_refused 1 \
+	"a binary that predates the subcommand cannot be taken for a verdict" \
+	'STUB_SPEC_DIVERGE_FROM=3' 'STUB_MARGIN_AT=3=0.0' 'STUB_JUDGE=silent' \
+	'GREP:exited 2 with no verdict'
+no_row mtp
+verdict
+
+run_case judge_status_must_match_its_verdict 1 \
+	"an exit status that disagrees with the verdict is refused by name" \
+	'STUB_SPEC_DIVERGE_FROM=3' 'STUB_MARGIN_AT=3=0.0' 'STUB_JUDGE=status1' \
+	'GREP:exited 1 but said verdict=near_tie'
+no_row mtp
+verdict
+
+# The point of the change: the speculative arm parts from the plain one at token 3,
+# where the plain arm's top two candidates are tied. The row is filed, says where
+# and by how much, and the plain row stays as it was.
+run_case near_tie_flip_is_filed 0 \
+	"a divergence at a tied decision files a row that names it" \
+	'STUB_SPEC_DIVERGE_FROM=3' 'STUB_MARGIN_AT=3=0.0'
+[ "$(answer_check_of mtp)" = "near_tie@3" ] ||
+	note_bad "mtp answer_check=$(answer_check_of mtp) (want near_tie@3)"
+[ "$(answer_check_of normal)" = "plain_repeatable" ] ||
+	note_bad "normal answer_check=$(answer_check_of normal)"
+case "$(notes_of mtp)" in
+*" divergence_rank=0.0000 divergence_margin=0.0000 "*) ;;
+*) note_bad "mtp notes do not carry the rank and margin: $(notes_of mtp)" ;;
+esac
+case "$(notes_of normal)" in
+*divergence_*) note_bad "the plain row carries a divergence figure: $(notes_of normal)" ;;
+esac
+[ -n "$(answer_of mtp)" ] && [ "$(answer_of mtp)" != "$(answer_of normal)" ] ||
+	note_bad "rows carry answers $(answer_of normal) and $(answer_of mtp)"
+judged_pair t3 x3
+verdict
+
+# The same divergence with the plain arm's margins read from the right file: the
+# plain arm is tied at token 3 and the speculative arm's own margin there is a
+# confident one. A script that handed the judge the arms the wrong way round reads
+# the confident margin and refuses.
+run_case judge_reads_the_plain_arms_margins 0 \
+	"the margins come from the no-drafter pass, not the speculative one" \
+	'STUB_SPEC_DIVERGE_FROM=3' 'STUB_MARGIN_AT=3=0.0' 'STUB_SPEC_MARGIN_AT=3=5.0'
+[ "$(answer_check_of mtp)" = "near_tie@3" ] ||
+	note_bad "mtp answer_check=$(answer_check_of mtp) (want near_tie@3)"
+judged_pair t3 x3
+verdict
+
+# The judge cannot read what the pass does not carry. Each refusal names the
+# input it could not read, and files no speculative row.
+run_case one_candidate_per_record_refused 1 \
+	"a pass listing one candidate per position has no margin to judge by" \
+	'STUB_SPEC_DIVERGE_FROM=3' 'STUB_TOP_LOGPROBS=1' \
+	'GREP:cannot be judged' \
+	'GREP:normal_logprobs.json: record 0 carries fewer than two top_logprobs'
+no_row mtp
+verdict
+
+run_case missing_record_refused 1 \
+	"a pass with fewer records than tokens is refused by name" \
+	'STUB_SPEC_DIVERGE_FROM=3' 'STUB_RECORDS_SHORT=1' \
+	'GREP:cannot be judged' \
+	'GREP:normal_logprobs.json: 7 logprob records for 8 completion tokens, so a record index is not a token position'
+no_row mtp
+verdict
+
+run_case no_logprobs_refused 1 \
+	"a response with no logprobs at all is refused" \
+	'STUB_SPEC_DIVERGE_FROM=3' 'STUB_NO_LOGPROBS=1' \
+	'GREP:cannot be judged' \
+	'GREP:no choices.0..logprobs.content'
+no_row mtp
+verdict
+
+# A pass whose answer is not the one its arm's measured runs gave carries the
+# margins of some other answer. The normal row is already filed: it is valid.
+run_case unbound_plain_pass_refused 1 \
+	"a plain pass that answered differently from its measured runs cannot judge" \
+	'STUB_SPEC_DIVERGE_FROM=3' 'STUB_MARGIN_AT=3=0.0' 'STUB_UNTIMED_DIFFERS=plain' \
+	'GREP:normal: the logprob pass of the no-drafter arm answered' \
+	'GREP:its margins are not those of the answer'
+no_row mtp
+[ -n "$(record_of normal)" ] || note_bad "the valid normal row was not filed"
+verdict
+
+# And when the arms agree the pass is never read, so the same stray pass costs
+# nothing.
+run_case unbound_pass_is_not_read_when_arms_agree 0 \
+	"a plain pass that answered differently does not matter when the arms agree" \
+	'STUB_UNTIMED_DIFFERS=plain'
+[ "$(answer_check_of mtp)" = "matches_plain" ] ||
+	note_bad "mtp answer_check=$(answer_check_of mtp)"
+no_judge
+verdict
+
+run_case unbound_speculative_pass_refused 1 \
+	"a speculative pass that answered differently from its measured runs is refused" \
+	'STUB_SPEC_DIVERGE_FROM=3' 'STUB_MARGIN_AT=3=0.0' 'STUB_UNTIMED_DIFFERS=spec' \
+	'GREP:mtp: the logprob pass of the speculative arm answered'
+no_row mtp
+verdict
+
+# A server that does not answer the pass leaves nothing to bind or judge by, and
+# the run stops before it files the plain row.
+run_case unanswered_pass_refused 1 \
+	"a server that does not answer the logprob pass stops the run" \
+	'STUB_UNSTREAMED_STATUS=500' \
+	'GREP:normal: the server did not answer the logprob pass'
+no_row normal
+no_row mtp
+verdict
+
+# The speculative arm wrote the whole reference answer and went on. Nothing
+# differs before the reference ends, so no rank can excuse it.
+run_case ran_past_the_reference_refused 1 \
+	"an arm that reproduces the reference and runs on is refused" \
+	'STUB_SPEC_EXTRA_TOKENS=2' \
+	'GREP:reproduced the whole reference answer' \
+	'GREP:did not stop where the verifier stopped'
+no_row mtp
+verdict
+
+# A tie at the point the shorter arm stopped would pass the rank; the length
+# ratio is what refuses it.
+run_case short_arm_refused 1 \
+	"an arm far shorter than the reference is refused on its length" \
+	'STUB_SPEC_EXTRA_TOKENS=-5' 'STUB_MARGIN_AT=3=0.0' \
+	'GREP:a ratio of 0\.3750'
+no_row mtp
+verdict
+
+run_case speculative_runs_disagreeing_refused 1 \
+	"measured speculative runs that differ from each other have no answer to judge" \
+	'STUB_SPEC_VARY=1' \
+	'GREP:mtp: the 3 measured runs answered differently from each other' \
+	'GREP:no one speculative answer to judge'
+no_row mtp
+no_judge
+verdict
+
+run_case indistinguishable_streams_refused 1 \
+	"two answers whose pieces read alike cannot be told apart by the oracle" \
+	'STUB_SPEC_DIVERGE_FROM=3' 'STUB_SAME_PIECES=1' \
+	'GREP:cannot be judged' \
+	'GREP:same token pieces'
 no_row mtp
 verdict
 
@@ -1315,6 +1664,7 @@ run_case sampled_run_is_not_compared 0 \
 	note_bad "mtp answer_check=$(answer_check_of mtp)"
 [ "$(answer_check_of normal)" = "sampled" ] ||
 	note_bad "normal answer_check=$(answer_check_of normal)"
+no_judge
 verdict
 
 # The plain arm is the reference. One that answered three different things
@@ -1328,7 +1678,7 @@ no_row normal
 no_row mtp
 verdict
 
-# Sampler events covering two of four requests: some ran sampled and some did
+# Sampler events covering three of five requests: some ran sampled and some did
 # not, so the run has no one disposition and neither answer_check would be true
 # of it.
 run_case partial_sampler_events_refused 1 \
@@ -1392,6 +1742,180 @@ sigterm_case() {
 	stop_stubs "$CASE_HOME/stub_bound"
 }
 sigterm_case
+verdict
+
+# ── The unstreamed pass and the judge ─────────────────────────────────────────
+
+# stub_answers — the stub server on $PORT accepts connections.
+stub_answers() {
+	python3 -c "import socket; socket.create_connection(('127.0.0.1', $PORT), 1).close()" 2>/dev/null
+}
+
+# start_stub <home> <plain|spec> [KEY=VALUE ...] — one stub server on $PORT, as
+# the harness starts it. Sets STUB_SERVER_PID.
+start_stub() {
+	local home="$1" arm="$2" extra=()
+	shift 2
+	[ "$arm" = spec ] && extra=(--draft-model "$WORK/drafter")
+	mkdir -p "$home/logs"
+	: >"$home/stub_args"
+	env -i \
+		PATH="$SHIM_DIR:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+		HOME="$WORK" \
+		RMLX_HOME="$home" \
+		STUB_TOKENS=8 \
+		STUB_GAP_S=0.05 \
+		STUB_PREFILL_S=0.05 \
+		STUB_EMITTED=128 \
+		STUB_ELAPSED_MS=2560 \
+		STUB_DECODE_TPS_SEQ='"Some(20.0)"' \
+		STUB_PROMPT_TOKENS=1234 \
+		STUB_BOUND_FLAG="$home/stub_bound" \
+		"$@" \
+		"$STUB" serve --port "$PORT" ${extra[@]+"${extra[@]}"} >/dev/null 2>&1 &
+	STUB_SERVER_PID=$!
+	wait_until 30 stub_answers
+}
+
+stop_stub() {
+	kill "$STUB_SERVER_PID" 2>/dev/null || true
+	wait "$STUB_SERVER_PID" 2>/dev/null || true
+}
+
+# The untimed pass reads the same answer the streamed run digests, and the
+# judge reads the two passes: this is the contract the bench builds on. The arms
+# part at token 3, where the plain arm's margin is tied.
+unstreamed_pass_smoke() {
+	CASE_NAME="unstreamed_pass_binds_and_judges"
+	CASE_WHAT="an unstreamed pass has its stream's digest, and the judge reads the pair"
+	CASE_HOME="$WORK/home_$CASE_NAME"
+	CASE_OUT="$WORK/$CASE_NAME.log"
+	CASE_BAD=""
+	mkdir -p "$CASE_HOME"
+	: >"$CASE_OUT"
+	local reader="$REPO_ROOT/scripts/lib/sse_decode_window.py"
+	local url="http://127.0.0.1:$PORT/v1/chat/completions"
+	local messages='[{"role": "user", "content": "hi"}]'
+	printf '{"model": "stub", "messages": %s, "stream": true}\n' "$messages" >"$CASE_HOME/streamed.json"
+	printf '{"model": "stub", "messages": %s, "stream": false, "logprobs": true, "top_logprobs": 2}\n' \
+		"$messages" >"$CASE_HOME/unstreamed.json"
+
+	local arm streamed unstreamed digests=()
+	for arm in plain spec; do
+		if [ "$arm" = spec ]; then
+			start_stub "$CASE_HOME/$arm" spec STUB_SPEC_DIVERGE_FROM=3
+		else
+			start_stub "$CASE_HOME/$arm" plain STUB_MARGIN_AT=3=0.0
+		fi
+		streamed="$(python3 "$reader" --url "$url" --body-file "$CASE_HOME/streamed.json" --server-stamps 2>>"$CASE_OUT" |
+			sed -n 's/^answer_sha256=//p')"
+		unstreamed="$(python3 "$reader" --url "$url" --body-file "$CASE_HOME/unstreamed.json" \
+			--complete "$CASE_HOME/$arm.json" 2>>"$CASE_OUT" | sed -n 's/^answer_sha256=//p')"
+		stop_stub
+		note_survivors "$CASE_HOME/$arm/stub_bound"
+		stop_stubs "$CASE_HOME/$arm/stub_bound"
+		[ -n "$streamed" ] || note_bad "$arm: the streamed reader printed no digest"
+		[ "$streamed" = "$unstreamed" ] ||
+			note_bad "$arm: unstreamed digest '$unstreamed' is not the streamed '$streamed'"
+		digests+=("$streamed")
+	done
+	[ "${digests[0]}" != "${digests[1]}" ] || note_bad "the arms answered alike, so nothing parted them"
+
+	local got=0 out
+	set +e
+	out="$(env -i PATH="$SHIM_DIR:/usr/bin:/bin" HOME="$WORK" RMLX_HOME="$CASE_HOME" \
+		"$STUB" eval spec-answer --plain "$CASE_HOME/plain.json" --spec "$CASE_HOME/spec.json" 2>>"$CASE_OUT")"
+	got=$?
+	set -e
+	[ "$got" -eq 0 ] || note_bad "spec-answer exit=$got (want 0): $out"
+	printf '%s\n' "$out" | grep -qx 'verdict=near_tie' || note_bad "no near_tie verdict: $out"
+	printf '%s\n' "$out" | grep -qx 'position=3' || note_bad "not parted at token 3: $out"
+	[ "$(sed -n '4p' "$CASE_HOME/spec_answer_argv" 2>/dev/null)" = "$CASE_HOME/plain.json" ] ||
+		note_bad "the stub binary was not handed the plain body as --plain"
+	cmp -s "$CASE_HOME/spec_answer_plain.json" "$CASE_HOME/plain.json" ||
+		note_bad "the plain body the stub binary kept is not the plain pass's"
+	cmp -s "$CASE_HOME/spec_answer_spec.json" "$CASE_HOME/spec.json" ||
+		note_bad "the spec body the stub binary kept is not the speculative pass's"
+}
+unstreamed_pass_smoke
+verdict
+
+# unstreamed_status <label> <body-file> [KEY=VALUE ...] — one unstreamed request
+# to a fresh plain stub, after the streamed one; prints the reader's exit status
+# and leaves its response in $CASE_HOME/<label>.json.
+unstreamed_status() {
+	local label="$1" body="$2" got=0
+	shift 2
+	start_stub "$CASE_HOME/$label" plain "$@"
+	python3 "$REPO_ROOT/scripts/lib/sse_decode_window.py" --url "http://127.0.0.1:$PORT/v1/chat/completions" \
+		--body-file "$CASE_HOME/streamed.json" --server-stamps >/dev/null 2>&1 || true
+	python3 "$REPO_ROOT/scripts/lib/sse_decode_window.py" --url "http://127.0.0.1:$PORT/v1/chat/completions" \
+		--body-file "$body" --complete "${OUT_PATH:-$CASE_HOME/$label.json}" >/dev/null 2>&1 || got=$?
+	stop_stub
+	stop_stubs "$CASE_HOME/$label/stub_bound"
+	echo "$got"
+}
+
+# The stub holds the unstreamed request to the streamed one, so a pass body that
+# strays from it is an answer, and the script's pass is only as good as that. The
+# reader's own exit codes for a response it cannot use are pinned here too: the
+# bench reads every one of them as "the server did not answer".
+unstreamed_request_contract() {
+	CASE_NAME="unstreamed_request_contract"
+	CASE_WHAT="the stub answers the pass the body asks for, and the reader names each failure"
+	CASE_HOME="$WORK/home_$CASE_NAME"
+	CASE_OUT="$WORK/$CASE_NAME.log"
+	CASE_BAD=""
+	mkdir -p "$CASE_HOME"
+	: >"$CASE_OUT"
+	python3 - "$CASE_HOME" <<'PYBODIES'
+import json, sys
+
+base = {"model": "stub", "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 8, "temperature": 0, "seed": 42}
+unstreamed = {"stream": False, "logprobs": True, "top_logprobs": 2}
+bodies = {
+    "streamed": {"stream": True, "stream_options": {"include_usage": True}},
+    "pass": unstreamed,
+    "top1": {**unstreamed, "top_logprobs": 1},
+    "nologprobs": {"stream": False},
+    "longer": {**unstreamed, "max_tokens": 64},
+    "colder": {**unstreamed, "temperature": 0.7},
+    "otherseed": {**unstreamed, "seed": 7},
+    "otherprompt": {**unstreamed, "messages": [{"role": "user", "content": "ho"}]},
+}
+for name, extra in bodies.items():
+    with open(f"{sys.argv[1]}/{name}.json", "w") as handle:
+        json.dump({**base, **extra}, handle)
+PYBODIES
+
+	# candidates_of <response> — how many candidates the first record lists, or
+	# `none` when the response carries no logprobs.
+	candidates_of() {
+		python3 -c 'import json, sys
+choice = json.load(open(sys.argv[1]))["choices"][0]
+print(len(choice["logprobs"]["content"][0]["top_logprobs"]) if "logprobs" in choice else "none")' "$1" 2>/dev/null
+	}
+	local label status
+	for label in pass top1 nologprobs; do
+		status="$(unstreamed_status "ok_$label" "$CASE_HOME/$label.json")"
+		[ "$status" = "0" ] || note_bad "$label: the reader exited $status (want 0)"
+	done
+	[ "$(candidates_of "$CASE_HOME/ok_pass.json")" = "2" ] || note_bad "top_logprobs 2 listed $(candidates_of "$CASE_HOME/ok_pass.json") candidates"
+	[ "$(candidates_of "$CASE_HOME/ok_top1.json")" = "1" ] || note_bad "top_logprobs 1 listed $(candidates_of "$CASE_HOME/ok_top1.json") candidates"
+	[ "$(candidates_of "$CASE_HOME/ok_nologprobs.json")" = "none" ] || note_bad "a request without logprobs got them"
+	for label in longer colder otherseed otherprompt; do
+		status="$(unstreamed_status "bad_$label" "$CASE_HOME/$label.json")"
+		[ "$status" = "4" ] || note_bad "$label: a pass that is not the measured request exited $status (want 4, the stub's 400)"
+	done
+	status="$(unstreamed_status status500 "$CASE_HOME/pass.json" STUB_UNSTREAMED_STATUS=500)"
+	[ "$status" = "4" ] || note_bad "an answer of 500 exited $status (want 4)"
+	status="$(unstreamed_status junk "$CASE_HOME/pass.json" STUB_UNSTREAMED_BODY=junk)"
+	[ "$status" = "6" ] || note_bad "a response that is not a chat completion exited $status (want 6)"
+	status="$(OUT_PATH="$CASE_HOME/no/such/dir/out.json" unstreamed_status unwritable "$CASE_HOME/pass.json")"
+	[ "$status" = "2" ] || note_bad "a response that cannot be written exited $status (want 2)"
+}
+unstreamed_request_contract
 verdict
 
 echo

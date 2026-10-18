@@ -22,6 +22,7 @@ rmlx [global flags] <subcommand> [flags]
 | `healthcheck` | Readiness probe; JSON lines or plain text |
 | `metrics` | Metrics database: schema, ingest, queries, export |
 | `eval ppl` | Perplexity over a text corpus |
+| `eval spec-answer` | Judge a speculative answer against a plain one from two saved responses |
 | `profile list` | Names of the `serve` profiles in `profiles.toml` |
 | `claim run` | Run a command while holding the claim; see "Claim file" |
 
@@ -480,6 +481,31 @@ GatedDeltaNet layers carry state no codec touches.
 The record's metric is `ppl_<corpus>` without a cache and `ppl_<corpus>_cached`
 with one; hyphens are dropped (`wikitext-2` → `ppl_wikitext2`). They are
 different metrics; compare each only with its own kind.
+
+---
+
+### `eval spec-answer`
+
+```bash
+rmlx eval spec-answer --plain plain.json --spec spec.json
+```
+
+Judges a speculative answer against the no-drafter answer to the same prompt.
+`--plain` and `--spec` are non-streamed `/v1/chat/completions` response bodies
+from temperature-0 runs, each sent with `logprobs: true` and `top_logprobs` of
+at least 2. It applies the first-divergence oracle of
+`SPEC_ANSWER_EQUIVALENCE.md` and the length-ratio floor. It loads no model,
+takes no claim and writes nothing but the verdict.
+
+Positions are record indices, and the margin at the first difference comes
+from the `--plain` body. Stdout is `key=value` lines: `verdict`, then
+`position`, `margin` and `rank` where they were computed, then `reason`.
+
+| Exit | `verdict` | Meaning |
+|---|---|---|
+| `0` | `near_tie` | The first difference sits at a decision the verifier was nearly tied on. |
+| `1` | `refused` | The rank is above the ceiling, the speculative answer ran past the reference, or the length ratio is under the floor. |
+| `2` | `unjudgeable` | A body does not parse or lacks `logprobs` or `usage.completion_tokens`; a record count differs from the token count; a `--plain` record lists fewer than two candidates; the two token streams are equal. |
 
 ---
 

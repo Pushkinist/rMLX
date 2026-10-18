@@ -27,6 +27,7 @@
     )
 )]
 
+pub mod answer_equivalence;
 pub mod arch;
 pub mod bitnet;
 pub mod block_manager;

@@ -31,22 +31,30 @@
 #   window timed client-side, and a disagreement past CROSS_CHECK_BAND_PCT is a
 #   refusal, not a choice between them.
 #
-# The two arms must have answered the same thing:
+# The two arms must have answered the same thing, or differ only at a near tie:
 #   A greedy speculative loop emits the verifier's own argmax at every position,
 #   so with no sampler running the speculative arm and the no-drafter arm are two
 #   ways of computing one answer. Every measured run's whole completion is
-#   digested and held to that, and a difference stops the run before any median
-#   is taken — an arm that answered a different question has no throughput to
-#   report for this one, and `observations` is append-only. Whether a sampler ran
-#   is read back from the engine's own per-request event rather than assumed from
-#   the temperature the request asked for; under one the arms are two draws, the
-#   comparison does not apply, and both rows say so in `answer_check`.
+#   digested. Equal digests file `answer_check=matches_plain`. A difference is
+#   not by itself a defect: the verify pass scores a block in one forward, a
+#   different reduction order, and that can flip a decision the verifier was
+#   nearly tied on. So a difference is judged by `rmlx eval spec-answer` over one
+#   unstreamed logprob pass of each arm, sent between the warmup and the measured
+#   runs and held to its arm's measured digest. A near-tie flip files
+#   `answer_check=near_tie@<token>` with the rank and margin that decided it; any
+#   other difference stops the run before any median is taken — an arm that
+#   answered a different question has no throughput to report for this one, and
+#   `observations` is append-only. Whether a sampler ran is read back from the
+#   engine's own per-request event rather than assumed from the temperature the
+#   request asked for; under one the arms are two draws, the comparison does not
+#   apply, and both rows say so in `answer_check`.
 #
 # Hard constraints honoured:
 #   - Single server process at a time; the script stops the server it started
 #     (kill + wait on its PID) between phases. A claim some other process holds
 #     stops the run with the server's exit status (11).
-#   - 1 warmup + 3 measured requests per config; 5 s sleep between requests
+#   - 1 warmup + 1 logprob pass + 3 measured requests per config; 5 s sleep
+#     between requests, LOGPROB_PASS_PAUSE_S after the logprob pass
 #   - All inserts go through `rmlx metrics record --file` (no direct sqlite writes)
 
 set -euo pipefail
@@ -104,6 +112,13 @@ fi
 PORT="${PORT:-8090}"
 WARMUP_RUNS=1
 MEASURED_RUNS=3
+# One unstreamed request with logprobs per phase. It reads the whole vocabulary
+# back to the host at every step, which the measured runs must never do, so it
+# is its own request and no rate is taken from it.
+LOGPROB_PASSES=1
+REQUESTS_PER_PHASE=$((WARMUP_RUNS + LOGPROB_PASSES + MEASURED_RUNS))
+# That read-back is a larger thermal event than a measured run.
+LOGPROB_PASS_PAUSE_S=15
 MAX_TOKENS=128
 TEMPERATURE=0
 SEED=42
@@ -265,6 +280,16 @@ fi
 mkdir -p "${LOG_DIR}" "${BUFFER_DIR}" "${SCRATCH_DIR}"
 REQUEST_BODY_FILE="${SCRATCH_DIR}/request_body.json"
 printf '%s\n' "${REQUEST_BODY}" > "${REQUEST_BODY_FILE}"
+# The logprob pass asks for the same answer as the measured runs, whole and
+# with the two best candidates of every position.
+LOGPROB_BODY_FILE="${SCRATCH_DIR}/logprob_request_body.json"
+REQUEST_BODY="${REQUEST_BODY}" python3 -c '
+import json, os
+body = json.loads(os.environ["REQUEST_BODY"])
+del body["stream_options"]
+body.update({"stream": False, "logprobs": True, "top_logprobs": 2})
+print(json.dumps(body))
+' > "${LOGPROB_BODY_FILE}"
 
 echo "==> spec_bench.sh"
 echo "    verifier : ${VERIFIER_MODEL}"
@@ -300,6 +325,24 @@ measured_request() {
         return 1
     fi
     printf '%s\n' "${block}"
+}
+
+# Fire the unstreamed logprob pass: the whole answer with the two best
+# candidates of every position, written to `$2` for the judge. Prints the digest
+# of its text, computed by the function that digests the streamed runs. A server
+# that does not answer it leaves nothing to bind or judge by: the caller stops.
+logprob_pass() {
+    local arm="$1" out_file="$2" block digest
+    rm -f "${out_file}"
+    block="$(python3 "${REPO_ROOT}/scripts/lib/sse_decode_window.py" \
+        --url "http://127.0.0.1:${PORT}/v1/chat/completions" \
+        --body-file "${LOGPROB_BODY_FILE}" --complete "${out_file}")" || block=""
+    digest="$(field_of "${block}" answer_sha256)"
+    if [[ -z "${digest}" ]]; then
+        echo "ERROR: ${arm}: the server did not answer the logprob pass" >&2
+        return 1
+    fi
+    echo "${digest}"
 }
 
 # How many ITL samples the server has recorded so far.
@@ -384,7 +427,7 @@ stddev() {
 
 # Emit a §8.5 RunRecord JSON and ingest it.
 # Args: config_name decode_tps stddev output_preview kv_quant prompt_tokens
-#       answer answer_check [spec_data]
+#       answer answer_check [spec_data [answer_notes]]
 #
 # `kv_quant` and `prompt_tokens` are measured facts about the run, not settings
 # this script may assume: the codec is whatever the engine resolved and said so
@@ -392,7 +435,8 @@ stddev() {
 # missing either is refused rather than filed under a guess.
 #
 # `answer` is the digest of what the arm generated and `answer_check` is what
-# comparing the two arms established, both in `notes`. A row that was never
+# comparing the two arms established, both in `notes`, with `answer_notes` (the
+# `key=value` figures the comparison read) beside the check. A row that was never
 # compared says so there rather than looking like one that was.
 #
 # `spec_data` is scripts/lib/spec_round_log.py's output for the speculative arm
@@ -410,6 +454,7 @@ emit_and_ingest() {
     local answer="$7"
     local answer_check="$8"
     local spec_data="${9:-}"
+    local answer_notes="${10:-}"
 
     if [[ -z "${kv_quant}" ]]; then
         echo "ERROR: ${config}: the run did not report which KV codec it resolved" >&2
@@ -436,6 +481,7 @@ emit_and_ingest() {
         BENCH_PROMPT_TOKENS="${prompt_tokens}" \
         BENCH_ANSWER="${answer}" \
         BENCH_ANSWER_CHECK="${answer_check}" \
+        BENCH_ANSWER_NOTES="${answer_notes}" \
         BENCH_MODEL_NAMESPACE="${MODEL_NAMESPACE}" \
         BENCH_MODEL="${MODEL_NAME}" \
         BENCH_WEIGHT_QUANT="${WEIGHT_QUANT}" \
@@ -468,6 +514,7 @@ kv_quant = os.environ["BENCH_KV_QUANT"]
 prompt_tokens = int(os.environ["BENCH_PROMPT_TOKENS"])
 answer = os.environ["BENCH_ANSWER"]
 answer_check = os.environ["BENCH_ANSWER_CHECK"]
+answer_notes = os.environ["BENCH_ANSWER_NOTES"]
 model_namespace = os.environ["BENCH_MODEL_NAMESPACE"]
 model_name = os.environ["BENCH_MODEL"]
 weight_quant = os.environ["BENCH_WEIGHT_QUANT"]
@@ -483,6 +530,9 @@ seed = int(os.environ["BENCH_SEED"])
 draft_kind = os.environ["BENCH_DRAFT_KIND"]
 bench_tag = os.environ.get("BENCH_TAG", "")
 tag_suffix = f" tag={bench_tag}" if bench_tag else ""
+# `answer_notes` is spaceless `key=value` pairs; none may spell a key the cell
+# reader looks for inside `notes` (`block_size=`, `config=`, `draft_kind=`).
+answer_check_notes = f"{answer_check} {answer_notes}" if answer_notes else answer_check
 
 prompt_content = os.environ["BENCH_PROMPT_CONTENT"]
 prompt_name = os.environ["BENCH_PROMPT_NAME"]
@@ -574,14 +624,14 @@ obj = {
     # (docs/METRICS_SCHEMA.md, "Known-bad rows already in the DB").
     "notes": (
         f"config={config} draft_kind=none{tag_suffix} decode_window=engine_itl "
-        f"answer_check={answer_check} answer={answer}"
+        f"answer_check={answer_check_notes} answer={answer}"
         if config == "normal"
         # `block_size` is the block the engine ran, which a sidecar can cap
         # below the one asked for.
         else f"config={config} draft_kind={draft_kind} "
         f"block_size={block_size} charged={charged}{tag_suffix} "
         f"decode_window=engine_round_loop "
-        f"answer_check={answer_check} answer={answer}"
+        f"answer_check={answer_check_notes} answer={answer}"
     ),
     "description": f"spec_bench {config} sha={git_sha}",
     "metrics": metrics,
@@ -650,6 +700,11 @@ for i in $(seq 1 ${WARMUP_RUNS}); do
     echo "  [normal] warmup ${i} done" >&2
     sleep 5
 done
+
+echo "  [normal] logprob pass..." >&2
+NORMAL_PASS_FILE="${SCRATCH_DIR}/normal_logprobs.json"
+NORMAL_PASS_ANSWER="$(logprob_pass normal "${NORMAL_PASS_FILE}")" || exit 1
+sleep "${LOGPROB_PASS_PAUSE_S}"
 
 echo "  [normal] measured runs..." >&2
 NORMAL_ENGINE_TPS_VALUES=()
@@ -724,7 +779,7 @@ if [[ ${#NORMAL_ENGINE_TPS_VALUES[@]} -ne ${MEASURED_RUNS} ]]; then
     exit 1
 fi
 
-NORMAL_SAMPLED="$(log_sampled "${NORMAL_LOG}" $((WARMUP_RUNS + MEASURED_RUNS)))" \
+NORMAL_SAMPLED="$(log_sampled "${NORMAL_LOG}" "${REQUESTS_PER_PHASE}")" \
     || NORMAL_SAMPLED=""
 if [[ -z "${NORMAL_SAMPLED}" ]]; then
     echo "ERROR: normal: ${NORMAL_LOG} does not say whether the engine ran a" \
@@ -774,6 +829,84 @@ echo ""
 echo "==> Phase 1 complete. Median decode TPS: ${NORMAL_MEDIAN_TPS}"
 echo ""
 
+# Judge a speculative answer that differs from the no-drafter one, when no
+# sampler ran. Reads both phases' logprob passes, each held to the digest its
+# arm's measured runs produced: a pass that answered something else carries
+# margins of an answer nobody is judging. Sets MTP_ANSWER_CHECK and
+# MTP_ANSWER_NOTES for a near tie; every other outcome stops the run.
+judge_difference() {
+    local verdict_block verdict status want_status stderr_file="${SCRATCH_DIR}/spec_answer_stderr.txt"
+    if [[ "${MTP_ANSWER}" == "varied" ]]; then
+        echo "ERROR: ${DRAFT_KIND}: the ${MEASURED_RUNS} measured runs answered differently" \
+             "from each other (${MTP_ANSWER_DIGESTS[*]}) and differently from the" \
+             "no-drafter arm (${NORMAL_ANSWER}), with no sampler on either arm; there is" \
+             "no one speculative answer to judge" >&2
+        exit 1
+    fi
+    if [[ "${NORMAL_PASS_ANSWER}" != "${NORMAL_ANSWER}" ]]; then
+        echo "ERROR: normal: the logprob pass of the no-drafter arm answered" \
+             "'${NORMAL_PASS_ANSWER}' where its measured runs answered" \
+             "'${NORMAL_ANSWER}', so its margins are not those of the answer the" \
+             "${DRAFT_KIND} arm differs from (${MTP_ANSWER}) and the difference cannot be" \
+             "judged" >&2
+        exit 1
+    fi
+    if [[ "${MTP_PASS_ANSWER}" != "${MTP_ANSWER}" ]]; then
+        echo "ERROR: ${DRAFT_KIND}: the logprob pass of the speculative arm answered" \
+             "'${MTP_PASS_ANSWER}' where its measured runs answered" \
+             "'${MTP_ANSWER}', so the answer that differs from the no-drafter arm" \
+             "(${NORMAL_ANSWER}) is not the one the judge would read" >&2
+        exit 1
+    fi
+    status=0
+    verdict_block="$(RMLX_HOME="${RMLX_HOME}" "${BINARY}" eval spec-answer \
+        --plain "${NORMAL_PASS_FILE}" --spec "${MTP_PASS_FILE}" \
+        2> "${stderr_file}")" || status=$?
+    verdict="$(field_of "${verdict_block}" verdict)"
+    if [[ -z "${verdict}" ]]; then
+        echo "ERROR: ${DRAFT_KIND}: 'rmlx eval spec-answer' exited ${status} with no" \
+             "verdict, so the difference from the no-drafter arm cannot be judged;" \
+             "stderr ends:" >&2
+        tail -n 3 "${stderr_file}" >&2 || true
+        exit 1
+    fi
+    # The exit status is the verdict's other spelling: 0 near tie, 1 refused, 2
+    # cannot judge. A pair that disagree is a judge this script does not know.
+    case "${verdict}" in
+        near_tie) want_status=0 ;;
+        refused) want_status=1 ;;
+        unjudgeable) want_status=2 ;;
+        *) want_status=-1 ;;
+    esac
+    if [[ "${status}" != "${want_status}" ]]; then
+        echo "ERROR: ${DRAFT_KIND}: 'rmlx eval spec-answer' exited ${status} but said" \
+             "verdict=${verdict}, so the difference from the no-drafter arm cannot be" \
+             "judged" >&2
+        exit 1
+    fi
+    case "${verdict}" in
+        near_tie)
+            MTP_ANSWER_CHECK="near_tie@$(field_of "${verdict_block}" position)"
+            MTP_ANSWER_NOTES="divergence_rank=$(field_of "${verdict_block}" rank)"
+            MTP_ANSWER_NOTES+=" divergence_margin=$(field_of "${verdict_block}" margin)"
+            echo "  [spec] $(field_of "${verdict_block}" reason)" >&2
+            ;;
+        refused)
+            echo "ERROR: ${DRAFT_KIND}: the answer differs from the no-drafter arm and the" \
+                 "difference is not a near tie: $(field_of "${verdict_block}" reason);" \
+                 "a greedy speculative loop emits the verifier's own argmax, so this arm" \
+                 "answered a different question and its throughput is not a rate for" \
+                 "this one" >&2
+            exit 1
+            ;;
+        *)
+            echo "ERROR: ${DRAFT_KIND}: the difference from the no-drafter arm cannot" \
+                 "be judged: $(field_of "${verdict_block}" reason)" >&2
+            exit 1
+            ;;
+    esac
+}
+
 # ── Phase 2: speculative decode ──────────────────────────────────────────────
 
 echo "==> Phase 2: speculative decode (draft_kind=${DRAFT_KIND} block_size=${DRAFT_BLOCK_SIZE:-engine})"
@@ -807,6 +940,11 @@ for i in $(seq 1 ${WARMUP_RUNS}); do
     echo "  [spec] warmup ${i} done" >&2
     sleep 5
 done
+
+echo "  [spec] logprob pass..." >&2
+MTP_PASS_FILE="${SCRATCH_DIR}/mtp_logprobs.json"
+MTP_PASS_ANSWER="$(logprob_pass "${DRAFT_KIND}" "${MTP_PASS_FILE}")" || exit 1
+sleep "${LOGPROB_PASS_PAUSE_S}"
 
 echo "  [spec] measured runs..." >&2
 MTP_CLIENT_TPS_VALUES=()
@@ -875,7 +1013,7 @@ echo "  [spec] resolved kv_quant=${MTP_KV_QUANT:-<unreported>}" >&2
 # MEASURED_RUNS of them are somebody else's.
 if ! MTP_SPEC_DATA=$(python3 "${REPO_ROOT}/scripts/lib/spec_round_log.py" \
         "${MTP_LOG}" \
-        --expect-total "$((WARMUP_RUNS + MEASURED_RUNS))" \
+        --expect-total "${REQUESTS_PER_PHASE}" \
         --last "${MEASURED_RUNS}"); then
     echo "ERROR: no usable speculative round-loop record in ${MTP_LOG}" >&2
     exit 1
@@ -907,7 +1045,7 @@ if [[ ${#MTP_ENGINE_TPS_VALUES[@]} -ne ${MEASURED_RUNS} ]]; then
     exit 1
 fi
 
-MTP_SAMPLED="$(log_sampled "${MTP_LOG}" $((WARMUP_RUNS + MEASURED_RUNS)))" \
+MTP_SAMPLED="$(log_sampled "${MTP_LOG}" "${REQUESTS_PER_PHASE}")" \
     || MTP_SAMPLED=""
 if [[ -z "${MTP_SAMPLED}" ]]; then
     echo "ERROR: ${DRAFT_KIND}: ${MTP_LOG} does not say whether the engine ran a" \
@@ -917,30 +1055,23 @@ if [[ -z "${MTP_SAMPLED}" ]]; then
 fi
 
 # A greedy speculative loop emits the verifier's own argmax at every position, so
-# with no sampler on either arm the two arms are two ways of computing one answer
-# and a difference between them is a defect in the loop. Every measured run is
-# held to that, and the run stops before the median: a rate measured while
-# answering something else is not a faster answer to the same question, and
-# `observations` is append-only, so a row filed here cannot be taken back out.
+# with no sampler on either arm the two arms are two ways of computing one answer.
+# Equal digests are that. A difference is a near-tie flip or a defect in the loop,
+# and the oracle says which; anything it does not call a near tie stops the run
+# before the median: a rate measured while answering something else is not a
+# faster answer to the same question, and `observations` is append-only, so a row
+# filed here cannot be taken back out.
 MTP_ANSWER="$(one_answer "${MTP_ANSWER_DIGESTS[@]}")"
+MTP_ANSWER_NOTES=""
 if [[ "${MTP_SAMPLED}" == "true" || "${NORMAL_SAMPLED}" == "true" ]]; then
     MTP_ANSWER_CHECK="sampled"
     echo "  [spec] answers not compared: the engine resolved a sampler (normal" \
          "sampled=${NORMAL_SAMPLED}, ${DRAFT_KIND} sampled=${MTP_SAMPLED}), so the" \
          "two arms are two draws and need not agree" >&2
-else
-    for i in $(seq 1 ${MEASURED_RUNS}); do
-        RUN_ANSWER="${MTP_ANSWER_DIGESTS[$((i - 1))]}"
-        if [[ "${RUN_ANSWER}" != "${NORMAL_ANSWER}" ]]; then
-            echo "ERROR: ${DRAFT_KIND}: measured run ${i} answered differently from" \
-                 "the no-drafter arm (${RUN_ANSWER} against ${NORMAL_ANSWER}) with" \
-                 "no sampler on either arm; a greedy speculative loop emits the" \
-                 "verifier's own argmax, so this arm answered a different question" \
-                 "and its throughput is not a rate for this one" >&2
-            exit 1
-        fi
-    done
+elif [[ "${MTP_ANSWER}" == "${NORMAL_ANSWER}" ]]; then
     MTP_ANSWER_CHECK="matches_plain"
+else
+    judge_difference
 fi
 echo "  [spec] answer_check=${MTP_ANSWER_CHECK} answer=${MTP_ANSWER}" >&2
 
@@ -961,7 +1092,8 @@ MTP_BUF_PATH=$(emit_and_ingest \
     "${MTP_PROMPT_TOKENS}" \
     "${MTP_ANSWER}" \
     "${MTP_ANSWER_CHECK}" \
-    "${MTP_SPEC_DATA}")
+    "${MTP_SPEC_DATA}" \
+    "${MTP_ANSWER_NOTES}")
 
 echo ""
 echo "==> Phase 2 complete. Median decode TPS: ${MTP_MEDIAN_TPS}"

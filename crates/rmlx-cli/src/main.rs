@@ -1509,7 +1509,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ClaimCmd,
     },
-    /// — offline evaluation harness (currently only `ppl`).
+    /// — offline evaluation harness: `ppl` scores a model, `spec-answer` judges two saved answers.
     Eval {
         #[command(subcommand)]
         cmd: EvalCmd,
@@ -1677,6 +1677,25 @@ enum EvalCmd {
             long_help = KV_BOUNDARY_LAYERS_LONG_HELP,
         )]
         kv_boundary_layers: Option<rmlx_models::kv_cache::KvBoundary>,
+    },
+    /// Judge a speculative answer against the plain answer to the same prompt.
+    ///
+    /// Reads two non-streamed `/v1/chat/completions` response bodies that carry
+    /// `logprobs` with `top_logprobs` of at least 2, from runs at temperature 0,
+    /// and applies the first-divergence oracle of
+    /// `docs/SPEC_ANSWER_EQUIVALENCE.md`. Loads no model and takes no claim.
+    ///
+    /// Prints `verdict=near_tie|refused|unjudgeable`, then `position=`,
+    /// `margin=` and `rank=` where they were computed, then `reason=`. Exit
+    /// code 0 is a near tie, 1 a divergence the oracle refuses, 2 an input it
+    /// cannot judge.
+    SpecAnswer {
+        /// Response body of the no-drafter run.
+        #[arg(long, value_name = "FILE")]
+        plain: PathBuf,
+        /// Response body of the speculative run.
+        #[arg(long, value_name = "FILE")]
+        spec: PathBuf,
     },
 }
 
@@ -1978,6 +1997,15 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
         };
     }
 
+    // `rmlx eval spec-answer` reads two files and prints a verdict: no model,
+    // no claim, no recorder.
+    if let Cmd::Eval {
+        cmd: EvalCmd::SpecAnswer { plain, spec },
+    } = &cli.cmd
+    {
+        return Ok(commands::run_spec_answer(plain, spec));
+    }
+
     // `rmlx claim run` records nothing itself; the command it runs does.
     if let Cmd::Claim {
         cmd: ClaimCmd::Run { command },
@@ -2018,9 +2046,9 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
 
     #[allow(
         clippy::unreachable,
-        reason = "Cmd::Metrics, Cmd::Profile, Cmd::Claim and Cmd::KvCalibrate are handled by \
-                  early blocks above that return; reaching these arms means the early-return \
-                  guard was removed — a BUG"
+        reason = "Cmd::Metrics, Cmd::Profile, Cmd::Claim, Cmd::KvCalibrate and \
+                  EvalCmd::SpecAnswer are handled by early blocks above that return; reaching \
+                  these arms means the early-return guard was removed — a BUG"
     )]
     #[allow(
         clippy::match_same_arms,
@@ -2869,6 +2897,7 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
                     kv_quant_resolved,
                 )?;
             }
+            EvalCmd::SpecAnswer { .. } => unreachable!("handled above"),
         },
     }
     Ok(0)

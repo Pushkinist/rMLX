@@ -1,9 +1,9 @@
-// LOC-exempt: one gate over seven round loops. The oracle it applies — the
-// divergence-confidence judgement and the repetition control — is one argument
-// whose constants are set against the population of pairs and prompts the file
-// runs, and the pair table, the prompt sweep and the per-loop arms are that
-// population. Splitting it would put the constants in one file and the readings
-// that set them in another.
+// LOC-exempt: one gate over seven round loops. The repetition control it
+// applies beside the divergence oracle is one argument whose constants are set
+// against the population of pairs and prompts the file runs, and the pair
+// table, the prompt sweep and the per-loop arms are that population. Splitting
+// it would put the constants in one file and the readings that set them in
+// another.
 //! Speculative decoding must not change what the model says.
 //!
 //! Greedy speculative decoding emits the verifier's own argmax at every
@@ -174,6 +174,10 @@ use common::round_stream::{
 };
 
 use rmlx_mlx::Device;
+use rmlx_models::answer_equivalence::{
+    common_prefix_len, divergence_confidence, read_divergence, top_two_margin, Divergence,
+    MAX_DIVERGENCE_CONFIDENCE, MIN_LENGTH_RATIO,
+};
 use rmlx_models::arch;
 use rmlx_models::speculative::dflash::{dflash_generate, DFlashDrafter};
 use rmlx_models::speculative::dflash2::{dflash2_generate, DFlash2Drafter};
@@ -208,68 +212,12 @@ const N_TOKENS: usize = 256;
 /// a pair that answers in full is never refused for length.
 const MIN_ANSWER_TOKENS: usize = 160;
 
-/// The shorter arm over the longer. `lcs_ratio` divides by the shorter stream,
-/// so an arm that stopped at a third of the other's length and matched its
-/// prefix would otherwise score 1.0.
-const MIN_LENGTH_RATIO: f64 = 0.60;
-
 use rmlx_models::speculative::{default_block_for, drafts_per_round, VerifierTrunk};
 
 /// Context both arms run under. Above the 4k prompt plus the budget, and the
 /// same on both sides — a different cap on either would make this a measurement
 /// of the cap.
 const MAX_CTX: i32 = 8192;
-
-/// Where the first divergence's own confidence may sit in the reference arm's
-/// margin distribution.
-///
-/// **Both sides measured**, over six pairs and six prompts each, by running the
-/// gate against the shipped engine and against a deliberately broken one per
-/// loop — two on the block pair and two on the restricted-vocabulary one:
-///
-/// | engine | percentile of the reference arm's own margins |
-/// |---|---|
-/// | assistant pair, as shipped | 0.0000 to 0.0820 |
-/// | recurrent pair, as shipped | 0.0000 to 0.0234 |
-/// | block pair, as shipped | 0.0000 to 0.0273 |
-/// | adaptive pair, as shipped, at the block it is served | 0.0000 to 0.0234 |
-/// | adaptive pair, as shipped, over its whole schedule | 0.0000 to 0.0703 |
-/// | restricted-vocabulary pair, as shipped | 0.0000 to 0.0703 |
-/// | two-model pair, as shipped | 0.0000 to 0.0234 |
-/// | assistant pair, SWA ring keeping its rejected block tail | 0.4219 to 0.9258 |
-/// | recurrent pair, acceptance walk without the final norm | 0.0000 to 0.5000 |
-/// | block pair, rejected tail never rolled off | 0.0117 to 0.9297 |
-/// | block pair, one rejected draft kept every partial round | 0.1758 to 0.6406 |
-/// | adaptive pair, one rejected draft kept every partial round | 0.0703 to 0.8320 |
-/// | restricted-vocabulary pair, one rejected draft kept every round | 0.0000 to 0.8320 |
-/// | two-model pair, one rejected draft kept every partial round | 0.0000 to 0.6680 |
-///
-/// The measurement leaves a band, and the value sits inside it: above the worst
-/// correct cell (0.0820, 1.46x) and under the lowest broken cell above it
-/// (0.1445, 1.20x). It clears every correct cell, and every broken engine here
-/// is refused on at least four of the prompts the gate judged for it — which is
-/// what running every prompt rather than one buys, since no broken engine is
-/// refused on all of them by this oracle alone.
-///
-/// **The adaptive pair's two rows are the same engine at two blocks**, and the
-/// wider one reads three times the narrower. Both clear the ceiling and both are
-/// refused on none of the prompts the gate judges, against at least four for
-/// every broken engine here — but 0.0703 is also where the broken adaptive row
-/// starts, so the two populations touch on that pair at that block, and the
-/// margin the ceiling has over a correct reading there is 1.71x rather than the
-/// 1.46x the paragraph above quotes. The narrower row was measured before this
-/// pair was split in two and its block is not recorded; the served block
-/// reproduces it exactly.
-///
-/// One broken engine is outside that statement, and that is a property of the
-/// defect rather than of the ceiling: leaving the correction on the restricted
-/// argmax only changes an answer where that vocabulary falls short of the
-/// verifier's, which the runs measure at one to five tokens per answer. It is
-/// refused on one of the five prompts the gate judges, at a token the
-/// drafter's vocabulary cannot name — and at the round's **correction**, which
-/// is the only thing that keeps it refused now the boundary at an accepted
-/// position is not. See [`Restriction`].
-const MAX_DIVERGENCE_CONFIDENCE: f64 = 0.12;
 
 /// The worst [`weakest_tail`] reading a **correct** pair reached over the prompts
 /// the gate judged, on any pair. Not a threshold the gate applies — see below —
@@ -367,11 +315,6 @@ const TAIL_WINDOWS: usize = 4;
 
 // ── Oracle ───────────────────────────────────────────────────────────────────
 
-/// How many leading tokens two streams share.
-fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
-    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
-}
-
 /// Longest common subsequence of two token streams, over the shorter of them.
 fn lcs_ratio(a: &[u32], b: &[u32]) -> f64 {
     let (n, m) = (a.len(), b.len());
@@ -392,25 +335,6 @@ fn lcs_ratio(a: &[u32], b: &[u32]) -> f64 {
         cur.fill(0);
     }
     prev[m] as f64 / n.min(m) as f64
-}
-
-/// Where the reference arm's confidence at the first divergence sits in its own
-/// distribution: the fraction of its decisions it was **less** sure about.
-///
-/// `margins[i]` is the verifier's top-two logprob gap at position `i` of the
-/// reference arm. The two arms share every position before the first divergence,
-/// so `margins[d]` is the gap the speculative arm faced as well.
-///
-/// `None` when the arms never differ, or when they first differ past the end of
-/// the reference arm — the length guard owns that case.
-fn divergence_confidence(spec: &[u32], plain: &[u32], margins: &[f32]) -> Option<(usize, f64)> {
-    let d = common_prefix_len(spec, plain);
-    if d >= spec.len() && d >= plain.len() {
-        return None;
-    }
-    let at = *margins.get(d)?;
-    let below = margins.iter().filter(|m| **m < at).count();
-    Some((d, below as f64 / margins.len() as f64))
 }
 
 /// One reading of the repetition control: `matches` of `samples` positions
@@ -653,7 +577,6 @@ fn judge(
     margins: &[f32],
     restriction: Option<&Restriction<'_>>,
 ) -> Verdict {
-    let shorter = spec.len().min(plain.len());
     let longer = spec.len().max(plain.len());
 
     // The controls first. A degenerate arm is a more specific verdict than a
@@ -725,19 +648,15 @@ fn judge(
             plain.len()
         ));
     }
-    let length_ratio = shorter as f64 / longer as f64;
-    if length_ratio < MIN_LENGTH_RATIO {
-        return Verdict::Refused(format!(
-            "the arms answered at {} and {} tokens, a ratio of {length_ratio:.4} (floor \
+    match read_divergence(spec, plain, margins) {
+        Divergence::ShortRun { ratio, .. } => Verdict::Refused(format!(
+            "the arms answered at {} and {} tokens, a ratio of {ratio:.4} (floor \
              {MIN_LENGTH_RATIO}) — one stopped well before the other, and there is no \
              divergence to read where the shorter arm has already ended",
             spec.len(),
             plain.len()
-        ));
-    }
-
-    if let Some((at, confidence)) = divergence_confidence(spec, plain, margins) {
-        if confidence > MAX_DIVERGENCE_CONFIDENCE {
+        )),
+        Divergence::Confident(at, confidence) => {
             if restriction.is_some_and(|r| r.explains(at, plain)) {
                 return Verdict::Unjudgeable(format!(
                     "the arms first differ at token {at}, which the round loop emitted from \
@@ -748,16 +667,16 @@ fn judge(
                      round loop"
                 ));
             }
-            return Verdict::Refused(format!(
+            Verdict::Refused(format!(
                 "the arms first differ at token {at}, where the verifier was surer than \
                  {confidence:.4} of its own decisions on this answer (ceiling \
                  {MAX_DIVERGENCE_CONFIDENCE}) — a different reduction order can only flip \
                  a decision that was nearly tied, so the round loop fed the verifier a \
                  different state rather than the same one in a different order"
-            ));
+            ))
         }
+        Divergence::NearTie(..) | Divergence::Unread => Verdict::Agreed,
     }
-    Verdict::Agreed
 }
 
 impl Verdict {
@@ -831,32 +750,6 @@ fn a_single_flip_passes_and_a_confident_flip_does_not() {
         .refusal()
         .expect("must refuse");
     assert!(failure.contains("nearly tied"), "{failure}");
-}
-
-/// What the divergence oracle reads, and when it stands down.
-#[test]
-fn the_divergence_oracle_reads_the_first_differing_position_or_nothing() {
-    let plain: Vec<u32> = (0..N_TOKENS as u32).collect();
-    let mut flipped = plain.clone();
-    flipped[66] = 9999;
-
-    let mut tied = vec![5.0f32; N_TOKENS];
-    tied[66] = 0.01;
-    assert_eq!(
-        divergence_confidence(&flipped, &plain, &tied),
-        Some((66, 0.0)),
-        "the position read is the first the arms differ at"
-    );
-
-    // Two identical arms have no divergence to judge, and an empty margin list
-    // stands the oracle down rather than reading position 0 of nothing.
-    assert_eq!(divergence_confidence(&plain, &plain, &tied), None);
-    assert_eq!(divergence_confidence(&flipped, &plain, &[]), None);
-
-    // A divergence past the end of the reference arm has no margin behind it;
-    // the length guard owns that pair.
-    let extended: Vec<u32> = plain.iter().copied().chain([1_u32]).collect();
-    assert_eq!(divergence_confidence(&extended, &plain, &tied), None);
 }
 
 /// One pair of arms parting at token 66, at a decision the verifier was sure
@@ -1008,26 +901,6 @@ fn the_boundary_excuses_no_other_refusal() {
         .refusal()
         .expect("a short speculative arm is refused whatever parted the arms");
     assert!(failure.contains("stopped early"), "{failure}");
-}
-
-/// The oracle's own denominator: the confidence is a rank over the reference
-/// arm's margins, so it must not move when every margin is scaled.
-///
-/// A threshold in nats would move. This is the property that lets one ceiling
-/// cover two models whose logits are not on the same scale.
-#[test]
-fn the_confidence_is_a_rank_and_not_a_number_of_nats() {
-    let plain: Vec<u32> = (0..N_TOKENS as u32).collect();
-    let mut flipped = plain.clone();
-    flipped[40] = 7777;
-
-    let base: Vec<f32> = (0..N_TOKENS).map(|i| 0.1 + (i % 17) as f32).collect();
-    let scaled: Vec<f32> = base.iter().map(|m| m * 250.0).collect();
-    assert_eq!(
-        divergence_confidence(&flipped, &plain, &base),
-        divergence_confidence(&flipped, &plain, &scaled),
-        "scaling every margin must not move the rank"
-    );
 }
 
 /// Two arms stuck in the same repetition loop agree perfectly and mean nothing.
@@ -3324,18 +3197,9 @@ fn plain_greedy(
     {
         let mut step = |s: &rmlx_models::ProbeStep| {
             ids.push(s.token_id);
-            let mut top: Vec<f32> = s
-                .logprobs
-                .as_ref()
-                .map(|lp| lp.top.iter().map(|t| t.1).collect())
-                .unwrap_or_default();
-            top.sort_by(|a, b| b.total_cmp(a));
-            margins.push(match (top.first(), top.get(1)) {
-                (Some(best), Some(second)) => best - second,
-                // A one-entry vocabulary is not a thing, but a margin the arm
-                // did not report must not read as a tie.
-                _ => f32::INFINITY,
-            });
+            margins.push(top_two_margin(
+                s.logprobs.iter().flat_map(|lp| lp.top.iter().map(|t| t.1)),
+            ));
             None
         };
         verifier

@@ -1,12 +1,11 @@
 //! `rmlx eval` command implementations.
 //!
-//! Currently exposes a single subcommand:
-//!
-//! * `rmlx eval ppl` -- sliding-window perplexity scorer. Loads a model,
-//!   tokenizes a text file, runs [`rmlx_models::ppl::compute_ppl`], prints one
-//!   JSON line to stdout, and (when `--corpus` is non-empty) emits one §8.5
-//!   universal `RunRecord` to `<RMLX_HOME>/metrics/runs.db` under op
-//!   `ppl_wikitext2`.
+//! This module holds `rmlx eval ppl` -- the sliding-window perplexity scorer.
+//! It loads a model, tokenizes a text file, runs
+//! [`rmlx_models::ppl::compute_ppl`], prints one JSON line to stdout, and (when
+//! `--corpus` is non-empty) emits one §8.5 universal `RunRecord` to
+//! `<RMLX_HOME>/metrics/runs.db` under op `ppl_wikitext2`. `rmlx eval
+//! spec-answer` lives in `spec_answer.rs`.
 //!
 //! The chat route does not serve `echo`+`logprobs`: that needs per-position
 //! logits across every architecture's forward path. This CLI subcommand scores
