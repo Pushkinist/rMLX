@@ -14,8 +14,9 @@ One §8.5 record per measured thing, and the measured things are the samples:
                        `prompt_id` is that sample's own body, so the row joins
                        to the exact prompt it was measured on. The speculative
                        arm adds its per-round figures.
-  the fixed prompt     one record: output speed, input speed, TTFT and the two
-                       resident peaks, on the prompt fitted for this checkpoint.
+  the fixed prompt     one record: output speed, input speed, TTFT, the two
+                       resident peaks and the Metal allocator peak, on the
+                       prompt fitted for this checkpoint.
 
 The per-dataset and macro averages are NOT recorded. They are means over the
 rows above, so storing them would put a derived number beside the numbers it is
@@ -28,12 +29,22 @@ reason to refuse these rows. The refusal is of a mean; the rows are the
 measurements it would have been a mean of, each carrying its own three pass
 readings in `notes`.
 
+WHAT IS CHECKED AFTER RECORDING
+
+`--record` ends by re-querying the rows it just wrote, by the run's label and
+start time, and rebuilding the per-cell and macro means from them
+(`lib/published_requery.py`). A result they do not reproduce is exit 1: the rows
+are not the measurement. The label is the run's own (`spec_bench_published.sh
+--label`); it is written as `label=<label>;` at the start of every row's `notes`.
+
 WHAT IS REFUSED
 
   synthetic arms       the server was a stub. There is no measurement in it and
                        no waiver for that.
   unverified samples   `--samples-root` named a copy that is not the pinned one,
                        so the run is not a published measurement.
+  an unlabelled run    the result carries no valid label, so its rows could not
+                       be found again as one campaign.
   a taint              a host that was busy, a window nobody could sample, a
                        thermal state that was throttled or unreadable. Waivable
                        with `--accept-tainted`, and then carried into `notes`.
@@ -73,6 +84,7 @@ from typing import Any
 _SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPT_DIR.parent))
 sys.path.insert(0, str(_SCRIPT_DIR.parent / "lib"))
+from published_requery import LABEL_PATTERN, Unreadable, check  # noqa: E402
 from published_samples import body_sha256  # noqa: E402
 
 RMLX_REPO_ROOT = Path(os.environ.get("RMLX_REPO_ROOT", str(_SCRIPT_DIR.parents[1])))
@@ -80,11 +92,11 @@ RMLX_REPO_ROOT = Path(os.environ.get("RMLX_REPO_ROOT", str(_SCRIPT_DIR.parents[1
 # in-repo `.rmlx/` is the dev default.
 RMLX_HOME = Path(os.environ.get("RMLX_HOME", str(RMLX_REPO_ROOT / ".rmlx")))
 BUFFER_PENDING = RMLX_HOME / "metrics" / "buffer" / "pending"
-# Records are assembled HERE and only moved into `pending/` for the moment the
-# recorder claims one: anything sitting in `pending/` is, by contract, work the
-# next `--replay-pending` sweep will take, and that sweep quarantines what it
-# cannot ingest.
-STAGING = RMLX_HOME / "bench" / "spec_bench_published" / "records"
+# Records are assembled in `records/` beside the result and only moved into
+# `pending/` for the moment the recorder claims one: anything sitting in
+# `pending/` is, by contract, work the next `--replay-pending` sweep will take,
+# and that sweep quarantines what it cannot ingest.
+STAGING_DIR = "records"
 
 SCHEMA_VERSION = 1
 # The identity fields the run stamped at emit time. §8.5.1: they are never
@@ -235,6 +247,7 @@ def run_notes(result: dict[str, Any], binary_sha: str) -> str:
     """What every row from this run says about how it was taken."""
     protocol = result["protocol"]
     parts = [
+        f"label={result['label']}",
         f"spec_bench_published.sh, {protocol['passes']} passes, "
         f"{protocol['warmups_per_pass']} untimed warmup each",
         f"sampling {protocol['thinking']}, seed {protocol['seed_policy']}",
@@ -378,7 +391,8 @@ def fixed_record(
             + f"; range {rates['decode_tps']['range_pct']:.2f}%"
             + "; resident figures are the peak of a gauge sampled every "
             + f"{block['memory_poll_ms']} ms, so they are a lower bound on the "
-            "true peak"
+            "true peak; the Metal peak is the allocator's own high-water mark "
+            "since the server started, so it spans the warmup too"
         ),
         "metrics": [
             {
@@ -397,6 +411,10 @@ def fixed_record(
                 "value": block["phys_footprint_bytes"]["max"] / 1e6,
             },
             {"name": "peak_rss_mb", "value": block["rss_bytes"]["max"] / 1e6},
+            {
+                "name": "metal_peak_alloc_mb",
+                "value": block["metal_peak_alloc_mb"]["max"],
+            },
         ],
     }
 
@@ -419,6 +437,12 @@ def gate(result: dict[str, Any], args: argparse.Namespace) -> None:
             "client clock. A stub's own stamps make the cross-check compare the "
             "stub with itself. There is no waiver for this: re-run against a real "
             "server."
+        )
+    label = result.get("label")
+    if not isinstance(label, str) or not LABEL_PATTERN.fullmatch(label):
+        raise Refused(
+            f"the result carries no valid label (got {label!r}), so its rows could "
+            "not be found again as one campaign. Re-run with --label."
         )
     if result.get("unverified_samples"):
         raise Refused(
@@ -487,13 +511,14 @@ def main() -> int:
         return 0
 
     stamp = result["ts_utc"].replace("-", "").replace(":", "")
-    STAGING.mkdir(parents=True, exist_ok=True)
+    staging = Path(args.result).resolve().parent / STAGING_DIR
+    staging.mkdir(parents=True, exist_ok=True)
     staged: list[Path] = []
     for rec in records:
-        path = STAGING / f"{stamp}-{uuid.uuid4().hex[:8]}.json"
+        path = staging / f"{stamp}-{uuid.uuid4().hex[:8]}.json"
         path.write_text(json.dumps(rec, ensure_ascii=False), encoding="utf-8")
         staged.append(path)
-    print(f"staged {len(staged)} records under {STAGING}")
+    print(f"staged {len(staged)} records under {staging}")
 
     if not args.record:
         print(
@@ -528,7 +553,21 @@ def main() -> int:
             )
             failed += 1
     print(f"ingested {len(staged) - failed}/{len(staged)} records")
-    return 1 if failed else 0
+    if failed:
+        return 1
+
+    summary = Path(args.result).resolve().parent / "db_summary.json"
+    try:
+        problems = check(Path(args.result), args.rmlx_bin, None, summary)
+    except Unreadable as exc:
+        print(f"re-query FAILED: {exc}", file=sys.stderr)
+        return 1
+    for problem in problems:
+        print(f"re-query DISAGREES: {problem}", file=sys.stderr)
+    if problems:
+        return 1
+    print(f"re-queried from runs.db: the rows reproduce the result ({summary})")
+    return 0
 
 
 if __name__ == "__main__":

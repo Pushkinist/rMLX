@@ -559,15 +559,20 @@ check-published-samples-fixtures: ## CI gate: recall test for the above — one 
 # the intended way to find out that the inputs to a published number were not
 # recorded.
 PUBLISHED_TABLE_FIXTURES := scripts/fixtures/published_table
+# The perplexity record is the fixture's only when the results and the model are
+# the fixture's too: a real snapshot refuses it. For a real run it is given on
+# the make command line and nowhere else, so the environment cannot supply it.
+PUBLISHED_TABLE_PPL_ARG := $(if $(filter command line,$(origin PUBLISHED_TABLE_PPL)),$(PUBLISHED_TABLE_PPL),$(if $(filter-out undefined,$(origin PUBLISHED_TABLE_RESULTS) $(origin PUBLISHED_TABLE_MODEL)),,$(PUBLISHED_TABLE_FIXTURES)/ppl.json))
 PUBLISHED_TABLE_RESULTS ?= $(PUBLISHED_TABLE_FIXTURES)/result_plain.json \
                            $(PUBLISHED_TABLE_FIXTURES)/result_mtp.json \
                            $(PUBLISHED_TABLE_FIXTURES)/result_dflash.json
 PUBLISHED_TABLE_MODEL ?= $(PUBLISHED_TABLE_FIXTURES)/fixture__published-table-16L
 
 .PHONY: published-table
-published-table: ## regenerate docs/PUBLISHED_PROTOCOL.md (PUBLISHED_TABLE_RESULTS= / PUBLISHED_TABLE_MODEL= to render a real run)
+published-table: ## regenerate docs/PUBLISHED_PROTOCOL.md (PUBLISHED_TABLE_RESULTS= / PUBLISHED_TABLE_MODEL= / PUBLISHED_TABLE_PPL= to render a real run)
 	@python3 scripts/lib/published_table.py $(PUBLISHED_TABLE_RESULTS) \
-		--model $(PUBLISHED_TABLE_MODEL) --out docs/PUBLISHED_PROTOCOL.md
+		--model $(PUBLISHED_TABLE_MODEL) $(if $(PUBLISHED_TABLE_PPL_ARG),--ppl $(PUBLISHED_TABLE_PPL_ARG)) \
+		--out docs/PUBLISHED_PROTOCOL.md
 	@echo "wrote docs/PUBLISHED_PROTOCOL.md"
 
 .PHONY: check-published-table
@@ -578,6 +583,7 @@ check-published-table: ## CI gate: the committed published-protocol table is wha
 		$(PUBLISHED_TABLE_FIXTURES)/result_mtp.json \
 		$(PUBLISHED_TABLE_FIXTURES)/result_dflash.json \
 		--model $(PUBLISHED_TABLE_FIXTURES)/fixture__published-table-16L \
+		--ppl $(PUBLISHED_TABLE_FIXTURES)/ppl.json \
 		--out "$$rendered" && \
 	diff -u docs/PUBLISHED_PROTOCOL.md "$$rendered" || { \
 		echo "ERROR: docs/PUBLISHED_PROTOCOL.md is not what the emitter renders."; \

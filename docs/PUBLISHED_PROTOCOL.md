@@ -24,7 +24,7 @@ assume.
 | thinking tokens | on, counted as output |
 | warmup | 1 untimed request per pass, on a prompt in no sample set |
 | passes | 3 consecutive, each score their mean |
-| resident memory | peak `phys_footprint` (`docs/PROFILING.md` §9), sampled every 250 ms, so it is a lower bound on the true peak |
+| resident memory | peak `phys_footprint` (`docs/PROFILING.md` §9), sampled every 250 ms, so it is a lower bound on the true peak; the Metal allocator's own peak is printed beside it |
 | sampling | the checkpoint's own — the request carries no sampling field. Read back from the engine: `min_p`=0.0, `seed`=42919, `temperature`=0.7, `top_k`=20, `top_p`=0.95 |
 | seed | engine default, identical in all three passes |
 | run-to-run range refusal | a mean whose three passes span more than 5% of the mean is withheld, not averaged |
@@ -133,6 +133,7 @@ file with the measurement.
 | input speed (tok/s) | 4818.67 | — | — |
 | peak `phys_footprint` (GB) | 9.64 | 8.80 | 91.3% |
 | peak RSS (GB) | 9.42 | 8.80 | 93.4% |
+| peak Metal allocation (GB) | 9.56 | — | — |
 
 The two resident rows read the other way round — their bound is a
 **floor**, so the last column is how much of what the process held is
@@ -143,11 +144,39 @@ the prompt cache and everything else a process holds; it is not waste and
 this does not say it is. Both peaks are a sampled gauge, so both are a
 lower bound on the true peak.
 
+The Metal row is the engine's own counter, the allocator's high-water mark
+since the server started. It is exact and not sampled, and it spans the
+warmup before the request as well as the request. It has no bound: the
+floor above is a statement about the process, and nothing here derives how
+much of the weights the allocator counts. A third-party column read off an
+MLX engine's own peak-memory counter corresponds to this row. One read off
+the process, as Activity Monitor or `ps` shows it, corresponds to the
+`phys_footprint` and RSS rows.
+
 The input-speed bound is empty on purpose. `perf_ceiling.py` projects
 prefill from a measured anchor row in `runs.db` and reports nothing at
 all rather than guessing when it has none: a single achieved-GEMM
 constant is not defensible on this host, where the recorded rows span a
 7× range across models.
+
+## Perplexity
+
+Sliding-window perplexity of this checkpoint over wikitext-2, scored by
+`rmlx eval ppl`. It is the checkpoint's own figure, measured apart from the
+speed runs above, so it says nothing about a drafter.
+
+| figure | value |
+|---|---:|
+| perplexity | 7.3412 |
+| scored tokens | 287644 |
+| windows | 141 |
+| window / stride (tokens) | 4096 / 2048 |
+| scorer | no KV cache: each window is one forward pass |
+
+A perplexity scored with a cache and one scored without are different
+metrics; compare each only with its own kind. No other checkpoint's
+perplexity is rendered, so this figure has nothing to be compared against
+here.
 
 ## Not in this table
 
@@ -158,7 +187,6 @@ their absence:
 
 - greedy token-match rate against plain decode on the same checkpoint, per dataset — the lossless proof
 - TTFT and decode rate at 32k and 128k input, plain, from `prompts/longctx_*.json`
-- Wikitext-2 perplexity of the served checkpoint against its bf16/mxfp8 sibling
 - pass@1 on the HumanEval subset, from these same completions
 
 Thermal state and binary identity, the other two, are under Provenance.
@@ -167,6 +195,7 @@ Thermal state and binary identity, the other two, are under Provenance.
 
 | field | value |
 |---|---|
+| campaign | `fixture-campaign` (the `label=` term in the notes of its `runs.db` rows) |
 | backend | rmlx 0.4.1 (release-perf) |
 | binary | `sha256:327e90b6f5e4f41e` |
 | snapshot | `fixture__published-table-16L` |

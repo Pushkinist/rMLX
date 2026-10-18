@@ -68,6 +68,13 @@ codec, the same context ceiling, the same protocol constants, the same cells and
 the same binary. A `x plain` column across two binaries is not a speedup, and
 nothing in the rendered table would say so.
 
+PERPLEXITY IS NOT MEASURED HERE.
+
+`--ppl` takes the JSON line `rmlx eval ppl --corpus wikitext-2` printed for the
+snapshot being rendered and adds a section for it. The record must name that
+snapshot and that corpus, or it is refused: a perplexity of another checkpoint
+renders as plausibly as the right one.
+
 Exit codes: 0 — rendered; 1 — an input could not be read, or the inputs do not
 describe one comparison; 3 — a ceiling that cannot describe a cell it is asked
 to bound.
@@ -77,6 +84,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -94,8 +102,8 @@ PERF_CEILING = _LIB.parent / "perf_ceiling.py"
 DATASET_ORDER = ("mt_bench", "math_500", "humaneval")
 
 # Fields every input must agree on to be rows of one table.
-SHARED_FIELDS = ("model_namespace", "model", "weight_quant", "kv_quant", "ctx_max",
-                 "hardware_tag", "range_refusal_pct")
+SHARED_FIELDS = ("label", "model_namespace", "model", "weight_quant", "kv_quant",
+                 "ctx_max", "hardware_tag", "range_refusal_pct")
 SHARED_PROTOCOL = ("passes", "warmups_per_pass", "macro_max_tokens", "thinking",
                    "seed_policy")
 
@@ -275,7 +283,8 @@ def protocol_block(result: dict) -> list[str]:
         "in no sample set |",
         f"| passes | {p['passes']} consecutive, each score their mean |",
         f"| resident memory | peak `phys_footprint` (`docs/PROFILING.md` §9), "
-        f"sampled every {poll} ms, so it is a lower bound on the true peak |",
+        f"sampled every {poll} ms, so it is a lower bound on the true peak; the "
+        "Metal allocator's own peak is printed beside it |",
         "| sampling | the checkpoint's own — the request carries no sampling field. "
         f"Read back from the engine: {sampling_text} |",
         f"| seed | {p['seed_policy']} |",
@@ -432,6 +441,7 @@ def fixed_table(result: dict, bound: dict) -> list[str]:
     block = result["fixed_prompt"]
     prefill_bound = bound["prefill_ceiling_tps"]
     footprint = block["phys_footprint_bytes"]["max"]
+    metal_peak = block["metal_peak_alloc_mb"]["max"] * 1024 * 1024
     out = [
         f"## The fixed-length prompt — {block['prompt_tokens']} tokens, plain decode",
         "",
@@ -456,6 +466,7 @@ def fixed_table(result: dict, bound: dict) -> list[str]:
         f"| peak RSS (GB) | {gb(block['rss_bytes']['max'])} "
         f"| {gb(bound['resident_floor_bytes'])} "
         f"| {ratio_pct(bound['resident_floor_bytes'], block['rss_bytes']['max'])} |",
+        f"| peak Metal allocation (GB) | {gb(metal_peak)} | — | — |",
         "",
         "The two resident rows read the other way round — their bound is a",
         "**floor**, so the last column is how much of what the process held is",
@@ -465,6 +476,15 @@ def fixed_table(result: dict, bound: dict) -> list[str]:
         "the prompt cache and everything else a process holds; it is not waste and",
         "this does not say it is. Both peaks are a sampled gauge, so both are a",
         "lower bound on the true peak.",
+        "",
+        "The Metal row is the engine's own counter, the allocator's high-water mark",
+        "since the server started. It is exact and not sampled, and it spans the",
+        "warmup before the request as well as the request. It has no bound: the",
+        "floor above is a statement about the process, and nothing here derives how",
+        "much of the weights the allocator counts. A third-party column read off an",
+        "MLX engine's own peak-memory counter corresponds to this row. One read off",
+        "the process, as Activity Monitor or `ps` shows it, corresponds to the",
+        "`phys_footprint` and RSS rows.",
     ]
     if not prefill_bound:
         out += [
@@ -479,6 +499,75 @@ def fixed_table(result: dict, bound: dict) -> list[str]:
     return out
 
 
+PPL_CORPUS = "wikitext-2"
+
+
+def load_ppl(path: str, snapshot: Path) -> dict:
+    """The `rmlx eval ppl` stdout line, for the checkpoint this table renders.
+
+    A perplexity of another checkpoint renders exactly as plausibly as the right
+    one, so the record must name the snapshot directory the table was given. The
+    record's `model` is the path the scorer was run on, and only its last
+    component is compared.
+    """
+    try:
+        record = json.loads(Path(path).read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise InputError(f"{path} is not the JSON line `rmlx eval ppl` prints: {exc}")
+    if not isinstance(record, dict):
+        raise InputError(f"{path} is not the JSON line `rmlx eval ppl` prints")
+    if record.get("corpus") != PPL_CORPUS:
+        raise InputError(
+            f"{path} scored the corpus {record.get('corpus')!r} where this table "
+            f"names {PPL_CORPUS!r}; a perplexity is only comparable over its own "
+            "corpus"
+        )
+    scored = Path(str(record.get("model", ""))).name
+    if scored != snapshot.name:
+        raise InputError(
+            f"{path} scored the checkpoint {scored!r} where this table renders "
+            f"{snapshot.name!r}; the perplexity of another checkpoint is not this "
+            "one's"
+        )
+    value = record.get("ppl")
+    if (not isinstance(value, (int, float)) or isinstance(value, bool)
+            or not math.isfinite(value) or value <= 0):
+        raise InputError(f"{path} reports ppl={value!r}, which is not a perplexity")
+    for name in ("scored_tokens", "windows", "ctx_window", "stride"):
+        count = record.get(name)
+        if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+            raise InputError(f"{path} reports {name}={count!r}, which is not a count")
+    return record
+
+
+def ppl_block(record: dict) -> list[str]:
+    kv_quant = record.get("kv_quant")
+    scorer = ("no KV cache: each window is one forward pass" if kv_quant is None
+              else f"through a real per-layer `{kv_quant}` cache, one decode step "
+                   "per scored token")
+    return [
+        "## Perplexity",
+        "",
+        f"Sliding-window perplexity of this checkpoint over {PPL_CORPUS}, scored by",
+        "`rmlx eval ppl`. It is the checkpoint's own figure, measured apart from the",
+        "speed runs above, so it says nothing about a drafter.",
+        "",
+        "| figure | value |",
+        "|---|---:|",
+        f"| perplexity | {record['ppl']:.4f} |",
+        f"| scored tokens | {record['scored_tokens']} |",
+        f"| windows | {record['windows']} |",
+        f"| window / stride (tokens) | {record['ctx_window']} / {record['stride']} |",
+        f"| scorer | {scorer} |",
+        "",
+        "A perplexity scored with a cache and one scored without are different",
+        "metrics; compare each only with its own kind. No other checkpoint's",
+        "perplexity is rendered, so this figure has nothing to be compared against",
+        "here.",
+        "",
+    ]
+
+
 # The columns the protocol omits and this harness set out to publish beside it,
 # each keyed on the result field it would arrive in. A section listing what is
 # missing is only honest while it is derived from the results rather than
@@ -489,17 +578,25 @@ EXTRA_COLUMNS = {
                     "checkpoint, per dataset — the lossless proof",
     "longctx": "TTFT and decode rate at 32k and 128k input, plain, from "
                "`prompts/longctx_*.json`",
-    "wikitext_ppl": "Wikitext-2 perplexity of the served checkpoint against its "
-                    "bf16/mxfp8 sibling",
+    "wikitext_ppl": "Wikitext-2 perplexity of the served checkpoint, from an "
+                    "`rmlx eval ppl` record given with `--ppl`",
     "humaneval_pass1": "pass@1 on the HumanEval subset, from these same "
                        "completions",
 }
 
 
-def missing_columns_block(results: list[dict]) -> list[str]:
+def is_measured(key: str, results: list[dict], ppl: dict | None) -> bool:
+    """Perplexity is measured by `rmlx eval ppl` and arrives as its own record;
+    every other column arrives in a result."""
+    if key == "wikitext_ppl":
+        return ppl is not None
+    return any(r.get(key) for r in results)
+
+
+def missing_columns_block(results: list[dict], ppl: dict | None) -> list[str]:
     """What a reader should not go looking for in the table above."""
     missing = [text for key, text in EXTRA_COLUMNS.items()
-               if not any(r.get(key) for r in results)]
+               if not is_measured(key, results, ppl)]
     if not missing:
         return []
     return [
@@ -525,6 +622,8 @@ def provenance_block(results: list[dict], snapshot: Path) -> list[str]:
         "",
         "| field | value |",
         "|---|---|",
+        f"| campaign | `{first['label']}` (the `label=` term in the notes of its "
+        "`runs.db` rows) |",
         f"| backend | {first.get('backend', '—')} "
         f"{first.get('backend_version', '')} ({first.get('build_profile', '—')}) |",
         f"| binary | `sha256:{binary.get('sha256', '—')[:16]}` |",
@@ -554,7 +653,7 @@ def provenance_block(results: list[dict], snapshot: Path) -> list[str]:
 
 
 def render(results: list[dict], snapshot: Path, bounds: dict, meta: dict,
-           command: str) -> str:
+           command: str, ppl: dict | None) -> str:
     plain = next((r for r in results if r["arm"] == "plain"), None)
     lines = [
         "<!-- GENERATED FILE — do not edit by hand. -->",
@@ -577,7 +676,9 @@ def render(results: list[dict], snapshot: Path, bounds: dict, meta: dict,
     for result in results:
         if result.get("fixed_prompt"):
             lines += fixed_table(result, bounds[(arm_label(result), "#fixed")])
-    lines += missing_columns_block(results)
+    if ppl is not None:
+        lines += ppl_block(ppl)
+    lines += missing_columns_block(results, ppl)
     lines += provenance_block(results, snapshot)
     return "\n".join(lines).rstrip() + "\n"
 
@@ -590,6 +691,12 @@ def load(paths: list[str]) -> list[dict]:
     for path in paths:
         with open(path, encoding="utf-8") as handle:
             results.append(json.load(handle))
+    for result in results:
+        if not result.get("label"):
+            raise InputError(
+                f"`{arm_label(result)}` carries no campaign label; it was not "
+                "written by a harness that files its runs under one"
+            )
     labels = [arm_label(r) for r in results]
     if len(set(labels)) != len(labels):
         raise InputError(
@@ -683,7 +790,8 @@ def run(args) -> str:
     }
 
     meta = {"bandwidth_gbs": bandwidth, "hardware_tag": first.get("hardware_tag", "—")}
-    return render(results, snapshot, bounds, meta, args.command)
+    ppl = load_ppl(args.ppl, snapshot) if args.ppl else None
+    return render(results, snapshot, bounds, meta, args.command, ppl)
 
 
 def main() -> int:
@@ -692,6 +800,9 @@ def main() -> int:
                     help="one spec_bench_published.sh result per engine mode")
     ap.add_argument("--model", required=True,
                     help="the verifier snapshot the runs measured")
+    ap.add_argument("--ppl", default=None,
+                    help="the JSON line `rmlx eval ppl --corpus wikitext-2` printed "
+                         "for this snapshot; adds the perplexity section")
     ap.add_argument("--out", default=None, help="write here instead of stdout")
     ap.add_argument("--bandwidth-gbs", type=float, default=None,
                     help="this host's memory bandwidth; required off the host "

@@ -3,8 +3,9 @@
 # speculative-decoding protocol.
 #
 # Usage:
-#   bash scripts/spec_bench_published.sh <verifier-snapshot-dir> [options]
+#   bash scripts/spec_bench_published.sh <verifier-snapshot-dir> --label NAME [options]
 #
+#     --label NAME             the campaign this run belongs to (required); see below
 #     --draft-model DIR        serve with this drafter (absent = plain decode)
 #     --draft-kind KIND        mtp | dflash | eagle3 | two_model | ...
 #     --draft-block-size N     block to ask the drafter for
@@ -31,6 +32,32 @@
 # window timed at the client. The two rings at GET /metrics/cache hold twenty
 # entries, so neither can carry a 128-sample dataset; the readings come out of
 # the run log, which holds one event per request.
+#
+# THE CAMPAIGN
+#
+# A published number comes from several runs — plain, and each speculative arm —
+# that have to be read together. `--label` names that set, and everything a run
+# leaves lives under one directory per label:
+#
+#   <RMLX_HOME>/bench/published/<label>/
+#     <run>/                 one run: <start time>-<model>-<arm>
+#       result.json          the run's result, carrying `label`
+#       passes/<n>/          the raw material of pass n: the engine's per-request
+#                            table, the client's reading of every request, the
+#                            memory poll, the fixed-prompt run, the server's run
+#                            log (`serve.jsonl`) and its stdout
+#       records/             what `ingest/published_ingest.py` staged for runs.db
+#       db_summary.json      the figures re-queried from runs.db after recording
+#     summary.md             the table, from `lib/published_table.py --out`
+#
+# The label reaches runs.db as `label=<label>;` at the start of `notes` on every
+# row, so `rmlx metrics query` finds a campaign's rows and
+# `lib/published_requery.py` checks they reproduce the result. The label names a
+# directory and enters a LIKE pattern, so it is lower-case letters, digits, `.`
+# and `-` only. A run never overwrites another: a directory that exists is an error.
+# `lib/published_table.py` takes one result per engine mode, so a label that holds
+# two runs of the same mode (a repeat, or a failed run's leftovers) cannot be
+# rendered with `*/result.json`: name the results to render, or use a new label.
 #
 # WHAT THE PROTOCOL DOES NOT STATE, AND WE THEREFORE CHOOSE AND PRINT
 #
@@ -83,6 +110,13 @@
 #                 docs/PROFILING.md §9 names) sampled at a fixed interval while
 #                 the fixed-prompt request is in flight, reported with the
 #                 interval — it is a gauge, so a sampled peak is a lower bound.
+#                 Beside it the engine's own Metal allocator peak, read off the
+#                 `generate: metal peak alloc` event of that request. It is the
+#                 high-water mark since the server started, in MiB, so it is
+#                 exact and not sampled, and it spans the warmup as well as the
+#                 request. A third-party column read off an MLX engine's own
+#                 peak-memory counter is this one; one read off the process is
+#                 the `phys_footprint` one.
 #
 # WHAT IS RECORDED ALONGSIDE THE NUMBERS
 #
@@ -134,7 +168,7 @@ BINARY="${REPO_ROOT}/target/release-perf/rmlx"
 RMLX_HOME="${RMLX_HOME:-${REPO_ROOT}/.rmlx}"
 LOG_DIR="${RMLX_HOME}/logs"
 SCRATCH_DIR="${RMLX_HOME}/tmp"
-RESULT_DIR="${RMLX_HOME}/bench/spec_bench_published"
+CAMPAIGN_ROOT="${RMLX_HOME}/bench/published"
 AWK_BUSIEST="${REPO_ROOT}/scripts/lib/busiest_between.awk"
 
 # ── Pinned protocol constants ────────────────────────────────────────────────
@@ -164,6 +198,7 @@ MEMORY_POLL_MS=250
 # ── Flags ────────────────────────────────────────────────────────────────────
 
 VERIFIER_MODEL=""
+LABEL=""
 DRAFTER_MODEL=""
 DRAFT_KIND=""
 DRAFT_BLOCK_SIZE=""
@@ -183,6 +218,7 @@ need_value() { [[ -n "${2:-}" ]] || { echo "ERROR: $1 requires a value" >&2; exi
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --label) need_value "$1" "${2:-}"; LABEL="$2"; shift 2 ;;
         --draft-model) need_value "$1" "${2:-}"; DRAFTER_MODEL="$2"; shift 2 ;;
         --draft-kind) need_value "$1" "${2:-}"; DRAFT_KIND="$2"; shift 2 ;;
         --draft-block-size) need_value "$1" "${2:-}"; DRAFT_BLOCK_SIZE="$2"; shift 2 ;;
@@ -207,6 +243,18 @@ if [[ -z "${VERIFIER_MODEL}" ]]; then
     echo "ERROR: a verifier snapshot directory is required." >&2
     echo "  Resolve a concrete path from LOCAL.md (gitignored):" >&2
     echo "  bash scripts/spec_bench_published.sh \$O_MODELS/<snapshot>" >&2
+    exit 1
+fi
+
+if [[ -z "${LABEL}" ]]; then
+    echo "ERROR: --label NAME is required: it names the campaign directory this" \
+         "run is filed under and the label its runs.db rows carry" >&2
+    exit 1
+fi
+if ! [[ "${LABEL}" =~ ^[a-z0-9][a-z0-9.-]{0,63}$ ]]; then
+    echo "ERROR: --label '${LABEL}' must be 1-64 characters of lower-case" \
+         "letters, digits, '.' and '-', starting with a letter or digit: it" \
+         "names a directory and enters a LIKE pattern" >&2
     exit 1
 fi
 
@@ -321,11 +369,16 @@ SNAPSHOT_SAMPLING="$(python3 "${REPO_ROOT}/scripts/lib/snapshot_sampling.py" \
     "${VERIFIER_MODEL}")" || exit 1
 SAMPLED="$(field_of "${SNAPSHOT_SAMPLING}" sampled)"
 
-mkdir -p "${LOG_DIR}" "${SCRATCH_DIR}" "${RESULT_DIR}"
+mkdir -p "${LOG_DIR}" "${SCRATCH_DIR}" "${CAMPAIGN_ROOT}/${LABEL}"
 WORK="$(mktemp -d "${SCRATCH_DIR}/published.XXXXXX")"
-# When the run started, in the shape §8.5 wants. Stamped once: the result file's
-# name and every row recorded from it name the same moment.
+# When the run started, in the shape §8.5 wants. Stamped once: the run
+# directory's name and every row recorded from it name the same moment.
 TS_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+RUN_DIR="${CAMPAIGN_ROOT}/${LABEL}/${TS_UTC//[-:]/}-${MODEL_NAME}-${ARM}"
+if ! mkdir "${RUN_DIR}"; then
+    echo "ERROR: ${RUN_DIR} already exists; a run does not overwrite another" >&2
+    exit 1
+fi
 
 # Three servers run per invocation. A SIGTERM to this script — a CI timeout, an
 # operator, a parent tearing down — would otherwise leave one alive holding the
@@ -706,6 +759,9 @@ for (( pass = 1; pass <= PASSES; pass++ )); do
     fi
     KV_QUANT_SEEN="${PASS_KV_QUANT}"
 
+    mkdir -p "${RUN_DIR}/passes/${pass}"
+    /bin/cp "${PASS_LOG}" "${RUN_DIR}/passes/${pass}/serve.jsonl"
+
     if ! python3 "${REPO_ROOT}/scripts/lib/published_run_log.py" "${PASS_LOG}" \
             --arm "${ARM}" \
             --expect-total "${REQUESTS_TOTAL}" \
@@ -742,7 +798,7 @@ for (( pass = 1; pass <= PASSES; pass++ )); do
                 > "${PASS_DIR}/fixed.json"; then
             exit 1
         fi
-        FIXED_FILES+=("${PASS_DIR}/fixed.json")
+        FIXED_FILES+=("${RUN_DIR}/passes/${pass}/fixed.json")
     fi
 
     if ! python3 "${REPO_ROOT}/scripts/lib/published_aggregate.py" pass \
@@ -752,7 +808,7 @@ for (( pass = 1; pass <= PASSES; pass++ )); do
             --cross-check-pct "${CROSS_CHECK_BAND_PCT}" > "${PASS_DIR}/pass.json"; then
         exit 1
     fi
-    PASS_FILES+=("${PASS_DIR}/pass.json")
+    PASS_FILES+=("${RUN_DIR}/passes/${pass}/pass.json")
 
     # What the run actually sampled under, off the engine's own event. The
     # checkpoint's file said what should happen; this says what did.
@@ -767,6 +823,9 @@ print(json.dumps(json.load(open(sys.argv[1]))["sampling"], sort_keys=True))' \
     fi
     SAMPLING_SEEN="${PASS_SAMPLING}"
 
+    /bin/cp -R "${PASS_DIR}/." "${RUN_DIR}/passes/${pass}/"
+    /bin/cp "${WORK}/server_${pass}.txt" "${RUN_DIR}/passes/${pass}/server_stdout.txt"
+
     echo "  [pass ${pass}] host window: ${WINDOW}"
     if ! $SYNTHETIC_ARMS; then
         echo "  [pass ${pass}] thermal: $(printf '%s; ' \
@@ -778,6 +837,7 @@ done
 # ── Report ───────────────────────────────────────────────────────────────────
 
 META="${WORK}/meta.json"
+LABEL="${LABEL}" \
 SYNTHETIC_ARMS="${SYNTHETIC_ARMS}" ARM="${ARM}" CLIENT_CLOCK="${CLIENT_CLOCK}" \
 MODEL_NAMESPACE="${MODEL_NAMESPACE}" MODEL_NAME="${MODEL_NAME}" \
 WEIGHT_QUANT="${WEIGHT_QUANT}" KV_QUANT_SEEN="${KV_QUANT_SEEN}" \
@@ -798,6 +858,7 @@ thermal = [r for r in os.environ["THERMAL_READINGS"].split("\n") if r]
 print(json.dumps({
     **json.loads(os.environ["RMLX_IDENTITY_JSON"]),
     "synthetic_arms": synthetic,
+    "label": os.environ["LABEL"],
     "arm": os.environ["ARM"],
     "model_namespace": os.environ["MODEL_NAMESPACE"],
     "model": os.environ["MODEL_NAME"],
@@ -847,7 +908,7 @@ print(json.dumps({
 }))
 PY
 
-RESULT="${RESULT_DIR}/${TS_UTC//[-:]/}-${MODEL_NAME}-${ARM}.json"
+RESULT="${RUN_DIR}/result.json"
 set +e
 python3 "${REPO_ROOT}/scripts/lib/published_aggregate.py" report \
     "${PASS_FILES[@]}" \
@@ -863,7 +924,7 @@ echo ""
 echo "sampling: ${SAMPLING_SEEN}  (read back from the engine)"
 echo "result: ${RESULT}"
 echo "  record it:  python3 scripts/ingest/published_ingest.py --record ${RESULT} --git-sha <sha>"
-echo "  render it:  python3 scripts/lib/published_table.py <result per mode> --model ${VERIFIER_MODEL}"
+echo "  render it:  python3 scripts/lib/published_table.py ${CAMPAIGN_ROOT}/${LABEL}/*/result.json --model ${VERIFIER_MODEL} [--ppl <rmlx eval ppl line>] --out ${CAMPAIGN_ROOT}/${LABEL}/summary.md"
 if $UNVERIFIED_SAMPLES; then
     echo "UNVERIFIED SAMPLES: not a published measurement, not recordable."
 fi

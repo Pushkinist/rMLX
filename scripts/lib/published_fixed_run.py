@@ -18,6 +18,12 @@ value seen at the poll interval is a lower bound on the true peak. The interval
 travels with the figure. A run with no sample at all is refused: a peak over
 nothing is not a small peak.
 
+THE METAL PEAK IS THE ENGINE'S OWN, and it is a different kind of figure: the
+allocator's high-water mark since the server started, read when the request
+ended (`row["metal_peak_alloc_mb"]`, MiB). It is exact, not sampled, and it
+covers the whole process life — the warmup before this request, not only this
+request.
+
 Exit codes: 0 — assembled; 1 — the readings do not describe one run of the
 fitted prompt; 2 — an input could not be read.
 """
@@ -144,6 +150,7 @@ def assemble(args):
         "prefill_tps": prompt_tokens / (ttft_ms / 1000.0),
         "phys_footprint_bytes": phys,
         "rss_bytes": rss,
+        "metal_peak_alloc_mb": row["metal_peak_alloc_mb"],
         "memory_samples": samples,
         "memory_poll_ms": args.memory_poll_ms,
     }

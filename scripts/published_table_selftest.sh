@@ -56,6 +56,7 @@ FAILED=0
 #   MTP:<py>     mutate the mtp result
 #   DFLASH:<py>  mutate the dflash result
 #   ONLY:a,b     which results to pass, by key (default plain,mtp,dflash)
+#   PPL:<py>     pass the perplexity record, mutated by <py> (bound as `result`)
 #   ARGS:<flag>  an extra flag for the emitter
 #   ABSENT:<re>  the output must NOT match this
 table_case() {
@@ -71,7 +72,7 @@ table_case() {
     CASE_ERR="${WORK}/${CASE_NAME}.err"
     CASE_BAD=""
 
-    local only="plain,mtp,dflash" absent="" model="${SNAPSHOT}"
+    local only="plain,mtp,dflash" absent="" model="${SNAPSHOT}" ppl_mutation=""
     local -a extra=() mutations=()
     local a
     for a in "$@"; do
@@ -79,6 +80,7 @@ table_case() {
         PLAIN:*|MTP:*|DFLASH:*) mutations+=("$a") ;;
         ONLY:*) only="${a#ONLY:}" ;;
         MODEL:*) model="${a#MODEL:}" ;;
+        PPL:*) ppl_mutation="${a#PPL:}" ;;
         ARGS:*) extra+=("${a#ARGS:}") ;;
         ABSENT:*) absent="${a#ABSENT:}" ;;
         esac
@@ -112,6 +114,20 @@ PY
 
     local -a inputs=()
     for key in ${only//,/ }; do inputs+=("${dir}/${key}.json"); done
+    if [ -n "${ppl_mutation}" ]; then
+        python3 - "${FIXTURES}/ppl.json" "${dir}/ppl.json" "${ppl_mutation}" <<'PY' || {
+import json, pathlib, sys
+
+src, out, mutation = sys.argv[1:4]
+result = json.loads(pathlib.Path(src).read_text(encoding="utf-8"))
+exec(mutation)
+pathlib.Path(out).write_text(json.dumps(result), encoding="utf-8")
+PY
+            CASE_BAD="the perplexity fixture could not be built"
+            return
+        }
+        extra+=(--ppl "${dir}/ppl.json")
+    fi
 
     python3 "${EMITTER}" "${inputs[@]}" --model "${model}" \
         ${extra[@]+"${extra[@]}"} >"${CASE_OUT}" 2>"${CASE_ERR}"
@@ -253,6 +269,32 @@ check_number resident_floor_matches_an_independent_derivation \
     "${FLOOR_RENDERED}" "$(oracle resident_floor_gb 1867 8192)" 0.005
 verdict
 
+# The Metal peak is recorded in MiB and printed in GB: 9118 MiB is 9.56 GB, where
+# reading the figure as MB would print 9.12. It has no bound, and says so.
+METAL_RENDERED="$(cell_at "${RENDERED}" '^\| peak Metal allocation' 1)"
+check_number metal_peak_is_converted_from_mib \
+    "the engine's MiB peak is printed as GB, not read as MB" \
+    "${METAL_RENDERED}" 9.56 0.005
+verdict
+
+table_case metal_peak_follows_the_result 0 \
+    "the Metal row is the result's peak, not a constant" "" \
+    PLAIN:'result["fixed_prompt"]["metal_peak_alloc_mb"]["max"] = 18000'
+verdict
+check_number metal_peak_follows_the_result_value \
+    "18000 MiB prints as 18.87 GB" \
+    "$(cell_at "${CASE_OUT}" '^\| peak Metal allocation' 1)" 18.87 0.005
+verdict
+
+CASE_NAME=metal_peak_has_no_bound
+CASE_WHAT="the Metal row carries no bound and no percentage of one"
+CASE_BAD=""; CASE_ERR="${WORK}/metal_bound.err"; : >"${CASE_ERR}"
+[ "$(cell_at "${RENDERED}" '^\| peak Metal allocation' 2)" = "—" ] ||
+    note_bad "the Metal row quotes a bound"
+[ "$(cell_at "${RENDERED}" '^\| peak Metal allocation' 3)" = "—" ] ||
+    note_bad "the Metal row quotes a percentage of a bound"
+verdict
+
 # ── The bound is derived from the run's own inputs ───────────────────────────
 
 # `mixed_k8g64_v4g64` and not `k8v8`: on this stack `k8v8` decodes off its bf16
@@ -355,6 +397,23 @@ table_case two_codecs_are_refused 1 \
     "rows compared down a column must have been measured at one codec" \
     'kv_quant=' \
     MTP:'result["kv_quant"] = "k8v8"'
+verdict
+
+table_case two_campaigns_are_refused 1 \
+    "runs filed under two labels are two campaigns, not two modes of one" \
+    'label=' \
+    MTP:'result["label"] = "another-campaign"'
+verdict
+
+table_case a_result_without_a_label_is_refused 1 \
+    "a result no campaign owns cannot be traced to its rows" \
+    'carries no campaign label' \
+    DFLASH:'del result["label"]'
+verdict
+
+table_case the_campaign_label_is_in_the_provenance 0 \
+    "the label that finds the rows in runs.db is printed beside the figures" \
+    '^\| campaign \| `fixture-campaign`'
 verdict
 
 table_case two_output_budgets_are_refused 1 \
@@ -500,6 +559,111 @@ verdict
 table_case an_absent_prefill_anchor_is_absent_not_guessed 0 \
     "without a runs.db anchor the input-speed bound is empty and says why" \
     'input-speed bound is empty on purpose'
+verdict
+
+# ── Perplexity ───────────────────────────────────────────────────────────────
+
+table_case ppl_record_is_rendered 0 \
+    "the record of the rendered checkpoint becomes a section, figure for figure" \
+    '^\| perplexity \| 7\.3412 \|' \
+    PPL:'pass'
+for want in '^\| scored tokens \| 287644 \|' '^\| windows \| 141 \|' \
+    '^\| window / stride \(tokens\) \| 4096 / 2048 \|' \
+    '^\| scorer \| no KV cache'; do
+    grep -qE -- "${want}" "${CASE_OUT}" || note_bad "no row matching /${want}/"
+done
+verdict
+
+table_case ppl_leaves_the_missing_list 0 \
+    "a column that is rendered is not also listed as not measured" \
+    'greedy token-match rate' \
+    PPL:'pass' \
+    ABSENT:'Wikitext-2 perplexity'
+verdict
+
+table_case ppl_through_a_cache_says_so 0 \
+    "a cached score names its codec, because it is a different metric" \
+    'through a real per-layer `k8v8` cache' \
+    PPL:'result["kv_quant"] = "k8v8"'
+verdict
+
+# The scorer prints the path it was run on, which is absolute on a real run.
+table_case ppl_path_is_compared_by_its_last_component 0 \
+    "an absolute path to the same snapshot is the same checkpoint" \
+    '^\| perplexity \| 7\.3412 \|' \
+    PPL:'result["model"] = "/some/where/fixture__published-table-16L"'
+verdict
+
+table_case another_checkpoints_ppl_is_refused 1 \
+    "a perplexity of another checkpoint is refused, not rendered beside this one" \
+    "scored the checkpoint 'other__model' where this table renders" \
+    PPL:'result["model"] = "/some/where/other__model"'
+verdict
+
+table_case another_corpus_ppl_is_refused 1 \
+    "a perplexity over another corpus is not this table's wikitext-2 figure" \
+    "scored the corpus 'c4' where this table names 'wikitext-2'" \
+    PPL:'result["corpus"] = "c4"'
+verdict
+
+table_case a_ppl_that_is_not_a_perplexity_is_refused 1 \
+    "a non-positive perplexity is refused rather than printed" \
+    'reports ppl=-1, which is not a perplexity' \
+    PPL:'result["ppl"] = -1'
+verdict
+
+table_case an_empty_ppl_window_count_is_refused 1 \
+    "a record that scored no windows has no perplexity to render" \
+    'reports windows=0, which is not a count' \
+    PPL:'result["windows"] = 0'
+verdict
+
+# ── `make published-table` and the perplexity record ─────────────────────────
+#
+# The checked-in record belongs to the checked-in snapshot. A real snapshot
+# refuses it, so the target passes it only when results and model are the
+# fixture's, and takes another only from the make command line.
+
+make_recipe() { # make_recipe [VAR=value ...] — the command `make published-table` would run
+    (cd "${REPO_ROOT}" && env -u PUBLISHED_TABLE_PPL ${MAKE_ENV:-} make -n --no-print-directory published-table "$@" 2>&1)
+}
+make_case() { # make_case <name> <what> <must-match-or-empty> <must-not-match-or-empty> [VAR=value ...]
+    CASE_NAME="$1"; CASE_WHAT="$2"; CASE_BAD=""; CASE_ERR="${WORK}/$1.err"; : >"${CASE_ERR}"
+    local want="$3" unwanted="$4"
+    shift 4
+    local out
+    out="$(make_recipe "$@")"
+    [ -z "${want}" ] || printf '%s' "${out}" | grep -qE -- "${want}" || note_bad "no /${want}/ in: ${out}"
+    [ -z "${unwanted}" ] || ! printf '%s' "${out}" | grep -qE -- "${unwanted}" || note_bad "unexpected /${unwanted}/ in: ${out}"
+}
+
+make_case make_renders_the_fixture_record_for_the_fixture \
+    "the default render carries the checked-in perplexity record" \
+    '--ppl scripts/fixtures/published_table/ppl.json' ''
+verdict
+
+make_case make_gives_a_real_model_no_fixture_record \
+    "a real snapshot is not handed the fixture's perplexity record" \
+    '--model /real/snapshot' '--ppl' \
+    PUBLISHED_TABLE_MODEL=/real/snapshot
+verdict
+
+make_case make_gives_real_results_no_fixture_record \
+    "real results rendered against the fixture snapshot get no fixture record either" \
+    '--model scripts/fixtures' '--ppl' \
+    PUBLISHED_TABLE_RESULTS=/real/result.json
+verdict
+
+make_case make_takes_a_record_from_the_command_line \
+    "a real run's record is given on the make command line" \
+    '--ppl /real/ppl.json' '' \
+    PUBLISHED_TABLE_MODEL=/real/snapshot PUBLISHED_TABLE_PPL=/real/ppl.json
+verdict
+
+MAKE_ENV="PUBLISHED_TABLE_PPL=/env/ppl.json" make_case make_does_not_read_the_record_from_the_environment \
+    "the environment cannot supply the record" \
+    '--model /real/snapshot' '--ppl' \
+    PUBLISHED_TABLE_MODEL=/real/snapshot
 verdict
 
 echo

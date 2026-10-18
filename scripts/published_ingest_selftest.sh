@@ -14,7 +14,10 @@
 # Each case starts from one synthetic result over the REAL checked-in sample
 # sets, applies one edit, and asserts the literal exit code and the reason. The
 # `rmlx` binary is a file with the marker literals in it; the recorder is a stub
-# that records what it was handed. No GPU, no model, no DB.
+# that files what it was handed in a small SQLite store of its own, with the
+# columns the real one has, and answers `metrics query` by running the SQL it is
+# sent against that store. So the re-query step's SQL is executed, not matched.
+# No GPU, no model, no real DB.
 #
 # Exit codes: 0 — every case behaved; 1 — at least one did not; 2 — the fixtures
 # themselves could not be built.
@@ -42,6 +45,7 @@ cat >"${BINARY}" <<'BINEOF'
 #!/bin/sh
 # generate_streaming: TTFT
 # generate: ITL stats
+# generate: metal peak alloc
 # generate: host categorical sampler active
 # cache-type resolved
 # mtp_generate: done
@@ -55,12 +59,81 @@ chmod +x "${BINARY}"
 # queue discipline is exercised: each record is moved into `pending/` only for
 # the moment the recorder claims it, and taken back out either way.
 STUB_RMLX="${WORK}/stub_rmlx"
-cat >"${STUB_RMLX}" <<STUBEOF
-#!/bin/sh
-# Log which file was handed over, from where.
-echo "\$4" >>"${WORK}/recorded.txt"
-exit \${STUB_RECORD_EXIT:-0}
-STUBEOF
+cat >"${WORK}/stub_rmlx.py" <<'STUBPY'
+"""rmlx metrics record --file F | rmlx metrics [--db D] query SQL
+
+Environment, all optional:
+  STUB_RECORD_EXIT    exit with this code instead of recording
+  STUB_QUERY_EXIT     exit with this code instead of answering a query
+  STUB_DOUBLE         file every record twice
+  STUB_DROP           do not file rows of this metric
+  STUB_SCALE          `<metric>:<factor>`, multiply that metric's value on filing
+"""
+import json, os, sqlite3, sys
+
+args = sys.argv[1:]
+if "--db" in args:
+    i = args.index("--db")
+    del args[i:i + 2]
+store = os.path.join(os.environ["RMLX_HOME"], "stub_runs.db")
+conn = sqlite3.connect(store)
+conn.executescript("""
+CREATE TABLE IF NOT EXISTS prompts (id INTEGER PRIMARY KEY, name TEXT NOT NULL, body TEXT);
+CREATE TABLE IF NOT EXISTS observations (
+    id INTEGER PRIMARY KEY, prompt_id INTEGER NOT NULL, metric TEXT NOT NULL,
+    value REAL NOT NULL, max_tokens INTEGER, ts_utc TEXT NOT NULL, notes TEXT,
+    decode_config TEXT);
+""")
+
+if args[:2] == ["metrics", "record"]:
+    with open(os.environ["STUB_RECORDED"], "a", encoding="utf-8") as handle:
+        handle.write(args[3] + "\n")
+    code = int(os.environ.get("STUB_RECORD_EXIT", "0"))
+    if code:
+        sys.exit(code)
+    record = json.load(open(args[3], encoding="utf-8"))
+    name = record["prompt"]["name"]
+    body = json.dumps(record["prompt"]["body"])
+    row = conn.execute("SELECT id FROM prompts WHERE name = ? AND body = ?", (name, body)).fetchone()
+    prompt_id = row[0] if row else conn.execute(
+        "INSERT INTO prompts (name, body) VALUES (?, ?)", (name, body)).lastrowid
+    scale_metric, _, factor = os.environ.get("STUB_SCALE", "").partition(":")
+    for _ in range(2 if os.environ.get("STUB_DOUBLE") else 1):
+        for metric in record["metrics"]:
+            if metric["value"] is None or metric["name"] == os.environ.get("STUB_DROP"):
+                continue
+            value = metric["value"] * (float(factor) if metric["name"] == scale_metric else 1.0)
+            conn.execute(
+                "INSERT INTO observations (prompt_id, metric, value, max_tokens, ts_utc, notes,"
+                " decode_config) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (prompt_id, metric["name"], value, record.get("max_tokens"), record["ts_utc"],
+                 record.get("notes"), record.get("decode_config")))
+            # Rows the store already holds that are not this run's: the same cell
+            # under another label, and under this label from an earlier run. Each
+            # is three times the value, so a query that lets either in moves a mean.
+            for decoy_ts, decoy_notes in (
+                (record["ts_utc"], record["notes"].replace("label=", "label=other-", 1)),
+                ("2026-01-01T00:00:00Z", record["notes"]),
+            ):
+                conn.execute(
+                    "INSERT INTO observations (prompt_id, metric, value, max_tokens, ts_utc,"
+                    " notes, decode_config) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (prompt_id, metric["name"], value * 3, record.get("max_tokens"), decoy_ts,
+                     decoy_notes, record.get("decode_config")))
+    conn.commit()
+elif args[:2] == ["metrics", "query"]:
+    code = int(os.environ.get("STUB_QUERY_EXIT", "0"))
+    if code:
+        print("stub: the store is unavailable", file=sys.stderr)
+        sys.exit(code)
+    cursor = conn.execute(args[2])
+    print("\t".join(c[0] for c in cursor.description))
+    for row in cursor:
+        print("\t".join("" if v is None else repr(v) if isinstance(v, float) else str(v) for v in row))
+else:
+    sys.exit("stub: unexpected arguments " + repr(args))
+STUBPY
+printf '#!/bin/sh\nexec python3 "%s" "$@"\n' "${WORK}/stub_rmlx.py" >"${STUB_RMLX}"
 chmod +x "${STUB_RMLX}"
 
 # ── The base result ───────────────────────────────────────────────────────────
@@ -83,7 +156,7 @@ for entry in manifest["datasets"][:2]:
 
 samples = []
 for number in (1, 2, 3):
-    for dataset, sample in chosen:
+    for index, (dataset, sample) in enumerate(chosen):
         samples.append({
             "pass": number,
             "cell": f"{dataset}@1024",
@@ -94,7 +167,7 @@ for number in (1, 2, 3):
             "prompt_tokens": 512,
             "completion_tokens": 900,
             "ttft_ms": 210.0 + number,
-            "decode_tps": 40.0 + number * 0.1,
+            "decode_tps": 40.0 + number * 0.1 + index * 0.5,
             "client_decode_tps": 40.0,
         })
 
@@ -109,6 +182,7 @@ markers = {
     for m in (
         "generate_streaming: TTFT",
         "generate: ITL stats",
+        "generate: metal peak alloc",
         "generate: host categorical sampler active",
         "cache-type resolved",
     )
@@ -125,6 +199,26 @@ def summary(values):
     }
 
 
+def mean(values):
+    return sum(values) / len(values)
+
+
+cells = {}
+for dataset in dict.fromkeys(d for d, _ in chosen):
+    name = f"{dataset}@1024"
+    rows = [r for r in samples if r["cell"] == name]
+    entry = summary([mean([r["decode_tps"] for r in rows if r["pass"] == n]) for n in (1, 2, 3)])
+    entry.update({
+        "dataset": dataset,
+        "max_tokens": 1024,
+        "samples": len(rows) // 3,
+        "ttft_ms_mean": mean([r["ttft_ms"] for r in rows]),
+    })
+    cells[name] = entry
+macro = summary([mean([c["pass_means"][n] for c in cells.values()]) for n in (0, 1, 2)])
+macro.update({"cells": list(cells), "max_tokens": 1024})
+
+
 out.write_text(json.dumps({
     "schema_version": 1,
     "backend": "rmlx",
@@ -132,6 +226,7 @@ out.write_text(json.dumps({
     "build_profile": "release-perf",
     "hardware_tag": "m5_max_128gb",
     "synthetic_arms": False,
+    "label": "published-protocol-test",
     "unverified_samples": False,
     "arm": "plain",
     "model_namespace": "mlx-community",
@@ -163,8 +258,8 @@ out.write_text(json.dumps({
              "thermal": ["pass 1 start nominal"],
              "thermal_source": "pmset -g therm",
              "taint": ""},
-    "cells": {},
-    "macro": {},
+    "cells": cells,
+    "macro": macro,
     "fixed_prompt": {
         "prompt_tokens": 1355,
         "target_tokens": 1355,
@@ -187,6 +282,8 @@ out.write_text(json.dumps({
                                  "max": 31_000_000_000, "min": 31_000_000_000},
         "rss_bytes": {"run_values": [29_000_000_000] * 3,
                       "max": 29_000_000_000, "min": 29_000_000_000},
+        "metal_peak_alloc_mb": {"run_values": [28_100, 28_300, 28_200],
+                                "max": 28_300, "min": 28_100},
     },
     "samples": samples,
 }, indent=1), encoding="utf-8")
@@ -238,6 +335,7 @@ PY
 
     rm -f "${WORK}/recorded.txt"
     env RMLX_HOME="${CASE_HOME}" RMLX_REPO_ROOT="${REPO_ROOT}" \
+        STUB_RECORDED="${WORK}/recorded.txt" \
         python3 "${INGEST}" "${CASE_RESULT}" \
         --rmlx-bin "${STUB_RMLX}" \
         ${extra_args[@]+"${extra_args[@]}"} >"${CASE_OUT}" 2>&1
@@ -266,10 +364,10 @@ verdict() {
 
 # The records this case staged, as a JSON array.
 staged_records() {
-    python3 - "${CASE_HOME}" <<'PY'
+    python3 - "$(dirname "${CASE_RESULT}")" <<'PY'
 import json, pathlib, sys
 
-root = pathlib.Path(sys.argv[1]) / "bench" / "spec_bench_published" / "records"
+root = pathlib.Path(sys.argv[1]) / "records"
 files = sorted(root.glob("*.json")) if root.is_dir() else []
 print(json.dumps([json.loads(f.read_text(encoding="utf-8")) for f in files]))
 PY
@@ -312,8 +410,17 @@ BODIES
 [ "$(recs_check "__import__('json').dumps(sorted(__import__('hashlib').sha256(__import__('json').dumps(r['prompt']['body'], ensure_ascii=False, separators=(',', ':')).encode()).hexdigest() for r in recs if not r['prompt']['name'].startswith('published/fixed_')))")" = "${WANT_BODIES}" ] ||
     note_bad "the submitted bodies are not the measured ones"
 [ "$(recs_check "sorted({m['name'] for r in recs for m in r['metrics']})")" = \
-  "['accept_rate', 'accepted_per_step', 'decode_tps_warm', 'peak_phys_footprint_mb', 'peak_rss_mb', 'prefill_tps', 'tokens_per_round', 'ttft_warm_ms']" ] ||
+  "['accept_rate', 'accepted_per_step', 'decode_tps_warm', 'metal_peak_alloc_mb', 'peak_phys_footprint_mb', 'peak_rss_mb', 'prefill_tps', 'tokens_per_round', 'ttft_warm_ms']" ] ||
     note_bad "metrics=$(recs_check "sorted({m['name'] for r in recs for m in r['metrics']})")"
+verdict
+
+# The allocator's own peak is recorded as the maximum over the three runs, in
+# the MiB the registry's `metal_peak_alloc_mb` is written in, and only on the
+# fixed-prompt row: a sample row has no such reading.
+ingest_case metal_peak_is_the_max_over_runs_on_the_fixed_row 0 \
+    "the Metal peak is a maximum, in MiB, on the fixed row alone" ""
+[ "$(recs_check "[m['value'] for r in recs for m in r['metrics'] if m['name'] == 'metal_peak_alloc_mb']")" = "[28300]" ] ||
+    note_bad "metal peak rows=$(recs_check "[m['value'] for r in recs for m in r['metrics'] if m['name'] == 'metal_peak_alloc_mb']")"
 verdict
 
 # A plain run has no round loop, so its round figures are null and not zero: a
@@ -555,6 +662,95 @@ STUB_RECORD_EXIT=1 ingest_case a_failed_ingest_keeps_its_record 1 \
     note_bad "a rejected record was left in the pending queue"
 [ "$(recs_check "len(recs)")" = "5" ] ||
     note_bad "$(recs_check "len(recs)") records survived in staging"
+verdict
+
+# ── The campaign label, and the check that the rows reproduce the result ──────
+
+ingest_case label_leads_the_notes_of_every_row 0 \
+    "a campaign's rows are found by label=<label>; at the start of notes" ""
+[ "$(recs_check "all(r['notes'].startswith('label=published-protocol-test; ') for r in recs)")" = "True" ] ||
+    note_bad "a row's notes do not start with the label: $(recs_check "recs[0]['notes'][:60]")"
+verdict
+
+ingest_case unlabelled_result_is_refused 2 \
+    "rows that could not be found again as one campaign are not written" \
+    "carries no valid label" \
+    'MUTATE:del result["label"]'
+verdict
+[ -d "$(dirname "${CASE_RESULT}")/records" ] && note_bad "a refused result staged records"
+
+ingest_case label_with_an_underscore_is_refused 2 \
+    "an underscore would be a LIKE wildcard, so it is not in a label" \
+    "carries no valid label" \
+    'MUTATE:result["label"] = "bad_label"'
+verdict
+
+ingest_case label_with_an_uppercase_letter_is_refused 2 \
+    "a label is lower-case, because it names a directory" \
+    "carries no valid label" \
+    'MUTATE:result["label"] = "BadLabel"'
+verdict
+
+ingest_case label_with_a_trailing_newline_is_refused 2 \
+    "a label that only matches up to a newline is not a label" \
+    "carries no valid label" \
+    'MUTATE:result["label"] = "abc\n"'
+verdict
+
+ingest_case recorded_rows_reproduce_the_result 0 \
+    "the means are rebuilt from this run's rows alone, though the store also holds another label's and an earlier run's" \
+    "the rows reproduce the result" ARGS:--record
+SUMMARY="$(dirname "${CASE_RESULT}")/db_summary.json"
+[ "$(python3 -c 'import json, sys
+d = json.load(open(sys.argv[1]))
+print(sorted(d["cells"]), d["fixed_prompt"]["metal_peak_alloc_mb"], round(d["macro_decode_tps"], 6))' "${SUMMARY}" 2>&1)" = \
+  "['math_500@1024', 'mt_bench@1024'] 28300.0 40.95" ] ||
+    note_bad "db_summary.json: $(cat "${SUMMARY}" 2>&1 | tr -d '\n ' | cut -c1-200)"
+verdict
+
+STUB_SCALE=decode_tps_warm:1.01 ingest_case a_value_that_moved_into_the_store_is_refused 1 \
+    "rows whose mean is not the result's mean are not the measurement" \
+    "re-query DISAGREES: cell mt_bench@1024: the rows give a mean decode_tps" ARGS:--record
+verdict
+
+STUB_SCALE=metal_peak_alloc_mb:1.01 ingest_case a_fixed_row_that_moved_is_refused 1 \
+    "the fixed-prompt row is held to the result like the cells" \
+    "re-query DISAGREES: fixed prompt: the row gives metal_peak_alloc_mb" ARGS:--record
+verdict
+
+STUB_DOUBLE=1 ingest_case a_result_recorded_twice_is_refused 1 \
+    "twice the rows is not the run: a duplicate is found, not averaged away" \
+    "already written. The store is append-only, so there is nothing to undo" ARGS:--record
+verdict
+
+STUB_DROP=ttft_warm_ms ingest_case a_lost_row_is_refused 1 \
+    "a metric the store never filed is a partial record" \
+    "0 TTFT rows where the result measured 2 samples" ARGS:--record
+verdict
+
+STUB_QUERY_EXIT=1 ingest_case an_unanswered_query_fails_the_record 1 \
+    "a store that cannot be read back leaves the record unverified, and says so" \
+    "re-query FAILED: .rmlx metrics query. exited 1" ARGS:--record
+verdict
+
+ingest_case a_macro_the_rows_do_not_reproduce_is_refused 1 \
+    "the headline is rebuilt from the rows, not copied from the result" \
+    "re-query DISAGREES: macro: the rows give a mean" ARGS:--record \
+    'MUTATE:result["macro"]["mean"] = result["macro"]["mean"] * 1.5'
+verdict
+
+# The standalone reader: no row for the label, because nothing was recorded.
+CASE_NAME=requery_of_an_unrecorded_run_is_refused
+CASE_WHAT="a run that was never recorded has no rows to reproduce it"
+CASE_BAD=""
+CASE_OUT="${WORK}/requery_unrecorded.log"
+mkdir -p "${WORK}/requery_home"
+env RMLX_HOME="${WORK}/requery_home" STUB_RECORDED="${WORK}/recorded.txt" \
+    python3 "${REPO_ROOT}/scripts/lib/published_requery.py" "${BASE}" \
+    --rmlx-bin "${STUB_RMLX}" --out "${WORK}/requery_unrecorded.json" >"${CASE_OUT}" 2>&1
+got=$?
+[ "${got}" -ne 1 ] && note_bad "exit=${got} (want 1)"
+grep -q "the run was not recorded" "${CASE_OUT}" || note_bad "missing /the run was not recorded/"
 verdict
 
 echo

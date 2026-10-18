@@ -187,6 +187,20 @@ fi
 DATEEOF
 chmod +x "${SHIMS}/sleep" "${SHIMS}/pmset" "${SHIMS}/date"
 
+# A harness started in the same second as an earlier one files its run under the
+# same name. The run's start stamp is the only thing that varies it, so a case
+# that needs the collision pins the stamp and leaves every other `date` call to
+# the shim above.
+mkdir -p "${WORK}/fixed_ts"
+cat >"${WORK}/fixed_ts/date" <<DATEEOF
+#!/bin/sh
+case "\$*" in
+*%Y-%m-%dT%H:%M:%SZ*) echo 2026-09-06T00:00:00Z ;;
+*) exec "${SHIMS}/date" "\$@" ;;
+esac
+DATEEOF
+chmod +x "${WORK}/fixed_ts/date"
+
 # A Mac that posted a level and is at full speed, one that is being held back,
 # and one where the tool is not there to ask.
 for spec in nominal:100 throttled:62; do
@@ -269,6 +283,9 @@ Per request it appends to the run log the events the harness reads back:
 
   generate_streaming: TTFT               unless capped by STUB_TTFT_LINES
   generate: ITL stats                    unless capped by STUB_ITL_LINES
+  generate: metal peak alloc             plain arm only, unless capped by
+                                         STUB_PEAK_LINES; rises 100 MiB per
+                                         request unless STUB_METAL_PEAK_MB
   generate: host categorical sampler active
                                          unless STUB_SAMPLED=0, capped by
                                          STUB_SAMPLER_LINES
@@ -327,6 +344,16 @@ ITL_MEAN_MS = os.environ.get("STUB_ITL_MEAN_MS", "")
 # request 1 of every pass, so this is how a disagreement can be staged on the
 # cells without the fixed prompt tripping the same guard first.
 ITL_MEAN_FROM = int(os.environ.get("STUB_ITL_MEAN_FROM", "0"))
+PEAK_LINES = int(os.environ.get("STUB_PEAK_LINES", "-1"))
+# Within one server the allocator's peak never falls, so the stub's rises by 100
+# MiB per served request: the warmup, the fixed prompt and each cell read
+# differently, and a reader that took the wrong request's event gets another
+# number. Each pass is a new server, and these offsets make the three fixed-prompt
+# readings 28100, 30100 and 28600, so their maximum is neither their mean, their
+# minimum nor the last one.
+PEAK_PASS_OFFSET_MB = {1: 0, 2: 2000, 3: 500}
+PEAK_BASE_MB = 28000
+PEAK_FIXED_MB = os.environ.get("STUB_METAL_PEAK_MB", "")
 SAMPLED = os.environ.get("STUB_SAMPLED", "1") == "1"
 SAMPLER_LINES = int(os.environ.get("STUB_SAMPLER_LINES", "-1"))
 SAMPLER_TOP_K = int(os.environ.get("STUB_SAMPLER_TOP_K", "20"))
@@ -564,6 +591,10 @@ class Handler(BaseHTTPRequestHandler):
             log(event({"message": "generate: ITL stats", "model_id": "stub",
                        "step_count": TOKENS, "p50_ms": mean, "p95_ms": mean,
                        "p99_ms": mean, "mean_ms": mean, "itl_spikes": 0}))
+        if not SPECULATIVE and (PEAK_LINES < 0 or served < PEAK_LINES):
+            peak = int(PEAK_FIXED_MB) if PEAK_FIXED_MB else PEAK_BASE_MB + PEAK_PASS_OFFSET_MB.get(PASS, 0) + 100 * served
+            log(event({"message": "generate: metal peak alloc",
+                       "model_id": "stub", "metal_peak_alloc_mb": peak}))
         if SPECULATIVE or FORCE_DONE:
             log(done_line(round(1000.0 / this_gap_ms, 6)))
         served += 1
@@ -604,6 +635,7 @@ set -eu
 # markers: generate_streaming: TTFT | generate: ITL stats
 # markers: generate: host categorical sampler active | cache-type resolved
 # markers: mtp_generate: done
+# markers: generate: metal peak alloc
 case "\$1" in
 metrics)
 	case "\$2" in
@@ -667,6 +699,14 @@ ln -s "${REPO_ROOT}/prompts" "${MARKERLESS_ROOT}/prompts"
 grep -v 'generate: ITL stats' "${STUB}" >"${MARKERLESS_ROOT}/target/release-perf/rmlx"
 chmod +x "${MARKERLESS_ROOT}/target/release-perf/rmlx"
 
+# The same, losing the Metal peak literal instead.
+NOPEAK_ROOT="${WORK}/repo_nopeak"
+mkdir -p "${NOPEAK_ROOT}/target/release-perf"
+ln -s "${REPO_ROOT}/scripts" "${NOPEAK_ROOT}/scripts"
+ln -s "${REPO_ROOT}/prompts" "${NOPEAK_ROOT}/prompts"
+grep -v 'generate: metal peak alloc' "${STUB}" >"${NOPEAK_ROOT}/target/release-perf/rmlx"
+chmod +x "${NOPEAK_ROOT}/target/release-perf/rmlx"
+
 # A port this host is not already using. Probed rather than assumed: a foreign
 # listener would answer the readiness poll and the suite would measure it.
 PORT="$(python3 -c '
@@ -689,7 +729,8 @@ sys.exit("no free port in 18000-19999")
 
 # run_case <name> <want-exit> <what-it-proves> [KEY=VALUE ...] [ARGS:flag ...]
 #          [HOST:quiet|hostile|flaky] [THERM:nominal|throttled|unreadable]
-#          [VERIFIER:dir] [MEASURED:1] [CANONICAL:1] [MARKERLESS:1]
+#          [VERIFIER:dir] [MEASURED:1] [CANONICAL:1] [MARKERLESS:itl|peak]
+#          [LABEL:name | NOLABEL:1] [FIXED_TS:1] [PREDIR:path-under-home ...]
 #          [CLIENT_SHIM:N] [NO_STAMPS:1] [STUB:<stub server arguments>]
 #          [GREP:pat ...] [NOGREP:pat ...]
 #
@@ -718,16 +759,21 @@ run_case() {
 
     local env_pairs=() greps=() nogreps=() extra_args=() host="quiet" a
     local synthetic=true verifier="${VERIFIER}" canonical=false
-    local therm="${SHIMS}" markerless=false delayed=0 stamps=true stub_args="" prelog=""
+    local therm="${SHIMS}" markerless="" delayed=0 stamps=true stub_args="" prelog=""
+    local label="selftest-campaign" fixed_ts="" predirs=()
     for a in "$@"; do
         case "$a" in
+        LABEL:*) label="${a#LABEL:}" ;;
+        NOLABEL:*) label="" ;;
+        FIXED_TS:*) fixed_ts="${WORK}/fixed_ts:" ;;
+        PREDIR:*) predirs+=("${a#PREDIR:}") ;;
         GREP:*) greps+=("${a#GREP:}") ;;
         NOGREP:*) nogreps+=("${a#NOGREP:}") ;;
         ARGS:*) extra_args+=("${a#ARGS:}") ;;
         HOST:*) host="${a#HOST:}" ;;
         MEASURED:*) synthetic=false ;;
         CANONICAL:*) canonical=true ;;
-        MARKERLESS:*) markerless=true ;;
+        MARKERLESS:*) markerless="${a#MARKERLESS:}" ;;
         CLIENT_SHIM:*) delayed="${a#CLIENT_SHIM:}" ;;
         NO_STAMPS:*) stamps=false ;;
         STUB:*) stub_args="${stub_args} ${a#STUB:}" ;;
@@ -739,6 +785,8 @@ run_case() {
     done
     $synthetic && extra_args+=(--synthetic-arms)
     $stamps && extra_args+=(--server-stamps)
+    [ -n "${label}" ] && extra_args+=(--label "${label}")
+    for a in ${predirs[@]+"${predirs[@]}"}; do mkdir -p "${CASE_HOME}/${a}"; done
     write_client_shim "${CASE_HOME}/client" "${delayed}"
     printf '%s\n' "--marks ${CASE_HOME}/client${stub_args}" >"${CASE_HOME}/stub_args"
     # A run log an earlier rmlx process left in this second: every server of the
@@ -756,14 +804,17 @@ LOGEOF
     if $canonical; then
         root="${CANON_ROOT}"
     else
-        $markerless && root="${MARKERLESS_ROOT}"
+        case "${markerless}" in
+        itl) root="${MARKERLESS_ROOT}" ;;
+        peak) root="${NOPEAK_ROOT}" ;;
+        esac
         extra_args+=(--samples-root "${SAMPLES}")
     fi
 
     CASE_OUT="${WORK}/${CASE_NAME}.log"
     local got=0
     env -i \
-        PATH="${CASE_HOME}/client/bin:${WORK}/${host}:${therm}:${SHIMS}:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+        PATH="${CASE_HOME}/client/bin:${fixed_ts}${WORK}/${host}:${therm}:${SHIMS}:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
         HOME="${WORK}" \
         RMLX_HOME="${CASE_HOME}" \
         STUB_BOUND_FLAG="${CASE_HOME}/stub_bound" \
@@ -810,7 +861,7 @@ verdict() {
 # The result file this case wrote, or the empty string.
 result_of() {
     local hits
-    hits=$(echo "${CASE_HOME}"/bench/spec_bench_published/*.json)
+    hits=$(echo "${CASE_HOME}"/bench/published/*/*/result.json)
     case "${hits}" in
     *'*'*) echo "" ;;
     *) echo "${hits%% *}" ;;
@@ -1548,11 +1599,80 @@ verdict
 
 run_case binary_missing_a_marker_refused 1 \
     "a binary that cannot write a reading's event is refused before it serves" \
-    MARKERLESS:1 \
+    MARKERLESS:itl \
     'GREP:contains none of .generate: ITL stats' \
     'GREP:cannot write the event this run reads its decode_rate from' \
     'NOGREP:\[server\] pid='
 no_result
+verdict
+
+# ── The campaign ──────────────────────────────────────────────────────────────
+#
+# One directory per label, one subdirectory per run, the raw material of every
+# pass beside the result. The label is what finds a campaign's rows in runs.db
+# afterwards, so it is required and it is held to the characters a directory
+# name and a LIKE pattern both accept.
+
+run_case label_is_required 1 \
+    "a run no campaign owns would leave rows nobody could find as one set" \
+    NOLABEL:1 \
+    'GREP:label NAME is required' \
+    'NOGREP:\[server\] pid='
+no_result
+verdict
+
+label_n=0
+for bad in Upper under_score a/b -lead 'a b'; do
+    label_n=$((label_n + 1))
+    run_case "label_${label_n}_is_refused" 1 \
+        "label '${bad}' names a directory and enters a LIKE pattern, so it is refused" \
+        "LABEL:${bad}" \
+        'GREP:must be 1-64 characters of lower-case' \
+        'NOGREP:\[server\] pid='
+    no_result
+    verdict
+done
+
+run_case campaign_layout 0 \
+    "a run is filed under its label, with every pass's raw material beside the result" \
+    FIXED_TS:1
+RUN="${CASE_HOME}/bench/published/selftest-campaign/20260906T000000Z-stub-model-plain"
+[ -f "${RUN}/result.json" ] || note_bad "no result.json at ${RUN#${CASE_HOME}/}"
+[ "$(jq_of "r['label']")" = "selftest-campaign" ] ||
+    note_bad "label=$(jq_of "r['label']")"
+for n in 1 2 3; do
+    for f in engine.json engine_with_fixed.json fixed.json fixed.kv index.tsv memory.txt \
+        pass.json serve.jsonl; do
+        [ -s "${RUN}/passes/${n}/${f}" ] || note_bad "passes/${n}/${f} is missing or empty"
+    done
+    # The stub server prints nothing, so the file is there and may be empty.
+    [ -e "${RUN}/passes/${n}/server_stdout.txt" ] || note_bad "passes/${n}/server_stdout.txt is missing"
+
+done
+[ -e "${CASE_HOME}/bench/spec_bench_published" ] &&
+    note_bad "a result was also filed at the old location"
+# The pass files the result was built from are the filed ones.
+[ "$(python3 -c 'import json, sys
+r = json.load(open(sys.argv[1]))
+p = json.load(open(sys.argv[2]))
+print(len(r["samples"]) == 3 * len(p["samples"]))' "${RUN}/result.json" "${RUN}/passes/1/pass.json")" = "True" ] ||
+    note_bad "the filed pass.json is not one of the three the result was built from"
+verdict
+
+run_case a_run_does_not_overwrite_another 1 \
+    "a run directory that exists is an error, never reused" \
+    FIXED_TS:1 \
+    PREDIR:bench/published/selftest-campaign/20260906T000000Z-stub-model-plain \
+    'GREP:already exists; a run does not overwrite another' \
+    'NOGREP:\[server\] pid='
+no_result
+verdict
+
+run_case another_campaigns_run_is_no_collision 0 \
+    "the same start stamp under another label is another run" \
+    FIXED_TS:1 \
+    LABEL:another-campaign \
+    PREDIR:bench/published/selftest-campaign/20260906T000000Z-stub-model-plain
 verdict
 
 # ── Thermal state ─────────────────────────────────────────────────────────────
@@ -1920,6 +2040,40 @@ close_to "$(jq_of "r['fixed_prompt']['prefill_tps']['mean']")" 32261.9 0.0001 ||
     note_bad "phys peak=$(jq_of "r['fixed_prompt']['phys_footprint_bytes']['max']")"
 [ "$(jq_of "r['fixed_prompt']['rss_bytes']['max']")" = "29000000000" ] ||
     note_bad "rss peak=$(jq_of "r['fixed_prompt']['rss_bytes']['max']")"
+# The stub's allocator peak rises 100 MiB per served request from 28000 plus a
+# per-pass offset, and the fixed prompt is the second request of each server: its
+# own event reads 28100 in pass 1, not the warmup's 28000 or the first cell's
+# 28200. The three runs are 28100, 30100 and 28600, and the block keeps their
+# maximum, not their mean, their minimum or the last.
+[ "$(jq_of "r['fixed_prompt']['metal_peak_alloc_mb']['run_values']")" = "[28100, 30100, 28600]" ] ||
+    note_bad "metal peak runs=$(jq_of "r['fixed_prompt']['metal_peak_alloc_mb']['run_values']")"
+[ "$(jq_of "r['fixed_prompt']['metal_peak_alloc_mb']['max']")" = "30100" ] ||
+    note_bad "metal peak max=$(jq_of "r['fixed_prompt']['metal_peak_alloc_mb']['max']")"
+[ "$(jq_of "r['fixed_prompt']['metal_peak_alloc_mb']['min']")" = "28100" ] ||
+    note_bad "metal peak min=$(jq_of "r['fixed_prompt']['metal_peak_alloc_mb']['min']")"
+verdict
+
+run_case metal_peak_event_missing_refused 1 \
+    "a plain log missing a request's Metal peak event is refused" \
+    'STUB_PEAK_LINES=5' \
+    "GREP:Metal peak events, expected ${EVENTS_PER_PASS}"
+no_result
+verdict
+
+run_case metal_peak_of_zero_refused 1 \
+    "a Metal peak that reads zero is not a peak and is refused" \
+    'STUB_METAL_PEAK_MB=0' \
+    'GREP:not a peak allocation'
+no_result
+verdict
+
+run_case binary_missing_metal_peak_marker_refused 1 \
+    "a binary that cannot write the Metal peak event is refused before it serves" \
+    MARKERLESS:peak \
+    'GREP:contains none of .generate: metal peak alloc' \
+    'GREP:cannot write the event this run reads its metal_peak from' \
+    'NOGREP:\[server\] pid='
+no_result
 verdict
 
 # The protocol's fixed-prompt figure is the AUTOREGRESSIVE one. A rate a drafter
@@ -2038,7 +2192,7 @@ sigterm_case() {
         STUB_TOKEN_BASE=100 \
         bash "${FAKE_ROOT}/scripts/spec_bench_published.sh" \
         "${VERIFIER}" --port "${PORT}" --samples-root "${SAMPLES}" \
-        --synthetic-arms --server-stamps >"${CASE_OUT}" 2>&1 &
+        --label selftest-campaign --synthetic-arms --server-stamps >"${CASE_OUT}" 2>&1 &
     local harness=$!
 
     request_held_or_harness_gone() {

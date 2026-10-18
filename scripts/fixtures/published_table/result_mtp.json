@@ -5,6 +5,7 @@
  "build_profile": "release-perf",
  "hardware_tag": "m5_max_128gb",
  "synthetic_arms": true,
+ "label": "fixture-campaign",
  "unverified_samples": false,
  "arm": "speculative",
  "model_namespace": "fixture",

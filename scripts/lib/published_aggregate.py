@@ -316,8 +316,9 @@ def macro_cell_per_dataset(cells, macro_max_tokens):
 FIXED_RATES = ("decode_tps", "prefill_tps")
 # Peaks, not scores. A peak over three runs is their maximum; a mean of three
 # peaks is not a peak of anything, and a range band over a resident figure would
-# refuse an allocator's ordinary behaviour.
-FIXED_PEAKS = ("phys_footprint_bytes", "rss_bytes")
+# refuse an allocator's ordinary behaviour. The first two are sampled gauges in
+# bytes; the Metal peak is the allocator's own high-water mark, in MiB.
+FIXED_PEAKS = ("phys_footprint_bytes", "rss_bytes", "metal_peak_alloc_mb")
 FIXED_REPORTED = ("ttft_ms", "completion_tokens")
 
 
@@ -568,10 +569,16 @@ def print_table(result, range_pct):
             )
         for name in FIXED_PEAKS:
             peak = block[name]
-            print(
-                f"    {name:<10} {peak['max'] / 1e6:>10.1f} MB peak over the three "
-                "runs, sampled every " + f"{block['memory_poll_ms']} ms"
-            )
+            if name.endswith("_mb"):
+                print(
+                    f"    {name:<10} {peak['max']:>10.0f} MiB peak over the three "
+                    "runs, the allocator's own high-water mark"
+                )
+            else:
+                print(
+                    f"    {name:<10} {peak['max'] / 1e6:>10.1f} MB peak over the three "
+                    "runs, sampled every " + f"{block['memory_poll_ms']} ms"
+                )
 
     refused = [n for n, c in result["cells"].items() if not c["stable"]]
     refused += [

@@ -175,7 +175,7 @@ is the surrogate `id`.
 | `n_measure`       | Measured runs behind `value`. |
 | `output_first_64` | Start of the generated text, to compare temp-0 output across builds. |
 | `decode_stddev`   | Stddev across the measured runs, when the emitter sends one. |
-| `notes`           | Machine-written by the emitter. |
+| `notes`           | Machine-written by the emitter. The published-protocol harness starts it with `label=<label>;`, the campaign the row belongs to; find one with `notes LIKE 'label=<label>;%'`. |
 | `description`     | Written by a person or an agent: why the run exists and what changed (`METRICS_DB.md` §6). |
 | `inserted_utc`    | When the row was written. |
 | `inserted_by`     | `<tool>@<semver>`, e.g. `rmlx-cli@<semver>`. |

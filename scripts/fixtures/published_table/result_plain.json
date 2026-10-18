@@ -5,6 +5,7 @@
  "build_profile": "release-perf",
  "hardware_tag": "m5_max_128gb",
  "synthetic_arms": true,
+ "label": "fixture-campaign",
  "unverified_samples": false,
  "arm": "plain",
  "model_namespace": "fixture",
@@ -210,6 +211,15 @@
    ],
    "max": 9418000000,
    "min": 9401000000
+  },
+  "metal_peak_alloc_mb": {
+   "run_values": [
+    9102,
+    9118,
+    9110
+   ],
+   "max": 9118,
+   "min": 9102
   }
  }
 }

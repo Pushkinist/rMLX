@@ -1,0 +1,1 @@
+{"ppl": 7.3412, "mean_nll": 1.9937, "scored_tokens": 287644, "windows": 141, "ctx_window": 4096, "stride": 2048, "n_tokens": 287644, "corpus": "wikitext-2", "model": "fixture__published-table-16L", "arch": "Qwen3ForCausalLM", "load_ms": 1200.0, "score_ms": 90500.0, "kv_quant": null, "decode_config": null}

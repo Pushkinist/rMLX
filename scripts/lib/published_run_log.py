@@ -36,9 +36,12 @@ engine. It is null for a greedy checkpoint, which resolves no sampler and
 writes no such event.
 
 `decode_config`, `block_size` and `charged` are present on the speculative arm
-only. Each request carries `ttft_ms` and `decode_tps`, plus `step_count` on the
-plain arm and the round loop's own counters and per-round figures on the
-speculative one.
+only. Each request carries `ttft_ms` and `decode_tps`, plus `step_count` and
+`metal_peak_alloc_mb` on the plain arm and the round loop's own counters and
+per-round figures on the speculative one. `metal_peak_alloc_mb` is the
+allocator's high-water mark since the process started, in MiB, read when the
+request ended: it never falls, so a request's reading includes every request
+before it.
 
 Exit codes: 0 — read; 2 — the log could not be read; 3 — an event carries
 something this reader must not interpret; 4 — the log holds no event of a kind
@@ -60,6 +63,10 @@ TTFT_MARKER = "generate_streaming: TTFT"
 # Anchored, not a substring test, so no other event whose message contains
 # this one is counted.
 ITL_MESSAGE = "generate: ITL stats"
+# The plain arm's per-request Metal allocator high-water mark. The speculative
+# arm writes the same reading under a longer message, which the exact match
+# keeps out.
+METAL_PEAK_MESSAGE = "generate: metal peak alloc"
 SAMPLER_MARKER = server_sampling.MARKER
 # The fields the engine says it resolved for a request. `seed` is on the list
 # because the request sends none and the engine substitutes a fixed default, so
@@ -200,6 +207,17 @@ def itl_rate(fields):
     return 1000.0 / mean_ms, step_count
 
 
+def metal_peak_of(fields):
+    """The Metal allocator peak this event reports, in MiB."""
+    value = fields.get("metal_peak_alloc_mb")
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise LogError(
+            f"a Metal peak event reports metal_peak_alloc_mb={value!r}, which is "
+            "not a peak allocation"
+        )
+    return value
+
+
 def plain_requests(path, expect_total, last, sampler_events):
     """One row per request, for a server that was given no drafter."""
     intruders = spec_round_log.done_events(path)
@@ -211,14 +229,21 @@ def plain_requests(path, expect_total, last, sampler_events):
         )
     ttfts = take(events_matching(path, TTFT_MARKER), "TTFT", expect_total, last)
     itls = take(events_matching(path, ITL_MESSAGE, exact=True), "ITL stats", expect_total, last)
+    peaks = take(
+        events_matching(path, METAL_PEAK_MESSAGE, exact=True),
+        "Metal peak",
+        expect_total,
+        last,
+    )
     rows = []
-    for ttft, itl in zip(ttfts, itls):
+    for ttft, itl, peak in zip(ttfts, itls, peaks):
         rate, step_count = itl_rate(itl)
         rows.append(
             {
                 "ttft_ms": ttft_of(ttft),
                 "decode_tps": rate,
                 "step_count": step_count,
+                "metal_peak_alloc_mb": metal_peak_of(peak),
             }
         )
     return {

@@ -55,6 +55,7 @@ import spec_round_log  # noqa: E402
 PLAIN_MARKERS = {
     "ttft": (published_run_log.TTFT_MARKER,),
     "decode_rate": (published_run_log.ITL_MESSAGE,),
+    "metal_peak": (published_run_log.METAL_PEAK_MESSAGE,),
     "sampling": (published_run_log.SAMPLER_MARKER,),
     "kv_quant": (server_kv_quant.EVENT,),
 }

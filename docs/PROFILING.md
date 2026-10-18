@@ -359,6 +359,12 @@ reads the MLX allocator's high-water mark of live bytes. The server publishes
 it as `metal_peak_alloc_mb`. It is a process-lifetime figure unless a
 `PeakBracket` scopes it.
 
+The engine writes the peak to the run log once per request, in MiB, in the
+`generate: metal peak alloc` event of a plain request. `scripts/spec_bench_published.sh`
+reads it back for the fixed-length prompt. A published "peak memory" column
+that an MLX engine read off its own counter is this figure. One read off the
+process, as Activity Monitor shows it, is `phys_footprint`.
+
 ### 9.1 Scoping the Metal peak to a region
 
 `rmlx_mlx::PeakBracket` records the live bytes and zeroes the peak mark at
