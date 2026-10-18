@@ -40,6 +40,7 @@
 // cannot affect them.
 
 use std::sync::atomic::AtomicBool;
+use std::time::Instant;
 
 use rmlx_core::cancel::ensure_not_cancelled;
 use rmlx_core::error::Result;
@@ -48,7 +49,9 @@ use rmlx_runtime::{count_nan_in_bytes, max_abs_from_bytes};
 
 use crate::constraint::ConstraintEngine;
 use crate::context::{resolve_context, ResolvedContext};
-use crate::decode_loop::{emit_token, reject_nan_prefill, ProbeStep, StepVerdict};
+use crate::decode_loop::{
+    emit_token, log_prefill, reject_nan_prefill, PrefillReport, ProbeStep, StepVerdict,
+};
 use crate::prompt_cache::{chained_block_hashes_seeded, snapshot_clone, Consumed, ReusePolicy};
 use crate::sampler::{apply_mask_argmax, sample_token_array, Pcg32, PenaltyConfig, SamplerConfig};
 use rmlx_kv_quant::{KvCache, KvQuant};
@@ -192,7 +195,7 @@ fn make_step(token_id: u32, tokenizer: &tokenizers::Tokenizer) -> ProbeStep {
 /// nothing is stored, so every request prefills. `max_ctx_override` sizes the
 /// KV ring ceiling so a long prompt (up to the effective `--max-ctx`) grows to
 /// fit and an over-cap prompt is rejected cleanly; see [`generate_image`].
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn generate_greedy(
     model: &Qwen3VlMoeText,
     tokenizer: &tokenizers::Tokenizer,
@@ -268,6 +271,10 @@ pub fn generate_greedy(
             token_id = first,
             "qwen3_vl_moe generate_greedy: prompt cache EXACT HIT"
         );
+        log_prefill(
+            "Qwen3VLMoeForConditionalGeneration",
+            &PrefillReport::exact(prompt_ids.len()),
+        );
         // The cached first_id is the same token the prefill argmax produced, and
         // first_piece is its piece_for(...) string (stored at Miss-path push), so
         // replaying it on the cloned caches yields the same decoded sequence as a
@@ -307,6 +314,7 @@ pub fn generate_greedy(
     // the other arch text paths (qwen3_5_moe / gemma4).
     let mut kv = kv_stack(n_layers, kv_quant, &ctx);
 
+    let prefill_t0 = Instant::now();
     let prefill_chunk = crate::prefill_chunk::resolve("qwen3_vl_moe");
     let logits = crate::decode_loop::chunked_prefill(
         &mut kv,
@@ -319,6 +327,7 @@ pub fn generate_greedy(
         |chunk, kv| model.forward_seq_with_cache(chunk, Some(kv), device),
     )?;
     guard_prefill_logits(&logits, prompt_ids.len())?;
+    let prefill_ns = prefill_t0.elapsed().as_nanos();
     let first = pick_token(
         &logits,
         vocab,
@@ -329,6 +338,10 @@ pub fn generate_greedy(
         rng,
         device,
     )?;
+    log_prefill(
+        "Qwen3VLMoeForConditionalGeneration",
+        &PrefillReport::cold(prompt_ids.len(), prefill_ns),
+    );
 
     // Push this prefill snapshot to the prompt cache (Miss → store), gated on
     // !has_image so an image turn can never pollute the text cache. Clone the
@@ -538,6 +551,7 @@ pub fn generate_image(
     }
     let ctx = resolved_context(model, max_ctx_override)?;
     let n_tokens = ctx.decode_budget(aug_ids.len(), n_tokens)?;
+    let prefill_t0 = Instant::now();
     let vocab = model.cfg.vocab_size;
     let seq = aug_ids.len() as i32;
 
@@ -609,6 +623,7 @@ pub fn generate_image(
     }
 
     guard_prefill_logits(&logits, aug_ids.len())?;
+    let prefill_ns = prefill_t0.elapsed().as_nanos();
 
     let mut steps = Vec::with_capacity(n_tokens);
     let first = pick_token(
@@ -621,6 +636,10 @@ pub fn generate_image(
         rng,
         device,
     )?;
+    log_prefill(
+        "Qwen3VLMoeForConditionalGeneration",
+        &PrefillReport::cold(aug_ids.len(), prefill_ns),
+    );
 
     // Decode continues from max(prompt positions)+1 in all three dims (the
     // trailing-text rule); the image tokens compress the position range so the

@@ -189,8 +189,6 @@ pub(crate) struct RoundTotals {
     pub(crate) total_draft: usize,
     /// Proposed tokens the verifier accepted, over all rounds.
     pub(crate) total_accept: usize,
-    /// Prompt prefill span.
-    pub(crate) prefill_ns: u128,
     /// Wall-clock inside the drafter call, over all rounds.
     pub(crate) draft_ns: u128,
     /// Wall-clock inside the verify forward, over all rounds.
@@ -237,7 +235,6 @@ pub(crate) fn round_stats(
         emitted_in_rounds,
         total_draft,
         total_accept,
-        prefill_ns,
         draft_ns,
         verifier_ns,
         round_loop_ns,
@@ -253,7 +250,6 @@ pub(crate) fn round_stats(
         conditioned_rows,
         total_draft,
         total_accept,
-        prefill_ns,
         draft_ns,
         verifier_ns,
         round_loop_ns,

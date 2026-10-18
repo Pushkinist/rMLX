@@ -242,7 +242,6 @@ def done_line(raw=None):
         "accepted_per_step": TOTAL_ACCEPT / ROUNDS,
         "tokens_per_round": round_emitted / ROUNDS,
         "elapsed_ms": ELAPSED_MS,
-        "prefill_ms": 100.0,
         "round_ms": ROUND_MS,
         "draft_ms": DRAFT_MS,
         "verifier_ms": VERIFY_MS,

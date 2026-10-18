@@ -257,6 +257,87 @@ pub(crate) fn emit_replayed_token(
     emitted.ends
 }
 
+/// What a request's prefill did, as the one `generate: prefill` event reports it.
+///
+/// `scripts/lib/published_run_log.py` reads the event: the engine's own input
+/// rate is `forwarded_tokens` over `prefill_ms`. This event is the one producer
+/// of the prefill time; no other event carries it.
+#[derive(Debug)]
+pub(crate) struct PrefillReport {
+    /// Tokens in the request's prompt.
+    pub(crate) prompt_tokens: usize,
+    /// Prompt tokens the request took from a prompt cache.
+    pub(crate) reused_tokens: usize,
+    /// Prompt tokens the prefill ran the model over.
+    pub(crate) forwarded_tokens: usize,
+    /// Wall clock of the target model's prefill forward or forwards, up to the
+    /// point its logits are forced. It excludes the draw of the first token, a
+    /// drafter's own work and any snapshot of the caches.
+    pub(crate) prefill_ns: u128,
+    /// Wall clock of a draft model's own prefill, `0` for a request with no draft
+    /// model prefill.
+    pub(crate) draft_prefill_ns: u128,
+}
+
+impl PrefillReport {
+    /// A prefill that ran the model over the whole prompt.
+    pub(crate) fn cold(prompt_tokens: usize, prefill_ns: u128) -> Self {
+        Self::reusing(prompt_tokens, 0, prefill_ns)
+    }
+
+    /// An exact prompt-cache hit: all of the prompt is reused and no prefill ran.
+    pub(crate) fn exact(prompt_tokens: usize) -> Self {
+        Self::reusing(prompt_tokens, prompt_tokens, 0)
+    }
+
+    /// A prefill that took `reused_tokens` of the prompt from a cache and ran the
+    /// model over the rest.
+    pub(crate) fn reusing(prompt_tokens: usize, reused_tokens: usize, prefill_ns: u128) -> Self {
+        Self {
+            prompt_tokens,
+            reused_tokens,
+            forwarded_tokens: prompt_tokens.saturating_sub(reused_tokens),
+            prefill_ns,
+            draft_prefill_ns: 0,
+        }
+    }
+
+    /// A speculative prefill that left the prompt's last token for the first
+    /// round, so the prefill ran the model over all the others.
+    pub(crate) fn carried(prompt_tokens: usize, prefill_ns: u128) -> Self {
+        Self {
+            forwarded_tokens: prompt_tokens.saturating_sub(1),
+            ..Self::cold(prompt_tokens, prefill_ns)
+        }
+    }
+
+    /// The same prefill, with the time a draft model's own prefill took.
+    pub(crate) fn with_draft(self, draft_prefill_ns: u128) -> Self {
+        Self {
+            draft_prefill_ns,
+            ..self
+        }
+    }
+}
+
+/// Write the one `generate: prefill` event of a request, at the point its
+/// prefill ends and before its first token is shown to the step callback.
+///
+/// Every path that prefills or replays a prefill calls this once, so a request
+/// leaves exactly one event, whichever path served it. The source gate in
+/// `prefill_event_tests.rs` holds that.
+pub(crate) fn log_prefill(arch: &str, report: &PrefillReport) {
+    tracing::info!(
+        arch,
+        prompt_tokens = report.prompt_tokens,
+        reused_tokens = report.reused_tokens,
+        forwarded_tokens = report.forwarded_tokens,
+        prefill_ms = (report.prefill_ns as f64) / 1.0e6,
+        draft_prefill_ms = (report.draft_prefill_ns as f64) / 1.0e6,
+        "generate: prefill"
+    );
+}
+
 /// Abort a generation whose prefill logits contain NaN.
 ///
 /// A logit row with NaN in it is not a degraded answer, it is no answer: greedy

@@ -75,6 +75,16 @@ fn every_spec_metric_present() {
         "ppl_wikitext2_cached",
         // resident memory has two counters and they are not the same number
         "peak_phys_footprint_mb",
+        // input speed has two definitions: `prefill_tps` is the prompt over
+        // the time to first token, this one the tokens the prefill ran the
+        // model over, over the prefill time the engine timed
+        "prefill_engine_tps",
+        // the published-protocol greedy match, counted in samples
+        "greedy_samples",
+        "greedy_identical",
+        "greedy_near_tie",
+        "greedy_refused",
+        "greedy_unjudgeable",
     ];
     for name in spec_names {
         assert!(
@@ -83,7 +93,7 @@ fn every_spec_metric_present() {
         );
     }
     // METRICS row count — bump when adding new metric ops.
-    assert_eq!(METRICS.len(), 61, "METRICS should have exactly 61 rows");
+    assert_eq!(METRICS.len(), 67, "METRICS should have exactly 67 rows");
 }
 
 #[test]

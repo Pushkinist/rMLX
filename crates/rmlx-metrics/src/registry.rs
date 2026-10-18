@@ -198,6 +198,12 @@ pub const METRICS: &[(&str, &str, Direction, Bounds)] = &[
         Direction::HigherBetter,
         Bounds::positive(1e5),
     ),
+    (
+        "prefill_engine_tps",
+        "tps",
+        Direction::HigherBetter,
+        Bounds::positive(1e5),
+    ),
     // Same ceiling as `decode_tps_warm`, and not a looser one: `overall_tps`
     // divides the same token count by a wall clock that also contains prefill,
     // so it is bounded above by the decode rate by construction.
@@ -297,6 +303,37 @@ pub const METRICS: &[(&str, &str, Direction, Bounds)] = &[
         "bytes",
         Direction::LowerBetter,
         Bounds::non_negative(BYTES_CEILING),
+    ),
+    // Greedy match of a speculative run against plain decode, counted in samples.
+    (
+        "greedy_samples",
+        "count",
+        Direction::HigherBetter,
+        Bounds::non_negative(COUNT_CEILING),
+    ),
+    (
+        "greedy_identical",
+        "count",
+        Direction::HigherBetter,
+        Bounds::non_negative(COUNT_CEILING),
+    ),
+    (
+        "greedy_near_tie",
+        "count",
+        Direction::LowerBetter,
+        Bounds::non_negative(COUNT_CEILING),
+    ),
+    (
+        "greedy_refused",
+        "count",
+        Direction::LowerBetter,
+        Bounds::non_negative(COUNT_CEILING),
+    ),
+    (
+        "greedy_unjudgeable",
+        "count",
+        Direction::LowerBetter,
+        Bounds::non_negative(COUNT_CEILING),
     ),
     // Block-level prompt-cache counters (monotonic).
     (

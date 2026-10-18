@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Every request writes one `generate: prefill` event.** It carries the
+  prompt tokens, the tokens a prompt cache supplied, the tokens the prefill ran
+  the model over and the prefill time, on every architecture and every
+  speculative drafter. It is the one producer of the prefill time: `decode_profile`
+  and the speculative `done` line no longer carry `prefill_ms`. An exact cache hit reports its whole prompt as reused and
+  a prefill time of zero. Before, only some paths wrote a prefill time, in
+  `decode_profile`, and no event said how many tokens the prefill ran over. See `docs/PROFILING.md` § "The prefill event of a request".
+- **The published-protocol harness reports three more columns.** The fixed
+  prompt's input speed now has two definitions, the prompt over the time to
+  first token and the engine's own prefill rate (`prefill_engine_tps`, off the
+  event above); the engine rate is refused on a prompt that was not cold. A
+  speculative run can be judged against a plain run at temperature 0 with
+  `--greedy-pass` and `--greedy-against`, through the divergence oracle, and
+  the table counts identical, near-tie, refused and unjudgeable answers by
+  dataset. `--longctx 32k` measures a checked-in long prompt on the plain arm.
+  None of these runs by default. `ingest/published_ingest.py` records the
+  long-context row and the per-dataset greedy counts (new `greedy_*` registry
+  metrics), and the re-query after it checks them.
 - **A Qwen3.5-family request resumes from a saved recurrent state.** A
   prompt-cache entry of Qwen3.8 or Ternary-Bonsai-2 served an exact replay
   only: the recurrent state cannot be cut back, so a longer or diverging prompt

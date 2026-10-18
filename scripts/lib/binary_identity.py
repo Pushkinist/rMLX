@@ -56,11 +56,13 @@ PLAIN_MARKERS = {
     "ttft": (published_run_log.TTFT_MARKER,),
     "decode_rate": (published_run_log.ITL_MESSAGE,),
     "metal_peak": (published_run_log.METAL_PEAK_MESSAGE,),
+    "prefill": (published_run_log.PREFILL_MESSAGE,),
     "sampling": (published_run_log.SAMPLER_MARKER,),
     "kv_quant": (server_kv_quant.EVENT,),
 }
 SPECULATIVE_MARKERS = {
     "ttft": (published_run_log.TTFT_MARKER,),
+    "prefill": (published_run_log.PREFILL_MESSAGE,),
     "sampling": (published_run_log.SAMPLER_MARKER,),
     "kv_quant": (server_kv_quant.EVENT,),
     "round_loop": tuple(f"{m}: done" for m in spec_round_log.DONE_MARKERS),

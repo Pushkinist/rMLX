@@ -286,11 +286,22 @@ Per request it appends to the run log the events the harness reads back:
   generate: metal peak alloc             plain arm only, unless capped by
                                          STUB_PEAK_LINES; rises 100 MiB per
                                          request unless STUB_METAL_PEAK_MB
+  generate: prefill                      unless capped by STUB_PREFILL_LINES;
+                                         the request's prompt count, STUB_REUSED
+                                         of it from a cache (`all` for all of it),
+                                         STUB_PREFILL_MS
+                                         long (one value per pass, `;` apart)
   generate: host categorical sampler active
                                          unless STUB_SAMPLED=0, capped by
                                          STUB_SAMPLER_LINES
   <kind>_generate: done                  when the serve argv carried a drafter,
                                          or STUB_FORCE_DONE is set
+
+An unstreamed request that asks for logprobs is a greedy-pass request: it is
+answered with a completion whose text is a function of the prompt, so the plain
+and the speculative stub agree on every sample, plus the word STUB_GREEDY_MARKS
+names for the request's index (`i:WORD,...`) on a speculative stub. The oracle
+stub reads that word from the speculative answer to stage its verdict.
 
 `mean_ms` on the ITL event and `decode_tps` on the done line both report the
 nominal gap, so the engine figure is exact and the client's reading of the same
@@ -299,6 +310,7 @@ disagreement is staged.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -354,6 +366,34 @@ PEAK_LINES = int(os.environ.get("STUB_PEAK_LINES", "-1"))
 PEAK_PASS_OFFSET_MB = {1: 0, 2: 2000, 3: 500}
 PEAK_BASE_MB = 28000
 PEAK_FIXED_MB = os.environ.get("STUB_METAL_PEAK_MB", "")
+# The engine's account of each prefill: how many prompt tokens a cache supplied,
+# how long the prefill took in each pass, and how many events are written.
+# Prompts above this many characters are the long-context ones. They count
+# STUB_LONG_PROMPT_TOKENS, and STUB_REUSED_LONG of them come from a cache.
+LONG_CHARS = 20000
+LONG_PROMPT_TOKENS = int(os.environ.get("STUB_LONG_PROMPT_TOKENS", "0"))
+REUSED_LONG = int(os.environ.get("STUB_REUSED_LONG", "0"))
+GREEDY_MARKS = dict(
+    (int(i), word)
+    for i, _, word in (m.partition(":") for m in os.environ.get("STUB_GREEDY_MARKS", "").split(",") if m)
+)
+REUSED_ALL = os.environ.get("STUB_REUSED", "0") == "all"
+REUSED = 0 if REUSED_ALL else int(os.environ.get("STUB_REUSED", "0"))
+PREFILL_MS = [float(v) for v in os.environ.get("STUB_PREFILL_MS", "250").split(";") if v != ""]
+PREFILL_LINES = int(os.environ.get("STUB_PREFILL_LINES", "-1"))
+# A prompt count that is not the request's, which is how an event paired with
+# the wrong request is staged.
+PREFILL_PROMPT = os.environ.get("STUB_PREFILL_PROMPT", "")
+# Which served request the override starts at: the fixed-length prompt is request 1
+# of every plain server, so a mismatch staged on the cells alone starts at 2.
+PREFILL_PROMPT_FROM = int(os.environ.get("STUB_PREFILL_PROMPT_FROM", "0"))
+# The greedy pass: with a prompt cache on, STUB_GREEDY_CACHE_HIT makes the engine
+# serve every answer from it; STUB_GREEDY_REUSED reuses that many tokens whatever
+# the cache is set to; STUB_GREEDY_NO_EVENT writes no prefill event for it.
+CACHE_SLOTS = os.environ.get("STUB_CACHE_SLOTS", "4")
+GREEDY_CACHE_HIT = os.environ.get("STUB_GREEDY_CACHE_HIT", "") == "1"
+GREEDY_REUSED = int(os.environ.get("STUB_GREEDY_REUSED", "0"))
+GREEDY_NO_EVENT = os.environ.get("STUB_GREEDY_NO_EVENT", "") == "1"
 SAMPLED = os.environ.get("STUB_SAMPLED", "1") == "1"
 SAMPLER_LINES = int(os.environ.get("STUB_SAMPLER_LINES", "-1"))
 SAMPLER_TOP_K = int(os.environ.get("STUB_SAMPLER_TOP_K", "20"))
@@ -377,6 +417,7 @@ BODIES = os.environ.get("STUB_BODIES", "")
 BOUND_FLAG = os.environ.get("STUB_BOUND_FLAG", "")
 
 served = 0
+greedy_served = 0
 FLIGHT = threading.Condition()
 in_flight = 0
 metrics_in_flight = 0
@@ -416,7 +457,6 @@ def done_line(rate):
         "accepted_per_step": total_accept / rounds,
         "tokens_per_round": in_rounds / rounds,
         "elapsed_ms": 2560.0,
-        "prefill_ms": 100.0,
         "round_ms": round_ms,
         "draft_ms": draft_ms,
         "verifier_ms": verify_ms,
@@ -440,10 +480,17 @@ def prompt_tokens_of(request):
     fit a search rather than a fixed answer. Without it, the fixed figure the
     other cases were written against.
     """
+    content = "".join(m.get("content", "") for m in request.get("messages", []))
+    if LONG_PROMPT_TOKENS and len(content) > LONG_CHARS:
+        return LONG_PROMPT_TOKENS
     if TOKEN_BASE:
-        content = "".join(m.get("content", "") for m in request.get("messages", []))
         return int(TOKEN_BASE) + len(content) // 4
     return PROMPT_TOKENS
+
+
+def is_long(request):
+    content = "".join(m.get("content", "") for m in request.get("messages", []))
+    return len(content) > LONG_CHARS
 
 
 def log(line):
@@ -508,6 +555,9 @@ class Handler(BaseHTTPRequestHandler):
         # A fixed-prompt fit probe: it asks the server for a token count and
         # nothing else, so it streams nothing and leaves no event behind. A
         # probe that logged would be counted as a served request by the reader.
+        if request.get("logprobs") and not request.get("stream"):
+            self._greedy(request)
+            return
         if not request.get("stream"):
             self._json({
                 "choices": [{"message": {"role": "assistant", "content": "."}}],
@@ -524,6 +574,36 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             with FLIGHT:
                 in_flight -= 1
+
+    def _greedy(self, request):
+        """A greedy-pass answer: the same text for the same prompt on either arm."""
+        global greedy_served
+        index = greedy_served
+        greedy_served += 1
+        content = "".join(m.get("content", "") for m in request.get("messages", []))
+        text = "answer " + hashlib.sha1(content.encode("utf-8")).hexdigest()[:12]
+        if SPECULATIVE and index in GREEDY_MARKS:
+            text += " " + GREEDY_MARKS[index]
+        tokens = len(text.split())
+        if not GREEDY_NO_EVENT:
+            prompt = prompt_tokens_of(request)
+            reused = prompt if (GREEDY_CACHE_HIT and CACHE_SLOTS != "0") else GREEDY_REUSED
+            log(event({"message": "generate: prefill", "arch": "Stub",
+                       "prompt_tokens": prompt, "reused_tokens": reused,
+                       "forwarded_tokens": max(prompt - reused, 0),
+                       "prefill_ms": 0.0 if reused >= prompt else 5.0,
+                       "draft_prefill_ms": 0.0}))
+        record = {"token": "t", "logprob": -0.1,
+                  "top_logprobs": [{"token": "t", "logprob": -0.1},
+                                   {"token": "u", "logprob": -3.0}]}
+        self._json({
+            "choices": [{
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop",
+                "logprobs": {"content": [record] * tokens},
+            }],
+            "usage": {"prompt_tokens": prompt_tokens_of(request), "completion_tokens": tokens},
+        })
 
     def _stream(self, request, readings_before):
         global served
@@ -572,7 +652,8 @@ class Handler(BaseHTTPRequestHandler):
             usage["prompt_tokens"] = prompt_tokens_of(request)
         chunk({"choices": [], "usage": usage})
 
-        if SAMPLED and (SAMPLER_LINES < 0 or served < SAMPLER_LINES):
+        # A request at temperature 0 resolves no sampler, as the engine's does not.
+        if SAMPLED and request.get("temperature") != 0 and (SAMPLER_LINES < 0 or served < SAMPLER_LINES):
             top_k = SAMPLER_TOP_K
             if SAMPLER_TOP_K_PASS2 and PASS >= 2:
                 top_k = int(SAMPLER_TOP_K_PASS2)
@@ -591,6 +672,20 @@ class Handler(BaseHTTPRequestHandler):
             log(event({"message": "generate: ITL stats", "model_id": "stub",
                        "step_count": TOKENS, "p50_ms": mean, "p95_ms": mean,
                        "p99_ms": mean, "mean_ms": mean, "itl_spikes": 0}))
+        if PREFILL_LINES < 0 or served < PREFILL_LINES:
+            prompt = (
+                int(PREFILL_PROMPT)
+                if PREFILL_PROMPT and served >= PREFILL_PROMPT_FROM
+                else prompt_tokens_of(request)
+            )
+            reused = prompt if REUSED_ALL else REUSED
+            if is_long(request):
+                reused = REUSED_LONG
+            log(event({"message": "generate: prefill", "arch": "Stub",
+                       "prompt_tokens": prompt, "reused_tokens": reused,
+                       "forwarded_tokens": max(prompt - reused, 0),
+                       "prefill_ms": pick(PREFILL_MS, PASS - 1),
+                       "draft_prefill_ms": 0.0}))
         if not SPECULATIVE and (PEAK_LINES < 0 or served < PEAK_LINES):
             peak = int(PEAK_FIXED_MB) if PEAK_FIXED_MB else PEAK_BASE_MB + PEAK_PASS_OFFSET_MB.get(PASS, 0) + 100 * served
             log(event({"message": "generate: metal peak alloc",
@@ -636,6 +731,7 @@ set -eu
 # markers: generate: host categorical sampler active | cache-type resolved
 # markers: mtp_generate: done
 # markers: generate: metal peak alloc
+# markers: generate: prefill
 case "\$1" in
 metrics)
 	case "\$2" in
@@ -645,12 +741,15 @@ metrics)
 	esac
 	;;
 serve)
+	printf '%s\n' "\$*" >>"\$RMLX_HOME/serve_args.log"
 	port=8090
 	speculative=0
+	cache_slots=4
 	while [ \$# -gt 0 ]; do
 		case "\$1" in
 		--port) port="\$2" ;;
 		--draft-model) speculative=1 ;;
+		--prompt-cache-slots) cache_slots="\$2" ;;
 		esac
 		shift
 	done
@@ -679,9 +778,26 @@ serve)
 		fi
 		printf '%s\n' "{\"timestamp\":\"2026-09-06T00:00:00Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"cache-type resolved\",\"arch\":\"Stub\",\"kv_quant\":\"\$kv\"}}" >>"\$log"
 	fi
-	export STUB_LOG="\$log" STUB_SPECULATIVE="\$speculative" STUB_PASS="\$pass"
+	export STUB_LOG="\$log" STUB_SPECULATIVE="\$speculative" STUB_PASS="\$pass" STUB_CACHE_SLOTS="\$cache_slots"
 	# The case's own arguments for the stub server, one line, if it left any.
 	exec python3 "${SERVER_PY}" "\$port" \$(cat "\$RMLX_HOME/stub_args" 2>/dev/null)
+	;;
+eval)
+	# eval spec-answer --plain P --spec S. The verdict is staged by a word in the
+	# speculative answer, and its exit code is the verdict's other spelling.
+	spec="\$6"
+	if grep -q BADEXIT "\$spec"; then echo verdict=near_tie; echo position=3; exit 1; fi
+	if grep -q NOVERDICT "\$spec"; then exit 0; fi
+	if grep -q NEAR "\$spec"; then
+		printf 'verdict=near_tie\nposition=3\nmargin=0.0100\nrank=0.0200\nreason=a staged near tie\n'
+		exit 0
+	fi
+	if grep -q UNJUDGE "\$spec"; then
+		printf 'verdict=unjudgeable\nreason=a staged pair the oracle cannot read\n'
+		exit 2
+	fi
+	printf 'verdict=refused\nposition=2\nrank=0.9000\nreason=a staged divergence\n'
+	exit 1
 	;;
 esac
 STUBEOF
@@ -707,6 +823,14 @@ ln -s "${REPO_ROOT}/prompts" "${NOPEAK_ROOT}/prompts"
 grep -v 'generate: metal peak alloc' "${STUB}" >"${NOPEAK_ROOT}/target/release-perf/rmlx"
 chmod +x "${NOPEAK_ROOT}/target/release-perf/rmlx"
 
+# And losing the prefill literal.
+NOPREFILL_ROOT="${WORK}/repo_noprefill"
+mkdir -p "${NOPREFILL_ROOT}/target/release-perf"
+ln -s "${REPO_ROOT}/scripts" "${NOPREFILL_ROOT}/scripts"
+ln -s "${REPO_ROOT}/prompts" "${NOPREFILL_ROOT}/prompts"
+grep -v 'generate: prefill' "${STUB}" >"${NOPREFILL_ROOT}/target/release-perf/rmlx"
+chmod +x "${NOPREFILL_ROOT}/target/release-perf/rmlx"
+
 # A port this host is not already using. Probed rather than assumed: a foreign
 # listener would answer the readiness poll and the suite would measure it.
 PORT="$(python3 -c '
@@ -729,7 +853,7 @@ sys.exit("no free port in 18000-19999")
 
 # run_case <name> <want-exit> <what-it-proves> [KEY=VALUE ...] [ARGS:flag ...]
 #          [HOST:quiet|hostile|flaky] [THERM:nominal|throttled|unreadable]
-#          [VERIFIER:dir] [MEASURED:1] [CANONICAL:1] [MARKERLESS:itl|peak]
+#          [VERIFIER:dir] [MEASURED:1] [CANONICAL:1] [MARKERLESS:itl|peak|prefill]
 #          [LABEL:name | NOLABEL:1] [FIXED_TS:1] [PREDIR:path-under-home ...]
 #          [CLIENT_SHIM:N] [NO_STAMPS:1] [STUB:<stub server arguments>]
 #          [GREP:pat ...] [NOGREP:pat ...]
@@ -807,6 +931,7 @@ LOGEOF
         case "${markerless}" in
         itl) root="${MARKERLESS_ROOT}" ;;
         peak) root="${NOPEAK_ROOT}" ;;
+        prefill) root="${NOPREFILL_ROOT}" ;;
         esac
         extra_args+=(--samples-root "${SAMPLES}")
     fi
@@ -2074,6 +2199,410 @@ run_case binary_missing_metal_peak_marker_refused 1 \
     'GREP:cannot write the event this run reads its metal_peak from' \
     'NOGREP:\[server\] pid='
 no_result
+verdict
+
+# Input speed has two definitions. The stub's TTFT is 42 ms and its prefill 250
+# ms, so the client-visible rate is 32261.9 and the engine's own 5420.0: a
+# harness that read one clock for both rows would print the same number twice.
+run_case engine_input_speed_is_forwarded_tokens_over_the_prefill 0 \
+    "the engine's input speed is the tokens its prefill ran over its own prefill time" \
+    'GREP:tok/s eng'
+close_to "$(jq_of "r['fixed_prompt']['prefill_engine_tps']['mean']")" 5420.0 0.0001 ||
+    note_bad "prefill_engine_tps=$(jq_of "r['fixed_prompt']['prefill_engine_tps']['mean']")"
+close_to "$(jq_of "r['fixed_prompt']['prefill_tps']['mean']")" 32261.9 0.0001 ||
+    note_bad "prefill_tps=$(jq_of "r['fixed_prompt']['prefill_tps']['mean']")"
+close_to "$(jq_of "r['fixed_prompt']['prefill_ms']['mean']")" 250.0 0.0001 ||
+    note_bad "prefill_ms=$(jq_of "r['fixed_prompt']['prefill_ms']['mean']")"
+verdict
+
+# Each pass is a server of its own and reads its own prefill time. The three
+# runs are 1355 tokens over 200, 204 and 208 ms; a block that kept the last run,
+# or the first, would not report their mean.
+run_case engine_input_speed_is_the_mean_of_the_three_passes 0 \
+    "the engine rate of the fixed prompt is a mean over the passes, with its spread" \
+    'STUB_PREFILL_MS=200;204;208'
+close_to "$(jq_of "r['fixed_prompt']['prefill_engine_tps']['mean']")" 6643.8601 0.0001 ||
+    note_bad "mean=$(jq_of "r['fixed_prompt']['prefill_engine_tps']['mean']")"
+close_to "$(jq_of "r['fixed_prompt']['prefill_engine_tps']['pass_means'][1]")" 6642.1569 0.0001 ||
+    note_bad "pass 2=$(jq_of "r['fixed_prompt']['prefill_engine_tps']['pass_means'][1]")"
+close_to "$(jq_of "r['fixed_prompt']['prefill_engine_tps']['range_pct']")" 3.9231 0.001 ||
+    note_bad "range=$(jq_of "r['fixed_prompt']['prefill_engine_tps']['range_pct']")"
+[ "$(jq_of "r['fixed_prompt']['prefill_engine_tps']['stable']")" = "True" ] ||
+    note_bad "a 3.9% spread was refused"
+verdict
+
+# Past the 5% band the mean is withheld, as it is for the other published rates.
+run_case unstable_engine_input_speed_is_refused 3 \
+    "three prefills that disagree by more than the band publish no engine input speed" \
+    'STUB_PREFILL_MS=200;212;200' \
+    'GREP:RANGE REFUSAL: .*fixed_prompt/prefill_engine_tps'
+[ "$(jq_of "r['fixed_prompt']['prefill_engine_tps']['stable']")" = "False" ] ||
+    note_bad "the unstable engine rate was filed as stable"
+[ "$(jq_of "r['fixed_prompt']['prefill_tps']['stable']")" = "True" ] ||
+    note_bad "the TTFT rate was refused for the engine rate's spread"
+verdict
+
+# The protocol's input speed is over a cold cache, and the engine can now say
+# whether it was. A prompt it took any token of from a cache is not cold.
+run_case a_fixed_prompt_served_from_a_cache_is_refused 1 \
+    "an input speed over a prompt the engine took from a cache is not a cold one" \
+    'STUB_REUSED=100' \
+    'GREP:took 100 of the fixed prompt.s tokens from a prompt cache' \
+    'GREP:not over a cold prompt'
+no_result
+verdict
+
+run_case an_engine_prefill_of_no_time_is_refused 1 \
+    "a prefill that took no time has no rate, and is refused rather than divided by" \
+    'STUB_PREFILL_MS=0' \
+    'GREP:reported prefill_ms=0.0, which is not a prefill duration'
+no_result
+verdict
+
+run_case a_negative_prefill_time_is_refused 1 \
+    "a prefill time below zero is not a time" \
+    'STUB_PREFILL_MS=-5' \
+    'GREP:reports prefill_ms=-5.0, which is not a time'
+no_result
+verdict
+
+run_case a_prefill_that_ran_no_token_but_took_time_is_refused 1 \
+    "an event that reuses the whole prompt and still reports a prefill time is incoherent" \
+    'STUB_REUSED=all' \
+    'GREP:reports 250.0 ms for a prefill that ran no token'
+no_result
+verdict
+
+run_case a_prefill_event_that_counts_more_than_the_prompt_is_refused 1 \
+    "a cache supplying more tokens than the prompt holds is not one prefill" \
+    'STUB_REUSED=99999' \
+    'GREP:together they exceed it'
+no_result
+verdict
+
+run_case prefill_event_missing_refused 1 \
+    "a log missing a request's prefill event is refused, not zipped short" \
+    'STUB_PREFILL_LINES=5' \
+    "GREP:prefill events, expected ${EVENTS_PER_PASS}"
+no_result
+verdict
+
+# The reader pairs the event with its request by order, so it checks the one
+# thing it can see: the prompt the event counted is the prompt the server counted.
+run_case a_prefill_event_of_another_request_is_refused 1 \
+    "an event whose prompt count is not the request's belongs to another request" \
+    'STUB_PREFILL_PROMPT=999' \
+    'GREP:counts 999 prompt tokens where the server counted 1355' \
+    'GREP:belongs to another request'
+no_result
+verdict
+
+run_case a_cell_paired_with_another_requests_prefill_event_is_refused 1 \
+    "each request's event is checked against its own prompt count, not only the fixed prompt's" \
+    'STUB_PREFILL_PROMPT=999' \
+    'STUB_PREFILL_PROMPT_FROM=2' \
+    "GREP:mt_bench@1024/.*the engine's prefill event counts 999 prompt tokens" \
+    'GREP:belongs to another request'
+no_result
+verdict
+
+run_case a_speculative_cell_paired_with_another_requests_event_is_refused 1 \
+    "the same check on the speculative arm, where the order is the only pairing there is" \
+    ARGS:--draft-model "ARGS:${WORK}/drafter" ARGS:--draft-kind ARGS:mtp \
+    'STUB_PREFILL_PROMPT=999' \
+    'STUB_PREFILL_PROMPT_FROM=2' \
+    "GREP:the engine's prefill event counts 999 prompt tokens"
+no_result
+verdict
+
+run_case binary_missing_prefill_marker_refused 1 \
+    "a binary that cannot write the prefill event is refused before it serves" \
+    MARKERLESS:prefill \
+    'GREP:contains none of .generate: prefill' \
+    'GREP:cannot write the event this run reads its prefill from' \
+    'NOGREP:\[server\] pid='
+no_result
+verdict
+
+# The round loop writes the same event, so a speculative run carries the engine's
+# prefill on every row. The stub's seed is drawn by the prefill, so it ran the
+# whole prompt, and each request counts its own prompt.
+run_case speculative_rows_carry_the_engine_prefill 0 \
+    "a speculative request has its prefill event read like a plain one" \
+    ARGS:--draft-model "ARGS:${WORK}/drafter" ARGS:--draft-kind ARGS:mtp
+ENGINE_JSON="$(dirname "$(result_of)")/passes/1/engine.json"
+[ "$(python3 -c 'import json, sys
+rows = json.load(open(sys.argv[1]))["requests"]
+print(len(rows), all(r["forwarded_tokens"] == r["prompt_tokens"] and r["reused_tokens"] == 0
+                     and r["prefill_ms"] == 250.0 and r["prompt_tokens"] > 100 for r in rows))' "${ENGINE_JSON}" 2>&1)" = "${REQUESTS_PER_PASS} True" ] ||
+    note_bad "engine rows: $(python3 -c 'import json, sys
+print(json.load(open(sys.argv[1]))["requests"][0])' "${ENGINE_JSON}" 2>&1 | cut -c1-200)"
+verdict
+
+run_case speculative_prefill_event_missing_refused 1 \
+    "a speculative log missing a request's prefill event is refused" \
+    'STUB_PREFILL_LINES=5' \
+    ARGS:--draft-model "ARGS:${WORK}/drafter" ARGS:--draft-kind ARGS:mtp \
+    'GREP:prefill events, expected'
+no_result
+verdict
+
+# ── The greedy pass ───────────────────────────────────────────────────────────
+#
+# The speed passes sample under the checkpoint's own defaults, so no two arms answer
+# one question there. The greedy pass answers every sample at the macro budget once,
+# at temperature 0, unstreamed and with logprobs, on a server of its own. The stub
+# answers such a request with a text that is a function of the prompt, so the plain
+# and the speculative stub agree on every sample unless a case marks one: index 0 is
+# the MT-Bench sample, 1 and 2 are MATH-500's, 3 to 5 are HumanEval's.
+
+run_case a_run_without_the_flag_makes_no_greedy_pass 0 \
+    "the greedy pass is asked for, not a default: the speed runs stay as long as they were" \
+    'NOGREP:greedy pass'
+[ ! -e "$(dirname "$(result_of)")/greedy" ] || note_bad "a greedy directory was written"
+[ "$(jq_of "'greedy_pass' in r or 'greedy_match' in r")" = "False" ] ||
+    note_bad "the result carries a greedy figure"
+verdict
+
+run_case greedy_pass_keeps_and_seals_its_answers 0 \
+    "a plain run's greedy pass leaves its answers, an index of their digests and a sealed meta" \
+    ARGS:--greedy-pass \
+    'GREP:greedy pass: temperature 0'
+PLAIN_RUN="$(dirname "$(result_of)")"
+GREEDY="${PLAIN_RUN}/greedy"
+[ "$(wc -l <"${GREEDY}/index.tsv" | tr -d ' ')" = "6" ] ||
+    note_bad "index rows=$(wc -l <"${GREEDY}/index.tsv" | tr -d ' ')"
+[ "$(find "${GREEDY}/answers" -type f | wc -l | tr -d ' ')" = "6" ] ||
+    note_bad "answers=$(find "${GREEDY}/answers" -type f | wc -l | tr -d ' ')"
+[ "$(jq_of "r['greedy_pass']['samples']")" = "6" ] || note_bad "greedy_pass samples"
+[ "$(jq_of "r['greedy_pass']['arm']")" = "plain" ] || note_bad "greedy_pass arm"
+[ "$(jq_of "r['greedy_pass']['kv_quant']")" = "mixed_k8g64_v4g64" ] || note_bad "greedy_pass kv_quant"
+# What was sent: the greedy requests are the only ones that ask for logprobs, they
+# are unstreamed at temperature 0 and the macro budget, and no speed request
+# overrides the checkpoint's sampling.
+[ "$(python3 -c 'import json, sys
+bodies = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
+greedy = [b for b in bodies if b.get("logprobs")]
+print(len(greedy),
+      all(b["temperature"] == 0 and b["stream"] is False and b["top_logprobs"] == 2
+          and b["max_tokens"] == 1024 for b in greedy),
+      all("temperature" not in b for b in bodies if not b.get("logprobs")))' "${CASE_HOME}/bodies.jsonl")" = "6 True True" ] ||
+    note_bad "greedy bodies: $(python3 -c 'import json, sys
+print([ (b.get("temperature"), b.get("stream"), b.get("logprobs")) for b in map(json.loads, open(sys.argv[1]))][-8:])' "${CASE_HOME}/bodies.jsonl")"
+verdict
+
+run_case greedy_match_is_judged_against_the_plain_run 0 \
+    "each differing pair goes to the oracle and the result files its verdicts by dataset" \
+    ARGS:--draft-model "ARGS:${WORK}/drafter" ARGS:--draft-kind ARGS:mtp \
+    ARGS:--greedy-against "ARGS:${PLAIN_RUN}" \
+    'STUB_GREEDY_MARKS=1:NEAR,2:REFUSED,4:UNJUDGE' \
+    'GREP:GREEDY MATCH against plain decode'
+SPEC_RUN="$(dirname "$(result_of)")"
+[ "$(jq_of "[ (k, e['samples'], e['identical'], e['near_tie'], e['refused'], e['unjudgeable']) for k, e in sorted(r['greedy_match']['datasets'].items()) ]")" = \
+  "[('humaneval', 3, 2, 0, 0, 1), ('math_500', 2, 0, 1, 1, 0), ('mt_bench', 1, 1, 0, 0, 0)]" ] ||
+    note_bad "counts=$(jq_of "sorted(r['greedy_match']['datasets'].items())")"
+close_to "$(jq_of "r['greedy_match']['identical_rate']")" 0.5 0.0001 ||
+    note_bad "identical_rate=$(jq_of "r['greedy_match']['identical_rate']")"
+close_to "$(jq_of "r['greedy_match']['identical_or_near_tie_rate']")" 0.6666667 0.0001 ||
+    note_bad "identical_or_near_tie_rate=$(jq_of "r['greedy_match']['identical_or_near_tie_rate']")"
+[ "$(jq_of "[ d['verdict'] for d in r['greedy_match']['differing'] ]")" = "['near_tie', 'refused', 'unjudgeable']" ] ||
+    note_bad "differing=$(jq_of "[ d['verdict'] for d in r['greedy_match']['differing'] ]")"
+[ "$(jq_of "r['greedy_match']['differing'][0]['position']")" = "3" ] ||
+    note_bad "the near tie's position was not carried"
+[ "$(jq_of "r['greedy_pass']['arm'] + ' ' + r['greedy_pass']['decode_config']")" = "speculative mtp/block=5" ] ||
+    note_bad "greedy_pass=$(jq_of "r['greedy_pass']")"
+verdict
+
+# A plain sample resumed from a cached prefix is a reference the speculative loop,
+# which prefills the whole prompt every time, did not answer from. The greedy server
+# runs with the prompt cache off, and the engine's events hold it to that.
+run_case greedy_pass_runs_with_the_prompt_cache_off 0 \
+    "the greedy server is started without a prompt cache, and no other server is" \
+    ARGS:--greedy-pass \
+    'STUB_GREEDY_CACHE_HIT=1' \
+    'GREP:all from a full prefill'
+[ "$(grep -c -e '--prompt-cache-slots 0' "${CASE_HOME}/serve_args.log")" = "1" ] ||
+    note_bad "servers with the cache off: $(grep -c -e '--prompt-cache-slots 0' "${CASE_HOME}/serve_args.log")"
+verdict
+
+run_case a_greedy_answer_taken_from_a_cache_is_refused 1 \
+    "a greedy answer decoded from a resumed prefill is not a reference, and the pass says so" \
+    ARGS:--greedy-pass \
+    'STUB_GREEDY_REUSED=50' \
+    'GREP:took 50 tokens of greedy request 1 from a prompt cache'
+no_result
+verdict
+
+run_case a_greedy_pass_missing_its_prefill_events_is_refused 1 \
+    "a greedy pass whose log cannot be attributed answer by answer is refused" \
+    ARGS:--greedy-pass \
+    'STUB_GREEDY_NO_EVENT=1' \
+    'GREP:holds 0 prefill events for 6 requests'
+no_result
+verdict
+
+run_case a_plain_run_is_not_judged_against_plain 1 \
+    "--greedy-against names a plain run, so a run with no drafter would be judged against itself" \
+    ARGS:--greedy-against "ARGS:${PLAIN_RUN}" \
+    'GREP:judges a speculative run against a plain one' \
+    'NOGREP:\[server\] pid='
+no_result
+verdict
+
+run_case greedy_against_a_directory_with_no_pass_is_refused 1 \
+    "a directory that holds no sealed greedy pass is not a plain run to judge against" \
+    ARGS:--draft-model "ARGS:${WORK}/drafter" \
+    ARGS:--greedy-against "ARGS:${WORK}" \
+    'GREP:holds no greedy/meta.json' \
+    'NOGREP:\[server\] pid='
+no_result
+verdict
+
+run_case greedy_against_a_speculative_pass_is_refused 1 \
+    "the plain side must be a plain pass: a speculative one beside it compares an arm with itself" \
+    ARGS:--draft-model "ARGS:${WORK}/drafter" \
+    ARGS:--greedy-against "ARGS:${SPEC_RUN}" \
+    'GREP:the plain pass is of the speculative arm, not the plain one'
+no_result
+verdict
+
+run_case greedy_passes_of_two_codecs_are_not_compared 1 \
+    "a speculative pass at one KV codec is not judged against a plain pass at another" \
+    ARGS:--draft-model "ARGS:${WORK}/drafter" \
+    ARGS:--greedy-against "ARGS:${PLAIN_RUN}" \
+    'STUB_KV_QUANT=none' \
+    'GREP:differ in kv_quant'
+no_result
+verdict
+
+# The set of samples is part of what the plain pass was sealed over. An index edited
+# afterwards no longer matches its meta, so the pass is not the one that was run.
+TAMPERED="${WORK}/tampered_plain"
+mkdir -p "${TAMPERED}"
+/bin/cp -R "${PLAIN_RUN}/greedy" "${TAMPERED}/greedy"
+python3 - "${TAMPERED}/greedy/index.tsv" <<'PY'
+import pathlib, sys
+
+path = pathlib.Path(sys.argv[1])
+rows = [line.split("\t") for line in path.read_text(encoding="utf-8").splitlines()]
+rows[0][4] = "0" * 64
+path.write_text("".join("\t".join(r) + "\n" for r in rows), encoding="utf-8")
+PY
+run_case greedy_against_a_pass_edited_after_sealing_is_refused 1 \
+    "an index that no longer matches the sample set its meta was sealed over is refused" \
+    ARGS:--draft-model "ARGS:${WORK}/drafter" \
+    ARGS:--greedy-against "ARGS:${TAMPERED}" \
+    'GREP:no longer matches the sample set it was sealed over'
+no_result
+verdict
+
+run_case an_oracle_whose_exit_code_disagrees_with_its_verdict_is_refused 1 \
+    "the exit code and the verdict are one answer spelled twice; a pair that disagree is no judgement" \
+    ARGS:--draft-model "ARGS:${WORK}/drafter" \
+    ARGS:--greedy-against "ARGS:${PLAIN_RUN}" \
+    'STUB_GREEDY_MARKS=1:BADEXIT' \
+    'GREP:are one answer spelled twice'
+no_result
+verdict
+
+run_case an_oracle_that_names_no_verdict_is_refused 1 \
+    "an oracle that prints no verdict has not judged the pair, and the run does not guess" \
+    ARGS:--draft-model "ARGS:${WORK}/drafter" \
+    ARGS:--greedy-against "ARGS:${PLAIN_RUN}" \
+    'STUB_GREEDY_MARKS=1:NOVERDICT' \
+    "GREP:verdict None, which is not a judgement"
+no_result
+verdict
+
+# ── The long-context row ──────────────────────────────────────────────────────
+#
+# `prompts/longctx_32k.json` is the real checked-in file, 100 kB of it. The stub
+# counts any prompt over 20 000 characters at STUB_LONG_PROMPT_TOKENS, and the
+# long-context servers are the fifth to seventh the stub starts on the plain arm
+# (the fit, three passes, then these), so the fourth to sixth entries of
+# STUB_PREFILL_MS are theirs.
+
+run_case longctx_row_is_three_cold_runs_each_on_a_server_of_its_own 0 \
+    "the 32k row is three runs, each on a server started at a ceiling its prompt fits" \
+    ARGS:--longctx ARGS:32k \
+    'STUB_LONG_PROMPT_TOKENS=32764' \
+    'STUB_PREFILL_MS=250;250;250;200;204;208' \
+    'GREP:LONG CONTEXT longctx_32k'
+[ "$(jq_of "r['longctx']['longctx_32k']['prompt_tokens']")" = "32764" ] ||
+    note_bad "prompt_tokens=$(jq_of "r['longctx']['longctx_32k']['prompt_tokens']")"
+[ "$(jq_of "r['longctx']['longctx_32k']['target_tokens']")" = "32768" ] ||
+    note_bad "target_tokens=$(jq_of "r['longctx']['longctx_32k']['target_tokens']")"
+# 32768 plus a quarter, plus the 200-token budget.
+[ "$(jq_of "r['longctx']['longctx_32k']['ctx_max']")" = "41160" ] ||
+    note_bad "ctx_max=$(jq_of "r['longctx']['longctx_32k']['ctx_max']")"
+[ "$(grep -c -e '--max-ctx 41160' "${CASE_HOME}/serve_args.log")" = "3" ] ||
+    note_bad "servers at the long ceiling: $(grep -c -e '--max-ctx 41160' "${CASE_HOME}/serve_args.log")"
+[ "$(grep -c -e '--max-ctx 8192' "${CASE_HOME}/serve_args.log")" = "4" ] ||
+    note_bad "servers at the harness ceiling: $(grep -c -e '--max-ctx 8192' "${CASE_HOME}/serve_args.log")"
+# 32764 tokens over 200, 204 and 208 ms of prefill; the client-visible rate is the
+# same tokens over the 42 ms TTFT the stub reports.
+[ "$(jq_of "[round(v, 1) for v in r['longctx']['longctx_32k']['prefill_engine_tps']['pass_means']]")" = "[163820.0, 160607.8, 157519.2]" ] ||
+    note_bad "engine rates=$(jq_of "r['longctx']['longctx_32k']['prefill_engine_tps']['pass_means']")"
+close_to "$(jq_of "r['longctx']['longctx_32k']['prefill_tps']['mean']")" 780095.2 0.0001 ||
+    note_bad "prefill_tps=$(jq_of "r['longctx']['longctx_32k']['prefill_tps']['mean']")"
+close_to "$(jq_of "r['longctx']['longctx_32k']['decode_tps']['mean']")" 25.0 0.0001 ||
+    note_bad "decode_tps=$(jq_of "r['longctx']['longctx_32k']['decode_tps']['mean']")"
+[ "$(jq_of "r['longctx']['longctx_32k']['prefill_engine_tps']['stable']")" = "True" ] ||
+    note_bad "a 3.9% spread was refused"
+# The request that was sent is the file's own messages at temperature 0 with a
+# 200-token budget; the speed requests are untouched.
+[ "$(python3 - "${CASE_HOME}/bodies.jsonl" "${REPO_ROOT}/prompts/longctx_32k.json" <<'PY'
+import json, sys
+
+bodies = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
+messages = json.load(open(sys.argv[2]))["messages"]
+long = [b for b in bodies if b.get("max_tokens") == 200]
+print(len(long), all(b["messages"] == messages and b["temperature"] == 0 and b["stream"] for b in long))
+PY
+)" = "3 True" ] || note_bad "the long-context requests are not the file's messages at temperature 0"
+verdict
+
+run_case longctx_size_without_a_prompt_file_is_refused 1 \
+    "a size with no checked-in prompt is refused before anything is served" \
+    ARGS:--longctx ARGS:99k \
+    'GREP:names no checked-in prompt' \
+    'NOGREP:\[server\] pid='
+no_result
+verdict
+
+run_case longctx_on_a_speculative_arm_is_refused 1 \
+    "the long-context row is autoregressive, and a drafter's rate is not" \
+    ARGS:--draft-model "ARGS:${WORK}/drafter" ARGS:--longctx ARGS:32k \
+    'GREP:measured on the plain arm only' \
+    'NOGREP:\[server\] pid='
+no_result
+verdict
+
+run_case a_longctx_prompt_served_from_a_cache_is_refused 1 \
+    "an input speed over a long prompt the engine took from a cache is not a cold one" \
+    ARGS:--longctx ARGS:32k \
+    'STUB_LONG_PROMPT_TOKENS=32764' \
+    'STUB_REUSED_LONG=100' \
+    "GREP:took 100 of the longctx_32k prompt.s tokens from a prompt cache"
+no_result
+verdict
+
+run_case a_longctx_prompt_of_another_size_is_refused 1 \
+    "a prompt the server counts far from the size in its name is not filed under it" \
+    ARGS:--longctx ARGS:32k \
+    'STUB_LONG_PROMPT_TOKENS=20000' \
+    'GREP:away from the 32768 it was built for'
+no_result
+verdict
+
+run_case an_unstable_longctx_rate_is_refused 3 \
+    "three long-context prefills that disagree past the band publish no engine input speed" \
+    ARGS:--longctx ARGS:32k \
+    'STUB_LONG_PROMPT_TOKENS=32764' \
+    'STUB_PREFILL_MS=250;250;250;200;212;200' \
+    'GREP:RANGE REFUSAL: .*longctx/longctx_32k/prefill_engine_tps'
+[ "$(jq_of "r['longctx']['longctx_32k']['prefill_engine_tps']['stable']")" = "False" ] ||
+    note_bad "the unstable engine rate was filed as stable"
 verdict
 
 # The protocol's fixed-prompt figure is the AUTOREGRESSIVE one. A rate a drafter

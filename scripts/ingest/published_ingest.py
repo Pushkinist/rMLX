@@ -14,9 +14,18 @@ One §8.5 record per measured thing, and the measured things are the samples:
                        `prompt_id` is that sample's own body, so the row joins
                        to the exact prompt it was measured on. The speculative
                        arm adds its per-round figures.
-  the fixed prompt     one record: output speed, input speed, TTFT, the two
-                       resident peaks and the Metal allocator peak, on the
-                       prompt fitted for this checkpoint.
+  the long-context     one record for each prompt of `longctx`, with the metric set
+  prompt               of the fixed prompt, filed under the digest of the checked-in
+                       file's body.
+  the greedy match     one record for each dataset of `greedy_match`: its five
+                       counts (`greedy_samples`, `greedy_identical`,
+                       `greedy_near_tie`, `greedy_refused`, `greedy_unjudgeable`),
+                       filed under the digest of the sample set both passes covered.
+  the fixed prompt     one record: output speed, input speed by both of its
+                       definitions (prompt over TTFT, and the engine's own
+                       prefill rate), TTFT, the two resident peaks and the
+                       Metal allocator peak, on the prompt fitted for this
+                       checkpoint.
 
 The per-dataset and macro averages are NOT recorded. They are means over the
 rows above, so storing them would put a derived number beside the numbers it is
@@ -355,6 +364,137 @@ def sample_records(
     return records
 
 
+def cold_prompt_metrics(block: dict[str, Any]) -> list[dict[str, Any]]:
+    """The metrics of one cold prompt measured three times: the fixed prompt and
+    each long-context prompt."""
+    rates = {
+        name: block[name] for name in ("decode_tps", "prefill_tps", "prefill_engine_tps")
+    }
+    return [
+        {
+            "name": "decode_tps_warm",
+            "value": rates["decode_tps"]["mean"],
+            "stddev": statistics.stdev(rates["decode_tps"]["pass_means"]),
+        },
+        {
+            "name": "prefill_tps",
+            "value": rates["prefill_tps"]["mean"],
+            "stddev": statistics.stdev(rates["prefill_tps"]["pass_means"]),
+        },
+        {
+            "name": "prefill_engine_tps",
+            "value": rates["prefill_engine_tps"]["mean"],
+            "stddev": statistics.stdev(rates["prefill_engine_tps"]["pass_means"]),
+        },
+        {"name": "ttft_warm_ms", "value": block["ttft_ms"]["mean"]},
+        {
+            "name": "peak_phys_footprint_mb",
+            "value": block["phys_footprint_bytes"]["max"] / 1e6,
+        },
+        {"name": "peak_rss_mb", "value": block["rss_bytes"]["max"] / 1e6},
+        {"name": "metal_peak_alloc_mb", "value": block["metal_peak_alloc_mb"]["max"]},
+    ]
+
+
+def longctx_records(
+    result: dict[str, Any], args: argparse.Namespace, notes: str, repo_root: Path
+) -> list[dict[str, Any]]:
+    """One record per long-context prompt, filed under the digest of its body."""
+    records = []
+    for label, block in sorted((result.get("longctx") or {}).items()):
+        path = repo_root / "prompts" / block["file"]
+        blob = path.read_bytes()
+        if hashlib.sha256(blob).hexdigest() != block["file_sha256"]:
+            raise Refused(
+                f"{label}: {path.name} no longer hashes to the digest the run "
+                "recorded for it, so the row would be attributed to a prompt that "
+                "was not measured"
+            )
+        messages = json.loads(blob)["messages"]
+        if body_sha256(messages) != block["body_sha256"]:
+            raise Refused(
+                f"{label}: the body of {path.name} does not hash to the digest the "
+                "run recorded for it"
+            )
+        decode = block["decode_tps"]
+        records.append(
+            {
+                **base_record(result, args),
+                "ctx_max": block["ctx_max"],
+                "temperature": 0.0,
+                "prompt": {
+                    "name": f"published/{label}",
+                    "body": messages,
+                    "notes": (
+                        f"{path.name} from prompts/, sent as it is checked in; the "
+                        f"file was built for {block['target_tokens']} tokens"
+                    ),
+                },
+                "prompt_tokens": block["prompt_tokens"],
+                "max_tokens": block["max_tokens"],
+                "notes": (
+                    notes
+                    + f"; {label}, plain decode, a server of its own for each run at "
+                    + f"a context ceiling of {block['ctx_max']}; run decode_tps "
+                    + " ".join(f"{v:.3f}" for v in decode["pass_means"])
+                    + f"; range {decode['range_pct']:.2f}%"
+                    + "; resident figures are the peak of a gauge sampled every "
+                    + f"{block['memory_poll_ms']} ms, so they are a lower bound"
+                ),
+                "metrics": cold_prompt_metrics(block),
+            }
+        )
+    return records
+
+
+def greedy_records(
+    result: dict[str, Any], args: argparse.Namespace, notes: str
+) -> list[dict[str, Any]]:
+    """One record per dataset of the greedy match against plain decode."""
+    match = result.get("greedy_match")
+    if not match:
+        return []
+    pass_meta = result["greedy_pass"]
+    records = []
+    for dataset, entry in sorted(match["datasets"].items()):
+        judged = entry["identical"] + entry["near_tie"] + entry["refused"] + entry["unjudgeable"]
+        if judged != entry["samples"]:
+            raise Refused(
+                f"greedy match, {dataset}: {judged} samples are in a class where "
+                f"{entry['samples']} were answered"
+            )
+        records.append(
+            {
+                **base_record(result, args),
+                "temperature": 0.0,
+                "prompt": {
+                    "name": f"published/greedy/{dataset}",
+                    "body": {"dataset": dataset, "set_sha256": pass_meta["set_sha256"]},
+                    "notes": (
+                        f"the {dataset} samples of the greedy pass, named by the "
+                        "digest of the sample set both passes were sealed over"
+                    ),
+                },
+                "max_tokens": result["protocol"]["macro_max_tokens"],
+                "notes": (
+                    notes
+                    + f"; greedy pass, temperature 0, judged against the plain run "
+                    + f"started {match['against']['ts_utc']} by `rmlx eval spec-answer`; "
+                    + "a near tie is a divergence at a decision the verifier was nearly "
+                    + "tied on; the counts are of samples"
+                ),
+                "metrics": [
+                    {"name": "greedy_samples", "value": entry["samples"]},
+                    {"name": "greedy_identical", "value": entry["identical"]},
+                    {"name": "greedy_near_tie", "value": entry["near_tie"]},
+                    {"name": "greedy_refused", "value": entry["refused"]},
+                    {"name": "greedy_unjudgeable", "value": entry["unjudgeable"]},
+                ],
+            }
+        )
+    return records
+
+
 def fixed_record(
     result: dict[str, Any], args: argparse.Namespace, notes: str
 ) -> dict[str, Any] | None:
@@ -368,7 +508,7 @@ def fixed_record(
             "recorded for it, so the row would be attributed to a prompt that "
             "was not measured"
         )
-    rates = {name: block[name] for name in ("decode_tps", "prefill_tps")}
+    rates = {name: block[name] for name in ("decode_tps",)}
     return {
         **base_record(result, args),
         "prompt": {
@@ -394,28 +534,7 @@ def fixed_record(
             "true peak; the Metal peak is the allocator's own high-water mark "
             "since the server started, so it spans the warmup too"
         ),
-        "metrics": [
-            {
-                "name": "decode_tps_warm",
-                "value": rates["decode_tps"]["mean"],
-                "stddev": statistics.stdev(rates["decode_tps"]["pass_means"]),
-            },
-            {
-                "name": "prefill_tps",
-                "value": rates["prefill_tps"]["mean"],
-                "stddev": statistics.stdev(rates["prefill_tps"]["pass_means"]),
-            },
-            {"name": "ttft_warm_ms", "value": block["ttft_ms"]["mean"]},
-            {
-                "name": "peak_phys_footprint_mb",
-                "value": block["phys_footprint_bytes"]["max"] / 1e6,
-            },
-            {"name": "peak_rss_mb", "value": block["rss_bytes"]["max"] / 1e6},
-            {
-                "name": "metal_peak_alloc_mb",
-                "value": block["metal_peak_alloc_mb"]["max"],
-            },
-        ],
+        "metrics": cold_prompt_metrics(block),
     }
 
 
@@ -487,6 +606,8 @@ def main() -> int:
         notes = run_notes(result, binary_sha)
         records = sample_records(result, args, bodies, notes)
         fixed = fixed_record(result, args, notes)
+        longctx = longctx_records(result, args, notes, RMLX_REPO_ROOT)
+        greedy = greedy_records(result, args, notes)
     except Refused as exc:
         print(f"refusing: {exc}", file=sys.stderr)
         return 2
@@ -499,6 +620,7 @@ def main() -> int:
         return 2
     if fixed:
         records.append(fixed)
+    records += longctx + greedy
 
     if args.dry_run:
         for rec in records:

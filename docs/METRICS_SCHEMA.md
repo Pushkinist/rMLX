@@ -414,6 +414,7 @@ controller tick with `stage = 'admission_ctrl'`:
 | `decode_tps_warm` | `tps` | `higher_better` | Decode tokens/s with prefill excluded, warm. |
 | `decode_tps_cold` | `tps` | `higher_better` | Decode tokens/s on the first run after load. |
 | `prefill_tps` | `tps` | `higher_better` | Prefill tokens/s. |
+| `prefill_engine_tps` | `tps` | `higher_better` | The rMLX engine's own prefill rate: the prompt tokens the prefill ran the model over, per second of the prefill time the engine timed (the `generate: prefill` event). A prompt-cache hit counts no token. `prefill_tps` of the same row is the prompt over the time to first token. |
 | `overall_tps` | `tps` | `higher_better` | Generated tokens over the whole request, prefill included. |
 | `ttft_cold_ms` | `ms` | `lower_better` | Time to first token of a request that found its model not resident: it loaded the model or waited for a load, so the figure contains load time. |
 | `ttft_warm_ms` | `ms` | `lower_better` | Time to first token of a request that found its model resident. The first request after an eager preload is warm. |
@@ -438,6 +439,11 @@ controller tick with `stage = 'admission_ctrl'`:
 | `kv_cache_bytes` | `bytes` | `lower_better` | Resident KV bytes after decode. See below. |
 | `tps_per_gb_ram` | `ratio` | `higher_better` | `decode_tps_warm / peak_rss_gb`. |
 | `task_pass_at_1` | `ratio` | `higher_better` | Quality-probe pass rate, 0.0–1.0. |
+| `greedy_samples` | `count` | `higher_better` | Samples of a dataset a speculative run answered at temperature 0, to be judged against plain decode (`scripts/lib/published_greedy.py`). The five `greedy_*` rows of one dataset are one record and add up: identical, near tie, refused and unjudgeable are the classes of the samples. |
+| `greedy_identical` | `count` | `higher_better` | Samples whose speculative answer, reasoning included, equals the plain answer to the last character. |
+| `greedy_near_tie` | `count` | `lower_better` | Samples whose answers first differ at a decision the verifier was nearly tied on (`rmlx eval spec-answer`). A near tie is the oracle's reading of one divergence; it does not show the rest of the answer agrees. |
+| `greedy_refused` | `count` | `lower_better` | Samples whose answers differ where the verifier was not tied, or where one run stopped well before the other. |
+| `greedy_unjudgeable` | `count` | `lower_better` | Samples whose pair the oracle could not read. |
 | `prompt_cache_hits` | `count` | `higher_better` | Prompt-cache prefix matches, cumulative per server. |
 | `prompt_cache_misses` | `count` | `lower_better` | Prompt-cache lookups with no match, cumulative per server. |
 | `prompt_cache_bytes` | `bytes` | `lower_better` | RAM held by the occupied prompt-cache slots. |
@@ -514,7 +520,7 @@ measurement. The families differ in whether `0` itself is one:
 
 | Family | Floor | Ceiling | Why |
 |---|---|---|---|
-| Rates (`tps`, `mb/s`, `tps_per_gb_ram`) | `0` excluded | `1e4`; `prefill_tps` and `tps_per_gb_ram` `1e5`; `mb/s` `1e6` | A zero rate means no token was produced. |
+| Rates (`tps`, `mb/s`, `tps_per_gb_ram`) | `0` excluded | `1e4`; `prefill_tps`, `prefill_engine_tps` and `tps_per_gb_ram` `1e5`; `mb/s` `1e6` | A zero rate means no token was produced. |
 | Durations (`ms`) | `0` included | `3.6e6` (1 h) | A sub-ms span rounds to 0. A span past an hour is a hung run. |
 | Counters (`count`) | `0` included | `1e12` | Zero cache hits is real. |
 | Gauges (`mb`, `bytes`) | `0` included, except `peak_rss_mb` and `peak_phys_footprint_mb` | `1e9` MB, `1e13` B | A live process always has RSS. A run can allocate no Metal. |
@@ -653,7 +659,8 @@ For the fifteen cross-backend metrics (`BACKEND_METRIC_SPEC`):
 it and no recording path is wired. The other `rmlx` entries of
 `COVERAGE_MATRIX` are `yes` for the prompt-cache, load-phase, queue, live
 token, ITL, speculative, SSD, `prefill_duration_ms` and `tpot_*` metrics. The
-`ppl_*` metrics and `peak_phys_footprint_mb` have no coverage entry.
+`ppl_*` metrics, `peak_phys_footprint_mb`, `prefill_engine_tps` and the
+`greedy_*` counts have no coverage entry.
 
 The server's metrics drainer writes `observations`; its
 `event_kind_to_metrics` (`crates/rmlx-server/src/metrics_drainer.rs`) is the

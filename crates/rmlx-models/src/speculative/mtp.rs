@@ -687,7 +687,6 @@ impl RoundDrafter for SidecarRound<'_> {
             device,
             cancel,
         )?;
-        let prefill_ns = prefill_t0.elapsed().as_nanos();
 
         // The sidecar's drafting position is the verifier prefix consumed so
         // far. After the prompt less its last token, plus the carry forward
@@ -706,11 +705,13 @@ impl RoundDrafter for SidecarRound<'_> {
         )?;
         self.draft_pos += 1;
         super::guard_verifier_prefill_logits(ctx.verifier, &r0_logits, prompt.len())?;
+        let prefill_ns = prefill_t0.elapsed().as_nanos();
         self.h_cond = Some(r0_hidden);
         let seed = ctx.draw.seed_token(&r0_logits, device)?;
         Ok(Prefilled {
             seed: Seed::Emitted(seed),
             prefill_ns,
+            draft_prefill_ns: 0,
             // It scores every position over the verifier's whole vocabulary.
             restricted_read_back: false,
             // The sidecar slices one verifier row per round and projects

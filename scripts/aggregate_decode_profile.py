@@ -4,7 +4,7 @@
 Reads per-model decode_profile lines from `profile_<MODEL>.txt` files and emits
 one CSV row per model with:
 
-    model, arch, quant, n_steps, prefill_ms, forward_total_ms, eval_total_ms,
+    model, arch, quant, n_steps, forward_total_ms, eval_total_ms,
     step_total_ms, forward_per_step_ms, eval_per_step_ms, decode_tps
 
 `decode_tps` is computed as `n_steps * 1000 / step_total_ms` (the closed-form
@@ -43,7 +43,7 @@ ARCH_QUANT = {
 
 
 # Compact line emitted by tracing-subscriber:
-#   ...INFO decode_profile: decode_profile arch="..." n_steps=31 prefill_ms=5031.7 ...
+#   ...INFO decode_profile: decode_profile arch="..." n_steps=31 forward_total_ms=612.3 ...
 # stdout-fmt layer emits ANSI colour codes around the field markers; strip
 # them before parsing.
 ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
@@ -82,7 +82,7 @@ def main() -> None:
 
     cols = [
         "model", "arch", "quant", "n_steps",
-        "prefill_ms", "forward_total_ms", "eval_total_ms", "step_total_ms",
+        "forward_total_ms", "eval_total_ms", "step_total_ms",
         "forward_per_step_ms", "eval_per_step_ms", "decode_tps",
     ]
     print(",".join(cols))
@@ -116,7 +116,6 @@ def main() -> None:
             arch,
             quant,
             str(n_steps_val),
-            f'{rec.get("prefill_ms", ""):.3f}' if isinstance(rec.get("prefill_ms"), float) else "",
             f'{rec.get("forward_total_ms", ""):.3f}' if isinstance(rec.get("forward_total_ms"), float) else "",
             f'{rec.get("eval_total_ms", ""):.3f}' if isinstance(rec.get("eval_total_ms"), float) else "",
             f'{rec.get("step_total_ms", ""):.3f}' if isinstance(rec.get("step_total_ms"), float) else "",

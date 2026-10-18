@@ -1937,6 +1937,10 @@ pub fn generate_greedy<'a>(
             token_id = last_id,
             "qwen3 generate_greedy: prompt cache EXACT HIT"
         );
+        crate::decode_loop::log_prefill(
+            "Qwen3ForCausalLM",
+            &crate::decode_loop::PrefillReport::exact(prompt_ids.len()),
+        );
         let ends = crate::decode_loop::emit_replayed_token(
             &mut constraint,
             step_fn,
@@ -2060,6 +2064,7 @@ pub fn generate_greedy<'a>(
 
     let logits_flat = prefill_logits.reshape(&[1, vocab], device)?;
     logits_flat.eval()?;
+    let prefill_ns = prefill_t0.elapsed().as_nanos();
 
     let logit_bytes = logits_flat.to_bytes()?;
     let nan_count = count_nan_in_bytes(&logit_bytes, logits_flat.dtype());
@@ -2111,7 +2116,10 @@ pub fn generate_greedy<'a>(
     }
     // Push prefill token into history.
     ctx.token_history.push(last_id);
-    let prefill_total_ns = prefill_t0.elapsed().as_nanos();
+    crate::decode_loop::log_prefill(
+        "Qwen3ForCausalLM",
+        &crate::decode_loop::PrefillReport::cold(prompt_ids.len(), prefill_ns),
+    );
 
     let piece = tokenizer
         .id_to_token(last_id)
@@ -2237,7 +2245,6 @@ pub fn generate_greedy<'a>(
         model.kv_bytes.store(kv_bytes, post);
     }
 
-    let prefill_ms = (prefill_total_ns as f64) / 1.0e6;
     let forward_ms = (stats.forward_total_ns as f64) / 1.0e6;
     let eval_ms = (stats.eval_total_ns as f64) / 1.0e6;
     let step_ms = (stats.step_total_ns as f64) / 1.0e6;
@@ -2246,7 +2253,6 @@ pub fn generate_greedy<'a>(
         target: "decode_profile",
         arch = "Qwen3ForCausalLM",
         n_steps = stats.decode_steps,
-        prefill_ms,
         forward_total_ms = forward_ms,
         eval_total_ms = eval_ms,
         step_total_ms = step_ms,

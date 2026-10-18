@@ -190,6 +190,10 @@ pub fn generate_greedy(
             token_id = last_id,
             "qwen2 generate_greedy: prompt cache EXACT HIT"
         );
+        crate::decode_loop::log_prefill(
+            "Qwen2ForCausalLM",
+            &crate::decode_loop::PrefillReport::exact(prompt_ids.len()),
+        );
         let ends = crate::decode_loop::emit_replayed_token(
             &mut constraint,
             step_fn,
@@ -235,13 +239,7 @@ pub fn generate_greedy(
             let kv_bytes: u64 = caches.iter().map(|c| c.resident_bytes()).sum();
             model.kv_bytes.store(kv_bytes, post);
         }
-        log_decode_profile(
-            0.0,
-            forward_total_ns,
-            eval_total_ns,
-            step_total_ns,
-            decode_steps,
-        );
+        log_decode_profile(forward_total_ns, eval_total_ns, step_total_ns, decode_steps);
         return Ok(steps);
     }
 
@@ -344,6 +342,7 @@ pub fn generate_greedy(
 
     let logits_flat = prefill_logits.reshape(&[1, vocab], device)?;
     logits_flat.eval()?;
+    let prefill_ns = prefill_t0.elapsed().as_nanos();
 
     let logit_bytes = logits_flat.to_bytes()?;
     let nan_count = count_nan_in_bytes(&logit_bytes, logits_flat.dtype());
@@ -407,7 +406,10 @@ pub fn generate_greedy(
     }
     // Push prefill token into history.
     token_history.push(last_id);
-    let prefill_total_ns = prefill_t0.elapsed().as_nanos();
+    crate::decode_loop::log_prefill(
+        "Qwen2ForCausalLM",
+        &crate::decode_loop::PrefillReport::cold(prompt_ids.len(), prefill_ns),
+    );
 
     let piece = tokenizer
         .id_to_token(last_id)
@@ -534,13 +536,7 @@ pub fn generate_greedy(
         model.kv_bytes.store(kv_bytes, post);
     }
 
-    log_decode_profile(
-        (prefill_total_ns as f64) / 1.0e6,
-        forward_total_ns,
-        eval_total_ns,
-        step_total_ns,
-        decode_steps,
-    );
+    log_decode_profile(forward_total_ns, eval_total_ns, step_total_ns, decode_steps);
 
     Ok(steps)
 }
@@ -837,10 +833,7 @@ fn decode_loop(
 }
 
 /// Emit the `decode_profile` info event for one generate call.
-///
-/// `prefill_ms` is `0.0` on the Exact-hit path (no prefill ran).
 fn log_decode_profile(
-    prefill_ms: f64,
     forward_total_ns: u128,
     eval_total_ns: u128,
     step_total_ns: u128,
@@ -854,7 +847,6 @@ fn log_decode_profile(
         target: "decode_profile",
         arch = "Qwen2ForCausalLM",
         n_steps = decode_steps,
-        prefill_ms,
         forward_total_ms = forward_ms,
         eval_total_ms = eval_ms,
         step_total_ms = step_ms,

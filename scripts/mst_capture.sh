@@ -85,7 +85,8 @@ usage: mst_capture.sh --model <snapshot-abs-path>
          [--time-limit S]         seconds to record (default 12)
          [--skip-ms N]            drop the first N ms of THIS PROCESS's GPU work
                                   from the summary. DEFAULT: the prefill_ms this
-                                  very run reported, read back from its own log,
+                                  very run reported in its `generate: prefill`
+                                  event, read back from its own log,
                                   so the decode window needs no guessing. Weight
                                   load submits nothing and is absent already.
          [--binary PATH]          rmlx to run (default target/release/rmlx)
@@ -277,7 +278,7 @@ fi
 
 # Nothing in the GPU-interval table marks where prefill ends — weight load
 # submits no work, so the process's first row is already prefill and the
-# boundary is invisible. The run itself knows: `decode_profile{prefill_ms}` is a
+# boundary is invisible. The run itself knows: `generate: prefill{prefill_ms}` is a
 # plain info! event, so it is in the run's own log at the default level even
 # though `xctrace --launch` swallowed the child's stdout.
 if [ -z "$SKIP_MS" ]; then
@@ -289,7 +290,7 @@ if [ -z "$SKIP_MS" ]; then
 		echo "skip:       ${SKIP_MS} ms — measured prefill_ms, read back from this run's log"
 	else
 		SKIP_MS=0
-		echo "WARNING: no decode_profile{prefill_ms} in ${log_file:-<no log>}; the" >&2
+		echo "WARNING: no generate: prefill event in ${log_file:-<no log>}; the" >&2
 		echo "  summary below INCLUDES prefill. Pass --skip-ms explicitly." >&2
 	fi
 fi
@@ -307,7 +308,8 @@ summarise() { # skip_ms [csv_path]
 }
 
 # Both windows are printed. The full one is what the within-run cross-check
-# needs (its span should equal prefill_ms + step_total_ms from the same log);
+# needs (its span should be close to prefill_ms + step_total_ms from the same log,
+# the draw of the first token sitting between the two);
 # the decode-only one is what kernel questions are asked of.
 echo ""
 echo "== full window (prefill included) =============================="

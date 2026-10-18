@@ -7,11 +7,17 @@ run of it: the engine's own reading of the decode window, the client's reading
 of the same window, the prompt count the server gave the body, and the peak the
 process-memory gauges reached while the request was in flight.
 
-INPUT SPEED IS PROMPT TOKENS OVER TTFT, on a cold prompt cache. The harness
-sends this request once per pass, before any cell request and after a warmup
-whose prompt shares no prefix with it, so the count in the denominator is a
-prefill that actually happened. A run whose TTFT is not a positive duration has
-no input speed and is refused rather than divided by.
+INPUT SPEED HAS TWO DEFINITIONS, on a cold prompt cache. The harness sends this
+request once per pass, before any cell request and after a warmup whose prompt
+shares no prefix with it, so the count in the denominator is a prefill that
+actually happened. `prefill_tps` is prompt tokens over TTFT: what a client sees.
+`prefill_engine_tps` is the tokens the prefill ran the model over, over the
+prefill time the engine timed itself, off its `generate: prefill` event: what
+the engine reports as its own prefill rate. The engine's event also says how
+many prompt tokens a cache supplied, so a prompt that was not cold is refused
+instead of published under a name that says it was. A run whose TTFT or prefill
+time is not a positive duration has no input speed and is refused rather than
+divided by.
 
 RESIDENT MEMORY IS A SAMPLED PEAK. `phys_footprint` is a gauge, so the largest
 value seen at the poll interval is a lower bound on the true peak. The interval
@@ -56,7 +62,7 @@ def number(values, key, cast=float):
         raise RunError(f"the client read {key}={values[key]!r}, not a number") from exc
 
 
-def peak_memory(path):
+def peak_memory(path, what="the fixed-prompt request"):
     """`(phys_bytes, rss_bytes, samples)` over the poll file."""
     peaks = {"phys": 0, "rss": 0}
     samples = 0
@@ -72,9 +78,9 @@ def peak_memory(path):
         samples += 1
     if not samples:
         raise RunError(
-            "the server published no process-memory gauge while the fixed-prompt "
-            "request was in flight, so there is no resident figure for it. A peak "
-            "over no sample is not a small peak"
+            f"the server published no process-memory gauge while {what} was in "
+            "flight, so there is no resident figure for it. A peak over no sample "
+            "is not a small peak"
         )
     for name, value in peaks.items():
         if value <= 0:
@@ -83,6 +89,77 @@ def peak_memory(path):
                 "figure; the gauge was published but carries nothing"
             )
     return peaks["phys"], peaks["rss"], samples
+
+
+def cold_request(row, client, what, cross_check_pct):
+    """The readings of one request on a cold prompt cache, checked against each other.
+
+    `row` is the engine's account of the request (`published_run_log.py`) and
+    `client` the client's. The prompt count is the server's, the engine's prefill
+    event must be of the same request, and the engine's decode rate must agree with
+    the client's reading of the same window. `what` names the request in a refusal.
+    """
+    prompt_tokens = number(client, "prompt_tokens", int)
+
+    ttft_ms = row["ttft_ms"]
+    if not isinstance(ttft_ms, (int, float)) or ttft_ms <= 0:
+        raise RunError(
+            f"the engine reported ttft_ms={ttft_ms!r}, which is not a prefill "
+            "duration; input speed is prompt tokens over it"
+        )
+
+    for name in ("prompt_tokens", "reused_tokens", "forwarded_tokens", "prefill_ms"):
+        if name not in row:
+            raise RunError(f"the engine's prefill event for this request carries no {name}")
+    if row["prompt_tokens"] != prompt_tokens:
+        raise RunError(
+            f"the engine's prefill event counts {row['prompt_tokens']} prompt tokens "
+            f"where the server counted {prompt_tokens} for this request: the event "
+            "belongs to another request"
+        )
+    if row["reused_tokens"] != 0:
+        raise RunError(
+            f"the engine took {row['reused_tokens']} of {what}'s tokens "
+            "from a prompt cache, so its input speed is not over a cold prompt"
+        )
+    if row["forwarded_tokens"] != prompt_tokens:
+        raise RunError(
+            f"the engine ran the model over {row['forwarded_tokens']} of the "
+            f"{prompt_tokens} prompt tokens, so its prefill is not of the whole prompt"
+        )
+    prefill_ms = row["prefill_ms"]
+    if not isinstance(prefill_ms, (int, float)) or prefill_ms <= 0:
+        raise RunError(
+            f"the engine reported prefill_ms={prefill_ms!r}, which is not a prefill "
+            "duration; its input speed is the forwarded tokens over it"
+        )
+
+    engine_tps = row["decode_tps"]
+    client_tps = number(client, "decode_tps")
+    if engine_tps <= 0:
+        raise RunError(
+            f"the engine reported decode_tps={engine_tps!r} for {what}, "
+            "which is not a rate"
+        )
+    off = abs(client_tps - engine_tps) / engine_tps * 100.0
+    if off > cross_check_pct:
+        raise RunError(
+            f"the engine read {engine_tps:.3f} tok/s over {what}'s decode "
+            f"window and the client read {client_tps:.3f} over the same window, "
+            f"{off:.1f}% apart and past the {cross_check_pct:.0f}% band two "
+            "readings of one window are allowed"
+        )
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": number(client, "completion_tokens", int),
+        "ttft_ms": ttft_ms,
+        "decode_tps": engine_tps,
+        "client_decode_tps": client_tps,
+        "prefill_tps": prompt_tokens / (ttft_ms / 1000.0),
+        "prefill_ms": prefill_ms,
+        "prefill_engine_tps": row["forwarded_tokens"] / (prefill_ms / 1000.0),
+        "metal_peak_alloc_mb": row["metal_peak_alloc_mb"],
+    }
 
 
 def assemble(args):
@@ -103,35 +180,12 @@ def assemble(args):
             f"where the fit measured {fit['prompt_tokens']} for the same body; "
             "the two counts are of different prompts"
         )
-
-    ttft_ms = row["ttft_ms"]
-    if not isinstance(ttft_ms, (int, float)) or ttft_ms <= 0:
-        raise RunError(
-            f"the engine reported ttft_ms={ttft_ms!r}, which is not a prefill "
-            "duration; input speed is prompt tokens over it"
-        )
-
-    engine_tps = row["decode_tps"]
-    client_tps = number(client, "decode_tps")
-    if engine_tps <= 0:
-        raise RunError(
-            f"the engine reported decode_tps={engine_tps!r} for the fixed prompt, "
-            "which is not a rate"
-        )
-    off = abs(client_tps - engine_tps) / engine_tps * 100.0
-    if off > args.cross_check_pct:
-        raise RunError(
-            f"the engine read {engine_tps:.3f} tok/s over the fixed prompt's decode "
-            f"window and the client read {client_tps:.3f} over the same window, "
-            f"{off:.1f}% apart and past the {args.cross_check_pct:.0f}% band two "
-            "readings of one window are allowed"
-        )
+    figures = cold_request(row, client, "the fixed prompt", args.cross_check_pct)
 
     phys, rss, samples = peak_memory(args.memory)
     return {
         "pass": args.pass_number,
         "target_tokens": fit["target_tokens"],
-        "prompt_tokens": prompt_tokens,
         "max_tokens": fit["max_tokens"],
         "body_sha256": fit["body_sha256"],
         "corpus": fit["corpus"],
@@ -143,14 +197,9 @@ def assemble(args):
         "words": fit["words"],
         "filler_word": fit["filler_word"],
         "filler_reps": fit["filler_reps"],
-        "completion_tokens": number(client, "completion_tokens", int),
-        "ttft_ms": ttft_ms,
-        "decode_tps": engine_tps,
-        "client_decode_tps": client_tps,
-        "prefill_tps": prompt_tokens / (ttft_ms / 1000.0),
+        **figures,
         "phys_footprint_bytes": phys,
         "rss_bytes": rss,
-        "metal_peak_alloc_mb": row["metal_peak_alloc_mb"],
         "memory_samples": samples,
         "memory_poll_ms": args.memory_poll_ms,
     }

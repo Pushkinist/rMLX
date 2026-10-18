@@ -46,6 +46,7 @@ cat >"${BINARY}" <<'BINEOF'
 # generate_streaming: TTFT
 # generate: ITL stats
 # generate: metal peak alloc
+# generate: prefill
 # generate: host categorical sampler active
 # cache-type resolved
 # mtp_generate: done
@@ -171,6 +172,13 @@ for number in (1, 2, 3):
             "client_decode_tps": 40.0,
         })
 
+longctx_file = published.parent / "longctx_32k.json"
+longctx_blob = longctx_file.read_bytes()
+longctx_messages = json.loads(longctx_blob)["messages"]
+longctx_body = hashlib.sha256(
+    json.dumps(longctx_messages, ensure_ascii=False, separators=(",", ":")).encode()
+).hexdigest()
+
 fixed_messages = [{"role": "user", "content": "Summarise this.\n\nA fixed body."}]
 fixed_digest = hashlib.sha256(
     json.dumps(fixed_messages, ensure_ascii=False, separators=(",", ":")).encode()
@@ -183,6 +191,7 @@ markers = {
         "generate_streaming: TTFT",
         "generate: ITL stats",
         "generate: metal peak alloc",
+        "generate: prefill",
         "generate: host categorical sampler active",
         "cache-type resolved",
     )
@@ -274,8 +283,11 @@ out.write_text(json.dumps({
         "messages": fixed_messages,
         "decode_tps": summary([40.0, 40.1, 40.2]),
         "prefill_tps": summary([4500.0, 4501.0, 4502.0]),
+        "prefill_engine_tps": summary([4990.0, 5000.0, 5010.0]),
         "ttft_ms": {"pass_means": [300.0, 301.0, 302.0], "mean": 301.0,
                     "range_pct": 0.66},
+        "prefill_ms": {"pass_means": [270.0, 271.0, 272.0], "mean": 271.0,
+                       "range_pct": 0.74},
         "completion_tokens": {"pass_means": [900.0] * 3, "mean": 900.0,
                               "range_pct": 0.0},
         "phys_footprint_bytes": {"run_values": [31_000_000_000] * 3,
@@ -284,6 +296,48 @@ out.write_text(json.dumps({
                       "max": 29_000_000_000, "min": 29_000_000_000},
         "metal_peak_alloc_mb": {"run_values": [28_100, 28_300, 28_200],
                                 "max": 28_300, "min": 28_100},
+    },
+    "longctx": {
+        "longctx_32k": {
+            "label": "longctx_32k",
+            "file": "longctx_32k.json",
+            "file_sha256": hashlib.sha256(longctx_blob).hexdigest(),
+            "body_sha256": longctx_body,
+            "prompt_tokens": 32764,
+            "target_tokens": 32768,
+            "max_tokens": 200,
+            "ctx_max": 41160,
+            "memory_poll_ms": 250,
+            "decode_tps": summary([38.0, 38.2, 38.4]),
+            "prefill_tps": summary([5100.0, 5102.0, 5104.0]),
+            "prefill_engine_tps": summary([5150.0, 5160.0, 5170.0]),
+            "ttft_ms": {"pass_means": [6400.0, 6410.0, 6420.0], "mean": 6410.0,
+                        "range_pct": 0.31},
+            "prefill_ms": {"pass_means": [6360.0, 6370.0, 6380.0], "mean": 6370.0,
+                           "range_pct": 0.31},
+            "completion_tokens": {"pass_means": [200.0] * 3, "mean": 200.0,
+                                  "range_pct": 0.0},
+            "phys_footprint_bytes": {"run_values": [33_000_000_000] * 3,
+                                     "max": 33_000_000_000, "min": 33_000_000_000},
+            "rss_bytes": {"run_values": [32_000_000_000] * 3,
+                          "max": 32_000_000_000, "min": 32_000_000_000},
+            "metal_peak_alloc_mb": {"run_values": [30_000, 30_100, 30_050],
+                                    "max": 30_100, "min": 30_000},
+        }
+    },
+    "greedy_pass": {"arm": "speculative", "set_sha256": "c" * 64, "samples": 4},
+    "greedy_match": {
+        "against": {"arm": "plain", "ts_utc": "2026-09-05T00:00:00Z",
+                    "binary_sha256": "d" * 64},
+        "datasets": {
+            "mt_bench": {"samples": 2, "identical": 1, "near_tie": 1, "refused": 0,
+                         "unjudgeable": 0, "identical_rate": 0.5,
+                         "identical_or_near_tie_rate": 1.0},
+            "math_500": {"samples": 2, "identical": 0, "near_tie": 0, "refused": 1,
+                         "unjudgeable": 1, "identical_rate": 0.0,
+                         "identical_or_near_tie_rate": 0.0},
+        },
+        "differing": [],
     },
     "samples": samples,
 }, indent=1), encoding="utf-8")
@@ -387,12 +441,12 @@ echo
 
 ingest_case one_record_per_sample_plus_the_fixed_prompt 0 \
     "the measured things are the samples, and the fixed prompt is one more" \
-    "^5 records$" ARGS:--dry-run
+    "^8 records$" ARGS:--dry-run
 verdict
 
 ingest_case sample_rows_carry_their_own_prompt 0 \
     "each row's prompt_id is the body that sample was measured on" ""
-[ "$(recs_check "len(recs)")" = "5" ] || note_bad "$(recs_check "len(recs)") records"
+[ "$(recs_check "len(recs)")" = "8" ] || note_bad "$(recs_check "len(recs)") records"
 [ "$(recs_check "sum(1 for r in recs if r['prompt']['name'].startswith('published/fixed_'))")" = "1" ] ||
     note_bad "no fixed-prompt record"
 [ "$(recs_check "all(r['n_measure'] == 3 for r in recs)")" = "True" ] ||
@@ -407,11 +461,62 @@ result = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 print(json.dumps(sorted({s["body_sha256"] for s in result["samples"]})))
 BODIES
 )"
-[ "$(recs_check "__import__('json').dumps(sorted(__import__('hashlib').sha256(__import__('json').dumps(r['prompt']['body'], ensure_ascii=False, separators=(',', ':')).encode()).hexdigest() for r in recs if not r['prompt']['name'].startswith('published/fixed_')))")" = "${WANT_BODIES}" ] ||
+[ "$(recs_check "__import__('json').dumps(sorted(__import__('hashlib').sha256(__import__('json').dumps(r['prompt']['body'], ensure_ascii=False, separators=(',', ':')).encode()).hexdigest() for r in recs if not r['prompt']['name'].startswith(('published/fixed_', 'published/longctx_', 'published/greedy/'))))")" = "${WANT_BODIES}" ] ||
     note_bad "the submitted bodies are not the measured ones"
 [ "$(recs_check "sorted({m['name'] for r in recs for m in r['metrics']})")" = \
-  "['accept_rate', 'accepted_per_step', 'decode_tps_warm', 'metal_peak_alloc_mb', 'peak_phys_footprint_mb', 'peak_rss_mb', 'prefill_tps', 'tokens_per_round', 'ttft_warm_ms']" ] ||
+  "['accept_rate', 'accepted_per_step', 'decode_tps_warm', 'greedy_identical', 'greedy_near_tie', 'greedy_refused', 'greedy_samples', 'greedy_unjudgeable', 'metal_peak_alloc_mb', 'peak_phys_footprint_mb', 'peak_rss_mb', 'prefill_engine_tps', 'prefill_tps', 'tokens_per_round', 'ttft_warm_ms']" ] ||
     note_bad "metrics=$(recs_check "sorted({m['name'] for r in recs for m in r['metrics']})")"
+verdict
+
+# The long-context prompt is a checked-in file, so its row is filed under the
+# digest of that file's body, with the metric set of the fixed prompt and the
+# ceiling its own servers ran at.
+ingest_case a_long_context_prompt_is_one_record_under_its_own_body 0 \
+    "the long-context row is a record of its own, under the body it was measured on" ""
+[ "$(recs_check "[(r['prompt']['name'], r['ctx_max'], r['max_tokens'], r['temperature'], r['prompt_tokens']) for r in recs if r['prompt']['name'].startswith('published/longctx_')]")" = \
+  "[('published/longctx_32k', 41160, 200, 0.0, 32764)]" ] ||
+    note_bad "longctx record: $(recs_check "[(r['prompt']['name'], r['ctx_max']) for r in recs if 'longctx' in r['prompt']['name']]")"
+[ "$(recs_check "sorted(m['name'] for r in recs if r['prompt']['name'] == 'published/longctx_32k' for m in r['metrics'])")" = \
+  "['decode_tps_warm', 'metal_peak_alloc_mb', 'peak_phys_footprint_mb', 'peak_rss_mb', 'prefill_engine_tps', 'prefill_tps', 'ttft_warm_ms']" ] ||
+    note_bad "longctx metrics"
+[ "$(recs_check "[m['value'] for r in recs if r['prompt']['name'] == 'published/longctx_32k' for m in r['metrics'] if m['name'] == 'prefill_engine_tps']")" = "[5160.0]" ] ||
+    note_bad "longctx engine rate"
+LC_BODY="$(python3 -c "import json, sys; print(json.load(open(sys.argv[1]))['longctx']['longctx_32k']['body_sha256'])" "${CASE_RESULT}")"
+[ "$(recs_check "__import__('hashlib').sha256(__import__('json').dumps(next(r['prompt']['body'] for r in recs if r['prompt']['name'] == 'published/longctx_32k'), ensure_ascii=False, separators=(',', ':')).encode()).hexdigest() == '${LC_BODY}'")" = "True" ] ||
+    note_bad "the long-context body is not the digest the run recorded"
+verdict
+
+ingest_case a_moved_long_context_file_is_refused 2 \
+    "a prompt file that no longer hashes to the digest the run recorded is not the prompt measured" \
+    "no longer hashes to the digest the run recorded" \
+    'MUTATE:result["longctx"]["longctx_32k"]["file_sha256"] = "0" * 64'
+verdict
+
+ingest_case the_greedy_match_is_one_record_per_dataset_of_counts 0 \
+    "each dataset's five counts are registry metrics of a record of its own" ""
+[ "$(recs_check "sorted((r['prompt']['name'], tuple((m['name'], m['value']) for m in r['metrics'])) for r in recs if r['prompt']['name'].startswith('published/greedy/'))")" = \
+  "[('published/greedy/math_500', (('greedy_samples', 2), ('greedy_identical', 0), ('greedy_near_tie', 0), ('greedy_refused', 1), ('greedy_unjudgeable', 1))), ('published/greedy/mt_bench', (('greedy_samples', 2), ('greedy_identical', 1), ('greedy_near_tie', 1), ('greedy_refused', 0), ('greedy_unjudgeable', 0)))]" ] ||
+    note_bad "greedy records: $(recs_check "[(r['prompt']['name'], [m['value'] for m in r['metrics']]) for r in recs if 'greedy' in r['prompt']['name']]")"
+[ "$(recs_check "all(r['temperature'] == 0.0 and r['max_tokens'] == 1024 for r in recs if r['prompt']['name'].startswith('published/greedy/'))")" = "True" ] ||
+    note_bad "a greedy record is not at temperature 0 and the macro budget"
+verdict
+
+ingest_case a_greedy_class_count_that_is_not_the_samples_is_refused 2 \
+    "counts that do not add up to the samples answered are refused, not filed" \
+    "5 samples are in a class where 2 were answered" \
+    'MUTATE:result["greedy_match"]["datasets"]["math_500"]["refused"] = 4'
+verdict
+
+# The engine's own prefill rate is its own metric on the fixed row, beside the
+# prompt-over-TTFT one under its old name: the mean of the three runs and their
+# stddev, on the fixed row alone.
+ingest_case the_engine_input_speed_is_its_own_row_on_the_fixed_prompt 0 \
+    "prefill_engine_tps is recorded with its spread, apart from prefill_tps" ""
+# The fixed prompt and the long-context prompt each file one.
+[ "$(recs_check "sorted((m['value'], round(m['stddev'], 6)) for r in recs for m in r['metrics'] if m['name'] == 'prefill_engine_tps')")" = "[(5000.0, 10.0), (5160.0, 10.0)]" ] ||
+    note_bad "engine rows=$(recs_check "sorted((m['value'], m.get('stddev')) for r in recs for m in r['metrics'] if m['name'] == 'prefill_engine_tps')")"
+[ "$(recs_check "sorted(m['value'] for r in recs for m in r['metrics'] if m['name'] == 'prefill_tps')")" = "[4501.0, 5102.0]" ] ||
+    note_bad "prefill_tps rows=$(recs_check "sorted(m['value'] for r in recs for m in r['metrics'] if m['name'] == 'prefill_tps')")"
 verdict
 
 # The allocator's own peak is recorded as the maximum over the three runs, in
@@ -419,8 +524,8 @@ verdict
 # fixed-prompt row: a sample row has no such reading.
 ingest_case metal_peak_is_the_max_over_runs_on_the_fixed_row 0 \
     "the Metal peak is a maximum, in MiB, on the fixed row alone" ""
-[ "$(recs_check "[m['value'] for r in recs for m in r['metrics'] if m['name'] == 'metal_peak_alloc_mb']")" = "[28300]" ] ||
-    note_bad "metal peak rows=$(recs_check "[m['value'] for r in recs for m in r['metrics'] if m['name'] == 'metal_peak_alloc_mb']")"
+[ "$(recs_check "sorted(m['value'] for r in recs for m in r['metrics'] if m['name'] == 'metal_peak_alloc_mb')")" = "[28300, 30100]" ] ||
+    note_bad "metal peak rows=$(recs_check "sorted(m['value'] for r in recs for m in r['metrics'] if m['name'] == 'metal_peak_alloc_mb')")"
 verdict
 
 # A plain run has no round loop, so its round figures are null and not zero: a
@@ -454,7 +559,7 @@ ingest_case seed_and_temperature_are_the_engines 0 \
     "the row records the sampling the engine resolved" ""
 [ "$(recs_check "sorted({r['seed'] for r in recs})")" = "[42919]" ] ||
     note_bad "seed=$(recs_check "sorted({r['seed'] for r in recs})")"
-[ "$(recs_check "sorted({r['temperature'] for r in recs})")" = "[0.6]" ] ||
+[ "$(recs_check "sorted(set(r['temperature'] for r in recs if not r['prompt']['name'].startswith(('published/longctx_', 'published/greedy/'))))")" = "[0.6]" ] ||
     note_bad "temperature=$(recs_check "sorted({r['temperature'] for r in recs})")"
 [ "$(recs_check "all('seed engine default, identical in all three passes' in r['notes'] for r in recs)")" = "True" ] ||
     note_bad "a row does not say what its spread is a spread of"
@@ -584,7 +689,7 @@ verdict
 # clock. Its result is ingested as one.
 ingest_case result_without_a_clock_key_is_ingested_as_client 0 \
     "a result from before the stamp option timed its rates by the client clock" \
-    "^5 records$" ARGS:--dry-run \
+    "^8 records$" ARGS:--dry-run \
     'MUTATE:del result["protocol"]["client_clock"]'
 verdict
 
@@ -641,15 +746,15 @@ ingest_case staging_is_outside_the_pending_queue 0 \
     "not ingested"
 [ -d "${CASE_HOME}/metrics/buffer/pending" ] &&
     note_bad "the pending queue was created by a run that did not record"
-[ "$(recs_check "len(recs)")" = "5" ] || note_bad "$(recs_check "len(recs)") staged"
+[ "$(recs_check "len(recs)")" = "8" ] || note_bad "$(recs_check "len(recs)") staged"
 verdict
 
 ingest_case recording_leaves_the_queue_empty 0 \
     "each record passes through the queue and comes back out" \
-    "ingested 5/5" ARGS:--record
+    "ingested 8/8" ARGS:--record
 [ -z "$(ls -A "${CASE_HOME}/metrics/buffer/pending" 2>/dev/null)" ] ||
     note_bad "a record was left in the pending queue"
-[ "$(wc -l < "${WORK}/recorded.txt" | tr -d ' ')" = "5" ] ||
+[ "$(wc -l < "${WORK}/recorded.txt" | tr -d ' ')" = "8" ] ||
     note_bad "the recorder saw $(wc -l < "${WORK}/recorded.txt" | tr -d ' ') files"
 grep -q "metrics/buffer/pending/" "${WORK}/recorded.txt" ||
     note_bad "the recorder was handed a path outside the pending queue"
@@ -660,7 +765,7 @@ STUB_RECORD_EXIT=1 ingest_case a_failed_ingest_keeps_its_record 1 \
     "ingest FAILED" ARGS:--record
 [ -z "$(ls -A "${CASE_HOME}/metrics/buffer/pending" 2>/dev/null)" ] ||
     note_bad "a rejected record was left in the pending queue"
-[ "$(recs_check "len(recs)")" = "5" ] ||
+[ "$(recs_check "len(recs)")" = "8" ] ||
     note_bad "$(recs_check "len(recs)") records survived in staging"
 verdict
 
@@ -716,6 +821,28 @@ verdict
 STUB_SCALE=metal_peak_alloc_mb:1.01 ingest_case a_fixed_row_that_moved_is_refused 1 \
     "the fixed-prompt row is held to the result like the cells" \
     "re-query DISAGREES: fixed prompt: the row gives metal_peak_alloc_mb" ARGS:--record
+verdict
+
+STUB_SCALE=prefill_engine_tps:1.01 ingest_case an_engine_rate_that_moved_is_refused 1 \
+    "the engine input speed is re-queried like the other fixed-prompt rows" \
+    "re-query DISAGREES: fixed prompt: the row gives prefill_engine_tps" ARGS:--record
+grep -q "re-query DISAGREES: longctx_32k: the row gives prefill_engine_tps" "${CASE_OUT}" ||
+    note_bad "the long-context row was not re-queried beside the fixed one"
+verdict
+
+STUB_SCALE=greedy_identical:2 ingest_case a_greedy_count_that_moved_is_refused 1 \
+    "the greedy counts are re-queried, per dataset" \
+    "re-query DISAGREES: greedy match, mt_bench: the row gives greedy_identical" ARGS:--record
+verdict
+
+STUB_DROP=greedy_refused ingest_case a_lost_greedy_count_is_refused 1 \
+    "a count the store never filed is a partial record" \
+    "greedy match, math_500: the database holds 0 greedy_refused rows" ARGS:--record
+verdict
+
+STUB_DROP=prefill_engine_tps ingest_case a_lost_engine_rate_is_refused 1 \
+    "an engine rate the store never filed is a partial record" \
+    "fixed prompt: the database holds 0 prefill_engine_tps rows" ARGS:--record
 verdict
 
 STUB_DOUBLE=1 ingest_case a_result_recorded_twice_is_refused 1 \

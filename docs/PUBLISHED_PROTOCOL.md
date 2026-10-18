@@ -130,10 +130,21 @@ file with the measurement.
 | figure | measured | bound | % of bound |
 |---|---:|---:|---:|
 | output speed (tok/s) | 61.83 | 81.41 | 76.0% |
-| input speed (tok/s) | 4818.67 | — | — |
+| input speed, prompt over TTFT (tok/s) | 4818.67 | — | — |
+| input speed, engine's own (tok/s) | 4986.33 | — | — |
 | peak `phys_footprint` (GB) | 9.64 | 8.80 | 91.3% |
 | peak RSS (GB) | 9.42 | 8.80 | 93.4% |
 | peak Metal allocation (GB) | 9.56 | — | — |
+
+The two input-speed rows are the two definitions a third-party column may
+use. Prompt over TTFT is what a client sees: it adds the first token's
+draw and the step callback to the prefill. The engine's own rate is the
+1355 prompt tokens the prefill ran the model over,
+divided by the time the engine measured for the prefill forwards, up to the
+point their logits are forced, off its `generate: prefill` event (mean
+271.8 ms; the draw of the first token is not in it).
+The prompt cache was cold: the engine reports no reused token, or the run
+is refused. Both rows share one bound, a projection of the prefill rate.
 
 The two resident rows read the other way round — their bound is a
 **floor**, so the last column is how much of what the process held is
@@ -158,6 +169,67 @@ prefill from a measured anchor row in `runs.db` and reports nothing at
 all rather than guessing when it has none: a single achieved-GEMM
 constant is not defensible on this host, where the recorded rows span a
 7× range across models.
+
+## Long context — `longctx_32k`, plain decode
+
+`longctx_32k.json` sent as it is checked in, at temperature 0 and a
+200-token output budget, three runs on a server each
+(context ceiling 40968). The checkpoint's tokenizer counts it at
+32764 tokens; the file was built for 32768.
+The prompt cache was cold: the engine reports no reused token, or the run is
+refused. Plain decode only, because a rate a drafter produced is not the
+autoregressive one.
+
+| figure | measured | range % |
+|---|---:|---:|
+| time to first token (ms) | 6410.3 | 1.08 |
+| engine prefill time (ms) | 6365.7 | 0.99 |
+| input speed, prompt over TTFT (tok/s) | 5111.67 | 1.08 |
+| input speed, engine's own (tok/s) | 5147.00 | 0.99 |
+| output speed (tok/s) | 41.23 | 1.70 |
+| peak `phys_footprint` (GB) | 17.94 | — |
+| peak RSS (GB) | 17.23 | — |
+| peak Metal allocation (GB) | 17.67 | — |
+
+This row has no bound beside it. `perf_ceiling.py` prices a cell at the
+run's context ceiling, and this row ran under a larger one than the cells
+above, so a percentage of the ceiling here would be a percentage of another
+run's. The resident peaks are the largest of the three runs, sampled as the
+fixed prompt's are, and the Metal peak is the allocator's own high-water mark
+since that run's server started.
+
+## Greedy match against plain decode
+
+Every sample answered once at temperature 0, unstreamed and with logprobs, in a
+pass of its own after the speed passes: the one place this harness overrides the
+checkpoint's sampling, because two arms can only be compared token for token
+when neither draws. A sample is **identical** when the speculative answer,
+reasoning included, is the plain answer to the last character. A pair that
+differs is judged by the divergence oracle (`rmlx eval spec-answer`): a
+**near tie** is the verify pass scoring a block in one forward and flipping a
+decision the verifier was nearly tied on. That is the oracle's reading of the
+first divergence only: it says that decision was close, and nothing about
+whether the rest of the answer agrees;
+**refused** is a divergence where the verifier was not tied, or a run that
+stopped well before the other; **unjudgeable** is a pair the oracle could not
+read. The last column counts identical and near-tie samples together; it is
+not a claim that those answers are equivalent.
+
+| mode | dataset | samples | identical | near tie | refused | unjudgeable | identical % | identical or near tie % |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| `mtp_sidecar/block=7` | mt_bench | 80 | 78 | 2 | 0 | 0 | 97.5 | 100.0 |
+| `mtp_sidecar/block=7` | math_500 | 128 | 120 | 6 | 1 | 1 | 93.8 | 98.4 |
+| `mtp_sidecar/block=7` | humaneval | 128 | 128 | 0 | 0 | 0 | 100.0 | 100.0 |
+| `mtp_sidecar/block=7` | **all** | 336 | 326 | 8 | 1 | 1 | 97.0 | 99.4 |
+| `dflash/block=16,dflash/depth=accept_rate` | mt_bench | 80 | 80 | 0 | 0 | 0 | 100.0 | 100.0 |
+| `dflash/block=16,dflash/depth=accept_rate` | math_500 | 128 | 127 | 1 | 0 | 0 | 99.2 | 100.0 |
+| `dflash/block=16,dflash/depth=accept_rate` | humaneval | 128 | 128 | 0 | 0 | 0 | 100.0 | 100.0 |
+| `dflash/block=16,dflash/depth=accept_rate` | **all** | 336 | 335 | 1 | 0 | 0 | 99.7 | 100.0 |
+
+Judged against the plain run started at 2026-09-06T09:00:00Z. The two passes
+are of one checkpoint, one KV codec, one context ceiling and one sample set,
+or the comparison is refused. The sample count is in each row: read a rate
+over a few samples there.
 
 ## Perplexity
 
@@ -185,8 +257,6 @@ comparison more than a rate comparison. This harness does not measure
 them yet, so they are named here rather than left for a reader to notice
 their absence:
 
-- greedy token-match rate against plain decode on the same checkpoint, per dataset — the lossless proof
-- TTFT and decode rate at 32k and 128k input, plain, from `prompts/longctx_*.json`
 - pass@1 on the HumanEval subset, from these same completions
 
 Thermal state and binary identity, the other two, are under Provenance.

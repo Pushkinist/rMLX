@@ -152,5 +152,60 @@
   "max_tokens": 1024
  },
  "decode_config": "dflash/block=16,dflash/depth=accept_rate",
- "block_size": 16
+ "block_size": 16,
+ "greedy_match": {
+  "against": {
+   "arm": "plain",
+   "ts_utc": "2026-09-06T09:00:00Z",
+   "binary_sha256": "327e90b6f5e4f41efe7bedebaa79368b100a3ba64ac8e75a4113162caec385ce"
+  },
+  "protocol": {
+   "temperature": 0,
+   "logprobs": true,
+   "top_logprobs": 2,
+   "stream": false
+  },
+  "datasets": {
+   "mt_bench": {
+    "samples": 80,
+    "identical": 80,
+    "near_tie": 0,
+    "refused": 0,
+    "unjudgeable": 0,
+    "identical_rate": 1.0,
+    "identical_or_near_tie_rate": 1.0
+   },
+   "math_500": {
+    "samples": 128,
+    "identical": 127,
+    "near_tie": 1,
+    "refused": 0,
+    "unjudgeable": 0,
+    "identical_rate": 0.9921875,
+    "identical_or_near_tie_rate": 1.0
+   },
+   "humaneval": {
+    "samples": 128,
+    "identical": 128,
+    "near_tie": 0,
+    "refused": 0,
+    "unjudgeable": 0,
+    "identical_rate": 1.0,
+    "identical_or_near_tie_rate": 1.0
+   }
+  },
+  "identical_rate": 0.9970238095238095,
+  "identical_or_near_tie_rate": 1.0,
+  "differing": [
+   {
+    "dataset": "math_500",
+    "sample_id": "math_500-000",
+    "verdict": "near_tie",
+    "position": "212",
+    "margin": "0.0312",
+    "rank": "0.0418",
+    "reason": "first differs at a near tie"
+   }
+  ]
+ }
 }

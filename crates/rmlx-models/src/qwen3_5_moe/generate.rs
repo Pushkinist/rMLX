@@ -27,7 +27,8 @@ use rmlx_runtime::{count_nan_in_bytes, max_abs_from_bytes};
 use crate::constraint::ConstraintEngine;
 use crate::decode_loop::{
     capture_first_logprobs, capture_logprobs, choose_token, chunked_prefill, emit_token,
-    pipelined_decode, reject_nan_prefill, replay_first_logprobs, DecodeCtx,
+    log_prefill, pipelined_decode, reject_nan_prefill, replay_first_logprobs, DecodeCtx,
+    PrefillReport,
 };
 use crate::kv_cache::{kv_layer_quants, warn_if_kv_codec_net_negative, KvLayerShape};
 use crate::prefill_chunk::prefill_pieces;
@@ -188,6 +189,7 @@ pub fn generate_greedy<'a>(
             token_id = last_id,
             "qwen3_5moe generate_greedy: prompt cache EXACT HIT"
         );
+        log_prefill(arch_label, &PrefillReport::exact(prompt_ids.len()));
         let ends = crate::decode_loop::emit_replayed_token(
             &mut constraint,
             step_fn,
@@ -273,6 +275,7 @@ pub fn generate_greedy<'a>(
         kind,
     }) = resumed
     {
+        let prefill_t0 = Instant::now();
         let tail_len = prompt_ids.len() - prefix_len;
         tracing::info!(
             arch = arch_label,
@@ -354,6 +357,7 @@ pub fn generate_greedy<'a>(
         // forward off SSD-restored KV can produce a NaN row just as a fresh
         // prefill can, and this path feeds the same decode loop.
         logits_flat.eval()?;
+        let prefill_ns = prefill_t0.elapsed().as_nanos();
         let logit_bytes = logits_flat.to_bytes()?;
         let nan_count = count_nan_in_bytes(&logit_bytes, logits_flat.dtype());
         let max_abs_logit = max_abs_from_bytes(&logit_bytes, logits_flat.dtype());
@@ -399,6 +403,10 @@ pub fn generate_greedy<'a>(
         if let Some(c) = ctx.constraint.as_mut() {
             c.advance(last_id);
         }
+        log_prefill(
+            arch_label,
+            &PrefillReport::reusing(prompt_ids.len(), prefix_len, prefill_ns),
+        );
 
         let piece = tokenizer
             .id_to_token(last_id)
@@ -542,6 +550,7 @@ pub fn generate_greedy<'a>(
     // step that reaches the classifier always has nan_count == 0 by
     // construction. See SmokeVerdict::BrokenNan.
     logits_flat.eval()?;
+    let prefill_ns = prefill_t0.elapsed().as_nanos();
     let logit_bytes = logits_flat.to_bytes()?;
     let nan_count = count_nan_in_bytes(&logit_bytes, logits_flat.dtype());
     let max_abs_logit = max_abs_from_bytes(&logit_bytes, logits_flat.dtype());
@@ -589,7 +598,10 @@ pub fn generate_greedy<'a>(
     if let Some(c) = ctx.constraint.as_mut() {
         c.advance(last_id);
     }
-    let prefill_total_ns = prefill_t0.elapsed().as_nanos();
+    log_prefill(
+        arch_label,
+        &PrefillReport::cold(prompt_ids.len(), prefill_ns),
+    );
 
     let piece = tokenizer
         .id_to_token(last_id)
@@ -640,14 +652,6 @@ pub fn generate_greedy<'a>(
 
     // EOS-stop. If prefill emitted an EOS already, no decode steps.
     if first.ends {
-        let prefill_ms = (prefill_total_ns as f64) / 1.0e6;
-        tracing::info!(
-            target: "decode_profile",
-            arch = arch_label,
-            n_steps = 0,
-            prefill_ms,
-            "decode_profile (prefill-EOS)"
-        );
         return Ok(steps);
     }
 
@@ -659,7 +663,6 @@ pub fn generate_greedy<'a>(
         model.forward_arr(y, 1, Some(&mut kv_caches), Some(&mut lin_caches), device)
     })?;
 
-    let prefill_ms = (prefill_total_ns as f64) / 1.0e6;
     let forward_ms = (stats.forward_total_ns as f64) / 1.0e6;
     let eval_ms = (stats.eval_total_ns as f64) / 1.0e6;
     let step_ms = (stats.step_total_ns as f64) / 1.0e6;
@@ -668,7 +671,6 @@ pub fn generate_greedy<'a>(
         target: "decode_profile",
         arch = arch_label,
         n_steps = stats.decode_steps,
-        prefill_ms,
         forward_total_ms = forward_ms,
         eval_total_ms = eval_ms,
         step_total_ms = step_ms,

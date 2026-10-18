@@ -44,7 +44,8 @@ use tracing::info_span;
 use crate::constraint::ConstraintEngine;
 use crate::decode_loop::{
     capture_first_logprobs, capture_logprobs, choose_token, chunked_prefill, emit_token,
-    pipelined_decode, reject_nan_prefill, replay_first_logprobs, DecodeCtx, StepVerdict,
+    log_prefill, pipelined_decode, reject_nan_prefill, replay_first_logprobs, DecodeCtx,
+    PrefillReport, StepVerdict,
 };
 use crate::kv_cache::{kv_layer_quants, warn_if_kv_codec_net_negative, KvLayerShape};
 use crate::prompt_cache::{entry_is_storable, Consumed, ReuseKind, ReusePolicy, BLOCK_TOKENS};
@@ -270,6 +271,10 @@ pub fn generate_greedy<'a>(
         first_logprobs,
     }) = exact_hit
     {
+        log_prefill(
+            "Gemma4ForConditionalGeneration",
+            &PrefillReport::exact(prompt_ids.len()),
+        );
         let ends = crate::decode_loop::emit_replayed_token(
             &mut constraint,
             step_fn,
@@ -309,7 +314,6 @@ pub fn generate_greedy<'a>(
             })?
         };
 
-        let prefill_ms = 0.0_f64;
         let forward_ms = (stats.forward_total_ns as f64) / 1.0e6;
         let eval_ms = (stats.eval_total_ns as f64) / 1.0e6;
         let step_ms = (stats.step_total_ns as f64) / 1.0e6;
@@ -318,7 +322,6 @@ pub fn generate_greedy<'a>(
             target: "decode_profile",
             arch = "Gemma4ForConditionalGeneration",
             n_steps = stats.decode_steps,
-            prefill_ms,
             forward_total_ms = forward_ms,
             eval_total_ms = eval_ms,
             step_total_ms = step_ms,
@@ -602,6 +605,7 @@ pub fn generate_greedy<'a>(
 
     let logits_flat = prefill_logits.reshape(&[1, vocab], device)?;
     logits_flat.eval()?;
+    let prefill_ns = prefill_t0.elapsed().as_nanos();
 
     let logit_bytes = logits_flat.to_bytes()?;
     let nan_count = count_nan_in_bytes(&logit_bytes, logits_flat.dtype());
@@ -653,7 +657,14 @@ pub fn generate_greedy<'a>(
     }
     // Push prefill token into history.
     ctx.token_history.push(last_id);
-    let prefill_total_ns = prefill_t0.elapsed().as_nanos();
+    log_prefill(
+        "Gemma4ForConditionalGeneration",
+        &PrefillReport::reusing(
+            prompt_ids.len(),
+            prompt_ids.len() - prefill_ids.len(),
+            prefill_ns,
+        ),
+    );
 
     let piece = tokenizer
         .id_to_token(last_id)
@@ -772,7 +783,6 @@ pub fn generate_greedy<'a>(
         model.forward_arr(y, 1, Some(&mut caches), device)
     })?;
 
-    let prefill_ms = (prefill_total_ns as f64) / 1.0e6;
     let forward_ms = (stats.forward_total_ns as f64) / 1.0e6;
     let eval_ms = (stats.eval_total_ns as f64) / 1.0e6;
     let step_ms = (stats.step_total_ns as f64) / 1.0e6;
@@ -781,7 +791,6 @@ pub fn generate_greedy<'a>(
            target: "decode_profile",
            arch = "Gemma4ForConditionalGeneration",
            n_steps = stats.decode_steps,
-           prefill_ms,
            forward_total_ms = forward_ms,
            eval_total_ms = eval_ms,
            step_total_ms = step_ms,
@@ -790,8 +799,7 @@ pub fn generate_greedy<'a>(
     // Path B (prefix hit, incl. B1 SWA snapshot/restore) and Path C
     // (miss) both reach this shared decode-profile emission. Report the
     // path that actually ran so the e2e gate can confirm the B1
-    // restore-and-tail path fired (flat prefill_ms across a multi-turn
-    // session is the prefix path; a cold full re-prefill is a miss).
+    // restore-and-tail path fired (a prefix path, not a cold re-prefill).
            cache_path = if is_prefix { "prefix" } else { "miss" },
            "decode_profile"
        );

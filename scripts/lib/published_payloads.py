@@ -22,6 +22,12 @@ is the checkpoint's own, and the way to send the checkpoint's own is to send
 none. Thinking is asked for explicitly — it is a pinned choice of the protocol,
 not a template default this is willing to inherit.
 
+With `--greedy` the payload is the greedy pass's instead: temperature 0, unstreamed,
+with the two best candidates of every position, which is what
+`rmlx eval spec-answer` reads. That pass is the one place the harness overrides the
+checkpoint's sampling, because two arms can only be compared token for token when
+neither draws.
+
 `warmup.json` is written beside the cells and left out of the index. Its prompt
 is not in any sample set: an untimed warmup on the first measured sample would
 leave that one sample facing a warm prompt cache while every other is cold, and
@@ -78,11 +84,24 @@ def payload(model_id, messages, max_tokens):
     }
 
 
+def greedy_payload(model_id, messages, max_tokens):
+    return {
+        "model": model_id,
+        "messages": messages,
+        "max_tokens": int(max_tokens),
+        "enable_thinking": True,
+        "stream": False,
+        "temperature": 0,
+        "logprobs": True,
+        "top_logprobs": 2,
+    }
+
+
 def write_json(path, body):
     path.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
 
 
-def render(root, out, model_id, cells):
+def render(root, out, model_id, cells, greedy=False):
     """(cell, dataset, max_tokens, sample_id, body_sha256, payload_path) rows."""
     files = load_root(root)
     check_coverage(files, cells)
@@ -107,7 +126,8 @@ def render(root, out, model_id, cells):
         cell_dir.mkdir(parents=True, exist_ok=True)
         for i, sample in enumerate(doc["samples"]):
             path = cell_dir / f"{i:05d}.json"
-            write_json(path, payload(model_id, sample["messages"], max_tokens))
+            build = greedy_payload if greedy else payload
+            write_json(path, build(model_id, sample["messages"], max_tokens))
             rows.append(
                 (cell, dataset, str(max_tokens), sample["id"],
                  sample["body_sha256"], str(path))
@@ -121,6 +141,11 @@ def main():
     ap.add_argument("--out", required=True, help="directory for the payload files")
     ap.add_argument("--model-id", required=True)
     ap.add_argument("--index", required=True, help="where to write the index")
+    ap.add_argument(
+        "--greedy",
+        action="store_true",
+        help="render the greedy pass's payloads: temperature 0, unstreamed, with logprobs",
+    )
     ap.add_argument(
         "--cell",
         action="append",
@@ -141,7 +166,7 @@ def main():
 
     root = pathlib.Path(args.samples_root)
     try:
-        rows = render(root, pathlib.Path(args.out), args.model_id, cells)
+        rows = render(root, pathlib.Path(args.out), args.model_id, cells, args.greedy)
     except (OSError, ValueError, KeyError) as exc:
         print(f"published_payloads: cannot read {root}: {exc}", file=sys.stderr)
         return 2

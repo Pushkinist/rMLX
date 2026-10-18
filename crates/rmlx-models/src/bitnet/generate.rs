@@ -136,6 +136,10 @@ pub fn generate_greedy(
             token_id = last_id,
             "bitnet generate_greedy: prompt cache EXACT HIT"
         );
+        crate::decode_loop::log_prefill(
+            "BitNetForCausalLM",
+            &crate::decode_loop::PrefillReport::exact(prompt_ids.len()),
+        );
         let ends = crate::decode_loop::emit_replayed_token(
             &mut constraint,
             step_fn,
@@ -276,9 +280,9 @@ pub fn generate_greedy(
         ));
     };
 
-    let prefill_ns = prefill_t0.elapsed().as_nanos();
     let logits_flat = prefill_logits.reshape(&[1, vocab], device)?;
     logits_flat.eval()?;
+    let prefill_ns = prefill_t0.elapsed().as_nanos();
 
     let logit_bytes = logits_flat.to_bytes()?;
     let nan_count = count_nan_in_bytes(&logit_bytes, logits_flat.dtype());
@@ -357,6 +361,10 @@ pub fn generate_greedy(
         c.advance(last_id);
     }
     token_history.push(last_id);
+    crate::decode_loop::log_prefill(
+        "BitNetForCausalLM",
+        &crate::decode_loop::PrefillReport::cold(prompt_ids.len(), prefill_ns),
+    );
 
     let piece = tokenizer
         .id_to_token(last_id)

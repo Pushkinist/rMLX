@@ -152,5 +152,137 @@
   "max_tokens": 1024
  },
  "decode_config": "mtp_sidecar/block=7",
- "block_size": 7
+ "block_size": 7,
+ "greedy_match": {
+  "against": {
+   "arm": "plain",
+   "ts_utc": "2026-09-06T09:00:00Z",
+   "binary_sha256": "327e90b6f5e4f41efe7bedebaa79368b100a3ba64ac8e75a4113162caec385ce"
+  },
+  "protocol": {
+   "temperature": 0,
+   "logprobs": true,
+   "top_logprobs": 2,
+   "stream": false
+  },
+  "datasets": {
+   "mt_bench": {
+    "samples": 80,
+    "identical": 78,
+    "near_tie": 2,
+    "refused": 0,
+    "unjudgeable": 0,
+    "identical_rate": 0.975,
+    "identical_or_near_tie_rate": 1.0
+   },
+   "math_500": {
+    "samples": 128,
+    "identical": 120,
+    "near_tie": 6,
+    "refused": 1,
+    "unjudgeable": 1,
+    "identical_rate": 0.9375,
+    "identical_or_near_tie_rate": 0.984375
+   },
+   "humaneval": {
+    "samples": 128,
+    "identical": 128,
+    "near_tie": 0,
+    "refused": 0,
+    "unjudgeable": 0,
+    "identical_rate": 1.0,
+    "identical_or_near_tie_rate": 1.0
+   }
+  },
+  "identical_rate": 0.9702380952380952,
+  "identical_or_near_tie_rate": 0.9940476190476191,
+  "differing": [
+   {
+    "dataset": "mt_bench",
+    "sample_id": "mt_bench-000",
+    "verdict": "near_tie",
+    "position": "212",
+    "margin": "0.0312",
+    "rank": "0.0418",
+    "reason": "first differs at a near tie"
+   },
+   {
+    "dataset": "mt_bench",
+    "sample_id": "mt_bench-001",
+    "verdict": "near_tie",
+    "position": "212",
+    "margin": "0.0312",
+    "rank": "0.0418",
+    "reason": "first differs at a near tie"
+   },
+   {
+    "dataset": "math_500",
+    "sample_id": "math_500-000",
+    "verdict": "near_tie",
+    "position": "212",
+    "margin": "0.0312",
+    "rank": "0.0418",
+    "reason": "first differs at a near tie"
+   },
+   {
+    "dataset": "math_500",
+    "sample_id": "math_500-001",
+    "verdict": "near_tie",
+    "position": "212",
+    "margin": "0.0312",
+    "rank": "0.0418",
+    "reason": "first differs at a near tie"
+   },
+   {
+    "dataset": "math_500",
+    "sample_id": "math_500-002",
+    "verdict": "near_tie",
+    "position": "212",
+    "margin": "0.0312",
+    "rank": "0.0418",
+    "reason": "first differs at a near tie"
+   },
+   {
+    "dataset": "math_500",
+    "sample_id": "math_500-003",
+    "verdict": "near_tie",
+    "position": "212",
+    "margin": "0.0312",
+    "rank": "0.0418",
+    "reason": "first differs at a near tie"
+   },
+   {
+    "dataset": "math_500",
+    "sample_id": "math_500-004",
+    "verdict": "near_tie",
+    "position": "212",
+    "margin": "0.0312",
+    "rank": "0.0418",
+    "reason": "first differs at a near tie"
+   },
+   {
+    "dataset": "math_500",
+    "sample_id": "math_500-005",
+    "verdict": "near_tie",
+    "position": "212",
+    "margin": "0.0312",
+    "rank": "0.0418",
+    "reason": "first differs at a near tie"
+   },
+   {
+    "dataset": "math_500",
+    "sample_id": "math_500-r000",
+    "verdict": "refused",
+    "position": "57",
+    "rank": "0.9120",
+    "reason": "first differs where the verifier was not tied"
+   },
+   {
+    "dataset": "math_500",
+    "sample_id": "math_500-u000",
+    "verdict": "unjudgeable",
+    "reason": "the answers carry no logprobs"
+   }
+  ]
+ }
 }

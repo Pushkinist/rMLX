@@ -19,8 +19,6 @@
 //! - [`DecodeProfile::log`] — emits the standard `decode_profile` tracing
 //!   event used by decode-loop performance analysis.
 
-use std::time::Instant;
-
 /// Standard prefill chunk size (tokens). Empirically safe under the Metal
 /// command-buffer watchdog (~10s budget) for all 6 supported archs at
 /// max-ctx 4k–8k. Lower means more sync points and lower prefill TPS.
@@ -87,10 +85,10 @@ pub enum SmokeVerdict {
 /// Coarse decode-loop timers. Each per-arch `generate_greedy`
 /// currently maintains these as four `u128` locals; this struct centralises
 /// the bookkeeping and the final `tracing::info!` emission so future
-/// migrations only need to call `start_prefill`, `tick_step`, and `log`.
+/// migrations only need to call `record_step` and `log`.
 #[allow(
     clippy::exhaustive_structs,
-    reason = "internal closed struct — five decode-loop timer fields; adding a timer requires updating record_step, log, and all arch generate_greedy callers"
+    reason = "internal closed struct — four decode-loop timer fields; adding a timer requires updating record_step, log, and all arch generate_greedy callers"
 )]
 #[derive(Debug, Default)]
 pub struct DecodeProfile {
@@ -100,24 +98,11 @@ pub struct DecodeProfile {
     pub eval_total_ns: u128,
     /// Cumulative nanoseconds for full step wall-clock (forward through piece resolved).
     pub step_total_ns: u128,
-    /// Nanoseconds elapsed during the prefill phase.
-    pub prefill_total_ns: u128,
     /// Number of decode steps recorded.
     pub decode_steps: u32,
 }
 
 impl DecodeProfile {
-    /// Start a fresh prefill window. Returns an `Instant` the caller stamps
-    /// at the end of prefill via `record_prefill`.
-    pub fn start_prefill() -> Instant {
-        Instant::now()
-    }
-
-    /// Record the elapsed prefill time.
-    pub fn record_prefill(&mut self, t0: Instant) {
-        self.prefill_total_ns = t0.elapsed().as_nanos();
-    }
-
     /// Record one decode step. Pass three nanosecond deltas:
     /// `forward_dt` — forward dispatch wall-clock
     /// `eval_dt` — eval/argmax/to_bytes wall-clock
@@ -133,7 +118,6 @@ impl DecodeProfile {
     /// the architecture string (e.g. `"Gemma3ForConditionalGeneration"`)
     /// used to filter decode-loop performance events.
     pub fn log(&self, arch: &'static str) {
-        let prefill_ms = (self.prefill_total_ns as f64) / 1.0e6;
         let forward_ms = (self.forward_total_ns as f64) / 1.0e6;
         let eval_ms = (self.eval_total_ns as f64) / 1.0e6;
         let step_ms = (self.step_total_ns as f64) / 1.0e6;
@@ -142,7 +126,6 @@ impl DecodeProfile {
             target: "decode_profile",
             arch,
             n_steps = self.decode_steps,
-            prefill_ms,
             forward_total_ms = forward_ms,
             eval_total_ms = eval_ms,
             step_total_ms = step_ms,

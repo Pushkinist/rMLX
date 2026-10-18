@@ -176,6 +176,16 @@
    "range_pct": 0.9546209186496954,
    "stable": true
   },
+  "prefill_engine_tps": {
+   "pass_means": [
+    4985.0,
+    4962.0,
+    5012.0
+   ],
+   "mean": 4986.333333333333,
+   "range_pct": 1.002740824921452,
+   "stable": true
+  },
   "ttft_ms": {
    "pass_means": [
     281.1,
@@ -184,6 +194,15 @@
    ],
    "mean": 281.17,
    "range_pct": 0.925
+  },
+  "prefill_ms": {
+   "pass_means": [
+    271.8,
+    273.1,
+    270.4
+   ],
+   "mean": 271.76666666666665,
+   "range_pct": 0.9934993254017094
   },
   "completion_tokens": {
    "pass_means": [
@@ -220,6 +239,103 @@
    ],
    "max": 9118,
    "min": 9102
+  }
+ },
+ "longctx": {
+  "longctx_32k": {
+   "label": "longctx_32k",
+   "file": "longctx_32k.json",
+   "file_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+   "body_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+   "prompt_tokens": 32764,
+   "target_tokens": 32768,
+   "max_tokens": 200,
+   "ctx_max": 40968,
+   "memory_poll_ms": 250,
+   "decode_tps": {
+    "pass_means": [
+     41.2,
+     41.6,
+     40.9
+    ],
+    "mean": 41.233333333333334,
+    "range_pct": 1.6976556184316964,
+    "stable": true
+   },
+   "prefill_tps": {
+    "pass_means": [
+     5110.0,
+     5140.0,
+     5085.0
+    ],
+    "mean": 5111.666666666667,
+    "range_pct": 1.0759700032605153,
+    "stable": true
+   },
+   "prefill_engine_tps": {
+    "pass_means": [
+     5150.0,
+     5171.0,
+     5120.0
+    ],
+    "mean": 5147.0,
+    "range_pct": 0.990868467068195,
+    "stable": true
+   },
+   "ttft_ms": {
+    "pass_means": [
+     6412.0,
+     6375.0,
+     6444.0
+    ],
+    "mean": 6410.333333333333,
+    "range_pct": 1.0763870833549998
+   },
+   "prefill_ms": {
+    "pass_means": [
+     6362.0,
+     6336.0,
+     6399.0
+    ],
+    "mean": 6365.666666666667,
+    "range_pct": 0.989684243598471
+   },
+   "completion_tokens": {
+    "pass_means": [
+     200.0,
+     200.0,
+     200.0
+    ],
+    "mean": 200.0,
+    "range_pct": 0.0
+   },
+   "phys_footprint_bytes": {
+    "run_values": [
+     17900000000,
+     17940000000,
+     17910000000
+    ],
+    "max": 17940000000,
+    "min": 17900000000
+   },
+   "rss_bytes": {
+    "run_values": [
+     17200000000,
+     17230000000,
+     17210000000
+    ],
+    "max": 17230000000,
+    "min": 17200000000
+   },
+   "metal_peak_alloc_mb": {
+    "run_values": [
+     16800,
+     16850,
+     16820
+    ],
+    "max": 16850,
+    "min": 16800
+   }
   }
  }
 }

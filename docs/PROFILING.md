@@ -243,7 +243,7 @@ each submission's `start` and `duration` in nanoseconds, `gpu-channel-name`,
   no rows for it. Keep the snapshot outside those folders, or clone it with
   `cp -c -R` to a folder outside them.
 - **Weight load leaves no rows; prefill does.** The table does not mark where
-  prefill ends. The harness reads the run's own `decode_profile{prefill_ms}`
+  prefill ends. The harness reads the run's own `generate: prefill{prefill_ms}`
   from `<RMLX_HOME>/logs/<run-id>.jsonl` and uses it as the default
   `--skip-ms`. An explicit `--skip-ms` wins. When no event is found, the
   harness says so and summarises the whole window. `--skip-ms` counts from the
@@ -272,8 +272,9 @@ The summariser tells two refusals apart: `contains no rows` is an empty table;
 #### Reading the timeline
 
 - **Check the window against the run's own log.** The full span should match
-  `prefill_ms + step_total_ms`, and the decode span should match
-  `step_total_ms`. The harness prints both. Do not compare against a separate
+  `prefill_ms + step_total_ms` to within the draw of the first token, which sits
+  between the two, and the decode span should match `step_total_ms`. The harness
+  prints both. Do not compare against a separate
   untraced run: tracing and run-to-run spread both move it.
 - **`start-latency` is queue depth, not a host stall.** It is the gap between
   commit and start on the GPU. It is high when the GPU is saturated and falls
@@ -471,6 +472,37 @@ log the resolved size as `debug!` fields: `prefill_chunk` and
 `prefill_chunk_for` directly logs neither field: the `laguna`, `qwen2` and
 `bitnet` generate paths, one `qwen3_5_moe` path and the `qwen3_vl_moe` image
 path.
+
+## 11. The prefill event of a request
+
+Every generate request (text, image, speculative) writes one `generate: prefill`
+event at `info` level, after its prefill ends and before its first token is
+shown. It carries:
+
+| Field | Meaning |
+|---|---|
+| `arch` | The architecture class that served the request. |
+| `prompt_tokens` | Tokens in the prompt. |
+| `reused_tokens` | Prompt tokens taken from a prompt cache: all of them on an exact hit, the saved prefix on a resume, none on a cold request. |
+| `forwarded_tokens` | Prompt tokens the prefill ran the model over. |
+| `prefill_ms` | Wall clock of the target model's prefill forward or forwards, up to the point its logits are forced. It excludes the draw of the first token, a drafter's own work and any snapshot of the caches. It is `0` on an exact hit. |
+| `draft_prefill_ms` | Wall clock of a draft model's own prefill: the second model of a two-model request, or the EAGLE-3 drafter's prefill over the verifier's capture. `0` when there is none. |
+
+`forwarded_tokens` over `prefill_ms` is the engine's own input rate. It is not
+the prompt over TTFT: TTFT adds tokenization, queueing, the first token's draw
+and the step callback, and counts reused tokens as work. The speculative round
+loop writes the same event. A drafter that carries the prompt's last token into
+its first round forwarded one token fewer than the prompt. For a sidecar drafter
+the prefill forwards include the one-token forward that yields its first logits.
+
+This event is the one producer of the prefill time. `decode_profile` and the
+speculative `done` line no longer carry it.
+
+The generation thread writes the event, and its events carry no request id: the
+`generate: metal peak alloc` line of a serve log has none. A reader pairs the
+event with its request by order, as it pairs the TTFT and ITL events, and
+requires exactly one per request. A serve process started with
+`--require-smoke-probe` writes one more before its first request.
 
 ## Quick reference
 

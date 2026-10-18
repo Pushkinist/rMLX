@@ -160,6 +160,7 @@ impl RoundDrafter for BlockRound<'_> {
             cancel,
         )?;
         guard_verifier_prefill_logits(ctx.verifier, &bonus_logits, prompt.len())?;
+        let prefill_ns = prefill_t0.elapsed().as_nanos();
         let prompt_ctx = self.drafter.trim_conditioning(&prompt_hidden)?;
         // What the capture was asked to keep is a number at a call site, and
         // the trim above accepts a shorter buffer without a word. A drafter
@@ -202,13 +203,13 @@ impl RoundDrafter for BlockRound<'_> {
             // all of it. See `phases_charged`.
             h_ctx.eval()?;
         }
-        let prefill_ns = prefill_t0.elapsed().as_nanos();
         self.h_ctx = Some(h_ctx);
 
         let seed = ctx.draw.seed_token(&bonus_logits, device)?;
         Ok(Prefilled {
             seed: Seed::Emitted(seed),
             prefill_ns,
+            draft_prefill_ns: 0,
             // It scores every position over the verifier's whole vocabulary.
             restricted_read_back: false,
             // It projects its committed rows every round and the loop counts

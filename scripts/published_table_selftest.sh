@@ -295,6 +295,42 @@ CASE_BAD=""; CASE_ERR="${WORK}/metal_bound.err"; : >"${CASE_ERR}"
     note_bad "the Metal row quotes a percentage of a bound"
 verdict
 
+# Input speed has two definitions and the table prints both, each from its own
+# result field: the fixture's prompt-over-TTFT mean is 4818.67 and its engine
+# mean is 4986.33, so a row that read the other's field prints the wrong one.
+check_number input_speed_over_ttft_is_the_results_own \
+    "the prompt-over-TTFT row prints the result's prefill_tps" \
+    "$(cell_at "${RENDERED}" '^\| input speed, prompt over TTFT' 1)" 4818.67 0.005
+verdict
+
+check_number engine_input_speed_is_the_results_own \
+    "the engine row prints the result's prefill_engine_tps, not prefill_tps" \
+    "$(cell_at "${RENDERED}" '^\| input speed, engine' 1)" 4986.33 0.005
+verdict
+
+table_case engine_input_speed_follows_the_result 0 \
+    "the engine row is the result's figure, not a constant" "" \
+    PLAIN:'result["fixed_prompt"]["prefill_engine_tps"]["mean"] = 7000.0'
+verdict
+check_number engine_input_speed_follows_the_result_value \
+    "a mean of 7000 prints as 7000.00" \
+    "$(cell_at "${CASE_OUT}" '^\| input speed, engine' 1)" 7000.00 0.005
+verdict
+
+table_case an_unstable_engine_input_speed_is_withheld 0 \
+    "a range the harness refused is not rendered as a rate" \
+    '^\| input speed, engine.*UNSTABLE' \
+    PLAIN:'result["fixed_prompt"]["prefill_engine_tps"]["stable"] = False'
+verdict
+
+CASE_NAME=engine_input_speed_shares_the_prefill_bound
+CASE_WHAT="the engine row is held to the same prefill bound as the TTFT row"
+CASE_BAD=""; CASE_ERR="${WORK}/engine_bound.err"; : >"${CASE_ERR}"
+[ "$(cell_at "${RENDERED}" '^\| input speed, engine' 2)" = \
+    "$(cell_at "${RENDERED}" '^\| input speed, prompt over TTFT' 2)" ] ||
+    note_bad "the two input-speed rows quote different bounds"
+verdict
+
 # ── The bound is derived from the run's own inputs ───────────────────────────
 
 # `mixed_k8g64_v4g64` and not `k8v8`: on this stack `k8v8` decodes off its bf16
@@ -538,9 +574,14 @@ if [ "$(grep -c 'The fixed-length prompt' "${CASE_OUT}")" -ne 1 ]; then
 fi
 verdict
 
+# The fixtures carry a greedy match and a long-context row; a run without them
+# is what the list is for.
 table_case what_is_not_measured_is_named 0 \
     "the columns the harness does not measure yet are listed, not left to be noticed" \
-    'greedy token-match rate'
+    'greedy token-match rate' \
+    PLAIN:'result.pop("longctx", None)' \
+    MTP:'result.pop("greedy_match", None)' \
+    DFLASH:'result.pop("greedy_match", None)'
 grep -q 'TTFT and decode rate at 32k and 128k' "${CASE_OUT}" || \
     note_bad "the long-context row is not named as missing"
 grep -q 'Wikitext-2 perplexity' "${CASE_OUT}" || \
@@ -551,9 +592,80 @@ verdict
 
 table_case a_measured_column_stops_being_listed_as_missing 0 \
     "...and the list is derived from the results, so it cannot go stale silently" \
-    'TTFT and decode rate at 32k' \
-    ABSENT:'greedy token-match rate' \
-    PLAIN:'result["greedy_match"] = {"mt_bench:1024": 1.0}'
+    'pass@1 on the HumanEval subset' \
+    ABSENT:'greedy token-match rate'
+grep -q 'TTFT and decode rate at 32k' "${CASE_OUT}" &&
+    note_bad "the long-context row is listed as missing though the result carries it"
+verdict
+
+# ── The greedy match ─────────────────────────────────────────────────────────
+
+table_case the_greedy_match_is_a_section_per_mode 0 \
+    "each mode that was judged against plain decode has its rows, counted by class" \
+    '^## Greedy match against plain decode' \
+    ONLY:plain,mtp
+grep -qF '| `mtp_sidecar/block=7` | math_500 | 128 | 120 | 6 | 1 | 1 | 93.8 | 98.4 |' "${CASE_OUT}" ||
+    note_bad "the math_500 row of the mtp mode is not rendered from its counts"
+grep -qF '| `mtp_sidecar/block=7` | **all** | 336 | 326 | 8 | 1 | 1 | 97.0 | 99.4 |' "${CASE_OUT}" ||
+    note_bad "the all-datasets row is not the sum of the datasets"
+awk '/^## Greedy match/ { in_section = 1; next } /^## / { in_section = 0 }
+     in_section && /^\| `plain` \|/ { found = 1 } END { exit !found }' "${CASE_OUT}" &&
+    note_bad "plain decode is judged against itself"
+verdict
+
+table_case a_greedy_rate_follows_its_counts 0 \
+    "a run with other counts prints other rates, not the fixture's" \
+    '\| math_500 \| 128 \| 100 \| 20 \| 4 \| 4 \| 78\.1 \| 93\.8 \|' \
+    ONLY:plain,mtp \
+    MTP:'e = result["greedy_match"]["datasets"]["math_500"]; e.update(identical=100, near_tie=20, refused=4, unjudgeable=4, identical_rate=100 / 128, identical_or_near_tie_rate=120 / 128); g = result["greedy_match"]; g["identical_rate"] = (78 + 100 + 128) / 336; g["identical_or_near_tie_rate"] = (80 + 120 + 128) / 336'
+verdict
+
+table_case a_greedy_rate_its_counts_do_not_make_is_refused 1 \
+    "a rate printed beside counts that do not make it is refused, not printed" \
+    'files identical_rate .* for math_500' \
+    MTP:'result["greedy_match"]["datasets"]["math_500"]["identical_rate"] = 0.99'
+verdict
+
+table_case a_greedy_sample_in_no_class_is_refused 1 \
+    "a sample that is in no class, or in two, is refused" \
+    'a sample is in no class, or in two' \
+    MTP:'result["greedy_match"]["datasets"]["math_500"]["refused"] += 1'
+verdict
+
+table_case an_overall_greedy_rate_its_datasets_do_not_make_is_refused 1 \
+    "the all-datasets rate is held to the datasets it is over" \
+    'an overall identical_or_near_tie_rate' \
+    MTP:'result["greedy_match"]["identical_or_near_tie_rate"] = 0.5'
+verdict
+
+# ── The long-context row ─────────────────────────────────────────────────────
+
+table_case the_long_context_row_is_the_results_figures 0 \
+    "the long-context section prints the result's own figures, by definition" \
+    '^## Long context'
+for want in \
+    '| time to first token (ms) | 6410.3 |' \
+    '| engine prefill time (ms) | 6365.7 |' \
+    '| input speed, prompt over TTFT (tok/s) | 5111.67 |' \
+    "| input speed, engine's own (tok/s) | 5147.00 |" \
+    '| output speed (tok/s) | 41.23 |' \
+    '32764 tokens; the file was built for 32768'; do
+    grep -qF -- "${want}" "${CASE_OUT}" || note_bad "missing /${want}/"
+done
+verdict
+
+table_case the_long_context_size_is_the_servers_count 0 \
+    "the token count printed is the one the server gave, not the file's size" \
+    '^30210 tokens; the file was built for 32768' \
+    ONLY:plain \
+    PLAIN:'result["longctx"]["longctx_32k"]["prompt_tokens"] = 30210'
+verdict
+
+table_case an_unstable_long_context_rate_is_withheld 0 \
+    "a long-context rate whose runs disagreed past the band is not rendered as a rate" \
+    '^\| input speed, engine.s own \(tok/s\) \| \*\*UNSTABLE\*\*' \
+    ONLY:plain \
+    PLAIN:'result["longctx"]["longctx_32k"]["prefill_engine_tps"]["stable"] = False'
 verdict
 
 table_case an_absent_prefill_anchor_is_absent_not_guessed 0 \
@@ -576,7 +688,7 @@ verdict
 
 table_case ppl_leaves_the_missing_list 0 \
     "a column that is rendered is not also listed as not measured" \
-    'greedy token-match rate' \
+    'pass@1 on the HumanEval subset' \
     PPL:'pass' \
     ABSENT:'Wikitext-2 perplexity'
 verdict

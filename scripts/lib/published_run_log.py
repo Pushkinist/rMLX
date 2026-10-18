@@ -43,6 +43,16 @@ allocator's high-water mark since the process started, in MiB, read when the
 request ended: it never falls, so a request's reading includes every request
 before it.
 
+Both arms also carry the engine's own account of the prefill, off the one
+`generate: prefill` event every request writes: `prompt_tokens`,
+`reused_tokens` (taken from a prompt cache), `forwarded_tokens` (the prefill ran
+the model over them), `prefill_ms` (the target model's prefill forwards, up to the
+point their logits are forced; the draw of the first token excluded) and `draft_prefill_ms` (a draft model's own prefill, 0
+when there is none). The event has no request id, so it is
+paired with its request by order and by count, as the other three are. A serve
+process started with `--require-smoke-probe` writes one more before its first
+request, and the count check refuses such a log.
+
 Exit codes: 0 — read; 2 — the log could not be read; 3 — an event carries
 something this reader must not interpret; 4 — the log holds no event of a kind
 the arm needs; 5 — the log holds a different number of events than the caller
@@ -67,6 +77,8 @@ ITL_MESSAGE = "generate: ITL stats"
 # arm writes the same reading under a longer message, which the exact match
 # keeps out.
 METAL_PEAK_MESSAGE = "generate: metal peak alloc"
+# Written by the engine once per request, on every path and on both arms.
+PREFILL_MESSAGE = "generate: prefill"
 SAMPLER_MARKER = server_sampling.MARKER
 # The fields the engine says it resolved for a request. `seed` is on the list
 # because the request sends none and the engine substitutes a fixed default, so
@@ -218,6 +230,54 @@ def metal_peak_of(fields):
     return value
 
 
+def count_of(fields, name):
+    value = fields.get(name)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise LogError(
+            f"a prefill event reports {name}={value!r}, which is not a token count"
+        )
+    return value
+
+
+def time_of(fields, name):
+    value = fields.get(name)
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+        raise LogError(f"a prefill event reports {name}={value!r}, which is not a time")
+    return float(value)
+
+
+def prefill_of(fields):
+    """The engine's account of one request's prefill.
+
+    The counts must describe one prefill: the tokens a cache supplied and the
+    tokens the model ran over cannot together exceed the prompt, and a prefill
+    that ran no token took no time. A request whose event says otherwise was
+    paired with the wrong event or written by a broken engine, and a rate taken
+    off it would be a rate of nothing.
+    """
+    prompt = count_of(fields, "prompt_tokens")
+    reused = count_of(fields, "reused_tokens")
+    forwarded = count_of(fields, "forwarded_tokens")
+    prefill_ms = time_of(fields, "prefill_ms")
+    draft_prefill_ms = time_of(fields, "draft_prefill_ms")
+    if reused + forwarded > prompt:
+        raise LogError(
+            f"a prefill event reports {reused} reused and {forwarded} forwarded "
+            f"tokens of a {prompt}-token prompt: together they exceed it"
+        )
+    if forwarded == 0 and prefill_ms != 0:
+        raise LogError(
+            f"a prefill event reports {prefill_ms} ms for a prefill that ran no token"
+        )
+    return {
+        "prompt_tokens": prompt,
+        "reused_tokens": reused,
+        "forwarded_tokens": forwarded,
+        "prefill_ms": prefill_ms,
+        "draft_prefill_ms": draft_prefill_ms,
+    }
+
+
 def plain_requests(path, expect_total, last, sampler_events):
     """One row per request, for a server that was given no drafter."""
     intruders = spec_round_log.done_events(path)
@@ -235,8 +295,14 @@ def plain_requests(path, expect_total, last, sampler_events):
         expect_total,
         last,
     )
+    prefills = take(
+        events_matching(path, PREFILL_MESSAGE, exact=True),
+        "prefill",
+        expect_total,
+        last,
+    )
     rows = []
-    for ttft, itl, peak in zip(ttfts, itls, peaks):
+    for ttft, itl, peak, prefill in zip(ttfts, itls, peaks, prefills):
         rate, step_count = itl_rate(itl)
         rows.append(
             {
@@ -244,6 +310,7 @@ def plain_requests(path, expect_total, last, sampler_events):
                 "decode_tps": rate,
                 "step_count": step_count,
                 "metal_peak_alloc_mb": metal_peak_of(peak),
+                **prefill_of(prefill),
             }
         )
     return {
@@ -262,6 +329,12 @@ def speculative_requests(path, expect_total, last, sampler_events):
             "the log holds no speculative round-loop 'done' event"
         )
     events = take(events, "round-loop 'done'", expect_total, last)
+    prefills = take(
+        events_matching(path, PREFILL_MESSAGE, exact=True),
+        "prefill",
+        expect_total,
+        last,
+    )
 
     spec_round_log.require_counters(events)
     for event in events:
@@ -269,7 +342,7 @@ def speculative_requests(path, expect_total, last, sampler_events):
         spec_round_log.check_derived(event)
 
     rows = []
-    for ttft, event in zip(ttfts, events):
+    for ttft, event, prefill in zip(ttfts, events, prefills):
         rate = spec_round_log.decode_tps(event)
         if rate is None:
             raise LogError(
@@ -278,7 +351,7 @@ def speculative_requests(path, expect_total, last, sampler_events):
                 "over the samples that happened to work is not a mean over the "
                 "sample set"
             )
-        row = {"ttft_ms": ttft_of(ttft), "decode_tps": rate}
+        row = {"ttft_ms": ttft_of(ttft), "decode_tps": rate, **prefill_of(prefill)}
         row.update({name: event[name] for name in ROUND_FIELDS})
         rows.append(row)
 

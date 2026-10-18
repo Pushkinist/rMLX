@@ -46,7 +46,6 @@ fn sample(loop_kind: SpecLoop) -> RoundStats {
         conditioned_rows: None,
         total_draft: 32,
         total_accept,
-        prefill_ns: 500_000_000,
         draft_ns: 200_000_000,
         verifier_ns: 400_000_000,
         round_loop_ns: 1_200_000_000,

@@ -29,7 +29,7 @@ derivation and the log site.
 | `accepted_per_step` | `total_accept / rounds` |
 | `tokens_per_round` | `emitted_in_rounds / rounds` |
 | `decode_tps` | first emitted token to last, prefill excluded; `Some(x)`, or `None` under two tokens |
-| `elapsed_ms`, `prefill_ms` | wall clock of the whole request and of the prefill |
+| `elapsed_ms` | wall clock of the whole request, prefill included; the prefill has its own `generate: prefill` event (`PROFILING.md` §11) |
 | `round_ms`, `draft_ms`, `verifier_ms` | the round loop, and the drafter and verify spans inside it |
 | `draft_ms_per_round`, `verify_ms_per_round`, `loop_ms_per_round` | per round; the last is `round_ms` less the other two |
 | `conditioned_rows` | rows a projecting drafter's rounds have projected |

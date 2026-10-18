@@ -262,9 +262,9 @@ impl RoundDrafter for Eagle3Round<'_> {
     /// own KV cache on the prompt shifted by one with that bonus appended,
     /// conditioned on the capture.
     ///
-    /// The span covers all three: the drafter's prefill is conditioned on the
-    /// verifier's capture and is part of what this request paid before its first
-    /// round.
+    /// The verifier's prefill and the drafter's own are timed apart: the drafter's
+    /// is conditioned on the verifier's capture, and is part of what this request
+    /// paid before its first round.
     fn prefill(
         &mut self,
         ctx: &mut RoundCtx<'_>,
@@ -302,6 +302,7 @@ impl RoundDrafter for Eagle3Round<'_> {
             cancel,
         )?;
         guard_verifier_prefill_logits(ctx.verifier, &bonus_logits, n)?;
+        let prefill_ns = prefill_t0.elapsed().as_nanos();
         let bonus = ctx.draw.seed_token(&bonus_logits, device)?;
 
         // Mirrors mlx-vlm `prefill_from_target_hidden`: the drafter reads the
@@ -310,6 +311,7 @@ impl RoundDrafter for Eagle3Round<'_> {
         let mut shifted: Vec<u32> = Vec::with_capacity(n);
         shifted.extend_from_slice(prompt.get(1..).unwrap_or_default());
         shifted.push(bonus);
+        let draft_prefill_t0 = Instant::now();
         let (h_seed, seed_tok) = self.drafter.prefill_from_verifier_hidden(
             ctx.verifier,
             &shifted,
@@ -327,7 +329,8 @@ impl RoundDrafter for Eagle3Round<'_> {
         self.d_seed_tok = Some(seed_tok);
         Ok(Prefilled {
             seed: Seed::Emitted(bonus),
-            prefill_ns: prefill_t0.elapsed().as_nanos(),
+            prefill_ns,
+            draft_prefill_ns: draft_prefill_t0.elapsed().as_nanos(),
             restricted_read_back: self.restricted_read_back,
             // It carries no conditioning buffer: what crosses a round is its own
             // KV cache and one hidden row, and it projects no rows to report.

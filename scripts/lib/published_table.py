@@ -457,9 +457,12 @@ def fixed_table(result: dict, bound: dict) -> list[str]:
         f"| output speed (tok/s) | {rate_cell(block['decode_tps'])} "
         f"| {bound['ceiling_tps']:.2f} "
         f"| {ratio_pct(measured_rate(block['decode_tps']), bound['ceiling_tps'])} |",
-        f"| input speed (tok/s) | {rate_cell(block['prefill_tps'])} "
+        f"| input speed, prompt over TTFT (tok/s) | {rate_cell(block['prefill_tps'])} "
         f"| {'—' if not prefill_bound else f'{prefill_bound:.0f}'} "
         f"| {ratio_pct(measured_rate(block['prefill_tps']), prefill_bound)} |",
+        f"| input speed, engine's own (tok/s) | {rate_cell(block['prefill_engine_tps'])} "
+        f"| {'—' if not prefill_bound else f'{prefill_bound:.0f}'} "
+        f"| {ratio_pct(measured_rate(block['prefill_engine_tps']), prefill_bound)} |",
         f"| peak `phys_footprint` (GB) | {gb(footprint)} "
         f"| {gb(bound['resident_floor_bytes'])} "
         f"| {ratio_pct(bound['resident_floor_bytes'], footprint)} |",
@@ -467,6 +470,16 @@ def fixed_table(result: dict, bound: dict) -> list[str]:
         f"| {gb(bound['resident_floor_bytes'])} "
         f"| {ratio_pct(bound['resident_floor_bytes'], block['rss_bytes']['max'])} |",
         f"| peak Metal allocation (GB) | {gb(metal_peak)} | — | — |",
+        "",
+        "The two input-speed rows are the two definitions a third-party column may",
+        "use. Prompt over TTFT is what a client sees: it adds the first token's",
+        "draw and the step callback to the prefill. The engine's own rate is the",
+        f"{block['prompt_tokens']} prompt tokens the prefill ran the model over,",
+        "divided by the time the engine measured for the prefill forwards, up to the",
+        "point their logits are forced, off its `generate: prefill` event (mean",
+        f"{block['prefill_ms']['mean']:.1f} ms; the draw of the first token is not in it).",
+        "The prompt cache was cold: the engine reports no reused token, or the run",
+        "is refused. Both rows share one bound, a projection of the prefill rate.",
         "",
         "The two resident rows read the other way round — their bound is a",
         "**floor**, so the last column is how much of what the process held is",
@@ -496,6 +509,141 @@ def fixed_table(result: dict, bound: dict) -> list[str]:
             "7× range across models.",
         ]
     out.append("")
+    return out
+
+
+def longctx_table(result: dict) -> list[str]:
+    """Time to first token and the rates at a context the fixed prompt does not reach."""
+    out = []
+    for label, row in sorted(result.get("longctx", {}).items()):
+        metal = row["metal_peak_alloc_mb"]["max"] * 1024 * 1024
+        out += [
+            f"## Long context — `{label}`, plain decode",
+            "",
+            f"`{row['file']}` sent as it is checked in, at temperature 0 and a",
+            f"{row['max_tokens']}-token output budget, three runs on a server each",
+            f"(context ceiling {row['ctx_max']}). The checkpoint's tokenizer counts it at",
+            f"{row['prompt_tokens']} tokens; the file was built for {row['target_tokens']}.",
+            "The prompt cache was cold: the engine reports no reused token, or the run is",
+            "refused. Plain decode only, because a rate a drafter produced is not the",
+            "autoregressive one.",
+            "",
+            "| figure | measured | range % |",
+            "|---|---:|---:|",
+            f"| time to first token (ms) | {row['ttft_ms']['mean']:.1f} "
+            f"| {row['ttft_ms']['range_pct']:.2f} |",
+            f"| engine prefill time (ms) | {row['prefill_ms']['mean']:.1f} "
+            f"| {row['prefill_ms']['range_pct']:.2f} |",
+            f"| input speed, prompt over TTFT (tok/s) | {rate_cell(row['prefill_tps'])} "
+            f"| {row['prefill_tps']['range_pct']:.2f} |",
+            f"| input speed, engine's own (tok/s) | {rate_cell(row['prefill_engine_tps'])} "
+            f"| {row['prefill_engine_tps']['range_pct']:.2f} |",
+            f"| output speed (tok/s) | {rate_cell(row['decode_tps'])} "
+            f"| {row['decode_tps']['range_pct']:.2f} |",
+            f"| peak `phys_footprint` (GB) | {gb(row['phys_footprint_bytes']['max'])} | — |",
+            f"| peak RSS (GB) | {gb(row['rss_bytes']['max'])} | — |",
+            f"| peak Metal allocation (GB) | {gb(metal)} | — |",
+            "",
+            "This row has no bound beside it. `perf_ceiling.py` prices a cell at the",
+            "run's context ceiling, and this row ran under a larger one than the cells",
+            "above, so a percentage of the ceiling here would be a percentage of another",
+            "run's. The resident peaks are the largest of the three runs, sampled as the",
+            "fixed prompt's are, and the Metal peak is the allocator's own high-water mark",
+            "since that run's server started.",
+            "",
+        ]
+    return out
+
+
+def check_greedy(result: dict) -> None:
+    """A rate printed beside counts that do not make it is refused, not printed."""
+    name = arm_label(result)
+    datasets = result["greedy_match"]["datasets"]
+    for dataset, e in datasets.items():
+        judged = e["identical"] + e["near_tie"] + e["refused"] + e["unjudgeable"]
+        if judged != e["samples"]:
+            raise InputError(
+                f"`{name}` files {judged} judged samples of {dataset} where it says it "
+                f"answered {e['samples']}: a sample is in no class, or in two"
+            )
+        for rate, counted in (("identical_rate", e["identical"]),
+                              ("identical_or_near_tie_rate", e["identical"] + e["near_tie"])):
+            if abs(e[rate] - counted / e["samples"]) > 1e-9:
+                raise InputError(
+                    f"`{name}` files {rate} {e[rate]!r} for {dataset} where its counts "
+                    f"make {counted / e['samples']!r}"
+                )
+    samples = sum(e["samples"] for e in datasets.values())
+    for rate, counted in (
+        ("identical_rate", sum(e["identical"] for e in datasets.values())),
+        ("identical_or_near_tie_rate", sum(e["identical"] + e["near_tie"] for e in datasets.values())),
+    ):
+        if abs(result["greedy_match"][rate] - counted / samples) > 1e-9:
+            raise InputError(
+                f"`{name}` files an overall {rate} of {result['greedy_match'][rate]!r} "
+                f"where its datasets make {counted / samples!r}"
+            )
+
+
+def greedy_table(results: list[dict]) -> list[str]:
+    """Whether a drafter changed the answer, sample by sample."""
+    judged = [r for r in results if r.get("greedy_match")]
+    if not judged:
+        return []
+    for result in judged:
+        check_greedy(result)
+    out = [
+        "## Greedy match against plain decode",
+        "",
+        "Every sample answered once at temperature 0, unstreamed and with logprobs, in a",
+        "pass of its own after the speed passes: the one place this harness overrides the",
+        "checkpoint's sampling, because two arms can only be compared token for token",
+        "when neither draws. A sample is **identical** when the speculative answer,",
+        "reasoning included, is the plain answer to the last character. A pair that",
+        "differs is judged by the divergence oracle (`rmlx eval spec-answer`): a",
+        "**near tie** is the verify pass scoring a block in one forward and flipping a",
+        "decision the verifier was nearly tied on. That is the oracle's reading of the",
+        "first divergence only: it says that decision was close, and nothing about",
+        "whether the rest of the answer agrees;",
+        "**refused** is a divergence where the verifier was not tied, or a run that",
+        "stopped well before the other; **unjudgeable** is a pair the oracle could not",
+        "read. The last column counts identical and near-tie samples together; it is",
+        "not a claim that those answers are equivalent.",
+        "",
+        "| mode | dataset | samples | identical | near tie | refused | unjudgeable "
+        "| identical % | identical or near tie % |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for result in judged:
+        match = result["greedy_match"]
+        datasets = match["datasets"]
+        order = [d for d in DATASET_ORDER if d in datasets]
+        order += sorted(d for d in datasets if d not in DATASET_ORDER)
+        for dataset in order:
+            e = datasets[dataset]
+            out.append(
+                f"| `{arm_label(result)}` | {dataset} | {e['samples']} "
+                f"| {e['identical']} | {e['near_tie']} | {e['refused']} "
+                f"| {e['unjudgeable']} | {e['identical_rate'] * 100:.1f} "
+                f"| {e['identical_or_near_tie_rate'] * 100:.1f} |"
+            )
+        total = {k: sum(e[k] for e in datasets.values())
+                 for k in ("samples", "identical", "near_tie", "refused", "unjudgeable")}
+        out.append(
+            f"| `{arm_label(result)}` | **all** | {total['samples']} "
+            f"| {total['identical']} | {total['near_tie']} | {total['refused']} "
+            f"| {total['unjudgeable']} | {match['identical_rate'] * 100:.1f} "
+            f"| {match['identical_or_near_tie_rate'] * 100:.1f} |"
+        )
+    started = sorted({r["greedy_match"]["against"]["ts_utc"] for r in judged})
+    out += [
+        "",
+        f"Judged against the plain run started at {', '.join(started)}. The two passes",
+        "are of one checkpoint, one KV codec, one context ceiling and one sample set,",
+        "or the comparison is refused. The sample count is in each row: read a rate",
+        "over a few samples there.",
+        "",
+    ]
     return out
 
 
@@ -575,7 +723,7 @@ def ppl_block(record: dict) -> list[str]:
 # has to grow a section of its own.
 EXTRA_COLUMNS = {
     "greedy_match": "greedy token-match rate against plain decode on the same "
-                    "checkpoint, per dataset — the lossless proof",
+                    "checkpoint, per dataset — whether a drafter changed the answer",
     "longctx": "TTFT and decode rate at 32k and 128k input, plain, from "
                "`prompts/longctx_*.json`",
     "wikitext_ppl": "Wikitext-2 perplexity of the served checkpoint, from an "
@@ -676,6 +824,9 @@ def render(results: list[dict], snapshot: Path, bounds: dict, meta: dict,
     for result in results:
         if result.get("fixed_prompt"):
             lines += fixed_table(result, bounds[(arm_label(result), "#fixed")])
+    for result in results:
+        lines += longctx_table(result)
+    lines += greedy_table(results)
     if ppl is not None:
         lines += ppl_block(ppl)
     lines += missing_columns_block(results, ppl)

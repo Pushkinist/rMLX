@@ -520,8 +520,6 @@ pub(crate) struct RoundStats {
     pub(crate) total_draft: usize,
     /// Proposed tokens the verifier accepted, over all rounds.
     pub(crate) total_accept: usize,
-    /// Prompt prefill span.
-    pub(crate) prefill_ns: u128,
     /// Wall-clock spent inside the drafter call, over all rounds.
     pub(crate) draft_ns: u128,
     /// Wall-clock spent inside the verify forward, over all rounds.
@@ -762,7 +760,6 @@ impl RoundStats {
             tokens_per_round = self.tokens_per_round(),
             decode_tps = ?self.decode_tps,
             elapsed_ms = ms(self.elapsed_ns),
-            prefill_ms = ms(self.prefill_ns),
             round_ms = ms(self.round_loop_ns),
             draft_ms = ms(self.draft_ns),
             verifier_ms = ms(self.verifier_ns),

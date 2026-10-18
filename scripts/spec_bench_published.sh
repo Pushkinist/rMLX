@@ -12,6 +12,11 @@
 #     --kv-quant Q             KV codec to ask the engine for
 #     --max-ctx N              context the server is started with
 #     --port N
+#     --longctx SIZE           also measure prompts/longctx_SIZE.json (e.g. 32k), plain only;
+#                              repeatable
+#     --greedy-pass            also answer every sample at temperature 0, unstreamed
+#     --greedy-against RUN     speculative only: judge that pass against the plain run
+#                              in RUN (a run directory); implies --greedy-pass
 #     --samples-root DIR       measure an unpinned copy instead; not recordable
 #     --allow-busy-host        measure anyway, and taint the result
 #     --synthetic-arms         the server is a stub, so this run measures nothing
@@ -32,6 +37,41 @@
 # window timed at the client. The two rings at GET /metrics/cache hold twenty
 # entries, so neither can carry a 128-sample dataset; the readings come out of
 # the run log, which holds one event per request.
+#
+# THE LONG-CONTEXT ROW
+#
+# `--longctx 32k` adds the protocol's fixed-prompt measurement at a context it does
+# not name: `prompts/longctx_32k.json` sent as it is checked in, at temperature 0 and
+# a short output budget, once per pass, to a server of its own whose context ceiling
+# a prompt of that size fits (the passes run at the default, which it does not).
+# Each run is a cold prompt: the server is new, so nothing of it is cached, and the
+# engine's prefill event says so or the run is refused. The result files time to
+# first token, input speed by both definitions, the decode rate and the resident
+# peaks under `longctx`, keyed by the prompt's label. Plain decode only, for the
+# reason the fixed prompt is: a rate a drafter produced is not the autoregressive one.
+# A grid of more sizes across three modes, and a KV-bytes companion, are not built;
+# each size is one more `--longctx`.
+#
+# THE GREEDY PASS
+#
+# The speed passes sample under the checkpoint's own defaults, so no two arms
+# answer the same question there and nothing in them says whether a drafter changed
+# the answer. `--greedy-pass` adds a pass of its own, after the speed passes, on a
+# server of its own: every sample at the macro budget, once, at temperature 0,
+# unstreamed and with the two best candidates of every position. It is the one place
+# this harness overrides the checkpoint's sampling, and it never runs inside a speed
+# pass, because reading logprobs back to the host at every step is a different
+# engine workload. Its answers are kept under `<run>/greedy/` with an index of their
+# digests and a `meta.json`.
+#
+# A speculative run given `--greedy-against <plain run directory>` judges its
+# answers against that run's, sample by sample: equal answers are identical, and a
+# pair that differs is judged by the divergence oracle, `rmlx eval spec-answer`, of
+# the binary that was measured. The result files per dataset the identical count and
+# rate, and the near-tie, refused and unjudgeable counts. A near tie is a legitimate
+# flip of the verify pass; a refused pair is a drafter that answered another question,
+# and it is published, not stopped on. The two passes must be of one checkpoint, one
+# KV codec, one context ceiling and one sample set, or the comparison is refused.
 #
 # THE CAMPAIGN
 #
@@ -105,7 +145,12 @@
 #                 once per pass, before the cells, so its prefill is cold. It is
 #                 not measured on a speculative arm at all: a rate a drafter
 #                 produced is not the autoregressive one.
-#   input speed   prompt tokens over TTFT, on that cold prompt cache.
+#   input speed   on that cold prompt cache, by both definitions a third-party
+#                 column may use: prompt tokens over TTFT (what a client sees),
+#                 and the tokens the prefill ran the model over, over the prefill
+#                 time the engine timed itself (its own rate), off the
+#                 `generate: prefill` event. A request the engine took any prompt
+#                 token for from a cache is refused: its input speed is not cold.
 #   memory        the peak of `rmlx_process_phys_footprint_bytes` (the counter
 #                 docs/PROFILING.md §9 names) sampled at a fixed interval while
 #                 the fixed-prompt request is in flight, reported with the
@@ -194,6 +239,9 @@ FIXED_PROMPT_CORPUS="${REPO_ROOT}/prompts/longctx_4k.json"
 # Resident memory is a gauge, so a peak can only be sampled. This interval is
 # recorded with the figure: what comes out is a lower bound on the true peak.
 MEMORY_POLL_MS=250
+# The long-context row is about the context, not the answer: a short budget keeps
+# the decode window at a context the prompt already fills.
+LONGCTX_MAX_TOKENS=200
 
 # ── Flags ────────────────────────────────────────────────────────────────────
 
@@ -208,6 +256,9 @@ PORT=8090
 PUBLISHED_ROOT="${REPO_ROOT}/prompts/published"
 SAMPLES_ROOT=""
 ALLOW_BUSY_HOST=false
+GREEDY_PASS=false
+GREEDY_AGAINST=""
+LONGCTX_SIZES=()
 SYNTHETIC_ARMS=false
 # Which clock times the stream at the client. `client` is the only value a
 # measurement can have; `--server-stamps` is for a stub that stamps its chunks.
@@ -227,6 +278,9 @@ while [[ $# -gt 0 ]]; do
         --port) need_value "$1" "${2:-}"; PORT="$2"; shift 2 ;;
         --samples-root) need_value "$1" "${2:-}"; SAMPLES_ROOT="$2"; shift 2 ;;
         --allow-busy-host) ALLOW_BUSY_HOST=true; shift ;;
+        --greedy-pass) GREEDY_PASS=true; shift ;;
+        --longctx) need_value "$1" "${2:-}"; LONGCTX_SIZES+=("$2"); shift 2 ;;
+        --greedy-against) need_value "$1" "${2:-}"; GREEDY_AGAINST="$2"; GREEDY_PASS=true; shift 2 ;;
         --synthetic-arms) SYNTHETIC_ARMS=true; shift ;;
         --server-stamps) CLIENT_CLOCK=server_stamps; SERVER_STAMPS_ARG=(--server-stamps); shift ;;
         -*) echo "ERROR: unknown flag: $1" >&2; exit 1 ;;
@@ -284,6 +338,32 @@ fi
 
 ARM="plain"
 [[ -n "${DRAFTER_MODEL}" ]] && ARM="speculative"
+
+for size in ${LONGCTX_SIZES[@]+"${LONGCTX_SIZES[@]}"}; do
+    if ! [[ "${size}" =~ ^[0-9]+k$ ]] || [[ ! -f "${REPO_ROOT}/prompts/longctx_${size}.json" ]]; then
+        echo "ERROR: --longctx '${size}' names no checked-in prompt: expected a size" \
+             "such as 32k with a prompts/longctx_<size>.json beside this script" >&2
+        exit 1
+    fi
+done
+if [[ ${#LONGCTX_SIZES[@]} -gt 0 && "${ARM}" != "plain" ]]; then
+    echo "ERROR: --longctx is measured on the plain arm only: the row's rates are the" \
+         "autoregressive ones, and a drafter's are not" >&2
+    exit 1
+fi
+
+if [[ -n "${GREEDY_AGAINST}" ]]; then
+    if [[ "${ARM}" != "speculative" ]]; then
+        echo "ERROR: --greedy-against judges a speculative run against a plain one;" \
+             "this run has no drafter, so it would be judged against itself" >&2
+        exit 1
+    fi
+    if [[ ! -f "${GREEDY_AGAINST}/greedy/meta.json" ]]; then
+        echo "ERROR: --greedy-against ${GREEDY_AGAINST} holds no greedy/meta.json:" \
+             "name the directory of a plain run that ran with --greedy-pass" >&2
+        exit 1
+    fi
+fi
 
 # ── Preconditions ────────────────────────────────────────────────────────────
 
@@ -583,14 +663,17 @@ poll_memory() {
 # ── Passes ───────────────────────────────────────────────────────────────────
 
 PASS_FILES=()
-# start_server <tag> — one verifier server, ready to serve, as SERVER_PID.
+# start_server <tag> [ctx [cache-slots]] — one verifier server, ready to serve, as
+# SERVER_PID, at the harness's context ceiling and the engine's prompt-cache default
+# unless they are given.
 #
 # Two callers: the preparation server the fixed prompt is fitted against, and
 # each pass. They must be the same server or the fit describes a different
 # engine than the one measured on it.
 start_server() {
-    local tag="$1"
-    local args=(serve --model "${VERIFIER_MODEL}" --max-ctx "${MAX_CTX}" --port "${PORT}")
+    local tag="$1" ctx="${2:-${MAX_CTX}}" cache_slots="${3:-}"
+    local args=(serve --model "${VERIFIER_MODEL}" --max-ctx "${ctx}" --port "${PORT}")
+    [[ -n "${cache_slots}" ]] && args+=(--prompt-cache-slots "${cache_slots}")
     [[ -n "${KV_QUANT}" ]] && args+=(--kv-quant "${KV_QUANT}")
     [[ -n "${DRAFTER_MODEL}" ]] && args+=(--draft-model "${DRAFTER_MODEL}")
     [[ -n "${DRAFT_KIND}" ]] && args+=(--draft-kind "${DRAFT_KIND}")
@@ -834,6 +917,171 @@ print(json.dumps(json.load(open(sys.argv[1]))["sampling"], sort_keys=True))' \
     echo ""
 done
 
+# ── The long-context rows ────────────────────────────────────────────────────
+#
+# One server per run, as the passes have one per pass: the prompt is cold only
+# while nothing of it has been served. Each run is a warmup and the one request.
+LONGCTX_REPORT_ARGS=()
+for size in ${LONGCTX_SIZES[@]+"${LONGCTX_SIZES[@]}"}; do
+    label="longctx_${size}"
+    echo "==> long context ${label}: three runs, one server each"
+    LC_DIR="${RUN_DIR}/longctx/${label}"
+    mkdir -p "${LC_DIR}"
+    LC_PAYLOAD="${WORK}/${label}.json"
+    LC_META="${WORK}/${label}.meta.json"
+    python3 "${REPO_ROOT}/scripts/lib/published_longctx.py" payload \
+        --file "${REPO_ROOT}/prompts/${label}.json" --model-id "${MODEL_ID}" \
+        --max-tokens "${LONGCTX_MAX_TOKENS}" --out "${LC_PAYLOAD}" --meta "${LC_META}" || exit 1
+    LC_CTX="$(python3 -c 'import json, sys
+print(json.load(open(sys.argv[1]))["ctx_max"])' "${LC_META}")"
+    LC_RUNS=()
+    for (( run = 1; run <= PASSES; run++ )); do
+        snapshot_logs
+        if ! start_server "${label}_${run}" "${LC_CTX}"; then exit 1; fi
+        $SYNTHETIC_ARMS || note_thermal "${label} run ${run}"
+        if ! send "${WARMUP_PAYLOAD}" "${WORK}/warmup.kv"; then
+            echo "ERROR: ${label} run ${run}: the warmup request failed" >&2
+            kill "${SERVER_PID}" 2>/dev/null || true
+            exit 1
+        fi
+        LC_RUN_DIR="${LC_DIR}/${run}"
+        mkdir -p "${LC_RUN_DIR}"
+        poll_memory "${LC_RUN_DIR}/memory.txt" &
+        MEMORY_PID=$!
+        if ! send "${LC_PAYLOAD}" "${LC_RUN_DIR}/client.kv"; then
+            kill "${MEMORY_PID}" 2>/dev/null || true
+            echo "ERROR: ${label} run ${run}: the request failed" >&2
+            kill "${SERVER_PID}" 2>/dev/null || true
+            exit 1
+        fi
+        kill "${MEMORY_PID}" 2>/dev/null || true
+        wait "${MEMORY_PID}" 2>/dev/null || true
+        kill "${SERVER_PID}" 2>/dev/null || true
+        wait "${SERVER_PID}" 2>/dev/null || true
+        sleep 3  # let the run log flush before it is read
+
+        LC_LOG="$(phase_log "${SERVER_PID}")" || LC_LOG=""
+        if [[ -z "${LC_LOG}" ]]; then
+            echo "ERROR: no run log in ${LOG_DIR} is attributable to the ${label}" \
+                 "run-${run} server (pid ${SERVER_PID})" >&2
+            exit 1
+        fi
+        /bin/cp "${LC_LOG}" "${LC_RUN_DIR}/serve.jsonl"
+        # The warmup and the request; the request is the last. The warmup is sampled
+        # under the checkpoint's defaults, the request is at temperature 0 and so
+        # resolves no sampler: one event on a sampled checkpoint, none on a greedy one.
+        LC_SAMPLER_EVENTS=0
+        [[ "${SAMPLED}" == "true" ]] && LC_SAMPLER_EVENTS=1
+        if ! python3 "${REPO_ROOT}/scripts/lib/published_run_log.py" "${LC_LOG}" \
+                --arm plain --expect-total 2 --last 1 \
+                --expect-sampler-events "${LC_SAMPLER_EVENTS}" > "${LC_RUN_DIR}/engine.json"; then
+            echo "ERROR: ${label} run ${run}: no usable per-request record in ${LC_LOG}" >&2
+            exit 1
+        fi
+        if ! python3 "${REPO_ROOT}/scripts/lib/published_longctx.py" run \
+                --engine "${LC_RUN_DIR}/engine.json" --client "${LC_RUN_DIR}/client.kv" \
+                --memory "${LC_RUN_DIR}/memory.txt" --meta "${LC_META}" \
+                --pass-number "${run}" --memory-poll-ms "${MEMORY_POLL_MS}" \
+                --cross-check-pct "${CROSS_CHECK_BAND_PCT}" > "${LC_RUN_DIR}/run.json"; then
+            exit 1
+        fi
+        LC_RUNS+=("${LC_RUN_DIR}/run.json")
+        SERVER_PID=""
+        sleep 3
+    done
+    LONGCTX_REPORT_ARGS+=(--longctx "${label}" "${LC_RUNS[@]}")
+    echo ""
+done
+
+# ── The greedy pass ──────────────────────────────────────────────────────────
+#
+# After the speed passes and on a server of its own: it sends logprob requests,
+# which the measured passes must never do. Only the cells at the macro budget are
+# answered, one per sample, so the longer MATH-500 cell does not weigh its dataset
+# twice.
+GREEDY_REPORT_ARGS=()
+if $GREEDY_PASS; then
+    echo "==> greedy pass: temperature 0, unstreamed, with logprobs"
+    GREEDY_CELL_ARGS=()
+    for spec in "${CELLS[@]}"; do
+        [[ "${spec#*:}" == "${MACRO_MAX_TOKENS}" ]] && GREEDY_CELL_ARGS+=(--cell "${spec}")
+    done
+    GREEDY_INDEX="${WORK}/greedy_cells.tsv"
+    python3 "${REPO_ROOT}/scripts/lib/published_payloads.py" --greedy \
+        --samples-root "${SAMPLES_ROOT}" \
+        --out "${WORK}/greedy_payloads" \
+        --model-id "${MODEL_ID}" \
+        --index "${GREEDY_INDEX}" \
+        "${GREEDY_CELL_ARGS[@]}" || exit 1
+
+    GREEDY_DIR="${RUN_DIR}/greedy"
+    mkdir -p "${GREEDY_DIR}/answers"
+    : > "${GREEDY_DIR}/index.tsv"
+    # The prompt cache is off: a plain sample resumed from a cached prefix would be
+    # a reference that the speculative loop, which prefills the whole prompt every
+    # time, did not answer from. The engine's prefill events are checked below.
+    snapshot_logs
+    if ! start_server greedy "${MAX_CTX}" 0; then exit 1; fi
+    g=0
+    while IFS=$'\t' read -r cell dataset max_tokens sample_id body_sha payload; do
+        answer="answers/$(printf '%05d' "${g}").json"
+        if ! block="$(python3 "${REPO_ROOT}/scripts/lib/sse_decode_window.py" \
+                --url "http://127.0.0.1:${PORT}/v1/chat/completions" \
+                --body-file "${payload}" --complete "${GREEDY_DIR}/${answer}")"; then
+            echo "ERROR: greedy pass ${cell}/${sample_id}: the request failed or its" \
+                 "response could not be read" >&2
+            kill "${SERVER_PID}" 2>/dev/null || true
+            exit 1
+        fi
+        digest="$(field_of "${block}" answer_sha256)"
+        if [[ -z "${digest}" ]]; then
+            echo "ERROR: greedy pass ${cell}/${sample_id}: the reader printed no" \
+                 "answer digest" >&2
+            kill "${SERVER_PID}" 2>/dev/null || true
+            exit 1
+        fi
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "${cell}" "${dataset}" "${max_tokens}" "${sample_id}" "${body_sha}" \
+            "${digest}" "${answer}" >> "${GREEDY_DIR}/index.tsv"
+        g=$((g + 1))
+        if (( g % 25 == 0 )); then echo "  [greedy] ${g}" >&2; fi
+    done < "${GREEDY_INDEX}"
+    kill "${SERVER_PID}" 2>/dev/null || true
+    wait "${SERVER_PID}" 2>/dev/null || true
+    sleep 3  # let the run log flush before it is read
+    GREEDY_LOG="$(phase_log "${SERVER_PID}")" || GREEDY_LOG=""
+    SERVER_PID=""
+    if [[ -z "${GREEDY_LOG}" ]]; then
+        echo "ERROR: no run log in ${LOG_DIR} is attributable to the greedy-pass server" >&2
+        exit 1
+    fi
+    /bin/cp "${GREEDY_LOG}" "${GREEDY_DIR}/serve.jsonl"
+    python3 "${REPO_ROOT}/scripts/lib/published_greedy.py" cold \
+        --log "${GREEDY_LOG}" --expect "${g}" || exit 1
+
+    GREEDY_DECODE_CONFIG=""
+    if [[ "${ARM}" == "speculative" ]]; then
+        GREEDY_DECODE_CONFIG="$(python3 -c 'import json, sys
+print(json.load(open(sys.argv[1]))["decode_config"])' "${RUN_DIR}/passes/1/engine.json")"
+    fi
+    python3 "${REPO_ROOT}/scripts/lib/published_greedy.py" seal \
+        --dir "${GREEDY_DIR}" --arm "${ARM}" \
+        --model-namespace "${MODEL_NAMESPACE}" --model "${MODEL_NAME}" \
+        --weight-quant "${WEIGHT_QUANT}" --kv-quant "${KV_QUANT_SEEN}" \
+        --ctx-max "${MAX_CTX}" --decode-config "${GREEDY_DECODE_CONFIG}" \
+        --binary-sha256 "${BINARY_SHA256}" --ts-utc "${TS_UTC}" || exit 1
+    GREEDY_REPORT_ARGS+=(--greedy-pass "${GREEDY_DIR}/meta.json")
+
+    if [[ -n "${GREEDY_AGAINST}" ]]; then
+        RMLX_HOME="${RMLX_HOME}" python3 "${REPO_ROOT}/scripts/lib/published_greedy.py" compare \
+            --plain "${GREEDY_AGAINST}/greedy" --spec "${GREEDY_DIR}" \
+            --rmlx-bin "${BINARY}" --out "${WORK}/greedy_match.json" || exit 1
+        /bin/cp "${WORK}/greedy_match.json" "${GREEDY_DIR}/match.json"
+        GREEDY_REPORT_ARGS+=(--greedy-match "${GREEDY_DIR}/match.json")
+    fi
+    echo ""
+fi
+
 # ── Report ───────────────────────────────────────────────────────────────────
 
 META="${WORK}/meta.json"
@@ -916,6 +1164,8 @@ python3 "${REPO_ROOT}/scripts/lib/published_aggregate.py" report \
     --macro-max-tokens "${MACRO_MAX_TOKENS}" \
     --meta "${META}" \
     ${FIXED_FILES[0]+--fixed "${FIXED_FILES[@]}"} \
+    ${LONGCTX_REPORT_ARGS[@]+"${LONGCTX_REPORT_ARGS[@]}"} \
+    ${GREEDY_REPORT_ARGS[@]+"${GREEDY_REPORT_ARGS[@]}"} \
     --json "${RESULT}"
 REPORT_STATUS=$?
 set -e

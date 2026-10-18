@@ -1,5 +1,4 @@
 use super::*;
-use std::time::Duration;
 
 #[test]
 fn prefill_chunk_constant() {
@@ -17,19 +16,6 @@ fn decode_profile_records_steps() {
     assert_eq!(p.forward_total_ns, 220);
     assert_eq!(p.eval_total_ns, 110);
     assert_eq!(p.step_total_ns, 420);
-}
-
-#[test]
-fn decode_profile_records_prefill() {
-    let mut p = DecodeProfile::default();
-    let t0 = DecodeProfile::start_prefill();
-    std::thread::sleep(Duration::from_millis(2));
-    p.record_prefill(t0);
-    // Avoid asserting exact ns — just sanity-check it advanced.
-    assert!(
-        p.prefill_total_ns > 1_000_000,
-        "prefill_total_ns must be > 1ms"
-    );
 }
 
 #[test]

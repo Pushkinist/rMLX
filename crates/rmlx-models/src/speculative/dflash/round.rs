@@ -139,7 +139,6 @@ impl RoundDrafter for AdaptiveRound<'_> {
             device,
             cancel,
         )?;
-        let prefill_ns = prefill_t0.elapsed().as_nanos();
 
         let (r0_logits, r0_hidden) = ctx.verifier.forward_verify_capture(
             &[last_prompt],
@@ -150,6 +149,7 @@ impl RoundDrafter for AdaptiveRound<'_> {
             device,
         )?;
         guard_verifier_prefill_logits(ctx.verifier, &r0_logits, prompt.len())?;
+        let prefill_ns = prefill_t0.elapsed().as_nanos();
         self.h_ctx = Some(self.drafter.project_condition(&r0_hidden)?);
         self.probe_seed = Some(r0_hidden);
 
@@ -157,6 +157,7 @@ impl RoundDrafter for AdaptiveRound<'_> {
         Ok(Prefilled {
             seed: Seed::Emitted(seed),
             prefill_ns,
+            draft_prefill_ns: 0,
             // It scores every position over the verifier's whole vocabulary.
             restricted_read_back: false,
             // It projects its committed rows every round and the loop counts

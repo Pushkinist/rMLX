@@ -66,7 +66,6 @@ fn totals(charged: bool) -> RoundTotals {
         emitted_in_rounds: 13,
         total_draft: 17,
         total_accept: 19,
-        prefill_ns: 23,
         draft_ns: 29,
         verifier_ns: 31,
         round_loop_ns: 37,
@@ -142,7 +141,7 @@ fn the_recorder_writes_the_charge_decision_it_was_handed() {
 ///
 /// Mutation: swap `total_draft` and `total_accept` in [`round_stats`], which
 /// inverts every ingested `accept_rate` and changes nothing else in the tree;
-/// or write `elapsed_ns: prefill_ns`, which lands a wall-clock of 23 ns in an
+/// or write `elapsed_ns: draft_ns`, which lands a wall-clock of 29 ns in an
 /// append-only store.
 #[test]
 fn every_counter_reaches_the_record_under_its_own_name() {
@@ -159,7 +158,6 @@ fn every_counter_reaches_the_record_under_its_own_name() {
     assert_eq!(record.emitted_in_rounds, 13);
     assert_eq!(record.total_draft, 17);
     assert_eq!(record.total_accept, 19);
-    assert_eq!(record.prefill_ns, 23);
     assert_eq!(record.draft_ns, 29);
     assert_eq!(record.verifier_ns, 31);
     assert_eq!(record.round_loop_ns, 37);

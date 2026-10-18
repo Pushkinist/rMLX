@@ -168,6 +168,8 @@ impl RoundDrafter for TwoModelRound<'_> {
             device,
             cancel,
         )?;
+        let prefill_ns = prefill_t0.elapsed().as_nanos();
+        let draft_prefill_t0 = Instant::now();
         prefill_chunked(
             self.draft,
             head,
@@ -180,7 +182,8 @@ impl RoundDrafter for TwoModelRound<'_> {
         self.seed = vec![last];
         Ok(Prefilled {
             seed: Seed::Carried(last),
-            prefill_ns: prefill_t0.elapsed().as_nanos(),
+            prefill_ns,
+            draft_prefill_ns: draft_prefill_t0.elapsed().as_nanos(),
             // It scores every position over the verifier's whole vocabulary.
             restricted_read_back: false,
             // It carries no conditioning buffer: what crosses a round is the

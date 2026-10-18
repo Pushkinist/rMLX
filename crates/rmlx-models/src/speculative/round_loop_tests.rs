@@ -15,6 +15,8 @@
 //! - `run_rounds` reads the request's token count and not the budget: the same
 //!   test.
 //! - the budget is read after the prefill: `a_prompt_with_no_room_is_refused_before_any_prefill`.
+//! - the loop writes no `generate: prefill` event, or counts a carried seed's token as run by
+//!   the prefill: `a_request_writes_one_prefill_event_and_counts_the_tokens_the_prefill_ran`.
 
 #![allow(
     clippy::expect_used,
@@ -35,9 +37,14 @@ use super::{
 use crate::arch::Architecture;
 use crate::decode_loop::StepVerdict;
 use crate::sampler::SamplerConfig;
+use crate::test_warnings::{field, info_events_during, only};
 
 /// Tokens of the prompt.
 const PROMPT: usize = 10;
+
+/// What the scripted drafter says its target and its draft model's prefills took.
+const TARGET_PREFILL_NS: u128 = 7_000_000;
+const DRAFT_PREFILL_NS: u128 = 3_000_000;
 
 /// Tokens a request asks for.
 const ASKED: usize = 40;
@@ -96,7 +103,8 @@ impl RoundDrafter for ScriptedRounds {
         write_positions(ctx, written)?;
         Ok(Prefilled {
             seed,
-            prefill_ns: 0,
+            prefill_ns: TARGET_PREFILL_NS,
+            draft_prefill_ns: DRAFT_PREFILL_NS,
             restricted_read_back: false,
             projects_conditioning: false,
         })
@@ -216,5 +224,42 @@ fn a_prompt_with_no_room_is_refused_before_any_prefill() {
             "{prefill:?}: {result:?}"
         );
         assert_eq!(prefills, 0, "{prefill:?}: the prompt was prefilled");
+    }
+}
+
+/// A request writes one `generate: prefill` event. A drafter that draws the seed
+/// has run the model over the whole prompt. One that carries the prompt's last
+/// token has run it over all the others. The target's prefill time and a draft
+/// model's are two fields.
+#[test]
+fn a_request_writes_one_prefill_event_and_counts_the_tokens_the_prefill_ran() {
+    for (prefill, forwarded) in [
+        (Prefill::SeedEmitted, PROMPT),
+        (Prefill::SeedCarried, PROMPT - 1),
+    ] {
+        let event = only(info_events_during("generate: prefill", || {
+            let (result, _) = run(prefill, ceiling(ASKED));
+            result.expect("a ceiling with room for the whole request");
+        }));
+        let event = &event;
+        let count = |name| field(event, name).map(str::to_owned);
+        assert_eq!(
+            count("prompt_tokens"),
+            Some(PROMPT.to_string()),
+            "{prefill:?}"
+        );
+        assert_eq!(count("reused_tokens"), Some("0".to_owned()), "{prefill:?}");
+        // The event carries the two spans the drafter timed, each under its own name.
+        assert_eq!(count("prefill_ms"), Some("7.0".to_owned()), "{prefill:?}");
+        assert_eq!(
+            count("draft_prefill_ms"),
+            Some("3.0".to_owned()),
+            "{prefill:?}"
+        );
+        assert_eq!(
+            count("forwarded_tokens"),
+            Some(forwarded.to_string()),
+            "{prefill:?}"
+        );
     }
 }

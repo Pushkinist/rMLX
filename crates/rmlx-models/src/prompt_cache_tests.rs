@@ -2398,100 +2398,19 @@ fn consume_quant_mismatch_evicts_and_misses() {
 // Every consume degrade branch must emit exactly one `debug!{branch=...}` so a
 // silent-drop regression (the qwen3/moe arms were silent before unification)
 // fails this test rather than passing every other one.
-//
-// Capturing tracing events reliably from a test that shares one binary with
-// many other tracing-emitting tests is subtle: the per-callsite Interest cache
-// is GLOBAL and is populated by whatever dispatcher was current the FIRST time a
-// callsite fired. A thread-local `with_default` subscriber cannot retroactively
-// un-disable a callsite that a sibling test already cached as `never` under the
-// no-op default. The fix is a process-global "tee" subscriber installed once:
-// its `register_callsite` returns `always` (so callsites are never cached
-// disabled) and its `event` forwards the `branch` field to a THREAD-LOCAL sink
-// that is only armed inside `capture_branches`. Outside a capture it is inert.
 
-thread_local! {
-    static BRANCH_SINK: std::cell::RefCell<Option<Vec<String>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-struct BranchVisitor<'a> {
-    out: &'a mut Vec<String>,
-}
-
-impl tracing::field::Visit for BranchVisitor<'_> {
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "branch" {
-            self.out.push(value.to_owned());
-        }
-    }
-    fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
-}
-
-/// Process-global tee subscriber. Always-interest so no callsite is cached as
-/// disabled; forwards `branch` fields to the thread-local sink when armed.
-struct TeeBranchSubscriber;
-
-impl tracing::Subscriber for TeeBranchSubscriber {
-    fn register_callsite(
-        &self,
-        _meta: &'static tracing::Metadata<'static>,
-    ) -> tracing::subscriber::Interest {
-        tracing::subscriber::Interest::always()
-    }
-    fn enabled(&self, _md: &tracing::Metadata<'_>) -> bool {
-        true
-    }
-    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
-        Some(tracing::level_filters::LevelFilter::TRACE)
-    }
-    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        tracing::span::Id::from_u64(1)
-    }
-    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-    fn event(&self, event: &tracing::Event<'_>) {
-        BRANCH_SINK.with(|sink| {
-            if let Some(out) = sink.borrow_mut().as_mut() {
-                let mut v = BranchVisitor { out };
-                event.record(&mut v);
-            }
-        });
-    }
-    fn enter(&self, _span: &tracing::span::Id) {}
-    fn exit(&self, _span: &tracing::span::Id) {}
-}
-
-/// Run `f` with the thread-local branch sink armed; return captured branches.
-///
-/// Installs the process-global tee subscriber on first use. Because the tee's
-/// `register_callsite` is `always`, the consume callsites dispatch to it on
-/// every thread regardless of which test fired them first — only the armed
-/// thread records, so the capture is deterministic across the shared binary.
-///
-/// test-ordering note: `set_global_default` is called exactly once (via
-/// `Once`) and is never uninstalled. No other test in this binary may rely on
-/// the global tracing dispatcher's span-filter or subscriber-specific
-/// semantics — the permanent install here will shadow any later attempt to set
-/// a different global default. Tests that need custom tracing must use a
-/// per-thread or scoped subscriber rather than the global dispatcher.
+/// The `branch` field of every event `f` emits on this thread, in order.
 fn capture_branches(f: impl FnOnce()) -> Vec<String> {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        // Ignore an error: another test having set a global default would only
-        // mean our tee is not installed; the assertions below would then catch
-        // a silent-drop, which is the desired failure mode.
-        let _ = tracing::subscriber::set_global_default(TeeBranchSubscriber);
-    });
-    BRANCH_SINK.with(|sink| *sink.borrow_mut() = Some(Vec::new()));
-    f();
-    BRANCH_SINK.with(|sink| sink.borrow_mut().take().unwrap_or_default())
+    crate::test_warnings::events_during(f)
+        .iter()
+        .filter_map(|event| crate::test_warnings::field(&event.fields, "branch"))
+        .map(|branch| branch.trim_matches('"').to_owned())
+        .collect()
 }
 
 /// Each degrade path emits exactly one `debug!{branch=...}` with the expected
-/// branch name. All six scenarios run inside ONE capture scope (one subscriber
-/// install + interest rebuild) so the collected `branch` sequence is
-/// deterministic — the per-call capture variant raced the global tracing
-/// interest cache against other tests sharing the binary.
+/// branch name. All six scenarios run inside ONE capture scope so the collected
+/// `branch` sequence is deterministic.
 ///
 /// Covers: has_image, quant_mismatch, incomplete_hydrate, non_reusable (fresh
 /// partial under Partial), hydrated_declined_to_exact (fresh partial under

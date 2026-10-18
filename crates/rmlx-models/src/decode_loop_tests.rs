@@ -1561,3 +1561,6 @@ mod decode_stop_tests;
 
 #[path = "first_logprobs_wiring_tests.rs"]
 mod first_logprobs_wiring_tests;
+
+#[path = "prefill_event_tests.rs"]
+pub(crate) mod prefill_event_tests;

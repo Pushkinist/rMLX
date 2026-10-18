@@ -28,7 +28,8 @@ use tracing::{info, warn};
 use crate::constraint::ConstraintEngine;
 use crate::decode_loop::{
     capture_first_logprobs, capture_logprobs, choose_token, chunked_prefill, emit_token,
-    pipelined_decode, reject_nan_prefill, replay_first_logprobs, DecodeCtx,
+    log_prefill, pipelined_decode, reject_nan_prefill, replay_first_logprobs, DecodeCtx,
+    PrefillReport,
 };
 use crate::kv_cache::kv_layer_quants;
 use crate::prompt_cache::{chained_block_hashes_seeded, entry_is_storable, Consumed, ReusePolicy};
@@ -322,6 +323,7 @@ pub fn generate_greedy<'a>(
 
     let logits_flat = prefill_logits.reshape(&[1, vocab], device)?;
     logits_flat.eval()?;
+    let prefill_ns = prefill_t0.elapsed().as_nanos();
 
     let logit_bytes = logits_flat.to_bytes()?;
     let nan_count = count_nan_in_bytes(&logit_bytes, logits_flat.dtype());
@@ -371,7 +373,10 @@ pub fn generate_greedy<'a>(
     }
     // Push prefill token into history.
     ctx.token_history.push(last_id);
-    let prefill_total_ns = prefill_t0.elapsed().as_nanos();
+    log_prefill(
+        "Gemma3ForConditionalGeneration",
+        &PrefillReport::cold(prompt_ids.len(), prefill_ns),
+    );
 
     let piece = tokenizer
         .id_to_token(last_id)
@@ -482,7 +487,6 @@ pub fn generate_greedy<'a>(
         model.forward_arr(y, 1, Some(&mut caches), device)
     })?;
 
-    let prefill_ms = (prefill_total_ns as f64) / 1.0e6;
     let forward_ms = (stats.forward_total_ns as f64) / 1.0e6;
     let eval_ms = (stats.eval_total_ns as f64) / 1.0e6;
     let step_ms = (stats.step_total_ns as f64) / 1.0e6;
@@ -491,7 +495,6 @@ pub fn generate_greedy<'a>(
         target: "decode_profile",
         arch = "Gemma3ForConditionalGeneration",
         n_steps = stats.decode_steps,
-        prefill_ms,
         forward_total_ms = forward_ms,
         eval_total_ms = eval_ms,
         step_total_ms = step_ms,
@@ -547,6 +550,10 @@ fn exact_hit_decode<'a>(
         token_id = last_id,
         "gemma3 generate_greedy: prompt cache EXACT HIT"
     );
+    log_prefill(
+        "Gemma3ForConditionalGeneration",
+        &PrefillReport::exact(prompt_ids.len()),
+    );
 
     let ends = crate::decode_loop::emit_replayed_token(
         &mut constraint,
@@ -595,7 +602,6 @@ fn exact_hit_decode<'a>(
         target: "decode_profile",
         arch = "Gemma3ForConditionalGeneration",
         n_steps = stats.decode_steps,
-        prefill_ms = 0.0_f64,
         forward_total_ms = forward_ms,
         eval_total_ms = eval_ms,
         step_total_ms = step_ms,

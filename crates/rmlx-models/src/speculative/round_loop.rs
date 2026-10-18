@@ -44,7 +44,7 @@ use super::round_common::{
 };
 use super::{guard_restricted_prefix, DecodeWindow, SpecLoop, VerifierDraw};
 use crate::arch::Architecture;
-use crate::decode_loop::{ProbeStep, StepVerdict};
+use crate::decode_loop::{log_prefill, PrefillReport, ProbeStep, StepVerdict};
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
 /// Which vocabulary decided one emitted token.
@@ -252,10 +252,13 @@ pub(crate) enum Seed {
 pub(crate) struct Prefilled {
     /// The token the first round carries, and whether the request emits it.
     pub(crate) seed: Seed,
-    /// How long the prefill took, timed by the drafter: what the span covers
-    /// differs per drafter, and a loop that timed the call would move the figure
-    /// on records no gate reads.
+    /// How long the verifier's prefill forward or forwards took, up to the point
+    /// its logits are forced. It excludes the draw of the seed and
+    /// whatever the drafter builds from the forward. The drafter times it, because
+    /// it is the drafter that decides which forwards are the prefill.
     pub(crate) prefill_ns: u128,
+    /// How long a draft model's own prefill took, `0` for a drafter with none.
+    pub(crate) draft_prefill_ns: u128,
     /// Whether this request scores any verified position over a vocabulary
     /// smaller than the verifier's.
     ///
@@ -459,7 +462,14 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
     let mut verifier_ns: u128 = 0;
 
     let prefilled = drafter.prefill(&mut ctx, prompt_ids, cancel)?;
-    let prefill_ns = prefilled.prefill_ns;
+    let report = match prefilled.seed {
+        Seed::Emitted(_) => PrefillReport::cold(prompt_ids.len(), prefilled.prefill_ns),
+        Seed::Carried(_) => PrefillReport::carried(prompt_ids.len(), prefilled.prefill_ns),
+    };
+    log_prefill(
+        verifier.arch_class(),
+        &report.with_draft(prefilled.draft_prefill_ns),
+    );
     let mut conditioned_rows = prefilled.projects_conditioning.then_some(0usize);
     let restricted_read_back = prefilled.restricted_read_back;
     let mut carry = match prefilled.seed {
@@ -494,7 +504,6 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
                 emitted_in_rounds: 0,
                 total_draft: 0,
                 total_accept: 0,
-                prefill_ns,
                 draft_ns: 0,
                 verifier_ns: 0,
                 round_loop_ns: 0,
@@ -709,7 +718,6 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
             emitted_in_rounds,
             total_draft,
             total_accept,
-            prefill_ns,
             draft_ns,
             verifier_ns,
             round_loop_ns,

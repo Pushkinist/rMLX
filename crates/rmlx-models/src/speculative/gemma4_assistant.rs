@@ -834,7 +834,6 @@ impl RoundDrafter for AssistantRound<'_> {
             device,
             cancel,
         )?;
-        let prefill_ns = prefill_t0.elapsed().as_nanos();
 
         // Round-0 seed: feed the last prompt token through the verifier in a
         // one-token forward, capture its hidden and the shared K/V, and read the
@@ -844,6 +843,7 @@ impl RoundDrafter for AssistantRound<'_> {
             .forward_hidden_states_shared_kv(&[last_prompt], 1, &mut ctx.kv, device)?;
         let logits = ctx.verifier.logits_from_hidden(&hidden_raw, device)?;
         super::guard_verifier_prefill_logits(ctx.verifier, &logits, prompt.len())?;
+        let prefill_ns = prefill_t0.elapsed().as_nanos();
         let seed = ctx.draw.seed_token(&logits, device)?;
         let hidden = ctx.verifier.apply_final_norm(&hidden_raw, device)?;
         self.conditioned = Some(Conditioned {
@@ -855,6 +855,7 @@ impl RoundDrafter for AssistantRound<'_> {
         Ok(Prefilled {
             seed: Seed::Emitted(seed),
             prefill_ns,
+            draft_prefill_ns: 0,
             // It scores every position over the verifier's whole vocabulary.
             restricted_read_back: false,
             // It reads the verifier's K/V and carries no conditioning buffer

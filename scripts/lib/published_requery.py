@@ -15,8 +15,11 @@ What is compared:
   per cell      the mean `decode_tps_warm` and `ttft_warm_ms` over the cell's
                 samples, and the number of samples that have a row
   macro         the mean of the cell means the result names for the macro
-  fixed prompt  its `decode_tps_warm`, `prefill_tps`, `ttft_warm_ms` and
-                `metal_peak_alloc_mb` rows, one of each
+  fixed prompt  its `decode_tps_warm`, `prefill_tps`, `prefill_engine_tps`,
+                `ttft_warm_ms` and `metal_peak_alloc_mb` rows, one of each
+  long context  the same five rows for each long-context prompt
+  greedy match  the five counts of each dataset: samples, identical, near tie,
+                refused and unjudgeable
 
 The rows are found by `label=<label>;` at the start of `notes` and by the run's
 `ts_utc`. The re-queried figures are written to `--out` (default
@@ -41,11 +44,29 @@ from pathlib import Path
 # in it.
 LABEL_PATTERN = re.compile(r"^[a-z0-9][a-z0-9.-]{0,63}$")
 TS_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
-METRICS = ("decode_tps_warm", "ttft_warm_ms", "prefill_tps", "metal_peak_alloc_mb")
+# The metrics the re-query reads back: the per-cell pair, and the fixed prompt's
+# five, which include that pair.
+COLD_PROMPT_METRICS = (
+    "decode_tps_warm",
+    "prefill_tps",
+    "prefill_engine_tps",
+    "ttft_warm_ms",
+    "metal_peak_alloc_mb",
+)
+GREEDY_METRICS = (
+    "greedy_samples",
+    "greedy_identical",
+    "greedy_near_tie",
+    "greedy_refused",
+    "greedy_unjudgeable",
+)
+METRICS = COLD_PROMPT_METRICS + GREEDY_METRICS
 # Values travel through JSON, a REAL column and a printed float. Each leg is
 # exact for a double; the allowance is for the order a mean is summed in.
 REL_TOL = 1e-9
 FIXED_PREFIX = "published/fixed_"
+LONGCTX_PREFIX = "published/longctx_"
+GREEDY_PREFIX = "published/greedy/"
 
 
 class Unreadable(Exception):
@@ -98,11 +119,50 @@ def close(got: float, want: float) -> bool:
     return abs(got - want) <= REL_TOL * max(abs(want), 1.0)
 
 
+def cold_prompt_wants(block: dict) -> list[tuple[str, float]]:
+    """What the result says each row of a cold prompt must read."""
+    return [
+        ("decode_tps_warm", block["decode_tps"]["mean"]),
+        ("prefill_tps", block["prefill_tps"]["mean"]),
+        ("prefill_engine_tps", block["prefill_engine_tps"]["mean"]),
+        ("ttft_warm_ms", block["ttft_ms"]["mean"]),
+        ("metal_peak_alloc_mb", block["metal_peak_alloc_mb"]["max"]),
+    ]
+
+
+def check_prompt(
+    what: str, rows: list[dict], wants: list[tuple[str, float]], problems: list[str]
+) -> dict[str, float]:
+    """One prompt's rows against the figures the result gives for it, one of each metric.
+
+    A metric with no row, or with more than one (the result was recorded twice),
+    is a disagreement; so is a value that moved on its way into the store.
+    """
+    found: dict[str, float] = {}
+    for metric, want in wants:
+        values = [r["value"] for r in rows if r["metric"] == metric]
+        if len(values) != 1:
+            problems.append(
+                f"{what}: the database holds {len(values)} {metric} rows where the "
+                "result recorded one"
+            )
+            continue
+        found[metric] = values[0]
+        if not close(values[0], want):
+            problems.append(
+                f"{what}: the row gives {metric} {values[0]!r} where the result says {want!r}"
+            )
+    return found
+
+
 def requery(result: dict, rows: list[dict]) -> tuple[dict, list[str]]:
     """`(figures from the database, disagreements with the result)`."""
     problems: list[str] = []
     fixed_rows = [r for r in rows if r["name"].startswith(FIXED_PREFIX)]
-    sample_rows = [r for r in rows if not r["name"].startswith(FIXED_PREFIX)]
+    longctx_rows = [r for r in rows if r["name"].startswith(LONGCTX_PREFIX)]
+    greedy_rows = [r for r in rows if r["name"].startswith(GREEDY_PREFIX)]
+    other = (FIXED_PREFIX, LONGCTX_PREFIX, GREEDY_PREFIX)
+    sample_rows = [r for r in rows if not r["name"].startswith(other)]
     if not rows:
         return {}, [
             f"the database holds no row for label {result['label']!r} at "
@@ -167,30 +227,39 @@ def requery(result: dict, rows: list[dict]) -> tuple[dict, list[str]]:
 
     block = result.get("fixed_prompt")
     if block:
-        fixed = {}
-        for metric in ("decode_tps_warm", "prefill_tps", "ttft_warm_ms", "metal_peak_alloc_mb"):
-            values = [r["value"] for r in fixed_rows if r["metric"] == metric]
-            if len(values) != 1:
-                problems.append(
-                    f"fixed prompt: the database holds {len(values)} {metric} rows "
-                    "where the result recorded one"
-                )
-                continue
-            fixed[metric] = values[0]
-        figures["fixed_prompt"] = fixed
-        for metric, want in (
-            ("decode_tps_warm", block["decode_tps"]["mean"]),
-            ("prefill_tps", block["prefill_tps"]["mean"]),
-            ("ttft_warm_ms", block["ttft_ms"]["mean"]),
-            ("metal_peak_alloc_mb", block["metal_peak_alloc_mb"]["max"]),
-        ):
-            if metric in fixed and not close(fixed[metric], want):
-                problems.append(
-                    f"fixed prompt: the row gives {metric} {fixed[metric]!r} where "
-                    f"the result says {want!r}"
-                )
+        figures["fixed_prompt"] = check_prompt(
+            "fixed prompt", fixed_rows, cold_prompt_wants(block), problems
+        )
     elif fixed_rows:
         problems.append("the database holds a fixed-prompt row the result has no block for")
+
+    longctx = result.get("longctx") or {}
+    figures["longctx"] = {}
+    for label, row in longctx.items():
+        own = [r for r in longctx_rows if r["name"] == f"published/{label}"]
+        figures["longctx"][label] = check_prompt(label, own, cold_prompt_wants(row), problems)
+    for row in longctx_rows:
+        if row["name"][len("published/"):] not in longctx:
+            problems.append(f"a row is filed under {row['name']!r}, which the result has no row for")
+
+    match = result.get("greedy_match")
+    datasets = (match or {}).get("datasets", {})
+    figures["greedy_match"] = {}
+    for dataset, entry in datasets.items():
+        own = [r for r in greedy_rows if r["name"] == f"{GREEDY_PREFIX}{dataset}"]
+        wants = [
+            ("greedy_samples", entry["samples"]),
+            ("greedy_identical", entry["identical"]),
+            ("greedy_near_tie", entry["near_tie"]),
+            ("greedy_refused", entry["refused"]),
+            ("greedy_unjudgeable", entry["unjudgeable"]),
+        ]
+        figures["greedy_match"][dataset] = check_prompt(
+            f"greedy match, {dataset}", own, wants, problems
+        )
+    for row in greedy_rows:
+        if row["name"][len(GREEDY_PREFIX):] not in datasets:
+            problems.append(f"a row is filed under {row['name']!r}, which the result has no dataset for")
     return figures, problems
 
 

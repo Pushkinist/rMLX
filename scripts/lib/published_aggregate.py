@@ -155,6 +155,14 @@ def cmd_pass(args):
                 f"window, {off:.1f}% apart and past the {args.cross_check_pct:.0f}% "
                 "band two readings of one window are allowed"
             )
+        prompt_tokens = require_number(client, "prompt_tokens", where, int)
+        if engine_row["prompt_tokens"] != prompt_tokens:
+            raise InputError(
+                f"{where}: the engine's prefill event counts {engine_row['prompt_tokens']} "
+                f"prompt tokens where the server counted {prompt_tokens} for this "
+                "request: the event belongs to another request, and the two are paired "
+                "by order"
+            )
         row = {
             "pass": args.pass_number,
             "cell": cell,
@@ -162,7 +170,7 @@ def cmd_pass(args):
             "sample_id": sample_id,
             "body_sha256": body_sha256,
             "max_tokens": int(max_tokens),
-            "prompt_tokens": require_number(client, "prompt_tokens", where, int),
+            "prompt_tokens": prompt_tokens,
             # `completion_tokens`, not `tokens`: the reader falls back to a count
             # of content chunks for the second when the usage chunk carried no
             # count, and that is a client derivation under an engine field's
@@ -310,16 +318,18 @@ def macro_cell_per_dataset(cells, macro_max_tokens):
     return [found[0] for found in (by_dataset[d] for d in sorted(by_dataset))]
 
 
-# The fixed-prompt block's rate figures — the two the protocol publishes as
-# scores, and so the two the range band refuses. `ttft_ms` is what `prefill_tps`
-# is derived from, so refusing the rate already covers it.
-FIXED_RATES = ("decode_tps", "prefill_tps")
+# The fixed-prompt block's rate figures — the ones the protocol publishes as
+# scores, and so the ones the range band refuses: output speed, and input speed
+# by both its definitions (prompt over TTFT, and the engine's own prefill rate).
+# `ttft_ms` and `prefill_ms` are what the input rates are derived from, so
+# refusing a rate already covers them.
+FIXED_RATES = ("decode_tps", "prefill_tps", "prefill_engine_tps")
 # Peaks, not scores. A peak over three runs is their maximum; a mean of three
 # peaks is not a peak of anything, and a range band over a resident figure would
 # refuse an allocator's ordinary behaviour. The first two are sampled gauges in
 # bytes; the Metal peak is the allocator's own high-water mark, in MiB.
 FIXED_PEAKS = ("phys_footprint_bytes", "rss_bytes", "metal_peak_alloc_mb")
-FIXED_REPORTED = ("ttft_ms", "completion_tokens")
+FIXED_REPORTED = ("ttft_ms", "prefill_ms", "completion_tokens")
 
 
 def fixed_block(paths, range_pct):
@@ -375,6 +385,50 @@ def fixed_block(paths, range_pct):
     for name in FIXED_REPORTED:
         entry = summarise([r[name] for r in runs], range_pct)
         # Reported with its spread, never refused: it is not a published score.
+        entry.pop("stable")
+        block[name] = entry
+    for name in FIXED_PEAKS:
+        values = [r[name] for r in runs]
+        block[name] = {"run_values": values, "max": max(values), "min": min(values)}
+    return block
+
+
+def longctx_block(label, paths, range_pct):
+    """One long-context row: three runs of one canonical prompt, summarised.
+
+    As the fixed-prompt block, but the prompt is a checked-in file and not a fitted
+    body, so what has to agree across the runs is the file, its body and the count
+    the server gave it, and the count is not held to a target.
+    """
+    runs = []
+    for path in paths:
+        with open(path, encoding="utf-8") as handle:
+            runs.append(json.load(handle))
+    if len(runs) != 3:
+        raise InputError(
+            f"the {label} row was given {len(runs)} runs; the protocol reports the "
+            "mean of three consecutive runs"
+        )
+    for field in ("label", "file_sha256", "body_sha256", "prompt_tokens", "target_tokens",
+                  "max_tokens", "ctx_max"):
+        seen = {r[field] for r in runs}
+        if len(seen) != 1:
+            raise InputError(
+                f"the {label} runs disagree on {field} ({sorted(seen)}); they did not "
+                "measure one prompt"
+            )
+    first = runs[0]
+    if first["label"] != label:
+        raise InputError(f"the runs are of {first['label']}, not of the {label} named for them")
+    block = {
+        name: first[name]
+        for name in ("label", "file", "file_sha256", "body_sha256", "prompt_tokens",
+                     "target_tokens", "max_tokens", "ctx_max", "memory_poll_ms")
+    }
+    for name in FIXED_RATES:
+        block[name] = summarise([r[name] for r in runs], range_pct)
+    for name in FIXED_REPORTED:
+        entry = summarise([r[name] for r in runs], range_pct)
         entry.pop("stable")
         block[name] = entry
     for name in FIXED_PEAKS:
@@ -475,6 +529,22 @@ def cmd_report(args):
         result["fixed_prompt"] = block
         stable = stable and all(block[name]["stable"] for name in FIXED_RATES)
 
+    if args.greedy_pass:
+        with open(args.greedy_pass, encoding="utf-8") as handle:
+            result["greedy_pass"] = json.load(handle)
+    if args.greedy_match:
+        with open(args.greedy_match, encoding="utf-8") as handle:
+            result["greedy_match"] = json.load(handle)
+
+    if args.longctx:
+        result["longctx"] = {}
+        for label, *paths in args.longctx:
+            if label in result["longctx"]:
+                raise InputError(f"the {label} row was given twice")
+            block = longctx_block(label, paths, args.range_pct)
+            result["longctx"][label] = block
+            stable = stable and all(block[name]["stable"] for name in FIXED_RATES)
+
     if args.json:
         with open(args.json, "w", encoding="utf-8") as handle:
             json.dump(result, handle, indent=1)
@@ -560,7 +630,11 @@ def print_table(result, range_pct):
             f"  FIXED PROMPT — {block['prompt_tokens']} tokens, plain decode, "
             f"{block['max_tokens']} output budget, three runs"
         )
-        for name, unit in (("decode_tps", "tok/s out"), ("prefill_tps", "tok/s in")):
+        for name, unit in (
+            ("decode_tps", "tok/s out"),
+            ("prefill_tps", "tok/s in"),
+            ("prefill_engine_tps", "tok/s eng"),
+        ):
             entry = block[name]
             print(
                 f"    {unit:<10} {mean_column(entry):>10}   range "
@@ -580,9 +654,50 @@ def print_table(result, range_pct):
                     "runs, sampled every " + f"{block['memory_poll_ms']} ms"
                 )
 
+    for label, row in sorted(result.get("longctx", {}).items()):
+        print()
+        print(
+            f"  LONG CONTEXT {label} — {row['prompt_tokens']} tokens counted, plain "
+            f"decode, {row['max_tokens']} output budget, three runs"
+        )
+        for name, unit in (
+            ("decode_tps", "tok/s out"),
+            ("prefill_tps", "tok/s in"),
+            ("prefill_engine_tps", "tok/s eng"),
+        ):
+            entry = row[name]
+            print(
+                f"    {unit:<10} {mean_column(entry):>10}   range "
+                f"{entry['range_pct']:.2f}%   runs "
+                + " ".join(f"{v:.2f}" for v in entry["pass_means"])
+            )
+        ttft = row["ttft_ms"]
+        print(f"    {'TTFT ms':<10} {ttft['mean']:>10.1f}   runs "
+              + " ".join(f"{v:.1f}" for v in ttft["pass_means"]))
+
+    match = result.get("greedy_match")
+    if match:
+        print()
+        print(
+            "  GREEDY MATCH against plain decode — temperature 0, a pass of its own "
+            "after the speed passes"
+        )
+        for dataset, entry in sorted(match["datasets"].items()):
+            print(
+                f"    {dataset:<10} {entry['identical']:>4}/{entry['samples']:<4} identical "
+                f"({entry['identical_rate'] * 100:.1f}%), {entry['near_tie']} near tie, "
+                f"{entry['refused']} refused, {entry['unjudgeable']} unjudgeable"
+            )
+
     refused = [n for n, c in result["cells"].items() if not c["stable"]]
     refused += [
         f"fixed_prompt/{n}" for n in FIXED_RATES if block and not block[n]["stable"]
+    ]
+    refused += [
+        f"longctx/{label}/{n}"
+        for label, row in result.get("longctx", {}).items()
+        for n in FIXED_RATES
+        if not row[n]["stable"]
     ]
     if refused:
         print()
@@ -630,9 +745,29 @@ def main():
         help="the three fixed-length-prompt runs, one per pass",
     )
     r.add_argument(
+        "--longctx",
+        nargs=4,
+        action="append",
+        default=None,
+        metavar=("LABEL", "RUN.json", "RUN.json", "RUN.json"),
+        help="the three long-context runs of one canonical prompt; repeatable",
+    )
+    r.add_argument(
         "--meta",
         default=None,
         help="a JSON object describing the run, merged into the result",
+    )
+    r.add_argument(
+        "--greedy-pass",
+        default=None,
+        metavar="META.json",
+        help="the sealed meta of this run's greedy pass, filed under greedy_pass",
+    )
+    r.add_argument(
+        "--greedy-match",
+        default=None,
+        metavar="MATCH.json",
+        help="published_greedy.py compare output, filed under greedy_match",
     )
     r.set_defaults(func=cmd_report)
 
