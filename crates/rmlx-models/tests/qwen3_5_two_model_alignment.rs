@@ -11,12 +11,11 @@
 //! order — but a *short* common prefix means the verifier state itself diverged.
 //!
 //! The failure this pins: on partial acceptance the GDN recurrent state has no
-//! sequence axis, so it is restored from a pre-round snapshot and replayed over
-//! the kept prefix. That replay runs the whole layer stack, and the
-//! full-attention layers interleaved between the GDN layers feed them.
-//! Replaying through a fresh scratch KV stack makes those FA layers attend a
-//! `kept`-token prefix at positions `0..kept`, so every downstream GDN layer
-//! advances on a wrong hidden. This path is where the shared rollback has
+//! sequence axis, so it is refolded from the round tape over the kept prefix
+//! (`refold_lin_tapes` in `round_common.rs`) while the attention layers' KV is
+//! truncated to it. A rollback that keeps a rejected draft, or refolds the wrong
+//! prefix, leaves every downstream layer reading a wrong state. This path is
+//! where the shared rollback has
 //! **two** callers per round — verifier and drafter — so a GDN pair exercises
 //! both.
 //!

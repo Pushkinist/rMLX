@@ -19,18 +19,18 @@
 //!      order through 48 GDN layers — but a *short* common prefix means the
 //!      verifier state itself diverged, not that a near-tie flipped.
 //!
-//!      The failure this pins: on partial acceptance the GDN recurrent state
-//!      is restored from a pre-round snapshot and replayed over the kept
-//!      prefix. That replay runs the whole layer stack, and the full-attention
-//!      layers interleaved between the GDN layers feed them. Replaying through
-//!      a fresh scratch KV stack makes those FA layers attend a `v_kept`-token
-//!      prefix at positions `0..v_kept`, so every downstream GDN layer advances
-//!      on a wrong hidden and the run degenerates within a few tokens.
+//!      The failure this pins: a partial acceptance that leaves the verifier in
+//!      a state a sequential decode would not reach. The rollback truncates the
+//!      attention layers' KV to the accepted prefix and refolds the GDN layers'
+//!      recurrent state from the round tape; a rollback that keeps a rejected
+//!      draft, or refolds the wrong prefix, makes every later token read a wrong
+//!      state and the run diverges within a few tokens.
 //!
-//! The second check's threshold is calibrated against the pair named below —
-//! its prompt is that model's chat template written out by hand, and the number
-//! of tokens two arms share before an ordinary near-tie flip is a property of
-//! the checkpoint. Point it at a different pair and re-measure both arms before
+//! The second check's threshold is one rule, half of the shorter arm, checked
+//! against each pair's two readings (see [`greedy_tracks_plain_greedy`]) — its
+//! prompt is the Qwen chat template written out by hand, and the number of
+//! tokens two arms share before an ordinary near-tie flip is a property of the
+//! checkpoint. Point it at a different pair and re-measure both arms before
 //! reading a failure as a regression. The first check is pair-independent.
 //!
 //! Server-free. Both halves resolve by slug under `RMLX_O_MODELS_ROOT`, so a
@@ -56,14 +56,34 @@ use rmlx_models::speculative::VerifierTrunk;
 
 mod common;
 
-/// The verifier this suite is calibrated against.
+/// The verifier the pair-independent cells run on.
 const VERIFIER: common::GoldenModel = common::GoldenModel {
     slug: "mlx-community__Qwen3.8-27B-mxfp8",
     archs: &["Qwen3_5ForConditionalGeneration"],
 };
 
-/// The drafter it is calibrated against.
+/// The drafter the pair-independent cells run on.
 const DRAFT_SLUG: &str = "mlx-community__Qwen3.8-27B-MTP-mxfp8";
+
+/// A verifier and the sidecar trained against it. A sidecar quantized unlike
+/// its verifier loads and drafts fluently, so the two slugs travel together.
+struct Pair {
+    verifier: common::GoldenModel,
+    draft_slug: &'static str,
+}
+
+const MXFP8_PAIR: Pair = Pair {
+    verifier: VERIFIER,
+    draft_slug: DRAFT_SLUG,
+};
+
+const FOUR_BIT_PAIR: Pair = Pair {
+    verifier: common::GoldenModel {
+        slug: "mlx-community__Qwen3.8-27B-4bit",
+        archs: &["Qwen3_5ForConditionalGeneration"],
+    },
+    draft_slug: "mlx-community__Qwen3.8-27B-MTP-4bit",
+};
 
 /// Draft-model override, for a models root that does not hold [`DRAFT_SLUG`].
 const DRAFT_VAR: &str = "RMLX_DRAFT_TEST_MODEL";
@@ -142,22 +162,50 @@ fn mtp_sidecar_loads_whatever_ffn_it_carries() {
 /// The MTP round loop tracks plain greedy decoding for a long prefix.
 ///
 /// Both arms run the same verifier at temp=0 on the same prompt. A rollback
-/// that corrupts the verifier's recurrent state shows up here as an early
-/// divergence — the pre-fix scratch-cache replay diverged within a handful of
-/// tokens and then degenerated into a repetition loop.
+/// that corrupts the verifier's state shows up here as an early divergence — a
+/// rollback that keeps one rejected draft diverges within two tokens on both
+/// pairs.
 #[ignore]
 #[test]
 fn mtp_greedy_tracks_plain_greedy_for_a_long_prefix() {
-    let test = "mtp_greedy_tracks_plain_greedy_for_a_long_prefix";
-    let Some(model_path) = common::model_for(&VERIFIER, test) else {
+    greedy_tracks_plain_greedy(
+        "mtp_greedy_tracks_plain_greedy_for_a_long_prefix",
+        &MXFP8_PAIR,
+    );
+}
+
+/// The same check on the 4-bit pair, against its own measured readings.
+#[ignore]
+#[test]
+fn mtp_greedy_tracks_plain_greedy_for_a_long_prefix_on_the_4bit_pair() {
+    greedy_tracks_plain_greedy(
+        "mtp_greedy_tracks_plain_greedy_for_a_long_prefix_on_the_4bit_pair",
+        &FOUR_BIT_PAIR,
+    );
+}
+
+fn greedy_tracks_plain_greedy(test: &str, pair: &Pair) {
+    let Some(model_path) = common::model_for(&pair.verifier, test) else {
         return;
     };
     let Some(draft_path) = common::apply(
-        common::slug_or_override(DRAFT_VAR, DRAFT_SLUG, common::Role::Sidecar),
+        common::slug_or_override(DRAFT_VAR, pair.draft_slug, common::Role::Sidecar),
         test,
     ) else {
         return;
     };
+    if let (Some(verifier_mode), Some(draft_mode)) = (
+        common::declared_quant_mode(&model_path),
+        common::declared_quant_mode(&draft_path),
+    ) {
+        if verifier_mode != draft_mode {
+            eprintln!(
+                "SKIP {test}: the verifier is quantized {verifier_mode} and the sidecar \
+                 {draft_mode}, so the two are not this pair"
+            );
+            return;
+        }
+    }
     let device = Device::Gpu;
     let verifier =
         arch::load_model(&model_path, device, &arch::LoadOpts::default()).expect("load verifier");
@@ -190,29 +238,57 @@ fn mtp_greedy_tracks_plain_greedy_for_a_long_prefix() {
     };
 
     let mut spec_ids: Vec<u32> = Vec::new();
+    let recorder = common::round_stream::RoundStreamRecorder::new();
     {
         let mut step_fn = |s: &rmlx_models::ProbeStep| {
             spec_ids.push(s.token_id);
             None
         };
-        let (_steps, ran) = mtp_generate(
-            &verifier,
-            &mut drafter,
-            &tk,
-            &prompt_ids,
-            N_TOKENS,
-            block_size,
-            kv_quant,
-            None,
-            &eos,
-            &mut step_fn,
-            &sampler_cfg,
-            device,
-            &std::sync::atomic::AtomicBool::new(false),
-        )
-        .expect("mtp generate");
+        let (_steps, ran) =
+            tracing::subscriber::with_default(std::sync::Arc::clone(&recorder), || {
+                mtp_generate(
+                    &verifier,
+                    &mut drafter,
+                    &tk,
+                    &prompt_ids,
+                    N_TOKENS,
+                    block_size,
+                    kv_quant,
+                    None,
+                    &eos,
+                    &mut step_fn,
+                    &sampler_cfg,
+                    device,
+                    &std::sync::atomic::AtomicBool::new(false),
+                )
+            })
+            .expect("mtp generate");
         assert_eq!(ran, block_size, "the loop must run the block it was handed");
     }
+    // A round that accepted fewer drafts than it proposed is the one that rolls
+    // the verifier back. A run with none exercises no rollback, so tracking
+    // plain greedy would say nothing about it.
+    let count = |round: &common::round_stream::CapturedEvent, field: &str| -> usize {
+        round
+            .field(field)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("a round event carries a numeric {field}: {round:?}"))
+    };
+    let rounds = common::round_stream::round_events(&recorder.events());
+    let partial_rounds = rounds
+        .iter()
+        .filter(|r| count(r, "accept") < count(r, "num_draft"))
+        .count();
+    eprintln!(
+        "[qwen35_mtp_align] rounds={} partial_rounds={partial_rounds}",
+        rounds.len()
+    );
+    assert!(
+        partial_rounds > 0,
+        "none of {} rounds was partially accepted, so no rollback ran and the common \
+         prefix below says nothing about one",
+        rounds.len()
+    );
 
     let mut plain_ids: Vec<u32> = Vec::new();
     let mut rng = rmlx_models::sampler::Pcg32::new(sampler_cfg.seed_or_default());
@@ -272,12 +348,26 @@ fn mtp_greedy_tracks_plain_greedy_for_a_long_prefix() {
     // reduction order through 48 GDN layers, so one legitimate near-tie flip
     // is expected behaviour and must not fail the gate.
     //
-    // The bound sits in the gap between the two measured regimes on the
-    // documented pair: 31 of 31 shared tokens with the partial-accept rollback
-    // replaying through the real KV caches, 4 of 31 replaying through a fresh
-    // scratch stack. Half leaves both regimes a wide margin — the corrupted
-    // arm is 3.8x below it and the correct arm 2.1x above — which is what
-    // keeps one legitimate near-tie flip from failing the gate.
+    // One rule, `shorter / 2`, checked against each pair's two readings: the
+    // shipped round loop, and the same loop with a rollback that keeps one
+    // rejected draft on every partial round (its rollback stops one position
+    // short; `scripts/spec_broken_engine.sh` names the edit).
+    //
+    //   pair  | shipped              | rollback keeps a draft | floor
+    //   mxfp8 | 31 of 31 shared      |  2 of 12 shared        | 6
+    //   4-bit | 31 of 31 shared      |  2 of 31 shared        | 15
+    //
+    // The corrupted mxfp8 run also stopped early (12 tokens against 31), which
+    // is why its floor is lower. Half leaves each pair's regimes a wide margin
+    // — the corrupted arm is 3x (mxfp8) and 7.5x (4-bit) below it and the
+    // correct arm 2.1x above — which is what keeps one legitimate near-tie flip
+    // from failing the gate.
+    //
+    // The shipped run has 3 partial rounds of 11 on each pair.
+    //
+    // The limit: the run is 31 tokens, so a rollback defect whose first effect
+    // lands after the floor passes. The partial-round assertion above shows the
+    // run reached a rollback; it does not show the defect bites early.
     let floor = shorter / 2;
     assert!(
         common >= floor,

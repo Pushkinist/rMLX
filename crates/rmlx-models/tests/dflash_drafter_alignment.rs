@@ -3,7 +3,7 @@
 //! Pins the three wired verifier-side seams against the real checkpoints:
 //!   1. multi-layer hidden capture (`forward_hidden_states_multi` /
 //!      `forward_verify_capture`) at `target_layer_ids`,
-//!   2. GDN snapshot/restore rollback (mechanism, reused),
+//!   2. GDN tape-refold rollback (mechanism, reused),
 //! 3. raw (unscaled) verifier `embed_tokens` accessor (`embed_tokens_raw`).
 //!
 //! The DFlash `bind()` resolves `embed_scale = 1.0` for Qwen3.5 (bare

@@ -235,6 +235,13 @@ branch refuses a checkpoint that omits it.
 |---|---|
 | `Qwen3.6-35B-A3B-MTP-5bit` | MoE |
 | `Qwen3.8-27B-MTP-mxfp8` | dense |
+| `Qwen3.8-27B-MTP-4bit` | dense |
+
+The two 27B sidecars pair by weight format: `-mxfp8` with
+`Qwen3.8-27B-mxfp8`, `-4bit` with `Qwen3.8-27B-4bit`. A sidecar of the other
+format loads and drafts fluently, at a rate no reading could attribute to
+either checkpoint, so the equivalence gate stands a pair down when the two
+declare different `quantization.mode`.
 
 The `mlx-community` snapshots store norm weights in MLX form, so they load
 verbatim and apply a plain `rms_norm`. The sidecar `config.json` carries
@@ -246,7 +253,8 @@ drafted token gets a KV slot. `MtpDrafter::truncate_to` warns when a layer is
 already shorter than the target.
 
 `crates/rmlx-models/tests/qwen3_5_mtp_drafter_alignment.rs` checks the FFN
-probe and the greedy-tracking property on the MoE and the dense pair.
+probe and the greedy-tracking property on the MoE and the dense pair, and the
+greedy-tracking property on both 27B pairs.
 
 ### Gemma4 assistant
 
@@ -376,6 +384,12 @@ nothing: a missing key is a refusal naming the key. It also refuses:
 rule applies. The reference's candidate-restricted rejection sampling is not
 implemented, so a published acceptance figure taken under that rule is a
 different quantity from this port's.
+
+**On the 4-bit verifier.** `z-lab__Qwen3.8-27B-DFlash2` drafts for
+`mlx-community__Qwen3.8-27B-4bit`. On the code prompt of `scripts/spec_bench.sh`
+(128 tokens, greedy) the speed-up over plain decode is 2.90 times at block 5
+(accept rate 0.9808, 4.885 tokens per round) and 2.89 times at block 8 (0.8730,
+7.056).
 
 ### EAGLE-3
 

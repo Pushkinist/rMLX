@@ -587,6 +587,34 @@ pub fn skip_if_arch_mismatch(model_dir: &Path, test_name: &str, expected: &[&str
     true
 }
 
+/// The weight-quantization mode a snapshot's `config.json` declares, if it
+/// declares one.
+///
+/// A sidecar is decoded through the verifier's own LM head and conditioned on
+/// its hidden states, so a pair whose halves were quantized differently is a
+/// pair in name only — and nothing downstream refuses it: both 27B sidecars
+/// carry the same width and the same tensor names, so a 4-bit one loads against
+/// an mxfp8 verifier and drafts fluently at a rate no reading could be
+/// attributed to either checkpoint.
+///
+/// **Mode and not bits.** The shipped Qwen3.6 pair is an 8-bit verifier with a
+/// 5-bit sidecar, both affine, and it is the pair the MoE rows were measured on
+/// — so a width comparison would stand down a pairing that is real. The mode is
+/// what the two 27B pairs differ on and what nothing else separates them by.
+///
+/// `None` on either side is no opinion: the DFlash 2 and EAGLE-3 drafters
+/// declare no `quantization` block at all.
+pub fn declared_quant_mode(path: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path.join("config.json")).ok()?;
+    let cfg: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    for at in [&cfg["quantization"], &cfg["text_config"]["quantization"]] {
+        if let Some(mode) = at["mode"].as_str() {
+            return Some(mode.to_owned());
+        }
+    }
+    None
+}
+
 /// Free the device buffers MLX keeps for reuse after a model is dropped.
 ///
 /// The tests of one binary share one process. Without this call, the buffers of

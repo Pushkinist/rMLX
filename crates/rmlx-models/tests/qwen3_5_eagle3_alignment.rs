@@ -11,11 +11,10 @@
 //! diverged, not that a near-tie flipped.
 //!
 //! The failure this pins: on partial acceptance the GDN recurrent state is
-//! restored from a pre-round snapshot and replayed over the kept prefix. That
-//! replay runs the whole layer stack, and the full-attention layers interleaved
-//! between the GDN layers feed them. Replaying through a fresh scratch KV stack
-//! makes those FA layers attend a `v_kept`-token prefix at positions
-//! `0..v_kept`, so every downstream GDN layer advances on a wrong hidden.
+//! refolded from the round tape over the kept prefix (`refold_lin_tapes` in
+//! `round_common.rs`) and the attention layers' KV is truncated to it. A
+//! rollback that keeps a rejected draft, or refolds the wrong prefix, leaves
+//! every downstream layer reading a wrong state.
 //! `eagle3_generate` is GDN-only by construction (it refuses a verifier
 //! without `needs_lin_caches`), so on this path the defect is always live on a
 //! partial accept.

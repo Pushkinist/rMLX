@@ -38,7 +38,7 @@
 //!
 //! 1. **Multi-layer hidden capture** — [`Architecture::forward_verify_capture`]
 
-//! 2. **GDN rollback** — reuses the `LinearAttnCache` snapshot/restore +
+//! 2. **GDN rollback** — reuses the `LinearAttnCache` round-tape refold +
 
 //! 3. **Raw embed accessor** — [`Architecture::embed_tokens_raw`] (the Qwen3.5
 

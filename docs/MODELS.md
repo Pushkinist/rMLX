@@ -256,18 +256,47 @@ has `full_attention_interval` 4, `head_dim` 256 and a
 |---|---|---|---|---|
 | `mlx-community__Qwen3.6-35B-A3B-8bit` | MoE, 256 experts, top 8 | 40 (10 / 30) | 16 / 2 | affine g64 b8 |
 | `mlx-community__Qwen3.8-27B-mxfp8` | dense | 64 (16 / 48) | 24 / 4 | mxfp8 |
+| `mlx-community__Qwen3.8-27B-4bit` | dense | 64 (16 / 48) | 24 / 4 | affine g64 b4 |
 | `z-lab__Qwen3.6-27B-PARO` | dense | 64 (16 / 48) | 24 / 4 | ParoQuant 4-bit |
 | `prism-ml__Ternary-Bonsai-27B-mlx-2bit` | dense | 64 (16 / 48) | 24 / 4 | affine g128 b2 |
 | `prism-ml__Ternary-Bonsai-2-27B-mlx-2bit` | dense | 64 (16 / 48) | 24 / 4 | Prism Hadamard pack, affine g128 b2 |
 
-The first four configs declare one MTP layer (`mtp_num_hidden_layers` 1),
-and none of the four snapshots ships an `mtp.*` tensor. The Ternary-Bonsai-2
+The first five configs declare one MTP layer (`mtp_num_hidden_layers` 1),
+and none of the five snapshots ships an `mtp.*` tensor. The Ternary-Bonsai-2
 pack declares none. The `mtp` drafter is a separate sidecar snapshot, such as
 the one below.
 
 The Qwen3.6-35B-A3B drafters: `mlx-community__Qwen3.6-35B-A3B-MTP-5bit`
 (`mtp`), `z-lab__Qwen3.6-35B-A3B-DFlash` (`dflash`) and
 `Dogacel__specdrift-qwen3.6-35b-a3b-eagle3` (`eagle3`).
+
+**Qwen3.8-27B-4bit and its drafters.** The sidecars are
+`mlx-community__Qwen3.8-27B-MTP-mxfp8` for the mxfp8 verifier and
+`mlx-community__Qwen3.8-27B-MTP-4bit` for the 4-bit one; a sidecar is paired
+with the verifier of its own weight format. `z-lab__Qwen3.8-27B-DFlash2`
+(`dflash2`) runs on the 4-bit verifier. Measured on one batch:
+
+- The weights are affine g64 b4 with no per-tensor overrides: 4.50 bits per
+  weight over the quantised linears. A decode step reads 14.42 GB.
+- Plain decode is 31.86 tokens per second at a 4k prompt (3892 tokens),
+  `--kv-quant none`, 128 generated tokens: 80.5 % of the 39.6 tokens per second
+  ceiling.
+- Wikitext-2 perplexity is 6.4211 against 6.1663 for mxfp8, +4.13 %. That fails
+  the 3 % bar set for this pair. An independent forward (mlx-vlm on the same MLX
+  release) agrees with `rmlx eval ppl` on the mxfp8, 4-bit and 6-bit snapshots
+  to implementation noise: the per-window mean NLL differs with a standard
+  deviation of 0.001 to 0.004. On the 6-bit snapshot the loss stays when every
+  quantised linear runs as dequantise plus a bf16 matmul. It sits in the stored
+  weights, not in an rMLX kernel.
+- DFlash 2 on the 4-bit verifier, code prompt, 128 tokens: 2.90 times the
+  plain rate at block 5 and 2.89 times at block 8.
+- MTP block-2 greedy output shares 31 of 31 tokens with plain greedy on the
+  4-bit pair, as on the mxfp8 pair
+  (`crates/rmlx-models/tests/qwen3_5_mtp_drafter_alignment.rs`).
+- Plain greedy on the 4-bit and the mxfp8 checkpoints parts on every prompt,
+  at tokens 0 to 27 of 256: the two formats are different functions, not equal
+  in bytes.
+  `docs/SPEC_ANSWER_EQUIVALENCE.md` § "Across weight formats" has the readings.
 
 **Ternary-Bonsai-2-27B.** `prism-ml__Ternary-Bonsai-2-27B-mlx-2bit` is a
 Prism Hadamard pack (`docs/WEIGHT_QUANTS.md` §10): `model_type`

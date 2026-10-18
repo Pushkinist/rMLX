@@ -702,8 +702,8 @@ impl Architecture {
     /// are pure FullAttention and ignore `lin_caches` (pass `None`).
     /// BitNet has no GDN layers — always returns `false` for it.
     ///
-    /// Used by the speculative decoder to decide whether to allocate +
-    /// snapshot/restore the recurrent GDN state per round.
+    /// Used by the speculative decoder to decide whether to allocate and tape
+    /// the recurrent GDN state per round.
     pub fn needs_lin_caches(&self) -> bool {
         matches!(self, Architecture::Qwen3_5Moe(_))
     }

@@ -27,11 +27,11 @@ Each pair runs every prompt in `PROMPTS`:
 | verifier | drafter | round loop | rollback |
 |---|---|---|---|
 | `gemma-4-e2b-it-mxfp8` | `gemma-4-E2B-it-assistant-bf16` | shared-K/V assistant | KV truncation, SWA ring included |
-| `Qwen3.8-27B-mxfp8` | `Qwen3.8-27B-MTP-mxfp8` | MTP sidecar | KV truncation + recurrent snapshot/replay |
-| `Qwen3.8-27B-4bit` | `Qwen3.8-27B-MTP-4bit` | MTP sidecar | KV truncation + recurrent snapshot/replay |
-| `Qwen3.8-27B-4bit` | `Qwen3.8-27B-DFlash2` | DFlash 2 block drafter | KV truncation + recurrent snapshot/replay |
-| `Qwen3.6-35B-A3B-8bit` | `Qwen3.6-35B-A3B-DFlash` | DFlash 1, adaptive block | KV truncation + recurrent snapshot/replay |
-| `Qwen3.6-35B-A3B-8bit` | `specdrift-qwen3.6-35b-a3b-eagle3` | EAGLE-3 | KV truncation + recurrent snapshot/replay |
+| `Qwen3.8-27B-mxfp8` | `Qwen3.8-27B-MTP-mxfp8` | MTP sidecar | KV truncation + tape refold |
+| `Qwen3.8-27B-4bit` | `Qwen3.8-27B-MTP-4bit` | MTP sidecar | KV truncation + tape refold |
+| `Qwen3.8-27B-4bit` | `Qwen3.8-27B-DFlash2` | DFlash 2 block drafter | KV truncation + tape refold |
+| `Qwen3.6-35B-A3B-8bit` | `Qwen3.6-35B-A3B-DFlash` | DFlash 1, adaptive block | KV truncation + tape refold |
+| `Qwen3.6-35B-A3B-8bit` | `specdrift-qwen3.6-35b-a3b-eagle3` | EAGLE-3 | KV truncation + tape refold |
 | `Qwen3.8-27B-mxfp8` | `ornith-1.0-9b-mxfp8-mlx` | two full models, greedy | both models' KV + recurrent state |
 
 Both halves resolve by slug from `RMLX_O_MODELS_ROOT`, so every pair runs
@@ -309,6 +309,46 @@ A rule keyed on the unnameable token alone would waive the widened
 correction, the defect the pair exists to catch. Every run of the pair prints
 `unnameable` (how many reference tokens the drafter cannot name),
 `divergence_unnameable` and `divergence_decided_by`.
+
+## Across weight formats
+
+`the_4bit_checkpoint_is_not_collapsed_or_truncated_against_mxfp8` decodes
+every prompt in `PROMPTS` at temperature 0 on `Qwen3.8-27B-mxfp8` and then on
+`Qwen3.8-27B-4bit`, one resident at a time. No round loop runs: both arms are
+plain greedy, and the mxfp8 arm is the reference.
+
+The first-divergence ceiling does not carry over. It is set from one set of
+weights read in two reduction orders, where a flip needs a near-tie in the
+reference arm. Two weight formats are two different functions of the prompt.
+The ceiling refuses three of the five prompts it can judge, each at a position
+where the mxfp8 arm was sure and the 4-bit arm was not:
+
+| prompt | first divergence | mxfp8 gap, rank | 4-bit gap, rank | ceiling verdict |
+|---|---|---|---|---|
+| hash-map-collisions | 0 | 1.5000, 0.3203 | 0.0000, 0.0000 | refused |
+| tcp-congestion | 0 | 0.3750, 0.0938 | 0.6250, 0.2148 | agreed |
+| virtual-memory | 5 | 1.3750, 0.2852 | 0.1250, 0.0000 | refused |
+| database-isolation | 27 | 0.2500, 0.0742 | 0.5000, 0.1172 | agreed |
+| photosynthesis | 23 | 1.5000, 0.2734 | 0.2500, 0.0703 | refused |
+| longctx-4k | 4 | 0.1250, 0.0769 | 0.0000, 0.0000 | unjudgeable: mxfp8 answers in 26 tokens |
+
+The gap is the verifier's top-two logprob gap in nats at that position. The
+rank is its place among that arm's own gaps. At every refused position the
+4-bit arm was at or near a tie (rank 0.0000, 0.0000 and 0.0703) while the
+mxfp8 arm was 1.4 to 1.5 nats sure. The 0.12 ceiling is calibrated on pairs
+that share their weights, so a refusal here is outside what it was measured
+for. No round loop runs in this comparison, and the perplexity cross-check
+puts the loss in the stored weights, not in an rMLX kernel. No broken
+cross-format engine has been measured, so the ceiling is printed and not
+asserted for this comparison.
+
+The test asserts what holds across formats: the controls (a collapsed arm, an
+arm that stopped early, two lengths too far apart) refuse nothing, and at
+least one prompt is judged. They are `judge` with no margins. A 4-bit decode
+defect that collapses or truncates an answer fails it. One that only moves
+tokens does not, and nothing here would see it.
+
+    cargo test -p rmlx-models --test spec_greedy_equivalence -- --ignored --nocapture the_4bit_checkpoint_is_not_collapsed
 
 ## Rules for changing the gate
 

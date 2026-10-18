@@ -324,8 +324,10 @@ patterns are `NAMED_WAIVED`, `ANY_WAIVED` and `NAMED_WAIVED_PLACEHOLDER` in
 
 `spec_greedy_equivalence.rs` refuses a mis-paired drafter before either model
 loads, with a named notice. `declared_kind` checks that the sidecar declares the
-kind the pair's loop drives. `declared_quant_mode` checks that the sidecar is
-quantized like its verifier. For the two-model pair, `vocab_pairing` in
+kind the pair's loop drives. `common::declared_quant_mode`, in
+`crates/rmlx-models/tests/common/mod.rs`, checks that the sidecar is quantized
+like its verifier. `qwen3_5_mtp_drafter_alignment.rs` calls it too, for both
+27B pairs. For the two-model pair, `vocab_pairing` in
 `crates/rmlx-models/src/speculative/mod.rs` compares the two tokenizers id by
 id; `load_speculative` calls the same function.
 

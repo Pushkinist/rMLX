@@ -118,12 +118,15 @@
 //!
 //! # Pairs
 //!
-//! Six, whose verifiers resolve by slug from `RMLX_O_MODELS_ROOT`:
+//! Ten `Pair` consts, whose verifiers resolve by slug from `RMLX_O_MODELS_ROOT`.
+//! Seven are listed; the other three are second pairs of the MTP 4-bit, DFlash 2
+//! and DFlash 1 rows, the same loop at a wider block:
 //!
 //! | verifier | drafter | round loop | rollback |
 //! |---|---|---|---|
 //! | `gemma-4-e2b-it-mxfp8` | `gemma-4-E2B-it-assistant-bf16` | shared-K/V assistant | KV truncation, SWA ring included |
 //! | `Qwen3.8-27B-mxfp8` | `Qwen3.8-27B-MTP-mxfp8` | MTP sidecar | KV truncation + tape refold |
+//! | `Qwen3.8-27B-4bit` | `Qwen3.8-27B-MTP-4bit` | MTP sidecar | KV truncation + tape refold |
 //! | `Qwen3.8-27B-4bit` | `Qwen3.8-27B-DFlash2` | DFlash 2 block drafter | KV truncation + tape refold |
 //! | `Qwen3.6-35B-A3B-8bit` | `Qwen3.6-35B-A3B-DFlash` | DFlash 1, adaptive block | KV truncation + tape refold |
 //! | `Qwen3.6-35B-A3B-8bit` | `specdrift-qwen3.6-35b-a3b-eagle3` | EAGLE-3 | KV truncation + tape refold |
@@ -2783,8 +2786,8 @@ enum RoundLoop {
     /// the rollback is a KV truncation that includes the SWA ring.
     Gemma4Assistant,
     /// Qwen3.5/3.6 MTP sidecar: the verifier carries recurrent state, and the
-    /// rollback restores it from a pre-round snapshot and replays the accepted
-    /// prefix.
+    /// rollback refolds it from the round tape (`refold_lin_tapes` in
+    /// `round_common.rs`) over the accepted prefix.
     MtpSidecar,
     /// DFlash 1 block drafter: the same recurrent rollback, and the only loop
     /// here whose block size changes between rounds — it is set from the accept
@@ -3115,36 +3118,6 @@ fn declared_backbone_hidden(draft_path: &Path) -> Option<usize> {
     draft_config(draft_path)?["backbone_hidden_size"]
         .as_u64()
         .and_then(|v| usize::try_from(v).ok())
-}
-
-/// The weight-quantization mode a snapshot declares, if it declares one.
-///
-/// A sidecar is decoded through the verifier's own LM head and conditioned on
-/// its hidden states, so a pair whose halves were quantized differently is a
-/// pair in name only — and nothing downstream refuses it: both 27B sidecars
-/// carry the same width and the same tensor names, so a 4-bit one loads against
-/// an mxfp8 verifier and drafts fluently at a rate no reading here could be
-/// attributed to either checkpoint.
-///
-/// **Mode and not bits.** The shipped Qwen3.6 pair is an 8-bit verifier with a
-/// 5-bit sidecar, both affine, and it is the pair the MoE rows were measured on
-/// — so a width comparison would stand down a pairing that is real. The mode is
-/// what the two 27B pairs differ on and what nothing else separates them by.
-///
-/// `None` on either side is no opinion: the DFlash 2 and EAGLE-3 drafters
-/// declare no `quantization` block at all.
-///
-/// It speaks for the sidecar loops only. A two-model draft is a whole model that
-/// shares the verifier's tokenizer and nothing else, so its weight format is
-/// unrelated to the verifier's and a pair of different ones is a pair.
-fn declared_quant_mode(path: &Path) -> Option<String> {
-    let cfg = draft_config(path)?;
-    for at in [&cfg["quantization"], &cfg["text_config"]["quantization"]] {
-        if let Some(mode) = at["mode"].as_str() {
-            return Some(mode.to_owned());
-        }
-    }
-    None
 }
 
 // ── Prompts ──────────────────────────────────────────────────────────────────
@@ -3802,14 +3775,14 @@ fn load(pair: &Pair, test: &str, device: Device) -> Option<Loaded> {
     }
     let model_path = common::model_for(&pair.verifier, test)?;
     // A sidecar quantized differently from its verifier is not this pair, and
-    // nothing downstream says so — see `declared_quant_mode`. The two-model arm
+    // nothing downstream says so — see `common::declared_quant_mode`. The two-model arm
     // is exempt because its draft is an independent model: it shares the
     // verifier's tokenizer and nothing else, so the two weight formats are
     // unrelated and a pair of different ones is a pair.
     if pair.round_loop != RoundLoop::TwoModelGreedy {
         if let (Some(d), Some(v)) = (
-            declared_quant_mode(&draft_path),
-            declared_quant_mode(&model_path),
+            common::declared_quant_mode(&draft_path),
+            common::declared_quant_mode(&model_path),
         ) {
             if d != v {
                 eprintln!(
@@ -4475,8 +4448,8 @@ fn the_assistant_round_loop_reproduces_plain_greedy() {
 }
 
 /// The recurrent pair, whose rollback has no truncation to be exact about — the
-/// recurrent state has no sequence axis, so the loop restores a pre-round
-/// snapshot and replays the accepted prefix.
+/// recurrent state has no sequence axis, so the loop refolds it from the round
+/// tape over the accepted prefix.
 ///
 /// Its subsequence agreement is far below the assistant pair's and no floor
 /// separates it from a defect, which is what the divergence oracle is for. It
@@ -4693,4 +4666,135 @@ fn run_gate(test: &str, pair: &Pair) {
         refusals.join("\n  ")
     );
     check_round_streams(test);
+}
+
+// ── Across weight formats ────────────────────────────────────────────────────
+
+/// What one checkpoint answers to every prompt in [`PROMPTS`] at temperature 0:
+/// the prompt ids, and per prompt the answer ids with the verifier's top-two gap
+/// at each answer position.
+struct FormatArm {
+    prompts: Vec<Vec<u32>>,
+    answers: Vec<(Vec<u32>, Vec<f32>)>,
+    tokenizer: tokenizers::Tokenizer,
+}
+
+/// Decode every prompt on the checkpoint at `model_path`, then drop it and
+/// release the buffers MLX kept for it, so two 27B checkpoints are never
+/// resident together.
+fn format_arm(model_path: &Path, device: Device) -> FormatArm {
+    let tokenizer =
+        tokenizers::Tokenizer::from_file(model_path.join("tokenizer.json")).expect("tokenizer");
+    let eos = eos_ids(model_path);
+    assert!(
+        !eos.is_empty(),
+        "the verifier config must name its stop ids — without them both arms run past \
+         the answer into end-of-turn filler and the comparison is over that"
+    );
+    let model =
+        arch::load_model(model_path, device, &arch::LoadOpts::default()).expect("load verifier");
+    let prompts: Vec<Vec<u32>> = PROMPTS.iter().map(|p| p.ids(&tokenizer)).collect();
+    let answers = prompts
+        .iter()
+        .map(|ids| plain_greedy(&model, &tokenizer, ids, &eos, device))
+        .collect();
+    drop(model);
+    common::release_cached_buffers();
+    FormatArm {
+        prompts,
+        answers,
+        tokenizer,
+    }
+}
+
+/// The 4-bit checkpoint against the mxfp8 one: plain greedy on both, every
+/// prompt in [`PROMPTS`], the mxfp8 arm as the reference.
+///
+/// **The first-divergence ceiling does not carry over, so it is printed and not
+/// asserted.** [`MAX_DIVERGENCE_CONFIDENCE`] is set from one set of weights read
+/// in two reduction orders, where a flip needs a near-tie in the reference arm.
+/// Two weight formats are two different functions of the prompt. Measured on
+/// this pair, the ceiling refuses three of the five prompts it can judge, each
+/// at a position where the mxfp8 arm was sure (a top-two gap of 1.4 to 1.5 nats)
+/// and the 4-bit arm was not (0.0 to 0.25). Each verdict is printed beside the
+/// 4-bit arm's own gap and its rank among its own gaps, which is the evidence a
+/// reader judges a part by. No broken cross-format engine has been measured, so
+/// no ceiling for this comparison is set.
+///
+/// What is asserted holds across formats: the controls (a collapsed arm, an arm
+/// that stopped early, two lengths too far apart) refuse nothing, and at least
+/// one prompt is judged. They are [`judge`] with no margins, which is the mode
+/// its fixtures run in.
+#[ignore]
+#[test]
+fn the_4bit_checkpoint_is_not_collapsed_or_truncated_against_mxfp8() {
+    let test = "the_4bit_checkpoint_is_not_collapsed_or_truncated_against_mxfp8";
+    let device = Device::Gpu;
+    let Some(reference_path) = common::model_for(&MTP_PAIR.verifier, test) else {
+        return;
+    };
+    let Some(other_path) = common::model_for(&MTP_4BIT_PAIR.verifier, test) else {
+        return;
+    };
+    if reference_path == other_path {
+        eprintln!(
+            "SKIP {test}: both verifiers resolved to one snapshot, so there are not two \
+             weight formats to compare ({} is set)",
+            common::SINGLE_MODEL_VAR
+        );
+        return;
+    }
+    let reference = format_arm(&reference_path, device);
+    let other = format_arm(&other_path, device);
+    assert_eq!(
+        reference.prompts, other.prompts,
+        "the two snapshots must tokenize every prompt alike"
+    );
+
+    let mut refusals: Vec<String> = Vec::new();
+    let mut judged = 0usize;
+    for (i, prompt) in PROMPTS.iter().enumerate() {
+        let (ref_ids, ref_margins) = &reference.answers[i];
+        let (ids, margins) = &other.answers[i];
+        let controls = judge(ids, ref_ids, &[], None);
+        let ceiling = judge(ids, ref_ids, ref_margins, None);
+        let (div, ref_confidence) = divergence_confidence(ids, ref_ids, ref_margins)
+            .unwrap_or((common_prefix_len(ids, ref_ids), 0.0));
+        let other_confidence = divergence_confidence(ref_ids, ids, margins).map(|(_, c)| c);
+        eprintln!(
+            "[{test}/{}] divergence={div} mxfp8_margin={:.4} mxfp8_confidence={ref_confidence:.4} \
+             4bit_margin={:.4} 4bit_confidence={other_confidence:?} lcs={:.4} mxfp8={} 4bit={}\n  \
+             controls = {controls:?}\n  ceiling  = {ceiling:?}\n  mxfp8 = {:?}\n  4bit  = {:?}",
+            prompt.name,
+            ref_margins.get(div).copied().unwrap_or(f32::NAN),
+            margins.get(div).copied().unwrap_or(f32::NAN),
+            lcs_ratio(ids, ref_ids),
+            ref_ids.len(),
+            ids.len(),
+            reference
+                .tokenizer
+                .decode(ref_ids, false)
+                .unwrap_or_default(),
+            other.tokenizer.decode(ids, false).unwrap_or_default(),
+        );
+        match controls {
+            Verdict::Agreed => judged += 1,
+            Verdict::Unjudgeable(_) => {}
+            Verdict::Refused(why) => {
+                judged += 1;
+                refusals.push(format!("{}: {why}", prompt.name));
+            }
+        }
+    }
+    assert!(
+        judged > 0,
+        "{test}: no prompt produced a pair the controls could judge, so it asserted \
+         nothing — the run is not a pass"
+    );
+    assert!(
+        refusals.is_empty(),
+        "{test}: the 4-bit arm failed a control on {} of {judged} judged prompts\n  {}",
+        refusals.len(),
+        refusals.join("\n  ")
+    );
 }
