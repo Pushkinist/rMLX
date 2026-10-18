@@ -53,18 +53,34 @@ field_of() {
     echo "${block}" | sed -n "s/^${key}=//p" | tail -1
 }
 
-# Where this process keeps its before/after log listings. Per-pid: two harnesses
-# sharing an RMLX_HOME would otherwise overwrite each other's listing and
-# attribute each other's run logs.
+# Where this process keeps its before-listing of the run logs. Per-pid: two
+# harnesses sharing an RMLX_HOME would otherwise overwrite each other's listing
+# and attribute each other's run logs.
 log_listing() { echo "${SCRATCH_DIR}/logs_$1.$$"; }
 
-# Which run logs exist right now. Called before a phase starts its server.
-snapshot_logs() {
-    { ls -1 "${LOG_DIR}"/*.jsonl 2>/dev/null || true; } | sort \
-        > "$(log_listing before)"
+# Every run log as `<bytes><TAB><path>`.
+log_sizes() {
+    local f
+    for f in "${LOG_DIR}"/*.jsonl; do
+        [[ -e "${f}" ]] || continue
+        printf '%s\t%s\n' "$(wc -c < "${f}" | tr -d ' ')" "${f}"
+    done
 }
 
-# The run log a given pid wrote, among those that appeared since snapshot_logs.
+# Which run logs exist right now, and how large. Called before a phase starts
+# its server.
+snapshot_logs() {
+    log_sizes > "$(log_listing before)"
+}
+
+# The run log a given pid wrote, among those that are new or have grown since
+# snapshot_logs.
+#
+# The run id has a granularity of one second, so a server that starts in the
+# same second as an earlier rmlx process appends to that process's file: a file
+# that already existed at the snapshot can still be the server's. What is
+# printed is then a copy of the bytes written since the snapshot, so a reader
+# never sees the events of the earlier process.
 #
 # Identity, not order: "the newest" and "the last new one" both answer a
 # different question, and any other rmlx process writing to this directory
@@ -73,13 +89,14 @@ snapshot_logs() {
 # all — reading metrics out of somebody else's log leaves no trace in the
 # output.
 phase_log() {
-    local pid="$1" before after
-    before="$(log_listing before)"
-    after="$(log_listing after)"
-    { ls -1 "${LOG_DIR}"/*.jsonl 2>/dev/null || true; } | sort > "${after}"
-    comm -13 "${before}" "${after}" \
-        | python3 "${REPO_ROOT}/scripts/lib/run_log_for_pid.py" --pid "${pid}"
-    rm -f "${after}"
+    local pid="$1"
+    log_sizes \
+        | awk -F'\t' 'FILENAME == ARGV[1] { size[$2] = $1; next }
+                      !($2 in size) { print 0 "\t" $2 }
+                      ($2 in size) && $1 > size[$2] { print size[$2] "\t" $2 }' \
+            "$(log_listing before)" - \
+        | python3 "${REPO_ROOT}/scripts/lib/run_log_for_pid.py" --pid "${pid}" \
+            --slice-dir "${SCRATCH_DIR}"
 }
 
 # The KV codec that log says the run resolved. Empty when it does not say.

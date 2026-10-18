@@ -460,8 +460,15 @@ at build time or at run time. The directory a process starts in is not
 necessarily its own checkout. `git_sha` is provenance that the caller
 supplies:
 
-- A bench script runs `git rev-parse` in its own repo and sets `"git_sha"`
-  after merging the identity block.
+- A bench script sets `"git_sha"` after merging the identity block. The sha is
+  the one `RMLX_IDENTITY_JSON` carries when a caller supplied it, so a binary
+  built at another commit than the checkout's is filed under its own commit;
+  only without one does the script run `git rev-parse` in its own repo
+  (`rmlx_git_sha` in `scripts/lib/identity.sh`). A hex sha that resolves in
+  that repo is filed in the short form HEAD is filed in; any other value is
+  filed as given, and an `unknown...` value counts as none. This covers
+  `spec_bench.sh`, `ssd_canary.sh`, `perf_canary.sh`, `bench_cell.sh`,
+  `bench_cache_types.sh` and `perf-iter/bench_decode_tps.sh`.
 - `rmlx baseline --git-sha <sha>` and `rmlx eval ppl --git-sha <sha>` stamp
   it. Without the flag it is `NULL`.
 

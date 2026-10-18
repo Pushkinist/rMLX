@@ -78,7 +78,7 @@ LOG_DIR="${RMLX_HOME}/logs"
 BUFFER_DIR="${RMLX_HOME}/metrics/buffer/pending"
 DB_PATH="${RMLX_HOME}/metrics/runs.db"
 SCRATCH_DIR="${RMLX_HOME}/tmp"
-GIT_SHA="$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || echo "unknown")"
+GIT_SHA="$(rmlx_git_sha "${REPO_ROOT}")"
 
 # Model paths — must be set via env. Concrete absolute paths live in LOCAL.md
 # (gitignored, never committed). See LOCAL.md §"Test-target model snapshots".

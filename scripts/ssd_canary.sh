@@ -89,7 +89,7 @@ fi
 source "$(dirname "${BASH_SOURCE[0]}")/lib/identity.sh"
 rmlx_export_identity "${BINARY}"
 PROMPT_DIR="${REPO_ROOT}/prompts/ssd_bench"
-GIT_SHA="$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || echo "unknown")"
+GIT_SHA="$(rmlx_git_sha "${REPO_ROOT}")"
 
 # The binary resolves the data root and the metrics DB, from the checkout, as
 # `make ssd-canary-gate` does, so the records land in the DB the gate reads.

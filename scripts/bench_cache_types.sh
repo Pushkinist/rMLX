@@ -79,10 +79,11 @@ RMLX_BIN="$RMLX_DIR/target/release/rmlx"
 # comes from the measured binary — never hard-coded here.
 source "$(dirname "${BASH_SOURCE[0]}")/lib/identity.sh"
 rmlx_export_identity "$RMLX_BIN"
-# git_sha is caller-supplied provenance, not part of RunIdentity — anchored
-# to RMLX_DIR (never the process cwd) so a run from another checkout cannot
-# stamp that repo's SHA into this one's observations.git_sha.
-GIT_SHA="$(git -C "${RMLX_DIR}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+# git_sha is caller-supplied provenance, not part of RunIdentity — the
+# identity's own when it carries one, else HEAD of RMLX_DIR (never the process
+# cwd) so a run from another checkout cannot stamp that repo's SHA into this
+# one's observations.git_sha.
+GIT_SHA="$(rmlx_git_sha "${RMLX_DIR}")"
 BUFFER_DIR="$RMLX_DIR/.rmlx/metrics/buffer/pending"
 mkdir -p "$BUFFER_DIR"
 

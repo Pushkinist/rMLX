@@ -41,3 +41,35 @@ rmlx_export_identity() {
   }
   export RMLX_IDENTITY_JSON
 }
+
+# The `git_sha` the identity carries, or nothing. The binary reports none; a
+# caller that built it at another commit than the checkout's HEAD supplies it in
+# RMLX_IDENTITY_JSON. `unknown...` is the placeholder scripts use for "no
+# commit", not a commit, so it counts as absent. Fails with one line when
+# RMLX_IDENTITY_JSON is not a JSON object.
+rmlx_identity_git_sha() {
+  python3 -c 'import json, os, sys
+try:
+    identity = json.loads(os.environ.get("RMLX_IDENTITY_JSON") or "{}")
+except ValueError:
+    identity = None
+if not isinstance(identity, dict):
+    sys.exit("rmlx_identity_git_sha: RMLX_IDENTITY_JSON is not a JSON object")
+sha = identity.get("git_sha")
+print(sha if isinstance(sha, str) and not sha.startswith("unknown") else "")'
+}
+
+# The commit a run is attributed to: the identity's `git_sha` when it carries
+# one, else HEAD of the checkout at $1, else `unknown`. A hex sha that resolves
+# in the checkout is filed in the short form HEAD is filed in; any other value
+# is kept as given.
+rmlx_git_sha() {
+  local repo="${1:?rmlx_git_sha: pass the checkout root}" sha
+  sha="$(rmlx_identity_git_sha)" || return 1
+  if [[ -z "$sha" ]]; then
+    sha="$(git -C "$repo" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  elif [[ "$sha" =~ ^[0-9a-fA-F]{4,40}$ ]]; then
+    sha="$(git -C "$repo" rev-parse --verify --quiet --short "${sha}^{commit}" 2>/dev/null || echo "$sha")"
+  fi
+  echo "$sha"
+}

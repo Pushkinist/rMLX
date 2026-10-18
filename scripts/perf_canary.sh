@@ -41,6 +41,7 @@ CSV_DIR="${RMLX_HOME}/bench"
 CSV="${CSV_DIR}/perf_canary.csv"
 LOG_DIR="${RMLX_HOME}/logs"
 SCRATCH_DIR="${RMLX_HOME}/tmp"
+source "${REPO_ROOT}/scripts/lib/bench_server.sh"
 
 PROMPT_TOKENS=4096
 MAX_TOKENS=100
@@ -93,7 +94,9 @@ if [[ ! -f "${CSV}" ]]; then
     echo "ts_utc,git_sha,model,kv_quant,prompt_tokens,decode_tps,stddev,build_profile" > "${CSV}"
 fi
 
-GIT_SHA="$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || echo "unknown")"
+source "${REPO_ROOT}/scripts/lib/identity.sh"
+rmlx_export_identity "${BINARY}"
+GIT_SHA="$(rmlx_git_sha "${REPO_ROOT}")"
 
 # Helper: run one baseline, parse decode_tps from stdout
 # Usage: run_once <model_path> [--kv-quant <tag>]
@@ -128,8 +131,7 @@ run_once() {
 resolve_kv_quant() {
     local model_path="$1"
     mkdir -p "${LOG_DIR}" "${SCRATCH_DIR}"
-    { ls -1 "${LOG_DIR}"/*.jsonl 2>/dev/null || true; } | sort \
-        > "${SCRATCH_DIR}/canary_logs_before"
+    snapshot_logs
 
     RMLX_HOME="${RMLX_HOME}" "${BINARY}" baseline \
         --model "${model_path}" \
@@ -141,10 +143,7 @@ resolve_kv_quant() {
     wait "${probe_pid}" || true
 
     local log
-    log="$({ ls -1 "${LOG_DIR}"/*.jsonl 2>/dev/null || true; } | sort \
-        | comm -13 "${SCRATCH_DIR}/canary_logs_before" - \
-        | python3 "${REPO_ROOT}/scripts/lib/run_log_for_pid.py" --pid "${probe_pid}")" ||
-        return 1
+    log="$(phase_log "${probe_pid}")" || return 1
 
     python3 "${REPO_ROOT}/scripts/lib/server_kv_quant.py" "${log}" \
         | sed -n 's/^kv_quant=//p'

@@ -631,8 +631,12 @@ serve)
 	echo "\$started" >"\$RMLX_HOME/pass.cnt"
 	pass=\$started
 	[ "\$speculative" = 0 ] && pass=\$((started - 1))
-	log="\$RMLX_HOME/logs/stub-\$\$-p\$pass.jsonl"
-	: >"\$log"
+	if [ -n "\${STUB_SHARED_LOG:-}" ]; then
+		log="\$RMLX_HOME/logs/\$STUB_SHARED_LOG"
+	else
+		log="\$RMLX_HOME/logs/stub-\$\$-p\$pass.jsonl"
+		: >"\$log"
+	fi
 	if [ -z "\${STUB_PID_SUPPRESS:-}" ]; then
 		printf '%s\n' "{\"timestamp\":\"2026-09-06T00:00:00Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"rmlx start\",\"version\":\"9.9.9\",\"run_id\":\"stub\",\"pid\":\$\$}}" >>"\$log"
 	fi
@@ -714,7 +718,7 @@ run_case() {
 
     local env_pairs=() greps=() nogreps=() extra_args=() host="quiet" a
     local synthetic=true verifier="${VERIFIER}" canonical=false
-    local therm="${SHIMS}" markerless=false delayed=0 stamps=true stub_args=""
+    local therm="${SHIMS}" markerless=false delayed=0 stamps=true stub_args="" prelog=""
     for a in "$@"; do
         case "$a" in
         GREP:*) greps+=("${a#GREP:}") ;;
@@ -727,6 +731,7 @@ run_case() {
         CLIENT_SHIM:*) delayed="${a#CLIENT_SHIM:}" ;;
         NO_STAMPS:*) stamps=false ;;
         STUB:*) stub_args="${stub_args} ${a#STUB:}" ;;
+        PRELOG:*) prelog="${a#PRELOG:}" ;;
         THERM:*) therm="${WORK}/therm_${a#THERM:}" ;;
         VERIFIER:*) verifier="${a#VERIFIER:}" ;;
         *) env_pairs+=("$a") ;;
@@ -736,6 +741,17 @@ run_case() {
     $stamps && extra_args+=(--server-stamps)
     write_client_shim "${CASE_HOME}/client" "${delayed}"
     printf '%s\n' "--marks ${CASE_HOME}/client${stub_args}" >"${CASE_HOME}/stub_args"
+    # A run log an earlier rmlx process left in this second: every server of the
+    # case appends to it, and none of its events belong to the run.
+    if [ -n "${prelog}" ]; then
+        cat >"${CASE_HOME}/logs/${prelog}" <<'LOGEOF'
+{"timestamp":"2026-09-06T00:00:00Z","level":"INFO","fields":{"message":"rmlx start","version":"9.9.9","run_id":"stub","pid":4242}}
+{"timestamp":"2026-09-06T00:00:00Z","level":"INFO","fields":{"message":"cache-type resolved","arch":"Stub","kv_quant":"none"}}
+{"timestamp":"2026-09-06T00:00:00Z","level":"INFO","fields":{"message":"generate_streaming: TTFT","model_id":"stub","ttft_ms":999.0}}
+{"timestamp":"2026-09-06T00:00:00Z","level":"INFO","fields":{"message":"generate: ITL stats","model_id":"stub","step_count":8,"p50_ms":99.0,"p95_ms":99.0,"p99_ms":99.0,"mean_ms":99.0,"itl_spikes":0}}
+LOGEOF
+        env_pairs+=("STUB_SHARED_LOG=${prelog}")
+    fi
     local root="${FAKE_ROOT}"
     if $canonical; then
         root="${CANON_ROOT}"
@@ -1229,6 +1245,11 @@ run_case unattributable_log_refused 1 \
     'STUB_PID_SUPPRESS=1' \
     'GREP:is attributable to the pass-1 server'
 no_result
+verdict
+
+run_case same_second_log_attributed 0 \
+    "passes that append to a log an earlier process began read only their own events" \
+    'PRELOG:20260906-000000-9.9.9.jsonl'
 verdict
 
 run_case unreported_kv_quant_refused 1 \

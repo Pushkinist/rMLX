@@ -39,6 +39,11 @@ FAILED=0
 FAKE_ROOT="$WORK/repo"
 mkdir -p "$FAKE_ROOT/target/release-perf"
 ln -s "$REPO_ROOT/scripts" "$FAKE_ROOT/scripts"
+# A checkout whose HEAD is a commit the identity under test does not name.
+git -C "$FAKE_ROOT" init -q
+git -C "$FAKE_ROOT" -c user.name=selftest -c user.email=selftest@example.invalid \
+	commit -q --allow-empty -m stub
+HEAD_SHA="$(git -C "$FAKE_ROOT" rev-parse --short HEAD)"
 
 # shellcheck source=scripts/lib/selftest_support.sh
 . "$REPO_ROOT/scripts/lib/selftest_support.sh"
@@ -378,8 +383,21 @@ serve)
 		esac
 		shift
 	done
-	log="\$RMLX_HOME/logs/\$(date +%s)-\$\$.jsonl"
-	: >"\$log"
+	if [ -n "\${STUB_SHARED_LOG:-}" ]; then
+		log="\$RMLX_HOME/logs/\$STUB_SHARED_LOG"
+		if [ -n "\${STUB_FOREIGN_START:-}" ]; then
+			printf '%s\n' "{\"timestamp\":\"2026-09-03T00:00:00Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"rmlx start\",\"version\":\"9.9.9\",\"run_id\":\"stub\",\"pid\":777}}" >>"\$log"
+		fi
+	else
+		log="\$RMLX_HOME/logs/\$(date +%s)-\$\$.jsonl"
+		: >"\$log"
+	fi
+	if [ -n "\${STUB_REWRITE_PID_IN:-}" ]; then
+		stale="\$RMLX_HOME/logs/\$STUB_REWRITE_PID_IN"
+		sed "s/PIDPLACEHOLDER/\$(printf '%14d' \$\$)/" "\$stale" >"\$stale.tmp"
+		cat "\$stale.tmp" >"\$stale"
+		rm -f "\$stale.tmp"
+	fi
 	if [ -z "\${STUB_PID_SUPPRESS:-}" ]; then
 		printf '%s\n' "{\"timestamp\":\"2026-09-03T00:00:00Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"rmlx start\",\"version\":\"9.9.9\",\"run_id\":\"stub\",\"pid\":\$\$}}" >>"\$log"
 	fi
@@ -433,7 +451,8 @@ sys.exit("no free port in 18000-19999")
 
 # run_case <name> <want-exit> <what-it-proves> [KEY=VALUE ...] [ARGS:flag ...]
 #          [CLIENT_SHIM:N] [NO_STAMPS:1] [READER_CLOCK:<step>]
-#          [STUB:<stub server arguments>]
+#          [STUB:<stub server arguments>] [PRELOG:<run log name>]
+#          [STALE:<run log name>]
 #          [GREP:pat ...]
 #
 # Stub defaults describe a run streaming eight tokens 50 ms apart, so the rate
@@ -449,7 +468,7 @@ run_case() {
 	CASE_HOME="$WORK/home_$CASE_NAME"
 	mkdir -p "$CASE_HOME/logs" "$CASE_HOME/metrics/buffer/pending"
 
-	local env_pairs=() greps=() extra_args=() a delayed=0 stamps=true stub_args="" step=""
+	local env_pairs=() greps=() extra_args=() a delayed=0 stamps=true stub_args="" step="" prelog="" stale=""
 	for a in "$@"; do
 		case "$a" in
 		GREP:*) greps+=("${a#GREP:}") ;;
@@ -458,11 +477,32 @@ run_case() {
 		NO_STAMPS:*) stamps=false ;;
 		READER_CLOCK:*) step="${a#READER_CLOCK:}" ;;
 		STUB:*) stub_args="$stub_args ${a#STUB:}" ;;
+		PRELOG:*) prelog="${a#PRELOG:}" ;;
+		STALE:*) stale="${a#STALE:}" ;;
 		*) env_pairs+=("$a") ;;
 		esac
 	done
 	$stamps && extra_args+=(--server-stamps)
 	write_client_shim "$CASE_HOME/client" "$delayed" "$step"
+	# A run log an earlier rmlx process left in this second: the servers of the
+	# case append to it instead of opening their own. It carries that process's
+	# own events, none of which belong to the run being measured.
+	if [ -n "$prelog" ]; then
+		cat >"$CASE_HOME/logs/$prelog" <<'LOGEOF'
+{"timestamp":"2026-09-03T00:00:00Z","level":"INFO","fields":{"message":"rmlx start","version":"9.9.9","run_id":"stub","pid":4242}}
+{"timestamp":"2026-09-03T00:00:00Z","level":"INFO","fields":{"message":"cache-type resolved","arch":"Stub","kv_quant":"none"}}
+{"timestamp":"2026-09-03T00:00:00Z","level":"INFO","fields":{"message":"generate: host categorical sampler active","temperature":0.7,"top_p":0.95,"top_k":20,"min_p":0.0,"seed":42}}
+{"timestamp":"2026-09-03T00:00:00Z","level":"INFO","fields":{"message":"mtp_generate: done","rounds":30,"emitted":128,"decode_tps":"Some(99.0)"}}
+LOGEOF
+		env_pairs+=("STUB_SHARED_LOG=$prelog")
+	fi
+	# A run log whose `rmlx start` is the server's own pid, written before the
+	# server exists: the stub fills the pid in without changing the file's size.
+	if [ -n "$stale" ]; then
+		printf '%s\n' '{"timestamp":"2026-09-03T00:00:00Z","level":"INFO","fields":{"message":"rmlx start","version":"9.9.9","run_id":"stub","pid":PIDPLACEHOLDER}}' \
+			>"$CASE_HOME/logs/$stale"
+		env_pairs+=("STUB_REWRITE_PID_IN=$stale")
+	fi
 	printf '%s\n' "--marks $CASE_HOME/client$stub_args" >"$CASE_HOME/stub_args"
 
 	CASE_OUT="$WORK/$CASE_NAME.log"
@@ -851,6 +891,65 @@ run_case decoy_log_ignored 0 \
 	'STUB_DECOY_LOG=1'
 got="$(metric_of mtp value)"
 close_to "$got" 20.0 0.001 || note_bad "mtp decode_tps_warm=$got (want 20.0)"
+verdict
+
+# The run id has a granularity of one second, so a server that starts in the
+# second an earlier rmlx process started in appends to that process's file. The
+# file existed before the snapshot; the pid in its `rmlx start` events is what
+# attributes it.
+run_case same_second_log_attributed 0 \
+	"a server appending to a log that predates the snapshot is attributed by pid" \
+	'PRELOG:20260903-000000-9.9.9.jsonl'
+got="$(metric_of mtp value)"
+close_to "$got" 20.0 0.001 || note_bad "mtp decode_tps_warm=$got (want 20.0)"
+got="$(metric_of normal value)"
+close_to "$got" 20.0 0.001 || note_bad "normal decode_tps_warm=$got (want 20.0)"
+verdict
+
+# The binary reports no commit; a caller that built it elsewhere than the
+# checkout's HEAD says which one in the identity, and the row carries that one.
+IDENTITY_SHA=feedbee
+run_case identity_sha_beats_checkout_head 0 \
+	"a git_sha the identity carries is the one filed, not the checkout's HEAD" \
+	'RMLX_IDENTITY_JSON={"backend":"rmlx","backend_version":"9.9.9","build_profile":"release-perf","hardware_tag":"m5_max_128gb","git_sha":"'$IDENTITY_SHA'"}'
+for arm in normal mtp; do
+	[ "$(field_of_record "$arm" git_sha)" = "$IDENTITY_SHA" ] ||
+		note_bad "$arm git_sha=$(field_of_record "$arm" git_sha) (want $IDENTITY_SHA)"
+	case "$(field_of_record "$arm" description)" in
+	*"sha=$IDENTITY_SHA") ;;
+	*) note_bad "$arm description=$(field_of_record "$arm" description) (want sha=$IDENTITY_SHA)" ;;
+	esac
+done
+verdict
+
+run_case checkout_head_is_the_fallback_sha 0 \
+	"an identity with no git_sha leaves the checkout's HEAD as the filed commit"
+for arm in normal mtp; do
+	[ "$(field_of_record "$arm" git_sha)" = "$HEAD_SHA" ] ||
+		note_bad "$arm git_sha=$(field_of_record "$arm" git_sha) (want $HEAD_SHA)"
+done
+verdict
+
+# A log that existed before the snapshot and did not grow is nobody's phase,
+# even when the pid in it is the server's: it is the earlier process's file.
+run_case unchanged_log_is_not_a_candidate 1 \
+	"a pre-existing log that did not grow is not read as this server's" \
+	'STUB_PID_SUPPRESS=1' \
+	'STALE:20260903-000001-9.9.9.jsonl' \
+	"GREP:no run log in .* is attributable"
+no_row normal
+no_row mtp
+verdict
+
+# Two processes started in one second and both wrote to the phase: their
+# lines cannot be told apart, so the phase is refused rather than guessed at.
+run_case shared_phase_log_refused 1 \
+	"a grown log whose phase carries another pid's start is refused" \
+	'PRELOG:20260903-000002-9.9.9.jsonl' \
+	'STUB_FOREIGN_START=1' \
+	"GREP:cannot be told apart"
+no_row normal
+no_row mtp
 verdict
 
 # `KvQuant` renders `None` / `K8V8` / `Mixed { .. }` under Debug and

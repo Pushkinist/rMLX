@@ -103,20 +103,25 @@ _RMLX_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # look the row's code up by it. Backend, version, build profile and hardware tag
 # all come from the measured binary via lib/identity.sh, never from constants
 # here — see docs/METRICS_DB.md on caller-supplied identity.
-GIT_SHA="$(git -C "${_RMLX_ROOT}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-if ! git -C "${_RMLX_ROOT}" diff --quiet 2>/dev/null ||
-    ! git -C "${_RMLX_ROOT}" diff --cached --quiet 2>/dev/null; then
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/identity.sh"
+GIT_SHA="$(rmlx_git_sha "${_RMLX_ROOT}")"
+if [[ -z "$(rmlx_identity_git_sha)" ]] &&
+    { ! git -C "${_RMLX_ROOT}" diff --quiet 2>/dev/null ||
+        ! git -C "${_RMLX_ROOT}" diff --cached --quiet 2>/dev/null; }; then
     GIT_SHA="unknown"
 fi
 TS_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-RUN_ID="$(date -u +%Y%m%d-%H%M%S)-${GIT_SHA}"
-# `unknown` is a fallback for run-ids and labels, never provenance — gate the
-# git_sha JSON key so a checkout without `.git`, or one with uncommitted edits,
-# writes NULL into observations.git_sha instead of a string nothing resolves.
-GIT_SHA_KV=""
+RUN_ID="$(date -u +%Y%m%d-%H%M%S)-${GIT_SHA//[^A-Za-z0-9._-]/_}"
+# `unknown` is a fallback for run-ids and labels, never provenance — the
+# git_sha key is left out for a checkout without `.git`, or one with uncommitted
+# edits, so observations.git_sha is NULL instead of a string nothing resolves.
+# The value reaches the record builders through the environment, not their
+# source.
+BENCH_GIT_SHA=""
 if [[ "${GIT_SHA}" != unknown* ]]; then
-    GIT_SHA_KV="'git_sha': '${GIT_SHA}',"
+    BENCH_GIT_SHA="${GIT_SHA}"
 fi
+export BENCH_GIT_SHA
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -162,7 +167,6 @@ fi
 
 # Run identity (backend / version / git sha / build profile / hardware tag)
 # comes from the measured binary — never hard-coded here.
-source "$(dirname "${BASH_SOURCE[0]}")/../lib/identity.sh"
 rmlx_export_identity "${RMLX_BIN}"
 [[ -d "${MODEL_PATH}" ]] || die "model directory not found: ${MODEL_PATH}"
 
@@ -354,7 +358,7 @@ print(json.dumps(words))
 ")"
 
 python3 -c "
-import json, sys
+import json, os, sys
 from datetime import datetime, timezone
 
 record = {
@@ -366,7 +370,7 @@ record = {
     'decode_tps_stddev':  ${tps_stddev},
     'step_ms_mean':       ${ttft_mean},
     'first_32_words':     ${first_32_words},
-    ${GIT_SHA_KV}
+    **({'git_sha': os.environ['BENCH_GIT_SHA']} if os.environ.get('BENCH_GIT_SHA') else {}),
     'notes':              'decode_window=engine_itl; first_32_words from temp=0 decode',
 }
 print(json.dumps(record))
@@ -434,7 +438,7 @@ output_first_64 = ' '.join(words)[:64]
 
 rec = {
     **json.loads(os.environ['RMLX_IDENTITY_JSON']),
-    ${GIT_SHA_KV}
+    **({'git_sha': os.environ['BENCH_GIT_SHA']} if os.environ.get('BENCH_GIT_SHA') else {}),
     'model_namespace': ns,
     'model':           mdl,
     'weight_quant':    weight_quant,
