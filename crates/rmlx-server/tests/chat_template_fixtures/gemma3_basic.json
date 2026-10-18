@@ -1,5 +1,7 @@
 {
-  "snapshot": "mlx-community__medgemma-1.5-4b-it-8bit",
+  "snapshots": [
+    "mlx-community__medgemma-1.5-4b-it-8bit"
+  ],
   "arch": "Gemma3ForConditionalGeneration",
   "messages": [
     {

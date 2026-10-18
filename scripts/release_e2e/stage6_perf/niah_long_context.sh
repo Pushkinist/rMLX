@@ -37,12 +37,8 @@
 #   --filter STR  Pass `STR` as the cargo-test test-name filter (e.g.
 #                 `niah_pflash_bonsai_16k` to limit scope).
 #
-# Env vars (required, per docs/TESTING.md):
-#   RMLX_TEST_MODEL_GEMMA4_E4B
-#   RMLX_TEST_MODEL_QWEN36
-#   RMLX_TEST_MODEL_BONSAI
-#
-# Skips gracefully when an env var is unset (printed by the test binary).
+# Each cell resolves its snapshot by slug under $RMLX_O_MODELS_ROOT (see
+# docs/TESTING.md) and prints a named SKIP when the root lacks it.
 
 set -euo pipefail
 

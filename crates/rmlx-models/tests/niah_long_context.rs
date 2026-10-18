@@ -8,16 +8,19 @@
 //!
 //! # Models
 //!
-//! Each model is gated by its `RMLX_TEST_MODEL_*` env var (see
-//! `docs/TESTING.md`). When the env var is unset, each of that model's cells
-//! prints `[niah] SKIP` and returns — the suite is green on machines without
-//! snapshots.
+//! Each cell resolves its snapshot by slug under `RMLX_O_MODELS_ROOT`, through
+//! `common::model_slug_first` (see `docs/TESTING.md`). A root without the slug
+//! makes the cell fall back to `RMLX_KV_TEST_MODEL` when it serves the cell's
+//! architecture, else print a named `SKIP` and return — the suite is green on
+//! machines without snapshots.
 //!
 //! Covered models (one `#[test]` per (model, ctx_len, depth) cell):
 //!
-//! - `RMLX_TEST_MODEL_GEMMA4_E4B`  → `Gemma4ForConditionalGeneration`
-//! - `RMLX_TEST_MODEL_QWEN36`      → `Qwen3_5MoeForConditionalGeneration`
-//! - `RMLX_TEST_MODEL_BONSAI`      → `Qwen3ForCausalLM`
+//! - `mlx-community__gemma-4-e4b-it-mxfp8`  → `Gemma4ForConditionalGeneration`
+//! - `mlx-community__Qwen3.6-35B-A3B-8bit`  → `Qwen3_5MoeForConditionalGeneration`
+//! - `mlx-community__Qwen3.8-27B-4bit`      → `Qwen3_5ForConditionalGeneration`
+//! - `prism-ml__Ternary-Bonsai-2-27B-mlx-2bit` → `prism_hadamard_qwen35` (`model_type`)
+//! - `prism-ml__Ternary-Bonsai-8B-mlx-2bit` → `Qwen3ForCausalLM`
 //!
 //! # Modes
 //!
@@ -76,38 +79,41 @@
 )]
 
 mod common;
+#[path = "niah_long_context/needle_watch.rs"]
+mod needle_watch;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use rmlx_kv_quant::KvQuant;
 use rmlx_mlx::Device;
 use rmlx_models::arch;
 use rmlx_models::{Pcg32, PenaltyConfig, SamplerConfig};
 
-// ── Per-model env-var resolution ──────────────────────────────────────────
+// ── Models ────────────────────────────────────────────────────────────────
 
-/// Architectures recognised by this harness. Other archs trigger a skip
-/// (see `skip_if_arch_mismatch`).
-const EXPECTED_ARCHS_GEMMA4: &[&str] = &["Gemma4ForConditionalGeneration"];
-const EXPECTED_ARCHS_QWEN36: &[&str] = &["Qwen3_5MoeForConditionalGeneration"];
-const EXPECTED_ARCHS_BONSAI: &[&str] = &["Qwen3ForCausalLM"];
+// `model_slug` in scripts/release_e2e/stage6_perf/codec_smoke_runner.sh lists the
+// same slugs; change both together.
 
-/// Resolve a model path from an env var. Returns `None` and prints a skip
-/// note when the var is unset or the path does not exist.
-fn model_path(var: &str) -> Option<PathBuf> {
-    if let Ok(p) = std::env::var(var) {
-        let pb = PathBuf::from(&p);
-        if pb.exists() {
-            Some(pb)
-        } else {
-            eprintln!("[niah] SKIP: {var}={p} — path does not exist");
-            None
-        }
-    } else {
-        eprintln!("[niah] SKIP: {var} not set");
-        None
-    }
-}
+const GEMMA4_E4B: common::GoldenModel = common::GoldenModel {
+    slug: "mlx-community__gemma-4-e4b-it-mxfp8",
+    archs: &["Gemma4ForConditionalGeneration"],
+};
+const QWEN3_6_MOE: common::GoldenModel = common::GoldenModel {
+    slug: "mlx-community__Qwen3.6-35B-A3B-8bit",
+    archs: &["Qwen3_5MoeForConditionalGeneration"],
+};
+const QWEN3_8: common::GoldenModel = common::GoldenModel {
+    slug: "mlx-community__Qwen3.8-27B-4bit",
+    archs: &["Qwen3_5ForConditionalGeneration"],
+};
+const BONSAI2: common::GoldenModel = common::GoldenModel {
+    slug: "prism-ml__Ternary-Bonsai-2-27B-mlx-2bit",
+    archs: &["prism_hadamard_qwen35"],
+};
+const BONSAI: common::GoldenModel = common::GoldenModel {
+    slug: "prism-ml__Ternary-Bonsai-8B-mlx-2bit",
+    archs: &["Qwen3ForCausalLM"],
+};
 
 // ── Needle + haystack construction ────────────────────────────────────────
 
@@ -223,10 +229,11 @@ fn resolve_bos(model_dir: &Path, tk: &tokenizers::Tokenizer) -> Option<u32> {
 
 // ── Test runner ───────────────────────────────────────────────────────────
 
-/// Number of decode tokens to emit. Short answers (the needle is 19 chars,
-/// roughly 8–12 tokens) — keep this modest so 32k-ctx tests stay tractable
-/// (each decode step is one full attention pass over the full KV cache).
-const N_DECODE_TOKENS: usize = 64;
+/// Most decode tokens a cell may emit. A model that answers at once ends the
+/// decode at the needle, so the budget costs nothing there. A thinking model
+/// reasons first: Qwen3.8 and Bonsai 2 state the needle after 79 to 108 tokens
+/// at 8k and 32k, and 512 leaves several times that.
+const N_DECODE_TOKENS: usize = 512;
 
 /// Verdict for one cell.
 #[derive(Debug)]
@@ -256,7 +263,6 @@ fn run_one(
     kind: FlashKind,
 ) -> NiahResult {
     let device = Device::Gpu;
-    common::release_cached_buffers();
     let model =
         arch::load_model(model_path, device, &arch::LoadOpts::default()).expect("arch::load_model");
     let tk_path = model_path.join("tokenizer.json");
@@ -312,30 +318,42 @@ fn run_one(
     let penalty_cfg = PenaltyConfig::default();
     let mut token_history: Vec<u32> = Vec::new();
 
-    let steps = model
-        .generate_greedy(
-            &tokenizer,
-            &prompt_ids,
-            N_DECODE_TOKENS,
-            device,
-            Some(kv_quant),
-            Some(max_ctx),
-            1,
-            &[],
-            &mut |_| None,
-            None,
-            &sampler_cfg,
-            &mut rng,
-            &penalty_cfg,
-            &mut token_history,
-            &std::sync::atomic::AtomicBool::new(false),
-        )
-        .expect("generate_greedy");
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let mut watch = needle_watch::NeedleWatch::new(&tokenizer, NEEDLE);
+    let mut stop_at_needle = |step: &rmlx_models::ProbeStep| {
+        if watch.push(step.token_id) {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        None
+    };
 
-    let token_ids: Vec<u32> = steps.iter().map(|s| s.token_id).collect();
-    let decoded: String = tokenizer
-        .decode(&token_ids, false)
-        .unwrap_or_else(|_| steps.iter().map(|s| s.piece.as_ref()).collect());
+    let generated = model.generate_greedy(
+        &tokenizer,
+        &prompt_ids,
+        N_DECODE_TOKENS,
+        device,
+        Some(kv_quant),
+        Some(max_ctx),
+        1,
+        &[],
+        &mut stop_at_needle,
+        None,
+        &sampler_cfg,
+        &mut rng,
+        &penalty_cfg,
+        &mut token_history,
+        &cancel,
+    );
+    // The watch cancels the decode at the needle, which the loop reports as an
+    // error; the tokens it collected are the output.
+    match generated {
+        Ok(_) => {}
+        Err(rmlx_core::Error::Cancelled) if watch.found() => {}
+        Err(err) => panic!("generate_greedy: {err}"),
+    }
+
+    let token_ids = watch.into_ids();
+    let decoded: String = tokenizer.decode(&token_ids, false).expect("decode");
 
     let needle_found = decoded.contains(NEEDLE);
     NiahResult {
@@ -379,24 +397,10 @@ enum FlashRouting {
     Dormant,
 }
 
-fn run_cell(model_path: &Path, ctx: usize, depth: f32, routing: FlashRouting) {
-    run_cell_kind(model_path, ctx, depth, routing, FlashKind::Turbo);
-}
-
-/// Entry point for planar_flash_decode cells. Same retrieval +
-/// dispatch-counter contract as the TurboFlash cells, but consults the
-/// `planar_flash_decode` OnceLock + counter and forces `KvQuant::PlanarK`.
-fn run_pflash_cell(model_path: &Path, ctx: usize, depth: f32, routing: FlashRouting) {
-    run_cell_kind(model_path, ctx, depth, routing, FlashKind::Pflash);
-}
-
-fn run_cell_kind(
-    model_path: &Path,
-    ctx: usize,
-    depth: f32,
-    routing: FlashRouting,
-    kind: FlashKind,
-) {
+/// One cell: retrieval plus the dispatch-counter contract of `kind`'s kernel.
+/// Pflash cells consult the `planar_flash_decode` counter and force
+/// `KvQuant::PlanarK`.
+fn run_cell(model_path: &Path, ctx: usize, depth: f32, routing: FlashRouting, kind: FlashKind) {
     // The mode label reads the same policy the decode path dispatches on —
     // the process default, which is what a cache built by this harness
     // captures — so the label cannot drift from the gate.
@@ -527,15 +531,14 @@ fn run_cell_kind(
 // own `#[test]` so a single failure is localised in the report.
 
 macro_rules! niah_cell {
-    ($name:ident, $env:literal, $expected_archs:expr, $routing:expr, $ctx:expr, $depth:expr) => {
+    ($name:ident, $model:expr, $kind:expr, $routing:expr, $ctx:expr, $depth:expr) => {
         #[ignore]
         #[test]
         fn $name() {
-            let Some(p) = model_path($env) else { return };
-            if common::skip_if_arch_mismatch(&p, stringify!($name), $expected_archs) {
+            let Some(p) = common::model_slug_first(&$model, stringify!($name)) else {
                 return;
-            }
-            run_cell(&p, $ctx, $depth, $routing);
+            };
+            run_cell(&p, $ctx, $depth, $routing, $kind);
         }
     };
 }
@@ -547,40 +550,40 @@ macro_rules! niah_cell {
 
 niah_cell!(
     niah_bonsai_8k_d10,
-    "RMLX_TEST_MODEL_BONSAI",
-    EXPECTED_ARCHS_BONSAI,
+    BONSAI,
+    FlashKind::Turbo,
     FlashRouting::Reachable,
     8_192,
     0.10
 );
 niah_cell!(
     niah_bonsai_8k_d30,
-    "RMLX_TEST_MODEL_BONSAI",
-    EXPECTED_ARCHS_BONSAI,
+    BONSAI,
+    FlashKind::Turbo,
     FlashRouting::Reachable,
     8_192,
     0.30
 );
 niah_cell!(
     niah_bonsai_8k_d50,
-    "RMLX_TEST_MODEL_BONSAI",
-    EXPECTED_ARCHS_BONSAI,
+    BONSAI,
+    FlashKind::Turbo,
     FlashRouting::Reachable,
     8_192,
     0.50
 );
 niah_cell!(
     niah_bonsai_8k_d70,
-    "RMLX_TEST_MODEL_BONSAI",
-    EXPECTED_ARCHS_BONSAI,
+    BONSAI,
+    FlashKind::Turbo,
     FlashRouting::Reachable,
     8_192,
     0.70
 );
 niah_cell!(
     niah_bonsai_8k_d90,
-    "RMLX_TEST_MODEL_BONSAI",
-    EXPECTED_ARCHS_BONSAI,
+    BONSAI,
+    FlashKind::Turbo,
     FlashRouting::Reachable,
     8_192,
     0.90
@@ -588,40 +591,40 @@ niah_cell!(
 
 niah_cell!(
     niah_bonsai_16k_d10,
-    "RMLX_TEST_MODEL_BONSAI",
-    EXPECTED_ARCHS_BONSAI,
+    BONSAI,
+    FlashKind::Turbo,
     FlashRouting::Reachable,
     16_384,
     0.10
 );
 niah_cell!(
     niah_bonsai_16k_d30,
-    "RMLX_TEST_MODEL_BONSAI",
-    EXPECTED_ARCHS_BONSAI,
+    BONSAI,
+    FlashKind::Turbo,
     FlashRouting::Reachable,
     16_384,
     0.30
 );
 niah_cell!(
     niah_bonsai_16k_d50,
-    "RMLX_TEST_MODEL_BONSAI",
-    EXPECTED_ARCHS_BONSAI,
+    BONSAI,
+    FlashKind::Turbo,
     FlashRouting::Reachable,
     16_384,
     0.50
 );
 niah_cell!(
     niah_bonsai_16k_d70,
-    "RMLX_TEST_MODEL_BONSAI",
-    EXPECTED_ARCHS_BONSAI,
+    BONSAI,
+    FlashKind::Turbo,
     FlashRouting::Reachable,
     16_384,
     0.70
 );
 niah_cell!(
     niah_bonsai_16k_d90,
-    "RMLX_TEST_MODEL_BONSAI",
-    EXPECTED_ARCHS_BONSAI,
+    BONSAI,
+    FlashKind::Turbo,
     FlashRouting::Reachable,
     16_384,
     0.90
@@ -634,40 +637,40 @@ niah_cell!(
 // mirror the 16k cells.
 niah_cell!(
     niah_bonsai_32k_d10,
-    "RMLX_TEST_MODEL_BONSAI",
-    EXPECTED_ARCHS_BONSAI,
+    BONSAI,
+    FlashKind::Turbo,
     FlashRouting::Reachable,
     32_768,
     0.10
 );
 niah_cell!(
     niah_bonsai_32k_d30,
-    "RMLX_TEST_MODEL_BONSAI",
-    EXPECTED_ARCHS_BONSAI,
+    BONSAI,
+    FlashKind::Turbo,
     FlashRouting::Reachable,
     32_768,
     0.30
 );
 niah_cell!(
     niah_bonsai_32k_d50,
-    "RMLX_TEST_MODEL_BONSAI",
-    EXPECTED_ARCHS_BONSAI,
+    BONSAI,
+    FlashKind::Turbo,
     FlashRouting::Reachable,
     32_768,
     0.50
 );
 niah_cell!(
     niah_bonsai_32k_d70,
-    "RMLX_TEST_MODEL_BONSAI",
-    EXPECTED_ARCHS_BONSAI,
+    BONSAI,
+    FlashKind::Turbo,
     FlashRouting::Reachable,
     32_768,
     0.70
 );
 niah_cell!(
     niah_bonsai_32k_d90,
-    "RMLX_TEST_MODEL_BONSAI",
-    EXPECTED_ARCHS_BONSAI,
+    BONSAI,
+    FlashKind::Turbo,
     FlashRouting::Reachable,
     32_768,
     0.90
@@ -677,40 +680,40 @@ niah_cell!(
 
 niah_cell!(
     niah_gemma4_8k_d10,
-    "RMLX_TEST_MODEL_GEMMA4_E4B",
-    EXPECTED_ARCHS_GEMMA4,
+    GEMMA4_E4B,
+    FlashKind::Turbo,
     FlashRouting::Dormant,
     8_192,
     0.10
 );
 niah_cell!(
     niah_gemma4_8k_d30,
-    "RMLX_TEST_MODEL_GEMMA4_E4B",
-    EXPECTED_ARCHS_GEMMA4,
+    GEMMA4_E4B,
+    FlashKind::Turbo,
     FlashRouting::Dormant,
     8_192,
     0.30
 );
 niah_cell!(
     niah_gemma4_8k_d50,
-    "RMLX_TEST_MODEL_GEMMA4_E4B",
-    EXPECTED_ARCHS_GEMMA4,
+    GEMMA4_E4B,
+    FlashKind::Turbo,
     FlashRouting::Dormant,
     8_192,
     0.50
 );
 niah_cell!(
     niah_gemma4_8k_d70,
-    "RMLX_TEST_MODEL_GEMMA4_E4B",
-    EXPECTED_ARCHS_GEMMA4,
+    GEMMA4_E4B,
+    FlashKind::Turbo,
     FlashRouting::Dormant,
     8_192,
     0.70
 );
 niah_cell!(
     niah_gemma4_8k_d90,
-    "RMLX_TEST_MODEL_GEMMA4_E4B",
-    EXPECTED_ARCHS_GEMMA4,
+    GEMMA4_E4B,
+    FlashKind::Turbo,
     FlashRouting::Dormant,
     8_192,
     0.90
@@ -718,40 +721,40 @@ niah_cell!(
 
 niah_cell!(
     niah_gemma4_16k_d10,
-    "RMLX_TEST_MODEL_GEMMA4_E4B",
-    EXPECTED_ARCHS_GEMMA4,
+    GEMMA4_E4B,
+    FlashKind::Turbo,
     FlashRouting::Dormant,
     16_384,
     0.10
 );
 niah_cell!(
     niah_gemma4_16k_d30,
-    "RMLX_TEST_MODEL_GEMMA4_E4B",
-    EXPECTED_ARCHS_GEMMA4,
+    GEMMA4_E4B,
+    FlashKind::Turbo,
     FlashRouting::Dormant,
     16_384,
     0.30
 );
 niah_cell!(
     niah_gemma4_16k_d50,
-    "RMLX_TEST_MODEL_GEMMA4_E4B",
-    EXPECTED_ARCHS_GEMMA4,
+    GEMMA4_E4B,
+    FlashKind::Turbo,
     FlashRouting::Dormant,
     16_384,
     0.50
 );
 niah_cell!(
     niah_gemma4_16k_d70,
-    "RMLX_TEST_MODEL_GEMMA4_E4B",
-    EXPECTED_ARCHS_GEMMA4,
+    GEMMA4_E4B,
+    FlashKind::Turbo,
     FlashRouting::Dormant,
     16_384,
     0.70
 );
 niah_cell!(
     niah_gemma4_16k_d90,
-    "RMLX_TEST_MODEL_GEMMA4_E4B",
-    EXPECTED_ARCHS_GEMMA4,
+    GEMMA4_E4B,
+    FlashKind::Turbo,
     FlashRouting::Dormant,
     16_384,
     0.90
@@ -759,40 +762,40 @@ niah_cell!(
 
 niah_cell!(
     niah_gemma4_32k_d10,
-    "RMLX_TEST_MODEL_GEMMA4_E4B",
-    EXPECTED_ARCHS_GEMMA4,
+    GEMMA4_E4B,
+    FlashKind::Turbo,
     FlashRouting::Dormant,
     32_768,
     0.10
 );
 niah_cell!(
     niah_gemma4_32k_d30,
-    "RMLX_TEST_MODEL_GEMMA4_E4B",
-    EXPECTED_ARCHS_GEMMA4,
+    GEMMA4_E4B,
+    FlashKind::Turbo,
     FlashRouting::Dormant,
     32_768,
     0.30
 );
 niah_cell!(
     niah_gemma4_32k_d50,
-    "RMLX_TEST_MODEL_GEMMA4_E4B",
-    EXPECTED_ARCHS_GEMMA4,
+    GEMMA4_E4B,
+    FlashKind::Turbo,
     FlashRouting::Dormant,
     32_768,
     0.50
 );
 niah_cell!(
     niah_gemma4_32k_d70,
-    "RMLX_TEST_MODEL_GEMMA4_E4B",
-    EXPECTED_ARCHS_GEMMA4,
+    GEMMA4_E4B,
+    FlashKind::Turbo,
     FlashRouting::Dormant,
     32_768,
     0.70
 );
 niah_cell!(
     niah_gemma4_32k_d90,
-    "RMLX_TEST_MODEL_GEMMA4_E4B",
-    EXPECTED_ARCHS_GEMMA4,
+    GEMMA4_E4B,
+    FlashKind::Turbo,
     FlashRouting::Dormant,
     32_768,
     0.90
@@ -802,40 +805,40 @@ niah_cell!(
 
 niah_cell!(
     niah_qwen36_8k_d10,
-    "RMLX_TEST_MODEL_QWEN36",
-    EXPECTED_ARCHS_QWEN36,
+    QWEN3_6_MOE,
+    FlashKind::Turbo,
     FlashRouting::Reachable,
     8_192,
     0.10
 );
 niah_cell!(
     niah_qwen36_8k_d30,
-    "RMLX_TEST_MODEL_QWEN36",
-    EXPECTED_ARCHS_QWEN36,
+    QWEN3_6_MOE,
+    FlashKind::Turbo,
     FlashRouting::Reachable,
     8_192,
     0.30
 );
 niah_cell!(
     niah_qwen36_8k_d50,
-    "RMLX_TEST_MODEL_QWEN36",
-    EXPECTED_ARCHS_QWEN36,
+    QWEN3_6_MOE,
+    FlashKind::Turbo,
     FlashRouting::Reachable,
     8_192,
     0.50
 );
 niah_cell!(
     niah_qwen36_8k_d70,
-    "RMLX_TEST_MODEL_QWEN36",
-    EXPECTED_ARCHS_QWEN36,
+    QWEN3_6_MOE,
+    FlashKind::Turbo,
     FlashRouting::Reachable,
     8_192,
     0.70
 );
 niah_cell!(
     niah_qwen36_8k_d90,
-    "RMLX_TEST_MODEL_QWEN36",
-    EXPECTED_ARCHS_QWEN36,
+    QWEN3_6_MOE,
+    FlashKind::Turbo,
     FlashRouting::Reachable,
     8_192,
     0.90
@@ -843,40 +846,40 @@ niah_cell!(
 
 niah_cell!(
     niah_qwen36_16k_d10,
-    "RMLX_TEST_MODEL_QWEN36",
-    EXPECTED_ARCHS_QWEN36,
+    QWEN3_6_MOE,
+    FlashKind::Turbo,
     FlashRouting::Reachable,
     16_384,
     0.10
 );
 niah_cell!(
     niah_qwen36_16k_d30,
-    "RMLX_TEST_MODEL_QWEN36",
-    EXPECTED_ARCHS_QWEN36,
+    QWEN3_6_MOE,
+    FlashKind::Turbo,
     FlashRouting::Reachable,
     16_384,
     0.30
 );
 niah_cell!(
     niah_qwen36_16k_d50,
-    "RMLX_TEST_MODEL_QWEN36",
-    EXPECTED_ARCHS_QWEN36,
+    QWEN3_6_MOE,
+    FlashKind::Turbo,
     FlashRouting::Reachable,
     16_384,
     0.50
 );
 niah_cell!(
     niah_qwen36_16k_d70,
-    "RMLX_TEST_MODEL_QWEN36",
-    EXPECTED_ARCHS_QWEN36,
+    QWEN3_6_MOE,
+    FlashKind::Turbo,
     FlashRouting::Reachable,
     16_384,
     0.70
 );
 niah_cell!(
     niah_qwen36_16k_d90,
-    "RMLX_TEST_MODEL_QWEN36",
-    EXPECTED_ARCHS_QWEN36,
+    QWEN3_6_MOE,
+    FlashKind::Turbo,
     FlashRouting::Reachable,
     16_384,
     0.90
@@ -884,40 +887,215 @@ niah_cell!(
 
 niah_cell!(
     niah_qwen36_32k_d10,
-    "RMLX_TEST_MODEL_QWEN36",
-    EXPECTED_ARCHS_QWEN36,
+    QWEN3_6_MOE,
+    FlashKind::Turbo,
     FlashRouting::Reachable,
     32_768,
     0.10
 );
 niah_cell!(
     niah_qwen36_32k_d30,
-    "RMLX_TEST_MODEL_QWEN36",
-    EXPECTED_ARCHS_QWEN36,
+    QWEN3_6_MOE,
+    FlashKind::Turbo,
     FlashRouting::Reachable,
     32_768,
     0.30
 );
 niah_cell!(
     niah_qwen36_32k_d50,
-    "RMLX_TEST_MODEL_QWEN36",
-    EXPECTED_ARCHS_QWEN36,
+    QWEN3_6_MOE,
+    FlashKind::Turbo,
     FlashRouting::Reachable,
     32_768,
     0.50
 );
 niah_cell!(
     niah_qwen36_32k_d70,
-    "RMLX_TEST_MODEL_QWEN36",
-    EXPECTED_ARCHS_QWEN36,
+    QWEN3_6_MOE,
+    FlashKind::Turbo,
     FlashRouting::Reachable,
     32_768,
     0.70
 );
 niah_cell!(
     niah_qwen36_32k_d90,
-    "RMLX_TEST_MODEL_QWEN36",
-    EXPECTED_ARCHS_QWEN36,
+    QWEN3_6_MOE,
+    FlashKind::Turbo,
+    FlashRouting::Reachable,
+    32_768,
+    0.90
+);
+
+// ── Qwen3.8 27B (dense Qwen3.5 hybrid) ───────────────────────────────────
+//
+// 16 full-attention layers with head_dim 256 and 24 / 4 heads reach
+// `KvCache::update_and_sdpa` through the same attention as Qwen3.6 and pass
+// the TurboFlash shape gate, so the kernel must dispatch.
+
+niah_cell!(
+    niah_qwen38_8k_d10,
+    QWEN3_8,
+    FlashKind::Turbo,
+    FlashRouting::Reachable,
+    8_192,
+    0.10
+);
+niah_cell!(
+    niah_qwen38_8k_d30,
+    QWEN3_8,
+    FlashKind::Turbo,
+    FlashRouting::Reachable,
+    8_192,
+    0.30
+);
+niah_cell!(
+    niah_qwen38_8k_d50,
+    QWEN3_8,
+    FlashKind::Turbo,
+    FlashRouting::Reachable,
+    8_192,
+    0.50
+);
+niah_cell!(
+    niah_qwen38_8k_d70,
+    QWEN3_8,
+    FlashKind::Turbo,
+    FlashRouting::Reachable,
+    8_192,
+    0.70
+);
+niah_cell!(
+    niah_qwen38_8k_d90,
+    QWEN3_8,
+    FlashKind::Turbo,
+    FlashRouting::Reachable,
+    8_192,
+    0.90
+);
+
+niah_cell!(
+    niah_qwen38_16k_d10,
+    QWEN3_8,
+    FlashKind::Turbo,
+    FlashRouting::Reachable,
+    16_384,
+    0.10
+);
+niah_cell!(
+    niah_qwen38_16k_d30,
+    QWEN3_8,
+    FlashKind::Turbo,
+    FlashRouting::Reachable,
+    16_384,
+    0.30
+);
+niah_cell!(
+    niah_qwen38_16k_d50,
+    QWEN3_8,
+    FlashKind::Turbo,
+    FlashRouting::Reachable,
+    16_384,
+    0.50
+);
+niah_cell!(
+    niah_qwen38_16k_d70,
+    QWEN3_8,
+    FlashKind::Turbo,
+    FlashRouting::Reachable,
+    16_384,
+    0.70
+);
+niah_cell!(
+    niah_qwen38_16k_d90,
+    QWEN3_8,
+    FlashKind::Turbo,
+    FlashRouting::Reachable,
+    16_384,
+    0.90
+);
+
+niah_cell!(
+    niah_qwen38_32k_d10,
+    QWEN3_8,
+    FlashKind::Turbo,
+    FlashRouting::Reachable,
+    32_768,
+    0.10
+);
+niah_cell!(
+    niah_qwen38_32k_d30,
+    QWEN3_8,
+    FlashKind::Turbo,
+    FlashRouting::Reachable,
+    32_768,
+    0.30
+);
+niah_cell!(
+    niah_qwen38_32k_d50,
+    QWEN3_8,
+    FlashKind::Turbo,
+    FlashRouting::Reachable,
+    32_768,
+    0.50
+);
+niah_cell!(
+    niah_qwen38_32k_d70,
+    QWEN3_8,
+    FlashKind::Turbo,
+    FlashRouting::Reachable,
+    32_768,
+    0.70
+);
+niah_cell!(
+    niah_qwen38_32k_d90,
+    QWEN3_8,
+    FlashKind::Turbo,
+    FlashRouting::Reachable,
+    32_768,
+    0.90
+);
+
+// ── Bonsai 2 27B (Hadamard-packed dense Qwen3.5 hybrid) ──────────────────
+//
+// Same attention shape as Qwen3.8 (16 full-attention layers, head_dim 256,
+// 24 / 4 heads), so TurboFlash must dispatch. The matrix runs 32k only.
+
+niah_cell!(
+    niah_bonsai2_32k_d10,
+    BONSAI2,
+    FlashKind::Turbo,
+    FlashRouting::Reachable,
+    32_768,
+    0.10
+);
+niah_cell!(
+    niah_bonsai2_32k_d30,
+    BONSAI2,
+    FlashKind::Turbo,
+    FlashRouting::Reachable,
+    32_768,
+    0.30
+);
+niah_cell!(
+    niah_bonsai2_32k_d50,
+    BONSAI2,
+    FlashKind::Turbo,
+    FlashRouting::Reachable,
+    32_768,
+    0.50
+);
+niah_cell!(
+    niah_bonsai2_32k_d70,
+    BONSAI2,
+    FlashKind::Turbo,
+    FlashRouting::Reachable,
+    32_768,
+    0.70
+);
+niah_cell!(
+    niah_bonsai2_32k_d90,
+    BONSAI2,
+    FlashKind::Turbo,
     FlashRouting::Reachable,
     32_768,
     0.90
@@ -926,9 +1104,9 @@ niah_cell!(
 // ── planar_flash_decode NIAH cells ───────────────────────────────────────
 //
 // Mirrors the TurboFlash cells above but exercises the `planar_flash_decode`
-// MSL kernel + the planar_fused_qk PlanarK chain. Two-step macro because the
-// cells use `KvQuant::PlanarK` (not K8V4) and consult a different env-var /
-// dispatch counter — see `FlashKind::Pflash`.
+// MSL kernel + the planar_fused_qk PlanarK chain. These cells use
+// `KvQuant::PlanarK` (not K8V4) and consult a different env-var / dispatch
+// counter — see `FlashKind::Pflash`.
 //
 // Routing:
 // - Bonsai (`Qwen3ForCausalLM`)              → Reachable. Routes through
@@ -945,99 +1123,85 @@ niah_cell!(
 // Bonsai max-pos = 16k (no YARN), so cells cap at 16k — matches the existing
 // TurboFlash Bonsai cells.
 
-macro_rules! niah_pflash_cell {
-    ($name:ident, $env:literal, $expected_archs:expr, $routing:expr, $ctx:expr, $depth:expr) => {
-        #[ignore]
-        #[test]
-        fn $name() {
-            let Some(p) = model_path($env) else { return };
-            if common::skip_if_arch_mismatch(&p, stringify!($name), $expected_archs) {
-                return;
-            }
-            run_pflash_cell(&p, $ctx, $depth, $routing);
-        }
-    };
-}
-
 // ── Bonsai (Qwen3) — Reachable. 8k + 16k × 5 depths. ─────────────────────
 
-niah_pflash_cell!(
+niah_cell!(
     niah_pflash_bonsai_8k_d10,
-    "RMLX_TEST_MODEL_BONSAI",
-    EXPECTED_ARCHS_BONSAI,
+    BONSAI,
+    FlashKind::Pflash,
     FlashRouting::Reachable,
     8_192,
     0.10
 );
-niah_pflash_cell!(
+niah_cell!(
     niah_pflash_bonsai_8k_d30,
-    "RMLX_TEST_MODEL_BONSAI",
-    EXPECTED_ARCHS_BONSAI,
+    BONSAI,
+    FlashKind::Pflash,
     FlashRouting::Reachable,
     8_192,
     0.30
 );
-niah_pflash_cell!(
+niah_cell!(
     niah_pflash_bonsai_8k_d50,
-    "RMLX_TEST_MODEL_BONSAI",
-    EXPECTED_ARCHS_BONSAI,
+    BONSAI,
+    FlashKind::Pflash,
     FlashRouting::Reachable,
     8_192,
     0.50
 );
-niah_pflash_cell!(
+niah_cell!(
     niah_pflash_bonsai_8k_d70,
-    "RMLX_TEST_MODEL_BONSAI",
-    EXPECTED_ARCHS_BONSAI,
+    BONSAI,
+    FlashKind::Pflash,
     FlashRouting::Reachable,
     8_192,
     0.70
 );
-niah_pflash_cell!(
+niah_cell!(
     niah_pflash_bonsai_8k_d90,
-    "RMLX_TEST_MODEL_BONSAI",
-    EXPECTED_ARCHS_BONSAI,
+    BONSAI,
+    FlashKind::Pflash,
     FlashRouting::Reachable,
     8_192,
     0.90
 );
 
-niah_pflash_cell!(
+niah_cell!(
     niah_pflash_bonsai_16k_d10,
-    "RMLX_TEST_MODEL_BONSAI",
-    EXPECTED_ARCHS_BONSAI,
+    BONSAI,
+    FlashKind::Pflash,
     FlashRouting::Reachable,
     16_384,
     0.10
 );
-niah_pflash_cell!(
+niah_cell!(
     niah_pflash_bonsai_16k_d30,
-    "RMLX_TEST_MODEL_BONSAI",
-    EXPECTED_ARCHS_BONSAI,
+    BONSAI,
+    FlashKind::Pflash,
     FlashRouting::Reachable,
     16_384,
     0.30
 );
-niah_pflash_cell!(
+niah_cell!(
     niah_pflash_bonsai_16k_d50,
-    "RMLX_TEST_MODEL_BONSAI",
-    EXPECTED_ARCHS_BONSAI,
+    BONSAI,
+    FlashKind::Pflash,
     FlashRouting::Reachable,
     16_384,
     0.50
 );
-niah_pflash_cell!(
+niah_cell!(
     niah_pflash_bonsai_16k_d70,
-    "RMLX_TEST_MODEL_BONSAI",
-    EXPECTED_ARCHS_BONSAI,
+    BONSAI,
+    FlashKind::Pflash,
     FlashRouting::Reachable,
     16_384,
     0.70
 );
-niah_pflash_cell!(
+niah_cell!(
     niah_pflash_bonsai_16k_d90,
-    "RMLX_TEST_MODEL_BONSAI",
-    EXPECTED_ARCHS_BONSAI,
+    BONSAI,
+    FlashKind::Pflash,
     FlashRouting::Reachable,
     16_384,
     0.90
@@ -1046,30 +1210,30 @@ niah_pflash_cell!(
 // ── Qwen3.6 35B-A3B — Dormant. PlanarK rejected at validate_resolved
 //   (`QwenMoePlanarKRejected`). The resolve failure panics inside
 //   `generate_greedy` before the dispatch-counter assertion runs. None of
-//   these cells carries `#[should_panic]`, so with `RMLX_TEST_MODEL_QWEN36`
-//   set the panic FAILS the test rather than confirming the rejection —
+//   these cells carries `#[should_panic]`, so on a host holding the snapshot
+//   the panic FAILS the test rather than confirming the rejection —
 //   these cells confirm nothing. ─────────────────────────────────────────
 
-niah_pflash_cell!(
+niah_cell!(
     niah_pflash_qwen36_32k_d10,
-    "RMLX_TEST_MODEL_QWEN36",
-    EXPECTED_ARCHS_QWEN36,
+    QWEN3_6_MOE,
+    FlashKind::Pflash,
     FlashRouting::Dormant,
     32_768,
     0.10
 );
-niah_pflash_cell!(
+niah_cell!(
     niah_pflash_qwen36_32k_d50,
-    "RMLX_TEST_MODEL_QWEN36",
-    EXPECTED_ARCHS_QWEN36,
+    QWEN3_6_MOE,
+    FlashKind::Pflash,
     FlashRouting::Dormant,
     32_768,
     0.50
 );
-niah_pflash_cell!(
+niah_cell!(
     niah_pflash_qwen36_32k_d90,
-    "RMLX_TEST_MODEL_QWEN36",
-    EXPECTED_ARCHS_QWEN36,
+    QWEN3_6_MOE,
+    FlashKind::Pflash,
     FlashRouting::Dormant,
     32_768,
     0.90
@@ -1079,26 +1243,26 @@ niah_pflash_cell!(
 //   `update_and_sdpa_shared_source`; the warm-TTFT bf16-K-seed gate is what
 //   keeps the kernel dormant. ──────────────────────────────────────────
 
-niah_pflash_cell!(
+niah_cell!(
     niah_pflash_gemma4_32k_d10,
-    "RMLX_TEST_MODEL_GEMMA4_E4B",
-    EXPECTED_ARCHS_GEMMA4,
+    GEMMA4_E4B,
+    FlashKind::Pflash,
     FlashRouting::Dormant,
     32_768,
     0.10
 );
-niah_pflash_cell!(
+niah_cell!(
     niah_pflash_gemma4_32k_d50,
-    "RMLX_TEST_MODEL_GEMMA4_E4B",
-    EXPECTED_ARCHS_GEMMA4,
+    GEMMA4_E4B,
+    FlashKind::Pflash,
     FlashRouting::Dormant,
     32_768,
     0.50
 );
-niah_pflash_cell!(
+niah_cell!(
     niah_pflash_gemma4_32k_d90,
-    "RMLX_TEST_MODEL_GEMMA4_E4B",
-    EXPECTED_ARCHS_GEMMA4,
+    GEMMA4_E4B,
+    FlashKind::Pflash,
     FlashRouting::Dormant,
     32_768,
     0.90

@@ -1045,6 +1045,120 @@ request = "thinking"
 assert = { kind = "thinking" }
 tags = ["run2c", "qwen36", "thinking"]
 
+# ── Qwen3.8-27B-4bit (4-bit affine, dense Qwen3.5 hybrid, 24 query heads over 4 KV heads) ──
+# The dense counterparts of the Qwen3.6 cells above, plus no refusal cases: the
+# K-side codec guard is MoE-only.
+
+[[case]]
+id = "p2c_qwen38_golden"
+feature = "broader_models"
+subfeature = "Qwen3.8-27B / text-core golden (temp=0)"
+model = "mlx-community__Qwen3.8-27B-4bit"
+serve_flags = []
+request = "chat_basic"
+assert = { kind = "golden", expect = "Paris" }
+tags = ["run2c", "qwen38", "text"]
+
+[[case]]
+id = "p2c_qwen38_stream"
+feature = "broader_models"
+subfeature = "Qwen3.8-27B / chat stream coherent"
+model = "mlx-community__Qwen3.8-27B-4bit"
+serve_flags = []
+request = "chat_stream"
+assert = { kind = "contains_coherent", expect = "Paris" }
+tags = ["run2c", "qwen38", "text"]
+
+[[case]]
+id = "p2c_qwen38_k8v8_niah"
+feature = "broader_models"
+subfeature = "Qwen3.8-27B / k8v8 niah@8k"
+model = "mlx-community__Qwen3.8-27B-4bit"
+kv_quant = "k8v8"
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run2c", "qwen38", "quant"]
+
+[[case]]
+id = "p2c_qwen38_k8v8_cosine"
+feature = "broader_models"
+subfeature = "Qwen3.8-27B / k8v8 cosine"
+model = "mlx-community__Qwen3.8-27B-4bit"
+kv_quant = "k8v8"
+request = "chat_logprobs"
+assert = { kind = "cosine_vs_bf16", min_cosine = 0.99 }
+tags = ["run2c", "qwen38", "quant"]
+
+[[case]]
+id = "p2c_qwen38_k8v4_niah"
+feature = "broader_models"
+subfeature = "Qwen3.8-27B / k8v4 niah@8k"
+model = "mlx-community__Qwen3.8-27B-4bit"
+kv_quant = "k8v4"
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run2c", "qwen38", "quant"]
+
+[[case]]
+id = "p2c_qwen38_k8v4_cosine"
+feature = "broader_models"
+subfeature = "Qwen3.8-27B / k8v4 cosine"
+model = "mlx-community__Qwen3.8-27B-4bit"
+kv_quant = "k8v4"
+request = "chat_logprobs"
+assert = { kind = "cosine_vs_bf16", min_cosine = 0.99 }
+tags = ["run2c", "qwen38", "quant"]
+
+[[case]]
+id = "p2c_qwen38_planar_niah"
+feature = "broader_models"
+subfeature = "Qwen3.8-27B / planar niah@8k"
+model = "mlx-community__Qwen3.8-27B-4bit"
+kv_quant = "planar"
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run2c", "qwen38", "quant"]
+
+[[case]]
+id = "p2c_qwen38_planar_cosine"
+feature = "broader_models"
+subfeature = "Qwen3.8-27B / planar cosine"
+model = "mlx-community__Qwen3.8-27B-4bit"
+kv_quant = "planar"
+request = "chat_logprobs"
+assert = { kind = "cosine_vs_bf16", min_cosine = 0.99 }
+tags = ["run2c", "qwen38", "quant"]
+
+[[case]]
+id = "p2c_qwen38_iso3_niah"
+feature = "broader_models"
+subfeature = "Qwen3.8-27B / iso3 niah@8k"
+model = "mlx-community__Qwen3.8-27B-4bit"
+kv_quant = "iso3"
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run2c", "qwen38", "quant"]
+
+[[case]]
+id = "p2c_qwen38_iso3_cosine"
+feature = "broader_models"
+subfeature = "Qwen3.8-27B / iso3 cosine"
+model = "mlx-community__Qwen3.8-27B-4bit"
+kv_quant = "iso3"
+request = "chat_logprobs"
+assert = { kind = "cosine_vs_bf16", min_cosine = 0.99 }
+tags = ["run2c", "qwen38", "quant"]
+
+[[case]]
+id = "p2c_qwen38_thinking"
+feature = "broader_models"
+subfeature = "Qwen3.8-27B / enable_thinking (reasoning_content + answer)"
+model = "mlx-community__Qwen3.8-27B-4bit"
+serve_flags = []
+request = "thinking"
+assert = { kind = "thinking" }
+tags = ["run2c", "qwen38", "thinking"]
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Big-Gemma4 text-core proof: gemma-4-26b-a4b (MoE, 128 experts) +
 # gemma-4-31b (dense, 60 layers). Both Gemma4ForConditionalGeneration,
@@ -1257,6 +1371,26 @@ draft_model = "sahilchachra__ornith-1.0-9b-mxfp8-mlx"
 assert = { kind = "spec_decode", expect = "Paris" }
 tags = ["run2e", "qwen38", "speculative"]
 
+[[case]]
+id = "p2e_qwen38_mtp"
+feature = "speculative"
+subfeature = "Qwen3.8-27B / MTP sidecar drafter — round-loop fires + coherent"
+model = "mlx-community__Qwen3.8-27B-4bit"
+draft_model = "mlx-community__Qwen3.8-27B-MTP-4bit"
+draft_kind = "mtp"
+assert = { kind = "spec_decode", expect = "Paris" }
+tags = ["run2e", "qwen38", "speculative"]
+
+[[case]]
+id = "p2e_qwen38_dflash2"
+feature = "speculative"
+subfeature = "Qwen3.8-27B / DFlash2 drafter — round-loop fires + coherent"
+model = "mlx-community__Qwen3.8-27B-4bit"
+draft_model = "z-lab__Qwen3.8-27B-DFlash2"
+draft_kind = "dflash2"
+assert = { kind = "spec_decode", expect = "Paris" }
+tags = ["run2e", "qwen38", "speculative"]
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Modalities + agent surface (LIVE). Image input (vision tower) and
 # function/tool-calling, the two heavy-use agent paths. Real models, real
@@ -1282,6 +1416,16 @@ model = "QWEN36"
 request = "tool_weather"
 assert = { kind = "tool_call", expect = "get_weather" }
 tags = ["run2f", "qwen36", "tools"]
+
+# ── Tool-calling: Qwen3.8 (XML format) emits a get_weather call ────────────────
+[[case]]
+id = "p2f_qwen38_tool_call"
+feature = "agent"
+subfeature = "Qwen3.8-27B / tool-calling — emits get_weather"
+model = "mlx-community__Qwen3.8-27B-4bit"
+request = "tool_weather"
+assert = { kind = "tool_call", expect = "get_weather" }
+tags = ["run2f", "qwen38", "tools"]
 
 # ── Tool-calling: Bonsai (Qwen3, Hermes-JSON format) emits a get_weather call ──
 [[case]]

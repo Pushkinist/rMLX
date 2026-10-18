@@ -1,0 +1,36 @@
+# golden tokens — tag=qwen3_8_27b_4bit_k8v8 kv_quant=k8v8
+# layer_mixture=0xca38ae3f8d093c0d
+# n_tokens=32
+# decoded: "<|im_end|>\n<|im_start|><think>\nThe user asks me to explain in one short sentence why the sky appears blue during the day. The first two sentences about France and Japan"
+248046
+198
+248045
+248068
+198
+760
+1156
+16561
+728
+310
+10033
+303
+799
+2716
+11316
+3069
+279
+12515
+7701
+6105
+2261
+279
+1834
+13
+561
+1118
+1330
+22157
+883
+9338
+321
+6124

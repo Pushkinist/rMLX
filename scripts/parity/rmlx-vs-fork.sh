@@ -38,7 +38,7 @@ set -euo pipefail
 REPO="${RMLX_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 RMLX_BIN="$REPO/target/release/rmlx"
 FORK_PY="${MLX_LM_TURBOQUANT_ROOT:-../mlx-lm-turboquant}/.venv/bin/python"
-MODEL_PATH="${RMLX_O_MODELS_ROOT:?Set RMLX_O_MODELS_ROOT - see .env.example}/mlx-community__Qwen3.6-35B-A3B-8bit"
+MODEL_PATH="${RMLX_O_MODELS_ROOT:?Set RMLX_O_MODELS_ROOT - see .env.example}/mlx-community__Qwen3.8-27B-4bit"
 PORT_FILE="$HOME/.pi/agent/.fork-port"
 PORT="$(cat "$PORT_FILE" 2>/dev/null || echo 62260)"
 STATS_JSONL="$HOME/.qwen-team/stats.jsonl"

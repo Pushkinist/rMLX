@@ -511,6 +511,22 @@ check family_size_is_stated 0 \
 	"GREP:this run makes 2 independent comparisons" \
 	"GREP:1-\(1-0\.00216\)\^2 = 0\.00432"
 
+# No --model: the run takes the default list from the models root. Every other
+# case names its model, so only this one reads the list.
+DEFAULT_ROOT="$WORK/default_root"
+mkdir -p "$DEFAULT_ROOT/mlx-community__gemma-4-e4b-it-mxfp8" \
+	"$DEFAULT_ROOT/mlx-community__Qwen3.8-27B-4bit" \
+	"$DEFAULT_ROOT/prism-ml__Ternary-Bonsai-2-27B-mlx-2bit"
+export RMLX_O_MODELS_ROOT="$DEFAULT_ROOT"
+check default_model_list 0 \
+	"with no --model the run compares the three default models, and no other" \
+	--binary-a "$SLOW" --binary-b "$FAST" --slots 8 --max-tokens 5 \
+	"GREP:this run makes 3 independent comparisons" \
+	"GREP:^==> mlx-community__gemma-4-e4b-it-mxfp8$" \
+	"GREP:^==> mlx-community__Qwen3\.8-27B-4bit$" \
+	"GREP:^==> prism-ml__Ternary-Bonsai-2-27B-mlx-2bit$"
+unset RMLX_O_MODELS_ROOT
+
 # ---- the interference detector itself ----------------------------------------
 #
 # The host gate above can only be exercised against whatever this machine

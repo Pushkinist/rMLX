@@ -1,5 +1,7 @@
 {
-  "snapshot": "prism-ml__Ternary-Bonsai-8B-mlx-2bit",
+  "snapshots": [
+    "prism-ml__Ternary-Bonsai-8B-mlx-2bit"
+  ],
   "arch": "Qwen3ForCausalLM",
   "messages": [
     {

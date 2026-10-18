@@ -123,12 +123,14 @@ must serve end-to-end at every change:
 | Family | Example snapshot | Arch |
 |---|---|---|
 | Gemma4 | `mlx-community__gemma-4-e4b-it-mxfp8`, `mlx-community__gemma-4-26b-a4b-it-mxfp8` | `Gemma4ForConditionalGeneration` |
-| Qwen3.6 | `mlx-community__Qwen3.6-35B-A3B-8bit` | `Qwen3_5MoeForConditionalGeneration` |
-| Bonsai | `prism-ml__Ternary-Bonsai-8B-mlx-2bit` | `Qwen3ForCausalLM` |
+| Qwen3.8 | `mlx-community__Qwen3.8-27B-4bit` | `Qwen3_5ForConditionalGeneration` |
+| Bonsai 2 | `prism-ml__Ternary-Bonsai-2-27B-mlx-2bit` | `prism_hadamard_qwen35` (`model_type`; dispatched as `Qwen3_5ForConditionalGeneration`) |
 
 Other Open Models snapshots (`z-lab__Qwen3.6-27B-PARO`, `medgemma`, the `jina`
 embedding/reranker models, `ReaderLM-v2`, …) are in scope as feature
-coverage grows.
+coverage grows. Qwen3.6, medgemma and every Bonsai without "2" keep their
+cells and are not test targets; see `docs/TESTING.md` § "Test targets, kept
+cells and gaps".
 
 ## Key external repos (GitHub)
 
@@ -523,13 +525,15 @@ DB from non-Rust code.
 ## Regression-bench discipline (hard rule)
 
 Every code-touching change runs a regression smoke before declaring done:
-the three test-target families (Gemma4, Qwen3.6, Bonsai) **plus any model
+the three test-target families (Gemma4, Qwen3.8, Bonsai 2) **plus any model
 the change touches**, each at its best-known KV quant.
 
 - **Correctness first, on ≥2 architectures.** Any code-touching change proves
   correct output on real models spanning ≥2 archs — minimum **gemma4-e2b**
-  (single-KV-head `kv_h == 1`, shared-KV) **+ Ternary-Bonsai-8B** (`kv_h > 1`,
-  dense). A KV/kernel fix that holds at one arch/shape can silently fail at
+  (single-KV-head `kv_h == 1`, shared-KV) **+ Qwen3.8-27B-4bit** (`kv_h == 4`,
+  dense Qwen3.5 hybrid). No target has the Qwen3 architecture or YaRN, and
+  `head_dim` 128 with attention on every layer is held only by cells outside
+  the rules. A KV/kernel fix that holds at one arch/shape can silently fail at
   another (`kv_h == 1` vs `kv_h > 1`, power-of-two vs non-power-of-two
   `head_dim`). Unit tests alone are not proof; serve the model.
 - Decode TPS within ±1% of the recorded best for that model at that KV mode.

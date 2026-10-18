@@ -72,8 +72,12 @@ def render(snap_dir: Path, messages: list, tools=None, add_generation_prompt=Tru
 
 def write_fixture(name: str, snap_dir: Path, arch: str, messages: list,
                   tools=None, add_generation_prompt=True, template_kwargs=None,
-                  refused=False):
+                  refused=False, same_template: tuple = ()):
     """Render with HF oracle and write the fixture JSON file.
+
+    The oracle renders `snap_dir`. `same_template` lists snapshots that ship the
+    byte-identical template: the fixture names them too, and the round-trip test
+    asserts the render on each one present.
 
     `template_kwargs` are the extra template variables the request sets
     (`reasoning_effort`, `enable_thinking`). With `refused`, the template must
@@ -95,7 +99,7 @@ def write_fixture(name: str, snap_dir: Path, arch: str, messages: list,
         return False
 
     fixture = {
-        "snapshot": snap_dir.name,
+        "snapshots": [snap_dir.name, *(p.name for p in same_template)],
         "arch": arch,
         "messages": messages,
         "tools": tools,
@@ -123,6 +127,15 @@ SNAPSHOTS = {
     "qwen3":      O_MODELS / "prism-ml__Ternary-Bonsai-8B-mlx-2bit",
     "qwen2":      O_MODELS / "mlx-community__jinaai-ReaderLM-v2",
     "bonsai2":    O_MODELS / "prism-ml__Ternary-Bonsai-2-27B-mlx-2bit",
+}
+
+# Snapshots that ship the same chat_template.jinja as the SNAPSHOTS entry of the
+# same key. `require_same_template` checks the bytes before a fixture names them.
+SAME_TEMPLATE = {
+    "bonsai2": [
+        O_MODELS / "mlx-community__Qwen3.8-27B-4bit",
+        O_MODELS / "mlx-community__Qwen3.8-27B-mxfp8",
+    ],
 }
 
 ARCHES = {
@@ -155,6 +168,15 @@ GET_WEATHER_TOOL = {
 }
 
 
+def require_same_template(snap_dir: Path, others: list) -> None:
+    """Exit unless every snapshot in `others` ships snap_dir's template bytes."""
+    want = (snap_dir / "chat_template.jinja").read_bytes()
+    for other in others:
+        path = other / "chat_template.jinja"
+        if not path.exists() or path.read_bytes() != want:
+            sys.exit(f"{other.name}: chat_template.jinja is absent or differs from {snap_dir.name}")
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -169,6 +191,8 @@ def main():
             continue
 
         print(f"[{key}] {snap_dir.name}")
+        same_template = SAME_TEMPLATE.get(key, [])
+        require_same_template(snap_dir, same_template)
 
         if key == "qwen3_5moe":
             # simple user
@@ -252,12 +276,13 @@ def main():
                  [GET_WEATHER_TOOL]),
             ]:
                 if write_fixture(name, snap_dir, arch, question, tools=tools,
-                                 template_kwargs=kwargs):
+                                 template_kwargs=kwargs,
+                                 same_template=same_template):
                     generated += 1
             if write_fixture("bonsai2_effort_high_refused", snap_dir, arch,
                              question,
                              template_kwargs={"reasoning_effort": "high"},
-                             refused=True):
+                             refused=True, same_template=same_template):
                 generated += 1
 
         elif key == "qwen2":

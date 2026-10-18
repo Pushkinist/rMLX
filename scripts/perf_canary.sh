@@ -51,9 +51,9 @@ MEASURED_RUNS=3
 BUILD_PROFILE="release-perf"
 
 # Model definitions: "short_name|absolute_path"
-BONSAI_PATH="${RMLX_O_MODELS_ROOT:?Set RMLX_O_MODELS_ROOT - see .env.example}/prism-ml__Ternary-Bonsai-8B-mlx-2bit"
 GEMMA4E4B_PATH="${RMLX_O_MODELS_ROOT:?Set RMLX_O_MODELS_ROOT - see .env.example}/mlx-community__gemma-4-e4b-it-mxfp8"
-QWEN36_PATH="${RMLX_O_MODELS_ROOT:?Set RMLX_O_MODELS_ROOT - see .env.example}/mlx-community__Qwen3.6-35B-A3B-8bit"
+QWEN38_PATH="${RMLX_O_MODELS_ROOT:?Set RMLX_O_MODELS_ROOT - see .env.example}/mlx-community__Qwen3.8-27B-4bit"
+BONSAI2_PATH="${RMLX_O_MODELS_ROOT:?Set RMLX_O_MODELS_ROOT - see .env.example}/prism-ml__Ternary-Bonsai-2-27B-mlx-2bit"
 GEMMA4_26B_PATH="${RMLX_O_MODELS_ROOT:?Set RMLX_O_MODELS_ROOT - see .env.example}/mlx-community__gemma-4-26b-a4b-it-mxfp8"
 
 INCLUDE_26B=false
@@ -69,9 +69,9 @@ done
 
 # Build model list
 MODELS=(
-    "prism-ml__Ternary-Bonsai-8B-mlx-2bit|${BONSAI_PATH}"
     "mlx-community__gemma-4-e4b-it-mxfp8|${GEMMA4E4B_PATH}"
-    "mlx-community__Qwen3.6-35B-A3B-8bit|${QWEN36_PATH}"
+    "mlx-community__Qwen3.8-27B-4bit|${QWEN38_PATH}"
+    "prism-ml__Ternary-Bonsai-2-27B-mlx-2bit|${BONSAI2_PATH}"
 )
 if $INCLUDE_26B; then
     MODELS+=("mlx-community__gemma-4-26b-a4b-it-mxfp8|${GEMMA4_26B_PATH}")

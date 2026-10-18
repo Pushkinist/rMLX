@@ -1138,6 +1138,9 @@ fn distinct_shapes(calls: &[AttentionCall]) -> Vec<(i64, i64)> {
 #[derive(Default)]
 struct Report {
     cells: usize,
+    /// Calls whose node has more query rows than the caller gave, summed over
+    /// every cell of the model's run.
+    padded_calls: usize,
     offenders: Vec<String>,
 }
 
@@ -1151,6 +1154,7 @@ impl Report {
             calls.iter().any(|c| c.k_rows == all_keys as i64),
             "{cell}: no attention call covered the whole prompt of {all_keys} tokens"
         );
+        self.padded_calls += calls.iter().filter(|c| c.q_rows != c.caller_q_rows).count();
         let faulty: Vec<&AttentionCall> = calls.iter().filter(|c| is_faulty(c)).collect();
         if let Some(first) = faulty.first() {
             self.offenders.push(format!(
@@ -1168,11 +1172,21 @@ impl Report {
         }
     }
 
-    fn finish(self, test: &str) {
+    /// `expects_padding`: some call of this model is one a rule may change, so
+    /// at least one node somewhere in the run must carry padded query rows. The
+    /// check is on the total over all cells, not on each cell. Without it, a
+    /// rule that stopped padding would leave every call clear of the
+    /// configuration by never changing any.
+    fn finish(self, test: &str, expects_padding: bool) {
         println!(
-            "[{test}] {} cells, {} reached the configuration",
+            "[{test}] {} cells, {} padded calls, {} reached the configuration",
             self.cells,
+            self.padded_calls,
             self.offenders.len()
+        );
+        assert!(
+            !expects_padding || self.padded_calls > 0,
+            "{test}: no attention call of the run was padded, so the padded path was never reached"
         );
         assert!(
             self.offenders.is_empty(),
@@ -1184,6 +1198,18 @@ impl Report {
             self.offenders.join("\n  ")
         );
     }
+}
+
+/// A run that expects padding and saw none fails; one that expects none passes.
+#[test]
+#[should_panic(expected = "the padded path was never reached")]
+fn a_run_with_no_padded_call_fails_where_padding_is_expected() {
+    Report::default().finish("cpu_case", true);
+}
+
+#[test]
+fn a_run_with_no_padded_call_passes_where_none_is_expected() {
+    Report::default().finish("cpu_case", false);
 }
 
 /// Prompt lengths on both sides of the first two chunk boundaries, and tails
@@ -1342,7 +1368,7 @@ fn check_every_prefill_path(loaded: &Loaded, test: &str, paths: Paths) {
             check_speculative_prefill(loaded, label, &mut report);
         }
     }
-    report.finish(test);
+    report.finish(test, !paths.plain_split);
 }
 
 // ---------------------------------------------------------------------------
@@ -1352,6 +1378,11 @@ fn check_every_prefill_path(loaded: &Loaded, test: &str, paths: Paths) {
 const QWEN3_6_MOE: common::GoldenModel = common::GoldenModel {
     slug: "mlx-community__Qwen3.6-35B-A3B-8bit",
     archs: &["Qwen3_5MoeForConditionalGeneration"],
+};
+
+const QWEN3_8: common::GoldenModel = common::GoldenModel {
+    slug: "mlx-community__Qwen3.8-27B-4bit",
+    archs: &["Qwen3_5ForConditionalGeneration"],
 };
 
 const QWEN3_5_DENSE: common::GoldenModel = common::GoldenModel {
@@ -1406,6 +1437,27 @@ fn qwen3_5_dense_prefill_stays_off_the_faulty_attention_configuration() {
         Paths {
             speculative: true,
             resumes_an_extended_prompt: true,
+            plain_split: false,
+        },
+    );
+}
+
+/// Head dim 256, 24 query heads over 4 KV heads, dense, no KV sharing.
+#[ignore = "loads a model and drives the Metal GPU"]
+#[test]
+fn qwen3_8_prefill_stays_off_the_faulty_attention_configuration() {
+    const TEST: &str = "qwen3_8_prefill_stays_off_the_faulty_attention_configuration";
+    let Some(loaded) = load(&QWEN3_8, TEST) else {
+        return;
+    };
+    assert_eq!(loaded.model.head_dim(), 256);
+    assert!(loaded.model.num_key_value_heads() > 1);
+    check_every_prefill_path(
+        &loaded,
+        TEST,
+        Paths {
+            speculative: true,
+            resumes_an_extended_prompt: false,
             plain_split: false,
         },
     );
@@ -1622,6 +1674,16 @@ fn check_tail_argmax_against_the_reference_split(
 fn qwen3_6_moe_tail_argmax_holds_across_the_prefill_split() {
     const TEST: &str = "qwen3_6_moe_tail_argmax_holds_across_the_prefill_split";
     let Some(loaded) = load(&QWEN3_6_MOE, TEST) else {
+        return;
+    };
+    check_tail_argmax_against_the_reference_split(&loaded, TEST, None);
+}
+
+#[ignore = "loads a model and drives the Metal GPU"]
+#[test]
+fn qwen3_8_tail_argmax_holds_across_the_prefill_split() {
+    const TEST: &str = "qwen3_8_tail_argmax_holds_across_the_prefill_split";
+    let Some(loaded) = load(&QWEN3_8, TEST) else {
         return;
     };
     check_tail_argmax_against_the_reference_split(&loaded, TEST, None);

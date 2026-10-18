@@ -189,10 +189,12 @@
 # from a test that ran with it off. Totals: 4 conv in
 # `rmlx-mlx`, 18 conv in `rmlx-server`, 4 gemv in `rmlx-models`.
 #
-# That run left thirteen cells standing down for want of `RMLX_KV_TEST_MODEL`
-# or `RMLX_TEST_MODEL_JINA_V4`, and four `integration_*` cells of `rmlx-models`
-# for want of their `RMLX_TEST_MODEL_*` variable. Filtered runs on the same
-# tree armed each of them and reported no diagnostic, so they pin nothing.
+# That run left cells standing down for want of `RMLX_KV_TEST_MODEL` or
+# `RMLX_TEST_MODEL_JINA_V4`, and `integration_*` cells of `rmlx-models` for want
+# of their `RMLX_TEST_MODEL_*` variable. The runner lists the stand-downs of
+# every run, and the list depends on the snapshots the host holds. Filtered
+# runs on the same tree armed each of them and reported no diagnostic, so they
+# pin nothing.
 # `RMLX_KV_TEST_MODEL` was not set in the complete run on purpose: it outranks
 # the slug of every golden-rule cell of its architecture (docs/TESTING.md).
 #
@@ -203,12 +205,6 @@
 # every test in both halves and ended red on the census with those two deltas
 # and no other. No whole run has been made since. Delete this paragraph when a
 # whole run matches.
-#
-# The stand-down list above predates the notice-form change. The runner of the
-# derivation run could not read a stand-down that a test announced in another
-# form than `SKIP <test>: <why>`, and counted that test as passed. The tests
-# that announced in another form now use that form, so a whole run can list
-# more stand-downs than the seventeen above.
 implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s | device load | 4 | rmlx-mlx | implicit_gemm_conv_tail_channel_reads_never_reach_the_output | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
 implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s | device load | 6 | rmlx-server | tts_first_synthesis_runs_on_a_thread_that_did_not_load_it | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
 implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s | device load | 12 | rmlx-server | tts_synthesizes_on_a_thread_that_did_not_load_it | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562

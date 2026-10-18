@@ -95,7 +95,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         build-perf build-debug test-perf ci-perf gpu-test claim-rmlx model-check model-check-full \
         profile-samply profile-samply-debug profile-instruments bench asm perf-iter \
         canary canary-gate canary-ab canary-ab-selftest canary-ab-ingest-selftest \
-        canary-ab-host-gate-fixtures llama-ab-selftest spec-bench-selftest bench-identity-selftest \
+        canary-ab-host-gate-fixtures codec-smoke-runner-selftest llama-ab-selftest spec-bench-selftest bench-identity-selftest \
         spec-bench-published-selftest published-ingest-selftest \
         published-table check-published-table published-table-selftest \
         check-spec-metric-parity check-spec-metric-parity-fixtures \
@@ -407,10 +407,10 @@ model-check:     ## cargo test -p rmlx-{models,runtime,quant,kv-quant} (no serve
 # every #[ignore] GPU test including these.
 #
 # Avoid --include-ignored here: the lib's own #[ignore] tests (kv-cache equivalence)
-# require a matching model + Metal context and segfault on arch mismatch. The five
+# require a matching model + Metal context and segfault on arch mismatch. The four
 # golden tests are integration test binaries (tests/*.rs) named explicitly below.
 #
-# --test-threads=1 is mandatory, not tidiness. The bonsai binary alone holds four
+# --test-threads=1 is mandatory, not tidiness. A golden binary can hold several
 # #[ignore] GPU tests, and libtest runs a binary's tests on parallel threads: a
 # shared Metal context driven from several of them aborts the whole binary
 # ("Rust cannot catch foreign exceptions"), which is the hazard the #[ignore]
@@ -424,25 +424,24 @@ model-check:     ## cargo test -p rmlx-{models,runtime,quant,kv-quant} (no serve
 # anything. Refusing up front, with the path in the message, is the honest form.
 #
 # Examples:
-#   make model-check-full MODEL=/path/to/prism-ml__Ternary-Bonsai-8B-mlx-2bit
+#   make model-check-full MODEL=/path/to/mlx-community__Qwen3.8-27B-4bit
 #   make model-check-full MODEL=/path/to/mlx-community__gemma-4-e4b-it-mxfp8
 model-check-full: ## run model-logic crates + golden-token integration tests (MODEL= must name an existing snapshot; matching arch runs+passes, others fall through to their own slug or skip)
 	@test -d "$(MODEL)" || { echo "model-check-full: MODEL must name an existing snapshot directory."; echo "  got: $(MODEL)"; echo "  usage: make model-check-full MODEL=/path/to/snapshot"; exit 1; }
 	cargo test -p rmlx-models -p rmlx-runtime -p rmlx-quant
 	RMLX_KV_TEST_MODEL="$(MODEL)" cargo test -p rmlx-models \
-	  --test bonsai_golden_tokens \
 	  --test gemma4_golden_tokens \
-	  --test qwen3_golden_tokens \
+	  --test qwen3_8_golden_tokens \
+	  --test bonsai2_golden_tokens \
 	  --test bitnet_golden_tokens \
-	  --test medgemma_golden_tokens \
 	  -- --ignored --test-threads=1
 
 # e2e: the feature-proof harness — drives the REAL rmlx binary per manifest case
 # (CLI subprocess or `rmlx serve` + HTTP), asserts on real output, writes the
 # PASS/FAIL grid to <temp_dir>/rmlx_e2e_<pid>/e2e/report.{json,md} (the
 # harness pins its own RMLX_HOME there). Single-MLX discipline:
-# --test-threads=1 is mandatory. Model-gated cases skip when no Bonsai snapshot
-# resolves (RMLX_E2E_MODEL_BONSAI / RMLX_TEST_MODEL_BONSAI / RMLX_O_MODELS_ROOT).
+# --test-threads=1 is mandatory. Model-gated cases skip when their snapshot does
+# not resolve (see docs/E2E_TEST_PLAN.md).
 # See docs/E2E_TEST_PLAN.md.
 e2e:             ## run the E2E feature-proof harness (--ignored --test-threads=1) and print the grid path
 	cargo test -p rmlx-cli --test e2e_harness -- --ignored --test-threads=1 --nocapture
@@ -745,6 +744,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_kernel_dtype_contract.sh
 	@bash scripts/check_kernel_dtype_contract_fixtures.sh
 	@bash scripts/perf_ab_selftest.sh
+	@bash scripts/codec_smoke_runner_selftest.sh
 	@bash scripts/perf_ab_host_gate_fixtures.sh
 	@bash scripts/perf_ab_ingest_selftest.sh
 	@bash scripts/bench_llama_ab_selftest.sh
@@ -882,15 +882,15 @@ bench:           ## cargo bench -p rmlx-quant --bench dequant  (on-demand; not i
 #   METRICS_OUT=...  — redirect output (default: metrics/perf-iter/baseline.jsonl)
 PERF_ITER_E2B  ?= $(O_MODELS_ROOT)/mlx-community__gemma-4-e2b-it-mxfp8
 PERF_ITER_E4B  ?= $(O_MODELS_ROOT)/mlx-community__gemma-4-e4b-it-mxfp8
-PERF_ITER_BNSI ?= $(O_MODELS_ROOT)/prism-ml__Ternary-Bonsai-8B-mlx-2bit
+PERF_ITER_QWEN38 ?= $(O_MODELS_ROOT)/mlx-community__Qwen3.8-27B-4bit
 
 perf-iter:       ## run 3-model regression bench in series (appends to metrics/perf-iter/baseline.jsonl)
 	@echo "=== perf-iter: gemma-4-e2b k8v8 ==="
 	MODEL_PATH="$(PERF_ITER_E2B)"  KV_QUANT=k8v8 bash scripts/perf-iter/bench_decode_tps.sh
 	@echo "=== perf-iter: gemma-4-e4b k8v8 ==="
 	MODEL_PATH="$(PERF_ITER_E4B)"  KV_QUANT=k8v8 bash scripts/perf-iter/bench_decode_tps.sh
-	@echo "=== perf-iter: Ternary-Bonsai-8B k8v4 ==="
-	MODEL_PATH="$(PERF_ITER_BNSI)" KV_QUANT=k8v4 bash scripts/perf-iter/bench_decode_tps.sh
+	@echo "=== perf-iter: Qwen3.8-27B-4bit k8v4 ==="
+	MODEL_PATH="$(PERF_ITER_QWEN38)" KV_QUANT=k8v4 bash scripts/perf-iter/bench_decode_tps.sh
 	@echo "=== perf-iter done. Compare with: bash scripts/perf-iter/diff_baseline.sh <prev.jsonl> metrics/perf-iter/baseline.jsonl ==="
 
 # ---- canary TPS gate (DB-backed, release-perf binary) -----------------
@@ -937,6 +937,9 @@ canary-ab: mlx-preflight build-perf  ## interleaved A/B of two arms (ARGS='--bin
 
 canary-ab-selftest: ## mutation-check the A/B harness against stub binaries (no GPU, no model)
 	bash scripts/perf_ab_selftest.sh
+
+codec-smoke-runner-selftest: ## recall-check the codec-matrix runner verdict (ran, skipped, INCOMPLETE, exit codes) over --dry-run and throwaway roots (no GPU, no model)
+	bash scripts/codec_smoke_runner_selftest.sh
 
 canary-ab-host-gate-fixtures: ## recall-check the A/B harness's host gates against shimmed hosts (no GPU, no model)
 	bash scripts/perf_ab_host_gate_fixtures.sh
@@ -1112,7 +1115,7 @@ ssd-canary-gate:   ## gate SSD-tier regressions; SHA= required, THRESHOLD_PCT=3 
 #
 # Examples:
 #   make bench-codec-cell CODEC=k8v4 MODEL=/path/to/mlx-community__gemma-4-e4b-it-mxfp8
-#   make bench-codec-cell CODEC=iso3_sym MODEL=/path/to/prism-ml__Ternary-Bonsai-8B-mlx-2bit
+#   make bench-codec-cell CODEC=iso3_sym MODEL=/path/to/mlx-community__Qwen3.8-27B-4bit
 #
 # See scripts/bench_codec_cell.sh for full options (--max-tokens, --prompt-len).
 # CSV schema documented in docs/PERF_BASELINE.md § "Per-codec × per-model cells".
@@ -1132,7 +1135,7 @@ bench-codec-cell: mlx-preflight  ## bench one codec × one model cell (CODEC= MO
 # Examples:
 #   make smoke-codec-matrix                            # full matrix
 #   make smoke-codec-matrix CODEC=k8v4                 # filter to one codec
-#   make smoke-codec-matrix MATRIX_MODEL=bonsai-8b     # filter to one model
+#   make smoke-codec-matrix MATRIX_MODEL=qwen3.8-27b-4bit  # filter to one model
 #   make smoke-codec-matrix RECORD=1                   # populate baselines (Exec B)
 #
 # CODEC / MATRIX_MODEL match the manifest's `codec_name` / `model` primary-key

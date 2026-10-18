@@ -21,10 +21,10 @@ set -euo pipefail
 RMLX_DIR="${RMLX_DIR:-${RMLX_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}}"
 BENCH_DIR=${BENCH_DIR:-${CROSS_BENCH_ROOT:-../Cross-Backend-Bench}}
 PORT=${PORT:-62265}                        # avoid colliding with bench-prod 62264
-MODEL_PATH=${MODEL_PATH:-${RMLX_O_MODELS_ROOT:?Set RMLX_O_MODELS_ROOT - see .env.example}/mlx-community__Qwen3.6-35B-A3B-8bit}
+MODEL_PATH=${MODEL_PATH:-${RMLX_O_MODELS_ROOT:?Set RMLX_O_MODELS_ROOT - see .env.example}/mlx-community__Qwen3.8-27B-4bit}
 MODEL_ID=$(basename "$MODEL_PATH")
-MODEL_DISK_GB=${MODEL_DISK_GB:-36.6}
-QUANT_SIG=${QUANT_SIG:-affine g64 b8}
+MODEL_DISK_GB=${MODEL_DISK_GB:-16.1}
+QUANT_SIG=${QUANT_SIG:-affine g64 b4}
 RUNS=${RUNS:-3}
 MAX_TOKENS=${MAX_TOKENS:-4096}
 LOG_FILE=/tmp/autoresearch_serve.log

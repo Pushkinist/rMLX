@@ -10,7 +10,7 @@ the GPU, and the gates that run them, are in [`GPU_TESTS.md`](GPU_TESTS.md).
 |---|---|
 | `make test` | `cargo test --workspace`, no `--ignored`. A snapshot-gated test skips. |
 | `make model-check` | the `rmlx-models`, `rmlx-runtime`, `rmlx-quant` and `rmlx-kv-quant` tests; no model |
-| `make model-check-full MODEL=<snapshot>` | `model-check` without `rmlx-kv-quant`, then the five golden-token suites with `MODEL` as `RMLX_KV_TEST_MODEL` |
+| `make model-check-full MODEL=<snapshot>` | `model-check` without `rmlx-kv-quant`, then the four golden-token suites with `MODEL` as `RMLX_KV_TEST_MODEL` |
 | `make e2e` | the E2E harness, `crates/rmlx-cli/tests/e2e/` |
 | `make gpu-test` | the GPU and Metal tests |
 
@@ -43,6 +43,7 @@ Each test resolves its snapshot by one of these rules:
 |---|---|---|---|
 | golden | `common::model_for` | `RMLX_KV_TEST_MODEL` if it serves the test's architecture, then the slug | fails |
 | slug first | `common::slug_or_override` | the slug, then the variable the test names | fails when the slug is absent; when the slug is present it runs, and a `NOTE <test>:` line names the variable it outranked |
+| slug first, one architecture | `common::model_slug_first` (`tests/niah_long_context.rs`) | the slug, then `RMLX_KV_TEST_MODEL` when it serves the cell's architecture | fails; an override of another architecture skips; a `NOTE <test>:` line names an override the slug outranked |
 | slug first, in `src/` | `rmlx_models::test_snapshot::snapshot` | the slug, then a `RMLX_TEST_MODEL_*` variable | skips |
 | slug only, in `src/` | `rmlx_models::test_snapshot::snapshot_by_slug` | the slug | skips |
 | variable first | `tests/resolved_arch_class.rs`, `crates/rmlx-cli/src/commands/kv_calibrate_tests.rs` | a `RMLX_TEST_MODEL_*` variable, then the slug | falls through to the slug |
@@ -53,11 +54,11 @@ The two `src/` rules stand down, with a `SKIP <test>: <why>` line, when the
 snapshot declares another identity than the cell lists: `architectures[0]`, or
 `model_type` for a snapshot that names no architecture (a Prism Hadamard pack).
 
-`common` is `crates/rmlx-models/tests/common/mod.rs`. Its two rules share one
+`common` is `crates/rmlx-models/tests/common/mod.rs`. Its three rules share one
 probe. It fails when `RMLX_O_MODELS_ROOT` is set but is not a directory, and
 when a variable it consults names a path that is not a runnable snapshot. The
 slug-first rule has one exception: a present slug runs, and a `NOTE <test>:`
-line names the variable it outranked. Both rules skip when nothing is
+line names the variable it outranked. The slug-first rules skip when nothing is
 configured, or when the root does not hold the slug.
 
 "Runnable" depends on what the caller opens. The probe takes a `Role`:
@@ -114,6 +115,48 @@ The Qwen-MoE K-side codec guard must still reject a codec on it.
 `SpeculativeGenerator` constructors and the speculative per-request path call
 it, only snapshot-gated tests check. Deleting one of those calls leaves
 `make ci` green.
+
+## Test targets, kept cells and gaps
+
+The test targets (`CLAUDE.md`) are Gemma4 (`mlx-community__gemma-4-e4b-it-mxfp8`,
+`mlx-community__gemma-4-e2b-it-mxfp8`), `mlx-community__Qwen3.8-27B-4bit` and
+`prism-ml__Ternary-Bonsai-2-27B-mlx-2bit`. A checkpoint that left the targets
+keeps every cell, fixture and variable that binds it. Those cells are not part
+of the routine runs. A host that does not hold the snapshot gets a named
+`SKIP <test>: <why>`, the GPU run ends `INCOMPLETE`, and the pull request lists
+the stand-downs. No skip list exists.
+
+### Kept cells
+
+| Checkpoint | Why it is not a target | Cells that stay |
+|---|---|---|
+| `Qwen3.6-35B-A3B-8bit` (sparse MoE) | A different class from the dense targets. | `integration_qwen3_5_moe_35b` (`crates/rmlx-models/src/qwen3_5_moe/tests.rs`); `mislabelled_moe_snapshot_cannot_bypass_the_k_side_guard` and `correctly_declared_moe_snapshot_is_still_guarded` (`crates/rmlx-models/tests/resolved_arch_class.rs`); `qwen3_moe_golden_tokens_k8v8`; `qwen3_5_moe_forward_seq_last_k.rs`; `niah_pflash_qwen36_32k_*`; the e2e cases `p2c_qwen36_guard_kbits` and `p2c_qwen36_guard_symk`; `qwen_moe_low_k_bits_rejected` (`crates/rmlx-cli/tests/cache_type_validate.rs`); the MoE sidecar pairs and the DFlash 1 and EAGLE-3 pairs (`spec_greedy_equivalence.rs`, `dflash_drafter_alignment.rs`, `qwen3_5_eagle3_alignment.rs`, `spec_conditioning_residual.rs`, `prefill_buffer_cache.rs`, `gone_request.rs`, `thread_boundary_drafters.rs`) |
+| `Ternary-Bonsai-8B-mlx-2bit` and the other first-generation Bonsai packs | Superseded by Bonsai 2; holds the only Qwen3 architecture and YaRN cells. | `bonsai_golden_tokens.rs`; `qwen3_tests.rs`; `niah_bonsai_*` and `niah_pflash_bonsai_*`; the `bonsai-8b` matrix rows; the 62 e2e cases bound to the `BONSAI` key (quant matrix, SSD tier, prompt cache, lifecycle); `bonsai_8b_prefill_stays_off_the_faulty_attention_configuration`; the first-generation 27B cells in `prefill_attention_configuration.rs` and `thread_boundary_text.rs`; `kv_calibrate_tests.rs`; the three thinking-budget and logprob cells in `bonsai_golden_tokens.rs`; `thinking_budget_exact_hit_qwen3_5_moe`; the Bonsai refusals in `cache_type_validate.rs` |
+| `medgemma-1.5-4b-it-8bit` (Gemma3) | Supported, not a target. | `medgemma_golden_tokens.rs`; `gemma3/tests.rs` and `gemma3/vision_tests.rs`; `thread_boundary_towers.rs`; `registry_tests.rs`; the `gemma3_basic` chat-template fixture |
+
+`scripts/bench-records-sweep.sh` is a broad records sweep, not a target list. It
+keeps naming Qwen3.6, Qwen3.6-27B-PARO, Bonsai-8B, gemma-4-e2b and medgemma on
+purpose.
+
+### Gaps
+
+No target has these, so no routine run covers them:
+
+- The sparse Qwen3.5 MoE class: router, shared expert, routes, GQA 8, two KV
+  heads, and the K-side codec guard on a real model.
+- The MoE sidecar layer, DFlash 1 and EAGLE-3.
+- ParoQuant on the Qwen3.5 stack, and affine 8-bit weights.
+- The Qwen3 architecture and YaRN.
+- Gemma3.
+- The end-to-end cases (quant matrix, SSD tier, prompt cache, lifecycle) bound
+  to the first-generation Bonsai key. They were not re-bound to a target.
+- The schema-constraint canary (`make schema-constraint-canary`) stays on
+  Bonsai-8B: its baseline table is that template's closed think block.
+
+`head_dim` 128 with attention on every layer is held by the BitNet-2B golden and
+the ReaderLM-v2 cells, which are not targets.
+`mlx-community__Qwen3-8B-8bit` is present and bound by no test; it is the
+candidate for the Qwen3 architecture and affine 8-bit weights.
 
 ## Other test-model variables
 
@@ -183,7 +226,7 @@ a stream drawn without the request's filters.
 
 ## Golden-token suites: how their snapshot resolves
 
-`crates/rmlx-models/tests/{bonsai,gemma4,qwen3,bitnet,medgemma}_golden_tokens.rs`
+`crates/rmlx-models/tests/{bonsai,bonsai2,gemma4,qwen3,qwen3_8,bitnet,medgemma}_golden_tokens.rs`
 each decode 32 tokens at temperature 0 and compare the ids with a committed
 fixture under `tests/fixtures/`. Each suite covers one architecture and names
 its snapshot by slug. They resolve by the golden rule:
@@ -475,17 +518,28 @@ and rotor pay one bit per stored code for the fourth bit.
 
 `crates/rmlx-models/tests/niah_long_context.rs` hides a needle in a filler
 text and asserts that a greedy decode recovers it. Each cell is an
-`#[ignore]`d test generated by `niah_cell!` or `niah_pflash_cell!`:
+`#[ignore]`d test generated by `niah_cell!`:
 
-- `niah_<model>_<ctx>k_d<depth>`: 45 cells over Bonsai, Gemma4-e4b and
-  Qwen3.6, at 8k, 16k and 32k tokens and five depths. They force
-  `KvQuant::K8V4`.
+- `niah_<model>_<ctx>k_d<depth>`: 65 cells. Bonsai, Gemma4-e4b, Qwen3.6 and
+  Qwen3.8 run at 8k, 16k and 32k tokens and five depths; Bonsai 2 runs at 32k
+  and five depths. They force `KvQuant::K8V4`.
 - `niah_pflash_<model>_*`: 16 cells. They force `KvQuant::PlanarK`.
 
-A cell reads its model from `RMLX_TEST_MODEL_BONSAI`,
-`RMLX_TEST_MODEL_GEMMA4_E4B` or `RMLX_TEST_MODEL_QWEN36`, with no slug
-fallback. Unset, the cell skips. `RMLX_NIAH_KV_QUANT` replaces the forced
-codec.
+A cell resolves its model by slug under `RMLX_O_MODELS_ROOT`
+(`mlx-community__gemma-4-e4b-it-mxfp8`, `mlx-community__Qwen3.6-35B-A3B-8bit`,
+`mlx-community__Qwen3.8-27B-4bit`, `prism-ml__Ternary-Bonsai-2-27B-mlx-2bit`,
+`prism-ml__Ternary-Bonsai-8B-mlx-2bit`),
+through `common::model_slug_first`. The slug comes first, as in the
+codec-matrix runner; then `RMLX_KV_TEST_MODEL` when the root lacks the slug and the
+variable serves the cell's architecture. A root with neither makes the cell
+print a named `SKIP`. The `RMLX_TEST_MODEL_*` variables are not read.
+`RMLX_NIAH_KV_QUANT` replaces the forced codec.
+
+The prompt is plain text with no chat template. A cell decodes at most 512
+tokens and stops at the first token whose decoded text holds the needle, so a
+model that answers at once ends the decode at the needle. A thinking model
+reasons first: Qwen3.8 and Bonsai 2 state the needle after 79 to 108 tokens at
+8k and 32k. The verdict is unchanged: the needle anywhere in the output.
 
 A cell that reaches its decode asserts that the decode recovers the needle.
 It also reads the kernel's dispatch counter around the decode, under the
@@ -495,8 +549,8 @@ asserts that it did not: the live bf16 K seed keeps it dormant. Every other
 cell asserts no dispatch.
 
 The three `niah_pflash_qwen36_32k_*` cells never reach their asserts.
-`validate_resolved` rejects `PlanarK` on Qwen3.6 MoE, so with
-`RMLX_TEST_MODEL_QWEN36` set they panic in `generate_greedy`. Unless
+`validate_resolved` rejects `PlanarK` on Qwen3.6 MoE, so on a root that holds
+the Qwen3.6 snapshot they panic in `generate_greedy`. Unless
 `RMLX_NIAH_KV_QUANT` replaces the codec, every driver run that selects them
 fails, the default `--mode turbo` run included.
 
@@ -516,8 +570,8 @@ and writes each pass's log to `/tmp/niah-<family>-<label>.log`.
 
 ### Why NIAH is not in `make gpu-test`
 
-The `#[ignore]` rule holds on the two macro bodies:
-`make check-gpu-tests-ignored` fails if either loses the attribute. The cells
+The `#[ignore]` rule holds on the macro body:
+`make check-gpu-tests-ignored` fails if it loses the attribute. The cells
 are not in `make gpu-test`. A macro cell has no name in the source, so the gate
 cannot derive a filter for it. Each cell also loads a snapshot and prefills up
 to 32k tokens. The NIAH driver and `make smoke-codec-matrix` run them.
@@ -538,15 +592,24 @@ bash scripts/release_e2e/stage6_perf/codec_smoke_runner.sh --dry-run
 ```
 
 The variable is `MATRIX_MODEL`, because the Makefile's `MODEL` has a default.
-The script also takes `--manifest <path>`. It writes
-`scripts/release_e2e/stage6_perf/last_run.json`, which git ignores. It exits 0
-only when every row that ran passed.
+The script also takes `--manifest <path>` and `--out <path>`. It writes
+`scripts/release_e2e/stage6_perf/last_run.json`, which git ignores, with
+`ran`, `skipped_known`, `skipped_absent` and `incomplete`. It ends with
+`matrix_done ... ran=N skipped=M`. The exit code is 0 when at least one row ran,
+every row that ran passed and no row skipped for an absent snapshot or an unset
+root. It is 1 when a row failed or no row ran, and 3 for `matrix INCOMPLETE`:
+every row that ran passed, but a row skipped for an absent snapshot or an unset
+root. A row with a manifest `skip_reason` is a known disposition and does not
+make the run INCOMPLETE. `make codec-smoke-runner-selftest` holds these codes.
 
-A row reads its model from `RMLX_TEST_MODEL_BONSAI`,
-`RMLX_TEST_MODEL_GEMMA4_E4B` or `RMLX_TEST_MODEL_QWEN36`, and skips when the
-variable is unset. Each smoke run takes the Metal claim itself, and each NIAH
-run runs under `rmlx claim run`. When another process holds the claim, the row
-fails with exit 11 and the refusal names the holder.
+A row's `model` maps to a snapshot slug under `RMLX_O_MODELS_ROOT`. The runner
+takes `$RMLX_O_MODELS_ROOT/<slug>` for the smoke run and exports no model
+variable to NIAH: the harness resolves the same slug. A row whose snapshot is
+absent from the root, or whose root is unset, is skipped with a reason that
+names the slug and what is missing; a root that is not a directory fails the
+row. `--dry-run` applies the same check. Each smoke run takes the Metal claim
+itself, and each NIAH run runs under `rmlx claim run`. When another process
+holds the claim, the row fails with exit 11 and the refusal names the holder.
 
 ### Manifest
 
@@ -556,9 +619,9 @@ table per `(codec_name, model)`:
 | Field | Meaning |
 |---|---|
 | `codec_name` | display name (`k8v4`, `TurboSym3`, …) |
-| `model` | `bonsai-8b`, `gemma4-e4b` or `qwen3.6-moe-8bit` |
+| `model` | `bonsai-8b`, `bonsai2-27b`, `gemma4-e4b`, `qwen3.6-moe-8bit` or `qwen3.8-27b-4bit` |
 | `context_length` | NIAH context in tokens |
-| `expected_retrieval_pct` | the baseline; `0.0` means not recorded |
+| `expected_retrieval_pct` | the baseline; `0.0` means not recorded, and a row at `0.0` outside `--record-baseline` ends the run INCOMPLETE (`niah_unrecorded`, verdict `unrecorded`, exit 3), because no reading can fail it |
 | `smoke_probe_prompts` | prompt names from `smoke_prompts.toml` |
 | `skip_reason` | non-empty skips the row |
 | `cli_args` | the `rmlx baseline` suffix that selects the codec |

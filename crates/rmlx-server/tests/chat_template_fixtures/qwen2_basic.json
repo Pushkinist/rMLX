@@ -1,5 +1,7 @@
 {
-  "snapshot": "mlx-community__jinaai-ReaderLM-v2",
+  "snapshots": [
+    "mlx-community__jinaai-ReaderLM-v2"
+  ],
   "arch": "Qwen2ForCausalLM",
   "messages": [
     {

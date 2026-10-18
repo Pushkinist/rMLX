@@ -17,11 +17,24 @@
 #   5. Compare retrieval to `expected_retrieval_pct`:
 #       * `--record-baseline` AND expected == 0.0 -> measured value is
 #         written back into the manifest (Exec B path).
+#       * expected == 0.0 without `--record-baseline` -> the row has no
+#         recorded baseline, so nothing can fail it: its verdict is
+#         `unrecorded` and the run ends INCOMPLETE.
 #       * otherwise -> measured >= expected - 2pp passes; else fails.
 #
 # Aggregated rows are emitted to
-# `scripts/release_e2e/stage6_perf/last_run.json`. Exit code is 0 iff all
-# non-skipped rows passed.
+# `scripts/release_e2e/stage6_perf/last_run.json` with `ran`, `skipped_known`,
+# `skipped_absent`, `unrecorded` and `incomplete`.
+#
+# Exit codes:
+#   0  at least one row ran, every row that ran passed, no row skipped for an
+#      absent snapshot or an unset root, no row without a recorded baseline
+#   1  a row failed, or no row ran
+#   3  matrix INCOMPLETE: every row that ran passed, but a row skipped for an
+#      absent snapshot or an unset root, or ran against an unrecorded baseline
+#   2  usage or setup error
+# `matrix_done` prints `ran=N skipped=M`. A row with a manifest `skip_reason`
+# is a known disposition and does not make the run INCOMPLETE.
 #
 # TOML parsing dependency: pure-python3 + `tomllib` (stdlib, Python 3.11+).
 # `dasel` and `yq` are NOT installed on the dev host; python3 is the
@@ -33,14 +46,11 @@
 #       [--manifest <path>] \
 #       [--filter codec_name=<x>] [--filter model=<m>] \
 #       [--record-baseline] \
-#       [--dry-run]
+#       [--dry-run] [--out <path>]
 #
-# Required env vars (per docs/TESTING.md):
-#   RMLX_TEST_MODEL_BONSAI
-#   RMLX_TEST_MODEL_GEMMA4_E4B
-#   RMLX_TEST_MODEL_QWEN36
-#
-# Skips gracefully on a per-row basis when the row's model env-var is unset.
+# Each row's `model` names a snapshot slug under $RMLX_O_MODELS_ROOT (see
+# `model_slug` below; the NIAH harness resolves the same slug). A row whose
+# slug is absent from the root is skipped with a named reason.
 
 set -euo pipefail
 
@@ -69,10 +79,13 @@ while [[ $# -gt 0 ]]; do
                 *) printf 'ERROR: --filter expects codec_name=<x> or model=<m>, got: %s\n' "$2" >&2; exit 2 ;;
             esac
             shift 2 ;;
+        --out)
+            [[ $# -lt 2 ]] && { printf 'ERROR: --out requires a value\n' >&2; exit 2; }
+            LAST_RUN="$2"; shift 2 ;;
         --record-baseline) RECORD_BASELINE=1; shift ;;
         --dry-run)         DRY_RUN=1; shift ;;
         -h|--help)
-            sed -n '2,30p' "$0"; exit 0 ;;
+            sed -n '2,56p' "$0"; exit 0 ;;
         *)
             printf 'ERROR: unknown flag: %s\n' "$1" >&2; exit 2 ;;
     esac
@@ -99,18 +112,38 @@ fi
 
 # Every process a pass starts under the claim inherits it, so everything the
 # passes run is compiled here, outside it; a pass that still compiles fails.
-cargo build --profile release-perf --bin rmlx || exit 2
-cargo test --no-run --profile release-perf -p rmlx-models --test niah_long_context || exit 2
+if [[ $DRY_RUN -eq 0 ]]; then
+    cargo build --profile release-perf --bin rmlx || exit 2
+    cargo test --no-run --profile release-perf -p rmlx-models --test niah_long_context || exit 2
+fi
 CLAIM_RMLX="$REPO_ROOT/target/release-perf/rmlx"
 
-# Map manifest `model` slug -> env var holding the absolute snapshot path.
-model_env_var() {
+# Map manifest `model` -> snapshot slug under $RMLX_O_MODELS_ROOT. The
+# `GoldenModel` consts in crates/rmlx-models/tests/niah_long_context.rs list the
+# same slugs; change both together.
+model_slug() {
     case "$1" in
-        bonsai-8b)        printf 'RMLX_TEST_MODEL_BONSAI' ;;
-        gemma4-e4b)       printf 'RMLX_TEST_MODEL_GEMMA4_E4B' ;;
-        qwen3.6-moe-8bit) printf 'RMLX_TEST_MODEL_QWEN36' ;;
+        bonsai-8b)        printf 'prism-ml__Ternary-Bonsai-8B-mlx-2bit' ;;
+        gemma4-e4b)       printf 'mlx-community__gemma-4-e4b-it-mxfp8' ;;
+        qwen3.6-moe-8bit) printf 'mlx-community__Qwen3.6-35B-A3B-8bit' ;;
+        qwen3.8-27b-4bit) printf 'mlx-community__Qwen3.8-27B-4bit' ;;
+        bonsai2-27b)      printf 'prism-ml__Ternary-Bonsai-2-27B-mlx-2bit' ;;
         *) printf '' ;;
     esac
+}
+
+# Print the first file a snapshot directory lacks; nothing when it can be
+# served. The same files the NIAH harness requires of a snapshot.
+snapshot_gap() {
+    local dir="$1" f
+    for f in config.json tokenizer.json; do
+        [[ -f "$dir/$f" ]] || { printf '%s' "$f"; return; }
+    done
+    if [[ ! -e "$dir/model.safetensors.index.json" && ! -e "$dir/model.safetensors" ]]; then
+        printf 'model.safetensors[.index.json]'
+    elif ! compgen -G "$dir/*.safetensors" >/dev/null; then
+        printf 'any *.safetensors shard'
+    fi
 }
 
 # Emit a single structured line to stderr (tracing-style key=value).
@@ -215,7 +248,7 @@ prompt_field() {
 
 # Parse retrieval-pct from cargo-test stdout. Convention: the NIAH harness
 # prints lines containing `needle_found=<bool>` (one per cell — see
-# `run_cell_kind` in `crates/rmlx-models/tests/niah_long_context.rs`). The
+# `run_cell` in `crates/rmlx-models/tests/niah_long_context.rs`). The
 # aggregate retrieval-pct is `hits / total` across all cells in the filter
 # scope.
 parse_retrieval_pct() {
@@ -318,6 +351,10 @@ PY
 # ── per-row execution ───────────────────────────────────────────────────────
 ROW_JSONS=()
 AGG_RC=0
+RAN=0
+SKIPPED_KNOWN=0
+SKIPPED_ABSENT=0
+UNRECORDED=0
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse --short HEAD 2>/dev/null || printf nogit)"
 
 while IFS=$'\t' read -r CODEC MODEL CTX EXPECTED PROMPTS_CSV SKIP CLI_ARGS NIAH_FILTER; do
@@ -334,40 +371,66 @@ while IFS=$'\t' read -r CODEC MODEL CTX EXPECTED PROMPTS_CSV SKIP CLI_ARGS NIAH_
 
     if [[ -n "$SKIP" ]]; then
         log_evt info "skip codec=$CODEC model=$MODEL reason=\"$SKIP\""
+        SKIPPED_KNOWN=$((SKIPPED_KNOWN + 1))
         ROW_JSONS+=("$(printf '{"codec":"%s","model":"%s","verdict":"skip","reason":"%s"}' \
             "$CODEC" "$MODEL" "$SKIP")")
         continue
     fi
 
-    if [[ $DRY_RUN -eq 1 ]]; then
-        log_evt info "dry-run codec=$CODEC model=$MODEL ctx=$CTX cli_args=\"$CLI_ARGS\" niah_filter=$NIAH_FILTER"
-        ROW_JSONS+=("$(printf '{"codec":"%s","model":"%s","verdict":"dry_run"}' "$CODEC" "$MODEL")")
-        continue
-    fi
-
-    ENV_VAR="$(model_env_var "$MODEL")"
-    if [[ -z "$ENV_VAR" ]]; then
+    SLUG="$(model_slug "$MODEL")"
+    if [[ -z "$SLUG" ]]; then
         log_evt error "unknown_model codec=$CODEC model=$MODEL"
         AGG_RC=1
         ROW_JSONS+=("$(printf '{"codec":"%s","model":"%s","verdict":"fail","reason":"unknown_model"}' \
             "$CODEC" "$MODEL")")
         continue
     fi
-    MODEL_PATH="${!ENV_VAR:-}"
-    if [[ -z "$MODEL_PATH" ]]; then
-        log_evt warn "skip_no_env codec=$CODEC model=$MODEL env=$ENV_VAR"
-        ROW_JSONS+=("$(printf '{"codec":"%s","model":"%s","verdict":"skip","reason":"env_unset:%s"}' \
-            "$CODEC" "$MODEL" "$ENV_VAR")")
+    if [[ $DRY_RUN -eq 1 ]]; then
+        SNAPSHOT_STATE=absent
+        if [[ -n "${RMLX_O_MODELS_ROOT:-}" && -d "$RMLX_O_MODELS_ROOT" \
+            && -z "$(snapshot_gap "$RMLX_O_MODELS_ROOT/$SLUG")" ]]; then
+            SNAPSHOT_STATE=present
+        fi
+        log_evt info "dry-run codec=$CODEC model=$MODEL slug=$SLUG ctx=$CTX cli_args=\"$CLI_ARGS\" niah_filter=$NIAH_FILTER snapshot=$SNAPSHOT_STATE"
+    fi
+    if [[ -z "${RMLX_O_MODELS_ROOT:-}" ]]; then
+        log_evt warn "skip_no_snapshot codec=$CODEC model=$MODEL slug=$SLUG missing=RMLX_O_MODELS_ROOT"
+        SKIPPED_ABSENT=$((SKIPPED_ABSENT + 1))
+        ROW_JSONS+=("$(printf '{"codec":"%s","model":"%s","verdict":"skip","reason":"snapshot_absent:%s:RMLX_O_MODELS_ROOT unset"}' \
+            "$CODEC" "$MODEL" "$SLUG")")
+        continue
+    fi
+    if [[ ! -d "$RMLX_O_MODELS_ROOT" ]]; then
+        log_evt error "models_root_not_a_directory codec=$CODEC model=$MODEL root=$RMLX_O_MODELS_ROOT"
+        AGG_RC=1
+        ROW_JSONS+=("$(printf '{"codec":"%s","model":"%s","verdict":"fail","reason":"models_root_not_a_directory"}' \
+            "$CODEC" "$MODEL")")
+        continue
+    fi
+    MODEL_PATH="$RMLX_O_MODELS_ROOT/$SLUG"
+    MISSING="$(snapshot_gap "$MODEL_PATH")"
+    if [[ -n "$MISSING" ]]; then
+        log_evt warn "skip_no_snapshot codec=$CODEC model=$MODEL slug=$SLUG missing=\"$MISSING\""
+        SKIPPED_ABSENT=$((SKIPPED_ABSENT + 1))
+        ROW_JSONS+=("$(printf '{"codec":"%s","model":"%s","verdict":"skip","reason":"snapshot_absent:%s:%s"}' \
+            "$CODEC" "$MODEL" "$SLUG" "$MISSING")")
+        continue
+    fi
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        RAN=$((RAN + 1))
+        ROW_JSONS+=("$(printf '{"codec":"%s","model":"%s","verdict":"dry_run"}' "$CODEC" "$MODEL")")
         continue
     fi
 
     log_evt info "row_start codec=$CODEC model=$MODEL ctx=$CTX"
+    RAN=$((RAN + 1))
 
     # ── smoke probes ────────────────────────────────────────────────────────
     SMOKE_VERDICT="pass"
     SMOKE_FAIL_PROMPT=""
     IFS=',' read -r -a PROMPT_NAMES <<<"$PROMPTS_CSV"
-    for PNAME in "${PROMPT_NAMES[@]}"; do
+    for PNAME in ${PROMPT_NAMES[@]+"${PROMPT_NAMES[@]}"}; do
         [[ -z "$PNAME" ]] && continue
         PCONTENT_RAW="$(prompt_field "$PNAME" 2)"
         # Decode \n sentinel into real newlines.
@@ -384,17 +447,18 @@ while IFS=$'\t' read -r CODEC MODEL CTX EXPECTED PROMPTS_CSV SKIP CLI_ARGS NIAH_
         # decoded text is emitted to a tracing log. We grep the tracing
         # output for the `decoded=` field that baseline emits.
         #
-        # `|| true` suppresses errexit on a failed pipeline so PIPESTATUS
-        # capture executes; the per-row error path then dispatches on
-        # BASELINE_RC (review CRITICAL-2).
+        # The `||` arm keeps errexit from ending the run and records the
+        # failed command's status: PIPESTATUS read after `|| true` would
+        # be the `true`'s, and a refused Metal claim would look like a
+        # clean run with empty output.
+        BASELINE_RC=0
         # shellcheck disable=SC2086  # CLI_ARGS deliberately word-split
         RUST_LOG=info cargo run --quiet --profile release-perf --bin rmlx -- \
             baseline \
             --model "$MODEL_PATH" \
             --prompt "$PROMPT_FILE" \
             --max-tokens "$PMAX" \
-            $CLI_ARGS 2>&1 | tee "$OUTPUT_FILE" >/dev/null || true
-        BASELINE_RC=${PIPESTATUS[0]}
+            $CLI_ARGS 2>&1 | tee "$OUTPUT_FILE" >/dev/null || BASELINE_RC=${PIPESTATUS[0]}
 
         # Extract `decoded=` so validate_regex sees only model output, not the
         # tracing-echoed prompt (review MED-2 path (a)).
@@ -430,27 +494,26 @@ while IFS=$'\t' read -r CODEC MODEL CTX EXPECTED PROMPTS_CSV SKIP CLI_ARGS NIAH_
     NIAH_LOG="$(mktemp -t rmlx-niah.XXXXXX.log)"
 
     # The NIAH harness wraps `cargo test -p rmlx-models --test niah_long_context`
-    # at the row's filter scope. We pass the env-var-resolved snapshot path
-    # via the model's `RMLX_TEST_MODEL_*` env var (the harness reads them).
+    # at the row's filter scope and resolves the row's slug under
+    # `RMLX_O_MODELS_ROOT` itself.
     #
     # Forward the row's codec selection to the
     # harness via `RMLX_NIAH_KV_QUANT`. If the codec is unmapped, leave the
     # env unset and the harness falls back to its per-FlashKind default.
-    # `|| true` keeps PIPESTATUS readable under set -euo pipefail
-    # (review CRITICAL-2).
+    # The `||` arm records the failed command's status, as for the baseline.
     NIAH_KV_QUANT="$(codec_to_kv_quant "$CODEC")"
-    NIAH_ENV=(env "$ENV_VAR=$MODEL_PATH")
+    NIAH_ENV=(env)
     if [[ -n "$NIAH_KV_QUANT" ]]; then
         NIAH_ENV+=("RMLX_NIAH_KV_QUANT=$NIAH_KV_QUANT")
     else
         log_evt warn "niah_codec_unmapped codec=$CODEC — harness uses default"
     fi
+    NIAH_RC=0
     "${NIAH_ENV[@]}" \
         timeout 3600 "$CLAIM_RMLX" claim run -- cargo test --profile release-perf \
             -p rmlx-models --test niah_long_context \
             -- --ignored --test-threads=1 --nocapture "$NIAH_FILTER" \
-            2>&1 | tee "$NIAH_LOG" >/dev/null || true
-    NIAH_RC=${PIPESTATUS[0]}
+            2>&1 | tee "$NIAH_LOG" >/dev/null || NIAH_RC=${PIPESTATUS[0]}
     if grep -Eq '^[[:space:]]*Compiling [A-Za-z0-9_-]+ v' "$NIAH_LOG"; then
         log_evt error "niah_compiled_under_claim codec=$CODEC model=$MODEL log=$NIAH_LOG"
         NIAH_RC=1
@@ -491,6 +554,12 @@ while IFS=$'\t' read -r CODEC MODEL CTX EXPECTED PROMPTS_CSV SKIP CLI_ARGS NIAH_
             log_evt info "record_baseline codec=$CODEC model=$MODEL measured=$MEASURED"
             manifest_record "$CODEC" "$MODEL" "$MEASURED" "$MANIFEST"
         fi
+    elif awk "BEGIN{exit !($EXP_FLOAT == 0.0)}"; then
+        # A zero expectation passes any measurement (measured >= 0 - 0.02).
+        VERDICT="unrecorded"
+        REASON="no recorded baseline"
+        UNRECORDED=$((UNRECORDED + 1))
+        log_evt warn "niah_unrecorded codec=$CODEC model=$MODEL measured=$MEASURED"
     else
         # Gate: measured >= expected - 0.02
         if ! awk -v m="$MEASURED" -v e="$EXP_FLOAT" 'BEGIN{exit !(m >= e - 0.02)}'; then
@@ -509,15 +578,32 @@ while IFS=$'\t' read -r CODEC MODEL CTX EXPECTED PROMPTS_CSV SKIP CLI_ARGS NIAH_
 done <<<"$ROWS_TSV"
 
 # ── aggregate output ────────────────────────────────────────────────────────
+SKIPPED=$((SKIPPED_KNOWN + SKIPPED_ABSENT))
+INCOMPLETE=false
+[[ $SKIPPED_ABSENT -gt 0 || $UNRECORDED -gt 0 ]] && INCOMPLETE=true
 {
-    printf '{"run_id":"%s","rows":[' "$RUN_ID"
+    printf '{"run_id":"%s","ran":%s,"skipped_known":%s,"skipped_absent":%s,"unrecorded":%s,"incomplete":%s,"rows":[' \
+        "$RUN_ID" "$RAN" "$SKIPPED_KNOWN" "$SKIPPED_ABSENT" "$UNRECORDED" "$INCOMPLETE"
     sep=""
-    for r in "${ROW_JSONS[@]}"; do
+    for r in ${ROW_JSONS[@]+"${ROW_JSONS[@]}"}; do
         printf '%s%s' "$sep" "$r"
         sep=","
     done
     printf ']}\n'
 } >"$LAST_RUN"
 
-log_evt info "matrix_done agg_rc=$AGG_RC rows=${#ROW_JSONS[@]} out=$LAST_RUN"
-exit $AGG_RC
+log_evt info "matrix_done agg_rc=$AGG_RC ran=$RAN skipped=$SKIPPED rows=${#ROW_JSONS[@]} out=$LAST_RUN"
+if [[ $INCOMPLETE == true ]]; then
+    log_evt warn "matrix INCOMPLETE skipped_absent=$SKIPPED_ABSENT unrecorded=$UNRECORDED: rows skipped for an absent snapshot or an unset RMLX_O_MODELS_ROOT, or run without a recorded baseline"
+fi
+if [[ $AGG_RC -ne 0 ]]; then
+    exit "$AGG_RC"
+fi
+if [[ $RAN -eq 0 ]]; then
+    log_evt error "matrix ran no row"
+    exit 1
+fi
+if [[ $INCOMPLETE == true ]]; then
+    exit 3
+fi
+exit 0

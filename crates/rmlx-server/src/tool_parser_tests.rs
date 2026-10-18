@@ -434,12 +434,25 @@ fn read_template(model_dir_slug: &str) -> Option<String> {
 }
 
 #[test]
-fn detect_qwen36_xml_from_real_template() {
-    if let Some(src) = read_template("mlx-community__Qwen3.6-35B-A3B-8bit") {
+fn detect_qwen_xml_from_real_templates() {
+    for (slug, arch) in [
+        (
+            "mlx-community__Qwen3.6-35B-A3B-8bit",
+            "Qwen3_5MoeForConditionalGeneration",
+        ),
+        (
+            "mlx-community__Qwen3.8-27B-4bit",
+            "Qwen3_5ForConditionalGeneration",
+        ),
+    ] {
+        let Some(src) = read_template(slug) else {
+            println!("SKIP detect_qwen_xml_from_real_templates: no template for {slug}");
+            continue;
+        };
         assert_eq!(
-            detect_tool_call_format(Some(&src), "Qwen3_5MoeForConditionalGeneration"),
+            detect_tool_call_format(Some(&src), arch),
             Some(ToolCallFormat::Qwen3XmlFunction),
-            "Qwen3.6 template must resolve to XML (regression guard)"
+            "{slug}: the template must resolve to XML (regression guard)"
         );
     }
 }

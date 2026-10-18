@@ -1,0 +1,36 @@
+# golden tokens — tag=bonsai2_27b_k8v8 kv_quant=k8v8
+# layer_mixture=0xca38ae3f8d093c0d
+# n_tokens=32
+# decoded: "<|im_end|><think>\nThe user is asking me to explain in one short sentence why the sky appears blue during the day. The preceding statements about capitals of France and Japan"
+248046
+248068
+198
+760
+1156
+369
+9859
+728
+310
+10033
+303
+799
+2716
+11316
+3069
+279
+12515
+7701
+6105
+2261
+279
+1834
+13
+561
+36497
+11889
+883
+89798
+314
+9338
+321
+6124

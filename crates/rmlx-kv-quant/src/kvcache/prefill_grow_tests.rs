@@ -18,7 +18,7 @@
 //!   process-global.
 //!
 //! Repro recipe (CLI):
-//!   ./target/release/rmlx baseline --model <BONSAI_PATH> --kv-quant k8v4
+//!   ./target/release/rmlx baseline --model <MODEL_PATH> --kv-quant k8v4
 //! Before the fix this failed once total prompt > 4096 tokens (default
 //! `KV_MAX_SEQ_DEFAULT`).  After the fix it grows past 4096 and completes.
 

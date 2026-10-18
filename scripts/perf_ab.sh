@@ -271,9 +271,9 @@ esac
 if [[ ${#MODELS[@]} -eq 0 ]]; then
 	: "${RMLX_O_MODELS_ROOT:?Set RMLX_O_MODELS_ROOT, or pass --model - see .env.example}"
 	MODELS=(
-		"${RMLX_O_MODELS_ROOT}/prism-ml__Ternary-Bonsai-8B-mlx-2bit"
 		"${RMLX_O_MODELS_ROOT}/mlx-community__gemma-4-e4b-it-mxfp8"
-		"${RMLX_O_MODELS_ROOT}/mlx-community__Qwen3.6-35B-A3B-8bit"
+		"${RMLX_O_MODELS_ROOT}/mlx-community__Qwen3.8-27B-4bit"
+		"${RMLX_O_MODELS_ROOT}/prism-ml__Ternary-Bonsai-2-27B-mlx-2bit"
 	)
 fi
 

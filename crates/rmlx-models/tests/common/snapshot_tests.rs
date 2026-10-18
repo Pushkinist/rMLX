@@ -26,8 +26,8 @@
 use std::path::{Path, PathBuf};
 
 use super::{
-    apply, choose, choose_by_slug, override_snapshot, slug_snapshot, Gate, GoldenModel, Role,
-    Snapshot,
+    apply, choose, choose_by_slug, model_arch, override_snapshot, slug_snapshot, Gate, GoldenModel,
+    Role, Snapshot,
 };
 
 const SLUG: &str = "vendor__model-8b-2bit";
@@ -614,6 +614,31 @@ fn arch_mismatch_on_the_slug_snapshot_fails() {
     );
 }
 
+/// A pack whose `config.json` names no architecture (a Prism Hadamard pack) is
+/// identified by its `model_type`; a declared architecture still outranks it.
+#[test]
+fn a_config_without_architectures_is_identified_by_its_model_type() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for (name, config, want) in [
+        (
+            "pack",
+            r#"{"model_type":"prism_hadamard_qwen35"}"#,
+            "prism_hadamard_qwen35",
+        ),
+        (
+            "declared",
+            r#"{"architectures":["ExampleForCausalLM"],"model_type":"example"}"#,
+            "ExampleForCausalLM",
+        ),
+        ("neither", r#"{"hidden_size":8}"#, ""),
+    ] {
+        let dir = tmp.path().join(name);
+        std::fs::create_dir_all(&dir).expect("create dir");
+        std::fs::write(dir.join("config.json"), config).expect("write config.json");
+        assert_eq!(model_arch(&dir), want, "{name}");
+    }
+}
+
 /// An unreadable or absent `config.json` yields an empty arch string. That must
 /// not accidentally match a golden's expected-arch list.
 #[test]
@@ -810,6 +835,7 @@ fn an_unset_override_leaves_the_slug_to_arm_the_cell() {
             None,
             slug_snapshot(Some(as_str(root.path())), SLUG, Role::Standalone),
             DRAFT_VAR,
+            None,
         ),
         Gate::Run {
             path: dir,
@@ -831,6 +857,7 @@ fn the_slug_outranks_an_override_that_also_resolves_and_says_so() {
         override_snapshot(Some(as_str(&theirs)), Role::Standalone),
         slug_snapshot(Some(as_str(root.path())), SLUG, Role::Standalone),
         DRAFT_VAR,
+        None,
     ) else {
         panic!("a present slug must run");
     };
@@ -853,6 +880,7 @@ fn an_override_naming_the_slugs_own_snapshot_adds_no_note() {
         override_snapshot(Some(as_str(&real)), Role::Standalone),
         slug_snapshot(Some(as_str(root.path())), SLUG, Role::Standalone),
         DRAFT_VAR,
+        None,
     ) else {
         panic!("a present slug must run");
     };
@@ -869,6 +897,7 @@ fn an_override_spelled_as_the_slugs_own_path_adds_no_note() {
         override_snapshot(Some(as_str(&mine)), Role::Standalone),
         slug_snapshot(Some(as_str(root.path())), SLUG, Role::Standalone),
         DRAFT_VAR,
+        None,
     ) else {
         panic!("a present slug must run");
     };
@@ -887,6 +916,7 @@ fn an_override_spelled_with_a_parent_component_adds_no_note() {
         override_snapshot(Some(as_str(&spelled)), Role::Standalone),
         slug_snapshot(Some(as_str(root.path())), SLUG, Role::Standalone),
         DRAFT_VAR,
+        None,
     ) else {
         panic!("a present slug must run");
     };
@@ -906,6 +936,7 @@ fn an_unrunnable_override_beside_a_present_slug_is_announced() {
         override_snapshot(Some(as_str(&nowhere)), Role::Standalone),
         slug_snapshot(Some(as_str(root.path())), SLUG, Role::Standalone),
         DRAFT_VAR,
+        None,
     ) else {
         panic!("a present slug must run");
     };
@@ -928,6 +959,7 @@ fn a_root_without_the_slug_falls_back_to_the_override_with_a_note() {
         override_snapshot(Some(as_str(&named)), Role::Standalone),
         slug_snapshot(Some(as_str(root.path())), SLUG, Role::Standalone),
         DRAFT_VAR,
+        None,
     ) else {
         panic!("a named runnable snapshot must run");
     };
@@ -950,14 +982,18 @@ fn neither_the_slug_nor_an_override_is_a_skip_naming_what_is_missing() {
         None,
         slug_snapshot(Some(as_str(root.path())), SLUG, Role::Standalone),
         DRAFT_VAR,
+        None,
     ) else {
         panic!("an absent slug with no override is a skip");
     };
     assert!(why.contains(SLUG), "{why}");
 
-    let Gate::Skip(why) =
-        choose_by_slug(None, slug_snapshot(None, SLUG, Role::Standalone), DRAFT_VAR)
-    else {
+    let Gate::Skip(why) = choose_by_slug(
+        None,
+        slug_snapshot(None, SLUG, Role::Standalone),
+        DRAFT_VAR,
+        None,
+    ) else {
         panic!("nothing configured is a skip");
     };
     assert!(why.contains(DRAFT_VAR), "{why}");
@@ -978,6 +1014,7 @@ fn a_misconfigured_root_fails_rather_than_taking_the_override() {
             override_snapshot(Some(as_str(&named)), Role::Standalone),
             slug_snapshot(Some(as_str(&missing)), SLUG, Role::Standalone),
             DRAFT_VAR,
+            None,
         ),
         Gate::Fail(_)
     ));
@@ -994,8 +1031,168 @@ fn an_unrunnable_override_fails_naming_this_cell_s_variable() {
         override_snapshot(Some(as_str(&nowhere)), Role::Standalone),
         slug_snapshot(Some(as_str(root.path())), SLUG, Role::Standalone),
         DRAFT_VAR,
+        None,
     ) else {
         panic!("a named path that is not a snapshot must fail");
     };
     assert!(why.contains(DRAFT_VAR), "{why}");
+}
+
+// ── the by-slug decision for a cell that covers one architecture ─────────
+
+/// The architectures a cell covers, as `choose_by_slug` takes them.
+const ARCHS: Option<&[&str]> = Some(MODEL.archs);
+
+/// The cell resolves the way the codec-matrix runner does: a present slug beats
+/// an override that serves the same architecture, and the run says so.
+#[test]
+fn a_present_slug_outranks_a_same_arch_override_and_says_so() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mine = make_snapshot(root.path(), SLUG, ARCH);
+    let theirs = make_snapshot(root.path(), "vendor__same-arch-other-size", ARCH);
+
+    let Gate::Run { path, note } = choose_by_slug(
+        override_snapshot(Some(as_str(&theirs)), Role::Standalone),
+        slug_snapshot(Some(as_str(root.path())), SLUG, Role::Standalone),
+        super::SINGLE_MODEL_VAR,
+        ARCHS,
+    ) else {
+        panic!("a present slug must run");
+    };
+    assert_eq!(path, mine);
+    let note = note.expect("an override that was not used must be announced");
+    assert!(note.contains(super::SINGLE_MODEL_VAR), "{note}");
+}
+
+/// With the slug absent the override serves the cell when it declares the
+/// cell's architecture, and the run says the variable decided.
+#[test]
+fn an_absent_slug_falls_back_to_a_same_arch_override() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let theirs = make_snapshot(root.path(), "vendor__same-arch-other-size", ARCH);
+    let empty_root = tempfile::tempdir().expect("tempdir");
+
+    let Gate::Run { path, note } = choose_by_slug(
+        override_snapshot(Some(as_str(&theirs)), Role::Standalone),
+        slug_snapshot(Some(as_str(empty_root.path())), SLUG, Role::Standalone),
+        super::SINGLE_MODEL_VAR,
+        ARCHS,
+    ) else {
+        panic!("a same-arch override must serve a cell whose slug is absent");
+    };
+    assert_eq!(path, theirs);
+    assert!(note.is_some(), "the fallback must be announced");
+}
+
+/// An override of another architecture does not serve the cell: skip, naming it.
+#[test]
+fn an_absent_slug_skips_rather_than_run_an_override_of_another_arch() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let theirs = make_snapshot(root.path(), "vendor__other-arch", OTHER_ARCH);
+    let empty_root = tempfile::tempdir().expect("tempdir");
+
+    let Gate::Skip(why) = choose_by_slug(
+        override_snapshot(Some(as_str(&theirs)), Role::Standalone),
+        slug_snapshot(Some(as_str(empty_root.path())), SLUG, Role::Standalone),
+        super::SINGLE_MODEL_VAR,
+        ARCHS,
+    ) else {
+        panic!("an override of another architecture must not run");
+    };
+    assert!(why.contains(OTHER_ARCH), "{why}");
+}
+
+/// A present slug whose snapshot declares another architecture is a broken root.
+#[test]
+fn a_present_slug_of_another_arch_fails() {
+    let root = tempfile::tempdir().expect("tempdir");
+    make_snapshot(root.path(), SLUG, OTHER_ARCH);
+
+    assert!(matches!(
+        choose_by_slug(
+            None,
+            slug_snapshot(Some(as_str(root.path())), SLUG, Role::Standalone),
+            super::SINGLE_MODEL_VAR,
+            ARCHS,
+        ),
+        Gate::Fail(_)
+    ));
+}
+
+/// An override whose `config.json` cannot be read is a broken pointer: it fails
+/// beside an absent slug instead of skipping quietly.
+#[test]
+fn an_override_with_no_readable_arch_fails_beside_an_absent_slug() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let broken = tmp.path().join("broken");
+    std::fs::create_dir_all(&broken).expect("create dir");
+    std::fs::write(broken.join("config.json"), b"not json").expect("write config");
+    std::fs::write(broken.join("tokenizer.json"), b"{}").expect("write tokenizer");
+    std::fs::write(broken.join("model.safetensors"), b"").expect("write weights");
+    let empty_root = tempfile::tempdir().expect("tempdir");
+
+    let Gate::Fail(why) = choose_by_slug(
+        override_snapshot(Some(as_str(&broken)), Role::Standalone),
+        slug_snapshot(Some(as_str(empty_root.path())), SLUG, Role::Standalone),
+        super::SINGLE_MODEL_VAR,
+        ARCHS,
+    ) else {
+        panic!("an override with an unreadable config must fail");
+    };
+    assert!(why.contains("architectures[0]"), "{why}");
+}
+
+/// A misconfigured override beside a present slug is ignored, and the run says so.
+#[test]
+fn a_misconfigured_override_beside_a_present_slug_is_noted() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mine = make_snapshot(root.path(), SLUG, ARCH);
+    let nowhere = root.path().join("was-moved-away");
+
+    let Gate::Run { path, note } = choose_by_slug(
+        override_snapshot(Some(as_str(&nowhere)), Role::Standalone),
+        slug_snapshot(Some(as_str(root.path())), SLUG, Role::Standalone),
+        super::SINGLE_MODEL_VAR,
+        ARCHS,
+    ) else {
+        panic!("a present slug must run");
+    };
+    assert_eq!(path, mine);
+    let note = note.expect("an ignored override must be announced");
+    assert!(note.contains("ignored beside the present slug"), "{note}");
+}
+
+/// A misconfigured override beside an absent slug fails.
+#[test]
+fn a_misconfigured_override_beside_an_absent_slug_fails() {
+    let empty_root = tempfile::tempdir().expect("tempdir");
+    let nowhere = empty_root.path().join("was-moved-away");
+
+    assert!(matches!(
+        choose_by_slug(
+            override_snapshot(Some(as_str(&nowhere)), Role::Standalone),
+            slug_snapshot(Some(as_str(empty_root.path())), SLUG, Role::Standalone),
+            super::SINGLE_MODEL_VAR,
+            ARCHS,
+        ),
+        Gate::Fail(_)
+    ));
+}
+
+/// A root that is not a directory fails even though an override would serve.
+#[test]
+fn a_root_that_is_not_a_directory_fails_even_with_a_serving_override() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let theirs = make_snapshot(tmp.path(), "vendor__same-arch-other-size", ARCH);
+    let missing = tmp.path().join("no-such-root");
+
+    assert!(matches!(
+        choose_by_slug(
+            override_snapshot(Some(as_str(&theirs)), Role::Standalone),
+            slug_snapshot(Some(as_str(&missing)), SLUG, Role::Standalone),
+            super::SINGLE_MODEL_VAR,
+            ARCHS,
+        ),
+        Gate::Fail(_)
+    ));
 }

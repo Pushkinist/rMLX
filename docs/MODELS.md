@@ -171,7 +171,8 @@ are kept. The paper defaults (32, 1) apply only when the config declares no
 No speculative seams. The `head_budget` and `softmax_mass` recipes of
 `rmlx kv-calibrate` accept only this architecture.
 
-Snapshot in use: `prism-ml__Ternary-Bonsai-8B-mlx-2bit`. Its `config.json`
+Snapshot in use: `prism-ml__Ternary-Bonsai-8B-mlx-2bit`, supported and not a test
+target. Its `config.json`
 declares 36 layers, 32 query and 8 KV heads at `head_dim` 128, and full
 attention on every layer (`sliding_window` is null). At its own YaRN
 scaling (factor 4 over 16384) the capacity is 65536. A larger
@@ -248,7 +249,10 @@ the request gets 400 with the template's own message. OpenAI clients send
 effort check.
 Tool calls use the Qwen3 XML form (`Qwen3XmlFunction`).
 
-**Snapshots in use.** Read from each snapshot's `config.json`. Every one
+**Snapshots in use.** Test targets: `Qwen3.8-27B-4bit` and
+`Ternary-Bonsai-2-27B-mlx-2bit`; the others are supported and are not test
+targets (`docs/TESTING.md` § "Test targets, kept cells and gaps"). Read from
+each snapshot's `config.json`. Every one
 has `full_attention_interval` 4, `head_dim` 256 and a
 `max_position_embeddings` of 262144.
 
@@ -375,7 +379,8 @@ Snapshot in use: `mlx-community__Qwen3-VL-30B-A3B-Instruct-4bit`.
   are quantized (`docs/KV_CACHE.md` §5.7).
 - No speculative seams.
 
-Snapshot in use: `mlx-community__medgemma-1.5-4b-it-8bit`.
+Snapshot in use: `mlx-community__medgemma-1.5-4b-it-8bit`, supported and not a test
+target.
 
 ---
 

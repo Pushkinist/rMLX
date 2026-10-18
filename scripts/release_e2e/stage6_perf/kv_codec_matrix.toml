@@ -409,6 +409,260 @@ cli_args = "--kv-quant mixed"
 niah_filter = "niah_qwen36_32k"
 
 # ===========================================================================
+# qwen3.8-27b-4bit (Qwen3_5ForConditionalGeneration, dense)
+#
+# Dense Qwen3.5 keeps every K-side codec the sparse MoE rejects, so no row
+# carries a low-K skip. Baselines are not recorded yet (0.0).
+# ===========================================================================
+
+[[entries]]
+codec_name = "bf16"
+model = "qwen3.8-27b-4bit"
+context_length = 32768
+expected_retrieval_pct = 1.0000
+smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
+skip_reason = ""
+cli_args = "--kv-quant bf16"
+niah_filter = "niah_qwen38_32k"
+
+[[entries]]
+codec_name = "k8v4"
+model = "qwen3.8-27b-4bit"
+context_length = 32768
+expected_retrieval_pct = 1.0000
+smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
+skip_reason = ""
+cli_args = "--kv-quant k8v4"
+niah_filter = "niah_qwen38_32k"
+
+[[entries]]
+codec_name = "k8v8"
+model = "qwen3.8-27b-4bit"
+context_length = 32768
+expected_retrieval_pct = 1.0000
+smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
+skip_reason = ""
+cli_args = "--kv-quant k8v8"
+niah_filter = "niah_qwen38_32k"
+
+[[entries]]
+codec_name = "TurboSym3"
+model = "qwen3.8-27b-4bit"
+context_length = 32768
+expected_retrieval_pct = 1.0000
+smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
+skip_reason = ""
+cli_args = "--kv-preset speed"
+niah_filter = "niah_qwen38_32k"
+
+[[entries]]
+codec_name = "TurboSym4"
+model = "qwen3.8-27b-4bit"
+context_length = 32768
+expected_retrieval_pct = 1.0000
+smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
+skip_reason = ""
+cli_args = "--kv-preset quality"
+niah_filter = "niah_qwen38_32k"
+
+[[entries]]
+codec_name = "Iso3Sym"
+model = "qwen3.8-27b-4bit"
+context_length = 32768
+expected_retrieval_pct = 1.0000
+smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
+skip_reason = ""
+cli_args = "--cache-type-k iso_k_3 --cache-type-v iso_v_3"
+niah_filter = "niah_qwen38_32k"
+
+[[entries]]
+codec_name = "Iso4Sym"
+model = "qwen3.8-27b-4bit"
+context_length = 32768
+expected_retrieval_pct = 1.0000
+smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
+skip_reason = ""
+cli_args = "--cache-type-k iso_k_4 --cache-type-v iso_v_4"
+niah_filter = "niah_qwen38_32k"
+
+[[entries]]
+codec_name = "Rotor3Sym"
+model = "qwen3.8-27b-4bit"
+context_length = 32768
+expected_retrieval_pct = 1.0000
+smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
+skip_reason = ""
+cli_args = "--cache-type-k rotor_k_3 --cache-type-v rotor_v_3"
+niah_filter = "niah_qwen38_32k"
+
+[[entries]]
+codec_name = "Rotor4Sym"
+model = "qwen3.8-27b-4bit"
+context_length = 32768
+expected_retrieval_pct = 1.0000
+smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
+skip_reason = ""
+cli_args = "--cache-type-k rotor_k_4 --cache-type-v rotor_v_4"
+niah_filter = "niah_qwen38_32k"
+
+[[entries]]
+codec_name = "PlanarK"
+model = "qwen3.8-27b-4bit"
+context_length = 32768
+expected_retrieval_pct = 1.0000
+smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
+skip_reason = ""
+cli_args = "--cache-type-k planar_k4 --cache-type-v bf16"
+niah_filter = "niah_qwen38_32k"
+
+[[entries]]
+codec_name = "planar"
+model = "qwen3.8-27b-4bit"
+context_length = 32768
+expected_retrieval_pct = 1.0000
+smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
+skip_reason = ""
+cli_args = "--kv-quant planar"
+niah_filter = "niah_qwen38_32k"
+
+[[entries]]
+codec_name = "Mixed"
+model = "qwen3.8-27b-4bit"
+context_length = 32768
+expected_retrieval_pct = 1.0000
+smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
+skip_reason = ""
+cli_args = "--kv-quant mixed"
+niah_filter = "niah_qwen38_32k"
+
+# ===========================================================================
+# bonsai2-27b (prism_hadamard_qwen35, dense)
+#
+# The dense Qwen3.5 layout keeps every K-side codec the sparse MoE rejects, so no row
+# carries a low-K skip. Baselines are not recorded yet (0.0).
+# ===========================================================================
+
+[[entries]]
+codec_name = "bf16"
+model = "bonsai2-27b"
+context_length = 32768
+expected_retrieval_pct = 1.0000
+smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
+skip_reason = ""
+cli_args = "--kv-quant bf16"
+niah_filter = "niah_bonsai2_32k"
+
+[[entries]]
+codec_name = "k8v4"
+model = "bonsai2-27b"
+context_length = 32768
+expected_retrieval_pct = 1.0000
+smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
+skip_reason = ""
+cli_args = "--kv-quant k8v4"
+niah_filter = "niah_bonsai2_32k"
+
+[[entries]]
+codec_name = "k8v8"
+model = "bonsai2-27b"
+context_length = 32768
+expected_retrieval_pct = 1.0000
+smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
+skip_reason = ""
+cli_args = "--kv-quant k8v8"
+niah_filter = "niah_bonsai2_32k"
+
+[[entries]]
+codec_name = "TurboSym3"
+model = "bonsai2-27b"
+context_length = 32768
+expected_retrieval_pct = 1.0000
+smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
+skip_reason = ""
+cli_args = "--kv-preset speed"
+niah_filter = "niah_bonsai2_32k"
+
+[[entries]]
+codec_name = "TurboSym4"
+model = "bonsai2-27b"
+context_length = 32768
+expected_retrieval_pct = 1.0000
+smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
+skip_reason = ""
+cli_args = "--kv-preset quality"
+niah_filter = "niah_bonsai2_32k"
+
+[[entries]]
+codec_name = "Iso3Sym"
+model = "bonsai2-27b"
+context_length = 32768
+expected_retrieval_pct = 1.0000
+smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
+skip_reason = ""
+cli_args = "--cache-type-k iso_k_3 --cache-type-v iso_v_3"
+niah_filter = "niah_bonsai2_32k"
+
+[[entries]]
+codec_name = "Iso4Sym"
+model = "bonsai2-27b"
+context_length = 32768
+expected_retrieval_pct = 1.0000
+smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
+skip_reason = ""
+cli_args = "--cache-type-k iso_k_4 --cache-type-v iso_v_4"
+niah_filter = "niah_bonsai2_32k"
+
+[[entries]]
+codec_name = "Rotor3Sym"
+model = "bonsai2-27b"
+context_length = 32768
+expected_retrieval_pct = 1.0000
+smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
+skip_reason = ""
+cli_args = "--cache-type-k rotor_k_3 --cache-type-v rotor_v_3"
+niah_filter = "niah_bonsai2_32k"
+
+[[entries]]
+codec_name = "Rotor4Sym"
+model = "bonsai2-27b"
+context_length = 32768
+expected_retrieval_pct = 1.0000
+smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
+skip_reason = ""
+cli_args = "--cache-type-k rotor_k_4 --cache-type-v rotor_v_4"
+niah_filter = "niah_bonsai2_32k"
+
+[[entries]]
+codec_name = "PlanarK"
+model = "bonsai2-27b"
+context_length = 32768
+expected_retrieval_pct = 1.0000
+smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
+skip_reason = ""
+cli_args = "--cache-type-k planar_k4 --cache-type-v bf16"
+niah_filter = "niah_bonsai2_32k"
+
+[[entries]]
+codec_name = "planar"
+model = "bonsai2-27b"
+context_length = 32768
+expected_retrieval_pct = 1.0000
+smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
+skip_reason = ""
+cli_args = "--kv-quant planar"
+niah_filter = "niah_bonsai2_32k"
+
+[[entries]]
+codec_name = "Mixed"
+model = "bonsai2-27b"
+context_length = 32768
+expected_retrieval_pct = 1.0000
+smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
+skip_reason = ""
+cli_args = "--kv-quant mixed"
+niah_filter = "niah_bonsai2_32k"
+
+# ===========================================================================
 # Fused-QK / sparse-attn rows.
 #
 # Kept for inventory. They are unconditionally skipped (no smoke, no NIAH
@@ -445,3 +699,23 @@ smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
 skip_reason = "fused-qk-dispatch-pending"
 cli_args = ""
 niah_filter = "niah_qwen36_32k"
+
+[[entries]]
+codec_name = "fused_qk_sparse"
+model = "qwen3.8-27b-4bit"
+context_length = 32768
+expected_retrieval_pct = 0.0
+smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
+skip_reason = "fused-qk-dispatch-pending"
+cli_args = ""
+niah_filter = "niah_qwen38_32k"
+
+[[entries]]
+codec_name = "fused_qk_sparse"
+model = "bonsai2-27b"
+context_length = 32768
+expected_retrieval_pct = 0.0
+smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
+skip_reason = "fused-qk-dispatch-pending"
+cli_args = ""
+niah_filter = "niah_bonsai2_32k"

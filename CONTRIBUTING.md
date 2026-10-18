@@ -44,7 +44,7 @@ runs a narrowed subset.
 
 Model-touching changes: see the regression-bench discipline in
 [`CLAUDE.md`](CLAUDE.md). At minimum the three test-target families (Gemma4,
-Qwen3.6, Bonsai) must still serve, each at its best-known KV quant, within ±1%
+Qwen3.8, Bonsai 2) must still serve, each at its best-known KV quant, within ±1%
 of the recorded decode TPS.
 
 ## Workflow

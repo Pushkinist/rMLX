@@ -18,7 +18,7 @@
 - [ ] `make ci` green locally
 - [ ] Tests added/updated in sibling `*_tests.rs` (no inline `#[cfg(test)] mod`)
 - [ ] Docs/`CLAUDE.md` updated if behavior or layout changed
-- [ ] **Model-touching change:** regression smoke run — Gemma4, Qwen3.6, Bonsai
+- [ ] **Model-touching change:** regression smoke run — Gemma4, Qwen3.8, Bonsai 2
       still serve at best-known KV quant, decode TPS within ±1% (N/A otherwise)
 - [ ] No new `Cargo.toml` dependency without justification
 

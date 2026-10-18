@@ -474,8 +474,24 @@ pub fn choose(over: Option<Snapshot>, slug: Snapshot, model: &GoldenModel, regen
 /// [`override_snapshot`]'s, not a second copy of their rules. `blame` is the
 /// variable a message should name — the harness's own messages name
 /// [`SINGLE_MODEL_VAR`], and a drafter is overridden by a different one.
-pub fn choose_by_slug(over: Option<Snapshot>, slug: Snapshot, blame: &str) -> Gate {
+///
+/// `archs` is the architectures the cell covers, or `None` for a cell that
+/// covers any. Whatever runs must declare one of them: a present slug that does
+/// not is a failure, and an override that does not, beside an absent slug, is a
+/// skip — it is a statement about another cell. An override whose
+/// `config.json` is unreadable is a broken pointer and fails.
+pub fn choose_by_slug(
+    over: Option<Snapshot>,
+    slug: Snapshot,
+    blame: &str,
+    archs: Option<&[&str]>,
+) -> Gate {
+    let serves = |arch: &str| archs.is_none_or(|a| a.contains(&arch));
     match slug {
+        Snapshot::Found { path, arch } if !serves(&arch) => Gate::Fail(format!(
+            "{} has arch \"{arch}\", not one of {archs:?}",
+            path.display()
+        )),
         Snapshot::Found { path, .. } => {
             let note = match over {
                 None => None,
@@ -494,6 +510,16 @@ pub fn choose_by_slug(over: Option<Snapshot>, slug: Snapshot, blame: &str) -> Ga
         Snapshot::Misconfigured(why) => Gate::Fail(why),
         Snapshot::Absent(why) => match over {
             None => Gate::Skip(why.replace(SINGLE_MODEL_VAR, blame)),
+            Some(Snapshot::Found { path, arch }) if arch.is_empty() && archs.is_some() => {
+                Gate::Fail(format!(
+                    "{blame}={} has no readable architectures[0] in its config.json",
+                    path.display()
+                ))
+            }
+            Some(Snapshot::Found { arch, .. }) if !serves(&arch) => Gate::Skip(format!(
+                "{}; {blame} names arch \"{arch}\", which this cell does not cover",
+                why.replace(SINGLE_MODEL_VAR, blame)
+            )),
             Some(Snapshot::Found { path, .. }) => Gate::Run {
                 path,
                 note: Some(format!("{why}; {blame} decides instead")),
@@ -523,7 +549,25 @@ pub fn slug_or_override(var: &str, slug: &str, role: Role) -> Gate {
         override_snapshot(named.as_deref(), role),
         slug_snapshot(root.as_deref(), slug, role),
         var,
+        None,
     )
+}
+
+/// Resolve the snapshot of a cell that covers one architecture family, slug
+/// first, or `None` when this machine has none. A resolved snapshot is loaded
+/// right after, so this also calls [`release_cached_buffers`].
+pub fn model_slug_first(model: &GoldenModel, test_name: &str) -> Option<PathBuf> {
+    let single = std::env::var(SINGLE_MODEL_VAR).ok();
+    let root = std::env::var(MODELS_ROOT_VAR).ok();
+    let gate = choose_by_slug(
+        override_snapshot(single.as_deref(), Role::Standalone),
+        slug_snapshot(root.as_deref(), model.slug, Role::Standalone),
+        SINGLE_MODEL_VAR,
+        Some(model.archs),
+    );
+    let path = apply(gate, test_name)?;
+    release_cached_buffers();
+    Some(path)
 }
 
 /// Turn a decision into what [`model_for`] returns. Split out so the
@@ -547,16 +591,14 @@ pub fn apply(gate: Gate, test_name: &str) -> Option<PathBuf> {
     }
 }
 
-/// Read the first entry of the `architectures` array from `<model_dir>/config.json`.
+/// Read the first entry of the `architectures` array from `<model_dir>/config.json`,
+/// or its `model_type` when it names no architecture (a Prism Hadamard pack).
 ///
 /// Returns an empty string when the file is missing or unparseable, which no
-/// golden's expected-arch list contains, so callers read it as a mismatch. The
-/// two callers then diverge on purpose, and the split is worth knowing:
-/// [`choose`] turns a mismatch on a path THIS golden named into a hard failure,
-/// while [`skip_if_arch_mismatch`] — used by suites that resolve their own
-/// per-architecture path — reports a skip. A golden pins one checkpoint's bytes
-/// and an unreadable config there means its own snapshot is broken; those suites
-/// are handed a path chosen for another architecture as a matter of course.
+/// golden's expected-arch list contains, so [`choose`] reads it as a mismatch and
+/// turns a mismatch on a path THIS golden named into a hard failure. A golden
+/// pins one checkpoint's bytes, so an unreadable config there means its own
+/// snapshot is broken.
 pub fn model_arch(model_dir: &Path) -> String {
     let cfg_path = model_dir.join("config.json");
     let Ok(data) = std::fs::read(&cfg_path) else {
@@ -567,24 +609,10 @@ pub fn model_arch(model_dir: &Path) -> String {
     };
     v.get("architectures")
         .and_then(|a| a.get(0))
+        .or_else(|| v.get("model_type"))
         .and_then(|s| s.as_str())
         .unwrap_or("")
         .to_owned()
-}
-
-/// Return `true` (and print a SKIP notice) when the model at `model_dir` does
-/// not match any of the `expected` architecture strings.
-///
-/// For a golden, prefer [`model_for`] — it resolves the snapshot and gates the
-/// arch in one place. This remains for suites that resolve their own per-arch
-/// path and only need the arch check (`niah_long_context.rs`).
-pub fn skip_if_arch_mismatch(model_dir: &Path, test_name: &str, expected: &[&str]) -> bool {
-    let arch = model_arch(model_dir);
-    if expected.contains(&arch.as_str()) {
-        return false;
-    }
-    eprintln!("SKIP {test_name}: model arch \"{arch}\" != expected {expected:?}");
-    true
 }
 
 /// The weight-quantization mode a snapshot's `config.json` declares, if it

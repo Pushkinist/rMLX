@@ -1,5 +1,7 @@
 {
-  "snapshot": "mlx-community__gemma-4-e4b-it-mxfp8",
+  "snapshots": [
+    "mlx-community__gemma-4-e4b-it-mxfp8"
+  ],
   "arch": "Gemma4ForConditionalGeneration",
   "messages": [
     {

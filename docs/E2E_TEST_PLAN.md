@@ -24,7 +24,9 @@ outside the checkout, and prints the path at the end of the run.
   `--cache-type-k`/`--cache-type-v` instead of `--kv-quant`.
 - `crates/rmlx-cli/tests/e2e/report.rs` writes the grid.
 - `crates/rmlx-cli/tests/e2e/golden/<case_id>.json` holds the recorded token
-  bytes of each `golden` case.
+  bytes of each `golden` case. `every_golden_case_has_a_recorded_file` fails
+  while a `golden` case has no file, because a run with the file absent records
+  one and passes.
 
 ## Assertion kinds
 
@@ -75,11 +77,11 @@ The manifest's `feature` column groups the rows:
 | `quant_matrix` | Bonsai at every `kv_quant` listed there, plus `rot_k` / `q4_g64` through `ctk`/`ctv`: `coherent` and `niah_retrieval` on each, `cosine_vs_bf16` on some |
 | `quant_matrix_konly` | the K-only and symmetric codecs on Bonsai (tag `konly`): short-context `coherent` only |
 | `thinking` | Bonsai `thinking` |
-| `broader_models` | Gemma4-e4b, Qwen3.6-35B-A3B, gemma-4-26b-a4b and gemma-4-31b: `golden`, stream and Anthropic coherence, `niah_retrieval` and `cosine_vs_bf16` on a subset of legal codecs, a sliding-window-crossing NIAH on Gemma4, the Qwen3.6 KV refusals (`q4_g128` K, `tsym3`) and Qwen3.6 thinking |
+| `broader_models` | Gemma4-e4b, Qwen3.6-35B-A3B, Qwen3.8-27B-4bit, gemma-4-26b-a4b and gemma-4-31b: `golden`, stream and Anthropic coherence, `niah_retrieval` and `cosine_vs_bf16` on a subset of legal codecs, a sliding-window-crossing NIAH on Gemma4, the Qwen3.6 KV refusals (`q4_g128` K, `tsym3`; Qwen3.8 is dense and has none) and Qwen3.6 and Qwen3.8 thinking |
 | `ssd_kv_tier`, `prompt_cache` | `byte_identical_restart`, `cache_hit_equivalence` on Bonsai |
 | `multi_model`, `attention` | `model_lifecycle`, `dispatch_fired` (k8v4) on Bonsai |
-| `speculative` | Qwen3.6 with its DFlash and MTP drafters, Gemma4-e4b drafted by Gemma4-e2b, Qwen3.8-27B drafted by ornith-1.0-9b, all `spec_decode`; `p2_speculative_decode` is a `phase2` row and records PENDING |
-| `modalities`, `agent` | Gemma4-e4b `image`; Qwen3.6 and Bonsai `tool_call` |
+| `speculative` | Qwen3.6 with its DFlash and MTP drafters, Gemma4-e4b drafted by Gemma4-e2b, Qwen3.8-27B drafted by ornith-1.0-9b, and Qwen3.8-27B-4bit with its MTP-4bit and DFlash2 drafters, all `spec_decode`; `p2_speculative_decode` is a `phase2` row and records PENDING |
+| `modalities`, `agent` | Gemma4-e4b `image`; Qwen3.6, Qwen3.8 and Bonsai `tool_call` |
 
 The K-only and symmetric codecs re-quantize K at every decode step. On
 Bonsai they lose coherence at long context, so their rows assert short-context

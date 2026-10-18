@@ -40,6 +40,28 @@ unsupported = [
   { backend = "ollama", reason = "no paroquant support" },
 ]
 
+# ── Qwen3.5 dense ─────────────────────────────────────────────────────────────
+
+[[model]]
+namespace = "mlx-community"
+name = "Qwen3.8-27B-4bit"
+arch = "Qwen3.5"
+weight_quant_display = "affine 4b"
+order = 10
+aliases = []
+unsupported = []
+
+[[model]]
+namespace = "prism-ml"
+name = "Ternary-Bonsai-2-27B-mlx-2bit"
+arch = "Qwen3.5"
+weight_quant_display = "2-bit ternary"
+order = 11
+aliases = []
+unsupported = [
+  { backend = "ollama", reason = "no 2-bit ternary support" },
+]
+
 # ── Qwen3 dense (Bonsai) ──────────────────────────────────────────────────────
 
 [[model]]

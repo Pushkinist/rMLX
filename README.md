@@ -58,10 +58,12 @@ cover these snapshots:
 | Family | Snapshot | Arch |
 |---|---|---|
 | Gemma 4 | `gemma-4-e4b-it-mxfp8` | `Gemma4ForConditionalGeneration` |
-| Qwen 3.6 | `Qwen3.6-35B-A3B-8bit` | `Qwen3_5MoeForConditionalGeneration` |
-| Bonsai | `Ternary-Bonsai-8B-mlx-2bit` | `Qwen3ForCausalLM` |
+| Qwen 3.8 | `Qwen3.8-27B-4bit` | `Qwen3_5ForConditionalGeneration` |
+| Bonsai 2 | `Ternary-Bonsai-2-27B-mlx-2bit` | `prism_hadamard_qwen35` (`model_type`) |
 | BitNet | `bitnet-b1.58-2B-4T` | `BitNetForCausalLM` |
-| MedGemma | `medgemma-1.5-4b-it-8bit` | `Gemma3ForConditionalGeneration` |
+
+Qwen 3.6, the first-generation Bonsai checkpoints and MedGemma (Gemma 3) are
+supported and keep their goldens; they are not test targets.
 
 [`docs/MODELS.md`](docs/MODELS.md) covers every architecture, including the
 Gemma 4 QAT checkpoints and

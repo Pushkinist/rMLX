@@ -2,7 +2,7 @@
 //! `: done` line each loop closes a request with; the other lines are the
 //! per-round record, the accounting error and an unrelated `: done`.
 
-use super::scrape_spec_accept;
+use super::{golden_dir, scrape_spec_accept, Manifest};
 
 /// The message and `loop_kind` of each loop's summary line, one per loop.
 const SUMMARY_EVENTS: [(&str, &str); 7] = [
@@ -106,4 +106,45 @@ fn the_last_summary_line_wins() {
 fn a_run_with_no_summary_line_is_an_error() {
     let got = scrape(&[round_line(), accounting_line(), unrelated_done_line()]);
     assert!(got.is_err(), "{got:?}");
+}
+
+const MANIFEST: &str = include_str!("manifest.toml");
+
+fn manifest() -> Manifest {
+    toml::from_str(MANIFEST).expect("manifest.toml must parse")
+}
+
+#[test]
+fn case_ids_are_unique() {
+    let mut seen = std::collections::BTreeSet::new();
+    let repeated: Vec<String> = manifest()
+        .case
+        .into_iter()
+        .map(|c| c.id)
+        .filter(|id| !seen.insert(id.clone()))
+        .collect();
+    assert!(repeated.is_empty(), "repeated case ids: {repeated:?}");
+}
+
+/// A `golden` case with no recorded file records one and passes on its first
+/// run, so it asserts nothing until the file is checked in.
+#[test]
+fn every_golden_case_has_a_recorded_file() {
+    let missing: Vec<String> = manifest()
+        .case
+        .into_iter()
+        .filter(|c| c.assert.kind == "golden")
+        .map(|c| c.id)
+        .filter(|id| !golden_dir().join(format!("{id}.json")).exists())
+        .collect();
+    let files: Vec<String> = missing
+        .iter()
+        .map(|id| format!("crates/rmlx-cli/tests/e2e/golden/{id}.json"))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "golden cases without a recorded file: {files:?}; record each with \
+         `RMLX_E2E_REGEN_GOLDEN=1 RMLX_E2E_ONLY=<case id> cargo test -p rmlx-cli --test \
+         e2e_harness -- --ignored --test-threads=1 --nocapture` and check the file in"
+    );
 }

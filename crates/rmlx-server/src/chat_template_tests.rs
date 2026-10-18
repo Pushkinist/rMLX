@@ -8,6 +8,14 @@ fn qwen36_snap_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("RMLX_TEST_MODEL_QWEN36").map(std::path::PathBuf::from)
 }
 
+fn qwen38_snap_dir() -> std::path::PathBuf {
+    let root = std::env::var_os("RMLX_O_MODELS_ROOT").map_or_else(
+        || std::path::PathBuf::from("models"),
+        std::path::PathBuf::from,
+    );
+    root.join("mlx-community__Qwen3.8-27B-4bit")
+}
+
 fn dr_venus_snap_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("RMLX_TEST_MODEL_DR_VENUS").map(std::path::PathBuf::from)
 }
@@ -785,28 +793,34 @@ fn qwen3_template_emits_tools_block() {
 }
 
 /// Full multi-turn tool conversation (system, user, assistant+tool_calls,
-/// tool result) must render through the real Qwen3.6 template with the
+/// tool result) must render through each real Qwen template present on this
+/// host (Qwen3.6 by variable, Qwen3.8 by slug under the models root) with the
 /// function name, the arguments, and the tool-result string all present.
 /// This is the exact shape pi sends on turn 2 of a tool session.
 #[test]
 fn qwen3_renders_full_tool_conversation() {
-    let Some(snap_buf) = qwen36_snap_dir() else {
-        tracing::warn!("RMLX_TEST_MODEL_QWEN36 not set — skipping");
-        return;
-    };
-    let snap = snap_buf.as_path();
-    if !snap.exists() {
-        tracing::warn!(
-            path = %snap.display(),
-            "Qwen3.6 snapshot absent — skipping qwen3_renders_full_tool_conversation"
-        );
-        return;
+    const TEST: &str = "qwen3_renders_full_tool_conversation";
+    let mut snaps = Vec::new();
+    for (name, dir) in [
+        ("Qwen3.6 (RMLX_TEST_MODEL_QWEN36)", qwen36_snap_dir()),
+        ("Qwen3.8 (RMLX_O_MODELS_ROOT)", Some(qwen38_snap_dir())),
+    ] {
+        match dir.filter(|d| d.exists()) {
+            Some(dir) => snaps.push(dir),
+            None => println!("SKIP {TEST}: no {name} snapshot present"),
+        }
     }
+    for snap in snaps {
+        assert_full_tool_conversation_renders(&snap);
+    }
+}
+
+fn assert_full_tool_conversation_renders(snap: &Path) {
     let source = load_template_source(snap).expect("load template source");
-    let tpl = ChatTemplate::new(source).expect("compile Qwen3.6 template");
+    let tpl = ChatTemplate::new(source).expect("compile Qwen template");
 
     // arguments arrive as a parsed object (OwnedTplMessage does the
-    // wire-string -> object conversion before render; Qwen3.6 uses
+    // wire-string -> object conversion before render; the Qwen templates use
     // `tool_call.arguments|items`).
     let tool_calls = serde_json::json!([{
         "id": "call_x",
@@ -850,17 +864,20 @@ fn qwen3_renders_full_tool_conversation() {
     let r = tpl.render(&messages, &opts).expect("render");
     assert!(
         r.text.contains("<function=write_file>"),
-        "missing tool-call function name in render:\n{}",
+        "{}: missing tool-call function name in render:\n{}",
+        snap.display(),
         r.text
     );
     assert!(
         r.text.contains("fizzbuzz.py"),
-        "missing tool-call arguments in render:\n{}",
+        "{}: missing tool-call arguments in render:\n{}",
+        snap.display(),
         r.text
     );
     assert!(
         r.text.contains("<tool_response>") && r.text.contains("wrote fizzbuzz.py (12 lines)"),
-        "missing tool-result string in render:\n{}",
+        "{}: missing tool-result string in render:\n{}",
+        snap.display(),
         r.text
     );
 }

@@ -1,9 +1,10 @@
 //! Chat-template HF round-trip fixture tests.
 //!
 //! For each fixture JSON in `tests/chat_template_fixtures/`, this test:
-//! 1. Checks whether the snapshot directory named in the fixture exists locally.
-
-//! 2. Loads `chat_template.jinja` from the snapshot via `load_template_source`.
+//! 1. Checks which of the snapshot directories named in the fixture exist
+//!    locally. Snapshots that ship the same template are listed together; the
+//!    fixture runs on every one present and is skipped only when none is.
+//! 2. Loads `chat_template.jinja` from each via `load_template_source`.
 //! 3. Renders with rMLX `ChatTemplate` using the fixture's messages, tools and
 //!    template variables (`template_kwargs`: `reasoning_effort`, `enable_thinking`).
 //! 4. Asserts `rendered.text == fixture.expected` BYTE-FOR-BYTE, or, for a
@@ -19,8 +20,9 @@
 //! - Gemma3ForConditionalGeneration
 //! - Qwen3ForCausalLM (incl. tools)
 //! - Qwen2ForCausalLM
-//! - Qwen3_5ForConditionalGeneration, the Ternary-Bonsai-2 pack (reasoning
-//!   effort, no-thinking, tools, a refused effort)
+//! - Qwen3_5ForConditionalGeneration, the Ternary-Bonsai-2 pack and the
+//!   Qwen3.8-27B snapshots that share its template (reasoning effort,
+//!   no-thinking, tools, a refused effort)
 //!
 //! Mistral / Llama3: deferred — no local snapshot available.
 
@@ -48,7 +50,7 @@ use rmlx_server::chat_template::{
 
 #[derive(serde::Deserialize, Debug)]
 struct Fixture {
-    snapshot: String,
+    snapshots: Vec<String>,
     // arch is present in the JSON for documentation purposes; not used at runtime.
     #[allow(dead_code)]
     arch: String,
@@ -92,15 +94,32 @@ fn load_fixture(stem: &str) -> Fixture {
     serde_json::from_str(&data).unwrap_or_else(|e| panic!("cannot parse fixture {stem}.json: {e}"))
 }
 
-/// Run a single round-trip assertion.
+/// Run a single round-trip assertion on every listed snapshot that is present.
 ///
-/// Returns `true` if the test ran, `false` if the snapshot was absent (skip).
+/// Returns `true` if the test ran on at least one. When none is present it
+/// prints one named `SKIP` on stdout and returns `false`.
 fn run_fixture(stem: &str) -> bool {
     let fixture = load_fixture(stem);
-    let snap_dir = o_models_root().join(&fixture.snapshot);
+    let mut ran = false;
+    for snapshot in &fixture.snapshots {
+        ran |= assert_on_snapshot(stem, &fixture, snapshot);
+    }
+    if !ran {
+        println!(
+            "SKIP roundtrip_{stem}: none of {:?} present with a chat_template.jinja",
+            fixture.snapshots
+        );
+    }
+    ran
+}
+
+/// Render the fixture with the template of one snapshot and assert it. Returns
+/// `false` when the snapshot is absent or ships no `chat_template.jinja`.
+fn assert_on_snapshot(stem: &str, fixture: &Fixture, snapshot: &str) -> bool {
+    let snap_dir = o_models_root().join(snapshot);
 
     if !snap_dir.exists() {
-        eprintln!("[SKIP] {stem}: snapshot '{}' absent", snap_dir.display());
+        eprintln!("{stem}: snapshot {snapshot} absent");
         return false;
     }
 
@@ -110,14 +129,11 @@ fn run_fixture(stem: &str) -> bool {
     let source = if let Ok(s) = load_template_source(&snap_dir) {
         s
     } else {
-        eprintln!(
-            "[SKIP] {stem}: snapshot '{}' has no chat_template.jinja",
-            snap_dir.display()
-        );
+        eprintln!("{stem}: snapshot {snapshot} has no chat_template.jinja");
         return false;
     };
     let tpl = ChatTemplate::new(source)
-        .unwrap_or_else(|e| panic!("{stem}: cannot compile template: {e}"));
+        .unwrap_or_else(|e| panic!("{stem} on {snapshot}: cannot compile template: {e}"));
 
     let msgs: Vec<ChatMessageTpl<'_>> = fixture
         .messages
@@ -147,17 +163,19 @@ fn run_fixture(stem: &str) -> bool {
     ) {
         (Ok(rendered), Some(expected), None) => assert_eq!(
             &rendered.text, expected,
-            "{stem} render diverges from HF reference.\n  got:      {:?}\n  expected: {expected:?}",
+            "{stem} on {snapshot}: render diverges from HF reference.\n  got:      {:?}\n  expected: {expected:?}",
             rendered.text,
         ),
         (Err(RenderError::Rejected(msg)), None, Some(expected_error)) => {
             assert_eq!(
                 &msg, expected_error,
-                "{stem}: the template refuses with another message"
+                "{stem} on {snapshot}: the template refuses with another message"
             );
         }
         (got, expected, expected_error) => {
-            panic!("{stem}: want render {expected:?} / refusal {expected_error:?}, got {got:?}")
+            panic!(
+                "{stem} on {snapshot}: want render {expected:?} / refusal {expected_error:?}, got {got:?}"
+            )
         }
     }
 

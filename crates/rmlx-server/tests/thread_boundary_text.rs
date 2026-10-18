@@ -18,7 +18,9 @@
 
 mod thread_boundary;
 
-use thread_boundary::{BITNET, BONSAI_8B, GEMMA4_E2B, QWEN36_MOE, READERLM_V2, TERNARY_BONSAI_27B};
+use thread_boundary::{
+    BITNET, BONSAI_8B, GEMMA4_E2B, QWEN36_MOE, QWEN38_4BIT, READERLM_V2, TERNARY_BONSAI_27B,
+};
 
 use rmlx_mlx::Device;
 use thread_boundary::{chat_prompt, greedy, hand_over, load_model, long_prompt, snapshot, Split};
@@ -67,6 +69,17 @@ fn qwen3_5_text_decodes_on_a_thread_that_did_not_load_the_model() {
     assert_text(
         "qwen3_5_text_decodes_on_a_thread_that_did_not_load_the_model",
         TERNARY_BONSAI_27B,
+        Device::Gpu,
+    );
+}
+
+/// A dense Qwen3.5 checkpoint with 4-bit affine weights.
+#[test]
+#[ignore = "requires Metal GPU and the Qwen3.8-27B-4bit snapshot; run with `make gpu-test`"]
+fn qwen3_8_text_decodes_on_a_thread_that_did_not_load_the_model() {
+    assert_text(
+        "qwen3_8_text_decodes_on_a_thread_that_did_not_load_the_model",
+        QWEN38_4BIT,
         Device::Gpu,
     );
 }
@@ -173,6 +186,18 @@ fn a_qwen3_5_moe_prompt_cache_hit_decodes_on_another_thread() {
     assert_prompt_cache(
         "a_qwen3_5_moe_prompt_cache_hit_decodes_on_another_thread",
         QWEN36_MOE,
+        Device::Gpu,
+    );
+}
+
+/// The dense Qwen3.5 entry also carries the recurrent state of its linear
+/// attention layers.
+#[test]
+#[ignore = "requires Metal GPU and the Qwen3.8-27B-4bit snapshot; run with `make gpu-test`"]
+fn a_qwen3_8_prompt_cache_hit_decodes_on_another_thread() {
+    assert_prompt_cache(
+        "a_qwen3_8_prompt_cache_hit_decodes_on_another_thread",
+        QWEN38_4BIT,
         Device::Gpu,
     );
 }
