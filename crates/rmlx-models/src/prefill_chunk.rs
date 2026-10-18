@@ -32,6 +32,7 @@
 
 #![allow(clippy::match_same_arms)]
 use std::env;
+use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const FALLBACK: usize = 64;
@@ -129,6 +130,38 @@ fn resolve_with(
         Some(v) => (v, "arch_default"),
         None => (FALLBACK, "fallback"),
     }
+}
+
+/// The forwards a prefill of tokens `start..end` makes: consecutive pieces of
+/// `chunk` tokens, and one more boundary at `cut` when it falls strictly inside
+/// a piece.
+///
+/// This is the one place that decides where a prefill splits. A boundary the
+/// chunk size already makes, or one outside `start..end`, adds nothing. The cut
+/// is where an architecture with recurrent state must take its state for the
+/// prompt cache; whether the state is then kept does not change the split.
+///
+/// The perplexity scorer (`ppl.rs`) stays outside this plan. It passes no cut,
+/// because its rows must stay comparable with the rows already in the metrics
+/// DB.
+pub(crate) fn prefill_pieces(
+    start: usize,
+    end: usize,
+    chunk: usize,
+    cut: Option<usize>,
+) -> Vec<Range<usize>> {
+    let chunk = chunk.max(1);
+    let mut pieces = Vec::new();
+    let mut from = start;
+    while from < end {
+        let to = end.min(from + chunk);
+        match cut.filter(|&at| from < at && at < to) {
+            Some(at) => pieces.extend([from..at, at..to]),
+            None => pieces.push(from..to),
+        }
+        from = to;
+    }
+    pieces
 }
 
 /// Map a config dispatch class (e.g. `"Qwen3ForCausalLM"`) to

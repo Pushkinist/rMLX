@@ -312,6 +312,7 @@ pub fn generate_greedy(
         &mut kv,
         prompt_ids,
         prefill_chunk,
+        None,
         device,
         "qwen3_vl_moe",
         cancel,

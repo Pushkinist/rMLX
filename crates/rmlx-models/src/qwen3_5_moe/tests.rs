@@ -36,14 +36,14 @@ use rmlx_kv_ssd::chained_block_hashes;
     reason = "shared with the integration tests, which use more of it"
 )]
 #[path = "../../tests/common/attention_calls.rs"]
-mod attention_calls;
+pub(super) mod attention_calls;
 #[allow(
     dead_code,
     unreachable_pub,
     reason = "shared with the integration tests, which use more of it"
 )]
 #[path = "../../tests/common/round_stream.rs"]
-mod round_stream;
+pub(super) mod round_stream;
 
 /// The PARO snapshot the PARO cells below read, and the variable that overrides
 /// it for a models root that does not hold it.
@@ -3586,4 +3586,4 @@ fn qwen3_5_moe_consume_engine_migration_golden() {
 
 /// A request resumed from a RAM entry's saved state, on the dense checkpoint.
 #[path = "anchor_resume_tests.rs"]
-mod anchor_resume_tests;
+pub(in crate::qwen3_5_moe) mod anchor_resume_tests;

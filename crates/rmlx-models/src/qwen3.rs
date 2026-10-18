@@ -2051,6 +2051,7 @@ pub fn generate_greedy<'a>(
         &mut caches,
         prompt_ids,
         prefill_chunk,
+        None,
         device,
         "qwen3",
         cancel,

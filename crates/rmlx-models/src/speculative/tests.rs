@@ -171,8 +171,8 @@ fn spec_prefill_chunked_runs_exit_sweep_on_failure() {
     let _ = prefill_chunked_with(
         "test",
         &tokens,
+        &crate::prefill_chunk::prefill_pieces(0, tokens.len(), 4, None),
         &mut caches,
-        4,
         Device::Cpu,
         &never,
         forward,
@@ -217,8 +217,8 @@ fn spec_prefill_chunked_reports_first_cause() {
     let err = prefill_chunked_with(
         "test",
         &tokens,
+        &crate::prefill_chunk::prefill_pieces(0, tokens.len(), 4, None),
         &mut caches,
-        4,
         Device::Cpu,
         &never,
         forward,
@@ -410,6 +410,7 @@ fn verifier_prefill_cuts_the_prompt_at_the_architectures_chunk() {
         let result = prefill_chunked_for_class(
             class,
             &tokens,
+            None,
             &mut [],
             Device::Cpu,
             &never,

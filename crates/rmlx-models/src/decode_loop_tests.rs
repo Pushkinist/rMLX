@@ -941,6 +941,7 @@ fn chunked_prefill_propagates_chunk_failure() {
         &mut caches,
         &ids,
         (4, "arch_default"),
+        None,
         Device::Cpu,
         "test",
         &AtomicBool::new(false),
@@ -983,6 +984,7 @@ fn chunked_prefill_runs_exit_sweep_on_failure() {
         &mut caches,
         &ids,
         (4, "arch_default"),
+        None,
         Device::Cpu,
         "test",
         &AtomicBool::new(false),
@@ -1017,6 +1019,7 @@ fn chunked_prefill_rejects_empty_prompt() {
         &mut caches,
         &ids,
         (4, "arch_default"),
+        None,
         Device::Cpu,
         "test",
         &AtomicBool::new(false),
@@ -1235,6 +1238,7 @@ fn chunked_prefill_logs_the_chunk_it_cut_at() {
             &mut caches,
             &ids,
             (4, "arch_default"),
+            None,
             Device::Cpu,
             "qwen3",
             &AtomicBool::new(false),
@@ -1256,6 +1260,41 @@ fn chunked_prefill_logs_the_chunk_it_cut_at() {
     assert_eq!(field("n_chunks").as_deref(), Some("3"));
     assert_eq!(field("arch").as_deref(), Some("qwen3"));
     assert_eq!(seen, vec![4], "prefill did not cut at the chunk it logged");
+}
+
+/// A cut inside a chunk adds one forward, and the forwards still cover the
+/// prompt once, in order.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test fixture: a failed prefill aborts the test loudly"
+)]
+fn chunked_prefill_splits_at_the_cut() {
+    let _g = mlx_guard();
+    let mut caches: Vec<KvCache> = (0..2)
+        .map(|_| KvCache::with_quant_max_seq(KvQuant::None, 16))
+        .collect();
+    let ids: Vec<u32> = (0..9).collect();
+    let mut seen: Vec<Vec<u32>> = Vec::new();
+    let forward_chunk = |chunk: &[u32], _caches: &mut Vec<KvCache>| -> Result<Array> {
+        seen.push(chunk.to_vec());
+        rmlx_mlx::zeros(&[1], Dtype::F32, Device::Cpu)
+    };
+    chunked_prefill(
+        &mut caches,
+        &ids,
+        (4, "arch_default"),
+        Some(6),
+        Device::Cpu,
+        "test",
+        &AtomicBool::new(false),
+        forward_chunk,
+    )
+    .expect("chunked_prefill");
+    assert_eq!(
+        seen,
+        vec![vec![0, 1, 2, 3], vec![4, 5], vec![6, 7], vec![8]]
+    );
 }
 
 // ── The replayed first token of an exact prompt-cache hit ────────────────────

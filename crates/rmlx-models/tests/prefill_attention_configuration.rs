@@ -1110,6 +1110,7 @@ fn speculative_prefill_calls(model: &Architecture, prompt: &[u32]) -> Vec<Attent
         rmlx_models::speculative::prefill_chunked(
             model,
             prompt,
+            prompt.len(),
             &mut kv,
             lin.as_deref_mut(),
             DEVICE,
@@ -1351,10 +1352,19 @@ fn check_every_prefill_path(loaded: &Loaded, test: &str, paths: Paths) {
     assert_the_recorder_is_live(DEVICE);
     let mut report = Report::default();
 
-    for (label, chunk, tail) in [
+    let mut cells = vec![
         ("default:", None, 1025),
         ("override:", Some(ADAPTIVE_CHUNK), 1100),
-    ] {
+    ];
+    // A recurrent architecture cuts its last block at the anchor, a multiple of
+    // 256, so no piece the cut leaves is a row short of or past the floor. A
+    // chunk of the floor and of one past it leaves such a piece before the cut.
+    if loaded.model.needs_lin_caches() {
+        let floor = SPLIT_KERNEL_MIN_QUERY_ROWS as usize;
+        cells.push(("floor chunk:", Some(floor), 1025));
+        cells.push(("floor + 1 chunk:", Some(floor + 1), 1025));
+    }
+    for (label, chunk, tail) in cells {
         let _chunk = chunk.map(install_chunk);
         check_fresh_prefills(loaded, label, paths.plain_split, &mut report);
         if paths.resumes_an_extended_prompt {
@@ -1535,6 +1545,7 @@ fn tail_rows_after_prefill(model: &Architecture, ids: &[u32], prefill_len: usize
     rmlx_models::speculative::prefill_chunked(
         model,
         &ids[..prefill_len],
+        prefill_len,
         &mut kv,
         lin.as_deref_mut(),
         DEVICE,

@@ -630,3 +630,7 @@ mod pack_serve_tests;
 #[cfg(test)]
 #[path = "first_logprobs_tests.rs"]
 mod first_logprobs_tests;
+
+#[cfg(test)]
+#[path = "prefill_plan_tests.rs"]
+mod prefill_plan_tests;

@@ -133,6 +133,7 @@ impl RoundDrafter for AdaptiveRound<'_> {
         prefill_chunked(
             ctx.verifier,
             head,
+            prompt.len(),
             &mut ctx.kv,
             ctx.lin.as_deref_mut(),
             device,

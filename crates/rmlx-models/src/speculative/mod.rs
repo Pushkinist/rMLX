@@ -930,6 +930,12 @@ pub(crate) fn emit_step(
 /// Chunked prefill of `tokens` into `caches`, mirroring the gemma4 generate
 /// path (enter_prefill / exit_prefill brackets, per-arch chunk size).
 ///
+/// `tokens` is the head of a prompt of `prompt_len` tokens: the round loop
+/// forwards the last token on its own, so `prompt_len` is `tokens.len()` or one
+/// more, and any other value is refused. An architecture with recurrent state
+/// (`lin_caches` is `Some`) splits the head where the plain prefill of the
+/// whole prompt splits it, at the anchor of `prompt_len`.
+///
 /// Used at the top of `spec_generate_greedy_cached` once per model.
 /// `pub` for the MTP drafter-alignment integration test (it replays
 /// round-0 prefill explicitly to assert drafter↔verifier first-token match).
@@ -938,14 +944,25 @@ pub(crate) fn emit_step(
 pub fn prefill_chunked(
     arch: &Architecture,
     tokens: &[u32],
+    prompt_len: usize,
     caches: &mut [KvCache],
     mut lin_caches: Option<&mut [LinearAttnCache]>,
     device: Device,
     cancel: &AtomicBool,
 ) -> Result<()> {
+    if !(tokens.len()..=tokens.len() + 1).contains(&prompt_len) {
+        return Err(Error::Model(format!(
+            "prefill_chunked: a prompt of {prompt_len} tokens cannot have a head of {} tokens",
+            tokens.len()
+        )));
+    }
+    let cut = lin_caches
+        .as_ref()
+        .and_then(|_| crate::prompt_cache::anchor_target(prompt_len, 0));
     prefill_chunked_for_class(
         arch.arch_class(),
         tokens,
+        cut,
         caches,
         device,
         cancel,
@@ -971,6 +988,7 @@ pub fn prefill_chunked(
 fn prefill_chunked_for_class(
     arch_class: &str,
     tokens: &[u32],
+    cut: Option<usize>,
     caches: &mut [KvCache],
     device: Device,
     cancel: &AtomicBool,
@@ -979,19 +997,21 @@ fn prefill_chunked_for_class(
     let arch = crate::prefill_chunk::event_name(arch_class);
     let (chunk_size, chunk_source) =
         crate::prefill_chunk::resolve(crate::prefill_chunk::module_key_for_class(arch_class));
+    let pieces = crate::prefill_chunk::prefill_pieces(0, tokens.len(), chunk_size, cut);
     tracing::debug!(
         arch,
         prefill_chunk = chunk_size,
         prefill_chunk_source = chunk_source,
         prompt_len = tokens.len(),
-        n_chunks = tokens.len().div_ceil(chunk_size.max(1)),
+        n_chunks = pieces.len(),
         "prefill: chunking prompt"
     );
-    prefill_chunked_with(arch, tokens, caches, chunk_size, device, cancel, forward)
+    prefill_chunked_with(arch, tokens, &pieces, caches, device, cancel, forward)
 }
 
 /// Bracket-and-sweep engine behind [`prefill_chunked`]: `enter_prefill` on every
-/// cache, run `forward` per chunk, then `exit_prefill` on every cache.
+/// cache, run `forward` on each of `pieces` (ranges of `tokens`, from
+/// [`crate::prefill_chunk::prefill_pieces`]), then `exit_prefill` on every cache.
 ///
 /// The `exit_prefill` sweep is **mandatory** and runs on the failure path too.
 /// On a chunk forward / eval failure this captures the first cause, breaks the
@@ -1013,8 +1033,8 @@ fn prefill_chunked_for_class(
 fn prefill_chunked_with(
     arch: &str,
     tokens: &[u32],
+    pieces: &[std::ops::Range<usize>],
     caches: &mut [KvCache],
-    prefill_chunk: usize,
     device: Device,
     cancel: &AtomicBool,
     mut forward: impl FnMut(&[u32], &mut [KvCache]) -> Result<()>,
@@ -1025,13 +1045,18 @@ fn prefill_chunked_with(
     for c in caches.iter_mut() {
         c.enter_prefill();
     }
-    let n_chunks = tokens.len().div_ceil(prefill_chunk);
+    let n_chunks = pieces.len();
     // A closure, so that `?` ends the chunk loop and not this fn: the sweep
     // below is owed on every outcome, a stop included.
     let mut run_chunks = |caches: &mut [KvCache]| -> Result<()> {
-        for (chunk_idx, chunk) in tokens.chunks(prefill_chunk).enumerate() {
+        for (chunk_idx, piece) in pieces.iter().enumerate() {
             ensure_not_cancelled(cancel)?;
             let is_last = chunk_idx + 1 == n_chunks;
+            #[allow(
+                clippy::indexing_slicing,
+                reason = "the pieces partition 0..tokens.len()"
+            )]
+            let chunk = &tokens[piece.clone()];
             if let Err(e) = forward(chunk, caches) {
                 tracing::error!(error = %e, "spec prefill chunk forward failed, aborting generation");
                 return Err(e);

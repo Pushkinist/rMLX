@@ -53,6 +53,7 @@ fn shared_prefill(
         caches,
         ids,
         (4, "arch_default"),
+        None,
         Device::Cpu,
         "test",
         stop,
@@ -361,7 +362,7 @@ fn a_prefill_whose_forward_fails_starts_no_further_chunk_and_returns_that_error(
 
 /// The decode loop and the prefill that several architectures share.
 const SHARED_LOOPS: [&str; 2] = [
-    "decode_loop.rs::chunked_prefill: for (chunk_idx, chunk) in ids.chunks(chunk_size.max(1)).enumerate() {",
+    "decode_loop.rs::chunked_prefill: for (chunk_idx, piece) in pieces.iter().enumerate() {",
     "decode_loop.rs::pipelined_decode: for step_idx in 1..ctx.n_tokens {",
 ];
 
@@ -375,7 +376,7 @@ const OWN_BODY_LOOPS: [&str; 11] = [
     "laguna/generate.rs::generate_greedy: for (chunk_idx, chunk) in prompt_ids.chunks(prefill_chunk).enumerate() {",
     "qwen2/generate.rs::decode_loop: for step_idx in 1..n_tokens {",
     "qwen2/generate.rs::generate_greedy: for (chunk_idx, chunk) in prompt_ids.chunks(prefill_chunk).enumerate() {",
-    "qwen3_5_moe/generate.rs::generate_greedy: for (chunk_idx, chunk) in tail.chunks(prefill_chunk).enumerate() {",
+    "qwen3_5_moe/generate.rs::generate_greedy: for (chunk_idx, piece) in pieces.iter().enumerate() {",
     "qwen3_vl_moe/generate.rs::decode_from: for _ in 0..n_tokens {",
     "qwen3_vl_moe/generate.rs::generate_image: for g in 0..n_tokens {",
     "qwen3_vl_moe/model.rs::forward_embeds_chunked: while start < seq {",
@@ -387,9 +388,9 @@ const TOWER_LOOPS: [&str; 1] =
 
 /// The round loop, and the prefills that only the drafters run.
 const SPECULATIVE_LOOPS: [&str; 4] = [
-    "qwen3_5_moe/model.rs::forward_verify_capture_chunked: while pos < n {",
+    "qwen3_5_moe/model.rs::forward_verify_capture_chunked: for (piece_idx, piece) in pieces.iter().enumerate() {",
     "speculative/eagle3/mod.rs::prefill_from_verifier_hidden: while pos < total {",
-    "speculative/mod.rs::prefill_chunked_with: for (chunk_idx, chunk) in tokens.chunks(prefill_chunk).enumerate() {",
+    "speculative/mod.rs::prefill_chunked_with: for (chunk_idx, piece) in pieces.iter().enumerate() {",
     "speculative/round_loop.rs::run_rounds: while emitted.len() < n_tokens {",
 ];
 

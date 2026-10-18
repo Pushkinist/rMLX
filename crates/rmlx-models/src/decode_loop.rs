@@ -44,6 +44,7 @@ use rmlx_core::cancel::ensure_not_cancelled;
 use rmlx_core::error::{Error, Result};
 
 use crate::constraint::ConstraintEngine;
+use crate::prefill_chunk::prefill_pieces;
 use crate::sampler::{
     compute_top_logprobs, select_token, Pcg32, PenaltyConfig, SamplerConfig, TokenLogprobs,
 };
@@ -902,6 +903,9 @@ fn prefill_cache_over_bound(active: Option<u64>, cached: Option<u64>) -> bool {
 /// second one can disagree with the size this prefill is actually using and
 /// would log the wrong provenance for an ordinary adaptive run.
 ///
+/// `cut` is a position the prefill must split at, if it falls inside a chunk:
+/// see [`prefill_pieces`].
+///
 /// `arch` is the key of [`crate::prefill_chunk::event_name`], the
 /// one name every prefill loop uses in its events.
 ///
@@ -923,6 +927,7 @@ pub(crate) fn chunked_prefill(
     caches: &mut Vec<KvCache>,
     ids: &[u32],
     resolved_chunk: (usize, &'static str),
+    cut: Option<usize>,
     device: Device,
     arch: &'static str,
     cancel: &AtomicBool,
@@ -932,15 +937,18 @@ pub(crate) fn chunked_prefill(
     for c in caches.iter_mut() {
         c.enter_prefill();
     }
-    let n_chunks = ids.len().div_ceil(chunk_size.max(1));
+    let pieces = prefill_pieces(0, ids.len(), chunk_size, cut);
+    let n_chunks = pieces.len();
     log_prefill_plan(arch, chunk_size, chunk_source, ids.len(), n_chunks);
     // A closure, so that `?` ends the chunk loop and not this fn: the
     // exit_prefill sweep below is owed on every outcome, a stop included.
     let mut run_chunks = |caches: &mut Vec<KvCache>| -> Result<Option<Array>> {
         let mut last_logits: Option<Array> = None;
-        for (chunk_idx, chunk) in ids.chunks(chunk_size.max(1)).enumerate() {
+        for (chunk_idx, piece) in pieces.iter().enumerate() {
             ensure_not_cancelled(cancel)?;
             let is_last = chunk_idx + 1 == n_chunks;
+            #[allow(clippy::indexing_slicing, reason = "the pieces partition 0..ids.len()")]
+            let chunk = &ids[piece.clone()];
             match forward_chunk(chunk, caches) {
                 Ok(logits) => {
                     if is_last {

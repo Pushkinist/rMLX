@@ -184,7 +184,7 @@ impl PromptCacheEntry for Qwen35MoeEntry {
     /// the K/V back to the anchor and puts the anchor's state in place of the
     /// end state. The anchor the clone keeps is never used after a
     /// `BlockTruncate`: the resumed request captures the anchor of its own entry
-    /// from the resume point on (`anchor_target`), the resume point included.
+    /// from the resume point on ([`crate::prompt_cache::anchor_target`]), the resume point included.
     fn prepare_reuse(&self, kind: ReuseKind) -> Result<Self> {
         let ReuseKind::BlockTruncate { effective_blocks } = kind else {
             return self.deep_clone();

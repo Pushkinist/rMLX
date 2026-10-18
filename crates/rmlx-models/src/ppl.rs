@@ -332,6 +332,7 @@ fn score_window_through_cache(
         caches,
         &win[..=warmup],
         crate::prefill_chunk::resolve(arch),
+        None,
         device,
         arch,
         // The perplexity command has no request, so it has no stop.

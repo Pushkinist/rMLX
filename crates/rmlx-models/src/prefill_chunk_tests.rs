@@ -125,3 +125,80 @@ fn each_resolution_rule_reports_its_own_source() {
     // qwen3's variable.
     assert_eq!(resolve_with(0, "gemma4", both), (256, "env_global"));
 }
+
+#[test]
+fn pieces_without_a_cut_are_the_chunks() {
+    assert_eq!(prefill_pieces(0, 5, 2, None), vec![0..2, 2..4, 4..5]);
+    assert_eq!(prefill_pieces(0, 4, 2, None), vec![0..2, 2..4]);
+    assert_eq!(prefill_pieces(3, 8, 4, None), vec![3..7, 7..8]);
+    assert_eq!(prefill_pieces(5, 5, 4, None), Vec::<Range<usize>>::new());
+    assert_eq!(prefill_pieces(0, 3, 0, None), vec![0..1, 1..2, 2..3]);
+}
+
+#[test]
+fn a_cut_inside_a_chunk_splits_it() {
+    assert_eq!(
+        prefill_pieces(0, 3893, 2048, Some(3840)),
+        vec![0..2048, 2048..3840, 3840..3893]
+    );
+    assert_eq!(
+        prefill_pieces(0, 700, 1024, Some(512)),
+        vec![0..512, 512..700]
+    );
+    assert_eq!(prefill_pieces(3, 8, 4, Some(5)), vec![3..5, 5..7, 7..8]);
+}
+
+#[test]
+fn a_cut_on_a_boundary_or_outside_adds_nothing() {
+    let plain = prefill_pieces(0, 5, 2, None);
+    assert_eq!(prefill_pieces(0, 5, 2, Some(2)), plain, "on a chunk edge");
+    assert_eq!(prefill_pieces(0, 5, 2, Some(4)), plain, "on the last edge");
+    assert_eq!(prefill_pieces(0, 5, 2, Some(5)), plain, "at the end");
+    assert_eq!(prefill_pieces(0, 5, 2, Some(0)), plain, "at the start");
+    assert_eq!(prefill_pieces(0, 5, 2, Some(9)), plain, "past the end");
+    assert_eq!(
+        prefill_pieces(3, 8, 4, Some(3)),
+        prefill_pieces(3, 8, 4, None)
+    );
+    assert_eq!(
+        prefill_pieces(3, 8, 4, Some(1)),
+        prefill_pieces(3, 8, 4, None),
+        "behind the start"
+    );
+}
+
+/// A speculative prefill forwards the prompt less its last token. When that
+/// head ends on the cut, the cut adds no boundary, and the last token is a
+/// piece of its own, as in a prefill of the whole prompt.
+#[test]
+fn a_cut_at_the_end_of_the_speculative_head_matches_the_whole_prompt() {
+    assert_eq!(
+        prefill_pieces(0, 3840, 2048, Some(3840)),
+        prefill_pieces(0, 3840, 2048, None)
+    );
+    assert_eq!(
+        prefill_pieces(0, 3841, 2048, Some(3840)),
+        vec![0..2048, 2048..3840, 3840..3841]
+    );
+}
+
+/// The pieces cover `start..end` once, in order, whatever the cut, and none is
+/// empty.
+#[test]
+fn the_pieces_partition_the_range() {
+    for end in [1, 2, 700, 1024, 1025, 4096, 4097] {
+        for chunk in [1, 64, 1024, 2048] {
+            for cut in [None, Some(0), Some(1), Some(256), Some(512), Some(3840)] {
+                let pieces = prefill_pieces(0, end, chunk, cut);
+                let mut covered = 0;
+                for piece in &pieces {
+                    assert!(piece.start < piece.end, "empty piece in {pieces:?}");
+                    assert_eq!(piece.start, covered, "gap or overlap in {pieces:?}");
+                    assert!(piece.len() <= chunk, "{pieces:?} over the chunk {chunk}");
+                    covered = piece.end;
+                }
+                assert_eq!(covered, end, "end={end} chunk={chunk} cut={cut:?}");
+            }
+        }
+    }
+}

@@ -19,7 +19,8 @@ fn spec_prefill(
     stop: &AtomicBool,
     forward: impl FnMut(&[u32], &mut [KvCache]) -> Result<()>,
 ) -> Result<()> {
-    prefill_chunked_with("test", tokens, caches, 4, Device::Cpu, stop, forward)
+    let pieces = crate::prefill_chunk::prefill_pieces(0, tokens.len(), 4, None);
+    prefill_chunked_with("test", tokens, &pieces, caches, Device::Cpu, stop, forward)
 }
 
 /// What one scripted prefill did.

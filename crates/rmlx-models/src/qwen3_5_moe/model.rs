@@ -840,8 +840,11 @@ impl Qwen3_5MoeText {
     /// Returns `(logits[1,1,vocab], hidden[1,kept,n_aux*hidden])`, oldest kept
     /// row first.
     ///
-    /// When `ids.len() <= chunk_size` the entire prompt is a single chunk
-    /// (no concatenation overhead).
+    /// The prompt is cut every `chunk_size` tokens and once more at its anchor
+    /// ([`crate::prefill_chunk::prefill_pieces`]), where the plain prefill cuts
+    /// it. The chunk stays the caller's: it bounds the memory of the captured
+    /// hidden rows. A prompt with no anchor inside it and no longer than
+    /// `chunk_size` is a single chunk (no concatenation overhead).
     ///
     /// `cancel` is the stop flag of the request. Each chunk reads it before its
     /// forward, and a stopped prefill returns
@@ -874,15 +877,17 @@ impl Qwen3_5MoeText {
             ));
         }
 
-        let chunk_size = chunk_size.max(1);
+        let cut = lin_caches
+            .as_ref()
+            .and_then(|_| crate::prompt_cache::anchor_target(n, 0));
+        let pieces = crate::prefill_chunk::prefill_pieces(0, n, chunk_size, cut);
         let mut lin_opt: Option<&mut [LinearAttnCache]> = lin_caches;
         let mut captured = CaptureTail::new(keep_last);
-        let mut pos = 0usize;
 
-        while pos < n {
+        for (piece_idx, piece) in pieces.iter().enumerate() {
             ensure_not_cancelled(cancel)?;
-            let end = (pos + chunk_size).min(n);
-            let chunk = &ids[pos..end];
+            let (pos, end) = (piece.start, piece.end);
+            let chunk = &ids[piece.clone()];
             let chunk_n = chunk.len();
             let is_last = end == n;
 
@@ -937,8 +942,7 @@ impl Qwen3_5MoeText {
             for c in kv_caches.iter() {
                 c.eval_gpu_state()?;
             }
-            crate::decode_loop::release_chunk_buffers("qwen3_5_moe", pos / chunk_size);
-            pos = end;
+            crate::decode_loop::release_chunk_buffers("qwen3_5_moe", piece_idx);
         }
 
         // Unreachable: `is_last` is true at the final iteration and returns early.

@@ -162,6 +162,7 @@ impl RoundDrafter for TwoModelRound<'_> {
         prefill_chunked(
             ctx.verifier,
             head,
+            prompt.len(),
             &mut ctx.kv,
             ctx.lin.as_deref_mut(),
             device,
@@ -170,6 +171,7 @@ impl RoundDrafter for TwoModelRound<'_> {
         prefill_chunked(
             self.draft,
             head,
+            prompt.len(),
             &mut self.kv,
             self.lin.as_deref_mut(),
             device,

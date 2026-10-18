@@ -1,6 +1,7 @@
 use super::*;
 use crate::prompt_cache::{
-    chained_block_hashes_seeded, request_cache_seed, Consumed, PromptCache, BLOCK_TOKENS,
+    anchor_target, chained_block_hashes_seeded, entry_is_storable, request_cache_seed, Consumed,
+    PromptCache, BLOCK_TOKENS,
 };
 use rmlx_core::error::Error;
 use rmlx_mlx::{Array, Device};
@@ -378,5 +379,29 @@ fn every_slot_declining_is_one_miss_with_the_best_slots_reason() {
     assert!(
         matches!(consume(&arch, &request), Consumed::Miss(reason) if reason.label() == "non_reusable"),
         "no slot offers a state, so the request misses on the first slot's reason"
+    );
+}
+
+#[test]
+fn the_target_is_the_anchor_position_of_the_prompt_length() {
+    assert_eq!(anchor_target(700, 0), Some(512));
+    assert_eq!(anchor_target(257, 0), Some(256));
+    assert_eq!(anchor_target(256, 0), None, "below one block of tail");
+}
+
+#[test]
+fn a_resumed_request_captures_only_at_or_past_its_resume_point() {
+    assert_eq!(anchor_target(740, 700), None, "the anchor 512 is behind it");
+    assert_eq!(anchor_target(1300, 700), Some(1280));
+    assert_eq!(anchor_target(769, 768), Some(768), "at the resume point");
+}
+
+#[test]
+fn an_entry_is_stored_with_slots_and_without_paged_kv() {
+    assert!(entry_is_storable(4, false));
+    assert!(!entry_is_storable(0, false), "no slots");
+    assert!(
+        !entry_is_storable(4, true),
+        "paged KV refuses a cache holding pages"
     );
 }

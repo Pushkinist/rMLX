@@ -55,7 +55,7 @@ fn reset_cache() {
 }
 
 /// Where the stored entry for a prompt of `len` tokens holds its anchor.
-fn stored_anchor_pos(len: usize) -> Option<usize> {
+pub(in crate::qwen3_5_moe) fn stored_anchor_pos(len: usize) -> Option<usize> {
     prompt_cache::PROMPT_CACHE.with_inner_mut(|guard| {
         let cache = guard.as_ref()?;
         let slot = cache

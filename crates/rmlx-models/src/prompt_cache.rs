@@ -291,6 +291,16 @@ impl Anchor {
     }
 }
 
+/// Where a prompt of `prompt_len` tokens is split and its recurrent state taken
+/// when it is forwarded from `resume_from`: the anchor position of its length,
+/// if that is not behind the resume point.
+///
+/// The split does not depend on whether the entry is stored
+/// ([`entry_is_storable`]): a prompt is forwarded in the same pieces either way.
+pub(crate) fn anchor_target(prompt_len: usize, resume_from: usize) -> Option<usize> {
+    Anchor::pos_for(prompt_len).filter(|&pos| pos >= resume_from)
+}
+
 // ---------------------------------------------------------------------------
 // PromptCacheEntry trait
 // ---------------------------------------------------------------------------

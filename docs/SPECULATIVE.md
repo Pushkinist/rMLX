@@ -496,8 +496,12 @@ verifier's cache stack is built by `round_common::verifier_cache_stack`:
 **Prefill.** The MTP sidecar, the assistant, DFlash 1 and the two-model kind
 prefill through `prefill_chunked`. It uses the verifier's per-architecture
 chunk (`prefill_chunk::resolve`) and logs the size and its source at `debug`.
+For a verifier with recurrent state it also splits the prompt at the anchor of
+the whole prompt, where the plain prefill splits it
+(`docs/PROMPT_CACHE.md` § "Qwen3.5 resume and the anchor").
 DFlash 2 and EAGLE-3 prefill through `forward_verify_capture_chunked` in
-1024-token chunks, because they need the captured hidden states.
+1024-token chunks, because they need the captured hidden states. It splits the
+prompt at the anchor of its length too.
 
 **Seed.** The five sidecar entries emit one token drawn from the prefill
 forward before the first round. The two-model entries emit nothing before a

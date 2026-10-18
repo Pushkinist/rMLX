@@ -397,12 +397,27 @@ previous generation prompt differently in the next request. A request that
 differs before the anchor misses (`non_reusable`).
 
 **Capture.** The anchor is taken while the prompt is prefilled
-(`qwen3_5_moe/anchor_capture.rs`). The chunk that holds the anchor position is
-forwarded in two parts, with the recurrent state cloned and evaluated between
-them. That moves where the cold prefill splits, so its logits can differ from
-those of a prefill that does not split there by bf16 noise. A resumed request
-stores an entry of its own. It takes the anchor of its prompt from its tail when
-the tail reaches that block, and inherits the resumed entry's anchor otherwise.
+(`qwen3_5_moe/anchor_capture.rs`). A chunk that holds the anchor position is
+forwarded in two pieces. `prefill_chunk::prefill_pieces` is the one producer of
+that split. The recurrent state is cloned and evaluated before the piece that
+starts at the anchor.
+
+Every cold prefill of an architecture with recurrent state splits at the anchor
+of the prompt length. The split does not depend on the request. A request that
+stores no entry (no prompt-cache slots, or paged KV) splits there too, and only
+skips the clone and the store. The speculative prefill forwards the prompt less
+its last token. It splits at the anchor of the whole prompt, so it forwards the
+pieces of the plain prefill, less the last token. The split moves where the
+prefill cuts, so its logits can differ from those of a prefill that does not
+split there by bf16 noise. A cold prefill forwards the same pieces whatever
+`--prompt-cache-slots` or `--paged-kv` is set to. A resume and an exact hit
+still differ from a cold prefill by bf16 noise. The DFlash 2 and EAGLE-3
+prefills also cut every 1024 tokens, so their pieces are not the plain ones.
+
+A resumed request stores an entry of its own. It takes the anchor of its prompt
+from its tail when the tail reaches that block, and inherits the resumed entry's
+anchor otherwise. A tail that starts at the anchor takes the state before its
+first piece.
 
 **Cost.** One anchor per entry, the newest. The K/V is shared with the entry and
 cut on reuse, not copied. The state is a fixed size per model whatever the

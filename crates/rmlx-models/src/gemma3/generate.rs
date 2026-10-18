@@ -312,6 +312,7 @@ pub fn generate_greedy<'a>(
             &mut caches,
             prompt_ids,
             prefill_chunk,
+            None,
             device,
             "gemma3",
             cancel,

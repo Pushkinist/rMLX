@@ -122,6 +122,7 @@ fn dflash_round0_first_token_aligns() {
     rmlx_models::speculative::prefill_chunked(
         &verifier,
         prefill,
+        prompt_ids.len(),
         &mut caches,
         Some(&mut lin),
         device,

@@ -30,13 +30,16 @@ use crate::decode_loop::{
     reject_nan_prefill, replay_first_logprobs, DecodeCtx,
 };
 use crate::kv_cache::{kv_layer_quants, warn_if_kv_codec_net_negative, KvLayerShape};
+use crate::prefill_chunk::prefill_pieces;
 use crate::sampler::TokenLogprobs;
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
-use super::anchor_capture::{anchor_target, AnchorCapture};
+use super::anchor_capture::AnchorCapture;
 use super::model::Qwen3_5MoeText;
 use super::prompt_cache::{ensure_prompt_cache, Qwen35MoeEntry, PROMPT_CACHE};
-use crate::prompt_cache::{entry_is_storable, Anchor, Consumed, ReuseKind, BLOCK_TOKENS};
+use crate::prompt_cache::{
+    anchor_target, entry_is_storable, Anchor, Consumed, ReuseKind, BLOCK_TOKENS,
+};
 
 /// Greedy autoregressive generation using KV-cache prefill + decode.
 ///
@@ -283,10 +286,10 @@ pub fn generate_greedy<'a>(
 
         // The new entry's anchor is taken from this tail when the tail reaches
         // it; otherwise the resumed entry's own anchor is the right one.
-        let mut anchor_capture = AnchorCapture::new(
-            anchor_target(prompt_ids.len(), storable, prefix_len),
-            KvCache::eval_gpu_state,
-        );
+        let cut = anchor_target(prompt_ids.len(), prefix_len);
+        let mut anchor_capture = AnchorCapture::new(cut.filter(|_| storable));
+        let pieces = prefill_pieces(prefix_len, prompt_ids.len(), prefill_chunk, cut);
+        let n_chunks = pieces.len();
 
         // No enter_prefill above (see the note on resumed caches) means no
         // exit_prefill sweep is owed here, so a failure or a stop returns its
@@ -294,15 +297,14 @@ pub fn generate_greedy<'a>(
         // sweep first).
         let prefill_logits = {
             let mut last_logits: Option<Array> = None;
-            let tail = &prompt_ids[prefix_len..];
-            let n_chunks = tail.len().div_ceil(prefill_chunk);
-            for (chunk_idx, chunk) in tail.chunks(prefill_chunk).enumerate() {
+            for (chunk_idx, piece) in pieces.iter().enumerate() {
                 ensure_not_cancelled(cancel)?;
                 let is_last = chunk_idx + 1 == n_chunks;
+                let chunk = &prompt_ids[piece.clone()];
                 match anchor_capture.forward(
                     model,
                     chunk,
-                    prefix_len + chunk_idx * prefill_chunk,
+                    piece.start,
                     &mut kv_caches,
                     &mut lin_caches,
                     device,
@@ -505,15 +507,14 @@ pub fn generate_greedy<'a>(
     // enter_prefill() / exit_prefill(), evals only the cache state on non-final
     // chunks, and propagates the cause on rejection. The GDN `lin_caches` are
     // closure-captured — the helper only owns `kv_caches`.
-    let mut anchor_capture = AnchorCapture::new(
-        anchor_target(prompt_ids.len(), storable, 0),
-        KvCache::eval_prefill_state,
-    );
+    let cut = anchor_target(prompt_ids.len(), 0);
+    let mut anchor_capture = AnchorCapture::new(cut.filter(|_| storable));
     let mut chunk_start = 0usize;
     let prefill_logits = chunked_prefill(
         &mut kv_caches,
         prompt_ids,
         prefill_chunk,
+        cut,
         device,
         "qwen3_5_moe",
         cancel,
