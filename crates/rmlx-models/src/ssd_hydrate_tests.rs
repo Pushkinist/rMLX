@@ -1250,23 +1250,23 @@ fn an_entry_that_ends_inside_a_block_hydrates_at_its_anchor() {
     let spiller = SsdSpiller::spawn(ns.name.clone(), LAYOUT_KEY, Device::Cpu);
     SpillSink::spill(&spiller, &entry);
 
-    // The drain thread creates the index while this one reads it, so an open
-    // that finds it half-built is retried with the read.
+    // The drain thread opens the index and writes the block in the background.
+    // The hydrator opens the same index here without the single-threaded open
+    // `prepare_attach` does first, so the two first opens overlap.
+    let hydrator = SsdHydrator::open(&ns.name, LAYOUT_KEY, Device::Cpu)
+        .expect("the index must open beside the drain thread's open");
     let request = request_longer_than(&prompt);
     let hydrated: Qwen35MoeEntry = (0..200)
         .find_map(|_| {
-            let hit = SsdHydrator::open(&ns.name, LAYOUT_KEY, Device::Cpu)
-                .ok()
-                .and_then(|h| {
-                    h.hydrate(
-                        &request,
-                        seed,
-                        QUANT,
-                        &layer_quants,
-                        DispatchPolicy::default(),
-                    )
-                    .expect("hydrate must not error")
-                });
+            let hit = hydrator
+                .hydrate(
+                    &request,
+                    seed,
+                    QUANT,
+                    &layer_quants,
+                    DispatchPolicy::default(),
+                )
+                .expect("hydrate must not error");
             if hit.is_none() {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }

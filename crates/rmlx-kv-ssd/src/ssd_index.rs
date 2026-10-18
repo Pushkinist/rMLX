@@ -69,9 +69,9 @@
 )]
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 
 // ── Error ─────────────────────────────────────────────────────────────────────
 
@@ -191,8 +191,11 @@ const SCHEMA_PRAGMAS: &str = "
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous  = NORMAL;
 PRAGMA foreign_keys = ON;
-PRAGMA busy_timeout = 5000;
 ";
+
+/// How long a contended lock is waited for, by the busy handler and by
+/// [`apply_pragmas`] alike.
+const BUSY_WAIT: Duration = Duration::from_secs(5);
 
 const SCHEMA_TABLES: &str = "
 CREATE TABLE IF NOT EXISTS kv_blocks (
@@ -287,11 +290,13 @@ impl SsdKvIndex {
     ///
     /// The DB is placed at `<kv_cache_dir(namespace)>/index.db`. Behaviour:
     ///
-    /// 1. File absent → create the current schema + insert `schema_version`.
-    /// 2. File present, **no `schema_version` table** → this is a pre-release
+    /// 1. No tables yet → create the current schema + insert `schema_version`.
+    /// 2. `kv_blocks` but **no `schema_version` table** → this is a pre-release
     ///    v1 DB. Return `SchemaMismatch`.
-    /// 3. File present, `schema_version != SCHEMA_VERSION` → `SchemaMismatch`.
-    /// 4. File present, `schema_version == SCHEMA_VERSION` → proceed.
+    /// 3. `schema_version != SCHEMA_VERSION` → `SchemaMismatch`.
+    /// 4. `schema_version == SCHEMA_VERSION` → proceed.
+    ///
+    /// Concurrent first opens of one namespace both succeed.
     pub fn open(namespace: &str) -> Result<Self> {
         let dir = rmlx_core::paths::kv_cache_dir(namespace);
         let db_path = dir.join("index.db");
@@ -306,42 +311,21 @@ impl SsdKvIndex {
     /// Open an in-memory index (for tests).
     pub fn open_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
+        conn.execute_batch(SCHEMA_PRAGMAS)?;
         init_current_schema(&conn)?;
         Ok(Self { conn })
     }
 
     /// Open the index at an explicit path. Performs the same schema-version
-    /// check as [`open`]: missing `schema_version` table on an existing DB ⇒
+    /// check as [`open`]: a pre-release layout or an unknown version ⇒
     /// [`SsdKvIndexError::SchemaMismatch`].
     pub fn open_at(db_path: &Path) -> Result<Self> {
-        let file_existed = db_path.exists();
         let conn = Connection::open(db_path)?;
-        conn.execute_batch(SCHEMA_PRAGMAS)?;
+        apply_pragmas(&conn)?;
 
-        if file_existed {
-            // Inspect schema_version before creating any table — touching
-            // them first would mask a pre-release v1 layout.
-            let version = read_schema_version(&conn)?;
-            match version {
-                Some(v) if v == SCHEMA_VERSION => conn.execute_batch(SCHEMA_INDEXES)?,
-                Some(v) => {
-                    return Err(SsdKvIndexError::SchemaMismatch {
-                        found: v,
-                        expected: SCHEMA_VERSION,
-                    })
-                }
-                None => {
-                    // Pre-release v1 — the cross-namespace wipe in
-                    // ssd_tier::install_config should have removed this DB
-                    // before we got here.
-                    return Err(SsdKvIndexError::SchemaMismatch {
-                        found: 1,
-                        expected: SCHEMA_VERSION,
-                    });
-                }
-            }
-        } else {
-            init_current_schema(&conn)?;
+        match read_schema_version(&conn)? {
+            Some(v) if v == SCHEMA_VERSION => conn.execute_batch(SCHEMA_INDEXES)?,
+            _ => init_current_schema(&conn)?,
         }
 
         adopt_persisted_stamps(&conn)?;
@@ -837,19 +821,56 @@ pub fn evict_pool_lru_until(kv_root: &Path, global_budget_bytes: u64) -> Result<
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Initialise a fresh [`SCHEMA_VERSION`] schema on a connection: create the
-/// tables + insert the version row. Idempotent on a clean DB; safe to call on
-/// an already-initialised DB at the same version (INSERT OR IGNORE on the
-/// version row).
+/// Set the busy timeout and apply [`SCHEMA_PRAGMAS`], waiting out a concurrent
+/// first open.
+///
+/// Switching a new database to WAL fails with `SQLITE_BUSY` at once while
+/// another connection is creating it: the busy handler is not consulted for
+/// that switch, so the timeout never applies and the wait is made here.
+fn apply_pragmas(conn: &Connection) -> Result<()> {
+    const POLL: Duration = Duration::from_millis(2);
+    conn.busy_timeout(BUSY_WAIT)?;
+    let deadline = Instant::now() + BUSY_WAIT;
+    loop {
+        match conn.execute_batch(SCHEMA_PRAGMAS) {
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::DatabaseBusy && Instant::now() < deadline =>
+            {
+                std::thread::sleep(POLL);
+            }
+            done => return done.map_err(Into::into),
+        }
+    }
+}
+
+/// Create the current schema on a database that holds none, or accept one that
+/// another opener created first.
+///
+/// The check and the creation share one write transaction, so two openers of a
+/// new database take turns instead of both finding it empty. A database that
+/// holds `kv_blocks` without a `schema_version` table is the pre-release
+/// layout; an empty file is not.
 fn init_current_schema(conn: &Connection) -> Result<()> {
-    conn.execute_batch(SCHEMA_PRAGMAS)?;
     // The tables and the version row commit together. Another process running
     // the stale-schema wipe must never see `kv_blocks` without a
     // `schema_version` row: that reads as version 0, which is "superseded", and
     // the pass would delete a namespace this call is still creating.
-    // `PRAGMA journal_mode` cannot run inside a transaction, so the pragmas
-    // stay outside it.
-    let tx = conn.unchecked_transaction()?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    match read_schema_version(&tx)? {
+        Some(v) if v != SCHEMA_VERSION => {
+            return Err(SsdKvIndexError::SchemaMismatch {
+                found: v,
+                expected: SCHEMA_VERSION,
+            })
+        }
+        None if has_table(&tx, "kv_blocks")? => {
+            return Err(SsdKvIndexError::SchemaMismatch {
+                found: 1,
+                expected: SCHEMA_VERSION,
+            })
+        }
+        _ => {}
+    }
     tx.execute_batch(SCHEMA_TABLES)?;
     tx.execute_batch(SCHEMA_INDEXES)?;
     tx.execute(
@@ -860,6 +881,15 @@ fn init_current_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Whether `conn`'s database holds a table called `name`.
+pub(crate) fn has_table(conn: &Connection, name: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        [name],
+        |r| r.get(0),
+    )?)
+}
+
 /// Read the schema version from an existing connection.
 ///
 /// `Ok(Some(v))` when the `schema_version` table exists and holds a row;
@@ -867,14 +897,7 @@ fn init_current_schema(conn: &Connection) -> Result<()> {
 /// `Err(_)` only on a genuine SQLite error.
 pub(crate) fn read_schema_version(conn: &Connection) -> Result<Option<i64>> {
     // Detect the table without creating it (DROP-and-recreate would mask v1).
-    let table_present: bool = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'",
-            [],
-            |_| Ok(true),
-        )
-        .unwrap_or(false);
-    if !table_present {
+    if !has_table(conn, "schema_version")? {
         return Ok(None);
     }
     let version: i64 = match conn.query_row(

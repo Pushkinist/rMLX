@@ -124,9 +124,9 @@ impl SsdSpiller {
     /// so the hot path never touches SQLite. `device` is the device used for
     /// serialization.
     ///
-    /// On index-open failure the drain thread logs `warn!` and exits; the
-    /// sender side still accepts (and silently drops) jobs, so the cache keeps
-    /// working with spill effectively disabled.
+    /// On index-open failure the drain thread logs `error!` and keeps draining
+    /// without writing; the sender side still accepts (and drops) jobs, so the
+    /// cache keeps working with spill disabled for the run.
     ///
     /// The namespace byte ceiling is resolved once here from the installed
     /// SSD-tier config, so it is the same figure the attach-time maintenance
@@ -147,7 +147,7 @@ impl SsdSpiller {
                 let index = match SsdKvIndex::open(&ns) {
                     Ok(idx) => idx,
                     Err(e) => {
-                        tracing::warn!(namespace = %ns, error = %e, "kv-spill: index open failed, spill disabled");
+                        tracing::error!(namespace = %ns, error = %e, "kv-spill: index open failed, every spill for this namespace is dropped");
  // Drain and drop remaining jobs so senders don't block.
                         for _ in rx {}
                         return;

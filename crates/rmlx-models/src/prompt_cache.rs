@@ -2006,7 +2006,7 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
 
 /// Shared SSD-sink install routine — replaces the three near-identical per-arch
 /// `install_ssd_sinks` helpers. Spiller is unconditional; hydrator-open failure
-/// logs a `warn!` and leaves the cache spill-only for the run.
+/// logs an `error!` and leaves the cache spill-only for the run.
 fn install_ssd_sinks<E: PromptCacheEntry>(cache: &mut PromptCache<E>, p: &AttachParams)
 where
     SsdSpiller: SpillSink<E>,
@@ -2019,7 +2019,7 @@ where
     )));
     match SsdHydrator::open(&p.namespace, p.layout_key, p.device) {
         Ok(h) => cache.set_ssd_source(Box::new(h)),
-        Err(e) => tracing::warn!(
+        Err(e) => tracing::error!(
             namespace = %p.namespace,
             error = %e,
             "SSD hydrator open failed; spill-only for this run"

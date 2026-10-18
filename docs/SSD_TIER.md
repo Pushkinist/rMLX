@@ -121,8 +121,10 @@ layout share their blocks: `layout_key` does not depend on the weights.
 `ssd_index::SCHEMA_VERSION` is the one source; its doc comment records what
 each version changed. `SsdKvIndex::open`:
 
-- no file: create the schema at the current version;
-- no `schema_version` table, or a different version: `SchemaMismatch`;
+- no tables: create the schema at the current version, in one write
+  transaction, so two openers of a new namespace take turns and both succeed;
+- `kv_blocks` without a `schema_version` table, or a different version:
+  `SchemaMismatch`;
 - the current version: open.
 
 Every schema change is a wipe, never a row migration: the tier holds nothing

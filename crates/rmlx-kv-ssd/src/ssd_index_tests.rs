@@ -581,6 +581,101 @@ fn open_at_tempfile_roundtrip() {
     assert_eq!(row.layout_key, LK_A);
 }
 
+/// Two threads opening the same absent index at once both get a usable index,
+/// in WAL mode.
+///
+/// A losing opener used to fail: the switch to WAL does not wait on the busy
+/// handler, and an opener that found the file already there read a missing
+/// `schema_version` table as a pre-release layout. The engine opens the index
+/// once on one thread before it starts the spiller, so the race is reachable
+/// across processes sharing a namespace, or when that first open failed.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "temp-dir fixtures created by this test; a failure is a broken fixture, not a condition under test"
+)]
+#[allow(
+    clippy::expect_used,
+    reason = "thread join: a panic in the worker is a test failure and must surface, not be swallowed"
+)]
+fn concurrent_first_opens_of_one_index_both_succeed() {
+    use std::sync::{Arc, Barrier};
+
+    const ROUNDS: usize = 200;
+
+    let tmp = TempDir::new().unwrap();
+    let mut failures = Vec::new();
+    let mut not_wal = Vec::new();
+    for round in 0..ROUNDS {
+        let db = tmp.path().join(format!("ns{round}.db"));
+        let start = Arc::new(Barrier::new(2));
+        let openers: Vec<_> = (0..2)
+            .map(|_| {
+                let (db, start) = (db.clone(), Arc::clone(&start));
+                std::thread::spawn(move || {
+                    start.wait();
+                    SsdKvIndex::open_at(&db)
+                })
+            })
+            .collect();
+        for opener in openers {
+            match opener.join().expect("opener thread panicked") {
+                Ok(index) => {
+                    let mode: String = index
+                        .conn
+                        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+                        .unwrap();
+                    if mode != "wal" {
+                        not_wal.push(format!("round {round}: {mode}"));
+                    }
+                }
+                Err(e) => failures.push(format!("round {round}: {e}")),
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {ROUNDS} rounds had an opener fail: {:?}",
+        failures.len(),
+        failures.first()
+    );
+    assert!(
+        not_wal.is_empty(),
+        "{} openers are not in WAL mode: {:?}",
+        not_wal.len(),
+        not_wal.first()
+    );
+}
+
+/// A file with no tables is not a pre-release layout: it is what an opener
+/// that died before creating the schema leaves behind, and it is opened as new.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "temp-dir fixtures created by this test; a failure is a broken fixture, not a condition under test"
+)]
+#[allow(
+    clippy::expect_used,
+    reason = "the open under test must succeed, and a failure is the result"
+)]
+fn an_empty_index_file_is_opened_as_new() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("index.db");
+    fs::File::create(&db).unwrap();
+
+    let idx = SsdKvIndex::open_at(&db).expect("an empty file must open as a new index");
+    idx.record(
+        &hash_to_hex(7),
+        LK_A,
+        &PathBuf::from("/x.kvb"),
+        "m",
+        "k8v8",
+        1,
+    )
+    .unwrap();
+    assert!(idx.lookup(&hash_to_hex(7), LK_A).unwrap().is_some());
+}
+
 /// unit test #5: an existing DB tagged with an unknown `schema_version`
 /// surfaces `SchemaMismatch`.
 #[test]

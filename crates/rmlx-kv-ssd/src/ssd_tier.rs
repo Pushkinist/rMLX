@@ -619,14 +619,7 @@ fn namespace_schema_version(db_path: &Path) -> Option<i64> {
         Ok(c) => c,
         Err(_) => return None,
     };
-    let has_kv_blocks: bool = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='kv_blocks'",
-            [],
-            |_| Ok(true),
-        )
-        .unwrap_or(false);
-    if !has_kv_blocks {
+    if !matches!(crate::ssd_index::has_table(&conn, "kv_blocks"), Ok(true)) {
         return None;
     }
     match crate::ssd_index::read_schema_version(&conn) {
