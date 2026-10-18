@@ -1002,7 +1002,8 @@ impl Architecture {
     ///
     /// `max_ctx_override` sets the KV buffer size. Pass `None` to use the
     /// model's `max_position_embeddings` (capped at `KV_MAX_SEQ_DEFAULT`).
-    /// Pass `Some(n)` to use `n` directly -- no further capping. Typically
+    /// Pass `Some(n)` to use `n` as the KV ceiling of the request: the cache
+    /// grows lazily up to it and a longer prompt is refused. Typically
     /// sourced from the `--max-ctx` CLI flag.
     ///
     /// `step_fn` is called once per generated token (immediately after the step

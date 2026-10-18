@@ -354,10 +354,9 @@ impl KvCache {
             flash_max_seq: 0,
             flash_filled: 0,
             fused_qk_shadow: None,
-            // Intentional: hydrated/restored caches resume with `in_prefill: false`
-            // and never re-enter the prefill grow path, so the ceiling guard is
-            // not needed. Callers that want to re-attach a ceiling after hydration
-            // can chain `.with_max_seq_ceiling(n)` explicitly.
+            // A cache rebuilt from storage has no ceiling. A cloned in-memory
+            // cache keeps the stored one. The reusing request binds its own with
+            // `.with_max_seq_ceiling(n)` either way.
             max_seq_ceiling: None,
             policy,
         }

@@ -176,31 +176,30 @@ fn generate(
     tokenizer: &tokenizers::Tokenizer,
     ids: &[u32],
     max_ctx: i32,
-) {
+) -> rmlx_core::error::Result<()> {
     let sampler_cfg = sampler();
     let mut rng = Pcg32::new(sampler_cfg.seed_or_default());
     let penalty_cfg = PenaltyConfig::default();
     let mut token_history: Vec<u32> = Vec::new();
-    let steps = model
-        .generate_greedy(
-            tokenizer,
-            ids,
-            DECODE_TOKENS,
-            Device::Gpu,
-            None,
-            Some(max_ctx),
-            1,
-            &[],
-            &mut |_| None,
-            None,
-            &sampler_cfg,
-            &mut rng,
-            &penalty_cfg,
-            &mut token_history,
-            &AtomicBool::new(false),
-        )
-        .expect("generate_greedy");
+    let steps = model.generate_greedy(
+        tokenizer,
+        ids,
+        DECODE_TOKENS,
+        Device::Gpu,
+        None,
+        Some(max_ctx),
+        1,
+        &[],
+        &mut |_| None,
+        None,
+        &sampler_cfg,
+        &mut rng,
+        &penalty_cfg,
+        &mut token_history,
+        &AtomicBool::new(false),
+    )?;
     assert!(!steps.is_empty(), "generate_greedy returned no token");
+    Ok(())
 }
 
 /// Run `run` from an empty cache and return the chunk-boundary events it
@@ -291,8 +290,9 @@ fn assert_boundary_events(
 ///
 /// With `cached_prefix`, a first request caches the first [`PREFIX_TOKENS`]
 /// tokens, and the measured request extends that prompt, so the prefix-tail
-/// loop prefills the rest. Both requests have the same context ceiling,
-/// because a cached entry keeps the ceiling of the request that stored it.
+/// loop prefills the rest. The first request has the small ceiling its own
+/// prompt needs. The measured request has a ceiling far above it, so the
+/// restored cache must take the ceiling of the request that uses it.
 fn assert_plain_prefill_releases(
     test: &str,
     model_spec: &common::GoldenModel,
@@ -317,9 +317,25 @@ fn assert_plain_prefill_releases(
     let max_ctx = ctx_for(measured_len, DECODE_TOKENS);
 
     if cached_prefix {
-        generate(&model, &tokenizer, &ids[..PREFIX_TOKENS], max_ctx);
+        let prefix_ctx = ctx_for(PREFIX_TOKENS, DECODE_TOKENS);
+        let first_tail_chunk_need = PREFIX_TOKENS + chunk;
+        assert!(
+            usize::try_from(prefix_ctx).is_ok_and(|ceiling| ceiling < first_tail_chunk_need),
+            "{test}: the stored ceiling {prefix_ctx} must be below {first_tail_chunk_need}, the \
+             first tail chunk's need, or a reused cache that keeps it never fails and the test \
+             cannot catch the defect"
+        );
+        generate(&model, &tokenizer, &ids[..PREFIX_TOKENS], prefix_ctx)
+            .expect("the request that stores the prefix");
     }
-    let events = boundary_events(|| generate(&model, &tokenizer, &ids, max_ctx));
+    let events = boundary_events(|| {
+        let outcome = generate(&model, &tokenizer, &ids, max_ctx);
+        assert!(
+            outcome.is_ok(),
+            "{test}: the request under ceiling {max_ctx} failed, as when a reused cache keeps the \
+             ceiling of the request that stored it: {outcome:?}"
+        );
+    });
     assert_boundary_events(test, chunks - 1, require_release, &events);
 }
 
