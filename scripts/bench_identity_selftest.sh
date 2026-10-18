@@ -240,7 +240,7 @@ baseline)
 esac
 STUBEOF
 chmod +x "$CANARY_STUB"
-mkdir -p "$WORK/models/prism-ml__Ternary-Bonsai-8B-mlx-2bit"
+mkdir -p "$WORK/models/prism-ml__Ternary-Bonsai-2-27B-mlx-2bit"
 
 # canary_case <name> <identity-json-or-empty> <shared-log-name-or-empty>
 canary_case() {
