@@ -133,7 +133,11 @@ async fn peak_of_request(
     PEAK.store(before, Ordering::SeqCst);
     stream.write_all(head.as_bytes()).await.unwrap();
     stream.write_all(&body).await.unwrap();
-    stream.read_to_end(&mut response).await.unwrap();
+    // A refusal sent before the upload is fully read closes with unread bytes,
+    // which the kernel turns into a reset. The response read before it stands.
+    if let Err(e) = stream.read_to_end(&mut response).await {
+        assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset, "{e}");
+    }
     let peak = PEAK.load(Ordering::SeqCst) - before;
     (String::from_utf8_lossy(&response).into_owned(), peak)
 }
