@@ -324,7 +324,7 @@ fn run_one(
         if watch.push(step.token_id) {
             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        None
+        rmlx_models::StepVerdict::Continue
     };
 
     let generated = model.generate_greedy(

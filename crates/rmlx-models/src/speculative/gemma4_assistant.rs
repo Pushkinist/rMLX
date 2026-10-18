@@ -718,7 +718,7 @@ fn load_assistant(
 // Round-loop (greedy MTP, port of _mtp_rounds + _mtp_acceptance_walk)
 // ---------------------------------------------------------------------------
 
-use crate::decode_loop::ProbeStep;
+use crate::decode_loop::{ProbeStep, StepVerdict};
 use rmlx_kv_quant::KvQuant;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
@@ -1019,7 +1019,7 @@ pub fn mtp_assistant_generate(
     kv_quant_override: Option<KvQuant>,
     max_ctx_override: Option<i32>,
     eos_ids: &[u32],
-    step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    step_fn: &mut dyn FnMut(&ProbeStep) -> StepVerdict,
     sampler_cfg: &crate::sampler::SamplerConfig,
     device: Device,
     cancel: &AtomicBool,

@@ -919,6 +919,75 @@ fn multi_tool_call_indexes_are_monotonic() {
     assert_eq!(calls[1].index, 1);
 }
 
+/// A forced tool call is tool-call markup, not content: the streamed path holds
+/// its JSON out of the stop matcher, so a `}` as a stop string does not cut it
+/// or end the stream. The non-streamed path does the same
+/// (`generate_tests.rs`).
+#[test]
+fn streaming_forced_call_is_not_content_to_the_stop_matcher() {
+    let mut state = StreamState {
+        parser: None,
+        next_tool_index: 0,
+        any_tool_calls: false,
+        id: "chatcmpl-1".to_owned(),
+        model: "qwen".to_owned(),
+        created: 0,
+        json_reply: None,
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        include_usage: false,
+        metrics_drainer: None,
+        metrics_model_id: String::new(),
+        metrics_ctx_max: 1,
+        lifetime_tokens_in: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        lifetime_tokens_out: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        error_counts: ApiErrorCounters::new(),
+        lifetime_requests_completed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        lifetime_requests_failed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        bare_json_tool_call_mode: true,
+        bare_json_accum: String::new(),
+        admission_ctrl: None,
+        stop_matcher: crate::stop_matcher::StopMatcher::new(&["}".to_owned()]),
+        stop_hit: false,
+        end_requested: Arc::default(),
+        last_thinking: false,
+    };
+    for (i, piece) in [r#"{"name":"f","arguments":{"x":"1"}"#, "}"]
+        .into_iter()
+        .enumerate()
+    {
+        let tok = GenerationToken {
+            token_id: i as u32,
+            piece: piece.to_owned(),
+            done: false,
+            finish_reason: None,
+            is_thinking: false,
+            logprobs: None,
+        };
+        drop(handle_streaming_token(Ok(tok), &mut state));
+    }
+    assert!(
+        !state.stop_hit,
+        "the forced call's JSON reached the matcher"
+    );
+    assert!(
+        !state
+            .end_requested
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "the end flag was set inside a forced call"
+    );
+    let done = GenerationToken {
+        token_id: 9,
+        piece: String::new(),
+        done: true,
+        finish_reason: Some("stop".to_owned()),
+        is_thinking: false,
+        logprobs: None,
+    };
+    drop(handle_streaming_token(Ok(done), &mut state));
+    assert!(state.any_tool_calls, "the call is sent at the end");
+}
+
 // ── Streaming-event helper coverage ────────────────────────────────
 
 /// Drive `handle_streaming_token` over a scripted token sequence containing
@@ -953,6 +1022,8 @@ fn streaming_emits_tool_calls_delta_and_upgrades_finish() {
         // Inert stop matcher (no stop strings) in these tests.
         stop_matcher: crate::stop_matcher::StopMatcher::new(&[]),
         stop_hit: false,
+        end_requested: Arc::default(),
+        last_thinking: false,
     };
 
     // Script: "Let me check.\n" + full <tool_call> + done sentinel.
@@ -1105,6 +1176,8 @@ fn streaming_without_parser_passes_through_unchanged() {
         // Inert stop matcher (no stop strings) in these tests.
         stop_matcher: crate::stop_matcher::StopMatcher::new(&[]),
         stop_hit: false,
+        end_requested: Arc::default(),
+        last_thinking: false,
     };
     let tok = GenerationToken {
         token_id: 0,
@@ -1430,6 +1503,8 @@ fn usage_stream_state(prompt_tokens: u32, include_usage: bool) -> StreamState {
         // Inert stop matcher (no stop strings) in these tests.
         stop_matcher: crate::stop_matcher::StopMatcher::new(&[]),
         stop_hit: false,
+        end_requested: Arc::default(),
+        last_thinking: false,
     }
 }
 
@@ -1802,6 +1877,8 @@ fn f14_lifetime_counters_incremented_at_done_boundary() {
         // Inert stop matcher (no stop strings) in these tests.
         stop_matcher: crate::stop_matcher::StopMatcher::new(&[]),
         stop_hit: false,
+        end_requested: Arc::default(),
+        last_thinking: false,
     };
 
     // 3 non-done tokens — counters must not change yet.
@@ -2098,6 +2175,8 @@ fn f8_successful_streaming_path_increments_no_error_counter() {
         // Inert stop matcher (no stop strings) in these tests.
         stop_matcher: crate::stop_matcher::StopMatcher::new(&[]),
         stop_hit: false,
+        end_requested: Arc::default(),
+        last_thinking: false,
     };
 
     // Success tokens.
@@ -2177,6 +2256,8 @@ fn f8_engine_error_in_streaming_increments_counter() {
         // Inert stop matcher (no stop strings) in these tests.
         stop_matcher: crate::stop_matcher::StopMatcher::new(&[]),
         stop_hit: false,
+        end_requested: Arc::default(),
+        last_thinking: false,
     };
 
     // Feed a non-OOM engine error (maps to Upstream).

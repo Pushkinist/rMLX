@@ -149,7 +149,7 @@ pub(crate) fn to_tool_use_block(p: &ParsedToolCall) -> ContentBlock {
 pub(crate) async fn messages(
     State(state): State<AppState>,
     headers: HeaderMap,
-    LoggedJson(req): LoggedJson<MessagesRequest>,
+    LoggedJson(mut req): LoggedJson<MessagesRequest>,
 ) -> Response {
     // Wall-clock anchor for TTFT. Captured immediately after header parse.
     let request_start = Instant::now();
@@ -552,13 +552,15 @@ pub(crate) async fn messages(
         "messages: tools parsed, injected into template"
     );
 
+    let stop_matcher =
+        crate::stop_matcher::StopMatcher::new(&req.stop_sequences.take().unwrap_or_default());
     let mut gen_req = GenerationRequest {
+        end_requested: Arc::default(),
         model_id: req.model.clone(),
         prompt_tokens,
         max_tokens,
         // Fully resolved sampling params.
         sampling,
-        stop: req.stop_sequences.unwrap_or_default(),
         stream: req.stream,
         system,
         session_id,
@@ -785,6 +787,7 @@ pub(crate) async fn messages(
             request_start,
             &state,
             parser_format,
+            stop_matcher,
             ctx_max_for_metrics,
             &rid,
             is_cold_request,
@@ -804,6 +807,7 @@ pub(crate) async fn messages(
             replay_plan,
             &req.model,
             parser_format,
+            stop_matcher,
             request_start,
             state.metrics_drainer.as_ref(),
             ctx_max_for_metrics,

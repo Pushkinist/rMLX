@@ -780,7 +780,7 @@ pub fn run_golden_test(test: &str, fixture_tag: &str, kv_quant: KvQuant, model_p
             None, // max_ctx: use arch default
             1,    // single-slot cache
             &[],  // no EOS stop — force the full N tokens
-            &mut |_| None,
+            &mut |_| rmlx_models::StepVerdict::Continue,
             None, // no sampler constraint
             &sampler_cfg,
             &mut rng,
@@ -942,7 +942,7 @@ fn measure_top2_margin(
             None,
             1,
             &[],
-            &mut |_| None,
+            &mut |_| rmlx_models::StepVerdict::Continue,
             None,
             &sampler_cfg,
             &mut rng,

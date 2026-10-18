@@ -640,6 +640,9 @@ impl Generator for ArchGenerator {
         let metrics_drainer = req.metrics_drainer;
         // ITL ring-buffer handle for per-request latency aggregates.
         let itl_store = req.itl_store;
+        // Set by the route at a stop-string match; the step callback ends the
+        // decode on it.
+        let end_requested = req.end_requested;
         // per-event DB recorder for events-table ITL/kv_cache writes.
         // TTFT is written by the HTTP handler layer off-runtime.
         let event_recorder = req.event_recorder;
@@ -835,15 +838,14 @@ impl Generator for ArchGenerator {
             // owned by `StreamingDetokenizer`. `step` returns "" when the
             // current token leaves a multi-byte codepoint incomplete; the
             // tail is flushed once at end-of-stream onto the terminal item.
-            // `step_fn` returns `Option<u32>` — the mlx-vlm
-            // `ThinkingBudgetCriteria.__call__` contract. `Some(id)` asks
-            // the decode loop to force `id` as the NEXT decode input,
-            // returning the model to the answer channel after the thinking
-            // budget was exceeded. `None` is the unconditional default —
-            // the budget-unset path always returns `None` after a single
-            // `Option`-discriminant + bool check, so the hot loop is
-            // unchanged when no budget is set.
-            let mut step_fn = |s: &rmlx_models::ProbeStep| -> Option<u32> {
+            // `step_fn` returns a `StepVerdict`. `Force(id)` asks the
+            // decode loop to force `id` as the NEXT decode input, returning
+            // the model to the answer channel after the thinking budget was
+            // exceeded (the mlx-vlm `ThinkingBudgetCriteria.__call__`
+            // contract). `Continue` is the unconditional default — the
+            // budget-unset path pays a single `Option`-discriminant + bool
+            // check, so the hot loop is unchanged when no budget is set.
+            let mut step_fn = |s: &rmlx_models::ProbeStep| -> rmlx_models::StepVerdict {
                 // Record step arrival time for ITL computation.
                 // Instant::now() on macOS is a single rdtsc-equivalent syscall,
                 // ~3 ns; negligible vs the 8–15 ms decode step.
@@ -917,6 +919,12 @@ impl Generator for ArchGenerator {
                     "generate: step_fn sending token"
                 );
                 let _ = tx_ref.blocking_send(Ok(tok));
+                // The route set the flag at a stop-string match: this token is
+                // the last. The send above comes first, so the route reads the
+                // token that drew the verdict, and an `End` beats a `Force`.
+                if end_requested.load(std::sync::atomic::Ordering::SeqCst) {
+                    return rmlx_models::StepVerdict::End;
+                }
                 // if the budget was just exceeded, ask the decode loop
                 // to force `</think>` next. `take_force_close()` returns
                 // `false` (and `thinking_end_token_id` is unused) on every
@@ -928,11 +936,11 @@ impl Generator for ArchGenerator {
                                 end_id,
                                 "generate: thinking budget exceeded — forcing </think>"
                             );
-                            return Some(end_id);
+                            return rmlx_models::StepVerdict::Force(end_id);
                         }
                     }
                 }
-                None
+                rmlx_models::StepVerdict::Continue
             };
 
             // Thread the per-request constraint into the arch-dispatched
@@ -1466,12 +1474,15 @@ impl Generator for ArchGenerator {
                     )));
                 }
                 Ok(steps) => {
-                    // finish_reason = "stop" when generation halted on
-                    // EOS (last emitted token id is in the configured eos set);
-                    // "length" when we hit max_tokens. Stop strings are not
-                    // matched here.
+                    // finish_reason = "stop" when generation halted on EOS
+                    // (last emitted token id is in the configured eos set) or
+                    // on the end the route asked for; "length" when we hit
+                    // max_tokens. The route is the one writer of the finish a
+                    // client reads: it matches the stop strings.
                     let last_id = steps.last().map_or(0, |s| s.token_id);
-                    let finish_reason = if eos_ids.contains(&last_id) {
+                    let finish_reason = if eos_ids.contains(&last_id)
+                        || end_requested.load(std::sync::atomic::Ordering::SeqCst)
+                    {
                         "stop".to_owned()
                     } else {
                         "length".to_owned()

@@ -48,7 +48,7 @@ use rmlx_runtime::{count_nan_in_bytes, max_abs_from_bytes};
 
 use crate::constraint::ConstraintEngine;
 use crate::context::{resolve_context, ResolvedContext};
-use crate::decode_loop::{reject_nan_prefill, ProbeStep};
+use crate::decode_loop::{emit_token, reject_nan_prefill, ProbeStep, StepVerdict};
 use crate::prompt_cache::{chained_block_hashes_seeded, snapshot_clone, Consumed, ReusePolicy};
 use crate::sampler::{apply_mask_argmax, sample_token_array, Pcg32, PenaltyConfig, SamplerConfig};
 use rmlx_kv_quant::{KvCache, KvQuant};
@@ -203,7 +203,7 @@ pub fn generate_greedy(
     max_ctx_override: Option<i32>,
     prompt_cache_slots: usize,
     eos_ids: &[u32],
-    step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    step_fn: &mut dyn FnMut(&ProbeStep) -> StepVerdict,
     mut constraint: Option<&mut dyn ConstraintEngine>,
     sampler_cfg: &SamplerConfig,
     rng: &mut Pcg32,
@@ -443,7 +443,7 @@ fn decode_from(
     device: Device,
     eos_ids: &[u32],
     steps: &mut Vec<ProbeStep>,
-    step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    step_fn: &mut dyn FnMut(&ProbeStep) -> StepVerdict,
     constraint: &mut Option<&mut dyn ConstraintEngine>,
     sampler_cfg: &SamplerConfig,
     rng: &mut Pcg32,
@@ -470,12 +470,11 @@ fn decode_from(
         if let Some(c) = constraint.as_mut() {
             c.advance(next);
         }
-        let forced = step_fn(&step);
-        steps.push(step);
-        if eos_ids.contains(&next) {
+        let shown = emit_token(step_fn, steps, eos_ids, step);
+        if shown.ends {
             break;
         }
-        let feed = forced.unwrap_or(next);
+        let feed = shown.force.unwrap_or(next);
         let logits = model.forward_seq_with_cache(&[feed], Some(&mut *kv), device)?;
         next = pick_token(
             &logits,
@@ -519,7 +518,7 @@ pub fn generate_image(
     kv_quant: KvQuant,
     max_ctx_override: Option<i32>,
     eos_ids: &[u32],
-    step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    step_fn: &mut dyn FnMut(&ProbeStep) -> StepVerdict,
     mut constraint: Option<&mut dyn ConstraintEngine>,
     sampler_cfg: &SamplerConfig,
     rng: &mut Pcg32,
@@ -646,12 +645,11 @@ pub fn generate_image(
         if let Some(c) = constraint.as_mut() {
             c.advance(next);
         }
-        let forced = step_fn(&step);
-        steps.push(step);
-        if eos_ids.contains(&next) {
+        let shown = emit_token(step_fn, &mut steps, eos_ids, step);
+        if shown.ends {
             break;
         }
-        let feed = forced.unwrap_or(next);
+        let feed = shown.force.unwrap_or(next);
         let ids_i32 = [feed as i32];
         let ids_bytes = unsafe { std::slice::from_raw_parts(ids_i32.as_ptr().cast::<u8>(), 4) };
         let ids_arr = Array::from_bytes(ids_bytes, &[1], Dtype::I32)?;

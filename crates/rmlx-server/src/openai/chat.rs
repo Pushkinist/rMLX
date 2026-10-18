@@ -1019,13 +1019,19 @@ pub(crate) async fn chat_completions(
         (imgs, audio)
     };
 
+    let stop_matcher = crate::stop_matcher::StopMatcher::new(
+        &req.stop
+            .take()
+            .map(StopSequences::into_vec)
+            .unwrap_or_default(),
+    );
     let gen_req = GenerationRequest {
+        end_requested: Arc::default(),
         model_id: req.model.clone(),
         prompt_tokens,
         max_tokens,
         // Fully resolved sampling params.
         sampling,
-        stop: req.stop.map(StopSequences::into_vec).unwrap_or_default(),
         stream: req.stream,
         system,
         session_id,
@@ -1322,6 +1328,7 @@ pub(crate) async fn chat_completions(
             &state,
             parser_format,
             engagement,
+            stop_matcher,
             bare_json_tool_call_mode,
             include_usage,
             prompt_token_count,
@@ -1346,6 +1353,7 @@ pub(crate) async fn chat_completions(
             &req.model,
             parser_format,
             engagement,
+            stop_matcher,
             bare_json_tool_call_mode,
             request_start,
             state.metrics_drainer.as_ref(),

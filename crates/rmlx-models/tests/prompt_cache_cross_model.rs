@@ -96,7 +96,7 @@ fn gen(
             None,
             SLOTS,
             &[], // no EOS stop — every run emits the same token count
-            &mut |_| None,
+            &mut |_| rmlx_models::StepVerdict::Continue,
             None,
             &sampler_cfg,
             &mut rng,

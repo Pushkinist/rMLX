@@ -128,7 +128,7 @@ fn thinking_budget_exact_hit_qwen3_5_moe() {
                 None,
                 1, // single-slot cache
                 &[],
-                &mut |_| None,
+                &mut |_| rmlx_models::StepVerdict::Continue,
                 None,
                 &sampler_cfg,
                 &mut rng,
@@ -160,9 +160,9 @@ fn thinking_budget_exact_hit_qwen3_5_moe() {
                 // Fire forced injection after the N_THINKING-th decode token.
                 if decode_step_count == N_THINKING + 1 && forced_at.is_none() {
                     forced_at = Some(decode_step_count);
-                    Some(FORCED_ID)
+                    rmlx_models::StepVerdict::Force(FORCED_ID)
                 } else {
-                    None
+                    rmlx_models::StepVerdict::Continue
                 }
             },
             None,

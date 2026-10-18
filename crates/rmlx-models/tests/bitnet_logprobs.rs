@@ -100,7 +100,7 @@ fn bitnet_emits_logprobs_when_requested() {
             None, // max_ctx: arch default
             1,    // single-slot prompt cache
             &[],  // no EOS stop — force the full N tokens
-            &mut |_| None,
+            &mut |_| rmlx_models::StepVerdict::Continue,
             None, // no sampler constraint
             &sampler_cfg,
             &mut rng,

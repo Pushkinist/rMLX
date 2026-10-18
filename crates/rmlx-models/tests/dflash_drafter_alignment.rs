@@ -224,7 +224,7 @@ fn dflash_live_loop_emits_coherent() {
     let mut emitted_ids: Vec<u32> = Vec::new();
     let mut step_fn = |s: &rmlx_models::ProbeStep| {
         emitted_ids.push(s.token_id);
-        None
+        rmlx_models::StepVerdict::Continue
     };
     let eos: Vec<u32> = tk
         .token_to_id("<|im_end|>")

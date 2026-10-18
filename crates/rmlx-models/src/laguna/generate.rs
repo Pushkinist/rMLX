@@ -21,7 +21,7 @@ use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{argmax, Array, Device, Dtype};
 
 use crate::constraint::ConstraintEngine;
-use crate::decode_loop::reject_nan_prefill;
+use crate::decode_loop::{emit_token, reject_nan_prefill};
 use crate::kv_cache::kv_layer_quants;
 use crate::prompt_cache::{chained_block_hashes_seeded, Consumed, ReusePolicy};
 use crate::sampler::apply_mask_argmax;
@@ -115,7 +115,7 @@ pub fn generate_greedy(
     max_ctx_override: Option<i32>,
     prompt_cache_slots: usize,
     eos_ids: &[u32],
-    step_fn: &mut dyn FnMut(&crate::decode_loop::ProbeStep) -> Option<u32>,
+    step_fn: &mut dyn FnMut(&crate::decode_loop::ProbeStep) -> crate::decode_loop::StepVerdict,
     // Optional sampler constraint. See gemma4::generate_greedy.
     mut constraint: Option<&mut dyn ConstraintEngine>,
     // Sampling config + per-request RNG. See gemma3::generate_greedy.
@@ -432,14 +432,18 @@ pub fn generate_greedy(
         "laguna generate_greedy prefill"
     );
 
-    steps.push(ProbeStep {
-        token_id: last_id,
-        piece: piece.clone().into_boxed_str(),
-        max_abs_logit,
-        nan_count,
-        logprobs: None,
-    });
-    step_fn(steps.last().unwrap());
+    let shown = emit_token(
+        step_fn,
+        &mut steps,
+        eos_ids,
+        ProbeStep {
+            token_id: last_id,
+            piece: piece.clone().into_boxed_str(),
+            max_abs_logit,
+            nan_count,
+            logprobs: None,
+        },
+    );
 
     // Push this prefill snapshot to the prompt cache (Miss → store). Clone the
     // post-prefill KV caches (refcount bump, no data copy) before the decode
@@ -504,7 +508,7 @@ pub fn generate_greedy(
     }
 
     // EOS-stop. If prefill emitted an EOS already, no decode steps.
-    if eos_ids.contains(&last_id) {
+    if shown.ends {
         return Ok(steps);
     }
 
@@ -590,7 +594,7 @@ fn decode_loop(
     device: Device,
     eos_ids: &[u32],
     steps: &mut Vec<crate::decode_loop::ProbeStep>,
-    step_fn: &mut dyn FnMut(&crate::decode_loop::ProbeStep) -> Option<u32>,
+    step_fn: &mut dyn FnMut(&crate::decode_loop::ProbeStep) -> crate::decode_loop::StepVerdict,
     constraint: &mut Option<&mut dyn ConstraintEngine>,
     sampler_cfg: &crate::sampler::SamplerConfig,
     rng: &mut crate::sampler::Pcg32,
@@ -739,17 +743,21 @@ fn decode_loop(
             "laguna generate_greedy decode step"
         );
 
-        steps.push(ProbeStep {
-            token_id: next_id,
-            piece: piece.into_boxed_str(),
-            max_abs_logit,
-            nan_count,
-            logprobs: None,
-        });
-        step_fn(steps.last().unwrap());
+        let shown = emit_token(
+            step_fn,
+            steps,
+            eos_ids,
+            ProbeStep {
+                token_id: next_id,
+                piece: piece.into_boxed_str(),
+                max_abs_logit,
+                nan_count,
+                logprobs: None,
+            },
+        );
 
         // EOS-stop in the decode loop.
-        if eos_ids.contains(&next_id) {
+        if shown.ends {
             tracing::debug!(
                 step = step_idx,
                 token_id = next_id,

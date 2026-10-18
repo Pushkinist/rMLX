@@ -3200,7 +3200,7 @@ fn plain_greedy(
             margins.push(top_two_margin(
                 s.logprobs.iter().flat_map(|lp| lp.top.iter().map(|t| t.1)),
             ));
-            None
+            rmlx_models::StepVerdict::Continue
         };
         verifier
             .generate_greedy(
@@ -3402,7 +3402,7 @@ impl Loaded {
         let ran = tracing::subscriber::with_default(std::sync::Arc::clone(&recorder), || {
             let mut step = |s: &rmlx_models::ProbeStep| {
                 spec_ids.push(s.token_id);
-                None
+                rmlx_models::StepVerdict::Continue
             };
             match &mut self.engine {
                 Engine::Sidecar { verifier, drafter } => match drafter {

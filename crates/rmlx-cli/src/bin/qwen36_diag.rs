@@ -122,9 +122,9 @@ fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("load tokenizer: {e}"))?;
 
     let mut ids: Vec<u32> = Vec::with_capacity(n_gen);
-    let mut step_fn = |s: &rmlx_models::ProbeStep| -> Option<u32> {
+    let mut step_fn = |s: &rmlx_models::ProbeStep| -> rmlx_models::StepVerdict {
         ids.push(s.token_id);
-        None
+        rmlx_models::StepVerdict::Continue
     };
     // Diag binary is greedy (temperature 0.0).
     let diag_sampler_cfg = rmlx_models::SamplerConfig {

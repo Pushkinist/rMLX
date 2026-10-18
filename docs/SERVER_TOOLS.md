@@ -71,15 +71,19 @@ the forced call runs with no constraint, and the reply is read as for `auto`:
 - Streaming sends reasoning deltas as they arrive and holds the content to
   the end.
 
-`stop` differs between the paths for a forced call, with or without the
-constraint: streaming does not give the held content to the stop matcher; the
-non-streamed path cuts the text first, then reads the call.
+The JSON of a forced call is tool-call markup: neither path gives it to the stop
+matcher, so a stop string such as `}` does not cut the call.
 
 ### EOF recovery
 
 While tokens arrive, a partial call is not completed. At the end of the
-generation, streaming or not, a Bonsai-style JSON call cut off mid-body (for
-example at `max_tokens`) is repaired by closing its open strings and
-brackets; a truncated Gemma call is dropped.
+generation, streaming or not, on both `/v1/chat/completions` and
+`/v1/messages`, the route calls the parser's `finalize`. A Bonsai-style JSON
+call cut off mid-body (for example at `max_tokens`) is repaired by closing its
+open strings and brackets; an XML call cut off before its closing tags is
+completed with the parameters read so far; a truncated Gemma call is dropped.
+The tail that the parser held back as the start of a marker that never
+completed (`<to`) is text. After a stop-string match none of this runs: what
+follows the match is dropped.
 
 OpenAI `parameters` and Anthropic `input_schema` tools render identically.

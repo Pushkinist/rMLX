@@ -26,7 +26,7 @@ use super::round_loop::DecidedBy;
 use super::{DecodeWindow, RoundStats, ScoredBlock, SpecLoop};
 use crate::arch::Architecture;
 use crate::context::{resolve_context, ResolvedContext};
-use crate::decode_loop::ProbeStep;
+use crate::decode_loop::{ProbeStep, StepVerdict};
 
 /// The KV codec, resolved context and per-layer cache stack a round loop runs
 /// its verifier on.
@@ -301,7 +301,7 @@ pub(crate) fn emit_round_tokens(
     scored: Option<&ScoredBlock>,
     n_tokens: usize,
     eos_ids: &[u32],
-    step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    step_fn: &mut dyn FnMut(&ProbeStep) -> StepVerdict,
     emitted: &mut Vec<ProbeStep>,
     emitted_in_rounds: &mut usize,
     window: &mut DecodeWindow,
@@ -317,7 +317,7 @@ pub(crate) fn emit_round_tokens(
             break;
         }
         let logprobs = scored.map(|s| s.token_logprobs(i, id)).transpose()?;
-        super::emit_step(tokenizer, id, logprobs, step_fn, emitted, window);
+        let shown = super::emit_step(tokenizer, id, logprobs, step_fn, eos_ids, emitted, window);
         if let Some(buf) = decided_by.as_mut() {
             buf.push(if i < restricted {
                 DecidedBy::RestrictedVocab
@@ -327,16 +327,16 @@ pub(crate) fn emit_round_tokens(
         }
         *emitted_in_rounds += 1;
         committed += 1;
-        if eos_ids.contains(&id) {
+        if shown.ends {
             return Ok(RoundEmit {
                 committed,
-                hit_eos: true,
+                ended: true,
             });
         }
     }
     Ok(RoundEmit {
         committed,
-        hit_eos: false,
+        ended: false,
     })
 }
 
@@ -351,7 +351,7 @@ pub(crate) struct RoundEmit {
     /// not.
     pub(crate) committed: usize,
     /// Whether one of them ended the request.
-    pub(crate) hit_eos: bool,
+    pub(crate) ended: bool,
 }
 
 /// Length of `a`'s sequence axis, which every taped recurrence input carries at
@@ -683,15 +683,15 @@ pub(crate) fn emit_seed_token(
     tokenizer: &tokenizers::Tokenizer,
     seed: u32,
     scored: Option<&ScoredBlock>,
-    step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    step_fn: &mut dyn FnMut(&ProbeStep) -> StepVerdict,
     emitted: &mut Vec<ProbeStep>,
     window: &mut DecodeWindow,
     eos_ids: &[u32],
     totals: &RoundTotals,
 ) -> Result<bool> {
     let logprobs = scored.map(|s| s.token_logprobs(0, seed)).transpose()?;
-    super::emit_step(tokenizer, seed, logprobs, step_fn, emitted, window);
-    if !eos_ids.contains(&seed) {
+    let shown = super::emit_step(tokenizer, seed, logprobs, step_fn, eos_ids, emitted, window);
+    if !shown.ends {
         return Ok(false);
     }
     log_request_record(totals, emitted, emitted.len(), window);

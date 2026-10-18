@@ -75,11 +75,11 @@ impl Generator for ErrorGenerator {
 
 fn minimal_request(model_id: &str) -> GenerationRequest {
     GenerationRequest {
+        end_requested: Arc::default(),
         model_id: model_id.to_owned(),
         prompt_tokens: vec![1, 2, 3],
         max_tokens: 16,
         sampling: crate::engine::types::SamplingParams::default(),
-        stop: vec![],
         stream: false,
         system: None,
         session_id: None,
@@ -131,6 +131,7 @@ async fn blocking_ttft_ring_populated() {
         "test-model",
         None,
         None,
+        crate::stop_matcher::StopMatcher::new(&[]),
         false,
         Instant::now(),
         None,
@@ -180,6 +181,7 @@ async fn blocking_ttft_ring_empty_on_engine_error() {
         "test-model",
         None,
         None,
+        crate::stop_matcher::StopMatcher::new(&[]),
         false,
         Instant::now(),
         None,
@@ -228,6 +230,7 @@ async fn blocking_ttft_ring_respects_capacity() {
             &model,
             None,
             None,
+            crate::stop_matcher::StopMatcher::new(&[]),
             false,
             Instant::now(),
             None,
@@ -307,6 +310,8 @@ impl Generator for LogprobGenerator {
 async fn blocking_reply(
     generator: LogprobGenerator,
     engagement: rmlx_models::Engagement,
+    stops: &[String],
+    forced_call: bool,
 ) -> serde_json::Value {
     let ttft_store = TtftStore::default();
     let counter = || Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -320,7 +325,8 @@ async fn blocking_reply(
         "test-model",
         None,
         Some(Arc::new(engagement)),
-        false,
+        crate::stop_matcher::StopMatcher::new(stops),
+        forced_call,
         Instant::now(),
         None,
         0,
@@ -354,7 +360,7 @@ async fn blocking_json_mode_logprobs_cover_the_tokens_of_the_content() {
     let engagement = rmlx_models::Engagement::default();
     engagement.report(3, 1);
 
-    let body = blocking_reply(generator, engagement).await;
+    let body = blocking_reply(generator, engagement, &[], false).await;
     let choice = &body["choices"][0];
     assert_eq!(choice["message"]["content"], "{}");
     let surfaces: Vec<&str> = choice["logprobs"]["content"]
@@ -377,6 +383,36 @@ async fn blocking_json_mode_reply_can_start_in_the_terminal_token() {
     let engagement = rmlx_models::Engagement::default();
     engagement.report(2, 1);
 
-    let body = blocking_reply(generator, engagement).await;
+    let body = blocking_reply(generator, engagement, &[], false).await;
     assert_eq!(body["choices"][0]["message"]["content"], "{");
+}
+
+/// A forced tool call is tool-call markup, not content: the stop matcher does
+/// not see its JSON, so a `}` or a quote as a stop string does not cut the
+/// call. The streamed path holds the JSON out of the matcher too
+/// (`openai/tests.rs`).
+///
+/// Mutation: give the forced call's JSON to the stop matcher.
+#[tokio::test]
+async fn blocking_forced_call_is_not_content_to_the_stop_matcher() {
+    for stop in ["}", "\""] {
+        let generator = LogprobGenerator {
+            pieces: vec![
+                ("{\"name\":\"f\",", false),
+                ("\"arguments\":{\"x\":\"1\"", false),
+                ("}}", false),
+            ],
+            tail: "",
+        };
+        let engagement = rmlx_models::Engagement::default();
+        engagement.report_token_start(1);
+
+        let body = blocking_reply(generator, engagement, &[stop.to_owned()], true).await;
+        let choice = &body["choices"][0];
+        assert_eq!(
+            choice["message"]["tool_calls"][0]["function"]["name"], "f",
+            "stop {stop:?}: the call survives"
+        );
+        assert_eq!(choice["finish_reason"], "tool_calls", "stop {stop:?}");
+    }
 }

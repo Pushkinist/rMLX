@@ -32,6 +32,8 @@ pub(super) async fn generate_blocking(
     replay_plan: Option<crate::retry::RequestPlan>,
     model_id: &str,
     parser_format: Option<ToolCallFormat>,
+    // The request's stop strings, matched on the content channel.
+    stop_matcher: crate::stop_matcher::StopMatcher,
     // Drainer handle + ctx_max for TTFT/token-count DB emission.
     request_start: Instant,
     metrics_drainer: Option<&crate::metrics_drainer::DrainerHandle>,
@@ -61,8 +63,10 @@ pub(super) async fn generate_blocking(
     ttft_store: &crate::openai::state::TtftStore,
 ) -> Response {
     let input_token_count = req.prompt_tokens.len() as u32;
-    // Capture stop sequences before `req` is moved into the generator.
-    let stop_sequences = req.stop.clone();
+    // The route sets the request's end flag at a stop-string match; the
+    // engine ends the decode on it.
+    let mut content =
+        crate::stop_matcher::ContentGate::new(stop_matcher, Arc::clone(&req.end_requested));
     // Clone generator before the stream match so kv_cache_bytes() is
     // still available after generate/replay_stream takes ownership.
     let generator_for_metrics = Arc::clone(&generator);
@@ -89,6 +93,9 @@ pub(super) async fn generate_blocking(
     // Instantiate parser when caller supplied a format. `None` means
     // tools-disabled — every non-thinking piece flows straight to `text`.
     let mut parser: Option<ToolCallStreamParser> = parser_format.map(ToolCallStreamParser::new);
+    // The think state of the last token: the tail the parser holds at the end
+    // goes to the channel that token was on.
+    let mut last_thinking = false;
     let mut tool_calls_accum: Vec<ParsedToolCall> = Vec::new();
 
     while let Some(item) = token_stream.next().await {
@@ -145,25 +152,38 @@ pub(super) async fn generate_blocking(
                 // routed to the channel matching the token's think state, so
                 // genuine reasoning still lands in the `thinking` buffer and
                 // Qwen3.6 (which closes `</think>` first) is unaffected.
-                match parser.as_mut() {
-                    Some(p) => {
-                        if !tok.piece.is_empty() {
-                            p.push(&tok.piece);
-                            if !p.passthrough_text.is_empty() {
-                                if tok.is_thinking {
-                                    thinking.push_str(&p.passthrough_text);
-                                } else {
-                                    text.push_str(&p.passthrough_text);
+                if !tok.done {
+                    last_thinking = tok.is_thinking;
+                }
+                // After a stop-string match the reply keeps nothing more: not
+                // text, not reasoning, not a tool call. The generation is still
+                // read to its terminal item, and each step is counted.
+                if !content.is_stopped() {
+                    match parser.as_mut() {
+                        Some(p) => {
+                            if !tok.piece.is_empty() {
+                                p.push(&tok.piece);
+                                if !p.passthrough_text.is_empty() {
+                                    if tok.is_thinking {
+                                        thinking.push_str(&p.passthrough_text);
+                                    } else {
+                                        content.push(&mut text, &p.passthrough_text);
+                                    }
+                                    p.passthrough_text.clear();
                                 }
-                                p.passthrough_text.clear();
+                            }
+                            // A call finished before the match stays; one
+                            // that this token finishes after it does not.
+                            if !content.is_stopped() {
+                                tool_calls_accum.extend(p.take_parsed());
                             }
                         }
-                    }
-                    None => {
-                        if tok.is_thinking {
-                            thinking.push_str(&tok.piece);
-                        } else {
-                            text.push_str(&tok.piece);
+                        None => {
+                            if tok.is_thinking {
+                                thinking.push_str(&tok.piece);
+                            } else {
+                                content.push(&mut text, &tok.piece);
+                            }
                         }
                     }
                 }
@@ -179,35 +199,41 @@ pub(super) async fn generate_blocking(
     }
 
     // Drain residual passthrough + completed tool_calls from the parser.
-    if let Some(p) = parser.as_mut() {
-        if !p.passthrough_text.is_empty() {
-            text.push_str(&p.passthrough_text);
-            p.passthrough_text.clear();
+    // `finalize` recovers a call that the generation cut before its closing
+    // tags and moves the tail of a marker that never completed into the text.
+    if !content.is_stopped() {
+        if let Some(p) = parser.as_mut() {
+            p.finalize();
+            if !p.passthrough_text.is_empty() {
+                if last_thinking {
+                    thinking.push_str(&p.passthrough_text);
+                } else {
+                    content.push(&mut text, &p.passthrough_text);
+                }
+                p.passthrough_text.clear();
+            }
+            if !content.is_stopped() {
+                tool_calls_accum.extend(p.take_parsed());
+            }
         }
-        tool_calls_accum.extend(p.take_parsed());
+        content.flush(&mut text);
     }
 
-    // Truncate the text block at the first stop-sequence boundary
-    // (stop string excluded). On a hit, force stop_reason="stop_sequence" and
-    // populate the `stop_sequence` field naming which stop matched. Only when
-    // no tool_use block was produced (tool responses carry no free text).
-    let matched_stop: Option<String> = if tool_calls_accum.is_empty() {
-        if let Some(hit) = crate::stop_matcher::find_stop_match(&text, &stop_sequences) {
-            tracing::debug!(
-                model_id,
-                stop = %hit.matched,
-                offset = hit.offset,
-                "truncated text block at stop sequence (anthropic non-streaming)"
-            );
-            text.truncate(hit.offset);
-            finish_reason = Some("stop".to_owned());
-            Some(hit.matched)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    // A stop-string match is the end of the reply: `stop_sequence`, with the
+    // string that matched. A tool_use block that the reply keeps outranks it
+    // below, with no stop string.
+    let matched_stop: Option<String> = content
+        .matched()
+        .filter(|_| tool_calls_accum.is_empty())
+        .map(str::to_owned);
+    if let Some(stop) = &matched_stop {
+        tracing::debug!(
+            model_id,
+            stop,
+            "stopped at a stop sequence (anthropic non-streaming)"
+        );
+        finish_reason = Some("stop".to_owned());
+    }
 
     // Emit TTFT + token counts to SQLite via the SPSC drainer.
     // Single-source: same counters that populate the Anthropic `usage` body.
@@ -280,8 +306,8 @@ pub(super) async fn generate_blocking(
     // matched_stop below.
     let any_tool_use = !tool_calls_accum.is_empty();
     let stop_reason = if matched_stop.is_some() {
-        // Real stop-string match; tool_use cannot co-occur (matched_stop is
-        // set only when tool_calls_accum is empty — see guard above).
+        // Real stop-string match; matched_stop is set only when the reply
+        // keeps no tool call (see above).
         "stop_sequence".to_owned()
     } else {
         let terminal = map_stop_reason(finish_reason.as_deref());

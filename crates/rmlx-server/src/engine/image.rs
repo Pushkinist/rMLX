@@ -395,7 +395,7 @@ pub(crate) fn run_qwen3vl_image(
     max_ctx_override: Option<i32>,
     eos_ids: &[u32],
     tokenizer: &tokenizers::Tokenizer,
-    step_fn: &mut dyn FnMut(&rmlx_models::ProbeStep) -> Option<u32>,
+    step_fn: &mut dyn FnMut(&rmlx_models::ProbeStep) -> rmlx_models::StepVerdict,
     constraint: Option<&mut dyn rmlx_models::ConstraintEngine>,
     sampler_cfg: &rmlx_models::SamplerConfig,
     rng: &mut rmlx_models::Pcg32,

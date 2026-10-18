@@ -648,7 +648,7 @@ pub fn run_smoke_probe(
         max_ctx_override,
         1,   // single-slot -- no multi-slot needed for smoke probe
         &[], // no EOS stop -- force full 8 steps
-        &mut |_| None,
+        &mut |_| crate::decode_loop::StepVerdict::Continue,
         None, // no sampler constraint
         &sampler_cfg,
         &mut rng,

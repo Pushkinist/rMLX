@@ -43,7 +43,7 @@ use rmlx_mlx::{concatenate, Array, Device};
 
 use super::{dflash_next_block_size, DFlashDrafter};
 use crate::arch::Architecture;
-use crate::decode_loop::ProbeStep;
+use crate::decode_loop::{ProbeStep, StepVerdict};
 use crate::speculative::round_loop::{
     run_rounds, Conditioning, Prefilled, ReportSkippedBy, RoundCfg, RoundCtx, RoundDrafter,
     RoundOutcome, Seed, Verdict, VerifierOffsetBasis,
@@ -272,7 +272,7 @@ impl RoundDrafter for AdaptiveRound<'_> {
 /// positions either way, and [`crate::speculative::VerifierDraw`] explains why
 /// the walk is still exact.
 ///
-/// `step_fn` is called once per emitted token. Its `Option<u32>` return — the
+/// `step_fn` is called once per emitted token. Its `Force` verdict — the
 /// forced-token contract the plain decode loop uses — is discarded here, as it
 /// is on every speculative loop: a round's tokens are already the verifier's.
 ///
@@ -301,7 +301,7 @@ pub fn dflash_generate(
     kv_quant_override: Option<KvQuant>,
     max_ctx_override: Option<i32>,
     eos_ids: &[u32],
-    step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    step_fn: &mut dyn FnMut(&ProbeStep) -> StepVerdict,
     sampler_cfg: &crate::sampler::SamplerConfig,
     device: Device,
     cancel: &AtomicBool,

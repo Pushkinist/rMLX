@@ -99,6 +99,21 @@ pub(crate) struct StreamState {
     /// Set once a stop string matched. Suppresses all further content
     /// and forces `finish_reason="stop"` on the terminal chunk.
     pub(crate) stop_hit: bool,
+    /// The end flag of the request: set at the match, so the engine ends the
+    /// decode.
+    pub(crate) end_requested: Arc<std::sync::atomic::AtomicBool>,
+    /// The think state of the last token. The tail the parser holds at the end
+    /// goes to the channel that token was on.
+    pub(crate) last_thinking: bool,
+}
+
+impl StreamState {
+    /// A stop string matched: keep no more of the reply and ask the engine to
+    /// end.
+    fn stop(&mut self) {
+        self.stop_hit = true;
+        crate::stop_matcher::request_end(&self.end_requested);
+    }
 }
 
 // ── Chunk builders ────────────────────────────────────────────────────────────
@@ -239,6 +254,16 @@ pub(crate) fn handle_streaming_token(
     if counts_toward_usage {
         state.completion_tokens += 1;
     }
+    if !done {
+        state.last_thinking = is_thinking;
+    }
+
+    // After a stop-string match the reply keeps nothing more: not text, not
+    // reasoning, not a tool call. The generation is read on to its terminal
+    // item, and each step is counted above.
+    if state.stop_hit && !done {
+        return Vec::new();
+    }
 
     let mut out: Vec<Result<Event, std::convert::Infallible>> = Vec::new();
 
@@ -308,6 +333,7 @@ pub(crate) fn handle_streaming_token(
         // Stop strings are matched on the whole answer text, as on the
         // non-streamed path; the reply is what they let through from the
         // engagement byte on.
+        let mut matched_here = false;
         let piece = match state.json_reply.as_mut() {
             Some(reply) if !state.bare_json_tool_call_mode => {
                 let started = reply.start().is_some();
@@ -322,13 +348,7 @@ pub(crate) fn handle_streaming_token(
                     String::new()
                 } else if state.stop_matcher.is_active() {
                     let pushed = state.stop_matcher.push(&piece);
-                    if pushed.stopped {
-                        state.stop_hit = true;
-                        tracing::debug!(
-                            stop = ?pushed.matched,
-                            "stop sequence matched (streaming); suppressing rest"
-                        );
-                    }
+                    matched_here = pushed.stopped;
                     pushed.emit
                 } else {
                     piece
@@ -338,6 +358,9 @@ pub(crate) fn handle_streaming_token(
             }
             _ => piece,
         };
+        if matched_here {
+            state.stop();
+        }
 
         // Drain parser-derived (passthrough_text, new_calls) without holding
         // a parser borrow across the make_*_chunk calls (which read state).
@@ -372,14 +395,12 @@ pub(crate) fn handle_streaming_token(
                 out.push(Ok(chunk_to_event(&chunk)));
             } else if state.stop_hit {
                 // A stop already matched; suppress all further content.
-            } else if state.stop_matcher.is_active() && !state.any_tool_calls {
+            } else if state.stop_matcher.is_active() {
                 // Gate content through the stop matcher. It holds back a
                 // partial-match tail (token-straddling safe) and signals when a
-                // stop string is hit, after which content is suppressed and the
-                // terminal chunk carries finish_reason="stop".
-                // Stop sequences apply to free-text content only; when a tool
-                // call is being emitted (any_tool_calls=true), stop-truncation
-                // does not apply — uniform with the non-streaming path.
+                // stop string is hit, after which the reply keeps nothing and
+                // the terminal chunk carries the finish. The matcher sees the
+                // content channel whether or not a tool call came before.
                 let pushed = state.stop_matcher.push(&text);
                 // LOW-1: take logprobs unconditionally once the piece is
                 // consumed into the matcher. When the whole piece is held back
@@ -391,7 +412,7 @@ pub(crate) fn handle_streaming_token(
                     out.push(Ok(chunk_to_event(&chunk)));
                 }
                 if pushed.stopped {
-                    state.stop_hit = true;
+                    state.stop();
                     tracing::debug!(
                         stop = ?pushed.matched,
                         "stop sequence matched (streaming); suppressing rest"
@@ -403,7 +424,13 @@ pub(crate) fn handle_streaming_token(
                 out.push(Ok(chunk_to_event(&chunk)));
             }
         }
-        for p in &drained_calls {
+        // A call that closes in the push of the match is after the match.
+        let kept_calls = if state.stop_hit {
+            &[][..]
+        } else {
+            &drained_calls[..]
+        };
+        for p in kept_calls {
             let idx = state.next_tool_index;
             state.next_tool_index += 1;
             state.any_tool_calls = true;
@@ -418,7 +445,9 @@ pub(crate) fn handle_streaming_token(
         // from the parser, then emit one finish chunk with the upgraded reason.
         let (final_text, final_calls): (Option<String>, Vec<ParsedToolCall>) =
             match state.parser.as_mut() {
-                Some(parser) => {
+                // After a match the parser's tail and any call it finishes are
+                // dropped.
+                Some(parser) if !state.stop_hit => {
                     parser.finalize();
                     let text = if parser.passthrough_text.is_empty() {
                         None
@@ -427,11 +456,15 @@ pub(crate) fn handle_streaming_token(
                     };
                     (text, parser.take_parsed())
                 }
-                None => (None, Vec::new()),
+                _ => (None, Vec::new()),
             };
         if let Some(text) = final_text {
             if state.stop_hit {
                 // Stop already matched — drop the parser's final tail.
+            } else if state.last_thinking {
+                // The generation ended in its reasoning: so does the tail.
+                let chunk = make_content_chunk(state, None, Some(text), false, None, None);
+                out.push(Ok(chunk_to_event(&chunk)));
             } else if state.stop_matcher.is_active() {
                 let pushed = state.stop_matcher.push(&text);
                 if !pushed.emit.is_empty() {
@@ -440,7 +473,7 @@ pub(crate) fn handle_streaming_token(
                     out.push(Ok(chunk_to_event(&chunk)));
                 }
                 if pushed.stopped {
-                    state.stop_hit = true;
+                    state.stop();
                 }
             } else {
                 let chunk = make_content_chunk(state, Some(text), None, false, None, None);

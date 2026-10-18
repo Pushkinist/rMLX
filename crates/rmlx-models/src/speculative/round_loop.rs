@@ -44,7 +44,7 @@ use super::round_common::{
 };
 use super::{guard_restricted_prefix, DecodeWindow, SpecLoop, VerifierDraw};
 use crate::arch::Architecture;
-use crate::decode_loop::ProbeStep;
+use crate::decode_loop::{ProbeStep, StepVerdict};
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
 /// Which vocabulary decided one emitted token.
@@ -424,7 +424,7 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
     verifier: &Architecture,
     drafter: &mut D,
     prompt_ids: &[u32],
-    step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    step_fn: &mut dyn FnMut(&ProbeStep) -> StepVerdict,
     cfg: &RoundCfg<'_>,
     mut decided_by: Option<&mut Vec<DecidedBy>>,
     device: Device,
@@ -597,7 +597,7 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
                 .as_deref_mut()
                 .map(|buf| (buf, verdict.restricted)),
         )?;
-        if emit.hit_eos {
+        if emit.ended {
             stopped_in_round = true;
             break;
         }

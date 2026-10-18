@@ -242,7 +242,7 @@ fn greedy_tracks_plain_greedy(test: &str, pair: &Pair) {
     {
         let mut step_fn = |s: &rmlx_models::ProbeStep| {
             spec_ids.push(s.token_id);
-            None
+            rmlx_models::StepVerdict::Continue
         };
         let (_steps, ran) =
             tracing::subscriber::with_default(std::sync::Arc::clone(&recorder), || {
@@ -297,7 +297,7 @@ fn greedy_tracks_plain_greedy(test: &str, pair: &Pair) {
     {
         let mut plain_step = |s: &rmlx_models::ProbeStep| {
             plain_ids.push(s.token_id);
-            None
+            rmlx_models::StepVerdict::Continue
         };
         verifier
             .generate_greedy(
@@ -421,7 +421,7 @@ fn the_round_loop_runs_a_block_deeper_than_the_sidecar_declares() {
     let mut emitted = 0usize;
     let mut step_fn = |_: &rmlx_models::ProbeStep| {
         emitted += 1;
-        None
+        rmlx_models::StepVerdict::Continue
     };
     let (_steps, ran) = mtp_generate(
         &verifier,

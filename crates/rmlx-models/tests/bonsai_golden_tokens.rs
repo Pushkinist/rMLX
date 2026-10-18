@@ -108,7 +108,7 @@ fn bonsai_golden_tokens_none() {
 /// thinking_budget forced injection on the Exact-hit decode path (Qwen3ForCausalLM).
 ///
 /// Run the same prompt twice so the second call hits the prompt cache Exact path.
-/// On the second call a step_fn fires `Some(FORCED_ID)` after seeing N_THINKING tokens
+/// On the second call a step_fn fires `rmlx_models::StepVerdict::Force(FORCED_ID)` after seeing N_THINKING tokens
 /// from the decode loop. The token at position N_THINKING+1 in the output sequence
 /// must equal FORCED_ID, proving the Exact-hit loop honours the forced injection.
 ///
@@ -169,7 +169,7 @@ fn thinking_budget_exact_hit_qwen3() {
                 None,
                 1, // single-slot cache
                 &[],
-                &mut |_| None,
+                &mut |_| rmlx_models::StepVerdict::Continue,
                 None,
                 &sampler_cfg,
                 &mut rng,
@@ -202,9 +202,9 @@ fn thinking_budget_exact_hit_qwen3() {
                 // (step 0 is the prefill / cached first token; decode steps start at 1).
                 if decode_step_count == N_THINKING + 1 && forced_at.is_none() {
                     forced_at = Some(decode_step_count);
-                    Some(FORCED_ID)
+                    rmlx_models::StepVerdict::Force(FORCED_ID)
                 } else {
-                    None
+                    rmlx_models::StepVerdict::Continue
                 }
             },
             None,
@@ -302,7 +302,7 @@ fn thinking_budget_forced_token_no_logprobs() {
                 None,
                 1,
                 &[],
-                &mut |_| None,
+                &mut |_| rmlx_models::StepVerdict::Continue,
                 None,
                 &sampler_cfg,
                 &mut rng,
@@ -331,9 +331,9 @@ fn thinking_budget_forced_token_no_logprobs() {
             &mut |_step| {
                 decode_step_count += 1;
                 if decode_step_count == N_THINKING + 1 {
-                    Some(FORCED_ID)
+                    rmlx_models::StepVerdict::Force(FORCED_ID)
                 } else {
-                    None
+                    rmlx_models::StepVerdict::Continue
                 }
             },
             None,
@@ -439,7 +439,7 @@ fn cache_hit_first_token_logprob_parity() {
                 None,
                 1,
                 &[],
-                &mut |_| None,
+                &mut |_| rmlx_models::StepVerdict::Continue,
                 None,
                 &sampler_cfg,
                 &mut rng,

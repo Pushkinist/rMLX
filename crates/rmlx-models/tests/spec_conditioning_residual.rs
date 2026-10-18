@@ -187,7 +187,7 @@ fn dflash1_carried_projection_against_one_call_at_full_height() {
     let mut emitted_ids: Vec<u32> = Vec::new();
     let mut step_fn = |s: &rmlx_models::ProbeStep| {
         emitted_ids.push(s.token_id);
-        None
+        rmlx_models::StepVerdict::Continue
     };
     dflash_generate(
         &verifier,
@@ -301,7 +301,7 @@ fn dflash2_carried_projection_against_one_call_at_full_height() {
     let mut emitted_ids: Vec<u32> = Vec::new();
     let mut step_fn = |s: &rmlx_models::ProbeStep| {
         emitted_ids.push(s.token_id);
-        None
+        rmlx_models::StepVerdict::Continue
     };
     dflash2_generate(
         &verifier,

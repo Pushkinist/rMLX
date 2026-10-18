@@ -133,7 +133,7 @@ fn mtp_assistant_accept_rate_is_high() {
     let mut emitted: Vec<u32> = Vec::new();
     let mut step_fn = |s: &rmlx_models::ProbeStep| {
         emitted.push(s.token_id);
-        None
+        rmlx_models::StepVerdict::Continue
     };
     let eos: Vec<u32> = Vec::new();
     let sampler_cfg = rmlx_models::sampler::SamplerConfig {

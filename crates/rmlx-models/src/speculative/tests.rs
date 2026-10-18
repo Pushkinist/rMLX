@@ -293,13 +293,13 @@ fn emit_step_advances_the_window_once_per_token() {
     let mut emitted: Vec<ProbeStep> = Vec::new();
     let mut window = DecodeWindow::new();
     let mut seen = 0_usize;
-    let mut step_fn = |_: &ProbeStep| -> Option<u32> {
+    let mut step_fn = |_: &ProbeStep| -> StepVerdict {
         seen += 1;
-        None
+        StepVerdict::Continue
     };
 
     for id in [1_u32, 2, 3, 4, 5] {
-        emit_step(&tk, id, None, &mut step_fn, &mut emitted, &mut window);
+        assert!(!emit_step(&tk, id, None, &mut step_fn, &[], &mut emitted, &mut window).ends);
     }
 
     assert_eq!(emitted.len(), 5, "every call must push a step");

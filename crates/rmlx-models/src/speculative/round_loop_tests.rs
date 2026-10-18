@@ -33,6 +33,7 @@ use super::{
     RoundOutcome, Seed, Verdict, VerifierOffsetBasis,
 };
 use crate::arch::Architecture;
+use crate::decode_loop::StepVerdict;
 use crate::sampler::SamplerConfig;
 
 /// Tokens of the prompt.
@@ -154,7 +155,7 @@ fn run(prefill: Prefill, max_ctx: i32) -> (Result<usize>, usize) {
         &verifier,
         &mut drafter,
         &prompt,
-        &mut |_| None,
+        &mut |_| StepVerdict::Continue,
         &RoundCfg {
             loop_kind: SpecLoop::MtpSidecar,
             block_size: BLOCK,

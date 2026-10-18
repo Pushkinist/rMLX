@@ -194,8 +194,9 @@ pub struct RequestPlan {
     pub original_max_tokens: u32,
     /// Sampling parameters (temperature, top-p, etc.) frozen at plan creation.
     pub sampling: SamplingParams,
-    /// Stop strings; generation halts on the first match.
-    pub stop: Vec<String>,
+    /// The end flag of the request. Every attempt of a request holds this
+    /// one flag, so a route that sets it is heard by a replayed attempt.
+    pub end_requested: Arc<std::sync::atomic::AtomicBool>,
     /// Whether the response is streamed via SSE.
     pub stream: bool,
     /// Optional system prompt injected before user turns.
@@ -255,7 +256,7 @@ impl RequestPlan {
             original_prompt_tokens: req.prompt_tokens.clone(),
             original_max_tokens: req.max_tokens,
             sampling: req.sampling.clone(),
-            stop: req.stop.clone(),
+            end_requested: Arc::clone(&req.end_requested),
             stream: req.stream,
             system: req.system.clone(),
             session_id: req.session_id.clone(),
@@ -296,11 +297,11 @@ impl RequestPlan {
     /// and make every legitimate partial-delivery replay spuriously diverge.
     pub fn build_request(&self) -> GenerationRequest {
         GenerationRequest {
+            end_requested: Arc::clone(&self.end_requested),
             model_id: self.model_id.clone(),
             prompt_tokens: self.original_prompt_tokens.clone(),
             max_tokens: self.original_max_tokens.max(1),
             sampling: self.sampling.clone(),
-            stop: self.stop.clone(),
             stream: self.stream,
             system: self.system.clone(),
             session_id: self.session_id.clone(),
@@ -371,6 +372,17 @@ impl futures::stream::Stream for ReplayStream {
     ) -> std::task::Poll<Option<Self::Item>> {
         self.rx.poll_recv(cx)
     }
+}
+
+/// The terminal item for a stream that ends because the route set the end flag:
+/// the client has all it will read. The route writes the finish it reports, so
+/// this item names only the last token it was sent.
+fn stop_terminal(delivered: &[u32]) -> GenerationToken {
+    GenerationToken::terminal(
+        delivered.last().copied().unwrap_or_default(),
+        "stop".to_owned(),
+        String::new(),
+    )
 }
 
 /// Wrap a generator call in a transparent token-replay envelope.
@@ -457,6 +469,14 @@ pub fn replay_stream(
                     Ok(tok) => {
                         // Skip already-delivered prefix tokens on retry attempts.
                         if skipped < skip_count {
+                            // The route sets the end flag when it pops the
+                            // matching token, which can be after the error was
+                            // classified. A replay then ends at its first item,
+                            // and that item is not a prefix that diverged.
+                            if plan.end_requested.load(std::sync::atomic::Ordering::SeqCst) {
+                                let _ = tx.send(Ok(stop_terminal(&delivered))).await;
+                                return;
+                            }
                             // Assert prefix identity: at temp=0 the model must
                             // reproduce the same token at each position.
                             let expected = delivered[skipped];
@@ -504,6 +524,10 @@ pub fn replay_stream(
 
             // Underrun: retry terminated before reproducing the delivered prefix.
             if attempt_error.is_none() && skipped < skip_count {
+                if plan.end_requested.load(std::sync::atomic::Ordering::SeqCst) {
+                    let _ = tx.send(Ok(stop_terminal(&delivered))).await;
+                    return;
+                }
                 tracing::error!(
                     skipped,
                     skip_count,
@@ -537,6 +561,21 @@ pub fn replay_stream(
                         "replay_stream fatal error, not retrying"
                     );
                     let _ = tx.send(Err(err)).await;
+                    return;
+                }
+                RetryClass::Migratable
+                    if plan.end_requested.load(std::sync::atomic::Ordering::SeqCst) =>
+                {
+                    // The route matched a stop string: the client has all it
+                    // will read. A replay would end at its first token and
+                    // answer `replay underrun`, so end the stream here.
+                    tracing::warn!(
+                        model_id = %model_id,
+                        error = %err,
+                        delivered_tokens = delivered.len(),
+                        "replay_stream: failure after the end was requested, not retrying"
+                    );
+                    let _ = tx.send(Ok(stop_terminal(&delivered))).await;
                     return;
                 }
                 RetryClass::Migratable if attempts_remaining == 0 => {

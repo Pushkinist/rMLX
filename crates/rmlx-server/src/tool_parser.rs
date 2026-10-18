@@ -246,13 +246,23 @@ impl ToolCallStreamParser {
     ///   (unclosed strings/braces/brackets are closed) and the call is emitted.
     /// - Other formats: any remaining in-flight XML state is finalized best-effort.
     ///
+    /// Outside a call, it also moves the held-back tail of a marker that never
+    /// completed into `passthrough_text`.
+    ///
     /// Safe to call multiple times (idempotent after first call).
     pub fn finalize(&mut self) {
         if self.allow_eof_recovery {
             return; // already finalized
         }
         self.allow_eof_recovery = true;
+        let outside = matches!(self.state, ParserState::Outside);
         self.run_eof_recovery();
+        if outside {
+            // The tail held back as a possible start of a marker (`<to`) never
+            // completed: it is text.
+            let tail = std::mem::take(&mut self.pending);
+            self.passthrough_text.push_str(&tail);
+        }
     }
 
     /// Run EOF recovery once `allow_eof_recovery` has been set. Extracts any

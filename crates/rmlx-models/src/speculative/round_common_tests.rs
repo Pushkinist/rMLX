@@ -30,7 +30,7 @@ use super::{
     seq_range, stack_offset, RoundTotals,
 };
 use crate::arch::{load_model, Architecture, LoadOpts};
-use crate::decode_loop::ProbeStep;
+use crate::decode_loop::{ProbeStep, StepVerdict};
 use crate::speculative::tests::{greedy_cfg, logits_block, logprob_cfg, tiny_tokenizer};
 use crate::speculative::{
     arm_lin_tapes, rollback_target_from_head, truncate_kv_to, DecodeWindow, ScoredBlock, SpecLoop,
@@ -987,7 +987,7 @@ fn a_round_clipped_by_the_budget_reports_what_it_emitted() {
     let mut emitted: Vec<ProbeStep> = Vec::new();
     let mut emitted_in_rounds = 0usize;
     let mut window = DecodeWindow::new();
-    let mut step = |_: &ProbeStep| -> Option<u32> { None };
+    let mut step = |_: &ProbeStep| -> StepVerdict { StepVerdict::Continue };
 
     let emit = super::emit_round_tokens(
         &tokenizer,
@@ -1002,7 +1002,7 @@ fn a_round_clipped_by_the_budget_reports_what_it_emitted() {
         None,
     )
     .unwrap_or_else(|e| panic!("emit: {e}"));
-    assert!(!emit.hit_eos, "no stop token was in the round");
+    assert!(!emit.ended, "no stop token was in the round");
     assert_eq!(
         emit.committed, 2,
         "the request had two tokens left of its budget and the round handed over four"
@@ -1017,7 +1017,7 @@ fn a_round_stopped_by_its_own_token_reports_what_it_emitted() {
     let mut emitted: Vec<ProbeStep> = Vec::new();
     let mut emitted_in_rounds = 0usize;
     let mut window = DecodeWindow::new();
-    let mut step = |_: &ProbeStep| -> Option<u32> { None };
+    let mut step = |_: &ProbeStep| -> StepVerdict { StepVerdict::Continue };
 
     let emit = super::emit_round_tokens(
         &tokenizer,
@@ -1032,11 +1032,117 @@ fn a_round_stopped_by_its_own_token_reports_what_it_emitted() {
         None,
     )
     .unwrap_or_else(|e| panic!("emit: {e}"));
-    assert!(emit.hit_eos, "the third token is the stop token");
+    assert!(emit.ended, "the third token is the stop token");
     assert_eq!(
         emit.committed, 3,
         "the stop token is emitted and the round ends on it"
     );
+}
+
+/// An end verdict from the sink ends the round where it falls, as a stop token
+/// does: the token that drew the verdict is emitted and counted, and no later
+/// token of the block reaches the sink.
+///
+/// Mutation: drop the verdict that `emit_step` returns; test `ended` only
+/// against the stop tokens.
+#[test]
+fn a_round_the_sink_ends_stops_after_the_token_that_drew_the_verdict() {
+    let tokenizer = tiny_tokenizer();
+    let mut emitted: Vec<ProbeStep> = Vec::new();
+    let mut emitted_in_rounds = 0usize;
+    let mut window = DecodeWindow::new();
+    let mut calls = 0usize;
+    let mut step = |_: &ProbeStep| {
+        calls += 1;
+        if calls == 3 {
+            StepVerdict::End
+        } else {
+            StepVerdict::Continue
+        }
+    };
+
+    let emit = super::emit_round_tokens(
+        &tokenizer,
+        &[1, 2, 3, 4, 5],
+        None,
+        8,
+        &[],
+        &mut step,
+        &mut emitted,
+        &mut emitted_in_rounds,
+        &mut window,
+        None,
+    )
+    .unwrap_or_else(|e| panic!("emit: {e}"));
+
+    assert!(emit.ended, "the third token drew the end verdict");
+    assert_eq!(
+        emit.committed, 3,
+        "the round ends on the token that drew it"
+    );
+    assert_eq!(emitted.len(), 3, "no later token reached the sink");
+    assert_eq!(emitted_in_rounds, 3);
+}
+
+/// The seed ends the request when the sink says so, as it does on a stop
+/// token, and the request's record is written then, once: no round follows, so
+/// no later path writes it. The totals are those of a request that emitted its
+/// seed and ran no round, so the record carries its info line and no accounting
+/// error.
+///
+/// Mutation: drop the verdict; write the record on a stop token only.
+#[test]
+fn a_seed_the_sink_ends_ends_the_request_and_writes_its_record() {
+    let tokenizer = tiny_tokenizer();
+    let seed_only = || RoundTotals {
+        rounds: 0,
+        emitted_in_rounds: 0,
+        total_draft: 0,
+        total_accept: 0,
+        conditioned_rows: None,
+        draft_ns: 1,
+        verifier_ns: 1,
+        round_loop_ns: 3,
+        ..totals(false)
+    };
+    for (sink_ends, stop_ids, want) in [
+        (false, &[][..], false),
+        (true, &[][..], true),
+        (false, &[2u32][..], true),
+    ] {
+        let mut emitted: Vec<ProbeStep> = Vec::new();
+        let mut window = DecodeWindow::new();
+        let mut step = |_: &ProbeStep| {
+            if sink_ends {
+                StepVerdict::End
+            } else {
+                StepVerdict::Continue
+            }
+        };
+        let mut ended = false;
+        let records = crate::stop_scan::events_at_info_or_above(|| {
+            ended = super::emit_seed_token(
+                &tokenizer,
+                2,
+                None,
+                &mut step,
+                &mut emitted,
+                &mut window,
+                stop_ids,
+                &seed_only(),
+            )
+            .unwrap_or_else(|e| panic!("seed: {e}"));
+        });
+        assert_eq!(
+            ended, want,
+            "sink ends: {sink_ends}, stop ids: {stop_ids:?}"
+        );
+        assert_eq!(
+            records,
+            usize::from(want),
+            "one record when the seed ends the request, none otherwise"
+        );
+    }
 }
 
 /// Four vocabulary-4 rows, and the block a draw that asks for logprobs keeps
@@ -1073,13 +1179,21 @@ fn a_round_reports_a_record_for_each_token_it_emits() {
     let (scored, tokens) = scored_rows(&FOUR_ROWS);
     let mut emitted: Vec<ProbeStep> = Vec::new();
     let mut window = DecodeWindow::new();
-    let mut held = |_: &ProbeStep| -> Option<u32> { None };
-    crate::speculative::emit_step(&tokenizer, 7, None, &mut held, &mut emitted, &mut window);
+    let mut held = |_: &ProbeStep| -> StepVerdict { StepVerdict::Continue };
+    let _seed = crate::speculative::emit_step(
+        &tokenizer,
+        7,
+        None,
+        &mut held,
+        &[],
+        &mut emitted,
+        &mut window,
+    );
     let mut emitted_in_rounds = 1usize;
     let mut seen: Vec<Option<u32>> = Vec::new();
-    let mut step = |s: &ProbeStep| -> Option<u32> {
+    let mut step = |s: &ProbeStep| -> StepVerdict {
         seen.push(s.logprobs.as_ref().map(|lp| lp.token_id));
-        None
+        StepVerdict::Continue
     };
 
     let emit = super::emit_round_tokens(
@@ -1137,7 +1251,7 @@ fn a_round_stopped_by_its_token_reads_no_record_past_it() {
     let mut emitted: Vec<ProbeStep> = Vec::new();
     let mut emitted_in_rounds = 0usize;
     let mut window = DecodeWindow::new();
-    let mut step = |_: &ProbeStep| -> Option<u32> { None };
+    let mut step = |_: &ProbeStep| -> StepVerdict { StepVerdict::Continue };
 
     let emit = super::emit_round_tokens(
         &tokenizer,
@@ -1153,7 +1267,7 @@ fn a_round_stopped_by_its_token_reads_no_record_past_it() {
     )
     .unwrap_or_else(|e| panic!("emit: {e}"));
 
-    assert!(emit.hit_eos);
+    assert!(emit.ended);
     assert_eq!(emitted.len(), 2, "the stop token is the second emission");
     assert!(
         emitted.iter().all(|s| s.logprobs.is_some()),
@@ -1175,7 +1289,7 @@ fn a_token_the_budget_cuts_needs_no_row() {
     let mut emitted: Vec<ProbeStep> = Vec::new();
     let mut emitted_in_rounds = 0usize;
     let mut window = DecodeWindow::new();
-    let mut step = |_: &ProbeStep| -> Option<u32> { None };
+    let mut step = |_: &ProbeStep| -> StepVerdict { StepVerdict::Continue };
 
     let emit = super::emit_round_tokens(
         &tokenizer,
@@ -1206,9 +1320,9 @@ fn a_token_with_no_scored_row_is_refused_before_the_sink() {
     let mut emitted_in_rounds = 0usize;
     let mut window = DecodeWindow::new();
     let mut seen = 0usize;
-    let mut step = |_: &ProbeStep| -> Option<u32> {
+    let mut step = |_: &ProbeStep| -> StepVerdict {
         seen += 1;
-        None
+        StepVerdict::Continue
     };
     let &[t0, t1] = tokens.as_slice() else {
         panic!("two rows give two tokens");
@@ -1246,7 +1360,7 @@ fn the_seed_reports_its_own_record_only_when_asked() {
     for with_scored in [true, false] {
         let mut emitted: Vec<ProbeStep> = Vec::new();
         let mut window = DecodeWindow::new();
-        let mut step = |_: &ProbeStep| -> Option<u32> { None };
+        let mut step = |_: &ProbeStep| -> StepVerdict { StepVerdict::Continue };
         let stopped = super::emit_seed_token(
             &tokenizer,
             seed,

@@ -347,30 +347,31 @@ answer. The engine emits no `finish_reason:"error"`.
 
 ### Stop-sequence truncation
 
-`stop` (OpenAI) and `stop_sequences` (Anthropic) truncate the generated
-content at the first match, on both surfaces, streaming or not:
+`stop` (OpenAI) and `stop_sequences` (Anthropic) truncate the content at the
+first match, on both surfaces, streaming or not:
 
-- The matched string is excluded; output ends just before it.
-- OpenAI sets `finish_reason:"stop"`. Anthropic sets
-  `stop_reason:"stop_sequence"` and names the match in `stop_sequence`.
-- With several strings, the earliest byte offset wins; a tie goes to the
-  first string in the array.
-- Matching runs on the detokenized text, so a stop string that straddles a
-  token boundary is found.
-- Streaming holds back a tail that could still grow into a stop string, so a
-  straddling stop is never half-emitted, and no content follows the stop.
-- Only the content channel is matched; reasoning is not.
-- A response carrying tool calls is not truncated.
-- The engine does not know the stop strings. After a match it generates to the
-  end, up to `max_tokens` or the end-of-turn token, and `usage` counts every
-  step. Both streams send their finish events when the generation ends, not at
-  the match, so the client waits for the engine after a match. The Anthropic
-  stream emits nothing more after the match. The OpenAI stream still emits
-  reasoning and tool-call deltas.
+- The matched string is excluded. With several strings, the earliest byte
+  offset wins; a tie goes to the first in the array.
+- Matching runs on the detokenized text; streaming holds back a tail that could
+  still grow into a stop.
+- Only the content channel is matched, from the first token, after the tool
+  parser. Reasoning and tool-call arguments are not, and a tool call earlier in
+  the reply does not switch matching off.
+- After a match the route keeps no text, reasoning or tool call. A tool call
+  before the match stays.
 
-`rmlx_server::stop_matcher` holds the matcher: `find_stop_match` for
-non-streaming and `StopMatcher` for streaming. An empty stop string is
-ignored.
+The route sets `end_requested` on the request at a match. The engine's step
+callback sends the token and then answers `End`, so the decode ends as at an
+end-of-turn token. The route reads to the terminal item and counts each step in
+`usage`; at temperature 0 the replay envelope's channel and the engine's let it
+run at most 10 steps past the match. A failure after the match starts no
+replay.
+
+The route writes one finish rule on both surfaces: a kept tool call gives
+`tool_calls` (OpenAI) or `tool_use` with a null `stop_sequence` (Anthropic);
+otherwise a match gives `stop` or `stop_sequence` with the string.
+
+An empty stop string is ignored.
 
 ### Anthropic `stop_reason` mapping
 

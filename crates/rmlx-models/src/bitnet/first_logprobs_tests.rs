@@ -46,7 +46,9 @@ fn generate_with_slots(model: &super::BitNetText, slots: usize, top_k: u32) -> V
     };
     let mut rng = Pcg32::new(sampler.seed_or_default());
     let mut history = Vec::new();
-    let mut step_fn = |_: &ProbeStep| -> Option<u32> { None };
+    let mut step_fn = |_: &ProbeStep| -> crate::decode_loop::StepVerdict {
+        crate::decode_loop::StepVerdict::Continue
+    };
     super::generate_greedy(
         model,
         &tokenizer,

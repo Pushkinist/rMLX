@@ -100,7 +100,7 @@ fn generate_and_read_bytes(
             None, // max_ctx: arch default
             prompt_cache_slots,
             &[], // no EOS stop — force the full n_tokens decode steps
-            &mut |_| None,
+            &mut |_| rmlx_models::StepVerdict::Continue,
             None,
             &sampler_cfg,
             &mut rng,

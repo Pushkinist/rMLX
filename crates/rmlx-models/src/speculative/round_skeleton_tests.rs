@@ -522,6 +522,43 @@ fn the_loop_checks_every_rounds_advance_before_it_emits() {
     );
 }
 
+/// The shared loop ends the request where the emit says the request ended.
+///
+/// `emit_round_tokens` ends a round on a stop token and on an end verdict from
+/// the sink, and reports both as `ended`. The loop needs a model and a drafter
+/// to run, so the text is what shows that the lines after the emit leave the
+/// loop on that flag. This is a shape pin: it reads the text of three lines,
+/// not what the loop does with a round it ends.
+///
+/// Mutation: drop the check; break on `emit.committed == 0`; test a stop token
+/// in the loop itself.
+#[test]
+fn the_shared_loop_leaves_on_the_end_its_emit_reports() {
+    let src = LOOP_SOURCES
+        .iter()
+        .find(|(f, _)| *f == SHARED_LOOP)
+        .map(|(_, s)| *s)
+        .unwrap_or_default();
+    let code: Vec<&str> = src.lines().map(str::trim).filter(|l| is_code(l)).collect();
+    let emit = code
+        .iter()
+        .position(|l| l.starts_with("let emit = emit_round_tokens("))
+        .unwrap_or_else(|| panic!("the shared loop no longer binds `emit`"));
+    let after: Vec<&str> = code
+        .iter()
+        .skip(emit)
+        .skip_while(|l| !l.starts_with(")?;"))
+        .skip(1)
+        .take(3)
+        .copied()
+        .collect();
+    assert_eq!(
+        after,
+        vec!["if emit.ended {", "stopped_in_round = true;", "break;"],
+        "the loop leaves on the line after the emit"
+    );
+}
+
 /// No round loop reads a stack's offset for itself.
 ///
 /// [`stack_offset`](super::round_common::stack_offset) is the one producer, and

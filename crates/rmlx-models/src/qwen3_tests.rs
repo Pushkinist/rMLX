@@ -448,7 +448,9 @@ fn qwen3_hydrated_exact_no_tail_not_placeholder() {
     let cold_tokens: Vec<u32> = {
         let mut rng = crate::sampler::Pcg32::new(sampler_cfg.seed_or_default());
         let mut token_history: Vec<u32> = Vec::new();
-        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> Option<u32> { None };
+        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> crate::decode_loop::StepVerdict {
+            crate::decode_loop::StepVerdict::Continue
+        };
         let steps = generate_greedy(
             &model,
             &tokenizer,
@@ -550,7 +552,9 @@ fn qwen3_hydrated_exact_no_tail_not_placeholder() {
     let warm_tokens: Vec<u32> = {
         let mut rng = crate::sampler::Pcg32::new(sampler_cfg.seed_or_default());
         let mut token_history: Vec<u32> = Vec::new();
-        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> Option<u32> { None };
+        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> crate::decode_loop::StepVerdict {
+            crate::decode_loop::StepVerdict::Continue
+        };
         let steps = generate_greedy(
             &model,
             &tokenizer,
@@ -682,7 +686,9 @@ fn qwen3_consume_engine_migration_golden() {
      -> Vec<crate::decode_loop::ProbeStep> {
         let mut rng = crate::sampler::Pcg32::new(sampler.seed_or_default());
         let mut token_history: Vec<u32> = Vec::new();
-        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> Option<u32> { None };
+        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> crate::decode_loop::StepVerdict {
+            crate::decode_loop::StepVerdict::Continue
+        };
         generate_greedy(
             &model,
             &tokenizer,

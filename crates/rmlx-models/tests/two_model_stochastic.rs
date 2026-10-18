@@ -164,7 +164,7 @@ fn generate_n(
     let mut ids: Vec<u32> = Vec::new();
     let mut step_fn = |s: &rmlx_models::ProbeStep| {
         ids.push(s.token_id);
-        None
+        rmlx_models::StepVerdict::Continue
     };
     dispatcher
         .spec_generate_greedy(

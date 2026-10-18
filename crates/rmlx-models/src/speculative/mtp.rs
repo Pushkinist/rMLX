@@ -594,7 +594,7 @@ fn load_mtp_head(
 // Round-loop (greedy)
 // ---------------------------------------------------------------------------
 
-use crate::decode_loop::ProbeStep;
+use crate::decode_loop::{ProbeStep, StepVerdict};
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
@@ -877,7 +877,7 @@ pub fn mtp_generate(
     kv_quant_override: Option<KvQuant>,
     max_ctx_override: Option<i32>,
     eos_ids: &[u32],
-    step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    step_fn: &mut dyn FnMut(&ProbeStep) -> StepVerdict,
     sampler_cfg: &crate::sampler::SamplerConfig,
     device: Device,
     cancel: &AtomicBool,

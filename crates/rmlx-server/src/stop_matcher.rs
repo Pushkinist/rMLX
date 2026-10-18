@@ -8,39 +8,40 @@
 //! stop is `"charlie"`). Matching the concatenated text is the only correct
 //! approach.
 //!
-//! Two entry points, one matching rule:
+//! One matching rule, two callers:
 //!
-//! - [`find_stop_match`] — non-streaming. The full text is already
-//!   accumulated; return the byte offset + which stop matched first.
-//! - [`StopMatcher`] — streaming. Stateful; buffers a held-back tail that
-//!   could still be the prefix of a stop string until it is confirmed not to
-//!   be one, so no post-stop content ever leaves the server.
+//! - [`StopMatcher`] — stateful; buffers a held-back tail that could still be
+//!   the prefix of a stop string until it is confirmed not to be one, so no
+//!   post-stop content ever leaves the server. The streaming routes feed it
+//!   piece by piece.
+//! - [`ContentGate`] — the non-streaming routes' accumulator over a matcher.
+//!   It appends the content that is safe to keep and, at a match, sets the end
+//!   flag of the request so the engine ends the decode.
+//!
+//! The matcher runs on the content channel only: not on reasoning and not on
+//! tool-call markup, which the tool parser takes out before the text reaches it.
 //!
 //! Matching rule (shared): the **earliest byte offset** wins; among stops that
 //! match at the same offset, the one **earliest in the `stops` slice** wins
 //! (OpenAI "first match in the array"). Empty stop strings are ignored — an
 //! empty needle would match at offset 0 and truncate everything.
 
-/// Result of scanning a fully-accumulated string for stop sequences.
+/// Result of scanning a string for stop sequences.
 #[derive(Debug, PartialEq, Eq)]
-#[allow(
-    clippy::exhaustive_structs,
-    reason = "closed result type — (offset, matched) is the complete stop-hit contract; callers read both fields"
-)]
-pub struct StopHit {
+struct StopHit {
     /// Byte offset in the text where the matched stop string begins. The
     /// caller truncates `text[..offset]` so the stop string is excluded.
-    pub offset: usize,
-    /// The stop string that matched (for Anthropic's `stop_sequence` field).
-    pub matched: String,
+    offset: usize,
+    /// The stop string that matched.
+    matched: String,
 }
 
-/// Non-streaming scan: find the first stop-sequence match in `text`.
+/// Find the first stop-sequence match in `text`.
 ///
 /// Returns `None` when no stop string is present (no truncation needed).
 /// Empty stop strings in `stops` are skipped.
 #[must_use]
-pub fn find_stop_match(text: &str, stops: &[String]) -> Option<StopHit> {
+fn find_stop_match(text: &str, stops: &[String]) -> Option<StopHit> {
     let mut best: Option<StopHit> = None;
     for s in stops {
         if s.is_empty() {
@@ -81,7 +82,7 @@ pub struct StopPush {
     pub matched: Option<String>,
 }
 
-/// Streaming stop matcher.
+/// Stop matcher.
 ///
 /// Holds back the smallest suffix of the running text that could still grow
 /// into a stop string, so a stop that straddles token boundaries is never
@@ -196,6 +197,73 @@ impl StopMatcher {
             emit,
             stopped: false,
             matched: None,
+        }
+    }
+}
+
+/// Ask the engine to end the decode: a stop string matched. This is the one
+/// place that writes the flag.
+pub(crate) fn request_end(end_requested: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    end_requested.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The content channel of a non-streaming route, behind a [`StopMatcher`].
+///
+/// [`push`](Self::push) appends the text that is safe to keep. At a match it
+/// sets the end flag of the request, so the engine ends the decode, and from
+/// then on it keeps nothing: the caller also stops feeding reasoning and the
+/// tool parser. The route still reads the generation to its terminal item.
+#[derive(Debug)]
+pub struct ContentGate {
+    matcher: StopMatcher,
+    matched: Option<String>,
+    end_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ContentGate {
+    /// A gate over `matcher` that sets `end_requested` at a match.
+    #[must_use]
+    pub fn new(
+        matcher: StopMatcher,
+        end_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            matcher,
+            matched: None,
+            end_requested,
+        }
+    }
+
+    /// `true` once a stop string has matched.
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        self.matched.is_some()
+    }
+
+    /// The stop string that matched, if one did.
+    #[must_use]
+    pub fn matched(&self) -> Option<&str> {
+        self.matched.as_deref()
+    }
+
+    /// Append the part of `piece` that is safe to keep to `text`.
+    pub fn push(&mut self, text: &mut String, piece: &str) {
+        if self.matched.is_some() {
+            return;
+        }
+        let pushed = self.matcher.push(piece);
+        text.push_str(&pushed.emit);
+        if pushed.stopped {
+            self.matched = pushed.matched;
+            request_end(&self.end_requested);
+        }
+    }
+
+    /// At the end of the generation, append the held-back tail: it cannot grow
+    /// into a stop string now.
+    pub fn flush(&mut self, text: &mut String) {
+        if self.matched.is_none() {
+            text.push_str(&self.matcher.finalize());
         }
     }
 }

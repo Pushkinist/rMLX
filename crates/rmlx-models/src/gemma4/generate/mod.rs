@@ -43,8 +43,8 @@ use tracing::info_span;
 
 use crate::constraint::ConstraintEngine;
 use crate::decode_loop::{
-    capture_first_logprobs, capture_logprobs, choose_token, chunked_prefill, pipelined_decode,
-    reject_nan_prefill, replay_first_logprobs, DecodeCtx,
+    capture_first_logprobs, capture_logprobs, choose_token, chunked_prefill, emit_token,
+    pipelined_decode, reject_nan_prefill, replay_first_logprobs, DecodeCtx, StepVerdict,
 };
 use crate::kv_cache::{kv_layer_quants, warn_if_kv_codec_net_negative, KvLayerShape};
 use crate::prompt_cache::{entry_is_storable, Consumed, ReuseKind, ReusePolicy, BLOCK_TOKENS};
@@ -101,7 +101,7 @@ pub fn generate_greedy<'a>(
     // The shared `DecodeCtx` bundles every per-request borrow under one
     // lifetime, so these references share `'a` (a `&mut dyn` trait-object
     // reborrow is invariant and cannot be re-unified once split).
-    step_fn: &'a mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    step_fn: &'a mut dyn FnMut(&ProbeStep) -> StepVerdict,
     // Optional sampler constraint. `None` = unmasked argmax (the hot
     // path). `Some(_)` enables the masked
     // branch at every argmax call site below.
@@ -742,18 +742,23 @@ pub fn generate_greedy<'a>(
     } else {
         None
     };
-    (ctx.step_fn)(steps.push_mut(ProbeStep {
-        token_id: last_id,
-        piece: piece.into_boxed_str(),
-        max_abs_logit,
-        nan_count,
-        logprobs: prefill_logprobs,
-    }));
+    let first = emit_token(
+        &mut *ctx.step_fn,
+        &mut steps,
+        eos_ids,
+        ProbeStep {
+            token_id: last_id,
+            piece: piece.into_boxed_str(),
+            max_abs_logit,
+            nan_count,
+            logprobs: prefill_logprobs,
+        },
+    );
     // Prefill first token into history.
     ctx.token_history.push(last_id);
 
     // EOS-stop. If prefill emitted an EOS already, no decode steps.
-    if eos_ids.contains(&last_id) {
+    if first.ends {
         return Ok(steps);
     }
 

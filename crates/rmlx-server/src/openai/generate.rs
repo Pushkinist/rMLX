@@ -35,6 +35,22 @@ use super::streaming::{handle_streaming_token, StreamState};
 
 // ── Non-streaming path ────────────────────────────────────────────────────────
 
+/// Keep `piece` as content of the reply. It goes through the stop matcher,
+/// except the JSON of a forced tool call: that is tool-call markup, and the
+/// streamed path holds it out of the matcher too.
+fn keep_content(
+    content: &mut crate::stop_matcher::ContentGate,
+    text: &mut String,
+    piece: &str,
+    forced_call: bool,
+) {
+    if forced_call {
+        text.push_str(piece);
+    } else {
+        content.push(text, piece);
+    }
+}
+
 /// Non-streaming generation path.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn generate_blocking(
@@ -48,6 +64,8 @@ pub(super) async fn generate_blocking(
     // engine was moved into the generator. `None` when the request built no
     // constraint that reports it.
     engagement: Option<Arc<rmlx_models::Engagement>>,
+    // The request's stop strings, matched on the content channel.
+    stop_matcher: crate::stop_matcher::StopMatcher,
     // True for a forced tool call (tool_choice=required/named); the text
     // output (bare JSON) must be converted to a tool_calls envelope.
     bare_json_tool_call_mode: bool,
@@ -82,9 +100,10 @@ pub(super) async fn generate_blocking(
     ttft_store: &TtftStore,
 ) -> Response {
     let prompt_token_count = req.prompt_tokens.len() as u32;
-    // Capture the stop sequences before `req` is moved into the
-    // generator. Used to truncate `text` at the first stop-string boundary.
-    let stop_sequences = req.stop.clone();
+    // The route sets this flag at a stop-string match; the engine ends the
+    // decode on it.
+    let mut content =
+        crate::stop_matcher::ContentGate::new(stop_matcher, Arc::clone(&req.end_requested));
     // Clone generator before the stream match so kv_cache_bytes() is
     // still available after generate/replay_stream takes ownership.
     let generator_for_metrics = Arc::clone(&generator);
@@ -112,6 +131,9 @@ pub(super) async fn generate_blocking(
     // Instantiate parser when caller supplied a format. `None` means
     // tools-disabled — every non-thinking piece flows straight to `text`.
     let mut parser: Option<ToolCallStreamParser> = parser_format.map(ToolCallStreamParser::new);
+    // The think state of the last token: the tail the parser holds at the end
+    // goes to the channel that token was on.
+    let mut last_thinking = false;
     let mut tool_calls_accum: Vec<ParsedToolCall> = Vec::new();
     // per-token logprob records, in emission order. Stays empty unless
     // the request set `logprobs:true` (the engine only attaches `logprobs`
@@ -170,8 +192,13 @@ pub(super) async fn generate_blocking(
                         });
                     }
                 }
+                if !tok.done {
+                    last_thinking = tok.is_thinking;
+                }
                 let in_answer = !tok.is_thinking || bare_json_tool_call_mode;
-                if let (Some(reply), true) = (json_reply.as_mut(), in_answer) {
+                if let (Some(reply), true) =
+                    (json_reply.as_mut(), in_answer && !content.is_stopped())
+                {
                     reply.receive(completion_tokens + 1, &tok.piece);
                 }
                 // collect this token's logprob record (present only when
@@ -181,7 +208,22 @@ pub(super) async fn generate_blocking(
                     && !bare_json_tool_call_mode
                     && json_reply.as_ref().is_some_and(|r| r.start().is_none());
                 if let (Some(lp), false) = (tok.logprobs.clone(), before_the_reply) {
-                    logprobs_accum.push(lp);
+                    if !content.is_stopped() {
+                        logprobs_accum.push(lp);
+                    }
+                }
+                // After a stop-string match the reply keeps nothing more: not
+                // text, not reasoning, not a tool call. The generation is still
+                // read to its terminal item, and each step is counted.
+                if content.is_stopped() {
+                    if tok.counts_toward_usage() {
+                        completion_tokens += 1;
+                    }
+                    if tok.done {
+                        finish_reason = tok.finish_reason;
+                        break;
+                    }
+                    continue;
                 }
                 // Feed the parser regardless of think state.
                 //
@@ -206,10 +248,20 @@ pub(super) async fn generate_blocking(
                                 if tok.is_thinking {
                                     reasoning_text.push_str(&p.passthrough_text);
                                 } else {
-                                    text.push_str(&p.passthrough_text);
+                                    keep_content(
+                                        &mut content,
+                                        &mut text,
+                                        &p.passthrough_text,
+                                        bare_json_tool_call_mode,
+                                    );
                                 }
                                 p.passthrough_text.clear();
                             }
+                        }
+                        // A call that the parser finished before the match
+                        // stays; one that this token finishes after it does not.
+                        if !content.is_stopped() {
+                            tool_calls_accum.extend(p.take_parsed());
                         }
                     }
                     None => {
@@ -220,7 +272,12 @@ pub(super) async fn generate_blocking(
                         if tok.is_thinking && !(bare_json_tool_call_mode && json_reply.is_some()) {
                             reasoning_text.push_str(&tok.piece);
                         } else {
-                            text.push_str(&tok.piece);
+                            keep_content(
+                                &mut content,
+                                &mut text,
+                                &tok.piece,
+                                bare_json_tool_call_mode,
+                            );
                         }
                     }
                 }
@@ -239,31 +296,34 @@ pub(super) async fn generate_blocking(
     // parser. Call `finalize` first (flips allow_eof_recovery=true) so that a
     // truncated Bonsai/Hermes `<tool_call>{json(unclosed)` at max_tokens/EOS
     // is balanced and recovered before draining.
-    if let Some(p) = parser.as_mut() {
-        p.finalize();
-        if !p.passthrough_text.is_empty() {
-            text.push_str(&p.passthrough_text);
-            p.passthrough_text.clear();
+    if !content.is_stopped() {
+        if let Some(p) = parser.as_mut() {
+            p.finalize();
+            if !p.passthrough_text.is_empty() {
+                if last_thinking {
+                    reasoning_text.push_str(&p.passthrough_text);
+                } else {
+                    keep_content(
+                        &mut content,
+                        &mut text,
+                        &p.passthrough_text,
+                        bare_json_tool_call_mode,
+                    );
+                }
+                p.passthrough_text.clear();
+            }
+            if !content.is_stopped() {
+                tool_calls_accum.extend(p.take_parsed());
+            }
         }
-        tool_calls_accum.extend(p.take_parsed());
+        content.flush(&mut text);
     }
 
-    // Truncate the accumulated content at the first stop-sequence
-    // boundary (stop string excluded) and force finish_reason="stop". Matching
-    // is on the detokenized text, so a stop that straddled token boundaries is
-    // handled. Only applies when no tool_calls were produced — a tool-call
-    // response carries no free-text content to truncate.
-    if tool_calls_accum.is_empty() {
-        if let Some(hit) = crate::stop_matcher::find_stop_match(&text, &stop_sequences) {
-            tracing::debug!(
-                model_id,
-                stop = %hit.matched,
-                offset = hit.offset,
-                "truncated content at stop sequence (non-streaming)"
-            );
-            text.truncate(hit.offset);
-            finish_reason = Some("stop".to_owned());
-        }
+    // A stop-string match is the end of the reply: `stop`. A tool call that the
+    // reply keeps outranks it below (`tool_calls`), as it outranks `length`.
+    if let Some(stop) = content.matched() {
+        tracing::debug!(model_id, stop, "stopped at a stop sequence (non-streaming)");
+        finish_reason = Some("stop".to_owned());
     }
 
     // A `response_format` reply is the returned text from the engagement byte
@@ -486,6 +546,8 @@ pub(super) async fn generate_streaming(
     parser_format: Option<ToolCallFormat>,
     // Where the request's constraint engaged; see `generate_blocking`.
     engagement: Option<Arc<rmlx_models::Engagement>>,
+    // The request's stop strings, matched on the content channel.
+    stop_matcher: crate::stop_matcher::StopMatcher,
     // True when tool_choice=required/named drives the constraint.
     bare_json_tool_call_mode: bool,
     include_usage: bool,
@@ -505,7 +567,7 @@ pub(super) async fn generate_streaming(
     decode_lease: Option<crate::keep_alive::DecodeLeaseGuard>,
 ) -> Response {
     // Capture stop sequences before `req` is moved into the generator.
-    let stop_sequences = req.stop.clone();
+    let end_requested = Arc::clone(&req.end_requested);
     // Peek at the first item. If it's an error, return 503 immediately
     // (before any SSE bytes are written to the connection).
     // use the replay envelope when eligible; direct generate otherwise.
@@ -677,7 +739,9 @@ pub(super) async fn generate_streaming(
                 .as_ref()
                 .map(|ctrl| (ctrl.clone(), queue_at_admission.0, queue_at_admission.1)),
             // Content-channel stop-sequence matcher (inert when empty).
-            stop_matcher: crate::stop_matcher::StopMatcher::new(&stop_sequences),
+            stop_matcher,
+            end_requested,
+            last_thinking: false,
             stop_hit: false,
         };
 

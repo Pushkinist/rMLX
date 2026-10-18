@@ -1873,7 +1873,7 @@ fn integration_paro_generate_greedy() {
         prompt_ids.len()
     );
     let mut report = String::new();
-    let mut step_fn = |step: &crate::decode_loop::ProbeStep| -> Option<u32> {
+    let mut step_fn = |step: &crate::decode_loop::ProbeStep| -> crate::decode_loop::StepVerdict {
         let line = format!(
             "step {} token_id={}\n",
             report.matches('\n').count(),
@@ -1881,7 +1881,7 @@ fn integration_paro_generate_greedy() {
         );
         report.push_str(&line);
         println!("{}", line.trim());
-        None
+        crate::decode_loop::StepVerdict::Continue
     };
     // Greedy (temperature 0.0) — untouched argmax path.
     let test_sampler_cfg = crate::sampler::SamplerConfig {
@@ -2278,7 +2278,9 @@ fn hydrated_tail_produces_identical_output() {
     let cold_tokens: Vec<u32> = {
         let mut rng = crate::sampler::Pcg32::new(sampler_cfg.seed_or_default());
         let mut token_history: Vec<u32> = Vec::new();
-        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> Option<u32> { None };
+        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> crate::decode_loop::StepVerdict {
+            crate::decode_loop::StepVerdict::Continue
+        };
         let steps = generate_greedy(
             &model,
             // Tokenizer is only needed for piece strings in ProbeStep; we can
@@ -2335,7 +2337,9 @@ fn hydrated_tail_produces_identical_output() {
     let warm_tokens: Vec<u32> = {
         let mut rng = crate::sampler::Pcg32::new(sampler_cfg.seed_or_default());
         let mut token_history: Vec<u32> = Vec::new();
-        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> Option<u32> { None };
+        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> crate::decode_loop::StepVerdict {
+            crate::decode_loop::StepVerdict::Continue
+        };
         let steps = generate_greedy(
             &model,
             &tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
@@ -2407,7 +2411,9 @@ fn hydrated_tail_produces_identical_output() {
     let divergent_tokens: Vec<u32> = {
         let mut rng = crate::sampler::Pcg32::new(sampler_cfg.seed_or_default());
         let mut token_history: Vec<u32> = Vec::new();
-        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> Option<u32> { None };
+        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> crate::decode_loop::StepVerdict {
+            crate::decode_loop::StepVerdict::Continue
+        };
         let steps = generate_greedy(
             &model,
             &tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
@@ -2538,7 +2544,9 @@ fn a_hydrated_tail_issues_no_attention_call_in_the_faulty_configuration() {
         let chunk_override = ChunkOverride::install(crate::prefill_chunk::set_prefill_chunk, chunk);
         let mut rng = crate::sampler::Pcg32::new(sampler_cfg.seed_or_default());
         let mut token_history: Vec<u32> = Vec::new();
-        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> Option<u32> { None };
+        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> crate::decode_loop::StepVerdict {
+            crate::decode_loop::StepVerdict::Continue
+        };
         let (steps, calls) = attention_calls::recorded(|| {
             generate_greedy(
                 &model,
@@ -2693,7 +2701,9 @@ fn hydrated_exact_block_no_tail_not_placeholder() {
     let cold_tokens: Vec<u32> = {
         let mut rng = crate::sampler::Pcg32::new(sampler_cfg.seed_or_default());
         let mut token_history: Vec<u32> = Vec::new();
-        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> Option<u32> { None };
+        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> crate::decode_loop::StepVerdict {
+            crate::decode_loop::StepVerdict::Continue
+        };
         let steps = generate_greedy(
             &model,
             &tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
@@ -2834,7 +2844,9 @@ fn hydrated_exact_block_no_tail_not_placeholder() {
     let warm_tokens: Vec<u32> = {
         let mut rng = crate::sampler::Pcg32::new(sampler_cfg.seed_or_default());
         let mut token_history: Vec<u32> = Vec::new();
-        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> Option<u32> { None };
+        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> crate::decode_loop::StepVerdict {
+            crate::decode_loop::StepVerdict::Continue
+        };
         let steps = generate_greedy(
             &model,
             &tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
@@ -2970,7 +2982,9 @@ fn hydrated_tail_k8v8_equivalence() {
     let cold_tokens: Vec<u32> = {
         let mut rng = crate::sampler::Pcg32::new(sampler_cfg.seed_or_default());
         let mut token_history: Vec<u32> = Vec::new();
-        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> Option<u32> { None };
+        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> crate::decode_loop::StepVerdict {
+            crate::decode_loop::StepVerdict::Continue
+        };
         let steps = generate_greedy(
             &model,
             &tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
@@ -3084,7 +3098,9 @@ fn hydrated_tail_k8v8_equivalence() {
     let warm_tokens: Vec<u32> = {
         let mut rng = crate::sampler::Pcg32::new(sampler_cfg.seed_or_default());
         let mut token_history: Vec<u32> = Vec::new();
-        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> Option<u32> { None };
+        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> crate::decode_loop::StepVerdict {
+            crate::decode_loop::StepVerdict::Continue
+        };
         let steps = generate_greedy(
             &model,
             &tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
@@ -3235,7 +3251,9 @@ fn qwen3_5_moe_consume_engine_migration_golden() {
     let run = |ids: &[u32]| -> Vec<u32> {
         let mut rng = crate::sampler::Pcg32::new(sampler_cfg.seed_or_default());
         let mut token_history: Vec<u32> = Vec::new();
-        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> Option<u32> { None };
+        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> crate::decode_loop::StepVerdict {
+            crate::decode_loop::StepVerdict::Continue
+        };
         generate_greedy(
             &model,
             &tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))

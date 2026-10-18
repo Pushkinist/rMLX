@@ -62,7 +62,7 @@ use rmlx_mlx::{argmax, subtract, Array, Device, Dtype};
 use rmlx_runtime::{count_nan_in_bytes, max_abs_from_bytes};
 
 use crate::arch::{load_model, Architecture, LoadOpts};
-use crate::decode_loop::ProbeStep;
+use crate::decode_loop::{ProbeStep, StepVerdict};
 pub use draft_kind::{Declared, DraftKind};
 pub(crate) use pairing::TrunkKeys;
 pub use pairing::VerifierTrunk;
@@ -587,7 +587,7 @@ impl SpeculativeDispatcher {
         max_ctx_override: Option<i32>,
         prompt_cache_slots: usize,
         eos_ids: &[u32],
-        step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+        step_fn: &mut dyn FnMut(&ProbeStep) -> StepVerdict,
         // Speculative decoding does not integrate the sampler constraint
         // engine. Per-round verifier argmax produces K+1 tokens in one
         // dispatch, but `ConstraintEngine::step_mask` returns one mask for
@@ -705,7 +705,7 @@ impl SpeculativeDispatcher {
         kv_quant_override: Option<KvQuant>,
         max_ctx_override: Option<i32>,
         eos_ids: &[u32],
-        step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+        step_fn: &mut dyn FnMut(&ProbeStep) -> StepVerdict,
         sampler_cfg: &crate::sampler::SamplerConfig,
         cancel: &AtomicBool,
     ) -> Result<(Vec<ProbeStep>, usize)> {
@@ -780,7 +780,7 @@ impl SpeculativeDispatcher {
         kv_quant_override: Option<KvQuant>,
         max_ctx_override: Option<i32>,
         eos_ids: &[u32],
-        step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+        step_fn: &mut dyn FnMut(&ProbeStep) -> StepVerdict,
         sampler_cfg: &crate::sampler::SamplerConfig,
         cancel: &AtomicBool,
     ) -> Result<(Vec<ProbeStep>, usize)> {
@@ -900,18 +900,20 @@ impl DecodeWindow {
 /// `logprobs` is the token's record when the request asked for them, built by
 /// the caller from the verifier's row at the position this token fills.
 ///
-/// The `Option<u32>` force-next signal `step_fn` may return is **discarded**:
-/// the ordinary decode loop folds it into `forced_next` to close an
-/// over-budget thinking block, so that force-close is inert on every
-/// speculative path.
+/// Returns what [`emit_token`](crate::decode_loop::emit_token) returns: `ends`
+/// is true on a token in `eos_ids` and on an `End` verdict. The `Force` in it
+/// is **ignored** by every caller: the ordinary decode loop folds it into
+/// `forced_next` to close an over-budget thinking block, so that force-close is
+/// inert on every speculative path.
 pub(crate) fn emit_step(
     tokenizer: &tokenizers::Tokenizer,
     id: u32,
     logprobs: Option<crate::sampler::TokenLogprobs>,
-    step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    step_fn: &mut dyn FnMut(&ProbeStep) -> StepVerdict,
+    eos_ids: &[u32],
     emitted: &mut Vec<ProbeStep>,
     window: &mut DecodeWindow,
-) {
+) -> crate::decode_loop::Emitted {
     let piece = tokenizer
         .id_to_token(id)
         .unwrap_or_else(|| format!("<unk:{id}>"));
@@ -923,8 +925,7 @@ pub(crate) fn emit_step(
         logprobs,
     };
     window.mark();
-    step_fn(&step);
-    emitted.push(step);
+    crate::decode_loop::emit_token(step_fn, emitted, eos_ids, step)
 }
 
 /// Chunked prefill of `tokens` into `caches`, mirroring the gemma4 generate

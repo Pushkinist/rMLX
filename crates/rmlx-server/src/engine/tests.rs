@@ -3,11 +3,11 @@ use futures::StreamExt;
 
 fn sample_req() -> GenerationRequest {
     GenerationRequest {
+        end_requested: Arc::default(),
         model_id: "test".to_owned(),
         prompt_tokens: vec![],
         max_tokens: 100,
         sampling: SamplingParams::default(),
-        stop: vec![],
         stream: false,
         system: None,
         session_id: None,

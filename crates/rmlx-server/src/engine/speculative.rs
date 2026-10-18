@@ -715,6 +715,9 @@ impl Generator for SpeculativeGenerator {
         let metrics_drainer = req.metrics_drainer;
         // ITL ring-buffer handle for per-request latency aggregates.
         let itl_store = req.itl_store;
+        // Set by the route at a stop-string match; the step callback ends the
+        // decode on it.
+        let end_requested = req.end_requested;
         // per-event DB recorder (TTFT is written by the HTTP handler
         // layer off-runtime; only ITL/kv_cache_bytes are written here).
         let event_recorder = req.event_recorder;
@@ -828,10 +831,10 @@ impl Generator for SpeculativeGenerator {
             let think_splitter_ref = &mut think_splitter;
             let tokenizer_ref = tokenizer.clone();
 
-            // Same `Option<u32>` forced-token contract as the standard path.
-            // Every speculative loop discards it (see `emit_step`), so a
-            // thinking budget's force-close is inert here.
-            let mut step_fn = |s: &rmlx_models::ProbeStep| -> Option<u32> {
+            // Same verdict contract as the standard path. Every speculative
+            // loop discards `Force` (see `emit_step`), so a thinking budget's
+            // force-close is inert here.
+            let mut step_fn = |s: &rmlx_models::ProbeStep| -> rmlx_models::StepVerdict {
                 // Record step arrival time for ITL computation.
                 timestamps_ref.push(Instant::now());
                 let mut text = match detok_ref.step(&tokenizer_ref, s.token_id) {
@@ -876,15 +879,21 @@ impl Generator for SpeculativeGenerator {
                     logprobs,
                 };
                 let _ = tx_ref.blocking_send(Ok(tok));
+                // The route set the flag at a stop-string match: this token is
+                // the last. The send above comes first, so the route reads the
+                // token that drew the verdict, and an `End` beats a `Force`.
+                if end_requested.load(std::sync::atomic::Ordering::SeqCst) {
+                    return rmlx_models::StepVerdict::End;
+                }
                 // forced-close on budget overflow (see standard path).
                 if let Some(sm) = think_splitter_ref.as_mut() {
                     if sm.take_force_close() {
                         if let Some(end_id) = thinking_end_token_id {
-                            return Some(end_id);
+                            return rmlx_models::StepVerdict::Force(end_id);
                         }
                     }
                 }
-                None
+                rmlx_models::StepVerdict::Continue
             };
 
             // Sampled before the generation so the byte count emitted below can
@@ -1101,7 +1110,9 @@ impl Generator for SpeculativeGenerator {
                 }
                 Ok(steps) => {
                     let last_id = steps.last().map_or(0, |s| s.token_id);
-                    let finish_reason = if eos_ids.contains(&last_id) {
+                    let finish_reason = if eos_ids.contains(&last_id)
+                        || end_requested.load(std::sync::atomic::Ordering::SeqCst)
+                    {
                         "stop".to_owned()
                     } else {
                         "length".to_owned()

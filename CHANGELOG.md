@@ -192,6 +192,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   filed under the wrong commit. The commit is now the identity's, shortened
   when it resolves in the checkout, else the checkout's HEAD, else `unknown`,
   in the six scripts that file a row.
+- **A stop-string match ends the generation.** The engine did not know the
+  `stop` and `stop_sequences` strings. After a match it ran to `max_tokens` or
+  the end-of-turn token, counted every step in `usage`, and both streams sent
+  their finish events only when it stopped. The route now sets
+  `end_requested` at a match and the decode ends on it as at an end-of-turn
+  token, on every decode loop, plain and speculative. The route reads on to the
+  terminal item, `usage` counts the steps that ran (at temperature 0, at most
+  10 past the match), and a failure after the match starts no replay.
+- **One stop rule on all four chat routes.** The routes disagreed about tool
+  calls: the non-streamed routes did not truncate a reply that held a tool
+  call, and the OpenAI stream stopped matching after one. Matching now runs on
+  the content channel from the first token, after the tool parser, whether or
+  not a tool call came before it. It does not match reasoning or the arguments
+  of a tool call. After a match the reply keeps no text, reasoning or tool call
+  that follows. A kept tool call gives `tool_calls` (OpenAI) or `tool_use`
+  (Anthropic, `stop_sequence` null); otherwise a match gives `stop` or
+  `stop_sequence` with the string.
+- **`/v1/messages` recovers a tool call cut off by `max_tokens`.** The route
+  never called the tool parser's `finalize`, so the end-of-generation recovery
+  that `/v1/chat/completions` runs did not run. The tail that the parser held
+  back as the start of a marker that never completed (`<to`) was lost on both
+  routes; it is now text.
 - **`/v1/messages` renders the earlier `thinking`, `tool_use` and
   `tool_result` blocks.** The route kept the `text` blocks of a message and
   dropped the rest. A chat template saw an earlier turn with an empty think

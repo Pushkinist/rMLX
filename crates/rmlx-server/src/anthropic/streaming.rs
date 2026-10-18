@@ -244,6 +244,9 @@ enum AnthropicState {
         stop_hit: bool,
         /// The stop string that matched, for the `stop_sequence` field.
         matched_stop: Option<String>,
+        /// The end flag of the request: set at the match, so the engine ends
+        /// the decode.
+        end_requested: Arc<std::sync::atomic::AtomicBool>,
     },
     Epilogue {
         events: std::collections::VecDeque<Result<Event, std::convert::Infallible>>,
@@ -282,6 +285,8 @@ pub(super) async fn generate_streaming(
     request_start: Instant,
     state: &AppState,
     parser_format: Option<ToolCallFormat>,
+    // The request's stop strings, matched on the text channel.
+    stop_matcher: crate::stop_matcher::StopMatcher,
     // Server effective_max_ctx for drainer MetricEvent.ctx_max.
     ctx_max_for_metrics: i64,
     // Correlation id resolved at handler entry.
@@ -297,8 +302,8 @@ pub(super) async fn generate_streaming(
 ) -> Response {
     // Capture input token count before generator consumes the request.
     let input_token_count = req.prompt_tokens.len() as u32;
-    // Capture stop sequences before `req` is moved into the generator.
-    let stop_sequences = req.stop.clone();
+    // The end flag, kept before `req` is moved into the generator.
+    let end_requested = Arc::clone(&req.end_requested);
     // use the replay envelope when eligible; direct generate otherwise.
     let mut token_stream: std::pin::Pin<
         Box<dyn futures::stream::Stream<Item = rmlx_core::Result<GenerationToken>> + Send>,
@@ -453,9 +458,10 @@ pub(super) async fn generate_streaming(
                 .map(|ctrl| (ctrl.clone(), queue_at_admission.0, queue_at_admission.1)),
             request_start,
             // Text-channel stop matcher (inert when no stop strings).
-            stop_matcher: crate::stop_matcher::StopMatcher::new(&stop_sequences),
+            stop_matcher,
             stop_hit: false,
             matched_stop: None,
+            end_requested,
         },
         |state| async move {
             match state {
@@ -491,6 +497,7 @@ pub(super) async fn generate_streaming(
                     mut stop_matcher,
                     mut stop_hit,
                     mut matched_stop,
+                    end_requested,
                 } => {
                     // Drain any queued events from the previous step first.
                     if let Some(ev) = pending.pop_front() {
@@ -519,6 +526,7 @@ pub(super) async fn generate_streaming(
                                 stop_matcher,
                                 stop_hit,
                                 matched_stop,
+                                end_requested,
                             },
                         ));
                     }
@@ -616,6 +624,7 @@ pub(super) async fn generate_streaming(
                                             }
                                             if pushed.stopped {
                                                 stop_hit = true;
+                                                crate::stop_matcher::request_end(&end_requested);
                                                 matched_stop = pushed.matched;
                                                 tracing::debug!(
                                                     stop = ?matched_stop,
@@ -633,7 +642,14 @@ pub(super) async fn generate_streaming(
                                         );
                                     }
                                 }
-                                for parsed in &drained_calls {
+                                // A call that closes in the push of the match
+                                // is after the match.
+                                let kept_calls = if stop_hit {
+                                    &[][..]
+                                } else {
+                                    &drained_calls[..]
+                                };
+                                for parsed in kept_calls {
                                     enqueue_tool_use_block(
                                         &mut queue,
                                         &mut current_block,
@@ -681,6 +697,7 @@ pub(super) async fn generate_streaming(
                                                 stop_matcher,
                                                 stop_hit,
                                                 matched_stop,
+                                                end_requested,
                                             },
                                         ));
                                     }
@@ -735,6 +752,7 @@ pub(super) async fn generate_streaming(
                                         stop_matcher,
                                         stop_hit,
                                         matched_stop,
+                                        end_requested,
                                     },
                                 ));
                             }
@@ -793,10 +811,27 @@ pub(super) async fn generate_streaming(
                         Result<Event, std::convert::Infallible>,
                     > = std::collections::VecDeque::new();
                     if let Some(p) = parser.as_mut() {
+                        // Recover a call the generation cut before its closing
+                        // tags and move the tail of a marker that never
+                        // completed into the text. After a match the tail is
+                        // dropped.
+                        if !stop_hit {
+                            p.finalize();
+                        }
                         if !p.passthrough_text.is_empty() && !stop_hit {
                             let text = std::mem::take(&mut p.passthrough_text);
-                            // Route the final tail through the matcher.
-                            if stop_matcher.is_active() {
+                            if current_block == Some(BlockKind::Thinking) {
+                                // The generation ended in its reasoning: so does
+                                // the tail, and the matcher does not see it.
+                                enqueue_text_or_thinking_delta(
+                                    &mut events,
+                                    &mut current_block,
+                                    &mut current_index,
+                                    BlockKind::Thinking,
+                                    &text,
+                                );
+                            } else if stop_matcher.is_active() {
+                                // Route the final tail through the matcher.
                                 let pushed = stop_matcher.push(&text);
                                 if !pushed.emit.is_empty() {
                                     enqueue_text_or_thinking_delta(
@@ -809,6 +844,7 @@ pub(super) async fn generate_streaming(
                                 }
                                 if pushed.stopped {
                                     stop_hit = true;
+                                    crate::stop_matcher::request_end(&end_requested);
                                     matched_stop = pushed.matched;
                                 }
                             } else {
@@ -825,6 +861,11 @@ pub(super) async fn generate_streaming(
                             p.passthrough_text.clear();
                         }
                         for parsed in &p.take_parsed() {
+                            // A call that the end-of-generation recovery finishes
+                            // after a match is after the match.
+                            if stop_hit {
+                                break;
+                            }
                             enqueue_tool_use_block(
                                 &mut events,
                                 &mut current_block,
@@ -872,7 +913,9 @@ pub(super) async fn generate_streaming(
                     // A stop-sequence match forces stop_reason
                     // "stop_sequence" and names the matched stop, overriding the
                     // engine's terminal (EOS/length) reason.
-                    let (stop_reason, stop_sequence_field) = if stop_hit {
+                    // A tool_use block that the reply keeps outranks it, with
+                    // no stop string.
+                    let (stop_reason, stop_sequence_field) = if stop_hit && !any_tool_use {
                         (
                             "stop_sequence".to_owned(),
                             Value::from(matched_stop.clone()),

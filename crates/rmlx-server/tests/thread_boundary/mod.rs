@@ -431,7 +431,7 @@ pub fn greedy(
         None,
         slots,
         &[],
-        &mut |_| None,
+        &mut |_| rmlx_models::StepVerdict::Continue,
         None,
         &sampler_cfg,
         &mut rng,
@@ -654,6 +654,7 @@ pub fn speculative_generator(verifier: PathBuf, drafter: PathBuf, device: Device
 /// A greedy request for the chat prompt of the generator loaded from `dir`.
 pub fn request(dir: &Path, images: Vec<String>, audio_b64: Vec<String>) -> GenerationRequest {
     GenerationRequest {
+        end_requested: Arc::default(),
         model_id: dir
             .file_name()
             .and_then(|n| n.to_str())
@@ -666,7 +667,6 @@ pub fn request(dir: &Path, images: Vec<String>, audio_b64: Vec<String>) -> Gener
             seed: Some(0),
             ..SamplingParams::default()
         },
-        stop: Vec::new(),
         stream: false,
         system: None,
         session_id: None,

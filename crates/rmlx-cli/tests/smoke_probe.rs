@@ -107,7 +107,7 @@ fn smoke_probe_gemma4_mxfp8_is_clean() {
             None,
             1,   // smoke probe: single-slot cache
             &[], // smoke probe: no EOS-stop, force full 8 steps
-            &mut |_| None,
+            &mut |_| rmlx_models::StepVerdict::Continue,
             None, // No sampler constraint in smoke probe.
             &smoke_sampler_cfg,
             &mut smoke_rng,

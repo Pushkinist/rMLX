@@ -531,7 +531,7 @@ pub(crate) fn run_info(
                 max_ctx_override,
                 1,   // smoke probe uses single-slot cache (no multi-slot needed)
                 &[], // smoke probe: no EOS-stop, force full 8 steps
-                &mut |_| None,
+                &mut |_| rmlx_models::StepVerdict::Continue,
                 None, // The smoke probe never uses sampler constraints.
                 &smoke_sampler_cfg,
                 &mut smoke_rng,

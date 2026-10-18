@@ -101,7 +101,7 @@ fn ctx<'a>(
     vocab: i32,
     n_tokens: usize,
     eos_ids: &'a [u32],
-    step_fn: &'a mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    step_fn: &'a mut dyn FnMut(&ProbeStep) -> StepVerdict,
     constraint: Option<&'a mut dyn ConstraintEngine>,
     sampler_cfg: &'a SamplerConfig,
     rng: &'a mut Pcg32,
@@ -139,7 +139,7 @@ fn choose_token_greedy() {
     let pen = no_penalties();
     let mut rng = Pcg32::new(1);
     let mut hist: Vec<u32> = vec![];
-    let mut step_fn = |_: &ProbeStep| None;
+    let mut step_fn = |_: &ProbeStep| StepVerdict::Continue;
     let mut c = ctx(
         &tk,
         4,
@@ -176,7 +176,7 @@ fn choose_token_seeded_temp_reproducible() {
     let run = || -> u32 {
         let mut rng = Pcg32::new(cfg.seed_or_default());
         let mut hist: Vec<u32> = vec![];
-        let mut step_fn = |_: &ProbeStep| None;
+        let mut step_fn = |_: &ProbeStep| StepVerdict::Continue;
         let mut c = ctx(
             &tk,
             6,
@@ -217,7 +217,7 @@ fn choose_token_penalties() {
     let mut rng = Pcg32::new(1);
     // id 2 already in history ⇒ presence penalty subtracts 100 from its logit.
     let mut hist: Vec<u32> = vec![2];
-    let mut step_fn = |_: &ProbeStep| None;
+    let mut step_fn = |_: &ProbeStep| StepVerdict::Continue;
     let mut c = ctx(
         &tk,
         4,
@@ -276,7 +276,7 @@ fn choose_token_constraint_mask() {
     let pen = no_penalties();
     let mut rng = Pcg32::new(1);
     let mut hist: Vec<u32> = vec![];
-    let mut step_fn = |_: &ProbeStep| None;
+    let mut step_fn = |_: &ProbeStep| StepVerdict::Continue;
     let mut engine = OnlyOne::default();
     let mut c = ctx(
         &tk,
@@ -343,7 +343,7 @@ fn choose_token_uses_pre_advance_gate() {
     let pen = no_penalties();
     let mut rng = Pcg32::new(1);
     let mut hist: Vec<u32> = vec![];
-    let mut step_fn = |_: &ProbeStep| None;
+    let mut step_fn = |_: &ProbeStep| StepVerdict::Continue;
     let mut engine = EngageOnAdvance::default();
     let mut c = ctx(
         &tk,
@@ -421,7 +421,7 @@ fn pipelined_decode_stops_on_eos() {
         nan_count: 0,
         logprobs: None,
     }];
-    let mut step_fn = |_: &ProbeStep| None;
+    let mut step_fn = |_: &ProbeStep| StepVerdict::Continue;
     let mut c = ctx(
         &tk,
         4,
@@ -447,6 +447,65 @@ fn pipelined_decode_stops_on_eos() {
     // emitted stream: first_id 0, then 1, then EOS 3.
     assert_eq!(ids, vec![0, 1, 3], "decode stops once EOS is emitted");
     assert!(stats.decode_steps >= 1, "at least one decode step recorded");
+}
+
+/// A forced token that the callback ends on ends the decode: the verdict on the
+/// forced token (`End`) wins over the force that put it there, so the loop
+/// emits the forced token and nothing after it.
+///
+/// Mutation: the loop reads `Force` and ignores `End` on the pass that
+/// emits the forced token; or keeps a pending force over an `End`.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn an_end_verdict_on_a_forced_token_ends_the_decode() {
+    let _g = mlx_guard();
+    let tk = tiny_tokenizer(5);
+    let cfg = greedy_cfg();
+    let pen = no_penalties();
+    let mut rng = Pcg32::new(1);
+    let rows = vec![vec![0.0, 9.0, 0.0, 0.0, 0.0]];
+    let calls = Cell::new(0);
+    let eos = [2u32];
+    let mut hist: Vec<u32> = vec![0];
+    let mut steps: Vec<ProbeStep> = vec![ProbeStep {
+        token_id: 0,
+        piece: String::new().into_boxed_str(),
+        max_abs_logit: 0.0,
+        nan_count: 0,
+        logprobs: None,
+    }];
+    let forced_done = Cell::new(false);
+    let mut step_fn = |s: &ProbeStep| match s.token_id {
+        1 if !forced_done.get() => {
+            forced_done.set(true);
+            StepVerdict::Force(4)
+        }
+        4 => StepVerdict::End,
+        _ => StepVerdict::Continue,
+    };
+    let mut c = ctx(
+        &tk,
+        5,
+        12,
+        &eos,
+        &mut step_fn,
+        None,
+        &cfg,
+        &mut rng,
+        &pen,
+        &mut hist,
+        true,
+    );
+    pipelined_decode(
+        &mut c,
+        0,
+        &mut steps,
+        &AtomicBool::new(false),
+        scripted(&rows, &calls),
+    )
+    .unwrap();
+    let ids: Vec<u32> = steps.iter().map(|s| s.token_id).collect();
+    assert_eq!(ids, vec![0, 1, 4], "nothing is emitted after the end");
 }
 
 #[test]
@@ -475,9 +534,9 @@ fn pipelined_decode_honors_forced_next() {
         // force id 4 right after the first '1' is emitted, once.
         if s.token_id == 1 && !forced_done.get() {
             forced_done.set(true);
-            Some(4u32)
+            StepVerdict::Force(4)
         } else {
-            None
+            StepVerdict::Continue
         }
     };
     let mut c = ctx(
@@ -532,7 +591,7 @@ fn pipelined_decode_resolve_pieces_toggle() {
         let mut rng = Pcg32::new(1);
         let mut hist: Vec<u32> = vec![0];
         let mut steps: Vec<ProbeStep> = vec![];
-        let mut step_fn = |_: &ProbeStep| None;
+        let mut step_fn = |_: &ProbeStep| StepVerdict::Continue;
         let mut c = ctx(
             &tk,
             4,
@@ -571,7 +630,7 @@ fn pipelined_decode_resolve_pieces_toggle() {
         let mut rng = Pcg32::new(1);
         let mut hist: Vec<u32> = vec![0];
         let mut steps: Vec<ProbeStep> = vec![];
-        let mut step_fn = |_: &ProbeStep| None;
+        let mut step_fn = |_: &ProbeStep| StepVerdict::Continue;
         let mut c = ctx(
             &tk,
             4,
@@ -617,7 +676,7 @@ fn pipelined_decode_lp_k_captures() {
     let eos = [3u32];
     let mut hist: Vec<u32> = vec![0];
     let mut steps: Vec<ProbeStep> = vec![];
-    let mut step_fn = |_: &ProbeStep| None;
+    let mut step_fn = |_: &ProbeStep| StepVerdict::Continue;
     let mut c = ctx(
         &tk,
         4,
@@ -776,7 +835,7 @@ fn pipelined_decode_host_path_emits_the_argmax_stream() {
             nan_count: 0,
             logprobs: None,
         }];
-        let mut step_fn = |_: &ProbeStep| None;
+        let mut step_fn = |_: &ProbeStep| StepVerdict::Continue;
         let mut c = ctx(
             &tk,
             4,
@@ -880,7 +939,7 @@ fn pipelined_decode_propagates_step_failure() {
         nan_count: 0,
         logprobs: None,
     }];
-    let mut step_fn = |_: &ProbeStep| None;
+    let mut step_fn = |_: &ProbeStep| StepVerdict::Continue;
     let mut c = ctx(
         &tk,
         4,
@@ -1333,7 +1392,7 @@ fn a_replayed_token_is_shown_to_the_constraint_before_the_step_callback() {
     let mut constraint: Option<&mut dyn ConstraintEngine> = Some(&mut engine);
     let mut step_fn = |s: &ProbeStep| {
         log.lock().unwrap().push(format!("step {}", s.token_id));
-        None
+        StepVerdict::Continue
     };
     let (mut steps, mut history) = (Vec::new(), vec![5]);
     let ends = emit_replayed_token(
@@ -1356,7 +1415,7 @@ fn a_replayed_eos_token_ends_the_generation_and_no_constraint_is_needed() {
     let mut seen = Vec::new();
     let mut step_fn = |s: &ProbeStep| {
         seen.push(s.token_id);
-        None
+        StepVerdict::Continue
     };
     let (mut steps, mut history) = (Vec::new(), Vec::new());
     let ends = emit_replayed_token(

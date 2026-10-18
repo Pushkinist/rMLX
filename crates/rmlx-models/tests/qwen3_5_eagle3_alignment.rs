@@ -151,7 +151,7 @@ fn eagle3_greedy_tracks_plain_greedy_for_a_long_prefix() {
     {
         let mut step_fn = |s: &rmlx_models::ProbeStep| {
             spec_ids.push(s.token_id);
-            None
+            rmlx_models::StepVerdict::Continue
         };
         let mut decided_by = Vec::new();
         eagle3_generate(
@@ -180,7 +180,7 @@ fn eagle3_greedy_tracks_plain_greedy_for_a_long_prefix() {
     {
         let mut plain_step = |s: &rmlx_models::ProbeStep| {
             plain_ids.push(s.token_id);
-            None
+            rmlx_models::StepVerdict::Continue
         };
         verifier
             .generate_greedy(

@@ -34,7 +34,9 @@ fn generate(model: &Qwen3_5MoeText, tail: usize, top_k: u32) -> Vec<ProbeStep> {
     };
     let mut rng = Pcg32::new(sampler.seed_or_default());
     let mut history = Vec::new();
-    let mut step_fn = |_: &ProbeStep| -> Option<u32> { None };
+    let mut step_fn = |_: &ProbeStep| -> crate::decode_loop::StepVerdict {
+        crate::decode_loop::StepVerdict::Continue
+    };
     generate_greedy(
         model,
         &tokenizer,

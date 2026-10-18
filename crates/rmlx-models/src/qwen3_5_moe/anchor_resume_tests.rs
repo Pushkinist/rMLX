@@ -108,7 +108,9 @@ impl Gate<'_> {
         let penalty_cfg = crate::sampler::PenaltyConfig::default();
         let mut rng = crate::sampler::Pcg32::new(sampler_cfg.seed_or_default());
         let mut token_history: Vec<u32> = Vec::new();
-        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> Option<u32> { None };
+        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> crate::decode_loop::StepVerdict {
+            crate::decode_loop::StepVerdict::Continue
+        };
         let steps = generate_greedy(
             self.model,
             self.tokenizer,

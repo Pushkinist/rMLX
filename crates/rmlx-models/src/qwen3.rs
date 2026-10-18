@@ -67,8 +67,8 @@ use tracing::{debug, info};
 use crate::calibration_sink::CalibrationSink;
 use crate::constraint::ConstraintEngine;
 use crate::decode_loop::{
-    capture_first_logprobs, capture_logprobs, choose_token, chunked_prefill, pipelined_decode,
-    reject_nan_prefill, replay_first_logprobs, DecodeCtx,
+    capture_first_logprobs, capture_logprobs, choose_token, chunked_prefill, emit_token,
+    pipelined_decode, reject_nan_prefill, replay_first_logprobs, DecodeCtx,
 };
 use crate::kv_cache::{kv_layer_quants, warn_if_kv_codec_net_negative, KvLayerShape};
 use crate::layers::{resolve_quant, QuantParams};
@@ -1859,7 +1859,7 @@ pub fn generate_greedy<'a>(
     max_ctx_override: Option<i32>,
     prompt_cache_slots: usize,
     eos_ids: &'a [u32],
-    step_fn: &'a mut dyn FnMut(&crate::decode_loop::ProbeStep) -> Option<u32>,
+    step_fn: &'a mut dyn FnMut(&crate::decode_loop::ProbeStep) -> crate::decode_loop::StepVerdict,
     // Optional sampler constraint. See gemma4::generate_greedy.
     // The shared `DecodeCtx` bundles every per-request borrow under one
     // lifetime, so these references share `'a` (a `&mut dyn` trait-object
@@ -2134,14 +2134,18 @@ pub fn generate_greedy<'a>(
     } else {
         None
     };
-    steps.push(ProbeStep {
-        token_id: last_id,
-        piece: piece.into_boxed_str(),
-        max_abs_logit,
-        nan_count,
-        logprobs: prefill_logprobs,
-    });
-    (ctx.step_fn)(steps.last().unwrap());
+    let first = emit_token(
+        &mut *ctx.step_fn,
+        &mut steps,
+        eos_ids,
+        ProbeStep {
+            token_id: last_id,
+            piece: piece.into_boxed_str(),
+            max_abs_logit,
+            nan_count,
+            logprobs: prefill_logprobs,
+        },
+    );
 
     // Push this prefill snapshot to the prompt cache (Miss → store).
     // We clone the post-prefill KV caches (refcount bump, no data copy) before
@@ -2211,8 +2215,8 @@ pub fn generate_greedy<'a>(
         }
     }
 
-    // EOS-stop. If prefill emitted an EOS already, no decode steps.
-    if eos_ids.contains(&last_id) {
+    // End-stop. If prefill emitted an end already, no decode steps.
+    if first.ends {
         return Ok(steps);
     }
 

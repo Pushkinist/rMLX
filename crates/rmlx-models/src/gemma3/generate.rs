@@ -27,8 +27,8 @@ use tracing::{info, warn};
 
 use crate::constraint::ConstraintEngine;
 use crate::decode_loop::{
-    capture_first_logprobs, capture_logprobs, choose_token, chunked_prefill, pipelined_decode,
-    reject_nan_prefill, replay_first_logprobs, DecodeCtx,
+    capture_first_logprobs, capture_logprobs, choose_token, chunked_prefill, emit_token,
+    pipelined_decode, reject_nan_prefill, replay_first_logprobs, DecodeCtx,
 };
 use crate::kv_cache::kv_layer_quants;
 use crate::prompt_cache::{chained_block_hashes_seeded, entry_is_storable, Consumed, ReusePolicy};
@@ -131,7 +131,7 @@ pub fn generate_greedy<'a>(
     // The shared `DecodeCtx` bundles every per-request borrow under one
     // lifetime, so these references share `'a` (a `&mut dyn` trait-object
     // reborrow is invariant and cannot be re-unified once split).
-    step_fn: &'a mut dyn FnMut(&crate::decode_loop::ProbeStep) -> Option<u32>,
+    step_fn: &'a mut dyn FnMut(&crate::decode_loop::ProbeStep) -> crate::decode_loop::StepVerdict,
     // Optional sampler constraint. See gemma4::generate_greedy.
     mut constraint: Option<&'a mut dyn ConstraintEngine>,
     // Sampling config + per-request RNG. `temperature <= 0.0` keeps the
@@ -456,16 +456,21 @@ pub fn generate_greedy<'a>(
     } else {
         None
     };
-    (ctx.step_fn)(steps.push_mut(ProbeStep {
-        token_id: last_id,
-        piece: piece.into_boxed_str(),
-        max_abs_logit,
-        nan_count,
-        logprobs: prefill_logprobs,
-    }));
+    let first = emit_token(
+        &mut *ctx.step_fn,
+        &mut steps,
+        eos_ids,
+        ProbeStep {
+            token_id: last_id,
+            piece: piece.into_boxed_str(),
+            max_abs_logit,
+            nan_count,
+            logprobs: prefill_logprobs,
+        },
+    );
 
     // EOS-stop. If prefill emitted an EOS already, no decode steps.
-    if eos_ids.contains(&last_id) {
+    if first.ends {
         return Ok(steps);
     }
 
@@ -518,7 +523,7 @@ fn exact_hit_decode<'a>(
     vocab: i32,
     device: Device,
     eos_ids: &'a [u32],
-    step_fn: &'a mut dyn FnMut(&crate::decode_loop::ProbeStep) -> Option<u32>,
+    step_fn: &'a mut dyn FnMut(&crate::decode_loop::ProbeStep) -> crate::decode_loop::StepVerdict,
     mut constraint: Option<&'a mut dyn ConstraintEngine>,
     sampler_cfg: &'a crate::sampler::SamplerConfig,
     rng: &'a mut crate::sampler::Pcg32,

@@ -553,7 +553,9 @@ fn gemma4_consume_engine_migration_golden() {
     let run = |ids: &[u32]| -> Vec<u32> {
         let mut rng = crate::sampler::Pcg32::new(sampler.seed_or_default());
         let mut token_history: Vec<u32> = Vec::new();
-        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> Option<u32> { None };
+        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> crate::decode_loop::StepVerdict {
+            crate::decode_loop::StepVerdict::Continue
+        };
         generate_greedy(
             &model,
             &tokenizer,

@@ -82,7 +82,7 @@ mod ssd_hydrate_tests;
 
 pub use arch::{is_arch_supported, is_generative_arch, read_load_phases, LoadPhases};
 pub use constraint::{ConstraintEngine, Engagement, NoOpConstraint};
-pub use decode_loop::{ProbeStep, SmokeVerdict};
+pub use decode_loop::{ProbeStep, SmokeVerdict, StepVerdict};
 // The flat `rmlx_models::{KvCache, KvQuant, LinearAttnCache,
 // write_caches, set_ssd_*}` re-exports were dropped. Codec types live at
 // `rmlx_kv_quant::*`, SSD-tier hooks + `write_caches` at `rmlx_kv_ssd::*`.

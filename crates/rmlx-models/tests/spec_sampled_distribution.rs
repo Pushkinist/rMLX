@@ -582,7 +582,7 @@ fn run_arm(
     {
         let mut step = |s: &rmlx_models::ProbeStep| {
             emitted.push(s.token_id);
-            None
+            rmlx_models::StepVerdict::Continue
         };
         mtp_assistant_generate(
             verifier,

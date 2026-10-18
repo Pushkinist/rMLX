@@ -26,8 +26,8 @@ use rmlx_runtime::{count_nan_in_bytes, max_abs_from_bytes};
 
 use crate::constraint::ConstraintEngine;
 use crate::decode_loop::{
-    capture_first_logprobs, capture_logprobs, choose_token, chunked_prefill, pipelined_decode,
-    reject_nan_prefill, replay_first_logprobs, DecodeCtx,
+    capture_first_logprobs, capture_logprobs, choose_token, chunked_prefill, emit_token,
+    pipelined_decode, reject_nan_prefill, replay_first_logprobs, DecodeCtx,
 };
 use crate::kv_cache::{kv_layer_quants, warn_if_kv_codec_net_negative, KvLayerShape};
 use crate::prefill_chunk::prefill_pieces;
@@ -73,7 +73,7 @@ pub fn generate_greedy<'a>(
     // The shared `DecodeCtx` bundles every per-request borrow under one
     // lifetime, so these references share `'a` (a `&mut dyn` trait-object
     // reborrow is invariant and cannot be re-unified once split).
-    step_fn: &'a mut dyn FnMut(&crate::decode_loop::ProbeStep) -> Option<u32>,
+    step_fn: &'a mut dyn FnMut(&crate::decode_loop::ProbeStep) -> crate::decode_loop::StepVerdict,
     mut constraint: Option<&'a mut dyn ConstraintEngine>,
     // Sampling config + per-request RNG. See gemma3::generate_greedy.
     sampler_cfg: &'a crate::sampler::SamplerConfig,
@@ -424,16 +424,21 @@ pub fn generate_greedy<'a>(
         } else {
             None
         };
-        (ctx.step_fn)(steps.push_mut(ProbeStep {
-            token_id: last_id,
-            piece: piece.into_boxed_str(),
-            max_abs_logit,
-            nan_count,
-            logprobs: prefill_logprobs,
-        }));
+        let first = emit_token(
+            &mut *ctx.step_fn,
+            &mut steps,
+            eos_ids,
+            ProbeStep {
+                token_id: last_id,
+                piece: piece.into_boxed_str(),
+                max_abs_logit,
+                nan_count,
+                logprobs: prefill_logprobs,
+            },
+        );
         ctx.token_history.push(last_id);
 
-        if eos_ids.contains(&last_id) {
+        if first.ends {
             return Ok(steps);
         }
 
@@ -618,18 +623,23 @@ pub fn generate_greedy<'a>(
     } else {
         None
     };
-    (ctx.step_fn)(steps.push_mut(ProbeStep {
-        token_id: last_id,
-        piece: piece.into_boxed_str(),
-        max_abs_logit,
-        nan_count,
-        logprobs: prefill_logprobs,
-    }));
+    let first = emit_token(
+        &mut *ctx.step_fn,
+        &mut steps,
+        eos_ids,
+        ProbeStep {
+            token_id: last_id,
+            piece: piece.into_boxed_str(),
+            max_abs_logit,
+            nan_count,
+            logprobs: prefill_logprobs,
+        },
+    );
     // prefill first token into history.
     ctx.token_history.push(last_id);
 
     // EOS-stop. If prefill emitted an EOS already, no decode steps.
-    if eos_ids.contains(&last_id) {
+    if first.ends {
         let prefill_ms = (prefill_total_ns as f64) / 1.0e6;
         tracing::info!(
             target: "decode_profile",

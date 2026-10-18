@@ -14,7 +14,7 @@ use std::sync::atomic::AtomicBool;
 use super::*;
 use crate::arch::Architecture;
 use crate::decode_loop::decode_loop_tests::tiny_tokenizer;
-use crate::decode_loop::ProbeStep;
+use crate::decode_loop::{ProbeStep, StepVerdict};
 use crate::qwen3_5_moe::generate_greedy;
 use crate::qwen3_5_moe::prompt_cache::{ensure_prompt_cache, PROMPT_CACHE};
 use crate::qwen3_5_moe::tests::anchor_resume_tests::stored_anchor_pos;
@@ -82,7 +82,7 @@ fn generate(model: &Qwen3_5MoeText, slots: usize, len: usize) {
     };
     let mut rng = Pcg32::new(sampler.seed_or_default());
     let mut history = Vec::new();
-    let mut step_fn = |_: &ProbeStep| -> Option<u32> { None };
+    let mut step_fn = |_: &ProbeStep| StepVerdict::Continue;
     generate_greedy(
         model,
         &tokenizer,

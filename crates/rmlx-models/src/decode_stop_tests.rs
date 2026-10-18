@@ -13,6 +13,10 @@
 //!   stop helper with `?`. It cannot read that the caller handed over the flag
 //!   of the request.
 //!
+//! The end verdict of the step callback is the other way a loop ends before
+//! its budget: the route has matched a stop string and tells the loop to end.
+//! Its tests read the same counts, and the outcome is `Ok`, not the stop.
+//!
 //! The source rule has one test for each group of loops, so a change that
 //! gives one group its stop turns one test green. A loop that only one
 //! architecture has needs its weights to run, so the source rule is its only
@@ -22,7 +26,7 @@
 
 use super::*;
 use crate::stop_scan::{
-    calls_a_flag_fn, calls_off_the_rule, can_leave, error_events, flag_fns_that_disagree,
+    calls_a_flag_fn, calls_of, calls_off_the_rule, can_leave, error_events, flag_fns_that_disagree,
     flag_uses_off_the_rule, fn_shapes, fns_of, helper_shadowed, loops_of, loops_under,
     not_stopping, opens_with_the_stop_read, prefill_sweeps, sources_under, stop_reads,
     stop_reads_past, stops_by_the_rule, top_level_args, unlisted_and_lost, FnShape, Loop,
@@ -67,14 +71,18 @@ fn is_the_stop(e: &Error) -> bool {
     format!("{e:?}").starts_with(STOP_OUTCOME) && !e.is_migratable()
 }
 
-/// When a scripted request goes away.
+/// How a scripted request is cut short, if it is.
 #[derive(Clone, Copy)]
-enum Gone {
+enum Cut {
     Never,
+    /// The request goes away before the loop starts.
     BeforeTheLoop,
-    /// In the step callback of this emitted token, counted from 0 after the
-    /// first token of the request.
+    /// The request goes away in the step callback of this emitted token,
+    /// counted from 0 after the first token of the request.
     AtEmittedToken(usize),
+    /// The step callback of this emitted token answers `StepVerdict::End`, as
+    /// it does at a stop-string match.
+    EndsAtEmittedToken(usize),
 }
 
 /// What one scripted decode did.
@@ -86,6 +94,10 @@ struct Decoded {
     forwards_after_stop: usize,
     /// Tokens that reached the step callback with the stop set.
     emitted_after_stop: usize,
+    /// Forwards that started after the step callback answered `End`.
+    forwards_after_end: usize,
+    /// Tokens that reached the step callback after it answered `End`.
+    emitted_after_end: usize,
     /// The error the loop returned, if it returned one.
     error: Option<Error>,
     /// Events the loop logged at `ERROR`.
@@ -93,8 +105,8 @@ struct Decoded {
 }
 
 /// Decode `n_tokens` with a model that always picks id 1 and never an end
-/// token: only the token budget or a stop ends this loop.
-fn decode(cfg: &SamplerConfig, n_tokens: usize, gone: Gone) -> Decoded {
+/// token: only the token budget, a stop or an end verdict ends this loop.
+fn decode(cfg: &SamplerConfig, n_tokens: usize, cut: Cut) -> Decoded {
     let _g = mlx_guard();
     let tk = tiny_tokenizer(4);
     let pen = no_penalties();
@@ -108,26 +120,41 @@ fn decode(cfg: &SamplerConfig, n_tokens: usize, gone: Gone) -> Decoded {
         nan_count: 0,
         logprobs: None,
     }];
-    let stop = AtomicBool::new(matches!(gone, Gone::BeforeTheLoop));
+    let stop = AtomicBool::new(matches!(cut, Cut::BeforeTheLoop));
     let emitted = Cell::new(0usize);
     let emitted_after_stop = Cell::new(0usize);
     let forwards = Cell::new(0usize);
     let forwards_after_stop = Cell::new(0usize);
+    let ended = Cell::new(false);
+    let emitted_after_end = Cell::new(0usize);
+    let forwards_after_end = Cell::new(0usize);
 
     let mut step_fn = |_: &ProbeStep| {
         if stop.load(Ordering::Relaxed) {
             emitted_after_stop.set(emitted_after_stop.get() + 1);
         }
-        if matches!(gone, Gone::AtEmittedToken(at) if at == emitted.get()) {
+        if ended.get() {
+            emitted_after_end.set(emitted_after_end.get() + 1);
+        }
+        if matches!(cut, Cut::AtEmittedToken(at) if at == emitted.get()) {
             stop.store(true, Ordering::Relaxed);
         }
+        let ends = matches!(cut, Cut::EndsAtEmittedToken(at) if at == emitted.get());
         emitted.set(emitted.get() + 1);
-        None
+        if ends {
+            ended.set(true);
+            StepVerdict::End
+        } else {
+            StepVerdict::Continue
+        }
     };
     let forward = |_y: &Array| {
         forwards.set(forwards.get() + 1);
         if stop.load(Ordering::Relaxed) {
             forwards_after_stop.set(forwards_after_stop.get() + 1);
+        }
+        if ended.get() {
+            forwards_after_end.set(forwards_after_end.get() + 1);
         }
         Ok(logits(&[0.0, 40.0, 0.0, 0.0]))
     };
@@ -153,6 +180,8 @@ fn decode(cfg: &SamplerConfig, n_tokens: usize, gone: Gone) -> Decoded {
         forwards: forwards.get(),
         forwards_after_stop: forwards_after_stop.get(),
         emitted_after_stop: emitted_after_stop.get(),
+        forwards_after_end: forwards_after_end.get(),
+        emitted_after_end: emitted_after_end.get(),
         error,
         logged_errors,
     }
@@ -180,7 +209,7 @@ const BUDGET: usize = 64;
 #[test]
 fn a_decode_that_is_not_stopped_runs_its_whole_budget() {
     for (path, cfg) in selection_paths() {
-        let run = decode(&cfg, BUDGET, Gone::Never);
+        let run = decode(&cfg, BUDGET, Cut::Never);
         assert_eq!(run.ids, vec![1; BUDGET - 1], "{path}");
         assert_eq!(run.forwards, BUDGET - 1, "{path}");
         assert!(run.error.is_none(), "{path}: {:?}", run.error);
@@ -195,7 +224,7 @@ fn a_decode_that_is_not_stopped_runs_its_whole_budget() {
 #[test]
 fn a_stopped_decode_starts_no_further_forward() {
     for (path, cfg) in selection_paths() {
-        let run = decode(&cfg, BUDGET, Gone::AtEmittedToken(2));
+        let run = decode(&cfg, BUDGET, Cut::AtEmittedToken(2));
         assert_eq!(
             run.forwards_after_stop, 0,
             "{path}: of {} forwards in the request",
@@ -205,11 +234,72 @@ fn a_stopped_decode_starts_no_further_forward() {
     }
 }
 
+/// An end verdict ends the decode where an end-of-turn token would. A token is
+/// emitted in the pass after the one that picked it, so token `k` (counted
+/// from 0 after the first token) is emitted in pass `k + 2`, which has run
+/// `k + 2` forwards: the same count as a stop set in the callback of token 2,
+/// which `a_stopped_decode_starts_no_further_forward` reads as 4 forwards and
+/// 3 ids. The loop starts no forward and emits no token after the verdict, on
+/// both selection paths, and returns `Ok`: an end is no error and no stop.
+#[test]
+fn an_ended_decode_runs_no_forward_after_the_token_that_ended_it() {
+    for (path, cfg) in selection_paths() {
+        for k in [0usize, 2, 5] {
+            let run = decode(&cfg, BUDGET, Cut::EndsAtEmittedToken(k));
+            assert_eq!(run.ids, vec![1; k + 1], "{path}, end at token {k}");
+            assert_eq!(run.forwards, k + 2, "{path}, end at token {k}");
+            assert_eq!(run.forwards_after_end, 0, "{path}, end at token {k}");
+            assert_eq!(run.emitted_after_end, 0, "{path}, end at token {k}");
+            assert!(run.error.is_none(), "{path}: {:?}", run.error);
+            assert_eq!(run.logged_errors, 0, "{path}");
+        }
+    }
+}
+
+/// The first token of a request is emitted by the caller, before the loop. A
+/// replayed first token that ends the request says so, as an end-of-turn token
+/// does, so the caller starts no decode.
+#[test]
+fn a_replayed_first_token_that_ends_the_request_says_so() {
+    for (verdict_ends, eos_ids, want) in [
+        (false, &[][..], false),
+        (true, &[][..], true),
+        (false, &[7u32][..], true),
+    ] {
+        let mut steps: Vec<ProbeStep> = Vec::new();
+        let mut hist: Vec<u32> = Vec::new();
+        let mut step_fn = |_: &ProbeStep| {
+            if verdict_ends {
+                StepVerdict::End
+            } else {
+                StepVerdict::Continue
+            }
+        };
+        let first = ProbeStep {
+            token_id: 7,
+            piece: "t7".to_owned().into_boxed_str(),
+            max_abs_logit: 0.0,
+            nan_count: 0,
+            logprobs: None,
+        };
+        let ends = emit_replayed_token(
+            &mut None,
+            &mut step_fn,
+            &mut steps,
+            &mut hist,
+            eos_ids,
+            first,
+        );
+        assert_eq!(ends, want, "verdict ends: {verdict_ends}, eos: {eos_ids:?}");
+        assert_eq!(steps.len(), 1, "the token reached the sink");
+    }
+}
+
 /// A request that is gone before its decode starts runs no forward.
 #[test]
 fn a_decode_stopped_before_its_first_step_runs_no_forward() {
     for (path, cfg) in selection_paths() {
-        let run = decode(&cfg, BUDGET, Gone::BeforeTheLoop);
+        let run = decode(&cfg, BUDGET, Cut::BeforeTheLoop);
         assert_eq!(run.forwards, 0, "{path}");
         assert_eq!(run.ids, Vec::<u32>::new(), "{path}");
     }
@@ -222,7 +312,7 @@ fn a_decode_stopped_before_its_first_step_runs_no_forward() {
 #[test]
 fn a_stopped_decode_returns_the_stop_outcome_and_logs_no_error() {
     for (path, cfg) in selection_paths() {
-        let run = decode(&cfg, BUDGET, Gone::AtEmittedToken(2));
+        let run = decode(&cfg, BUDGET, Cut::AtEmittedToken(2));
         assert!(
             run.error.as_ref().is_some_and(is_the_stop),
             "{path}: {:?}",
@@ -1140,4 +1230,452 @@ fn the_loop_scan_reads_work_and_the_stop_rule_reads_the_first_statement() {
     assert!(opens_with_the_stop_read(
         "'c: for chunk in ids\n    .chunks(4)\n{\n    ensure_not_cancelled(cancel)?;\n}"
     ));
+}
+
+// ── One helper shows a token to the step callback ───────────────────────────
+//
+// The end verdict reaches a loop only if the loop reads it. A loop that calls
+// the step callback itself can drop the verdict, and `#[must_use]` catches
+// only a verdict that is dropped whole: a loop that binds it and treats `End`
+// as `Continue` compiles clean. So the call is made in one place, the helper
+// returns what the loop needs to leave, and a loop that wants a token shown to
+// the sink has no other way to do it. The scan below is the gate on that. It
+// reads, from the source:
+//
+// - the names of the step callback, from every declaration of a `FnMut` over
+//   `ProbeStep`, however the declaration is wrapped or bounded;
+// - each fn that calls one of them, which must be the helper and only the
+//   helper, and which must call it once;
+// - each call of the helper, and of `emit_step`, which wraps it for the
+//   speculative loops, outside its own body: the value must be used. A call that
+//   ends its statement, or that is bound to `_` or to a name that starts with
+//   `_`, drops the verdict.
+//
+// What it cannot see:
+//
+// - a loop that reads the value and ignores `End` (`let ends = ..; if
+//   ends.eos { break; }`). The behaviour tests carry that: an end at token k
+//   leaves no further forward, and a round or a seed the sink ends says so;
+// - a callback rebound under another name (`let f = &mut *step_fn; f(&step)`),
+//   which the scan reads as a call of `f`, a name it was never told;
+// - what the helper returns. It reads that the helper's text names
+//   `StepVerdict::End` and `.contains(`, not that the return value is built
+//   from them. The behaviour tests carry that too.
+
+/// The one fn that calls the step callback. It pushes the step, calls the
+/// callback, and returns what a loop needs to leave: `ends` is true on an
+/// end-of-turn token or an `End` verdict, with the forced token beside it.
+const STEP_HELPER: &str = "emit_token";
+
+/// The speculative loops' emit, which wraps the helper and returns what it
+/// returns. A call of it that drops the value drops the verdict as well.
+const SPECULATIVE_EMIT: &str = "emit_step";
+
+/// `code` with each run of whitespace made one space, so a declaration that
+/// wraps over lines reads as one.
+fn joined(code: &str) -> String {
+    code.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The trailing identifier of `text`, if it ends with one.
+fn last_ident(text: &str) -> Option<String> {
+    let ident: String = text
+        .chars()
+        .rev()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    (!ident.is_empty()).then_some(ident)
+}
+
+/// The names of the step callback in `code`: each parameter or field typed as
+/// a `dyn FnMut`, an `impl FnMut` or a bounded generic over `ProbeStep`. A
+/// generic (`F: FnMut(&ProbeStep) -> ..`) names the parameters typed `F`.
+fn callback_names(code: &str) -> Vec<String> {
+    let flat = joined(code);
+    let mut names: Vec<String> = Vec::new();
+    for (at, _) in flat.match_indices("FnMut(") {
+        let args_end = flat.get(at..).and_then(|rest| {
+            let mut depth = 0usize;
+            rest.char_indices().find_map(|(i, c)| {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(i);
+                        }
+                    }
+                    _ => {}
+                }
+                None
+            })
+        });
+        let Some(args_end) = args_end else {
+            continue;
+        };
+        if !flat
+            .get(at..at + args_end)
+            .is_some_and(|args| args.contains("ProbeStep"))
+        {
+            continue;
+        }
+        let mut before = flat.get(..at).unwrap_or_default().trim_end();
+        loop {
+            let trimmed = ["dyn", "impl", "mut", "&"]
+                .iter()
+                .find_map(|word| before.strip_suffix(word))
+                .or_else(|| {
+                    let ident = last_ident(before)?;
+                    before.strip_suffix(ident.as_str())?.strip_suffix('\'')
+                })
+                .map(str::trim_end);
+            match trimmed {
+                Some(rest) => before = rest,
+                None => break,
+            }
+        }
+        let Some(declared) = before
+            .strip_suffix(':')
+            .and_then(|b| last_ident(b.trim_end()))
+        else {
+            continue;
+        };
+        if declared.starts_with(char::is_uppercase) {
+            for pattern in [format!(": &mut {declared}"), format!(": {declared}")] {
+                for (hit, _) in flat.match_indices(&pattern) {
+                    let next = flat
+                        .get(hit + pattern.len()..)
+                        .and_then(|r| r.chars().next());
+                    if next.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+                        continue;
+                    }
+                    if let Some(name) = last_ident(flat.get(..hit).unwrap_or_default()) {
+                        names.push(name);
+                    }
+                }
+            }
+        } else {
+            names.push(declared);
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// `true` when the call of the helper at `call` in `text` drops its value: it
+/// ends its statement, or it is bound to `_`.
+fn drops_the_value(text: &str, call: &crate::stop_scan::Call<'_>) -> bool {
+    let before = text.get(..call.at).unwrap_or_default().trim_end();
+    let statement_start =
+        before.is_empty() || before.ends_with([';', '{', '}']) || before.ends_with("=> {");
+    let bound_to_nothing = before
+        .strip_suffix('=')
+        .and_then(|bound| bound.trim_end().rsplit_once("let "))
+        .is_some_and(|(_, name)| name.trim().trim_start_matches("mut ").starts_with('_'));
+    let ends_the_statement = call.after.trim_start().starts_with(';');
+    bound_to_nothing || (statement_start && ends_the_statement)
+}
+
+/// What is wrong with how the files under `src` call the step callback: each
+/// fn that calls it outside the helper, a helper that is missing, is declared
+/// twice, calls the callback other than once, or does not name `End` and an
+/// end-of-turn test, and each call of the helper whose value is dropped. Empty
+/// when the rule holds.
+fn step_callback_misuse(src: &std::path::Path) -> Vec<String> {
+    let sources = sources_under(src);
+    let mut names: Vec<String> = sources
+        .iter()
+        .flat_map(|(_, code)| callback_names(code))
+        .collect();
+    names.sort();
+    names.dedup();
+    let mut found = Vec::new();
+    if names.is_empty() {
+        found.push("no step callback is declared in the tree: the scan reads nothing".to_owned());
+    }
+    let mut helpers = 0;
+    for (file, code) in &sources {
+        for (owner, text) in fns_of(code) {
+            let calls: usize = names
+                .iter()
+                .map(|name| {
+                    calls_of(&text, name).len() + calls_of(&text, &format!("{name})")).len()
+                })
+                .sum();
+            if owner == STEP_HELPER {
+                helpers += 1;
+                if calls != 1 {
+                    found.push(format!("{file}::{owner} calls the callback {calls} times"));
+                }
+                if !text.contains("StepVerdict::End") || !text.contains(".contains(") {
+                    found.push(format!(
+                        "{file}::{owner} does not end on an `End` verdict and on an end-of-turn token"
+                    ));
+                }
+                continue;
+            }
+            if calls > 0 {
+                found.push(format!(
+                    "{file}::{owner} calls the step callback outside `{STEP_HELPER}`"
+                ));
+            }
+            for helper in [STEP_HELPER, SPECULATIVE_EMIT] {
+                for call in calls_of(&text, helper) {
+                    if drops_the_value(&text, &call) {
+                        found.push(format!("{file}::{owner} drops the value of `{helper}`"));
+                    }
+                }
+            }
+        }
+    }
+    if helpers != 1 {
+        found.push(format!(
+            "`{STEP_HELPER}` is declared {helpers} times, not once"
+        ));
+    }
+    found
+}
+
+/// Every decode loop shows a token to the step callback through the one
+/// helper, and uses what the helper returns. Today this lists each loop that
+/// still calls the callback itself: the shared pipelined loop (two), the
+/// replayed first token, the first-token emits of qwen3, qwen3_5_moe (two),
+/// gemma4 and gemma3, the loops of BitNet (two), Laguna (two) and Qwen2
+/// (four), the Qwen3-VL loops, and `speculative::emit_step`.
+///
+/// Mutation: add a raw call of the callback in an architecture file; call the
+/// helper and drop its value.
+#[test]
+fn every_decode_loop_shows_a_token_through_the_one_helper() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let misuse = step_callback_misuse(&src);
+    assert!(misuse.is_empty(), "\n{}", misuse.join("\n"));
+}
+
+/// The helper of a fixture tree: it calls the callback once and ends on `End`
+/// and on an end-of-turn token.
+const GATE_HELPER: &str = "pub(crate) fn emit_token(\n    step_fn: &mut dyn FnMut(&ProbeStep) -> StepVerdict,\n    eos_ids: &[u32],\n) -> Emitted {\n    let verdict = step_fn(&step);\n    Emitted { ends: eos_ids.contains(&id) || verdict == StepVerdict::End }\n}\n";
+
+/// What the gate says about a tree of the files in `files`.
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: a panic names the fixture that cannot be written"
+)]
+fn gate_tree(files: &[(&str, &str)]) -> Vec<String> {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    for (name, text) in files {
+        std::fs::write(dir.path().join(name), text).expect("write the fixture");
+    }
+    step_callback_misuse(dir.path())
+}
+
+/// A fixture loop body that calls the helper and uses its value.
+const GATE_USED: &str =
+    "let emitted = emit_token(step_fn, &eos);\n    if emitted.ends {\n        return;\n    }";
+
+/// A fixture loop that holds the callback and runs `call`.
+fn gate_loop_with(call: &str) -> String {
+    format!("pub(crate) fn decode(\n    step_fn: &mut dyn FnMut(&ProbeStep) -> StepVerdict,\n) {{\n    {call}\n}}\n")
+}
+
+/// The gate reads its reasons: a clean tree passes, and a call of the helper
+/// whose value is dropped fails with the reason that names it.
+#[test]
+fn the_one_helper_gate_names_each_dropped_value() {
+    let (tree, loop_with) = (gate_tree, gate_loop_with);
+    let dropped = "arch.rs::decode drops the value of `emit_token`".to_owned();
+    let dropped_step = "arch.rs::decode drops the value of `emit_step`".to_owned();
+
+    assert_eq!(
+        tree(&[("decode_loop.rs", GATE_HELPER)]),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        tree(&[
+            ("decode_loop.rs", GATE_HELPER),
+            ("arch.rs", &loop_with(GATE_USED))
+        ]),
+        Vec::<String>::new(),
+        "a loop that goes through the helper and uses the value"
+    );
+    assert_eq!(
+        tree(&[
+            ("decode_loop.rs", GATE_HELPER),
+            (
+                "arch.rs",
+                &loop_with("if emit_token(step_fn, &eos).ends {\n        return;\n    }")
+            ),
+        ]),
+        Vec::<String>::new(),
+        "a call used as a condition"
+    );
+    assert_eq!(
+        tree(&[
+            ("decode_loop.rs", GATE_HELPER),
+            ("arch.rs", &loop_with("emit_token(step_fn, &eos)?;")),
+        ]),
+        Vec::<String>::new(),
+        "a call whose value is propagated"
+    );
+    assert_eq!(
+        tree(&[
+            ("decode_loop.rs", GATE_HELPER),
+            ("arch.rs", &loop_with("emit_token(step_fn, &eos);")),
+        ]),
+        vec![dropped.clone()],
+        "a call that ends its statement"
+    );
+    assert_eq!(
+        tree(&[
+            ("decode_loop.rs", GATE_HELPER),
+            ("arch.rs", &loop_with("let _ = emit_token(step_fn, &eos);")),
+        ]),
+        vec![dropped.clone()],
+        "a call bound to `_`"
+    );
+    assert_eq!(
+        tree(&[
+            ("decode_loop.rs", GATE_HELPER),
+            (
+                "arch.rs",
+                &loop_with("let _shown = emit_token(step_fn, &eos);")
+            ),
+        ]),
+        vec![dropped.clone()],
+        "a call bound to a name that starts with `_`"
+    );
+    assert_eq!(
+        tree(&[
+            ("decode_loop.rs", GATE_HELPER),
+            ("arch.rs", &loop_with("let _x = emit_token(step_fn, &eos);\n    let kept = emit_token(step_fn, &eos);\n    if kept.ends {\n        return;\n    }")),
+        ]),
+        vec![dropped],
+        "only the call whose value is dropped is named"
+    );
+    assert_eq!(
+        tree(&[
+            ("decode_loop.rs", GATE_HELPER),
+            ("arch.rs", &loop_with("emit_step(step_fn, &eos);")),
+        ]),
+        vec![dropped_step.clone()],
+        "a speculative emit that ends its statement"
+    );
+    assert_eq!(
+        tree(&[
+            ("decode_loop.rs", GATE_HELPER),
+            ("arch.rs", &loop_with("let _ = emit_step(step_fn, &eos);")),
+        ]),
+        vec![dropped_step],
+        "a speculative emit bound to `_`"
+    );
+    assert_eq!(
+        tree(&[
+            ("decode_loop.rs", GATE_HELPER),
+            ("arch.rs", &loop_with("let shown = emit_step(step_fn, &eos);\n    if shown.ends {\n        return;\n    }")),
+        ]),
+        Vec::<String>::new(),
+        "a speculative emit whose value is used"
+    );
+}
+
+/// Each other way to break the rule fails with the reason that names it. A
+/// comment or a string that mentions the callback is no call.
+#[test]
+fn the_one_helper_gate_names_each_way_to_break_the_rule() {
+    let (tree, loop_with) = (gate_tree, gate_loop_with);
+    let raw = "arch.rs::decode calls the step callback outside `emit_token`".to_owned();
+
+    assert_eq!(
+        tree(&[
+            ("decode_loop.rs", GATE_HELPER),
+            ("arch.rs", &loop_with("let _ = step_fn(&step);")),
+        ]),
+        vec![raw.clone()],
+        "a raw call in an architecture file"
+    );
+    assert_eq!(
+        tree(&[
+            ("decode_loop.rs", GATE_HELPER),
+            ("arch.rs", &loop_with("let _ = (step_fn)(&step);")),
+        ]),
+        vec![raw],
+        "a raw call in the parenthesised spelling"
+    );
+    assert_eq!(
+        tree(&[
+            ("decode_loop.rs", GATE_HELPER),
+            (
+                "arch.rs",
+                &loop_with("// step_fn(&step);\n    let note = \"step_fn(&step)\";"),
+            ),
+        ]),
+        Vec::<String>::new(),
+        "a comment and a string are no call"
+    );
+    assert_eq!(
+        tree(&[("arch.rs", &loop_with(GATE_USED))]),
+        vec!["`emit_token` is declared 0 times, not once".to_owned()],
+        "no helper"
+    );
+    assert_eq!(
+        tree(&[(
+            "decode_loop.rs",
+            &GATE_HELPER.replace(" || verdict == StepVerdict::End", "")
+        )]),
+        vec![
+            "decode_loop.rs::emit_token does not end on an `End` verdict and on an end-of-turn token"
+                .to_owned()
+        ],
+        "a helper that ignores End"
+    );
+    assert_eq!(
+        tree(&[(
+            "decode_loop.rs",
+            &GATE_HELPER.replace(
+                "let verdict = step_fn(&step);",
+                "let verdict = step_fn(&step);\n    let _ = step_fn(&step);"
+            )
+        )]),
+        vec!["decode_loop.rs::emit_token calls the callback 2 times".to_owned()],
+        "a helper that calls twice"
+    );
+    assert_eq!(
+        tree(&[("arch.rs", "pub(crate) fn decode() {}\n")]),
+        vec![
+            "no step callback is declared in the tree: the scan reads nothing".to_owned(),
+            "`emit_token` is declared 0 times, not once".to_owned()
+        ],
+        "a tree the scan cannot read"
+    );
+}
+
+/// The scan finds a callback under a name it was never told, however the
+/// declaration is written: wrapped over lines, as an `impl` parameter, or as a
+/// bounded generic. A raw call of each is a misuse of the rule.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: a panic names the fixture that cannot be written"
+)]
+fn the_callback_scan_reads_wrapped_impl_and_bounded_declarations() {
+    let wrapped = "pub(crate) fn a(\n    n: usize,\n    on_token: &'a mut dyn FnMut(\n        &ProbeStep,\n    ) -> StepVerdict,\n) {\n    on_token(&s);\n}\n";
+    let in_impl = "fn b(sink: &mut impl FnMut(&ProbeStep) -> StepVerdict) {\n    sink(&s);\n}\n";
+    let bounded = "fn c<F>(tick: &mut F)\nwhere\n    F: FnMut(&ProbeStep) -> StepVerdict,\n{\n    tick(&s);\n}\n";
+    let unrelated = "fn d(f: &mut dyn FnMut(&Array) -> Array) {\n    f(&a);\n}\n";
+    assert_eq!(callback_names(wrapped), vec!["on_token".to_owned()]);
+    assert_eq!(callback_names(in_impl), vec!["sink".to_owned()]);
+    assert_eq!(callback_names(bounded), vec!["tick".to_owned()]);
+    assert_eq!(callback_names(unrelated), Vec::<String>::new());
+
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    std::fs::write(dir.path().join("arch.rs"), wrapped).expect("write the fixture");
+    let misuse = step_callback_misuse(dir.path());
+    assert!(
+        misuse.contains(&"arch.rs::a calls the step callback outside `emit_token`".to_owned()),
+        "{misuse:?}"
+    );
 }

@@ -1062,7 +1062,7 @@ fn generate_one(
                 Some(MAX_CTX),
                 cache_slots,
                 &[],
-                &mut |_| None,
+                &mut |_| rmlx_models::StepVerdict::Continue,
                 None,
                 &sampler_cfg,
                 &mut rng,

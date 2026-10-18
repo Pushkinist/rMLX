@@ -733,9 +733,9 @@ fn measure_one(
     // and the timing it records is not the timing of its own bookkeeping.
     let mut arrivals_s: Vec<f64> = Vec::with_capacity(args.max_tokens as usize);
     let t0 = Instant::now();
-    let mut on_token = |_step: &rmlx_models::ProbeStep| -> Option<u32> {
+    let mut on_token = |_step: &rmlx_models::ProbeStep| -> rmlx_models::StepVerdict {
         arrivals_s.push(t0.elapsed().as_secs_f64());
-        None
+        rmlx_models::StepVerdict::Continue
     };
 
     let steps = model

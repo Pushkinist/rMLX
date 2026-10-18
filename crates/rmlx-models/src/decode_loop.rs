@@ -3,7 +3,9 @@
 //! Shared, model-agnostic pipelined decode loop.
 //!
 //! One copy of the autoregressive decode pipeline every pipelined arch (qwen3,
-//! qwen3_5_moe, gemma4, gemma3, qwen2) previously hand-copied.
+//! qwen3_5_moe, gemma4, gemma3) previously hand-copied. Qwen2, BitNet, Laguna
+//! and Qwen3-VL keep loops of their own; they show a token to the step callback
+//! through [`emit_token`], as this one does.
 //!
 //! # Two selection paths, and only one of them pipelines
 //!
@@ -31,7 +33,7 @@
 //!
 //! `resolve_pieces` parameterizes the one emission difference between the source
 //! loops: per-step `piece` resolution via `tokenizer.id_to_token` plus a
-//! per-step `debug!` (gemma4/qwen2/qwen3 = true) vs. an empty `Box<str>` piece
+//! per-step `debug!` (gemma4/qwen3 = true) vs. an empty `Box<str>` piece
 //! with no per-step debug (qwen3_5_moe = false). Both are preserved byte-for-byte.
 
 use std::sync::atomic::AtomicBool;
@@ -80,6 +82,23 @@ pub struct ProbeStep {
     pub logprobs: Option<TokenLogprobs>,
 }
 
+/// What a step callback tells the decode loop about the token it was just shown.
+#[allow(
+    clippy::exhaustive_enums,
+    reason = "closed callback contract — every decode loop matches all three"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a loop that drops the verdict ignores the order to end or to force a token"]
+pub enum StepVerdict {
+    /// Decode on.
+    Continue,
+    /// Feed this token next instead of the model's pick (thinking-budget
+    /// injection).
+    Force(u32),
+    /// Stop after this token, as an end-of-turn token does.
+    End,
+}
+
 /// Verdict returned by `classify_smoke`.
 ///
 /// Heuristic: after the seeded 8-token probe, the snapshot is flagged broken on
@@ -125,9 +144,9 @@ pub(crate) struct DecodeCtx<'a> {
     pub n_tokens: usize,
     pub device: Device,
     pub eos_ids: &'a [u32],
-    /// dyn today (`arch/mod.rs`) — unchanged. Returns `Some(id)` to force the
-    /// next emitted token (thinking-budget injection), `None` otherwise.
-    pub step_fn: &'a mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    /// dyn today (`arch/mod.rs`) — unchanged. Returns `Force(id)` to force the
+    /// next emitted token (thinking-budget injection), `Continue` otherwise.
+    pub step_fn: &'a mut dyn FnMut(&ProbeStep) -> StepVerdict,
     /// dyn today — unchanged. Optional grammar/JSON constraint engine.
     pub constraint: Option<&'a mut dyn ConstraintEngine>,
     pub sampler_cfg: &'a SamplerConfig,
@@ -136,7 +155,7 @@ pub(crate) struct DecodeCtx<'a> {
     pub token_history: &'a mut Vec<u32>,
     /// tracing field only — names the arch in the per-step `debug!`.
     pub arch: &'static str,
-    /// gemma4/qwen2/qwen3: true (resolve `piece` per token via `id_to_token`,
+    /// gemma4/qwen3: true (resolve `piece` per token via `id_to_token`,
     /// emit a per-step `debug!`); qwen3_5_moe: false (push an empty `Box<str>`,
     /// no per-step debug). Both byte-for-byte preserved.
     pub resolve_pieces: bool,
@@ -184,13 +203,46 @@ impl PostDecode {
     }
 }
 
+/// What showing a token to the step callback came to.
+#[derive(Debug, Clone, Copy)]
+#[must_use = "a loop that drops this keeps decoding after an end"]
+pub(crate) struct Emitted {
+    /// The token ends the request: it is an end-of-turn token, or the callback
+    /// answered `End`. An `End` beats a `Force` on the same token.
+    pub(crate) ends: bool,
+    /// The callback asked for this token to be the next input.
+    pub(crate) force: Option<u32>,
+}
+
+/// Show one token to the step callback. This is the only call of the callback
+/// in the crate, and every loop that emits a token goes through it: the loop
+/// gets `ends` and leaves on it, so an end verdict ends a request on every path
+/// as an end-of-turn token does. The source gate in `decode_stop_tests.rs`
+/// holds that no other fn calls the callback and that no loop drops the value.
+pub(crate) fn emit_token(
+    step_fn: &mut dyn FnMut(&ProbeStep) -> StepVerdict,
+    steps: &mut Vec<ProbeStep>,
+    eos_ids: &[u32],
+    step: ProbeStep,
+) -> Emitted {
+    let token_id = step.token_id;
+    let verdict = step_fn(steps.push_mut(step));
+    Emitted {
+        ends: eos_ids.contains(&token_id) || verdict == StepVerdict::End,
+        force: match verdict {
+            StepVerdict::Force(id) => Some(id),
+            StepVerdict::Continue | StepVerdict::End => None,
+        },
+    }
+}
+
 /// Emit the first token of an exact prompt-cache hit. The token is replayed,
 /// not sampled, and the constraint sees it before the step callback as it
 /// sees every sampled token. Returns `true` when the token ends the
 /// generation.
 pub(crate) fn emit_replayed_token(
     constraint: &mut Option<&mut dyn ConstraintEngine>,
-    step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    step_fn: &mut dyn FnMut(&ProbeStep) -> StepVerdict,
     steps: &mut Vec<ProbeStep>,
     token_history: &mut Vec<u32>,
     eos_ids: &[u32],
@@ -200,9 +252,9 @@ pub(crate) fn emit_replayed_token(
     if let Some(c) = constraint.as_mut() {
         c.advance(token_id);
     }
-    step_fn(steps.push_mut(step));
+    let emitted = emit_token(step_fn, steps, eos_ids, step);
     token_history.push(token_id);
-    eos_ids.contains(&token_id)
+    emitted.ends
 }
 
 /// Abort a generation whose prefill logits contain NaN.
@@ -525,7 +577,7 @@ pub(crate) fn pipelined_decode(
         } else {
             0
         };
-        let pre_drain_eos = if drain_now {
+        let pre_drain_ends = if drain_now {
             if let Some(p) = pending.take() {
                 let top_bytes = p.to_bytes()?;
                 let next_id = i32::from_le_bytes(top_bytes[..4].try_into().unwrap()) as u32;
@@ -534,28 +586,33 @@ pub(crate) fn pipelined_decode(
                 }
                 ctx.token_history.push(next_id);
                 let piece = resolve_piece(ctx, next_id);
-                let last = steps.push_mut(ProbeStep {
-                    token_id: next_id,
-                    piece,
-                    max_abs_logit: 0.0,
-                    nan_count: 0,
-                    // logprobs computed when this token was sampled.
-                    logprobs: pending_logprobs.take(),
-                });
-                forced_next = forced_next.or((ctx.step_fn)(&*last));
-                ctx.eos_ids.contains(&next_id)
+                let emitted = emit_token(
+                    &mut *ctx.step_fn,
+                    steps,
+                    ctx.eos_ids,
+                    ProbeStep {
+                        token_id: next_id,
+                        piece,
+                        max_abs_logit: 0.0,
+                        nan_count: 0,
+                        // logprobs computed when this token was sampled.
+                        logprobs: pending_logprobs.take(),
+                    },
+                );
+                forced_next = forced_next.or(emitted.force);
+                emitted.ends
             } else {
                 false
             }
         } else {
             false
         };
-        if pre_drain_eos {
+        if pre_drain_ends {
             early_stop = true;
             tracing::debug!(
                 arch = ctx.arch,
                 step = step_idx - 1,
-                "EOS emitted (pre-drain, masked), stopping"
+                "end emitted (pre-drain, masked), stopping"
             );
             break;
         }
@@ -585,7 +642,7 @@ pub(crate) fn pipelined_decode(
         // (unconstrained / warm-up branch). The masked / sampling / penalty branch
         // already drained above.
         let eval_t0 = Instant::now();
-        let mut emitted_eos = false;
+        let mut emitted_ends = false;
         if !drain_now {
             if let Some(p) = pending.take() {
                 // mlx_sync span — measures the GPU-sync cost of materializing the
@@ -614,16 +671,21 @@ pub(crate) fn pipelined_decode(
                         "decode step (pipelined emit)"
                     );
                 }
-                let last = steps.push_mut(ProbeStep {
-                    token_id: next_id,
-                    piece,
-                    max_abs_logit: 0.0,
-                    nan_count: 0,
-                    // this branch only runs when drain_now == false (lp_k == 0).
-                    logprobs: None,
-                });
-                forced_next = forced_next.or((ctx.step_fn)(&*last));
-                emitted_eos = ctx.eos_ids.contains(&next_id);
+                let emitted = emit_token(
+                    &mut *ctx.step_fn,
+                    steps,
+                    ctx.eos_ids,
+                    ProbeStep {
+                        token_id: next_id,
+                        piece,
+                        max_abs_logit: 0.0,
+                        nan_count: 0,
+                        // this branch only runs when drain_now == false (lp_k == 0).
+                        logprobs: None,
+                    },
+                );
+                forced_next = forced_next.or(emitted.force);
+                emitted_ends = emitted.ends;
             }
         }
         let eval_dt = eval_t0.elapsed().as_nanos();
@@ -640,12 +702,12 @@ pub(crate) fn pipelined_decode(
             host_step_total_ns += step_dt;
         }
 
-        if emitted_eos {
+        if emitted_ends {
             early_stop = true;
             tracing::debug!(
                 arch = ctx.arch,
                 step = step_idx - 1,
-                "EOS emitted, stopping decode loop"
+                "end emitted, stopping decode loop"
             );
             break;
         }
@@ -685,14 +747,25 @@ pub(crate) fn pipelined_decode(
             }
             ctx.token_history.push(next_id);
             let piece = resolve_piece(ctx, next_id);
-            (ctx.step_fn)(&*steps.push_mut(ProbeStep {
-                token_id: next_id,
-                piece,
-                max_abs_logit: 0.0,
-                nan_count: 0,
-                // final pending token carries its sample-time logprobs.
-                logprobs: pending_logprobs.take(),
-            }));
+            let last = emit_token(
+                &mut *ctx.step_fn,
+                steps,
+                ctx.eos_ids,
+                ProbeStep {
+                    token_id: next_id,
+                    piece,
+                    max_abs_logit: 0.0,
+                    nan_count: 0,
+                    // final pending token carries its sample-time logprobs.
+                    logprobs: pending_logprobs.take(),
+                },
+            );
+            tracing::debug!(
+                arch = ctx.arch,
+                token_id = next_id,
+                ends = last.ends,
+                "final pending token emitted"
+            );
         }
     }
 

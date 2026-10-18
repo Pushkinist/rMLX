@@ -490,13 +490,13 @@ pub(crate) fn run_baseline(
     // Per-token callback wall-clocks (elapsed seconds since generate-start).
     let mut first_cb_s: Option<f64> = None;
     let mut last_cb_s: f64 = 0.0;
-    let mut step_timing = |_step: &rmlx_models::ProbeStep| -> Option<u32> {
+    let mut step_timing = |_step: &rmlx_models::ProbeStep| -> rmlx_models::StepVerdict {
         let elapsed = ts_generate_start.elapsed().as_secs_f64();
         if first_cb_s.is_none() {
             first_cb_s = Some(elapsed);
         }
         last_cb_s = elapsed;
-        None
+        rmlx_models::StepVerdict::Continue
     };
     let kv_before = model.kv_cache_bytes_sample();
     let steps = model

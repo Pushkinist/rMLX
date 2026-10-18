@@ -13,7 +13,10 @@
 //! the last step and the bytes left over when the generation ends inside a
 //! multi-byte character (empty otherwise). The terminal item is no generated
 //! token. The expected figure of each case is the number of decode steps in
-//! its script, written as a literal and checked against the script.
+//! its script, written as a literal and checked against the script. A script
+//! with a stop string ends at the step where the string completes: the
+//! generator sends its terminal item when the route sets the end flag of the
+//! request, as the engine does, so the model's later steps do not run.
 //!
 //! What cannot move: a `length` reply never reports more than `max_tokens`;
 //! the figure is the same on the blocking and the streaming path of one API,
@@ -43,10 +46,18 @@
 //! - the terminal item counts when it carries text (the predicate reads the
 //!   piece as well as `done`): `usage_counts_the_decode_steps` fails on
 //!   `mid_character`.
-//! - a streaming path stops reading the generation at a stop-string match:
-//!   `usage_counts_the_decode_steps` and `blocking_and_streaming_agree` fail
-//!   on the `stop_string` rows (the match with an event queued, and the match
-//!   with none).
+//! - a route that does not set the end flag at a stop-string match, or counts
+//!   a step that ran past it: `usage_counts_the_decode_steps` fails on the
+//!   `stop_string` rows (the match with an event queued, and the match with
+//!   none), on the usage figure and on the flag the stub kept.
+//! - a route that sets the flag when no stop string matched:
+//!   `usage_counts_the_decode_steps` fails on every row without a stop.
+//! - a path counts a different number of steps after a match than its twin:
+//!   `blocking_and_streaming_agree` fails on the `stop_string` rows.
+//!
+//! These tests prove what a route does. They do not prove that an engine ends
+//! when the flag is set: the loop tests of `rmlx-models` and the GPU cells of
+//! `stop_ends_decode` hold that.
 
 // Test harness: panics/unwraps are acceptable in test bodies.
 #![allow(
@@ -59,8 +70,8 @@
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::stream::{self, Stream};
@@ -177,15 +188,15 @@ const MID_CHARACTER: Case = Case {
 
 /// A stop string matches inside the second step of four, after text of that
 /// step ("b") is released: a streaming path has an event queued when the match
-/// happens. The engine keeps generating, so the figure is still the four
-/// steps; the reply is cut before the match. Two steps follow the match, so a
-/// path that reads one more item and then stops is caught too.
+/// happens. The engine ends the generation at the match, so the figure is the
+/// two steps up to it; the reply is cut before the match. Two steps of the
+/// script follow the match, so a path that counts one more item is caught too.
 const STOP_STRING: Case = Case {
     name: "stop_string",
     steps: &[answer("a"), answer("bc"), answer("d"), answer("e")],
     finish: "length",
     max_tokens: 4,
-    expected: 4,
+    expected: 2,
     content: "ab",
     reasoning: "",
     tail: "",
@@ -200,7 +211,7 @@ const STOP_STRING_AT_A_STEP_START: Case = Case {
     steps: &[answer("a"), answer("b"), answer("c"), answer("d")],
     finish: "length",
     max_tokens: 4,
-    expected: 4,
+    expected: 2,
     content: "a",
     reasoning: "",
     tail: "",
@@ -235,35 +246,42 @@ const CASES: [Case; 7] = [
 #[derive(Clone)]
 struct ScriptedGenerator {
     case: Case,
+    /// The end flag of the last request, kept so the test can read whether the
+    /// route set it.
+    flag: Arc<Mutex<Option<Arc<AtomicBool>>>>,
 }
 
 impl Generator for ScriptedGenerator {
     fn generate(
         &self,
-        _req: GenerationRequest,
+        req: GenerationRequest,
     ) -> Pin<Box<dyn Stream<Item = rmlx_core::Result<GenerationToken>> + Send>> {
-        let mut items: Vec<rmlx_core::Result<GenerationToken>> = self
-            .case
-            .steps
-            .iter()
-            .enumerate()
-            .map(|(id, step)| {
-                Ok(GenerationToken {
-                    token_id: id as u32,
+        *self.flag.lock().unwrap() = Some(Arc::clone(&req.end_requested));
+        let state = (self.case, req.end_requested, 0usize);
+        Box::pin(stream::unfold(state, |(case, flag, at)| async move {
+            let n = case.steps.len();
+            if at > n {
+                return None;
+            }
+            if at < n && !flag.load(Ordering::SeqCst) {
+                let step = case.steps[at];
+                let token = GenerationToken {
+                    token_id: at as u32,
                     piece: step.piece.to_owned(),
                     done: false,
                     finish_reason: None,
                     is_thinking: step.thinking,
                     logprobs: None,
-                })
-            })
-            .collect();
-        items.push(Ok(GenerationToken::terminal(
-            self.case.steps.len().saturating_sub(1) as u32,
-            self.case.finish.to_owned(),
-            self.case.tail.to_owned(),
-        )));
-        Box::pin(stream::iter(items))
+                };
+                return Some((Ok(token), (case, flag, at + 1)));
+            }
+            let terminal = GenerationToken::terminal(
+                at.saturating_sub(1) as u32,
+                case.finish.to_owned(),
+                case.tail.to_owned(),
+            );
+            Some((Ok(terminal), (case, flag, n + 1)))
+        }))
     }
 }
 
@@ -271,16 +289,33 @@ impl Generator for ScriptedGenerator {
 
 struct Server {
     port: u16,
+    end_flag: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     tokens_out: Arc<AtomicU64>,
     metrics_db: PathBuf,
     _snapshot: tempfile::TempDir,
 }
 
+/// The steps the engine runs for `case`: all of them, or the steps up to the
+/// one in which the stop string completes.
+fn steps_that_run(case: Case) -> u64 {
+    let Some(stop) = case.stop else {
+        return case.steps.len() as u64;
+    };
+    let mut text = String::new();
+    for (at, step) in case.steps.iter().enumerate() {
+        text.push_str(step.piece);
+        if text.contains(stop) {
+            return at as u64 + 1;
+        }
+    }
+    case.steps.len() as u64
+}
+
 async fn start_server(case: Case) -> Server {
     assert_eq!(
         case.expected,
-        case.steps.len() as u64,
-        "harness: `expected` of {} is the number of decode steps",
+        steps_that_run(case),
+        "harness: `expected` of {} is the number of decode steps that run",
         case.name
     );
     assert!(
@@ -308,8 +343,16 @@ async fn start_server(case: Case) -> Server {
     .unwrap();
     let metrics_db = tmp.path().join("metrics").join("runs.db");
     let reg = ModelRegistry::from_paths(std::slice::from_ref(&snap));
-    let loader: ModelLoader =
-        Arc::new(move |_path, _id| Ok(Box::new(ScriptedGenerator { case }) as Box<dyn Generator>));
+    let end_flag: Arc<Mutex<Option<Arc<AtomicBool>>>> = Arc::default();
+    let loader: ModelLoader = {
+        let flag = Arc::clone(&end_flag);
+        Arc::new(move |_path, _id| {
+            Ok(Box::new(ScriptedGenerator {
+                case,
+                flag: Arc::clone(&flag),
+            }) as Box<dyn Generator>)
+        })
+    };
     let tokens_out = Arc::new(AtomicU64::new(0));
     let state = AppState {
         device: rmlx_mlx::Device::Cpu,
@@ -356,7 +399,10 @@ async fn start_server(case: Case) -> Server {
     let now = std::time::Instant::now();
     state.slots.write().push(LoadedModel {
         id: "scripted".to_owned(),
-        model: Arc::new(ScriptedGenerator { case }),
+        model: Arc::new(ScriptedGenerator {
+            case,
+            flag: Arc::clone(&end_flag),
+        }),
         loaded_at: now,
         last_used: now,
         effective_max_ctx: usize::MAX,
@@ -374,6 +420,7 @@ async fn start_server(case: Case) -> Server {
     tokio::time::sleep(Duration::from_millis(20)).await;
     Server {
         port,
+        end_flag,
         tokens_out,
         metrics_db,
         _snapshot: tmp,
@@ -481,7 +528,12 @@ impl Route {
             body[field] = json!([stop]);
         }
         if !self.is_anthropic() {
-            body["temperature"] = json!(0);
+            // Temperature 0 goes through the replay envelope, whose channel
+            // lets the generator run ahead of a match. A stop-string case
+            // keeps the default temperature so the count is exact.
+            if case.stop.is_none() {
+                body["temperature"] = json!(0);
+            }
             if self.streams() {
                 body["stream_options"] = json!({"include_usage": true});
             }
@@ -509,6 +561,8 @@ struct Observed {
     reasoning: String,
     tokens_out: u64,
     metrics: Vec<f64>,
+    /// The route set the end flag of the request.
+    end_requested: bool,
 }
 
 async fn observe(route: Route, case: Case) -> Observed {
@@ -597,6 +651,12 @@ async fn observe(route: Route, case: Case) -> Observed {
         }
     };
     let metrics = completion_tokens_observed(&server.metrics_db).await;
+    let end_requested = server
+        .end_flag
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::SeqCst));
     Observed {
         usage,
         finish,
@@ -604,6 +664,7 @@ async fn observe(route: Route, case: Case) -> Observed {
         reasoning,
         tokens_out: server.tokens_out.load(Ordering::Relaxed),
         metrics,
+        end_requested,
     }
 }
 
@@ -633,6 +694,13 @@ async fn usage_counts_the_decode_steps() {
                 wrong.push(format!(
                     "{at}: usage {}, expected {} (one per decode step, none for the terminal item)",
                     seen.usage, case.expected
+                ));
+            }
+            if seen.end_requested != case.stop.is_some() {
+                wrong.push(format!(
+                    "{at}: end flag {}, expected {}",
+                    seen.end_requested,
+                    case.stop.is_some()
                 ));
             }
         }

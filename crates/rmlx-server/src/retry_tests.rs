@@ -134,6 +134,7 @@ fn classify_kv_hard_cap_exceeded_is_fatal() {
 
 fn req_with_temp(temperature: f32) -> GenerationRequest {
     GenerationRequest {
+        end_requested: Arc::default(),
         model_id: "mock".to_owned(),
         prompt_tokens: vec![],
         max_tokens: 100,
@@ -141,7 +142,6 @@ fn req_with_temp(temperature: f32) -> GenerationRequest {
             temperature,
             ..SamplingParams::default()
         },
-        stop: vec![],
         stream: false,
         system: None,
         session_id: None,
@@ -261,11 +261,11 @@ impl Generator for MockGenerator {
 
 fn make_initial_req(prompt: Vec<u32>, max_tokens: u32) -> GenerationRequest {
     GenerationRequest {
+        end_requested: Arc::default(),
         model_id: "mock".to_owned(),
         prompt_tokens: prompt,
         max_tokens,
         sampling: SamplingParams::default(),
-        stop: vec![],
         stream: true,
         system: None,
         session_id: None,
@@ -1027,4 +1027,279 @@ async fn replay_prompt_aware_true_divergence_still_caught() {
         !delivered.contains(&DIVERGED_TOKEN),
         "the diverged token must never reach the client"
     );
+}
+
+// ── stop-string match ────────────────────────────────────────────────────
+
+/// How the first attempt of a [`HonoursTheFlag`] generator fails.
+#[derive(Clone, Copy)]
+enum Fails {
+    /// After `n` tokens, at once.
+    At(usize),
+    /// After `n` tokens and once the route has set the end flag of the request:
+    /// the narrow case of a failure in the pass that runs after a match.
+    AfterTheFlag(usize),
+}
+
+/// A generator that behaves as the engine does around a stop-string match. The
+/// first attempt delivers `tokens` as far as `fails` says and then fails with a
+/// migratable error. A later attempt replays `tokens` from the start and ends
+/// with a terminal item as soon as the end flag of its request is set, as an
+/// engine told to end does. It keeps the end flag of every attempt.
+struct HonoursTheFlag {
+    tokens: Vec<u32>,
+    fails: Fails,
+    flags: std::sync::Mutex<Vec<Arc<std::sync::atomic::AtomicBool>>>,
+    /// Tokens that attempts after the first produced.
+    replayed: Arc<AtomicUsize>,
+    /// The attempt in whose `generate` call the route sets the end flag, as when
+    /// it pops the matching token while the replay starts.
+    raises_the_flag_at: Option<usize>,
+}
+
+impl HonoursTheFlag {
+    fn new(tokens: Vec<u32>, fails: Fails) -> Self {
+        Self {
+            tokens,
+            fails,
+            flags: std::sync::Mutex::new(Vec::new()),
+            replayed: Arc::new(AtomicUsize::new(0)),
+            raises_the_flag_at: None,
+        }
+    }
+
+    fn raising_the_flag_at(mut self, attempt: usize) -> Self {
+        self.raises_the_flag_at = Some(attempt);
+        self
+    }
+
+    fn attempts(&self) -> usize {
+        self.flags.lock().expect("the lock").len()
+    }
+}
+
+fn token_item(token_id: u32) -> GenerationToken {
+    GenerationToken {
+        token_id,
+        piece: format!("t{token_id}"),
+        done: false,
+        finish_reason: None,
+        is_thinking: false,
+        logprobs: None,
+    }
+}
+
+impl Generator for HonoursTheFlag {
+    fn generate(
+        &self,
+        req: GenerationRequest,
+    ) -> Pin<Box<dyn futures::stream::Stream<Item = rmlx_core::Result<GenerationToken>> + Send>>
+    {
+        let attempt = {
+            let mut flags = self.flags.lock().expect("the lock");
+            flags.push(Arc::clone(&req.end_requested));
+            flags.len() - 1
+        };
+        if self.raises_the_flag_at == Some(attempt) {
+            req.end_requested.store(true, Ordering::SeqCst);
+        }
+        let state = (
+            self.tokens.clone(),
+            req.end_requested,
+            self.fails,
+            Arc::clone(&self.replayed),
+            0usize,
+        );
+        Box::pin(futures::stream::unfold(
+            state,
+            move |(tokens, flag, fails, replayed, at)| async move {
+                let next = if attempt == 0 {
+                    let (Fails::At(n) | Fails::AfterTheFlag(n)) = fails;
+                    match at.cmp(&n) {
+                        std::cmp::Ordering::Less => Ok(token_item(tokens[at])),
+                        std::cmp::Ordering::Equal => {
+                            if matches!(fails, Fails::AfterTheFlag(_)) {
+                                while !flag.load(Ordering::SeqCst) {
+                                    tokio::task::yield_now().await;
+                                }
+                            }
+                            Err(rmlx_core::Error::Mlx("Metal watchdog (mock)".to_owned()))
+                        }
+                        std::cmp::Ordering::Greater => return None,
+                    }
+                } else if flag.load(Ordering::SeqCst) && at <= tokens.len() {
+                    Ok(GenerationToken::terminal(
+                        tokens[at.saturating_sub(1)],
+                        "stop".to_owned(),
+                        String::new(),
+                    ))
+                } else if at < tokens.len() {
+                    replayed.fetch_add(1, Ordering::SeqCst);
+                    Ok(token_item(tokens[at]))
+                } else if at == tokens.len() {
+                    Ok(GenerationToken::terminal(
+                        tokens[at - 1],
+                        "length".to_owned(),
+                        String::new(),
+                    ))
+                } else {
+                    return None;
+                };
+                let done = matches!(&next, Ok(t) if t.done) && attempt > 0;
+                let at = if done { tokens.len() + 1 } else { at + 1 };
+                Some((next, (tokens, flag, fails, replayed, at)))
+            },
+        ))
+    }
+}
+
+/// Drain `s`, giving the ids of the tokens and the terminal item. An error
+/// fails the test.
+async fn drain(s: &mut ReplayStream, ids: &mut Vec<u32>) -> Option<GenerationToken> {
+    let mut terminal = None;
+    while let Some(item) = s.next().await {
+        let tok = item.unwrap_or_else(|e| panic!("the stream failed: {e}"));
+        if tok.done {
+            terminal = Some(tok);
+        } else {
+            ids.push(tok.token_id);
+        }
+    }
+    terminal
+}
+
+/// A migratable failure after the route has matched a stop string must not
+/// start a replay. The engine ends a replayed attempt at its first token, as
+/// the flag is still set, so the attempt would deliver one token against the
+/// three the client has and the envelope would answer `replay underrun`. The
+/// stream ends with a terminal item, and the generator runs once. The route is
+/// the one writer of the finish, so the test reads no finish from the item.
+///
+/// Mutation: skip the flag check before a later attempt.
+#[tokio::test]
+async fn a_failure_after_a_stop_match_ends_with_a_terminal_and_no_replay() {
+    let gen = Arc::new(HonoursTheFlag::new(
+        (1..=20).collect(),
+        Fails::AfterTheFlag(3),
+    ));
+    let initial = make_initial_req(vec![0u32], 8);
+    let flag = Arc::clone(&initial.end_requested);
+    let plan = RequestPlan::from_gen_req(&initial);
+    let mut s = replay_stream(
+        Arc::<HonoursTheFlag>::clone(&gen),
+        initial,
+        plan,
+        DEFAULT_MAX_RETRIES,
+    );
+
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let tok = s.next().await.expect("an item").expect("a token");
+        ids.push(tok.token_id);
+    }
+    flag.store(true, Ordering::SeqCst);
+    let terminal = drain(&mut s, &mut ids).await;
+
+    assert_eq!(
+        ids,
+        [1, 2, 3],
+        "no token after the match reached the client"
+    );
+    assert!(terminal.is_some(), "the stream ends with a terminal item");
+    assert_eq!(gen.attempts(), 1, "no second attempt after a match");
+}
+
+/// Every attempt of a request holds the one end flag of the request. A route
+/// that sets the flag after attempt 1 started must reach attempt 2.
+///
+/// Mutation: build a replay request with a flag of its own.
+#[tokio::test]
+async fn every_attempt_of_a_request_shares_its_end_flag() {
+    let gen = Arc::new(HonoursTheFlag::new((1..=6).collect(), Fails::At(2)));
+    let initial = make_initial_req(vec![0u32], 8);
+    let flag = Arc::clone(&initial.end_requested);
+    let plan = RequestPlan::from_gen_req(&initial);
+    let mut s = replay_stream(
+        Arc::<HonoursTheFlag>::clone(&gen),
+        initial,
+        plan,
+        DEFAULT_MAX_RETRIES,
+    );
+    let mut ids = Vec::new();
+    drain(&mut s, &mut ids).await;
+
+    assert_eq!(gen.attempts(), 2, "attempt 1 failed and attempt 2 replayed");
+    let flags = gen.flags.lock().expect("the lock");
+    assert!(
+        flags.iter().all(|f| Arc::ptr_eq(f, &flag)),
+        "an attempt holds an end flag of its own"
+    );
+}
+
+/// The first attempt fails before the match. The replay delivers the match
+/// step, the route sets the flag, and the replayed attempt, which holds the
+/// same flag, ends within the bound of the envelope: the 4 steps its channel
+/// holds and 1 waiting to enter it.
+///
+/// Mutation: build a replay request with a flag of its own.
+#[tokio::test]
+async fn a_replayed_attempt_ends_when_the_route_sets_the_flag() {
+    let gen = Arc::new(HonoursTheFlag::new((1..=40).collect(), Fails::At(2)));
+    let initial = make_initial_req(vec![0u32], 64);
+    let flag = Arc::clone(&initial.end_requested);
+    let plan = RequestPlan::from_gen_req(&initial);
+    let mut s = replay_stream(
+        Arc::<HonoursTheFlag>::clone(&gen),
+        initial,
+        plan,
+        DEFAULT_MAX_RETRIES,
+    );
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        let tok = s.next().await.expect("an item").expect("a token");
+        ids.push(tok.token_id);
+    }
+    flag.store(true, Ordering::SeqCst);
+    let terminal = drain(&mut s, &mut ids).await;
+
+    assert!(terminal.is_some(), "the stream ends with a terminal item");
+    assert!(
+        (3..=3 + 5).contains(&ids.len()),
+        "the client got {} tokens; the match is at token 3",
+        ids.len()
+    );
+    assert!(
+        gen.replayed.load(Ordering::SeqCst) <= 3 + 5,
+        "the replayed attempt produced {} tokens",
+        gen.replayed.load(Ordering::SeqCst)
+    );
+    assert_eq!(gen.attempts(), 2);
+}
+
+/// The route sets the flag when it pops the matching token, and up to 4 tokens
+/// can wait in the envelope's channel by then. So the flag can be set after the
+/// failure was classified and before the first token of the replay. The replayed
+/// attempt answers with its terminal item at once, and that item must not be
+/// read as a prefix that diverged or fell short: the client has the whole reply,
+/// and the stream ends with a terminal item, not the engine error.
+///
+/// Mutation: read the flag where the error is classified and nowhere else.
+#[tokio::test]
+async fn a_flag_set_while_a_replay_starts_ends_the_stream_with_a_terminal() {
+    let gen =
+        Arc::new(HonoursTheFlag::new((1..=20).collect(), Fails::At(2)).raising_the_flag_at(1));
+    let initial = make_initial_req(vec![0u32], 8);
+    let plan = RequestPlan::from_gen_req(&initial);
+    let mut s = replay_stream(
+        Arc::<HonoursTheFlag>::clone(&gen),
+        initial,
+        plan,
+        DEFAULT_MAX_RETRIES,
+    );
+    let mut ids = Vec::new();
+    let terminal = drain(&mut s, &mut ids).await;
+
+    assert_eq!(ids, [1, 2], "the client keeps the tokens it had");
+    assert!(terminal.is_some(), "the stream ends with a terminal item");
+    assert_eq!(gen.attempts(), 2, "the replay started once");
 }

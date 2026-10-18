@@ -1062,7 +1062,9 @@ impl Architecture {
         max_ctx_override: Option<i32>,
         prompt_cache_slots: usize,
         eos_ids: &'a [u32],
-        step_fn: &'a mut dyn FnMut(&crate::decode_loop::ProbeStep) -> Option<u32>,
+        step_fn: &'a mut dyn FnMut(
+            &crate::decode_loop::ProbeStep,
+        ) -> crate::decode_loop::StepVerdict,
         // Optional sampler constraint. `None` = unmasked argmax (the hot
         // path). `Some(_)` enables the masked branch in each arch's `argmax`
         // call sites (the route's json_object or json_schema grammar).
@@ -1292,7 +1294,9 @@ impl Architecture {
         eos_ids: &'a [u32],
         // The per-request borrows share `'a`: the shared decode loop stores
         // them together in one `DecodeCtx<'a>` for the duration of the call.
-        step_fn: &'a mut dyn FnMut(&crate::decode_loop::ProbeStep) -> Option<u32>,
+        step_fn: &'a mut dyn FnMut(
+            &crate::decode_loop::ProbeStep,
+        ) -> crate::decode_loop::StepVerdict,
         constraint: Option<&'a mut dyn crate::ConstraintEngine>,
         sampler_cfg: &'a crate::sampler::SamplerConfig,
         rng: &'a mut crate::sampler::Pcg32,

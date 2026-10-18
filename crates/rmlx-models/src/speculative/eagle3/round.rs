@@ -52,7 +52,7 @@ use rmlx_mlx::{argmax, Array, Device};
 
 use super::{find_full_pos, step_trace_enabled, DecidedBy, Eagle3Drafter, STEP_TARGET};
 use crate::arch::Architecture;
-use crate::decode_loop::ProbeStep;
+use crate::decode_loop::{ProbeStep, StepVerdict};
 use crate::speculative::round_loop::{
     run_rounds, CacheSpan, Conditioning, Prefilled, ReportSkippedBy, RoundCfg, RoundCtx,
     RoundDrafter, RoundOutcome, Seed, Verdict, VerifierOffsetBasis,
@@ -468,7 +468,7 @@ impl RoundDrafter for Eagle3Round<'_> {
 /// reduced one is an argmax over a subset of the row and a distribution needs
 /// the whole row.
 ///
-/// `step_fn` is called once per emitted token. Its `Option<u32>` return — the
+/// `step_fn` is called once per emitted token. Its `Force` verdict — the
 /// forced-token contract the plain decode loop uses — is discarded here, as it
 /// is on every speculative loop: a round's tokens are already the verifier's.
 ///
@@ -498,7 +498,7 @@ pub fn eagle3_generate(
     kv_quant_override: Option<KvQuant>,
     max_ctx_override: Option<i32>,
     eos_ids: &[u32],
-    step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    step_fn: &mut dyn FnMut(&ProbeStep) -> StepVerdict,
     decided_by: &mut Vec<DecidedBy>,
     sampler_cfg: &crate::sampler::SamplerConfig,
     device: Device,

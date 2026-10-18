@@ -284,8 +284,6 @@ pub struct GenerationRequest {
     /// Fully resolved sampling parameters.
     ///
     pub sampling: SamplingParams,
-    /// Stop strings; generation halts on the first match.
-    pub stop: Vec<String>,
     /// When `true`, the response is delivered as an SSE stream.
     pub stream: bool,
     /// Optional system prompt.
@@ -357,6 +355,12 @@ pub struct GenerationRequest {
     /// when no constraint is in use OR the constraint doesn't expose a
     /// handle (e.g. NoOp).
     pub is_thinking_handle: Option<Arc<std::sync::atomic::AtomicBool>>,
+
+    /// Set by the route when it has matched a stop string. The decode ends
+    /// after the token it is on, as at an end-of-turn token. It is not the
+    /// cancel flag: a request that ends here sends its terminal item and
+    /// writes its rows.
+    pub end_requested: Arc<std::sync::atomic::AtomicBool>,
 
     /// per-request thinking-token budget. `Some(n)` caps the
     /// reasoning channel at `n` pieces; once exceeded the engine injects
