@@ -279,8 +279,8 @@ fn assert_boundary_events(
              and only if it holds more than the live memory"
         );
         if over_bound {
-            // Buffers an in-flight command buffer still holds are freed after the
-            // trim and move from live to cached; the sum is what the trim bounds.
+            // A buffer freed between the two after-reads is counted once or in
+            // neither, so the sum is at or below the live plus cached total.
             let live_and_cached_after = event_bytes(event, "active_after_bytes")
                 .checked_add(event_bytes(event, "cached_after_bytes"));
             let bound = event_bytes(event, "active_bytes").checked_mul(2);

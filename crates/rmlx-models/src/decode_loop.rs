@@ -1003,6 +1003,12 @@ fn log_prefill_plan(
 /// trim and enter the cache, so the cache alone can end above the live bytes
 /// by those buffers. The sum of live and cached bytes does not grow past the
 /// live bytes before plus the bytes the trim keeps.
+///
+/// The two after-reads are not one snapshot. During one request's prefill, what
+/// can change the counts between them is a completion handler freeing a buffer.
+/// The free takes its bytes off the live count and puts the buffer in the cache.
+/// The cache is read first, so such a buffer is counted in neither read, never
+/// in both. The logged sum is therefore at or below the true sum.
 pub(crate) fn release_chunk_buffers(arch: &str, chunk_idx: usize) {
     let active_bytes = rmlx_mlx::mlx_active_memory_bytes();
     let cached_bytes = rmlx_mlx::mlx_cache_memory_bytes();
@@ -1011,8 +1017,8 @@ pub(crate) fn release_chunk_buffers(arch: &str, chunk_idx: usize) {
             (Some(active), Some(_)) => rmlx_mlx::trim_buffer_cache(active),
             _ => rmlx_mlx::release_buffer_cache(),
         };
-    let active_after_bytes = rmlx_mlx::mlx_active_memory_bytes();
     let cached_after_bytes = rmlx_mlx::mlx_cache_memory_bytes();
+    let active_after_bytes = rmlx_mlx::mlx_active_memory_bytes();
     tracing::debug!(
         arch,
         chunk_idx,

@@ -81,7 +81,9 @@ the MLX buffer cache to the live bytes (`rmlx_mlx::trim_buffer_cache`). When MLX
 reports either number as unknown, it clears the cache
 (`rmlx_mlx::release_buffer_cache`). It logs one `debug!` event at every such
 chunk boundary, with `active_bytes`, `cached_bytes`, `active_after_bytes` and `cached_after_bytes` (the
-live and cached bytes read after the decision) and `released`.
+live and cached bytes read after the decision) and `released`. The cache is
+read before the live bytes after the decision, so a buffer freed between the
+two reads is counted in neither, never in both.
 
 MLX reuses a cached buffer only for a request of nearly the same size. Each
 chunk attends over a longer key length than the chunk before, so its attention
