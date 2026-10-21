@@ -348,15 +348,6 @@ fn model_id(model: &std::path::Path) -> String {
         .to_owned()
 }
 
-/// Build the JSON body for a named request fixture. All fixtures pin temp=0 +
-/// seed=0 for determinism.
-///
-/// Bonsai is a thinking model: with `enable_thinking` on (its default) the
-/// final-answer `content` stays empty until the thinking budget is spent. The
-/// deterministic text / quant fixtures therefore set `enable_thinking=false`
-/// so the model emits a direct answer (the dedicated `thinking` fixture keeps
-/// it on and asserts on `reasoning_content`). See MEMORY: Bonsai/Qwen3
-/// thinking-model output lives in `reasoning_content`.
 /// File-path URL to the bundled 224×224 solid-red PNG test fixture. The server's
 /// `image_io::load_image` accepts an absolute file path; a committed binary asset
 /// avoids any base64 transport corruption. Proves the vision path decodes a real
@@ -366,6 +357,14 @@ const RED_PNG_PATH: &str = concat!(
     "/tests/e2e/fixtures/vtest_red.png"
 );
 
+/// Build the JSON body for a named request fixture. All fixtures pin temp=0 +
+/// seed=0 for determinism.
+///
+/// The text and quant fixtures send `enable_thinking=false`, so a model whose
+/// template reads the flag (Qwen3.6, Qwen3.8) answers directly in `content`.
+/// The `thinking` fixture sends it on and `assert_thinking` reads
+/// `reasoning_content`. A template that never reads the flag (the Bonsai-8B
+/// snapshot) answers in `content` either way.
 fn request_fixture(name: &str, model_id: &str) -> serde_json::Value {
     let base_msg = "What is the capital of France? Answer in one short sentence.";
     match name {
@@ -652,14 +651,12 @@ fn is_coherent(text: &str) -> bool {
         return false;
     }
     // Require ≥3 distinct alphanumeric characters (rejects "aaaa", "1 1 1").
-    let distinct: std::collections::HashSet<char> =
-        t.chars().filter(|c| c.is_alphanumeric()).collect();
-    if distinct.len() < 3 {
+    if distinct_alphanumerics(t) < 3 {
         return false;
     }
     // Require ≥2 whitespace-separated words whose mean length is > 1 char.
-    // Rejects "a b c" punctuation-noise and single-word non-answers, but a
-    // legitimate one-word answer is handled by the caller's substring anchor.
+    // Rejects "a b c" punctuation-noise and single-word non-answers; a
+    // one-word answer to a one-word question goes through `is_coherent_answer`.
     let words: Vec<&str> = t.split_whitespace().filter(|w| !w.is_empty()).collect();
     if words.len() < 2 {
         return false;
@@ -693,6 +690,30 @@ fn is_coherent(text: &str) -> bool {
         }
     }
     true
+}
+
+/// Coherence of an answer to a question with an expected answer word: a
+/// single word that is that word (case-insensitive, edge punctuation
+/// ignored) passes, so a correct one-word reply ("Teal.") is not rejected for
+/// being short. Glued repeats ("TealTealTeal") are not that word. Everything
+/// else is `is_coherent`.
+fn is_coherent_answer(text: &str, expect: Option<&str>) -> bool {
+    if is_coherent(text) {
+        return true;
+    }
+    let t = text.trim();
+    let word = t.trim_matches(|c: char| !c.is_alphanumeric());
+    expect.is_some_and(|want| {
+        t.split_whitespace().count() == 1
+            && distinct_alphanumerics(t) >= 3
+            && word.eq_ignore_ascii_case(want)
+    })
+}
+
+fn distinct_alphanumerics(t: &str) -> usize {
+    let distinct: std::collections::HashSet<char> =
+        t.chars().filter(|c| c.is_alphanumeric()).collect();
+    distinct.len()
 }
 
 // ── Case execution ──────────────────────────────────────────────────────────
@@ -1226,7 +1247,7 @@ fn assert_coherent(
     } else {
         openai_content(&resp).unwrap_or_default()
     };
-    if !is_coherent(&text) {
+    if !is_coherent_answer(&text, case.assert.expect.as_deref()) {
         return mk(Verdict::Fail, format!("incoherent: {:?}", trunc(&text)));
     }
     // Optional substring anchor (e.g. multi_turn → "teal", stop → must NOT
@@ -1502,8 +1523,8 @@ deployment to the production cluster on Friday.'";
 
 /// Build a deterministic temp=0 chat-completion body for an explicit prompt
 /// string, with per-token logprob bytes ON so the caller can capture the
-/// byte-for-byte chosen-token-id sequence. `enable_thinking=false` so Bonsai
-/// emits the final answer directly (not buried in `reasoning_content`).
+/// byte-for-byte chosen-token-id sequence. `enable_thinking=false` so a model
+/// whose template reads the flag answers directly in `content`.
 fn long_logprob_body(id: &str, prompt: &str, max_tokens: u32) -> String {
     serde_json::json!({
         "model": id,

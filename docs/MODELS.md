@@ -157,7 +157,11 @@ back to `hidden_size / num_attention_heads`.
   `--kv-quant none` cache. See `docs/KV_LAYER_POLICY.md` "Qwen3 dense KV is
   bf16 at `--kv-quant none`".
 - `supports_thinking()` is `true`: the server splits `<think>…</think>` into
-  `reasoning_content`.
+  `reasoning_content`. That is the architecture; a snapshot's chat template
+  decides whether anything is thought. The `prism-ml__Ternary-Bonsai-8B-mlx-2bit`
+  template never reads `enable_thinking` and always ends the generation prompt
+  with an empty think block, so that snapshot answers in `content` and leaves
+  `reasoning_content` empty.
 - Weights: bf16, affine, mxfp8. `prism-ml__Ternary-Bonsai-8B-mlx-2bit` is
   affine `g128 b2`.
 

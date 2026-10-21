@@ -2,7 +2,7 @@
 //! `: done` line each loop closes a request with; the other lines are the
 //! per-round record, the accounting error and an unrelated `: done`.
 
-use super::{golden_dir, scrape_spec_accept, Manifest};
+use super::{golden_dir, is_coherent_answer, scrape_spec_accept, Manifest};
 
 /// The message and `loop_kind` of each loop's summary line, one per loop.
 const SUMMARY_EVENTS: [(&str, &str); 7] = [
@@ -124,6 +124,46 @@ fn case_ids_are_unique() {
         .filter(|id| !seen.insert(id.clone()))
         .collect();
     assert!(repeated.is_empty(), "repeated case ids: {repeated:?}");
+}
+
+#[test]
+fn a_one_word_answer_carrying_the_anchor_is_coherent() {
+    assert!(is_coherent_answer("Teal.", Some("teal")));
+    assert!(is_coherent_answer("  TEAL\n", Some("teal")));
+}
+
+#[test]
+fn a_one_word_answer_without_the_anchor_is_not_coherent() {
+    assert!(!is_coherent_answer("Blue.", Some("teal")));
+    assert!(!is_coherent_answer("Teal.", None));
+    assert!(!is_coherent_answer("Teal.", Some("")));
+    assert!(!is_coherent_answer("Teal.", Some("!teal")));
+}
+
+#[test]
+fn degenerate_output_stays_incoherent_with_an_anchor() {
+    for text in [
+        "",
+        "   ",
+        ".",
+        ". . .",
+        "the the the the",
+        "a b c",
+        "tt",
+        "NaN",
+        "TealTealTealTeal",
+        "Teal.Teal.Teal.",
+        "xxtealxx",
+    ] {
+        assert!(!is_coherent_answer(text, Some("teal")), "{text:?}");
+        assert!(!is_coherent_answer(text, Some("the")), "{text:?}");
+    }
+}
+
+#[test]
+fn a_multi_word_answer_is_judged_as_before() {
+    assert!(is_coherent_answer("Paris is the capital of France.", None));
+    assert!(!is_coherent_answer("teal teal teal teal", Some("teal")));
 }
 
 /// A `golden` case with no recorded file records one and passes on its first

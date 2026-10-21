@@ -33,8 +33,8 @@ outside the checkout, and prints the path at the end of the run.
 | kind | passes when | used for |
 |---|---|---|
 | `golden` | The per-token chosen bytes (OpenAI non-stream logprobs `bytes`) at temperature 0 equal the recorded golden. A missing golden, or `RMLX_E2E_REGEN_GOLDEN=1`, records one and passes. | text core, OpenAI non-stream |
-| `contains_coherent` | The output is coherent and contains `expect`. | streaming, Anthropic `/v1/messages` |
-| `coherent` | The output is coherent: at least 3 distinct alphanumeric characters, at least two words of mean length above one, no word over 60% of three or more words, not NaN; it contains `expect` when one is given. | K-only and symmetric codecs, short context |
+| `contains_coherent` | The output is coherent by the `coherent` rules below, except that a one-word answer is not accepted, and contains `expect` as a case-sensitive substring (default `Paris`). | streaming, Anthropic `/v1/messages` |
+| `coherent` | The output is coherent: at least 3 distinct alphanumeric characters, at least two words of mean length above one, no word over 60% of three or more words, not NaN; it contains `expect` when one is given. A single word also passes when it is `expect` (case-insensitive, edge punctuation ignored) and has at least 3 distinct alphanumeric characters; a glued repeat such as `TealTeal` does not. The check on `expect` is a case-insensitive substring; a leading `!` makes it a forbidden substring. | K-only and symmetric codecs, short context |
 | `niah_retrieval` | The needle is recovered from a haystack of about 8k tokens at temperature 0. | quantized KV at long context |
 | `cosine_vs_bf16` | The mean cosine of the per-position top-k logprob distributions against the model's own `none` run is at least `min_cosine` (default 0.99), over positions where the chosen ids agree. A chosen-id divergence in the first 8 tokens fails. | quantized KV fidelity |
 | `thinking` | `reasoning_content` is non-empty and the answer (68) appears in the content or the reasoning. | thinking mode |
@@ -76,7 +76,6 @@ The manifest's `feature` column groups the rows:
 | `text_core` | chat non-stream and seed determinism (`golden`), chat stream, Anthropic, multi-turn, `stop` |
 | `quant_matrix` | Bonsai at every `kv_quant` listed there, plus `rot_k` / `q4_g64` through `ctk`/`ctv`: `coherent` and `niah_retrieval` on each, `cosine_vs_bf16` on some |
 | `quant_matrix_konly` | the K-only and symmetric codecs on Bonsai (tag `konly`): short-context `coherent` only |
-| `thinking` | Bonsai `thinking` |
 | `broader_models` | Gemma4-e4b, Qwen3.6-35B-A3B, Qwen3.8-27B-4bit, gemma-4-26b-a4b and gemma-4-31b: `golden`, stream and Anthropic coherence, `niah_retrieval` and `cosine_vs_bf16` on a subset of legal codecs, a sliding-window-crossing NIAH on Gemma4, the Qwen3.6 KV refusals (`q4_g128` K, `tsym3`; Qwen3.8 is dense and has none) and Qwen3.6 and Qwen3.8 thinking |
 | `ssd_kv_tier`, `prompt_cache` | `byte_identical_restart`, `cache_hit_equivalence` on Bonsai |
 | `multi_model`, `attention` | `model_lifecycle`, `dispatch_fired` (k8v4) on Bonsai |

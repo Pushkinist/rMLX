@@ -633,21 +633,7 @@ assert = { kind = "coherent" }
 tags = ["run1", "quant", "konly"]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. Thinking (Bonsai is a thinking model)
-# ─────────────────────────────────────────────────────────────────────────────
-
-[[case]]
-id = "thinking_budget_enforced"
-feature = "thinking"
-subfeature = "enable_thinking + thinking_budget"
-model = "BONSAI"
-serve_flags = []
-request = "thinking"
-assert = { kind = "thinking" }
-tags = ["run1", "thinking"]
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 5. State features (SSD cross-restart + prompt-cache reuse), LIVE.
+# 4. State features (SSD cross-restart + prompt-cache reuse), LIVE.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # SSD KV cross-restart: the runner owns two serve phases under single-MLX
