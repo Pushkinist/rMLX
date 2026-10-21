@@ -5,6 +5,7 @@
 //! - `is_reconstructible_tool_marker` — Gemma-4 tool protocol marker allowlist
 //! - `compute_itl_stats` — ITL percentile / mean / spike computation
 //! - `spsc_ts` — UTC timestamp string for SPSC metric events
+//! - `log_sampler_active` — the one per-request sampler event of both paths
 //! - `terminal_item` — the terminal item of a generation, with the detokenizer's tail
 
 use std::time::Instant;
@@ -18,6 +19,23 @@ use super::types::GenerationToken;
 /// attempt, so it is the client's input and is not replayed.
 pub(crate) fn empty_prompt() -> rmlx_core::Error {
     rmlx_core::Error::InvalidInput("the messages render to an empty prompt".to_owned())
+}
+
+/// Write the one `generate: host categorical sampler active` event of a
+/// request, when the request samples. A greedy request writes nothing.
+/// `scripts/lib/server_sampling.py` reads this event back.
+pub(crate) fn log_sampler_active(model_id: &str, sampler: &rmlx_models::SamplerConfig) {
+    if sampler.sampling_active() {
+        tracing::info!(
+            model_id = %model_id,
+            temperature = sampler.temperature,
+            top_p = sampler.top_p,
+            top_k = sampler.top_k,
+            min_p = sampler.min_p,
+            seed = sampler.seed_or_default(),
+            "generate: host categorical sampler active"
+        );
+    }
 }
 
 // ── shared helper for ITL percentile events-table writes ───────────────
@@ -292,3 +310,7 @@ pub(crate) fn terminal_item(
 #[cfg(test)]
 #[path = "helpers_tests.rs"]
 mod helpers_tests;
+
+#[cfg(test)]
+#[path = "sampler_event_tests.rs"]
+mod sampler_event_tests;

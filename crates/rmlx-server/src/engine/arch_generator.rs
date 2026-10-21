@@ -23,7 +23,7 @@ use crate::openai::ItlSample;
 use super::audio::{build_audio_prompt, AudioBundle};
 use super::generator::Generator;
 use super::helpers::{
-    compute_itl_stats, is_reconstructible_tool_marker, record_itl_percentiles,
+    compute_itl_stats, is_reconstructible_tool_marker, log_sampler_active, record_itl_percentiles,
     resolve_kv_quant_for_load, spsc_ts, terminal_item,
 };
 use super::image::{build_image_prompt, run_qwen3vl_image, VisionBundle};
@@ -664,17 +664,7 @@ impl Generator for ArchGenerator {
         // `temperature <= 0.0` keeps the untouched GPU argmax greedy path.
         let sampler_cfg = req.sampling.sampler_config();
         let mut sampler_rng = rmlx_models::Pcg32::new(sampler_cfg.seed_or_default());
-        if sampler_cfg.sampling_active() {
-            tracing::debug!(
-                model_id = %req.model_id,
-                temperature = sampler_cfg.temperature,
-                top_p = sampler_cfg.top_p,
-                top_k = sampler_cfg.top_k,
-                min_p = sampler_cfg.min_p,
-                seed = sampler_cfg.seed_or_default(),
-                "generate: host categorical sampler active"
-            );
-        }
+        log_sampler_active(&req.model_id, &sampler_cfg);
         // Logit-penalty config from per-request sampling params.
         // `token_history` is per-request; starts empty each generation.
         let penalty_cfg = rmlx_models::PenaltyConfig {

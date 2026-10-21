@@ -79,7 +79,7 @@ pub(crate) fn capture() -> (
 }
 
 /// The events of `f`, each as its level and its fields.
-pub(super) fn events_of(f: impl FnOnce()) -> Vec<Vec<(String, String)>> {
+pub(crate) fn events_of(f: impl FnOnce()) -> Vec<Vec<(String, String)>> {
     let (events, guards) = capture();
     f();
     drop(guards);

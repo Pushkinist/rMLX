@@ -19,7 +19,7 @@ use crate::openai::ItlSample;
 
 use super::generator::Generator;
 use super::helpers::{
-    compute_itl_stats, is_reconstructible_tool_marker, record_itl_percentiles,
+    compute_itl_stats, is_reconstructible_tool_marker, log_sampler_active, record_itl_percentiles,
     resolve_kv_quant_for_load, spsc_ts, terminal_item,
 };
 use super::think::ThinkSplitter;
@@ -758,16 +758,7 @@ impl Generator for SpeculativeGenerator {
                  ran without them. Retry without a draft model to have them applied."
             );
         }
-        tracing::debug!(
-            model_id = %req.model_id,
-            temperature = spec_sampler_cfg.temperature,
-            top_p = spec_sampler_cfg.top_p,
-            top_k = spec_sampler_cfg.top_k,
-            min_p = spec_sampler_cfg.min_p,
-            seed = spec_sampler_cfg.seed_or_default(),
-            sampled = spec_sampler_cfg.sampling_active(),
-            "SpeculativeGenerator: sampling configuration"
-        );
+        log_sampler_active(&req.model_id, &spec_sampler_cfg);
         // Think-splitter mirrors ArchGenerator: budget, thinking-end id, the
         // prompt-derived initial channel and per-request delimiters go through
         // the same `new_for_request` constructor as the standard path.
