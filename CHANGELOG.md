@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-10-24
+
+A Qwen3.5-family request can now resume from a saved recurrent state. Every
+request writes one prefill event.
+
+Most other changes are fixes. A stop string now ends the decode on every path.
+A generation that reaches the context ceiling stops there and keeps its
+output. A speculative request that asks for `logprobs` gets them. A drafter
+whose width does not match its verifier is refused.
+
+Four changes to read before upgrading: `prefill_ms` moved off `decode_profile`
+and the speculative `done` line to the new `generate: prefill` event
+(**Added**); a speculative drafter whose hidden size, layer count or
+vocabulary size does not match its verifier is refused, and an EAGLE-3
+`config.json` must declare `hidden_size` and `vocab_size` (**Changed**); the
+request time cap ends a reply that has started to stream (**Changed**); the SSD
+index schema version is 9, so the SSD cache of an older version is wiped at the
+first open (**Fixed**).
+
 ### Added
 
 - **Every request writes one `generate: prefill` event.** It carries the
@@ -344,6 +363,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bf16 activation (`docs/CLI.md`). The refusal of a 1-bit affine model now says
   that it needs an MLX with 1-bit affine kernels, MLX 0.32.4 or later, and no
   longer calls the kernel unreleased.
+
+### Dependencies
+
+- `webpki-root-certs` 1.0.7 -> 1.0.10 in `Cargo.lock`, for RUSTSEC-2026-0383:
+  the bundled root certificates allowed trust in distrusted emSign
+  intermediates.
+
+### Retrospective
+
+- [#718](https://github.com/Pushkinist/rMLX/issues/718): ci(debt-report): the file-pair scan pairs files inside one directory only, so three per-arch generate.rs files at 57% to 73% never reach the report
+- [#719](https://github.com/Pushkinist/rMLX/issues/719): test(refactor): fourteen test files implement tracing::Subscriber to capture events; 0.4.4 added eight and none is shared
+- [#720](https://github.com/Pushkinist/rMLX/issues/720): server(refactor): the OpenAI and Anthropic routes each carry their own engine-error map and token count; 0.4.4 made the same edit in both
+- [#721](https://github.com/Pushkinist/rMLX/issues/721): docs: cut the five docs that 0.4.4 grew or added to current truth (AUDIO, AUDIO_TTS, AUDIO_WAV, SERVER_SHUTDOWN, WEIGHT_QUANTS)
+- [#722](https://github.com/Pushkinist/rMLX/issues/722): docs(releasing): the retrospective sets PREV from the nearest tag of any name, so a local tag gives the wrong range
 
 ## [0.4.4] - 2026-10-17
 
@@ -3907,7 +3940,8 @@ inference + conversion backend for Apple Silicon — no Python at runtime.
 - Speculative drafters validated against their verifiers: Qwen 3.6 MTP sidecar
   and the Gemma 4 assistant drafter.
 
-[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.4.4...HEAD
+[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.4.5...HEAD
+[0.4.5]: https://github.com/Pushkinist/rMLX/releases/tag/v0.4.5
 [0.4.4]: https://github.com/Pushkinist/rMLX/releases/tag/v0.4.4
 [0.4.3]: https://github.com/Pushkinist/rMLX/releases/tag/v0.4.3
 [0.4.2]: https://github.com/Pushkinist/rMLX/releases/tag/v0.4.2
