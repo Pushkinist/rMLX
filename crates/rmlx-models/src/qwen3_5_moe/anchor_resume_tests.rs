@@ -30,9 +30,9 @@ const MAX_SEQ: i32 = 8192;
 const N_DECODE: usize = 6;
 
 /// Deterministic synthetic ids in `1..9999`, never 0.
-fn synthetic_ids(len: usize, salt: u32) -> Vec<u32> {
+fn synthetic_ids(len: usize, seed: u32) -> Vec<u32> {
     (1u32..=len as u32)
-        .map(|i| (i.wrapping_mul(7).wrapping_add(salt) % 9999).max(1))
+        .map(|i| (i.wrapping_mul(7).wrapping_add(seed) % 9999).max(1))
         .collect()
 }
 
