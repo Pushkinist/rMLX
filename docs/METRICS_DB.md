@@ -90,14 +90,16 @@ Must be in `identity::WEIGHT_QUANT_WHITELIST`: `bf16`, `fp16`, `mxfp8`,
 `mxfp4`, `nvfp4`, `q8_0`, `q4_k_m`, `1bit`, `2bit`, `3bit`, `4bit`, `5bit`,
 `6bit`, `8bit`, `paro`. `bf16` means unquantized. An rMLX producer reads the
 label from the snapshot's `config.json`: ParoQuant is `paro`; else the
-`quantization` block's format mode or bit width; else a `dtype` /
-`torch_dtype` of bfloat16 (`bf16`) or float16 (`fp16`). Rust has one producer,
+`quantization` block's `mode` verbatim, or `<bits>bit` when the mode is
+absent or `affine`; else a `dtype` / `torch_dtype` of bfloat16 (`bf16`) or
+float16 (`fp16`). A mode this list does not name is refused, not mapped. Rust has one producer,
 `rmlx_loader::ModelConfig::weight_quant_label` (`baseline --record`,
 `eval ppl --corpus`, the server's drainer); the shell benches use
 `scripts/lib/snapshot_identity.py`. One table,
 `crates/rmlx-loader/tests/fixtures/weight_quant_labels.json`, holds both. A
 config that names none is refused by `baseline --record` and
-`eval ppl --corpus`, and the drainer records no row for that model.
+`eval ppl --corpus`, and the drainer warns once at start and records no row
+for that model.
 
 ### 5.3 `kv_quant` canonicalization
 
