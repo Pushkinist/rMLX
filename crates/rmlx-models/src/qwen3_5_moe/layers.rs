@@ -283,17 +283,22 @@ impl Linear {
 }
 
 /// An input that several linear layers read: a Hadamard layer's transform of
-/// it is computed once and reused by every later layer holding that transform.
+/// it is computed once and reused by the later layers holding that transform.
+///
+/// One slot is exact because the loader builds one transform per input width,
+/// so the Hadamard layers reading one input hold the same transform. A layer
+/// holding another transform computes its own, uncached.
+#[allow(missing_debug_implementations)]
 pub(super) struct SharedInput<'a> {
     x: &'a Array,
-    transformed: Vec<(Arc<SignedBlockHadamard>, Array)>,
+    transformed: Option<(&'a SignedBlockHadamard, Array)>,
 }
 
 impl<'a> SharedInput<'a> {
     pub(super) fn new(x: &'a Array) -> Self {
         Self {
             x,
-            transformed: Vec::new(),
+            transformed: None,
         }
     }
 
@@ -301,23 +306,22 @@ impl<'a> SharedInput<'a> {
     ///
     /// Layers share a transform when they hold the same `Arc`: the fold builds
     /// one per sign vector, and the contract reader checked each module's
-    /// `.signs` tensor equal to it. A layer holding another transform
-    /// transforms `x` itself.
-    pub(super) fn forward(&mut self, linear: &Linear, device: Device) -> Result<Array> {
+    /// `.signs` tensor equal to it.
+    pub(super) fn forward(&mut self, linear: &'a Linear, device: Device) -> Result<Array> {
         let Linear::Hadamard { transform, inner } = linear else {
             return linear.forward(self.x, device);
         };
-        if let Some((_, xt)) = self
-            .transformed
-            .iter()
-            .find(|(t, _)| Arc::ptr_eq(t, transform))
-        {
-            return inner.forward(xt, device);
+        let transform: &'a SignedBlockHadamard = transform;
+        match &self.transformed {
+            Some((cached, xt)) if std::ptr::eq(*cached, transform) => inner.forward(xt, device),
+            Some(_) => inner.forward(&transform.forward(self.x, device)?, device),
+            None => {
+                let xt = transform.forward(self.x, device)?;
+                let y = inner.forward(&xt, device)?;
+                self.transformed = Some((transform, xt));
+                Ok(y)
+            }
         }
-        let xt = transform.forward(self.x, device)?;
-        let y = inner.forward(&xt, device);
-        self.transformed.push((Arc::clone(transform), xt));
-        y
     }
 }
 
