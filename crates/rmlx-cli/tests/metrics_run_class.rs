@@ -176,6 +176,54 @@ fn baseline_record_refuses_to_run_without_a_class() {
     assert!(stderr(&out).contains("--run-class"), "{}", stderr(&out));
 }
 
+/// `--record` asks for a runs.db row that `--metrics off` (and `events`) never
+/// writes, so the pair is refused before any work rather than dropping the row.
+#[test]
+fn record_with_metrics_off_is_refused() {
+    let td = tempfile::tempdir().unwrap();
+    for mode in ["off", "events"] {
+        let out = rmlx(td.path())
+            .args(["--metrics", mode, "baseline", "--model"])
+            .arg(td.path().join("no-such-snapshot"))
+            .args([
+                "--prompt",
+                "hi",
+                "--device",
+                "cpu",
+                "--record",
+                "--run-class",
+                "gate",
+            ])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "--metrics {mode} with --record ran");
+        assert!(
+            stderr(&out).contains("--metrics"),
+            "{mode}: {}",
+            stderr(&out)
+        );
+        let out = rmlx(td.path())
+            .args(["--metrics", mode, "eval", "ppl", "--model"])
+            .arg(td.path().join("no-such-snapshot"))
+            .args([
+                "--text-file",
+                "x.txt",
+                "--corpus",
+                "wikitext-2",
+                "--run-class",
+                "gate",
+            ])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "--metrics {mode} with --corpus ran");
+        assert!(
+            stderr(&out).contains("--metrics"),
+            "{mode}: {}",
+            stderr(&out)
+        );
+    }
+}
+
 /// `--record` defaults to off, and the default is not a request to record.
 #[test]
 fn baseline_without_record_needs_no_class() {

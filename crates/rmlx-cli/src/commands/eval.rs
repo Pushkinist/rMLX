@@ -59,12 +59,11 @@ pub(crate) fn run_ppl(
     kv_quant: Option<rmlx_kv_quant::KvQuant>,
 ) -> Result<()> {
     let device = claimed.device();
-    // Resolved before any work: a run whose identity cannot be recorded stops here.
-    let identity = if recording.is_some() && rmlx_metrics::mode::observations_enabled() {
-        Some(resolve_record_identity(model_path)?)
-    } else {
-        None
-    };
+    // Resolved before any work: a run whose identity cannot be recorded stops
+    // here. `main` refuses `--corpus` under `--metrics off` or `events`.
+    let identity = recording
+        .map(|_| resolve_record_identity(model_path))
+        .transpose()?;
     // -- Read corpus + tokenize ------------------------------------------------
     let corpus_text = std::fs::read_to_string(text_file)
         .map_err(|e| anyhow::anyhow!("cannot read text file {}: {e}", text_file.display()))?;
@@ -148,7 +147,7 @@ pub(crate) fn run_ppl(
     println!("{}", serde_json::to_string(&out)?);
 
     // -- §8.5 universal record -------------------------------------------------
-    let Some((corpus, run_class)) = recording else {
+    let (Some((corpus, run_class)), Some(identity)) = (recording, identity) else {
         // A run that measured something and stored nothing should say so. The
         // number is on stdout either way, but a sweep whose rows never reach
         // the DB looks exactly like a sweep that did until someone queries for
@@ -158,10 +157,6 @@ pub(crate) fn run_ppl(
             "ppl: no --corpus given, so this measurement is printed and not recorded; \
              pass --corpus <name> to write it to runs.db"
         );
-        return Ok(());
-    };
-    let Some(identity) = identity else {
-        info!("ppl: observations disabled, no record written");
         return Ok(());
     };
     record_ppl_run(&PplRecordArgs {

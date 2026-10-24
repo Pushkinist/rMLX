@@ -2582,6 +2582,12 @@ fn run(cli: Cli, run_id: &str) -> Result<i32> {
             gpu_capture_steps,
             kv_boundary_layers,
         } => {
+            if record && !rmlx_metrics::mode::observations_enabled() {
+                anyhow::bail!(
+                    "--record writes a runs.db row, and --metrics off or events records no \
+                     observation: drop one of the two"
+                );
+            }
             #[cfg(feature = "metal-capture")]
             if gpu_capture.is_some()
                 && run_class != Some(rmlx_metrics::run_class::RunClass::Diagnostic)
@@ -2819,6 +2825,12 @@ fn run(cli: Cli, run_id: &str) -> Result<i32> {
                 kv_group_size,
                 kv_boundary_layers,
             } => {
+                if !corpus.is_empty() && !rmlx_metrics::mode::observations_enabled() {
+                    anyhow::bail!(
+                        "--corpus writes a runs.db row, and --metrics off or events records no \
+                         observation: drop one of the two"
+                    );
+                }
                 let recording = match (corpus.is_empty(), run_class) {
                     (true, None) => None,
                     (false, Some(class)) => Some((corpus.as_str(), class)),

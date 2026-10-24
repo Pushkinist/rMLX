@@ -380,12 +380,12 @@ pub(crate) fn run_baseline(
     record_args: Option<BaselineRecordArgs<'_>>,
 ) -> anyhow::Result<()> {
     let device = claimed.device();
-    // Resolved before any work: a run whose identity cannot be recorded stops here.
-    let identity = if record_args.is_some() && rmlx_metrics::mode::observations_enabled() {
-        Some(resolve_record_identity(model_path)?)
-    } else {
-        None
-    };
+    // Resolved before any work: a run whose identity cannot be recorded stops
+    // here. `main` refuses `--record` under `--metrics off` or `events`.
+    let identity = record_args
+        .as_ref()
+        .map(|_| resolve_record_identity(model_path))
+        .transpose()?;
     // -- Read prompt file -------------------------------------------------------
     let prompt_text = std::fs::read_to_string(prompt_path)
         .map_err(|e| anyhow::anyhow!("cannot read prompt file {}: {e}", prompt_path.display()))?;
@@ -856,14 +856,7 @@ pub(crate) fn run_baseline(
     );
 
     // -- §8.5 universal record (Phase-8 bench harness) ------------------------
-    if let Some(record_args) = record_args.as_ref() {
-        // `--metrics off` means a no-op at the producer, not "build the record,
-        // then throw it away".
-        let Some(identity) = identity else {
-            info!("baseline: observations disabled, no record written");
-            return Ok(());
-        };
-
+    if let (Some(record_args), Some(identity)) = (record_args.as_ref(), identity) {
         // First-64-char preview for the `output_first_64` column.
         let preview_64: String = preview_full.chars().take(64).collect();
 
