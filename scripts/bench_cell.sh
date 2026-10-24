@@ -78,7 +78,11 @@ PORT=62265
 RMLX_BIN="$RMLX_DIR/target/release/rmlx"
 BUDGET_S=$((BUDGET_MIN * 60))
 
-export RMLX_METRICS_DB="${RMLX_DIR}/.rmlx/metrics/runs.db"
+# Runtime state lives under one root (CLAUDE.md): `RMLX_HOME`, else the
+# checkout's `.rmlx/`. The CBB harness reads the DB path from RMLX_METRICS_DB.
+RMLX_HOME="${RMLX_HOME:-${RMLX_DIR}/.rmlx}"
+export RMLX_HOME
+export RMLX_METRICS_DB="${RMLX_HOME}/metrics/runs.db"
 export RMLX_REPO_ROOT="${RMLX_DIR}"
 
 # --- env-var override resolution -------------------------------------------
@@ -339,7 +343,7 @@ if [ "$_CT_MODE" -eq 1 ]; then
     exit 8
   fi
 
-  _BUFFER_DIR="${RMLX_DIR}/.rmlx/metrics/buffer/pending"
+  _BUFFER_DIR="${RMLX_HOME}/metrics/buffer/pending"
   mkdir -p "$_BUFFER_DIR"
 
   # If median TPS < 0.5 the baseline run succeeded syntactically but produced
