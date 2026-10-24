@@ -238,8 +238,8 @@ fn the_column_holds_the_three_classes_and_nothing_else() {
     let mut conn = test_conn();
     record(&mut conn, "gate", 100.0, "2026-10-01T00:00:00Z", None);
 
-    for class in ["gate", "ab_arm", "diagnostic"] {
-        conn.execute("UPDATE observations SET run_class = ?1", [class])
+    for class in crate::run_class::RunClass::ALL {
+        conn.execute("UPDATE observations SET run_class = ?1", [class.as_str()])
             .unwrap();
     }
     assert!(conn
