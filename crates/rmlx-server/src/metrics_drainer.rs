@@ -273,9 +273,13 @@ const FLUSH_INTERVAL_MS: u64 = 100;
 /// `None`, `try_emit` drops at the producer, and the DB is never touched.
 ///
 /// `weight_quants` maps each model id to the weight label its config describes
-/// (`ModelRegistry::weight_quants`). An event for a model with no label is
-/// skipped with a warning rather than filed under a guessed one.
-pub fn spawn_drainer(db_path: PathBuf, weight_quants: BTreeMap<String, String>) -> DrainerHandle {
+/// (`ModelRegistry::weight_quants`). A model with no label is warned about once,
+/// here, and its events are then skipped quietly rather than filed under a
+/// guessed label.
+pub fn spawn_drainer(
+    db_path: PathBuf,
+    weight_quants: BTreeMap<String, Option<String>>,
+) -> DrainerHandle {
     let dropped = Arc::new(AtomicU64::new(0));
 
     if !rmlx_metrics::mode::observations_enabled() {
@@ -283,15 +287,23 @@ pub fn spawn_drainer(db_path: PathBuf, weight_quants: BTreeMap<String, String>) 
         return DrainerHandle { tx: None, dropped };
     }
 
+    let mut labelled = BTreeMap::new();
+    for (model_id, label) in weight_quants {
+        if let Some(label) = label {
+            labelled.insert(model_id, label);
+        } else {
+            tracing::warn!(
+                model_id = %model_id,
+                "metrics_drainer: the model's config names no weight format, so its \
+                 live-request rows are not recorded"
+            );
+        }
+    }
+
     let (tx, rx) = mpsc::channel::<MetricEvent>(CHANNEL_CAPACITY);
     let dropped_task = Arc::clone(&dropped);
 
-    tokio::spawn(drainer_task(
-        rx,
-        db_path,
-        dropped_task,
-        Arc::new(weight_quants),
-    ));
+    tokio::spawn(drainer_task(rx, db_path, dropped_task, Arc::new(labelled)));
 
     DrainerHandle {
         tx: Some(tx),
@@ -428,7 +440,12 @@ fn write_batch_to_db(
             _ => {}
         }
 
-        let run = match event_to_run_record(ev, weight_quants) {
+        // Warned about once, when the drainer was spawned.
+        let Some(weight_quant) = weight_quants.get(&ev.model_id) else {
+            tracing::debug!(model_id = %ev.model_id, "metrics_drainer: no weight label, event skipped");
+            continue;
+        };
+        let run = match event_to_run_record(ev, weight_quant) {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(
@@ -468,17 +485,8 @@ fn write_batch_to_db(
 /// not a controlled run, so it reaches no champion and no gate.
 fn event_to_run_record(
     ev: &MetricEvent,
-    weight_quants: &BTreeMap<String, String>,
+    weight_quant: &str,
 ) -> rmlx_metrics::error::Result<RunRecord> {
-    let weight_quant = weight_quants.get(&ev.model_id).ok_or_else(|| {
-        rmlx_metrics::error::Error::InvalidIngestField {
-            field: "weight_quant".to_owned(),
-            message: format!(
-                "{}'s config names no weight format, so its rows have no cell",
-                ev.model_id
-            ),
-        }
-    })?;
     RunRecordBuilder::rmlx(
         &ev.model_id,
         weight_quant,

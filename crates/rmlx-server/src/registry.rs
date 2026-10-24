@@ -349,12 +349,13 @@ impl ModelRegistry {
         reg
     }
 
-    /// The weight label of every model that has one, keyed by model id: what
-    /// the metrics drainer files each model's rows under.
-    pub fn weight_quants(&self) -> BTreeMap<String, String> {
+    /// Every model's weight label, keyed by model id (`None` for a model whose
+    /// config names no weight format): what the metrics drainer files each
+    /// model's rows under.
+    pub fn weight_quants(&self) -> BTreeMap<String, Option<String>> {
         self.entries
             .values()
-            .filter_map(|e| Some((e.id.clone(), e.weight_quant.clone()?)))
+            .map(|e| (e.id.clone(), e.weight_quant.clone()))
             .collect()
     }
 

@@ -3,10 +3,10 @@ use super::*;
 // ── Helper: build a timestamped event ────────────────────────────────────
 
 /// The registry's labels for the model `make_event` names.
-fn labels() -> BTreeMap<String, String> {
+fn labels() -> BTreeMap<String, Option<String>> {
     BTreeMap::from([(
         "mlx-community__gemma-4-e2b-it-mxfp8".to_owned(),
-        "mxfp8".to_owned(),
+        Some("mxfp8".to_owned()),
     )])
 }
 
@@ -128,20 +128,22 @@ fn load_phases_produces_five_metrics() {
 /// The label the registry supplies is the one filed; no name is parsed.
 #[test]
 fn a_row_carries_the_label_its_model_config_describes() {
-    let run = event_to_run_record(&make_event(MetricKind::KvCacheBytes(1024)), &labels()).unwrap();
+    let run = event_to_run_record(&make_event(MetricKind::KvCacheBytes(1024)), "mxfp8").unwrap();
     assert_eq!(run.weight_quant, "mxfp8");
 }
 
-/// A model whose config names no weight format has no cell, so its event is
-/// refused rather than filed under a guessed label.
+/// A model whose config names no weight format has no cell: its events are
+/// skipped, with no error, rather than filed under a guessed label.
 #[test]
-fn an_event_for_a_model_with_no_label_is_refused() {
-    let err = event_to_run_record(
-        &make_event(MetricKind::KvCacheBytes(1024)),
+fn an_event_for_a_model_with_no_label_is_skipped() {
+    let td = tempfile::tempdir().unwrap();
+    let written = write_batch_to_db(
+        &[make_event(MetricKind::KvCacheBytes(1024))],
+        &td.path().join("runs.db"),
         &BTreeMap::new(),
     )
-    .unwrap_err();
-    assert!(err.to_string().contains("weight_quant"), "{err}");
+    .unwrap();
+    assert_eq!(written, 0);
 }
 
 // ── PromptTokens / CompletionTokens mapping ────────────────────────
@@ -339,6 +341,6 @@ fn itl_stats_produces_three_metrics_with_correct_names() {
 /// Live-request telemetry is not a controlled run, so it reaches no gate.
 #[test]
 fn a_live_request_row_is_diagnostic() {
-    let run = event_to_run_record(&make_event(MetricKind::KvCacheBytes(1024)), &labels()).unwrap();
+    let run = event_to_run_record(&make_event(MetricKind::KvCacheBytes(1024)), "mxfp8").unwrap();
     assert_eq!(run.run_class, Some(RunClass::Diagnostic));
 }
