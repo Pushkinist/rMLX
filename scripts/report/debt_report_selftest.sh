@@ -1403,6 +1403,193 @@ check "doc_size_keeps_untracked" \
     contains "SHOWN.md" \
     IGNORED_OUT
 
+# ---- the entry's modes: flags that contradict, the advisory exit 0, --file-sizes
+# ---- and the default root --------------------------------------------------
+
+# run_tool <args...>: OUT and RC from one run of the tool, stdout and stderr together.
+run_tool() {
+    OUT=$(python3 "$TOOL" "$@" 2>&1)
+    RC=$?
+}
+
+# check_equal <name> <what it proves> <want> <got>
+check_equal() {
+    if [ "$3" = "$4" ]; then
+        PASSED=$((PASSED + 1))
+        printf '  ok   %-32s — %s\n' "$1" "$2"
+    else
+        FAILED=$((FAILED + 1))
+        printf '  FAIL %-32s — %s\n' "$1" "$2"
+        printf '    want:\n%s\n    got:\n%s\n' "$3" "$4"
+    fi
+}
+
+# lines_file <path> <n>: a file of n lines.
+lines_file() {
+    python3 -c 'import sys; open(sys.argv[1], "w").write("x\n" * int(sys.argv[2]))' "$1" "$2"
+}
+
+MODES_WORK="$(mktemp -d)"
+
+run_tool --check-doc-size --matched-lines drivers
+check_exit "modes_mix_doc_size_matched_lines" \
+    "two modes in one run are a usage error, not a silent choice of one" 2 "$RC"
+
+run_tool --file-sizes 5 --kv-census all
+check_exit "modes_mix_file_sizes_kv_census" \
+    "--file-sizes and --kv-census in one run are a usage error" 2 "$RC"
+
+run_tool --threshold 2
+check_exit "threshold_alone_exits_2" \
+    "--threshold without --kv-census is a usage error, not a flag that is dropped" 2 "$RC"
+check "threshold_alone_names_the_mode" \
+    "the refusal names the mode the flags belong to" \
+    contains "need --kv-census" OUT
+
+run_tool --file somewhere.rs
+check_exit "file_alone_exits_2" \
+    "--file without --kv-census is a usage error" 2 "$RC"
+
+run_tool --include-tests
+check_exit "include_tests_alone_exits_2" \
+    "--include-tests without --kv-census is a usage error" 2 "$RC"
+
+run_tool --since HEAD --check-doc-size
+check_exit "since_with_doc_size_exits_2" \
+    "--since only means something to the report: with a gate it is a usage error" 2 "$RC"
+check "since_with_doc_size_named" \
+    "the refusal says --since needs the report" \
+    contains "--since needs the report" OUT
+
+run_tool --since HEAD --file-sizes 3
+check_exit "since_with_file_sizes_exits_2" \
+    "--since with --file-sizes is a usage error" 2 "$RC"
+
+run_tool --root "$MODES_WORK/none" --since HEAD
+check_exit "report_missing_root_exits_0" \
+    "the advisory report exits 0 for a root that is not there" 0 "$RC"
+check "report_missing_root_unavailable" \
+    "...and says it could not measure" \
+    contains "unavailable (--root" OUT
+
+run_tool --root "$MODES_WORK/none" --file-sizes
+check_exit "file_sizes_missing_root_exits_0" \
+    "--file-sizes is advisory too: exit 0 for a root that is not there" 0 "$RC"
+
+run_tool --root "$MODES_WORK/none" --matched-lines impls
+check_exit "matched_lines_missing_root_exits_1" \
+    "--matched-lines keeps its exit 1 for a root that is not there" 1 "$RC"
+
+# A copy of the base fixture as a git work tree with one doc over the cap.
+MODES_BASE="$MODES_WORK/base"
+cp -R "$BASE" "$MODES_BASE"
+git -C "$MODES_BASE" init -q || exit 1
+python3 -c 'import sys; open(sys.argv[1], "w").write("x" * 50000)' "$MODES_BASE/docs/BIG.md"
+
+CRASH_OUT=$(python3 - "$REPO_ROOT/scripts/report" "$MODES_BASE" <<'EOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+import debt_report as dr
+
+
+def boom(*_args):
+    raise RuntimeError("planted failure")
+
+
+dr.report_debt_counters = boom
+print("report rc", dr.main(["--root", sys.argv[2], "--since", "HEAD"]))
+dr.file_size_report = boom
+print("file-sizes rc", dr.main(["--root", sys.argv[2], "--file-sizes"]))
+EOF
+)
+
+check "report_crash_exits_0" \
+    "an error inside a report section still exits 0" \
+    contains "report rc 0" CRASH_OUT
+
+check "report_crash_names_the_error" \
+    "...and the report says what failed instead of a traceback" \
+    contains "debt-report: unavailable (RuntimeError: planted failure)" CRASH_OUT
+
+check "report_crash_keeps_earlier_sections" \
+    "...and the sections printed before the failure are kept" \
+    contains "=== sibling similarity (twins) ===" CRASH_OUT
+
+check "file_sizes_crash_exits_0" \
+    "an error inside --file-sizes exits 0 too" \
+    contains "file-sizes rc 0" CRASH_OUT
+
+# --file-sizes: threshold 3 over a planted crates/ tree. big (10), mid and mid2 (6, a tie
+# listed in reverse path order) are above it; edge (3) is at it and only counts toward the
+# total; tests/, tests.rs, *_tests.rs and target/ are out of both; a directory named *.rs
+# and a broken symlink named *.rs are not files.
+FS_WORK="$MODES_WORK/fs"
+mkdir -p "$FS_WORK/crates/x/src/dir.rs" "$FS_WORK/crates/x/tests" "$FS_WORK/crates/x/target"
+lines_file "$FS_WORK/crates/x/src/big.rs" 10
+lines_file "$FS_WORK/crates/x/src/mid.rs" 6
+lines_file "$FS_WORK/crates/x/src/mid2.rs" 6
+lines_file "$FS_WORK/crates/x/src/edge.rs" 3
+lines_file "$FS_WORK/crates/x/src/foo_tests.rs" 20
+lines_file "$FS_WORK/crates/x/src/tests.rs" 20
+lines_file "$FS_WORK/crates/x/tests/it.rs" 20
+lines_file "$FS_WORK/crates/x/target/gen.rs" 20
+lines_file "$FS_WORK/crates/x/src/notes.txt" 99
+printf 'x\n' >"$FS_WORK/crates/x/src/dir.rs/inner.txt"
+ln -s "$FS_WORK/crates/x/src/missing_target" "$FS_WORK/crates/x/src/gone.rs"
+
+FS_WANT=$(printf 'Files >3 LOC (excluding tests/, tests.rs, *_tests.rs):\n\n%6d  %s\n%6d  %s\n%6d  %s\n\nWorkspace total (excluding test files): 25 LOC' \
+    10 "$FS_WORK/crates/x/src/big.rs" 6 "$FS_WORK/crates/x/src/mid2.rs" 6 "$FS_WORK/crates/x/src/mid.rs")
+run_tool --root "$FS_WORK" --file-sizes 3
+check_exit "file_sizes_exit_0" "--file-sizes over the planted tree exits 0" 0 "$RC"
+check_equal "file_sizes_listing" \
+    "above the threshold only, largest first, a tie in reverse path order; tests and target/ out; a directory and a broken symlink named *.rs are not files; the total counts every non-test file" \
+    "$FS_WANT" "$OUT"
+
+run_tool --root "$FS_WORK" --file-sizes
+check "file_sizes_default_threshold" \
+    "with no N the threshold is 1000" \
+    contains "Files >1000 LOC (excluding tests/, tests.rs, *_tests.rs):" OUT
+check "file_sizes_default_total" \
+    "...and every file of the planted tree is below it, so the listing is empty and the total still counts them all" \
+    contains "Workspace total (excluding test files): 25 LOC" OUT
+
+# Every mode run with no --root reads the tree its tool sits in: a copy of the tool
+# under a fixture tree's scripts/report/, run from another directory.
+DEF_TREE="$MODES_WORK/default_root"
+cp -R "$MODES_BASE" "$DEF_TREE"
+mkdir -p "$DEF_TREE/scripts/report"
+for f in debt_report.py kv_census.py rust_scan.py; do
+    cp "$REPO_ROOT/scripts/report/$f" "$DEF_TREE/scripts/report/$f"
+done
+DEF_REAL="$(cd "$DEF_TREE" && pwd -P)"
+
+DEF_REPORT=$(cd "$MODES_WORK" && python3 "$DEF_TREE/scripts/report/debt_report.py" --since HEAD 2>&1)
+check "default_root_report" \
+    "the report with no --root reads the tree the tool sits in" \
+    contains "codec_alpha3.rs <-> crates/rmlx-kv-quant/src/storage/codec_alpha4.rs: 100.0% shared" \
+    DEF_REPORT
+
+DEF_ML=$(cd "$MODES_WORK" && python3 "$DEF_TREE/scripts/report/debt_report.py" --matched-lines impls 2>&1)
+check "default_root_matched_lines" \
+    "--matched-lines with no --root reads the tree the tool sits in" \
+    contains "impl RoundDrafter bodies (crates/rmlx-models/src/speculative): 7 matched lines over 14 body lines (2 item(s), 1 pair(s))" \
+    DEF_ML
+
+DEF_DOCS=$(cd "$MODES_WORK" && python3 "$DEF_TREE/scripts/report/debt_report.py" --check-doc-size 2>&1)
+DEF_DOCS_STATUS=$?
+check_exit "default_root_doc_size_exit" \
+    "--check-doc-size with no --root finds the fixture's oversized doc" 1 "$DEF_DOCS_STATUS"
+check "default_root_doc_size" \
+    "...and names it" \
+    contains "BIG.md  48.8 KiB (50000 B) is over the 40 KiB cap" DEF_DOCS
+
+DEF_FS=$(cd "$MODES_WORK" && python3 "$DEF_TREE/scripts/report/debt_report.py" --file-sizes 0 2>&1)
+check "default_root_file_sizes" \
+    "--file-sizes with no --root lists files of the tree the tool sits in" \
+    contains "$DEF_REAL/crates/rmlx-models/src/speculative/mtp.rs" DEF_FS
+
+rm -rf "$MODES_WORK"
+
 if [ "$FAILED" -ne 0 ]; then
     echo "debt-report selftest: FAIL ($FAILED of $((PASSED + FAILED)))" >&2
     exit 1

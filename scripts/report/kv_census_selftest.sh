@@ -1180,6 +1180,34 @@ for pin in ${REAL_PINS}; do
     echo "ok    real tree: ${name} ${got}  (pinned)"
 done
 
+# 57 — `all` prints the variant, match-site and update-body figures.
+T="${WORK}/all"
+build_tree "${T}"
+check "all prints the variant figures" "${T}" 0 "^variants 4$" all --threshold 2
+check "all prints the match-site figures" "${T}" 0 "^match-sites 3$" all --threshold 2
+check "all prints the update-body figures" "${T}" 0 "^update-bodies 3$" all --threshold 2
+
+# 58 — a root that is not a directory is unmeasurable, named as such.
+check "a root that is not a directory is a refusal" "${WORK}/none" 2 "unavailable: .*/none is not a directory" match-sites
+
+# 59 — with no --root the census reads the tree the tool sits in: a copy of the
+# tool under the planted tree's scripts/report/, run from another directory.
+T="${WORK}/default_root"
+build_tree "${T}"
+mkdir -p "${T}/scripts/report"
+for f in debt_report.py kv_census.py rust_scan.py; do
+    cp "${REPO_ROOT}/scripts/report/${f}" "${T}/scripts/report/${f}"
+done
+default_out="$(cd "${WORK}" && python3 "${T}/scripts/report/debt_report.py" --kv-census match-sites --threshold 2 2>&1)"
+default_rc=$?
+if [ "${default_rc}" -eq 0 ] && grep -qE -- "^match-sites 3$" <<<"${default_out}"; then
+    echo "ok    no --root reads the tree the tool sits in  (exit 0, output matched)"
+else
+    echo "FAIL  no --root reads the tree the tool sits in: exit ${default_rc}" >&2
+    head -5 >&2 <<<"${default_out}"
+    failures=$((failures + 1))
+fi
+
 if [ "${failures}" -gt 0 ]; then
     echo >&2
     echo "ERROR: ${failures} case(s) did not reproduce the expected behaviour." >&2

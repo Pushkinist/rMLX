@@ -352,6 +352,20 @@ def is_test_path(path: Path) -> bool:
     return name == "tests.rs" or name.endswith("_tests.rs")
 
 
+def glob_source_files(root: Path, directory: str, glob: str) -> list[Path]:
+    """The non-test files of `root/directory` matching `glob`, sorted. Raises
+    RuntimeError naming what is missing: the directory, or any file in it. A
+    directory that is not there and one whose glob finds nothing are different
+    answers."""
+    base = root / directory
+    if not base.is_dir():
+        raise RuntimeError(f"{directory} is not a directory")
+    paths = [p for p in sorted(base.glob(glob)) if not is_test_path(p.relative_to(root))]
+    if not paths:
+        raise RuntimeError(f"{directory}/{glob} matches no file")
+    return paths
+
+
 # ---- fn extraction ----------------------------------------------------------
 #
 # A single low-level scanner (`_skip_token`) knows how to step over anything

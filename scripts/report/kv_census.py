@@ -63,6 +63,7 @@ from rust_scan import (
     enum_body,
     enum_variants,
     extract_fns,
+    glob_source_files,
     is_test_path,
     let_patterns,
     match_sites,
@@ -583,13 +584,11 @@ def mode_match_sites(root: Path, threshold: int | None, include_tests: bool) -> 
 
 
 def update_files(root: Path) -> list[Path]:
-    base = root / UPDATE_DIR
-    if not base.is_dir():
-        fail(f"{UPDATE_DIR} is not a directory under {root}")
-    paths = [p for p in sorted(base.glob(UPDATE_GLOB)) if not is_test_path(p.relative_to(root))]
-    if not paths:
-        fail(f"{UPDATE_DIR}/{UPDATE_GLOB} matches no file under {root}")
-    return paths
+    try:
+        return glob_source_files(root, UPDATE_DIR, UPDATE_GLOB)
+    except RuntimeError as exc:
+        fail(f"{exc} under {root}")
+        raise
 
 
 def mode_update_bodies(root: Path) -> None:

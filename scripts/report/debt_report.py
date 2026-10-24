@@ -8,9 +8,11 @@ Usage:  debt_report.py [--root DIR] [--since REF]
         debt_report.py --kv-census {variants,match-sites,update-bodies,refs,all}
                        [--threshold N] [--file PATH] [--include-tests]
 Exit:   0 a report, a figure or a clean gate; 1 the doc-size gate failed,
-        ``--matched-lines`` has no population to measure, ``--kv-census``
-        refused a codec descriptor or a storage view, or the report's
-        ``--root`` is not a directory; 2 the tree cannot be measured
+        ``--matched-lines`` has no population to measure, ``--root`` of
+        ``--matched-lines`` is not a directory, or ``--kv-census`` refused a
+        codec descriptor or a storage view; 2 the tree cannot be measured, or
+        the flags contradict each other. The report and ``--file-sizes`` exit
+        0 whatever happens.
 LOC-exempt: the report and its modes share one fn scan and one entry
 
 The default mode is the report. ``--matched-lines``, ``--check-doc-size``,
@@ -84,13 +86,12 @@ carrying a ``size-exempt:`` marker, and exits 2 when the docs cannot be
 measured.
 
 ``--file-sizes [N]`` prints the non-test Rust source files above N lines
-(default 1000), largest first, and the workspace total. Advisory: it never
-fails.
+(default 1000), largest first, and the workspace total.
 
-Advisory (the four-section report only): it exits 0 and never raises for
-anything short of a caller error (a ``--root`` that does not exist) — an
-unavailable round-loop-driver scan prints ``unavailable (...)`` in its
-section rather than aborting the rest of the report.
+The report and ``--file-sizes`` are advisory: they exit 0 whatever happens. A
+``--root`` that is not a directory, or any error while scanning, prints
+``unavailable (...)`` instead — in its section for the round-loop-driver scan,
+so the rest of the report still prints.
 """
 
 from __future__ import annotations
@@ -108,7 +109,7 @@ from pathlib import Path
 
 import kv_census
 from kv_census import UPDATE_DIR, UPDATE_FN_PATTERN, UPDATE_GLOB
-from rust_scan import FnInfo, extract_fns, is_test_path, scan_after_name
+from rust_scan import FnInfo, extract_fns, glob_source_files, is_test_path, scan_after_name
 
 SIM_THRESHOLD = 0.60
 DOC_SIZE_THRESHOLD_KIB = 40
@@ -179,7 +180,7 @@ def rust_files(root: Path, subdir: str, include_tests: bool) -> list[Path]:
     base = root / subdir
     if not base.is_dir():
         return []
-    out = [p for p in base.rglob("*.rs")]
+    out = [p for p in base.rglob("*.rs") if p.is_file()]
     if not include_tests:
         out = [p for p in out if not is_test_path(p.relative_to(root))]
     return sorted(out)
@@ -436,15 +437,9 @@ def glob_fn_items(root: Path, *, directory: str, glob: str, pattern: str) -> lis
     no file raises its own reason rather than an empty population: a root that
     is not there and a root whose files hold no matching fn are different
     answers."""
-    base = root / directory
-    if not base.is_dir():
-        raise RuntimeError(f"{directory} is not a directory")
-    paths = [p for p in sorted(base.glob(glob)) if not is_test_path(p.relative_to(root))]
-    if not paths:
-        raise RuntimeError(f"{directory}/{glob} matches no file")
     matches = re.compile(pattern).search
     items: list[FnInfo] = []
-    for path in paths:
+    for path in glob_source_files(root, directory, glob):
         fns, _skipped = fns_in_file(root, path)
         items.extend(fn for fn in fns if matches(fn.name))
     return items
@@ -1021,6 +1016,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not args.kv_census and (args.threshold is not None or args.file or args.include_tests):
         parser.error("--threshold, --file and --include-tests need --kv-census")
+    report_mode = not (
+        args.matched_lines or args.check_doc_size or args.kv_census or args.file_sizes is not None
+    )
+    if args.since is not None and not report_mode:
+        parser.error("--since needs the report")
 
     if args.kv_census:
         kv_census.run(
@@ -1030,15 +1030,18 @@ def main(argv: list[str] | None = None) -> int:
 
     root = Path(args.root)
     if not root.is_dir():
-        print(f"debt-report: --root {root} is not a directory", file=sys.stderr)
-        return 2 if args.check_doc_size else 1
+        reason = f"--root {root} is not a directory"
+        if args.check_doc_size:
+            print(f"debt-report: {reason}", file=sys.stderr)
+            return 2
+        if args.matched_lines:
+            print(f"debt-report: {reason}", file=sys.stderr)
+            return 1
+        print(f"debt-report: unavailable ({reason})")
+        return 0
 
     if args.check_doc_size:
         return check_doc_size(root)
-
-    if args.file_sizes is not None:
-        file_size_report(root, args.file_sizes)
-        return 0
 
     if args.matched_lines:
         try:
@@ -1052,11 +1055,18 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     lines: list[str] = []
-    report_sibling_similarity(root, lines)
-    report_debt_counters(root, lines)
-    report_add_remove_ratio(root, args.since, lines)
-    report_doc_sizes(root, lines)
-    print("\n".join(lines))
+    try:
+        if args.file_sizes is not None:
+            file_size_report(root, args.file_sizes)
+        else:
+            report_sibling_similarity(root, lines)
+            report_debt_counters(root, lines)
+            report_add_remove_ratio(root, args.since, lines)
+            report_doc_sizes(root, lines)
+    except Exception as exc:  # the advisory modes exit 0 whatever happens
+        lines.append(f"debt-report: unavailable ({type(exc).__name__}: {exc})")
+    if lines:
+        print("\n".join(lines))
     return 0
 
 
