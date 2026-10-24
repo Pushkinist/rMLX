@@ -96,6 +96,14 @@ CASES=(
     "changelog_out_of_scope|CHANGELOG.md|- scripts no longer run rm -f /tmp/rmlx.*.claim|0|-"
     "word_inside_identifier|scripts/n.sh|no_pkill_here=1; format_claim_report|0|-"
     "word_prefix|scripts/o.sh|echo \"confirm the claim\"; call_nopkill now|0|-"
+    "contributing_hint|CONTRIBUTING.md|run rm -f /tmp/rmlx.claim first|1|claim-delete: CONTRIBUTING.md:2:"
+    "readme_hint|README.md|run rm -f /tmp/rmlx.claim first|1|claim-delete: README.md:2:"
+    "rust_bench_file|crates/x/benches/b.rs|    let _ = std::fs::remove_file(&claim_path);|1|claim-delete: crates/x/benches/b.rs:2:"
+    "nested_doc_hint|docs/sub/deeper/N.md|run rm -f /tmp/rmlx.claim first|1|claim-delete: docs/sub/deeper/N.md:2:"
+    "doc_non_md_out_of_scope|docs/notes.txt|run rm -f /tmp/rmlx.claim first|0|-"
+    "python_object_remove|scripts/q2.py|claim_file.remove()|1|claim-delete: scripts/q2.py:2:"
+    "python_os_unlink|scripts/q3.py|os.unlink(\"/tmp/rmlx.claim\")|1|claim-delete: scripts/q3.py:2:"
+    "xargs_unlink|scripts/e5.sh|ls /tmp/rmlx.*.claim \| xargs unlink|1|claim-delete: scripts/e5.sh:2:"
 )
 
 for spec in "${CASES[@]}"; do
@@ -134,6 +142,20 @@ done
 [ "$doc_rows_found" -eq 1 ] &&
     st_case doc_rows 0 --what "the gate's rows in CLAUDE.md and scripts/INDEX.md pass it" -- bash "$GATE" "$root"
 
+# A violation in a file that is tracked, not merely untracked, is reported.
+root="$(fresh tracked_violation)"
+plant "$root" scripts/staged.sh 'rm -f /tmp/rmlx.claim'
+git -C "$root" add scripts/staged.sh
+st_case tracked_violation 1 --what "a staged file is scanned" \
+    --has "claim-delete: scripts/staged.sh:2:" -- bash "$GATE" "$root"
+
+# The summary counts every violation, not the files that hold one.
+root="$(fresh two_violations)"
+plant "$root" docs/v1.md 'rm -f /tmp/rmlx.claim'
+plant "$root" docs/v2.md 'rm -f /tmp/rmlx.claim'
+st_case two_violations_counted 1 --what "two planted lines are two violations" \
+    --has "FAIL: 2 violation(s)" -- bash "$GATE" "$root"
+
 # A scope with no file cannot pass.
 root="$(st_git_root empty_scope)"
 mkdir -p "$root/other"
@@ -161,6 +183,6 @@ root="$ST_WORK/not_a_git_tree"
 mkdir -p "$root/scripts"
 printf '#!/bin/sh\nrm -f /tmp/rmlx.claim\n' >"$root/scripts/x.sh"
 st_case not_a_git_tree 2 --what "outside a git work tree the gate cannot scan: exit 2" \
-    --has "unavailable: git ls-files exit 128" -- bash "$GATE" "$root"
+    --has "unavailable: git ls-files exit 128" --lacks "no in-scope file" -- bash "$GATE" "$root"
 
 st_done
