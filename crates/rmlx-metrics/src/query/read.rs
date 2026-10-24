@@ -436,7 +436,7 @@ pub fn deltas(
     });
     let baseline_ts = baseline_ts.ok_or_else(|| {
         Error::Query(format!(
-            "no observations found with git_sha '{since_sha}' (or '{since_sha}-dirty'){scope}"
+            "no gate observations found with git_sha '{since_sha}' (or '{since_sha}-dirty'){scope}"
         ))
     })?;
 
@@ -638,7 +638,7 @@ pub fn regress(
     // Step 4: build the human-readable message.
     let message = match (champion_value, latest_value, delta_pct) {
         (None, _, _) => format!("{model} {metric} no champion found — skip (no data)"),
-        (_, None, _) => format!("{model} {metric} no observations found — skip (no data)"),
+        (_, None, _) => format!("{model} {metric} no gate observations found — skip (no data)"),
         (Some(c), Some(l), Some(d)) => {
             let status = if regressed { "REGRESSED" } else { "ok" };
             format!(

@@ -567,8 +567,8 @@ Through `make canary-gate`, a failed recipe line always reports `make`'s own
 exit code (2) — a regression, an unknown SHA and the underlying skip
 condition all surface as the same 2. Call `rmlx metrics deltas
 --since-sha <SHA> --threshold-pct 3 --exit-code true` directly to read its
-own exit codes: 1 for a regression or a SHA with no rows at all (unknown
-SHA), 125 for the skip condition (no comparable baseline). A known SHA with
+own exit codes: 1 for a regression or a SHA with no gate observations
+(unknown SHA), 125 for the skip condition (no comparable baseline). A known SHA with
 no cell measured again after it exits 0 even directly, so a clean exit does
 not prove every cell was re-measured. Two `Cargo.toml` perf profiles are
 in play: `release-perf` (`debug-assertions=false`, `overflow-checks=false`,

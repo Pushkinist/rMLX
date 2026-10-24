@@ -251,7 +251,7 @@ pub(crate) enum MetricsAction {
     /// Exit codes:
     ///   0   — within tolerance (or improvement)
     ///   1   — regressed beyond `--threshold-pct`
-    ///   125 — no champion or no observations found (skip, bisect-safe)
+    ///   125 — no champion or no gate observations found (skip, bisect-safe)
     Regress {
         /// Model name substring to match (e.g. "bonsai" matches any model
         /// whose name contains "bonsai").

@@ -958,7 +958,7 @@ fn deltas_prompt_prefix_scopes_the_sha_lookup() {
     let err = deltas(&conn, "sha_other", Some(5.0), Some("ssd-canary-")).unwrap_err();
     assert!(
         err.to_string()
-            .contains("no observations found with git_sha 'sha_other'"),
+            .contains("no gate observations found with git_sha 'sha_other'"),
         "{err}"
     );
     assert!(deltas(&conn, "sha_canary", Some(5.0), Some("ssd-canary-")).is_ok());
