@@ -742,18 +742,6 @@ fn buffered_record(dir: &Path, tps: f64) -> (serde_json::Value, PathBuf) {
     (record, buffer)
 }
 
-/// `mst_capture.sh` cannot see the exit code under `xctrace`, so it reads a
-/// pending record from the run log by this event's message.
-#[test]
-fn the_traced_capture_reads_the_pending_event_by_its_message() {
-    let script = include_str!("../../../../scripts/mst_capture.sh");
-    let message = format!("\"baseline: {RECORD_DID_NOT_LAND}\"");
-    assert!(
-        script.contains(&message),
-        "mst_capture.sh does not match {message}"
-    );
-}
-
 #[test]
 fn a_record_that_lands_drops_its_buffer_file() {
     let tmp = tempfile::tempdir().expect("tempdir");

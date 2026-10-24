@@ -176,7 +176,7 @@ Conventions:
 | `gputrace_kernels.sh` | — | List the Metal functions a captured window referenced. |
 | `gputrace_diff.sh` | — | Diff the function sets of two `.gputrace` bundles. |
 | `gputrace_summary.sh` | — | Summarise a `.gputrace` bundle. |
-| `mst_capture.sh` | `make mst-capture` | Record a Metal System Trace of a live `rmlx` run and export the GPU-interval table. The run is recorded as `diagnostic` when it finishes inside `--time-limit`; a record that did not land is read from the run's log, named, and ends the script 75 with the trace kept. |
+| `mst_capture.sh` | `make mst-capture` | Record a Metal System Trace of a live `rmlx` run and export the GPU-interval table. The run is recorded as `diagnostic` when it finishes inside `--time-limit`; a record that did not land is found as the pending buffer file carrying this run's label, named as soon as it is found, and ends the script 75 with the trace kept. The prefill skip is read from the log naming this run's label, not the newest log. |
 | `traces_gc.sh` | `make traces-gc` | Bound how much disk `.rmlx/traces` holds. |
 | `rmlx-capture.entitlements` | — | Entitlements plist for codesigning a capture-enabled binary. |
 

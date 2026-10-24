@@ -153,41 +153,85 @@ grep -q -- 'baseline --record --run-class diagnostic --label mst_capture:' "$XCR
 	bad="launched argv: $(cat "$XCRUN_LOG"); $(tail -2 "$WORK/mst.out" | tr '\n' ' ')"
 verdict mst_capture_records_diagnostic "the traced run is launched recording as diagnostic" "$bad"
 
-# xctrace hides the child's exit code, so a record that did not land is read
-# from the run's log. The shim writes the bundle, the table and that log line;
-# a `cargo` stub stands in for the summariser.
+# xctrace hides the child's exit code, so a record that did not land is found as
+# the buffer file carrying this run's label. The shim stands in for the child:
+# it writes under the RMLX_HOME it was handed with --env (else the inherited
+# one), then a second process's newer log and buffer file. A `cargo` stub
+# stands in for the summariser.
 cat >"$WORK/xcbin/xcrun" <<'SHIM'
 #!/usr/bin/env bash
 [ "$1" = -f ] && exit 0
-out=""
+out="" home="" label=""
 args=("$@")
 for ((i = 0; i < ${#args[@]}; i++)); do
-	[ "${args[$i]}" = --output ] && out="${args[$((i + 1))]}"
+	case "${args[$i]}" in
+	--output) out="${args[$((i + 1))]}" ;;
+	--env) case "${args[$((i + 1))]}" in RMLX_HOME=*) home="${args[$((i + 1))]#RMLX_HOME=}" ;; esac ;;
+	--label) label="${args[$((i + 1))]}" ;;
+	esac
 done
 case "$1 $2" in
 "xctrace record")
-	mkdir -p "$out" "$RMLX_HOME/logs"
-	printf '%s\n' '{"level":"ERROR","fields":{"message":"baseline: record did not land","error":"stub","buffer":"/x/pending/mst.json","db":"/x/runs.db"}}' \
-		>"$RMLX_HOME/logs/20261024-000000-9.9.9.jsonl"
+	mkdir -p "$out"
+	printf '%s\n' "$*" >"$RMLX_HOME.xctrace_argv"
+	home="${home:-$RMLX_HOME}"
+	mkdir -p "$home/logs" "$home/metrics/buffer/pending"
+	this="$home/logs/20261024-000000-9.9.9.jsonl"
+	printf '%s\n' "{\"fields\":{\"message\":\"rmlx start\",\"cmd\":\"Baseline { label: Some(\\\"$label\\\") }\"}}" \
+		'{"fields":{"message":"generate: prefill","prefill_ms":123.4}}' >"$this"
+	if [ "$STUB_MST_MODE" = pending ]; then
+		printf '{"notes": "label=%s"}\n' "$label" >"$home/metrics/buffer/pending/this.json"
+		printf '%s\n' '{"fields":{"message":"baseline: record did not land","buffer":"this.json"}}' >>"$this"
+	else
+		printf '{"notes": "label=perf_ab:other:A:1"}\n' >"$home/metrics/buffer/pending/other.json"
+	fi
+	other="$home/logs/20261024-000001-9.9.9.jsonl"
+	printf '%s\n' '{"fields":{"message":"rmlx start","cmd":"Info"}}' >"$other"
+	[ "$STUB_MST_MODE" = pending ] ||
+		printf '%s\n' '{"fields":{"message":"baseline: record did not land","buffer":"other.json"}}' >>"$other"
+	touch -t 203001010000 "$other"
 	;;
-"xctrace export") printf '<trace/>\n' >"$out" ;;
+"xctrace export") [ -n "${STUB_MST_NO_EXPORT:-}" ] || printf '<trace/>\n' >"$out" ;;
 esac
 exit 0
 SHIM
 mkdir -p "$WORK/cargobin"
 printf '#!/usr/bin/env bash\necho "stub summary"\n' >"$WORK/cargobin/cargo"
 chmod +x "$WORK/cargobin/cargo"
-set +e
-PATH="$WORK/xcbin:$WORK/cargobin:$PATH" ARGV_LOG="$WORK/mst.argv" RMLX_HOME="$WORK/mst_home" \
-	bash "$REPO_ROOT/scripts/mst_capture.sh" --model "$MODEL" --binary "$MST_BIN" \
-	--out-dir "$WORK/mst_traces" >"$WORK/mst_pending.out" 2>&1
-status=$?
-set -e
+
+# mst_case <mode> <home> [no-export] — runs the script; sets $status and writes <home>.out.
+mst_case() {
+	set +e
+	PATH="$WORK/xcbin:$WORK/cargobin:$PATH" STUB_MST_MODE="$1" STUB_MST_NO_EXPORT="${3:-}" ARGV_LOG="$WORK/mst.argv" RMLX_HOME="$2" \
+		bash "$REPO_ROOT/scripts/mst_capture.sh" --model "$MODEL" --binary "$MST_BIN" \
+		--out-dir "$2.traces" >"$2.out" 2>&1
+	status=$?
+	set -e
+}
+
+mst_case pending "$WORK/mst_home"
 bad=""
-[ "$status" -eq 75 ] || bad="exit=$status (want 75: traced, record pending): $(tail -3 "$WORK/mst_pending.out" | tr '\n' ' ')"
-grep -q '^record pending: /x/pending/mst.json' "$WORK/mst_pending.out" || bad="${bad:+$bad; }the buffer file is not named"
-grep -q '^bundle: ' "$WORK/mst_pending.out" || bad="${bad:+$bad; }the trace was not reported"
-verdict mst_capture_with_a_pending_record_keeps_its_trace "a traced run whose record did not land keeps its trace and ends 75" "$bad"
+[ "$status" -eq 75 ] || bad="exit=$status (want 75: traced, record pending): $(tail -3 "$WORK/mst_home.out" | tr '\n' ' ')"
+grep -q "^record pending: $WORK/mst_home/metrics/buffer/pending/this.json\$" "$WORK/mst_home.out" ||
+	bad="${bad:+$bad; }this run's buffer file is not named alone"
+grep -q '^bundle: ' "$WORK/mst_home.out" || bad="${bad:+$bad; }the trace was not reported"
+grep -qF -- "--env RMLX_HOME=$WORK/mst_home " "$WORK/mst_home.xctrace_argv" ||
+	bad="${bad:+$bad; }the child was not handed RMLX_HOME"
+grep -q '^skip: *123 ms' "$WORK/mst_home.out" || bad="${bad:+$bad; }the prefill was not read from this run's log"
+verdict mst_capture_with_a_pending_record_keeps_its_trace "a traced run whose record did not land is found by its label, past a newer log of another process, and ends 75" "$bad"
+
+mst_case other "$WORK/mst_home_other"
+bad=""
+[ "$status" -eq 0 ] || bad="exit=$status (want 0: this run's record landed): $(tail -3 "$WORK/mst_home_other.out" | tr '\n' ' ')"
+! grep -q 'record pending' "$WORK/mst_home_other.out" || bad="${bad:+$bad; }another process's buffer file was named as this run's"
+verdict mst_capture_ignores_another_runs_pending_record "a traced run whose record landed is not charged with another process's pending record" "$bad"
+
+mst_case pending "$WORK/mst_home_noexport" 1
+bad=""
+[ "$status" -eq 1 ] || bad="exit=$status (want 1: the export failed)"
+grep -q "^record pending: $WORK/mst_home_noexport/metrics/buffer/pending/this.json\$" "$WORK/mst_home_noexport.out" ||
+	bad="${bad:+$bad; }a failed export hid the pending buffer file"
+verdict mst_capture_names_a_pending_record_when_the_export_fails "a traced run whose export failed still names its pending buffer file" "$bad"
 
 # ── codec_inertness_probe.sh ──────────────────────────────────────────────────
 PROBE_BIN="$WORK/rmlx_probe"
