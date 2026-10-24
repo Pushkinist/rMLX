@@ -16,5 +16,3 @@ ALTER TABLE observations ADD COLUMN run_class TEXT
     CHECK (run_class IN ('gate', 'ab_arm', 'diagnostic'));
 
 UPDATE observations SET run_class = 'gate';
-
-CREATE INDEX IF NOT EXISTS obs_run_class_idx ON observations(run_class);

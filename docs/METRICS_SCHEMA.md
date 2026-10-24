@@ -137,7 +137,6 @@ CREATE INDEX obs_run_id_idx        ON observations(run_id);
 CREATE INDEX obs_backend_idx       ON observations(backend);
 CREATE INDEX obs_inserted_idx      ON observations(inserted_utc);
 CREATE INDEX obs_decode_config_idx ON observations(decode_config);
-CREATE INDEX obs_run_class_idx     ON observations(run_class);
 ```
 
 `decode_config` and `run_class` are added by `ALTER TABLE`, so they are the
