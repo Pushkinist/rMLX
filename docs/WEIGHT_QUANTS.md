@@ -408,6 +408,9 @@ and a cast back. MLX's custom kernels have no CPU backend. The GPU test
 `the_signed_block_hadamard_kernel_is_within_one_bf16_ulp_of_the_op_chain_on_gpu`
 (`crates/rmlx-models/src/hadamard_msl_tests.rs`) holds the kernel to that op
 chain at the pack's widths; measured, the two are bit-identical.
+`the_signed_block_hadamard_kernel_is_within_one_ulp_of_the_op_chain_at_every_block_on_gpu`
+holds it to one ulp at every block from 2 to `MAX_BLOCK` (4096), in f32 and
+bf16.
 
 ### 10.3 What is checked
 
