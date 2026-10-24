@@ -998,30 +998,67 @@ struct Item<'a> {
     text: String,
 }
 
-/// Whether `line` closes a `const` item: it ends in `;` outside any string
-/// literal. `in_str` carries a string literal left open by an earlier line.
-fn ends_const(line: &str, in_str: &mut bool) -> bool {
-    let mut chars = line.chars().peekable();
+/// A string literal a `const` item's scan is inside: a normal one, or a raw
+/// one closed by `"` and this many `#`s.
+#[derive(Clone, Copy)]
+enum Open {
+    Str,
+    Raw(usize),
+}
+
+/// Whether `line` closes a `const` item: it ends in `;` outside any string or
+/// char literal. `open` carries a string literal left open by an earlier line.
+fn ends_const(line: &str, open: &mut Option<Open>) -> bool {
+    let chars: Vec<char> = line.chars().collect();
     let mut last = None;
-    while let Some(c) = chars.next() {
-        if *in_str {
-            match c {
-                '\\' => {
-                    chars.next();
-                }
-                '"' => *in_str = false,
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match *open {
+            Some(Open::Str) => match c {
+                '\\' => i += 1,
+                '"' => *open = None,
                 _ => {}
+            },
+            Some(Open::Raw(hashes)) => {
+                let closes = c == '"' && (1..=hashes).all(|k| chars.get(i + k) == Some(&'#'));
+                if closes {
+                    *open = None;
+                    i += hashes;
+                }
             }
-            continue;
+            None => {
+                let after_ident = i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_');
+                if c == '"' {
+                    *open = Some(Open::Str);
+                } else if c == 'r' && !after_ident {
+                    let hashes = chars[i + 1..].iter().take_while(|&&h| h == '#').count();
+                    if chars.get(i + 1 + hashes) == Some(&'"') {
+                        *open = Some(Open::Raw(hashes));
+                        i += 1 + hashes;
+                    } else {
+                        last = Some(c);
+                    }
+                } else if c == '\'' {
+                    // A char literal (`'"'`, `'\''`); a lifetime has no closing quote.
+                    if chars.get(i + 1) == Some(&'\\') {
+                        if let Some(end) = (i + 2..chars.len()).find(|&k| chars[k] == '\'') {
+                            i = end;
+                        }
+                    } else if chars.get(i + 2) == Some(&'\'') {
+                        i += 2;
+                    }
+                    last = Some('\'');
+                } else if c == '/' && chars.get(i + 1) == Some(&'/') {
+                    break;
+                } else if !c.is_whitespace() {
+                    last = Some(c);
+                }
+            }
         }
-        match c {
-            '"' => *in_str = true,
-            '/' if chars.peek() == Some(&'/') => break,
-            c if !c.is_whitespace() => last = Some(c),
-            _ => {}
-        }
+        i += 1;
     }
-    !*in_str && last == Some(';')
+    open.is_none() && last == Some(';')
 }
 
 /// Every top-level fn, `const` and `static` of `source`, in order.
@@ -1032,7 +1069,7 @@ fn top_level_items(source: &str) -> Vec<Item<'_>> {
     .unwrap();
     let mut items = Vec::new();
     let mut current: Option<Item<'_>> = None;
-    let mut in_str = false;
+    let mut open = None;
     for line in source.lines() {
         if current.is_none() {
             if let Some(caps) = decl.captures(line) {
@@ -1041,7 +1078,7 @@ fn top_level_items(source: &str) -> Vec<Item<'_>> {
                     name: caps.get(2).map_or("", |m| m.as_str()),
                     text: String::new(),
                 });
-                in_str = false;
+                open = None;
             }
         }
         let Some(item) = current.as_mut() else {
@@ -1052,7 +1089,7 @@ fn top_level_items(source: &str) -> Vec<Item<'_>> {
         let closed = if item.is_fn {
             line == "}"
         } else {
-            ends_const(line, &mut in_str)
+            ends_const(line, &mut open)
         };
         if closed {
             items.extend(current.take());
@@ -1124,10 +1161,11 @@ fn every_observations_reader_but_the_history_filters_on_the_gate_class() {
 }
 
 /// The scan reads every shape a reader can take: a lowercase `join`, a `const`
-/// whose SQL holds a `;`, a `const fn`, an `async fn` and a `pub(in …) fn`.
+/// whose SQL holds a `;`, a raw string holding a `"` and a `;`, a char literal
+/// `'"'`, a `static`, a `const fn`, an `async fn` and a `pub(in …) fn`.
 #[test]
 fn the_gate_scan_reads_every_reader_shape() {
-    let source = r#"fn lower_join_reader() -> String {
+    let source = r##"fn lower_join_reader() -> String {
     "select v from x join observations o on o.id = x.id".to_owned()
 }
 
@@ -1146,17 +1184,27 @@ pub(in crate::query) fn scoped_reader() -> String {
     "SELECT value FROM observations".to_owned()
 }
 
+const RAW_READER: &str = r#"SELECT "v";
+FROM observations"#;
+
+const QUOTE_THEN_READER: (char, &str) = ('"', "SELECT value FROM observations");
+
+static STATIC_READER: &str = "SELECT value FROM observations";
+
 fn gated() -> String {
     format!("SELECT value FROM observations WHERE {}", crate::bests_view::gate_rows_sql())
 }
-"#;
+"##;
     let (readers, mut offenders) = gate_offenders(source, &[]).unwrap();
     offenders.sort();
-    assert_eq!(readers.len(), 6, "{readers:?}");
+    assert_eq!(readers.len(), 9, "{readers:?}");
     assert_eq!(
         offenders,
         vec![
             "MULTI_STATEMENT",
+            "QUOTE_THEN_READER",
+            "RAW_READER",
+            "STATIC_READER",
             "async_reader",
             "const_fn_reader",
             "lower_join_reader",
