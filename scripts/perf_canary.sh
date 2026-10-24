@@ -8,6 +8,11 @@
 # <RMLX_HOME>/bench/perf_canary.csv, and records one further run into runs.db
 # via `rmlx baseline --record --run-class gate`. Each model also gets an
 # explicit `k8vturbo3` arm, which appends its own CSV row after the `auto` row.
+# The warmup, the measured calls and the `k8vturbo3` arm are recorded too, as
+# `diagnostic`, labelled `canary sha=<sha> <phase>`: only the one further run
+# is the gate's. The one-token run that reads the codec name off the log is not
+# recorded: a one-token generation has no decode rate, and the recorder refuses
+# a record that carries none.
 #
 # The default mode measures ONE build. All of its measured runs for a model
 # happen together, which is fine for tracking one build over time but not for
@@ -98,21 +103,27 @@ source "${REPO_ROOT}/scripts/lib/identity.sh"
 rmlx_export_identity "${BINARY}"
 GIT_SHA="$(rmlx_git_sha "${REPO_ROOT}")"
 
-# Helper: run one baseline, parse decode_tps from stdout
-# Usage: run_once <model_path> [--kv-quant <tag>]
+# "unknown" is a fallback for the --label text, never provenance — a checkout
+# without .git must not pass --git-sha at all.
+git_sha_args=()
+if [[ "${GIT_SHA}" != unknown* ]]; then
+    git_sha_args=(--git-sha "${GIT_SHA}")
+fi
+
+# Helper: run one baseline, recorded as diagnostic, and parse decode_tps from stdout
+# Usage: run_once <phase> <model_path> [--kv-quant <tag>]
 run_once() {
-    local model_path="$1"
-    local kv_flag="${2:-}"
-    local kv_val="${3:-}"
-    local extra_args=()
-    if [[ -n "${kv_flag}" ]]; then
-        extra_args=("${kv_flag}" "${kv_val}")
-    fi
+    local phase="$1"
+    local model_path="$2"
+    local extra_args=("${@:3}")
     RMLX_HOME="${RMLX_HOME}" "${BINARY}" baseline \
         --model "${model_path}" \
         --prompt-tokens "${PROMPT_TOKENS}" \
         --max-tokens "${MAX_TOKENS}" \
         --max-ctx "${MAX_CTX}" \
+        --label "canary sha=${GIT_SHA} ${phase}" \
+        ${git_sha_args[@]+"${git_sha_args[@]}"} \
+        --record --run-class diagnostic \
         ${extra_args[@]+"${extra_args[@]}"} \
         2>/dev/null \
         | grep -o 'decode_tps=[0-9.]*' \
@@ -189,14 +200,14 @@ for entry in "${MODELS[@]}"; do
     # Warmup (discarded)
     for i in $(seq 1 ${WARMUP_RUNS}); do
         echo "  warmup ${i}/${WARMUP_RUNS}..." >&2
-        run_once "${model_path}" > /dev/null
+        run_once warmup "${model_path}" > /dev/null
     done
 
     # Measured runs
     tps_values=()
     for i in $(seq 1 ${MEASURED_RUNS}); do
         echo "  measured run ${i}/${MEASURED_RUNS}..." >&2
-        val="$(run_once "${model_path}" "" "")"
+        val="$(run_once measured "${model_path}")"
         if [[ -z "${val}" ]]; then
             echo "ERROR: failed to parse decode_tps for ${short_name} run ${i}" >&2
             exit 1
@@ -221,13 +232,6 @@ for entry in "${MODELS[@]}"; do
     # same protocol: prompt-tokens/max-tokens/max-ctx as the measured runs, kv_quant=auto).
     # This is the authoritative canary record; use `make canary-gate` to gate regressions.
     echo "  recording into runs.db..." >&2
-    # "unknown" is a fallback for the --label text above, never provenance —
-    # a checkout without .git must not pass --git-sha at all.
-    # (top-level loop body, not a function — `local` is not valid here.)
-    git_sha_args=()
-    if [[ "${GIT_SHA}" != unknown* ]]; then
-        git_sha_args=(--git-sha "${GIT_SHA}")
-    fi
     if RMLX_HOME="${RMLX_HOME}" "${BINARY}" baseline \
         --model "${model_path}" \
         --prompt-tokens "${PROMPT_TOKENS}" \
@@ -248,11 +252,11 @@ for entry in "${MODELS[@]}"; do
     # K8VTurbo3 informational column (1 warmup + 3 measured, explicit --kv-quant)
     # for every model; `auto` resolves to bf16.
     echo "  [k8vturbo3] warmup..." >&2
-    run_once "${model_path}" --kv-quant k8vturbo3 > /dev/null
+    run_once k8vturbo3-warmup "${model_path}" --kv-quant k8vturbo3 > /dev/null
     turbo3_values=()
     for i in $(seq 1 ${MEASURED_RUNS}); do
         echo "  [k8vturbo3] measured run ${i}/${MEASURED_RUNS}..." >&2
-        val="$(run_once "${model_path}" --kv-quant k8vturbo3)"
+        val="$(run_once k8vturbo3 "${model_path}" --kv-quant k8vturbo3)"
         if [[ -z "${val}" ]]; then
             echo "  WARN: k8vturbo3 run ${i} failed to parse decode_tps — skipping" >&2
             continue

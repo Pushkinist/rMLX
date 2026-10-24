@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Ingest `codec_inertness_probe.sh` residency cells into the rMLX metrics DB.
 
-The probe writes a CSV and never touches `runs.db` — a sweep is an experiment
-and the store is append-only. This is the separate, explicit step that promotes
-its cells into §8.5 RunRecords, one per (model, context, codec).
+The probe now records each of its runs itself, as `diagnostic`, and marks the
+row in its CSV's `recorded_run_class` column; such a row is skipped here, so no
+run's `kv_cache_bytes` is written twice. This ingests the rows of a sweep the
+probe did not record, into §8.5 RunRecords of class `diagnostic`, one per
+(model, context, codec): a probe sweep is an investigation.
 
 **Only `kv_cache_bytes` is recorded.** The probe's `decode_tps` / `ttft_ms` /
 `prefill_tps` columns are single unpaired runs on a shared host, where the same
@@ -85,6 +87,8 @@ def weight_quant_of(model: str) -> str:
 
 # Column the probe records its `--kv-boundary-layers` value in.
 KV_BOUNDARY_FIELD = "kv_boundary"
+# Column the probe sets on a row whose run it recorded itself.
+RECORDED_FIELD = "recorded_run_class"
 # Where `csv.DictReader` puts fields the header does not name. Checked, not
 # ignored: a non-empty bucket means the columns are shifted.
 EXTRA_FIELDS_KEY = "__unnamed_fields__"
@@ -198,7 +202,7 @@ def build_record(row: dict[str, str], args: argparse.Namespace, prompts_dir: Pat
             "runs on a shared host and are deliberately not recorded"
         ),
         "description": args.description,
-        "run_class": "gate",
+        "run_class": "diagnostic",
         "metrics": [{"name": "kv_cache_bytes", "value": float(row["kv_cache_bytes"])}],
     }
 
@@ -256,6 +260,13 @@ def main() -> int:
     # A failed cell emits an empty `kv_cache_bytes` and an empty digest — the
     # sha256 of nothing, which reads exactly like a real result. The exit code
     # is the column that tells the two apart, so it is the filter.
+    recorded = [r for r in rows if (r.get(RECORDED_FIELD) or "").strip()]
+    if recorded:
+        print(
+            f"skipping {len(recorded)} row(s) the probe already recorded in runs.db "
+            f"(`{RECORDED_FIELD}` is set); ingesting them would write each byte count twice"
+        )
+    rows = [r for r in rows if not (r.get(RECORDED_FIELD) or "").strip()]
     usable = [r for r in rows if r["exit_code"] == "0" and r["kv_cache_bytes"]]
     dropped = len(rows) - len(usable)
     if dropped:

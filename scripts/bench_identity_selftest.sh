@@ -283,7 +283,11 @@ bad=""
 /usr/bin/grep -q -- '--label canary sha=feedbee' "$CANARY_HOME/baseline_argv" ||
 	bad="$bad; the label does not carry the identity's sha"
 [ "$(csv_field "$CANARY_HOME" 4)" = stubq ] || bad="$bad; csv kv_quant=$(csv_field "$CANARY_HOME" 4) (want stubq)"
-verdict canary_identity_sha "the canary files the identity's commit and reads the codec from the probe's log" "${bad#; }"
+diag="$(/usr/bin/grep -c -- '--record --run-class diagnostic' "$CANARY_HOME/baseline_argv" || true)"
+gate="$(/usr/bin/grep -c -- '--record --run-class gate' "$CANARY_HOME/baseline_argv" || true)"
+[ "$diag" = 8 ] || bad="$bad; $diag diagnostic records (want 8: 1+3 auto, 1+3 k8vturbo3)"
+[ "$gate" = 1 ] || bad="$bad; $gate gate records (want 1)"
+verdict canary_identity_sha "the canary files the identity's commit, reads the codec from the probe's log, and records 8 diagnostic runs and 1 gate run" "${bad#; }"
 
 canary_case canary_same_second_log "" 20260903-000000-9.9.9.jsonl
 bad=""
