@@ -74,11 +74,12 @@ from typing import Any
 _SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPT_DIR.parent / "lib"))
 from recorder_check import require_run_class_recorder  # noqa: E402
+from rmlx_home import rmlx_home  # noqa: E402
 from snapshot_identity import split_model_dir  # noqa: E402
 RMLX_REPO_ROOT = Path(os.environ.get("RMLX_REPO_ROOT", str(_SCRIPT_DIR.parents[1])))
 # Runtime state lives under a single root (CLAUDE.md). `RMLX_HOME` wins; the
 # in-repo `.rmlx/` is the dev default. The recorder resolves the DB itself.
-RMLX_HOME = Path(os.environ.get("RMLX_HOME", str(RMLX_REPO_ROOT / ".rmlx")))
+RMLX_HOME = rmlx_home(RMLX_REPO_ROOT)
 _BUFFER_PENDING = RMLX_HOME / "metrics" / "buffer" / "pending"
 _BUFFER_FAILED = RMLX_HOME / "metrics" / "buffer" / "failed"
 

@@ -56,6 +56,7 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPT_DIR.parent / "lib"))
 from kv_boundary_default import kv_boundary_default  # noqa: E402
 from recorder_check import require_run_class_recorder  # noqa: E402
+from rmlx_home import rmlx_home  # noqa: E402
 from snapshot_identity import (  # noqa: E402
     UnlabelledSnapshot,
     snapshot_weight_quant,
@@ -64,7 +65,7 @@ from snapshot_identity import (  # noqa: E402
 RMLX_REPO_ROOT = Path(os.environ.get("RMLX_REPO_ROOT", str(_SCRIPT_DIR.parents[1])))
 # Runtime state lives under a single root (CLAUDE.md). `RMLX_HOME` wins; the
 # in-repo `.rmlx/` is the dev default.
-RMLX_HOME = Path(os.environ.get("RMLX_HOME", str(RMLX_REPO_ROOT / ".rmlx")))
+RMLX_HOME = rmlx_home(RMLX_REPO_ROOT)
 BUFFER_PENDING = RMLX_HOME / "metrics" / "buffer" / "pending"
 # Assembled here first, moved into `pending/` only for the moment the recorder
 # is invoked. Anything left sitting in `pending/` is, by contract, work the next
