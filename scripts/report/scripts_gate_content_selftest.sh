@@ -303,6 +303,7 @@ verdict name_work_tree_top_level 1 "the work tree's top level is a repository ro
 
 for spec in 'ROOT = Path(__file__).resolve().parents[2]|ROOT' 'ROOT = Path(__file__).resolve().parent.parent.parent|ROOT' \
     'REPO_ROOT = Path(__file__).resolve().parents[2]|' 'HERE = Path(__file__).resolve().parent|' \
+    'OTHER = Path(sys.argv[1]).resolve().parents[2]|' \
     'DOCS = Path(__file__).resolve().parents[2] / "docs"|' 'ROOT = Path(__file__).resolve().parents[1]|' \
     'ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))|ROOT'; do
     line=${spec%|*}
@@ -434,6 +435,16 @@ root=$(sg_fresh heredoc_dash_c_20)
 verdict heredoc_python_dash_c_at_the_limit 0 "a 20-line one" "$root" \
     --has "check-scripts: ok (5 files"
 
+root=$(sg_fresh heredoc_dash_c_quoted)
+{
+    sg_valid_sh ':'
+    printf '%s\n' 'python3 -c "'
+    /usr/bin/yes 'print(\"x\")' | head -n 21
+    printf '%s\n' '" arg'
+} | sg_put "$root" check/y.sh
+verdict heredoc_python_dash_c_escaped_quote 1 "a double-quoted -c string runs on past an escaped quote" "$root" \
+    --has "heredoc: check/y.sh:10: a Python body of 21 lines"
+
 root=$(sg_fresh heredoc_one_liner)
 { sg_valid_sh ':'; printf '%s\n' "python3 -c 'print(1)'" "python3 -c \"print(2)\""; } | sg_put "$root" check/y.sh
 verdict heredoc_one_line_dash_c 0 "one-line python3 -c strings" "$root" \
@@ -460,7 +471,11 @@ verdict heredoc_inside_another_heredoc 0 "Python in the body of a cat heredoc is
     --has "check-scripts: ok (5 files"
 
 root=$(sg_fresh heredoc_string)
-{ sg_valid_sh ':'; printf '%s\n' "echo \"python3 - <<'PY'\"" "echo done"; } | sg_put "$root" check/y.sh
+{
+    sg_valid_sh ':'
+    printf '%s\n' "echo \"python3 - <<'PY'\""
+    /usr/bin/yes ': after' | head -n 30
+} | sg_put "$root" check/y.sh
 verdict heredoc_opener_in_a_string 0 "an opener inside a string opens nothing" "$root" \
     --has "check-scripts: ok (5 files"
 
@@ -476,7 +491,7 @@ verdict heredoc_tab_terminator 0 "a <<- heredoc ends at its tab-indented termina
 root=$(sg_fresh heredoc_herestring)
 {
     sg_valid_sh ':'
-    printf '%s\n' "python3 - <<<'print(1)'"
+    printf '%s\n' "python3 -c 'pass' <<<word"
     /usr/bin/yes ': after' | head -n 30
 } | sg_put "$root" check/y.sh
 verdict heredoc_here_string 0 "a here-string opens no heredoc" "$root" \
@@ -636,6 +651,15 @@ sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
 EOF
 st_case lib_shadow_pin_stale 1 --what "and is stale once the function is gone" \
     --has "pin-stale: report/scripts_gate_pins.txt:4: lib-shadow check/y.sh: no longer violated" -- sg_gate "$root"
+
+root=$(sg_fresh libshadow_pin_other)
+sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
+helper() { :; }
+EOF
+sg_pins_file 'lib-shadow check/y.sh other_function' >"$root/$SG_PINS_REL"
+verdict lib_shadow_pin_names_another_function 1 "a pin for another function accepts nothing" "$root" \
+    --has "lib-shadow: check/y.sh:10: helper() is defined in lib/helper.sh" \
+    --has "pin-stale: report/scripts_gate_pins.txt:4: lib-shadow check/y.sh: function other_function is fixed or gone"
 
 # ---- binary-literal ------------------------------------------------------
 

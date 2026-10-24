@@ -226,10 +226,10 @@ def closing_quote(text: str, opening: int) -> int:
 def python_bodies(text: str) -> Iterator[tuple[int, int]]:
     """(line, length in lines) of every Python body in shell text: the lines
     between a `python` command's heredoc opener and its terminator, or the
-    lines of a `python -c` string. A heredoc of another command is skipped
-    whole, so a planted file that holds Python is not read as Python. Openers
-    are looked for in the text with its comments, heredoc bodies and string
-    bodies blanked, so one inside a string is not an opener."""
+    lines of a `python -c` string. Openers are looked for in the text with its
+    comments, heredoc bodies and string bodies blanked, so Python held in the
+    body of another command's heredoc, or an opener inside a string, is not
+    read as a Python body."""
     lines = text.split("\n")
     blanked = clean_shell(text, True)
     starts = [0]
@@ -240,15 +240,15 @@ def python_bodies(text: str) -> Iterator[tuple[int, int]]:
         line = blanked[i]
         opener = next((m for m in HEREDOC_RE.finditer(line) if line[m.start() - 1 : m.start()] != "<"), None)
         if opener:
-            end = i + 1
-            while end < len(lines):
-                body = lines[end].lstrip("\t") if opener.group(1) else lines[end]
-                if body.rstrip() == opener.group(3):
-                    break
-                end += 1
             if PYTHON_WORD_RE.search(line):
+                end = i + 1
+                while end < len(lines):
+                    body = lines[end].lstrip("\t") if opener.group(1) else lines[end]
+                    if body.rstrip() == opener.group(3):
+                        break
+                    end += 1
                 yield i + 1, end - i - 1
-            i = end + 1
+            i += 1
             continue
         command = PYTHON_C_RE.search(line)
         if command:
