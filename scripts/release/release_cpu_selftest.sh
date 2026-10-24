@@ -160,6 +160,40 @@ printf '{"rustc": ' >"$root/target/release/.fingerprint/rmlx-cli-$HASH_A/bin-rml
 st_case record_garbled_unavailable 2 --what "an unreadable record is unknown" \
     --has "bin-rmlx.json: not JSON: Expecting value" -- release_check "$root"
 
+root=$(fresh record_nonstring_flags "$BASELINE_FLAGS")
+printf '{"rustflags": [1]}\n' >"$root/target/release/.fingerprint/rmlx-cli-$HASH_A/bin-rmlx.json"
+st_case record_nonstring_flags_unavailable 2 --what "a record whose rustflags hold a non-string is unknown, not a crash" \
+    --has "no rustflags list" -- release_check "$root"
+
+root=$(fresh record_bare_dash_c '["-C", "target-cpu=apple-m1", "-C"]')
+st_case record_bare_dash_c_unavailable 2 --what "a flag list ending in a bare -C is refused, not read as an empty option" \
+    --has "flag list ends in a bare -C" -- release_check "$root"
+
+root=$(fresh config_nonstring "$BASELINE_FLAGS")
+printf '[build]\nrustflags = ["-C", 5]\n' >"$root/.cargo/config.toml"
+st_case config_nonstring_unavailable 2 --what "a non-string entry in config.toml's rustflags is refused" \
+    --has "rustflags holds a non-string entry" -- release_check "$root"
+
+root=$(fresh config_bad_json "$BASELINE_FLAGS")
+printf '[build]\nrustflags = ["-C", target-cpu=native]\n' >"$root/.cargo/config.toml"
+st_case config_bad_json_unavailable 2 --what "a rustflags array that is not JSON is refused" \
+    --has "cannot read the rustflags array" -- release_check "$root"
+
+root=$(fresh dir_beside "$BASELINE_FLAGS")
+mkdir -p "$root/target/release/deps/rmlx-$HASH_B"
+st_case unit_directory_not_a_binary 0 --what "a deps/rmlx-<hash> directory is not a linked unit" \
+    --has "release-cpu: ok" -- release_check "$root"
+
+root=$(fresh short_name_beside "$BASELINE_FLAGS")
+printf 'binary-a' >"$root/target/release/deps/rmlx-abc"
+st_case short_hash_not_a_unit 0 --what "a deps/rmlx-<name> that is not a 16-digit hash is not a linked unit" \
+    --has "release-cpu: ok" -- release_check "$root"
+
+root=$(fresh not_a_tarball "$BASELINE_FLAGS")
+printf 'not a tarball' >"$root/dist/rmlx.tar.gz"
+st_case unreadable_tarball_unavailable 2 --what "a file that is not a tar.gz is unknown, not a crash" \
+    --has "release-cpu: unavailable:" -- release_check "$root"
+
 root=$(fresh no_config "$BASELINE_FLAGS")
 rm -f "$root/.cargo/config.toml"
 st_case missing_config_unavailable 2 --what "no config.toml to hold the other flags to" \
