@@ -106,6 +106,8 @@ impl GatedDeltaNet {
         // z: [B, S, value_dim]
         let z = input.forward(&self.in_proj_z, device)?;
         // b, a: [B, S, num_v_heads]
+        // f32-on-decode-ok: the delta-net log gate needs these projections in f32; a bf16 cast of
+        // the two weights raises its error to 1.46-2.44x the bf16 floor (docs/WEIGHT_QUANTS.md §10.5).
         let b_proj = input.forward(&self.in_proj_b, device)?;
         let a_proj = input.forward(&self.in_proj_a, device)?;
 
