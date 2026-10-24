@@ -873,7 +873,7 @@ fn migrate_records_md(
 /// Infer weight quantization from model name suffix (§5.2 + §7.2 defaults).
 ///
 /// Suffix-matching order matters — check longer/more-specific suffixes first.
-pub fn infer_weight_quant_from_model(model: &str) -> &'static str {
+pub(crate) fn infer_weight_quant_from_model(model: &str) -> &'static str {
     let lower = model.to_lowercase();
     // Microscaling FP families first (most specific).
     if lower.contains("mxfp8") {
