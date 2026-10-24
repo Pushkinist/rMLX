@@ -253,6 +253,75 @@ used="$(sort -u "$WORK/llama_recorder.log" | tr '\n' ' ')"
 [ "$used" = "checkout " ] || bad="the recorder that ran: ${used:-none} (want the checkout's build only); $(tail -2 "$WORK/llama_record.out" | tr '\n' ' ')"
 verdict llama_bench_records_through_the_checkout "an rmlx on PATH is not chosen over the checkout's build" "$bad"
 
+# ── bench_codec_cell.sh, bench_cache_types.sh, codec_smoke_runner.sh ─────────
+#
+# Each records its runs as diagnostic; the stub logs the argv it is handed.
+ARGV_LOG="$WORK/codec_cell.argv"
+: >"$ARGV_LOG"
+set +e
+ARGV_LOG="$ARGV_LOG" RMLX_BINARY="$PROBE_BIN" RMLX_HOME="$WORK/home" \
+	bash "$REPO_ROOT/scripts/bench_codec_cell.sh" --kv-quant k8v8 --model "$MODEL" \
+	>"$WORK/codec_cell.out" 2>&1
+set -e
+bad=""
+runs="$(grep -c -- '--record --run-class diagnostic --label codec_cell:' "$ARGV_LOG" || true)"
+[ "$runs" = 4 ] || bad="$runs of 4 runs asked to record as diagnostic: $(head -1 "$ARGV_LOG")"
+verdict codec_cell_records_diagnostic "the warmup and the three measured runs record as diagnostic" "$bad"
+
+# The cache-type driver runs `target/release/rmlx` under its own root, so it
+# uses the fake root above; a smoke probe that exits 78 (an unsupported combo)
+# skips its cell, so no cell driver runs.
+mkdir -p "$FAKE/target/release"
+cat >"$FAKE/target/release/rmlx" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$ARGV_LOG"
+exit 78
+STUB
+chmod +x "$FAKE/target/release/rmlx"
+ARGV_LOG="$WORK/cache_types.argv"
+: >"$ARGV_LOG"
+set +e
+ARGV_LOG="$ARGV_LOG" RMLX_HOME="$WORK/home" \
+	bash "$FAKE/scripts/bench_cache_types.sh" "$MODEL" Stub bf16 >"$WORK/cache_types.out" 2>&1
+set -e
+bad=""
+probes="$(wc -l <"$ARGV_LOG" | tr -d ' ')"
+recorded="$(grep -c -- '--record --run-class diagnostic --label ctype-smoke-' "$ARGV_LOG" || true)"
+[ "$probes" -gt 0 ] && [ "$recorded" = "$probes" ] ||
+	bad="$recorded of $probes smoke probes asked to record as diagnostic: $(head -1 "$ARGV_LOG")"
+verdict cache_types_smoke_records_diagnostic "every smoke probe records as diagnostic" "$bad"
+
+# The codec smoke runner reaches `rmlx baseline` through `cargo run`; a stub
+# `cargo` logs what it was handed and builds nothing.
+SMOKE_ROOT="$WORK/smoke_models"
+SMOKE_SLUG="mlx-community__gemma-4-e4b-it-mxfp8"
+mkdir -p "$SMOKE_ROOT/$SMOKE_SLUG" "$WORK/cargobin"
+for f in config.json tokenizer.json model.safetensors; do : >"$SMOKE_ROOT/$SMOKE_SLUG/$f"; done
+printf '#!/bin/sh\n[ "$1" = run ] && printf "%%s\\n" "$*" >>"$ARGV_LOG"\nexit 0\n' >"$WORK/cargobin/cargo"
+chmod +x "$WORK/cargobin/cargo"
+cat >"$WORK/smoke.toml" <<'TOML'
+[[entries]]
+codec_name = "k8v4"
+model = "gemma4-e4b"
+context_length = 32768
+expected_retrieval_pct = 1.0
+smoke_probe_prompts = ["coherence"]
+skip_reason = ""
+cli_args = "--kv-quant k8v4"
+niah_filter = "niah_k8v4"
+TOML
+ARGV_LOG="$WORK/smoke.argv"
+: >"$ARGV_LOG"
+set +e
+PATH="$WORK/cargobin:$PATH" ARGV_LOG="$ARGV_LOG" RMLX_O_MODELS_ROOT="$SMOKE_ROOT" RMLX_HOME="$WORK/home" \
+	bash "$REPO_ROOT/scripts/release_e2e/stage6_perf/codec_smoke_runner.sh" \
+	--manifest "$WORK/smoke.toml" --out "$WORK/smoke.json" >"$WORK/smoke.out" 2>&1
+set -e
+bad=""
+grep -q -- 'baseline .*--record --run-class diagnostic --label codec_smoke:k8v4:coherence' "$ARGV_LOG" ||
+	bad="baseline argv: $(grep baseline "$ARGV_LOG" | head -1); $(tail -2 "$WORK/smoke.out" | tr '\n' ' ')"
+verdict codec_smoke_records_diagnostic "each smoke prompt's baseline records as diagnostic" "$bad"
+
 # ── snapshot_identity.py against the shared label table ──────────────────────
 #
 # The Rust producer, `ModelConfig::weight_quant_label`, is held to the same
