@@ -158,12 +158,13 @@ fn copied_columns(
     carries_class: bool,
     source: &Path,
 ) -> Result<Vec<String>> {
-    let set_here: &[&str] = if carries_class {
-        &["id", "prompt_id"]
-    } else {
-        &SET_BY_IMPORT
-    };
-    let needed = shared_columns(dst, src, "observations", set_here, source)?;
+    // A source that carries the class must have the column too, so it is
+    // checked like any other column there and set by the import otherwise.
+    let set_here: Vec<&str> = SET_BY_IMPORT
+        .into_iter()
+        .filter(|&c| !(carries_class && c == "run_class"))
+        .collect();
+    let needed = shared_columns(dst, src, "observations", &set_here, source)?;
     let mut ordered: Vec<String> = KEY_COLUMNS.iter().map(|&c| c.to_owned()).collect();
     ordered.extend(
         needed
