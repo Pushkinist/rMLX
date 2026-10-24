@@ -42,6 +42,8 @@ verdict() { # verdict <name> <what-it-proves> <bad-reason-or-empty>
 
 MODEL="$WORK/models/host__m"
 mkdir -p "$MODEL"
+# float16 on purpose: a label read off the name `m` could only guess bf16.
+printf '{"torch_dtype": "float16"}\n' >"$MODEL/config.json"
 
 # make_rmlx <path> — a stub `rmlx` that logs each `baseline` argv to
 # $ARGV_LOG, answers `claim run -- <cmd>` by running the command, prints the
@@ -166,7 +168,7 @@ MIXED="$WORK/inertness_mixed.csv"
 	printf '2026-10-01T00:00:00Z,host__m,4096,4200,8192,100,k8v8,0,1000,abc,0,1,10,1,sha,"",\n'
 } >"$MIXED"
 set +e
-out="$(RMLX_HOME="$WORK/home" python3 "$INGEST" --dry-run "$MIXED" \
+out="$(RMLX_HOME="$WORK/home" python3 "$INGEST" --dry-run "$MIXED" --models-root "$WORK/models" \
 	--backend-version 9.9.9 --build-profile release-perf 2>&1)"
 status=$?
 set -e
@@ -176,13 +178,14 @@ records="$(grep -c '"schema_version"' <<<"$out" || true)"
 [ "$records" = 1 ] || bad="${bad:+$bad; }$records record(s), want 1 (the row the probe did not record)"
 grep -q '"kv_quant": "k8v8"' <<<"$out" || bad="${bad:+$bad; }the unrecorded k8v8 row is not the one written"
 grep -q '"run_class": "diagnostic"' <<<"$out" || bad="${bad:+$bad; }the record is not diagnostic"
+grep -q '"weight_quant": "fp16"' <<<"$out" || bad="${bad:+$bad; }the weight label is not the one the snapshot's config describes"
 verdict ingest_skips_recorded_rows "a row the probe recorded is skipped; the other is written once" "$bad"
 
 OLD_RECORDER="$WORK/rmlx_old"
 printf '#!/usr/bin/env bash\necho "      --file <FILE>"\n' >"$OLD_RECORDER"
 chmod +x "$OLD_RECORDER"
 set +e
-out="$(RMLX_HOME="$WORK/home" python3 "$INGEST" --record "$MIXED" --rmlx-bin "$OLD_RECORDER" \
+out="$(RMLX_HOME="$WORK/home" python3 "$INGEST" --record "$MIXED" --rmlx-bin "$OLD_RECORDER" --models-root "$WORK/models" \
 	--backend-version 9.9.9 --build-profile release-perf 2>&1)"
 status=$?
 set -e
