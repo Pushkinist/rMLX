@@ -807,7 +807,7 @@ change to what `bests` publishes, such as a `METRICS_SCHEMA.md` §4.1 bounds cha
     since each opens the DB at start to record its events. A scratch
     `RMLX_HOME`, or `--db` for `rmlx metrics`, points it at another DB.
     `make canary-gate` under `git bisect` builds the old commit's binary with
-    that commit's own `Makefile`, so a bisect across migration 9 runs the
-    gate's `metrics deltas --since-sha <SHA> --threshold-pct 3 --exit-code
-    true` with a binary built at or after migration 9, copied outside the
-    checkout.
+    that commit's own `Makefile`. When bisecting across migration 9, run
+    `metrics deltas --since-sha <SHA> --threshold-pct 3 --exit-code true`
+    with a binary built at or after migration 9, copied outside the
+    checkout, and run the bisected build under a scratch `RMLX_HOME`.
