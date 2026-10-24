@@ -2688,7 +2688,7 @@ fn run(cli: Cli, run_id: &str) -> Result<i32> {
                 (false, None) => None,
                 // clap's `requires` on both flags rejects either one alone first.
                 (true, None) | (false, Some(_)) => {
-                    anyhow::bail!("--record and --run-class are given together")
+                    anyhow::bail!("--record and --run-class must be given together")
                 }
             };
 
