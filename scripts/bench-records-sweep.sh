@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# 5-model x 4-KV-quant regression sweep for BENCHMARK_CHAMPIONS, one cold and one warm run per cell.
+# 5-model x 4-KV-quant regression sweep, one cold and one warm run per cell.
 #
-# Methodology (BENCHMARK_CHAMPIONS.md protocol):
+# Methodology:
 #   Prompt   : Cross-Backend-Bench/prompts/longctx_4k.json (4096-token)
 #   Server   : --max-ctx 8192, port 62265
 #   Decode   : max_tokens=32

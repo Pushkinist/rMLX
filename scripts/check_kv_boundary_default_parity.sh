@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# check_kv_boundary_default_parity.sh — CI gate: every surface that names the
-# default KV boundary-layer counts names the pair the engine actually applies.
+# CI gate: every surface naming the default KV boundary-layer counts agrees with the engine's pair.
 #
 # WHY
 #   `rmlx_core::kv_boundary::DEFAULT_BOUNDARY_{HEAD,TAIL}_N` is the one

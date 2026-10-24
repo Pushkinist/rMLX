@@ -6,18 +6,18 @@
 # WHY BOTH
 #   The producer reports a measured figure (exit 0) and an inability to measure
 #   (exit 2) on different exits on purpose. A structural metric that silently
-#   printed `0` for a tree it could not read would report the restructure as
-#   finished on the day the scan broke. A case that asserted only "non-zero"
-#   would pass against a producer that had stopped finding any site at all.
+#   printed `0` for a tree it could not read would report a change to the
+#   update path as finished on the day the scan broke. A case that asserted
+#   only "non-zero" would pass against a producer that had stopped finding any
+#   site at all.
 #
 #   The fixtures are their own trees, and each case states the number its own
 #   planted source implies. The last case pins the real tree's figures
 #   exactly, so a change that moves one re-pins it in the same change.
 #
-# EXIT CODES
-#   0  every case produced the expected exit code and output
-#   1  a case did not
-#   2  the fixtures themselves could not be built
+# Usage:  bash scripts/report/kv_census_selftest.sh
+# Exit:   0 every case produced the expected exit code and output; 1 a case
+#         did not; 2 the fixtures themselves could not be built
 
 set -uo pipefail
 
@@ -1192,7 +1192,7 @@ check "a root that is not a directory is a refusal" "${WORK}/none" 2 "unavailabl
 T="${WORK}/default_root"
 build_tree "${T}"
 mkdir -p "${T}/scripts/report"
-for f in debt_report.py kv_census.py rust_scan.py; do
+for f in debt_report.py kv_census.py rust_scan.py scripts_gate.py; do
     cp "${REPO_ROOT}/scripts/report/${f}" "${T}/scripts/report/${f}"
 done
 default_out="$(cd "${WORK}" && python3 "${T}/scripts/report/debt_report.py" --kv-census match-sites --threshold 2 2>&1)"

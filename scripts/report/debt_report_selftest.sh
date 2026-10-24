@@ -2,6 +2,8 @@
 # Recall test for debt_report.py: fixture trees, asserting what the printed text holds.
 #
 # Recall test for: report/debt_report.py (the report and --matched-lines)
+# Usage:  bash scripts/report/debt_report_selftest.sh
+# Exit:   0 every case held; 1 a case did not
 #
 # WHY
 #   The report always exits 0 (advisory), so its
@@ -357,7 +359,7 @@ check "unresolved_driver_named" \
 
 rm -rf "$MOVED_WORK"
 
-# ---- --matched-lines: one producer for the campaign's duplication figure --
+# ---- --matched-lines: one producer for the duplication figure -------------
 
 DRIVERS_ML=$(python3 "$TOOL" --root "$STATIC_WORK/base" --matched-lines drivers)
 
@@ -1558,7 +1560,7 @@ check "file_sizes_default_total" \
 DEF_TREE="$MODES_WORK/default_root"
 cp -R "$MODES_BASE" "$DEF_TREE"
 mkdir -p "$DEF_TREE/scripts/report"
-for f in debt_report.py kv_census.py rust_scan.py; do
+for f in debt_report.py kv_census.py rust_scan.py scripts_gate.py; do
     cp "$REPO_ROOT/scripts/report/$f" "$DEF_TREE/scripts/report/$f"
 done
 DEF_REAL="$(cd "$DEF_TREE" && pwd -P)"

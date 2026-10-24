@@ -155,6 +155,11 @@ jobs:
         run: make check-doc-size
       - name: the doc-size gate still catches what it is for
         run: make check-doc-size-selftest
+      # `make check-scripts` itself needs a base to tell which files are new, and a
+      # shallow checkout has none, so only its recall test runs here. Pure bash +
+      # python3 over throwaway trees — no toolchain, no GPU, no model.
+      - name: the scripts gate still catches what it is for
+        run: make check-scripts-selftest
 
   msl:
     name: msl kernels (compile + format)

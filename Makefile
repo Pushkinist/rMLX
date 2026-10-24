@@ -113,6 +113,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         e2e \
         file-size-report debt-report debt-report-selftest \
         check-doc-size check-doc-size-selftest \
+        check-scripts scripts-index check-scripts-selftest \
         kv-update-census kv-update-census-selftest \
         check-no-inline-tests check-no-scalar-f32-leak \
         check-doc-source-citations \
@@ -486,6 +487,15 @@ check-doc-size: ## CI gate: fail naming every docs/**/*.md over 40 KiB or carryi
 check-doc-size-selftest: ## CI gate: recall test for check-doc-size over throwaway git trees, each case asserting its exit code and reason
 	@bash scripts/report/doc_size_selftest.sh
 
+check-scripts: ## CI gate: fail on a violation of the scripts/ rules or a scripts/INDEX.md that differs from the headers
+	@python3 scripts/report/debt_report.py --scripts
+
+scripts-index: ## regenerate scripts/INDEX.md from the scripts' headers, then check the other rules
+	@python3 scripts/report/debt_report.py --scripts --write-index
+
+check-scripts-selftest: ## CI gate: recall test for check-scripts over throwaway git trees, each case asserting its exit code and rule:file:line
+	@bash scripts/report/scripts_gate_selftest.sh
+
 kv-update-census: ## advisory: the KV structural figures — variant shapes, match sites a new codec must touch, subset sites (matches!, if-let, catch-all) and table sites, per-variant update bodies (non-failing)
 	@python3 scripts/report/debt_report.py --kv-census all
 
@@ -706,6 +716,8 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/report/debt_report_selftest.sh
 	@bash scripts/report/doc_size_selftest.sh
 	@python3 scripts/report/debt_report.py --check-doc-size
+	@python3 scripts/report/debt_report.py --scripts
+	@bash scripts/report/scripts_gate_selftest.sh
 	@bash scripts/release/release_cpu_selftest.sh
 	@bash scripts/report/kv_census_selftest.sh
 	@bash scripts/check_no_inline_tests.sh

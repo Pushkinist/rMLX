@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Generate Lloyd-Max optimal N(0,1) centroids for TurboQuant codebook.
 
-2026-05-11: Replaces the prior N(0,1) quantile centroids with
-true Lloyd-Max MSE-optimal centroids for the standard normal distribution.
+The centroids are the Lloyd-Max MSE-optimal ones for the standard normal
+distribution, not its quantile centroids.
 
 Source algorithm: turboquant_plus/turboquant/codebook.py::_lloyds_gaussian
 with sigma=1.0, n_iter=100.

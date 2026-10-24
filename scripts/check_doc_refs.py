@@ -78,8 +78,8 @@ Every run prints its base.
 `CHANGELOG.md` is released history and is never edited for a doc cut. Its
 references are scanned and a broken one is printed, but it never fails.
 
-A file named `scripts/<name>_selftest.sh` or `scripts/<name>_fixtures.sh`
-whose first ten lines carry a comment line `doc-refs: fixture` is not
+A file named `scripts/<name>_selftest.sh` or `scripts/<name>_fixtures.sh`, at
+any depth below `scripts/`, whose first ten lines carry a comment line `doc-refs: fixture` is not
 scanned: its doc paths belong to a synthetic tree it builds. The marker counts
 nowhere else. With --base, a file that existed at REF and gains the marker
 fails. Every run names the files it skipped.

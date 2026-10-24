@@ -7,17 +7,20 @@ Usage:  debt_report.py [--root DIR] [--since REF]
         debt_report.py --file-sizes [N]
         debt_report.py --kv-census {variants,match-sites,update-bodies,refs,all}
                        [--threshold N] [--file PATH] [--include-tests]
+        debt_report.py --scripts [--base REF] [--write-index]
 Exit:   0 a report, a figure or a clean gate; 1 the doc-size gate failed,
-        ``--matched-lines`` has no population to measure, ``--root`` of
-        ``--matched-lines`` is not a directory, or ``--kv-census`` refused a
-        codec descriptor or a storage view; 2 the tree cannot be measured, or
-        the flags contradict each other. The report and ``--file-sizes`` exit
-        0 whatever happens.
+        ``--scripts`` found a violation, ``--matched-lines`` has no population
+        to measure, ``--root`` of ``--matched-lines`` is not a directory, or
+        ``--kv-census`` refused a codec descriptor or a storage view; 2 the
+        tree cannot be measured (``--scripts``: not a git work tree), or the
+        flags contradict each other. The report and ``--file-sizes`` exit 0
+        whatever happens.
 LOC-exempt: the report and its modes share one fn scan and one entry
 
 The default mode is the report. ``--matched-lines``, ``--check-doc-size``,
-``--file-sizes`` and ``--kv-census`` are the other modes, one per run.
-``--kv-census`` runs ``kv_census.py``, a module of this tool.
+``--file-sizes``, ``--kv-census`` and ``--scripts`` are the other modes, one
+per run. ``--kv-census`` runs ``kv_census.py`` and ``--scripts`` runs
+``scripts_gate.py``, modules of this tool.
 
 Report: four sections, in order: sibling-file/fn similarity ("twins"), debt
 counters (`#[allow(` sites, debt-marker comments, `check-*` Make targets and
@@ -92,6 +95,12 @@ be measured. No doc exempts itself: the marker counts nowhere.
 ``--file-sizes [N]`` prints the non-test Rust source files above N lines
 (default 1000), largest first, and the workspace total.
 
+``--scripts`` is the fifth mode, a gate over ``scripts/``: it fails on a
+violation of the rules in ``scripts_gate.py``, or when the generated
+``scripts/INDEX.md`` differs from the headers. ``--write-index`` rewrites
+that file first and still runs every other rule. ``--base REF`` (default: the
+merge-base with ``origin/main``) decides which files count as new.
+
 The report and ``--file-sizes`` are advisory: they exit 0 whatever happens. A
 ``--root`` that is not a directory, or any error while scanning, prints
 ``unavailable (...)`` instead — in its section for the round-loop-driver scan,
@@ -112,6 +121,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import kv_census
+import scripts_gate
 from kv_census import UPDATE_DIR, UPDATE_FN_PATTERN, UPDATE_GLOB
 from rust_scan import FnInfo, extract_fns, glob_source_files, is_test_path, scan_after_name
 
@@ -1001,6 +1011,23 @@ def main(argv: list[str] | None = None) -> int:
         help="print the KV structural figures of one mode, or of three with 'all'; "
         "exit 2 when the tree cannot be measured",
     )
+    modes.add_argument(
+        "--scripts",
+        action="store_true",
+        help="check the rules for scripts/ and the generated scripts/INDEX.md "
+        "(exit 1 on a violation, 2 when the tree cannot be read)",
+    )
+    parser.add_argument(
+        "--base",
+        default=None,
+        help="with --scripts: the ref that decides which files are new "
+        "(default: the merge-base with origin/main)",
+    )
+    parser.add_argument(
+        "--write-index",
+        action="store_true",
+        help="with --scripts: rewrite scripts/INDEX.md from the headers first",
+    )
     parser.add_argument(
         "--threshold",
         type=int,
@@ -1020,8 +1047,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not args.kv_census and (args.threshold is not None or args.file or args.include_tests):
         parser.error("--threshold, --file and --include-tests need --kv-census")
+    if not args.scripts and (args.base is not None or args.write_index):
+        parser.error("--base and --write-index need --scripts")
     report_mode = not (
-        args.matched_lines or args.check_doc_size or args.kv_census or args.file_sizes is not None
+        args.matched_lines
+        or args.check_doc_size
+        or args.kv_census
+        or args.scripts
+        or args.file_sizes is not None
     )
     if args.since is not None and not report_mode:
         parser.error("--since needs the report")
@@ -1038,6 +1071,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.check_doc_size:
             print(f"debt-report: {reason}", file=sys.stderr)
             return 2
+        if args.scripts:
+            print(f"check-scripts: unavailable ({reason})", file=sys.stderr)
+            return 2
         if args.matched_lines:
             print(f"debt-report: {reason}", file=sys.stderr)
             return 1
@@ -1046,6 +1082,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.check_doc_size:
         return check_doc_size(root)
+
+    if args.scripts:
+        return scripts_gate.run(root.resolve(), args.base, args.write_index)
 
     if args.matched_lines:
         try:

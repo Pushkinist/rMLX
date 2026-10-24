@@ -4,9 +4,10 @@
 # Sourced, not executed.
 #
 # WHY ONE PRODUCER
-#   A gate that reads Rust source needs the same two answers everywhere: what on
-#   this line is code rather than a comment, and what is code rather than the
-#   contents of a string literal. A second copy of either drifts, and the way it
+#   A gate that reads Rust source needs the same answers everywhere: what on
+#   this line is code rather than a comment, what is code rather than the
+#   contents of a string literal, and whether a signature line ends its
+#   declaration. A second copy of any of the three drifts, and the way it
 #   drifts is silent — a needle that matches a commented-out line reports a call
 #   the code no longer makes, and one that matches inside a literal reports a
 #   construction that is only being printed.
@@ -36,12 +37,13 @@
 #                        both gates refuse entries with no forwarded loop to
 #                        enter.
 #
-#   THE BOUNDARY. Both readers track the `"` and the backslash escape and
-#   nothing else, so a character literal holding a quote (`'\"'`) and a raw
-#   string (`r#"..."#`, whose inner quotes end nothing) are both mis-read — the
-#   raw string fails open, leaving the rest of the line unblanked. Neither
-#   occurs in the sources these gates scan today. A gate that starts scanning a
-#   file with either needs a real lexer, not a wider regex here.
+#   THE BOUNDARY. `decomment` and `blank_strings` track the `"` and the
+#   backslash escape and nothing else, so a character literal holding a quote
+#   (`'\"'`) and a raw string (`r#"..."#`, whose inner quotes end nothing) are
+#   both mis-read — the raw string fails open, leaving the rest of the line
+#   unblanked. Neither occurs in the sources these gates scan today. A gate
+#   that starts scanning a file with either needs a real lexer, not a wider
+#   regex here.
 #
 #   Use `blank_strings` where a needle must not match text a program merely
 #   prints. Do NOT use it where the needle IS a literal: `check_spec_charge.sh`

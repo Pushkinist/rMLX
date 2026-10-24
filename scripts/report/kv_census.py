@@ -2,11 +2,12 @@
 
 Module of: report/debt_report.py
 
-Four modes, each printing one figure the restructure is judged on. They run
-as `debt_report.py --kv-census MODE`, and `all` runs the first three:
+Four modes, each printing one figure a change to the KV update path is judged
+on. They run as `debt_report.py --kv-census MODE`, and `all` runs the first
+three:
 
 * `variants` — every `KvStorage` variant with its field shape, and the census
-  of how many carry the store-slot shape the restructure writes one body for.
+  of how many carry the store-slot shape one update body can serve.
 * `match-sites` — every `match` over a codec enum that enumerates the codec
   surface, per file, and the count. This is the "match sites a new codec must
   touch" figure. The codec enums are `KvStorage`, `KvQuant` and every enum a
@@ -39,8 +40,7 @@ as `debt_report.py --kv-census MODE`, and `all` runs the first three:
 * `refs` — `KvStorage::` / `KvQuant::` variant references in one file.
 
 The figures are derived from the tree on every run. None of them is a hand
-list, so one command reads the tree before the restructure and the tree after
-it.
+list, so one command reads the tree before a change and the tree after it.
 
 Every mode exits 2 and prints `unavailable: <reason>` when it cannot measure —
 a missing directory, an enum it cannot find, a source shape it cannot read

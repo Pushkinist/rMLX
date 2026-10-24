@@ -8,8 +8,9 @@
 # Each case builds a throwaway git work tree, runs the gate against it and
 # asserts the literal exit code and, for every failure, the line naming why.
 #
-# Exit 0 = every case held. Exit 1 = at least one did not. Exit 2 = a scan root
-# could not be built.
+# Usage:  bash scripts/report/doc_size_selftest.sh
+# Exit:   0 every case held; 1 at least one did not; 2 a scan root could not be
+#         built
 
 set -uo pipefail
 
@@ -173,7 +174,7 @@ st_case missing_root_unmeasurable 2 --what "a root that does not exist is exit 2
 # under a fixture tree's scripts/report/.
 root=$(fresh default_root)
 mkdir -p "$root/scripts/report"
-for f in debt_report.py kv_census.py rust_scan.py; do
+for f in debt_report.py kv_census.py rust_scan.py scripts_gate.py; do
     cp "$REPO_ROOT/scripts/report/$f" "$root/scripts/report/$f"
 done
 st_case default_root_is_the_tools_tree 0 --what "with no --root the gate measures the tree the tool sits in" \
