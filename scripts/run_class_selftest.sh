@@ -558,7 +558,7 @@ from snapshot_identity import weight_quant
 table = json.load(open(f"{root}/crates/rmlx-loader/tests/fixtures/weight_quant_labels.json"))
 wrong = [f"{c['name']}: {weight_quant(c['config'])!r} != {c['label']!r}"
          for c in table if weight_quant(c["config"]) != c["label"]]
-print("; ".join(wrong) if len(table) >= 15 else f"the table lost cases: {len(table)}")
+print("; ".join(wrong) if len(table) >= 17 else f"the table lost cases: {len(table)}")
 LABELS
 )"
 verdict python_label_matches_the_shared_table "snapshot_identity.py labels every config in the shared table" "$bad"

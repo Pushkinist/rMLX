@@ -796,7 +796,7 @@ fn every_local_snapshot_dispatches_on_the_class_its_config_names() {
 fn weight_quant_label_matches_the_shared_fixture_table() {
     let table: Vec<serde_json::Value> =
         serde_json::from_str(include_str!("../tests/fixtures/weight_quant_labels.json")).unwrap();
-    assert!(table.len() >= 15, "the table lost cases: {}", table.len());
+    assert!(table.len() >= 17, "the table lost cases: {}", table.len());
     for case in &table {
         let cfg: ModelConfig = serde_json::from_value(case["config"].clone()).unwrap();
         let want = case["label"].as_str().map(str::to_owned);
