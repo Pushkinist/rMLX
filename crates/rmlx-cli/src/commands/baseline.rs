@@ -1123,6 +1123,10 @@ fn build_run_record(
     Ok(record)
 }
 
+/// The message of the log event naming a record that did not land, after the
+/// `{what}: ` prefix. `scripts/mst_capture.sh` reads the event by it.
+pub(crate) const RECORD_DID_NOT_LAND: &str = "record did not land";
+
 /// Record the §8.5 `record` that [`write_buffer_record`] left at `buffer` into
 /// the DB at `db_path`, so the row is visible to `bests` right away.
 ///
@@ -1167,7 +1171,7 @@ pub(crate) fn ingest_buffer_record(
                 error = %e,
                 buffer = %buffer.display(),
                 db = %db_path.display(),
-                "{what}: record did not land"
+                "{what}: {RECORD_DID_NOT_LAND}"
             );
             let message = format!(
                 "{what}: measured, but the record did not reach {}: {e:#}; it is kept at {} for \
