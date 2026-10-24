@@ -18,9 +18,10 @@ rows reference, into the DB `--db` names. Use it to keep the rows a scratch
   column, needs `--run-class`, and every row takes it. A source from version 9
   up to this binary's last migration keeps each row's own class, and
   `--run-class` is refused. Any other version is refused, naming it.
-- The columns copied are the target's own `observations` columns, read from
-  the target at run time. A source missing one of them is refused, naming
-  the column; `run_class` may be missing only from a version 8 source.
+- The columns copied are the target's own `observations` and `prompts`
+  columns, read from the target at run time. A source missing one of them is
+  refused, naming the column; `run_class` may be missing only from a version
+  8 source.
 - A row is copied as it stands, identity and `inserted_by` included, except
   `id`, `prompt_id` and `run_class`. A source row with no class is copied
   with none, and still reaches no gate. A prompt is matched by `sha256` and

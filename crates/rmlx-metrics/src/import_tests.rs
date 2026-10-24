@@ -164,3 +164,19 @@ fn a_source_outside_the_readable_versions_is_refused_naming_both() {
     );
     assert!(err.contains(&format!("{}", last_version())), "{err}");
 }
+
+#[test]
+fn a_source_missing_a_prompts_column_the_target_has_is_refused_naming_it() {
+    let td = tempfile::tempdir().unwrap();
+    let source = source_at(td.path(), last_version());
+    insert_row(&source, "a", Some("'gate'"));
+    Connection::open(&source)
+        .unwrap()
+        .execute_batch("ALTER TABLE prompts DROP COLUMN notes;")
+        .unwrap();
+    let mut conn = target();
+
+    let err = import_db(&mut conn, &source, None).unwrap_err().to_string();
+    assert!(err.contains("prompts.notes"), "{err}");
+    assert_eq!(classes(&conn), Vec::<Option<String>>::new());
+}

@@ -91,9 +91,10 @@ pub fn import_db(
         _ => {}
     }
     let columns = copied_columns(conn, &src, carries_class, source)?;
+    let prompt_columns = shared_columns(conn, &src, "prompts", &["id"], source)?;
 
     let tx = conn.transaction()?;
-    let prompts_inserted = copy_prompts(&src, &tx)?;
+    let prompts_inserted = copy_prompts(&src, &tx, &prompt_columns)?;
     let copied = copy_observations(&src, &tx, &columns, stated)?;
     tx.commit()?;
 
@@ -118,34 +119,51 @@ pub fn import_db(
     })
 }
 
-/// The `observations` columns of `conn`.
-fn observation_columns(conn: &Connection) -> Result<Vec<String>> {
-    let mut stmt =
-        conn.prepare("SELECT name FROM pragma_table_info('observations') ORDER BY cid")?;
+/// The columns of `table` in `conn`, in table order.
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")?;
     let names = stmt
-        .query_map([], |r| r.get(0))?
+        .query_map([table], |r| r.get(0))?
         .collect::<rusqlite::Result<Vec<String>>>()?;
     Ok(names)
 }
 
-/// The target's columns the import copies, key columns first. Refuses a source
-/// missing one of them, or missing `run_class` when its version carries it.
+/// The target's `table` columns except `set_here`, refusing a source that
+/// lacks one of them: the import would have to invent its values.
+fn shared_columns(
+    dst: &Connection,
+    src: &Connection,
+    table: &str,
+    set_here: &[&str],
+    source: &Path,
+) -> Result<Vec<String>> {
+    let source_columns = table_columns(src, table)?;
+    let mut columns = table_columns(dst, table)?;
+    columns.retain(|c| !set_here.contains(&c.as_str()));
+    if let Some(missing) = columns.iter().find(|c| !source_columns.contains(c)) {
+        return Err(Error::Schema(format!(
+            "{} has no {table}.{missing} column, which this DB has; the import \
+             would have to invent its values",
+            source.display()
+        )));
+    }
+    Ok(columns)
+}
+
+/// The `observations` columns the import copies, key columns first. A source
+/// whose version carries `run_class` must have the column too.
 fn copied_columns(
     dst: &Connection,
     src: &Connection,
     carries_class: bool,
     source: &Path,
 ) -> Result<Vec<String>> {
-    let source_columns = observation_columns(src)?;
-    let mut needed = observation_columns(dst)?;
-    needed.retain(|c| !SET_BY_IMPORT.contains(&c.as_str()) || (c == "run_class" && carries_class));
-    if let Some(missing) = needed.iter().find(|c| !source_columns.contains(c)) {
-        return Err(Error::Schema(format!(
-            "{} has no observations.{missing} column, which this DB has; the import \
-             would have to invent its values",
-            source.display()
-        )));
-    }
+    let set_here: &[&str] = if carries_class {
+        &["id", "prompt_id"]
+    } else {
+        &SET_BY_IMPORT
+    };
+    let needed = shared_columns(dst, src, "observations", set_here, source)?;
     let mut ordered: Vec<String> = KEY_COLUMNS.iter().map(|&c| c.to_owned()).collect();
     ordered.extend(
         needed
@@ -233,25 +251,34 @@ fn copy_observations(
 }
 
 /// Insert every source prompt an observation references and whose `sha256`
-/// is not present. Returns how many were inserted.
-fn copy_prompts(src: &Connection, dst: &Connection) -> Result<usize> {
-    let mut read = src.prepare(
-        "SELECT sha256, name, body, tokens_approx, first_seen_utc, notes FROM prompts
-          WHERE id IN (SELECT DISTINCT prompt_id FROM observations)",
-    )?;
+/// is not present, copying every `prompts` column but `id`. Returns how many
+/// were inserted.
+fn copy_prompts(src: &Connection, dst: &Connection, columns: &[String]) -> Result<usize> {
+    let sha_at = columns
+        .iter()
+        .position(|c| c == "sha256")
+        .ok_or_else(|| Error::Schema("this DB's prompts table has no sha256 column".to_owned()))?;
+    let list = columns.join(", ");
+    let mut read = src.prepare(&format!(
+        "SELECT {list} FROM prompts
+          WHERE id IN (SELECT DISTINCT prompt_id FROM observations)"
+    ))?;
     let mut present = dst.prepare("SELECT 1 FROM prompts WHERE sha256 = ?1")?;
-    let mut insert = dst.prepare(
-        "INSERT INTO prompts (sha256, name, body, tokens_approx, first_seen_utc, notes)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-    )?;
+    let placeholders = (1..=columns.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut insert = dst.prepare(&format!(
+        "INSERT INTO prompts ({list}) VALUES ({placeholders})"
+    ))?;
     let mut rows = read.query([])?;
     let mut inserted = 0_usize;
     while let Some(row) = rows.next()? {
-        let sha: String = row.get(0)?;
+        let sha: String = row.get(sha_at)?;
         if present.exists([&sha])? {
             continue;
         }
-        let values = (0..6)
+        let values = (0..columns.len())
             .map(|i| row.get::<_, Value>(i))
             .collect::<rusqlite::Result<Vec<Value>>>()?;
         insert.execute(params_from_iter(values.iter()))?;
