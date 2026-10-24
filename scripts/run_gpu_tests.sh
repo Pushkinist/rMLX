@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Run the #[ignore] Metal tests of every member crate, serialized, under Metal shader validation.
 #
+# Set:    -uo — a failing crate must not stop the crates after it
+#
 # WHY
 #   Every test reaching `Device::Gpu` is REQUIRED to carry `#[ignore]`, because a
 #   shared Metal context driven from parallel `cargo test` threads aborts the

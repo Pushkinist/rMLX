@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # Recall test for check_doc_refs.py: synthetic git repos, asserting exit code and reason.
+#
+# Set:    -uo — a failing case must not stop the cases after it
+#
 # doc-refs: fixture — the docs/ paths below belong to the synthetic repo.
 #
 # Recall test for: check_doc_refs.py --base

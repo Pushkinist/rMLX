@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Recall test for check_kv_codec_disposition.sh: synthetic scan roots, asserting rule and exit code.
 #
+# Set:    -uo — a failing case must not stop the cases after it
+#
 # Recall test for: check_kv_codec_disposition.sh
 #
 # That gate has eleven rules and two exit codes, and every one of them is one regex

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Recall test for check_personal_data.sh: throwaway git trees, asserting exit code and file:line.
 #
+# Set:    -uo — a failing case must not stop the cases after it
+#
 # Recall test for: check_personal_data.sh
 #
 # Each case builds a throwaway git tree, plants one edit, runs the gate over it

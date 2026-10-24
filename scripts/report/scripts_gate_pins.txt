@@ -1,10 +1,16 @@
-# Accepted violations of the scripts/ rules, one `<rule> <path>` per line; a pin only shrinks.
+# Accepted violations of the scripts/ rules: `<rule> <path> [<members>]`; a pin only shrinks.
 #
 # A pin accepts every violation of that rule in that file. Fix the file and delete its
-# line: a pin whose file now passes fails the gate (`pin-stale`). An `exit-undeclared`
-# pin lists the codes the file leaves undeclared. Never pin a new file or a new code.
+# line: a pin whose file now passes fails the gate (`pin-stale`). A rule whose violation
+# is a set pins the set (`exit-undeclared` the codes, `recall-missing` the modes, `lib-run`
+# the sites, `dead-path` the tokens, `name` the hyphen and the root variables, `lib-shadow`
+# the functions, `env-knob` the variables); a rule whose violation is a measure pins the
+# measure (`size` the line count, `heredoc` the lengths of the over-limit bodies, `twin` the
+# matched lines of a pair written `<a>+<b>`, `binary-literal` the site count). A measure that
+# grew fails its `-pin` rule; one that shrank asks for the pin to be lowered.
+# Never pin a new file, a new member or a larger measure.
 #
-# pinnable: class purpose usage exit-undeclared caller recall-missing lib-consumers lib-run shebang exec-bit dead-path
+# pinnable: class purpose usage exit-undeclared caller recall-missing lib-consumers lib-run shebang exec-bit dead-path set-mode name size heredoc twin lib-shadow binary-literal env-knob
 class aggregate_decode_profile.py
 class bench-records-sweep.sh
 class bench_cache_types.sh
@@ -347,3 +353,176 @@ exec-bit ingest/published_ingest.py
 exec-bit perf_ceiling.py
 exec-bit published_ingest_selftest.sh
 dead-path perf_canary.sh regression_gate.sh
+set-mode bench/codec_inertness_probe.sh
+set-mode bench_cache_types.sh
+set-mode bench_cell.sh
+set-mode bench_identity_selftest.sh
+set-mode bench_llama_ab.sh
+set-mode bench_llama_ab_selftest.sh
+set-mode check_claim_bypass.sh
+set-mode check_gpu_device_census.sh
+set-mode check_kv_byte_model_parity.sh
+set-mode check_kv_codec_disposition.sh
+set-mode check_metal_compiles.sh
+set-mode check_named_skip_notices.sh
+set-mode check_personal_data.sh
+set-mode check_spec_charge.sh
+set-mode check_spec_sampling.sh
+set-mode codec_smoke_runner_selftest.sh
+set-mode gpu_capture.sh
+set-mode gpu_test_halves.sh
+set-mode gpu_test_threadgroup.sh
+set-mode gputrace_diff.sh
+set-mode gputrace_kernels.sh
+set-mode gputrace_preflight.sh
+set-mode gputrace_summary.sh
+set-mode metal_dirs.sh
+set-mode mlx_preflight.sh
+set-mode mlx_restore_pin.sh
+set-mode mst_capture.sh
+set-mode perf_ab.sh
+set-mode perf_ab_ingest_selftest.sh
+set-mode perf_ab_selftest.sh
+set-mode prefill_chunk_sweep.sh
+set-mode published_ingest_selftest.sh
+set-mode schema_constraint_canary.sh
+set-mode spec_bench_selftest.sh
+set-mode spec_broken_engine.sh
+set-mode target_gc.sh
+set-mode target_size_report.sh
+set-mode traces_gc.sh
+name bench-records-sweep.sh RMLX_DIR,hyphen
+name bench_cache_types.sh RMLX_DIR
+name bench_llama_ab_selftest.sh ROOT
+name check_claim_bypass.sh ROOT
+name check_eval_lock_fixtures.sh ROOT
+name check_gpu_tests_ignored_fixtures.sh ROOT
+name check_kernel_dtype_contract_fixtures.sh ROOT
+name check_kv_codec_disposition_fixtures.sh ROOT
+name check_named_skip_notices.sh ROOT
+name check_no_kernel_input_eval.sh ROOT
+name check_no_kernel_input_eval_fixtures.sh ROOT
+name check_personal_data.sh ROOT
+name check_spec_charge.sh root
+name check_spec_sampling.sh root
+name eval/wikitext2_ppl.py workspace
+name lib/kv_boundary_default.py _REPO_ROOT
+name parity/jina_v4_parity.py _ROOT
+name perf-iter/bench_decode_tps.sh _RMLX_ROOT
+name perf_ab_selftest.sh ROOT
+name rmlx-capture.entitlements hyphen
+name run_gpu_tests_selftest.sh ROOT
+name spec_broken_engine.sh ROOT
+size check_gpu_tests_ignored.sh 1143
+size check_spec_charge.sh 1100
+size check_spec_charge_fixtures.sh 1213
+size perf_ab.sh 1031
+size perf_ceiling.py 1107
+size report/debt_report_selftest.sh 1598
+size report/kv_census_selftest.sh 1212
+size run_gpu_tests.sh 1322
+size run_gpu_tests_selftest.sh 2412
+size spec_bench.sh 1169
+size spec_bench_published.sh 1185
+size spec_bench_published_selftest.sh 2842
+size spec_bench_selftest.sh 1924
+size ssd_canary.sh 1283
+heredoc bench_cell.sh 40,30
+heredoc bench_llama_ab.sh 30
+heredoc check_published_samples_fixtures.sh 23
+heredoc perf-iter/bench_decode_tps.sh 65
+heredoc perf_ab_ingest_selftest.sh 29
+heredoc prefill_chunk_sweep.sh 161
+heredoc published_ingest_selftest.sh 198
+heredoc published_table_selftest.sh 31
+heredoc schema_constraint_canary.sh 140,27
+heredoc spec_bench.sh 138
+heredoc spec_bench_published.sh 56
+heredoc spec_bench_published_selftest.sh 34,23
+heredoc ssd_canary.sh 65,49
+twin check_claim_bypass.sh+check_personal_data.sh 26
+twin check_named_skip_notices_fixtures.sh+run_gpu_tests_selftest.sh 47
+twin check_spec_charge.sh+check_spec_sampling.sh 77
+twin check_spec_charge_fixtures.sh+check_spec_sampling_fixtures.sh 138
+twin ingest/codec_inertness_ingest.py+ingest/llama_ab_ingest.py 66
+twin ingest/codec_inertness_ingest.py+ingest/perf_ab_ingest.py 76
+twin ingest/codec_inertness_ingest.py+ingest/published_ingest.py 53
+twin ingest/llama_ab_ingest.py+ingest/perf_ab_ingest.py 98
+twin ingest/llama_ab_ingest.py+ingest/published_ingest.py 63
+twin ingest/perf_ab_ingest.py+ingest/published_ingest.py 76
+twin lib/published_run_log.py+lib/spec_round_log.py 42
+twin published_ingest_selftest.sh+published_table_selftest.sh 88
+twin published_ingest_selftest.sh+spec_bench_published_selftest.sh 66
+twin published_ingest_selftest.sh+spec_bench_selftest.sh 68
+twin published_table_selftest.sh+spec_bench_published_selftest.sh 82
+twin published_table_selftest.sh+spec_bench_selftest.sh 81
+twin spec_bench.sh+spec_bench_published.sh 51
+twin spec_bench.sh+ssd_canary.sh 95
+twin spec_bench_published_selftest.sh+spec_bench_selftest.sh 229
+lib-shadow perf-iter/bench_decode_tps.sh field_of
+lib-shadow schema_constraint_canary.sh wait_for_server
+lib-shadow ssd_canary.sh wait_for_server
+binary-literal bench-records-sweep.sh 1
+binary-literal bench/codec_inertness_probe.sh 3
+binary-literal bench_cache_types.sh 1
+binary-literal bench_cell.sh 6
+binary-literal bench_codec_cell.sh 5
+binary-literal bench_identity_selftest.sh 2
+binary-literal bench_llama_ab.sh 2
+binary-literal codec_smoke_runner_selftest.sh 2
+binary-literal eval/wikitext2_ppl.py 2
+binary-literal gpu_capture.sh 1
+binary-literal gputrace_preflight.sh 1
+binary-literal mlx_preflight.sh 1
+binary-literal mst_capture.sh 2
+binary-literal perf-iter/bench_decode_tps.sh 4
+binary-literal perf_ab.sh 2
+binary-literal perf_canary.sh 1
+binary-literal prefill_chunk_sweep.sh 2
+binary-literal release/package_binary.sh 1
+binary-literal release_e2e/stage6_perf/codec_smoke_runner.sh 1
+binary-literal release_e2e/stage6_perf/niah_long_context.sh 1
+binary-literal schema_constraint_canary.sh 1
+binary-literal spec_bench.sh 1
+binary-literal spec_bench_published.sh 1
+binary-literal ssd_canary.sh 1
+env-knob bench-records-sweep.sh CROSS_BENCH_ROOT,RMLX_O_MODELS_ROOT,RMLX_ROOT
+env-knob bench/codec_inertness_probe.sh RMLX_BINARY,RMLX_HOME
+env-knob bench_cache_types.sh RMLX_HARDWARE_TAG
+env-knob bench_cell.sh CROSS_BENCH_ROOT,CTK,CTV,CTX_MAX,KV_CANON_OVERRIDE,LABEL_PREFIX,LLAMA_CPP_ROOT,LLAMA_CPP_TURBOQUANT_ROOT,MAX_TOKENS,MEASURED_RUNS,MLX_LM_ROOT,MLX_LM_TURBOQUANT_ROOT,OMLX_ROOT,PAROQUANT_ROOT,PROMPT_ID,RMLX_HARDWARE_TAG,WARMUP_RUNS
+env-knob bench_codec_cell.sh RMLX_BINARY,RMLX_HOME
+env-knob bench_llama_ab.sh RMLX_HOME
+env-knob bench_llama_ab_selftest.sh FORCE_UNMEASURED_ROWS
+env-knob check_gpu_tests_ignored_fixtures.sh GATE_AWK_SHIM
+env-knob check_no_kernel_input_eval.sh CHECK_EVAL_MIN_FILES
+env-knob check_spec_sampling.sh SPEC_SAMPLING_ROOT
+env-knob codec_smoke_runner_selftest.sh GATE_BIN,STUB_RC
+env-knob eval/wikitext2_ppl.py RMLX_HOME
+env-knob eval_lock_stress.sh RUNS,TIMEOUT_SECS
+env-knob ingest/codec_inertness_ingest.py RMLX_HOME,RMLX_REPO_ROOT
+env-knob ingest/llama_ab_ingest.py RMLX_HOME,RMLX_REPO_ROOT
+env-knob ingest/llama_bench_ingest.py RMLX_METRICS_DB,RMLX_REPO_ROOT
+env-knob ingest/perf_ab_ingest.py RMLX_HOME,RMLX_REPO_ROOT
+env-knob ingest/published_ingest.py RMLX_HOME,RMLX_REPO_ROOT
+env-knob lib/cpu_snapshot.sh CPU_SNAPSHOT_MIN_ROWS,CPU_SNAPSHOT_SKIP,SYNTHETIC_ARMS
+env-knob lib/identity.sh RMLX_IDENTITY_JSON
+env-knob lib/kv_boundary_default.py RMLX_REPO_ROOT
+env-knob metal_dirs.sh REPO_ROOT
+env-knob mlx_preflight.sh HOMEBREW_PREFIX
+env-knob mlx_restore_pin.sh HOMEBREW_PREFIX,RMLX_BOTTLE_STORE
+env-knob mst_capture.sh RMLX_HOME
+env-knob parity/jina_v4_parity.py RMLX_O_MODELS_ROOT,RMLX_ROOT
+env-knob perf-iter/bench_decode_tps.sh KV_QUANT,MAX_CTX,MEASURE_RUNS,METRICS_DB,METRICS_OUT,MODEL_PATH,PORT,RMLX_BIN,RMLX_HOME,WARMUP_RUNS
+env-knob perf_ab.sh RMLX_HOME,RMLX_O_MODELS_ROOT
+env-knob perf_canary.sh RMLX_HOME,RMLX_O_MODELS_ROOT
+env-knob prefill_chunk_sweep.sh RMLX_HOME
+env-knob published_table_selftest.sh MAKE_ENV
+env-knob release_e2e/stage6_perf/codec_smoke_runner.sh RMLX_O_MODELS_ROOT
+env-knob report/scripts_gate_selftest.sh X
+env-knob run_gpu_tests.sh RMLX_O_MODELS_ROOT,RMLX_SKIP_GPU
+env-knob schema_constraint_canary.sh BONSAI_MODEL,GEMMA_E2B_MODEL,PORT,RMLX_O_MODELS_ROOT
+env-knob spec_bench.sh BENCH_PROMPT,BENCH_PROMPT_FILE,BENCH_PROMPT_NAME,DRAFTER_MODEL,PORT,RMLX_HARDWARE_TAG,RMLX_HOME,VERIFIER_MODEL
+env-knob spec_bench_published.sh KV_QUANT_SEEN,MEMORY_PID,RMLX_HOME,SAMPLING_SEEN,SERVER_PID
+env-knob spec_bench_selftest.sh OUT_PATH,SLEEP_LOG
+env-knob ssd_canary.sh PORT,SSD_GB,VERIFIER_MODEL
+env-knob target_gc.sh MAX_AGE_DAYS

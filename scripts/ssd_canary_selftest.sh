@@ -35,6 +35,7 @@
 # Usage: ssd_canary_selftest.sh [--script <path>] [--makefile <path>]
 #   (defaults: the tree's own scripts/ssd_canary.sh and Makefile)
 # Exit 0 — every case behaved; 1 — at least one did not; 2 — cannot run.
+# Set:    -uo — a failing case must not stop the cases after it
 
 set -uo pipefail
 export LC_ALL=C

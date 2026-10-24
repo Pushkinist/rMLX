@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Recall test for check_gpu_tests_ignored.sh: synthetic workspaces, asserting the failure reason.
 #
+# Set:    -uo — a failing case must not stop the cases after it
+#
 # Recall test for: check_gpu_tests_ignored.sh
 #
 # The gate it guards enforces a rule ("a test reaching Device::Gpu carries

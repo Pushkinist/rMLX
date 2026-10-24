@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Recall test for run_gpu_tests.sh: how it reports red runs, waivers and census verdicts.
 #
+# Set:    -uo — a failing case must not stop the cases after it
+#
 # Recall test for: run_gpu_tests.sh
 #
 # The runner accumulates two independent kinds of red across its crate loop:

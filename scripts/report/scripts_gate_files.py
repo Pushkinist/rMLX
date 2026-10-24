@@ -26,6 +26,7 @@ FIELD_NAMES = (
     "Module of",
     "Not a mode of",
     "LOC-exempt",
+    "Set",
 )
 FIELD_RE = re.compile(r"^(" + "|".join(FIELD_NAMES) + r"):\s*(.*)$")
 # A line after the purpose that begins a field or a marker is not a wrapped purpose.
@@ -43,6 +44,8 @@ class Violation:
     line: int
     detail: str
     key: str = ""
+    figure: int = 0
+    pin_path: str = ""
 
     def text(self) -> str:
         return f"{self.rule}: {self.path}:{self.line}: {self.detail}"

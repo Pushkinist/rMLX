@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Recall test for check_no_kernel_input_eval.sh: synthetic scan roots, asserting exit code.
 #
+# Set:    -uo — a failing case must not stop the cases after it
+#
 # Recall test for: check_no_kernel_input_eval.sh
 #
 # A source gate is only worth its runtime if it still fires when the thing it

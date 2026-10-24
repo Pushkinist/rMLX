@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Mutation check for spec_bench_published.sh: a stub server, asserting exit codes and refusals.
 #
+# Set:    -uo — a failing case must not stop the cases after it
+#
 # Recall test for: spec_bench_published.sh
 #
 # WHY THIS EXISTS

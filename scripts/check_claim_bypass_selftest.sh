@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # Recall test for check_claim_bypass.sh: planted git work trees, asserting exit code and file:line.
+#
+# Set:    -uo — a failing case must not stop the cases after it
+#
 # doc-refs: fixture — the docs/ paths below belong to the synthetic scan roots.
 #
 # Recall test for: check_claim_bypass.sh

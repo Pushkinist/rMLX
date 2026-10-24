@@ -5,8 +5,8 @@
 file with its caller and purpose; `make scripts-index` generates it from the
 files' own headers and `make check-scripts` fails when it differs, so never
 edit it by hand. A rule marked [gate] is enforced by a named `make` gate
-(`make check-scripts` unless the line names another); [gate, next] is meant to
-be and is not yet; [review] is the reviewer's.
+(`make check-scripts` unless the line names another); [review] is the
+reviewer's.
 
 ## 1. Add a mode, not a script
 
@@ -33,8 +33,19 @@ entry point under every rule. A file is new when it is absent at the base; move
 a file with `git mv`, because a plain `mv` that is not staged reads as a new
 file.
 
-A file whose body matches another script past a twin threshold, and a `lib/`
-function defined again outside `lib/`, fail too. [gate, next]
+Two files of one language that say the same lines are one tool in two files.
+The figure of a pair is `matched_lines` (`report/debt_report.py
+--matched-lines`): the larger of the two directions of `difflib` over the
+significant lines of both files, digit-folded. A significant line is not blank,
+not a comment and not a bare closer (`fi`, `done`, `}`). A pair is a twin at 40
+matched lines, or at half of the smaller file's significant lines when that file
+has at least 20 of them; below 20 a header and a few lines of boilerplate would
+make every small pair one. A shell file and a Python file are never compared. A
+pinned pair whose figure grows fails `twin-pin`. [gate: `twin`, `twin-pin`]
+
+A shell function defined in a `lib/` file and defined again in a file outside
+`lib/` fails (`lib-shadow`): the file stops using the one the others share. A
+recall test is not exempt; none redefines one today. [gate: `lib-shadow`]
 
 A committed file is a **repeated** operation with a **named caller**: a make
 target, another script, or a person who runs it again. A one-off campaign
@@ -64,8 +75,7 @@ directories, are pinned (section 11) until they move. `fixtures/` is not
 scanned. A new directory needs three files that share its meaning and a row
 here. [review]
 
-* A recall test lives beside its subject as `<subject>_selftest.sh`.
-  [gate, next]
+* A recall test lives beside its subject as `<subject>_selftest.sh`. [review]
 * A module used by one tool lives beside it, has no shebang and no exec bit,
   and its header says `Module of: <class>/<tool>`. A file with that line is not
   an entry point. The tool must exist, not be the file itself, and reach it: run,
@@ -96,6 +106,7 @@ comment):
     #
     # Usage:  <invocation>
     # Exit:   0 <meaning>; 1 <meaning>; 2 <meaning>
+    # Set:    -uo — <why a failing step must not stop the script>
     # Caller: by hand              (only when no make target or script runs it)
 
 * The purpose line is the `INDEX.md` row: the line right after the shebang,
@@ -111,6 +122,8 @@ comment):
   a range `3-10`; a number in prose does not. A status passed through from
   another program is `passthrough of <program>`. A `return N` from a Python
   `main()` is not read. [gate: `exit-undeclared`]
+* `Set:` only on a shell entry point that runs under `set -uo pipefail`
+  (section 5), with the reason after the dash. [gate: `set-mode`]
 * The caller is derived: a make target whose recipe runs the file, or another
   script that runs, sources or imports it (a mention in a comment or an `echo`
   is not a run). A `VAR=path` assignment counts only where the same file later
@@ -150,23 +163,36 @@ comment):
 ## 5. Shell and Python
 
 * Python for parsing, arithmetic, JSON, SQLite, HTTP and source scanning;
-  standard library only, runs on Python 3.9 (the host's `python3`).
-  [gate, next: compiles; no construct newer than 3.9]
+  standard library only, runs on Python 3.9 (the host's `python3`). The gate
+  parses every `.py` with `ast.parse(..., feature_version=(3, 9))`, whatever
+  interpreter runs it, and fails a `|` union in an annotation Python evaluates
+  when the definition runs (an argument or return annotation, a variable
+  annotation outside a function) in a file with no `from __future__ import
+  annotations`. A library call newer than 3.9 is not seen (section 12). [gate:
+  `py-floor`, never pinned]
 * Bash for running other programs in order — `cargo`, `make`, `xcrun`,
   `rmlx serve`, `rmlx claim run`, a PID it started — and for every recall test.
   It runs on bash 3.2 (the Makefile's `SHELL`) and on GNU tools in CI: no
   associative arrays, no `mapfile`, guard `"${arr[@]}"` under `set -u`.
   [review]
 * No Python heredoc or `python3 -c` body longer than 20 lines in a `.sh`
-  file; it becomes a `.py` file. [gate, next]
+  file; it becomes a `.py` file. A body is the lines between the opener of a
+  heredoc on a command line that holds `python` or `python3` and its terminator,
+  or the lines of a `-c` string. The heredoc of another command is skipped whole,
+  so Python held in the body of a `cat` heredoc is text. A file with a longer
+  body is pinned with the length of each; a longer body, or one more, fails
+  `heredoc-pin`. [gate: `heredoc`, `heredoc-pin`]
 * Shebang `#!/usr/bin/env bash` or `#!/usr/bin/env python3` matching the
   extension; exec bit on every entry point, never on a module or `lib/` file,
   and no shebang on those. A `lib/` file that is run is judged as a `lib/` file.
   The exec bit is the one git's index records; an untracked file's is the
   file system's. [gate: `shebang`, `exec-bit`]
-* `set -euo pipefail`. A recall test or matrix driver that must go on after a
-  failing case uses `set -uo pipefail` and says so in its header. [gate, next:
-  mode; review: the reason]
+* `set -euo pipefail` in every shell entry point: the options `e`, `u` and
+  `pipefail` set by `set` commands in any spelling (`-Eeuo pipefail`, `-eu -o
+  pipefail`). A recall test or matrix driver that must go on after a failing
+  case uses `set -uo pipefail` and gives the reason in a `Set: -uo — <reason>`
+  header field; the field is stale on a file that runs under the strict mode.
+  [gate: `set-mode`; review: the reason is true]
 
 ## 6. Use what `lib/` has
 
@@ -175,31 +201,55 @@ comment):
 | run identity for a §8.5 record | `lib/identity.sh` (`rmlx_export_identity`) |
 | start, wait for and attribute one `rmlx serve` | `lib/bench_server.sh` |
 | host CPU interference | `lib/cpu_snapshot.sh` + `lib/busiest_between.awk` |
-| a recall-test case runner | `lib/selftest_support.sh` (`st_init`, `st_case`, `st_run`, `st_check`, `st_verdict`, `st_done`) |
+| a recall-test case runner | `lib/selftest_support.sh` (`st_init`, `st_case`, `st_run`, `st_check`, `st_verdict`, `st_bounded`, `st_done`) |
+| the planted `scripts/` trees of the gate's recall tests | `lib/selftest_support.sh` (`sg_init`, `sg_fresh`, `sg_put`, `sg_gate`, ...) |
 | comment and literal blanking in a Rust scanner | `lib/awk_text.sh` |
 | a snapshot's identity columns | `lib/snapshot_identity.py` |
 | the gated `.metal` directories | `metal_dirs.sh` (to move into `lib/`) |
 
-A script that defines one of these again fails the gate (`lib-shadow`), and
-`target/<profile>/rmlx` written outside `lib/identity.sh` fails it too
-(`binary-literal`; recall tests that plant a stub binary are exempt).
-[gate, next]
+A script that defines one of these again fails the gate (`lib-shadow`, section
+1). A path of the form `target/<profile>/rmlx`, the profile a name or a
+variable, written in a file other than `lib/identity.sh` fails it too: a
+comment is not read, a recall test (a file with a valid `Recall test for:`) is
+exempt because it plants stub binaries, and a file merely named
+`*_selftest.sh` is not one. The files that write it today are pinned with their
+site count; one more site, or a larger count, fails `binary-literal-pin`. [gate:
+`binary-literal`, `binary-literal-pin`]
 
 ## 7. Knobs and names
 
-* Knobs are arguments. No script reads a new environment variable; the ones
-  read today are pinned and the pin only shrinks. [gate, next]
-* File names use underscores; the repository root variable is `REPO_ROOT`,
-  derived from the file's own location. [gate, next, pinned]
+* Knobs are arguments. A file reads no environment variable it did not read
+  when the rule landed. A read is `${NAME:-…}`, `${NAME-…}`, `${NAME:=…}`,
+  `${NAME:?…}` (and `=`, `?` without the colon) in shell, or `os.environ[...]`,
+  `os.environ.get(...)` and `os.getenv(...)` with a literal name in Python, of
+  an upper-case name that the file has not assigned on an earlier line (`NAME=`,
+  `local NAME`, `for NAME in`), and that is not a system name (`HOME`, `PATH`,
+  `TMPDIR`, `PWD`, `USER`, `SHELL`, `TERM`, `LANG`, `LC_ALL`, `TZ`, `CI`,
+  `NO_COLOR` and the bash variables such as `BASH_SOURCE`). A file pins the set
+  of names it reads; a name outside the set fails, and `pin-new` refuses a name
+  added to a pin. `RMLX_BIN` (in `perf-iter/bench_decode_tps.sh`) and
+  `RMLX_BINARY` (in `bench/codec_inertness_probe.sh` and `bench_codec_cell.sh`)
+  are pinned where they are read today; the `--binary` sweep removes them, and no
+  other file can add them. [gate: `env-knob`]
+* File names use underscores. [gate: `name`] The repository root variable is
+  `REPO_ROOT`, derived from the file's own location. A variable is a root
+  variable when its value is, in shell, `dirname` of `$0` or `${BASH_SOURCE[0]}`
+  followed by one `/..` for each part of the file's path under `scripts/`
+  (`check/x.sh` has two), or `git rev-parse --show-toplevel`; in Python, an
+  expression of `__file__` that climbs as many `.parent`, `dirname` and
+  `.parents[k]` steps as that count plus one and goes no deeper (a `/ "docs"`
+  makes it a path below the root, not the root). Any other name for it fails
+  `name`; the files that use one today are pinned with the names. [gate: `name`]
 * No absolute machine path in a checked-in file; model snapshots resolve
   under `RMLX_O_MODELS_ROOT`, which the Makefile exports.
   [gate: `make check-personal-data`]
 * A `scripts/<path>` token in a script, the Makefile, a workflow,
   `.pre-commit-config.yaml`, `CLAUDE.md`, `CONTRIBUTING.md`, the top-level
-  `README.md`, a doc under `docs/` or a `crates/` string literal names a file or
-  directory that git lists. A recall test is not read: it plants trees. A token
-  holding `*`, `<`, `{` or `$`, one followed by `(`, `[`, `?`, `\`, `+` or `|`
-  (a pattern), and a path git ignores (a produced file) are not checked.
+  `README.md`, this file, a doc under `docs/` or a `crates/` string literal names
+  a file or directory that git lists. A recall test and the case runner
+  (`lib/selftest_support.sh`) are not read: they plant trees. A token holding
+  `*`, `<`, `{` or `$`, one followed by `(`, `[`, `?`, `\`, `+` or `|` (a
+  pattern), and a path git ignores (a produced file) are not checked.
   `CHANGELOG.md` is not read. [gate: `dead-path`; `make
   check-doc-source-citations` for `crates/` paths in docs]
 
@@ -217,52 +267,71 @@ the claim file. [gate: `make check-claim-bypass`, tree-wide]
 * Every mode of a tool that `make ci` runs has a recall test declared with
   `Recall test for:`, run by `make ci`, asserting the exit code and the reason.
   What `make ci` runs is its recipe, its prerequisites and every `$(MAKE)
-  <target>` line it or they hold, recursively. A recipe line that ends in
-  `|| true` gates nothing and asks for no recall test; a tool that is itself a
-  recall test asks for none. [gate: `recall-missing`]
+  <target>` line it or they hold, recursively. A tool that is itself a recall
+  test asks for none. A recipe line that ends in `|| true` throws the failure
+  away and asks for none when the tool's purpose line starts with `Advisory`;
+  the three such lines `make ci` holds run `debt_report.py` (twice) and
+  `target_size_report.sh`, both advisory. On any other tool the line is a gate
+  someone silenced and is reported. [gate: `recall-missing`]
 * A recall test never sources its gate, and a gate never sources the case
   runner. [review]
 
-## 10. Size
+## 10. Size and lint
 
 * Soft limit 1000 lines; a longer file carries `LOC-exempt: <why>` in its
-  header. [gate, next]
+  header, with a reason. A file over the limit without one is pinned with its
+  line count; a pinned file that grew fails `size-pin`. [gate: `size`,
+  `size-pin`]
+* `make shellcheck-report` prints the `shellcheck` findings of every shell file
+  in `scripts/` (`debt_report.py --shellcheck`), or `skipped: shellcheck not on
+  PATH`. It runs at the end of `make ci`, gates nothing and exits 0.
 
 ## 11. Pins
 
 Every [gate] rule started with the files that broke it pinned in
-`report/scripts_gate_pins.txt`, one `<rule> <path>` per line. A pin accepts
-every violation of that rule in that file and can only shrink. [gate]
+`report/scripts_gate_pins.txt`, one `<rule> <path> [<members>]` per line. A pin
+accepts every violation of that rule in that file and can only shrink. [gate]
 
 * Fixing a file without deleting its line fails (`pin-stale`); so does a pin
   for a file that is gone or a rule that cannot be pinned. A line written twice
   fails (`pin-dup`).
-* Only `class`, `purpose`, `usage`, `exit-undeclared`, `caller`,
-  `recall-missing`, `lib-consumers`, `lib-run`, `shebang`, `exec-bit` and
-  `dead-path` can be pinned. The line `# pinnable: <rule> ...` lists them and
+* `class`, `purpose`, `usage`, `exit-undeclared`, `caller`, `recall-missing`,
+  `lib-consumers`, `lib-run`, `shebang`, `exec-bit`, `dead-path`, `set-mode`,
+  `name`, `size`, `heredoc`, `twin`, `lib-shadow`, `binary-literal` and
+  `env-knob` can be pinned. The line `# pinnable: <rule> ...` lists them and
   must equal the gate's set (`pin-header`); `index-stale`, `not-a-mode`,
-  `not-a-mode-stale`, `recall-stale`, `module-of`, `orphan` and every `pin-*`
-  rule never can.
+  `not-a-mode-stale`, `recall-stale`, `module-of`, `orphan`, `py-floor` and
+  every `pin-*` and `*-pin` rule never can.
 * A rule whose violation is a set pins the set: `exit-undeclared <path>
   <codes>`, `recall-missing <path> <modes>`, `lib-run <path> <sites>` (a site is
-  `make:<target>`, a script, `ci.yml`, `pre-commit` or a crate path) and
-  `dead-path <path> <tokens>` (the token is the part after `scripts/`; a path
-  outside `scripts/` is written `../<path>`). A member outside the set fails the
-  rule; a member of the set that is fixed or gone fails `pin-stale`.
+  `make:<target>`, a script, `ci.yml`, `pre-commit` or a crate path), `dead-path
+  <path> <tokens>` (the token is the part after `scripts/`; a path outside
+  `scripts/` is written `../<path>`), `name <path> <items>` (`hyphen` and the
+  root variable names), `lib-shadow <path> <functions>` and `env-knob <path>
+  <variables>`. A member outside the set fails the rule; a member of the set
+  that is fixed or gone fails `pin-stale`.
+* A rule whose violation is a measure pins the measure (a pin with no number
+  fails `pin-figure`): `size <path> <lines>`,
+  `heredoc <path> <n>,<n>,...` (the lengths of the over-limit bodies, longest
+  first), `twin <a>+<b> <matched lines>` (the paths in sorted order) and
+  `binary-literal <path> <sites>`. The measure must equal its pin. A larger
+  one fails the rule's own `-pin` rule (`size-pin`, `heredoc-pin`, `twin-pin`,
+  `binary-literal-pin`); a smaller one fails `pin-stale` until the pin is
+  lowered.
 * A pin the base does not have, for a rule the base's `# pinnable:` line lists,
-  fails (`pin-new`); so does a set member the base's pin for that file lacks. A
-  moved file keeps its pin when the pin line moves with it. A rule the base does
-  not list is new and may seed pins.
+  fails (`pin-new`); so does a set member the base's pin for that file lacks and
+  a measure above the base's. A moved file keeps its pin when the pin line moves
+  with it. A rule the base does not list is new and may seed pins.
 * While the base has no pin list, the run prints `pins: <base> has no pin list;
   growth not checked` and `pin-new` has nothing to compare with. Until the pin
-  list lands on `main`, the recall test holds the per-rule counts as literals,
+  list lands on `main`, the recall tests hold the per-rule counts as literals,
   so a chunk that shrinks a pin lowers its literal and growth shows in the diff.
 
 ## 12. What the gate cannot see
 
 * That a purpose line is true, that a `Not a mode of:` reason is, that a
-  `Caller: by hand` file is repeated work, and that a recall test asserts the
-  reason as well as the exit code.
+  `Caller: by hand` file is repeated work, that a `Set:` reason is true, and
+  that a recall test asserts the reason as well as the exit code.
 * An exit code that is not a literal: `return N` from a Python `main()`, and a
   helper whose code is a positional parameter (`fail() { exit "$1"; }` then
   `fail 9`). No file in the tree uses the second form today; a new one hides
@@ -272,5 +341,22 @@ every violation of that rule in that file and can only shrink. [gate]
   pieces or passed through a variable, a shell path assembled from fragments.
   A file only such a path runs reads as having no caller, which fails closed.
 * A mode that is not the first argument of its line, a first argument that is a
-  bare word and no mode (`bash scripts/foo.sh all` reads as mode `all`), and a
-  tool whose recall test covers a mode by running it without naming it.
+  bare word and no mode (`bash run.sh all` reads as mode `all`), and a tool
+  whose recall test covers a mode by running it without naming it.
+* Python newer than 3.9 that parses: a library call (`zip(strict=True)`,
+  `int.bit_count`, `dataclass(slots=True)`), and a `|` union in an expression
+  that runs (`isinstance(x, int | str)`, a type alias assignment).
+* `set` options given any other way than a `set` command in the file: on the
+  shebang line, by a sourced file, or by `bash -e` in the caller.
+* An environment read written `$NAME` or `${NAME}`, one through `env` or
+  `printenv`, an `os.environ` held under another name, and a name that is not a
+  literal. A shell string is read as code: `${NAME:-x}` inside a quoted string
+  that no shell expands counts as a read, and a name assigned later in the file
+  or in a sourced file counts as read.
+* A root variable derived through another variable (`REPO_ROOT="$HERE/.."`), a
+  `dirname` written without quotes, and a Python root built with `os.path.join`.
+* A binary path assembled from pieces, and the same text in two files that
+  differs enough to stay under the twin threshold: the rule measures text, not
+  whether two files do one job.
+* A function defined in `lib/` and redefined outside it by `eval`, or a Python
+  function of the same name.

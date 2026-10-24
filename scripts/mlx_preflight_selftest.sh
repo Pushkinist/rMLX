@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Recall test for mlx_preflight.sh: throwaway Homebrew prefixes and stubs, asserting output.
 #
+# Set:    -uo — a failing case must not stop the cases after it
+#
 # Recall test for: mlx_preflight.sh
 #
 #     bash scripts/mlx_preflight_selftest.sh [<script under test>]

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Recall test for check_kernel_dtype_contract.sh: scan roots, asserting exit code and function.
 #
+# Set:    -uo — a failing case must not stop the cases after it
+#
 # Recall test for: check_kernel_dtype_contract.sh
 #
 # A source gate is only worth its runtime if it still fires when the pattern it

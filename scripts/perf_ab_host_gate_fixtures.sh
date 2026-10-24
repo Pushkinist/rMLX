@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Recall test for the perf_ab.sh boundary: --synthetic-arms gives the same verdict on any host.
 #
+# Set:    -uo — a failing case must not stop the cases after it
+#
 # Recall test for: perf_ab.sh --synthetic-arms
 #
 # WHY THIS EXISTS

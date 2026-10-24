@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Recall test for check_kv_byte_model_parity.sh: one edited manifest per case, asserting the check.
 #
+# Set:    -uo — a failing case must not stop the cases after it
+#
 # Recall test for: check_kv_byte_model_parity.sh
 #
 # WHY BOTH

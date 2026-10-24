@@ -8,18 +8,19 @@ Usage:  debt_report.py [--root DIR] [--since REF]
         debt_report.py --kv-census {variants,match-sites,update-bodies,refs,all}
                        [--threshold N] [--file PATH] [--include-tests]
         debt_report.py --scripts [--base REF] [--write-index]
+        debt_report.py --shellcheck
 Exit:   0 a report, a figure or a clean gate; 1 the doc-size gate failed,
         ``--scripts`` found a violation, ``--matched-lines`` has no population
         to measure, ``--root`` of ``--matched-lines`` is not a directory, or
         ``--kv-census`` refused a codec descriptor or a storage view; 2 the
         tree cannot be measured (``--scripts``: not a git work tree), or the
-        flags contradict each other. The report and ``--file-sizes`` exit 0
-        whatever happens.
+        flags contradict each other. The report, ``--file-sizes`` and
+        ``--shellcheck`` exit 0 whatever happens.
 LOC-exempt: the report and its modes share one fn scan and one entry
 
 The default mode is the report. ``--matched-lines``, ``--check-doc-size``,
-``--file-sizes``, ``--kv-census`` and ``--scripts`` are the other modes, one
-per run. ``--kv-census`` runs ``kv_census.py`` and ``--scripts`` runs
+``--file-sizes``, ``--kv-census``, ``--scripts`` and ``--shellcheck`` are the other
+modes, one per run. ``--kv-census`` runs ``kv_census.py`` and ``--scripts`` runs
 ``scripts_gate.py`` (with the ``scripts_gate_*.py`` modules it imports), modules
 of this tool.
 
@@ -102,7 +103,11 @@ violation of the rules in ``scripts_gate.py``, or when the generated
 that file first and still runs every other rule. ``--base REF`` (default: the
 merge-base with ``origin/main``) decides which files count as new.
 
-The report and ``--file-sizes`` are advisory: they exit 0 whatever happens. A
+``--shellcheck`` is the sixth mode, advisory: it prints what ``shellcheck`` finds in
+the shell files of ``scripts/`` (``scripts_gate.run_shellcheck``), or ``skipped:
+shellcheck not on PATH``, and exits 0.
+
+The report, ``--file-sizes`` and ``--shellcheck`` are advisory: they exit 0 whatever happens. A
 ``--root`` that is not a directory, or any error while scanning, prints
 ``unavailable (...)`` instead — in its section for the round-loop-driver scan,
 so the rest of the report still prints.
@@ -124,6 +129,7 @@ from pathlib import Path
 import kv_census
 import scripts_gate
 from kv_census import UPDATE_DIR, UPDATE_FN_PATTERN, UPDATE_GLOB
+from line_match import matched_lines, normalize
 from rust_scan import FnInfo, extract_fns, glob_source_files, is_test_path, scan_after_name
 
 SIM_THRESHOLD = 0.60
@@ -179,17 +185,6 @@ DEBT_COMMENT_RE = re.compile(
     r"\b(inert|dormant|deferred|kept for|future-reference|no longer)\b",
     re.IGNORECASE,
 )
-
-# A digit run is folded to a single 'N' whenever it touches an identifier
-# character on either side — `rotor3` / `rotor4` -> `rotorN`, `K3` -> `KN`,
-# `3u8` -> `Nu8`, `4-bit` -> `N-bit`. A bare number with no adjacent letter
-# (a line count in a comment, say) is left alone.
-_DIGIT_RUN = re.compile(r"(?<=[A-Za-z_])\d+|\d+(?=[A-Za-z_-])")
-
-
-def normalize(text: str) -> str:
-    return _DIGIT_RUN.sub("N", text)
-
 
 def rust_files(root: Path, subdir: str, include_tests: bool) -> list[Path]:
     base = root / subdir
@@ -280,30 +275,6 @@ def similarity(a: str, b: str) -> float:
     a_lines = normalize(a).splitlines()
     b_lines = normalize(b).splitlines()
     return difflib.SequenceMatcher(None, a_lines, b_lines, autojunk=False).ratio()
-
-
-def matched_lines(a: str, b: str) -> int:
-    """Summed size of every matching block `difflib.SequenceMatcher` finds
-    between `a` and `b`, over the same digit-folded, `autojunk=False` lines
-    `similarity()` compares — a line count, not a ratio. This is the figure
-    the round-loop migration chunks reported by hand; `--matched-lines` is
-    its one producer now.
-
-    Measured both ways round and reported as the larger. `SequenceMatcher` is
-    not symmetric: it anchors on the longest match it finds in `a` and can
-    reach a smaller total with the arguments swapped. A one-directional
-    measure would therefore move when a body changed file, or was renamed, or
-    when a population gained an item that re-ordered it — with no line of any
-    body changing. The larger of the two is the count of lines the pair
-    genuinely shares, and it depends on the pair alone."""
-    a_lines = normalize(a).splitlines()
-    b_lines = normalize(b).splitlines()
-    forward = difflib.SequenceMatcher(None, a_lines, b_lines, autojunk=False)
-    reverse = difflib.SequenceMatcher(None, b_lines, a_lines, autojunk=False)
-    return max(
-        sum(block.size for block in forward.get_matching_blocks()),
-        sum(block.size for block in reverse.get_matching_blocks()),
-    )
 
 
 @dataclass
@@ -1018,6 +989,12 @@ def main(argv: list[str] | None = None) -> int:
         help="check the rules for scripts/ and the generated scripts/INDEX.md "
         "(exit 1 on a violation, 2 when the tree cannot be read)",
     )
+    modes.add_argument(
+        "--shellcheck",
+        action="store_true",
+        help="advisory: print the shellcheck findings of the shell files of scripts/, "
+        "or that shellcheck is not on PATH (exit 0)",
+    )
     parser.add_argument(
         "--base",
         default=None,
@@ -1055,6 +1032,7 @@ def main(argv: list[str] | None = None) -> int:
         or args.check_doc_size
         or args.kv_census
         or args.scripts
+        or args.shellcheck
         or args.file_sizes is not None
     )
     if args.since is not None and not report_mode:
@@ -1086,6 +1064,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.scripts:
         return scripts_gate.run(root.resolve(), args.base, args.write_index)
+
+    if args.shellcheck:
+        return scripts_gate.run_shellcheck(root.resolve())
 
     if args.matched_lines:
         try:

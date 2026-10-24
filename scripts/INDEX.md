@@ -144,7 +144,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `lib/published_run_log.py` | lib/binary_identity.py, lib/prefill_ms.py, lib/published_greedy.py, +1 more scripts | Read one rmlx run log back as a per-request table. |
 | `lib/published_table.py` | make check-published-table, make published-table, published_table_selftest.sh | Render published-protocol runs as the Markdown table a post needs. |
 | `lib/run_log_for_pid.py` | lib/bench_server.sh | Pick the run log a given process wrote, out of the candidates on stdin. |
-| `lib/selftest_support.sh` | bench_llama_ab_selftest.sh, check_claim_bypass_selftest.sh, check_gpu_device_census_selftest.sh, +9 more scripts | The case runner and shims the self-tests share; source it. |
+| `lib/selftest_support.sh` | bench_llama_ab_selftest.sh, check_claim_bypass_selftest.sh, check_gpu_device_census_selftest.sh, +10 more scripts | The case runner and shims the self-tests share; source it. |
 | `lib/server_decode_tps.py` | perf-iter/bench_decode_tps.sh, spec_bench.sh | Read one request's decode rate off a running rmlx server. |
 | `lib/server_kv_quant.py` | lib/bench_server.sh, lib/binary_identity.py, perf_canary.sh, +1 more scripts | Read the KV codec a run resolved out of its rmlx run log. |
 | `lib/server_sampling.py` | crates/rmlx-server/src/engine/sampler_event_tests.rs, lib/published_run_log.py, spec_bench.sh | Read whether a run's requests were sampled, out of its rmlx run log. |
@@ -192,18 +192,22 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
-| `report/debt_report.py` | make check-doc-size, make check-scripts, make ci, make debt-report, make file-size-report, make kv-update-census, make scripts-index, report/debt_report_selftest.sh, report/doc_size_selftest.sh, report/kv_census_selftest.sh | Advisory reports about the tree, the doc-size gate and the KV structural figures. |
+| `report/debt_report.py` | make check-doc-size, make check-scripts, make ci, make debt-report, make file-size-report, make kv-update-census, make scripts-index, make shellcheck-report, report/debt_report_selftest.sh, report/doc_size_selftest.sh, report/kv_census_selftest.sh | Advisory reports about the tree, the doc-size gate and the KV structural figures. |
 | `report/debt_report_selftest.sh` | make ci, make debt-report-selftest | Recall test for debt_report.py: fixture trees, asserting what the printed text holds. |
 | `report/doc_size_selftest.sh` | make check-doc-size-selftest, make ci | Recall test for debt_report.py --check-doc-size: throwaway git trees, asserting exit and reason. |
 | `report/kv_census.py` | report/debt_report.py | Structural figures for the KV update path: variant shapes, match sites, update bodies, refs. |
 | `report/kv_census_selftest.sh` | make ci, make kv-update-census-selftest | Recall test for debt_report.py --kv-census: synthetic trees, asserting exit code and figure. |
+| `report/line_match.py` | report/debt_report.py, report/scripts_gate_twin.py | Line-level overlap of two texts: digit-folded lines and the matched-line count. |
 | `report/rust_scan.py` | report/debt_report.py, report/kv_census.py | Rust source reader for the report tools: enums, `match` arms and `fn` bodies. |
 | `report/scripts_gate.py` | report/debt_report.py | The rules for scripts/ and the generated scripts/INDEX.md. |
 | `report/scripts_gate_callers.py` | report/scripts_gate.py, report/scripts_gate_rules.py | The derived caller of each file and the INDEX.md built from it. |
+| `report/scripts_gate_content.py` | report/scripts_gate.py | Per-file content rules of the scripts gate: shell mode, Python floor, names, size, heredocs, knobs. |
+| `report/scripts_gate_content_selftest.sh` | make check-scripts-selftest, make ci | Recall test for the per-file rules of debt_report.py --scripts: planted files, exit code, rule:line. |
 | `report/scripts_gate_external.py` | report/scripts_gate.py, report/scripts_gate_callers.py, report/scripts_gate_rules.py | Callers of scripts/ that are not scripts: hosted CI steps, pre-commit hooks, Rust sources. |
-| `report/scripts_gate_files.py` | report/scripts_gate.py, report/scripts_gate_callers.py, report/scripts_gate_external.py, +2 more scripts | The population of scripts/ and the header each file carries. |
-| `report/scripts_gate_pins.txt` | report/scripts_gate.py, report/scripts_gate_selftest.sh | Accepted violations of the scripts/ rules, one `<rule> <path>` per line; a pin only shrinks. |
-| `report/scripts_gate_rules.py` | report/scripts_gate.py, report/scripts_gate_structure.py | The per-file rules of the scripts gate and their registry. |
+| `report/scripts_gate_files.py` | report/scripts_gate.py, report/scripts_gate_callers.py, report/scripts_gate_content.py, +4 more scripts | The population of scripts/ and the header each file carries. |
+| `report/scripts_gate_pins.txt` | lib/selftest_support.sh, report/scripts_gate.py | Accepted violations of the scripts/ rules: `<rule> <path> [<members>]`; a pin only shrinks. |
+| `report/scripts_gate_rules.py` | report/scripts_gate.py, report/scripts_gate_content.py, report/scripts_gate_structure.py, +1 more scripts | The per-file rules of the scripts gate and their registry. |
 | `report/scripts_gate_selftest.sh` | make check-scripts-selftest, make ci | Recall test for debt_report.py --scripts: planted trees, asserting exit code and rule:file:line. |
-| `report/scripts_gate_structure.py` | report/scripts_gate.py | Structural rules of the scripts gate: recall tests, lib/, modules, shebang, exec bit, dead paths. |
-| `report/scripts_gate_text.py` | report/scripts_gate_callers.py, report/scripts_gate_rules.py, report/scripts_gate_structure.py | Readers of script text: shell, Python and Makefile source. |
+| `report/scripts_gate_structure.py` | report/scripts_gate.py, report/scripts_gate_content.py | Structural rules of the scripts gate: recall tests, lib/, modules, shebang, exec bit, dead paths. |
+| `report/scripts_gate_text.py` | report/scripts_gate_callers.py, report/scripts_gate_content.py, report/scripts_gate_rules.py, +1 more scripts | Readers of script text: shell, Python and Makefile source. |
+| `report/scripts_gate_twin.py` | report/scripts_gate.py | The twin rule of the scripts gate: two files of one language that say the same lines. |

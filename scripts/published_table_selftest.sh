@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Mutation check for lib/published_table.py: a fixture snapshot, asserting exit code and reason.
 #
+# Set:    -uo — a failing case must not stop the cases after it
+#
 # Recall test for: lib/published_table.py
 #
 # WHY THIS EXISTS

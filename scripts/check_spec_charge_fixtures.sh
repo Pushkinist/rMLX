@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Recall test for check_spec_charge.sh: one edit per synthetic source root, asserting rule and exit.
 #
+# Set:    -uo — a failing case must not stop the cases after it
+#
 # Recall test for: check_spec_charge.sh
 #
 # A gate is only worth its runtime if it fires, and "the tree is clean" is no

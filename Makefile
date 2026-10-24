@@ -111,7 +111,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         bench-codec-cell \
         smoke-codec-matrix \
         e2e \
-        file-size-report debt-report debt-report-selftest \
+        file-size-report shellcheck-report debt-report debt-report-selftest \
         check-doc-size check-doc-size-selftest \
         check-scripts scripts-index check-scripts-selftest \
         kv-update-census kv-update-census-selftest \
@@ -475,6 +475,9 @@ hooks:           ## install the pre-commit git hook
 file-size-report: ## advisory: print source files >1000 LOC (non-failing)
 	@python3 scripts/report/debt_report.py --file-sizes
 
+shellcheck-report: ## advisory: print the shellcheck findings of scripts/**/*.sh, or that shellcheck is not on PATH (non-failing; also runs at the end of `make ci`)
+	@python3 scripts/report/debt_report.py --shellcheck
+
 debt-report: ## advisory: sibling similarity, debt counters, add/remove ratio, oversized docs (non-failing; also runs at the end of `make ci`)
 	@python3 scripts/report/debt_report.py
 
@@ -493,8 +496,9 @@ check-scripts: ## CI gate: fail on a violation of the scripts/ rules or a script
 scripts-index: ## regenerate scripts/INDEX.md from the scripts' headers, then check the other rules
 	@python3 scripts/report/debt_report.py --scripts --write-index
 
-check-scripts-selftest: ## CI gate: recall test for check-scripts over throwaway git trees, each case asserting its exit code and rule:file:line
+check-scripts-selftest: ## CI gate: recall tests for check-scripts and shellcheck-report over planted trees, each case asserting its exit code and rule:file:line
 	@bash scripts/report/scripts_gate_selftest.sh
+	@bash scripts/report/scripts_gate_content_selftest.sh
 
 kv-update-census: ## advisory: the KV structural figures — variant shapes, match sites a new codec must touch, subset sites (matches!, if-let, catch-all) and table sites, per-variant update bodies (non-failing)
 	@python3 scripts/report/debt_report.py --kv-census all
@@ -718,6 +722,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@python3 scripts/report/debt_report.py --check-doc-size
 	@python3 scripts/report/debt_report.py --scripts
 	@bash scripts/report/scripts_gate_selftest.sh
+	@bash scripts/report/scripts_gate_content_selftest.sh
 	@bash scripts/release/release_cpu_selftest.sh
 	@bash scripts/report/kv_census_selftest.sh
 	@bash scripts/check_no_inline_tests.sh
@@ -775,6 +780,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@$(MAKE) --no-print-directory check-published-table
 	@bash scripts/check_metal_format.sh
 	@bash scripts/check_metal_compiles.sh
+	@python3 scripts/report/debt_report.py --shellcheck
 	@python3 scripts/report/debt_report.py --file-sizes || true
 	@bash scripts/target_size_report.sh || true
 	@python3 scripts/report/debt_report.py || true

@@ -211,3 +211,158 @@ except subprocess.TimeoutExpired:
     sys.exit(124)
 ' "$@"
 }
+
+# ---- planted scripts/ trees --------------------------------------------------
+#
+# The recall tests of `debt_report.py --scripts` plant one edit in a copy of a
+# small valid tree and run the gate over it with `--base HEAD`. They share the
+# builders below. A test sets TOOL (the debt_report.py under test), sources this
+# file, calls st_init and then sg_init, which builds the committed base tree.
+# Every tree keeps four clean files in scope, so a must-fail case cannot pass
+# through an empty scope.
+
+SG_PINS_REL=scripts/report/scripts_gate_pins.txt
+SG_NAM='# Not a mode of: check/ok.sh — a planted entry point'
+SG_TIMEOUT_S=60
+SG_PINNABLE='# pinnable: class purpose usage exit-undeclared caller recall-missing lib-consumers lib-run shebang exec-bit dead-path set-mode name size heredoc twin lib-shadow binary-literal env-knob'
+
+# sg_gate <root> — the scripts gate over <root>, the base being its own HEAD.
+sg_gate() {
+	python3 "$TOOL" --scripts --root "$1" --base HEAD
+}
+
+# sg_bounded_gate <root> — sg_gate, killed after SG_TIMEOUT_S seconds.
+sg_bounded_gate() {
+	st_bounded "$SG_TIMEOUT_S" python3 "$TOOL" --scripts --root "$1" --base HEAD
+}
+
+# sg_gate_at <root> <ref> — the gate with <ref> as its base.
+sg_gate_at() {
+	python3 "$TOOL" --scripts --root "$1" --base "$2"
+}
+
+# sg_reindex <root> — regenerate INDEX.md, so a case isolates the rule it plants.
+sg_reindex() {
+	st_bounded "$SG_TIMEOUT_S" python3 "$TOOL" --scripts --root "$1" --base HEAD --write-index >/dev/null 2>&1 || true
+}
+
+# sg_put <root> <rel> — write stdin to <root>/scripts/<rel>, executable when it starts with a shebang.
+sg_put() {
+	mkdir -p "$(dirname "$1/scripts/$2")"
+	cat >"$1/scripts/$2"
+	if [ "$(head -c 2 "$1/scripts/$2")" = '#!' ]; then chmod +x "$1/scripts/$2"; fi
+}
+
+# sg_commit_all <root> <message> — commit everything in <root>.
+sg_commit_all() {
+	git -C "$1" add -A &&
+		git -C "$1" -c user.name=selftest -c user.email=selftest@invalid -c commit.gpgsign=false \
+			commit -q -m "$2" || st_die "cannot commit the fixture tree $1"
+}
+
+# sg_row_line <root> <rel> — the INDEX.md line that holds the row for <rel>.
+sg_row_line() {
+	grep -n -F "| \`$2\` |" "$1/scripts/INDEX.md" | head -n 1 | cut -d: -f1
+}
+
+# sg_entry_sh <line 2> <line 3> <usage> <exit> <caller> <not-a-mode> <body> — a shell
+# entry point whose header lines are the arguments. A bare `#` leaves a field out.
+sg_entry_sh() {
+	printf '%s\n' '#!/usr/bin/env bash' "$1" "$2" "$3" "$4" "$5" "$6" 'set -euo pipefail' "$7"
+}
+
+# sg_valid_sh <body> — a shell entry point every rule accepts, with <body> as line 9.
+sg_valid_sh() {
+	sg_entry_sh '# CI gate: a planted entry point.' '#' '# Usage:  bash scripts/check/ok.sh' \
+		'# Exit:   0 clean; 1 failed' '# Caller: by hand' "$SG_NAM" "$1"
+}
+
+# sg_nocaller_sh <body> — a shell entry point with no Caller: line, so only a run makes it callable.
+sg_nocaller_sh() {
+	sg_entry_sh '# CI gate: a planted entry point.' '#' '# Usage:  bash scripts/check/ok.sh' \
+		'# Exit:   0 clean; 1 failed' '#' "$SG_NAM" "$1"
+}
+
+# sg_recall_sh <caller line> <field line>... — a planted recall test; each argument after the first
+# is a line of its Recall test for: field. The caller line is a bare # when a recipe runs it.
+sg_recall_sh() {
+	local caller=$1 first=1 line
+	shift
+	printf '%s\n' '#!/usr/bin/env bash' '# A planted recall test.' '#'
+	for line in "$@"; do
+		if [ "$first" = 1 ]; then
+			printf '# Recall test for: %s\n' "$line"
+			first=0
+		else
+			printf '#                  %s\n' "$line"
+		fi
+	done
+	printf '%s\n' '#' '# Usage:  bash scripts/check/ok.sh' '# Exit:   0 held' "$caller" "$SG_NAM" 'set -euo pipefail' 'exit 0'
+}
+
+# sg_lib_sh [<last header line>] — a planted lib/ file, no shebang, sourced and never run.
+sg_lib_sh() {
+	printf '%s\n' '# A planted lib file.' '#' "${1:-# Sourced, not executed.}" 'liby() { :; }'
+}
+
+# sg_make_ci <root> <text> — append <text> (printf %b) to the fixture Makefile.
+sg_make_ci() {
+	printf '%b' "$2" >>"$1/Makefile"
+}
+
+# sg_pins_file <line>... — a pin file for the fixture tree: its header, then the lines.
+sg_pins_file() {
+	printf '%s\n' '# Accepted violations of the fixture tree.' '#' "$SG_PINNABLE" "$@"
+}
+
+# sg_init — build the committed base tree in $SG_BASE: an entry point that sources its
+# module and a Python entry point that imports its module.
+sg_init() {
+	SG_BASE="$(st_git_root base)"
+	printf 'check-ok:\n\t@bash scripts/check/ok.sh\n\ntool:\n\t@python3 scripts/report/tool.py\n' >"$SG_BASE/Makefile"
+	sg_put "$SG_BASE" check/ok.sh <<'EOF'
+#!/usr/bin/env bash
+# CI gate: the fixture entry point that every rule accepts.
+#
+# Usage:  bash scripts/check/ok.sh
+# Exit:   0 clean; 1 a violation
+set -euo pipefail
+. "$(dirname "$0")/../lib/helper.sh"
+helper
+[ "$#" -eq 0 ] || exit 1
+exit 0
+EOF
+	sg_put "$SG_BASE" lib/helper.sh <<'EOF'
+# A helper the fixture's entry point sources.
+#
+# Module of: check/ok.sh
+helper() { :; }
+EOF
+	sg_put "$SG_BASE" report/tool.py <<'EOF'
+#!/usr/bin/env python3
+"""The fixture's Python entry point; it imports its module.
+
+Usage:  python3 scripts/report/tool.py
+Exit:   0 always
+"""
+
+import tool_mod
+
+raise SystemExit(0)
+EOF
+	sg_put "$SG_BASE" report/tool_mod.py <<'EOF'
+"""A module the fixture's Python entry point imports.
+
+Module of: report/tool.py
+"""
+EOF
+	sg_commit_all "$SG_BASE" files
+	sg_reindex "$SG_BASE"
+	sg_commit_all "$SG_BASE" base
+}
+
+# sg_fresh <name> — print the path of a copy of the base tree, to plant one edit in.
+sg_fresh() {
+	cp -R "$SG_BASE" "$ST_WORK/$1" || st_die "cannot copy the base tree to $1"
+	printf '%s' "$ST_WORK/$1"
+}

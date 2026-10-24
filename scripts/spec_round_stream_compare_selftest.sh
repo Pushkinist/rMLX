@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Recall test for spec_round_stream_compare.py verify: synthetic captures, asserting the exit code.
 #
+# Set:    -uo — a failing case must not stop the cases after it
+#
 # Recall test for: spec_round_stream_compare.py verify
 #
 # Each case builds a synthetic capture of the 36 pinned cells, whose round

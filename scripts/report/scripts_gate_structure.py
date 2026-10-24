@@ -22,14 +22,15 @@ CI_TARGET = "ci"
 DEFAULT_MODE = "default"
 MODE_RE = re.compile(r"--?[A-Za-z][\w-]*|[a-z][a-z0-9_-]*")
 MAKE_CALL_RE = re.compile(r"\$[({]MAKE[)}]([^;&|]*)")
-ADVISORY_RE = re.compile(r"\|\|\s*true\s*$")
+SILENCED_RE = re.compile(r"\|\|\s*true\s*$")
+ADVISORY_PURPOSE = "Advisory"
 SHEBANGS = {".sh": "#!/usr/bin/env bash", ".py": "#!/usr/bin/env python3"}
 LIB_PREFIX = "lib/"
 LIB_CONSUMERS_MIN = 2
 SELFTEST_SUPPORT = "lib/selftest_support.sh"
 DEAD_TOKEN_RE = re.compile(r"(?<![\w./-])scripts/([\w./-]*)")
 PATTERN_FOLLOWERS = frozenset("*<{$([?\\+|")
-DOC_ROOTS = ("CLAUDE.md", "CONTRIBUTING.md", "README.md", "Makefile", ".pre-commit-config.yaml")
+DOC_ROOTS = ("CLAUDE.md", "CONTRIBUTING.md", "README.md", "Makefile", ".pre-commit-config.yaml", "scripts/README.md")
 OUTSIDE = "../"
 
 
@@ -55,13 +56,14 @@ def make_closure(ctx: Context) -> dict[str, list[str]]:
     return out
 
 
-def recipe_runs(ctx: Context, line: str) -> list[tuple[str, str]]:
-    """(file, mode) for each scripts/ file a recipe line runs. The mode is the
-    first argument when it is a bare flag or word, else the default; a line
-    that ends in `|| true` gates nothing and runs nothing here."""
+def recipe_runs(ctx: Context, line: str) -> list[tuple[str, str, bool]]:
+    """(file, mode, silenced) for each scripts/ file a recipe line runs. The
+    mode is the first argument when it is a bare flag or word, else the
+    default. A line that ends in `|| true` throws the failure away: it asks for
+    no recall test when the file's purpose line starts with `Advisory`, and is
+    otherwise a silenced gate that does."""
     text = line.lstrip("@-+ \t")
-    if ADVISORY_RE.search(text):
-        return []
+    silenced = bool(SILENCED_RE.search(text))
     out = []
     for logical in clean_shell(text, False, True):
         for piece in peel_substitutions(logical):
@@ -69,20 +71,26 @@ def recipe_runs(ctx: Context, line: str) -> list[tuple[str, str]]:
                 run, _source, every, _assigned = command_words(command)
                 for word in run:
                     for f in ctx.resolver.find(word, True):
+                        if silenced and f.purpose.startswith(ADVISORY_PURPOSE):
+                            continue
                         args = every[every.index(word) + 1 :] if word in every else []
                         mode = args[0] if args and MODE_RE.fullmatch(args[0]) else DEFAULT_MODE
-                        out.append((f.rel, mode))
+                        out.append((f.rel, mode, silenced))
     return out
 
 
-def closure_runs(ctx: Context) -> dict[str, dict[str, set[str]]]:
-    """File -> mode -> the make targets of the `make ci` closure that run it."""
+def closure_runs(ctx: Context) -> tuple[dict[str, dict[str, set[str]]], set[tuple[str, str]]]:
+    """(file -> mode -> the make targets of the `make ci` closure that run it,
+    the (file, mode) pairs run with `|| true`)."""
     runs: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+    silenced: set[tuple[str, str]] = set()
     for target, lines in make_closure(ctx).items():
         for line in lines:
-            for rel, mode in recipe_runs(ctx, line):
+            for rel, mode, is_silenced in recipe_runs(ctx, line):
                 runs[rel][mode].add(target)
-    return runs
+                if is_silenced:
+                    silenced.add((rel, mode))
+    return runs, silenced
 
 
 def recall_claims(f: Script) -> list[tuple[int, str, list[str]]]:
@@ -139,7 +147,7 @@ def covering_tests(ctx: Context) -> dict[tuple[str, str], list[str]]:
 
 
 def rule_recall_missing(ctx: Context) -> list[Violation]:
-    runs = closure_runs(ctx)
+    runs, silenced = closure_runs(ctx)
     covered = covering_tests(ctx)
     by_rel = ctx.by_rel
     out = []
@@ -154,6 +162,8 @@ def rule_recall_missing(ctx: Context) -> list[Violation]:
                 detail = f"mode {mode}: its recall test {tests[0]} is not run by `make {CI_TARGET}`"
             else:
                 detail = f"mode {mode} is run by `make {CI_TARGET}` and no `Recall test for:` names it"
+                if (tool, mode) in silenced:
+                    detail += f"; `|| true` exempts only a tool whose purpose line starts with `{ADVISORY_PURPOSE}`"
             out.append(Violation("recall-missing", tool, 1, detail, key=mode))
     return out
 
@@ -274,9 +284,10 @@ def dead_tokens(text: str, files: set[str], dirs: set[str]) -> list[tuple[int, s
 
 
 def dead_path_sources(ctx: Context) -> list[tuple[str, str]]:
-    """(path as printed, text): the scripts that are not recall tests, then the
-    Makefile, the pre-commit config, the guides, the workflows and the docs."""
-    out = [(f.rel, f.text) for f in ctx.files if not is_recall_test(f, ctx)]
+    """(path as printed, text): the scripts that are not recall tests or the
+    case runner (both plant trees), then the Makefile, the pre-commit config,
+    the guides, the README of scripts/, the workflows and the docs."""
+    out = [(f.rel, f.text) for f in ctx.files if not is_recall_test(f, ctx) and f.rel != SELFTEST_SUPPORT]
     listing = git(ctx.root, "ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", "docs", ".github")
     names = [n for n in listing.split("\0") if n.endswith((".md", ".yml", ".yaml"))]
     for name in (*DOC_ROOTS, *names):

@@ -4,6 +4,7 @@
 # Recall test for: report/debt_report.py default --matched-lines
 # Usage:  bash scripts/report/debt_report_selftest.sh
 # Exit:   0 every case held; 1 a case did not
+# Set:    -uo — a failing case must not stop the cases after it
 #
 # WHY
 #   The report always exits 0 (advisory), so its

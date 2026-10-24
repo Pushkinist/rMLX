@@ -9,11 +9,17 @@ prints as `<rule>: <path>:<line>: <detail>`, the path relative to `scripts/`.
 
 Each rule is a function over the population that yields violations. A pin is a
 `<rule> <path>` line in `report/scripts_gate_pins.txt` and accepts every
-violation of that rule in that file (a rule whose violation is a set, listed
-in `SET_NOUNS`, pins the set: `exit-undeclared <path> <codes>`).
+violation of that rule in that file. A rule whose violation is a set, listed in
+`SET_NOUNS`, pins the set (`exit-undeclared <path> <codes>`); a rule whose
+violation is a measure, listed in `FIGURE_RULES`, pins the measure (`size <path>
+<lines>`) and fails its own `-pin` rule when the measure grows.
 Pins only shrink: a pin whose file now passes is a violation (`pin-stale`), and
 a pin the base lacks, for a rule the base's `# pinnable:` line lists, is one too
 (`pin-new`). Only the rules in `PINNABLE` can be pinned.
+
+`debt_report.py --shellcheck` is the advisory mode: it prints what `shellcheck`
+finds in the shell files of the population, or that it is not on `PATH`, and
+exits 0 either way.
 
 Definitions the rules share:
 
@@ -27,8 +33,8 @@ Definitions the rules share:
 * The header is the leading comment block (Python: the module docstring;
   `.entitlements`: the first XML comment). Its first line, directly after the
   shebang, is the purpose; `Usage:`, `Exit:`, `Caller:`, `Recall test for:`,
-  `Module of:`, `Not a mode of:` and `LOC-exempt:` start a field that runs to
-  the next blank line or field.
+  `Module of:`, `Not a mode of:`, `LOC-exempt:` and `Set:` start a field that
+  runs to the next blank line or field.
 * A caller is a Makefile target whose recipe, or another script that, runs or
   sources the file; a Python import of the module counts, and so does a name
   bound to its path and passed as the program of a `subprocess` call. A hosted-CI
@@ -45,16 +51,21 @@ its code as a parameter. `scripts/README.md` section 12 lists the rest.
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 import sys
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from scripts_gate_callers import Resolver, derive_callers, index_violations, render_index
+from scripts_gate_content import CONTENT_RULES
 from scripts_gate_external import load_external
 from scripts_gate_files import INDEX, Unavailable, Violation, git, git_ok, load_population
 from scripts_gate_rules import RULE_FUNCTIONS, Context, entry_points
 from scripts_gate_structure import STRUCTURE_RULES
+from scripts_gate_twin import rule_twin
 
 PINS = "report/scripts_gate_pins.txt"
 PINNABLE = (
@@ -69,12 +80,41 @@ PINNABLE = (
     "shebang",
     "exec-bit",
     "dead-path",
+    "set-mode",
+    "name",
+    "size",
+    "heredoc",
+    "twin",
+    "lib-shadow",
+    "binary-literal",
+    "env-knob",
 )
 SET_NOUNS = {
     "exit-undeclared": "code",
     "recall-missing": "mode",
     "lib-run": "site",
     "dead-path": "token",
+    "name": "item",
+    "lib-shadow": "function",
+    "env-knob": "variable",
+}
+
+
+def total_figure(violations: list[Violation]) -> tuple[int, ...]:
+    return (sum(v.figure for v in violations),)
+
+
+def sorted_figures(violations: list[Violation]) -> tuple[int, ...]:
+    return tuple(sorted((v.figure for v in violations), reverse=True))
+
+
+# A rule whose violation is a measure pins the measure: `<rule> <path> <n>[,<n>...]`.
+# The rule that fails when the measure grows, and how the violations reduce to it.
+FIGURE_RULES: dict[str, tuple[str, Callable[[list[Violation]], tuple[int, ...]]]] = {
+    "size": ("size-pin", total_figure),
+    "twin": ("twin-pin", total_figure),
+    "binary-literal": ("binary-literal-pin", total_figure),
+    "heredoc": ("heredoc-pin", sorted_figures),
 }
 PINS_HEADER = "pinnable:"
 
@@ -117,6 +157,7 @@ class Pin:
     path: str
     codes: frozenset[str]
     line: int
+    figure: tuple[int, ...] = ()
 
 
 @dataclass
@@ -150,9 +191,41 @@ def parse_pins(text: str) -> PinList:
             detail = f"{rule} {path} is already pinned at line {out.pins[key].line}"
             out.problems.append(Violation("pin-dup", PINS, number, detail))
             continue
+        if rule in FIGURE_RULES:
+            try:
+                figure = tuple(int(n) for n in parts[2].split(","))
+            except (IndexError, ValueError):
+                detail = f"{rule} {path} needs a figure: `{rule} {path} <n>`"
+                out.problems.append(Violation("pin-figure", PINS, number, detail))
+                continue
+            out.pins[key] = Pin(rule, path, frozenset(), number, figure)
+            continue
         codes = frozenset(parts[2].split(",")) if len(parts) > 2 else frozenset()
         out.pins[key] = Pin(rule, path, codes, number)
     return out
+
+
+def grows(now: tuple[int, ...], pinned: tuple[int, ...]) -> bool:
+    """A figure grew when it has more members or a member above its pin's."""
+    return len(now) > len(pinned) or any(n > p for n, p in zip(now, pinned))
+
+
+def show(figure: tuple[int, ...]) -> str:
+    return ",".join(str(n) for n in figure)
+
+
+def figure_problems(key: tuple[str, str], violations: list[Violation], pin: Pin) -> list[Violation]:
+    """Held when the figure equals its pin; a larger one fails the rule's `-pin`
+    rule, a smaller one asks for the pin to be lowered."""
+    pin_rule, reduce = FIGURE_RULES[key[0]]
+    now = reduce(violations)
+    if grows(now, pin.figure):
+        detail = f"{key[0]} figure is {show(now)}, pinned {show(pin.figure)}; fix the file, do not raise the pin"
+        return [Violation(pin_rule, violations[0].path, violations[0].line, detail)]
+    if now != pin.figure:
+        detail = f"{key[0]} {key[1]}: figure is {show(now)}, pinned {show(pin.figure)}; lower the pin"
+        return [Violation("pin-stale", PINS, pin.line, detail)]
+    return []
 
 
 def load_pins(root: Path) -> PinList:
@@ -172,13 +245,15 @@ def apply_pins(found: list[Violation], pins: PinList) -> tuple[list[Violation], 
     held: dict[tuple[str, str], Pin] = {}
     groups: dict[tuple[str, str], list[Violation]] = defaultdict(list)
     for violation in found:
-        groups[(violation.rule, violation.path)].append(violation)
+        groups[(violation.rule, violation.pin_path or violation.path)].append(violation)
     for key, violations in groups.items():
         pin = pins.pins.get(key)
         if pin is None or key[0] not in PINNABLE:
             active += violations
             continue
-        if key[0] in SET_NOUNS:
+        if key[0] in FIGURE_RULES:
+            active += figure_problems(key, violations, pin)
+        elif key[0] in SET_NOUNS:
             active += [v for v in violations if v.key not in pin.codes]
             for member in sorted(pin.codes - {v.key for v in violations}):
                 detail = f"{key[0]} {key[1]}: {SET_NOUNS[key[0]]} {member} is fixed or gone; delete it from the pin"
@@ -211,6 +286,9 @@ def pin_growth(
         if old is None:
             out.append(Violation("pin-new", PINS, pin.line, f"{rule} {path} is not pinned at the base"))
             continue
+        if rule in FIGURE_RULES and grows(pin.figure, old.figure):
+            detail = f"{rule} {path}: figure {show(pin.figure)} is above the base's {show(old.figure)}"
+            out.append(Violation("pin-new", PINS, pin.line, detail))
         for member in sorted(pin.codes - old.codes):
             detail = f"{rule} {path}: {SET_NOUNS.get(rule, 'member')} {member} is not pinned at the base"
             out.append(Violation("pin-new", PINS, pin.line, detail))
@@ -225,9 +303,35 @@ def run(root: Path, base: str | None, write_index: bool) -> int:
         return 2
 
 
-def check(root: Path, base: str | None, write_index: bool) -> int:
+def run_shellcheck(root: Path) -> int:
+    """Print the `shellcheck` findings of the shell files of the population.
+    Advisory: exits 0 whatever it finds, whether `shellcheck` is absent or the
+    tree cannot be read."""
+    exe = shutil.which("shellcheck")
+    if exe is None:
+        print("shellcheck-report: skipped: shellcheck not on PATH")
+        return 0
+    try:
+        require_work_tree(root)
+        paths = [f"scripts/{f.rel}" for f in load_population(root) if f.rel.endswith(".sh")]
+    except Unavailable as exc:
+        print(f"shellcheck-report: unavailable ({exc})")
+        return 0
+    proc = subprocess.run([exe, "--format=gcc", "--", *paths], cwd=root, capture_output=True, text=True)
+    findings = [line for line in proc.stdout.split("\n") if line.strip()]
+    for line in findings:
+        print(line)
+    print(f"shellcheck-report: {len(findings)} finding(s) in {len(paths)} shell file(s)")
+    return 0
+
+
+def require_work_tree(root: Path) -> None:
     if git_ok(root, "rev-parse", "--is-inside-work-tree") is None:
         raise Unavailable(f"{root} is not inside a git work tree")
+
+
+def check(root: Path, base: str | None, write_index: bool) -> int:
+    require_work_tree(root)
     files = load_population(root)
     name, sha = resolve_base(root, base)
     makefile = root / "Makefile"
@@ -243,7 +347,7 @@ def check(root: Path, base: str | None, write_index: bool) -> int:
     added, renames = changes_since(root, sha)
     ctx = Context(root, files, callers, added, entry_points(files, callers), makefile_text, external, resolver)
     found: list[Violation] = []
-    for _name, rule in (*RULE_FUNCTIONS, *STRUCTURE_RULES):
+    for _name, rule in (*RULE_FUNCTIONS, *STRUCTURE_RULES, *CONTENT_RULES, ("twin", rule_twin)):
         found += sorted(rule(ctx), key=lambda v: (v.path, v.line))
     pins = load_pins(root)
     active, held = apply_pins(found, pins)

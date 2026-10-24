@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Recall test for check_named_skip_notices.sh: planted notice shapes, asserting the reason.
 #
+# Set:    -uo — a failing case must not stop the cases after it
+#
 # Recall test for: check_named_skip_notices.sh
 #
 # WHY

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Recall test for check_gpu_device_census.sh: scan roots, asserting exit code and file:line.
 #
+# Set:    -uo — a failing case must not stop the cases after it
+#
 # Recall test for: check_gpu_device_census.sh default --library
 #
 # Each case builds a throwaway scan root holding the one legitimate site, plants

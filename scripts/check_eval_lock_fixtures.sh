@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Recall test for check_eval_lock.sh: a synthetic scan root per case, asserting exit code and rule.
 #
+# Set:    -uo — a failing case must not stop the cases after it
+#
 # Recall test for: check_eval_lock.sh
 #
 # A source gate is only worth its runtime if it still fires when the thing it
