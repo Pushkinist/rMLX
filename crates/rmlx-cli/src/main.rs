@@ -2686,11 +2686,9 @@ fn run(cli: Cli, run_id: &str) -> Result<i32> {
                     run_class,
                 }),
                 (false, None) => None,
-                (true, None) => {
-                    anyhow::bail!("--record needs --run-class (gate, ab_arm or diagnostic)")
-                }
-                (false, Some(_)) => {
-                    anyhow::bail!("--run-class names the class of a recorded run; pass --record")
+                // clap's `requires` on both flags rejects either one alone first.
+                (true, None) | (false, Some(_)) => {
+                    anyhow::bail!("--record and --run-class are given together")
                 }
             };
 

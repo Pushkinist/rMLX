@@ -144,8 +144,8 @@ pub fn open_readonly(path: &std::path::Path) -> Result<Connection> {
     let conn =
         Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| {
             Error::Schema(format!(
-                "cannot open {} read-only ({e}); a copy taken with \
-                 `rmlx metrics --db {} backup --out <copy>` opens",
+                "cannot open {} read-only ({e}); import a copy taken with \
+                 `rmlx metrics --db {} backup --out <copy>`",
                 path.display(),
                 path.display()
             ))
