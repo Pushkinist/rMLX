@@ -11,7 +11,9 @@
 #     row `recorded_run_class` only when the run says it ingested its record.
 #   - ingest/codec_inertness_ingest.py skips a row the probe already recorded,
 #     and refuses a recorder built before the run class before writing anything.
-#   - ingest/llama_bench_ingest.py refuses that recorder before writing anything.
+#   - ingest/llama_bench_ingest.py refuses that recorder before writing anything,
+#     queues its records under $RMLX_HOME, and records through the checkout's
+#     build rather than an `rmlx` on PATH.
 #
 # No GPU, no model, no DB.
 #
@@ -185,20 +187,61 @@ verdict ingest_refuses_a_classless_recorder "a recorder without --run-class is r
 
 # ── llama_bench_ingest.py ─────────────────────────────────────────────────────
 #
-# It finds its recorder as `rmlx` on PATH first, so the old recorder goes there.
 mkdir -p "$WORK/oldbin" "$WORK/llama_root"
 cp "$OLD_RECORDER" "$WORK/oldbin/rmlx"
 printf '[]\n' >"$WORK/llama_bench.json"
 set +e
-out="$(PATH="$WORK/oldbin:$PATH" RMLX_REPO_ROOT="$WORK/llama_root" \
-	python3 "$REPO_ROOT/scripts/ingest/llama_bench_ingest.py" "$WORK/llama_bench.json" --record 2>&1)"
+out="$(RMLX_HOME="$WORK/llama_home0" RMLX_REPO_ROOT="$WORK/llama_root" \
+	python3 "$REPO_ROOT/scripts/ingest/llama_bench_ingest.py" "$WORK/llama_bench.json" --record \
+	--rmlx-bin "$WORK/oldbin/rmlx" 2>&1)"
 status=$?
 set -e
 bad=""
 [ "$status" -ne 0 ] || bad="exit 0: a classless recorder was accepted"
 grep -q "oldbin/rmlx has no \`metrics record --run-class\`" <<<"$out" || bad="${bad:+$bad; }no refusal naming the binary: $out"
-[ ! -d "$WORK/llama_root/metrics" ] || bad="${bad:+$bad; }a record was written before the refusal"
+[ ! -d "$WORK/llama_home0/metrics" ] || bad="${bad:+$bad; }a record was written before the refusal"
 verdict llama_bench_refuses_a_classless_recorder "a recorder without --run-class is refused before anything is written" "$bad"
+
+cat >"$WORK/llama_row.json" <<'ROW'
+[{"model_filename": "/models/hf__Qwen3-8B-Q8_0.gguf", "test_time": "2026-10-01T00:00:00Z",
+  "type_k": "f16", "type_v": "f16", "n_prompt": 0, "n_gen": 128, "avg_ts": 50.0,
+  "stddev_ts": 0.5, "build_commit": "abc1234", "n_gpu_layers": 99}]
+ROW
+set +e
+RMLX_HOME="$WORK/llama_home" RMLX_REPO_ROOT="$WORK/llama_root" \
+	python3 "$REPO_ROOT/scripts/ingest/llama_bench_ingest.py" "$WORK/llama_row.json" \
+	>"$WORK/llama_queue.out" 2>&1
+status=$?
+set -e
+bad=""
+[ "$status" -eq 0 ] || bad="exit=$status: $(tail -2 "$WORK/llama_queue.out" | tr '\n' ' ')"
+queued="$(ls "$WORK/llama_home/metrics/buffer/pending/"*.json 2>/dev/null | wc -l | tr -d ' ')"
+[ "$queued" = 1 ] || bad="${bad:+$bad; }$queued file(s) under \$RMLX_HOME/metrics/buffer/pending (want 1)"
+[ ! -d "$WORK/llama_root/metrics" ] || bad="${bad:+$bad; }a record was queued under the repo root"
+verdict llama_bench_queues_under_rmlx_home "a record is queued under \$RMLX_HOME, not the repo root" "$bad"
+
+# A recorder that has the flag and logs which copy of it ran.
+make_logging_recorder() { # <path> <name>
+	mkdir -p "$(dirname "$1")"
+	cat >"$1" <<STUB
+#!/usr/bin/env bash
+if [ "\$*" = "metrics record --help" ]; then echo "      --run-class <CLASS>"; exit 0; fi
+echo "$2" >>"$WORK/llama_recorder.log"
+STUB
+	chmod +x "$1"
+}
+make_logging_recorder "$WORK/pathbin/rmlx" path
+make_logging_recorder "$WORK/llama_root2/target/release/rmlx" checkout
+: >"$WORK/llama_recorder.log"
+set +e
+PATH="$WORK/pathbin:$PATH" RMLX_HOME="$WORK/llama_home2" RMLX_REPO_ROOT="$WORK/llama_root2" \
+	python3 "$REPO_ROOT/scripts/ingest/llama_bench_ingest.py" "$WORK/llama_row.json" --record \
+	>"$WORK/llama_record.out" 2>&1
+set -e
+bad=""
+used="$(sort -u "$WORK/llama_recorder.log" | tr '\n' ' ')"
+[ "$used" = "checkout " ] || bad="the recorder that ran: ${used:-none} (want the checkout's build only); $(tail -2 "$WORK/llama_record.out" | tr '\n' ' ')"
+verdict llama_bench_records_through_the_checkout "an rmlx on PATH is not chosen over the checkout's build" "$bad"
 
 echo
 echo "passed=$PASSED failed=$FAILED"

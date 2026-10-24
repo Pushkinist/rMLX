@@ -2,8 +2,10 @@
 """Ingest llama-bench JSON output into the rMLX metrics DB.
 
 Converts `llama-bench -o json` result rows into the §8.5 universal ingest
-record shape and writes each one to `metrics/buffer/pending/` for pickup by
-`rmlx metrics record --file <path>`.
+record shape and writes each one to `<RMLX_HOME>/metrics/buffer/pending/` for
+pickup by `rmlx metrics record --file <path>`. `--record` records through
+`--rmlx-bin`, by default the checkout's `target/release/rmlx`, never an `rmlx`
+found on PATH.
 
 Usage:
     # Write pending buffer file(s) only — human can inspect before ingest:
@@ -74,11 +76,11 @@ sys.path.insert(0, str(_SCRIPT_DIR.parent / "lib"))
 from recorder_check import require_run_class_recorder  # noqa: E402
 from snapshot_identity import split_model_dir  # noqa: E402
 RMLX_REPO_ROOT = Path(os.environ.get("RMLX_REPO_ROOT", str(_SCRIPT_DIR.parents[1])))
-_BUFFER_PENDING = RMLX_REPO_ROOT / "metrics" / "buffer" / "pending"
-_BUFFER_FAILED = RMLX_REPO_ROOT / "metrics" / "buffer" / "failed"
-RMLX_DB_PATH = Path(
-    os.environ.get("RMLX_METRICS_DB", str(RMLX_REPO_ROOT / "metrics" / "runs.db"))
-)
+# Runtime state lives under a single root (CLAUDE.md). `RMLX_HOME` wins; the
+# in-repo `.rmlx/` is the dev default. The recorder resolves the DB itself.
+RMLX_HOME = Path(os.environ.get("RMLX_HOME", str(RMLX_REPO_ROOT / ".rmlx")))
+_BUFFER_PENDING = RMLX_HOME / "metrics" / "buffer" / "pending"
+_BUFFER_FAILED = RMLX_HOME / "metrics" / "buffer" / "failed"
 
 DEFAULT_HARDWARE_TAG = "m5_max_128gb"
 
@@ -374,19 +376,6 @@ def _group_key(row: dict[str, Any]) -> tuple[str, ...]:
 
 # ── Buffer write + recorder invocation ────────────────────────────────────────
 
-def _find_rmlx_bin() -> str | None:
-    result = subprocess.run(["which", "rmlx"], capture_output=True, text=True)
-    if result.returncode == 0:
-        return result.stdout.strip()
-    release = RMLX_REPO_ROOT / "target" / "release" / "rmlx"
-    if release.exists():
-        return str(release)
-    debug = RMLX_REPO_ROOT / "target" / "debug" / "rmlx"
-    if debug.exists():
-        return str(debug)
-    return None
-
-
 def _write_pending(payload: dict[str, Any]) -> Path:
     """Write one §8.5 payload to metrics/buffer/pending/ and return the path."""
     _BUFFER_PENDING.mkdir(parents=True, exist_ok=True)
@@ -397,19 +386,10 @@ def _write_pending(payload: dict[str, Any]) -> Path:
     return record_path
 
 
-def _invoke_recorder(record_path: Path) -> bool:
+def _invoke_recorder(record_path: Path, rmlx_bin: str) -> bool:
     """Call `rmlx metrics record --file <path>`.  Return True on success."""
-    rmlx_bin = _find_rmlx_bin()
-    if rmlx_bin is None:
-        print(
-            f"[llama_bench_ingest] ERROR: rmlx binary not found; "
-            f"pending file kept at {record_path}",
-            file=sys.stderr,
-        )
-        return False
-
     result = subprocess.run(
-        [rmlx_bin, "metrics", "--db", str(RMLX_DB_PATH), "record", "--file", str(record_path)],
+        [rmlx_bin, "metrics", "record", "--file", str(record_path)],
         capture_output=True,
         text=True,
     )
@@ -437,7 +417,7 @@ def _invoke_recorder(record_path: Path) -> bool:
 def ingest(
     source_path: str,
     hardware_tag: str,
-    invoke_recorder: bool,
+    rmlx_bin: str | None,
     dry_run: bool,
 ) -> int:
     """Parse llama-bench JSON, build §8.5 records, write to buffer.
@@ -505,8 +485,8 @@ def ingest(
         record_path = _write_pending(payload)
         print(f"[llama_bench_ingest] wrote {record_path}", flush=True)
 
-        if invoke_recorder:
-            ok = _invoke_recorder(record_path)
+        if rmlx_bin is not None:
+            ok = _invoke_recorder(record_path, rmlx_bin)
             if ok:
                 print(f"[llama_bench_ingest] recorded OK", flush=True)
         n_written += 1
@@ -541,6 +521,11 @@ def main() -> None:
         help="Print §8.5 JSON records to stdout without writing files or calling recorder.",
     )
     parser.add_argument(
+        "--rmlx-bin",
+        default=str(RMLX_REPO_ROOT / "target" / "release" / "rmlx"),
+        help="the rmlx that records with --record (default: the checkout's release build)",
+    )
+    parser.add_argument(
         "--hardware-tag",
         default=DEFAULT_HARDWARE_TAG,
         help=f"hardware_tag for the observations (default: {DEFAULT_HARDWARE_TAG}).",
@@ -550,15 +535,12 @@ def main() -> None:
     if args.dry_run and args.record:
         parser.error("--dry-run and --record are mutually exclusive")
     if args.record:
-        rmlx_bin = _find_rmlx_bin()
-        if rmlx_bin is None:
-            raise SystemExit("[llama_bench_ingest] ERROR: rmlx binary not found; nothing written")
-        require_run_class_recorder(rmlx_bin)
+        require_run_class_recorder(args.rmlx_bin)
 
     n = ingest(
         source_path=args.input,
         hardware_tag=args.hardware_tag,
-        invoke_recorder=args.record,
+        rmlx_bin=args.rmlx_bin if args.record else None,
         dry_run=args.dry_run,
     )
     print(f"[llama_bench_ingest] done: {n} record(s) processed", flush=True)
