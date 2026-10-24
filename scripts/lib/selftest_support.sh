@@ -98,7 +98,7 @@ st_verdict() {
 		ST_FAILED=$((ST_FAILED + 1))
 		printf '  FAIL %s%s\n' "$name" "${what:+ - $what}"
 		printf '%s\n' "$why" | sed 's/^/         /'
-		[ -z "$ST_OUT" ] || printf '%s\n' "$ST_OUT" | head -40 | sed 's/^/    | /'
+		[ -z "$ST_OUT" ] || printf '%s\n' "$ST_OUT" | sed -n '1,40s/^/    | /p'
 	fi
 	ST_OUT=""
 }
@@ -260,9 +260,13 @@ sg_commit_all() {
 			commit -q -m "$2" || st_die "cannot commit the fixture tree $1"
 }
 
-# sg_row_line <root> <rel> — the INDEX.md line that holds the row for <rel>.
+# sg_row_line <root> <rel> — the INDEX.md line that holds the row for <rel>; a row that is
+# not there ends the harness with exit 2, naming it.
 sg_row_line() {
-	grep -n -F "| \`$2\` |" "$1/scripts/INDEX.md" | head -n 1 | cut -d: -f1
+	local rows
+	rows=$(grep -n -F "| \`$2\` |" "$1/scripts/INDEX.md" || true)
+	[ -n "$rows" ] || st_die "sg_row_line: scripts/INDEX.md has no row for $2"
+	printf '%s' "${rows%%:*}"
 }
 
 # sg_entry_sh <line 2> <line 3> <usage> <exit> <caller> <not-a-mode> <body> — a shell

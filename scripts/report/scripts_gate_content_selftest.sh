@@ -561,6 +561,25 @@ root=$(sg_fresh heredoc_continued_opener_20)
 verdict heredoc_opener_on_a_continuation_line_at_the_limit 0 "the same with 20 lines" "$root" \
     --has "check-scripts: ok (5 files"
 
+root=$(sg_fresh heredoc_after_a_shift)
+{
+    sg_valid_sh ':'
+    printf '%s\n' 'n=3' 'x=$((1<<n))' '(( y = 2<<n ))' 'z=$(( (1<<n) + (3<<n) ))'
+    py_heredoc 21
+} | sg_put "$root" check/y.sh
+verdict heredoc_after_an_arithmetic_shift 1 "<< inside \$(( )) and (( )) opens no heredoc: the 21-line body after them is found" "$root" \
+    --has "heredoc: check/y.sh:14: a Python body of 21 lines, over 20"
+
+root=$(sg_fresh shift_then_exit)
+{ sg_valid_sh ':'; printf '%s\n' 'n=3' 'x=$((1<<n))' 'exit 7'; } | sg_put "$root" check/y.sh
+verdict arithmetic_shift_keeps_other_rules_reading 1 "the line after a shift is read by exit-undeclared" "$root" \
+    --has "exit-undeclared: check/y.sh:12: 7 is not declared in \`Exit:\`"
+
+root=$(sg_fresh shift_then_real_heredoc)
+{ sg_valid_sh ':'; printf '%s\n' 'x=$((1<<3))' "cat <<'EOT'" 'exit 7' 'EOT'; } | sg_put "$root" check/y.sh
+verdict arithmetic_shift_then_a_heredoc_body_is_still_blanked 0 "a heredoc after a shift still hides its body" "$root" \
+    --has "check-scripts: ok (5 files"
+
 root=$(sg_fresh heredoc_continued_other)
 {
     sg_valid_sh ':'
@@ -996,13 +1015,28 @@ verdict env_knob_python_not_reads 0 "a store, a lower-case name and the system n
 
 root=$(sg_fresh env_declared)
 sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
-declare KNOB_E
+declare KNOB_E=1
 read -r KNOB_F
-export KNOB_G
-: "${KNOB_E:-x}" "${KNOB_F:-x}" "${KNOB_G:-x}"
+export KNOB_G=2
+readonly KNOB_H=3
+: "${KNOB_E:-x}" "${KNOB_F:-x}" "${KNOB_G:-x}" "${KNOB_H:-x}"
 EOF
-verdict env_knob_declared_names 0 "a name declared by declare, read or export is the file's own" "$root" \
+verdict env_knob_declared_names 0 "a name given a value by declare, read, export or readonly is the file's own" "$root" \
     --has "check-scripts: ok (5 files"
+
+root=$(sg_fresh env_bare_declarations)
+sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
+export KNOB_A
+declare -x KNOB_B
+readonly KNOB_C
+local KNOB_D
+: "${KNOB_A:-x}" "${KNOB_B:-x}" "${KNOB_C:-x}" "${KNOB_D:-x}" "$KNOB_A"
+EOF
+verdict env_knob_bare_declarations_assign_nothing 1 "export, declare -x, readonly and local without a value only re-export what the environment holds" "$root" \
+    --has "env-knob: check/y.sh:14: reads the environment variable KNOB_A" \
+    --has "env-knob: check/y.sh:14: reads the environment variable KNOB_B" \
+    --has "env-knob: check/y.sh:14: reads the environment variable KNOB_C" \
+    --has "env-knob: check/y.sh:14: reads the environment variable KNOB_D"
 
 root=$(sg_fresh env_py_imported)
 py_entry "$root" report/y.py <<'EOF'
@@ -1204,6 +1238,25 @@ A = E["KNOB_A"]
 EOF
 verdict env_knob_python_aliased_import 1 "from os import environ as E" "$root" \
     --has "env-knob: report/y.py:11: reads the environment variable KNOB_A"
+
+root=$(sg_fresh env_py_getenv_forms)
+py_entry "$root" report/y.py <<'EOF'
+import os
+from os import getenv as ge
+
+A = ge("KNOB_A")
+B = os.getenv(key="KNOB_B")
+C = os.environ.get(key="KNOB_C")
+D = ge(key="KNOB_D")
+E = os.getenv(default="x")
+F = ge("lower")
+EOF
+verdict env_knob_python_getenv_alias_and_keyword 1 "from os import getenv as ge, and a key given as a keyword" "$root" \
+    --has "env-knob: report/y.py:12: reads the environment variable KNOB_A" \
+    --has "env-knob: report/y.py:13: reads the environment variable KNOB_B" \
+    --has "env-knob: report/y.py:14: reads the environment variable KNOB_C" \
+    --has "env-knob: report/y.py:15: reads the environment variable KNOB_D" \
+    --lacks "report/y.py:16:" --lacks "report/y.py:17:"
 
 root=$(sg_fresh env_py_not_reads_more)
 py_entry "$root" report/y.py <<'EOF'

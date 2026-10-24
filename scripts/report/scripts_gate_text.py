@@ -35,6 +35,9 @@ SOURCING = frozenset({"source", "."})
 OPTIONS_WITH_VALUE = frozenset({"-u", "-C", "-s"})
 PROSE_COMMANDS = frozenset({"echo", "printf"})
 SUBPROCESS_CALLS = frozenset({"run", "check_output", "check_call", "call", "Popen"})
+ROOT_PREFIX_RE = re.compile(r'(?:\./|"?\$(?:\w+|\{\w+(?::?[-=+?][^}]*)?\}|\([^()]*\))"?/)$')
+PATH_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./-")
+WORD_CHARS = PATH_CHARS - {"-"}
 
 
 def clean_shell(text: str, blank_strings: bool, join: bool = False, blank_single: bool = False) -> list[str]:
@@ -108,6 +111,13 @@ def clean_shell(text: str, blank_strings: bool, join: bool = False, blank_single
             while i < n and text[i] != "\n":
                 i += 1
             continue
+        if c == "(" and text.startswith("((", i):
+            end = arithmetic_end(text, i)
+            if end > i:
+                out.append(text[i:end])
+                prev = ")"
+                i = end
+                continue
         if c == "<" and text.startswith("<<", i) and not text.startswith("<<<", i):
             found = HEREDOC_RE.match(text, i)
             if found:
@@ -121,6 +131,31 @@ def clean_shell(text: str, blank_strings: bool, join: bool = False, blank_single
         i += 1
     lines.append("".join(out))
     return lines
+
+
+def arithmetic_end(text: str, i: int) -> int:
+    """Index just past the `((...))` that starts at `i` and closes on its line,
+    else `i`. A `<<` inside it shifts bits and opens no heredoc."""
+    depth = 0
+    for j in range(i, len(text)):
+        if text[j] == "\n":
+            break
+        depth += (text[j] == "(") - (text[j] == ")")
+        if depth == 0:
+            return j + 1
+    return i
+
+
+def arithmetic_spans(line: str) -> list[tuple[int, int]]:
+    """The (start, end) of each `((...))` of a line."""
+    spans: list[tuple[int, int]] = []
+    i = line.find("((")
+    while i >= 0:
+        end = arithmetic_end(line, i)
+        if end > i:
+            spans.append((i, end))
+        i = line.find("((", max(end, i + 1))
+    return spans
 
 
 def skip_substitution(text: str, i: int) -> int:
@@ -167,6 +202,20 @@ def skip_heredocs(text: str, i: int, pending: list[tuple[str, bool]], lines: lis
             if (body.lstrip("\t") if strip_tabs else body).rstrip() == tag:
                 break
     return i
+
+
+def starts_a_token(line: str, start: int) -> bool:
+    """Whether the `scripts/` at `start` is the repository's directory: at the
+    start of a word, or behind a repository-root expression (`./`, `$VAR/`,
+    `${VAR}/`, `${VAR:-x}/`, `$(cmd)/`, each quoted or not). A path through `../`
+    or another directory is another tree."""
+    before = line[:start]
+    if not before or before[-1] not in PATH_CHARS:
+        return True
+    if before[-1] != "/":
+        return False
+    prefix = ROOT_PREFIX_RE.search(before)
+    return bool(prefix) and (prefix.start() == 0 or before[prefix.start() - 1] not in WORD_CHARS)
 
 
 def shell_literal_exits(text: str) -> list[tuple[int, int]]:

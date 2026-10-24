@@ -15,15 +15,13 @@ import re
 from scripts_gate_files import Script, Violation, first_token, git, git_ignored, named_file, scripts_tree
 from scripts_gate_recall import is_recall_test, reachable
 from scripts_gate_rules import Context
+from scripts_gate_text import starts_a_token
 
 SHEBANGS = {".sh": "#!/usr/bin/env bash", ".py": "#!/usr/bin/env python3"}
 LIB_PREFIX = "lib/"
 LIB_CONSUMERS_MIN = 2
 SELFTEST_SUPPORT = "lib/selftest_support.sh"
 DEAD_TOKEN_RE = re.compile(r"scripts/([\w./-]*)")
-ROOT_PREFIX_RE = re.compile(r'(?:\./|\$\w+/|\$\{\w+\}/|\$\(\w+\)/|"\$\w+"/|"\$\{\w+\}"/)$')
-PATH_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./-")
-WORD_CHARS = PATH_CHARS - {"-"}
 PATTERN_FOLLOWERS = frozenset("*<{$([?\\+|")
 DOC_ROOTS = ("CLAUDE.md", "CONTRIBUTING.md", "README.md", "Makefile", ".pre-commit-config.yaml", "scripts/README.md")
 OUTSIDE = "../"
@@ -111,20 +109,6 @@ def rule_orphan(ctx: Context) -> list[Violation]:
         if f.is_code and unused and not f.rel.startswith(LIB_PREFIX):
             out.append(Violation("orphan", f.rel, 1, "no shebang and nothing runs, sources or imports it"))
     return out
-
-
-def starts_a_token(line: str, start: int) -> bool:
-    """Whether the `scripts/` at `start` is the repository's directory: at the
-    start of a word, or behind a repository-root expression (`./`, `$VAR/`,
-    `${VAR}/`, `$(VAR)/`, `"$VAR"/`). A path through `../` or another directory
-    is another tree."""
-    before = line[:start]
-    if not before or before[-1] not in PATH_CHARS:
-        return True
-    if before[-1] != "/":
-        return False
-    prefix = ROOT_PREFIX_RE.search(before)
-    return bool(prefix) and (prefix.start() == 0 or before[prefix.start() - 1] not in WORD_CHARS)
 
 
 def dead_tokens(text: str, files: set[str], dirs: set[str]) -> list[tuple[int, str]]:

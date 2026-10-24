@@ -211,5 +211,5 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `report/scripts_gate_rules.py` | report/scripts_gate.py, report/scripts_gate_content.py, report/scripts_gate_env.py, +3 more scripts | The per-file rules of the scripts gate and their registry. |
 | `report/scripts_gate_selftest.sh` | make check-scripts-selftest, make ci | Recall test for debt_report.py --scripts: planted trees, asserting exit code and rule:file:line. |
 | `report/scripts_gate_structure.py` | report/scripts_gate.py, report/scripts_gate_content.py | Structural rules of the scripts gate: lib/, modules, shebang, exec bit, orphans, dead paths. |
-| `report/scripts_gate_text.py` | report/scripts_gate_callers.py, report/scripts_gate_content.py, report/scripts_gate_env.py, +2 more scripts | Readers of script text: shell, Python and Makefile source. |
+| `report/scripts_gate_text.py` | report/scripts_gate_callers.py, report/scripts_gate_content.py, report/scripts_gate_env.py, +3 more scripts | Readers of script text: shell, Python and Makefile source. |
 | `report/scripts_gate_twin.py` | report/scripts_gate.py | The twin rule of the scripts gate: two files of one language that say the same lines. |

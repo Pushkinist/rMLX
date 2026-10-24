@@ -18,7 +18,7 @@ from pathlib import Path
 
 from scripts_gate_external import PRE_COMMIT_LABEL, External
 from scripts_gate_files import INDEX, Script, Violation
-from scripts_gate_text import Refs, clean_shell, make_recipes, make_refs, python_refs, shell_refs
+from scripts_gate_text import Refs, clean_shell, make_recipes, make_refs, python_refs, shell_refs, starts_a_token
 
 CALLERS_SHOWN = 3
 MAKE_SITE = "make:"
@@ -49,8 +49,10 @@ SCRIPTS_DIR_RE = re.compile(r"(?:^|/)scripts/(.*)$")
 class Resolver:
     """The file of the tree a word names. Only the part after the word's last
     expansion is read. A part that goes through a `scripts/` directory must name
-    the file's path under it; any other names the file by its base name when that
-    is unique, else by its path."""
+    the file's path under it, and that directory must be the repository's (the
+    test `dead-path` applies: a word start or a repository-root expression in
+    front), else the word names a file of another tree and no file here; any other
+    part names the file by its base name when that is unique, else by its path."""
 
     def __init__(self, files: list[Script]) -> None:
         self.by_base: dict[str, list[Script]] = defaultdict(list)
@@ -63,6 +65,12 @@ class Resolver:
         literal = EXPANSION_RE.split(word)[-1]
         candidates = self.by_base.get(os.path.basename(literal), [])
         below_scripts = SCRIPTS_DIR_RE.search(literal)
+        if below_scripts:
+            start = len(word) - len(literal) + below_scripts.start()
+            if word[start] == "/":
+                start += 1
+            if not starts_a_token(word, start):
+                return []
         found = []
         for f in candidates:
             if f.is_code != code:

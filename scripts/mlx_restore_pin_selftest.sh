@@ -135,8 +135,9 @@ resolves() { (cd "$1/prefix/$2" 2>/dev/null && pwd -P); }
 
 # restore_run <case>: the script under test, run from the case's repo tree.
 restore_run() {
+	local repo="$1/repo"
 	PATH="$1/bin:$ST_WORK/bin:$PATH" HOMEBREW_PREFIX="$1/prefix" RMLX_BOTTLE_STORE="$1/store" \
-		bash "$1/repo/scripts/mlx_restore_pin.sh"
+		bash "$repo/scripts/mlx_restore_pin.sh"
 }
 
 # expect <name> <case> <exit> <needles> [<check> <arg>]...

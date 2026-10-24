@@ -128,23 +128,43 @@ plant "$root" scripts/check_claim_bypass.sh "rm -f /tmp/rmlx.claim; pkill -f rml
 plant "$root" scripts/check_claim_bypass_selftest.sh "rm -f /tmp/rmlx.claim; pkill -f rmlx"
 st_case self_exclude 0 --what "the gate and its selftest are not scanned" -- bash "$GATE" "$root"
 
+# doc_rows_plant <docs root> <scan root>: copy the lines of CLAUDE.md and
+# scripts/INDEX.md that name the gate into the scan root; set why when a doc
+# has fewer than two (why is empty otherwise).
+doc_rows_plant() {
+    local docs="$1" root="$2" doc rows
+    why=""
+    for doc in CLAUDE.md scripts/INDEX.md; do
+        rows="$(grep -F -e 'check-claim-bypass' -e 'check_claim_bypass' "$docs/$doc" || true)"
+        if [ "$(grep -c '' <<<"$rows")" -lt 2 ]; then
+            why="$doc has fewer than two rows naming the gate"
+            return 0
+        fi
+        mkdir -p "$(dirname "$root/$doc")"
+        printf '%s\n' "$rows" >"$root/$doc"
+    done
+}
+
 # The rows that document the gate say what it refuses without spelling a
 # refused command. They are planted as the tree has them, so a row reworded into
 # a violation fails here, and a lost row fails as a missing row.
 root="$(fresh doc_rows)"
-doc_rows_found=1
-for doc in CLAUDE.md scripts/INDEX.md; do
-    rows="$(grep -F -e 'check-claim-bypass' -e 'check_claim_bypass' "$REPO_ROOT/$doc")"
-    if [ "$(grep -c '' <<<"$rows")" -lt 2 ]; then
-        st_verdict doc_rows "$doc has fewer than two rows naming the gate"
-        doc_rows_found=0
-        continue
-    fi
-    mkdir -p "$(dirname "$root/$doc")"
-    printf '%s\n' "$rows" >"$root/$doc"
-done
-[ "$doc_rows_found" -eq 1 ] &&
+doc_rows_plant "$REPO_ROOT" "$root"
+if [ -n "$why" ]; then
+    st_verdict doc_rows "$why"
+else
     st_case doc_rows 0 --what "the gate's rows in CLAUDE.md and scripts/INDEX.md pass it" -- bash "$GATE" "$root"
+fi
+
+# A doc with no row is named, and the verdict is reached.
+docs="$ST_WORK/docs_without_rows"
+mkdir -p "$docs/scripts"
+printf 'no row here\n' >"$docs/CLAUDE.md"
+printf 'no row here\n' >"$docs/scripts/INDEX.md"
+root="$(fresh doc_rows_lost)"
+doc_rows_plant "$docs" "$root"
+st_verdict doc_rows_lost "$([ "$why" = "CLAUDE.md has fewer than two rows naming the gate" ] || echo "verdict is '$why'")" \
+    "a doc with no row is named, not a silent abort"
 
 # A violation in a file that is tracked, not merely untracked, is reported.
 root="$(fresh tracked_violation)"

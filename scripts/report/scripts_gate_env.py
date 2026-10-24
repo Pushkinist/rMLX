@@ -45,9 +45,11 @@ def shell_commands(line: str) -> Iterator[list[str]]:
 
 def assigned_by(command: list[str]) -> set[str]:
     """The names a command assigns: leading `NAME=value` words, the names a
-    declaring builtin (`local`, `export`, `read`, ...) takes, and the variable of
-    a `for` loop. An assignment whose value expands the name itself reads it
-    instead (`X="${X:-d}"`) and assigns nothing."""
+    declaring builtin takes with a value (`export NAME=v`; `read NAME` takes its
+    value from input), and the variable of a `for` loop. A bare `export NAME`,
+    `declare -x NAME`, `readonly NAME` or `local NAME` assigns nothing. An
+    assignment whose value expands the name itself reads it instead
+    (`X="${X:-d}"`) and assigns nothing."""
     out: set[str] = set()
     i = 0
     while i < len(command) and (command[i] in KEYWORDS or ASSIGN_WORD_RE.match(command[i])):
@@ -59,7 +61,8 @@ def assigned_by(command: list[str]) -> set[str]:
     if rest[:1] and rest[0] in DECLARING:
         for word in rest[1:]:
             name = word.split("=", 1)[0]
-            if not word.startswith("-") and IDENTIFIER_RE.fullmatch(name) and not references(word[len(name) :], name):
+            valued = "=" in word or rest[0] == "read"
+            if valued and not word.startswith("-") and IDENTIFIER_RE.fullmatch(name) and not references(word[len(name) :], name):
                 out.add(name)
     elif len(rest) > 2 and rest[0] == "for" and rest[2] == "in" and IDENTIFIER_RE.fullmatch(rest[1]):
         out.add(rest[1])
@@ -184,6 +187,22 @@ def environ_names(tree: ast.Module) -> set[str]:
     return names
 
 
+def getenv_names(tree: ast.Module) -> set[str]:
+    """The names `getenv` is called by: itself, and `from os import getenv as x`."""
+    names = {"getenv"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "os":
+            names.update(a.asname or a.name for a in node.names if a.name == "getenv")
+    return names
+
+
+def call_key(node: ast.Call) -> ast.expr | None:
+    """The key a call looks up: its first argument, else its `key=` keyword."""
+    if node.args:
+        return node.args[0]
+    return next((k.value for k in node.keywords if k.arg == "key"), None)
+
+
 def literal_key(key: ast.expr | None) -> str:
     return key.value if isinstance(key, ast.Constant) and isinstance(key.value, str) else UNKNOWN_NAME
 
@@ -197,6 +216,7 @@ def python_env_reads(text: str) -> Iterator[tuple[int, str]]:
     except SyntaxError:
         return
     aliases = environ_names(tree)
+    getenvs = getenv_names(tree)
 
     def is_environ(node: ast.expr) -> bool:
         return (isinstance(node, ast.Attribute) and node.attr == "environ") or (
@@ -206,14 +226,14 @@ def python_env_reads(text: str) -> Iterator[tuple[int, str]]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Subscript) and is_environ(node.value) and isinstance(node.ctx, ast.Load):
             yield node.lineno, literal_key(node.slice)
-        elif isinstance(node, ast.Call) and node.args:
+        elif isinstance(node, ast.Call) and call_key(node) is not None:
             func = node.func
             on_environ = isinstance(func, ast.Attribute) and func.attr in ("get", "setdefault", "pop") and is_environ(func.value)
             getenv = (isinstance(func, ast.Attribute) and func.attr == "getenv") or (
-                isinstance(func, ast.Name) and func.id == "getenv"
+                isinstance(func, ast.Name) and func.id in getenvs
             )
             if on_environ or getenv:
-                yield node.lineno, literal_key(node.args[0])
+                yield node.lineno, literal_key(call_key(node))
         elif isinstance(node, ast.Compare) and isinstance(node.ops[0], (ast.In, ast.NotIn)) and is_environ(node.comparators[0]):
             yield node.lineno, literal_key(node.left)
 

@@ -19,7 +19,7 @@ from scripts_gate_files import Script, Violation
 from scripts_gate_rules import Context, not_a_mode_target
 from scripts_gate_recall import is_recall_test
 from scripts_gate_structure import LIB_PREFIX
-from scripts_gate_text import HEREDOC_RE, KEYWORDS, clean_shell, split_commands
+from scripts_gate_text import HEREDOC_RE, KEYWORDS, arithmetic_spans, clean_shell, split_commands
 
 PY_FLOOR = (3, 9)
 OPTION_LETTERS = {"errexit": "e", "nounset": "u"}
@@ -264,7 +264,15 @@ def python_bodies(text: str) -> Iterator[tuple[int, int]]:
     for command, segments in command_lines(clean_shell(text, True)):
         if segments[0][1] < resume:
             continue
-        opener = next((m for m in HEREDOC_RE.finditer(command) if command[m.start() - 1 : m.start()] != "<"), None)
+        shifts = arithmetic_spans(command)
+        opener = next(
+            (
+                m
+                for m in HEREDOC_RE.finditer(command)
+                if command[m.start() - 1 : m.start()] != "<" and not any(a <= m.start() < b for a, b in shifts)
+            ),
+            None,
+        )
         if opener:
             if PYTHON_WORD_RE.search(command):
                 first = physical_position(segments, opener.start())[0]

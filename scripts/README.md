@@ -6,7 +6,8 @@ file with its caller and purpose; `make scripts-index` generates it from the
 files' own headers and `make check-scripts` fails when it differs, so never
 edit it by hand. A rule marked [gate] is enforced by a named `make` gate
 (`make check-scripts` unless the line names another); [review] is the
-reviewer's.
+reviewer's. The gate catches the honest mistake; a deliberate evasion is the
+reviewer's to find (section 12).
 
 ## 1. Add a mode, not a script
 
@@ -27,9 +28,11 @@ point, not the file itself, `INDEX.md`, `README.md` or a directory
 
 Two kinds of file are not tools and need no such line: a recall test, whose
 `Recall test for: <file>` names another file of the tree, and a module, whose
-`Module of: <file>` does. A name that ends in `_selftest.sh` proves nothing, and
-a `Module of:` or `Recall test for:` that names nothing leaves the file an
-entry point under every rule. A file is new when it is absent at the base; move
+`Module of: <file>` does. A name proves nothing alone and a claim proves
+nothing without the name: a `Recall test for:` is honoured only in a file named
+`*_selftest.<ext>` or `*_fixtures.<ext>` that runs the tool (section 3). A
+`Module of:` or `Recall test for:` that names nothing, or whose conditions fail,
+leaves the file an entry point under every rule. A file is new when it is absent at the base; move
 a file with `git mv`, because a plain `mv` that is not staged reads as a new
 file.
 
@@ -135,7 +138,10 @@ comment):
   `--` of `st_case`; `VAR="${1:-<path>}"` counts the default as the path. A word is
   read from its last expansion on: `"$ROOT/scripts/lib/identity.sh"` names `lib/identity.sh` and
   nothing else, and a word with no `scripts/` in it (`"$HERE/identity.sh"`) names the one
-  file of that base name. Text in single quotes is no command, and a `$( )` inside
+  file of that base name. A `scripts/` in a word is the repository's only where
+  `dead-path` reads it as the repository's (section 7): at the start of the word
+  or behind a repository-root expression, so `/opt/x/scripts/check/c.sh` and
+  `../scripts/check/c.sh` run no file of this tree. Text in single quotes is no command, and a `$( )` inside
   single quotes runs nothing. A Python file runs a file through a command vector passed
   to a call, or through a name bound to the path (a string, or `Path(__file__)`
   arithmetic) and passed as the program of a `subprocess` call; a name that is
@@ -148,14 +154,16 @@ comment):
   line when something does. [gate: `caller`, entry points]
 * A recall test names its subject: `Recall test for: <tool> [<mode> ...]`, the
   tool a path relative to `scripts/`, one line per tool; a test that covers
-  several modes lists them. A claim holds only when the tool exists and is not
-  the file itself, the test runs, sources or imports the tool (the derived caller
-  relation, through what the test runs too), and each mode token occurs in the
+  several modes lists them. A claim holds only when all of these hold: the file
+  is named `*_selftest.<ext>` or `*_fixtures.<ext>`; the tool exists and is not
+  the file itself; the test runs, sources or imports the tool (the derived caller
+  relation, through what the test runs too); and each mode token occurs in the
   tool's text and in the test's own code: not in a comment or the header, not in
-  a shell heredoc body, not in a Python docstring. A claim that does not hold
-  exempts the file from nothing: `not-a-mode`, `recall-missing`, `dead-path`,
-  `binary-literal` and `lib-consumers` all read it as no recall test. It is
-  reported as `recall-stale`, which cannot be pinned. [gate: `recall-stale`]
+  a shell heredoc body, not in any Python docstring (module, class or function).
+  A claim that does not hold exempts the file from nothing: `not-a-mode`,
+  `recall-missing`, `dead-path`, `binary-literal` and `lib-consumers` all read it
+  as no recall test. It is reported as `recall-stale`, naming the condition that
+  failed, and that cannot be pinned. [gate: `recall-stale`]
 * A mode is the first argument of the line that runs the tool that is an option or
   a bare word (`--library`, `verify`). An option followed by a word that is not an
   option takes it as its value, so neither is a mode and the scan goes on after
@@ -202,7 +210,8 @@ comment):
 * No Python heredoc or `python3 -c` body longer than 20 lines in a `.sh`
   file; it becomes a `.py` file. A body is the lines between the opener of a
   heredoc on a command line that holds `python` or `python3` and its terminator,
-  or the lines of a `-c` string. A command continued with a backslash is one
+  or the lines of a `-c` string; a `<<` inside `((...))` or `$((...))` shifts bits
+  and opens no heredoc. A command continued with a backslash is one
   command line, and the violation names the physical line of the opener or of the
   opening quote. The heredoc of another command is skipped whole,
   so Python held in the body of a `cat` heredoc is text. A file with a longer
@@ -223,9 +232,12 @@ comment):
   under both modes against its real subject and against a stub subject, and under
   `-e` it stops where the reason says. A recall test built on `st_case` takes the
   subject's status itself and needs no field: it runs under `set -euo pipefail`
-  when its per-case table is the same under both modes, and is pinned
-  (`set-mode`) when it is not. A pipeline that ends in `head` is a non-zero
-  status under `pipefail` (SIGPIPE); generate repeated lines in a loop.
+  when its per-case tables are identical under both modes against the real
+  subject and against a broken copy of it, and is pinned (`set-mode`) when they
+  are not. A pipeline that ends in `head` is a non-zero status under `pipefail`
+  (SIGPIPE); generate repeated lines in a loop. A `$(grep ...)` or `grep | ...`
+  that finds nothing is a non-zero status under `-e`; end it with `|| true`, or
+  test the result and say what is missing.
   [gate: `set-mode`; review: the reason is true]
 
 ## 6. Use what `lib/` has
@@ -259,17 +271,21 @@ site count; one more site, or a larger count, fails `binary-literal-pin`. [gate:
   name (`:-`, `-`, `:=`, `=`, `:?`, `?`, `:+`, `+`, `#`, `%`, `/`, `^`, `,`, an
   offset `:n`, `@`) or none, `${#NAME}`, `${!NAME}`, bare `$NAME`, and `printenv
   NAME`. In Python: `os.environ[...]`, `.get`, `.setdefault` and `.pop` on it,
-  `"NAME" in os.environ`, `os.getenv(...)`, and the same through a name bound to
-  `os.environ` (`env = os.environ`, `from os import environ as e`); a key that is
-  not a string literal is a read of the name `?`. Not a read: a lower-case name,
+  `"NAME" in os.environ`, `os.getenv(...)` and `getenv(...)` under any name
+  `from os import getenv as g` gives it, the key given positionally or as
+  `key=`, and the same through a name bound to `os.environ` (`env = os.environ`,
+  `from os import environ as e`); a key that is not a string literal is a read of
+  the name `?`. Not a read: a lower-case name,
   an array (`${NAME[@]}`), text in single quotes, a comment, a heredoc body, a
   store or a delete in Python, and a system name (`HOME`, `PATH`, `TMPDIR`, `PWD`,
   `USER`, `SHELL`, `TERM`, `LANG`, `LC_ALL`, `TZ`, `NO_COLOR` and the bash
   variables such as `BASH_SOURCE`). `CI` is not a system name: it changes what a
   gate does between a hosted and a local run.
   A name is assigned by `NAME=` or `NAME+=` at the start of a command, by
-  `local`, `declare`, `typeset`, `export`, `readonly` or `read` naming it, by
-  `for NAME in`, `getopts`, `printf -v` and `mapfile`. A value that expands the
+  `local`, `declare`, `typeset`, `export` or `readonly` naming it with a value
+  (`export NAME=v`; a bare `export NAME` or `declare -x NAME` only passes on what
+  the environment holds), by `read NAME`, `for NAME in`, `getopts`, `printf -v`
+  and `mapfile`. A value that expands the
   name itself (`X="${X:-d}"`, `X="$X/sub"`) reads it and assigns nothing.
   Assignments are looked for outside strings, so `echo "usage: X=path"` assigns
   nothing. An operator expansion reads a name unless an earlier line assigns it;
@@ -303,7 +319,7 @@ site count; one more site, or a larger count, fails `binary-literal-pin`. [gate:
   `README.md`, this file, a doc under `docs/` or a `crates/` string literal names
   a file or directory that git lists. The token is `scripts/` at the start of a
   word or behind a repository-root expression: `./`, `$VAR/`, `${VAR}/`,
-  `$(VAR)/`, `"$VAR"/`. A path through `../`, through a literal directory
+  `${VAR:-x}/`, `$(cmd ...)/`, each of the last four also in double quotes. A path through `../`, through a literal directory
   (`/opt/x/scripts/`, `my/scripts/`) or through a variable and a directory
   (`$A/b/scripts/`) is another tree and is not read. A recall test (a file with a
   claim that holds) and the case runner (`lib/selftest_support.sh`) are not read:
@@ -330,16 +346,25 @@ the claim file. [gate: `make check-claim-bypass`, tree-wide]
   that is a make variable is followed when the Makefile defines it once, as `NAME
   = words` or `NAME := words` with no `$` in the value; any other expansion makes
   the run exit 2 (`unavailable`), because a target the gate cannot name is a gate
-  it cannot ask for a recall test. A tool that is itself a recall test asks for
-  none. [gate: `recall-missing`]
-* A recipe line of the `make ci` closure that throws the exit code of a tool away
-  fails (`silenced`), whatever the tool's purpose line says: a `-` in front of the
-  command; `|| true`, `|| :`, `|| exit 0`, `|| echo ...` or `|| printf ...`
-  anywhere on the line; a trailing `; true`, `; :` or `; exit 0`; and any of these
-  on a `$(MAKE)` line, for every tool of a target only that line reaches. The
-  three such lines `make ci` holds are pinned (`debt_report.py --file-sizes`,
-  `debt_report.py` and `target_size_report.sh`, all advisory reports), and so is
-  the recall test `target_size_report.sh` lacks. [gate: `silenced`]
+  it cannot ask for a recall test. A make variable defined that way is also
+  expanded where it stands in a recipe line of the closure; a `$(call ...)` in
+  one, and a command word that is a make expansion the gate cannot follow
+  (`$(RUNNER) bash ...` with no simple `RUNNER`), exit 2 the same way. A
+  tool that is itself a recall test asks for none. [gate: `recall-missing`]
+* A recipe line of the `make ci` closure that runs a `scripts/` tool must keep its
+  exit code (`silenced`). The tool's command is a simple command, with no `-` in
+  front of it, and it is last on the line or followed only by `&& <command>`.
+  Anything else on that line is silenced, whatever the tool's purpose line says:
+  `;`, `|`, `|&`, `||`, a single trailing `&`, a group (`( ... )`, `{ ...; }`), a
+  compound command (`if`, `for`, `case`, `!`), a tool run inside `$( )`, and a
+  `$(MAKE) -k` or `$(MAKE) -i`, for every tool of a target only that line
+  reaches. The shape cannot tell a `|| exit 1` that keeps the failure from a
+  `|| true` that drops it, so both are pinned when they occur. The four such lines
+  `make ci` holds are pinned: `debt_report.py --file-sizes`, `debt_report.py` and
+  `target_size_report.sh` (all advisory reports, each ending in `|| true`) and
+  `lib/published_table.py` (`... && diff -u ... || { ...; exit 1; }`, which keeps
+  the failure); so is the recall test `target_size_report.sh` lacks.
+  [gate: `silenced`]
 * A recall test never sources its gate, and a gate never sources the case
   runner. [review]
 
@@ -420,8 +445,14 @@ accepts every violation of that rule in that file and can only shrink. [gate]
   running it without naming it.
 * What `make ci` runs, beyond the closure the gate reads: a target defined
   through a variable name (`$(NAME):`), a conditional branch (`ifeq`), a
-  `$(shell ...)` word, `.IGNORE`, `make -k`, and an exit code dropped in a way the
-  `silenced` list does not name (`set +e`, a function that ends in `true`).
+  `$(shell ...)` word, `.IGNORE`, `make -k` given on the command line, and an
+  exit code dropped in a way the shape rule does not read (`set +e` earlier in the
+  recipe, a function that ends in `true`).
+* A claim, a tool run or a mode token that sits in code that never runs: the
+  tool is run only in a function nothing calls, the mode token only in an `echo`,
+  in a variable nothing reads or behind `if false`. A claim on a `lib/` file the
+  test only sources: it holds, since sourcing is the relation the lib has, and is
+  bounded by the name rule alone.
 * Python newer than 3.9 that parses: a library call (`zip(strict=True)`,
   `int.bit_count`, `dataclass(slots=True)`), a `|` union in an expression that
   runs (`isinstance(x, int | str)`, a type alias assignment), and a quote
@@ -435,18 +466,27 @@ accepts every violation of that rule in that file and can only shrink. [gate]
   `set +eu` after the strict line; a strict line only inside a function nothing
   calls.
 * An environment read through indirection (`${!v}` where `v` names the
-  variable), through `env` with no command, in an `eval`ed string or in a
-  here-document that expands it; a name assigned in a branch that never runs
-  counts as assigned; and in Python a copy of the environment that is read later
-  (`dict(os.environ).get("X")`, `os.environ.copy()`, `{**os.environ}`), and
-  iteration over it.
+  variable, `${!1}`), through `env` with no command, in an `eval`ed string or in a
+  here-document that expands it; a test that only asks whether a name is set
+  (`[[ -v NAME ]]`, `test -v NAME`, `(( NAME ))`, `declare -p NAME`); a name
+  assigned in a branch or a `for` loop that never runs counts as assigned; and in
+  Python a copy of the environment that is read later (`dict(os.environ).get("X")`,
+  `os.environ.copy()`, `{**os.environ}`), iteration over it, `os.environ` passed
+  as an argument or a default, `getattr(os, "environ")`, a walrus alias and
+  `os.path.expandvars`.
 * A root variable derived through another variable (`REPO_ROOT="$HERE/.."`), a
   `dirname` written without quotes or with `--`, `${BASH_SOURCE%/*}`,
   `dirname "$BASH_SOURCE"`, a `cd` and a `pwd` on two lines, and a Python root
   built with `os.path.join`. No file in the tree uses one of these as a root
   today.
 * A `scripts/` path through `../`, through a literal directory or through a
-  variable and a directory: it is another tree and `dead-path` does not read it.
+  variable and a directory: it is another tree and neither `dead-path` nor the
+  caller derivation reads it. A path built in two steps (`d=scripts; bash
+  "$ROOT/$d/x.sh"`) is no `scripts/` token at all.
+* Two heredocs opened on one command line (`cat <<A; python3 <<B`): only the
+  first opener is read, so a Python body behind the second is not measured.
+* A pin member swapped for another one of the same rule leaves every count and
+  total unchanged; `pin-new` catches it once the base has a pin list.
 * A binary path assembled from pieces, and the same text in two files that
   differs enough to stay under the twin threshold: the rule measures text, not
   whether two files do one job. The ratio rule starts at 20 significant lines,
