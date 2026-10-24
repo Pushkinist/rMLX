@@ -41,9 +41,10 @@ interleaved A/B run supports a direction between two builds.
   `kv_quant` is the codec name the run's own log states, or `auto` if that
   probe fails.
 - `runs.db`: one further run per model with `rmlx baseline --record
-  --run-class gate`. A failed record is a warning; the CSV row is still
-  written.
-- A `k8vturbo3` arm follows each model: 1 warmup, 3 measured, CSV row only.
+  --run-class gate`, and the warmup, measured and `k8vturbo3` runs as
+  `diagnostic`. A snapshot whose identity cannot be recorded stops the canary
+  before its first run, and a failed gate record stops it too.
+- A `k8vturbo3` arm follows each model: 1 warmup, 3 measured, one CSV row.
 
 **Gating.** Two gates read what the canary wrote:
 

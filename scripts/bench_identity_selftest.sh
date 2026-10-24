@@ -228,6 +228,7 @@ claim) exit 0 ;;
 metrics) echo '{$BASE_IDENTITY}' ;;
 baseline)
 	printf '%s\n' "\$*" >>"\$RMLX_HOME/baseline_argv"
+	case " \$* " in *" --run-class gate "*) [ -z "\${STUB_FAIL_GATE:-}" ] || exit 1 ;; esac
 	if [ -n "\${STUB_SHARED_LOG:-}" ]; then
 		log="\$RMLX_HOME/logs/\$STUB_SHARED_LOG"
 	else
@@ -240,7 +241,9 @@ baseline)
 esac
 STUBEOF
 chmod +x "$CANARY_STUB"
-mkdir -p "$WORK/models/prism-ml__Ternary-Bonsai-2-27B-mlx-2bit"
+CANARY_MODEL="$WORK/models/prism-ml__Ternary-Bonsai-2-27B-mlx-2bit"
+mkdir -p "$CANARY_MODEL"
+printf '{"quantization": {"group_size": 64, "bits": 2}}\n' >"$CANARY_MODEL/config.json"
 
 # canary_case <name> <identity-json-or-empty> <shared-log-name-or-empty>
 canary_case() {
@@ -249,6 +252,7 @@ canary_case() {
 	mkdir -p "$home/logs"
 	local env_extra=()
 	[ -z "$identity" ] || env_extra+=("RMLX_IDENTITY_JSON=$identity")
+	[ -z "${STUB_FAIL_GATE:-}" ] || env_extra+=("STUB_FAIL_GATE=1")
 	if [ -n "$shared" ]; then
 		printf '%s\n' '{"timestamp":"2026-09-03T00:00:00Z","level":"INFO","fields":{"message":"rmlx start","version":"9.9.9","run_id":"stub","pid":4242}}' \
 			'{"timestamp":"2026-09-03T00:00:00Z","level":"INFO","fields":{"message":"cache-type resolved","arch":"Stub","kv_quant":"none"}}' \
@@ -296,6 +300,20 @@ bad=""
 [ "$(csv_field "$CANARY_HOME" 4)" = stubq ] ||
 	bad="$bad; csv kv_quant=$(csv_field "$CANARY_HOME" 4) (want stubq, not the earlier process's none)"
 verdict canary_same_second_log "a probe that appends to an earlier process's log is attributed by pid" "${bad#; }"
+
+STUB_FAIL_GATE=1 canary_case canary_gate_record_fails "" ""
+bad=""
+[ "$CANARY_STATUS" -eq 1 ] || bad="exit=$CANARY_STATUS (want 1)"
+/usr/bin/grep -q 'the gate record failed' "$CANARY_HOME/out.log" || bad="$bad; no error naming the gate record"
+verdict canary_gate_record_fails "a gate record that fails stops the canary" "${bad#; }"
+
+printf '{}\n' >"$CANARY_MODEL/config.json"
+canary_case canary_unrecordable_identity "" ""
+bad=""
+[ "$CANARY_STATUS" -eq 1 ] || bad="exit=$CANARY_STATUS (want 1)"
+[ ! -s "$CANARY_HOME/baseline_argv" ] || bad="$bad; $(wc -l <"$CANARY_HOME/baseline_argv" | tr -d ' ') run(s) before the refusal"
+/usr/bin/grep -q 'its identity cannot be recorded' "$CANARY_HOME/out.log" || bad="$bad; no error naming the identity"
+verdict canary_unrecordable_identity "a snapshot whose identity cannot be recorded stops the canary before any run" "${bad#; }"
 
 echo
 echo "passed=$PASSED failed=$FAILED"

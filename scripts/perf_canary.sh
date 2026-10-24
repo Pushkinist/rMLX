@@ -14,6 +14,11 @@
 # recorded: a one-token generation has no decode rate, and the recorder refuses
 # a record that carries none.
 #
+# Every one of those records must land, so a snapshot whose identity cannot be
+# recorded (`lib/snapshot_identity.py`, which labels a snapshot as `rmlx
+# baseline --record` does) stops the canary before its first run, and a failed
+# gate record stops it too.
+#
 # The default mode measures ONE build. All of its measured runs for a model
 # happen together, which is fine for tracking one build over time but not for
 # comparing two: whichever arm ran second wears any drift. `--ab` hands off to
@@ -185,6 +190,17 @@ stddev() {
     }'
 }
 
+# Every run below records, so an identity the DB would refuse stops the canary
+# here, before any model is loaded, and not at its first measured run.
+for entry in "${MODELS[@]}"; do
+    model_path="${entry##*|}"
+    [[ -d "${model_path}" ]] || continue
+    if ! python3 "${REPO_ROOT}/scripts/lib/snapshot_identity.py" "${model_path}" > /dev/null; then
+        echo "ERROR: ${model_path}: its identity cannot be recorded (above); nothing was measured" >&2
+        exit 1
+    fi
+done
+
 # Main loop
 for entry in "${MODELS[@]}"; do
     short_name="${entry%%|*}"
@@ -243,7 +259,8 @@ for entry in "${MODELS[@]}"; do
         > /dev/null 2>&1; then
         echo "  runs.db: ok" >&2
     else
-        echo "  WARN: runs.db record failed (non-fatal; CSV row still written)" >&2
+        echo "ERROR: ${short_name}: the gate record failed; the canary has no row to gate on" >&2
+        exit 1
     fi
 
     # Print result
