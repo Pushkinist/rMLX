@@ -44,6 +44,9 @@ from pathlib import Path
 from typing import Any
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(_SCRIPT_DIR.parent / "lib"))
+from recorder_check import require_run_class_recorder  # noqa: E402
+
 RMLX_REPO_ROOT = Path(os.environ.get("RMLX_REPO_ROOT", str(_SCRIPT_DIR.parents[1])))
 # Runtime state lives under a single root (CLAUDE.md). `RMLX_HOME` wins; the
 # in-repo `.rmlx/` is the dev default.
@@ -148,7 +151,7 @@ def _arm_record(
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("result", help="JSON emitted by bench_llama_ab.sh")
+    p.add_argument("result", nargs="?", help="JSON emitted by bench_llama_ab.sh")
     p.add_argument("--prompt-file", required=True, help="the prompt body that was sent")
     p.add_argument("--prompt-name", required=True)
     p.add_argument("--prompt-notes", default=None)
@@ -191,7 +194,20 @@ def main() -> int:
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--record", action="store_true", help="ingest via `rmlx metrics record --file`")
     p.add_argument("--rmlx-bin", default=str(RMLX_REPO_ROOT / "target" / "release" / "rmlx"))
+    p.add_argument(
+        "--check-args",
+        action="store_true",
+        help="parse the arguments, and with --record check the recorder, then exit 0 "
+        "without reading a result: bench_llama_ab.sh runs this before its first slot",
+    )
     args = p.parse_args()
+
+    if args.check_args:
+        if args.record:
+            require_run_class_recorder(args.rmlx_bin)
+        return 0
+    if args.result is None:
+        p.error("the following arguments are required: result")
 
     result = json.loads(Path(args.result).read_text(encoding="utf-8"))
     # A run made with --synthetic-arms drove stub servers, so its numbers
@@ -230,6 +246,9 @@ def main() -> int:
             trimmed["prompt"] = dict(rec["prompt"], body=f"<{len(prompt_body)} chars>")
             print(json.dumps(trimmed, indent=2))
         return 0
+
+    if args.record:
+        require_run_class_recorder(args.rmlx_bin)
 
     # Compact stamp: every other producer in this tree names buffer files
     # `YYYYMMDDTHHMMSS...`, and the ISO form puts colons in a filename.

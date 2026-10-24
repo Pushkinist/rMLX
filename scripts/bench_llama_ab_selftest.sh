@@ -118,10 +118,15 @@ KV_OK='llama_kv_cache:       MTL0 KV buffer size =   512.00 MiB'
 # wrapper-versus-server bookkeeping is exercised without a real claim. Each use
 # is recorded, so a case can tell that every slot ran under it. It also stands
 # in for `rmlx metrics record --file <record>`, logging the class of each
-# record it is handed instead of writing a DB.
+# record it is handed instead of writing a DB, and answers `metrics record
+# --help` the way a binary with the run class does.
 CLAIM_STUB="$WORK/claim_rmlx"
 cat >"$CLAIM_STUB" <<STUB
 #!/usr/bin/env bash
+if [ "\$1 \$2 \$3" = "metrics record --help" ]; then
+    echo "      --run-class <CLASS>"
+    exit 0
+fi
 if [ "\$1 \$2 \$3" = "metrics record --file" ]; then
     python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r["run_class"], r["backend"])' "\$4" >>"$WORK/recorded"
     exit 0
@@ -412,6 +417,48 @@ fi
 
 NO_RECORD_ARGS=1 run_ab "$HOST" --bin-a "$STUB_A" --bin-b "$STUB_B" --pairs 2 --allow-busy-host
 check "a real run without --record-args is refused before any slot" 125 "missing required --record-args"
+
+# The ingest's own argparse judges --record-args, before anything is measured.
+: >"$WORK/claim_runs"
+NO_RECORD_ARGS=1 run_ab "$HOST" --bin-a "$STUB_A" --bin-b "$STUB_B" --pairs 2 --allow-busy-host \
+	--record-args "--model stub --weight-quant q8_0 --arm-a-backend llama_cpp"
+check "--record-args the ingest refuses stop the run before any slot" 125 "the following arguments are required"
+if [ -s "$WORK/claim_runs" ]; then
+	echo "  FAIL  a refused --record-args still ran a slot"
+	FAIL=$((FAIL + 1))
+else
+	echo "  PASS  a refused --record-args ran no slot"
+	PASS=$((PASS + 1))
+fi
+
+# A recorder built before the run class would store classless rows.
+OLD_RECORDER="$WORK/claim_rmlx_old"
+sed 's/--run-class <CLASS>/--label <LABEL>/' "$CLAIM_STUB" >"$OLD_RECORDER"
+chmod +x "$OLD_RECORDER"
+run_ab "$HOST" --bin-a "$STUB_A" --bin-b "$STUB_B" --pairs 2 --allow-busy-host --claim-rmlx "$OLD_RECORDER"
+check "a recorder without --run-class is refused before any slot, by name" 125 "claim_rmlx_old has no \`metrics record --run-class\`"
+
+# A record that fails after the comparison has its own exit code.
+FAILING_RECORDER="$WORK/claim_rmlx_failing"
+sed 's|^    python3 -c .*|    exit 1|' "$CLAIM_STUB" >"$FAILING_RECORDER"
+chmod +x "$FAILING_RECORDER"
+run_ab "$HOST" --bin-a "$STUB_A" --bin-b "$STUB_B" --pairs 2 --allow-busy-host --claim-rmlx "$FAILING_RECORDER"
+check "a record that fails after the comparison exits 4, not the verdict's code" 4 "recorded   NOTHING"
+
+# --keep-arm writes the surviving arm alone, as gate, under its own backend.
+REAL_RESULT="$(printf '%s' "$OUT" | sed -n 's/^result     //p' | tail -1)"
+KEEP_OUT="$(python3 "$ROOT/scripts/ingest/llama_ab_ingest.py" --dry-run "$REAL_RESULT" \
+	--prompt-file "$PROMPT" --accept-tainted --keep-arm B $RECORD_ARGS_REAL 2>&1)"
+KEEP_RECORDS="$(grep -c '"schema_version"' <<<"$KEEP_OUT" || true)"
+if [ "$KEEP_RECORDS" = 1 ] && grep -q '"run_class": "gate"' <<<"$KEEP_OUT" &&
+	grep -q '"backend": "llama_cpp_tq"' <<<"$KEEP_OUT" && ! grep -q '"backend": "llama_cpp"' <<<"$KEEP_OUT"; then
+	echo "  PASS  --keep-arm B writes one gate record, under arm B's backend"
+	PASS=$((PASS + 1))
+else
+	echo "  FAIL  --keep-arm B should write one gate record under llama_cpp_tq ($KEEP_RECORDS record(s))"
+	printf '%s\n' "$KEEP_OUT" | sed 's/^/        /' | tail -8
+	FAIL=$((FAIL + 1))
+fi
 
 unset FORCE_UNMEASURED_ROWS
 

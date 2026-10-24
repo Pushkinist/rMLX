@@ -42,9 +42,12 @@
 # (docs/METRICS_DB.md section 13). A TAINTED run is recorded too, with the taint
 # in `notes`. The identity of the rows (model label, weight quant, each arm's
 # backend and codec, prompt name) is not something a llama-server reports, so
-# `--record-args` carries it, verbatim, to the ingest; a real run without it is
-# refused before the first slot. Promoting the surviving arm as `gate` is a
-# second, explicit run of the ingest with `--keep-arm A|B`.
+# `--record-args` carries it to the ingest, split on whitespace and never
+# globbed. Before the first slot the ingest itself checks those arguments and
+# the recorder (`--check-args`), so a set it would refuse, or a recorder built
+# before the run class, stops the run before anything is measured. Promoting
+# the surviving arm as `gate` is a second, explicit run of the ingest with
+# `--keep-arm A|B`.
 #
 # MEASUREMENT VS LOGIC
 #
@@ -64,7 +67,11 @@
 # Exit codes:
 #   0   — ran cleanly; verdict on stdout
 #   125 — not usable: busy host, indistinguishable arms, missing binary or
-#         model, a slot that produced no parseable timing, or TAINTED.
+#         model, `--record-args` the ingest refuses, a slot that produced no
+#         parseable timing, or TAINTED.
+#   4   — the comparison ran, but recording it failed. The verdict is printed
+#         and the result file kept; re-run the ingest on it. Overrides the
+#         verdict's own code.
 #         Under --synthetic-arms a 0 says the logic ran, not that a measurement
 #         was clean.
 
@@ -163,6 +170,15 @@ if ! $SYNTHETIC_ARMS && [ -z "$RECORD_ARGS" ]; then
 	echo "  codec, prompt name) is not something llama-server reports." >&2
 	exit 125
 fi
+RECORD_ARGV=()
+if [ -n "$RECORD_ARGS" ]; then
+	read -ra RECORD_ARGV <<<"$RECORD_ARGS"
+fi
+INGEST="${REPO_ROOT}/scripts/ingest/llama_ab_ingest.py"
+ingest() { # <ingest args...> -- the arguments every recording run of the ingest takes
+	python3 "$INGEST" "$@" --prompt-file "$PROMPT_FILE" --accept-tainted --record \
+		--rmlx-bin "$CLAIM_RMLX" ${RECORD_ARGV[@]+"${RECORD_ARGV[@]}"}
+}
 [ -x "$CLAIM_RMLX" ] || { echo "no rmlx binary at $CLAIM_RMLX (make build-perf, or --claim-rmlx)" >&2; exit 125; }
 for f in "$BIN_A" "$BIN_B" "$MODEL" "$PROMPT_FILE"; do
 	[ -e "$f" ] || { echo "not found: $f" >&2; exit 125; }
@@ -174,6 +190,11 @@ done
 if [ "$PAIRS" -lt 2 ]; then
 	echo "--pairs must be >= 2: at 1 slot per arm each range is a single point," >&2
 	echo "  so the overlap test cannot fire and every run reads SEPARATED." >&2
+	exit 125
+fi
+if ! $SYNTHETIC_ARMS && ! ingest --check-args >&2; then
+	echo "the ingest refuses --record-args or the recorder (above), so this run could" >&2
+	echo "  not be recorded; nothing was measured." >&2
 	exit 125
 fi
 
@@ -572,14 +593,11 @@ echo "result     $RESULT"
 if $SYNTHETIC_ARMS; then
 	echo "host       not sampled (--synthetic-arms): stub arms, so nothing above measures this machine or any model"
 else
-	# A failed ingest leaves the result file; the verdict below is unchanged.
-	# shellcheck disable=SC2086  # RECORD_ARGS is a deliberate word list
-	if python3 "${REPO_ROOT}/scripts/ingest/llama_ab_ingest.py" "$RESULT" \
-		--prompt-file "$PROMPT_FILE" --accept-tainted --record \
-		--rmlx-bin "$CLAIM_RMLX" $RECORD_ARGS >&2; then
+	if ingest "$RESULT" >&2; then
 		echo "recorded   both arms as ab_arm rows in runs.db"
 	else
 		echo "recorded   NOTHING: the ingest failed; re-run scripts/ingest/llama_ab_ingest.py on $RESULT" >&2
+		exit 4
 	fi
 fi
 if [ -n "$TAINT" ]; then

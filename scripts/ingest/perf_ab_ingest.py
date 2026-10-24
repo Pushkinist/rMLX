@@ -52,6 +52,7 @@ from typing import Any
 _SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPT_DIR.parent / "lib"))
 from kv_boundary_default import kv_boundary_default  # noqa: E402
+from recorder_check import require_run_class_recorder  # noqa: E402
 
 RMLX_REPO_ROOT = Path(os.environ.get("RMLX_REPO_ROOT", str(_SCRIPT_DIR.parents[1])))
 # Runtime state lives under a single root (CLAUDE.md). `RMLX_HOME` wins; the
@@ -406,6 +407,9 @@ def main() -> int:
             trimmed["prompt"] = dict(rec["prompt"], body=f"<{len(prompt_body)} chars>")
             print(json.dumps(trimmed, indent=2))
         return 0
+
+    if args.record:
+        require_run_class_recorder(args.rmlx_bin)
 
     stamp = result["ts_utc"].replace("-", "").replace(":", "")
     STAGING.mkdir(parents=True, exist_ok=True)
