@@ -70,6 +70,9 @@ CASES=(
     "tests_rs|commands/tests.rs|    let d = Device::Gpu;|0|ok (1 site"
     "bin_program|bin/diag.rs|    \"gpu\" => Device::Gpu,|0|ok (1 site"
     "alias_in_comment|commands/l.rs|// use rmlx_mlx::Device as Dev;|0|ok (1 site"
+    "deep_type_alias|commands/f7.rs|type Dev = rmlx_mlx::device::Device;|1|device-alias: commands/f7.rs:2:"
+    "drop_check_claim_alone|commands/o2.rs|    let d = check_claim(res)?.device();|1|claim-dropped: commands/o2.rs:2:"
+    "drop_generic_angle|commands/o3.rs|    let d = parse_device<T>(&s)?.device();|1|claim-dropped: commands/o3.rs:2:"
 )
 
 for c in "${CASES[@]}"; do
@@ -116,6 +119,13 @@ printf '// header\npub(crate) fn claim_gpu() -> Result<ClaimedDevice, E> {\n    
 st_case "definition_is_not_a_call" 0 --what "commands/y.rs" \
     --has "ok (1 site" -- bash "$GATE" "$root"
 
+for fn in parse_device check_claim; do
+    root="$(fresh "definition_of_${fn}")"
+    printf '// header\npub(crate) fn %s() -> Result<ClaimedDevice, E> {\n    let claimed = ClaimedDevice { claim: None };\n    Ok(claimed)\n}\n' "$fn" >"$root/commands/y.rs"
+    st_case "definition_of_${fn}_is_not_a_call" 0 --what "commands/y.rs" \
+        --has "ok (1 site" -- bash "$GATE" "$root"
+done
+
 st_case "one_site" 0 --what "the legitimate site alone passes" \
     --has "gpu-device: commands/parse.rs:3:" -- bash "$GATE" "$(fresh one_site)"
 st_case "no_site" 1 --what "the claimed-GPU helper lost its site" \
@@ -160,6 +170,7 @@ LIB_CASES=(
     "lib_matches~    let g = matches!(self.device(), Device::Gpu);\n~0~0 value site(s)"
     "lib_or_pattern_in_if_let~    if let Device::Cpu | Device::Gpu = d {\n~0~0 value site(s)"
     "lib_if_let~    if let Device::Gpu = d {\n~0~0 value site(s)"
+    "lib_while_let~    while let Device::Gpu = d {\n~0~0 value site(s)"
     "lib_comment~    // pass Device::Gpu here\n~0~0 value site(s)"
     "lib_string~    let s = \"Device::Gpu\";\n~0~0 value site(s)"
     "lib_longer_ident~    let d = Device::GpuLike;\n~0~0 value site(s)"
