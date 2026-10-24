@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Recall test for release_cpu.py: throwaway repo roots and a stub cargo, asserting exit and reason.
 #
-# Set:    -uo — a failing case must not stop the cases after it
 #
 # Recall test for: release/release_cpu.py
 #
@@ -13,7 +12,7 @@
 #
 # Exit 0 = every case held. Exit 1 = at least one did not.
 
-set -uo pipefail
+set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOOL="$HERE/release_cpu.py"

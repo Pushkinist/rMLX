@@ -192,7 +192,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
-| `report/debt_report.py` | make check-doc-size, make check-scripts, make ci, make debt-report, make file-size-report, make kv-update-census, make scripts-index, make shellcheck-report, report/debt_report_selftest.sh, report/doc_size_selftest.sh, report/kv_census_selftest.sh | Advisory reports about the tree, the doc-size gate and the KV structural figures. |
+| `report/debt_report.py` | make check-doc-size, make check-scripts, make ci, make debt-report, make file-size-report, make kv-update-census, make scripts-index, make shellcheck-report, report/debt_report_selftest.sh, report/doc_size_selftest.sh, report/kv_census_selftest.sh, +2 more scripts | Advisory reports about the tree, the doc-size gate and the KV structural figures. |
 | `report/debt_report_selftest.sh` | make ci, make debt-report-selftest | Recall test for debt_report.py: fixture trees, asserting what the printed text holds. |
 | `report/doc_size_selftest.sh` | make check-doc-size-selftest, make ci | Recall test for debt_report.py --check-doc-size: throwaway git trees, asserting exit and reason. |
 | `report/kv_census.py` | report/debt_report.py | Structural figures for the KV update path: variant shapes, match sites, update bodies, refs. |
@@ -203,11 +203,13 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `report/scripts_gate_callers.py` | report/scripts_gate.py, report/scripts_gate_rules.py | The derived caller of each file and the INDEX.md built from it. |
 | `report/scripts_gate_content.py` | report/scripts_gate.py | Per-file content rules of the scripts gate: shell mode, Python floor, names, size, heredocs, knobs. |
 | `report/scripts_gate_content_selftest.sh` | make check-scripts-selftest, make ci | Recall test for the per-file rules of debt_report.py --scripts: planted files, exit code, rule:line. |
+| `report/scripts_gate_env.py` | report/scripts_gate_content.py | Environment reads of the scripts gate: the knobs a file takes from the environment. |
 | `report/scripts_gate_external.py` | report/scripts_gate.py, report/scripts_gate_callers.py, report/scripts_gate_rules.py | Callers of scripts/ that are not scripts: hosted CI steps, pre-commit hooks, Rust sources. |
-| `report/scripts_gate_files.py` | report/scripts_gate.py, report/scripts_gate_callers.py, report/scripts_gate_content.py, +4 more scripts | The population of scripts/ and the header each file carries. |
-| `report/scripts_gate_pins.txt` | lib/selftest_support.sh, report/scripts_gate.py | Accepted violations of the scripts/ rules: `<rule> <path> [<members>]`; a pin only shrinks. |
-| `report/scripts_gate_rules.py` | report/scripts_gate.py, report/scripts_gate_content.py, report/scripts_gate_structure.py, +1 more scripts | The per-file rules of the scripts gate and their registry. |
+| `report/scripts_gate_files.py` | report/scripts_gate.py, report/scripts_gate_callers.py, report/scripts_gate_content.py, +6 more scripts | The population of scripts/ and the header each file carries. |
+| `report/scripts_gate_pins.txt` | lib/selftest_support.sh, report/scripts_gate.py, report/scripts_gate_selftest.sh | Accepted violations of the scripts/ rules: `<rule> <path> [<members>]`; a pin only shrinks. |
+| `report/scripts_gate_recall.py` | report/scripts_gate.py, report/scripts_gate_content.py, report/scripts_gate_rules.py, +1 more scripts | Recall tests of the scripts gate: what `make ci` runs, who covers it, what a line silences. |
+| `report/scripts_gate_rules.py` | report/scripts_gate.py, report/scripts_gate_content.py, report/scripts_gate_env.py, +3 more scripts | The per-file rules of the scripts gate and their registry. |
 | `report/scripts_gate_selftest.sh` | make check-scripts-selftest, make ci | Recall test for debt_report.py --scripts: planted trees, asserting exit code and rule:file:line. |
-| `report/scripts_gate_structure.py` | report/scripts_gate.py, report/scripts_gate_content.py | Structural rules of the scripts gate: recall tests, lib/, modules, shebang, exec bit, dead paths. |
-| `report/scripts_gate_text.py` | report/scripts_gate_callers.py, report/scripts_gate_content.py, report/scripts_gate_rules.py, +1 more scripts | Readers of script text: shell, Python and Makefile source. |
+| `report/scripts_gate_structure.py` | report/scripts_gate.py, report/scripts_gate_content.py | Structural rules of the scripts gate: lib/, modules, shebang, exec bit, orphans, dead paths. |
+| `report/scripts_gate_text.py` | report/scripts_gate_callers.py, report/scripts_gate_content.py, report/scripts_gate_env.py, +2 more scripts | Readers of script text: shell, Python and Makefile source. |
 | `report/scripts_gate_twin.py` | report/scripts_gate.py | The twin rule of the scripts gate: two files of one language that say the same lines. |

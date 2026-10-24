@@ -22,6 +22,12 @@ def normalize(text: str) -> str:
     return _DIGIT_RUN.sub("N", text)
 
 
+def lines_of(text: str) -> list[str]:
+    """The lines of a text. Every reader of the figure splits one way, so a
+    count taken over these lines bounds the figure from above."""
+    return text.splitlines()
+
+
 def matched_lines(a: str, b: str) -> int:
     """Summed size of every matching block `difflib.SequenceMatcher` finds
     between `a` and `b`, over the same digit-folded, `autojunk=False` lines
@@ -36,8 +42,8 @@ def matched_lines(a: str, b: str) -> int:
     when a population gained an item that re-ordered it — with no line of any
     body changing. The larger of the two is the count of lines the pair
     genuinely shares, and it depends on the pair alone."""
-    a_lines = normalize(a).splitlines()
-    b_lines = normalize(b).splitlines()
+    a_lines = lines_of(normalize(a))
+    b_lines = lines_of(normalize(b))
     forward = difflib.SequenceMatcher(None, a_lines, b_lines, autojunk=False)
     reverse = difflib.SequenceMatcher(None, b_lines, a_lines, autojunk=False)
     return max(

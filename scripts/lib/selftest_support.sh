@@ -224,7 +224,7 @@ except subprocess.TimeoutExpired:
 SG_PINS_REL=scripts/report/scripts_gate_pins.txt
 SG_NAM='# Not a mode of: check/ok.sh — a planted entry point'
 SG_TIMEOUT_S=60
-SG_PINNABLE='# pinnable: class purpose usage exit-undeclared caller recall-missing lib-consumers lib-run shebang exec-bit dead-path set-mode name size heredoc twin lib-shadow binary-literal env-knob'
+SG_PINNABLE='# pinnable: class purpose usage exit-undeclared caller recall-missing silenced lib-consumers lib-run shebang exec-bit dead-path set-mode name size heredoc twin lib-shadow binary-literal env-knob'
 
 # sg_gate <root> — the scripts gate over <root>, the base being its own HEAD.
 sg_gate() {
@@ -284,9 +284,10 @@ sg_nocaller_sh() {
 }
 
 # sg_recall_sh <caller line> <field line>... — a planted recall test; each argument after the first
-# is a line of its Recall test for: field. The caller line is a bare # when a recipe runs it.
+# is a line of its Recall test for: field, and the test runs that tool once for each mode the line
+# names. The caller line is a bare # when a recipe runs it.
 sg_recall_sh() {
-	local caller=$1 first=1 line
+	local caller=$1 first=1 line tool word runs=()
 	shift
 	printf '%s\n' '#!/usr/bin/env bash' '# A planted recall test.' '#'
 	for line in "$@"; do
@@ -296,8 +297,17 @@ sg_recall_sh() {
 		else
 			printf '#                  %s\n' "$line"
 		fi
+		tool=${line%% *}
+		if [ "$line" = "$tool" ]; then
+			runs+=("bash scripts/$tool")
+		else
+			for word in ${line#"$tool "}; do
+				if [ "$word" = default ]; then runs+=("bash scripts/$tool"); else runs+=("bash scripts/$tool $word"); fi
+			done
+		fi
 	done
-	printf '%s\n' '#' '# Usage:  bash scripts/check/ok.sh' '# Exit:   0 held' "$caller" "$SG_NAM" 'set -euo pipefail' 'exit 0'
+	printf '%s\n' '#' '# Usage:  bash scripts/check/ok.sh' '# Exit:   0 held' "$caller" "$SG_NAM" 'set -euo pipefail' \
+		${runs[@]+"${runs[@]}"} 'exit 0'
 }
 
 # sg_lib_sh [<last header line>] — a planted lib/ file, no shebang, sourced and never run.

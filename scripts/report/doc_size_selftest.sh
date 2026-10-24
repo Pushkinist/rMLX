@@ -11,9 +11,8 @@
 # Usage:  bash scripts/report/doc_size_selftest.sh
 # Exit:   0 every case held; 1 at least one did not; 2 a scan root could not be
 #         built
-# Set:    -uo — a failing case must not stop the cases after it
 
-set -uo pipefail
+set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TOOL="$REPO_ROOT/scripts/report/debt_report.py"

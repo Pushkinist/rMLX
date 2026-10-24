@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Recall test for debt_report.py: fixture trees, asserting what the printed text holds.
 #
-# Recall test for: report/debt_report.py default --matched-lines
+# Recall test for: report/debt_report.py default --matched-lines --file-sizes
 # Usage:  bash scripts/report/debt_report_selftest.sh
 # Exit:   0 every case held; 1 a case did not
-# Set:    -uo — a failing case must not stop the cases after it
+# Set:    -uo — a non-zero status inside a case ends the run under -e, before the cases after it
 #
 # WHY
 #   The report always exits 0 (advisory), so its

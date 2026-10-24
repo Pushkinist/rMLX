@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Recall test for check_kernel_dtype_contract.sh: scan roots, asserting exit code and function.
 #
-# Set:    -uo — a failing case must not stop the cases after it
+# Set:    -uo — a non-zero status inside a case ends the run under -e, before the cases after it
 #
 # Recall test for: check_kernel_dtype_contract.sh
 #

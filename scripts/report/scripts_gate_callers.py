@@ -42,9 +42,15 @@ class Callers:
         return bool(self.run_by)
 
 
+EXPANSION_RE = re.compile(r"\$(?:\{[^}]*\}|\([^)]*\)|[A-Za-z_][A-Za-z0-9_]*)")
+SCRIPTS_DIR_RE = re.compile(r"(?:^|/)scripts/(.*)$")
+
+
 class Resolver:
-    """The file of the tree a word names: its base name when that is unique,
-    else its path."""
+    """The file of the tree a word names. Only the part after the word's last
+    expansion is read. A part that goes through a `scripts/` directory must name
+    the file's path under it; any other names the file by its base name when that
+    is unique, else by its path."""
 
     def __init__(self, files: list[Script]) -> None:
         self.by_base: dict[str, list[Script]] = defaultdict(list)
@@ -54,12 +60,20 @@ class Resolver:
     def find(self, word: str, code: bool) -> list[Script]:
         if not word or any(ch.isspace() for ch in word):
             return []
-        candidates = self.by_base.get(os.path.basename(word), [])
-        return [
-            f
-            for f in candidates
-            if f.is_code == code and (len(candidates) == 1 or word == f.rel or word.endswith("/" + f.rel))
-        ]
+        literal = EXPANSION_RE.split(word)[-1]
+        candidates = self.by_base.get(os.path.basename(literal), [])
+        below_scripts = SCRIPTS_DIR_RE.search(literal)
+        found = []
+        for f in candidates:
+            if f.is_code != code:
+                continue
+            if below_scripts:
+                named = below_scripts.group(1) == f.rel
+            else:
+                named = len(candidates) == 1 or word == f.rel or word.endswith("/" + f.rel)
+            if named:
+                found.append(f)
+        return found
 
 
 def derive_callers(

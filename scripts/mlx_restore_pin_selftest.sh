@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Recall test for mlx_restore_pin.sh: throwaway prefixes, stub brew, asserting exit and records.
 #
-# Set:    -uo — a failing case must not stop the cases after it
 #
 # Recall test for: mlx_restore_pin.sh
 #

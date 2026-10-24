@@ -21,7 +21,7 @@ import re
 from collections import Counter
 from collections.abc import Iterator
 
-from line_match import matched_lines, normalize
+from line_match import lines_of, matched_lines, normalize
 from scripts_gate_files import Script, Violation
 from scripts_gate_rules import Context
 
@@ -32,7 +32,7 @@ CLOSER_RE = re.compile(r'(?:fi|done|esac|else|then|do|\{|\}|\(|\)|;;|EOF|pass|""
 
 
 def significant_lines(f: Script) -> list[str]:
-    lines = (raw.strip() for raw in f.text.split("\n"))
+    lines = (raw.strip() for raw in lines_of(f.text))
     return [normalize(s) for s in lines if s and not s.startswith("#") and not CLOSER_RE.fullmatch(s)]
 
 

@@ -1,171 +1,32 @@
-"""Structural rules of the scripts gate: recall tests, lib/, modules, shebang, exec bit, dead paths.
+"""Structural rules of the scripts gate: lib/, modules, shebang, exec bit, orphans, dead paths.
 
 Module of: report/debt_report.py
 
 Each rule is a function over the `Context` that yields violations; the
 registry is `STRUCTURE_RULES`. A rule here reads how files relate to one
-another (who runs whom, which recall test covers which mode) and not what one
-file's header says.
+another (who runs, sources or imports whom) and not what one file's header says.
 """
 
 from __future__ import annotations
 
 import os
 import re
-from collections import defaultdict
 
 from scripts_gate_files import Script, Violation, first_token, git, git_ignored, named_file, scripts_tree
+from scripts_gate_recall import is_recall_test, reachable
 from scripts_gate_rules import Context
-from scripts_gate_text import clean_shell, command_words, make_rules, peel_substitutions, split_commands
 
-CI_TARGET = "ci"
-DEFAULT_MODE = "default"
-MODE_RE = re.compile(r"--?[A-Za-z][\w-]*|[a-z][a-z0-9_-]*")
-MAKE_CALL_RE = re.compile(r"\$[({]MAKE[)}]([^;&|]*)")
-SILENCED_RE = re.compile(r"\|\|\s*true\s*$")
-ADVISORY_PURPOSE = "Advisory"
 SHEBANGS = {".sh": "#!/usr/bin/env bash", ".py": "#!/usr/bin/env python3"}
 LIB_PREFIX = "lib/"
 LIB_CONSUMERS_MIN = 2
 SELFTEST_SUPPORT = "lib/selftest_support.sh"
-DEAD_TOKEN_RE = re.compile(r"(?<![\w./-])scripts/([\w./-]*)")
+DEAD_TOKEN_RE = re.compile(r"scripts/([\w./-]*)")
+ROOT_PREFIX_RE = re.compile(r'(?:\./|\$\w+/|\$\{\w+\}/|\$\(\w+\)/|"\$\w+"/|"\$\{\w+\}"/)$')
+PATH_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./-")
+WORD_CHARS = PATH_CHARS - {"-"}
 PATTERN_FOLLOWERS = frozenset("*<{$([?\\+|")
 DOC_ROOTS = ("CLAUDE.md", "CONTRIBUTING.md", "README.md", "Makefile", ".pre-commit-config.yaml", "scripts/README.md")
 OUTSIDE = "../"
-
-
-def is_recall_test(f: Script, ctx: Context) -> bool:
-    return bool(named_file(f, "Recall test for", ctx.rels))
-
-
-def make_closure(ctx: Context) -> dict[str, list[str]]:
-    """Target -> recipe lines, for every target `make ci` reaches: through its
-    prerequisites and through `$(MAKE) <target>` lines, recursively."""
-    recipes, prerequisites = make_rules(ctx.makefile)
-    out: dict[str, list[str]] = {}
-    pending = [CI_TARGET] if CI_TARGET in recipes or CI_TARGET in prerequisites else []
-    while pending:
-        target = pending.pop()
-        if target in out:
-            continue
-        out[target] = recipes.get(target, [])
-        pending += prerequisites.get(target, [])
-        for line in out[target]:
-            for found in MAKE_CALL_RE.finditer(line):
-                pending += [w for w in found.group(1).split() if not w.startswith("-") and "=" not in w]
-    return out
-
-
-def recipe_runs(ctx: Context, line: str) -> list[tuple[str, str, bool]]:
-    """(file, mode, silenced) for each scripts/ file a recipe line runs. The
-    mode is the first argument when it is a bare flag or word, else the
-    default. A line that ends in `|| true` throws the failure away: it asks for
-    no recall test when the file's purpose line starts with `Advisory`, and is
-    otherwise a silenced gate that does."""
-    text = line.lstrip("@-+ \t")
-    silenced = bool(SILENCED_RE.search(text))
-    out = []
-    for logical in clean_shell(text, False, True):
-        for piece in peel_substitutions(logical):
-            for command in split_commands(piece):
-                run, _source, every, _assigned = command_words(command)
-                for word in run:
-                    for f in ctx.resolver.find(word, True):
-                        if silenced and f.purpose.startswith(ADVISORY_PURPOSE):
-                            continue
-                        args = every[every.index(word) + 1 :] if word in every else []
-                        mode = args[0] if args and MODE_RE.fullmatch(args[0]) else DEFAULT_MODE
-                        out.append((f.rel, mode, silenced))
-    return out
-
-
-def closure_runs(ctx: Context) -> tuple[dict[str, dict[str, set[str]]], set[tuple[str, str]]]:
-    """(file -> mode -> the make targets of the `make ci` closure that run it,
-    the (file, mode) pairs run with `|| true`)."""
-    runs: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
-    silenced: set[tuple[str, str]] = set()
-    for target, lines in make_closure(ctx).items():
-        for line in lines:
-            for rel, mode, is_silenced in recipe_runs(ctx, line):
-                runs[rel][mode].add(target)
-                if is_silenced:
-                    silenced.add((rel, mode))
-    return runs, silenced
-
-
-def recall_claims(f: Script) -> list[tuple[int, str, list[str]]]:
-    """(line, tool, mode tokens) per line of the `Recall test for:` field; a
-    tool with no mode token claims the default mode."""
-    declared = f.fields.get("Recall test for")
-    if not declared:
-        return []
-    out = []
-    for offset, text in enumerate(declared[1].split("\n")):
-        words = text.replace(",", " ").split()
-        if words:
-            tool = words[0].strip("`").removeprefix("scripts/")
-            out.append((declared[0] + offset, tool, words[1:] or [DEFAULT_MODE]))
-    return out
-
-
-def mode_problem(tool: Script, mode: str) -> str:
-    if mode == DEFAULT_MODE:
-        return ""
-    if not MODE_RE.fullmatch(mode):
-        return f"`{mode}` is not a mode token"
-    return "" if mode in tool.text else f"`{mode}` occurs nowhere in {tool.rel}"
-
-
-def rule_recall_stale(ctx: Context) -> list[Violation]:
-    by_rel = ctx.by_rel
-    out = []
-    for f in ctx.files:
-        for number, tool, modes in recall_claims(f):
-            if tool == f.rel:
-                out.append(Violation("recall-stale", f.rel, number, "`Recall test for:` names the file itself"))
-            elif tool not in by_rel:
-                out.append(Violation("recall-stale", f.rel, number, f"names {tool}, which is no file of the tree"))
-            else:
-                for mode in modes:
-                    problem = mode_problem(by_rel[tool], mode)
-                    if problem:
-                        out.append(Violation("recall-stale", f.rel, number, f"{tool}: {problem}"))
-    return out
-
-
-def covering_tests(ctx: Context) -> dict[tuple[str, str], list[str]]:
-    """(tool, mode) -> the recall tests whose valid claim names it."""
-    by_rel = ctx.by_rel
-    covered: dict[tuple[str, str], list[str]] = defaultdict(list)
-    for f in ctx.files:
-        for _number, tool, modes in recall_claims(f):
-            if tool in by_rel and tool != f.rel:
-                for mode in modes:
-                    if not mode_problem(by_rel[tool], mode):
-                        covered[(tool, mode)].append(f.rel)
-    return covered
-
-
-def rule_recall_missing(ctx: Context) -> list[Violation]:
-    runs, silenced = closure_runs(ctx)
-    covered = covering_tests(ctx)
-    by_rel = ctx.by_rel
-    out = []
-    for tool in sorted(runs):
-        if is_recall_test(by_rel[tool], ctx):
-            continue
-        for mode in sorted(runs[tool]):
-            tests = covered.get((tool, mode), [])
-            if any(t in runs for t in tests):
-                continue
-            if tests:
-                detail = f"mode {mode}: its recall test {tests[0]} is not run by `make {CI_TARGET}`"
-            else:
-                detail = f"mode {mode} is run by `make {CI_TARGET}` and no `Recall test for:` names it"
-                if (tool, mode) in silenced:
-                    detail += f"; `|| true` exempts only a tool whose purpose line starts with `{ADVISORY_PURPOSE}`"
-            out.append(Violation("recall-missing", tool, 1, detail, key=mode))
-    return out
 
 
 def rule_lib_consumers(ctx: Context) -> list[Violation]:
@@ -194,22 +55,6 @@ def rule_lib_run(ctx: Context) -> list[Violation]:
             for site in sorted(ctx.callers[f.rel].run_by):
                 out.append(Violation("lib-run", f.rel, 1, f"lib/ is sourced or imported, never run; run by {site}", key=site))
     return out
-
-
-def reachable(ctx: Context, start: str) -> set[str]:
-    """The files `start` runs, sources or imports, and what those do in turn."""
-    callees: dict[str, list[str]] = defaultdict(list)
-    for rel, callers in ctx.callers.items():
-        for caller in callers.scripts:
-            callees[caller].append(rel)
-    seen: set[str] = set()
-    pending = [start]
-    while pending:
-        for rel in callees.get(pending.pop(), []):
-            if rel not in seen:
-                seen.add(rel)
-                pending.append(rel)
-    return seen
 
 
 def rule_module_of(ctx: Context) -> list[Violation]:
@@ -268,12 +113,28 @@ def rule_orphan(ctx: Context) -> list[Violation]:
     return out
 
 
+def starts_a_token(line: str, start: int) -> bool:
+    """Whether the `scripts/` at `start` is the repository's directory: at the
+    start of a word, or behind a repository-root expression (`./`, `$VAR/`,
+    `${VAR}/`, `$(VAR)/`, `"$VAR"/`). A path through `../` or another directory
+    is another tree."""
+    before = line[:start]
+    if not before or before[-1] not in PATH_CHARS:
+        return True
+    if before[-1] != "/":
+        return False
+    prefix = ROOT_PREFIX_RE.search(before)
+    return bool(prefix) and (prefix.start() == 0 or before[prefix.start() - 1] not in WORD_CHARS)
+
+
 def dead_tokens(text: str, files: set[str], dirs: set[str]) -> list[tuple[int, str]]:
     """The `scripts/<path>` tokens of `text` that name no file or directory of
     the tree. A token followed by a pattern character is a template."""
     out = []
     for number, line in enumerate(text.split("\n"), 1):
         for found in DEAD_TOKEN_RE.finditer(line):
+            if not starts_a_token(line, found.start()):
+                continue
             token = found.group(1).rstrip(".")
             follower = line[found.end() : found.end() + 1]
             if not token or (follower and follower in PATTERN_FOLLOWERS):
@@ -318,8 +179,6 @@ def rule_dead_path(ctx: Context) -> list[Violation]:
 
 
 STRUCTURE_RULES = (
-    ("recall-missing", rule_recall_missing),
-    ("recall-stale", rule_recall_stale),
     ("lib-consumers", rule_lib_consumers),
     ("lib-run", rule_lib_run),
     ("module-of", rule_module_of),

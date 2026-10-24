@@ -8,12 +8,14 @@ function is registered in `RULE_FUNCTIONS`; the gate runs them in that order.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from scripts_gate_callers import Callers, Resolver
 from scripts_gate_external import External
 from scripts_gate_files import Script, Violation, named_file
+from scripts_gate_recall import is_recall_test
 from scripts_gate_text import declared_exit_codes, python_literal_exits, shell_literal_exits
 
 CLASSES = (
@@ -57,6 +59,7 @@ class Context:
     makefile: str
     external: External
     resolver: Resolver
+    cache: dict[tuple[str, str], Any] = field(default_factory=dict)
 
     @property
     def rels(self) -> set[str]:
@@ -152,7 +155,7 @@ def rule_not_a_mode(ctx: Context) -> list[Violation]:
     for f in ctx.files:
         if f.rel not in ctx.added or f.rel not in ctx.entries:
             continue
-        if named_file(f, "Recall test for", ctx.rels):
+        if is_recall_test(f, ctx):
             continue
         declared = f.fields.get("Not a mode of")
         if not declared:

@@ -18,7 +18,7 @@
 # Usage:  bash scripts/report/kv_census_selftest.sh
 # Exit:   0 every case produced the expected exit code and output; 1 a case
 #         did not; 2 the fixtures themselves could not be built
-# Set:    -uo — a failing case must not stop the cases after it
+# Set:    -uo — a non-zero status inside a case ends the run under -e, before the cases after it
 
 set -uo pipefail
 

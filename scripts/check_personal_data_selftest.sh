@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Recall test for check_personal_data.sh: throwaway git trees, asserting exit code and file:line.
 #
-# Set:    -uo — a failing case must not stop the cases after it
 #
 # Recall test for: check_personal_data.sh
 #
@@ -10,7 +9,7 @@
 # the gate printed; for a refusal, the reason. The planted values are built
 # from parts at run time, so this file holds no line the gate would report.
 
-set -uo pipefail
+set -euo pipefail
 export LC_ALL=C
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

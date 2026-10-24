@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Recall test for the per-file rules of debt_report.py --scripts: planted files, exit code, rule:line.
 #
-# Recall test for: report/debt_report.py --scripts --shellcheck
+# Recall test for: report/debt_report.py --shellcheck
 # Usage:  bash scripts/report/scripts_gate_content_selftest.sh [<debt_report.py under test>]
 # Exit:   0 every case held; 1 a case did not; 2 a fixture could not be built
-# Set:    -uo — a failing case must not stop the cases after it
+# LOC-exempt: one planted file per case; the builders are in lib/selftest_support.sh
 #
 # The rules that read one file: set-mode, py-floor, name, size, heredoc, twin,
 # lib-shadow, binary-literal, env-knob, and the advisory shellcheck mode. Each
@@ -12,7 +12,7 @@
 # builds, and runs the gate with `--base HEAD`. Planted shell comes from
 # heredocs, which the gate does not read as this file's own code.
 
-set -uo pipefail
+set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TOOL="${1:-$REPO_ROOT/scripts/report/debt_report.py}"
@@ -42,6 +42,12 @@ py_entry() {
     } | sg_put "$1" "$2"
 }
 
+# repeat_line <text> <n>: n copies of the text, one per line. No pipe, so no SIGPIPE under pipefail.
+repeat_line() {
+    local i
+    for ((i = 0; i < $2; i++)); do printf '%s\n' "$1"; done
+}
+
 # words <n> <prefix>: n distinct lines. The digit fold would merge numbered ones.
 words() {
     python3 -c '
@@ -56,7 +62,7 @@ for name in itertools.islice(names, int(sys.argv[1])):
 # padded <lines>: a valid entry point of exactly that many lines, on stdout.
 padded() {
     sg_valid_sh ':'
-    /usr/bin/yes ': pad' | head -n "$(($1 - 9))"
+    repeat_line ': pad' "$(($1 - 9))"
 }
 
 # verdict <name> <want exit> <what> <root> [<check>...]: regenerate the INDEX.md of <root>, so the case
@@ -70,7 +76,8 @@ verdict() {
 
 # ---- set-mode ------------------------------------------------------------
 
-for form in 'set -euo pipefail' 'set -Eeuo pipefail' 'set -eu -o pipefail' 'set -e -u -o pipefail'; do
+for form in 'set -euo pipefail' 'set -Eeuo pipefail' 'set -eu -o pipefail' 'set -e -u -o pipefail' \
+    'set -o errexit -o nounset -o pipefail' 'set -o errexit -u -o pipefail'; do
     root=$(sg_fresh "setmode_ok_$(printf '%s' "$form" | tr -c 'a-zA-Z' _)")
     sh_entry "$root" check/y.sh "$form" <<'EOF'
 :
@@ -219,6 +226,36 @@ EOF
 verdict py_floor_local_annotation 0 "a variable annotation inside a function is not evaluated" "$root" \
     --has "check-scripts: ok (5 files"
 
+root=$(sg_fresh pyfloor_class_in_function)
+py_entry "$root" report/y.py <<'EOF'
+def f():
+    class C:
+        x: int | None = None
+    return C
+EOF
+verdict py_floor_class_body_inside_a_function 1 "a class body runs when the function does: its variable annotation is evaluated" "$root" \
+    --has "py-floor: report/y.py:11:" --has "needs \`from __future__ import annotations\`"
+
+root=$(sg_fresh pyfloor_class_module)
+py_entry "$root" report/y.py <<'EOF'
+class C:
+    x: int | None = None
+EOF
+verdict py_floor_class_body_at_module_level 1 "a class attribute annotation at module level" "$root" \
+    --has "py-floor: report/y.py:10:"
+
+root=$(sg_fresh pyfloor_method_local)
+py_entry "$root" report/y.py <<'EOF'
+def f():
+    class C:
+        def m(self):
+            y: int | None = None
+            return y
+    return C
+EOF
+verdict py_floor_local_annotation_in_a_method 0 "a variable annotation in a method of a class inside a function is local, not evaluated" "$root" \
+    --has "check-scripts: ok (5 files"
+
 root=$(sg_fresh pyfloor_string)
 py_entry "$root" report/y.py <<'EOF'
 def f(x: "int | None", y=1 | 2):
@@ -285,6 +322,13 @@ UP="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RAW='$(cd "$(dirname "$0")/../.." && pwd)'
 EOF
 verdict name_directory_above_scripts_is_no_root 0 "the script's own directory, scripts/ itself and a quoted literal are no repository root" "$root" \
+    --has "check-scripts: ok (5 files"
+
+root=$(sg_fresh name_too_many_levels)
+sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+EOF
+verdict name_directory_above_the_repository_is_no_root 0 "three levels above check/y.sh is not the repository root" "$root" \
     --has "check-scripts: ok (5 files"
 
 root=$(sg_fresh name_dollar0)
@@ -358,12 +402,12 @@ verdict size_at_the_limit 0 "1000 lines is within the limit" "$root" \
     --has "check-scripts: ok (5 files"
 
 root=$(sg_fresh size_exempt)
-/usr/bin/yes ': pad' | head -n 1200 | sh_entry "$root" check/y.sh 'set -euo pipefail' '# LOC-exempt: one planted case per line'
+repeat_line ': pad' 1200 | sh_entry "$root" check/y.sh 'set -euo pipefail' '# LOC-exempt: one planted case per line'
 verdict size_with_loc_exempt 0 "a header LOC-exempt reason exempts the file" "$root" \
     --has "check-scripts: ok (5 files"
 
 root=$(sg_fresh size_exempt_empty)
-/usr/bin/yes ': pad' | head -n 1200 | sh_entry "$root" check/y.sh 'set -euo pipefail' '# LOC-exempt:'
+repeat_line ': pad' 1200 | sh_entry "$root" check/y.sh 'set -euo pipefail' '# LOC-exempt:'
 verdict size_exempt_without_a_reason 1 "LOC-exempt with no reason exempts nothing" "$root" \
     --has "size: check/y.sh:1: 1210 lines"
 
@@ -401,7 +445,7 @@ st_case size_pin_raised_above_the_base 1 --what "a pin raised above the base's f
 # py_heredoc <lines> [<tag>]: a python3 heredoc of that many body lines.
 py_heredoc() {
     printf '%s\n' "python3 - <<'${2:-PY}'"
-    /usr/bin/yes 'print(1)' | head -n "$1"
+    repeat_line 'print(1)' "$1"
     printf '%s\n' "${2:-PY}"
 }
 
@@ -419,7 +463,7 @@ root=$(sg_fresh heredoc_dash_c)
 {
     sg_valid_sh ':'
     printf '%s\n' "python3 -c '"
-    /usr/bin/yes 'print(1)' | head -n 21
+    repeat_line 'print(1)' 21
     printf '%s\n' "' arg"
 } | sg_put "$root" check/y.sh
 verdict heredoc_python_dash_c_over_the_limit 1 "a 21-line python3 -c string" "$root" \
@@ -429,7 +473,7 @@ root=$(sg_fresh heredoc_dash_c_20)
 {
     sg_valid_sh ':'
     printf '%s\n' "python3 -c '"
-    /usr/bin/yes 'print(1)' | head -n 20
+    repeat_line 'print(1)' 20
     printf '%s\n' "' arg"
 } | sg_put "$root" check/y.sh
 verdict heredoc_python_dash_c_at_the_limit 0 "a 20-line one" "$root" \
@@ -439,7 +483,7 @@ root=$(sg_fresh heredoc_dash_c_quoted)
 {
     sg_valid_sh ':'
     printf '%s\n' 'python3 -c "'
-    /usr/bin/yes 'print(\"x\")' | head -n 21
+    repeat_line 'print(\"x\")' 21
     printf '%s\n' '" arg'
 } | sg_put "$root" check/y.sh
 verdict heredoc_python_dash_c_escaped_quote 1 "a double-quoted -c string runs on past an escaped quote" "$root" \
@@ -454,7 +498,7 @@ root=$(sg_fresh heredoc_other_command)
 {
     sg_valid_sh ':'
     printf '%s\n' "cat <<'TXT' >/dev/null"
-    /usr/bin/yes 'plain text' | head -n 40
+    repeat_line 'plain text' 40
     printf '%s\n' TXT
 } | sg_put "$root" check/y.sh
 verdict heredoc_of_another_command 0 "a 40-line heredoc that feeds cat" "$root" \
@@ -474,7 +518,7 @@ root=$(sg_fresh heredoc_string)
 {
     sg_valid_sh ':'
     printf '%s\n' "echo \"python3 - <<'PY'\""
-    /usr/bin/yes ': after' | head -n 30
+    repeat_line ': after' 30
 } | sg_put "$root" check/y.sh
 verdict heredoc_opener_in_a_string 0 "an opener inside a string opens nothing" "$root" \
     --has "check-scripts: ok (5 files"
@@ -483,7 +527,7 @@ root=$(sg_fresh heredoc_dash)
 {
     sg_valid_sh ':'
     printf '%s\n' "python3 - <<-PY" $'\tprint(1)' $'\tPY'
-    /usr/bin/yes ': after' | head -n 30
+    repeat_line ': after' 30
 } | sg_put "$root" check/y.sh
 verdict heredoc_tab_terminator 0 "a <<- heredoc ends at its tab-indented terminator" "$root" \
     --has "check-scripts: ok (5 files"
@@ -492,9 +536,92 @@ root=$(sg_fresh heredoc_herestring)
 {
     sg_valid_sh ':'
     printf '%s\n' "python3 -c 'pass' <<<word"
-    /usr/bin/yes ': after' | head -n 30
+    repeat_line ': after' 30
 } | sg_put "$root" check/y.sh
 verdict heredoc_here_string 0 "a here-string opens no heredoc" "$root" \
+    --has "check-scripts: ok (5 files"
+
+root=$(sg_fresh heredoc_continued_opener)
+{
+    sg_valid_sh ':'
+    printf '%s\n' 'a=1; b=2' 'python3 - "$a" \' "  \"\$b\" <<'PY'"
+    repeat_line 'print(1)' 21
+    printf '%s\n' PY
+} | sg_put "$root" check/y.sh
+verdict heredoc_opener_on_a_continuation_line 1 "python3 on one line, its heredoc opener on the next: reported at the opener's line" "$root" \
+    --has "heredoc: check/y.sh:12: a Python body of 21 lines, over 20"
+
+root=$(sg_fresh heredoc_continued_opener_20)
+{
+    sg_valid_sh ':'
+    printf '%s\n' 'a=1; b=2' 'python3 - "$a" \' "  \"\$b\" <<'PY'"
+    repeat_line 'print(1)' 20
+    printf '%s\n' PY
+} | sg_put "$root" check/y.sh
+verdict heredoc_opener_on_a_continuation_line_at_the_limit 0 "the same with 20 lines" "$root" \
+    --has "check-scripts: ok (5 files"
+
+root=$(sg_fresh heredoc_continued_other)
+{
+    sg_valid_sh ':'
+    printf '%s\n' 'cat \' "  <<'TXT' >/dev/null"
+    repeat_line 'plain text' 40
+    printf '%s\n' TXT
+} | sg_put "$root" check/y.sh
+verdict heredoc_continued_opener_of_another_command 0 "a continued cat heredoc is not Python" "$root" \
+    --has "check-scripts: ok (5 files"
+
+root=$(sg_fresh heredoc_continued_dash_c)
+{
+    sg_valid_sh ':'
+    printf '%s\n' 'python3 \' "  -c '"
+    repeat_line 'print(1)' 21
+    printf '%s\n' "'"
+} | sg_put "$root" check/y.sh
+verdict heredoc_dash_c_on_a_continuation_line 1 "python3 on one line, -c and its string on the next: reported at the quote's line" "$root" \
+    --has "heredoc: check/y.sh:11: a Python body of 21 lines"
+
+root=$(sg_fresh heredoc_continued_dash_c_20)
+{
+    sg_valid_sh ':'
+    printf '%s\n' 'python3 \' "  -c '"
+    repeat_line 'print(1)' 20
+    printf '%s\n' "'"
+} | sg_put "$root" check/y.sh
+verdict heredoc_dash_c_on_a_continuation_line_at_the_limit 0 "the same with 20 lines" "$root" \
+    --has "check-scripts: ok (5 files"
+
+root=$(sg_fresh heredoc_python_without_3)
+{
+    sg_valid_sh ':'
+    printf '%s\n' "python <<'PY'"
+    repeat_line 'print(1)' 21
+    printf '%s\n' PY
+} | sg_put "$root" check/y.sh
+verdict heredoc_plain_python_word 1 "python (no 3) with a 21-line heredoc" "$root" \
+    --has "heredoc: check/y.sh:10: a Python body of 21 lines"
+
+root=$(sg_fresh heredoc_python_without_3_c)
+{
+    sg_valid_sh ':'
+    printf '%s\n' "python -c '"
+    repeat_line 'print(1)' 21
+    printf '%s\n' "'"
+} | sg_put "$root" check/y.sh
+verdict heredoc_plain_python_dash_c 1 "python (no 3) -c with a 21-line string" "$root" \
+    --has "heredoc: check/y.sh:10: a Python body of 21 lines"
+
+root=$(sg_fresh heredoc_python_name_inside)
+{
+    sg_valid_sh ':'
+    printf '%s\n' "cat <<'TXT' >/dev/null"
+    repeat_line 'plain text' 40
+    printf '%s\n' TXT
+    printf '%s\n' "pythonic <<'TXT'"
+    repeat_line 'plain text' 40
+    printf '%s\n' TXT
+} | sg_put "$root" check/y.sh
+verdict heredoc_pythonic_is_no_python 0 "a command named pythonic is not python" "$root" \
     --has "check-scripts: ok (5 files"
 
 root=$(sg_fresh heredoc_pin)
@@ -568,8 +695,8 @@ verdict twin_other_language_is_no_twin 0 "a shell file and a Python file with th
     --has "check-scripts: ok (6 files"
 
 root=$(sg_fresh twin_comments)
-{ sg_valid_sh "$(words 24 ': w_')"; words 30 '# c_'; /usr/bin/yes '}' | head -n 30; } | sg_put "$root" check/a.sh
-{ sg_valid_sh "$(words 24 ': v_')"; words 30 '# c_'; /usr/bin/yes '}' | head -n 30; } | sg_put "$root" check/b.sh
+{ sg_valid_sh "$(words 24 ': w_')"; words 30 '# c_'; repeat_line '}' 30; } | sg_put "$root" check/a.sh
+{ sg_valid_sh "$(words 24 ': v_')"; words 30 '# c_'; repeat_line '}' 30; } | sg_put "$root" check/b.sh
 verdict twin_comments_and_closers_are_not_significant 0 "30 shared comment lines and 30 shared closers do not make a twin" "$root" \
     --has "check-scripts: ok (6 files"
 
@@ -591,6 +718,24 @@ twin_of 31 | sg_put "$root" check/a.sh
 verdict twin_half_rounds_up 0 "15 of 31 lines is under half: it takes 16" "$root" \
     --has "check-scripts: ok (6 files"
 
+root=$(sg_fresh twin_digits_only)
+{ sg_valid_sh ':'; words 44 ': w_' | sed 's/$/1/'; } | sg_put "$root" check/a.sh
+{ sg_valid_sh ':'; words 44 ': w_' | sed 's/$/2/'; } | sg_put "$root" check/b.sh
+verdict twin_files_that_differ_only_in_digits 1 "the same 44 lines with a different digit at the end are folded before the bound is taken" "$root" \
+    --has "twin: check/a.sh:1: 46 matched significant lines with check/b.sh"
+
+root=$(sg_fresh twin_form_feed)
+{
+    sg_valid_sh ':'
+    for c in a b c d e f g h i j k l m n o; do printf 'echo a%s\fb%s\fc%s\fd%s\n' "$c" "$c" "$c" "$c"; done
+} | sg_put "$root" check/a.sh
+{
+    sg_valid_sh ':'
+    for c in a b c d e f g h i j k l m n o; do printf 'echo a%s\fb%s\fc%s\fd%s\n' "$c" "$c" "$c" "$c"; done
+} | sg_put "$root" check/b.sh
+verdict twin_lines_with_a_form_feed 1 "15 lines of four form-feed pieces: the pieces are lines to the figure, so they are to the bound" "$root" \
+    --has "twin: check/a.sh:1: " --has "matched significant lines with check/b.sh"
+
 root=$(sg_fresh twin_pin)
 twin_of 45 | sg_put "$root" check/a.sh
 twin_of 45 | sg_put "$root" check/b.sh
@@ -605,6 +750,14 @@ twin_of 45 | sg_put "$root" check/a.sh
 { sg_valid_sh "$(words 24 ': w_')"; words 40 ': v_'; } | sg_put "$root" check/b.sh
 st_case twin_pin_shrank 1 --what "one that shrank asks for the pin to be lowered" \
     --has "pin-stale: report/scripts_gate_pins.txt:4: twin check/a.sh+check/b.sh: figure is 25, pinned 45" -- sg_gate "$root"
+
+root=$(sg_fresh twin_pin_unsorted)
+twin_of 45 | sg_put "$root" check/a.sh
+twin_of 45 | sg_put "$root" check/b.sh
+sg_pins_file 'twin check/b.sh+check/a.sh 45' >"$root/$SG_PINS_REL"
+verdict twin_pin_written_unsorted 1 "a pair pinned as b+a never matches: the message says why" "$root" \
+    --has "twin: check/a.sh:1: 45 matched significant lines with check/b.sh" \
+    --has "pin-stale: report/scripts_gate_pins.txt:4: twin check/b.sh+check/a.sh: write the two paths of a pair in sorted order (check/a.sh+check/b.sh)"
 
 root=$(sg_fresh twin_pin_moved)
 twin_of 45 | sg_put "$root" check/a.sh
@@ -644,6 +797,29 @@ TXT
 # helper() { :; }
 EOF
 verdict lib_shadow_other_names_heredocs_comments 0 "another name, a heredoc body and a comment define nothing" "$root" \
+    --has "check-scripts: ok (5 files"
+
+n=0
+for body in 'x=1; helper() { :; }' 'if true; then helper() { :; }; fi' 'true && helper() { :; }' 'false || helper() { :; }' \
+    'for i in 1; do helper() { :; }; done' 'if false; then :; else helper() { :; }; fi' '{ helper() { :; }; }' \
+    '    helper() { :; }' ': ; function helper { :; }' 'case x in x) helper() { :; } ;; esac'; do
+    n=$((n + 1))
+    root=$(sg_fresh "libshadow_form_$n")
+    sh_entry "$root" check/y.sh 'set -euo pipefail' <<EOF
+$body
+EOF
+    verdict "lib_shadow_form_$n" 1 "a definition inside: $body" "$root" \
+        --has "lib-shadow: check/y.sh:10: helper() is defined in lib/helper.sh"
+done
+
+root=$(sg_fresh libshadow_text)
+sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
+echo "a; helper() { :; }"
+echo 'if x; then helper() { :; }; fi'
+x=$(helper)
+helper_two() { :; }; other() { :; }
+EOF
+verdict lib_shadow_definition_in_a_string_or_a_call 0 "a definition quoted in a string, a call, and other names define nothing" "$root" \
     --has "check-scripts: ok (5 files"
 
 root=$(sg_fresh libshadow_recall)
@@ -691,6 +867,21 @@ BIN2=target/release/rmlx_main
 EOF
 verdict binary_literal_not_a_site 0 "a comment, rmlx-server and rmlx_main are no binary literal" "$root" \
     --has "check-scripts: ok (5 files"
+
+root=$(sg_fresh binary_trailing_comment)
+sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
+echo hi # see target/release/rmlx
+echo hi;# and target/debug/rmlx
+EOF
+verdict binary_literal_trailing_comment_is_not_read 0 "a comment after code is not read" "$root" \
+    --has "check-scripts: ok (5 files"
+
+root=$(sg_fresh binary_hash_in_string)
+sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
+echo "a # b" target/release/rmlx # but this is a comment
+EOF
+verdict binary_literal_hash_inside_quotes 1 "a # inside quotes starts no comment: the site before the comment is read" "$root" \
+    --has 'binary-literal: check/y.sh:10: `target/release/rmlx` is written out' --lacks "check/y.sh:11"
 
 root=$(sg_fresh binary_identity)
 printf '%s\n' '# The planted identity library.' '#' '# Module of: check/ok.sh' 'BIN=target/release/rmlx' | sg_put "$root" lib/identity.sh
@@ -748,13 +939,13 @@ verdict env_knob_read_forms 1 "the four default forms of an environment read" "$
 
 root=$(sg_fresh env_not_reads)
 sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
-: "${KNOB_A}" "${KNOB_B:+x}" "${knob_c:-x}" "${1:-x}" "${#KNOB_D}" "${HOME:-/}" "${PATH:-}" "${TMPDIR:-/tmp}"
+: "${knob_c:-x}" "${1:-x}" "${HOME:-/}" "${PATH:-}" "${TMPDIR:-/tmp}" "$HOME" "${#PATH}"
 # : "${KNOB_E:-x}"
 cat <<'TXT' >/dev/null
 : "${KNOB_F:-x}"
 TXT
 EOF
-verdict env_knob_not_a_read 0 "a plain expansion, :+, lower case, a parameter, a comment, a heredoc and the system names" "$root" \
+verdict env_knob_not_a_read 0 "lower case, a parameter, a comment, a heredoc and the system names" "$root" \
     --has "check-scripts: ok (5 files"
 
 root=$(sg_fresh env_assigned)
@@ -787,11 +978,10 @@ root=$(sg_fresh env_py_not_reads)
 py_entry "$root" report/y.py <<'EOF'
 import os
 
-name = "KNOB_P"
 os.environ["KNOB_Q"] = "1"
-VALUE = (os.environ.get(name), os.environ["HOME"], os.getenv("lower"), os.environ.get("TMPDIR"))
+VALUE = (os.environ["HOME"], os.getenv("lower"), os.environ.get("TMPDIR"))
 EOF
-verdict env_knob_python_not_reads 0 "a store, a computed name, a lower-case name and the system names" "$root" \
+verdict env_knob_python_not_reads 0 "a store, a lower-case name and the system names" "$root" \
     --has "check-scripts: ok (5 files"
 
 root=$(sg_fresh env_declared)
@@ -814,6 +1004,193 @@ EOF
 verdict env_knob_python_imported_names 1 "environ and getenv imported from os" "$root" \
     --has "env-knob: report/y.py:11: reads the environment variable KNOB_P" \
     --has "env-knob: report/y.py:12: reads the environment variable KNOB_Q"
+
+root=$(sg_fresh env_operator_forms)
+sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
+: "${KNOB_A+x}"
+: "${KNOB_B:+x}"
+: "${KNOB_C#x}"
+: "${KNOB_D%/}"
+: "${KNOB_E/a/b}"
+: "${KNOB_F^^}"
+: "${KNOB_G:0:1}"
+: "${KNOB_H@Q}"
+EOF
+verdict env_knob_operator_forms 1 "every operator after the name is a read, not only the default forms" "$root" \
+    --has "env-knob: check/y.sh:10: reads the environment variable KNOB_A" \
+    --has "env-knob: check/y.sh:11: reads the environment variable KNOB_B" \
+    --has "env-knob: check/y.sh:12: reads the environment variable KNOB_C" \
+    --has "env-knob: check/y.sh:13: reads the environment variable KNOB_D" \
+    --has "env-knob: check/y.sh:14: reads the environment variable KNOB_E" \
+    --has "env-knob: check/y.sh:15: reads the environment variable KNOB_F" \
+    --has "env-knob: check/y.sh:16: reads the environment variable KNOB_G" \
+    --has "env-knob: check/y.sh:17: reads the environment variable KNOB_H"
+
+root=$(sg_fresh env_bare_forms)
+sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
+: "$KNOB_A"
+: "${KNOB_B}"
+: "${#KNOB_C}"
+: "${!KNOB_D}"
+: $KNOB_E/sub
+EOF
+verdict env_knob_bare_forms 1 "\$NAME, \${NAME}, \${#NAME} and \${!NAME} of a name nothing assigns" "$root" \
+    --has "env-knob: check/y.sh:10: reads the environment variable KNOB_A" \
+    --has "env-knob: check/y.sh:11: reads the environment variable KNOB_B" \
+    --has "env-knob: check/y.sh:12: reads the environment variable KNOB_C" \
+    --has "env-knob: check/y.sh:13: reads the environment variable KNOB_D" \
+    --has "env-knob: check/y.sh:14: reads the environment variable KNOB_E"
+
+root=$(sg_fresh env_bare_assigned_later)
+sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
+use() { : "$KNOB_A" "${KNOB_B}" "${#KNOB_C}"; }
+KNOB_A=1
+KNOB_B=2
+KNOB_C=3
+use
+: "${KNOB_D:-x}"
+KNOB_D=1
+EOF
+verdict env_knob_bare_read_of_a_name_assigned_later 1 "a bare read in a function is fed by an assignment further down; an operator read before its assignment is still a read" "$root" \
+    --has "env-knob: check/y.sh:15: reads the environment variable KNOB_D" --lacks "KNOB_A" --lacks "KNOB_B" --lacks "KNOB_C"
+
+root=$(sg_fresh env_self_reference)
+sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
+KNOB_A="${KNOB_A:-x}"
+KNOB_B="$KNOB_B/sub"
+: "$KNOB_A" "$KNOB_B"
+EOF
+verdict env_knob_assignment_from_itself_assigns_nothing 1 "X=\"\${X:-d}\" and X=\"\$X/sub\" read the environment, and the later bare reads stay reads" "$root" \
+    --has "env-knob: check/y.sh:10: reads the environment variable KNOB_A" \
+    --has "env-knob: check/y.sh:11: reads the environment variable KNOB_B" \
+    --has "env-knob: check/y.sh:12: reads the environment variable KNOB_A"
+
+root=$(sg_fresh env_string_assignment)
+sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
+echo "usage: KNOB_A=path bash scripts/check/y.sh"
+b="${KNOB_A:-x}"
+EOF
+verdict env_knob_assignment_in_a_string 1 "NAME=value inside a string assigns nothing" "$root" \
+    --has "env-knob: check/y.sh:11: reads the environment variable KNOB_A"
+
+root=$(sg_fresh env_single_quoted)
+sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
+printf '%s\n' '${KNOB_A:-x} $KNOB_B ${KNOB_C}' "\${KNOB_D:-x} \$KNOB_E"
+cat <<'TXT' >/dev/null
+$KNOB_F ${KNOB_G:-x}
+TXT
+arr=(a b); : "${KNOB_ARRAY[@]}" "${#KNOB_ARRAY[@]}"
+EOF
+verdict env_knob_text_that_no_shell_expands 0 "single-quoted text, an escaped dollar, a quoted heredoc body and an array are no reads" "$root" \
+    --has "check-scripts: ok (5 files"
+
+root=$(sg_fresh env_sourced)
+sg_put "$root" lib/y.sh <<'EOF'
+# A planted lib file that sets a name.
+#
+# Module of: check/y.sh
+KNOB_A=1
+. "$(dirname "${BASH_SOURCE[0]}")/z.sh"
+EOF
+sg_put "$root" lib/z.sh <<'EOF'
+# A planted lib file one level down.
+#
+# Module of: lib/y.sh
+KNOB_B=2
+EOF
+sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
+. "$(dirname "$0")/../lib/y.sh"
+: "$KNOB_A" "${KNOB_B:-x}" "$KNOB_C"
+EOF
+verdict env_knob_name_assigned_by_a_sourced_file 1 "a name a sourced file assigns, directly or through the file it sources, is not a read" "$root" \
+    --has "env-knob: check/y.sh:11: reads the environment variable KNOB_C" --lacks "KNOB_A" --lacks "KNOB_B"
+
+root=$(sg_fresh env_consumers)
+sg_put "$root" lib/y.sh <<'EOF'
+# A planted lib file that reads names its consumers set.
+#
+# Sourced, not executed.
+liby() { : "$KNOB_A" "$KNOB_B"; }
+EOF
+sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
+KNOB_A=1
+KNOB_B=2
+. "$(dirname "$0")/../lib/y.sh"
+EOF
+sh_entry "$root" check/z.sh 'set -euo pipefail' <<'EOF'
+KNOB_A=1
+. "$(dirname "$0")/../lib/y.sh"
+EOF
+verdict env_knob_lib_reads_what_every_consumer_sets 1 "lib/y.sh reads KNOB_A (both consumers set it) and KNOB_B (only one does)" "$root" \
+    --has "env-knob: lib/y.sh:4: reads the environment variable KNOB_B" --lacks "KNOB_A"
+
+root=$(sg_fresh env_printenv)
+sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
+printenv KNOB_A
+printenv
+EOF
+verdict env_knob_printenv 1 "printenv NAME reads NAME and a bare printenv reads them all" "$root" \
+    --has "env-knob: check/y.sh:10: reads the environment variable KNOB_A" \
+    --has "env-knob: check/y.sh:11: reads the environment variable ?"
+
+root=$(sg_fresh env_binary_names)
+sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
+: "${RMLX_BIN:-x}"
+: "${RMLX_BINARY:+x}"
+: "$RMLX"
+: "${CI:-}"
+EOF
+verdict env_knob_names_the_sweep_removes 1 "a new file cannot read RMLX_BIN, RMLX_BINARY, RMLX or CI" "$root" \
+    --has "env-knob: check/y.sh:10: reads the environment variable RMLX_BIN" \
+    --has "env-knob: check/y.sh:11: reads the environment variable RMLX_BINARY" \
+    --has "env-knob: check/y.sh:12: reads the environment variable RMLX" \
+    --has "env-knob: check/y.sh:13: reads the environment variable CI"
+
+root=$(sg_fresh env_py_more)
+py_entry "$root" report/y.py <<'EOF'
+import os
+
+A = "KNOB_A" in os.environ
+os.environ.setdefault("KNOB_B", "x")
+C = os.environ.pop("KNOB_C", None)
+env = os.environ
+D = env["KNOB_D"]
+E = env.get("KNOB_E")
+key = "KNOB_F"
+F = os.environ[key]
+G = os.getenv(key)
+EOF
+verdict env_knob_python_more_forms 1 "in, setdefault, pop, an alias of os.environ, and a computed key" "$root" \
+    --has "env-knob: report/y.py:11: reads the environment variable KNOB_A" \
+    --has "env-knob: report/y.py:12: reads the environment variable KNOB_B" \
+    --has "env-knob: report/y.py:13: reads the environment variable KNOB_C" \
+    --has "env-knob: report/y.py:15: reads the environment variable KNOB_D" \
+    --has "env-knob: report/y.py:16: reads the environment variable KNOB_E" \
+    --has "env-knob: report/y.py:18: reads the environment variable ?" \
+    --has "env-knob: report/y.py:19: reads the environment variable ?"
+
+root=$(sg_fresh env_py_aliased_import)
+py_entry "$root" report/y.py <<'EOF'
+from os import environ as E
+
+A = E["KNOB_A"]
+EOF
+verdict env_knob_python_aliased_import 1 "from os import environ as E" "$root" \
+    --has "env-knob: report/y.py:11: reads the environment variable KNOB_A"
+
+root=$(sg_fresh env_py_not_reads_more)
+py_entry "$root" report/y.py <<'EOF'
+import os
+
+os.environ["KNOB_A"] = "1"
+del os.environ["KNOB_B"]
+COPY = dict(os.environ)
+ITEMS = list(os.environ.items())
+environ = {"KNOB_C": 1}
+C = environ["KNOB_C"]
+EOF
+verdict env_knob_python_not_reads_more "0" "a store, a delete, a copy, items() and a dict that is merely called environ" "$root" \
+    --has "check-scripts: ok (5 files"
 
 root=$(sg_fresh env_pin)
 sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'

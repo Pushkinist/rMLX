@@ -28,8 +28,8 @@ Definitions the rules share:
   A file whose `Module of:` names another file of the tree is not one.
 * The run of `make ci` is the closure of the `ci` target: its recipe lines, its
   prerequisites and every `$(MAKE) <target>` line, recursively. A mode of a tool
-  is the first argument of the recipe line when it is a bare flag or word, else
-  `default`.
+  is the first option or bare word of its recipe line that is not the value of
+  an option before it (`--x=v` is a mode as written), else `default`.
 * The header is the leading comment block (Python: the module docstring;
   `.entitlements`: the first XML comment). Its first line, directly after the
   shebang, is the purpose; `Usage:`, `Exit:`, `Caller:`, `Recall test for:`,
@@ -63,6 +63,7 @@ from scripts_gate_callers import Resolver, derive_callers, index_violations, ren
 from scripts_gate_content import CONTENT_RULES
 from scripts_gate_external import load_external
 from scripts_gate_files import INDEX, Unavailable, Violation, git, git_ok, load_population
+from scripts_gate_recall import RECALL_RULES
 from scripts_gate_rules import RULE_FUNCTIONS, Context, entry_points
 from scripts_gate_structure import STRUCTURE_RULES
 from scripts_gate_twin import rule_twin
@@ -75,6 +76,7 @@ PINNABLE = (
     "exit-undeclared",
     "caller",
     "recall-missing",
+    "silenced",
     "lib-consumers",
     "lib-run",
     "shebang",
@@ -92,6 +94,7 @@ PINNABLE = (
 SET_NOUNS = {
     "exit-undeclared": "code",
     "recall-missing": "mode",
+    "silenced": "mode",
     "lib-run": "site",
     "dead-path": "token",
     "name": "item",
@@ -263,7 +266,11 @@ def apply_pins(found: list[Violation], pins: PinList) -> tuple[list[Violation], 
         if key[0] not in PINNABLE:
             active.append(Violation("pin-stale", PINS, pin.line, f"{key[0]} {key[1]}: {key[0]} cannot be pinned"))
         elif key not in groups:
-            active.append(Violation("pin-stale", PINS, pin.line, f"{key[0]} {key[1]}: no longer violated; delete the pin"))
+            detail = f"{key[0]} {key[1]}: no longer violated; delete the pin"
+            halves = key[1].split("+")
+            if key[0] == "twin" and halves != sorted(halves):
+                detail = f"{key[0]} {key[1]}: write the two paths of a pair in sorted order ({'+'.join(sorted(halves))})"
+            active.append(Violation("pin-stale", PINS, pin.line, detail))
     return active, held
 
 
@@ -355,7 +362,7 @@ def check(root: Path, base: str | None, write_index: bool) -> int:
     added, renames = changes_since(root, sha)
     ctx = Context(root, files, callers, added, entry_points(files, callers), makefile_text, external, resolver)
     found: list[Violation] = []
-    for _name, rule in (*RULE_FUNCTIONS, *STRUCTURE_RULES, *CONTENT_RULES, ("twin", rule_twin)):
+    for _name, rule in (*RULE_FUNCTIONS, *RECALL_RULES, *STRUCTURE_RULES, *CONTENT_RULES, ("twin", rule_twin)):
         found += sorted(rule(ctx), key=lambda v: (v.path, v.line))
     pins = load_pins(root)
     active, held = apply_pins(found, pins)

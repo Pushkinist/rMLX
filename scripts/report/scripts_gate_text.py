@@ -19,6 +19,8 @@ HEREDOC_RE = re.compile(r"<<(-?)\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
 EXIT_RE = re.compile(r"(?:^|[;&|(){!)]|\bthen\b|\belse\b|\bdo\b|\belif\b)\s*exit\s+([0-9]+)\b")
 ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 VAR_RE = re.compile(r"^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$")
+DEFAULT_EXPANSION_RE = re.compile(r"^\$\{[A-Za-z0-9_]+:?-(.*)\}$")
+MAKE_VARIABLE_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*(\+|\?|:|::)?=\s*(.*)$")
 EXIT_CODE_RE = re.compile(r"(?:^|[;,|/(])[ \t]*(\d+)(?:[ \t]*[-\u2013][ \t]*(\d+))?\b", re.M)
 SUBST_RE = re.compile(r"\$\(([^()]*)\)")
 RULE_RE = re.compile(r"^([A-Za-z0-9_./ -]+?)\s*:(?![=:])")
@@ -35,11 +37,12 @@ PROSE_COMMANDS = frozenset({"echo", "printf"})
 SUBPROCESS_CALLS = frozenset({"run", "check_output", "check_call", "call", "Popen"})
 
 
-def clean_shell(text: str, blank_strings: bool, join: bool = False) -> list[str]:
+def clean_shell(text: str, blank_strings: bool, join: bool = False, blank_single: bool = False) -> list[str]:
     """Shell source without comments and heredoc bodies; string bodies are
-    blanked when asked. One entry per physical line, so line numbers hold; with
-    `join`, one entry per command line, a string or a trailing backslash
-    carrying a command over several physical lines."""
+    blanked when asked, or only the single-quoted ones, which no shell expands.
+    One entry per physical line, so line numbers hold; with `join`, one entry per
+    command line, a string or a trailing backslash carrying a command over
+    several physical lines."""
     lines: list[str] = []
     out: list[str] = []
     i, n = 0, len(text)
@@ -87,7 +90,7 @@ def clean_shell(text: str, blank_strings: bool, join: bool = False) -> list[str]
                 quote = ""
                 i += 1
             else:
-                out.append(" " if blank_strings else c)
+                out.append(" " if blank_strings or (blank_single and quote == "'") else c)
                 i += 1
             continue
         if c == "\\" and i + 1 < n and text[i + 1] != "\n":
@@ -208,12 +211,38 @@ def declared_exit_codes(text: str) -> set[int]:
 
 
 
+def single_quoted(line: str) -> list[bool]:
+    """Per character of a line: whether it is inside single quotes, which no
+    shell expands."""
+    inside: list[bool] = []
+    quote = ""
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if c == "\\" and quote != "'" and i + 1 < len(line):
+            inside += [False, False]
+            i += 2
+            continue
+        if not quote and c in "'\"":
+            quote = c
+            inside.append(c == "'")
+        elif quote and c == quote:
+            inside.append(c == "'")
+            quote = ""
+        else:
+            inside.append(quote == "'")
+        i += 1
+    return inside
+
+
 def peel_substitutions(line: str) -> list[str]:
     """The line with each command substitution replaced by `$SUB`, then the
-    substitution bodies, so a script run inside `$(...)` is still seen."""
+    substitution bodies, so a script run inside `$(...)` is still seen. A
+    substitution inside single quotes is text."""
     parts = []
     while True:
-        found = SUBST_RE.search(line)
+        quoted = single_quoted(line)
+        found = next((m for m in SUBST_RE.finditer(line) if not quoted[m.start()]), None)
         if not found:
             break
         parts.append(found.group(1))
@@ -355,6 +384,9 @@ def shell_refs(lines: list[str]) -> Refs:
 
     def put(target: set[str], word: str, seen: frozenset[str] = frozenset()) -> None:
         target.add(word)
+        default = DEFAULT_EXPANSION_RE.match(word)
+        if default:
+            put(target, default.group(1), seen)
         found = VAR_RE.match(word)
         if found and found.group(1) not in seen:
             for value in values.get(found.group(1), ()):
@@ -452,10 +484,8 @@ def is_subprocess_call(func: ast.expr, local_calls: set[str]) -> bool:
     return isinstance(func, ast.Name) and func.id in local_calls
 
 
-def make_rules(text: str) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
-    """(target -> recipe lines, target -> prerequisites). Comments and
-    continuations are resolved; a prerequisite that holds a variable or a
-    pattern is dropped."""
+def make_logical_lines(text: str) -> list[tuple[bool, str]]:
+    """(is a recipe line, line) with each continuation joined to its line."""
     logical: list[tuple[bool, str]] = []
     held = ""
     for raw in text.split("\n"):
@@ -465,6 +495,29 @@ def make_rules(text: str) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
         line = held + raw
         held = ""
         logical.append((line.startswith("\t"), line))
+    return logical
+
+
+def make_variables(text: str) -> dict[str, str | None]:
+    """Name -> value of each Makefile variable written as one `NAME = words` or
+    `NAME := words` line with no `$` in the value; None for a name defined any
+    other way or more than once (`?=`, `+=`, a value that expands something)."""
+    out: dict[str, str | None] = {}
+    for is_recipe, line in make_logical_lines(text):
+        found = None if is_recipe else MAKE_VARIABLE_RE.match(line)
+        if not found:
+            continue
+        name, flavour, value = found.group(1), found.group(2), found.group(3).split("#", 1)[0].strip()
+        simple = flavour in (None, ":", "::") and "$" not in value and name not in out
+        out[name] = value if simple else None
+    return out
+
+
+def make_rules(text: str) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """(target -> recipe lines, target -> prerequisites). Comments and
+    continuations are resolved; a prerequisite that is a pattern or an
+    assignment is dropped, one that holds a variable is kept as written."""
+    logical = make_logical_lines(text)
     recipes: dict[str, list[str]] = defaultdict(list)
     prerequisites: dict[str, list[str]] = defaultdict(list)
     current: list[str] = []
@@ -480,7 +533,7 @@ def make_rules(text: str) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
         if found and "$(" not in found.group(1):
             current = [t for t in found.group(1).split() if not t.startswith(".") and "%" not in t]
             after = line[found.end() :].split("#", 1)[0]
-            needs = [w for w in after.split() if w != "|" and not any(ch in w for ch in "$%=")]
+            needs = [w for w in after.split() if w != "|" and not any(ch in w for ch in "%=")]
             for target in current:
                 prerequisites[target].extend(needs)
         else:

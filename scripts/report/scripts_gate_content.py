@@ -14,12 +14,15 @@ import os
 import re
 from collections.abc import Iterator
 
+from scripts_gate_env import rule_env_knob
 from scripts_gate_files import Script, Violation
 from scripts_gate_rules import Context, not_a_mode_target
-from scripts_gate_structure import LIB_PREFIX, is_recall_test
+from scripts_gate_recall import is_recall_test
+from scripts_gate_structure import LIB_PREFIX
 from scripts_gate_text import HEREDOC_RE, KEYWORDS, clean_shell, split_commands
 
 PY_FLOOR = (3, 9)
+OPTION_LETTERS = {"errexit": "e", "nounset": "u"}
 SIZE_LIMIT = 1000
 HEREDOC_LIMIT = 20
 ROOT_VARIABLE = "REPO_ROOT"
@@ -31,24 +34,17 @@ TOPLEVEL_RE = re.compile(r"rev-parse\s+--show-toplevel")
 PYTHON_WORD_RE = re.compile(r"\bpython3?\b")
 PYTHON_C_RE = re.compile(r"""\bpython3?\b[^\n]*?\s-c\s+(['"])""")
 BINARY_RE = re.compile(r"target/[^/\s\"']+/rmlx(?![\w-])")
-FUNCTION_RE = re.compile(r"^\s*(?:function\s+([A-Za-z_]\w*)|([A-Za-z_]\w*)\s*\(\s*\))")
-ENV_READ_RE = re.compile(r"\$\{([A-Z][A-Z0-9_]*)(?::?[-=?])")
-ENV_NAME_RE = re.compile(r"[A-Z][A-Z0-9_]*")
-DECLARING = frozenset({"local", "declare", "typeset", "export", "readonly", "read"})
-SYSTEM_ENV = frozenset(
-    {
-        "HOME", "PATH", "TMPDIR", "PWD", "OLDPWD", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "LC_ALL", "TZ", "CI",
-        "NO_COLOR", "BASH_SOURCE", "BASH_VERSION", "BASH_REMATCH", "FUNCNAME", "PIPESTATUS", "LINENO", "RANDOM",
-        "SECONDS", "HOSTNAME", "UID", "EUID", "OSTYPE", "IFS", "REPLY", "OPTARG", "OPTIND", "PPID", "SHLVL",
-    }
-)  # fmt: skip
+FUNCTION_RE = re.compile(
+    r"(?:^|[;{}()&|]|\bthen\b|\bdo\b|\belse\b|\belif\b)\s*(?:function\s+([A-Za-z_]\w*)|([A-Za-z_]\w*)\s*\(\s*\))"
+)
 
 
 # ---- set-mode ------------------------------------------------------------
 
 
 def set_options(text: str) -> tuple[set[str], set[str]]:
-    """(option letters, `-o` names) of every `set` command in the shell text."""
+    """(option letters, `-o` names) of every `set` command in the shell text;
+    `-o errexit` and `-o nounset` count as the letters `e` and `u`."""
     letters: set[str] = set()
     names: set[str] = set()
     for line in clean_shell(text, True, True):
@@ -65,6 +61,7 @@ def set_options(text: str) -> tuple[set[str], set[str]]:
                     names.add(command[i + 1])
                     i += 1
                 i += 1
+    letters.update(OPTION_LETTERS[name] for name in names if name in OPTION_LETTERS)
     return letters, names
 
 
@@ -99,8 +96,9 @@ def has_future_annotations(tree: ast.Module) -> bool:
 
 def evaluated_annotations(node: ast.AST, in_function: bool) -> Iterator[ast.expr]:
     """The annotations Python evaluates when the definition runs: every
-    argument and return annotation, and a variable annotation outside a
-    function."""
+    argument and return annotation, and a variable annotation that is not in
+    the body of a function. A class body evaluates its annotations, also when the
+    class sits inside a function."""
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         args = node.args
         every = [*args.posonlyargs, *args.args, *args.kwonlyargs, *(a for a in (args.vararg, args.kwarg) if a)]
@@ -108,6 +106,8 @@ def evaluated_annotations(node: ast.AST, in_function: bool) -> Iterator[ast.expr
         if node.returns:
             yield node.returns
         in_function = True
+    elif isinstance(node, ast.ClassDef):
+        in_function = False
     elif isinstance(node, ast.AnnAssign) and not in_function:
         yield node.annotation
     for child in ast.iter_child_nodes(node):
@@ -223,44 +223,69 @@ def closing_quote(text: str, opening: int) -> int:
     return min(i, len(text))
 
 
+def command_lines(blanked: list[str]) -> Iterator[tuple[str, list[tuple[int, int]]]]:
+    """(text, segments) per command line of the blanked shell lines: a line that
+    ends in a backslash is joined to the next, the backslash becoming a space, so
+    a column of the text is a column of its physical line. A segment is (offset
+    in the text where a physical line starts, its index); the physical line of a
+    position is the last segment starting at or before it."""
+    i = 0
+    while i < len(blanked):
+        text, segments = "", []
+        while True:
+            segments.append((len(text), i))
+            line = blanked[i]
+            continued = line.rstrip().endswith("\\") and i + 1 < len(blanked)
+            text += line.rstrip()[:-1] + " " if continued else line
+            i += 1
+            if not continued:
+                break
+        yield text, segments
+
+
+def physical_position(segments: list[tuple[int, int]], position: int) -> tuple[int, int]:
+    """(physical line index, column) of a position in a joined command line."""
+    offset, index = [s for s in segments if s[0] <= position][-1]
+    return index, position - offset
+
+
 def python_bodies(text: str) -> Iterator[tuple[int, int]]:
     """(line, length in lines) of every Python body in shell text: the lines
     between a `python` command's heredoc opener and its terminator, or the
-    lines of a `python -c` string. Openers are looked for in the text with its
-    comments, heredoc bodies and string bodies blanked, so Python held in the
-    body of another command's heredoc, or an opener inside a string, is not
-    read as a Python body."""
+    lines of a `python -c` string. The line is the physical line of the opener or
+    of the opening quote, wherever the command is continued. Openers are looked
+    for in the text with its comments, heredoc bodies and string bodies blanked,
+    so Python held in the body of another command's heredoc, or an opener inside
+    a string, is not read as a Python body."""
     lines = text.split("\n")
-    blanked = clean_shell(text, True)
     starts = [0]
     for line in lines:
         starts.append(starts[-1] + len(line) + 1)
-    i = 0
-    while i < len(lines):
-        line = blanked[i]
-        opener = next((m for m in HEREDOC_RE.finditer(line) if line[m.start() - 1 : m.start()] != "<"), None)
+    resume = 0
+    for command, segments in command_lines(clean_shell(text, True)):
+        if segments[0][1] < resume:
+            continue
+        opener = next((m for m in HEREDOC_RE.finditer(command) if command[m.start() - 1 : m.start()] != "<"), None)
         if opener:
-            if PYTHON_WORD_RE.search(line):
-                end = i + 1
+            if PYTHON_WORD_RE.search(command):
+                first = physical_position(segments, opener.start())[0]
+                end = segments[-1][1] + 1
                 while end < len(lines):
                     body = lines[end].lstrip("\t") if opener.group(1) else lines[end]
                     if body.rstrip() == opener.group(3):
                         break
                     end += 1
-                yield i + 1, end - i - 1
-            i += 1
+                yield first + 1, end - segments[-1][1] - 1
             continue
-        command = PYTHON_C_RE.search(line)
-        if command:
-            opening = starts[i] + command.end() - 1
-            closing = closing_quote(text, opening)
-            body = text[opening + 1 : closing].split("\n")
+        flag = PYTHON_C_RE.search(command)
+        if flag:
+            line, column = physical_position(segments, flag.end() - 1)
+            closing = closing_quote(text, starts[line] + column)
+            body = text[starts[line] + column + 1 : closing].split("\n")
             body = body[1:] if body and not body[0].strip() else body
             body = body[:-1] if body and not body[-1].strip() else body
-            yield i + 1, len(body)
-            i = text.count("\n", 0, closing) + 1
-            continue
-        i += 1
+            yield line + 1, len(body)
+            resume = text.count("\n", 0, closing) + 1
 
 
 def rule_heredoc(ctx: Context) -> Iterator[Violation]:
@@ -277,9 +302,12 @@ def rule_heredoc(ctx: Context) -> Iterator[Violation]:
 
 
 def defined_functions(text: str) -> Iterator[tuple[int, str]]:
-    for number, line in enumerate(clean_shell(text, False), 1):
-        found = FUNCTION_RE.match(line)
-        if found:
+    """(line, name) of each function defined at the start of a command: at the
+    start of a line or after `;`, `{`, `}`, `(`, `&`, `|`, `then`, `do`, `else`
+    or `elif`. String bodies are blanked, so a definition quoted in a string is
+    text."""
+    for number, line in enumerate(clean_shell(text, True), 1):
+        for found in FUNCTION_RE.finditer(line):
             yield number, found.group(1) or found.group(2)
 
 
@@ -297,77 +325,27 @@ def rule_lib_shadow(ctx: Context) -> Iterator[Violation]:
 # ---- binary-literal ------------------------------------------------------
 
 
+def code_part(line: str) -> str:
+    """The line up to a `#` comment that starts outside quotes."""
+    quote = ""
+    for i, c in enumerate(line):
+        if quote:
+            quote = "" if c == quote else quote
+        elif c in "'\"":
+            quote = c
+        elif c == "#" and (i == 0 or line[i - 1] in " \t;&|("):
+            return line[:i]
+    return line
+
+
 def rule_binary_literal(ctx: Context) -> Iterator[Violation]:
     for f in ctx.files:
         if f.rel == IDENTITY_FILE or is_recall_test(f, ctx):
             continue
         for number, line in enumerate(f.text.split("\n"), 1):
-            if line.lstrip().startswith("#"):
-                continue
-            for found in BINARY_RE.finditer(line):
+            for found in BINARY_RE.finditer(code_part(line)):
                 detail = f"`{found.group(0)}` is written out; take the binary from lib/identity.sh"
                 yield Violation("binary-literal", f.rel, number, detail, figure=1)
-
-
-# ---- env-knob ------------------------------------------------------------
-
-
-def assigned_names(line: str) -> set[str]:
-    names = set(ASSIGN_RE.findall(line))
-    names.update(re.findall(r"\bfor\s+([A-Za-z_]\w*)\s+in\b", line))
-    words = line.split()
-    if words and words[0] in DECLARING:
-        names.update(w for w in words[1:] if IDENTIFIER_RE.fullmatch(w))
-    return names
-
-
-def shell_env_reads(text: str) -> Iterator[tuple[int, str]]:
-    """(line, name) of each `${NAME:-…}`-style read of an upper-case name the
-    file has not assigned on an earlier line."""
-    assigned: set[str] = set()
-    for number, line in enumerate(clean_shell(text, False), 1):
-        for found in ENV_READ_RE.finditer(line):
-            if found.group(1) not in assigned:
-                yield number, found.group(1)
-        assigned |= assigned_names(line)
-
-
-def is_environ(node: ast.expr) -> bool:
-    return (isinstance(node, ast.Attribute) and node.attr == "environ") or (isinstance(node, ast.Name) and node.id == "environ")
-
-
-def python_env_reads(text: str) -> Iterator[tuple[int, str]]:
-    """(line, name) of `os.environ[...]`, `os.environ.get(...)` and
-    `os.getenv(...)` with a literal name."""
-    try:
-        tree = ast.parse(text)
-    except SyntaxError:
-        return
-    for node in ast.walk(tree):
-        key: ast.expr | None = None
-        if isinstance(node, ast.Subscript) and is_environ(node.value) and isinstance(node.ctx, ast.Load):
-            key = node.slice if isinstance(node.slice, ast.Constant) else getattr(node.slice, "value", None)
-        elif isinstance(node, ast.Call) and node.args:
-            func = node.func
-            if (isinstance(func, ast.Attribute) and func.attr == "get" and is_environ(func.value)) or (
-                isinstance(func, ast.Attribute) and func.attr == "getenv" and isinstance(func.value, ast.Name)
-            ) or (isinstance(func, ast.Name) and func.id == "getenv"):
-                key = node.args[0]
-        if isinstance(key, ast.Constant) and isinstance(key.value, str):
-            yield node.lineno, key.value
-
-
-def rule_env_knob(ctx: Context) -> Iterator[Violation]:
-    for f in ctx.files:
-        if f.rel.endswith(".sh"):
-            reads = shell_env_reads(f.text)
-        elif f.rel.endswith(".py"):
-            reads = python_env_reads(f.text)
-        else:
-            continue
-        for number, name in reads:
-            if ENV_NAME_RE.fullmatch(name) and name not in SYSTEM_ENV:
-                yield Violation("env-knob", f.rel, number, f"reads the environment variable {name}", key=name)
 
 
 CONTENT_RULES = (

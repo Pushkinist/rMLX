@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Recall test for check_claim_bypass.sh: planted git work trees, asserting exit code and file:line.
 #
-# Set:    -uo — a failing case must not stop the cases after it
 #
 # doc-refs: fixture — the docs/ paths below belong to the synthetic scan roots.
 #
@@ -17,7 +16,7 @@
 # Exit 0 = every case held. Exit 1 = at least one did not. Exit 2 = a scan root
 # could not be built.
 
-set -uo pipefail
+set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GATE="$REPO_ROOT/scripts/check_claim_bypass.sh"

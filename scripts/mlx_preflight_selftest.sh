@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Recall test for mlx_preflight.sh: throwaway Homebrew prefixes and stubs, asserting output.
 #
-# Set:    -uo — a failing case must not stop the cases after it
 #
 # Recall test for: mlx_preflight.sh
 #
@@ -18,7 +17,7 @@
 #
 # Portable to GNU and BSD userlands: the hosted CI runs it on Linux.
 
-set -uo pipefail
+set -euo pipefail
 export LC_ALL=C
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

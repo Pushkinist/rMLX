@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Recall test for check_gpu_device_census.sh: scan roots, asserting exit code and file:line.
 #
-# Set:    -uo — a failing case must not stop the cases after it
 #
 # Recall test for: check_gpu_device_census.sh default --library
 #
@@ -14,7 +13,7 @@
 #
 # Exit 0 = every case held. Exit 1 = at least one did not.
 
-set -uo pipefail
+set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GATE="$REPO_ROOT/scripts/check_gpu_device_census.sh"

@@ -16,7 +16,8 @@ Exit:   0 a report, a figure or a clean gate; 1 the doc-size gate failed,
         tree cannot be measured (``--scripts``: not a git work tree), or the
         flags contradict each other. The report, ``--file-sizes`` and
         ``--shellcheck`` exit 0 whatever happens.
-LOC-exempt: the report and its modes share one fn scan and one entry
+LOC-exempt: the report, --matched-lines, --check-doc-size and --file-sizes share one fn scan and one set of populations;
+            --kv-census and --scripts are modules of their own
 
 The default mode is the report. ``--matched-lines``, ``--check-doc-size``,
 ``--file-sizes``, ``--kv-census``, ``--scripts`` and ``--shellcheck`` are the other

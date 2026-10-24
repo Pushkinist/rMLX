@@ -5,7 +5,6 @@
 # Recall test for: report/debt_report.py --scripts
 # Usage:  bash scripts/report/scripts_gate_selftest.sh [<debt_report.py under test>]
 # Exit:   0 every case held; 1 a case did not; 2 a fixture could not be built
-# Set:    -uo — a failing case must not stop the cases after it
 # LOC-exempt: one planted tree per case; the builders are in lib/selftest_support.sh
 #
 # The core and structural rules; scripts_gate_content_selftest.sh holds the per-file ones.
@@ -13,7 +12,7 @@
 # runs the gate with `--base HEAD`, so a planted file is new. The last case runs
 # the gate on the real tree and holds the pinned counts it prints to the pin file.
 
-set -uo pipefail
+set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TOOL="${1:-$REPO_ROOT/scripts/report/debt_report.py}"
@@ -505,6 +504,73 @@ sg_reindex "$root"
 st_case caller_inside_command_substitution 0 --what "a run inside \$( ) is a caller" \
     --has "check-scripts: ok (5 files" -- sg_gate "$root"
 
+root=$(sg_fresh caller_path_in_another_directory)
+sg_nocaller_sh 'exit 0' | sg_put "$root" check/x.sh
+printf 'REPO_ROOT=.\nbash "$REPO_ROOT/scripts/no_such_dir/x.sh"\n' >>"$root/scripts/check/ok.sh"
+sg_reindex "$root"
+st_case caller_path_through_a_directory_that_has_no_such_file 1 --what "a path under scripts/ that names no file credits no file of the same base name" \
+    --has "caller: check/x.sh:1:" -- sg_gate "$root"
+
+root=$(sg_fresh caller_path_under_repo_root)
+sg_nocaller_sh 'exit 0' | sg_put "$root" check/x.sh
+printf 'REPO_ROOT=.\nbash "$REPO_ROOT/scripts/check/x.sh"\n' >>"$root/scripts/check/ok.sh"
+sg_reindex "$root"
+st_case caller_path_under_a_variable_and_scripts 0 --what "\$REPO_ROOT/scripts/check/x.sh is a caller of check/x.sh" \
+    --has "check-scripts: ok (5 files" -- sg_gate "$root"
+
+root=$(sg_fresh caller_path_dot_scripts)
+sg_nocaller_sh 'exit 0' | sg_put "$root" check/x.sh
+printf 'bash ./scripts/check/x.sh\n' >>"$root/scripts/check/ok.sh"
+sg_reindex "$root"
+st_case caller_path_dot_slash_scripts 0 --what "./scripts/check/x.sh is a caller of check/x.sh" \
+    --has "check-scripts: ok (5 files" -- sg_gate "$root"
+
+root=$(sg_fresh caller_path_sibling)
+sg_nocaller_sh 'exit 0' | sg_put "$root" check/x.sh
+printf 'HERE="$(cd "$(dirname "$0")" && pwd)"\nbash "$HERE/x.sh"\n' >>"$root/scripts/check/ok.sh"
+sg_reindex "$root"
+st_case caller_path_sibling_by_a_variable 0 --what "\$HERE/x.sh, no scripts/ in the word, still credits the one file of that name" \
+    --has "check-scripts: ok (5 files" -- sg_gate "$root"
+
+root=$(sg_fresh caller_path_wrong_tail)
+sg_nocaller_sh 'exit 0' | sg_put "$root" check/x.sh
+printf 'REPO_ROOT=.\nbash "${REPO_ROOT}/scripts/lib/x.sh"\n' >>"$root/scripts/check/ok.sh"
+sg_reindex "$root"
+st_case caller_path_with_the_wrong_directory 1 --what "scripts/lib/x.sh is not scripts/check/x.sh" \
+    --has "caller: check/x.sh:1:" -- sg_gate "$root"
+
+root=$(sg_fresh caller_default_expansion)
+sg_nocaller_sh 'exit 0' | sg_put "$root" check/x.sh
+printf 'REPO_ROOT=.\nTOOL="${1:-$REPO_ROOT/scripts/check/x.sh}"\nbash "$TOOL"\n' >>"$root/scripts/check/ok.sh"
+sg_reindex "$root"
+st_case caller_default_of_a_parameter_expansion 0 --what "VAR=\"\${1:-<path>}\" then bash \"\$VAR\": the default is the path that runs" \
+    --has "check-scripts: ok (5 files" -- sg_gate "$root"
+
+root=$(sg_fresh caller_default_expansion_unused)
+sg_nocaller_sh 'exit 0' | sg_put "$root" check/x.sh
+printf 'REPO_ROOT=.\nTOOL="${1:-$REPO_ROOT/scripts/check/x.sh}"\necho "$TOOL"\n' >>"$root/scripts/check/ok.sh"
+sg_reindex "$root"
+st_case caller_default_expansion_only_printed 1 --what "the same assignment, only printed: no caller" \
+    --has "caller: check/x.sh:1:" -- sg_gate "$root"
+
+root=$(sg_fresh caller_single_quoted_substitution)
+sg_nocaller_sh 'exit 0' | sg_put "$root" check/x.sh
+cat >>"$root/scripts/check/ok.sh" <<'EOF'
+printf '%s\n' 'out=$(bash scripts/check/x.sh 2>&1)'
+EOF
+sg_reindex "$root"
+st_case caller_substitution_inside_single_quotes_is_text 1 --what "a \$( ) in single quotes is no run: the shell never expands it" \
+    --has "caller: check/x.sh:1:" -- sg_gate "$root"
+
+root=$(sg_fresh caller_double_quoted_substitution)
+sg_nocaller_sh 'exit 0' | sg_put "$root" check/x.sh
+cat >>"$root/scripts/check/ok.sh" <<'EOF'
+out="it's $(bash scripts/check/x.sh 2>&1)"
+EOF
+sg_reindex "$root"
+st_case caller_substitution_inside_double_quotes_runs 0 --what "a \$( ) in double quotes runs, also behind an apostrophe" \
+    --has "check-scripts: ok (5 files" -- sg_gate "$root"
+
 root=$(sg_fresh caller_self)
 sg_valid_sh 'bash scripts/check/x.sh' | python3 -c 'import sys; sys.stdout.write(sys.stdin.read().replace("# Caller: by hand\n", "#\n"))' |
     sg_put "$root" check/x.sh
@@ -849,7 +915,7 @@ st_case not_a_mode_old_file_exempt 0 --what "ok.sh is in the base and carries no
 root=$(sg_fresh nam_recall_test)
 printf '%s\n' '#!/usr/bin/env bash' '# Recall test for ok.sh: a planted recall test.' '#' \
     '# Recall test for: check/ok.sh' '# Usage:  bash scripts/check/ok_selftest.sh' '# Exit:   0 held' \
-    '# Caller: by hand' 'set -euo pipefail' |
+    '# Caller: by hand' 'set -euo pipefail' 'bash scripts/check/ok.sh' |
     sg_put "$root" check/ok_selftest.sh
 sg_reindex "$root"
 st_case not_a_mode_recall_test_exempt 0 --what "a new recall test that names an existing file belongs to it" \
@@ -1183,28 +1249,99 @@ sg_reindex "$root"
 st_case recall_tool_outside_ci_asks_nothing 0 --what "a tool only another target runs needs no recall test" \
     --has "check-scripts: ok (5 files" -- sg_gate "$root"
 
-root=$(sg_fresh recall_advisory)
-sg_entry_sh '# Advisory report: a planted entry point.' '#' '# Usage:  bash scripts/check/ok.sh' \
-    '# Exit:   0 clean; 1 failed' '#' "$SG_NAM" "$GATE_BODY" | sg_put "$root" check/gate.sh
-sg_make_ci "$root" 'ci:\n\t@bash scripts/check/gate.sh || true\n'
-sg_reindex "$root"
-st_case recall_advisory_line_asks_nothing 0 --what "a recipe line ending in || true gates nothing when the tool's purpose says Advisory" \
-    --has "check-scripts: ok (5 files" -- sg_gate "$root"
-
-root=$(sg_fresh recall_silenced_gate)
+root=$(sg_fresh silenced_gate)
 sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
 sg_make_ci "$root" 'ci:\n\t@bash scripts/check/gate.sh || true\n'
 sg_reindex "$root"
-st_case recall_silenced_gate_is_reported 1 --what "|| true on a tool that is not an advisory report is a gate someone silenced" \
-    --has "recall-missing: check/gate.sh:1: mode default" --has "exempts only a tool whose purpose line starts with" -- sg_gate "$root"
+st_case silenced_gate_is_reported 1 --what "|| true on a gate: the line throws its exit code away" \
+    --has "silenced: check/gate.sh:1: mode default is run by \`make ci\` on a line that throws its exit code away" \
+    --has "recall-missing: check/gate.sh:1: mode default" -- sg_gate "$root"
 
-root=$(sg_fresh recall_advisory_then_more)
+root=$(sg_fresh silenced_advisory_purpose)
 sg_entry_sh '# Advisory report: a planted entry point.' '#' '# Usage:  bash scripts/check/ok.sh' \
     '# Exit:   0 clean; 1 failed' '#' "$SG_NAM" "$GATE_BODY" | sg_put "$root" check/gate.sh
-sg_make_ci "$root" 'ci:\n\t@bash scripts/check/gate.sh || true; echo done\n'
+sg_make_ci "$root" 'ci:\n\t@bash scripts/check/gate.sh || true\n'
 sg_reindex "$root"
-st_case recall_advisory_line_must_end_there 1 --what "|| true that is followed by another command does not make the line advisory" \
-    --has "recall-missing: check/gate.sh:1: mode default" -- sg_gate "$root"
+st_case silenced_purpose_line_exempts_nothing 1 --what "a purpose line that says Advisory does not excuse a silenced line" \
+    --has "silenced: check/gate.sh:1: mode default" --has "recall-missing: check/gate.sh:1: mode default" -- sg_gate "$root"
+
+root=$(sg_fresh silenced_with_recall_test)
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_recall_sh '#' 'check/gate.sh' | sg_put "$root" check/gate_selftest.sh
+sg_make_ci "$root" 'ci:\n\t@bash scripts/check/gate.sh || true\n\t@bash scripts/check/gate_selftest.sh\n'
+sg_reindex "$root"
+st_case silenced_gate_with_a_recall_test_is_reported 1 --what "a recall test for the tool does not make its silenced line harmless" \
+    --has "silenced: check/gate.sh:1: mode default" --lacks "recall-missing" -- sg_gate "$root"
+
+root=$(sg_fresh silenced_or_exit)
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_recall_sh '#' 'check/gate.sh' | sg_put "$root" check/gate_selftest.sh
+sg_make_ci "$root" 'ci:\n\t@bash scripts/check/gate.sh || exit 1\n\t@bash scripts/check/gate_selftest.sh\n'
+sg_reindex "$root"
+st_case silenced_or_exit_1_is_not_silenced 0 --what "|| exit 1 keeps the failure" \
+    --has "check-scripts: ok (6 files" -- sg_gate "$root"
+
+for form in '|| :' '|| exit 0' '|| echo skipped' '|| printf x' '; true' '; :' '|| true; echo done' '&& echo ok || true'; do
+    root=$(sg_fresh "silenced_form_$(printf '%s' "$form" | tr -c 'a-z' _)")
+    sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+    sg_make_ci "$root" "ci:\\n\\t@bash scripts/check/gate.sh $form\\n"
+    sg_reindex "$root"
+    st_case "silenced_form_${form// /_}" 1 --what "a recipe line that ends in: $form" \
+        --has "silenced: check/gate.sh:1: mode default" -- sg_gate "$root"
+done
+
+root=$(sg_fresh silenced_dash_prefix)
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_make_ci "$root" 'ci:\n\t-@bash scripts/check/gate.sh\n'
+sg_reindex "$root"
+st_case silenced_dash_prefix 1 --what "a - in front of the command makes make ignore its failure" \
+    --has "silenced: check/gate.sh:1: mode default" -- sg_gate "$root"
+
+root=$(sg_fresh silenced_in_a_string)
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_make_ci "$root" 'ci:\n\t@bash scripts/check/gate.sh "|| true"\n'
+sg_reindex "$root"
+st_case silenced_words_in_a_string_are_an_argument 1 --what "|| true inside quotes is an argument, not a silenced line" \
+    --lacks "silenced:" --has "recall-missing: check/gate.sh:1: mode default" -- sg_gate "$root"
+
+root=$(sg_fresh silenced_make_call)
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_make_ci "$root" 'ci:\n\t@$(MAKE) --no-print-directory gates || true\n\ngates:\n\t@bash scripts/check/gate.sh\n'
+sg_reindex "$root"
+st_case silenced_through_a_make_call 1 --what "|| true on a \$(MAKE) line silences every tool of the target it calls" \
+    --has "silenced: check/gate.sh:1: mode default" -- sg_gate "$root"
+
+root=$(sg_fresh silenced_make_call_loud_too)
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_make_ci "$root" 'ci: gates\n\t@$(MAKE) --no-print-directory gates || true\n\ngates:\n\t@bash scripts/check/gate.sh\n'
+sg_reindex "$root"
+st_case silenced_target_reached_loudly_too 1 --what "a target ci also reaches through a prerequisite is not silenced" \
+    --lacks "silenced:" --has "recall-missing: check/gate.sh:1: mode default" -- sg_gate "$root"
+
+root=$(sg_fresh silenced_pin_holds)
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_make_ci "$root" 'ci:\n\t@bash scripts/check/gate.sh || true\n'
+sg_pins_file 'recall-missing check/gate.sh default' 'silenced check/gate.sh default' >"$root/$SG_PINS_REL"
+sg_reindex "$root"
+st_case silenced_pin_holds 0 --what "a pinned silenced mode passes and the rule is counted" \
+    --has "pinned: recall-missing 1, silenced 1" -- sg_gate "$root"
+
+root=$(sg_fresh silenced_pin_new_mode)
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_make_ci "$root" 'ci:\n\t@bash scripts/check/gate.sh || true\n\t@bash scripts/check/gate.sh --lib || true\n'
+sg_pins_file 'recall-missing check/gate.sh default,--lib' 'silenced check/gate.sh default' >"$root/$SG_PINS_REL"
+sg_reindex "$root"
+st_case silenced_pin_new_mode 1 --what "a second silenced mode of a pinned tool is outside the pinned set" \
+    --has "silenced: check/gate.sh:1: mode --lib" --lacks "silenced: check/gate.sh:1: mode default" -- sg_gate "$root"
+
+root=$(sg_fresh silenced_pin_stale)
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_recall_sh '#' 'check/gate.sh' | sg_put "$root" check/gate_selftest.sh
+sg_make_ci "$root" 'ci:\n\t@bash scripts/check/gate.sh\n\t@bash scripts/check/gate_selftest.sh\n'
+sg_pins_file 'silenced check/gate.sh default' >"$root/$SG_PINS_REL"
+sg_reindex "$root"
+st_case silenced_pin_stale 1 --what "the line no longer discards the exit code: the pin is stale" \
+    --has "pin-stale: report/scripts_gate_pins.txt:4: silenced check/gate.sh: no longer violated" -- sg_gate "$root"
 
 root=$(sg_fresh recall_covered)
 sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
@@ -1263,21 +1400,21 @@ st_case recall_two_modes_on_two_lines 0 --what "a field of two lines covers both
     --has "check-scripts: ok (6 files" -- sg_gate "$root"
 
 root=$(sg_fresh recall_stale_tool)
-sg_valid_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
 sg_recall_sh '# Caller: by hand' 'check/gone.sh' | sg_put "$root" check/gate_selftest.sh
 sg_reindex "$root"
 st_case recall_stale_names_no_file 1 --what "Recall test for: names a file that does not exist, at the field's line" \
     --has "recall-stale: check/gate_selftest.sh:4: names check/gone.sh, which is no file of the tree" -- sg_gate "$root"
 
 root=$(sg_fresh recall_stale_mode)
-sg_valid_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
 sg_recall_sh '# Caller: by hand' 'check/gate.sh --nope' | sg_put "$root" check/gate_selftest.sh
 sg_reindex "$root"
 st_case recall_stale_mode_not_in_tool 1 --what "a mode token that occurs nowhere in the tool" \
     --has "recall-stale: check/gate_selftest.sh:4: check/gate.sh: \`--nope\` occurs nowhere in check/gate.sh" -- sg_gate "$root"
 
 root=$(sg_fresh recall_stale_token)
-sg_valid_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
 sg_recall_sh '# Caller: by hand' 'check/gate.sh (all modes)' | sg_put "$root" check/gate_selftest.sh
 sg_reindex "$root"
 st_case recall_stale_prose_after_the_tool 1 --what "words after the tool are mode tokens, and a parenthesis is not one" \
@@ -1290,17 +1427,165 @@ st_case recall_stale_names_itself 1 --what "a recall test of itself" \
     --has "recall-stale: check/gate_selftest.sh:4: \`Recall test for:\` names the file itself" -- sg_gate "$root"
 
 root=$(sg_fresh recall_stale_second_line)
-sg_valid_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
 sg_recall_sh '# Caller: by hand' 'check/gate.sh' 'check/gone.sh' | sg_put "$root" check/gate_selftest.sh
 sg_reindex "$root"
 st_case recall_stale_second_line 1 --what "the second line of the field is the one named" \
     --has "recall-stale: check/gate_selftest.sh:5: names check/gone.sh" --lacks "gate_selftest.sh:4" -- sg_gate "$root"
 
 root=$(sg_fresh recall_valid_claim)
-sg_valid_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
 sg_recall_sh '# Caller: by hand' 'check/gate.sh --lib' | sg_put "$root" check/gate_selftest.sh
 sg_reindex "$root"
 st_case recall_valid_claim 0 --what "a claim on a tool and a mode that occurs in it" \
+    --has "check-scripts: ok (6 files" -- sg_gate "$root"
+
+root=$(sg_fresh recall_claim_not_run)
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_recall_sh '#' 'check/gate.sh' | sed '/^bash scripts\//d' | sg_put "$root" check/gate_selftest.sh
+sg_make_ci "$root" 'ci:\n\t@bash scripts/check/gate.sh\n\t@bash scripts/check/gate_selftest.sh\n'
+sg_reindex "$root"
+st_case recall_claim_of_a_tool_it_does_not_run 1 --what "a test that names a tool and never runs it covers nothing and is itself reported" \
+    --has "recall-stale: check/gate_selftest.sh:4: names check/gate.sh, which this file does not run, source or import" \
+    --has "recall-missing: check/gate.sh:1: mode default is run by" -- sg_gate "$root"
+
+root=$(sg_fresh recall_claim_not_run_exempts_nothing)
+sg_entry_sh '# CI gate: a planted entry point.' '#' '# Usage:  bash scripts/check/ok.sh' '# Exit:   0 clean; 1 failed' \
+    '# Recall test for: report/tool.py' '#' 'bin=target/release/rmlx' | sg_put "$root" check/newgate.sh
+printf '%s\n' 'cat scripts/check/gone_table.txt' >>"$root/scripts/check/newgate.sh"
+sg_make_ci "$root" 'ci:\n\t@bash scripts/check/newgate.sh\n'
+sg_reindex "$root"
+st_case recall_claim_not_run_exempts_nothing 1 --what "a new gate with a claim on a file it never runs is not a recall test: four rules still apply" \
+    --has "not-a-mode: check/newgate.sh:1:" --has "recall-missing: check/newgate.sh:1: mode default" \
+    --has "dead-path: check/newgate.sh:10: scripts/check/gone_table.txt names no file" \
+    --has "binary-literal: check/newgate.sh:9:" --has "recall-stale: check/newgate.sh:6:" -- sg_gate "$root"
+
+root=$(sg_fresh recall_claim_mode_not_in_test)
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_recall_sh '#' 'check/gate.sh --lib' | sed 's|^bash scripts/check/gate.sh --lib$|bash scripts/check/gate.sh|' | sg_put "$root" check/gate_selftest.sh
+sg_make_ci "$root" 'ci:\n\t@bash scripts/check/gate.sh --lib\n\t@bash scripts/check/gate_selftest.sh\n'
+sg_reindex "$root"
+st_case recall_claim_of_a_mode_the_test_never_runs 1 --what "the test names --lib and only runs the default mode: the claim is stale and the mode uncovered" \
+    --has "recall-stale: check/gate_selftest.sh:4: check/gate.sh: \`--lib\` occurs nowhere in the code of check/gate_selftest.sh" \
+    --has "recall-missing: check/gate.sh:1: mode --lib is run by" -- sg_gate "$root"
+
+root=$(sg_fresh recall_claim_mode_in_comment)
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_recall_sh '#' 'check/gate.sh --lib' | sed 's|^bash scripts/check/gate.sh --lib$|bash scripts/check/gate.sh|' | sed 's|^exit 0$|# bash scripts/check/gate.sh --lib\nexit 0|' | sg_put "$root" check/gate_selftest.sh
+sg_make_ci "$root" 'ci:\n\t@bash scripts/check/gate.sh --lib\n\t@bash scripts/check/gate_selftest.sh\n'
+sg_reindex "$root"
+st_case recall_claim_of_a_mode_named_in_a_comment 1 --what "a mode token that only a comment of the test holds is not exercised" \
+    --has "recall-stale: check/gate_selftest.sh:4: check/gate.sh: \`--lib\` occurs nowhere in the code of check/gate_selftest.sh" -- sg_gate "$root"
+
+root=$(sg_fresh recall_claim_one_of_two_holds)
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_recall_sh '#' 'check/gate.sh --lib --nope' | sg_put "$root" check/gate_selftest.sh
+sg_make_ci "$root" 'ci:\n\t@bash scripts/check/gate.sh --lib\n\t@bash scripts/check/gate_selftest.sh\n'
+sg_reindex "$root"
+st_case recall_claim_with_one_good_mode_and_one_bad 1 --what "the mode that holds covers its line; the other is reported" \
+    --has "recall-stale: check/gate_selftest.sh:4: check/gate.sh: \`--nope\` occurs nowhere in check/gate.sh" \
+    --lacks "recall-missing" --lacks "not-a-mode" -- sg_gate "$root"
+
+root=$(sg_fresh recall_claim_python_test)
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_put "$root" check/gate_test.py <<'EOF'
+#!/usr/bin/env python3
+"""A planted Python recall test.
+
+Recall test for: check/gate.sh --lib
+Usage:  python3 scripts/check/gate_test.py
+Exit:   0 held
+"""
+
+import subprocess
+
+subprocess.run(["bash", "scripts/check/gate.sh", "--lib"])
+EOF
+sg_make_ci "$root" 'ci:\n\t@bash scripts/check/gate.sh --lib\n\t@python3 scripts/check/gate_test.py\n'
+sg_reindex "$root"
+st_case recall_claim_python_test_holds 0 --what "a Python recall test whose command vector holds the mode covers it" \
+    --has "check-scripts: ok (6 files" -- sg_gate "$root"
+
+root=$(sg_fresh closure_var_make_call)
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_make_ci "$root" 'NEW_GATES := check-g\n\ncheck-g:\n\t@bash scripts/check/gate.sh\n\nci:\n\t@$(MAKE) --no-print-directory $(NEW_GATES)\n'
+sg_reindex "$root"
+st_case closure_follows_a_variable_in_a_make_call 1 --what "a target named through a variable is in the closure: its tool asks for a recall test" \
+    --has "recall-missing: check/gate.sh:1: mode default is run by" -- sg_gate "$root"
+
+root=$(sg_fresh closure_var_prerequisite)
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_make_ci "$root" 'NEW_GATES = check-g other-g\n\ncheck-g:\n\t@bash scripts/check/gate.sh\n\nother-g:\n\t@echo hi\n\nci: $(NEW_GATES)\n'
+sg_reindex "$root"
+st_case closure_follows_a_variable_prerequisite 1 --what "a prerequisite named through a two-word variable is followed" \
+    --has "recall-missing: check/gate.sh:1: mode default is run by" -- sg_gate "$root"
+
+root=$(sg_fresh closure_var_unknown)
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_make_ci "$root" 'ci: $(UNSET_GATES)\n'
+sg_reindex "$root"
+st_case closure_unknown_variable_is_unavailable 2 --what "a prerequisite the gate cannot expand is exit 2, not a pass" \
+    --has 'check-scripts: unavailable (`$(UNSET_GATES)` in the prerequisites of `ci` is a make expansion the gate cannot follow' -- sg_gate "$root"
+
+root=$(sg_fresh closure_var_twice)
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_make_ci "$root" 'NEW_GATES := check-g\nNEW_GATES := other\n\nci:\n\t@$(MAKE) $(NEW_GATES)\n'
+sg_reindex "$root"
+st_case closure_variable_defined_twice_is_unavailable 2 --what "a variable defined twice is not simple" \
+    --has 'in a `$(MAKE)` line of `ci` is a make expansion' -- sg_gate "$root"
+
+root=$(sg_fresh closure_var_nested)
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_make_ci "$root" 'BASE := check\nNEW_GATES := $(BASE)-g\n\nci: $(NEW_GATES)\n'
+sg_reindex "$root"
+st_case closure_variable_with_an_expansion_is_unavailable 2 --what "a value that expands another variable is not simple" \
+    --has 'in the prerequisites of `ci` is a make expansion' -- sg_gate "$root"
+
+root=$(sg_fresh closure_var_embedded)
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_make_ci "$root" 'WHICH := g\n\nci: check-$(WHICH)\n'
+sg_reindex "$root"
+st_case closure_variable_inside_a_word_is_unavailable 2 --what "a variable inside a word is not followed" \
+    --has 'check-$(WHICH)` in the prerequisites of `ci`' -- sg_gate "$root"
+
+root=$(sg_fresh mode_value_option)
+sg_nocaller_sh 'case "${1:-}" in --root) shift 2 ;; esac; case "${1:-}" in --strict) exit 1 ;; esac' | sg_put "$root" check/gate.sh
+sg_recall_sh '#' 'check/gate.sh --strict' | sg_put "$root" check/gate_selftest.sh
+sg_make_ci "$root" 'ci:\n\t@bash scripts/check/gate.sh --root . --strict\n\t@bash scripts/check/gate_selftest.sh\n'
+sg_reindex "$root"
+st_case mode_skips_an_option_with_a_value 0 --what "--root . takes its value: the mode of the line is --strict, which the test names" \
+    --has "check-scripts: ok (6 files" -- sg_gate "$root"
+
+root=$(sg_fresh mode_value_option_not_a_mode)
+sg_nocaller_sh 'case "${1:-}" in --root) shift 2 ;; esac; case "${1:-}" in --strict) exit 1 ;; esac' | sg_put "$root" check/gate.sh
+sg_recall_sh '#' 'check/gate.sh --root' | sg_put "$root" check/gate_selftest.sh
+sg_make_ci "$root" 'ci:\n\t@bash scripts/check/gate.sh --root . --strict\n\t@bash scripts/check/gate_selftest.sh\n'
+sg_reindex "$root"
+st_case mode_option_with_a_value_is_no_mode 1 --what "a test that names --root covers nothing the line runs" \
+    --has "recall-missing: check/gate.sh:1: mode --strict is run by" -- sg_gate "$root"
+
+root=$(sg_fresh mode_value_only)
+sg_nocaller_sh 'case "${1:-}" in --base) shift 2 ;; esac' | sg_put "$root" check/gate.sh
+sg_recall_sh '#' 'check/gate.sh' | sg_put "$root" check/gate_selftest.sh
+sg_make_ci "$root" 'ci:\n\t@bash scripts/check/gate.sh --base "$(BASE_ARG)"\n\t@bash scripts/check/gate_selftest.sh\n'
+sg_reindex "$root"
+st_case mode_line_with_only_an_option_and_its_value_is_the_default 0 --what "--base VALUE alone is the default mode" \
+    --has "check-scripts: ok (6 files" -- sg_gate "$root"
+
+root=$(sg_fresh mode_equals)
+sg_nocaller_sh '[ "${1:-}" = --mode=a ] || [ "${1:-}" = --mode=b ] || exit 0' | sg_put "$root" check/gate.sh
+sg_recall_sh '#' 'check/gate.sh --mode=a' | sg_put "$root" check/gate_selftest.sh
+sg_make_ci "$root" 'ci:\n\t@bash scripts/check/gate.sh --mode=a\n\t@bash scripts/check/gate.sh --mode=b\n\t@bash scripts/check/gate_selftest.sh\n'
+sg_reindex "$root"
+st_case mode_equals_form_is_a_mode_as_written 1 --what "--mode=a and --mode=b are two modes: the test names one" \
+    --has "recall-missing: check/gate.sh:1: mode --mode=b is run by" --lacks "mode --mode=a" --lacks "mode default" -- sg_gate "$root"
+
+root=$(sg_fresh mode_equals_both)
+sg_nocaller_sh '[ "${1:-}" = --mode=a ] || [ "${1:-}" = --mode=b ] || exit 0' | sg_put "$root" check/gate.sh
+sg_recall_sh '#' 'check/gate.sh --mode=a --mode=b' | sg_put "$root" check/gate_selftest.sh
+sg_make_ci "$root" 'ci:\n\t@bash scripts/check/gate.sh --mode=a\n\t@bash scripts/check/gate.sh --mode=b\n\t@bash scripts/check/gate_selftest.sh\n'
+sg_reindex "$root"
+st_case mode_equals_both_named 0 --what "a test that names both spellings covers both lines" \
     --has "check-scripts: ok (6 files" -- sg_gate "$root"
 
 # ---- lib-consumers, lib-run ----------------------------------------------
@@ -1430,11 +1715,40 @@ st_case lib_run_by_a_crate 1 --what "Command::new on the path runs a lib/ file" 
 root=$(sg_fresh librun_crate_read)
 lib_py | sg_put "$root" lib/y.py
 mkdir -p "$root/crates/c/src"
-printf 'fn run() { Command::new("python3").arg(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/lib/y.py")); }\nconst S: &str = include_str!("../../../scripts/lib/y.py");\n' >"$root/crates/c/src/lib.rs"
+printf 'const S: &str = include_str!("../../../scripts/lib/y.py");\n' >"$root/crates/c/src/lib.rs"
 printf 'import y\n' >>"$root/scripts/report/tool.py"
 sg_reindex "$root"
-st_case lib_run_crate_reads_and_imports_are_not_runs 0 --what "an argument after Command::new, include_str! and an import read the file" \
+st_case lib_run_crate_reads_and_imports_are_not_runs 0 --what "include_str! and an import read the file" \
     --has "check-scripts: ok (" -- sg_gate "$root"
+
+n=0
+for form in 'Command::new("python3").arg(PATH)' 'Command::new("python").arg("-u").arg(PATH)' 'Command::new("python3").args([PATH, "x"])' \
+    'Command::new("bash").arg(PATH)' 'Command::new("sh").arg(PATH).output()'; do
+    n=$((n + 1))
+    root=$(sg_fresh "librun_crate_interpreter_$n")
+    lib_py | sg_put "$root" lib/y.py
+    mkdir -p "$root/crates/c/src"
+    path='concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/lib/y.py")'
+    printf 'fn run() { let _ = %s; }\n' "${form//PATH/$path}" >"$root/crates/c/src/lib.rs"
+    sg_reindex "$root"
+    st_case "lib_run_by_a_crate_through_an_interpreter_$n" 1 --what "$form: the file is run" \
+        --has "lib-run: lib/y.py:1:" --has "run by crates/c/src/lib.rs" -- sg_gate "$root"
+done
+
+n=0
+for form in 'Command::new("cargo").arg(PATH)' 'Command::new("python3").env("X", PATH)' 'Command::new("python3"); let _ = include_str!(PATH)' \
+    'Command::new("python3").arg("-c").arg("x"); let _ = (PATH)'; do
+    n=$((n + 1))
+    root=$(sg_fresh "librun_crate_not_interpreter_$n")
+    lib_py | sg_put "$root" lib/y.py
+    mkdir -p "$root/crates/c/src"
+    path='concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/lib/y.py")'
+    printf 'fn run() { let _ = %s; }\n' "${form//PATH/$path}" >"$root/crates/c/src/lib.rs"
+    printf 'import y\n' >>"$root/scripts/report/tool.py"
+    sg_reindex "$root"
+    st_case "lib_run_crate_not_a_run_$n" 0 --what "$form: the file is only named" \
+        --has "check-scripts: ok (" -- sg_gate "$root"
+done
 
 root=$(sg_fresh librun_sourced)
 sg_lib_sh '# Module of: check/ok.sh' | sg_put "$root" lib/y.sh
@@ -1603,7 +1917,7 @@ st_case dead_path_same_token_not_ignored 1 --what "the same token with no ignore
     --has "dead-path: check/ok.sh:" --has "scripts/check/out.json names no file" -- sg_gate "$root"
 
 root=$(sg_fresh dead_path_recall_test)
-sg_valid_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
 sg_recall_sh '# Caller: by hand' 'check/gate.sh' | sg_put "$root" check/gate_selftest.sh
 printf '%s\n' 'echo scripts/check/planted.sh' >>"$root/scripts/check/gate_selftest.sh"
 sg_reindex "$root"
@@ -1632,6 +1946,49 @@ printf 'const S: &str = include_str!("../../../scripts/check/gone.sh");\n' >"$ro
 sg_reindex "$root"
 st_case dead_path_in_a_crate_literal 1 --what "a crates/ string literal naming a file that is gone" \
     --has "dead-path: ../crates/c/src/lib.rs:1: scripts/check/gone.sh names no file" -- sg_gate "$root"
+
+n=0
+for spelling in './scripts/check/gone.sh' '$REPO_ROOT/scripts/check/gone.sh' '${REPO_ROOT}/scripts/check/gone.sh' \
+    '$(CURDIR)/scripts/check/gone.sh' '"$REPO_ROOT"/scripts/check/gone.sh' '"${REPO_ROOT}"/scripts/check/gone.sh'; do
+    n=$((n + 1))
+    root=$(sg_fresh "deadroot_$n")
+    printf '%s\n' "# runs $spelling" >>"$root/scripts/check/ok.sh"
+    sg_reindex "$root"
+    line=$(grep -c '' "$root/scripts/check/ok.sh")
+    st_case "dead_path_behind_root_expression_$n" 1 --what "scripts/check/gone.sh behind the repository-root expression $spelling" \
+        --has "dead-path: check/ok.sh:${line}: scripts/check/gone.sh names no file" -- sg_gate "$root"
+done
+
+for spelling in '../scripts/check/gone.sh' '/opt/other/scripts/check/gone.sh' '$HOME/other/scripts/check/gone.sh' \
+    '$REPO_ROOT/../scripts/check/gone.sh' 'my-scripts/check/gone.sh' 'x/$REPO_ROOT/scripts/check/gone.sh'; do
+    n=$((n + 1))
+    root=$(sg_fresh "deadother_$n")
+    printf '%s\n' "# runs $spelling" >>"$root/scripts/check/ok.sh"
+    sg_reindex "$root"
+    st_case "dead_path_skips_other_tree_$n" 0 --what "$spelling is another tree or another name: not read" \
+        --has "check-scripts: ok (4 files" -- sg_gate "$root"
+done
+
+root=$(sg_fresh dead_path_default_expansion)
+printf '%s\n' 'TOOL="${1:-$REPO_ROOT/scripts/check/gone.sh}"' >>"$root/scripts/check/ok.sh"
+sg_reindex "$root"
+line=$(grep -c '' "$root/scripts/check/ok.sh")
+st_case dead_path_in_a_parameter_default 1 --what "the default of \${1:-\$REPO_ROOT/scripts/...} is a path" \
+    --has "dead-path: check/ok.sh:${line}: scripts/check/gone.sh names no file" -- sg_gate "$root"
+
+root=$(sg_fresh dead_path_root_prefix_docs)
+mkdir -p "$root/docs"
+printf 'run `./scripts/check/gone.sh` first\nrun `../scripts/check/gone.sh` too\n' >"$root/docs/B.md"
+sg_reindex "$root"
+st_case dead_path_in_a_doc_behind_dot_slash 1 --what "./scripts/ in a doc is read; ../scripts/ on the next line is not" \
+    --has "dead-path: ../docs/B.md:1: scripts/check/gone.sh names no file" --lacks "docs/B.md:2" -- sg_gate "$root"
+
+root=$(sg_fresh dead_path_makefile_curdir)
+sg_make_ci "$root" 'gone-target:\n\tbash $(CURDIR)/scripts/check/gone.sh\n'
+sg_reindex "$root"
+make_line=$(grep -c '' "$root/Makefile")
+st_case dead_path_in_the_makefile_behind_curdir 1 --what "\$(CURDIR)/scripts/ in a recipe" \
+    --has "dead-path: ../Makefile:${make_line}: scripts/check/gone.sh names no file" -- sg_gate "$root"
 
 # ---- pins of the new rules ----------------------------------------------
 
@@ -1810,9 +2167,36 @@ st_case base_parent_leaves_older_files_alone 0 --what "a file committed before t
 # ---- the real tree -------------------------------------------------------
 
 # The pin counts are literals, so a chunk that shrinks a pin lowers them in the same commit
-# and growth shows in the diff as a raised literal.
+# and growth shows in the diff as a raised literal. Beside the line counts, the member total of
+# every set rule and the figure sum of every measure rule are literals too: a figure raised
+# inside a pin, or a name added to one, changes no line count.
+# pin_totals: those totals, read from the checked-in pin file.
+pin_totals() {
+    awk '
+/^#/ || NF == 0 { next }
+{
+    n = split($3, parts, ",")
+    if ($1 ~ /^(exit-undeclared|recall-missing|silenced|lib-run|dead-path|name|lib-shadow|env-knob)$/) {
+        members[$1] += n
+    } else if ($1 ~ /^(size|heredoc|twin|binary-literal)$/) {
+        for (i = 1; i <= n; i++) sum[$1] += parts[i]
+    }
+}
+END {
+    split("exit-undeclared recall-missing silenced lib-run dead-path name lib-shadow env-knob", sets, " ")
+    split("size heredoc twin binary-literal", measures, " ")
+    line = ""
+    for (i = 1; i <= 8; i++) line = line (i > 1 ? ", " : "") sets[i] " " members[sets[i]] + 0
+    print "members: " line
+    line = ""
+    for (i = 1; i <= 4; i++) line = line (i > 1 ? ", " : "") measures[i] " " sum[measures[i]] + 0
+    print "figures: " line
+}' "$REPO_ROOT/scripts/report/scripts_gate_pins.txt"
+}
+st_case real_tree_pin_totals 0 --what "the checked-in pin file holds exactly these member totals and figure sums" \
+    --is "$(printf '%s\n%s' 'members: exit-undeclared 143, recall-missing 15, silenced 3, lib-run 29, dead-path 1, name 23, lib-shadow 3, env-knob 98' 'figures: size 20541, heredoc 1278, twin 1522, binary-literal 45')" -- pin_totals
 st_case real_tree 0 --what "the checked-in tree passes with exactly these pins" \
-    --has "pinned: class 97, purpose 6, usage 87, exit-undeclared 86, caller 16, recall-missing 14, lib-consumers 10, lib-run 19, shebang 1, exec-bit 5, dead-path 1, set-mode 38, name 22, size 14, heredoc 13, twin 19, lib-shadow 3, binary-literal 24, env-knob 40" \
-    --has "515 pinned)" -- sg_gate "$REPO_ROOT"
+    --has "pinned: class 97, purpose 6, usage 87, exit-undeclared 86, caller 16, recall-missing 15, silenced 2, lib-consumers 10, lib-run 19, shebang 1, exec-bit 5, dead-path 1, set-mode 40, name 22, size 14, heredoc 14, twin 19, lib-shadow 3, binary-literal 24, env-knob 40" \
+    --has "521 pinned)" -- sg_gate "$REPO_ROOT"
 
 st_done

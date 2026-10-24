@@ -23,6 +23,8 @@ ENTRY_KEY_RE = re.compile(r"^\s*(?:-\s+)?entry:\s*(.*)$")
 SCRIPT_PATH_RE = re.compile(r"[\w./-]*?(?:^|/)scripts/([\w./-]+)")
 RAW_START_RE = re.compile(r'b?r(#*)"')
 COMMAND_NEW = "Command::new("
+INTERPRETER_PROGRAMS = frozenset({"python3", "python", "bash", "sh"})
+METHOD_CALL_RE = re.compile(r"\.(\w+)\(")
 
 
 @dataclass
@@ -157,8 +159,9 @@ def rust_code_and_literals(text: str) -> tuple[str, list[tuple[int, str]]]:
 
 
 def rust_script_paths(text: str) -> list[RustPath]:
-    """Every string literal that is a path into scripts/, and whether it sits
-    inside a `Command::new(` call."""
+    """Every string literal that is a path into scripts/, and whether the
+    command it names is run: it sits inside a `Command::new(` call, or is an
+    argument of a `Command::new("python3")` (or `bash`, `sh`) call."""
     if "scripts/" not in text:
         return []
     code, literals = rust_code_and_literals(text)
@@ -166,7 +169,8 @@ def rust_script_paths(text: str) -> list[RustPath]:
     for offset, body in literals:
         found = SCRIPT_PATH_RE.fullmatch(body)
         if found:
-            out.append(RustPath(found.group(1), text.count("\n", 0, offset) + 1, inside_command_new(code, offset)))
+            runs = inside_command_new(code, offset) or is_interpreter_argument(code, literals, offset)
+            out.append(RustPath(found.group(1), text.count("\n", 0, offset) + 1, runs))
     return out
 
 
@@ -183,6 +187,25 @@ def inside_command_new(code: str, offset: int) -> bool:
             if depth == 0:
                 return False
     return True
+
+
+def is_interpreter_argument(code: str, literals: list[tuple[int, str]], offset: int) -> bool:
+    """Whether the literal at `offset` is an `.arg(` or `.args(` of a command
+    built by `Command::new("python3")`, `"python"`, `"bash"` or `"sh"` in the
+    same statement."""
+    start = code.rfind(COMMAND_NEW, 0, offset)
+    if start < 0 or ";" in code[start:offset]:
+        return False
+    opening = start + len(COMMAND_NEW)
+    depth, end = 1, opening
+    while end < offset and depth:
+        depth += {"(": 1, ")": -1}.get(code[end], 0)
+        end += 1
+    if depth:
+        return False
+    program = next((body for position, body in literals if opening <= position < end), "")
+    calls = METHOD_CALL_RE.findall(code[end:offset])
+    return program in INTERPRETER_PROGRAMS and bool(calls) and calls[-1] in ("arg", "args")
 
 
 def load_external(root: Path) -> External:

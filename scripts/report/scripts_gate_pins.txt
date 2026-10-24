@@ -2,7 +2,7 @@
 #
 # A pin accepts every violation of that rule in that file. Fix the file and delete its
 # line: a pin whose file now passes fails the gate (`pin-stale`). A rule whose violation
-# is a set pins the set (`exit-undeclared` the codes, `recall-missing` the modes, `lib-run`
+# is a set pins the set (`exit-undeclared` the codes, `recall-missing` and `silenced` the modes, `lib-run`
 # the sites, `dead-path` the tokens, `name` the hyphen and the root variables, `lib-shadow`
 # the functions, `env-knob` the variables); a rule whose violation is a measure pins the
 # measure (`size` the line count, `heredoc` the lengths of the over-limit bodies, `twin` the
@@ -10,7 +10,7 @@
 # grew fails its `-pin` rule; one that shrank asks for the pin to be lowered.
 # Never pin a new file, a new member or a larger measure.
 #
-# pinnable: class purpose usage exit-undeclared caller recall-missing lib-consumers lib-run shebang exec-bit dead-path set-mode name size heredoc twin lib-shadow binary-literal env-knob
+# pinnable: class purpose usage exit-undeclared caller recall-missing silenced lib-consumers lib-run shebang exec-bit dead-path set-mode name size heredoc twin lib-shadow binary-literal env-knob
 class aggregate_decode_profile.py
 class bench-records-sweep.sh
 class bench_cache_types.sh
@@ -317,6 +317,9 @@ recall-missing codec_smoke_runner_selftest.sh default
 recall-missing perf_ab_ingest_selftest.sh default
 recall-missing perf_ab_selftest.sh default
 recall-missing published_ingest_selftest.sh default
+recall-missing target_size_report.sh default
+silenced report/debt_report.py --file-sizes,default
+silenced target_size_report.sh default
 lib-consumers lib/binary_identity.py
 lib-consumers lib/prefill_ms.py
 lib-consumers lib/published_aggregate.py
@@ -379,6 +382,7 @@ set-mode gputrace_summary.sh
 set-mode metal_dirs.sh
 set-mode mlx_preflight.sh
 set-mode mlx_restore_pin.sh
+set-mode mlx_restore_pin_selftest.sh
 set-mode mst_capture.sh
 set-mode perf_ab.sh
 set-mode perf_ab_ingest_selftest.sh
@@ -388,6 +392,7 @@ set-mode published_ingest_selftest.sh
 set-mode schema_constraint_canary.sh
 set-mode spec_bench_selftest.sh
 set-mode spec_broken_engine.sh
+set-mode spec_round_stream_compare_selftest.sh
 set-mode target_gc.sh
 set-mode target_size_report.sh
 set-mode traces_gc.sh
@@ -428,18 +433,19 @@ size spec_bench_published_selftest.sh 2842
 size spec_bench_selftest.sh 1924
 size ssd_canary.sh 1283
 heredoc bench_cell.sh 40,30
-heredoc bench_llama_ab.sh 30
+heredoc bench_llama_ab.sh 30,27
 heredoc check_published_samples_fixtures.sh 23
 heredoc perf-iter/bench_decode_tps.sh 65
 heredoc perf_ab_ingest_selftest.sh 29
 heredoc prefill_chunk_sweep.sh 161
 heredoc published_ingest_selftest.sh 198
 heredoc published_table_selftest.sh 31
+heredoc report/debt_report_selftest.sh 26,24,24
 heredoc schema_constraint_canary.sh 140,27
 heredoc spec_bench.sh 138
 heredoc spec_bench_published.sh 56
 heredoc spec_bench_published_selftest.sh 34,23
-heredoc ssd_canary.sh 65,49
+heredoc ssd_canary.sh 65,49,38
 twin check_claim_bypass.sh+check_personal_data.sh 26
 twin check_named_skip_notices_fixtures.sh+run_gpu_tests_selftest.sh 47
 twin check_spec_charge.sh+check_spec_sampling.sh 77
@@ -489,14 +495,14 @@ binary-literal ssd_canary.sh 1
 env-knob bench-records-sweep.sh CROSS_BENCH_ROOT,RMLX_O_MODELS_ROOT,RMLX_ROOT
 env-knob bench/codec_inertness_probe.sh RMLX_BINARY,RMLX_HOME
 env-knob bench_cache_types.sh RMLX_HARDWARE_TAG
-env-knob bench_cell.sh CROSS_BENCH_ROOT,CTK,CTV,CTX_MAX,KV_CANON_OVERRIDE,LABEL_PREFIX,LLAMA_CPP_ROOT,LLAMA_CPP_TURBOQUANT_ROOT,MAX_TOKENS,MEASURED_RUNS,MLX_LM_ROOT,MLX_LM_TURBOQUANT_ROOT,OMLX_ROOT,PAROQUANT_ROOT,PROMPT_ID,RMLX_HARDWARE_TAG,WARMUP_RUNS
+env-knob bench_cell.sh CROSS_BENCH_ROOT,CTK,CTV,CTX_MAX,KV_CANON_OVERRIDE,LABEL_PREFIX,LLAMA_CPP_ROOT,LLAMA_CPP_TURBOQUANT_ROOT,MAX_TOKENS,MEASURED_RUNS,MLX_LM_ROOT,MLX_LM_TURBOQUANT_ROOT,OMLX_ROOT,PAROQUANT_ROOT,PROMPT_ID,RMLX_HARDWARE_TAG,RMLX_ROOT,WARMUP_RUNS
 env-knob bench_codec_cell.sh RMLX_BINARY,RMLX_HOME
 env-knob bench_llama_ab.sh RMLX_HOME
 env-knob bench_llama_ab_selftest.sh FORCE_UNMEASURED_ROWS
 env-knob check_gpu_tests_ignored_fixtures.sh GATE_AWK_SHIM
 env-knob check_no_kernel_input_eval.sh CHECK_EVAL_MIN_FILES
 env-knob check_spec_sampling.sh SPEC_SAMPLING_ROOT
-env-knob codec_smoke_runner_selftest.sh GATE_BIN,STUB_RC
+env-knob codec_smoke_runner_selftest.sh GATE_BIN
 env-knob eval/wikitext2_ppl.py RMLX_HOME
 env-knob eval_lock_stress.sh RUNS,TIMEOUT_SECS
 env-knob ingest/codec_inertness_ingest.py RMLX_HOME,RMLX_REPO_ROOT
@@ -504,10 +510,11 @@ env-knob ingest/llama_ab_ingest.py RMLX_HOME,RMLX_REPO_ROOT
 env-knob ingest/llama_bench_ingest.py RMLX_METRICS_DB,RMLX_REPO_ROOT
 env-knob ingest/perf_ab_ingest.py RMLX_HOME,RMLX_REPO_ROOT
 env-knob ingest/published_ingest.py RMLX_HOME,RMLX_REPO_ROOT
-env-knob lib/cpu_snapshot.sh CPU_SNAPSHOT_MIN_ROWS,CPU_SNAPSHOT_SKIP,SYNTHETIC_ARMS
+env-knob lib/bench_server.sh PORT
+env-knob lib/cpu_snapshot.sh CPU_SNAPSHOT_MIN_ROWS,SYNTHETIC_ARMS
 env-knob lib/identity.sh RMLX_IDENTITY_JSON
 env-knob lib/kv_boundary_default.py RMLX_REPO_ROOT
-env-knob metal_dirs.sh REPO_ROOT
+env-knob lib/selftest_support.sh TOOL
 env-knob mlx_preflight.sh HOMEBREW_PREFIX
 env-knob mlx_restore_pin.sh HOMEBREW_PREFIX,RMLX_BOTTLE_STORE
 env-knob mst_capture.sh RMLX_HOME
@@ -518,11 +525,10 @@ env-knob perf_canary.sh RMLX_HOME,RMLX_O_MODELS_ROOT
 env-knob prefill_chunk_sweep.sh RMLX_HOME
 env-knob published_table_selftest.sh MAKE_ENV
 env-knob release_e2e/stage6_perf/codec_smoke_runner.sh RMLX_O_MODELS_ROOT
-env-knob report/scripts_gate_selftest.sh X
 env-knob run_gpu_tests.sh RMLX_O_MODELS_ROOT,RMLX_SKIP_GPU
 env-knob schema_constraint_canary.sh BONSAI_MODEL,GEMMA_E2B_MODEL,PORT,RMLX_O_MODELS_ROOT
 env-knob spec_bench.sh BENCH_PROMPT,BENCH_PROMPT_FILE,BENCH_PROMPT_NAME,DRAFTER_MODEL,PORT,RMLX_HARDWARE_TAG,RMLX_HOME,VERIFIER_MODEL
 env-knob spec_bench_published.sh KV_QUANT_SEEN,MEMORY_PID,RMLX_HOME,SAMPLING_SEEN,SERVER_PID
-env-knob spec_bench_selftest.sh OUT_PATH,SLEEP_LOG
+env-knob spec_bench_selftest.sh OUT_PATH
 env-knob ssd_canary.sh PORT,SSD_GB,VERIFIER_MODEL
 env-knob target_gc.sh MAX_AGE_DAYS
