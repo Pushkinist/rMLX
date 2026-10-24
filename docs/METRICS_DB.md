@@ -87,8 +87,8 @@ renamed fine-tune still records.
 ### 5.2 `weight_quant` canonicalization
 
 Must be in `identity::WEIGHT_QUANT_WHITELIST`: `bf16`, `fp16`, `mxfp8`,
-`mxfp4`, `nvfp4`, `q8_0`, `q4_k_m`, `2bit`, `3bit`, `4bit`, `5bit`, `6bit`,
-`8bit`, `paro`. `bf16` means unquantized. `identity::infer_weight_quant`
+`mxfp4`, `nvfp4`, `q8_0`, `q4_k_m`, `1bit`, `2bit`, `3bit`, `4bit`, `5bit`,
+`6bit`, `8bit`, `paro`. `bf16` means unquantized. `identity::infer_weight_quant`
 reads the value from a snapshot name for `RunRecordBuilder::rmlx` and falls
 back to `bf16`.
 

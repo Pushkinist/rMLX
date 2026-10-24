@@ -32,7 +32,7 @@ import sys
 # docs/METRICS_DB.md §5.2, mirroring identity::WEIGHT_QUANT_WHITELIST.
 WEIGHT_QUANT_WHITELIST = {
     "bf16", "fp16", "mxfp8", "mxfp4", "nvfp4", "q8_0", "q4_k_m",
-    "2bit", "3bit", "4bit", "5bit", "6bit", "8bit", "paro",
+    "1bit", "2bit", "3bit", "4bit", "5bit", "6bit", "8bit", "paro",
 }
 
 DTYPE_LABELS = {"bfloat16": "bf16", "float16": "fp16"}

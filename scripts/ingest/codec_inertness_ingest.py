@@ -71,7 +71,7 @@ STAGING = RMLX_HOME / "bench" / "codec_inertness" / "records"
 # a row ingested here lands in the same cell as one the binary recorded.
 WEIGHT_QUANT_TOKENS = [
     "mxfp8", "mxfp4", "nvfp4", "q4_k_m", "q8_0",
-    "8bit", "4bit", "2bit", "3bit", "5bit", "6bit", "fp16", "bf16", "paro",
+    "8bit", "4bit", "2bit", "1bit", "3bit", "5bit", "6bit", "fp16", "bf16", "paro",
 ]
 
 
