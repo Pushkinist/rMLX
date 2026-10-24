@@ -240,6 +240,31 @@ check keep_arm_is_required 2 \
 	"the promoter does not choose the surviving arm for the caller" "$CLEAN" \
 	NOARM "GREP:required: --keep-arm"
 
+# --- the recorder ------------------------------------------------------------
+
+# The stub answers `metrics record --help` with an identity block and no
+# `--run-class`, as a binary built before the run class would.
+REC_HOME="$WORK/recorder_home"
+set +e
+RMLX_HOME="$REC_HOME" python3 "$SCRIPT" --record "$CLEAN" \
+	--model snap --model-namespace mlx-community --weight-quant mxfp8 \
+	--arm-a-kv-quant none --arm-b-kv-quant mixed_k8g64_v4g64 --keep-arm A \
+	--rmlx-bin "$STUB" >"$WORK/recorder.log" 2>&1
+rec_code=$?
+set -e
+rec_bad=""
+[[ "$rec_code" -ne 0 ]] || rec_bad="exit 0"
+grep -q "rmlx has no \`metrics record --run-class\`" "$WORK/recorder.log" || rec_bad="${rec_bad:+$rec_bad; }no refusal naming the binary"
+[[ ! -d "$REC_HOME/bench/perf_ab/records" ]] || rec_bad="${rec_bad:+$rec_bad; }a record was staged before the refusal"
+if [[ -z "$rec_bad" ]]; then
+	PASSED=$((PASSED + 1))
+	printf '  ok   %-38s exit=%s — %s\n' classless_recorder_refused "$rec_code" "a recorder without --run-class is refused, by name, before anything is staged"
+else
+	FAILED=$((FAILED + 1))
+	printf '  FAIL %-38s %s\n' classless_recorder_refused "$rec_bad"
+	sed 's/^/       | /' "$WORK/recorder.log" | tail -4
+fi
+
 # --- shape -------------------------------------------------------------------
 
 TWO="$(make_result two)"

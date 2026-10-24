@@ -467,6 +467,22 @@ else
 	FAIL=$((FAIL + 1))
 fi
 
+# The ingest checks its recorder on the real path too, not only under
+# --check-args: a classless recorder is refused before anything is staged.
+POST_HOME="$WORK/home/post_check"
+POST_OUT="$(RMLX_HOME="$POST_HOME" python3 "$ROOT/scripts/ingest/llama_ab_ingest.py" "$(printf '%s' "$OUT" | sed -n 's/^result     //p' | tail -1)" \
+	--prompt-file "$PROMPT" --accept-tainted --record --rmlx-bin "$OLD_RECORDER" $RECORD_ARGS_REAL 2>&1)"
+POST_CODE=$?
+if [ "$POST_CODE" -ne 0 ] && grep -q "claim_rmlx_old has no \`metrics record --run-class\`" <<<"$POST_OUT" &&
+	[ ! -d "$POST_HOME/bench/llama_ab/records" ]; then
+	echo "  PASS  the ingest refuses a classless recorder after a run, before staging anything"
+	PASS=$((PASS + 1))
+else
+	echo "  FAIL  the ingest's post-run recorder check (exit $POST_CODE)"
+	printf '%s\n' "$POST_OUT" | sed 's/^/        /' | tail -4
+	FAIL=$((FAIL + 1))
+fi
+
 # --keep-arm writes the surviving arm alone, as gate, under its own backend.
 REAL_RESULT="$(printf '%s' "$OUT" | sed -n 's/^result     //p' | tail -1)"
 KEEP_OUT="$(python3 "$ROOT/scripts/ingest/llama_ab_ingest.py" --dry-run "$REAL_RESULT" \
