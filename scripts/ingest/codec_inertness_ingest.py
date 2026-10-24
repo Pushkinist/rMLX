@@ -198,6 +198,7 @@ def build_record(row: dict[str, str], args: argparse.Namespace, prompts_dir: Pat
             "runs on a shared host and are deliberately not recorded"
         ),
         "description": args.description,
+        "run_class": "gate",
         "metrics": [{"name": "kv_cache_bytes", "value": float(row["kv_cache_bytes"])}],
     }
 

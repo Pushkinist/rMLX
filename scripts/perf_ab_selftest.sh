@@ -65,19 +65,25 @@ if [ "\${1:-}" = claim ]; then
   exec "\$@"
 fi
 # Imitate the real binary's metrics behaviour, including clap's last-occurrence
-# -wins resolution of a \`global = true\` flag: \`--metrics off ... --metrics full\`
-# records. Without that, the "no runs.db written" assertion at the end of the
-# suite would be a statement about stubs not doing very much, instead of a
-# guard on the one escape that reaches the real append-only store.
+# -wins resolution of a \`global = true\` flag, and log how this slot was told
+# to record. \`check\` reads the log: a synthetic run records nothing, and a
+# real one records every slot as an ab_arm row.
 mode=full
+record=0
+class=""
+label=""
 prev=""
 for a in "\$@"; do
   case "\$a" in
   --metrics=*) mode="\${a#--metrics=}" ;;
-  *) [ "\$prev" = "--metrics" ] && mode="\$a" ;;
+  --record) record=1 ;;
   esac
+  [ "\$prev" = "--metrics" ] && mode="\$a"
+  [ "\$prev" = "--run-class" ] && class="\$a"
+  [ "\$prev" = "--label" ] && label="\$a"
   prev="\$a"
 done
+printf 'mode=%s record=%s class=%s label=%s\n' "\$mode" "\$record" "\$class" "\$label" >>"$STATE/slots.log"
 if [ "\$mode" != "off" ]; then
   mkdir -p "\$RMLX_HOME/metrics" && : >"\$RMLX_HOME/metrics/runs.db"
 fi
@@ -115,12 +121,14 @@ STUB
 	echo "$path"
 }
 
-reset_state() { rm -f "$STATE"/*.cnt; }
+reset_state() { rm -f "$STATE"/*.cnt "$STATE/slots.log"; }
 
 PASSED=0
 FAILED=0
 SYNTHETIC_CASES=0
 REAL_HOST_CASES=0
+SYNTHETIC_SLOTS_CHECKED=0
+REAL_SLOTS_CHECKED=0
 HOST_READING_CASES=0
 
 # check <name> <expected-exit> <what-it-proves> -- <perf_ab.sh args...>
@@ -189,6 +197,19 @@ check() {
 	local ok=1
 	[[ "$got" -eq "$want" ]] || ok=0
 	local failed_pattern=""
+	# How each slot was told to record. A real run records every slot,
+	# warmups included, as an ab_arm row; a synthetic run records nothing.
+	if [[ -s "$STATE/slots.log" ]]; then
+		local expected='^mode=off record=0 class= label=$' stray
+		if [[ "$real_host" -eq 1 ]]; then
+			expected='^mode=full record=1 class=ab_arm label=perf_ab:[0-9]{8}T[0-9]{6}Z:[AB]:(warm_[ab]|slot_[0-9]+)$'
+			REAL_SLOTS_CHECKED=$((REAL_SLOTS_CHECKED + $(wc -l <"$STATE/slots.log")))
+		else
+			SYNTHETIC_SLOTS_CHECKED=$((SYNTHETIC_SLOTS_CHECKED + $(wc -l <"$STATE/slots.log")))
+		fi
+		stray="$(grep -vE -- "$expected" "$STATE/slots.log" | head -1 || true)"
+		[[ -z "$stray" ]] || { ok=0; failed_pattern="slot recorded as: $stray"; }
+	fi
 	for g in ${greps[@]+"${greps[@]}"}; do
 		if [[ "$g" == !* ]]; then
 			grep -qE -- "${g#!}" "$out" && { ok=0; failed_pattern="unexpected: ${g#!}"; }
@@ -415,7 +436,19 @@ mkdir -p "$WORK/servebin"
 printf '#!/usr/bin/env bash\n%s\n' "$idle_rows" >"$WORK/servebin/ps"
 printf '#!/bin/sh\necho 4243\nexit 0\n' >"$WORK/servebin/claim-holder"
 
-chmod +x "$WORK"/busybin/* "$WORK"/servebin/*
+# A quiet machine with the Metal context free.
+mkdir -p "$WORK/quietbin"
+printf '#!/usr/bin/env bash\n%s\n' "$idle_rows" >"$WORK/quietbin/ps"
+printf '#!/bin/sh\nexit 1\n' >"$WORK/quietbin/claim-holder"
+
+chmod +x "$WORK"/busybin/* "$WORK"/servebin/* "$WORK"/quietbin/*
+
+check real_slots_record_as_ab_arm 0 \
+	"on a quiet host every slot, warmups included, is recorded as an ab_arm row" \
+	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" \
+	REALHOST "PATHPRE:$WORK/quietbin" \
+	"GREP:recorded in runs.db as an ab_arm row" \
+	"GREP:VERDICT: SEPARATED"
 
 check busy_host_refused 125 \
 	"a host over the CPU threshold is refused before anything is measured" \
@@ -445,25 +478,37 @@ check metal_holder_refused 125 \
 	"GREP:holds the Metal context" \
 	"NOGREP:VERDICT:"
 
-# ---- the runs.db escape ------------------------------------------------------
+# ---- the recording flags -----------------------------------------------------
 #
-# `--metrics` is `global = true`, so an occurrence after the subcommand beats
-# the harness's leading `--metrics off` and the slot opens the real append-only
-# runs.db. Verified against the built binary, including on a failure path where
-# the model never loaded.
+# The harness sets how every slot records. `--metrics` is `global = true`, so an
+# arm's occurrence after the subcommand would win; an arm's `--record`,
+# `--run-class` or `--label` would be refused by the binary or move the arm into
+# another class.
 
 check metrics_flag_in_arm_refused 125 \
 	"--metrics in an arm's arguments is refused before anything runs" \
 	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" \
 	--arm-b "--metrics full" \
 	"GREP:--metrics may not appear in arm arguments" \
-	"GREP:append-only"
+	"GREP:change how that arm is recorded"
 
 check metrics_flag_equals_form_refused 125 \
 	"the --metrics=VALUE spelling is refused too" \
 	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" \
 	--arm-a "--metrics=full" \
 	"GREP:--metrics may not appear in arm arguments"
+
+check run_class_flag_in_arm_refused 125 \
+	"--run-class in an arm's arguments is refused before anything runs" \
+	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" \
+	--arm-a "--run-class gate" \
+	"GREP:--run-class may not appear in arm arguments"
+
+check record_flag_in_arm_refused 125 \
+	"--record in an arm's arguments is refused before anything runs" \
+	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" \
+	--arm-b "--record" \
+	"GREP:--record may not appear in arm arguments"
 
 # ---- degenerate measurements -------------------------------------------------
 
@@ -712,20 +757,19 @@ else
 		"json_result_parses_body" "${JSON_PATH:-<no result line>}"
 fi
 
-# ---- it must not touch the metrics database ---------------------------------
+# ---- the recording check had something to read ------------------------------
 #
-# The stubs create runs.db unless they are handed `--metrics off`, so this is a
-# check on what the harness passes, not on stubs being inert. Every case above
-# has run by now; if any of them dropped the flag, the file exists.
+# `check` holds every slot of every case to its expected recording flags. That
+# is only a guard if slots of both kinds reached it.
 
-if [[ -e "$WORK/home/metrics/runs.db" ]]; then
-	FAILED=$((FAILED + 1))
-	printf '  FAIL %-26s        — a slot ran without --metrics off; runs.db appeared at %s\n' \
-		"no_metrics_db_written" "$WORK/home/metrics/runs.db"
-else
+if [[ "$SYNTHETIC_SLOTS_CHECKED" -gt 0 && "$REAL_SLOTS_CHECKED" -gt 0 ]]; then
 	PASSED=$((PASSED + 1))
-	printf '  ok   %-26s        — every slot ran with --metrics off; no runs.db was created\n' \
-		"no_metrics_db_written"
+	printf '  ok   %-26s        — %d synthetic slots recorded nothing; %d real slots recorded as ab_arm\n' \
+		"slot_recording_checked" "$SYNTHETIC_SLOTS_CHECKED" "$REAL_SLOTS_CHECKED"
+else
+	FAILED=$((FAILED + 1))
+	printf '  FAIL %-26s        — slots checked: %d synthetic, %d real; both must be above 0\n' \
+		"slot_recording_checked" "$SYNTHETIC_SLOTS_CHECKED" "$REAL_SLOTS_CHECKED"
 fi
 
 echo ""

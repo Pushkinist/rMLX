@@ -404,7 +404,7 @@ if [ -n "$SYNTH_RESULT" ] && [ -r "$SYNTH_RESULT" ]; then
 	INGEST_OUT="$(python3 "$ROOT/scripts/ingest/llama_ab_ingest.py" --dry-run "$SYNTH_RESULT" \
 		--prompt-file "$PROMPT" --prompt-name selftest --model stub \
 		--weight-quant mxfp8 --arm-a-backend llama.cpp --arm-b-backend llama.cpp \
-		--arm-a-kv-quant none --arm-b-kv-quant none 2>&1)"
+		--arm-a-kv-quant none --arm-b-kv-quant none --run-class gate 2>&1)"
 	INGEST_CODE=$?
 	if [ "$INGEST_CODE" -eq 2 ] && grep -q "no waiver for this" <<<"$INGEST_OUT"; then
 		echo "  PASS  a --synthetic-arms result is refused by the promoter, with no waiver"

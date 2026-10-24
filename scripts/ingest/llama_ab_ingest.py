@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Ingest a `scripts/bench_llama_ab.sh` result into the rMLX metrics DB.
 
-`bench_llama_ab.sh` deliberately never touches `runs.db` — an A/B run is an
-experiment and the store is append-only. This is the separate, explicit step
-that promotes one accepted comparison into two §8.5 RunRecords, one per arm.
+`bench_llama_ab.sh` never touches `runs.db`. This is the separate, explicit
+step that promotes one accepted comparison into two §8.5 RunRecords, one per
+arm, under the `--run-class` it is given: `gate` for arms that are kept cells,
+`ab_arm` otherwise.
 
 Sibling of `llama_bench_ingest.py`, which reads `llama-bench -o json`. The two
 inputs are unrelated shapes: `llama-bench` measures synthetic token generation
@@ -17,7 +18,7 @@ Usage:
         --arm-a-backend llama_cpp --arm-b-backend llama_cpp_tq \
         --model Qwen3-8B-Q8_0 --weight-quant q8_0 \
         --arm-a-kv-quant none --arm-b-kv-quant turbo3 \
-        --prompt-name longctx_8k_text --prompt-file PROMPT.txt
+        --prompt-name longctx_8k_text --prompt-file PROMPT.txt --run-class gate
 
     # Write buffer files and ingest them:
     python3 scripts/ingest/llama_ab_ingest.py --record RESULT.json ...
@@ -131,6 +132,7 @@ def _arm_record(
         "output_first_64": slots[0].get("output_first_64") or None,
         "notes": notes,
         "description": args.description,
+        "run_class": args.run_class,
         "metrics": [
             {"name": "decode_tps_warm", "value": statistics.median(tps), "stddev": stddev},
             {
@@ -176,6 +178,14 @@ def main() -> int:
         "test' on others cannot be queried. Pass the arm's own commit, or omit it.",
     )
     p.add_argument("--description", default=None)
+    p.add_argument(
+        "--run-class",
+        required=True,
+        choices=["gate", "ab_arm", "diagnostic"],
+        help="why the rows are recorded (docs/METRICS_DB.md §8.5). Both arms take "
+        "this class, and only gate rows reach bests and the gates: pass gate when "
+        "both arms are kept cells, ab_arm otherwise.",
+    )
     p.add_argument("--accept-tainted", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--record", action="store_true", help="ingest via `rmlx metrics record --file`")

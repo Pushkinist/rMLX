@@ -197,6 +197,8 @@ def run_ppl(args: argparse.Namespace, text_path: Path, rmlx: Path) -> dict:
         str(args.stride),
         "--corpus",
         args.corpus,
+        "--run-class",
+        "gate",
         "--device",
         args.device,
         "--max-tokens",

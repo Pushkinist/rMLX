@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Ingest a `scripts/perf_ab.sh` result into the rMLX metrics DB.
 
-`perf_ab.sh` deliberately never touches `runs.db` — an A/B run is an experiment
-and the store is append-only. This is the separate, explicit step that promotes
-one accepted comparison into two §8.5 RunRecords, one per arm.
+`perf_ab.sh` records every slot as an `ab_arm` row, which reaches no champion
+and no gate. This is the separate, explicit step that promotes one accepted
+comparison into two §8.5 RunRecords, one per arm, under the `--run-class` it is
+given: `gate` for arms that are kept cells.
 
 Sibling of `llama_ab_ingest.py`, which does the same job for
 `bench_llama_ab.sh`. The two inputs are different shapes and different
@@ -17,7 +18,7 @@ Usage:
     python3 scripts/ingest/perf_ab_ingest.py --dry-run RESULT.json \
         --model Qwen3.8-27B-mxfp8 --weight-quant mxfp8 \
         --arm-a-kv-quant none --arm-b-kv-quant mixed_k8g64_v4g64 \
-        --prompt-tokens 130848
+        --prompt-tokens 130848 --run-class gate
 
     # Write buffer files and ingest them:
     python3 scripts/ingest/perf_ab_ingest.py --record RESULT.json ...
@@ -248,6 +249,7 @@ def _arm_record(
         "n_measure": stats["n"],
         "notes": notes,
         "description": args.description,
+        "run_class": args.run_class,
         "metrics": metrics,
     }
 
@@ -288,6 +290,14 @@ def main() -> int:
         help="caller-supplied provenance (§8.5.1); the binary does no git.",
     )
     p.add_argument("--description", default=None)
+    p.add_argument(
+        "--run-class",
+        required=True,
+        choices=["gate", "ab_arm", "diagnostic"],
+        help="why the rows are recorded (docs/METRICS_DB.md §8.5). Both arms take "
+        "this class, and only gate rows reach bests and the gates: pass gate when "
+        "both arms are kept cells, ab_arm otherwise.",
+    )
     p.add_argument("--accept-tainted", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument(

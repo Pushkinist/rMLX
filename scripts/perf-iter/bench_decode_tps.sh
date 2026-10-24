@@ -459,6 +459,8 @@ rec = {
     'output_first_64': output_first_64,
     'notes':           'decode_window=engine_itl; perf-iter bench script',
     'description':     None,
+    # One iteration of a perf investigation, not a gate measurement.
+    'run_class':       'diagnostic',
     'metrics': [
         {'name': 'decode_tps_warm', 'value': float('${tps_mean}'),   'stddev': float('${tps_stddev}')},
         {'name': 'step_ms_mean',    'value': float('${ttft_mean}')},

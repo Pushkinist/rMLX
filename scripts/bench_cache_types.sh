@@ -198,6 +198,7 @@ rec = {
   "n_measure": 0,
   "notes": os.environ["NOTES_VAL"],
   "description": os.environ["DESC_VAL"],
+  "run_class": "diagnostic",
   "metrics": [
     {"name": "decode_tps_warm", "value": 0.0, "stddev": 0.0},
   ],

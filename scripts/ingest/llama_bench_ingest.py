@@ -312,6 +312,7 @@ def _build_record(rows: list[dict[str, Any]], hardware_tag: str) -> dict[str, An
         "output_first_64":  None,
         "notes":            " ".join(notes_parts),
         "description":      None,
+        "run_class":        "gate",
         "metrics":          metrics,
     }
 

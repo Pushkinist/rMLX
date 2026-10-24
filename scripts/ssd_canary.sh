@@ -542,6 +542,7 @@ obj = {
     "seed": seed,
     "notes": notes,
     "description": f"ssd_canary tag={tag} sha={git_sha}",
+    "run_class": "gate",
     "metrics": metric_entries,
 }
 print(json.dumps(obj))

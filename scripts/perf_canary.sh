@@ -6,8 +6,8 @@
 # Runs 1 warmup + 3 measured baseline calls per model, prints median decode_tps
 # ± sample stddev, appends one CSV row per model to
 # <RMLX_HOME>/bench/perf_canary.csv, and records one further run into runs.db
-# via `rmlx baseline --record`. Each model also gets an explicit `k8vturbo3`
-# arm, which appends its own CSV row after the `auto` row.
+# via `rmlx baseline --record --run-class gate`. Each model also gets an
+# explicit `k8vturbo3` arm, which appends its own CSV row after the `auto` row.
 #
 # The default mode measures ONE build. All of its measured runs for a model
 # happen together, which is fine for tracking one build over time but not for
@@ -235,7 +235,7 @@ for entry in "${MODELS[@]}"; do
         --max-ctx "${MAX_CTX}" \
         --label "canary sha=${GIT_SHA}" \
         ${git_sha_args[@]+"${git_sha_args[@]}"} \
-        --record \
+        --record --run-class gate \
         > /dev/null 2>&1; then
         echo "  runs.db: ok" >&2
     else

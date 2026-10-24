@@ -83,15 +83,18 @@ PY
 	echo "$path"
 }
 
-# check <name> <want-exit> <what-it-proves> <result-file> [extra args...] [GREP:pat]
+# check <name> <want-exit> <what-it-proves> <result-file> [extra args...] [GREP:pat] [NOCLASS]
+#
+# Every case passes `--run-class gate` unless it says NOCLASS.
 check() {
 	local name="$1" want="$2" what="$3" result="$4"
 	shift 4
-	local args=() greps=()
+	local args=() greps=() class=(--run-class gate)
 	local a
 	for a in "$@"; do
 		case "$a" in
 		GREP:*) greps+=("${a#GREP:}") ;;
+		NOCLASS) class=() ;;
 		*) args+=("$a") ;;
 		esac
 	done
@@ -100,7 +103,7 @@ check() {
 	python3 "$SCRIPT" --dry-run "$result" \
 		--model snap --model-namespace mlx-community --weight-quant mxfp8 \
 		--arm-a-kv-quant none --arm-b-kv-quant mixed_k8g64_v4g64 \
-		--rmlx-bin "$STUB" ${args[@]+"${args[@]}"} >"$out" 2>&1
+		--rmlx-bin "$STUB" ${class[@]+"${class[@]}"} ${args[@]+"${args[@]}"} >"$out" 2>&1
 	got=$?
 	set -e
 
@@ -216,6 +219,16 @@ REFUSED="$(make_result kvrefused '{"results.0.arm_a.median_kv_cache_bytes": null
 check kv_refusal_records_null_not_zero 0 \
 	"an arm with no residency figure records null, never 0" "$REFUSED" \
 	"GREP:\"value\": null"
+
+# --- run class ---------------------------------------------------------------
+
+check class_reaches_both_records 0 \
+	"the stated class is on each arm's record" "$CLEAN" \
+	"GREP:\"run_class\": \"gate\""
+
+check class_is_required 2 \
+	"the promoter does not choose a class for the caller" "$CLEAN" \
+	NOCLASS "GREP:required: --run-class"
 
 # --- shape -------------------------------------------------------------------
 

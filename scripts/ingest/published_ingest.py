@@ -244,6 +244,7 @@ def base_record(result: dict[str, Any], args: argparse.Namespace) -> dict[str, A
         # spread in `notes` a reading of machine variance.
         "seed": sampling.get("seed"),
         "description": args.description,
+        "run_class": "gate",
     }
     # `decode_config` is cell identity: absent means every engine setting at its
     # default, and the empty string is not a spelling of that.

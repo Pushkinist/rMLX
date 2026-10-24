@@ -451,6 +451,7 @@ for ptok in ptoks:
             "notes": (f"prefill_chunk sweep; {os.environ['RMLX_SWEEP_ARCH_KEY']} level {lvl}; "
                       f"cyclic Latin square, {len(rows)} rows x {len(levels)} levels, "
                       f"rmlx bench per slot; token_digest={sorted(all_digests)[0]}"),
+            "run_class": "gate",
             "metrics": measurements,
         })
 

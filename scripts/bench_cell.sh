@@ -393,6 +393,7 @@ rec = {
   "n_measure": int(os.environ["N_MEAS_VAL"]),
   "notes": os.environ["NOTES_VAL"],
   "description": os.environ["DESC_VAL"],
+  "run_class": "diagnostic",
   # A run that failed its throughput threshold measured no throughput. `null`
   # records the attempt (notes carry status=runtime_fail and the observed tps)
   # without filing a fabricated 0.0 that would rank as a measurement.
@@ -466,6 +467,7 @@ rec = {
   "n_measure": int(os.environ["N_MEAS_VAL"]),
   "notes": os.environ["NOTES_VAL"],
   "description": os.environ["DESC_VAL"],
+  "run_class": "gate",
   # `or 0` coerced a scrape that came back empty into a measurement of zero.
   # A missed RSS scrape is not a 0 MB process, and a zero rate is not a rate:
   # send null and let the recorder write no row for that metric.
