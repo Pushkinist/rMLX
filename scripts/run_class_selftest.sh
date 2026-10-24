@@ -348,6 +348,42 @@ grep -q 'metrics record --help` failed (exit 2): dyld: library not loaded' <<<"$
 ! grep -q 'built before the run class' <<<"$out" || bad="${bad:+$bad; }a failing recorder is called an old one"
 verdict recorder_whose_help_fails_is_reported_as_failing "a recorder whose --help exits non-zero is reported as failing" "$bad"
 
+# ── eval/wikitext2_ppl.py ─────────────────────────────────────────────────────
+#
+# A PPL run that measured and whose record did not land keeps its number,
+# names the buffer file and ends 75; one that failed to measure ends 1.
+mkdir -p "$WORK/wikitext_cache"
+printf 'some text\n' >"$WORK/wikitext_cache/wiki.test.raw.txt"
+cat >"$WORK/rmlx_ppl" <<'STUB'
+#!/usr/bin/env bash
+[ -n "${STUB_PPL_CRASH:-}" ] && exit 1
+echo '{"ppl": 7.5, "scored_tokens": 10, "windows": 1, "ctx_window": 4096, "stride": 2048}'
+echo "error: ppl: measured, but the record did not reach runs.db; it is kept at /x/pending/ppl.json for \`rmlx metrics record --replay-pending\`" >&2
+echo "rMLX exits with code 75." >&2
+exit 75
+STUB
+chmod +x "$WORK/rmlx_ppl"
+ppl_case() { # <crash>
+	STUB_PPL_CRASH="$1" python3 "$REPO_ROOT/scripts/eval/wikitext2_ppl.py" --model "$MODEL" \
+		--run-class diagnostic --rmlx-binary "$WORK/rmlx_ppl" --cache-dir "$WORK/wikitext_cache" \
+		>"$WORK/ppl.out" 2>"$WORK/ppl.err"
+}
+set +e
+ppl_case ""
+status=$?
+set -e
+bad=""
+[ "$status" -eq 75 ] || bad="exit=$status (want 75)"
+grep -q '"ppl": 7.5' "$WORK/ppl.out" || bad="${bad:+$bad; }the PPL line was not kept"
+grep -q 'kept at /x/pending/ppl.json' "$WORK/ppl.err" || bad="${bad:+$bad; }the buffer file is not named"
+verdict ppl_with_a_pending_record_keeps_its_number "a PPL whose record did not land is printed, its file named, and the run ends 75" "$bad"
+set +e
+ppl_case 1
+status=$?
+set -e
+[ "$status" -eq 1 ] && bad="" || bad="exit=$status (want 1)"
+verdict ppl_that_did_not_measure_fails "a PPL run that failed to measure ends 1" "$bad"
+
 # ── snapshot_identity.py against the shared label table ──────────────────────
 #
 # The Rust producer, `ModelConfig::weight_quant_label`, is held to the same
