@@ -30,21 +30,12 @@ use crate::{
 /// `docs/METRICS_SCHEMA.md` §4 registry — see that module for why the view is generated rather than
 /// pinned to a migration.
 ///
-/// A DB at a version past the last migration this binary carries is refused:
-/// a newer binary migrated it, and rebuilding `bests` here would drop what the
-/// later migrations put in the view.
+/// A DB at a version past the last migration this binary carries is refused
+/// ([`refuse_newer_schema`]).
 ///
 /// Returns the number of migrations applied (0 when already up to date).
 pub fn run_pending(conn: &mut Connection) -> Result<u32> {
-    let current_version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    let last_known = MIGRATIONS.last().map_or(0, |&(v, _)| v);
-    if current_version > last_known {
-        return Err(Error::Schema(format!(
-            "the DB is at schema version {current_version}, and this binary knows migrations \
-             up to version {last_known}: a newer binary migrated it. Open it with that binary \
-             or a newer one (docs/METRICS_DB.md §13)."
-        )));
-    }
+    let current_version = refuse_newer_schema(conn)?;
 
     let mut applied: u32 = 0;
 
@@ -84,6 +75,26 @@ pub fn run_pending(conn: &mut Connection) -> Result<u32> {
     bests_view::ensure(conn)?;
 
     Ok(applied)
+}
+
+/// The DB's `user_version`, or an error when it is past the last migration
+/// this binary carries: a newer binary migrated it, so this one's `bests`
+/// rebuild and its readers would drop what the later migrations put there.
+/// Shared by the writers ([`run_pending`]) and the readers
+/// ([`crate::schema::open_checked`]).
+pub(crate) fn refuse_newer_schema(conn: &Connection) -> Result<u32> {
+    let version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let last_known = MIGRATIONS.last().map_or(0, |&(v, _)| v);
+    if version > last_known {
+        return Err(Error::Schema(format!(
+            "the DB is at schema version {version}, and this binary knows migrations up to \
+             version {last_known}: a newer binary migrated it. Use that binary or a newer one, \
+             or give this one another DB: a scratch RMLX_HOME, `rmlx metrics --db <path>`, or \
+             `--metrics off` for a command that is not `rmlx metrics` (docs/METRICS_DB.md §13, \
+             rule 23)."
+        )));
+    }
+    Ok(version)
 }
 
 /// Fill `decode_config` for rows whose own `notes` say what they were.

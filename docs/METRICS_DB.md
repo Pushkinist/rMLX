@@ -800,7 +800,11 @@ change to what `bests` publishes, such as a `METRICS_SCHEMA.md` §4.1 bounds cha
     the repo, which resolves `<workspace>/.rmlx/`. Its writers rebuild `bests`
     without the class filter, and its readers have none, so an `ab_arm` or
     `diagnostic` row would win a champion and move a gate. A binary from
-    migration 9 on refuses a DB at a later version than it knows, naming both.
+    migration 9 on refuses a DB at a later version than it knows, naming
+    both: every `rmlx metrics` subcommand that opens the DB, reader or
+    writer, and every other command unless it runs with `--metrics off`,
+    since each opens the DB at start to record its events. A scratch
+    `RMLX_HOME`, or `--db` for `rmlx metrics`, points it at another DB.
     `make canary-gate` under `git bisect` builds the old commit's binary with
     that commit's own `Makefile`, so a bisect across migration 9 runs the
     gate's `metrics deltas --since-sha <SHA> --threshold-pct 3 --exit-code

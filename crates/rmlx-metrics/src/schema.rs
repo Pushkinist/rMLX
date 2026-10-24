@@ -105,6 +105,7 @@ pub fn open_checked(path: &std::path::Path) -> Result<Connection> {
     }
 
     let conn = open(path)?;
+    crate::migrate::refuse_newer_schema(&conn)?;
 
     if crate::bests_view::is_stale(&conn)? {
         return Err(Error::Schema(format!(

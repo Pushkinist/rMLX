@@ -333,3 +333,23 @@ fn schema_meta_seeded() {
         "created_utc must be ISO-8601 UTC, got: {created_utc}"
     );
 }
+
+/// A read command opens through `open_checked`, which must refuse a DB a newer
+/// binary migrated just as the writers' `run_pending` does: its `bests` and its
+/// rows may carry what this binary does not know to filter.
+#[test]
+fn open_checked_refuses_a_db_newer_than_this_binary() {
+    let td = tempfile::tempdir().unwrap();
+    let path = td.path().join("runs.db");
+    {
+        let mut conn = open(&path).unwrap();
+        migrate::run_pending(&mut conn).unwrap();
+        let last = MIGRATIONS.last().map_or(0, |&(v, _)| v);
+        conn.execute_batch(&format!("PRAGMA user_version = {};", last + 1))
+            .unwrap();
+    }
+    let last = MIGRATIONS.last().map_or(0, |&(v, _)| v);
+    let err = open_checked(&path).unwrap_err().to_string();
+    assert!(err.contains(&format!("version {}", last + 1)), "{err}");
+    assert!(err.contains("RMLX_HOME"), "{err}");
+}
