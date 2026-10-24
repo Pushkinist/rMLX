@@ -8,11 +8,14 @@
 #
 # Per combo:
 #   1. Smoke probe: short generation via `rmlx baseline`. Reject empty /
-#      non-UTF-8 / 4-gram-repeat-heavy output. On fail, write a §8.5 record
-#      with notes "status=smoke_fail" and skip the cell.
+#      non-UTF-8 / 4-gram-repeat-heavy output. On fail, log it in the summary
+#      and skip the cell.
 #   2. Call `scripts/bench_cell.sh` for the real measurement.
 #   3. Exit code 78 from `scripts/bench_cell.sh` (unsupported resolver combo) =>
-#      write a "status=skip" record and continue.
+#      log a skip in the summary and continue.
+#
+# A cell that fails or is skipped measured nothing, so it writes no runs.db
+# record: the recorder refuses a record with no measurement.
 #
 # Every step is a one-shot `rmlx` command that holds the Metal claim for its own
 # run, so nothing here stops a process. A claim another process holds fails the
@@ -79,13 +82,6 @@ RMLX_BIN="$RMLX_DIR/target/release/rmlx"
 # comes from the measured binary — never hard-coded here.
 source "$(dirname "${BASH_SOURCE[0]}")/lib/identity.sh"
 rmlx_export_identity "$RMLX_BIN"
-# git_sha is caller-supplied provenance, not part of RunIdentity — the
-# identity's own when it carries one, else HEAD of RMLX_DIR (never the process
-# cwd) so a run from another checkout cannot stamp that repo's SHA into this
-# one's observations.git_sha.
-GIT_SHA="$(rmlx_git_sha "${RMLX_DIR}")"
-BUFFER_DIR="$RMLX_DIR/.rmlx/metrics/buffer/pending"
-mkdir -p "$BUFFER_DIR"
 
 if [ ! -x "$RMLX_BIN" ]; then
   echo "rmlx binary not found / not executable: $RMLX_BIN" >&2
@@ -146,70 +142,6 @@ printf "%s\t%s\t%s\t%s\t%s\n" "label" "kv_quant" "decode_tps" "decode_stddev" "s
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-# Emit a §8.5 RunRecord JSON for skip / smoke_fail cases.
-#  $1 = canonical kv_quant string
-#  $2 = status string (e.g. smoke_fail, skip)
-#  $3 = combo label
-#  $4 = optional extra notes blob
-emit_status_record() {
-  local kv_canon="$1"
-  local status="$2"
-  local combo_label="$3"
-  local extra_notes="${4:-}"
-
-  local out_json
-  out_json="$BUFFER_DIR/$(date -u +"%Y%m%dT%H%M%S%3N")-bench-$$.json"
-  local prompt_file="$RMLX_DIR/prompts/${PROMPT_ID}.json"
-
-  PROMPT_FILE="$prompt_file" \
-  NS_VAL="$NS" \
-  MODEL_VAL="$MODEL_NAME" \
-  WQ_VAL="$WEIGHT_BITS_IN" \
-  KV_VAL="$kv_canon" \
-  CTX_VAL="$CTX_MAX_DEFAULT" \
-  PROMPT_NAME_VAL="$PROMPT_ID" \
-  TS_VAL="$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
-  HW_VAL="${RMLX_HARDWARE_TAG:-m5_max_128gb}" \
-  PROMPT_TOK_VAL="$PROMPT_TOKENS" \
-  NOTES_VAL="label=ctype-${combo_label} status=${status} ${extra_notes}" \
-  DESC_VAL="bench_cache_types ${combo_label} ${status}" \
-  GIT_SHA_VAL="$GIT_SHA" \
-  python3 -c '
-import json, os, sys
-with open(os.environ["PROMPT_FILE"], "r") as f:
-    body = json.load(f)
-rec = {
-    **json.loads(os.environ['RMLX_IDENTITY_JSON']),
-  # "unknown" is a fallback, never provenance — a checkout without .git
-  # must not stamp git_sha at all.
-  **({"git_sha": os.environ["GIT_SHA_VAL"]} if not os.environ["GIT_SHA_VAL"].startswith("unknown") else {}),
-  "model_namespace": os.environ["NS_VAL"],
-  "model": os.environ["MODEL_VAL"],
-  "weight_quant": os.environ["WQ_VAL"],
-  "kv_quant": os.environ["KV_VAL"],
-  "ctx_max": int(os.environ["CTX_VAL"]),
-  "prompt": {"name": os.environ["PROMPT_NAME_VAL"], "body": body},
-  "ts_utc": os.environ["TS_VAL"],
-  "prompt_tokens": int(os.environ["PROMPT_TOK_VAL"]),
-  "max_tokens": 32,
-  "temperature": 0.0,
-  "n_warmups": 0,
-  "n_measure": 0,
-  "notes": os.environ["NOTES_VAL"],
-  "description": os.environ["DESC_VAL"],
-  "run_class": "diagnostic",
-  "metrics": [
-    {"name": "decode_tps_warm", "value": 0.0, "stddev": 0.0},
-  ],
-}
-json.dump(rec, sys.stdout, indent=2)
-' >"$out_json"
-
-  if ! ( cd "$RMLX_DIR" && "$RMLX_BIN" metrics record --file "$out_json" >/dev/null 2>&1 ); then
-    echo "[$(date +%T)] WARN: failed to ingest status record $out_json" >&2
-  fi
-}
 
 # Build the canonical kv_quant string for a (ctk, ctv, kv_quant_arg) tuple.
 # Mirrors the formula in scripts/bench_cell.sh so smoke/skip rows match warm rows.
@@ -380,17 +312,15 @@ for entry in "${COMBOS[@]}"; do
     rc=$?
     if [ "$SMOKE_REASON" = "resolver_skip" ]; then
       echo "[$(date +%T)] CELL SKIP (resolver) label=$LABEL" >&2
-      emit_status_record "$KV_CANON" "skip" "$LABEL" "smoke_rc=$rc"
       printf "%s\t%s\t%s\t%s\t%s\n" "$LABEL" "$KV_CANON" "" "" "skip" >>"$SUMMARY_FILE"
     else
       # Bug-1: tps_zero is a runtime failure (not a smoke content failure).
-      local _emit_status="smoke_fail"
+      local _status="smoke_fail"
       case "$SMOKE_REASON" in
-        tps_zero=*) _emit_status="runtime_fail" ;;
+        tps_zero=*) _status="runtime_fail" ;;
       esac
-      echo "[$(date +%T)] CELL SMOKE_FAIL label=$LABEL reason=$SMOKE_REASON status=$_emit_status" >&2
-      emit_status_record "$KV_CANON" "$_emit_status" "$LABEL" "reason=$SMOKE_REASON"
-      printf "%s\t%s\t%s\t%s\t%s\n" "$LABEL" "$KV_CANON" "" "" "$_emit_status" >>"$SUMMARY_FILE"
+      echo "[$(date +%T)] CELL SMOKE_FAIL label=$LABEL reason=$SMOKE_REASON status=$_status" >&2
+      printf "%s\t%s\t%s\t%s\t%s\n" "$LABEL" "$KV_CANON" "" "" "$_status" >>"$SUMMARY_FILE"
     fi
     continue
   fi
@@ -429,20 +359,17 @@ for entry in "${COMBOS[@]}"; do
       ;;
     78)
       echo "[$(date +%T)] CELL RESOLVER_SKIP label=$LABEL" >&2
-      emit_status_record "$KV_CANON" "skip" "$LABEL" "cell_rc=78"
       printf "%s\t%s\t%s\t%s\t%s\n" "$LABEL" "$KV_CANON" "" "" "skip" >>"$SUMMARY_FILE"
       ;;
     10)
       # Bug-1: exit 10 = TPS below threshold in scripts/bench_cell.sh CT-mode loop.
       echo "[$(date +%T)] CELL RUNTIME_FAIL (tps=0) label=$LABEL" >&2
-      emit_status_record "$KV_CANON" "runtime_fail" "$LABEL" "cell_rc=10 status=runtime_fail"
       printf "%s\t%s\t%s\t%s\t%s\n" "$LABEL" "$KV_CANON" "0.0" "" "runtime_fail" >>"$SUMMARY_FILE"
       ;;
     *)
       # Tail of log helps diagnose.
       echo "[$(date +%T)] CELL FAIL label=$LABEL rc=$CELL_RC (log: $CELL_LOG)" >&2
       tail -15 "$CELL_LOG" >&2 || true
-      emit_status_record "$KV_CANON" "cell_fail" "$LABEL" "cell_rc=$CELL_RC"
       printf "%s\t%s\t%s\t%s\t%s\n" "$LABEL" "$KV_CANON" "" "" "fail_rc${CELL_RC}" >>"$SUMMARY_FILE"
       ;;
   esac
