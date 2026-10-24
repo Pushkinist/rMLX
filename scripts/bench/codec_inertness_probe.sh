@@ -32,7 +32,7 @@
 # Every run is recorded in runs.db by `rmlx baseline --record --run-class
 # diagnostic --label codec_inertness:<ts>:<codec>`, so its rows reach no
 # champion and no gate. The CSV's `recorded_run_class` column says so per row
-# (empty for a run that did not complete), and `codec_inertness_ingest.py`
+# (empty for a run whose record did not reach runs.db), and `codec_inertness_ingest.py`
 # skips such a row rather than write its `kv_cache_bytes` a second time.
 #
 # Usage:
@@ -219,8 +219,10 @@ for codec in "${CODECS[@]}"; do
 		--record --run-class diagnostic --label "codec_inertness:${PROBE_TS}:${codec}" \
 		--log debug >"$raw" 2>&1
 	rc=$?
+	# `baseline` exits 0 when its inline ingest fails too, so the run counts as
+	# recorded only when it says it ingested the record.
 	recorded=""
-	if [[ "$rc" -eq 0 ]]; then
+	if grep -q 'baseline: ingested record into runs.db' "$raw"; then
 		recorded=diagnostic
 	fi
 
