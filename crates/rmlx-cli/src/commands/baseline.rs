@@ -1157,7 +1157,14 @@ pub(crate) fn ingest_buffer_record(
                 inserted = outcome.observation_ids.len(),
                 "{what}: ingested record into runs.db"
             );
-            let _ = std::fs::remove_file(buffer);
+            if let Err(e) = std::fs::remove_file(buffer) {
+                warn!(
+                    error = %e,
+                    buffer = %buffer.display(),
+                    "{what}: the record landed, but its buffer file stays; delete it, do not \
+                     replay it, or its rows are written twice"
+                );
+            }
             Ok(())
         }
         Err(e) => {
