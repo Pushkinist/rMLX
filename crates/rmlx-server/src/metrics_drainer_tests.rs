@@ -146,6 +146,18 @@ fn an_event_for_a_model_with_no_label_is_skipped() {
     assert_eq!(written, 0);
 }
 
+/// A model whose label the metrics DB does not record is dropped once, at
+/// start, like a model with no label: its rows would be refused per event.
+#[test]
+fn only_a_label_the_metrics_db_records_is_kept() {
+    let kept = recordable_labels(BTreeMap::from([
+        ("a".to_owned(), Some("mxfp8".to_owned())),
+        ("b".to_owned(), None),
+        ("c".to_owned(), Some("mxfp6".to_owned())),
+    ]));
+    assert_eq!(kept, BTreeMap::from([("a".to_owned(), "mxfp8".to_owned())]));
+}
+
 // ── PromptTokens / CompletionTokens mapping ────────────────────────
 
 /// `PromptTokens` maps to one `MetricEntry` row with name

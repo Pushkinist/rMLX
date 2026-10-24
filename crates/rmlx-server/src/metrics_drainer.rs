@@ -273,9 +273,9 @@ const FLUSH_INTERVAL_MS: u64 = 100;
 /// `None`, `try_emit` drops at the producer, and the DB is never touched.
 ///
 /// `weight_quants` maps each model id to the weight label its config describes
-/// (`ModelRegistry::weight_quants`). A model with no label is warned about once,
-/// here, and its events are then skipped quietly rather than filed under a
-/// guessed label.
+/// (`ModelRegistry::weight_quants`). A model with no recordable label is warned
+/// about once, here, and its events are then skipped quietly rather than filed
+/// under a guessed label.
 pub fn spawn_drainer(
     db_path: PathBuf,
     weight_quants: BTreeMap<String, Option<String>>,
@@ -287,19 +287,7 @@ pub fn spawn_drainer(
         return DrainerHandle { tx: None, dropped };
     }
 
-    let mut labelled = BTreeMap::new();
-    for (model_id, label) in weight_quants {
-        if let Some(label) = label {
-            labelled.insert(model_id, label);
-        } else {
-            tracing::warn!(
-                model_id = %model_id,
-                "metrics_drainer: the model's config names no weight format, so its \
-                 live-request rows are not recorded"
-            );
-        }
-    }
-
+    let labelled = recordable_labels(weight_quants);
     let (tx, rx) = mpsc::channel::<MetricEvent>(CHANNEL_CAPACITY);
     let dropped_task = Arc::clone(&dropped);
 
@@ -309,6 +297,36 @@ pub fn spawn_drainer(
         tx: Some(tx),
         dropped,
     }
+}
+
+/// The models whose rows can be filed, each with its label. A model with no
+/// label, or one the metrics DB does not record, is warned about once here, and
+/// its events are skipped quietly later.
+fn recordable_labels(weight_quants: BTreeMap<String, Option<String>>) -> BTreeMap<String, String> {
+    use rmlx_metrics::identity::{canonicalize, WEIGHT_QUANT_WHITELIST};
+    let mut labelled = BTreeMap::new();
+    for (model_id, label) in weight_quants {
+        let Some(label) = label else {
+            tracing::warn!(
+                model_id = %model_id,
+                "metrics_drainer: the model's config names no weight format, so its \
+                 live-request rows are not recorded"
+            );
+            continue;
+        };
+        match canonicalize("weight_quant", &label, WEIGHT_QUANT_WHITELIST) {
+            Ok(label) => {
+                labelled.insert(model_id, label);
+            }
+            Err(e) => tracing::warn!(
+                model_id = %model_id,
+                error = %e,
+                "metrics_drainer: the model's weight label is not one the metrics DB \
+                 records, so its live-request rows are not recorded"
+            ),
+        }
+    }
+    labelled
 }
 
 // ── Consumer task ─────────────────────────────────────────────────────────────
