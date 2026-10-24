@@ -37,7 +37,7 @@ use tracing::{info, instrument, warn};
     text_file = %text_file.display(),
     ctx_window,
     stride,
-    corpus,
+    corpus = recording.map_or("", |(corpus, _)| corpus),
     device = ?claimed.device(),
     ?kv_quant,
 ))]
@@ -51,17 +51,16 @@ pub(crate) fn run_ppl(
     text_file: &Path,
     ctx_window: usize,
     stride: usize,
-    corpus: &str,
+    recording: Option<(&str, RunClass)>,
     claimed: &ClaimedDevice,
     max_tokens: usize,
     run_id: &str,
     git_sha: Option<&str>,
-    run_class: Option<RunClass>,
     kv_quant: Option<rmlx_kv_quant::KvQuant>,
 ) -> Result<()> {
     let device = claimed.device();
     // Resolved before any work: a run whose identity cannot be recorded stops here.
-    let identity = if !corpus.is_empty() && rmlx_metrics::mode::observations_enabled() {
+    let identity = if recording.is_some() && rmlx_metrics::mode::observations_enabled() {
         Some(resolve_record_identity(model_path)?)
     } else {
         None
@@ -138,7 +137,7 @@ pub(crate) fn run_ppl(
         "ctx_window": ctx_window,
         "stride": stride,
         "n_tokens": n_tokens,
-        "corpus": corpus,
+        "corpus": recording.map_or("", |(corpus, _)| corpus),
         "model": model_path.display().to_string(),
         "arch": model.arch_class(),
         "load_ms": load_ms,
@@ -149,7 +148,7 @@ pub(crate) fn run_ppl(
     println!("{}", serde_json::to_string(&out)?);
 
     // -- §8.5 universal record -------------------------------------------------
-    if corpus.is_empty() {
+    let Some((corpus, run_class)) = recording else {
         // A run that measured something and stored nothing should say so. The
         // number is on stdout either way, but a sweep whose rows never reach
         // the DB looks exactly like a sweep that did until someone queries for
@@ -160,7 +159,7 @@ pub(crate) fn run_ppl(
              pass --corpus <name> to write it to runs.db"
         );
         return Ok(());
-    }
+    };
     let Some(identity) = identity else {
         info!("ppl: observations disabled, no record written");
         return Ok(());
@@ -217,7 +216,7 @@ struct PplRecordArgs<'a> {
     load_ms: f64,
     score_ms: f64,
     git_sha: Option<&'a str>,
-    run_class: Option<RunClass>,
+    run_class: RunClass,
     kv_quant: Option<rmlx_kv_quant::KvQuant>,
     decode_config: Option<&'a str>,
 }
@@ -298,7 +297,7 @@ fn build_ppl_run_record(
     load_ms: f64,
     score_ms: f64,
     git_sha: Option<&str>,
-    run_class: Option<RunClass>,
+    run_class: RunClass,
     kv_quant: Option<rmlx_kv_quant::KvQuant>,
     decode_config: Option<&str>,
 ) -> Result<serde_json::Value> {

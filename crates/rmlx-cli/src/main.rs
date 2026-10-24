@@ -2718,7 +2718,13 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
                     git_sha: git_sha_ref,
                     run_class,
                 }),
-                _ => None,
+                (false, None) => None,
+                (true, None) => {
+                    anyhow::bail!("--record needs --run-class (gate, ab_arm or diagnostic)")
+                }
+                (false, Some(_)) => {
+                    anyhow::bail!("--run-class names the class of a recorded run; pass --record")
+                }
             };
 
             // Build YARN override from CLI flags. None when yarn_factor is absent.
@@ -2848,9 +2854,9 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
                 kv_group_size,
                 kv_boundary_layers,
             } => {
-                let run_class = match (corpus.is_empty(), run_class) {
+                let recording = match (corpus.is_empty(), run_class) {
                     (true, None) => None,
-                    (false, Some(class)) => Some(class),
+                    (false, Some(class)) => Some((corpus.as_str(), class)),
                     (false, None) => anyhow::bail!(
                         "--corpus records the run, so it needs --run-class (gate, ab_arm or \
                          diagnostic): only gate rows reach bests and the gates"
@@ -2912,12 +2918,11 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
                     &text_file,
                     ctx_window,
                     stride,
-                    &corpus,
+                    recording,
                     &claimed,
                     max_tokens,
                     run_id,
                     git_sha.as_deref(),
-                    run_class,
                     kv_quant_resolved,
                 )?;
             }
