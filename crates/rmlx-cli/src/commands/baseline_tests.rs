@@ -135,6 +135,7 @@ fn build_record_git_sha_survives_stamp_json() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let model_dir = tmp.path().join("m");
     std::fs::create_dir_all(&model_dir).expect("mkdir m");
+    std::fs::write(model_dir.join("config.json"), "{}").expect("write config.json");
 
     let args = BaselineRecordArgs {
         label: None,
@@ -179,6 +180,7 @@ fn build_record_git_sha_absent_is_null() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let model_dir = tmp.path().join("m2");
     std::fs::create_dir_all(&model_dir).expect("mkdir m2");
+    std::fs::write(model_dir.join("config.json"), "{}").expect("write config.json");
 
     let args = BaselineRecordArgs {
         label: None,
@@ -220,6 +222,7 @@ fn build_record_git_sha_blank_string_is_null() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let model_dir = tmp.path().join("m3");
     std::fs::create_dir_all(&model_dir).expect("mkdir m3");
+    std::fs::write(model_dir.join("config.json"), "{}").expect("write config.json");
 
     let args = BaselineRecordArgs {
         label: None,

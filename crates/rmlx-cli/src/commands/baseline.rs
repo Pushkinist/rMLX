@@ -942,12 +942,23 @@ pub(crate) struct RecordIdentity {
 ///
 /// `weight_quant` is derived from the snapshot's quantization config and
 /// checked against the metrics DB's list here, so a value the DB would refuse
-/// stops the run now and not after the measurement.
+/// stops the run now and not after the measurement. A config with no
+/// `quantization` is `bf16`; a missing or unreadable config is refused, since
+/// either would otherwise record a label nothing measured.
 pub(crate) fn resolve_record_identity(model_path: &Path) -> anyhow::Result<RecordIdentity> {
     let (namespace, model) = rmlx_metrics::identity::snapshot_identity(model_path)?;
+    let config_path = model_path.join("config.json");
+    if !config_path.is_file() {
+        anyhow::bail!(
+            "no config.json at {}, so the run's weight_quant cannot be recorded",
+            config_path.display()
+        );
+    }
     let weight_quant = rmlx_loader::load_config(model_path)
-        .ok()
-        .and_then(|c| c.quantization)
+        .map_err(|e| {
+            anyhow::anyhow!("read the snapshot's quantization for the recorded weight_quant: {e}")
+        })?
+        .quantization
         .map_or_else(
             || "bf16".to_string(),
             |q| match q.mode_or_default() {

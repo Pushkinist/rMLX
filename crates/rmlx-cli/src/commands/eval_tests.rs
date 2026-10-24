@@ -5,6 +5,7 @@ fn build_record_includes_ppl_op_name() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let model_dir = tmp.path().join("fake-model");
     std::fs::create_dir_all(&model_dir).expect("mkdir fake-model");
+    std::fs::write(model_dir.join("config.json"), "{}").expect("write config.json");
     let report = ppl::PplReport {
         ppl: 12.34,
         mean_nll: 2.5,
@@ -52,6 +53,7 @@ fn build_record_stamps_identity_from_the_single_source() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let model_dir = tmp.path().join("m");
     std::fs::create_dir_all(&model_dir).expect("mkdir m");
+    std::fs::write(model_dir.join("config.json"), "{}").expect("write config.json");
     let report = ppl::PplReport {
         ppl: 1.0,
         mean_nll: 0.0,
@@ -92,6 +94,7 @@ fn build_record_git_sha_absent_is_null() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let model_dir = tmp.path().join("m2");
     std::fs::create_dir_all(&model_dir).expect("mkdir m2");
+    std::fs::write(model_dir.join("config.json"), "{}").expect("write config.json");
     let report = ppl::PplReport {
         ppl: 1.0,
         mean_nll: 0.0,
@@ -125,6 +128,7 @@ fn build_record_git_sha_blank_string_is_null() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let model_dir = tmp.path().join("m3");
     std::fs::create_dir_all(&model_dir).expect("mkdir m3");
+    std::fs::write(model_dir.join("config.json"), "{}").expect("write config.json");
     let report = ppl::PplReport {
         ppl: 1.0,
         mean_nll: 0.0,
@@ -160,6 +164,7 @@ fn build_record_reports_the_codec_and_boundary_it_scored_at() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let model_dir = tmp.path().join("m4");
     std::fs::create_dir_all(&model_dir).expect("mkdir m4");
+    std::fs::write(model_dir.join("config.json"), "{}").expect("write config.json");
     let report = ppl::PplReport {
         ppl: 1.0,
         mean_nll: 0.0,
@@ -229,6 +234,7 @@ fn the_scorer_mode_is_not_a_decode_config_term() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let model_dir = tmp.path().join("m5");
     std::fs::create_dir_all(&model_dir).expect("mkdir m5");
+    std::fs::write(model_dir.join("config.json"), "{}").expect("write config.json");
     let report = ppl::PplReport {
         ppl: 1.0,
         mean_nll: 0.0,
@@ -339,4 +345,39 @@ fn record_identity_carries_the_snapshot_weight_quant() {
         ),
         ("host", "m", "4bit")
     );
+}
+
+#[test]
+fn record_identity_of_a_snapshot_with_no_config_is_refused() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model_dir = tmp.path().join("host__m");
+    std::fs::create_dir_all(&model_dir).expect("mkdir snapshot");
+    let err = resolve_record_identity(&model_dir)
+        .err()
+        .expect("a snapshot with no config.json has no weight_quant to record");
+    let msg = err.to_string();
+    assert!(msg.contains("no config.json"), "{msg}");
+}
+
+#[test]
+fn record_identity_of_a_snapshot_whose_config_does_not_parse_is_refused() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model_dir = tmp.path().join("host__m");
+    std::fs::create_dir_all(&model_dir).expect("mkdir snapshot");
+    std::fs::write(model_dir.join("config.json"), "{ not json").expect("write config.json");
+    let err = resolve_record_identity(&model_dir)
+        .err()
+        .expect("an unreadable config is not an unquantized snapshot");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("malformed config.json"), "{msg}");
+}
+
+#[test]
+fn record_identity_of_a_config_without_quantization_is_bf16() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model_dir = tmp.path().join("host__m");
+    std::fs::create_dir_all(&model_dir).expect("mkdir snapshot");
+    std::fs::write(model_dir.join("config.json"), "{}").expect("write config.json");
+    let id = resolve_record_identity(&model_dir).expect("identity");
+    assert_eq!(id.weight_quant, "bf16");
 }
