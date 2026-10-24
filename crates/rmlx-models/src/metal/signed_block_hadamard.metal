@@ -33,9 +33,10 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 //
-// T, N, WIDTH and INVERSE are MLX template arguments; scale is a 0-D f32
-// input, which MLX declares as `constant float&`.
-constexpr int MAX_RADIX   = N < 16 ? N : 16;
+// T, N, WIDTH, INVERSE and RADIX are MLX template arguments; scale is a 0-D
+// f32 input, which MLX declares as `constant float&`. The host sizes the
+// threadgroup from the same RADIX.
+constexpr int MAX_RADIX   = N < RADIX ? N : RADIX;
 constexpr int READ_WIDTH  = MAX_RADIX < 4 ? MAX_RADIX : 4;
 constexpr int NUM_THREADS = N / MAX_RADIX;
 constexpr int LOG_N       = __builtin_ctz(N);

@@ -23,6 +23,6 @@ gated_delta_step.metal | - | q:f,k:f,v:f,g:f,beta:f,state_in:f,y:f,state_out:f |
 # what has to resolve.
 paroquant_rotate.metal | - | x:f,packed_pairs:u,cos_theta:f,sin_theta:f,channel_scales:f,params:u,out:f | ROWS_PER_TILE=4,MAX_KROT=16,MAX_GROUP_SIZE=256,InT=float
 # N and WIDTH are Ternary-Bonsai-2-27B's block and hidden size; scale is
-# 1 / sqrt(N). Forward only: INVERSE selects where the signs apply, not what
-# has to resolve.
-signed_block_hadamard.metal | ../hadamard_header.metal | x:b,signs:f,out:b | T=bfloat,N=1024,WIDTH=5120,INVERSE=0,scale=0.03125f
+# 1 / sqrt(N); RADIX is the radix the host dispatches with. Forward only:
+# INVERSE selects where the signs apply, not what has to resolve.
+signed_block_hadamard.metal | ../hadamard_header.metal | x:b,signs:f,out:b | T=bfloat,N=1024,WIDTH=5120,INVERSE=0,RADIX=16,scale=0.03125f

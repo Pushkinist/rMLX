@@ -23,8 +23,9 @@ const HEADER: &str = include_str!("metal/hadamard_header.metal");
 const SOURCE: &str = include_str!("metal/signed_block_hadamard.metal");
 
 /// The kernel's radix, as MLX chooses it: a thread holds 16 values, so a block
-/// runs on `block / 16` threads. The body derives the same radix from `N`.
-const MAX_RADIX: usize = 16;
+/// runs on `block / 16` threads. Passed to the body as its `RADIX` template
+/// argument, so the threadgroup size and the body's radix are one value.
+const RADIX: usize = 16;
 
 static KERNEL: OnceLock<Result<MetalKernel>> = OnceLock::new();
 
@@ -70,7 +71,7 @@ pub(crate) fn signed_block_hadamard_gpu(
             .map_err(|_| Error::Mlx(format!("signed block Hadamard {what} {v} exceeds i32")))
     };
     let blocks = to_i32("block count", elements / block as i64)?;
-    let threads = to_i32("threadgroup size", (block / block.min(MAX_RADIX)) as i64)?;
+    let threads = to_i32("threadgroup size", (block / block.min(RADIX)) as i64)?;
 
     let mut invoke = MetalKernelInvoke::new();
     invoke.add_input(x)?;
@@ -81,6 +82,7 @@ pub(crate) fn signed_block_hadamard_gpu(
     invoke.set_template_int("N", to_i32("block", block as i64)?)?;
     invoke.set_template_int("WIDTH", width)?;
     invoke.set_template_int("INVERSE", i32::from(direction == Direction::Inverse))?;
+    invoke.set_template_int("RADIX", to_i32("radix", RADIX as i64)?)?;
     invoke.set_grid(threads, blocks, 1)?;
     invoke.set_thread_group(threads, 1, 1)?;
 
