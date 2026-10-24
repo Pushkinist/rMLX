@@ -340,6 +340,28 @@ recorded="$(grep -c -- '--record --run-class diagnostic --label ctype-smoke-' "$
 	bad="$recorded of $probes smoke probes asked to record as diagnostic: $(head -1 "$ARGV_LOG")"
 verdict cache_types_smoke_records_diagnostic "every smoke probe records as diagnostic" "$bad"
 
+# A smoke probe that measured fluent text and whose record did not land: the
+# cell is measured, not skipped, and the run ends 75. The cell driver is a stub.
+cat >"$FAKE/target/release/rmlx" <<'STUB'
+#!/usr/bin/env bash
+echo "baseline: model=stub decode_tps=10.0"
+echo "output: The sun rises slowly over the quiet hills each morning."
+echo "error: baseline: measured, but the record did not reach runs.db; it is kept at /x/pending/smoke.json for \`rmlx metrics record --replay-pending\`" >&2
+exit 75
+STUB
+rm "$FAKE/scripts/bench_cell.sh"
+printf '#!/usr/bin/env bash\necho "CELL DONE median=10.0 stddev=0.1 kv=auto" >&2\n' >"$FAKE/scripts/bench_cell.sh"
+set +e
+RMLX_HOME="$WORK/home" bash "$FAKE/scripts/bench_cache_types.sh" "$MODEL" Stub >"$WORK/cache_types_pending.out" 2>&1
+status=$?
+set -e
+bad=""
+[ "$status" -eq 75 ] || bad="exit=$status (want 75)"
+grep -q 'record pending: /x/pending/smoke.json' "$WORK/cache_types_pending.out" || bad="${bad:+$bad; }the buffer file is not named"
+grep -q 'CELL OK' "$WORK/cache_types_pending.out" || bad="${bad:+$bad; }no cell was measured"
+! grep -q 'baseline_exit_75' "$WORK/cache_types_pending.out" || bad="${bad:+$bad; }a pending record was read as a failed smoke"
+verdict cache_types_smoke_with_a_pending_record_is_measured "a smoke probe whose record did not land still lets its cell run; the run ends 75" "$bad"
+
 # The codec smoke runner reaches `rmlx baseline` through `cargo run`; a stub
 # `cargo` logs what it was handed and builds nothing.
 SMOKE_ROOT="$WORK/smoke_models"

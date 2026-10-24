@@ -72,6 +72,10 @@ elif [ "$PROMPT_TOKENS" -le 16384 ]; then CTX_MAX_DEFAULT=32768
 else CTX_MAX_DEFAULT=$((PROMPT_TOKENS * 2)); fi
 
 RMLX_DIR=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source=scripts/lib/record_pending.sh
+. "$RMLX_DIR/scripts/lib/record_pending.sh"
+# Smoke probes that measured and whose diagnostic record did not land.
+SMOKE_RECORDS_PENDING=0
 RMLX_BIN="$RMLX_DIR/target/release/rmlx"
 
 if [ ! -x "$RMLX_BIN" ]; then
@@ -189,6 +193,13 @@ run_smoke_probe() {
 
   ( cd "$RMLX_DIR" && "$RMLX_BIN" "${args[@]}" ) >"$smoke_log" 2>&1
   local rc=$?
+  # A probe that measured and whose record did not land is judged on its
+  # output like any other; the buffer file is named and the run ends non-zero.
+  if [ "$rc" -eq "$RECORD_PENDING_EXIT" ]; then
+    record_pending_note "$smoke_log"
+    SMOKE_RECORDS_PENDING=$((SMOKE_RECORDS_PENDING + 1))
+    rc=0
+  fi
   if [ "$rc" -ne 0 ]; then
     SMOKE_REASON="baseline_exit_${rc}"
     # Pass through exit 78 (unsupported combo) to caller via SMOKE_REASON.
@@ -372,4 +383,8 @@ column -t -s "$(printf '\t')" "$SUMMARY_FILE" >&2 || cat "$SUMMARY_FILE" >&2
 echo "" >&2
 echo "(summary file: $SUMMARY_FILE)" >&2
 
+if [ "$SMOKE_RECORDS_PENDING" -gt 0 ]; then
+  echo "INCOMPLETE: $SMOKE_RECORDS_PENDING smoke record(s) pending (named above); the cells stand" >&2
+  exit "$RECORD_PENDING_EXIT"
+fi
 exit 0
