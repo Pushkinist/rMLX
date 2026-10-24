@@ -322,6 +322,21 @@ grep -q -- 'baseline .*--prompt-label coherence .*--record --run-class diagnosti
 	bad="baseline argv: $(grep baseline "$ARGV_LOG" | head -1); $(tail -2 "$WORK/smoke.out" | tr '\n' ' ')"
 verdict codec_smoke_records_diagnostic "each smoke prompt's baseline records as diagnostic" "$bad"
 
+# A recorder whose help fails is reported as failing, not as an old binary.
+BROKEN_RECORDER="$WORK/rmlx_broken"
+printf '#!/usr/bin/env bash\necho "dyld: library not loaded" >&2\nexit 2\n' >"$BROKEN_RECORDER"
+chmod +x "$BROKEN_RECORDER"
+set +e
+out="$(RMLX_HOME="$WORK/llama_home3" RMLX_REPO_ROOT="$WORK/llama_root" \
+	python3 "$REPO_ROOT/scripts/ingest/llama_bench_ingest.py" "$WORK/llama_bench.json" --record \
+	--rmlx-bin "$BROKEN_RECORDER" 2>&1)"
+set -e
+bad=""
+grep -q 'metrics record --help` failed (exit 2): dyld: library not loaded' <<<"$out" ||
+	bad="the refusal does not say the help failed: $out"
+! grep -q 'built before the run class' <<<"$out" || bad="${bad:+$bad; }a failing recorder is called an old one"
+verdict recorder_whose_help_fails_is_reported_as_failing "a recorder whose --help exits non-zero is reported as failing" "$bad"
+
 # ── snapshot_identity.py against the shared label table ──────────────────────
 #
 # The Rust producer, `ModelConfig::weight_quant_label`, is held to the same

@@ -23,6 +23,11 @@ def require_run_class_recorder(rmlx_bin: str) -> None:
         )
     except OSError as exc:
         raise SystemExit(f"cannot run the recorder {rmlx_bin}: {exc}") from None
+    if out.returncode != 0:
+        raise SystemExit(
+            f"`{rmlx_bin} metrics record --help` failed (exit {out.returncode}): "
+            f"{out.stderr.strip()}"
+        )
     if "--run-class" not in out.stdout:
         raise SystemExit(
             f"the recorder {rmlx_bin} has no `metrics record --run-class`: it was built "
