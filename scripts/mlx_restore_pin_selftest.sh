@@ -11,6 +11,9 @@
 # it names. A case can put its own stubs in <case>/bin, which comes first on
 # PATH. No case reads or changes the real Homebrew prefix.
 #
+# Blind spot: the stub reads only the name and version pairs of the Ruby handed
+# to `brew ruby`, so that Ruby's unpin, unlink and exact-keg lines are not run.
+#
 # Portable to GNU and BSD userlands: the hosted CI runs it on Linux.
 
 set -uo pipefail
@@ -28,7 +31,8 @@ NEWER_V=9.9.10
 
 # The stub `brew`. It logs every call and changes only the prefix it is given.
 # `brew.fail` in the prefix makes every call fail; `brew.newest` makes a
-# `brew ruby` link the newest keg instead of the one it names. A `brew ruby`
+# `brew ruby` link the newest keg instead of the one it names; `brew.no-linked`
+# makes it leave the `linked` record out. A `brew ruby`
 # call made while the restore holds its lock says so.
 mkdir -p "$ST_WORK/bin"
 cat >"$ST_WORK/bin/brew" <<'STUB'
@@ -51,7 +55,7 @@ ruby)
 		[ -f "$P/brew.newest" ] && version=$(newest "$name")
 		rm -f "$P/var/homebrew/pinned/$name" "$P/var/homebrew/linked/$name"
 		record opt "$name" "$version"
-		record var/homebrew/linked "$name" "$version"
+		[ -f "$P/brew.no-linked" ] || record var/homebrew/linked "$name" "$version"
 		record var/homebrew/pinned "$name" "$version"
 	done <<<"$pairs"
 	;;
@@ -354,6 +358,18 @@ mkdir -p "$c/prefix/Cellar/mlx/$MLX_V"
 keg "$c/prefix/Cellar" mlx-c "$MLXC_V" yes
 expect "an empty keg directory is not overwritten" "$c" 1 "has no lib/libmlx.dylib"
 
+c=$(new_case cellar-no-metallib)
+keg "$c/prefix/Cellar" mlx "$MLX_V" yes lib/mlx.metallib
+keg "$c/prefix/Cellar" mlx-c "$MLXC_V" yes
+expect "a keg in the Cellar without mlx.metallib is refused" "$c" 1 \
+	"has no lib/mlx.metallib, or the file is empty. Remove that directory, then run this again"
+
+c=$(new_case cellar-no-version-h)
+keg "$c/prefix/Cellar" mlx "$MLX_V" yes include/mlx/version.h
+keg "$c/prefix/Cellar" mlx-c "$MLXC_V" yes
+expect "a keg in the Cellar without version.h is refused" "$c" 1 \
+	"has no include/mlx/version.h, or the file is empty. Remove that directory, then run this again"
+
 c=$(new_case cellar-no-header)
 keg "$c/prefix/Cellar" mlx "$MLX_V" yes
 keg "$c/prefix/Cellar" mlx-c "$MLXC_V" yes include/mlx/c/fast.h
@@ -376,6 +392,14 @@ keg "$c/prefix/Cellar" mlx-c "$MLXC_V" yes
 touch "$c/prefix/brew.newest"
 expect "a link that leaves a record on another keg is a failure" "$c" 1 \
 	"$c/prefix/opt/mlx resolves to '$(cd "$c/prefix/Cellar/mlx/$NEWER_V" && pwd -P)'
+run make mlx-restore-pin again"
+
+c=$(new_case links-no-linked-record)
+keg "$c/prefix/Cellar" mlx "$MLX_V" yes
+keg "$c/prefix/Cellar" mlx-c "$MLXC_V" yes
+touch "$c/prefix/brew.no-linked"
+expect "a link that leaves no linked record is a failure" "$c" 1 \
+	"$c/prefix/var/homebrew/linked/mlx resolves to 'nothing'
 run make mlx-restore-pin again"
 
 st_done
