@@ -20,7 +20,8 @@ st_init() {
 	ST_FAILED=0
 	ST_OUT=""
 	ST_RC=0
-	ST_WORK="$(mktemp -d "${TMPDIR:-/tmp}/${1}.XXXXXX")" || {
+	local tmp="${TMPDIR:-/tmp}"
+	ST_WORK="$(mktemp -d "${tmp%/}/${1}.XXXXXX")" || {
 		echo "${1}: cannot make a scratch directory" >&2
 		exit 2
 	}
@@ -51,15 +52,17 @@ st_run() {
 	ST_RC=$?
 }
 
-# st_check <want-exit> [--has S]... [--lacks S]... — judge the last st_run:
-# print one reason per line for each condition that fails, nothing when all
-# hold. --has and --lacks match fixed strings anywhere in the output.
+# st_check <want-exit> [--has S]... [--lacks S]... [--is S] — judge the last
+# st_run: print one reason per line for each condition that fails, nothing when
+# all hold. --has and --lacks match fixed strings anywhere in the output; --is
+# wants the whole output to equal S.
 st_check() {
 	local want="$1"
 	shift
 	[ "$ST_RC" -eq "$want" ] || echo "exit $ST_RC, want $want"
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
+		--is) [ "$ST_OUT" = "${2-}" ] || echo "output is '$ST_OUT', want '${2-}'" ;;
 		--has) grep -qF -- "${2-}" <<<"$ST_OUT" || echo "no '${2-}' in the output" ;;
 		--lacks) ! grep -qF -- "${2-}" <<<"$ST_OUT" || echo "'${2-}' is in the output" ;;
 		*) echo "st_check: unknown option '$1'" ;;
@@ -84,8 +87,8 @@ st_verdict() {
 	ST_OUT=""
 }
 
-# st_case <name> <want-exit> [--what S] [--has S]... [--lacks S]... -- <cmd...>
-# — run the command and hold it to an exact exit code and to lines of output.
+# st_case <name> <want-exit> [--what S] [--has S]... [--lacks S]... [--is S]
+# -- <cmd...> — run the command and hold it to an exact exit code and to its output.
 st_case() {
 	local name="$1" want="$2" what="" checks=()
 	shift 2
