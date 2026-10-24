@@ -166,7 +166,11 @@ arm-reading guards still apply.
 The boundary lives in `scripts/lib/cpu_snapshot.sh`, as `snapshot_ok` and
 `window_not_sampled`. `scripts/bench_llama_ab.sh` takes the same
 `--synthetic-arms` flag through it. Its result file carries `synthetic_arms`,
-and `scripts/ingest/llama_ab_ingest.py` refuses that result with no waiver.
+and `scripts/ingest/llama_ab_ingest.py` refuses that result with no waiver. A
+real `bench_llama_ab.sh` run ends by handing its result to that ingest, which
+records both arms as `ab_arm` rows under the identity `--record-args` carries;
+`--keep-arm A|B` on a second run of the ingest records the surviving arm as
+`gate`.
 
 **Interference measurement.** The figure is the change in a process's
 cumulative CPU time across a known window, per slot and across the whole
@@ -195,12 +199,12 @@ gate (`docs/METRICS_DB.md` §13). Find one run's rows with
 through `baseline --help`, whether it has `--run-class`: an arm built before
 the run class runs `--metrics off` and records nothing, and the report says so
 per arm. A `--synthetic-arms` run passes `--metrics off` to every slot and
-records nothing. Promoting an accepted
-comparison is a separate step: `scripts/ingest/perf_ab_ingest.py --run-class
-<class>` turns one result file into two `docs/METRICS_DB.md` §8.5 RunRecords
-(`decode_tps_warm`, `kv_cache_bytes`), `gate` for arms that are kept cells. It
-refuses a TAINTED run unless told otherwise, and carries the taint text into
-`notes`.
+records nothing. Promoting the surviving
+arm is a separate step: `scripts/ingest/perf_ab_ingest.py --keep-arm A|B`
+turns one result file into one `gate` RunRecord (`docs/METRICS_DB.md` §8.5;
+`decode_tps_warm`, `kv_cache_bytes`) for that arm, whose slots are already
+`ab_arm` rows. It refuses a TAINTED run unless told otherwise, and carries the
+taint text into `notes`.
 
 The result lands in `$RMLX_HOME/bench/perf_ab/<timestamp>.json`, with the
 host conditions, the statistics and the binary digests. Each slot is a full

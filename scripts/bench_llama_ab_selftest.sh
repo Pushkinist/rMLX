@@ -116,10 +116,16 @@ KV_OK='llama_kv_cache:       MTL0 KV buffer size =   512.00 MiB'
 # Stands in for `rmlx claim run -- <command>`: runs the command as its child,
 # passes SIGTERM on, and exits with the child's status, so the harness's
 # wrapper-versus-server bookkeeping is exercised without a real claim. Each use
-# is recorded, so a case can tell that every slot ran under it.
+# is recorded, so a case can tell that every slot ran under it. It also stands
+# in for `rmlx metrics record --file <record>`, logging the class of each
+# record it is handed instead of writing a DB.
 CLAIM_STUB="$WORK/claim_rmlx"
 cat >"$CLAIM_STUB" <<STUB
 #!/usr/bin/env bash
+if [ "\$1 \$2 \$3" = "metrics record --file" ]; then
+    python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r["run_class"], r["backend"])' "\$4" >>"$WORK/recorded"
+    exit 0
+fi
 [ "\$1 \$2 \$3" = "claim run --" ] || { echo "claim stub: unexpected argv \$*" >&2; exit 2; }
 shift 3
 echo "\$\$" >>"$WORK/claim_runs"
@@ -162,6 +168,9 @@ SYNTHETIC_CASES=0
 REAL_HOST_CASES=0
 HOST_READING_CASES=0
 RUN_SEQ=0
+# The identity a real run hands its ingest. Under --synthetic-arms it is not
+# needed, and a REALHOST case can drop it with NO_RECORD_ARGS=1.
+RECORD_ARGS_REAL="--model stub --weight-quant q8_0 --arm-a-backend llama_cpp --arm-b-backend llama_cpp_tq --arm-a-kv-quant none --arm-b-kv-quant turbo3 --prompt-name selftest"
 
 run_ab() { # [REALHOST:<shim-dir>] <extra args...> -> stdout+stderr in $OUT, code in $CODE
 	local host_shim="" boundary=(--synthetic-arms)
@@ -176,6 +185,9 @@ run_ab() { # [REALHOST:<shim-dir>] <extra args...> -> stdout+stderr in $OUT, cod
 			return
 		fi
 		REAL_HOST_CASES=$((REAL_HOST_CASES + 1))
+		if [ -z "${NO_RECORD_ARGS:-}" ]; then
+			boundary=(--record-args "$RECORD_ARGS_REAL")
+		fi
 	else
 		SYNTHETIC_CASES=$((SYNTHETIC_CASES + 1))
 	fi
@@ -355,6 +367,18 @@ chmod +x "$HELD_CLAIM"
 run_ab --bin-a "$STUB_A" --bin-b "$STUB_B" --pairs 2 --allow-busy-host --claim-rmlx "$HELD_CLAIM"
 check "a held Metal claim fails the slot with exit 11" 125 "server-not-ready (exit 11"
 
+# --- a --synthetic-arms run records nothing ----------------------------------
+#
+# Every case above that ran a comparison declared its arms synthetic, so none
+# of them may have handed a record to the recorder.
+if [ -s "$WORK/recorded" ]; then
+	echo "  FAIL  a --synthetic-arms run handed records to the recorder"
+	FAIL=$((FAIL + 1))
+else
+	echo "  PASS  no --synthetic-arms run handed a record to the recorder"
+	PASS=$((PASS + 1))
+fi
+
 # --- the same three verdicts, with the taint path forced --------------------
 #
 # The point of the three cases above is that the verdict is a property of the
@@ -373,8 +397,21 @@ check "...and a forced taint really did taint" 125 "TAINTED"
 run_ab "$HOST" --bin-a "$STUB_A" --bin-b "$STUB_B" --pairs 2 --allow-busy-host
 check_verdict "SEPARATED-WEAK survives a tainted host" 125 "SEPARATED-WEAK n=2-per-arm"
 
+# --- a real run records both arms as ab_arm rows ----------------------------
+: >"$WORK/recorded"
 run_ab "$HOST" --bin-a "$STUB_A" --bin-b "$STUB_B" --pairs 3 --allow-busy-host
 check_verdict "SEPARATED survives a tainted host" 125 "SEPARATED 0."
+RECORDED="$(sort "$WORK/recorded" | tr '\n' ' ')"
+if [ "$RECORDED" = "ab_arm llama_cpp ab_arm llama_cpp_tq " ]; then
+	echo "  PASS  a real run, tainted included, records each arm once as ab_arm"
+	PASS=$((PASS + 1))
+else
+	echo "  FAIL  a real run should record each arm once as ab_arm (recorded: ${RECORDED:-nothing})"
+	FAIL=$((FAIL + 1))
+fi
+
+NO_RECORD_ARGS=1 run_ab "$HOST" --bin-a "$STUB_A" --bin-b "$STUB_B" --pairs 2 --allow-busy-host
+check "a real run without --record-args is refused before any slot" 125 "missing required --record-args"
 
 unset FORCE_UNMEASURED_ROWS
 
@@ -404,7 +441,7 @@ if [ -n "$SYNTH_RESULT" ] && [ -r "$SYNTH_RESULT" ]; then
 	INGEST_OUT="$(python3 "$ROOT/scripts/ingest/llama_ab_ingest.py" --dry-run "$SYNTH_RESULT" \
 		--prompt-file "$PROMPT" --prompt-name selftest --model stub \
 		--weight-quant mxfp8 --arm-a-backend llama.cpp --arm-b-backend llama.cpp \
-		--arm-a-kv-quant none --arm-b-kv-quant none --run-class gate 2>&1)"
+		--arm-a-kv-quant none --arm-b-kv-quant none 2>&1)"
 	INGEST_CODE=$?
 	if [ "$INGEST_CODE" -eq 2 ] && grep -q "no waiver for this" <<<"$INGEST_OUT"; then
 		echo "  PASS  a --synthetic-arms result is refused by the promoter, with no waiver"
@@ -419,12 +456,12 @@ else
 	FAIL=$((FAIL + 1))
 fi
 
-# --- the harness must never write runs.db ------------------------------------
+# --- the harness writes runs.db only through the recorder --------------------
 if find "$WORK/home" -name 'runs.db*' -print -quit 2>/dev/null | grep . >/dev/null; then
-	echo "  FAIL  harness wrote a metrics DB"
+	echo "  FAIL  harness wrote a metrics DB around the recorder"
 	FAIL=$((FAIL + 1))
 else
-	echo "  PASS  no metrics DB written"
+	echo "  PASS  no metrics DB written around the recorder"
 	PASS=$((PASS + 1))
 fi
 

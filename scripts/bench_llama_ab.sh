@@ -36,8 +36,15 @@
 #   * Spread is reported, never hidden. When the two arms' [min,max] ranges
 #     overlap the verdict is INCONCLUSIVE, whatever the medians say.
 #
-# NEVER WRITES TO runs.db. An A/B run is an experiment. Feed an accepted cell
-# to `rmlx metrics record --file` yourself, from the emitted JSON.
+# EVERY REAL RUN IS RECORDED. At the end of a comparison that is not
+# `--synthetic-arms`, the result is handed to `ingest/llama_ab_ingest.py`, which
+# writes both arms as `ab_arm` records: they reach no champion and no gate
+# (docs/METRICS_DB.md section 13). A TAINTED run is recorded too, with the taint
+# in `notes`. The identity of the rows (model label, weight quant, each arm's
+# backend and codec, prompt name) is not something a llama-server reports, so
+# `--record-args` carries it, verbatim, to the ingest; a real run without it is
+# refused before the first slot. Promoting the surviving arm as `gate` is a
+# second, explicit run of the ingest with `--keep-arm A|B`.
 #
 # MEASUREMENT VS LOGIC
 #
@@ -77,6 +84,7 @@ SYNTHETIC_ARMS=false
 READY_TIMEOUT=600
 OUT_DIR="${RMLX_HOME}/bench/llama_ab"
 CLAIM_RMLX="${REPO_ROOT}/target/release-perf/rmlx"
+RECORD_ARGS=""
 
 usage() {
 	cat <<'USAGE'
@@ -104,8 +112,14 @@ bench_llama_ab.sh --bin-a P --bin-b P --model GGUF --prompt-file F [options]
   --ready-timeout S        seconds to wait for /health per slot (default 600)
   --out-dir PATH           JSON result directory (default $RMLX_HOME/bench/llama_ab)
   --claim-rmlx PATH        the rmlx binary each slot's server runs under, as
-                           `rmlx claim run`, so it holds the Metal claim
-                           (default target/release-perf/rmlx)
+                           `rmlx claim run`, so it holds the Metal claim, and
+                           that records the run (default target/release-perf/rmlx)
+  --record-args STR        identity flags for ingest/llama_ab_ingest.py, which
+                           records both arms as ab_arm rows at the end of a real
+                           run: --model, --weight-quant, --arm-a-backend,
+                           --arm-b-backend, --arm-a-kv-quant, --arm-b-kv-quant,
+                           --prompt-name, and any of its optional flags.
+                           Required unless --synthetic-arms.
 USAGE
 }
 
@@ -133,6 +147,7 @@ while [ $# -gt 0 ]; do
 	--ready-timeout) need_value "$1" $#; READY_TIMEOUT="$2"; shift 2 ;;
 	--out-dir) need_value "$1" $#; OUT_DIR="$2"; shift 2 ;;
 	--claim-rmlx) need_value "$1" $#; CLAIM_RMLX="$2"; shift 2 ;;
+	--record-args) need_value "$1" $#; RECORD_ARGS="$2"; shift 2 ;;
 	-h | --help) usage; exit 0 ;;
 	*) echo "unknown argument: $1" >&2; usage >&2; exit 125 ;;
 	esac
@@ -142,6 +157,12 @@ done
 [ -n "$BIN_B" ] || { echo "missing required --bin-b" >&2; exit 125; }
 [ -n "$MODEL" ] || { echo "missing required --model" >&2; exit 125; }
 [ -n "$PROMPT_FILE" ] || { echo "missing required --prompt-file" >&2; exit 125; }
+if ! $SYNTHETIC_ARMS && [ -z "$RECORD_ARGS" ]; then
+	echo "missing required --record-args: a real run records both arms as ab_arm rows," >&2
+	echo "  and the rows' identity (model label, weight quant, each arm's backend and" >&2
+	echo "  codec, prompt name) is not something llama-server reports." >&2
+	exit 125
+fi
 [ -x "$CLAIM_RMLX" ] || { echo "no rmlx binary at $CLAIM_RMLX (make build-perf, or --claim-rmlx)" >&2; exit 125; }
 for f in "$BIN_A" "$BIN_B" "$MODEL" "$PROMPT_FILE"; do
 	[ -e "$f" ] || { echo "not found: $f" >&2; exit 125; }
@@ -550,6 +571,16 @@ echo "verdict    $VERDICT   (B/A on medians)"
 echo "result     $RESULT"
 if $SYNTHETIC_ARMS; then
 	echo "host       not sampled (--synthetic-arms): stub arms, so nothing above measures this machine or any model"
+else
+	# A failed ingest leaves the result file; the verdict below is unchanged.
+	# shellcheck disable=SC2086  # RECORD_ARGS is a deliberate word list
+	if python3 "${REPO_ROOT}/scripts/ingest/llama_ab_ingest.py" "$RESULT" \
+		--prompt-file "$PROMPT_FILE" --accept-tainted --record \
+		--rmlx-bin "$CLAIM_RMLX" $RECORD_ARGS >&2; then
+		echo "recorded   both arms as ab_arm rows in runs.db"
+	else
+		echo "recorded   NOTHING: the ingest failed; re-run scripts/ingest/llama_ab_ingest.py on $RESULT" >&2
+	fi
 fi
 if [ -n "$TAINT" ]; then
 	echo "TAINTED    ${TAINT%; }"

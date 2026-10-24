@@ -83,18 +83,21 @@ PY
 	echo "$path"
 }
 
-# check <name> <want-exit> <what-it-proves> <result-file> [extra args...] [GREP:pat] [NOCLASS]
+# check <name> <want-exit> <what-it-proves> <result-file> [extra args...] [GREP:pat] [NOGREP:pat] [NOARM]
 #
-# Every case passes `--run-class gate` unless it says NOCLASS.
+# Every case keeps arm A (`--keep-arm A`) unless it passes its own `--keep-arm`
+# or says NOARM.
 check() {
 	local name="$1" want="$2" what="$3" result="$4"
 	shift 4
-	local args=() greps=() class=(--run-class gate)
+	local args=() greps=() keep=(--keep-arm A)
 	local a
 	for a in "$@"; do
 		case "$a" in
 		GREP:*) greps+=("${a#GREP:}") ;;
-		NOCLASS) class=() ;;
+		NOGREP:*) greps+=("!${a#NOGREP:}") ;;
+		NOARM) keep=() ;;
+		--keep-arm) keep=() ; args+=("$a") ;;
 		*) args+=("$a") ;;
 		esac
 	done
@@ -103,7 +106,7 @@ check() {
 	python3 "$SCRIPT" --dry-run "$result" \
 		--model snap --model-namespace mlx-community --weight-quant mxfp8 \
 		--arm-a-kv-quant none --arm-b-kv-quant mixed_k8g64_v4g64 \
-		--rmlx-bin "$STUB" ${class[@]+"${class[@]}"} ${args[@]+"${args[@]}"} >"$out" 2>&1
+		--rmlx-bin "$STUB" ${keep[@]+"${keep[@]}"} ${args[@]+"${args[@]}"} >"$out" 2>&1
 	got=$?
 	set -e
 
@@ -111,7 +114,11 @@ check() {
 	[[ "$got" -ne "$want" ]] && bad="exit=$got (want $want)"
 	local g
 	for g in ${greps[@]+"${greps[@]}"}; do
-		grep -qE "$g" "$out" || bad="${bad:+$bad; }missing: $g"
+		if [[ "$g" == !* ]]; then
+			! grep -qE "${g#!}" "$out" || bad="${bad:+$bad; }unexpected: ${g#!}"
+		else
+			grep -qE "$g" "$out" || bad="${bad:+$bad; }missing: $g"
+		fi
 	done
 	if [[ -z "$bad" ]]; then
 		PASSED=$((PASSED + 1))
@@ -127,9 +134,9 @@ echo "perf_ab_ingest selftest: refusal checks"
 
 CLEAN="$(make_result clean)"
 check accepts_a_clean_result 0 \
-	"a clean result produces two records" "$CLEAN" \
+	"a clean result produces one record, the kept arm's" "$CLEAN" \
 	"GREP:\"kv_quant\": \"none\"" \
-	"GREP:\"kv_quant\": \"mixed_k8g64_v4g64\"" \
+	"NOGREP:\"kv_quant\": \"mixed_k8g64_v4g64\"" \
 	"GREP:\"prompt_tokens\": 3770"
 
 # --- the taint / waiver family ------------------------------------------------
@@ -220,15 +227,18 @@ check kv_refusal_records_null_not_zero 0 \
 	"an arm with no residency figure records null, never 0" "$REFUSED" \
 	"GREP:\"value\": null"
 
-# --- run class ---------------------------------------------------------------
+# --- the kept arm -------------------------------------------------------------
 
-check class_reaches_both_records 0 \
-	"the stated class is on each arm's record" "$CLEAN" \
-	"GREP:\"run_class\": \"gate\""
+check keep_arm_writes_one_gate_record 0 \
+	"only the kept arm is written, as gate; its slots were already ab_arm rows" "$CLEAN" \
+	--keep-arm B \
+	"GREP:\"kv_quant\": \"mixed_k8g64_v4g64\"" \
+	"GREP:\"run_class\": \"gate\"" \
+	"NOGREP:\"kv_quant\": \"none\""
 
-check class_is_required 2 \
-	"the promoter does not choose a class for the caller" "$CLEAN" \
-	NOCLASS "GREP:required: --run-class"
+check keep_arm_is_required 2 \
+	"the promoter does not choose the surviving arm for the caller" "$CLEAN" \
+	NOARM "GREP:required: --keep-arm"
 
 # --- shape -------------------------------------------------------------------
 

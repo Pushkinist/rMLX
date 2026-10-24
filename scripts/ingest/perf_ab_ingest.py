@@ -2,9 +2,9 @@
 """Ingest a `scripts/perf_ab.sh` result into the rMLX metrics DB.
 
 `perf_ab.sh` records every slot as an `ab_arm` row, which reaches no champion
-and no gate. This is the separate, explicit step that promotes one accepted
-comparison into two §8.5 RunRecords, one per arm, under the `--run-class` it is
-given: `gate` for arms that are kept cells.
+and no gate. This is the separate, explicit step that promotes the surviving
+arm of one accepted comparison, `--keep-arm A|B`, into one §8.5 RunRecord of
+class `gate`. The other arm is not written again: its slots are its record.
 
 Sibling of `llama_ab_ingest.py`, which does the same job for
 `bench_llama_ab.sh`. The two inputs are different shapes and different
@@ -18,7 +18,7 @@ Usage:
     python3 scripts/ingest/perf_ab_ingest.py --dry-run RESULT.json \
         --model Qwen3.8-27B-mxfp8 --weight-quant mxfp8 \
         --arm-a-kv-quant none --arm-b-kv-quant mixed_k8g64_v4g64 \
-        --prompt-tokens 130848 --run-class gate
+        --prompt-tokens 130848 --keep-arm B
 
     # Write buffer files and ingest them:
     python3 scripts/ingest/perf_ab_ingest.py --record RESULT.json ...
@@ -249,7 +249,7 @@ def _arm_record(
         "n_measure": stats["n"],
         "notes": notes,
         "description": args.description,
-        "run_class": args.run_class,
+        "run_class": "gate",
         "metrics": metrics,
     }
 
@@ -291,12 +291,11 @@ def main() -> int:
     )
     p.add_argument("--description", default=None)
     p.add_argument(
-        "--run-class",
+        "--keep-arm",
         required=True,
-        choices=["gate", "ab_arm", "diagnostic"],
-        help="why the rows are recorded (docs/METRICS_DB.md §8.5). Both arms take "
-        "this class, and only gate rows reach bests and the gates: pass gate when "
-        "both arms are kept cells, ab_arm otherwise.",
+        choices=["A", "B"],
+        help="the surviving arm, written as one gate record (docs/METRICS_DB.md "
+        "§8.5). Both arms' slots are already in runs.db as ab_arm rows.",
     )
     p.add_argument("--accept-tainted", action="store_true")
     p.add_argument("--dry-run", action="store_true")
@@ -393,9 +392,12 @@ def main() -> int:
             )
         prompt_tokens = measured
 
+    # The kept row's notes name the arm it was paired with, so both declared
+    # codecs are held to the arguments that ran.
+    for arm, declared in (("A", args.arm_a_kv_quant), ("B", args.arm_b_kv_quant)):
+        _kv_quant_of(result["arm_a" if arm == "A" else "arm_b"].get("args", ""), declared, arm)
     records = [
-        _arm_record(result, cell, arm, args, prompt_body, prompt_tokens, prompt_name)
-        for arm in ("A", "B")
+        _arm_record(result, cell, args.keep_arm, args, prompt_body, prompt_tokens, prompt_name)
     ]
 
     if args.dry_run:

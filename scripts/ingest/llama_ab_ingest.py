@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Ingest a `scripts/bench_llama_ab.sh` result into the rMLX metrics DB.
 
-`bench_llama_ab.sh` never touches `runs.db`. This is the separate, explicit
-step that promotes one accepted comparison into two §8.5 RunRecords, one per
-arm, under the `--run-class` it is given: `gate` for arms that are kept cells,
-`ab_arm` otherwise.
+`bench_llama_ab.sh` runs this at the end of every real comparison, with no
+`--keep-arm`: both arms are written as `ab_arm` records, one per arm, which
+reach no champion and no gate. Promoting the surviving arm is a second,
+explicit run with `--keep-arm A|B`, which writes that arm alone as `gate`.
 
 Sibling of `llama_bench_ingest.py`, which reads `llama-bench -o json`. The two
 inputs are unrelated shapes: `llama-bench` measures synthetic token generation
@@ -18,7 +18,7 @@ Usage:
         --arm-a-backend llama_cpp --arm-b-backend llama_cpp_tq \
         --model Qwen3-8B-Q8_0 --weight-quant q8_0 \
         --arm-a-kv-quant none --arm-b-kv-quant turbo3 \
-        --prompt-name longctx_8k_text --prompt-file PROMPT.txt --run-class gate
+        --prompt-name longctx_8k_text --prompt-file PROMPT.txt --keep-arm B
 
     # Write buffer files and ingest them:
     python3 scripts/ingest/llama_ab_ingest.py --record RESULT.json ...
@@ -65,6 +65,7 @@ def _arm_record(
     arm: str,
     args: argparse.Namespace,
     prompt_body: str,
+    run_class: str,
 ) -> dict[str, Any]:
     """Build one §8.5 RunRecord from one arm of an A/B result."""
     slots = [s for s in result["slots"] if s["arm"] == arm]
@@ -132,7 +133,7 @@ def _arm_record(
         "output_first_64": slots[0].get("output_first_64") or None,
         "notes": notes,
         "description": args.description,
-        "run_class": args.run_class,
+        "run_class": run_class,
         "metrics": [
             {"name": "decode_tps_warm", "value": statistics.median(tps), "stddev": stddev},
             {
@@ -179,12 +180,12 @@ def main() -> int:
     )
     p.add_argument("--description", default=None)
     p.add_argument(
-        "--run-class",
-        required=True,
-        choices=["gate", "ab_arm", "diagnostic"],
-        help="why the rows are recorded (docs/METRICS_DB.md §8.5). Both arms take "
-        "this class, and only gate rows reach bests and the gates: pass gate when "
-        "both arms are kept cells, ab_arm otherwise.",
+        "--keep-arm",
+        choices=["A", "B"],
+        default=None,
+        help="write only this arm, as gate: the surviving arm of an accepted "
+        "comparison (docs/METRICS_DB.md §8.5). Without it both arms are written "
+        "as ab_arm, which is what bench_llama_ab.sh does after every real run.",
     )
     p.add_argument("--accept-tainted", action="store_true")
     p.add_argument("--dry-run", action="store_true")
@@ -218,7 +219,10 @@ def main() -> int:
         return 2
 
     prompt_body = Path(args.prompt_file).read_text(encoding="utf-8")
-    records = [_arm_record(result, arm, args, prompt_body) for arm in ("A", "B")]
+    if args.keep_arm:
+        records = [_arm_record(result, args.keep_arm, args, prompt_body, "gate")]
+    else:
+        records = [_arm_record(result, arm, args, prompt_body, "ab_arm") for arm in ("A", "B")]
 
     if args.dry_run:
         for rec in records:
