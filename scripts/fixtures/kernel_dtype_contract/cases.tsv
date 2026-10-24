@@ -1,0 +1,37 @@
+# Planted scan roots for check_kernel_dtype_contract.sh: the exit code and the function it names.
+#
+# Columns, tab-separated, none empty ("-" for none): fixture (a directory beside this
+# table), args (gate arguments, "{}" is the fixture path), stream (both, out or err: the
+# gate's output the needles are read from), exit (exact), has (strings that must all
+# appear), lacks (strings none of which may appear), is (the whole output; "\t" is a
+# tab), what (what the case proves). Needles are fixed strings separated by ";;".
+#
+# A source gate is only worth its runtime if it still fires when the pattern it
+# looks for is spelled differently, hidden inside a tuple, or separated from
+# its marker by an attribute block. Each fixture under
+# `scripts/fixtures/kernel_dtype_contract/` is a synthetic scan root paired
+# with the exit code the gate must produce and, for the failing cases, the
+# function it must name. Four of them are bypasses that were reproduced against
+# an earlier revision of the gate: a rustfmt-split declaration it could not see,
+# a second escaping buffer that one cast exempted, a derived cast on an input
+# that counted as a guard, and a marker that leaked across a `const`. Asserting the named function — not just the exit code
+# — is what stops a gate that fails for the wrong reason from counting as
+# recall.
+
+clean	{} 1	both	0	check-kernel-dtype-contract: ok	-	-	a derived .astype( on the way out passes
+unguarded_return	{} 1	both	1	leaky_sdpa	-	-	an f32 kernel output returned as-is is caught
+f32_literal_astype	{} 1	both	1	upcast_only_sdpa	-	-	the .astype(Dtype::F32) upcast is not a guard
+literal_width_astype	{} 1	both	1	pinned_width_sdpa	-	-	a literal-width .astype( is not a guard
+marker_above	{} 1	both	0	check-kernel-dtype-contract: ok	-	-	an f32-out-ok marker in the block above exempts the fn
+marker_through_attributes	{} 1	both	0	check-kernel-dtype-contract: ok	-	-	a marker separated by a multi-line attribute still applies
+marker_does_not_leak	{} 1	both	1	leaky_sdpa	-	-	one marker exempts one function, not the next one
+tuple_scales	{} 1	both	1	quantize_gpu	-	-	an f32 scale buffer returned in a tuple is caught
+partial_tuple_guard	{} 1	both	1	quantize_partial_guard_gpu	-	-	casting one of two escaping f32 buffers is not enough
+multiline_add_output_shape	{} 1	both	1	split_decl_sdpa	-	-	a rustfmt-split add_output_shape is still seen
+derived_astype_on_input	{} 1	both	1	input_cast_sdpa	-	-	a derived cast BEFORE the dispatch guards an input, not the output
+marker_over_const	{} 1	both	1	leaky_after_const_sdpa	-	-	a marker above a const does not leak onto the next fn
+nested_dir	{} 1	both	1	leaky_sdpa	-	-	a dispatcher in a sub-directory is still scanned
+not_a_dispatcher	{} 1	both	1	expected at least	-	-	a file with no MetalKernelInvoke is out of scope
+test_file_excluded	{} 1	both	1	expected at least	-	-	a *_tests.rs dispatcher is out of scope
+empty_tree	{} 1	both	1	expected at least	-	-	an empty scan root fails instead of passing vacuously
+clean	{} 2	both	1	expected at least	-	-	fewer dispatcher functions than the pinned floor fails

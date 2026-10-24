@@ -1,0 +1,25 @@
+# Planted scan roots for check_no_kernel_input_eval.sh: the exit code for each.
+#
+# Columns, tab-separated, none empty ("-" for none): fixture (a directory beside this
+# table), args (gate arguments, "{}" is the fixture path), stream (both, out or err: the
+# gate's output the needles are read from), exit (exact), has (strings that must all
+# appear), lacks (strings none of which may appear), is (the whole output; "\t" is a
+# tab), what (what the case proves). Needles are fixed strings separated by ";;".
+#
+# A source gate is only worth its runtime if it still fires when the thing it
+# looks for is spelled differently, moved, or hidden one call deep. Each
+# fixture under `scripts/fixtures/no_kernel_input_eval/` is a synthetic scan
+# root paired with the exit code the gate must produce for it. A gate change
+# that loses recall fails here instead of passing silently on the real tree.
+
+clean	{} 1	both	0	-	-	-	a dispatcher with no eval passes
+plain_eval	{} 1	both	1	-	-	-	the plain x.eval() spelling is caught
+ufcs_eval	{} 1	both	1	-	-	-	the UFCS Array::eval(&x) spelling is caught
+common_helper	{} 2	both	1	-	-	-	an eval hidden in a shared _common.rs scaffold is caught
+nested_dir	{} 1	both	1	-	-	-	a dispatcher in a sub-directory is still scanned
+marker_same_line	{} 1	both	0	-	-	-	a same-line eval-ok marker exempts its own call
+marker_above	{} 1	both	0	-	-	-	an eval-ok marker on the lines above exempts one call
+marker_leaks_to_loop	{} 1	both	1	-	-	-	one marker exempts one call, not a following loop
+trailing_comment	{} 1	both	0	-	-	-	a comment naming .eval() is not itself a call
+empty_tree	{} 1	both	1	-	-	-	an empty scan root fails instead of passing vacuously
+clean	{} 2	both	1	-	-	-	fewer dispatchers than the pinned floor fails

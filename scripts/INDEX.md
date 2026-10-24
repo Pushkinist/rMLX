@@ -21,27 +21,27 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `check_doc_refs.py` | make check-doc-refs, check_doc_refs_selftest.sh | Every reference into docs/ resolves, and a doc edit re-points none of them. |
 | `check_doc_refs_selftest.sh` | make check-doc-refs-selftest, make ci | Recall test for check_doc_refs.py: synthetic git repos, asserting exit code and reason. |
 | `check_doc_source_citations.sh` | make check-doc-source-citations, make ci | CI gate: every crates/... source path cited in a tracked docs/*.md file exists. |
-| `check_eval_lock.sh` | make check-eval-lock, make ci, check_eval_lock_fixtures.sh | CI gate: every MLX FFI call that can evaluate runs under the process-wide evaluation lock. |
+| `check_eval_lock.sh` | make check-eval-lock, make ci, check/rust_gates_fixtures.sh, check_eval_lock_fixtures.sh | CI gate: every MLX FFI call that can evaluate runs under the process-wide evaluation lock. |
 | `check_eval_lock_fixtures.sh` | make check-eval-lock-fixtures, make ci | Recall test for check_eval_lock.sh: a synthetic scan root per case, asserting exit code and rule. |
 | `check_gpu_device_census.sh` | make check-gpu-device-census, make check-gpu-device-census-library, make ci, check_gpu_device_census_selftest.sh | CI gate: the rmlx binary's source names Device::Gpu in exactly one place, claim_gpu. |
 | `check_gpu_device_census_selftest.sh` | make check-gpu-device-census-selftest, make ci | Recall test for check_gpu_device_census.sh: scan roots, asserting exit code and file:line. |
-| `check_gpu_tests_ignored.sh` | make check-gpu-tests-ignored, make ci, check_gpu_tests_ignored_fixtures.sh, check_named_skip_notices.sh, gpu_test_halves.sh, +3 more scripts | CI gate: every test that reaches Device::Gpu, in any workspace crate, carries #[ignore]. |
+| `check_gpu_tests_ignored.sh` | make check-gpu-tests-ignored, make ci, check/rust_gates_fixtures.sh, check_gpu_tests_ignored_fixtures.sh, check_named_skip_notices.sh, +4 more scripts | CI gate: every test that reaches Device::Gpu, in any workspace crate, carries #[ignore]. |
 | `check_gpu_tests_ignored_fixtures.sh` | make check-gpu-tests-ignored-fixtures, make ci | Recall test for check_gpu_tests_ignored.sh: synthetic workspaces, asserting the failure reason. |
-| `check_kernel_dtype_contract.sh` | make check-kernel-dtype-contract, make ci, check_kernel_dtype_contract_fixtures.sh | CI gate: a custom-Metal-kernel dispatcher never hands its f32 kernel output back unexamined. |
+| `check_kernel_dtype_contract.sh` | make check-kernel-dtype-contract, make ci, check/rust_gates_fixtures.sh, check_kernel_dtype_contract_fixtures.sh | CI gate: a custom-Metal-kernel dispatcher never hands its f32 kernel output back unexamined. |
 | `check_kernel_dtype_contract_fixtures.sh` | make check-kernel-dtype-contract-fixtures, make ci | Recall test for check_kernel_dtype_contract.sh: scan roots, asserting exit code and function. |
 | `check_kv_boundary_default_parity.sh` | make check-kv-boundary-default-parity, make ci | CI gate: every surface naming the default KV boundary-layer counts agrees with the engine's pair. |
 | `check_kv_byte_model_parity.sh` | make check-kv-byte-model-parity, make ci, check_kv_byte_model_parity_fixtures.sh | CI gate: the KV byte model in perf_ceiling.py agrees byte for byte with the engine's. |
 | `check_kv_byte_model_parity_fixtures.sh` | make check-kv-byte-model-parity-fixtures, make ci | Recall test for check_kv_byte_model_parity.sh: one edited manifest per case, asserting the check. |
 | `check_kv_codec_disposition.sh` | make check-kv-codec-disposition, make ci, check_kv_codec_disposition_fixtures.sh | CI gate: what the KV help and docs say a codec does agrees with its runtime disposition. |
 | `check_kv_codec_disposition_fixtures.sh` | make check-kv-codec-disposition-fixtures, make ci | Recall test for check_kv_codec_disposition.sh: synthetic scan roots, asserting rule and exit code. |
-| `check_kv_layer_quants.sh` | make check-kv-layer-quants, make ci | CI gate: the per-layer KV codec vector has one producer, and every cache stack uses it. |
+| `check_kv_layer_quants.sh` | make check-kv-layer-quants, make ci, check/rust_gates_fixtures.sh | CI gate: the per-layer KV codec vector has one producer, and every cache stack uses it. |
 | `check_metal_compiles.sh` | make check-metal-compiles, make ci | CI gate: every .metal kernel compiles at -std=metal3.1 and metal4.0 and is named by its manifest. |
 | `check_metal_format.sh` | make check-metal-format, make ci, pre-commit | CI gate: every .metal kernel file is clang-format clean. |
 | `check_named_skip_notices.sh` | make check-named-skip-notices, make ci, check_named_skip_notices_fixtures.sh | CI gate: every classified GPU test that announces its own stand-down names itself in the notice. |
 | `check_named_skip_notices_fixtures.sh` | make check-named-skip-notices-fixtures, make ci | Recall test for check_named_skip_notices.sh: planted notice shapes, asserting the reason. |
-| `check_no_decode_swallow.sh` | make check-no-decode-swallow, make ci | CI gate: a failed decode step or prefill chunk propagates instead of looking like a success. |
-| `check_no_inline_tests.sh` | make check-no-inline-tests, make ci | CI gate: no inline #[cfg(test)] mod tests block in a non-test source file. |
-| `check_no_kernel_input_eval.sh` | make check-no-kernel-input-eval, make ci, check_no_kernel_input_eval_fixtures.sh | CI gate: no blocking Array::eval() on a kernel input in a custom-Metal-kernel dispatcher. |
+| `check_no_decode_swallow.sh` | make check-no-decode-swallow, make ci, check/rust_gates_fixtures.sh | CI gate: a failed decode step or prefill chunk propagates instead of looking like a success. |
+| `check_no_inline_tests.sh` | make check-no-inline-tests, make ci, check/rust_gates_fixtures.sh | CI gate: no inline #[cfg(test)] mod tests block in a non-test source file. |
+| `check_no_kernel_input_eval.sh` | make check-no-kernel-input-eval, make ci, check/rust_gates_fixtures.sh, check_no_kernel_input_eval_fixtures.sh | CI gate: no blocking Array::eval() on a kernel input in a custom-Metal-kernel dispatcher. |
 | `check_no_kernel_input_eval_fixtures.sh` | make check-no-kernel-input-eval-fixtures, make ci | Recall test for check_no_kernel_input_eval.sh: synthetic scan roots, asserting exit code. |
 | `check_no_scalar_f32_leak.sh` | make check-no-scalar-f32-leak, make ci | CI gate: no unguarded scalar_f32( in the crates that own .metal kernels. |
 | `check_personal_data.sh` | make check-personal-data, make ci, check_personal_data_selftest.sh | CI gate: no personal email, macOS home or temp path, or assistant session link in published files. |
@@ -105,6 +105,12 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 |---|---|---|
 | `bench/codec_inertness_probe.sh` | none | codec_inertness_probe.sh — does a KV codec change anything a caller can see? |
 
+## scripts/check/
+
+| path | caller (derived) | purpose (header line 1) |
+|---|---|---|
+| `check/rust_gates_fixtures.sh` | by hand | Recall test for the Rust-source gates: planted scan roots from a table, asserting exit and reason. |
+
 ## scripts/eval/
 
 | path | caller (derived) | purpose (header line 1) |
@@ -144,7 +150,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `lib/published_run_log.py` | lib/binary_identity.py, lib/prefill_ms.py, lib/published_greedy.py, +1 more scripts | Read one rmlx run log back as a per-request table. |
 | `lib/published_table.py` | make check-published-table, make published-table, published_table_selftest.sh | Render published-protocol runs as the Markdown table a post needs. |
 | `lib/run_log_for_pid.py` | lib/bench_server.sh | Pick the run log a given process wrote, out of the candidates on stdin. |
-| `lib/selftest_support.sh` | bench_llama_ab_selftest.sh, check_claim_bypass_selftest.sh, check_gpu_device_census_selftest.sh, +10 more scripts | The case runner and shims the self-tests share; source it. |
+| `lib/selftest_support.sh` | bench_llama_ab_selftest.sh, check/rust_gates_fixtures.sh, check_claim_bypass_selftest.sh, +11 more scripts | The case runner and shims the self-tests share; source it. |
 | `lib/server_decode_tps.py` | perf-iter/bench_decode_tps.sh, spec_bench.sh | Read one request's decode rate off a running rmlx server. |
 | `lib/server_kv_quant.py` | lib/bench_server.sh, lib/binary_identity.py, perf_canary.sh, +1 more scripts | Read the KV codec a run resolved out of its rmlx run log. |
 | `lib/server_sampling.py` | crates/rmlx-server/src/engine/sampler_event_tests.rs, lib/published_run_log.py, spec_bench.sh | Read whether a run's requests were sampled, out of its rmlx run log. |

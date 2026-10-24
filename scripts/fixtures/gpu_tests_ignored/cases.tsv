@@ -1,0 +1,120 @@
+# Planted workspaces for check_gpu_tests_ignored.sh: the failure reason, under each awk.
+#
+# Columns, tab-separated, none empty ("-" for none): fixture (a directory beside this
+# table), args (gate arguments, "{}" is the fixture path), stream (both, out or err: the
+# gate's output the needles are read from), exit (exact), has (strings that must all
+# appear), lacks (strings none of which may appear), is (the whole output; "\t" is a
+# tab), what (what the case proves). Needles are fixed strings separated by ";;".
+#
+# The gate it guards enforces a rule ("a test reaching Device::Gpu carries
+# #[ignore]") that nothing else in the tree can check, so a silent loss of
+# recall there is indistinguishable from compliance. Each fixture under
+# `scripts/fixtures/gpu_tests_ignored/` is a synthetic workspace paired with the
+# outcome the gate must produce for it, driven through the gate's `--root`
+# option. Half the cases are violations the gate must catch and half are
+# legitimate shapes it must leave alone — a gate that fails everything is as
+# useless as one that fails nothing, and only the pair pins it.
+#
+# WHY THE EXIT CODE ALONE IS NOT AN ASSERTION
+#   The gate has several fail-closed paths that also exit 1 — a missing --root
+#   directory, zero parsed workspace members, fewer members than crate dirs on
+#   disk, a member whose src/ is gone, an unreadable package name, zero matched
+#   test files. A case that only checks `exit == 1` is satisfied by every one of
+#   them, so DELETING a fixture makes its case pass. (Measured: removing one
+#   fixture tree and gutting another still reported "ok (9 cases)".) Each case
+#   therefore pins three things: the exit code, the violation-class MARKER the
+#   gate must print, and the specific LABEL it must name — plus an optional
+#   string that must NOT appear. A wrong reason is a failure.
+#
+# The macro cases are the reason this file exists. A `macro_rules!` body
+# declaring `#[test] fn $name()` names no readable fn at its definition site and
+# emits no `fn` line at its invocation sites, so a source scanner can miss it in
+# both directions at once: never flagged however much Metal it dispatches, and
+# never listed for the runner either.
+#
+# EVERY CASE RUNS ONCE PER AWK ON THE MACHINE
+#   The gate is an awk program, and awk implementations genuinely disagree. A
+#   bracket range of octal escapes (`[\300-\337]`, the obvious way to match a
+#   UTF-8 continuation byte) is accepted by BSD awk and is a hard syntax error
+#   in gawk — so a gate green on a developer's Mac can be hard-DOWN on the Linux
+#   CI runner, which is strictly worse than the blind spot it exists to close.
+#   Byte-vs-character indexing and the POSIX classes differ too: `[[:print:]]`
+#   calls a UTF-8 continuation byte printable in BSD awk and mawk under a UTF-8
+#   locale but not under C, and gawk indexes characters where the others index
+#   bytes. A suite that checks one implementation cannot see any of that, so it
+#   runs under each — and when only one is installed it SAYS so rather than
+#   reporting a clean run that proved less than it looks like it did.
+
+macro_gpu_no_ignore	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_cell!{$name}	-	-	a macro body binding Device::Gpu without #[ignore] is caught
+macro_gpu_via_helper	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;cell!{$name}	-	-	a macro body reaching Metal through a helper is caught
+macro_inline_body	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;later_plain_gpu_no_ignore	-	-	a one-line generated fn does not swallow the rest of the file
+macro_inline_string_brace	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;second_cell!{$name}	-	-	a } inside a string literal does not make the line look unbalanced
+fn_url_in_string	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;later_plain_gpu_no_ignore	-	-	a // inside a string literal is not a comment
+fn_char_literal_quote	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;later_plain_gpu_no_ignore	-	-	a " inside a char literal does not desynchronise the string scan
+fn_comment_brace	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;plain_gpu_no_ignore	-	-	a } inside a trailing comment does not make the line look self-contained
+trait_signature_fns	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;after_trait_gpu_no_ignore	-	-	one-line signature-only fns neither latch nor hard-fail the run
+trait_where_signature	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;fn never closed	-	-	a where-split signature latches, and is loud ONLY when nothing closes the latch
+# Pins the file count too, so a fixture that lost its source file cannot pass by
+# scanning nothing.
+trait_where_signature_open_hole	--root {}	both	0	OK: every GPU-touching test carries #[ignore] (1 files	ERROR	-	KNOWN OPEN HOLE: one nested block closes the latch and the swallowed GPU test is reported clean
+fn_never_closes	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;fn never closed	-	-	a capture that cannot terminate is reported, not skipped
+attr_multiline_ignore	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;later_plain_gpu_no_ignore	probe	-	a wrapped #[ignore = ".." ] closes, and is read rather than merely un-latched
+attr_trailing_comment	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_after_comment_attr	-	-	a comment after an attribute's closing ] does not latch the capture
+attr_never_closes	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;attribute never closed	-	-	an attribute capture that cannot terminate is reported, not swallowed
+exempt_in_body	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_marker_inside_body	-	-	a marker among a fn's statements exempts nothing
+exempt_in_body	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_after_marker_in_body	-	-	and does not carry to the next fn
+macro_one_line_no_test	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_cell!{$name}	-	-	a one-line macro declaring no test is stepped over, not latched
+tokio_test_gpu	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;tokio_gpu_no_ignore	-	-	#[tokio::test] classifies like #[test]
+tokio_test_gpu	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;tokio_flavored_gpu_no_ignore	-	-	the parameterised #[tokio::test(..)] spelling classifies too
+macro_close_comment	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;second_cell!{$name}	-	-	a commented close brace still ends the body, so blame lands on the right macro
+macro_unreadable	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;gpu_cell!	-	-	an assembled fn name fails closed, not silently
+macro_one_line	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;one_line_cell!	-	-	a whole-macro-on-one-line #[test] fails closed
+plain_gpu_no_ignore	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;plain_gpu_test	-	-	the original non-macro detection still fires
+macro_gpu_ignored	--root {}	both	0	OK: every GPU-touching test carries #[ignore] (1 files;;gpu_cell!{$name}	-	-	a compliant macro body does not fire, and was read
+macro_cpu_no_ignore	--root {}	both	0	OK: every GPU-touching test carries #[ignore] (1 files	NOTE:	-	a macro body that never reaches the GPU stays un-ignored
+macro_gpu_exempt	--root {}	both	0	OK: every GPU-touching test carries #[ignore] (1 files	NOTE:	-	the per-test exemption marker works inside a macro body
+plain_gpu_ignored	--root {}	both	0	OK: every GPU-touching test carries #[ignore] (1 files	NOTE:	-	the compliant non-macro shape stays green
+ignore_metal_undeclared	--root {}	both	1	ERROR: #[ignore] claims a Metal context;;orphaned_metal_test	-	-	an #[ignore] claiming Metal with no reachable device and no declared route is fatal
+ignore_bare_env_gated	--root {}	both	1	ERROR: #[ignore] with no reason on an environment-gated test;;env_gated_cpu_cell	ERROR: #[ignore] claims a Metal context	-	a reasonless #[ignore] on an environment-gated test no device is reachable from is fatal
+ignore_bare_env_gated	--root {}	both	1	ERROR: #[ignore] with no reason on an environment-gated test;;snapshot_gated_cpu_cell	ERROR: #[ignore] claims a Metal context	-	and so is one gated through the snapshot resolver
+ignore_bare_env_gated_dispositioned	--root {}	both	0	OK: every GPU-touching test carries #[ignore] (1 files	ERROR	-	a written reason, a GPU cell, and an ungated cell each pass it
+unscanned_in_body	--root {}	both	1	ERROR: #[ignore] claims a Metal context;;marker_inside_body	-	-	a declared-route marker among a fn's statements declares nothing
+unscanned_in_body	--root {}	both	1	ERROR: #[ignore] claims a Metal context;;test_after_body_marker	-	-	and does not carry to the next fn
+metal_unscanned_no_ignore	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;declared_without_ignore	-	-	a declared route makes the missing #[ignore] a violation
+metal_unscanned_and_exempt	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;metal-unscanned AND exempt	-	-	declaring and exempting the same test fails closed
+metal_unscanned_stale	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;Device::Gpu is reachable here	-	-	a marker the scanner can check for itself is stale, not redundant
+metal_unscanned_declared	--root {}	both	0	OK: every GPU-touching test carries #[ignore] (1 files	ERROR	-	a declared route closes the fatal converse
+metal_unscanned_declared	--root {}	both	0	NOTE: declared-route GPU tests;;declared_metal_test	-	-	and the enforced-but-unlisted test is announced
+# The list/enforce split, pinned on a fixture that holds one of each. The macro
+# cell is GPU-touching and compliant, so it is enforced; only the plain test may
+# reach `--list`, because the runner turns a listed name into a libtest filter
+# and a `$metavar` matches no test. Asserting the exact stdout is what stops the
+# split from silently becoming "macro cells are listed" (which under-matches in
+# the runner) or "plain tests are dropped" (which stops running them).
+macro_gpu_ignored	--list --root {}	out	0	-	-	fx\tplain_gpu_test	--list — macro cell enforced but not listed; plain test listed
+# The same run must still ANNOUNCE the excluded macro cells. `make gpu-test`
+# calls only `--list`, so a note printed exclusively by the enforcing path is
+# invisible to the one operator who needs it.
+macro_gpu_ignored	--list --root {}	err	0	NOTE: macro-generated GPU tests;;fixture_tests.rs: gpu_cell!{$name}	-	-	--list — the excluded macro cells are announced on stderr
+# The same split for the declared-route marker, and for the same reason: the
+# runner turns a listed name into a libtest filter and executes it, and every
+# declared test is snapshot-gated or drives a child process, so listing one
+# would have the runner execute a no-op, see no Metal validation banner for that
+# crate, and fail the suite over a missing model. Asserting the exact stdout is
+# what stops "declared tests are enforced but unlisted" from quietly becoming
+# either "declared tests are listed" or "plain tests were dropped too".
+metal_unscanned_declared	--list --root {}	out	0	-	-	fx\tplain_gpu_test	--list — declared test enforced but not listed; plain test listed
+# `--list` must refuse an undeclared Metal-claiming #[ignore] exactly as the
+# enforcing path does. `make gpu-test` calls only `--list`, so a check that
+# fires in one mode and not the other leaves the whole GPU suite running over a
+# tree the gate has already judged incomplete.
+#
+# The exit code alone would not assert it: with the check removed the fixture
+# classifies no GPU test at all, so `--list` still exits 1 on its own
+# refuse-to-emit-an-empty-list path. The REASON is what pins this.
+ignore_metal_undeclared	--list --root {}	both	1	ERROR: #[ignore] claims a Metal context	-	-	--list — refuses an undeclared Metal-claiming #[ignore] too
+# The reasonless-#[ignore] rule refuses `--list` too, for the reason above; and
+# the GPU form of the same cell is what `--list` hands the runner, which is the
+# disposition that puts it under a gate.
+ignore_bare_env_gated	--list --root {}	both	1	ERROR: #[ignore] with no reason on an environment-gated test	-	-	--list — refuses a reasonless environment-gated #[ignore] too
+ignore_bare_env_gated_dispositioned	--list --root {}	out	0	-	-	fx\tenv_gated_gpu_cell	--list — the GPU form of the cell is listed; the others are not
