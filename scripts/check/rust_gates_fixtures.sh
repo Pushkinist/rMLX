@@ -2,12 +2,9 @@
 # Recall test for the Rust-source gates: planted scan roots from a table, asserting exit and reason.
 #
 # Recall test for: check_eval_lock.sh
-# Recall test for: check_gpu_tests_ignored.sh
-# Recall test for: check_kernel_dtype_contract.sh
-# Recall test for: check_no_kernel_input_eval.sh
-# Recall test for: check_kv_layer_quants.sh
-# Recall test for: check_no_decode_swallow.sh
-# Recall test for: check_no_inline_tests.sh
+#                  check_gpu_tests_ignored.sh
+#                  check_kernel_dtype_contract.sh
+#                  check_no_kernel_input_eval.sh
 #
 # The mode is a directory under scripts/fixtures/ that holds a planted tree for
 # each case and a cases.tsv: one row per case, tab-separated, no empty field
@@ -21,12 +18,9 @@
 # with the same code a violation does, so a deleted tree must not pass for it.
 #
 # Usage:  bash scripts/check/rust_gates_fixtures.sh <mode>
-#         mode: eval_lock | gpu_tests_ignored | kernel_dtype_contract |
-#               no_kernel_input_eval | kv_layer_quants | no_decode_swallow |
-#               no_inline_tests
+#         mode: eval_lock | gpu_tests_ignored | kernel_dtype_contract | no_kernel_input_eval
 # Exit:   0 every case held; 1 a case did not, or none ran; 2 an unknown mode, a
 #         missing table, a malformed row or no awk on the machine
-# Caller: by hand
 
 set -euo pipefail
 
@@ -40,9 +34,6 @@ eval_lock) GATE="$REPO_ROOT/scripts/check_eval_lock.sh" ;;
 gpu_tests_ignored) GATE="$REPO_ROOT/scripts/check_gpu_tests_ignored.sh" ;;
 kernel_dtype_contract) GATE="$REPO_ROOT/scripts/check_kernel_dtype_contract.sh" ;;
 no_kernel_input_eval) GATE="$REPO_ROOT/scripts/check_no_kernel_input_eval.sh" ;;
-kv_layer_quants) GATE="$REPO_ROOT/scripts/check_kv_layer_quants.sh" ;;
-no_decode_swallow) GATE="$REPO_ROOT/scripts/check_no_decode_swallow.sh" ;;
-no_inline_tests) GATE="$REPO_ROOT/scripts/check_no_inline_tests.sh" ;;
 *)
     echo "usage: bash scripts/check/rust_gates_fixtures.sh <mode>  (modes: see the header)" >&2
     exit 2

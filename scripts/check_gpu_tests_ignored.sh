@@ -322,7 +322,7 @@
 #       and not under C, and gawk indexes characters where they index bytes.
 #   Prefer `index()` / `substr()` arithmetic, which counts in the same units as
 #   `length()` and `RLENGTH` in every implementation.
-#   `scripts/check_gpu_tests_ignored_fixtures.sh` re-runs its whole corpus under
+#   `scripts/check/rust_gates_fixtures.sh` re-runs its whole corpus under
 #   every awk installed, so a violation of this surfaces there.
 #
 # Exit 0 = clean. Exit 1 = violation (or a scan that found nothing to check).
@@ -343,7 +343,7 @@ set -euo pipefail
 # asked for, so the two modes cannot name different populations.
 #
 # --root <dir>: scan <dir> instead of the repository. Used by
-# `scripts/check_gpu_tests_ignored_fixtures.sh` to drive the classifier over
+# `scripts/check/rust_gates_fixtures.sh` to drive the classifier over
 # synthetic workspaces whose expected exit code is known, so a change that loses
 # recall fails there rather than passing silently on the real tree.
 LIST_MODE=0

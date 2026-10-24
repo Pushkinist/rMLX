@@ -637,7 +637,7 @@ check-eval-lock:  ## CI gate: fail if an MLX eval FFI call is made without the p
 	@bash scripts/check_eval_lock.sh
 
 check-eval-lock-fixtures: ## CI gate: recall test for check-eval-lock (synthetic scan roots)
-	@bash scripts/check_eval_lock_fixtures.sh
+	@bash scripts/check/rust_gates_fixtures.sh eval_lock
 
 eval-lock-stress: ## run the evaluation-lock reproducer across RUNS fresh processes (default 60); not in `make ci`
 	@bash scripts/eval_lock_stress.sh $(RUNS)
@@ -660,7 +660,7 @@ check-gpu-tests-ignored: ## CI gate: fail if a GPU-touching test in ANY workspac
 	@bash scripts/check_gpu_tests_ignored.sh
 
 check-gpu-tests-ignored-fixtures: ## CI gate: the #[ignore] gate still fires on macro-generated and helper-reached GPU tests
-	@bash scripts/check_gpu_tests_ignored_fixtures.sh
+	@bash scripts/check/rust_gates_fixtures.sh gpu_tests_ignored
 
 gpu-runner-selftest: ## CI gate: the GPU runner reports a failing test and a shader-validation hit in the same run, reports the access mix it saw, reads the verdict from the uninstrumented run, and reaches every census-pin verdict (stubbed crates, no GPU)
 	@bash scripts/run_gpu_tests_selftest.sh
@@ -675,7 +675,7 @@ check-no-kernel-input-eval: ## CI gate: fail if a Metal-kernel dispatcher blocks
 	@bash scripts/check_no_kernel_input_eval.sh
 
 check-no-kernel-input-eval-fixtures: ## CI gate: the eval gate still fires on renamed/relocated/differently-spelled evals
-	@bash scripts/check_no_kernel_input_eval_fixtures.sh
+	@bash scripts/check/rust_gates_fixtures.sh no_kernel_input_eval
 
 check-gpu-device-census: ## CI gate: the rmlx binary names Device::Gpu in exactly one place, claim_gpu, which takes the Metal claim, and never takes .device() from a fresh claim
 	@bash scripts/check_gpu_device_census.sh
@@ -702,7 +702,7 @@ check-kernel-dtype-contract: ## CI gate: fail if a Metal-kernel dispatcher retur
 	@bash scripts/check_kernel_dtype_contract.sh
 
 check-kernel-dtype-contract-fixtures: ## CI gate: the dtype-contract gate still fires on tuple-returned scales, false guards and marker leaks
-	@bash scripts/check_kernel_dtype_contract_fixtures.sh
+	@bash scripts/check/rust_gates_fixtures.sh kernel_dtype_contract
 
 # METAL_STRICT=--strict turns a missing toolchain into a hard failure instead of
 # a skip. CI sets it (the macOS runner ships the toolchain, so a skip there would
@@ -747,14 +747,14 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@$(MAKE) --no-print-directory check-doc-refs
 	@bash scripts/check_no_decode_swallow.sh
 	@bash scripts/check_eval_lock.sh
-	@bash scripts/check_eval_lock_fixtures.sh
+	@bash scripts/check/rust_gates_fixtures.sh eval_lock
 	@bash scripts/check_gpu_tests_ignored.sh
-	@bash scripts/check_gpu_tests_ignored_fixtures.sh
+	@bash scripts/check/rust_gates_fixtures.sh gpu_tests_ignored
 	@bash scripts/run_gpu_tests_selftest.sh
 	@bash scripts/check_named_skip_notices.sh
 	@bash scripts/check_named_skip_notices_fixtures.sh
 	@bash scripts/check_no_kernel_input_eval.sh
-	@bash scripts/check_no_kernel_input_eval_fixtures.sh
+	@bash scripts/check/rust_gates_fixtures.sh no_kernel_input_eval
 	@bash scripts/check_gpu_device_census.sh
 	@bash scripts/check_gpu_device_census.sh --library
 	@bash scripts/check_gpu_device_census_selftest.sh
@@ -765,7 +765,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/mlx_restore_pin_selftest.sh
 	@bash scripts/mlx_preflight_selftest.sh
 	@bash scripts/check_kernel_dtype_contract.sh
-	@bash scripts/check_kernel_dtype_contract_fixtures.sh
+	@bash scripts/check/rust_gates_fixtures.sh kernel_dtype_contract
 	@bash scripts/perf_ab_selftest.sh
 	@bash scripts/codec_smoke_runner_selftest.sh
 	@bash scripts/perf_ab_host_gate_fixtures.sh

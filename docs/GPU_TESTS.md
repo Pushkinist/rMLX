@@ -171,7 +171,7 @@ Each of these passes the gate silently:
 The script's `PARSING` header gives the close-test rules in full.
 
 `make check-gpu-tests-ignored-fixtures`
-(`scripts/check_gpu_tests_ignored_fixtures.sh`, in `make ci` and hosted CI) is
+(`scripts/check/rust_gates_fixtures.sh gpu_tests_ignored`, in `make ci` and hosted CI) is
 the recall test. Each fixture under `scripts/fixtures/gpu_tests_ignored/` is a
 synthetic workspace driven through the gate's `--root`. Some are violations and
 some are legitimate shapes. Each case asserts the exit code, the violation
