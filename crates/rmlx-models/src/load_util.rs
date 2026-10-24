@@ -319,7 +319,7 @@ impl<'a> Weights<'a> {
     ) -> Result<Linear> {
         let scales_name = format!("{base}.scales");
         if !self.has(&scales_name)? {
-            // No scales sibling → plain bf16 weight.
+            // No scales sibling: a plain weight, kept at its stored dtype.
             let weight = self.array(&format!("{base}.weight"))?;
             return Ok(Linear::Plain { weight });
         }
@@ -364,7 +364,7 @@ impl<'a> Weights<'a> {
     ) -> Result<Embedding> {
         let scales_name = format!("{base}.scales");
         if !self.has(&scales_name)? {
-            // No scales sibling → plain bf16 weight.
+            // No scales sibling: a plain weight, kept at its stored dtype.
             let weight = self.array(&format!("{base}.weight"))?;
             return Ok(Embedding::Plain { weight });
         }
