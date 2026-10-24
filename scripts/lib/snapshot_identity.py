@@ -8,7 +8,7 @@ They are facts about the directory being served and are read from it:
 * namespace and model from the directory name, split on `__` (docs/METRICS_DB.md
   §5.1). A name without the separator is `local/<name>`.
 * `weight_quant` from `config.json`, which is the checkpoint's own statement:
-  `paro` for a ParoQuant checkpoint, else `quantization.mode` verbatim
+  `paro` for a ParoQuant checkpoint, else `quantization.mode` lowercased
   (`mxfp8`), or the bit width when the mode is absent or `affine`, which names
   a *scheme* (`affine` at 8 bits is `8bit`), else the storage dtype for an
   unquantized one. Anything that does not land on the §5.2 whitelist is
@@ -68,12 +68,12 @@ def weight_quant(config):
     quant = config.get("quantization")
     if isinstance(quant, dict):
         # `mode` names the format for mxfp/nvfp checkpoints and passes through
-        # verbatim; for affine ones it names the *scheme* ("affine", or absent),
+        # lowercased; for affine ones it names the *scheme* ("affine", or absent),
         # and the bit width is what distinguishes them. The whitelist is the
         # caller's check, not this function's.
         mode = quant.get("mode")
-        if isinstance(mode, str) and mode and mode != "affine":
-            return mode
+        if isinstance(mode, str) and mode and mode.lower() != "affine":
+            return mode.lower()
         bits = quant.get("bits")
         if isinstance(bits, int):
             return f"{bits}bit"

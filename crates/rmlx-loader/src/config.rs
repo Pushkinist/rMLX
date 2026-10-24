@@ -141,7 +141,7 @@ impl ModelConfig {
     /// `None` when it names no weight format.
     ///
     /// ParoQuant first, then the MLX `quantization` block — its `mode`
-    /// verbatim, or `<bits>bit` when the mode is absent or `affine` — then an
+    /// lowercased, or `<bits>bit` when the mode is absent or `affine` — then an
     /// unquantized `dtype` / `torch_dtype`. No list of modes lives here: the
     /// recorder's §5.2 whitelist is the one check, and it refuses a mode it
     /// does not name. Kept in step with `weight_quant` in
@@ -153,9 +153,10 @@ impl ModelConfig {
             return Some("paro".to_owned());
         }
         if let Some(quant) = &self.quantization {
-            return Some(match quant.mode_or_default() {
+            let mode = quant.mode_or_default().to_lowercase();
+            return Some(match mode.as_str() {
                 "" | "affine" => format!("{}bit", quant.bits),
-                mode => mode.to_owned(),
+                _ => mode,
             });
         }
         let dtype = self
