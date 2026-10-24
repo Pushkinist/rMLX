@@ -18,21 +18,20 @@ export LC_ALL=C
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SUT="${1:-$HERE/mlx_restore_pin.sh}"
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/mlx-restore-pin-selftest.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
+# shellcheck source=scripts/lib/selftest_support.sh
+. "$HERE/lib/selftest_support.sh"
+st_init mlx-restore-pin-selftest
 
 MLX_V=9.9.9
 MLXC_V=8.8.8
 NEWER_V=9.9.10
-pass=0
-fail=0
 
 # The stub `brew`. It logs every call and changes only the prefix it is given.
 # `brew.fail` in the prefix makes every call fail; `brew.newest` makes a
 # `brew ruby` link the newest keg instead of the one it names. A `brew ruby`
 # call made while the restore holds its lock says so.
-mkdir -p "$WORK/bin"
-cat >"$WORK/bin/brew" <<'STUB'
+mkdir -p "$ST_WORK/bin"
+cat >"$ST_WORK/bin/brew" <<'STUB'
 #!/usr/bin/env bash
 set -uo pipefail
 P="$HOMEBREW_PREFIX"
@@ -74,7 +73,7 @@ unpin | unlink)
 *) exit 0 ;;
 esac
 STUB
-chmod +x "$WORK/bin/brew"
+chmod +x "$ST_WORK/bin/brew"
 
 # keg <root> <formula> <version> <nax: yes|no> [<file to leave out>]: a keg
 # directory as brew leaves it, with every file the script requires.
@@ -98,7 +97,7 @@ keg() {
 
 # new_case <name> -> prints the case directory, with repo, prefix and store.
 new_case() {
-	local c="$WORK/$1"
+	local c="$ST_WORK/$1"
 	mkdir -p "$c/repo/scripts/lib" "$c/repo/crates/rmlx-mlx" "$c/prefix/Cellar" \
 		"$c/store/source-built"
 	cp "$SUT" "$c/repo/scripts/mlx_restore_pin.sh"
@@ -127,6 +126,12 @@ store_tar() {
 # resolves <case> <record> -> the real directory a prefix record names.
 resolves() { (cd "$1/prefix/$2" 2>/dev/null && pwd -P); }
 
+# restore_run <case>: the script under test, run from the case's repo tree.
+restore_run() {
+	PATH="$1/bin:$ST_WORK/bin:$PATH" HOMEBREW_PREFIX="$1/prefix" RMLX_BOTTLE_STORE="$1/store" \
+		bash "$1/repo/scripts/mlx_restore_pin.sh"
+}
+
 # expect <name> <case> <exit> <needles> [<check> <arg>]...
 #   <needles>  one or more lines; each must occur in the output
 #   <check>    a prefix record that must resolve to the Cellar keg <arg>;
@@ -134,39 +139,31 @@ resolves() { (cd "$1/prefix/$2" 2>/dev/null && pwd -P); }
 #              prefix that must match nothing or something; or `no-line`, and
 #              <arg> is text that must not occur in the output
 expect() {
-	local name=$1 c=$2 want=$3 needles=$4 out rc ok=1 why="" needle
+	local name=$1 c=$2 want=$3 needles=$4 line why="" got expected checks=() k i=0
 	shift 4
-	out=$(PATH="$c/bin:$WORK/bin:$PATH" HOMEBREW_PREFIX="$c/prefix" RMLX_BOTTLE_STORE="$c/store" \
-		bash "$c/repo/scripts/mlx_restore_pin.sh" 2>&1)
-	rc=$?
-	[ "$rc" -eq "$want" ] || { ok=0; why="exit $rc, wanted $want"; }
-	while IFS= read -r needle; do
-		grep -qF -- "$needle" <<<"$out" || { ok=0; why="$why; no line with: $needle"; }
-	done <<<"$needles"
+	k=("$@")
+	while IFS= read -r line; do checks+=(--has "$line"); done <<<"$needles"
+	while [ "$i" -lt "${#k[@]}" ]; do
+		[ "${k[$i]}" != no-line ] || checks+=(--lacks "${k[$((i + 1))]}")
+		i=$((i + 2))
+	done
+	st_run restore_run "$c"
+	why=$(st_check "$want" "${checks[@]}")
 	while [ "$#" -ge 2 ]; do
-		if [ "$1" = absent ]; then
-			! compgen -G "$c/prefix/$2" >/dev/null || { ok=0; why="$why; $2 exists"; }
-		elif [ "$1" = present ]; then
-			compgen -G "$c/prefix/$2" >/dev/null || { ok=0; why="$why; no $2"; }
-		elif [ "$1" = no-line ]; then
-			! grep -qF -- "$2" <<<"$out" || { ok=0; why="$why; a line with: $2"; }
-		else
-			local got expected
+		case "$1" in
+		no-line) ;;
+		absent) ! compgen -G "$c/prefix/$2" >/dev/null || why="${why:+$why$'\n'}$2 exists" ;;
+		present) compgen -G "$c/prefix/$2" >/dev/null || why="${why:+$why$'\n'}no $2" ;;
+		*)
 			got=$(resolves "$c" "$1")
 			expected=$(cd "$c/prefix/Cellar/$2" 2>/dev/null && pwd -P)
 			[ -n "$expected" ] && [ "$got" = "$expected" ] ||
-				{ ok=0; why="$why; $1 -> '${got:-nothing}', wanted Cellar/$2"; }
-		fi
+				why="${why:+$why$'\n'}$1 -> '${got:-nothing}', wanted Cellar/$2"
+			;;
+		esac
 		shift 2
 	done
-	if [ "$ok" = 1 ]; then
-		pass=$((pass + 1))
-		echo "  PASS  $name"
-	else
-		fail=$((fail + 1))
-		echo "  FAIL  $name ($why)"
-		while IFS= read -r line; do echo "        $line"; done <<<"$out"
-	fi
+	st_verdict "$name" "$why"
 }
 
 LINKED=(opt/mlx "mlx/$MLX_V" opt/mlx-c "mlx-c/$MLXC_V"
@@ -381,5 +378,4 @@ expect "a link that leaves a record on another keg is a failure" "$c" 1 \
 	"$c/prefix/opt/mlx resolves to '$(cd "$c/prefix/Cellar/mlx/$NEWER_V" && pwd -P)'
 run make mlx-restore-pin again"
 
-echo "mlx_restore_pin_selftest: $pass passed, $fail failed"
-[ "$fail" -eq 0 ]
+st_done
