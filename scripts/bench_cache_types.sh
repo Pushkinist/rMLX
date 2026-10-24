@@ -32,6 +32,13 @@
 # scripts/lib/snapshot_identity.py, the one shell-side producer of it; there is
 # no argument to override it.
 #
+# Exit codes:
+#   0   every combo ran; a combo that failed or was skipped is in the summary
+#   2   usage: bad arguments, a missing snapshot or binary, or a snapshot whose
+#       weights have no label
+#   75  a smoke probe measured and its diagnostic record did not land; each
+#       buffer file is named (docs/METRICS_DB.md section 13, rule 24)
+#
 set -uo pipefail
 
 # ---------------------------------------------------------------------------
