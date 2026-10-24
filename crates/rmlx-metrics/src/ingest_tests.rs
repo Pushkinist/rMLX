@@ -31,6 +31,7 @@ fn valid_record() -> RunRecord {
         notes: None,
         description: None,
         decode_config: None,
+        run_class: Some(RunClass::Gate),
         metrics: vec![MetricEntry {
             name: "decode_tps_warm".to_string(),
             value: Some(100.0),
@@ -96,6 +97,7 @@ fn prompt_by_body_str() {
         "prompt": { "name": "t", "body": "hello" },
         "ts_utc": "2026-05-10T07:30:00Z",
         "hardware_tag": "m5_max_128gb",
+        "run_class": "gate",
         "metrics": [{ "name": "decode_tps_warm", "value": 100.0 }]
     }"#;
     let record: RunRecord = serde_json::from_str(json_str).unwrap();
@@ -120,6 +122,7 @@ fn prompt_by_body_messages() {
         },
         "ts_utc": "2026-05-10T07:30:00Z",
         "hardware_tag": "m5_max_128gb",
+        "run_class": "gate",
         "metrics": [{ "name": "decode_tps_warm", "value": 100.0 }]
     }"#;
     let record: RunRecord = serde_json::from_str(json_str).unwrap();
@@ -143,6 +146,7 @@ fn prompt_by_sha256_only() {
             "prompt": {{ "sha256": "{sha}" }},
             "ts_utc": "2026-05-10T07:30:00Z",
             "hardware_tag": "m5_max_128gb",
+            "run_class": "gate",
             "metrics": [{{ "name": "decode_tps_warm", "value": 100.0 }}]
         }}"#
     );
@@ -299,6 +303,7 @@ fn absent_schema_version_defaults_to_v1() {
         "prompt": { "name": "t", "body": "hi" },
         "ts_utc": "2026-05-10T07:30:00Z",
         "hardware_tag": "m5_max_128gb",
+        "run_class": "gate",
         "metrics": [{ "name": "decode_tps_warm", "value": 100.0 }],
     });
     let r: RunRecord = serde_json::from_value(raw).unwrap();
@@ -322,6 +327,7 @@ fn builder_fills_identity_and_canonicalization() {
         },
     )
     .unwrap()
+    .run_class(RunClass::Gate)
     .metric("decode_tps_warm", Some(119.14), Some(0.6))
     .build()
     .unwrap();
@@ -360,6 +366,7 @@ fn builder_infers_weight_quant_and_namespace_from_a_path() {
         },
     )
     .unwrap()
+    .run_class(RunClass::Gate)
     .metric("decode_tps_warm", Some(110.0), None)
     .build()
     .unwrap();
@@ -385,6 +392,7 @@ fn builder_rejects_a_record_ingest_would_reject() {
         },
     )
     .unwrap()
+    .run_class(RunClass::Gate)
     .build()
     .unwrap_err();
     assert!(matches!(err, Error::NoMeasurements), "got {err:?}");
@@ -461,6 +469,7 @@ fn cbb_shaped_record_with_model_field_ingests() {
         "git_sha": null,
         "build_profile": null,
         "hardware_tag": "m5_max_128gb",
+        "run_class": "gate",
         "notes": "cbb-runner",
         "metrics": [{"name": "decode_tps_warm", "value": 100.0}]
     }"#;
@@ -485,6 +494,7 @@ fn record_with_model_id_alias_ingests() {
         "prompt": {"name": "longctx_4k", "tokens_approx": 4096, "body": "hi"},
         "ts_utc": "2026-05-10T07:30:00Z",
         "hardware_tag": "m5_max_128gb",
+        "run_class": "gate",
         "metrics": [{"name": "decode_tps_warm", "value": 100.0}]
     }"#;
     let r: RunRecord = serde_json::from_str(json_str).unwrap();
@@ -643,6 +653,7 @@ fn the_decode_config_wire_key_reaches_the_column() {
         "prompt": { "name": "p", "body": "hi" },
         "ts_utc": "2026-05-10T07:30:00Z",
         "hardware_tag": "m5_max_128gb",
+        "run_class": "gate",
         "metrics": [{ "name": "decode_tps_warm", "value": 275.7 }]
     }"#;
 
@@ -755,6 +766,7 @@ fn an_absent_decode_config_stores_null() {
         "prompt": { "name": "p", "body": "hi" },
         "ts_utc": "2026-05-10T07:30:00Z",
         "hardware_tag": "m5_max_128gb",
+        "run_class": "gate",
         "metrics": [{ "name": "decode_tps_warm", "value": 142.5 }]
     }"#;
 

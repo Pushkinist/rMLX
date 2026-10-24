@@ -91,6 +91,7 @@ fn record_one(db: &Path, ts: &str, value: f64, backend: &str) {
         "prompt": { "name": "test_prompt", "body": "Hello world" },
         "ts_utc": ts,
         "hardware_tag": "m5_max_128gb",
+        "run_class": "gate",
         "metrics": [{ "name": "decode_tps_warm", "value": value }]
     })
     .to_string();
@@ -197,6 +198,7 @@ fn rank_orders_by_metric() {
             "prompt": { "name": "test_prompt", "body": "Hello world" },
             "ts_utc": ts,
             "hardware_tag": "m5_max_128gb",
+            "run_class": "gate",
             "metrics": [{ "name": "decode_tps_warm", "value": tps }]
         })
         .to_string();
@@ -321,6 +323,7 @@ fn compare_two_backends() {
         "prompt": { "name": "test_prompt", "body": "Hello world" },
         "ts_utc": "2026-01-02T00:00:00Z",
         "hardware_tag": "m5_max_128gb",
+        "run_class": "gate",
         "metrics": [{ "name": "decode_tps_warm", "value": 85.0 }]
     })
     .to_string();
@@ -426,6 +429,7 @@ fn describe_by_run_id_updates_all_rows_in_run() {
         "prompt": { "name": "test_prompt", "body": "Hello world" },
         "ts_utc": "2026-01-01T00:00:00Z",
         "hardware_tag": "m5_max_128gb",
+        "run_class": "gate",
         "metrics": [
             { "name": "decode_tps_warm", "value": 100.0 },
             { "name": "prefill_tps", "value": 200.0 }

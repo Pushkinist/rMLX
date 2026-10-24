@@ -56,6 +56,7 @@ fn record_json(backend: &str, version: Option<&str>) -> String {
         "prompt": { "name": "t", "body": "hi" },
         "ts_utc": "2026-05-10T07:30:00Z",
         "hardware_tag": "m5_max_128gb",
+        "run_class": "gate",
         "metrics": [{ "name": "decode_tps_warm", "value": 100.0 }]
     });
     if let Some(v) = version {

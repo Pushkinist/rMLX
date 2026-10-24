@@ -142,6 +142,7 @@ fn build_record_git_sha_survives_stamp_json() {
         prompt_body: Some(serde_json::json!([{"role": "user", "content": "hi"}])),
         kv_quant: rmlx_kv_quant::KvQuant::None,
         git_sha: Some("cafebabe"),
+        run_class: rmlx_metrics::run_class::RunClass::Gate,
     };
 
     let rec = build_run_record(
@@ -185,6 +186,7 @@ fn build_record_git_sha_absent_is_null() {
         prompt_body: Some(serde_json::json!([{"role": "user", "content": "hi"}])),
         kv_quant: rmlx_kv_quant::KvQuant::None,
         git_sha: None,
+        run_class: rmlx_metrics::run_class::RunClass::Gate,
     };
 
     let rec = build_run_record(
@@ -225,6 +227,7 @@ fn build_record_git_sha_blank_string_is_null() {
         prompt_body: Some(serde_json::json!([{"role": "user", "content": "hi"}])),
         kv_quant: rmlx_kv_quant::KvQuant::None,
         git_sha: Some(""),
+        run_class: rmlx_metrics::run_class::RunClass::Gate,
     };
 
     let rec = build_run_record(
@@ -672,6 +675,7 @@ fn run_baseline_recording(model_dir: &Path, root: &Path) -> anyhow::Result<()> {
             prompt_body: None,
             kv_quant: rmlx_kv_quant::KvQuant::None,
             git_sha: None,
+            run_class: rmlx_metrics::run_class::RunClass::Gate,
         }),
     )
 }

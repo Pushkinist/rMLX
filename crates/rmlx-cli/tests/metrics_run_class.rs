@@ -176,6 +176,19 @@ fn baseline_record_refuses_to_run_without_a_class() {
     assert!(stderr(&out).contains("--run-class"), "{}", stderr(&out));
 }
 
+/// `--record` defaults to off, and the default is not a request to record.
+#[test]
+fn baseline_without_record_needs_no_class() {
+    let td = tempfile::tempdir().unwrap();
+    let out = rmlx(td.path())
+        .args(["baseline", "--model"])
+        .arg(td.path().join("no-such-snapshot"))
+        .args(["--prompt", "hi", "--device", "cpu"])
+        .output()
+        .unwrap();
+    assert!(!stderr(&out).contains("--run-class"), "{}", stderr(&out));
+}
+
 #[test]
 fn eval_ppl_with_a_corpus_refuses_to_run_without_a_class() {
     let td = tempfile::tempdir().unwrap();

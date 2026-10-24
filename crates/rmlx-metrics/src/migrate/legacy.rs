@@ -13,6 +13,7 @@ use crate::error::{Error, Result};
 use crate::identity;
 use crate::ingest::{MetricEntry, PromptRef, RunRecord, RECORD_SCHEMA_VERSION};
 use crate::recorder::Recorder;
+use crate::run_class::RunClass;
 
 // ── Public options + report ───────────────────────────────────────────────────
 
@@ -375,6 +376,7 @@ fn ingest_jsonl_row(
         notes,
         description: None,
         decode_config: None,
+        run_class: Some(RunClass::Gate),
         metrics,
     };
 
@@ -655,6 +657,7 @@ fn migrate_cbb_csv(
             notes,
             description: None,
             decode_config: None,
+            run_class: Some(RunClass::Gate),
             metrics,
         };
 
@@ -842,6 +845,7 @@ fn migrate_records_md(
             notes,
             description: Some("migrated from BENCHMARK_RECORDS.md".to_string()),
             decode_config: None,
+            run_class: Some(RunClass::Gate),
             metrics: vec![MetricEntry {
                 name: "decode_tps_warm".to_string(),
                 value: Some(decode_tps),

@@ -325,3 +325,10 @@ fn itl_stats_produces_three_metrics_with_correct_names() {
         "mean value mismatch"
     );
 }
+
+/// Live-request telemetry is not a controlled run, so it reaches no gate.
+#[test]
+fn a_live_request_row_is_diagnostic() {
+    let run = event_to_run_record(&make_event(MetricKind::KvCacheBytes(1024))).unwrap();
+    assert_eq!(run.run_class, Some(RunClass::Diagnostic));
+}

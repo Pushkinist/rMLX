@@ -168,11 +168,11 @@ fn doctor_detects_unknown_backend() {
             "INSERT INTO observations(
                  backend, model_namespace, model, weight_quant, kv_quant,
                  ctx_max, prompt_id, metric, value, unit, direction,
-                 run_id, ts_utc, hardware_tag, inserted_utc, inserted_by)
+                 run_id, ts_utc, hardware_tag, inserted_utc, inserted_by, run_class)
              VALUES ('pytorch','mlx-community','test-model','mxfp8','none',
                      8192, ?1, 'decode_tps_warm', 42.0, 'tps', 'higher_better',
                      'run0', '2026-01-01T00:00:00Z', 'm5_max_128gb',
-                     '2026-01-01T00:00:00Z', 'test@0.0.1')",
+                     '2026-01-01T00:00:00Z', 'test@0.0.1', 'gate')",
             rusqlite::params![prompt_id],
         )
         .expect("insert bad observation");
@@ -276,11 +276,11 @@ fn f13_doctor_coverage_matrix_no_gaps_when_all_present() {
                 "INSERT INTO observations(
                      backend, model_namespace, model, weight_quant, kv_quant,
                      ctx_max, prompt_id, metric, value, unit, direction,
-                     run_id, ts_utc, hardware_tag, inserted_utc, inserted_by)
+                     run_id, ts_utc, hardware_tag, inserted_utc, inserted_by, run_class)
                  VALUES (?1,'mlx-community','f13-model','mxfp8','none',
                          8192, ?2, ?3, 1.0, ?4, ?5,
                          'f13run', '2026-01-01T00:00:00Z', 'm5_max_128gb',
-                         '2026-01-01T00:00:00Z', 'test@0.0.1')",
+                         '2026-01-01T00:00:00Z', 'test@0.0.1', 'gate')",
                 rusqlite::params![backend, prompt_id, metric, unit, dir.as_str()],
             )
             .expect("insert coverage row");
@@ -454,11 +454,11 @@ fn f17_doctor_no_warning_for_refract_validated_kv_quant() {
                 "INSERT INTO observations(
                      backend, model_namespace, model, weight_quant, kv_quant,
                      ctx_max, prompt_id, metric, value, unit, direction,
-                     run_id, ts_utc, hardware_tag, inserted_utc, inserted_by)
+                     run_id, ts_utc, hardware_tag, inserted_utc, inserted_by, run_class)
                  VALUES ('rmlx','mlx-community','f17-model','mxfp8',?1,
                          8192, ?2, 'decode_tps_warm', 50.0, ?3, ?4,
                          'f17run0', '2026-01-01T00:00:00Z', 'm5_max_128gb',
-                         '2026-01-01T00:00:00Z', 'test@0.0.1')",
+                         '2026-01-01T00:00:00Z', 'test@0.0.1', 'gate')",
                 rusqlite::params![kq, prompt_id, unit, dir.as_str()],
             )
             .expect("insert validated kv_quant row");
@@ -523,11 +523,11 @@ fn f17_doctor_warns_for_refract_unvalidated_kv_quant() {
                 "INSERT INTO observations(
                      backend, model_namespace, model, weight_quant, kv_quant,
                      ctx_max, prompt_id, metric, value, unit, direction,
-                     run_id, ts_utc, hardware_tag, inserted_utc, inserted_by)
+                     run_id, ts_utc, hardware_tag, inserted_utc, inserted_by, run_class)
                  VALUES ('rmlx','mlx-community','f17u-model','mxfp8',?1,
                          8192, ?2, 'decode_tps_warm', 50.0, ?3, ?4,
                          'f17run1', '2026-01-01T00:00:00Z', 'm5_max_128gb',
-                         '2026-01-01T00:00:00Z', 'test@0.0.1')",
+                         '2026-01-01T00:00:00Z', 'test@0.0.1', 'gate')",
                 rusqlite::params![kq, prompt_id, unit, dir.as_str()],
             )
             .expect("insert unvalidated kv_quant row");

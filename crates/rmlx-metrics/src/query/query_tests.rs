@@ -53,6 +53,7 @@ fn make_run(
         notes: None,
         description: None,
         decode_config: None,
+        run_class: Some(crate::run_class::RunClass::Gate),
         metrics: vec![MetricEntry {
             name: metric.into(),
             value: Some(value),
@@ -943,6 +944,20 @@ fn cell_predicate_reaches_every_consumer() {
                 col.name
             );
         }
+    }
+}
+
+/// Every query that feeds a gate reads `gate` rows only. A body that lost the
+/// filter would rank an A/B slot against the champion it is not allowed to
+/// move.
+#[test]
+fn gate_predicate_reaches_every_gate_reader() {
+    let gate = crate::bests_view::gate_rows_sql();
+    for (name, sql) in read::gate_keyed_sql() {
+        assert!(
+            sql.contains(&gate),
+            "{name} does not filter on `{gate}`:\n{sql}"
+        );
     }
 }
 

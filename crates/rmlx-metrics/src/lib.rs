@@ -25,6 +25,7 @@ pub mod error;
 pub mod events;
 pub mod export;
 pub mod identity;
+pub mod import;
 pub mod ingest;
 pub mod legacy_ingest;
 pub mod migrate;
@@ -33,13 +34,10 @@ pub mod prompts;
 pub mod query;
 pub mod recorder;
 pub mod registry;
+pub mod run_class;
 pub mod schema;
 pub mod scope;
 pub mod time_util;
-
-#[cfg(test)]
-#[path = "run_class_tests.rs"]
-mod run_class_tests;
 
 /// Placeholder so the crate is not considered dead code by the compiler.
 pub fn placeholder() -> &'static str {

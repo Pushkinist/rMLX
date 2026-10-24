@@ -22,6 +22,7 @@ fn build_record_includes_ppl_op_name() {
         123.4,
         7777.0,
         None,
+        Some(RunClass::Gate),
         None,
         None,
     )
@@ -68,6 +69,7 @@ fn build_record_stamps_identity_from_the_single_source() {
         0.0,
         0.0,
         Some("cafebabe"),
+        Some(RunClass::Gate),
         None,
         None,
     )
@@ -107,6 +109,7 @@ fn build_record_git_sha_absent_is_null() {
         0.0,
         0.0,
         None,
+        Some(RunClass::Gate),
         None,
         None,
     )
@@ -139,6 +142,7 @@ fn build_record_git_sha_blank_string_is_null() {
         0.0,
         0.0,
         Some(""),
+        Some(RunClass::Gate),
         None,
         None,
     )
@@ -174,6 +178,7 @@ fn build_record_reports_the_codec_and_boundary_it_scored_at() {
             0.0,
             0.0,
             None,
+            Some(RunClass::Gate),
             kv,
             dc,
         )
@@ -241,6 +246,7 @@ fn the_scorer_mode_is_not_a_decode_config_term() {
         0.0,
         0.0,
         None,
+        Some(RunClass::Gate),
         Some(rmlx_kv_quant::KvQuant::Iso3Sym),
         None,
     )
@@ -275,6 +281,7 @@ fn ppl_refuses_an_unrecordable_identity_before_any_work() {
         0,
         "20260526-120000-deadbeef",
         None,
+        Some(RunClass::Gate),
         None,
     )
     .expect_err("identity is refused");
@@ -310,6 +317,7 @@ fn ppl_refuses_an_unrecordable_weight_quant_before_any_work() {
         0,
         "20260526-120000-deadbeef",
         None,
+        Some(RunClass::Gate),
         None,
     )
     .expect_err("weight_quant is refused");

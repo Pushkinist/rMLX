@@ -297,3 +297,11 @@ fn migrating_files_every_existing_row_as_gate() {
         .unwrap();
     assert_eq!(champion, 110.0);
 }
+
+#[test]
+fn the_refusal_names_every_class() {
+    let message = crate::error::Error::MissingRunClass.to_string();
+    for class in crate::run_class::RunClass::ALL {
+        assert!(message.contains(class.as_str()), "{message}");
+    }
+}

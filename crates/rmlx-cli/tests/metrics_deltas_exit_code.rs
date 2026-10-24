@@ -102,6 +102,7 @@ fn make_run(
         "git_sha": git_sha,
         "build_profile": "release",
         "hardware_tag": "m5_max_128gb",
+        "run_class": "gate",
         "prompt_tokens": 4,
         "max_tokens": 32,
         "temperature": 0.0,

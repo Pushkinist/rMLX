@@ -19,6 +19,7 @@ use crate::commands::baseline::{resolve_record_identity, RecordIdentity};
 use crate::commands::parse::ClaimedDevice;
 use anyhow::Result;
 use rmlx_metrics::identity::RunIdentity;
+use rmlx_metrics::run_class::RunClass;
 use rmlx_models::{arch, ppl};
 use tracing::{info, instrument, warn};
 
@@ -55,6 +56,7 @@ pub(crate) fn run_ppl(
     max_tokens: usize,
     run_id: &str,
     git_sha: Option<&str>,
+    run_class: Option<RunClass>,
     kv_quant: Option<rmlx_kv_quant::KvQuant>,
 ) -> Result<()> {
     let device = claimed.device();
@@ -174,6 +176,7 @@ pub(crate) fn run_ppl(
         load_ms,
         score_ms,
         git_sha,
+        run_class,
         kv_quant,
         decode_config: decode_config.as_deref(),
     })
@@ -214,6 +217,7 @@ struct PplRecordArgs<'a> {
     load_ms: f64,
     score_ms: f64,
     git_sha: Option<&'a str>,
+    run_class: Option<RunClass>,
     kv_quant: Option<rmlx_kv_quant::KvQuant>,
     decode_config: Option<&'a str>,
 }
@@ -234,6 +238,7 @@ fn record_ppl_run(args: &PplRecordArgs<'_>) -> Result<()> {
         args.load_ms,
         args.score_ms,
         args.git_sha,
+        args.run_class,
         args.kv_quant,
         args.decode_config,
     )?;
@@ -242,7 +247,7 @@ fn record_ppl_run(args: &PplRecordArgs<'_>) -> Result<()> {
     info!(path = %buf_path.display(), "ppl: wrote §8.5 ingest record");
 
     let db_path = rmlx_core::paths::metrics_db_path();
-    match rmlx_metrics::schema::open(&db_path) {
+    match rmlx_metrics::schema::open_migrated(&db_path) {
         Ok(mut conn) => {
             let inserted_by = RunIdentity::get().inserted_by("rmlx-cli");
             let mut rec_inst = rmlx_metrics::recorder::Recorder::new(&mut conn, inserted_by);
@@ -293,6 +298,7 @@ fn build_ppl_run_record(
     load_ms: f64,
     score_ms: f64,
     git_sha: Option<&str>,
+    run_class: Option<RunClass>,
     kv_quant: Option<rmlx_kv_quant::KvQuant>,
     decode_config: Option<&str>,
 ) -> Result<serde_json::Value> {
@@ -337,6 +343,7 @@ fn build_ppl_run_record(
         "output_first_64": "",
         "notes": format!("corpus={corpus} ctx_window={ctx_window} stride={stride}"),
         "description": format!("ppl {run_id}"),
+        "run_class": run_class,
         "metrics": metrics,
     });
 

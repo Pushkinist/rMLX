@@ -31,6 +31,7 @@ pub static MIGRATIONS: &[(u32, &str)] = &[
         8,
         include_str!("migrations/008_adaptive_depth_decode_config.sql"),
     ),
+    (9, include_str!("migrations/009_observations_run_class.sql")),
 ];
 
 // ---------------------------------------------------------------------------

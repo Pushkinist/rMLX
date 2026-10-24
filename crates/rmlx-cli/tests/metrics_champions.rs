@@ -79,6 +79,7 @@ fn record_one(db: &Path, backend: &str, model: &str, metric: &str, value: f64, t
         "prompt": { "name": "test_prompt", "body": "Hello world" },
         "ts_utc": ts,
         "hardware_tag": "m5_max_128gb",
+        "run_class": "gate",
         "metrics": [{ "name": metric, "value": value }]
     })
     .to_string();

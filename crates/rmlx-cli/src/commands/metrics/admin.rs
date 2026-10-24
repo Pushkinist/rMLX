@@ -230,6 +230,30 @@ pub(super) fn cmd_doctor(db_path: &Path, fix: bool) -> anyhow::Result<()> {
         }
     }
 
+    // ── Check 4b: run_class ───────────────────────────────────────────────────
+    // The column's CHECK refuses a spelling outside the three classes, so only
+    // NULL can be wrong here: a row written around the recorder. NULL is never
+    // `gate`, so the row reaches no gate; it is reported, not repaired.
+    {
+        let (count, first): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT COUNT(*), MIN(id) FROM observations WHERE run_class IS NULL",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .context("query run_class sweep")?;
+        if count == 0 {
+            println!("[ok] run_class: every row states its class");
+        } else {
+            eprintln!(
+                "[WARN] run_class: {count} row(s) state no class (first id={}); they reach \
+                 no gate. Only the recorder writes observations (docs/METRICS_DB.md §13).",
+                first.unwrap_or_default()
+            );
+            warnings += 1;
+        }
+    }
+
     // ── Check 5: direction sanity ──────────────────────────────────────────────
     {
         let mut stmt = conn

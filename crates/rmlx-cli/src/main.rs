@@ -1284,9 +1284,13 @@ enum Cmd {
         /// Emit one §8.5 universal `RunRecord` to `<RMLX_HOME>/metrics/buffer/pending/`
         /// at the end of the run and ingest it into `runs.db` in-process. The
         /// resulting row is visible to `rmlx metrics champions` / the `bests`
-        /// view immediately. Used by the bench harness.
-        #[arg(long, default_value_t = false)]
+        /// view immediately. Used by the bench harness. Needs `--run-class`.
+        #[arg(long, default_value_t = false, requires = "run_class")]
         record: bool,
+        /// Why the run is recorded: `gate`, `ab_arm` or `diagnostic`. Required
+        /// with `--record`; only `gate` rows reach `bests` and the gates.
+        #[arg(long, value_name = "CLASS", requires = "record")]
+        run_class: Option<rmlx_metrics::run_class::RunClass>,
         /// Commit SHA to record as provenance on the emitted metrics row
         /// (only meaningful with `--record`). Optional caller-supplied
         /// value — the binary cannot honestly know what commit it was
@@ -1626,6 +1630,11 @@ enum EvalCmd {
         /// guessed. Absent by default (`git_sha` is `NULL`).
         #[arg(long, value_name = "SHA")]
         git_sha: Option<String>,
+        /// Why the run is recorded: `gate`, `ab_arm` or `diagnostic`. Required
+        /// with a non-empty `--corpus`; only `gate` rows reach `bests` and the
+        /// gates.
+        #[arg(long, value_name = "CLASS")]
+        run_class: Option<rmlx_metrics::run_class::RunClass>,
         #[arg(long, help = KV_QUANT_HELP, long_help = KV_QUANT_LONG_HELP)]
         kv_quant: Option<String>,
         /// Named KV-cache preset (see long-help). Mutually exclusive with
@@ -2601,6 +2610,7 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
             allow_truncate,
             label: bench_label,
             record,
+            run_class,
             git_sha,
             prompts_dir,
             yarn_factor,
@@ -2699,16 +2709,16 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
             let bench_label_ref = bench_label.as_deref();
             let prompt_id_ref = prompt_id_opt.as_deref();
             let git_sha_ref = git_sha.as_deref();
-            let record_args = if record {
-                Some(commands::baseline::BaselineRecordArgs {
+            let record_args = match (record, run_class) {
+                (true, Some(run_class)) => Some(commands::baseline::BaselineRecordArgs {
                     label: bench_label_ref,
                     prompt_id: prompt_id_ref,
                     prompt_body: prompt_body_opt,
                     kv_quant: kv_quant_resolved,
                     git_sha: git_sha_ref,
-                })
-            } else {
-                None
+                    run_class,
+                }),
+                _ => None,
             };
 
             // Build YARN override from CLI flags. None when yarn_factor is absent.
@@ -2829,6 +2839,7 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
                 device,
                 max_tokens,
                 git_sha,
+                run_class,
                 kv_quant,
                 kv_preset,
                 cache_type_k,
@@ -2837,6 +2848,18 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
                 kv_group_size,
                 kv_boundary_layers,
             } => {
+                let run_class = match (corpus.is_empty(), run_class) {
+                    (true, None) => None,
+                    (false, Some(class)) => Some(class),
+                    (false, None) => anyhow::bail!(
+                        "--corpus records the run, so it needs --run-class (gate, ab_arm or \
+                         diagnostic): only gate rows reach bests and the gates"
+                    ),
+                    (true, Some(_)) => anyhow::bail!(
+                        "--run-class names the class of a recorded run, and with no --corpus \
+                         this run is not recorded"
+                    ),
+                };
                 // A KV codec is opt-in here: with none of these flags the
                 // scorer keeps its cacheless full-window forward, which is what
                 // every PPL row already in the DB was measured with. Asking for
@@ -2894,6 +2917,7 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
                     max_tokens,
                     run_id,
                     git_sha.as_deref(),
+                    run_class,
                     kv_quant_resolved,
                 )?;
             }

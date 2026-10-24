@@ -123,6 +123,7 @@ fn canonicalize_backend_unknown() {
             assert_eq!(value, "pytorch");
         }
         Error::MissingBackendVersion { .. }
+        | Error::MissingRunClass
         | Error::Sqlite(_)
         | Error::Io(_)
         | Error::Schema(_)
@@ -199,6 +200,7 @@ fn alias_normalization_non_backend_field_untouched() {
     match err {
         Error::IdentityNotInWhitelist { field, .. } => assert_eq!(field, "weight_quant"),
         Error::MissingBackendVersion { .. }
+        | Error::MissingRunClass
         | Error::Sqlite(_)
         | Error::Io(_)
         | Error::Schema(_)

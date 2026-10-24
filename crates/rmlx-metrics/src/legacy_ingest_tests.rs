@@ -144,7 +144,8 @@ fn legacy_bf16_kv_quant_converts_to_none() {
 /// bug being fixed. It goes to `buffer/failed/` for triage.
 #[test]
 fn converted_legacy_rmlx_record_is_rejected_for_missing_identity() {
-    let run = try_parse_legacy(legacy_json_with_prompt()).expect("should parse");
+    let mut run = try_parse_legacy(legacy_json_with_prompt()).expect("should parse");
+    run.run_class = Some(crate::run_class::RunClass::Gate);
     assert_eq!(run.backend, "rmlx");
     assert!(run.backend_version.is_none());
     assert!(matches!(
@@ -302,7 +303,8 @@ fn try_parse_cbb_rmlx_mxfp8_k8v8() {
 /// DB. Conversion still works; ingest now rejects it instead of recording it.
 #[test]
 fn cbb_rmlx_record_with_git_sha_as_version_is_rejected() {
-    let run = try_parse_cbb(cbb_json_rmlx_mxfp8_kv_k8v8()).unwrap();
+    let mut run = try_parse_cbb(cbb_json_rmlx_mxfp8_kv_k8v8()).unwrap();
+    run.run_class = Some(crate::run_class::RunClass::Gate);
     assert_eq!(run.backend_version.as_deref(), Some("379dcea"));
     assert!(matches!(
         run.validate().unwrap_err(),
@@ -326,7 +328,8 @@ fn cbb_non_rmlx_record_still_validates_without_a_version() {
         "hardware_tag": "m5_max_128gb",
         "metrics": [{"name":"decode_tps_warm","value":55.3}]
     }"#;
-    let run = try_parse_cbb(json).expect("should parse");
+    let mut run = try_parse_cbb(json).expect("should parse");
+    run.run_class = Some(crate::run_class::RunClass::Gate);
     assert_eq!(run.backend, "mlx_lm_tq");
     assert!(run.backend_version.is_none());
     run.validate()
@@ -347,7 +350,8 @@ fn try_parse_cbb_turboquant_backend() {
         "hardware_tag": "m5_max_128gb",
         "metrics": [{"name":"decode_tps_warm","value":55.3}]
     }"#;
-    let run = try_parse_cbb(json).expect("should parse");
+    let mut run = try_parse_cbb(json).expect("should parse");
+    run.run_class = Some(crate::run_class::RunClass::Gate);
     assert_eq!(run.backend, "mlx_lm_tq");
     assert_eq!(run.weight_quant, "8bit");
     assert_eq!(run.kv_quant, "turbo4");

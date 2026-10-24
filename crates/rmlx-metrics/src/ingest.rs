@@ -43,6 +43,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::identity::{self, RunIdentity};
 use crate::registry;
+use crate::run_class::RunClass;
 use crate::time_util::now_iso8601;
 
 /// Wire-format version of the §8.5 record shape understood by this binary.
@@ -168,6 +169,10 @@ pub struct RunRecord {
     /// each other.
     #[serde(default)]
     pub decode_config: Option<String>,
+    /// Why the run was recorded. Only [`RunClass::Gate`] rows reach `bests`
+    /// and the gates. `None` is refused by [`RunRecord::validate`].
+    #[serde(default)]
+    pub run_class: Option<RunClass>,
     /// Free-form run notes (auto-summary, legacy keys, etc.).
     #[serde(default)]
     pub notes: Option<String>,
@@ -386,6 +391,8 @@ impl RunRecord {
                 });
             }
         }
+
+        self.run_class.ok_or(Error::MissingRunClass)?;
 
         // backend
         identity::canonicalize("backend", &self.backend, identity::BACKEND_WHITELIST)?;
@@ -639,9 +646,18 @@ impl RunRecordBuilder {
                 notes: None,
                 description: None,
                 decode_config: None,
+                run_class: None,
                 metrics: Vec::new(),
             },
         })
+    }
+
+    /// Why the run is recorded. Required: [`Self::build`] refuses a record
+    /// with no class.
+    #[must_use]
+    pub fn run_class(mut self, class: RunClass) -> Self {
+        self.rec.run_class = Some(class);
+        self
     }
 
     /// Override the weight quant inferred from the model id.

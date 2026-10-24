@@ -29,6 +29,7 @@ use rmlx_metrics::identity::RunIdentity;
 use rmlx_metrics::ingest::{MetricEntry, PromptRef, RunRecord, RunRecordBuilder};
 use rmlx_metrics::migrate;
 use rmlx_metrics::recorder::Recorder;
+use rmlx_metrics::run_class::RunClass;
 use rmlx_metrics::schema;
 use tokio::sync::mpsc;
 
@@ -443,7 +444,8 @@ fn write_batch_to_db(
 ///
 /// Identity, namespace/model split, weight-quant inference and kv-quant
 /// canonicalization all come from the builder — this function supplies the
-/// measurement and nothing else.
+/// measurement and the class. Live-request telemetry is `diagnostic`: it is
+/// not a controlled run, so it reaches no champion and no gate.
 fn event_to_run_record(ev: &MetricEvent) -> rmlx_metrics::error::Result<RunRecord> {
     RunRecordBuilder::rmlx(
         &ev.model_id,
@@ -458,6 +460,7 @@ fn event_to_run_record(ev: &MetricEvent) -> rmlx_metrics::error::Result<RunRecor
     )?
     .ts_utc(ev.ts_utc.clone())
     .notes("spsc_drainer")
+    .run_class(RunClass::Diagnostic)
     .metrics(event_kind_to_metrics(&ev.kind))
     .build()
 }

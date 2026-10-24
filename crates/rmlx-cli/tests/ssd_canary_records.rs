@@ -54,6 +54,7 @@ fn phase_record(identity: &Value, tag: &str, content: &str) -> Value {
             "body": [{"role": "user", "content": content}],
         },
         "ts_utc": "2026-09-27T10:00:00Z",
+        "run_class": "gate",
         "temperature": 0.0,
         "seed": 42,
         "notes": format!("ssd_canary {tag} phase"),

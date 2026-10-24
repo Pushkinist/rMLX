@@ -893,7 +893,7 @@ pub(crate) fn run_baseline(
         // `bests` right away. Drop the buffer file on success; leave it for
         // `rmlx metrics record --replay-pending` to pick up on failure.
         let db_path = rmlx_core::paths::metrics_db_path();
-        match rmlx_metrics::schema::open(&db_path) {
+        match rmlx_metrics::schema::open_migrated(&db_path) {
             Ok(mut conn) => {
                 let inserted_by = RunIdentity::get().inserted_by("rmlx-cli");
                 let mut rec_inst = rmlx_metrics::recorder::Recorder::new(&mut conn, inserted_by);
@@ -984,6 +984,8 @@ pub(crate) struct BaselineRecordArgs<'a> {
     /// Caller-supplied `--git-sha` value, or `None`. Provenance only — the
     /// binary never derives this itself (see `RunIdentity`'s doc).
     pub git_sha: Option<&'a str>,
+    /// Why the run is recorded (`--run-class`).
+    pub run_class: rmlx_metrics::run_class::RunClass,
 }
 
 /// Resolve a `--prompt-tokens N` flag to the canonical `prompts/longctx_<N/1024>k.json`
@@ -1125,6 +1127,7 @@ fn build_run_record(
         "output_first_64": preview_first_64,
         "notes": notes,
         "description": format!("baseline {run_id}"),
+        "run_class": args.run_class,
         "metrics": metrics,
     });
 

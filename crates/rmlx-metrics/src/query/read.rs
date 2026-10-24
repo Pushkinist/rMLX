@@ -47,7 +47,7 @@ fn history_sql() -> String {
     let (cell_pred, _) = crate::cell::predicate(1);
     format!(
         "SELECT id, backend, model_namespace, model, weight_quant, kv_quant, ctx_max, prompt_id,
-                decode_config, metric, value, ts_utc, git_sha, run_id, description
+                decode_config, metric, value, ts_utc, git_sha, run_id, description, run_class
          FROM observations
          WHERE {cell_pred}"
     )
@@ -58,6 +58,7 @@ fn timeseries_sql(bucket_expr: &str, plausible: &str) -> String {
     let (cell_pred, metric_idx) = crate::cell::predicate(1);
     format!(
         "SELECT {bucket_expr} AS bucket_start,
+                run_class,
                 AVG(value)              AS mean_value,
                 COUNT(*)               AS n
          FROM observations
@@ -79,6 +80,7 @@ fn window_sql(
     ts_idx: usize,
     plausible: &str,
 ) -> String {
+    let gate = crate::bests_view::gate_rows_sql();
     format!(
         "
         SELECT value FROM (
@@ -93,6 +95,7 @@ fn window_sql(
             WHERE {cell_pred}
               AND metric = ?{metric_idx}
               AND ts_utc {ts_cmp} ?{ts_idx}
+              AND {gate}
               AND ({plausible})
         ) WHERE rn = 1"
     )
@@ -296,6 +299,7 @@ pub fn history(
                 git_sha: r.get(12)?,
                 run_id: r.get(13)?,
                 description: r.get(14)?,
+                run_class: r.get(15)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -338,15 +342,16 @@ pub fn timeseries(
         params.push(Box::new(s.to_owned()));
     }
 
-    sql.push_str(" GROUP BY bucket_start ORDER BY bucket_start ASC");
+    sql.push_str(" GROUP BY bucket_start, run_class ORDER BY bucket_start ASC, run_class ASC");
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
         .query_map(params_from_iter(params.iter().map(AsRef::as_ref)), |r| {
             Ok(TimeseriesPoint {
                 bucket_start_utc: r.get(0)?,
-                mean_value: r.get(1)?,
-                n: r.get(2)?,
+                run_class: r.get(1)?,
+                mean_value: r.get(2)?,
+                n: r.get(3)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -360,6 +365,16 @@ fn prompt_prefix_pred(idx: usize) -> String {
     format!(
         "(?{idx} IS NULL
           OR prompt_id IN (SELECT id FROM prompts WHERE substr(name, 1, length(?{idx})) = ?{idx}))"
+    )
+}
+
+/// SQL for the cutoff of [`deltas`]: the first gate row carrying the SHA.
+fn baseline_ts_sql() -> String {
+    format!(
+        "SELECT MIN(ts_utc) FROM observations
+          WHERE (git_sha = ?1 OR git_sha = ?2) AND {} AND {}",
+        crate::bests_view::gate_rows_sql(),
+        prompt_prefix_pred(3)
     )
 }
 
@@ -409,11 +424,7 @@ pub fn deltas(
     let dirty = format!("{since_sha}-dirty");
     let baseline_ts: Option<String> = conn
         .query_row(
-            &format!(
-                "SELECT MIN(ts_utc) FROM observations
-                  WHERE (git_sha = ?1 OR git_sha = ?2) AND {}",
-                prompt_prefix_pred(3)
-            ),
+            &baseline_ts_sql(),
             rusqlite::params![since_sha, dirty, prompt_prefix],
             |r| r.get(0),
         )
@@ -518,6 +529,25 @@ pub fn deltas(
     Ok(result)
 }
 
+/// SQL for the latest gate row of [`regress`]; `?3` NULL matches every `kv_quant`.
+///
+/// "Latest" means latest *measurement*: an implausible row here reads as a
+/// 100% regression against the champion and fails the gate on nothing.
+fn regress_latest_sql() -> String {
+    format!(
+        "SELECT value FROM observations
+          WHERE instr(model, ?1) > 0
+            AND metric = ?2
+            AND (?3 IS NULL OR kv_quant = ?3)
+            AND {}
+            AND ({})
+          ORDER BY ts_utc DESC
+          LIMIT 1",
+        crate::bests_view::gate_rows_sql(),
+        crate::bests_view::plausible_sql("value")
+    )
+}
+
 /// Compare the latest observation vs the `bests` champion for one model + metric.
 ///
 /// `model` is matched as a **substring** of `bests.model` / `observations.model`
@@ -580,40 +610,14 @@ pub fn regress(
         .optional()?
     };
 
-    // Step 2: find the most-recent observation for this (model, metric).
-    // "Latest" means latest *measurement*: an implausible row here reads as a
-    // 100% regression against the champion and fails the gate on nothing.
-    let plausible = crate::bests_view::plausible_sql("value");
-    let latest_value: Option<f64> = if let Some(kv) = kv_quant {
-        conn.query_row(
-            &format!(
-                "SELECT value FROM observations
-                  WHERE instr(model, ?1) > 0
-                    AND metric   = ?2
-                    AND kv_quant = ?3
-                    AND ({plausible})
-                  ORDER BY ts_utc DESC
-                  LIMIT 1"
-            ),
-            rusqlite::params![model, metric, kv],
+    // Step 2: find the most-recent gate observation for this (model, metric).
+    let latest_value: Option<f64> = conn
+        .query_row(
+            &regress_latest_sql(),
+            rusqlite::params![model, metric, kv_quant],
             |r| r.get(0),
         )
-        .optional()?
-    } else {
-        conn.query_row(
-            &format!(
-                "SELECT value FROM observations
-                  WHERE instr(model, ?1) > 0
-                    AND metric = ?2
-                    AND ({plausible})
-                  ORDER BY ts_utc DESC
-                  LIMIT 1"
-            ),
-            rusqlite::params![model, metric],
-            |r| r.get(0),
-        )
-        .optional()?
-    };
+        .optional()?;
 
     // Step 3: compute delta and regression flag.
     let delta_pct = match (champion_value, latest_value) {
@@ -657,6 +661,40 @@ pub fn regress(
     })
 }
 
+/// SQL for the cells [`champions`] lists: those a gate row measured.
+fn champion_cells_sql() -> String {
+    format!(
+        "SELECT DISTINCT model_namespace, model, weight_quant, kv_quant
+         FROM observations
+         WHERE (?1 IS NULL OR backend = ?1)
+           AND {}
+         ORDER BY model_namespace ASC, model ASC, weight_quant ASC, kv_quant ASC",
+        crate::bests_view::gate_rows_sql()
+    )
+}
+
+/// SQL for one backend's champion in [`champions`], read from gate rows.
+fn champion_of_backend_sql() -> String {
+    format!(
+        "SELECT value, unit, backend, run_id, git_sha, ts_utc
+         FROM observations
+         WHERE model_namespace = ?1
+           AND model           = ?2
+           AND weight_quant    = ?3
+           AND kv_quant        = ?4
+           AND metric          = ?5
+           AND backend         = ?6
+           AND {}
+         ORDER BY
+             CASE direction
+                 WHEN 'higher_better' THEN -value
+                 ELSE value
+             END ASC
+         LIMIT 1",
+        crate::bests_view::gate_rows_sql()
+    )
+}
+
 /// One row per (model_namespace, model, weight_quant, kv_quant) with per-metric
 /// champions. When `backend_filter` is None, picks the overall champion across all
 /// backends; when Some, picks per-backend champion only.
@@ -669,12 +707,7 @@ pub fn champions(conn: &Connection, backend_filter: Option<&str>) -> Result<Vec<
     type CellKey = (String, String, String, String);
 
     let distinct_cells: Vec<CellKey> = {
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT model_namespace, model, weight_quant, kv_quant
-             FROM observations
-             WHERE (?1 IS NULL OR backend = ?1)
-             ORDER BY model_namespace ASC, model ASC, weight_quant ASC, kv_quant ASC",
-        )?;
+        let mut stmt = conn.prepare(&champion_cells_sql())?;
         let x = stmt
             .query_map(rusqlite::params![backend_filter], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
@@ -701,23 +734,8 @@ pub fn champions(conn: &Connection, backend_filter: Option<&str>) -> Result<Vec<
              END ASC
          LIMIT 1";
 
-    let bests_with_backend_sql = "SELECT value, unit, backend, run_id, git_sha, ts_utc
-         FROM observations
-         WHERE model_namespace = ?1
-           AND model           = ?2
-           AND weight_quant    = ?3
-           AND kv_quant        = ?4
-           AND metric          = ?5
-           AND backend         = ?6
-         ORDER BY
-             CASE direction
-                 WHEN 'higher_better' THEN -value
-                 ELSE value
-             END ASC
-         LIMIT 1";
-
     let mut stmt_no_filter = conn.prepare(bests_no_filter_sql)?;
-    let mut stmt_with_backend = conn.prepare(bests_with_backend_sql)?;
+    let mut stmt_with_backend = conn.prepare(&champion_of_backend_sql())?;
 
     let mut rows: Vec<ChampionRow> = Vec::with_capacity(distinct_cells.len());
 
@@ -799,6 +817,33 @@ pub(super) fn cell_keyed_sql() -> Vec<(&'static str, String)> {
             "deltas:best_after",
             window_sql(">", &cell_pred, metric_idx, ts_idx, &plausible),
         ),
+    ]
+}
+
+/// Every SQL body in this module that reads `observations` for a gate,
+/// paired with a name for the failure message. `bests` reads are gated by the
+/// view itself. `gate_predicate_reaches_every_gate_reader` asserts each body
+/// carries [`crate::bests_view::gate_rows_sql`].
+#[cfg(test)]
+pub(super) fn gate_keyed_sql() -> Vec<(&'static str, String)> {
+    let plausible = crate::bests_view::plausible_sql("value");
+    let (cell_pred, metric_idx) = crate::cell::predicate(1);
+    let ts_idx = metric_idx + 1;
+
+    vec![
+        ("bests", crate::bests_view::create_sql()),
+        ("deltas:baseline_ts", baseline_ts_sql()),
+        (
+            "deltas:best_in_window",
+            window_sql("<=", &cell_pred, metric_idx, ts_idx, &plausible),
+        ),
+        (
+            "deltas:best_after",
+            window_sql(">", &cell_pred, metric_idx, ts_idx, &plausible),
+        ),
+        ("regress:latest", regress_latest_sql()),
+        ("champions:cells", champion_cells_sql()),
+        ("champions:of_backend", champion_of_backend_sql()),
     ]
 }
 

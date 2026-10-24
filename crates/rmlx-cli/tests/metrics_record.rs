@@ -94,6 +94,7 @@ fn valid_record_json() -> String {
         },
         "ts_utc": "2026-05-10T07:30:00Z",
         "hardware_tag": "m5_max_128gb",
+        "run_class": "gate",
         "metrics": [
             { "name": "decode_tps_warm", "value": 100.0 }
         ]
@@ -163,6 +164,7 @@ fn record_file_kept_on_failure() {
         "prompt": { "name": "p", "body": "x" },
         "ts_utc": "2026-05-10T07:30:00Z",
         "hardware_tag": "m5_max_128gb",
+        "run_class": "gate",
         "metrics": [{ "name": "decode_tps_warm", "value": 1.0 }]
     })
     .to_string();
@@ -304,6 +306,7 @@ fn replay_pending_moves_invalid_to_failed() {
         "prompt": { "name": "p", "body": "x" },
         "ts_utc": "2026-05-10T07:30:00Z",
         "hardware_tag": "m5_max_128gb",
+        "run_class": "gate",
         "metrics": [{ "name": "decode_tps_warm", "value": 1.0 }]
     })
     .to_string();
