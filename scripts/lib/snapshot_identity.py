@@ -8,11 +8,12 @@ They are facts about the directory being served and are read from it:
 * namespace and model from the directory name, split on `__` (docs/METRICS_DB.md
   §5.1). A name without the separator is `local/<name>`.
 * `weight_quant` from `config.json`, which is the checkpoint's own statement:
-  `quantization.mode` when that names a format (`mxfp8`), the bit width when it
-  names a *scheme* instead (`affine` at 8 bits is `8bit`), `paro` for a
-  ParoQuant checkpoint, and the storage dtype for an unquantized one. Anything
-  that does not land on the §5.2 whitelist is refused rather than guessed at — a
-  wrong label here puts the measurement in another checkpoint's cell.
+  `paro` for a ParoQuant checkpoint, else `quantization.mode` verbatim
+  (`mxfp8`), or the bit width when the mode is absent or `affine`, which names
+  a *scheme* (`affine` at 8 bits is `8bit`), else the storage dtype for an
+  unquantized one. Anything that does not land on the §5.2 whitelist is
+  refused rather than guessed at — a wrong label here puts the measurement in
+  another checkpoint's cell.
 
 Output (stdout), one `key=value` per line:
 
