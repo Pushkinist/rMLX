@@ -31,3 +31,7 @@ pub(crate) fn exit_code(outcome: Result<i32>) -> Result<i32> {
         Err(e) => e.downcast::<ExitWith>().map(|exit| exit.0),
     }
 }
+
+#[cfg(test)]
+#[path = "exit_tests.rs"]
+mod tests;

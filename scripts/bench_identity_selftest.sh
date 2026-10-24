@@ -243,8 +243,13 @@ baseline)
 	echo "decode_tps=12.5"
 	# Like the real binary: the measurement prints, then a record that did not
 	# land fails the run.
-	case " \$* " in *" --run-class gate "*) [ -z "\${STUB_FAIL_GATE:-}" ] || exit 1 ;; esac
-	case " \$* " in *" measured "*) [ -z "\${STUB_FAIL_MEASURED:-}" ] || exit 1 ;; esac
+	pending() {
+		echo "error: baseline: measured, but the record did not reach runs.db; it is kept at \$RMLX_HOME/metrics/buffer/pending/stub.json for \\\`rmlx metrics record --replay-pending\\\`" >&2
+		exit 75
+	}
+	case " \$* " in *" --run-class gate "*) [ -z "\${STUB_FAIL_GATE:-}" ] || pending ;; esac
+	case " \$* " in *" measured "*) [ -z "\${STUB_FAIL_MEASURED:-}" ] || pending ;; esac
+	case " \$* " in *" measured "*) [ -z "\${STUB_CRASH_MEASURED:-}" ] || exit 1 ;; esac
 	;;
 esac
 STUBEOF
@@ -262,6 +267,7 @@ canary_case() {
 	[ -z "$identity" ] || env_extra+=("RMLX_IDENTITY_JSON=$identity")
 	[ -z "${STUB_FAIL_GATE:-}" ] || env_extra+=("STUB_FAIL_GATE=1")
 	[ -z "${STUB_FAIL_MEASURED:-}" ] || env_extra+=("STUB_FAIL_MEASURED=1")
+	[ -z "${STUB_CRASH_MEASURED:-}" ] || env_extra+=("STUB_CRASH_MEASURED=1")
 	if [ -n "$shared" ]; then
 		printf '%s\n' '{"timestamp":"2026-09-03T00:00:00Z","level":"INFO","fields":{"message":"rmlx start","version":"9.9.9","run_id":"stub","pid":4242}}' \
 			'{"timestamp":"2026-09-03T00:00:00Z","level":"INFO","fields":{"message":"cache-type resolved","arch":"Stub","kv_quant":"none"}}' \
@@ -314,16 +320,22 @@ STUB_FAIL_GATE=1 canary_case canary_gate_record_fails "" ""
 bad=""
 [ "$CANARY_STATUS" -eq 1 ] || bad="exit=$CANARY_STATUS (want 1)"
 /usr/bin/grep -q 'the gate record failed' "$CANARY_HOME/out.log" || bad="$bad; no error naming the gate record"
-verdict canary_gate_record_fails "a gate record that fails stops the canary" "${bad#; }"
+verdict canary_gate_record_fails "a gate record that does not land (exit 75) stops the canary" "${bad#; }"
 
-STUB_FAIL_MEASURED=1 canary_case canary_diagnostic_record_fails "" ""
+STUB_FAIL_MEASURED=1 canary_case canary_diagnostic_record_pending "" ""
+bad=""
+[ "$CANARY_STATUS" -eq 75 ] || bad="exit=$CANARY_STATUS (want 75)"
+[ "$(csv_field "$CANARY_HOME" 6)" = 12.5 ] || bad="$bad; the measurement was not kept (csv decode_tps=$(csv_field "$CANARY_HOME" 6))"
+/usr/bin/grep -q 'record pending: .*metrics/buffer/pending/stub.json' "$CANARY_HOME/out.log" ||
+	bad="$bad; the buffer file is not named"
+/usr/bin/grep -q 'canary INCOMPLETE: 3 diagnostic record' "$CANARY_HOME/out.log" || bad="$bad; no INCOMPLETE line counting the 3 pending records"
+verdict canary_diagnostic_record_pending "a diagnostic run whose record does not land keeps its measurement, names the file, and the canary ends 75" "${bad#; }"
+
+STUB_CRASH_MEASURED=1 canary_case canary_measured_run_crashes "" ""
 bad=""
 [ "$CANARY_STATUS" -eq 1 ] || bad="exit=$CANARY_STATUS (want 1)"
-/usr/bin/grep -q 'measured run failed, or its record did not land' "$CANARY_HOME/out.log" ||
-	bad="$bad; no error naming the run whose record did not land"
-[ ! -f "$CANARY_HOME/bench/perf_canary.csv" ] || [ "$(wc -l <"$CANARY_HOME/bench/perf_canary.csv" | tr -d ' ')" = 1 ] ||
-	bad="$bad; a CSV row was written for a run that did not record"
-verdict canary_diagnostic_record_fails "a measured run whose record does not land stops the canary, saying so" "${bad#; }"
+/usr/bin/grep -q 'the measured run failed (exit 1' "$CANARY_HOME/out.log" || bad="$bad; no error naming the run that failed"
+verdict canary_measured_run_crashes "a measured run that fails without measuring stops the canary" "${bad#; }"
 
 printf '{}\n' >"$CANARY_MODEL/config.json"
 canary_case canary_unrecordable_identity "" ""

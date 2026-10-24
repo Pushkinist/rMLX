@@ -14,11 +14,13 @@
 # recorded: a one-token generation has no decode rate, and the recorder refuses
 # a record that carries none.
 #
-# Every one of those records must land, so a snapshot whose identity cannot be
-# recorded (`lib/snapshot_identity.py`, which labels a snapshot as `rmlx
-# baseline --record` does) stops the canary before its first run, and a run
-# whose record did not land (`baseline --record` then exits non-zero) stops it
-# too.
+# A snapshot whose identity cannot be recorded (`lib/snapshot_identity.py`,
+# which labels a snapshot as `rmlx baseline --record` does) stops the canary
+# before its first run. A gate record that does not land stops it: the gate
+# has no row to read. A diagnostic run that measured and whose record did not
+# land (`baseline` exit 75) keeps its measurement, names its buffer file, and
+# the canary ends with exit 75 after the last model (docs/METRICS_DB.md
+# section 13, rule 24).
 #
 # The default mode measures ONE build. All of its measured runs for a model
 # happen together, which is fine for tracking one build over time but not for
@@ -116,16 +118,23 @@ if [[ "${GIT_SHA}" != unknown* ]]; then
     git_sha_args=(--git-sha "${GIT_SHA}")
 fi
 
+source "${REPO_ROOT}/scripts/lib/record_pending.sh"
+# One line per diagnostic run that measured and whose record did not land.
+CANARY_PENDING="$(mktemp "${TMPDIR:-/tmp}/perf_canary_pending.XXXXXX")"
+trap 'rm -f "${CANARY_PENDING}"' EXIT
+
 # Helper: run one baseline, recorded as diagnostic, and parse decode_tps from stdout.
-# `baseline --record` exits non-zero when its record did not land, and that
-# stops the canary.
+# A run that measured and whose record did not land (exit
+# RECORD_PENDING_EXIT) keeps its measurement: the buffer file is named, and the
+# canary ends non-zero. Any other failure stops it.
 # Usage: run_once <phase> <model_path> [--kv-quant <tag>]
 run_once() {
     local phase="$1"
     local model_path="$2"
     local extra_args=("${@:3}")
-    local out
-    if ! out="$(RMLX_HOME="${RMLX_HOME}" "${BINARY}" baseline \
+    local out rc=0 err
+    err="$(mktemp "${TMPDIR:-/tmp}/perf_canary_err.XXXXXX")"
+    out="$(RMLX_HOME="${RMLX_HOME}" "${BINARY}" baseline \
         --model "${model_path}" \
         --prompt-tokens "${PROMPT_TOKENS}" \
         --max-tokens "${MAX_TOKENS}" \
@@ -134,11 +143,18 @@ run_once() {
         ${git_sha_args[@]+"${git_sha_args[@]}"} \
         --record --run-class diagnostic \
         ${extra_args[@]+"${extra_args[@]}"} \
-        2>/dev/null)"; then
-        echo "ERROR: ${model_path##*/}: the ${phase} run failed, or its record did not land (see ${LOG_DIR})" >&2
+        2>"${err}")" || rc=$?
+    if [[ "${rc}" -eq "${RECORD_PENDING_EXIT}" ]]; then
+        record_pending_note "${err}"
+        echo "${model_path##*/} ${phase}" >>"${CANARY_PENDING}"
+    elif [[ "${rc}" -ne 0 ]]; then
+        rm -f "${err}"
+        echo "ERROR: ${model_path##*/}: the ${phase} run failed (exit ${rc}; see ${LOG_DIR})" >&2
         exit 1
     fi
-    printf '%s\n' "${out}" | grep -o 'decode_tps=[0-9.]*' | cut -d= -f2
+    rm -f "${err}"
+    # An empty reading is the caller's to judge, not this function's.
+    printf '%s\n' "${out}" | grep -o 'decode_tps=[0-9.]*' | cut -d= -f2 || true
 }
 
 # Which KV codec a one-token run resolves, read out of that run's own log.
@@ -297,3 +313,7 @@ done
 echo "" >&2
 echo "LEGACY CSV: ${CSV}" >&2
 echo "DB: ${RMLX_HOME}/metrics/runs.db (use 'make canary-gate SHA=<sha>' to gate)" >&2
+if [[ -s "${CANARY_PENDING}" ]]; then
+    echo "canary INCOMPLETE: $(wc -l <"${CANARY_PENDING}" | tr -d ' ') diagnostic record(s) did not land (named above)" >&2
+    exit "${RECORD_PENDING_EXIT}"
+fi
