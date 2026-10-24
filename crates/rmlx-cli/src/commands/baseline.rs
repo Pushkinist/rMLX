@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::commands::parse::ClaimedDevice;
+use anyhow::Context as _;
 use rmlx_metrics::events::EventRecorder;
 use rmlx_metrics::identity::RunIdentity;
 use rmlx_mlx::Device;
@@ -940,11 +941,11 @@ pub(crate) struct RecordIdentity {
 
 /// Resolve and check the identity of a run before it does any work.
 ///
-/// `weight_quant` is derived from the snapshot's quantization config and
-/// checked against the metrics DB's list here, so a value the DB would refuse
-/// stops the run now and not after the measurement. A config with no
-/// `quantization` is `bf16`; a missing or unreadable config is refused, since
-/// either would otherwise record a label nothing measured.
+/// `weight_quant` is the label the snapshot's own config describes
+/// ([`weight_quant_label`]), checked against the metrics DB's list here, so a
+/// value the DB would refuse stops the run now and not after the measurement.
+/// A missing or unreadable config, or one that names no weight format, is
+/// refused rather than recorded under a label nothing measured.
 pub(crate) fn resolve_record_identity(model_path: &Path) -> anyhow::Result<RecordIdentity> {
     let (namespace, model) = rmlx_metrics::identity::snapshot_identity(model_path)?;
     let config_path = model_path.join("config.json");
@@ -954,18 +955,16 @@ pub(crate) fn resolve_record_identity(model_path: &Path) -> anyhow::Result<Recor
             config_path.display()
         );
     }
-    let weight_quant = rmlx_loader::load_config(model_path)
-        .map_err(|e| {
-            anyhow::anyhow!("read the snapshot's quantization for the recorded weight_quant: {e}")
-        })?
-        .quantization
-        .map_or_else(
-            || "bf16".to_string(),
-            |q| match q.mode_or_default() {
-                "mxfp8" | "mxfp4" | "nvfp4" => q.mode_or_default().to_string(),
-                _ => format!("{}bit", q.bits),
-            },
+    let config = rmlx_loader::load_config(model_path)
+        .context("read the snapshot's config for the recorded weight_quant")?;
+    let Some(weight_quant) = weight_quant_label(&config) else {
+        anyhow::bail!(
+            "{} names no weight format (no `quantization`, no ParoQuant `quantization_config`, \
+             and no `dtype` / `torch_dtype` of bfloat16 or float16), so the run's weight_quant \
+             cannot be recorded",
+            config_path.display()
         );
+    };
     let weight_quant = rmlx_metrics::identity::canonicalize(
         "weight_quant",
         &weight_quant,
@@ -976,6 +975,37 @@ pub(crate) fn resolve_record_identity(model_path: &Path) -> anyhow::Result<Recor
         model,
         weight_quant,
     })
+}
+
+/// The `docs/METRICS_DB.md` §5.2 label a snapshot's config describes, or `None`.
+///
+/// Kept in step with `weight_quant` in `scripts/lib/snapshot_identity.py`, the
+/// label the shell benches file a snapshot under: the two disagreeing would
+/// split one model across two cells.
+fn weight_quant_label(config: &rmlx_loader::ModelConfig) -> Option<String> {
+    if config.is_paroquant() {
+        return Some("paro".to_owned());
+    }
+    if let Some(quant) = &config.quantization {
+        let mode = quant.mode_or_default();
+        return Some(
+            if rmlx_metrics::identity::WEIGHT_QUANT_WHITELIST.contains(&mode) {
+                mode.to_owned()
+            } else {
+                format!("{}bit", quant.bits)
+            },
+        );
+    }
+    let dtype = config
+        .dtype
+        .as_deref()
+        .filter(|d| !d.is_empty())
+        .or_else(|| config.extras.get("torch_dtype").and_then(|v| v.as_str()));
+    match dtype {
+        Some("bfloat16") => Some("bf16".to_owned()),
+        Some("float16") => Some("fp16".to_owned()),
+        _ => None,
+    }
 }
 
 /// Arguments needed to emit one §8.5 universal `RunRecord` to the metrics

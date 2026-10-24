@@ -53,7 +53,12 @@ def split_model_dir(name):
 
 
 def weight_quant(config):
-    """The §5.2 label this checkpoint's own metadata describes, or None."""
+    """The §5.2 label this checkpoint's own metadata describes, or None.
+
+    Kept in step with `weight_quant_label` in
+    `crates/rmlx-cli/src/commands/baseline.rs`, the label `rmlx baseline
+    --record` files the same snapshot under.
+    """
     quant_config = config.get("quantization_config") or {}
     if quant_config.get("quant_method") == "paroquant":
         return "paro"
