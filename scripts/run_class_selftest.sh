@@ -11,6 +11,7 @@
 #     row `recorded_run_class` only when the run says it ingested its record.
 #   - ingest/codec_inertness_ingest.py skips a row the probe already recorded,
 #     and refuses a recorder built before the run class before writing anything.
+#   - ingest/llama_bench_ingest.py refuses that recorder before writing anything.
 #
 # No GPU, no model, no DB.
 #
@@ -181,6 +182,23 @@ bad=""
 grep -q "rmlx_old has no \`metrics record --run-class\`" <<<"$out" || bad="${bad:+$bad; }no refusal naming the binary: $out"
 [ ! -d "$WORK/home/bench/codec_inertness/records" ] || bad="${bad:+$bad; }records were staged before the refusal"
 verdict ingest_refuses_a_classless_recorder "a recorder without --run-class is refused before anything is written" "$bad"
+
+# ── llama_bench_ingest.py ─────────────────────────────────────────────────────
+#
+# It finds its recorder as `rmlx` on PATH first, so the old recorder goes there.
+mkdir -p "$WORK/oldbin" "$WORK/llama_root"
+cp "$OLD_RECORDER" "$WORK/oldbin/rmlx"
+printf '[]\n' >"$WORK/llama_bench.json"
+set +e
+out="$(PATH="$WORK/oldbin:$PATH" RMLX_REPO_ROOT="$WORK/llama_root" \
+	python3 "$REPO_ROOT/scripts/ingest/llama_bench_ingest.py" "$WORK/llama_bench.json" --record 2>&1)"
+status=$?
+set -e
+bad=""
+[ "$status" -ne 0 ] || bad="exit 0: a classless recorder was accepted"
+grep -q "oldbin/rmlx has no \`metrics record --run-class\`" <<<"$out" || bad="${bad:+$bad; }no refusal naming the binary: $out"
+[ ! -d "$WORK/llama_root/metrics" ] || bad="${bad:+$bad; }a record was written before the refusal"
+verdict llama_bench_refuses_a_classless_recorder "a recorder without --run-class is refused before anything is written" "$bad"
 
 echo
 echo "passed=$PASSED failed=$FAILED"

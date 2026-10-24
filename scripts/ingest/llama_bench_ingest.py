@@ -71,6 +71,7 @@ from typing import Any
 # rMLX repo root: this file lives at scripts/ingest/llama_bench_ingest.py.
 _SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPT_DIR.parent / "lib"))
+from recorder_check import require_run_class_recorder  # noqa: E402
 from snapshot_identity import split_model_dir  # noqa: E402
 RMLX_REPO_ROOT = Path(os.environ.get("RMLX_REPO_ROOT", str(_SCRIPT_DIR.parents[1])))
 _BUFFER_PENDING = RMLX_REPO_ROOT / "metrics" / "buffer" / "pending"
@@ -548,6 +549,11 @@ def main() -> None:
 
     if args.dry_run and args.record:
         parser.error("--dry-run and --record are mutually exclusive")
+    if args.record:
+        rmlx_bin = _find_rmlx_bin()
+        if rmlx_bin is None:
+            raise SystemExit("[llama_bench_ingest] ERROR: rmlx binary not found; nothing written")
+        require_run_class_recorder(rmlx_bin)
 
     n = ingest(
         source_path=args.input,

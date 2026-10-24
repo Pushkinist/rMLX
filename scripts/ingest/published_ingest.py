@@ -95,6 +95,7 @@ sys.path.insert(0, str(_SCRIPT_DIR.parent))
 sys.path.insert(0, str(_SCRIPT_DIR.parent / "lib"))
 from published_requery import LABEL_PATTERN, Unreadable, check  # noqa: E402
 from published_samples import body_sha256  # noqa: E402
+from recorder_check import require_run_class_recorder  # noqa: E402
 
 RMLX_REPO_ROOT = Path(os.environ.get("RMLX_REPO_ROOT", str(_SCRIPT_DIR.parents[1])))
 # Runtime state lives under a single root (CLAUDE.md). `RMLX_HOME` wins; the
@@ -632,6 +633,9 @@ def main() -> int:
             print(json.dumps(trimmed, indent=2))
         print(f"{len(records)} records", file=sys.stderr)
         return 0
+
+    if args.record:
+        require_run_class_recorder(args.rmlx_bin)
 
     stamp = result["ts_utc"].replace("-", "").replace(":", "")
     staging = Path(args.result).resolve().parent / STAGING_DIR
