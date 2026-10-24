@@ -771,8 +771,10 @@ change to what `bests` publishes, such as a `METRICS_SCHEMA.md` §4.1 bounds cha
     migration 9 on refuses a DB at a later version than it knows, naming
     both: every `rmlx metrics` subcommand that opens the DB, reader, writer
     or `doctor`, except `backup` and `restore`, which only copy the file; and
-    every other command unless it runs with `--metrics off`,
-    since each opens the DB at start to record its events. A scratch
+    `serve`, `chat`, `transcribe`, `info`, `healthcheck`, `baseline`, `bench`
+    and `eval ppl` unless run with `--metrics off`, since each opens the DB
+    at start to record its events. `claim`, `profile`, `kv-calibrate` and
+    `eval spec-answer` do not open it. A scratch
     `RMLX_HOME`, or `--db` for `rmlx metrics`, points it at another DB.
     `make canary-gate` under `git bisect` builds the old commit's binary with
     that commit's own `Makefile`. When bisecting across migration 9, run
