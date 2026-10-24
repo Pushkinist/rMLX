@@ -401,11 +401,11 @@ fn clone_row_with(conn: &Connection, metric: &str, value: f64, ts_utc: &str, git
         "INSERT INTO observations (
              backend, model_namespace, model, weight_quant, kv_quant, ctx_max, prompt_id,
              metric, value, unit, direction, run_id, ts_utc, git_sha, hardware_tag,
-             inserted_utc, inserted_by
+             inserted_utc, inserted_by, run_class
          )
          SELECT backend, model_namespace, model, weight_quant, kv_quant, ctx_max, prompt_id,
                 metric, ?1, unit, direction, run_id, ?2, ?3, hardware_tag,
-                inserted_utc, inserted_by
+                inserted_utc, inserted_by, run_class
            FROM observations WHERE metric = ?4 LIMIT 1",
         rusqlite::params![value, ts_utc, git_sha, metric],
     )
@@ -548,6 +548,45 @@ fn champions_with_backend_filter_picks_per_backend_best() {
     let cell = rows[0].metrics.get("decode_tps_warm").unwrap();
     assert_eq!(cell.value, 100.0);
     assert_eq!(cell.backend, "rmlx");
+}
+
+/// The per-backend champion reads `observations` in its own SQL, so it must
+/// refuse the rows `bests` refuses: a gate row outside its bound is not a
+/// champion, and a cell whose only gate rows are outside it is not listed.
+#[test]
+fn champions_with_backend_filter_do_not_rank_an_implausible_row() {
+    let mut conn = test_conn();
+    seed_two_backend_one_metric(&mut conn);
+    clone_row_with(
+        &conn,
+        "decode_tps_warm",
+        1.0e9,
+        "2026-05-02T10:00:00Z",
+        "sha",
+    );
+    conn.execute(
+        "UPDATE observations SET backend = 'rmlx' WHERE value = 1.0e9",
+        [],
+    )
+    .unwrap();
+    let rows = champions(&conn, Some("rmlx")).unwrap();
+    let cell = rows[0].metrics.get("decode_tps_warm").unwrap();
+    assert_eq!(cell.value, 100.0);
+
+    conn.execute(
+        "UPDATE observations SET model = 'only-implausible' WHERE value = 1.0e9",
+        [],
+    )
+    .unwrap();
+    let models: Vec<String> = champions(&conn, Some("rmlx"))
+        .unwrap()
+        .into_iter()
+        .map(|r| r.model)
+        .collect();
+    assert!(
+        !models.iter().any(|m| m == "only-implausible"),
+        "a cell with no plausible gate row was listed: {models:?}"
+    );
 }
 
 #[test]

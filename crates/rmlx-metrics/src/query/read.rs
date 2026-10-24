@@ -661,19 +661,22 @@ pub fn regress(
     })
 }
 
-/// SQL for the cells [`champions`] lists: those a gate row measured.
+/// SQL for the cells [`champions`] lists: those a plausible gate row measured.
 fn champion_cells_sql() -> String {
     format!(
         "SELECT DISTINCT model_namespace, model, weight_quant, kv_quant
          FROM observations
          WHERE (?1 IS NULL OR backend = ?1)
            AND {}
+           AND ({})
          ORDER BY model_namespace ASC, model ASC, weight_quant ASC, kv_quant ASC",
-        crate::bests_view::gate_rows_sql()
+        crate::bests_view::gate_rows_sql(),
+        crate::bests_view::plausible_sql("value")
     )
 }
 
-/// SQL for one backend's champion in [`champions`], read from gate rows.
+/// SQL for one backend's champion in [`champions`], read from plausible gate
+/// rows, as `bests` ranks them.
 fn champion_of_backend_sql() -> String {
     format!(
         "SELECT value, unit, backend, run_id, git_sha, ts_utc
@@ -685,13 +688,15 @@ fn champion_of_backend_sql() -> String {
            AND metric          = ?5
            AND backend         = ?6
            AND {}
+           AND ({})
          ORDER BY
              CASE direction
                  WHEN 'higher_better' THEN -value
                  ELSE value
              END ASC
          LIMIT 1",
-        crate::bests_view::gate_rows_sql()
+        crate::bests_view::gate_rows_sql(),
+        crate::bests_view::plausible_sql("value")
     )
 }
 
