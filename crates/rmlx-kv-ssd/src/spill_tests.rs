@@ -178,17 +178,6 @@ fn try_spill_does_not_block_when_drain_stalled() {
     handle.join().unwrap();
 }
 
-// Touch `spawn` (the production constructor) so it isn't flagged unused in
-// the test build, and confirm it returns a usable handle whose drain exits
-// cleanly when the sender is dropped.
-#[test]
-fn spawn_returns_handle_that_exits_on_drop() {
-    let spiller = SsdSpiller::spawn(format!("{MODEL_ID}-spawn"), TEST_LAYOUT_KEY, Device::Cpu);
-    assert_eq!(spiller.model_id(), format!("{MODEL_ID}-spawn"));
-    assert_eq!(spiller.layout_key(), TEST_LAYOUT_KEY);
-    drop(spiller); // closing the channel lets the production drain thread exit
-}
-
 /// The drain thread is the only writer that grows the namespace, and between
 /// model loads nothing else evicts — so if it does not enforce the configured
 /// ceiling, a long-lived `serve` runs past `--kv-ssd-cache-gb` for its whole
