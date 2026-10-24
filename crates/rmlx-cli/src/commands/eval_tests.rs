@@ -408,3 +408,17 @@ fn record_identity_of_a_config_naming_no_weight_format_is_refused() {
         .to_string();
     assert!(msg.contains("names no weight format"), "{msg}");
 }
+
+/// A format mode no whitelist names passes through the label unchanged, so the
+/// recorder's whitelist is the one check, and it refuses the label by name.
+#[test]
+fn record_identity_refuses_a_mode_the_metrics_db_has_no_label_for() {
+    let config = r#"{"quantization": {"group_size": 32, "bits": 6, "mode": "mxfp6"}}"#;
+    let msg = weight_quant_of(config)
+        .expect_err("mxfp6 is not a recordable weight_quant")
+        .to_string();
+    assert!(
+        msg.contains("mxfp6") && msg.contains("weight_quant"),
+        "{msg}"
+    );
+}
