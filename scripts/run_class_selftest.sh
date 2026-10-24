@@ -292,15 +292,18 @@ runs="$(grep -cE -- '--record --run-class diagnostic --label codec_cell:[0-9]{8}
 verdict codec_cell_records_diagnostic "the warmup and the three measured runs record as diagnostic" "$bad"
 
 set +e
-STUB_NO_INGEST=k8v8 ARGV_LOG="$WORK/codec_cell_fail.argv" RMLX_BINARY="$PROBE_BIN" RMLX_HOME="$WORK/home" \
+STUB_NO_INGEST=k8v8 ARGV_LOG="$WORK/codec_cell_fail.argv" RMLX_BINARY="$PROBE_BIN" RMLX_HOME="$WORK/home_cell" \
 	bash "$REPO_ROOT/scripts/bench_codec_cell.sh" --kv-quant k8v8 --model "$MODEL" \
 	>"$WORK/codec_cell_fail.out" 2>&1
 status=$?
 set -e
 bad=""
-[ "$status" -ne 0 ] || bad="exit 0 with a run whose record did not land"
-grep -q 'its record did not land' "$WORK/codec_cell_fail.out" || bad="${bad:+$bad; }no error saying so"
-verdict codec_cell_stops_on_a_record_that_did_not_land "a run whose record did not land stops the cell, saying so" "$bad"
+[ "$status" -eq 75 ] || bad="exit=$status (want 75)"
+grep -q 'record pending: /x/pending/stub.json' "$WORK/codec_cell_fail.out" || bad="${bad:+$bad; }the buffer file is not named"
+[ "$(grep -c ',k8v8,host__m,' "$WORK/home_cell/bench/codec_cells.csv" 2>/dev/null || true)" = 3 ] ||
+	bad="${bad:+$bad; }the three readings were not kept"
+grep -q 'mean decode_tps=10.0' "$WORK/codec_cell_fail.out" || bad="${bad:+$bad; }no summary"
+verdict codec_cell_keeps_readings_whose_record_is_pending "runs whose record did not land keep their readings; the cell names the files and ends 75" "$bad"
 
 # The cache-type driver runs `target/release/rmlx` under its own root, so it
 # uses the fake root above; a smoke probe that exits 78 (an unsupported combo)

@@ -14,7 +14,9 @@
 #   - Appends 3 rows to .rmlx/bench/codec_cells.csv (one per run_idx 1/2/3).
 #   - Records every run, the warmup included, in runs.db as `diagnostic`
 #     (`--record --run-class diagnostic --label codec_cell:<ts>:<codec>`): single
-#     unpaired runs reach no champion and no gate.
+#     unpaired runs reach no champion and no gate. A run whose record does not
+#     land (`baseline` exit 75) keeps its reading; the cell names the buffer
+#     file and ends 75 (docs/METRICS_DB.md section 13, rule 24).
 #   - Prints summary: <codec> × <model>: mean decode_tps=X.X (±stddev), prefill_tps=X.X
 #
 # CSV schema (codec_cells.csv):
@@ -117,21 +119,35 @@ GIT_SHA="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null | cut -c1-12 || echo
 # One stamp for the cell, so its runs are found together by label.
 RUN_TS="$(date -u +%Y%m%dT%H%M%SZ)"
 
+# shellcheck source=scripts/lib/record_pending.sh
+source "${REPO_ROOT}/scripts/lib/record_pending.sh"
+# One line per run that measured and whose diagnostic record did not land.
+CELL_PENDING="$(mktemp "${TMPDIR:-/tmp}/codec_cell_pending.XXXXXX")"
+trap 'rm -f "${CELL_PENDING}"' EXIT
+
 # ---- Helper: run one baseline, parse decode_tps and prefill_tps --------------
 # Outputs a single colon-separated string: "<decode_tps>:<prefill_tps>"
+# A run that measured and whose record did not land (exit RECORD_PENDING_EXIT)
+# keeps its reading; its buffer file is named and the cell ends non-zero.
 run_once() {
-    local output
-    # `baseline --record` exits non-zero when its record did not land.
-    if ! output="$(RMLX_HOME="${RMLX_HOME}" "${BINARY}" baseline \
+    local output rc=0 err
+    err="$(mktemp "${TMPDIR:-/tmp}/codec_cell_err.XXXXXX")"
+    output="$(RMLX_HOME="${RMLX_HOME}" "${BINARY}" baseline \
         --model "${MODEL_PATH}" \
         --kv-quant "${KV_QUANT}" \
         --prompt-tokens "${PROMPT_LEN}" \
         --max-tokens "${MAX_TOKENS}" \
         --record --run-class diagnostic --label "codec_cell:${RUN_TS}:${KV_QUANT}" \
-        2>/dev/null)"; then
-        echo "ERROR: ${KV_QUANT} × ${MODEL_BASENAME}: a run failed, or its record did not land (see ${RMLX_HOME}/logs)" >&2
+        2>"${err}")" || rc=$?
+    if [[ "${rc}" -eq "${RECORD_PENDING_EXIT}" ]]; then
+        record_pending_note "${err}"
+        echo pending >>"${CELL_PENDING}"
+    elif [[ "${rc}" -ne 0 ]]; then
+        rm -f "${err}"
+        echo "ERROR: ${KV_QUANT} × ${MODEL_BASENAME}: a run failed (exit ${rc}; see ${RMLX_HOME}/logs)" >&2
         exit 1
     fi
+    rm -f "${err}"
     local dtps
     dtps="$(echo "${output}" | grep -o 'decode_tps=[0-9.]*' | cut -d= -f2 || true)"
     local ptps
@@ -205,3 +221,7 @@ printf "%s × %s: mean decode_tps=%.1f (±%.2f), prefill_tps=%.1f\n" \
 
 echo "" >&2
 echo "CSV: ${CSV} (3 rows appended)" >&2
+if [[ -s "${CELL_PENDING}" ]]; then
+    echo "INCOMPLETE: $(wc -l <"${CELL_PENDING}" | tr -d ' ') record(s) pending (named above); the readings stand" >&2
+    exit "${RECORD_PENDING_EXIT}"
+fi
