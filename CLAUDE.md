@@ -74,6 +74,7 @@ areas before touching code:
 | [`docs/FFI.md`](docs/FFI.md) | rmlx-mlx ↔ mlx-c FFI bridge; MSL kernel surface; unsafe policy |
 | [`docs/MLX_PAIR.md`](docs/MLX_PAIR.md) | The pinned MLX / mlx-c pair: what to do on each Mac, the source build, `make mlx-restore-pin`, the pin gate and its verdicts, the two mlx-c C APIs, the attention row rule, moving the pin |
 | [`docs/METRICS_DB.md`](docs/METRICS_DB.md) | Metrics DB: path, identity rules, ingest and the run class, `rmlx metrics` tooling, operating rules |
+| [`docs/METRICS_EXPORT.md`](docs/METRICS_EXPORT.md) | `BENCHMARK_CHAMPIONS.md` and the exports, split out of `METRICS_DB.md` for size: what `export --markdown` renders, the other formats, the `Updated` column |
 | [`docs/METRICS_IMPORT.md`](docs/METRICS_IMPORT.md) | `rmlx metrics import`, split out of `METRICS_DB.md` for size: what is copied, the run class by source version, the skip key, the report |
 | [`docs/METRICS_SCHEMA.md`](docs/METRICS_SCHEMA.md) | Metrics DB schema: tables (observations, events, prompts, the bests view), metric registry, plausible-value bounds, known-bad rows |
 | [`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md) | The three canary anchors and the bench methods: A/B comparison, per-codec cells, the bandwidth ceiling, cross-backend cells |
