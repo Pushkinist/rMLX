@@ -876,6 +876,7 @@ def prefill_anchor(db: Path, model_basename: str) -> dict | None:
     try:
         rows = con.execute(
             "SELECT prompt_tokens, value, hardware_tag FROM observations "
+            # run_class spelling: RunClass::Gate.as_str() in crates/rmlx-metrics/src/run_class.rs
             "WHERE metric='prefill_tps' AND backend='rmlx' AND run_class='gate' AND model=? "
             "AND value>0 AND value<=1e5 AND ts_utc>=?",  # METRICS_SCHEMA.md §4.1 Bounds::positive(1e5)
             (model_basename, PREFILL_ANCHOR_MIN_TS),

@@ -825,33 +825,6 @@ pub(super) fn cell_keyed_sql() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// Every SQL body in this module that reads `observations` for a gate,
-/// paired with a name for the failure message. `bests` reads are gated by the
-/// view itself. `gate_predicate_reaches_every_gate_reader` asserts each body
-/// carries [`crate::bests_view::gate_rows_sql`].
-#[cfg(test)]
-pub(super) fn gate_keyed_sql() -> Vec<(&'static str, String)> {
-    let plausible = crate::bests_view::plausible_sql("value");
-    let (cell_pred, metric_idx) = crate::cell::predicate(1);
-    let ts_idx = metric_idx + 1;
-
-    vec![
-        ("bests", crate::bests_view::create_sql()),
-        ("deltas:baseline_ts", baseline_ts_sql()),
-        (
-            "deltas:best_in_window",
-            window_sql("<=", &cell_pred, metric_idx, ts_idx, &plausible),
-        ),
-        (
-            "deltas:best_after",
-            window_sql(">", &cell_pred, metric_idx, ts_idx, &plausible),
-        ),
-        ("regress:latest", regress_latest_sql()),
-        ("champions:cells", champion_cells_sql()),
-        ("champions:of_backend", champion_of_backend_sql()),
-    ]
-}
-
 pub(crate) fn row_to_best(r: &rusqlite::Row<'_>) -> rusqlite::Result<BestRow> {
     Ok(BestRow {
         observation_id: r.get(0)?,

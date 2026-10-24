@@ -989,15 +989,71 @@ fn cell_predicate_reaches_every_consumer() {
 /// Every query that feeds a gate reads `gate` rows only. A body that lost the
 /// filter would rank an A/B slot against the champion it is not allowed to
 /// move.
+/// The readers of `read.rs` that show every class: a cell's history and its
+/// time series. Every other fn whose SQL reads `observations` feeds a gate or a
+/// published figure.
+const HISTORY_READERS: [&str; 2] = ["history_sql", "timeseries_sql"];
+
+/// Each top-level fn of `source` as (name, text up to its closing brace).
+fn top_level_fns(source: &str) -> Vec<(&str, String)> {
+    let mut fns = Vec::new();
+    let mut current: Option<(&str, String)> = None;
+    for line in source.lines() {
+        let decl = ["fn ", "pub fn ", "pub(crate) fn ", "pub(super) fn "]
+            .iter()
+            .find_map(|prefix| line.strip_prefix(prefix));
+        if let Some(rest) = decl {
+            let name = rest.split(['(', '<']).next().unwrap_or(rest);
+            current = Some((name, String::new()));
+        }
+        if let Some((_, body)) = current.as_mut() {
+            body.push_str(line);
+            body.push('\n');
+        }
+        if line == "}" {
+            fns.extend(current.take());
+        }
+    }
+    fns
+}
+
 #[test]
-fn gate_predicate_reaches_every_gate_reader() {
-    let gate = crate::bests_view::gate_rows_sql();
-    for (name, sql) in read::gate_keyed_sql() {
+fn every_observations_reader_but_the_history_filters_on_the_gate_class() {
+    let readers: Vec<(&str, String)> = top_level_fns(include_str!("read.rs"))
+        .into_iter()
+        .filter(|(_, body)| body.contains("FROM observations"))
+        .collect();
+    let names: Vec<&str> = readers.iter().map(|(name, _)| *name).collect();
+    for history in HISTORY_READERS {
         assert!(
-            sql.contains(&gate),
-            "{name} does not filter on `{gate}`:\n{sql}"
+            names.contains(&history),
+            "{history} no longer reads observations; the allow-set names a reader that \
+             does not exist (found {names:?})"
         );
     }
+    assert!(
+        readers.len() > HISTORY_READERS.len(),
+        "the scan found no gate reader in read.rs: {names:?}"
+    );
+    for (name, body) in &readers {
+        if HISTORY_READERS.contains(name) {
+            continue;
+        }
+        assert!(
+            body.contains("gate_rows_sql()"),
+            "{name} reads observations without `bests_view::gate_rows_sql`:\n{body}"
+        );
+    }
+}
+
+#[test]
+fn bests_ranks_gate_rows_only() {
+    let gate = crate::bests_view::gate_rows_sql();
+    let sql = crate::bests_view::create_sql();
+    assert!(
+        sql.contains(&gate),
+        "bests does not filter on `{gate}`:\n{sql}"
+    );
 }
 
 /// `best()` must answer for the cell it was asked about. With two arms in one
