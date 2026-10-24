@@ -124,6 +124,7 @@ fn canonicalize_backend_unknown() {
         }
         Error::MissingBackendVersion { .. }
         | Error::MissingRunClass
+        | Error::ImportRunClass(_)
         | Error::Sqlite(_)
         | Error::Io(_)
         | Error::Schema(_)
@@ -201,6 +202,7 @@ fn alias_normalization_non_backend_field_untouched() {
         Error::IdentityNotInWhitelist { field, .. } => assert_eq!(field, "weight_quant"),
         Error::MissingBackendVersion { .. }
         | Error::MissingRunClass
+        | Error::ImportRunClass(_)
         | Error::Sqlite(_)
         | Error::Io(_)
         | Error::Schema(_)

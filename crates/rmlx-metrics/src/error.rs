@@ -109,6 +109,11 @@ pub enum Error {
     )]
     MissingRunClass,
 
+    /// `rmlx metrics import --run-class` given for a source whose rows state
+    /// their own class, or missing for one whose rows state none.
+    #[error("import: {0}")]
+    ImportRunClass(String),
+
     /// Recorder-layer error (DB insert or transaction failure).
     #[error("recorder: {0}")]
     Recorder(String),

@@ -91,8 +91,8 @@ pub fn open_migrated(path: &std::path::Path) -> Result<Connection> {
 /// definition does not match the `docs/METRICS_SCHEMA.md` §4 registry, the
 /// caller is told to run `rmlx metrics doctor --fix`.
 ///
-/// The connection is opened read-write rather than with `open_readonly` on
-/// purpose. A read-only connection to a DB with a non-empty `-wal` must create
+/// The connection is opened read-write rather than read-only on purpose. A
+/// read-only connection to a DB with a non-empty `-wal` must create
 /// the `-shm` file, so it fails outright ("unable to open database file") when
 /// the containing directory is not writable — trading a mutation hazard for an
 /// availability one. Nothing on this path issues a write.
@@ -128,13 +128,28 @@ pub fn open_memory() -> Result<Connection> {
     Ok(conn)
 }
 
-/// Open an existing DB at `path` in read-only mode.
+/// Open an existing DB at `path` read-only, for `rmlx metrics import`.
 ///
-/// No CLI command uses it: the read commands (`best`, `rank`, `query`,
-/// `export`) open through [`open_checked`].
+/// It takes none of the PRAGMAs [`open`] sets: `journal_mode = WAL` is a
+/// write. The file is not written, but SQLite may create `-wal` and `-shm`
+/// beside a WAL-mode DB.
 pub fn open_readonly(path: &std::path::Path) -> Result<Connection> {
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    apply_pragmas(&conn)?;
+    if !path.exists() {
+        return Err(Error::Schema(format!(
+            "no metrics DB at {}",
+            path.display()
+        )));
+    }
+    let conn =
+        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| {
+            Error::Schema(format!(
+                "cannot open {} read-only ({e}); a copy taken with \
+                 `rmlx metrics --db {} backup --out <copy>` opens",
+                path.display(),
+                path.display()
+            ))
+        })?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
     Ok(conn)
 }
 

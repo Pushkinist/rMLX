@@ -14,8 +14,8 @@ pub(super) fn cmd_import(
 ) -> anyhow::Result<()> {
     let mut conn = schema::open_migrated(db_path)
         .with_context(|| format!("open DB at {}", db_path.display()))?;
-    let report =
-        import::import_db(&mut conn, from, run_class).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let report = import::import_db(&mut conn, from, run_class)
+        .with_context(|| format!("import from {}", from.display()))?;
     println!("{}", serde_json::to_string(&report)?);
     Ok(())
 }

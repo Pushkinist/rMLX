@@ -1,15 +1,17 @@
 //! DB-to-DB import: bring the `observations` rows of another metrics DB, and
 //! the prompts they reference, into this one (`docs/METRICS_IMPORT.md`).
 //!
-//! The source is opened read-only and never migrated. A row is copied as it
-//! stands, except `id`, `prompt_id` (remapped by the prompt's `sha256`) and
-//! `run_class`. A row already present — same `run_id`, `metric`, `ts_utc` and
-//! `inserted_utc` — is skipped, so a second import adds nothing.
+//! The source is opened read-only and never migrated, so its rows and schema
+//! are not changed; SQLite may still create its `-wal` and `-shm` files beside
+//! a WAL-mode source. A row is copied as it stands, except `id`, `prompt_id`
+//! (remapped by the prompt's `sha256`) and `run_class`. A row already present
+//! — same `run_id`, `metric`, `ts_utc` and `inserted_utc` — is skipped, so a
+//! second import adds nothing.
 
 use std::path::Path;
 
 use rusqlite::types::Value;
-use rusqlite::{params_from_iter, Connection, OpenFlags};
+use rusqlite::{params_from_iter, Connection};
 use serde::Serialize;
 
 use crate::error::{Error, Result};
@@ -23,35 +25,8 @@ pub const LAST_VERSION_WITHOUT_RUN_CLASS: u32 = 8;
 /// present in the target is skipped.
 const KEY_COLUMNS: [&str; 4] = ["run_id", "metric", "ts_utc", "inserted_utc"];
 
-/// The other `observations` columns copied verbatim. `id`, `prompt_id` and
-/// `run_class` are set by the import.
-const OTHER_COLUMNS: &[&str] = &[
-    "backend",
-    "model_namespace",
-    "model",
-    "weight_quant",
-    "kv_quant",
-    "ctx_max",
-    "value",
-    "unit",
-    "direction",
-    "git_sha",
-    "build_profile",
-    "backend_version",
-    "hardware_tag",
-    "prompt_tokens",
-    "max_tokens",
-    "temperature",
-    "seed",
-    "n_warmups",
-    "n_measure",
-    "output_first_64",
-    "decode_stddev",
-    "notes",
-    "description",
-    "inserted_by",
-    "decode_config",
-];
+/// The `observations` columns the import sets itself rather than copying.
+const SET_BY_IMPORT: [&str; 3] = ["id", "prompt_id", "run_class"];
 
 /// What one import read and wrote.
 #[derive(Debug, Clone, Serialize)]
@@ -67,6 +42,9 @@ pub struct ImportReport {
     pub inserted: usize,
     /// Rows already present, not inserted again.
     pub skipped: usize,
+    /// Source rows that carry the column and state no class. They are copied
+    /// with no class, so they reach no gate here either.
+    pub classless: usize,
     /// Prompts inserted because no prompt with their `sha256` was present.
     pub prompts_inserted: usize,
 }
@@ -75,38 +53,35 @@ pub struct ImportReport {
 /// transaction.
 ///
 /// A source at [`LAST_VERSION_WITHOUT_RUN_CLASS`] needs `stated`, which every
-/// row then carries. A source at the current schema keeps each row's own class
-/// and refuses `stated`. Any other version is refused.
+/// row then carries. A later source, up to this binary's last migration, keeps
+/// each row's own class and refuses `stated`. Any other version is refused, and
+/// so is a source missing a column the target has.
 pub fn import_db(
     conn: &mut Connection,
     source: &Path,
     stated: Option<RunClass>,
 ) -> Result<ImportReport> {
-    let src = open_source(source)?;
+    let src = crate::schema::open_readonly(source)?;
     let source_version: u32 = src.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let current = MIGRATIONS.last().map_or(0, |&(v, _)| v);
-
-    let carries_class = if source_version == current {
-        true
-    } else if source_version == LAST_VERSION_WITHOUT_RUN_CLASS {
-        false
-    } else {
+    if !(LAST_VERSION_WITHOUT_RUN_CLASS..=current).contains(&source_version) {
         return Err(Error::Schema(format!(
-            "{} is at schema version {source_version}; import reads version \
-             {LAST_VERSION_WITHOUT_RUN_CLASS} and version {current} only",
+            "{} is at schema version {source_version}; import reads versions \
+             {LAST_VERSION_WITHOUT_RUN_CLASS} to {current}",
             source.display()
         )));
-    };
+    }
+    let carries_class = source_version > LAST_VERSION_WITHOUT_RUN_CLASS;
     match (carries_class, stated) {
         (true, Some(class)) => {
-            return Err(Error::Schema(format!(
-                "{} is at schema version {current}, so each row states its own run_class; \
-                 --run-class {class} would overwrite it. Omit --run-class.",
+            return Err(Error::ImportRunClass(format!(
+                "{} is at schema version {source_version}, so each row states its own \
+                 run_class; --run-class {class} would overwrite it. Omit --run-class.",
                 source.display()
             )))
         }
         (false, None) => {
-            return Err(Error::Schema(format!(
+            return Err(Error::ImportRunClass(format!(
                 "{} is at schema version {source_version}, which predates run_class; state \
                  the class of its rows with --run-class ({})",
                 source.display(),
@@ -115,31 +90,87 @@ pub fn import_db(
         }
         _ => {}
     }
+    let columns = copied_columns(conn, &src, carries_class, source)?;
 
     let tx = conn.transaction()?;
     let prompts_inserted = copy_prompts(&src, &tx)?;
-    let (read, inserted, skipped) = copy_observations(&src, &tx, stated)?;
+    let copied = copy_observations(&src, &tx, &columns, stated)?;
     tx.commit()?;
 
+    tracing::info!(
+        source = %source.display(),
+        source_version,
+        read = copied.read,
+        inserted = copied.inserted,
+        skipped = copied.skipped,
+        classless = copied.classless,
+        prompts_inserted,
+        "metrics import: copied another DB's observations"
+    );
     Ok(ImportReport {
         source_version,
         stated_run_class: stated,
-        read,
-        inserted,
-        skipped,
+        read: copied.read,
+        inserted: copied.inserted,
+        skipped: copied.skipped,
+        classless: copied.classless,
         prompts_inserted,
     })
 }
 
+/// The `observations` columns of `conn`.
+fn observation_columns(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt =
+        conn.prepare("SELECT name FROM pragma_table_info('observations') ORDER BY cid")?;
+    let names = stmt
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(names)
+}
+
+/// The target's columns the import copies, key columns first. Refuses a source
+/// missing one of them, or missing `run_class` when its version carries it.
+fn copied_columns(
+    dst: &Connection,
+    src: &Connection,
+    carries_class: bool,
+    source: &Path,
+) -> Result<Vec<String>> {
+    let source_columns = observation_columns(src)?;
+    let mut needed = observation_columns(dst)?;
+    needed.retain(|c| !SET_BY_IMPORT.contains(&c.as_str()) || (c == "run_class" && carries_class));
+    if let Some(missing) = needed.iter().find(|c| !source_columns.contains(c)) {
+        return Err(Error::Schema(format!(
+            "{} has no observations.{missing} column, which this DB has; the import \
+             would have to invent its values",
+            source.display()
+        )));
+    }
+    let mut ordered: Vec<String> = KEY_COLUMNS.iter().map(|&c| c.to_owned()).collect();
+    ordered.extend(
+        needed
+            .into_iter()
+            .filter(|c| c != "run_class" && !KEY_COLUMNS.contains(&c.as_str())),
+    );
+    Ok(ordered)
+}
+
+/// What [`copy_observations`] read and wrote.
+struct Copied {
+    read: usize,
+    inserted: usize,
+    skipped: usize,
+    classless: usize,
+}
+
 /// Copy every source observation whose key is not present. Each row gets
-/// `stated`, or its own `run_class` when `stated` is `None`. Returns how many
-/// rows were read, inserted and skipped.
+/// `stated`, or its own `run_class` when `stated` is `None`.
 fn copy_observations(
     src: &Connection,
     dst: &Connection,
+    columns: &[String],
     stated: Option<RunClass>,
-) -> Result<(usize, usize, usize)> {
-    let columns: Vec<&str> = KEY_COLUMNS.iter().chain(OTHER_COLUMNS).copied().collect();
+) -> Result<Copied> {
     let own_class = if stated.is_none() {
         ", o.run_class"
     } else {
@@ -159,56 +190,46 @@ fn copy_observations(
         "INSERT INTO observations ({}, prompt_id, run_class) VALUES ({placeholders})",
         columns.join(", ")
     ))?;
-    let mut present = dst.prepare(
-        "SELECT 1 FROM observations
-          WHERE run_id = ?1 AND metric = ?2 AND ts_utc = ?3 AND inserted_utc = ?4",
-    )?;
+    let key_pred = KEY_COLUMNS
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("{c} = ?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let mut present = dst.prepare(&format!("SELECT 1 FROM observations WHERE {key_pred}"))?;
     let mut prompt_id = dst.prepare("SELECT id FROM prompts WHERE sha256 = ?1")?;
 
     let n = columns.len();
     let mut rows = read_stmt.query([])?;
-    let (mut read, mut inserted, mut skipped) = (0_usize, 0_usize, 0_usize);
+    let mut copied = Copied {
+        read: 0,
+        inserted: 0,
+        skipped: 0,
+        classless: 0,
+    };
     while let Some(row) = rows.next()? {
-        read += 1;
+        copied.read += 1;
+        let class = match stated {
+            Some(class) => Value::Text(class.as_str().to_owned()),
+            None => row.get(n + 1)?,
+        };
+        if class == Value::Null {
+            copied.classless += 1;
+        }
         let mut values = (0..n)
             .map(|i| row.get::<_, Value>(i))
             .collect::<rusqlite::Result<Vec<Value>>>()?;
         if present.exists(params_from_iter(values.iter().take(KEY_COLUMNS.len())))? {
-            skipped += 1;
+            copied.skipped += 1;
             continue;
         }
         let sha: String = row.get(n)?;
         values.push(Value::Integer(prompt_id.query_row([&sha], |r| r.get(0))?));
-        values.push(match stated {
-            Some(class) => Value::Text(class.as_str().to_owned()),
-            None => row.get(n + 1)?,
-        });
+        values.push(class);
         insert.execute(params_from_iter(values.iter()))?;
-        inserted += 1;
+        copied.inserted += 1;
     }
-    Ok((read, inserted, skipped))
-}
-
-/// Open `path` read-only. A read-only open never writes the file, so it does
-/// not take the connection PRAGMAs `schema::open` sets.
-fn open_source(path: &Path) -> Result<Connection> {
-    if !path.exists() {
-        return Err(Error::Schema(format!(
-            "no metrics DB at {}",
-            path.display()
-        )));
-    }
-    let conn =
-        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| {
-            Error::Schema(format!(
-                "cannot open {} read-only ({e}); import a copy taken with \
-                 `rmlx metrics --db {} backup --out <copy>`",
-                path.display(),
-                path.display()
-            ))
-        })?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
-    Ok(conn)
+    Ok(copied)
 }
 
 /// Insert every source prompt an observation references and whose `sha256`
@@ -238,3 +259,7 @@ fn copy_prompts(src: &Connection, dst: &Connection) -> Result<usize> {
     }
     Ok(inserted)
 }
+
+#[cfg(test)]
+#[path = "import_tests.rs"]
+mod tests;
