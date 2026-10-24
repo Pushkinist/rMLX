@@ -688,7 +688,7 @@ never in a Rust string literal:
 | Directory | Scope |
 |---|---|
 | `crates/rmlx-kv-quant/src/metal/` | every KV codec kernel, dispatched from `src/*_msl.rs` and `src/sparse_attn/*_msl.rs` |
-| `crates/rmlx-models/src/metal/` | GatedDeltaNet and weight-side ParoQuant, from `gated_delta_msl.rs` / `paroquant_msl.rs` |
+| `crates/rmlx-models/src/metal/` | GatedDeltaNet, ParoQuant and the signed block Hadamard transform, dispatched from `src/*_msl.rs` |
 | `crates/rmlx-mlx/src/metal/` | the MLX JIT language-version probe; not a production kernel |
 
 The gates are scoped by directory, not crate: a kernel outside a listed
