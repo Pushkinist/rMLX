@@ -1398,7 +1398,7 @@ st_case silenced_pin_stale 1 --what "the line no longer discards the exit code: 
 silencing_shapes=(
     'TOOL | cat' 'TOOL; echo done' 'TOOL || (true)' 'TOOL || /usr/bin/true' 'TOOL || { true; }'
     'if TOOL; then :; fi' 'TOOL &' 'TOOL; exit 0 ;' '( TOOL )' '{ TOOL; }' '! TOOL' 'x=$$(TOOL)'
-    'echo "$$(TOOL)"' 'TOOL || true && echo ok' 'TOOL 2>&1 | tee log.txt' 'TOOL |& cat'
+    'echo "$$(TOOL)"' 'TOOL || true && echo ok' 'TOOL 2>&1 | tee log.txt' 'TOOL |& cat' 'TOOL || TOOL'
 )
 n=0
 for form in "${silencing_shapes[@]}"; do
@@ -1440,6 +1440,43 @@ sg_make_ci "$root" 'ci:\n\t@cd . && bash scripts/check/gate.sh >/dev/null 2>&1 &
 sg_reindex "$root"
 st_case silenced_shape_controls 0 --what "a tool after cd &&, with redirections, then && another tool, then a timed tool: nothing is silenced" \
     --has "check-scripts: ok (7 files" -- sg_gate "$root"
+
+for flag in -i -ik --keep-going --ignore-errors; do
+    root=$(sg_fresh "silenced_shape_make_$(printf '%s' "$flag" | tr -c 'a-z' _)")
+    sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+    sg_make_ci "$root" "ci:\\n\\t@\$(MAKE) $flag gates\\n\\ngates:\\n\\t@bash scripts/check/gate.sh\\n"
+    sg_reindex "$root"
+    st_case "silenced_shape_make_option_${flag//-/_}" 1 --what "\$(MAKE) $flag goes on after a failure" \
+        --has "silenced: check/gate.sh:1: mode default" -- sg_gate "$root"
+done
+
+root=$(sg_fresh silenced_shape_substitution_argument)
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_recall_sh '#' 'check/gate.sh' | sg_put "$root" check/gate_selftest.sh
+sg_make_ci "$root" 'ci:\n\t@bash scripts/check/gate.sh $$(cd . && pwd)\n\t@bash scripts/check/gate_selftest.sh\n'
+sg_reindex "$root"
+st_case silenced_shape_substitution_as_an_argument 0 --what "a \$( ) argument holds operators of its own and silences nothing" \
+    --has "check-scripts: ok (6 files" -- sg_gate "$root"
+
+root=$(sg_fresh silenced_shape_shell_variable_head)
+sg_make_ci "$root" 'ci:\n\t@$$SHELL -c true\n'
+sg_reindex "$root"
+st_case silenced_shape_shell_expansion_as_command_word 0 --what "\$\$SHELL is the shell's variable, not a make expansion the gate cannot follow" \
+    --has "check-scripts: ok (4 files" -- sg_gate "$root"
+
+root=$(sg_fresh silenced_shape_curdir_head)
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_make_ci "$root" 'ci:\n\t@$(CURDIR)/scripts/check/gate.sh\n'
+sg_reindex "$root"
+st_case silenced_shape_path_command_word 1 --what "\$(CURDIR)/scripts/... as the command word is the tool, not an unresolved expansion" \
+    --lacks "unavailable" --has "recall-missing: check/gate.sh:1: mode default" -- sg_gate "$root"
+
+root=$(sg_fresh silenced_shape_shell_substitution_is_not_a_variable)
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_make_ci "$root" 'QUIET := || true\n\nci:\n\t@bash scripts/check/gate.sh $$(QUIET)\n'
+sg_reindex "$root"
+st_case silenced_shape_double_dollar_is_the_shell 1 --what "\$\$(QUIET) is a shell substitution, not the make variable QUIET" \
+    --lacks "silenced:" --has "recall-missing: check/gate.sh:1: mode default" -- sg_gate "$root"
 
 root=$(sg_fresh silenced_shape_call)
 sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
@@ -1598,6 +1635,14 @@ sg_make_ci "$root" 'ci:\n\t@bash scripts/check/gate.sh\n\t@bash scripts/check/ga
 sg_reindex "$root"
 st_case recall_claim_in_a_fixtures_file 0 --what "a file named *_fixtures.sh that runs the tool holds its claim" \
     --has "check-scripts: ok (6 files" -- sg_gate "$root"
+
+root=$(sg_fresh recall_claim_without_the_underscore)
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_recall_sh '#' 'check/gate.sh' | sg_put "$root" check/gateselftest.sh
+sg_make_ci "$root" 'ci:\n\t@bash scripts/check/gate.sh\n\t@bash scripts/check/gateselftest.sh\n'
+sg_reindex "$root"
+st_case recall_claim_needs_the_underscore 1 --what "gateselftest.sh does not end in _selftest.sh" \
+    --has "recall-stale: check/gateselftest.sh:4: a \`Recall test for:\` claim needs a file named" -- sg_gate "$root"
 
 root=$(sg_fresh recall_claim_in_a_file_named_selftest_in_the_middle)
 sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
@@ -1764,34 +1809,24 @@ sg_reindex "$root"
 st_case recall_claim_of_a_mode_only_the_docstring_names 1 --what "a mode token in the docstring of a Python test is not code" \
     --has "recall-stale: check/gate_selftest.py:4: check/gate.sh: \`--lib\` occurs nowhere in the code of check/gate_selftest.py" -- sg_gate "$root"
 
-root=$(sg_fresh recall_claim_python_function_docstring)
-sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
-sg_put "$root" check/gate_selftest.py <<'EOF'
-#!/usr/bin/env python3
-"""A planted Python recall test.
-
-Recall test for: check/gate.sh --lib
-Usage:  python3 scripts/check/gate_selftest.py
-Exit:   0 held
-"""
-
-import subprocess
-
-
-class Case:
-    """Runs the gate with --lib."""
-
-    def run(self):
-        """Runs bash scripts/check/gate.sh --lib."""
-        subprocess.run(["bash", "scripts/check/gate.sh"])
-
-
-Case().run()
-EOF
-sg_make_ci "$root" 'ci:\n\t@bash scripts/check/gate.sh --lib\n\t@python3 scripts/check/gate_selftest.py\n'
-sg_reindex "$root"
-st_case recall_claim_of_a_mode_only_a_function_docstring_names 1 --what "a mode token in the docstring of a class or a function of a Python test is not code" \
-    --has "recall-stale: check/gate_selftest.py:4: check/gate.sh: \`--lib\` occurs nowhere in the code of check/gate_selftest.py" -- sg_gate "$root"
+for kind in class function async; do
+    root=$(sg_fresh "recall_claim_python_${kind}_docstring")
+    sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+    {
+        printf '%s\n' '#!/usr/bin/env python3' '"""A planted Python recall test.' '' 'Recall test for: check/gate.sh --lib' \
+            'Usage:  python3 scripts/check/gate_selftest.py' 'Exit:   0 held' '"""' '' 'import subprocess' ''
+        case "$kind" in
+        class) printf '%s\n' 'class Case:' '    """Runs the gate with --lib."""' '' '    def run(self):' \
+            '        subprocess.run(["bash", "scripts/check/gate.sh"])' '' '' 'Case().run()' ;;
+        function) printf '%s\n' 'def run():' '    """Runs the gate with --lib."""' '    subprocess.run(["bash", "scripts/check/gate.sh"])' '' '' 'run()' ;;
+        async) printf '%s\n' 'async def run():' '    """Runs the gate with --lib."""' '    subprocess.run(["bash", "scripts/check/gate.sh"])' '' '' 'run()' ;;
+        esac
+    } | sg_put "$root" check/gate_selftest.py
+    sg_make_ci "$root" 'ci:\n\t@bash scripts/check/gate.sh --lib\n\t@python3 scripts/check/gate_selftest.py\n'
+    sg_reindex "$root"
+    st_case "recall_claim_of_a_mode_only_a_${kind}_docstring_names" 1 --what "a mode token in the docstring of a $kind of a Python test is not code" \
+        --has "recall-stale: check/gate_selftest.py:4: check/gate.sh: \`--lib\` occurs nowhere in the code of check/gate_selftest.py" -- sg_gate "$root"
+done
 
 root=$(sg_fresh mode_equals_then_positional)
 sg_nocaller_sh '[ "${1:-}" = --mode=a ] || exit 0' | sg_put "$root" check/gate.sh

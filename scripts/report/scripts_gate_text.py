@@ -35,7 +35,7 @@ SOURCING = frozenset({"source", "."})
 OPTIONS_WITH_VALUE = frozenset({"-u", "-C", "-s"})
 PROSE_COMMANDS = frozenset({"echo", "printf"})
 SUBPROCESS_CALLS = frozenset({"run", "check_output", "check_call", "call", "Popen"})
-ROOT_PREFIX_RE = re.compile(r'(?:\./|"?\$(?:\w+|\{\w+(?::?[-=+?][^}]*)?\}|\([^()]*\))"?/)$')
+ROOT_PREFIX_RE = re.compile(r'(?:\./|\$(?:\w+|\{\w+(?::?[-=+?][^}]*)?\}|\([^()]*\))"?/)$')
 PATH_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./-")
 WORD_CHARS = PATH_CHARS - {"-"}
 

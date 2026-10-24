@@ -42,7 +42,7 @@ MAKE_CALL_RE = re.compile(MAKE_WORD + r"([^;&|]*)")
 VARIABLE_REFERENCE_RE = re.compile(r"\$[({]([A-Za-z_][A-Za-z0-9_]*)[)}]")
 VARIABLE_USE_RE = re.compile(r"(?<!\$)\$[({]([A-Za-z_][A-Za-z0-9_]*)[)}]")
 CALL_RE = re.compile(r"(?<!\$)\$[({]call\b")
-OPERATOR_RE = re.compile(r"&&|\|\||\|&|;;|[;|&()]")
+OPERATOR_RE = re.compile(r"&&|\|\||[;|&()]")
 REDIRECT_RE = re.compile(r"\d*[<>]+&\d*-?|&>>?")
 HEAD_RE = re.compile(r"""\s*(?:[A-Za-z_]\w*=(?:"[^"]*"|'[^']*'|\S*)\s+)*(\S+)""")
 KEEP_GOING_RE = re.compile(r"-[A-Za-z]*[ik][A-Za-z]*|--keep-going|--ignore-errors")
@@ -165,10 +165,12 @@ def command_head(segment: str) -> str:
 def line_silenced(ctx: Context, text: str) -> bool:
     """True when the failure of what a recipe line runs (a scripts/ file or a
     `$(MAKE)` call) need not fail the line. The command must be a simple command,
-    with no `-` in front of it, last on the line or followed only by `&& <command>`;
-    a `;`, `|`, `||`, a single `&`, a group, a compound command or a `$(MAKE) -k`
-    on the line, or the command inside a substitution, silences it. A line that
-    runs nothing of the kind is not silenced. `text` has its variables expanded."""
+    with no `-` in front of it, last on the line or followed only by
+    `&& <command>`. A `;`, `|`, `||`, a single `&`, a group (its closing
+    parenthesis or brace follows the command), a compound command or a
+    `$(MAKE) -k` on the line, and the command inside a substitution, silence it.
+    A line that runs nothing of the kind is not silenced. `text` has its
+    variables expanded."""
     command = text.lstrip(MAKE_RECIPE_FLAGS)
     flags = text[: len(text) - len(command)]
     segments, operators = split_operators(" ".join(clean_shell(command, False, True)))
@@ -192,10 +194,8 @@ def line_silenced(ctx: Context, text: str) -> bool:
         silenced |= head in COMPOUND_WORDS
     if not watched_at and not inside_substitution:
         return False
-    silenced |= inside_substitution
-    silenced |= any(op in ("(", ")") for op in operators)
-    silenced |= any(op != "&&" for k in watched_at for op in operators[k:])
-    return silenced
+    after_the_first = operators[watched_at[0] :] if watched_at else []
+    return silenced or inside_substitution or any(op != "&&" for op in after_the_first)
 
 
 def expand_words(words: list[str], variables: dict[str, str | None], where: str) -> list[str]:
@@ -220,7 +220,7 @@ def expand_words(words: list[str], variables: dict[str, str | None], where: str)
 def make_closure(ctx: Context) -> tuple[dict[str, list[str]], set[str]]:
     """(target -> recipe lines for every target `make ci` reaches, through its
     prerequisites and through `$(MAKE) <target>` lines, recursively; the targets
-    reached only through a line that discards its exit code)."""
+    reached only through a silenced line)."""
     recipes, prerequisites = make_rules(ctx.makefile)
     variables = make_variables(ctx.makefile)
     out: dict[str, list[str]] = {}
@@ -261,7 +261,7 @@ def recipe_runs(ctx: Context, line: str) -> list[tuple[str, str]]:
 
 def closure_runs(ctx: Context) -> tuple[dict[str, dict[str, set[str]]], set[tuple[str, str]]]:
     """(file -> mode -> the make targets of the `make ci` closure that run it,
-    the (file, mode) pairs run on a line that discards its exit code)."""
+    the (file, mode) pairs run on a silenced line)."""
     runs: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
     silenced: set[tuple[str, str]] = set()
     lines_by_target, quiet_targets = make_closure(ctx)

@@ -570,6 +570,16 @@ root=$(sg_fresh heredoc_after_a_shift)
 verdict heredoc_after_an_arithmetic_shift 1 "<< inside \$(( )) and (( )) opens no heredoc: the 21-line body after them is found" "$root" \
     --has "heredoc: check/y.sh:14: a Python body of 21 lines, over 20"
 
+root=$(sg_fresh heredoc_shift_on_the_opener_line)
+{
+    sg_valid_sh ':'
+    printf '%s\n' "n=3; x=\$((1<<n)); python3 - <<'PY'"
+    repeat_line 'print(1)' 21
+    printf '%s\n' PY
+} | sg_put "$root" check/y.sh
+verdict heredoc_shift_before_the_opener_on_one_line 1 "a shift and a Python opener on one command line: the opener is the second <<" "$root" \
+    --has "heredoc: check/y.sh:10: a Python body of 21 lines, over 20"
+
 root=$(sg_fresh shift_then_exit)
 { sg_valid_sh ':'; printf '%s\n' 'n=3' 'x=$((1<<n))' 'exit 7'; } | sg_put "$root" check/y.sh
 verdict arithmetic_shift_keeps_other_rules_reading 1 "the line after a shift is read by exit-undeclared" "$root" \
