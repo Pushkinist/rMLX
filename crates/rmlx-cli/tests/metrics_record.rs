@@ -17,36 +17,21 @@
     clippy::items_after_statements
 )]
 
+mod common;
+
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+
+use common::rmlx_metrics;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn rmlx_bin() -> PathBuf {
-    let manifest_dir =
-        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set by cargo");
-    let workspace_root = PathBuf::from(manifest_dir)
-        .parent() // crates/
-        .and_then(|p| p.parent()) // workspace root
-        .expect("workspace root from CARGO_MANIFEST_DIR")
-        .to_path_buf();
-    let debug = workspace_root.join("target/debug/rmlx");
-    assert!(
-        debug.exists(),
-        "target/debug/rmlx not found at {} — run `cargo build -p rmlx-cli` first",
-        debug.display()
-    );
-    debug
-}
-
 /// Initialize a fresh DB in `td` and return its absolute path.
 fn init_db(td: &tempfile::TempDir) -> PathBuf {
     let db = td.path().join("runs.db");
-    let out = Command::new(rmlx_bin())
-        .args(["metrics", "--db"])
-        .arg(&db)
+    let out = rmlx_metrics(&db)
         .arg("init")
         .output()
         .expect("launch rmlx metrics init");
@@ -60,10 +45,7 @@ fn init_db(td: &tempfile::TempDir) -> PathBuf {
 
 /// Run `rmlx metrics --db <db> record <extra_args...>` and return Output.
 fn run_record(db: &Path, extra: &[&str]) -> std::process::Output {
-    Command::new(rmlx_bin())
-        .arg("metrics")
-        .arg("--db")
-        .arg(db)
+    rmlx_metrics(db)
         .arg("record")
         .args(extra)
         .output()
@@ -195,10 +177,7 @@ fn record_stdin_inserts_observation() {
     let db = init_db(&td);
 
     let json = valid_record_json();
-    let mut child = Command::new(rmlx_bin())
-        .arg("metrics")
-        .arg("--db")
-        .arg(&db)
+    let mut child = rmlx_metrics(&db)
         .arg("record")
         .arg("--stdin")
         .stdin(Stdio::piped())
@@ -258,11 +237,7 @@ fn replay_pending_consumes_pending_dir() {
         std::fs::write(pending.join(format!("run{i}.json")), valid_record_json()).unwrap();
     }
 
-    let out = Command::new(rmlx_bin())
-        .env("RMLX_HOME", td.path())
-        .arg("metrics")
-        .arg("--db")
-        .arg(&db)
+    let out = rmlx_metrics(&db)
         .arg("record")
         .arg("--replay-pending")
         .output()
@@ -312,11 +287,7 @@ fn replay_pending_moves_invalid_to_failed() {
     .to_string();
     std::fs::write(pending.join("bad.json"), &bad).unwrap();
 
-    let out = Command::new(rmlx_bin())
-        .env("RMLX_HOME", td.path())
-        .arg("metrics")
-        .arg("--db")
-        .arg(&db)
+    let out = rmlx_metrics(&db)
         .arg("record")
         .arg("--replay-pending")
         .output()

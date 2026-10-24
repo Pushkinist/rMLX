@@ -19,36 +19,20 @@
     clippy::float_cmp
 )]
 
+mod common;
+
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+use common::rmlx_metrics;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn rmlx_bin() -> PathBuf {
-    let manifest_dir =
-        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set by cargo");
-    let workspace_root = PathBuf::from(manifest_dir)
-        .parent() // crates/
-        .and_then(|p| p.parent()) // workspace root
-        .expect("workspace root from CARGO_MANIFEST_DIR")
-        .to_path_buf();
-    let debug = workspace_root.join("target/debug/rmlx");
-    assert!(
-        debug.exists(),
-        "target/debug/rmlx not found at {} — run `cargo build -p rmlx-cli` first",
-        debug.display()
-    );
-    debug
-}
-
 /// Initialize a fresh DB and return its path.
 fn init_db(td: &tempfile::TempDir) -> PathBuf {
     let db = td.path().join("runs.db");
-    let out = Command::new(rmlx_bin())
-        .args(["metrics", "--db"])
-        .arg(&db)
+    let out = rmlx_metrics(&db)
         .arg("init")
         .output()
         .expect("launch rmlx metrics init");
@@ -62,10 +46,7 @@ fn init_db(td: &tempfile::TempDir) -> PathBuf {
 
 /// Run `rmlx metrics --db <db> <subargs...>` and return Output.
 fn run_metrics(db: &Path, subargs: &[&str]) -> std::process::Output {
-    Command::new(rmlx_bin())
-        .arg("metrics")
-        .arg("--db")
-        .arg(db)
+    rmlx_metrics(db)
         .args(subargs)
         .output()
         .expect("launch rmlx")
@@ -596,11 +577,8 @@ fn prompts_list_after_sync_shows_real_files() {
     let prompts_dir = workspace_root.join("prompts");
 
     // We need RMLX_REPO_ROOT so `prompts sync` finds the prompts/ dir.
-    let out = Command::new(rmlx_bin())
+    let out = rmlx_metrics(&db)
         .env("RMLX_REPO_ROOT", &workspace_root)
-        .arg("metrics")
-        .arg("--db")
-        .arg(&db)
         .arg("prompts")
         .arg("sync")
         .output()
@@ -635,11 +613,8 @@ fn prompts_list_after_sync_shows_real_files() {
         })
         .count();
 
-    let out = Command::new(rmlx_bin())
+    let out = rmlx_metrics(&db)
         .env("RMLX_REPO_ROOT", &workspace_root)
-        .arg("metrics")
-        .arg("--db")
-        .arg(&db)
         .arg("prompts")
         .arg("list")
         .output()
@@ -729,11 +704,8 @@ fn migrate_dryish_smoke() {
         .to_path_buf();
 
     let glob = format!("{}/*.jsonl", td.path().display());
-    let out = Command::new(rmlx_bin())
+    let out = rmlx_metrics(&db)
         .env("RMLX_REPO_ROOT", &workspace_root)
-        .arg("metrics")
-        .arg("--db")
-        .arg(&db)
         .arg("migrate")
         .arg("--rmlx-glob")
         .arg(&glob)

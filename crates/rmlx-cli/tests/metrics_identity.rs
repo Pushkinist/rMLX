@@ -18,28 +18,15 @@
     clippy::items_after_statements
 )]
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+mod common;
 
-/// Locate the cargo-built `rmlx` binary.
-///
-/// `CARGO_BIN_EXE_rmlx` is injected by Cargo's integration-test runner and
-/// resolves to whatever profile/target dir this test binary was itself built
-/// under — unlike a hard-coded `target/debug/rmlx`, it is never absent under
-/// `--profile release-perf` or a custom `CARGO_TARGET_DIR`, and never
-/// silently stale (exercising a different binary than the one under test).
-fn rmlx_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_rmlx"))
-}
+use std::path::{Path, PathBuf};
+
+use common::{rmlx_at, rmlx_metrics};
 
 fn init_db(td: &tempfile::TempDir) -> PathBuf {
     let db = td.path().join("runs.db");
-    let out = Command::new(rmlx_bin())
-        .args(["metrics", "--db"])
-        .arg(&db)
-        .arg("init")
-        .output()
-        .expect("launch init");
+    let out = rmlx_metrics(&db).arg("init").output().expect("launch init");
     assert!(out.status.success());
     db
 }
@@ -66,10 +53,7 @@ fn record_json(backend: &str, version: Option<&str>) -> String {
 }
 
 fn record_inline(db: &Path, json: &str) -> std::process::Output {
-    Command::new(rmlx_bin())
-        .arg("metrics")
-        .arg("--db")
-        .arg(db)
+    rmlx_metrics(db)
         .args(["record", "--inline", json])
         .output()
         .expect("launch record")
@@ -85,7 +69,8 @@ fn obs_count(db: &Path) -> i64 {
 
 #[test]
 fn identity_json_carries_semver_and_real_build_profile() {
-    let out = Command::new(rmlx_bin())
+    let home = tempfile::tempdir().unwrap();
+    let out = rmlx_at(home.path())
         .args(["metrics", "identity", "--json"])
         .output()
         .expect("launch identity");
@@ -182,10 +167,7 @@ fn file_rmlx_without_version_is_rejected_and_buffer_kept() {
     let buf = td.path().join("run.json");
     std::fs::write(&buf, record_json("rmlx", None)).unwrap();
 
-    let out = Command::new(rmlx_bin())
-        .arg("metrics")
-        .arg("--db")
-        .arg(&db)
+    let out = rmlx_metrics(&db)
         .arg("record")
         .arg("--file")
         .arg(&buf)
@@ -209,7 +191,7 @@ fn replay_pending_does_not_restamp_identity() {
     std::fs::create_dir_all(&pending).unwrap();
 
     let db = home.join("metrics/runs.db");
-    let init = Command::new(rmlx_bin())
+    let init = rmlx_at(home)
         .args(["metrics", "--db"])
         .arg(&db)
         .arg("init")
@@ -223,8 +205,7 @@ fn replay_pending_does_not_restamp_identity() {
     rec["build_profile"] = serde_json::Value::String("release-perf".into());
     std::fs::write(pending.join("old.json"), rec.to_string()).unwrap();
 
-    let out = Command::new(rmlx_bin())
-        .env("RMLX_HOME", home)
+    let out = rmlx_at(home)
         .args(["metrics", "--db"])
         .arg(&db)
         .args(["record", "--replay-pending"])
@@ -261,7 +242,7 @@ fn replay_pending_moves_identity_less_rmlx_record_to_failed() {
     std::fs::create_dir_all(&pending).unwrap();
 
     let db = home.join("metrics/runs.db");
-    let init = Command::new(rmlx_bin())
+    let init = rmlx_at(home)
         .args(["metrics", "--db"])
         .arg(&db)
         .arg("init")
@@ -271,8 +252,7 @@ fn replay_pending_moves_identity_less_rmlx_record_to_failed() {
 
     std::fs::write(pending.join("bad.json"), record_json("rmlx", None)).unwrap();
 
-    let out = Command::new(rmlx_bin())
-        .env("RMLX_HOME", home)
+    let out = rmlx_at(home)
         .args(["metrics", "--db"])
         .arg(&db)
         .args(["record", "--replay-pending"])
@@ -294,14 +274,14 @@ fn validate_accepts_good_and_rejects_bad_without_writing() {
     std::fs::write(&good, record_json("rmlx", Some("0.2.8"))).unwrap();
     std::fs::write(&bad, record_json("rmlx", None)).unwrap();
 
-    let ok = Command::new(rmlx_bin())
+    let ok = rmlx_at(td.path())
         .args(["metrics", "validate", "--file"])
         .arg(&good)
         .output()
         .expect("launch validate");
     assert!(ok.status.success());
 
-    let err = Command::new(rmlx_bin())
+    let err = rmlx_at(td.path())
         .args(["metrics", "validate", "--file"])
         .arg(&bad)
         .output()
@@ -331,8 +311,7 @@ fn metrics_off_never_creates_runs_db() {
     let td = tempfile::tempdir().unwrap();
     let rmlx_home = td.path();
 
-    let out = Command::new(rmlx_bin())
-        .env("RMLX_HOME", rmlx_home)
+    let out = rmlx_at(rmlx_home)
         .args([
             "--metrics",
             "off",
@@ -370,8 +349,7 @@ fn default_metrics_mode_does_create_runs_db_on_the_same_fast_fail_path() {
     let td = tempfile::tempdir().unwrap();
     let rmlx_home = td.path();
 
-    let out = Command::new(rmlx_bin())
-        .env("RMLX_HOME", rmlx_home)
+    let out = rmlx_at(rmlx_home)
         .args(["info", "--model", "/nonexistent/rmlx-metrics-off-probe"])
         .output()
         .expect("launch info");

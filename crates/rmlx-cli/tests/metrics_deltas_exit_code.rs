@@ -24,8 +24,11 @@
     clippy::float_cmp
 )]
 
+mod common;
+
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+use common::rmlx_metrics;
 
 use rmlx_metrics::{
     ingest::{PromptRef, RunRecord},
@@ -38,23 +41,6 @@ use serde_json::json;
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn rmlx_bin() -> PathBuf {
-    let manifest_dir =
-        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set by cargo");
-    let workspace_root = PathBuf::from(manifest_dir)
-        .parent() // crates/
-        .and_then(|p| p.parent()) // workspace root
-        .expect("workspace root from CARGO_MANIFEST_DIR")
-        .to_path_buf();
-    let debug = workspace_root.join("target/debug/rmlx");
-    assert!(
-        debug.exists(),
-        "target/debug/rmlx not found at {} — run `cargo build -p rmlx-cli` first",
-        debug.display()
-    );
-    debug
-}
 
 /// Open an in-memory SQLite DB with the rmlx-metrics schema applied.
 fn open_mem() -> Connection {
@@ -306,10 +292,7 @@ fn seed_two_prompt_db(td: &tempfile::TempDir, canary_after: f64, other_after: f6
 }
 
 fn run_deltas(db: &Path, extra: &[&str]) -> std::process::Output {
-    Command::new(rmlx_bin())
-        .arg("metrics")
-        .arg("--db")
-        .arg(db)
+    rmlx_metrics(db)
         .arg("deltas")
         .args(extra)
         .output()

@@ -10,10 +10,9 @@
 //! Run explicitly:
 //! cargo test -p rmlx-cli --test baseline_smoke -- --ignored --nocapture
 //!
-//! # Binary path
-//! `cargo test` sets cwd to `CARGO_MANIFEST_DIR` = `crates/rmlx-cli/`.
-//! The compiled binary lives at workspace root `target/{profile}/rmlx`.
-//! We resolve it via `env!("CARGO_MANIFEST_DIR")` + `../../target/…`.
+//! # Runtime home
+//! Each test runs the binary with its own temporary `RMLX_HOME` and reads
+//! `metrics/baseline.csv` from there.
 
 #![allow(
     clippy::unwrap_used,
@@ -30,39 +29,15 @@
     clippy::unnecessary_debug_formatting
 )]
 
+mod common;
+
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
+
+use common::rmlx_at;
 
 fn primary_model_dir() -> Option<PathBuf> {
     std::env::var_os("RMLX_TEST_MODEL_GEMMA4_E4B").map(PathBuf::from)
-}
-
-/// Resolve the rmlx binary at workspace root `target/{release,debug}/rmlx`.
-///
-/// `CARGO_MANIFEST_DIR` = `<workspace>/crates/rmlx-cli/`.
-/// Workspace root = two levels up.
-fn rmlx_binary() -> PathBuf {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest_dir
-        .parent()
-        .expect("crates/")
-        .parent()
-        .expect("workspace root");
-
-    let release = workspace_root.join("target/release/rmlx");
-    let debug = workspace_root.join("target/debug/rmlx");
-
-    if release.exists() {
-        release
-    } else if debug.exists() {
-        debug
-    } else {
-        panic!(
-            "[baseline_smoke] rmlx binary not found at {release:?} or {debug:?}; \
-             run `cargo build` or `cargo build --release` first"
-        )
-    }
 }
 
 /// End-to-end baseline subcommand smoke test — GPU device.
@@ -82,7 +57,7 @@ fn baseline_command_gpu_produces_output_and_csv_row() {
         return;
     }
 
-    let binary_path = rmlx_binary();
+    let home = tempfile::tempdir().expect("create RMLX_HOME tempdir");
 
     // Write a tiny prompt to a temp file so we avoid the multi-hour full fixture.
     let mut prompt_file = tempfile::NamedTempFile::new().expect("create temp prompt file");
@@ -90,7 +65,7 @@ fn baseline_command_gpu_produces_output_and_csv_row() {
     let prompt_path = prompt_file.path().to_path_buf();
 
     let model_str = model_path.to_str().expect("model path is valid UTF-8");
-    let output = Command::new(&binary_path)
+    let output = rmlx_at(home.path())
         .args([
             "baseline",
             "--model",
@@ -125,29 +100,12 @@ fn baseline_command_gpu_produces_output_and_csv_row() {
         "[baseline_smoke/gpu] stdout does not contain 'baseline: ' summary line:\n{stdout}"
     );
 
-    // Verify metrics/baseline.csv has at least 1 data row.
-    // The baseline command writes relative to cwd (where rmlx binary is invoked),
-    // which is inherited from the test process = CARGO_MANIFEST_DIR.
-    // Resolve to the crate-local metrics/baseline.csv.
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let csv_path = manifest_dir.join("metrics/baseline.csv");
-    // Also try workspace root (the baseline command uses cwd of the binary, which
-    // inherits from the test process — CARGO_MANIFEST_DIR for cargo test).
-    let csv_path_workspace = manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|ws| ws.join("metrics/baseline.csv"));
-
-    let found_csv = if csv_path.exists() {
-        csv_path
-    } else if csv_path_workspace.as_ref().is_some_and(|p| p.exists()) {
-        csv_path_workspace.unwrap()
-    } else {
-        panic!(
-            "[baseline_smoke/gpu] metrics/baseline.csv was not created \
-             (checked {csv_path:?} and workspace root)"
-        );
-    };
+    // `baseline` appends its row to `<RMLX_HOME>/metrics/baseline.csv`.
+    let found_csv = home.path().join("metrics/baseline.csv");
+    assert!(
+        found_csv.exists(),
+        "[baseline_smoke/gpu] metrics/baseline.csv was not created at {found_csv:?}"
+    );
 
     let csv_content = std::fs::read_to_string(&found_csv).expect("read metrics/baseline.csv");
     let data_rows: Vec<&str> = csv_content
@@ -183,14 +141,14 @@ fn baseline_command_cpu_produces_output_and_csv_row() {
         return;
     }
 
-    let binary_path = rmlx_binary();
+    let home = tempfile::tempdir().expect("create RMLX_HOME tempdir");
 
     let mut prompt_file = tempfile::NamedTempFile::new().expect("create temp prompt file");
     writeln!(prompt_file, "The history of paper begins in ancient China.").expect("write prompt");
     let prompt_path = prompt_file.path().to_path_buf();
 
     let model_str = model_path.to_str().expect("model path is valid UTF-8");
-    let output = Command::new(&binary_path)
+    let output = rmlx_at(home.path())
         .args([
             "baseline",
             "--model",
@@ -225,23 +183,11 @@ fn baseline_command_cpu_produces_output_and_csv_row() {
         "[baseline_smoke/cpu] stdout does not contain 'baseline: ' summary line:\n{stdout}"
     );
 
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let csv_path = manifest_dir.join("metrics/baseline.csv");
-    let csv_path_workspace = manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|ws| ws.join("metrics/baseline.csv"));
-
-    let found_csv = if csv_path.exists() {
-        csv_path
-    } else if csv_path_workspace.as_ref().is_some_and(|p| p.exists()) {
-        csv_path_workspace.unwrap()
-    } else {
-        panic!(
-            "[baseline_smoke/cpu] metrics/baseline.csv was not created \
-             (checked {csv_path:?} and workspace root)"
-        );
-    };
+    let found_csv = home.path().join("metrics/baseline.csv");
+    assert!(
+        found_csv.exists(),
+        "[baseline_smoke/cpu] metrics/baseline.csv was not created at {found_csv:?}"
+    );
 
     let csv_content = std::fs::read_to_string(&found_csv).expect("read metrics/baseline.csv");
     let data_rows: Vec<&str> = csv_content
