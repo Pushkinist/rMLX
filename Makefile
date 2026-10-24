@@ -115,12 +115,12 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         check-doc-size check-doc-size-selftest \
         check-scripts scripts-index check-scripts-selftest \
         kv-update-census kv-update-census-selftest \
-        check-no-inline-tests check-no-scalar-f32-leak \
+        check-no-inline-tests check-no-inline-tests-fixtures check-no-scalar-f32-leak \
         check-doc-source-citations \
-        check-kv-layer-quants check-kv-codec-disposition \
+        check-kv-layer-quants check-kv-layer-quants-fixtures check-kv-codec-disposition \
         check-kv-codec-disposition-fixtures \
         check-kv-byte-model-parity check-kv-byte-model-parity-fixtures \
-        check-no-decode-swallow check-gpu-tests-ignored \
+        check-no-decode-swallow check-no-decode-swallow-fixtures check-gpu-tests-ignored \
         check-gpu-tests-ignored-fixtures gpu-runner-selftest \
         check-named-skip-notices check-named-skip-notices-fixtures \
         check-eval-lock check-eval-lock-fixtures eval-lock-stress miri \
@@ -509,11 +509,17 @@ kv-update-census-selftest: ## CI gate: recall test for the KV structural figures
 check-no-inline-tests: ## CI gate: fail if any non-test.rs file has inline #[cfg(test)] mod tests { ... }
 	@bash scripts/check_no_inline_tests.sh
 
+check-no-inline-tests-fixtures: ## CI gate: recall test for the above, 14 planted scan roots, each asserting the rule or the refusal as well as the exit code
+	@bash scripts/check/rust_gates_fixtures.sh no_inline_tests
+
 check-no-scalar-f32-leak: ## CI gate: fail if arch-layer code has unguarded scalar_f32( not followed by .astype(
 	@bash scripts/check_no_scalar_f32_leak.sh
 
 check-kv-layer-quants: ## CI gate: fail if kv_quant_for_layer is called outside kv_cache/ (one producer: kv_layer_quants)
 	@bash scripts/check_kv_layer_quants.sh
+
+check-kv-layer-quants-fixtures: ## CI gate: recall test for the above, 14 planted scan roots, each asserting the rule or the refusal as well as the exit code
+	@bash scripts/check/rust_gates_fixtures.sh kv_layer_quants
 
 check-kv-codec-disposition: ## CI gate: fail if the --kv-quant/--kv-bits help or the INERT banner docs contradict a codec's runtime disposition
 	@bash scripts/check_kv_codec_disposition.sh
@@ -633,6 +639,9 @@ check-doc-consumers: check-doc-refs check-doc-source-citations check-kv-codec-di
 check-no-decode-swallow: ## CI gate: fail if a decode-step failure breaks instead of propagating (would report as finish_reason="length")
 	@bash scripts/check_no_decode_swallow.sh
 
+check-no-decode-swallow-fixtures: ## CI gate: recall test for the above, 26 planted scan roots, each asserting the rule, the pinned site count or the refusal as well as the exit code
+	@bash scripts/check/rust_gates_fixtures.sh no_decode_swallow
+
 check-eval-lock:  ## CI gate: fail if an MLX eval FFI call is made without the process-wide evaluation lock
 	@bash scripts/check_eval_lock.sh
 
@@ -726,8 +735,10 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/release/release_cpu_selftest.sh
 	@bash scripts/report/kv_census_selftest.sh
 	@bash scripts/check_no_inline_tests.sh
+	@bash scripts/check/rust_gates_fixtures.sh no_inline_tests
 	@bash scripts/check_no_scalar_f32_leak.sh
 	@bash scripts/check_kv_layer_quants.sh
+	@bash scripts/check/rust_gates_fixtures.sh kv_layer_quants
 	@bash scripts/check_kv_codec_disposition.sh
 	@bash scripts/check_kv_codec_disposition_fixtures.sh
 	@bash scripts/check_kv_byte_model_parity.sh
@@ -746,6 +757,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_doc_refs_selftest.sh
 	@$(MAKE) --no-print-directory check-doc-refs
 	@bash scripts/check_no_decode_swallow.sh
+	@bash scripts/check/rust_gates_fixtures.sh no_decode_swallow
 	@bash scripts/check_eval_lock.sh
 	@bash scripts/check/rust_gates_fixtures.sh eval_lock
 	@bash scripts/check_gpu_tests_ignored.sh

@@ -82,6 +82,11 @@ scanned. A new directory needs three files that share its meaning and a row
 here. [review]
 
 * A recall test lives beside its subject as `<subject>_selftest.sh`. [review]
+* The recall tests of the gates that read Rust source over a planted tree are the
+  modes of `check/rust_gates_fixtures.sh`: one `fixtures/<gate>/cases.tsv` per gate
+  (cases only, no gate path or command) beside its planted trees, and one `case`
+  arm in the file that names the gate. A new gate of that kind adds a mode and a
+  table, never a file. [review]
 * A module used by one tool lives beside it, has no shebang and no exec bit,
   and its header says `Module of: <class>/<tool>`. A file with that line is not
   an entry point. The tool must exist, not be the file itself, and reach it: run,

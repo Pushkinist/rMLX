@@ -31,13 +31,13 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `check_kv_byte_model_parity_fixtures.sh` | make check-kv-byte-model-parity-fixtures, make ci | Recall test for check_kv_byte_model_parity.sh: one edited manifest per case, asserting the check. |
 | `check_kv_codec_disposition.sh` | make check-kv-codec-disposition, make ci, check_kv_codec_disposition_fixtures.sh | CI gate: what the KV help and docs say a codec does agrees with its runtime disposition. |
 | `check_kv_codec_disposition_fixtures.sh` | make check-kv-codec-disposition-fixtures, make ci | Recall test for check_kv_codec_disposition.sh: synthetic scan roots, asserting rule and exit code. |
-| `check_kv_layer_quants.sh` | make check-kv-layer-quants, make ci | CI gate: the per-layer KV codec vector has one producer, and every cache stack uses it. |
+| `check_kv_layer_quants.sh` | make check-kv-layer-quants, make ci, check/rust_gates_fixtures.sh | CI gate: the per-layer KV codec vector has one producer, and every cache stack uses it. |
 | `check_metal_compiles.sh` | make check-metal-compiles, make ci | CI gate: every .metal kernel compiles at -std=metal3.1 and metal4.0 and is named by its manifest. |
 | `check_metal_format.sh` | make check-metal-format, make ci, pre-commit | CI gate: every .metal kernel file is clang-format clean. |
 | `check_named_skip_notices.sh` | make check-named-skip-notices, make ci, check_named_skip_notices_fixtures.sh | CI gate: every classified GPU test that announces its own stand-down names itself in the notice. |
 | `check_named_skip_notices_fixtures.sh` | make check-named-skip-notices-fixtures, make ci | Recall test for check_named_skip_notices.sh: planted notice shapes, asserting the reason. |
-| `check_no_decode_swallow.sh` | make check-no-decode-swallow, make ci | CI gate: a failed decode step or prefill chunk propagates instead of looking like a success. |
-| `check_no_inline_tests.sh` | make check-no-inline-tests, make ci | CI gate: no inline #[cfg(test)] mod tests block in a non-test source file. |
+| `check_no_decode_swallow.sh` | make check-no-decode-swallow, make ci, check/rust_gates_fixtures.sh | CI gate: a failed decode step or prefill chunk propagates instead of looking like a success. |
+| `check_no_inline_tests.sh` | make check-no-inline-tests, make ci, check/rust_gates_fixtures.sh | CI gate: no inline #[cfg(test)] mod tests block in a non-test source file. |
 | `check_no_kernel_input_eval.sh` | make check-no-kernel-input-eval, make ci, check/rust_gates_fixtures.sh | CI gate: no blocking Array::eval() on a kernel input in a custom-Metal-kernel dispatcher. |
 | `check_no_scalar_f32_leak.sh` | make check-no-scalar-f32-leak, make ci | CI gate: no unguarded scalar_f32( in the crates that own .metal kernels. |
 | `check_personal_data.sh` | make check-personal-data, make ci, check_personal_data_selftest.sh | CI gate: no personal email, macOS home or temp path, or assistant session link in published files. |
@@ -105,7 +105,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
-| `check/rust_gates_fixtures.sh` | make check-eval-lock-fixtures, make check-gpu-tests-ignored-fixtures, make check-kernel-dtype-contract-fixtures, make check-no-kernel-input-eval-fixtures, make ci | Recall test for the Rust-source gates: planted scan roots from a table, asserting exit and reason. |
+| `check/rust_gates_fixtures.sh` | make check-eval-lock-fixtures, make check-gpu-tests-ignored-fixtures, make check-kernel-dtype-contract-fixtures, make check-kv-layer-quants-fixtures, make check-no-decode-swallow-fixtures, make check-no-inline-tests-fixtures, make check-no-kernel-input-eval-fixtures, make ci | Recall test for the Rust-source gates: planted scan roots from a table, asserting exit and reason. |
 
 ## scripts/eval/
 

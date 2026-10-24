@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # CI gate: the per-layer KV codec vector has one producer, and every cache stack uses it.
 #
+# Usage:  bash scripts/check_kv_layer_quants.sh [<root>]
+# Exit:   0 clean; 1 a violation; 2 nothing to scan under <root>/crates/rmlx-models/src
+#
+# <root> is the directory that holds crates/; it defaults to the repository.
+#
 # A stack that deliberately does not use it declares itself uniform.
 #
 # WHY
@@ -45,13 +50,22 @@
 #   that builds every layer at one codec, is spilled and keyed, and whose
 #   hydrate reads the one vector its prompt cache declares uniform
 #   (`ArchPromptCache::layer_quants`).
-#
-# Exit 0 = clean. Exit 1 = violation found.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCAN_ROOT="${1:-${REPO_ROOT}}"
 POLICY_DIR="crates/rmlx-models/src/kv_cache/"
+MODELS_SRC="crates/rmlx-models/src"
+
+if [ ! -d "${SCAN_ROOT}/${MODELS_SRC}" ]; then
+    echo "check_kv_layer_quants: no ${MODELS_SRC} directory under ${SCAN_ROOT}, nothing to scan." >&2
+    exit 2
+fi
+if [ -z "$(find "${SCAN_ROOT}/${MODELS_SRC}" -name '*.rs' -print -quit)" ]; then
+    echo "check_kv_layer_quants: no .rs file under ${SCAN_ROOT}/${MODELS_SRC}, nothing to scan." >&2
+    exit 2
+fi
 
 # ── Rule 1 ────────────────────────────────────────────────────────────────
 # Call sites that read the boundary counts to REPORT them — the `decode_config`
@@ -74,7 +88,7 @@ is_boundary_reporter() {
 
 rule1=()
 while IFS= read -r f; do
-    rel="${f#"${REPO_ROOT}/"}"
+    rel="${f#"${SCAN_ROOT}/"}"
     case "${rel}" in
         "${POLICY_DIR}"*) continue ;;
     esac
@@ -82,7 +96,7 @@ while IFS= read -r f; do
     rule1+=("${rel}")
 done < <(
     grep -rlE --include='*.rs' '(kv_quant_for_layer|active_kv_boundary)\(' \
-        "${REPO_ROOT}/crates" 2>/dev/null || true
+        "${SCAN_ROOT}/crates" 2>/dev/null || true
 )
 
 if [ ${#rule1[@]} -gt 0 ]; then
@@ -101,7 +115,7 @@ fi
 # ── Rule 2 ────────────────────────────────────────────────────────────────
 rule2=()
 while IFS= read -r f; do
-    rel="${f#"${REPO_ROOT}/"}"
+    rel="${f#"${SCAN_ROOT}/"}"
     case "${rel}" in
         "${POLICY_DIR}"*) continue ;;
         *_tests.rs|*/tests.rs|*/tests/*) continue ;;
@@ -111,7 +125,7 @@ while IFS= read -r f; do
     rule2+=("${rel}")
 done < <(
     grep -rl --include='*.rs' -E 'KvCache::with_quant_max_seq(_window)?\(' \
-        "${REPO_ROOT}/crates/rmlx-models/src" 2>/dev/null || true
+        "${SCAN_ROOT}/${MODELS_SRC}" 2>/dev/null || true
 )
 
 if [ ${#rule2[@]} -gt 0 ]; then

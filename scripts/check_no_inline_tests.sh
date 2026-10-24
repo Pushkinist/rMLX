@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # CI gate: no inline #[cfg(test)] mod tests block in a non-test source file.
 #
+# Usage:  bash scripts/check_no_inline_tests.sh [<root>]
+# Exit:   0 clean; 1 a violation; 2 nothing to scan under <root>/crates
+#
+# <root> is the directory that holds crates/; it defaults to the repository.
+#
 # ALLOWED (sibling-pointer pattern):
 #   #[cfg(test)]
 #   #[path = "foo_tests.rs"]
@@ -17,16 +22,22 @@
 #   - files under tests/ directories (integration tests)
 #   - tests.rs files
 #   - *_tests.rs files
-#
-# Exit 0 = clean. Exit 1 = violation found.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCAN_ROOT="${1:-${REPO_ROOT}}"
+
+if [ ! -d "${SCAN_ROOT}/crates" ]; then
+    echo "check_no_inline_tests: no crates directory at ${SCAN_ROOT}/crates, nothing to scan." >&2
+    exit 2
+fi
 
 violators=()
+scanned=0
 
 while IFS= read -r -d '' f; do
+    scanned=$((scanned + 1))
     # Use awk to detect the banned pattern:
     # A line matching `#[cfg(test)]` (possibly with surrounding whitespace)
     # is immediately followed (next non-blank line) by `mod <name> {` (brace).
@@ -50,13 +61,18 @@ while IFS= read -r -d '' f; do
         violators+=("$f")
     fi
 done < <(
-    find "${REPO_ROOT}/crates" -name "*.rs" \
+    find "${SCAN_ROOT}/crates" -name "*.rs" \
         -not -path "*/target/*" \
         -not -path "*/tests/*" \
         -not -name "tests.rs" \
         -not -name "*_tests.rs" \
         -print0
 )
+
+if [ "${scanned}" -eq 0 ]; then
+    echo "check_no_inline_tests: no .rs file under ${SCAN_ROOT}/crates, nothing to scan." >&2
+    exit 2
+fi
 
 if [ ${#violators[@]} -gt 0 ]; then
     echo "ERROR: inline #[cfg(test)] mod <name> { ... } blocks found outside tests.rs / *_tests.rs:" >&2

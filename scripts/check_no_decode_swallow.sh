@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # CI gate: a failed decode step or prefill chunk propagates instead of looking like a success.
 #
+# Usage:  bash scripts/check_no_decode_swallow.sh [<root>]
+# Exit:   0 clean; 1 a violation or a pinned site count off; 2 <root> is no directory
+#
+# <root> is the directory that holds crates/; it defaults to the repository.
+#
 # THE BUG THIS PINS
 #   Decode: a decode step that errored used to log a warning and `break`, handing
 #   the caller the tokens produced so far. The server then saw a non-EOS last
@@ -60,13 +65,15 @@
 #   error as a structured field is invisible to it (and is a traceability bug
 #   in its own right — see the tracing rules in CLAUDE.md). RULE 4 exists
 #   precisely because that anchor is missing from a detect-and-discard site.
-#
-# Exit 0 = clean. Exit 1 = violation found.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "${REPO_ROOT}"
+SCAN_ROOT="${1:-${REPO_ROOT}}"
+cd "${SCAN_ROOT}" 2>/dev/null || {
+    echo "check_no_decode_swallow: no scan root at ${SCAN_ROOT}" >&2
+    exit 2
+}
 
 # Lines of context after an anchor in which the verdict must appear. The log
 # macro spans several lines (fields, message, closing paren) before the control

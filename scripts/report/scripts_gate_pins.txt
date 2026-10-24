@@ -127,13 +127,10 @@ usage check_kv_byte_model_parity.sh
 usage check_kv_byte_model_parity_fixtures.sh
 usage check_kv_codec_disposition.sh
 usage check_kv_codec_disposition_fixtures.sh
-usage check_kv_layer_quants.sh
 usage check_metal_compiles.sh
 usage check_metal_format.sh
 usage check_named_skip_notices.sh
 usage check_named_skip_notices_fixtures.sh
-usage check_no_decode_swallow.sh
-usage check_no_inline_tests.sh
 usage check_no_kernel_input_eval.sh
 usage check_no_scalar_f32_leak.sh
 usage check_personal_data_selftest.sh
@@ -213,13 +210,10 @@ exit-undeclared check_kv_byte_model_parity.sh 1,2
 exit-undeclared check_kv_byte_model_parity_fixtures.sh 1,2
 exit-undeclared check_kv_codec_disposition.sh 1,2
 exit-undeclared check_kv_codec_disposition_fixtures.sh 1
-exit-undeclared check_kv_layer_quants.sh 1
 exit-undeclared check_metal_compiles.sh 0,1,2
 exit-undeclared check_metal_format.sh 0,1,2
 exit-undeclared check_named_skip_notices.sh 1,2
 exit-undeclared check_named_skip_notices_fixtures.sh 1
-exit-undeclared check_no_decode_swallow.sh 1
-exit-undeclared check_no_inline_tests.sh 1
 exit-undeclared check_no_kernel_input_eval.sh 1
 exit-undeclared check_no_scalar_f32_leak.sh 1
 exit-undeclared check_personal_data.sh 1,2
@@ -295,11 +289,8 @@ recall-missing bench_identity_selftest.sh default
 recall-missing bench_llama_ab_selftest.sh default
 recall-missing check_doc_source_citations.sh default
 recall-missing check_kv_boundary_default_parity.sh default
-recall-missing check_kv_layer_quants.sh default
 recall-missing check_metal_compiles.sh default
 recall-missing check_metal_format.sh default
-recall-missing check_no_decode_swallow.sh default
-recall-missing check_no_inline_tests.sh default
 recall-missing check_no_scalar_f32_leak.sh default
 recall-missing codec_smoke_runner_selftest.sh default
 recall-missing perf_ab_ingest_selftest.sh default

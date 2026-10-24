@@ -92,6 +92,14 @@ jobs:
       # passing forever. Fixture trees pin its recall, per rule.
       - name: the eval-lock gate still catches what it is for
         run: make check-eval-lock-fixtures
+      # Three more single-rule source gates, read by grep and awk; planted scan
+      # roots pin their recall and their refusal of a root with nothing in it.
+      - name: the inline-test gate still catches what it is for
+        run: make check-no-inline-tests-fixtures
+      - name: the per-layer KV codec gate still catches what it is for
+        run: make check-kv-layer-quants-fixtures
+      - name: the decode-swallow gate still catches what it is for
+        run: make check-no-decode-swallow-fixtures
       # A library that names the GPU device itself does Metal work in a process
       # that decided on the CPU and holds no claim. Static gate.
       - name: library code takes its device from the caller
