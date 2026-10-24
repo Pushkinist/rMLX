@@ -63,13 +63,15 @@
 # `rmlx baseline --record --run-class ab_arm --label perf_ab:<ts>:<A|B>:<slot>`,
 # so `runs.db` keeps the whole comparison and no row of it reaches `bests` or a
 # gate (docs/METRICS_DB.md section 13). Find a run's rows with
-# `notes LIKE 'label=perf_ab:<ts>:%'`. `ingest/perf_ab_ingest.py` promotes an
-# accepted comparison's medians under the class it is given, `gate` for the
-# surviving arm. Under `--synthetic-arms` the arms are stubs and measure
-# nothing, so every slot runs `--metrics off` instead and records nothing.
-# `--metrics`, `--record`, `--run-class` and `--label` are refused in arm
-# arguments: the harness sets them for every slot, and an arm's own occurrence
-# would win.
+# `notes LIKE 'label=perf_ab:<ts>:%'`. `ingest/perf_ab_ingest.py` promotes the
+# surviving arm of an accepted comparison as `gate`. A binary built before the
+# run class existed rejects `--run-class`, so each arm's binary is asked once,
+# through `baseline --help`, before the first slot: an arm whose binary lacks
+# the flag runs `--metrics off` and records nothing, and the report says so.
+# Under `--synthetic-arms` the arms are stubs and measure nothing, so every
+# slot runs `--metrics off` and the binaries are not asked. `--metrics`,
+# `--record`, `--run-class` and `--label` are refused in arm arguments: the
+# harness sets them for every slot, and an arm's own occurrence would win.
 #
 # It also writes elsewhere: the result lands in
 # `$RMLX_HOME/bench/perf_ab/<timestamp>.json`, and every slot is a full `rmlx`
@@ -326,6 +328,21 @@ if [[ "$SHA_A" == "$SHA_B" && "$ARGS_A" == "$ARGS_B" ]]; then
 	echo "NOTE: --allow-null-arms: arms are identical by construction (null calibration)." >&2
 fi
 
+# A binary built before the run class existed has no `--run-class`, and clap
+# would refuse the first slot. Read from the help text, not from a version: the
+# flag is the fact the slot depends on.
+records_run_class() {
+	local help
+	help="$("$1" baseline --help 2>/dev/null || true)"
+	[[ "$help" == *--run-class* ]]
+}
+RECORDS_A=false
+RECORDS_B=false
+if ! $SYNTHETIC_ARMS; then
+	if records_run_class "$BIN_A"; then RECORDS_A=true; fi
+	if records_run_class "$BIN_B"; then RECORDS_B=true; fi
+fi
+
 TS="$(date -u +"%Y%m%dT%H%M%SZ")"
 OUT_DIR="${RMLX_HOME}/bench/perf_ab"
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/rmlx_perf_ab.XXXXXX")"
@@ -510,9 +527,10 @@ run_slot() {
 	# has whole-second resolution, which rounds a short slot's window to 0 and
 	# makes the interference reading unmeasurable for reasons that have nothing
 	# to do with the host. TIMEFORMAT=%R gives milliseconds and forks nothing.
-	local record=(--record --run-class ab_arm --label "perf_ab:${TS}:${arm}:${tag}")
-	if $SYNTHETIC_ARMS; then
-		record=(--metrics off)
+	local records="$RECORDS_B" record=(--metrics off)
+	if [[ "$arm" == A ]]; then records="$RECORDS_A"; fi
+	if $records; then
+		record=(--record --run-class ab_arm --label "perf_ab:${TS}:${arm}:${tag}")
 	fi
 	TIMEFORMAT='%R'
 	# shellcheck disable=SC2086  # extra args are deliberately word-split
@@ -688,8 +706,20 @@ if $SYNTHETIC_ARMS; then
 	RECORDING="Every slot runs with --metrics off: the stub arms measure nothing, so runs.db
 is not opened."
 else
-	RECORDING="Every slot, warmups included, is recorded in runs.db as an ab_arm row labelled
-perf_ab:${TS}:<A|B>:<slot>. An ab_arm row reaches no champion and no gate."
+	RECORDING=""
+	for letter in A B; do
+		records="$RECORDS_B"
+		if [[ "$letter" == A ]]; then records="$RECORDS_A"; fi
+		if $records; then
+			RECORDING="${RECORDING}arm $letter: every slot, warmups included, is recorded in runs.db as an ab_arm
+  row labelled perf_ab:${TS}:$letter:<slot>, which reaches no champion and no gate.
+"
+		else
+			RECORDING="${RECORDING}arm $letter: its binary has no --run-class (built before the run class), so
+  its slots run with --metrics off and record nothing.
+"
+		fi
+	done
 
 	# One awk, not `awk && echo`: this is an assignment, so a false test would
 	# be the assignment's exit status and `set -e` would end the run here.

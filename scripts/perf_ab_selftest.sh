@@ -39,7 +39,7 @@ mkdir -p "$STATE" "$MODEL" "$MODEL2"
 TOKENS_MAIN="11,22,33,44,55"
 TOKENS_ALT="11,22,99,44,55"
 
-# make_stub <name> <tps-csv> <gen_alloc_mb> <tokens> [drift_at_call] [omit] [kv_bytes]
+# make_stub <name> <tps-csv> <gen_alloc_mb> <tokens> [drift_at_call] [omit] [kv_bytes] [old]
 #
 # The stub cycles through <tps-csv> across successive calls, so a run sees a
 # spread rather than a constant and the disjoint-range criterion is exercised
@@ -47,9 +47,11 @@ TOKENS_ALT="11,22,99,44,55"
 # TOKENS_ALT instead. `omit` drops a required field from the output.
 # `kv_bytes` is the resident-KV column: a byte count, the literal `n/a` (the
 # baseline command's own refusal), or empty to drop the field entirely, which
-# is what an older binary looks like to this harness.
+# is what an older binary looks like to this harness. `old` is a binary built
+# before the run class: its help names no `--run-class`, and it refuses the
+# flag the way clap does.
 make_stub() {
-	local name="$1" tps="$2" mem="$3" tokens="$4" drift="${5:-}" omit="${6:-}" kv="${7:-}"
+	local name="$1" tps="$2" mem="$3" tokens="$4" drift="${5:-}" omit="${6:-}" kv="${7:-}" old="${8:-}"
 	local path="$WORK/$name"
 	cat >"$path" <<STUB
 #!/usr/bin/env bash
@@ -64,6 +66,16 @@ if [ "\${1:-}" = claim ]; then
   shift 3
   exec "\$@"
 fi
+for a in "\$@"; do
+  if [ "\$a" = --help ]; then
+    if [ "$old" = old ]; then echo "Options: --record --label <LABEL>"; else echo "Options: --record --run-class <CLASS> --label <LABEL>"; fi
+    exit 0
+  fi
+  if [ "$old" = old ] && [ "\$a" = --run-class ]; then
+    echo "error: unexpected argument '--run-class' found" >&2
+    exit 2
+  fi
+done
 # Imitate the real binary's metrics behaviour, including clap's last-occurrence
 # -wins resolution of a \`global = true\` flag, and log how this slot was told
 # to record. \`check\` reads the log: a synthetic run records nothing, and a
@@ -83,7 +95,7 @@ for a in "\$@"; do
   [ "\$prev" = "--label" ] && label="\$a"
   prev="\$a"
 done
-printf 'mode=%s record=%s class=%s label=%s\n' "\$mode" "\$record" "\$class" "\$label" >>"$STATE/slots.log"
+printf 'stub=%s mode=%s record=%s class=%s label=%s\n' "$name" "\$mode" "\$record" "\$class" "\$label" >>"$STATE/slots.log"
 if [ "\$mode" != "off" ]; then
   mkdir -p "\$RMLX_HOME/metrics" && : >"\$RMLX_HOME/metrics/runs.db"
 fi
@@ -135,7 +147,8 @@ HOST_READING_CASES=0
 #
 # Optional trailing entries: `GREP:<pattern>` and `NOGREP:<pattern>` assert on
 # the captured output, `PATHPRE:<dir>` puts a directory of shims at the front of
-# PATH, and `REALHOST` turns off the --synthetic-arms default.
+# PATH, `REALHOST` turns off the --synthetic-arms default, and `SLOTS:<regex>`
+# replaces the expectation every line of the slot log is held to.
 #
 # WHY --synthetic-arms IS THE DEFAULT HERE
 #
@@ -161,12 +174,13 @@ HOST_READING_CASES=0
 check() {
 	local name="$1" want="$2" what="$3"
 	shift 3
-	local args=() greps=() path_prefix="" real_host=0
+	local args=() greps=() path_prefix="" real_host=0 slots=""
 	for a in "$@"; do
 		case "$a" in
 		GREP:*) greps+=("${a#GREP:}") ;;
 		NOGREP:*) greps+=("!${a#NOGREP:}") ;;
 		PATHPRE:*) path_prefix="${a#PATHPRE:}" ;;
+		SLOTS:*) slots="${a#SLOTS:}" ;;
 		REALHOST) real_host=1 ;;
 		*) args+=("$a") ;;
 		esac
@@ -200,13 +214,14 @@ check() {
 	# How each slot was told to record. A real run records every slot,
 	# warmups included, as an ab_arm row; a synthetic run records nothing.
 	if [[ -s "$STATE/slots.log" ]]; then
-		local expected='^mode=off record=0 class= label=$' stray
+		local expected='^stub=[^ ]+ mode=off record=0 class= label=$' stray
 		if [[ "$real_host" -eq 1 ]]; then
-			expected='^mode=full record=1 class=ab_arm label=perf_ab:[0-9]{8}T[0-9]{6}Z:[AB]:(warm_[ab]|slot_[0-9]+)$'
+			expected='^stub=[^ ]+ mode=full record=1 class=ab_arm label=perf_ab:[0-9]{8}T[0-9]{6}Z:[AB]:(warm_[ab]|slot_[0-9]+)$'
 			REAL_SLOTS_CHECKED=$((REAL_SLOTS_CHECKED + $(wc -l <"$STATE/slots.log")))
 		else
 			SYNTHETIC_SLOTS_CHECKED=$((SYNTHETIC_SLOTS_CHECKED + $(wc -l <"$STATE/slots.log")))
 		fi
+		[[ -z "$slots" ]] || expected="$slots"
 		stray="$(grep -vE -- "$expected" "$STATE/slots.log" | head -1 || true)"
 		[[ -z "$stray" ]] || { ok=0; failed_pattern="slot recorded as: $stray"; }
 	fi
@@ -260,6 +275,8 @@ KV_PARTIAL="$(make_stub kv_partial "100.0,100.5,101.0" 40.0 "$TOKENS_MAIN" "" ""
 # Neither a byte count nor the `n/a` refusal.
 KV_NAN="$(make_stub kv_nan "100.0,100.5,101.0" 40.0 "$TOKENS_MAIN" "" "" "nan")"
 KV_ABSENT="$(make_stub kv_absent "100.0,100.5,101.0" 40.0 "$TOKENS_MAIN")"
+# SLOW, built before the run class existed.
+SLOW_OLD="$(make_stub slow_old "100.0,100.5,101.0" 40.0 "$TOKENS_MAIN" "" "" "" old)"
 
 # The stubs emit 5 token ids, so --max-tokens matches: the harness refuses a
 # slot whose generation is shorter than asked for.
@@ -447,7 +464,17 @@ check real_slots_record_as_ab_arm 0 \
 	"on a quiet host every slot, warmups included, is recorded as an ab_arm row" \
 	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" \
 	REALHOST "PATHPRE:$WORK/quietbin" \
-	"GREP:recorded in runs.db as an ab_arm row" \
+	"GREP:arm A: every slot, warmups included, is recorded in runs.db as an ab_arm" \
+	"GREP:arm B: every slot, warmups included, is recorded in runs.db as an ab_arm" \
+	"GREP:VERDICT: SEPARATED"
+
+check old_binary_arm_records_nothing 0 \
+	"an arm whose binary predates --run-class runs --metrics off; the other arm still records" \
+	--binary-a "$SLOW_OLD" --binary-b "$FAST" "${COMMON[@]}" \
+	REALHOST "PATHPRE:$WORK/quietbin" \
+	"SLOTS:^(stub=slow_old mode=off record=0 class= label=|stub=fast mode=full record=1 class=ab_arm label=perf_ab:[0-9]{8}T[0-9]{6}Z:B:(warm_b|slot_[0-9]+))$" \
+	"GREP:arm A: its binary has no --run-class" \
+	"GREP:arm B: every slot, warmups included, is recorded in runs.db as an ab_arm" \
 	"GREP:VERDICT: SEPARATED"
 
 check busy_host_refused 125 \
