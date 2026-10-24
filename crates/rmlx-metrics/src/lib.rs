@@ -37,6 +37,10 @@ pub mod schema;
 pub mod scope;
 pub mod time_util;
 
+#[cfg(test)]
+#[path = "run_class_tests.rs"]
+mod run_class_tests;
+
 /// Placeholder so the crate is not considered dead code by the compiler.
 pub fn placeholder() -> &'static str {
     "rmlx-metrics"
