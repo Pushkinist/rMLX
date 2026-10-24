@@ -69,9 +69,10 @@
 #   125 — not usable: busy host, indistinguishable arms, missing binary or
 #         model, `--record-args` the ingest refuses, a slot that produced no
 #         parseable timing, or TAINTED.
-#   4   — the comparison ran, but recording it failed. The verdict is printed
-#         and the result file kept; re-run the ingest on it. Overrides the
-#         verdict's own code.
+#   4   — the comparison ran, but a record did not land. The verdict, and a
+#         TAINTED line when the run was tainted, are printed and the result file
+#         kept; the ingest names each record that did not land. Overrides the
+#         verdict's own code, 125 included.
 #         Under --synthetic-arms a 0 says the logic ran, not that a measurement
 #         was clean.
 
@@ -596,7 +597,12 @@ else
 	if ingest "$RESULT" >&2; then
 		echo "recorded   both arms as ab_arm rows in runs.db"
 	else
-		echo "recorded   NOTHING: the ingest failed; re-run scripts/ingest/llama_ab_ingest.py on $RESULT" >&2
+		echo "recorded   NOT ALL: the ingest names above, as \`not recorded\`, each record that did" >&2
+		echo "  not land, and how to record it; if it names none, nothing was written and the" >&2
+		echo "  ingest can be run again on $RESULT" >&2
+		if [ -n "$TAINT" ]; then
+			echo "TAINTED    ${TAINT%; }"
+		fi
 		exit 4
 	fi
 fi

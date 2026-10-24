@@ -443,7 +443,29 @@ FAILING_RECORDER="$WORK/claim_rmlx_failing"
 sed 's|^    python3 -c .*|    exit 1|' "$CLAIM_STUB" >"$FAILING_RECORDER"
 chmod +x "$FAILING_RECORDER"
 run_ab "$HOST" --bin-a "$STUB_A" --bin-b "$STUB_B" --pairs 2 --allow-busy-host --claim-rmlx "$FAILING_RECORDER"
-check "a record that fails after the comparison exits 4, not the verdict's code" 4 "recorded   NOTHING"
+check "a record that fails after the comparison exits 4, not the verdict's code" 4 "recorded   NOT ALL"
+
+# Arm A lands and arm B is refused, on a tainted host: the run says it was
+# tainted, names the one record that did not land and how to record it, and does
+# not send the operator back to the ingest, which would write arm A twice.
+HALF_RECORDER="$WORK/claim_rmlx_half"
+sed 's|^    python3 -c .*|    grep -q llama_cpp_tq "\$4" \&\& exit 1|' "$CLAIM_STUB" >"$HALF_RECORDER"
+chmod +x "$HALF_RECORDER"
+run_ab "$HOST" --bin-a "$STUB_A" --bin-b "$STUB_B" --pairs 2 --allow-busy-host --claim-rmlx "$HALF_RECORDER"
+check "a half-recorded tainted run exits 4" 4 "TAINTED"
+HALF_BAD=""
+grep -q 'not recorded: .*llama_cpp_tq' <<<"$OUT" || HALF_BAD="the record that did not land is not named"
+grep -q 'metrics record --file' <<<"$OUT" || HALF_BAD="${HALF_BAD:+$HALF_BAD; }no command to record it"
+grep -q 're-run scripts/ingest/llama_ab_ingest.py' <<<"$OUT" && HALF_BAD="${HALF_BAD:+$HALF_BAD; }the run says to re-run the ingest"
+grep -q 'not recorded: .*-llama_cpp-' <<<"$OUT" && HALF_BAD="${HALF_BAD:+$HALF_BAD; }arm A, which landed, is named as not recorded"
+if [ -z "$HALF_BAD" ]; then
+	echo "  PASS  a half-recorded run names the record that did not land, and how to record it alone"
+	PASS=$((PASS + 1))
+else
+	echo "  FAIL  half-recorded run: $HALF_BAD"
+	printf '%s\n' "$OUT" | sed 's/^/        /' | tail -8
+	FAIL=$((FAIL + 1))
+fi
 
 # --keep-arm writes the surviving arm alone, as gate, under its own backend.
 REAL_RESULT="$(printf '%s' "$OUT" | sed -n 's/^result     //p' | tail -1)"

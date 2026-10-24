@@ -276,7 +276,7 @@ def main() -> int:
     # writes is reachable by `--replay-pending` unless that invocation put it
     # there.
     BUFFER_PENDING.mkdir(parents=True, exist_ok=True)
-    failed = 0
+    failed: list[Path] = []
     for path in staged:
         queued = BUFFER_PENDING / path.name
         path.rename(queued)
@@ -295,7 +295,18 @@ def main() -> int:
                 "record kept in staging, not in the pending queue",
                 file=sys.stderr,
             )
-            failed += 1
+            failed.append(path)
+    if failed:
+        # The other records landed, so re-running this ingest would write
+        # them a second time; the ones that did not are recorded one by one.
+        for path in failed:
+            print(f"not recorded: {path}", file=sys.stderr)
+        print(
+            f"  record each with `{args.rmlx_bin} metrics record --file <path>`; do not "
+            f"re-run this ingest, which would write the {len(staged) - len(failed)} "
+            "record(s) that landed again",
+            file=sys.stderr,
+        )
     return 1 if failed else 0
 
 
