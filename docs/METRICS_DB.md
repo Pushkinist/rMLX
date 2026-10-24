@@ -788,6 +788,12 @@ change to what `bests` publishes, such as a `METRICS_SCHEMA.md` §4.1 bounds cha
     - A run that measured nothing: the canary's one-token codec probe, a
       failed or skipped bench cell. The recorder refuses a record with no
       measurement.
+    - The `rmlx baseline` runs of a `scripts/bench_cell.sh` cache-type cell,
+      and the `rmlx bench` slots of `scripts/prefill_chunk_sweep.sh`: each
+      set is recorded once, as the aggregate the script computes.
+    - `scripts/schema_constraint_canary.sh`: a correctness proof run under
+      `--log verbose` in a hermetic `RMLX_HOME` per probe, so that probe's
+      log holds its own records only. It measures no rate.
     - A `scripts/mst_capture.sh` run its `--time-limit` stops: `baseline`
       records at exit.
     - A `scripts/perf_ab.sh` arm whose binary predates `--run-class`, and any
