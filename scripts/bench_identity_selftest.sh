@@ -240,6 +240,7 @@ baseline)
 	fi
 	printf '%s\n' "{\"timestamp\":\"2026-09-03T00:00:00Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"rmlx start\",\"version\":\"9.9.9\",\"run_id\":\"stub\",\"pid\":\$\$}}" >>"\$log"
 	printf '%s\n' "{\"timestamp\":\"2026-09-03T00:00:00Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"cache-type resolved\",\"arch\":\"Stub\",\"kv_quant\":\"stubq\"}}" >>"\$log"
+	case " \$* " in *" --kv-quant k8vturbo3 "*) [ -z "\${STUB_TURBO_NO_TPS:-}" ] || exit 0 ;; esac
 	echo "decode_tps=12.5"
 	# Like the real binary: the measurement prints, then a record that did not
 	# land fails the run.
@@ -268,6 +269,7 @@ canary_case() {
 	[ -z "${STUB_FAIL_GATE:-}" ] || env_extra+=("STUB_FAIL_GATE=1")
 	[ -z "${STUB_FAIL_MEASURED:-}" ] || env_extra+=("STUB_FAIL_MEASURED=1")
 	[ -z "${STUB_CRASH_MEASURED:-}" ] || env_extra+=("STUB_CRASH_MEASURED=1")
+	[ -z "${STUB_TURBO_NO_TPS:-}" ] || env_extra+=("STUB_TURBO_NO_TPS=1")
 	if [ -n "$shared" ]; then
 		printf '%s\n' '{"timestamp":"2026-09-03T00:00:00Z","level":"INFO","fields":{"message":"rmlx start","version":"9.9.9","run_id":"stub","pid":4242}}' \
 			'{"timestamp":"2026-09-03T00:00:00Z","level":"INFO","fields":{"message":"cache-type resolved","arch":"Stub","kv_quant":"none"}}' \
@@ -336,6 +338,15 @@ bad=""
 [ "$CANARY_STATUS" -eq 1 ] || bad="exit=$CANARY_STATUS (want 1)"
 /usr/bin/grep -q 'the measured run failed (exit 1' "$CANARY_HOME/out.log" || bad="$bad; no error naming the run that failed"
 verdict canary_measured_run_crashes "a measured run that fails without measuring stops the canary" "${bad#; }"
+
+STUB_TURBO_NO_TPS=1 canary_case canary_turbo_arm_without_a_reading "" ""
+bad=""
+[ "$CANARY_STATUS" -eq 0 ] || bad="exit=$CANARY_STATUS (want 0: the k8vturbo3 arm is informational)"
+turbo_warns="$(/usr/bin/grep -c 'WARN: k8vturbo3 run [0-9] failed to parse decode_tps' "$CANARY_HOME/out.log" || true)"
+[ "$turbo_warns" = 3 ] || bad="$bad; $turbo_warns k8vturbo3 warnings (want 3)"
+! /usr/bin/grep -q ',k8vturbo3,' "$CANARY_HOME/bench/perf_canary.csv" || bad="$bad; a k8vturbo3 row with no reading was written"
+[ "$(csv_field "$CANARY_HOME" 6)" = 12.5 ] || bad="$bad; the plain row is missing"
+verdict canary_turbo_arm_without_a_reading "a k8vturbo3 run with no reading is warned about and skipped, not fatal" "${bad#; }"
 
 printf '{}\n' >"$CANARY_MODEL/config.json"
 canary_case canary_unrecordable_identity "" ""
