@@ -98,7 +98,11 @@ fn a_source_with_the_column_keeps_each_row_class_and_counts_the_classless() {
     assert_eq!(classes(&conn), vec![Some("diagnostic".to_owned()), None]);
 
     let again = import_db(&mut conn, &source, None).unwrap();
-    assert_eq!((again.inserted, again.skipped), (0, 2));
+    assert_eq!(
+        (again.inserted, again.skipped, again.classless),
+        (0, 2, 0),
+        "classless counts rows copied with no class, not rows read"
+    );
 }
 
 #[test]

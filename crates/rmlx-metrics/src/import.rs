@@ -42,8 +42,8 @@ pub struct ImportReport {
     pub inserted: usize,
     /// Rows already present, not inserted again.
     pub skipped: usize,
-    /// Source rows that carry the column and state no class. They are copied
-    /// with no class, so they reach no gate here either.
+    /// Rows copied with no class: the source carries the column and the row
+    /// states none. They reach no gate here either.
     pub classless: usize,
     /// Prompts inserted because no prompt with their `sha256` was present.
     pub prompts_inserted: usize,
@@ -213,9 +213,6 @@ fn copy_observations(
             Some(class) => Value::Text(class.as_str().to_owned()),
             None => row.get(n + 1)?,
         };
-        if class == Value::Null {
-            copied.classless += 1;
-        }
         let mut values = (0..n)
             .map(|i| row.get::<_, Value>(i))
             .collect::<rusqlite::Result<Vec<Value>>>()?;
@@ -225,6 +222,9 @@ fn copy_observations(
         }
         let sha: String = row.get(n)?;
         values.push(Value::Integer(prompt_id.query_row([&sha], |r| r.get(0))?));
+        if class == Value::Null {
+            copied.classless += 1;
+        }
         values.push(class);
         insert.execute(params_from_iter(values.iter()))?;
         copied.inserted += 1;

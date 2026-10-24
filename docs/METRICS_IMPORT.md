@@ -29,6 +29,6 @@ rows reference, into the DB `--db` names. Use it to keep the rows a scratch
   the target is skipped, so a second import adds nothing.
 - One transaction. It prints a JSON report and logs the same fields as one
   `info` event: `source_version`, `stated_run_class`, `read`, `inserted`,
-  `skipped`, `classless` (source rows that carry the column and state no
-  class) and `prompts_inserted`.
+  `skipped`, `classless` (rows copied with no class, from a source that
+  carries the column) and `prompts_inserted`.
 - `events` is not imported.
