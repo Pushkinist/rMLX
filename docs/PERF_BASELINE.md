@@ -191,8 +191,11 @@ refused, the column reads `n/a` for that whole arm, never `0`.
 `rmlx baseline --record --run-class ab_arm --label perf_ab:<ts>:<A|B>:<slot>`.
 `runs.db` keeps the whole comparison, and no `ab_arm` row reaches `bests` or a
 gate (`docs/METRICS_DB.md` §13). Find one run's rows with
-`notes LIKE 'label=perf_ab:<ts>:%'`. A `--synthetic-arms` run passes
-`--metrics off` to every slot and records nothing. Promoting an accepted
+`notes LIKE 'label=perf_ab:<ts>:%'`. Each arm's binary is asked once,
+through `baseline --help`, whether it has `--run-class`: an arm built before
+the run class runs `--metrics off` and records nothing, and the report says so
+per arm. A `--synthetic-arms` run passes `--metrics off` to every slot and
+records nothing. Promoting an accepted
 comparison is a separate step: `scripts/ingest/perf_ab_ingest.py --run-class
 <class>` turns one result file into two `docs/METRICS_DB.md` §8.5 RunRecords
 (`decode_tps_warm`, `kv_cache_bytes`), `gate` for arms that are kept cells. It
@@ -203,7 +206,10 @@ The result lands in `$RMLX_HOME/bench/perf_ab/<timestamp>.json`, with the
 host conditions, the statistics and the binary digests. Each slot is a full
 `rmlx` process that writes its own `$RMLX_HOME/logs/<run-id>.jsonl`. A default
 three-model run writes 42 of them, and each launch runs the log size-cap
-rotation. Point `RMLX_HOME` at a scratch directory when that matters.
+rotation. A recorded slot also appends one `metrics/baseline.csv` row and its
+`events` rows, 42 of each in a default run. Neither carries a run class, so an
+A/B slot there reads like any other baseline run. Point `RMLX_HOME` at a
+scratch directory when that matters.
 
 **Cost.** `2 + slots` process launches per model: 14 at the default.
 

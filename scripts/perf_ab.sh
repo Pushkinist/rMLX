@@ -76,8 +76,10 @@
 # It also writes elsewhere: the result lands in
 # `$RMLX_HOME/bench/perf_ab/<timestamp>.json`, and every slot is a full `rmlx`
 # process that writes its own `$RMLX_HOME/logs/<run-id>.jsonl` and runs the log
-# size-cap rotation. A default run is 42 of those. Point RMLX_HOME at a scratch
-# directory when that matters.
+# size-cap rotation. A recorded slot also appends one `metrics/baseline.csv`
+# row and its `events` rows; neither carries a run class, so an A/B slot there
+# looks like any other baseline run. A default run is 42 slots of each. Point
+# RMLX_HOME at a scratch directory when that matters.
 #
 # Exit codes:
 #   0   — ran cleanly; the verdict is on stdout. Under --synthetic-arms this
