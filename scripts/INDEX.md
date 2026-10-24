@@ -216,7 +216,7 @@ Conventions:
 | `bench/build_ppl_drift_table.py` | Render the PPL × TPS × similarity-drift table. |
 | `bench/extract_outputs.py` | Extract per-(model, backend, quant) greedy-output tuples from CBB `summary.csv`. |
 | `bench/auto_resolution_smoke.py` | 5-model auto-resolution + regression smoke. Asserts every arch resolves **both** `--kv-quant auto` and `--kv-preset auto` to the one engine default, and that serving has not collapsed. |
-| `bench/codec_inertness_probe.sh` | Per-codec `kv_cache_bytes` + greedy token-id digest + "packed store skipped" for one (model, prompt length). Separates a codec that changes something from one that is another spelling of `none`. `--kv-boundary-layers H,T` sweeps the boundary-floor counts and records them in a `kv_boundary` column. Each run is recorded in `runs.db` as `diagnostic`, and the CSV's `recorded_run_class` column says so per row. |
+| `bench/codec_inertness_probe.sh` | Per-codec `kv_cache_bytes` + greedy token-id digest + "packed store skipped" for one (model, prompt length). Separates a codec that changes something from one that is another spelling of `none`. `--kv-boundary-layers H,T` sweeps the boundary-floor counts and records them in a `kv_boundary` column. Each run is recorded in `runs.db` as `diagnostic`; `exit_code` is the measurement's status and `record_status` the record's (`landed` or `pending`), and a pending record is named and ends the probe 75. |
 
 ## One-off assets
 

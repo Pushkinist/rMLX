@@ -269,8 +269,9 @@ def main() -> int:
     recorded = [r for r in rows if (r.get(RECORDED_FIELD) or "").strip()]
     if recorded:
         print(
-            f"skipping {len(recorded)} row(s) the probe already recorded in runs.db "
-            f"(`{RECORDED_FIELD}` is set); ingesting them would write each byte count twice"
+            f"skipping {len(recorded)} row(s) the probe already recorded, or whose record is "
+            f"pending a replay (`{RECORDED_FIELD}` is set); ingesting them would write each "
+            "byte count twice"
         )
     rows = [r for r in rows if not (r.get(RECORDED_FIELD) or "").strip()]
     usable = [r for r in rows if r["exit_code"] == "0" and r["kv_cache_bytes"]]

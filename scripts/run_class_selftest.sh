@@ -47,9 +47,9 @@ printf '{"torch_dtype": "float16"}\n' >"$MODEL/config.json"
 
 # make_rmlx <path> — a stub `rmlx` that logs each `baseline` argv to
 # $ARGV_LOG, answers `claim run -- <cmd>` by running the command, prints the
-# summary line a baseline prints, and, like the real binary, exits non-zero
-# after it when the argv names the codec in $STUB_NO_INGEST, whose record did
-# not land.
+# summary line a baseline prints, and, like the real binary, exits 75 after it,
+# naming a buffer file, when the argv names the codec in $STUB_NO_INGEST, whose
+# record did not land. A codec in $STUB_NO_MEASURE fails before it measures.
 make_rmlx() {
 	cat >"$1" <<'STUB'
 #!/usr/bin/env bash
@@ -59,14 +59,19 @@ claim) shift 3; exec "$@" ;;
 baseline)
 	if [ "${2:-}" = --help ]; then echo "  --gpu-capture <PATH>  --record  --run-class <CLASS>"; exit 0; fi
 	printf '%s\n' "$*" >>"$ARGV_LOG"
+	case " $* " in *" --kv-quant ${STUB_NO_MEASURE:-none-matches} "*) echo "error: load failed" >&2; exit 1 ;; esac
 	echo "baseline: model=stub  ttft_ms=1  decode_tps=10.0  prefill_tps=1.0  prompt_tokens=4200  kv_cache_bytes=1000"
 	echo "baseline: token_ids=1,2,3"
-	case " $* " in *" --kv-quant ${STUB_NO_INGEST:-none-matches} "*) exit 1 ;; esac
 	prev=""
 	for a in "$@"; do
 		[ "$prev" = --gpu-capture ] && mkdir -p "$a"
 		prev="$a"
 	done
+	case " $* " in *" --kv-quant ${STUB_NO_INGEST:-none-matches} "*)
+		echo "error: baseline: measured, but the record did not reach runs.db; it is kept at /x/pending/stub.json for \`rmlx metrics record --replay-pending\`" >&2
+		echo "rMLX exits with code 75." >&2
+		exit 75 ;;
+	esac
 	;;
 esac
 STUB
@@ -140,52 +145,70 @@ CSV="$WORK/inertness.csv"
 ARGV_LOG="$WORK/probe.argv"
 : >"$ARGV_LOG"
 set +e
-ARGV_LOG="$ARGV_LOG" STUB_NO_INGEST=k8v8 RMLX_BINARY="$PROBE_BIN" RMLX_HOME="$WORK/home" \
+ARGV_LOG="$ARGV_LOG" STUB_NO_INGEST=k8v8 STUB_NO_MEASURE=iso3 RMLX_BINARY="$PROBE_BIN" RMLX_HOME="$WORK/home" \
 	bash "$REPO_ROOT/scripts/bench/codec_inertness_probe.sh" --model "$MODEL" \
-	--codecs "none k8v8" --out "$CSV" >"$WORK/probe.out" 2>&1
+	--codecs "none k8v8 iso3" --out "$CSV" >"$WORK/probe.out" 2>&1
 status=$?
 set -e
 bad=""
-[ "$status" -eq 0 ] || bad="exit=$status: $(tail -2 "$WORK/probe.out" | tr '\n' ' ')"
-[ "$(grep -c -- '--record --run-class diagnostic --label codec_inertness:' "$ARGV_LOG" || true)" = 2 ] ||
+[ "$status" -eq 75 ] || bad="exit=$status (want 75, a record pending): $(tail -2 "$WORK/probe.out" | tr '\n' ' ')"
+[ "$(grep -c -- '--record --run-class diagnostic --label codec_inertness:' "$ARGV_LOG" || true)" = 3 ] ||
 	bad="${bad:+$bad; }not every run asked to record as diagnostic: $(cat "$ARGV_LOG")"
-column="$(python3 -c '
+grep -q 'record pending: /x/pending/stub.json' "$WORK/probe.out" || bad="${bad:+$bad; }the pending buffer file is not named"
+columns="$(python3 -c '
 import csv, sys
-rows = {r["codec"]: r.get("recorded_run_class") for r in csv.DictReader(open(sys.argv[1]))}
-print(rows.get("none"), rows.get("k8v8"))' "$CSV" 2>&1)"
-[ "$column" = "diagnostic " ] ||
-	bad="${bad:+$bad; }recorded_run_class none/k8v8 = '$column' (want 'diagnostic' and empty)"
-verdict probe_marks_only_ingested_runs "each run records as diagnostic; only an ingested one is marked" "$bad"
+rows = {r["codec"]: r for r in csv.DictReader(open(sys.argv[1]))}
+print(" ".join("%s:%s/%s/%s" % (c, rows[c]["exit_code"], rows[c]["recorded_run_class"], rows[c]["record_status"])
+               for c in ("none", "k8v8", "iso3")))' "$CSV" 2>&1)"
+[ "$columns" = "none:0/diagnostic/landed k8v8:0/diagnostic/pending iso3:1//" ] ||
+	bad="${bad:+$bad; }exit_code/recorded_run_class/record_status = '$columns'"
+verdict probe_keeps_measured_runs_apart_from_their_records "a measured run keeps exit_code 0 whatever its record did; a pending record is named and ends the probe 75" "$bad"
 
 # ── codec_inertness_ingest.py ─────────────────────────────────────────────────
 #
-# One row the probe recorded and one it did not, both completed runs.
+# Over the probe's own CSV: the landed row and the pending one are both
+# recorded (the replay writes the pending one), and the run that did not
+# measure has nothing to write, so nothing is promoted.
 INGEST="$REPO_ROOT/scripts/ingest/codec_inertness_ingest.py"
-MIXED="$WORK/inertness_mixed.csv"
-{
-	head -1 "$CSV"
-	printf '2026-10-01T00:00:00Z,host__m,4096,4200,8192,100,none,0,1000,abc,0,1,10,1,sha,"",diagnostic\n'
-	printf '2026-10-01T00:00:00Z,host__m,4096,4200,8192,100,k8v8,0,1000,abc,0,1,10,1,sha,"",\n'
-} >"$MIXED"
 set +e
-out="$(RMLX_HOME="$WORK/home" python3 "$INGEST" --dry-run "$MIXED" --models-root "$WORK/models" \
+out="$(RMLX_HOME="$WORK/home" python3 "$INGEST" --dry-run "$CSV" --models-root "$WORK/models" \
+	--backend-version 9.9.9 --build-profile release-perf 2>&1)"
+status=$?
+set -e
+bad=""
+[ "$status" -eq 2 ] || bad="exit=$status (want 2, no usable rows): $out"
+grep -q 'skipping 2 row(s) the probe already recorded, or whose record is' <<<"$out" || bad="${bad:+$bad; }the landed and the pending row are not both skipped"
+! grep -q '"schema_version"' <<<"$out" || bad="${bad:+$bad; }a row was promoted"
+verdict ingest_promotes_no_recorded_or_pending_row "the ingest writes neither a landed nor a pending row of the probe's CSV" "$bad"
+
+# A sweep from before the probe recorded its runs has no record columns, so
+# each measured row is the ingest's to write, once, labelled from its config.
+LEGACY="$WORK/inertness_legacy.csv"
+python3 -c '
+import csv, sys
+rows = list(csv.DictReader(open(sys.argv[1])))
+cols = [c for c in rows[0] if c not in ("recorded_run_class", "record_status")]
+w = csv.DictWriter(open(sys.argv[2], "w", newline=""), fieldnames=cols, extrasaction="ignore")
+w.writeheader()
+w.writerows(rows)' "$CSV" "$LEGACY"
+set +e
+out="$(RMLX_HOME="$WORK/home" python3 "$INGEST" --dry-run "$LEGACY" --models-root "$WORK/models" \
 	--backend-version 9.9.9 --build-profile release-perf 2>&1)"
 status=$?
 set -e
 bad=""
 [ "$status" -eq 0 ] || bad="exit=$status: $out"
 records="$(grep -c '"schema_version"' <<<"$out" || true)"
-[ "$records" = 1 ] || bad="${bad:+$bad; }$records record(s), want 1 (the row the probe did not record)"
-grep -q '"kv_quant": "k8v8"' <<<"$out" || bad="${bad:+$bad; }the unrecorded k8v8 row is not the one written"
+[ "$records" = 2 ] || bad="${bad:+$bad; }$records record(s), want 2 (the two measured rows)"
 grep -q '"run_class": "diagnostic"' <<<"$out" || bad="${bad:+$bad; }the record is not diagnostic"
 grep -q '"weight_quant": "fp16"' <<<"$out" || bad="${bad:+$bad; }the weight label is not the one the snapshot's config describes"
-verdict ingest_skips_recorded_rows "a row the probe recorded is skipped; the other is written once" "$bad"
+verdict ingest_writes_a_legacy_sweep_once "a sweep with no record columns has each measured row written once" "$bad"
 
 OLD_RECORDER="$WORK/rmlx_old"
 printf '#!/usr/bin/env bash\necho "      --file <FILE>"\n' >"$OLD_RECORDER"
 chmod +x "$OLD_RECORDER"
 set +e
-out="$(RMLX_HOME="$WORK/home" python3 "$INGEST" --record "$MIXED" --rmlx-bin "$OLD_RECORDER" --models-root "$WORK/models" \
+out="$(RMLX_HOME="$WORK/home" python3 "$INGEST" --record "$LEGACY" --rmlx-bin "$OLD_RECORDER" --models-root "$WORK/models" \
 	--backend-version 9.9.9 --build-profile release-perf 2>&1)"
 status=$?
 set -e
