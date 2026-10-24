@@ -22,44 +22,49 @@
 # step with exit 11 and names the holder.
 #
 # Usage:
-#   scripts/bench_cache_types.sh MODEL_PATH ARCH_CLASS [WEIGHT_BITS] [PROMPT_TOKENS]
+#   scripts/bench_cache_types.sh MODEL_PATH ARCH_CLASS [PROMPT_TOKENS]
 #
 #   MODEL_PATH      abs path to snapshot directory
 #   ARCH_CLASS      e.g. Qwen3ForCausalLM
-#   WEIGHT_BITS     optional; read from the snapshot's config.json through
-#                   scripts/lib/snapshot_identity.py if omitted
-#                   (e.g. "1bit", "8bit", "mxfp8")
 #   PROMPT_TOKENS   optional; default 4096 (=> longctx_4k.json)
+#
+# The weight label is read from the snapshot's config.json through
+# scripts/lib/snapshot_identity.py, the one shell-side producer of it; there is
+# no argument to override it.
 #
 set -uo pipefail
 
 # ---------------------------------------------------------------------------
 # Args + defaults
 # ---------------------------------------------------------------------------
-if [ $# -lt 2 ]; then
-  echo "usage: $0 MODEL_PATH ARCH_CLASS [WEIGHT_BITS] [PROMPT_TOKENS]" >&2
+if [ $# -lt 2 ] || [ $# -gt 3 ]; then
+  echo "usage: $0 MODEL_PATH ARCH_CLASS [PROMPT_TOKENS]" >&2
+  echo "  (the weight label comes from the snapshot's config.json; it is not an argument)" >&2
   exit 2
 fi
 
 MODEL_PATH="$1"
 ARCH="$2"
-WEIGHT_BITS_IN="${3:-}"
-PROMPT_TOKENS="${4:-4096}"
+PROMPT_TOKENS="${3:-4096}"
+case "$PROMPT_TOKENS" in
+  '' | *[!0-9]*)
+    echo "PROMPT_TOKENS must be a token count, got '$PROMPT_TOKENS'" >&2
+    exit 2
+    ;;
+esac
 
 if [ ! -d "$MODEL_PATH" ]; then
   echo "model path does not exist: $MODEL_PATH" >&2
   exit 2
 fi
 
-# When not supplied, the weight label is the one the snapshot's own config
-# describes, read through the one shell-side producer of it.
-if [ -z "$WEIGHT_BITS_IN" ]; then
-  if ! _IDENTITY="$(python3 "$(dirname "$0")/lib/snapshot_identity.py" "$MODEL_PATH")"; then
-    echo "cannot label the snapshot's weights (above); pass WEIGHT_BITS" >&2
-    exit 2
-  fi
-  WEIGHT_BITS_IN="$(printf '%s\n' "$_IDENTITY" | sed -n 's/^weight_quant=//p')"
+# The weight label is the one the snapshot's own config describes, read
+# through the one shell-side producer of it.
+if ! _IDENTITY="$(python3 "$(dirname "$0")/lib/snapshot_identity.py" "$MODEL_PATH")"; then
+  echo "cannot label the snapshot's weights (above)" >&2
+  exit 2
 fi
+WEIGHT_BITS_IN="$(printf '%s\n' "$_IDENTITY" | sed -n 's/^weight_quant=//p')"
 
 # Map prompt tokens → prompt id (longctx_<N/1024>k).
 _PROMPT_K=$((PROMPT_TOKENS / 1024))

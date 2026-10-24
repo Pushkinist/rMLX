@@ -331,7 +331,7 @@ ARGV_LOG="$WORK/cache_types.argv"
 : >"$ARGV_LOG"
 set +e
 ARGV_LOG="$ARGV_LOG" RMLX_HOME="$WORK/home" \
-	bash "$FAKE/scripts/bench_cache_types.sh" "$MODEL" Stub bf16 >"$WORK/cache_types.out" 2>&1
+	bash "$FAKE/scripts/bench_cache_types.sh" "$MODEL" Stub >"$WORK/cache_types.out" 2>&1
 set -e
 bad=""
 probes="$(wc -l <"$ARGV_LOG" | tr -d ' ')"

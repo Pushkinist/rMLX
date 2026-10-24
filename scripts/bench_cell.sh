@@ -259,7 +259,7 @@ if [ "$_CT_MODE" -eq 1 ]; then
       }')
   fi
 
-  # --- Resolve weight_quant via `rmlx info` (best-effort; fall back to arg) ---
+  # --- weight_quant: the label the caller passed as QUANT_SIG ($7) ---------
   _WQ_EFF="$WEIGHT_QUANT"
 
   # --- Resolve canonical kv_quant string ------------------------------------

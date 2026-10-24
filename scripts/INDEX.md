@@ -121,7 +121,7 @@ Conventions:
 |---|---|
 | `bench_cell.sh` | Per-cell driver for the cross-backend bench. Legacy mode drives the CBB Python harness over an HTTP backend; cache-type mode drives `rmlx baseline` directly and emits one §8.5 RunRecord. A cell that measured nothing writes no record. |
 | `bench_codec_cell.sh` | Single-codec × single-model bench runner. Each run is recorded as `diagnostic`. |
-| `bench_cache_types.sh` | Drive the cache-type combo matrix for one model. The weight label is `lib/snapshot_identity.py`'s unless given; each smoke probe is recorded as `diagnostic`. |
+| `bench_cache_types.sh` | Drive the cache-type combo matrix for one model. The weight label is `lib/snapshot_identity.py`'s, with no argument to override it (`MODEL_PATH ARCH_CLASS [PROMPT_TOKENS]`); each smoke probe is recorded as `diagnostic`. |
 | `bench-records-sweep.sh` | 5-model × 4-KV-quant `BENCHMARK_CHAMPIONS` regression sweep. |
 | `bench/tri_engine_same_model.sh` | **llama.cpp vs rMLX vs stock mlx-lm on ONE checkpoint**, across each engine's KV options. Refuses to emit a llama.cpp row unless that binary's Metal tensor API probes live (an inert one reads ~3x low on prefill), and refuses any cell whose KV would push this host into swap. |
 | `bench/tri_engine_summarize.py` | Ingest one raw artifact from `tri_engine_same_model.sh` into a normalized cell record, print the comparison table, or (`--geometry`) read the benched checkpoint's KV geometry out of its `config.json`. Owns the single definition of the cross-engine record shape, incl. the KV bits/value normalization that makes an allocated-for-n_ctx figure comparable to a filled-prefix one. |
