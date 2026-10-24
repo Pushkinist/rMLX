@@ -264,7 +264,7 @@ ARGV_LOG="$ARGV_LOG" RMLX_BINARY="$PROBE_BIN" RMLX_HOME="$WORK/home" \
 	>"$WORK/codec_cell.out" 2>&1
 set -e
 bad=""
-runs="$(grep -c -- '--record --run-class diagnostic --label codec_cell:' "$ARGV_LOG" || true)"
+runs="$(grep -cE -- '--record --run-class diagnostic --label codec_cell:[0-9]{8}T[0-9]{6}Z:k8v8' "$ARGV_LOG" || true)"
 [ "$runs" = 4 ] || bad="$runs of 4 runs asked to record as diagnostic: $(head -1 "$ARGV_LOG")"
 verdict codec_cell_records_diagnostic "the warmup and the three measured runs record as diagnostic" "$bad"
 
@@ -318,7 +318,7 @@ PATH="$WORK/cargobin:$PATH" ARGV_LOG="$ARGV_LOG" RMLX_O_MODELS_ROOT="$SMOKE_ROOT
 	--manifest "$WORK/smoke.toml" --out "$WORK/smoke.json" >"$WORK/smoke.out" 2>&1
 set -e
 bad=""
-grep -q -- 'baseline .*--record --run-class diagnostic --label codec_smoke:k8v4:coherence' "$ARGV_LOG" ||
+grep -q -- 'baseline .*--prompt-label coherence .*--record --run-class diagnostic --label codec_smoke:k8v4:coherence' "$ARGV_LOG" ||
 	bad="baseline argv: $(grep baseline "$ARGV_LOG" | head -1); $(tail -2 "$WORK/smoke.out" | tr '\n' ' ')"
 verdict codec_smoke_records_diagnostic "each smoke prompt's baseline records as diagnostic" "$bad"
 

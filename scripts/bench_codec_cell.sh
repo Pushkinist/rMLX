@@ -13,7 +13,7 @@
 #   - Parses decode_tps + prefill_tps from stdout.
 #   - Appends 3 rows to .rmlx/bench/codec_cells.csv (one per run_idx 1/2/3).
 #   - Records every run, the warmup included, in runs.db as `diagnostic`
-#     (`--record --run-class diagnostic --label codec_cell:<codec>`): single
+#     (`--record --run-class diagnostic --label codec_cell:<ts>:<codec>`): single
 #     unpaired runs reach no champion and no gate.
 #   - Prints summary: <codec> × <model>: mean decode_tps=X.X (±stddev), prefill_tps=X.X
 #
@@ -114,6 +114,8 @@ if [[ ! -f "${CSV}" ]]; then
 fi
 
 GIT_SHA="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null | cut -c1-12 || echo "unknown")"
+# One stamp for the cell, so its runs are found together by label.
+RUN_TS="$(date -u +%Y%m%dT%H%M%SZ)"
 
 # ---- Helper: run one baseline, parse decode_tps and prefill_tps --------------
 # Outputs a single colon-separated string: "<decode_tps>:<prefill_tps>"
@@ -124,7 +126,7 @@ run_once() {
         --kv-quant "${KV_QUANT}" \
         --prompt-tokens "${PROMPT_LEN}" \
         --max-tokens "${MAX_TOKENS}" \
-        --record --run-class diagnostic --label "codec_cell:${KV_QUANT}" \
+        --record --run-class diagnostic --label "codec_cell:${RUN_TS}:${KV_QUANT}" \
         2>/dev/null)"
     local dtps
     dtps="$(echo "${output}" | grep -o 'decode_tps=[0-9.]*' | cut -d= -f2 || true)"
