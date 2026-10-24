@@ -12,7 +12,8 @@ that, a header and a few lines of boilerplate would make every small pair one.
 `difflib` costs too much to run over every pair. The size of the multiset
 intersection of two files' significant lines bounds `matched_lines` from above
 (a matching block pairs equal lines, each used once), so a pair under the bound
-is not measured.
+is not measured. The bound is an upper bound only if both count the same lines:
+`line_match.lines_of` splits the text for the figure and for this count.
 """
 
 from __future__ import annotations

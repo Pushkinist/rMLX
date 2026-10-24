@@ -571,6 +571,26 @@ sg_reindex "$root"
 st_case caller_substitution_inside_double_quotes_runs 0 --what "a \$( ) in double quotes runs, also behind an apostrophe" \
     --has "check-scripts: ok (5 files" -- sg_gate "$root"
 
+root=$(sg_fresh caller_escaped_apostrophe)
+sg_nocaller_sh 'exit 0' | sg_put "$root" check/x.sh
+cat >>"$root/scripts/check/ok.sh" <<'EOF'
+echo \' "$(bash scripts/check/x.sh 2>&1)"
+EOF
+sg_reindex "$root"
+st_case caller_substitution_after_an_escaped_apostrophe 0 --what "a backslashed apostrophe opens no single quote: the substitution after it runs" \
+    --has "check-scripts: ok (5 files" -- sg_gate "$root"
+
+root=$(sg_fresh caller_variable_after_scripts)
+sg_nocaller_sh 'exit 0' | sg_put "$root" check/x.sh
+cat >>"$root/scripts/check/ok.sh" <<'EOF'
+REPO_ROOT=.
+sub=check
+bash "$REPO_ROOT/scripts/$sub/x.sh"
+EOF
+sg_reindex "$root"
+st_case caller_path_read_from_its_last_expansion 0 --what "scripts/\$sub/x.sh: only the part after the last expansion is read, and x.sh is the one file of that name" \
+    --has "check-scripts: ok (5 files" -- sg_gate "$root"
+
 root=$(sg_fresh caller_self)
 sg_valid_sh 'bash scripts/check/x.sh' | python3 -c 'import sys; sys.stdout.write(sys.stdin.read().replace("# Caller: by hand\n", "#\n"))' |
     sg_put "$root" check/x.sh
@@ -1318,6 +1338,13 @@ sg_reindex "$root"
 st_case silenced_target_reached_loudly_too 1 --what "a target ci also reaches through a prerequisite is not silenced" \
     --lacks "silenced:" --has "recall-missing: check/gate.sh:1: mode default" -- sg_gate "$root"
 
+root=$(sg_fresh silenced_nested_make_call)
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_make_ci "$root" 'ci:\n\t@$(MAKE) --no-print-directory outer || true\n\nouter:\n\t@$(MAKE) --no-print-directory inner\n\ninner:\n\t@bash scripts/check/gate.sh\n'
+sg_reindex "$root"
+st_case silenced_through_two_make_calls 1 --what "a target only a silenced line reaches silences the \$(MAKE) lines of its own, down to the tool" \
+    --has "silenced: check/gate.sh:1: mode default" -- sg_gate "$root"
+
 root=$(sg_fresh silenced_pin_holds)
 sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
 sg_make_ci "$root" 'ci:\n\t@bash scripts/check/gate.sh || true\n'
@@ -1572,6 +1599,14 @@ sg_reindex "$root"
 st_case mode_line_with_only_an_option_and_its_value_is_the_default 0 --what "--base VALUE alone is the default mode" \
     --has "check-scripts: ok (6 files" -- sg_gate "$root"
 
+root=$(sg_fresh mode_positional_first)
+sg_nocaller_sh 'case "${1:-}" in --lib) exit 0 ;; esac' | sg_put "$root" check/gate.sh
+sg_recall_sh '#' 'check/gate.sh' | sg_put "$root" check/gate_selftest.sh
+sg_make_ci "$root" 'ci:\n\t@bash scripts/check/gate.sh some/path.txt --lib\n\t@bash scripts/check/gate_selftest.sh\n'
+sg_reindex "$root"
+st_case mode_first_argument_that_is_no_mode_ends_the_scan 0 --what "a path first, then --lib: the line has the mode default, as the first argument decides" \
+    --has "check-scripts: ok (6 files" -- sg_gate "$root"
+
 root=$(sg_fresh mode_equals)
 sg_nocaller_sh '[ "${1:-}" = --mode=a ] || [ "${1:-}" = --mode=b ] || exit 0' | sg_put "$root" check/gate.sh
 sg_recall_sh '#' 'check/gate.sh --mode=a' | sg_put "$root" check/gate_selftest.sh
@@ -1586,6 +1621,34 @@ sg_recall_sh '#' 'check/gate.sh --mode=a --mode=b' | sg_put "$root" check/gate_s
 sg_make_ci "$root" 'ci:\n\t@bash scripts/check/gate.sh --mode=a\n\t@bash scripts/check/gate.sh --mode=b\n\t@bash scripts/check/gate_selftest.sh\n'
 sg_reindex "$root"
 st_case mode_equals_both_named 0 --what "a test that names both spellings covers both lines" \
+    --has "check-scripts: ok (6 files" -- sg_gate "$root"
+
+root=$(sg_fresh recall_claim_python_docstring)
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+sg_put "$root" check/gate_test.py <<'EOF'
+#!/usr/bin/env python3
+"""A planted Python recall test.
+
+Recall test for: check/gate.sh --lib
+Usage:  python3 scripts/check/gate_test.py --lib
+Exit:   0 held
+"""
+
+import subprocess
+
+subprocess.run(["bash", "scripts/check/gate.sh"])
+EOF
+sg_make_ci "$root" 'ci:\n\t@bash scripts/check/gate.sh --lib\n\t@python3 scripts/check/gate_test.py\n'
+sg_reindex "$root"
+st_case recall_claim_of_a_mode_only_the_docstring_names 1 --what "a mode token in the docstring of a Python test is not code" \
+    --has "recall-stale: check/gate_test.py:4: check/gate.sh: \`--lib\` occurs nowhere in the code of check/gate_test.py" -- sg_gate "$root"
+
+root=$(sg_fresh mode_equals_then_positional)
+sg_nocaller_sh '[ "${1:-}" = --mode=a ] || exit 0' | sg_put "$root" check/gate.sh
+sg_recall_sh '#' 'check/gate.sh --mode=a' | sg_put "$root" check/gate_selftest.sh
+sg_make_ci "$root" 'ci:\n\t@bash scripts/check/gate.sh --mode=a some/path.txt\n\t@bash scripts/check/gate_selftest.sh\n'
+sg_reindex "$root"
+st_case mode_equals_form_takes_no_value 0 --what "--mode=a followed by a path is still the mode --mode=a" \
     --has "check-scripts: ok (6 files" -- sg_gate "$root"
 
 # ---- lib-consumers, lib-run ----------------------------------------------

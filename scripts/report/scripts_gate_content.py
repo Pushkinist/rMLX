@@ -27,7 +27,6 @@ SIZE_LIMIT = 1000
 HEREDOC_LIMIT = 20
 ROOT_VARIABLE = "REPO_ROOT"
 IDENTITY_FILE = "lib/identity.sh"
-IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 ASSIGN_RE = re.compile(r"(?:^|[\s;&|({])(?:(?:local|export|readonly|declare|typeset)\s+(?:-\w+\s+)*)?([A-Za-z_]\w*)\+?=")
 OWN_DIR_UP_RE = re.compile(r'dirname\s+"(?:\$0|\$\{BASH_SOURCE\[0\]\})"\)((?:/\.\.)*)')
 TOPLEVEL_RE = re.compile(r"rev-parse\s+--show-toplevel")

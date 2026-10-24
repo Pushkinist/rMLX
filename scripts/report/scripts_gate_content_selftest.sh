@@ -591,6 +591,16 @@ root=$(sg_fresh heredoc_continued_dash_c_20)
 verdict heredoc_dash_c_on_a_continuation_line_at_the_limit 0 "the same with 20 lines" "$root" \
     --has "check-scripts: ok (5 files"
 
+root=$(sg_fresh heredoc_opener_then_continuation)
+{
+    sg_valid_sh ':'
+    printf '%s\n' "python3 - <<'PY' \\" '    --flag'
+    repeat_line 'print(1)' 20
+    printf '%s\n' PY
+} | sg_put "$root" check/y.sh
+verdict heredoc_body_starts_after_the_continued_line 0 "the opener is followed by a continuation line: the body is the 20 lines after both" "$root" \
+    --has "check-scripts: ok (5 files"
+
 root=$(sg_fresh heredoc_python_without_3)
 {
     sg_valid_sh ':'
@@ -1123,6 +1133,23 @@ KNOB_A=1
 EOF
 verdict env_knob_lib_reads_what_every_consumer_sets 1 "lib/y.sh reads KNOB_A (both consumers set it) and KNOB_B (only one does)" "$root" \
     --has "env-knob: lib/y.sh:4: reads the environment variable KNOB_B" --lacks "KNOB_A"
+
+root=$(sg_fresh env_lib_own_assignment)
+sg_put "$root" lib/y.sh <<'EOF'
+# A planted lib file that reads a name before it sets it.
+#
+# Sourced, not executed.
+liby() { : "${KNOB_A:-x}"; }
+KNOB_A=1
+EOF
+sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
+. "$(dirname "$0")/../lib/y.sh"
+EOF
+sh_entry "$root" check/z.sh 'set -euo pipefail' <<'EOF'
+. "$(dirname "$0")/../lib/y.sh"
+EOF
+verdict env_knob_lib_assignment_of_its_own_is_no_consumer_assignment 1 "a name the lib sets itself, below its read, is still left to the environment by a consumer that sets nothing" "$root" \
+    --has "env-knob: lib/y.sh:4: reads the environment variable KNOB_A"
 
 root=$(sg_fresh env_printenv)
 sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
