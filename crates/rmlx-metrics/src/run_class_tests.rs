@@ -305,3 +305,21 @@ fn the_refusal_names_every_class() {
         assert!(message.contains(class.as_str()), "{message}");
     }
 }
+
+#[test]
+fn a_stored_class_reads_back_as_the_enum_and_a_misspelling_is_an_error() {
+    let conn = Connection::open_in_memory().unwrap();
+    for class in crate::run_class::RunClass::ALL {
+        let read: crate::run_class::RunClass = conn
+            .query_row("SELECT ?1", [class.as_str()], |r| r.get(0))
+            .unwrap();
+        assert_eq!(read, class);
+    }
+    let none: Option<crate::run_class::RunClass> =
+        conn.query_row("SELECT NULL", [], |r| r.get(0)).unwrap();
+    assert_eq!(none, None);
+    assert!(conn
+        .query_row("SELECT 'gat'", [], |r| r
+            .get::<_, crate::run_class::RunClass>(0))
+        .is_err());
+}

@@ -66,6 +66,15 @@ impl FromStr for RunClass {
     }
 }
 
+impl rusqlite::types::FromSql for RunClass {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        value
+            .as_str()?
+            .parse()
+            .map_err(|e: String| rusqlite::types::FromSqlError::Other(e.into()))
+    }
+}
+
 #[cfg(test)]
 #[path = "run_class_tests.rs"]
 mod tests;
