@@ -88,6 +88,10 @@
 #   125 — the comparison is not usable: a precondition failed (busy host,
 #         indistinguishable arms, missing binary/model, unparseable output), or
 #         the run completed but was TAINTED by interference.
+#   75  — the comparison ran and its verdict is printed, but at least one
+#         slot's ab_arm record did not land (`baseline` exit 75); each buffer
+#         file is named for `rmlx metrics record --replay-pending`. Only when
+#         nothing above already applies: 1 and 125 win.
 
 # No `pipefail`: several parses here legitimately end in `| head -1`, which
 # SIGPIPEs its producer once it has what it needs. Under pipefail that reads as
@@ -98,6 +102,10 @@ set -eu
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RMLX_HOME="${RMLX_HOME:-${REPO_ROOT}/.rmlx}"
+# shellcheck source=scripts/lib/record_pending.sh
+. "${REPO_ROOT}/scripts/lib/record_pending.sh"
+# Slots that measured and whose ab_arm record did not land.
+PENDING_RECORDS=0
 AWK_BUSIEST="${REPO_ROOT}/scripts/lib/busiest_between.awk"
 
 # ---- defaults ----------------------------------------------------------------
@@ -535,8 +543,9 @@ run_slot() {
 		record=(--record --run-class ab_arm --label "perf_ab:${TS}:${arm}:${tag}")
 	fi
 	TIMEFORMAT='%R'
+	local slot_rc=0
 	# shellcheck disable=SC2086  # extra args are deliberately word-split
-	if ! elapsed="$( { time {
+	elapsed="$( { time {
 		RMLX_HOME="$RMLX_HOME" "$bin" baseline \
 			--model "$model" \
 			--prompt-tokens "$PROMPT_TOKENS" \
@@ -546,8 +555,14 @@ run_slot() {
 			"${record[@]}" \
 			$extra \
 			>"$raw" 2>"${raw}.err"
-	}; } 2>&1 )"; then
-		echo "ERROR: slot $tag failed to run" >&2
+	}; } 2>&1 )" || slot_rc=$?
+	# A slot that measured and whose record did not land is still a slot: its
+	# reading counts, and its buffer file is named for replay.
+	if [[ "$slot_rc" -eq "$RECORD_PENDING_EXIT" ]]; then
+		record_pending_note "${raw}.err"
+		PENDING_RECORDS=$((PENDING_RECORDS + 1))
+	elif [[ "$slot_rc" -ne 0 ]]; then
+		echo "ERROR: slot $tag failed to run (exit $slot_rc)" >&2
 		echo "  cmd: $bin baseline --model $model ... $extra" >&2
 		sed 's/^/    | /' "${raw}.err" | tail -20 >&2
 		exit 125
@@ -1072,4 +1087,9 @@ else
 	echo "host at end:   busiest foreign process over a 1s window: $(host_detail "$FINAL_HOST")"
 fi
 echo "result: $RESULT_JSON"
+if [[ "$PENDING_RECORDS" -gt 0 ]]; then
+	echo "INCOMPLETE: $PENDING_RECORDS slot record(s) did not land (named above); the verdict stands,"
+	echo "  and \`rmlx metrics record --replay-pending\` records them once the cause is fixed."
+	if [[ "$OVERALL_EXIT" -eq 0 ]]; then OVERALL_EXIT="$RECORD_PENDING_EXIT"; fi
+fi
 exit "$OVERALL_EXIT"

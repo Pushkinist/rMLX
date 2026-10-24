@@ -128,6 +128,12 @@ else
   printf 'baseline: model=stub  load=1ms  ttft_ms=1  prompt_tokens=4096  metal_peak_mb=%s  metal_gen_alloc_mb=%s%s\n' "\$peak" "$mem" "\$kvcol"
 fi
 if [ "$omit" != "ids" ]; then printf 'baseline: token_ids=%s\n' "\$tok"; fi
+# Like the real binary: a run that measured and whose record did not land
+# prints its measurement, names its buffer file and exits 75.
+if [ -n "\${STUB_RECORD_PENDING:-}" ] && [ "\$record" = 1 ]; then
+  echo "error: baseline: measured, but the record did not reach runs.db; it is kept at \$RMLX_HOME/metrics/buffer/pending/$name-\$n.json for \\\`rmlx metrics record --replay-pending\\\`" >&2
+  exit 75
+fi
 STUB
 	chmod +x "$path"
 	echo "$path"
@@ -476,6 +482,14 @@ check old_binary_arm_records_nothing 0 \
 	"GREP:arm A: its binary has no --run-class" \
 	"GREP:arm B: every slot, warmups included, is recorded in runs.db as an ab_arm" \
 	"GREP:VERDICT: SEPARATED"
+
+STUB_RECORD_PENDING=1 check slots_with_pending_records_keep_their_verdict 75 \
+	"slots that measured and whose ab_arm record did not land still count; the run names each file and ends 75" \
+	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" \
+	REALHOST "PATHPRE:$WORK/quietbin" \
+	"GREP:VERDICT: SEPARATED" \
+	"GREP:record pending: .*metrics/buffer/pending/(slow|fast)-[0-9]+\.json" \
+	"GREP:INCOMPLETE: 14 slot record\(s\) did not land"
 
 check busy_host_refused 125 \
 	"a host over the CPU threshold is refused before anything is measured" \
