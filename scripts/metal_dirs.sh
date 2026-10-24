@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/metal_dirs.sh — the directories holding gated `.metal` kernels.
+# The directories holding gated .metal kernels; sourced by the metal gates.
 #
 # Sourced by `check_metal_compiles.sh` and `check_metal_format.sh`. Single-sourced
 # on purpose: two copies held in step by a comment is how a fourth crate gets

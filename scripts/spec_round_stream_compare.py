@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Compare two captures of the speculative per-round event stream, or hold one
-to the checked-in baseline manifest.
+"""Compare two speculative per-round event-stream captures, or hold one to the pinned manifest.
 
 WHY
     The equivalence pairs read the answer and the accept counters read the
@@ -33,7 +32,13 @@ CELLS READ
 --pair
     Holds the six cells of one pinned pair and reads no other file in <dir>.
     The equivalence test of each pinned pair runs this on its own cells after
-    every run.
+    every run: a moved cell fails it on the pinned MLX pair and is waived, with a
+    `WAIVED` notice, on another pair, where a different kernel can resolve a
+    near-tie the other way. Those tests are `#[ignore]` and need two model
+    snapshots and a Metal context, so they run under `make gpu-test`, not
+    `make ci`. The test
+    `the_engine_and_its_readers_state_the_same_target_and_round_fields` holds the
+    `ROUND_EVENT_FIELDS` below to the engine's.
 
 --fields
     Two captures either side of a change that renamed, added or dropped a field

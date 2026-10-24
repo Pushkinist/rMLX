@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# spec_bench_published_selftest.sh — mutation check for
-# scripts/spec_bench_published.sh.
+# Mutation check for spec_bench_published.sh: a stub server, asserting exit codes and refusals.
 #
 # WHY THIS EXISTS
 #

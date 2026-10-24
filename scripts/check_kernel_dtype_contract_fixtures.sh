@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# scripts/check_kernel_dtype_contract_fixtures.sh — recall test for the
-# `check_kernel_dtype_contract.sh` gate.
+# Recall test for check_kernel_dtype_contract.sh: scan roots, asserting exit code and function.
 #
 # A source gate is only worth its runtime if it still fires when the pattern it
 # looks for is spelled differently, hidden inside a tuple, or separated from

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# scripts/check_kv_layer_quants.sh — CI gate: the per-layer KV codec vector has
-# exactly one producer, and every path that builds a per-layer cache stack
-# either uses it or declares that it deliberately does not.
+# CI gate: the per-layer KV codec vector has one producer, and every cache stack uses it.
+#
+# A stack that deliberately does not use it declares itself uniform.
 #
 # WHY
 #   Three places must agree on which codec each decoder layer gets: the arch

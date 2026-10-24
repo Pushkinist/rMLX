@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# ssd_canary_selftest.sh — checks scripts/ssd_canary.sh and its two Makefile
-# targets against a stub `rmlx` binary and a stub HTTP server. No GPU, no model,
-# no metrics DB outside a throwaway directory.
+# Recall test for ssd_canary.sh and its make targets, against a stub rmlx and a stub HTTP server.
+#
+# No GPU, no model, no metrics DB outside a throwaway directory.
 #
 # Each run case builds a fixture tree (a copy of the script, the helpers it
 # reads, the real `prompts/ssd_bench/` and the Makefile, plus a stub binary at

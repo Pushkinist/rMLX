@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# spec_bench_published.sh — bench one verifier under the published on-device
-# speculative-decoding protocol.
+# Bench one verifier under the published on-device speculative-decoding protocol, three passes.
 #
 # Usage:
 #   bash scripts/spec_bench_published.sh <verifier-snapshot-dir> --label NAME [options]
@@ -204,6 +203,8 @@
 #   0   — three passes ran and every mean is within the range band
 #   1   — a precondition failed, or a reading could not be attributed
 #   3   — the run is readable and at least one mean is refused for its range
+#         (more than 5% of the mean; the mean is withheld and named, and the
+#         macro with it)
 #   125 — the host is not quiescent (pass --allow-busy-host to measure anyway)
 
 set -euo pipefail

@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# scripts/release/release_cpu_selftest.sh — recall test for
-# `scripts/release/release_cpu.py`.
+# Recall test for release_cpu.py: throwaway repo roots and a stub cargo, asserting exit and reason.
 #
 # Each case builds a throwaway repo root holding a `.cargo/config.toml`, a
 # cargo-shaped `target/release/` (a `deps/rmlx-<hash>` binary and the

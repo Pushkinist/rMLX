@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# scripts/eval_lock_stress.sh — drive the evaluation-lock reproducer across many
-# FRESH PROCESSES and fail on any non-zero exit.
+# Drive the evaluation-lock reproducer across fresh processes; a non-zero exit or timeout fails.
+#
+# Not part of `make ci`.
 #
 # WHY A DRIVER AND NOT JUST A TEST
 #   `concurrent_first_eval_reproducer` has 400 threads evaluate at one moment

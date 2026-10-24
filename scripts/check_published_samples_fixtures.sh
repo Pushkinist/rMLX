@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# check_published_samples_fixtures.sh — recall test for
-# `published_samples.py verify`.
+# Recall test for published_samples.py verify: synthetic sample-set roots, one edit per case.
 #
 # WHY
 #   The verifier's whole job is to refuse. It reads a manifest, re-derives what

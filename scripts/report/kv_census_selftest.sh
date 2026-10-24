@@ -1,8 +1,5 @@
 #!/usr/bin/env bash
-# scripts/report/kv_census_selftest.sh — recall test for
-# `debt_report.py --kv-census`. Every case is one edit to an otherwise valid synthetic
-# tree, and asserts both the exit code and the figure or reason the producer
-# printed.
+# Recall test for debt_report.py --kv-census: synthetic trees, asserting exit code and figure.
 #
 # Recall test for: report/debt_report.py --kv-census
 #

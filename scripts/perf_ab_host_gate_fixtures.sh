@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# perf_ab_host_gate_fixtures.sh — recall test for the boundary between what
-# `scripts/perf_ab.sh` measures and what it reads off the machine.
+# Recall test for the perf_ab.sh boundary: --synthetic-arms gives the same verdict on any host.
 #
 # WHY THIS EXISTS
 #

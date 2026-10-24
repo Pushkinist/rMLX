@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# scripts/check_no_kernel_input_eval_fixtures.sh — recall test for the
-# `check_no_kernel_input_eval.sh` gate.
+# Recall test for check_no_kernel_input_eval.sh: synthetic scan roots, asserting exit code.
 #
 # A source gate is only worth its runtime if it still fires when the thing it
 # looks for is spelled differently, moved, or hidden one call deep. Each

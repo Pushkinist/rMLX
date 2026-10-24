@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# scripts/check_named_skip_notices.sh — every classified GPU test that announces
-# its own stand-down names itself while doing it.
+# CI gate: every classified GPU test that announces its own stand-down names itself in the notice.
 #
 # WHY
 #   `scripts/run_gpu_tests.sh` reads the tests' own words to tell a cell that

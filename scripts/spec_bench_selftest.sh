@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# spec_bench_selftest.sh — mutation check for scripts/spec_bench.sh.
+# Mutation check for spec_bench.sh: a stub rmlx server, asserting recorded values and refusals.
 #
 # WHY THIS EXISTS
 #

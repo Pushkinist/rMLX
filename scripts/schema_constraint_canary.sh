@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# schema_constraint_canary.sh — real-model proof for the `json_schema` constraint path.
+# Real-model proof for the json_schema constrained-decoding path: two probes, two architectures.
 #
 # Two probes on two architectures, verdict fixed before the run.
 #

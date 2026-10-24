@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# scripts/check_kv_byte_model_parity.sh — CI gate: the KV byte model in
-# `scripts/perf_ceiling.py` agrees, byte for byte, with the one the engine uses.
+# CI gate: the KV byte model in perf_ceiling.py agrees byte for byte with the engine's.
 #
 # USAGE
 #   check_kv_byte_model_parity.sh [MANIFEST]

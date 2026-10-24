@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/check_claim_bypass_selftest.sh — recall test for check_claim_bypass.sh.
+# Recall test for check_claim_bypass.sh: planted git work trees, asserting exit code and file:line.
 # doc-refs: fixture — the docs/ paths below belong to the synthetic scan roots.
 #
 # Each case builds a throwaway git work tree with one planted line, runs the

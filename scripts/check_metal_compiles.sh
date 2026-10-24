@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# scripts/check_metal_compiles.sh — CI gate: every `.metal` kernel compiles with
-# the native Metal compiler, so an MSL syntax error surfaces here instead of on
-# the first GPU dispatch.
+# CI gate: every .metal kernel compiles at -std=metal3.1 and metal4.0 and is named by its manifest.
 #
 # Where the kernels are
 # ---------------------

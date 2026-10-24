@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# scripts/check_kv_byte_model_parity_fixtures.sh — recall test for
-# `check_kv_byte_model_parity.sh`: each fixture is one edit to an otherwise
-# valid manifest, and asserts both the exit code and *which* check fired.
+# Recall test for check_kv_byte_model_parity.sh: one edited manifest per case, asserting the check.
 #
 # WHY BOTH
 #   The parity gate reports a disagreement (exit 1) and an inability to look

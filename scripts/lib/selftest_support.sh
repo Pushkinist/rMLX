@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# selftest_support.sh — what the self-tests share. Source it.
+# The case runner and shims the self-tests share; source it.
 #
 # The case runner (st_*) counts cases and prints one summary line. A harness
 # calls st_init, then st_case for a case that is a command, an exit code and

@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# scripts/check_personal_data.sh — no personal data in the files the public
-# repository publishes.
+# CI gate: no personal email, macOS home or temp path, or assistant session link in published files.
 #
 # The repository is public, and a line published once is cached and indexed
 # even after it is edited out. This gate keeps three kinds of line out of every

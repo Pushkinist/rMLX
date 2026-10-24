@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/report/debt_report_selftest.sh — fixture test for scripts/report/debt_report.py.
+# Recall test for debt_report.py: fixture trees, asserting what the printed text holds.
 #
 # Recall test for: report/debt_report.py (the report and --matched-lines)
 #

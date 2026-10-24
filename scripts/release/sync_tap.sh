@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Sync the canonical formula (packaging/homebrew/rmlx.rb) into the Homebrew tap
-# repo (Pushkinist/homebrew-rmlx) as Formula/rmlx.rb, commit, and push.
+# Sync packaging/homebrew/rmlx.rb into the Homebrew tap repo as Formula/rmlx.rb, commit and push.
 #
 # The in-repo formula is the source of truth (reviewed with the code); the tap
 # is a thin published copy so `brew tap Pushkinist/rmlx` works.

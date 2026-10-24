@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# List the Metal functions a captured window referenced, straight out of the
-# bundle — no Xcode, no replay.
+# List the Metal functions a captured window referenced, straight from the bundle; no Xcode.
 #
 # This is the one thing a .gputrace answers offline (docs/PROFILING.md §5): it
 # proves a kernel *fired* instead of inferring it from timing, which is what

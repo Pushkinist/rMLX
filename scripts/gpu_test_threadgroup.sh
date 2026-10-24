@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# scripts/gpu_test_threadgroup.sh — which classified GPU tests run with Metal's
-# threadgroup-memory validation. One row per test, `<on|off><TAB><crate><TAB><test>`.
+# Print which classified GPU tests run with threadgroup-memory validation: on|off, crate, test.
 #
 # WHY TWO SETTINGS
 #   `MTL_SHADER_VALIDATION_THREADGROUP_MEMORY=1` makes MLX's own NAX kernels

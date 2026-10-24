@@ -20,7 +20,10 @@ The default mode is the report. ``--matched-lines``, ``--check-doc-size``,
 ``--kv-census`` runs ``kv_census.py``, a module of this tool.
 
 Report: four sections, in order: sibling-file/fn similarity ("twins"), debt
-counters, the add/remove line ratio since the last tag, and oversized docs.
+counters (`#[allow(` sites, debt-marker comments, `check-*` Make targets and
+oversized files without `LOC-exempt`), the churn since the last tag, summed over
+commits, and oversized docs. The round-loop drivers print as a named group in
+the first section, read from `check_spec_charge.sh --list-drivers`.
 Reads only files under ``--root`` (default: the repo this file lives in) plus
 ``git log`` against that same working tree — no network, no other machine path.
 
@@ -81,9 +84,10 @@ rotor/iso/turbo pairs by hand, generalised from those specific spellings to
 any digit run touching a letter, underscore or hyphen.
 
 ``--check-doc-size`` is the third mode, a gate: it measures the same docs as
-the fourth section and exits 1 naming every doc over the cap and every doc
-carrying a ``size-exempt:`` marker, and exits 2 when the docs cannot be
-measured.
+the fourth section (every ``docs/**/*.md`` git does not ignore, ``.md`` in any
+case, at most 40 KiB = 40,960 B) and exits 1 naming every doc over the cap and
+every doc carrying a ``size-exempt:`` marker, and exits 2 when the docs cannot
+be measured. No doc exempts itself: the marker counts nowhere.
 
 ``--file-sizes [N]`` prints the non-test Rust source files above N lines
 (default 1000), largest first, and the workspace total.

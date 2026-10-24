@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# scripts/check_claim_bypass.sh — nothing in the tree deletes the Metal claim,
-# names the claim file outside its owner, or kills a process by pattern.
+# CI gate: nothing deletes the Metal claim, names its file outside its owner, or kills by name.
+#
+# No marker exempts a line.
 #
 # The Metal claim is a flock on one file. A process that deletes the file lets
 # the next process create a new file with a free lock, so every deletion is a

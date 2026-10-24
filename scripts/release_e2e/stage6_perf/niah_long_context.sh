@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# NIAH (Needle-In-A-Haystack) validation driver.
+# Needle-in-a-haystack long-context validation driver: a kernel-gate off pass, then an on pass.
 #
 # Two flash families share this driver:
 #

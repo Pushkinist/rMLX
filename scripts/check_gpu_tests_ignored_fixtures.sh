@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# scripts/check_gpu_tests_ignored_fixtures.sh — recall test for the
-# `check_gpu_tests_ignored.sh` gate.
+# Recall test for check_gpu_tests_ignored.sh: synthetic workspaces, asserting the failure reason.
 #
 # The gate it guards enforces a rule ("a test reaching Device::Gpu carries
 # #[ignore]") that nothing else in the tree can check, so a silent loss of

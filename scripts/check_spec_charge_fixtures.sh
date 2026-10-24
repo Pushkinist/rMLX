@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# scripts/check_spec_charge_fixtures.sh — recall test for
-# scripts/check_spec_charge.sh.
+# Recall test for check_spec_charge.sh: one edit per synthetic source root, asserting rule and exit.
 #
 # A gate is only worth its runtime if it fires, and "the tree is clean" is no
 # evidence of that: a scan whose regex stopped matching reports the same clean

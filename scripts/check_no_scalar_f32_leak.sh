@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/check_no_scalar_f32_leak.sh — CI gate: flag unguarded scalar_f32( in arch-layer code.
+# CI gate: no unguarded scalar_f32( in the crates that own .metal kernels.
 #
 # PROBLEM
 # -------

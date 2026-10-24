@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# build_bottle.sh — build a Homebrew bottle from the installed rmlx keg and
-# prepare it for upload to the GitHub Release.
+# Build a Homebrew bottle from the installed rmlx keg and prepare it for the GitHub Release.
 #
 # What this script does:
 #   1. Verifies rmlx is installed in Homebrew (brew install --build-bottle

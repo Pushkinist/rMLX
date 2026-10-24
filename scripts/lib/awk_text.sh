@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# scripts/lib/awk_text.sh — the two text readers every source-scanning gate
-# needs. Sourced, not executed.
+# Line readers for Rust-scanning gates: code without comments, without string bodies, bodiless fns.
+#
+# Sourced, not executed.
 #
 # WHY ONE PRODUCER
 #   A gate that reads Rust source needs the same two answers everywhere: what on

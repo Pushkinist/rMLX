@@ -1,4 +1,4 @@
-# gpu_validation_census.txt — the Metal shader-validation hits this tree accepts.
+# The Metal shader-validation hits run_gpu_tests.sh accepts, one entry per originating test.
 #
 # `scripts/run_gpu_tests.sh` instruments every Metal pipeline and scans for
 # invalid-access diagnostics. Some of them come from a kernel this repo neither

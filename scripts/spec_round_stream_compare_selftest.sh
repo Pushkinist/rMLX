@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# scripts/spec_round_stream_compare_selftest.sh — recall test for
-# `scripts/spec_round_stream_compare.py verify`, the one reader of the pinned
-# round-stream manifest.
+# Recall test for spec_round_stream_compare.py verify: synthetic captures, asserting the exit code.
 #
 # Each case builds a synthetic capture of the 36 pinned cells, whose round
 # counts sum to the script's own TOTAL_ROUNDS, and asserts the literal exit code

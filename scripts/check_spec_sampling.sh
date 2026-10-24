@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# scripts/check_spec_sampling.sh — CI gate: every speculative generation path is
-# handed the request's sampling configuration and draws with it, and every
-# drafter arm passes it.
+# CI gate: every speculative generation path is handed the request's sampler and draws with it.
 #
 # WHY
 #   A round loop that takes no sampler decodes greedily. It does not fail, it
@@ -74,7 +72,10 @@
 #   cannot fire, and what it would admit is precisely the shape the collapse
 #   removed — a second generator seeded from the request's seed, which is a
 #   second stream correlated with the first while looking reproducible on its
-#   own.
+#   own. A second generator beside a correct draw is outside this gate, since the
+#   construction it requires is present; `the_requests_draw_stream_has_one_generator`
+#   in `crates/rmlx-models/src/speculative/round_skeleton_tests.rs` reads it, over
+#   every non-test source of the module family.
 #
 # RULE 2 (an entry hands the sampler to the loop)
 #   An entry declares the parameter and the configuration it builds carries it:

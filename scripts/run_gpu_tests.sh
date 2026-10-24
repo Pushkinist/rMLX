@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# scripts/run_gpu_tests.sh — execute the GPU (Metal-context) tests that
-# `scripts/check_gpu_tests_ignored.sh` mandates be `#[ignore]`d, serialized.
+# Run the #[ignore] Metal tests of every member crate, serialized, under Metal shader validation.
 #
 # WHY
 #   Every test reaching `Device::Gpu` is REQUIRED to carry `#[ignore]`, because a

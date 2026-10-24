@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# run_gpu_tests_selftest.sh — recall check for how `scripts/run_gpu_tests.sh`
-# reports a red run.
+# Recall test for run_gpu_tests.sh: how it reports red runs, waivers and census verdicts.
 #
 # The runner accumulates two independent kinds of red across its crate loop:
 # Metal shader-validation diagnostics, and everything that makes a crate fail

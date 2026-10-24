@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# scripts/report/doc_size_selftest.sh — recall test for the doc-size gate,
-# `python3 scripts/report/debt_report.py --check-doc-size`.
+# Recall test for debt_report.py --check-doc-size: throwaway git trees, asserting exit and reason.
 #
 # Recall test for: report/debt_report.py --check-doc-size
 #

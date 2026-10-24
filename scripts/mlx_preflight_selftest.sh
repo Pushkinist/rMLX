@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/mlx_preflight_selftest.sh — recall test for mlx_preflight.sh.
+# Recall test for mlx_preflight.sh: throwaway Homebrew prefixes and stubs, asserting output.
 #
 #     bash scripts/mlx_preflight_selftest.sh [<script under test>]
 #

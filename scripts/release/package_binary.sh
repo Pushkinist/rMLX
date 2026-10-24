@@ -5,6 +5,9 @@
 #   rmlx-v<ver>-aarch64-apple-darwin.tar.gz        (rmlx + licenses + README)
 #   rmlx-v<ver>-aarch64-apple-darwin.tar.gz.sha256 (checksum, `shasum -c` format)
 #
+# The binary is compiled for apple-m1, not this machine's CPU, and the tarball is
+# kept only when `release_cpu.py check` passes.
+#
 # Hosted GitHub macOS runners cannot build rMLX (no usable Metal); run this on a
 # real Apple-Silicon machine with `brew install mlx-c` present.
 #

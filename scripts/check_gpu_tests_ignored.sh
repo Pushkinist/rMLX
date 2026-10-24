@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# scripts/check_gpu_tests_ignored.sh — CI gate: fail if a GPU-touching test in
-# ANY workspace member crate is missing the `#[ignore]` Metal-context attribute.
+# CI gate: every test that reaches Device::Gpu, in any workspace crate, carries #[ignore].
 #
 # WHY
 #   A shared Metal context cannot be driven from parallel test threads. A GPU

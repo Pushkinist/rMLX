@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/target_size_report.sh — advisory target/ size report for CI.
+# Advisory (non-failing) report of target/ size, with a make target-gc hint past a threshold.
 #
 # `target/` has no size cap (see scripts/target_gc.sh) and a workspace this
 # size with several profiles in regular use (dev, release, release-perf,

@@ -1,4 +1,4 @@
-"""Structural figures for the KV update-path restructure.
+"""Structural figures for the KV update path: variant shapes, match sites, update bodies, refs.
 
 Module of: report/debt_report.py
 

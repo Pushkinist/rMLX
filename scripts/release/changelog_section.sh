@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Print the CHANGELOG.md section for a given version, for use as the GitHub
-# Release body:  gh release create v<ver> --notes-file <(scripts/release/changelog_section.sh <ver>)
+# Print one version's CHANGELOG.md section, for use as the GitHub release body.
+#
+# Use:  gh release create v<ver> --notes-file <(scripts/release/changelog_section.sh <ver>)
 #
 # Defaults to the current [workspace.package].version.
 #

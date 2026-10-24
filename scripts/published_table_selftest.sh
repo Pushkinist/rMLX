@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# published_table_selftest.sh — mutation check for scripts/lib/published_table.py.
+# Mutation check for lib/published_table.py: a fixture snapshot, asserting exit code and reason.
 #
 # WHY THIS EXISTS
 #

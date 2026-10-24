@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bench-records-sweep.sh — 5-model × 4-KV-quant BENCHMARK_CHAMPIONS regression sweep.
+# 5-model x 4-KV-quant regression sweep for BENCHMARK_CHAMPIONS, one cold and one warm run per cell.
 #
 # Methodology (BENCHMARK_CHAMPIONS.md protocol):
 #   Prompt   : Cross-Backend-Bench/prompts/longctx_4k.json (4096-token)

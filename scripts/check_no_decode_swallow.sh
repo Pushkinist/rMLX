@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# scripts/check_no_decode_swallow.sh — CI gate: a failed decode step or a failed
-# prefill chunk must propagate, never be swallowed into a successful-looking run.
+# CI gate: a failed decode step or prefill chunk propagates instead of looking like a success.
 #
 # THE BUG THIS PINS
 #   Decode: a decode step that errored used to log a warning and `break`, handing

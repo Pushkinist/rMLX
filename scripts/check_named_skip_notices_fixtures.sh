@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# scripts/check_named_skip_notices_fixtures.sh — recall test for
-# `check_named_skip_notices.sh`.
+# Recall test for check_named_skip_notices.sh: planted notice shapes, asserting the reason.
 #
 # WHY
 #   The gate it tests is a text scan, and a text scan that stops matching says

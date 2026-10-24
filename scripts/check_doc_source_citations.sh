@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# scripts/check_doc_source_citations.sh — CI gate: every `crates/...` source
-# path cited in a tracked docs/*.md file must exist in the tree.
+# CI gate: every crates/... source path cited in a tracked docs/*.md file exists.
 #
 # Why this exists: the subsystem docs replace figures with citations — "pinned
 # by X (`crates/.../y_tests.rs`)", "the predicate lives in `crates/.../z.rs`".

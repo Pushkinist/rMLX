@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# scripts/check_kv_codec_disposition.sh — CI gate: what the user-facing surfaces
-# say a KV codec does, and what the runtime classifiers say it does, agree.
+# CI gate: what the KV help and docs say a codec does agrees with its runtime disposition.
 #
 # USAGE
 #   check_kv_codec_disposition.sh [SCAN_ROOT]

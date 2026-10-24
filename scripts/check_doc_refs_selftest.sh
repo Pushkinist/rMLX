@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/check_doc_refs_selftest.sh — recall test for check_doc_refs.py.
+# Recall test for check_doc_refs.py: synthetic git repos, asserting exit code and reason.
 # doc-refs: fixture — the docs/ paths below belong to the synthetic repo.
 #
 # Builds one synthetic git repo at run time (three docs, a CLAUDE.md map, a

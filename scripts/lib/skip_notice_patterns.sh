@@ -1,4 +1,4 @@
-# scripts/lib/skip_notice_patterns.sh — the stand-down notice, defined once.
+# The SKIP and WAIVED stand-down notice patterns, defined once for the runner and the gate.
 #
 # A model-gated test that returns before asserting anything announces
 # `SKIP <test>: <why>`. Two tools read that line and they must agree exactly on

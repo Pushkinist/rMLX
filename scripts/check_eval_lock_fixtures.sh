@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/check_eval_lock_fixtures.sh — recall test for `check_eval_lock.sh`.
+# Recall test for check_eval_lock.sh: a synthetic scan root per case, asserting exit code and rule.
 #
 # A source gate is only worth its runtime if it still fires when the thing it
 # looks for is spelled differently, nested deeper, or hidden behind a comment.

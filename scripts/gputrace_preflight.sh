@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Check the host-side prerequisites for Apple's GPU tools to work with a Metal
-# capture of this binary.
+# Check the host prerequisites for Apple's GPU tools to work with a Metal capture of this binary.
 #
 # Two different things gate a session, and confusing them is why a trace can be
 # written successfully and still be useless:

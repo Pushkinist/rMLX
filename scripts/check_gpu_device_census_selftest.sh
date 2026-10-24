@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# scripts/check_gpu_device_census_selftest.sh — recall test for
-# check_gpu_device_census.sh.
+# Recall test for check_gpu_device_census.sh: scan roots, asserting exit code and file:line.
 #
 # Each case builds a throwaway scan root holding the one legitimate site, plants
 # one file, runs the gate and asserts the literal exit code and, for a failure,
 # the rule and the file:line it names (or the reason). The library-mode cases
 # plant one file in a root with no device site. The last case runs the binary
-# mode on the real tree; the library mode is red on the real tree until the
-# library sites take their device from the caller, so no case runs it there.
+# mode on the real tree; the library mode runs on the real tree as
+# `make check-gpu-device-census-library`, so no case runs it there.
 #
 # Exit 0 = every case held. Exit 1 = at least one did not.
 

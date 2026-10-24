@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# cpu_snapshot.sh — per-process cumulative CPU seconds, for interference gates.
+# Per-process cumulative CPU seconds, for interference gates; source it.
 #
-# Defines one function. Source it; do not execute it.
+# Defines `cpu_snapshot`, and `snapshot_ok` and `window_not_sampled`, which both
+# A/B harnesses share. Source it; do not execute it.
 #
 #     source "$REPO_ROOT/scripts/lib/cpu_snapshot.sh"
 #     cpu_snapshot /tmp/before

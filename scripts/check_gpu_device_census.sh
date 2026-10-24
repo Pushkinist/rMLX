@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# scripts/check_gpu_device_census.sh — the rmlx binary names the GPU device in
-# exactly one place.
+# CI gate: the rmlx binary's source names Device::Gpu in exactly one place, claim_gpu.
 #
 # A GPU command must hold the Metal claim from before its first GPU call until
 # its last one. In the rmlx binary the GPU device comes from one helper,

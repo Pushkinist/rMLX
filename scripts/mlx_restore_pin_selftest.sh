@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/mlx_restore_pin_selftest.sh — recall test for mlx_restore_pin.sh.
+# Recall test for mlx_restore_pin.sh: throwaway prefixes, stub brew, asserting exit and records.
 #
 #     bash scripts/mlx_restore_pin_selftest.sh [<script under test>]
 #

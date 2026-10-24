@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# scripts/check_no_kernel_input_eval.sh — CI gate: flag blocking Array::eval()
-# in a custom-Metal-kernel dispatcher.
+# CI gate: no blocking Array::eval() on a kernel input in a custom-Metal-kernel dispatcher.
 #
 # usage: check_no_kernel_input_eval.sh [SRC_DIR] [MIN_FILES]
 #

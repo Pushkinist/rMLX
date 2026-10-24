@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# scripts/check_kv_codec_disposition_fixtures.sh — recall test for
-# `check_kv_codec_disposition.sh`.
+# Recall test for check_kv_codec_disposition.sh: synthetic scan roots, asserting rule and exit code.
 #
 # That gate has eleven rules and two exit codes, and every one of them is one regex
 # edit away from matching nothing and going permanently green. This repo has

@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# scripts/check_no_inline_tests.sh — CI gate: fail if any non-test source file
-# contains an inline `#[cfg(test)] mod tests {` or `mod <name>_tests {` block.
+# CI gate: no inline #[cfg(test)] mod tests block in a non-test source file.
 #
 # ALLOWED (sibling-pointer pattern):
 #   #[cfg(test)]

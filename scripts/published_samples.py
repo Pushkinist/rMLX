@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""published_samples.py — build and verify the published-protocol sample sets.
+"""Build and verify the checked-in published-protocol sample sets.
 
 The published speculative-decoding protocol reports output speed as a
 macro-average over MT-Bench, MATH-500 and HumanEval subsets. Those subsets are
@@ -27,6 +27,11 @@ WHERE THE ANCHOR LIVES
 
   What that still does not reach: an editor who changes the data *and* the pins
   in one commit. Nothing in a repository can catch that; review can.
+
+  No gate passes --sources, because the upstream files are not checked in. That
+  the body digest computed here equals the id the Rust recorder gives the same
+  body is checked by `published_sample_body_digests_match_this_recorder` in
+  `crates/rmlx-metrics/src/prompts_tests.rs`.
 
 Exit codes:
   0  everything agrees

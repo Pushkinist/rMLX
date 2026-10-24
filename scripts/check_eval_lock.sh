@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# scripts/check_eval_lock.sh — CI gate: every FFI call that can reach
-# `mlx::core::eval_impl` must be made under the process-wide evaluation lock,
-# and nothing that runs under that lock may take it again.
+# CI gate: every MLX FFI call that can evaluate runs under the process-wide evaluation lock.
 #
 # WHAT THIS HOLDS
 #   rMLX evaluates one graph at a time, and `rmlx_mlx::with_eval_lock` makes

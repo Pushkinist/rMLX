@@ -1,5 +1,4 @@
-"""
-Convert Silero VAD v4 ONNX weights (16kHz branch only) to safetensors.
+"""Convert Silero VAD v4 ONNX weights (16kHz branch only) to safetensors.
 
 Run once at asset-preparation time. The output file is committed to
 crates/rmlx-audio/assets/silero_vad_16k.safetensors and loaded at runtime

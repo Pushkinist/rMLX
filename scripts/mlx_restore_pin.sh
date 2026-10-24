@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Restore the MLX pair named by crates/rmlx-mlx/mlx-pin.txt, then link and pin
-# exactly those two kegs.
+# Restore the MLX and mlx-c pair named by crates/rmlx-mlx/mlx-pin.txt, then link and pin those kegs.
 #
 # The pinned pair is a source build with the NAX kernels (docs/MLX_PAIR.md).
 # No Homebrew bottle for macOS 26 carries them, so this script pours no

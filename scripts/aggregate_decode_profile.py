@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Decode-profile aggregator.
+"""Aggregate per-model decode_profile lines from profile_<MODEL>.txt into one CSV row per model.
 
 Reads per-model decode_profile lines from `profile_<MODEL>.txt` files and emits
 one CSV row per model with:

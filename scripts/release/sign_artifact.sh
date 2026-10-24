@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# sign_artifact.sh — cosign key-pair signature for the release tarball.
+# Sign the release tarball with the maintainer's cosign key pair, producing a .cosign.bundle.
 #
 # Produces, alongside dist/rmlx-v<ver>-aarch64-apple-darwin.tar.gz:
 #   <tarball>.cosign.bundle   signature + Rekor inclusion proof

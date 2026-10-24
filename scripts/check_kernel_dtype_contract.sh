@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# scripts/check_kernel_dtype_contract.sh — CI gate: a custom-Metal-kernel
-# dispatcher that declares an f32 kernel output must not hand that f32 back to
-# its caller unexamined.
+# CI gate: a custom-Metal-kernel dispatcher never hands its f32 kernel output back unexamined.
 #
 # usage: check_kernel_dtype_contract.sh [SRC_DIR] [MIN_FNS]
 #

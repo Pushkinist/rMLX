@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# check_spec_metric_parity.sh — CI gate: the speculative metrics the engine
-# declares are the ones the bench records.
+# CI gate: every speculative metric the engine declares is one spec_bench.sh records.
 #
 # WHY
 #   `rmlx_metrics::registry::SPEC_METRICS` is where a speculative metric is

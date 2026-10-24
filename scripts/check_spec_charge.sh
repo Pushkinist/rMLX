@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# scripts/check_spec_charge.sh — CI gate: each speculative round loop names one
-# phase-charge decision, and it names it everywhere the decision is read.
+# CI gate: each speculative round loop names one phase-charge decision, everywhere it is read.
 #
 # WHY
 #   Each of the seven entries decides once whether its request's phases are
@@ -139,7 +138,9 @@
 #   enable at TRACE. That copy is outside this scan; it is held to the engine's
 #   by `the_engine_and_its_readers_state_the_same_target_and_round_fields` in
 #   `tests/spec_greedy_equivalence.rs`, which reads `round_stats.rs` and looks
-#   for the declaration. What this rule enforces is the engine half. A loop that
+#   for the declaration, and holds the Rust `ROUND_EVENT_FIELDS` to the tuple
+#   `spec_round_stream_compare.py` reads a capture back with. What this rule
+#   enforces is the engine half. A loop that
 #   keeps its charge decision honest and writes its own
 #   `tracing::debug!` on that target, with the same fields in the same order,
 #   produces a byte-identical line — so the pinned round-stream digests agree,

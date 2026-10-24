@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# scripts/check_metal_format.sh — CI gate: every `.metal` kernel file is
-# clang-format clean.
+# CI gate: every .metal kernel file is clang-format clean.
 #
 # Metal Shading Language is a C++14 dialect, so clang-format's Cpp mode formats
 # it. Style is pinned by a `.clang-format` in each kernel directory, which

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Stop a measurement exactly where `rmlx baseline` and `rmlx bench` refuse:
-# an mlx-c C API mismatch on every host, and a pair that is not the pinned,
-# nax-capable one on M5 and later or on a host whose chip cannot be
-# identified. On an identified M1-M4 host the pin does not bind, so the
-# preflight passes there when the C API matches.
+# Stop a measurement where rmlx baseline and rmlx bench refuse: a bad mlx-c C API or MLX pair.
+#
+# An mlx-c C API mismatch refuses on every host. A pair that is not the pinned, nax-capable one
+# refuses on M5 and later, and on a host whose chip cannot be identified. On an identified
+# M1-M4 host the pin does not bind, so the preflight passes there when the C API matches.
 #
 # A C API mismatch is fixed by a rebuild. The restore is named for it only
 # when the binary's line names it: where the pinned pair is required (the pin

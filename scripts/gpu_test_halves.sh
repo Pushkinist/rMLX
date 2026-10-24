@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# scripts/gpu_test_halves.sh — which half of the GPU suite each classified test
-# belongs to. One row per test, `<half><TAB><crate><TAB><test>`.
+# Print which half of the GPU suite each classified test is in: codec|rest, crate, test.
 #
 # WHY
 #   The whole GPU suite is hours of wall, and a change pays for all of it to

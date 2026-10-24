@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# scripts/check_personal_data_selftest.sh — recall test for
-# check_personal_data.sh.
+# Recall test for check_personal_data.sh: throwaway git trees, asserting exit code and file:line.
 #
 # Each case builds a throwaway git tree, plants one edit, runs the gate over it
 # and asserts the exit code and, for a violation, the rule and the file:line

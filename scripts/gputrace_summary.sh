@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Summarise a .gputrace bundle: what it is, how big it is, and — the part that
-# is otherwise invisible — whether it has been profiled in Xcode yet.
+# Summarise a .gputrace bundle: what it captured, its size, and whether Xcode has profiled it.
 #
 # A bundle is several GB of opaque blobs. Two facts are worth having before
 # opening one:

@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Diff the function sets of two .gputrace bundles: what did A's window reference
-# that B's did not, and the other way round.
+# Diff the Metal function sets of two .gputrace bundles, in both directions.
 #
 # This is the A/B that motivates capturing at all — "what does iso3_sym dispatch
 # that none does not", one codec against another, or one commit against another.

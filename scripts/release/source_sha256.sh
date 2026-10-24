@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Compute the sha256 of a GitHub source tarball for the Homebrew formula, and
-# (optionally) patch packaging/homebrew/rmlx.rb in place.
+# Compute the sha256 of a GitHub source tarball for the Homebrew formula; --write patches it in.
 #
 # GitHub serves the auto-generated source tarball at:
 #   https://github.com/<owner>/<repo>/archive/refs/tags/v<ver>.tar.gz
