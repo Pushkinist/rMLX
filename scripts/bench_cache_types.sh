@@ -173,6 +173,7 @@ run_smoke_probe() {
     --gen-tokens 16
     --ctx-max 8192
     --device gpu
+    --record --run-class diagnostic --label "ctype-smoke-${LABEL}"
   )
   if [ -n "$ctk" ] && [ -n "$ctv" ]; then
     args+=(--cache-type-k "$ctk" --cache-type-v "$ctv")

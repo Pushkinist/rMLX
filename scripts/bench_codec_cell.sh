@@ -12,6 +12,9 @@
 #   - Each run: target/release/rmlx baseline --model ... --kv-quant ... --prompt-tokens ... --max-tokens ...
 #   - Parses decode_tps + prefill_tps from stdout.
 #   - Appends 3 rows to .rmlx/bench/codec_cells.csv (one per run_idx 1/2/3).
+#   - Records every run, the warmup included, in runs.db as `diagnostic`
+#     (`--record --run-class diagnostic --label codec_cell:<codec>`): single
+#     unpaired runs reach no champion and no gate.
 #   - Prints summary: <codec> × <model>: mean decode_tps=X.X (±stddev), prefill_tps=X.X
 #
 # CSV schema (codec_cells.csv):
@@ -121,6 +124,7 @@ run_once() {
         --kv-quant "${KV_QUANT}" \
         --prompt-tokens "${PROMPT_LEN}" \
         --max-tokens "${MAX_TOKENS}" \
+        --record --run-class diagnostic --label "codec_cell:${KV_QUANT}" \
         2>/dev/null)"
     local dtps
     dtps="$(echo "${output}" | grep -o 'decode_tps=[0-9.]*' | cut -d= -f2 || true)"

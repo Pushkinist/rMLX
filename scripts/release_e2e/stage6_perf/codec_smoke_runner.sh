@@ -458,6 +458,7 @@ while IFS=$'\t' read -r CODEC MODEL CTX EXPECTED PROMPTS_CSV SKIP CLI_ARGS NIAH_
             --model "$MODEL_PATH" \
             --prompt "$PROMPT_FILE" \
             --max-tokens "$PMAX" \
+            --record --run-class diagnostic --label "codec_smoke:$CODEC:$PNAME" \
             $CLI_ARGS 2>&1 | tee "$OUTPUT_FILE" >/dev/null || BASELINE_RC=${PIPESTATUS[0]}
 
         # Extract `decoded=` so validate_regex sees only model output, not the
