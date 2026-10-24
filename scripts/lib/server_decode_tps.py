@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Read one request's decode rate off a running rmlx server.
 
 The server times every generation's inter-token gaps and appends the aggregate

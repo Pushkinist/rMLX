@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Recall test for run_gpu_tests.sh: how it reports red runs, waivers and census verdicts.
 #
+# Recall test for: run_gpu_tests.sh
+#
 # The runner accumulates two independent kinds of red across its crate loop:
 # Metal shader-validation diagnostics, and everything that makes a crate fail
 # (a failing test, a crate that under-matched its classified population, a crate

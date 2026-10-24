@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Recall test for check_spec_sampling.sh: one edit per synthetic root, asserting rule and exit.
 #
+# Recall test for: check_spec_sampling.sh
+#
 # A gate is only worth its runtime if it fires, and "the tree is clean" is no
 # evidence of that: a scan whose regex stopped matching reports the same clean
 # tree as a scan that works. Each case below is one edit to a synthetic source

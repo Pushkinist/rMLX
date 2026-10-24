@@ -1,4 +1,3 @@
-#!/usr/bin/env bash
 # Start, wait for and identify one rmlx server, for bench harnesses; source it.
 #
 # Source it; do not execute it. The caller must have set:

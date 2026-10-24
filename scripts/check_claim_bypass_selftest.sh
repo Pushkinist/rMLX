@@ -2,6 +2,8 @@
 # Recall test for check_claim_bypass.sh: planted git work trees, asserting exit code and file:line.
 # doc-refs: fixture — the docs/ paths below belong to the synthetic scan roots.
 #
+# Recall test for: check_claim_bypass.sh
+#
 # Each case builds a throwaway git work tree with one planted line, runs the
 # gate and asserts the literal exit code and, for every failure, the rule and
 # the file:line it names. Every scan root also holds one clean in-scope file,

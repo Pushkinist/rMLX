@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Recall test for check_spec_metric_parity.sh: synthetic scan roots, asserting exit code and reason.
 #
+# Recall test for: check_spec_metric_parity.sh
+#
 # WHY
 #   The parity gate reads two files with awk. A gate that reads source with awk
 #   fails silently the day either file is reformatted — it finds nothing, sees

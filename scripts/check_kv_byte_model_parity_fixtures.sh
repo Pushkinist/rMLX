@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Recall test for check_kv_byte_model_parity.sh: one edited manifest per case, asserting the check.
 #
+# Recall test for: check_kv_byte_model_parity.sh
+#
 # WHY BOTH
 #   The parity gate reports a disagreement (exit 1) and an inability to look
 #   (exit 2) on different exits on purpose. A recall test that asserted only

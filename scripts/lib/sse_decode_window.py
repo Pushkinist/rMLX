@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Time a streamed chat-completions response over its decode window.
 
 Sends one `stream: true` request, stamps each chunk as it arrives, and reports

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Recall test for check_eval_lock.sh: a synthetic scan root per case, asserting exit code and rule.
 #
+# Recall test for: check_eval_lock.sh
+#
 # A source gate is only worth its runtime if it still fires when the thing it
 # looks for is spelled differently, nested deeper, or hidden behind a comment.
 # All three of that gate's rules are one regex edit away from matching nothing

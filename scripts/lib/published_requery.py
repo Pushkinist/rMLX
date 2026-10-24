@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Re-query a recorded published-protocol run from `runs.db` and compare.
 
 `ingest/published_ingest.py` records the measured things and deliberately not

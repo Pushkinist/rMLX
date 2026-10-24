@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Recall test for ssd_canary.sh and its make targets, against a stub rmlx and a stub HTTP server.
 #
+# Recall test for: ssd_canary.sh
+#
 # No GPU, no model, no metrics DB outside a throwaway directory.
 #
 # Each run case builds a fixture tree (a copy of the script, the helpers it

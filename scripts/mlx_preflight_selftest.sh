@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Recall test for mlx_preflight.sh: throwaway Homebrew prefixes and stubs, asserting output.
 #
+# Recall test for: mlx_preflight.sh
+#
 #     bash scripts/mlx_preflight_selftest.sh [<script under test>]
 #
 # Each case builds a throwaway Homebrew prefix whose `opt` records name a pair,

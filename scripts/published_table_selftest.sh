@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Mutation check for lib/published_table.py: a fixture snapshot, asserting exit code and reason.
 #
+# Recall test for: lib/published_table.py
+#
 # WHY THIS EXISTS
 #
 # The emitter's whole job is to put a bound next to a measurement, and a

@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Convert Silero VAD v4 ONNX weights (16kHz branch only) to safetensors.
 
 Run once at asset-preparation time. The output file is committed to
@@ -6,6 +7,8 @@ by the rmlx-audio VAD engine. Do NOT run at server startup.
 
 Usage:
     uv run scripts/convert_silero_vad.py <silero_vad.onnx> <output.safetensors>
+Exit:   0 converted; 1 onnx is not installed, or a weight the model must hold is missing
+Caller: by hand
 
 Dependencies (via paroquant venv or any Python 3.9+ env):
     uv pip install onnx

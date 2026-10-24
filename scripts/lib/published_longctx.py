@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """The long-context row: one canonical prompt, plain decode, a cold cache.
 
 The protocol's fixed prompt is 1 355 tokens, which says nothing about how time to

@@ -36,7 +36,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `check_kv_codec_disposition_fixtures.sh` | make check-kv-codec-disposition-fixtures, make ci | Recall test for check_kv_codec_disposition.sh: synthetic scan roots, asserting rule and exit code. |
 | `check_kv_layer_quants.sh` | make check-kv-layer-quants, make ci | CI gate: the per-layer KV codec vector has one producer, and every cache stack uses it. |
 | `check_metal_compiles.sh` | make check-metal-compiles, make ci | CI gate: every .metal kernel compiles at -std=metal3.1 and metal4.0 and is named by its manifest. |
-| `check_metal_format.sh` | make check-metal-format, make ci | CI gate: every .metal kernel file is clang-format clean. |
+| `check_metal_format.sh` | make check-metal-format, make ci, pre-commit | CI gate: every .metal kernel file is clang-format clean. |
 | `check_named_skip_notices.sh` | make check-named-skip-notices, make ci, check_named_skip_notices_fixtures.sh | CI gate: every classified GPU test that announces its own stand-down names itself in the notice. |
 | `check_named_skip_notices_fixtures.sh` | make check-named-skip-notices-fixtures, make ci | Recall test for check_named_skip_notices.sh: planted notice shapes, asserting the reason. |
 | `check_no_decode_swallow.sh` | make check-no-decode-swallow, make ci | CI gate: a failed decode step or prefill chunk propagates instead of looking like a success. |
@@ -47,14 +47,14 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `check_personal_data.sh` | make check-personal-data, make ci, check_personal_data_selftest.sh | CI gate: no personal email, macOS home or temp path, or assistant session link in published files. |
 | `check_personal_data_selftest.sh` | make check-personal-data-selftest, make ci | Recall test for check_personal_data.sh: throwaway git trees, asserting exit code and file:line. |
 | `check_published_samples_fixtures.sh` | make check-published-samples-fixtures, make ci | Recall test for published_samples.py verify: synthetic sample-set roots, one edit per case. |
-| `check_spec_charge.sh` | make check-spec-charge, make ci, check_spec_charge_fixtures.sh | CI gate: each speculative round loop names one phase-charge decision, everywhere it is read. |
+| `check_spec_charge.sh` | make check-spec-charge, make ci, check_spec_charge_fixtures.sh, report/debt_report.py | CI gate: each speculative round loop names one phase-charge decision, everywhere it is read. |
 | `check_spec_charge_fixtures.sh` | make check-spec-charge-fixtures, make ci | Recall test for check_spec_charge.sh: one edit per synthetic source root, asserting rule and exit. |
 | `check_spec_metric_parity.sh` | make check-spec-metric-parity, make ci, check_spec_metric_parity_fixtures.sh | CI gate: every speculative metric the engine declares is one spec_bench.sh records. |
 | `check_spec_metric_parity_fixtures.sh` | make check-spec-metric-parity-fixtures, make ci | Recall test for check_spec_metric_parity.sh: synthetic scan roots, asserting exit code and reason. |
 | `check_spec_sampling.sh` | make check-spec-sampling, make ci, check_spec_sampling_fixtures.sh | CI gate: every speculative generation path is handed the request's sampler and draws with it. |
 | `check_spec_sampling_fixtures.sh` | make check-spec-sampling-fixtures, make ci | Recall test for check_spec_sampling.sh: one edit per synthetic root, asserting rule and exit. |
 | `codec_smoke_runner_selftest.sh` | make ci, make codec-smoke-runner-selftest | scripts/codec_smoke_runner_selftest.sh — recall test for the verdict of |
-| `convert_silero_vad.py` | none | Convert Silero VAD v4 ONNX weights (16kHz branch only) to safetensors. |
+| `convert_silero_vad.py` | by hand | Convert Silero VAD v4 ONNX weights (16kHz branch only) to safetensors. |
 | `eval_lock_stress.sh` | make eval-lock-stress | Drive the evaluation-lock reproducer across fresh processes; a non-zero exit or timeout fails. |
 | `gen_lloyd_codebook.py` | none | Generate Lloyd-Max optimal N(0,1) centroids for TurboQuant codebook. |
 | `gpu_capture.sh` | make profile-gputrace | Capture a Metal GPU trace of a bounded window of steady-state decode, for |
@@ -91,7 +91,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `spec_bench_published_selftest.sh` | make ci, make spec-bench-published-selftest | Mutation check for spec_bench_published.sh: a stub server, asserting exit codes and refusals. |
 | `spec_bench_selftest.sh` | make ci, make spec-bench-selftest | Mutation check for spec_bench.sh: a stub rmlx server, asserting recorded values and refusals. |
 | `spec_broken_engine.sh` | none | Run the answer-equivalence gate against a deliberately broken round loop. |
-| `spec_round_stream_compare.py` | spec_round_stream_compare_selftest.sh | Compare two speculative per-round event-stream captures, or hold one to the pinned manifest. |
+| `spec_round_stream_compare.py` | crates/rmlx-models/tests/spec_greedy_equivalence.rs, spec_round_stream_compare_selftest.sh | Compare two speculative per-round event-stream captures, or hold one to the pinned manifest. |
 | `spec_round_stream_compare_selftest.sh` | make ci, make spec-round-stream-selftest | Recall test for spec_round_stream_compare.py verify: synthetic captures, asserting the exit code. |
 | `ssd_canary.sh` | make ssd-canary, ssd_canary_selftest.sh | ssd_canary.sh — end-to-end long-session SSD prompt-cache tier canary. |
 | `ssd_canary_selftest.sh` | make ci, make ssd-canary-selftest | Recall test for ssd_canary.sh and its make targets, against a stub rmlx and a stub HTTP server. |
@@ -125,14 +125,14 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
-| `lib/awk_text.sh` | check_gpu_device_census.sh, check_named_skip_notices.sh, check_spec_charge.sh, +2 more scripts | Line readers for Rust-scanning gates: code without comments, without string bodies, bodiless fns. |
+| `lib/awk_text.sh` | crates/rmlx-models/tests/common/stop_scan.rs, check_gpu_device_census.sh, check_named_skip_notices.sh, check_spec_charge.sh, +2 more scripts | Line readers for Rust-scanning gates: code without comments, without string bodies, bodiless fns. |
 | `lib/bench_server.sh` | perf_canary.sh, spec_bench.sh, spec_bench_published.sh | Start, wait for and identify one rmlx server, for bench harnesses; source it. |
 | `lib/binary_identity.py` | spec_bench_published.sh | Say which binary a bench run measured, and prove it can produce the readings. |
 | `lib/busiest_between.awk` | bench_llama_ab.sh, perf_ab.sh, perf_ab_selftest.sh, +2 more scripts | Which process burned the most CPU between two cpu_snapshot files. |
 | `lib/cpu_snapshot.sh` | bench_llama_ab.sh, perf_ab.sh, perf_ab_selftest.sh, +2 more scripts | Per-process cumulative CPU seconds, for interference gates; source it. |
 | `lib/identity.sh` | bench_cache_types.sh, bench_cell.sh, perf-iter/bench_decode_tps.sh, +5 more scripts | Shared §8.5 run-identity for rMLX bench scripts. |
 | `lib/kv_boundary_default.py` | ingest/codec_inertness_ingest.py, ingest/perf_ab_ingest.py | The engine's default KV boundary-layer counts, read from the engine. |
-| `lib/mlx_pin.sh` | mlx_preflight.sh, mlx_restore_pin.sh | Read the validated MLX / mlx-c pair from its one declaration. |
+| `lib/mlx_pin.sh` | crates/rmlx-mlx/src/pin_tests.rs, mlx_preflight.sh, mlx_restore_pin.sh | Read the validated MLX / mlx-c pair from its one declaration. |
 | `lib/prefill_ms.py` | mst_capture.sh | Read the prefill time of an rmlx run out of its log: `generate: prefill{prefill_ms}`. |
 | `lib/published_aggregate.py` | spec_bench_published.sh, spec_bench_published_selftest.sh | Assemble and summarise a published-protocol speculative-decoding run. |
 | `lib/published_fixed_prompt.py` | spec_bench_published.sh | Fit the published protocol's fixed-length prompt against a live server. |
@@ -147,7 +147,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `lib/selftest_support.sh` | bench_llama_ab_selftest.sh, check_claim_bypass_selftest.sh, check_gpu_device_census_selftest.sh, +9 more scripts | The case runner and shims the self-tests share; source it. |
 | `lib/server_decode_tps.py` | perf-iter/bench_decode_tps.sh, spec_bench.sh | Read one request's decode rate off a running rmlx server. |
 | `lib/server_kv_quant.py` | lib/bench_server.sh, lib/binary_identity.py, perf_canary.sh, +1 more scripts | Read the KV codec a run resolved out of its rmlx run log. |
-| `lib/server_sampling.py` | lib/published_run_log.py, spec_bench.sh | Read whether a run's requests were sampled, out of its rmlx run log. |
+| `lib/server_sampling.py` | crates/rmlx-server/src/engine/sampler_event_tests.rs, lib/published_run_log.py, spec_bench.sh | Read whether a run's requests were sampled, out of its rmlx run log. |
 | `lib/skip_notice_patterns.sh` | check_named_skip_notices.sh, run_gpu_tests.sh | The SKIP and WAIVED stand-down notice patterns, defined once for the runner and the gate. |
 | `lib/snapshot_identity.py` | ingest/codec_inertness_ingest.py, ingest/llama_bench_ingest.py, lib/published_table.py, +2 more scripts | Read a model snapshot's identity columns out of the snapshot itself. |
 | `lib/snapshot_sampling.py` | spec_bench_published.sh | Read the sampling defaults a snapshot states, for a run that sends none. |
@@ -200,8 +200,10 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `report/rust_scan.py` | report/debt_report.py, report/kv_census.py | Rust source reader for the report tools: enums, `match` arms and `fn` bodies. |
 | `report/scripts_gate.py` | report/debt_report.py | The rules for scripts/ and the generated scripts/INDEX.md. |
 | `report/scripts_gate_callers.py` | report/scripts_gate.py, report/scripts_gate_rules.py | The derived caller of each file and the INDEX.md built from it. |
-| `report/scripts_gate_files.py` | report/scripts_gate.py, report/scripts_gate_callers.py, report/scripts_gate_rules.py | The population of scripts/ and the header each file carries. |
+| `report/scripts_gate_external.py` | report/scripts_gate.py, report/scripts_gate_callers.py, report/scripts_gate_rules.py | Callers of scripts/ that are not scripts: hosted CI steps, pre-commit hooks, Rust sources. |
+| `report/scripts_gate_files.py` | report/scripts_gate.py, report/scripts_gate_callers.py, report/scripts_gate_external.py, +2 more scripts | The population of scripts/ and the header each file carries. |
 | `report/scripts_gate_pins.txt` | report/scripts_gate.py, report/scripts_gate_selftest.sh | Accepted violations of the scripts/ rules, one `<rule> <path>` per line; a pin only shrinks. |
-| `report/scripts_gate_rules.py` | report/scripts_gate.py | The per-file rules of the scripts gate and their registry. |
+| `report/scripts_gate_rules.py` | report/scripts_gate.py, report/scripts_gate_structure.py | The per-file rules of the scripts gate and their registry. |
 | `report/scripts_gate_selftest.sh` | make check-scripts-selftest, make ci | Recall test for debt_report.py --scripts: planted trees, asserting exit code and rule:file:line. |
-| `report/scripts_gate_text.py` | report/scripts_gate_callers.py, report/scripts_gate_rules.py | Readers of script text: shell, Python and Makefile source. |
+| `report/scripts_gate_structure.py` | report/scripts_gate.py | Structural rules of the scripts gate: recall tests, lib/, modules, shebang, exec bit, dead paths. |
+| `report/scripts_gate_text.py` | report/scripts_gate_callers.py, report/scripts_gate_rules.py, report/scripts_gate_structure.py | Readers of script text: shell, Python and Makefile source. |

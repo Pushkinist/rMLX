@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Say which binary a bench run measured, and prove it can produce the readings.
 
 A digest alone answers "is this the same file as last time". It does not answer

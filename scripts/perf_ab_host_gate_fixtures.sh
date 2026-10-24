@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Recall test for the perf_ab.sh boundary: --synthetic-arms gives the same verdict on any host.
 #
+# Recall test for: perf_ab.sh --synthetic-arms
+#
 # WHY THIS EXISTS
 #
 # `perf_ab.sh` refuses to measure on a host it does not have to itself: a

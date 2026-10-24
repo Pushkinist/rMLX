@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Assemble and summarise a published-protocol speculative-decoding run.
 
 Two subcommands, one row schema:

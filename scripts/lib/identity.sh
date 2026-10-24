@@ -1,4 +1,3 @@
-#!/usr/bin/env bash
 # Shared §8.5 run-identity for rMLX bench scripts.
 #
 # Asks the binary that is actually being measured who it is, and exports the

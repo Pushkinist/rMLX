@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Render one request payload per checked-in sample, and index them.
 
 A cell is a `<dataset>:<max output tokens>` pair, and the protocol measures four

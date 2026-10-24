@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Recall test for mlx_restore_pin.sh: throwaway prefixes, stub brew, asserting exit and records.
 #
+# Recall test for: mlx_restore_pin.sh
+#
 #     bash scripts/mlx_restore_pin_selftest.sh [<script under test>]
 #
 # Each case builds a throwaway Homebrew prefix, a durable store and a repo tree

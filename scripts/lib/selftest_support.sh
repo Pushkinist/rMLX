@@ -1,4 +1,3 @@
-#!/usr/bin/env bash
 # The case runner and shims the self-tests share; source it.
 #
 # The case runner (st_*) counts cases and prints one summary line. A harness

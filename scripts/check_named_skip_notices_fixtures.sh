@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Recall test for check_named_skip_notices.sh: planted notice shapes, asserting the reason.
 #
+# Recall test for: check_named_skip_notices.sh
+#
 # WHY
 #   The gate it tests is a text scan, and a text scan that stops matching says
 #   exactly what a clean tree says. Every case below plants ONE shape and asserts

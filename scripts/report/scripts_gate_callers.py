@@ -12,61 +12,110 @@ import itertools
 import os
 import re
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from scripts_gate_external import PRE_COMMIT_LABEL, External
 from scripts_gate_files import INDEX, Script, Violation
 from scripts_gate_text import Refs, clean_shell, make_recipes, make_refs, python_refs, shell_refs
 
 CALLERS_SHOWN = 3
+MAKE_SITE = "make:"
 
 
 @dataclass
 class Callers:
+    """Who uses a file. `run_by` holds the sites that run it, as `make:<target>`,
+    a script's path or the label of a non-script caller."""
+
     targets: set[str] = field(default_factory=set)
     scripts: set[str] = field(default_factory=set)
-    runs: bool = False
+    others: set[str] = field(default_factory=set)
+    run_by: set[str] = field(default_factory=set)
 
     def __bool__(self) -> bool:
-        return bool(self.targets or self.scripts)
+        return bool(self.targets or self.scripts or self.others)
+
+    @property
+    def runs(self) -> bool:
+        return bool(self.run_by)
 
 
+class Resolver:
+    """The file of the tree a word names: its base name when that is unique,
+    else its path."""
 
-def derive_callers(files: list[Script], makefile: str) -> dict[str, Callers]:
-    by_base: dict[str, list[Script]] = defaultdict(list)
-    for f in files:
-        by_base[os.path.basename(f.rel)].append(f)
+    def __init__(self, files: list[Script]) -> None:
+        self.by_base: dict[str, list[Script]] = defaultdict(list)
+        for f in files:
+            self.by_base[os.path.basename(f.rel)].append(f)
+
+    def find(self, word: str, code: bool) -> list[Script]:
+        if not word or any(ch.isspace() for ch in word):
+            return []
+        candidates = self.by_base.get(os.path.basename(word), [])
+        return [
+            f
+            for f in candidates
+            if f.is_code == code and (len(candidates) == 1 or word == f.rel or word.endswith("/" + f.rel))
+        ]
+
+
+def derive_callers(
+    files: list[Script], resolver: Resolver, makefile: str, external: External | None = None
+) -> dict[str, Callers]:
     callers = {f.rel: Callers() for f in files}
 
-    def credit(refs: Refs, who: str, is_target: bool) -> None:
+    def credit(refs: Refs, who: str, kind: str) -> None:
         for words, want_code, runs in (
             (refs.run, True, True),
             (refs.source, True, False),
             (refs.anywhere, False, False),
         ):
             for word in words:
-                if not word or any(ch.isspace() for ch in word):
-                    continue
-                candidates = by_base.get(os.path.basename(word), [])
-                for f in candidates:
-                    if f.is_code != want_code or f.rel == who:
-                        continue
-                    if len(candidates) == 1 or word == f.rel or word.endswith("/" + f.rel):
-                        (callers[f.rel].targets if is_target else callers[f.rel].scripts).add(who)
-                        callers[f.rel].runs = callers[f.rel].runs or runs
+                for f in resolver.find(word, want_code):
+                    if f.rel != who:
+                        mark(callers[f.rel], who, kind, runs)
 
     for f in files:
         if f.rel.endswith(".sh"):
-            credit(shell_refs(clean_shell(f.text, False, True)), f.rel, False)
+            credit(shell_refs(clean_shell(f.text, False, True)), f.rel, "script")
         elif f.rel.endswith(".py"):
-            credit(python_refs(f.text), f.rel, False)
+            credit(python_refs(f.text), f.rel, "script")
     for target, recipe in make_recipes(makefile).items():
-        credit(make_refs(recipe), target, True)
+        credit(make_refs(recipe), target, "target")
+    if external is not None:
+        credit_external(external, callers, credit)
     return callers
+
+
+def mark(callers: Callers, who: str, kind: str, runs: bool) -> None:
+    if kind == "target":
+        callers.targets.add(who)
+    elif kind == "script":
+        callers.scripts.add(who)
+    else:
+        callers.others.add(who)
+    if runs:
+        callers.run_by.add(MAKE_SITE + who if kind == "target" else who)
+
+
+def credit_external(external: External, callers: dict[str, Callers], credit: Callable[[Refs, str, str], None]) -> None:
+    """Workflow run steps and pre-commit entries are shell; a crate credits the
+    scripts/ path a string literal of its sources names."""
+    for label, lines in external.workflows.items():
+        credit(shell_refs(clean_shell("\n".join(lines), False, True)), label, "other")
+    credit(shell_refs(clean_shell("\n".join(external.pre_commit), False, True)), PRE_COMMIT_LABEL, "other")
+    for path, literals in external.crates.items():
+        for literal in literals:
+            if literal.rel in callers:
+                mark(callers[literal.rel], path, "other", literal.runs)
 
 
 def caller_cell(f: Script, callers: Callers) -> str:
     parts = [f"make {t}" for t in sorted(callers.targets)]
+    parts += sorted(callers.others)
     scripts = sorted(callers.scripts)
     parts += scripts[:CALLERS_SHOWN]
     if len(scripts) > CALLERS_SHOWN:

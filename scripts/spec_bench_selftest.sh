@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Mutation check for spec_bench.sh: a stub rmlx server, asserting recorded values and refusals.
 #
+# Recall test for: spec_bench.sh
+#
 # WHY THIS EXISTS
 #
 # spec_bench.sh writes permanent rows into the append-only metrics store, and

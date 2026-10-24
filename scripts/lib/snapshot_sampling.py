@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Read the sampling defaults a snapshot states, for a run that sends none.
 
 The published protocol measures a checkpoint under its own sampling, and the way

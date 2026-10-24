@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Render published-protocol runs as the Markdown table a post needs.
 
 Reads one `spec_bench_published.sh` result file per engine mode — plain, and

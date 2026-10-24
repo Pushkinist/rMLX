@@ -32,6 +32,7 @@ INTERPRETERS = frozenset(
 SOURCING = frozenset({"source", "."})
 OPTIONS_WITH_VALUE = frozenset({"-u", "-C", "-s"})
 PROSE_COMMANDS = frozenset({"echo", "printf"})
+SUBPROCESS_CALLS = frozenset({"run", "check_output", "check_call", "call", "Popen"})
 
 
 def clean_shell(text: str, blank_strings: bool, join: bool = False) -> list[str]:
@@ -373,14 +374,55 @@ def shell_refs(lines: list[str]) -> Refs:
     return refs
 
 
+def bound_strings(tree: ast.AST) -> dict[str, set[str]]:
+    """Name -> the string constants of every value assigned to it, the names
+    inside a value resolved through the assignments of those names."""
+    direct: dict[str, set[str]] = defaultdict(set)
+    uses: dict[str, set[str]] = defaultdict(set)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets = [t for t in node.targets if isinstance(t, ast.Name)]
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value:
+            targets = [node.target]
+        else:
+            continue
+        for target in targets:
+            for sub in ast.walk(node.value):
+                if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                    direct[target.id].add(sub.value)
+                elif isinstance(sub, ast.Name):
+                    uses[target.id].add(sub.id)
+    changed = True
+    while changed:
+        changed = False
+        for name, used in uses.items():
+            for other in used:
+                if not direct[other] <= direct[name]:
+                    direct[name] |= direct[other]
+                    changed = True
+    return direct
+
+
+def subprocess_names(tree: ast.AST) -> set[str]:
+    """The local names `from subprocess import ...` binds to a process call."""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "subprocess" and node.level == 0:
+            names.update(a.asname or a.name for a in node.names if a.name in SUBPROCESS_CALLS)
+    return names
+
+
 def python_refs(text: str) -> Refs:
-    """What a Python file imports, runs (a command vector passed to a call) and
+    """What a Python file imports, runs (a command vector passed to a call, or a
+    name bound to a path and passed as the program of a `subprocess` call) and
     mentions (any string constant)."""
     refs = Refs()
     try:
         tree = ast.parse(text)
     except SyntaxError:
         return refs
+    bound = bound_strings(tree)
+    local_calls = subprocess_names(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             for arg in [*node.args, *(keyword.value for keyword in node.keywords)]:
@@ -388,6 +430,13 @@ def python_refs(text: str) -> Refs:
                     refs.run.update(
                         e.value for e in arg.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)
                     )
+            program = node.args[0] if node.args else None
+            if program is not None and is_subprocess_call(node.func, local_calls):
+                for sub in ast.walk(program):
+                    if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                        refs.run.add(sub.value)
+                    elif isinstance(sub, ast.Name):
+                        refs.run.update(bound.get(sub.id, ()))
         elif isinstance(node, ast.Import):
             refs.source.update(alias.name.split(".")[0] + ".py" for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
@@ -397,8 +446,16 @@ def python_refs(text: str) -> Refs:
     return refs
 
 
-def make_recipes(text: str) -> dict[str, list[str]]:
-    """Target name -> recipe lines, comments and continuations resolved."""
+def is_subprocess_call(func: ast.expr, local_calls: set[str]) -> bool:
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        return func.value.id == "subprocess" and func.attr in SUBPROCESS_CALLS
+    return isinstance(func, ast.Name) and func.id in local_calls
+
+
+def make_rules(text: str) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """(target -> recipe lines, target -> prerequisites). Comments and
+    continuations are resolved; a prerequisite that holds a variable or a
+    pattern is dropped."""
     logical: list[tuple[bool, str]] = []
     held = ""
     for raw in text.split("\n"):
@@ -409,6 +466,7 @@ def make_recipes(text: str) -> dict[str, list[str]]:
         held = ""
         logical.append((line.startswith("\t"), line))
     recipes: dict[str, list[str]] = defaultdict(list)
+    prerequisites: dict[str, list[str]] = defaultdict(list)
     current: list[str] = []
     for is_recipe, line in logical:
         if is_recipe:
@@ -421,9 +479,18 @@ def make_recipes(text: str) -> dict[str, list[str]]:
         found = RULE_RE.match(line)
         if found and "$(" not in found.group(1):
             current = [t for t in found.group(1).split() if not t.startswith(".") and "%" not in t]
+            after = line[found.end() :].split("#", 1)[0]
+            needs = [w for w in after.split() if w != "|" and not any(ch in w for ch in "$%=")]
+            for target in current:
+                prerequisites[target].extend(needs)
         else:
             current = []
-    return recipes
+    return recipes, prerequisites
+
+
+def make_recipes(text: str) -> dict[str, list[str]]:
+    """Target name -> recipe lines, comments and continuations resolved."""
+    return make_rules(text)[0]
 
 
 def make_refs(lines: list[str]) -> Refs:

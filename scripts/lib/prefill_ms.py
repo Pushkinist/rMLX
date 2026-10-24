@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Read the prefill time of an rmlx run out of its log: `generate: prefill{prefill_ms}`.
 
 Nothing in a Metal System Trace marks where prefill ends: weight load submits no

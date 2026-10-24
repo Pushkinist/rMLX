@@ -1,4 +1,3 @@
-#!/usr/bin/env bash
 # Line readers for Rust-scanning gates: code without comments, without string bodies, bodiless fns.
 #
 # Sourced, not executed.

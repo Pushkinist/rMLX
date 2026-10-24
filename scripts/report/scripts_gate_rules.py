@@ -11,7 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from scripts_gate_callers import Callers
+from scripts_gate_callers import Callers, Resolver
+from scripts_gate_external import External
 from scripts_gate_files import Script, Violation, named_file
 from scripts_gate_text import declared_exit_codes, python_literal_exits, shell_literal_exits
 
@@ -53,10 +54,17 @@ class Context:
     callers: dict[str, Callers]
     added: set[str]
     entries: set[str]
+    makefile: str
+    external: External
+    resolver: Resolver
 
     @property
     def rels(self) -> set[str]:
         return {f.rel for f in self.files}
+
+    @property
+    def by_rel(self) -> dict[str, Script]:
+        return {f.rel: f for f in self.files}
 
 
 def rule_class(ctx: Context) -> list[Violation]:

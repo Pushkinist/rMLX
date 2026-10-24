@@ -1,4 +1,3 @@
-#!/usr/bin/env bash
 # Per-process cumulative CPU seconds, for interference gates; source it.
 #
 # Defines `cpu_snapshot`, and `snapshot_ok` and `window_not_sampled`, which both

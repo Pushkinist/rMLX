@@ -68,10 +68,20 @@ here. [review]
   [gate, next]
 * A module used by one tool lives beside it, has no shebang and no exec bit,
   and its header says `Module of: <class>/<tool>`. A file with that line is not
-  an entry point. [gate, next: the tool exists and imports or runs it]
-* `lib/` holds a file only when two or more files use it, or one script and a
-  Rust test; a helper of one `lib/` file sits beside it with
-  `Module of: lib/<file>`. No make recipe runs a `lib/` file. [gate, next]
+  an entry point. The tool must exist, not be the file itself, and reach it: run,
+  source or import it, or do so through modules that do. [gate: `module-of`;
+  `shebang` and `exec-bit` for the bits]
+* `lib/` holds a file only when two or more different files use it: scripts that
+  source, import, run or read it, or `crates/` sources that name it in a string
+  literal. A recall test counts only for `lib/selftest_support.sh`. A file with
+  one user carries `Module of: <that user>` and is not counted. [gate:
+  `lib-consumers`]
+* `lib/` is sourced or imported, never run: no recipe, script, workflow or
+  crate runs a file in it. A crate runs one when its path is the argument of
+  `Command::new(`; any other string literal that names it only reads it. [gate:
+  `lib-run`]
+* A `.sh` or `.py` file outside `lib/` with no shebang that nothing runs,
+  sources or imports is an orphan: no other rule sees it. [gate: `orphan`]
 * A name does not repeat its directory (`check/eval_lock.sh`, not
   `check/check_eval_lock.sh`). [review]
 
@@ -106,12 +116,22 @@ comment):
   is not a run). A `VAR=path` assignment counts only where the same file later
   puts `$VAR` in command position, as the command, behind a wrapper such as
   `bash`, `env` or `timeout`, as the first argument of `st_run`, or after the
-  `--` of `st_case`. A Python file runs a file only through a command vector
-  passed to a call, or imports a module. Write `Caller: by hand` only when
-  nothing runs the file; the gate fails the line when something does.
-  [gate: `caller`, entry points]
-* A recall test names its subject: `Recall test for: <class>/<tool> [<mode>]`.
-  [gate, next]
+  `--` of `st_case`. A Python file runs a file through a command vector passed
+  to a call, or through a name bound to the path (a string, or `Path(__file__)`
+  arithmetic) and passed as the program of a `subprocess` call; a name that is
+  only printed is no caller. It imports a module with `import`. A hosted-CI
+  `run:` step and a pre-commit `entry:` are callers, shown as `ci.yml` and
+  `pre-commit`, and so is a `crates/` source whose string literal is the whole
+  path (`concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/lib/x.sh")`), shown
+  as the crate path; a path in a comment or inside a longer string is not.
+  Write `Caller: by hand` only when nothing runs the file; the gate fails the
+  line when something does. [gate: `caller`, entry points]
+* A recall test names its subject: `Recall test for: <tool> [<mode> ...]`, the
+  tool a path relative to `scripts/`, one line per tool. A mode is the first
+  argument of the line that runs the tool when that is a bare flag or word
+  (`--library`, `verify`), else `default`; a test that covers several modes lists
+  them. The tool must exist and not be the file itself, and each mode token must
+  occur in the tool's text. [gate: `recall-stale`]
 * Explanation may follow the block. It states why, not what, and names no
   ticket, plan or campaign (CLAUDE.md "Comments and identifiers"). [review]
 
@@ -140,8 +160,10 @@ comment):
 * No Python heredoc or `python3 -c` body longer than 20 lines in a `.sh`
   file; it becomes a `.py` file. [gate, next]
 * Shebang `#!/usr/bin/env bash` or `#!/usr/bin/env python3` matching the
-  extension; exec bit on every entry point, never on a module or `lib/` file.
-  [gate, next]
+  extension; exec bit on every entry point, never on a module or `lib/` file,
+  and no shebang on those. A `lib/` file that is run is judged as a `lib/` file.
+  The exec bit is the one git's index records; an untracked file's is the
+  file system's. [gate: `shebang`, `exec-bit`]
 * `set -euo pipefail`. A recall test or matrix driver that must go on after a
   failing case uses `set -uo pipefail` and says so in its header. [gate, next:
   mode; review: the reason]
@@ -172,9 +194,14 @@ A script that defines one of these again fails the gate (`lib-shadow`), and
 * No absolute machine path in a checked-in file; model snapshots resolve
   under `RMLX_O_MODELS_ROOT`, which the Makefile exports.
   [gate: `make check-personal-data`]
-* A `scripts/<path>` written in a script, the Makefile, a crate's
-  `concat!`/`join` path or a doc names a file that exists. [gate, next here;
-  `make check-doc-source-citations` for `crates/` paths in docs]
+* A `scripts/<path>` token in a script, the Makefile, a workflow,
+  `.pre-commit-config.yaml`, `CLAUDE.md`, `CONTRIBUTING.md`, the top-level
+  `README.md`, a doc under `docs/` or a `crates/` string literal names a file or
+  directory that git lists. A recall test is not read: it plants trees. A token
+  holding `*`, `<`, `{` or `$`, one followed by `(`, `[`, `?`, `\`, `+` or `|`
+  (a pattern), and a path git ignores (a produced file) are not checked.
+  `CHANGELOG.md` is not read. [gate: `dead-path`; `make
+  check-doc-source-citations` for `crates/` paths in docs]
 
 ## 8. Processes and the Metal claim
 
@@ -189,7 +216,10 @@ the claim file. [gate: `make check-claim-bypass`, tree-wide]
   changes its recipe. [review]
 * Every mode of a tool that `make ci` runs has a recall test declared with
   `Recall test for:`, run by `make ci`, asserting the exit code and the reason.
-  [gate, next]
+  What `make ci` runs is its recipe, its prerequisites and every `$(MAKE)
+  <target>` line it or they hold, recursively. A recipe line that ends in
+  `|| true` gates nothing and asks for no recall test; a tool that is itself a
+  recall test asks for none. [gate: `recall-missing`]
 * A recall test never sources its gate, and a gate never sources the case
   runner. [review]
 
@@ -207,19 +237,40 @@ every violation of that rule in that file and can only shrink. [gate]
 * Fixing a file without deleting its line fails (`pin-stale`); so does a pin
   for a file that is gone or a rule that cannot be pinned. A line written twice
   fails (`pin-dup`).
-* Only `class`, `purpose`, `usage`, `exit-undeclared` and `caller` can be
-  pinned. The line `# pinnable: <rule> ...` lists them and must equal the
-  gate's set (`pin-header`); `index-stale`, `not-a-mode`, `not-a-mode-stale`
-  and every `pin-*` rule never can.
-* An `exit-undeclared` pin carries the codes the file leaves undeclared,
-  `exit-undeclared <path> <c1,c2>`. A code outside the set fails
-  `exit-undeclared`; a code in the set that is now declared or gone fails
-  `pin-stale`.
+* Only `class`, `purpose`, `usage`, `exit-undeclared`, `caller`,
+  `recall-missing`, `lib-consumers`, `lib-run`, `shebang`, `exec-bit` and
+  `dead-path` can be pinned. The line `# pinnable: <rule> ...` lists them and
+  must equal the gate's set (`pin-header`); `index-stale`, `not-a-mode`,
+  `not-a-mode-stale`, `recall-stale`, `module-of`, `orphan` and every `pin-*`
+  rule never can.
+* A rule whose violation is a set pins the set: `exit-undeclared <path>
+  <codes>`, `recall-missing <path> <modes>`, `lib-run <path> <sites>` (a site is
+  `make:<target>`, a script, `ci.yml`, `pre-commit` or a crate path) and
+  `dead-path <path> <tokens>` (the token is the part after `scripts/`; a path
+  outside `scripts/` is written `../<path>`). A member outside the set fails the
+  rule; a member of the set that is fixed or gone fails `pin-stale`.
 * A pin the base does not have, for a rule the base's `# pinnable:` line lists,
-  fails (`pin-new`); so does a code the base's pin for that file lacks. A moved
-  file keeps its pin when the pin line moves with it. A rule the base does not
-  list is new and may seed pins.
+  fails (`pin-new`); so does a set member the base's pin for that file lacks. A
+  moved file keeps its pin when the pin line moves with it. A rule the base does
+  not list is new and may seed pins.
 * While the base has no pin list, the run prints `pins: <base> has no pin list;
   growth not checked` and `pin-new` has nothing to compare with. Until the pin
   list lands on `main`, the recall test holds the per-rule counts as literals,
   so a chunk that shrinks a pin lowers its literal and growth shows in the diff.
+
+## 12. What the gate cannot see
+
+* That a purpose line is true, that a `Not a mode of:` reason is, that a
+  `Caller: by hand` file is repeated work, and that a recall test asserts the
+  reason as well as the exit code.
+* An exit code that is not a literal: `return N` from a Python `main()`, and a
+  helper whose code is a positional parameter (`fail() { exit "$1"; }` then
+  `fail 9`). No file in the tree uses the second form today; a new one hides
+  its exits from `exit-undeclared`.
+* A script run through a path the gate cannot read: an interpreter held in a
+  variable, `python3 -m`, a Rust path built from `.join("scripts").join(..)`
+  pieces or passed through a variable, a shell path assembled from fragments.
+  A file only such a path runs reads as having no caller, which fails closed.
+* A mode that is not the first argument of its line, a first argument that is a
+  bare word and no mode (`bash scripts/foo.sh all` reads as mode `all`), and a
+  tool whose recall test covers a mode by running it without naming it.

@@ -9,7 +9,8 @@ prints as `<rule>: <path>:<line>: <detail>`, the path relative to `scripts/`.
 
 Each rule is a function over the population that yields violations. A pin is a
 `<rule> <path>` line in `report/scripts_gate_pins.txt` and accepts every
-violation of that rule in that file (an `exit-undeclared` pin lists the codes).
+violation of that rule in that file (a rule whose violation is a set, listed
+in `SET_NOUNS`, pins the set: `exit-undeclared <path> <codes>`).
 Pins only shrink: a pin whose file now passes is a violation (`pin-stale`), and
 a pin the base lacks, for a rule the base's `# pinnable:` line lists, is one too
 (`pin-new`). Only the rules in `PINNABLE` can be pinned.
@@ -19,19 +20,27 @@ Definitions the rules share:
 * An entry point is a `.sh` or `.py` file that is run: it starts with a shebang
   outside `lib/`, or a recipe or a script runs it (not sources or imports it).
   A file whose `Module of:` names another file of the tree is not one.
+* The run of `make ci` is the closure of the `ci` target: its recipe lines, its
+  prerequisites and every `$(MAKE) <target>` line, recursively. A mode of a tool
+  is the first argument of the recipe line when it is a bare flag or word, else
+  `default`.
 * The header is the leading comment block (Python: the module docstring;
   `.entitlements`: the first XML comment). Its first line, directly after the
   shebang, is the purpose; `Usage:`, `Exit:`, `Caller:`, `Recall test for:`,
   `Module of:`, `Not a mode of:` and `LOC-exempt:` start a field that runs to
   the next blank line or field.
 * A caller is a Makefile target whose recipe, or another script that, runs or
-  sources the file; a Python import of the module counts. A data file has a
-  reader instead, and any non-comment mention counts.
+  sources the file; a Python import of the module counts, and so does a name
+  bound to its path and passed as the program of a `subprocess` call. A hosted-CI
+  run step, a pre-commit entry and a `crates/` string literal that is the whole
+  path are callers too. A data file has a reader instead, and any non-comment
+  mention counts.
 * A new file is one absent at the base, a moved file (`git mv`) excepted.
 
 Not checked, by design: that a purpose line is true, that a `Not a mode of:`
-reason is, and a `return N` from a Python `main()` (only `sys.exit(N)`,
-`exit(N)` and `SystemExit(N)` are literal exits).
+reason is, a `return N` from a Python `main()` (only `sys.exit(N)`, `exit(N)`
+and `SystemExit(N)` are literal exits), and an exit through a helper that takes
+its code as a parameter. `scripts/README.md` section 12 lists the rest.
 """
 
 from __future__ import annotations
@@ -41,12 +50,32 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from scripts_gate_callers import derive_callers, index_violations, render_index
+from scripts_gate_callers import Resolver, derive_callers, index_violations, render_index
+from scripts_gate_external import load_external
 from scripts_gate_files import INDEX, Unavailable, Violation, git, git_ok, load_population
 from scripts_gate_rules import RULE_FUNCTIONS, Context, entry_points
+from scripts_gate_structure import STRUCTURE_RULES
 
 PINS = "report/scripts_gate_pins.txt"
-PINNABLE = ("class", "purpose", "usage", "exit-undeclared", "caller")
+PINNABLE = (
+    "class",
+    "purpose",
+    "usage",
+    "exit-undeclared",
+    "caller",
+    "recall-missing",
+    "lib-consumers",
+    "lib-run",
+    "shebang",
+    "exec-bit",
+    "dead-path",
+)
+SET_NOUNS = {
+    "exit-undeclared": "code",
+    "recall-missing": "mode",
+    "lib-run": "site",
+    "dead-path": "token",
+}
 PINS_HEADER = "pinnable:"
 
 
@@ -100,8 +129,9 @@ class PinList:
 
 
 def parse_pins(text: str) -> PinList:
-    """`<rule> <path>` per line; `exit-undeclared` adds its undeclared codes as
-    `<c1,c2>`; `# pinnable: <rule> ...` names the rules a pin may be added for."""
+    """`<rule> <path>` per line; a rule in `SET_NOUNS` adds the members it
+    accepts as `<a,b>`; `# pinnable: <rule> ...` names the rules a pin may be
+    added for."""
     out = PinList(exists=True)
     for number, raw in enumerate(text.split("\n"), 1):
         line = raw.strip()
@@ -148,10 +178,10 @@ def apply_pins(found: list[Violation], pins: PinList) -> tuple[list[Violation], 
         if pin is None or key[0] not in PINNABLE:
             active += violations
             continue
-        if key[0] == "exit-undeclared":
+        if key[0] in SET_NOUNS:
             active += [v for v in violations if v.key not in pin.codes]
-            for code in sorted(pin.codes - {v.key for v in violations}):
-                detail = f"{key[0]} {key[1]}: code {code} is declared or gone; delete it from the pin"
+            for member in sorted(pin.codes - {v.key for v in violations}):
+                detail = f"{key[0]} {key[1]}: {SET_NOUNS[key[0]]} {member} is fixed or gone; delete it from the pin"
                 active.append(Violation("pin-stale", PINS, pin.line, detail))
         held[key] = pin
     for key, pin in pins.pins.items():
@@ -181,8 +211,9 @@ def pin_growth(
         if old is None:
             out.append(Violation("pin-new", PINS, pin.line, f"{rule} {path} is not pinned at the base"))
             continue
-        for code in sorted(pin.codes - old.codes):
-            out.append(Violation("pin-new", PINS, pin.line, f"{rule} {path}: code {code} is not pinned at the base"))
+        for member in sorted(pin.codes - old.codes):
+            detail = f"{rule} {path}: {SET_NOUNS.get(rule, 'member')} {member} is not pinned at the base"
+            out.append(Violation("pin-new", PINS, pin.line, detail))
     return out, ""
 
 
@@ -200,16 +231,19 @@ def check(root: Path, base: str | None, write_index: bool) -> int:
     files = load_population(root)
     name, sha = resolve_base(root, base)
     makefile = root / "Makefile"
-    callers = derive_callers(files, makefile.read_text(encoding="utf-8") if makefile.is_file() else "")
+    makefile_text = makefile.read_text(encoding="utf-8") if makefile.is_file() else ""
+    external = load_external(root)
+    resolver = Resolver(files)
+    callers = derive_callers(files, resolver, makefile_text, external)
     expected = render_index(files, callers)
     if write_index:
         (root / "scripts" / INDEX).write_text(expected, encoding="utf-8")
         print(f"scripts-index: wrote scripts/{INDEX} ({len(files)} rows)")
     print(f"check-scripts: base {name} ({sha[:12]})")
     added, renames = changes_since(root, sha)
-    ctx = Context(root, files, callers, added, entry_points(files, callers))
+    ctx = Context(root, files, callers, added, entry_points(files, callers), makefile_text, external, resolver)
     found: list[Violation] = []
-    for _name, rule in RULE_FUNCTIONS:
+    for _name, rule in (*RULE_FUNCTIONS, *STRUCTURE_RULES):
         found += sorted(rule(ctx), key=lambda v: (v.path, v.line))
     pins = load_pins(root)
     active, held = apply_pins(found, pins)

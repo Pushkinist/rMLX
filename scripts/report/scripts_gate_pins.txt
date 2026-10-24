@@ -4,7 +4,7 @@
 # line: a pin whose file now passes fails the gate (`pin-stale`). An `exit-undeclared`
 # pin lists the codes the file leaves undeclared. Never pin a new file or a new code.
 #
-# pinnable: class purpose usage exit-undeclared caller
+# pinnable: class purpose usage exit-undeclared caller recall-missing lib-consumers lib-run shebang exec-bit dead-path
 class aggregate_decode_profile.py
 class bench-records-sweep.sh
 class bench_cache_types.sh
@@ -190,7 +190,6 @@ usage release/sign_artifact.sh
 usage run_gpu_tests.sh
 usage run_gpu_tests_selftest.sh
 usage schema_constraint_canary.sh
-usage sdpa_headdim_bench.py
 usage spec_bench_published_selftest.sh
 usage spec_bench_selftest.sh
 usage spec_broken_engine.sh
@@ -298,3 +297,53 @@ caller release/changelog_section.sh
 caller release_e2e/stage6_perf/niah_long_context.sh
 caller sdpa_headdim_bench.py
 caller spec_broken_engine.sh
+recall-missing bench_identity_selftest.sh default
+recall-missing bench_llama_ab_selftest.sh default
+recall-missing check_doc_source_citations.sh default
+recall-missing check_kv_boundary_default_parity.sh default
+recall-missing check_kv_layer_quants.sh default
+recall-missing check_metal_compiles.sh default
+recall-missing check_metal_format.sh default
+recall-missing check_no_decode_swallow.sh default
+recall-missing check_no_inline_tests.sh default
+recall-missing check_no_scalar_f32_leak.sh default
+recall-missing codec_smoke_runner_selftest.sh default
+recall-missing perf_ab_ingest_selftest.sh default
+recall-missing perf_ab_selftest.sh default
+recall-missing published_ingest_selftest.sh default
+lib-consumers lib/binary_identity.py
+lib-consumers lib/prefill_ms.py
+lib-consumers lib/published_aggregate.py
+lib-consumers lib/published_fixed_prompt.py
+lib-consumers lib/published_greedy.py
+lib-consumers lib/published_longctx.py
+lib-consumers lib/published_payloads.py
+lib-consumers lib/published_table.py
+lib-consumers lib/run_log_for_pid.py
+lib-consumers lib/snapshot_sampling.py
+lib-run lib/binary_identity.py spec_bench_published.sh
+lib-run lib/prefill_ms.py mst_capture.sh
+lib-run lib/published_aggregate.py spec_bench_published.sh,spec_bench_published_selftest.sh
+lib-run lib/published_fixed_prompt.py spec_bench_published.sh
+lib-run lib/published_fixed_run.py spec_bench_published.sh
+lib-run lib/published_greedy.py spec_bench_published.sh
+lib-run lib/published_longctx.py spec_bench_published.sh
+lib-run lib/published_payloads.py spec_bench_published.sh,spec_bench_published_selftest.sh
+lib-run lib/published_requery.py published_ingest_selftest.sh
+lib-run lib/published_run_log.py spec_bench_published.sh
+lib-run lib/published_table.py make:check-published-table,make:published-table,published_table_selftest.sh
+lib-run lib/run_log_for_pid.py lib/bench_server.sh
+lib-run lib/server_decode_tps.py perf-iter/bench_decode_tps.sh,spec_bench.sh
+lib-run lib/server_kv_quant.py lib/bench_server.sh,perf_canary.sh,ssd_canary.sh
+lib-run lib/server_sampling.py spec_bench.sh
+lib-run lib/snapshot_identity.py spec_bench.sh,spec_bench_published.sh
+lib-run lib/snapshot_sampling.py spec_bench_published.sh
+lib-run lib/spec_round_log.py spec_bench.sh
+lib-run lib/sse_decode_window.py spec_bench.sh,spec_bench_published.sh,spec_bench_selftest.sh
+shebang lib/snapshot_identity.py
+exec-bit bench_identity_selftest.sh
+exec-bit ingest/codec_inertness_ingest.py
+exec-bit ingest/published_ingest.py
+exec-bit perf_ceiling.py
+exec-bit published_ingest_selftest.sh
+dead-path perf_canary.sh regression_gate.sh

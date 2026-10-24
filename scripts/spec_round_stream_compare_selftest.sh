@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Recall test for spec_round_stream_compare.py verify: synthetic captures, asserting the exit code.
 #
+# Recall test for: spec_round_stream_compare.py verify
+#
 # Each case builds a synthetic capture of the 36 pinned cells, whose round
 # counts sum to the script's own TOTAL_ROUNDS, and asserts the literal exit code
 # and the line naming why. The last case holds the checked-in manifest to the

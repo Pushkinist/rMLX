@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Assemble one pass's fixed-length-prompt run.
 
 The published protocol's second figure is autoregressive output speed, input

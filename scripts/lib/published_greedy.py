@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Seal a greedy pass, and judge a speculative one against a plain one.
 
 The speed passes of the published protocol sample under the checkpoint's own

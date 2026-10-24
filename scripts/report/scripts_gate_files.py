@@ -10,6 +10,7 @@ yields and the git helpers the gate shares.
 from __future__ import annotations
 
 import ast
+import os
 import re
 import subprocess
 from dataclasses import dataclass
@@ -56,10 +57,15 @@ class Script:
     purpose: str
     wrap_line: int
     fields: dict[str, tuple[int, str]]
+    executable: bool = False
 
     @property
     def is_code(self) -> bool:
         return self.rel.endswith((".sh", ".py"))
+
+    @property
+    def shebang_line(self) -> str:
+        return self.text.split("\n", 1)[0] if self.shebang else ""
 
 
 def first_token(text: str) -> str:
@@ -166,7 +172,7 @@ def parse_fields(hlines: list[tuple[int, str]]) -> dict[str, tuple[int, str]]:
     return fields
 
 
-def load_script(root: Path, rel: str) -> Script:
+def load_script(root: Path, rel: str, executable: bool) -> Script:
     path = root / "scripts" / rel
     text = path.read_text(encoding="utf-8", errors="replace")
     shebang, hlines, missing_line = header_lines(rel, text)
@@ -178,23 +184,58 @@ def load_script(root: Path, rel: str) -> Script:
             if nxt.strip() and not NOT_WRAP_RE.match(nxt):
                 wrap_line = number
     return Script(
-        rel, text, shebang, purpose_line, purpose.strip(), wrap_line, parse_fields(hlines)
+        rel, text, shebang, purpose_line, purpose.strip(), wrap_line, parse_fields(hlines), executable
     )
 
 
-def load_population(root: Path) -> list[Script]:
+def index_modes(root: Path) -> dict[str, bool]:
+    """Path -> whether git's index records the executable bit, for tracked files."""
+    modes = {}
+    for entry in git(root, "ls-files", "--stage", "-z", "--", "scripts").split("\0"):
+        if "\t" in entry:
+            info, path = entry.split("\t", 1)
+            modes[path] = info.startswith("100755")
+    return modes
+
+
+def scripts_tree(root: Path) -> set[str]:
+    """Every file under `<root>/scripts/` git lists, relative to it: fixtures,
+    INDEX.md and README.md included."""
     listing = git(
         root, "ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", "scripts"
     )
     rels = set()
     for entry in listing.split("\0"):
-        if not entry.startswith("scripts/"):
-            continue
-        rel = entry[len("scripts/") :]
-        if rel.startswith("fixtures/") or rel in (INDEX, README):
-            continue
-        if (root / entry).is_file():
-            rels.add(rel)
+        if entry.startswith("scripts/") and (root / entry).is_file():
+            rels.add(entry[len("scripts/") :])
+    return rels
+
+
+def git_ignored(root: Path, paths: list[str]) -> set[str]:
+    """The paths among `paths` that git ignores."""
+    if not paths:
+        return set()
+    proc = subprocess.run(
+        ["git", "-C", str(root), "check-ignore", "-z", "--stdin"],
+        input="\0".join(paths),
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode not in (0, 1):
+        raise Unavailable(f"git check-ignore exit {proc.returncode}: {proc.stderr.strip()}")
+    return {p for p in proc.stdout.split("\0") if p}
+
+
+def load_population(root: Path) -> list[Script]:
+    rels = {
+        rel
+        for rel in scripts_tree(root)
+        if not rel.startswith("fixtures/") and rel not in (INDEX, README)
+    }
     if not rels:
         raise Unavailable("no file under scripts/ to check")
-    return [load_script(root, rel) for rel in sorted(rels)]
+    modes = index_modes(root)
+    return [
+        load_script(root, rel, modes.get(f"scripts/{rel}", os.access(root / "scripts" / rel, os.X_OK)))
+        for rel in sorted(rels)
+    ]

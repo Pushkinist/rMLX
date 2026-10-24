@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Read a speculative round loop's own numbers back out of an rmlx run log.
 
 Every speculative round loop closes a request with one

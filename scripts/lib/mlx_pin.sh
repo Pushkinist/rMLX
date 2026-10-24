@@ -1,4 +1,3 @@
-#!/usr/bin/env bash
 # Read the validated MLX / mlx-c pair from its one declaration.
 #
 #     REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"   # adjust depth per script

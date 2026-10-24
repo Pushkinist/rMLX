@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Fit the published protocol's fixed-length prompt against a live server.
 
 The protocol reports autoregressive output speed, input speed and resident

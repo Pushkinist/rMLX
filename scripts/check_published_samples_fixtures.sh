@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Recall test for published_samples.py verify: synthetic sample-set roots, one edit per case.
 #
+# Recall test for: published_samples.py verify
+#
 # WHY
 #   The verifier's whole job is to refuse. It reads a manifest, re-derives what
 #   the manifest claims, and reports agreement — which is exactly the shape of a
