@@ -6,12 +6,14 @@
 # was handed, and asserts what the script asked for or wrote:
 #
 #   - gpu_capture.sh and mst_capture.sh run `baseline --record --run-class
-#     diagnostic`.
-#   - bench/codec_inertness_probe.sh records each run as diagnostic and marks a
-#     row `recorded_run_class` only when `baseline --record` exited 0, which it
-#     does only once its record landed.
+#     diagnostic`, and keep their trace when its record did not land, ending 75.
+#   - bench/codec_inertness_probe.sh records each run as diagnostic, and keeps
+#     a measured run's status apart from its record's (`landed` or `pending`).
+#   - bench_codec_cell.sh, the bench_cache_types.sh smoke probes and
+#     eval/wikitext2_ppl.py keep a reading whose record did not land (exit 75).
 #   - ingest/codec_inertness_ingest.py skips a row the probe already recorded,
-#     and refuses a recorder built before the run class before writing anything.
+#     refuses a snapshot with no recordable label, and refuses a recorder built
+#     before the run class before writing anything.
 #   - ingest/llama_bench_ingest.py refuses that recorder before writing anything,
 #     queues its records under $RMLX_HOME, and records through the checkout's
 #     build rather than an `rmlx` on PATH.
@@ -113,11 +115,12 @@ STUB_NO_INGEST=none ARGV_LOG="$ARGV_LOG" bash "$FAKE/scripts/gpu_capture.sh" --k
 status=$?
 set -e
 bad=""
-[ "$status" -eq 0 ] || bad="exit=$status (want 0: the capture succeeded)"
+[ "$status" -eq 75 ] || bad="exit=$status (want 75: captured, record pending)"
 grep -q 'WARNING: the capture succeeded, but its diagnostic record did not land' "$WORK/gpu_capture_pending.out" ||
 	bad="${bad:+$bad; }no warning"
 grep -q '^retention:' "$WORK/gpu_capture_pending.out" || bad="${bad:+$bad; }the retention step did not run"
-verdict gpu_capture_with_a_pending_record_succeeds "a capture whose record did not land succeeds, warns, and still runs its retention" "$bad"
+grep -q '^done: ' "$WORK/gpu_capture_pending.out" || bad="${bad:+$bad; }the trace was not reported"
+verdict gpu_capture_with_a_pending_record_keeps_its_trace "a capture whose record did not land keeps its trace, runs its retention and ends 75" "$bad"
 
 # ── mst_capture.sh ────────────────────────────────────────────────────────────
 #
@@ -149,6 +152,42 @@ bad=""
 grep -q -- 'baseline --record --run-class diagnostic --label mst_capture:' "$XCRUN_LOG" ||
 	bad="launched argv: $(cat "$XCRUN_LOG"); $(tail -2 "$WORK/mst.out" | tr '\n' ' ')"
 verdict mst_capture_records_diagnostic "the traced run is launched recording as diagnostic" "$bad"
+
+# xctrace hides the child's exit code, so a record that did not land is read
+# from the run's log. The shim writes the bundle, the table and that log line;
+# a `cargo` stub stands in for the summariser.
+cat >"$WORK/xcbin/xcrun" <<'SHIM'
+#!/usr/bin/env bash
+[ "$1" = -f ] && exit 0
+out=""
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+	[ "${args[$i]}" = --output ] && out="${args[$((i + 1))]}"
+done
+case "$1 $2" in
+"xctrace record")
+	mkdir -p "$out" "$RMLX_HOME/logs"
+	printf '%s\n' '{"level":"ERROR","fields":{"message":"baseline: record did not land","error":"stub","buffer":"/x/pending/mst.json","db":"/x/runs.db"}}' \
+		>"$RMLX_HOME/logs/20261024-000000-9.9.9.jsonl"
+	;;
+"xctrace export") printf '<trace/>\n' >"$out" ;;
+esac
+exit 0
+SHIM
+mkdir -p "$WORK/cargobin"
+printf '#!/usr/bin/env bash\necho "stub summary"\n' >"$WORK/cargobin/cargo"
+chmod +x "$WORK/cargobin/cargo"
+set +e
+PATH="$WORK/xcbin:$WORK/cargobin:$PATH" ARGV_LOG="$WORK/mst.argv" RMLX_HOME="$WORK/mst_home" \
+	bash "$REPO_ROOT/scripts/mst_capture.sh" --model "$MODEL" --binary "$MST_BIN" \
+	--out-dir "$WORK/mst_traces" >"$WORK/mst_pending.out" 2>&1
+status=$?
+set -e
+bad=""
+[ "$status" -eq 75 ] || bad="exit=$status (want 75: traced, record pending): $(tail -3 "$WORK/mst_pending.out" | tr '\n' ' ')"
+grep -q '^record pending: /x/pending/mst.json' "$WORK/mst_pending.out" || bad="${bad:+$bad; }the buffer file is not named"
+grep -q '^bundle: ' "$WORK/mst_pending.out" || bad="${bad:+$bad; }the trace was not reported"
+verdict mst_capture_with_a_pending_record_keeps_its_trace "a traced run whose record did not land keeps its trace and ends 75" "$bad"
 
 # ── codec_inertness_probe.sh ──────────────────────────────────────────────────
 PROBE_BIN="$WORK/rmlx_probe"

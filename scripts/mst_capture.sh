@@ -15,6 +15,10 @@
 #   Use it WITH `scripts/gputrace_kernels.sh`, not instead: the export carries no
 #   pipeline or function names, so "which kernel" still comes from a capture.
 #
+# Exit 75: the trace and its table stand, and the run's diagnostic record did not
+# land; the buffer file is read from the run's log and named (docs/METRICS_DB.md
+# section 13, rule 24).
+#
 # THREE TRAPS, ALL HANDLED HERE
 #   1. `--attach <pid>` does not work for this template. It reports "No
 #      configuration information received, will have to guess" and exports zero
@@ -265,6 +269,22 @@ if [ ! -e "$trace" ]; then
 	exit 1
 fi
 
+# xctrace takes the child's exit code with its output, so a record that did not
+# land (`baseline` exit 75) is read from the run's own log, which names the
+# buffer file. The trace stands; the script ends 75 after it.
+log_file=$(ls -1t "$RMLX_HOME_DIR"/logs/*.jsonl 2>/dev/null | sed -n 1p)
+pending_buffer=""
+if [ -n "$log_file" ]; then
+	pending_buffer=$(python3 - "$REPO_ROOT/scripts/lib" "$log_file" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import published_run_log
+found = published_run_log.events_matching(sys.argv[2], "baseline: record did not land", exact=True)
+print(found[-1].get("buffer", "(no buffer field)") if found else "")
+PY
+	)
+fi
+
 echo ""
 echo "exporting:  metal-gpu-intervals -> $xml"
 xcrun xctrace export \
@@ -285,7 +305,6 @@ fi
 # plain info! event, so it is in the run's own log at the default level even
 # though `xctrace --launch` swallowed the child's stdout.
 if [ -z "$SKIP_MS" ]; then
-	log_file=$(ls -1t "$RMLX_HOME_DIR"/logs/*.jsonl 2>/dev/null | sed -n 1p)
 	if [ -n "$log_file" ]; then
 		SKIP_MS=$(python3 "$REPO_ROOT/scripts/lib/prefill_ms.py" "$log_file")
 	fi
@@ -353,3 +372,10 @@ echo "csv:    $csv"
 echo ""
 echo "This table has no kernel names — pair it with a capture when you need to"
 echo "know WHICH kernel: bash scripts/gputrace_kernels.sh <bundle>.gputrace"
+if [ -n "$pending_buffer" ]; then
+	echo "" >&2
+	echo "record pending: $pending_buffer" >&2
+	echo "  the trace stands, but its diagnostic record did not land; replay it with" >&2
+	echo "  \`rmlx metrics record --replay-pending\` once the cause is fixed" >&2
+	exit 75
+fi

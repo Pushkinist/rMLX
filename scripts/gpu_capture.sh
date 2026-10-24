@@ -38,6 +38,10 @@
 # a successful capture the trace directory is bounded by scripts/traces_gc.sh
 # (oldest-first, never the new bundle, every removal printed); --keep-all skips
 # that for a session that wants to keep more than the cap.
+#
+# Exit 75: the capture succeeded and its diagnostic record did not land; the
+# trace is kept and the buffer file is named (docs/METRICS_DB.md section 13,
+# rule 24).
 
 set -uo pipefail
 
@@ -174,11 +178,14 @@ rc=$?
 
 # shellcheck source=scripts/lib/record_pending.sh
 . scripts/lib/record_pending.sh
-# The capture is what this script is for; a diagnostic record that did not land
-# does not undo it. The binary named the buffer file on stderr above.
+# A diagnostic record that did not land does not undo the capture: the trace is
+# kept, the retention runs, and the script ends 75 at the end. The binary named
+# the buffer file on stderr above.
+record_pending=0
 if [ $rc -eq "$RECORD_PENDING_EXIT" ]; then
 	echo "WARNING: the capture succeeded, but its diagnostic record did not land (buffer file" >&2
 	echo "  named above); replay it with \`rmlx metrics record --replay-pending\`" >&2
+	record_pending=1
 	rc=0
 fi
 
@@ -226,3 +233,7 @@ echo "  - for wall-clock GPU time and CPU->GPU gaps, record the live process:"
 echo "      xcrun xctrace record --template 'Metal System Trace' --no-prompt \\"
 echo "        --output run.trace --time-limit 8s --launch -- <rmlx ...>"
 echo "    See docs/PROFILING.md §5 for the export and its parsing traps."
+if [ "$record_pending" = 1 ]; then
+	echo "INCOMPLETE: the trace stands, its diagnostic record is pending (named above)" >&2
+	exit "$RECORD_PENDING_EXIT"
+fi
