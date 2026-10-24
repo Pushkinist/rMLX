@@ -27,7 +27,7 @@ use rmlx_mlx::{
 
 use rmlx_kv_quant::{GdnTapeSegment, LinearAttnCache};
 
-use super::layers::Linear;
+use super::layers::{Linear, SharedInput};
 
 #[allow(missing_debug_implementations)]
 pub(super) struct GatedDeltaNet {
@@ -100,13 +100,14 @@ impl GatedDeltaNet {
         let qk_repeat = (hv / hk) as i32; // 32/16 = 2
 
         // ── Projections ───────────────────────────────────────────────────
+        let mut input = SharedInput::new(x);
         // qkv: [B, S, key_dim*2 + value_dim]
-        let qkv = self.in_proj_qkv.forward(x, device)?;
+        let qkv = input.forward(&self.in_proj_qkv, device)?;
         // z: [B, S, value_dim]
-        let z = self.in_proj_z.forward(x, device)?;
+        let z = input.forward(&self.in_proj_z, device)?;
         // b, a: [B, S, num_v_heads]
-        let b_proj = self.in_proj_b.forward(x, device)?;
-        let a_proj = self.in_proj_a.forward(x, device)?;
+        let b_proj = input.forward(&self.in_proj_b, device)?;
+        let a_proj = input.forward(&self.in_proj_a, device)?;
 
         // ── Depthwise conv1d on qkv ───────────────────────────────────────
         // conv1d_weight shape: [conv_dim, kernel, 1] (MLX depthwise layout).

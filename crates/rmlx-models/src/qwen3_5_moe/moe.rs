@@ -14,7 +14,7 @@ use rmlx_mlx::{
     silu, softmax, sum_axis, take_along_axis, Array, Device, Dtype,
 };
 
-use super::layers::Linear;
+use super::layers::{Linear, SharedInput};
 
 /// Flattened `n_tokens * top_k` count at or above which the expert dispatch
 /// sorts indices for contiguous per-expert access (prefill). Below it (decode,
@@ -294,9 +294,10 @@ pub(super) struct DenseMlp {
 
 impl DenseMlp {
     pub(super) fn forward(&self, x: &Array, device: Device) -> Result<Array> {
-        let gate = self.gate_proj.forward(x, device)?;
+        let mut input = SharedInput::new(x);
+        let gate = input.forward(&self.gate_proj, device)?;
         let gate = silu(&gate, device)?;
-        let up = self.up_proj.forward(x, device)?;
+        let up = input.forward(&self.up_proj, device)?;
         let gated = multiply(&gate, &up, device)?;
         self.down_proj.forward(&gated, device)
     }

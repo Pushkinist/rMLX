@@ -282,6 +282,45 @@ impl Linear {
     }
 }
 
+/// An input that several linear layers read: a Hadamard layer's transform of
+/// it is computed once and reused by every later layer holding that transform.
+pub(super) struct SharedInput<'a> {
+    x: &'a Array,
+    transformed: Vec<(Arc<SignedBlockHadamard>, Array)>,
+}
+
+impl<'a> SharedInput<'a> {
+    pub(super) fn new(x: &'a Array) -> Self {
+        Self {
+            x,
+            transformed: Vec::new(),
+        }
+    }
+
+    /// `linear.forward(x)`.
+    ///
+    /// Layers share a transform when they hold the same `Arc`: the fold builds
+    /// one per sign vector, and the contract reader checked each module's
+    /// `.signs` tensor equal to it. A layer holding another transform
+    /// transforms `x` itself.
+    pub(super) fn forward(&mut self, linear: &Linear, device: Device) -> Result<Array> {
+        let Linear::Hadamard { transform, inner } = linear else {
+            return linear.forward(self.x, device);
+        };
+        if let Some((_, xt)) = self
+            .transformed
+            .iter()
+            .find(|(t, _)| Arc::ptr_eq(t, transform))
+        {
+            return inner.forward(xt, device);
+        }
+        let xt = transform.forward(self.x, device)?;
+        let y = inner.forward(&xt, device);
+        self.transformed.push((Arc::clone(transform), xt));
+        y
+    }
+}
+
 #[allow(missing_debug_implementations)]
 pub(super) enum Embedding {
     Plain {
