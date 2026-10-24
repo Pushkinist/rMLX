@@ -1161,6 +1161,14 @@ pub(crate) fn ingest_buffer_record(
             Ok(())
         }
         Err(e) => {
+            // The scripts send stderr to /dev/null and point at the run log,
+            // so the log names the file to replay.
+            tracing::error!(
+                error = %e,
+                buffer = %buffer.display(),
+                db = %db_path.display(),
+                "{what}: record did not land"
+            );
             let message = format!(
                 "{what}: measured, but the record did not reach {}: {e:#}; it is kept at {} for \
                  `rmlx metrics record --replay-pending`",
