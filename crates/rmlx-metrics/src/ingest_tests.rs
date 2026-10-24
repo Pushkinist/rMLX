@@ -317,6 +317,7 @@ fn absent_schema_version_defaults_to_v1() {
 fn builder_fills_identity_and_canonicalization() {
     let rec = RunRecordBuilder::rmlx(
         "mlx-community__gemma-4-e4b-it-mxfp8",
+        "MXFP8",
         "K8V8",
         8192,
         PromptRef::ByBody {
@@ -344,7 +345,8 @@ fn builder_fills_identity_and_canonicalization() {
     );
     assert_eq!(rec.schema_version, RECORD_SCHEMA_VERSION);
 
-    // Canonicalization: derived from the model id, not hand-passed.
+    // Canonicalization: the namespace split from the model id, the labels
+    // canonicalized.
     assert_eq!(rec.model_namespace, "mlx-community");
     assert_eq!(rec.model, "gemma-4-e4b-it-mxfp8");
     assert_eq!(rec.weight_quant, "mxfp8");
@@ -353,9 +355,10 @@ fn builder_fills_identity_and_canonicalization() {
 }
 
 #[test]
-fn builder_infers_weight_quant_and_namespace_from_a_path() {
+fn builder_splits_the_namespace_from_a_path() {
     let rec = RunRecordBuilder::rmlx(
         "/models/prism-ml__Ternary-Bonsai-8B-mlx-2bit",
+        "2bit",
         "none",
         4096,
         PromptRef::ByBody {
@@ -382,6 +385,7 @@ fn builder_rejects_a_record_ingest_would_reject() {
     // be recorded cannot be built either.
     let err = RunRecordBuilder::rmlx(
         "mlx-community__gemma-4-e4b-it-mxfp8",
+        "mxfp8",
         "none",
         8192,
         PromptRef::ByBody {
@@ -823,4 +827,22 @@ fn an_unmarked_record_is_not_refused_for_mentioning_synthesis() {
         r.validate().is_ok(),
         "only the marker refuses, not the word"
     );
+}
+
+#[test]
+fn builder_refuses_a_weight_quant_the_db_has_no_label_for() {
+    let err = RunRecordBuilder::rmlx(
+        "mlx-community__m",
+        "7bit",
+        "none",
+        8192,
+        PromptRef::ByBody {
+            name: "t".to_string(),
+            body: json!("hi"),
+            notes: None,
+            tokens_approx: None,
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("weight_quant"), "{err}");
 }

@@ -250,6 +250,23 @@ used="$(sort -u "$WORK/llama_recorder.log" | tr '\n' ' ')"
 [ "$used" = "checkout " ] || bad="the recorder that ran: ${used:-none} (want the checkout's build only); $(tail -2 "$WORK/llama_record.out" | tr '\n' ' ')"
 verdict llama_bench_records_through_the_checkout "an rmlx on PATH is not chosen over the checkout's build" "$bad"
 
+# ── snapshot_identity.py against the shared label table ──────────────────────
+#
+# The Rust producer, `ModelConfig::weight_quant_label`, is held to the same
+# table by `weight_quant_label_matches_the_shared_fixture_table`.
+bad="$(python3 - "$REPO_ROOT" <<'LABELS'
+import json, sys
+root = sys.argv[1]
+sys.path.insert(0, f"{root}/scripts/lib")
+from snapshot_identity import weight_quant
+table = json.load(open(f"{root}/crates/rmlx-loader/tests/fixtures/weight_quant_labels.json"))
+wrong = [f"{c['name']}: {weight_quant(c['config'])!r} != {c['label']!r}"
+         for c in table if weight_quant(c["config"]) != c["label"]]
+print("; ".join(wrong) if len(table) >= 9 else f"the table lost cases: {len(table)}")
+LABELS
+)"
+verdict python_label_matches_the_shared_table "snapshot_identity.py labels every config in the shared table" "$bad"
+
 echo
 echo "passed=$PASSED failed=$FAILED"
 [ "$FAILED" -eq 0 ] || exit 1

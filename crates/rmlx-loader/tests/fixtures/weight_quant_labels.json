@@ -1,0 +1,11 @@
+[
+  {"name": "torch_dtype bfloat16", "config": {"torch_dtype": "bfloat16"}, "label": "bf16"},
+  {"name": "torch_dtype float16", "config": {"torch_dtype": "float16"}, "label": "fp16"},
+  {"name": "dtype key", "config": {"dtype": "bfloat16"}, "label": "bf16"},
+  {"name": "ParoQuant", "config": {"torch_dtype": "bfloat16", "quantization_config": {"quant_method": "paroquant", "bits": 4, "group_size": 128}}, "label": "paro"},
+  {"name": "no weight format", "config": {}, "label": null},
+  {"name": "affine 4bit", "config": {"quantization": {"group_size": 64, "bits": 4}}, "label": "4bit"},
+  {"name": "mxfp8", "config": {"quantization": {"group_size": 32, "bits": 8, "mode": "mxfp8"}}, "label": "mxfp8"},
+  {"name": "1bit", "config": {"quantization": {"group_size": 64, "bits": 1}}, "label": "1bit"},
+  {"name": "2bit", "config": {"quantization": {"group_size": 64, "bits": 2}}, "label": "2bit"}
+]

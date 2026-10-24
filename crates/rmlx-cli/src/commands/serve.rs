@@ -962,7 +962,7 @@ pub(crate) fn run_serve(
     rmlx_server::block_on_serve(rt, claimed.claim(), async {
         // Spawn the SPSC metrics drainer task.
         // Must be inside block_on so tokio::spawn is available.
-        let drainer_handle = spawn_drainer(drainer_db_path);
+        let drainer_handle = spawn_drainer(drainer_db_path, registry.weight_quants());
 
         let mut state = AppState {
             device,

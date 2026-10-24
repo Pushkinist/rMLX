@@ -81,6 +81,10 @@ pub struct ModelEntry {
     pub abs_path_str: String,
     /// First architecture string from `config.json`.
     pub arch: String,
+    /// The weight label `config.json` describes
+    /// (`ModelConfig::weight_quant_label`), which the metrics drainer files
+    /// this model's rows under; `None` when it names no weight format.
+    pub weight_quant: Option<String>,
     /// Compiled Jinja chat template, if `chat_template.jinja` was found.
     pub chat_template: Option<Arc<ChatTemplate>>,
     /// Raw `chat_template.jinja` source text, retained for tool-call format
@@ -251,6 +255,7 @@ impl ModelRegistry {
                 }
             };
             let arch = cfg.dispatch_arch().unwrap_or("unknown").to_owned();
+            let weight_quant = cfg.weight_quant_label();
             let stop_token_ids = cfg.stop_token_ids(generation.as_ref());
             let generation_defaults = generation.map(Arc::new);
 
@@ -329,6 +334,7 @@ impl ModelRegistry {
                     abs_path_str: abs_path.to_string_lossy().into_owned(),
                     abs_path,
                     arch,
+                    weight_quant,
                     chat_template,
                     chat_template_src,
                     tokenizer,
@@ -341,6 +347,15 @@ impl ModelRegistry {
             );
         }
         reg
+    }
+
+    /// The weight label of every model that has one, keyed by model id: what
+    /// the metrics drainer files each model's rows under.
+    pub fn weight_quants(&self) -> BTreeMap<String, String> {
+        self.entries
+            .values()
+            .filter_map(|e| Some((e.id.clone(), e.weight_quant.clone()?)))
+            .collect()
     }
 
     /// Look up a snapshot by its id (directory basename).

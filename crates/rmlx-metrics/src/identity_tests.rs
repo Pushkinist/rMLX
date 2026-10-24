@@ -335,7 +335,6 @@ fn canonicalize_kv_quant_malformed_mixed_records_verbatim() {
 
 #[test]
 fn a_one_bit_snapshot_has_a_recordable_weight_quant() {
-    assert_eq!(infer_weight_quant("prism-ml__Bonsai-27B-mlx-1bit"), "1bit");
     assert_eq!(
         canonicalize("weight_quant", "1bit", WEIGHT_QUANT_WHITELIST).unwrap(),
         "1bit"

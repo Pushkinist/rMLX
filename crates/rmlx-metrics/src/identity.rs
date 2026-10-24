@@ -246,24 +246,6 @@ pub fn split_model_id(model_id: &str) -> (String, String) {
     )
 }
 
-/// Infer the on-disk weight quantization from a snapshot name.
-///
-/// Order matters — the more specific token wins (`mxfp8` before `8bit`).
-/// Falls back to `bf16`, which is the whitelist's "unquantized / we don't
-/// know" value.
-pub fn infer_weight_quant(model_id: &str) -> String {
-    let lower = model_id.to_lowercase();
-    for token in [
-        "mxfp8", "mxfp4", "nvfp4", "q4_k_m", "q8_0", "8bit", "4bit", "2bit", "1bit", "3bit",
-        "5bit", "6bit", "fp16", "bf16", "paro",
-    ] {
-        if lower.contains(token) {
-            return token.to_string();
-        }
-    }
-    "bf16".to_string()
-}
-
 /// True when `v` is a semver `MAJOR.MINOR.PATCH`, with an optional
 /// `-prerelease` / `+build` suffix.
 ///

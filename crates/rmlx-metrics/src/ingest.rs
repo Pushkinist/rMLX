@@ -586,8 +586,11 @@ impl RunRecord {
 ///   `backend_version`, `build_profile`, `hardware_tag` — NOT `git_sha`,
 ///   which the binary cannot honestly derive; it stays `None` unless a
 ///   future caller adds a `.git_sha(...)` builder method for it);
-/// * `model_namespace` / `model` / `weight_quant`, parsed and inferred from the
-///   model id ([`identity::split_model_id`], [`identity::infer_weight_quant`]);
+/// * `model_namespace` / `model`, parsed from the model id
+///   ([`identity::split_model_id`]);
+/// * `weight_quant`, the label the caller read from the snapshot's config
+///   (`rmlx_loader::ModelConfig::weight_quant_label`), checked against the
+///   §5.2 whitelist;
 /// * `kv_quant`, canonicalized ([`identity::canonicalize_kv_quant`]);
 /// * `ts_utc`, as an ISO-8601 UTC stamp of now;
 /// * `schema_version`.
@@ -612,7 +615,13 @@ impl RunRecordBuilder {
     /// future codec) under the champion cell for *unquantised* KV. The caller
     /// (server drainer, `baseline`, `eval`) already handles a builder `Err` by
     /// skipping the record with a warning; propagate rather than mislabel.
-    pub fn rmlx(model_id: &str, kv_quant: &str, ctx_max: i64, prompt: PromptRef) -> Result<Self> {
+    pub fn rmlx(
+        model_id: &str,
+        weight_quant: &str,
+        kv_quant: &str,
+        ctx_max: i64,
+        prompt: PromptRef,
+    ) -> Result<Self> {
         let ident = RunIdentity::rmlx();
         let (model_namespace, model) = identity::split_model_id(model_id);
         Ok(Self {
@@ -622,7 +631,11 @@ impl RunRecordBuilder {
                 backend_version: Some(ident.backend_version),
                 model_namespace,
                 model,
-                weight_quant: identity::infer_weight_quant(model_id),
+                weight_quant: identity::canonicalize(
+                    "weight_quant",
+                    weight_quant,
+                    identity::WEIGHT_QUANT_WHITELIST,
+                )?,
                 kv_quant: identity::canonicalize_kv_quant(kv_quant)?,
                 ctx_max,
                 prompt,

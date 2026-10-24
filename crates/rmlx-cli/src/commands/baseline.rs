@@ -911,8 +911,9 @@ pub(crate) struct RecordIdentity {
 /// Resolve and check the identity of a run before it does any work.
 ///
 /// `weight_quant` is the label the snapshot's own config describes
-/// ([`weight_quant_label`]), checked against the metrics DB's list here, so a
-/// value the DB would refuse stops the run now and not after the measurement.
+/// ([`rmlx_loader::ModelConfig::weight_quant_label`]), checked against the
+/// metrics DB's list here, so a value the DB would refuse stops the run now and
+/// not after the measurement.
 /// A missing or unreadable config, or one that names no weight format, is
 /// refused rather than recorded under a label nothing measured.
 pub(crate) fn resolve_record_identity(model_path: &Path) -> anyhow::Result<RecordIdentity> {
@@ -926,7 +927,7 @@ pub(crate) fn resolve_record_identity(model_path: &Path) -> anyhow::Result<Recor
     }
     let config = rmlx_loader::load_config(model_path)
         .context("read the snapshot's config for the recorded weight_quant")?;
-    let Some(weight_quant) = weight_quant_label(&config) else {
+    let Some(weight_quant) = config.weight_quant_label() else {
         anyhow::bail!(
             "{} names no weight format (no `quantization`, no ParoQuant `quantization_config`, \
              and no `dtype` / `torch_dtype` of bfloat16 or float16), so the run's weight_quant \
@@ -944,37 +945,6 @@ pub(crate) fn resolve_record_identity(model_path: &Path) -> anyhow::Result<Recor
         model,
         weight_quant,
     })
-}
-
-/// The `docs/METRICS_DB.md` §5.2 label a snapshot's config describes, or `None`.
-///
-/// Kept in step with `weight_quant` in `scripts/lib/snapshot_identity.py`, the
-/// label the shell benches file a snapshot under: the two disagreeing would
-/// split one model across two cells.
-fn weight_quant_label(config: &rmlx_loader::ModelConfig) -> Option<String> {
-    if config.is_paroquant() {
-        return Some("paro".to_owned());
-    }
-    if let Some(quant) = &config.quantization {
-        let mode = quant.mode_or_default();
-        return Some(
-            if rmlx_metrics::identity::WEIGHT_QUANT_WHITELIST.contains(&mode) {
-                mode.to_owned()
-            } else {
-                format!("{}bit", quant.bits)
-            },
-        );
-    }
-    let dtype = config
-        .dtype
-        .as_deref()
-        .filter(|d| !d.is_empty())
-        .or_else(|| config.extras.get("torch_dtype").and_then(|v| v.as_str()));
-    match dtype {
-        Some("bfloat16") => Some("bf16".to_owned()),
-        Some("float16") => Some("fp16".to_owned()),
-        _ => None,
-    }
 }
 
 /// Arguments needed to emit one §8.5 universal `RunRecord` to the metrics

@@ -2,6 +2,14 @@ use super::*;
 
 // ── Helper: build a timestamped event ────────────────────────────────────
 
+/// The registry's labels for the model `make_event` names.
+fn labels() -> BTreeMap<String, String> {
+    BTreeMap::from([(
+        "mlx-community__gemma-4-e2b-it-mxfp8".to_owned(),
+        "mxfp8".to_owned(),
+    )])
+}
+
 fn make_event(kind: MetricKind) -> MetricEvent {
     MetricEvent {
         model_id: "mlx-community__gemma-4-e2b-it-mxfp8".into(),
@@ -20,7 +28,7 @@ async fn round_trip_five_events() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("runs.db");
 
-    let handle = spawn_drainer(db_path.clone());
+    let handle = spawn_drainer(db_path.clone(), labels());
 
     for i in 0u64..5 {
         let ok = handle.try_emit(make_event(MetricKind::KvCacheBytes(1024 * i)));
@@ -115,23 +123,25 @@ fn load_phases_produces_five_metrics() {
     assert!(names.contains(&"load_total_ms"));
 }
 
-// ── infer_weight_quant ───────────────────────────────────────────────────
+// ── weight label ─────────────────────────────────────────────────────────
 
+/// The label the registry supplies is the one filed; no name is parsed.
 #[test]
-fn infer_weight_quant_mxfp8() {
-    assert_eq!(
-        rmlx_metrics::identity::infer_weight_quant("mlx-community__gemma-4-e2b-it-mxfp8"),
-        "mxfp8"
-    );
+fn a_row_carries_the_label_its_model_config_describes() {
+    let run = event_to_run_record(&make_event(MetricKind::KvCacheBytes(1024)), &labels()).unwrap();
+    assert_eq!(run.weight_quant, "mxfp8");
 }
 
+/// A model whose config names no weight format has no cell, so its event is
+/// refused rather than filed under a guessed label.
 #[test]
-fn infer_weight_quant_fallback() {
-    // No token matches → "bf16" (always-valid whitelist fallback)
-    assert_eq!(
-        rmlx_metrics::identity::infer_weight_quant("some-obscure-model"),
-        "bf16"
-    );
+fn an_event_for_a_model_with_no_label_is_refused() {
+    let err = event_to_run_record(
+        &make_event(MetricKind::KvCacheBytes(1024)),
+        &BTreeMap::new(),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("weight_quant"), "{err}");
 }
 
 // ── PromptTokens / CompletionTokens mapping ────────────────────────
@@ -172,7 +182,7 @@ async fn f2_ctx_max_is_real_value_not_sentinel() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("runs.db");
 
-    let handle = spawn_drainer(db_path.clone());
+    let handle = spawn_drainer(db_path.clone(), labels());
 
     // Emit an event with a known ctx_max.
     let ev = MetricEvent {
@@ -262,7 +272,7 @@ async fn f9_itl_p99_and_spikes_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("runs.db");
 
-    let handle = spawn_drainer(db_path.clone());
+    let handle = spawn_drainer(db_path.clone(), labels());
 
     handle.try_emit(make_event(MetricKind::ItlP99Ms(18.4)));
     handle.try_emit(make_event(MetricKind::ItlSpikes(2)));
@@ -329,6 +339,6 @@ fn itl_stats_produces_three_metrics_with_correct_names() {
 /// Live-request telemetry is not a controlled run, so it reaches no gate.
 #[test]
 fn a_live_request_row_is_diagnostic() {
-    let run = event_to_run_record(&make_event(MetricKind::KvCacheBytes(1024))).unwrap();
+    let run = event_to_run_record(&make_event(MetricKind::KvCacheBytes(1024)), &labels()).unwrap();
     assert_eq!(run.run_class, Some(RunClass::Diagnostic));
 }
