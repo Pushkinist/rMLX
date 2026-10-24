@@ -459,3 +459,36 @@ fn import_leaves_the_source_untouched() {
     assert_eq!(version, 8, "the import migrated its source");
     assert_eq!(std::fs::read(&source).unwrap(), before);
 }
+
+// ── a DB a newer binary migrated ────────────────────────────────────────────
+
+#[test]
+fn a_db_newer_than_this_binary_is_refused_by_readers_writers_and_doctor() {
+    let td = tempfile::tempdir().unwrap();
+    let db = init_db(td.path(), "runs.db");
+    let last = rmlx_metrics::schema::MIGRATIONS
+        .last()
+        .map_or(0, |&(v, _)| v);
+    Connection::open(&db)
+        .unwrap()
+        .execute_batch(&format!("PRAGMA user_version = {};", last + 1))
+        .unwrap();
+
+    for args in [
+        vec!["rank", "--metric", "decode_tps_warm"],
+        vec!["doctor", "--fix"],
+        vec![
+            "record",
+            "--inline",
+            &record_json(Some("gate"), 100.0, "2026-10-01T00:00:00Z"),
+        ],
+    ] {
+        let out = metrics(td.path(), &db, &args);
+        assert!(!out.status.success(), "{args:?} opened a newer DB");
+        let err = stderr(&out);
+        assert!(
+            err.contains(&format!("version {}", last + 1)),
+            "{args:?}: {err}"
+        );
+    }
+}

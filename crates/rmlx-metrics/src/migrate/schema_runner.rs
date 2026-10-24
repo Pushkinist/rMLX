@@ -80,9 +80,9 @@ pub fn run_pending(conn: &mut Connection) -> Result<u32> {
 /// The DB's `user_version`, or an error when it is past the last migration
 /// this binary carries: a newer binary migrated it, so this one's `bests`
 /// rebuild and its readers would drop what the later migrations put there.
-/// Shared by the writers ([`run_pending`]) and the readers
-/// ([`crate::schema::open_checked`]).
-pub(crate) fn refuse_newer_schema(conn: &Connection) -> Result<u32> {
+/// Shared by the writers ([`run_pending`]), the readers
+/// ([`crate::schema::open_checked`]) and `rmlx metrics doctor`.
+pub fn refuse_newer_schema(conn: &Connection) -> Result<u32> {
     let version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let last_known = MIGRATIONS.last().map_or(0, |&(v, _)| v);
     if version > last_known {

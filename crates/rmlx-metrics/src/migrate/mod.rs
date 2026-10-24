@@ -16,5 +16,4 @@ mod legacy;
 mod schema_runner;
 
 pub use legacy::{infer_weight_quant_from_model, migrate_all, MigrateOptions, MigrateReport};
-pub(crate) use schema_runner::refuse_newer_schema;
-pub use schema_runner::run_pending;
+pub use schema_runner::{refuse_newer_schema, run_pending};

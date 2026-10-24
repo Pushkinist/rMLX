@@ -37,6 +37,8 @@ pub(super) fn cmd_init(db_path: &Path) -> anyhow::Result<()> {
 pub(super) fn cmd_doctor(db_path: &Path, fix: bool) -> anyhow::Result<()> {
     let mut conn =
         schema::open(db_path).with_context(|| format!("open DB at {}", db_path.display()))?;
+    // Every check below, and every `--fix` repair, assumes this binary's schema.
+    migrate::refuse_newer_schema(&conn).context("check the schema version")?;
 
     let mut errors: u32 = 0;
     let mut warnings: u32 = 0;
