@@ -81,6 +81,37 @@ def weight_quant(config):
     return DTYPE_LABELS.get(config.get("dtype") or config.get("torch_dtype"))
 
 
+class UnlabelledSnapshot(Exception):
+    """A snapshot whose weights have no label the metrics DB records.
+
+    `exit_code` is this script's exit code for the case: 2 when `config.json`
+    cannot be read, 6 when the quantization it describes has no §5.2 label.
+    """
+
+    def __init__(self, message, exit_code):
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+def snapshot_weight_quant(snapshot_dir):
+    """The §5.2 weight label of the snapshot at `snapshot_dir`, read from its
+    `config.json`; raises `UnlabelledSnapshot` rather than guess one."""
+    config_path = os.path.join(snapshot_dir, "config.json")
+    try:
+        with open(config_path, encoding="utf-8") as handle:
+            config = json.load(handle)
+    except (OSError, ValueError) as exc:
+        raise UnlabelledSnapshot(f"{config_path}: {exc}", 2) from None
+    label = weight_quant(config)
+    if label not in WEIGHT_QUANT_WHITELIST:
+        raise UnlabelledSnapshot(
+            f"{snapshot_dir} describes weight quantization {label!r}, "
+            "which is not one of the labels the metrics DB records",
+            6,
+        )
+    return label
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("snapshot", help="path to a model snapshot directory")
@@ -94,20 +125,10 @@ def main():
         return 2
 
     try:
-        with open(os.path.join(path, "config.json"), encoding="utf-8") as handle:
-            config = json.load(handle)
-    except (OSError, ValueError) as exc:
-        print(f"snapshot_identity: {path}/config.json: {exc}", file=sys.stderr)
-        return 2
-
-    label = weight_quant(config)
-    if label not in WEIGHT_QUANT_WHITELIST:
-        print(
-            f"snapshot_identity: {path} describes weight quantization {label!r}, "
-            "which is not one of the labels the metrics DB records",
-            file=sys.stderr,
-        )
-        return 6
+        label = snapshot_weight_quant(path)
+    except UnlabelledSnapshot as exc:
+        print(f"snapshot_identity: {exc}", file=sys.stderr)
+        return exc.exit_code
 
     print(f"model_namespace={namespace}")
     print(f"model={model}")

@@ -216,6 +216,25 @@ grep -q '"run_class": "diagnostic"' <<<"$out" || bad="${bad:+$bad; }the record i
 grep -q '"weight_quant": "fp16"' <<<"$out" || bad="${bad:+$bad; }the weight label is not the one the snapshot's config describes"
 verdict ingest_writes_a_legacy_sweep_once "a sweep with no record columns has each measured row written once" "$bad"
 
+# A snapshot whose config names a mode the metrics DB has no label for is
+# refused by the ingest itself, through the one label producer, before a record
+# carrying that mode is built.
+mkdir -p "$WORK/models_mxfp6"
+for snap in $(python3 -c 'import csv,sys; print(" ".join(sorted({r["model"] for r in csv.DictReader(open(sys.argv[1]))})))' "$LEGACY"); do
+	mkdir -p "$WORK/models_mxfp6/$snap"
+	printf '{"quantization": {"mode": "mxfp6", "bits": 6, "group_size": 32}}\n' >"$WORK/models_mxfp6/$snap/config.json"
+done
+set +e
+out="$(RMLX_HOME="$WORK/home" python3 "$INGEST" --dry-run "$LEGACY" --models-root "$WORK/models_mxfp6" \
+	--backend-version 9.9.9 --build-profile release-perf 2>&1)"
+status=$?
+set -e
+bad=""
+[ "$status" -ne 0 ] || bad="exit 0: a snapshot with no recordable label was ingested"
+grep -q "describes weight quantization 'mxfp6', which is not one of the labels the metrics DB records" <<<"$out" || bad="${bad:+$bad; }no refusal naming the mode: $out"
+! grep -q '"schema_version"' <<<"$out" || bad="${bad:+$bad; }a record was built"
+verdict ingest_refuses_a_snapshot_with_no_recordable_label "the ingest refuses a weight mode the metrics DB has no label for" "$bad"
+
 OLD_RECORDER="$WORK/rmlx_old"
 printf '#!/usr/bin/env bash\necho "      --file <FILE>"\n' >"$OLD_RECORDER"
 chmod +x "$OLD_RECORDER"

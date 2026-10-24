@@ -56,7 +56,11 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPT_DIR.parent / "lib"))
 from kv_boundary_default import kv_boundary_default  # noqa: E402
 from recorder_check import require_run_class_recorder  # noqa: E402
-from snapshot_identity import split_model_dir, weight_quant  # noqa: E402
+from snapshot_identity import (  # noqa: E402
+    UnlabelledSnapshot,
+    snapshot_weight_quant,
+    split_model_dir,
+)
 RMLX_REPO_ROOT = Path(os.environ.get("RMLX_REPO_ROOT", str(_SCRIPT_DIR.parents[1])))
 # Runtime state lives under a single root (CLAUDE.md). `RMLX_HOME` wins; the
 # in-repo `.rmlx/` is the dev default.
@@ -70,19 +74,14 @@ STAGING = RMLX_HOME / "bench" / "codec_inertness" / "records"
 # The probe's model column is a snapshot directory name, split by
 # `split_model_dir` into the identity columns `<namespace>__<model>`. Its weight
 # label is the one that snapshot's `config.json` describes, read through
-# `snapshot_identity.weight_quant` under `--models-root`, as `rmlx baseline
-# --record` reads it: a label guessed from the name would file the row in
-# another cell than the probe's own record.
+# `snapshot_identity.snapshot_weight_quant` under `--models-root`, as `rmlx
+# baseline --record` reads it: a label guessed from the name would file the row
+# in another cell than the probe's own record.
 def weight_quant_of(models_root: Path, model_dir: str) -> str:
-    config_path = models_root / model_dir / "config.json"
     try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise SystemExit(f"cannot read {config_path} for the row's weight label: {exc}") from None
-    label = weight_quant(config)
-    if label is None:
-        raise SystemExit(f"{config_path} names no weight format, so the row has no cell")
-    return label
+        return snapshot_weight_quant(str(models_root / model_dir))
+    except UnlabelledSnapshot as exc:
+        raise SystemExit(f"cannot label the row's weights: {exc}") from None
 
 
 # Column the probe records its `--kv-boundary-layers` value in.
