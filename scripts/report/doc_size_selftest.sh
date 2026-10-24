@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# scripts/check_doc_size_selftest.sh — recall test for the doc-size gate,
-# `python3 scripts/lib/debt_report.py --check-doc-size`.
+# scripts/report/doc_size_selftest.sh — recall test for the doc-size gate,
+# `python3 scripts/report/debt_report.py --check-doc-size`.
+#
+# Recall test for: report/debt_report.py --check-doc-size
 #
 # doc-refs: fixture
 #
@@ -12,8 +14,8 @@
 
 set -uo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TOOL="$REPO_ROOT/scripts/lib/debt_report.py"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TOOL="$REPO_ROOT/scripts/report/debt_report.py"
 # shellcheck source=scripts/lib/selftest_support.sh
 . "$REPO_ROOT/scripts/lib/selftest_support.sh"
 st_init check-doc-size-selftest

@@ -4,7 +4,7 @@
 //! public predicates on `KvQuant` and its `Display` read their answer from it.
 //! Each arm names one variant and states every fact as a literal, so a new
 //! variant does not compile until each of its facts is written down. The census
-//! (`scripts/kv_update_census.py`) refuses a struct-update base (`..X`) in the
+//! (`scripts/report/kv_census.py`) refuses a struct-update base (`..X`) in the
 //! fn body: a row copied from a neighbour would inherit facts nobody stated.
 //!
 //! `codec_facts_tests.rs` holds the same facts in a table written apart from

@@ -298,7 +298,7 @@
 #   refusal the full gate makes (exit 2): an empty population is a refusal
 #   here too, never a silent empty listing. This is the population's one
 #   producer: a caller that needs "which fns are round loops today"
-#   (scripts/lib/debt_report.py's driver group) reads it from here instead of
+#   (scripts/report/debt_report.py's driver group) reads it from here instead of
 #   re-deriving (a1)+(a2) on its own. The line number is part of the join key
 #   a caller resolves each entry against its own fn scan with — file and fn
 #   name alone collide when two same-named fns live in one file (nested

@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# scripts/debt_report_selftest.sh — fixture test for scripts/lib/debt_report.py.
+# scripts/report/debt_report_selftest.sh — fixture test for scripts/report/debt_report.py.
+#
+# Recall test for: report/debt_report.py (the report and --matched-lines)
 #
 # WHY
-#   The report always exits 0 (advisory) — see scripts/debt_report.sh — so its
+#   The report always exits 0 (advisory), so its
 #   detection power is not in an exit code. Each case below asserts that a
 #   specific fact actually appears (or is absent) in the printed text, rather
 #   than trusting that the tool ran without checking what it found.
@@ -41,8 +43,8 @@
 
 set -uo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TOOL="$REPO_ROOT/scripts/lib/debt_report.py"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TOOL="$REPO_ROOT/scripts/report/debt_report.py"
 BASE="$REPO_ROOT/scripts/fixtures/debt_report/base"
 
 for f in \
@@ -248,7 +250,7 @@ rm -rf "$TOTALS_WORK"
 # ---- a dead producer (check_spec_charge.sh unreachable) is unavailable, ---
 # ---- never a silent 0 — the concrete failure the guard above rules out ----
 
-DEAD_OUT=$(python3 - "$REPO_ROOT/scripts/lib" "$STATIC_WORK/base" <<'EOF'
+DEAD_OUT=$(python3 - "$REPO_ROOT/scripts/report" "$STATIC_WORK/base" <<'EOF'
 import sys
 sys.path.insert(0, sys.argv[1])
 import debt_report as dr

@@ -1,7 +1,9 @@
-#!/usr/bin/env python3
 """Structural figures for the KV update-path restructure.
 
-Four modes, each printing one figure the restructure is judged on:
+Module of: report/debt_report.py
+
+Four modes, each printing one figure the restructure is judged on. They run
+as `debt_report.py --kv-census MODE`, and `all` runs the first three:
 
 * `variants` — every `KvStorage` variant with its field shape, and the census
   of how many carry the store-slot shape the restructure writes one body for.
@@ -47,29 +49,25 @@ back. It never prints a `0` that a reader could mistake for a measured answer.
 
 from __future__ import annotations
 
-import argparse
 import math
 import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
-
-from debt_report import extract_fns, is_test_path  # noqa: E402
-from rust_scan import (  # noqa: E402
+from rust_scan import (
     MatchArm,
     ScanError,
     blank_text,
     block_end,
     enum_body,
     enum_variants,
+    extract_fns,
+    is_test_path,
     let_patterns,
     match_sites,
     matches_macros,
 )
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
 
 STORAGE_ENUM_FILE = "crates/rmlx-kv-quant/src/storage/kv_storage.rs"
 QUANT_ENUM_FILE = "crates/rmlx-kv-quant/src/quant.rs"
@@ -629,32 +627,25 @@ def mode_refs(root: Path, rel: str) -> None:
     print(f"refs {rel} KvQuant={len(quant)} distinct={len(set(quant))}")
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("mode", choices=["variants", "match-sites", "update-bodies", "refs", "all"])
-    ap.add_argument("--root", default=str(REPO_ROOT), help="tree to measure")
-    ap.add_argument("--threshold", type=int, default=None, help="override the derived arm bar")
-    ap.add_argument("--file", default=None, help="file for the refs mode")
-    ap.add_argument("--include-tests", action="store_true", help="count test files too")
-    args = ap.parse_args()
-    root = Path(args.root).resolve()
+MODES = ["variants", "match-sites", "update-bodies", "refs", "all"]
+
+
+def run(mode: str, root: Path, threshold: int | None, include_tests: bool, file: str | None) -> None:
+    """Print the figures of `mode` over `root`. Raises SystemExit: 2 when the
+    tree cannot be measured, 1 when a descriptor or a view is refused."""
     if not root.is_dir():
         fail(f"{root} is not a directory")
-    if args.mode == "variants":
+    if mode == "variants":
         mode_variants(root)
-    elif args.mode == "match-sites":
-        mode_match_sites(root, args.threshold, args.include_tests)
-    elif args.mode == "update-bodies":
+    elif mode == "match-sites":
+        mode_match_sites(root, threshold, include_tests)
+    elif mode == "update-bodies":
         mode_update_bodies(root)
-    elif args.mode == "refs":
-        if not args.file:
+    elif mode == "refs":
+        if not file:
             fail("refs mode needs --file")
-        mode_refs(root, args.file)
+        mode_refs(root, file)
     else:
         mode_variants(root)
-        mode_match_sites(root, args.threshold, args.include_tests)
+        mode_match_sites(root, threshold, include_tests)
         mode_update_bodies(root)
-
-
-if __name__ == "__main__":
-    main()

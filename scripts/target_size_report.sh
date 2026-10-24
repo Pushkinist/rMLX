@@ -6,7 +6,7 @@
 # release-debug) plus repeated `cargo test --workspace` runs can grow into the
 # hundreds of GB. This prints the current size and, past a threshold, a hint
 # pointing at `make target-gc`. Non-failing — advisory only, mirrors
-# file_size_report.sh.
+# debt_report.py --file-sizes.
 #
 # Usage:
 #   bash scripts/target_size_report.sh              # threshold=50 (GB)

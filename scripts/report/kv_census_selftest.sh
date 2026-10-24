@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# scripts/kv_update_census_selftest.sh — recall test for
-# `kv_update_census.py`. Every case is one edit to an otherwise valid synthetic
+# scripts/report/kv_census_selftest.sh — recall test for
+# `debt_report.py --kv-census`. Every case is one edit to an otherwise valid synthetic
 # tree, and asserts both the exit code and the figure or reason the producer
 # printed.
+#
+# Recall test for: report/debt_report.py --kv-census
 #
 # WHY BOTH
 #   The producer reports a measured figure (exit 0) and an inability to measure
@@ -22,10 +24,10 @@
 
 set -uo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CENSUS="${REPO_ROOT}/scripts/kv_update_census.py"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TOOL="${REPO_ROOT}/scripts/report/debt_report.py"
 
-[ -f "${CENSUS}" ] || { echo "ERROR: missing ${CENSUS}" >&2; exit 2; }
+[ -f "${TOOL}" ] || { echo "ERROR: missing ${TOOL}" >&2; exit 2; }
 command -v python3 >/dev/null 2>&1 || {
     echo "ERROR: python3 not on PATH" >&2
     exit 2
@@ -109,7 +111,7 @@ EOF
 
 run() { # run ROOT MODE [EXTRA...]
     local root="$1"; shift
-    python3 "${CENSUS}" --root "${root}" "$@" 2>&1
+    python3 "${TOOL}" --root "${root}" --kv-census "$@" 2>&1
 }
 
 failures=0
@@ -1139,22 +1141,22 @@ check "a view and a view_mut that bind every field pass and count two view fns" 
 # each failure prints the figure beside its pin and what to do.
 REAL_PINS="match-sites=7 forcing-sites=7 subset-sites=154 table-sites=1 descriptor-fns=1 view-fns=2"
 pin_advice() { # pin_advice NAME
-    local list="python3 scripts/kv_update_census.py match-sites | grep"
+    local list="python3 scripts/report/debt_report.py --kv-census match-sites | grep"
     case "$1" in
     match-sites | forcing-sites)
-        echo "A new codec must touch N sites; a change that moves N states the new N in its commit message. List them: ${list} '^site'. Set the pin in the real-tree case of scripts/kv_update_census_selftest.sh."
+        echo "A new codec must touch N sites; a change that moves N states the new N in its commit message. List them: ${list} '^site'. Set the pin in the real-tree case of scripts/report/kv_census_selftest.sh."
         ;;
     subset-sites)
-        echo "A subset site is a matches!, if-let or catch-all match over a codec enum; a new codec compiles there and silently takes false or the catch-all arm. List them: ${list} '^subset'. If the change is correct, set the pin in the real-tree case of scripts/kv_update_census_selftest.sh and name the site you added or removed in the commit message; if not, write an exhaustive match with no \`_\` arm."
+        echo "A subset site is a matches!, if-let or catch-all match over a codec enum; a new codec compiles there and silently takes false or the catch-all arm. List them: ${list} '^subset'. If the change is correct, set the pin in the real-tree case of scripts/report/kv_census_selftest.sh and name the site you added or removed in the commit message; if not, write an exhaustive match with no \`_\` arm."
         ;;
     descriptor-fns)
-        echo "The census reads KvQuant::descriptor (an \`fn descriptor\` inside \`impl KvQuant\`) to refuse a row that does not state its own facts. 0 means the fn was renamed or moved out of the impl, and the refusal checks nothing. Rename it back, or teach DESCRIPTOR_FN in scripts/kv_update_census.py the new name."
+        echo "The census reads KvQuant::descriptor (an \`fn descriptor\` inside \`impl KvQuant\`) to refuse a row that does not state its own facts. 0 means the fn was renamed or moved out of the impl, and the refusal checks nothing. Rename it back, or teach DESCRIPTOR_FN in scripts/report/kv_census.py the new name."
         ;;
     view-fns)
-        echo "The census reads KvStorage::view and KvStorage::view_mut (an \`fn view\` and an \`fn view_mut\` inside \`impl KvStorage\`) to refuse an arm with a \`..\` rest pattern. Fewer than 2 means a fn was renamed or moved out of the impl, and its refusal checks nothing. Rename it back, or teach VIEW_FN in scripts/kv_update_census.py the new name."
+        echo "The census reads KvStorage::view and KvStorage::view_mut (an \`fn view\` and an \`fn view_mut\` inside \`impl KvStorage\`) to refuse an arm with a \`..\` rest pattern. Fewer than 2 means a fn was renamed or moved out of the impl, and its refusal checks nothing. Rename it back, or teach VIEW_FN in scripts/report/kv_census.py the new name."
         ;;
     table-sites)
-        echo "A table site is a match keyed by string literals or constants whose arms name the codec variants; a new codec compiles there and cannot be parsed. List them: ${list} '^table'. If the change is correct, set the pin in the real-tree case of scripts/kv_update_census_selftest.sh and name the site you added or removed in the commit message."
+        echo "A table site is a match keyed by string literals or constants whose arms name the codec variants; a new codec compiles there and cannot be parsed. List them: ${list} '^table'. If the change is correct, set the pin in the real-tree case of scripts/report/kv_census_selftest.sh and name the site you added or removed in the commit message."
         ;;
     esac
 }

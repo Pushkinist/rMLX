@@ -1,4 +1,6 @@
-"""Enum and `match` reader for the KV structural-metric producers.
+"""Rust source reader for the report tools: enums, `match` arms and `fn` bodies.
+
+Module of: report/debt_report.py
 
 It blanks comments and literals, finds an `enum` body, walks `match`
 expressions arm by arm, and reads the pattern of each `matches!` call and
@@ -7,14 +9,15 @@ refuses, loudly, on a shape it cannot read back — a scan that silently drops
 a site reports a smaller number than the truth, which is the failure mode
 every producer here exists to avoid.
 
-`fn` bodies are **not** read here. `lib/debt_report.py` owns that scan, and
-both producers of the update-body figure call it, so the two cannot drift.
+`fn` bodies are read by `extract_fns` below, the one scan both producers of
+the update-body figure call, so the two cannot drift.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 class ScanError(Exception):
@@ -323,3 +326,154 @@ def let_patterns(blanked: str) -> list[MatchSite]:
                 out.append(MatchSite(line=line, start=m.start(), arms=[MatchArm(pattern=pattern, line=line)]))
                 break
     return out
+
+
+# `r"..."`, `r#"..."#`, `r##"..."##`, and the byte-string forms `br"..."` /
+# `br#"..."#`. A raw string does not process `\` as an escape, so the plain
+# `"..."` scanner below would desync on one containing a literal backslash,
+# and does not stop at the first bare `"` when hashes are in play.
+_RAW_STRING_OPEN = re.compile(r'b?r(?P<hashes>#*)"')
+
+
+_FN_SIG = re.compile(
+    r"^[ \t]*(?:pub(?:\([\w:]+\))?\s+)?"
+    r"(?:default\s+)?(?:async\s+)?(?:const\s+)?(?:unsafe\s+)?"
+    r"(?:extern\s+\"[^\"]*\"\s+)?fn\s+"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\b",
+    re.MULTILINE,
+)
+
+
+def is_test_path(path: Path) -> bool:
+    parts = path.parts
+    if "tests" in parts:
+        return True
+    name = path.name
+    return name == "tests.rs" or name.endswith("_tests.rs")
+
+
+# ---- fn extraction ----------------------------------------------------------
+#
+# A single low-level scanner (`_skip_token`) knows how to step over anything
+# that is not plain code — a line or block comment, a "..." or raw string, a
+# char literal — and both the signature scan and the body scan share it. A
+# bug fixed here (a char literal that closes on a brace or a quote, a raw
+# string with hashes) is fixed in both places at once, instead of twice or
+# once.
+
+
+def _skip_token(text: str, i: int) -> int:
+    """If position `i` opens a comment, string, char, or raw-string literal,
+    return the index just past it. Otherwise return `i` unchanged — the
+    caller treats `text[i]` as one plain code character."""
+    n = len(text)
+    if text.startswith("//", i):
+        j = text.find("\n", i)
+        return n if j == -1 else j
+    if text.startswith("/*", i):
+        j = text.find("*/", i + 2)
+        return n if j == -1 else j + 2
+    m = _RAW_STRING_OPEN.match(text, i)
+    if m:
+        close = '"' + m.group("hashes")
+        j = text.find(close, m.end())
+        return n if j == -1 else j + len(close)
+    c = text[i]
+    if c == '"':
+        j = i + 1
+        while j < n and text[j] != '"':
+            j += 2 if text[j] == "\\" else 1
+        return min(j + 1, n)
+    if c == "'":
+        # A char literal ('a', '\n', '{', '"', '\u{2581}') always closes on a
+        # `'` at a fixed offset once its own escape is accounted for; a
+        # lifetime ('a, 'static) never does. Only consume it as a literal if
+        # the expected closing quote is actually there.
+        if i + 1 < n and text[i + 1] == "\\":
+            if text[i + 2 : i + 4] == "u{":
+                close_brace = text.find("}", i + 4)
+                j = close_brace + 1 if close_brace != -1 else i + 3
+            else:
+                j = i + 3
+        else:
+            j = i + 2
+        if j < n and text[j] == "'":
+            return j + 1
+        return i + 1
+    return i
+
+
+@dataclass
+class FnInfo:
+    name: str
+    line: int
+    signature: str
+    body: str
+    file: str = ""
+
+
+def scan_after_name(text: str, start: int) -> tuple[str, tuple[int, int] | None]:
+    """From just past an `fn NAME`, scan the parameter list, return type and
+    where clause. A top-level `;` (paren/bracket depth 0) is a body-less
+    declaration — a trait method or an `extern` block signature — and is
+    refused rather than let the scan run on to steal the next `fn`'s body. A
+    top-level `{` opens the body. Depth tracking is what keeps an array
+    type's `[u8; 4]` from reading as the declaration's own terminator."""
+    i, n = start, len(text)
+    depth = 0
+    while i < n:
+        j = _skip_token(text, i)
+        if j != i:
+            i = j
+            continue
+        c = text[i]
+        if c in "([":
+            depth += 1
+        elif c in ")]":
+            depth = max(0, depth - 1)
+        elif depth == 0 and c == ";":
+            return text[start:i], None
+        elif depth == 0 and c == "{":
+            return text[start:i], (i, _scan_body(text, i))
+        i += 1
+    return text[start:n], None
+
+
+def _scan_body(text: str, start: int) -> int:
+    """End (exclusive) of the balanced `{ ... }` opened at `start`."""
+    i, n = start, len(text)
+    depth = 0
+    while i < n:
+        j = _skip_token(text, i)
+        if j != i:
+            i = j
+            continue
+        c = text[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return n
+
+
+def extract_fns(text: str) -> tuple[list[FnInfo], int]:
+    """Every `fn` in `text` that has a body — keyed by (name, line), so two
+    declarations sharing a name (an inherent method and a trait impl of the
+    same name, say) are both kept rather than one silently overwriting the
+    other. Returns `(fns, skipped)`: `skipped` counts declarations this
+    scanner deliberately did not extract (body-less — a trait method or an
+    `extern` signature) — a caller-visible count, not a silent drop."""
+    fns: list[FnInfo] = []
+    skipped = 0
+    for m in _FN_SIG.finditer(text):
+        sig, body_span = scan_after_name(text, m.end())
+        if body_span is None:
+            skipped += 1
+            continue
+        start, end = body_span
+        line = text.count("\n", 0, m.start()) + 1
+        fns.append(FnInfo(name=m.group("name"), line=line, signature=sig, body=text[start:end]))
+    return fns, skipped

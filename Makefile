@@ -472,25 +472,25 @@ hooks:           ## install the pre-commit git hook
 
 # ---- advisory tooling --------------------------------------------------
 file-size-report: ## advisory: print source files >1000 LOC (non-failing)
-	@bash scripts/file_size_report.sh
+	@python3 scripts/report/debt_report.py --file-sizes
 
 debt-report: ## advisory: sibling similarity, debt counters, add/remove ratio, oversized docs (non-failing; also runs at the end of `make ci`)
-	@bash scripts/debt_report.sh
+	@python3 scripts/report/debt_report.py
 
 debt-report-selftest: ## CI gate: recall test for debt-report over synthetic fixtures — a planted twin, a non-twin, the round-loop group, and a two-commit ratio repo
-	@bash scripts/debt_report_selftest.sh
+	@bash scripts/report/debt_report_selftest.sh
 
 check-doc-size: ## CI gate: fail naming every docs/**/*.md over 40 KiB or carrying a size-exempt marker (exit 2: cannot measure)
-	@python3 scripts/lib/debt_report.py --check-doc-size
+	@python3 scripts/report/debt_report.py --check-doc-size
 
 check-doc-size-selftest: ## CI gate: recall test for check-doc-size over throwaway git trees, each case asserting its exit code and reason
-	@bash scripts/check_doc_size_selftest.sh
+	@bash scripts/report/doc_size_selftest.sh
 
 kv-update-census: ## advisory: the KV structural figures — variant shapes, match sites a new codec must touch, subset sites (matches!, if-let, catch-all) and table sites, per-variant update bodies (non-failing)
-	@python3 scripts/kv_update_census.py all
+	@python3 scripts/report/debt_report.py --kv-census all
 
 kv-update-census-selftest: ## CI gate: recall test for the KV structural figures over planted fixtures — a hidden site, a collapsed one, a tree that cannot be measured — and the real tree's figures, pinned exactly (a failing pin prints the figure, the pin and what to do)
-	@bash scripts/kv_update_census_selftest.sh
+	@bash scripts/report/kv_census_selftest.sh
 
 check-no-inline-tests: ## CI gate: fail if any non-test.rs file has inline #[cfg(test)] mod tests { ... }
 	@bash scripts/check_no_inline_tests.sh
@@ -703,11 +703,11 @@ check-metal-format: ## CI gate: every .metal kernel is clang-format clean (skips
 
 # ---- one-shot CI gate -------------------------------------------------
 ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gate: fmt + clippy + test + feature-gated capture tests + deny + audit + metrics-sanity + inline-test + A/B-harness + MSL gates
-	@bash scripts/debt_report_selftest.sh
-	@bash scripts/check_doc_size_selftest.sh
-	@python3 scripts/lib/debt_report.py --check-doc-size
+	@bash scripts/report/debt_report_selftest.sh
+	@bash scripts/report/doc_size_selftest.sh
+	@python3 scripts/report/debt_report.py --check-doc-size
 	@bash scripts/release/release_cpu_selftest.sh
-	@bash scripts/kv_update_census_selftest.sh
+	@bash scripts/report/kv_census_selftest.sh
 	@bash scripts/check_no_inline_tests.sh
 	@bash scripts/check_no_scalar_f32_leak.sh
 	@bash scripts/check_kv_layer_quants.sh
@@ -763,9 +763,9 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@$(MAKE) --no-print-directory check-published-table
 	@bash scripts/check_metal_format.sh
 	@bash scripts/check_metal_compiles.sh
-	@bash scripts/file_size_report.sh || true
+	@python3 scripts/report/debt_report.py --file-sizes || true
 	@bash scripts/target_size_report.sh || true
-	@bash scripts/debt_report.sh || true
+	@python3 scripts/report/debt_report.py || true
 	@echo "ci ok"
 
 # tag: derive v<version> from the single source of truth

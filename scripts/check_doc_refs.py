@@ -129,7 +129,7 @@ INLINE_LINK = re.compile(r"\]\(\s*<?([^()\s<>]+)>?(?:\s+\"[^\"]*\")?\s*\)")
 LINK_DEF = re.compile(r"^\s*(?://[/!]?\s*|#\s*)?\[[^\]]+\]:\s*<?(\S+?)>?(?:\s|$)", re.M)
 MAP_ROW = re.compile(r"^\| \[`([^`]+)`\]\(([^)]+)\)", re.M)
 COMMENT_LEADER = re.compile(r"\\?\n\s*(?://[/!]?|#|\*|>|--)?\s*")
-FIXTURE_PATH = re.compile(r"^scripts/[^/]+_(?:selftest|fixtures)\.sh$")
+FIXTURE_PATH = re.compile(r"^scripts/(?:[^/]+/)*[^/]+_(?:selftest|fixtures)\.sh$")
 FIXTURE_MARKER = re.compile(r"^\s*(?:#|//)\s*doc-refs: fixture\b", re.M)
 # A run-in heading: a paragraph that opens with a bold title, `**Title.** Text`.
 # A run-in heading opens a paragraph with a bold title that ends in a period

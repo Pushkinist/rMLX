@@ -326,7 +326,7 @@ The figures are printed by tools, not recorded here:
 - `make kv-update-census`: the variant shapes, the `match` sites over
   `KvStorage` or `KvQuant` that name at least half the enum (and those with no
   catch-all arm, which a new codec must touch), and the `update_` bodies.
-- `scripts/debt_report.sh --matched-lines <population>`: the duplication
+- `scripts/report/debt_report.py --matched-lines <population>`: the duplication
   figure per population. The KV ones are `rotor-storage`, `iso-storage`,
   `turbo-storage`, `rotor-updates`, `iso-updates`, `turbo-updates`,
   `turbo-ssd` and `update-bodies`.

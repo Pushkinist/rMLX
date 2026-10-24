@@ -267,14 +267,14 @@ The checklist:
    over both trees, and compare. A new file or fn pair in the report is a
    finding. It gets a const-generic or trait issue.
    ```sh
-   bash scripts/debt_report.sh --root ../rmlx-retro-prev > .rmlx/tmp/retro-prev.txt
-   bash scripts/debt_report.sh --root ../rmlx-retro-new --since "$PREV" > .rmlx/tmp/retro-new.txt
+   python3 scripts/report/debt_report.py --root ../rmlx-retro-prev > .rmlx/tmp/retro-prev.txt
+   python3 scripts/report/debt_report.py --root ../rmlx-retro-new --since "$PREV" > .rmlx/tmp/retro-new.txt
    diff .rmlx/tmp/retro-prev.txt .rmlx/tmp/retro-new.txt
-   pops=$(python3 -c 'import sys; sys.path.insert(0, "scripts/lib"); import debt_report; print(*sorted(debt_report.MATCHED_LINES_POPULATIONS))')
+   pops=$(python3 -c 'import sys; sys.path.insert(0, "scripts/report"); import debt_report; print(*sorted(debt_report.MATCHED_LINES_POPULATIONS))')
    for tree in prev new; do
      for p in $pops; do
        printf '%s: ' "$p"
-       bash scripts/debt_report.sh --root "../rmlx-retro-$tree" --matched-lines "$p" 2>&1 | tail -1
+       python3 scripts/report/debt_report.py --root "../rmlx-retro-$tree" --matched-lines "$p" 2>&1 | tail -1
      done > ".rmlx/tmp/retro-lines-$tree.txt"
    done
    diff .rmlx/tmp/retro-lines-prev.txt .rmlx/tmp/retro-lines-new.txt

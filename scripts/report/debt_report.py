@@ -1,9 +1,26 @@
-"""scripts/lib/debt_report.py — technical-debt report and the doc-size gate.
+#!/usr/bin/env python3
+"""Advisory reports about the tree, the doc-size gate and the KV structural figures.
 
-Four sections, in order: sibling-file/fn similarity ("twins"), debt counters,
-the add/remove line ratio since the last tag, and oversized docs. Reads only
-files under ``--root`` (default: the repo this file lives in) plus ``git log``
-against that same working tree — no network, no other machine path.
+Usage:  debt_report.py [--root DIR] [--since REF]
+        debt_report.py --matched-lines POPULATION
+        debt_report.py --check-doc-size
+        debt_report.py --file-sizes [N]
+        debt_report.py --kv-census {variants,match-sites,update-bodies,refs,all}
+                       [--threshold N] [--file PATH] [--include-tests]
+Exit:   0 a report, a figure or a clean gate; 1 the doc-size gate failed,
+        ``--matched-lines`` has no population to measure, ``--kv-census``
+        refused a codec descriptor or a storage view, or the report's
+        ``--root`` is not a directory; 2 the tree cannot be measured
+LOC-exempt: the report and its modes share one fn scan and one entry
+
+The default mode is the report. ``--matched-lines``, ``--check-doc-size``,
+``--file-sizes`` and ``--kv-census`` are the other modes, one per run.
+``--kv-census`` runs ``kv_census.py``, a module of this tool.
+
+Report: four sections, in order: sibling-file/fn similarity ("twins"), debt
+counters, the add/remove line ratio since the last tag, and oversized docs.
+Reads only files under ``--root`` (default: the repo this file lives in) plus
+``git log`` against that same working tree — no network, no other machine path.
 
 ``--matched-lines <population>`` is a second, non-advisory mode: prints the
 summed pairwise ``difflib`` matched-line count for one named population and
@@ -66,12 +83,14 @@ the fourth section and exits 1 naming every doc over the cap and every doc
 carrying a ``size-exempt:`` marker, and exits 2 when the docs cannot be
 measured.
 
-Advisory (the four-section report only): this module never raises for
+``--file-sizes [N]`` prints the non-test Rust source files above N lines
+(default 1000), largest first, and the workspace total. Advisory: it never
+fails.
+
+Advisory (the four-section report only): it exits 0 and never raises for
 anything short of a caller error (a ``--root`` that does not exist) — an
 unavailable round-loop-driver scan prints ``unavailable (...)`` in its
-section rather than aborting the rest of the report. ``scripts/debt_report.sh``
-is the wrapper that also guarantees exit 0 for `make debt-report`, and
-forwards this module's own exit code for ``--matched-lines``.
+section rather than aborting the rest of the report.
 """
 
 from __future__ import annotations
@@ -86,6 +105,10 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+
+import kv_census
+from kv_census import UPDATE_DIR, UPDATE_FN_PATTERN, UPDATE_GLOB
+from rust_scan import FnInfo, extract_fns, is_test_path, scan_after_name
 
 SIM_THRESHOLD = 0.60
 DOC_SIZE_THRESHOLD_KIB = 40
@@ -102,12 +125,7 @@ KV_STORAGE_DIR = "crates/rmlx-kv-quant/src/storage"
 ROTOR_STORAGE_GLOB = "quant_rotor_*.rs"
 ISO_STORAGE_GLOB = "quant_iso_*.rs"
 TURBO_STORAGE_GLOB = "quant_k_turbo*.rs"
-KV_UPDATE_DIR = "crates/rmlx-kv-quant/src/kvcache"
-# The update path is one dispatch file plus one file per codec family. A glob,
-# never a file list, so one command measures the tree that held every family in
-# `update.rs` and the tree that split them out.
-KV_UPDATE_GLOB = "update*.rs"
-KV_UPDATE_ROOT = f"{KV_UPDATE_DIR}/{KV_UPDATE_GLOB}"
+KV_UPDATE_ROOT = f"{UPDATE_DIR}/{UPDATE_GLOB}"
 KV_SSD_BLOCK_IO_FILE = "crates/rmlx-kv-ssd/src/block_io.rs"
 # Name patterns, not prefixes: a family is a shape, and a prefix reads only the
 # fns that happen to lead with it. Each pattern is the codec's own token,
@@ -136,15 +154,6 @@ TURBO_UPDATE_FN_PATTERN = r"(^|_)t(urbo_)?sym(\d|_|$)"
 # suffix, and a digit-bearing pattern would find nothing and report the
 # population unavailable rather than a measured 0.
 TURBO_SSD_FN_PATTERN = r"(turbo|tsym)"
-# Every `update_`-prefixed fn of the update files, whatever family it belongs
-# to. The three family patterns above each read one codec's twins; this one
-# reads the whole prefixed population, which is what the "one update body per
-# store shape" step has to shrink. The prefix admits the shared entries the
-# dispatch reaches as well as the per-variant bodies — `update_and_sdpa_*`,
-# `update_decode_fp16*`, `update_prefill_raw` — and they are counted, because
-# any rule that dropped them would be a hand-drawn boundary over which body is
-# "per-variant" enough, and the label says what the prefix finds.
-UPDATE_FN_PATTERN = r"^update_"
 MODELS_SOURCE_DIR = "crates/rmlx-models/src"
 SSD_HYDRATE_FN_NAMES = ("from_hydrated", "hydrate")
 WORKSPACE_SOURCE_DIR = "crates"
@@ -161,31 +170,9 @@ DEBT_COMMENT_RE = re.compile(
 # (a line count in a comment, say) is left alone.
 _DIGIT_RUN = re.compile(r"(?<=[A-Za-z_])\d+|\d+(?=[A-Za-z_-])")
 
-_FN_SIG = re.compile(
-    r"^[ \t]*(?:pub(?:\([\w:]+\))?\s+)?"
-    r"(?:default\s+)?(?:async\s+)?(?:const\s+)?(?:unsafe\s+)?"
-    r"(?:extern\s+\"[^\"]*\"\s+)?fn\s+"
-    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\b",
-    re.MULTILINE,
-)
-
-# `r"..."`, `r#"..."#`, `r##"..."##`, and the byte-string forms `br"..."` /
-# `br#"..."#`. A raw string does not process `\` as an escape, so the plain
-# `"..."` scanner below would desync on one containing a literal backslash,
-# and does not stop at the first bare `"` when hashes are in play.
-_RAW_STRING_OPEN = re.compile(r'b?r(?P<hashes>#*)"')
-
 
 def normalize(text: str) -> str:
     return _DIGIT_RUN.sub("N", text)
-
-
-def is_test_path(path: Path) -> bool:
-    parts = path.parts
-    if "tests" in parts:
-        return True
-    name = path.name
-    return name == "tests.rs" or name.endswith("_tests.rs")
 
 
 def rust_files(root: Path, subdir: str, include_tests: bool) -> list[Path]:
@@ -196,133 +183,6 @@ def rust_files(root: Path, subdir: str, include_tests: bool) -> list[Path]:
     if not include_tests:
         out = [p for p in out if not is_test_path(p.relative_to(root))]
     return sorted(out)
-
-
-# ---- fn extraction ----------------------------------------------------------
-#
-# A single low-level scanner (`_skip_token`) knows how to step over anything
-# that is not plain code — a line or block comment, a "..." or raw string, a
-# char literal — and both the signature scan and the body scan share it. A
-# bug fixed here (a char literal that closes on a brace or a quote, a raw
-# string with hashes) is fixed in both places at once, instead of twice or
-# once.
-
-
-def _skip_token(text: str, i: int) -> int:
-    """If position `i` opens a comment, string, char, or raw-string literal,
-    return the index just past it. Otherwise return `i` unchanged — the
-    caller treats `text[i]` as one plain code character."""
-    n = len(text)
-    if text.startswith("//", i):
-        j = text.find("\n", i)
-        return n if j == -1 else j
-    if text.startswith("/*", i):
-        j = text.find("*/", i + 2)
-        return n if j == -1 else j + 2
-    m = _RAW_STRING_OPEN.match(text, i)
-    if m:
-        close = '"' + m.group("hashes")
-        j = text.find(close, m.end())
-        return n if j == -1 else j + len(close)
-    c = text[i]
-    if c == '"':
-        j = i + 1
-        while j < n and text[j] != '"':
-            j += 2 if text[j] == "\\" else 1
-        return min(j + 1, n)
-    if c == "'":
-        # A char literal ('a', '\n', '{', '"', '\u{2581}') always closes on a
-        # `'` at a fixed offset once its own escape is accounted for; a
-        # lifetime ('a, 'static) never does. Only consume it as a literal if
-        # the expected closing quote is actually there.
-        if i + 1 < n and text[i + 1] == "\\":
-            if text[i + 2 : i + 4] == "u{":
-                close_brace = text.find("}", i + 4)
-                j = close_brace + 1 if close_brace != -1 else i + 3
-            else:
-                j = i + 3
-        else:
-            j = i + 2
-        if j < n and text[j] == "'":
-            return j + 1
-        return i + 1
-    return i
-
-
-@dataclass
-class FnInfo:
-    name: str
-    line: int
-    signature: str
-    body: str
-    file: str = ""
-
-
-def _scan_after_name(text: str, start: int) -> tuple[str, tuple[int, int] | None]:
-    """From just past an `fn NAME`, scan the parameter list, return type and
-    where clause. A top-level `;` (paren/bracket depth 0) is a body-less
-    declaration — a trait method or an `extern` block signature — and is
-    refused rather than let the scan run on to steal the next `fn`'s body. A
-    top-level `{` opens the body. Depth tracking is what keeps an array
-    type's `[u8; 4]` from reading as the declaration's own terminator."""
-    i, n = start, len(text)
-    depth = 0
-    while i < n:
-        j = _skip_token(text, i)
-        if j != i:
-            i = j
-            continue
-        c = text[i]
-        if c in "([":
-            depth += 1
-        elif c in ")]":
-            depth = max(0, depth - 1)
-        elif depth == 0 and c == ";":
-            return text[start:i], None
-        elif depth == 0 and c == "{":
-            return text[start:i], (i, _scan_body(text, i))
-        i += 1
-    return text[start:n], None
-
-
-def _scan_body(text: str, start: int) -> int:
-    """End (exclusive) of the balanced `{ ... }` opened at `start`."""
-    i, n = start, len(text)
-    depth = 0
-    while i < n:
-        j = _skip_token(text, i)
-        if j != i:
-            i = j
-            continue
-        c = text[i]
-        if c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                return i + 1
-        i += 1
-    return n
-
-
-def extract_fns(text: str) -> tuple[list[FnInfo], int]:
-    """Every `fn` in `text` that has a body — keyed by (name, line), so two
-    declarations sharing a name (an inherent method and a trait impl of the
-    same name, say) are both kept rather than one silently overwriting the
-    other. Returns `(fns, skipped)`: `skipped` counts declarations this
-    scanner deliberately did not extract (body-less — a trait method or an
-    `extern` signature) — a caller-visible count, not a silent drop."""
-    fns: list[FnInfo] = []
-    skipped = 0
-    for m in _FN_SIG.finditer(text):
-        sig, body_span = _scan_after_name(text, m.end())
-        if body_span is None:
-            skipped += 1
-            continue
-        start, end = body_span
-        line = text.count("\n", 0, m.start()) + 1
-        fns.append(FnInfo(name=m.group("name"), line=line, signature=sig, body=text[start:end]))
-    return fns, skipped
 
 
 def fns_in_file(root: Path, path: Path) -> tuple[list[FnInfo], int]:
@@ -345,12 +205,12 @@ def extract_round_drafter_impls(text: str) -> list[FnInfo]:
     (every method it implements, not one at a time) — the unit the migration
     chunks measured duplication over once a drafter's round loop collapsed
     into the shared one and its own logic moved into this impl. Reuses
-    `_scan_after_name`, the same balanced-brace scanner `extract_fns` uses:
+    `scan_after_name`, the same balanced-brace scanner `extract_fns` uses:
     an impl header carries no `(` or `[` before its opening `{`, so the scan
     that finds a fn's body finds an impl block's just as well."""
     out: list[FnInfo] = []
     for m in _IMPL_ROUND_DRAFTER.finditer(text):
-        _sig, body_span = _scan_after_name(text, m.end())
+        _sig, body_span = scan_after_name(text, m.end())
         if body_span is None:
             continue
         start, end = body_span
@@ -636,8 +496,8 @@ MATCHED_LINES_POPULATIONS = {
         KV_UPDATE_ROOT,
         functools.partial(
             glob_fn_items,
-            directory=KV_UPDATE_DIR,
-            glob=KV_UPDATE_GLOB,
+            directory=UPDATE_DIR,
+            glob=UPDATE_GLOB,
             pattern=ISO_UPDATE_FN_PATTERN,
         ),
     ),
@@ -652,8 +512,8 @@ MATCHED_LINES_POPULATIONS = {
         KV_UPDATE_ROOT,
         functools.partial(
             glob_fn_items,
-            directory=KV_UPDATE_DIR,
-            glob=KV_UPDATE_GLOB,
+            directory=UPDATE_DIR,
+            glob=UPDATE_GLOB,
             pattern=TURBO_UPDATE_FN_PATTERN,
         ),
         width_pair_key,
@@ -683,8 +543,8 @@ MATCHED_LINES_POPULATIONS = {
         KV_UPDATE_ROOT,
         functools.partial(
             glob_fn_items,
-            directory=KV_UPDATE_DIR,
-            glob=KV_UPDATE_GLOB,
+            directory=UPDATE_DIR,
+            glob=UPDATE_GLOB,
             pattern=ROTOR_UPDATE_FN_PATTERN,
         ),
         width_pair_key,
@@ -700,9 +560,9 @@ MATCHED_LINES_POPULATIONS = {
         KV_UPDATE_ROOT,
         functools.partial(
             glob_fn_items,
-            directory=KV_UPDATE_DIR,
-            glob=KV_UPDATE_GLOB,
-            pattern=UPDATE_FN_PATTERN,
+            directory=UPDATE_DIR,
+            glob=UPDATE_GLOB,
+            pattern=UPDATE_FN_PATTERN.pattern,
         ),
     ),
 }
@@ -1078,8 +938,27 @@ def check_doc_size(root: Path) -> int:
     return 0
 
 
+def file_size_report(root: Path, threshold: int) -> None:
+    """`--file-sizes`: the non-test Rust source files above `threshold` lines,
+    largest first (equal sizes in reverse path order), and the workspace total."""
+    files = [
+        path
+        for path in rust_files(root, WORKSPACE_SOURCE_DIR, include_tests=False)
+        if "target" not in path.relative_to(root).parts
+    ]
+    sizes = [(path.read_bytes().count(b"\n"), str(path)) for path in files]
+    print(f"Files >{threshold} LOC (excluding tests/, tests.rs, *_tests.rs):")
+    print()
+    for lines, path in sorted((size for size in sizes if size[0] > threshold), reverse=True):
+        print(f"{lines:6d}  {path}")
+    print()
+    print(f"Workspace total (excluding test files): {sum(lines for lines, _path in sizes)} LOC")
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument(
         "--root",
         default=str(Path(__file__).resolve().parents[2]),
@@ -1088,9 +967,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--since",
         default=None,
-        help="git ref for the churn section (default: last tag)",
+        help="ref for the churn section (default: last tag)",
     )
-    parser.add_argument(
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument(
         "--matched-lines",
         choices=sorted(MATCHED_LINES_POPULATIONS),
         default=None,
@@ -1098,14 +978,55 @@ def main(argv: list[str] | None = None) -> int:
         "population, over that population's own root, and exit, instead of "
         "the full report",
     )
-    parser.add_argument(
+    modes.add_argument(
         "--check-doc-size",
         action="store_true",
         help=f"fail (exit 1) naming every docs/**/*.md over {DOC_SIZE_THRESHOLD_KIB} KiB "
         "and every size-exempt marker; exit 2 "
         "when the docs cannot be measured",
     )
+    modes.add_argument(
+        "--file-sizes",
+        nargs="?",
+        type=int,
+        const=LOC_THRESHOLD,
+        default=None,
+        metavar="N",
+        help=f"print the non-test Rust source files above N lines (default {LOC_THRESHOLD}), "
+        "largest first, and the workspace total",
+    )
+    modes.add_argument(
+        "--kv-census",
+        choices=kv_census.MODES,
+        default=None,
+        help="print the KV structural figures of one mode, or of three with 'all'; "
+        "exit 2 when the tree cannot be measured",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=int,
+        default=None,
+        help="with --kv-census: override the arm bar derived from each enum",
+    )
+    parser.add_argument(
+        "--file",
+        default=None,
+        help="with --kv-census refs: the file whose variant references are counted",
+    )
+    parser.add_argument(
+        "--include-tests",
+        action="store_true",
+        help="with --kv-census: count test files too",
+    )
     args = parser.parse_args(argv)
+    if not args.kv_census and (args.threshold is not None or args.file or args.include_tests):
+        parser.error("--threshold, --file and --include-tests need --kv-census")
+
+    if args.kv_census:
+        kv_census.run(
+            args.kv_census, Path(args.root).resolve(), args.threshold, args.include_tests, args.file
+        )
+        return 0
 
     root = Path(args.root)
     if not root.is_dir():
@@ -1114,6 +1035,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.check_doc_size:
         return check_doc_size(root)
+
+    if args.file_sizes is not None:
+        file_size_report(root, args.file_sizes)
+        return 0
 
     if args.matched_lines:
         try:
