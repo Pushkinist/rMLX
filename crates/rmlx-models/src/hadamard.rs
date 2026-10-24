@@ -14,6 +14,13 @@
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{hadamard_transform, multiply, Array, Device, Dtype};
 
+#[cfg(test)]
+thread_local! {
+    /// [`SignedBlockHadamard::forward`] calls made on this thread: what a test
+    /// reads to count the transforms one forward pass builds.
+    pub(crate) static FORWARD_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// One signed block Hadamard transform: a block size and one sign vector that
 /// covers the full input width.
 #[derive(Debug)]
@@ -69,6 +76,8 @@ impl SignedBlockHadamard {
     /// # Errors
     /// `Error::Model` when the last axis of `x` is not the sign width.
     pub fn forward(&self, x: &Array, device: Device) -> Result<Array> {
+        #[cfg(test)]
+        FORWARD_CALLS.with(|n| n.set(n.get() + 1));
         let shape = self.input_shape(x)?;
         // Explicit on purpose: the f32 signs would promote `x` anyway.
         let signed = multiply(&x.astype(Dtype::F32, device)?, &self.signs, device)?;
