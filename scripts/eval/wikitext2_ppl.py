@@ -23,7 +23,8 @@ Exit codes:
     75 measured, record pending: the PPL is printed, and its record did not
        land; the buffer file ``rmlx eval ppl`` named is kept for
        ``rmlx metrics record --replay-pending`` (docs/METRICS_DB.md section 13,
-       rule 24)
+       rule 24). A PPL outside the plausible band exits 2 even when its
+       record is also pending: 2 wins over 75.
 """
 
 from __future__ import annotations
