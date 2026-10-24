@@ -267,6 +267,14 @@ def apply_pins(found: list[Violation], pins: PinList) -> tuple[list[Violation], 
     return active, held
 
 
+def base_path(rule: str, path: str, renames: dict[str, str]) -> str:
+    """The path a pin had at the base: a moved file's old path; for a twin pair
+    `<a>+<b>`, the old path of each half, in sorted order."""
+    if rule == "twin":
+        return "+".join(sorted(renames.get(half, half) for half in path.split("+")))
+    return renames.get(path, path)
+
+
 def pin_growth(
     root: Path, sha: str, name: str, pins: PinList, renames: dict[str, str]
 ) -> tuple[list[Violation], str]:
@@ -282,7 +290,7 @@ def pin_growth(
     for (rule, path), pin in pins.pins.items():
         if rule not in (before.pinnable or ()):
             continue
-        old = before.pins.get((rule, renames.get(path, path)))
+        old = before.pins.get((rule, base_path(rule, path, renames)))
         if old is None:
             out.append(Violation("pin-new", PINS, pin.line, f"{rule} {path} is not pinned at the base"))
             continue

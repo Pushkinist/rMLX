@@ -606,6 +606,17 @@ twin_of 45 | sg_put "$root" check/a.sh
 st_case twin_pin_shrank 1 --what "one that shrank asks for the pin to be lowered" \
     --has "pin-stale: report/scripts_gate_pins.txt:4: twin check/a.sh+check/b.sh: figure is 25, pinned 45" -- sg_gate "$root"
 
+root=$(sg_fresh twin_pin_moved)
+twin_of 45 | sg_put "$root" check/a.sh
+twin_of 45 | sg_put "$root" check/b.sh
+sg_pins_file 'twin check/a.sh+check/b.sh 45' >"$root/$SG_PINS_REL"
+sg_reindex "$root"
+sg_commit_all "$root" "pin the pair"
+git -C "$root" mv scripts/check/a.sh scripts/check/z.sh
+sg_pins_file 'twin check/b.sh+check/z.sh 45' >"$root/$SG_PINS_REL"
+verdict twin_pin_follows_a_moved_file 0 "a pinned pair keeps its pin when one file moves and the pin line moves with it" "$root" \
+    --has "pinned: twin 1" --lacks "pin-new"
+
 # ---- lib-shadow ----------------------------------------------------------
 
 root=$(sg_fresh libshadow)

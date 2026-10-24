@@ -38,8 +38,8 @@ The figure of a pair is `matched_lines` (`report/debt_report.py
 --matched-lines`): the larger of the two directions of `difflib` over the
 significant lines of both files, digit-folded. A significant line is not blank,
 not a comment and not a bare closer (`fi`, `done`, `}`). A pair is a twin at 40
-matched lines, or at half of the smaller file's significant lines when that file
-has at least 20 of them; below 20 a header and a few lines of boilerplate would
+matched lines, or at half of the smaller file's significant lines (rounded up)
+when that file has at least 20 of them; below 20 a header and a few lines of boilerplate would
 make every small pair one. A shell file and a Python file are never compared. A
 pinned pair whose figure grows fails `twin-pin`. [gate: `twin`, `twin-pin`]
 
@@ -229,8 +229,9 @@ site count; one more site, or a larger count, fails `binary-literal-pin`. [gate:
   of names it reads; a name outside the set fails, and `pin-new` refuses a name
   added to a pin. `RMLX_BIN` (in `perf-iter/bench_decode_tps.sh`) and
   `RMLX_BINARY` (in `bench/codec_inertness_probe.sh` and `bench_codec_cell.sh`)
-  are pinned where they are read today; the `--binary` sweep removes them, and no
-  other file can add them. [gate: `env-knob`]
+  are pinned where they are read today, and `RMLX` is read by no file; the
+  `--binary` sweep removes the first two, and no other file can add any of the
+  three. [gate: `env-knob`]
 * File names use underscores. [gate: `name`] The repository root variable is
   `REPO_ROOT`, derived from the file's own location. A variable is a root
   variable when its value is, in shell, `dirname` of `$0` or `${BASH_SOURCE[0]}`
@@ -321,7 +322,7 @@ accepts every violation of that rule in that file and can only shrink. [gate]
 * A pin the base does not have, for a rule the base's `# pinnable:` line lists,
   fails (`pin-new`); so does a set member the base's pin for that file lacks and
   a measure above the base's. A moved file keeps its pin when the pin line moves
-  with it. A rule the base does not list is new and may seed pins.
+  with it, and a twin pin follows each of its two files. A rule the base does not list is new and may seed pins.
 * While the base has no pin list, the run prints `pins: <base> has no pin list;
   growth not checked` and `pin-new` has nothing to compare with. Until the pin
   list lands on `main`, the recall tests hold the per-rule counts as literals,
@@ -346,6 +347,8 @@ accepts every violation of that rule in that file and can only shrink. [gate]
 * Python newer than 3.9 that parses: a library call (`zip(strict=True)`,
   `int.bit_count`, `dataclass(slots=True)`), and a `|` union in an expression
   that runs (`isinstance(x, int | str)`, a type alias assignment).
+* A Python body whose interpreter is held in a variable or called by another
+  name than `python` or `python3` (`heredoc`).
 * `set` options given any other way than a `set` command in the file: on the
   shebang line, by a sourced file, or by `bash -e` in the caller.
 * An environment read written `$NAME` or `${NAME}`, one through `env` or
