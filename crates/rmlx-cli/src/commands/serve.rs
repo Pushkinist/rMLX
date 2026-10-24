@@ -620,12 +620,15 @@ pub(crate) fn run_serve(
     if let Some(name) = &project {
         per_project_budgets.insert(name.clone(), per_ns_bytes);
     }
-    rmlx_kv_ssd::ssd_tier::install_config(rmlx_kv_ssd::ssd_tier::SsdTierConfig {
-        per_namespace_budget_bytes: per_ns_bytes,
-        global_budget_bytes: global_bytes,
-        default_namespace: project,
-        per_project_budgets,
-    })
+    rmlx_kv_ssd::ssd_tier::install_config(
+        rmlx_kv_ssd::ssd_tier::SsdTierConfig {
+            per_namespace_budget_bytes: per_ns_bytes,
+            global_budget_bytes: global_bytes,
+            default_namespace: project,
+            per_project_budgets,
+        },
+        &rmlx_core::paths::cache_dir().join("kv"),
+    )
     .map_err(|e| anyhow::anyhow!("ssd-tier config: {e}"))?;
 
     // --draft-model activates SpeculativeGenerator

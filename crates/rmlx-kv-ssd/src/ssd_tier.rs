@@ -86,7 +86,9 @@ pub struct SsdTierConfig {
 static CONFIG: OnceLock<Option<SsdTierConfig>> = OnceLock::new();
 
 /// Install the process-global SSD-tier config and run the schema wipe pass
-/// (call once at serve startup, before any model loads).
+/// over `kv_root` (call once at serve startup, before any model loads).
+/// `serve` passes `<RMLX_HOME>/cache/kv`; the wipe and the pool eviction act
+/// on `kv_root` and nothing else.
 ///
 /// Per-namespace budget `0` AND global budget `0` install the OFF state
 /// (tier disabled). The wipe runs unconditionally on the first call, including
@@ -111,7 +113,7 @@ static CONFIG: OnceLock<Option<SsdTierConfig>> = OnceLock::new();
     reason = "tracing macros expand to expressions in macro position; adding ';' \
               would require rewriting as statement blocks — the existing form is clearer"
 )]
-pub fn install_config(cfg: SsdTierConfig) -> Result<()> {
+pub fn install_config(cfg: SsdTierConfig, kv_root: &Path) -> Result<()> {
     let tier_on = cfg.per_namespace_budget_bytes > 0 || cfg.global_budget_bytes > 0;
     let stored = if tier_on { Some(cfg) } else { None };
 
@@ -138,13 +140,12 @@ pub fn install_config(cfg: SsdTierConfig) -> Result<()> {
     }
 
     // single startup pass; runs BEFORE any namespace SsdKvIndex::open.
-    wipe_stale_schema_namespaces(&rmlx_core::paths::cache_dir().join("kv"));
+    wipe_stale_schema_namespaces(kv_root);
 
     // cross-namespace LRU enforcement. No-op when global_budget == 0.
     if let Some(c) = CONFIG.get().and_then(|v| v.as_ref()) {
         if c.global_budget_bytes > 0 {
-            let kv_root = rmlx_core::paths::cache_dir().join("kv");
-            match crate::ssd_index::evict_pool_lru_until(&kv_root, c.global_budget_bytes) {
+            match crate::ssd_index::evict_pool_lru_until(kv_root, c.global_budget_bytes) {
                 Ok(_) => {}
                 Err(e) => tracing::warn!(
                     error = %e,

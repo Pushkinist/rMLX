@@ -58,8 +58,10 @@ block is always re-prefilled. Paths go through
 
 ## SsdTierConfig
 
-`install_config` stores the config in a `OnceLock` once, before any model
-loads. A second call returns `Error::SsdTierAlreadyInstalled`.
+`install_config(cfg, kv_root)` stores the config in a `OnceLock` once, before
+any model loads. A second call returns `Error::SsdTierAlreadyInstalled`.
+`serve` passes `<RMLX_HOME>/cache/kv` as `kv_root`; the wipe and the pool
+eviction act on that directory alone.
 
 | Field | Meaning |
 |---|---|
