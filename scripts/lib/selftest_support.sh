@@ -1,9 +1,113 @@
 #!/usr/bin/env bash
-# selftest_support.sh — what the spec-bench self-tests share. Source it.
+# selftest_support.sh — what the self-tests share. Source it.
+#
+# The case runner (st_*) counts cases and prints one summary line. A harness
+# calls st_init, then st_case for a case that is a command, an exit code and
+# lines of output, or st_run + st_check + st_verdict for a case that also
+# inspects what the command left behind, then ends with st_done. Exit codes of
+# a harness on the runner: 0 every case held, 1 one did not or none ran,
+# 2 its fixtures could not be built.
 #
 # The two spec-bench tests drive a harness against a stub server and need a
 # stand-in for `python3` that stands between the harness and the client reader.
 # They and bench_llama_ab_selftest.sh need a wait that cannot hang.
+
+# st_init <suite> — zero the counters and make the scratch directory ST_WORK,
+# removed when the harness exits.
+st_init() {
+	ST_SUITE="$1"
+	ST_PASSED=0
+	ST_FAILED=0
+	ST_OUT=""
+	ST_RC=0
+	ST_WORK="$(mktemp -d "${TMPDIR:-/tmp}/${1}.XXXXXX")" || {
+		echo "${1}: cannot make a scratch directory" >&2
+		exit 2
+	}
+	trap st_cleanup EXIT
+}
+
+st_cleanup() {
+	[ -z "${ST_WORK:-}" ] || rm -rf "$ST_WORK"
+}
+
+# st_setup_fail <why> — a fixture could not be built: exit 2, not a red case.
+st_setup_fail() {
+	echo "${ST_SUITE}: cannot build fixtures: $1" >&2
+	exit 2
+}
+
+# st_git_root <name> — print $ST_WORK/<name>, made and initialised as a git work tree.
+st_git_root() {
+	local root="$ST_WORK/$1"
+	mkdir -p "$root" && git -C "$root" init -q || st_setup_fail "git init in $root"
+	printf '%s' "$root"
+}
+
+# st_run <cmd...> — run it with stdout and stderr together. ST_OUT holds the
+# output and ST_RC the exit code.
+st_run() {
+	ST_OUT=$("$@" 2>&1)
+	ST_RC=$?
+}
+
+# st_check <want-exit> [--has S]... [--lacks S]... — judge the last st_run:
+# print one reason per line for each condition that fails, nothing when all
+# hold. --has and --lacks match fixed strings anywhere in the output.
+st_check() {
+	local want="$1"
+	shift
+	[ "$ST_RC" -eq "$want" ] || echo "exit $ST_RC, want $want"
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+		--has) grep -qF -- "${2-}" <<<"$ST_OUT" || echo "no '${2-}' in the output" ;;
+		--lacks) ! grep -qF -- "${2-}" <<<"$ST_OUT" || echo "'${2-}' is in the output" ;;
+		*) echo "st_check: unknown option '$1'" ;;
+		esac
+		shift 2 || break
+	done
+}
+
+# st_verdict <name> <why> [<what>] — count the case as held when <why> is
+# empty; otherwise count it as failed and print <why> and the head of ST_OUT.
+st_verdict() {
+	local name="$1" why="$2" what="${3:-}"
+	if [ -z "$why" ]; then
+		ST_PASSED=$((ST_PASSED + 1))
+		printf '  ok   %s%s\n' "$name" "${what:+ - $what}"
+	else
+		ST_FAILED=$((ST_FAILED + 1))
+		printf '  FAIL %s%s\n' "$name" "${what:+ - $what}"
+		printf '%s\n' "$why" | sed 's/^/         /'
+		[ -z "$ST_OUT" ] || printf '%s\n' "$ST_OUT" | head -40 | sed 's/^/    | /'
+	fi
+	ST_OUT=""
+}
+
+# st_case <name> <want-exit> [--what S] [--has S]... [--lacks S]... -- <cmd...>
+# — run the command and hold it to an exact exit code and to lines of output.
+st_case() {
+	local name="$1" want="$2" what="" checks=()
+	shift 2
+	while [ "$#" -gt 0 ] && [ "$1" != -- ]; do
+		if [ "$1" = --what ]; then what="${2-}"; else checks+=("$1" "${2-}"); fi
+		shift 2 || break
+	done
+	[ "${1-}" = -- ] || { st_verdict "$name" "st_case: no '--' before the command" "$what"; return; }
+	shift
+	st_run "$@"
+	st_verdict "$name" "$(st_check "$want" ${checks[@]+"${checks[@]}"})" "$what"
+}
+
+# st_done — print the summary line; fail when a case failed or none ran.
+st_done() {
+	printf '%s: %d passed, %d failed\n' "$ST_SUITE" "$ST_PASSED" "$ST_FAILED"
+	if [ "$((ST_PASSED + ST_FAILED))" -eq 0 ]; then
+		echo "${ST_SUITE}: no case ran" >&2
+		return 1
+	fi
+	[ "$ST_FAILED" -eq 0 ]
+}
 
 # write_client_shim <dir> <delayed> [<step>] — write <dir>/bin/python3, a
 # stand-in for `python3` that watches the client reader and runs everything else
