@@ -47,17 +47,23 @@ pinned() {
     printf '%s' "$1.manifest"
 }
 
-# edit <file>: the same rounds, one accepted count moved on the first line.
-edit() {
-    python3 - "$1" <<'EOF'
+# retouch <file> <python statement>: run the statement on the first round line
+# of the file, named `first`, and write the file back.
+retouch() {
+    python3 - "$1" "$2" <<'EOF'
 import json, pathlib, sys
 p = pathlib.Path(sys.argv[1])
 lines = p.read_text().splitlines()
 first = json.loads(lines[0])
-first["accept"] = str(int(first["accept"]) + 1)
+exec(sys.argv[2])
 lines[0] = json.dumps(first)
 p.write_text("\n".join(lines) + "\n")
 EOF
+}
+
+# edit <file>: the same rounds, one accepted count moved on the first line.
+edit() {
+    retouch "$1" 'first["accept"] = str(int(first["accept"]) + 1)'
 }
 
 dir="$ST_WORK/true"; capture "$dir"; man=$(pinned "$dir")
@@ -127,6 +133,56 @@ st_case pair_not_pinned 2 --what "a test the manifest does not pin is refused" \
     --has "not one of the 6 pinned pairs" -- python3 "$TOOL" verify "$dir" "$man" --pair "${PAIR}_at_the_declared_block"
 st_case pair_without_name 2 --what "--pair with no name is refused" \
     --has "--pair takes one pinned test name" -- python3 "$TOOL" verify "$dir" "$man" --pair
+
+dir="$ST_WORK/timing"; capture "$dir"; man=$(pinned "$dir")
+retouch "$dir/$PAIR.photosynthesis.stable.jsonl" 'first["elapsed_ms"] = "3"'
+st_case timing_field_refused 2 --what "a cell that carries a wall-clock field is not a stable stream" \
+    --has "carries the wall-clock field(s)" -- python3 "$TOOL" verify "$dir" "$man"
+
+dir="$ST_WORK/absent"; capture "$dir"; man=$(pinned "$dir")
+retouch "$dir/$PAIR.photosynthesis.stable.jsonl" 'del first["emitted_total"]'
+st_case round_field_absent_refused 2 --what "a line without a round event's field is not a round stream" \
+    --has "carries no ['emitted_total']" -- python3 "$TOOL" verify "$dir" "$man"
+
+dir="$ST_WORK/blank"; capture "$dir"
+python3 -c 'import pathlib, sys; p = pathlib.Path(sys.argv[1]); t = p.read_text().splitlines(True); p.write_text(t[0] + "\n" + "".join(t[1:]) + "\n")' \
+    "$dir/$PAIR.photosynthesis.stable.jsonl"
+man=$(pinned "$dir")
+st_case blank_lines_skipped 0 --what "a blank line in a cell is not a round" \
+    --has "36 cells match" -- python3 "$TOOL" verify "$dir" "$man"
+
+dir="$ST_WORK/more_rounds"; capture "$dir"
+printf '%s\n' '{"round": "9999", "accept": "0", "num_draft": "4", "emitted_total": "1"}' \
+    >>"$dir/$PAIR.photosynthesis.stable.jsonl"
+st_case manifest_of_another_round_count_refused 2 --what "a manifest is not emitted from a capture whose round count moved" \
+    --has "A round count that moved is a round loop that changed" -- python3 "$TOOL" manifest "$dir"
+
+dir="$ST_WORK/extra_line"; capture "$dir"; man=$(pinned "$dir")
+printf '%064d      0  bogus.photosynthesis.stable.jsonl\n' 0 >>"$man"
+st_case manifest_extra_cell_refused 2 --what "a manifest that pins a cell the baseline is not over is refused" \
+    --has "it pins bogus.photosynthesis.stable.jsonl, which the baseline is not over" -- python3 "$TOOL" verify "$dir" "$man"
+
+dir="$ST_WORK/compensated"; capture "$dir"; man=$(pinned "$dir")
+python3 - "$man" <<'EOF'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+lines = p.read_text().splitlines()
+_, rounds0, _ = lines[0].split()
+digest, rounds1, name = lines[1].split()
+lines[1] = f"{digest}  {int(rounds1) + int(rounds0):>5}  {name}"
+p.write_text("\n".join(lines[1:]) + "\n")
+EOF
+st_case manifest_missing_cell_refused 2 --what "a manifest that lost a cell is refused though its round count still sums" \
+    --has "pins 35 of 36 cells" -- python3 "$TOOL" verify "$dir" "$man"
+
+dir="$ST_WORK/unpinned_cell"; capture "$dir"; man=$(pinned "$dir")
+cp "$dir/$PAIR.photosynthesis.stable.jsonl" "$dir/$PAIR.zzz-unpinned.stable.jsonl"
+st_case captured_cell_not_pinned 1 --what "a cell of a pinned pair that the manifest does not pin is a difference" \
+    --has "captured and the manifest pins no such cell" -- python3 "$TOOL" verify "$dir" "$man"
+
+dir="$ST_WORK/two_manifests"; capture "$dir"; man=$(pinned "$dir")
+st_case verify_takes_one_manifest 2 --what "a second manifest argument is refused, not ignored" \
+    --has "USAGE" -- python3 "$TOOL" verify "$dir" "$man" "$man"
 
 dir="$ST_WORK/real"; mkdir -p "$dir"
 printf '{"round": "0", "accept": "0", "num_draft": "4", "emitted_total": "1"}\n' \
