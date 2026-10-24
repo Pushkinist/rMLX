@@ -641,8 +641,8 @@ rmlx --metrics off serve --model <snapshot>
 
 `rmlx_metrics::mode::init` sets the mode once, at process start, and every
 writer reads it there. `off` stops the producers, so no record is built. A
-GPU-capture run is forced to `off`, because capture makes every timing false.
-`off` also stops the `metrics/baseline.csv` append of `rmlx baseline`.
+GPU-capture run records only as `diagnostic`, because capture makes every
+timing false. `off` also stops the `metrics/baseline.csv` append of `rmlx baseline`.
 
 `off` stops telemetry writes only. `rmlx metrics` read commands work in
 every mode. `rmlx metrics record` and `migrate` are explicit commands, not

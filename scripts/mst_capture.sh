@@ -223,7 +223,11 @@ csv="${base}.channels.csv"
 # and would otherwise reject the prefill and report a zero decode rate.
 max_ctx=$((PROMPT_TOKENS + MAX_TOKENS + 512))
 
-run_cmd=("$BIN" --metrics off baseline
+# Recorded as diagnostic: a traced run's numbers are perturbed, and a
+# diagnostic row reaches no champion and no gate. `baseline` records at exit, so
+# a run that --time-limit stops before it finishes leaves no row.
+run_cmd=("$BIN" baseline
+	--record --run-class diagnostic --label "mst_capture:${stamp}"
 	--model "$MODEL"
 	--kv-quant "$KV_QUANT"
 	--prompt-tokens "$PROMPT_TOKENS"
@@ -237,8 +241,7 @@ echo "trace:      $trace"
 # rows for this process. Print the command so it can be re-run by hand.
 echo "running:    ${run_cmd[*]}"
 
-# --launch, not --attach (trap 1). --metrics off because a traced run's numbers
-# are perturbed and must never reach runs.db.
+# --launch, not --attach (trap 1).
 xcrun xctrace record \
 	--template 'Metal System Trace' \
 	--no-prompt \

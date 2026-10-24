@@ -208,8 +208,43 @@ fn gpu_capture_refused_on_cpu_before_the_model_load() {
             "cpu",
             "--gpu-capture",
             "unused.gputrace",
+            "--record",
+            "--run-class",
+            "diagnostic",
         ],
         "--gpu-capture records a Metal trace and needs --device gpu",
+    );
+}
+
+#[cfg(feature = "metal-capture")]
+#[test]
+fn gpu_capture_records_only_as_diagnostic() {
+    assert_refused(
+        &[
+            "baseline",
+            "--model",
+            "{model}",
+            "--device",
+            "cpu",
+            "--gpu-capture",
+            "unused.gputrace",
+            "--record",
+            "--run-class",
+            "gate",
+        ],
+        "records only as --run-class diagnostic",
+    );
+    assert_refused(
+        &[
+            "baseline",
+            "--model",
+            "{model}",
+            "--device",
+            "cpu",
+            "--gpu-capture",
+            "unused.gputrace",
+        ],
+        "--record",
     );
 }
 

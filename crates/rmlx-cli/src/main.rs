@@ -1341,10 +1341,11 @@ enum Cmd {
         /// Metal inserts the capture layer at launch and cannot do so later.
         /// `scripts/gpu_capture.sh` handles both.
         ///
-        /// Capture perturbs every timing this command measures, so it cannot be
-        /// combined with `--record`.
+        /// Capture serialises every dispatch, so every timing this command
+        /// measures is false: the run needs `--record --run-class diagnostic`,
+        /// which keeps it out of `bests` and the gates.
         #[cfg(feature = "metal-capture")]
-        #[arg(long, value_name = "PATH", conflicts_with = "record")]
+        #[arg(long, value_name = "PATH", requires = "record")]
         gpu_capture: Option<PathBuf>,
         /// Decode steps to run before the GPU-capture window opens. Skipping the
         /// first steps keeps first-touch kernel compilation and pipeline warm-up
@@ -1778,28 +1779,6 @@ fn resolve_prompts_root(prompts_dir: Option<PathBuf>) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("prompts"))
 }
 
-/// Whether this invocation asks for a GPU trace capture.
-///
-/// Read before the metrics kill switch is resolved: a captured run's numbers are
-/// instrumentation artefacts, not measurements, and must not reach any metrics
-/// surface. See the call site in [`main`].
-#[cfg(feature = "metal-capture")]
-fn gpu_capture_requested(cmd: &Cmd) -> bool {
-    matches!(
-        cmd,
-        Cmd::Baseline {
-            gpu_capture: Some(_),
-            ..
-        }
-    )
-}
-
-/// Without the capture feature there is no flag to ask with.
-#[cfg(not(feature = "metal-capture"))]
-const fn gpu_capture_requested(_cmd: &Cmd) -> bool {
-    false
-}
-
 /// Refuse to measure against an MLX that is not the validated pair.
 ///
 /// The pin exists because a drifted MLX changes prefill throughput by ~3.8x
@@ -1864,20 +1843,7 @@ fn main() -> Result<()> {
     // Resolve the metrics kill switch exactly once, before anything can open
     // the DB or spawn the drainer. Every writer reads it from here; no call
     // site carries its own toggle.
-    //
-    // A GPU-capture run is instrumentation, not measurement: the capture layer
-    // serialises every dispatch and collapses decode to single-digit TPS, so
-    // every number the run produces is false. Force the switch off for it. The
-    // clap conflict with `--record` covers the §8.5 observations row only —
-    // the `events` rows and the `metrics/baseline.csv` append happen outside
-    // it, so without this a hand-run capture still wrote a ~2.5 TPS row into
-    // append-only surfaces.
-    let capture_forces_metrics_off = gpu_capture_requested(&cli.cmd);
-    rmlx_metrics::mode::init(if capture_forces_metrics_off {
-        rmlx_metrics::mode::MetricsMode::Off
-    } else {
-        cli.metrics_mode.mode()
-    });
+    rmlx_metrics::mode::init(cli.metrics_mode.mode());
 
     // Set RUST_BACKTRACE before init_tracing so the call happens while the
     // process is genuinely single-threaded — no background threads exist yet
@@ -1897,7 +1863,7 @@ fn main() -> Result<()> {
         }
     }
     let log_guard = init_tracing(&run_id, cli.log, cli.log_cap_mb)?;
-    let outcome = run(cli, &run_id, capture_forces_metrics_off);
+    let outcome = run(cli, &run_id);
     finish(log_guard, outcome)
 }
 
@@ -1927,7 +1893,7 @@ fn finish(log_guard: WorkerGuard, outcome: Result<i32>) -> Result<()> {
     reason = "run() is the top-level CLI dispatch — splitting fragments the \
               subcommand wiring, which must remain co-located for clap arg resolution"
 )]
-fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> {
+fn run(cli: Cli, run_id: &str) -> Result<i32> {
     // Record the nax-GEMM-kernel capability of the MLX this process loaded.
     // `rmlx-metrics` cannot read this itself (see `identity::set_mlx_nax`
     // doc) — `rmlx-cli` is the one binary that links both `rmlx-mlx` and
@@ -1938,14 +1904,6 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
     // cannot read the metallib, and that warning is the only record of *why* a
     // run ends up stamped `unknown` in an append-only table.
     rmlx_metrics::identity::set_mlx_nax(rmlx_mlx::nax_capability());
-
-    // Reported after tracing is up, since the decision above predates it.
-    if capture_forces_metrics_off {
-        info!(
-            "--gpu-capture: metrics forced off — a capture-distorted run writes no events \
-             row, no baseline.csv row and no observation"
-        );
-    }
 
     // Install the rotor-QJL toggle before any cache construction.
     // This is a process-wide one-shot OnceLock; safe to call once at startup.
@@ -2624,6 +2582,15 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
             gpu_capture_steps,
             kv_boundary_layers,
         } => {
+            #[cfg(feature = "metal-capture")]
+            if gpu_capture.is_some()
+                && run_class != Some(rmlx_metrics::run_class::RunClass::Diagnostic)
+            {
+                anyhow::bail!(
+                    "--gpu-capture makes every timing false, so the run records only as \
+                     --run-class diagnostic"
+                );
+            }
             rmlx_models::kv_cache::install_kv_boundary(kv_boundary_layers)?;
             refuse_to_measure_off_the_pin("rmlx baseline")?;
 

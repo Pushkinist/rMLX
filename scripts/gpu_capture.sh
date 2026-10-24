@@ -156,9 +156,11 @@ echo "trace:     $trace"
 # MTL_CAPTURE_ENABLED is Apple's — Metal reads it at launch to insert the
 # capture layer, and there is no in-process way to add it later. It is not an
 # rMLX configuration knob: the trace path and the window come from CLI flags.
-# --metrics off keeps a capture-distorted run out of runs.db.
+# The run is recorded as diagnostic: capture makes every timing false, and a
+# diagnostic row reaches no champion and no gate.
 MTL_CAPTURE_ENABLED=1 \
-	"$BIN" --metrics off baseline \
+	"$BIN" baseline \
+	--record --run-class diagnostic --label "gpu_capture:${stamp}" \
 	--model "$MODEL" \
 	--kv-quant "$KV_QUANT" \
 	--prompt-tokens "$PROMPT_TOKENS" \

@@ -85,7 +85,7 @@ These flags exist only in a binary built with
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
-| `--gpu-capture` | path | — | Writes a `.gputrace` of a window of decode steps. Conflicts with `--record`, and forces `--metrics off`. |
+| `--gpu-capture` | path | — | Writes a `.gputrace` of a window of decode steps. Requires `--record --run-class diagnostic`: capture makes every timing false. |
 | `--gpu-capture-skip` | u32 | `4` | Decode steps before the window. Requires `--gpu-capture`. |
 | `--gpu-capture-steps` | u32 | `8` | Decode steps in the window. Requires `--gpu-capture`. |
 
