@@ -607,6 +607,18 @@ kinds. The rows are inside their bounds, so a predicate names each.
     AND prompt_tokens = 14
     AND (notes IS NULL OR notes NOT LIKE '%decode_window=%');
   ```
+- **MLX snapshots filed under a GGUF weight label.** Early rMLX bench
+  scripts (`perf-iter/bench_decode_tps.sh` among them) labelled an MLX
+  `8bit` snapshot `q8_0` and a `4bit` one `q4_k_m` from a name table. rMLX
+  reads no GGUF, so an `rmlx` row carrying either label is one of these;
+  current producers read the label from the snapshot's `config.json`
+  (`METRICS_DB.md` §5.2):
+
+  ```sql
+  SELECT * FROM observations
+  WHERE backend = 'rmlx'
+    AND weight_quant IN ('q8_0', 'q4_k_m');
+  ```
 - **Speculative rows with `decode_config IS NULL`.** Migration 006 fills
   `decode_config` from the drafter that `notes` names
   (`rmlx_metrics::cell::decode_config_from_notes`). It writes no measurement.
