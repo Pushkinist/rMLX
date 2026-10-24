@@ -196,3 +196,18 @@ wait_until() {
 		/bin/sleep 0.1
 	done
 }
+
+# st_bounded <seconds> <command...> — run the command, killed after <seconds>
+# with exit 124 and a "timed out" line, so a loop is a red case and not a hung
+# run. `timeout(1)` is not on stock macOS.
+st_bounded() {
+	python3 -c '
+import subprocess, sys
+
+try:
+    sys.exit(subprocess.run(sys.argv[2:], timeout=float(sys.argv[1])).returncode)
+except subprocess.TimeoutExpired:
+    print(f"timed out after {sys.argv[1]} s")
+    sys.exit(124)
+' "$@"
+}

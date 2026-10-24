@@ -24,7 +24,7 @@ SUBST_RE = re.compile(r"\$\(([^()]*)\)")
 RULE_RE = re.compile(r"^([A-Za-z0-9_./ -]+?)\s*:(?![=:])")
 KEYWORDS = frozenset({"if", "then", "else", "elif", "do", "while", "until", "!", "{", "}", "time"})
 WRAPPERS = frozenset(
-    {"exec", "env", "command", "nohup", "nice", "timeout", "sudo", "builtin", "st_run"}
+    {"exec", "env", "command", "nohup", "nice", "timeout", "sudo", "builtin", "st_run", "st_bounded"}
 )
 INTERPRETERS = frozenset(
     {"bash", "sh", "zsh", "dash", "python", "python3", "awk", "gawk", "perl", "source", ".", "uv"}

@@ -72,22 +72,11 @@ recall_sh() {
     printf '%s\n' '#' '# Usage:  bash scripts/check/ok.sh' '# Exit:   0 held' "$caller" "$NAM" 'set -euo pipefail' 'exit 0'
 }
 
-# bounded <command>...: run it, killed after 60 seconds so a loop is a red case and not a hung run.
-bounded() {
-    python3 -c '
-import subprocess, sys
+GATE_TIMEOUT_S=60
 
-try:
-    sys.exit(subprocess.run(sys.argv[1:], timeout=60).returncode)
-except subprocess.TimeoutExpired:
-    print("timed out after 60 s")
-    sys.exit(124)
-' "$@"
-}
-
-# bounded_gate <root>: the gate over <root>, bounded.
+# bounded_gate <root>: the gate over <root>, killed after GATE_TIMEOUT_S seconds.
 bounded_gate() {
-    bounded python3 "$TOOL" --scripts --root "$1" --base HEAD
+    st_bounded "$GATE_TIMEOUT_S" python3 "$TOOL" --scripts --root "$1" --base HEAD
 }
 
 # gate_at <root> <ref>: the gate with <ref> as its base.
@@ -97,7 +86,7 @@ gate_at() {
 
 # reindex <root>: regenerate INDEX.md, so a case isolates the rule it plants.
 reindex() {
-    bounded python3 "$TOOL" --scripts --root "$1" --base HEAD --write-index >/dev/null 2>&1 || true
+    st_bounded "$GATE_TIMEOUT_S" python3 "$TOOL" --scripts --root "$1" --base HEAD --write-index >/dev/null 2>&1 || true
 }
 
 # row_line <root> <rel>: the INDEX.md line that holds the row for <rel>.
@@ -688,7 +677,8 @@ st_case caller_assignment_only_as_an_argument 1 --what "VAR=path with \$VAR used
 
 n=0
 for use in 'bash "$SUBJECT"' 'st_run "$SUBJECT"' 'st_case name 0 -- "$SUBJECT"' 'env -u A "$SUBJECT"' \
-    'T2="$SUBJECT"; bash "${T2}"' 'timeout 5 "$SUBJECT"' 'bounded python3 "$SUBJECT"'; do
+    'T2="$SUBJECT"; bash "${T2}"' 'timeout 5 "$SUBJECT"' 'bounded python3 "$SUBJECT"' \
+    'st_bounded 5 bash "$SUBJECT"'; do
     n=$((n + 1))
     root=$(fresh "caller_assign_used_$n")
     nocaller_sh 'exit 0' | put "$root" check/x.sh

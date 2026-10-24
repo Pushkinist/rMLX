@@ -35,22 +35,12 @@ fresh() {
 }
 
 # Every gate run is bounded, so a scan that backtracks without end is a failed
-# case (exit 124) rather than a hung selftest. `timeout(1)` is not on stock macOS.
+# case (exit 124) rather than a hung selftest.
 CASE_TIMEOUT_S=5
-bounded() {
-    python3 -c '
-import subprocess, sys
-try:
-    sys.exit(subprocess.run(sys.argv[2:], timeout=float(sys.argv[1])).returncode)
-except subprocess.TimeoutExpired:
-    print(f"timed out after {sys.argv[1]} s")
-    sys.exit(124)
-' "$CASE_TIMEOUT_S" "$@"
-}
 
 # doc_size_gate <root>: the doc-size gate over <root>, bounded.
 doc_size_gate() {
-    bounded python3 "$TOOL" --root "$1" --check-doc-size
+    st_bounded "$CASE_TIMEOUT_S" python3 "$TOOL" --root "$1" --check-doc-size
 }
 
 root=$(fresh clean)
@@ -176,6 +166,6 @@ root=$(fresh default_root)
 mkdir -p "$root/scripts/report"
 cp "$REPO_ROOT"/scripts/report/*.py "$root/scripts/report/"
 st_case default_root_is_the_tools_tree 0 --what "with no --root the gate measures the tree the tool sits in" \
-    --has "check-doc-size: ok (1 docs measured" -- bounded python3 "$root/scripts/report/debt_report.py" --check-doc-size
+    --has "check-doc-size: ok (1 docs measured" -- st_bounded "$CASE_TIMEOUT_S" python3 "$root/scripts/report/debt_report.py" --check-doc-size
 
 st_done
