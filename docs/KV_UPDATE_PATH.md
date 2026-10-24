@@ -377,5 +377,5 @@ keeps one structured parser per payload shape (`mixed_*`, `rot_k_v*`,
   `path = "warm_ttft_bypass"`. `crates/rmlx-cli/tests/e2e/runner.rs`,
   `crates/rmlx-models/tests/niah_long_context.rs` and
   `docs/KV_FUSED_KERNELS.md` read it.
-- The `kv_bytes` request-boundary event, which
-  `scripts/bench/tri_engine_summarize.py` reads from a run's stderr.
+- The `kv_bytes` request-boundary event, which a bench reads from a run's
+  stderr.

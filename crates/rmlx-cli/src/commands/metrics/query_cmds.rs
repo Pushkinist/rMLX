@@ -224,7 +224,7 @@ pub(super) fn cmd_regress(
     println!("{}", serde_json::to_string(&result)?);
     eprintln!("{}", result.message);
 
-    // Exit-code gate (mirrors regression_gate.sh idiom):
+    // Exit-code gate:
     // 125 = no champion or no data → bisect skip
     // 1 = regressed beyond threshold
     // 0 = within tolerance
@@ -256,7 +256,7 @@ pub(super) fn cmd_deltas(
         println!("{}", serde_json::to_string(r)?);
     }
     // No comparable rows (all baselines missing) → skip, not a false regression.
-    // Exit 125 matches the regression_gate.sh "git bisect skip" idiom.
+    // Exit 125 = measurement precondition failed, the `git bisect skip` convention.
     if exit_code {
         let has_baseline = rows.iter().any(|r| r.baseline_value.is_some());
         if has_baseline {

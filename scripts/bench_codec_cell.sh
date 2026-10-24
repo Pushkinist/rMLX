@@ -22,7 +22,7 @@
 #     Override: RMLX_BINARY=<path> to point at release-perf if available.
 #   - Binary path resolves to REPO_ROOT/target/release/rmlx by default; for parity
 #     with perf_canary.sh, set RMLX_BINARY=$REPO_ROOT/target/release-perf/rmlx.
-#   - The 3% regression gate threshold is enforced by regression_gate.sh / make canary-gate.
+#   - The 3% regression gate threshold is enforced by make canary-gate.
 #     This script only records; it does not gate.
 
 set -euo pipefail

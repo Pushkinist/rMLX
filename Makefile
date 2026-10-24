@@ -880,7 +880,7 @@ bench:           ## cargo bench -p rmlx-quant --bench dequant  (on-demand; not i
 # ---- perf-iter regression bench (on-demand; NOT part of make ci) ---------------
 # Runs the 3-model regression bench in series (one process at a time — Apple
 # Silicon Metal context rule).  Appends results to metrics/perf-iter/baseline.jsonl.
-# Use diff_baseline.sh afterwards to compare against a saved snapshot.
+# Compare two snapshots by diffing the JSONL files.
 #
 # Env-var overrides (all optional):
 #   MEASURE_RUNS=5   — more samples for stable per-finding numbers
@@ -897,7 +897,7 @@ perf-iter:       ## run 3-model regression bench in series (appends to metrics/p
 	MODEL_PATH="$(PERF_ITER_E4B)"  KV_QUANT=k8v8 bash scripts/perf-iter/bench_decode_tps.sh
 	@echo "=== perf-iter: Qwen3.8-27B-4bit k8v4 ==="
 	MODEL_PATH="$(PERF_ITER_QWEN38)" KV_QUANT=k8v4 bash scripts/perf-iter/bench_decode_tps.sh
-	@echo "=== perf-iter done. Compare with: bash scripts/perf-iter/diff_baseline.sh <prev.jsonl> metrics/perf-iter/baseline.jsonl ==="
+	@echo "=== perf-iter done. Compare against a saved snapshot of metrics/perf-iter/baseline.jsonl ==="
 
 # ---- canary TPS gate (DB-backed, release-perf binary) -----------------
 #

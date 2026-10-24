@@ -2,8 +2,7 @@
 
 This doc holds the decode-throughput anchors of the three test-target models.
 It also names the tools that measure a build against them. No program reads an
-anchor from this doc. `scripts/regression_gate.sh` takes the anchor as
-arguments, and `make canary-gate` reads `runs.db`.
+anchor from this doc. `make canary-gate` reads `runs.db`.
 
 ## Canary anchors (release-perf)
 
@@ -55,16 +54,6 @@ interleaved A/B run supports a direction between two builds.
   exit does not prove every cell was re-measured. Through `make`, a failed
   recipe line always reports `make`'s own exit code (2), not the
   underlying command's.
-- `scripts/regression_gate.sh <model> <baseline_tps> <baseline_stddev>
-  [--tolerance PCT]` compares the last CSV row naming the model with the
-  anchor given as arguments. The tolerance defaults to 3%. It widens to 5%
-  when that row's stddev exceeds half the tolerance band. Exit 0 is within
-  tolerance, 1 a regression, 125 a failed precondition (arguments, binary,
-  CSV, or a missing or unparseable row).
-
-The last CSV row for a model is its `k8vturbo3` arm, because the canary
-appends that row after the `auto` row. `regression_gate.sh` therefore
-compares the `k8vturbo3` median with the anchor.
 
 **The canary decodes greedily.** `rmlx baseline` samples at temperature 0, on
 the GPU-argmax path. A served request resolves its temperature in the order

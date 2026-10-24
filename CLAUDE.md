@@ -553,8 +553,7 @@ are at the bf16 `auto` default (Bonsai ~142, Gemma4-e4b ~80, Qwen3.6 ~101
 TPS). The `canary` target stops no process and deletes no claim file: when
 another process holds the Metal claim, `perf_canary.sh` exits 11 and names the
 holder. For automated gates use `make canary-gate SHA=<sha>` against
-`runs.db`, or `scripts/regression_gate.sh <model> <baseline_tps>
-<baseline_stddev>`: exit 125 = `git bisect skip`, exit 1 = regression.
+`runs.db`; exit 125 = `git bisect skip`, exit 1 = regression.
 Through `make canary-gate`, a failed recipe line always reports `make`'s own
 exit code (2) — a regression, an unknown SHA and the underlying skip
 condition all surface as the same 2. Call `rmlx metrics deltas
