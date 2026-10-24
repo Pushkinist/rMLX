@@ -179,6 +179,8 @@ HOSTILE_SHA="a', 'b': __import__('os').system('touch $WORK/pwned'), 'c': 'd"
 
 CASE="$WORK/decode_sha_is_data"
 mkdir -p "$CASE/home" "$CASE/model/ns__m"
+# 8-bit affine: a label read off the name `m` could only guess.
+printf '{"quantization": {"group_size": 64, "bits": 8}}\n' >"$CASE/model/ns__m/config.json"
 rm -f "$WORK/pwned"
 set +e
 (
@@ -207,6 +209,9 @@ bad=""
 filed="$(python3 -c 'import json, sys
 print(json.load(open(sys.argv[1])).get("git_sha"))' "$CASE/home/recorded.json" 2>/dev/null || echo "no record")"
 [ "$filed" = "$HOSTILE_SHA" ] || bad="$bad; filed git_sha=$filed"
+filed_wq="$(python3 -c 'import json, sys
+print(json.load(open(sys.argv[1])).get("weight_quant"))' "$CASE/home/recorded.json" 2>/dev/null || echo "no record")"
+[ "$filed_wq" = 8bit ] || bad="$bad; filed weight_quant=$filed_wq (want the config's 8bit)"
 jsonl="$(python3 -c 'import json, sys
 print(json.loads(open(sys.argv[1]).readline()).get("git_sha"))' "$CASE/home/metrics/perf-iter/baseline.jsonl" 2>/dev/null || echo "no line")"
 [ "$jsonl" = "$HOSTILE_SHA" ] || bad="$bad; jsonl git_sha=$jsonl"
