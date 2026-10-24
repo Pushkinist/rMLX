@@ -7,9 +7,9 @@
 //!
 //! # DB location
 //!
-//! The index lives at `<rmlx_core::paths::kv_cache_dir(namespace)>/index.db`.
-//! The path is always resolved through `rmlx_core::paths` — never a
-//! hard-coded or CWD-relative string.
+//! The index lives at `<kv_root>/<namespace>/index.db`. The caller names the
+//! KV root: `serve` passes `<RMLX_HOME>/cache/kv` once, to
+//! [`crate::ssd_tier::install_config`], and the attach path hands that root on.
 //!
 //! # Schema (version `SCHEMA_VERSION`)
 //!
@@ -269,7 +269,7 @@ pub struct NamespaceEviction {
 /// One `SsdKvIndex` instance per namespace. The index DB is opened once and
 /// kept open for the lifetime of the struct. The `namespace` is typically
 /// `"<model_id>"` or the `--project P` override; it is only used to derive the
-/// DB path via [`rmlx_core::paths::kv_cache_dir`]. The layout-key column lets
+/// DB path below the caller's KV root. The layout-key column lets
 /// the SAME namespace hold disjoint per-layout rows.
 #[allow(
     clippy::exhaustive_structs,
@@ -286,9 +286,10 @@ impl std::fmt::Debug for SsdKvIndex {
 }
 
 impl SsdKvIndex {
-    /// Open (or create) the index for `namespace`.
+    /// Open (or create) the index for `namespace` below `kv_root`.
     ///
-    /// The DB is placed at `<kv_cache_dir(namespace)>/index.db`. Behaviour:
+    /// The DB is placed at `<kv_root>/<namespace>/index.db`; the namespace
+    /// directory is created when missing. Behaviour:
     ///
     /// 1. No tables yet → create the current schema + insert `schema_version`.
     /// 2. `kv_blocks` but **no `schema_version` table** → this is a pre-release
@@ -297,8 +298,9 @@ impl SsdKvIndex {
     /// 4. `schema_version == SCHEMA_VERSION` → proceed.
     ///
     /// Concurrent first opens of one namespace both succeed.
-    pub fn open(namespace: &str) -> Result<Self> {
-        let dir = rmlx_core::paths::kv_cache_dir(namespace);
+    pub fn open(kv_root: &Path, namespace: &str) -> Result<Self> {
+        let dir = kv_root.join(namespace);
+        std::fs::create_dir_all(&dir)?;
         let db_path = dir.join("index.db");
         tracing::debug!(
             namespace,

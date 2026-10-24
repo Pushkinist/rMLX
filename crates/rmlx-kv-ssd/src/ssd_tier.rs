@@ -5,7 +5,7 @@
 //! - `block_io` — serialize / deserialize a post-prefill snapshot to a
 //!   `.kvb` safetensors file.
 //! - `SsdKvIndex` — SQLite index of those blocks with LRU-by-size
-//!   eviction, under `paths::kv_cache_dir(<namespace>)`.
+//!   eviction, under `<kv_root>/<namespace>/`.
 //! - `SsdSpiller` — a background drain thread that persists RAM-evicted
 //!   prompt-cache entries to the tier (`PromptCache::set_spill_sink`).
 //! - `SsdHydrator` — reads the longest cached block-aligned prefix back
@@ -83,12 +83,14 @@ pub struct SsdTierConfig {
     pub per_project_budgets: std::collections::BTreeMap<String, u64>,
 }
 
-static CONFIG: OnceLock<Option<SsdTierConfig>> = OnceLock::new();
+/// The installed config and the KV root it governs, `None` when the tier is OFF.
+static CONFIG: OnceLock<Option<(SsdTierConfig, std::path::PathBuf)>> = OnceLock::new();
 
 /// Install the process-global SSD-tier config and run the schema wipe pass
 /// over `kv_root` (call once at serve startup, before any model loads).
-/// `serve` passes `<RMLX_HOME>/cache/kv`; the wipe and the pool eviction act
-/// on `kv_root` and nothing else.
+/// `serve` passes `<RMLX_HOME>/cache/kv`; the wipe, the pool eviction and every
+/// namespace a later [`prepare_attach`] opens act on `kv_root` and nothing
+/// else.
 ///
 /// Per-namespace budget `0` AND global budget `0` install the OFF state
 /// (tier disabled). The wipe runs unconditionally on the first call, including
@@ -115,7 +117,11 @@ static CONFIG: OnceLock<Option<SsdTierConfig>> = OnceLock::new();
 )]
 pub fn install_config(cfg: SsdTierConfig, kv_root: &Path) -> Result<()> {
     let tier_on = cfg.per_namespace_budget_bytes > 0 || cfg.global_budget_bytes > 0;
-    let stored = if tier_on { Some(cfg) } else { None };
+    let stored = if tier_on {
+        Some((cfg, kv_root.to_path_buf()))
+    } else {
+        None
+    };
 
     if CONFIG.set(stored).is_err() {
         tracing::error!(
@@ -125,7 +131,7 @@ pub fn install_config(cfg: SsdTierConfig, kv_root: &Path) -> Result<()> {
         );
         return Err(Error::SsdTierAlreadyInstalled);
     }
-    if let Some(c) = CONFIG.get().and_then(|v| v.as_ref()) {
+    if let Some((c, _)) = CONFIG.get().and_then(|v| v.as_ref()) {
         tracing::info!(
             per_namespace_budget_bytes = c.per_namespace_budget_bytes,
             per_namespace_budget_gib =
@@ -143,7 +149,7 @@ pub fn install_config(cfg: SsdTierConfig, kv_root: &Path) -> Result<()> {
     wipe_stale_schema_namespaces(kv_root);
 
     // cross-namespace LRU enforcement. No-op when global_budget == 0.
-    if let Some(c) = CONFIG.get().and_then(|v| v.as_ref()) {
+    if let Some((c, _)) = CONFIG.get().and_then(|v| v.as_ref()) {
         if c.global_budget_bytes > 0 {
             match crate::ssd_index::evict_pool_lru_until(kv_root, c.global_budget_bytes) {
                 Ok(_) => {}
@@ -159,6 +165,11 @@ pub fn install_config(cfg: SsdTierConfig, kv_root: &Path) -> Result<()> {
 
 /// The active SSD-tier config, or `None` if the tier is OFF / unconfigured.
 pub fn active() -> Option<SsdTierConfig> {
+    installed().map(|(cfg, _)| cfg)
+}
+
+/// The active config and its KV root, or `None` if the tier is OFF.
+fn installed() -> Option<(SsdTierConfig, std::path::PathBuf)> {
     CONFIG.get().cloned().flatten()
 }
 
@@ -256,7 +267,9 @@ pub fn compute_layout_key(
 #[derive(Debug, Clone)]
 #[allow(clippy::exhaustive_structs, reason = "internal closed bridge struct")]
 pub struct AttachInfo {
-    /// Resolved namespace under `<RMLX_HOME>/cache/kv/<namespace>/`.
+    /// The KV root [`install_config`] was given; `namespace` lives below it.
+    pub kv_root: std::path::PathBuf,
+    /// Resolved namespace under `<kv_root>/<namespace>/`.
     pub namespace: String,
     /// Stable u64 over
     /// `(arch, per-layer codec vector, n_kv_heads, head_dim, kv_quant)`.
@@ -285,8 +298,8 @@ pub struct AttachInfo {
 ///   (a caller that dropped the vector — folding a zero-length layout would
 ///   make distinct layouts share a key, which is the whole point of the fold).
 /// - `Some(info)` otherwise; the caller then dispatches to the per-arch
-///   `attach_ssd_tier` with the contained `(namespace, kv_quant, layout_key,
-///   device)`.
+///   `attach_ssd_tier` with the contained `(kv_root, namespace, kv_quant,
+///   layout_key, device)`.
 ///
 /// The wrapper retains all the side effects the previous `attach_at_load`
 /// performed pre-dispatch: layout-key logging, prune + evict-to-budget pass,
@@ -300,7 +313,7 @@ pub fn prepare_attach(
     head_dim: usize,
     device: Device,
 ) -> Option<AttachInfo> {
-    let cfg = active()?; // tier OFF — true no-op, spill/hydrate hooks never installed
+    let (cfg, kv_root) = installed()?; // tier OFF — true no-op, spill/hydrate hooks never installed
     let kv_quant = keyable_layout(arch, model_id, kv_quant, layer_quants)?;
     let namespace = namespace_for(&cfg, model_id);
 
@@ -322,13 +335,7 @@ pub fn prepare_attach(
     // Startup maintenance: drop rows whose .kvb vanished, then evict
     // oldest-first until the persisted footprint is within budget.
     let effective_per_ns = effective_namespace_budget(&cfg);
-    // Open the namespace index here — this is the single `paths::home()`
-    // resolution on the attach path — then hand the opened handle to the
-    // maintenance routine. Keeping the open at the boundary means the
-    // maintenance logic itself takes its root explicitly (the index already
-    // carries it) and never re-resolves the process-global home, which is
-    // what makes it testable against an injected temp dir.
-    match SsdKvIndex::open(namespace.as_ref()) {
+    match SsdKvIndex::open(&kv_root, namespace.as_ref()) {
         Ok(index) => startup_maintenance(&index, namespace.as_ref(), effective_per_ns),
         Err(e) => tracing::warn!(
             namespace = %namespace,
@@ -338,6 +345,7 @@ pub fn prepare_attach(
     }
 
     Some(AttachInfo {
+        kv_root,
         namespace: namespace.into_owned(),
         layout_key,
         kv_quant,
@@ -387,10 +395,8 @@ fn keyable_layout(
 /// error is `warn!`ed and the remaining steps proceed (the spiller opens its
 /// own index on its drain thread regardless).
 ///
-/// Takes the opened `index` explicitly rather than resolving it from the
-/// process-global home — the caller owns the one `paths::home()` resolution on
-/// the attach path. This keeps the routine root-injectable (tests open against
-/// a temp dir) and free of the `OnceLock` ordering hazard.
+/// Takes the opened `index`, so a test drives it over an index below a temp
+/// dir.
 #[allow(
     clippy::semicolon_if_nothing_returned,
     reason = "tracing macros expand to expressions in macro position; the trailing \

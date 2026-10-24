@@ -53,15 +53,19 @@ Qwen3-VL MoE, Laguna and BitNet. Any other class logs that it stays RAM-only.
 
 The namespace is `--project` when given, else the model id. A block covers
 whole 256-token blocks of the prompt (`BLOCK_TOKENS`); a trailing partial
-block is always re-prefilled. Paths go through
-`rmlx_core::paths::kv_cache_dir(namespace)`.
+block is always re-prefilled. `SsdKvIndex::open`, `SsdHydrator::open` and
+`SsdSpiller::spawn` take the KV root as a parameter and open
+`<kv_root>/<namespace>/`; none of them resolves the home.
 
 ## SsdTierConfig
 
 `install_config(cfg, kv_root)` stores the config in a `OnceLock` once, before
 any model loads. A second call returns `Error::SsdTierAlreadyInstalled`.
-`serve` passes `<RMLX_HOME>/cache/kv` as `kv_root`; the wipe and the pool
-eviction act on that directory alone.
+`serve` passes `<RMLX_HOME>/cache/kv` as `kv_root`, the one place it is
+resolved. The wipe and the pool eviction act on that directory alone, and the
+`OnceLock` keeps the root beside the config: `prepare_attach` returns it in
+`AttachInfo::kv_root`, and the arch's `attach_ssd_tier` hands it to the
+spiller and the hydrator.
 
 | Field | Meaning |
 |---|---|

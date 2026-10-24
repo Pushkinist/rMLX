@@ -104,17 +104,6 @@ pub fn cache_dir() -> PathBuf {
     p
 }
 
-/// `<home>/cache/kv/<namespace>/` — per-namespace KV-block SSD cache.
-///
-/// Each namespace (typically `<model_id>/<kv_quant>`) gets its own
-/// sub-directory so block files and the index DB are collocated.
-/// Created on demand, matching the pattern of the other path helpers.
-pub fn kv_cache_dir(namespace: &str) -> PathBuf {
-    let p = cache_dir().join("kv").join(namespace);
-    let _ = std::fs::create_dir_all(&p);
-    p
-}
-
 /// `<home>/bench/` — micro-benchmark artefacts (CSV rows, ad-hoc baselines).
 ///
 /// review LOW-4: canonical location for criterion / shell-script
