@@ -9,23 +9,22 @@
 # cases plant a `.gitignore` to prove the gate scans exactly the files git
 # does not ignore, and one runs outside any git work tree.
 #
-# Exit 0 = every case held. Exit 1 = at least one did not.
+# Exit 0 = every case held. Exit 1 = at least one did not. Exit 2 = a scan root
+# could not be built.
 
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GATE="$REPO_ROOT/scripts/check_claim_bypass.sh"
-WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
-
-FAILED=0
-PASSED=0
+# shellcheck source=scripts/lib/selftest_support.sh
+. "$REPO_ROOT/scripts/lib/selftest_support.sh"
+st_init check-claim-bypass-selftest
 
 # fresh <name>: a git work tree with one clean script in scope.
 fresh() {
-    local root="$WORK/$1"
+    local root
+    root="$(st_git_root "$1")"
     mkdir -p "$root/scripts"
-    git -C "$root" init -q || exit 1
     # shellcheck disable=SC2016 # the planted script must hold the literal $SERVER_PID
     printf '#!/bin/sh\nkill "$SERVER_PID"\nwait "$SERVER_PID"\n' >"$root/scripts/clean.sh"
     printf '%s' "$root"
@@ -35,28 +34,6 @@ fresh() {
 plant() {
     mkdir -p "$(dirname "$1/$2")"
     printf '# header\n%s\n' "$3" >"$1/$2"
-}
-
-# case_run <name> <what> <want-exit> <needle|-> <root>
-# <needle> is the "<rule>: <file>:2:" prefix a failing case must print.
-case_run() {
-    local name="$1" what="$2" want="$3" needle="$4" root="$5"
-    local out status
-    out=$(bash "$GATE" "$root" 2>&1)
-    status=$?
-    if [ "$status" -ne "$want" ]; then
-        echo "FAIL $name ($what): exit $status, want $want"
-        printf '%s\n' "$out" | sed 's/^/    /'
-        FAILED=$((FAILED + 1))
-        return
-    fi
-    if [ "$needle" != "-" ] && ! grep -qF -- "$needle" <<<"$out"; then
-        echo "FAIL $name ($what): output does not name '$needle'"
-        printf '%s\n' "$out" | sed 's/^/    /'
-        FAILED=$((FAILED + 1))
-        return
-    fi
-    PASSED=$((PASSED + 1))
 }
 
 # name | relpath | planted line | want-exit | needle ("-" = must pass)
@@ -126,14 +103,18 @@ for spec in "${CASES[@]}"; do
     line="${line//$'\x1f'/|}"
     root="$(fresh "$name")"
     plant "$root" "$rel" "$line"
-    case_run "$name" "$rel: $line" "$want" "$needle" "$root"
+    if [ "$needle" = - ]; then
+        st_case "$name" "$want" --what "$rel: $line" -- bash "$GATE" "$root"
+    else
+        st_case "$name" "$want" --what "$rel: $line" --has "$needle" -- bash "$GATE" "$root"
+    fi
 done
 
 # The gate's own files are outside its scope.
 root="$(fresh self_exclude)"
 plant "$root" scripts/check_claim_bypass.sh "rm -f /tmp/rmlx.claim; pkill -f rmlx"
 plant "$root" scripts/check_claim_bypass_selftest.sh "rm -f /tmp/rmlx.claim; pkill -f rmlx"
-case_run self_exclude "the gate and its selftest are not scanned" 0 - "$root"
+st_case self_exclude 0 --what "the gate and its selftest are not scanned" -- bash "$GATE" "$root"
 
 # The rows that document the gate say what it refuses without spelling a
 # refused command. They are planted as the tree has them, so a row reworded into
@@ -143,8 +124,7 @@ doc_rows_found=1
 for doc in CLAUDE.md scripts/INDEX.md; do
     rows="$(grep -F -e 'check-claim-bypass' -e 'check_claim_bypass' "$REPO_ROOT/$doc")"
     if [ "$(grep -c '' <<<"$rows")" -lt 2 ]; then
-        echo "FAIL doc_rows: $doc has fewer than two rows naming the gate"
-        FAILED=$((FAILED + 1))
+        st_verdict doc_rows "$doc has fewer than two rows naming the gate"
         doc_rows_found=0
         continue
     fi
@@ -152,34 +132,35 @@ for doc in CLAUDE.md scripts/INDEX.md; do
     printf '%s\n' "$rows" >"$root/$doc"
 done
 [ "$doc_rows_found" -eq 1 ] &&
-    case_run doc_rows "the gate's rows in CLAUDE.md and scripts/INDEX.md pass it" 0 - "$root"
+    st_case doc_rows 0 --what "the gate's rows in CLAUDE.md and scripts/INDEX.md pass it" -- bash "$GATE" "$root"
 
 # A scope with no file cannot pass.
-mkdir -p "$WORK/empty_scope/other"
-git -C "$WORK/empty_scope" init -q || exit 1
-printf 'rm -f /tmp/rmlx.claim\n' >"$WORK/empty_scope/other/notes.txt"
-case_run empty_scope "no in-scope file is exit 2, not a pass" 2 "unavailable: no in-scope file" "$WORK/empty_scope"
+root="$(st_git_root empty_scope)"
+mkdir -p "$root/other"
+printf 'rm -f /tmp/rmlx.claim\n' >"$root/other/notes.txt"
+st_case empty_scope 2 --what "no in-scope file is exit 2, not a pass" \
+    --has "unavailable: no in-scope file" -- bash "$GATE" "$root"
 
-case_run missing_root "a missing scan root is exit 2" 2 "is not a directory" "$WORK/does-not-exist"
+st_case missing_root 2 --what "a missing scan root is exit 2" \
+    --has "is not a directory" -- bash "$GATE" "$ST_WORK/does-not-exist"
 
 # A violation inside a git-ignored file is invisible to the gate; the same
 # violation in an untracked, not-ignored file is reported.
 root="$(fresh ignored_violation)"
 printf 'scripts/hidden.sh\n' >"$root/.gitignore"
 plant "$root" scripts/hidden.sh 'rm -f /tmp/rmlx.claim'
-case_run ignored_violation "a violation in a git-ignored file is not reported" 0 - "$root"
+st_case ignored_violation 0 --what "a violation in a git-ignored file is not reported" -- bash "$GATE" "$root"
 
 root="$(fresh untracked_violation)"
 plant "$root" scripts/visible.sh 'rm -f /tmp/rmlx.claim'
-case_run untracked_violation "the same violation, untracked but not git-ignored, is reported" \
-    1 "claim-delete: scripts/visible.sh:2:" "$root"
+st_case untracked_violation 1 --what "the same violation, untracked but not git-ignored, is reported" \
+    --has "claim-delete: scripts/visible.sh:2:" -- bash "$GATE" "$root"
 
 # Outside any git work tree the scope is unknown: fail closed, exit 2.
-root="$WORK/not_a_git_tree"
+root="$ST_WORK/not_a_git_tree"
 mkdir -p "$root/scripts"
 printf '#!/bin/sh\nrm -f /tmp/rmlx.claim\n' >"$root/scripts/x.sh"
-case_run not_a_git_tree "outside a git work tree the gate cannot scan: exit 2" \
-    2 "unavailable: git ls-files exit 128" "$root"
+st_case not_a_git_tree 2 --what "outside a git work tree the gate cannot scan: exit 2" \
+    --has "unavailable: git ls-files exit 128" -- bash "$GATE" "$root"
 
-echo "check-claim-bypass selftest: $PASSED passed, $FAILED failed"
-[ "$FAILED" -eq 0 ]
+st_done
