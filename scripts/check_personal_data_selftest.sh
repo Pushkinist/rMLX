@@ -78,6 +78,31 @@ t="$(new_tree binary)"
 printf 'jane%sgmail.com\000\001' "$AT" >"$t/blob.bin"
 st_case "a binary file is skipped" 0 --has "check-personal-data: ok" -- bash "$GATE" "$t"
 
+for domain in example.org example.net noreply.github.com; do
+    t="$(new_tree "placeholder-$domain")"
+    printf 'a x%s%s b\n' "$AT" "$domain" >"$t/ok.txt"
+    st_case "the placeholder domain $domain passes" 0 --has "check-personal-data: ok" -- bash "$GATE" "$t"
+done
+
+t="$(new_tree scratch-path)"
+printf 'tmp /private/tmp/%s/x\n' "claude" >"$t/c.txt"
+st_case "an assistant scratch path fails" 1 --has "home-path: c.txt:1:" -- bash "$GATE" "$t"
+
+t="$(new_tree tracked)"
+printf 'jane%sgmail.com\n' "$AT" >"$t/staged.txt"
+git -C "$t" add staged.txt
+st_case "a staged file is in scope" 1 --has "email: staged.txt:1:" -- bash "$GATE" "$t"
+
+t="$(new_tree own-files)"
+mkdir -p "$t/scripts"
+printf 'jane%sgmail.com\n' "$AT" >"$t/scripts/check_personal_data.sh"
+printf 'jane%sgmail.com\n' "$AT" >"$t/scripts/check_personal_data_selftest.sh"
+st_case "the gate and its selftest are not scanned" 0 --has "check-personal-data: ok" -- bash "$GATE" "$t"
+
+t="$(new_tree two-on-a-line)"
+printf 'jane%sgmail.com and joe%scorp.io\n' "$AT" "$AT" >"$t/two.txt"
+st_case "two addresses on one line are one violation" 1 --has "FAIL: 1 violation(s)" -- bash "$GATE" "$t"
+
 mkdir -p "$ST_WORK/nogit"
 printf 'x\n' >"$ST_WORK/nogit/a.txt"
 st_case "a root outside a git work tree cannot be scanned" 2 --has "git ls-files exit" -- bash "$GATE" "$ST_WORK/nogit"
