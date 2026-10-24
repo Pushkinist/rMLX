@@ -986,44 +986,81 @@ fn cell_predicate_reaches_every_consumer() {
     }
 }
 
-/// Every query that feeds a gate reads `gate` rows only. A body that lost the
-/// filter would rank an A/B slot against the champion it is not allowed to
-/// move.
 /// The readers of `read.rs` that show every class: a cell's history and its
-/// time series. Every other fn whose SQL reads `observations` feeds a gate or a
-/// published figure.
+/// time series.
 const HISTORY_READERS: [&str; 2] = ["history_sql", "timeseries_sql"];
 
-/// Each top-level fn of `source` as (name, text up to its closing brace).
-fn top_level_fns(source: &str) -> Vec<(&str, String)> {
-    let mut fns = Vec::new();
-    let mut current: Option<(&str, String)> = None;
-    for line in source.lines() {
-        let decl = ["fn ", "pub fn ", "pub(crate) fn ", "pub(super) fn "]
-            .iter()
-            .find_map(|prefix| line.strip_prefix(prefix));
-        if let Some(rest) = decl {
-            let name = rest.split(['(', '<']).next().unwrap_or(rest);
-            current = Some((name, String::new()));
-        }
-        if let Some((_, body)) = current.as_mut() {
-            body.push_str(line);
-            body.push('\n');
-        }
-        if line == "}" {
-            fns.extend(current.take());
-        }
-    }
-    fns
+/// A top-level item of a source file the scan reads: a fn up to its closing
+/// brace, or a `const` up to its closing semicolon.
+struct Item<'a> {
+    is_fn: bool,
+    name: &'a str,
+    text: String,
 }
 
+/// Every top-level fn and const of `source`, in order.
+fn top_level_items(source: &str) -> Vec<Item<'_>> {
+    let decl =
+        regex_lite::Regex::new(r"^(?:pub(?:\([a-z]+\))? )?(fn|const) ([A-Za-z_][A-Za-z0-9_]*)")
+            .unwrap();
+    let mut items = Vec::new();
+    let mut current: Option<Item<'_>> = None;
+    for line in source.lines() {
+        if current.is_none() {
+            if let Some(caps) = decl.captures(line) {
+                let is_fn = &caps[1] == "fn";
+                let name = caps.get(2).map_or("", |m| m.as_str());
+                current = Some(Item {
+                    is_fn,
+                    name,
+                    text: String::new(),
+                });
+            }
+        }
+        let Some(item) = current.as_mut() else {
+            continue;
+        };
+        item.text.push_str(line);
+        item.text.push('\n');
+        let closed = if item.is_fn {
+            line == "}"
+        } else {
+            line.trim_end().ends_with(';')
+        };
+        if closed {
+            items.extend(current.take());
+        }
+    }
+    items
+}
+
+/// Every query that feeds a gate reads `gate` rows only. A body that lost the
+/// filter would rank an A/B slot against the champion it is not allowed to
+/// move. So every top-level fn or const of `read.rs` whose SQL reads
+/// `observations` (`FROM` or `JOIN`, any case) must carry
+/// `bests_view::gate_rows_sql`, except [`HISTORY_READERS`], which show every
+/// class. The scan must see every fn the file declares, so a reader it cannot
+/// parse fails here rather than dropping out of the check.
 #[test]
 fn every_observations_reader_but_the_history_filters_on_the_gate_class() {
-    let readers: Vec<(&str, String)> = top_level_fns(include_str!("read.rs"))
-        .into_iter()
-        .filter(|(_, body)| body.contains("FROM observations"))
-        .collect();
-    let names: Vec<&str> = readers.iter().map(|(name, _)| *name).collect();
+    let source = include_str!("read.rs");
+    let items = top_level_items(source);
+    let declared = regex_lite::Regex::new(r"(?m)^\s*(?:pub(?:\([a-z]+\))? )?fn [A-Za-z_]")
+        .unwrap()
+        .find_iter(source)
+        .count();
+    let scanned = items
+        .iter()
+        .filter(|i| i.text.trim_start().contains("fn "))
+        .count();
+    assert_eq!(
+        scanned, declared,
+        "read.rs declares {declared} fns but the scan read {scanned}; a fn the scan cannot \
+         delimit (nested, or not closed by a bare `}}`) would escape the gate check"
+    );
+    let reads = regex_lite::Regex::new(r"(?i)\b(?:from|join)\s+observations\b").unwrap();
+    let readers: Vec<&Item<'_>> = items.iter().filter(|i| reads.is_match(&i.text)).collect();
+    let names: Vec<&str> = readers.iter().map(|i| i.name).collect();
     for history in HISTORY_READERS {
         assert!(
             names.contains(&history),
@@ -1035,13 +1072,15 @@ fn every_observations_reader_but_the_history_filters_on_the_gate_class() {
         readers.len() > HISTORY_READERS.len(),
         "the scan found no gate reader in read.rs: {names:?}"
     );
-    for (name, body) in &readers {
-        if HISTORY_READERS.contains(name) {
+    for item in &readers {
+        if HISTORY_READERS.contains(&item.name) {
             continue;
         }
         assert!(
-            body.contains("gate_rows_sql()"),
-            "{name} reads observations without `bests_view::gate_rows_sql`:\n{body}"
+            item.text.contains("gate_rows_sql()"),
+            "{} reads observations without `bests_view::gate_rows_sql`:\n{}",
+            item.name,
+            item.text
         );
     }
 }
