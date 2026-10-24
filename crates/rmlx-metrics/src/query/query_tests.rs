@@ -991,30 +991,57 @@ fn cell_predicate_reaches_every_consumer() {
 const HISTORY_READERS: [&str; 2] = ["history_sql", "timeseries_sql"];
 
 /// A top-level item of a source file the scan reads: a fn up to its closing
-/// brace, or a `const` up to its closing semicolon.
+/// brace, or a `const` / `static` up to its closing semicolon.
 struct Item<'a> {
     is_fn: bool,
     name: &'a str,
     text: String,
 }
 
-/// Every top-level fn and const of `source`, in order.
+/// Whether `line` closes a `const` item: it ends in `;` outside any string
+/// literal. `in_str` carries a string literal left open by an earlier line.
+fn ends_const(line: &str, in_str: &mut bool) -> bool {
+    let mut chars = line.chars().peekable();
+    let mut last = None;
+    while let Some(c) = chars.next() {
+        if *in_str {
+            match c {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => *in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => *in_str = true,
+            '/' if chars.peek() == Some(&'/') => break,
+            c if !c.is_whitespace() => last = Some(c),
+            _ => {}
+        }
+    }
+    !*in_str && last == Some(';')
+}
+
+/// Every top-level fn, `const` and `static` of `source`, in order.
 fn top_level_items(source: &str) -> Vec<Item<'_>> {
-    let decl =
-        regex_lite::Regex::new(r"^(?:pub(?:\([a-z]+\))? )?(fn|const) ([A-Za-z_][A-Za-z0-9_]*)")
-            .unwrap();
+    let decl = regex_lite::Regex::new(
+        r"^(?:pub(?:\([^)]*\))?\s+)?((?:(?:const|async|unsafe)\s+)*fn|const|static)\s+([A-Za-z_][A-Za-z0-9_]*)",
+    )
+    .unwrap();
     let mut items = Vec::new();
     let mut current: Option<Item<'_>> = None;
+    let mut in_str = false;
     for line in source.lines() {
         if current.is_none() {
             if let Some(caps) = decl.captures(line) {
-                let is_fn = &caps[1] == "fn";
-                let name = caps.get(2).map_or("", |m| m.as_str());
                 current = Some(Item {
-                    is_fn,
-                    name,
+                    is_fn: caps[1].ends_with("fn"),
+                    name: caps.get(2).map_or("", |m| m.as_str()),
                     text: String::new(),
                 });
+                in_str = false;
             }
         }
         let Some(item) = current.as_mut() else {
@@ -1025,7 +1052,7 @@ fn top_level_items(source: &str) -> Vec<Item<'_>> {
         let closed = if item.is_fn {
             line == "}"
         } else {
-            line.trim_end().ends_with(';')
+            ends_const(line, &mut in_str)
         };
         if closed {
             items.extend(current.take());
@@ -1034,55 +1061,113 @@ fn top_level_items(source: &str) -> Vec<Item<'_>> {
     items
 }
 
-/// Every query that feeds a gate reads `gate` rows only. A body that lost the
-/// filter would rank an A/B slot against the champion it is not allowed to
-/// move. So every top-level fn or const of `read.rs` whose SQL reads
-/// `observations` (`FROM` or `JOIN`, any case) must carry
-/// `bests_view::gate_rows_sql`, except [`HISTORY_READERS`], which show every
-/// class. The scan must see every fn the file declares, so a reader it cannot
-/// parse fails here rather than dropping out of the check.
-#[test]
-fn every_observations_reader_but_the_history_filters_on_the_gate_class() {
-    let source = include_str!("read.rs");
+/// The names of the items of `source` that read `observations` (`FROM` or
+/// `JOIN`, any case), and of those, the ones outside `history` that do not
+/// carry `bests_view::gate_rows_sql`. An error when the scan delimited fewer
+/// fns than `source` declares, so a reader it cannot parse fails the check
+/// rather than dropping out of it.
+fn gate_offenders(
+    source: &str,
+    history: &[&str],
+) -> std::result::Result<(Vec<String>, Vec<String>), String> {
     let items = top_level_items(source);
-    let declared = regex_lite::Regex::new(r"(?m)^\s*(?:pub(?:\([a-z]+\))? )?fn [A-Za-z_]")
-        .unwrap()
-        .find_iter(source)
-        .count();
-    let scanned = items
-        .iter()
-        .filter(|i| i.text.trim_start().contains("fn "))
-        .count();
-    assert_eq!(
-        scanned, declared,
-        "read.rs declares {declared} fns but the scan read {scanned}; a fn the scan cannot \
-         delimit (nested, or not closed by a bare `}}`) would escape the gate check"
-    );
+    let declared = regex_lite::Regex::new(
+        r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:const|async|unsafe)\s+)*fn\s+[A-Za-z_]",
+    )
+    .unwrap()
+    .find_iter(source)
+    .count();
+    let scanned = items.iter().filter(|i| i.is_fn).count();
+    if scanned != declared {
+        return Err(format!(
+            "the source declares {declared} fns but the scan read {scanned}; a fn the scan \
+             cannot delimit (nested, or not closed by a bare `}}`) would escape the gate check"
+        ));
+    }
     let reads = regex_lite::Regex::new(r"(?i)\b(?:from|join)\s+observations\b").unwrap();
     let readers: Vec<&Item<'_>> = items.iter().filter(|i| reads.is_match(&i.text)).collect();
-    let names: Vec<&str> = readers.iter().map(|i| i.name).collect();
+    let offenders = readers
+        .iter()
+        .filter(|i| !history.contains(&i.name) && !i.text.contains("gate_rows_sql()"))
+        .map(|i| i.name.to_owned())
+        .collect();
+    Ok((
+        readers.iter().map(|i| i.name.to_owned()).collect(),
+        offenders,
+    ))
+}
+
+/// Every query that feeds a gate reads `gate` rows only. A body that lost the
+/// filter would rank an A/B slot against the champion it is not allowed to
+/// move. So every top-level fn, `const` or `static` of `read.rs` whose SQL
+/// reads `observations` must carry `bests_view::gate_rows_sql`, except
+/// [`HISTORY_READERS`], which show every class.
+#[test]
+fn every_observations_reader_but_the_history_filters_on_the_gate_class() {
+    let (readers, offenders) = gate_offenders(include_str!("read.rs"), &HISTORY_READERS).unwrap();
     for history in HISTORY_READERS {
         assert!(
-            names.contains(&history),
+            readers.iter().any(|r| r == history),
             "{history} no longer reads observations; the allow-set names a reader that \
-             does not exist (found {names:?})"
+             does not exist (found {readers:?})"
         );
     }
     assert!(
         readers.len() > HISTORY_READERS.len(),
-        "the scan found no gate reader in read.rs: {names:?}"
+        "the scan found no gate reader in read.rs: {readers:?}"
     );
-    for item in &readers {
-        if HISTORY_READERS.contains(&item.name) {
-            continue;
-        }
-        assert!(
-            item.text.contains("gate_rows_sql()"),
-            "{} reads observations without `bests_view::gate_rows_sql`:\n{}",
-            item.name,
-            item.text
-        );
-    }
+    assert_eq!(
+        offenders,
+        Vec::<String>::new(),
+        "these read observations without `bests_view::gate_rows_sql`"
+    );
+}
+
+/// The scan reads every shape a reader can take: a lowercase `join`, a `const`
+/// whose SQL holds a `;`, a `const fn`, an `async fn` and a `pub(in …) fn`.
+#[test]
+fn the_gate_scan_reads_every_reader_shape() {
+    let source = r#"fn lower_join_reader() -> String {
+    "select v from x join observations o on o.id = x.id".to_owned()
+}
+
+const MULTI_STATEMENT: &str = "DELETE FROM t WHERE 1;
+SELECT value FROM observations WHERE metric = 'm'";
+
+pub const fn const_fn_reader() -> &'static str {
+    "SELECT value FROM observations"
+}
+
+async fn async_reader() -> String {
+    String::from("SELECT value FROM observations")
+}
+
+pub(in crate::query) fn scoped_reader() -> String {
+    "SELECT value FROM observations".to_owned()
+}
+
+fn gated() -> String {
+    format!("SELECT value FROM observations WHERE {}", crate::bests_view::gate_rows_sql())
+}
+"#;
+    let (readers, mut offenders) = gate_offenders(source, &[]).unwrap();
+    offenders.sort();
+    assert_eq!(readers.len(), 6, "{readers:?}");
+    assert_eq!(
+        offenders,
+        vec![
+            "MULTI_STATEMENT",
+            "async_reader",
+            "const_fn_reader",
+            "lower_join_reader",
+            "scoped_reader"
+        ]
+    );
+    let nested = "fn outer() {\n    fn inner() {}\n}\n";
+    assert!(
+        gate_offenders(nested, &[]).is_err(),
+        "a nested fn was not counted"
+    );
 }
 
 #[test]

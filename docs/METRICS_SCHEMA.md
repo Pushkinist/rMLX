@@ -306,10 +306,12 @@ The `WHERE` is generated. `bests_view::gate_rows_sql` renders the
 `run_class` filter from `RunClass::Gate`; `query::deltas`, `query::regress`
 and `query::champions` `AND` it in.
 `every_observations_reader_but_the_history_filters_on_the_gate_class` scans
-every top-level fn and `const` of `query/read.rs` whose SQL reads
-`observations` (`FROM` or `JOIN`, any case) and fails on one without it,
-except the history and time-series readers it names. It also fails when it
-cannot delimit every fn the file declares. `bests_view::plausible_sql` renders one
+every top-level fn (`const fn`, `async fn` and `pub(in …) fn` included),
+`const` and `static` of `query/read.rs` whose SQL reads `observations`
+(`FROM` or `JOIN`, any case) and fails on one without it, except the history
+and time-series readers it names. It also fails when it cannot delimit every
+fn the file declares; `the_gate_scan_reads_every_reader_shape` holds the scan
+to each of those shapes. `bests_view::plausible_sql` renders one
 branch per metric from the §4 registry's `Bounds`, which ingest enforces.
 `query::deltas`, `query::regress`, `query::timeseries` and
 `query::champions` `AND` in the same predicate.
