@@ -26,8 +26,9 @@
 #
 #   MODEL_PATH      abs path to snapshot directory
 #   ARCH_CLASS      e.g. Qwen3ForCausalLM
-#   WEIGHT_BITS     optional; inferred from MODEL_PATH if omitted
-#                   (e.g. "2bit", "8bit", "mxfp8")
+#   WEIGHT_BITS     optional; read from the snapshot's config.json through
+#                   scripts/lib/snapshot_identity.py if omitted
+#                   (e.g. "1bit", "8bit", "mxfp8")
 #   PROMPT_TOKENS   optional; default 4096 (=> longctx_4k.json)
 #
 set -uo pipefail
@@ -50,19 +51,14 @@ if [ ! -d "$MODEL_PATH" ]; then
   exit 2
 fi
 
-# Resolve WEIGHT_BITS heuristically when not supplied.
+# When not supplied, the weight label is the one the snapshot's own config
+# describes, read through the one shell-side producer of it.
 if [ -z "$WEIGHT_BITS_IN" ]; then
-  _BASE=$(basename "$MODEL_PATH")
-  case "$_BASE" in
-    *mxfp8*) WEIGHT_BITS_IN="mxfp8" ;;
-    *2bit*)  WEIGHT_BITS_IN="2bit" ;;
-    *3bit*)  WEIGHT_BITS_IN="3bit" ;;
-    *4bit*)  WEIGHT_BITS_IN="4bit" ;;
-    *6bit*)  WEIGHT_BITS_IN="6bit" ;;
-    *8bit*)  WEIGHT_BITS_IN="8bit" ;;
-    *PARO*|*paro*) WEIGHT_BITS_IN="paro" ;;
-    *)       WEIGHT_BITS_IN="unknown" ;;
-  esac
+  if ! _IDENTITY="$(python3 "$(dirname "$0")/lib/snapshot_identity.py" "$MODEL_PATH")"; then
+    echo "cannot label the snapshot's weights (above); pass WEIGHT_BITS" >&2
+    exit 2
+  fi
+  WEIGHT_BITS_IN="$(printf '%s\n' "$_IDENTITY" | sed -n 's/^weight_quant=//p')"
 fi
 
 # Map prompt tokens → prompt id (longctx_<N/1024>k).
