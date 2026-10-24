@@ -121,13 +121,17 @@ RUN_TS="$(date -u +%Y%m%dT%H%M%SZ)"
 # Outputs a single colon-separated string: "<decode_tps>:<prefill_tps>"
 run_once() {
     local output
-    output="$(RMLX_HOME="${RMLX_HOME}" "${BINARY}" baseline \
+    # `baseline --record` exits non-zero when its record did not land.
+    if ! output="$(RMLX_HOME="${RMLX_HOME}" "${BINARY}" baseline \
         --model "${MODEL_PATH}" \
         --kv-quant "${KV_QUANT}" \
         --prompt-tokens "${PROMPT_LEN}" \
         --max-tokens "${MAX_TOKENS}" \
         --record --run-class diagnostic --label "codec_cell:${RUN_TS}:${KV_QUANT}" \
-        2>/dev/null)"
+        2>/dev/null)"; then
+        echo "ERROR: ${KV_QUANT} × ${MODEL_BASENAME}: a run failed, or its record did not land (see ${RMLX_HOME}/logs)" >&2
+        exit 1
+    fi
     local dtps
     dtps="$(echo "${output}" | grep -o 'decode_tps=[0-9.]*' | cut -d= -f2 || true)"
     local ptps

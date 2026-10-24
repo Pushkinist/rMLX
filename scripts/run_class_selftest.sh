@@ -268,6 +268,17 @@ runs="$(grep -cE -- '--record --run-class diagnostic --label codec_cell:[0-9]{8}
 [ "$runs" = 4 ] || bad="$runs of 4 runs asked to record as diagnostic: $(head -1 "$ARGV_LOG")"
 verdict codec_cell_records_diagnostic "the warmup and the three measured runs record as diagnostic" "$bad"
 
+set +e
+STUB_NO_INGEST=k8v8 ARGV_LOG="$WORK/codec_cell_fail.argv" RMLX_BINARY="$PROBE_BIN" RMLX_HOME="$WORK/home" \
+	bash "$REPO_ROOT/scripts/bench_codec_cell.sh" --kv-quant k8v8 --model "$MODEL" \
+	>"$WORK/codec_cell_fail.out" 2>&1
+status=$?
+set -e
+bad=""
+[ "$status" -ne 0 ] || bad="exit 0 with a run whose record did not land"
+grep -q 'its record did not land' "$WORK/codec_cell_fail.out" || bad="${bad:+$bad; }no error saying so"
+verdict codec_cell_stops_on_a_record_that_did_not_land "a run whose record did not land stops the cell, saying so" "$bad"
+
 # The cache-type driver runs `target/release/rmlx` under its own root, so it
 # uses the fake root above; a smoke probe that exits 78 (an unsupported combo)
 # skips its cell, so no cell driver runs.
