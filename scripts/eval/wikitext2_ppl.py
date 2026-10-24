@@ -108,6 +108,14 @@ def parse_args() -> argparse.Namespace:
         "an omitted flag leaves the column NULL.",
     )
     p.add_argument(
+        "--run-class",
+        required=True,
+        choices=["gate", "ab_arm", "diagnostic"],
+        help="Why the run is recorded (docs/METRICS_DB.md §8.5): gate for a "
+        "published or release number, diagnostic for an investigation. Only "
+        "gate rows reach bests and the gates.",
+    )
+    p.add_argument(
         "--plausibility",
         action="store_true",
         help="Gate the result: exit 2 when PPL is outside (1.5, 50.0).",
@@ -198,7 +206,7 @@ def run_ppl(args: argparse.Namespace, text_path: Path, rmlx: Path) -> dict:
         "--corpus",
         args.corpus,
         "--run-class",
-        "gate",
+        args.run_class,
         "--device",
         args.device,
         "--max-tokens",
