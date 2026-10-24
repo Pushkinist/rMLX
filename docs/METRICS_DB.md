@@ -421,6 +421,9 @@ the exports, `make canary-gate`. `history` and `timeseries` read every class
 and show it. A record that states no class never reaches the gates, by two
 rules: `RunRecord::validate` refuses it, and a row written around the
 recorder stores `NULL`, which is not `gate` (`METRICS_SCHEMA.md` §3.2).
+Producers outside this repo state it too: the Cross-Backend-Bench runner
+(`../Cross-Backend-Bench/runners/_common.py`, `_build_metrics_record`), which
+`scripts/bench_cell.sh` hands its non-rMLX cells to, writes `gate`.
 
 **Optional keys**: `schema_version` (default `1`), `backend_version`,
 `git_sha`, `build_profile`, `prompt_tokens`, `max_tokens`, `temperature`,
@@ -773,10 +776,33 @@ change to what `bests` publishes, such as a `METRICS_SCHEMA.md` §4.1 bounds cha
     never from a literal (§8.5.1).
 21. **Record every measurement run, under its class** (§8.5). `gate`: a
     canary, a release gate, the surviving arm of an A/B recorded once.
-    `ab_arm`: every A/B slot; `scripts/perf_ab.sh` records each one.
-    `diagnostic`: profiling, traced and investigation runs. Only `gate` rows
-    reach `bests`, the gates and the exports. A GPU-capture run stays
-    `--metrics off` (§10.1.1). Bring a scratch DB's rows in with
-    `rmlx metrics import` (§11).
+    `ab_arm`: every A/B slot; `scripts/perf_ab.sh` and
+    `scripts/bench_llama_ab.sh` record each one. `diagnostic`: profiling,
+    traced and investigation runs, among them the canary's warmup and
+    measured calls, a GPU capture, a codec probe and the server's live
+    requests. Only `gate` rows reach `bests`, the gates and the exports.
+    Bring a scratch DB's rows in with `rmlx metrics import` (§11). Not
+    recorded, and why:
+    - `rmlx bench` (§8.1.1): recording it would need a record builder beside
+      `rmlx baseline`'s.
+    - A run that measured nothing: the canary's one-token codec probe, a
+      failed or skipped bench cell. The recorder refuses a record with no
+      measurement.
+    - A `scripts/mst_capture.sh` run its `--time-limit` stops: `baseline`
+      records at exit.
+    - A `scripts/perf_ab.sh` arm whose binary predates `--run-class`, and any
+      `--synthetic-arms` run: an old binary cannot state a class, and a stub
+      measures nothing.
 22. **A new rule, metric or backend** updates this doc or `METRICS_SCHEMA.md`,
     `CLAUDE.md` and `crates/rmlx-metrics/README.md` in the same change.
+23. **A binary built before migration 9 must not open a DB that holds
+    non-gate rows.** That includes an installed release binary run from inside
+    the repo, which resolves `<workspace>/.rmlx/`. Its writers rebuild `bests`
+    without the class filter, and its readers have none, so an `ab_arm` or
+    `diagnostic` row would win a champion and move a gate. A binary from
+    migration 9 on refuses a DB at a later version than it knows, naming both.
+    `make canary-gate` under `git bisect` builds the old commit's binary with
+    that commit's own `Makefile`, so a bisect across migration 9 runs the
+    gate's `metrics deltas --since-sha <SHA> --threshold-pct 3 --exit-code
+    true` with a binary built at or after migration 9, copied outside the
+    checkout.
