@@ -890,43 +890,12 @@ pub(crate) fn run_baseline(
         let path = write_buffer_record(&record)?;
         info!(path = %path.display(), "baseline: wrote §8.5 ingest record");
 
-        // Inline ingest so the row is visible to `rmlx metrics champions` /
-        // `bests` right away. Drop the buffer file on success; leave it for
-        // `rmlx metrics record --replay-pending` to pick up on failure.
-        let db_path = rmlx_core::paths::metrics_db_path();
-        match rmlx_metrics::schema::open_migrated(&db_path) {
-            Ok(mut conn) => {
-                let inserted_by = RunIdentity::get().inserted_by("rmlx-cli");
-                let mut rec_inst = rmlx_metrics::recorder::Recorder::new(&mut conn, inserted_by);
-                let run: rmlx_metrics::ingest::RunRecord = serde_json::from_value(record)
-                    .map_err(|e| anyhow::anyhow!("deserialize RunRecord: {e}"))?;
-                match rec_inst.record_run(&run) {
-                    Ok(outcome) => {
-                        info!(
-                            run_id = %outcome.run_id,
-                            inserted = outcome.observation_ids.len(),
-                            "baseline: ingested record into runs.db"
-                        );
-                        // Drop the buffer file: row is durable in the DB.
-                        let _ = std::fs::remove_file(&path);
-                    }
-                    Err(e) => {
-                        warn!(
-                            error = %e,
-                            buffer = %path.display(),
-                            "baseline: inline ingest failed; leaving buffer file for replay"
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    buffer = %path.display(),
-                    "baseline: cannot open metrics DB; leaving buffer file for replay"
-                );
-            }
-        }
+        ingest_buffer_record(
+            record,
+            &path,
+            &rmlx_core::paths::metrics_db_path(),
+            "baseline",
+        )?;
     }
 
     Ok(())
@@ -1189,6 +1158,44 @@ fn build_run_record(
         .insert("git_sha".to_string(), serde_json::Value::from(git_sha));
 
     Ok(record)
+}
+
+/// Record the §8.5 `record` that [`write_buffer_record`] left at `buffer` into
+/// the DB at `db_path`, so the row is visible to `bests` right away.
+///
+/// On success the buffer file is dropped. On failure it is kept for
+/// `rmlx metrics record --replay-pending` and the error names it: a run asked
+/// to record whose record did not land has not done what it was asked.
+pub(crate) fn ingest_buffer_record(
+    record: serde_json::Value,
+    buffer: &Path,
+    db_path: &Path,
+    what: &str,
+) -> anyhow::Result<()> {
+    let landed = (|| -> anyhow::Result<rmlx_metrics::recorder::RecordOutcome> {
+        let mut conn = rmlx_metrics::schema::open_migrated(db_path)?;
+        let inserted_by = RunIdentity::get().inserted_by("rmlx-cli");
+        let mut recorder = rmlx_metrics::recorder::Recorder::new(&mut conn, inserted_by);
+        let run: rmlx_metrics::ingest::RunRecord = serde_json::from_value(record)?;
+        Ok(recorder.record_run(&run)?)
+    })();
+    match landed {
+        Ok(outcome) => {
+            info!(
+                run_id = %outcome.run_id,
+                inserted = outcome.observation_ids.len(),
+                "{what}: ingested record into runs.db"
+            );
+            let _ = std::fs::remove_file(buffer);
+            Ok(())
+        }
+        Err(e) => Err(e.context(format!(
+            "{what}: the record did not reach {}; it is kept at {} for \
+             `rmlx metrics record --replay-pending`",
+            db_path.display(),
+            buffer.display()
+        ))),
+    }
 }
 
 /// Write a `RunRecord` JSON to `<RMLX_HOME>/metrics/buffer/pending/<ts>-<uniq>.json`.

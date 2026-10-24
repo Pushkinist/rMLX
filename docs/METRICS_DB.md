@@ -341,8 +341,9 @@ locked or missing DB.
 
 - `rmlx metrics record --file <path>` deletes the file on success. On
   failure it exits 1 and leaves the file in place.
-- `rmlx baseline --record` and `rmlx eval ppl` ingest in-process, delete the
-  file on success, and leave it in `pending/` on failure.
+- `rmlx baseline --record` and `rmlx eval ppl` ingest in-process and delete
+  the file on success. On failure they leave it in `pending/` and exit
+  non-zero, naming the file, after printing the measurement.
 - A script that calls `record --file` moves a rejected file to
   `buffer/failed/` for triage (`scripts/perf-iter/bench_decode_tps.sh`).
 - `rmlx metrics record --replay-pending` walks `pending/` in name order. It

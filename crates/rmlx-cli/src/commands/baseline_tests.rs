@@ -720,3 +720,59 @@ fn baseline_refuses_an_unrecordable_weight_quant_before_any_work() {
     assert!(msg.contains("weight_quant"), "{msg}");
     assert!(!msg.contains("cannot read prompt file"), "{msg}");
 }
+
+/// A record `ingest_buffer_record` is handed, with `decode_tps_warm` = `tps`.
+fn buffered_record(dir: &Path, tps: f64) -> (serde_json::Value, PathBuf) {
+    let record = serde_json::json!({
+        "backend": "rmlx",
+        "backend_version": "0.4.5",
+        "model_namespace": "host",
+        "model": "m",
+        "weight_quant": "bf16",
+        "kv_quant": "none",
+        "ctx_max": 8192,
+        "prompt": { "name": "p", "body": "hi" },
+        "ts_utc": "2026-10-01T00:00:00Z",
+        "hardware_tag": "m5_max_128gb",
+        "run_class": "diagnostic",
+        "metrics": [ { "name": "decode_tps_warm", "value": tps } ],
+    });
+    let buffer = dir.join("pending.json");
+    std::fs::write(&buffer, record.to_string()).expect("write buffer");
+    (record, buffer)
+}
+
+#[test]
+fn a_record_that_lands_drops_its_buffer_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (record, buffer) = buffered_record(tmp.path(), 50.0);
+    ingest_buffer_record(record, &buffer, &tmp.path().join("runs.db"), "baseline")
+        .expect("a plausible record lands");
+    assert!(!buffer.exists(), "the buffer file outlived its record");
+}
+
+#[test]
+fn a_record_the_recorder_refuses_is_an_error_naming_its_buffer_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (record, buffer) = buffered_record(tmp.path(), 0.0);
+    let err = ingest_buffer_record(record, &buffer, &tmp.path().join("runs.db"), "baseline")
+        .expect_err("a 0.0 rate is refused, so the run did not record");
+    let msg = format!("{err:#}");
+    assert!(msg.contains(&buffer.display().to_string()), "{msg}");
+    assert!(
+        buffer.exists(),
+        "the buffer file was dropped with nothing recorded"
+    );
+}
+
+#[test]
+fn a_db_that_cannot_be_opened_is_an_error_naming_the_buffer_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (record, buffer) = buffered_record(tmp.path(), 50.0);
+    let not_a_dir = tmp.path().join("file");
+    std::fs::write(&not_a_dir, "").expect("write file");
+    let err = ingest_buffer_record(record, &buffer, &not_a_dir.join("runs.db"), "baseline")
+        .expect_err("a DB under a regular file cannot be opened");
+    assert!(format!("{err:#}").contains(&buffer.display().to_string()));
+    assert!(buffer.exists());
+}

@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::commands::baseline::{resolve_record_identity, RecordIdentity};
+use crate::commands::baseline::{ingest_buffer_record, resolve_record_identity, RecordIdentity};
 use crate::commands::parse::ClaimedDevice;
 use anyhow::Result;
 use rmlx_metrics::identity::RunIdentity;
@@ -245,40 +245,12 @@ fn record_ppl_run(args: &PplRecordArgs<'_>) -> Result<()> {
     let buf_path = write_buffer_record(&record)?;
     info!(path = %buf_path.display(), "ppl: wrote §8.5 ingest record");
 
-    let db_path = rmlx_core::paths::metrics_db_path();
-    match rmlx_metrics::schema::open_migrated(&db_path) {
-        Ok(mut conn) => {
-            let inserted_by = RunIdentity::get().inserted_by("rmlx-cli");
-            let mut rec_inst = rmlx_metrics::recorder::Recorder::new(&mut conn, inserted_by);
-            let run: rmlx_metrics::ingest::RunRecord = serde_json::from_value(record)
-                .map_err(|e| anyhow::anyhow!("deserialize RunRecord: {e}"))?;
-            match rec_inst.record_run(&run) {
-                Ok(outcome) => {
-                    info!(
-                        run_id = %outcome.run_id,
-                        inserted = outcome.observation_ids.len(),
-                        "ppl: ingested record into runs.db"
-                    );
-                    let _ = std::fs::remove_file(&buf_path);
-                }
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        buffer = %buf_path.display(),
-                        "ppl: inline ingest failed; leaving buffer file for replay"
-                    );
-                }
-            }
-        }
-        Err(e) => {
-            warn!(
-                error = %e,
-                buffer = %buf_path.display(),
-                "ppl: cannot open metrics DB; leaving buffer file for replay"
-            );
-        }
-    }
-    Ok(())
+    ingest_buffer_record(
+        record,
+        &buf_path,
+        &rmlx_core::paths::metrics_db_path(),
+        "ppl",
+    )
 }
 
 /// Build a §8.5 universal `RunRecord` JSON for a completed PPL run.
