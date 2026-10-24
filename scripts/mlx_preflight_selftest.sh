@@ -133,7 +133,8 @@ st_case "a red line that names GREEN and INFO stops" 1 \
 c=$(new_case no-launch "Apple M5 Max" "$MLX_V" "$MLXC_V" yes "mlx_pin: GREEN — loaded mlx 9.9.9")
 printf '#!/usr/bin/env bash\nexit 1\n' >"$c/repo/target/release-perf/rmlx"
 st_case "a binary that cannot launch stops" 1 \
-	--has "PREFLIGHT FAIL: target/release-perf/rmlx cannot launch" -- preflight_run "$c"
+	--has "PREFLIGHT FAIL: target/release-perf/rmlx cannot launch" \
+	--has "Restore the nax-capable pair:  make mlx-restore-pin" -- preflight_run "$c"
 
 # The opt records would pass: a binary that cannot run must not fall through
 # to them.
@@ -150,11 +151,12 @@ st_case "a binary that prints no mlx_pin line stops" 1 \
 # No binary yet: the opt records stand in for the pair a build would load.
 c=$(new_case m2-no-binary "Apple M2 Pro" 9.9.8 8.8.7 no none)
 st_case "no binary, an M1-M4 Mac on another pair passes" 0 \
+	--has "note: no target/release-perf/rmlx yet" \
 	--has "preflight ok: Apple M2 Pro (no Neural Accelerator, the pin does not bind), mlx 9.9.8 + mlx-c 8.8.7, nax check skipped" -- preflight_run "$c"
 
 c=$(new_case m5-no-binary "Apple M5 Max" "$MLX_V" "$MLXC_V" yes none)
 st_case "no binary, an M5 Mac on the pinned pair passes" 0 \
-	--has "preflight ok: Apple M5 Max (the pin binds, or the chip is not identified), pinned mlx 9.9.9 + mlx-c 8.8.8" -- preflight_run "$c"
+	--has "preflight ok: Apple M5 Max (the pin binds, or the chip is not identified), pinned mlx 9.9.9 + mlx-c 8.8.8, 1 nax GEMM kernel occurrences" -- preflight_run "$c"
 
 c=$(new_case m5-no-binary-no-nax "Apple M5 Max" "$MLX_V" "$MLXC_V" no none)
 st_case "no binary, an M5 Mac without NAX kernels stops" 1 \
@@ -180,13 +182,23 @@ st_case "no binary, a brand that does not start with Apple M<n> is held to the p
 for brand in "apple m2" "APPLE M3" "  Apple M3 Max" "Apple M04"; do
 	c=$(new_case "exempt-$(printf '%s' "$brand" | tr -c 'A-Za-z0-9' _)" "$brand" 9.9.8 8.8.7 no none)
 	st_case "no binary, \"$brand\" is an M1-M4 Mac" 0 \
-	--has "(no Neural Accelerator, the pin does not bind), mlx 9.9.8 + mlx-c 8.8.7, nax check skipped" -- preflight_run "$c"
+		--has "(no Neural Accelerator, the pin does not bind), mlx 9.9.8 + mlx-c 8.8.7, nax check skipped" -- preflight_run "$c"
 done
 
 # parse_apple_generation takes only these three spellings of the vendor.
 c=$(new_case mixed-case-no-binary "aPPLE M2" 9.9.8 8.8.7 yes none)
 st_case "no binary, a vendor spelling the Rust parser refuses is held to the pin" 1 \
 	--has "linked mlx 9.9.8 + mlx-c 8.8.7 is not the pinned pair" -- preflight_run "$c"
+
+c=$(new_case m5-no-binary-mlx-only "Apple M5 Max" 9.9.8 "$MLXC_V" yes none)
+st_case "no binary, an M5 Mac on the pinned mlx-c and another mlx stops" 1 \
+	--has "linked mlx 9.9.8 + mlx-c 8.8.8 is not the pinned pair" \
+	--has "make mlx-restore-pin" -- preflight_run "$c"
+
+c=$(new_case m5-no-binary-mlxc-only "Apple M5 Max" "$MLX_V" 8.8.7 yes none)
+st_case "no binary, an M5 Mac on the pinned mlx and another mlx-c stops" 1 \
+	--has "linked mlx 9.9.9 + mlx-c 8.8.7 is not the pinned pair" \
+	--has "make mlx-restore-pin" -- preflight_run "$c"
 
 c=$(new_case m41-no-binary "Apple M41" 9.9.8 8.8.7 yes none)
 st_case "no binary, M41 is not M4" 1 \
@@ -195,17 +207,44 @@ st_case "no binary, M41 is not M4" 1 \
 c=$(new_case no-opt "Apple M2 Pro" 9.9.8 8.8.7 no none)
 rm "$c/prefix/opt/mlx-c"
 st_case "no binary, an opt record that does not resolve stops" 1 \
-	--has "PREFLIGHT FAIL: $c/prefix/opt/mlx-c does not resolve" -- preflight_run "$c"
+	--has "PREFLIGHT FAIL: $c/prefix/opt/mlx-c does not resolve" \
+	--has "Restore the nax-capable pair:  make mlx-restore-pin" -- preflight_run "$c"
+
+c=$(new_case no-opt-mlx "Apple M2 Pro" 9.9.8 8.8.7 no none)
+rm "$c/prefix/opt/mlx"
+st_case "no binary, an mlx opt record that does not resolve stops" 1 \
+	--has "PREFLIGHT FAIL: $c/prefix/opt/mlx does not resolve" \
+	--has "Restore the nax-capable pair:  make mlx-restore-pin" -- preflight_run "$c"
+
+c=$(new_case no-libmlx "Apple M2 Pro" 9.9.8 8.8.7 no none)
+rm "$c/prefix/Cellar/mlx/9.9.8/lib/libmlx.dylib"
+st_case "no binary, a missing libmlx.dylib stops" 1 \
+	--has "PREFLIGHT FAIL: $c/prefix/opt/mlx/lib/libmlx.dylib missing" \
+	--has "Restore the nax-capable pair:  make mlx-restore-pin" -- preflight_run "$c"
+
+c=$(new_case no-libmlxc "Apple M2 Pro" 9.9.8 8.8.7 no none)
+rm "$c/prefix/Cellar/mlx-c/8.8.7/lib/libmlxc.dylib"
+st_case "no binary, a missing libmlxc.dylib stops" 1 \
+	--has "PREFLIGHT FAIL: $c/prefix/opt/mlx-c/lib/libmlxc.dylib missing" \
+	--has "Restore the nax-capable pair:  make mlx-restore-pin" -- preflight_run "$c"
 
 c=$(new_case unrelocated "Apple M2 Pro" 9.9.8 8.8.7 no none)
 printf '#!/usr/bin/env bash\necho "@@HOMEBREW_PREFIX@@/opt/mlx/lib/libmlx.dylib"\n' >"$c/bin/otool"
 st_case "no binary, an unrelocated dylib stops" 1 \
-	--has "carries @@HOMEBREW_PREFIX@@ placeholders" -- preflight_run "$c"
+	--has "carries @@HOMEBREW_PREFIX@@ placeholders" \
+	--has "Restore the nax-capable pair:  make mlx-restore-pin" -- preflight_run "$c"
+
+c=$(new_case unrelocated-mlxc "Apple M2 Pro" 9.9.8 8.8.7 no none)
+printf '#!/usr/bin/env bash\ncase "$2" in *libmlxc.dylib) echo "@@HOMEBREW_PREFIX@@/opt/mlx-c/lib/libmlxc.dylib" ;; esac\n' >"$c/bin/otool"
+st_case "no binary, an unrelocated libmlxc.dylib stops" 1 \
+	--has "$c/prefix/opt/mlx-c/lib/libmlxc.dylib still carries @@HOMEBREW_PREFIX@@ placeholders" \
+	--has "Restore the nax-capable pair:  make mlx-restore-pin" -- preflight_run "$c"
 
 c=$(new_case no-metallib "Apple M5 Max" "$MLX_V" "$MLXC_V" yes none)
 rm "$c/prefix/Cellar/mlx/$MLX_V/lib/mlx.metallib"
 st_case "no binary, an M5 Mac without mlx.metallib stops" 1 \
-	--has "mlx.metallib missing" -- preflight_run "$c"
+	--has "mlx.metallib missing" \
+	--has "Restore the nax-capable pair:  make mlx-restore-pin" -- preflight_run "$c"
 
 c=$(new_case no-strings "Apple M5 Max" "$MLX_V" "$MLXC_V" yes none)
 printf '#!/usr/bin/env bash\nexit 1\n' >"$c/bin/strings"
