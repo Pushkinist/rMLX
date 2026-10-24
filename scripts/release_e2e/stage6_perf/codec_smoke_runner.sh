@@ -31,7 +31,9 @@
 #      absent snapshot or an unset root, no row without a recorded baseline
 #   1  a row failed, or no row ran
 #   3  matrix INCOMPLETE: every row that ran passed, but a row skipped for an
-#      absent snapshot or an unset root, or ran against an unrecorded baseline
+#      absent snapshot or an unset root, ran against an unrecorded baseline, or
+#      had a smoke run that measured and whose record did not land (`baseline`
+#      exit 75; the buffer file is named)
 #   2  usage or setup error
 # `matrix_done` prints `ran=N skipped=M`. A row with a manifest `skip_reason`
 # is a known disposition and does not make the run INCOMPLETE.
@@ -56,6 +58,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO_ROOT"
+# shellcheck source=scripts/lib/record_pending.sh
+. "$REPO_ROOT/scripts/lib/record_pending.sh"
 
 MANIFEST="$REPO_ROOT/scripts/release_e2e/stage6_perf/kv_codec_matrix.toml"
 PROMPTS="$REPO_ROOT/scripts/release_e2e/stage6_perf/smoke_prompts.toml"
@@ -355,6 +359,8 @@ RAN=0
 SKIPPED_KNOWN=0
 SKIPPED_ABSENT=0
 UNRECORDED=0
+# Smoke runs that measured and whose diagnostic record did not land.
+RECORDS_PENDING=0
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse --short HEAD 2>/dev/null || printf nogit)"
 
 while IFS=$'\t' read -r CODEC MODEL CTX EXPECTED PROMPTS_CSV SKIP CLI_ARGS NIAH_FILTER; do
@@ -461,6 +467,16 @@ while IFS=$'\t' read -r CODEC MODEL CTX EXPECTED PROMPTS_CSV SKIP CLI_ARGS NIAH_
             --prompt-label "$PNAME" \
             --record --run-class diagnostic --label "codec_smoke:$CODEC:$PNAME" \
             $CLI_ARGS 2>&1 | tee "$OUTPUT_FILE" >/dev/null || BASELINE_RC=${PIPESTATUS[0]}
+
+        # A run that measured and whose record did not land is judged on its
+        # output like any other; its record makes the matrix INCOMPLETE. The
+        # buffer file is read off the output before the trace is reduced.
+        if [[ $BASELINE_RC -eq $RECORD_PENDING_EXIT ]]; then
+            record_pending_note "$OUTPUT_FILE"
+            log_evt warn "record_pending codec=$CODEC model=$MODEL prompt=$PNAME"
+            RECORDS_PENDING=$((RECORDS_PENDING + 1))
+            BASELINE_RC=0
+        fi
 
         # Extract `decoded=` so validate_regex sees only model output, not the
         # tracing-echoed prompt (review MED-2 path (a)).
@@ -582,10 +598,10 @@ done <<<"$ROWS_TSV"
 # ── aggregate output ────────────────────────────────────────────────────────
 SKIPPED=$((SKIPPED_KNOWN + SKIPPED_ABSENT))
 INCOMPLETE=false
-[[ $SKIPPED_ABSENT -gt 0 || $UNRECORDED -gt 0 ]] && INCOMPLETE=true
+[[ $SKIPPED_ABSENT -gt 0 || $UNRECORDED -gt 0 || $RECORDS_PENDING -gt 0 ]] && INCOMPLETE=true
 {
-    printf '{"run_id":"%s","ran":%s,"skipped_known":%s,"skipped_absent":%s,"unrecorded":%s,"incomplete":%s,"rows":[' \
-        "$RUN_ID" "$RAN" "$SKIPPED_KNOWN" "$SKIPPED_ABSENT" "$UNRECORDED" "$INCOMPLETE"
+    printf '{"run_id":"%s","ran":%s,"skipped_known":%s,"skipped_absent":%s,"unrecorded":%s,"records_pending":%s,"incomplete":%s,"rows":[' \
+        "$RUN_ID" "$RAN" "$SKIPPED_KNOWN" "$SKIPPED_ABSENT" "$UNRECORDED" "$RECORDS_PENDING" "$INCOMPLETE"
     sep=""
     for r in ${ROW_JSONS[@]+"${ROW_JSONS[@]}"}; do
         printf '%s%s' "$sep" "$r"
@@ -596,7 +612,7 @@ INCOMPLETE=false
 
 log_evt info "matrix_done agg_rc=$AGG_RC ran=$RAN skipped=$SKIPPED rows=${#ROW_JSONS[@]} out=$LAST_RUN"
 if [[ $INCOMPLETE == true ]]; then
-    log_evt warn "matrix INCOMPLETE skipped_absent=$SKIPPED_ABSENT unrecorded=$UNRECORDED: rows skipped for an absent snapshot or an unset RMLX_O_MODELS_ROOT, or run without a recorded baseline"
+    log_evt warn "matrix INCOMPLETE skipped_absent=$SKIPPED_ABSENT unrecorded=$UNRECORDED records_pending=$RECORDS_PENDING: rows skipped for an absent snapshot or an unset RMLX_O_MODELS_ROOT, run without a recorded baseline, or smoke runs whose record did not land"
 fi
 if [[ $AGG_RC -ne 0 ]]; then
     exit "$AGG_RC"
