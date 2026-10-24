@@ -7,17 +7,16 @@
 # Each case builds a throwaway git work tree, runs the gate against it and
 # asserts the literal exit code and, for every failure, the line naming why.
 #
-# Exit 0 = every case held. Exit 1 = at least one did not.
+# Exit 0 = every case held. Exit 1 = at least one did not. Exit 2 = a scan root
+# could not be built.
 
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TOOL="$REPO_ROOT/scripts/lib/debt_report.py"
-WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
-
-FAILED=0
-PASSED=0
+# shellcheck source=scripts/lib/selftest_support.sh
+. "$REPO_ROOT/scripts/lib/selftest_support.sh"
+st_init check-doc-size-selftest
 
 # bytes <path> <n>: a file of exactly n bytes.
 bytes() {
@@ -26,9 +25,9 @@ bytes() {
 
 # fresh <name>: a git work tree whose docs/ holds one small doc.
 fresh() {
-    local root="$WORK/$1"
+    local root
+    root="$(st_git_root "$1")"
     mkdir -p "$root/docs"
-    git -C "$root" init -q || exit 1
     printf '# Small\n\nShort doc.\n' >"$root/docs/SMALL.md"
     printf '%s' "$root"
 }
@@ -47,75 +46,62 @@ except subprocess.TimeoutExpired:
 ' "$CASE_TIMEOUT_S" "$@"
 }
 
-# case_run <name> <what> <want-exit> <needle|-> <root>
-case_run() {
-    local name="$1" what="$2" want="$3" needle="$4" root="$5"
-    local out status
-    out=$(bounded python3 "$TOOL" --root "$root" --check-doc-size 2>&1)
-    status=$?
-    if [ "$status" != "$want" ]; then
-        FAILED=$((FAILED + 1))
-        printf '  FAIL %-34s (want exit %s, got %s) — %s\n%s\n' "$name" "$want" "$status" "$what" "$out"
-    elif [ "$needle" != "-" ] && ! grep -qF -- "$needle" <<<"$out"; then
-        FAILED=$((FAILED + 1))
-        printf '  FAIL %-34s (missing %q) — %s\n%s\n' "$name" "$needle" "$what" "$out"
-    else
-        PASSED=$((PASSED + 1))
-        printf '  ok   %-34s — %s\n' "$name" "$what"
-    fi
+# doc_size_gate <root>: the doc-size gate over <root>, bounded.
+doc_size_gate() {
+    bounded python3 "$TOOL" --root "$1" --check-doc-size
 }
 
 root=$(fresh clean)
-case_run clean_tree "every doc within the cap passes" \
-    0 "check-doc-size: ok (1 docs measured" "$root"
+st_case clean_tree 0 --what "every doc within the cap passes" \
+    --has "check-doc-size: ok (1 docs measured" -- doc_size_gate "$root"
 
 root=$(fresh boundary_at_cap)
 bytes "$root/docs/AT_CAP.md" 40960
-case_run boundary_at_cap_passes "a doc of exactly 40,960 B is at the cap, not over it" \
-    0 "check-doc-size: ok (2 docs measured" "$root"
+st_case boundary_at_cap_passes 0 --what "a doc of exactly 40,960 B is at the cap, not over it" \
+    --has "check-doc-size: ok (2 docs measured" -- doc_size_gate "$root"
 
 root=$(fresh boundary_over_cap)
 bytes "$root/docs/OVER_CAP.md" 40961
-case_run boundary_one_byte_over_fails "a doc of 40,961 B is over the cap and is named" \
-    1 "FAIL docs/OVER_CAP.md  40.0 KiB (40961 B) is over the 40 KiB cap" "$root"
+st_case boundary_one_byte_over_fails 1 --what "a doc of 40,961 B is over the cap and is named" \
+    --has "FAIL docs/OVER_CAP.md  40.0 KiB (40961 B) is over the 40 KiB cap" -- doc_size_gate "$root"
 
 root=$(fresh kb_not_kib)
 bytes "$root/docs/KB.md" 40500
-case_run cap_counts_in_kib "40,500 B is over 40 KB and within 40 KiB: it passes" \
-    0 "check-doc-size: ok" "$root"
+st_case cap_counts_in_kib 0 --what "40,500 B is over 40 KB and within 40 KiB: it passes" \
+    --has "check-doc-size: ok" -- doc_size_gate "$root"
 
 root=$(fresh nested_over)
 mkdir -p "$root/docs/deep/er"
 bytes "$root/docs/deep/er/NESTED.md" 50000
-case_run nested_doc_over_fails "a doc below docs/ in a subdirectory is measured and named" \
-    1 "FAIL docs/deep/er/NESTED.md" "$root"
+st_case nested_doc_over_fails 1 --what "a doc below docs/ in a subdirectory is measured and named" \
+    --has "FAIL docs/deep/er/NESTED.md" -- doc_size_gate "$root"
 
 root=$(fresh two_over)
 bytes "$root/docs/A_OVER.md" 45000
 bytes "$root/docs/B_OVER.md" 46000
-case_run two_over_first_named "the first of two docs over the cap is named" \
-    1 "FAIL docs/A_OVER.md" "$root"
-case_run two_over_second_named "the second is named too: the gate lists every doc, not the first" \
-    1 "FAIL docs/B_OVER.md" "$root"
+st_case two_over_first_named 1 --what "the first of two docs over the cap is named" \
+    --has "FAIL docs/A_OVER.md" -- doc_size_gate "$root"
+st_case two_over_second_named 1 --what "the second is named too: the gate lists every doc, not the first" \
+    --has "FAIL docs/B_OVER.md" -- doc_size_gate "$root"
 
 root=$(fresh ignored_over)
 mkdir -p "$root/docs/private"
 printf 'docs/private/\n' >"$root/.gitignore"
 bytes "$root/docs/private/HIDDEN.md" 50000
-case_run ignored_doc_skipped "a git-ignored doc over the cap is not measured" \
-    0 "check-doc-size: ok (1 docs measured" "$root"
+st_case ignored_doc_skipped 0 --what "a git-ignored doc over the cap is not measured" \
+    --has "check-doc-size: ok (1 docs measured" -- doc_size_gate "$root"
 
 root=$(fresh marker_under_cap)
 printf '<!-- size-exempt: it is long on purpose -->\n# Marked\n' >"$root/docs/MARKED.md"
-case_run marker_in_doc_fails "a doc carrying the marker fails even within the cap" \
-    1 "FAIL docs/MARKED.md  carries a size-exempt marker" "$root"
+st_case marker_in_doc_fails 1 --what "a doc carrying the marker fails even within the cap" \
+    --has "FAIL docs/MARKED.md  carries a size-exempt marker" -- doc_size_gate "$root"
 
 root=$(fresh marker_over_cap)
 { printf 'size-exempt: generated\n'; python3 -c 'print("y" * 45000)'; } >"$root/docs/BIG_MARKED.md"
-case_run marker_does_not_exempt_size "the marker does not lift the cap: the doc is named as over it" \
-    1 "FAIL docs/BIG_MARKED.md  44.0 KiB (45024 B) is over the 40 KiB cap" "$root"
-case_run marker_over_cap_also_named "and the marker is named as a failure of its own" \
-    1 "FAIL docs/BIG_MARKED.md  carries a size-exempt marker" "$root"
+st_case marker_does_not_exempt_size 1 --what "the marker does not lift the cap: the doc is named as over it" \
+    --has "FAIL docs/BIG_MARKED.md  44.0 KiB (45024 B) is over the 40 KiB cap" -- doc_size_gate "$root"
+st_case marker_over_cap_also_named 1 --what "and the marker is named as a failure of its own" \
+    --has "FAIL docs/BIG_MARKED.md  carries a size-exempt marker" -- doc_size_gate "$root"
 
 n=0
 for leader in "- " "> " "* " "## " "1. " "<!-- - "; do
@@ -123,54 +109,47 @@ for leader in "- " "> " "* " "## " "1. " "<!-- - "; do
     tag="$n"
     root=$(fresh "marker_leader_$tag")
     printf '# Doc\n\n%ssize-exempt: long on purpose\n' "$leader" >"$root/docs/LEAD.md"
-    case_run "marker_after_leader_${tag}" "a marker after the Markdown leader '${leader}' still fails" \
-        1 "FAIL docs/LEAD.md  carries a size-exempt marker" "$root"
+    st_case "marker_after_leader_${tag}" 1 --what "a marker after the Markdown leader '${leader}' still fails" \
+    --has "FAIL docs/LEAD.md  carries a size-exempt marker" -- doc_size_gate "$root"
 done
 
 root=$(fresh marker_scan_linear)
 printf '%s\n' "$(printf '#%.0s' $(seq 64))x" >"$root/docs/HASHES.md"
-case_run marker_scan_is_linear "a line of 64 '#' and no marker is scanned in bounded time" \
-    0 "check-doc-size: ok (2 docs measured" "$root"
+st_case marker_scan_is_linear 0 --what "a line of 64 '#' and no marker is scanned in bounded time" \
+    --has "check-doc-size: ok (2 docs measured" -- doc_size_gate "$root"
 
 root=$(fresh upper_case_suffix)
 bytes "$root/docs/SHOUT.MD" 45000
-case_run upper_case_suffix_measured "a doc spelled .MD is measured like .md" \
-    1 "FAIL docs/SHOUT.MD" "$root"
+st_case upper_case_suffix_measured 1 --what "a doc spelled .MD is measured like .md" \
+    --has "FAIL docs/SHOUT.MD" -- doc_size_gate "$root"
 
 root=$(fresh marker_in_prose)
 printf '# Prose\n\nThe gate refuses a `size-exempt:` line in any doc.\n' >"$root/docs/PROSE.md"
-case_run marker_mid_line_is_prose "a mid-line mention is prose, not a marker" \
-    0 "check-doc-size: ok" "$root"
+st_case marker_mid_line_is_prose 0 --what "a mid-line mention is prose, not a marker" \
+    --has "check-doc-size: ok" -- doc_size_gate "$root"
 
 root=$(fresh marker_in_script)
 mkdir -p "$root/scripts"
 printf '# size-exempt: planted by a selftest\n' >"$root/scripts/x_selftest.sh"
-case_run marker_in_script_not_scanned "the marker in a selftest script is outside the scanned docs" \
-    0 "check-doc-size: ok" "$root"
+st_case marker_in_script_not_scanned 0 --what "the marker in a selftest script is outside the scanned docs" \
+    --has "check-doc-size: ok" -- doc_size_gate "$root"
 
-root="$WORK/no_docs"
-mkdir -p "$root"
-git -C "$root" init -q || exit 1
-case_run no_docs_dir_unmeasurable "a root with no docs/ cannot be measured: exit 2" \
-    2 "check-doc-size: unavailable (" "$root"
+root="$(st_git_root no_docs)"
+st_case no_docs_dir_unmeasurable 2 --what "a root with no docs/ cannot be measured: exit 2" \
+    --has "check-doc-size: unavailable (" -- doc_size_gate "$root"
 
-root="$WORK/empty_docs"
+root="$(st_git_root empty_docs)"
 mkdir -p "$root/docs"
-git -C "$root" init -q || exit 1
-case_run empty_docs_unmeasurable "a docs/ with no doc is exit 2, never a clean pass" \
-    2 "unavailable (no docs/**/*.md under" "$root"
+st_case empty_docs_unmeasurable 2 --what "a docs/ with no doc is exit 2, never a clean pass" \
+    --has "unavailable (no docs/**/*.md under" -- doc_size_gate "$root"
 
-root="$WORK/not_git"
+root="$ST_WORK/not_git"
 mkdir -p "$root/docs"
 bytes "$root/docs/LARGE.md" 50000
-case_run outside_git_unmeasurable "outside a git work tree the ignored set is unknown: exit 2" \
-    2 "unavailable (git check-ignore exit 128" "$root"
+st_case outside_git_unmeasurable 2 --what "outside a git work tree the ignored set is unknown: exit 2" \
+    --has "unavailable (git check-ignore exit 128" -- doc_size_gate "$root"
 
-case_run missing_root_unmeasurable "a root that does not exist is exit 2" \
-    2 "is not a directory" "$WORK/does-not-exist"
+st_case missing_root_unmeasurable 2 --what "a root that does not exist is exit 2" \
+    --has "is not a directory" -- doc_size_gate "$ST_WORK/does-not-exist"
 
-if [ "$FAILED" -ne 0 ]; then
-    echo "check-doc-size selftest: FAIL ($FAILED of $((PASSED + FAILED)))" >&2
-    exit 1
-fi
-echo "check-doc-size selftest: ok ($PASSED cases)"
+st_done
