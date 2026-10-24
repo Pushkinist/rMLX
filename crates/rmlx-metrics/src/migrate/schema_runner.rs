@@ -6,7 +6,12 @@
 
 use rusqlite::Connection;
 
-use crate::{bests_view, error::Result, schema::MIGRATIONS, time_util::now_iso8601};
+use crate::{
+    bests_view,
+    error::{Error, Result},
+    schema::MIGRATIONS,
+    time_util::now_iso8601,
+};
 
 /// Apply all pending migrations from [`MIGRATIONS`] to `conn`.
 ///
@@ -25,9 +30,21 @@ use crate::{bests_view, error::Result, schema::MIGRATIONS, time_util::now_iso860
 /// `docs/METRICS_SCHEMA.md` §4 registry — see that module for why the view is generated rather than
 /// pinned to a migration.
 ///
+/// A DB at a version past the last migration this binary carries is refused:
+/// a newer binary migrated it, and rebuilding `bests` here would drop what the
+/// later migrations put in the view.
+///
 /// Returns the number of migrations applied (0 when already up to date).
 pub fn run_pending(conn: &mut Connection) -> Result<u32> {
     let current_version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let last_known = MIGRATIONS.last().map_or(0, |&(v, _)| v);
+    if current_version > last_known {
+        return Err(Error::Schema(format!(
+            "the DB is at schema version {current_version}, and this binary knows migrations \
+             up to version {last_known}: a newer binary migrated it. Open it with that binary \
+             or a newer one (docs/METRICS_DB.md §13)."
+        )));
+    }
 
     let mut applied: u32 = 0;
 

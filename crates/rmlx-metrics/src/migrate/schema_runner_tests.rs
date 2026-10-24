@@ -398,3 +398,18 @@ fn champions(conn: &Connection) -> Vec<(i64, Option<String>)> {
         .map(Result::unwrap)
         .collect()
 }
+
+/// A DB a newer binary migrated has a schema this binary cannot describe:
+/// rebuilding `bests` over it would drop whatever the later migrations put in
+/// the view, so the open is refused, naming both versions.
+#[test]
+fn a_db_newer_than_this_binary_is_refused() {
+    let last = MIGRATIONS.last().map_or(0, |&(v, _)| v);
+    let mut conn = conn_at_version(last);
+    conn.execute_batch(&format!("PRAGMA user_version = {};", last + 1))
+        .unwrap();
+
+    let err = super::run_pending(&mut conn).unwrap_err().to_string();
+    assert!(err.contains(&format!("version {}", last + 1)), "{err}");
+    assert!(err.contains(&format!("version {last}")), "{err}");
+}
