@@ -16,8 +16,9 @@
 #
 # A snapshot whose identity cannot be recorded (`lib/snapshot_identity.py`,
 # which labels a snapshot as `rmlx baseline --record` does) stops the canary
-# before its first run. A gate record that does not land stops it: the gate
-# has no row to read. A diagnostic run that measured and whose record did not
+# before its first run. A gate record that does not land stops it with exit 1,
+# naming its buffer file: the gate has no row to read, and a replay adds one.
+# A diagnostic run that measured and whose record did not
 # land (`baseline` exit 75) keeps its measurement, names its buffer file, and
 # the canary ends with exit 75 after the last model (docs/METRICS_DB.md
 # section 13, rule 24).
@@ -270,7 +271,9 @@ for entry in "${MODELS[@]}"; do
     # same protocol: prompt-tokens/max-tokens/max-ctx as the measured runs, kv_quant=auto).
     # This is the authoritative canary record; use `make canary-gate` to gate regressions.
     echo "  recording into runs.db..." >&2
-    if RMLX_HOME="${RMLX_HOME}" "${BINARY}" baseline \
+    gate_err="$(mktemp "${TMPDIR:-/tmp}/perf_canary_gate_err.XXXXXX")"
+    gate_rc=0
+    RMLX_HOME="${RMLX_HOME}" "${BINARY}" baseline \
         --model "${model_path}" \
         --prompt-tokens "${PROMPT_TOKENS}" \
         --max-tokens "${MAX_TOKENS}" \
@@ -278,12 +281,19 @@ for entry in "${MODELS[@]}"; do
         --label "canary sha=${GIT_SHA}" \
         ${git_sha_args[@]+"${git_sha_args[@]}"} \
         --record --run-class gate \
-        > /dev/null 2>&1; then
+        > /dev/null 2>"${gate_err}" || gate_rc=$?
+    if [[ "${gate_rc}" -eq 0 ]]; then
         echo "  runs.db: ok" >&2
     else
-        echo "ERROR: ${short_name}: the gate record failed; the canary has no row to gate on" >&2
+        if [[ "${gate_rc}" -eq "${RECORD_PENDING_EXIT}" ]]; then
+            record_pending_note "${gate_err}"
+            echo "  replaying it adds the gate row this canary reports as missing" >&2
+        fi
+        rm -f "${gate_err}"
+        echo "ERROR: ${short_name}: the gate record failed (exit ${gate_rc}); the canary has no row to gate on" >&2
         exit 1
     fi
+    rm -f "${gate_err}"
 
     # Print result
     printf "%s  decode_tps=%.2f ± %.2f\n" "${short_name}" "${med}" "${sd}"

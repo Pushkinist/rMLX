@@ -322,7 +322,10 @@ STUB_FAIL_GATE=1 canary_case canary_gate_record_fails "" ""
 bad=""
 [ "$CANARY_STATUS" -eq 1 ] || bad="exit=$CANARY_STATUS (want 1)"
 /usr/bin/grep -q 'the gate record failed' "$CANARY_HOME/out.log" || bad="$bad; no error naming the gate record"
-verdict canary_gate_record_fails "a gate record that does not land (exit 75) stops the canary" "${bad#; }"
+/usr/bin/grep -q 'record pending: .*metrics/buffer/pending/stub.json' "$CANARY_HOME/out.log" ||
+	bad="$bad; the gate's buffer file is not named"
+/usr/bin/grep -q 'replaying it adds the gate row' "$CANARY_HOME/out.log" || bad="$bad; no warning that a replay adds the gate row"
+verdict canary_gate_record_fails "a gate record that does not land (exit 75) stops the canary and names its buffer file" "${bad#; }"
 
 STUB_FAIL_MEASURED=1 canary_case canary_diagnostic_record_pending "" ""
 bad=""
