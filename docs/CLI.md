@@ -436,7 +436,7 @@ refuse a missing DB, and a DB whose `bests` view is stale, naming
 | `champions` | `--backend`, `--jsonl` | One row per (namespace, model, weight quant, KV quant) with one column per metric. |
 | `prompts` | `list`; `get --name`; `add --file [--name] [--notes]`; `sync` | Prompt registry. `sync` registers every `*.json` under `prompts/` in `RMLX_REPO_ROOT`, else the working directory. |
 | `migrate` | `--rmlx-glob`, `--cbb-csv`, `--records-md`, `--hardware-tag` (`m5_max_128gb`) | Idempotent import of legacy JSONL, CSV and Markdown. |
-| `import` | `--from <db>` (required), `--run-class <class>` | Copies another metrics DB's observations and their prompts; a second run adds nothing. See `METRICS_DB.md` §11. |
+| `import` | `--from <db>` (required), `--run-class <class>` | Copies another metrics DB's observations and their prompts; a second run adds nothing. See [`METRICS_IMPORT.md`](METRICS_IMPORT.md). |
 
 `record` and `validate` refuse a record whose `notes` or `description`
 contains `synthetic=true`. They also refuse an `rmlx` record whose

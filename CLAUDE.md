@@ -73,7 +73,8 @@ areas before touching code:
 | [`docs/SAMPLING.md`](docs/SAMPLING.md) | Per-token sampling (temperature, top-k/p, penalties, thinking budget, constrained decoding) |
 | [`docs/FFI.md`](docs/FFI.md) | rmlx-mlx ↔ mlx-c FFI bridge; MSL kernel surface; unsafe policy |
 | [`docs/MLX_PAIR.md`](docs/MLX_PAIR.md) | The pinned MLX / mlx-c pair: what to do on each Mac, the source build, `make mlx-restore-pin`, the pin gate and its verdicts, the two mlx-c C APIs, the attention row rule, moving the pin |
-| [`docs/METRICS_DB.md`](docs/METRICS_DB.md) | Metrics DB: path, identity rules, ingest and the run class, `rmlx metrics` tooling, DB import, operating rules |
+| [`docs/METRICS_DB.md`](docs/METRICS_DB.md) | Metrics DB: path, identity rules, ingest and the run class, `rmlx metrics` tooling, operating rules |
+| [`docs/METRICS_IMPORT.md`](docs/METRICS_IMPORT.md) | `rmlx metrics import`, split out of `METRICS_DB.md` for size: what is copied, the run class by source version, the skip key, the report |
 | [`docs/METRICS_SCHEMA.md`](docs/METRICS_SCHEMA.md) | Metrics DB schema: tables (observations, events, prompts, the bests view), metric registry, plausible-value bounds, known-bad rows |
 | [`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md) | The three canary anchors and the bench methods: A/B comparison, per-codec cells, the bandwidth ceiling, cross-backend cells |
 | [`docs/PUBLISHED_PROTOCOL.md`](docs/PUBLISHED_PROTOCOL.md) | Generated: published-protocol results (MT-Bench / MATH-500 / HumanEval, fixed prompt) with every number beside the bound it cannot pass |
@@ -518,8 +519,8 @@ summary.
   canaries, release gates and the surviving arm of an A/B as `gate`, every A/B
   slot as `ab_arm`, investigation runs as `diagnostic`. Only `gate` rows reach
   `bests`, the gates and the exports. A record that states no class is refused.
-  `rmlx metrics import` brings a scratch DB's rows in (`docs/METRICS_DB.md`
-  §11).
+  `rmlx metrics import` brings a scratch DB's rows in
+  (`docs/METRICS_IMPORT.md`).
 - **Ingest**: a bench script writes a §8.5 record to
   `<RMLX_HOME>/metrics/buffer/pending/`, then `rmlx metrics record --file
   <path>` ingests and deletes it. Every backend emits that shape.
