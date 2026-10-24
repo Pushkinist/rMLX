@@ -107,6 +107,18 @@ grep -q -- '--record --run-class diagnostic --label gpu_capture:' "$ARGV_LOG" ||
 	bad="${bad:+$bad; }baseline argv: $(cat "$ARGV_LOG")"
 verdict gpu_capture_records_diagnostic "the capture run is recorded as diagnostic" "$bad"
 
+set +e
+STUB_NO_INGEST=none ARGV_LOG="$ARGV_LOG" bash "$FAKE/scripts/gpu_capture.sh" --kv-quant none --model "$MODEL" \
+	--out-dir "$WORK/traces_pending" --keep-all >"$WORK/gpu_capture_pending.out" 2>&1
+status=$?
+set -e
+bad=""
+[ "$status" -eq 0 ] || bad="exit=$status (want 0: the capture succeeded)"
+grep -q 'WARNING: the capture succeeded, but its diagnostic record did not land' "$WORK/gpu_capture_pending.out" ||
+	bad="${bad:+$bad; }no warning"
+grep -q '^retention:' "$WORK/gpu_capture_pending.out" || bad="${bad:+$bad; }the retention step did not run"
+verdict gpu_capture_with_a_pending_record_succeeds "a capture whose record did not land succeeds, warns, and still runs its retention" "$bad"
+
 # ── mst_capture.sh ────────────────────────────────────────────────────────────
 #
 # `xcrun` is a shim: `-f xctrace` answers, and `xctrace record --launch -- cmd`

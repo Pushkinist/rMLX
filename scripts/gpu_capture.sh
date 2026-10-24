@@ -172,6 +172,16 @@ MTL_CAPTURE_ENABLED=1 \
 	--gpu-capture-steps "$STEPS"
 rc=$?
 
+# shellcheck source=scripts/lib/record_pending.sh
+. scripts/lib/record_pending.sh
+# The capture is what this script is for; a diagnostic record that did not land
+# does not undo it. The binary named the buffer file on stderr above.
+if [ $rc -eq "$RECORD_PENDING_EXIT" ]; then
+	echo "WARNING: the capture succeeded, but its diagnostic record did not land (buffer file" >&2
+	echo "  named above); replay it with \`rmlx metrics record --replay-pending\`" >&2
+	rc=0
+fi
+
 # The engine already fails loudly on every way a capture can not happen, so a
 # zero exit here means the bundle exists. Re-check anyway: this script is the
 # thing an operator runs, and a missing bundle must never read as success.
