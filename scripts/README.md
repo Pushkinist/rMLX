@@ -4,8 +4,9 @@
 (through `make` only) and people run against this tree. `INDEX.md` lists every
 file with its caller and purpose; `make scripts-index` generates it from the
 files' own headers and `make check-scripts` fails when it differs, so never
-edit it by hand. A rule marked [gate] is enforced by `make check-scripts`;
-[gate, next] is meant to be and is not yet; [review] is the reviewer's.
+edit it by hand. A rule marked [gate] is enforced by a named `make` gate
+(`make check-scripts` unless the line names another); [gate, next] is meant to
+be and is not yet; [review] is the reviewer's.
 
 ## 1. Add a mode, not a script
 
@@ -19,10 +20,18 @@ carries:
 
     # Not a mode of: <closest existing tool> — <why it cannot be a mode there>
 
-[gate: on every entry point added since the base that is not a recall test or a
-module, the line exists, names an existing file and gives a reason; on every
-file, a named file that no longer exists fails (`not-a-mode`,
-`not-a-mode-stale`). review: the reason is true]
+[gate: on every entry point added since the base, the line exists and gives a
+reason (`not-a-mode`); on every file, the file it names must be another entry
+point, not the file itself, `INDEX.md`, `README.md` or a directory
+(`not-a-mode-stale`). review: the reason is true]
+
+Two kinds of file are not tools and need no such line: a recall test, whose
+`Recall test for: <file>` names another file of the tree, and a module, whose
+`Module of: <file>` does. A name that ends in `_selftest.sh` proves nothing, and
+a `Module of:` or `Recall test for:` that names nothing leaves the file an
+entry point under every rule. A file is new when it is absent at the base; move
+a file with `git mv`, because a plain `mv` that is not staged reads as a new
+file.
 
 A file whose body matches another script past a twin threshold, and a `lib/`
 function defined again outside `lib/`, fail too. [gate, next]
@@ -81,16 +90,26 @@ comment):
 
 * The purpose line is the `INDEX.md` row: the line right after the shebang,
   not wrapped onto the next one. [gate: `purpose`]
-* `Usage:` on every entry point. An entry point is a `.sh` or `.py` file with a
-  shebang, no `Module of:` line, outside `lib/`. [gate: `usage`]
+* `Usage:` on every entry point, and it says something. An entry point is a
+  `.sh` or `.py` file that is run: it has a shebang and sits outside `lib/`, or
+  a recipe or a script runs it (sourcing and importing are not running),
+  wherever it lives; a file that is a module of another file is not one.
+  [gate: `usage`]
 * `Exit:` names every literal exit code the code uses (`exit N`,
-  `sys.exit(N)`, `raise SystemExit(N)`); a range `3-10` counts. A status passed
-  through from another program is `passthrough of <program>`. A `return N`
-  from a Python `main()` is not read. [gate: `exit-undeclared`]
+  `sys.exit(N)`, `raise SystemExit(N)`). A number counts only at a code
+  position, the start of a line or after `;`, `,`, `|`, `/` or `(`, alone or as
+  a range `3-10`; a number in prose does not. A status passed through from
+  another program is `passthrough of <program>`. A `return N` from a Python
+  `main()` is not read. [gate: `exit-undeclared`]
 * The caller is derived: a make target whose recipe runs the file, or another
   script that runs, sources or imports it (a mention in a comment or an `echo`
-  is not a run). Write `Caller: by hand` only when nothing runs the file; the
-  gate fails the line when something does. [gate: `caller`, entry points]
+  is not a run). A `VAR=path` assignment counts only where the same file later
+  puts `$VAR` in command position, as the command, behind a wrapper such as
+  `bash`, `env` or `timeout`, as the first argument of `st_run`, or after the
+  `--` of `st_case`. A Python file runs a file only through a command vector
+  passed to a call, or imports a module. Write `Caller: by hand` only when
+  nothing runs the file; the gate fails the line when something does.
+  [gate: `caller`, entry points]
 * A recall test names its subject: `Recall test for: <class>/<tool> [<mode>]`.
   [gate, next]
 * Explanation may follow the block. It states why, not what, and names no
@@ -183,7 +202,24 @@ the claim file. [gate: `make check-claim-bypass`, tree-wide]
 
 Every [gate] rule started with the files that broke it pinned in
 `report/scripts_gate_pins.txt`, one `<rule> <path>` per line. A pin accepts
-every violation of that rule in that file and can only shrink: fixing a file
-without deleting its line fails (`pin-stale`), and a pin for a file that is
-gone or a rule that does not exist fails the same way. A new file is never
-pinned. [review]
+every violation of that rule in that file and can only shrink. [gate]
+
+* Fixing a file without deleting its line fails (`pin-stale`); so does a pin
+  for a file that is gone or a rule that cannot be pinned. A line written twice
+  fails (`pin-dup`).
+* Only `class`, `purpose`, `usage`, `exit-undeclared` and `caller` can be
+  pinned. The line `# pinnable: <rule> ...` lists them and must equal the
+  gate's set (`pin-header`); `index-stale`, `not-a-mode`, `not-a-mode-stale`
+  and every `pin-*` rule never can.
+* An `exit-undeclared` pin carries the codes the file leaves undeclared,
+  `exit-undeclared <path> <c1,c2>`. A code outside the set fails
+  `exit-undeclared`; a code in the set that is now declared or gone fails
+  `pin-stale`.
+* A pin the base does not have, for a rule the base's `# pinnable:` line lists,
+  fails (`pin-new`); so does a code the base's pin for that file lacks. A moved
+  file keeps its pin when the pin line moves with it. A rule the base does not
+  list is new and may seed pins.
+* While the base has no pin list, the run prints `pins: <base> has no pin list;
+  growth not checked` and `pin-new` has nothing to compare with. Until the pin
+  list lands on `main`, the recall test holds the per-rule counts as literals,
+  so a chunk that shrinks a pin lowers its literal and growth shows in the diff.

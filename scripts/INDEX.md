@@ -47,7 +47,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `check_personal_data.sh` | make check-personal-data, make ci, check_personal_data_selftest.sh | CI gate: no personal email, macOS home or temp path, or assistant session link in published files. |
 | `check_personal_data_selftest.sh` | make check-personal-data-selftest, make ci | Recall test for check_personal_data.sh: throwaway git trees, asserting exit code and file:line. |
 | `check_published_samples_fixtures.sh` | make check-published-samples-fixtures, make ci | Recall test for published_samples.py verify: synthetic sample-set roots, one edit per case. |
-| `check_spec_charge.sh` | make check-spec-charge, make ci, check_spec_charge_fixtures.sh, report/debt_report.py | CI gate: each speculative round loop names one phase-charge decision, everywhere it is read. |
+| `check_spec_charge.sh` | make check-spec-charge, make ci, check_spec_charge_fixtures.sh | CI gate: each speculative round loop names one phase-charge decision, everywhere it is read. |
 | `check_spec_charge_fixtures.sh` | make check-spec-charge-fixtures, make ci | Recall test for check_spec_charge.sh: one edit per synthetic source root, asserting rule and exit. |
 | `check_spec_metric_parity.sh` | make check-spec-metric-parity, make ci, check_spec_metric_parity_fixtures.sh | CI gate: every speculative metric the engine declares is one spec_bench.sh records. |
 | `check_spec_metric_parity_fixtures.sh` | make check-spec-metric-parity-fixtures, make ci | Recall test for check_spec_metric_parity.sh: synthetic scan roots, asserting exit code and reason. |
@@ -60,7 +60,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `gpu_capture.sh` | make profile-gputrace | Capture a Metal GPU trace of a bounded window of steady-state decode, for |
 | `gpu_test_halves.sh` | run_gpu_tests.sh, run_gpu_tests_selftest.sh | Print which half of the GPU suite each classified test is in: codec\|rest, crate, test. |
 | `gpu_test_threadgroup.sh` | run_gpu_tests.sh, run_gpu_tests_selftest.sh | Print which classified GPU tests run with threadgroup-memory validation: on\|off, crate, test. |
-| `gpu_validation_census.txt` | run_gpu_tests.sh, run_gpu_tests_selftest.sh | The Metal shader-validation hits run_gpu_tests.sh accepts, one entry per originating test. |
+| `gpu_validation_census.txt` | run_gpu_tests.sh, run_gpu_tests_selftest.sh | The Metal shader-validation hits run_gpu_tests.sh accepts, per (kernel, kind, crate, test). |
 | `gputrace_diff.sh` | none | Diff the Metal function sets of two .gputrace bundles, in both directions. |
 | `gputrace_kernels.sh` | gputrace_diff.sh | List the Metal functions a captured window referenced, straight from the bundle; no Xcode. |
 | `gputrace_preflight.sh` | make build-capture, make gputrace-preflight, gpu_capture.sh | Check the host prerequisites for Apple's GPU tools to work with a Metal capture of this binary. |
@@ -86,7 +86,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `run_gpu_tests_selftest.sh` | make ci, make gpu-runner-selftest | Recall test for run_gpu_tests.sh: how it reports red runs, waivers and census verdicts. |
 | `schema_constraint_canary.sh` | make schema-constraint-canary | Real-model proof for the json_schema constrained-decoding path: two probes, two architectures. |
 | `sdpa_headdim_bench.py` | none | What MLX's SDPA dispatch costs as a function of `head_dim`. |
-| `spec_bench.sh` | make spec-canary, check_spec_metric_parity.sh, check_spec_metric_parity_fixtures.sh, spec_bench_selftest.sh | spec_bench.sh — bench one model in normal vs MTP speculative-decode mode. |
+| `spec_bench.sh` | make spec-canary, check_spec_metric_parity_fixtures.sh, spec_bench_selftest.sh | spec_bench.sh — bench one model in normal vs MTP speculative-decode mode. |
 | `spec_bench_published.sh` | spec_bench_published_selftest.sh | Bench one verifier under the published on-device speculative-decoding protocol, three passes. |
 | `spec_bench_published_selftest.sh` | make ci, make spec-bench-published-selftest | Mutation check for spec_bench_published.sh: a stub server, asserting exit codes and refusals. |
 | `spec_bench_selftest.sh` | make ci, make spec-bench-selftest | Mutation check for spec_bench.sh: a stub rmlx server, asserting recorded values and refusals. |
@@ -172,7 +172,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 |---|---|---|
 | `release/build_bottle.sh` | make bottle | Build a Homebrew bottle from the installed rmlx keg and prepare it for the GitHub Release. |
 | `release/changelog_section.sh` | none | Print one version's CHANGELOG.md section, for use as the GitHub release body. |
-| `release/package_binary.sh` | make release-package | Build + package the rMLX release binary for aarch64-apple-darwin. |
+| `release/package_binary.sh` | make release-package, release/release_cpu_selftest.sh | Build + package the rMLX release binary for aarch64-apple-darwin. |
 | `release/release_cpu.py` | release/package_binary.sh, release/release_cpu_selftest.sh | The CPU target of the release tarball binary. |
 | `release/release_cpu_selftest.sh` | make ci, make release-cpu-selftest | Recall test for release_cpu.py: throwaway repo roots and a stub cargo, asserting exit and reason. |
 | `release/sign_artifact.sh` | make release-sign | Sign the release tarball with the maintainer's cosign key pair, producing a .cosign.bundle. |

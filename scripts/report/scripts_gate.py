@@ -9,13 +9,16 @@ prints as `<rule>: <path>:<line>: <detail>`, the path relative to `scripts/`.
 
 Each rule is a function over the population that yields violations. A pin is a
 `<rule> <path>` line in `report/scripts_gate_pins.txt` and accepts every
-violation of that rule in that file; it only shrinks, because a pin whose file
-now passes is itself a violation (`pin-stale`). `index-stale` cannot be pinned.
+violation of that rule in that file (an `exit-undeclared` pin lists the codes).
+Pins only shrink: a pin whose file now passes is a violation (`pin-stale`), and
+a pin the base lacks, for a rule the base's `# pinnable:` line lists, is one too
+(`pin-new`). Only the rules in `PINNABLE` can be pinned.
 
 Definitions the rules share:
 
-* An entry point is a `.sh` or `.py` file that starts with a shebang, has no
-  `Module of:` line and is not under `lib/`.
+* An entry point is a `.sh` or `.py` file that is run: it starts with a shebang
+  outside `lib/`, or a recipe or a script runs it (not sources or imports it).
+  A file whose `Module of:` names another file of the tree is not one.
 * The header is the leading comment block (Python: the module docstring;
   `.entitlements`: the first XML comment). Its first line, directly after the
   shebang, is the purpose; `Usage:`, `Exit:`, `Caller:`, `Recall test for:`,
@@ -24,6 +27,7 @@ Definitions the rules share:
 * A caller is a Makefile target whose recipe, or another script that, runs or
   sources the file; a Python import of the module counts. A data file has a
   reader instead, and any non-comment mention counts.
+* A new file is one absent at the base, a moved file (`git mv`) excepted.
 
 Not checked, by design: that a purpose line is true, that a `Not a mode of:`
 reason is, and a `return N` from a Python `main()` (only `sys.exit(N)`,
@@ -33,6 +37,7 @@ reason is, and a `return N` from a Python `main()` (only `sys.exit(N)`,
 from __future__ import annotations
 
 import ast
+import itertools
 import os
 import re
 import subprocess
@@ -54,7 +59,6 @@ CLASSES = (
     "spec",
     "gen",
     "lib",
-    "fixtures",
 )
 INDEX = "INDEX.md"
 README = "README.md"
@@ -76,25 +80,22 @@ NOT_WRAP_RE = re.compile(r"^(?:" + "|".join(FIELD_NAMES) + r"|doc-refs):")
 HEREDOC_RE = re.compile(r"<<(-?)\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
 EXIT_RE = re.compile(r"(?:^|[;&|(){!)]|\bthen\b|\belse\b|\bdo\b|\belif\b)\s*exit\s+([0-9]+)\b")
 ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+VAR_RE = re.compile(r"^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$")
+EXIT_CODE_RE = re.compile(r"(?:^|[;,|/(])[ \t]*(\d+)(?:[ \t]*[-\u2013][ \t]*(\d+))?\b", re.M)
 SUBST_RE = re.compile(r"\$\(([^()]*)\)")
 RULE_RE = re.compile(r"^([A-Za-z0-9_./ -]+?)\s*:(?![=:])")
 KEYWORDS = frozenset({"if", "then", "else", "elif", "do", "while", "until", "!", "{", "}", "time"})
-WRAPPERS = frozenset({"exec", "env", "command", "nohup", "nice", "timeout", "sudo", "builtin"})
+WRAPPERS = frozenset(
+    {"exec", "env", "command", "nohup", "nice", "timeout", "sudo", "builtin", "st_run"}
+)
 INTERPRETERS = frozenset(
     {"bash", "sh", "zsh", "dash", "python", "python3", "awk", "gawk", "perl", "source", ".", "uv"}
 )
+SOURCING = frozenset({"source", "."})
+OPTIONS_WITH_VALUE = frozenset({"-u", "-C", "-s"})
 PROSE_COMMANDS = frozenset({"echo", "printf"})
-RULES = (
-    "class",
-    "purpose",
-    "usage",
-    "exit-undeclared",
-    "caller",
-    "not-a-mode",
-    "not-a-mode-stale",
-    "index-stale",
-    "pin-stale",
-)
+PINNABLE = ("class", "purpose", "usage", "exit-undeclared", "caller")
+PINS_HEADER = "pinnable:"
 
 
 class Unavailable(Exception):
@@ -107,6 +108,7 @@ class Violation:
     path: str
     line: int
     detail: str
+    key: str = ""
 
     def text(self) -> str:
         return f"{self.rule}: {self.path}:{self.line}: {self.detail}"
@@ -126,24 +128,24 @@ class Script:
     def is_code(self) -> bool:
         return self.rel.endswith((".sh", ".py"))
 
-    @property
-    def is_entry(self) -> bool:
-        return (
-            self.is_code
-            and self.shebang
-            and "Module of" not in self.fields
-            and not self.rel.startswith("lib/")
-        )
 
-    @property
-    def is_recall_test(self) -> bool:
-        return self.rel.endswith(("_selftest.sh", "_fixtures.sh")) or "Recall test for" in self.fields
+def first_token(text: str) -> str:
+    parts = text.strip().split()
+    return parts[0].strip("`").removeprefix("scripts/") if parts else ""
+
+
+def named_file(f: Script, label: str, rels: set[str]) -> str:
+    """The file a header field names, when it is another file of the tree."""
+    declared = f.fields.get(label)
+    token = first_token(declared[1]) if declared else ""
+    return token if token in rels and token != f.rel else ""
 
 
 @dataclass
 class Callers:
     targets: set[str] = field(default_factory=set)
     scripts: set[str] = field(default_factory=set)
+    runs: bool = False
 
     def __bool__(self) -> bool:
         return bool(self.targets or self.scripts)
@@ -235,7 +237,7 @@ def parse_fields(hlines: list[tuple[int, str]]) -> dict[str, tuple[int, str]]:
         while j < len(hlines) and hlines[j][1].strip() and not FIELD_RE.match(hlines[j][1]):
             parts.append(hlines[j][1].strip())
             j += 1
-        fields.setdefault(found.group(1), (number, " ".join(parts).strip()))
+        fields.setdefault(found.group(1), (number, "\n".join(parts).strip()))
         i = j
     return fields
 
@@ -306,7 +308,8 @@ def clean_shell(text: str, blank_strings: bool, join: bool = False) -> list[str]
             continue
         if quote == '"' and c == "$" and text[i + 1 : i + 2] == "(":
             end = skip_substitution(text, i)
-            for ch in text[i:end]:
+            segment = text[i:end].replace("\\\n", " ") if join else text[i:end]
+            for ch in segment:
                 if ch != "\n":
                     out.append(" " if blank_strings else ch)
                 elif join:
@@ -434,9 +437,11 @@ def python_literal_exits(text: str) -> list[tuple[int, int]]:
 
 
 def declared_exit_codes(text: str) -> set[int]:
-    codes = {int(n) for n in re.findall(r"\d+", text)}
-    for low, high in re.findall(r"(\d+)\s*[-–]\s*(\d+)", text):
-        codes.update(range(int(low), int(high) + 1))
+    """The codes an `Exit:` field names: a number at a code position (the start
+    of a line or after `;`, `,`, `|`, `/` or `(`), alone or as a range."""
+    codes: set[int] = set()
+    for low, high in EXIT_CODE_RE.findall(text):
+        codes.update(range(int(low), int(high or low) + 1))
     return codes
 
 
@@ -525,8 +530,6 @@ def interpreter_target(words: list[str], interpreter: str) -> list[str]:
     i = 0
     while i < len(words):
         w = words[i]
-        if w == "-c":
-            return []
         if w in ("-v", "-W", "-X", "-o"):
             i += 2
             continue
@@ -537,71 +540,100 @@ def interpreter_target(words: list[str], interpreter: str) -> list[str]:
     return []
 
 
-def command_words(words: list[str]) -> tuple[list[str], list[str]]:
-    """(words that name what the command runs, every word of the command)."""
+def command_words(words: list[str]) -> tuple[list[str], list[str], list[str], list[tuple[str, str]]]:
+    """(words naming what the command runs, words it sources, every word,
+    the assignments in front of it)."""
     i = 0
-    refs: list[str] = []
+    assigned: list[tuple[str, str]] = []
     while i < len(words):
         w = words[i]
         if w in KEYWORDS:
             i += 1
         elif ASSIGN_RE.match(w):
-            refs.append(w.split("=", 1)[1])
+            name, value = w.split("=", 1)
+            assigned.append((name, value))
             i += 1
         else:
             break
     if i < len(words) and os.path.basename(words[i]) in PROSE_COMMANDS:
-        return [], []
-    run: list[str] = list(refs)
+        return [], [], [], assigned
+    run: list[str] = []
+    source: list[str] = []
     while i < len(words):
         w = words[i]
         base = os.path.basename(w)
-        if base in WRAPPERS:
+        following = os.path.basename(words[i + 1]) if i + 1 < len(words) else ""
+        carries = following in (WRAPPERS | INTERPRETERS) - SOURCING
+        if base in WRAPPERS or (base not in INTERPRETERS and carries):
             i += 1
             while i < len(words) and (
                 words[i].startswith("-") or ASSIGN_RE.match(words[i]) or words[i].isdigit()
             ):
-                i += 1
+                i += 2 if words[i] in OPTIONS_WITH_VALUE else 1
             continue
         if base in INTERPRETERS:
-            run += interpreter_target(words[i + 1 :], base)
+            (source if base in SOURCING else run).extend(interpreter_target(words[i + 1 :], base))
         else:
             run.append(w)
         break
-    return run, list(words)
+    return run, source, list(words), assigned
 
 
 @dataclass
 class Refs:
     run: set[str] = field(default_factory=set)
+    source: set[str] = field(default_factory=set)
     anywhere: set[str] = field(default_factory=set)
 
 
 def shell_refs(lines: list[str]) -> Refs:
+    """What a shell file runs, sources and mentions. A `VAR=path` assignment
+    credits the path only where the file later puts `$VAR` where a command
+    goes."""
     refs = Refs()
+    values: dict[str, list[str]] = defaultdict(list)
+
+    def put(target: set[str], word: str, seen: frozenset[str] = frozenset()) -> None:
+        target.add(word)
+        found = VAR_RE.match(word)
+        if found and found.group(1) not in seen:
+            for value in values.get(found.group(1), ()):
+                put(target, value, seen | {found.group(1)})
+
     for logical in lines:
         for piece in peel_substitutions(logical):
             for command in split_commands(piece):
-                run, every = command_words(command)
-                refs.run.update(run)
+                run, source, every, assigned = command_words(command)
+                for name, value in assigned:
+                    values[name].append(value)
+                for word in run:
+                    put(refs.run, word)
+                for word in source:
+                    put(refs.source, word)
                 refs.anywhere.update(every)
     return refs
 
 
 def python_refs(text: str) -> Refs:
+    """What a Python file imports, runs (a command vector passed to a call) and
+    mentions (any string constant)."""
     refs = Refs()
     try:
         tree = ast.parse(text)
     except SyntaxError:
         return refs
     for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                refs.run.add(alias.name.split(".")[0] + ".py")
+        if isinstance(node, ast.Call):
+            for arg in [*node.args, *(keyword.value for keyword in node.keywords)]:
+                if isinstance(arg, (ast.List, ast.Tuple)):
+                    refs.run.update(
+                        e.value for e in arg.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)
+                    )
+        elif isinstance(node, ast.Import):
+            refs.source.update(alias.name.split(".")[0] + ".py" for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
-            refs.run.add(node.module.split(".")[0] + ".py")
+            refs.source.add(node.module.split(".")[0] + ".py")
         elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-            refs.run.add(node.value)
             refs.anywhere.add(node.value)
     return refs
 
@@ -636,12 +668,8 @@ def make_recipes(text: str) -> dict[str, list[str]]:
 
 
 def make_refs(lines: list[str]) -> Refs:
-    prepared = []
-    for line in lines:
-        line = line.lstrip("@-+ \t")
-        line = re.sub(r"\$\(([A-Za-z_]\w*)\)", r"$\1", line)
-        prepared.append(line)
-    return shell_refs(clean_shell("\n".join(prepared), False, True))
+    recipe = "\n".join(line.lstrip("@-+ \t") for line in lines)
+    return shell_refs(clean_shell(recipe, False, True))
 
 
 def derive_callers(files: list[Script], makefile: str) -> dict[str, Callers]:
@@ -651,7 +679,11 @@ def derive_callers(files: list[Script], makefile: str) -> dict[str, Callers]:
     callers = {f.rel: Callers() for f in files}
 
     def credit(refs: Refs, who: str, is_target: bool) -> None:
-        for words, want_code in ((refs.run, True), (refs.anywhere, False)):
+        for words, want_code, runs in (
+            (refs.run, True, True),
+            (refs.source, True, False),
+            (refs.anywhere, False, False),
+        ):
             for word in words:
                 if not word or any(ch.isspace() for ch in word):
                     continue
@@ -661,6 +693,7 @@ def derive_callers(files: list[Script], makefile: str) -> dict[str, Callers]:
                         continue
                     if len(candidates) == 1 or word == f.rel or word.endswith("/" + f.rel):
                         (callers[f.rel].targets if is_target else callers[f.rel].scripts).add(who)
+                        callers[f.rel].runs = callers[f.rel].runs or runs
 
     for f in files:
         if f.rel.endswith(".sh"):
@@ -745,12 +778,27 @@ def index_violations(root: Path, expected: str) -> list[Violation]:
         else:
             out.append(Violation("index-stale", INDEX, last + 1, f"missing row for {rel}"))
     if not out:
-        first = next(i for i, (a, b) in enumerate(zip(have_lines, want_lines), 1) if a != b)
+        pairs = itertools.zip_longest(have_lines, want_lines)
+        first = next(i for i, (a, b) in enumerate(pairs, 1) if a != b)
         out.append(Violation("index-stale", INDEX, first, "differs from the generated text"))
     return sorted(out, key=lambda v: (v.line, v.detail))
 
 
 # ---- rules ---------------------------------------------------------------
+
+
+def entry_points(files: list[Script], callers: dict[str, Callers]) -> set[str]:
+    """Shell and Python files that are run: they start with a shebang outside
+    lib/, or something runs them. A file that names another file in `Module of:`
+    belongs to that file and is not one."""
+    rels = {f.rel for f in files}
+    return {
+        f.rel
+        for f in files
+        if f.is_code
+        and not named_file(f, "Module of", rels)
+        and ((f.shebang and not f.rel.startswith("lib/")) or callers[f.rel].runs)
+    }
 
 
 @dataclass
@@ -759,6 +807,11 @@ class Context:
     files: list[Script]
     callers: dict[str, Callers]
     added: set[str]
+    entries: set[str]
+
+    @property
+    def rels(self) -> set[str]:
+        return {f.rel for f in self.files}
 
 
 def rule_class(ctx: Context) -> list[Violation]:
@@ -787,17 +840,22 @@ def rule_purpose(ctx: Context) -> list[Violation]:
 
 
 def rule_usage(ctx: Context) -> list[Violation]:
-    return [
-        Violation("usage", f.rel, 1, "entry point has no `Usage:` line in its header")
-        for f in ctx.files
-        if f.is_entry and "Usage" not in f.fields
-    ]
+    out = []
+    for f in ctx.files:
+        if f.rel not in ctx.entries:
+            continue
+        declared = f.fields.get("Usage")
+        if not declared:
+            out.append(Violation("usage", f.rel, 1, "entry point has no `Usage:` line in its header"))
+        elif not declared[1]:
+            out.append(Violation("usage", f.rel, declared[0], "`Usage:` says nothing"))
+    return out
 
 
 def rule_exit_undeclared(ctx: Context) -> list[Violation]:
     out = []
     for f in ctx.files:
-        if not f.is_entry:
+        if f.rel not in ctx.entries:
             continue
         exits = shell_literal_exits(f.text) if f.rel.endswith(".sh") else python_literal_exits(f.text)
         declared = declared_exit_codes(f.fields.get("Exit", (0, ""))[1])
@@ -805,14 +863,15 @@ def rule_exit_undeclared(ctx: Context) -> list[Violation]:
         for number, code in exits:
             if code not in declared and code not in seen:
                 seen.add(code)
-                out.append(Violation("exit-undeclared", f.rel, number, f"{code} is not declared in `Exit:`"))
+                detail = f"{code} is not declared in `Exit:`"
+                out.append(Violation("exit-undeclared", f.rel, number, detail, key=str(code)))
     return out
 
 
 def rule_caller(ctx: Context) -> list[Violation]:
     out = []
     for f in ctx.files:
-        if not f.is_entry:
+        if f.rel not in ctx.entries:
             continue
         derived = ctx.callers[f.rel]
         declared = f.fields.get("Caller")
@@ -838,7 +897,9 @@ def not_a_mode_target(text: str) -> tuple[str, str]:
 def rule_not_a_mode(ctx: Context) -> list[Violation]:
     out = []
     for f in ctx.files:
-        if f.rel not in ctx.added or not f.is_entry or f.is_recall_test:
+        if f.rel not in ctx.added or f.rel not in ctx.entries:
+            continue
+        if named_file(f, "Recall test for", ctx.rels):
             continue
         declared = f.fields.get("Not a mode of")
         if not declared:
@@ -854,8 +915,10 @@ def rule_not_a_mode_stale(ctx: Context) -> list[Violation]:
         declared = f.fields.get("Not a mode of")
         if declared:
             tool = not_a_mode_target(declared[1])[0]
-            if not tool or not (ctx.root / "scripts" / tool).is_file():
-                out.append(Violation("not-a-mode-stale", f.rel, declared[0], f"names {tool or 'nothing'}, which does not exist"))
+            if tool not in ctx.entries or tool == f.rel:
+                out.append(
+                    Violation("not-a-mode-stale", f.rel, declared[0], f"names {tool or 'nothing'}, which is not another entry point")
+                )
     return out
 
 
@@ -890,26 +953,123 @@ def resolve_base(root: Path, base: str | None) -> tuple[str, str]:
     return "origin/main", merge_base
 
 
-def files_added_since(root: Path, sha: str) -> set[str]:
-    tracked = git(root, "diff", "-M", "--name-status", "--diff-filter=A", sha, "--", "scripts")
+def changes_since(root: Path, sha: str) -> tuple[set[str], dict[str, str]]:
+    """(files added since `sha`, new path -> old path of each file moved)."""
+    tracked = git(root, "diff", "-M", "--name-status", sha, "--", "scripts")
     untracked = git(root, "ls-files", "--others", "--exclude-standard", "-z", "--", "scripts")
-    added = {line.split("\t")[-1] for line in tracked.splitlines() if line}
-    added |= {p for p in untracked.split("\0") if p}
-    return {p[len("scripts/") :] for p in added if p.startswith("scripts/")}
+    added = {p for p in untracked.split("\0") if p}
+    renames: dict[str, str] = {}
+    for line in tracked.splitlines():
+        parts = line.split("\t")
+        if parts[0] == "A":
+            added.add(parts[1])
+        elif parts[0].startswith("R"):
+            renames[parts[2].removeprefix("scripts/")] = parts[1].removeprefix("scripts/")
+    return {p.removeprefix("scripts/") for p in added if p.startswith("scripts/")}, renames
 
 
-def load_pins(root: Path) -> dict[tuple[str, str], int]:
-    path = root / "scripts" / PINS
-    pins: dict[tuple[str, str], int] = {}
-    if not path.is_file():
-        return pins
-    for number, raw in enumerate(path.read_text(encoding="utf-8").split("\n"), 1):
+@dataclass
+class Pin:
+    rule: str
+    path: str
+    codes: frozenset[str]
+    line: int
+
+
+@dataclass
+class PinList:
+    exists: bool = False
+    pins: dict[tuple[str, str], Pin] = field(default_factory=dict)
+    pinnable: set[str] | None = None
+    header_line: int = 1
+    problems: list[Violation] = field(default_factory=list)
+
+
+def parse_pins(text: str) -> PinList:
+    """`<rule> <path>` per line; `exit-undeclared` adds its undeclared codes as
+    `<c1,c2>`; `# pinnable: <rule> ...` names the rules a pin may be added for."""
+    out = PinList(exists=True)
+    for number, raw in enumerate(text.split("\n"), 1):
         line = raw.strip()
-        if not line or line.startswith("#"):
+        if line.startswith("#"):
+            body = line.lstrip("#").strip()
+            if body.startswith(PINS_HEADER):
+                out.pinnable = set(body[len(PINS_HEADER) :].split())
+                out.header_line = number
+            continue
+        if not line:
             continue
         parts = line.split()
-        pins[(parts[0], parts[1] if len(parts) > 1 else "")] = number
+        rule, path = parts[0], parts[1] if len(parts) > 1 else ""
+        key = (rule, path)
+        if key in out.pins:
+            detail = f"{rule} {path} is already pinned at line {out.pins[key].line}"
+            out.problems.append(Violation("pin-dup", PINS, number, detail))
+            continue
+        codes = frozenset(parts[2].split(",")) if len(parts) > 2 else frozenset()
+        out.pins[key] = Pin(rule, path, codes, number)
+    return out
+
+
+def load_pins(root: Path) -> PinList:
+    path = root / "scripts" / PINS
+    if not path.is_file():
+        return PinList()
+    pins = parse_pins(path.read_text(encoding="utf-8"))
+    if pins.pinnable != set(PINNABLE):
+        detail = f"the `# {PINS_HEADER}` line must list exactly: {' '.join(PINNABLE)}"
+        pins.problems.append(Violation("pin-header", PINS, pins.header_line, detail))
     return pins
+
+
+def apply_pins(found: list[Violation], pins: PinList) -> tuple[list[Violation], dict[tuple[str, str], Pin]]:
+    """The violations no pin accepts, and the pins that held."""
+    active = list(pins.problems)
+    held: dict[tuple[str, str], Pin] = {}
+    groups: dict[tuple[str, str], list[Violation]] = defaultdict(list)
+    for violation in found:
+        groups[(violation.rule, violation.path)].append(violation)
+    for key, violations in groups.items():
+        pin = pins.pins.get(key)
+        if pin is None or key[0] not in PINNABLE:
+            active += violations
+            continue
+        if key[0] == "exit-undeclared":
+            active += [v for v in violations if v.key not in pin.codes]
+            for code in sorted(pin.codes - {v.key for v in violations}):
+                detail = f"{key[0]} {key[1]}: code {code} is declared or gone; delete it from the pin"
+                active.append(Violation("pin-stale", PINS, pin.line, detail))
+        held[key] = pin
+    for key, pin in pins.pins.items():
+        if key[0] not in PINNABLE:
+            active.append(Violation("pin-stale", PINS, pin.line, f"{key[0]} {key[1]}: {key[0]} cannot be pinned"))
+        elif key not in groups:
+            active.append(Violation("pin-stale", PINS, pin.line, f"{key[0]} {key[1]}: no longer violated; delete the pin"))
+    return active, held
+
+
+def pin_growth(
+    root: Path, sha: str, name: str, pins: PinList, renames: dict[str, str]
+) -> tuple[list[Violation], str]:
+    """Pins the base does not have, for a rule the base already pinned, and the
+    note to print when the base has no pin list to compare with."""
+    if not pins.exists:
+        return [], ""
+    text = git_ok(root, "show", f"{sha}:scripts/{PINS}")
+    if text is None:
+        return [], f"pins: {name} has no pin list; growth not checked"
+    before = parse_pins(text)
+    out = []
+    for (rule, path), pin in pins.pins.items():
+        if rule not in (before.pinnable or ()):
+            continue
+        old = before.pins.get((rule, renames.get(path, path)))
+        if old is None:
+            out.append(Violation("pin-new", PINS, pin.line, f"{rule} {path} is not pinned at the base"))
+            continue
+        for code in sorted(pin.codes - old.codes):
+            out.append(Violation("pin-new", PINS, pin.line, f"{rule} {path}: code {code} is not pinned at the base"))
+    return out, ""
 
 
 def run(root: Path, base: str | None, write_index: bool) -> int:
@@ -924,33 +1084,33 @@ def check(root: Path, base: str | None, write_index: bool) -> int:
     if git_ok(root, "rev-parse", "--is-inside-work-tree") is None:
         raise Unavailable(f"{root} is not inside a git work tree")
     files = load_population(root)
+    name, sha = resolve_base(root, base)
     makefile = root / "Makefile"
     callers = derive_callers(files, makefile.read_text(encoding="utf-8") if makefile.is_file() else "")
     expected = render_index(files, callers)
     if write_index:
         (root / "scripts" / INDEX).write_text(expected, encoding="utf-8")
         print(f"scripts-index: wrote scripts/{INDEX} ({len(files)} rows)")
-    name, sha = resolve_base(root, base)
     print(f"check-scripts: base {name} ({sha[:12]})")
-    ctx = Context(root, files, callers, files_added_since(root, sha))
+    added, renames = changes_since(root, sha)
+    ctx = Context(root, files, callers, added, entry_points(files, callers))
     found: list[Violation] = []
     for _name, rule in RULE_FUNCTIONS:
         found += sorted(rule(ctx), key=lambda v: (v.path, v.line))
-    pinnable = {(v.rule, v.path) for v in found}
     pins = load_pins(root)
-    active = [v for v in found if (v.rule, v.path) not in pins]
-    held = {key: number for key, number in pins.items() if key in pinnable}
-    for (rule, path), number in sorted(pins.items(), key=lambda kv: kv[1]):
-        if (rule, path) not in held:
-            active.append(Violation("pin-stale", PINS, number, f"{rule} {path}: no longer violated; delete the pin"))
+    active, held = apply_pins(found, pins)
+    growth, note = pin_growth(root, sha, name, pins, renames)
+    active += growth
     if not write_index:
         active += index_violations(root, expected)
+    if note:
+        print(note)
     for violation in active:
         print(violation.text())
     per_rule: dict[str, int] = defaultdict(int)
     for rule, _path in held:
         per_rule[rule] += 1
-    print("pinned: " + (", ".join(f"{r} {per_rule[r]}" for r in RULES if per_rule[r]) or "none"))
+    print("pinned: " + (", ".join(f"{r} {per_rule[r]}" for r in PINNABLE if per_rule[r]) or "none"))
     if active:
         print(f"check-scripts: FAIL: {len(active)} violation(s)")
         return 1

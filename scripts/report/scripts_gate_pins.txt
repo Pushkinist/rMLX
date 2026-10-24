@@ -1,7 +1,10 @@
 # Accepted violations of the scripts/ rules, one `<rule> <path>` per line; a pin only shrinks.
 #
 # A pin accepts every violation of that rule in that file. Fix the file and delete its
-# line: a pin whose file now passes fails the gate (`pin-stale`). Never pin a new file.
+# line: a pin whose file now passes fails the gate (`pin-stale`). An `exit-undeclared`
+# pin lists the codes the file leaves undeclared. Never pin a new file or a new code.
+#
+# pinnable: class purpose usage exit-undeclared caller
 class aggregate_decode_profile.py
 class bench-records-sweep.sh
 class bench_cache_types.sh
@@ -148,6 +151,24 @@ usage eval/wikitext2_ppl.py
 usage eval_lock_stress.sh
 usage gpu_test_halves.sh
 usage gpu_test_threadgroup.sh
+usage lib/binary_identity.py
+usage lib/prefill_ms.py
+usage lib/published_aggregate.py
+usage lib/published_fixed_prompt.py
+usage lib/published_fixed_run.py
+usage lib/published_greedy.py
+usage lib/published_longctx.py
+usage lib/published_payloads.py
+usage lib/published_requery.py
+usage lib/published_run_log.py
+usage lib/published_table.py
+usage lib/run_log_for_pid.py
+usage lib/server_decode_tps.py
+usage lib/server_kv_quant.py
+usage lib/server_sampling.py
+usage lib/snapshot_identity.py
+usage lib/snapshot_sampling.py
+usage lib/spec_round_log.py
 usage metal_dirs.sh
 usage mlx_preflight.sh
 usage mlx_preflight_selftest.sh
@@ -169,97 +190,98 @@ usage release/sign_artifact.sh
 usage run_gpu_tests.sh
 usage run_gpu_tests_selftest.sh
 usage schema_constraint_canary.sh
+usage sdpa_headdim_bench.py
 usage spec_bench_published_selftest.sh
 usage spec_bench_selftest.sh
 usage spec_broken_engine.sh
 usage spec_round_stream_compare.py
 usage spec_round_stream_compare_selftest.sh
-exit-undeclared aggregate_decode_profile.py
-exit-undeclared bench-records-sweep.sh
-exit-undeclared bench/codec_inertness_probe.sh
-exit-undeclared bench_cache_types.sh
-exit-undeclared bench_cell.sh
-exit-undeclared bench_codec_cell.sh
-exit-undeclared bench_identity_selftest.sh
-exit-undeclared bench_llama_ab.sh
-exit-undeclared bench_llama_ab_selftest.sh
-exit-undeclared check_claim_bypass.sh
-exit-undeclared check_doc_source_citations.sh
-exit-undeclared check_eval_lock.sh
-exit-undeclared check_eval_lock_fixtures.sh
-exit-undeclared check_gpu_device_census.sh
-exit-undeclared check_gpu_tests_ignored.sh
-exit-undeclared check_gpu_tests_ignored_fixtures.sh
-exit-undeclared check_kernel_dtype_contract.sh
-exit-undeclared check_kernel_dtype_contract_fixtures.sh
-exit-undeclared check_kv_boundary_default_parity.sh
-exit-undeclared check_kv_byte_model_parity.sh
-exit-undeclared check_kv_byte_model_parity_fixtures.sh
-exit-undeclared check_kv_codec_disposition.sh
-exit-undeclared check_kv_codec_disposition_fixtures.sh
-exit-undeclared check_kv_layer_quants.sh
-exit-undeclared check_metal_compiles.sh
-exit-undeclared check_metal_format.sh
-exit-undeclared check_named_skip_notices.sh
-exit-undeclared check_named_skip_notices_fixtures.sh
-exit-undeclared check_no_decode_swallow.sh
-exit-undeclared check_no_inline_tests.sh
-exit-undeclared check_no_kernel_input_eval.sh
-exit-undeclared check_no_kernel_input_eval_fixtures.sh
-exit-undeclared check_no_scalar_f32_leak.sh
-exit-undeclared check_personal_data.sh
-exit-undeclared check_published_samples_fixtures.sh
-exit-undeclared check_spec_charge.sh
-exit-undeclared check_spec_charge_fixtures.sh
-exit-undeclared check_spec_metric_parity.sh
-exit-undeclared check_spec_metric_parity_fixtures.sh
-exit-undeclared check_spec_sampling.sh
-exit-undeclared check_spec_sampling_fixtures.sh
-exit-undeclared codec_smoke_runner_selftest.sh
-exit-undeclared eval/wikitext2_ppl.py
-exit-undeclared eval_lock_stress.sh
-exit-undeclared gen_lloyd_codebook.py
-exit-undeclared gpu_capture.sh
-exit-undeclared gpu_test_halves.sh
-exit-undeclared gpu_test_threadgroup.sh
-exit-undeclared gputrace_diff.sh
-exit-undeclared ingest/llama_bench_ingest.py
-exit-undeclared metal_dirs.sh
-exit-undeclared mlx_preflight.sh
-exit-undeclared mlx_restore_pin.sh
-exit-undeclared mst_capture.sh
-exit-undeclared perf-iter/bench_decode_tps.sh
-exit-undeclared perf_ab.sh
-exit-undeclared perf_ab_host_gate_fixtures.sh
-exit-undeclared perf_ab_ingest_selftest.sh
-exit-undeclared perf_ab_selftest.sh
-exit-undeclared perf_canary.sh
-exit-undeclared prefill_chunk_sweep.sh
-exit-undeclared published_ingest_selftest.sh
-exit-undeclared published_table_selftest.sh
-exit-undeclared release/build_bottle.sh
-exit-undeclared release/changelog_section.sh
-exit-undeclared release/package_binary.sh
-exit-undeclared release/sign_artifact.sh
-exit-undeclared release/source_sha256.sh
-exit-undeclared release/sync_tap.sh
-exit-undeclared release_e2e/stage6_perf/codec_smoke_runner.sh
-exit-undeclared release_e2e/stage6_perf/niah_long_context.sh
-exit-undeclared run_gpu_tests.sh
-exit-undeclared run_gpu_tests_selftest.sh
-exit-undeclared schema_constraint_canary.sh
-exit-undeclared spec_bench.sh
-exit-undeclared spec_bench_published.sh
-exit-undeclared spec_bench_published_selftest.sh
-exit-undeclared spec_bench_selftest.sh
-exit-undeclared spec_broken_engine.sh
-exit-undeclared spec_round_stream_compare.py
-exit-undeclared spec_round_stream_compare_selftest.sh
-exit-undeclared ssd_canary.sh
-exit-undeclared ssd_canary_selftest.sh
-exit-undeclared target_gc.sh
-exit-undeclared target_size_report.sh
-exit-undeclared traces_gc.sh
+exit-undeclared aggregate_decode_profile.py 2
+exit-undeclared bench-records-sweep.sh 1
+exit-undeclared bench/codec_inertness_probe.sh 0,2
+exit-undeclared bench_cache_types.sh 0,2
+exit-undeclared bench_cell.sh 0,1,2,3,4,5,6,7,8,9,10
+exit-undeclared bench_codec_cell.sh 1
+exit-undeclared bench_identity_selftest.sh 1
+exit-undeclared bench_llama_ab.sh 0,125
+exit-undeclared bench_llama_ab_selftest.sh 1
+exit-undeclared check_claim_bypass.sh 1,2
+exit-undeclared check_doc_source_citations.sh 1
+exit-undeclared check_eval_lock.sh 1
+exit-undeclared check_eval_lock_fixtures.sh 1
+exit-undeclared check_gpu_device_census.sh 2
+exit-undeclared check_gpu_tests_ignored.sh 0,1
+exit-undeclared check_gpu_tests_ignored_fixtures.sh 1
+exit-undeclared check_kernel_dtype_contract.sh 1
+exit-undeclared check_kernel_dtype_contract_fixtures.sh 1
+exit-undeclared check_kv_boundary_default_parity.sh 1,2
+exit-undeclared check_kv_byte_model_parity.sh 1,2
+exit-undeclared check_kv_byte_model_parity_fixtures.sh 1,2
+exit-undeclared check_kv_codec_disposition.sh 1,2
+exit-undeclared check_kv_codec_disposition_fixtures.sh 1
+exit-undeclared check_kv_layer_quants.sh 1
+exit-undeclared check_metal_compiles.sh 0,1,2
+exit-undeclared check_metal_format.sh 0,1,2
+exit-undeclared check_named_skip_notices.sh 1,2
+exit-undeclared check_named_skip_notices_fixtures.sh 1
+exit-undeclared check_no_decode_swallow.sh 1
+exit-undeclared check_no_inline_tests.sh 1
+exit-undeclared check_no_kernel_input_eval.sh 1
+exit-undeclared check_no_kernel_input_eval_fixtures.sh 1
+exit-undeclared check_no_scalar_f32_leak.sh 1
+exit-undeclared check_personal_data.sh 1,2
+exit-undeclared check_published_samples_fixtures.sh 1
+exit-undeclared check_spec_charge.sh 0,1,2
+exit-undeclared check_spec_charge_fixtures.sh 1
+exit-undeclared check_spec_metric_parity.sh 2
+exit-undeclared check_spec_metric_parity_fixtures.sh 1
+exit-undeclared check_spec_sampling.sh 1,2
+exit-undeclared check_spec_sampling_fixtures.sh 1
+exit-undeclared codec_smoke_runner_selftest.sh 0,1
+exit-undeclared eval/wikitext2_ppl.py 1
+exit-undeclared eval_lock_stress.sh 1
+exit-undeclared gen_lloyd_codebook.py 1
+exit-undeclared gpu_capture.sh 1,2
+exit-undeclared gpu_test_halves.sh 0,2
+exit-undeclared gpu_test_threadgroup.sh 0,2
+exit-undeclared gputrace_diff.sh 1
+exit-undeclared ingest/llama_bench_ingest.py 1
+exit-undeclared metal_dirs.sh 2
+exit-undeclared mlx_preflight.sh 0,1
+exit-undeclared mlx_restore_pin.sh 1
+exit-undeclared mst_capture.sh 0,1,2
+exit-undeclared perf-iter/bench_decode_tps.sh 1
+exit-undeclared perf_ab.sh 0,1,125
+exit-undeclared perf_ab_host_gate_fixtures.sh 1,2
+exit-undeclared perf_ab_ingest_selftest.sh 1
+exit-undeclared perf_ab_selftest.sh 1
+exit-undeclared perf_canary.sh 1,125
+exit-undeclared prefill_chunk_sweep.sh 0,125
+exit-undeclared published_ingest_selftest.sh 1,2
+exit-undeclared published_table_selftest.sh 0,1,2
+exit-undeclared release/build_bottle.sh 1
+exit-undeclared release/changelog_section.sh 1
+exit-undeclared release/package_binary.sh 1
+exit-undeclared release/sign_artifact.sh 1
+exit-undeclared release/source_sha256.sh 1
+exit-undeclared release/sync_tap.sh 1
+exit-undeclared release_e2e/stage6_perf/codec_smoke_runner.sh 0,1,2,3
+exit-undeclared release_e2e/stage6_perf/niah_long_context.sh 1,2
+exit-undeclared run_gpu_tests.sh 0,1
+exit-undeclared run_gpu_tests_selftest.sh 1
+exit-undeclared schema_constraint_canary.sh 0,2
+exit-undeclared spec_bench.sh 1,125
+exit-undeclared spec_bench_published.sh 1,125
+exit-undeclared spec_bench_published_selftest.sh 1,2
+exit-undeclared spec_bench_selftest.sh 1,2
+exit-undeclared spec_broken_engine.sh 2,3
+exit-undeclared spec_round_stream_compare.py 2
+exit-undeclared spec_round_stream_compare_selftest.sh 1
+exit-undeclared ssd_canary.sh 1,125
+exit-undeclared ssd_canary_selftest.sh 2
+exit-undeclared target_gc.sh 0,1,2
+exit-undeclared target_size_report.sh 0
+exit-undeclared traces_gc.sh 1
 caller aggregate_decode_profile.py
 caller bench-records-sweep.sh
 caller bench/codec_inertness_probe.sh

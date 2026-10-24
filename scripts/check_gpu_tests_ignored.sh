@@ -234,8 +234,9 @@
 #   That divergence is a real cost and is accepted deliberately for the one
 #   population that has it today, the NIAH long-context cells: they are
 #   snapshot-gated, run 8k–32k-token prefills, and already have a purpose-built
-#   driver (`scripts/release_e2e/stage6_perf/niah_long_context.sh`, wired into
-#   `make smoke-codec-matrix`). Folding ~75 model loads into the pre-merge GPU
+#   driver (`scripts/release_e2e/stage6_perf/niah_long_context.sh`, run by hand;
+#   `make smoke-codec-matrix` runs the same cells through its matrix runner).
+#   Folding ~75 model loads into the pre-merge GPU
 #   suite would make it depend on model snapshots and cost hours. What the
 #   present change buys is the half that was genuinely unenforced: the
 #   `#[ignore]` attribute on the macro body.

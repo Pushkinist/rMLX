@@ -47,6 +47,17 @@ valid_sh() {
         '# Exit:   0 clean; 1 failed' '# Caller: by hand' "$NAM" "$1"
 }
 
+# nocaller_sh <body>: a shell entry point with no Caller: line, so only a run makes it callable.
+nocaller_sh() {
+    entry_sh '# CI gate: a planted entry point.' '#' '# Usage:  bash scripts/check/x.sh' \
+        '# Exit:   0 clean; 1 failed' '#' "$NAM" "$1"
+}
+
+# gate_at <root> <ref>: the gate with <ref> as its base.
+gate_at() {
+    python3 "$TOOL" --scripts --root "$1" --base "$2"
+}
+
 # reindex <root>: regenerate INDEX.md, so a case isolates the rule it plants.
 reindex() {
     python3 "$TOOL" --scripts --root "$1" --base HEAD --write-index >/dev/null 2>&1 || true
@@ -102,6 +113,7 @@ put "$BASE" report/tool_mod.py <<'EOF'
 Module of: report/tool.py
 """
 EOF
+commit_all "$BASE" files
 reindex "$BASE"
 commit_all "$BASE" base
 
@@ -154,6 +166,12 @@ EOF
 st_case index_preamble_edited 1 --what "a change outside the rows is still stale" \
     --has "index-stale: INDEX.md:" --has "differs from the generated text" -- gate "$root"
 
+root=$(fresh index_longer)
+printf '\n' >>"$root/scripts/INDEX.md"
+line=$(($(grep -c '' "$root/scripts/INDEX.md") + 1))
+st_case index_only_longer 1 --what "an INDEX.md that differs only in length is named at the first line past the text, with no traceback" \
+    --has "index-stale: INDEX.md:${line}: differs from the generated text" --lacks "Traceback" -- gate "$root"
+
 root=$(fresh index_absent)
 rm "$root/scripts/INDEX.md"
 st_case index_absent 1 --what "no INDEX.md is stale, not clean" \
@@ -165,6 +183,14 @@ st_case write_index_then_pass 0 --what "--write-index regenerates the rows and t
     --has "scripts-index: wrote scripts/INDEX.md (5 rows)" -- python3 "$TOOL" --scripts --root "$root" --base HEAD --write-index
 st_case index_written_passes 0 --what "the regenerated index is what the check expects" \
     --has "check-scripts: ok (5 files, 0 pinned)" -- gate "$root"
+
+root=$(fresh index_write_refused)
+valid_sh 'exit 0' | put "$root" check/x.sh
+before=$(cksum <"$root/scripts/INDEX.md")
+st_case write_index_unknown_base 2 --what "--write-index with a base that is no commit refuses" \
+    --has "is not a commit" -- python3 "$TOOL" --scripts --root "$root" --base no-such-ref --write-index
+st_case write_index_unknown_base_writes_nothing 0 --what "and the INDEX.md it would have rewritten is as it was" \
+    --has "$before" -- sh -c 'cksum <"$1/scripts/INDEX.md"' sh "$root"
 
 root=$(fresh index_written_still_checks)
 put "$root" stray.sh <<'EOF'
@@ -309,8 +335,29 @@ Nothing here is an entry point, so no Usage: line is asked of it.
 """
 EOF
 reindex "$root"
-st_case usage_not_asked_without_shebang 0 --what "a file with no shebang is not an entry point" \
+st_case usage_not_asked_without_shebang 0 --what "no shebang and nobody runs it: not an entry point" \
     --has "check-scripts: ok (5 files" -- gate "$root"
+
+root=$(fresh usage_run_without_shebang)
+printf '%s\n' '# A planted script with no shebang that a recipe runs.' 'exit 0' | put "$root" check/noshebang.sh
+printf 'check-noshebang:\n\t@bash scripts/check/noshebang.sh\n' >>"$root/Makefile"
+reindex "$root"
+st_case usage_asked_of_a_file_a_recipe_runs 1 --what "no shebang, but a recipe runs it: an entry point" \
+    --has "usage: check/noshebang.sh:1:" -- gate "$root"
+
+root=$(fresh usage_run_in_lib)
+printf '%s\n' '#!/usr/bin/env bash' '# A planted file in lib/ that a recipe runs.' 'exit 0' | put "$root" lib/runme.sh
+printf 'check-runme:\n\t@bash scripts/lib/runme.sh\n' >>"$root/Makefile"
+reindex "$root"
+st_case usage_asked_of_a_lib_file_a_recipe_runs 1 --what "a lib/ file a recipe runs is an entry point" \
+    --has "usage: lib/runme.sh:1:" -- gate "$root"
+
+root=$(fresh usage_empty)
+entry_sh '# CI gate: a planted entry point.' '#' '# Usage:' '# Exit:   0 clean' '# Caller: by hand' "$NAM" 'exit 0' |
+    put "$root" check/x.sh
+reindex "$root"
+st_case usage_empty 1 --what "a Usage: line that says nothing" \
+    --has "usage: check/x.sh:4: \`Usage:\` says nothing" -- gate "$root"
 
 root=$(fresh usage_module_with_shebang)
 put "$root" report/tool_three.py <<'EOF'
@@ -399,6 +446,30 @@ valid_sh "$(printf 'cat <<-TXT\n\texit 7\n\tTXT\nexit 6')" | put "$root" check/x
 reindex "$root"
 st_case exit_after_tab_indented_heredoc 1 --what "<<- ends at a tab-indented tag, so the exit after it is read" \
     --has "exit-undeclared: check/x.sh:12: 6" --lacks ": 7 is not declared" -- gate "$root"
+
+root=$(fresh exit_prose_digit)
+entry_sh '# CI gate: a planted entry point.' '#' '# Usage:  bash scripts/check/x.sh' \
+    '# Exit:   0 clean; 1 failed; reads the last 30 lines of the log' '# Caller: by hand' "$NAM" 'exit 30' |
+    put "$root" check/x.sh
+reindex "$root"
+st_case exit_digit_in_prose_is_not_declared 1 --what "30 in the prose of Exit: declares nothing" \
+    --has "exit-undeclared: check/x.sh:9: 30 is not declared" -- gate "$root"
+
+root=$(fresh exit_equals_form)
+entry_sh '# CI gate: a planted entry point.' '#' '# Usage:  bash scripts/check/x.sh' \
+    "$(printf '# Exit:   0 = clean\n#         4 = refused')" '# Caller: by hand' "$NAM" 'exit 4' |
+    put "$root" check/x.sh
+reindex "$root"
+st_case exit_n_equals_meaning_declares 0 --what "N = meaning, on a continuation line, declares N" \
+    --has "check-scripts: ok (5 files" -- gate "$root"
+
+root=$(fresh exit_substitution_quotes)
+dq='"'
+sq="'"
+valid_sh "v=${dq}\$(echo ${sq}${dq}${sq})${dq}"$'\n'"exit 6" | put "$root" check/x.sh
+reindex "$root"
+st_case exit_after_a_substitution_with_quotes 1 --what "a quote inside \$( ) in a string does not hide the exit after it" \
+    --has "exit-undeclared: check/x.sh:10: 6" -- gate "$root"
 
 root=$(fresh exit_after_then)
 valid_sh 'if [ -n "${X:-}" ]; then exit 5; fi' | put "$root" check/x.sh
@@ -560,6 +631,105 @@ reindex "$root"
 st_case caller_every_target_of_a_rule 0 --what "a rule with two target names credits both" \
     --has '| `check/x.sh` | make multi-a, make multi-b |' -- cat "$root/scripts/INDEX.md"
 
+root=$(fresh caller_assign_unused)
+nocaller_sh 'exit 0' | put "$root" check/x.sh
+printf 'SUBJECT=scripts/check/x.sh\ngrep -c TODO "$SUBJECT" >/dev/null || true\n' >>"$root/scripts/check/ok.sh"
+reindex "$root"
+st_case caller_assignment_only_as_an_argument 1 --what "VAR=path with \$VAR used as an argument runs nothing" \
+    --has "caller: check/x.sh:1:" -- gate "$root"
+
+n=0
+for use in 'bash "$SUBJECT"' 'st_run "$SUBJECT"' 'st_case name 0 -- "$SUBJECT"' 'env -u A "$SUBJECT"' \
+    'T2="$SUBJECT"; bash "${T2}"' 'timeout 5 "$SUBJECT"' 'bounded python3 "$SUBJECT"'; do
+    n=$((n + 1))
+    root=$(fresh "caller_assign_used_$n")
+    nocaller_sh 'exit 0' | put "$root" check/x.sh
+    printf 'SUBJECT=scripts/check/x.sh\n%s\n' "$use" >>"$root/scripts/check/ok.sh"
+    reindex "$root"
+    st_case "caller_assign_used_$n" 0 --what "VAR=path, later used as: $use" \
+        --has "check-scripts: ok (5 files" -- gate "$root"
+done
+
+root=$(fresh caller_assign_used_before)
+nocaller_sh 'exit 0' | put "$root" check/x.sh
+printf 'bash "$SUBJECT"\nSUBJECT=scripts/check/x.sh\n' >>"$root/scripts/check/ok.sh"
+reindex "$root"
+st_case caller_variable_used_before_it_is_set 1 --what "\$VAR expanded before VAR=path credits nothing" \
+    --has "caller: check/x.sh:1:" -- gate "$root"
+
+root=$(fresh caller_python_constant)
+nocaller_sh 'exit 0' | put "$root" check/x.sh
+printf '\nSUBJECT = "scripts/check/x.sh"\n' >>"$root/scripts/report/tool.py"
+reindex "$root"
+st_case caller_python_bare_constant 1 --what "a Python string constant outside a command vector is no caller" \
+    --has "caller: check/x.sh:1:" -- gate "$root"
+
+root=$(fresh caller_shell_continuation)
+nocaller_sh 'exit 0' | put "$root" check/x.sh
+printf 'echo \\\nscripts/check/x.sh\n' >>"$root/scripts/check/ok.sh"
+reindex "$root"
+st_case caller_shell_continuation_joined 1 --what "a name on the continuation line of an echo in a script is text" \
+    --has "caller: check/x.sh:1:" -- gate "$root"
+
+root=$(fresh caller_make_continuation)
+nocaller_sh 'exit 0' | put "$root" check/x.sh
+printf 'check-echo:\n\t@echo \\\n\t\tscripts/check/x.sh\n' >>"$root/Makefile"
+reindex "$root"
+st_case caller_recipe_continuation_joined 1 --what "a name on the continuation line of an echo is text" \
+    --has "caller: check/x.sh:1:" -- gate "$root"
+
+root=$(fresh caller_make_continuation_run)
+nocaller_sh 'exit 0' | put "$root" check/x.sh
+printf 'check-cont:\n\t@bash \\\n\t\tscripts/check/x.sh\n' >>"$root/Makefile"
+reindex "$root"
+st_case caller_recipe_continuation_run 0 --what "bash on one line and the script on the next is a run" \
+    --has "check-scripts: ok (5 files" -- gate "$root"
+
+root=$(fresh caller_make_continuation_flush)
+nocaller_sh 'exit 0' | put "$root" check/x.sh
+printf 'check-flush:\n\t@bash \\\nscripts/check/x.sh\n' >>"$root/Makefile"
+reindex "$root"
+st_case caller_recipe_continuation_at_column_0 0 --what "a continuation line that starts at column 0 still belongs to the recipe" \
+    --has "check-scripts: ok (5 files" -- gate "$root"
+
+n=0
+for wrapper in 'exec' 'env A=1' 'command' 'nohup' 'nice -n 5' 'timeout 5' 'sudo' 'builtin'; do
+    n=$((n + 1))
+    root=$(fresh "caller_wrapper_$n")
+    nocaller_sh 'exit 0' | put "$root" check/x.sh
+    printf '%s scripts/check/x.sh\n' "$wrapper" >>"$root/scripts/check/ok.sh"
+    reindex "$root"
+    st_case "caller_wrapper_$n" 0 --what "run behind: $wrapper" \
+        --has "check-scripts: ok (5 files" -- gate "$root"
+done
+
+n=0
+for form in 'source scripts/lib/second.sh' '. scripts/lib/second.sh'; do
+    n=$((n + 1))
+    root=$(fresh "caller_source_$n")
+    printf '%s\n' '#!/usr/bin/env bash' '# A second helper that nothing runs.' '#' '# Sourced, not executed.' |
+        put "$root" lib/second.sh
+    printf '%s\n' "$form" >>"$root/scripts/check/ok.sh"
+    reindex "$root"
+    st_case "caller_source_$n" 0 --what "$form: a caller, and a sourced file is no entry point" \
+        --has '| `lib/second.sh` | check/ok.sh |' -- cat "$root/scripts/INDEX.md"
+    st_case "caller_source_clean_$n" 0 --what "and it is not asked for a Usage: line" \
+        --has "check-scripts: ok (5 files" -- gate "$root"
+done
+
+root=$(fresh caller_nested_substitution)
+nocaller_sh 'exit 0' | put "$root" check/x.sh
+printf 'bash "$(dirname "$(dirname "$0")")/check/x.sh"\n' >>"$root/scripts/check/ok.sh"
+reindex "$root"
+st_case caller_nested_substitution 0 --what "a path built from a nested \$( ) in double quotes" \
+    --has "check-scripts: ok (5 files" -- gate "$root"
+
+root=$(fresh caller_cell_by_hand)
+valid_sh 'exit 0' | put "$root" check/x.sh
+reindex "$root"
+st_case caller_cell_by_hand 0 --what "an entry nothing runs, declared by hand, reads by hand in the index" \
+    --has '| `check/x.sh` | by hand |' -- cat "$root/scripts/INDEX.md"
+
 root=$(fresh caller_python_string)
 valid_sh 'exit 0' | python3 -c 'import sys; sys.stdout.write(sys.stdin.read().replace("# Caller: by hand\n", "#\n"))' |
     put "$root" check/x.sh
@@ -618,11 +788,66 @@ st_case not_a_mode_old_file_exempt 0 --what "ok.sh is in the base and carries no
 
 root=$(fresh nam_recall_test)
 printf '%s\n' '#!/usr/bin/env bash' '# Recall test for ok.sh: a planted recall test.' '#' \
-    '# Usage:  bash scripts/check/ok_selftest.sh' '# Exit:   0 held' '# Caller: by hand' |
+    '# Recall test for: check/ok.sh' '# Usage:  bash scripts/check/ok_selftest.sh' '# Exit:   0 held' \
+    '# Caller: by hand' |
     put "$root" check/ok_selftest.sh
 reindex "$root"
-st_case not_a_mode_recall_test_exempt 0 --what "a new recall test belongs to its subject" \
+st_case not_a_mode_recall_test_exempt 0 --what "a new recall test that names an existing file belongs to it" \
     --has "check-scripts: ok (5 files" -- gate "$root"
+
+root=$(fresh nam_selftest_name_only)
+printf '%s\n' '#!/usr/bin/env bash' '# Deploys the release bottle; not a test at all.' '#' \
+    '# Usage:  bash scripts/check/deploy_selftest.sh' '# Exit:   0 ok' '# Caller: by hand' 'exit 0' |
+    put "$root" check/deploy_selftest.sh
+reindex "$root"
+st_case not_a_mode_name_alone_is_no_recall_test 1 --what "a _selftest.sh name with no Recall test for: line" \
+    --has "not-a-mode: check/deploy_selftest.sh:1:" -- gate "$root"
+
+root=$(fresh nam_recall_nothing)
+printf '%s\n' '#!/usr/bin/env bash' '# A new tool that claims to be a recall test.' '#' \
+    '# Recall test for: nothing/at_all.sh' '# Usage:  bash scripts/check/tool2.sh' '# Exit:   0 ok' \
+    '# Caller: by hand' 'exit 0' | put "$root" check/tool2.sh
+reindex "$root"
+st_case not_a_mode_recall_test_of_nothing 1 --what "Recall test for: names a file that does not exist" \
+    --has "not-a-mode: check/tool2.sh:1:" -- gate "$root"
+
+root=$(fresh nam_recall_itself)
+printf '%s\n' '#!/usr/bin/env bash' '# A new tool that claims to be its own recall test.' '#' \
+    '# Recall test for: check/tool2.sh' '# Usage:  bash scripts/check/tool2.sh' '# Exit:   0 ok' \
+    '# Caller: by hand' 'exit 0' | put "$root" check/tool2.sh
+reindex "$root"
+st_case not_a_mode_recall_test_of_itself 1 --what "Recall test for: names the file itself" \
+    --has "not-a-mode: check/tool2.sh:1:" -- gate "$root"
+
+root=$(fresh nam_module_nowhere)
+printf '%s\n' '#!/usr/bin/env bash' '# A new entry point hidden behind a Module of: line.' '#' \
+    '# Module of: check/does_not_exist.sh' 'exit 7' | put "$root" check/hidden.sh
+reindex "$root"
+st_case not_a_mode_module_of_nothing 1 --what "Module of: names no file: an entry point under every rule" \
+    --has "not-a-mode: check/hidden.sh:1:" --has "usage: check/hidden.sh:1:" -- gate "$root"
+
+root=$(fresh nam_module_itself)
+printf '%s\n' '#!/usr/bin/env bash' '# A new entry point that is a module of itself.' '#' \
+    '# Module of: check/hidden.sh' 'exit 7' | put "$root" check/hidden.sh
+reindex "$root"
+st_case not_a_mode_module_of_itself 1 --what "Module of: names the file itself" \
+    --has "not-a-mode: check/hidden.sh:1:" -- gate "$root"
+
+root=$(fresh nam_renamed)
+git -C "$root" config diff.renames false
+git -C "$root" mv scripts/check/ok.sh scripts/check/ok2.sh
+printf 'check-ok:\n\t@bash scripts/check/ok2.sh\n\ntool:\n\t@python3 scripts/report/tool.py\n' >"$root/Makefile"
+reindex "$root"
+commit_all "$root" "move ok.sh"
+st_case not_a_mode_moved_file_is_not_new 0 --what "a committed git mv of an old file is not a new file" \
+    --has "check-scripts: ok (4 files" --lacks "not-a-mode" -- gate_at "$root" HEAD^
+
+root=$(fresh nam_unstaged_move)
+mv "$root/scripts/check/ok.sh" "$root/scripts/check/ok2.sh"
+printf 'check-ok:\n\t@bash scripts/check/ok2.sh\n\ntool:\n\t@python3 scripts/report/tool.py\n' >"$root/Makefile"
+reindex "$root"
+st_case not_a_mode_unstaged_move_is_new 1 --what "a plain mv, not staged, reads as a new file" \
+    --has "not-a-mode: check/ok2.sh:1:" -- gate "$root"
 
 root=$(fresh nam_module)
 printf '%s\n' '"""A planted module of the fixture tool.' '' 'Module of: report/tool.py' '"""' |
@@ -642,24 +867,71 @@ open(path, "w").write(text)
 EOF
 reindex "$root"
 st_case not_a_mode_stale 1 --what "an old file names a tool that no longer exists, at its own line" \
-    --has "not-a-mode-stale: check/ok.sh:6: names check/gone.sh, which does not exist" -- gate "$root"
+    --has "not-a-mode-stale: check/ok.sh:6: names check/gone.sh, which is not another entry point" -- gate "$root"
 
 root=$(fresh nam_names_existing)
 python3 - "$root/scripts/check/ok.sh" <<'EOF'
 import sys
 
 path = sys.argv[1]
-text = open(path).read().replace("set -euo", "# Not a mode of: lib/helper.sh — a tool that exists\nset -euo")
+text = open(path).read().replace("set -euo", "# Not a mode of: report/tool.py — a tool that exists\nset -euo")
 open(path, "w").write(text)
 EOF
 reindex "$root"
-st_case not_a_mode_names_existing 0 --what "the same line naming an existing tool passes" \
+st_case not_a_mode_names_existing 0 --what "the same line naming an existing entry point passes" \
     --has "check-scripts: ok (4 files" -- gate "$root"
+
+n=0
+for target in 'check/ok.sh' 'README.md' 'check' 'lib/helper.sh' 'INDEX.md'; do
+    n=$((n + 1))
+    root=$(fresh "nam_target_$n")
+    entry_sh '# CI gate: a planted entry point.' '#' '# Usage:  bash scripts/check/x.sh' '# Exit:   0 clean' \
+        '# Caller: by hand' "# Not a mode of: $target — a reason" 'exit 0' | put "$root" check/x.sh
+    reindex "$root"
+    if [ "$target" = check/ok.sh ]; then
+        st_case "not_a_mode_target_$n" 0 --what "naming another entry point ($target) passes" \
+            --has "check-scripts: ok (5 files" -- gate "$root"
+        entry_sh '# CI gate: a planted entry point.' '#' '# Usage:  bash scripts/check/x.sh' '# Exit:   0 clean' \
+            '# Caller: by hand' "# Not a mode of: check/x.sh — a reason" 'exit 0' | put "$root" check/x.sh
+        reindex "$root"
+        st_case "not_a_mode_target_itself" 1 --what "naming the file itself fails" \
+            --has "not-a-mode-stale: check/x.sh:7: names check/x.sh, which is not another entry point" -- gate "$root"
+    else
+        st_case "not_a_mode_target_$n" 1 --what "naming $target is not naming another entry point" \
+            --has "not-a-mode-stale: check/x.sh:7: names $target, which is not another entry point" -- gate "$root"
+    fi
+done
+
+n=0
+for separator in ' -- ' ' - '; do
+    n=$((n + 1))
+    root=$(fresh "nam_separator_$n")
+    entry_sh '# CI gate: a planted entry point.' '#' '# Usage:  bash scripts/check/x.sh' '# Exit:   0 clean' \
+        '# Caller: by hand' "# Not a mode of: check/ok.sh${separator}a reason" 'exit 0' | put "$root" check/x.sh
+    reindex "$root"
+    st_case "not_a_mode_separator_$n" 0 --what "the tool and its reason, separated by '${separator}'" \
+        --has "check-scripts: ok (5 files" -- gate "$root"
+done
 
 # ---- pins ----------------------------------------------------------------
 
+PINNABLE='# pinnable: class purpose usage exit-undeclared caller'
 pins_file() {
-    printf '%s\n' '# Accepted violations of the fixture tree.' '#' "$@"
+    printf '%s\n' '# Accepted violations of the fixture tree.' '#' "$PINNABLE" "$@"
+}
+
+# pinned_base <name> [header]: the base tree plus check/p.sh, which has no Usage: line and
+# an undeclared exit 7, both pinned; committed, so these pins are the base's.
+pinned_base() {
+    local r
+    r=$(fresh "$1")
+    entry_sh '# CI gate: a pinned entry point.' '#' '#' '# Exit:   0 clean' '# Caller: by hand' "$NAM" 'exit 7' |
+        put "$r" check/p.sh
+    printf '%s\n' '# Accepted violations of the fixture tree.' '#' "${2:-$PINNABLE}" \
+        'usage check/p.sh' 'exit-undeclared check/p.sh 7' >"$r/$PINS_REL"
+    reindex "$r"
+    commit_all "$r" "pin p.sh"
+    printf '%s' "$r"
 }
 
 root=$(fresh pin_holds)
@@ -668,7 +940,8 @@ entry_sh '# CI gate: a planted entry point.' '#' '#' '# Exit:   0 clean' '# Call
 pins_file 'usage check/x.sh' >"$root/$PINS_REL"
 reindex "$root"
 st_case pin_accepts_a_violation 0 --what "a pinned violation passes and is counted" \
-    --has "pinned: usage 1" --has "check-scripts: ok (6 files, 1 pinned)" -- gate "$root"
+    --has "pinned: usage 1" --has "check-scripts: ok (6 files, 1 pinned)" \
+    --has "pins: HEAD has no pin list; growth not checked" -- gate "$root"
 
 root=$(fresh pin_other_rule)
 entry_sh '# CI gate: a planted entry point.' '#' '#' '# Exit:   0 clean' '# Caller: by hand' "$NAM" 'exit 7' |
@@ -683,25 +956,141 @@ valid_sh 'exit 0' | put "$root" check/x.sh
 pins_file 'usage check/x.sh' >"$root/$PINS_REL"
 reindex "$root"
 st_case pin_stale_file_now_passes 1 --what "a pinned file that now passes fails, at the pin's own line" \
-    --has "pin-stale: report/scripts_gate_pins.txt:3: usage check/x.sh: no longer violated" -- gate "$root"
+    --has "pin-stale: report/scripts_gate_pins.txt:4: usage check/x.sh: no longer violated" -- gate "$root"
 
 root=$(fresh pin_stale_gone)
 pins_file 'usage check/gone.sh' >"$root/$PINS_REL"
 reindex "$root"
 st_case pin_stale_file_gone 1 --what "a pin on a file that does not exist" \
-    --has "pin-stale: report/scripts_gate_pins.txt:3: usage check/gone.sh" -- gate "$root"
+    --has "pin-stale: report/scripts_gate_pins.txt:4: usage check/gone.sh" -- gate "$root"
 
 root=$(fresh pin_unknown_rule)
 pins_file 'no-such-rule check/ok.sh' >"$root/$PINS_REL"
 reindex "$root"
 st_case pin_stale_unknown_rule 1 --what "a pin naming no rule" \
-    --has "pin-stale: report/scripts_gate_pins.txt:3: no-such-rule check/ok.sh" -- gate "$root"
+    --has "pin-stale: report/scripts_gate_pins.txt:4: no-such-rule check/ok.sh" -- gate "$root"
 
 root=$(fresh pin_index)
 pins_file 'index-stale INDEX.md' >"$root/$PINS_REL"
 reindex "$root"
 st_case pin_cannot_hold_index_stale 1 --what "index-stale cannot be pinned" \
-    --has "pin-stale: report/scripts_gate_pins.txt:3: index-stale INDEX.md" -- gate "$root"
+    --has "pin-stale: report/scripts_gate_pins.txt:4: index-stale INDEX.md" -- gate "$root"
+
+root=$(pinned_base pin_base_holds)
+st_case pin_list_equal_to_the_base_holds 0 --what "pins equal to the base's: nothing grew, no bootstrap note" \
+    --has "pinned: usage 1, exit-undeclared 1" --lacks "pin-new" --lacks "has no pin list" -- gate "$root"
+
+root=$(pinned_base pin_growth)
+entry_sh '# CI gate: a planted entry point.' '#' '#' '# Exit:   0 clean' '# Caller: by hand' "$NAM" 'exit 0' |
+    put "$root" check/foo.sh
+printf 'usage check/foo.sh\n' >>"$root/$PINS_REL"
+reindex "$root"
+st_case pin_new_for_a_new_file 1 --what "a pin for a file the base did not pin, for a rule the base pinned" \
+    --has "pin-new: report/scripts_gate_pins.txt:6: usage check/foo.sh is not pinned at the base" -- gate "$root"
+
+root=$(pinned_base pin_duplicate)
+printf 'usage check/p.sh\n' >>"$root/$PINS_REL"
+st_case pin_duplicate 1 --what "the same pin twice" \
+    --has "pin-dup: report/scripts_gate_pins.txt:6: usage check/p.sh is already pinned at line 4" -- gate "$root"
+
+root=$(pinned_base pin_unpinnable)
+printf 'not-a-mode check/p.sh\n' >>"$root/$PINS_REL"
+st_case pin_unpinnable_rule 1 --what "not-a-mode cannot be pinned" \
+    --has "pin-stale: report/scripts_gate_pins.txt:6: not-a-mode check/p.sh: not-a-mode cannot be pinned" -- gate "$root"
+
+root=$(pinned_base pin_unpinnable_violation)
+entry_sh '# CI gate: a planted entry point.' '#' '# Usage:  bash scripts/check/foo.sh' '# Exit:   0 clean' \
+    '# Caller: by hand' '#' 'exit 0' | put "$root" check/foo.sh
+printf 'not-a-mode check/foo.sh\n' >>"$root/$PINS_REL"
+reindex "$root"
+st_case pin_does_not_hide_an_unpinnable_violation 1 --what "a pin for not-a-mode leaves the not-a-mode violation standing" \
+    --has "not-a-mode: check/foo.sh:1:" \
+    --has "pin-stale: report/scripts_gate_pins.txt:6: not-a-mode check/foo.sh: not-a-mode cannot be pinned" -- gate "$root"
+
+root=$(pinned_base pin_header "# pinnable: class purpose")
+st_case pin_header_mismatch 1 --what "the pinnable line differs from the gate's rule set" \
+    --has "pin-header: report/scripts_gate_pins.txt:3:" -- gate "$root"
+
+root=$(pinned_base pin_new_exit)
+printf 'exit 99\n' >>"$root/scripts/check/p.sh"
+st_case pin_exit_code_beyond_the_set 1 --what "a pinned file grows another undeclared exit" \
+    --has "exit-undeclared: check/p.sh:10: 99 is not declared" -- gate "$root"
+
+root=$(pinned_base pin_exit_declared)
+python3 - "$root/scripts/check/p.sh" <<'EOF'
+import sys
+
+path = sys.argv[1]
+text = open(path).read().replace("# Exit:   0 clean\n", "# Exit:   0 clean; 7 a violation\n")
+open(path, "w").write(text)
+EOF
+st_case pin_exit_only_code_declared 1 --what "the file's only undeclared code is now declared: the pin is stale" \
+    --has "pin-stale: report/scripts_gate_pins.txt:5: exit-undeclared check/p.sh: no longer violated" -- gate "$root"
+
+root=$(pinned_base pin_exit_declared_other)
+python3 - "$root/scripts/check/p.sh" <<'EOF'
+import sys
+
+path = sys.argv[1]
+text = open(path).read().replace("# Exit:   0 clean\n", "# Exit:   0 clean; 7 a violation\n") + "exit 99\n"
+open(path, "w").write(text)
+EOF
+st_case pin_exit_code_now_declared 1 --what "a code in the pinned set is declared while another is not" \
+    --has "pin-stale: report/scripts_gate_pins.txt:5: exit-undeclared check/p.sh: code 7 is declared or gone" \
+    --has "exit-undeclared: check/p.sh:10: 99 is not declared" -- gate "$root"
+
+root=$(pinned_base pin_exit_grown_set)
+printf 'exit 99\n' >>"$root/scripts/check/p.sh"
+python3 - "$root/$PINS_REL" <<'EOF'
+import sys
+
+path = sys.argv[1]
+text = open(path).read().replace("check/p.sh 7\n", "check/p.sh 7,99\n")
+open(path, "w").write(text)
+EOF
+st_case pin_exit_set_grows 1 --what "the pinned code set gains a code the base did not pin" \
+    --has "pin-new: report/scripts_gate_pins.txt:5: exit-undeclared check/p.sh: code 99 is not pinned at the base" \
+    --lacks "exit-undeclared: check/p.sh" -- gate "$root"
+
+root=$(pinned_base pin_two_rules)
+python3 - "$root/scripts/check/p.sh" <<'EOF'
+import sys
+
+path = sys.argv[1]
+lines = open(path).read().split("\n")
+lines[3] = "# Usage:  bash scripts/check/p.sh"
+open(path, "w").write("\n".join(lines))
+EOF
+st_case pin_one_of_two_rules_fixed 1 --what "a file pinned for two rules that fixes one: that pin is stale, the other holds" \
+    --has "pin-stale: report/scripts_gate_pins.txt:4: usage check/p.sh: no longer violated" \
+    --lacks "exit-undeclared check/p.sh: code" -- gate "$root"
+
+root=$(pinned_base pin_moved)
+git -C "$root" mv scripts/check/p.sh scripts/check/q.sh
+python3 - "$root/$PINS_REL" <<'EOF'
+import sys
+
+path = sys.argv[1]
+text = open(path).read().replace("check/p.sh", "check/q.sh")
+open(path, "w").write(text)
+EOF
+reindex "$root"
+st_case pin_follows_a_moved_file 0 --what "a git mv with its pin lines renamed keeps the pins" \
+    --has "pinned: usage 1, exit-undeclared 1" --lacks "pin-new" -- gate "$root"
+
+root=$(pinned_base pin_new_rule "# pinnable: class purpose usage exit-undeclared")
+nocaller_sh 'exit 0' | put "$root" check/r.sh
+python3 - "$root/$PINS_REL" <<'EOF'
+import sys
+
+path = sys.argv[1]
+text = open(path).read().replace("exit-undeclared\n", "exit-undeclared caller\n", 1)
+open(path, "w").write(text)
+EOF
+printf 'caller check/r.sh\n' >>"$root/$PINS_REL"
+reindex "$root"
+st_case pin_seeds_a_rule_the_base_lacked 0 --what "a rule absent from the base's pinnable line may seed pins" \
+    --has "pinned: usage 1, exit-undeclared 1, caller 1" -- gate "$root"
 
 # ---- scope ---------------------------------------------------------------
 
@@ -799,13 +1188,10 @@ st_case base_parent_leaves_older_files_alone 0 --what "a file committed before t
 
 # ---- the real tree -------------------------------------------------------
 
-pinned=""
-for rule in class purpose usage exit-undeclared caller not-a-mode not-a-mode-stale; do
-    n=$(grep -c "^${rule} " "$REPO_ROOT/$PINS_REL" || true)
-    [ "$n" -eq 0 ] || pinned="${pinned:+$pinned, }$rule $n"
-done
-total=$(grep -c '^[a-z]' "$REPO_ROOT/$PINS_REL" || true)
-st_case real_tree 0 --what "the checked-in tree passes, and the pins it prints are the pin file's" \
-    --has "pinned: $pinned" --has "$total pinned)" -- gate "$REPO_ROOT"
+# The pin counts are literals, so a chunk that shrinks a pin lowers them in the same commit
+# and growth shows in the diff as a raised literal.
+st_case real_tree 0 --what "the checked-in tree passes with exactly these pins" \
+    --has "pinned: class 97, purpose 6, usage 88, exit-undeclared 86, caller 16" \
+    --has "293 pinned)" -- gate "$REPO_ROOT"
 
 st_done
