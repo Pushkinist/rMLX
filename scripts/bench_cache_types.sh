@@ -74,11 +74,6 @@ else CTX_MAX_DEFAULT=$((PROMPT_TOKENS * 2)); fi
 RMLX_DIR=$(cd "$(dirname "$0")/.." && pwd)
 RMLX_BIN="$RMLX_DIR/target/release/rmlx"
 
-# Run identity (backend / version / git sha / build profile / hardware tag)
-# comes from the measured binary — never hard-coded here.
-source "$(dirname "${BASH_SOURCE[0]}")/lib/identity.sh"
-rmlx_export_identity "$RMLX_BIN"
-
 if [ ! -x "$RMLX_BIN" ]; then
   echo "rmlx binary not found / not executable: $RMLX_BIN" >&2
   exit 2
@@ -86,16 +81,7 @@ fi
 
 RUN_TS=$(date -u +"%Y%m%dT%H%M%SZ")
 MODEL_BASENAME=$(basename "$MODEL_PATH")
-case "$MODEL_BASENAME" in
-  *__*)
-    NS="${MODEL_BASENAME%%__*}"
-    MODEL_NAME="${MODEL_BASENAME#*__}"
-    ;;
-  *)
-    NS="local"
-    MODEL_NAME="$MODEL_BASENAME"
-    ;;
-esac
+MODEL_NAME="${MODEL_BASENAME#*__}"
 
 # Pick a TAG for `scripts/bench_cell.sh` (used only for log filenames / progress line).
 TAG_BASE=$(echo "$MODEL_NAME" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g' | cut -c1-20)
@@ -140,7 +126,8 @@ printf "%s\t%s\t%s\t%s\t%s\n" "label" "kv_quant" "decode_tps" "decode_stddev" "s
 # ---------------------------------------------------------------------------
 
 # Build the canonical kv_quant string for a (ctk, ctv, kv_quant_arg) tuple.
-# Mirrors the formula in scripts/bench_cell.sh so smoke/skip rows match warm rows.
+# Mirrors the formula in scripts/bench_cell.sh, so the summary names a cell as
+# its record does.
 compute_kv_canon() {
   local ctk="$1" ctv="$2" kvq="$3"
   if [ -n "$ctk" ] || [ -n "$ctv" ]; then
@@ -211,7 +198,7 @@ run_smoke_probe() {
     return "$rc"
   fi
 
-  # Bug-1: parse TPS from the baseline summary line. If TPS < 0.5 the run
+  # Parse TPS from the baseline summary line. If TPS < 0.5 the run
   # succeeded syntactically but produced no real decode (e.g. Gemma4 Shared-KV
   # rejects Mixed codec, emits TPS=0.000). Treat this as a runtime failure.
   local smoke_tps
@@ -289,7 +276,7 @@ for entry in "${COMBOS[@]}"; do
 
   KV_CANON=$(compute_kv_canon "$CTK_VAL" "$CTV_VAL" "$KV_ARG")
 
-  # Bug-2: compute_kv_canon emits ct_<k>_<v> for non-numeric per-side codecs
+  # compute_kv_canon emits ct_<k>_<v> for non-numeric per-side codecs
   # (tq4, planar4). The metrics validator rejects those strings. Map them to
   # the canonical value the resolver would have chosen if it accepted the combo.
   # This override is applied before any record emission for this cell.
@@ -310,7 +297,7 @@ for entry in "${COMBOS[@]}"; do
       echo "[$(date +%T)] CELL SKIP (resolver) label=$LABEL" >&2
       printf "%s\t%s\t%s\t%s\t%s\n" "$LABEL" "$KV_CANON" "" "" "skip" >>"$SUMMARY_FILE"
     else
-      # Bug-1: tps_zero is a runtime failure (not a smoke content failure).
+      # tps_zero is a runtime failure (not a smoke content failure).
       local _status="smoke_fail"
       case "$SMOKE_REASON" in
         tps_zero=*) _status="runtime_fail" ;;
@@ -358,7 +345,7 @@ for entry in "${COMBOS[@]}"; do
       printf "%s\t%s\t%s\t%s\t%s\n" "$LABEL" "$KV_CANON" "" "" "skip" >>"$SUMMARY_FILE"
       ;;
     10)
-      # Bug-1: exit 10 = TPS below threshold in scripts/bench_cell.sh CT-mode loop.
+      # exit 10 = TPS below threshold in scripts/bench_cell.sh CT-mode loop.
       echo "[$(date +%T)] CELL RUNTIME_FAIL (tps=0) label=$LABEL" >&2
       printf "%s\t%s\t%s\t%s\t%s\n" "$LABEL" "$KV_CANON" "0.0" "" "runtime_fail" >>"$SUMMARY_FILE"
       ;;
