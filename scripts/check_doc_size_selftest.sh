@@ -104,7 +104,7 @@ st_case marker_over_cap_also_named 1 --what "and the marker is named as a failur
     --has "FAIL docs/BIG_MARKED.md  carries a size-exempt marker" -- doc_size_gate "$root"
 
 n=0
-for leader in "- " "> " "* " "## " "1. " "<!-- - "; do
+for leader in "- " "> " "* " "+ " "## " "1. " "12. " "<!-- - "; do
     n=$((n + 1))
     tag="$n"
     root=$(fresh "marker_leader_$tag")
@@ -133,6 +133,22 @@ mkdir -p "$root/scripts"
 printf '# size-exempt: planted by a selftest\n' >"$root/scripts/x_selftest.sh"
 st_case marker_in_script_not_scanned 0 --what "the marker in a selftest script is outside the scanned docs" \
     --has "check-doc-size: ok" -- doc_size_gate "$root"
+
+root=$(fresh undecodable)
+printf '\377\n- size-exempt: after a byte that is not UTF-8\n' >"$root/docs/BYTES.md"
+st_case undecodable_doc_still_scanned 1 --what "a doc with a byte that is not UTF-8 is read, and its marker is named" \
+    --has "FAIL docs/BYTES.md  carries a size-exempt marker" -- doc_size_gate "$root"
+
+# doc_size_gate_fake_git <root>: the gate with a `git` that answers check-ignore with exit 99.
+doc_size_gate_fake_git() {
+    mkdir -p "$ST_WORK/fakegit"
+    printf '#!/bin/sh\nexit 99\n' >"$ST_WORK/fakegit/git"
+    chmod +x "$ST_WORK/fakegit/git"
+    PATH="$ST_WORK/fakegit:$PATH" doc_size_gate "$1"
+}
+root=$(fresh git_cannot_say)
+st_case git_check_ignore_exit_99_unmeasurable 2 --what "any check-ignore exit but 0 and 1 is a question git did not answer: exit 2" \
+    --has "unavailable (git check-ignore exit 99" -- doc_size_gate_fake_git "$root"
 
 root="$(st_git_root no_docs)"
 st_case no_docs_dir_unmeasurable 2 --what "a root with no docs/ cannot be measured: exit 2" \
