@@ -1,5 +1,5 @@
 //! DB-to-DB import: bring the `observations` rows of another metrics DB, and
-//! the prompts they reference, into this one (`docs/METRICS_DB.md` §7.4).
+//! the prompts they reference, into this one (`docs/METRICS_DB.md` §11).
 //!
 //! The source is opened read-only and never migrated. A row is copied as it
 //! stands, except `id`, `prompt_id` (remapped by the prompt's `sha256`) and

@@ -418,14 +418,14 @@ refuse a missing DB, and a DB whose `bests` view is stale, naming
 | `doctor` | `--fix` | Checks schema version, integrity, foreign keys, whitelists, units, directions and the [`METRICS_SCHEMA.md`](METRICS_SCHEMA.md) §4.1 bounds. `--fix` rebuilds a stale `bests` view; it never edits a value. |
 | `backup` | `--out <path>`, `--keep <N>` | WAL-checkpointed copy; `--keep` prunes older backups. |
 | `restore` | `--from <path>` (required) | Replaces the DB from a backup after snapshotting the current one. |
-| `record` | `--inline <json>` \| `--file <path>` \| `--stdin` \| `--replay-pending`; `--dry-run` | Ingests one `METRICS_DB.md` §8.5 record. `--replay-pending` ingests every file in `metrics/buffer/pending/` and moves failures to `failed/`. `--dry-run` writes nothing. |
+| `record` | `--inline <json>` \| `--file <path>` \| `--stdin` \| `--replay-pending`; `--dry-run`, `--run-class <class>` | Ingests one `METRICS_DB.md` §8.5 record. `--replay-pending` ingests every file in `metrics/buffer/pending/` and moves failures to `failed/`. `--dry-run` writes nothing. `--run-class` fills a record that states no class and refuses one that states another. |
 | `validate` | `--file <path>` \| `--stdin` | Runs `RunRecord::validate` and writes nothing; exit 1 on rejection. `record` checks more: it refuses a `sha256` prompt that is not registered. |
 | `identity` | `--json` | Prints `backend`, `backend_version`, `build_profile`, `hardware_tag` for this binary. No `git_sha`; see `METRICS_DB.md` §8.5.1. |
 | `best` | `--backend --namespace --model --weight-quant --kv-quant --metric` (required); `--ctx-max` (`8192`), `--decode-config`, `--prompt-id` \| `--prompt-name` | Champion row for one cell and metric. |
 | `rank` | `--metric` (required), `--backend`, `--limit` (`20`) | Top champions for one metric. |
 | `compare` | `--backends a,b` and `--metric` (required); `--namespace`, `--model`, `--weight-quant`, `--kv-quant` | Champions of several backends side by side. The four filters are accepted and ignored. |
-| `history` | the `best` cell flags; `--metric`, `--since <date>` optional | Every observation of one cell, oldest first. |
-| `timeseries` | the `best` flags; `--since`, `--bucket day\|week` (`day`) | Mean per bucket for one cell and metric. |
+| `history` | the `best` cell flags; `--metric`, `--since <date>` optional | Every observation of one cell, oldest first, each with its `run_class`. |
+| `timeseries` | the `best` flags; `--since`, `--bucket day\|week` (`day`) | Mean per bucket and run class for one cell and metric. |
 | `regress` | `--model <substring>`, `--metric` (required); `--kv`, `--threshold-pct` (`1.0`) | Latest observation against the champion. Exit `0` within tolerance, `1` regressed, `125` nothing to compare. |
 | `path` | `--home` | Prints the DB path this invocation resolves, or with `--home` the data root, and nothing else on stdout. Opens no DB, but like every `rmlx` command it creates the data root and its `metrics/`, starts a run log in `logs/` and may rotate old logs by the size cap. |
 | `deltas` | `--since-sha` (required), `--threshold-pct` (`5.0`), `--exit-code` (`true`), `--prompt-prefix` | Changes per cell and metric since a commit. `--prompt-prefix` keeps the cells whose prompt name starts with it and looks the SHA up among their observations only; a prefix naming no cell is an error (exit 1). A SHA with no observations is an error (exit 1). With `--exit-code true`: `1` when a row regressed past the threshold, `125` when no row has a baseline, `0` otherwise. |
@@ -436,6 +436,7 @@ refuse a missing DB, and a DB whose `bests` view is stale, naming
 | `champions` | `--backend`, `--jsonl` | One row per (namespace, model, weight quant, KV quant) with one column per metric. |
 | `prompts` | `list`; `get --name`; `add --file [--name] [--notes]`; `sync` | Prompt registry. `sync` registers every `*.json` under `prompts/` in `RMLX_REPO_ROOT`, else the working directory. |
 | `migrate` | `--rmlx-glob`, `--cbb-csv`, `--records-md`, `--hardware-tag` (`m5_max_128gb`) | Idempotent import of legacy JSONL, CSV and Markdown. |
+| `import` | `--from <db>` (required), `--run-class <class>` | Copies another metrics DB's observations and their prompts; a second run adds nothing. See `METRICS_DB.md` §11. |
 
 `record` and `validate` refuse a record whose `notes` or `description`
 contains `synthetic=true`. They also refuse an `rmlx` record whose
@@ -454,7 +455,7 @@ MoE). Prints one JSON line:
 
 ```bash
 rmlx eval ppl --model /path/to/snapshot --text-file wiki.txt \
-  --corpus wikitext-2 --ctx-window 4096 --stride 2048
+  --corpus wikitext-2 --run-class gate --ctx-window 4096 --stride 2048
 ```
 
 | Flag | Type | Default | Description |
@@ -463,7 +464,8 @@ rmlx eval ppl --model /path/to/snapshot --text-file wiki.txt \
 | `--text-file` | path | required | UTF-8 corpus. |
 | `--ctx-window` | usize | `4096` | Tokens per window. |
 | `--stride` | usize | `2048` | Stride between windows. |
-| `--corpus` | string | `""` | Corpus name. A non-empty value ingests one `METRICS_DB.md` §8.5 record into `runs.db` |
+| `--corpus` | string | `""` | Corpus name. A non-empty value ingests one `METRICS_DB.md` §8.5 record into `runs.db` and needs `--run-class`. |
+| `--run-class` | `gate \| ab_arm \| diagnostic` | — | Why the run is recorded. Required with a non-empty `--corpus`, refused without one. |
 | `--device` | `cpu \| gpu` | `gpu` | Device. |
 | `--max-tokens` | usize | `0` | Tokens scored; `0` is the whole corpus. |
 | `--git-sha` | string | — | Commit SHA for the record's `git_sha`. |

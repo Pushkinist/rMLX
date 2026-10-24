@@ -19,7 +19,9 @@ Two access patterns:
 - **Champion view** (`bests`): the best value per cell. `rmlx metrics best`,
   `rank` and `export --markdown` read it.
 - **Time series** (`observations`): every value of a cell over time. `rmlx
-  metrics history`, `timeseries`, `regress` and `deltas` read it.
+  metrics history`, `timeseries`, `regress` and `deltas` read it. `regress`
+  and `deltas` read `gate` rows only; `history` and `timeseries` read every
+  class and show it.
 
 Every observation is kept. A value worse than the best is inserted and does
 not surface in `bests`.
@@ -120,7 +122,10 @@ CREATE TABLE observations (
     inserted_utc     TEXT    NOT NULL,
     inserted_by      TEXT    NOT NULL,
     -- cell identity (migration 005)
-    decode_config    TEXT
+    decode_config    TEXT,
+    -- why the run was recorded (migration 009)
+    run_class        TEXT
+        CHECK (run_class IN ('gate', 'ab_arm', 'diagnostic'))
 );
 
 CREATE INDEX obs_cell_idx          ON observations(backend, model_namespace,
@@ -132,9 +137,11 @@ CREATE INDEX obs_run_id_idx        ON observations(run_id);
 CREATE INDEX obs_backend_idx       ON observations(backend);
 CREATE INDEX obs_inserted_idx      ON observations(inserted_utc);
 CREATE INDEX obs_decode_config_idx ON observations(decode_config);
+CREATE INDEX obs_run_class_idx     ON observations(run_class);
 ```
 
-`decode_config` is added by `ALTER TABLE`, so it is the last column.
+`decode_config` and `run_class` are added by `ALTER TABLE`, so they are the
+last columns.
 
 **The cell.** `rmlx_metrics::cell::CELL_COLUMNS` is the cell key: `backend`,
 `model_namespace`, `model`, `weight_quant`, `kv_quant`, `ctx_max`,
@@ -179,6 +186,14 @@ is the surrogate `id`.
 | `description`     | Written by a person or an agent: why the run exists and what changed (`METRICS_DB.md` §6). |
 | `inserted_utc`    | When the row was written. |
 | `inserted_by`     | `<tool>@<semver>`, e.g. `rmlx-cli@<semver>`. |
+| `run_class`       | `gate`, `ab_arm` or `diagnostic` (`METRICS_DB.md` §8.5). Only `gate` rows reach `bests` and the gates. |
+
+**`run_class` is not cell identity.** It is a filter: an `ab_arm` row
+measures the same cell as a `gate` row and is kept out of the ranking, not
+put in a cell of its own. The column has no `DEFAULT`. A row inserted without
+a class holds `NULL`, and `NULL` is not `gate`, so it reaches no gate.
+Migration 009 set every row written before the column to `gate`, so no
+champion moved.
 
 **`decode_config` is cell identity, not context.** It names every engine
 setting that a run moved off its default. A drafter arm and a plain arm of one
@@ -274,7 +289,8 @@ WITH ranked AS (
                 ts_utc DESC
         ) AS rn
     FROM observations o
-    WHERE CASE metric
+    WHERE run_class = 'gate'
+      AND CASE metric
               WHEN 'decode_tps_warm' THEN (value > 0.0 AND value <= 10000.0)
               -- one branch per registry metric (§4.1)
               ELSE 1
@@ -287,8 +303,11 @@ The partition is `cell::partition_columns`. Equal values resolve to the
 newest `ts_utc`. The champion row carries every `observations` column,
 plus `rn`.
 
-The `WHERE` is generated from the §4 registry: `bests_view::plausible_sql`
-renders one branch per metric from the `Bounds` that ingest enforces.
+The `WHERE` is generated. `bests_view::gate_rows_sql` renders the
+`run_class` filter from `RunClass::Gate`; `query::deltas`, `query::regress`
+and `query::champions` `AND` it in, and `gate_predicate_reaches_every_gate_reader`
+checks each of their SQL bodies. `bests_view::plausible_sql` renders one
+branch per metric from the §4 registry's `Bounds`, which ingest enforces.
 `query::deltas`, `query::regress`, `query::timeseries` and
 `query::champions` `AND` in the same predicate.
 
@@ -311,7 +330,7 @@ policy applies to `bests`.
 `direction`; `run_id`, `ts_utc`, `hardware_tag`, `inserted_utc`,
 `inserted_by`.
 
-**Nullable:** `decode_config`; `git_sha`, `build_profile`,
+**Nullable:** `decode_config`, `run_class`; `git_sha`, `build_profile`,
 `backend_version`; the bench-config columns; `output_first_64`,
 `decode_stddev`, `notes`, `description`.
 

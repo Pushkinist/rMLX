@@ -10,7 +10,7 @@ One generation per process, with EOS stop off. Prints one summary line.
 ```bash
 rmlx baseline --model /path/to/snapshot
 rmlx baseline --model /path/to/snapshot --prompt-tokens 4096 --max-tokens 128 \
-  --record
+  --record --run-class gate
 ```
 
 | Flag | Type | Default | Description |
@@ -28,7 +28,8 @@ rmlx baseline --model /path/to/snapshot --prompt-tokens 4096 --max-tokens 128 \
 | `--allow-truncate` | bool flag | off | Truncate an over-cap prompt on the GPU instead of refusing it. |
 | `--kv-boundary-layers` | `HEAD,TAIL` | `2,8` | See [`CLI.md`](CLI.md) § "KV codec flags". |
 | `--label` | string | — | Written to the record's `notes` column. |
-| `--record` | bool flag | off | Writes a [`METRICS_DB.md`](METRICS_DB.md) §8.5 record to the buffer and ingests it into `runs.db`. |
+| `--record` | bool flag | off | Writes a [`METRICS_DB.md`](METRICS_DB.md) §8.5 record to the buffer and ingests it into `runs.db`. Needs `--run-class`. |
+| `--run-class` | `gate \| ab_arm \| diagnostic` | — | Why the run is recorded. Required with `--record`, refused without it. Only `gate` rows reach `bests` and the gates ([`METRICS_DB.md`](METRICS_DB.md) §8.5). |
 | `--git-sha` | string | — | Commit SHA for the record's `git_sha`; the binary never derives one. |
 | `--emit-token-ids` | bool flag | off | Adds a `baseline: token_ids=<ids>` line, so an A/B harness can compare token streams. |
 
