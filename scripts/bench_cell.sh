@@ -259,7 +259,7 @@ if [ "$_CT_MODE" -eq 1 ]; then
       }')
   fi
 
-  # --- weight_quant: the label the caller passed as QUANT_SIG ($7) ---------
+  # --- weight_quant: the weight label the caller passed ($7) ---------------
   _WQ_EFF="$WEIGHT_QUANT"
 
   # --- Resolve canonical kv_quant string ------------------------------------
