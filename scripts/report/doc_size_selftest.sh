@@ -174,9 +174,7 @@ st_case missing_root_unmeasurable 2 --what "a root that does not exist is exit 2
 # under a fixture tree's scripts/report/.
 root=$(fresh default_root)
 mkdir -p "$root/scripts/report"
-for f in debt_report.py kv_census.py rust_scan.py scripts_gate.py; do
-    cp "$REPO_ROOT/scripts/report/$f" "$root/scripts/report/$f"
-done
+cp "$REPO_ROOT"/scripts/report/*.py "$root/scripts/report/"
 st_case default_root_is_the_tools_tree 0 --what "with no --root the gate measures the tree the tool sits in" \
     --has "check-doc-size: ok (1 docs measured" -- bounded python3 "$root/scripts/report/debt_report.py" --check-doc-size
 

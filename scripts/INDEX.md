@@ -199,5 +199,9 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `report/kv_census_selftest.sh` | make ci, make kv-update-census-selftest | Recall test for debt_report.py --kv-census: synthetic trees, asserting exit code and figure. |
 | `report/rust_scan.py` | report/debt_report.py, report/kv_census.py | Rust source reader for the report tools: enums, `match` arms and `fn` bodies. |
 | `report/scripts_gate.py` | report/debt_report.py | The rules for scripts/ and the generated scripts/INDEX.md. |
+| `report/scripts_gate_callers.py` | report/scripts_gate.py, report/scripts_gate_rules.py | The derived caller of each file and the INDEX.md built from it. |
+| `report/scripts_gate_files.py` | report/scripts_gate.py, report/scripts_gate_callers.py, report/scripts_gate_rules.py | The population of scripts/ and the header each file carries. |
 | `report/scripts_gate_pins.txt` | report/scripts_gate.py, report/scripts_gate_selftest.sh | Accepted violations of the scripts/ rules, one `<rule> <path>` per line; a pin only shrinks. |
+| `report/scripts_gate_rules.py` | report/scripts_gate.py | The per-file rules of the scripts gate and their registry. |
 | `report/scripts_gate_selftest.sh` | make check-scripts-selftest, make ci | Recall test for debt_report.py --scripts: planted trees, asserting exit code and rule:file:line. |
+| `report/scripts_gate_text.py` | report/scripts_gate_callers.py, report/scripts_gate_rules.py | Readers of script text: shell, Python and Makefile source. |

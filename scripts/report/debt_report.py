@@ -20,7 +20,8 @@ LOC-exempt: the report and its modes share one fn scan and one entry
 The default mode is the report. ``--matched-lines``, ``--check-doc-size``,
 ``--file-sizes``, ``--kv-census`` and ``--scripts`` are the other modes, one
 per run. ``--kv-census`` runs ``kv_census.py`` and ``--scripts`` runs
-``scripts_gate.py``, modules of this tool.
+``scripts_gate.py`` (with the ``scripts_gate_*.py`` modules it imports), modules
+of this tool.
 
 Report: four sections, in order: sibling-file/fn similarity ("twins"), debt
 counters (`#[allow(` sites, debt-marker comments, `check-*` Make targets and

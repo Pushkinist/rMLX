@@ -1192,9 +1192,7 @@ check "a root that is not a directory is a refusal" "${WORK}/none" 2 "unavailabl
 T="${WORK}/default_root"
 build_tree "${T}"
 mkdir -p "${T}/scripts/report"
-for f in debt_report.py kv_census.py rust_scan.py scripts_gate.py; do
-    cp "${REPO_ROOT}/scripts/report/${f}" "${T}/scripts/report/${f}"
-done
+cp "${REPO_ROOT}"/scripts/report/*.py "${T}/scripts/report/"
 default_out="$(cd "${WORK}" && python3 "${T}/scripts/report/debt_report.py" --kv-census match-sites --threshold 2 2>&1)"
 default_rc=$?
 if [ "${default_rc}" -eq 0 ] && grep -qE -- "^match-sites 3$" <<<"${default_out}"; then

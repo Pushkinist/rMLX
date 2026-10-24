@@ -1560,9 +1560,7 @@ check "file_sizes_default_total" \
 DEF_TREE="$MODES_WORK/default_root"
 cp -R "$MODES_BASE" "$DEF_TREE"
 mkdir -p "$DEF_TREE/scripts/report"
-for f in debt_report.py kv_census.py rust_scan.py scripts_gate.py; do
-    cp "$REPO_ROOT/scripts/report/$f" "$DEF_TREE/scripts/report/$f"
-done
+cp "$REPO_ROOT"/scripts/report/*.py "$DEF_TREE/scripts/report/"
 DEF_REAL="$(cd "$DEF_TREE" && pwd -P)"
 
 DEF_REPORT=$(cd "$MODES_WORK" && python3 "$DEF_TREE/scripts/report/debt_report.py" --since HEAD 2>&1)
