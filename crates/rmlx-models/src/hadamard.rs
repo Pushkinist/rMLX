@@ -117,7 +117,7 @@ impl SignedBlockHadamard {
     fn apply(&self, direction: Direction, x: &Array, device: Device) -> Result<Array> {
         match device {
             Device::Gpu => {
-                self.input_shape(x)?;
+                self.check_width(x)?;
                 signed_block_hadamard_gpu(
                     x,
                     &self.signs,
@@ -143,7 +143,8 @@ impl SignedBlockHadamard {
         x: &Array,
         device: Device,
     ) -> Result<Array> {
-        let shape = self.input_shape(x)?;
+        self.check_width(x)?;
+        let shape = x.shape();
         // Explicit on purpose: the f32 signs would promote `x` anyway.
         let wide = x.astype(Dtype::F32, device)?;
         let transformed = match direction {
@@ -157,16 +158,20 @@ impl SignedBlockHadamard {
         transformed.astype(x.dtype(), device)
     }
 
-    fn input_shape(&self, x: &Array) -> Result<Vec<i32>> {
-        let shape = x.shape();
-        let last = shape.last().copied().unwrap_or(0);
+    /// Refuse an `x` whose last axis is not the sign width; a 0-D `x` has
+    /// width 0.
+    fn check_width(&self, x: &Array) -> Result<()> {
+        let last = match x.ndim().checked_sub(1) {
+            Some(axis) => x.dim(axis)?,
+            None => 0,
+        };
         if usize::try_from(last).ok() != Some(self.width) {
             return Err(Error::Model(format!(
                 "Hadamard input width {last} is not the sign width {}",
                 self.width
             )));
         }
-        Ok(shape)
+        Ok(())
     }
 
     /// The normalised transform of every `block` run of the last axis.

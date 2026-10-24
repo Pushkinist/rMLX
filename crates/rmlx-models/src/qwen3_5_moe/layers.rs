@@ -314,7 +314,7 @@ impl<'a> SharedInput<'a> {
         let transform: &'a SignedBlockHadamard = transform;
         match &self.transformed {
             Some((cached, xt)) if std::ptr::eq(*cached, transform) => inner.forward(xt, device),
-            Some(_) => inner.forward(&transform.forward(self.x, device)?, device),
+            Some(_) => linear.forward(self.x, device),
             None => {
                 let xt = transform.forward(self.x, device)?;
                 let y = inner.forward(&xt, device)?;
