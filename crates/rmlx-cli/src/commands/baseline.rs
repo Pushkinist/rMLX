@@ -1134,8 +1134,9 @@ fn build_run_record(
 /// the DB at `db_path`, so the row is visible to `bests` right away.
 ///
 /// On success the buffer file is dropped. On failure it is kept for
-/// `rmlx metrics record --replay-pending` and the error names it: a run asked
-/// to record whose record did not land has not done what it was asked.
+/// `rmlx metrics record --replay-pending`, the failure is printed naming it,
+/// and the run exits [`crate::exit::RECORD_PENDING`]: it measured, and did not
+/// record what it was asked to.
 pub(crate) fn ingest_buffer_record(
     record: serde_json::Value,
     buffer: &Path,
@@ -1159,12 +1160,28 @@ pub(crate) fn ingest_buffer_record(
             let _ = std::fs::remove_file(buffer);
             Ok(())
         }
-        Err(e) => Err(e.context(format!(
-            "{what}: the record did not reach {}; it is kept at {} for \
-             `rmlx metrics record --replay-pending`",
-            db_path.display(),
-            buffer.display()
-        ))),
+        Err(e) => {
+            let message = format!(
+                "{what}: measured, but the record did not reach {}: {e:#}; it is kept at {} for \
+                 `rmlx metrics record --replay-pending`",
+                db_path.display(),
+                buffer.display()
+            );
+            #[allow(
+                clippy::print_stderr,
+                reason = "operator-facing: the exit code alone does not say which file to replay"
+            )]
+            {
+                eprintln!(
+                    "error: {message}\nrMLX exits with code {}.",
+                    crate::exit::RECORD_PENDING
+                );
+            }
+            Err(
+                anyhow::Error::new(crate::exit::ExitWith(crate::exit::RECORD_PENDING))
+                    .context(message),
+            )
+        }
     }
 }
 

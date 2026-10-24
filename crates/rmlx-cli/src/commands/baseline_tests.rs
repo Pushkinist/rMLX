@@ -759,9 +759,19 @@ fn a_record_the_recorder_refuses_is_an_error_naming_its_buffer_file() {
         .expect_err("a 0.0 rate is refused, so the run did not record");
     let msg = format!("{err:#}");
     assert!(msg.contains(&buffer.display().to_string()), "{msg}");
+    assert_eq!(
+        err.downcast_ref::<crate::exit::ExitWith>().map(|e| e.0),
+        Some(crate::exit::RECORD_PENDING),
+        "a measured run whose record did not land exits with its own code, not a crash's"
+    );
     assert!(
         buffer.exists(),
         "the buffer file was dropped with nothing recorded"
+    );
+    assert_eq!(
+        crate::exit::exit_code(Err(err)).ok(),
+        Some(crate::exit::RECORD_PENDING),
+        "main reads the code through the context the message adds"
     );
 }
 
@@ -774,5 +784,10 @@ fn a_db_that_cannot_be_opened_is_an_error_naming_the_buffer_file() {
     let err = ingest_buffer_record(record, &buffer, &not_a_dir.join("runs.db"), "baseline")
         .expect_err("a DB under a regular file cannot be opened");
     assert!(format!("{err:#}").contains(&buffer.display().to_string()));
+    assert_eq!(
+        err.downcast_ref::<crate::exit::ExitWith>().map(|e| e.0),
+        Some(crate::exit::RECORD_PENDING),
+        "a measured run whose record did not land exits with its own code, not a crash's"
+    );
     assert!(buffer.exists());
 }

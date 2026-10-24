@@ -464,7 +464,7 @@ rmlx eval ppl --model /path/to/snapshot --text-file wiki.txt \
 | `--text-file` | path | required | UTF-8 corpus. |
 | `--ctx-window` | usize | `4096` | Tokens per window. |
 | `--stride` | usize | `2048` | Stride between windows. |
-| `--corpus` | string | `""` | Corpus name. A non-empty value ingests one `METRICS_DB.md` §8.5 record into `runs.db` and needs `--run-class`. |
+| `--corpus` | string | `""` | Corpus name. A non-empty value ingests one `METRICS_DB.md` §8.5 record into `runs.db` and needs `--run-class`. A record that does not land exits **75** after the JSON line, naming the buffer file left for `rmlx metrics record --replay-pending` (`METRICS_DB.md` §13, rule 24). |
 | `--run-class` | `gate \| ab_arm \| diagnostic` | — | Why the run is recorded. Required with a non-empty `--corpus`, refused without one. |
 | `--device` | `cpu \| gpu` | `gpu` | Device. |
 | `--max-tokens` | usize | `0` | Tokens scored; `0` is the whole corpus. |

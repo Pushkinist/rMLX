@@ -776,6 +776,13 @@ change to what `bests` publishes, such as a `METRICS_SCHEMA.md` §4.1 bounds cha
     at start to record its events. `claim`, `profile`, `kv-calibrate` and
     `eval spec-answer` do not open it. A scratch
     `RMLX_HOME`, or `--db` for `rmlx metrics`, points it at another DB.
+24. **Exit 75 means measured, record pending.** `rmlx baseline --record` and
+    `rmlx eval ppl --corpus` exit 75 when the run measured and its record did
+    not land; the buffer file it names stays for `rmlx metrics record
+    --replay-pending`. A caller that records `gate` fails on 75: the gate has
+    no row to read. A caller that records `ab_arm` or `diagnostic` keeps the
+    measurement, prints the buffer file and the replay command, goes on, and
+    ends non-zero, with its own INCOMPLETE code where it has one.
     `make canary-gate` under `git bisect` builds the old commit's binary with
     that commit's own `Makefile`. When bisecting across migration 9, run
     `metrics deltas --since-sha <SHA> --threshold-pct 3 --exit-code true`
