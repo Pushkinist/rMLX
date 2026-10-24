@@ -43,7 +43,10 @@ interleaved A/B run supports a direction between two builds.
 - `runs.db`: one further run per model with `rmlx baseline --record
   --run-class gate`, and the warmup, measured and `k8vturbo3` runs as
   `diagnostic`. A snapshot whose identity cannot be recorded stops the canary
-  before its first run, and a failed gate record stops it too.
+  before its first run, and a gate record that does not land stops it too
+  (exit 1). A diagnostic record that does not land keeps its reading and its
+  CSV row, names its buffer file, and ends the canary 75 after the last
+  model (`docs/METRICS_DB.md` §13, rule 24).
 - A `k8vturbo3` arm follows each model: 1 warmup, 3 measured, one CSV row.
 
 **Gating.** Two gates read what the canary wrote:
@@ -200,7 +203,9 @@ gate (`docs/METRICS_DB.md` §13). Find one run's rows with
 through `baseline --help`, whether it has `--run-class`: an arm built before
 the run class runs `--metrics off` and records nothing, and the report says so
 per arm. A `--synthetic-arms` run passes `--metrics off` to every slot and
-records nothing. Promoting the surviving
+records nothing. A slot whose record does not land keeps its reading and the
+verdict, names its buffer file, and ends the run 75 when nothing else failed.
+Promoting the surviving
 arm is a separate step: `scripts/ingest/perf_ab_ingest.py --keep-arm A|B`
 turns one result file into one `gate` RunRecord (`docs/METRICS_DB.md` §8.5;
 `decode_tps_warm`, `kv_cache_bytes`) for that arm, whose slots are already
