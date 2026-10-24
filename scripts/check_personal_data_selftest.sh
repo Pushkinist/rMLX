@@ -12,99 +12,79 @@ export LC_ALL=C
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GATE="$HERE/check_personal_data.sh"
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/personal-data-selftest.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
+# shellcheck source=scripts/lib/selftest_support.sh
+. "$HERE/lib/selftest_support.sh"
+st_init check-personal-data-selftest
 
 AT='@'
-pass=0
-fail=0
 
 new_tree() {
-    local d="$WORK/$1"
-    mkdir -p "$d"
-    git -C "$d" init -q
+    local d
+    d="$(st_git_root "$1")"
     printf 'clean line\n' >"$d/README.md"
     printf '%s\n' "$d"
 }
 
-# expect <name> <tree> <exit> <needle>
-expect() {
-    local name="$1" tree="$2" want="$3" needle="$4" out rc
-    out="$(bash "$GATE" "$tree" 2>&1)"
-    rc=$?
-    if [ "$rc" -eq "$want" ] && grep -qF -- "$needle" <<<"$out"; then
-        pass=$((pass + 1))
-        echo "  PASS  $name"
-    else
-        fail=$((fail + 1))
-        echo "  FAIL  $name (exit $rc, wanted $want; looking for: $needle)"
-        sed 's/^/        /' <<<"$out"
-    fi
-}
-
 t="$(new_tree clean)"
-expect "a clean tree passes" "$t" 0 "check-personal-data: ok"
+st_case "a clean tree passes" 0 --has "check-personal-data: ok" -- bash "$GATE" "$t"
 
 t="$(new_tree email)"
 printf 'line one\nmail jane.doe%sgmail.com here\n' "$AT" >"$t/notes.txt"
-expect "a personal address fails" "$t" 1 "email: notes.txt:2:"
+st_case "a personal address fails" 1 --has "email: notes.txt:2:" -- bash "$GATE" "$t"
 
 t="$(new_tree email-upper)"
 printf 'Contact: Jane%sMail.Example.Ru\n' "$AT" >"$t/a.json"
-expect "an address in any case fails" "$t" 1 "email: a.json:1:"
+st_case "an address in any case fails" 1 --has "email: a.json:1:" -- bash "$GATE" "$t"
 
 t="$(new_tree placeholder)"
 printf 'a %sexample.invalid b %susers.noreply.github.com c %sexample.com\n' \
     "x$AT" "1+me$AT" "y$AT" >"$t/ok.txt"
-expect "placeholder and noreply domains pass" "$t" 0 "check-personal-data: ok"
+st_case "placeholder and noreply domains pass" 0 --has "check-personal-data: ok" -- bash "$GATE" "$t"
 
 t="$(new_tree mixed)"
 printf 'x%sexample.invalid then y%scorp.io\n' "$AT" "$AT" >"$t/m.txt"
-expect "a real address after a placeholder on one line fails" "$t" 1 "email: m.txt:1:"
+st_case "a real address after a placeholder on one line fails" 1 --has "email: m.txt:1:" -- bash "$GATE" "$t"
 
 t="$(new_tree users)"
 printf 'path /%s/alice/src\n' "Users" >"$t/s.sh"
-expect "a macOS home path fails" "$t" 1 "home-path: s.sh:1:"
+st_case "a macOS home path fails" 1 --has "home-path: s.sh:1:" -- bash "$GATE" "$t"
 
 t="$(new_tree users-placeholder)"
 printf 'path /%s/<you>/src\n' "Users" >"$t/s.md"
-expect "an angle-bracket placeholder home path passes" "$t" 0 "check-personal-data: ok"
+st_case "an angle-bracket placeholder home path passes" 0 --has "check-personal-data: ok" -- bash "$GATE" "$t"
 
 t="$(new_tree varfolders)"
 printf 'tmp /private/var/%s/ab/T/x\n' "folders" >"$t/v.txt"
-expect "a per-user temp path fails" "$t" 1 "home-path: v.txt:1:"
+st_case "a per-user temp path fails" 1 --has "home-path: v.txt:1:" -- bash "$GATE" "$t"
 
 t="$(new_tree linux-home)"
 printf 'db /home/user/.rmlx/metrics/runs.db\n' >"$t/l.md"
-expect "a Linux placeholder home path passes" "$t" 0 "check-personal-data: ok"
+st_case "a Linux placeholder home path passes" 0 --has "check-personal-data: ok" -- bash "$GATE" "$t"
 
 t="$(new_tree session)"
 printf 'see https://claude.ai/code/%s_01ABC\n' "session" >"$t/pr.md"
-expect "an assistant session link fails" "$t" 1 "session-link: pr.md:1:"
+st_case "an assistant session link fails" 1 --has "session-link: pr.md:1:" -- bash "$GATE" "$t"
 
 t="$(new_tree ignored)"
 printf '*.local\n' >"$t/.gitignore"
 printf 'jane%sgmail.com\n' "$AT" >"$t/notes.local"
-expect "a git-ignored file is out of scope" "$t" 0 "check-personal-data: ok"
+st_case "a git-ignored file is out of scope" 0 --has "check-personal-data: ok" -- bash "$GATE" "$t"
 
 t="$(new_tree untracked)"
 printf 'jane%sgmail.com\n' "$AT" >"$t/new.txt"
-expect "an untracked, not-ignored file is in scope" "$t" 1 "email: new.txt:1:"
+st_case "an untracked, not-ignored file is in scope" 1 --has "email: new.txt:1:" -- bash "$GATE" "$t"
 
 t="$(new_tree binary)"
 printf 'jane%sgmail.com\000\001' "$AT" >"$t/blob.bin"
-expect "a binary file is skipped" "$t" 0 "check-personal-data: ok"
+st_case "a binary file is skipped" 0 --has "check-personal-data: ok" -- bash "$GATE" "$t"
 
-mkdir -p "$WORK/nogit"
-printf 'x\n' >"$WORK/nogit/a.txt"
-expect "a root outside a git work tree cannot be scanned" "$WORK/nogit" 2 "git ls-files exit"
+mkdir -p "$ST_WORK/nogit"
+printf 'x\n' >"$ST_WORK/nogit/a.txt"
+st_case "a root outside a git work tree cannot be scanned" 2 --has "git ls-files exit" -- bash "$GATE" "$ST_WORK/nogit"
 
-expect "a missing root cannot be scanned" "$WORK/does-not-exist" 2 "is not a directory"
+st_case "a missing root cannot be scanned" 2 --has "is not a directory" -- bash "$GATE" "$ST_WORK/does-not-exist"
 
-t="$WORK/empty"
-mkdir -p "$t"
-git -C "$t" init -q
-expect "an empty scope cannot be scanned" "$t" 2 "no in-scope file"
+t="$(st_git_root empty)"
+st_case "an empty scope cannot be scanned" 2 --has "no in-scope file" -- bash "$GATE" "$t"
 
-echo "check_personal_data selftest: $pass passed, $fail failed"
-[ "$fail" -eq 0 ]
+st_done
