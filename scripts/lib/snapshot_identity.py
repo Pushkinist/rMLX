@@ -66,11 +66,12 @@ def weight_quant(config):
 
     quant = config.get("quantization")
     if isinstance(quant, dict):
-        # `mode` names the format for mxfp/nvfp checkpoints; for affine ones it
-        # names the *scheme* ("affine"), which is not a format, and the bit
-        # width is what distinguishes them.
+        # `mode` names the format for mxfp/nvfp checkpoints and passes through
+        # verbatim; for affine ones it names the *scheme* ("affine", or absent),
+        # and the bit width is what distinguishes them. The whitelist is the
+        # caller's check, not this function's.
         mode = quant.get("mode")
-        if isinstance(mode, str) and mode in WEIGHT_QUANT_WHITELIST:
+        if isinstance(mode, str) and mode and mode != "affine":
             return mode
         bits = quant.get("bits")
         if isinstance(bits, int):

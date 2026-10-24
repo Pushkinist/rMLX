@@ -140,19 +140,22 @@ impl ModelConfig {
     /// The `docs/METRICS_DB.md` §5.2 weight label this config describes, or
     /// `None` when it names no weight format.
     ///
-    /// ParoQuant first, then the MLX `quantization` block (its format mode,
-    /// else its bit width), then an unquantized `dtype` / `torch_dtype`. Kept
-    /// in step with `weight_quant` in `scripts/lib/snapshot_identity.py` by
-    /// one shared table, `tests/fixtures/weight_quant_labels.json`: the two
-    /// disagreeing would split one model across two cells.
+    /// ParoQuant first, then the MLX `quantization` block — its `mode`
+    /// verbatim, or `<bits>bit` when the mode is absent or `affine` — then an
+    /// unquantized `dtype` / `torch_dtype`. No list of modes lives here: the
+    /// recorder's §5.2 whitelist is the one check, and it refuses a mode it
+    /// does not name. Kept in step with `weight_quant` in
+    /// `scripts/lib/snapshot_identity.py` by one shared table,
+    /// `tests/fixtures/weight_quant_labels.json`: the two disagreeing would
+    /// split one model across two cells.
     pub fn weight_quant_label(&self) -> Option<String> {
         if self.is_paroquant() {
             return Some("paro".to_owned());
         }
         if let Some(quant) = &self.quantization {
             return Some(match quant.mode_or_default() {
-                mode @ ("mxfp8" | "mxfp4" | "nvfp4") => mode.to_owned(),
-                _ => format!("{}bit", quant.bits),
+                "" | "affine" => format!("{}bit", quant.bits),
+                mode => mode.to_owned(),
             });
         }
         let dtype = self
