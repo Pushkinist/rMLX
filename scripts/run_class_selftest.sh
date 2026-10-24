@@ -8,7 +8,8 @@
 #   - gpu_capture.sh and mst_capture.sh run `baseline --record --run-class
 #     diagnostic`.
 #   - bench/codec_inertness_probe.sh records each run as diagnostic and marks a
-#     row `recorded_run_class` only when the run says it ingested its record.
+#     row `recorded_run_class` only when `baseline --record` exited 0, which it
+#     does only once its record landed.
 #   - ingest/codec_inertness_ingest.py skips a row the probe already recorded,
 #     and refuses a recorder built before the run class before writing anything.
 #   - ingest/llama_bench_ingest.py refuses that recorder before writing anything,
@@ -44,8 +45,9 @@ mkdir -p "$MODEL"
 
 # make_rmlx <path> — a stub `rmlx` that logs each `baseline` argv to
 # $ARGV_LOG, answers `claim run -- <cmd>` by running the command, prints the
-# summary line a baseline prints, and says it ingested its record unless the
-# argv names the codec in $STUB_NO_INGEST.
+# summary line a baseline prints, and, like the real binary, exits non-zero
+# after it when the argv names the codec in $STUB_NO_INGEST, whose record did
+# not land.
 make_rmlx() {
 	cat >"$1" <<'STUB'
 #!/usr/bin/env bash
@@ -57,10 +59,7 @@ baseline)
 	printf '%s\n' "$*" >>"$ARGV_LOG"
 	echo "baseline: model=stub  ttft_ms=1  decode_tps=10.0  prefill_tps=1.0  prompt_tokens=4200  kv_cache_bytes=1000"
 	echo "baseline: token_ids=1,2,3"
-	case " $* " in
-	*" --kv-quant ${STUB_NO_INGEST:-none-matches} "*) ;;
-	*) echo "INFO rmlx_cli::commands::baseline: baseline: ingested record into runs.db" >&2 ;;
-	esac
+	case " $* " in *" --kv-quant ${STUB_NO_INGEST:-none-matches} "*) exit 1 ;; esac
 	prev=""
 	for a in "$@"; do
 		[ "$prev" = --gpu-capture ] && mkdir -p "$a"
@@ -157,9 +156,17 @@ print(rows.get("none"), rows.get("k8v8"))' "$CSV" 2>&1)"
 verdict probe_marks_only_ingested_runs "each run records as diagnostic; only an ingested one is marked" "$bad"
 
 # ── codec_inertness_ingest.py ─────────────────────────────────────────────────
+#
+# One row the probe recorded and one it did not, both completed runs.
 INGEST="$REPO_ROOT/scripts/ingest/codec_inertness_ingest.py"
+MIXED="$WORK/inertness_mixed.csv"
+{
+	head -1 "$CSV"
+	printf '2026-10-01T00:00:00Z,host__m,4096,4200,8192,100,none,0,1000,abc,0,1,10,1,sha,"",diagnostic\n'
+	printf '2026-10-01T00:00:00Z,host__m,4096,4200,8192,100,k8v8,0,1000,abc,0,1,10,1,sha,"",\n'
+} >"$MIXED"
 set +e
-out="$(RMLX_HOME="$WORK/home" python3 "$INGEST" --dry-run "$CSV" \
+out="$(RMLX_HOME="$WORK/home" python3 "$INGEST" --dry-run "$MIXED" \
 	--backend-version 9.9.9 --build-profile release-perf 2>&1)"
 status=$?
 set -e
@@ -175,7 +182,7 @@ OLD_RECORDER="$WORK/rmlx_old"
 printf '#!/usr/bin/env bash\necho "      --file <FILE>"\n' >"$OLD_RECORDER"
 chmod +x "$OLD_RECORDER"
 set +e
-out="$(RMLX_HOME="$WORK/home" python3 "$INGEST" --record "$CSV" --rmlx-bin "$OLD_RECORDER" \
+out="$(RMLX_HOME="$WORK/home" python3 "$INGEST" --record "$MIXED" --rmlx-bin "$OLD_RECORDER" \
 	--backend-version 9.9.9 --build-profile release-perf 2>&1)"
 status=$?
 set -e

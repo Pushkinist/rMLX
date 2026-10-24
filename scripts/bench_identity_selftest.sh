@@ -228,7 +228,6 @@ claim) exit 0 ;;
 metrics) echo '{$BASE_IDENTITY}' ;;
 baseline)
 	printf '%s\n' "\$*" >>"\$RMLX_HOME/baseline_argv"
-	case " \$* " in *" --run-class gate "*) [ -z "\${STUB_FAIL_GATE:-}" ] || exit 1 ;; esac
 	if [ -n "\${STUB_SHARED_LOG:-}" ]; then
 		log="\$RMLX_HOME/logs/\$STUB_SHARED_LOG"
 	else
@@ -237,6 +236,10 @@ baseline)
 	printf '%s\n' "{\"timestamp\":\"2026-09-03T00:00:00Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"rmlx start\",\"version\":\"9.9.9\",\"run_id\":\"stub\",\"pid\":\$\$}}" >>"\$log"
 	printf '%s\n' "{\"timestamp\":\"2026-09-03T00:00:00Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"cache-type resolved\",\"arch\":\"Stub\",\"kv_quant\":\"stubq\"}}" >>"\$log"
 	echo "decode_tps=12.5"
+	# Like the real binary: the measurement prints, then a record that did not
+	# land fails the run.
+	case " \$* " in *" --run-class gate "*) [ -z "\${STUB_FAIL_GATE:-}" ] || exit 1 ;; esac
+	case " \$* " in *" measured "*) [ -z "\${STUB_FAIL_MEASURED:-}" ] || exit 1 ;; esac
 	;;
 esac
 STUBEOF
@@ -253,6 +256,7 @@ canary_case() {
 	local env_extra=()
 	[ -z "$identity" ] || env_extra+=("RMLX_IDENTITY_JSON=$identity")
 	[ -z "${STUB_FAIL_GATE:-}" ] || env_extra+=("STUB_FAIL_GATE=1")
+	[ -z "${STUB_FAIL_MEASURED:-}" ] || env_extra+=("STUB_FAIL_MEASURED=1")
 	if [ -n "$shared" ]; then
 		printf '%s\n' '{"timestamp":"2026-09-03T00:00:00Z","level":"INFO","fields":{"message":"rmlx start","version":"9.9.9","run_id":"stub","pid":4242}}' \
 			'{"timestamp":"2026-09-03T00:00:00Z","level":"INFO","fields":{"message":"cache-type resolved","arch":"Stub","kv_quant":"none"}}' \
@@ -306,6 +310,15 @@ bad=""
 [ "$CANARY_STATUS" -eq 1 ] || bad="exit=$CANARY_STATUS (want 1)"
 /usr/bin/grep -q 'the gate record failed' "$CANARY_HOME/out.log" || bad="$bad; no error naming the gate record"
 verdict canary_gate_record_fails "a gate record that fails stops the canary" "${bad#; }"
+
+STUB_FAIL_MEASURED=1 canary_case canary_diagnostic_record_fails "" ""
+bad=""
+[ "$CANARY_STATUS" -eq 1 ] || bad="exit=$CANARY_STATUS (want 1)"
+/usr/bin/grep -q 'measured run failed, or its record did not land' "$CANARY_HOME/out.log" ||
+	bad="$bad; no error naming the run whose record did not land"
+[ ! -f "$CANARY_HOME/bench/perf_canary.csv" ] || [ "$(wc -l <"$CANARY_HOME/bench/perf_canary.csv" | tr -d ' ')" = 1 ] ||
+	bad="$bad; a CSV row was written for a run that did not record"
+verdict canary_diagnostic_record_fails "a measured run whose record does not land stops the canary, saying so" "${bad#; }"
 
 printf '{}\n' >"$CANARY_MODEL/config.json"
 canary_case canary_unrecordable_identity "" ""

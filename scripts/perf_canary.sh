@@ -16,8 +16,9 @@
 #
 # Every one of those records must land, so a snapshot whose identity cannot be
 # recorded (`lib/snapshot_identity.py`, which labels a snapshot as `rmlx
-# baseline --record` does) stops the canary before its first run, and a failed
-# gate record stops it too.
+# baseline --record` does) stops the canary before its first run, and a run
+# whose record did not land (`baseline --record` then exits non-zero) stops it
+# too.
 #
 # The default mode measures ONE build. All of its measured runs for a model
 # happen together, which is fine for tracking one build over time but not for
@@ -115,13 +116,16 @@ if [[ "${GIT_SHA}" != unknown* ]]; then
     git_sha_args=(--git-sha "${GIT_SHA}")
 fi
 
-# Helper: run one baseline, recorded as diagnostic, and parse decode_tps from stdout
+# Helper: run one baseline, recorded as diagnostic, and parse decode_tps from stdout.
+# `baseline --record` exits non-zero when its record did not land, and that
+# stops the canary.
 # Usage: run_once <phase> <model_path> [--kv-quant <tag>]
 run_once() {
     local phase="$1"
     local model_path="$2"
     local extra_args=("${@:3}")
-    RMLX_HOME="${RMLX_HOME}" "${BINARY}" baseline \
+    local out
+    if ! out="$(RMLX_HOME="${RMLX_HOME}" "${BINARY}" baseline \
         --model "${model_path}" \
         --prompt-tokens "${PROMPT_TOKENS}" \
         --max-tokens "${MAX_TOKENS}" \
@@ -130,9 +134,11 @@ run_once() {
         ${git_sha_args[@]+"${git_sha_args[@]}"} \
         --record --run-class diagnostic \
         ${extra_args[@]+"${extra_args[@]}"} \
-        2>/dev/null \
-        | grep -o 'decode_tps=[0-9.]*' \
-        | cut -d= -f2
+        2>/dev/null)"; then
+        echo "ERROR: ${model_path##*/}: the ${phase} run failed, or its record did not land (see ${LOG_DIR})" >&2
+        exit 1
+    fi
+    printf '%s\n' "${out}" | grep -o 'decode_tps=[0-9.]*' | cut -d= -f2
 }
 
 # Which KV codec a one-token run resolves, read out of that run's own log.

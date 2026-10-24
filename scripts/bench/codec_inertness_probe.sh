@@ -219,10 +219,9 @@ for codec in "${CODECS[@]}"; do
 		--record --run-class diagnostic --label "codec_inertness:${PROBE_TS}:${codec}" \
 		--log debug >"$raw" 2>&1
 	rc=$?
-	# `baseline` exits 0 when its inline ingest fails too, so the run counts as
-	# recorded only when it says it ingested the record.
+	# `baseline --record` exits 0 only when its record landed in runs.db.
 	recorded=""
-	if grep -q 'baseline: ingested record into runs.db' "$raw"; then
+	if [[ "$rc" -eq 0 ]]; then
 		recorded=diagnostic
 	fi
 
