@@ -846,12 +846,13 @@ metrics-champions-rmlx: ## Print champion table (rMLX only, markdown)
 	cargo run --release --bin rmlx -- metrics champions --backend rmlx
 
 ci-metrics:      ## Verify metrics DB sanity via doctor (no-op if DB absent)
-	@RMLX_HOME="$${RMLX_HOME:-$$PWD/.rmlx}"; \
-	if [ ! -f "$$RMLX_HOME/metrics/runs.db" ]; then \
-		echo "$$RMLX_HOME/metrics/runs.db absent — skipping ci-metrics (run 'make metrics-init' once)"; \
+	@db="$$(cargo run -q --release --bin rmlx -- metrics path)" || exit $$?; \
+	if [ ! -f "$$db" ]; then \
+		echo "$$db absent — skipping ci-metrics (run 'make metrics-init' once)"; \
 		exit 0; \
-	fi
-	cargo run --release --bin rmlx -- metrics doctor
+	fi; \
+	echo "ci-metrics: $$db"; \
+	cargo run --release --bin rmlx -- metrics --db "$$db" doctor
 
 # ---- profiling (on-demand; NOT part of make ci) ---------------------------
 # See docs/PROFILING.md for full runbook.

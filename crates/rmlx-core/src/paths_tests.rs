@@ -7,13 +7,25 @@ fn env_home_must_be_absolute() {
     let prev = std::env::var_os(ENV_HOME);
 
     std::env::set_var(ENV_HOME, "not/absolute");
-    assert!(env_home().is_none(), "relative RMLX_HOME must be rejected");
+    let refused = env_home().map_err(|e| e.to_string());
+    assert_eq!(
+        refused,
+        Err("config: RMLX_HOME=not/absolute must be an absolute path".to_owned()),
+        "a relative RMLX_HOME is refused, naming the value"
+    );
+    assert!(check_env_home().is_err());
 
     std::env::set_var(ENV_HOME, "/tmp/rmlx-test-abs");
     assert_eq!(
-        env_home(),
-        Some(PathBuf::from("/tmp/rmlx-test-abs")),
+        env_home().ok(),
+        Some(Some(PathBuf::from("/tmp/rmlx-test-abs"))),
         "absolute RMLX_HOME must round-trip"
+    );
+
+    std::env::remove_var(ENV_HOME);
+    assert!(
+        matches!(env_home(), Ok(None)),
+        "an unset RMLX_HOME is no override"
     );
 
     match prev {

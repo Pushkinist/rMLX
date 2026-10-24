@@ -23,7 +23,7 @@ binary is missing.
 | `--port`, `PORT` | `62265` | Server port |
 | `--ssd-gb`, `SSD_GB` | `100` | `--kv-ssd-cache-gb` for POPULATE and REVISIT |
 | `--dry-run` | off | Skips the ingest and the `events` and `observations` checks |
-| `RMLX_HOME` | the checkout's `.rmlx/` | Data root: holds the run directory, and its `metrics/runs.db` is the default metrics DB. A relative value is ignored, as by every `rmlx` command |
+| `RMLX_HOME` | the checkout's `.rmlx/` | Data root: holds the run directory, and its `metrics/runs.db` is the default metrics DB. A relative value is refused, as by every `rmlx` command: the run exits non-zero before a phase server starts |
 | `RMLX_METRICS_DB` | `<data root>/metrics/runs.db` | Metrics DB the records go to, as for every `rmlx metrics` command |
 
 The script does not work out either path itself: it asks the binary, from the
@@ -123,8 +123,8 @@ earlier runs filed all three phases under one prompt.
 
 `scripts/ssd_canary_selftest.sh` (`make ssd-canary-selftest`, in `make ci`)
 runs `make ssd-canary` and the gate against a stub binary and a stub server,
-with `RMLX_HOME` exported, unset, relative, and beside an exported
-`RMLX_METRICS_DB`. It checks that a data root survives the run byte for byte,
+with `RMLX_HOME` exported, unset, and beside an exported `RMLX_METRICS_DB`,
+and checks that a relative `RMLX_HOME` is refused before a phase server starts. It checks that a data root survives the run byte for byte,
 that each run gets a new absolute directory whose SSD blocks are gone at exit,
 that the script removes nothing outside it, that the summary and the records
 carry what the stub server wrote into its own data root, and that the gate

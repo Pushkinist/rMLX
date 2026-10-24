@@ -690,9 +690,10 @@ and their prompts into this one. The contract is in
 
 ### 12.1 Pre-push gate (`make ci`)
 
-`make ci` runs `ci-metrics`: `rmlx metrics doctor` against
-`$RMLX_HOME/metrics/runs.db` (default `.rmlx/`), skipped when that file is
-absent. CI never runs a bench. It checks the DB's structure, its identity
+`make ci` runs `ci-metrics`: `rmlx metrics doctor` against the DB
+`rmlx metrics path` resolves, `<RMLX_HOME>/metrics/runs.db` (default `.rmlx/`),
+skipped when that file is absent. The check and the doctor read the same path;
+a relative `RMLX_HOME` turns the target red with the binary's refusal. CI never runs a bench. It checks the DB's structure, its identity
 whitelists, its registry agreement and its `METRICS_SCHEMA.md` §4.1 plausibility.
 
 It does not diff `BENCHMARK_CHAMPIONS.md`. That file is git-ignored and

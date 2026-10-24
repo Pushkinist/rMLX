@@ -1,8 +1,8 @@
 //! `rmlx metrics path [--home]` prints what every `rmlx metrics` command in the
 //! same environment resolves: `--db` over `RMLX_METRICS_DB` over
-//! `<RMLX_HOME>/metrics/runs.db`, and a relative `RMLX_HOME` ignored in favour
-//! of the checkout found by walking up for `Cargo.lock`. Stdout is the path and
-//! nothing else, because scripts read it with `$(...)`.
+//! `<RMLX_HOME>/metrics/runs.db`. A relative `RMLX_HOME` is refused before any
+//! path is resolved. Stdout is the path and nothing else, because scripts read
+//! it with `$(...)`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -100,17 +100,30 @@ fn db_flag_beats_rmlx_metrics_db() {
 }
 
 #[test]
-fn relative_rmlx_home_is_ignored() {
+fn relative_rmlx_home_is_refused() {
     let (_td, root) = tempdir();
     std::fs::write(root.join("Cargo.lock"), "").unwrap();
-    let expected = root.join(".rmlx");
-    assert_eq!(
-        path(&root, "relative-home", None, &["path", "--home"]),
-        expected.to_str().unwrap()
-    );
-    assert_eq!(
-        path(&root, "relative-home", None, &["path"]),
-        expected.join("metrics/runs.db").to_str().unwrap()
-    );
+    for args in [&["path", "--home"][..], &["path"][..]] {
+        let out = Command::new(rmlx_bin())
+            .current_dir(&root)
+            .arg("metrics")
+            .args(args)
+            .env("RMLX_HOME", "relative-home")
+            .env("HOME", &root)
+            .env_remove("RMLX_METRICS_DB")
+            .output()
+            .expect("launch rmlx");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {stderr}");
+        assert!(out.stdout.is_empty(), "{args:?}: no path is printed");
+        assert!(
+            stderr.contains("RMLX_HOME=relative-home must be an absolute path"),
+            "{args:?}: {stderr}"
+        );
+    }
     assert!(!root.join("relative-home").exists());
+    assert!(
+        !root.join(".rmlx").exists(),
+        "nothing falls back to the checkout"
+    );
 }

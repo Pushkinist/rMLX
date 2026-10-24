@@ -1838,6 +1838,7 @@ fn main() -> Result<()> {
 
     // Parse CLI first so `--log` can shape the tracing filter.
     let cli = Cli::parse();
+    rmlx_core::paths::check_env_home()?;
     let run_id = make_run_id();
 
     // Resolve the metrics kill switch exactly once, before anything can open
