@@ -302,6 +302,12 @@ case_ fixture_marker_gained 1 "scripts/old_selftest.sh: gained the 'doc-refs: fi
 case_ new_fixture_file_skipped 0 "not scanned (2 file(s) marked 'doc-refs: fixture')" \
     "a new selftest may carry the marker" \
     bash -c 'printf "# doc-refs: fixture\n# docs/NOPE.md\n" > scripts/new_fixtures.sh'
+case_ fixture_marker_in_nested_selftest_skipped 0 "not scanned (2 file(s) marked 'doc-refs: fixture')" \
+    "a selftest in a directory below scripts/ may carry the marker" \
+    bash -c 'mkdir scripts/sub && printf "# doc-refs: fixture\n# docs/NOPE.md\n" > scripts/sub/x_selftest.sh'
+case_ fixture_marker_in_nested_tool_ignored 1 "scripts/sub/tool.sh:2: PATH docs/NOPE.md — resolves to nothing" \
+    "a script below scripts/ not named *_selftest.sh or *_fixtures.sh is still scanned" \
+    bash -c 'mkdir scripts/sub && printf "# doc-refs: fixture\n# docs/NOPE.md\n" > scripts/sub/tool.sh'
 
 case_ anchor_heading_deleted 1 "LINK docs/A.md '2-contract' — resolves to nothing" \
     "deleting a heading a Markdown link anchors on fails" \
