@@ -8,8 +8,7 @@
 # and the line naming why. The last case holds the checked-in manifest to the
 # script's three literals. No GPU, no model.
 #
-# Exit 0 = every case held. Exit 1 = at least one did not. Exit 2 = a capture
-# could not be built.
+# Exit 0 = every case held. Exit 1 = at least one did not.
 
 set -uo pipefail
 

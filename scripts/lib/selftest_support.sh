@@ -6,7 +6,8 @@
 # lines of output, or st_run + st_check + st_verdict for a case that also
 # inspects what the command left behind, then ends with st_done. Exit codes of
 # a harness on the runner: 0 every case held, 1 one did not or none ran,
-# 2 its fixtures could not be built.
+# 2 a fixture could not be built or a case was written with a bad needle.
+# st_init installs the EXIT trap, so it replaces any trap set before it.
 #
 # The two spec-bench tests drive a harness against a stub server and need a
 # stand-in for `python3` that stands between the harness and the client reader.
@@ -32,30 +33,37 @@ st_cleanup() {
 	[ -z "${ST_WORK:-}" ] || rm -rf "$ST_WORK"
 }
 
-# st_setup_fail <why> — a fixture could not be built: exit 2, not a red case.
-st_setup_fail() {
-	echo "${ST_SUITE}: cannot build fixtures: $1" >&2
+# st_die <why> — the harness itself is broken: exit 2, not a red case. Called
+# inside $(...) it leaves a mark that the next st_run, st_verdict or st_done
+# turns into the same exit in the harness's own shell.
+st_die() {
+	echo "${ST_SUITE}: $1" >&2
+	: >"$ST_WORK/.broken"
 	exit 2
+}
+
+st_abort_if_broken() {
+	[ ! -e "$ST_WORK/.broken" ] || exit 2
 }
 
 # st_git_root <name> — print $ST_WORK/<name>, made and initialised as a git work tree.
 st_git_root() {
 	local root="$ST_WORK/$1"
-	mkdir -p "$root" && git -C "$root" init -q || st_setup_fail "git init in $root"
+	mkdir -p "$root" && git -C "$root" init -q || st_die "cannot build a fixture: git init in $root"
 	printf '%s' "$root"
 }
 
 # st_run <cmd...> — run it with stdout and stderr together. ST_OUT holds the
 # output and ST_RC the exit code.
 st_run() {
-	ST_OUT=$("$@" 2>&1)
-	ST_RC=$?
+	st_abort_if_broken
+	ST_OUT=$("$@" 2>&1) && ST_RC=0 || ST_RC=$?
 }
 
 # st_check <want-exit> [--has S]... [--lacks S]... [--is S] — judge the last
 # st_run: print one reason per line for each condition that fails, nothing when
-# all hold. --has and --lacks match fixed strings anywhere in the output; --is
-# wants the whole output to equal S.
+# all hold. --has and --lacks match a fixed one-line, non-empty string anywhere
+# in the output; --is wants the whole output to equal S.
 st_check() {
 	local want="$1"
 	shift
@@ -63,8 +71,16 @@ st_check() {
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
 		--is) [ "$ST_OUT" = "${2-}" ] || echo "output is '$ST_OUT', want '${2-}'" ;;
-		--has) grep -qF -- "${2-}" <<<"$ST_OUT" || echo "no '${2-}' in the output" ;;
-		--lacks) ! grep -qF -- "${2-}" <<<"$ST_OUT" || echo "'${2-}' is in the output" ;;
+		--has | --lacks)
+			case "${2-}" in
+			"" | *$'\n'*) st_die "$1 takes one non-empty line, got '${2-}'" ;;
+			esac
+			if [ "$1" = --has ]; then
+				grep -qF -- "$2" <<<"$ST_OUT" || echo "no '$2' in the output"
+			else
+				! grep -qF -- "$2" <<<"$ST_OUT" || echo "'$2' is in the output"
+			fi
+			;;
 		*) echo "st_check: unknown option '$1'" ;;
 		esac
 		shift 2 || break
@@ -75,6 +91,7 @@ st_check() {
 # empty; otherwise count it as failed and print <why> and the head of ST_OUT.
 st_verdict() {
 	local name="$1" why="$2" what="${3:-}"
+	st_abort_if_broken
 	if [ -z "$why" ]; then
 		ST_PASSED=$((ST_PASSED + 1))
 		printf '  ok   %s%s\n' "$name" "${what:+ - $what}"
@@ -104,6 +121,7 @@ st_case() {
 
 # st_done — print the summary line; fail when a case failed or none ran.
 st_done() {
+	st_abort_if_broken
 	printf '%s: %d passed, %d failed\n' "$ST_SUITE" "$ST_PASSED" "$ST_FAILED"
 	if [ "$((ST_PASSED + ST_FAILED))" -eq 0 ]; then
 		echo "${ST_SUITE}: no case ran" >&2

@@ -9,8 +9,7 @@
 # mode on the real tree; the library mode is red on the real tree until the
 # library sites take their device from the caller, so no case runs it there.
 #
-# Exit 0 = every case held. Exit 1 = at least one did not. Exit 2 = a scan root
-# could not be built.
+# Exit 0 = every case held. Exit 1 = at least one did not.
 
 set -uo pipefail
 

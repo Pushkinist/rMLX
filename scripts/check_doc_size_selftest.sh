@@ -110,7 +110,7 @@ for leader in "- " "> " "* " "## " "1. " "<!-- - "; do
     root=$(fresh "marker_leader_$tag")
     printf '# Doc\n\n%ssize-exempt: long on purpose\n' "$leader" >"$root/docs/LEAD.md"
     st_case "marker_after_leader_${tag}" 1 --what "a marker after the Markdown leader '${leader}' still fails" \
-    --has "FAIL docs/LEAD.md  carries a size-exempt marker" -- doc_size_gate "$root"
+        --has "FAIL docs/LEAD.md  carries a size-exempt marker" -- doc_size_gate "$root"
 done
 
 root=$(fresh marker_scan_linear)

@@ -8,8 +8,7 @@
 # check against it and asserts the literal exit code and the line naming why.
 # No cargo, no build, no GPU.
 #
-# Exit 0 = every case held. Exit 1 = at least one did not. Exit 2 = a fixture
-# could not be built.
+# Exit 0 = every case held. Exit 1 = at least one did not.
 
 set -uo pipefail
 
