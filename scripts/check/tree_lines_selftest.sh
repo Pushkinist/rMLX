@@ -12,8 +12,11 @@
 # personal values are built from parts at run time, so this file holds no line the
 # personal-data mode would report. A few cases plant a `.gitignore` to prove the tool
 # scans exactly the files git does not ignore, and one runs outside any git work tree.
-# The tool and this file are outside both modes' scopes, so the planted lines in the
-# claim-bypass table are not reported when the tool scans the tree this file sits in.
+# This file is outside both modes' scopes and the tool is outside claim-bypass's, so the
+# planted lines in the claim-bypass table are not reported when the tool scans the tree
+# this file sits in. A case that needs the host (a UTF-8 locale, a user that cannot read
+# a mode-000 file) prints a `skip` line when the host lacks it; a skipped case is neither
+# passed nor failed, and a line before the summary says how many were skipped.
 #
 # Usage:  bash scripts/check/tree_lines_selftest.sh [<claim-bypass|personal-data>]
 #         no mode runs the cases of both
@@ -39,6 +42,25 @@ both) st_init tree-lines-selftest ;;
     exit 2
     ;;
 esac
+export GIT_CEILING_DIRECTORIES="$ST_WORK"
+
+SKIPPED=0
+# skip <name> <why>: a case the host cannot run.
+skip() {
+    SKIPPED=$((SKIPPED + 1))
+    printf '  skip %s - %s\n' "$1" "$2"
+}
+
+# A UTF-8 locale the host has, or empty. `locale -a` is read whole: grep -q on a pipe
+# would end it early and fail the pipeline under pipefail.
+UTF8_LOCALE=""
+installed_locales="$(locale -a 2>/dev/null || true)"
+for candidate in en_US.UTF-8 C.UTF-8 en_US.utf8 C.utf8; do
+    if grep -qxF "$candidate" <<<"$installed_locales"; then
+        UTF8_LOCALE="$candidate"
+        break
+    fi
+done
 
 AT='@'
 TIMEOUT_S=60
@@ -61,17 +83,19 @@ plant() {
 
 # The cases both modes answer alike. Each mode plants a line of its own rules.
 shared_cases() {
-    local mode="$1" line rule old root
+    local mode="$1" line rule old hint root
     case "$mode" in
     claim-bypass)
         line='rm -f /tmp/rmlx.claim'
         rule=claim-delete
         old=scripts/check_claim_bypass
+        hint="Stop a server by the PID the claim refusal names"
         ;;
     personal-data)
         line="jane.doe${AT}mail.example.test"
         rule=email
         old=scripts/check_personal_data
+        hint="Replace an address with a placeholder"
         ;;
     esac
     local both="rm -f /tmp/rmlx.claim jane.doe${AT}mail.example.test"
@@ -94,7 +118,7 @@ shared_cases() {
     plant "$root" docs/two.md "$line"
     printf '%s\n' "$line" >>"$root/docs/two.md"
     st_case "$mode: two violating lines of one file are two violations" 1 \
-        --has "FAIL: 2 violation(s)" -- st_bounded "$TIMEOUT_S" bash "$TOOL" "$mode" "$root"
+        --has "FAIL: 2 violation(s). $hint" -- st_bounded "$TIMEOUT_S" bash "$TOOL" "$mode" "$root"
 
     root="$(fresh "$mode-staged")"
     plant "$root" scripts/staged.sh "$line"
@@ -112,8 +136,8 @@ shared_cases() {
     root="$(fresh "$mode-self")"
     plant "$root" "$TOOL_REL" "$both"
     plant "$root" "$SELFTEST_REL" "$both"
-    st_case "$mode: the tool and its recall test are not scanned" 0 \
-        --has "$label: ok" -- st_bounded "$TIMEOUT_S" bash "$TOOL" "$mode" "$root"
+    st_case "$mode: files at the tool's and its test's paths in another tree are scanned" 1 \
+        --has "$rule: $TOOL_REL:2:" --has "$rule: $SELFTEST_REL:2:" -- st_bounded "$TIMEOUT_S" bash "$TOOL" "$mode" "$root"
 
     root="$(fresh "$mode-old-paths")"
     plant "$root" "$old.sh" "$line"
@@ -121,11 +145,10 @@ shared_cases() {
     st_case "$mode: a file at an old gate path is scanned" 1 \
         --has "$rule: $old.sh:2:" --has "$rule: ${old}_selftest.sh:2:" -- st_bounded "$TIMEOUT_S" bash "$TOOL" "$mode" "$root"
 
-    root="$(fresh "$mode-near-paths")"
-    plant "$root" "$TOOL_REL.orig" "$line"
-    plant "$root" "scripts/old/$SELFTEST_REL" "$line"
-    st_case "$mode: a path that only contains the tool's or its test's path is scanned" 1 \
-        --has "$rule: $TOOL_REL.orig:2:" --has "$rule: scripts/old/$SELFTEST_REL:2:" -- st_bounded "$TIMEOUT_S" bash "$TOOL" "$mode" "$root"
+    root="$(fresh "$mode-near-name")"
+    plant "$root" "${TOOL_REL%.sh}Xsh" "$line"
+    st_case "$mode: a name that differs from the tool's by one character is scanned" 1 \
+        --has "$rule: ${TOOL_REL%.sh}Xsh:2:" -- st_bounded "$TIMEOUT_S" bash "$TOOL" "$mode" "$root"
 
     root="$(fresh "$mode-copy")"
     mkdir -p "$root/scripts/tools"
@@ -133,22 +156,148 @@ shared_cases() {
     plant "$root" scripts/tools/tree_lines_selftest.sh "$both"
     plant "$root" "$TOOL_REL" "$line"
     plant "$root" "$SELFTEST_REL" "$line"
-    st_case "$mode: a copy of the tool excludes its own path and its test's, and no other" 1 \
-        --has "$rule: $TOOL_REL:2:" --has "$rule: $SELFTEST_REL:2:" --lacks "scripts/tools/" \
+    st_case "$mode: a copy of the tool leaves out its own test and no other file" 1 \
+        --has "$rule: $TOOL_REL:2:" --has "$rule: $SELFTEST_REL:2:" --lacks "scripts/tools/tree_lines_selftest.sh" \
         -- st_bounded "$TIMEOUT_S" bash "$root/scripts/tools/tree_lines.sh" "$mode"
+
+    root="$(fresh "$mode-near-paths")"
+    mkdir -p "$root/$(dirname "$TOOL_REL")"
+    cp "$TOOL" "$root/$TOOL_REL"
+    plant "$root" "$TOOL_REL.orig" "$line"
+    plant "$root" "scripts/old/$SELFTEST_REL" "$line"
+    st_case "$mode: a path that only contains the tool's or its test's path is scanned" 1 \
+        --has "$rule: $TOOL_REL.orig:2:" --has "$rule: scripts/old/$SELFTEST_REL:2:" \
+        -- st_bounded "$TIMEOUT_S" bash "$root/$TOOL_REL" "$mode"
+
+    # The tool's own lines: claim-bypass leaves out the tool and its test; personal-data
+    # scans the tool, so a violation added to it is reported.
+    local own_lines
+    own_lines=$(($(wc -l <"$TOOL") + 1))
+    root="$(fresh "$mode-own-lines")"
+    mkdir -p "$root/$(dirname "$TOOL_REL")"
+    cp "$TOOL" "$root/$TOOL_REL"
+    printf '%s\n' "$line" >>"$root/$TOOL_REL"
+    plant "$root" "$SELFTEST_REL" "$both"
+    if [ "$mode" = claim-bypass ]; then
+        st_case "$mode: a violation in the tool and one in its test are not reported" 0 \
+            --has "$label: ok (1 file(s) scanned)" -- st_bounded "$TIMEOUT_S" bash "$root/$TOOL_REL" "$mode"
+    else
+        st_case "$mode: a violation in the tool is reported, one in its test is not" 1 \
+            --has "$rule: $TOOL_REL:$own_lines:" --lacks "$SELFTEST_REL" --has "FAIL: 1 violation(s)" \
+            -- st_bounded "$TIMEOUT_S" bash "$root/$TOOL_REL" "$mode"
+
+        root="$(fresh "$mode-own-text")"
+        mkdir -p "$root/$(dirname "$TOOL_REL")"
+        cp "$TOOL" "$root/$TOOL_REL"
+        st_case "$mode: the tool's own text holds no line the mode reports" 0 \
+            --has "$label: ok (2 file(s) scanned)" -- st_bounded "$TIMEOUT_S" bash "$TOOL" "$mode" "$root"
+    fi
+
+    # A scan root below the repository root lists paths relative to itself.
+    root="$(fresh "$mode-sub-root")"
+    mkdir -p "$root/$(dirname "$TOOL_REL")"
+    cp "$TOOL" "$root/$TOOL_REL"
+    plant "$root" "$SELFTEST_REL" "$both"
+    plant "$root" scripts/Makefile "$line"
+    st_case "$mode: a scan root below the repo root leaves out the tool's files and no other" 1 \
+        --has "$rule: Makefile:2:" --lacks "check/" \
+        -- st_bounded "$TIMEOUT_S" bash "$root/$TOOL_REL" "$mode" "$root/scripts"
+
+    # The same tree reached through a symlinked tool, directory and root.
+    local scanned_ok=1 links="$ST_WORK/$mode-links"
+    if [ "$mode" = personal-data ]; then
+        scanned_ok=2
+    fi
+    root="$(fresh "$mode-linked")"
+    mkdir -p "$root/$(dirname "$TOOL_REL")" "$links"
+    cp "$TOOL" "$root/$TOOL_REL"
+    plant "$root" "$SELFTEST_REL" "$both"
+    ln -s "$root/$TOOL_REL" "$links/abs-link.sh"
+    ln -s "../$mode-linked/$TOOL_REL" "$links/rel-link.sh"
+    ln -s "$root/$(dirname "$TOOL_REL")" "$links/dir-link"
+    ln -s "$root" "$links/root-link"
+    st_case "$mode: a tool reached by an absolute symlink leaves out its own files" 0 \
+        --has "$label: ok ($scanned_ok file(s) scanned)" -- st_bounded "$TIMEOUT_S" bash "$links/abs-link.sh" "$mode" "$root"
+    st_case "$mode: a tool reached by a relative symlink finds its repo root" 0 \
+        --has "$label: ok ($scanned_ok file(s) scanned)" -- st_bounded "$TIMEOUT_S" bash "$links/rel-link.sh" "$mode"
+    st_case "$mode: a tool reached through a symlinked directory finds its repo root" 0 \
+        --has "$label: ok ($scanned_ok file(s) scanned)" -- st_bounded "$TIMEOUT_S" bash "$links/dir-link/tree_lines.sh" "$mode"
+    st_case "$mode: a repo reached through a symlink finds its root and leaves out the tool's files" 0 \
+        --has "$label: ok ($scanned_ok file(s) scanned)" -- st_bounded "$TIMEOUT_S" bash "$links/root-link/$TOOL_REL" "$mode"
+    st_case "$mode: a scan root reached through a symlink leaves out the tool's files" 0 \
+        --has "$label: ok ($scanned_ok file(s) scanned)" -- st_bounded "$TIMEOUT_S" bash "$root/$TOOL_REL" "$mode" "$links/root-link"
+
+    # git lists a name with a non-ASCII character, a tab or a quote in quoted form.
+    local odd n=0 shown
+    for odd in "scripts/caf"$'\303\251'".sh" "scripts/tab"$'\t'"x.sh" 'scripts/quo"te.sh' "docs/caf"$'\303\251'".md"; do
+        n=$((n + 1))
+        shown="${odd//$'\t'/<TAB>}"
+        root="$(fresh "$mode-odd-name-$n")"
+        plant "$root" "$odd" "$line"
+        st_case "$mode: a file named $shown is scanned" 1 \
+            --has "$rule: $odd:2:" -- st_bounded "$TIMEOUT_S" bash "$TOOL" "$mode" "$root"
+    done
+    root="$(fresh "$mode-odd-names-clean")"
+    for odd in "scripts/caf"$'\303\251'".sh" "scripts/tab"$'\t'"x.sh" 'scripts/quo"te.sh' "docs/caf"$'\303\251'".md"; do
+        plant "$root" "$odd" "clean"
+    done
+    st_case "$mode: clean files with such names are scanned and pass" 0 \
+        --has "$label: ok (5 file(s) scanned)" -- st_bounded "$TIMEOUT_S" bash "$TOOL" "$mode" "$root"
+
+    root="$(fresh "$mode-unreadable")"
+    plant "$root" scripts/a_violation.sh "$line"
+    plant "$root" scripts/locked.sh "$both"
+    chmod 000 "$root/scripts/locked.sh"
+    if [ -r "$root/scripts/locked.sh" ]; then
+        skip "$mode: a file that cannot be read ends the run" "this user can read a mode-000 file"
+    else
+        st_case "$mode: a file that cannot be read ends the run with exit 2, after the hits found" 2 \
+            --has "$rule: scripts/a_violation.sh:2:" --has "$label: unavailable: cannot read scripts/locked.sh" --lacks "FAIL" \
+            -- st_bounded "$TIMEOUT_S" bash "$TOOL" "$mode" "$root"
+    fi
+
+    local scratch left why
+    scratch="$ST_WORK/$mode-scratch"
+    mkdir -p "$scratch"
+    root="$(fresh "$mode-scratch-run")"
+    plant "$root" scripts/visible.sh "$line"
+    st_run st_bounded "$TIMEOUT_S" env TMPDIR="$scratch" bash "$TOOL" "$mode" "$root"
+    why="$(st_check 1 --has "$rule: scripts/visible.sh:2:")"
+    left="$(ls -A "$scratch")"
+    if [ -n "$left" ]; then
+        why="$why${why:+$'\n'}left in TMPDIR: $left"
+    fi
+    st_verdict "$mode: a run leaves nothing behind in TMPDIR" "$why"
+
+    root="$(st_git_root "$mode-all-missing")"
+    plant "$root" scripts/gone.sh "$line"
+    git -C "$root" add scripts/gone.sh
+    rm "$root/scripts/gone.sh"
+    st_case "$mode: a scope whose every file is missing cannot be scanned" 2 \
+        --has "$label: unavailable: no file to scan" -- st_bounded "$TIMEOUT_S" bash "$TOOL" "$mode" "$root"
+
+    if [ -n "$UTF8_LOCALE" ]; then
+        root="$(fresh "$mode-locale")"
+        printf '# header\n\377\376 %s\n' "$line" >"$root/scripts/bytes.sh"
+        st_case "$mode: bytes that are not UTF-8 are scanned under a UTF-8 locale" 1 \
+            --has "$rule: scripts/bytes.sh:2:" \
+            -- st_bounded "$TIMEOUT_S" env LC_ALL="$UTF8_LOCALE" bash "$TOOL" "$mode" "$root"
+    else
+        skip "$mode: bytes that are not UTF-8 are scanned under a UTF-8 locale" "no UTF-8 locale on this host"
+    fi
 
     root="$ST_WORK/$mode-not-a-git-tree"
     mkdir -p "$root/scripts"
     printf '%s\n' "$line" >"$root/scripts/x.sh"
     st_case "$mode: a root outside a git work tree cannot be scanned" 2 \
-        --has "unavailable: git ls-files exit 128" --lacks "no in-scope file" -- st_bounded "$TIMEOUT_S" bash "$TOOL" "$mode" "$root"
+        --has "unavailable: git ls-files exit 128" --has "not a git repository" --lacks "no in-scope file" -- st_bounded "$TIMEOUT_S" bash "$TOOL" "$mode" "$root"
 
     st_case "$mode: a missing root cannot be scanned" 2 \
         --has "is not a directory" --lacks "git ls-files" -- st_bounded "$TIMEOUT_S" bash "$TOOL" "$mode" "$ST_WORK/does-not-exist"
 
     root="$(st_git_root "$mode-empty")"
     st_case "$mode: an empty scope cannot be scanned" 2 \
-        --has "unavailable: no in-scope file" -- st_bounded "$TIMEOUT_S" bash "$TOOL" "$mode" "$root"
+        --has "unavailable: no in-scope file" --lacks "no file to scan" -- st_bounded "$TIMEOUT_S" bash "$TOOL" "$mode" "$root"
 }
 
 # name | relpath | planted line | want-exit | needle ("-" = must pass)
@@ -219,6 +368,45 @@ CLAIM_BYPASS_CASES=(
     "python_object_remove|scripts/q2.py|claim_file.remove()|1|claim-delete: scripts/q2.py:2:"
     "python_os_unlink|scripts/q3.py|os.unlink(\"/tmp/rmlx.claim\")|1|claim-delete: scripts/q3.py:2:"
     "xargs_unlink|scripts/e5.sh|ls /tmp/rmlx.*.claim \| xargs unlink|1|claim-delete: scripts/e5.sh:2:"
+
+    "rm_tab_separator|scripts/x1.sh|rm"$'\t'"-f /tmp/rmlx.claim|1|claim-delete: scripts/x1.sh:2:"
+    "find_exec_rm_ends_line|scripts/e6.sh|find /tmp -name 'rmlx*' -exec rm|1|claim-delete: scripts/e6.sh:2:"
+    "pkill_ends_line|scripts/k2.sh|echo do not run pkill|1|process-kill: scripts/k2.sh:2:"
+    "remove_call_space_before_paren|scripts/q4.py|os.remove (\"/var/tmp/rmlx.claim\")|1|claim-delete: scripts/q4.py:2:"
+    "claim_module_path_is_exact|crates/a/src/rmlx-server/src/claim.rs|let p = \"/var/tmp/rmlx.claim\";|1|claim-path: crates/a/src/rmlx-server/src/claim.rs:2:"
+    "md_exemption_is_the_extension|scripts/cmd|CLAIM=/var/tmp/rmlx.claim|1|claim-path: scripts/cmd:2:"
+
+    "rm_then_and_then_echo|scripts/m4.sh|rm -f out.json && echo claim done|0|-"
+    "rm_then_semicolon_then_echo|scripts/m5.sh|rm -f out.json; echo claim done|0|-"
+    "rm_piped_to_claim_log|scripts/m6.sh|rm -f out.json \| tee claim.log|0|-"
+    "git_hyphen_rm_claim|scripts/m7.sh|git-rm -f /tmp/x/claim|0|-"
+    "git_rm_two_spaces|scripts/m8.sh|git  rm scripts/old_claim.sh|0|-"
+    "dash_pkill_word|scripts/o2.sh|no-pkill -f x|0|-"
+    "kill_pid_piped_to_grep|scripts/l2.sh|kill \$SERVER_PID \| grep x \$(pgrep y)|0|-"
+    "xargs_killswitch|scripts/l3.sh|ls \| xargs killswitch|0|-"
+    "find_delete_outside_tmp|scripts/e7.sh|find crates -name 'rmlx*' -delete|0|-"
+    "own_remove_helper|scripts/q5.py|my_remove(claim_name)|0|-"
+    "backtick_inside_claim_name|scripts/f2.sh|echo \`rmlx\`foo.claim|0|-"
+    "readme_below_root_out_of_scope|sub/dir/README.md|rm -f /tmp/rmlx.claim|0|-"
+    "docs_below_root_out_of_scope|other/docs/n.md|rm -f /tmp/rmlx.claim|0|-"
+    "github_dir_below_root_out_of_scope|x/.github/y.yml|rm -f /tmp/rmlx.claim|0|-"
+    "scripts_dir_below_root_out_of_scope|vendor/scripts/x.sh|rm -f /tmp/rmlx.claim|0|-"
+    "claude_md_dot_is_literal|CLAUDEXmd|rm -f /tmp/rmlx.claim|0|-"
+)
+
+# name | relpath | planted line | want-exit | needle ("-" = must pass)
+# {AT}, {USERS} and {SESSION} stand for the parts the personal-data mode reports, so no
+# line of this file is one.
+PERSONAL_DATA_CASES=(
+    "email_two_letter_tld|n.txt|jane{AT}corp.io|1|email: n.txt:2:"
+    "email_hyphen_in_domain|n.txt|jane{AT}my-corp.example.test|1|email: n.txt:2:"
+    "email_placeholder_domain_as_prefix|n.txt|jane{AT}example.com.corp.test|1|email: n.txt:2:"
+    "email_placeholder_domain_as_suffix|n.txt|jane{AT}myexample.com|1|email: n.txt:2:"
+    "home_name_starts_with_digit|n.txt|path /{USERS}/1234/src|1|home-path: n.txt:2:"
+    "home_name_ends_the_line|n.txt|path /{USERS}/alice|1|home-path: n.txt:2:"
+    "session_link_with_hyphen|n.md|https://claude.ai/code/{SESSION}-01ABC|1|session-link: n.md:2:"
+    "users_word_is_not_a_home|n.txt|see users/guide|0|-"
+    "private_tmp_of_another_name|n.txt|see /private/tmp/other|0|-"
 )
 
 # doc_rows_plant <docs root> <scan root>: copy the lines of CLAUDE.md and
@@ -281,6 +469,12 @@ claim_bypass_cases() {
     st_case binary_scanned 1 --what "a file with a NUL byte is scanned" \
         --has "claim-delete: scripts/blob.sh:1:" -- st_bounded "$TIMEOUT_S" bash "$TOOL" claim-bypass "$root"
 
+    # Unlike personal-data, this mode counts an empty file as scanned.
+    root="$(fresh empty_file)"
+    : >"$root/scripts/empty.sh"
+    st_case empty_file_scanned 0 --what "an empty file is scanned" \
+        --has "check-claim-bypass: ok (2 file(s) scanned)" -- st_bounded "$TIMEOUT_S" bash "$TOOL" claim-bypass "$root"
+
     # The summary counts every violation, not the files that hold one.
     root="$(fresh two_violations)"
     plant "$root" docs/v1.md 'rm -f /tmp/rmlx.claim'
@@ -293,13 +487,13 @@ claim_bypass_cases() {
     mkdir -p "$root/other"
     printf 'rm -f /tmp/rmlx.claim\n' >"$root/other/notes.txt"
     st_case empty_scope 2 --what "no in-scope file is exit 2, not a pass" \
-        --has "unavailable: no in-scope file" -- st_bounded "$TIMEOUT_S" bash "$TOOL" claim-bypass "$root"
+        --has "unavailable: no in-scope file" --lacks "no file to scan" -- st_bounded "$TIMEOUT_S" bash "$TOOL" claim-bypass "$root"
 
     shared_cases claim-bypass
 }
 
 personal_data_cases() {
-    local root domain
+    local root domain spec name rel line want needle
 
     root="$(fresh email)"
     printf 'line one\nmail jane.doe%smail.example.test here\n' "$AT" >"$root/notes.txt"
@@ -356,6 +550,30 @@ personal_data_cases() {
     printf 'jane.doe%smail.example.test and joe%scorp.example.test\n' "$AT" "$AT" >"$root/two.txt"
     st_case "two addresses on one line are one violation" 1 --has "FAIL: 1 violation(s)" -- st_bounded "$TIMEOUT_S" bash "$TOOL" personal-data "$root"
 
+    root="$(st_git_root only-binary)"
+    printf 'jane.doe%smail.example.test\000\001' "$AT" >"$root/blob.bin"
+    st_case "a tree of binary files only cannot be scanned" 2 \
+        --has "check-personal-data: unavailable: no file to scan" -- st_bounded "$TIMEOUT_S" bash "$TOOL" personal-data "$root"
+
+    root="$(st_git_root only-empty)"
+    : >"$root/empty.txt"
+    st_case "a tree of empty files only cannot be scanned" 2 \
+        --has "check-personal-data: unavailable: no file to scan" -- st_bounded "$TIMEOUT_S" bash "$TOOL" personal-data "$root"
+
+    for spec in "${PERSONAL_DATA_CASES[@]}"; do
+        IFS='|' read -r name rel line want needle <<<"$spec"
+        line="${line//\{AT\}/$AT}"
+        line="${line//\{USERS\}/Users}"
+        line="${line//\{SESSION\}/session}"
+        root="$(fresh "$name")"
+        plant "$root" "$rel" "$line"
+        if [ "$needle" = - ]; then
+            st_case "$name" "$want" -- st_bounded "$TIMEOUT_S" bash "$TOOL" personal-data "$root"
+        else
+            st_case "$name" "$want" --has "$needle" -- st_bounded "$TIMEOUT_S" bash "$TOOL" personal-data "$root"
+        fi
+    done
+
     shared_cases personal-data
 }
 
@@ -372,4 +590,7 @@ both)
     ;;
 esac
 
+if [ "$SKIPPED" -gt 0 ]; then
+    printf '%s: %d skipped\n' "$ST_SUITE" "$SKIPPED"
+fi
 st_done
