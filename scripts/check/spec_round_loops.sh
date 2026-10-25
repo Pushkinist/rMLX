@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # CI gate: speculative round loops carry one phase-charge decision and the request's sampler.
 #
-# One population of Rust fns, read off the speculative source once, and two rule sets over it.
-# Nothing is a name list; every member is derived from its signature and body.
+# One population of Rust fns, derived from the speculative source by one scanner, and two rule
+# sets over it. Nothing is a name list; every member is derived from its signature and body.
 #
 #   LOOPS   — a fn whose parameters include `step_fn: &mut dyn FnMut(&ProbeStep)`, at any
 #             visibility (that argument is what makes a fn a generation driver), that also
@@ -20,10 +20,16 @@
 #             discriminator and not a detail: without it the population admits the entry guard
 #             and the emit helpers, none of which decides anything. An entry that stops
 #             constructing the configuration leaves the population, which is what makes a
-#             dropped decision read as a lost entry rather than as a clean scan.
+#             dropped decision read as a lost entry rather than as a clean scan. Charge counts
+#             an entry built by a `RoundCfg {` literal or by a `RoundCfg::` constructor;
+#             sampling counts the literal only, because it looks inside it for the sampler. A
+#             constructor-built entry is therefore refused by both modes, never missed: charge
+#             finds it states no `charged:` field, sampling finds one drafter path fewer.
 #
-# A `fn` inside a `trait` or an `impl` block is read exactly like a free one, and a `fn` with
-# no body, which is what a trait declares, is closed at its own `;`. A fn opens at a `fn` item
+# A `fn` inside a `trait` or an `impl` block is read exactly like a free one, at any visibility
+# (`pub`, `pub(crate)`, `pub(super)`, `pub(self)`, `pub(in <path>)`) and with any of `const`,
+# `async`, `unsafe` and `extern "<abi>"` before the `fn`. A `fn` with no body, which is what a
+# trait declares, is closed at its own `;`. A fn opens at a `fn` item
 # and closes when its brace depth returns to zero; a nested `fn` is not opened, because the
 # enclosing loop is the unit the rules are about. Files named `*_tests.rs` and `tests.rs` are
 # not read.
@@ -65,14 +71,14 @@
 # verdicts: a needle that reaches for an extension one of them lacks would break it silently,
 # so run a new one under all three.
 #
-# LOC-exempt: one population read by two rule sets that share one scanner; the rule text is the spec
+# LOC-exempt: one scanner shared by two rule sets, which read the entries differently; the rule text is the spec
 # Usage:  bash scripts/check/spec_round_loops.sh <charge|sampling|list-drivers> [--root DIR]
 # Exit:   0 clean; 1 a rule fired; 2 the gate could not scan (a usage error, a missing tree or
-#         dispatch, no round loop found, a body or call or binding it could not read back, a
+#         dispatch, no round loop found, a call or binding it could not read back, a
 #         drafter-path count that moved, a failed awk scan)
-# Not a mode of: check_spec_metric_parity.sh — that gate compares the metric names a bench
-#                script prints with the engine's list; this one reads the round loops of the
-#                speculative source for two rules that are not about metric names
+# Not a mode of: check/kernel_dispatch.sh — that gate reads the kernel dispatchers of the
+#                crates that own `.metal` files for eval, dtype and scalar shapes; this one
+#                reads the speculative round loops for the charge and sampler rules
 
 set -euo pipefail
 
@@ -81,6 +87,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 . "$REPO_ROOT/scripts/lib/awk_text.sh"
 
 usage() {
+    echo "spec_round_loops: $1" >&2
     echo "usage: bash scripts/check/spec_round_loops.sh <charge|sampling|list-drivers> [--root DIR]" >&2
     exit 2
 }
@@ -89,7 +96,8 @@ MODE="${1:-}"
 case "$MODE" in
 charge | list-drivers) LABEL=check-spec-charge ;;
 sampling) LABEL=check-spec-sampling ;;
-*) usage ;;
+"") usage "no mode given" ;;
+*) usage "unknown mode: $MODE" ;;
 esac
 shift
 
@@ -97,11 +105,13 @@ ROOT_ARG=""
 while [ $# -gt 0 ]; do
     case "$1" in
     --root)
-        [ $# -ge 2 ] && [ -n "$2" ] && [ -z "$ROOT_ARG" ] || usage
+        [ $# -ge 2 ] || usage "--root needs a directory"
+        [ -n "$2" ] || usage "--root is empty"
+        [ -z "$ROOT_ARG" ] || usage "--root given twice"
         ROOT_ARG="$2"
         shift 2
         ;;
-    *) usage ;;
+    *) usage "unknown option: $1" ;;
     esac
 done
 SCAN_ROOT="${ROOT_ARG:-$REPO_ROOT}"
@@ -136,8 +146,8 @@ fi
 #   1 file     2 fn        3 driver signature   4 RoundTotals
 #   5 rollback_round call  6 constructs RoundCfg  7 RoundCfg parameter  8 fn start line
 #
-# A hook never writes a record of its own: a body this scan cannot read back is reported
-# rather than skipped. The awk text holds no apostrophe; it sits in single quotes.
+# A hook reads the facts of 4 to 6 through `read_facts` on the lines it wants them from, and
+# never writes a record of its own. The awk text holds no apostrophe; it sits in single quotes.
 
 SCAN_CORE='
       function reset() {
@@ -159,10 +169,15 @@ SCAN_CORE='
         depth = gsub(/\{/, "{", s) - gsub(/\}/, "}", s)
         if (depth < 0) { depth = 0 }
       }
+      function read_facts(code) {
+        if (index(code, "RoundTotals {") > 0) { has_stats = 1 }
+        if (index(code, "RoundCfg {") > 0) { makes_cfg = 1 }
+        if (index(code, "rollback_round(") > 0 && code !~ /fn[[:space:]]+rollback_round\(/) { has_roll = 1 }
+      }
       FNR == 1 { flush() }
 
       !in_body && !in_sig && !awaiting_body &&
-      /^[[:space:]]*(pub(\([a-z:]+\))?[[:space:]]+)?(async[[:space:]]+)?fn[[:space:]]+[a-z_0-9]+/ {
+      /^[[:space:]]*(pub([[:space:]]*\((crate|super|self|in[[:space:]]+[A-Za-z_:][A-Za-z0-9_:]*)\))?[[:space:]]+)?(const[[:space:]]+)?(async[[:space:]]+)?(unsafe[[:space:]]+)?(extern[[:space:]]+("[^"]*"[[:space:]]+)?)?fn[[:space:]]+[a-z_0-9]+/ {
         flush()
         line = $0
         sub(/^.*fn[[:space:]]+/, "", line)
@@ -208,15 +223,12 @@ SCAN_CORE='
       # close the record early, and every needle after it would belong to no fn.
       {
         code = view($0)
-        if (index(code, "RoundTotals {") > 0) { has_stats = 1 }
-        if (index(code, "RoundCfg {") > 0) { makes_cfg = 1 }
-        if (index(code, "rollback_round(") > 0 && code !~ /fn[[:space:]]+rollback_round\(/) { has_roll = 1 }
         if (!hook_line(code)) {
           depth += gsub(/\{/, "{", code) - gsub(/\}/, "}", code)
           if (depth <= 0) { flush() }
         }
       }
-      END { hook_end(); flush() }
+      END { flush() }
 '
 
 # Charge hooks. The extra fields, after the common eight:
@@ -360,9 +372,8 @@ CHARGE_HOOKS='
         in_call = 0; args = ""
       }
       function hook_line(code,   arg, tok, rest, arm) {
-        # An entry may build its configuration through a constructor as well as a literal;
-        # the sampling rules read the literal alone, because they look inside it.
-        if (index(code, "RoundCfg::") > 0) { makes_cfg = 1 }
+        # The arguments of a multi-line call are read as arguments and nothing else: a
+        # population fact on one of them belongs to no statement of the fn.
         if (in_call) {
           if (code ~ /^[[:space:]]*\)/) {
             close_call()
@@ -373,6 +384,10 @@ CHARGE_HOOKS='
           }
           return 1
         }
+        read_facts(code)
+        # An entry may build its configuration through a constructor as well as a literal;
+        # the sampling rules read the literal alone, because they look inside it.
+        if (index(code, "RoundCfg::") > 0) { makes_cfg = 1 }
 
         # The configuration handed over is neither rebound under its own name nor
         # written through. Four spellings, because the rule constrains the token and the
@@ -420,11 +435,14 @@ CHARGE_HOOKS='
           nlow++
         }
 
-        # The one round emit: a call at a statement position, not the definition. Read
-        # off the code, so a trailing comment naming it is not a call, and anchored, so
-        # the count is of calls a loop makes rather than of the name appearing on a line.
-        if (code ~ /^[[:space:]]*(let[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=[[:space:]]*)?([A-Za-z_][A-Za-z0-9_]*::)*log_round\(/) {
+        # The round emits: every call at a statement position, which is the start of the
+        # line or what follows a `{` or a `;`, and not the definition. Read off the code,
+        # so a trailing comment naming it is not a call, and anchored, so the count is of
+        # calls a loop makes rather than of the name appearing on a line.
+        rest = ";" code
+        while (match(rest, /[{;][[:space:]]*(let[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=[[:space:]]*)?([A-Za-z_][A-Za-z0-9_]*::)*log_round\(/)) {
           nemit++
+          rest = substr(rest, RSTART + RLENGTH)
         }
 
         # The per-round event target, per fn. The file-level reading cannot see which fn
@@ -451,7 +469,6 @@ CHARGE_HOOKS='
         }
         return 0
       }
-      function hook_end() { }
       function hook_emit(   t, joined, plist) {
         joined = ""
         for (t in toks) { joined = (joined == "") ? t : joined " " t }
@@ -468,17 +485,18 @@ CHARGE_HOOKS='
 # Sampling hooks, pass 1. The extra fields, after the common eight:
 #
 #   9 a `sampler_cfg: &...` parameter   10 a draw built from the sampler
-#  11 a RoundCfg literal carrying it     12 an unreadable body
+#  11 a RoundCfg literal carrying it
 SAMPLING_HOOKS='
       function view(s) { return blank_strings(decomment(s)) }
       function hook_reset() {
         cfg_depth = 0; draw_depth = 0
-        has_param = 0; draws = 0; cfg_carries = 0; unreadable = 0
+        has_param = 0; draws = 0; cfg_carries = 0
       }
       function hook_sig(sig) {
         if (sig ~ /sampler_cfg:[[:space:]]*&/) { has_param = 1 }
       }
       function hook_line(code,   rest) {
+        read_facts(code)
         # The draw a loop uses, built from the sampler of the request: one construction,
         # the VerifierDraw of the request, which the shared acceptance walk and the stochastic
         # one both draw through. It is followed to its closing parenthesis, so a wrapped
@@ -490,9 +508,7 @@ SAMPLING_HOOKS='
           draw_depth = 1 + gsub(/\(/, "(", rest) - gsub(/\)/, ")", rest)
           if (index(rest, "sampler_cfg") > 0) { draws = 1 }
           if (draw_depth < 0) { draw_depth = 0 }
-          return 0
-        }
-        if (draw_depth > 0) {
+        } else if (draw_depth > 0) {
           if (index(code, "sampler_cfg") > 0) { draws = 1 }
           draw_depth += gsub(/\(/, "(", code) - gsub(/\)/, ")", code)
           if (draw_depth < 0) { draw_depth = 0 }
@@ -500,34 +516,32 @@ SAMPLING_HOOKS='
 
         # The configuration an entry builds, and whether the sampler is in it. The
         # literal is followed to its closing brace, so a sampler_cfg further down the
-        # body is not read as one the entry handed over.
+        # body is not read as one the entry handed over. It is read on a line that also
+        # holds the draw: the two are independent facts.
         if (index(code, "RoundCfg {") > 0) {
           rest = code
           sub(/^.*RoundCfg[[:space:]]*\{/, "", rest)
           cfg_depth = 1 + gsub(/\{/, "{", rest) - gsub(/\}/, "}", rest)
           if (index(rest, "sampler_cfg") > 0) { cfg_carries = 1 }
           if (cfg_depth <= 0) { cfg_depth = 0 }
-          return 0
-        }
-        if (cfg_depth > 0) {
+        } else if (cfg_depth > 0) {
           if (index(code, "sampler_cfg") > 0) { cfg_carries = 1 }
           cfg_depth += gsub(/\{/, "{", code) - gsub(/\}/, "}", code)
           if (cfg_depth < 0) { cfg_depth = 0 }
         }
         return 0
       }
-      function hook_end() {
-        if (in_sig || awaiting_body) { unreadable = 1 }
-      }
       function hook_emit() {
-        printf "%s\t%d\t%d\t%d\t%d\n", common_fields(), has_param, draws, cfg_carries, unreadable
+        printf "%s\t%d\t%d\t%d\n", common_fields(), has_param, draws, cfg_carries
       }
 '
 
 # Sampling hooks, pass 2: every call to a member of the population, and whether the request
 # sampler goes with it. The names cross on spaces because BSD awk cannot take a newline in a
 # -v value; they are Rust identifiers, which hold neither. Record: file, fn, calls made,
-# calls without the sampler, the first such callee.
+# calls without the sampler, the first such callee. A call carries the sampler when the text
+# up to its own closing parenthesis names it, so a second call on the same line is read on
+# its own and not through the first one's arguments.
 GUARD_HOOKS='
       BEGIN { n = split(names, list, " "); for (i = 1; i <= n; i++) { if (list[i] != "") { pop[list[i]] = 1 } } }
       function view(s) { return blank_strings(decomment(s)) }
@@ -540,28 +554,40 @@ GUARD_HOOKS='
         if (!carries) { nmissing++; if (missing == "-") { missing = callee } }
         call_depth = 0; callee = ""; carries = 0
       }
-      function hook_sig(sig) { }
-      function hook_line(code,   rest, name) {
-        if (call_depth > 0) {
-          if (index(code, "sampler_cfg") > 0) { carries = 1 }
-          call_depth += gsub(/\(/, "(", code) - gsub(/\)/, ")", code)
-          if (call_depth <= 0) { close_call() }
-          return 0
-        }
-        rest = code
-        while (match(rest, /[A-Za-z_][A-Za-z0-9_]*\(/)) {
-          name = substr(rest, RSTART, RLENGTH - 1)
-          rest = substr(rest, RSTART + RLENGTH)
-          if (!(name in pop) || name == fname) { continue }
-          callee = name
-          carries = (index(rest, "sampler_cfg") > 0)
-          call_depth = 1 + gsub(/\(/, "(", rest) - gsub(/\)/, ")", rest)
-          if (call_depth <= 0) { close_call() }
-          break
+      # The length of the prefix of s that ends the open call at its closing parenthesis, or
+      # 0 when the call stays open past the end of s.
+      function call_end(s,   i, d, ch) {
+        d = call_depth
+        for (i = 1; i <= length(s); i++) {
+          ch = substr(s, i, 1)
+          if (ch == "(") { d++ } else if (ch == ")") { d--; if (d <= 0) { return i } }
         }
         return 0
       }
-      function hook_end() { }
+      function hook_sig(sig) { }
+      function hook_line(code,   rest, name, cut) {
+        rest = code
+        while (rest != "") {
+          if (call_depth > 0) {
+            cut = call_end(rest)
+            if (cut == 0) {
+              if (index(rest, "sampler_cfg") > 0) { carries = 1 }
+              call_depth += gsub(/\(/, "(", rest) - gsub(/\)/, ")", rest)
+              return 0
+            }
+            if (index(substr(rest, 1, cut), "sampler_cfg") > 0) { carries = 1 }
+            close_call()
+            rest = substr(rest, cut + 1)
+          } else if (match(rest, /[A-Za-z_][A-Za-z0-9_]*\(/)) {
+            name = substr(rest, RSTART, RLENGTH - 1)
+            rest = substr(rest, RSTART + RLENGTH)
+            if (name in pop) { callee = name; call_depth = 1 }
+          } else {
+            return 0
+          }
+        }
+        return 0
+      }
       function hook_emit() {
         printf "%s\t%s\t%d\t%d\t%s\n", FILENAME, fname, ncalls, nmissing, missing
       }
@@ -688,8 +714,9 @@ has_unread_token() {
 #   outside `round_stats.rs` is exit 2, read by file (the only reading that sees a mention
 #   outside any fn) and by fn (so a round loop that moved into `round_stats.rs` does not
 #   inherit that file exemption and write a second event beside its emit). By call: each
-#   round loop calls `log_round(` exactly once, at a statement position. Zero is a loop that
-#   left the seam; two or more is a second record shape under one target.
+#   round loop calls `log_round(` exactly once, at a statement position: the start of a line,
+#   or after a `{` or a `;`, so a second emit inside a one-line `if` is counted. Zero is a loop
+#   that left the seam; two or more is a second record shape under one target.
 #
 #   A loop whose emit moves into the skeleton moves this needle in the same commit, as RULE
 #   6 needle moved when the rollback went behind `rollback_round`, and the old seam has to
@@ -1152,7 +1179,10 @@ run_charge() {
 #
 # RULE 3 (a guard passes it on)
 #   A guard declares the parameter and passes it at every call it makes to a loop or an entry
-#   that takes one.
+#   that takes one. A call is recognised by its name, and carries the sampler when the text up
+#   to its own closing parenthesis names it, so two calls on one line are each read. A member
+#   is skipped as a caller by its file and name together: a fn in another file that merely
+#   shares a member's name is a guard like any other.
 #
 # RULE 4 (the dispatch)
 #   In the server's speculative generator, every arm of the `match &drafter` that drives a
@@ -1174,25 +1204,26 @@ run_charge() {
 #   it has stopped looking, so a count that moves is exit 2 rather than a quieter run.
 #
 # EXIT
-#   0 clean, 1 a rule fired, 2 the gate could not scan: a missing file, no loop found, a body
-#   it could not read back, or a drafter-path count that moved.
+#   0 clean, 1 a rule fired, 2 the gate could not scan: a missing file, no loop found, or a
+#   drafter-path count that moved.
 
 run_sampling() {
-    local records callers population population_flat arms
+    local records callers population population_flat members arms
     local loop_count=0 entry_count=0 path_count=0 forwarded_count=0 guard_count=0 arm_count=0
-    local file name has_cfg has_param draws carries unreadable ncalls nmissing missing arm passes rel
+    local file name has_cfg has_param draws carries ncalls nmissing missing arm passes rel
 
-    # Columns after the common eight: 9 has_param, 10 draws, 11 carries, 12 unreadable.
+    # Columns after the common eight: 9 has_param, 10 draws, 11 carries.
     records=$(scan_rs "$SAMPLING_HOOKS") || scan_failed
     derive_population "$records"
 
     population=$(printf '%s\n%s\n' "$loops" "$entries" | awk -F'\t' '$2 != "" { print $2 }')
     population_flat=$(printf '%s\n' "$population" | tr '\n' ' ')
+    members=$(printf '%s\n%s\n' "$loops" "$entries" | awk -F'\t' '$2 != "" { print $1 "\t" $2 }')
 
     callers=$(scan_rs "$GUARD_HOOKS" -v names="$population_flat") || scan_failed
 
     # Rule 1: the loops.
-    while IFS=$'\t' read -r file name _ _ _ _ has_cfg _ has_param draws _ unreadable; do
+    while IFS=$'\t' read -r file name _ _ _ _ has_cfg _ has_param draws _; do
         [ -n "$name" ] || continue
         rel="${file#"$SCAN_ROOT"/}"
         loop_count=$((loop_count + 1))
@@ -1200,13 +1231,6 @@ run_sampling() {
             forwarded_count=$((forwarded_count + 1))
         else
             path_count=$((path_count + 1))
-        fi
-        if [ "$unreadable" = "1" ]; then
-            note "$LABEL: $rel: \`$name\` opened a body this gate could not read back."
-            note "  A loop whose extent cannot be determined is not scanned, and an unscanned"
-            note "  loop is exactly the one that would decode greedily unnoticed."
-            scan_error=1
-            continue
         fi
         if [ "$has_param" != "1" ] && [ "$has_cfg" != "1" ]; then
             note "$LABEL: $rel: \`$name\` drives a generation but takes neither a"
@@ -1226,16 +1250,11 @@ run_sampling() {
     done <<<"$loops"
 
     # Rule 2: the entries.
-    while IFS=$'\t' read -r file name _ _ _ _ _ _ has_param _ carries unreadable; do
+    while IFS=$'\t' read -r file name _ _ _ _ _ _ has_param _ carries; do
         [ -n "$name" ] || continue
         rel="${file#"$SCAN_ROOT"/}"
         entry_count=$((entry_count + 1))
         path_count=$((path_count + 1))
-        if [ "$unreadable" = "1" ]; then
-            note "$LABEL: $rel: \`$name\` opened a body this gate could not read back."
-            scan_error=1
-            continue
-        fi
         if [ "$has_param" != "1" ]; then
             note "$LABEL: $rel: \`$name\` starts a round loop and takes no"
             note "  \`sampler_cfg: &SamplerConfig\`, so the request's temperature stops here and"
@@ -1256,7 +1275,7 @@ run_sampling() {
     while IFS=$'\t' read -r file name ncalls nmissing missing; do
         [ -n "$name" ] || continue
         [ "$ncalls" != "0" ] || continue
-        if grep -qx -- "$name" <<<"$population"; then
+        if grep -qxF -- "$file"$'\t'"$name" <<<"$members"; then
             continue
         fi
         rel="${file#"$SCAN_ROOT"/}"

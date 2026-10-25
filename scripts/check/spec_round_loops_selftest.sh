@@ -22,7 +22,8 @@
 # loop, and the end state the tree has: one shared loop and seven entries.
 #
 # The `charge` group also holds the cases of `list-drivers`, which reads the same population,
-# and the argument cases of the tool.
+# and the argument cases of the tool. A case the host cannot run (a mode-000 source file that
+# this user can read) prints `skip` and counts as neither passed nor failed.
 #
 # LOC-exempt: one planted tree per case; the builders are shared by both rule sets
 # Usage:  bash scripts/check/spec_round_loops_selftest.sh [<charge|sampling>]
@@ -67,6 +68,25 @@ gate() {
         st_case "$mode: $name" "$want" --has "$reason" -- bash "$TOOL" "$mode" --root "$ROOT"
     else
         st_case "$mode: $name" "$want" -- bash "$TOOL" "$mode" --root "$ROOT"
+    fi
+}
+
+# The routing of the guard in mod.rs as a perl pattern, for the edits that rewrite it.
+GUARD_IF='    if sampler_cfg\.sampling_active\(\) \{\n        spec_generate_stochastic_cached\(verifier, step_fn, sampler_cfg, device\)\n    \} else \{\n        spec_generate_greedy_cached\(verifier, step_fn, sampler_cfg, device\)\n    \}'
+
+# skip <name> <why>: a case the host cannot run, neither passed nor failed.
+skip() {
+    printf '  skip %s - %s\n' "$1" "$2"
+}
+
+# unreadable_source_case <mode>: a source file nobody can read ends the run in every mode.
+unreadable_source_case() {
+    build_root
+    chmod 000 "$ROOT/$SPEC/dflash.rs"
+    if [ -r "$ROOT/$SPEC/dflash.rs" ]; then
+        skip "$1: a source file that cannot be read is a scan error" "this user can read a mode-000 file"
+    else
+        gate "$1" "a source file that cannot be read is a scan error" 2 "the awk scan failed"
     fi
 }
 
@@ -461,6 +481,16 @@ build_root() {
     write_dispatch
 }
 
+# A round loop moved into the file that owns the per-round event's target.
+move_loop_into_stats_file() {
+    {
+        printf '//! The shared record and the one round emit.\n\n'
+        loop_src "eagle3_generate" "false" "plain"
+    } >"$ROOT/$SPEC/round_stats.rs"
+    printf '//! The loop that used to live here moved into the shared record.\n' \
+        >"$ROOT/$SPEC/eagle3.rs"
+}
+
 # Mid-campaign: one drafter migrated. Its loop body is gone, the shared loop runs its rounds,
 # and the decision it made inside the body is made at the entry that starts the loop. Six
 # loops still carry their own body, and the census is unchanged.
@@ -779,19 +809,52 @@ RS
     gate charge "a loop closing its round twice is refused" 2 \
         "\`eagle3_generate\` reaches the one round emit 2 time(s)."
 
+    # A second emit that is not the first token of its line: inside a one-line `if`, and two
+    # on one line. A reading anchored to the start of a statement line counts neither.
+    build_root
+    edit 's/(            &\[\],\n        \);\n)/$1        if verbose { super::log_round(\&extra, \&[]); }\n/' "$ROOT/$SPEC/eagle3.rs"
+    gate charge "a second emit inside a one-line if is counted" 2 \
+        "\`eagle3_generate\` reaches the one round emit 2 time(s)."
+
+    build_root
+    edit 's/(            &\[\],\n        \);\n)/$1        { super::log_round(\&a, \&[]); super::log_round(\&b, \&[]); }\n/' "$ROOT/$SPEC/eagle3.rs"
+    gate charge "two emits on one line are both counted" 2 \
+        "\`eagle3_generate\` reaches the one round emit 3 time(s)."
+
+    # The controls: a `let` binding the one emit's result is still the emit, and a name that
+    # is not at a statement position is not a call.
+    build_root
+    edit 's/        super::log_round\(/        let _ = super::log_round(/' "$ROOT/$SPEC/eagle3.rs"
+    gate charge "an emit bound with let is the one emit" 0 \
+        "OK: 7 classic, 0 forwarded, 0 entries; census charge_phases:3 false:4 (7 sites)."
+
+    build_root
+    edit 's/(    let mut draw = super::VerifierDraw::new\(sampler_cfg\);\n)/$1    let note = "the shared log_round( call";\n/' "$ROOT/$SPEC/eagle3.rs"
+    gate charge "a string literal naming the emit is not a call to it" 0 \
+        "OK: 7 classic, 0 forwarded, 0 entries; census charge_phases:3 false:4 (7 sites)."
+
     # RULE 7 by name, by fn: a round loop that moved into the file that owns the target. It
     # calls the emitter once, and the file reading exempts the path, so only the fn reading sees
     # the second event it writes on the target.
     build_root
-    {
-        printf '//! The shared record and the one round emit.\n\n'
-        loop_src "eagle3_generate" "false" "plain"
-    } >"$ROOT/$SPEC/round_stats.rs"
-    printf '//! The loop that used to live here moved into the shared record.\n' \
-        >"$ROOT/$SPEC/eagle3.rs"
+    move_loop_into_stats_file
     edit 's/(        super::log_round\(\n(?:.*\n)*?        \);\n)/$1        tracing::debug!(target: PHASE_TARGET, round = rounds, "speculative round");\n/' "$ROOT/$SPEC/round_stats.rs"
     gate charge "a round loop inside the target's own file does not inherit its exemption" 2 \
         "\`eagle3_generate\` is a round loop and names the"
+
+    # The same by the literal, which is the reading that keeps string bodies: outside this file
+    # the file-level reading sees the literal anyway, so only this case reaches the fn reading.
+    build_root
+    move_loop_into_stats_file
+    edit 's/(        super::log_round\(\n(?:.*\n)*?        \);\n)/$1        tracing::debug!(target: "rmlx::spec::phase", round = rounds, "speculative round");\n/' "$ROOT/$SPEC/round_stats.rs"
+    gate charge "a round loop inside the target's own file naming it by its literal is refused" 2 \
+        "\`eagle3_generate\` is a round loop and names the"
+
+    # Its control: the loop in that file that only calls the emit names no target.
+    build_root
+    move_loop_into_stats_file
+    gate charge "a round loop inside the target's own file that only calls the emit passes" 0 \
+        "OK: 7 classic, 0 forwarded, 0 entries; census charge_phases:3 false:4 (7 sites)."
 
     # The needle is code, not prose. A trailing comment naming the emit on a line that is not
     # one would otherwise count as a call.
@@ -1065,6 +1128,15 @@ RS
     gate charge "an entry building its configuration by a constructor states no decision" 1 \
         "\`eagle3_generate\` builds a round loop's configuration and states"
 
+    # An entry that also rolls a round back is no entry: the rollback is outside the populations,
+    # and so is the decision it states. Both are named.
+    build_end_root
+    edit 's/(    super::round_loop_generate\(\n)/    super::rollback_round(\n        \&mut caches,\n        None,\n        \&fed,\n        0,\n        0,\n        charge_phases,\n        device,\n    )?;\n$1/' "$ROOT/$SPEC/mtp.rs"
+    st_case "charge: an entry that also rolls a round back is no entry" 2 \
+        --has "\`mtp_generate\` rolls a round's caches back and is" \
+        --has "\`mtp_generate\` writes 1 \`charged:\` field(s)" -- \
+        bash "$TOOL" charge --root "$ROOT"
+
     # A pair, because a case without its control proves nothing about which reading fired: the
     # low-level rollback after a loop's record is refused, and refused just the same when a
     # comment carrying an unbalanced brace sits in front of it. A body whose extent is read off
@@ -1099,6 +1171,89 @@ RS
     rm -f "$ROOT/$SPEC/round_loop.rs"
     gate charge "an entry with no forwarded loop to enter is a scan error" 2 \
         "the scan found 1 entries and no forwarded loop"
+
+    # The arguments of a multi-line rollback are arguments and nothing else. A `RoundTotals`
+    # literal on one is no statement of the fn, so it cannot make a loop of a fn whose record
+    # is built elsewhere; that fn rolls back and is in no population, which is a scan error.
+    build_root
+    edit 's/            &v_input,/            \&RoundTotals { rounds, charged: true }.fed,/' "$ROOT/$SPEC/dflash.rs"
+    edit 's/    log_request_record\(\n        &RoundTotals \{\n(?:.*\n)*?    \);/    log_request_record(\&totals_for(rounds), \&emitted, seed_emitted, \&window);/' "$ROOT/$SPEC/dflash.rs"
+    gate charge "a RoundTotals literal on a rollback argument line makes no round loop" 2 \
+        "\`dflash_generate\` rolls a round's caches back and is"
+
+    # Likewise a `RoundCfg` literal there builds no configuration for an entry.
+    build_mid_root
+    cat >>"$ROOT/$SPEC/mtp.rs" <<'RS'
+
+fn rewind(
+    &mut self,
+    ctx: &RoundCtx<'_>,
+    step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+) -> Result<()> {
+    super::rollback_round(
+        &mut self.caches,
+        None,
+        &RoundCfg { loop_kind: SpecLoop::Kind, charged: false }.fed,
+        0,
+        0,
+        ctx.charged,
+        ctx.device,
+    )?;
+    Ok(())
+}
+RS
+    gate charge "a RoundCfg literal on a rollback argument line makes no entry" 2 \
+        "\`rewind\` rolls a round's caches back and is"
+
+    # A string literal holding a brace leaves a fn open to the end of its file. The next file
+    # must start from nothing, or every loop in it is read as the body of that fn.
+    build_root
+    for f in "$ROOT/$SPEC"/*.rs "$ROOT/$SPEC/dflash2"/*.rs; do
+        printf '\nfn brace_in_a_string() {\n    let open = "{";\n}\n' >>"$f"
+    done
+    gate charge "a fn left open at the end of a file does not swallow the next file" 0 \
+        "OK: 7 classic, 0 forwarded, 0 entries; census charge_phases:3 false:4 (7 sites)."
+
+    # A fn item is a fn at every visibility and under every qualifier Rust allows before the
+    # keyword. A loop the regex does not open is a lost loop, and the census then moves.
+    local qualifier
+    for qualifier in 'pub(in crate::speculative)' 'pub(super) const' 'pub(self) unsafe' \
+        'pub extern "C"' 'pub extern' 'pub async' 'pub const async unsafe extern "C"'; do
+        build_root
+        edit "s/^pub fn eagle3_generate\\(/$qualifier fn eagle3_generate(/m" "$ROOT/$SPEC/eagle3.rs"
+        gate charge "a round loop declared \`$qualifier fn\` is still a loop" 0 \
+            "OK: 7 classic, 0 forwarded, 0 entries; census charge_phases:3 false:4 (7 sites)."
+    done
+
+    # A driver that names the totals' type and builds none is no loop.
+    build_root
+    cat >>"$ROOT/$SPEC/dflash.rs" <<'RS'
+
+pub fn probe_driver(
+    step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+) -> Result<Vec<ProbeStep>> {
+    let t = RoundTotals::default();
+    Ok(vec![])
+}
+RS
+    gate charge "a driver naming RoundTotals only as a type is not a loop" 0 \
+        "OK: 7 classic, 0 forwarded, 0 entries; census charge_phases:3 false:4 (7 sites)."
+
+    # The filename rule for `tests.rs`, apart from `*_tests.rs`: a charged loop there is not read.
+    build_root
+    loop_src "a_test_loop" "true" "plain" >"$ROOT/$SPEC/tests.rs"
+    gate charge "a loop in a file named tests.rs is not scanned" 0 \
+        "OK: 7 classic, 0 forwarded, 0 entries; census charge_phases:3 false:4 (7 sites)."
+
+    # An entry's decision that the scan cannot read is a scan error, as in a loop, and not a
+    # census that merely moved.
+    build_end_root
+    edit 's/            charged: false,/            charged: !flag,/' "$ROOT/$SPEC/eagle3.rs"
+    gate charge "an entry whose charged value is a negation is a scan error" 2 \
+        "\`eagle3_generate\` has a charge site this gate could not read"
+
+    unreadable_source_case charge
+    unreadable_source_case list-drivers
 
     # With no --root the tree is the repository the tool sits in.
     build_root
@@ -1140,17 +1295,17 @@ RS
 
     # The arguments. A mode is required and named, and a root is one directory given once; a
     # typo must not run the default invocation.
-    st_case "usage: no mode is refused" 2 --has "usage: bash scripts/check/spec_round_loops.sh" -- \
+    st_case "usage: no mode is refused" 2 --has "spec_round_loops: no mode given" -- \
         bash "$TOOL"
-    st_case "usage: an unknown mode is refused" 2 --has "usage: bash scripts/check/spec_round_loops.sh" -- \
+    st_case "usage: an unknown mode is refused" 2 --has "spec_round_loops: unknown mode: list-driver" -- \
         bash "$TOOL" list-driver --root "$ROOT"
-    st_case "usage: an unknown option is refused" 2 --has "usage: bash scripts/check/spec_round_loops.sh" -- \
+    st_case "usage: an unknown option is refused" 2 --has "spec_round_loops: unknown option: --rot" -- \
         bash "$TOOL" charge --rot "$ROOT"
-    st_case "usage: --root without a directory is refused" 2 --has "usage: bash scripts/check/spec_round_loops.sh" -- \
+    st_case "usage: --root without a directory is refused" 2 --has "spec_round_loops: --root needs a directory" -- \
         bash "$TOOL" charge --root
-    st_case "usage: an empty --root is refused" 2 --has "usage: bash scripts/check/spec_round_loops.sh" -- \
+    st_case "usage: an empty --root is refused" 2 --has "spec_round_loops: --root is empty" -- \
         bash "$TOOL" charge --root ""
-    st_case "usage: a repeated --root is refused" 2 --has "usage: bash scripts/check/spec_round_loops.sh" -- \
+    st_case "usage: a repeated --root is refused" 2 --has "spec_round_loops: --root given twice" -- \
         bash "$TOOL" sampling --root "$ROOT" --root "$ROOT"
 }
 
@@ -1382,6 +1537,121 @@ cases_sampling() {
     edit 's|    let mut draw = super::VerifierDraw::new\(sampler_cfg\);|    let note = \x27"\x27; let text = "VerifierDraw::new(sampler_cfg)";\n    let mut draw = super::VerifierDraw::new(\&greedy());|' "$ROOT/$SPEC/dflash.rs"
     gate sampling "a needle in a string literal after a quote character literal is not a draw" 1 \
         "\`dflash_generate\` is handed the request's sampler and builds"
+
+    # The guard pass reads code too: a sampler named only in a comment inside the call that
+    # drops it is passed to nothing.
+    build_root
+    edit 's/spec_generate_stochastic_cached\(verifier, step_fn, sampler_cfg, device\)/spec_generate_stochastic_cached(\n            verifier,\n            step_fn, \/\/ sampler_cfg dropped\n            device,\n        )/' "$ROOT/$SPEC/mod.rs"
+    gate sampling "a guard route keeping the sampler only in a comment is refused" 1 \
+        "\`spec_generate_greedy\` runs \`spec_generate_stochastic_cached\` without passing the"
+
+    # Both routes on one line: each call carries the sampler up to its own closing parenthesis,
+    # and the second is read as well as the first.
+    build_root
+    edit "s/$GUARD_IF/    if sampler_cfg.sampling_active() { spec_generate_stochastic_cached(verifier, step_fn, sampler_cfg, device) } else { spec_generate_greedy_cached(verifier, step_fn, device) }/" "$ROOT/$SPEC/mod.rs"
+    gate sampling "a guard with two routes on one line, the second dropping the sampler, is refused" 1 \
+        "\`spec_generate_greedy\` runs \`spec_generate_greedy_cached\` without passing the"
+
+    build_root
+    edit "s/$GUARD_IF/    if sampler_cfg.sampling_active() { spec_generate_stochastic_cached(verifier, step_fn, device) } else { spec_generate_greedy_cached(verifier, step_fn, sampler_cfg, device) }/" "$ROOT/$SPEC/mod.rs"
+    gate sampling "a guard with two routes on one line, the first dropping the sampler, is refused" 1 \
+        "\`spec_generate_greedy\` runs \`spec_generate_stochastic_cached\` without passing the"
+
+    build_root
+    edit "s/$GUARD_IF/    if sampler_cfg.sampling_active() { spec_generate_stochastic_cached(verifier, step_fn, sampler_cfg, device) } else { spec_generate_greedy_cached(verifier, step_fn, sampler_cfg, device) }/" "$ROOT/$SPEC/mod.rs"
+    gate sampling "a guard with two routes on one line, both carrying the sampler, passes" 0 \
+        "OK: 7 loops (0 forwarded), 0 entries, 1 guards"
+
+    # A wrapped call that drops the sampler and closes on a line holding a second call that
+    # carries it: the second call's sampler is not the first one's.
+    build_root
+    edit "s/$GUARD_IF/    spec_generate_stochastic_cached(\n        verifier,\n        step_fn,\n        device,\n    ); spec_generate_greedy_cached(verifier, step_fn, sampler_cfg, device)/" "$ROOT/$SPEC/mod.rs"
+    gate sampling "a wrapped call closing beside a call that carries the sampler is still refused" 1 \
+        "\`spec_generate_greedy\` runs \`spec_generate_stochastic_cached\` without passing the"
+
+    # A fn in another file that shares a member's name is not that member: it is a guard like any
+    # other, and a call it makes without the sampler is refused. The member itself is skipped,
+    # even where it calls its own name, and a namesake that passes the sampler passes.
+    build_root
+    printf 'fn eagle3_generate(verifier: &Architecture) -> usize {\n    spec_generate_stochastic_cached(verifier, 1)\n}\n' >"$ROOT/$SPEC/namesake.rs"
+    gate sampling "a fn sharing a member's name in another file is not skipped as a member" 1 \
+        "\`eagle3_generate\` runs \`spec_generate_stochastic_cached\` without passing the"
+
+    build_root
+    printf 'fn eagle3_generate(verifier: &Architecture) -> usize {\n    eagle3_generate(verifier)\n}\n' >"$ROOT/$SPEC/namesake.rs"
+    gate sampling "a namesake calling its own name is a call to the member, and refused" 1 \
+        "\`eagle3_generate\` runs \`eagle3_generate\` without passing the"
+
+    build_root
+    printf 'fn eagle3_generate(verifier: &Architecture, sampler_cfg: &SamplerConfig) -> usize {\n    spec_generate_stochastic_cached(verifier, sampler_cfg)\n}\n' >"$ROOT/$SPEC/namesake.rs"
+    gate sampling "a namesake of a member that passes the sampler is one more guard, and passes" 0 \
+        "OK: 7 loops (0 forwarded), 0 entries, 2 guards"
+
+    build_root
+    edit 's/^(pub fn eagle3_generate\((?:.*\n)*?\) -> Result<Vec<ProbeStep>> \{\n)/$1    eagle3_generate(verifier, n_tokens, step_fn, device)?;\n/m' "$ROOT/$SPEC/eagle3.rs"
+    gate sampling "a member calling its own name without the sampler is skipped as a member" 0 \
+        "OK: 7 loops (0 forwarded), 0 entries, 1 guards"
+
+    # A dispatch arm passing some other sampler is not passing the resolved one.
+    build_root
+    edit 's/(dflash2_generate\(\n            &dispatcher.verifier,\n            n_tokens,\n            &mut step_fn,\n)            &spec_sampler_cfg,/$1            \&default_sampler_cfg(),/' "$ROOT/crates/rmlx-server/src/engine/speculative.rs"
+    gate sampling "a dispatch arm passing a sampler that is not the resolved one is refused" 1 \
+        "the \`Drafter::DFlash2\` arm drives a"
+
+    # An entry that also rolls a round back is no entry. Charge sees it as a rollback outside
+    # the populations; here the entry leaves the population and a drafter path goes with it.
+    build_end_root
+    edit 's/(    super::round_loop_generate\(\n)/    super::rollback_round(\n        \&mut caches,\n        None,\n        \&fed,\n        0,\n        0,\n        charge_phases,\n        device,\n    )?;\n$1/' "$ROOT/$SPEC/mtp.rs"
+    gate sampling "an entry that also rolls a round back is not an entry" 2 \
+        "the tree has 6 drafter generation paths and records"
+
+    # The arguments of a multi-line rollback are read for the loop facts here, as they always
+    # were: a RoundTotals literal on one makes a loop (charge reads none of them).
+    build_root
+    edit 's/            &v_input,/            \&RoundTotals { rounds, charged: true }.fed,/' "$ROOT/$SPEC/dflash.rs"
+    edit 's/    log_request_record\(\n        &RoundTotals \{\n(?:.*\n)*?    \);/    log_request_record(\&totals_for(rounds), \&emitted, seed_emitted, \&window);/' "$ROOT/$SPEC/dflash.rs"
+    gate sampling "a RoundTotals literal on a rollback argument line still makes a loop" 0 \
+        "OK: 7 loops (0 forwarded), 0 entries, 1 guards"
+
+    # A draw and the configuration on one line are independent facts, and both are read.
+    build_mid_root
+    edit 's/        &RoundCfg \{\n            loop_kind: SpecLoop::Kind,\n            sampler_cfg,\n            charged: charge_phases,\n        \},/        \&RoundCfg { draw: super::VerifierDraw::new(sampler_cfg), sampler_cfg, charged: charge_phases },/' "$ROOT/$SPEC/mtp.rs"
+    gate sampling "an entry building its draw and its configuration on one line passes" 0 \
+        "OK: 7 loops (1 forwarded), 1 entries, 1 guards"
+
+    build_mid_root
+    edit 's/        &RoundCfg \{\n            loop_kind: SpecLoop::Kind,\n            sampler_cfg,\n            charged: charge_phases,\n        \},/        \&RoundCfg { draw: super::VerifierDraw::new(\&greedy()), charged: charge_phases },/' "$ROOT/$SPEC/mtp.rs"
+    gate sampling "the same line with the sampler left out of the configuration is refused" 1 \
+        "\`mtp_generate\` takes \`sampler_cfg\` and leaves it out of the"
+
+    # The same inside a literal written over several lines: a field that holds the draw carries
+    # the sampler into the configuration.
+    build_mid_root
+    edit 's/            sampler_cfg,\n/            draw: super::VerifierDraw::new(sampler_cfg),\n/' "$ROOT/$SPEC/mtp.rs"
+    gate sampling "a configuration field holding the draw carries the sampler" 0 \
+        "OK: 7 loops (1 forwarded), 1 entries, 1 guards"
+
+    build_mid_root
+    edit 's/            sampler_cfg,\n/            draw: super::VerifierDraw::new(\&greedy()),\n/' "$ROOT/$SPEC/mtp.rs"
+    gate sampling "a configuration field holding a greedy draw leaves the sampler out" 1 \
+        "\`mtp_generate\` takes \`sampler_cfg\` and leaves it out of the"
+
+    # An entry built by a constructor is read by the literal alone: it leaves the sampling
+    # population (one path fewer), where charge sees an entry that states no decision.
+    build_end_root
+    edit 's/        &RoundCfg \{\n(?:.*\n)*?        \},\n/        \&RoundCfg::new(sampler_cfg, false),\n/' "$ROOT/$SPEC/eagle3.rs"
+    gate sampling "an entry building its configuration by a constructor is not in the population" 2 \
+        "the tree has 6 drafter generation paths and records"
+
+    unreadable_source_case sampling
+
+    build_root
+    chmod 000 "$ROOT/crates/rmlx-server/src/engine/speculative.rs"
+    if [ -r "$ROOT/crates/rmlx-server/src/engine/speculative.rs" ]; then
+        skip "sampling: a dispatch that cannot be read is a scan error" "this user can read a mode-000 file"
+    else
+        gate sampling "a dispatch that cannot be read is a scan error" 2 "the awk scan failed"
+    fi
 
     # The root is an argument. The variable the old gate read it from is gone, so a value left in
     # the environment points the scan nowhere.
