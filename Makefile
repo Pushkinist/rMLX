@@ -696,16 +696,16 @@ check-gpu-device-census-selftest: ## CI gate: recall test for the above and its 
 	@bash scripts/check_gpu_device_census_selftest.sh
 
 check-claim-bypass: ## CI gate: nothing in the tree deletes the Metal claim, names its file outside the claim module, or kills by process-name pattern
-	@bash scripts/check_claim_bypass.sh
+	@bash scripts/check/tree_lines.sh claim-bypass
 
 check-claim-bypass-selftest: ## CI gate: recall test for the above, each case asserting the rule and file:line or the reason as well as the exit code
-	@bash scripts/check_claim_bypass_selftest.sh
+	@bash scripts/check/tree_lines_selftest.sh claim-bypass
 
 check-personal-data: ## CI gate: no personal email address, home or per-user temp path, or assistant session link in any file git does not ignore
-	@bash scripts/check_personal_data.sh
+	@bash scripts/check/tree_lines.sh personal-data
 
 check-personal-data-selftest: ## CI gate: recall test for the above, each case asserting the rule and file:line or the reason as well as the exit code
-	@bash scripts/check_personal_data_selftest.sh
+	@bash scripts/check/tree_lines_selftest.sh personal-data
 
 check-kernel-dtype-contract: ## CI gate: fail if a Metal-kernel dispatcher returns its declared-f32 output without restoring a caller dtype (promotes the whole decode graph)
 	@bash scripts/check_kernel_dtype_contract.sh
@@ -770,10 +770,10 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_gpu_device_census.sh
 	@bash scripts/check_gpu_device_census.sh --library
 	@bash scripts/check_gpu_device_census_selftest.sh
-	@bash scripts/check_claim_bypass.sh
-	@bash scripts/check_claim_bypass_selftest.sh
-	@bash scripts/check_personal_data.sh
-	@bash scripts/check_personal_data_selftest.sh
+	@bash scripts/check/tree_lines.sh claim-bypass
+	@bash scripts/check/tree_lines_selftest.sh claim-bypass
+	@bash scripts/check/tree_lines.sh personal-data
+	@bash scripts/check/tree_lines_selftest.sh personal-data
 	@bash scripts/mlx_restore_pin_selftest.sh
 	@bash scripts/mlx_preflight_selftest.sh
 	@bash scripts/check_kernel_dtype_contract.sh

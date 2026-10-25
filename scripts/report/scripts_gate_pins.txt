@@ -19,8 +19,6 @@ class bench_codec_cell.sh
 class bench_identity_selftest.sh
 class bench_llama_ab.sh
 class bench_llama_ab_selftest.sh
-class check_claim_bypass.sh
-class check_claim_bypass_selftest.sh
 class check_eval_lock.sh
 class check_gpu_device_census.sh
 class check_gpu_device_census_selftest.sh
@@ -40,8 +38,6 @@ class check_no_decode_swallow.sh
 class check_no_inline_tests.sh
 class check_no_kernel_input_eval.sh
 class check_no_scalar_f32_leak.sh
-class check_personal_data.sh
-class check_personal_data_selftest.sh
 class check_published_samples_fixtures.sh
 class check_spec_charge.sh
 class check_spec_charge_fixtures.sh
@@ -111,7 +107,6 @@ usage bench_cell.sh
 usage bench_identity_selftest.sh
 usage bench_llama_ab.sh
 usage bench_llama_ab_selftest.sh
-usage check_claim_bypass_selftest.sh
 usage check_eval_lock.sh
 usage check_gpu_device_census_selftest.sh
 usage check_gpu_tests_ignored.sh
@@ -127,7 +122,6 @@ usage check_named_skip_notices.sh
 usage check_named_skip_notices_fixtures.sh
 usage check_no_kernel_input_eval.sh
 usage check_no_scalar_f32_leak.sh
-usage check_personal_data_selftest.sh
 usage check_published_samples_fixtures.sh
 usage check_spec_charge.sh
 usage check_spec_charge_fixtures.sh
@@ -193,7 +187,6 @@ exit-undeclared bench_codec_cell.sh 1
 exit-undeclared bench_identity_selftest.sh 1
 exit-undeclared bench_llama_ab.sh 0,125
 exit-undeclared bench_llama_ab_selftest.sh 1
-exit-undeclared check_claim_bypass.sh 1,2
 exit-undeclared check_eval_lock.sh 1
 exit-undeclared check_gpu_device_census.sh 2
 exit-undeclared check_gpu_tests_ignored.sh 0,1
@@ -209,7 +202,6 @@ exit-undeclared check_named_skip_notices.sh 1,2
 exit-undeclared check_named_skip_notices_fixtures.sh 1
 exit-undeclared check_no_kernel_input_eval.sh 1
 exit-undeclared check_no_scalar_f32_leak.sh 1
-exit-undeclared check_personal_data.sh 1,2
 exit-undeclared check_published_samples_fixtures.sh 1
 exit-undeclared check_spec_charge.sh 0,1,2
 exit-undeclared check_spec_charge_fixtures.sh 1
@@ -334,13 +326,11 @@ set-mode bench_cell.sh
 set-mode bench_identity_selftest.sh
 set-mode bench_llama_ab.sh
 set-mode bench_llama_ab_selftest.sh
-set-mode check_claim_bypass.sh
 set-mode check_gpu_device_census.sh
 set-mode check_kv_byte_model_parity.sh
 set-mode check_kv_codec_disposition.sh
 set-mode check_metal_compiles.sh
 set-mode check_named_skip_notices.sh
-set-mode check_personal_data.sh
 set-mode check_spec_charge.sh
 set-mode check_spec_sampling.sh
 set-mode codec_smoke_runner_selftest.sh
@@ -371,11 +361,9 @@ set-mode traces_gc.sh
 name bench-records-sweep.sh RMLX_DIR,hyphen
 name bench_cache_types.sh RMLX_DIR
 name bench_llama_ab_selftest.sh ROOT
-name check_claim_bypass.sh ROOT
 name check_kv_codec_disposition_fixtures.sh ROOT
 name check_named_skip_notices.sh ROOT
 name check_no_kernel_input_eval.sh ROOT
-name check_personal_data.sh ROOT
 name check_spec_charge.sh root
 name check_spec_sampling.sh root
 name eval/wikitext2_ppl.py workspace
@@ -414,7 +402,6 @@ heredoc spec_bench.sh 138
 heredoc spec_bench_published.sh 56
 heredoc spec_bench_published_selftest.sh 34,23
 heredoc ssd_canary.sh 65,49,38
-twin check_claim_bypass.sh+check_personal_data.sh 26
 twin check_named_skip_notices_fixtures.sh+run_gpu_tests_selftest.sh 47
 twin check_spec_charge.sh+check_spec_sampling.sh 77
 twin check_spec_charge_fixtures.sh+check_spec_sampling_fixtures.sh 138

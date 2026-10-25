@@ -16,8 +16,6 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `bench_identity_selftest.sh` | make bench-identity-selftest, make ci | bench_identity_selftest.sh — mutation check for the commit and run-log sources |
 | `bench_llama_ab.sh` | bench_llama_ab_selftest.sh | bench_llama_ab.sh — ABBA-interleaved A/B comparison of two `llama-server` arms. |
 | `bench_llama_ab_selftest.sh` | make ci, make llama-ab-selftest | bench_llama_ab_selftest.sh — mutation check for `scripts/bench_llama_ab.sh`. |
-| `check_claim_bypass.sh` | make check-claim-bypass, make ci, check_claim_bypass_selftest.sh | CI gate: nothing deletes the Metal claim, names its file outside its owner, or kills by name. |
-| `check_claim_bypass_selftest.sh` | make check-claim-bypass-selftest, make ci | Recall test for check_claim_bypass.sh: planted git work trees, asserting exit code and file:line. |
 | `check_eval_lock.sh` | make check-eval-lock, make ci, check/rust_gates_fixtures.sh | CI gate: every MLX FFI call that can evaluate runs under the process-wide evaluation lock. |
 | `check_gpu_device_census.sh` | make check-gpu-device-census, make check-gpu-device-census-library, make ci, check_gpu_device_census_selftest.sh | CI gate: the rmlx binary's source names Device::Gpu in exactly one place, claim_gpu. |
 | `check_gpu_device_census_selftest.sh` | make check-gpu-device-census-selftest, make ci | Recall test for check_gpu_device_census.sh: scan roots, asserting exit code and file:line. |
@@ -37,8 +35,6 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `check_no_inline_tests.sh` | make check-no-inline-tests, make ci, check/rust_gates_fixtures.sh | CI gate: no inline #[cfg(test)] mod tests block in a non-test source file. |
 | `check_no_kernel_input_eval.sh` | make check-no-kernel-input-eval, make ci, check/rust_gates_fixtures.sh | CI gate: no blocking Array::eval() on a kernel input in a custom-Metal-kernel dispatcher. |
 | `check_no_scalar_f32_leak.sh` | make check-no-scalar-f32-leak, make ci | CI gate: no unguarded scalar_f32( in the crates that own .metal kernels. |
-| `check_personal_data.sh` | make check-personal-data, make ci, check_personal_data_selftest.sh | CI gate: no personal email, macOS home or temp path, or assistant session link in published files. |
-| `check_personal_data_selftest.sh` | make check-personal-data-selftest, make ci | Recall test for check_personal_data.sh: throwaway git trees, asserting exit code and file:line. |
 | `check_published_samples_fixtures.sh` | make check-published-samples-fixtures, make ci | Recall test for published_samples.py verify: synthetic sample-set roots, one edit per case. |
 | `check_spec_charge.sh` | make check-spec-charge, make ci, check_spec_charge_fixtures.sh, report/debt_report.py | CI gate: each speculative round loop names one phase-charge decision, everywhere it is read. |
 | `check_spec_charge_fixtures.sh` | make check-spec-charge-fixtures, make ci | Recall test for check_spec_charge.sh: one edit per synthetic source root, asserting rule and exit. |
@@ -105,6 +101,8 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `check/doc_refs.py` | make check-doc-refs, make check-doc-source-citations, make ci, check/doc_refs_selftest.sh | References into docs/ resolve and no edit re-points one; --source-paths: cited crates/ files exist. |
 | `check/doc_refs_selftest.sh` | make check-doc-refs-selftest, make ci | Recall test for doc_refs.py: synthetic git repos, asserting exit code and reason. |
 | `check/rust_gates_fixtures.sh` | make check-eval-lock-fixtures, make check-gpu-tests-ignored-fixtures, make check-kernel-dtype-contract-fixtures, make check-kv-layer-quants-fixtures, make check-no-decode-swallow-fixtures, make check-no-inline-tests-fixtures, make check-no-kernel-input-eval-fixtures, make ci | Recall test for the Rust-source gates: planted scan roots from a table, asserting exit and reason. |
+| `check/tree_lines.sh` | make check-claim-bypass, make check-personal-data, make ci, check/tree_lines_selftest.sh | CI gate: forbidden lines in the files git does not ignore, one rule set per mode. |
+| `check/tree_lines_selftest.sh` | make check-claim-bypass-selftest, make check-personal-data-selftest, make ci | Recall test for the tree-line gate: planted git work trees, asserting exit code and file:line. |
 
 ## scripts/eval/
 
@@ -145,7 +143,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `lib/published_run_log.py` | lib/binary_identity.py, lib/prefill_ms.py, lib/published_greedy.py, +1 more scripts | Read one rmlx run log back as a per-request table. |
 | `lib/published_table.py` | make check-published-table, make published-table, published_table_selftest.sh | Render published-protocol runs as the Markdown table a post needs. |
 | `lib/run_log_for_pid.py` | lib/bench_server.sh | Pick the run log a given process wrote, out of the candidates on stdin. |
-| `lib/selftest_support.sh` | bench_llama_ab_selftest.sh, check/rust_gates_fixtures.sh, check_claim_bypass_selftest.sh, +11 more scripts | The case runner and shims the self-tests share; source it. |
+| `lib/selftest_support.sh` | bench_llama_ab_selftest.sh, check/rust_gates_fixtures.sh, check/tree_lines_selftest.sh, +10 more scripts | The case runner and shims the self-tests share; source it. |
 | `lib/server_decode_tps.py` | perf-iter/bench_decode_tps.sh, spec_bench.sh | Read one request's decode rate off a running rmlx server. |
 | `lib/server_kv_quant.py` | lib/bench_server.sh, lib/binary_identity.py, perf_canary.sh, +1 more scripts | Read the KV codec a run resolved out of its rmlx run log. |
 | `lib/server_sampling.py` | crates/rmlx-server/src/engine/sampler_event_tests.rs, lib/published_run_log.py, spec_bench.sh | Read whether a run's requests were sampled, out of its rmlx run log. |

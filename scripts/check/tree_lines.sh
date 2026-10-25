@@ -52,6 +52,8 @@
 # Exit:   0 no violation; 1 at least one violation; 2 cannot scan: no mode or an unknown
 #         one, a root that is not a directory or not inside a git work tree, or a scope
 #         that holds no file
+# Not a mode of: check_no_inline_tests.sh — that gate reads Rust items (attributes, braces)
+#                under crates/; this one matches raw lines, comments included, in any file
 
 set -euo pipefail
 export LC_ALL=C
