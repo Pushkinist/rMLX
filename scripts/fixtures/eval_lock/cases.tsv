@@ -5,6 +5,7 @@
 # gate's output the needles are read from), exit (exact), has (strings that must all
 # appear), lacks (strings none of which may appear), is (the whole output; "\t" is a
 # tab), what (what the case proves). Needles are fixed strings separated by ";;".
+# In has, "A;>B" is one needle: B must appear after the first A.
 #
 # A source gate is only worth its runtime if it still fires when the thing it
 # looks for is spelled differently, nested deeper, or hidden behind a comment.

@@ -5,6 +5,7 @@
 # gate's output the needles are read from), exit (exact), has (strings that must all
 # appear), lacks (strings none of which may appear), is (the whole output; "\t" is a
 # tab), what (what the case proves). Needles are fixed strings separated by ";;".
+# In has, "A;>B" is one needle: B must appear after the first A.
 #
 # A source gate is only worth its runtime if it still fires when the pattern it
 # looks for is spelled differently, hidden inside a tuple, or separated from
@@ -22,6 +23,7 @@ clean	{} 1	both	0	check-kernel-dtype-contract: ok	-	-	a derived .astype( on the 
 unguarded_return	{} 1	both	1	leaky_sdpa	-	-	an f32 kernel output returned as-is is caught
 f32_literal_astype	{} 1	both	1	upcast_only_sdpa	-	-	the .astype(Dtype::F32) upcast is not a guard
 literal_width_astype	{} 1	both	1	pinned_width_sdpa	-	-	a literal-width .astype( is not a guard
+bare_width_astype	{} 1	both	1	bare_f32_sdpa;;bare_bf16_sdpa;;bare_f16_sdpa;;check-kernel-dtype-contract: FAIL	check-kernel-dtype-contract: ok	-	a cast to a bare F32, Bf16 or F16 is a fixed width too, not a guard
 marker_above	{} 1	both	0	check-kernel-dtype-contract: ok	-	-	an f32-out-ok marker in the block above exempts the fn
 marker_through_attributes	{} 1	both	0	check-kernel-dtype-contract: ok	-	-	a marker separated by a multi-line attribute still applies
 marker_does_not_leak	{} 1	both	1	leaky_sdpa	-	-	one marker exempts one function, not the next one

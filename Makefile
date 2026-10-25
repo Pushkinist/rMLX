@@ -509,7 +509,7 @@ kv-update-census-selftest: ## CI gate: recall test for the KV structural figures
 check-no-inline-tests: ## CI gate: fail if any non-test.rs file has inline #[cfg(test)] mod tests { ... }
 	@bash scripts/check_no_inline_tests.sh
 
-check-no-inline-tests-fixtures: ## CI gate: recall test for the above, 14 planted scan roots, each asserting the rule or the refusal as well as the exit code
+check-no-inline-tests-fixtures: ## CI gate: recall test for the above, 20 planted scan roots, each asserting the rule or the refusal as well as the exit code
 	@bash scripts/check/rust_gates_fixtures.sh no_inline_tests
 
 check-no-scalar-f32-leak: ## CI gate: fail if arch-layer code has unguarded scalar_f32( not followed by .astype(
@@ -518,7 +518,7 @@ check-no-scalar-f32-leak: ## CI gate: fail if arch-layer code has unguarded scal
 check-kv-layer-quants: ## CI gate: fail if kv_quant_for_layer is called outside kv_cache/ (one producer: kv_layer_quants)
 	@bash scripts/check_kv_layer_quants.sh
 
-check-kv-layer-quants-fixtures: ## CI gate: recall test for the above, 14 planted scan roots, each asserting the rule or the refusal as well as the exit code
+check-kv-layer-quants-fixtures: ## CI gate: recall test for the above, 24 planted scan roots, each asserting the rule or the refusal as well as the exit code
 	@bash scripts/check/rust_gates_fixtures.sh kv_layer_quants
 
 check-kv-codec-disposition: ## CI gate: fail if the --kv-quant/--kv-bits help or the INERT banner docs contradict a codec's runtime disposition
@@ -639,7 +639,7 @@ check-doc-consumers: check-doc-refs check-doc-source-citations check-kv-codec-di
 check-no-decode-swallow: ## CI gate: fail if a decode-step failure breaks instead of propagating (would report as finish_reason="length")
 	@bash scripts/check_no_decode_swallow.sh
 
-check-no-decode-swallow-fixtures: ## CI gate: recall test for the above, 26 planted scan roots, each asserting the rule, the pinned site count or the refusal as well as the exit code
+check-no-decode-swallow-fixtures: ## CI gate: recall test for the above, 42 planted scan roots, each asserting the rule, the pinned site count or the refusal as well as the exit code
 	@bash scripts/check/rust_gates_fixtures.sh no_decode_swallow
 
 check-eval-lock:  ## CI gate: fail if an MLX eval FFI call is made without the process-wide evaluation lock

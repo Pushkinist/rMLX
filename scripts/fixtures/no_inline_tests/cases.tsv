@@ -5,6 +5,7 @@
 # gate's output the needles are read from), exit (exact), has (strings that must all
 # appear), lacks (strings none of which may appear), is (the whole output; "\t" is a
 # tab), what (what the case proves). Needles are fixed strings separated by ";;".
+# In has, "A;>B" is one needle: B must appear after the first A.
 #
 # Each root holds a crates/ tree. The rule bans an inline test module in a source file and
 # allows the sibling-pointer form; a test file, an integration test and a build directory
@@ -12,12 +13,18 @@
 # scan passes every rule it has.
 
 sibling_pointer	{}	both	0	OK: no inline test modules outside sibling test files.	ERROR: inline #[cfg(test)] mod <name> { ... } blocks found outside tests.rs / *_tests.rs:	-	the sibling-pointer spellings (path attribute, bare mod tests;) are the allowed form
+inline_latch_resets	{}	both	0	OK: no inline test modules outside sibling test files.	ERROR	-	the cfg(test) attribute applies to the module right after it: a later inline module is not under it
 inline_block	{}	both	1	ERROR: inline #[cfg(test)] mod <name> { ... } blocks found outside tests.rs / *_tests.rs:;;crates/a/src/lib.rs	OK: no inline test modules outside sibling test files.	-	an inline #[cfg(test)] mod tests { } block in a source file is caught and named
 inline_after_attribute	{}	both	1	ERROR: inline #[cfg(test)] mod <name> { ... } blocks found outside tests.rs / *_tests.rs:;;crates/a/src/lib.rs	OK: no inline test modules outside sibling test files.	-	another attribute between #[cfg(test)] and the module does not hide it
 inline_after_blank	{}	both	1	ERROR: inline #[cfg(test)] mod <name> { ... } blocks found outside tests.rs / *_tests.rs:;;crates/a/src/lib.rs	OK: no inline test modules outside sibling test files.	-	a blank line between #[cfg(test)] and the module does not hide it
 inline_indented	{}	both	1	ERROR: inline #[cfg(test)] mod <name> { ... } blocks found outside tests.rs / *_tests.rs:;;crates/a/src/lib.rs	OK: no inline test modules outside sibling test files.	-	an indented inline block is caught
 inline_nested_dir	{}	both	1	ERROR: inline #[cfg(test)] mod <name> { ... } blocks found outside tests.rs / *_tests.rs:;;crates/a/src/deep/er/lib.rs	OK: no inline test modules outside sibling test files.	-	a source file deep in the tree is scanned
 inline_second_crate	{}	both	1	ERROR: inline #[cfg(test)] mod <name> { ... } blocks found outside tests.rs / *_tests.rs:;;crates/b/src/lib.rs	crates/a/src/lib.rs	-	only the offending file is named, in any crate
+inline_other_name	{}	both	1	ERROR: inline #[cfg(test)] mod <name> { ... } blocks found outside tests.rs / *_tests.rs:;;crates/a/src/lib.rs	OK: no inline test modules outside sibling test files.	-	a test module of any other name is the banned shape too
+inline_one_line_body	{}	both	1	ERROR: inline #[cfg(test)] mod <name> { ... } blocks found outside tests.rs / *_tests.rs:;;crates/a/src/lib.rs	OK: no inline test modules outside sibling test files.	-	a body that opens and closes on the module's own line is inline
+inline_no_space_brace	{}	both	1	ERROR: inline #[cfg(test)] mod <name> { ... } blocks found outside tests.rs / *_tests.rs:;;crates/a/src/lib.rs	OK: no inline test modules outside sibling test files.	-	no space before the brace is still an inline block
+inline_contests	{}	both	1	ERROR: inline #[cfg(test)] mod <name> { ... } blocks found outside tests.rs / *_tests.rs:;;crates/a/src/contests.rs	OK: no inline test modules outside sibling test files.;;crates/a/src/lib.rs	-	only a file named tests.rs or ending _tests.rs is a test file: a name that merely ends in tests.rs is scanned
+inline_tests_like_dir	{}	both	1	ERROR: inline #[cfg(test)] mod <name> { ... } blocks found outside tests.rs / *_tests.rs:;;crates/a/src/tests_util/lib.rs	OK: no inline test modules outside sibling test files.;;crates/a/src/lib.rs	-	only a directory named tests is an integration-test directory: one that merely starts with tests is scanned
 inline_in_tests_rs	{}	both	0	OK: no inline test modules outside sibling test files.	ERROR: inline #[cfg(test)] mod <name> { ... } blocks found outside tests.rs / *_tests.rs:	-	a bare tests.rs is a test file and may hold an inline block
 inline_in_suffix_tests	{}	both	0	OK: no inline test modules outside sibling test files.	ERROR: inline #[cfg(test)] mod <name> { ... } blocks found outside tests.rs / *_tests.rs:	-	a *_tests.rs file is a test file and may hold an inline block
 inline_in_tests_dir	{}	both	0	OK: no inline test modules outside sibling test files.	ERROR: inline #[cfg(test)] mod <name> { ... } blocks found outside tests.rs / *_tests.rs:	-	an integration test under tests/ may hold an inline block

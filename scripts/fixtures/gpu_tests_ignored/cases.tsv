@@ -5,6 +5,7 @@
 # gate's output the needles are read from), exit (exact), has (strings that must all
 # appear), lacks (strings none of which may appear), is (the whole output; "\t" is a
 # tab), what (what the case proves). Needles are fixed strings separated by ";;".
+# In has, "A;>B" is one needle: B must appear after the first A.
 #
 # The gate it guards enforces a rule ("a test reaching Device::Gpu carries
 # #[ignore]") that nothing else in the tree can check, so a silent loss of
@@ -70,6 +71,7 @@ macro_close_comment	--root {}	both	1	ERROR: GPU-touching tests missing the #[ign
 macro_unreadable	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;gpu_cell!	-	-	an assembled fn name fails closed, not silently
 macro_one_line	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;one_line_cell!	-	-	a whole-macro-on-one-line #[test] fails closed
 plain_gpu_no_ignore	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;plain_gpu_test	-	-	the original non-macro detection still fires
+plain_gpu_no_ignore_in_tests_rs	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;crates/fx/src/tests.rs: plain_gpu_test	-	-	a bare tests.rs under src/ is a unit-test file and is scanned
 macro_gpu_ignored	--root {}	both	0	OK: every GPU-touching test carries #[ignore] (1 files;;gpu_cell!{$name}	-	-	a compliant macro body does not fire, and was read
 macro_cpu_no_ignore	--root {}	both	0	OK: every GPU-touching test carries #[ignore] (1 files	NOTE:	-	a macro body that never reaches the GPU stays un-ignored
 macro_gpu_exempt	--root {}	both	0	OK: every GPU-touching test carries #[ignore] (1 files	NOTE:	-	the per-test exemption marker works inside a macro body
@@ -95,7 +97,7 @@ macro_gpu_ignored	--list --root {}	out	0	-	-	fx\tplain_gpu_test	--list — macro
 # The same run must still ANNOUNCE the excluded macro cells. `make gpu-test`
 # calls only `--list`, so a note printed exclusively by the enforcing path is
 # invisible to the one operator who needs it.
-macro_gpu_ignored	--list --root {}	err	0	NOTE: macro-generated GPU tests;;fixture_tests.rs: gpu_cell!{$name}	-	-	--list — the excluded macro cells are announced on stderr
+macro_gpu_ignored	--list --root {}	err	0	NOTE: macro-generated GPU tests;>fixture_tests.rs: gpu_cell!{$name}	-	-	--list — the excluded macro cells are announced on stderr, after the note that says why
 # The same split for the declared-route marker, and for the same reason: the
 # runner turns a listed name into a libtest filter and executes it, and every
 # declared test is snapshot-gated or drives a child process, so listing one

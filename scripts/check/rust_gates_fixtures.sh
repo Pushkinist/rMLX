@@ -17,14 +17,19 @@
 # table, never a file.
 #
 # A row whose tree is missing is a red case, and so is a tree under the mode's
-# directory that no row names: a gate that refuses a root it cannot read exits
-# with the same code a violation does, so a deleted tree must not pass for it.
+# directory that no row names, a hidden one included: a gate that refuses a root
+# it cannot read exits with the same code a violation does, so a deleted tree must
+# not pass for it.
+#
+# A needle in the has column is a fixed string; "A;>B" is one needle that holds
+# when B appears after the first A, for output whose order is part of the contract.
 #
 # Usage:  bash scripts/check/rust_gates_fixtures.sh <mode>
 #         mode: eval_lock | gpu_tests_ignored | kernel_dtype_contract | no_kernel_input_eval |
 #               kv_layer_quants | no_decode_swallow | no_inline_tests
 # Exit:   0 every case held; 1 a case did not, or none ran; 2 an unknown mode, a
-#         missing table, a malformed row or no awk on the machine
+#         missing table, a malformed row (not 8 fields, a fixture name that is a
+#         path, args without "{}", a needle that is blank) or no awk on the machine
 
 set -euo pipefail
 
@@ -84,7 +89,8 @@ stdout_of() { "$@" 2>/dev/null; }
 # shellcheck disable=SC2069 # the order is the point: stderr to the capture, stdout dropped
 stderr_of() { "$@" 2>&1 >/dev/null; }
 
-# add_needles <--has|--lacks> <needles separated by ;;> — append them to CHECKS; "-" adds none.
+# add_needles <--has|--lacks> <needles separated by ;;> — append them to CHECKS, or to ORDERED
+# when a has needle holds an "A;>B" chain; "-" adds none. A blank needle matches any output.
 add_needles() {
     local flag="$1" rest="$2" needle
     [ "$rest" != - ] || return 0
@@ -99,7 +105,42 @@ add_needles() {
             rest=""
             ;;
         esac
-        CHECKS+=("$flag" "$needle")
+        case "$needle" in
+        *[![:space:]]*) ;;
+        *) st_die "scripts/fixtures/$MODE/cases.tsv: '$fixture': a $flag needle is blank" ;;
+        esac
+        case "$flag$needle" in
+        --has*';>'*) ORDERED+=("$needle") ;;
+        *) CHECKS+=("$flag" "$needle") ;;
+        esac
+    done
+}
+
+# order_why <output> <A;>B;>...> — print why when a part is not found after the one before it.
+order_why() {
+    local rest="$1" chain="$2" part
+    while [ -n "$chain" ]; do
+        case "$chain" in
+        *';>'*)
+            part="${chain%%;>*}"
+            chain="${chain#*;>}"
+            ;;
+        *)
+            part="$chain"
+            chain=""
+            ;;
+        esac
+        case "$part" in
+        *[![:space:]]*) ;;
+        *) st_die "scripts/fixtures/$MODE/cases.tsv: an ordered needle has a blank part" ;;
+        esac
+        case "$rest" in
+        *"$part"*) rest="${rest#*"$part"}" ;;
+        *)
+            echo "no '$part' after the part before it in the output"
+            return 0
+            ;;
+        esac
     done
 }
 
@@ -114,13 +155,23 @@ for impl in "${AWKS[@]}"; do
         RUN_PATH="$shim:$PATH"
         echo "== awk: $impl =="
     fi
-    while IFS=$'\t' read -u 3 -r fixture args stream want has lacks is what || [ -n "$fixture" ]; do
+    while IFS=$'\t' read -u 3 -r fixture args stream want has lacks is what extra || [ -n "$fixture" ]; do
         case "$fixture" in
         '' | '#'*) continue ;;
         esac
         if [ -z "$what" ]; then
             st_die "scripts/fixtures/$MODE/cases.tsv: the row for '$fixture' has fewer than 8 fields"
         fi
+        if [ -n "$extra" ]; then
+            st_die "scripts/fixtures/$MODE/cases.tsv: the row for '$fixture' has more than 8 fields"
+        fi
+        case "$fixture" in
+        */* | .*) st_die "scripts/fixtures/$MODE/cases.tsv: '$fixture' is a path, not the name of a tree beside the table" ;;
+        esac
+        case "$args" in
+        *'{}'*) ;;
+        *) st_die "scripts/fixtures/$MODE/cases.tsv: '$fixture': args '$args' has no {}, so the gate would not run on the tree" ;;
+        esac
         case "$stream" in
         both | out | err) ;;
         *) st_die "scripts/fixtures/$MODE/cases.tsv: '$fixture': stream '$stream' is not both, out or err" ;;
@@ -137,20 +188,27 @@ for impl in "${AWKS[@]}"; do
         for word in "${words[@]}"; do
             ARGV+=("${word//\{\}/$FIX/$fixture}")
         done
-        CHECKS=(--what "$what")
+        CHECKS=()
+        ORDERED=()
         add_needles --has "$has"
         add_needles --lacks "$lacks"
         if [ "$is" != - ]; then CHECKS+=(--is "$(printf '%b' "$is")"); fi
         case "$stream" in
-        both) st_case "$fixture" "$want" "${CHECKS[@]}" -- env PATH="$RUN_PATH" bash "$GATE" "${ARGV[@]}" ;;
-        out) st_case "$fixture" "$want" "${CHECKS[@]}" -- stdout_of env PATH="$RUN_PATH" bash "$GATE" "${ARGV[@]}" ;;
-        err) st_case "$fixture" "$want" "${CHECKS[@]}" -- stderr_of env PATH="$RUN_PATH" bash "$GATE" "${ARGV[@]}" ;;
+        both) st_run env PATH="$RUN_PATH" bash "$GATE" "${ARGV[@]}" ;;
+        out) st_run stdout_of env PATH="$RUN_PATH" bash "$GATE" "${ARGV[@]}" ;;
+        err) st_run stderr_of env PATH="$RUN_PATH" bash "$GATE" "${ARGV[@]}" ;;
         esac
+        why="$(st_check "$want" ${CHECKS[@]+"${CHECKS[@]}"})"
+        for chain in ${ORDERED[@]+"${ORDERED[@]}"}; do
+            ordered="$(order_why "$ST_OUT" "$chain")"
+            why="${why:+$why$'\n'}$ordered"
+        done
+        st_verdict "$fixture" "$why" "$what"
     done 3<"$FIX/cases.tsv"
 done
 
 NAMED="$(cut -f1 "$FIX/cases.tsv")"
-for dir in "$FIX"/*/; do
+for dir in "$FIX"/*/ "$FIX"/.[!.]*/; do
     [ -d "$dir" ] || continue
     name="$(basename "$dir")"
     if ! grep -qxF -- "$name" <<<"$NAMED"; then

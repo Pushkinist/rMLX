@@ -5,6 +5,7 @@
 # gate's output the needles are read from), exit (exact), has (strings that must all
 # appear), lacks (strings none of which may appear), is (the whole output; "\t" is a
 # tab), what (what the case proves). Needles are fixed strings separated by ";;".
+# In has, "A;>B" is one needle: B must appear after the first A.
 #
 # Each root holds a crates/ tree. Four rules: a failure-log site must not return Ok or clear
 # a *_ok flag from its own failure arm; a decode step that fails must return Err; the shared
@@ -13,31 +14,49 @@
 # number of detector and guard call sites it expects (11 and 17): every root carries a
 # nan_floor.rs of planted sites that make up the counts, and a case that varies one site does
 # it in nan_site.rs, so a failing case fails for the rule it names and not for the count.
-# A root with nothing to scan fails on the counts.
+# A root with nothing to scan fails on the counts. Each rule that reads a window of lines
+# after its anchor has a row with the verdict on the last line the window reads and a row
+# with it one line past, so the window's width is held by what the gate decides.
 
 clean	{}	both	0	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	VIOLATION	-	the pinned detector and guard counts, a propagating detector site and no failure-log site pass
 swallow_return_ok	{}	both	1	failure-log site swallows the cause;;crates/rmlx-models/src/swallow.rs;;FAIL: 1 failure site(s) swallow the error	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	-	a failure-log site that returns Ok from its own failure arm is caught and named
 swallow_propagates	{}	both	0	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	VIOLATION	-	the same site returning Err instead passes
 swallow_flag	{}	both	1	failure-log site swallows the cause;;crates/rmlx-models/src/swallow.rs;;FAIL: 1 failure site(s) swallow the error	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	-	a *_ok = false flag set from the failure arm is a swallow too
 swallow_dedented_sibling	{}	both	0	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	VIOLATION	-	a return Ok that follows the failure arm at a shallower indent is a sibling, not a swallow
+swallow_multiline_macro	{}	both	1	crates/rmlx-models/src/swallow.rs:5;;failure-log site swallows the cause.;;FAIL: 1 failure site(s) swallow the error	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	-	the real shape: error = %e on its own argument line of a multi-line tracing::error!(, a return Ok one level out is the swallow
+swallow_multiline_sibling	{}	both	0	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	VIOLATION	-	a return Ok two levels out of a multi-line log site is a sibling of the failure arm, not a swallow
+swallow_ok_at_window_edge	{}	both	1	crates/rmlx-models/src/swallow.rs:3;;failure-log site swallows the cause.;;FAIL: 1 failure site(s) swallow the error	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	-	a return Ok on the last line the window reads is the swallow
+swallow_ok_past_window	{}	both	0	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	VIOLATION	-	a return Ok one line past the window is not read
 swallow_in_tests_file	{}	both	0	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	VIOLATION	-	a *_tests.rs file is not scanned for failure-log sites
 swallow_outside_models	{}	both	0	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	VIOLATION	-	failure-log sites outside rmlx-models/src are out of this rule's scope
 decode_without_return_err	{}	both	1	'decode step failed' is not followed by 'return Err' within 8 lines.;;crates/rmlx-models/src/decode.rs;;FAIL: 1 failure site(s) swallow the error	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	-	a decode step that fails and breaks instead of returning Err is caught and named
 decode_returns_err	{}	both	0	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	VIOLATION	-	the same site returning Err passes
+decode_err_at_window_edge	{}	both	0	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	VIOLATION	-	a return Err on the last line the decode window reads passes
+decode_err_past_window	{}	both	1	crates/rmlx-models/src/decode.rs:6;;'decode step failed' is not followed by 'return Err';;FAIL: 1 failure site(s) swallow the error	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	-	a return Err one line past the window is not read
 decode_in_other_crate	{}	both	1	'decode step failed' is not followed by 'return Err' within 8 lines.;;crates/other/src/decode.rs;;FAIL: 1 failure site(s) swallow the error	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	-	the decode rule scans every crate, not only rmlx-models
 decode_in_tests_file	{}	both	0	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	VIOLATION	-	a *_tests.rs file is not scanned for the decode message
 sweep_captures_cause	{}	both	0	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	VIOLATION	-	a site that captures the cause and lets the post-loop sweep run passes
 sweep_closure_swept	{}	both	0	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	VIOLATION	-	a return Err inside the run_chunks closure, with the sweep right after the call, passes
+sweep_capture_and_return	{}	both	1	crates/rmlx-models/src/decode_loop.rs:4;;does not capture the cause ('= Some(e)');;closure (let mut run_chunks = |...| { ... };) is missing.;;FAIL: 1 failure site(s) swallow the error	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	-	a site that captures the cause and also returns Err does not keep the capture form and has no closure to hold it
+sweep_site_before_closure	{}	both	1	crates/rmlx-models/src/decode_loop.rs:3;;is outside the 'run_chunks' closure;;(lines 6-8);;FAIL: 1 failure site(s) swallow the error	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	-	a site above the closure is outside it, not inside
+sweep_nested_close	{}	both	0	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	VIOLATION	-	a closure inside the run_chunks closure closes at its own indent and does not end the outer body early
 sweep_return_outside_closure	{}	both	1	is outside the 'run_chunks' closure;;crates/rmlx-models/src/decode_loop.rs;;FAIL: 1 failure site(s) swallow the error	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	-	a return Err outside the closure skips the sweep for the caches left in prefill
 sweep_closure_missing	{}	both	1	does not capture the cause ('= Some(e)');;closure (let mut run_chunks = |...| { ... };) is missing.;;FAIL: 1 failure site(s) swallow the error	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	-	no cause captured and no run_chunks closure to hold the site is caught
 sweep_closure_no_return	{}	both	1	inside 'run_chunks' does not 'return Err'.;;crates/rmlx-models/src/decode_loop.rs;;FAIL: 1 failure site(s) swallow the error	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	-	a site inside the closure that does not return Err is caught
 sweep_after_call_missing	{}	both	1	the exit_prefill sweep does not;;crates/rmlx-models/src/decode_loop.rs;;FAIL: 1 failure site(s) swallow the error	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	-	reading the closure's result with ? before the sweep is caught
 sweep_second_anchor	{}	both	1	is outside the 'run_chunks' closure;;FAIL: 1 failure site(s) swallow the error	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	-	the cache-eval failure site owes the sweep like the chunk site
 sweep_other_file	{}	both	0	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	VIOLATION	-	only the shared decode_loop.rs owes the sweep; a per-arch copy that never enters prefill returns inline
+sweep_loop_suffix_file	{}	both	0	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	VIOLATION	-	only the file named decode_loop.rs owes the sweep: another file whose name ends in loop.rs does not
 nan_dropped	{}	both	1	NaN is counted here and never propagated.;;crates/rmlx-models/src/nan_site.rs;;FAIL: 1 failure site(s) swallow the error	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	-	a counted NaN that is neither raised nor returned is caught and named
+detector_definition_not_counted	{}	both	0	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	VIOLATION	-	the definition of the detector is not a call site and does not move the pinned count
+guard_definitions_not_counted	{}	both	0	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	VIOLATION	-	the definitions of the three guards are not call sites and do not move the pinned count
 nan_emit_before_propagation	{}	both	1	the token is emitted BEFORE the NaN is propagated.;;crates/rmlx-models/src/nan_site.rs;;FAIL: 1 failure site(s) swallow the error	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	-	erring after step_fn has shipped the token is still the original bug
-nan_step_fn_field_init	{}	both	0	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	VIOLATION	-	a bare step_fn field initialiser is not a call and does not count as an emit
+nan_guard_at_window_edge	{}	both	0	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	VIOLATION	-	a return Err on the last line the NaN window reads passes
+nan_guard_past_window	{}	both	1	crates/rmlx-models/src/nan_site.rs:2;;NaN is counted here and never propagated.;;FAIL: 1 failure site(s) swallow the error	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	-	a return Err one line past the NaN window is not read
+nan_step_fn_field_init	{}	both	0	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	VIOLATION	-	a bare step_fn field initialiser between the detector and the guard is not a call and does not count as an emit
 nan_detector_floor	{}	both	1	NaN detector call sites = 10, expected 11.	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	-	a detector site that disappears is caught by the pinned count, not by the per-site rule
 nan_guard_floor	{}	both	1	NaN guard call sites = 16, expected 17.	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	-	a prefill path that stops calling the guard is caught by the pinned count
+nan_detector_above_pin	{}	both	1	NaN detector call sites = 12, expected 11.	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;;;NaN guard call sites	-	a detector site that appears is caught by the pinned count: the pin is exact, not a floor
+nan_guard_above_pin	{}	both	1	NaN guard call sites = 18, expected 17.	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;;;NaN detector call sites	-	a guard call site that appears is caught by the pinned count: the pin is exact, not a floor
 empty_root	{}	both	1	NaN detector call sites = 0, expected 11.	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	-	a root with nothing to scan fails on the pinned counts instead of passing
 missing_root	{}/absent	both	2	check_no_decode_swallow: no scan root at	OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;	-	a root that is no directory is refused, not scanned as the working directory
