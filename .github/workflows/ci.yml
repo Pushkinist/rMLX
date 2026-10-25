@@ -54,6 +54,15 @@ jobs:
       # recall in both directions — violations caught, legitimate shapes left be.
       - name: the #[ignore] gate still catches what it is for
         run: make check-gpu-tests-ignored-fixtures
+      # A classified GPU test that stands down says `SKIP <test>: <why>`, and the runner
+      # can attribute only a notice that names its test; a guard that stands a cell down
+      # and says nothing is counted as a pass. Static, over the same classification.
+      - name: a GPU test that stands down names itself
+        run: make check-named-skip-notices
+      # ...and that gate is a text scan too, so planted workspaces pin each of its rules
+      # and each of its refusals, on this job's awk.
+      - name: the stand-down gate still catches what it is for
+        run: make check-named-skip-notices-fixtures
       # The runner those tests execute under accumulates shader-validation
       # diagnostics and crate failures independently, and both have to reach the
       # operator in the same run — while any diagnostic stands, reporting one and
