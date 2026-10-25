@@ -209,7 +209,7 @@ SCAN_CORE='
       {
         code = view($0)
         if (index(code, "RoundTotals {") > 0) { has_stats = 1 }
-        if (index(code, "RoundCfg {") > 0 || index(code, "RoundCfg::") > 0) { makes_cfg = 1 }
+        if (index(code, "RoundCfg {") > 0) { makes_cfg = 1 }
         if (index(code, "rollback_round(") > 0 && code !~ /fn[[:space:]]+rollback_round\(/) { has_roll = 1 }
         if (!hook_line(code)) {
           depth += gsub(/\{/, "{", code) - gsub(/\}/, "}", code)
@@ -360,6 +360,9 @@ CHARGE_HOOKS='
         in_call = 0; args = ""
       }
       function hook_line(code,   arg, tok, rest, arm) {
+        # An entry may build its configuration through a constructor as well as a literal;
+        # the sampling rules read the literal alone, because they look inside it.
+        if (index(code, "RoundCfg::") > 0) { makes_cfg = 1 }
         if (in_call) {
           if (code ~ /^[[:space:]]*\)/) {
             close_call()
