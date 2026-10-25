@@ -2,7 +2,7 @@
 # Recall test for the Rust-source gates: planted scan roots from a table, asserting exit and reason.
 #
 # Recall test for: check_eval_lock.sh
-#                  check_gpu_tests_ignored.sh
+#                  check/gpu_tests.sh ignored
 #                  check/kernel_dispatch.sh input-eval dtype-contract scalar-f32
 #                  check_kv_layer_quants.sh
 #                  check_no_decode_swallow.sh
@@ -24,8 +24,9 @@
 # when B appears after the first A, for output whose order is part of the contract.
 #
 # A gate that takes a mode word gets the mode of its table. A first word "!name" in args
-# replaces it ("!bogus --root {}" runs an unknown mode, "! --root {}" runs none), for the
-# rows that prove the refusal of a mode.
+# replaces it ("!bogus --root {}" runs an unknown mode, "! --root {}" runs none, "!list
+# --root {}" runs a sibling mode of the same gate), for the rows that prove the refusal of a
+# mode and the rows that read another mode's output.
 #
 # Usage:  bash scripts/check/rust_gates_fixtures.sh <mode>
 #         mode: eval_lock | gpu_tests_ignored | kernel_dtype_contract | no_kernel_input_eval |
@@ -45,7 +46,10 @@ MODE="${1:-}"
 GATE_MODE=""
 case "$MODE" in
 eval_lock) GATE="$REPO_ROOT/scripts/check_eval_lock.sh" ;;
-gpu_tests_ignored) GATE="$REPO_ROOT/scripts/check_gpu_tests_ignored.sh" ;;
+gpu_tests_ignored)
+    GATE="$REPO_ROOT/scripts/check/gpu_tests.sh"
+    GATE_MODE=ignored
+    ;;
 kernel_dtype_contract)
     GATE="$REPO_ROOT/scripts/check/kernel_dispatch.sh"
     GATE_MODE=dtype-contract

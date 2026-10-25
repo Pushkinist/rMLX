@@ -74,7 +74,7 @@ new_case() {
     CASE="$1"
     CASE_ROOT="${WORK}/$1"
     local root="${CASE_ROOT}"
-    mkdir -p "${root}/scripts/lib" "${root}/bin" "${root}/logs" || return 1
+    mkdir -p "${root}/scripts/lib" "${root}/scripts/check" "${root}/bin" "${root}/logs" || return 1
     cp "${RUNNER}" "${root}/scripts/run_gpu_tests.sh" || return 1
     # Symlinked, not copied: the runner reads the stand-down notice's shape from
     # this file and so does the source gate, and a fixture carrying its own copy
@@ -88,7 +88,7 @@ new_case() {
     printf '# kernel | kind | count | crate | test | reference\n' \
         >"${root}/scripts/gpu_validation_census.txt"
 
-    cat >"${root}/scripts/check_gpu_tests_ignored.sh" <<STUB
+    cat >"${root}/scripts/check/gpu_tests.sh" <<STUB
 #!/usr/bin/env bash
 cat "${root}/classified"
 STUB
@@ -1085,7 +1085,7 @@ expect_report "not pinned: 4 device load \"${CENSUS_KERNEL}\" in rmlx-kv-quant"
 # skipped here, which is what proves the file parsed into entries at all.
 new_case tracked_census_pin || exit 1
 cp "${ROOT}/scripts/gpu_validation_census.txt" "${CASE_ROOT}/scripts/gpu_validation_census.txt" || exit 1
-bash "${ROOT}/scripts/check_gpu_tests_ignored.sh" --list >"${CASE_ROOT}/classified" || exit 1
+bash "${ROOT}/scripts/check/gpu_tests.sh" list >"${CASE_ROOT}/classified" || exit 1
 while IFS= read -r tracked_crate; do
     [ -n "${tracked_crate}" ] || continue
     {

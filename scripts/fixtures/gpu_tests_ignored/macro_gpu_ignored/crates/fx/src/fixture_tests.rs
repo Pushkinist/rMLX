@@ -1,6 +1,6 @@
 // Negative control: the compliant shape must NOT fire. The plain test below
 // it pins the other half of the decision — a macro cell is enforced but stays
-// out of `--list`, while a normal GPU test still goes in.
+// out of `list`, while a normal GPU test still goes in.
 
 macro_rules! gpu_cell {
     ($name:ident, $n:expr) => {

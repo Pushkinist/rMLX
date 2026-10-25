@@ -1,0 +1,6 @@
+# Synthetic workspace for scripts/check/rust_gates_fixtures.sh.
+# Never built — the listed member has a manifest and no src/.
+[workspace]
+members = [
+    "crates/fx",
+]

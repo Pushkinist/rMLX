@@ -6,8 +6,8 @@
 #
 #   * `scripts/run_gpu_tests.sh` reads it out of a libtest log, to list the cell
 #     and to drop its count from the shader-validation census expectation.
-#   * `scripts/check_named_skip_notices.sh` reads it out of the source, to fail
-#     the build on a notice that names no test.
+#   * `scripts/check/gpu_tests.sh skip-notices` reads it out of the source, to
+#     fail the build on a notice that names no test.
 #
 # A difference between the two is invisible in both directions and worse than
 # either being wrong alone: a notice the source gate calls attributed and the

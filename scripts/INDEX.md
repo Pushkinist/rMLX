@@ -19,7 +19,6 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `check_eval_lock.sh` | make check-eval-lock, make ci, check/rust_gates_fixtures.sh | CI gate: every MLX FFI call that can evaluate runs under the process-wide evaluation lock. |
 | `check_gpu_device_census.sh` | make check-gpu-device-census, make check-gpu-device-census-library, make ci, check_gpu_device_census_selftest.sh | CI gate: the rmlx binary's source names Device::Gpu in exactly one place, claim_gpu. |
 | `check_gpu_device_census_selftest.sh` | make check-gpu-device-census-selftest, make ci | Recall test for check_gpu_device_census.sh: scan roots, asserting exit code and file:line. |
-| `check_gpu_tests_ignored.sh` | make check-gpu-tests-ignored, make ci, check/rust_gates_fixtures.sh, check_named_skip_notices.sh, gpu_test_halves.sh, +3 more scripts | CI gate: every test that reaches Device::Gpu, in any workspace crate, carries #[ignore]. |
 | `check_kv_boundary_default_parity.sh` | make check-kv-boundary-default-parity, make ci | CI gate: every surface naming the default KV boundary-layer counts agrees with the engine's pair. |
 | `check_kv_byte_model_parity.sh` | make check-kv-byte-model-parity, make ci, check_kv_byte_model_parity_fixtures.sh | CI gate: the KV byte model in perf_ceiling.py agrees byte for byte with the engine's. |
 | `check_kv_byte_model_parity_fixtures.sh` | make check-kv-byte-model-parity-fixtures, make ci | Recall test for check_kv_byte_model_parity.sh: one edited manifest per case, asserting the check. |
@@ -28,8 +27,6 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `check_kv_layer_quants.sh` | make check-kv-layer-quants, make ci, check/rust_gates_fixtures.sh | CI gate: the per-layer KV codec vector has one producer, and every cache stack uses it. |
 | `check_metal_compiles.sh` | make check-metal-compiles, make ci | CI gate: every .metal kernel compiles at -std=metal3.1 and metal4.0 and is named by its manifest. |
 | `check_metal_format.sh` | make check-metal-format, make ci, pre-commit | CI gate: every .metal kernel file is clang-format clean. |
-| `check_named_skip_notices.sh` | make check-named-skip-notices, make ci, check_named_skip_notices_fixtures.sh | CI gate: every classified GPU test that announces its own stand-down names itself in the notice. |
-| `check_named_skip_notices_fixtures.sh` | make check-named-skip-notices-fixtures, make ci | Recall test for check_named_skip_notices.sh: planted notice shapes, asserting the reason. |
 | `check_no_decode_swallow.sh` | make check-no-decode-swallow, make ci, check/rust_gates_fixtures.sh | CI gate: a failed decode step or prefill chunk propagates instead of looking like a success. |
 | `check_no_inline_tests.sh` | make check-no-inline-tests, make ci, check/rust_gates_fixtures.sh | CI gate: no inline #[cfg(test)] mod tests block in a non-test source file. |
 | `check_published_samples_fixtures.sh` | make check-published-samples-fixtures, make ci | Recall test for published_samples.py verify: synthetic sample-set roots, one edit per case. |
@@ -93,6 +90,8 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 |---|---|---|
 | `check/doc_refs.py` | make check-doc-refs, make check-doc-source-citations, make ci, check/doc_refs_selftest.sh | References into docs/ resolve and no edit re-points one; --source-paths: cited crates/ files exist. |
 | `check/doc_refs_selftest.sh` | make check-doc-refs-selftest, make ci | Recall test for doc_refs.py: synthetic git repos, asserting exit code and reason. |
+| `check/gpu_tests.sh` | make check-gpu-tests-ignored, make check-named-skip-notices, make ci, check/gpu_tests_selftest.sh, check/rust_gates_fixtures.sh, gpu_test_halves.sh, +3 more scripts | CI gate: the classified GPU tests carry #[ignore] and name their stand-downs; one tool lists them. |
+| `check/gpu_tests_selftest.sh` | make check-named-skip-notices-fixtures, make ci | Recall test for check/gpu_tests.sh skip-notices and list: planted shapes, asserting the reason. |
 | `check/kernel_dispatch.sh` | make check-kernel-dtype-contract, make check-no-kernel-input-eval, make check-no-scalar-f32-leak, make ci, check/rust_gates_fixtures.sh | CI gate: Metal-kernel dispatchers keep inputs lazy, return the caller's dtype, leak no f32 scalar. |
 | `check/rust_gates_fixtures.sh` | make check-eval-lock-fixtures, make check-gpu-tests-ignored-fixtures, make check-kernel-dtype-contract-fixtures, make check-kv-layer-quants-fixtures, make check-no-decode-swallow-fixtures, make check-no-inline-tests-fixtures, make check-no-kernel-input-eval-fixtures, make check-no-scalar-f32-leak-fixtures, make ci | Recall test for the Rust-source gates: planted scan roots from a table, asserting exit and reason. |
 | `check/spec_round_loops.sh` | make check-spec-charge, make check-spec-sampling, make ci, check/spec_round_loops_selftest.sh, report/debt_report.py | CI gate: speculative round loops carry one phase-charge decision and the request's sampler. |
@@ -120,7 +119,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
-| `lib/awk_text.sh` | crates/rmlx-models/tests/common/stop_scan.rs, check/kernel_dispatch.sh, check/spec_round_loops.sh, check_gpu_device_census.sh, +2 more scripts | Line readers for Rust-scanning gates: code without comments, without string bodies, bodiless fns. |
+| `lib/awk_text.sh` | crates/rmlx-models/tests/common/stop_scan.rs, check/gpu_tests.sh, check/kernel_dispatch.sh, check/spec_round_loops.sh, +2 more scripts | Line readers for Rust-scanning gates: code without comments, without string bodies, bodiless fns. |
 | `lib/bench_server.sh` | perf_canary.sh, spec_bench.sh, spec_bench_published.sh | Start, wait for and identify one rmlx server, for bench harnesses; source it. |
 | `lib/binary_identity.py` | spec_bench_published.sh | Say which binary a bench run measured, and prove it can produce the readings. |
 | `lib/busiest_between.awk` | bench_llama_ab.sh, perf_ab.sh, perf_ab_selftest.sh, +2 more scripts | Which process burned the most CPU between two cpu_snapshot files. |
@@ -139,11 +138,11 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `lib/published_run_log.py` | lib/binary_identity.py, lib/prefill_ms.py, lib/published_greedy.py, +1 more scripts | Read one rmlx run log back as a per-request table. |
 | `lib/published_table.py` | make check-published-table, make published-table, published_table_selftest.sh | Render published-protocol runs as the Markdown table a post needs. |
 | `lib/run_log_for_pid.py` | lib/bench_server.sh | Pick the run log a given process wrote, out of the candidates on stdin. |
-| `lib/selftest_support.sh` | bench_llama_ab_selftest.sh, check/rust_gates_fixtures.sh, check/spec_round_loops_selftest.sh, +11 more scripts | The case runner and shims the self-tests share; source it. |
+| `lib/selftest_support.sh` | bench_llama_ab_selftest.sh, check/gpu_tests_selftest.sh, check/rust_gates_fixtures.sh, +12 more scripts | The case runner and shims the self-tests share; source it. |
 | `lib/server_decode_tps.py` | perf-iter/bench_decode_tps.sh, spec_bench.sh | Read one request's decode rate off a running rmlx server. |
 | `lib/server_kv_quant.py` | lib/bench_server.sh, lib/binary_identity.py, perf_canary.sh, +1 more scripts | Read the KV codec a run resolved out of its rmlx run log. |
 | `lib/server_sampling.py` | crates/rmlx-server/src/engine/sampler_event_tests.rs, lib/published_run_log.py, spec_bench.sh | Read whether a run's requests were sampled, out of its rmlx run log. |
-| `lib/skip_notice_patterns.sh` | check_named_skip_notices.sh, run_gpu_tests.sh | The SKIP and WAIVED stand-down notice patterns, defined once for the runner and the gate. |
+| `lib/skip_notice_patterns.sh` | check/gpu_tests.sh, run_gpu_tests.sh | The SKIP and WAIVED stand-down notice patterns, defined once for the runner and the gate. |
 | `lib/snapshot_identity.py` | ingest/codec_inertness_ingest.py, ingest/llama_bench_ingest.py, lib/published_table.py, +2 more scripts | Read a model snapshot's identity columns out of the snapshot itself. |
 | `lib/snapshot_sampling.py` | spec_bench_published.sh | Read the sampling defaults a snapshot states, for a run that sends none. |
 | `lib/spec_round_log.py` | lib/binary_identity.py, lib/published_run_log.py, spec_bench.sh | Read a speculative round loop's own numbers back out of an rmlx run log. |

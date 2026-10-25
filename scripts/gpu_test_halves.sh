@@ -197,9 +197,9 @@ while IFS=$'\t' read -r pkg dir; do
     esac
 done <<< "${member_dirs}"
 
-listing="$(bash "${REPO_ROOT}/scripts/check_gpu_tests_ignored.sh" --list-files --root "${ROOT}" 2>/dev/null)"
+listing="$(bash "${REPO_ROOT}/scripts/check/gpu_tests.sh" list --files --root "${ROOT}" 2>/dev/null)"
 if [ -z "${listing}" ]; then
-    echo "ERROR: check_gpu_tests_ignored.sh --list-files produced no GPU tests for ${ROOT}." >&2
+    echo "ERROR: check/gpu_tests.sh list --files produced no GPU tests for ${ROOT}." >&2
     exit 2
 fi
 

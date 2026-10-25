@@ -22,7 +22,6 @@ class bench_llama_ab_selftest.sh
 class check_eval_lock.sh
 class check_gpu_device_census.sh
 class check_gpu_device_census_selftest.sh
-class check_gpu_tests_ignored.sh
 class check_kv_boundary_default_parity.sh
 class check_kv_byte_model_parity.sh
 class check_kv_byte_model_parity_fixtures.sh
@@ -31,8 +30,6 @@ class check_kv_codec_disposition_fixtures.sh
 class check_kv_layer_quants.sh
 class check_metal_compiles.sh
 class check_metal_format.sh
-class check_named_skip_notices.sh
-class check_named_skip_notices_fixtures.sh
 class check_no_decode_swallow.sh
 class check_no_inline_tests.sh
 class check_published_samples_fixtures.sh
@@ -102,7 +99,6 @@ usage bench_llama_ab.sh
 usage bench_llama_ab_selftest.sh
 usage check_eval_lock.sh
 usage check_gpu_device_census_selftest.sh
-usage check_gpu_tests_ignored.sh
 usage check_kv_boundary_default_parity.sh
 usage check_kv_byte_model_parity.sh
 usage check_kv_byte_model_parity_fixtures.sh
@@ -110,8 +106,6 @@ usage check_kv_codec_disposition.sh
 usage check_kv_codec_disposition_fixtures.sh
 usage check_metal_compiles.sh
 usage check_metal_format.sh
-usage check_named_skip_notices.sh
-usage check_named_skip_notices_fixtures.sh
 usage check_published_samples_fixtures.sh
 usage check_spec_metric_parity.sh
 usage check_spec_metric_parity_fixtures.sh
@@ -175,7 +169,6 @@ exit-undeclared bench_llama_ab.sh 0,125
 exit-undeclared bench_llama_ab_selftest.sh 1
 exit-undeclared check_eval_lock.sh 1
 exit-undeclared check_gpu_device_census.sh 2
-exit-undeclared check_gpu_tests_ignored.sh 0,1
 exit-undeclared check_kv_boundary_default_parity.sh 1,2
 exit-undeclared check_kv_byte_model_parity.sh 1,2
 exit-undeclared check_kv_byte_model_parity_fixtures.sh 1,2
@@ -183,8 +176,6 @@ exit-undeclared check_kv_codec_disposition.sh 1,2
 exit-undeclared check_kv_codec_disposition_fixtures.sh 1
 exit-undeclared check_metal_compiles.sh 0,1,2
 exit-undeclared check_metal_format.sh 0,1,2
-exit-undeclared check_named_skip_notices.sh 1,2
-exit-undeclared check_named_skip_notices_fixtures.sh 1
 exit-undeclared check_published_samples_fixtures.sh 1
 exit-undeclared check_spec_metric_parity.sh 2
 exit-undeclared check_spec_metric_parity_fixtures.sh 1
@@ -308,7 +299,6 @@ set-mode check_gpu_device_census.sh
 set-mode check_kv_byte_model_parity.sh
 set-mode check_kv_codec_disposition.sh
 set-mode check_metal_compiles.sh
-set-mode check_named_skip_notices.sh
 set-mode codec_smoke_runner_selftest.sh
 set-mode gpu_capture.sh
 set-mode gpu_test_halves.sh
@@ -338,7 +328,6 @@ name bench-records-sweep.sh RMLX_DIR,hyphen
 name bench_cache_types.sh RMLX_DIR
 name bench_llama_ab_selftest.sh ROOT
 name check_kv_codec_disposition_fixtures.sh ROOT
-name check_named_skip_notices.sh ROOT
 name eval/wikitext2_ppl.py workspace
 name lib/kv_boundary_default.py _REPO_ROOT
 name parity/jina_v4_parity.py _ROOT
@@ -347,7 +336,6 @@ name perf_ab_selftest.sh ROOT
 name rmlx-capture.entitlements hyphen
 name run_gpu_tests_selftest.sh ROOT
 name spec_broken_engine.sh ROOT
-size check_gpu_tests_ignored.sh 1143
 size perf_ab.sh 1031
 size perf_ceiling.py 1107
 size report/debt_report_selftest.sh 1598
@@ -373,7 +361,6 @@ heredoc spec_bench.sh 138
 heredoc spec_bench_published.sh 56
 heredoc spec_bench_published_selftest.sh 34,23
 heredoc ssd_canary.sh 65,49,38
-twin check_named_skip_notices_fixtures.sh+run_gpu_tests_selftest.sh 47
 twin ingest/codec_inertness_ingest.py+ingest/llama_ab_ingest.py 66
 twin ingest/codec_inertness_ingest.py+ingest/perf_ab_ingest.py 76
 twin ingest/codec_inertness_ingest.py+ingest/published_ingest.py 53

@@ -19,7 +19,7 @@
 #   against cannot happen.
 #
 # WHICH TESTS
-#   Exactly the compliant set from `check_gpu_tests_ignored.sh --list` — the
+#   Exactly the compliant set from `check/gpu_tests.sh list` — the
 #   NAMED `#[test]` fns that reach `Device::Gpu` AND carry `#[ignore]`. Deriving
 #   the population from the enforcing gate's own classifier is the point: a
 #   second, hand-maintained list would drift, and the rule would end up
@@ -398,9 +398,9 @@ elif [ ! -d "${RMLX_O_MODELS_ROOT}" ]; then
     snapshot_root_note="RMLX_O_MODELS_ROOT='${RMLX_O_MODELS_ROOT}' does not exist — every snapshot-gated cell skipped and counted as passed"
 fi
 
-listing="$(bash "${REPO_ROOT}/scripts/check_gpu_tests_ignored.sh" --list)"
+listing="$(bash "${REPO_ROOT}/scripts/check/gpu_tests.sh" list)"
 if [ -z "${listing}" ]; then
-    echo "ERROR: check_gpu_tests_ignored.sh --list produced no GPU tests." >&2
+    echo "ERROR: check/gpu_tests.sh list produced no GPU tests." >&2
     exit 1
 fi
 

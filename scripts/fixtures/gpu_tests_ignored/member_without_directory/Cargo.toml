@@ -1,0 +1,6 @@
+# Synthetic workspace for scripts/check/rust_gates_fixtures.sh.
+# Never built — the one member it lists has no directory, as a crate that moved does not.
+[workspace]
+members = [
+    "crates/gone",
+]

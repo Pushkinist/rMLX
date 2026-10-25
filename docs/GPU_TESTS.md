@@ -41,7 +41,7 @@ each test still passes alone, so the rule is mechanical.
 returns before any device-parameterized op is not a GPU test: pass it
 `Device::Cpu` and leave it un-ignored, so the default gate keeps running it.
 
-`make check-gpu-tests-ignored` (`scripts/check_gpu_tests_ignored.sh`) enforces
+`make check-gpu-tests-ignored` (`scripts/check/gpu_tests.sh ignored`) enforces
 the rule. It runs in `make ci` and in the hosted `source gates` job. Its scope:
 
 - every workspace member, read from `Cargo.toml`;
@@ -117,10 +117,11 @@ and the marker beside `exempt`.
 | `serve_refuses_to_start_above_the_positional_capacity` | `crates/rmlx-cli/tests/serve_context_ceiling.rs` | spawned `rmlx serve` child | nothing; run by hand |
 | `paro_kernel_registration` | `crates/rmlx-models/src/paroquant_msl_tests.rs` | `paro_rotate_kernel()` in a non-scanned source file | the `paro_rotate_identity_roundtrip_*` cells in `make gpu-test` dispatch the same kernel |
 
-**Three populations.** `--list` is what `make gpu-test` executes. It is a
-strict subset of what the gate enforces, and every run prints the difference:
+**Three populations.** `scripts/check/gpu_tests.sh list` is what `make gpu-test`
+executes. It is a strict subset of what the gate enforces, and every run prints
+the difference:
 
-| population | `#[ignore]` enforced | in `--list` | why not listed |
+| population | `#[ignore]` enforced | in `list` | why not listed |
 |---|---|---|---|
 | `Device::Gpu` reachable | yes | yes | — |
 | macro-generated | yes, at the `macro_rules!` body | no | a cell has no name before expansion, so no libtest filter selects it |
@@ -192,7 +193,7 @@ make gpu-test HALF=codec                        # one half, see below
 make gpu-test VALIDATE=0                        # without shader validation
 ```
 
-It runs exactly the tests `check_gpu_tests_ignored.sh --list` names. It does
+It runs exactly the tests `check/gpu_tests.sh list` names. It does
 not run every `#[ignore]` test: many are ignored for network access, a missing
 feature or a doc example. Each name becomes a libtest substring filter, not
 `--exact`; an over-match runs a test twice and hides nothing.
@@ -239,7 +240,7 @@ has no exit code, so a developer without the weights is not blocked.
 `make ci-perf` prints `ci-perf INCOMPLETE` instead of `ci-perf ok` when the
 runner's output carries the word.
 
-`make check-named-skip-notices` (`scripts/check_named_skip_notices.sh`, in
+`make check-named-skip-notices` (`scripts/check/gpu_tests.sh skip-notices`, in
 `make ci`) enforces the notice at the source line, over the classified GPU
 tests:
 
@@ -282,8 +283,8 @@ the second and third rule. The three that hold a stand-down today are
 stand-down in them is held to `SKIP {test}:` by review.
 
 The notice's shape lives in `scripts/lib/skip_notice_patterns.sh`, which the
-gate and the runner both read. `make check-named-skip-notices-fixtures` is the
-gate's recall test.
+gate and the runner both read. `make check-named-skip-notices-fixtures`
+(`scripts/check/gpu_tests_selftest.sh`) is the gate's recall test.
 
 A cell that resolves through `common::slug_or_override`
 (`crates/rmlx-models/tests/common/mod.rs`) or `test_snapshot::snapshot`

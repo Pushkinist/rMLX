@@ -670,7 +670,7 @@ miri: ## run the MLX-thread hand-off tests under Miri (nightly toolchain with th
 	  2>&1 | tee /dev/stderr | grep '^test result: ok\. [1-9]' > /dev/null
 
 check-gpu-tests-ignored: ## CI gate: fail if a GPU-touching test in ANY workspace member lacks #[ignore] (would abort the whole test binary under parallel cargo test)
-	@bash scripts/check_gpu_tests_ignored.sh
+	@bash scripts/check/gpu_tests.sh ignored
 
 check-gpu-tests-ignored-fixtures: ## CI gate: the #[ignore] gate still fires on macro-generated and helper-reached GPU tests
 	@bash scripts/check/rust_gates_fixtures.sh gpu_tests_ignored
@@ -679,10 +679,10 @@ gpu-runner-selftest: ## CI gate: the GPU runner reports a failing test and a sha
 	@bash scripts/run_gpu_tests_selftest.sh
 
 check-named-skip-notices: ## CI gate: a classified GPU test that announces its own stand-down names itself, so the runner can attribute it
-	@bash scripts/check_named_skip_notices.sh
+	@bash scripts/check/gpu_tests.sh skip-notices
 
-check-named-skip-notices-fixtures: ## CI gate: recall test for the above, 44 cases, each asserting the reason as well as the exit code
-	@bash scripts/check_named_skip_notices_fixtures.sh
+check-named-skip-notices-fixtures: ## CI gate: recall test for the above and for the classified-test listing, 71 cases, each asserting the reason as well as the exit code
+	@bash scripts/check/gpu_tests_selftest.sh
 
 check-no-kernel-input-eval: ## CI gate: fail if a Metal-kernel dispatcher blocks on Array::eval() (serialises host vs GPU once per layer per decode step)
 	@bash scripts/check/kernel_dispatch.sh input-eval
@@ -765,11 +765,11 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check/rust_gates_fixtures.sh no_decode_swallow
 	@bash scripts/check_eval_lock.sh
 	@bash scripts/check/rust_gates_fixtures.sh eval_lock
-	@bash scripts/check_gpu_tests_ignored.sh
+	@bash scripts/check/gpu_tests.sh ignored
 	@bash scripts/check/rust_gates_fixtures.sh gpu_tests_ignored
 	@bash scripts/run_gpu_tests_selftest.sh
-	@bash scripts/check_named_skip_notices.sh
-	@bash scripts/check_named_skip_notices_fixtures.sh
+	@bash scripts/check/gpu_tests.sh skip-notices
+	@bash scripts/check/gpu_tests_selftest.sh
 	@bash scripts/check/kernel_dispatch.sh input-eval
 	@bash scripts/check/rust_gates_fixtures.sh no_kernel_input_eval
 	@bash scripts/check_gpu_device_census.sh

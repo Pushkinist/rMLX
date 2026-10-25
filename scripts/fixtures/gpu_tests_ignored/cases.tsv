@@ -1,4 +1,4 @@
-# Planted workspaces for check_gpu_tests_ignored.sh: the failure reason, under each awk.
+# Planted workspaces for check/gpu_tests.sh ignored and list: the failure reason, under each awk.
 #
 # Columns, tab-separated, none empty ("-" for none): fixture (a directory beside this
 # table), args (gate arguments, "{}" is the fixture path), stream (both, out or err: the
@@ -87,17 +87,24 @@ metal_unscanned_and_exempt	--root {}	both	1	ERROR: this gate could not classify 
 metal_unscanned_stale	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;Device::Gpu is reachable here	-	-	a marker the scanner can check for itself is stale, not redundant
 metal_unscanned_declared	--root {}	both	0	OK: every GPU-touching test carries #[ignore] (1 files	ERROR	-	a declared route closes the fatal converse
 metal_unscanned_declared	--root {}	both	0	NOTE: declared-route GPU tests;;declared_metal_test	-	-	and the enforced-but-unlisted test is announced
+member_floor	--root {}	both	1	ERROR: parsed 1 workspace members but 2 crate dirs exist under crates/	OK:	-	a crate directory the members list does not name is a narrowed scan, refused
+no_manifest	--root {}	both	1	not found — cannot resolve workspace members	OK:	-	a root with no workspace manifest is refused, not scanned as empty
+no_members	--root {}	both	1	parsed 0 workspace members	OK:	-	a member list the parser reads as empty is refused
+member_without_directory	--root {}	both	1	member crate 'crates/gone' from Cargo.toml has no directory	OK:	-	a listed member that moved is a broken scan, not a narrowed one
+member_without_src	--root {}	both	1	does not exist — this gate is scanning nothing for 'crates/fx'	OK:	-	a listed member with no src/ scans nothing and says so
+member_without_name	--root {}	both	1	could not read [package] name from	OK:	-	a manifest that names no package is refused, since cargo is handed the name
+no_test_files	--root {}	both	1	matched 0 test files across 1 workspace members	OK:	-	a workspace with no test file to read is refused, not passed
 # The list/enforce split, pinned on a fixture that holds one of each. The macro
 # cell is GPU-touching and compliant, so it is enforced; only the plain test may
-# reach `--list`, because the runner turns a listed name into a libtest filter
+# reach `list`, because the runner turns a listed name into a libtest filter
 # and a `$metavar` matches no test. Asserting the exact stdout is what stops the
 # split from silently becoming "macro cells are listed" (which under-matches in
 # the runner) or "plain tests are dropped" (which stops running them).
-macro_gpu_ignored	--list --root {}	out	0	-	-	fx\tplain_gpu_test	--list — macro cell enforced but not listed; plain test listed
+macro_gpu_ignored	!list --root {}	out	0	-	-	fx\tplain_gpu_test	list — macro cell enforced but not listed; plain test listed
 # The same run must still ANNOUNCE the excluded macro cells. `make gpu-test`
-# calls only `--list`, so a note printed exclusively by the enforcing path is
+# calls only `list`, so a note printed exclusively by the enforcing path is
 # invisible to the one operator who needs it.
-macro_gpu_ignored	--list --root {}	err	0	NOTE: macro-generated GPU tests;>fixture_tests.rs: gpu_cell!{$name}	-	-	--list — the excluded macro cells are announced on stderr, after the note that says why
+macro_gpu_ignored	!list --root {}	err	0	NOTE: macro-generated GPU tests;>fixture_tests.rs: gpu_cell!{$name}	-	-	list — the excluded macro cells are announced on stderr, after the note that says why
 # The same split for the declared-route marker, and for the same reason: the
 # runner turns a listed name into a libtest filter and executes it, and every
 # declared test is snapshot-gated or drives a child process, so listing one
@@ -105,18 +112,18 @@ macro_gpu_ignored	--list --root {}	err	0	NOTE: macro-generated GPU tests;>fixtur
 # crate, and fail the suite over a missing model. Asserting the exact stdout is
 # what stops "declared tests are enforced but unlisted" from quietly becoming
 # either "declared tests are listed" or "plain tests were dropped too".
-metal_unscanned_declared	--list --root {}	out	0	-	-	fx\tplain_gpu_test	--list — declared test enforced but not listed; plain test listed
-# `--list` must refuse an undeclared Metal-claiming #[ignore] exactly as the
-# enforcing path does. `make gpu-test` calls only `--list`, so a check that
+metal_unscanned_declared	!list --root {}	out	0	-	-	fx\tplain_gpu_test	list — declared test enforced but not listed; plain test listed
+# `list` must refuse an undeclared Metal-claiming #[ignore] exactly as the
+# enforcing path does. `make gpu-test` calls only `list`, so a check that
 # fires in one mode and not the other leaves the whole GPU suite running over a
 # tree the gate has already judged incomplete.
 #
 # The exit code alone would not assert it: with the check removed the fixture
-# classifies no GPU test at all, so `--list` still exits 1 on its own
+# classifies no GPU test at all, so `list` still exits 1 on its own
 # refuse-to-emit-an-empty-list path. The REASON is what pins this.
-ignore_metal_undeclared	--list --root {}	both	1	ERROR: #[ignore] claims a Metal context	-	-	--list — refuses an undeclared Metal-claiming #[ignore] too
-# The reasonless-#[ignore] rule refuses `--list` too, for the reason above; and
-# the GPU form of the same cell is what `--list` hands the runner, which is the
+ignore_metal_undeclared	!list --root {}	both	1	ERROR: #[ignore] claims a Metal context	-	-	list — refuses an undeclared Metal-claiming #[ignore] too
+# The reasonless-#[ignore] rule refuses `list` too, for the reason above; and
+# the GPU form of the same cell is what `list` hands the runner, which is the
 # disposition that puts it under a gate.
-ignore_bare_env_gated	--list --root {}	both	1	ERROR: #[ignore] with no reason on an environment-gated test	-	-	--list — refuses a reasonless environment-gated #[ignore] too
-ignore_bare_env_gated_dispositioned	--list --root {}	out	0	-	-	fx\tenv_gated_gpu_cell	--list — the GPU form of the cell is listed; the others are not
+ignore_bare_env_gated	!list --root {}	both	1	ERROR: #[ignore] with no reason on an environment-gated test	-	-	list — refuses a reasonless environment-gated #[ignore] too
+ignore_bare_env_gated_dispositioned	!list --root {}	out	0	-	-	fx\tenv_gated_gpu_cell	list — the GPU form of the cell is listed; the others are not
