@@ -1037,6 +1037,7 @@ classify_root() {
         echo "ERROR: ${CARGO_TOML} not found — cannot resolve workspace members." >&2
         exit "$FAIL_RC"
     fi
+    [ -r "${CARGO_TOML}" ] || refuse "cannot read ${CARGO_TOML}."
 
     # Read `[workspace] members = [ ... ]` — the single source of the crate list.
     # Never hard-code a crate root: a moved/renamed crate must surface as a
@@ -1049,6 +1050,9 @@ classify_root() {
     # below (parsed members vs. crate dirs on disk) guards against exactly that.
     members=()
     while IFS= read -r m; do
+        # `./crates/fa` and `crates/fa/` are the member `crates/fa`; every later path is built from it.
+        while [ "${m#./}" != "$m" ]; do m="${m#./}"; done
+        while [ "${m%/}" != "$m" ]; do m="${m%/}"; done
         [ -n "$m" ] && members+=("$m")
     done < <(awk '
         /^[[:space:]]*members[[:space:]]*=[[:space:]]*\[/ { inm = 1; next }
@@ -1078,7 +1082,8 @@ classify_root() {
     if [ -d "${SCAN_ROOT}/crates" ]; then
         list_into_scan "the member manifests under ${SCAN_ROOT}/crates" "${SCAN_ROOT}/crates" \
             -mindepth 2 -maxdepth 2 -name Cargo.toml -not -path "*/target/*" -print
-        disk_crates=$(wc -l <"${SCAN_LIST}" | tr -d ' ')
+        disk_crates=$(wc -l <"${SCAN_LIST}" | tr -d ' ') ||
+            refuse "could not count the member manifests listed in ${SCAN_LIST}."
     fi
     if [ "${#members[@]}" -lt "${disk_crates}" ]; then
         echo "ERROR: parsed ${#members[@]} workspace members but ${disk_crates} crate dirs exist under crates/." >&2
@@ -1361,7 +1366,7 @@ mode_skip_notices() {
     list_into_scan "the test-bearing sources under ${SCAN_ROOT}/crates" "${SCAN_ROOT}/crates" \
         \( -path '*/src/*_tests.rs' -o -path '*/src/*/tests.rs' -o -path '*/src/tests.rs' \
            -o -path '*/tests/*.rs' \) -type f
-    files="$(sort "${SCAN_LIST}")"
+    files="$(sort "${SCAN_LIST}")" || refuse "could not sort the test-bearing sources listed in ${SCAN_LIST}."
     if [ -z "${files}" ]; then
         refuse "no test-bearing sources found under ${SCAN_ROOT}/crates."
     fi

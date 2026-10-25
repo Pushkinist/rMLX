@@ -1100,6 +1100,31 @@ fn gpu_alpha() {
 RS
 check_case 0
 
+# A member spelled with a trailing slash or a ./ prefix is the same member. The path the classifier
+# reports carries neither, so the file a notice is matched to is the file the scan finds.
+for spelled in 'trailing_slash:crates/fb/' 'dot_prefix:./crates/fb'; do
+    tag="${spelled%%:*}"
+    workspace "member_with_a_${tag}" fb
+    printf '[workspace]\nmembers = [\n    "%s",\n]\n' "${spelled#*:}" >"$CASE_ROOT/Cargo.toml"
+    source_file fb src/alpha_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    let device = Device::Gpu;
+    eprintln!("SKIP: no snapshot");
+}
+RS
+    st_case "member_with_a_${tag}_has_its_notice_attributed" 1 \
+        --has "fb/src/alpha_tests.rs:5 — fb gpu_alpha names no test" \
+        -- bash "$TOOL" skip-notices --root "$CASE_ROOT"
+    st_case "member_with_a_${tag}_lists_one_slash" 0 \
+        --is "$(printf 'fb\tgpu_alpha\t%s' "$CASE_ROOT/crates/fb/src/alpha_tests.rs")" \
+        -- bash "$TOOL" list --files --root "$CASE_ROOT"
+    st_case "member_with_a_${tag}_agrees_with_the_plain_spelling" 0 \
+        --is "OK: every GPU-touching test carries #[ignore] (1 files across 1 workspace members)." \
+        -- bash "$TOOL" ignored --root "$CASE_ROOT"
+done
+
 # ---------------------------------------------------------------------------
 # A scan that cannot read is a refusal that names what it could not read, never a tree with
 # no findings. Each case below makes a path unreadable for its run and puts it back; a user
@@ -1217,22 +1242,35 @@ unreadable "$CASE_ROOT/crates/zz" skip_notices_refuses_a_crates_directory_it_can
     --has "could not list the member manifests under" \
     -- bash "$TOOL" skip-notices --root "$CASE_ROOT"
 
-# An awk that fails reaches the verdict. The awk that stands in for the real one fails when its
-# program holds a marker only one scan has, and otherwise is the real awk, so the rest of the
-# run is untouched. Without the check, a program that one awk cannot compile switches its rule
-# off and the mode passes.
+# The workspace manifest is read by an awk too, so an unreadable one is refused before it, naming it.
+workspace an_unreadable_workspace_manifest_is_refused
+gpu_test 'eprintln!("SKIP gpu_alpha: no snapshot");'
+unreadable "$CASE_ROOT/Cargo.toml" list_refuses_an_unreadable_workspace_manifest 1 \
+    --has "cannot read $CASE_ROOT/Cargo.toml" \
+    -- bash "$TOOL" list --root "$CASE_ROOT"
+unreadable "$CASE_ROOT/Cargo.toml" ignored_refuses_an_unreadable_workspace_manifest 1 \
+    --has "cannot read $CASE_ROOT/Cargo.toml" \
+    -- bash "$TOOL" ignored --root "$CASE_ROOT"
+unreadable "$CASE_ROOT/Cargo.toml" skip_notices_refuses_an_unreadable_workspace_manifest 2 \
+    --has "cannot read $CASE_ROOT/Cargo.toml" \
+    -- bash "$TOOL" skip-notices --root "$CASE_ROOT"
+
+# A command that fails reaches the verdict. The one that stands in for the real one fails when
+# an argument holds a marker (any argument, for an empty marker) and otherwise is the real one,
+# so the rest of the run is untouched. Without the check, an awk program that one awk cannot
+# compile switches its rule off and the mode passes.
 #
-# awk_that_fails_on <marker>: print a directory holding that awk, to put first on PATH.
-awk_that_fails_on() {
+# failing_command <command> <marker>: print a directory holding that command, to put first on PATH.
+failing_command() {
     local dir real
-    dir="$(mktemp -d "$ST_WORK/awk.XXXXXX")"
-    real="$(command -v awk)"
+    dir="$(mktemp -d "$ST_WORK/$1.XXXXXX")"
+    real="$(command -v "$1")"
     {
         # shellcheck disable=SC2016 # the script written here expands these, not this one
-        printf '#!/bin/sh\nfor arg in "$@"; do\n    case "$arg" in\n    *%s*)\n' "'$1'"
-        printf '        echo "awk: planted failure" >&2\n        exit 2\n        ;;\n    esac\ndone\nexec "%s" "$@"\n' "$real"
-    } >"$dir/awk"
-    chmod +x "$dir/awk"
+        printf '#!/bin/sh\nfor arg in "$@"; do\n    case "$arg" in\n    *%s*)\n' "'$2'"
+        printf '        echo "%s: planted failure" >&2\n        exit 2\n        ;;\n    esac\ndone\nexec "%s" "$@"\n' "$1" "$real"
+    } >"$dir/$1"
+    chmod +x "$dir/$1"
     printf '%s' "$dir"
 }
 
@@ -1247,8 +1285,8 @@ fn gpu_alpha() {
 RS
 st_case an_awk_that_fails_on_nothing_changes_nothing 0 \
     --has "every stand-down notice" \
-    -- env PATH="$(awk_that_fails_on 'a marker no program holds'):$PATH" bash "$TOOL" skip-notices --root "$CASE_ROOT"
-detector_awk="$(awk_that_fails_on 'flush_attr')"
+    -- env PATH="$(failing_command awk 'a marker no program holds'):$PATH" bash "$TOOL" skip-notices --root "$CASE_ROOT"
+detector_awk="$(failing_command awk 'flush_attr')"
 st_case a_failing_detector_is_refused_by_list 1 \
     --has "the detector failed over" --has "crates/rmlx-models" \
     -- env PATH="$detector_awk:$PATH" bash "$TOOL" list --root "$CASE_ROOT"
@@ -1261,7 +1299,7 @@ st_case a_failing_detector_is_refused_by_skip_notices 2 \
 for scan in 'notice:verdict = "none"' 'guard:gtext' 'print:printed[sp]' 'waiver:why = "names no test"'; do
     st_case "a_failing_${scan%%:*}_scan_is_refused" 2 \
         --has "the scan of" --has "crates/rmlx-models/src/alpha_tests.rs failed" \
-        -- env PATH="$(awk_that_fails_on "${scan#*:}"):$PATH" bash "$TOOL" skip-notices --root "$CASE_ROOT"
+        -- env PATH="$(failing_command awk "${scan#*:}"):$PATH" bash "$TOOL" skip-notices --root "$CASE_ROOT"
 done
 
 # The file a scan lists into is removed on every exit, the refusals included.
@@ -1273,6 +1311,16 @@ st_run env TMPDIR="$scratch" bash "$TOOL" list --root "$CASE_ROOT"
 st_run env TMPDIR="$scratch" bash "$TOOL" list --root "$ST_WORK/nowhere"
 left="$(ls -A "$scratch")"
 st_verdict a_run_leaves_no_scratch_file "$([ -z "$left" ] || printf 'left behind: %s' "$left")"
+
+# The two reads of that file that are not an awk or a find are refusals too, and name the file.
+workspace a_count_or_sort_of_the_scratch_file_that_fails_is_refused
+gpu_test 'eprintln!("SKIP gpu_alpha: no snapshot");'
+st_case a_member_count_that_fails_is_refused 1 \
+    --has "could not count the member manifests listed in" --has "/gpu_tests." \
+    -- env PATH="$(failing_command wc ''):$PATH" bash "$TOOL" ignored --root "$CASE_ROOT"
+st_case a_file_sort_that_fails_is_refused 2 \
+    --has "could not sort the test-bearing sources listed in" --has "/gpu_tests." \
+    -- env PATH="$(failing_command sort '/gpu_tests.'):$PATH" bash "$TOOL" skip-notices --root "$CASE_ROOT"
 
 # ---------------------------------------------------------------------------
 # list: the compliant set, `<crate> <fn>` per line, and with --files the declaring file.

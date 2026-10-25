@@ -2232,6 +2232,27 @@ HALVES_ERR="$(bash "${ROOT}/scripts/gpu_test_halves.sh" --root "${tree}" 2>&1 >/
 TG_ERR="$(bash "${ROOT}/scripts/gpu_test_threadgroup.sh" --root "${tree}" 2>&1 >/dev/null)"
 [ -z "${TG_ERR}" ] || fail "threadgroup printed on stderr although the listing succeeded: ${TG_ERR}"
 
+# A member spelled with a trailing slash or a ./ prefix is the same member: the classifier reports
+# the files under it by the normalised path, so the producer compares against that path.
+new_case half_members_spelled_with_a_slash_or_a_dot_place_like_any_other || exit 1
+tree="${CASE_ROOT}/tree"
+halves_fixture_tree "${tree}" || exit 1
+cat >"${tree}/Cargo.toml" <<'TOML'
+[workspace]
+members = [
+    "crates/rmlx-kv-quant/",
+    "./crates/rmlx-models",
+    "crates/rmlx-audio",
+]
+TOML
+gpu_fixture_test "${tree}/crates/rmlx-kv-quant/src/codec_tests.rs" codec_decodes
+gpu_fixture_test "${tree}/crates/rmlx-models/src/arch_tests.rs" arch_forwards
+gpu_fixture_test "${tree}/crates/rmlx-audio/src/asr_tests.rs" asr_transcribes
+HALVES_OUT="$(bash "${ROOT}/scripts/gpu_test_halves.sh" --root "${tree}" 2>&1)"
+expect_placed codec rmlx-kv-quant codec_decodes
+expect_placed codec rmlx-models arch_forwards
+expect_placed rest rmlx-audio asr_transcribes
+
 # ---------------------------------------------------------------------------
 # THE THREADGROUP SPLIT
 #
@@ -2452,6 +2473,18 @@ STATUS=$?
 OUT="${TG_OUT}"
 expect_status 2
 expect_out "the threadgroup split collapsed — 0 test(s) on, 1 off."
+
+# A tree in which no source embeds a gated kernel has nothing to place a test against: the
+# producer refuses with exit 2, as its header says.
+new_case threadgroup_a_tree_with_no_kernel_source_is_exit_2 || exit 1
+tree="${CASE_ROOT}/tree"
+halves_fixture_tree "${tree}" || exit 1
+gpu_fixture_test "${tree}/crates/rmlx-models/src/arch_tests.rs" arch_forwards
+TG_OUT="$(bash "${ROOT}/scripts/gpu_test_threadgroup.sh" --root "${tree}" 2>&1)"
+STATUS=$?
+OUT="${TG_OUT}"
+expect_status 2
+expect_out "no source embeds a .metal file"
 
 # The classifier's reason reaches the operator here too.
 new_case threadgroup_the_classifier_refusal_reaches_the_operator || exit 1

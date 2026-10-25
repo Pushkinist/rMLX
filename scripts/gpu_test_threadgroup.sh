@@ -215,8 +215,7 @@ for top, dirs, files in os.walk(os.path.join(root, 'crates'),
                 entries.update(fn_bodies(path))
 
 if not dispatchers:
-    sys.exit('ERROR: no source embeds a .metal file from a gated directory, so no test '
-             'can be placed on.')
+    refuse('no source embeds a .metal file from a gated directory, so no test can be placed on.')
 
 rows, on, off, parsed = [], 0, 0, {}
 for line in sys.stdin:

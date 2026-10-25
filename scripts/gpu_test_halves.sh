@@ -140,6 +140,8 @@ fi
 # narrows the parse fails there first.
 members=()
 while IFS= read -r m; do
+    while [ "${m#./}" != "$m" ]; do m="${m#./}"; done
+    while [ "${m%/}" != "$m" ]; do m="${m%/}"; done
     [ -n "$m" ] && members+=("$m")
 done < <(awk '
     /^[[:space:]]*members[[:space:]]*=[[:space:]]*\[/ { inm = 1; next }
