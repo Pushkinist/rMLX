@@ -100,6 +100,22 @@ jobs:
       # passing forever. Fixture trees pin its recall, per rule.
       - name: the eval-lock gate still catches what it is for
         run: make check-eval-lock-fixtures
+      # A speculative round loop that charges its phases and records that it did not
+      # re-attributes its work to the drafter with every token and count identical, so
+      # no test sees it. Static: bash and awk over the checked-in sources.
+      - name: speculative round loops carry one phase-charge decision
+        run: make check-spec-charge
+      # ...and a loop that takes no sampler decodes greedily under a sampled label,
+      # fluent and silent. Same scanner, the sampler rules.
+      - name: speculative generation paths carry the request's sampler
+        run: make check-spec-sampling
+      # Both gates are source-shape scans, so their recall is the part that can rot.
+      # Planted source roots pin the rule and the exit code of every case; they need
+      # perl, which the runner ships.
+      - name: the phase-charge gate still catches what it is for
+        run: make check-spec-charge-fixtures
+      - name: the sampler gate still catches what it is for
+        run: make check-spec-sampling-fixtures
       # Three more single-rule source gates, read by grep and awk; planted scan
       # roots pin their recall and their refusal of a root with nothing in it.
       - name: the inline-test gate still catches what it is for
