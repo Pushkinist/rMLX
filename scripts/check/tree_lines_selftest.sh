@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Recall test for the tree-line gate: planted git work trees, asserting exit code and file:line.
 #
+# doc-refs: fixture — the docs/ paths below belong to the synthetic scan roots.
+#
 # Recall test for: check/tree_lines.sh claim-bypass personal-data
 #
 # Each case builds a throwaway git work tree with one planted edit, runs the tool in one
@@ -39,6 +41,7 @@ both) st_init tree-lines-selftest ;;
 esac
 
 AT='@'
+TIMEOUT_S=60
 
 # fresh <name>: a git work tree with one clean script in scope of both modes.
 fresh() {
@@ -75,42 +78,54 @@ shared_cases() {
     local label="check-$mode"
 
     root="$(fresh "$mode-clean")"
-    st_case "$mode: a clean tree passes" 0 --has "$label: ok" -- bash "$TOOL" "$mode" "$root"
+    st_case "$mode: a clean tree passes" 0 --has "$label: ok" -- st_bounded "$TIMEOUT_S" bash "$TOOL" "$mode" "$root"
 
     root="$(fresh "$mode-ignored")"
     printf 'scripts/hidden.sh\n' >"$root/.gitignore"
     plant "$root" scripts/hidden.sh "$line"
-    st_case "$mode: a git-ignored file is out of scope" 0 --has "$label: ok" -- bash "$TOOL" "$mode" "$root"
+    st_case "$mode: a git-ignored file is out of scope" 0 --has "$label: ok" -- st_bounded "$TIMEOUT_S" bash "$TOOL" "$mode" "$root"
 
     root="$(fresh "$mode-untracked")"
     plant "$root" scripts/visible.sh "$line"
     st_case "$mode: an untracked, not-ignored file is in scope" 1 \
-        --has "$rule: scripts/visible.sh:2:" -- bash "$TOOL" "$mode" "$root"
+        --has "$rule: scripts/visible.sh:2:" -- st_bounded "$TIMEOUT_S" bash "$TOOL" "$mode" "$root"
+
+    root="$(fresh "$mode-two-lines")"
+    plant "$root" docs/two.md "$line"
+    printf '%s\n' "$line" >>"$root/docs/two.md"
+    st_case "$mode: two violating lines of one file are two violations" 1 \
+        --has "FAIL: 2 violation(s)" -- st_bounded "$TIMEOUT_S" bash "$TOOL" "$mode" "$root"
 
     root="$(fresh "$mode-staged")"
     plant "$root" scripts/staged.sh "$line"
     git -C "$root" add scripts/staged.sh
     st_case "$mode: a staged file is in scope" 1 \
-        --has "$rule: scripts/staged.sh:2:" -- bash "$TOOL" "$mode" "$root"
+        --has "$rule: scripts/staged.sh:2:" -- st_bounded "$TIMEOUT_S" bash "$TOOL" "$mode" "$root"
 
     root="$(fresh "$mode-deleted")"
     plant "$root" scripts/gone.sh "$line"
     git -C "$root" add scripts/gone.sh
     rm "$root/scripts/gone.sh"
     st_case "$mode: a tracked file missing from the work tree is skipped" 0 \
-        --has "$label: ok (1 file(s) scanned)" -- bash "$TOOL" "$mode" "$root"
+        --has "$label: ok (1 file(s) scanned)" -- st_bounded "$TIMEOUT_S" bash "$TOOL" "$mode" "$root"
 
     root="$(fresh "$mode-self")"
     plant "$root" "$TOOL_REL" "$both"
     plant "$root" "$SELFTEST_REL" "$both"
     st_case "$mode: the tool and its recall test are not scanned" 0 \
-        --has "$label: ok" -- bash "$TOOL" "$mode" "$root"
+        --has "$label: ok" -- st_bounded "$TIMEOUT_S" bash "$TOOL" "$mode" "$root"
 
     root="$(fresh "$mode-old-paths")"
     plant "$root" "$old.sh" "$line"
     plant "$root" "${old}_selftest.sh" "$line"
     st_case "$mode: a file at an old gate path is scanned" 1 \
-        --has "$rule: $old.sh:2:" --has "$rule: ${old}_selftest.sh:2:" -- bash "$TOOL" "$mode" "$root"
+        --has "$rule: $old.sh:2:" --has "$rule: ${old}_selftest.sh:2:" -- st_bounded "$TIMEOUT_S" bash "$TOOL" "$mode" "$root"
+
+    root="$(fresh "$mode-near-paths")"
+    plant "$root" "$TOOL_REL.orig" "$line"
+    plant "$root" "scripts/old/$SELFTEST_REL" "$line"
+    st_case "$mode: a path that only contains the tool's or its test's path is scanned" 1 \
+        --has "$rule: $TOOL_REL.orig:2:" --has "$rule: scripts/old/$SELFTEST_REL:2:" -- st_bounded "$TIMEOUT_S" bash "$TOOL" "$mode" "$root"
 
     root="$(fresh "$mode-copy")"
     mkdir -p "$root/scripts/tools"
@@ -120,20 +135,20 @@ shared_cases() {
     plant "$root" "$SELFTEST_REL" "$line"
     st_case "$mode: a copy of the tool excludes its own path and its test's, and no other" 1 \
         --has "$rule: $TOOL_REL:2:" --has "$rule: $SELFTEST_REL:2:" --lacks "scripts/tools/" \
-        -- bash "$root/scripts/tools/tree_lines.sh" "$mode"
+        -- st_bounded "$TIMEOUT_S" bash "$root/scripts/tools/tree_lines.sh" "$mode"
 
     root="$ST_WORK/$mode-not-a-git-tree"
     mkdir -p "$root/scripts"
     printf '%s\n' "$line" >"$root/scripts/x.sh"
     st_case "$mode: a root outside a git work tree cannot be scanned" 2 \
-        --has "unavailable: git ls-files exit 128" --lacks "no in-scope file" -- bash "$TOOL" "$mode" "$root"
+        --has "unavailable: git ls-files exit 128" --lacks "no in-scope file" -- st_bounded "$TIMEOUT_S" bash "$TOOL" "$mode" "$root"
 
     st_case "$mode: a missing root cannot be scanned" 2 \
-        --has "is not a directory" -- bash "$TOOL" "$mode" "$ST_WORK/does-not-exist"
+        --has "is not a directory" --lacks "git ls-files" -- st_bounded "$TIMEOUT_S" bash "$TOOL" "$mode" "$ST_WORK/does-not-exist"
 
     root="$(st_git_root "$mode-empty")"
     st_case "$mode: an empty scope cannot be scanned" 2 \
-        --has "unavailable: no in-scope file" -- bash "$TOOL" "$mode" "$root"
+        --has "unavailable: no in-scope file" -- st_bounded "$TIMEOUT_S" bash "$TOOL" "$mode" "$root"
 }
 
 # name | relpath | planted line | want-exit | needle ("-" = must pass)
@@ -232,9 +247,9 @@ claim_bypass_cases() {
         root="$(fresh "$name")"
         plant "$root" "$rel" "$line"
         if [ "$needle" = - ]; then
-            st_case "$name" "$want" --what "$rel: $line" -- bash "$TOOL" claim-bypass "$root"
+            st_case "$name" "$want" --what "$rel: $line" -- st_bounded "$TIMEOUT_S" bash "$TOOL" claim-bypass "$root"
         else
-            st_case "$name" "$want" --what "$rel: $line" --has "$needle" -- bash "$TOOL" claim-bypass "$root"
+            st_case "$name" "$want" --what "$rel: $line" --has "$needle" -- st_bounded "$TIMEOUT_S" bash "$TOOL" claim-bypass "$root"
         fi
     done
 
@@ -246,7 +261,7 @@ claim_bypass_cases() {
     if [ -n "$why" ]; then
         st_verdict doc_rows "$why"
     else
-        st_case doc_rows 0 --what "the gate's rows in CLAUDE.md and scripts/INDEX.md pass it" -- bash "$TOOL" claim-bypass "$root"
+        st_case doc_rows 0 --what "the gate's rows in CLAUDE.md and scripts/INDEX.md pass it" -- st_bounded "$TIMEOUT_S" bash "$TOOL" claim-bypass "$root"
     fi
 
     # A doc with no row is named, and the verdict is reached.
@@ -259,19 +274,26 @@ claim_bypass_cases() {
     st_verdict doc_rows_lost "$([ "$why" = "CLAUDE.md has fewer than two rows naming the gate" ] || echo "verdict is '$why'")" \
         "a doc with no row is named, not a silent abort"
 
+    # Unlike personal-data, this mode does not skip a file that holds a NUL byte.
+    root="$(fresh binary_scanned)"
+    mkdir -p "$root/scripts"
+    printf 'rm -f /tmp/rmlx.claim\000\001\n' >"$root/scripts/blob.sh"
+    st_case binary_scanned 1 --what "a file with a NUL byte is scanned" \
+        --has "claim-delete: scripts/blob.sh:1:" -- st_bounded "$TIMEOUT_S" bash "$TOOL" claim-bypass "$root"
+
     # The summary counts every violation, not the files that hold one.
     root="$(fresh two_violations)"
     plant "$root" docs/v1.md 'rm -f /tmp/rmlx.claim'
     plant "$root" docs/v2.md 'rm -f /tmp/rmlx.claim'
     st_case two_violations_counted 1 --what "two planted lines are two violations" \
-        --has "FAIL: 2 violation(s)" -- bash "$TOOL" claim-bypass "$root"
+        --has "FAIL: 2 violation(s)" -- st_bounded "$TIMEOUT_S" bash "$TOOL" claim-bypass "$root"
 
     # A scope with no file cannot pass.
     root="$(st_git_root empty_scope)"
     mkdir -p "$root/other"
     printf 'rm -f /tmp/rmlx.claim\n' >"$root/other/notes.txt"
     st_case empty_scope 2 --what "no in-scope file is exit 2, not a pass" \
-        --has "unavailable: no in-scope file" -- bash "$TOOL" claim-bypass "$root"
+        --has "unavailable: no in-scope file" -- st_bounded "$TIMEOUT_S" bash "$TOOL" claim-bypass "$root"
 
     shared_cases claim-bypass
 }
@@ -281,65 +303,65 @@ personal_data_cases() {
 
     root="$(fresh email)"
     printf 'line one\nmail jane.doe%smail.example.test here\n' "$AT" >"$root/notes.txt"
-    st_case "a personal address fails" 1 --has "email: notes.txt:2:" -- bash "$TOOL" personal-data "$root"
+    st_case "a personal address fails" 1 --has "email: notes.txt:2:" -- st_bounded "$TIMEOUT_S" bash "$TOOL" personal-data "$root"
 
     root="$(fresh email-upper)"
     printf 'Contact: Jane%sMail.Example.Test\n' "$AT" >"$root/a.json"
-    st_case "an address in any case fails" 1 --has "email: a.json:1:" -- bash "$TOOL" personal-data "$root"
+    st_case "an address in any case fails" 1 --has "email: a.json:1:" -- st_bounded "$TIMEOUT_S" bash "$TOOL" personal-data "$root"
 
     root="$(fresh placeholder)"
     printf 'a %sexample.invalid b %susers.noreply.github.com c %sexample.com\n' \
         "x$AT" "1+me$AT" "y$AT" >"$root/ok.txt"
-    st_case "placeholder and noreply domains pass" 0 --has "check-personal-data: ok" -- bash "$TOOL" personal-data "$root"
+    st_case "placeholder and noreply domains pass" 0 --has "check-personal-data: ok" -- st_bounded "$TIMEOUT_S" bash "$TOOL" personal-data "$root"
 
     root="$(fresh mixed)"
     printf 'x%sexample.invalid then y%scorp.example.test\n' "$AT" "$AT" >"$root/m.txt"
-    st_case "a real address after a placeholder on one line fails" 1 --has "email: m.txt:1:" -- bash "$TOOL" personal-data "$root"
+    st_case "a real address after a placeholder on one line fails" 1 --has "email: m.txt:1:" -- st_bounded "$TIMEOUT_S" bash "$TOOL" personal-data "$root"
 
     root="$(fresh users)"
     printf 'path /%s/alice/src\n' "Users" >"$root/s.sh"
-    st_case "a macOS home path fails" 1 --has "home-path: s.sh:1:" -- bash "$TOOL" personal-data "$root"
+    st_case "a macOS home path fails" 1 --has "home-path: s.sh:1:" -- st_bounded "$TIMEOUT_S" bash "$TOOL" personal-data "$root"
 
     root="$(fresh users-placeholder)"
     printf 'path /%s/<you>/src\n' "Users" >"$root/s.md"
-    st_case "an angle-bracket placeholder home path passes" 0 --has "check-personal-data: ok" -- bash "$TOOL" personal-data "$root"
+    st_case "an angle-bracket placeholder home path passes" 0 --has "check-personal-data: ok" -- st_bounded "$TIMEOUT_S" bash "$TOOL" personal-data "$root"
 
     root="$(fresh varfolders)"
     printf 'tmp /private/var/%s/ab/T/x\n' "folders" >"$root/v.txt"
-    st_case "a per-user temp path fails" 1 --has "home-path: v.txt:1:" -- bash "$TOOL" personal-data "$root"
+    st_case "a per-user temp path fails" 1 --has "home-path: v.txt:1:" -- st_bounded "$TIMEOUT_S" bash "$TOOL" personal-data "$root"
 
     root="$(fresh linux-home)"
     printf 'db /home/user/.rmlx/metrics/runs.db\n' >"$root/l.md"
-    st_case "a Linux placeholder home path passes" 0 --has "check-personal-data: ok" -- bash "$TOOL" personal-data "$root"
+    st_case "a Linux placeholder home path passes" 0 --has "check-personal-data: ok" -- st_bounded "$TIMEOUT_S" bash "$TOOL" personal-data "$root"
 
     root="$(fresh session)"
     printf 'see https://claude.ai/code/%s_01ABC\n' "session" >"$root/pr.md"
-    st_case "an assistant session link fails" 1 --has "session-link: pr.md:1:" -- bash "$TOOL" personal-data "$root"
+    st_case "an assistant session link fails" 1 --has "session-link: pr.md:1:" -- st_bounded "$TIMEOUT_S" bash "$TOOL" personal-data "$root"
 
     root="$(fresh binary)"
     printf 'jane.doe%smail.example.test\000\001' "$AT" >"$root/blob.bin"
-    st_case "a binary file is skipped" 0 --has "check-personal-data: ok" -- bash "$TOOL" personal-data "$root"
+    st_case "a binary file is skipped" 0 --has "check-personal-data: ok" -- st_bounded "$TIMEOUT_S" bash "$TOOL" personal-data "$root"
 
     for domain in example.org example.net noreply.github.com; do
         root="$(fresh "placeholder-$domain")"
         printf 'a x%s%s b\n' "$AT" "$domain" >"$root/ok.txt"
-        st_case "the placeholder domain $domain passes" 0 --has "check-personal-data: ok" -- bash "$TOOL" personal-data "$root"
+        st_case "the placeholder domain $domain passes" 0 --has "check-personal-data: ok" -- st_bounded "$TIMEOUT_S" bash "$TOOL" personal-data "$root"
     done
 
     root="$(fresh scratch-path)"
     printf 'tmp /private/tmp/%s/x\n' "claude" >"$root/c.txt"
-    st_case "an assistant scratch path fails" 1 --has "home-path: c.txt:1:" -- bash "$TOOL" personal-data "$root"
+    st_case "an assistant scratch path fails" 1 --has "home-path: c.txt:1:" -- st_bounded "$TIMEOUT_S" bash "$TOOL" personal-data "$root"
 
     root="$(fresh two-on-a-line)"
     printf 'jane.doe%smail.example.test and joe%scorp.example.test\n' "$AT" "$AT" >"$root/two.txt"
-    st_case "two addresses on one line are one violation" 1 --has "FAIL: 1 violation(s)" -- bash "$TOOL" personal-data "$root"
+    st_case "two addresses on one line are one violation" 1 --has "FAIL: 1 violation(s)" -- st_bounded "$TIMEOUT_S" bash "$TOOL" personal-data "$root"
 
     shared_cases personal-data
 }
 
 root="$(fresh no-mode)"
-st_case "no mode is a usage error" 2 --has "usage:" -- bash "$TOOL"
-st_case "an unknown mode is a usage error" 2 --has "usage:" -- bash "$TOOL" claim-delete "$root"
+st_case "no mode is a usage error" 2 --has "usage:" --lacks "unbound variable" -- st_bounded "$TIMEOUT_S" bash "$TOOL"
+st_case "an unknown mode is a usage error" 2 --has "usage:" --lacks "unbound variable" -- st_bounded "$TIMEOUT_S" bash "$TOOL" claim-delete "$root"
 
 case "$MODE" in
 claim-bypass) claim_bypass_cases ;;
