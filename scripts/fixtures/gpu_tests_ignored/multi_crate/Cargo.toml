@@ -1,0 +1,8 @@
+# Synthetic workspace for scripts/check/rust_gates_fixtures.sh.
+# Never built — the gate reads only the member list and the package names.
+# Two members; the second one's package name differs from its directory.
+[workspace]
+members = [
+    "crates/fa",
+    "crates/fb",
+]

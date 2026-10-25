@@ -3,6 +3,8 @@
 #
 # Set:    -uo — a non-zero status inside a case ends the run under -e, before the cases after it
 #
+# LOC-exempt: one planted run per case; the cases are the spec
+#
 # Recall test for: run_gpu_tests.sh
 #
 # The runner accumulates two independent kinds of red across its crate loop:
@@ -2073,6 +2075,51 @@ HALVES_OUT="$(bash "${ROOT}/scripts/gpu_test_halves.sh" --root "${tree}" 2>&1)"
 expect_placed rest rmlx-models flag_parses
 expect_placed rest rmlx-models none_is_pinned
 
+# When the classifier cannot trust the tree it says why, and that reason reaches the operator
+# instead of the producer's bare "no GPU tests".
+new_case half_the_classifier_refusal_reaches_the_operator || exit 1
+tree="${CASE_ROOT}/tree"
+halves_fixture_tree "${tree}" || exit 1
+gpu_fixture_test "${tree}/crates/rmlx-models/tests/pipeline.rs" pipeline_agrees
+cat >"${tree}/crates/rmlx-models/src/orphan_tests.rs" <<'TEST'
+#[test]
+#[ignore = "GPU Metal context"]
+fn orphaned_metal_test() {
+    run(Device::Cpu);
+}
+TEST
+OUT="$(bash "${ROOT}/scripts/gpu_test_halves.sh" --root "${tree}" 2>&1)"
+STATUS=$?
+expect_status 2
+expect_out "claims a Metal context"
+expect_out "produced no GPU tests"
+
+# A declaring file the producer cannot read is not a file that selects no codec: it would land
+# in the rest half and the codec half would lose a test it guards. The classifier reads the file
+# first and refuses it, so the producer's own read is reached only through an awk that fails.
+new_case half_a_file_it_cannot_read_is_refused_not_placed || exit 1
+tree="${CASE_ROOT}/tree"
+halves_fixture_tree "${tree}" || exit 1
+gpu_fixture_test "${tree}/crates/rmlx-models/tests/pipeline.rs" pipeline_agrees
+mkdir -p "${CASE_ROOT}/failing_awk"
+cat >"${CASE_ROOT}/failing_awk/awk" <<SHIM
+#!/bin/sh
+for arg in "\$@"; do
+    case "\$arg" in
+    *'found = 1'*) echo "awk: planted failure" >&2; exit 2 ;;
+    esac
+done
+exec "$(command -v awk)" "\$@"
+SHIM
+chmod +x "${CASE_ROOT}/failing_awk/awk"
+HALVES_OUT="$(bash "${ROOT}/scripts/gpu_test_halves.sh" --root "${tree}" 2>&1)"
+expect_placed rest rmlx-models pipeline_agrees
+OUT="$(PATH="${CASE_ROOT}/failing_awk:${PATH}" bash "${ROOT}/scripts/gpu_test_halves.sh" --root "${tree}" 2>&1)"
+STATUS=$?
+expect_status 2
+expect_out "could not read ${tree}/crates/rmlx-models/tests/pipeline.rs"
+expect_no_out "rest	rmlx-models"
+
 # ---------------------------------------------------------------------------
 # THE THREADGROUP SPLIT
 #
@@ -2293,6 +2340,63 @@ STATUS=$?
 OUT="${TG_OUT}"
 expect_status 2
 expect_out "the threadgroup split collapsed — 0 test(s) on, 1 off."
+
+# The classifier's reason reaches the operator here too.
+new_case threadgroup_the_classifier_refusal_reaches_the_operator || exit 1
+tree="${CASE_ROOT}/tree"
+threadgroup_fixture_tree "${tree}" || exit 1
+gpu_fixture_test "${tree}/crates/rmlx-models/tests/pipeline.rs" pipeline_agrees
+cat >"${tree}/crates/rmlx-models/src/orphan_tests.rs" <<'TEST'
+#[test]
+#[ignore = "GPU Metal context"]
+fn orphaned_metal_test() {
+    run(Device::Cpu);
+}
+TEST
+TG_OUT="$(bash "${ROOT}/scripts/gpu_test_threadgroup.sh" --root "${tree}" 2>&1)"
+STATUS=$?
+OUT="${TG_OUT}"
+expect_status 2
+expect_out "claims a Metal context"
+expect_out "produced no GPU tests"
+
+# A source the producer cannot read is not a source that embeds no kernel: the tests that name
+# its entries would run with the instrumentation off, and the split would still read as computed.
+# The same holds for a directory under crates/ it cannot list. Both are made unreadable for the
+# run, since a mode-000 path cannot be checked in.
+new_case threadgroup_an_unreadable_path_is_refused || exit 1
+tree="${CASE_ROOT}/tree"
+threadgroup_fixture_tree "${tree}" || exit 1
+gpu_fixture_test "${tree}/crates/rmlx-kv-quant/src/codec_msl_tests.rs" codec_decodes \
+    'codec_quantize_gpu();'
+gpu_fixture_test "${tree}/crates/rmlx-models/src/arch_tests.rs" arch_forwards
+mkdir -p "${tree}/crates/rmlx-models/benches"
+TG_OUT="$(bash "${ROOT}/scripts/gpu_test_threadgroup.sh" --root "${tree}" 2>&1)"
+HALVES_OUT="${TG_OUT}"
+expect_placed on rmlx-kv-quant codec_decodes
+dispatcher="${tree}/crates/rmlx-kv-quant/src/codec_msl.rs"
+chmod 000 "${dispatcher}"
+if cat "${dispatcher}" >/dev/null 2>&1; then
+    echo "skip [${CASE}]: this user can read a mode-000 file"
+else
+    TG_OUT="$(bash "${ROOT}/scripts/gpu_test_threadgroup.sh" --root "${tree}" 2>&1)"
+    STATUS=$?
+    OUT="${TG_OUT}"
+    expect_status 2
+    expect_out "cannot read ${dispatcher}"
+fi
+chmod 644 "${dispatcher}"
+chmod 000 "${tree}/crates/rmlx-models/benches"
+if ls "${tree}/crates/rmlx-models/benches" >/dev/null 2>&1; then
+    echo "skip [${CASE}]: this user can read a mode-000 directory"
+else
+    TG_OUT="$(bash "${ROOT}/scripts/gpu_test_threadgroup.sh" --root "${tree}" 2>&1)"
+    STATUS=$?
+    OUT="${TG_OUT}"
+    expect_status 2
+    expect_out "cannot list ${tree}/crates/rmlx-models/benches"
+fi
+chmod 755 "${tree}/crates/rmlx-models/benches"
 
 # ---------------------------------------------------------------------------
 # The half's marker line. It is the split's ONE structural defence — a half

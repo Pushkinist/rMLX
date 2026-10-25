@@ -1,10 +1,12 @@
 # Planted workspaces for check/gpu_tests.sh ignored and list: the failure reason, under each awk.
 #
 # Columns, tab-separated, none empty ("-" for none): fixture (a directory beside this
-# table), args (gate arguments, "{}" is the fixture path), stream (both, out or err: the
-# gate's output the needles are read from), exit (exact), has (strings that must all
-# appear), lacks (strings none of which may appear), is (the whole output; "\t" is a
-# tab), what (what the case proves). Needles are fixed strings separated by ";;".
+# table), args (gate arguments, "{}" is the fixture path), stream (both, out, err or
+# sorted: the gate's output the needles are read from; sorted is stdout with its lines
+# sorted, for a listing whose order follows the file system), exit (exact), has (strings
+# that must all appear), lacks (strings none of which may appear), is (the whole output;
+# "\t" is a tab, "\n" a line break, "{}" the fixture path), what (what the case proves).
+# Needles are fixed strings separated by ";;".
 # In has, "A;>B" is one needle: B must appear after the first A.
 #
 # The gate it guards enforces a rule ("a test reaching Device::Gpu carries
@@ -127,3 +129,30 @@ ignore_metal_undeclared	!list --root {}	both	1	ERROR: #[ignore] claims a Metal c
 # disposition that puts it under a gate.
 ignore_bare_env_gated	!list --root {}	both	1	ERROR: #[ignore] with no reason on an environment-gated test	-	-	list — refuses a reasonless environment-gated #[ignore] too
 ignore_bare_env_gated_dispositioned	!list --root {}	out	0	-	-	fx\tenv_gated_gpu_cell	list — the GPU form of the cell is listed; the others are not
+# The population as a whole: two members, the second named other than its directory, a unit-test
+# file below src/, an integration binary reaching a helper in a subdirectory of tests/, an async
+# test, and one each of the macro, declared-route and exempt shapes. The exact listing is what
+# sees a scan narrow: a find that stops descending, a root that is not scanned, a member the parser
+# drops, the directory name where the package name belongs. The listing is sorted because its
+# order is the file system's.
+multi_crate	!list --files --root {}	sorted	0	-	-	fa\tinteg_via_helper\t{}/crates/fa/tests/integ.rs\nfa\tnested_deep_gpu\t{}/crates/fa/src/deep/inner/deep_tests.rs\nfa\tsub_tests_rs_gpu\t{}/crates/fa/src/sub/tests.rs\nfa\ttokio_flavored_gpu\t{}/crates/fa/src/sub/tests.rs\nfb-pkg\tfb_gpu\t{}/crates/fb/src/lib_tests.rs	list --files names each classified test once, with its package and its declaring file; macro, declared and exempt tests stay out
+multi_crate	!list --root {}	sorted	0	-	-	fa\tinteg_via_helper\nfa\tnested_deep_gpu\nfa\tsub_tests_rs_gpu\nfa\ttokio_flavored_gpu\nfb-pkg\tfb_gpu	list names the package, not the directory; an exempt test that is also ignored is not listed
+multi_crate	!list --root {}	err	0	NOTE: macro-generated GPU tests;>deep_tests.rs: gpu_cell!{$name};;NOTE: declared-route GPU tests;>integ.rs: declared_child	-	-	both excluded populations are announced on stderr, each after the note that says why
+multi_crate	--root {}	out	0	-	-	OK: every GPU-touching test carries #[ignore] (5 files across 2 workspace members).	ignored prints its one line and nothing else on stdout, with every scanned file counted
+two_members	!list --root {}	sorted	0	-	-	fx\tgpu_fx\nfy\tgpu_fy	list reads every member of the manifest, one of them outside crates/ where the member floor cannot see it
+two_members	--root {}	out	0	-	-	OK: every GPU-touching test carries #[ignore] (2 files across 2 workspace members).	ignored reads every member of the manifest too
+# An exemption covers the one test it sits on. The test after it is held to the rule.
+exempt_is_per_test	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;fixture_tests.rs: real_gpu	exempt_policy_value	-	a test after an exempt one is still a violation; the exempt one is not named
+# list refuses everything ignored refuses before it has a population, for the same reason.
+# make gpu-test calls only list, so a refusal that only ignored makes leaves the suite running
+# over a tree the gate has already judged unreadable.
+macro_unreadable	!list --root {}	both	1	ERROR: this gate could not classify part of a scanned file;;gpu_cell!	OK:	-	an assembled fn name fails closed in list too
+member_floor	!list --root {}	both	1	ERROR: parsed 1 workspace members but 2 crate dirs exist under crates/	OK:	-	list refuses a narrowed member list too
+no_manifest	!list --root {}	both	1	not found — cannot resolve workspace members	OK:	-	list refuses a root with no workspace manifest
+no_members	!list --root {}	both	1	parsed 0 workspace members	OK:	-	list refuses a member list the parser reads as empty
+member_without_directory	!list --root {}	both	1	member crate 'crates/gone' from Cargo.toml has no directory	OK:	-	list refuses a member that moved
+member_without_src	!list --root {}	both	1	does not exist — this gate is scanning nothing for 'crates/fx'	OK:	-	list refuses a member with no src/
+member_without_name	!list --root {}	both	1	could not read [package] name from	OK:	-	list refuses a manifest that names no package
+no_test_files	!list --root {}	both	1	matched 0 test files across 1 workspace members	OK:	-	list refuses a workspace with no test file
+member_without_manifest	--root {}	both	1	could not read [package] name from	OK:	-	a member with no manifest is refused with its reason, not stopped silently
+member_without_manifest	!list --root {}	both	1	could not read [package] name from	-	-	list refuses a member with no manifest too

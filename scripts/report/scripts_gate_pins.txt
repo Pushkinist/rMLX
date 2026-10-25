@@ -341,7 +341,6 @@ size perf_ceiling.py 1107
 size report/debt_report_selftest.sh 1598
 size report/kv_census_selftest.sh 1212
 size run_gpu_tests.sh 1322
-size run_gpu_tests_selftest.sh 2412
 size spec_bench.sh 1169
 size spec_bench_published.sh 1185
 size spec_bench_published_selftest.sh 2842

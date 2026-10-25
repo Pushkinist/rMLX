@@ -1,0 +1,7 @@
+# Synthetic workspace for scripts/check/rust_gates_fixtures.sh.
+# Never built — the gate reads only the member list and the package name.
+# crates/fx has a src/ and no Cargo.toml.
+[workspace]
+members = [
+    "crates/fx",
+]

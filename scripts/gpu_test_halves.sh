@@ -197,7 +197,7 @@ while IFS=$'\t' read -r pkg dir; do
     esac
 done <<< "${member_dirs}"
 
-listing="$(bash "${REPO_ROOT}/scripts/check/gpu_tests.sh" list --files --root "${ROOT}" 2>/dev/null)"
+listing="$(bash "${REPO_ROOT}/scripts/check/gpu_tests.sh" list --files --root "${ROOT}")"
 if [ -z "${listing}" ]; then
     echo "ERROR: check/gpu_tests.sh list --files produced no GPU tests for ${ROOT}." >&2
     exit 2
@@ -208,12 +208,20 @@ fi
 selects_codec=""
 while IFS= read -r file; do
     [ -n "${file}" ] || continue
-    if awk -v NEEDLE="${CODEC_NEEDLE}" "${AWK_TEXT_FNS}"'
+    # awk exits 1 when the file names no codec; any other status is a file it could not read.
+    awk_rc=0
+    awk -v NEEDLE="${CODEC_NEEDLE}" "${AWK_TEXT_FNS}"'
         blank_strings(decomment($0)) ~ NEEDLE { found = 1 }
         END { exit(found ? 0 : 1) }
-    ' "${file}" 2>/dev/null; then
-        selects_codec="${selects_codec}${file}"$'\n'
-    fi
+    ' "${file}" || awk_rc=$?
+    case "${awk_rc}" in
+        0) selects_codec="${selects_codec}${file}"$'\n' ;;
+        1) ;;
+        *)
+            echo "ERROR: could not read ${file} to see whether it selects a codec." >&2
+            exit 2
+            ;;
+    esac
 done < <(printf '%s\n' "${listing}" | cut -f3 | sort -u)
 
 while IFS=$'\t' read -r crate test file; do

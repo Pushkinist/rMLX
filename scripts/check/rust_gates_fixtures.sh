@@ -22,6 +22,8 @@
 #
 # A needle in the has column is a fixed string; "A;>B" is one needle that holds
 # when B appears after the first A, for output whose order is part of the contract.
+# The stream "sorted" is the gate's stdout with its lines sorted, for output whose order
+# follows the file system; "{}" in the is column is the fixture path, as in args.
 #
 # A gate that takes a mode word gets the mode of its table. A first word "!name" in args
 # replaces it ("!bogus --root {}" runs an unknown mode, "! --root {}" runs none, "!list
@@ -107,6 +109,8 @@ fi
 stdout_of() { "$@" 2>/dev/null; }
 # shellcheck disable=SC2069 # the order is the point: stderr to the capture, stdout dropped
 stderr_of() { "$@" 2>&1 >/dev/null; }
+# The gate's own exit code survives: pipefail makes the pipeline fail when the gate does.
+sorted_of() { "$@" 2>/dev/null | LC_ALL=C sort; }
 
 # add_needles <--has|--lacks> <needles separated by ;;> — append them to CHECKS, or to ORDERED
 # when a has needle holds an "A;>B" chain; "-" adds none. A blank needle matches any output.
@@ -192,8 +196,8 @@ for impl in "${AWKS[@]}"; do
         *) st_die "scripts/fixtures/$MODE/cases.tsv: '$fixture': args '$args' has no {}, so the gate would not run on the tree" ;;
         esac
         case "$stream" in
-        both | out | err) ;;
-        *) st_die "scripts/fixtures/$MODE/cases.tsv: '$fixture': stream '$stream' is not both, out or err" ;;
+        both | out | err | sorted) ;;
+        *) st_die "scripts/fixtures/$MODE/cases.tsv: '$fixture': stream '$stream' is not both, out, err or sorted" ;;
         esac
         case "$want" in
         *[!0-9]*) st_die "scripts/fixtures/$MODE/cases.tsv: '$fixture': exit '$want' is not a number" ;;
@@ -221,11 +225,12 @@ for impl in "${AWKS[@]}"; do
         ORDERED=()
         add_needles --has "$has"
         add_needles --lacks "$lacks"
-        if [ "$is" != - ]; then CHECKS+=(--is "$(printf '%b' "$is")"); fi
+        if [ "$is" != - ]; then CHECKS+=(--is "$(printf '%b' "${is//\{\}/$FIX/$fixture}")"); fi
         case "$stream" in
         both) st_run env PATH="$RUN_PATH" bash "$GATE" ${mode_word:+"$mode_word"} "${ARGV[@]}" ;;
         out) st_run stdout_of env PATH="$RUN_PATH" bash "$GATE" ${mode_word:+"$mode_word"} "${ARGV[@]}" ;;
         err) st_run stderr_of env PATH="$RUN_PATH" bash "$GATE" ${mode_word:+"$mode_word"} "${ARGV[@]}" ;;
+        sorted) st_run sorted_of env PATH="$RUN_PATH" bash "$GATE" ${mode_word:+"$mode_word"} "${ARGV[@]}" ;;
         esac
         why="$(st_check "$want" ${CHECKS[@]+"${CHECKS[@]}"})"
         for chain in ${ORDERED[@]+"${ORDERED[@]}"}; do

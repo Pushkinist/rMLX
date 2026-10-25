@@ -1,0 +1,9 @@
+# Synthetic workspace for scripts/check/rust_gates_fixtures.sh.
+# Never built — the gate reads only the member list and the package names.
+# The second member sits outside crates/, so the member floor cannot notice a parser that
+# stopped after the first one.
+[workspace]
+members = [
+    "crates/fx",
+    "tools/fy",
+]

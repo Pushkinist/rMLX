@@ -82,7 +82,7 @@ if [ ${#METAL_DIRS[@]} -eq 0 ]; then
     exit 2
 fi
 
-listing="$(bash "${REPO_ROOT}/scripts/check/gpu_tests.sh" list --files --root "${ROOT}" 2>/dev/null)"
+listing="$(bash "${REPO_ROOT}/scripts/check/gpu_tests.sh" list --files --root "${ROOT}")"
 if [ -z "${listing}" ]; then
     echo "ERROR: check/gpu_tests.sh list --files produced no GPU tests for ${ROOT}." >&2
     exit 2
@@ -145,12 +145,21 @@ def decomment(line):
     return line
 
 
-def embeds_gated_metal(path):
+def refuse(message):
+    sys.stderr.write(f'ERROR: {message}\n')
+    sys.exit(2)
+
+
+def read_lines(path):
     try:
-        lines = open(path, errors='replace').read().split('\n')
-    except OSError:
-        return False
-    for line in lines:
+        with open(path, errors='replace') as f:
+            return f.read().split('\n')
+    except OSError as e:
+        refuse(f'cannot read {path}: {e.strerror}')
+
+
+def embeds_gated_metal(path):
+    for line in read_lines(path):
         for lit in INCLUDE.findall(decomment(line)):
             target = os.path.realpath(os.path.join(os.path.dirname(path), lit))
             if os.path.isfile(target) and any(target.startswith(g + os.sep) for g in gated):
@@ -161,7 +170,7 @@ def embeds_gated_metal(path):
 def fn_bodies(path):
     """fn name -> list of body texts, by rustfmt layout: a fn closes on the
     first line that is its own indent followed by `}`."""
-    lines = open(path, errors='replace').read().split('\n')
+    lines = read_lines(path)
     bodies, i = {}, 0
     while i < len(lines):
         m = FN.match(lines[i])
@@ -186,7 +195,8 @@ def is_test_file(path):
 
 dispatchers = set()
 entries = set()
-for top, dirs, files in os.walk(os.path.join(root, 'crates')):
+for top, dirs, files in os.walk(os.path.join(root, 'crates'),
+                                onerror=lambda e: refuse(f'cannot list {e.filename}: {e.strerror}')):
     dirs[:] = [d for d in dirs if d != 'target']
     for name in files:
         path = os.path.join(top, name)

@@ -35,7 +35,7 @@
 #     * unit tests under `src/` — files named `<name>_tests.rs` OR bare
 #       `tests.rs` (the file-size convention in CLAUDE.md allows both; a glob
 #       of `*_tests.rs` alone silently misses every `tests.rs`).
-#     * integration binaries under `tests/*.rs`.
+#     * integration binaries under `tests/**/*.rs`.
 #   `cargo test -p <crate> --lib` does not build `tests/` at all, so a check
 #   scoped to `src/` alone would mirror exactly the blind spot it exists to
 #   catch.
@@ -455,9 +455,14 @@
 #   test announces a stand-down in another form. It names each one that does not, with its file,
 #   line and reason.
 #
-#   KNOWN OPEN BLIND SPOT: a scan that fails reads as a file with no findings. An awk that cannot
-#   open a file the classification names, or a find that fails, ends no run: the file contributes
-#   nothing and the mode passes.
+#   A notice is matched to its test by the declaring file and the fn, so a package whose name
+#   differs from its directory is attributed like any other.
+#
+# ---- a scan that cannot read is a refusal -------------------------------------------------
+#   A directory or file the scan cannot read is not a place with no findings. Every mode refuses,
+#   with a line naming it, when a find fails, a file in a population is unreadable, or an awk
+#   fails: `ignored` and `list` exit 1 as for any classification they cannot trust, `skip-notices`
+#   exits 2.
 #
 # LOC-exempt: one classifier shared by two rules and the listing; the rule text is the spec
 # Usage:  bash scripts/check/gpu_tests.sh <ignored|skip-notices|list> [--files] [--listing FILE] [--root DIR]
@@ -466,9 +471,10 @@
 #                    per line) from FILE instead of classifying --root
 #         --root     scan DIR instead of the repository
 # Exit:   0 clean, or the listing printed; 1 a rule fired, or (ignored, list) the classification
-#         cannot be trusted: no member, no test file, a body or attribute it could not read, an
-#         #[ignore] no gate runs; 2 a usage error, or (skip-notices) the scan cannot be trusted:
-#         no classification, no test sources
+#         cannot be trusted: no member, no test file, a directory or file it could not read, a
+#         body or attribute it could not parse, an #[ignore] no gate runs; 2 a usage error, or
+#         (skip-notices) the scan cannot be trusted: no classification, no test sources, a
+#         directory or file it could not read
 # Not a mode of: check_gpu_device_census.sh — that gate reads the rmlx binary's own source for
 #                its one Device::Gpu site; this one reads the workspace's test sources for the
 #                tests that reach it
@@ -524,8 +530,26 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+refuse() {
+    echo "ERROR: $1" >&2
+    exit "$FAIL_RC"
+}
+
 SCAN_ROOT="${ROOT_ARG:-$REPO_ROOT}"
-[ ! -d "$SCAN_ROOT" ] || SCAN_ROOT="$(cd "$SCAN_ROOT" && pwd)"
+if [ -d "$SCAN_ROOT" ]; then
+    SCAN_ROOT="$(cd "$SCAN_ROOT" && pwd)" || refuse "cannot enter the scan root ${SCAN_ROOT}."
+fi
+
+SCAN_LIST="$(mktemp "${TMPDIR:-/tmp}/gpu_tests.XXXXXX")" || refuse "cannot make a scratch file."
+trap 'rm -f "$SCAN_LIST"' EXIT
+
+# list_into_scan <what> <find args>...: run find into $SCAN_LIST, and refuse when it fails. A
+# find that fails has listed part of what it was asked for, and a part reads as the whole.
+list_into_scan() {
+    local what="$1"
+    shift
+    find "$@" >"$SCAN_LIST" || refuse "could not list ${what}."
+}
 
 # The awk detector, shared across every crate's scan. Reads all of a crate's
 # scanned files in one pass (FILENAME distinguishes them) and builds a
@@ -1062,8 +1086,9 @@ classify_root() {
     # would trip this; that is a reviewable event, not a silent narrowing.)
     disk_crates=0
     if [ -d "${SCAN_ROOT}/crates" ]; then
-        disk_crates=$(find "${SCAN_ROOT}/crates" -mindepth 2 -maxdepth 2 \
-            -name Cargo.toml -not -path "*/target/*" | wc -l | tr -d ' ')
+        list_into_scan "the member manifests under ${SCAN_ROOT}/crates" "${SCAN_ROOT}/crates" \
+            -mindepth 2 -maxdepth 2 -name Cargo.toml -not -path "*/target/*" -print
+        disk_crates=$(wc -l <"${SCAN_LIST}" | tr -d ' ')
     fi
     if [ "${#members[@]}" -lt "${disk_crates}" ]; then
         echo "ERROR: parsed ${#members[@]} workspace members but ${disk_crates} crate dirs exist under crates/." >&2
@@ -1107,31 +1132,32 @@ classify_root() {
         # mismatch would surface as an opaque "package not found" from cargo instead
         # of failing at this gate, which is the fail-closed discipline the rest of
         # this script follows.
-        pkg_name="$(awk -F'"' '/^name[[:space:]]*=/{print $2; exit}' "${crate_dir}/Cargo.toml" 2>/dev/null)"
+        pkg_name="$(awk -F'"' '/^name[[:space:]]*=/{print $2; exit}' "${crate_dir}/Cargo.toml" 2>/dev/null)" || pkg_name=""
         if [ -z "${pkg_name}" ]; then
-            echo "ERROR: could not read [package] name from ${crate_dir}/Cargo.toml." >&2
-            exit "$FAIL_RC"
+            refuse "could not read [package] name from ${crate_dir}/Cargo.toml."
         fi
 
         # Gather this crate's scanned files. Whole-crate reachability needs every
         # scanned file of the crate in ONE awk pass, so collect them per crate.
         crate_files=()
         # Unit tests: match both `<name>_tests.rs` and bare `tests.rs`.
-        while IFS= read -r -d '' f; do crate_files+=("$f"); done < <(
-            find "${src_dir}" \( -name "*_tests.rs" -o -name "tests.rs" \) \
-                -not -path "*/target/*" -print0
-        )
+        list_into_scan "the test files under ${src_dir}" "${src_dir}" \
+            \( -name "*_tests.rs" -o -name "tests.rs" \) -not -path "*/target/*" -print0
+        while IFS= read -r -d '' f; do crate_files+=("$f"); done <"${SCAN_LIST}"
         # Integration binaries + their shared modules (optional per crate).
         if [ -d "${tests_dir}" ]; then
-            while IFS= read -r -d '' f; do crate_files+=("$f"); done < <(
-                find "${tests_dir}" -name "*.rs" -not -path "*/target/*" -print0
-            )
+            list_into_scan "the test files under ${tests_dir}" "${tests_dir}" \
+                -name "*.rs" -not -path "*/target/*" -print0
+            while IFS= read -r -d '' f; do crate_files+=("$f"); done <"${SCAN_LIST}"
         fi
 
         [ ${#crate_files[@]} -eq 0 ] && continue
         total_files=$((total_files + ${#crate_files[@]}))
 
-        out=$(awk "$AWK_DETECT" "${crate_files[@]}")
+        for f in "${crate_files[@]}"; do
+            [ -r "$f" ] || refuse "cannot read ${f}."
+        done
+        out=$(awk "$AWK_DETECT" "${crate_files[@]}") || refuse "the detector failed over the test files of ${crate_dir}."
         while IFS= read -r line; do
             [ -z "$line" ] && continue
             case "$line" in
@@ -1306,8 +1332,25 @@ mode_ignored() {
     echo "OK: every GPU-touching test carries #[ignore] (${total_files} files across ${#members[@]} workspace members)."
 }
 
+# scan_failed <file>: an awk that exits non-zero has read none or part of its file, and what it
+# did not read has no findings only as far as this scan can tell.
+scan_failed() {
+    refuse "the scan of ${1} failed."
+}
+
+# package_of <file>: the package that declares the classified tests of <file>.
+package_of() {
+    local c f
+    while IFS=$'\t' read -r c _ f; do
+        if [ "$f" = "$1" ]; then
+            printf '%s' "$c"
+            return 0
+        fi
+    done <<<"${classification}"
+}
+
 mode_skip_notices() {
-    local classification listing gpu_files files notices records f
+    local gpu_files files notices records f out
     local violations n silent n_silent other n_other waivers n_waivers red rel
 
     if [ -n "$LISTING" ]; then
@@ -1322,19 +1365,24 @@ mode_skip_notices() {
         echo "would pass by having nothing to look at." >&2
         exit 2
     fi
-    listing="$(printf '%s\n' "${classification}" | cut -f1,2)"
     gpu_files="$(printf '%s\n' "${classification}" | cut -f3 | sort -u)"
 
     # The test-bearing files, in the classifier's own population: sibling test files
     # under src/ and the integration tests. A notice anywhere else is in a fn the
     # classifier cannot have named.
-    files="$(find "${SCAN_ROOT}/crates" \
-        \( -path '*/src/*_tests.rs' -o -path '*/src/*/tests.rs' -o -path '*/src/tests.rs' \
-           -o -path '*/tests/*.rs' \) -type f 2>/dev/null | sort)" || true
-    if [ -z "${files}" ]; then
-        echo "ERROR: no test-bearing sources found under ${SCAN_ROOT}/crates." >&2
-        exit 2
+    if [ ! -d "${SCAN_ROOT}/crates" ]; then
+        refuse "no test-bearing sources found under ${SCAN_ROOT}/crates."
     fi
+    list_into_scan "the test-bearing sources under ${SCAN_ROOT}/crates" "${SCAN_ROOT}/crates" \
+        \( -path '*/src/*_tests.rs' -o -path '*/src/*/tests.rs' -o -path '*/src/tests.rs' \
+           -o -path '*/tests/*.rs' \) -type f
+    files="$(sort "${SCAN_LIST}")"
+    if [ -z "${files}" ]; then
+        refuse "no test-bearing sources found under ${SCAN_ROOT}/crates."
+    fi
+    while IFS= read -r f; do
+        [ -r "${f}" ] || refuse "cannot read ${f}."
+    done <<<"${files}"
 
     # One `<file>\t<line>\t<enclosing fn>\t<verdict>\t<text>` record per stand-down
     # notice, where the verdict is what the notice names:
@@ -1346,9 +1394,10 @@ mode_skip_notices() {
     # The enclosing fn is the nearest preceding `fn`, which is what a notice inside
     # a closure or a nested block belongs to as well. A notice in a helper resolves
     # to the helper, which the attribution step below then drops.
-    notices="$(printf '%s\n' "${files}" | while IFS= read -r f; do
+    notices=""
+    while IFS= read -r f; do
         [ -n "${f}" ] || continue
-        awk -v FILE="${f}" \
+        out="$(awk -v FILE="${f}" \
             -v ANY="${ANY_SKIP}" -v NAMED="${NAMED_SKIP}" -v PLACEHOLDER="${NAMED_SKIP_PLACEHOLDER}" '
             match($0, /^[[:space:]]*(pub[[:space:]]+(\([^)]*\)[[:space:]]*)?)?(async[[:space:]]+)?fn[[:space:]]+[A-Za-z_][A-Za-z0-9_]*/) {
                 head = substr($0, RSTART, RLENGTH)
@@ -1372,21 +1421,22 @@ mode_skip_notices() {
                 sub(/^[[:space:]]+/, "", text)
                 printf "%s\t%d\t%s\t%s\t%s\n", FILE, NR, cur, verdict, text
             }
-        ' "${f}" || true
-    done)"
+        ' "${f}")" || scan_failed "${f}"
+        notices="${notices}${out}"$'\n'
+    done <<<"${files}"
 
     violations=""
     n=0
     while IFS=$'\t' read -r v_file v_line v_fn v_verdict v_text; do
         [ -n "${v_file:-}" ] || continue
         case "${v_verdict}" in self) continue ;; esac
-        # Attribute to a crate by path, then keep only what the classifier named.
-        rel="${v_file#"${SCAN_ROOT}"/crates/}"
-        crate="${rel%%/*}"
-        case $'\n'"${listing}"$'\n' in
-            *$'\n'"${crate}"$'\t'"${v_fn}"$'\n'*) ;;
+        # Keep only what the classifier named, by the file that declares it and its fn.
+        case $'\n'"${classification}"$'\n' in
+            *$'\t'"${v_fn}"$'\t'"${v_file}"$'\n'*) ;;
             *) continue ;;
         esac
+        rel="${v_file#"${SCAN_ROOT}"/crates/}"
+        crate="$(package_of "${v_file}")"
         case "${v_verdict}" in
             none) why="names no test" ;;
             other:*) why="names ${v_verdict#other:}, not itself" ;;
@@ -1406,9 +1456,10 @@ mode_skip_notices() {
     # line as written, because both of those ARE literals.
     silent=""
     n_silent=0
-    records="$(printf '%s\n' "${gpu_files}" | while IFS= read -r f; do
+    records=""
+    while IFS= read -r f; do
         [ -n "${f}" ] || continue
-        awk -v FILE="${f}" -v ANY="${ANY_SKIP}" "${AWK_TEXT_FNS}"'
+        out="$(awk -v FILE="${f}" -v ANY="${ANY_SKIP}" "${AWK_TEXT_FNS}"'
             {
                 raw = $0
                 code = blank_strings(decomment(raw))
@@ -1448,8 +1499,9 @@ mode_skip_notices() {
                     g = 0
                 }
             }
-        ' "${f}" || true
-    done)"
+        ' "${f}")" || scan_failed "${f}"
+        records="${records}${out}"$'\n'
+    done <<<"${gpu_files}"
     while IFS=$'\t' read -r s_file s_line s_fn s_text; do
         [ -n "${s_file:-}" ] || continue
         rel="${s_file#"${SCAN_ROOT}"/crates/}"
@@ -1466,9 +1518,10 @@ mode_skip_notices() {
     # and a notice belong to the innermost block open on their line.
     other=""
     n_other=0
-    records="$(printf '%s\n' "${gpu_files}" | while IFS= read -r f; do
+    records=""
+    while IFS= read -r f; do
         [ -n "${f}" ] || continue
-        awk -v FILE="${f}" -v ANY="${ANY_SKIP}" "${AWK_TEXT_FNS}"'
+        out="$(awk -v FILE="${f}" -v ANY="${ANY_SKIP}" "${AWK_TEXT_FNS}"'
             {
                 raw = $0
                 code = blank_strings(decomment(raw))
@@ -1494,8 +1547,9 @@ mode_skip_notices() {
                 if (code ~ /(^|[^A-Za-z0-9_])return([[:space:]]*(;|$)|[[:space:]]+(None|Ok\(\(\)\))[[:space:]]*;)/ && printed[sp] != "" && !noticed[sp])
                     printf "%s\t%d\t%s\t%s\n", FILE, NR, cur, printed[sp]
             }
-        ' "${f}" || true
-    done)"
+        ' "${f}")" || scan_failed "${f}"
+        records="${records}${out}"$'\n'
+    done <<<"${gpu_files}"
     while IFS=$'\t' read -r o_file o_line o_fn o_text; do
         [ -n "${o_file:-}" ] || continue
         rel="${o_file#"${SCAN_ROOT}"/crates/}"
@@ -1509,9 +1563,10 @@ mode_skip_notices() {
     # its enclosing fn; anything else is one record `<file>\t<line>\t<fn>\t<why>\t<text>`.
     waivers=""
     n_waivers=0
-    records="$(printf '%s\n' "${gpu_files}" | while IFS= read -r f; do
+    records=""
+    while IFS= read -r f; do
         [ -n "${f}" ] || continue
-        awk -v FILE="${f}" -v ANY="${ANY_WAIVED}" -v NAMED="${NAMED_WAIVED}" \
+        out="$(awk -v FILE="${f}" -v ANY="${ANY_WAIVED}" -v NAMED="${NAMED_WAIVED}" \
             -v PLACEHOLDER="${NAMED_WAIVED_PLACEHOLDER}" '
             match($0, /^[[:space:]]*(pub[[:space:]]+(\([^)]*\)[[:space:]]*)?)?(async[[:space:]]+)?fn[[:space:]]+[A-Za-z_][A-Za-z0-9_]*/) {
                 head = substr($0, RSTART, RLENGTH)
@@ -1531,12 +1586,13 @@ mode_skip_notices() {
                 sub(/^[[:space:]]+/, "", text)
                 printf "%s\t%d\t%s\t%s\t%s\n", FILE, NR, cur, why, text
             }
-        ' "${f}" || true
-    done)"
+        ' "${f}")" || scan_failed "${f}"
+        records="${records}${out}"$'\n'
+    done <<<"${gpu_files}"
     while IFS=$'\t' read -r w_file w_line w_fn w_why w_text; do
         [ -n "${w_file:-}" ] || continue
         rel="${w_file#"${SCAN_ROOT}"/crates/}"
-        waivers="${waivers}    ${rel}:${w_line} — ${rel%%/*} ${w_fn}: the waiver ${w_why}"$'\n'
+        waivers="${waivers}    ${rel}:${w_line} — $(package_of "${w_file}") ${w_fn}: the waiver ${w_why}"$'\n'
         waivers="${waivers}        ${w_text}"$'\n'
         n_waivers=$((n_waivers + 1))
     done <<< "${records}"

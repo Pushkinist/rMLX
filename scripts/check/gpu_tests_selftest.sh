@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Recall test for check/gpu_tests.sh skip-notices and list: planted shapes, asserting the reason.
 #
-# Recall test for: check/gpu_tests.sh skip-notices list
+# Recall test for: check/gpu_tests.sh ignored skip-notices list
 #
 # WHY
 #   The gate it tests is a text scan, and a text scan that stops matching says
@@ -252,6 +252,13 @@ check_case 0
 # attributed to a same-named test classified under another.
 new_case crate_is_read_from_the_path
 classify rmlx-models src/alpha_tests.rs gpu_alpha
+source_file rmlx-models src/alpha_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    eprintln!("SKIP gpu_alpha: no snapshot");
+}
+RS
 source_file rmlx-audio src/alpha_tests.rs <<'RS'
 #[test]
 fn gpu_alpha() {
@@ -886,36 +893,28 @@ check_case 2 \
     --has "no test-bearing sources" \
     --lacks "No such file"
 
-# KNOWN OPEN BLIND SPOT, pinned so that changing it is a decision: a source awk cannot open
-# reads as a source with no findings, so the nameless notice in it passes. Closing the hole
-# turns this case red, and the case then takes the exit the closed hole gives.
-new_case an_unreadable_source_is_a_known_open_hole
-classify rmlx-models src/alpha_tests.rs gpu_alpha
-source_file rmlx-models src/alpha_tests.rs <<'RS'
-#[test]
-fn gpu_alpha() {
-    eprintln!("SKIP: no snapshot");
-}
-RS
-chmod 000 "$CASE_ROOT/crates/rmlx-models/src/alpha_tests.rs"
-if [ -r "$CASE_ROOT/crates/rmlx-models/src/alpha_tests.rs" ]; then
-    printf '  skip %s - %s\n' "$CASE" "this user can read a mode-000 file"
-else
-    check_case 0 \
-        --has "every stand-down notice"
-fi
-
 # ---------------------------------------------------------------------------
 # The cases above state the classification in a listing. These classify a planted
 # workspace for real, which is how the Makefile runs the gate.
 
-# workspace <name>: a one-member workspace, so the classifier reads the planted tests itself.
+# workspace <name> [<crate>[=<package>]]...: a root whose members are the named crates, each
+# manifest naming its package (the crate name when none is given). Without a crate, one
+# member, fx.
 workspace() {
     CASE="$1"
     CASE_ROOT="$ST_WORK/$1"
-    mkdir -p "$CASE_ROOT/crates/fx/src"
-    printf '[workspace]\nmembers = [\n    "crates/fx",\n]\n' >"$CASE_ROOT/Cargo.toml"
-    printf '[package]\nname = "fx"\nversion = "0.0.0"\nedition = "2021"\n' >"$CASE_ROOT/crates/fx/Cargo.toml"
+    shift
+    [ "$#" -gt 0 ] || set -- fx
+    local spec dir
+    mkdir -p "$CASE_ROOT"
+    printf '[workspace]\nmembers = [\n' >"$CASE_ROOT/Cargo.toml"
+    for spec in "$@"; do
+        dir="crates/${spec%%=*}"
+        mkdir -p "$CASE_ROOT/$dir/src"
+        printf '    "%s",\n' "$dir" >>"$CASE_ROOT/Cargo.toml"
+        printf '[package]\nname = "%s"\nversion = "0.0.0"\nedition = "2021"\n' "${spec#*=}" >"$CASE_ROOT/$dir/Cargo.toml"
+    done
+    printf ']\n' >>"$CASE_ROOT/Cargo.toml"
 }
 
 # gpu_test <statement>: one classified test, a GPU test that carries #[ignore], whose body ends in the statement.
@@ -1000,6 +999,253 @@ CASE=derived_root_that_is_no_directory_is_exit_2
 CASE_ROOT="$ST_WORK/nowhere"
 derived_case 2 \
     --has "is not a directory"
+
+# ---------------------------------------------------------------------------
+# The guard rule reads past a line break, and the process-wide GPU switch is no stand-down
+# there either: the variable on one line and the block on a later one.
+workspace multi_line_skip_gpu_guard_is_not_a_stand_down rmlx-models
+source_file rmlx-models src/alpha_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    let device = Device::Gpu;
+    let Some(_) =
+        std::env::var_os("RMLX_SKIP_GPU")
+    else {
+        return;
+    };
+}
+RS
+derived_case 0
+
+workspace multi_line_guard_on_another_variable_is_a_stand_down rmlx-models
+source_file rmlx-models src/alpha_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    let device = Device::Gpu;
+    let Some(_) =
+        std::env::var_os("RMLX_KV_TEST_MODEL")
+    else {
+        return;
+    };
+}
+RS
+derived_case 1 \
+    --has "src/alpha_tests.rs:6 — gpu_alpha returns from an environment guard with no stand-down notice"
+
+# A tests.rs below src/ is a test-bearing source: its notices are read like any other's.
+workspace a_nested_tests_rs_is_scanned rmlx-models
+source_file rmlx-models src/sub/tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    let device = Device::Gpu;
+    eprintln!("SKIP: no snapshot");
+}
+RS
+derived_case 1 \
+    --has "src/sub/tests.rs:5 — rmlx-models gpu_alpha names no test"
+
+workspace a_named_notice_in_a_nested_tests_rs_passes rmlx-models
+source_file rmlx-models src/sub/tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    let device = Device::Gpu;
+    eprintln!("SKIP gpu_alpha: no snapshot");
+}
+RS
+derived_case 0
+
+# A package whose name differs from its directory is attributed like any other: the notice is
+# matched to its test by the file and the fn, and the report names the package.
+workspace package_named_other_than_its_directory_is_attributed fb=fb-pkg
+source_file fb src/alpha_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    let device = Device::Gpu;
+    eprintln!("SKIP: no snapshot");
+}
+RS
+derived_case 1 \
+    --has "fb/src/alpha_tests.rs:5 — fb-pkg gpu_alpha names no test"
+
+workspace package_named_other_than_its_directory_passes_when_named fb=fb-pkg
+source_file fb src/alpha_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    let device = Device::Gpu;
+    eprintln!("SKIP gpu_alpha: no snapshot");
+}
+RS
+derived_case 0
+
+# ---------------------------------------------------------------------------
+# A scan that cannot read is a refusal that names what it could not read, never a tree with
+# no findings. Each case below makes a path unreadable for its run and puts it back; a user
+# who can read it anyway is told so.
+
+# unreadable <path> <name> <exit> [--has S | --lacks S]... -- <command>...: run the command with
+# the path at mode 000, held to the exit code and to its output.
+unreadable() {
+    local path="$1" name="$2" probe="cat" restore=644
+    shift 2
+    if [ -d "$path" ]; then
+        probe="ls"
+        restore=755
+    fi
+    chmod 000 "$path"
+    if "$probe" "$path" >/dev/null 2>&1; then
+        printf '  skip %s - %s\n' "$name" "this user can read a mode-000 path"
+    else
+        st_case "$name" "$@"
+    fi
+    chmod "$restore" "$path"
+}
+
+# The classifier's own population: a directory under src/ it cannot list. Without the refusal
+# the tests below it are not in the listing, and the listing passes for the whole population.
+workspace an_unreadable_directory_under_src
+gpu_test 'eprintln!("SKIP gpu_alpha: no snapshot");'
+source_file fx src/sub/sub_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_hidden() {
+    let device = Device::Gpu;
+}
+RS
+source_file fx tests/sub/integ.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_hidden_integ() {
+    let device = Device::Gpu;
+}
+RS
+st_case a_readable_directory_under_src_is_listed 0 \
+    --has "gpu_hidden" --has "gpu_alpha" --has "gpu_hidden_integ" \
+    -- bash "$TOOL" list --root "$CASE_ROOT"
+unreadable "$CASE_ROOT/crates/fx/tests/sub" list_refuses_an_unreadable_directory_under_tests 1 \
+    --has "could not list the test files under" --has "crates/fx/tests/sub" \
+    -- bash "$TOOL" list --root "$CASE_ROOT"
+unreadable "$CASE_ROOT/crates/fx/src/sub" list_refuses_an_unreadable_directory 1 \
+    --has "could not list the test files under" --has "crates/fx/src/sub" \
+    -- bash "$TOOL" list --root "$CASE_ROOT"
+unreadable "$CASE_ROOT/crates/fx/src/sub" ignored_refuses_an_unreadable_directory 1 \
+    --has "could not list the test files under" --has "crates/fx/src/sub" \
+    -- bash "$TOOL" ignored --root "$CASE_ROOT"
+unreadable "$CASE_ROOT/crates/fx/src/sub" skip_notices_refuses_an_unreadable_directory 2 \
+    --has "could not list the test files under" --has "crates/fx/src/sub" \
+    -- bash "$TOOL" skip-notices --root "$CASE_ROOT"
+
+# A file the classifier declares its tests in, in all three modes.
+workspace an_unreadable_source_is_refused
+source_file fx src/alpha_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    let device = Device::Gpu;
+    eprintln!("SKIP: no snapshot");
+}
+RS
+st_case a_readable_source_with_a_nameless_notice_is_found 1 \
+    --has "gpu_alpha names no test" \
+    -- bash "$TOOL" skip-notices --root "$CASE_ROOT"
+unreadable "$CASE_ROOT/crates/fx/src/alpha_tests.rs" list_refuses_an_unreadable_source 1 \
+    --has "cannot read" --has "crates/fx/src/alpha_tests.rs" \
+    -- bash "$TOOL" list --root "$CASE_ROOT"
+unreadable "$CASE_ROOT/crates/fx/src/alpha_tests.rs" ignored_refuses_an_unreadable_source 1 \
+    --has "cannot read" --has "crates/fx/src/alpha_tests.rs" \
+    -- bash "$TOOL" ignored --root "$CASE_ROOT"
+unreadable "$CASE_ROOT/crates/fx/src/alpha_tests.rs" skip_notices_refuses_an_unreadable_source 2 \
+    --has "cannot read" --has "crates/fx/src/alpha_tests.rs" \
+    -- bash "$TOOL" skip-notices --root "$CASE_ROOT"
+
+# skip-notices reads more than the classifier does: every test-bearing file under crates/. A
+# directory or a file there that only it reads is its refusal alone.
+workspace an_unreadable_path_only_skip_notices_reads
+gpu_test 'eprintln!("SKIP gpu_alpha: no snapshot");'
+mkdir -p "$CASE_ROOT/crates/fx/benches/tests"
+printf '#[test]\nfn cpu_bench() {}\n' >"$CASE_ROOT/crates/fx/benches/tests/bench.rs"
+st_case a_readable_bench_directory_passes 0 \
+    --has "every stand-down notice" \
+    -- bash "$TOOL" skip-notices --root "$CASE_ROOT"
+unreadable "$CASE_ROOT/crates/fx/benches" skip_notices_refuses_an_unreadable_directory_the_classifier_never_reads 2 \
+    --has "could not list the test-bearing sources under" \
+    -- bash "$TOOL" skip-notices --root "$CASE_ROOT"
+unreadable "$CASE_ROOT/crates/fx/benches" list_ignores_a_directory_the_classifier_never_reads 0 \
+    --is "$(printf 'fx\tgpu_alpha')" \
+    -- bash "$TOOL" list --root "$CASE_ROOT"
+unreadable "$CASE_ROOT/crates/fx/benches/tests/bench.rs" skip_notices_refuses_an_unreadable_file_the_classifier_never_reads 2 \
+    --has "cannot read" --has "benches/tests/bench.rs" \
+    -- bash "$TOOL" skip-notices --root "$CASE_ROOT"
+
+# The root itself, and a directory under crates/ that is no member: the member floor counts
+# manifests there, and a count over a directory it could not list is no count.
+workspace an_unreadable_root_is_refused
+gpu_test 'eprintln!("SKIP gpu_alpha: no snapshot");'
+unreadable "$CASE_ROOT" list_refuses_an_unreadable_root 1 \
+    --has "cannot enter the scan root" \
+    -- bash "$TOOL" list --root "$CASE_ROOT"
+unreadable "$CASE_ROOT" skip_notices_refuses_an_unreadable_root 2 \
+    --has "cannot enter the scan root" \
+    -- bash "$TOOL" skip-notices --root "$CASE_ROOT"
+mkdir -p "$CASE_ROOT/crates/zz"
+unreadable "$CASE_ROOT/crates/zz" ignored_refuses_a_crates_directory_it_cannot_count 1 \
+    --has "could not list the member manifests under" \
+    -- bash "$TOOL" ignored --root "$CASE_ROOT"
+unreadable "$CASE_ROOT/crates/zz" skip_notices_refuses_a_crates_directory_it_cannot_count 2 \
+    --has "could not list the member manifests under" \
+    -- bash "$TOOL" skip-notices --root "$CASE_ROOT"
+
+# An awk that fails reaches the verdict. The awk that stands in for the real one fails when its
+# program holds a marker only one scan has, and otherwise is the real awk, so the rest of the
+# run is untouched. Without the check, a program that one awk cannot compile switches its rule
+# off and the mode passes.
+#
+# awk_that_fails_on <marker>: print a directory holding that awk, to put first on PATH.
+awk_that_fails_on() {
+    local dir real
+    dir="$(mktemp -d "$ST_WORK/awk.XXXXXX")"
+    real="$(command -v awk)"
+    {
+        # shellcheck disable=SC2016 # the script written here expands these, not this one
+        printf '#!/bin/sh\nfor arg in "$@"; do\n    case "$arg" in\n    *%s*)\n' "'$1'"
+        printf '        echo "awk: planted failure" >&2\n        exit 2\n        ;;\n    esac\ndone\nexec "%s" "$@"\n' "$real"
+    } >"$dir/awk"
+    chmod +x "$dir/awk"
+    printf '%s' "$dir"
+}
+
+workspace a_failing_awk_is_a_refusal rmlx-models
+source_file rmlx-models src/alpha_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    let device = Device::Gpu;
+    eprintln!("SKIP gpu_alpha: no snapshot");
+}
+RS
+st_case an_awk_that_fails_on_nothing_changes_nothing 0 \
+    --has "every stand-down notice" \
+    -- env PATH="$(awk_that_fails_on 'a marker no program holds'):$PATH" bash "$TOOL" skip-notices --root "$CASE_ROOT"
+detector_awk="$(awk_that_fails_on 'flush_attr')"
+st_case a_failing_detector_is_refused_by_list 1 \
+    --has "the detector failed over" --has "crates/rmlx-models" \
+    -- env PATH="$detector_awk:$PATH" bash "$TOOL" list --root "$CASE_ROOT"
+st_case a_failing_detector_is_refused_by_ignored 1 \
+    --has "the detector failed over" \
+    -- env PATH="$detector_awk:$PATH" bash "$TOOL" ignored --root "$CASE_ROOT"
+st_case a_failing_detector_is_refused_by_skip_notices 2 \
+    --has "the detector failed over" \
+    -- env PATH="$detector_awk:$PATH" bash "$TOOL" skip-notices --root "$CASE_ROOT"
+for scan in 'notice:verdict = "none"' 'guard:gtext' 'print:printed[sp]' 'waiver:why = "names no test"'; do
+    st_case "a_failing_${scan%%:*}_scan_is_refused" 2 \
+        --has "the scan of" --has "crates/rmlx-models/src/alpha_tests.rs failed" \
+        -- env PATH="$(awk_that_fails_on "${scan#*:}"):$PATH" bash "$TOOL" skip-notices --root "$CASE_ROOT"
+done
 
 # ---------------------------------------------------------------------------
 # list: the compliant set, `<crate> <fn>` per line, and with --files the declaring file.
