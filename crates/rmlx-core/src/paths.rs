@@ -104,6 +104,11 @@ pub fn cache_dir() -> PathBuf {
     p
 }
 
+/// `<home>/cache/kv/` — root of the SSD KV tier, one namespace per subdirectory.
+pub fn kv_cache_root() -> PathBuf {
+    cache_dir().join("kv")
+}
+
 /// `<home>/bench/` — micro-benchmark artefacts (CSV rows, ad-hoc baselines).
 ///
 /// review LOW-4: canonical location for criterion / shell-script

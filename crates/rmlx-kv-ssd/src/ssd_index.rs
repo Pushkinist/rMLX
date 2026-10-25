@@ -8,7 +8,7 @@
 //! # DB location
 //!
 //! The index lives at `<kv_root>/<namespace>/index.db`. The caller names the
-//! KV root: `serve` passes `<RMLX_HOME>/cache/kv` once, to
+//! KV root: `serve` passes `rmlx_core::paths::kv_cache_root()` once, to
 //! [`crate::ssd_tier::install_config`], and the attach path hands that root on.
 //!
 //! # Schema (version `SCHEMA_VERSION`)

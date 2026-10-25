@@ -627,7 +627,7 @@ pub(crate) fn run_serve(
             default_namespace: project,
             per_project_budgets,
         },
-        &rmlx_core::paths::cache_dir().join("kv"),
+        &rmlx_core::paths::kv_cache_root(),
     )
     .map_err(|e| anyhow::anyhow!("ssd-tier config: {e}"))?;
 

@@ -61,8 +61,8 @@ block is always re-prefilled. `SsdKvIndex::open`, `SsdHydrator::open` and
 
 `install_config(cfg, kv_root)` stores the config in a `OnceLock` once, before
 any model loads. A second call returns `Error::SsdTierAlreadyInstalled`.
-`serve` passes `<RMLX_HOME>/cache/kv` as `kv_root`, the one place it is
-resolved. The wipe and the pool eviction act on that directory alone, and the
+`serve` passes `<RMLX_HOME>/cache/kv` (`rmlx_core::paths::kv_cache_root()`)
+as `kv_root`, the one place it is resolved. The wipe and the pool eviction act on that directory alone, and the
 `OnceLock` keeps the root beside the config: `prepare_attach` returns it in
 `AttachInfo::kv_root`, and the arch's `attach_ssd_tier` hands it to the
 spiller and the hydrator.
