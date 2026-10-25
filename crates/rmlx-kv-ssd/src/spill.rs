@@ -179,8 +179,9 @@ impl SsdSpiller {
     /// Test-only: spawn a drain thread over an index the test already opened.
     /// Same drain semantics as [`Self::spawn`], including the post-spill
     /// evict-to-budget pass — `budget_bytes` stands in for what
-    /// [`Self::spawn`] reads from the installed config (`0` = no ceiling). Returns the handle plus the spawned
-    /// thread's `JoinHandle` so a test can join after dropping the sender.
+    /// [`Self::spawn`] reads from the installed config (`0` = no ceiling).
+    /// Returns the handle plus the spawned thread's `JoinHandle` so a test can
+    /// join after dropping the sender.
     #[cfg(test)]
     #[allow(
         clippy::expect_used,
