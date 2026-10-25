@@ -455,8 +455,9 @@
 #   test announces a stand-down in another form. It names each one that does not, with its file,
 #   line and reason.
 #
-#   A scan that fails reads as a file with no findings. An awk that cannot open a file the
-#   classification names, and a find that fails, are not errors here: the file contributes nothing.
+#   KNOWN OPEN BLIND SPOT: a scan that fails reads as a file with no findings. An awk that cannot
+#   open a file the classification names, or a find that fails, ends no run: the file contributes
+#   nothing and the mode passes.
 #
 # LOC-exempt: one classifier shared by two rules and the listing; the rule text is the spec
 # Usage:  bash scripts/check/gpu_tests.sh <ignored|skip-notices|list> [--files] [--listing FILE] [--root DIR]

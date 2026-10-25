@@ -886,6 +886,25 @@ check_case 2 \
     --has "no test-bearing sources" \
     --lacks "No such file"
 
+# KNOWN OPEN BLIND SPOT, pinned so that changing it is a decision: a source awk cannot open
+# reads as a source with no findings, so the nameless notice in it passes. Closing the hole
+# turns this case red, and the case then takes the exit the closed hole gives.
+new_case an_unreadable_source_is_a_known_open_hole
+classify rmlx-models src/alpha_tests.rs gpu_alpha
+source_file rmlx-models src/alpha_tests.rs <<'RS'
+#[test]
+fn gpu_alpha() {
+    eprintln!("SKIP: no snapshot");
+}
+RS
+chmod 000 "$CASE_ROOT/crates/rmlx-models/src/alpha_tests.rs"
+if [ -r "$CASE_ROOT/crates/rmlx-models/src/alpha_tests.rs" ]; then
+    printf '  skip %s - %s\n' "$CASE" "this user can read a mode-000 file"
+else
+    check_case 0 \
+        --has "every stand-down notice"
+fi
+
 # ---------------------------------------------------------------------------
 # The cases above state the classification in a listing. These classify a planted
 # workspace for real, which is how the Makefile runs the gate.
