@@ -1125,6 +1125,120 @@ RS
         -- bash "$TOOL" ignored --root "$CASE_ROOT"
 done
 
+# Every rule reads every file. Each case has two classified files with the violation in the one
+# read first, so a rule that kept only the last file's findings would pass it.
+workspace the_first_of_two_files_with_a_nameless_notice_is_found
+source_file fx src/a_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_a() {
+    let device = Device::Gpu;
+    eprintln!("SKIP: no snapshot");
+}
+RS
+source_file fx src/b_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_b() {
+    let device = Device::Gpu;
+}
+RS
+check_case 1 \
+    --has "fx/src/a_tests.rs:5 — fx gpu_a names no test"
+
+workspace the_first_of_two_files_with_a_silent_guard_is_found
+source_file fx src/a_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_a() {
+    let device = Device::Gpu;
+    let Ok(p) = std::env::var("RMLX_KV_TEST_MODEL") else { return; };
+}
+RS
+source_file fx src/b_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_b() {
+    let device = Device::Gpu;
+}
+RS
+check_case 1 \
+    --has "fx/src/a_tests.rs:5 — gpu_a returns from an environment guard with no stand-down notice"
+
+workspace the_first_of_two_files_with_a_print_and_return_is_found
+source_file fx src/a_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_a() {
+    let device = Device::Gpu;
+    if nothing() {
+        eprintln!("gpu_a: skipping");
+        return;
+    }
+}
+RS
+source_file fx src/b_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_b() {
+    let device = Device::Gpu;
+}
+RS
+check_case 1 \
+    --has "fx/src/a_tests.rs:7 — gpu_a prints and returns with no value, and the block holds no stand-down notice"
+
+workspace the_first_of_two_files_with_a_nameless_waiver_is_found
+source_file fx src/a_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_a() {
+    let device = Device::Gpu;
+    eprintln!("WAIVED: not compared");
+}
+RS
+source_file fx src/b_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_b() {
+    let device = Device::Gpu;
+}
+RS
+check_case 1 \
+    --has "fx/src/a_tests.rs:5 — fx gpu_a: the waiver names no test"
+
+# The package a finding is attributed to is the one that declares the file: the second member's
+# for a notice, and a package named other than its directory for a waiver.
+workspace a_finding_in_the_second_member_is_attributed_to_it fa fb
+source_file fa src/a_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_a() {
+    let device = Device::Gpu;
+}
+RS
+source_file fb src/b_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_b() {
+    let device = Device::Gpu;
+    eprintln!("SKIP: no snapshot");
+}
+RS
+check_case 1 \
+    --has "fb/src/b_tests.rs:5 — fb gpu_b names no test"
+
+workspace a_waiver_is_attributed_to_the_package_not_the_directory fb=fb-pkg
+source_file fb src/a_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_a() {
+    let device = Device::Gpu;
+    eprintln!("WAIVED: not compared");
+}
+RS
+check_case 1 \
+    --has "fb/src/a_tests.rs:5 — fb-pkg gpu_a: the waiver names no test"
+
 # ---------------------------------------------------------------------------
 # A scan that cannot read is a refusal that names what it could not read, never a tree with
 # no findings. Each case below makes a path unreadable for its run and puts it back; a user
@@ -1162,24 +1276,26 @@ RS
 source_file fx tests/sub/integ.rs <<'RS'
 #[test]
 #[ignore = "GPU Metal"]
-fn gpu_hidden_integ() {
+fn gpu_visible_integ() {
     let device = Device::Gpu;
 }
 RS
 st_case a_readable_directory_under_src_is_listed 0 \
-    --has "gpu_hidden" --has "gpu_alpha" --has "gpu_hidden_integ" \
+    --has "gpu_hidden" --has "gpu_alpha" --has "gpu_visible_integ" \
     -- bash "$TOOL" list --root "$CASE_ROOT"
+# The tool's own line names the directory it listed; the subdirectory needle is `find`'s own
+# message, which must reach the operator and so names the directory it could not open.
 unreadable "$CASE_ROOT/crates/fx/tests/sub" list_refuses_an_unreadable_directory_under_tests 1 \
-    --has "could not list the test files under" --has "crates/fx/tests/sub" \
+    --has "could not list the test files under $CASE_ROOT/crates/fx/tests." --has "crates/fx/tests/sub" \
     -- bash "$TOOL" list --root "$CASE_ROOT"
 unreadable "$CASE_ROOT/crates/fx/src/sub" list_refuses_an_unreadable_directory 1 \
-    --has "could not list the test files under" --has "crates/fx/src/sub" \
+    --has "could not list the test files under $CASE_ROOT/crates/fx/src." --has "crates/fx/src/sub" \
     -- bash "$TOOL" list --root "$CASE_ROOT"
 unreadable "$CASE_ROOT/crates/fx/src/sub" ignored_refuses_an_unreadable_directory 1 \
-    --has "could not list the test files under" --has "crates/fx/src/sub" \
+    --has "could not list the test files under $CASE_ROOT/crates/fx/src." --has "crates/fx/src/sub" \
     -- bash "$TOOL" ignored --root "$CASE_ROOT"
 unreadable "$CASE_ROOT/crates/fx/src/sub" skip_notices_refuses_an_unreadable_directory 2 \
-    --has "could not list the test files under" --has "crates/fx/src/sub" \
+    --has "could not list the test files under $CASE_ROOT/crates/fx/src." --has "crates/fx/src/sub" \
     -- bash "$TOOL" skip-notices --root "$CASE_ROOT"
 
 # A file the classifier declares its tests in, in all three modes.
@@ -1223,6 +1339,39 @@ unreadable "$CASE_ROOT/crates/fx/benches" list_ignores_a_directory_the_classifie
 unreadable "$CASE_ROOT/crates/fx/benches/tests/bench.rs" skip_notices_refuses_an_unreadable_file_the_classifier_never_reads 2 \
     --has "cannot read" --has "benches/tests/bench.rs" \
     -- bash "$TOOL" skip-notices --root "$CASE_ROOT"
+
+# Every file of a population is checked, not the first: the unreadable one is read last, and the
+# refusal names it.
+workspace the_last_unreadable_file_of_a_population_is_named
+source_file fx src/a_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_a() {
+    let device = Device::Gpu;
+}
+RS
+source_file fx tests/z.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_z() {
+    let device = Device::Gpu;
+}
+RS
+mkdir -p "$CASE_ROOT/crates/fx/zz/tests"
+printf 'fn helper() {}\n' >"$CASE_ROOT/crates/fx/zz/tests/b.rs"
+unreadable "$CASE_ROOT/crates/fx/tests/z.rs" list_names_the_last_unreadable_file_it_classifies 1 \
+    --has "cannot read $CASE_ROOT/crates/fx/tests/z.rs." \
+    -- bash "$TOOL" list --root "$CASE_ROOT"
+unreadable "$CASE_ROOT/crates/fx/zz/tests/b.rs" skip_notices_names_the_last_unreadable_file_it_scans 2 \
+    --has "cannot read $CASE_ROOT/crates/fx/zz/tests/b.rs." \
+    -- bash "$TOOL" skip-notices --root "$CASE_ROOT"
+
+# A scratch file that cannot be made is a refusal that says so.
+workspace a_scratch_file_that_cannot_be_made_is_refused
+gpu_test 'eprintln!("SKIP gpu_alpha: no snapshot");'
+st_case a_scratch_file_that_cannot_be_made_is_refused 1 \
+    --has "cannot make a scratch file" \
+    -- env TMPDIR="$ST_WORK/no/such/directory" bash "$TOOL" list --root "$CASE_ROOT"
 
 # The root itself, and a directory under crates/ that is no member: the member floor counts
 # manifests there, and a count over a directory it could not list is no count.

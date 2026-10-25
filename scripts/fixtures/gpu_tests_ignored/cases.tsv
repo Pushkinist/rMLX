@@ -155,3 +155,4 @@ member_without_name	!list --root {}	both	1	could not read [package] name from	OK
 no_test_files	!list --root {}	both	1	matched 0 test files across 1 workspace members	OK:	-	list refuses a workspace with no test file
 member_without_manifest	--root {}	both	1	could not read [package] name from	OK:	-	a member with no manifest is refused with its reason, not stopped silently
 member_without_manifest	!list --root {}	both	1	could not read [package] name from	-	-	list refuses a member with no manifest too
+same_name_two_files	!list --root {}	sorted	0	-	-	fx\tgpu_same\nfx\tgpu_same	one fn name declared in two files of a crate is two rows, not one; the real tree has this shape
