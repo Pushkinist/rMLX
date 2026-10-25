@@ -177,6 +177,11 @@ comment):
   modes with two claims. A first argument that is a path, a number or a
   substitution leaves the mode `default`, which is also the mode of a line with
   no argument. [gate: `recall-missing`]
+* A field appears once. A value that goes on over several lines continues on the
+  lines after it, which begin with no field name; a recall claim lists one tool
+  per line that way. A header that holds one field twice fails, naming both
+  lines, and cannot be pinned: the gate reads only the first value. [gate:
+  `field-dup`]
 * Explanation may follow the block. It states why, not what, and names no
   ticket, plan or campaign (CLAUDE.md "Comments and identifiers"). [review]
 
@@ -397,7 +402,7 @@ accepts every violation of that rule in that file and can only shrink. [gate]
   `set-mode`,
   `name`, `size`, `heredoc`, `twin`, `lib-shadow`, `binary-literal` and
   `env-knob` can be pinned. The line `# pinnable: <rule> ...` lists them and
-  must equal the gate's set (`pin-header`); `index-stale`, `not-a-mode`,
+  must equal the gate's set (`pin-header`); `index-stale`, `field-dup`, `not-a-mode`,
   `not-a-mode-stale`, `recall-stale`, `module-of`, `orphan`, `py-floor` and
   every `pin-*` and `*-pin` rule never can.
 * A rule whose violation is a set pins the set: `exit-undeclared <path>

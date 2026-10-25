@@ -1144,6 +1144,12 @@ sg_reindex "$root"
 st_case pin_cannot_hold_index_stale 1 --what "index-stale cannot be pinned" \
     --has "pin-stale: report/scripts_gate_pins.txt:4: index-stale INDEX.md" -- sg_gate "$root"
 
+root=$(sg_fresh pin_field_dup)
+sg_pins_file 'field-dup check/ok.sh' >"$root/$SG_PINS_REL"
+sg_reindex "$root"
+st_case pin_cannot_hold_field_dup 1 --what "field-dup cannot be pinned" \
+    --has "pin-stale: report/scripts_gate_pins.txt:4: field-dup check/ok.sh" -- sg_gate "$root"
+
 root=$(pinned_base pin_base_holds)
 st_case pin_list_equal_to_the_base_holds 0 --what "pins equal to the base's: nothing grew, no bootstrap note" \
     --has "pinned: usage 1, exit-undeclared 1" --lacks "pin-new" --lacks "has no pin list" -- sg_gate "$root"
@@ -1835,6 +1841,35 @@ sg_make_ci "$root" 'ci:\n\t@bash scripts/check/gate.sh --mode=a some/path.txt\n\
 sg_reindex "$root"
 st_case mode_equals_form_takes_no_value 0 --what "--mode=a followed by a path is still the mode --mode=a" \
     --has "check-scripts: ok (6 files" -- sg_gate "$root"
+
+# ---- field-dup -----------------------------------------------------------
+
+root=$(sg_fresh field_dup_recall)
+sg_nocaller_sh "$GATE_BODY" | sg_put "$root" check/gate.sh
+printf '%s\n' '#!/usr/bin/env bash' '# A planted recall test.' '#' \
+    '# Recall test for: check/gate.sh' '# Recall test for: check/gate.sh --lib' '#' \
+    '# Usage:  bash scripts/check/gate_selftest.sh' '# Exit:   0 held' '# Caller: by hand' "$SG_NAM" \
+    'set -euo pipefail' 'bash scripts/check/gate.sh' 'bash scripts/check/gate.sh --lib' 'exit 0' |
+    sg_put "$root" check/gate_selftest.sh
+sg_reindex "$root"
+st_case field_dup_recall_test_twice 1 --what "a second Recall test for: line is not dropped without a word: both lines are named" \
+    --has "field-dup: check/gate_selftest.sh:5: \`Recall test for:\` is declared twice, at lines 4 and 5" -- sg_gate "$root"
+
+root=$(sg_fresh field_dup_usage)
+sg_entry_sh '# CI gate: a planted entry point.' '#' \
+    "$(printf '%s\n' '# Usage:  bash scripts/check/ok.sh' '# Usage:  bash scripts/check/ok.sh --lib')" \
+    '# Exit:   0 clean; 1 failed' '# Caller: by hand' "$SG_NAM" 'exit 0' | sg_put "$root" check/x.sh
+sg_reindex "$root"
+st_case field_dup_any_field 1 --what "the rule reads every field, not the recall claim alone" \
+    --has "field-dup: check/x.sh:5: \`Usage:\` is declared twice, at lines 4 and 5" -- sg_gate "$root"
+
+root=$(sg_fresh field_continuation)
+sg_entry_sh '# CI gate: a planted entry point.' '#' \
+    "$(printf '%s\n' '# Usage:  bash scripts/check/ok.sh' '#         bash scripts/check/ok.sh --lib')" \
+    '# Exit:   0 clean; 1 failed' '# Caller: by hand' "$SG_NAM" 'exit 0' | sg_put "$root" check/x.sh
+sg_reindex "$root"
+st_case field_continuation_lines_are_one_field 0 --what "a field that goes on over lines with no field name is one field" \
+    --has "check-scripts: ok (5 files" --lacks "field-dup" -- sg_gate "$root"
 
 # ---- lib-consumers, lib-run ----------------------------------------------
 

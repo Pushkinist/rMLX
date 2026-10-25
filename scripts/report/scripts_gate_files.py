@@ -13,7 +13,7 @@ import ast
 import os
 import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 INDEX = "INDEX.md"
@@ -61,6 +61,7 @@ class Script:
     wrap_line: int
     fields: dict[str, tuple[int, str]]
     executable: bool = False
+    repeated_fields: list[tuple[str, int, int]] = field(default_factory=list)
 
     @property
     def is_code(self) -> bool:
@@ -156,8 +157,12 @@ def xml_comment(lines: list[str]) -> list[tuple[int, str]]:
     return out
 
 
-def parse_fields(hlines: list[tuple[int, str]]) -> dict[str, tuple[int, str]]:
+def parse_fields(
+    hlines: list[tuple[int, str]],
+) -> tuple[dict[str, tuple[int, str]], list[tuple[str, int, int]]]:
+    """The first line and text of each header field, and (field, first line, repeat line) for each repeat."""
     fields: dict[str, tuple[int, str]] = {}
+    repeated: list[tuple[str, int, int]] = []
     i = 0
     while i < len(hlines):
         number, text = hlines[i]
@@ -170,9 +175,13 @@ def parse_fields(hlines: list[tuple[int, str]]) -> dict[str, tuple[int, str]]:
         while j < len(hlines) and hlines[j][1].strip() and not FIELD_RE.match(hlines[j][1]):
             parts.append(hlines[j][1].strip())
             j += 1
-        fields.setdefault(found.group(1), (number, "\n".join(parts).strip()))
+        name = found.group(1)
+        if name in fields:
+            repeated.append((name, fields[name][0], number))
+        else:
+            fields[name] = (number, "\n".join(parts).strip())
         i = j
-    return fields
+    return fields, repeated
 
 
 def load_script(root: Path, rel: str, executable: bool) -> Script:
@@ -186,9 +195,8 @@ def load_script(root: Path, rel: str, executable: bool) -> Script:
             number, nxt = hlines[1]
             if nxt.strip() and not NOT_WRAP_RE.match(nxt):
                 wrap_line = number
-    return Script(
-        rel, text, shebang, purpose_line, purpose.strip(), wrap_line, parse_fields(hlines), executable
-    )
+    fields, repeated = parse_fields(hlines)
+    return Script(rel, text, shebang, purpose_line, purpose.strip(), wrap_line, fields, executable, repeated)
 
 
 def index_modes(root: Path) -> dict[str, bool]:

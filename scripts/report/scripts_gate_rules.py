@@ -165,6 +165,14 @@ def rule_not_a_mode(ctx: Context) -> list[Violation]:
     return out
 
 
+def rule_field_dup(ctx: Context) -> list[Violation]:
+    return [
+        Violation("field-dup", f.rel, repeat, f"`{name}:` is declared twice, at lines {first} and {repeat}")
+        for f in ctx.files
+        for name, first, repeat in f.repeated_fields
+    ]
+
+
 def rule_not_a_mode_stale(ctx: Context) -> list[Violation]:
     out = []
     for f in ctx.files:
@@ -186,4 +194,5 @@ RULE_FUNCTIONS = (
     ("caller", rule_caller),
     ("not-a-mode", rule_not_a_mode),
     ("not-a-mode-stale", rule_not_a_mode_stale),
+    ("field-dup", rule_field_dup),
 )
