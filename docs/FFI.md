@@ -382,11 +382,10 @@ Pass lazy arrays to `MetalKernel::apply`:
   `ensure_row_contiguous`.
 
 `make check-no-kernel-input-eval` enforces this across every
-custom-kernel dispatcher in the three crates of `scripts/metal_dirs.sh`, and
-every shared `*_common.rs` scaffold in a directory that holds one. It keys on
-a file constructing a `MetalKernelInvoke`, not on a codec name. An
-`// eval-ok: <reason>` marker exempts one call, such as a host readback before
-`to_bytes()`. `make check-no-kernel-input-eval-fixtures` is its recall test.
+custom-kernel dispatcher in the crates of `scripts/metal_dirs.sh`, and
+every `*_common.rs` scaffold in a directory that holds one. It keys on
+a file constructing a `MetalKernelInvoke`. An `// eval-ok: <reason>` marker
+exempts one call. `make check-no-kernel-input-eval-fixtures` is its recall test.
 
 ### A kernel returns the dtype it was given
 
