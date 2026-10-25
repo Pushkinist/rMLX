@@ -3,7 +3,7 @@
 #
 # doc-refs: fixture — the docs/ paths below belong to the synthetic repo.
 #
-# Recall test for: check/doc_refs.py
+# Recall test for: check/doc_refs.py default --source-paths
 #
 # Usage:  bash scripts/check/doc_refs_selftest.sh
 # Exit:   0 every case held; 1 a case did not
@@ -13,7 +13,8 @@
 # CHANGELOG, a crate file, scripts), commits it as the base, then copies it
 # once per case, applies one edit to the copy's working tree, and runs the
 # checker with `--base HEAD`. Every case asserts the exit code and the reason
-# in the output. Nothing is written to the real tree.
+# in the output. The --source-paths cases build one small repo each. Nothing is
+# written to the real tree.
 
 set -uo pipefail
 
@@ -483,6 +484,128 @@ mkdir -p "${WORK}/no_docs"
 git -C "${WORK}/no_docs" init -q
 run_exit no_docs 2 "no tracked docs/*.md" \
     "a tree with no docs is exit 2, not a clean scan" --root "${WORK}/no_docs"
+
+# --source-paths: one small repo per case, committed, then run on its own.
+# sp_repo <name> prints the path of a new repo that holds the crate file crates/c/src/lib.rs.
+sp_repo() {
+    local dir="${WORK}/$1"
+    mkdir -p "${dir}/docs" "${dir}/crates/c/src"
+    printf '// lib\n' >"${dir}/crates/c/src/lib.rs"
+    git -C "${dir}" init -q
+    printf '%s\n' "${dir}"
+}
+
+# sp_case <name> <want-exit> <what it proves> <needle>...: every needle must be in the output.
+sp_case() {
+    local name="$1" want="$2" what="$3" dir="${WORK}/$1" out got needle
+    shift 3
+    out="$(python3 "${TOOL}" --source-paths --root "${dir}" 2>&1)"
+    got=$?
+    for needle in "$@"; do
+        verdict "${name}" "${want}" "${needle}" "${what}" "${got}" "${out}"
+    done
+}
+
+d=$(sp_repo source_paths_missing_fails)
+printf '# A\n\nSee `crates/c/src/gone.rs`.\n' >"${d}/docs/A.md"
+commit_all "${d}" base
+sp_case source_paths_missing_fails 1 "a cited crates/ path that names no file fails, with its doc and line" \
+    "ERROR: source paths cited in docs/ that do not exist" \
+    "docs/A.md:3: crates/c/src/gone.rs — resolves to nothing"
+
+d=$(sp_repo source_paths_existing_passes)
+printf '# A\n\nSee `crates/c/src/lib.rs`.\n\nAgain `crates/c/src/lib.rs`.\n' >"${d}/docs/A.md"
+commit_all "${d}" base
+sp_case source_paths_existing_passes 0 "cited paths that exist pass, each citation counted" \
+    "OK: 2 source paths cited in docs/ — all resolve."
+
+d=$(sp_repo source_paths_prose_and_fence)
+printf '# A\n\nSee `crates/c/src/gone.rs`.\n\n```sh\necho `crates/c/src/gone.rs`\n```\n' >"${d}/docs/A.md"
+commit_all "${d}" base
+sp_case source_paths_prose_and_fence 1 "the same missing path in prose and in a fenced block fails at both lines" \
+    "docs/A.md:3: crates/c/src/gone.rs" "docs/A.md:6: crates/c/src/gone.rs"
+
+d=$(sp_repo source_paths_two_on_a_line)
+printf '# A\n\nBoth `crates/c/src/one.rs` and `crates/c/src/two.rs`.\n' >"${d}/docs/A.md"
+commit_all "${d}" base
+sp_case source_paths_two_on_a_line 1 "two missing paths on one line are two failures" \
+    "docs/A.md:3: crates/c/src/one.rs" "docs/A.md:3: crates/c/src/two.rs"
+
+d=$(sp_repo source_paths_listed_extensions)
+printf '# A\n\n`crates/c/a.rs` `crates/c/b.metal` `crates/c/c.sql` `crates/c/d.toml` `crates/c/e.txt`\n' >"${d}/docs/A.md"
+commit_all "${d}" base
+sp_case source_paths_listed_extensions 1 "every listed source extension is read" \
+    "docs/A.md:3: crates/c/a.rs" "docs/A.md:3: crates/c/b.metal" "docs/A.md:3: crates/c/c.sql" \
+    "docs/A.md:3: crates/c/d.toml" "docs/A.md:3: crates/c/e.txt"
+
+d=$(sp_repo source_paths_no_backticks)
+printf '# A\n\nSee crates/c/src/gone.rs, and `crates/c/src/lib.rs`.\n' >"${d}/docs/A.md"
+commit_all "${d}" base
+sp_case source_paths_no_backticks 0 "a crates/ path with no backticks is not read" \
+    "OK: 1 source paths cited"
+
+d=$(sp_repo source_paths_other_extension)
+printf '# A\n\nSee `crates/c/gone.md` and `crates/c/gone.py`, and `crates/c/src/lib.rs`.\n' >"${d}/docs/A.md"
+commit_all "${d}" base
+sp_case source_paths_other_extension 0 "a crates/ path with an extension outside the list is not read" \
+    "OK: 1 source paths cited"
+
+d=$(sp_repo source_paths_not_crates)
+printf '# A\n\nSee `./crates/c/gone.rs`, `xcrates/c/gone.rs` and `docs/gone.rs`, and `crates/c/src/lib.rs`.\n' >"${d}/docs/A.md"
+commit_all "${d}" base
+sp_case source_paths_not_crates 0 "a path that does not begin with crates/ is not read" \
+    "OK: 1 source paths cited"
+
+d=$(sp_repo source_paths_nested_doc)
+mkdir "${d}/docs/sub"
+printf '# A\n' >"${d}/docs/A.md"
+printf '# B\n\n`crates/c/src/gone.rs`\n' >"${d}/docs/sub/B.md"
+commit_all "${d}" base
+sp_case source_paths_nested_doc 1 "a doc below docs/ is read" \
+    "docs/sub/B.md:3: crates/c/src/gone.rs"
+
+d=$(sp_repo source_paths_ignored_doc)
+printf 'docs/IGNORED.md\n' >"${d}/.gitignore"
+printf '# A\n\n`crates/c/src/lib.rs`\n' >"${d}/docs/A.md"
+commit_all "${d}" base
+printf '# I\n\n`crates/c/src/gone.rs`\n' >"${d}/docs/IGNORED.md"
+sp_case source_paths_ignored_doc 0 "a doc git ignores is not read" \
+    "OK: 1 source paths cited"
+
+d=$(sp_repo source_paths_untracked_doc)
+printf '# A\n\n`crates/c/src/lib.rs`\n' >"${d}/docs/A.md"
+commit_all "${d}" base
+printf '# N\n\n`crates/c/src/gone.rs`\n' >"${d}/docs/NEW.md"
+sp_case source_paths_untracked_doc 0 "a doc git does not track is not read, ignored or not" \
+    "OK: 1 source paths cited"
+
+d=$(sp_repo source_paths_deleted_doc)
+printf '# A\n\n`crates/c/src/gone.rs`\n' >"${d}/docs/A.md"
+printf '# B\n\n`crates/c/src/lib.rs`\n' >"${d}/docs/B.md"
+commit_all "${d}" base
+rm "${d}/docs/A.md"
+sp_case source_paths_deleted_doc 0 "a tracked doc that is gone from the work tree is skipped" \
+    "OK: 1 source paths cited"
+
+d=$(sp_repo source_paths_no_docs)
+sp_case source_paths_no_docs 2 "a work tree with no docs is exit 2, not a pass over nothing" \
+    "no tracked docs/*.md"
+
+d=$(sp_repo source_paths_only_untracked_docs)
+printf '# A\n\n`crates/c/src/lib.rs`\n' >"${d}/docs/A.md"
+sp_case source_paths_only_untracked_docs 2 "a work tree whose docs are all untracked is exit 2" \
+    "no tracked docs/*.md"
+
+mkdir -p "${WORK}/source_paths_not_git/docs"
+printf '# A\n\n`crates/c/src/gone.rs`\n' >"${WORK}/source_paths_not_git/docs/A.md"
+sp_case source_paths_not_git 2 "a root that is not a git work tree is exit 2, not a pass" \
+    "could not run: git ls-files"
+
+d=$(sp_repo source_paths_with_base)
+printf '# A\n' >"${d}/docs/A.md"
+commit_all "${d}" base
+run_exit source_paths_with_base 2 "--source-paths takes no --base and no --list" \
+    "--source-paths and --base contradict each other" --source-paths --base HEAD --root "${d}"
 
 # --base auto: origin/main at the base commit, HEAD two commits above it.
 AUTO="${WORK}/auto"
