@@ -1,5 +1,6 @@
 # Rust build artefacts
 target/
+!/scripts/fixtures/**/target/
 **/*.rs.bk
 *.pdb
 

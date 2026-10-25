@@ -42,7 +42,7 @@ empty_tree	--root {}	both	2	no .rs file to scan	check-no-scalar-f32-leak: ok	-	a
 min_refused	--min 1 --root {}	both	2	scalar-f32 has no floor	check-no-scalar-f32-leak: ok	-	scalar-f32 has no floor, so --min is refused instead of ignored
 clean_missing_root	--root {}/absent	both	2	scan root does not exist	check-no-scalar-f32-leak: ok	-	a scan root that does not exist is refused, not scanned as empty
 clean_unknown_option	--bogus --root {}	both	2	usage: bash scripts/check/kernel_dispatch.sh	check-no-scalar-f32-leak: ok	-	an option the tool does not have is a usage error
-clean_root_twice	--root {} --root {}	both	2	usage: bash scripts/check/kernel_dispatch.sh	check-no-scalar-f32-leak: ok	-	a repeated --root is a usage error, not last-one-wins
+clean_root_twice	--root {} --root {}	both	0	check-no-scalar-f32-leak: ok (1 files scanned)	check-no-scalar-f32-leak: FAIL;;(2 files scanned)	-	a root given twice is scanned once, not twice
 trailing_comment_hides_end	--root {}	both	1	check-no-scalar-f32-leak: FAIL;;trailing_comment_hides_end/model.rs:3: unguarded scalar_f32(	check-no-scalar-f32-leak: ok	-	a trailing comment does not keep the statement open for a cast on the next line
 trailing_comment_mention	--root {}	both	0	check-no-scalar-f32-leak: ok (1 files scanned)	check-no-scalar-f32-leak: FAIL;;unguarded scalar_f32(	-	a trailing comment that names scalar_f32( is not a call
 string_holds_marker_text	--root {}	both	1	check-no-scalar-f32-leak: FAIL;;string_holds_marker_text/model.rs:3: unguarded scalar_f32(	check-no-scalar-f32-leak: ok	-	marker text inside a string literal is no marker
@@ -53,3 +53,11 @@ chain_end_comment	--root {}	both	1	check-no-scalar-f32-leak: FAIL;;chain_end_com
 comment_names_cast	--root {}	both	1	check-no-scalar-f32-leak: FAIL;;comment_names_cast/model.rs:3: unguarded scalar_f32(	check-no-scalar-f32-leak: ok	-	a cast named only in a trailing comment is no guard
 char_quote_hides_call	--root {}	both	1	check-no-scalar-f32-leak: FAIL;;char_quote_hides_call/model.rs:3: unguarded scalar_f32(;;char_quote_hides_call/model.rs:4: unguarded scalar_f32(	check-no-scalar-f32-leak: ok	-	a quote inside the character literals '"' and '\"' does not flip the string state, so the call behind a later string is still code
 char_quote_marker	--root {}	both	0	check-no-scalar-f32-leak: ok (1 files scanned)	check-no-scalar-f32-leak: FAIL;;unguarded scalar_f32(	-	a quote inside the character literals '"' and '\"' opens no string, so the marker after them is still a comment
+args_on_own_line	--root {}	both	0	check-no-scalar-f32-leak: ok (1 files scanned)	check-no-scalar-f32-leak: FAIL;;unguarded scalar_f32(	-	an argument on its own line ending in a comma does not end the statement: the cast after the call still guards it
+brace_terminated	--root {}	both	1	check-no-scalar-f32-leak: FAIL;;brace_terminated/model.rs:3: unguarded scalar_f32(	check-no-scalar-f32-leak: ok	-	a closing brace ends the statement, so a cast on the next line guards another statement
+cast_in_continuation_comment	--root {}	both	1	check-no-scalar-f32-leak: FAIL;;cast_in_continuation_comment/model.rs:3: unguarded scalar_f32(	check-no-scalar-f32-leak: ok	-	a cast named only in a comment on a continuation line is no guard
+marker_no_colon	--root {}	both	1	check-no-scalar-f32-leak: FAIL;;marker_no_colon/model.rs:3: unguarded scalar_f32(	check-no-scalar-f32-leak: ok	-	an f32-ok marker without its colon exempts nothing
+target_dir	--root {}	both	0	check-no-scalar-f32-leak: ok (1 files scanned)	check-no-scalar-f32-leak: FAIL;;gen.rs	-	a target/ directory is build output and is not scanned
+marker_trailing_above	--root {}	both	0	check-no-scalar-f32-leak: ok (1 files scanned)	check-no-scalar-f32-leak: FAIL;;unguarded scalar_f32(	-	a marker in the trailing comment of the code line directly above exempts the call
+clean	--root {}/model.rs	both	2	scan root is not a directory	scan root does not exist;;check-no-scalar-f32-leak: ok	-	a scan root that is a file is refused as not a directory
+clean	--root {} --root {}/absent	both	2	scan root does not exist	check-no-scalar-f32-leak: ok	-	every root given is checked, not only the first

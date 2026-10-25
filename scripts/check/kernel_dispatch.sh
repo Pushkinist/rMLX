@@ -2,11 +2,10 @@
 # CI gate: Metal-kernel dispatchers keep inputs lazy, return the caller's dtype, leak no f32 scalar.
 #
 # One population, three rules: the Rust that dispatches the custom Metal kernels of the crates
-# that own `.metal` files. dtype-contract and scalar-f32 take the crates from
-# `scripts/metal_dirs.sh` (the one list; nothing here restates it): each directory listed there
-# names a crate's `metal/` directory, and the Rust sits one level up. input-eval scans
-# `crates/rmlx-kv-quant/src` alone, because its `_common.rs` arm also catches a file outside the
-# KV codec layer that evaluates on purpose. `--root DIR` scans exactly DIR in every mode.
+# that own `.metal` files. Every mode takes the crates from `scripts/metal_dirs.sh` (the one
+# list; nothing here restates it): each directory listed there names a crate's `metal/`
+# directory, and the Rust sits one level up. `--root DIR` scans exactly the DIRs given, in every
+# mode, and may be repeated.
 #
 # input-eval: no blocking `Array::eval()` on a kernel input.
 #
@@ -22,10 +21,11 @@
 #   `MetalKernel::new`) happens inside that same `eval_gpu`. The long form of this argument
 #   lives in the `flash_decode_common` module docs.
 #
-#   Scanned: every non-test `.rs` file that constructs a `MetalKernelInvoke` (a dispatcher) or
-#   whose name ends in `_common.rs` (a shared scaffold), keyed on shape and never on a codec
-#   or architecture name, so a rename or a move keeps a file in scope. The `_common.rs` arm
-#   keeps an eval from hiding one call deep in a helper every dispatcher imports.
+#   Scanned: every non-test `.rs` file that constructs a `MetalKernelInvoke` (a dispatcher), and
+#   every `*_common.rs` file (a shared scaffold) in a directory that holds a dispatcher. Keyed on
+#   shape and never on a codec or architecture name, so a rename or a move keeps a file in scope.
+#   The scaffold arm keeps an eval from hiding one call deep in a helper the dispatchers beside it
+#   import; a `_common.rs` with no dispatcher beside it is no scaffold of one and is not scanned.
 #
 #   A `.eval(` or `::eval(` call is a violation unless the same call carries an
 #   `// eval-ok: <reason>` marker, on its own line or on the contiguous comment lines
@@ -48,7 +48,8 @@
 #                - (# of those outputs fed straight back into another kernel via
 #                   `add_input(&x)`, which never leave the function)
 #     guards   = # of casts to a derived dtype (`.astype(x.dtype(), ..)`, `.astype(out_dtype, ..)`)
-#                after the last `.apply(`; a cast before it lands on an input and guards nothing.
+#                after the call of the last `.apply(`, in its statement or a later one; a cast
+#                before it, or inside its arguments, lands on an input and guards nothing.
 #   A function passes when `guards >= escaping`, or when a `// f32-out-ok: <reason>` marker
 #   sits in the comment and attribute block directly above its signature (the walk back stops
 #   at the first line of anything else, so a marker cannot leak across a `const`, a `use` or a
@@ -77,16 +78,19 @@
 #
 # Floor. A rename or a move that drops a dispatcher out of the scan must fail the gate, not
 # shrink its coverage: input-eval counts scanned files and dtype-contract counts f32-declaring
-# functions, and either fails below `--min N`. The default floor is the figure the real tree
-# gives for the derived crates; lower it only against a file or function gone from the tree,
-# in the same change. With `--root` and no `--min` the floor is 1. scalar-f32 has no floor
-# (every non-test file is in its population, which has no stable count) and fails on an empty
-# scan instead.
+# functions, and either fails below `--min N` (1 to 9 digits, no leading zero). The default
+# floor is the figure the real tree gives for the derived crates, files for input-eval and
+# functions for dtype-contract; lower it only against a file or function gone from the tree,
+# in the same change. With `--root` and no `--min` the floor is 1. No recall table can see a
+# default raised or lowered, because every row names its own `--root`: the real-tree targets
+# run with the default and are what catches it. scalar-f32 has no floor (every non-test file
+# is in its population, which has no stable count) and fails on an empty scan instead.
 #
-# Usage:  bash scripts/check/kernel_dispatch.sh <input-eval|dtype-contract|scalar-f32> [--root DIR] [--min N]
+# Usage:  bash scripts/check/kernel_dispatch.sh <input-eval|dtype-contract|scalar-f32> [--root DIR]... [--min N]
 # Exit:   0 clean; 1 a violation, or fewer files or functions than the floor; 2 usage error
-#         (no mode, an unknown mode, a bad or repeated option, --min on scalar-f32), a scan
-#         root that is not a directory, or nothing to scan (scalar-f32)
+#         (no mode, an unknown mode, a bad option, a repeated --min, an invalid --min, --min on
+#         scalar-f32), a scan root that is not a directory, nothing to scan (scalar-f32), or an
+#         awk scan that failed
 # Not a mode of: check_eval_lock.sh — that gate reads every MLX eval FFI call of the workspace
 #                for the lock held around it; this one reads only the dispatcher files of the
 #                crates that own `.metal` kernels, for three rules that are not about a lock
@@ -98,7 +102,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 . "$REPO_ROOT/scripts/lib/awk_text.sh"
 
 usage() {
-    echo "usage: bash scripts/check/kernel_dispatch.sh <input-eval|dtype-contract|scalar-f32> [--root DIR] [--min N]" >&2
+    echo "usage: bash scripts/check/kernel_dispatch.sh <input-eval|dtype-contract|scalar-f32> [--root DIR]... [--min N]" >&2
     exit 2
 }
 
@@ -108,19 +112,19 @@ input-eval | dtype-contract | scalar-f32) shift ;;
 *) usage ;;
 esac
 
-SCAN_ROOT=""
+SCAN_ROOTS=()
 MIN=""
 while [ $# -gt 0 ]; do
     case "$1" in
     --root)
-        [ $# -ge 2 ] && [ -n "$2" ] && [ -z "$SCAN_ROOT" ] || usage
-        SCAN_ROOT="$2"
+        [ $# -ge 2 ] && [ -n "$2" ] || usage
+        SCAN_ROOTS+=("$2")
         shift 2
         ;;
     --min)
         [ $# -ge 2 ] && [ -z "$MIN" ] || usage
         case "$2" in
-        '' | *[!0-9]* | 0) usage ;;
+        '' | *[!0-9]* | 0* | ??????????*) usage ;;
         esac
         MIN="$2"
         shift 2
@@ -133,7 +137,7 @@ case "$MODE" in
 input-eval)
     LABEL=check-no-kernel-input-eval
     UNIT="dispatcher/scaffold files"
-    DEFAULT_MIN=26
+    DEFAULT_MIN=29
     ;;
 dtype-contract)
     LABEL=check-kernel-dtype-contract
@@ -142,7 +146,6 @@ dtype-contract)
     ;;
 scalar-f32)
     LABEL=check-no-scalar-f32-leak
-    UNIT="files"
     if [ -n "$MIN" ]; then
         echo "$LABEL: scalar-f32 has no floor; --min is for input-eval and dtype-contract" >&2
         exit 2
@@ -150,45 +153,56 @@ scalar-f32)
     ;;
 esac
 
-if [ -n "$SCAN_ROOT" ]; then
-    SRC_DIRS=("$SCAN_ROOT")
-    FLOOR="${MIN:-1}"
+if [ "${#SCAN_ROOTS[@]}" -gt 0 ]; then
+    SRC_DIRS=("${SCAN_ROOTS[@]}")
 else
-    case "$MODE" in
-    input-eval) SRC_DIRS=("$REPO_ROOT/crates/rmlx-kv-quant/src") ;;
-    *)
-        # shellcheck source=scripts/metal_dirs.sh
-        . "$REPO_ROOT/scripts/metal_dirs.sh"
-        SRC_DIRS=()
-        for d in "${METAL_DIRS[@]}"; do
-            SRC_DIRS+=("${d%/metal}")
-        done
-        ;;
-    esac
-    FLOOR="${MIN:-${DEFAULT_MIN:-1}}"
+    # shellcheck source=scripts/metal_dirs.sh
+    . "$REPO_ROOT/scripts/metal_dirs.sh"
+    SRC_DIRS=()
+    for d in "${METAL_DIRS[@]}"; do
+        SRC_DIRS+=("${d%/metal}")
+    done
 fi
 
 for d in "${SRC_DIRS[@]}"; do
-    if [ ! -d "$d" ]; then
+    if [ ! -e "$d" ]; then
         echo "$LABEL: scan root does not exist: $d" >&2
+        exit 2
+    fi
+    if [ ! -d "$d" ]; then
+        echo "$LABEL: scan root is not a directory: $d" >&2
         exit 2
     fi
 done
 
+dispatcher_files() {
+    find "${SRC_DIRS[@]}" -type f -name '*.rs' \
+        ! -name '*_tests.rs' ! -name 'tests.rs' \
+        -exec grep -lq 'MetalKernelInvoke' {} \; \
+        -print
+}
+
+# The dispatchers, and each `*_common.rs` in a directory that holds one.
+input_eval_files() {
+    local dispatchers dirs nl scaffold
+    nl=$'\n'
+    dispatchers="$(dispatcher_files)"
+    [ -z "$dispatchers" ] || printf '%s\n' "$dispatchers"
+    dirs="$nl"
+    while IFS= read -r scaffold; do
+        [ -z "$scaffold" ] || dirs="$dirs${scaffold%/*}$nl"
+    done <<<"$dispatchers"
+    find "${SRC_DIRS[@]}" -type f -name '*_common.rs' | while IFS= read -r scaffold; do
+        case "$dirs" in
+        *"$nl${scaffold%/*}$nl"*) printf '%s\n' "$scaffold" ;;
+        esac
+    done
+}
+
 list_files() {
     case "$MODE" in
-    input-eval)
-        find "${SRC_DIRS[@]}" -type f -name '*.rs' \
-            ! -name '*_tests.rs' ! -name 'tests.rs' \
-            \( -name '*_common.rs' -o -exec grep -lq 'MetalKernelInvoke' {} \; \) \
-            -print
-        ;;
-    dtype-contract)
-        find "${SRC_DIRS[@]}" -type f -name '*.rs' \
-            ! -name '*_tests.rs' ! -name 'tests.rs' \
-            -exec grep -lq 'MetalKernelInvoke' {} \; \
-            -print
-        ;;
+    input-eval) input_eval_files ;;
+    dtype-contract) dispatcher_files ;;
     scalar-f32)
         find "${SRC_DIRS[@]}" -type f -name '*.rs' \
             -not -path '*/target/*' \
@@ -199,7 +213,7 @@ list_files() {
             -not -path '*/dr_venus/*' \
             -print
         ;;
-    esac | sort
+    esac | sort -u
 }
 
 # Each scan prints "file:line: ..." for a violation and exits 1; exit 0 is clean.
@@ -266,6 +280,20 @@ scan_dtype_contract() {
                 s = rest
             }
             return n
+        }
+
+        # What follows the call that opens at the last `.apply(` of `s`: the
+        # arguments of the dispatch are inputs, the chain after it is the output.
+        function after_last_apply(s,   p, q, i, depth, ch) {
+            p = 0
+            while ((q = index(substr(s, p + 1), ".apply(")) > 0) p += q
+            depth = 1
+            for (i = p + 7; i <= length(s); i++) {
+                ch = substr(s, i, 1)
+                if (ch == "(") depth++
+                else if (ch == ")" && --depth == 0) return substr(s, i + 1)
+            }
+            return ""
         }
 
         # Does the doc/attribute block directly above line `i` carry the
@@ -338,6 +366,7 @@ scan_dtype_contract() {
                         if (a != "" && index(removed, " " a " ") > 0) internal++
                     }
                     if (k > last_apply) guards += derived_astype_count(st[k])
+                    else if (k == last_apply) guards += derived_astype_count(after_last_apply(st[k]))
                 }
 
                 if (f32_out == 0) continue
@@ -597,9 +626,20 @@ if [ "$VIOLATIONS" -ne 0 ]; then
     exit 1
 fi
 
+if [ "$MODE" = scalar-f32 ]; then
+    echo "$LABEL: ok (${#FILES[@]} files scanned)"
+    exit 0
+fi
+
 FOUND="${#FILES[@]}"
 if [ "$MODE" = dtype-contract ]; then
     FOUND="$(awk '{ s += $2 } END { print s + 0 }' "$TOTALS_FILE")"
+fi
+
+if [ "${#SCAN_ROOTS[@]}" -gt 0 ]; then
+    FLOOR="${MIN:-1}"
+else
+    FLOOR="${MIN:-$DEFAULT_MIN}"
 fi
 
 if [ "$FOUND" -lt "$FLOOR" ]; then
@@ -613,5 +653,5 @@ fi
 
 case "$MODE" in
 dtype-contract) echo "$LABEL: ok (${#FILES[@]} dispatcher files, $FOUND f32-declaring functions)" ;;
-*) echo "$LABEL: ok ($FOUND $UNIT scanned)" ;;
+input-eval) echo "$LABEL: ok ($FOUND $UNIT scanned)" ;;
 esac

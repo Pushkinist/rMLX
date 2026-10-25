@@ -23,12 +23,17 @@
 # A needle in the has column is a fixed string; "A;>B" is one needle that holds
 # when B appears after the first A, for output whose order is part of the contract.
 #
+# A gate that takes a mode word gets the mode of its table. A first word "!name" in args
+# replaces it ("!bogus --root {}" runs an unknown mode, "! --root {}" runs none), for the
+# rows that prove the refusal of a mode.
+#
 # Usage:  bash scripts/check/rust_gates_fixtures.sh <mode>
 #         mode: eval_lock | gpu_tests_ignored | kernel_dtype_contract | no_kernel_input_eval |
 #               kv_layer_quants | no_decode_swallow | no_inline_tests | scalar_f32_leak
 # Exit:   0 every case held; 1 a case did not, or none ran; 2 an unknown mode, a
 #         missing table, a malformed row (not 8 fields, a fixture name that is a
-#         path, args without "{}", a needle that is blank) or no awk on the machine
+#         path, args without "{}", a "!mode" word for a gate with no mode word, a needle that
+#         is blank) or no awk on the machine
 
 set -euo pipefail
 
@@ -195,6 +200,16 @@ for impl in "${AWKS[@]}"; do
         fi
         ARGV=()
         read -r -a words <<<"$args"
+        mode_word="$GATE_MODE"
+        case "${words[0]}" in
+        '!'*)
+            if [ -z "$GATE_MODE" ]; then
+                st_die "scripts/fixtures/$MODE/cases.tsv: '$fixture': args '$args' name a mode, and this gate has none"
+            fi
+            mode_word="${words[0]#!}"
+            words=("${words[@]:1}")
+            ;;
+        esac
         for word in "${words[@]}"; do
             ARGV+=("${word//\{\}/$FIX/$fixture}")
         done
@@ -204,9 +219,9 @@ for impl in "${AWKS[@]}"; do
         add_needles --lacks "$lacks"
         if [ "$is" != - ]; then CHECKS+=(--is "$(printf '%b' "$is")"); fi
         case "$stream" in
-        both) st_run env PATH="$RUN_PATH" bash "$GATE" ${GATE_MODE:+"$GATE_MODE"} "${ARGV[@]}" ;;
-        out) st_run stdout_of env PATH="$RUN_PATH" bash "$GATE" ${GATE_MODE:+"$GATE_MODE"} "${ARGV[@]}" ;;
-        err) st_run stderr_of env PATH="$RUN_PATH" bash "$GATE" ${GATE_MODE:+"$GATE_MODE"} "${ARGV[@]}" ;;
+        both) st_run env PATH="$RUN_PATH" bash "$GATE" ${mode_word:+"$mode_word"} "${ARGV[@]}" ;;
+        out) st_run stdout_of env PATH="$RUN_PATH" bash "$GATE" ${mode_word:+"$mode_word"} "${ARGV[@]}" ;;
+        err) st_run stderr_of env PATH="$RUN_PATH" bash "$GATE" ${mode_word:+"$mode_word"} "${ARGV[@]}" ;;
         esac
         why="$(st_check "$want" ${CHECKS[@]+"${CHECKS[@]}"})"
         for chain in ${ORDERED[@]+"${ORDERED[@]}"}; do
