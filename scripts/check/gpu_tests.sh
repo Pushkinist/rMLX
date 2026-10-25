@@ -465,10 +465,8 @@
 #   exits 2.
 #
 # LOC-exempt: one classifier shared by two rules and the listing; the rule text is the spec
-# Usage:  bash scripts/check/gpu_tests.sh <ignored|skip-notices|list> [--files] [--listing FILE] [--root DIR]
+# Usage:  bash scripts/check/gpu_tests.sh <ignored|skip-notices|list> [--files] [--root DIR]
 #         --files    list only: add the declaring file as a third column
-#         --listing  skip-notices only: read the classified tests (`<crate><TAB><fn><TAB><file>`
-#                    per line) from FILE instead of classifying --root
 #         --root     scan DIR instead of the repository
 # Exit:   0 clean, or the listing printed; 1 a rule fired, or (ignored, list) the classification
 #         cannot be trusted: no member, no test file, a directory or file it could not read, a
@@ -489,7 +487,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 usage() {
     echo "gpu_tests: $1" >&2
-    echo "usage: bash scripts/check/gpu_tests.sh <ignored|skip-notices|list> [--files] [--listing FILE] [--root DIR]" >&2
+    echo "usage: bash scripts/check/gpu_tests.sh <ignored|skip-notices|list> [--files] [--root DIR]" >&2
     exit 2
 }
 
@@ -503,7 +501,6 @@ esac
 shift
 
 FILES=0
-LISTING=""
 ROOT_ARG=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -511,13 +508,6 @@ while [ $# -gt 0 ]; do
         [ "$MODE" = list ] || usage "--files belongs to list"
         FILES=1
         shift
-        ;;
-    --listing)
-        [ "$MODE" = skip-notices ] || usage "--listing belongs to skip-notices"
-        [ $# -ge 2 ] || usage "--listing needs a file"
-        [ -z "$LISTING" ] || usage "--listing given twice"
-        LISTING="$2"
-        shift 2
         ;;
     --root)
         [ $# -ge 2 ] || usage "--root needs a directory"
@@ -1353,13 +1343,8 @@ mode_skip_notices() {
     local gpu_files files notices records f out
     local violations n silent n_silent other n_other waivers n_waivers red rel
 
-    if [ -n "$LISTING" ]; then
-        [ -f "$LISTING" ] || usage "--listing: no such file: $LISTING"
-        classification="$(cat "$LISTING")"
-    else
-        classify_root
-        classification="$(list_rows files)"
-    fi
+    classify_root
+    classification="$(list_rows files)"
     if [ -z "${classification}" ]; then
         echo "ERROR: the classification produced no GPU tests — the scan" >&2
         echo "would pass by having nothing to look at." >&2
