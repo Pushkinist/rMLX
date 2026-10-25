@@ -46,9 +46,9 @@
 #   regex here.
 #
 #   Use `blank_strings` where a needle must not match text a program merely
-#   prints. Do NOT use it where the needle IS a literal: `check_spec_charge.sh`
-#   reads the per-round event's target that way, and blanking would make that
-#   rule unfireable.
+#   prints. Do NOT use it where the needle IS a literal: the charge mode of
+#   `check/spec_round_loops.sh` reads the per-round event's target that way, and
+#   blanking would make that rule unfireable.
 
 # shellcheck disable=SC2034  # consumed by the gates that source this file
 readonly AWK_TEXT_FNS='

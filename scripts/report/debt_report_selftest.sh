@@ -180,7 +180,7 @@ check "round_loop_group_named" \
     BASE_OUT
 
 check "round_loop_driver_count" \
-    "population (a) — the driver signature AND a constructed RoundTotals, check_spec_charge.sh's own rule — finds exactly the one fn that carries both, not every signature match" \
+    "population (a) — the driver signature AND a constructed RoundTotals, check/spec_round_loops.sh's own rule — finds exactly the one fn that carries both, not every signature match" \
     contains "  1 driver(s) found" \
     BASE_OUT
 
@@ -194,7 +194,7 @@ check "round_loop_no_pairwise" \
     contains "  no pairwise similarity (fewer than two drivers)" \
     BASE_OUT
 
-# A dead producer (check_spec_charge.sh missing/broken) also reports 0
+# A dead producer (check/spec_round_loops.sh missing/broken) also reports 0
 # drivers, which would make every absent-check below pass for the wrong
 # reason. This pins that BASE_OUT is a genuinely healthy scan, not that.
 check "base_out_not_unavailable" \
@@ -234,8 +234,8 @@ rm -f "$TOTALS_WORK/base/crates/rmlx-models/src/speculative/mtp.rs.bak"
 TOTALS_OUT=$(python3 "$TOOL" --root "$TOTALS_WORK/base" --since HEAD)
 
 check "totals_removed_reports_unavailable" \
-    "renaming the sole driver and removing its RoundTotals leaves check_spec_charge.sh's own population empty, which is a refusal (exit 2, 'found no round loop'), not a silent 0" \
-    contains "  unavailable (check_spec_charge.sh --list-drivers failed (exit 2): check-spec-charge: found no round loop" \
+    "renaming the sole driver and removing its RoundTotals leaves check/spec_round_loops.sh's own population empty, which is a refusal (exit 2, 'found no round loop'), not a silent 0" \
+    contains "  unavailable (check/spec_round_loops.sh list-drivers failed (exit 2): check-spec-charge: found no round loop" \
     TOTALS_OUT
 
 check "totals_removed_no_driver_count_line" \
@@ -250,7 +250,7 @@ check "totals_removed_old_name_absent" \
 
 rm -rf "$TOTALS_WORK"
 
-# ---- a dead producer (check_spec_charge.sh unreachable) is unavailable, ---
+# ---- a dead producer (check/spec_round_loops.sh unreachable) is unavailable, ---
 # ---- never a silent 0 — the concrete failure the guard above rules out ----
 
 DEAD_OUT=$(python3 - "$REPO_ROOT/scripts/report" "$STATIC_WORK/base" <<'EOF'
@@ -258,7 +258,7 @@ import sys
 sys.path.insert(0, sys.argv[1])
 import debt_report as dr
 from pathlib import Path
-dr.CHECK_SPEC_CHARGE_SCRIPT = Path("/nonexistent/check_spec_charge.sh")
+dr.SPEC_ROUND_LOOPS_TOOL = Path("/nonexistent/spec_round_loops.sh")
 lines = []
 dr.report_sibling_similarity(Path(sys.argv[2]), lines)
 print("\n".join(lines))
@@ -267,7 +267,7 @@ EOF
 
 check "dead_producer_reports_unavailable" \
     "pointing the gate script at a path that does not exist surfaces as unavailable" \
-    contains "  unavailable (check_spec_charge.sh not found at /nonexistent/check_spec_charge.sh)" \
+    contains "  unavailable (check/spec_round_loops.sh not found at /nonexistent/spec_round_loops.sh)" \
     DEAD_OUT
 
 check "dead_producer_no_driver_count_line" \
@@ -349,7 +349,7 @@ EOF
 MOVED_OUT=$(python3 "$TOOL" --root "$MOVED_WORK/base" --since HEAD)
 
 check "unresolved_driver_reported_not_zero" \
-    "check_spec_charge.sh excludes only by filename (*_tests.rs / tests.rs) and still lists a driver under a tests/ subdirectory; rust_files() excludes the whole subdirectory by path component and cannot resolve it — this reads as 1 listed, 0 resolved, not a silent 0 driver(s) found" \
+    "check/spec_round_loops.sh excludes only by filename (*_tests.rs / tests.rs) and still lists a driver under a tests/ subdirectory; rust_files() excludes the whole subdirectory by path component and cannot resolve it — this reads as 1 listed, 0 resolved, not a silent 0 driver(s) found" \
     contains "  1 listed, 0 resolved" \
     MOVED_OUT
 

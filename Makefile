@@ -550,19 +550,19 @@ check-spec-metric-parity-fixtures: ## CI gate: recall test for the above — one
 
 .PHONY: check-spec-sampling
 check-spec-sampling: ## CI gate: fail if a speculative round loop is not handed the request's sampler, or a drafter arm does not pass it
-	@bash scripts/check_spec_sampling.sh
+	@bash scripts/check/spec_round_loops.sh sampling
 
 .PHONY: check-spec-sampling-fixtures
-check-spec-sampling-fixtures: ## CI gate: recall test for the above — 31 cases over four tree shapes, each asserting the reason as well as exit 1 vs exit 2
-	@bash scripts/check_spec_sampling_fixtures.sh
+check-spec-sampling-fixtures: ## CI gate: recall test for the above — 34 cases over four tree shapes, each asserting the reason as well as exit 1 vs exit 2
+	@bash scripts/check/spec_round_loops_selftest.sh sampling
 
 .PHONY: check-spec-charge
 check-spec-charge: ## CI gate: fail if a speculative round loop names more than one phase-charge decision, or the census over the loops moves
-	@bash scripts/check_spec_charge.sh
+	@bash scripts/check/spec_round_loops.sh charge
 
 .PHONY: check-spec-charge-fixtures
-check-spec-charge-fixtures: ## CI gate: recall test for the above — 76 cases over three tree shapes, each asserting the reason as well as exit 1 vs exit 2
-	@bash scripts/check_spec_charge_fixtures.sh
+check-spec-charge-fixtures: ## CI gate: recall test for the above, and for the driver listing and the arguments — 92 cases over three tree shapes, each asserting the reason as well as exit 1 vs exit 2
+	@bash scripts/check/spec_round_loops_selftest.sh charge
 
 .PHONY: spec-round-stream-selftest
 spec-round-stream-selftest: ## CI gate: recall test for the round-stream manifest reader — 17 cases, a stale pin and a true one among them
@@ -751,10 +751,10 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_kv_boundary_default_parity.sh
 	@bash scripts/check_spec_metric_parity.sh
 	@bash scripts/check_spec_metric_parity_fixtures.sh
-	@bash scripts/check_spec_sampling.sh
-	@bash scripts/check_spec_sampling_fixtures.sh
-	@bash scripts/check_spec_charge.sh
-	@bash scripts/check_spec_charge_fixtures.sh
+	@bash scripts/check/spec_round_loops.sh sampling
+	@bash scripts/check/spec_round_loops_selftest.sh sampling
+	@bash scripts/check/spec_round_loops.sh charge
+	@bash scripts/check/spec_round_loops_selftest.sh charge
 	@bash scripts/spec_round_stream_compare_selftest.sh
 	@python3 scripts/published_samples.py verify
 	@bash scripts/check_published_samples_fixtures.sh

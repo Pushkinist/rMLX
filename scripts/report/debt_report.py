@@ -29,7 +29,7 @@ Report: four sections, in order: sibling-file/fn similarity ("twins"), debt
 counters (`#[allow(` sites, debt-marker comments, `check-*` Make targets and
 oversized files without `LOC-exempt`), the churn since the last tag, summed over
 commits, and oversized docs. The round-loop drivers print as a named group in
-the first section, read from `check_spec_charge.sh --list-drivers`.
+the first section, read from `check/spec_round_loops.sh list-drivers`.
 Reads only files under ``--root`` (default: the repo this file lives in) plus
 ``git log`` against that same working tree — no network, no other machine path.
 
@@ -180,7 +180,7 @@ TURBO_SSD_FN_PATTERN = r"(turbo|tsym)"
 MODELS_SOURCE_DIR = "crates/rmlx-models/src"
 SSD_HYDRATE_FN_NAMES = ("from_hydrated", "hydrate")
 WORKSPACE_SOURCE_DIR = "crates"
-CHECK_SPEC_CHARGE_SCRIPT = Path(__file__).resolve().parents[1] / "check_spec_charge.sh"
+SPEC_ROUND_LOOPS_TOOL = Path(__file__).resolve().parents[1] / "check" / "spec_round_loops.sh"
 
 DEBT_COMMENT_RE = re.compile(
     r"\b(inert|dormant|deferred|kept for|future-reference|no longer)\b",
@@ -292,10 +292,10 @@ class DriverGroup:
 
 def list_driver_population(root: Path) -> list[tuple[str, str, int]]:
     """``(file, fn, line)`` triples for population (a) — round loops —
-    exactly as ``check_spec_charge.sh``'s ``check-spec-charge`` gate derives
-    them: the driver signature plus a constructed ``RoundTotals``. Runs the
-    real gate script in ``--list-drivers`` mode with ``--root`` pointed at
-    ``root`` — the same flag its own fixture recall test uses to aim the gate
+    exactly as ``check/spec_round_loops.sh`` derives them for its ``charge``
+    mode: the driver signature plus a constructed ``RoundTotals``. Runs the
+    real gate script in ``list-drivers`` mode with ``--root`` pointed at
+    ``root`` — the same flag its own recall test uses to aim the gate
     at a synthetic tree — so this is the population's one producer rather
     than a second copy of its rule. The line number is part of the join key:
     file and fn name alone collide when two same-named fns live in one file.
@@ -305,10 +305,10 @@ def list_driver_population(root: Path) -> list[tuple[str, str, int]]:
     genuinely has none) and "found no round loop" (the gate scanned and the
     population came back empty) — both read as ``unavailable`` upstream, not
     as a silent ``0 driver(s) found`` indistinguishable from a real answer."""
-    if not CHECK_SPEC_CHARGE_SCRIPT.is_file():
-        raise RuntimeError(f"check_spec_charge.sh not found at {CHECK_SPEC_CHARGE_SCRIPT}")
+    if not SPEC_ROUND_LOOPS_TOOL.is_file():
+        raise RuntimeError(f"check/spec_round_loops.sh not found at {SPEC_ROUND_LOOPS_TOOL}")
     proc = subprocess.run(
-        ["bash", str(CHECK_SPEC_CHARGE_SCRIPT), "--list-drivers", "--root", str(root)],
+        ["bash", str(SPEC_ROUND_LOOPS_TOOL), "list-drivers", "--root", str(root)],
         capture_output=True,
         text=True,
     )
@@ -316,7 +316,7 @@ def list_driver_population(root: Path) -> list[tuple[str, str, int]]:
         raise RuntimeError("no speculative source directory")
     if proc.returncode != 0:
         raise RuntimeError(
-            f"check_spec_charge.sh --list-drivers failed (exit {proc.returncode}): "
+            f"check/spec_round_loops.sh list-drivers failed (exit {proc.returncode}): "
             f"{proc.stderr.strip()}"
         )
     triples: list[tuple[str, str, int]] = []
@@ -605,15 +605,15 @@ def report_sibling_similarity(root: Path, lines: list[str]) -> None:
         "text (autojunk off); no other normalisation"
     )
 
-    # Named group: population (a) of check-spec-charge — the round loops —
-    # read from check_spec_charge.sh --list-drivers, not re-derived here.
+    # Named group: the round loops, read from check/spec_round_loops.sh
+    # list-drivers, not re-derived here.
     # Always printed, not gated on the similarity threshold — this is the
     # standing violation the twin rule names, not a candidate.
     lines.append("")
     lines.append(f"--- round-loop drivers ({SPEC_DIR}) ---")
     lines.append(
-        "  a driver is population (a) of check-spec-charge "
-        "(`scripts/check_spec_charge.sh --list-drivers`)"
+        "  a driver is a round loop of check-spec-charge "
+        "(`scripts/check/spec_round_loops.sh list-drivers`)"
     )
     try:
         group = discover_drivers(root)
