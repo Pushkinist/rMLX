@@ -62,7 +62,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `published_table_selftest.sh` | make ci, make published-table-selftest | Mutation check for lib/published_table.py: a fixture snapshot, asserting exit code and reason. |
 | `rmlx-capture.entitlements` | make build-capture | Debug-only entitlement for the GPU-capture binary (`make build-capture`). |
 | `run_gpu_tests.sh` | make ci-perf, make gpu-test, run_gpu_tests_selftest.sh | Run the #[ignore] Metal tests of every member crate, serialized, under Metal shader validation. |
-| `run_gpu_tests_selftest.sh` | make ci, make gpu-runner-selftest | Recall test for run_gpu_tests.sh: how it reports red runs, waivers and census verdicts. |
+| `run_gpu_tests_selftest.sh` | make ci, make gpu-runner-selftest, report/scripts_gate_selftest.sh | Recall test for run_gpu_tests.sh: how it reports red runs, waivers and census verdicts. |
 | `schema_constraint_canary.sh` | make schema-constraint-canary | Real-model proof for the json_schema constrained-decoding path: two probes, two architectures. |
 | `sdpa_headdim_bench.py` | none | What MLX's SDPA dispatch costs as a function of `head_dim`. |
 | `spec_bench.sh` | make spec-canary, check_spec_metric_parity_fixtures.sh, spec_bench_selftest.sh | spec_bench.sh — bench one model in normal vs MTP speculative-decode mode. |

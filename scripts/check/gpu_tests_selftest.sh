@@ -1418,13 +1418,13 @@ unreadable "$CASE_ROOT/crates/zz" skip_notices_refuses_a_crates_directory_it_can
 workspace an_unreadable_workspace_manifest_is_refused
 gpu_test 'eprintln!("SKIP gpu_alpha: no snapshot");'
 unreadable "$CASE_ROOT/Cargo.toml" list_refuses_an_unreadable_workspace_manifest 1 \
-    --has "cannot read $CASE_ROOT/Cargo.toml" \
+    --has "cannot read $CASE_ROOT/Cargo.toml" --lacks "parsed 0 workspace members" \
     -- bash "$TOOL" list --root "$CASE_ROOT"
 unreadable "$CASE_ROOT/Cargo.toml" ignored_refuses_an_unreadable_workspace_manifest 1 \
-    --has "cannot read $CASE_ROOT/Cargo.toml" \
+    --has "cannot read $CASE_ROOT/Cargo.toml" --lacks "parsed 0 workspace members" \
     -- bash "$TOOL" ignored --root "$CASE_ROOT"
 unreadable "$CASE_ROOT/Cargo.toml" skip_notices_refuses_an_unreadable_workspace_manifest 2 \
-    --has "cannot read $CASE_ROOT/Cargo.toml" \
+    --has "cannot read $CASE_ROOT/Cargo.toml" --lacks "parsed 0 workspace members" \
     -- bash "$TOOL" skip-notices --root "$CASE_ROOT"
 
 # A command that fails reaches the verdict. The one that stands in for the real one fails when

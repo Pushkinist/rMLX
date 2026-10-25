@@ -2507,6 +2507,25 @@ st_case runner_summary_without_a_skip_is_unchanged 0 --what "with no skipped cas
     --is "  ok   held
 child: 1 passed, 0 failed" -- runner_child "$body"
 
+body="$ST_WORK/runner_only_skips"
+cat >"$body" <<'EOF'
+st_skip only "cannot run here"
+st_done
+EOF
+st_case runner_a_run_of_skips_only_is_no_case_ran 1 --what "a run in which every case was skipped checked nothing, and is not a clean run" \
+    --has "child: 0 passed, 0 failed, 1 skipped" --has "child: no case ran" -- runner_child "$body"
+
+# The GPU runner's recall test counts its own skips and says so on its last line. A shim makes
+# `chmod 000` a no-op, so the paths it makes unreadable stay readable, as for root, and it must
+# skip the checks that need them.
+shim="$ST_WORK/chmod_shim"
+mkdir -p "$shim"
+printf '#!/bin/sh\n[ "$1" = 000 ] && exit 0\nexec %s "$@"\n' "$(command -v chmod)" >"$shim/chmod"
+chmod +x "$shim/chmod"
+st_case runner_selftest_counts_its_skips 0 --what "the GPU runner's recall test reports how many checks it skipped" \
+    --has "check(s) were skipped on this host" \
+    -- st_bounded 900 env PATH="$shim:$PATH" bash "$REPO_ROOT/scripts/run_gpu_tests_selftest.sh"
+
 # ---- the real tree -------------------------------------------------------
 
 # The pin counts are literals, so a chunk that shrinks a pin lowers them in the same commit
