@@ -5,7 +5,8 @@ Usage:  doc_refs.py [--root DIR] [--base REF|auto] [--list]
         doc_refs.py --source-paths [--root DIR]
 Exit:   0 pass; 1 a broken or re-pointed reference, or a cited source path that
         does not exist; 2 could not run (not a git work tree, no tracked docs,
-        an unknown base)
+        an unknown base, or --source-paths reading docs that cite no `crates/`
+        source path at all)
 
 A reference is text in a tracked file that names a doc under `docs/`, and
 maybe something inside it. A doc is named by its `docs/` path, by a bare
@@ -98,7 +99,10 @@ that begins `crates/` and ends in .rs, .metal, .sql, .toml or .txt, in a file
 git tracks under `docs/`, names a file that exists. Fenced code blocks are read
 too: a snippet naming a moved file is as wrong as prose naming it. Identifiers
 (a test or function name) and paths outside `crates/` are not read. It takes no
---base: a citation to a missing file fails whatever the base held.
+--base, not even an empty one: a citation to a missing file fails whatever the
+base held. Docs that cite no such path at all are exit 2, not a pass: a pattern
+that read nothing has checked nothing. A line ends at a newline and nowhere
+else, so the numbers match `grep -n`.
 """
 
 from __future__ import annotations
@@ -425,7 +429,8 @@ def refs_after(tail: str) -> tuple[list[tuple[str, str, bool]], int]:
 
 
 def collect(tree: Tree, doc_names: set[str]) -> list[tuple[Ref, int]]:
-    """Every reference in `tree`; a bare doc name resolves against `doc_names`. MAP refs carry line 0."""
+    """Every reference in `tree`, sorted by citing file and line; a bare doc name
+    resolves against `doc_names`. MAP refs carry line 0."""
     refs: list[tuple[Ref, int]] = []
     for citing, text in tree.files.items():
         if citing in tree.fixtures:
@@ -471,7 +476,7 @@ def collect(tree: Tree, doc_names: set[str]) -> list[tuple[Ref, int]]:
         for doc in sorted(tree.docs):
             if doc.count("/") == 1:
                 refs.append((Ref("CLAUDE.md", "MAP", doc, ""), 0))
-    return refs
+    return sorted(refs, key=lambda item: (item[0].citing, item[1], item[0].kind, item[0].doc, item[0].key, item[0].runs_on))
 
 
 def describe(ref: Ref, line: int) -> str:
@@ -487,7 +492,7 @@ def cited_source_paths(root: Path) -> tuple[list[str], list[tuple[str, int, str]
     docs = [d for d in listed if d and (root / d).is_file()]
     cited = []
     for doc in docs:
-        text = (root / doc).read_text(encoding="utf-8", errors="replace")
+        text = (root / doc).read_bytes().decode("utf-8", errors="replace")
         for number, line in enumerate(text.split("\n"), 1):
             cited += [(doc, number, path) for path in SOURCE_PATH.findall(line)]
     return docs, cited
@@ -502,7 +507,10 @@ def check_source_paths(root: Path) -> int:
     if not docs:
         print(f"doc_refs: could not run: no tracked docs/*.md under {root}", file=sys.stderr)
         return 2
-    missing = [(doc, line, path) for doc, line, path in cited if not (root / path).exists()]
+    if not cited:
+        print(f"doc_refs: could not run: no `crates/` source path is cited in the {len(docs)} docs/*.md read", file=sys.stderr)
+        return 2
+    missing = sorted((doc, line, path) for doc, line, path in cited if not (root / path).exists())
     if missing:
         print("ERROR: source paths cited in docs/ that do not exist:", file=sys.stderr)
         for doc, line, path in missing:
@@ -523,7 +531,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     root = Path(args.root)
     if args.source_paths:
-        if args.base or args.list:
+        if args.base is not None or args.list:
             parser.error("--source-paths takes no --base and no --list")
         return check_source_paths(root)
 
