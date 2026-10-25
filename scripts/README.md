@@ -81,12 +81,12 @@ directories, are pinned (section 11) until they move. `fixtures/` is not
 scanned. A new directory needs three files that share its meaning and a row
 here. [review]
 
-* A recall test lives beside its subject as `<subject>_selftest.sh`. [review]
-* The recall tests of the gates that read Rust source over a planted tree are the
-  modes of `check/rust_gates_fixtures.sh`: one `fixtures/<gate>/cases.tsv` per gate
-  (cases only, no gate path or command) beside its planted trees, and one `case`
-  arm in the file that names the gate. A new gate of that kind adds a mode and a
-  table, never a file. [review]
+* A recall test lives beside its subject as `<subject>_selftest.sh`. The recall
+  tests of the gates that read Rust source over a planted tree are the exception:
+  they are the modes of `check/rust_gates_fixtures.sh`, one
+  `fixtures/<gate>/cases.tsv` per gate (cases only, no gate path or command) beside
+  its planted trees, and one `case` arm in the file that names the gate. A new
+  gate of that kind adds a mode and a table, never a file. [review]
 * A module used by one tool lives beside it, has no shebang and no exec bit,
   and its header says `Module of: <class>/<tool>`. A file with that line is not
   an entry point. The tool must exist, not be the file itself, and reach it: run,
@@ -368,8 +368,8 @@ the claim file. [gate: `make check-claim-bypass`, tree-wide]
   `;`, `|`, `|&`, `||`, a single trailing `&`, a group (`( ... )`, `{ ...; }`), a
   compound command (`if`, `for`, `case`, `!`), a tool run inside `$( )`, and a
   `$(MAKE) -k` or `$(MAKE) -i`, for every tool of a target only that line
-  reaches. The shape cannot tell a `|| exit 1` that keeps the failure from a
-  `|| true` that drops it, so both are pinned when they occur. The four such lines
+  reaches. The rule does not read what follows `||`, by choice: a `|| exit 1` that
+  keeps the failure and a `|| true` that drops it are both pinned when they occur. The four such lines
   `make ci` holds are pinned: `debt_report.py --file-sizes`, `debt_report.py` and
   `target_size_report.sh` (all advisory reports, each ending in `|| true`) and
   `lib/published_table.py` (`... && diff -u ... || { ...; exit 1; }`, which keeps
