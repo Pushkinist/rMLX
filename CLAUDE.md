@@ -271,7 +271,7 @@ Hard rules:
   un-ignored — ignoring a CPU test silently stops running it. The CI gate
   `make check-gpu-tests-ignored` enforces this across **every workspace member
   crate** (from `Cargo.toml`), scanning `src/**/{*_tests.rs,tests.rs}` and
-  `tests/*.rs`; it keys on shape (does the test reach `Device::Gpu`?), never on
+  `tests/**/*.rs`; it keys on shape (does the test reach `Device::Gpu`?), never on
   the ignore reason's text. "Test" covers `#[test]` and `#[tokio::test]` (with
   or without arguments). A pure device-*policy* test (passes `Device::Gpu`
   as a plain value, never dispatches Metal) opts out **per fn** with a
@@ -304,10 +304,12 @@ Hard rules:
   `test_snapshot::snapshot` resolver) that reaches no `Device::Gpu`
   is fatal on the same terms: it runs under no gate and has no reason for that
   check to read.
-  `make check-gpu-tests-ignored-fixtures` (the `gpu_tests_ignored` mode of
-  `scripts/check/rust_gates_fixtures.sh`: 52 cases, run once under each awk on the
-  machine) pins the gate's recall in both directions, asserting each case's
-  failure *reason* and not just its exit code. See `docs/GPU_TESTS.md`.
+  `make check-gpu-tests-ignored-fixtures` (in `make ci` and hosted CI: the
+  `gpu_tests_ignored` mode of `scripts/check/rust_gates_fixtures.sh`, 69 cases, run
+  once under each awk on the machine) pins the gate's recall in both directions,
+  asserting each case's failure *reason* and not just its exit code. A directory or
+  file the scan cannot read is a refusal that names it, never a tree with no
+  findings. See `docs/GPU_TESTS.md`.
 - **Advisory: `make file-size-report`** prints files >1000 LOC. Non-failing.
   Also runs at the end of `make ci` (advisory, non-blocking).
 - **Advisory: `make target-size-report`** prints `target/` size and, past a

@@ -45,8 +45,13 @@ returns before any device-parameterized op is not a GPU test: pass it
 the rule. It runs in `make ci` and in the hosted `source gates` job. Its scope:
 
 - every workspace member, read from `Cargo.toml`;
-- `src/**/*_tests.rs`, `src/**/tests.rs` and `tests/*.rs` in each member;
+- `src/**/*_tests.rs`, `src/**/tests.rs` and `tests/**/*.rs` in each member;
 - `#[test]`, `#[tokio::test]` and `#[tokio::test(…)]`.
+
+A directory or file the scan cannot read is a refusal that names it, never a
+tree with no findings: `ignored` and `list` exit 1, `skip-notices` exits 2.
+`scripts/gpu_test_halves.sh` and `scripts/gpu_test_threadgroup.sh` refuse the
+same way and print the classifier's reason.
 
 A test reaches `Device::Gpu` when the name appears in its body, or in a
 module-scope `const … = Device::Gpu`, or in a helper it calls. An unqualified
@@ -178,7 +183,10 @@ synthetic workspace driven through the gate's `--root`. Some are violations and
 some are legitimate shapes. Each case asserts the exit code, the violation
 marker and the label the gate must name, because the gate has other paths that
 also exit 1. The suite runs once under each of `awk`, `gawk` and `mawk` that is
-installed, and prints a note when only one is.
+installed, and prints a note when only one is. `multi_crate` and `two_members`
+pin the exact listing of a multi-member workspace, which is what shows a scan
+narrowing: a find that stops descending, a member the parser drops, the
+directory name where the package name belongs.
 
 ## Running the GPU tests: `make gpu-test`
 
@@ -241,7 +249,7 @@ has no exit code, so a developer without the weights is not blocked.
 runner's output carries the word.
 
 `make check-named-skip-notices` (`scripts/check/gpu_tests.sh skip-notices`, in
-`make ci`) enforces the notice at the source line, over the classified GPU
+`make ci` and hosted CI) enforces the notice at the source line, over the classified GPU
 tests:
 
 - a notice names its own test fn, written out or as the exact `{test}`
@@ -284,7 +292,9 @@ stand-down in them is held to `SKIP {test}:` by review.
 
 The notice's shape lives in `scripts/lib/skip_notice_patterns.sh`, which the
 gate and the runner both read. `make check-named-skip-notices-fixtures`
-(`scripts/check/gpu_tests_selftest.sh`) is the gate's recall test.
+(`scripts/check/gpu_tests_selftest.sh`, 100 cases, in `make ci` and hosted CI) is
+the gate's recall test. It classifies planted workspaces, as the Makefile does,
+and plants its unreadable paths at run time.
 
 A cell that resolves through `common::slug_or_override`
 (`crates/rmlx-models/tests/common/mod.rs`) or `test_snapshot::snapshot`
