@@ -13,7 +13,8 @@
 )]
 
 use std::path::Path;
-use std::process::Command;
+
+mod common;
 
 const CONFIG: &str = r#"{
     "architectures": ["Qwen3ForCausalLM"],
@@ -40,9 +41,8 @@ fn rmlx(home: &Path, args: &[&str]) -> Run {
 }
 
 fn rmlx_logging(home: &Path, args: &[&str], rust_log: &str) -> Run {
-    let out = Command::new(env!("CARGO_BIN_EXE_rmlx"))
+    let out = common::rmlx_at(home)
         .env("RUST_LOG", rust_log)
-        .env("RMLX_HOME", home)
         .args(args)
         .output()
         .expect("rmlx runs");

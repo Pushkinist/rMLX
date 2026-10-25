@@ -12,8 +12,10 @@
 
 use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
+
+mod common;
 
 /// The `config.json` of a Prism Hadamard pack on a Qwen3.5 backbone: no
 /// `architectures`. The tests write no contract file beside it.
@@ -35,9 +37,8 @@ struct Run {
 }
 
 fn rmlx(home: &Path, args: &[&str]) -> Run {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rmlx"))
+    let mut child = common::rmlx_at(home)
         .env("RUST_LOG", "off")
-        .env("RMLX_HOME", home)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

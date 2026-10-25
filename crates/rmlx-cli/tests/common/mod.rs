@@ -14,7 +14,7 @@ use std::process::Command;
 /// `home` must be absolute and outlive the command.
 pub fn rmlx_at(home: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_rmlx"));
-    cmd.env("RMLX_HOME", home);
+    cmd.env("RMLX_HOME", home).env_remove("RMLX_METRICS_DB");
     cmd
 }
 
