@@ -155,7 +155,6 @@ member_dirs=""
 models_dir=""
 for m in "${members[@]}"; do
     manifest="${ROOT}/${m}/Cargo.toml"
-    [ "${m}" != . ] || manifest="${ROOT}/Cargo.toml"
     [ -f "${manifest}" ] || continue
     pkg="$(awk -F'"' '/^name[[:space:]]*=/{print $2; exit}' "${manifest}")"
     [ -n "${pkg}" ] || continue
@@ -179,7 +178,7 @@ models_deps="$(awk '
     in_deps && match($0, /^[A-Za-z_][A-Za-z0-9_-]*/) {
         print substr($0, RSTART, RLENGTH)
     }
-' "${ROOT}/$(member_prefix "${models_dir}")Cargo.toml")"
+' "${ROOT}/${models_dir}/Cargo.toml")"
 
 # The member directories the rule's first clause covers, one per line.
 codec_dirs=""

@@ -264,9 +264,10 @@ run_case() {
     : >"${root}/cargo_argv"
     : >"${root}/invocations"
     : >"${root}/mtl_seen"
-    OUT="$(PATH="${root}/bin:${PATH}" env -u RMLX_SKIP_GPU \
-        RMLX_O_MODELS_ROOT="${WORK}" bash "${root}/scripts/run_gpu_tests.sh" "$@" 2>&1)"
+    PATH="${root}/bin:${PATH}" env -u RMLX_SKIP_GPU \
+        RMLX_O_MODELS_ROOT="${WORK}" bash "${root}/scripts/run_gpu_tests.sh" "$@" >"${root}/output" 2>&1
     STATUS=$?
+    OUT="$(cat "${root}/output")"
     ARGV="$(cat "${root}/cargo_argv")"
     INVOCATIONS="$(cat "${root}/invocations")"
     MTL_SEEN="$(cat "${root}/mtl_seen")"
@@ -333,6 +334,12 @@ expect_no_out() {
     case "${OUT}" in
         *"$1"*) fail "output should not mention: $1" ;;
     esac
+}
+
+# expect_no_blank_after <line> — the raw output, trailing lines included, has no empty line straight after that line.
+expect_no_blank_after() {
+    awk -v want="$1" 'found && $0 == "" { bad = 1 } { found = ($0 == want) } END { exit bad }' "${CASE_ROOT}/output" ||
+        fail "output has an empty line after: $1"
 }
 
 expect_once() {
@@ -2196,6 +2203,7 @@ run_case "${CASE_ROOT}" --half codec
 expect_status 1
 expect_once "planted partition refusal"
 expect_out "the GPU-suite partition could not be computed"
+expect_no_blank_after "ERROR: the GPU-suite partition could not be computed."
 cat >"${CASE_ROOT}/scripts/gpu_test_threadgroup.sh" <<'STUB'
 #!/usr/bin/env bash
 echo "ERROR: planted split refusal" >&2
@@ -2205,6 +2213,7 @@ run_case "${CASE_ROOT}"
 expect_status 1
 expect_once "planted split refusal"
 expect_out "the threadgroup-validation split could not be computed"
+expect_no_blank_after "ERROR: the threadgroup-validation split could not be computed."
 
 # The real producers print the classifier's stderr only when the classifier fails. On success
 # the runner's own listing has already printed the NOTE blocks, so repeating them would show
@@ -2592,6 +2601,43 @@ STATUS=$?
 OUT="${TG_OUT}"
 expect_status 2
 expect_out "the threadgroup split collapsed — 0 test(s) on, 1 off."
+
+# The root package is a member, written `./` or `.`, and its files are src/ and tests/ under the
+# root: when the model layer depends on it they are codec, and when it is the model layer its src/
+# is codec.
+new_case half_the_root_member_is_placed_by_its_own_src_and_tests || exit 1
+tree="${CASE_ROOT}/tree"
+mkdir -p "${tree}/src" "${tree}/tests" "${tree}/crates/rmlx-models/src" "${tree}/crates/rmlx-audio/src" || exit 1
+cat >"${tree}/Cargo.toml" <<'TOML'
+[package]
+name = "rootdep"
+version = "0.0.0"
+
+[workspace]
+members = [
+    "./",
+    "crates/rmlx-models",
+    "crates/rmlx-audio",
+]
+TOML
+printf '[package]\nname = "rmlx-models"\n\n[dependencies]\nrootdep = { path = "../.." }\n' \
+    >"${tree}/crates/rmlx-models/Cargo.toml"
+printf '[package]\nname = "rmlx-audio"\n\n[dependencies]\n' >"${tree}/crates/rmlx-audio/Cargo.toml"
+gpu_fixture_test "${tree}/src/dep_tests.rs" dep_gpu
+gpu_fixture_test "${tree}/tests/dep_it.rs" dep_it_gpu
+gpu_fixture_test "${tree}/crates/rmlx-models/src/arch_tests.rs" arch_forwards
+gpu_fixture_test "${tree}/crates/rmlx-audio/src/asr_tests.rs" asr_transcribes
+HALVES_OUT="$(bash "${ROOT}/scripts/gpu_test_halves.sh" --root "${tree}" 2>&1)"
+expect_placed codec rootdep dep_gpu
+expect_placed codec rootdep dep_it_gpu
+expect_placed codec rmlx-models arch_forwards
+expect_placed rest rmlx-audio asr_transcribes
+tree="${CASE_ROOT}/rootmodels"
+mkdir -p "${tree}/src" || exit 1
+printf '[package]\nname = "rmlx-models"\nversion = "0.0.0"\n\n[workspace]\nmembers = [\n    ".",\n]\n' >"${tree}/Cargo.toml"
+gpu_fixture_test "${tree}/src/arch_tests.rs" arch_forwards
+HALVES_OUT="$(bash "${ROOT}/scripts/gpu_test_halves.sh" --root "${tree}" 2>&1)"
+expect_placed codec rmlx-models arch_forwards
 
 # The same members spelled with a doubled slash, a /./, a ./ prefix and a trailing slash are the
 # same members: the dispatcher a test is compared against is found by the path the classifier

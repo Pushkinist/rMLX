@@ -1104,7 +1104,8 @@ check_case 0
 # a doubled slash and a /./ in the middle all name crates/fb. The path the classifier reports carries
 # none of them, so the file a notice is matched to is the file the scan finds.
 for spelled in 'trailing_slash:crates/fb/' 'dot_prefix:./crates/fb' 'double_slash:crates//fb' \
-    'inner_dot:crates/./fb' 'repeated_dot_prefix:././crates/fb' 'repeated_trailing_slash:crates/fb//'; do
+    'inner_dot:crates/./fb' 'repeated_dot_prefix:././crates/fb' 'repeated_trailing_slash:crates/fb//' \
+    'trailing_dot:crates/fb/.'; do
     tag="${spelled%%:*}"
     workspace "member_with_a_${tag}" fb
     printf '[workspace]\nmembers = [\n    "%s",\n]\n' "${spelled#*:}" >"$CASE_ROOT/Cargo.toml"
@@ -1138,6 +1139,12 @@ for spelled in 'dot:.' 'dot_slash:./'; do
         --has "src/root_tests.rs: gpu_root_no_ignore" --lacks "/./" --lacks "//src" \
         -- bash "$TOOL" ignored --root "$CASE_ROOT"
 done
+workspace a_comment_line_in_the_members_array_is_not_a_member fb
+printf '[workspace]\nmembers = [\n    # the model layer\n    "crates/fb",\n]\n' >"$CASE_ROOT/Cargo.toml"
+printf '#[test]\n#[ignore = "GPU Metal"]\nfn gpu_alpha() {\n    let device = Device::Gpu;\n}\n' >"$CASE_ROOT/crates/fb/src/alpha_tests.rs"
+st_case a_comment_line_in_the_members_array_is_not_a_member 0 \
+    --is "$(printf 'fb\tgpu_alpha\t%s' "$CASE_ROOT/crates/fb/src/alpha_tests.rs")" \
+    -- bash "$TOOL" list --files --root "$CASE_ROOT"
 workspace the_root_member_lists_its_files_under_the_root fb
 printf '[package]\nname = "rootpkg"\nversion = "0.0.0"\n\n[workspace]\nmembers = [\n    "./",\n    "crates/fb",\n]\n' >"$CASE_ROOT/Cargo.toml"
 mkdir -p "$CASE_ROOT/src"
