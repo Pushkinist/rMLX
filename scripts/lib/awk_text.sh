@@ -36,12 +36,13 @@
 #                        both gates refuse entries with no forwarded loop to
 #                        enter.
 #
-#   THE BOUNDARY. `decomment` and `blank_strings` track the `"` and the
-#   backslash escape and nothing else, so a character literal holding a quote
-#   (`'\"'`) and a raw string (`r#"..."#`, whose inner quotes end nothing) are
-#   both mis-read — the raw string fails open, leaving the rest of the line
-#   unblanked. Neither occurs in the sources these gates scan today. A gate
-#   that starts scanning a file with either needs a real lexer, not a wider
+#   THE BOUNDARY. Both readers track the `"` and the backslash escape, and skip
+#   the two character literals that hold a quote, `'"'` and `'\"'`, as fixed
+#   sequences: they occur in the scanned sources and the quote in one ends
+#   nothing. A raw string (`r#"..."#`) is not recognised. Its inner quote flips
+#   the quote state for the rest of the line, so a `//` after it cuts the line
+#   short and hides the code behind it, and a real comment after it reads as
+#   code. A gate that must scan a file with one needs a real lexer, not a wider
 #   regex here.
 #
 #   Use `blank_strings` where a needle must not match text a program merely
@@ -51,11 +52,18 @@
 
 # shellcheck disable=SC2034  # consumed by the gates that source this file
 readonly AWK_TEXT_FNS='
-      function decomment(s,   i, n, q, ch) {
+      function char_quote_len(s, i,   t) {
+        t = substr(s, i, 4)
+        if (substr(t, 1, 3) == "\047\"\047") return 3
+        if (t == "\047\\\"\047") return 4
+        return 0
+      }
+      function decomment(s,   i, n, q, ch, k) {
         n = length(s); q = 0
         for (i = 1; i <= n; i++) {
           ch = substr(s, i, 1)
           if (q && ch == "\\") { i++; continue }
+          if (!q && ch == "\047" && (k = char_quote_len(s, i)) > 0) { i += k - 1; continue }
           if (ch == "\"") { q = !q; continue }
           if (!q && ch == "/" && substr(s, i + 1, 1) == "/") { return substr(s, 1, i - 1) }
         }
@@ -64,7 +72,7 @@ readonly AWK_TEXT_FNS='
       function sig_is_bodiless(s) {
         return (index(s, "{") == 0 && s ~ /;[[:space:]]*$/)
       }
-      function blank_strings(s,   i, n, q, ch, out) {
+      function blank_strings(s,   i, n, q, ch, out, k) {
         n = length(s); q = 0; out = ""
         for (i = 1; i <= n; i++) {
           ch = substr(s, i, 1)
@@ -74,6 +82,7 @@ readonly AWK_TEXT_FNS='
             out = out " "
             continue
           }
+          if (ch == "\047" && (k = char_quote_len(s, i)) > 0) { out = out substr(s, i, k); i += k - 1; continue }
           if (ch == "\"") { q = 1 }
           out = out ch
         }

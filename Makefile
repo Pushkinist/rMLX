@@ -516,7 +516,7 @@ check-no-inline-tests-fixtures: ## CI gate: recall test for the above, 20 plante
 check-no-scalar-f32-leak: ## CI gate: fail if arch-layer code has unguarded scalar_f32( not followed by .astype(
 	@bash scripts/check/kernel_dispatch.sh scalar-f32
 
-check-no-scalar-f32-leak-fixtures: ## CI gate: recall test for the above, 33 planted scan roots, each asserting the line it names or the refusal as well as the exit code
+check-no-scalar-f32-leak-fixtures: ## CI gate: recall test for the above, 35 planted scan roots, each asserting the line it names or the refusal as well as the exit code
 	@bash scripts/check/rust_gates_fixtures.sh scalar_f32_leak
 
 check-kv-layer-quants: ## CI gate: fail if kv_quant_for_layer is called outside kv_cache/ (one producer: kv_layer_quants)
@@ -553,7 +553,7 @@ check-spec-sampling: ## CI gate: fail if a speculative round loop is not handed 
 	@bash scripts/check_spec_sampling.sh
 
 .PHONY: check-spec-sampling-fixtures
-check-spec-sampling-fixtures: ## CI gate: recall test for the above — 30 cases over four tree shapes, each asserting the reason as well as exit 1 vs exit 2
+check-spec-sampling-fixtures: ## CI gate: recall test for the above — 31 cases over four tree shapes, each asserting the reason as well as exit 1 vs exit 2
 	@bash scripts/check_spec_sampling_fixtures.sh
 
 .PHONY: check-spec-charge

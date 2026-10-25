@@ -537,6 +537,14 @@ perl -0pi -e 's|    let mut draw = super::VerifierDraw::new\(sampler_cfg\);|    
 run "a loop that seeds a second generator instead of drawing is refused" 1 \
   "\`spec_generate_greedy_cached\` is handed the request's sampler and builds"
 
+# 30. A character literal holding a quote opens no string, so the needle in the
+#     literal after it is still text a program prints and not a construction.
+build_root "$root"
+perl -0pi -e 's|    let mut draw = super::VerifierDraw::new\(sampler_cfg\);|    let note = \x27"\x27; let text = "VerifierDraw::new(sampler_cfg)";\n    let mut draw = super::VerifierDraw::new(\&greedy());|' \
+  "$root/crates/rmlx-models/src/speculative/dflash.rs"
+run "a needle in a string literal after a quote character literal is not a draw" 1 \
+  "\`dflash_generate\` is handed the request's sampler and builds"
+
 echo
 if [ "$failures" != "0" ]; then
   echo "check-spec-sampling-fixtures: $failures of $cases cases failed"
