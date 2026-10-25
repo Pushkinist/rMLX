@@ -2489,6 +2489,24 @@ EOF
 st_case runner_row_present 0 --what "sg_row_line on a row that is there prints its line number" \
     --is "row at line 2" -- runner_child "$body"
 
+body="$ST_WORK/runner_skip"
+cat >"$body" <<'EOF'
+st_case held 0 -- true
+st_skip needs_root "this user can read a mode-000 file"
+st_done
+EOF
+st_case runner_skip_is_in_the_summary 0 --what "a skipped case is neither passed nor failed, and the summary line says how many were skipped" \
+    --has "  skip needs_root - this user can read a mode-000 file" --has "child: 1 passed, 0 failed, 1 skipped" -- runner_child "$body"
+
+body="$ST_WORK/runner_no_skip"
+cat >"$body" <<'EOF'
+st_case held 0 -- true
+st_done
+EOF
+st_case runner_summary_without_a_skip_is_unchanged 0 --what "with no skipped case the summary line is the two counts and nothing more" \
+    --is "  ok   held
+child: 1 passed, 0 failed" -- runner_child "$body"
+
 # ---- the real tree -------------------------------------------------------
 
 # The pin counts are literals, so a chunk that shrinks a pin lowers them in the same commit

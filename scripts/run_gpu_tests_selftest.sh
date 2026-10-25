@@ -56,6 +56,7 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/rmlx_gpu_runner_selftest.XXXXXX")"
 trap 'rm -rf "${WORK}"' EXIT
 
 failures=0
+skipped=0
 CASE=""
 CASE_ROOT=""
 OUT=""
@@ -283,6 +284,12 @@ run_case() {
 fail() {
     echo "FAIL [${CASE}] $1" >&2
     failures=$((failures + 1))
+}
+
+# A check this host cannot make: neither passed nor failed, and the last line says how many.
+skip_check() {
+    skipped=$((skipped + 1))
+    echo "skip [${CASE}]: $1"
 }
 
 expect_status() {
@@ -2522,7 +2529,7 @@ expect_placed on rmlx-kv-quant codec_decodes
 dispatcher="${tree}/crates/rmlx-kv-quant/src/codec_msl.rs"
 chmod 000 "${dispatcher}"
 if cat "${dispatcher}" >/dev/null 2>&1; then
-    echo "skip [${CASE}]: this user can read a mode-000 file"
+    skip_check "this user can read a mode-000 file"
 else
     TG_OUT="$(bash "${ROOT}/scripts/gpu_test_threadgroup.sh" --root "${tree}" 2>&1)"
     STATUS=$?
@@ -2533,7 +2540,7 @@ fi
 chmod 644 "${dispatcher}"
 chmod 000 "${tree}/crates/rmlx-models/benches"
 if ls "${tree}/crates/rmlx-models/benches" >/dev/null 2>&1; then
-    echo "skip [${CASE}]: this user can read a mode-000 directory"
+    skip_check "this user can read a mode-000 directory"
 else
     TG_OUT="$(bash "${ROOT}/scripts/gpu_test_threadgroup.sh" --root "${tree}" 2>&1)"
     STATUS=$?
@@ -2658,4 +2665,4 @@ if [ "${failures}" -ne 0 ]; then
     exit 1
 fi
 
-echo "run_gpu_tests_selftest: OK — every kind of red is reported, the access mix is the one observed, the census pin accepts only what it names, each half runs its own tests against its own slice of that pin, each test runs under its own threadgroup setting, the verdict is the uninstrumented run's, and a test only the instrument turned red is a failure."
+echo "run_gpu_tests_selftest: OK — every kind of red is reported, the access mix is the one observed, the census pin accepts only what it names, each half runs its own tests against its own slice of that pin, each test runs under its own threadgroup setting, the verdict is the uninstrumented run's, and a test only the instrument turned red is a failure.$([ "${skipped}" -eq 0 ] || printf ' %d check(s) were skipped on this host.' "${skipped}")"

@@ -18,6 +18,7 @@ st_init() {
 	ST_SUITE="$1"
 	ST_PASSED=0
 	ST_FAILED=0
+	ST_SKIPPED=0
 	ST_OUT=""
 	ST_RC=0
 	local tmp="${TMPDIR:-/tmp}"
@@ -118,10 +119,20 @@ st_case() {
 	st_verdict "$name" "$(st_check "$want" ${checks[@]+"${checks[@]}"})" "$what"
 }
 
+# st_skip <name> <why> — a case this host cannot run: neither passed nor failed. The summary
+# line says how many were skipped, so a run that skipped what a clean run would check does
+# not read as one.
+st_skip() {
+	ST_SKIPPED=$((ST_SKIPPED + 1))
+	printf '  skip %s - %s\n' "$1" "$2"
+}
+
 # st_done — print the summary line; fail when a case failed or none ran.
 st_done() {
 	st_abort_if_broken
-	printf '%s: %d passed, %d failed\n' "$ST_SUITE" "$ST_PASSED" "$ST_FAILED"
+	printf '%s: %d passed, %d failed' "$ST_SUITE" "$ST_PASSED" "$ST_FAILED"
+	if [ "$ST_SKIPPED" -gt 0 ]; then printf ', %d skipped' "$ST_SKIPPED"; fi
+	printf '\n'
 	if [ "$((ST_PASSED + ST_FAILED))" -eq 0 ]; then
 		echo "${ST_SUITE}: no case ran" >&2
 		return 1

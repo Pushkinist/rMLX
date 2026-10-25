@@ -16,7 +16,7 @@
 # planted lines in the claim-bypass table are not reported when the tool scans the tree
 # this file sits in. A case that needs the host (a UTF-8 locale, a user that cannot read
 # a mode-000 file) prints a `skip` line when the host lacks it; a skipped case is neither
-# passed nor failed, and a line before the summary says how many were skipped.
+# passed nor failed, and the summary line says how many were skipped.
 #
 # Usage:  bash scripts/check/tree_lines_selftest.sh [<claim-bypass|personal-data>]
 #         no mode runs the cases of both
@@ -44,11 +44,9 @@ both) st_init tree-lines-selftest ;;
 esac
 export GIT_CEILING_DIRECTORIES="$ST_WORK"
 
-SKIPPED=0
 # skip <name> <why>: a case the host cannot run.
 skip() {
-    SKIPPED=$((SKIPPED + 1))
-    printf '  skip %s - %s\n' "$1" "$2"
+    st_skip "$1" "$2"
 }
 
 # A UTF-8 locale the host has, or empty. `locale -a` is read whole: grep -q on a pipe
@@ -590,7 +588,4 @@ both)
     ;;
 esac
 
-if [ "$SKIPPED" -gt 0 ]; then
-    printf '%s: %d skipped\n' "$ST_SUITE" "$SKIPPED"
-fi
 st_done

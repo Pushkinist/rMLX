@@ -1255,7 +1255,7 @@ unreadable() {
     fi
     chmod 000 "$path"
     if "$probe" "$path" >/dev/null 2>&1; then
-        printf '  skip %s - %s\n' "$name" "this user can read a mode-000 path"
+        st_skip "$name" "this user can read a mode-000 path"
     else
         st_case "$name" "$@"
     fi

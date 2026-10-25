@@ -76,7 +76,7 @@ GUARD_IF='    if sampler_cfg\.sampling_active\(\) \{\n        spec_generate_stoc
 
 # skip <name> <why>: a case the host cannot run, neither passed nor failed.
 skip() {
-    printf '  skip %s - %s\n' "$1" "$2"
+    st_skip "$1" "$2"
 }
 
 # unreadable_source_case <mode>: a source file nobody can read ends the run in every mode.
