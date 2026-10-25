@@ -2117,7 +2117,7 @@ expect_placed rest rmlx-models pipeline_agrees
 OUT="$(PATH="${CASE_ROOT}/failing_awk:${PATH}" bash "${ROOT}/scripts/gpu_test_halves.sh" --root "${tree}" 2>&1)"
 STATUS=$?
 expect_status 2
-expect_out "could not read ${tree}/crates/rmlx-models/tests/pipeline.rs"
+expect_out "could not read $(cd "${tree}" && pwd)/crates/rmlx-models/tests/pipeline.rs"
 expect_no_out "rest	rmlx-models"
 
 # ---------------------------------------------------------------------------
@@ -2383,7 +2383,7 @@ else
     STATUS=$?
     OUT="${TG_OUT}"
     expect_status 2
-    expect_out "cannot read ${dispatcher}"
+    expect_out "cannot read $(cd "${tree}" && pwd)/crates/rmlx-kv-quant/src/codec_msl.rs"
 fi
 chmod 644 "${dispatcher}"
 chmod 000 "${tree}/crates/rmlx-models/benches"
@@ -2394,7 +2394,7 @@ else
     STATUS=$?
     OUT="${TG_OUT}"
     expect_status 2
-    expect_out "cannot list ${tree}/crates/rmlx-models/benches"
+    expect_out "cannot list $(cd "${tree}" && pwd)/crates/rmlx-models/benches"
 fi
 chmod 755 "${tree}/crates/rmlx-models/benches"
 

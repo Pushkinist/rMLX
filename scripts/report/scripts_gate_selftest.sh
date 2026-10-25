@@ -2519,9 +2519,9 @@ END {
 }' "$REPO_ROOT/scripts/report/scripts_gate_pins.txt"
 }
 st_case real_tree_pin_totals 0 --what "the checked-in pin file holds exactly these member totals and figure sums" \
-    --is "$(printf '%s\n%s' 'members: exit-undeclared 116, recall-missing 10, silenced 4, lib-run 29, dead-path 1, name 13, lib-shadow 3, env-knob 95' 'figures: size 17085, heredoc 1278, twin 1234, binary-literal 45')" -- pin_totals
+    --is "$(printf '%s\n%s' 'members: exit-undeclared 116, recall-missing 10, silenced 4, lib-run 29, dead-path 1, name 13, lib-shadow 3, env-knob 95' 'figures: size 14673, heredoc 1278, twin 1234, binary-literal 45')" -- pin_totals
 st_case real_tree 0 --what "the checked-in tree passes with exactly these pins" \
-    --has "pinned: class 76, purpose 6, usage 65, exit-undeclared 66, caller 16, recall-missing 10, silenced 3, lib-consumers 10, lib-run 19, shebang 1, exec-bit 5, dead-path 1, set-mode 35, name 12, size 11, heredoc 14, twin 15, lib-shadow 3, binary-literal 24, env-knob 37" \
-    --has "429 pinned)" -- sg_gate "$REPO_ROOT"
+    --has "pinned: class 76, purpose 6, usage 65, exit-undeclared 66, caller 16, recall-missing 10, silenced 3, lib-consumers 10, lib-run 19, shebang 1, exec-bit 5, dead-path 1, set-mode 35, name 12, size 10, heredoc 14, twin 15, lib-shadow 3, binary-literal 24, env-knob 37" \
+    --has "428 pinned)" -- sg_gate "$REPO_ROOT"
 
 st_done
