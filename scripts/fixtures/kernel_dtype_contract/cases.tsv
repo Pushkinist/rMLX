@@ -37,3 +37,8 @@ not_a_dispatcher	--root {} --min 1	both	1	expected at least	-	-	a file with no M
 test_file_excluded	--root {} --min 1	both	1	expected at least	-	-	a *_tests.rs dispatcher is out of scope
 empty_tree	--root {} --min 1	both	1	expected at least	-	-	an empty scan root fails instead of passing vacuously
 clean	--root {} --min 2	both	1	expected at least	-	-	fewer dispatcher functions than the pinned floor fails
+fed_back_output	--root {} --min 1	both	0	check-kernel-dtype-contract: ok (1 dispatcher files, 1 f32-declaring functions)	check-kernel-dtype-contract: FAIL	-	an f32 output fed straight into a second kernel never escapes, so one cast covers the function
+same_line_marker	--root {} --min 1	both	0	check-kernel-dtype-contract: ok (1 dispatcher files, 1 f32-declaring functions)	check-kernel-dtype-contract: FAIL	-	an f32-out-ok marker on the signature line exempts the fn
+two_files	--root {} --min 2	both	0	check-kernel-dtype-contract: ok (2 dispatcher files, 2 f32-declaring functions)	check-kernel-dtype-contract: FAIL	-	the functions of every dispatcher file are summed, not those of the last one
+clean	--root {}	both	0	check-kernel-dtype-contract: ok (1 dispatcher files, 1 f32-declaring functions)	check-kernel-dtype-contract: FAIL	-	with --root and no --min the floor is 1, not the floor of the derived roots
+clean	--root {}/absent --min 1	both	2	scan root does not exist	check-kernel-dtype-contract: ok	-	a scan root that does not exist is refused, not scanned as empty

@@ -28,3 +28,9 @@ marker_then_statement	--root {} --min 1	both	1	check-no-kernel-input-eval: FAIL;
 trailing_comment	--root {} --min 1	both	0	check-no-kernel-input-eval: ok (1 dispatcher/scaffold files scanned)	check-no-kernel-input-eval: FAIL	-	a comment naming .eval() is not itself a call
 empty_tree	--root {} --min 1	both	1	found 0 dispatcher/scaffold files under;;but expected at least 1.	check-no-kernel-input-eval: FAIL;;check-no-kernel-input-eval: ok (1 dispatcher/scaffold files scanned)	-	an empty scan root fails on the pinned floor instead of passing vacuously
 clean	--root {} --min 2	both	1	found 1 dispatcher/scaffold files under;;but expected at least 2.	check-no-kernel-input-eval: FAIL;;check-no-kernel-input-eval: ok	-	fewer dispatchers than the pinned floor fails
+tests_excluded	--root {} --min 1	both	0	check-no-kernel-input-eval: ok (1 dispatcher/scaffold files scanned)	check-no-kernel-input-eval: FAIL	-	a *_tests.rs and a tests.rs dispatcher are out of scope, and only the one in-scope file is counted
+clean	--root {}	both	0	check-no-kernel-input-eval: ok (1 dispatcher/scaffold files scanned)	check-no-kernel-input-eval: FAIL	-	with --root and no --min the floor is 1, not the floor of the derived roots
+clean	--root {}/absent --min 1	both	2	scan root does not exist	check-no-kernel-input-eval: ok	-	a scan root that does not exist is refused, not scanned as empty
+clean	--root {} --min 0	both	2	usage: bash scripts/check/kernel_dispatch.sh	check-no-kernel-input-eval: ok	-	a floor of zero is a usage error, since a floor of zero is no floor
+clean	--root {} --min	both	2	usage: bash scripts/check/kernel_dispatch.sh	check-no-kernel-input-eval: ok	-	--min without a value is a usage error
+clean	--root {} --min 1 --min 1	both	2	usage: bash scripts/check/kernel_dispatch.sh	check-no-kernel-input-eval: ok	-	a repeated --min is a usage error, not last-one-wins
