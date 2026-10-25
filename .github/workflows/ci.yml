@@ -83,6 +83,10 @@ jobs:
       # exit code.
       - name: the dtype-contract gate still catches what it is for
         run: make check-kernel-dtype-contract-fixtures
+      # The third rule of the same tool: an f32 scalar combined with a bf16
+      # activation promotes the result. Planted scan roots pin its recall.
+      - name: the f32-scalar gate still catches what it is for
+        run: make check-no-scalar-f32-leak-fixtures
       # rMLX serialises every MLX evaluation under one lock; this gate is what
       # keeps a new FFI call from quietly stepping outside it. Static — the
       # local stress driver is deliberately not run here.
@@ -96,8 +100,6 @@ jobs:
       # roots pin their recall and their refusal of a root with nothing in it.
       - name: the inline-test gate still catches what it is for
         run: make check-no-inline-tests-fixtures
-      - name: the f32-scalar gate still catches what it is for
-        run: make check-no-scalar-f32-leak-fixtures
       - name: the per-layer KV codec gate still catches what it is for
         run: make check-kv-layer-quants-fixtures
       - name: the decode-swallow gate still catches what it is for
