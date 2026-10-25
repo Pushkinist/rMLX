@@ -328,6 +328,12 @@ expect_no_out() {
     esac
 }
 
+expect_once() {
+    local n
+    n="$(printf '%s\n' "${OUT}" | grep -cF -- "$1")"
+    [ "${n}" = 1 ] || fail "output mentions '$1' ${n} times, expected once"
+}
+
 # The executed set, read from the libtest filters the runner issued rather than
 # from its report, which carries a count and no names.
 expect_ran() {
@@ -2119,6 +2125,112 @@ STATUS=$?
 expect_status 2
 expect_out "could not read $(cd "${tree}" && pwd)/crates/rmlx-models/tests/pipeline.rs"
 expect_no_out "rest	rmlx-models"
+
+# What a producer writes to stderr is the operator's, not rows: the runner reads the producers'
+# stdout only. A producer that chatters on stderr (here the two NOTE blocks of the real
+# classifier) must neither refuse the run nor be read as a partition row or a setting, and
+# each block reaches the operator once.
+new_case runner_reads_producer_stdout_only || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+halves "${CASE_ROOT}" <<'HALVES'
+codec	rmlx-kv-quant	kv_gpu_alpha
+HALVES
+printf 'on\trmlx-kv-quant\tkv_gpu_alpha\n' >"${CASE_ROOT}/tg"
+cat >"${CASE_ROOT}/note_macro" <<'NOTE'
+NOTE: macro-generated GPU tests — the #[ignore] rule is ENFORCED on the macro
+body, but the cells are not listed for scripts/run_gpu_tests.sh (their fn names
+exist only after expansion, so a filter cannot be derived):
+  crates/rmlx-models/tests/niah_long_context.rs: niah_cell!{$name}
+  -> These run under their own driver; see docs/TESTING.md.
+
+NOTE
+cat >"${CASE_ROOT}/note_declared" <<'NOTE'
+NOTE: declared-route GPU tests — the #[ignore] rule is ENFORCED on them, but
+they are not listed for scripts/run_gpu_tests.sh (that runner asserts a Metal
+validation banner per crate, and these are snapshot-gated or drive a child
+process, so listing them would fail the suite for a missing model):
+  crates/rmlx-server/tests/ssd_cache_restart.rs: ssd_cache_survives_server_restart
+  -> No gate executes these. See docs/GPU_TESTS.md for each one's coverage.
+
+NOTE
+cat >"${CASE_ROOT}/scripts/gpu_test_halves.sh" <<STUB
+#!/usr/bin/env bash
+cat "${CASE_ROOT}/note_macro" >&2
+cat "${CASE_ROOT}/halves"
+STUB
+cat >"${CASE_ROOT}/scripts/gpu_test_threadgroup.sh" <<STUB
+#!/usr/bin/env bash
+cat "${CASE_ROOT}/note_declared" >&2
+cat "${CASE_ROOT}/tg"
+STUB
+crate_log "${CASE_ROOT}" rmlx-kv-quant 0 <<'LOG'
+Metal GPU Validation Enabled
+running 1 test
+test kv::gpu_alpha ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}" --half codec
+expect_status 0
+expect_once "NOTE: macro-generated GPU tests"
+expect_once "NOTE: declared-route GPU tests"
+expect_no_out "neither on nor off"
+expect_no_out "do not cover each other"
+
+# A producer that refuses says why on its stderr, and the runner refuses with that reason shown
+# to the operator.
+new_case runner_shows_a_refusing_producers_reason || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+cat >"${CASE_ROOT}/scripts/gpu_test_halves.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "ERROR: planted partition refusal" >&2
+exit 2
+STUB
+run_case "${CASE_ROOT}" --half codec
+expect_status 1
+expect_once "planted partition refusal"
+expect_out "the GPU-suite partition could not be computed"
+cat >"${CASE_ROOT}/scripts/gpu_test_threadgroup.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "ERROR: planted split refusal" >&2
+exit 2
+STUB
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_once "planted split refusal"
+expect_out "the threadgroup-validation split could not be computed"
+
+# The real producers print the classifier's stderr only when the classifier fails. On success
+# the runner's own listing has already printed the NOTE blocks, so repeating them would show
+# each twice.
+new_case producers_forward_the_classifier_stderr_only_on_failure || exit 1
+tree="${CASE_ROOT}/tree"
+threadgroup_fixture_tree "${tree}" || exit 1
+gpu_fixture_test "${tree}/crates/rmlx-kv-quant/src/codec_msl_tests.rs" codec_decodes \
+    'codec_quantize_gpu();'
+gpu_fixture_test "${tree}/crates/rmlx-models/src/arch_tests.rs" arch_forwards
+cat >"${tree}/crates/rmlx-models/src/cell_tests.rs" <<'TEST'
+macro_rules! gpu_cell {
+    ($name:ident) => {
+        #[ignore = "GPU Metal context"]
+        #[test]
+        fn $name() {
+            let device = Device::Gpu;
+            let _ = device;
+        }
+    };
+}
+
+gpu_cell!(cell_a);
+TEST
+LIST_ERR="$(bash "${ROOT}/scripts/check/gpu_tests.sh" list --root "${tree}" 2>&1 >/dev/null)"
+case "${LIST_ERR}" in
+    *"NOTE: macro-generated GPU tests"*) ;;
+    *) fail "the control tree's own listing prints no NOTE block" ;;
+esac
+HALVES_ERR="$(bash "${ROOT}/scripts/gpu_test_halves.sh" --root "${tree}" 2>&1 >/dev/null)"
+[ -z "${HALVES_ERR}" ] || fail "halves printed on stderr although the listing succeeded: ${HALVES_ERR}"
+TG_ERR="$(bash "${ROOT}/scripts/gpu_test_threadgroup.sh" --root "${tree}" 2>&1 >/dev/null)"
+[ -z "${TG_ERR}" ] || fail "threadgroup printed on stderr although the listing succeeded: ${TG_ERR}"
 
 # ---------------------------------------------------------------------------
 # THE THREADGROUP SPLIT

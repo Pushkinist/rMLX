@@ -437,7 +437,7 @@ CANARY_TEST="shader_validation_canary_emits_an_invalid_access_report"
 # script selects.
 half_rows=""
 if [ -n "${HALF}" ]; then
-    if ! halves_out="$(bash "${REPO_ROOT}/scripts/gpu_test_halves.sh" --root "${REPO_ROOT}" 2>&1)"; then
+    if ! halves_out="$(bash "${REPO_ROOT}/scripts/gpu_test_halves.sh" --root "${REPO_ROOT}")"; then
         echo "ERROR: the GPU-suite partition could not be computed:" >&2
         printf '%s\n' "${halves_out}" >&2
         echo "Refusing to run a half whose other half is unknown." >&2
@@ -483,7 +483,7 @@ tg_rows=""
 n_tg_on=0
 n_tg_off=0
 if [ "${SHADER_VALIDATION}" = "1" ] && [ "${BUILD_ONLY}" = "0" ]; then
-    if ! tg_out="$(bash "${REPO_ROOT}/scripts/gpu_test_threadgroup.sh" --root "${REPO_ROOT}" 2>&1)"; then
+    if ! tg_out="$(bash "${REPO_ROOT}/scripts/gpu_test_threadgroup.sh" --root "${REPO_ROOT}")"; then
         echo "ERROR: the threadgroup-validation split could not be computed:" >&2
         printf '%s\n' "${tg_out}" >&2
         exit 1

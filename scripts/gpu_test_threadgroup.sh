@@ -82,7 +82,16 @@ if [ ${#METAL_DIRS[@]} -eq 0 ]; then
     exit 2
 fi
 
-listing="$(bash "${REPO_ROOT}/scripts/check/gpu_tests.sh" list --files --root "${ROOT}")"
+# The classifier's stderr is shown only when it fails: on success its NOTE blocks are the
+# runner's own listing's to print, and repeating them here would show each twice.
+list_err="$(mktemp "${TMPDIR:-/tmp}/gpu_test_threadgroup.XXXXXX")" || {
+    echo "ERROR: cannot make a scratch file." >&2
+    exit 2
+}
+trap 'rm -f "${list_err}"' EXIT
+if ! listing="$(bash "${REPO_ROOT}/scripts/check/gpu_tests.sh" list --files --root "${ROOT}" 2>"${list_err}")"; then
+    cat "${list_err}" >&2
+fi
 if [ -z "${listing}" ]; then
     echo "ERROR: check/gpu_tests.sh list --files produced no GPU tests for ${ROOT}." >&2
     exit 2
