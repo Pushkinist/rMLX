@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Every reference into docs/ resolves, and a doc edit re-points none of them.
 
+Usage:  doc_refs.py [--root DIR] [--base REF|auto] [--list]
+Exit:   0 pass; 1 a broken or re-pointed reference; 2 could not run (not a git
+        work tree, no tracked docs, an unknown base)
+
 A reference is text in a tracked file that names a doc under `docs/`, and
 maybe something inside it. A doc is named by its `docs/` path, by a bare
 top-level doc name (`KV_QUANT.md`), or, inside a doc, by a name relative to
@@ -87,8 +91,6 @@ fails. Every run names the files it skipped.
 This reads text, not meaning. It cannot tell whether the text a reference
 lands on still says what the citing sentence claims, and it cannot see a
 reference spelled in a form it does not parse.
-
-Exit 0 = pass, 1 = a broken or re-pointed reference, 2 = could not run.
 """
 
 from __future__ import annotations
@@ -471,7 +473,7 @@ def describe(ref: Ref, line: int) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--root", default=str(Path(__file__).resolve().parents[1]), help="git work tree to check")
+    parser.add_argument("--root", default=str(Path(__file__).resolve().parents[2]), help="git work tree to check")
     parser.add_argument("--base", help="git ref to compare the working tree with, or 'auto'")
     parser.add_argument("--list", action="store_true", help="print every reference and what it resolves to")
     args = parser.parse_args(argv)
@@ -489,10 +491,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"base: {args.base} (merge-base {base_ref[:12]})")
         base = Tree(ref_files(root, base_ref)) if base_ref else None
     except CannotRun as err:
-        print(f"check_doc_refs: could not run: {err}", file=sys.stderr)
+        print(f"doc_refs: could not run: {err}", file=sys.stderr)
         return 2
     if not head.docs:
-        print(f"check_doc_refs: could not run: no tracked docs/*.md under {root}", file=sys.stderr)
+        print(f"doc_refs: could not run: no tracked docs/*.md under {root}", file=sys.stderr)
         return 2
 
     names = set(head.docs) | (set(base.docs) if base else set())

@@ -622,16 +622,16 @@ check-doc-source-citations: ## CI gate: fail if a `crates/...` source path cited
 # DOC_REFS_BASE=<ref> on the make command line counts, which in make includes
 # the same assignment passed in MAKEFLAGS. `auto` is the merge-base with
 # origin/main, or HEAD itself when origin/main already contains HEAD (see
-# check_doc_refs.py).
+# check/doc_refs.py).
 DOC_REFS_BASE_ARG := $(if $(filter command line,$(origin DOC_REFS_BASE)),$(DOC_REFS_BASE),auto)
 
 .PHONY: check-doc-refs
 check-doc-refs: ## CI gate: fail if a doc edit broke or re-pointed a reference into docs/ (DOC_REFS_BASE=<ref>, default auto)
-	@python3 scripts/check_doc_refs.py --base "$(DOC_REFS_BASE_ARG)"
+	@python3 scripts/check/doc_refs.py --base "$(DOC_REFS_BASE_ARG)"
 
 .PHONY: check-doc-refs-selftest
-check-doc-refs-selftest: ## CI gate: recall test for check_doc_refs.py over a synthetic repo, each case asserting its reason
-	@bash scripts/check_doc_refs_selftest.sh
+check-doc-refs-selftest: ## CI gate: recall test for check/doc_refs.py over a synthetic repo, each case asserting its reason
+	@bash scripts/check/doc_refs_selftest.sh
 
 .PHONY: check-doc-consumers
 check-doc-consumers: check-doc-refs check-doc-source-citations check-kv-codec-disposition check-kv-boundary-default-parity check-published-table ## every reader of doc text still finds what it reads
@@ -754,7 +754,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@python3 scripts/published_samples.py verify
 	@bash scripts/check_published_samples_fixtures.sh
 	@bash scripts/check_doc_source_citations.sh
-	@bash scripts/check_doc_refs_selftest.sh
+	@bash scripts/check/doc_refs_selftest.sh
 	@$(MAKE) --no-print-directory check-doc-refs
 	@bash scripts/check_no_decode_swallow.sh
 	@bash scripts/check/rust_gates_fixtures.sh no_decode_swallow

@@ -21,8 +21,6 @@ class bench_llama_ab.sh
 class bench_llama_ab_selftest.sh
 class check_claim_bypass.sh
 class check_claim_bypass_selftest.sh
-class check_doc_refs.py
-class check_doc_refs_selftest.sh
 class check_doc_source_citations.sh
 class check_eval_lock.sh
 class check_gpu_device_census.sh
@@ -115,8 +113,6 @@ usage bench_identity_selftest.sh
 usage bench_llama_ab.sh
 usage bench_llama_ab_selftest.sh
 usage check_claim_bypass_selftest.sh
-usage check_doc_refs.py
-usage check_doc_refs_selftest.sh
 usage check_doc_source_citations.sh
 usage check_eval_lock.sh
 usage check_gpu_device_census_selftest.sh

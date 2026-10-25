@@ -18,8 +18,6 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `bench_llama_ab_selftest.sh` | make ci, make llama-ab-selftest | bench_llama_ab_selftest.sh — mutation check for `scripts/bench_llama_ab.sh`. |
 | `check_claim_bypass.sh` | make check-claim-bypass, make ci, check_claim_bypass_selftest.sh | CI gate: nothing deletes the Metal claim, names its file outside its owner, or kills by name. |
 | `check_claim_bypass_selftest.sh` | make check-claim-bypass-selftest, make ci | Recall test for check_claim_bypass.sh: planted git work trees, asserting exit code and file:line. |
-| `check_doc_refs.py` | make check-doc-refs, check_doc_refs_selftest.sh | Every reference into docs/ resolves, and a doc edit re-points none of them. |
-| `check_doc_refs_selftest.sh` | make check-doc-refs-selftest, make ci | Recall test for check_doc_refs.py: synthetic git repos, asserting exit code and reason. |
 | `check_doc_source_citations.sh` | make check-doc-source-citations, make ci | CI gate: every crates/... source path cited in a tracked docs/*.md file exists. |
 | `check_eval_lock.sh` | make check-eval-lock, make ci, check/rust_gates_fixtures.sh | CI gate: every MLX FFI call that can evaluate runs under the process-wide evaluation lock. |
 | `check_gpu_device_census.sh` | make check-gpu-device-census, make check-gpu-device-census-library, make ci, check_gpu_device_census_selftest.sh | CI gate: the rmlx binary's source names Device::Gpu in exactly one place, claim_gpu. |
@@ -105,6 +103,8 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
+| `check/doc_refs.py` | make check-doc-refs, check/doc_refs_selftest.sh | Every reference into docs/ resolves, and a doc edit re-points none of them. |
+| `check/doc_refs_selftest.sh` | make check-doc-refs-selftest, make ci | Recall test for doc_refs.py: synthetic git repos, asserting exit code and reason. |
 | `check/rust_gates_fixtures.sh` | make check-eval-lock-fixtures, make check-gpu-tests-ignored-fixtures, make check-kernel-dtype-contract-fixtures, make check-kv-layer-quants-fixtures, make check-no-decode-swallow-fixtures, make check-no-inline-tests-fixtures, make check-no-kernel-input-eval-fixtures, make ci | Recall test for the Rust-source gates: planted scan roots from a table, asserting exit and reason. |
 
 ## scripts/eval/

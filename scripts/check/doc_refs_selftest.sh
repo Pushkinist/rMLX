@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Recall test for check_doc_refs.py: synthetic git repos, asserting exit code and reason.
-#
-# Set:    -uo — a non-zero status inside a case ends the run under -e, before the cases after it
+# Recall test for doc_refs.py: synthetic git repos, asserting exit code and reason.
 #
 # doc-refs: fixture — the docs/ paths below belong to the synthetic repo.
 #
-# Recall test for: check_doc_refs.py
+# Recall test for: check/doc_refs.py
+#
+# Usage:  bash scripts/check/doc_refs_selftest.sh
+# Exit:   0 every case held; 1 a case did not
+# Set:    -uo — a non-zero status inside a case ends the run under -e, before the cases after it
 #
 # Builds one synthetic git repo at run time (three docs, a CLAUDE.md map, a
 # CHANGELOG, a crate file, scripts), commits it as the base, then copies it
@@ -15,8 +17,8 @@
 
 set -uo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TOOL="${REPO_ROOT}/scripts/check_doc_refs.py"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TOOL="${REPO_ROOT}/scripts/check/doc_refs.py"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
