@@ -2246,7 +2246,7 @@ producer_scratch() {
     mkdir -p "${d}/scripts/check" "${d}/scripts/lib" "${d}/crates/rmlx-kv-quant/src" || return 1
     cp "${ROOT}/scripts/gpu_test_halves.sh" "${ROOT}/scripts/gpu_test_threadgroup.sh" \
         "${ROOT}/scripts/metal_dirs.sh" "${d}/scripts/" || return 1
-    cp "${ROOT}/scripts/lib/awk_text.sh" "${d}/scripts/lib/" || return 1
+    cp "${ROOT}/scripts/lib/awk_text.sh" "${ROOT}/scripts/lib/workspace_members.sh" "${d}/scripts/lib/" || return 1
     cp "${ROOT}/crates/rmlx-kv-quant/src/quant.rs" "${d}/crates/rmlx-kv-quant/src/" || return 1
     cat >"${d}/scripts/check/gpu_tests.sh" <<STUB
 #!/usr/bin/env bash
@@ -2299,6 +2299,7 @@ expect_once "planted classifier failure"
 new_case runner_refuses_a_listing_whose_cut_failed || exit 1
 ln -sf "${ROOT}/scripts/check/gpu_tests.sh" "${CASE_ROOT}/scripts/check/gpu_tests.sh" || exit 1
 ln -sf "${ROOT}/scripts/lib/awk_text.sh" "${CASE_ROOT}/scripts/lib/awk_text.sh" || exit 1
+ln -sf "${ROOT}/scripts/lib/workspace_members.sh" "${CASE_ROOT}/scripts/lib/workspace_members.sh" || exit 1
 halves_fixture_tree "${CASE_ROOT}" || exit 1
 gpu_fixture_test "${CASE_ROOT}/crates/rmlx-kv-quant/src/codec_tests.rs" codec_decodes
 gpu_fixture_test "${CASE_ROOT}/crates/rmlx-models/src/arch_tests.rs" arch_forwards
@@ -2358,9 +2359,9 @@ halves_fixture_tree "${tree}" || exit 1
 cat >"${tree}/Cargo.toml" <<'TOML'
 [workspace]
 members = [
-    "crates/rmlx-kv-quant/",
-    "./crates/rmlx-models",
-    "crates/rmlx-audio",
+    "crates/rmlx-kv-quant//",
+    "././crates/rmlx-models",
+    "crates/./rmlx-audio",
 ]
 TOML
 gpu_fixture_test "${tree}/crates/rmlx-kv-quant/src/codec_tests.rs" codec_decodes
@@ -2591,6 +2592,38 @@ STATUS=$?
 OUT="${TG_OUT}"
 expect_status 2
 expect_out "the threadgroup split collapsed — 0 test(s) on, 1 off."
+
+# The same members spelled with a doubled slash, a /./, a ./ prefix and a trailing slash are the
+# same members: the dispatcher a test is compared against is found by the path the classifier
+# prints, which carries none of those, so the split is the plain spelling's.
+new_case threadgroup_members_spelled_with_slashes_and_dots_place_like_any_other || exit 1
+tree="${CASE_ROOT}/tree"
+threadgroup_fixture_tree "${tree}" || exit 1
+cat >"${tree}/Cargo.toml" <<'TOML'
+[workspace]
+members = [
+    "crates//rmlx-kv-quant",
+    "crates/./rmlx-mlx",
+    "./crates/rmlx-models/",
+    "crates/rmlx-audio//",
+]
+TOML
+gpu_fixture_test "${tree}/crates/rmlx-kv-quant/src/codec_msl_tests.rs" codec_decodes \
+    'codec_quantize_gpu();'
+gpu_fixture_test "${tree}/crates/rmlx-kv-quant/src/embed_tests.rs" codec_embeds_its_kernel \
+    'let src = include_str!("metal/codec.metal");'
+gpu_fixture_test "${tree}/crates/rmlx-mlx/src/op_tests.rs" op_computes
+gpu_fixture_test "${tree}/crates/rmlx-models/src/step_msl_tests.rs" step_kernel_steps \
+    'step_gpu();'
+gpu_fixture_test "${tree}/crates/rmlx-models/src/arch_tests.rs" arch_forwards
+gpu_fixture_test "${tree}/crates/rmlx-audio/src/asr_tests.rs" asr_transcribes
+HALVES_OUT="$(bash "${ROOT}/scripts/gpu_test_threadgroup.sh" --root "${tree}" 2>&1)"
+expect_placed on rmlx-kv-quant codec_decodes
+expect_placed on rmlx-kv-quant codec_embeds_its_kernel
+expect_placed off rmlx-mlx op_computes
+expect_placed on rmlx-models step_kernel_steps
+expect_placed off rmlx-models arch_forwards
+expect_placed off rmlx-audio asr_transcribes
 
 # A tree in which no source embeds a gated kernel has nothing to place a test against: the
 # producer refuses with exit 2, as its header says.

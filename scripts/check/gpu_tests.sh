@@ -476,6 +476,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 . "$REPO_ROOT/scripts/lib/awk_text.sh"
 # shellcheck source=scripts/lib/skip_notice_patterns.sh
 . "$REPO_ROOT/scripts/lib/skip_notice_patterns.sh"
+# shellcheck source=scripts/lib/workspace_members.sh
+. "$REPO_ROOT/scripts/lib/workspace_members.sh"
 
 usage() {
     echo "gpu_tests: $1" >&2
@@ -1058,22 +1060,8 @@ classify_root() {
     # below (parsed members vs. crate dirs on disk) guards against exactly that.
     members=()
     while IFS= read -r m; do
-        # `./crates/fa` and `crates/fa/` are the member `crates/fa`; every later path is built from it.
-        while [ "${m#./}" != "$m" ]; do m="${m#./}"; done
-        while [ "${m%/}" != "$m" ]; do m="${m%/}"; done
-        [ -n "$m" ] && members+=("$m")
-    done < <(awk '
-        /^[[:space:]]*members[[:space:]]*=[[:space:]]*\[/ { inm = 1; next }
-        inm {
-            line = $0
-            if (line ~ /\]/) { inm = 0 }
-            gsub(/[",]/, "", line)
-            gsub(/[[:space:]]/, "", line)
-            gsub(/\[/, "", line)
-            gsub(/\]/, "", line)
-            if (line != "" && line !~ /^#/) { print line }
-        }
-    ' "${CARGO_TOML}")
+        members+=("$m")
+    done < <(workspace_members "${CARGO_TOML}")
 
     if [ ${#members[@]} -eq 0 ]; then
         echo "ERROR: parsed 0 workspace members from ${CARGO_TOML}." >&2
@@ -1115,6 +1103,7 @@ classify_root() {
 
     for crate in "${members[@]}"; do
         crate_dir="${SCAN_ROOT}/${crate}"
+        [ "${crate}" != . ] || crate_dir="${SCAN_ROOT}"
         src_dir="${crate_dir}/src"
         tests_dir="${crate_dir}/tests"
 

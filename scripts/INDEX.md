@@ -147,6 +147,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `lib/snapshot_sampling.py` | spec_bench_published.sh | Read the sampling defaults a snapshot states, for a run that sends none. |
 | `lib/spec_round_log.py` | lib/binary_identity.py, lib/published_run_log.py, spec_bench.sh | Read a speculative round loop's own numbers back out of an rmlx run log. |
 | `lib/sse_decode_window.py` | spec_bench.sh, spec_bench_published.sh, spec_bench_selftest.sh | Time a streamed chat-completions response over its decode window. |
+| `lib/workspace_members.sh` | check/gpu_tests.sh, gpu_test_halves.sh | The workspace members of a Cargo.toml, parsed and normalised once for the tools that read them. |
 
 ## scripts/parity/
 

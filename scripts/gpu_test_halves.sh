@@ -75,6 +75,8 @@ ROOT="${REPO_ROOT}"
 
 # shellcheck source=lib/awk_text.sh
 . "${REPO_ROOT}/scripts/lib/awk_text.sh"
+# shellcheck source=lib/workspace_members.sh
+. "${REPO_ROOT}/scripts/lib/workspace_members.sh"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -140,20 +142,8 @@ fi
 # narrows the parse fails there first.
 members=()
 while IFS= read -r m; do
-    while [ "${m#./}" != "$m" ]; do m="${m#./}"; done
-    while [ "${m%/}" != "$m" ]; do m="${m%/}"; done
-    [ -n "$m" ] && members+=("$m")
-done < <(awk '
-    /^[[:space:]]*members[[:space:]]*=[[:space:]]*\[/ { inm = 1; next }
-    inm {
-        line = $0
-        if (line ~ /\]/) { inm = 0 }
-        gsub(/[",]/, "", line)
-        gsub(/[[:space:]]/, "", line)
-        gsub(/\[/, "", line); gsub(/\]/, "", line)
-        if (line != "" && line !~ /^#/) { print line }
-    }
-' "${CARGO_TOML}")
+    members+=("$m")
+done < <(workspace_members "${CARGO_TOML}")
 
 if [ ${#members[@]} -eq 0 ]; then
     echo "ERROR: parsed 0 workspace members from ${CARGO_TOML}." >&2
@@ -165,6 +155,7 @@ member_dirs=""
 models_dir=""
 for m in "${members[@]}"; do
     manifest="${ROOT}/${m}/Cargo.toml"
+    [ "${m}" != . ] || manifest="${ROOT}/Cargo.toml"
     [ -f "${manifest}" ] || continue
     pkg="$(awk -F'"' '/^name[[:space:]]*=/{print $2; exit}' "${manifest}")"
     [ -n "${pkg}" ] || continue
@@ -188,7 +179,7 @@ models_deps="$(awk '
     in_deps && match($0, /^[A-Za-z_][A-Za-z0-9_-]*/) {
         print substr($0, RSTART, RLENGTH)
     }
-' "${ROOT}/${models_dir}/Cargo.toml")"
+' "${ROOT}/$(member_prefix "${models_dir}")Cargo.toml")"
 
 # The member directories the rule's first clause covers, one per line.
 codec_dirs=""
@@ -244,14 +235,20 @@ while IFS=$'\t' read -r crate test file; do
     rel="${file#"${ROOT}"/}"
     half="rest"
     case "${rel}" in
-        "${models_dir}/src/"*) half="codec" ;;
+        "$(member_prefix "${models_dir}")src/"*) half="codec" ;;
     esac
     if [ "${half}" = "rest" ]; then
         while IFS= read -r dir; do
             [ -n "${dir}" ] || continue
-            case "${rel}" in
-                "${dir}/"*) half="codec"; break ;;
-            esac
+            if [ "${dir}" = . ]; then
+                case "${rel}" in
+                    src/* | tests/*) half="codec"; break ;;
+                esac
+            else
+                case "${rel}" in
+                    "${dir}/"*) half="codec"; break ;;
+                esac
+            fi
         done <<< "${codec_dirs}"
     fi
     if [ "${half}" = "rest" ]; then

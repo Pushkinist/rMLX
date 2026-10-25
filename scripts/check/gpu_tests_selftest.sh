@@ -1100,9 +1100,11 @@ fn gpu_alpha() {
 RS
 check_case 0
 
-# A member spelled with a trailing slash or a ./ prefix is the same member. The path the classifier
-# reports carries neither, so the file a notice is matched to is the file the scan finds.
-for spelled in 'trailing_slash:crates/fb/' 'dot_prefix:./crates/fb'; do
+# A member is the same member however it is spelled: a leading ./ (repeated), a trailing / (repeated),
+# a doubled slash and a /./ in the middle all name crates/fb. The path the classifier reports carries
+# none of them, so the file a notice is matched to is the file the scan finds.
+for spelled in 'trailing_slash:crates/fb/' 'dot_prefix:./crates/fb' 'double_slash:crates//fb' \
+    'inner_dot:crates/./fb' 'repeated_dot_prefix:././crates/fb' 'repeated_trailing_slash:crates/fb//'; do
     tag="${spelled%%:*}"
     workspace "member_with_a_${tag}" fb
     printf '[workspace]\nmembers = [\n    "%s",\n]\n' "${spelled#*:}" >"$CASE_ROOT/Cargo.toml"
@@ -1117,13 +1119,34 @@ RS
     st_case "member_with_a_${tag}_has_its_notice_attributed" 1 \
         --has "fb/src/alpha_tests.rs:5 — fb gpu_alpha names no test" \
         -- bash "$TOOL" skip-notices --root "$CASE_ROOT"
-    st_case "member_with_a_${tag}_lists_one_slash" 0 \
+    st_case "member_with_a_${tag}_lists_clean_paths" 0 \
         --is "$(printf 'fb\tgpu_alpha\t%s' "$CASE_ROOT/crates/fb/src/alpha_tests.rs")" \
         -- bash "$TOOL" list --files --root "$CASE_ROOT"
-    st_case "member_with_a_${tag}_agrees_with_the_plain_spelling" 0 \
-        --is "OK: every GPU-touching test carries #[ignore] (1 files across 1 workspace members)." \
+done
+
+# The root package is a member too, spelled `.` or `./`. Its files are src/ and tests/ under the
+# root, and a member that normalises to nothing is not dropped.
+for spelled in 'dot:.' 'dot_slash:./'; do
+    tag="${spelled%%:*}"
+    workspace "root_member_spelled_${tag}" fb
+    printf '[package]\nname = "rootpkg"\nversion = "0.0.0"\n\n[workspace]\nmembers = [\n    "%s",\n    "crates/fb",\n]\n' \
+        "${spelled#*:}" >"$CASE_ROOT/Cargo.toml"
+    mkdir -p "$CASE_ROOT/src"
+    printf '#[test]\nfn gpu_root_no_ignore() {\n    let device = Device::Gpu;\n}\n' >"$CASE_ROOT/src/root_tests.rs"
+    printf '#[test]\n#[ignore = "GPU Metal"]\nfn gpu_alpha() {\n    let device = Device::Gpu;\n}\n' >"$CASE_ROOT/crates/fb/src/alpha_tests.rs"
+    st_case "root_member_spelled_${tag}_is_scanned" 1 \
+        --has "src/root_tests.rs: gpu_root_no_ignore" --lacks "/./" --lacks "//src" \
         -- bash "$TOOL" ignored --root "$CASE_ROOT"
 done
+workspace the_root_member_lists_its_files_under_the_root fb
+printf '[package]\nname = "rootpkg"\nversion = "0.0.0"\n\n[workspace]\nmembers = [\n    "./",\n    "crates/fb",\n]\n' >"$CASE_ROOT/Cargo.toml"
+mkdir -p "$CASE_ROOT/src"
+printf '#[test]\n#[ignore = "GPU Metal"]\nfn gpu_root() {\n    let device = Device::Gpu;\n}\n' >"$CASE_ROOT/src/root_tests.rs"
+printf '#[test]\n#[ignore = "GPU Metal"]\nfn gpu_alpha() {\n    let device = Device::Gpu;\n}\n' >"$CASE_ROOT/crates/fb/src/alpha_tests.rs"
+st_case the_root_member_lists_its_files_under_the_root 0 \
+    --has "$(printf 'rootpkg\tgpu_root\t%s' "$CASE_ROOT/src/root_tests.rs")" \
+    --has "$(printf 'fb\tgpu_alpha\t%s' "$CASE_ROOT/crates/fb/src/alpha_tests.rs")" \
+    -- bash "$TOOL" list --files --root "$CASE_ROOT"
 
 # Every rule reads every file. Each case has two classified files with the violation in the one
 # read first, so a rule that kept only the last file's findings would pass it.
