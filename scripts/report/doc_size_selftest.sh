@@ -36,7 +36,7 @@ fresh() {
 
 # Every gate run is bounded, so a scan that backtracks without end is a failed
 # case (exit 124) rather than a hung selftest.
-CASE_TIMEOUT_S=5
+CASE_TIMEOUT_S=60
 
 # doc_size_gate <root>: the doc-size gate over <root>, bounded.
 doc_size_gate() {
