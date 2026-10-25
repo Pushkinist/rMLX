@@ -54,7 +54,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `gputrace_kernels.sh` | gputrace_diff.sh | List the Metal functions a captured window referenced, straight from the bundle; no Xcode. |
 | `gputrace_preflight.sh` | make build-capture, make gputrace-preflight, gpu_capture.sh | Check the host prerequisites for Apple's GPU tools to work with a Metal capture of this binary. |
 | `gputrace_summary.sh` | none | Summarise a .gputrace bundle: what it captured, its size, and whether Xcode has profiled it. |
-| `metal_dirs.sh` | check_kernel_dtype_contract.sh, check_metal_compiles.sh, check_metal_format.sh, +2 more scripts | The directories holding gated .metal kernels; sourced by the metal gates. |
+| `metal_dirs.sh` | check/kernel_dispatch.sh, check_kernel_dtype_contract.sh, check_metal_compiles.sh, +3 more scripts | The directories holding gated .metal kernels; sourced by the metal gates. |
 | `mlx_preflight.sh` | make mlx-preflight, gpu_capture.sh, mlx_preflight_selftest.sh, mlx_restore_pin.sh | Stop a measurement where rmlx baseline and rmlx bench refuse: a bad mlx-c C API or MLX pair. |
 | `mlx_preflight_selftest.sh` | make ci, make mlx-preflight-selftest | Recall test for mlx_preflight.sh: throwaway Homebrew prefixes and stubs, asserting output. |
 | `mlx_restore_pin.sh` | make mlx-restore-pin, mlx_restore_pin_selftest.sh | Restore the MLX and mlx-c pair named by crates/rmlx-mlx/mlx-pin.txt, then link and pin those kegs. |
@@ -100,7 +100,8 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 |---|---|---|
 | `check/doc_refs.py` | make check-doc-refs, make check-doc-source-citations, make ci, check/doc_refs_selftest.sh | References into docs/ resolve and no edit re-points one; --source-paths: cited crates/ files exist. |
 | `check/doc_refs_selftest.sh` | make check-doc-refs-selftest, make ci | Recall test for doc_refs.py: synthetic git repos, asserting exit code and reason. |
-| `check/rust_gates_fixtures.sh` | make check-eval-lock-fixtures, make check-gpu-tests-ignored-fixtures, make check-kernel-dtype-contract-fixtures, make check-kv-layer-quants-fixtures, make check-no-decode-swallow-fixtures, make check-no-inline-tests-fixtures, make check-no-kernel-input-eval-fixtures, make ci | Recall test for the Rust-source gates: planted scan roots from a table, asserting exit and reason. |
+| `check/kernel_dispatch.sh` | check/rust_gates_fixtures.sh | CI gate: Metal-kernel dispatchers keep inputs lazy, return the caller's dtype, leak no f32 scalar. |
+| `check/rust_gates_fixtures.sh` | make check-eval-lock-fixtures, make check-gpu-tests-ignored-fixtures, make check-kernel-dtype-contract-fixtures, make check-kv-layer-quants-fixtures, make check-no-decode-swallow-fixtures, make check-no-inline-tests-fixtures, make check-no-kernel-input-eval-fixtures, make check-no-scalar-f32-leak-fixtures, make ci | Recall test for the Rust-source gates: planted scan roots from a table, asserting exit and reason. |
 | `check/tree_lines.sh` | make check-claim-bypass, make check-personal-data, make ci, check/tree_lines_selftest.sh | CI gate: forbidden lines in the files git does not ignore, one rule set per mode. |
 | `check/tree_lines_selftest.sh` | make check-claim-bypass-selftest, make check-personal-data-selftest, make ci | Recall test for the tree-line gate: planted git work trees, asserting exit code and file:line. |
 

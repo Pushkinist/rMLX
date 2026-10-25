@@ -8,6 +8,7 @@
 #                  check_kv_layer_quants.sh
 #                  check_no_decode_swallow.sh
 #                  check_no_inline_tests.sh
+#                  check/kernel_dispatch.sh scalar-f32
 #
 # The mode is a directory under scripts/fixtures/ that holds a planted tree for
 # each case and a cases.tsv: one row per case, tab-separated, no empty field
@@ -26,7 +27,7 @@
 #
 # Usage:  bash scripts/check/rust_gates_fixtures.sh <mode>
 #         mode: eval_lock | gpu_tests_ignored | kernel_dtype_contract | no_kernel_input_eval |
-#               kv_layer_quants | no_decode_swallow | no_inline_tests
+#               kv_layer_quants | no_decode_swallow | no_inline_tests | scalar_f32_leak
 # Exit:   0 every case held; 1 a case did not, or none ran; 2 an unknown mode, a
 #         missing table, a malformed row (not 8 fields, a fixture name that is a
 #         path, args without "{}", a needle that is blank) or no awk on the machine
@@ -38,6 +39,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 . "$REPO_ROOT/scripts/lib/selftest_support.sh"
 
 MODE="${1:-}"
+GATE_MODE=""
 case "$MODE" in
 eval_lock) GATE="$REPO_ROOT/scripts/check_eval_lock.sh" ;;
 gpu_tests_ignored) GATE="$REPO_ROOT/scripts/check_gpu_tests_ignored.sh" ;;
@@ -46,6 +48,10 @@ no_kernel_input_eval) GATE="$REPO_ROOT/scripts/check_no_kernel_input_eval.sh" ;;
 kv_layer_quants) GATE="$REPO_ROOT/scripts/check_kv_layer_quants.sh" ;;
 no_decode_swallow) GATE="$REPO_ROOT/scripts/check_no_decode_swallow.sh" ;;
 no_inline_tests) GATE="$REPO_ROOT/scripts/check_no_inline_tests.sh" ;;
+scalar_f32_leak)
+    GATE="$REPO_ROOT/scripts/check/kernel_dispatch.sh"
+    GATE_MODE=scalar-f32
+    ;;
 *)
     echo "usage: bash scripts/check/rust_gates_fixtures.sh <mode>  (modes: see the header)" >&2
     exit 2
@@ -194,9 +200,9 @@ for impl in "${AWKS[@]}"; do
         add_needles --lacks "$lacks"
         if [ "$is" != - ]; then CHECKS+=(--is "$(printf '%b' "$is")"); fi
         case "$stream" in
-        both) st_run env PATH="$RUN_PATH" bash "$GATE" "${ARGV[@]}" ;;
-        out) st_run stdout_of env PATH="$RUN_PATH" bash "$GATE" "${ARGV[@]}" ;;
-        err) st_run stderr_of env PATH="$RUN_PATH" bash "$GATE" "${ARGV[@]}" ;;
+        both) st_run env PATH="$RUN_PATH" bash "$GATE" ${GATE_MODE:+"$GATE_MODE"} "${ARGV[@]}" ;;
+        out) st_run stdout_of env PATH="$RUN_PATH" bash "$GATE" ${GATE_MODE:+"$GATE_MODE"} "${ARGV[@]}" ;;
+        err) st_run stderr_of env PATH="$RUN_PATH" bash "$GATE" ${GATE_MODE:+"$GATE_MODE"} "${ARGV[@]}" ;;
         esac
         why="$(st_check "$want" ${CHECKS[@]+"${CHECKS[@]}"})"
         for chain in ${ORDERED[@]+"${ORDERED[@]}"}; do

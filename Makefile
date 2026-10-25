@@ -116,6 +116,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         check-scripts scripts-index check-scripts-selftest \
         kv-update-census kv-update-census-selftest \
         check-no-inline-tests check-no-inline-tests-fixtures check-no-scalar-f32-leak \
+        check-no-scalar-f32-leak-fixtures \
         check-doc-source-citations \
         check-kv-layer-quants check-kv-layer-quants-fixtures check-kv-codec-disposition \
         check-kv-codec-disposition-fixtures \
@@ -515,6 +516,9 @@ check-no-inline-tests-fixtures: ## CI gate: recall test for the above, 20 plante
 check-no-scalar-f32-leak: ## CI gate: fail if arch-layer code has unguarded scalar_f32( not followed by .astype(
 	@bash scripts/check_no_scalar_f32_leak.sh
 
+check-no-scalar-f32-leak-fixtures: ## CI gate: recall test for the above, 25 planted scan roots, each asserting the line it names or the refusal as well as the exit code
+	@bash scripts/check/rust_gates_fixtures.sh scalar_f32_leak
+
 check-kv-layer-quants: ## CI gate: fail if kv_quant_for_layer is called outside kv_cache/ (one producer: kv_layer_quants)
 	@bash scripts/check_kv_layer_quants.sh
 
@@ -737,6 +741,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_no_inline_tests.sh
 	@bash scripts/check/rust_gates_fixtures.sh no_inline_tests
 	@bash scripts/check_no_scalar_f32_leak.sh
+	@bash scripts/check/rust_gates_fixtures.sh scalar_f32_leak
 	@bash scripts/check_kv_layer_quants.sh
 	@bash scripts/check/rust_gates_fixtures.sh kv_layer_quants
 	@bash scripts/check_kv_codec_disposition.sh
