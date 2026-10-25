@@ -89,8 +89,12 @@ list_err="$(mktemp "${TMPDIR:-/tmp}/gpu_test_threadgroup.XXXXXX")" || {
     exit 2
 }
 trap 'rm -f "${list_err}"' EXIT
-if ! listing="$(bash "${REPO_ROOT}/scripts/check/gpu_tests.sh" list --files --root "${ROOT}" 2>"${list_err}")"; then
+listing="$(bash "${REPO_ROOT}/scripts/check/gpu_tests.sh" list --files --root "${ROOT}" 2>"${list_err}")"
+list_rc=$?
+if [ "${list_rc}" -ne 0 ]; then
     cat "${list_err}" >&2
+    echo "ERROR: check/gpu_tests.sh list --files failed (exit ${list_rc}) for ${ROOT}; no split is computed from a listing it did not finish." >&2
+    exit 2
 fi
 if [ -z "${listing}" ]; then
     echo "ERROR: check/gpu_tests.sh list --files produced no GPU tests for ${ROOT}." >&2

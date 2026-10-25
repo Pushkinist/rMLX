@@ -398,7 +398,7 @@ elif [ ! -d "${RMLX_O_MODELS_ROOT}" ]; then
     snapshot_root_note="RMLX_O_MODELS_ROOT='${RMLX_O_MODELS_ROOT}' does not exist — every snapshot-gated cell skipped and counted as passed"
 fi
 
-listing="$(bash "${REPO_ROOT}/scripts/check/gpu_tests.sh" list)"
+listing="$(bash "${REPO_ROOT}/scripts/check/gpu_tests.sh" list)" || { echo "ERROR: check/gpu_tests.sh list failed (exit $?); refusing to run a classification it did not finish." >&2; exit 1; }
 if [ -z "${listing}" ]; then
     echo "ERROR: check/gpu_tests.sh list produced no GPU tests." >&2
     exit 1
@@ -438,8 +438,8 @@ CANARY_TEST="shader_validation_canary_emits_an_invalid_access_report"
 half_rows=""
 if [ -n "${HALF}" ]; then
     if ! halves_out="$(bash "${REPO_ROOT}/scripts/gpu_test_halves.sh" --root "${REPO_ROOT}")"; then
-        echo "ERROR: the GPU-suite partition could not be computed:" >&2
-        printf '%s\n' "${halves_out}" >&2
+        echo "ERROR: the GPU-suite partition could not be computed." >&2
+        [ -z "${halves_out}" ] || printf '%s\n' "${halves_out}" >&2
         echo "Refusing to run a half whose other half is unknown." >&2
         exit 1
     fi
@@ -484,8 +484,8 @@ n_tg_on=0
 n_tg_off=0
 if [ "${SHADER_VALIDATION}" = "1" ] && [ "${BUILD_ONLY}" = "0" ]; then
     if ! tg_out="$(bash "${REPO_ROOT}/scripts/gpu_test_threadgroup.sh" --root "${REPO_ROOT}")"; then
-        echo "ERROR: the threadgroup-validation split could not be computed:" >&2
-        printf '%s\n' "${tg_out}" >&2
+        echo "ERROR: the threadgroup-validation split could not be computed." >&2
+        [ -z "${tg_out}" ] || printf '%s\n' "${tg_out}" >&2
         exit 1
     fi
     tg_errors=""

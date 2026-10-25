@@ -2105,7 +2105,7 @@ OUT="$(bash "${ROOT}/scripts/gpu_test_halves.sh" --root "${tree}" 2>&1)"
 STATUS=$?
 expect_status 2
 expect_out "claims a Metal context"
-expect_out "produced no GPU tests"
+expect_out "failed (exit 1)"
 
 # A declaring file the producer cannot read is not a file that selects no codec: it would land
 # in the rest half and the codec half would lose a test it guards. The classifier reads the file
@@ -2238,6 +2238,117 @@ HALVES_ERR="$(bash "${ROOT}/scripts/gpu_test_halves.sh" --root "${tree}" 2>&1 >/
 [ -z "${HALVES_ERR}" ] || fail "halves printed on stderr although the listing succeeded: ${HALVES_ERR}"
 TG_ERR="$(bash "${ROOT}/scripts/gpu_test_threadgroup.sh" --root "${tree}" 2>&1 >/dev/null)"
 [ -z "${TG_ERR}" ] || fail "threadgroup printed on stderr although the listing succeeded: ${TG_ERR}"
+
+# producer_scratch <dir> — a repo root holding the real producers beside a classifier that runs the
+# real one, prints its rows, and then fails: the listing that failed after printing.
+producer_scratch() {
+    local d="$1"
+    mkdir -p "${d}/scripts/check" "${d}/scripts/lib" "${d}/crates/rmlx-kv-quant/src" || return 1
+    cp "${ROOT}/scripts/gpu_test_halves.sh" "${ROOT}/scripts/gpu_test_threadgroup.sh" \
+        "${ROOT}/scripts/metal_dirs.sh" "${d}/scripts/" || return 1
+    cp "${ROOT}/scripts/lib/awk_text.sh" "${d}/scripts/lib/" || return 1
+    cp "${ROOT}/crates/rmlx-kv-quant/src/quant.rs" "${d}/crates/rmlx-kv-quant/src/" || return 1
+    cat >"${d}/scripts/check/gpu_tests.sh" <<STUB
+#!/usr/bin/env bash
+rows="\$(bash "${ROOT}/scripts/check/gpu_tests.sh" "\$@")" || exit \$?
+printf '%s\n' "\${rows}"
+echo "ERROR: planted failure after the rows" >&2
+exit 1
+STUB
+}
+
+# A listing that failed is refused whatever it printed before it failed: a partition or a split
+# computed from part of the classification would place the rest nowhere.
+new_case producers_refuse_a_listing_that_failed_after_printing || exit 1
+producer_scratch "${CASE_ROOT}/p" || exit 1
+tree="${CASE_ROOT}/tree"
+threadgroup_fixture_tree "${tree}" || exit 1
+gpu_fixture_test "${tree}/crates/rmlx-kv-quant/src/codec_msl_tests.rs" codec_decodes \
+    'codec_quantize_gpu();'
+gpu_fixture_test "${tree}/crates/rmlx-models/src/arch_tests.rs" arch_forwards
+for producer in halves:partition threadgroup:split; do
+    script="${producer%%:*}"
+    what="${producer#*:}"
+    case "${script}" in halves) script=gpu_test_halves.sh ;; *) script=gpu_test_threadgroup.sh ;; esac
+    OUT="$(bash "${CASE_ROOT}/p/scripts/${script}" --root "${tree}" 2>&1)"
+    STATUS=$?
+    expect_status 2
+    expect_out "failed (exit 1)"
+    expect_out "no ${what} is computed from a listing it did not finish"
+    expect_out "planted failure after the rows"
+    ROWS="$(bash "${CASE_ROOT}/p/scripts/${script}" --root "${tree}" 2>/dev/null)"
+    [ -z "${ROWS}" ] || fail "${script} printed rows although its listing failed: ${ROWS}"
+done
+
+# The runner refuses a listing that failed, for the same reason.
+new_case runner_refuses_a_listing_that_failed_after_printing || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+cat >"${CASE_ROOT}/scripts/check/gpu_tests.sh" <<STUB
+#!/usr/bin/env bash
+cat "${CASE_ROOT}/classified"
+echo "planted classifier failure" >&2
+exit 1
+STUB
+run_case "${CASE_ROOT}" --build --no-shader-validation
+expect_status 1
+expect_once "check/gpu_tests.sh list failed (exit 1)"
+expect_once "planted classifier failure"
+
+# The pairs form of the listing is `printf | cut` under pipefail: a cut that fails after some rows
+# fails the listing, and with no half asked for no producer cross-checks it.
+new_case runner_refuses_a_listing_whose_cut_failed || exit 1
+ln -sf "${ROOT}/scripts/check/gpu_tests.sh" "${CASE_ROOT}/scripts/check/gpu_tests.sh" || exit 1
+ln -sf "${ROOT}/scripts/lib/awk_text.sh" "${CASE_ROOT}/scripts/lib/awk_text.sh" || exit 1
+halves_fixture_tree "${CASE_ROOT}" || exit 1
+gpu_fixture_test "${CASE_ROOT}/crates/rmlx-kv-quant/src/codec_tests.rs" codec_decodes
+gpu_fixture_test "${CASE_ROOT}/crates/rmlx-models/src/arch_tests.rs" arch_forwards
+gpu_fixture_test "${CASE_ROOT}/crates/rmlx-audio/src/asr_tests.rs" asr_transcribes
+cat >"${CASE_ROOT}/bin/cut" <<STUB
+#!/bin/sh
+if [ "\$1" = "-f1,2" ]; then
+    $(command -v cut) "\$@" | head -n 1
+    echo "cut: planted failure" >&2
+    exit 1
+fi
+exec $(command -v cut) "\$@"
+STUB
+chmod +x "${CASE_ROOT}/bin/cut"
+run_case "${CASE_ROOT}" --build --no-shader-validation
+expect_status 1
+expect_out "check/gpu_tests.sh list failed (exit 1)"
+expect_out "cut: planted failure"
+
+# The producers' failure path: a refusal of several lines reaches the operator whole; the
+# scratch file is removed; a scratch file that cannot be made is a refusal; and the refusal
+# is not written where the rows are.
+new_case producers_failure_path || exit 1
+tree="${CASE_ROOT}/tree"
+mkdir -p "${tree}/crates/rmlx-models/src" || exit 1
+printf '[package]\nname = "rmlx-models"\n\n[dependencies]\n' >"${tree}/crates/rmlx-models/Cargo.toml"
+gpu_fixture_test "${tree}/crates/rmlx-models/src/arch_tests.rs" arch_forwards
+printf '[workspace]\nmembers = [\n    "crates/rmlx-models",\n    "crates/gone",\n]\n' >"${tree}/Cargo.toml"
+scratch="${CASE_ROOT}/scratch"
+mkdir -p "${scratch}"
+for script in gpu_test_halves.sh gpu_test_threadgroup.sh; do
+    OUT="$(TMPDIR="${scratch}" bash "${ROOT}/scripts/${script}" --root "${tree}" 2>&1)"
+    STATUS=$?
+    expect_status 2
+    expect_out "The crate moved or was renamed"
+    LEFT="$(ls -A "${scratch}")"
+    [ -z "${LEFT}" ] || fail "${script} left a scratch file behind after a refusal: ${LEFT}"
+    ROWS="$(TMPDIR="${scratch}" bash "${ROOT}/scripts/${script}" --root "${tree}" 2>/dev/null)"
+    [ -z "${ROWS}" ] || fail "${script} wrote its refusal where the rows go: ${ROWS}"
+    OUT="$(TMPDIR="${CASE_ROOT}/no/such/directory" bash "${ROOT}/scripts/${script}" --root "${tree}" 2>&1)"
+    STATUS=$?
+    expect_status 2
+    expect_out "cannot make a scratch file"
+done
+printf '[workspace]\nmembers = [\n    "crates/rmlx-models",\n]\n' >"${tree}/Cargo.toml"
+for script in gpu_test_halves.sh gpu_test_threadgroup.sh; do
+    TMPDIR="${scratch}" bash "${ROOT}/scripts/${script}" --root "${tree}" >/dev/null 2>&1
+    LEFT="$(ls -A "${scratch}")"
+    [ -z "${LEFT}" ] || fail "${script} left a scratch file behind after a run: ${LEFT}"
+done
 
 # A member spelled with a trailing slash or a ./ prefix is the same member: the classifier reports
 # the files under it by the normalised path, so the producer compares against that path.
@@ -2510,7 +2621,7 @@ STATUS=$?
 OUT="${TG_OUT}"
 expect_status 2
 expect_out "claims a Metal context"
-expect_out "produced no GPU tests"
+expect_out "failed (exit 1)"
 
 # A source the producer cannot read is not a source that embeds no kernel: the tests that name
 # its entries would run with the instrumentation off, and the split would still read as computed.
