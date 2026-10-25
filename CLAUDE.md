@@ -287,7 +287,7 @@ Hard rules:
   dispatches Metal but never names the device: an in-process HTTP handler, or a
   child process), drop the `#[ignore]` and pass `Device::Cpu`, or reword the
   `#[ignore]` so it does not claim Metal. A declared test is enforced but
-  deliberately **not** in `--list` — `run_gpu_tests.sh` asserts a Metal
+  deliberately **not** in `check/gpu_tests.sh list` — `run_gpu_tests.sh` asserts a Metal
   validation banner per crate and every declared test is snapshot-gated or drives
   a child, so listing one would fail the suite over a missing model. This one
   check keys on the ignore *text*, which is why a Metal-driving test whose reason
@@ -297,7 +297,7 @@ Hard rules:
   scanner cannot read back — an assembled fn name, a whole macro on one line, an
   item whose brace never closes, an attribute whose bracket never closes — is a
   hard failure rather than a clean scan;
-  those cells are deliberately excluded from `--list` / `make gpu-test`, which
+  those cells are deliberately excluded from `check/gpu_tests.sh list` / `make gpu-test`, which
   every run prints. A proc-macro-generated test, and a `macro_rules!` with a
   non-brace delimiter, remain outside the fail-closed net — neither exists in
   the tree. A bare `#[ignore]` on an environment-gated test (an `env::var` read or the
@@ -305,7 +305,7 @@ Hard rules:
   is fatal on the same terms: it runs under no gate and has no reason for that
   check to read.
   `make check-gpu-tests-ignored-fixtures` (the `gpu_tests_ignored` mode of
-  `scripts/check/rust_gates_fixtures.sh`: 45 cases, run once under each awk on the
+  `scripts/check/rust_gates_fixtures.sh`: 52 cases, run once under each awk on the
   machine) pins the gate's recall in both directions, asserting each case's
   failure *reason* and not just its exit code. See `docs/GPU_TESTS.md`.
 - **Advisory: `make file-size-report`** prints files >1000 LOC. Non-failing.
