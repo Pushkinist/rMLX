@@ -2,8 +2,10 @@
 """Every reference into docs/ resolves, and a doc edit re-points none of them.
 
 Usage:  doc_refs.py [--root DIR] [--base REF|auto] [--list]
-Exit:   0 pass; 1 a broken or re-pointed reference; 2 could not run (not a git
-        work tree, no tracked docs, an unknown base)
+        doc_refs.py --source-paths [--root DIR]
+Exit:   0 pass; 1 a broken or re-pointed reference, or a cited source path that
+        does not exist; 2 could not run (not a git work tree, no tracked docs,
+        an unknown base)
 
 A reference is text in a tracked file that names a doc under `docs/`, and
 maybe something inside it. A doc is named by its `docs/` path, by a bare
@@ -91,6 +93,13 @@ fails. Every run names the files it skipped.
 This reads text, not meaning. It cannot tell whether the text a reference
 lands on still says what the citing sentence claims, and it cannot see a
 reference spelled in a form it does not parse.
+
+`--source-paths` is the other rule over the same docs: every backticked path
+that begins `crates/` and ends in .rs, .metal, .sql, .toml or .txt, in a file
+git tracks under `docs/`, names a file that exists. Fenced code blocks are read
+too: a snippet naming a moved file is as wrong as prose naming it. Identifiers
+(a test or function name) and paths outside `crates/` are not read. It takes no
+--base: a citation to a missing file fails whatever the base held.
 """
 
 from __future__ import annotations
@@ -131,6 +140,7 @@ INLINE_LINK = re.compile(r"\]\(\s*<?([^()\s<>]+)>?(?:\s+\"[^\"]*\")?\s*\)")
 LINK_DEF = re.compile(r"^\s*(?://[/!]?\s*|#\s*)?\[[^\]]+\]:\s*<?(\S+?)>?(?:\s|$)", re.M)
 MAP_ROW = re.compile(r"^\| \[`([^`]+)`\]\(([^)]+)\)", re.M)
 COMMENT_LEADER = re.compile(r"\\?\n\s*(?://[/!]?|#|\*|>|--)?\s*")
+SOURCE_PATH = re.compile(r"`(crates/[A-Za-z0-9_][A-Za-z0-9_./-]*\.(?:rs|metal|sql|toml|txt))`")
 FIXTURE_PATH = re.compile(r"^scripts/(?:[^/]+/)*[^/]+_(?:selftest|fixtures)\.sh$")
 FIXTURE_MARKER = re.compile(r"^\s*(?:#|//)\s*doc-refs: fixture\b", re.M)
 # A run-in heading: a paragraph that opens with a bold title, `**Title.** Text`.
@@ -471,13 +481,52 @@ def describe(ref: Ref, line: int) -> str:
     return f"{where}: {ref.kind} {ref.doc}{key}"
 
 
+def cited_source_paths(root: Path) -> tuple[list[str], list[tuple[str, int, str]]]:
+    """(the docs read, (doc, line, path) for every `crates/` source path they cite).
+    The docs are the files git tracks under `docs/`, not the untracked ones."""
+    listed = git(root, "ls-files", "-z", "--", "docs/*.md", "docs/**/*.md").decode().split("\0")
+    docs = [d for d in listed if d and (root / d).is_file()]
+    cited = []
+    for doc in docs:
+        text = (root / doc).read_text(encoding="utf-8", errors="replace")
+        for number, line in enumerate(text.split("\n"), 1):
+            cited += [(doc, number, path) for path in SOURCE_PATH.findall(line)]
+    return docs, cited
+
+
+def check_source_paths(root: Path) -> int:
+    try:
+        docs, cited = cited_source_paths(root)
+    except CannotRun as err:
+        print(f"doc_refs: could not run: {err}", file=sys.stderr)
+        return 2
+    if not docs:
+        print(f"doc_refs: could not run: no tracked docs/*.md under {root}", file=sys.stderr)
+        return 2
+    missing = [(doc, line, path) for doc, line, path in cited if not (root / path).exists()]
+    if missing:
+        print("ERROR: source paths cited in docs/ that do not exist:", file=sys.stderr)
+        for doc, line, path in missing:
+            print(f"  {doc}:{line}: {path} — resolves to nothing", file=sys.stderr)
+        return 1
+    print(f"OK: {len(cited)} source paths cited in docs/ — all resolve.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--root", default=str(Path(__file__).resolve().parents[2]), help="git work tree to check")
     parser.add_argument("--base", help="git ref to compare the working tree with, or 'auto'")
     parser.add_argument("--list", action="store_true", help="print every reference and what it resolves to")
+    parser.add_argument(
+        "--source-paths", action="store_true", help="check the `crates/` source paths cited in docs/ instead of the references"
+    )
     args = parser.parse_args(argv)
     root = Path(args.root)
+    if args.source_paths:
+        if args.base or args.list:
+            parser.error("--source-paths takes no --base and no --list")
+        return check_source_paths(root)
 
     try:
         head = Tree(worktree_files(root))
