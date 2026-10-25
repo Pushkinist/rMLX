@@ -19,26 +19,14 @@ use std::process::Command;
 
 use rusqlite::Connection;
 
+mod common;
+
 const MODEL: &str = "gemma-4-e4b-it-mxfp8";
 const PROMPT_BODY: &str = "Hello world";
 
-fn rmlx_bin() -> PathBuf {
-    let manifest_dir =
-        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set by cargo");
-    let debug = PathBuf::from(manifest_dir)
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root from CARGO_MANIFEST_DIR")
-        .join("target/debug/rmlx");
-    assert!(debug.exists(), "{} not built", debug.display());
-    debug
-}
-
 /// `rmlx` with a scratch `RMLX_HOME`, so no command here can reach a real DB.
 fn rmlx(home: &Path) -> Command {
-    let mut cmd = Command::new(rmlx_bin());
-    cmd.env("RMLX_HOME", home).env_remove("RMLX_METRICS_DB");
-    cmd
+    common::rmlx_at(home)
 }
 
 fn metrics(home: &Path, db: &Path, args: &[&str]) -> std::process::Output {

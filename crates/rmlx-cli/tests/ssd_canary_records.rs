@@ -7,33 +7,16 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
 use serde_json::{json, Value};
 
-fn rmlx_bin() -> PathBuf {
-    let manifest_dir =
-        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set by cargo");
-    let debug = PathBuf::from(manifest_dir)
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root from CARGO_MANIFEST_DIR")
-        .join("target/debug/rmlx");
-    assert!(
-        debug.exists(),
-        "target/debug/rmlx not found at {}",
-        debug.display()
-    );
-    debug
-}
+mod common;
 
 /// `rmlx <args>` with its data root in `home`, so no run log lands elsewhere.
 fn rmlx(home: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(rmlx_bin())
+    common::rmlx_at(home)
         .args(args)
-        .env("RMLX_HOME", home)
-        .env_remove("RMLX_METRICS_DB")
         .output()
         .expect("launch rmlx")
 }
