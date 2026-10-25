@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Every reference into docs/ resolves, and a doc edit re-points none of them.
+"""References into docs/ resolve and no edit re-points one; --source-paths: cited crates/ files exist.
 
 Usage:  doc_refs.py [--root DIR] [--base REF|auto] [--list]
         doc_refs.py --source-paths [--root DIR]
@@ -57,10 +57,9 @@ doc the same way, or no gate sees a cut that deletes its figure.
 Readers of doc text that this script does not parse have their own gates:
 the INERT banners of docs/KV_CODECS.md and docs/KV_ROTATION_CODECS.md
 (check_kv_codec_disposition.sh), the
-`--kv-boundary-layers` rows of docs/CLI.md (check_kv_boundary_default_parity.sh),
-the generated docs/PUBLISHED_PROTOCOL.md (make check-published-table), and the
-`crates/...` citations in every doc (check_doc_source_citations.sh).
-`make check-doc-consumers` runs all five.
+`--kv-boundary-layers` rows of docs/CLI.md (check_kv_boundary_default_parity.sh)
+and the generated docs/PUBLISHED_PROTOCOL.md (make check-published-table).
+`make check-doc-consumers` runs those, this script and its `--source-paths` mode.
 
 Without --base, every reference in the tree is checked and any broken one
 fails. With --base REF, the working tree is compared with the merge-base of

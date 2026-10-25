@@ -616,7 +616,7 @@ published-table-selftest: ## CI gate: mutation check for the published-protocol 
 	@bash scripts/published_table_selftest.sh
 
 check-doc-source-citations: ## CI gate: fail if a `crates/...` source path cited in docs/ does not exist
-	@bash scripts/check_doc_source_citations.sh
+	@python3 scripts/check/doc_refs.py --source-paths
 
 # The base is a make variable, never read from the environment: only
 # DOC_REFS_BASE=<ref> on the make command line counts, which in make includes
@@ -753,7 +753,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/spec_round_stream_compare_selftest.sh
 	@python3 scripts/published_samples.py verify
 	@bash scripts/check_published_samples_fixtures.sh
-	@bash scripts/check_doc_source_citations.sh
+	@python3 scripts/check/doc_refs.py --source-paths
 	@bash scripts/check/doc_refs_selftest.sh
 	@$(MAKE) --no-print-directory check-doc-refs
 	@bash scripts/check_no_decode_swallow.sh

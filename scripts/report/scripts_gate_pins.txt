@@ -21,7 +21,6 @@ class bench_llama_ab.sh
 class bench_llama_ab_selftest.sh
 class check_claim_bypass.sh
 class check_claim_bypass_selftest.sh
-class check_doc_source_citations.sh
 class check_eval_lock.sh
 class check_gpu_device_census.sh
 class check_gpu_device_census_selftest.sh
@@ -113,7 +112,6 @@ usage bench_identity_selftest.sh
 usage bench_llama_ab.sh
 usage bench_llama_ab_selftest.sh
 usage check_claim_bypass_selftest.sh
-usage check_doc_source_citations.sh
 usage check_eval_lock.sh
 usage check_gpu_device_census_selftest.sh
 usage check_gpu_tests_ignored.sh
@@ -196,7 +194,6 @@ exit-undeclared bench_identity_selftest.sh 1
 exit-undeclared bench_llama_ab.sh 0,125
 exit-undeclared bench_llama_ab_selftest.sh 1
 exit-undeclared check_claim_bypass.sh 1,2
-exit-undeclared check_doc_source_citations.sh 1
 exit-undeclared check_eval_lock.sh 1
 exit-undeclared check_gpu_device_census.sh 2
 exit-undeclared check_gpu_tests_ignored.sh 0,1
@@ -283,7 +280,6 @@ caller sdpa_headdim_bench.py
 caller spec_broken_engine.sh
 recall-missing bench_identity_selftest.sh default
 recall-missing bench_llama_ab_selftest.sh default
-recall-missing check_doc_source_citations.sh default
 recall-missing check_kv_boundary_default_parity.sh default
 recall-missing check_metal_compiles.sh default
 recall-missing check_metal_format.sh default
