@@ -1,16 +1,7 @@
-// The boundary of the last-character rule. A signature-only fn is recognised
-// by its trailing `;`, and a `where` clause pushes that `;` onto a later line
-// — so this one DOES latch.
-//
-// This fixture pins only the SUB-CASE where nothing ever closes the latch, and
-// it is loud only for that reason: the file below has no nested block, so no
-// later line bares to the fn's indent. Add one and the latch closes silently —
-// see `trait_where_signature_open_hole/`, which pins that fail-OPEN answer.
-//
-// So: not "where-split signatures fail closed". Only "a where-split signature
-// with nothing after it to close the latch fails closed". The diagnostic also
-// still talks about macro_rules! on a file that has none, which is a wording
-// debt on top.
+// A signature-only fn whose `where` clause puts the closing `;` on a later line. Until the
+// body's `{` has been seen, a line that ends in `;` ends the declaration, so it neither
+// latches nor swallows the test after it, which is classified and, being un-ignored and
+// reaching Device::Gpu, named.
 
 trait Loader {
     fn load<T>(&self, x: T) -> u32

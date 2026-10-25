@@ -56,10 +56,9 @@ fn_url_in_string	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore
 fn_char_literal_quote	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;later_plain_gpu_no_ignore	-	-	a " inside a char literal does not desynchronise the string scan
 fn_comment_brace	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;plain_gpu_no_ignore	-	-	a } inside a trailing comment does not make the line look self-contained
 trait_signature_fns	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;after_trait_gpu_no_ignore	-	-	one-line signature-only fns neither latch nor hard-fail the run
-trait_where_signature	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;fn never closed	-	-	a where-split signature latches, and is loud ONLY when nothing closes the latch
-# Pins the file count too, so a fixture that lost its source file cannot pass by
-# scanning nothing.
-trait_where_signature_open_hole	--root {}	both	0	OK: every GPU-touching test carries #[ignore] (1 files	ERROR	-	KNOWN OPEN HOLE: one nested block closes the latch and the swallowed GPU test is reported clean
+trait_where_signature	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;after_where_gpu_no_ignore	fn never closed	-	a where-split declaration ends at its `;`: it neither latches nor swallows the test after it
+trait_where_signature_nested_block	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;after_where_gpu_no_ignore	OK:	-	a nested block after a where-split declaration cannot close a latch, so the un-ignored test is named
+fn_where_split_with_body	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;calls_the_where_split_helper	fn never closed	-	a where-split fn with a body is not a declaration: its body's Device::Gpu is seen through the call
 fn_never_closes	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;fn never closed	-	-	a capture that cannot terminate is reported, not skipped
 attr_multiline_ignore	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;later_plain_gpu_no_ignore	probe	-	a wrapped #[ignore = ".." ] closes, and is read rather than merely un-latched
 attr_trailing_comment	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_after_comment_attr	-	-	a comment after an attribute's closing ] does not latch the capture

@@ -158,10 +158,6 @@ it. End a wrapped attribute on a line whose last significant character is `]`.
 
 Each of these passes the gate silently:
 
-- A signature-only fn whose `where` clause pushes the `;` to a later line. The
-  latch closes at the next line indented like the fn, so any `#[test]` it
-  swallowed goes unclassified. The fixtures `trait_where_signature` and
-  `trait_where_signature_open_hole` pin both outcomes.
 - An attribute left open by a raw string or a block comment, closed by a later
   line that ends in `]`. The items between are lost with no report.
 - A raw string (`r"…"`, `r#"…"#`) or a `/* … */` block comment on an item's

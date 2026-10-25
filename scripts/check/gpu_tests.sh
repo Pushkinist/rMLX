@@ -279,19 +279,12 @@
 #       item's body so a `Device::Gpu` in it is never seen, a false "open"
 #       swallows the rest of the file.
 #
-#       KNOWN OPEN BLIND SPOT. The `;` arm covers a signature that fits on ONE
-#       line. A `where` clause pushes the `;` onto a later line, so such a
-#       declaration latches — and the latch is then closed by the first later
-#       line that bares to the fn's indent, which in a Rust test file is `    }`,
-#       the close of any nested block. When it closes that way NO `U` is
-#       emitted: the swallowed `#[test]` was never registered, so nothing looks
-#       unterminated, and the gate reports OK at exit 0 over an un-ignored
-#       `Device::Gpu` test. This is fail-OPEN, not fail-closed. It is
-#       unreachable in the tree today (no scanned file has a where-split
-#       signature) and the class is tracked for reconciliation against the
-#       compiled `cargo test -- --list`. The `trait_where_signature` fixture
-#       pins only the sub-case where nothing closes the latch;
-#       `trait_where_signature_open_hole` pins the open answer.
+#       A signature that does not fit on one line (a `where` clause puts the
+#       `;` on a later line) is read the same way until the item's body `{`
+#       ends a line: until then a line whose last significant character is `;`
+#       ends the declaration. Without that, such a declaration would latch, a
+#       nested block's `    }` would close the latch, and the `#[test]` it
+#       swallowed would pass unclassified.
 #     * A capture that is still open at a file boundary means the parser lost
 #       the file, so it reports `U` rather than letting the remainder go
 #       unclassified. This holds for all THREE captures — fn item, macro body
@@ -321,9 +314,8 @@
 #       Fail-closed.
 #     * something later does — a subsequent `#[test]` is exactly that shape ->
 #       the latch ends there, classification resumes correctly, and the items
-#       swallowed in between are gone with NO report. Fail-OPEN, the same shape
-#       as the `where`-split hole above, and not detectable from here;
-#       reconciliation against the compiled `cargo test -- --list` is what would
+#       swallowed in between are gone with NO report. Fail-OPEN, and not
+#       detectable from here; reconciliation against the compiled `cargo test -- --list` is what would
 #       catch it.
 #   What the close-test buys is not immunity but reachability: getting into that
 #   state now requires one of the two `bare()` hazards, where before it needed
@@ -630,6 +622,7 @@ read -r -d '' AWK_DETECT <<'AWK' || true
                 file_of[curid], label_of[curid]
         }
         in_fn = 0
+        in_sig = 0
         curid = 0
         close_marker = ""
     }
@@ -857,9 +850,24 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         } else {
             in_fn = 1
             close_marker = indent "}"
+            # Until the body's `{` ends a line, a line ending in `;` ends the declaration.
+            in_sig = (bare(line) !~ /\{$/)
         }
         attrs = ""
         next
+    }
+    # ── A `where` clause can put a declaration's `;` on a later line ────
+    in_fn && in_sig {
+        sigline = bare($0)
+        if (sigline ~ /;$/) {
+            in_fn = 0
+            in_sig = 0
+            curid = 0
+            close_marker = ""
+            attrs = ""
+            next
+        }
+        if (sigline ~ /\{$/) { in_sig = 0 }
     }
     # ── Close of the captured fn: `}` at the fn keyword indent ──────────
     in_fn && bare($0) == close_marker {
