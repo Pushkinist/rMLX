@@ -29,8 +29,9 @@ ANY_SKIP='(^|[^A-Za-z0-9_])SKIP([^A-Za-z0-9_]|$)'
 # The same notice as it is written in a Rust format string, where the test's own
 # name arrives as an argument rather than as a literal. `{test}` exactly: any
 # other placeholder is a name the source gate cannot check, and `{other}` reads
-# identically while naming a cell that ran.
-NAMED_SKIP_PLACEHOLDER='SKIP \{test\}:'
+# identically while naming a cell that ran. The braces are bracket expressions because gawk
+# warns about a backslash before a brace in a dynamic regex, once for every line it matches.
+NAMED_SKIP_PLACEHOLDER='SKIP [{]test[}]:'
 
 # A test that ran and judged its answers, and did not make one of its checks on
 # this host, announces `WAIVED <test>: <why>`. It is not a stand-down: the test
@@ -40,4 +41,4 @@ NAMED_WAIVED='WAIVED [A-Za-z_][A-Za-z0-9_]*:'
 
 # Any waiver, named or not, and its form in a Rust format string. As for SKIP.
 ANY_WAIVED='(^|[^A-Za-z0-9_])WAIVED([^A-Za-z0-9_]|$)'
-NAMED_WAIVED_PLACEHOLDER='WAIVED \{test\}:'
+NAMED_WAIVED_PLACEHOLDER='WAIVED [{]test[}]:'
