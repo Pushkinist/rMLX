@@ -34,3 +34,7 @@ clean	--root {}/absent --min 1	both	2	scan root does not exist	check-no-kernel-i
 clean	--root {} --min 0	both	2	usage: bash scripts/check/kernel_dispatch.sh	check-no-kernel-input-eval: ok	-	a floor of zero is a usage error, since a floor of zero is no floor
 clean	--root {} --min	both	2	usage: bash scripts/check/kernel_dispatch.sh	check-no-kernel-input-eval: ok	-	--min without a value is a usage error
 clean	--root {} --min 1 --min 1	both	2	usage: bash scripts/check/kernel_dispatch.sh	check-no-kernel-input-eval: ok	-	a repeated --min is a usage error, not last-one-wins
+string_slashes_before_eval	--root {} --min 1	both	1	check-no-kernel-input-eval: FAIL;;string_slashes_before_eval/alpha_msl.rs:4: let url = "a//b"; q.eval()?;	expected at least	-	two slashes inside a string literal do not start a comment that hides the call after them
+string_holds_marker_text	--root {} --min 1	both	1	check-no-kernel-input-eval: FAIL;;string_holds_marker_text/alpha_msl.rs:4: let note = "// eval-ok: not a comment"; q.eval()?;	expected at least	-	marker text inside a string literal is no marker
+string_then_marker	--root {} --min 1	both	0	check-no-kernel-input-eval: ok (1 dispatcher/scaffold files scanned)	check-no-kernel-input-eval: FAIL	-	a real marker after a string literal with two slashes still exempts its call
+string_then_comment	--root {} --min 1	both	0	check-no-kernel-input-eval: ok (1 dispatcher/scaffold files scanned)	check-no-kernel-input-eval: FAIL	-	a comment after a string literal with two slashes is still a comment

@@ -94,6 +94,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=scripts/lib/awk_text.sh
+. "$REPO_ROOT/scripts/lib/awk_text.sh"
 
 usage() {
     echo "usage: bash scripts/check/kernel_dispatch.sh <input-eval|dtype-contract|scalar-f32> [--root DIR] [--min N]" >&2
@@ -202,17 +204,17 @@ list_files() {
 
 # Each scan prints "file:line: ..." for a violation and exits 1; exit 0 is clean.
 scan_input_eval() {
-    awk '
+    awk "$AWK_TEXT_FNS"'
         {
             line = $0
             stripped = line
             gsub(/^[ \t]+|[ \t]+$/, "", stripped)
 
-            code = line
-            sub(/\/\/.*$/, "", code)
+            code = decomment(line)
+            comment = substr(line, length(code) + 1)
 
             is_full_comment = (stripped ~ /^\/\//)
-            has_marker      = (stripped ~ /\/\/.*eval-ok:/)
+            has_marker      = (comment ~ /eval-ok:/)
             is_eval         = (code ~ /(\.|::)eval[[:space:]]*\(/)
         }
 
@@ -239,7 +241,7 @@ scan_input_eval() {
 }
 
 scan_dtype_contract() {
-    awk -v totals="$TOTALS_FILE" '
+    awk -v totals="$TOTALS_FILE" "$AWK_TEXT_FNS"'
         function trim(s) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", s); return s }
 
         function is_fn(s) {
@@ -306,7 +308,7 @@ scan_dtype_contract() {
                 ns = 0
                 cur = ""
                 for (k = i; k <= end; k++) {
-                    t = trim(line[k])
+                    t = trim(decomment(line[k]))
                     if (t == "") continue
                     cur = (cur == "") ? t : cur " " t
                     if (t ~ /[;{}\]]$/) { ns++; st[ns] = cur; cur = "" }
@@ -357,7 +359,7 @@ scan_dtype_contract() {
 }
 
 scan_scalar_f32() {
-    awk -v file="$1" '
+    awk -v file="$1" "$AWK_TEXT_FNS"'
         function is_f32_astype(line,    p) {
             # Returns 1 if the line contains .astype( targeting F32 — not a guard.
             p = index(line, ".astype(Dtype::F32")
@@ -417,6 +419,9 @@ scan_scalar_f32() {
 
         # ---- code line --------------------------------------------------------
         {
+            code = decomment($0)
+            comment = substr($0, length(code) + 1)
+
             # Capture preceding comment block f32-ok status on first code line.
             if (in_comment_block) {
                 prev_f32ok = block_has_f32ok
@@ -426,10 +431,10 @@ scan_scalar_f32() {
 
             # Handle pending multi-line chain from a previous scalar_f32( line.
             if (pending) {
-                if (has_good_astype($0)) {
+                if (has_good_astype(code)) {
                     # Chain resolved with a non-F32 .astype( — OK.
                     pending = 0
-                } else if (is_terminated($0)) {
+                } else if (is_terminated(code)) {
                     # Statement terminated without a non-F32 .astype( → violation.
                     print file ":" pending_line ": unguarded scalar_f32(  →  " pending_text
                     found = 1
@@ -440,18 +445,18 @@ scan_scalar_f32() {
             }
 
             # Check this code line for scalar_f32(.
-            if (index($0, "scalar_f32(") > 0) {
+            if (index(code, "scalar_f32(") > 0) {
                 # (a) Same-line f32-ok allowlist.
-                if (index($0, "// f32-ok:") > 0) { prev_f32ok = 0; next }
+                if (index(comment, "// f32-ok:") > 0) { prev_f32ok = 0; next }
                 # (b) Preceding comment block had f32-ok.
                 if (prev_f32ok) { prev_f32ok = 0; next }
                 # (c) Same-line non-F32 .astype( chain.
-                if (has_good_astype($0)) { prev_f32ok = 0; next }
+                if (has_good_astype(code)) { prev_f32ok = 0; next }
                 # (d) Same-line .astype( that targets F32 — counts as NO guard.
                 # (falls through to the termination check below)
 
                 # (e) Is the statement terminated on this line?
-                if (is_terminated($0)) {
+                if (is_terminated(code)) {
                     # Terminated with no guard → violation.
                     print file ":" NR ": unguarded scalar_f32(  →  " $0
                     found = 1
@@ -467,7 +472,7 @@ scan_scalar_f32() {
             }
 
             # Not a scalar_f32( line.
-            prev_f32ok = (index($0, "// f32-ok:") > 0)
+            prev_f32ok = (index(comment, "// f32-ok:") > 0)
         }
 
         END {

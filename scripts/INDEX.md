@@ -122,7 +122,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
-| `lib/awk_text.sh` | crates/rmlx-models/tests/common/stop_scan.rs, check_gpu_device_census.sh, check_named_skip_notices.sh, check_spec_charge.sh, +2 more scripts | Line readers for Rust-scanning gates: code without comments, without string bodies, bodiless fns. |
+| `lib/awk_text.sh` | crates/rmlx-models/tests/common/stop_scan.rs, check/kernel_dispatch.sh, check_gpu_device_census.sh, check_named_skip_notices.sh, +3 more scripts | Line readers for Rust-scanning gates: code without comments, without string bodies, bodiless fns. |
 | `lib/bench_server.sh` | perf_canary.sh, spec_bench.sh, spec_bench_published.sh | Start, wait for and identify one rmlx server, for bench harnesses; source it. |
 | `lib/binary_identity.py` | spec_bench_published.sh | Say which binary a bench run measured, and prove it can produce the readings. |
 | `lib/busiest_between.awk` | bench_llama_ab.sh, perf_ab.sh, perf_ab_selftest.sh, +2 more scripts | Which process burned the most CPU between two cpu_snapshot files. |
