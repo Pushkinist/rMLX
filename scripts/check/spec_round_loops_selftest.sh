@@ -70,6 +70,13 @@ gate() {
     fi
 }
 
+# plant_tool: put a copy of the tool in the planted root, so the root it defaults to is $ROOT.
+plant_tool() {
+    mkdir -p "$ROOT/scripts/check" "$ROOT/scripts/lib"
+    cp "$TOOL" "$ROOT/scripts/check/spec_round_loops.sh"
+    cp "$REPO_ROOT/scripts/lib/awk_text.sh" "$ROOT/scripts/lib/awk_text.sh"
+}
+
 # ---- sources -----------------------------------------------------------------
 
 # loop_src <name> <token> <bind|plain>: one round loop. A driver signature that takes the
@@ -1033,6 +1040,31 @@ RS
     gate charge "a write to the configuration is read even where the parameter is immutable" 2 \
         "\`round_loop_generate\` rebinds or writes \`cfg\`, the configuration it"
 
+    build_mid_root
+    edit 's/    let charge = cfg\.charged;/    *cfg = RoundCfg::uncharged();\n    let charge = cfg.charged;/' "$ROOT/$SPEC/round_loop.rs"
+    gate charge "an assignment through the immutable parameter is read" 2 \
+        "\`round_loop_generate\` rebinds or writes \`cfg\`, the configuration it"
+
+    build_mid_root
+    edit 's/    let charge = cfg\.charged;/    let old = std::mem::take(cfg);\n    let charge = cfg.charged;/' "$ROOT/$SPEC/round_loop.rs"
+    gate charge "a mem::take of the immutable parameter is read" 2 \
+        "\`round_loop_generate\` rebinds or writes \`cfg\`, the configuration it"
+
+    # A rollback in a drafter that takes the round's context twice: which one carries the
+    # decision cannot be said, and the scan refuses rather than reading the last one written.
+    build_mid_root
+    drafter_rollback_src "ctx.charged" >>"$ROOT/$SPEC/mtp.rs"
+    edit 's/    ctx: &RoundCtx<\x27_>,\n/    ctx: \&RoundCtx<\x27_>,\n    other: \&RoundCtx<\x27_>,\n/' "$ROOT/$SPEC/mtp.rs"
+    gate charge "a drafter rollback taking the round's context twice is a scan error" 2 \
+        "\`rollback\` takes a \`RoundCtx\` this gate could not name"
+
+    # An entry whose configuration comes from a constructor is still an entry: it states no
+    # decision here, and that is the zero-arm of RULE 5, not a census that quietly lost a site.
+    build_end_root
+    edit 's/        &RoundCfg \{\n(?:.*\n)*?        \},\n/        \&RoundCfg::new(),\n/' "$ROOT/$SPEC/eagle3.rs"
+    gate charge "an entry building its configuration by a constructor states no decision" 1 \
+        "\`eagle3_generate\` builds a round loop's configuration and states"
+
     # A pair, because a case without its control proves nothing about which reading fired: the
     # low-level rollback after a loop's record is refused, and refused just the same when a
     # comment carrying an unbalanced brace sits in front of it. A body whose extent is read off
@@ -1068,6 +1100,13 @@ RS
     gate charge "an entry with no forwarded loop to enter is a scan error" 2 \
         "the scan found 1 entries and no forwarded loop"
 
+    # With no --root the tree is the repository the tool sits in.
+    build_root
+    plant_tool
+    st_case "charge: the default root is the repository the tool sits in" 0 \
+        --has "OK: 7 classic, 0 forwarded, 0 entries" -- \
+        bash "$ROOT/scripts/check/spec_round_loops.sh" charge
+
     # list-drivers reads the population the charge rules read.
     build_root
     st_case "list-drivers: every round loop is listed with its file, fn and line, sorted" 0 \
@@ -1076,6 +1115,11 @@ RS
         --has "$SPEC/mod.rs"$'\t'"spec_generate_stochastic_cached"$'\t' \
         --lacks "round_stats_tests.rs" --lacks "mtp_tests.rs" --lacks "spec_generate_greedy"$'\t' -- \
         bash "$TOOL" list-drivers --root "$ROOT"
+
+    build_root
+    st_run bash "$TOOL" list-drivers --root "$ROOT"
+    st_verdict "list-drivers: the listing is sorted by path, fn and line as text" \
+        "$(st_check 0; [ "$ST_OUT" = "$(printf '%s\n' "$ST_OUT" | LC_ALL=C sort)" ] || echo "the listing is not sorted")"
 
     build_end_root
     st_case "list-drivers: the end state lists its one loop and no entry" 0 \
@@ -1179,6 +1223,18 @@ cases_sampling() {
     build_root
     edit 's/spec_generate_stochastic_cached\(verifier, step_fn, sampler_cfg, device\)/spec_generate_stochastic_cached(verifier, step_fn, device)/' "$ROOT/$SPEC/mod.rs"
     gate sampling "a guard dropping the sampler on one route is refused" 1 \
+        "\`spec_generate_greedy\` runs \`spec_generate_stochastic_cached\` without passing the"
+
+    # The converse and its control for a call rustfmt wraps: the sampler on a later line still
+    # counts, and a wrapped call without it is still refused.
+    build_root
+    edit 's/spec_generate_stochastic_cached\(verifier, step_fn, sampler_cfg, device\)/spec_generate_stochastic_cached(\n            verifier,\n            step_fn,\n            sampler_cfg,\n            device,\n        )/' "$ROOT/$SPEC/mod.rs"
+    gate sampling "a guard call wrapped over several lines still carries the sampler" 0 \
+        "OK: 7 loops (0 forwarded), 0 entries, 1 guards"
+
+    build_root
+    edit 's/spec_generate_stochastic_cached\(verifier, step_fn, sampler_cfg, device\)/spec_generate_stochastic_cached(\n            verifier,\n            step_fn,\n            device,\n        )/' "$ROOT/$SPEC/mod.rs"
+    gate sampling "a guard call wrapped over several lines without the sampler is refused" 1 \
         "\`spec_generate_greedy\` runs \`spec_generate_stochastic_cached\` without passing the"
 
     # The shape the tree has: the path the gate used to exempt by name is an entry, and the
@@ -1330,9 +1386,10 @@ cases_sampling() {
     # The root is an argument. The variable the old gate read it from is gone, so a value left in
     # the environment points the scan nowhere.
     build_root
+    plant_tool
     st_case "sampling: the root cannot be set from the environment" 0 \
         --has "OK: 7 loops (0 forwarded), 0 entries, 1 guards" -- \
-        env SPEC_SAMPLING_ROOT=/nonexistent bash "$TOOL" sampling --root "$ROOT"
+        env SPEC_SAMPLING_ROOT=/nonexistent bash "$ROOT/scripts/check/spec_round_loops.sh" sampling
 }
 
 case "$GROUP" in
