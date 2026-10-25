@@ -1,4 +1,4 @@
-# Planted scan roots for check_no_kernel_input_eval.sh: the exit code and the reason for each.
+# Planted scan roots for check/kernel_dispatch.sh input-eval: the exit code and the reason for each.
 #
 # Columns, tab-separated, none empty ("-" for none): fixture (a directory beside this
 # table), args (gate arguments, "{}" is the fixture path), stream (both, out or err: the
@@ -15,16 +15,16 @@
 # A row that must fail also names the call it is about and lacks the dispatcher floor's
 # message: the floor fails with the same exit code, so the code alone proves nothing.
 
-clean	{} 1	both	0	check-no-kernel-input-eval: ok (1 dispatcher/scaffold files scanned)	check-no-kernel-input-eval: FAIL	-	a dispatcher with no eval passes
-plain_eval	{} 1	both	1	check-no-kernel-input-eval: FAIL;;plain_eval/alpha_msl.rs:3: q.eval()?;	expected at least	-	the plain x.eval() spelling is caught
-ufcs_eval	{} 1	both	1	check-no-kernel-input-eval: FAIL;;ufcs_eval/alpha_msl.rs:3: Array::eval(q)?;	expected at least	-	the UFCS Array::eval(&x) spelling is caught
-common_helper	{} 2	both	1	check-no-kernel-input-eval: FAIL;;common_helper/flash_decode_common.rs:4: a.eval()	expected at least	-	an eval hidden in a shared _common.rs scaffold is caught
-nested_dir	{} 1	both	1	check-no-kernel-input-eval: FAIL;;nested_dir/sub/alpha_msl.rs:4: q.eval()?;	expected at least	-	a dispatcher in a sub-directory is still scanned
-marker_same_line	{} 1	both	0	check-no-kernel-input-eval: ok (1 dispatcher/scaffold files scanned)	check-no-kernel-input-eval: FAIL	-	a same-line eval-ok marker exempts its own call
-marker_same_line_does_not_leak	{} 1	both	1	check-no-kernel-input-eval: FAIL;;marker_same_line_does_not_leak/alpha_msl.rs:4: b.eval()?;	expected at least;;marker_same_line_does_not_leak/alpha_msl.rs:3:	-	a same-line marker exempts its own call, not the call on the next line
-marker_above	{} 1	both	0	check-no-kernel-input-eval: ok (1 dispatcher/scaffold files scanned)	check-no-kernel-input-eval: FAIL	-	an eval-ok marker on the lines above exempts one call
-marker_leaks_to_loop	{} 1	both	1	check-no-kernel-input-eval: FAIL;;marker_leaks_to_loop/alpha_msl.rs:7: arr.eval()?;	expected at least;;marker_leaks_to_loop/alpha_msl.rs:5:	-	one marker exempts one call, not a following loop
-marker_then_statement	{} 1	both	1	check-no-kernel-input-eval: FAIL;;marker_then_statement/alpha_msl.rs:5: q.eval()?;	expected at least	-	a marker does not survive a plain statement between it and the call
-trailing_comment	{} 1	both	0	check-no-kernel-input-eval: ok (1 dispatcher/scaffold files scanned)	check-no-kernel-input-eval: FAIL	-	a comment naming .eval() is not itself a call
-empty_tree	{} 1	both	1	found 0 dispatcher/scaffold files under;;but expected at least 1.	check-no-kernel-input-eval: FAIL;;check-no-kernel-input-eval: ok (1 dispatcher/scaffold files scanned)	-	an empty scan root fails on the pinned floor instead of passing vacuously
-clean	{} 2	both	1	found 1 dispatcher/scaffold files under;;but expected at least 2.	check-no-kernel-input-eval: FAIL;;check-no-kernel-input-eval: ok	-	fewer dispatchers than the pinned floor fails
+clean	--root {} --min 1	both	0	check-no-kernel-input-eval: ok (1 dispatcher/scaffold files scanned)	check-no-kernel-input-eval: FAIL	-	a dispatcher with no eval passes
+plain_eval	--root {} --min 1	both	1	check-no-kernel-input-eval: FAIL;;plain_eval/alpha_msl.rs:3: q.eval()?;	expected at least	-	the plain x.eval() spelling is caught
+ufcs_eval	--root {} --min 1	both	1	check-no-kernel-input-eval: FAIL;;ufcs_eval/alpha_msl.rs:3: Array::eval(q)?;	expected at least	-	the UFCS Array::eval(&x) spelling is caught
+common_helper	--root {} --min 2	both	1	check-no-kernel-input-eval: FAIL;;common_helper/flash_decode_common.rs:4: a.eval()	expected at least	-	an eval hidden in a shared _common.rs scaffold is caught
+nested_dir	--root {} --min 1	both	1	check-no-kernel-input-eval: FAIL;;nested_dir/sub/alpha_msl.rs:4: q.eval()?;	expected at least	-	a dispatcher in a sub-directory is still scanned
+marker_same_line	--root {} --min 1	both	0	check-no-kernel-input-eval: ok (1 dispatcher/scaffold files scanned)	check-no-kernel-input-eval: FAIL	-	a same-line eval-ok marker exempts its own call
+marker_same_line_does_not_leak	--root {} --min 1	both	1	check-no-kernel-input-eval: FAIL;;marker_same_line_does_not_leak/alpha_msl.rs:4: b.eval()?;	expected at least;;marker_same_line_does_not_leak/alpha_msl.rs:3:	-	a same-line marker exempts its own call, not the call on the next line
+marker_above	--root {} --min 1	both	0	check-no-kernel-input-eval: ok (1 dispatcher/scaffold files scanned)	check-no-kernel-input-eval: FAIL	-	an eval-ok marker on the lines above exempts one call
+marker_leaks_to_loop	--root {} --min 1	both	1	check-no-kernel-input-eval: FAIL;;marker_leaks_to_loop/alpha_msl.rs:7: arr.eval()?;	expected at least;;marker_leaks_to_loop/alpha_msl.rs:5:	-	one marker exempts one call, not a following loop
+marker_then_statement	--root {} --min 1	both	1	check-no-kernel-input-eval: FAIL;;marker_then_statement/alpha_msl.rs:5: q.eval()?;	expected at least	-	a marker does not survive a plain statement between it and the call
+trailing_comment	--root {} --min 1	both	0	check-no-kernel-input-eval: ok (1 dispatcher/scaffold files scanned)	check-no-kernel-input-eval: FAIL	-	a comment naming .eval() is not itself a call
+empty_tree	--root {} --min 1	both	1	found 0 dispatcher/scaffold files under;;but expected at least 1.	check-no-kernel-input-eval: FAIL;;check-no-kernel-input-eval: ok (1 dispatcher/scaffold files scanned)	-	an empty scan root fails on the pinned floor instead of passing vacuously
+clean	--root {} --min 2	both	1	found 1 dispatcher/scaffold files under;;but expected at least 2.	check-no-kernel-input-eval: FAIL;;check-no-kernel-input-eval: ok	-	fewer dispatchers than the pinned floor fails

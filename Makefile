@@ -514,7 +514,7 @@ check-no-inline-tests-fixtures: ## CI gate: recall test for the above, 20 plante
 	@bash scripts/check/rust_gates_fixtures.sh no_inline_tests
 
 check-no-scalar-f32-leak: ## CI gate: fail if arch-layer code has unguarded scalar_f32( not followed by .astype(
-	@bash scripts/check_no_scalar_f32_leak.sh
+	@bash scripts/check/kernel_dispatch.sh scalar-f32
 
 check-no-scalar-f32-leak-fixtures: ## CI gate: recall test for the above, 25 planted scan roots, each asserting the line it names or the refusal as well as the exit code
 	@bash scripts/check/rust_gates_fixtures.sh scalar_f32_leak
@@ -685,7 +685,7 @@ check-named-skip-notices-fixtures: ## CI gate: recall test for the above, 44 cas
 	@bash scripts/check_named_skip_notices_fixtures.sh
 
 check-no-kernel-input-eval: ## CI gate: fail if a Metal-kernel dispatcher blocks on Array::eval() (serialises host vs GPU once per layer per decode step)
-	@bash scripts/check_no_kernel_input_eval.sh
+	@bash scripts/check/kernel_dispatch.sh input-eval
 
 check-no-kernel-input-eval-fixtures: ## CI gate: the eval gate still fires on renamed/relocated/differently-spelled evals
 	@bash scripts/check/rust_gates_fixtures.sh no_kernel_input_eval
@@ -712,7 +712,7 @@ check-personal-data-selftest: ## CI gate: recall test for the above, each case a
 	@bash scripts/check/tree_lines_selftest.sh personal-data
 
 check-kernel-dtype-contract: ## CI gate: fail if a Metal-kernel dispatcher returns its declared-f32 output without restoring a caller dtype (promotes the whole decode graph)
-	@bash scripts/check_kernel_dtype_contract.sh
+	@bash scripts/check/kernel_dispatch.sh dtype-contract
 
 check-kernel-dtype-contract-fixtures: ## CI gate: the dtype-contract gate still fires on tuple-returned scales, false guards and marker leaks
 	@bash scripts/check/rust_gates_fixtures.sh kernel_dtype_contract
@@ -740,7 +740,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/report/kv_census_selftest.sh
 	@bash scripts/check_no_inline_tests.sh
 	@bash scripts/check/rust_gates_fixtures.sh no_inline_tests
-	@bash scripts/check_no_scalar_f32_leak.sh
+	@bash scripts/check/kernel_dispatch.sh scalar-f32
 	@bash scripts/check/rust_gates_fixtures.sh scalar_f32_leak
 	@bash scripts/check_kv_layer_quants.sh
 	@bash scripts/check/rust_gates_fixtures.sh kv_layer_quants
@@ -770,7 +770,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/run_gpu_tests_selftest.sh
 	@bash scripts/check_named_skip_notices.sh
 	@bash scripts/check_named_skip_notices_fixtures.sh
-	@bash scripts/check_no_kernel_input_eval.sh
+	@bash scripts/check/kernel_dispatch.sh input-eval
 	@bash scripts/check/rust_gates_fixtures.sh no_kernel_input_eval
 	@bash scripts/check_gpu_device_census.sh
 	@bash scripts/check_gpu_device_census.sh --library
@@ -781,7 +781,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check/tree_lines_selftest.sh personal-data
 	@bash scripts/mlx_restore_pin_selftest.sh
 	@bash scripts/mlx_preflight_selftest.sh
-	@bash scripts/check_kernel_dtype_contract.sh
+	@bash scripts/check/kernel_dispatch.sh dtype-contract
 	@bash scripts/check/rust_gates_fixtures.sh kernel_dtype_contract
 	@bash scripts/perf_ab_selftest.sh
 	@bash scripts/codec_smoke_runner_selftest.sh

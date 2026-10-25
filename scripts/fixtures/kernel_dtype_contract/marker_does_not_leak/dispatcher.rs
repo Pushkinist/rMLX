@@ -1,4 +1,4 @@
-// Synthetic fixture for scripts/check_kernel_dtype_contract.sh — not compiled.
+// Synthetic fixture for scripts/check/kernel_dispatch.sh dtype-contract — not compiled.
 use rmlx_mlx::metal_kernel::MetalKernelInvoke;
 
 // f32-out-ok: read back by another MSL kernel that declares its buffer type.

@@ -1,4 +1,4 @@
-// Synthetic fixture for scripts/check_kernel_dtype_contract.sh — not compiled.
+// Synthetic fixture for scripts/check/kernel_dispatch.sh dtype-contract — not compiled.
 use rmlx_mlx::metal_kernel::MetalKernelInvoke;
 
 /// Quantizer handing f32 scales back inside a tuple — no array is obviously

@@ -3,12 +3,10 @@
 #
 # Recall test for: check_eval_lock.sh
 #                  check_gpu_tests_ignored.sh
-#                  check_kernel_dtype_contract.sh
-#                  check_no_kernel_input_eval.sh
+#                  check/kernel_dispatch.sh input-eval dtype-contract scalar-f32
 #                  check_kv_layer_quants.sh
 #                  check_no_decode_swallow.sh
 #                  check_no_inline_tests.sh
-#                  check/kernel_dispatch.sh scalar-f32
 #
 # The mode is a directory under scripts/fixtures/ that holds a planted tree for
 # each case and a cases.tsv: one row per case, tab-separated, no empty field
@@ -43,8 +41,14 @@ GATE_MODE=""
 case "$MODE" in
 eval_lock) GATE="$REPO_ROOT/scripts/check_eval_lock.sh" ;;
 gpu_tests_ignored) GATE="$REPO_ROOT/scripts/check_gpu_tests_ignored.sh" ;;
-kernel_dtype_contract) GATE="$REPO_ROOT/scripts/check_kernel_dtype_contract.sh" ;;
-no_kernel_input_eval) GATE="$REPO_ROOT/scripts/check_no_kernel_input_eval.sh" ;;
+kernel_dtype_contract)
+    GATE="$REPO_ROOT/scripts/check/kernel_dispatch.sh"
+    GATE_MODE=dtype-contract
+    ;;
+no_kernel_input_eval)
+    GATE="$REPO_ROOT/scripts/check/kernel_dispatch.sh"
+    GATE_MODE=input-eval
+    ;;
 kv_layer_quants) GATE="$REPO_ROOT/scripts/check_kv_layer_quants.sh" ;;
 no_decode_swallow) GATE="$REPO_ROOT/scripts/check_no_decode_swallow.sh" ;;
 no_inline_tests) GATE="$REPO_ROOT/scripts/check_no_inline_tests.sh" ;;
