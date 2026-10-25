@@ -271,20 +271,21 @@
 #       multi-line capture on it would wait for a close that never comes —
 #       swallowing every later item in the file into its body and silently
 #       ending classification. Such a line is captured whole and never latches.
-#       "Closes on its own line" is decided from the line's LAST significant
-#       character (`}` ends an inline body, `;` ends a signature-only
-#       declaration), never from a brace COUNT: `{` / `}` inside a string, a
-#       char literal or a comment are not block delimiters, and counting them
-#       breaks the decision in both directions — a false "balanced" drops the
-#       item's body so a `Device::Gpu` in it is never seen, a false "open"
-#       swallows the rest of the file.
-#
-#       A signature that does not fit on one line (a `where` clause puts the
-#       `;` on a later line) is read the same way until the item's body `{`
-#       ends a line: until then a line whose last significant character is `;`
-#       ends the declaration. Without that, such a declaration would latch, a
-#       nested block's `    }` would close the latch, and the `#[test]` it
-#       swallowed would pass unclassified.
+#       The signature is read by one reader, from the header line on, over the
+#       line's CODE (strings, char literals and line comments blanked): it keeps
+#       the depths of `(`, `[` and `{` across the signature's lines and tracks a
+#       `/* … */` comment across them. A `{` still open at the end of a line is
+#       the body, which latches until the `}` at the fn's indent; a `{` opened
+#       and closed on the line, ending in `}`, is an inline body and the item is
+#       complete; a `;` outside every bracket ends a declaration, however many
+#       lines the signature ran over; anything else is a signature that goes on.
+#       Counting over the raw line instead would break the decision in both
+#       directions: a `{` or `}` in a string, a char literal or a comment is not
+#       a block delimiter — a false "balanced" drops the item's body so a
+#       `Device::Gpu` in it is never seen, a false "open" swallows the rest of
+#       the file — and a `;` in `[u8; 4]` or a comment is not a terminator.
+#       Not tracked: a raw string (`r"…"`, `r#"…"#`), and a `/* … */` comment on
+#       a line outside a signature.
 #     * A capture that is still open at a file boundary means the parser lost
 #       the file, so it reports `U` rather than letting the remainder go
 #       unclassified. This holds for all THREE captures — fn item, macro body
@@ -559,13 +560,23 @@ read -r -d '' AWK_DETECT <<'AWK' || true
     # next line; scanning that line from q=0 would read its payload as code and
     # cut at the first `//` in it. Callers that read one self-contained line
     # pass neither and get the old q=0 behaviour exactly.
-    function bare(s, q0,   i, n, q, c, rest, w, ascii) {
+    #
+    # `bare_code` is the same text with the body of every string and char
+    # literal blanked (the quotes stay), for a reader that counts brackets.
+    function blanks(k,   r) {
+        r = ""
+        while (k-- > 0) r = r " "
+        return r
+    }
+    function bare(s, q0,   i, n, q, c, rest, w, ascii, st, out) {
         n = length(s)
         q = q0 + 0
+        out = ""
         for (i = 1; i <= n; i++) {
+            st = i
             c = substr(s, i, 1)
-            if (c == "\\" && q) { i++; continue }
-            if (c == "\"") { q = !q; continue }
+            if (c == "\\" && q) { i++; out = out blanks(i - st + 1); continue }
+            if (c == "\"") { q = !q; out = out c; continue }
             if (!q && c == "'") {
                 # Step over the WHOLE char literal. A partially-stepped one
                 # leaves its closing quote to be re-read as an opener, and that
@@ -579,6 +590,7 @@ read -r -d '' AWK_DETECT <<'AWK' || true
                  || match(rest, /^\\.'/) \
                  || match(rest, /^[^'\\]'/)) {
                     i += RLENGTH
+                    out = out blanks(i - st + 1)
                     continue
                 }
                 # A non-ASCII payload (`'é'`) is ONE character but 2-4 bytes, so
@@ -602,14 +614,17 @@ read -r -d '' AWK_DETECT <<'AWK' || true
                  && index(substr(rest, 1, w - 1), "\\") == 0) {
                     i += w
                 }
+                out = out blanks(i - st + 1)
                 continue
             }
             if (!q && c == "/" && substr(s, i + 1, 1) == "/") {
                 s = substr(s, 1, i - 1)
                 break
             }
+            out = out (q ? " " : c)
         }
         bare_q = q
+        bare_code = out
         sub(/[[:space:]]+$/, "", s)
         return s
     }
@@ -644,6 +659,44 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         macro_file = ""
         macro_test_n = 0
         macro_fn_n = 0
+    }
+
+    # One reader of a fn item's signature, from its header line on, over the line's
+    # code (`bare_code`: strings, char literals and line comments are not code).
+    # It keeps the depths of `(`, `[` and `{` across the signature's lines, tracks a
+    # `/* ... */` comment across them, and leaves, for the line it read, the number
+    # of `{` it opened (`sig_opened`) and its last significant character (`sig_last`).
+    function sig_reset() {
+        sig_par = 0; sig_sq = 0; sig_br = 0; sig_bc = 0
+    }
+    function sig_scan(m,   i, n, c) {
+        n = length(m)
+        sig_opened = 0
+        sig_last = ""
+        for (i = 1; i <= n; i++) {
+            c = substr(m, i, 1)
+            if (sig_bc) {
+                if (c == "*" && substr(m, i + 1, 1) == "/") { sig_bc = 0; i++ }
+                continue
+            }
+            if (c == "/" && substr(m, i + 1, 1) == "*") { sig_bc = 1; i++; continue }
+            if (c == "(") sig_par++
+            else if (c == ")") { if (sig_par > 0) sig_par-- }
+            else if (c == "[") sig_sq++
+            else if (c == "]") { if (sig_sq > 0) sig_sq-- }
+            else if (c == "{") { sig_br++; sig_opened++ }
+            else if (c == "}") { if (sig_br > 0) sig_br-- }
+            if (c !~ /[[:space:]]/) sig_last = c
+        }
+    }
+    # What the line just read decides: "body" (a `{` is open: the body starts here),
+    # "done" (a `{` opened and closed on this line: the item is complete), "decl" (a
+    # `;` outside every bracket: a declaration with no body) or "more".
+    function sig_verdict() {
+        if (sig_br > 0) return "body"
+        if (sig_opened > 0 && sig_last == "}") return "done"
+        if (sig_last == ";" && sig_par == 0 && sig_sq == 0) return "decl"
+        return "more"
     }
 
     # Tear down an attribute capture whose closing `]` was never found. The
@@ -834,34 +887,51 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         }
         if (in_macro && attrs ~ /#\[(tokio::)?test[](]/) { macro_fn_n++ }
         curid = G
-        # Self-contained iff the line's last significant character closes it:
-        # `}` ends an inline body, `;` ends a signature-only declaration (a
-        # trait method, an extern block). Anything else — `{`, or a `(` from a
-        # multi-line signature — continues onto later lines and must latch.
+        # The signature is read from this line on (sig_scan): the item is complete
+        # when a `{` opened and closed on a line (an inline body) or a `;` ends a
+        # declaration outside every bracket (a trait method, an extern block); it
+        # is a body when a `{` is still open at the end of a line, which is
+        # latched until the `}` at the fn's indent; and anything else is a
+        # signature that continues onto later lines.
         #
-        # A brace COUNT cannot make this call: `{` / `}` inside a string, a
-        # char literal or a trailing comment are not block delimiters, and
-        # counting them breaks the decision in BOTH directions. A false
+        # The counts run over the line's CODE, not the raw line: `{` / `}` inside
+        # a string, a char literal or a comment are not block delimiters, and
+        # counting them raw breaks the decision in BOTH directions. A false
         # "balanced" drops the fn's body, so a `Device::Gpu` inside it never
         # reaches body_of and the test is silently unclassified; a false "open"
         # latches and swallows every later item in the file.
-        if (bare(line) ~ /(\}|;)$/) {
+        #
+        # Not tracked: a raw string (`r"…"`, `r#"…"#`) and a `/* … */` comment on a
+        # line that is not part of a signature. A `/* … */` between the lines of a
+        # signature is.
+        bare(line)
+        sig_reset()
+        sig_scan(bare_code)
+        sig_state = sig_verdict()
+        if (sig_state == "done" || sig_state == "decl") {
             in_fn = 0
             curid = 0
             close_marker = ""
         } else {
             in_fn = 1
             close_marker = indent "}"
-            # Until the body's `{` ends a line, a line ending in `;` ends the declaration.
-            in_sig = (bare(line) !~ /\{$/)
+            in_sig = (sig_state == "more")
         }
         attrs = ""
         next
     }
     # ── A `where` clause can put a declaration's `;` on a later line ────
     in_fn && in_sig {
-        sigline = bare($0)
-        if (sigline ~ /;$/) {
+        bare($0)
+        sig_scan(bare_code)
+        sig_state = sig_verdict()
+        if (sig_state == "body") { in_sig = 0 }
+        if (sig_state == "done" || sig_state == "decl") {
+            if (sig_state == "done") {
+                line = $0
+                sub(/\/\/.*$/, "", line)
+                body_of[curid] = body_of[curid] " " line
+            }
             in_fn = 0
             in_sig = 0
             curid = 0
@@ -869,7 +939,6 @@ read -r -d '' AWK_DETECT <<'AWK' || true
             attrs = ""
             next
         }
-        if (sigline ~ /\{$/) { in_sig = 0 }
     }
     # ── Close of the captured fn: `}` at the fn keyword indent ──────────
     in_fn && bare($0) == close_marker {
