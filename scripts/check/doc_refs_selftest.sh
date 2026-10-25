@@ -272,7 +272,7 @@ cite_ambiguous_memo() {
 
 noop() { :; }
 
-echo "check_doc_refs selftest:"
+echo "doc_refs selftest:"
 
 case_ clean 0 "OK: " \
     "an unedited tree passes" noop
@@ -486,11 +486,15 @@ run_exit no_docs 2 "no tracked docs/*.md" \
     "a tree with no docs is exit 2, not a clean scan" --root "${WORK}/no_docs"
 
 # --source-paths: one small repo per case, committed, then run on its own.
-# sp_repo <name> prints the path of a new repo that holds the crate file crates/c/src/lib.rs.
+# sp_repo <name> prints the path of a new repo whose crate files are shaped like the real
+# tree's: a hyphen in a directory name (rmlx-c), a digit (v2), an underscore (snake_case),
+# an uppercase letter (Upper), and all four in one (rmlx-kv-quant/src/Codec_v2.rs).
 sp_repo() {
-    local dir="${WORK}/$1"
-    mkdir -p "${dir}/docs" "${dir}/crates/c/src"
-    printf '// lib\n' >"${dir}/crates/c/src/lib.rs"
+    local dir="${WORK}/$1" file
+    mkdir -p "${dir}/docs" "${dir}/crates/c/src" "${dir}/crates/rmlx-c/src" "${dir}/crates/rmlx-kv-quant/src"
+    for file in c/src/lib.rs rmlx-c/src/lib.rs c/src/v2.rs c/src/snake_case.rs c/src/Upper.rs rmlx-kv-quant/src/Codec_v2.rs; do
+        printf '// lib\n' >"${dir}/crates/${file}"
+    done
     git -C "${dir}" init -q
     printf '%s\n' "${dir}"
 }
@@ -504,6 +508,32 @@ sp_case() {
     for needle in "$@"; do
         verdict "${name}" "${want}" "${needle}" "${what}" "${got}" "${out}"
     done
+}
+
+# sp_doc <name> <want-exit> <what> <doc text> <needle>...: a repo whose only doc, docs/A.md, holds the text.
+sp_doc() {
+    local name="$1" want="$2" what="$3" text="$4" dir
+    shift 4
+    dir=$(sp_repo "${name}")
+    printf '%s' "${text}" >"${dir}/docs/A.md"
+    commit_all "${dir}" base
+    sp_case "${name}" "${want}" "${what}" "$@"
+}
+
+# sp_streams <name> <want-exit> <what> <want-stdout> <want-stderr>: the repo exists; the two streams are compared whole.
+sp_streams() {
+    local name="$1" want="$2" what="$3" dir="${WORK}/$1" got actual
+    python3 "${TOOL}" --source-paths --root "${dir}" >"${WORK}/${name}.out" 2>"${WORK}/${name}.err"
+    got=$?
+    actual="stdout=[$(cat "${WORK}/${name}.out")] stderr=[$(cat "${WORK}/${name}.err")]"
+    if [ "${got}" = "${want}" ] && [ "${actual}" = "stdout=[$4] stderr=[$5]" ]; then
+        PASSED=$((PASSED + 1))
+        printf '  ok   %-38s — %s\n' "${name}" "${what}"
+    else
+        FAILED=$((FAILED + 1))
+        printf '  FAIL %-38s (want exit %s + stdout=[%s] stderr=[%s], got exit %s) — %s\n' "${name}" "${want}" "$4" "$5" "${got}" "${what}"
+        printf '%s\n' "${actual}" | sed 's/^/         /'
+    fi
 }
 
 d=$(sp_repo source_paths_missing_fails)
@@ -606,6 +636,101 @@ printf '# A\n' >"${d}/docs/A.md"
 commit_all "${d}" base
 run_exit source_paths_with_base 2 "--source-paths takes no --base and no --list" \
     "--source-paths and --base contradict each other" --source-paths --base HEAD --root "${d}"
+run_exit source_paths_with_empty_base 2 "--source-paths takes no --base and no --list" \
+    "an empty --base is a base all the same" --source-paths --base "" --root "${d}"
+run_exit source_paths_with_list 2 "--source-paths takes no --base and no --list" \
+    "--source-paths and --list contradict each other" --source-paths --list --root "${d}"
+
+sp_doc source_paths_class_missing 1 "a missing path is read whatever mix of hyphen, digit, underscore and uppercase it holds" \
+    $'# A\n\n`crates/rmlx-c/src/gone.rs`\n`crates/c/src/gone2.rs`\n`crates/c/src/gone_x.rs`\n`crates/c/src/Gone.rs`\n`crates/rmlx-kv-quant/src/Codec_v3.rs`\n' \
+    "docs/A.md:3: crates/rmlx-c/src/gone.rs" "docs/A.md:4: crates/c/src/gone2.rs" \
+    "docs/A.md:5: crates/c/src/gone_x.rs" "docs/A.md:6: crates/c/src/Gone.rs" \
+    "docs/A.md:7: crates/rmlx-kv-quant/src/Codec_v3.rs"
+sp_doc source_paths_class_existing 0 "an existing path holding a hyphen, a digit, an underscore or an uppercase letter is read, and resolves" \
+    $'# A\n\n`crates/rmlx-c/src/lib.rs` `crates/c/src/v2.rs` `crates/c/src/snake_case.rs`\n`crates/c/src/Upper.rs` `crates/rmlx-kv-quant/src/Codec_v2.rs` `crates/c/src/lib.rs`\n' \
+    "OK: 6 source paths cited"
+
+sp_doc source_paths_nothing_cited 2 "docs that cite no crates/ source path are exit 2, not a pass over nothing" \
+    $'# A\n\nSee `crates/c/gone.md` and crates/c/src/gone.rs.\n' \
+    "no \`crates/\` source path is cited in the 1 docs/*.md read"
+d=$(sp_repo source_paths_nothing_cited_two_docs)
+printf '# A\n' >"${d}/docs/A.md"
+printf '# B\n\nNo path here.\n' >"${d}/docs/B.md"
+commit_all "${d}" base
+sp_case source_paths_nothing_cited_two_docs 2 "the exit 2 line names how many docs were read" \
+    "cited in the 2 docs/*.md read"
+
+sp_doc source_paths_not_scripts 0 "a scripts/ path is not read; the scripts gate owns it" \
+    $'# A\n\n`scripts/gone.rs` and `crates/c/src/lib.rs`\n' \
+    "OK: 1 source paths cited"
+sp_doc source_paths_longer_extension 0 "a path whose extension runs on past the listed one is not read" \
+    $'# A\n\n`crates/c/src/gone.rs.bak` and `crates/c/src/lib.rs`\n' \
+    "OK: 1 source paths cited"
+sp_doc source_paths_uppercase_extension 0 "an extension in the other case is not read" \
+    $'# A\n\n`crates/c/src/gone.RS` and `crates/c/src/lib.rs`\n' \
+    "OK: 1 source paths cited"
+
+d=$(sp_repo source_paths_invalid_utf8)
+printf '# A\n\xff\xfe\n`crates/c/src/gone.rs`\n' >"${d}/docs/A.md"
+commit_all "${d}" base
+sp_case source_paths_invalid_utf8 1 "bytes that are not UTF-8 do not stop the read; the citation after them is reported" \
+    "docs/A.md:3: crates/c/src/gone.rs"
+
+d=$(sp_repo source_paths_line_separators)
+printf '# A\n\f\n\xe2\x80\xa8\nx\ry\n`crates/c/src/gone.rs`\n' >"${d}/docs/A.md"
+commit_all "${d}" base
+sp_case source_paths_line_separators 1 "a form feed, U+2028 and a lone carriage return do not start a line: numbers match grep -n" \
+    "docs/A.md:5: crates/c/src/gone.rs"
+
+d=$(sp_repo source_paths_streams_fail)
+printf '# A\n\n`crates/c/src/two.rs` `crates/c/src/one.rs`\n\n\n\n\n\n\n`crates/c/src/ten.rs`\n' >"${d}/docs/A.md"
+printf '# B\n\n`crates/c/src/b.rs`\n' >"${d}/docs/B.md"
+commit_all "${d}" base
+sp_streams source_paths_streams_fail 1 "every failure line is on stderr, none on stdout, sorted by doc, then line number, then path" \
+    "" "ERROR: source paths cited in docs/ that do not exist:
+  docs/A.md:3: crates/c/src/one.rs — resolves to nothing
+  docs/A.md:3: crates/c/src/two.rs — resolves to nothing
+  docs/A.md:10: crates/c/src/ten.rs — resolves to nothing
+  docs/B.md:3: crates/c/src/b.rs — resolves to nothing"
+
+d=$(sp_repo source_paths_streams_pass)
+printf '# A\n\n`crates/c/src/lib.rs`\n' >"${d}/docs/A.md"
+commit_all "${d}" base
+sp_streams source_paths_streams_pass 0 "the OK line is on stdout and nothing is on stderr" \
+    "OK: 1 source paths cited in docs/ — all resolve." ""
+
+d=$(sp_repo source_paths_default_root)
+mkdir -p "${d}/scripts/check"
+cp "${TOOL}" "${d}/scripts/check/doc_refs.py"
+printf '# A\n\n`crates/c/src/gone.rs`\n' >"${d}/docs/A.md"
+commit_all "${d}" base
+out="$(python3 "${d}/scripts/check/doc_refs.py" --source-paths 2>&1)"
+got=$?
+verdict source_paths_default_root 1 "docs/A.md:3: crates/c/src/gone.rs" \
+    "with no --root, the tree is the one two directories above the script" "${got}" "${out}"
+
+# Output must not depend on the hash seed: the same tree under three seeds prints the same bytes.
+# seed_same <name> <what it proves> <checker args...>
+seed_same() {
+    local name="$1" what="$2" a b c
+    shift 2
+    a="$(PYTHONHASHSEED=1 python3 "${TOOL}" "$@" 2>&1)"
+    b="$(PYTHONHASHSEED=2 python3 "${TOOL}" "$@" 2>&1)"
+    c="$(PYTHONHASHSEED=3 python3 "${TOOL}" "$@" 2>&1)"
+    if [ -n "${a}" ] && [ "${a}" = "${b}" ] && [ "${a}" = "${c}" ]; then
+        PASSED=$((PASSED + 1))
+        printf '  ok   %-38s — %s\n' "${name}" "${what}"
+    else
+        FAILED=$((FAILED + 1))
+        printf '  FAIL %-38s (output differs between hash seeds, or is empty) — %s\n' "${name}" "${what}"
+    fi
+}
+SEEDED="${WORK}/seeded"
+cp -R "${BASE}" "${SEEDED}"
+printf '# Again: docs/GONE.md\n' >>"${SEEDED}/scripts/s.py"
+seed_same hash_seed_default "the lines and the carried-or-failed choice do not depend on the hash seed" \
+    --root "${SEEDED}" --base HEAD
+seed_same hash_seed_list "the --list inventory does not depend on the hash seed" --root "${SEEDED}" --list
 
 # --base auto: origin/main at the base commit, HEAD two commits above it.
 AUTO="${WORK}/auto"
@@ -640,5 +765,5 @@ run_exit auto_head_parent_catches_tip_break 1 "crates/c/m.sql:1: SECTION docs/A.
     "the HEAD^ fallback catches a reference broken in the commit that lands on main" \
     --root "${AUTO_TIP_BREAK}" --base auto
 
-echo "check_doc_refs selftest: ${PASSED} passed, ${FAILED} failed"
+echo "doc_refs selftest: ${PASSED} passed, ${FAILED} failed"
 [ "${FAILED}" -eq 0 ]
