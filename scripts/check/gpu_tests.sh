@@ -1322,8 +1322,8 @@ mode_ignored() {
     echo "OK: every GPU-touching test carries #[ignore] (${total_files} files across ${#members[@]} workspace members)."
 }
 
-# scan_failed <file>: an awk that exits non-zero has read none or part of its file, and what it
-# did not read has no findings only as far as this scan can tell.
+# scan_failed <file>: an awk that fails has read none or part of its file, and what it did not
+# read is not a clean file.
 scan_failed() {
     refuse "the scan of ${1} failed."
 }

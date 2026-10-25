@@ -1264,6 +1264,16 @@ for scan in 'notice:verdict = "none"' 'guard:gtext' 'print:printed[sp]' 'waiver:
         -- env PATH="$(awk_that_fails_on "${scan#*:}"):$PATH" bash "$TOOL" skip-notices --root "$CASE_ROOT"
 done
 
+# The file a scan lists into is removed on every exit, the refusals included.
+workspace a_run_leaves_no_scratch_file
+gpu_test 'eprintln!("SKIP gpu_alpha: no snapshot");'
+scratch="$ST_WORK/scratch"
+mkdir -p "$scratch"
+st_run env TMPDIR="$scratch" bash "$TOOL" list --root "$CASE_ROOT"
+st_run env TMPDIR="$scratch" bash "$TOOL" list --root "$ST_WORK/nowhere"
+left="$(ls -A "$scratch")"
+st_verdict a_run_leaves_no_scratch_file "$([ -z "$left" ] || printf 'left behind: %s' "$left")"
+
 # ---------------------------------------------------------------------------
 # list: the compliant set, `<crate> <fn>` per line, and with --files the declaring file.
 workspace list_names_the_crate_and_the_fn
