@@ -84,7 +84,11 @@ jobs:
       - name: the dtype-contract gate still catches what it is for
         run: make check-kernel-dtype-contract-fixtures
       # The third rule of the same tool: an f32 scalar combined with a bf16
-      # activation promotes the result. Planted scan roots pin its recall.
+      # activation promotes the result to f32, and the call site looks harmless
+      # at review. Static; the scan needs only bash, awk, grep and find.
+      - name: no f32 scalar is combined with a bf16 activation unguarded
+        run: make check-no-scalar-f32-leak
+      # ...and planted scan roots pin the recall of the gate above.
       - name: the f32-scalar gate still catches what it is for
         run: make check-no-scalar-f32-leak-fixtures
       # rMLX serialises every MLX evaluation under one lock; this gate is what
