@@ -1017,7 +1017,8 @@ RS
 workspace derived_nameless_notice_fails
 gpu_test 'eprintln!("SKIP: no snapshot");'
 check_case 1 \
-    --has "fx/src/fixture_tests.rs:5 — fx gpu_alpha names no test"
+    --has "fx/src/fixture_tests.rs:5 — fx gpu_alpha names no test" \
+    --lacks "crates/fx/"
 
 workspace derived_named_notice_passes
 gpu_test 'eprintln!("SKIP gpu_alpha: no snapshot");'
@@ -1046,6 +1047,31 @@ fn cpu_beta() {
 }
 RS
 check_case 0
+
+# A notice is attributed by the file that declares the test as well as by its name: a helper that
+# shares a name with a classified test in another file is not that test.
+workspace a_helper_named_like_a_test_in_another_file_is_not_that_test
+source_file fx src/a_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal context"]
+fn gpu_alpha() {
+    let device = Device::Gpu;
+    eprintln!("SKIP gpu_alpha: no snapshot");
+}
+RS
+source_file fx src/b_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal context"]
+fn gpu_beta() {
+    let device = Device::Gpu;
+}
+
+fn gpu_alpha() {
+    eprintln!("SKIP: no snapshot");
+}
+RS
+check_case 0 \
+    --has "every stand-down notice"
 
 # Nothing classified is not a clean tree.
 workspace derived_no_gpu_test_is_exit_2
@@ -1659,6 +1685,12 @@ st_case bare_reads_a_backslash_in_a_raw_string_as_a_character 0 \
 st_case bare_does_not_read_a_raw_string_inside_a_name 0 \
     --is 'bar"x";|0|0|bar" "; $' \
     -- bare_probe 'bar"x"; // c'
+st_case bare_leaves_a_raw_string_that_does_not_close_to_the_plain_string_rule 0 \
+    --is 'x = r#"abc|1|0|x = r#"   $' \
+    -- bare_probe 'x = r#"abc'
+st_case bare_does_not_open_a_raw_string_inside_a_string 0 \
+    --is 'let s = "abc r"; let t = "x"; y|0|0|let s = "     "; let t = " "; y$' \
+    -- bare_probe 'let s = "abc r"; let t = "x"; y'
 st_case bare_keeps_the_text_as_long_across_a_backslash_that_ends_the_line 0 \
     --is 'let s = "ab\|1|0|let s = "   $' \
     -- bare_probe 'let s = "ab\'

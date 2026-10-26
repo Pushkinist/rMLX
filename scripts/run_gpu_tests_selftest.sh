@@ -45,18 +45,21 @@
 # cases under THE HALVES below hold it to a union that loses nothing, a census
 # slice keyed on the pin's own crate and test, and a stand-down that stays one.
 #
-# Exit 0 = every case reported exactly what it should.
+# Exit: 0 every case reported what it should; 1 one did not, or none ran.
 
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNNER="${ROOT}/scripts/run_gpu_tests.sh"
 
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/rmlx_gpu_runner_selftest.XXXXXX")"
-trap 'rm -rf "${WORK}"' EXIT
+# shellcheck source=scripts/lib/selftest_support.sh
+. "${ROOT}/scripts/lib/selftest_support.sh"
 
-failures=0
-skipped=0
+st_init run_gpu_tests_selftest
+WORK="${ST_WORK}"
+
+cases=0
+failed_case=""
 CASE=""
 CASE_ROOT=""
 OUT=""
@@ -75,6 +78,7 @@ TG_OUT=""
 # and a subshell would drop it.
 new_case() {
     CASE="$1"
+    cases=$((cases + 1))
     CASE_ROOT="${WORK}/$1"
     local root="${CASE_ROOT}"
     mkdir -p "${root}/scripts/lib" "${root}/scripts/check" "${root}/bin" "${root}/logs" || return 1
@@ -284,13 +288,8 @@ run_case() {
 
 fail() {
     echo "FAIL [${CASE}] $1" >&2
-    failures=$((failures + 1))
-}
-
-# A check this host cannot make: neither passed nor failed, and the last line says how many.
-skip_check() {
-    skipped=$((skipped + 1))
-    echo "skip [${CASE}]: $1"
+    [ "${failed_case}" = "${CASE}" ] || ST_FAILED=$((ST_FAILED + 1))
+    failed_case="${CASE}"
 }
 
 expect_status() {
@@ -2284,7 +2283,7 @@ for producer in halves:partition threadgroup:split; do
     expect_status 2
     expect_out "failed (exit 1)"
     expect_out "no ${what} is computed from a listing it did not finish"
-    expect_out "planted failure after the rows"
+    expect_once "planted failure after the rows"
     ROWS="$(bash "${CASE_ROOT}/p/scripts/${script}" --root "${tree}" 2>/dev/null)"
     [ -z "${ROWS}" ] || fail "${script} printed rows although its listing failed: ${ROWS}"
 done
@@ -2719,7 +2718,7 @@ expect_placed on rmlx-kv-quant codec_decodes
 dispatcher="${tree}/crates/rmlx-kv-quant/src/codec_msl.rs"
 chmod 000 "${dispatcher}"
 if cat "${dispatcher}" >/dev/null 2>&1; then
-    skip_check "this user can read a mode-000 file"
+    st_skip "${CASE}" "this user can read a mode-000 file"
 else
     TG_OUT="$(bash "${ROOT}/scripts/gpu_test_threadgroup.sh" --root "${tree}" 2>&1)"
     STATUS=$?
@@ -2730,7 +2729,7 @@ fi
 chmod 644 "${dispatcher}"
 chmod 000 "${tree}/crates/rmlx-models/benches"
 if ls "${tree}/crates/rmlx-models/benches" >/dev/null 2>&1; then
-    skip_check "this user can read a mode-000 directory"
+    st_skip "${CASE}" "this user can read a mode-000 directory"
 else
     TG_OUT="$(bash "${ROOT}/scripts/gpu_test_threadgroup.sh" --root "${tree}" 2>&1)"
     STATUS=$?
@@ -2849,10 +2848,5 @@ expect_out "shader validation clean"
 expect_no_out "INCOMPLETE"
 expect_no_out "ERROR:"
 
-if [ "${failures}" -ne 0 ]; then
-    echo >&2
-    echo "run_gpu_tests_selftest: ${failures} assertion(s) failed." >&2
-    exit 1
-fi
-
-echo "run_gpu_tests_selftest: OK — every kind of red is reported, the access mix is the one observed, the census pin accepts only what it names, each half runs its own tests against its own slice of that pin, each test runs under its own threadgroup setting, the verdict is the uninstrumented run's, and a test only the instrument turned red is a failure.$([ "${skipped}" -eq 0 ] || printf ' %d check(s) were skipped on this host.' "${skipped}")"
+ST_PASSED=$((cases - ST_FAILED))
+st_done

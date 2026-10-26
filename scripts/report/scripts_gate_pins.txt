@@ -210,7 +210,6 @@ exit-undeclared release/sync_tap.sh 1
 exit-undeclared release_e2e/stage6_perf/codec_smoke_runner.sh 0,1,2,3
 exit-undeclared release_e2e/stage6_perf/niah_long_context.sh 1,2
 exit-undeclared run_gpu_tests.sh 0,1
-exit-undeclared run_gpu_tests_selftest.sh 1
 exit-undeclared schema_constraint_canary.sh 0,2
 exit-undeclared spec_bench.sh 1,125
 exit-undeclared spec_bench_published.sh 1,125

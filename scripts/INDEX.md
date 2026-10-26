@@ -62,7 +62,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `published_table_selftest.sh` | make ci, make published-table-selftest | Mutation check for lib/published_table.py: a fixture snapshot, asserting exit code and reason. |
 | `rmlx-capture.entitlements` | make build-capture | Debug-only entitlement for the GPU-capture binary (`make build-capture`). |
 | `run_gpu_tests.sh` | make ci-perf, make gpu-test, run_gpu_tests_selftest.sh | Run the #[ignore] Metal tests of every member crate, serialized, under Metal shader validation. |
-| `run_gpu_tests_selftest.sh` | make ci, make gpu-runner-selftest, report/scripts_gate_selftest.sh | Recall test for run_gpu_tests.sh: how it reports red runs, waivers and census verdicts. |
+| `run_gpu_tests_selftest.sh` | make ci, make gpu-runner-selftest | Recall test for run_gpu_tests.sh: how it reports red runs, waivers and census verdicts. |
 | `schema_constraint_canary.sh` | make schema-constraint-canary | Real-model proof for the json_schema constrained-decoding path: two probes, two architectures. |
 | `sdpa_headdim_bench.py` | none | What MLX's SDPA dispatch costs as a function of `head_dim`. |
 | `spec_bench.sh` | make spec-canary, check_spec_metric_parity_fixtures.sh, spec_bench_selftest.sh | spec_bench.sh — bench one model in normal vs MTP speculative-decode mode. |
@@ -138,7 +138,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `lib/published_run_log.py` | lib/binary_identity.py, lib/prefill_ms.py, lib/published_greedy.py, +1 more scripts | Read one rmlx run log back as a per-request table. |
 | `lib/published_table.py` | make check-published-table, make published-table, published_table_selftest.sh | Render published-protocol runs as the Markdown table a post needs. |
 | `lib/run_log_for_pid.py` | lib/bench_server.sh | Pick the run log a given process wrote, out of the candidates on stdin. |
-| `lib/selftest_support.sh` | bench_llama_ab_selftest.sh, check/gpu_tests_selftest.sh, check/rust_gates_fixtures.sh, +12 more scripts | The case runner and shims the self-tests share; source it. |
+| `lib/selftest_support.sh` | bench_llama_ab_selftest.sh, check/gpu_tests_selftest.sh, check/rust_gates_fixtures.sh, +13 more scripts | The case runner and shims the self-tests share; source it. |
 | `lib/server_decode_tps.py` | perf-iter/bench_decode_tps.sh, spec_bench.sh | Read one request's decode rate off a running rmlx server. |
 | `lib/server_kv_quant.py` | lib/bench_server.sh, lib/binary_identity.py, perf_canary.sh, +1 more scripts | Read the KV codec a run resolved out of its rmlx run log. |
 | `lib/server_sampling.py` | crates/rmlx-server/src/engine/sampler_event_tests.rs, lib/published_run_log.py, spec_bench.sh | Read whether a run's requests were sampled, out of its rmlx run log. |

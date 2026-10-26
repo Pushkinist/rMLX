@@ -3,10 +3,7 @@ macro_rules! gpu_cell2 {
         #[test]
         fn $name(
             $($p: $t),*
-        ) {
-            let device = Device::Gpu;
-            run(device);
-        }
+        ) { let device = Device::Gpu; }
     };
 }
 

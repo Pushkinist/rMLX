@@ -2515,17 +2515,6 @@ EOF
 st_case runner_a_run_of_skips_only_is_no_case_ran 1 --what "a run in which every case was skipped checked nothing, and is not a clean run" \
     --has "child: 0 passed, 0 failed, 1 skipped" --has "child: no case ran" -- runner_child "$body"
 
-# The GPU runner's recall test counts its own skips and says so on its last line. A shim makes
-# `chmod 000` a no-op, so the paths it makes unreadable stay readable, as for root, and it must
-# skip the checks that need them.
-shim="$ST_WORK/chmod_shim"
-mkdir -p "$shim"
-printf '#!/bin/sh\n[ "$1" = 000 ] && exit 0\nexec %s "$@"\n' "$(command -v chmod)" >"$shim/chmod"
-chmod +x "$shim/chmod"
-st_case runner_selftest_counts_its_skips 0 --what "the GPU runner's recall test reports how many checks it skipped" \
-    --has "check(s) were skipped on this host" \
-    -- st_bounded 900 env PATH="$shim:$PATH" bash "$REPO_ROOT/scripts/run_gpu_tests_selftest.sh"
-
 # ---- the real tree -------------------------------------------------------
 
 # The pin counts are literals, so a chunk that shrinks a pin lowers them in the same commit
@@ -2556,9 +2545,9 @@ END {
 }' "$REPO_ROOT/scripts/report/scripts_gate_pins.txt"
 }
 st_case real_tree_pin_totals 0 --what "the checked-in pin file holds exactly these member totals and figure sums" \
-    --is "$(printf '%s\n%s' 'members: exit-undeclared 116, recall-missing 10, silenced 4, lib-run 29, dead-path 1, name 13, lib-shadow 3, env-knob 95' 'figures: size 14673, heredoc 1278, twin 1234, binary-literal 45')" -- pin_totals
+    --is "$(printf '%s\n%s' 'members: exit-undeclared 115, recall-missing 10, silenced 4, lib-run 29, dead-path 1, name 13, lib-shadow 3, env-knob 95' 'figures: size 14673, heredoc 1278, twin 1234, binary-literal 45')" -- pin_totals
 st_case real_tree 0 --what "the checked-in tree passes with exactly these pins" \
-    --has "pinned: class 76, purpose 6, usage 65, exit-undeclared 66, caller 16, recall-missing 10, silenced 3, lib-consumers 10, lib-run 19, shebang 1, exec-bit 5, dead-path 1, set-mode 35, name 12, size 10, heredoc 14, twin 15, lib-shadow 3, binary-literal 24, env-knob 37" \
-    --has "428 pinned)" -- sg_gate "$REPO_ROOT"
+    --has "pinned: class 76, purpose 6, usage 65, exit-undeclared 65, caller 16, recall-missing 10, silenced 3, lib-consumers 10, lib-run 19, shebang 1, exec-bit 5, dead-path 1, set-mode 35, name 12, size 10, heredoc 14, twin 15, lib-shadow 3, binary-literal 24, env-knob 37" \
+    --has "427 pinned)" -- sg_gate "$REPO_ROOT"
 
 st_done

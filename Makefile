@@ -681,7 +681,7 @@ gpu-runner-selftest: ## CI gate: the GPU runner reports a failing test and a sha
 check-named-skip-notices: ## CI gate: a classified GPU test that announces its own stand-down names itself, so the runner can attribute it
 	@bash scripts/check/gpu_tests.sh skip-notices
 
-check-named-skip-notices-fixtures: ## CI gate: recall test for the above and for the classified-test listing, 148 cases, each asserting the reason as well as the exit code
+check-named-skip-notices-fixtures: ## CI gate: recall test for the above and for the classified-test listing, 151 cases, each asserting the reason as well as the exit code
 	@bash scripts/check/gpu_tests_selftest.sh
 
 check-no-kernel-input-eval: ## CI gate: fail if a Metal-kernel dispatcher blocks on Array::eval() (serialises host vs GPU once per layer per decode step)
