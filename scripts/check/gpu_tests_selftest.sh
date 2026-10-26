@@ -1087,7 +1087,7 @@ source_file fx src/b_tests.rs <<'RS'
 RS
 st_case a_string_left_open_by_one_file_is_not_carried_into_the_next 1 \
     --has "gpu_a (fn never closed" \
-    --has "b_tests.rs:1: #[test] fn gpu_b() { let device = Device::Gpu; } (code after an attribute's closing bracket" \
+    --has "b_tests.rs:1: #[test] fn gpu_b() { let device = Device::Gpu; } (an item after an attribute's closing bracket" \
     -- bash "$TOOL" ignored --root "$CASE_ROOT"
 
 # Nothing classified is not a clean tree.

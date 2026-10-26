@@ -149,15 +149,16 @@ compliant:
   name built by `paste!` or `concat_idents!`, or a `#[test]` on its `fn` line;
 - a `macro_rules!` written on one line whose body declares `#[test]`;
 - an item whose closing brace is never found;
-- an attribute whose closing `]` is never found, and code on the line of an
-  attribute's closing `]` (`#[test] fn x() {}`, or `)] fn x() {`): the item is
-  not followed;
+- an attribute whose closing `]` is never found, and an item after an
+  attribute's closing `]` on its line (`#[test] fn x() {}`, `)] fn x() {`, a
+  `macro_rules!`, a `Device` alias): the item is not followed;
 - a string or block comment still open at the end of a file: the gate lost the
   file at some point and read the tail as text.
 
 Write a generated fn as `fn $name()` on its own line, with its attributes above
 it. An attribute ends at its own `]`, counted over its code across its lines,
-and nothing follows that `]` on its line but a comment.
+and no item follows that `]` on its line. A field, a generic parameter or a
+`mod m {` may.
 
 ### What the scanner cannot see
 

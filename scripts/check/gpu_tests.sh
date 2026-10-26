@@ -293,8 +293,7 @@
 #       The body carries the string and comment state of the line that opened it
 #       from line to line, so a `}` that starts a line inside a string or a comment
 #       closes nothing, and a `//` inside one cuts nothing. Outside a fn the same
-#       state is carried too. Not tracked: a `/* … */` comment that spans the
-#       lines of an attribute.
+#       state is carried too, and across the lines of an attribute.
 #     * A capture that is still open at a file boundary means the parser lost
 #       the file, so it reports `U` rather than letting the remainder go
 #       unclassified. This holds for all FOUR captures — fn item, macro body,
@@ -303,34 +302,22 @@
 #   ATTRIBUTES ARE A THIRD CAPTURE, with the same latch hazard. An attribute
 #   that does not close on its own line latches until one does, and while
 #   latched it consumes every line — including every `fn` — so a latch that
-#   never ends silently unclassifies the rest of the file. The close-test is
-#   therefore the same "last SIGNIFICANT character" rule the fn arm uses, not a
-#   match against one wrapped spelling: reading only `)]` (how a wrapped
-#   `#[cfg(..)]` ends) missed the wrapped STRING form `"]`, and reading the raw
-#   line missed any attribute with a trailing comment. The string state is
-#   carried across the line break (`bare()`'s `q0` / `bare_q`), so a `//` in the
-#   continued payload of a wrapped string is not mistaken for a comment.
+#   never ends silently unclassifies the rest of the file. It closes at its own
+#   `]`, found by bracket depth over the code of each line, with the string and
+#   block-comment state (`attr_q`, `attr_c`) carried across the line break. An
+#   attribute never closed at the file boundary is reported `U`.
+#
+#   An item after the `]` on its line (`#[test] fn x() {}`, `)] fn x() {`,
+#   `macro_rules!`, a `const NAME: Device = Device::Gpu` alias) is refused, since
+#   the reader would not follow it. Any other tail (`T,`, `pub u8,`, `mod m {`)
+#   feeds no rule and ends the pending attribute block.
 #
 #   `bare()` finds the trailing comment with a string-aware scan, so neither a
 #   `//` inside a string literal nor a char literal of any payload form (`b'"'`,
 #   `'\x1b'`, `'\u{FFFD}'`, `'é'`) derails it, a non-ASCII lifetime (`<'é, '"'>`)
-#   is no char literal and swallows nothing after it, and a block comment is read before
-#   a `//` or a quote in it is looked at. A raw string that does not close on its
-#   line is carried like a plain one (the `\` in `r"a\"` is no escape). The
-#   remaining known parse hazard is a block comment that spans the lines of an
-#   attribute — the close-test does not carry its depth. An attribute whose
-#   closing `]` is hidden behind one latches, and what happens next splits two
-#   ways — state both rather than claim the good one:
-#     * nothing later in the file bares to `]` -> the file boundary reports `U`.
-#       Fail-closed.
-#     * something later does — a subsequent `#[test]` is exactly that shape ->
-#       the latch ends there, classification resumes correctly, and the items
-#       swallowed in between are gone with NO report. Fail-OPEN, and not
-#       detectable from here; reconciliation against the compiled `cargo test -- --list` is what would
-#       catch it.
-#   What the close-test buys is not immunity but reachability: getting into that
-#   state now requires a block comment across the attribute's lines, where before
-#   it needed only the ordinary wrapped-string spelling.
+#   is no char literal and swallows nothing after it, and a block comment is read
+#   before a `//` or a quote in it is looked at. A raw string that does not close
+#   on its line is carried like a plain one (the `\` in `r"a\"` is no escape).
 #
 #   PORTABLE AWK ONLY — this runs on the developer's BSD awk and on whatever
 #   the Linux CI image provides. Two constructs are out of bounds because they
@@ -819,15 +806,24 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         return 0
     }
 
-    # Code on the line of an attribute's closing `]` is an item the reader does not
-    # follow (`#[test] fn x() {}`): refused, not skipped.
-    function attr_tail_refuse(m, pos,   t) {
-        if (substr(m, pos + 1) ~ /[^[:space:]]/) {
-            t = $0
-            sub(/^[[:space:]]+/, "", t)
-            printf "U  %s:%d: %s (code after an attribute's closing bracket on its line — parser lost the item)\n",
-                FILENAME, FNR, t
+    # What follows an attribute's closing `]` on its line. An item a rule below would
+    # read (`#[test] fn x() {}`, `macro_rules!`, a Device alias) or a second attribute
+    # is refused, not skipped; any other tail (`T,`, `pub u8,`, `mod m {`) feeds no
+    # rule and ends the pending attribute block.
+    function attr_tail_refuse(m, pos,   t, l) {
+        t = substr(m, pos + 1)
+        sub(/^[[:space:]]+/, "", t)
+        if (t == "") return
+        if ((t ~ /^(pub[^ ]* )?(async )?fn [$a-zA-Z0-9_]/ && t !~ /^(pub[^ ]* )?(async )?fn \$[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:/) \
+            || t ~ /^macro_rules!/ || t ~ /^#\[/ \
+            || t ~ /^const[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:[[:space:]]*Device[[:space:]]*=[[:space:]]*Device::Gpu/) {
+            l = $0
+            sub(/^[[:space:]]+/, "", l)
+            printf "U  %s:%d: %s (an item after an attribute's closing bracket on its line — parser lost the item)\n",
+                FILENAME, FNR, l
+            return
         }
+        attrs = ""
     }
 
     # New file: reset the per-file parse state and derive this file's module
