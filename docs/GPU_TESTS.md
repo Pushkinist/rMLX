@@ -149,16 +149,17 @@ compliant:
   name built by `paste!` or `concat_idents!`, or a `#[test]` on its `fn` line;
 - a `macro_rules!` written on one line whose body declares `#[test]`;
 - an item whose closing brace is never found;
-- an attribute whose closing `]` is never found, and an item after an
-  attribute's closing `]` on its line (`#[test] fn x() {}`, `)] fn x() {`, a
-  `macro_rules!`, a `Device` alias): the item is not followed;
+- an attribute whose closing `]` is never found, and a tail after its closing
+  `]` on its line that holds an fn anywhere (`#[test] fn x() {}`,
+  `#[cfg(test)] impl S { fn h() {} }`), a second attribute, `macro_rules!` or
+  `Device::Gpu`: the item is not followed;
 - a string or block comment still open at the end of a file: the gate lost the
   file at some point and read the tail as text.
 
 Write a generated fn as `fn $name()` on its own line, with its attributes above
 it. An attribute ends at its own `]`, counted over its code across its lines,
-and no item follows that `]` on its line. A field, a generic parameter or a
-`mod m {` may.
+and no fn follows that `]` on its line. A field (`cb: fn(u8),` included, a fn
+pointer type has no space after `fn`), a generic parameter or a `mod m {` may.
 
 ### What the scanner cannot see
 
@@ -175,6 +176,9 @@ Each of these passes the gate silently:
   one line (`trait Tr {` then `fn load(&self); }`) is refused as a fn never
   closed. An item that starts on the line where a multi-line string or block
   comment closes (`"; const D: Device = Device::Gpu;`) is not read.
+- An item that does not start its line and has no attribute before it
+  (`impl S { fn h() -> Device { Device::Gpu } }`, `mod m { #[test] fn t() {} }`
+  on one line): no rule reads it. rustfmt splits it.
 - An unqualified cross-file call through a glob import (`use m::*; helper()`).
 - A helper in a non-scanned source file. The one instance,
   `paro_kernel_registration`, is declared `metal-unscanned`.

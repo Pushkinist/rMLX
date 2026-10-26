@@ -806,17 +806,16 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         return 0
     }
 
-    # What follows an attribute's closing `]` on its line. An item a rule below would
-    # read (`#[test] fn x() {}`, `macro_rules!`, a Device alias) or a second attribute
-    # is refused, not skipped; any other tail (`T,`, `pub u8,`, `mod m {`) feeds no
-    # rule and ends the pending attribute block.
+    # What follows an attribute's closing `]` on its line. A tail holding an fn
+    # (`#[test] fn x() {}`, `impl S { fn h() {} }`), a second attribute, `macro_rules!`
+    # or `Device::Gpu` is refused, not skipped; a fn pointer type is `fn(`. Any other
+    # tail (`T,`, `pub u8,`, `mod m {`) feeds no rule and ends the pending attribute block.
     function attr_tail_refuse(m, pos,   t, l) {
         t = substr(m, pos + 1)
         sub(/^[[:space:]]+/, "", t)
         if (t == "") return
-        if ((t ~ /^(pub[^ ]* )?(async )?fn [$a-zA-Z0-9_]/ && t !~ /^(pub[^ ]* )?(async )?fn \$[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:/) \
-            || t ~ /^macro_rules!/ || t ~ /^#\[/ \
-            || t ~ /^const[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:[[:space:]]*Device[[:space:]]*=[[:space:]]*Device::Gpu/) {
+        if ((t ~ /(^|[^A-Za-z0-9_])fn[[:space:]]/ && t !~ /^(pub[^ ]* )?(async )?fn \$[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:/) \
+            || index(t, "#[") || index(t, "macro_rules!") || index(t, "Device::Gpu")) {
             l = $0
             sub(/^[[:space:]]+/, "", l)
             printf "U  %s:%d: %s (an item after an attribute's closing bracket on its line — parser lost the item)\n",
