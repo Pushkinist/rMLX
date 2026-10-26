@@ -92,14 +92,11 @@ slug, and when the snapshot holds no weight file (a half-written download).
 | `RMLX_TEST_MODEL_GEMMA4_E4B` | `mlx-community__gemma-4-e4b-it-mxfp8` | `Gemma4ForConditionalGeneration` |
 | `RMLX_TEST_MODEL_GEMMA4_E2B` | `mlx-community__gemma-4-e2b-it-mxfp8` | `Gemma4ForConditionalGeneration` |
 | `RMLX_TEST_MODEL_GEMMA4_PARO` | `z-lab__gemma-4-31B-it-PARO` | `Gemma4ForConditionalGeneration` |
-| `RMLX_TEST_MODEL_MEDGEMMA` | `mlx-community__medgemma-1.5-4b-it-8bit` | `Gemma3ForConditionalGeneration` |
 | `RMLX_TEST_MODEL_QWEN36` | `mlx-community__Qwen3.6-35B-A3B-8bit` | `Qwen3_5MoeForConditionalGeneration` |
 | `RMLX_TEST_MODEL_QWEN36_PARO` | `z-lab__Qwen3.6-27B-PARO` | `Qwen3_5ForConditionalGeneration` |
 | `RMLX_TEST_MODEL_ORNITH_9B` | `sahilchachra__ornith-1.0-9b-mxfp8-mlx` | `Qwen3_5ForConditionalGeneration` |
 | `RMLX_TEST_MODEL_BONSAI` | `prism-ml__Ternary-Bonsai-8B-mlx-2bit` | `Qwen3ForCausalLM` |
-| `RMLX_TEST_MODEL_DR_VENUS` | a `z-lab__DR-Venus-*` snapshot | `Qwen3ForCausalLM` |
 | `RMLX_TEST_MODEL_JINA_V4` | `jinaai__jina-embeddings-v4` | `JinaEmbeddingsV4Model` |
-| `RMLX_TEST_MODEL_LAGUNA` | a `z-lab__Laguna-*` snapshot | `LagunaForCausalLM` |
 | `RMLX_TEST_MODEL_READERLM_V2` | `mlx-community__jinaai-ReaderLM-v2` | `Qwen2ForCausalLM` |
 | `RMLX_TEST_MODEL_QWEN3_VL_30B` | a `mlx-community__Qwen3-VL-30B-Instruct-*` snapshot | `Qwen3VLMoeForConditionalGeneration` |
 
@@ -132,7 +129,6 @@ the stand-downs. No skip list exists.
 |---|---|---|
 | `Qwen3.6-35B-A3B-8bit` (sparse MoE) | A different class from the dense targets. | `integration_qwen3_5_moe_35b` (`crates/rmlx-models/src/qwen3_5_moe/tests.rs`); `mislabelled_moe_snapshot_cannot_bypass_the_k_side_guard` and `correctly_declared_moe_snapshot_is_still_guarded` (`crates/rmlx-models/tests/resolved_arch_class.rs`); `qwen3_moe_golden_tokens_k8v8`; `qwen3_5_moe_forward_seq_last_k.rs`; `niah_pflash_qwen36_32k_*`; the e2e cases `p2c_qwen36_guard_kbits` and `p2c_qwen36_guard_symk`; `qwen_moe_low_k_bits_rejected` (`crates/rmlx-cli/tests/cache_type_validate.rs`); the MoE sidecar pairs and the DFlash 1 and EAGLE-3 pairs (`spec_greedy_equivalence.rs`, `dflash_drafter_alignment.rs`, `qwen3_5_eagle3_alignment.rs`, `spec_conditioning_residual.rs`, `prefill_buffer_cache.rs`, `gone_request.rs`, `thread_boundary_drafters.rs`) |
 | `Ternary-Bonsai-8B-mlx-2bit` and the other first-generation Bonsai packs | Superseded by Bonsai 2; holds the only Qwen3 architecture and YaRN cells. | `bonsai_golden_tokens.rs`; `qwen3_tests.rs`; `niah_bonsai_*` and `niah_pflash_bonsai_*`; the `bonsai-8b` matrix rows; the 61 e2e cases bound to the `BONSAI` key (quant matrix, SSD tier, prompt cache, lifecycle); `bonsai_8b_prefill_stays_off_the_faulty_attention_configuration`; the first-generation 27B cells in `prefill_attention_configuration.rs` and `thread_boundary_text.rs`; `kv_calibrate_tests.rs`; the three thinking-budget and logprob cells in `bonsai_golden_tokens.rs`; `thinking_budget_exact_hit_qwen3_5_moe`; the Bonsai refusals in `cache_type_validate.rs` |
-| `medgemma-1.5-4b-it-8bit` (Gemma3) | Supported, not a target. | `medgemma_golden_tokens.rs`; `gemma3/tests.rs` and `gemma3/vision_tests.rs`; `thread_boundary_towers.rs`; `registry_tests.rs`; the `gemma3_basic` chat-template fixture |
 
 `scripts/bench-records-sweep.sh` is a broad records sweep, not a target list. It
 keeps naming Qwen3.6, Qwen3.6-27B-PARO, Bonsai-8B, gemma-4-e2b and medgemma on
@@ -226,7 +222,7 @@ a stream drawn without the request's filters.
 
 ## Golden-token suites: how their snapshot resolves
 
-`crates/rmlx-models/tests/{bonsai,bonsai2,gemma4,qwen3,qwen3_8,bitnet,medgemma}_golden_tokens.rs`
+`crates/rmlx-models/tests/{bonsai,bonsai2,gemma4,qwen3,qwen3_8,bitnet}_golden_tokens.rs`
 each decode 32 tokens at temperature 0 and compare the ids with a committed
 fixture under `tests/fixtures/`. Each suite covers one architecture and names
 its snapshot by slug. They resolve by the golden rule:

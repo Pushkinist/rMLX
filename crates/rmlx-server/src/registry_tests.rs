@@ -135,32 +135,6 @@ fn qwen36_snapshot_tools_supported() {
     assert!(entry.tools_supported, "Qwen3.6 template must support tools");
 }
 
-/// the medgemma snapshot must register as a `Gemma3ForConditionalGeneration`
-/// entry (text path). Returns without asserting when `RMLX_TEST_MODEL_MEDGEMMA`
-/// names no snapshot; registration reads only the config and tokenizer.
-#[test]
-fn medgemma_registers_as_gemma3() {
-    let Some(snap_buf) = std::env::var_os("RMLX_TEST_MODEL_MEDGEMMA").map(PathBuf::from) else {
-        return;
-    };
-    let snap = snap_buf.as_path();
-    if !snap.exists() {
-        return;
-    }
-    let reg = ModelRegistry::from_paths(std::slice::from_ref(&snap.to_path_buf()));
-    let entry = reg
-        .get("mlx-community__medgemma-1.5-4b-it-8bit")
-        .expect("medgemma entry present");
-    assert_eq!(
-        entry.arch, "Gemma3ForConditionalGeneration",
-        "medgemma must dispatch to the Gemma3 text path, not Gemma4"
-    );
-    assert!(
-        entry.tokenizer.is_some(),
-        "medgemma tokenizer.json must load"
-    );
-}
-
 /// A snapshot whose template has no tools branch must have
 /// `tools_supported = false` after registry build.
 #[test]

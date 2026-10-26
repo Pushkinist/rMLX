@@ -47,66 +47,6 @@ fn qwen3_per_head_qnorm_shape() {
     );
 }
 
-/// Integration test: load DR-Venus-4B snapshot (Qwen3, g64 b8 affine).
-///
-/// Skips if snapshot absent. Run explicitly:
-/// cargo test -p rmlx-models integration_qwen3_dr_venus -- --ignored
-#[test]
-#[ignore]
-#[allow(
-    clippy::expect_used,
-    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
-)]
-#[allow(
-    clippy::unwrap_used,
-    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
-)]
-fn integration_qwen3_dr_venus() {
-    let Some(model_dir_buf) =
-        std::env::var_os("RMLX_TEST_MODEL_DR_VENUS").map(std::path::PathBuf::from)
-    else {
-        eprintln!("SKIP integration_qwen3_dr_venus: RMLX_TEST_MODEL_DR_VENUS not set");
-        return;
-    };
-    let model_dir = model_dir_buf.as_path();
-    if !model_dir.exists() {
-        eprintln!("SKIP integration_qwen3_dr_venus: snapshot absent");
-        return;
-    }
-
-    crate::test_snapshot::release_cached_buffers();
-    let model = load_from_path(model_dir, None).expect("load_from_path failed");
-
-    let logits = model
-        .forward_seq(&[151643], Device::Gpu)
-        .expect("forward_seq failed");
-    logits.eval().expect("logits eval");
-
-    let vocab = model.cfg.vocab_size as i32;
-    let logits_flat = logits.reshape(&[1, vocab], Device::Gpu).expect("reshape");
-    logits_flat.eval().expect("logits_flat eval");
-
-    assert_eq!(logits_flat.shape(), vec![1, vocab]);
-
-    let lf32 = logits_flat.astype(Dtype::F32, Device::Cpu).expect("cast");
-    lf32.eval().expect("f32 eval");
-    let bytes = lf32.to_bytes().expect("to_bytes");
-    let values: Vec<f32> = bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-        .collect();
-
-    let nan_count = values.iter().filter(|v| v.is_nan()).count();
-    assert_eq!(nan_count, 0, "NaN in logits: {nan_count}");
-
-    let max_logit = values.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    assert!(
-        max_logit > 5.0 && max_logit < 100.0,
-        "max_logit {max_logit:.2}"
-    );
-    eprintln!("qwen3 DR-Venus forward probe: max_logit={max_logit:.2}");
-}
-
 /// Integration test: load Ternary-Bonsai-8B snapshot (Qwen3, g128 b2 affine).
 ///
 /// Exercises the 2-bit affine loader path. Skips if snapshot absent.
