@@ -219,3 +219,12 @@ sig_unbalanced_angle_does_not_leak_into_the_next_item	--root {}	both	1	ERROR: GP
 header_trailing_comment_naming_the_device_is_not_a_use	--root {}	both	0	OK: every GPU-touching test carries #[ignore] (1 files	ERROR	-	a trailing comment on the line that opens a one-line test names the device and makes no use of it
 sig_c_raw_string_then_slashes_in_a_string	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_hc6	OK:	-	a `cr#"..."#` literal is a raw string, so the slashes in the string after it start no comment on the header line
 body_c_raw_string_then_slashes_in_a_string	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_hc6b	OK:	-	the same on a body line, which is cut by the same reader
+body_real_tree_shape_source_text_in_a_test	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_bs2	OK:	-	source text held in a continued string of a test, as the tree has it, closes nothing
+body_block_comment_holding_a_close_brace	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_bc1	OK:	-	a `}` that starts a line inside a block comment of the body is not the end of the fn
+body_raw_string_holding_a_close_brace	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_br1	OK:	-	a `}` that starts a line inside a raw string of the body is not the end of the fn
+body_string_continued_then_slashes	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_hc9	OK:	-	slashes in the continued part of a string cut no code after them
+body_comment_open_then_slashes_before_its_close	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_hc5b	OK:	-	slashes inside a block comment that is still open start no line comment
+body_string_onto_a_slash_line	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_bq1	OK:	-	a string carried onto a line that starts with slashes is not a comment line
+body_string_line_starting_an_attribute	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_ba1	OK:	-	a line of a string that starts like an attribute is not one
+body_opens_on_the_second_signature_line_into_a_string	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_cl	OK:	-	a body that opens on the second line of the signature, into a string, starts in that string
+body_opens_on_the_second_signature_line_into_a_comment	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_cl2	OK:	-	the same into a block comment

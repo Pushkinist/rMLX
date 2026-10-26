@@ -289,9 +289,12 @@
 #       a block delimiter — a false "balanced" drops the item's body so a
 #       `Device::Gpu` in it is never seen, a false "open" swallows the rest of
 #       the file — and a `;` in `[u8; 4]` or a comment is not a terminator.
-#       Not tracked: a string, a raw string or a `/* … */` comment that spans
-#       several lines of a body or of a macro body, and a `/* … */` comment that
-#       spans the lines of an attribute.
+#       The body carries the string and comment state of the line that opened it
+#       from line to line, so a `}` that starts a line inside a string or a comment
+#       closes nothing, and a `//` inside one cuts nothing. Not tracked: a string,
+#       a raw string or a `/* … */` comment that spans several lines outside a fn
+#       (between items, in a macro body outside its fns), and a `/* … */` comment
+#       that spans the lines of an attribute.
 #     * A capture that is still open at a file boundary means the parser lost
 #       the file, so it reports `U` rather than letting the remainder go
 #       unclassified. This holds for all THREE captures — fn item, macro body
@@ -703,6 +706,8 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         in_sig = 0
         curid = 0
         close_marker = ""
+        body_q = 0
+        body_c = 0
     }
 
     # Tear down the open `macro_rules!` body, reporting it when it declared
@@ -821,7 +826,7 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         next
     }
     # ── Attribute (any indent) ──────────────────────────────────────────
-    /^[[:space:]]*#\[/ {
+    !(in_fn && (body_q || body_c)) && /^[[:space:]]*#\[/ {
         attrs = attrs " " $0
         # Count `#[test]`s declared inside a macro body, so the END check can
         # compare them against the test items actually extracted from it.
@@ -856,7 +861,7 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         next
     }
     # ── Comments / doc comments keep the pending attribute block ────────
-    /^[[:space:]]*\/\// { next }
+    !(in_fn && (body_q || body_c)) && /^[[:space:]]*\/\// { next }
 
     # ── Module-scope `const NAME: Device = Device::Gpu;` ────────────────
     # A test that uses NAME (rather than the Device::Gpu literal) is still
@@ -986,18 +991,30 @@ read -r -d '' AWK_DETECT <<'AWK' || true
             in_fn = 1
             close_marker = indent "}"
             in_sig = (sig_state == "more")
+            if (sig_state == "body") {
+                body_q = sig_q
+                body_c = sig_bc
+            }
         }
         attrs = ""
         next
     }
     # ── A `where` clause can put a declaration's `;` on a later line ────
+    # The line that opens the body is the last the signature reads: the body takes
+    # it, and the state it ends in.
     in_fn && in_sig {
         line = bare($0, sig_q, sig_bc, 1)
         sig_bc = bare_c
         sig_q = bare_q
         sig_scan(bare_code)
         sig_state = sig_verdict()
-        if (sig_state == "body") { in_sig = 0 }
+        if (sig_state == "body") {
+            in_sig = 0
+            body_q = sig_q
+            body_c = sig_bc
+            body_of[curid] = body_of[curid] " " line
+            next
+        }
         if (sig_state == "done" || sig_state == "decl") {
             if (sig_state == "done") {
                 body_of[curid] = body_of[curid] " " line
@@ -1011,18 +1028,32 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         }
     }
     # ── Close of the captured fn: `}` at the fn keyword indent ──────────
-    # The cut line is a prefix of the line, so only a line that starts with the marker
-    # is worth cutting; every other body line skips the scan.
-    in_fn && substr($0, 1, length(close_marker)) == close_marker && bare($0) == close_marker {
+    # A `}` that starts a line inside a string or a block comment of the body closes
+    # nothing, so the test waits for both states to be closed. The cut line is a
+    # prefix of the line, so only a line that starts with the marker is worth cutting;
+    # every other body line skips the scan.
+    in_fn && !body_q && !body_c && substr($0, 1, length(close_marker)) == close_marker && bare($0) == close_marker {
         in_fn = 0
         curid = 0
         attrs = ""
         next
     }
     # Body lines, with line comments stripped: prose that names a GPU
-    # helper or Device::Gpu must not make the fn look GPU-touching.
+    # helper or Device::Gpu must not make the fn look GPU-touching. The string and
+    # comment state of the body is carried from line to line (`body_q`, `body_c`),
+    # starting from the line that opened the body, so a `//` or a `}` inside a string
+    # or a comment that runs over several lines is not read as code. A line with no
+    # quote and no slash cannot change the state, and skips the call. The rules
+    # above that would take such a line for an attribute or a comment are gated on
+    # the same state.
     in_fn {
-        line = index($0, "//") ? bare($0) : $0
+        if (index($0, "\"") || index($0, "/")) {
+            line = bare($0, body_q, body_c)
+            body_q = bare_q
+            body_c = bare_c
+        } else {
+            line = $0
+        }
         body_of[curid] = body_of[curid] " " line
         next
     }

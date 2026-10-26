@@ -1073,6 +1073,29 @@ RS
 check_case 0 \
     --has "every stand-down notice"
 
+# A string left open at the end of one file is not carried into the next file: its first
+# signature still takes a parameter attribute for an attribute.
+workspace a_string_left_open_by_one_file_is_not_carried_into_the_next
+source_file fx src/a_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_a() {
+    let s = "open
+RS
+source_file fx src/b_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_b(
+    #[allow(unused)] x: u32,
+) {
+    let device = Device::Gpu;
+}
+RS
+st_case a_string_left_open_by_one_file_is_not_carried_into_the_next 1 \
+    --has "gpu_a (fn never closed" \
+    --has "x: u32, (attribute never closed" \
+    -- bash "$TOOL" ignored --root "$CASE_ROOT"
+
 # Nothing classified is not a clean tree.
 workspace derived_no_gpu_test_is_exit_2
 source_file fx src/fixture_tests.rs <<'RS'

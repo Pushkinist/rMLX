@@ -161,10 +161,15 @@ Each of these passes the gate silently:
 - An attribute left open by a block comment, closed by a later line that ends
   in `]`. The items between are lost with no report.
 - A string, a raw string or a `/* … */` block comment that spans several lines
-  of a body or of a macro body: its state is carried across the lines of a
-  signature, an attribute (strings only) and nothing else, so a `}` or a `//`
-  inside it is read as code. A device named inside such a comment counts as
-  named by the body, which fails closed.
+  outside a fn: between items, in a `macro_rules!` body outside its fns, or (a
+  block comment only) in an attribute. Its lines are read as code, so a
+  `#[test] fn` in such a text is classified as a test, and a `}` at a macro
+  body's indent ends the body early. Inside a body, a signature and (strings)
+  an attribute the state is carried.
+- A device written inside a string or a comment of a body counts as named by
+  the body, which fails closed. So does a statement attribute that shares its
+  line with its statement (`#[allow(..)] let d = Device::Gpu;`): the line is
+  read as an attribute, and the fn is reported lost (`U`).
 - An unqualified cross-file call through a glob import (`use m::*; helper()`).
 - A helper in a non-scanned source file. The one instance,
   `paro_kernel_registration`, is declared `metal-unscanned`.
@@ -177,7 +182,9 @@ A fn's signature is read from its header line on, over the code of each line
 (comments, strings and char literals blanked by one reader, which reads a block
 comment, nesting included, before it looks at a `//` or a quote in it), with
 the depths of `(`, `[`, `{` and the generic `<` kept across its lines. A `{`
-still open at the end of a line is the body. While a `(`, `[` or `<` is open the
+still open at the end of a line is the body, and the body carries the string and
+comment state of the line that opened it, so a `}` that starts a line inside a
+string or a comment closes nothing. While a `(`, `[` or `<` is open the
 signature goes on, whatever the line ends in; with none open, a `{` opened and
 closed on a line ends the item, and so does a `;`. A `<` or `>` is a generic
 bracket only outside every `(`, `[` and `{`, and never in `->` or `=>`. A `<`
@@ -302,7 +309,7 @@ stand-down in them is held to `SKIP {test}:` by review.
 
 The notice's shape lives in `scripts/lib/skip_notice_patterns.sh`, which the
 gate and the runner both read. `make check-named-skip-notices-fixtures`
-(`scripts/check/gpu_tests_selftest.sh`, 157 cases, in `make ci` and hosted CI) is
+(`scripts/check/gpu_tests_selftest.sh`, 158 cases, in `make ci` and hosted CI) is
 the gate's recall test. It classifies planted workspaces, as the Makefile does,
 and plants its unreadable paths at run time.
 
