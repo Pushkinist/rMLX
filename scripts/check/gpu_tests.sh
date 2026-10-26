@@ -274,13 +274,16 @@
 #       ending classification. Such a line is captured whole and never latches.
 #       The signature is read by one reader, from the header line on, over the
 #       line's CODE (comments, strings and char literals blanked by `bare()`): it
-#       keeps the depths of `(`, `[` and `{` across the signature's lines, and
-#       carries the depth of an open `/* … */` comment across them. A `{` still
-#       open at the end of a line is the body, which latches until the `}` at
-#       the fn's indent; a `{` opened
-#       and closed on the line, ending in `}`, is an inline body and the item is
-#       complete; a `;` outside every bracket ends a declaration, however many
-#       lines the signature ran over; anything else is a signature that goes on.
+#       keeps the depths of `(`, `[`, `{` and the generic `<` across the
+#       signature's lines, and carries the depth of an open `/* … */` comment
+#       across them. A `{` still open at the end of a line is the body, which
+#       latches until the `}` at the fn's indent. While a `(`, `[` or `<` is open
+#       the signature goes on, whatever the line ends in; with none open, a `{`
+#       opened and closed on the line, ending in `}`, is an inline body and the
+#       item is complete, a `;` ends a declaration however many lines the
+#       signature ran over, and anything else is a signature that goes on. A `<`
+#       or `>` counts as a generic bracket only outside every `(`, `[` and `{`,
+#       and the `>` of `->` and `=>` never does.
 #       Counting over the raw line instead would break the decision in both
 #       directions: a `{` or `}` in a string, a char literal or a comment is not
 #       a block delimiter — a false "balanced" drops the item's body so a
@@ -704,20 +707,30 @@ read -r -d '' AWK_DETECT <<'AWK' || true
 
     # One reader of a fn item's signature, from its header line on, over the line's
     # code (`bare_code`: comments, strings and char literals blanked). It keeps the
-    # depths of `(`, `[` and `{` across the signature's lines, and leaves, for the
-    # line it read, the number of `{` it opened (`sig_opened`) and its last
-    # significant character (`sig_last`). What a comment is, `bare()` decides: a
-    # caller carries the depth of an open `/* ... */` from line to line in `sig_bc`.
+    # depths of `(`, `[`, `{` and the generic `<` across the signature's lines, and
+    # leaves, for the line it read, the number of `{` it opened (`sig_opened`) and
+    # its last significant character (`sig_last`). What a comment is, `bare()`
+    # decides: a caller carries the depth of an open `/* ... */` from line to line
+    # in `sig_bc`.
+    #
+    # A `<` or `>` is a generic bracket only when no `(`, `[` or `{` is open: inside
+    # them it is an operator (`[u8; 1 << 4]`, `{ N > 4 }`) and counting it would end or
+    # extend the item wrongly. The `>` of `->` and `=>` is never a bracket.
     function sig_reset() {
-        sig_par = 0; sig_sq = 0; sig_br = 0; sig_bc = 0
+        sig_par = 0; sig_sq = 0; sig_br = 0; sig_ang = 0; sig_bc = 0
     }
-    function sig_scan(m,   i, n, c) {
+    function sig_scan(m,   i, n, c, p) {
         n = length(m)
         sig_opened = 0
         sig_last = ""
         for (i = 1; i <= n; i++) {
             c = substr(m, i, 1)
-            if (c == "(") sig_par++
+            if (c == "<" && sig_br == 0 && sig_par == 0 && sig_sq == 0) sig_ang++
+            else if (c == ">" && sig_br == 0 && sig_par == 0 && sig_sq == 0) {
+                p = (i > 1) ? substr(m, i - 1, 1) : ""
+                if (p != "-" && p != "=" && sig_ang > 0) sig_ang--
+            }
+            else if (c == "(") sig_par++
             else if (c == ")") { if (sig_par > 0) sig_par-- }
             else if (c == "[") sig_sq++
             else if (c == "]") { if (sig_sq > 0) sig_sq-- }
@@ -727,12 +740,14 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         }
     }
     # What the line just read decides: "body" (a `{` is open: the body starts here),
-    # "done" (a `{` opened and closed on this line: the item is complete), "decl" (a
-    # `;` outside every bracket: a declaration with no body) or "more".
+    # "more" (a `(`, `[` or `<` is still open: the signature goes on, whatever the line
+    # ends in), "done" (a `{` opened and closed on this line: the item is complete),
+    # "decl" (a `;` outside every bracket: a declaration with no body) or "more".
     function sig_verdict() {
         if (sig_br > 0) return "body"
+        if (sig_par > 0 || sig_sq > 0 || sig_ang > 0) return "more"
         if (sig_opened > 0 && sig_last == "}") return "done"
-        if (sig_last == ";" && sig_par == 0 && sig_sq == 0) return "decl"
+        if (sig_last == ";") return "decl"
         return "more"
     }
 
@@ -924,12 +939,13 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         }
         if (in_macro && attrs ~ /#\[(tokio::)?test[](]/) { macro_fn_n++ }
         curid = G
-        # The signature is read from this line on (sig_scan): the item is complete
-        # when a `{` opened and closed on a line (an inline body) or a `;` ends a
-        # declaration outside every bracket (a trait method, an extern block); it
-        # is a body when a `{` is still open at the end of a line, which is
-        # latched until the `}` at the fn's indent; and anything else is a
-        # signature that continues onto later lines.
+        # The signature is read from this line on (sig_scan). It is a body when a `{`
+        # is still open at the end of a line, which is latched until the `}` at the
+        # fn's indent. While a `(`, `[` or generic `<` is open it continues onto
+        # later lines, whatever the line ends in. With none open, the item is
+        # complete when a `{` opened and closed on a line (an inline body) or a `;`
+        # ends a declaration (a trait method, an extern block); anything else is a
+        # signature that continues.
         #
         # The counts run over the line's CODE, not the raw line: `{` / `}` inside
         # a string, a char literal or a comment are not block delimiters, and

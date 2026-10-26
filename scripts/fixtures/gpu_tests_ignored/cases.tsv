@@ -196,3 +196,15 @@ sig_raw_string_backslash_on_inline_body	--root {}	both	1	ERROR: GPU-touching tes
 sig_url_string_before_gpu_on_a_done_line	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_u1	OK:	-	a URL string before the device on the line that completes an item is not a comment
 sig_url_string_before_gpu_on_a_body_line	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_u2	OK:	-	a URL string before the device on a body line is not a comment
 sig_trailing_comment_naming_gpu_on_a_done_line	--root {}	both	0	OK: every GPU-touching test carries #[ignore] (1 files	ERROR	-	a trailing comment that names the device on the line that completes an item makes no test of it
+sig_const_block_in_param_type_wrapped	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_v	OK:	-	a line ending in a const block's brace inside an open parenthesis is not the end of the item
+sig_const_block_in_array_param_wrapped	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_v2	OK:	-	a line ending in a const block's brace inside an open bracket is not the end of the item
+sig_header_const_block_in_param_wrapped	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_v3	OK:	-	the same on the header line, which is read by the same rule as a later line
+sig_return_array_const_block_wrapped	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_v4	OK:	-	a const block in the length of a wrapped return array does not end the item
+sig_const_block_in_generic_param_wrapped	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_x	OK:	-	a const block inside an open generic list does not end the item
+sig_where_const_block_bound_wrapped	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_y1	OK:	-	a const block inside a where bound's open generic list does not end the item
+sig_return_type_const_block_wrapped_after_paren	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_y2	OK:	-	a const block inside a return type's open generic list does not end the item
+sig_header_return_type_const_block_wrapped	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_y3	OK:	-	the same on the header line
+sig_const_default_block_then_generics_close	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_y4	OK:	-	a const parameter's default block on the header line, with the generic list closing on the next, does not end the item
+sig_const_default_block_on_second_line	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_y5	OK:	-	a const parameter's default block on a later line of an open generic list does not end the item
+sig_shift_in_array_length_of_a_declaration	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_z1	OK:	-	a shift in an array length is not a generic bracket, so the declaration ends and the next test is read
+sig_shift_in_array_length_of_return_type_inline	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_z3;;gpu_z3b	OK:	-	a shift in a return array's length is not a generic bracket, so the inline body ends the item and the next test is read too

@@ -177,9 +177,15 @@ Each of these passes the gate silently:
 A fn's signature is read from its header line on, over the code of each line
 (comments, strings and char literals blanked by one reader, which reads a block
 comment, nesting included, before it looks at a `//` or a quote in it), with
-the depths of `(`, `[` and `{` kept across its lines: a `{` still open at the
-end of a line is the body, and a `;` outside every bracket ends a declaration.
-The script's `PARSING` header gives the close-test rules in full.
+the depths of `(`, `[`, `{` and the generic `<` kept across its lines. A `{`
+still open at the end of a line is the body. While a `(`, `[` or `<` is open the
+signature goes on, whatever the line ends in; with none open, a `{` opened and
+closed on a line ends the item, and so does a `;`. A `<` or `>` is a generic
+bracket only outside every `(`, `[` and `{`, and never in `->` or `=>`. A `<`
+that is an operator there (it takes a macro fragment to write one) is read as a
+bracket, and the item then runs on to the end of the file and is reported as
+`U`, which fails closed. The script's `PARSING` header gives the close-test
+rules in full.
 
 `make check-gpu-tests-ignored-fixtures`
 (`scripts/check/rust_gates_fixtures.sh gpu_tests_ignored`, in `make ci` and hosted CI) is

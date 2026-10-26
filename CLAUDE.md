@@ -305,7 +305,7 @@ Hard rules:
   is fatal on the same terms: it runs under no gate and has no reason for that
   check to read.
   `make check-gpu-tests-ignored-fixtures` (in `make ci` and hosted CI: the
-  `gpu_tests_ignored` mode of `scripts/check/rust_gates_fixtures.sh`, 111 cases, run
+  `gpu_tests_ignored` mode of `scripts/check/rust_gates_fixtures.sh`, 123 cases, run
   once under each awk on the machine) pins the gate's recall in both directions,
   asserting each case's failure *reason* and not just its exit code. A directory or
   file the scan cannot read is a refusal that names it, never a tree with no
