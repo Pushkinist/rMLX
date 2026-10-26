@@ -1076,8 +1076,8 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         sig_bc = bare_c
         sig_q = bare_q
         sig_scan(bare_code)
-        if (sig_stray) sig_stray_refuse()
         sig_state = sig_verdict()
+        if (sig_stray && sig_state != "decl") sig_stray_refuse()
         if (sig_state == "done" || sig_state == "decl") {
             in_fn = 0
             curid = 0
@@ -1104,8 +1104,8 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         sig_bc = bare_c
         sig_q = bare_q
         sig_scan(bare_code)
-        if (sig_stray) sig_stray_refuse()
         sig_state = sig_verdict()
+        if (sig_stray && sig_state != "decl") sig_stray_refuse()
         if (sig_state == "body") {
             in_sig = 0
             body_q = sig_q
@@ -1458,7 +1458,7 @@ classify_root() {
     if [ -n "$unreadable" ]; then
         echo "ERROR: this gate could not classify part of a scanned file" >&2
         echo "       (an unreadable macro_rules! body, an item or attribute that never" >&2
-        echo "        closed, code after an attribute's closing bracket on its line, a" >&2
+        echo "        closed, an item after an attribute's closing bracket on its line, a" >&2
         echo "        qualifier alone on a line after an attribute, a signature that" >&2
         echo "        closes a bracket it never opened, or a string or comment open at" >&2
         echo "        the end of the file, ending" >&2
