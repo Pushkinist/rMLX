@@ -58,8 +58,8 @@ RUNNER="${ROOT}/scripts/run_gpu_tests.sh"
 st_init run_gpu_tests_selftest
 WORK="${ST_WORK}"
 
-cases=0
-failed_case=""
+case_why=""
+case_skipped=0
 CASE=""
 CASE_ROOT=""
 OUT=""
@@ -77,8 +77,10 @@ TG_OUT=""
 # Not a command substitution: the case name has to reach the assertions below,
 # and a subshell would drop it.
 new_case() {
+    end_case
     CASE="$1"
-    cases=$((cases + 1))
+    case_why=""
+    case_skipped=0
     CASE_ROOT="${WORK}/$1"
     local root="${CASE_ROOT}"
     mkdir -p "${root}/scripts/lib" "${root}/scripts/check" "${root}/bin" "${root}/logs" || return 1
@@ -288,8 +290,15 @@ run_case() {
 
 fail() {
     echo "FAIL [${CASE}] $1" >&2
-    [ "${failed_case}" = "${CASE}" ] || ST_FAILED=$((ST_FAILED + 1))
-    failed_case="${CASE}"
+    case_why="${case_why}${case_why:+; }$1"
+}
+
+# end_case: hand the case just run to the lib, held when no assertion failed. A case that
+# stood down (st_skip counted it) is neither passed nor failed, unless an assertion failed.
+end_case() {
+    [ -n "${CASE}" ] || return 0
+    [ "${case_skipped}" = 0 ] || [ -n "${case_why}" ] || return 0
+    st_verdict "${CASE}" "${case_why}"
 }
 
 expect_status() {
@@ -2719,6 +2728,7 @@ dispatcher="${tree}/crates/rmlx-kv-quant/src/codec_msl.rs"
 chmod 000 "${dispatcher}"
 if cat "${dispatcher}" >/dev/null 2>&1; then
     st_skip "${CASE}" "this user can read a mode-000 file"
+    case_skipped=1
 else
     TG_OUT="$(bash "${ROOT}/scripts/gpu_test_threadgroup.sh" --root "${tree}" 2>&1)"
     STATUS=$?
@@ -2730,6 +2740,7 @@ chmod 644 "${dispatcher}"
 chmod 000 "${tree}/crates/rmlx-models/benches"
 if ls "${tree}/crates/rmlx-models/benches" >/dev/null 2>&1; then
     st_skip "${CASE}" "this user can read a mode-000 directory"
+    case_skipped=1
 else
     TG_OUT="$(bash "${ROOT}/scripts/gpu_test_threadgroup.sh" --root "${tree}" 2>&1)"
     STATUS=$?
@@ -2848,5 +2859,5 @@ expect_out "shader validation clean"
 expect_no_out "INCOMPLETE"
 expect_no_out "ERROR:"
 
-ST_PASSED=$((cases - ST_FAILED))
+end_case
 st_done
