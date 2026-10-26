@@ -47,7 +47,7 @@ the rule. It runs in `make ci` and in the hosted `source gates` job. Its scope:
 A directory or file the scan cannot read is a refusal that names it, never a
 tree with no findings: `ignored` and `list` exit 1, `skip-notices` exits 2.
 `scripts/suite/gpu_test_classes.sh` refuses the
-same way in both modes and prints the classifier's reason.
+same way in `half` and `threadgroup`: exit 2, with the classifier's reason.
 
 A test reaches `Device::Gpu` when the name appears in its body, or in a
 module-scope `const … = Device::Gpu`, or in a helper it calls. An unqualified

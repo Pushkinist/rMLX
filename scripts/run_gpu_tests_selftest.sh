@@ -2393,6 +2393,89 @@ expect_placed codec rmlx-kv-quant codec_decodes
 expect_placed codec rmlx-models arch_forwards
 expect_placed rest rmlx-audio asr_transcribes
 
+# A call the producer cannot read is refused in both modes, naming what it did not understand.
+new_case producers_refuse_a_call_they_cannot_read || exit 1
+producer_scratch "${CASE_ROOT}/p" || exit 1
+producer="${CASE_ROOT}/p/scripts/suite/gpu_test_classes.sh"
+OUT="$(bash "${producer}" 2>&1)"
+STATUS=$?
+expect_status 2
+expect_out "unknown mode '' (expected half or threadgroup)"
+OUT="$(bash "${producer}" bogus 2>&1)"
+STATUS=$?
+expect_status 2
+expect_out "unknown mode 'bogus' (expected half or threadgroup)"
+for mode in half threadgroup; do
+    OUT="$(bash "${producer}" "${mode}" --bogus 2>&1)"
+    STATUS=$?
+    expect_status 2
+    expect_out "unknown argument '--bogus' (expected --root <dir>)"
+    OUT="$(bash "${producer}" "${mode}" --root "${CASE_ROOT}/no/such/directory" 2>&1)"
+    STATUS=$?
+    expect_status 2
+    expect_out "is not a directory"
+done
+
+# The half rule refuses a tree whose facts it derives are missing: no codec source, no codec names,
+# no manifest, no members, no model layer.
+new_case half_refuses_a_tree_without_the_facts_it_derives || exit 1
+producer_scratch "${CASE_ROOT}/p" || exit 1
+producer="${CASE_ROOT}/p/scripts/suite/gpu_test_classes.sh"
+tree="${CASE_ROOT}/tree"
+halves_fixture_tree "${tree}" || exit 1
+gpu_fixture_test "${tree}/crates/rmlx-models/src/arch_tests.rs" arch_forwards
+OUT="$(bash "${producer}" half --root "${tree}" 2>&1)"
+STATUS=$?
+expect_status 2
+expect_out "planted failure after the rows"
+rm -f "${CASE_ROOT}/p/crates/rmlx-kv-quant/src/quant.rs"
+OUT="$(bash "${producer}" half --root "${tree}" 2>&1)"
+STATUS=$?
+expect_status 2
+expect_out "quant.rs not found — the codec names cannot be derived"
+printf 'pub const ALL_KV_QUANTS: [KvQuant; 1] = [\n    KvQuant::None,\n];\n' \
+    >"${CASE_ROOT}/p/crates/rmlx-kv-quant/src/quant.rs"
+OUT="$(bash "${producer}" half --root "${tree}" 2>&1)"
+STATUS=$?
+expect_status 2
+expect_out "derived 0 codec names from ALL_KV_QUANTS"
+cp "${ROOT}/crates/rmlx-kv-quant/src/quant.rs" "${CASE_ROOT}/p/crates/rmlx-kv-quant/src/quant.rs" || exit 1
+rm -f "${tree}/Cargo.toml"
+OUT="$(bash "${producer}" half --root "${tree}" 2>&1)"
+STATUS=$?
+expect_status 2
+expect_out "Cargo.toml not found — cannot resolve workspace members"
+printf '[workspace]\nmembers = [\n]\n' >"${tree}/Cargo.toml"
+OUT="$(bash "${producer}" half --root "${tree}" 2>&1)"
+STATUS=$?
+expect_status 2
+expect_out "parsed 0 workspace members from"
+printf '[workspace]\nmembers = [\n    "crates/rmlx-audio",\n]\n' >"${tree}/Cargo.toml"
+OUT="$(bash "${producer}" half --root "${tree}" 2>&1)"
+STATUS=$?
+expect_status 2
+expect_out "no workspace member is named rmlx-models"
+
+# A listing with no GPU test, and a gated-directory list with no directory, are refused rather
+# than read as an empty partition or split.
+new_case producers_refuse_an_empty_listing_and_an_empty_gated_list || exit 1
+producer_scratch "${CASE_ROOT}/p" || exit 1
+producer="${CASE_ROOT}/p/scripts/suite/gpu_test_classes.sh"
+tree="${CASE_ROOT}/tree"
+threadgroup_fixture_tree "${tree}" || exit 1
+printf '#!/usr/bin/env bash\nexit 0\n' >"${CASE_ROOT}/p/scripts/check/gpu_tests.sh"
+for mode in half threadgroup; do
+    OUT="$(bash "${producer}" "${mode}" --root "${tree}" 2>&1)"
+    STATUS=$?
+    expect_status 2
+    expect_out "list --files produced no GPU tests for"
+done
+printf 'METAL_DIRS=()\n' >"${CASE_ROOT}/p/scripts/metal_dirs.sh"
+OUT="$(bash "${producer}" threadgroup --root "${tree}" 2>&1)"
+STATUS=$?
+expect_status 2
+expect_out "scripts/metal_dirs.sh names no gated directory"
+
 # ---------------------------------------------------------------------------
 # THE THREADGROUP SPLIT
 #
