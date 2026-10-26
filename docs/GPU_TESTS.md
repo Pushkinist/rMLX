@@ -303,7 +303,7 @@ stand-down in them is held to `SKIP {test}:` by review.
 
 The notice's shape lives in `scripts/lib/skip_notice_patterns.sh`, which the
 gate and the runner both read. `make check-named-skip-notices-fixtures`
-(`scripts/check/gpu_tests_selftest.sh`, 145 cases, in `make ci` and hosted CI) is
+(`scripts/check/gpu_tests_selftest.sh`, 146 cases, in `make ci` and hosted CI) is
 the gate's recall test. It classifies planted workspaces, as the Makefile does,
 and plants its unreadable paths at run time.
 

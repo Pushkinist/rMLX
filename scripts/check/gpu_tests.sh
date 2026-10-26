@@ -1462,8 +1462,17 @@ package_of() {
     done <<<"${classification}"
 }
 
+# report_path <file>: the file as a report names it: relative to crates/ for a member
+# under it, relative to the root for any other.
+report_path() {
+    case "$1" in
+    "${SCAN_ROOT}"/crates/*) printf '%s' "${1#"${SCAN_ROOT}"/crates/}" ;;
+    *) printf '%s' "${1#"${SCAN_ROOT}"/}" ;;
+    esac
+}
+
 mode_skip_notices() {
-    local gpu_files files notices records f out
+    local gpu_files notices records f out
     local violations n silent n_silent other n_other waivers n_waivers red rel
 
     classify_root
@@ -1473,24 +1482,9 @@ mode_skip_notices() {
         echo "would pass by having nothing to look at." >&2
         exit 2
     fi
+    # The files that declare a classified test, whichever member holds them. A notice
+    # in any other file is in a fn the classifier cannot have named.
     gpu_files="$(printf '%s\n' "${classification}" | cut -f3 | sort -u)"
-
-    # The test-bearing files, in the classifier's own population: sibling test files
-    # under src/ and the integration tests. A notice anywhere else is in a fn the
-    # classifier cannot have named.
-    if [ ! -d "${SCAN_ROOT}/crates" ]; then
-        refuse "no test-bearing sources found under ${SCAN_ROOT}/crates."
-    fi
-    list_into_scan "the test-bearing sources under ${SCAN_ROOT}/crates" "${SCAN_ROOT}/crates" \
-        \( -path '*/src/*_tests.rs' -o -path '*/src/*/tests.rs' -o -path '*/src/tests.rs' \
-           -o -path '*/tests/*.rs' \) -type f
-    files="$(sort "${SCAN_LIST}")" || refuse "could not sort the test-bearing sources listed in ${SCAN_LIST}."
-    if [ -z "${files}" ]; then
-        refuse "no test-bearing sources found under ${SCAN_ROOT}/crates."
-    fi
-    while IFS= read -r f; do
-        [ -r "${f}" ] || refuse "cannot read ${f}."
-    done <<<"${files}"
 
     # One `<file>\t<line>\t<enclosing fn>\t<verdict>\t<text>` record per stand-down
     # notice, where the verdict is what the notice names:
@@ -1531,7 +1525,7 @@ mode_skip_notices() {
             }
         ' "${f}")" || scan_failed "${f}"
         notices="${notices}${out}"$'\n'
-    done <<<"${files}"
+    done <<<"${gpu_files}"
 
     violations=""
     n=0
@@ -1543,7 +1537,7 @@ mode_skip_notices() {
             *$'\t'"${v_fn}"$'\t'"${v_file}"$'\n'*) ;;
             *) continue ;;
         esac
-        rel="${v_file#"${SCAN_ROOT}"/crates/}"
+        rel="$(report_path "${v_file}")"
         crate="$(package_of "${v_file}")"
         case "${v_verdict}" in
             none) why="names no test" ;;
@@ -1612,7 +1606,7 @@ mode_skip_notices() {
     done <<<"${gpu_files}"
     while IFS=$'\t' read -r s_file s_line s_fn s_text; do
         [ -n "${s_file:-}" ] || continue
-        rel="${s_file#"${SCAN_ROOT}"/crates/}"
+        rel="$(report_path "${s_file}")"
         silent="${silent}    ${rel}:${s_line} — ${s_fn} returns from an environment guard with no stand-down notice"$'\n'
         silent="${silent}        ${s_text}"$'\n'
         n_silent=$((n_silent + 1))
@@ -1660,7 +1654,7 @@ mode_skip_notices() {
     done <<<"${gpu_files}"
     while IFS=$'\t' read -r o_file o_line o_fn o_text; do
         [ -n "${o_file:-}" ] || continue
-        rel="${o_file#"${SCAN_ROOT}"/crates/}"
+        rel="$(report_path "${o_file}")"
         other="${other}    ${rel}:${o_line} — ${o_fn} prints and returns with no value, and the block holds no stand-down notice"$'\n'
         other="${other}        ${o_text}"$'\n'
         n_other=$((n_other + 1))
@@ -1699,7 +1693,7 @@ mode_skip_notices() {
     done <<<"${gpu_files}"
     while IFS=$'\t' read -r w_file w_line w_fn w_why w_text; do
         [ -n "${w_file:-}" ] || continue
-        rel="${w_file#"${SCAN_ROOT}"/crates/}"
+        rel="$(report_path "${w_file}")"
         waivers="${waivers}    ${rel}:${w_line} — $(package_of "${w_file}") ${w_fn}: the waiver ${w_why}"$'\n'
         waivers="${waivers}        ${w_text}"$'\n'
         n_waivers=$((n_waivers + 1))

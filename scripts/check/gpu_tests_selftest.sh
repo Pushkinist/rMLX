@@ -176,21 +176,87 @@ check_case 2 \
     --has "produced no GPU tests"
 
 # ---------------------------------------------------------------------------
-# No test-bearing sources is the same failure one layer down: a find that stopped
-# matching reports every notice as absent. A member outside crates/ is classified and
-# still leaves crates/ with none.
+# A member outside crates/ whose tests reach no GPU leaves the classification empty, which is
+# the refusal above, with an empty crates/ beside it or none at all; find's complaint about a
+# directory that is not there stays out of the report.
 workspace no_sources_is_exit_2 tools/alpha
 mkdir -p "$CASE_ROOT/crates"
 source_file tools/alpha src/alpha_tests.rs <<'RS'
 #[test]
-#[ignore = "GPU Metal"]
-fn gpu_alpha() {
-    let device = Device::Gpu;
-    eprintln!("SKIP gpu_alpha: no snapshot");
-}
+fn cpu_alpha() {}
 RS
 check_case 2 \
-    --has "no test-bearing sources"
+    --has "produced no GPU tests"
+
+# A member outside crates/ is scanned like any other, and a report names its files
+# relative to the root. One violation of each of the four notice rules, in one file.
+workspace a_member_outside_crates_is_scanned tools/tx=tx fb
+source_file fb src/beta_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_named() {
+    let device = Device::Gpu;
+    eprintln!("SKIP gpu_named: no snapshot");
+}
+RS
+source_file tools/tx src/alpha_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_n() {
+    let device = Device::Gpu;
+    eprintln!("SKIP: no snapshot");
+}
+
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_s() {
+    let device = Device::Gpu;
+    let Ok(p) = std::env::var("RMLX_KV_TEST_MODEL") else {
+        return;
+    };
+    let _ = p;
+}
+
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_o() {
+    let device = Device::Gpu;
+    let Some(p) =
+        std::env::var_os("RMLX_TEST_MODEL_ALPHA").map(std::path::PathBuf::from)
+    else {
+        eprintln!("gpu_o: skipping: RMLX_TEST_MODEL_ALPHA not set");
+        return;
+    };
+    let _ = p;
+}
+
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_w() {
+    let device = Device::Gpu;
+    check("gpu_w");
+}
+
+fn check(test: &str) {
+    eprintln!("WAIVED gpu_other: the streams were not compared");
+}
+RS
+check_case 1 \
+    --has "tools/tx/src/alpha_tests.rs:5 — tx gpu_n names no test" \
+    --has "tools/tx/src/alpha_tests.rs:12 — gpu_s returns from an environment guard with no stand-down notice" \
+    --has "tools/tx/src/alpha_tests.rs:26 — gpu_o prints and returns with no value, and the block holds no stand-down notice" \
+    --has "tools/tx/src/alpha_tests.rs:39 — tx check: the waiver names gpu_other, not itself" \
+    --lacks "$CASE_ROOT"
+
+# The root package is a member too: its files are src/ and tests/ under the root.
+workspace the_root_member_is_scanned fb
+printf '[package]\nname = "rootpkg"\nversion = "0.0.0"\n\n[workspace]\nmembers = [\n    ".",\n    "crates/fb",\n]\n' >"$CASE_ROOT/Cargo.toml"
+mkdir -p "$CASE_ROOT/src"
+printf '#[test]\n#[ignore = "GPU Metal"]\nfn gpu_root() {\n    let device = Device::Gpu;\n    eprintln!("SKIP: no snapshot");\n}\n' >"$CASE_ROOT/src/root_tests.rs"
+printf '#[test]\n#[ignore = "GPU Metal"]\nfn gpu_alpha() {\n    let device = Device::Gpu;\n    eprintln!("SKIP gpu_alpha: no snapshot");\n}\n' >"$CASE_ROOT/crates/fb/src/alpha_tests.rs"
+check_case 1 \
+    --has "src/root_tests.rs:5 — rootpkg gpu_root names no test" \
+    --lacks "$CASE_ROOT"
 
 # ---------------------------------------------------------------------------
 # Two spaces. The runner's pattern carries exactly one, so it reads this notice
@@ -924,19 +990,13 @@ waiver_case waiver_names_another 'WAIVED gpu_beta: the streams were not compared
 check_case 1 \
     --has "src/alpha_tests.rs:9 — rmlx-models check: the waiver names gpu_beta, not itself"
 
-# A root with no crates directory at all is the same refusal as one with no test
-# source, and find's own complaint stays out of the report.
 workspace no_crates_directory_is_exit_2 tools/alpha
 source_file tools/alpha src/alpha_tests.rs <<'RS'
 #[test]
-#[ignore = "GPU Metal"]
-fn gpu_alpha() {
-    let device = Device::Gpu;
-    eprintln!("SKIP gpu_alpha: no snapshot");
-}
+fn cpu_alpha() {}
 RS
 check_case 2 \
-    --has "no test-bearing sources" \
+    --has "produced no GPU tests" \
     --lacks "No such file"
 
 # ---------------------------------------------------------------------------
@@ -1351,8 +1411,8 @@ unreadable "$CASE_ROOT/crates/fx/src/alpha_tests.rs" skip_notices_refuses_an_unr
     --has "cannot read" --has "crates/fx/src/alpha_tests.rs" \
     -- bash "$TOOL" skip-notices --root "$CASE_ROOT"
 
-# skip-notices reads more than the classifier does: every test-bearing file under crates/. A
-# directory or a file there that only it reads is its refusal alone.
+# skip-notices reads the files the classifier names and no more: a directory or a file under
+# crates/ that holds no classified test is none of its business, however unreadable.
 workspace an_unreadable_path_only_skip_notices_reads
 gpu_test 'eprintln!("SKIP gpu_alpha: no snapshot");'
 mkdir -p "$CASE_ROOT/crates/fx/benches/tests"
@@ -1360,14 +1420,14 @@ printf '#[test]\nfn cpu_bench() {}\n' >"$CASE_ROOT/crates/fx/benches/tests/bench
 st_case a_readable_bench_directory_passes 0 \
     --has "every stand-down notice" \
     -- bash "$TOOL" skip-notices --root "$CASE_ROOT"
-unreadable "$CASE_ROOT/crates/fx/benches" skip_notices_refuses_an_unreadable_directory_the_classifier_never_reads 2 \
-    --has "could not list the test-bearing sources under" \
+unreadable "$CASE_ROOT/crates/fx/benches" skip_notices_ignores_a_directory_the_classifier_never_reads 0 \
+    --has "every stand-down notice" \
     -- bash "$TOOL" skip-notices --root "$CASE_ROOT"
 unreadable "$CASE_ROOT/crates/fx/benches" list_ignores_a_directory_the_classifier_never_reads 0 \
     --is "$(printf 'fx\tgpu_alpha')" \
     -- bash "$TOOL" list --root "$CASE_ROOT"
-unreadable "$CASE_ROOT/crates/fx/benches/tests/bench.rs" skip_notices_refuses_an_unreadable_file_the_classifier_never_reads 2 \
-    --has "cannot read" --has "benches/tests/bench.rs" \
+unreadable "$CASE_ROOT/crates/fx/benches/tests/bench.rs" skip_notices_ignores_a_file_the_classifier_never_reads 0 \
+    --has "every stand-down notice" \
     -- bash "$TOOL" skip-notices --root "$CASE_ROOT"
 
 # Every file of a population is checked, not the first: the unreadable one is read last, and the
@@ -1387,13 +1447,11 @@ fn gpu_z() {
     let device = Device::Gpu;
 }
 RS
-mkdir -p "$CASE_ROOT/crates/fx/zz/tests"
-printf 'fn helper() {}\n' >"$CASE_ROOT/crates/fx/zz/tests/b.rs"
 unreadable "$CASE_ROOT/crates/fx/tests/z.rs" list_names_the_last_unreadable_file_it_classifies 1 \
     --has "cannot read $CASE_ROOT/crates/fx/tests/z.rs." \
     -- bash "$TOOL" list --root "$CASE_ROOT"
-unreadable "$CASE_ROOT/crates/fx/zz/tests/b.rs" skip_notices_names_the_last_unreadable_file_it_scans 2 \
-    --has "cannot read $CASE_ROOT/crates/fx/zz/tests/b.rs." \
+unreadable "$CASE_ROOT/crates/fx/tests/z.rs" skip_notices_names_the_last_unreadable_file_it_classifies 2 \
+    --has "cannot read $CASE_ROOT/crates/fx/tests/z.rs." \
     -- bash "$TOOL" skip-notices --root "$CASE_ROOT"
 
 # A scratch file that cannot be made is a refusal that says so.
@@ -1491,15 +1549,12 @@ st_run env TMPDIR="$scratch" bash "$TOOL" list --root "$ST_WORK/nowhere"
 left="$(ls -A "$scratch")"
 st_verdict a_run_leaves_no_scratch_file "$([ -z "$left" ] || printf 'left behind: %s' "$left")"
 
-# The two reads of that file that are not an awk or a find are refusals too, and name the file.
-workspace a_count_or_sort_of_the_scratch_file_that_fails_is_refused
+# The read of that file that is not an awk or a find is a refusal too, and names the file.
+workspace a_count_of_the_scratch_file_that_fails_is_refused
 gpu_test 'eprintln!("SKIP gpu_alpha: no snapshot");'
 st_case a_member_count_that_fails_is_refused 1 \
     --has "could not count the member manifests listed in" --has "/gpu_tests." \
     -- env PATH="$(failing_command wc ''):$PATH" bash "$TOOL" ignored --root "$CASE_ROOT"
-st_case a_file_sort_that_fails_is_refused 2 \
-    --has "could not sort the test-bearing sources listed in" --has "/gpu_tests." \
-    -- env PATH="$(failing_command sort '/gpu_tests.'):$PATH" bash "$TOOL" skip-notices --root "$CASE_ROOT"
 
 # ---------------------------------------------------------------------------
 # list: the compliant set, `<crate> <fn>` per line, and with --files the declaring file.
