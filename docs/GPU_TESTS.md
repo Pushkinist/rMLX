@@ -132,9 +132,6 @@ the difference:
 | macro-generated | yes, at the `macro_rules!` body | no | a cell has no name before expansion, so no libtest filter selects it |
 | `metal-unscanned` | yes | no | the gate lists none of them; the runner's per-crate banner check would fail on a snapshot-gated or child-driving test on a host without the snapshot |
 
-`paro_kernel_registration` needs no snapshot and drives no child. It is
-unlisted only because the gate lists no `metal-unscanned` test.
-
 ### Macro-generated tests
 
 The gate classifies a `macro_rules!` body that declares `#[test]` as one
@@ -179,6 +176,7 @@ Each of these passes the gate silently:
 - An item that does not start its line and has no attribute before it
   (`impl S { fn h() -> Device { Device::Gpu } }`, `mod m { #[test] fn t() {} }`
   on one line): no rule reads it. rustfmt splits it.
+- A helper named by a raw identifier (`fn r#try`) is read as `r`, which no call matches.
 - An unqualified cross-file call through a glob import (`use m::*; helper()`).
 - A helper in a non-scanned source file. The one instance,
   `paro_kernel_registration`, is declared `metal-unscanned`.
@@ -198,7 +196,8 @@ goes on, whatever the line ends in; a `;` with none open ends a declaration,
 since no generic list holds one; while a generic `<` is open it goes on, and
 with none open a `{` opened and closed on a line ends the item. A `<` or `>` is
 a generic bracket only outside every `(`, `[` and `{`, and never in `->` or
-`=>`. A header `fn $name:` is a macro matcher, never an item. Outside a fn the
+`=>`. A header is an optional `pub` or `pub(…)`, any of `const`, `async` and `unsafe`, an optional
+`extern "C"`, then `fn` and a name; a non-ASCII letter stays in the name. A header `fn $name:` is a macro matcher, never an item. Outside a fn the
 same state is carried line to line, so the lines of a string or comment that
 spans several lines are text, never an item, an attribute or the close of a
 macro body.

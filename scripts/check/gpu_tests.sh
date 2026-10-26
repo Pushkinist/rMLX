@@ -540,6 +540,27 @@ list_into_scan() {
 # warning. Kept in a variable so the per-crate loop invokes one identical
 # program over each crate's file list.
 read -r -d '' AWK_DETECT <<'AWK' || true
+    # An fn item header: visibility, qualifiers, an optional extern ABI, then `fn` and
+    # a space. A name starts with `$`, `_` or a character that is neither white space
+    # nor ASCII punctuation, which admits a non-ASCII letter.
+    BEGIN {
+        FN_HEAD = "^[[:space:]]*(pub([[:space:]]*\\([^)]*\\))?[[:space:]]+)?((const|async|unsafe)[[:space:]]+)*(extern[[:space:]]+(\"[^\"]*\"[[:space:]]+)?)?fn[[:space:]]+"
+        FN_NAME_START = "([$_]|[^[:space:][:punct:]])"
+        FN_MATCHER = "\\$[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:"
+    }
+
+    # The name at the start of s: cut at the first ASCII character that cannot be in
+    # one, so a non-ASCII character stays in the name.
+    function fn_name(s,   i, c) {
+        for (i = 1; i <= length(s); i++) {
+            c = substr(s, i, 1)
+            if (c != "$" && c != "_" && index(" \t!\"#%&'()*+,-./:;<=>?@[\\]^`{|}~", c) > 0) {
+                return substr(s, 1, i - 1)
+            }
+        }
+        return s
+    }
+
     # The line's significant text: trailing line comment and trailing blanks
     # removed. Used both to compare a closing brace against its marker (`}
     # // end of macro` must still close) and to read the line's LAST
@@ -814,7 +835,7 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         t = substr(m, pos + 1)
         sub(/^[[:space:]]+/, "", t)
         if (t == "") return
-        if ((t ~ /(^|[^A-Za-z0-9_])fn[[:space:]]/ && t !~ /^(pub[^ ]* )?(async )?fn \$[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:/) \
+        if ((t ~ /(^|[^A-Za-z0-9_])fn[[:space:]]/ && t !~ (FN_HEAD FN_MATCHER)) \
             || index(t, "#[") || index(t, "macro_rules!") || index(t, "Device::Gpu")) {
             l = $0
             sub(/^[[:space:]]+/, "", l)
@@ -992,14 +1013,13 @@ read -r -d '' AWK_DETECT <<'AWK' || true
     # A header whose name is a metavariable followed by `:` is a macro matcher
     # (`fn $name:ident where ...`), the pattern a macro invocation is matched
     # against, and never an item.
-    !in_fn && /^[[:space:]]*(pub[^ ]* )?(async )?fn [$a-zA-Z0-9_]/ \
-     && !/^[[:space:]]*(pub[^ ]* )?(async )?fn \$[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:/ {
+    !in_fn && $0 ~ (FN_HEAD FN_NAME_START) && $0 !~ (FN_HEAD FN_MATCHER) {
         line = $0
         indent = line
         sub(/[^[:space:]].*$/, "", indent)   # leading whitespace only
         name = line
-        sub(/^[[:space:]]*(pub[^ ]* )?(async )?fn /, "", name)
-        sub(/[^$a-zA-Z0-9_].*$/, "", name)
+        sub(FN_HEAD, "", name)
+        name = fn_name(name)
         G++
         order[++ord_n] = G
         name_of[G] = name
