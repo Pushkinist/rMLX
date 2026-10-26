@@ -50,7 +50,7 @@ fn too_many_tensors_returns_err() {
     let json_str = make_large_index_json(n);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("model.safetensors.index.json");
-    std::fs::File::create(&path)
+    File::create(&path)
         .unwrap()
         .write_all(json_str.as_bytes())
         .unwrap();
@@ -70,7 +70,7 @@ fn normal_weight_map_parses_ok() {
     let json_str = make_large_index_json(10);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("model.safetensors.index.json");
-    std::fs::File::create(&path)
+    File::create(&path)
         .unwrap()
         .write_all(json_str.as_bytes())
         .unwrap();
@@ -91,7 +91,7 @@ fn too_many_shards_returns_err() {
     let json_str = make_many_shards_index_json(n);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("model.safetensors.index.json");
-    std::fs::File::create(&path)
+    File::create(&path)
         .unwrap()
         .write_all(json_str.as_bytes())
         .unwrap();
@@ -298,4 +298,117 @@ fn every_local_snapshot_index_is_accepted() {
     }
     println!("{TEST}: {indexed} indexed snapshots");
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+fn pattern(len: usize, seed: usize) -> Vec<u8> {
+    (0..len).map(|i| ((i * 31 + seed) % 251) as u8).collect()
+}
+
+/// A one-shard snapshot holding `tensors` as `U8` vectors.
+fn write_u8_snapshot(dir: &Path, tensors: &[(&str, &[u8])]) {
+    let views: Vec<(&str, safetensors::tensor::TensorView<'_>)> = tensors
+        .iter()
+        .map(|&(name, data)| {
+            let view = safetensors::tensor::TensorView::new(
+                safetensors::Dtype::U8,
+                vec![data.len()],
+                data,
+            )
+            .unwrap();
+            (name, view)
+        })
+        .collect();
+    safetensors::serialize_to_file(views, None, &dir.join(SINGLE_SHARD)).unwrap();
+}
+
+#[test]
+fn release_mapped_keeps_every_tensor_readable() {
+    let page = page_size().unwrap();
+    let big = pattern(5 * page + 123, 1);
+    let small = pattern(100, 2);
+    let straddle = pattern(page + 200, 3);
+    let dir = tempfile::tempdir().unwrap();
+    write_u8_snapshot(
+        dir.path(),
+        &[
+            ("a_big", &big),
+            ("b_small", &small),
+            ("c_straddle", &straddle),
+        ],
+    );
+    let idx = load_shard_index(dir.path()).unwrap();
+    let shards = ShardSet::open(dir.path(), &idx).unwrap();
+    let big_view = crate::tensors::view(&shards, &idx, "a_big").unwrap();
+    let small_view = crate::tensors::view(&shards, &idx, "b_small").unwrap();
+    let straddle_view = crate::tensors::view(&shards, &idx, "c_straddle").unwrap();
+
+    let big_copy = big_view.bytes.to_vec();
+    let released = release_mapped(big_view.bytes);
+    assert!(released > 0, "a tensor of five pages released nothing");
+    assert_eq!(released % page, 0);
+    assert!(released <= big.len());
+    assert!(released > big.len() - 2 * page);
+    assert_eq!(big_copy, big);
+
+    let straddle_released = release_mapped(straddle_view.bytes);
+    assert_eq!(straddle_released % page, 0);
+    assert!(straddle_released <= straddle.len());
+    assert_eq!(release_mapped(small_view.bytes), 0);
+
+    assert_eq!(big_view.bytes, big.as_slice());
+    assert_eq!(small_view.bytes, small.as_slice());
+    assert_eq!(straddle_view.bytes, straddle.as_slice());
+    let fresh = crate::tensors::view(&shards, &idx, "a_big").unwrap();
+    assert_eq!(fresh.bytes, big.as_slice());
+}
+
+#[test]
+fn release_mapped_twice_rereads_the_same_bytes() {
+    let page = page_size().unwrap();
+    let big = pattern(4 * page, 7);
+    let dir = tempfile::tempdir().unwrap();
+    write_u8_snapshot(dir.path(), &[("w", &big)]);
+    let idx = load_shard_index(dir.path()).unwrap();
+    let shards = ShardSet::open(dir.path(), &idx).unwrap();
+    let view = crate::tensors::view(&shards, &idx, "w").unwrap();
+
+    let first = release_mapped(view.bytes);
+    assert!(first > 0);
+    assert_eq!(view.bytes, big.as_slice());
+    assert_eq!(release_mapped(view.bytes), first);
+    assert_eq!(view.bytes, big.as_slice());
+}
+
+#[test]
+fn release_mapped_ignores_bytes_outside_a_shard_mapping() {
+    let page = page_size().unwrap();
+    let heap = pattern(4 * page, 9);
+    assert_eq!(release_mapped(&heap), 0);
+    assert_eq!(heap, pattern(4 * page, 9));
+}
+
+#[test]
+fn release_mapped_drops_the_resident_pages() {
+    const LEN: usize = 64 << 20;
+    let data = pattern(LEN, 5);
+    let dir = tempfile::tempdir().unwrap();
+    write_u8_snapshot(dir.path(), &[("w", &data)]);
+    drop(data);
+    let idx = load_shard_index(dir.path()).unwrap();
+    let shards = ShardSet::open(dir.path(), &idx).unwrap();
+    let view = crate::tensors::view(&shards, &idx, "w").unwrap();
+    let sum: u64 = view.bytes.iter().map(|&b| u64::from(b)).sum();
+    std::hint::black_box(sum);
+
+    let touched = rmlx_core::mach_mem::read_proc_mem().unwrap().rss_bytes;
+    let released = release_mapped(view.bytes);
+    let after = rmlx_core::mach_mem::read_proc_mem().unwrap().rss_bytes;
+
+    assert!(released > LEN - 2 * page_size().unwrap());
+    let dropped = touched.saturating_sub(after);
+    assert!(
+        dropped >= (LEN as u64) * 3 / 4,
+        "RSS fell by {dropped} bytes after releasing {released}"
+    );
+    assert_eq!(view.bytes, pattern(LEN, 5).as_slice());
 }

@@ -46,7 +46,9 @@ pub use config::{
 pub use hadamard::{HadamardContract, HadamardContractError};
 pub use head_budgets::{load_head_budgets, write_head_budgets, HeadBudgetCalibration, HeadBudgets};
 pub use safetensors::Dtype as SafetensorsDtype;
-pub use shards::{count_tensors_per_shard, load_shard_index, ShardHandle, ShardIndex, ShardSet};
+pub use shards::{
+    count_tensors_per_shard, load_shard_index, release_mapped, ShardHandle, ShardIndex, ShardSet,
+};
 pub use tensors::{
     resolve, resolve_paro, try_exact_then_suffix, view, view_discriminated, ParoQuantParams,
     ParoQuantState, ResolvedTensor, TensorKind, TensorLookup, TensorView,

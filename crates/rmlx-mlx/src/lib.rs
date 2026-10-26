@@ -745,14 +745,18 @@ impl Array {
     /// Create an Array from a `TensorView` obtained via the loader.
     ///
     /// The view carries safetensors dtype + shape + bytes. The bytes are
-    /// copied into MLX immediately (MLX owns them after this call).
+    /// copied into MLX immediately (MLX owns them after this call), and then
+    /// their shard pages are released ([`rmlx_loader::release_mapped`]), so a
+    /// load does not hold the checkpoint twice. The view stays readable.
     /// For bf16 the native MLX `BF16` dtype is used — no host-side conversion.
     pub fn from_safetensor_view(view: &rmlx_loader::TensorView<'_>) -> Result<Self> {
         install_error_handler();
 
         let dtype = dtype_from_safetensors(view.dtype)?;
         let shape: Vec<i32> = view.shape.iter().map(|&d| d as i32).collect();
-        Self::from_bytes(view.bytes, &shape, dtype)
+        let array = Self::from_bytes(view.bytes, &shape, dtype)?;
+        rmlx_loader::release_mapped(view.bytes);
+        Ok(array)
     }
 
     /// Number of dimensions.
