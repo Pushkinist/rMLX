@@ -10,7 +10,8 @@
 # reads) must be one spelling, so the spelling is settled here and nowhere else:
 #
 #   * a `#` comment, a whole line or the end of one, is dropped before anything else is
-#     read: a `]` in it does not end the array;
+#     read: a `]` in it does not end the array. A `#` inside a quoted path is part of
+#     the path;
 #   * a leading `./`, a trailing `/` and a trailing `/.` are dropped, repeatedly;
 #   * `//` and `/./` inside the path become `/`, repeatedly;
 #   * a member that is then empty or `.` is the root member, written `.`.
@@ -52,7 +53,12 @@ workspace_members() {
         /^[[:space:]]*members[[:space:]]*=[[:space:]]*\[/ { inm = 1; next }
         inm {
             line = $0
-            sub(/#.*/, "", line)
+            quoted = 0
+            for (k = 1; k <= length(line); k++) {
+                c = substr(line, k, 1)
+                if (c == "\"") quoted = !quoted
+                else if (c == "#" && !quoted) { line = substr(line, 1, k - 1); break }
+            }
             if (line ~ /\]/) { inm = 0 }
             gsub(/[",]/, "", line)
             gsub(/[[:space:]]/, "", line)

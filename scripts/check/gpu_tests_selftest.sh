@@ -1271,6 +1271,18 @@ printf '#[test]\n#[ignore = "GPU Metal"]\nfn gpu_alpha() {\n    let device = Dev
 st_case a_comment_after_a_member_is_not_part_of_the_member 0 \
     --is "$(printf 'fb\tgpu_alpha\t%s' "$CASE_ROOT/crates/fb/src/alpha_tests.rs")" \
     -- bash "$TOOL" list --files --root "$CASE_ROOT"
+# A `#` inside a quoted member path is part of the path, with or without a comment after it.
+workspace a_hash_inside_a_quoted_member_path_is_part_of_the_path fb tools/t#1=t1
+printf '[workspace]\nmembers = [\n    "crates/fb",\n    "tools/t#1",\n]\n' >"$CASE_ROOT/Cargo.toml"
+printf '#[test]\n#[ignore = "GPU Metal"]\nfn gpu_one() {\n    let device = Device::Gpu;\n}\n' >"$CASE_ROOT/tools/t#1/src/one_tests.rs"
+printf '#[test]\n#[ignore = "GPU Metal"]\nfn gpu_alpha() {\n    let device = Device::Gpu;\n}\n' >"$CASE_ROOT/crates/fb/src/alpha_tests.rs"
+st_case a_hash_inside_a_quoted_member_path_is_part_of_the_path 0 \
+    --has "$(printf 't1\tgpu_one\t%s' "$CASE_ROOT/tools/t#1/src/one_tests.rs")" \
+    -- bash "$TOOL" list --files --root "$CASE_ROOT"
+printf '[workspace]\nmembers = [\n    "crates/fb",\n    "tools/t#1", # the one\n]\n' >"$CASE_ROOT/Cargo.toml"
+st_case a_comment_after_a_quoted_member_path_holding_a_hash_is_dropped 0 \
+    --has "$(printf 't1\tgpu_one\t%s' "$CASE_ROOT/tools/t#1/src/one_tests.rs")" \
+    -- bash "$TOOL" list --files --root "$CASE_ROOT"
 workspace the_root_member_lists_its_files_under_the_root fb
 printf '[package]\nname = "rootpkg"\nversion = "0.0.0"\n\n[workspace]\nmembers = [\n    "./",\n    "crates/fb",\n]\n' >"$CASE_ROOT/Cargo.toml"
 mkdir -p "$CASE_ROOT/src"
