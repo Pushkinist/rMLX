@@ -289,8 +289,9 @@
 #       a block delimiter — a false "balanced" drops the item's body so a
 #       `Device::Gpu` in it is never seen, a false "open" swallows the rest of
 #       the file — and a `;` in `[u8; 4]` or a comment is not a terminator.
-#       Not tracked: a raw string that runs over several lines, and a `/* … */`
-#       comment that spans the lines of a body, an attribute or a macro body.
+#       Not tracked: a string, a raw string or a `/* … */` comment that spans
+#       several lines of a body or of a macro body, and a `/* … */` comment that
+#       spans the lines of an attribute.
 #     * A capture that is still open at a file boundary means the parser lost
 #       the file, so it reports `U` rather than letting the remainder go
 #       unclassified. This holds for all THREE captures — fn item, macro body
@@ -310,14 +311,12 @@
 #   `bare()` finds the trailing comment with a string-aware scan, so neither a
 #   `//` inside a string literal nor a char literal of any payload form (`b'"'`,
 #   `'\x1b'`, `'\u{FFFD}'`, `'é'`) derails it, and a block comment is read before
-#   a `//` or a quote in it is looked at. Remaining known parse hazards, which
-#   apply to the attribute close-test exactly as they do to the fn one: a raw
-#   string that runs over several lines (the `\` in `r"a\"` is not an escape,
-#   but only a raw string that closes on its line is read as one) and a block
-#   comment that spans the lines of an attribute — the close-test does not carry
-#   its depth. An attribute whose closing `]` is hidden behind one of those
-#   latches, and what happens next splits two ways — state both rather than
-#   claim the good one:
+#   a `//` or a quote in it is looked at. A raw string that does not close on its
+#   line is carried like a plain one (the `\` in `r"a\"` is no escape). The
+#   remaining known parse hazard is a block comment that spans the lines of an
+#   attribute — the close-test does not carry its depth. An attribute whose
+#   closing `]` is hidden behind one latches, and what happens next splits two
+#   ways — state both rather than claim the good one:
 #     * nothing later in the file bares to `]` -> the file boundary reports `U`.
 #       Fail-closed.
 #     * something later does — a subsequent `#[test]` is exactly that shape ->
@@ -326,8 +325,8 @@
 #       detectable from here; reconciliation against the compiled `cargo test -- --list` is what would
 #       catch it.
 #   What the close-test buys is not immunity but reachability: getting into that
-#   state now requires one of the two `bare()` hazards, where before it needed
-#   only the ordinary wrapped-string spelling.
+#   state now requires a block comment across the attribute's lines, where before
+#   it needed only the ordinary wrapped-string spelling.
 #
 #   PORTABLE AWK ONLY — this runs on the developer's BSD awk and on whatever
 #   the Linux CI image provides. Two constructs are out of bounds because they
@@ -564,17 +563,19 @@ read -r -d '' AWK_DETECT <<'AWK' || true
     # The `//` scan is string-aware. A `//` inside a string literal — a URL is
     # the everyday case — is not a comment, and cutting there would end the
     # line in mid-string and flip every decision that reads its last
-    # character. A raw string that opens and closes on the line (`r"..."`,
-    # `br#"..."#`, with the hashes matched) is a string too; one that runs over
-    # several lines is not tracked.
+    # character. A raw string (`r"..."`, `br#"..."#`, `cr"..."`, with the hashes
+    # matched) is a string too.
     #
     # `q0` and `c0` seed the string state and the block-comment depth, and
     # `bare_q` and `bare_c` report where the scan ended, so a caller walking a
-    # MULTI-LINE construct can carry both across the line break. A string
-    # continued with a trailing `\` is still open on the next line; scanning that
-    # line from q=0 would read its payload as code and cut at the first `//` in
-    # it. Callers that read one self-contained line pass neither and start
-    # outside a string and a comment.
+    # MULTI-LINE construct can carry both across the line break. The string state
+    # is 0 outside a string, 1 inside a plain string (continued with a trailing
+    # `\`, or by a quote left open) and 2 plus the hash count inside a raw string
+    # that did not close on its line; the line that closes a raw string is cut at
+    # the `"` and the same hashes, and a `\` in it is no escape. Scanning such a
+    # line from q=0 would read its payload as code and cut at the first `//` in it.
+    # A caller that reads one self-contained line passes neither, and a caller that
+    # carries the state hands back what it was given.
     #
     # With `want` set, `bare_code` is the same text with every comment body,
     # string body and char literal body blanked (the quotes stay), one character
@@ -590,7 +591,20 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         q = q0 + 0
         d = c0 + 0
         out = ""
-        for (i = 1; i <= n; i++) {
+        i = 1
+        if (q >= 2) {
+            h = ""
+            for (j = 2; j < q; j++) h = h "#"
+            e = index(s, "\"" h)
+            if (e == 0) {
+                i = n + 1
+            } else {
+                i = e + length(h) + 1
+                q = 0
+            }
+            if (want) out = blanks(i - 1 > n ? n : i - 1)
+        }
+        for (; i <= n; i++) {
             st = i
             c = substr(s, i, 1)
             nx = substr(s, i + 1, 1)
@@ -602,12 +616,12 @@ read -r -d '' AWK_DETECT <<'AWK' || true
             }
             if (!q && c == "/" && nx == "*") { d = 1; i++; if (want) out = out "  "; continue }
             if (c == "\\" && q) { i++; if (want) out = out blanks(i > n ? 1 : 2); continue }
-            if (!q && (c == "r" || (c == "b" && nx == "r")) \
+            if (!q && (c == "r" || ((c == "b" || c == "c") && nx == "r")) \
              && (i == 1 || substr(s, i - 1, 1) !~ /[A-Za-z0-9_]/)) {
-                # A raw string: the `r`, the hashes, a quote, and the same hashes after
-                # the closing quote. One that does not close on this line falls through
-                # to the plain string rule.
-                j = i + (c == "b" ? 2 : 1)
+                # A raw string: the `r` (after a `b` or a `c`), the hashes, a quote, and
+                # the same hashes after the closing quote. One that does not close on
+                # this line is carried to the next, as a state of its own.
+                j = i + (c == "r" ? 1 : 2)
                 h = ""
                 while (substr(s, j, 1) == "#") { h = h "#"; j++ }
                 if (substr(s, j, 1) == "\"") {
@@ -617,6 +631,9 @@ read -r -d '' AWK_DETECT <<'AWK' || true
                         if (want) out = out blanks(i - st + 1)
                         continue
                     }
+                    q = 2 + length(h)
+                    if (want) out = out blanks(n - st + 1)
+                    break
                 }
             }
             if (c == "\"") { q = !q; if (want) out = out c; continue }
@@ -711,13 +728,13 @@ read -r -d '' AWK_DETECT <<'AWK' || true
     # leaves, for the line it read, the number of `{` it opened (`sig_opened`) and
     # its last significant character (`sig_last`). What a comment is, `bare()`
     # decides: a caller carries the depth of an open `/* ... */` from line to line
-    # in `sig_bc`.
+    # in `sig_bc` and the state of an open string in `sig_q`.
     #
     # A `<` or `>` is a generic bracket only when no `(`, `[` or `{` is open: inside
     # them it is an operator (`[u8; 1 << 4]`, `{ N > 4 }`) and counting it would end or
     # extend the item wrongly. The `>` of `->` and `=>` is never a bracket.
     function sig_reset() {
-        sig_par = 0; sig_sq = 0; sig_br = 0; sig_ang = 0; sig_bc = 0
+        sig_par = 0; sig_sq = 0; sig_br = 0; sig_ang = 0; sig_bc = 0; sig_q = 0
     }
     function sig_scan(m,   i, n, c, p) {
         n = length(m)
@@ -953,12 +970,12 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         # reaches body_of and the test is silently unclassified; a false "open"
         # latches and swallows every later item in the file.
         #
-        # Not tracked: a raw string that runs over several lines. A `/* … */` comment
-        # that stays open at the end of a line is carried to the next line of the
-        # signature, and ends with the signature.
+        # A string or a `/* … */` comment that stays open at the end of a line is
+        # carried to the next line of the signature, and ends with the signature.
         body_of[G] = bare(line, 0, 0, 1)
         sig_reset()
         sig_bc = bare_c
+        sig_q = bare_q
         sig_scan(bare_code)
         sig_state = sig_verdict()
         if (sig_state == "done" || sig_state == "decl") {
@@ -975,8 +992,9 @@ read -r -d '' AWK_DETECT <<'AWK' || true
     }
     # ── A `where` clause can put a declaration's `;` on a later line ────
     in_fn && in_sig {
-        line = bare($0, 0, sig_bc, 1)
+        line = bare($0, sig_q, sig_bc, 1)
         sig_bc = bare_c
+        sig_q = bare_q
         sig_scan(bare_code)
         sig_state = sig_verdict()
         if (sig_state == "body") { in_sig = 0 }

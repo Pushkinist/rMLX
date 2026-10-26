@@ -1685,9 +1685,27 @@ st_case bare_reads_a_backslash_in_a_raw_string_as_a_character 0 \
 st_case bare_does_not_read_a_raw_string_inside_a_name 0 \
     --is 'bar"x";|0|0|bar" "; $' \
     -- bare_probe 'bar"x"; // c'
-st_case bare_leaves_a_raw_string_that_does_not_close_to_the_plain_string_rule 0 \
-    --is 'x = r#"abc|1|0|x = r#"   $' \
+st_case bare_carries_a_raw_string_that_does_not_close_with_its_hash_count 0 \
+    --is 'x = r#"abc|3|0|x =       $' \
     -- bare_probe 'x = r#"abc'
+st_case bare_carries_a_raw_string_with_no_hashes_as_two 0 \
+    --is 'x = r"abc|2|0|x =      $' \
+    -- bare_probe 'x = r"abc'
+st_case bare_cuts_no_comment_out_of_a_carried_raw_string 0 \
+    --is 'abc // def|3|0|          $' \
+    -- bare_probe 'abc // def' 3 0
+st_case bare_closes_a_carried_raw_string_at_its_quote_and_hashes 0 \
+    --is 'a"# ; x|0|0|    ; x $' \
+    -- bare_probe 'a"# ; x // c' 3 0
+st_case bare_does_not_close_a_two_hash_raw_string_at_one 0 \
+    --is 'a"# b"## ; x|0|0|         ; x $' \
+    -- bare_probe 'a"# b"## ; x // c' 4 0
+st_case bare_ends_a_carried_raw_string_at_a_quote_that_follows_a_backslash 0 \
+    --is 'a \" b" ; x // c|1|0|     b"         $' \
+    -- bare_probe 'a \" b" ; x // c' 2 0
+st_case bare_reads_a_c_raw_string 0 \
+    --is 'cr#"a"b"#; x|0|0|         ; x $' \
+    -- bare_probe 'cr#"a"b"#; x // c'
 st_case bare_does_not_open_a_raw_string_inside_a_string 0 \
     --is 'let s = "abc r"; let t = "x"; y|0|0|let s = "     "; let t = " "; y$' \
     -- bare_probe 'let s = "abc r"; let t = "x"; y'

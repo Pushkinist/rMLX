@@ -158,13 +158,12 @@ it. End a wrapped attribute on a line whose last significant character is `]`.
 
 Each of these passes the gate silently:
 
-- An attribute left open by a raw string that runs over several lines or by a
-  block comment, closed by a later line that ends in `]`. The items between are
-  lost with no report.
-- A raw string that runs over several lines: only one that opens and closes on
-  its line is read as a string. A `/* … */` block comment that spans the lines
-  of a body, an attribute or a macro body: its depth is carried across the
-  lines of a signature only. A device named inside such a comment counts as
+- An attribute left open by a block comment, closed by a later line that ends
+  in `]`. The items between are lost with no report.
+- A string, a raw string or a `/* … */` block comment that spans several lines
+  of a body or of a macro body: its state is carried across the lines of a
+  signature, an attribute (strings only) and nothing else, so a `}` or a `//`
+  inside it is read as code. A device named inside such a comment counts as
   named by the body, which fails closed.
 - An unqualified cross-file call through a glob import (`use m::*; helper()`).
 - A helper in a non-scanned source file. The one instance,
@@ -303,7 +302,7 @@ stand-down in them is held to `SKIP {test}:` by review.
 
 The notice's shape lives in `scripts/lib/skip_notice_patterns.sh`, which the
 gate and the runner both read. `make check-named-skip-notices-fixtures`
-(`scripts/check/gpu_tests_selftest.sh`, 151 cases, in `make ci` and hosted CI) is
+(`scripts/check/gpu_tests_selftest.sh`, 157 cases, in `make ci` and hosted CI) is
 the gate's recall test. It classifies planted workspaces, as the Makefile does,
 and plants its unreadable paths at run time.
 
