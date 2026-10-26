@@ -1205,6 +1205,23 @@ printf '#[test]\n#[ignore = "GPU Metal"]\nfn gpu_alpha() {\n    let device = Dev
 st_case a_comment_line_in_the_members_array_is_not_a_member 0 \
     --is "$(printf 'fb\tgpu_alpha\t%s' "$CASE_ROOT/crates/fb/src/alpha_tests.rs")" \
     -- bash "$TOOL" list --files --root "$CASE_ROOT"
+
+# A bracket in a comment does not end the members array: the member after the comment is still a
+# member, and the floor that compares members with crates/ cannot see one outside it.
+workspace a_comment_holding_a_bracket_does_not_end_the_members_array fb tools/tx=tx
+printf '[workspace]\nmembers = [\n    "crates/fb",\n    # see [workspace] docs\n    "tools/tx",\n]\n' >"$CASE_ROOT/Cargo.toml"
+printf '#[test]\n#[ignore = "GPU Metal"]\nfn gpu_alpha() {\n    let device = Device::Gpu;\n}\n' >"$CASE_ROOT/crates/fb/src/alpha_tests.rs"
+printf '#[test]\n#[ignore = "GPU Metal"]\nfn gpu_tx() {\n    let device = Device::Gpu;\n}\n' >"$CASE_ROOT/tools/tx/src/tx_tests.rs"
+st_case a_comment_holding_a_bracket_does_not_end_the_members_array 0 \
+    --has "$(printf 'fb\tgpu_alpha\t%s' "$CASE_ROOT/crates/fb/src/alpha_tests.rs")" \
+    --has "$(printf 'tx\tgpu_tx\t%s' "$CASE_ROOT/tools/tx/src/tx_tests.rs")" \
+    -- bash "$TOOL" list --files --root "$CASE_ROOT"
+workspace a_comment_after_a_member_is_not_part_of_the_member fb
+printf '[workspace]\nmembers = [\n    "crates/fb", # the model layer\n]\n' >"$CASE_ROOT/Cargo.toml"
+printf '#[test]\n#[ignore = "GPU Metal"]\nfn gpu_alpha() {\n    let device = Device::Gpu;\n}\n' >"$CASE_ROOT/crates/fb/src/alpha_tests.rs"
+st_case a_comment_after_a_member_is_not_part_of_the_member 0 \
+    --is "$(printf 'fb\tgpu_alpha\t%s' "$CASE_ROOT/crates/fb/src/alpha_tests.rs")" \
+    -- bash "$TOOL" list --files --root "$CASE_ROOT"
 workspace the_root_member_lists_its_files_under_the_root fb
 printf '[package]\nname = "rootpkg"\nversion = "0.0.0"\n\n[workspace]\nmembers = [\n    "./",\n    "crates/fb",\n]\n' >"$CASE_ROOT/Cargo.toml"
 mkdir -p "$CASE_ROOT/src"

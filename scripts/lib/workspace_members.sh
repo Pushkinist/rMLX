@@ -9,6 +9,8 @@
 # another path (the files the classifier lists, the directories the partition producer
 # reads) must be one spelling, so the spelling is settled here and nowhere else:
 #
+#   * a `#` comment, a whole line or the end of one, is dropped before anything else is
+#     read: a `]` in it does not end the array;
 #   * a leading `./`, a trailing `/` and a trailing `/.` are dropped, repeatedly;
 #   * `//` and `/./` inside the path become `/`, repeatedly;
 #   * a member that is then empty or `.` is the root member, written `.`.
@@ -50,12 +52,13 @@ workspace_members() {
         /^[[:space:]]*members[[:space:]]*=[[:space:]]*\[/ { inm = 1; next }
         inm {
             line = $0
+            sub(/#.*/, "", line)
             if (line ~ /\]/) { inm = 0 }
             gsub(/[",]/, "", line)
             gsub(/[[:space:]]/, "", line)
             gsub(/\[/, "", line)
             gsub(/\]/, "", line)
-            if (line != "" && line !~ /^#/) { print line }
+            if (line != "") { print line }
         }
     ' "$1" | while IFS= read -r m; do
         printf '%s\n' "$(normalize_member "$m")"
