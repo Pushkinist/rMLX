@@ -43,11 +43,18 @@ pub fn inner_page_range(start: usize, end: usize, page: usize) -> Option<Range<u
 /// `PROT_READ`, `MAP_SHARED` file mapping. Never call it on anonymous or
 /// private memory: `MS_INVALIDATE` there is unmeasured and may discard data.
 pub unsafe fn invalidate_file_pages(addr: usize, len: usize) -> io::Result<()> {
-    // SAFETY: by the contract the range is a read-only shared file mapping, so
-    // its pages are clean and invalidating them loses nothing. The mapping
-    // stays in place with no holes, so a `&[u8]` into it stays valid and reads
-    // the same file bytes.
-    let rc = unsafe { libc::msync(addr as *mut c_void, len, libc::MS_INVALIDATE) };
+    // SAFETY: by the contract the range is a shared file mapping. Another writer
+    // of the file can dirty its pages, but a synchronous `msync` writes back a
+    // dirty page before `MS_INVALIDATE` drops it, so no data is lost. The
+    // mapping stays in place with no holes, so a `&[u8]` into it stays valid and
+    // reads the same file bytes.
+    let rc = unsafe {
+        libc::msync(
+            addr as *mut c_void,
+            len,
+            libc::MS_SYNC | libc::MS_INVALIDATE,
+        )
+    };
     if rc == 0 {
         Ok(())
     } else {
@@ -56,8 +63,9 @@ pub unsafe fn invalidate_file_pages(addr: usize, len: usize) -> io::Result<()> {
 }
 
 /// Which pages of the file at `path` are in the page cache, one entry per
-/// page, read through a fresh mapping. Lets a test observe what
-/// [`invalidate_file_pages`] evicts.
+/// page, read through a fresh mapping. Observes the page cache for tests only:
+/// it shows what [`invalidate_file_pages`] evicts.
+#[doc(hidden)]
 pub fn file_pages_in_cache(path: &Path) -> io::Result<Vec<bool>> {
     let file = File::open(path)?;
     let len = usize::try_from(file.metadata()?.len()).map_err(io::Error::other)?;

@@ -344,6 +344,8 @@ pub fn top_k_norm_indices(
             ))
         })?;
 
+        release_mapped(data_bytes);
+
         let total_elems: usize = shape.iter().product();
         if flat.len() != total_elems {
             return Err(Error::Loader(format!(

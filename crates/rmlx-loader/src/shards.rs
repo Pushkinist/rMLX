@@ -97,22 +97,23 @@ impl ShardHandle {
         let mmap = unsafe { memmap2::Mmap::map(&file) }
             .map_err(|e| Error::Loader(format!("mmap failed for {}: {e}", abs_path.display())))?;
 
-        if !mmap.is_empty() {
+        let handle = ShardHandle {
+            filename: filename.to_owned(),
+            abs_path,
+            mmap,
+        };
+        if !handle.mmap.is_empty() {
             let prev = live_mappings().insert(
-                mmap.as_ptr() as usize,
+                handle.mmap.as_ptr() as usize,
                 LiveMapping {
-                    len: mmap.len(),
+                    len: handle.mmap.len(),
+                    path: handle.abs_path.clone(),
                     warned: false,
                 },
             );
             debug_assert!(prev.is_none(), "shard mapping registered twice");
         }
-
-        Ok(ShardHandle {
-            filename: filename.to_owned(),
-            abs_path,
-            mmap,
-        })
+        Ok(handle)
     }
 
     /// Borrows the entire mmap'd byte slice.
@@ -148,10 +149,12 @@ impl Drop for ShardHandle {
 
 // ── release_mapped ───────────────────────────────────────────────────────────
 
-/// A live shard mapping of `len` bytes. `warned` is set after its first failed
-/// release, so a failure that repeats for every tensor warns once per shard.
+/// A live mapping of `len` bytes of the shard file at `path`. `warned` is set
+/// after its first failed release, so a failure that repeats for every tensor
+/// warns once per shard.
 struct LiveMapping {
     len: usize,
+    path: PathBuf,
     warned: bool,
 }
 
@@ -162,13 +165,15 @@ fn live_mappings() -> MutexGuard<'static, BTreeMap<usize, LiveMapping>> {
     LIVE_MAPPINGS.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The start address and length of every registered shard mapping.
-#[cfg(test)]
-fn registered_mappings() -> Vec<(usize, usize)> {
-    live_mappings()
-        .iter()
-        .map(|(&base, mapping)| (base, mapping.len))
-        .collect()
+/// The start address of the mapping that holds `start..end`: the last one that
+/// starts at or below `start`, accepted only if it reaches `end`.
+fn containing_mapping(
+    mappings: &BTreeMap<usize, LiveMapping>,
+    start: usize,
+    end: usize,
+) -> Option<usize> {
+    let (&base, mapping) = mappings.range(..=start).next_back()?;
+    (end <= base + mapping.len).then_some(base)
 }
 
 /// Drops the pages of `bytes` from the process and from the page cache once
@@ -190,12 +195,12 @@ pub fn release_mapped(bytes: &[u8]) -> usize {
         return 0;
     };
     let mut mappings = live_mappings();
-    let Some((&base, mapping)) = mappings.range_mut(..=start).next_back() else {
+    let Some(base) = containing_mapping(&mappings, start, end) else {
         return 0;
     };
-    if end > base + mapping.len {
+    let Some(mapping) = mappings.get_mut(&base) else {
         return 0;
-    }
+    };
     // SAFETY: the registry exists to refuse a slice outside a shard mapping:
     // `pages` is page-aligned and lies inside `bytes`, which lies inside the
     // mapping registered at `base`, a `PROT_READ`, `MAP_SHARED` file mapping
@@ -209,6 +214,7 @@ pub fn release_mapped(bytes: &[u8]) -> usize {
             if !std::mem::replace(&mut mapping.warned, true) {
                 warn!(
                     error = %e,
+                    shard = %mapping.path.display(),
                     bytes = pages.len(),
                     "cannot release a copied tensor's mapped pages; the load continues with them resident"
                 );

@@ -55,6 +55,8 @@ fn file_pages_in_cache_has_one_entry_per_page_of_a_written_file() {
     let path = dir.path().join("pages.bin");
     std::fs::write(&path, vec![7u8; 3 * page + 1]).unwrap();
     File::open(&path).unwrap().sync_all().unwrap();
+    let contents = std::fs::read(&path).unwrap();
+    std::hint::black_box(contents.iter().fold(0u64, |sum, &b| sum + u64::from(b)));
     let cached = file_pages_in_cache(&path).unwrap();
     assert_eq!(cached.len(), 4);
     assert!(cached.iter().all(|&c| c));
