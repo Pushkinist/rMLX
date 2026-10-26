@@ -6,6 +6,7 @@
 # LOC-exempt: one planted run per case; the cases are the spec
 #
 # Recall test for: run_gpu_tests.sh
+#                  suite/gpu_test_classes.sh half threadgroup
 #
 # The runner accumulates two independent kinds of red across its crate loop:
 # Metal shader-validation diagnostics, and everything that makes a crate fail
@@ -83,7 +84,7 @@ new_case() {
     case_skipped=0
     CASE_ROOT="${WORK}/$1"
     local root="${CASE_ROOT}"
-    mkdir -p "${root}/scripts/lib" "${root}/scripts/check" "${root}/bin" "${root}/logs" || return 1
+    mkdir -p "${root}/scripts/lib" "${root}/scripts/check" "${root}/scripts/suite" "${root}/bin" "${root}/logs" || return 1
     cp "${RUNNER}" "${root}/scripts/run_gpu_tests.sh" || return 1
     # Symlinked, not copied: the runner reads the stand-down notice's shape from
     # this file and so does the source gate, and a fixture carrying its own copy
@@ -106,8 +107,12 @@ STUB
     # of the classification, so it gets its own stub: a case states the
     # partition it is testing instead of re-deriving it from a fixture tree,
     # and the one case that does exercise the real rule runs the real producer.
+    cat >"${root}/scripts/suite/gpu_test_classes.sh" <<STUB
+#!/usr/bin/env bash
+exec bash "${root}/stub_\$1"
+STUB
     : >"${root}/halves"
-    cat >"${root}/scripts/gpu_test_halves.sh" <<STUB
+    cat >"${root}/stub_half" <<STUB
 #!/usr/bin/env bash
 cat "${root}/halves"
 STUB
@@ -118,7 +123,7 @@ STUB
     # canned log (`<crate>.tgunset.log` overrides the uninstrumented one); the cases
     # under THE THREADGROUP SPLIT state their own rows, and one runs the real
     # producer over a fixture tree.
-    cat >"${root}/scripts/gpu_test_threadgroup.sh" <<STUB
+    cat >"${root}/stub_threadgroup" <<STUB
 #!/usr/bin/env bash
 if [ -f "${root}/tg" ]; then
     cat "${root}/tg"
@@ -1822,7 +1827,7 @@ expect_report "rmlx-kv-quant: under-matched (1/2 executed) with uninstrumented, 
 # in full`, which carries no INCOMPLETE, so a half that turned a stand-down into
 # a non-selection would buy a green run by not asking.
 #
-# The partition itself comes from `scripts/gpu_test_halves.sh`, which is the one
+# The partition itself comes from `scripts/suite/gpu_test_classes.sh half`, which is the one
 # producer of it. Every case here stubs that producer, so the case states its
 # own partition; the last case runs the real one over a fixture tree, which is
 # what holds the rule to the tree instead of to a list of test names.
@@ -2075,7 +2080,7 @@ gpu_fixture_test "${tree}/crates/rmlx-models/tests/pipeline.rs" pipeline_agrees
 gpu_fixture_test "${tree}/crates/rmlx-models/tests/codec_sweep.rs" sweep_holds \
     'let q = rmlx_kv_quant::KvQuant::K8V8;'
 gpu_fixture_test "${tree}/crates/rmlx-audio/src/asr_tests.rs" asr_transcribes
-HALVES_OUT="$(bash "${ROOT}/scripts/gpu_test_halves.sh" --root "${tree}" 2>&1)"
+HALVES_OUT="$(bash "${ROOT}/scripts/suite/gpu_test_classes.sh" half --root "${tree}" 2>&1)"
 expect_placed codec rmlx-kv-quant codec_decodes
 expect_placed codec rmlx-models arch_forwards
 expect_placed codec rmlx-models sweep_holds
@@ -2084,7 +2089,7 @@ expect_placed rest rmlx-audio asr_transcribes
 # The same test under a different name keeps its half, because the half came
 # from where the test is declared.
 gpu_fixture_test "${tree}/crates/rmlx-kv-quant/src/codec_tests.rs" codec_decodes_renamed
-HALVES_OUT="$(bash "${ROOT}/scripts/gpu_test_halves.sh" --root "${tree}" 2>&1)"
+HALVES_OUT="$(bash "${ROOT}/scripts/suite/gpu_test_classes.sh" half --root "${tree}" 2>&1)"
 expect_placed codec rmlx-kv-quant codec_decodes_renamed
 
 # The codec-name set comes from `ALL_KV_QUANTS`, not from a pattern. `FromStr` is
@@ -2099,7 +2104,7 @@ gpu_fixture_test "${tree}/crates/rmlx-models/tests/parses_a_flag.rs" flag_parses
     'let q = <rmlx_kv_quant::KvQuant as std::str::FromStr>::from_str("none");'
 gpu_fixture_test "${tree}/crates/rmlx-models/tests/pins_none.rs" none_is_pinned \
     'let q = rmlx_kv_quant::KvQuant::None;'
-HALVES_OUT="$(bash "${ROOT}/scripts/gpu_test_halves.sh" --root "${tree}" 2>&1)"
+HALVES_OUT="$(bash "${ROOT}/scripts/suite/gpu_test_classes.sh" half --root "${tree}" 2>&1)"
 expect_placed rest rmlx-models flag_parses
 expect_placed rest rmlx-models none_is_pinned
 
@@ -2116,7 +2121,7 @@ fn orphaned_metal_test() {
     run(Device::Cpu);
 }
 TEST
-OUT="$(bash "${ROOT}/scripts/gpu_test_halves.sh" --root "${tree}" 2>&1)"
+OUT="$(bash "${ROOT}/scripts/suite/gpu_test_classes.sh" half --root "${tree}" 2>&1)"
 STATUS=$?
 expect_status 2
 expect_out "claims a Metal context"
@@ -2140,9 +2145,9 @@ done
 exec "$(command -v awk)" "\$@"
 SHIM
 chmod +x "${CASE_ROOT}/failing_awk/awk"
-HALVES_OUT="$(bash "${ROOT}/scripts/gpu_test_halves.sh" --root "${tree}" 2>&1)"
+HALVES_OUT="$(bash "${ROOT}/scripts/suite/gpu_test_classes.sh" half --root "${tree}" 2>&1)"
 expect_placed rest rmlx-models pipeline_agrees
-OUT="$(PATH="${CASE_ROOT}/failing_awk:${PATH}" bash "${ROOT}/scripts/gpu_test_halves.sh" --root "${tree}" 2>&1)"
+OUT="$(PATH="${CASE_ROOT}/failing_awk:${PATH}" bash "${ROOT}/scripts/suite/gpu_test_classes.sh" half --root "${tree}" 2>&1)"
 STATUS=$?
 expect_status 2
 expect_out "could not read $(cd "${tree}" && pwd)/crates/rmlx-models/tests/pipeline.rs"
@@ -2175,12 +2180,12 @@ process, so listing them would fail the suite for a missing model):
   -> No gate executes these. See docs/GPU_TESTS.md for each one's coverage.
 
 NOTE
-cat >"${CASE_ROOT}/scripts/gpu_test_halves.sh" <<STUB
+cat >"${CASE_ROOT}/stub_half" <<STUB
 #!/usr/bin/env bash
 cat "${CASE_ROOT}/note_macro" >&2
 cat "${CASE_ROOT}/halves"
 STUB
-cat >"${CASE_ROOT}/scripts/gpu_test_threadgroup.sh" <<STUB
+cat >"${CASE_ROOT}/stub_threadgroup" <<STUB
 #!/usr/bin/env bash
 cat "${CASE_ROOT}/note_declared" >&2
 cat "${CASE_ROOT}/tg"
@@ -2202,7 +2207,7 @@ expect_no_out "do not cover each other"
 # to the operator.
 new_case runner_shows_a_refusing_producers_reason || exit 1
 classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
-cat >"${CASE_ROOT}/scripts/gpu_test_halves.sh" <<'STUB'
+cat >"${CASE_ROOT}/stub_half" <<'STUB'
 #!/usr/bin/env bash
 echo "ERROR: planted partition refusal" >&2
 exit 2
@@ -2212,7 +2217,7 @@ expect_status 1
 expect_once "planted partition refusal"
 expect_out "the GPU-suite partition could not be computed"
 expect_no_blank_after "ERROR: the GPU-suite partition could not be computed."
-cat >"${CASE_ROOT}/scripts/gpu_test_threadgroup.sh" <<'STUB'
+cat >"${CASE_ROOT}/stub_threadgroup" <<'STUB'
 #!/usr/bin/env bash
 echo "ERROR: planted split refusal" >&2
 exit 2
@@ -2251,18 +2256,18 @@ case "${LIST_ERR}" in
     *"NOTE: macro-generated GPU tests"*) ;;
     *) fail "the control tree's own listing prints no NOTE block" ;;
 esac
-HALVES_ERR="$(bash "${ROOT}/scripts/gpu_test_halves.sh" --root "${tree}" 2>&1 >/dev/null)"
+HALVES_ERR="$(bash "${ROOT}/scripts/suite/gpu_test_classes.sh" half --root "${tree}" 2>&1 >/dev/null)"
 [ -z "${HALVES_ERR}" ] || fail "halves printed on stderr although the listing succeeded: ${HALVES_ERR}"
-TG_ERR="$(bash "${ROOT}/scripts/gpu_test_threadgroup.sh" --root "${tree}" 2>&1 >/dev/null)"
+TG_ERR="$(bash "${ROOT}/scripts/suite/gpu_test_classes.sh" threadgroup --root "${tree}" 2>&1 >/dev/null)"
 [ -z "${TG_ERR}" ] || fail "threadgroup printed on stderr although the listing succeeded: ${TG_ERR}"
 
 # producer_scratch <dir> — a repo root holding the real producers beside a classifier that runs the
 # real one, prints its rows, and then fails: the listing that failed after printing.
 producer_scratch() {
     local d="$1"
-    mkdir -p "${d}/scripts/check" "${d}/scripts/lib" "${d}/crates/rmlx-kv-quant/src" || return 1
-    cp "${ROOT}/scripts/gpu_test_halves.sh" "${ROOT}/scripts/gpu_test_threadgroup.sh" \
-        "${ROOT}/scripts/metal_dirs.sh" "${d}/scripts/" || return 1
+    mkdir -p "${d}/scripts/check" "${d}/scripts/lib" "${d}/scripts/suite" "${d}/crates/rmlx-kv-quant/src" || return 1
+    cp "${ROOT}/scripts/suite/gpu_test_classes.sh" "${d}/scripts/suite/" || return 1
+    cp "${ROOT}/scripts/metal_dirs.sh" "${d}/scripts/" || return 1
     cp "${ROOT}/scripts/lib/awk_text.sh" "${ROOT}/scripts/lib/workspace_members.sh" "${d}/scripts/lib/" || return 1
     cp "${ROOT}/crates/rmlx-kv-quant/src/quant.rs" "${d}/crates/rmlx-kv-quant/src/" || return 1
     cat >"${d}/scripts/check/gpu_tests.sh" <<STUB
@@ -2283,18 +2288,17 @@ threadgroup_fixture_tree "${tree}" || exit 1
 gpu_fixture_test "${tree}/crates/rmlx-kv-quant/src/codec_msl_tests.rs" codec_decodes \
     'codec_quantize_gpu();'
 gpu_fixture_test "${tree}/crates/rmlx-models/src/arch_tests.rs" arch_forwards
-for producer in halves:partition threadgroup:split; do
-    script="${producer%%:*}"
+for producer in half:partition threadgroup:split; do
+    mode="${producer%%:*}"
     what="${producer#*:}"
-    case "${script}" in halves) script=gpu_test_halves.sh ;; *) script=gpu_test_threadgroup.sh ;; esac
-    OUT="$(bash "${CASE_ROOT}/p/scripts/${script}" --root "${tree}" 2>&1)"
+    OUT="$(bash "${CASE_ROOT}/p/scripts/suite/gpu_test_classes.sh" "${mode}" --root "${tree}" 2>&1)"
     STATUS=$?
     expect_status 2
     expect_out "failed (exit 1)"
     expect_out "no ${what} is computed from a listing it did not finish"
     expect_once "planted failure after the rows"
-    ROWS="$(bash "${CASE_ROOT}/p/scripts/${script}" --root "${tree}" 2>/dev/null)"
-    [ -z "${ROWS}" ] || fail "${script} printed rows although its listing failed: ${ROWS}"
+    ROWS="$(bash "${CASE_ROOT}/p/scripts/suite/gpu_test_classes.sh" "${mode}" --root "${tree}" 2>/dev/null)"
+    [ -z "${ROWS}" ] || fail "${mode} printed rows although its listing failed: ${ROWS}"
 done
 
 # The runner refuses a listing that failed, for the same reason.
@@ -2347,25 +2351,25 @@ gpu_fixture_test "${tree}/crates/rmlx-models/src/arch_tests.rs" arch_forwards
 printf '[workspace]\nmembers = [\n    "crates/rmlx-models",\n    "crates/gone",\n]\n' >"${tree}/Cargo.toml"
 scratch="${CASE_ROOT}/scratch"
 mkdir -p "${scratch}"
-for script in gpu_test_halves.sh gpu_test_threadgroup.sh; do
-    OUT="$(TMPDIR="${scratch}" bash "${ROOT}/scripts/${script}" --root "${tree}" 2>&1)"
+for mode in half threadgroup; do
+    OUT="$(TMPDIR="${scratch}" bash "${ROOT}/scripts/suite/gpu_test_classes.sh" "${mode}" --root "${tree}" 2>&1)"
     STATUS=$?
     expect_status 2
     expect_out "The crate moved or was renamed"
     LEFT="$(ls -A "${scratch}")"
-    [ -z "${LEFT}" ] || fail "${script} left a scratch file behind after a refusal: ${LEFT}"
-    ROWS="$(TMPDIR="${scratch}" bash "${ROOT}/scripts/${script}" --root "${tree}" 2>/dev/null)"
-    [ -z "${ROWS}" ] || fail "${script} wrote its refusal where the rows go: ${ROWS}"
-    OUT="$(TMPDIR="${CASE_ROOT}/no/such/directory" bash "${ROOT}/scripts/${script}" --root "${tree}" 2>&1)"
+    [ -z "${LEFT}" ] || fail "${mode} left a scratch file behind after a refusal: ${LEFT}"
+    ROWS="$(TMPDIR="${scratch}" bash "${ROOT}/scripts/suite/gpu_test_classes.sh" "${mode}" --root "${tree}" 2>/dev/null)"
+    [ -z "${ROWS}" ] || fail "${mode} wrote its refusal where the rows go: ${ROWS}"
+    OUT="$(TMPDIR="${CASE_ROOT}/no/such/directory" bash "${ROOT}/scripts/suite/gpu_test_classes.sh" "${mode}" --root "${tree}" 2>&1)"
     STATUS=$?
     expect_status 2
     expect_out "cannot make a scratch file"
 done
 printf '[workspace]\nmembers = [\n    "crates/rmlx-models",\n]\n' >"${tree}/Cargo.toml"
-for script in gpu_test_halves.sh gpu_test_threadgroup.sh; do
-    TMPDIR="${scratch}" bash "${ROOT}/scripts/${script}" --root "${tree}" >/dev/null 2>&1
+for mode in half threadgroup; do
+    TMPDIR="${scratch}" bash "${ROOT}/scripts/suite/gpu_test_classes.sh" "${mode}" --root "${tree}" >/dev/null 2>&1
     LEFT="$(ls -A "${scratch}")"
-    [ -z "${LEFT}" ] || fail "${script} left a scratch file behind after a run: ${LEFT}"
+    [ -z "${LEFT}" ] || fail "${mode} left a scratch file behind after a run: ${LEFT}"
 done
 
 # A member spelled with a trailing slash or a ./ prefix is the same member: the classifier reports
@@ -2384,7 +2388,7 @@ TOML
 gpu_fixture_test "${tree}/crates/rmlx-kv-quant/src/codec_tests.rs" codec_decodes
 gpu_fixture_test "${tree}/crates/rmlx-models/src/arch_tests.rs" arch_forwards
 gpu_fixture_test "${tree}/crates/rmlx-audio/src/asr_tests.rs" asr_transcribes
-HALVES_OUT="$(bash "${ROOT}/scripts/gpu_test_halves.sh" --root "${tree}" 2>&1)"
+HALVES_OUT="$(bash "${ROOT}/scripts/suite/gpu_test_classes.sh" half --root "${tree}" 2>&1)"
 expect_placed codec rmlx-kv-quant codec_decodes
 expect_placed codec rmlx-models arch_forwards
 expect_placed rest rmlx-audio asr_transcribes
@@ -2393,7 +2397,7 @@ expect_placed rest rmlx-audio asr_transcribes
 # THE THREADGROUP SPLIT
 #
 # Threadgroup-memory validation is on for the tests of rMLX's own kernels and
-# off for the rest, per `scripts/gpu_test_threadgroup.sh`. The split has two
+# off for the rest, per `scripts/suite/gpu_test_classes.sh threadgroup`. The split has two
 # ways to collapse — every test on, or every test off — and each reads as a
 # green run with a plausible count, so what these cases read is the setting
 # each cargo process actually saw, next to the names it was asked to run.
@@ -2573,7 +2577,7 @@ gpu_fixture_test "${tree}/crates/rmlx-models/src/prose_tests.rs" prose_mentions_
     'println!("step_gpu"); // step_gpu is not called here'
 gpu_fixture_test "${tree}/crates/rmlx-models/tests/pipeline.rs" pipeline_agrees
 gpu_fixture_test "${tree}/crates/rmlx-audio/src/asr_tests.rs" asr_transcribes
-TG_OUT="$(bash "${ROOT}/scripts/gpu_test_threadgroup.sh" --root "${tree}" 2>&1)"
+TG_OUT="$(bash "${ROOT}/scripts/suite/gpu_test_classes.sh" threadgroup --root "${tree}" 2>&1)"
 HALVES_OUT="${TG_OUT}"
 expect_placed on rmlx-kv-quant codec_decodes
 expect_placed on rmlx-kv-quant dispatch_holds
@@ -2596,7 +2600,7 @@ tree="${CASE_ROOT}/all_on"
 threadgroup_fixture_tree "${tree}" || exit 1
 gpu_fixture_test "${tree}/crates/rmlx-kv-quant/src/codec_msl_tests.rs" codec_decodes \
     'codec_quantize_gpu();'
-TG_OUT="$(bash "${ROOT}/scripts/gpu_test_threadgroup.sh" --root "${tree}" 2>&1)"
+TG_OUT="$(bash "${ROOT}/scripts/suite/gpu_test_classes.sh" threadgroup --root "${tree}" 2>&1)"
 STATUS=$?
 OUT="${TG_OUT}"
 expect_status 2
@@ -2604,7 +2608,7 @@ expect_out "the threadgroup split collapsed — 1 test(s) on, 0 off."
 tree="${CASE_ROOT}/all_off"
 threadgroup_fixture_tree "${tree}" || exit 1
 gpu_fixture_test "${tree}/crates/rmlx-models/src/arch_tests.rs" arch_forwards
-TG_OUT="$(bash "${ROOT}/scripts/gpu_test_threadgroup.sh" --root "${tree}" 2>&1)"
+TG_OUT="$(bash "${ROOT}/scripts/suite/gpu_test_classes.sh" threadgroup --root "${tree}" 2>&1)"
 STATUS=$?
 OUT="${TG_OUT}"
 expect_status 2
@@ -2635,7 +2639,7 @@ gpu_fixture_test "${tree}/src/dep_tests.rs" dep_gpu
 gpu_fixture_test "${tree}/tests/dep_it.rs" dep_it_gpu
 gpu_fixture_test "${tree}/crates/rmlx-models/src/arch_tests.rs" arch_forwards
 gpu_fixture_test "${tree}/crates/rmlx-audio/src/asr_tests.rs" asr_transcribes
-HALVES_OUT="$(bash "${ROOT}/scripts/gpu_test_halves.sh" --root "${tree}" 2>&1)"
+HALVES_OUT="$(bash "${ROOT}/scripts/suite/gpu_test_classes.sh" half --root "${tree}" 2>&1)"
 expect_placed codec rootdep dep_gpu
 expect_placed codec rootdep dep_it_gpu
 expect_placed codec rmlx-models arch_forwards
@@ -2644,7 +2648,7 @@ tree="${CASE_ROOT}/rootmodels"
 mkdir -p "${tree}/src" || exit 1
 printf '[package]\nname = "rmlx-models"\nversion = "0.0.0"\n\n[workspace]\nmembers = [\n    ".",\n]\n' >"${tree}/Cargo.toml"
 gpu_fixture_test "${tree}/src/arch_tests.rs" arch_forwards
-HALVES_OUT="$(bash "${ROOT}/scripts/gpu_test_halves.sh" --root "${tree}" 2>&1)"
+HALVES_OUT="$(bash "${ROOT}/scripts/suite/gpu_test_classes.sh" half --root "${tree}" 2>&1)"
 expect_placed codec rmlx-models arch_forwards
 
 # The same members spelled with a doubled slash, a /./, a ./ prefix and a trailing slash are the
@@ -2671,7 +2675,7 @@ gpu_fixture_test "${tree}/crates/rmlx-models/src/step_msl_tests.rs" step_kernel_
     'step_gpu();'
 gpu_fixture_test "${tree}/crates/rmlx-models/src/arch_tests.rs" arch_forwards
 gpu_fixture_test "${tree}/crates/rmlx-audio/src/asr_tests.rs" asr_transcribes
-HALVES_OUT="$(bash "${ROOT}/scripts/gpu_test_threadgroup.sh" --root "${tree}" 2>&1)"
+HALVES_OUT="$(bash "${ROOT}/scripts/suite/gpu_test_classes.sh" threadgroup --root "${tree}" 2>&1)"
 expect_placed on rmlx-kv-quant codec_decodes
 expect_placed on rmlx-kv-quant codec_embeds_its_kernel
 expect_placed off rmlx-mlx op_computes
@@ -2685,7 +2689,7 @@ new_case threadgroup_a_tree_with_no_kernel_source_is_exit_2 || exit 1
 tree="${CASE_ROOT}/tree"
 halves_fixture_tree "${tree}" || exit 1
 gpu_fixture_test "${tree}/crates/rmlx-models/src/arch_tests.rs" arch_forwards
-TG_OUT="$(bash "${ROOT}/scripts/gpu_test_threadgroup.sh" --root "${tree}" 2>&1)"
+TG_OUT="$(bash "${ROOT}/scripts/suite/gpu_test_classes.sh" threadgroup --root "${tree}" 2>&1)"
 STATUS=$?
 OUT="${TG_OUT}"
 expect_status 2
@@ -2703,7 +2707,7 @@ fn orphaned_metal_test() {
     run(Device::Cpu);
 }
 TEST
-TG_OUT="$(bash "${ROOT}/scripts/gpu_test_threadgroup.sh" --root "${tree}" 2>&1)"
+TG_OUT="$(bash "${ROOT}/scripts/suite/gpu_test_classes.sh" threadgroup --root "${tree}" 2>&1)"
 STATUS=$?
 OUT="${TG_OUT}"
 expect_status 2
@@ -2721,7 +2725,7 @@ gpu_fixture_test "${tree}/crates/rmlx-kv-quant/src/codec_msl_tests.rs" codec_dec
     'codec_quantize_gpu();'
 gpu_fixture_test "${tree}/crates/rmlx-models/src/arch_tests.rs" arch_forwards
 mkdir -p "${tree}/crates/rmlx-models/benches"
-TG_OUT="$(bash "${ROOT}/scripts/gpu_test_threadgroup.sh" --root "${tree}" 2>&1)"
+TG_OUT="$(bash "${ROOT}/scripts/suite/gpu_test_classes.sh" threadgroup --root "${tree}" 2>&1)"
 HALVES_OUT="${TG_OUT}"
 expect_placed on rmlx-kv-quant codec_decodes
 dispatcher="${tree}/crates/rmlx-kv-quant/src/codec_msl.rs"
@@ -2730,7 +2734,7 @@ if cat "${dispatcher}" >/dev/null 2>&1; then
     st_skip "${CASE}" "this user can read a mode-000 file"
     case_skipped=1
 else
-    TG_OUT="$(bash "${ROOT}/scripts/gpu_test_threadgroup.sh" --root "${tree}" 2>&1)"
+    TG_OUT="$(bash "${ROOT}/scripts/suite/gpu_test_classes.sh" threadgroup --root "${tree}" 2>&1)"
     STATUS=$?
     OUT="${TG_OUT}"
     expect_status 2
@@ -2742,7 +2746,7 @@ if ls "${tree}/crates/rmlx-models/benches" >/dev/null 2>&1; then
     st_skip "${CASE}" "this user can read a mode-000 directory"
     case_skipped=1
 else
-    TG_OUT="$(bash "${ROOT}/scripts/gpu_test_threadgroup.sh" --root "${tree}" 2>&1)"
+    TG_OUT="$(bash "${ROOT}/scripts/suite/gpu_test_classes.sh" threadgroup --root "${tree}" 2>&1)"
     STATUS=$?
     OUT="${TG_OUT}"
     expect_status 2

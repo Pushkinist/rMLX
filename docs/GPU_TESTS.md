@@ -46,8 +46,8 @@ the rule. It runs in `make ci` and in the hosted `source gates` job. Its scope:
 
 A directory or file the scan cannot read is a refusal that names it, never a
 tree with no findings: `ignored` and `list` exit 1, `skip-notices` exits 2.
-`scripts/gpu_test_halves.sh` and `scripts/gpu_test_threadgroup.sh` refuse the
-same way and print the classifier's reason.
+`scripts/suite/gpu_test_classes.sh` refuses the
+same way in both modes and prints the classifier's reason.
 
 A test reaches `Device::Gpu` when the name appears in its body, or in a
 module-scope `const … = Device::Gpu`, or in a helper it calls. An unqualified
@@ -368,7 +368,7 @@ id; `load_speculative` calls the same function.
 
 ### Splitting the GPU suite by what it guards
 
-`scripts/gpu_test_halves.sh` is the one producer of the partition. It prints
+`scripts/suite/gpu_test_classes.sh half` is the one producer of the partition. It prints
 `half<TAB>crate<TAB>test` for every classified test:
 
 > A classified GPU test is in the **`codec`** half if and only if its declaring
@@ -565,7 +565,7 @@ judged with threadgroup validation on, and a test of rMLX's own `.metal`
 kernels, which this repo can get wrong in threadgroup memory, loses coverage
 without it.
 
-`scripts/gpu_test_threadgroup.sh` is the one producer of the split. A
+`scripts/suite/gpu_test_classes.sh threadgroup` is the one producer of the split. A
 *dispatcher* is a source file that embeds, with `include_str!`, a `.metal` file
 under a directory `scripts/metal_dirs.sh` names; its *entry names* are the fns a
 non-test dispatcher defines. A classified test runs with threadgroup validation

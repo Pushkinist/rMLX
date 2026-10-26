@@ -41,8 +41,6 @@ class eval/wikitext2_ppl.py
 class eval_lock_stress.sh
 class gen_lloyd_codebook.py
 class gpu_capture.sh
-class gpu_test_halves.sh
-class gpu_test_threadgroup.sh
 class gpu_validation_census.txt
 class gputrace_diff.sh
 class gputrace_kernels.sh
@@ -112,8 +110,6 @@ usage check_spec_metric_parity_fixtures.sh
 usage codec_smoke_runner_selftest.sh
 usage eval/wikitext2_ppl.py
 usage eval_lock_stress.sh
-usage gpu_test_halves.sh
-usage gpu_test_threadgroup.sh
 usage lib/binary_identity.py
 usage lib/prefill_ms.py
 usage lib/published_aggregate.py
@@ -184,8 +180,6 @@ exit-undeclared eval/wikitext2_ppl.py 1
 exit-undeclared eval_lock_stress.sh 1
 exit-undeclared gen_lloyd_codebook.py 1
 exit-undeclared gpu_capture.sh 1,2
-exit-undeclared gpu_test_halves.sh 0,2
-exit-undeclared gpu_test_threadgroup.sh 0,2
 exit-undeclared gputrace_diff.sh 1
 exit-undeclared ingest/llama_bench_ingest.py 1
 exit-undeclared metal_dirs.sh 2
@@ -300,8 +294,6 @@ set-mode check_kv_codec_disposition.sh
 set-mode check_metal_compiles.sh
 set-mode codec_smoke_runner_selftest.sh
 set-mode gpu_capture.sh
-set-mode gpu_test_halves.sh
-set-mode gpu_test_threadgroup.sh
 set-mode gputrace_diff.sh
 set-mode gputrace_kernels.sh
 set-mode gputrace_preflight.sh

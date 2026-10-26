@@ -114,7 +114,7 @@
 # THREADGROUP
 #   Threadgroup-memory instrumentation makes MLX's NAX kernels return wrong
 #   values at random in a checkpoint's forward, so a test over a checkpoint
-#   cannot be judged with it. `scripts/gpu_test_threadgroup.sh` sets it `on`
+#   cannot be judged with it. `scripts/suite/gpu_test_classes.sh threadgroup` sets it `on`
 #   for the tests of rMLX's own `.metal` kernels and `off` for the rest, and
 #   states the rule. Each crate is scanned once per setting, each scan skipping
 #   the other setting's names; the report lists every test under the setting it ran
@@ -159,7 +159,7 @@
 #   disarms the instrumentation entirely.
 #
 # HALVES (--half)
-#   `--half` narrows to one side of the partition `scripts/gpu_test_halves.sh`
+#   `--half` narrows to one side of the partition `scripts/suite/gpu_test_classes.sh half`
 #   computes, so a change can pay for the part of the suite that guards what it
 #   touched. It has the same narrowing hazard as `--crate`, and the defence is
 #   that a half-run SAYS SO on its final line: the half is named there, and
@@ -205,7 +205,7 @@ Usage: run_gpu_tests.sh [--crate <name>] [--filter <substring>]
 
   --crate <name>          restrict to one workspace member (e.g. rmlx-kv-quant)
   --filter <substring>    restrict to GPU test fns whose name contains <substring>
-  --half codec|rest       run one side of the partition scripts/gpu_test_halves.sh
+  --half codec|rest       run one side of the partition scripts/suite/gpu_test_classes.sh half
                           computes; the half is named on the final line
   --shader-validation     instrument every Metal pipeline and fail on an invalid
                           memory access (default)
@@ -260,7 +260,7 @@ fi
 # kernel instead of the first. See `man MetalValidation`.
 #
 # THREADGROUP_MEMORY is not in this list because it is set per test, from
-# `scripts/gpu_test_threadgroup.sh`: its instrumentation makes MLX's NAX
+# `scripts/suite/gpu_test_classes.sh threadgroup`: its instrumentation makes MLX's NAX
 # kernels return wrong values in a checkpoint's forward, so it is on for the
 # tests of rMLX's own kernels and off for the rest. See THREADGROUP below.
 #
@@ -437,7 +437,7 @@ CANARY_TEST="shader_validation_canary_emits_an_invalid_access_report"
 # script selects.
 half_rows=""
 if [ -n "${HALF}" ]; then
-    if ! halves_out="$(bash "${REPO_ROOT}/scripts/gpu_test_halves.sh" --root "${REPO_ROOT}")"; then
+    if ! halves_out="$(bash "${REPO_ROOT}/scripts/suite/gpu_test_classes.sh" half --root "${REPO_ROOT}")"; then
         echo "ERROR: the GPU-suite partition could not be computed." >&2
         [ -z "${halves_out}" ] || printf '%s\n' "${halves_out}" >&2
         echo "Refusing to run a half whose other half is unknown." >&2
@@ -469,7 +469,7 @@ if [ -n "${HALF}" ]; then
         printf '%s' "${partition_errors}" >&2
         echo >&2
         echo "Every classified GPU test belongs to exactly one half, or it runs under" >&2
-        echo "no gate. Fix scripts/gpu_test_halves.sh, or run the whole suite with no" >&2
+        echo "no gate. Fix scripts/suite/gpu_test_classes.sh half, or run the whole suite with no" >&2
         echo "--half. See docs/GPU_TESTS.md." >&2
         exit 1
     fi
@@ -483,7 +483,7 @@ tg_rows=""
 n_tg_on=0
 n_tg_off=0
 if [ "${SHADER_VALIDATION}" = "1" ] && [ "${BUILD_ONLY}" = "0" ]; then
-    if ! tg_out="$(bash "${REPO_ROOT}/scripts/gpu_test_threadgroup.sh" --root "${REPO_ROOT}")"; then
+    if ! tg_out="$(bash "${REPO_ROOT}/scripts/suite/gpu_test_classes.sh" threadgroup --root "${REPO_ROOT}")"; then
         echo "ERROR: the threadgroup-validation split could not be computed." >&2
         [ -z "${tg_out}" ] || printf '%s\n' "${tg_out}" >&2
         exit 1
@@ -537,7 +537,7 @@ if [ "${SHADER_VALIDATION}" = "1" ] && [ "${BUILD_ONLY}" = "0" ]; then
     if [ -n "${tg_errors}" ]; then
         echo "ERROR: the threadgroup split cannot be run as computed:" >&2
         printf '%s' "${tg_errors}" >&2
-        echo "Fix scripts/gpu_test_threadgroup.sh. See docs/GPU_TESTS.md." >&2
+        echo "Fix scripts/suite/gpu_test_classes.sh threadgroup. See docs/GPU_TESTS.md." >&2
         exit 1
     fi
 fi

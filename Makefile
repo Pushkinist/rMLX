@@ -243,7 +243,7 @@ build-debug:     ## cargo build --profile release-debug (opt-level=3 + full DWAR
 test-perf:       ## cargo test --profile release-perf (release-perf profile, panic=unwind forced by cargo for test harness)
 	cargo test --workspace --profile release-perf
 
-# HALF selects one side of the GPU-suite partition scripts/gpu_test_halves.sh
+# HALF selects one side of the GPU-suite partition scripts/suite/gpu_test_classes.sh half
 # computes. The value is checked rather than its origin alone: an empty HALF=
 # on the command line has origin `command line` too, and would otherwise run
 # the whole gate while its final line claimed a half.

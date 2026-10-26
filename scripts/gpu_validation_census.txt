@@ -185,7 +185,7 @@
 # DERIVED ON one complete `make gpu-test` on mlx 0.32.3 / mlx-c 0.7.0, every
 # diagnostic attributed to the test libtest last announced, on a host holding
 # every snapshot the suite resolves by slug, with threadgroup-memory validation
-# split per test (`scripts/gpu_test_threadgroup.sh`); every entry below comes
+# split per test (`scripts/suite/gpu_test_classes.sh threadgroup`); every entry below comes
 # from a test that ran with it off. Totals: 4 conv in
 # `rmlx-mlx`, 18 conv in `rmlx-server`, 4 gemv in `rmlx-models`.
 #

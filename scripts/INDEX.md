@@ -37,8 +37,6 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `eval_lock_stress.sh` | make eval-lock-stress | Drive the evaluation-lock reproducer across fresh processes; a non-zero exit or timeout fails. |
 | `gen_lloyd_codebook.py` | none | Generate Lloyd-Max optimal N(0,1) centroids for TurboQuant codebook. |
 | `gpu_capture.sh` | make profile-gputrace | Capture a Metal GPU trace of a bounded window of steady-state decode, for |
-| `gpu_test_halves.sh` | run_gpu_tests.sh, run_gpu_tests_selftest.sh | Print which half of the GPU suite each classified test is in: codec\|rest, crate, test. |
-| `gpu_test_threadgroup.sh` | run_gpu_tests.sh, run_gpu_tests_selftest.sh | Print which classified GPU tests run with threadgroup-memory validation: on\|off, crate, test. |
 | `gpu_validation_census.txt` | run_gpu_tests.sh, run_gpu_tests_selftest.sh | The Metal shader-validation hits run_gpu_tests.sh accepts, per (kernel, kind, crate, test). |
 | `gputrace_diff.sh` | none | Diff the Metal function sets of two .gputrace bundles, in both directions. |
 | `gputrace_kernels.sh` | gputrace_diff.sh | List the Metal functions a captured window referenced, straight from the bundle; no Xcode. |
@@ -90,7 +88,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 |---|---|---|
 | `check/doc_refs.py` | make check-doc-refs, make check-doc-source-citations, make ci, check/doc_refs_selftest.sh | References into docs/ resolve and no edit re-points one; --source-paths: cited crates/ files exist. |
 | `check/doc_refs_selftest.sh` | make check-doc-refs-selftest, make ci | Recall test for doc_refs.py: synthetic git repos, asserting exit code and reason. |
-| `check/gpu_tests.sh` | make check-gpu-tests-ignored, make check-named-skip-notices, make ci, check/gpu_tests_selftest.sh, check/rust_gates_fixtures.sh, gpu_test_halves.sh, +3 more scripts | CI gate: the classified GPU tests carry #[ignore] and name their stand-downs; one tool lists them. |
+| `check/gpu_tests.sh` | make check-gpu-tests-ignored, make check-named-skip-notices, make ci, check/gpu_tests_selftest.sh, check/rust_gates_fixtures.sh, run_gpu_tests.sh, +2 more scripts | CI gate: the classified GPU tests carry #[ignore] and name their stand-downs; one tool lists them. |
 | `check/gpu_tests_selftest.sh` | make check-named-skip-notices-fixtures, make ci | Recall test for check/gpu_tests.sh skip-notices and list: planted shapes, asserting the reason. |
 | `check/kernel_dispatch.sh` | make check-kernel-dtype-contract, make check-no-kernel-input-eval, make check-no-scalar-f32-leak, make ci, check/rust_gates_fixtures.sh | CI gate: Metal-kernel dispatchers keep inputs lazy, return the caller's dtype, leak no f32 scalar. |
 | `check/rust_gates_fixtures.sh` | make check-eval-lock-fixtures, make check-gpu-tests-ignored-fixtures, make check-kernel-dtype-contract-fixtures, make check-kv-layer-quants-fixtures, make check-no-decode-swallow-fixtures, make check-no-inline-tests-fixtures, make check-no-kernel-input-eval-fixtures, make check-no-scalar-f32-leak-fixtures, make ci | Recall test for the Rust-source gates: planted scan roots from a table, asserting exit and reason. |
@@ -147,7 +145,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `lib/snapshot_sampling.py` | spec_bench_published.sh | Read the sampling defaults a snapshot states, for a run that sends none. |
 | `lib/spec_round_log.py` | lib/binary_identity.py, lib/published_run_log.py, spec_bench.sh | Read a speculative round loop's own numbers back out of an rmlx run log. |
 | `lib/sse_decode_window.py` | spec_bench.sh, spec_bench_published.sh, spec_bench_selftest.sh | Time a streamed chat-completions response over its decode window. |
-| `lib/workspace_members.sh` | check/gpu_tests.sh, gpu_test_halves.sh | The workspace members of a Cargo.toml, parsed and normalised once for the tools that read them. |
+| `lib/workspace_members.sh` | check/gpu_tests.sh, suite/gpu_test_classes.sh | The workspace members of a Cargo.toml, parsed and normalised once for the tools that read them. |
 
 ## scripts/parity/
 
@@ -208,3 +206,9 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `report/scripts_gate_structure.py` | report/scripts_gate.py, report/scripts_gate_content.py | Structural rules of the scripts gate: lib/, modules, shebang, exec bit, orphans, dead paths. |
 | `report/scripts_gate_text.py` | report/scripts_gate_callers.py, report/scripts_gate_content.py, report/scripts_gate_env.py, +3 more scripts | Readers of script text: shell, Python and Makefile source. |
 | `report/scripts_gate_twin.py` | report/scripts_gate.py | The twin rule of the scripts gate: two files of one language that say the same lines. |
+
+## scripts/suite/
+
+| path | caller (derived) | purpose (header line 1) |
+|---|---|---|
+| `suite/gpu_test_classes.sh` | run_gpu_tests.sh, run_gpu_tests_selftest.sh | Print the half (codec\|rest) or threadgroup setting (on\|off) of each classified GPU test. |

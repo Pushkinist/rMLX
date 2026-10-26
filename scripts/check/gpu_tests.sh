@@ -9,9 +9,8 @@
 #   skip-notices  every classified test that announces its own stand-down names itself in the
 #                 notice, and none stands down silently.
 #   list          the compliant set, `<crate><TAB><fn>` per line; with --files a third column
-#                 names the declaring file, which is `scripts/gpu_test_halves.sh`'s and
-#                 `scripts/gpu_test_threadgroup.sh`'s input. `scripts/run_gpu_tests.sh` turns
-#                 the two columns into the tests it runs.
+#                 names the declaring file, which is `scripts/suite/gpu_test_classes.sh`'s input.
+#                 `scripts/run_gpu_tests.sh` turns the two columns into the tests it runs.
 #
 # The population is classified once, by the code below the awk program. `ignored` and `list` are
 # its two ends, and `skip-notices` reads its listing with the declaring file, so the three cannot
@@ -463,9 +462,9 @@
 #         body or attribute it could not parse, an #[ignore] no gate runs; 2 a usage error, or
 #         (skip-notices) the scan cannot be trusted: no classification, no test sources, a
 #         directory or file it could not read
-# Not a mode of: check_gpu_device_census.sh — that gate reads the rmlx binary's own source for
-#                its one Device::Gpu site; this one reads the workspace's test sources for the
-#                tests that reach it
+# Not a mode of: suite/gpu_test_classes.sh — that tool derives each listed test's half and threadgroup
+#                setting from manifests and kernel sources and judges nothing; this one reads only
+#                the test sources and fails `make ci` on a violation
 
 set -euo pipefail
 
