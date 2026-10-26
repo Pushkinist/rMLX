@@ -313,7 +313,8 @@
 #
 #   `bare()` finds the trailing comment with a string-aware scan, so neither a
 #   `//` inside a string literal nor a char literal of any payload form (`b'"'`,
-#   `'\x1b'`, `'\u{FFFD}'`, `'é'`) derails it, and a block comment is read before
+#   `'\x1b'`, `'\u{FFFD}'`, `'é'`) derails it, a non-ASCII lifetime (`<'é, '"'>`)
+#   is no char literal and swallows nothing after it, and a block comment is read before
 #   a `//` or a quote in it is looked at. A raw string that does not close on its
 #   line is carried like a plain one (the `\` in `r"a\"` is no escape). The
 #   remaining known parse hazard is a block comment that spans the lines of an
@@ -590,6 +591,7 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         return r
     }
     function bare(s, q0, c0, want,   i, n, q, d, c, nx, rest, w, ascii, st, out, j, h, e) {
+        ascii = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
         n = length(s)
         q = q0 + 0
         d = c0 + 0
@@ -671,11 +673,12 @@ read -r -d '' AWK_DETECT <<'AWK' || true
                 # index() against a literal ASCII set is locale-independent, and
                 # it is also what stops a lifetime tick with a nearby quote
                 # (`<'a>'x'`) from being stepped as though it were a literal.
-                ascii = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+                # A non-ASCII literal holds no ASCII character, so the `,`, space
+                # or `>` after a non-ASCII lifetime (`<'é, '"'>`) rules the window out.
                 w = index(substr(rest, 1, 5), "'")
-                if (w >= 3 && index(ascii, substr(rest, 1, 1)) == 0 \
-                 && index(substr(rest, 1, w - 1), "\\") == 0) {
-                    i += w
+                if (w >= 3) {
+                    for (j = 1; j < w; j++) if (index(ascii, substr(rest, j, 1))) break
+                    if (j == w) i += w
                 }
                 if (want) out = out blanks(i - st + 1)
                 continue
@@ -684,7 +687,7 @@ read -r -d '' AWK_DETECT <<'AWK' || true
                 s = substr(s, 1, i - 1)
                 break
             }
-            if (want) out = out (q ? " " : c)
+            if (want) out = out (q || index(ascii, c) == 0 ? " " : c)
         }
         bare_q = q
         bare_c = d

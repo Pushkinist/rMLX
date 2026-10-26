@@ -1744,5 +1744,11 @@ st_case bare_keeps_the_text_as_long_across_a_backslash_that_ends_the_line 0 \
 st_case bare_builds_the_code_only_when_asked 0 \
     --is 'let s = "x";|0|0|$' \
     -- bare_probe 'let s = "x"; // c' 0 0 0
+st_case bare_does_not_read_a_non_ascii_lifetime_as_a_char_literal 0 \
+    --is $'type T<\'é> = S<\'é, \'"\'>;|0|0|$' \
+    -- bare_probe $'type T<\'é> = S<\'é, \'"\'>;' 0 0 0
+st_case bare_steps_over_non_ascii_char_literals 0 \
+    --is $'[\'é\',\'"\',\'日\'];|0|0|$' \
+    -- bare_probe $'[\'é\',\'"\',\'日\']; // c' 0 0 0
 
 st_done
