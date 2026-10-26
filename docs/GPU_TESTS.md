@@ -149,28 +149,31 @@ compliant:
   name built by `paste!` or `concat_idents!`, or a `#[test]` on its `fn` line;
 - a `macro_rules!` written on one line whose body declares `#[test]`;
 - an item whose closing brace is never found;
-- an attribute whose closing `]` is never found;
+- an attribute whose closing `]` is never found, and code on the line of an
+  attribute's closing `]` (`#[test] fn x() {}`, or `)] fn x() {`): the item is
+  not followed;
 - a string or block comment still open at the end of a file: the gate lost the
   file at some point and read the tail as text.
 
 Write a generated fn as `fn $name()` on its own line, with its attributes above
-it. End a wrapped attribute on a line whose last significant character is `]`.
+it. An attribute ends at its own `]`, counted over its code across its lines,
+and nothing follows that `]` on its line but a comment.
 
 ### What the scanner cannot see
 
 Each of these passes the gate silently:
 
-- An attribute left open by a block comment, closed by a later line that ends
-  in `]`. The items between are lost with no report.
 - A `<` that is an operator outside every bracket, in an item with an inline
   body (`fn f() where A < B { true }`): the `<` cannot be told from a generic
   bracket without reading the spacing, the item stays open, and the next test is
   read as part of it. No valid Rust writes one outside a macro matcher or macro
   input; macro input reads `U`.
 - A device written inside a string or a comment of a body counts as named by
-  the body, which fails closed. So does a statement attribute that shares its
-  line with its statement (`#[allow(..)] let d = Device::Gpu;`): the line is
-  read as an attribute, and the fn is reported lost (`U`).
+  the body, which fails closed.
+- Valid Rust that rustfmt never writes. A bodiless fn and the trait's `}` on
+  one line (`trait Tr {` then `fn load(&self); }`) is refused as a fn never
+  closed. An item that starts on the line where a multi-line string or block
+  comment closes (`"; const D: Device = Device::Gpu;`) is not read.
 - An unqualified cross-file call through a glob import (`use m::*; helper()`).
 - A helper in a non-scanned source file. The one instance,
   `paro_kernel_registration`, is declared `metal-unscanned`.

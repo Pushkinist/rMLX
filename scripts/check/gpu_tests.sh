@@ -798,10 +798,33 @@ read -r -d '' AWK_DETECT <<'AWK' || true
     # after it was read as text: a refusal, not a clean scan.
     function flush_top() {
         if (top_q || top_c) {
-            printf "U  %s: (a string or block comment is open at the end of the file)\n", top_file
+            printf "U  %s: end-of-file (a string or block comment is open at the end of the file)\n", top_file
         }
         top_q = 0
         top_c = 0
+    }
+
+    # Count `[` and `]` over the code `m` from column `from`, carrying `attr_depth`
+    # across lines. Returns the column of the `]` that closes the attribute, or 0.
+    function attr_scan(m, from,   i, n, c) {
+        n = length(m)
+        for (i = from; i <= n; i++) {
+            c = substr(m, i, 1)
+            if (c == "[") attr_depth++
+            else if (c == "]" && --attr_depth == 0) return i
+        }
+        return 0
+    }
+
+    # Code on the line of an attribute's closing `]` is an item the reader does not
+    # follow (`#[test] fn x() {}`): refused, not skipped.
+    function attr_tail_refuse(m, pos,   t) {
+        if (substr(m, pos + 1) ~ /[^[:space:]]/) {
+            t = $0
+            sub(/^[[:space:]]+/, "", t)
+            printf "U  %s:%d: %s (code after an attribute's closing bracket on its line — parser lost the item)\n",
+                FILENAME, FNR, t
+        }
     }
 
     # New file: reset the per-file parse state and derive this file's module
@@ -825,19 +848,21 @@ read -r -d '' AWK_DETECT <<'AWK' || true
     }
 
     # ── Multi-line attribute continuation ────────────────────────────────
-    # Closed by the line's SIGNIFICANT text ending in `]`, carrying the string
-    # state across the line break. Keying this on the wrapped-`#[cfg(..)]`
-    # shape `)]` alone reads only one of the two ways an attribute wraps: a
-    # wrapped string argument ends `"]`, never `)]`, so such an attribute never
-    # closed and the capture swallowed the rest of the FILE — every later item
-    # unclassified, and a clean OK printed over them. The `)]` arm is kept
-    # ahead of the general one: it needs no string scan, so it still closes a
-    # wrapped list whose last line the scan below would misread.
+    # Closed by the attribute's own `]`, found by counting brackets over the
+    # code of each line and carrying the string and block-comment state across
+    # the line break.
     in_attr {
         attrs = attrs " " $0
-        sig = bare($0, attr_q)
+        bare($0, attr_q, attr_c, 1)
         attr_q = bare_q
-        if ($0 ~ /^[[:space:]]*\)\]/ || sig ~ /\]$/) { in_attr = 0 }
+        attr_c = bare_c
+        attr_end = attr_scan(bare_code, 1)
+        if (attr_end > 0) {
+            in_attr = 0
+            top_q = attr_q
+            top_c = attr_c
+            attr_tail_refuse(bare_code, attr_end)
+        }
         next
     }
     # ── Strings and block comments outside a fn ─────────────────────────
@@ -854,25 +879,27 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         }
         if (top_open) { next }
     }
-    # ── Attribute (any indent) ──────────────────────────────────────────
-    !(in_fn && (body_q || body_c)) && /^[[:space:]]*#\[/ {
+    # ── Attribute (any indent, outside a fn) ────────────────────────────
+    # Only the attribute block that heads the next item is captured. Inside a fn
+    # an attribute line is a line of the signature or the body.
+    !in_fn && /^[[:space:]]*#\[/ {
         attrs = attrs " " $0
         # Count `#[test]`s declared inside a macro body, so the END check can
         # compare them against the test items actually extracted from it.
-        if (in_macro && !in_fn && $0 ~ /#\[(tokio::)?test[](]/) { macro_test_n++ }
-        # Self-contained iff the SIGNIFICANT text closes it. Read from the raw
-        # line, a trailing comment (`#[test] // why`) hides the closing `]` and
-        # latches the capture over the rest of the file — the same fail-open as
-        # the continuation rule above, reached by an easier-to-write shape.
-        if (bare($0) !~ /\]$/) {
-            in_attr = 1
-            top_q = 0
-            top_c = 0
-            attr_q = bare_q
-            attr_file = FILENAME
-            attr_label = $0
-            sub(/^[[:space:]]+/, "", attr_label)
+        if (in_macro && $0 ~ /#\[(tokio::)?test[](]/) { macro_test_n++ }
+        bare($0, 0, 0, 1)
+        attr_q = bare_q
+        attr_c = bare_c
+        attr_depth = 0
+        attr_end = attr_scan(bare_code, index(bare_code, "#["))
+        if (attr_end > 0) {
+            attr_tail_refuse(bare_code, attr_end)
+            next
         }
+        in_attr = 1
+        attr_file = FILENAME
+        attr_label = $0
+        sub(/^[[:space:]]+/, "", attr_label)
         next
     }
     # ── Per-test exemption marker (line-leading, in the attr block) ─────
@@ -1389,8 +1416,9 @@ classify_root() {
     if [ -n "$unreadable" ]; then
         echo "ERROR: this gate could not classify part of a scanned file" >&2
         echo "       (an unreadable macro_rules! body, an item or attribute that never" >&2
-        echo "        closed, or a string or comment open at the end of the file," >&2
-        echo "        ending classification mid-file):" >&2
+        echo "        closed, code after an attribute's closing bracket on its line, or a" >&2
+        echo "        string or comment open at the end of the file, ending" >&2
+        echo "        classification mid-file):" >&2
         printf '%s' "$unreadable" >&2
         echo >&2
         echo "The gate classifies a test-generating macro from its body: it needs an" >&2
@@ -1406,8 +1434,8 @@ classify_root() {
         echo "looks exactly like a compliant one." >&2
         echo >&2
         echo "Write the generated fn as \`fn \$name()\` on its own line with its" >&2
-        echo "attributes above it, close the attribute on a line whose last significant" >&2
-        echo "character is \`]\`, or extend the classifier to read the new shape." >&2
+        echo "attributes above it, put nothing after an attribute's closing \`]\` on its" >&2
+        echo "line, or extend the classifier to read the new shape." >&2
         exit "$FAIL_RC"
     fi
 
