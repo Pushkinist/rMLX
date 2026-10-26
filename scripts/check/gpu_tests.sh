@@ -547,6 +547,8 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         FN_HEAD = "^[[:space:]]*(pub([[:space:]]*\\([^)]*\\))?[[:space:]]+)?((const|async|unsafe)[[:space:]]+)*(extern[[:space:]]+(\"[^\"]*\"[[:space:]]+)?)?fn[[:space:]]+"
         FN_NAME_START = "([$_]|[^[:space:][:punct:]])"
         FN_MATCHER = "\\$[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:"
+        QUALIFIER = "(pub([[:space:]]*\\([^)]*\\))?|const|async|unsafe|extern([[:space:]]+\"[^\"]*\")?)"
+        QUALIFIER_LINE = "^[[:space:]]*" QUALIFIER "([[:space:]]+" QUALIFIER ")*[[:space:]]*$"
     }
 
     # The name at the start of s: cut at the first ASCII character that cannot be in
@@ -741,8 +743,9 @@ read -r -d '' AWK_DETECT <<'AWK' || true
     # One reader of a fn item's signature, from its header line on, over the line's
     # code (`bare_code`: comments, strings and char literals blanked). It keeps the
     # depths of `(`, `[`, `{` and the generic `<` across the signature's lines, and
-    # leaves, for the line it read, the number of `{` it opened (`sig_opened`) and
-    # its last significant character (`sig_last`). What a comment is, `bare()`
+    # leaves, for the line it read, the number of `{` it opened (`sig_opened`), its
+    # last significant character (`sig_last`) and whether a `)`, `]` or `}` met
+    # no opener of its own kind (`sig_stray`). What a comment is, `bare()`
     # decides: a caller carries the depth of an open `/* ... */` from line to line
     # in `sig_bc` and the state of an open string in `sig_q`.
     #
@@ -755,6 +758,7 @@ read -r -d '' AWK_DETECT <<'AWK' || true
     function sig_scan(m,   i, n, c, p) {
         n = length(m)
         sig_opened = 0
+        sig_stray = 0
         sig_last = ""
         for (i = 1; i <= n; i++) {
             c = substr(m, i, 1)
@@ -764,11 +768,11 @@ read -r -d '' AWK_DETECT <<'AWK' || true
                 if (p != "-" && p != "=" && sig_ang > 0) sig_ang--
             }
             else if (c == "(") sig_par++
-            else if (c == ")") { if (sig_par > 0) sig_par-- }
+            else if (c == ")") { if (sig_par > 0) sig_par--; else sig_stray = 1 }
             else if (c == "[") sig_sq++
-            else if (c == "]") { if (sig_sq > 0) sig_sq-- }
+            else if (c == "]") { if (sig_sq > 0) sig_sq--; else sig_stray = 1 }
             else if (c == "{") { sig_br++; sig_opened++ }
-            else if (c == "}") { if (sig_br > 0) sig_br-- }
+            else if (c == "}") { if (sig_br > 0) sig_br--; else sig_stray = 1 }
             if (c !~ /[[:space:]]/) sig_last = c
         }
     }
@@ -784,6 +788,16 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         if (sig_ang > 0) return "more"
         if (sig_opened > 0 && sig_last == "}") return "done"
         return "more"
+    }
+
+    # A signature that closes a bracket it never opened was not a signature: the
+    # header line was the middle of something else (a macro matcher), and the
+    # braces after it are not this fn's.
+    function sig_stray_refuse(   l) {
+        l = $0
+        sub(/^[[:space:]]+/, "", l)
+        printf "U  %s:%d: %s (a signature closes a bracket it never opened — parser lost the item)\n",
+            FILENAME, FNR, l
     }
 
     # Tear down an attribute capture whose closing `]` was never found. The
@@ -835,7 +849,7 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         t = substr(m, pos + 1)
         sub(/^[[:space:]]+/, "", t)
         if (t == "") return
-        if ((t ~ /(^|[^A-Za-z0-9_])fn[[:space:]]/ && t !~ (FN_HEAD FN_MATCHER)) \
+        if ((t ~ /(^|[^A-Za-z0-9_])fn([[:space:]]|$)/ && t !~ (FN_HEAD FN_MATCHER)) \
             || index(t, "#[") || index(t, "macro_rules!") || index(t, "Device::Gpu")) {
             l = $0
             sub(/^[[:space:]]+/, "", l)
@@ -1062,6 +1076,7 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         sig_bc = bare_c
         sig_q = bare_q
         sig_scan(bare_code)
+        if (sig_stray) sig_stray_refuse()
         sig_state = sig_verdict()
         if (sig_state == "done" || sig_state == "decl") {
             in_fn = 0
@@ -1089,6 +1104,7 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         sig_bc = bare_c
         sig_q = bare_q
         sig_scan(bare_code)
+        if (sig_stray) sig_stray_refuse()
         sig_state = sig_verdict()
         if (sig_state == "body") {
             in_sig = 0
@@ -1140,6 +1156,14 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         }
         body_of[curid] = body_of[curid] " " line
         next
+    }
+    # Qualifiers alone on a line while an attribute block is pending: the fn that
+    # follows on the next line would be read without its attributes.
+    attrs != "" && $0 ~ /^[[:space:]]*(pub|const|async|unsafe|extern)/ && bare($0) ~ QUALIFIER_LINE {
+        l = $0
+        sub(/^[[:space:]]+/, "", l)
+        printf "U  %s:%d: %s (a qualifier alone on a line after an attribute — parser lost the item)\n",
+            FILENAME, FNR, l
     }
     # Any other line drops a dangling attribute block.
     /^[[:space:]]*[^[:space:]]/ { attrs = "" }
@@ -1434,8 +1458,10 @@ classify_root() {
     if [ -n "$unreadable" ]; then
         echo "ERROR: this gate could not classify part of a scanned file" >&2
         echo "       (an unreadable macro_rules! body, an item or attribute that never" >&2
-        echo "        closed, code after an attribute's closing bracket on its line, or a" >&2
-        echo "        string or comment open at the end of the file, ending" >&2
+        echo "        closed, code after an attribute's closing bracket on its line, a" >&2
+        echo "        qualifier alone on a line after an attribute, a signature that" >&2
+        echo "        closes a bracket it never opened, or a string or comment open at" >&2
+        echo "        the end of the file, ending" >&2
         echo "        classification mid-file):" >&2
         printf '%s' "$unreadable" >&2
         echo >&2

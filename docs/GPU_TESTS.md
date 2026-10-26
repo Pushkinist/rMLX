@@ -23,10 +23,6 @@ cargo test --no-run -p rmlx-kv-quant --tests
 rmlx claim run -- cargo test -p rmlx-kv-quant --lib -- --ignored <filter> --test-threads=1
 ```
 
-Building under the claim would hold it for the whole compile, blocking any
-other GPU user for no GPU work at all — so build first, then run the
-already-built binary under `rmlx claim run`.
-
 `cargo test` runs a binary's tests on parallel threads. A shared Metal context
 driven from several of them aborts the whole process:
 
@@ -56,8 +52,7 @@ same way and print the classifier's reason.
 A test reaches `Device::Gpu` when the name appears in its body, or in a
 module-scope `const … = Device::Gpu`, or in a helper it calls. An unqualified
 call binds to a helper in the same file. A `module::helper(..)` call binds to
-the scanned file of that module name in the same crate. The gate keys on this
-shape and never on the ignore reason's wording, with one exception below.
+the scanned file of that module name in the same crate.
 
 ### Exempting a device-as-value test
 
@@ -96,8 +91,7 @@ one of three dispositions is recorded:
 3. It is ignored for a reason: write the reason.
 
 A bare `#[ignore]` on a test that reads no variable, or reads one only through
-another helper, is outside this check. The fixtures `ignore_bare_env_gated` and
-`ignore_bare_env_gated_dispositioned` pin both directions.
+another helper, is outside this check.
 
 ### Declaring a Metal route the scanner cannot follow
 
@@ -147,9 +141,14 @@ compliant:
 - a `macro_rules!` written on one line whose body declares `#[test]`;
 - an item whose closing brace is never found;
 - an attribute whose closing `]` is never found, and a tail after its closing
-  `]` on its line that holds an fn anywhere (`#[test] fn x() {}`,
-  `#[cfg(test)] impl S { fn h() {} }`), a second attribute, `macro_rules!` or
-  `Device::Gpu`: the item is not followed;
+  `]` on its line that holds an fn anywhere (`#[test] fn x() {}`, an `fn` ending
+  the line, `#[cfg(test)] impl S { fn h() {} }`), a second attribute,
+  `macro_rules!` or `Device::Gpu`: the item is not followed;
+- qualifiers (`pub(…)`, `const`, `async`, `unsafe`, `extern "C"`) alone on a
+  line while an attribute block is pending: the fn under them would be read
+  without its attributes;
+- a signature that closes a bracket it never opened, such as the `) => {` under
+  a macro matcher line headed by `fn`;
 - a string or block comment still open at the end of a file: the gate lost the
   file at some point and read the tail as text.
 

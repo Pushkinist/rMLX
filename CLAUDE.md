@@ -296,7 +296,7 @@ Hard rules:
   its `macro_rules!` body (one body governs every cell it emits), and a body the
   scanner cannot read back — an assembled fn name, a whole macro on one line, an
   item whose brace never closes, an attribute whose bracket never closes, an item
-  after an attribute's closing bracket on its line, a string or block comment still open at the end of a file — is a
+  after an attribute's closing bracket on its line, a qualifier alone on a line after an attribute, a signature that closes a bracket it never opened, a string or block comment still open at the end of a file — is a
   hard failure rather than a clean scan;
   those cells are deliberately excluded from `check/gpu_tests.sh list` / `make gpu-test`, which
   every run prints. A proc-macro-generated test, and a `macro_rules!` with a
@@ -306,7 +306,7 @@ Hard rules:
   is fatal on the same terms: it runs under no gate and has no reason for that
   check to read.
   `make check-gpu-tests-ignored-fixtures` (in `make ci` and hosted CI: the
-  `gpu_tests_ignored` mode of `scripts/check/rust_gates_fixtures.sh`, 194 cases, run
+  `gpu_tests_ignored` mode of `scripts/check/rust_gates_fixtures.sh`, 203 cases, run
   once under each awk on the machine) pins the gate's recall in both directions,
   asserting each case's failure *reason* and not just its exit code. A directory or
   file the scan cannot read is a refusal that names it, never a tree with no
