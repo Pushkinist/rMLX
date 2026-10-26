@@ -994,7 +994,9 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         }
     }
     # ── Close of the captured fn: `}` at the fn keyword indent ──────────
-    in_fn && bare($0) == close_marker {
+    # The cut line is a prefix of the line, so only a line that starts with the marker
+    # is worth cutting; every other body line skips the scan.
+    in_fn && substr($0, 1, length(close_marker)) == close_marker && bare($0) == close_marker {
         in_fn = 0
         curid = 0
         attrs = ""
