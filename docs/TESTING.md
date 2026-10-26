@@ -117,11 +117,12 @@ it, only snapshot-gated tests check. Deleting one of those calls leaves
 
 The test targets (`CLAUDE.md`) are Gemma4 (`mlx-community__gemma-4-e4b-it-mxfp8`,
 `mlx-community__gemma-4-e2b-it-mxfp8`), `mlx-community__Qwen3.8-27B-4bit` and
-`prism-ml__Ternary-Bonsai-2-27B-mlx-2bit`. A checkpoint that left the targets
-keeps every cell, fixture and variable that binds it. Those cells are not part
-of the routine runs. A host that does not hold the snapshot gets a named
-`SKIP <test>: <why>`, the GPU run ends `INCOMPLETE`, and the pull request lists
-the stand-downs. No skip list exists.
+`prism-ml__Ternary-Bonsai-2-27B-mlx-2bit`. Qwen3.6 and the first-generation
+Bonsai packs left the targets and keep every cell, fixture and variable that
+binds them. medgemma, Laguna and DR-Venus have no test bound to their snapshots.
+Those cells are not part of the routine runs. A host that does not hold the
+snapshot gets a named `SKIP <test>: <why>`, the GPU run ends `INCOMPLETE`, and
+the pull request lists the stand-downs. No skip list exists.
 
 ### Kept cells
 

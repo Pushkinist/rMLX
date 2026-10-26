@@ -132,9 +132,9 @@ must serve end-to-end at every change:
 
 Other Open Models snapshots (`z-lab__Qwen3.6-27B-PARO`, `medgemma`, the `jina`
 embedding/reranker models, `ReaderLM-v2`, …) are in scope as feature
-coverage grows. Qwen3.6, medgemma and every Bonsai without "2" keep their
-cells and are not test targets; see `docs/TESTING.md` § "Test targets, kept
-cells and gaps".
+coverage grows. Qwen3.6 and every Bonsai without "2" keep their cells and are
+not test targets; medgemma, Laguna and DR-Venus have no test bound to their
+snapshots; see `docs/TESTING.md` § "Test targets, kept cells and gaps".
 
 ## Key external repos (GitHub)
 
