@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use rmlx_core::error::{Error, Result};
-use rmlx_loader::{load_config, load_shard_index, ShardSet};
+use rmlx_loader::{load_config, load_shard_index, release_mapped, ShardSet};
 use rmlx_mlx::{argmax, max_axis, Array, Device, Dtype};
 use tracing::{debug, info, warn};
 
@@ -502,7 +502,9 @@ pub fn load_from_path_paro(model_dir: &Path) -> Result<Gemma4Text> {
         for (_, handle) in shards.iter() {
             let st = handle.safetensors()?;
             if let Ok(t) = st.tensor(name) {
-                return Ok((t.data().to_vec(), t.shape().to_vec()));
+                let bytes = t.data().to_vec();
+                release_mapped(t.data());
+                return Ok((bytes, t.shape().to_vec()));
             }
         }
         Err(Error::Loader(format!(

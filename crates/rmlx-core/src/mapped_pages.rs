@@ -1,20 +1,21 @@
-// unsafe_code: mmap(MAP_FIXED) over a read-only shared file mapping, to drop its resident pages in place
+// unsafe_code: msync(MS_INVALIDATE) over a read-only shared file mapping, and mincore to observe it
 #![allow(unsafe_code)]
 
-//! Releasing the resident pages of a read-only shared file mapping.
+//! Dropping the pages of a read-only shared file mapping once its bytes are
+//! no longer needed.
 //!
-//! macOS keeps every touched page of a file mapping resident in the process
-//! until the range is unmapped: `madvise` `MADV_DONTNEED` and `MADV_FREE` leave
-//! it resident, and `msync(MS_INVALIDATE)` releases it but also evicts the file
-//! from the page cache. Mapping the same file range over itself with
-//! `MAP_FIXED` drops the process's pages and leaves the page cache alone, so a
-//! later read faults the same bytes back in from the cache.
+//! On macOS `madvise` `MADV_DONTNEED` and `MADV_FREE` do not release a touched
+//! page of a file mapping. Unmapping it, or mapping it again with `MAP_FIXED`,
+//! releases it from the process but leaves it in the page cache, which the
+//! kernel did not reclaim under a load burst: it compressed the Metal copies
+//! instead. `msync(MS_INVALIDATE)` releases it from both.
 
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 use std::fs::File;
 use std::io;
 use std::ops::Range;
 use std::os::fd::AsRawFd;
+use std::path::Path;
 
 /// The VM page size in bytes, or `None` when the system does not report a
 /// power of two.
@@ -32,45 +33,68 @@ pub fn inner_page_range(start: usize, end: usize, page: usize) -> Option<Range<u
     (first < last).then_some(first..last)
 }
 
-/// Maps `file` from `offset` over `addr..addr + len`, read-only and shared,
-/// replacing the mapping there. The pages the process held for that range are
-/// released; the next read re-faults them from the page cache.
+/// Drops the pages of `addr..addr + len` from the process and from the page
+/// cache. The range stays mapped, and the next read faults the same file
+/// bytes back in from disk.
 ///
 /// # Safety
 ///
-/// `addr` and `len` are multiples of the page size, and `addr..addr + len`
-/// lies inside a live `PROT_READ`, `MAP_SHARED` mapping of `file` whose byte at
-/// `addr` is the file's byte at `offset`, which stays mapped for the call.
-pub unsafe fn remap_in_place(addr: usize, len: usize, file: &File, offset: u64) -> io::Result<()> {
-    let offset = libc::off_t::try_from(offset)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "file offset exceeds off_t"))?;
-    // SAFETY: by the contract the new mapping covers only pages of the old one,
-    // with the same file, offset, length, protection and sharing, so every byte
-    // of the range reads the same before and after and a `&[u8]` borrowing it
-    // stays valid. Pages outside the range are not touched, so a concurrent
-    // reader of other bytes of the mapping is unaffected.
-    let placed = unsafe {
+/// `addr` is page-aligned and `addr..addr + len` lies inside a live
+/// `PROT_READ`, `MAP_SHARED` file mapping. Never call it on anonymous or
+/// private memory: `MS_INVALIDATE` there is unmeasured and may discard data.
+pub unsafe fn invalidate_file_pages(addr: usize, len: usize) -> io::Result<()> {
+    // SAFETY: by the contract the range is a read-only shared file mapping, so
+    // its pages are clean and invalidating them loses nothing. The mapping
+    // stays in place with no holes, so a `&[u8]` into it stays valid and reads
+    // the same file bytes.
+    let rc = unsafe { libc::msync(addr as *mut c_void, len, libc::MS_INVALIDATE) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Which pages of the file at `path` are in the page cache, one entry per
+/// page, read through a fresh mapping. Lets a test observe what
+/// [`invalidate_file_pages`] evicts.
+pub fn file_pages_in_cache(path: &Path) -> io::Result<Vec<bool>> {
+    let file = File::open(path)?;
+    let len = usize::try_from(file.metadata()?.len()).map_err(io::Error::other)?;
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let page = page_size().ok_or_else(|| io::Error::other("no power-of-two page size"))?;
+    // SAFETY: a new read-only shared mapping of a file this call opened.
+    let addr = unsafe {
         libc::mmap(
-            addr as *mut c_void,
+            std::ptr::null_mut(),
             len,
             libc::PROT_READ,
-            libc::MAP_SHARED | libc::MAP_FIXED,
+            libc::MAP_SHARED,
             file.as_raw_fd(),
-            offset,
+            0,
         )
     };
-    if placed == libc::MAP_FAILED {
+    if addr == libc::MAP_FAILED {
         return Err(io::Error::last_os_error());
     }
-    if placed as usize != addr {
-        // SAFETY: `placed` is a mapping of `len` bytes this call created and
-        // nothing borrows.
-        unsafe { libc::munmap(placed, len) };
-        return Err(io::Error::other(format!(
-            "mmap placed the range at {placed:p}, not at {addr:#x}"
-        )));
-    }
-    Ok(())
+    let mut vec: Vec<c_char> = vec![0; len.div_ceil(page)];
+    // SAFETY: `addr..addr + len` is the mapping created above, and `vec` holds
+    // one byte for each of its pages.
+    let rc = unsafe { libc::mincore(addr, len, vec.as_mut_ptr()) };
+    let in_cache = if rc == 0 {
+        Ok(vec
+            .iter()
+            .map(|&b| i32::from(b) & libc::MINCORE_INCORE != 0)
+            .collect())
+    } else {
+        Err(io::Error::last_os_error())
+    };
+    // SAFETY: `addr` is the mapping of `len` bytes created above; nothing
+    // borrows it.
+    unsafe { libc::munmap(addr, len) };
+    in_cache
 }
 
 #[cfg(test)]

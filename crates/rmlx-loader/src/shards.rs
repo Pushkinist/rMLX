@@ -3,20 +3,19 @@
 //! `ShardSet` (collection of all open shard handles for a model).
 
 // unsafe_code: safetensors mmap view — unsafe { Mmap::map(&file) } for zero-copy tensor loading,
-// and the in-place remap that releases a copied tensor's pages
+// and the page invalidation that releases a copied tensor's pages
 #![allow(unsafe_code)]
 
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde_json::Value;
 use tracing::{error, warn};
 
-use rmlx_core::mapped_pages::{inner_page_range, page_size, remap_in_place};
+use rmlx_core::mapped_pages::{inner_page_range, invalidate_file_pages, page_size};
 use rmlx_core::{Error, Result};
 
 // Bounded against malformed/adversarial model.safetensors.index.json.
@@ -55,7 +54,8 @@ pub(crate) fn is_plain_file_name(name: &str) -> bool {
 /// The file is mapped lazily — OS pages are faulted in only when accessed.
 /// No full file copy is made. The mapping is dropped automatically when this
 /// handle is dropped. While the handle lives, [`release_mapped`] can drop the
-/// resident pages of a tensor already copied out of it.
+/// pages of a tensor already copied out of it from the process and from the
+/// page cache.
 #[allow(
     clippy::exhaustive_structs,
     reason = "internal RAII type — fields are the complete mmap-backed shard-handle contract; adding a field requires updating ShardHandle::open and all shard consumers"
@@ -67,8 +67,8 @@ pub struct ShardHandle {
     pub abs_path: PathBuf,
     // SAFETY invariant: `mmap` borrows from the underlying file for the
     // lifetime of this handle. We open the file read-only and never mutate
-    // the mapped region; `release_mapped` only maps the same file range over
-    // a sub-range of it, and the whole-range `munmap` on drop covers those.
+    // the mapped region; `release_mapped` only invalidates whole pages of it,
+    // which leaves them mapped to the same file bytes.
     // Concurrent writes to the file from another process would be UB, but
     // model weights on disk are never modified while the server is running.
     mmap: memmap2::Mmap,
@@ -98,13 +98,14 @@ impl ShardHandle {
             .map_err(|e| Error::Loader(format!("mmap failed for {}: {e}", abs_path.display())))?;
 
         if !mmap.is_empty() {
-            live_mappings().insert(
+            let prev = live_mappings().insert(
                 mmap.as_ptr() as usize,
                 LiveMapping {
                     len: mmap.len(),
-                    file,
+                    warned: false,
                 },
             );
+            debug_assert!(prev.is_none(), "shard mapping registered twice");
         }
 
         Ok(ShardHandle {
@@ -137,7 +138,8 @@ impl ShardHandle {
 impl Drop for ShardHandle {
     fn drop(&mut self) {
         // Deregister before the fields drop and `munmap` runs, under the lock a
-        // release holds, so no release can remap a range that is being unmapped.
+        // release holds, so no release can invalidate a range that is being
+        // unmapped.
         if !self.mmap.is_empty() {
             live_mappings().remove(&(self.mmap.as_ptr() as usize));
         }
@@ -146,32 +148,38 @@ impl Drop for ShardHandle {
 
 // ── release_mapped ───────────────────────────────────────────────────────────
 
-/// A live shard mapping: `len` bytes of `file` from offset 0. The entry keeps
-/// the file open for as long as its handle is registered.
+/// A live shard mapping of `len` bytes. `warned` is set after its first failed
+/// release, so a failure that repeats for every tensor warns once per shard.
 struct LiveMapping {
     len: usize,
-    file: File,
+    warned: bool,
 }
 
 /// Every live [`ShardHandle`] mapping, by start address.
 static LIVE_MAPPINGS: Mutex<BTreeMap<usize, LiveMapping>> = Mutex::new(BTreeMap::new());
 
-/// Set after the first failed release, so a failure that repeats for every
-/// tensor warns once.
-static RELEASE_FAILED: AtomicBool = AtomicBool::new(false);
-
 fn live_mappings() -> MutexGuard<'static, BTreeMap<usize, LiveMapping>> {
     LIVE_MAPPINGS.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Releases the resident pages of `bytes` once they have been copied out of a
-/// shard mapping, and returns how many bytes were released.
+/// The start address and length of every registered shard mapping.
+#[cfg(test)]
+fn registered_mappings() -> Vec<(usize, usize)> {
+    live_mappings()
+        .iter()
+        .map(|(&base, mapping)| (base, mapping.len))
+        .collect()
+}
+
+/// Drops the pages of `bytes` from the process and from the page cache once
+/// they have been copied out of a shard mapping, and returns how many bytes
+/// were released.
 ///
 /// Only the whole pages inside `bytes` are released, so neighbouring tensors
 /// keep theirs. The range stays mapped to the same file bytes: `bytes`, and
-/// any other view of the range, still read the same values, faulted back in
-/// from the page cache. Returns 0 when `bytes` lies in no live shard mapping
-/// or holds no whole page. A failed release is logged and returns 0.
+/// any other view of the range, still read the same values, read back in
+/// from disk. Returns 0 when `bytes` lies in no live shard mapping or holds
+/// no whole page. A failed release is logged once per shard and returns 0.
 pub fn release_mapped(bytes: &[u8]) -> usize {
     let Some(page) = page_size() else {
         return 0;
@@ -181,32 +189,24 @@ pub fn release_mapped(bytes: &[u8]) -> usize {
     let Some(pages) = inner_page_range(start, end, page) else {
         return 0;
     };
-    let mappings = live_mappings();
-    let Some((&base, mapping)) = mappings.range(..=start).next_back() else {
+    let mut mappings = live_mappings();
+    let Some((&base, mapping)) = mappings.range_mut(..=start).next_back() else {
         return 0;
     };
     if end > base + mapping.len {
         return 0;
     }
-    // SAFETY: `pages` is page-aligned and lies inside `bytes`, which lies
-    // inside the mapping registered at `base`. `Mmap::map` maps the whole file
-    // read-only and shared from offset 0, so the byte at `pages.start` is file
-    // byte `pages.start - base`. The lock is held for the call and
-    // `ShardHandle::drop` deregisters under it before unmapping, so the mapping
-    // is live. Only pages inside the copied tensor are replaced, so a read of
-    // another tensor of the shard is unaffected.
-    let released = unsafe {
-        remap_in_place(
-            pages.start,
-            pages.len(),
-            &mapping.file,
-            (pages.start - base) as u64,
-        )
-    };
+    // SAFETY: the registry exists to refuse a slice outside a shard mapping:
+    // `pages` is page-aligned and lies inside `bytes`, which lies inside the
+    // mapping registered at `base`, a `PROT_READ`, `MAP_SHARED` file mapping
+    // made by `Mmap::map`. The lock is held for the call and
+    // `ShardHandle::drop` deregisters under it before unmapping, so the
+    // mapping is live.
+    let released = unsafe { invalidate_file_pages(pages.start, pages.len()) };
     match released {
         Ok(()) => pages.len(),
         Err(e) => {
-            if !RELEASE_FAILED.swap(true, Ordering::Relaxed) {
+            if !std::mem::replace(&mut mapping.warned, true) {
                 warn!(
                     error = %e,
                     bytes = pages.len(),

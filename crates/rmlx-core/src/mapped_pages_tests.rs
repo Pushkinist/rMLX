@@ -47,3 +47,23 @@ fn inner_page_range_is_none_for_a_zero_page() {
 fn inner_page_range_is_none_when_rounding_up_overflows() {
     assert_eq!(inner_page_range(usize::MAX - 1, usize::MAX, PAGE), None);
 }
+
+#[test]
+fn file_pages_in_cache_has_one_entry_per_page_of_a_written_file() {
+    let page = page_size().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pages.bin");
+    std::fs::write(&path, vec![7u8; 3 * page + 1]).unwrap();
+    File::open(&path).unwrap().sync_all().unwrap();
+    let cached = file_pages_in_cache(&path).unwrap();
+    assert_eq!(cached.len(), 4);
+    assert!(cached.iter().all(|&c| c));
+}
+
+#[test]
+fn file_pages_in_cache_is_empty_for_an_empty_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("empty.bin");
+    std::fs::write(&path, []).unwrap();
+    assert_eq!(file_pages_in_cache(&path).unwrap(), Vec::<bool>::new());
+}

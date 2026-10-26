@@ -1,4 +1,5 @@
 use super::*;
+use rmlx_core::mapped_pages::file_pages_in_cache;
 use serde_json::json;
 
 fn make_index_json(weight_map: &[(&str, &str)]) -> String {
@@ -304,7 +305,8 @@ fn pattern(len: usize, seed: usize) -> Vec<u8> {
     (0..len).map(|i| ((i * 31 + seed) % 251) as u8).collect()
 }
 
-/// A one-shard snapshot holding `tensors` as `U8` vectors.
+/// A one-shard snapshot holding `tensors` as `U8` vectors, flushed so its
+/// page-cache pages are clean.
 fn write_u8_snapshot(dir: &Path, tensors: &[(&str, &[u8])]) {
     let views: Vec<(&str, safetensors::tensor::TensorView<'_>)> = tensors
         .iter()
@@ -318,7 +320,9 @@ fn write_u8_snapshot(dir: &Path, tensors: &[(&str, &[u8])]) {
             (name, view)
         })
         .collect();
-    safetensors::serialize_to_file(views, None, &dir.join(SINGLE_SHARD)).unwrap();
+    let path = dir.join(SINGLE_SHARD);
+    safetensors::serialize_to_file(views, None, &path).unwrap();
+    File::open(&path).unwrap().sync_all().unwrap();
 }
 
 #[test]
@@ -379,36 +383,106 @@ fn release_mapped_twice_rereads_the_same_bytes() {
     assert_eq!(view.bytes, big.as_slice());
 }
 
+/// Writes `data` to `path` and flushes it, so its page-cache pages are clean.
+fn write_clean(path: &Path, data: &[u8]) {
+    std::fs::write(path, data).unwrap();
+    File::open(path).unwrap().sync_all().unwrap();
+}
+
 #[test]
 fn release_mapped_ignores_bytes_outside_a_shard_mapping() {
     let page = page_size().unwrap();
     let heap = pattern(4 * page, 9);
     assert_eq!(release_mapped(&heap), 0);
     assert_eq!(heap, pattern(4 * page, 9));
+
+    let dir = tempfile::tempdir().unwrap();
+    write_u8_snapshot(dir.path(), &[("w", &pattern(4 * page, 10))]);
+    let idx = load_shard_index(dir.path()).unwrap();
+    let shards = ShardSet::open(dir.path(), &idx).unwrap();
+    let shard_base = shards.get(SINGLE_SHARD).unwrap().as_bytes().as_ptr() as usize;
+
+    let other_path = dir.path().join("other.bin");
+    let other_data = pattern(8 * page, 11);
+    write_clean(&other_path, &other_data);
+    // The lookup reaches the length guard only when a registered mapping
+    // starts below the slice, so map until one lands above the shard.
+    let mut below_the_shard = Vec::new();
+    let other = loop {
+        // SAFETY: the file is private to this test and not modified while mapped.
+        let mapping = unsafe { memmap2::Mmap::map(&File::open(&other_path).unwrap()) }.unwrap();
+        if mapping.as_ptr() as usize > shard_base {
+            break mapping;
+        }
+        assert!(
+            below_the_shard.len() < 64,
+            "every mapping landed below the shard"
+        );
+        below_the_shard.push(mapping);
+    };
+    let other_start = other.as_ptr() as usize;
+    assert_eq!(&other[..], other_data.as_slice());
+    assert!(registered_mappings()
+        .iter()
+        .any(|&(base, len)| base == shard_base && base + len <= other_start));
+    println!(
+        "shard mapping at {shard_base:#x}, unregistered mapping at {other_start:#x} after {} retries",
+        below_the_shard.len()
+    );
+
+    assert_eq!(release_mapped(&other), 0);
+    let cached = file_pages_in_cache(&other_path).unwrap();
+    assert!(
+        cached.iter().all(|&c| c),
+        "{} of {} pages of the unregistered file left the page cache",
+        cached.iter().filter(|&&c| !c).count(),
+        cached.len()
+    );
+    assert_eq!(&other[..], other_data.as_slice());
 }
 
 #[test]
-fn release_mapped_drops_the_resident_pages() {
+fn release_mapped_evicts_the_pages_from_the_page_cache() {
     const LEN: usize = 64 << 20;
-    let data = pattern(LEN, 5);
+    let page = page_size().unwrap();
     let dir = tempfile::tempdir().unwrap();
-    write_u8_snapshot(dir.path(), &[("w", &data)]);
-    drop(data);
+    write_u8_snapshot(dir.path(), &[("w", &pattern(LEN, 5))]);
+    let path = dir.path().join(SINGLE_SHARD);
     let idx = load_shard_index(dir.path()).unwrap();
     let shards = ShardSet::open(dir.path(), &idx).unwrap();
+    let base = shards.get(SINGLE_SHARD).unwrap().as_bytes().as_ptr() as usize;
     let view = crate::tensors::view(&shards, &idx, "w").unwrap();
-    let sum: u64 = view.bytes.iter().map(|&b| u64::from(b)).sum();
-    std::hint::black_box(sum);
+    assert_eq!(view.bytes, pattern(LEN, 5).as_slice());
 
-    let touched = rmlx_core::mach_mem::read_proc_mem().unwrap().rss_bytes;
+    let start = view.bytes.as_ptr() as usize;
+    let pages = inner_page_range(start, start + LEN, page).unwrap();
+    let file_pages = (pages.start - base) / page..(pages.end - base) / page;
+    let cached = file_pages_in_cache(&path).unwrap();
+    assert!(
+        cached[file_pages.clone()].iter().all(|&c| c),
+        "the tensor's pages are not in the page cache before the release"
+    );
+
+    let touched = rmlx_core::mach_mem::read_proc_mem().unwrap().external_bytes;
     let released = release_mapped(view.bytes);
-    let after = rmlx_core::mach_mem::read_proc_mem().unwrap().rss_bytes;
+    let after = rmlx_core::mach_mem::read_proc_mem().unwrap().external_bytes;
+    assert_eq!(released, pages.len());
 
-    assert!(released > LEN - 2 * page_size().unwrap());
+    let cached = file_pages_in_cache(&path).unwrap();
+    let still_cached = cached[file_pages.clone()].iter().filter(|&&c| c).count();
+    assert_eq!(
+        still_cached,
+        0,
+        "{still_cached} of {} released pages are still in the page cache",
+        file_pages.len()
+    );
     let dropped = touched.saturating_sub(after);
     assert!(
         dropped >= (LEN as u64) * 3 / 4,
-        "RSS fell by {dropped} bytes after releasing {released}"
+        "file-backed memory fell by {dropped} bytes after releasing {released}"
     );
+
     assert_eq!(view.bytes, pattern(LEN, 5).as_slice());
+    let again = crate::tensors::view(&shards, &idx, "w").unwrap();
+    assert_eq!(again.bytes, pattern(LEN, 5).as_slice());
 }
