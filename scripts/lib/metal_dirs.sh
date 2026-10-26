@@ -1,10 +1,8 @@
-#!/usr/bin/env bash
 # The directories holding gated .metal kernels; sourced by the metal gates.
 #
-# Sourced by `check_metal_compiles.sh` and `check_metal_format.sh`. Single-sourced
-# on purpose: two copies held in step by a comment is how a fourth crate gets
-# added to one gate and forgotten by the other, which silently halves the
-# coverage while both jobs stay green.
+# Sourced, not executed. Single-sourced on purpose: copies held in step by a
+# comment is how a fourth crate gets added to one gate and forgotten by the
+# others, which silently halves the coverage while every job stays green.
 #
 # Scope is the DIRECTORY, not the crate: a `.metal` file is gated by where it
 # lives, wherever its Rust dispatcher sits. A kernel inside a gated crate but

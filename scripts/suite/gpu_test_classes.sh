@@ -68,7 +68,7 @@
 #   rMLX's own `.metal` kernels, the ones this repo can get wrong in threadgroup memory, keep it.
 #
 #   A DISPATCHER is a source file that embeds, with `include_str!`, a `.metal` file under a
-#   directory `scripts/metal_dirs.sh` names. Its ENTRY NAMES are the names of the fns a non-test
+#   directory `scripts/lib/metal_dirs.sh` names. Its ENTRY NAMES are the names of the fns a non-test
 #   dispatcher defines. A classified GPU test runs with threadgroup validation `on` if and only if
 #     * its declaring file is itself a dispatcher, or
 #     * its body, or the body of a fn in the same file it calls (followed transitively, by name),
@@ -277,11 +277,11 @@ threadgroup_setup() {
     METAL_DIRS=()
     local scripts_dir="${REPO_ROOT}/scripts"
     REPO_ROOT="${ROOT}"
-    # shellcheck source=../metal_dirs.sh
-    . "${scripts_dir}/metal_dirs.sh"
+    # shellcheck source=../lib/metal_dirs.sh
+    . "${scripts_dir}/lib/metal_dirs.sh"
     REPO_ROOT="$(cd "${scripts_dir}/.." && pwd)"
     if [ ${#METAL_DIRS[@]} -eq 0 ]; then
-        echo "ERROR: scripts/metal_dirs.sh names no gated directory." >&2
+        echo "ERROR: scripts/lib/metal_dirs.sh names no gated directory." >&2
         exit 2
     fi
 }
@@ -457,7 +457,12 @@ esac
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --root) ROOT="${2:?--root needs a value}"; shift 2 ;;
+        --root)
+            if [ $# -lt 2 ]; then
+                echo "ERROR: --root needs a value (expected --root <dir>)." >&2
+                exit 2
+            fi
+            ROOT="$2"; shift 2 ;;
         -h|--help)
             echo "${USAGE}"
             exit 0 ;;

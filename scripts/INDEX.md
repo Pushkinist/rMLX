@@ -42,7 +42,6 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `gputrace_kernels.sh` | gputrace_diff.sh | List the Metal functions a captured window referenced, straight from the bundle; no Xcode. |
 | `gputrace_preflight.sh` | make build-capture, make gputrace-preflight, gpu_capture.sh | Check the host prerequisites for Apple's GPU tools to work with a Metal capture of this binary. |
 | `gputrace_summary.sh` | none | Summarise a .gputrace bundle: what it captured, its size, and whether Xcode has profiled it. |
-| `metal_dirs.sh` | check/kernel_dispatch.sh, check_metal_compiles.sh, check_metal_format.sh, +1 more scripts | The directories holding gated .metal kernels; sourced by the metal gates. |
 | `mlx_preflight.sh` | make mlx-preflight, gpu_capture.sh, mlx_preflight_selftest.sh, mlx_restore_pin.sh | Stop a measurement where rmlx baseline and rmlx bench refuse: a bad mlx-c C API or MLX pair. |
 | `mlx_preflight_selftest.sh` | make ci, make mlx-preflight-selftest | Recall test for mlx_preflight.sh: throwaway Homebrew prefixes and stubs, asserting output. |
 | `mlx_restore_pin.sh` | make mlx-restore-pin, mlx_restore_pin_selftest.sh | Restore the MLX and mlx-c pair named by crates/rmlx-mlx/mlx-pin.txt, then link and pin those kegs. |
@@ -124,6 +123,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `lib/cpu_snapshot.sh` | bench_llama_ab.sh, perf_ab.sh, perf_ab_selftest.sh, +2 more scripts | Per-process cumulative CPU seconds, for interference gates; source it. |
 | `lib/identity.sh` | bench_cache_types.sh, bench_cell.sh, perf-iter/bench_decode_tps.sh, +5 more scripts | Shared §8.5 run-identity for rMLX bench scripts. |
 | `lib/kv_boundary_default.py` | ingest/codec_inertness_ingest.py, ingest/perf_ab_ingest.py | The engine's default KV boundary-layer counts, read from the engine. |
+| `lib/metal_dirs.sh` | check/kernel_dispatch.sh, check_metal_compiles.sh, check_metal_format.sh, +1 more scripts | The directories holding gated .metal kernels; sourced by the metal gates. |
 | `lib/mlx_pin.sh` | crates/rmlx-mlx/src/pin_tests.rs, mlx_preflight.sh, mlx_restore_pin.sh | Read the validated MLX / mlx-c pair from its one declaration. |
 | `lib/prefill_ms.py` | mst_capture.sh | Read the prefill time of an rmlx run out of its log: `generate: prefill{prefill_ms}`. |
 | `lib/published_aggregate.py` | spec_bench_published.sh, spec_bench_published_selftest.sh | Assemble and summarise a published-protocol speculative-decoding run. |

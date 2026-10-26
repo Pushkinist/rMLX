@@ -382,7 +382,7 @@ Pass lazy arrays to `MetalKernel::apply`:
   `ensure_row_contiguous`.
 
 `make check-no-kernel-input-eval` enforces this across every
-custom-kernel dispatcher in the crates of `scripts/metal_dirs.sh`, and
+custom-kernel dispatcher in the crates of `scripts/lib/metal_dirs.sh`, and
 every `*_common.rs` scaffold in a directory that holds one. It keys on
 a file constructing a `MetalKernelInvoke`. An `// eval-ok: <reason>` marker
 exempts one call. `make check-no-kernel-input-eval-fixtures` is its recall test.
@@ -401,7 +401,7 @@ Two checks hold the rule:
 
 - `make check-kernel-dtype-contract` (in `make ci`) scans every file that
   constructs a `MetalKernelInvoke` in the three crates of
-  `scripts/metal_dirs.sh`. A function declaring an f32 output must cast to a
+  `scripts/lib/metal_dirs.sh`. A function declaring an f32 output must cast to a
   *derived* dtype (`.astype(x.dtype(), …)`, `.astype(out_dtype, …)`) or carry
   `// f32-out-ok: <reason>` naming a consumer that cannot promote. Codec
   buffers read back only by our own kernels are the legitimate case.
@@ -733,7 +733,7 @@ see `CLAUDE.md` hard rule 10.
 
 ### MSL gates (`make ci`, enforced in CI)
 
-`scripts/metal_dirs.sh` lists the three kernel directories, and both gates
+`scripts/lib/metal_dirs.sh` lists the three kernel directories, and both gates
 source it. The `check-metal-format` pre-commit hook triggers on any
 `crates/*/src/metal/*.metal` file but checks only the listed directories. A
 crate that starts shipping MSL must be added to the list; nothing else

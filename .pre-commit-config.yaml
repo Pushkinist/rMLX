@@ -52,7 +52,7 @@ repos:
 
       # MSL style gate. Fast (clang-format --dry-run over every gated kernel
       # directory) and skips itself when clang-format is unavailable. The
-      # trigger must span all of `scripts/metal_dirs.sh`, not one crate: a
+      # trigger must span all of `scripts/lib/metal_dirs.sh`, not one crate: a
       # pattern narrower than the gate's own scope means editing a kernel in
       # another gated directory never fires the hook. The companion
       # `check-metal-compiles` gate is NOT run per-commit: it needs the full

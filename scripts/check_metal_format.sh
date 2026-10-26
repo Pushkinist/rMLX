@@ -34,8 +34,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Directories holding gated `.metal` kernels. Single-sourced with the compile
 # gate so the two cannot drift apart.
-# shellcheck source=scripts/metal_dirs.sh
-. "$(dirname "${BASH_SOURCE[0]}")/metal_dirs.sh"
+# shellcheck source=scripts/lib/metal_dirs.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/metal_dirs.sh"
 
 STRICT=0
 for arg in "$@"; do
@@ -78,7 +78,7 @@ done
 shopt -u nullglob
 
 if [ ${#missing_dirs[@]} -gt 0 ]; then
-    echo "ERROR: kernel director(ies) listed in scripts/metal_dirs.sh do not exist:" >&2
+    echo "ERROR: kernel director(ies) listed in scripts/lib/metal_dirs.sh do not exist:" >&2
     for d in "${missing_dirs[@]}"; do echo "  ${d}" >&2; done
     echo "       A stale list silently shrinks this gate. Fix the list or restore the directory." >&2
     exit 1

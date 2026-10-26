@@ -261,7 +261,7 @@ comment):
 | the planted `scripts/` trees of the gate's recall tests | `lib/selftest_support.sh` (`sg_init`, `sg_fresh`, `sg_put`, `sg_gate`, ...) |
 | comment and literal blanking in a Rust scanner | `lib/awk_text.sh` |
 | a snapshot's identity columns | `lib/snapshot_identity.py` |
-| the gated `.metal` directories | `metal_dirs.sh` (to move into `lib/`) |
+| the gated `.metal` directories | `lib/metal_dirs.sh` |
 
 A script that defines one of these again fails the gate (`lib-shadow`, section
 1). A path of the form `target/<profile>/rmlx`, the profile a name or a

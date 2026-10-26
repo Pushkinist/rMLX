@@ -101,8 +101,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Directories holding gated `.metal` kernels. Single-sourced with the format
 # gate so the two cannot drift apart.
-# shellcheck source=scripts/metal_dirs.sh
-. "$(dirname "${BASH_SOURCE[0]}")/metal_dirs.sh"
+# shellcheck source=scripts/lib/metal_dirs.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/metal_dirs.sh"
 
 # The floor, and the version MLX's JIT was observed to use.
 BASELINE_STD="metal3.1"

@@ -400,7 +400,7 @@ expect_no_invocation_with() {
 }
 
 # threadgroup_fixture_tree <dir> — a workspace carrying every member
-# `scripts/metal_dirs.sh` names, each with its gated `src/metal` directory, plus
+# `scripts/lib/metal_dirs.sh` names, each with its gated `src/metal` directory, plus
 # one member that ships no MSL. The model layer holds one kernel dispatcher that
 # embeds a gated `.metal` file.
 threadgroup_fixture_tree() {
@@ -2267,7 +2267,7 @@ producer_scratch() {
     local d="$1"
     mkdir -p "${d}/scripts/check" "${d}/scripts/lib" "${d}/scripts/suite" "${d}/crates/rmlx-kv-quant/src" || return 1
     cp "${ROOT}/scripts/suite/gpu_test_classes.sh" "${d}/scripts/suite/" || return 1
-    cp "${ROOT}/scripts/metal_dirs.sh" "${d}/scripts/" || return 1
+    cp "${ROOT}/scripts/lib/metal_dirs.sh" "${d}/scripts/lib/" || return 1
     cp "${ROOT}/scripts/lib/awk_text.sh" "${ROOT}/scripts/lib/workspace_members.sh" "${d}/scripts/lib/" || return 1
     cp "${ROOT}/crates/rmlx-kv-quant/src/quant.rs" "${d}/crates/rmlx-kv-quant/src/" || return 1
     cat >"${d}/scripts/check/gpu_tests.sh" <<STUB
@@ -2410,6 +2410,10 @@ for mode in half threadgroup; do
     STATUS=$?
     expect_status 2
     expect_out "unknown argument '--bogus' (expected --root <dir>)"
+    OUT="$(bash "${producer}" "${mode}" --root 2>&1)"
+    STATUS=$?
+    expect_status 2
+    expect_out "--root needs a value"
     OUT="$(bash "${producer}" "${mode}" --root "${CASE_ROOT}/no/such/directory" 2>&1)"
     STATUS=$?
     expect_status 2
@@ -2470,11 +2474,11 @@ for mode in half threadgroup; do
     expect_status 2
     expect_out "list --files produced no GPU tests for"
 done
-printf 'METAL_DIRS=()\n' >"${CASE_ROOT}/p/scripts/metal_dirs.sh"
+printf 'METAL_DIRS=()\n' >"${CASE_ROOT}/p/scripts/lib/metal_dirs.sh"
 OUT="$(bash "${producer}" threadgroup --root "${tree}" 2>&1)"
 STATUS=$?
 expect_status 2
-expect_out "scripts/metal_dirs.sh names no gated directory"
+expect_out "scripts/lib/metal_dirs.sh names no gated directory"
 
 # ---------------------------------------------------------------------------
 # THE THREADGROUP SPLIT

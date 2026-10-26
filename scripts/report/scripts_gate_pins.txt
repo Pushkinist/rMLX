@@ -46,7 +46,6 @@ class gputrace_diff.sh
 class gputrace_kernels.sh
 class gputrace_preflight.sh
 class gputrace_summary.sh
-class metal_dirs.sh
 class mlx_preflight.sh
 class mlx_preflight_selftest.sh
 class mlx_restore_pin.sh
@@ -128,7 +127,6 @@ usage lib/server_sampling.py
 usage lib/snapshot_identity.py
 usage lib/snapshot_sampling.py
 usage lib/spec_round_log.py
-usage metal_dirs.sh
 usage mlx_preflight.sh
 usage mlx_preflight_selftest.sh
 usage mlx_restore_pin.sh
@@ -182,7 +180,6 @@ exit-undeclared gen_lloyd_codebook.py 1
 exit-undeclared gpu_capture.sh 1,2
 exit-undeclared gputrace_diff.sh 1
 exit-undeclared ingest/llama_bench_ingest.py 1
-exit-undeclared metal_dirs.sh 2
 exit-undeclared mlx_preflight.sh 0,1
 exit-undeclared mlx_restore_pin.sh 1
 exit-undeclared mst_capture.sh 0,1,2
@@ -298,7 +295,6 @@ set-mode gputrace_diff.sh
 set-mode gputrace_kernels.sh
 set-mode gputrace_preflight.sh
 set-mode gputrace_summary.sh
-set-mode metal_dirs.sh
 set-mode mlx_preflight.sh
 set-mode mlx_restore_pin.sh
 set-mode mlx_restore_pin_selftest.sh

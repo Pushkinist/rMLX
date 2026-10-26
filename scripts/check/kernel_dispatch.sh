@@ -2,7 +2,7 @@
 # CI gate: Metal-kernel dispatchers keep inputs lazy, return the caller's dtype, leak no f32 scalar.
 #
 # One population, three rules: the Rust that dispatches the custom Metal kernels of the crates
-# that own `.metal` files. Every mode takes the crates from `scripts/metal_dirs.sh` (the one
+# that own `.metal` files. Every mode takes the crates from `scripts/lib/metal_dirs.sh` (the one
 # list; nothing here restates it): each directory listed there names a crate's `metal/`
 # directory, and the Rust sits one level up. `--root DIR` scans exactly the DIRs given, in every
 # mode, and may be repeated.
@@ -156,8 +156,8 @@ esac
 if [ "${#SCAN_ROOTS[@]}" -gt 0 ]; then
     SRC_DIRS=("${SCAN_ROOTS[@]}")
 else
-    # shellcheck source=scripts/metal_dirs.sh
-    . "$REPO_ROOT/scripts/metal_dirs.sh"
+    # shellcheck source=scripts/lib/metal_dirs.sh
+    . "$REPO_ROOT/scripts/lib/metal_dirs.sh"
     SRC_DIRS=()
     for d in "${METAL_DIRS[@]}"; do
         SRC_DIRS+=("${d%/metal}")

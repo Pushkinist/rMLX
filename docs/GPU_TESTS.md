@@ -567,7 +567,7 @@ without it.
 
 `scripts/suite/gpu_test_classes.sh threadgroup` is the one producer of the split. A
 *dispatcher* is a source file that embeds, with `include_str!`, a `.metal` file
-under a directory `scripts/metal_dirs.sh` names; its *entry names* are the fns a
+under a directory `scripts/lib/metal_dirs.sh` names; its *entry names* are the fns a
 non-test dispatcher defines. A classified test runs with threadgroup validation
 on when its declaring file is itself a dispatcher, or when its body, or a
 same-file fn it calls (followed by name), names an entry name. Comments and
