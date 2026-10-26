@@ -149,7 +149,9 @@ compliant:
   name built by `paste!` or `concat_idents!`, or a `#[test]` on its `fn` line;
 - a `macro_rules!` written on one line whose body declares `#[test]`;
 - an item whose closing brace is never found;
-- an attribute whose closing `]` is never found.
+- an attribute whose closing `]` is never found;
+- a string or block comment still open at the end of a file: the gate lost the
+  file at some point and read the tail as text.
 
 Write a generated fn as `fn $name()` on its own line, with its attributes above
 it. End a wrapped attribute on a line whose last significant character is `]`.
@@ -160,12 +162,6 @@ Each of these passes the gate silently:
 
 - An attribute left open by a block comment, closed by a later line that ends
   in `]`. The items between are lost with no report.
-- A string, a raw string or a `/* … */` block comment that spans several lines
-  outside a fn: between items, in a `macro_rules!` body outside its fns, or (a
-  block comment only) in an attribute. Its lines are read as code, so a
-  `#[test] fn` in such a text is classified as a test, and a `}` at a macro
-  body's indent ends the body early. Inside a body, a signature and (strings)
-  an attribute the state is carried.
 - A `<` that is an operator outside every bracket, in an item with an inline
   body (`fn f() where A < B { true }`): the `<` cannot be told from a generic
   bracket without reading the spacing, the item stays open, and the next test is
@@ -194,7 +190,10 @@ goes on, whatever the line ends in; a `;` with none open ends a declaration,
 since no generic list holds one; while a generic `<` is open it goes on, and
 with none open a `{` opened and closed on a line ends the item. A `<` or `>` is
 a generic bracket only outside every `(`, `[` and `{`, and never in `->` or
-`=>`. A header `fn $name:` is a macro matcher, never an item.
+`=>`. A header `fn $name:` is a macro matcher, never an item. Outside a fn the
+same state is carried line to line, so the lines of a string or comment that
+spans several lines are text, never an item, an attribute or the close of a
+macro body.
 
 `make check-gpu-tests-ignored-fixtures`
 (`scripts/check/rust_gates_fixtures.sh gpu_tests_ignored`, in `make ci` and hosted CI) is

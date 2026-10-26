@@ -292,14 +292,13 @@
 #       the file — and a `;` in `[u8; 4]` or a comment is not a terminator.
 #       The body carries the string and comment state of the line that opened it
 #       from line to line, so a `}` that starts a line inside a string or a comment
-#       closes nothing, and a `//` inside one cuts nothing. Not tracked: a string,
-#       a raw string or a `/* … */` comment that spans several lines outside a fn
-#       (between items, in a macro body outside its fns), and a `/* … */` comment
-#       that spans the lines of an attribute.
+#       closes nothing, and a `//` inside one cuts nothing. Outside a fn the same
+#       state is carried too. Not tracked: a `/* … */` comment that spans the
+#       lines of an attribute.
 #     * A capture that is still open at a file boundary means the parser lost
 #       the file, so it reports `U` rather than letting the remainder go
-#       unclassified. This holds for all THREE captures — fn item, macro body
-#       and attribute block.
+#       unclassified. This holds for all FOUR captures — fn item, macro body,
+#       attribute block and the string or comment state outside a fn.
 #
 #   ATTRIBUTES ARE A THIRD CAPTURE, with the same latch hazard. An attribute
 #   that does not close on its own line latches until one does, and while
@@ -794,6 +793,17 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         attr_label = ""
     }
 
+    # A string or block comment still open when its file ends. Valid Rust never
+    # ends that way, so the reader lost the file at some point and everything
+    # after it was read as text: a refusal, not a clean scan.
+    function flush_top() {
+        if (top_q || top_c) {
+            printf "U  %s: (a string or block comment is open at the end of the file)\n", top_file
+        }
+        top_q = 0
+        top_c = 0
+    }
+
     # New file: reset the per-file parse state and derive this file's module
     # name (directory name for a mod.rs, otherwise the file stem). The module
     # name is how a QUALIFIED cross-file call `module::helper(..)` binds.
@@ -801,6 +811,8 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         flush_fn()
         flush_macro()
         flush_attr()
+        flush_top()
+        top_file = FILENAME
         attrs = ""; last_macro_name = ""
         nseg = split(FILENAME, seg, "/")
         base = seg[nseg]
@@ -828,6 +840,20 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         if ($0 ~ /^[[:space:]]*\)\]/ || sig ~ /\]$/) { in_attr = 0 }
         next
     }
+    # ── Strings and block comments outside a fn ─────────────────────────
+    # `top_q` and `top_c` carry the state as `body_q` and `body_c` do inside a fn.
+    # A line that starts inside a string or a comment is its content, which no
+    # rule below may read as an item, an attribute or a close. A fn header or an
+    # attribute that continues hands the state to the reader that owns its lines.
+    !in_fn && !in_attr {
+        top_open = (top_q || top_c)
+        if (index($0, "\"") || index($0, "/")) {
+            bare($0, top_q, top_c)
+            top_q = bare_q
+            top_c = bare_c
+        }
+        if (top_open) { next }
+    }
     # ── Attribute (any indent) ──────────────────────────────────────────
     !(in_fn && (body_q || body_c)) && /^[[:space:]]*#\[/ {
         attrs = attrs " " $0
@@ -840,6 +866,8 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         # the continuation rule above, reached by an easier-to-write shape.
         if (bare($0) !~ /\]$/) {
             in_attr = 1
+            top_q = 0
+            top_c = 0
             attr_q = bare_q
             attr_file = FILENAME
             attr_label = $0
@@ -996,6 +1024,8 @@ read -r -d '' AWK_DETECT <<'AWK' || true
             close_marker = ""
         } else {
             in_fn = 1
+            top_q = 0
+            top_c = 0
             close_marker = indent "}"
             in_sig = (sig_state == "more")
             if (sig_state == "body") {
@@ -1030,6 +1060,8 @@ read -r -d '' AWK_DETECT <<'AWK' || true
             in_sig = 0
             curid = 0
             close_marker = ""
+            top_q = sig_q
+            top_c = sig_bc
             attrs = ""
             next
         }
@@ -1073,6 +1105,7 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         flush_fn()
         flush_macro()
         flush_attr()
+        flush_top()
 
         # ── Seed: fns naming Device::Gpu (literal) or a file-scoped
         #    `const … = Device::Gpu` alias in their own body. Seeds feed a
@@ -1355,8 +1388,9 @@ classify_root() {
     # missing one. This is the same fail-closed rule as "scanned 0 files".
     if [ -n "$unreadable" ]; then
         echo "ERROR: this gate could not classify part of a scanned file" >&2
-        echo "       (an unreadable macro_rules! body, or an item or attribute that" >&2
-        echo "        never closed, ending classification mid-file):" >&2
+        echo "       (an unreadable macro_rules! body, an item or attribute that never" >&2
+        echo "        closed, or a string or comment open at the end of the file," >&2
+        echo "        ending classification mid-file):" >&2
         printf '%s' "$unreadable" >&2
         echo >&2
         echo "The gate classifies a test-generating macro from its body: it needs an" >&2
@@ -1365,7 +1399,8 @@ classify_root() {
         echo "its fn's line, and a whole macro_rules! on one line are all invisible —" >&2
         echo "and an invisible GPU test is exactly what this gate exists to prevent." >&2
         echo >&2
-        echo "A 'fn never closed' or 'attribute never closed' finding means the parser" >&2
+        echo "A 'fn never closed', 'attribute never closed' or 'open at the end of the" >&2
+        echo "file' finding means the parser" >&2
         echo "lost the file at that point, so everything after it went unclassified. All" >&2
         echo "are reported rather than skipped, because a shape this gate cannot read" >&2
         echo "looks exactly like a compliant one." >&2
