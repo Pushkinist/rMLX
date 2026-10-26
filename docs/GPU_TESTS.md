@@ -158,10 +158,14 @@ it. End a wrapped attribute on a line whose last significant character is `]`.
 
 Each of these passes the gate silently:
 
-- An attribute left open by a raw string or a block comment, closed by a later
-  line that ends in `]`. The items between are lost with no report.
-- A raw string (`r"…"`, `r#"…"#`), or a `/* … */` block comment on a line
-  outside a signature: neither is tracked.
+- An attribute left open by a raw string that runs over several lines or by a
+  block comment, closed by a later line that ends in `]`. The items between are
+  lost with no report.
+- A raw string that runs over several lines: only one that opens and closes on
+  its line is read as a string. A `/* … */` block comment that spans the lines
+  of a body, an attribute or a macro body: its depth is carried across the
+  lines of a signature only. A device named inside such a comment counts as
+  named by the body, which fails closed.
 - An unqualified cross-file call through a glob import (`use m::*; helper()`).
 - A helper in a non-scanned source file. The one instance,
   `paro_kernel_registration`, is declared `metal-unscanned`.
@@ -171,10 +175,11 @@ Each of these passes the gate silently:
   `macro_rules!` defined in a non-scanned file.
 
 A fn's signature is read from its header line on, over the code of each line
-(strings, char literals and line comments blanked), with the depths of `(`, `[`
-and `{` kept across its lines and a `/* … */` tracked across them: a `{` still
-open at the end of a line is the body, and a `;` outside every bracket ends a
-declaration. The script's `PARSING` header gives the close-test rules in full.
+(comments, strings and char literals blanked by one reader, which reads a block
+comment, nesting included, before it looks at a `//` or a quote in it), with
+the depths of `(`, `[` and `{` kept across its lines: a `{` still open at the
+end of a line is the body, and a `;` outside every bracket ends a declaration.
+The script's `PARSING` header gives the close-test rules in full.
 
 `make check-gpu-tests-ignored-fixtures`
 (`scripts/check/rust_gates_fixtures.sh gpu_tests_ignored`, in `make ci` and hosted CI) is
@@ -292,7 +297,7 @@ stand-down in them is held to `SKIP {test}:` by review.
 
 The notice's shape lives in `scripts/lib/skip_notice_patterns.sh`, which the
 gate and the runner both read. `make check-named-skip-notices-fixtures`
-(`scripts/check/gpu_tests_selftest.sh`, 133 cases, in `make ci` and hosted CI) is
+(`scripts/check/gpu_tests_selftest.sh`, 145 cases, in `make ci` and hosted CI) is
 the gate's recall test. It classifies planted workspaces, as the Makefile does,
 and plants its unreadable paths at run time.
 

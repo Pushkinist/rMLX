@@ -1545,4 +1545,53 @@ st_case usage_empty_root 2 --has "--root is empty" -- bash "$TOOL" list --root "
 st_case usage_root_given_twice 2 --has "--root given twice" \
     -- bash "$TOOL" list --root "$ST_WORK" --root "$ST_WORK"
 
+# ---------------------------------------------------------------------------
+# bare(), the one reader of what a comment, a string and a char literal are, run on its own over
+# a line: `return|bare_q|bare_c|bare_code$` (the `$` shows the last blank of bare_code). The
+# functions are cut out of the tool, so these cases hold the reader the gate runs.
+
+# bare_probe <line> [<q0> <c0> <want>]
+bare_probe() {
+    LINE="$1" Q0="${2:-0}" C0="${3:-0}" WANT="${4:-1}" awk \
+        "$(sed -n '/^    function blanks(/,/^        return s$/p' "$TOOL")"$'\n    }\n'\
+'BEGIN { r = bare(ENVIRON["LINE"], ENVIRON["Q0"], ENVIRON["C0"], ENVIRON["WANT"]); printf "%s|%d|%d|%s$\n", r, bare_q, bare_c, bare_code }'
+}
+
+st_case bare_reads_a_block_comment_before_slashes_and_quotes 0 \
+    --is 'x /* a // b "c */ y|0|0|x                 y $' \
+    -- bare_probe 'x /* a // b "c */ y // z'
+st_case bare_nests_block_comments_and_reports_the_depth 0 \
+    --is '/* a /* b */ c|0|1|              $' \
+    -- bare_probe '/* a /* b */ c'
+st_case bare_closes_a_nested_comment_at_the_last_closer 0 \
+    --is '/* a /* b */ c */ d|0|0|                  d$' \
+    -- bare_probe '/* a /* b */ c */ d'
+st_case bare_carries_the_depth_in_from_the_line_before 0 \
+    --is 'still */ code|0|0|         code$' \
+    -- bare_probe 'still */ code' 0 1
+st_case bare_ignores_a_comment_opener_inside_a_string 0 \
+    --is '"a /* b" /* c */ d|0|0|"      "         d$' \
+    -- bare_probe '"a /* b" /* c */ d'
+st_case bare_ignores_a_closer_outside_a_comment 0 \
+    --is 'x */ y|0|0|x */ y$' \
+    -- bare_probe 'x */ y'
+st_case bare_reads_a_raw_string_with_an_inner_quote_as_one_string 0 \
+    --is 'r#"a"b"#; x|0|0|        ; x $' \
+    -- bare_probe 'r#"a"b"#; x // c'
+st_case bare_matches_the_hashes_of_a_raw_string 0 \
+    --is 'r##"a"# x"##; y|0|0|            ; y$' \
+    -- bare_probe 'r##"a"# x"##; y'
+st_case bare_reads_a_backslash_in_a_raw_string_as_a_character 0 \
+    --is 'b"a"; br"c\"; d|0|0|b" ";       ; d$' \
+    -- bare_probe 'b"a"; br"c\"; d'
+st_case bare_does_not_read_a_raw_string_inside_a_name 0 \
+    --is 'bar"x";|0|0|bar" "; $' \
+    -- bare_probe 'bar"x"; // c'
+st_case bare_keeps_the_text_as_long_across_a_backslash_that_ends_the_line 0 \
+    --is 'let s = "ab\|1|0|let s = "   $' \
+    -- bare_probe 'let s = "ab\'
+st_case bare_builds_the_code_only_when_asked 0 \
+    --is 'let s = "x";|0|0|$' \
+    -- bare_probe 'let s = "x"; // c' 0 0 0
+
 st_done

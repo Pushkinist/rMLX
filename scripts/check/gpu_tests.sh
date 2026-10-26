@@ -262,7 +262,8 @@
 # PARSING
 #   Relies on rustfmt layout (already enforced by `make fmt-check`): a `fn`
 #   item's closing brace sits at the same indent as its `fn` keyword. That
-#   makes brace/string depth tracking unnecessary. rustfmt does not reformat a
+#   ends a BODY without tracking its braces. A signature has no such marker, so
+#   it is read by bracket depth (below). rustfmt does not reformat a
 #   `macro_rules!` body, so the same layout there is a convention — which is why
 #   an unreadable body fails closed (`U`) instead of being skipped.
 #
@@ -272,10 +273,11 @@
 #       swallowing every later item in the file into its body and silently
 #       ending classification. Such a line is captured whole and never latches.
 #       The signature is read by one reader, from the header line on, over the
-#       line's CODE (strings, char literals and line comments blanked): it keeps
-#       the depths of `(`, `[` and `{` across the signature's lines and tracks a
-#       `/* … */` comment across them. A `{` still open at the end of a line is
-#       the body, which latches until the `}` at the fn's indent; a `{` opened
+#       line's CODE (comments, strings and char literals blanked by `bare()`): it
+#       keeps the depths of `(`, `[` and `{` across the signature's lines, and
+#       carries the depth of an open `/* … */` comment across them. A `{` still
+#       open at the end of a line is the body, which latches until the `}` at
+#       the fn's indent; a `{` opened
 #       and closed on the line, ending in `}`, is an inline body and the item is
 #       complete; a `;` outside every bracket ends a declaration, however many
 #       lines the signature ran over; anything else is a signature that goes on.
@@ -284,8 +286,8 @@
 #       a block delimiter — a false "balanced" drops the item's body so a
 #       `Device::Gpu` in it is never seen, a false "open" swallows the rest of
 #       the file — and a `;` in `[u8; 4]` or a comment is not a terminator.
-#       Not tracked: a raw string (`r"…"`, `r#"…"#`), and a `/* … */` comment on
-#       a line outside a signature.
+#       Not tracked: a raw string that runs over several lines, and a `/* … */`
+#       comment that spans the lines of a body, an attribute or a macro body.
 #     * A capture that is still open at a file boundary means the parser lost
 #       the file, so it reports `U` rather than letting the remainder go
 #       unclassified. This holds for all THREE captures — fn item, macro body
@@ -304,13 +306,15 @@
 #
 #   `bare()` finds the trailing comment with a string-aware scan, so neither a
 #   `//` inside a string literal nor a char literal of any payload form (`b'"'`,
-#   `'\x1b'`, `'\u{FFFD}'`, `'é'`) derails it. Remaining known parse hazards,
-#   which apply to the attribute close-test exactly as they do to the fn one:
-#   raw strings (the `\` in `r"a\"` is not an escape, and `r#"…"#` hashes are
-#   not tracked) and block comments — a `/* … */` spanning an item's opening
-#   line is read literally. An attribute whose closing `]` is hidden behind one
-#   of those latches, and what happens next splits two ways — state both rather
-#   than claim the good one:
+#   `'\x1b'`, `'\u{FFFD}'`, `'é'`) derails it, and a block comment is read before
+#   a `//` or a quote in it is looked at. Remaining known parse hazards, which
+#   apply to the attribute close-test exactly as they do to the fn one: a raw
+#   string that runs over several lines (the `\` in `r"a\"` is not an escape,
+#   but only a raw string that closes on its line is read as one) and a block
+#   comment that spans the lines of an attribute — the close-test does not carry
+#   its depth. An attribute whose closing `]` is hidden behind one of those
+#   latches, and what happens next splits two ways — state both rather than
+#   claim the good one:
 #     * nothing later in the file bares to `]` -> the file boundary reports `U`.
 #       Fail-closed.
 #     * something later does — a subsequent `#[test]` is exactly that shape ->
@@ -549,34 +553,70 @@ read -r -d '' AWK_DETECT <<'AWK' || true
     # significant character, which is what decides whether an item is
     # self-contained.
     #
+    # This is the one place that decides what a comment, a string and a char
+    # literal are. A `/* ... */` comment is read first, with its nesting, and its
+    # body is skipped before any `//`, `"` or `'` in it is looked at: a URL or a
+    # quote inside a block comment starts no line comment and opens no string.
+    #
     # The `//` scan is string-aware. A `//` inside a string literal — a URL is
     # the everyday case — is not a comment, and cutting there would end the
     # line in mid-string and flip every decision that reads its last
-    # character.
+    # character. A raw string that opens and closes on the line (`r"..."`,
+    # `br#"..."#`, with the hashes matched) is a string too; one that runs over
+    # several lines is not tracked.
     #
-    # `q0` seeds that string state, and `bare_q` reports where the scan ended,
-    # so a caller walking a MULTI-LINE construct can carry the state across the
-    # line break. A string continued with a trailing `\` is still open on the
-    # next line; scanning that line from q=0 would read its payload as code and
-    # cut at the first `//` in it. Callers that read one self-contained line
-    # pass neither and get the old q=0 behaviour exactly.
+    # `q0` and `c0` seed the string state and the block-comment depth, and
+    # `bare_q` and `bare_c` report where the scan ended, so a caller walking a
+    # MULTI-LINE construct can carry both across the line break. A string
+    # continued with a trailing `\` is still open on the next line; scanning that
+    # line from q=0 would read its payload as code and cut at the first `//` in
+    # it. Callers that read one self-contained line pass neither and start
+    # outside a string and a comment.
     #
-    # `bare_code` is the same text with the body of every string and char
-    # literal blanked (the quotes stay), for a reader that counts brackets.
+    # With `want` set, `bare_code` is the same text with every comment body,
+    # string body and char literal body blanked (the quotes stay), one character
+    # for each character of the line, for a reader that counts brackets. Only
+    # the callers that read it ask for it.
     function blanks(k,   r) {
         r = ""
         while (k-- > 0) r = r " "
         return r
     }
-    function bare(s, q0,   i, n, q, c, rest, w, ascii, st, out) {
+    function bare(s, q0, c0, want,   i, n, q, d, c, nx, rest, w, ascii, st, out, j, h, e) {
         n = length(s)
         q = q0 + 0
+        d = c0 + 0
         out = ""
         for (i = 1; i <= n; i++) {
             st = i
             c = substr(s, i, 1)
-            if (c == "\\" && q) { i++; out = out blanks(i - st + 1); continue }
-            if (c == "\"") { q = !q; out = out c; continue }
+            nx = substr(s, i + 1, 1)
+            if (d) {
+                if (c == "*" && nx == "/") { d--; i++ }
+                else if (c == "/" && nx == "*") { d++; i++ }
+                if (want) out = out blanks(i - st + 1)
+                continue
+            }
+            if (!q && c == "/" && nx == "*") { d = 1; i++; if (want) out = out "  "; continue }
+            if (c == "\\" && q) { i++; if (want) out = out blanks(i > n ? 1 : 2); continue }
+            if (!q && (c == "r" || (c == "b" && nx == "r")) \
+             && (i == 1 || substr(s, i - 1, 1) !~ /[A-Za-z0-9_]/)) {
+                # A raw string: the `r`, the hashes, a quote, and the same hashes after
+                # the closing quote. One that does not close on this line falls through
+                # to the plain string rule.
+                j = i + (c == "b" ? 2 : 1)
+                h = ""
+                while (substr(s, j, 1) == "#") { h = h "#"; j++ }
+                if (substr(s, j, 1) == "\"") {
+                    e = index(substr(s, j + 1), "\"" h)
+                    if (e > 0) {
+                        i = j + e + length(h)
+                        if (want) out = out blanks(i - st + 1)
+                        continue
+                    }
+                }
+            }
+            if (c == "\"") { q = !q; if (want) out = out c; continue }
             if (!q && c == "'") {
                 # Step over the WHOLE char literal. A partially-stepped one
                 # leaves its closing quote to be re-read as an opener, and that
@@ -590,7 +630,7 @@ read -r -d '' AWK_DETECT <<'AWK' || true
                  || match(rest, /^\\.'/) \
                  || match(rest, /^[^'\\]'/)) {
                     i += RLENGTH
-                    out = out blanks(i - st + 1)
+                    if (want) out = out blanks(i - st + 1)
                     continue
                 }
                 # A non-ASCII payload (`'é'`) is ONE character but 2-4 bytes, so
@@ -614,16 +654,17 @@ read -r -d '' AWK_DETECT <<'AWK' || true
                  && index(substr(rest, 1, w - 1), "\\") == 0) {
                     i += w
                 }
-                out = out blanks(i - st + 1)
+                if (want) out = out blanks(i - st + 1)
                 continue
             }
-            if (!q && c == "/" && substr(s, i + 1, 1) == "/") {
+            if (!q && c == "/" && nx == "/") {
                 s = substr(s, 1, i - 1)
                 break
             }
-            out = out (q ? " " : c)
+            if (want) out = out (q ? " " : c)
         }
         bare_q = q
+        bare_c = d
         bare_code = out
         sub(/[[:space:]]+$/, "", s)
         return s
@@ -662,10 +703,11 @@ read -r -d '' AWK_DETECT <<'AWK' || true
     }
 
     # One reader of a fn item's signature, from its header line on, over the line's
-    # code (`bare_code`: strings, char literals and line comments are not code).
-    # It keeps the depths of `(`, `[` and `{` across the signature's lines, tracks a
-    # `/* ... */` comment across them, and leaves, for the line it read, the number
-    # of `{` it opened (`sig_opened`) and its last significant character (`sig_last`).
+    # code (`bare_code`: comments, strings and char literals blanked). It keeps the
+    # depths of `(`, `[` and `{` across the signature's lines, and leaves, for the
+    # line it read, the number of `{` it opened (`sig_opened`) and its last
+    # significant character (`sig_last`). What a comment is, `bare()` decides: a
+    # caller carries the depth of an open `/* ... */` from line to line in `sig_bc`.
     function sig_reset() {
         sig_par = 0; sig_sq = 0; sig_br = 0; sig_bc = 0
     }
@@ -675,11 +717,6 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         sig_last = ""
         for (i = 1; i <= n; i++) {
             c = substr(m, i, 1)
-            if (sig_bc) {
-                if (c == "*" && substr(m, i + 1, 1) == "/") { sig_bc = 0; i++ }
-                continue
-            }
-            if (c == "/" && substr(m, i + 1, 1) == "*") { sig_bc = 1; i++; continue }
             if (c == "(") sig_par++
             else if (c == ")") { if (sig_par > 0) sig_par-- }
             else if (c == "[") sig_sq++
@@ -901,11 +938,12 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         # reaches body_of and the test is silently unclassified; a false "open"
         # latches and swallows every later item in the file.
         #
-        # Not tracked: a raw string (`r"…"`, `r#"…"#`) and a `/* … */` comment on a
-        # line that is not part of a signature. A `/* … */` between the lines of a
-        # signature is.
-        bare(line)
+        # Not tracked: a raw string that runs over several lines. A `/* … */` comment
+        # that stays open at the end of a line is carried to the next line of the
+        # signature, and ends with the signature.
+        bare(line, 0, 0, 1)
         sig_reset()
+        sig_bc = bare_c
         sig_scan(bare_code)
         sig_state = sig_verdict()
         if (sig_state == "done" || sig_state == "decl") {
@@ -922,14 +960,13 @@ read -r -d '' AWK_DETECT <<'AWK' || true
     }
     # ── A `where` clause can put a declaration's `;` on a later line ────
     in_fn && in_sig {
-        bare($0)
+        line = bare($0, 0, sig_bc, 1)
+        sig_bc = bare_c
         sig_scan(bare_code)
         sig_state = sig_verdict()
         if (sig_state == "body") { in_sig = 0 }
         if (sig_state == "done" || sig_state == "decl") {
             if (sig_state == "done") {
-                line = $0
-                sub(/\/\/.*$/, "", line)
                 body_of[curid] = body_of[curid] " " line
             }
             in_fn = 0
@@ -950,8 +987,7 @@ read -r -d '' AWK_DETECT <<'AWK' || true
     # Body lines, with line comments stripped: prose that names a GPU
     # helper or Device::Gpu must not make the fn look GPU-touching.
     in_fn {
-        line = $0
-        sub(/\/\/.*$/, "", line)
+        line = index($0, "//") ? bare($0) : $0
         body_of[curid] = body_of[curid] " " line
         next
     }
