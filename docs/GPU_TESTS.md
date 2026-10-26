@@ -166,6 +166,11 @@ Each of these passes the gate silently:
   `#[test] fn` in such a text is classified as a test, and a `}` at a macro
   body's indent ends the body early. Inside a body, a signature and (strings)
   an attribute the state is carried.
+- A `<` that is an operator outside every bracket, in an item with an inline
+  body (`fn f() where A < B { true }`): the `<` cannot be told from a generic
+  bracket without reading the spacing, the item stays open, and the next test is
+  read as part of it. No valid Rust writes one outside a macro matcher or macro
+  input; macro input reads `U`.
 - A device written inside a string or a comment of a body counts as named by
   the body, which fails closed. So does a statement attribute that shares its
   line with its statement (`#[allow(..)] let d = Device::Gpu;`): the line is
@@ -184,14 +189,12 @@ comment, nesting included, before it looks at a `//` or a quote in it), with
 the depths of `(`, `[`, `{` and the generic `<` kept across its lines. A `{`
 still open at the end of a line is the body, and the body carries the string and
 comment state of the line that opened it, so a `}` that starts a line inside a
-string or a comment closes nothing. While a `(`, `[` or `<` is open the
-signature goes on, whatever the line ends in; with none open, a `{` opened and
-closed on a line ends the item, and so does a `;`. A `<` or `>` is a generic
-bracket only outside every `(`, `[` and `{`, and never in `->` or `=>`. A `<`
-that is an operator there (it takes a macro fragment to write one) is read as a
-bracket, and the item then runs on to the end of the file and is reported as
-`U`, which fails closed. The script's `PARSING` header gives the close-test
-rules in full.
+string or a comment closes nothing. While a `(` or `[` is open the signature
+goes on, whatever the line ends in; a `;` with none open ends a declaration,
+since no generic list holds one; while a generic `<` is open it goes on, and
+with none open a `{` opened and closed on a line ends the item. A `<` or `>` is
+a generic bracket only outside every `(`, `[` and `{`, and never in `->` or
+`=>`. A header `fn $name:` is a macro matcher, never an item.
 
 `make check-gpu-tests-ignored-fixtures`
 (`scripts/check/rust_gates_fixtures.sh gpu_tests_ignored`, in `make ci` and hosted CI) is

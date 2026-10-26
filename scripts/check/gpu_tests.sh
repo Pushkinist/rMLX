@@ -278,10 +278,11 @@
 #       signature's lines, and carries the depth of an open `/* … */` comment
 #       across them. A `{` still open at the end of a line is the body, which
 #       latches until the `}` at the fn's indent. While a `(`, `[` or `<` is open
-#       the signature goes on, whatever the line ends in; with none open, a `{`
-#       opened and closed on the line, ending in `}`, is an inline body and the
-#       item is complete, a `;` ends a declaration however many lines the
-#       signature ran over, and anything else is a signature that goes on. A `<`
+#       the signature goes on, whatever the line ends in; a `;` with no `(` or `[`
+#       open ends a declaration however many lines the signature ran over, since
+#       no generic list holds one; with no generic `<` open either, a `{` opened
+#       and closed on the line, ending in `}`, is an inline body and the item is
+#       complete, and anything else is a signature that goes on. A `<`
 #       or `>` counts as a generic bracket only outside every `(`, `[` and `{`,
 #       and the `>` of `->` and `=>` never does.
 #       Counting over the raw line instead would break the decision in both
@@ -762,14 +763,16 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         }
     }
     # What the line just read decides: "body" (a `{` is open: the body starts here),
-    # "more" (a `(`, `[` or `<` is still open: the signature goes on, whatever the line
-    # ends in), "done" (a `{` opened and closed on this line: the item is complete),
-    # "decl" (a `;` outside every bracket: a declaration with no body) or "more".
+    # "more" (a `(` or `[` is still open: the signature goes on, whatever the line ends
+    # in), "decl" (a `;` with none open: a declaration with no body, which no generic
+    # list can contain), "more" again (a generic `<` is still open) and "done" (a `{`
+    # opened and closed on this line: the item is complete).
     function sig_verdict() {
         if (sig_br > 0) return "body"
-        if (sig_par > 0 || sig_sq > 0 || sig_ang > 0) return "more"
-        if (sig_opened > 0 && sig_last == "}") return "done"
+        if (sig_par > 0 || sig_sq > 0) return "more"
         if (sig_last == ";") return "decl"
+        if (sig_ang > 0) return "more"
+        if (sig_opened > 0 && sig_last == "}") return "done"
         return "more"
     }
 
@@ -933,7 +936,11 @@ read -r -d '' AWK_DETECT <<'AWK' || true
 
     # ── fn item at any indent (top-level, inside an inherent impl, or
     #    inside a `macro_rules!` body where the name is a `$metavar`) ────
-    !in_fn && /^[[:space:]]*(pub[^ ]* )?(async )?fn [$a-zA-Z0-9_]/ {
+    # A header whose name is a metavariable followed by `:` is a macro matcher
+    # (`fn $name:ident where ...`), the pattern a macro invocation is matched
+    # against, and never an item.
+    !in_fn && /^[[:space:]]*(pub[^ ]* )?(async )?fn [$a-zA-Z0-9_]/ \
+     && !/^[[:space:]]*(pub[^ ]* )?(async )?fn \$[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:/ {
         line = $0
         indent = line
         sub(/[^[:space:]].*$/, "", indent)   # leading whitespace only
