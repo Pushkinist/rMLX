@@ -158,6 +158,9 @@ jobs:
       # Stub toolchains and planted kernel trees: no Metal compiler is needed.
       - name: the MSL kernel gates still catch what they are for
         run: make check-metal-kernels-selftest
+      # Synthetic bundles and a stub plutil: no trace and no Xcode tool needed.
+      - name: the .gputrace readers still refuse what they must
+        run: make gputrace-selftest
       # The restore script links and pins Homebrew kegs, so its recall test runs
       # it against throwaway prefixes and a stub brew. It needs no macOS tool:
       # bash with compgen, tar, shasum, strings, awk, sort -V and head -c.

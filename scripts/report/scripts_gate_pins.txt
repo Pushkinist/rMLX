@@ -214,8 +214,6 @@ caller bench/codec_inertness_probe.sh
 caller bench_cache_types.sh
 caller eval/wikitext2_ppl.py
 caller gen_lloyd_codebook.py
-caller gputrace_diff.sh
-caller gputrace_summary.sh
 caller ingest/codec_inertness_ingest.py
 caller ingest/llama_bench_ingest.py
 caller parity/jina_v4_parity.py

@@ -36,10 +36,10 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `gen_lloyd_codebook.py` | none | Generate Lloyd-Max optimal N(0,1) centroids for TurboQuant codebook. |
 | `gpu_capture.sh` | make profile-gputrace | Capture a Metal GPU trace of a bounded window of steady-state decode, for |
 | `gpu_validation_census.txt` | run_gpu_tests.sh, run_gpu_tests_selftest.sh | The Metal shader-validation hits run_gpu_tests.sh accepts, per (kernel, kind, crate, test). |
-| `gputrace_diff.sh` | none | Diff the Metal function sets of two .gputrace bundles, in both directions. |
-| `gputrace_kernels.sh` | gputrace_diff.sh | List the Metal functions a captured window referenced, straight from the bundle; no Xcode. |
+| `gputrace_diff.sh` | profile/gputrace_selftest.sh | Diff the Metal function sets of two .gputrace bundles, in both directions. |
+| `gputrace_kernels.sh` | gputrace_diff.sh, profile/gputrace_selftest.sh | List the Metal functions a captured window referenced, straight from the bundle; no Xcode. |
 | `gputrace_preflight.sh` | make build-capture, make gputrace-preflight, gpu_capture.sh | Check the host prerequisites for Apple's GPU tools to work with a Metal capture of this binary. |
-| `gputrace_summary.sh` | none | Summarise a .gputrace bundle: what it captured, its size, and whether Xcode has profiled it. |
+| `gputrace_summary.sh` | profile/gputrace_selftest.sh | Summarise a .gputrace bundle: what it captured, its size, and whether Xcode has profiled it. |
 | `mlx_preflight.sh` | make mlx-preflight, gpu_capture.sh, mlx_preflight_selftest.sh, mlx_restore_pin.sh | Stop a measurement where rmlx baseline and rmlx bench refuse: a bad mlx-c C API or MLX pair. |
 | `mlx_preflight_selftest.sh` | make ci, make mlx-preflight-selftest | Recall test for mlx_preflight.sh: throwaway Homebrew prefixes and stubs, asserting output. |
 | `mlx_restore_pin.sh` | make mlx-restore-pin, mlx_restore_pin_selftest.sh | Restore the MLX and mlx-c pair named by crates/rmlx-mlx/mlx-pin.txt, then link and pin those kegs. |
@@ -136,7 +136,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `lib/published_run_log.py` | lib/binary_identity.py, lib/prefill_ms.py, lib/published_greedy.py, +1 more scripts | Read one rmlx run log back as a per-request table. |
 | `lib/published_table.py` | make check-published-table, make published-table, published_table_selftest.sh | Render published-protocol runs as the Markdown table a post needs. |
 | `lib/run_log_for_pid.py` | lib/bench_server.sh | Pick the run log a given process wrote, out of the candidates on stdin. |
-| `lib/selftest_support.sh` | bench_llama_ab_selftest.sh, check/gpu_tests_selftest.sh, check/metal_kernels_selftest.sh, +14 more scripts | The case runner and shims the self-tests share; source it. |
+| `lib/selftest_support.sh` | bench_llama_ab_selftest.sh, check/gpu_tests_selftest.sh, check/metal_kernels_selftest.sh, +15 more scripts | The case runner and shims the self-tests share; source it. |
 | `lib/server_decode_tps.py` | perf-iter/bench_decode_tps.sh, spec_bench.sh | Read one request's decode rate off a running rmlx server. |
 | `lib/server_kv_quant.py` | lib/bench_server.sh, lib/binary_identity.py, perf_canary.sh, +1 more scripts | Read the KV codec a run resolved out of its rmlx run log. |
 | `lib/server_sampling.py` | crates/rmlx-server/src/engine/sampler_event_tests.rs, lib/published_run_log.py, spec_bench.sh | Read whether a run's requests were sampled, out of its rmlx run log. |
@@ -158,6 +158,12 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
 | `perf-iter/bench_decode_tps.sh` | make perf-iter, bench_identity_selftest.sh | bench_decode_tps.sh — per-iteration regression bench for the perf-fix campaign. |
+
+## scripts/profile/
+
+| path | caller (derived) | purpose (header line 1) |
+|---|---|---|
+| `profile/gputrace_selftest.sh` | make ci, make gputrace-selftest | Recall test for the .gputrace readers: synthetic bundles, no trace, no Xcode tool, no GPU. |
 
 ## scripts/release/
 
