@@ -90,6 +90,7 @@ PINNABLE = (
     "lib-shadow",
     "binary-literal",
     "env-knob",
+    "unguarded-array",
 )
 SET_NOUNS = {
     "exit-undeclared": "code",
@@ -100,6 +101,7 @@ SET_NOUNS = {
     "name": "item",
     "lib-shadow": "function",
     "env-knob": "variable",
+    "unguarded-array": "array",
 }
 
 

@@ -251,7 +251,7 @@ except subprocess.TimeoutExpired:
 SG_PINS_REL=scripts/report/scripts_gate_pins.txt
 SG_NAM='# Not a mode of: check/ok.sh — a planted entry point'
 SG_TIMEOUT_S=60
-SG_PINNABLE='# pinnable: class purpose usage exit-undeclared caller recall-missing silenced lib-consumers lib-run shebang exec-bit dead-path set-mode name size heredoc twin lib-shadow binary-literal env-knob'
+SG_PINNABLE='# pinnable: class purpose usage exit-undeclared caller recall-missing silenced lib-consumers lib-run shebang exec-bit dead-path set-mode name size heredoc twin lib-shadow binary-literal env-knob unguarded-array'
 
 # sg_gate <root> — the scripts gate over <root>, the base being its own HEAD.
 sg_gate() {

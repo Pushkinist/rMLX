@@ -1311,6 +1311,119 @@ sg_pins_file 'env-knob check/y.sh KNOB_A,KNOB_B' >"$root/$SG_PINS_REL"
 st_case env_knob_pin_cannot_grow 1 --what "a name added to a pin the base already had" \
     --has "pin-new: report/scripts_gate_pins.txt:4: env-knob check/y.sh: variable KNOB_B is not pinned at the base" -- sg_gate "$root"
 
+# ---- unguarded-array -----------------------------------------------------
+
+root=$(sg_fresh array_fires)
+sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
+trap 'rm -f x' EXIT
+a=()
+for x in "${a[@]}"; do :; done
+EOF
+verdict array_expansion_fires 1 "an array expanded bare under -u with an EXIT trap of its own" "$root" \
+    --has 'unguarded-array: check/y.sh:12: ${a[@]}'
+
+root=$(sg_fresh array_star)
+sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
+trap 'rm -f x' EXIT
+a=()
+echo "${a[*]}"
+echo ${b[*]}
+echo ${c[@]}
+EOF
+verdict array_star_and_unquoted_fire 1 "[*], and an expansion without quotes, fire like a quoted [@]" "$root" \
+    --has 'unguarded-array: check/y.sh:12: ${a[*]}' --has 'unguarded-array: check/y.sh:13: ${b[*]}' \
+    --has 'unguarded-array: check/y.sh:14: ${c[@]}'
+
+root=$(sg_fresh array_nounset)
+sh_entry "$root" check/y.sh 'set -eo pipefail -o nounset' <<'EOF'
+trap 'rm -f x' EXIT
+echo "${a[@]}"
+EOF
+verdict array_nounset_by_name_fires 1 "set -o nounset is -u" "$root" \
+    --has 'unguarded-array: check/y.sh:11: ${a[@]}'
+
+root=$(sg_fresh array_guarded)
+sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
+trap 'rm -f x' EXIT
+for x in ${a[@]+"${a[@]}"}; do :; done
+echo "${b[*]+"${b[*]}"}" "${c[@]:+${c[@]}}"
+EOF
+verdict array_guard_passes 0 "the + and :+ guards, with the expansion repeated inside them" "$root" \
+    --lacks "unguarded-array" --has "check-scripts: ok (5 files"
+
+root=$(sg_fresh array_guard_then_bare)
+sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
+trap 'rm -f x' EXIT
+f ${a[@]+"${a[@]}"} "${a[@]}"
+EOF
+verdict array_bare_after_a_guard_fires 1 "an expansion after a guard on the same line is still bare" "$root" \
+    --has 'unguarded-array: check/y.sh:11: ${a[@]}'
+
+root=$(sg_fresh array_no_trap)
+sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
+echo "${a[@]}"
+trap - EXIT
+trap 'echo x' ERR
+EOF
+verdict array_without_exit_trap_passes 0 "no EXIT trap: the unbound error exits 1; a reset and an ERR trap are no EXIT trap" "$root" \
+    --lacks "unguarded-array" --has "check-scripts: ok (5 files"
+
+root=$(sg_fresh array_no_nounset)
+sh_entry "$root" check/y.sh 'set -eo pipefail' <<'EOF'
+trap 'rm -f x' EXIT
+echo "${a[@]}"
+EOF
+verdict array_without_nounset_passes 1 "without -u an empty array is empty; only set-mode speaks" "$root" \
+    --lacks "unguarded-array" --has "set-mode: check/y.sh:1:"
+
+root=$(sg_fresh array_count)
+sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
+trap 'rm -f x' EXIT
+echo "${#a[@]}" "${#b[*]}"
+(( ${#c[@]} )) && f "${c[@]}"
+EOF
+verdict array_count_and_tested_pass 0 "a count is no expansion, and a count of the array earlier on the line proves it non-empty" "$root" \
+    --lacks "unguarded-array" --has "check-scripts: ok (5 files"
+
+root=$(sg_fresh array_prose)
+sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
+trap 'rm -f x' EXIT
+# for x in "${a[@]}"; do :; done
+echo 'for x in "${b[@]}"' # "${c[@]}"
+cat <<'TXT'
+"${d[@]}"
+TXT
+EOF
+verdict array_in_prose_passes 0 "a comment, a single-quoted string and a heredoc body are not code" "$root" \
+    --lacks "unguarded-array" --has "check-scripts: ok (5 files"
+
+root=$(sg_fresh array_pin)
+sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
+trap 'rm -f x' EXIT
+echo "${a[@]}" "${b[@]}"
+EOF
+sg_pins_file 'unguarded-array check/y.sh a,b' >"$root/$SG_PINS_REL"
+verdict array_pin_holds 0 "pinned arrays pass and the file is counted once" "$root" \
+    --has "pinned: unguarded-array 1"
+sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
+trap 'rm -f x' EXIT
+echo "${a[@]}" "${b[@]}" "${c[@]}"
+EOF
+st_case array_pin_new_name 1 --what "an array outside the pin fails" \
+    --has 'unguarded-array: check/y.sh:11: ${c[@]}' --lacks 'unguarded-array: check/y.sh:11: ${a[@]}' -- sg_gate "$root"
+sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
+trap 'rm -f x' EXIT
+echo "${a[@]}"
+EOF
+st_case array_pin_stale_name 1 --what "a pinned array that is fixed is stale" \
+    --has "pin-stale: report/scripts_gate_pins.txt:4: unguarded-array check/y.sh: array b is fixed or gone" -- sg_gate "$root"
+sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
+trap 'rm -f x' EXIT
+echo "${a[@]+"${a[@]}"}"
+EOF
+st_case array_pin_stale_file 1 --what "a pin on a file that no longer expands one bare is stale" \
+    --has "pin-stale: report/scripts_gate_pins.txt:4: unguarded-array check/y.sh: no longer violated" -- sg_gate "$root"
+
 # ---- shellcheck ----------------------------------------------------------
 
 root=$(sg_fresh shellcheck)

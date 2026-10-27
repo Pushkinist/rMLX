@@ -355,6 +355,58 @@ def rule_binary_literal(ctx: Context) -> Iterator[Violation]:
                 yield Violation("binary-literal", f.rel, number, detail, figure=1)
 
 
+# ---- unguarded-array -----------------------------------------------------
+
+ARRAY_EXPANSION_RE = re.compile(r"(?<!\\)\$\{(#?)([A-Za-z_]\w*)\[([@*])\](\+|:\+)?")
+
+
+def installs_exit_trap(text: str) -> bool:
+    """Whether a `trap` command in the file sets a handler for EXIT; `trap - EXIT` resets it."""
+    for line in clean_shell(text, True, True):
+        for command in split_commands(line):
+            while command and command[0] in KEYWORDS:
+                command = command[1:]
+            if command[:1] == ["trap"] and "EXIT" in command[1:] and command[1:2] != ["-"]:
+                return True
+    return False
+
+
+def guard_end(line: str, start: int) -> int:
+    """Index just past the `}` that closes the `${` at `start`."""
+    depth = 0
+    for i in range(start, len(line)):
+        depth += {"{": 1, "}": -1}.get(line[i], 0)
+        if depth == 0 and i > start:
+            return i + 1
+    return len(line)
+
+
+def unguarded_expansions(line: str) -> Iterator[tuple[str, str]]:
+    """(array name, bracket) of each `${NAME[@]}` or `${NAME[*]}` outside a `+` guard and not
+    after a `${#NAME[@]}` count of the same array on the line."""
+    counted: set[str] = set()
+    resume = 0
+    for found in ARRAY_EXPANSION_RE.finditer(line):
+        count, name, bracket, guard = found.groups()
+        if found.start() < resume:
+            continue
+        if count:
+            counted.add(name)
+        elif guard:
+            resume = guard_end(line, found.start())
+        elif name not in counted:
+            yield name, bracket
+
+
+def rule_unguarded_array(ctx: Context) -> Iterator[Violation]:
+    for f in ctx.files:
+        if not f.rel.endswith(".sh") or "u" not in set_options(f.text)[0] or not installs_exit_trap(f.text):
+            continue
+        for number, line in enumerate(clean_shell(f.text, False, blank_single=True), 1):
+            for name, bracket in unguarded_expansions(line):
+                yield Violation("unguarded-array", f.rel, number, f"${{{name}[{bracket}]}}", key=name)
+
+
 CONTENT_RULES = (
     ("set-mode", rule_set_mode),
     ("py-floor", rule_py_floor),
@@ -364,4 +416,5 @@ CONTENT_RULES = (
     ("lib-shadow", rule_lib_shadow),
     ("binary-literal", rule_binary_literal),
     ("env-knob", rule_env_knob),
+    ("unguarded-array", rule_unguarded_array),
 )

@@ -249,6 +249,18 @@ comment):
   that finds nothing is a non-zero status under `-e`; end it with `|| true`, or
   test the result and say what is missing.
   [gate: `set-mode`; review: the reason is true]
+* No unguarded array expansion in a file that runs under `set -u` (`set -u`,
+  `set -euo pipefail` or `set -o nounset`) and sets an EXIT trap of its own. On
+  bash 3.2 an empty array expanded as `"${a[@]}"` is an unbound variable, and
+  under `-e` with an EXIT trap that error exits 0, a false green that a bash 4.4
+  or newer cannot show; only a static rule sees it. A `trap` command with `EXIT`
+  among its words counts (`trap - EXIT` does not); the trap of the selftest lib
+  does not. Every `${NAME[@]}` and `${NAME[*]}`, quoted or not, outside a
+  `${NAME[@]+...}` guard fails as `${NAME[@]}`, comments and single-quoted
+  strings excepted. The fix is the guard `${NAME[@]+"${NAME[@]}"}`, or a
+  `${#NAME[@]}` test earlier on the same line (a count is not an expansion). The
+  files that expand one today are pinned with the array names.
+  [gate: `unguarded-array`]
 
 ## 6. Use what `lib/` has
 
@@ -404,8 +416,8 @@ accepts every violation of that rule in that file and can only shrink. [gate]
 * `class`, `purpose`, `usage`, `exit-undeclared`, `caller`, `recall-missing`,
   `silenced`, `lib-consumers`, `lib-run`, `shebang`, `exec-bit`, `dead-path`,
   `set-mode`,
-  `name`, `size`, `heredoc`, `twin`, `lib-shadow`, `binary-literal` and
-  `env-knob` can be pinned. The line `# pinnable: <rule> ...` lists them and
+  `name`, `size`, `heredoc`, `twin`, `lib-shadow`, `binary-literal`,
+  `env-knob` and `unguarded-array` can be pinned. The line `# pinnable: <rule> ...` lists them and
   must equal the gate's set (`pin-header`); `index-stale`, `field-dup`, `not-a-mode`,
   `not-a-mode-stale`, `recall-stale`, `module-of`, `orphan`, `py-floor` and
   every `pin-*` and `*-pin` rule never can.
@@ -416,7 +428,8 @@ accepts every violation of that rule in that file and can only shrink. [gate]
   <path> <tokens>` (the token is the part after `scripts/`; a path outside
   `scripts/` is written `../<path>`), `name <path> <items>` (`hyphen` and the
   root variable names), `lib-shadow <path> <functions>` and `env-knob <path>
-  <variables>` (`?` is a Python key that is not a literal). A member outside the
+  <variables>` (`?` is a Python key that is not a literal) and `unguarded-array
+  <path> <arrays>`. A member outside the
   set fails the rule; a member of the set
   that is fixed or gone fails `pin-stale`.
 * A rule whose violation is a measure pins the measure (a pin with no number

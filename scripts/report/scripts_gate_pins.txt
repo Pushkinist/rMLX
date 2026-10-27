@@ -4,13 +4,13 @@
 # line: a pin whose file now passes fails the gate (`pin-stale`). A rule whose violation
 # is a set pins the set (`exit-undeclared` the codes, `recall-missing` and `silenced` the modes, `lib-run`
 # the sites, `dead-path` the tokens, `name` the hyphen and the root variables, `lib-shadow`
-# the functions, `env-knob` the variables); a rule whose violation is a measure pins the
+# the functions, `env-knob` the variables, `unguarded-array` the arrays); a rule whose violation is a measure pins the
 # measure (`size` the line count, `heredoc` the lengths of the over-limit bodies, `twin` the
 # matched lines of a pair written `<a>+<b>`, `binary-literal` the site count). A measure that
 # grew fails its `-pin` rule; one that shrank asks for the pin to be lowered.
 # Never pin a new file, a new member or a larger measure.
 #
-# pinnable: class purpose usage exit-undeclared caller recall-missing silenced lib-consumers lib-run shebang exec-bit dead-path set-mode name size heredoc twin lib-shadow binary-literal env-knob
+# pinnable: class purpose usage exit-undeclared caller recall-missing silenced lib-consumers lib-run shebang exec-bit dead-path set-mode name size heredoc twin lib-shadow binary-literal env-knob unguarded-array
 class aggregate_decode_profile.py
 class bench-records-sweep.sh
 class bench_cache_types.sh
@@ -417,3 +417,19 @@ env-knob spec_bench_published.sh KV_QUANT_SEEN,MEMORY_PID,RMLX_HOME,SAMPLING_SEE
 env-knob spec_bench_selftest.sh OUT_PATH
 env-knob ssd_canary.sh PORT,SSD_GB,VERIFIER_MODEL
 env-knob target_gc.sh MAX_AGE_DAYS
+unguarded-array check/gpu_tests.sh crate_files,members
+unguarded-array check/kernel_dispatch.sh METAL_DIRS,SCAN_ROOTS,SRC_DIRS
+unguarded-array check/metal_kernels.sh FILES,METAL_DIRS,MISSING_DIRS,STDS,defs,failed
+unguarded-array check_kv_codec_disposition.sh BANNER_DOCS
+unguarded-array check_kv_codec_disposition_fixtures.sh BASE_FILES,CASES
+unguarded-array check_published_samples_fixtures.sh args
+unguarded-array mst_capture.sh run_cmd
+unguarded-array perf_ab.sh A_KV,A_MEM,A_TPS,B_KV,B_MEM,B_TPS,MODELS
+unguarded-array perf_ab_host_gate_fixtures.sh RESULT_PATHS
+unguarded-array perf_ab_selftest.sh COMMON
+unguarded-array published_table_selftest.sh inputs
+unguarded-array spec_bench.sh MTP_ANSWER_DIGESTS,MTP_CLIENT_TPS_VALUES,MTP_ENGINE_TPS_VALUES,NORMAL_ANSWER_DIGESTS,NORMAL_CLIENT_TPS_VALUES,NORMAL_ENGINE_TPS_VALUES
+unguarded-array spec_bench_published.sh CELLS,CELL_ARGS,FIXED_FILES,GREEDY_CELL_ARGS,HOST_WINDOWS,LC_RUNS,PASS_FILES,THERMAL_READINGS,args
+unguarded-array spec_bench_published_selftest.sh cell_args
+unguarded-array ssd_canary.sh ALL_PROMPTS
+unguarded-array suite/gpu_test_classes.sh METAL_DIRS,members
