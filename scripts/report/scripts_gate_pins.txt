@@ -40,10 +40,7 @@ class eval_lock_stress.sh
 class gen_lloyd_codebook.py
 class gpu_capture.sh
 class gpu_validation_census.txt
-class gputrace_diff.sh
-class gputrace_kernels.sh
 class gputrace_preflight.sh
-class gputrace_summary.sh
 class mlx_preflight.sh
 class mlx_preflight_selftest.sh
 class mlx_restore_pin.sh
@@ -172,7 +169,6 @@ exit-undeclared eval/wikitext2_ppl.py 1
 exit-undeclared eval_lock_stress.sh 1
 exit-undeclared gen_lloyd_codebook.py 1
 exit-undeclared gpu_capture.sh 1,2
-exit-undeclared gputrace_diff.sh 1
 exit-undeclared ingest/llama_bench_ingest.py 1
 exit-undeclared mlx_preflight.sh 0,1
 exit-undeclared mlx_restore_pin.sh 1
@@ -280,10 +276,7 @@ set-mode check_kv_byte_model_parity.sh
 set-mode check_kv_codec_disposition.sh
 set-mode codec_smoke_runner_selftest.sh
 set-mode gpu_capture.sh
-set-mode gputrace_diff.sh
-set-mode gputrace_kernels.sh
 set-mode gputrace_preflight.sh
-set-mode gputrace_summary.sh
 set-mode mlx_preflight.sh
 set-mode mlx_restore_pin.sh
 set-mode mlx_restore_pin_selftest.sh

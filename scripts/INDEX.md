@@ -36,10 +36,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `gen_lloyd_codebook.py` | none | Generate Lloyd-Max optimal N(0,1) centroids for TurboQuant codebook. |
 | `gpu_capture.sh` | make profile-gputrace | Capture a Metal GPU trace of a bounded window of steady-state decode, for |
 | `gpu_validation_census.txt` | run_gpu_tests.sh, run_gpu_tests_selftest.sh | The Metal shader-validation hits run_gpu_tests.sh accepts, per (kernel, kind, crate, test). |
-| `gputrace_diff.sh` | profile/gputrace_selftest.sh | Diff the Metal function sets of two .gputrace bundles, in both directions. |
-| `gputrace_kernels.sh` | gputrace_diff.sh, profile/gputrace_selftest.sh | List the Metal functions a captured window referenced, straight from the bundle; no Xcode. |
 | `gputrace_preflight.sh` | make build-capture, make gputrace-preflight, gpu_capture.sh | Check the host prerequisites for Apple's GPU tools to work with a Metal capture of this binary. |
-| `gputrace_summary.sh` | profile/gputrace_selftest.sh | Summarise a .gputrace bundle: what it captured, its size, and whether Xcode has profiled it. |
 | `mlx_preflight.sh` | make mlx-preflight, gpu_capture.sh, mlx_preflight_selftest.sh, mlx_restore_pin.sh | Stop a measurement where rmlx baseline and rmlx bench refuse: a bad mlx-c C API or MLX pair. |
 | `mlx_preflight_selftest.sh` | make ci, make mlx-preflight-selftest | Recall test for mlx_preflight.sh: throwaway Homebrew prefixes and stubs, asserting output. |
 | `mlx_restore_pin.sh` | make mlx-restore-pin, mlx_restore_pin_selftest.sh | Restore the MLX and mlx-c pair named by crates/rmlx-mlx/mlx-pin.txt, then link and pin those kegs. |
@@ -163,6 +160,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
+| `profile/gputrace.sh` | profile/gputrace_selftest.sh | Read a .gputrace bundle offline: the Metal functions it names, a diff of two, or a summary. |
 | `profile/gputrace_selftest.sh` | make ci, make gputrace-selftest | Recall test for the .gputrace readers: synthetic bundles, no trace, no Xcode tool, no GPU. |
 
 ## scripts/release/

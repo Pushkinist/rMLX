@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
 # Recall test for the .gputrace readers: synthetic bundles, no trace, no Xcode tool, no GPU.
 #
-# Recall test for: gputrace_kernels.sh
-#     gputrace_diff.sh
-#     gputrace_summary.sh
+# Recall test for: profile/gputrace.sh
 # Not a mode of: check/metal_kernels_selftest.sh — that one plants MSL kernel trees; this one builds .gputrace bundles
 #
 # Each case builds a small bundle in scratch (an MTSP archive of `function` records, and the
-# files the summary reads), runs one reader and asserts the literal exit code and the lines or
-# the reason it prints. `plutil` is a stub that reads a one-line `PLIST` marker, so the cases
-# run on any host. The readers are named in one place, the function `reader`.
+# files the summary reads), runs one mode of the reader and asserts the literal exit code and
+# the lines or the reason it prints. `plutil` is a stub that reads a one-line `PLIST` marker,
+# so the cases run on any host. The reader is named in one place, the function `reader`.
 #
 # Usage:  bash scripts/profile/gputrace_selftest.sh
 # Exit:   0 every case held; 1 a case did not, or none ran; 2 a fixture could not be built
@@ -22,17 +20,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 . "$REPO_ROOT/scripts/lib/selftest_support.sh"
 st_init gputrace-selftest
 
-# reader <kernels|diff|summary> [args]: one reader, run from the repo.
+# reader <kernels|diff|summary> [args]: one mode of the reader, run from the repo.
 reader() {
-    local mode="$1"
-    shift
-    if [ "$mode" = kernels ]; then
-        st_bounded 60 bash "$REPO_ROOT/scripts/gputrace_kernels.sh" ${1+"$@"}
-    elif [ "$mode" = diff ]; then
-        st_bounded 60 bash "$REPO_ROOT/scripts/gputrace_diff.sh" ${1+"$@"}
-    else
-        st_bounded 60 bash "$REPO_ROOT/scripts/gputrace_summary.sh" ${1+"$@"}
-    fi
+    st_bounded 60 bash "$REPO_ROOT/scripts/profile/gputrace.sh" ${1+"$@"}
 }
 
 mkdir -p "$ST_WORK/stubs"
@@ -79,6 +69,11 @@ unused() {
     shift
     archive "$dir/unused-device-resources-0x2" ${1+"$@"}
 }
+
+# ---- modes -------------------------------------------------------------------
+
+st_case "no mode is a usage error" 2 --has "usage:" --has "{kernels|diff|summary}" -- reader
+st_case "an unknown mode is a usage error" 2 --has "unknown mode: bogus" --has "usage:" -- reader bogus
 
 # ---- kernels -----------------------------------------------------------------
 

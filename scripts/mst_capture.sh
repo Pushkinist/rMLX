@@ -12,7 +12,7 @@
 #   submission `start`, `duration`, and `start-latency` — the CPU->GPU gap, the
 #   signal nothing else on this hardware exposes.
 #
-#   Use it WITH `scripts/gputrace_kernels.sh`, not instead: the export carries no
+#   Use it WITH `scripts/profile/gputrace.sh kernels`, not instead: the export carries no
 #   pipeline or function names, so "which kernel" still comes from a capture.
 #
 # THREE TRAPS, ALL HANDLED HERE
@@ -349,4 +349,4 @@ echo "table:  $xml"
 echo "csv:    $csv"
 echo ""
 echo "This table has no kernel names — pair it with a capture when you need to"
-echo "know WHICH kernel: bash scripts/gputrace_kernels.sh <bundle>.gputrace"
+echo "know WHICH kernel: bash scripts/profile/gputrace.sh kernels <bundle>.gputrace"

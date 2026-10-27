@@ -289,9 +289,9 @@ structure it reads and fails by name when the layout moves.
 
 | Command | What it answers |
 |---|---|
-| `bash scripts/gputrace_summary.sh <bundle>` | What was captured (from the harness file name), total and command-stream size, and whether a `.gpuprofiler_raw` is present. |
-| `bash scripts/gputrace_kernels.sh <bundle>` | Which Metal functions the window referenced, and which it recorded as unused. `--set used\|unused\|all`, `--names-only`. |
-| `bash scripts/gputrace_diff.sh <a> <b>` | What A's window referenced that B's did not, and the reverse. |
+| `bash scripts/profile/gputrace.sh summary <bundle>` | What was captured (from the harness file name), total and command-stream size, and whether a `.gpuprofiler_raw` is present. |
+| `bash scripts/profile/gputrace.sh kernels <bundle>` | Which Metal functions the window referenced, and which it recorded as unused. `--set used\|unused\|all`, `--names-only`. |
+| `bash scripts/profile/gputrace.sh diff <a> <b>` | What A's window referenced that B's did not, and the reverse. |
 | `bash scripts/gputrace_preflight.sh` | The host prerequisites above, each with its fix. Also `make gputrace-preflight`. |
 
 Some function records store their name by object id. The scripts count and

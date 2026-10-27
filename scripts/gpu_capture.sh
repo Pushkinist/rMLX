@@ -200,9 +200,9 @@ else
 fi
 echo ""
 echo "Offline, no Xcode:"
-echo "  bash scripts/gputrace_summary.sh '$trace'"
-echo "  bash scripts/gputrace_kernels.sh '$trace'"
-echo "  bash scripts/gputrace_diff.sh <other.gputrace> '$trace'"
+echo "  bash scripts/profile/gputrace.sh summary '$trace'"
+echo "  bash scripts/profile/gputrace.sh kernels '$trace'"
+echo "  bash scripts/profile/gputrace.sh diff <other.gputrace> '$trace'"
 echo ""
 echo "What this bundle holds, and what it does not:"
 echo "  - kernel identity is in the bundle already: which pipelines the window"

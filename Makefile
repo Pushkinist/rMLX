@@ -731,7 +731,7 @@ check-metal-format: ## CI gate: every .metal kernel is clang-format clean (skips
 check-metal-kernels-selftest: ## CI gate: recall test for the two MSL kernel gates over planted kernel trees and stub toolchains, each case asserting the exit code and the line or file named
 	@bash scripts/check/metal_kernels_selftest.sh
 
-gputrace-selftest: ## CI gate: recall test for the three .gputrace readers (kernels, diff, summary) over synthetic bundles, each case asserting the exit code and the line or reason
+gputrace-selftest: ## CI gate: recall test for the three modes of the .gputrace reader (kernels, diff, summary) over synthetic bundles, each case asserting the exit code and the line or reason
 	@bash scripts/profile/gputrace_selftest.sh
 
 # ---- one-shot CI gate -------------------------------------------------
