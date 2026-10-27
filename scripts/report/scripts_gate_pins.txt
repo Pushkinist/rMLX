@@ -28,8 +28,6 @@ class check_kv_byte_model_parity_fixtures.sh
 class check_kv_codec_disposition.sh
 class check_kv_codec_disposition_fixtures.sh
 class check_kv_layer_quants.sh
-class check_metal_compiles.sh
-class check_metal_format.sh
 class check_no_decode_swallow.sh
 class check_no_inline_tests.sh
 class check_published_samples_fixtures.sh
@@ -101,8 +99,6 @@ usage check_kv_byte_model_parity.sh
 usage check_kv_byte_model_parity_fixtures.sh
 usage check_kv_codec_disposition.sh
 usage check_kv_codec_disposition_fixtures.sh
-usage check_metal_compiles.sh
-usage check_metal_format.sh
 usage check_published_samples_fixtures.sh
 usage check_spec_metric_parity.sh
 usage check_spec_metric_parity_fixtures.sh
@@ -168,8 +164,6 @@ exit-undeclared check_kv_byte_model_parity.sh 1,2
 exit-undeclared check_kv_byte_model_parity_fixtures.sh 1,2
 exit-undeclared check_kv_codec_disposition.sh 1,2
 exit-undeclared check_kv_codec_disposition_fixtures.sh 1
-exit-undeclared check_metal_compiles.sh 0,1,2
-exit-undeclared check_metal_format.sh 0,1,2
 exit-undeclared check_published_samples_fixtures.sh 1
 exit-undeclared check_spec_metric_parity.sh 2
 exit-undeclared check_spec_metric_parity_fixtures.sh 1
@@ -286,7 +280,6 @@ set-mode bench_llama_ab_selftest.sh
 set-mode check_gpu_device_census.sh
 set-mode check_kv_byte_model_parity.sh
 set-mode check_kv_codec_disposition.sh
-set-mode check_metal_compiles.sh
 set-mode codec_smoke_runner_selftest.sh
 set-mode gpu_capture.sh
 set-mode gputrace_diff.sh

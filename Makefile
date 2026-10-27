@@ -723,10 +723,10 @@ check-kernel-dtype-contract-fixtures: ## CI gate: the dtype-contract gate still 
 METAL_STRICT ?=
 
 check-metal-compiles: ## CI gate: every .metal kernel compiles natively at metal3.1 + metal4.0 and is named by its manifest (skips without the Xcode Metal toolchain; METAL_STRICT=--strict to require it)
-	@bash scripts/check_metal_compiles.sh $(METAL_STRICT)
+	@bash scripts/check/metal_kernels.sh compile $(METAL_STRICT)
 
 check-metal-format: ## CI gate: every .metal kernel is clang-format clean (skips without clang-format; METAL_STRICT=--strict to require it)
-	@bash scripts/check_metal_format.sh $(METAL_STRICT)
+	@bash scripts/check/metal_kernels.sh format $(METAL_STRICT)
 
 check-metal-kernels-selftest: ## CI gate: recall test for the two MSL kernel gates over planted kernel trees and stub toolchains, each case asserting the exit code and the line or file named
 	@bash scripts/check/metal_kernels_selftest.sh
@@ -799,8 +799,8 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/ssd_canary_selftest.sh
 	@$(MAKE) --no-print-directory check-published-table
 	@bash scripts/check/metal_kernels_selftest.sh
-	@bash scripts/check_metal_format.sh
-	@bash scripts/check_metal_compiles.sh
+	@bash scripts/check/metal_kernels.sh format
+	@bash scripts/check/metal_kernels.sh compile
 	@python3 scripts/report/debt_report.py --shellcheck
 	@python3 scripts/report/debt_report.py --file-sizes || true
 	@bash scripts/target_size_report.sh || true

@@ -1,6 +1,6 @@
 # MSL compile probes
 
-Support files for `make check-metal-compiles` (`scripts/check_metal_compiles.sh`).
+Support files for `make check-metal-compiles` (`scripts/check/metal_kernels.sh compile`).
 Nothing here is compiled into the binary or read at runtime — production kernels
 come from `../*.metal` via `include_str!`, and production headers are built in
 Rust at dispatch.

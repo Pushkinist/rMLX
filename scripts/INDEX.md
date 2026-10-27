@@ -25,8 +25,6 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `check_kv_codec_disposition.sh` | make check-kv-codec-disposition, make ci, check_kv_codec_disposition_fixtures.sh | CI gate: what the KV help and docs say a codec does agrees with its runtime disposition. |
 | `check_kv_codec_disposition_fixtures.sh` | make check-kv-codec-disposition-fixtures, make ci | Recall test for check_kv_codec_disposition.sh: synthetic scan roots, asserting rule and exit code. |
 | `check_kv_layer_quants.sh` | make check-kv-layer-quants, make ci, check/rust_gates_fixtures.sh | CI gate: the per-layer KV codec vector has one producer, and every cache stack uses it. |
-| `check_metal_compiles.sh` | make check-metal-compiles, make ci, check/metal_kernels_selftest.sh | CI gate: every .metal kernel compiles at -std=metal3.1 and metal4.0 and is named by its manifest. |
-| `check_metal_format.sh` | make check-metal-format, make ci, pre-commit, check/metal_kernels_selftest.sh | CI gate: every .metal kernel file is clang-format clean. |
 | `check_no_decode_swallow.sh` | make check-no-decode-swallow, make ci, check/rust_gates_fixtures.sh | CI gate: a failed decode step or prefill chunk propagates instead of looking like a success. |
 | `check_no_inline_tests.sh` | make check-no-inline-tests, make ci, check/rust_gates_fixtures.sh | CI gate: no inline #[cfg(test)] mod tests block in a non-test source file. |
 | `check_published_samples_fixtures.sh` | make check-published-samples-fixtures, make ci | Recall test for published_samples.py verify: synthetic sample-set roots, one edit per case. |
@@ -90,6 +88,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `check/gpu_tests.sh` | make check-gpu-tests-ignored, make check-named-skip-notices, make ci, check/gpu_tests_selftest.sh, check/rust_gates_fixtures.sh, run_gpu_tests.sh, +2 more scripts | CI gate: the classified GPU tests carry #[ignore] and name their stand-downs; one tool lists them. |
 | `check/gpu_tests_selftest.sh` | make check-named-skip-notices-fixtures, make ci | Recall test for check/gpu_tests.sh skip-notices and list: planted shapes, asserting the reason. |
 | `check/kernel_dispatch.sh` | make check-kernel-dtype-contract, make check-no-kernel-input-eval, make check-no-scalar-f32-leak, make ci, check/rust_gates_fixtures.sh | CI gate: Metal-kernel dispatchers keep inputs lazy, return the caller's dtype, leak no f32 scalar. |
+| `check/metal_kernels.sh` | make check-metal-compiles, make check-metal-format, make ci, pre-commit, check/metal_kernels_selftest.sh | CI gate: gated .metal kernels compile (compile) or are clang-format clean (format). |
 | `check/metal_kernels_selftest.sh` | make check-metal-kernels-selftest, make ci | Recall test for the MSL kernel gates: planted kernel trees and stub toolchains. |
 | `check/rust_gates_fixtures.sh` | make check-eval-lock-fixtures, make check-gpu-tests-ignored-fixtures, make check-kernel-dtype-contract-fixtures, make check-kv-layer-quants-fixtures, make check-no-decode-swallow-fixtures, make check-no-inline-tests-fixtures, make check-no-kernel-input-eval-fixtures, make check-no-scalar-f32-leak-fixtures, make ci | Recall test for the Rust-source gates: planted scan roots from a table, asserting exit and reason. |
 | `check/spec_round_loops.sh` | make check-spec-charge, make check-spec-sampling, make ci, check/spec_round_loops_selftest.sh, report/debt_report.py | CI gate: speculative round loops carry one phase-charge decision and the request's sampler. |
@@ -124,7 +123,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `lib/cpu_snapshot.sh` | bench_llama_ab.sh, perf_ab.sh, perf_ab_selftest.sh, +2 more scripts | Per-process cumulative CPU seconds, for interference gates; source it. |
 | `lib/identity.sh` | bench_cache_types.sh, bench_cell.sh, perf-iter/bench_decode_tps.sh, +5 more scripts | Shared §8.5 run-identity for rMLX bench scripts. |
 | `lib/kv_boundary_default.py` | ingest/codec_inertness_ingest.py, ingest/perf_ab_ingest.py | The engine's default KV boundary-layer counts, read from the engine. |
-| `lib/metal_dirs.sh` | check/kernel_dispatch.sh, check/metal_kernels_selftest.sh, check_metal_compiles.sh, +2 more scripts | The directories holding gated .metal kernels; sourced by the metal gates. |
+| `lib/metal_dirs.sh` | check/kernel_dispatch.sh, check/metal_kernels.sh, check/metal_kernels_selftest.sh, +1 more scripts | The directories holding gated .metal kernels; sourced by the metal gates. |
 | `lib/mlx_pin.sh` | crates/rmlx-mlx/src/pin_tests.rs, mlx_preflight.sh, mlx_restore_pin.sh | Read the validated MLX / mlx-c pair from its one declaration. |
 | `lib/prefill_ms.py` | mst_capture.sh | Read the prefill time of an rmlx run out of its log: `generate: prefill{prefill_ms}`. |
 | `lib/published_aggregate.py` | spec_bench_published.sh, spec_bench_published_selftest.sh | Assemble and summarise a published-protocol speculative-decoding run. |

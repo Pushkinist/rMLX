@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 # Recall test for the MSL kernel gates: planted kernel trees and stub toolchains.
 #
-# Recall test for: check_metal_compiles.sh default --strict
-#                  check_metal_format.sh default --strict
+# Recall test for: check/metal_kernels.sh compile format
 #
-# Each case copies the gates into a throwaway root, plants the gated kernel directories
+# Each case copies the gate into a throwaway root, plants the gated kernel directories
 # beside them with a manifest and some `.metal` files, puts stub `xcrun` and `clang-format`
 # on a PATH of their own and asserts the literal exit code and the line or the file the gate
 # names. A kernel holding the word PLANTED_FAIL is the one the stubs reject. The stubs record
 # their argv, so a case can read which language levels and which files the gate handed them.
-# No case runs the real compiler or the real formatter. The gates are named in one place,
+# No case runs the real compiler or the real formatter. The gate is named in one place,
 # `gate` and `GATE_FILES`.
 #
 # Usage:  bash scripts/check/metal_kernels_selftest.sh
@@ -23,7 +22,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 . "$REPO_ROOT/scripts/lib/selftest_support.sh"
 st_init metal-kernels-selftest
 
-GATE_FILES=(scripts/check_metal_compiles.sh scripts/check_metal_format.sh scripts/lib/metal_dirs.sh)
+GATE_FILES=(scripts/check/metal_kernels.sh scripts/lib/metal_dirs.sh)
 
 # gate <compile|format> <root> [args]: one gate, run from the copy in <root>, under GATE_PATH.
 gate() {
@@ -46,14 +45,14 @@ gate_compile() {
     local root="$1"
     shift
     # shellcheck disable=SC2046 # the prefix is words
-    st_bounded 60 $(clean_env) bash "$root/scripts/check_metal_compiles.sh" ${1+"$@"}
+    st_bounded 60 $(clean_env) bash "$root/scripts/check/metal_kernels.sh" compile ${1+"$@"}
 }
 
 gate_format() {
     local root="$1"
     shift
     # shellcheck disable=SC2046 # the prefix is words
-    st_bounded 60 $(clean_env) bash "$root/scripts/check_metal_format.sh" ${1+"$@"}
+    st_bounded 60 $(clean_env) bash "$root/scripts/check/metal_kernels.sh" format ${1+"$@"}
 }
 
 # ---- stub toolchains ---------------------------------------------------------
@@ -251,6 +250,15 @@ toolchain yes no
 root="$(plant c-no-manifest)"
 rm -f "$root/$KV/probes/kernels.manifest"
 st_case "compile: a missing manifest fails and is named" 1 --has "ERROR: missing $root/$KV/probes/kernels.manifest" --has "  $KV (missing manifest)" -- gate compile "$root"
+
+toolchain yes no
+root="$(plant c-empty)"
+for dir in "$KV" "$MODELS" "$MLX"; do
+    rm -f "${root:?}/$dir"/*.metal
+    printf '# planted\n' >"$root/$dir/probes/kernels.manifest"
+done
+st_case "compile: an empty kernel set is a skip" 0 --has "SKIP: no .metal files under" --lacks "OK:" -- gate compile "$root"
+st_case "compile: an empty kernel set with --strict is a refusal" 1 --has "ERROR: --strict: no .metal files found under" -- gate compile "$root" --strict
 
 st_case "compile: an unknown argument is a usage error" 2 --has "usage:" -- gate compile "$root" --loose
 
