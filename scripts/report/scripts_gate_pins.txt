@@ -233,8 +233,6 @@ caller spec_broken_engine.sh
 recall-missing bench_identity_selftest.sh default
 recall-missing bench_llama_ab_selftest.sh default
 recall-missing check_kv_boundary_default_parity.sh default
-recall-missing check_metal_compiles.sh default
-recall-missing check_metal_format.sh default
 recall-missing codec_smoke_runner_selftest.sh default
 recall-missing perf_ab_ingest_selftest.sh default
 recall-missing perf_ab_selftest.sh default

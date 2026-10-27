@@ -155,6 +155,9 @@ jobs:
         run: make check-personal-data
       - name: the personal-data gate still catches what it is for
         run: make check-personal-data-selftest
+      # Stub toolchains and planted kernel trees: no Metal compiler is needed.
+      - name: the MSL kernel gates still catch what they are for
+        run: make check-metal-kernels-selftest
       # The restore script links and pins Homebrew kegs, so its recall test runs
       # it against throwaway prefixes and a stub brew. It needs no macOS tool:
       # bash with compgen, tar, shasum, strings, awk, sort -V and head -c.
