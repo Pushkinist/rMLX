@@ -131,7 +131,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         check-claim-bypass check-claim-bypass-selftest \
         check-personal-data check-personal-data-selftest \
         check-kernel-dtype-contract check-kernel-dtype-contract-fixtures \
-        check-metal-compiles check-metal-format check-metal-kernels-selftest gputrace-selftest
+        check-metal-compiles check-metal-format check-metal-kernels-selftest gputrace-selftest gc-selftest
 
 help:
 	@awk 'BEGIN{FS=":.*##"} /^[a-zA-Z_-]+:.*##/ {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -734,6 +734,9 @@ check-metal-kernels-selftest: ## CI gate: recall test for the two MSL kernel gat
 gputrace-selftest: ## CI gate: recall test for the three modes of the .gputrace reader (kernels, diff, summary) over synthetic bundles, each case asserting the exit code and the line or reason
 	@bash scripts/profile/gputrace_selftest.sh
 
+gc-selftest: ## CI gate: recall test for the cleanup tools (target_gc.sh, traces_gc.sh, target_size_report.sh) over planted scratch trees, each case asserting the exit code, the output and what is left on disk
+	@bash scripts/host/gc_selftest.sh
+
 # ---- one-shot CI gate -------------------------------------------------
 ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gate: fmt + clippy + test + feature-gated capture tests + deny + audit + metrics-sanity + inline-test + A/B-harness + MSL gates
 	@bash scripts/report/debt_report_selftest.sh
@@ -803,6 +806,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@$(MAKE) --no-print-directory check-published-table
 	@bash scripts/check/metal_kernels_selftest.sh
 	@bash scripts/profile/gputrace_selftest.sh
+	@bash scripts/host/gc_selftest.sh
 	@bash scripts/check/metal_kernels.sh format
 	@bash scripts/check/metal_kernels.sh compile
 	@python3 scripts/report/debt_report.py --shellcheck

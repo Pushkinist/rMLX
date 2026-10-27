@@ -225,7 +225,6 @@ recall-missing codec_smoke_runner_selftest.sh default
 recall-missing perf_ab_ingest_selftest.sh default
 recall-missing perf_ab_selftest.sh default
 recall-missing published_ingest_selftest.sh default
-recall-missing target_size_report.sh default
 silenced lib/published_table.py default
 silenced report/debt_report.py --file-sizes,default
 silenced target_size_report.sh default
