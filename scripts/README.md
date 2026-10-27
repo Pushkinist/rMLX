@@ -263,6 +263,10 @@ comment):
 | a snapshot's identity columns | `lib/snapshot_identity.py` |
 | the gated `.metal` directories | `lib/metal_dirs.sh` |
 
+A harness on the case runner ends in `st_done`, ends early on purpose through
+`st_finish_early`, and sets no EXIT trap of its own: the runner's trap turns an
+exit 0 before `st_done` into exit 1. [review]
+
 A script that defines one of these again fails the gate (`lib-shadow`, section
 1). A path of the form `target/<profile>/rmlx`, the profile a name or a
 variable, written in a file other than `lib/identity.sh` fails it too: a

@@ -6,7 +6,10 @@
 # inspects what the command left behind, then ends with st_done. Exit codes of
 # a harness on the runner: 0 every case held, 1 one did not or none ran,
 # 2 a fixture could not be built or a case was written with a bad needle.
-# st_init installs the EXIT trap, so it replaces any trap set before it.
+# st_init installs the EXIT trap, so it replaces any trap set before it, and a
+# harness that calls it sets no EXIT trap of its own. The trap turns an exit 0
+# before st_done into exit 1: bash 3.2 exits 0 on an unbound variable when an
+# EXIT trap is set. A harness that ends early on purpose calls st_finish_early.
 #
 # The two spec-bench tests drive a harness against a stub server and need a
 # stand-in for `python3` that stands between the harness and the client reader.
@@ -21,6 +24,7 @@ st_init() {
 	ST_SKIPPED=0
 	ST_OUT=""
 	ST_RC=0
+	ST_FINISHED=""
 	local tmp="${TMPDIR:-/tmp}"
 	ST_WORK="$(mktemp -d "${tmp%/}/${1}.XXXXXX")" || {
 		echo "${1}: cannot make a scratch directory" >&2
@@ -30,7 +34,18 @@ st_init() {
 }
 
 st_cleanup() {
+	local rc=$?
 	[ -z "${ST_WORK:-}" ] || rm -rf "$ST_WORK"
+	if [ "$rc" -eq 0 ] && [ -z "${ST_FINISHED:-}" ]; then
+		echo "${ST_SUITE}: the harness ended before its summary" >&2
+		exit 1
+	fi
+}
+
+# st_finish_early — end the harness with exit 0 before st_done, on purpose.
+st_finish_early() {
+	ST_FINISHED=1
+	exit 0
 }
 
 # st_die <why> — the harness itself is broken: exit 2, not a red case. Called
@@ -130,6 +145,7 @@ st_skip() {
 # st_done — print the summary line; fail when a case failed or none ran.
 st_done() {
 	st_abort_if_broken
+	ST_FINISHED=1
 	printf '%s: %d passed, %d failed' "$ST_SUITE" "$ST_PASSED" "$ST_FAILED"
 	if [ "$ST_SKIPPED" -gt 0 ]; then printf ', %d skipped' "$ST_SKIPPED"; fi
 	printf '\n'

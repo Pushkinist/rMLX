@@ -2485,6 +2485,7 @@ mkdir -p "$ST_WORK/r/scripts"
 printf '# preamble\n| `a.sh` | by hand | x |\n' >"$ST_WORK/r/scripts/INDEX.md"
 line=$(sg_row_line "$ST_WORK/r" a.sh)
 echo "row at line $line"
+st_finish_early
 EOF
 st_case runner_row_present 0 --what "sg_row_line on a row that is there prints its line number" \
     --is "row at line 2" -- runner_child "$body"
@@ -2514,6 +2515,39 @@ st_done
 EOF
 st_case runner_a_run_of_skips_only_is_no_case_ran 1 --what "a run in which every case was skipped checked nothing, and is not a clean run" \
     --has "child: 0 passed, 0 failed, 1 skipped" --has "child: no case ran" -- runner_child "$body"
+
+body="$ST_WORK/runner_unbound"
+cat >"$body" <<'EOF'
+st_case held 0 -- true
+echo "$NO_SUCH_VARIABLE"
+st_done
+EOF
+st_case runner_unbound_expansion_is_exit_1 1 --what "a harness that dies on an unbound variable before its summary exits 1 and says so, where bash 3.2 would exit 0" \
+    --has "child: the harness ended before its summary" -- runner_child "$body"
+
+body="$ST_WORK/runner_exit_before_done"
+cat >"$body" <<'EOF'
+st_case held 0 -- true
+exit 0
+EOF
+st_case runner_exit_0_before_the_summary_is_exit_1 1 --what "an exit 0 that skips st_done is a harness that ended before its summary" \
+    --has "child: the harness ended before its summary" -- runner_child "$body"
+
+body="$ST_WORK/runner_finish_early"
+cat >"$body" <<'EOF'
+st_finish_early
+st_case never 0 -- false
+st_done
+EOF
+st_case runner_finish_early_is_exit_0 0 --what "st_finish_early ends the harness with exit 0 and no complaint" \
+    --lacks "ended before its summary" -- runner_child "$body"
+
+body="$ST_WORK/runner_die"
+cat >"$body" <<'EOF'
+st_die "the fixture is broken"
+EOF
+st_case runner_die_stays_exit_2 2 --what "st_die ends the harness with exit 2, not the exit 1 of a harness without a summary" \
+    --has "child: the fixture is broken" --lacks "ended before its summary" -- runner_child "$body"
 
 # ---- the real tree -------------------------------------------------------
 
