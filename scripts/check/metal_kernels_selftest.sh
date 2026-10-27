@@ -41,6 +41,13 @@ clean_env() {
         STUB_NO_METAL4="$STUB_NO_METAL4" STUB_NO_GUARD="$STUB_NO_GUARD" STUB_CF="$STUB_CF"
 }
 
+gate_raw() {
+    local root="$1"
+    shift
+    # shellcheck disable=SC2046 # the prefix is words
+    st_bounded 60 $(clean_env) bash "$root/scripts/check/metal_kernels.sh" ${1+"$@"}
+}
+
 gate_compile() {
     local root="$1"
     shift
@@ -59,7 +66,7 @@ gate_format() {
 
 TOOLS="$ST_WORK/tools"
 mkdir -p "$TOOLS" "$ST_WORK/xcrun" "$ST_WORK/clang-format" "$ST_WORK/cf-only-via-xcrun"
-for tool in bash mktemp cut xargs tr grep cat basename dirname head rm sed awk mkdir sort touch; do
+for tool in bash mktemp cut tr grep cat basename dirname head rm sed awk mkdir sort touch; do
     found="$(command -v "$tool")" || st_die "no $tool on this host"
     ln -s "$found" "$TOOLS/$tool"
 done
@@ -260,7 +267,29 @@ done
 st_case "compile: an empty kernel set is a skip" 0 --has "SKIP: no .metal files under" --lacks "OK:" -- gate compile "$root"
 st_case "compile: an empty kernel set with --strict is a refusal" 1 --has "ERROR: --strict: no .metal files found under" -- gate compile "$root" --strict
 
+toolchain yes no
+root="$(plant c-no-buffers)"
+printf '# planted\na_one.metal|-\n' >"$root/$KV/probes/kernels.manifest"
+st_case "compile: a manifest line without a buffers field fails and is named" 1 \
+    --has "ERROR: manifest line has no buffers field: $KV/a_one.metal" --has "  $KV/a_one.metal (no buffers field)" \
+    --lacks "unbound" --lacks "OK:" -- gate compile "$root"
+
+toolchain yes no
+root="$(plant c-quote-body)"
+printf '# planted\na_one".metal|-|buf:u|-\n' >"$root/$KV/probes/kernels.manifest"
+st_case "compile: a quote in a manifest body name fails and is named" 1 \
+    --has "ERROR: manifest references missing body: $KV/a_one\".metal" --lacks "xargs" -- gate compile "$root"
+
+toolchain yes no
+root="$(plant c-quote-define)"
+printf '# planted\na_one.metal|-|buf:u|X="a\n' >"$root/$KV/probes/kernels.manifest"
+st_case "compile: a quote in a manifest define is read, not a parse error" 0 \
+    --has "OK: 3 .metal kernels compile clean" --lacks "xargs" -- gate compile "$root"
+
 st_case "compile: an unknown argument is a usage error" 2 --has "usage:" -- gate compile "$root" --loose
+
+st_case "no mode is a usage error" 2 --has "usage:" -- gate_raw "$root"
+st_case "an unknown mode is a usage error" 2 --has "usage:" -- gate_raw "$root" lint
 
 # ---- format gate -------------------------------------------------------------
 

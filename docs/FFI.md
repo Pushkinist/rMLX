@@ -733,8 +733,8 @@ see `CLAUDE.md` hard rule 10.
 
 ### MSL gates (`make ci`, enforced in CI)
 
-`scripts/lib/metal_dirs.sh` lists the three kernel directories, and both gates
-source it. The `check-metal-format` pre-commit hook triggers on any
+`scripts/lib/metal_dirs.sh` lists the three kernel directories, and the tool
+sources it. The `check-metal-format` pre-commit hook triggers on any
 `crates/*/src/metal/*.metal` file but checks only the listed directories. A
 crate that starts shipping MSL must be added to the list; nothing else
 discovers it.

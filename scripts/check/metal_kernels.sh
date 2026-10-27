@@ -112,7 +112,7 @@
 # it. Style is pinned by a `.clang-format` in each kernel directory, which
 # clang-format discovers by walking up from each file.
 #
-# Scope is the same directory list the compile gate uses — directory, not crate:
+# Scope is the same directory list compile mode uses — directory, not crate:
 # a `.metal` file is gated by where it lives, not by whose dispatcher reads it.
 #
 # clang-format is not on PATH on a stock macOS box — it ships inside the Xcode
@@ -124,8 +124,7 @@
 # `--strict` turns a missing clang-format into a hard failure, and likewise an
 # empty file set: a renamed or moved kernel directory would otherwise disable the
 # whole gate while the CI job stayed green — protecting nothing is the one
-# outcome a gate must never report as success. CI passes it. Detection and
-# enforcement stay in one place so the two cannot drift.
+# outcome a gate must never report as success. CI passes it.
 #
 # A missing directory is always an error, strict or not: `METAL_DIRS` names
 # directories that are supposed to exist, so one that does not is a stale list,
@@ -177,6 +176,14 @@ skip_if_empty() {
         echo "SKIP: no .metal files under ${METAL_DIRS[*]}."
         exit 0
     fi
+}
+
+# field <line> <n>: the nth `|` field of a manifest line, without surrounding blanks.
+field() {
+    local value
+    value="$(echo "$1" | cut -d'|' -f"$2")"
+    value="${value#"${value%%[![:space:]]*}"}"
+    printf '%s' "${value%"${value##*[![:space:]]}"}"
 }
 
 run_compile() {
@@ -314,10 +321,10 @@ run_compile() {
             # Skip comments / blanks.
             case "${line}" in ''|'#'*) continue ;; esac
 
-            body="$(echo "${line}" | cut -d'|' -f1 | xargs)"
-            header="$(echo "${line}" | cut -d'|' -f2 | xargs)"
-            buffers="$(echo "${line}" | cut -d'|' -f3 | xargs)"
-            defines="$(echo "${line}" | cut -d'|' -f4 | xargs)"
+            body="$(field "${line}" 1)"
+            header="$(field "${line}" 2)"
+            buffers="$(field "${line}" 3)"
+            defines="$(field "${line}" 4)"
 
             echo "${body}" >> "${referenced}"
             case "${header}" in ../*) echo "${header#../}" >> "${referenced}" ;; esac
@@ -325,6 +332,12 @@ run_compile() {
             if [ ! -f "${METAL_DIR}/${body}" ]; then
                 echo "ERROR: manifest references missing body: ${rel_dir}/${body}" >&2
                 failed+=("${rel_dir}/${body} (missing)")
+                continue
+            fi
+
+            if [ -z "${buffers}" ]; then
+                echo "ERROR: manifest line has no buffers field: ${rel_dir}/${body}" >&2
+                failed+=("${rel_dir}/${body} (no buffers field)")
                 continue
             fi
 
@@ -383,7 +396,7 @@ run_compile() {
                 echo '    uint  simdgroups_per_threadgroup       [[simdgroups_per_threadgroup]]) {'
                 # Buffer aliases: the names this body expects, at their dispatch dtype.
                 IFS=',' read -ra bufs <<< "${buffers}"
-                for b in "${bufs[@]}"; do
+                for b in ${bufs[@]+"${bufs[@]}"}; do
                     name="${b%%:*}"
                     type="${b##*:}"
                     case "${type}" in
