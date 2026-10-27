@@ -184,7 +184,7 @@ half_setup() {
     # `<pkg name><TAB><member dir>` per member, and the model layer's own dir.
     member_dirs=""
     models_dir=""
-    for m in "${members[@]}"; do
+    for m in ${members[@]+"${members[@]}"}; do
         manifest="${ROOT}/${m}/Cargo.toml"
         [ -f "${manifest}" ] || continue
         pkg="$(awk -F'"' '/^name[[:space:]]*=/{print $2; exit}' "${manifest}")"
@@ -443,7 +443,7 @@ if on == 0 or off == 0:
 print('\n'.join(rows))
 PY
 
-    printf '%s\n' "${listing}" | python3 -c "${SPLIT_PY}" "${ROOT}" "${METAL_DIRS[@]}"
+    printf '%s\n' "${listing}" | python3 -c "${SPLIT_PY}" "${ROOT}" ${METAL_DIRS[@]+"${METAL_DIRS[@]}"}
 }
 
 mode="${1:-}"

@@ -1380,7 +1380,7 @@ classify_root() {
     macro_generated=""
     declared_unscanned=""
 
-    for crate in "${members[@]}"; do
+    for crate in ${members[@]+"${members[@]}"}; do
         crate_dir="${SCAN_ROOT}/${crate}"
         [ "${crate}" != . ] || crate_dir="${SCAN_ROOT}"
         src_dir="${crate_dir}/src"
@@ -1425,10 +1425,10 @@ classify_root() {
         [ ${#crate_files[@]} -eq 0 ] && continue
         total_files=$((total_files + ${#crate_files[@]}))
 
-        for f in "${crate_files[@]}"; do
+        for f in ${crate_files[@]+"${crate_files[@]}"}; do
             [ -r "$f" ] || refuse "cannot read ${f}."
         done
-        out=$(awk "$AWK_DETECT" "${crate_files[@]}") || refuse "the detector failed over the test files of ${crate_dir}."
+        out=$(awk "$AWK_DETECT" ${crate_files[@]+"${crate_files[@]}"}) || refuse "the detector failed over the test files of ${crate_dir}."
         while IFS= read -r line; do
             [ -z "$line" ] && continue
             case "$line" in

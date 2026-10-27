@@ -417,9 +417,6 @@ env-knob spec_bench_published.sh KV_QUANT_SEEN,MEMORY_PID,RMLX_HOME,SAMPLING_SEE
 env-knob spec_bench_selftest.sh OUT_PATH
 env-knob ssd_canary.sh PORT,SSD_GB,VERIFIER_MODEL
 env-knob target_gc.sh MAX_AGE_DAYS
-unguarded-array check/gpu_tests.sh crate_files,members
-unguarded-array check/kernel_dispatch.sh METAL_DIRS,SCAN_ROOTS,SRC_DIRS
-unguarded-array check/metal_kernels.sh FILES,METAL_DIRS,MISSING_DIRS,STDS,defs,failed
 unguarded-array check_kv_codec_disposition.sh BANNER_DOCS
 unguarded-array check_kv_codec_disposition_fixtures.sh BASE_FILES,CASES
 unguarded-array check_published_samples_fixtures.sh args
@@ -432,4 +429,3 @@ unguarded-array spec_bench.sh MTP_ANSWER_DIGESTS,MTP_CLIENT_TPS_VALUES,MTP_ENGIN
 unguarded-array spec_bench_published.sh CELLS,CELL_ARGS,FIXED_FILES,GREEDY_CELL_ARGS,HOST_WINDOWS,LC_RUNS,PASS_FILES,THERMAL_READINGS,args
 unguarded-array spec_bench_published_selftest.sh cell_args
 unguarded-array ssd_canary.sh ALL_PROMPTS
-unguarded-array suite/gpu_test_classes.sh METAL_DIRS,members

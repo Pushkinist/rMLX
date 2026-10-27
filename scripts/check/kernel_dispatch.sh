@@ -154,17 +154,17 @@ scalar-f32)
 esac
 
 if [ "${#SCAN_ROOTS[@]}" -gt 0 ]; then
-    SRC_DIRS=("${SCAN_ROOTS[@]}")
+    SRC_DIRS=(${SCAN_ROOTS[@]+"${SCAN_ROOTS[@]}"})
 else
     # shellcheck source=scripts/lib/metal_dirs.sh
     . "$REPO_ROOT/scripts/lib/metal_dirs.sh"
     SRC_DIRS=()
-    for d in "${METAL_DIRS[@]}"; do
+    for d in ${METAL_DIRS[@]+"${METAL_DIRS[@]}"}; do
         SRC_DIRS+=("${d%/metal}")
     done
 fi
 
-for d in "${SRC_DIRS[@]}"; do
+for d in ${SRC_DIRS[@]+"${SRC_DIRS[@]}"}; do
     if [ ! -e "$d" ]; then
         echo "$LABEL: scan root does not exist: $d" >&2
         exit 2
@@ -176,7 +176,7 @@ for d in "${SRC_DIRS[@]}"; do
 done
 
 dispatcher_files() {
-    find "${SRC_DIRS[@]}" -type f -name '*.rs' \
+    find ${SRC_DIRS[@]+"${SRC_DIRS[@]}"} -type f -name '*.rs' \
         ! -name '*_tests.rs' ! -name 'tests.rs' \
         -exec grep -lq 'MetalKernelInvoke' {} \; \
         -print
@@ -192,7 +192,7 @@ input_eval_files() {
     while IFS= read -r scaffold; do
         [ -z "$scaffold" ] || dirs="$dirs${scaffold%/*}$nl"
     done <<<"$dispatchers"
-    find "${SRC_DIRS[@]}" -type f -name '*_common.rs' | while IFS= read -r scaffold; do
+    find ${SRC_DIRS[@]+"${SRC_DIRS[@]}"} -type f -name '*_common.rs' | while IFS= read -r scaffold; do
         case "$dirs" in
         *"$nl${scaffold%/*}$nl"*) printf '%s\n' "$scaffold" ;;
         esac
@@ -204,7 +204,7 @@ list_files() {
     input-eval) input_eval_files ;;
     dtype-contract) dispatcher_files ;;
     scalar-f32)
-        find "${SRC_DIRS[@]}" -type f -name '*.rs' \
+        find ${SRC_DIRS[@]+"${SRC_DIRS[@]}"} -type f -name '*.rs' \
             -not -path '*/target/*' \
             -not -path '*/tests/*' \
             -not -name '*_tests.rs' \
@@ -598,7 +598,7 @@ done < <(list_files)
 
 if [ "$MODE" = scalar-f32 ] && [ "${#FILES[@]}" -eq 0 ]; then
     echo "$LABEL: no .rs file to scan under" >&2
-    printf '  %s\n' "${SRC_DIRS[@]}" >&2
+    printf '  %s\n' ${SRC_DIRS[@]+"${SRC_DIRS[@]}"} >&2
     exit 2
 fi
 
@@ -644,7 +644,7 @@ fi
 
 if [ "$FOUND" -lt "$FLOOR" ]; then
     echo "$LABEL: found $FOUND $UNIT under" >&2
-    printf '  %s\n' "${SRC_DIRS[@]}" >&2
+    printf '  %s\n' ${SRC_DIRS[@]+"${SRC_DIRS[@]}"} >&2
     echo "but expected at least $FLOOR." >&2
     echo "A dispatcher was renamed, moved or hidden behind a helper and the scan lost" >&2
     echo "coverage. Fix the scan (or lower the floor deliberately, in the same change)." >&2

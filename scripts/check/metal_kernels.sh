@@ -155,7 +155,7 @@ MISSING_DIRS=()
 read_population() {
     local d
     shopt -s nullglob
-    for d in "${METAL_DIRS[@]}"; do
+    for d in ${METAL_DIRS[@]+"${METAL_DIRS[@]}"}; do
         if [ ! -d "${d}" ]; then
             MISSING_DIRS+=("${d#"${REPO_ROOT}/"}")
             continue
@@ -168,12 +168,12 @@ read_population() {
 skip_if_empty() {
     if [ ${#FILES[@]} -eq 0 ]; then
         if [ "${STRICT}" = 1 ]; then
-            echo "ERROR: --strict: no .metal files found under ${METAL_DIRS[*]}." >&2
+            echo "ERROR: --strict: no .metal files found under ${METAL_DIRS[*]+${METAL_DIRS[*]}}." >&2
             echo "       An empty file set means this gate checked nothing." \
                  "Refusing to pass by skipping." >&2
             exit 1
         fi
-        echo "SKIP: no .metal files under ${METAL_DIRS[*]}."
+        echo "SKIP: no .metal files under ${METAL_DIRS[*]+${METAL_DIRS[*]}}."
         exit 0
     fi
 }
@@ -287,7 +287,7 @@ run_compile() {
             exit 1
         fi
         echo "NOTE: this toolchain ${reduced_reason}."
-        echo "      Checking ${STDS[*]}; bodies guarded by ${TENSOR_GUARD} are SKIPPED," \
+        echo "      Checking ${STDS[*]+${STDS[*]}}; bodies guarded by ${TENSOR_GUARD} are SKIPPED," \
              "not silently passed."
         echo "      Install a Metal 4 toolchain to run the whole gate. CI runs it with" \
              "--strict, which refuses this."
@@ -297,7 +297,7 @@ run_compile() {
     checked=0
     skipped=0
 
-    for METAL_DIR in "${METAL_DIRS[@]}"; do
+    for METAL_DIR in ${METAL_DIRS[@]+"${METAL_DIRS[@]}"}; do
         PROBE_DIR="${METAL_DIR}/probes"
         MANIFEST="${PROBE_DIR}/kernels.manifest"
         rel_dir="${METAL_DIR#"${REPO_ROOT}/"}"
@@ -416,7 +416,7 @@ run_compile() {
                 # own signature.
                 if [ -n "${defines}" ] && [ "${defines}" != "-" ]; then
                     IFS=',' read -ra defs <<< "${defines}"
-                    for d in "${defs[@]}"; do
+                    for d in ${defs[@]+"${defs[@]}"}; do
                         echo "#define ${d%%=*} ${d#*=}"
                     done
                 fi
@@ -426,7 +426,7 @@ run_compile() {
                 echo '}'
             } > "${probe}" || { failed+=("${rel_dir}/${body} (probe assembly)"); continue; }
 
-            for std in "${STDS[@]}"; do
+            for std in ${STDS[@]+"${STDS[@]}"}; do
                 if ! err="$(xcrun -sdk macosx metal "-std=${std}" -c "${probe}" \
                         -o "${TMP}/out.air" 2>&1)"; then
                     echo "FAIL: ${rel_dir}/${body} at -std=${std}" >&2
@@ -454,7 +454,7 @@ run_compile() {
 
     if [ ${#failed[@]} -gt 0 ]; then
         echo "ERROR: ${#failed[@]} .metal kernel check(s) failed:" >&2
-        for f in "${failed[@]}"; do echo "  ${f}" >&2; done
+        for f in ${failed[@]+"${failed[@]}"}; do echo "  ${f}" >&2; done
         exit 1
     fi
 
@@ -462,10 +462,10 @@ run_compile() {
     skip_if_empty
 
     if [ "${skipped}" -gt 0 ]; then
-        echo "OK: ${checked} .metal kernels compile clean at ${STDS[*]};" \
+        echo "OK: ${checked} .metal kernels compile clean at ${STDS[*]+${STDS[*]}};" \
              "${skipped} skipped (see the ${TENSOR_GUARD} notes above)."
     else
-        echo "OK: ${checked} .metal kernels compile clean at ${STDS[*]}."
+        echo "OK: ${checked} .metal kernels compile clean at ${STDS[*]+${STDS[*]}}."
     fi
 }
 
@@ -494,18 +494,18 @@ run_format() {
 
     if [ ${#MISSING_DIRS[@]} -gt 0 ]; then
         echo "ERROR: kernel director(ies) listed in scripts/lib/metal_dirs.sh do not exist:" >&2
-        for d in "${MISSING_DIRS[@]}"; do echo "  ${d}" >&2; done
+        for d in ${MISSING_DIRS[@]+"${MISSING_DIRS[@]}"}; do echo "  ${d}" >&2; done
         echo "       A stale list silently shrinks this gate. Fix the list or restore the directory." >&2
         exit 1
     fi
 
     skip_if_empty
 
-    if ! "${CLANG_FORMAT}" --dry-run -Werror "${FILES[@]}" 2>&1; then
+    if ! "${CLANG_FORMAT}" --dry-run -Werror ${FILES[@]+"${FILES[@]}"} 2>&1; then
         echo >&2
         echo "ERROR: the .metal files above are not clang-format clean." >&2
         echo "Fix with:" >&2
-        for d in "${METAL_DIRS[@]}"; do
+        for d in ${METAL_DIRS[@]+"${METAL_DIRS[@]}"}; do
             echo "  xcrun clang-format -i ${d#"${REPO_ROOT}/"}/*.metal" >&2
         done
         exit 1
