@@ -42,7 +42,7 @@
 use std::path::Path;
 
 use rmlx_core::error::{Error, Result};
-use rmlx_loader::{load_config, load_shard_index, ShardSet};
+use rmlx_loader::{load_config, load_shard_index, release_mapped, ShardSet};
 use rmlx_mlx::{Array, Device, Dtype};
 use tracing::{debug, info};
 
@@ -227,6 +227,7 @@ pub fn load_from_path(model_dir: &Path, device: Device) -> Result<BitNetText> {
             })?;
             if let Ok(t) = st.tensor(name) {
                 let bytes = t.data().to_vec();
+                release_mapped(t.data());
                 let dtype = format!("{:?}", t.dtype());
                 let shape: Vec<usize> = t.shape().to_vec();
                 return Ok((bytes, dtype, shape));

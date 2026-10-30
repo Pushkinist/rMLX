@@ -83,15 +83,21 @@ PY
 	echo "$path"
 }
 
-# check <name> <want-exit> <what-it-proves> <result-file> [extra args...] [GREP:pat]
+# check <name> <want-exit> <what-it-proves> <result-file> [extra args...] [GREP:pat] [NOGREP:pat] [NOARM]
+#
+# Every case keeps arm A (`--keep-arm A`) unless it passes its own `--keep-arm`
+# or says NOARM.
 check() {
 	local name="$1" want="$2" what="$3" result="$4"
 	shift 4
-	local args=() greps=()
+	local args=() greps=() keep=(--keep-arm A)
 	local a
 	for a in "$@"; do
 		case "$a" in
 		GREP:*) greps+=("${a#GREP:}") ;;
+		NOGREP:*) greps+=("!${a#NOGREP:}") ;;
+		NOARM) keep=() ;;
+		--keep-arm) keep=() ; args+=("$a") ;;
 		*) args+=("$a") ;;
 		esac
 	done
@@ -100,7 +106,7 @@ check() {
 	python3 "$SCRIPT" --dry-run "$result" \
 		--model snap --model-namespace mlx-community --weight-quant mxfp8 \
 		--arm-a-kv-quant none --arm-b-kv-quant mixed_k8g64_v4g64 \
-		--rmlx-bin "$STUB" ${args[@]+"${args[@]}"} >"$out" 2>&1
+		--rmlx-bin "$STUB" ${keep[@]+"${keep[@]}"} ${args[@]+"${args[@]}"} >"$out" 2>&1
 	got=$?
 	set -e
 
@@ -108,7 +114,11 @@ check() {
 	[[ "$got" -ne "$want" ]] && bad="exit=$got (want $want)"
 	local g
 	for g in ${greps[@]+"${greps[@]}"}; do
-		grep -qE "$g" "$out" || bad="${bad:+$bad; }missing: $g"
+		if [[ "$g" == !* ]]; then
+			! grep -qE "${g#!}" "$out" || bad="${bad:+$bad; }unexpected: ${g#!}"
+		else
+			grep -qE "$g" "$out" || bad="${bad:+$bad; }missing: $g"
+		fi
 	done
 	if [[ -z "$bad" ]]; then
 		PASSED=$((PASSED + 1))
@@ -124,9 +134,9 @@ echo "perf_ab_ingest selftest: refusal checks"
 
 CLEAN="$(make_result clean)"
 check accepts_a_clean_result 0 \
-	"a clean result produces two records" "$CLEAN" \
+	"a clean result produces one record, the kept arm's" "$CLEAN" \
 	"GREP:\"kv_quant\": \"none\"" \
-	"GREP:\"kv_quant\": \"mixed_k8g64_v4g64\"" \
+	"NOGREP:\"kv_quant\": \"mixed_k8g64_v4g64\"" \
 	"GREP:\"prompt_tokens\": 3770"
 
 # --- the taint / waiver family ------------------------------------------------
@@ -216,6 +226,44 @@ REFUSED="$(make_result kvrefused '{"results.0.arm_a.median_kv_cache_bytes": null
 check kv_refusal_records_null_not_zero 0 \
 	"an arm with no residency figure records null, never 0" "$REFUSED" \
 	"GREP:\"value\": null"
+
+# --- the kept arm -------------------------------------------------------------
+
+check keep_arm_writes_one_gate_record 0 \
+	"only the kept arm is written, as gate; its slots were already ab_arm rows" "$CLEAN" \
+	--keep-arm B \
+	"GREP:\"kv_quant\": \"mixed_k8g64_v4g64\"" \
+	"GREP:\"run_class\": \"gate\"" \
+	"NOGREP:\"kv_quant\": \"none\""
+
+check keep_arm_is_required 2 \
+	"the promoter does not choose the surviving arm for the caller" "$CLEAN" \
+	NOARM "GREP:required: --keep-arm"
+
+# --- the recorder ------------------------------------------------------------
+
+# The stub answers `metrics record --help` with an identity block and no
+# `--run-class`, as a binary built before the run class would.
+REC_HOME="$WORK/recorder_home"
+set +e
+RMLX_HOME="$REC_HOME" python3 "$SCRIPT" --record "$CLEAN" \
+	--model snap --model-namespace mlx-community --weight-quant mxfp8 \
+	--arm-a-kv-quant none --arm-b-kv-quant mixed_k8g64_v4g64 --keep-arm A \
+	--rmlx-bin "$STUB" >"$WORK/recorder.log" 2>&1
+rec_code=$?
+set -e
+rec_bad=""
+[[ "$rec_code" -ne 0 ]] || rec_bad="exit 0"
+grep -q "rmlx has no \`metrics record --run-class\`" "$WORK/recorder.log" || rec_bad="${rec_bad:+$rec_bad; }no refusal naming the binary"
+[[ ! -d "$REC_HOME/bench/perf_ab/records" ]] || rec_bad="${rec_bad:+$rec_bad; }a record was staged before the refusal"
+if [[ -z "$rec_bad" ]]; then
+	PASSED=$((PASSED + 1))
+	printf '  ok   %-38s exit=%s — %s\n' classless_recorder_refused "$rec_code" "a recorder without --run-class is refused, by name, before anything is staged"
+else
+	FAILED=$((FAILED + 1))
+	printf '  FAIL %-38s %s\n' classless_recorder_refused "$rec_bad"
+	sed 's/^/       | /' "$WORK/recorder.log" | tail -4
+fi
 
 # --- shape -------------------------------------------------------------------
 

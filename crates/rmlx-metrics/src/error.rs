@@ -100,6 +100,20 @@ pub enum Error {
         got: String,
     },
 
+    /// The record states no `run_class`. A record that does not say why it
+    /// was recorded never reaches the gates.
+    #[error(
+        "ingest: the record states no run_class; set it to gate, ab_arm or diagnostic, or \
+         pass `--run-class` to `rmlx metrics record`. Only gate rows reach bests and the \
+         gates (see docs/METRICS_DB.md §8.5)."
+    )]
+    MissingRunClass,
+
+    /// `rmlx metrics import --run-class` given for a source whose rows state
+    /// their own class, or missing for one whose rows state none.
+    #[error("import: {0}")]
+    ImportRunClass(String),
+
     /// Recorder-layer error (DB insert or transaction failure).
     #[error("recorder: {0}")]
     Recorder(String),

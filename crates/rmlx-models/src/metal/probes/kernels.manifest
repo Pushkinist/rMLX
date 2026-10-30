@@ -6,11 +6,11 @@
 # Format:  <body.metal> | <header or -> | <name:type,...> | [NAME=VALUE,...]
 #   type: u = uint buffer, i = int buffer, f = float buffer, b = bfloat buffer
 #
-# Neither kernel here has a header: both take their compile-time constants as
-# MLX template arguments, so the fourth field carries representative values for
-# them. `T` in the gated-delta body is a scalar 0-D input, which MLX declares as
-# `constant int&` — a numeric literal to the body, hence a define rather than a
-# buffer alias.
+# Every kernel here takes its compile-time constants as MLX template
+# arguments, so the fourth field carries representative values for them. `T`
+# in the gated-delta body and `scale` in the Hadamard body are scalar 0-D
+# inputs, which MLX declares as `constant int&` / `constant float&` — a numeric
+# literal to the body, hence a define rather than a buffer alias.
 #
 # Every `.metal` file in the parent directory must appear here, as a body or as
 # a `../`-prefixed header. The gate fails on one that does not.
@@ -22,3 +22,7 @@ gated_delta_step.metal | - | q:f,k:f,v:f,g:f,beta:f,state_in:f,y:f,state_out:f |
 # larger is probed — the two differ by the value of one template int, not by
 # what has to resolve.
 paroquant_rotate.metal | - | x:f,packed_pairs:u,cos_theta:f,sin_theta:f,channel_scales:f,params:u,out:f | ROWS_PER_TILE=4,MAX_KROT=16,MAX_GROUP_SIZE=256,InT=float
+# N and WIDTH are Ternary-Bonsai-2-27B's block and hidden size; scale is
+# 1 / sqrt(N); RADIX is the radix the host dispatches with. Forward only:
+# INVERSE selects where the signs apply, not what has to resolve.
+signed_block_hadamard.metal | ../hadamard_header.metal | x:b,signs:f,out:b | T=bfloat,N=1024,WIDTH=5120,INVERSE=0,RADIX=16,scale=0.03125f

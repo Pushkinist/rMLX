@@ -36,7 +36,7 @@ use super::decoder_layer::{AttnBlock, DecoderLayer, MlpBlock};
 use super::gated_delta_net::GatedDeltaNet;
 use super::layers::{Embedding, HadamardFold, Linear, ParoRotation, RmsNorm};
 use super::model::Qwen3_5MoeText;
-use super::moe::{DenseMlp, SharedExpert, SparseMoeBlock, SwitchMlp};
+use super::moe::{DenseMlp, SparseMoeBlock, SwitchMlp};
 
 /// Build one decoder layer's MLP block, selecting dense vs MoE by tensor facts.
 ///
@@ -72,7 +72,7 @@ fn build_mlp(
                 up_proj: lin(&format!("{m}.switch_mlp.up_proj"))?,
                 down_proj: lin(&format!("{m}.switch_mlp.down_proj"))?,
             },
-            shared_expert: SharedExpert {
+            shared_expert: DenseMlp {
                 gate_proj: lin(&format!("{m}.shared_expert.gate_proj"))?,
                 up_proj: lin(&format!("{m}.shared_expert.up_proj"))?,
                 down_proj: lin(&format!("{m}.shared_expert.down_proj"))?,

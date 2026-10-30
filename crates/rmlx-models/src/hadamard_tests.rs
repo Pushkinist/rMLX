@@ -13,7 +13,7 @@
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device, Dtype};
 
-use super::SignedBlockHadamard;
+use super::{Direction, SignedBlockHadamard};
 
 const BLOCK: usize = 1024;
 /// The input widths of the Ternary-Bonsai-2-27B pack: hidden size, the
@@ -122,24 +122,17 @@ fn max_abs_diff_f32(a: &[f32], b: &[f64]) -> f64 {
     max_abs_diff(&widen(a), b)
 }
 
-#[derive(Clone, Copy, Debug)]
-enum Direction {
-    Forward,
-    Inverse,
+fn oracle(direction: Direction, x: &[f64], s: &[f32]) -> Vec<f64> {
+    match direction {
+        Direction::Forward => oracle_forward(x, s, BLOCK),
+        Direction::Inverse => oracle_inverse(x, s, BLOCK),
+    }
 }
 
-impl Direction {
-    fn oracle(self, x: &[f64], s: &[f32]) -> Vec<f64> {
-        match self {
-            Direction::Forward => oracle_forward(x, s, BLOCK),
-            Direction::Inverse => oracle_inverse(x, s, BLOCK),
-        }
-    }
-    fn run(self, t: &SignedBlockHadamard, x: &Array, device: Device) -> Result<Array> {
-        match self {
-            Direction::Forward => t.forward(x, device),
-            Direction::Inverse => t.inverse(x, device),
-        }
+fn run(direction: Direction, t: &SignedBlockHadamard, x: &Array, device: Device) -> Result<Array> {
+    match direction {
+        Direction::Forward => t.forward(x, device),
+        Direction::Inverse => t.inverse(x, device),
     }
 }
 
@@ -318,9 +311,9 @@ fn check_leading_axes(device: Device) -> Result<()> {
     let x = Array::from_f32_slice(&x32, &[2, 3, width as i32])?;
     let t = SignedBlockHadamard::new(BLOCK, &s)?;
     for direction in [Direction::Forward, Direction::Inverse] {
-        let out = direction.run(&t, &x, device)?;
+        let out = run(direction, &t, &x, device)?;
         assert_eq!(out.shape(), vec![2, 3, width as i32], "{direction:?}");
-        let d = max_abs_diff_f32(&read_f32(&out)?, &direction.oracle(&widen(&x32), &s));
+        let d = max_abs_diff_f32(&read_f32(&out)?, &oracle(direction, &widen(&x32), &s));
         assert!(
             d <= F32_BOUND,
             "{direction:?} of [2, 3, {width}] misses the oracle by {d:.3e}"
@@ -347,7 +340,7 @@ impl LowPrecisionCase {
             &[LOW_ROWS as i32, LOW_WIDTH as i32],
         )?
         .astype(dtype, Device::Cpu)?;
-        let oracle = direction.oracle(&widen(&read_f32(&x)?), s);
+        let oracle = oracle(direction, &widen(&read_f32(&x)?), s);
         let rounded = oracle.iter().map(|&v| round_to(dtype, v)).collect();
         Ok(Self { x, oracle, rounded })
     }
@@ -371,7 +364,7 @@ fn check_low_precision(device: Device) -> Result<()> {
         for direction in [Direction::Forward, Direction::Inverse] {
             let case = LowPrecisionCase::new(dtype, direction, &s)?;
             let label = format!("{direction:?} {dtype:?}");
-            let out = direction.run(&t, &case.x, device)?;
+            let out = run(direction, &t, &case.x, device)?;
             assert_eq!(
                 out.dtype(),
                 dtype,
@@ -509,6 +502,14 @@ fn new_refuses_what_the_contract_does_not_define() {
     assert!(
         refused(&SignedBlockHadamard::new(0, &signs(801, 1024))),
         "block 0"
+    );
+    assert!(
+        refused(&SignedBlockHadamard::new(1, &signs(801, 1024))),
+        "block 1"
+    );
+    assert!(
+        refused(&SignedBlockHadamard::new(8192, &signs(801, 8192))),
+        "block above the largest the kernel is checked at"
     );
     assert!(
         refused(&SignedBlockHadamard::new(BLOCK, &signs(802, 1536))),

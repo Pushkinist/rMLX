@@ -4,8 +4,8 @@
 //!
 //! One body, run over each architecture that emits logprobs and keeps a prompt
 //! cache. Qwen3.5 and BitNet also have CPU cases beside their generate paths,
-//! and Qwen3 is held by `bonsai_golden_tokens`. Laguna, Qwen2 and Qwen3-VL-MoE
-//! emit no logprobs on any path.
+//! and Qwen3 is held by `bonsai_golden_tokens`. Gemma3 has no case here. Laguna,
+//! Qwen2 and Qwen3-VL-MoE emit no logprobs on any path.
 //!
 //! Models resolve from `RMLX_O_MODELS_ROOT` by slug, or `RMLX_KV_TEST_MODEL` by
 //! path.
@@ -31,10 +31,6 @@ use rmlx_models::{Pcg32, PenaltyConfig, ProbeStep, SamplerConfig};
 const GEMMA4: common::GoldenModel = common::GoldenModel {
     slug: "mlx-community__gemma-4-e2b-it-mxfp8",
     archs: &["Gemma4ForConditionalGeneration"],
-};
-const MEDGEMMA: common::GoldenModel = common::GoldenModel {
-    slug: "mlx-community__medgemma-1.5-4b-it-8bit",
-    archs: &["Gemma3ForConditionalGeneration"],
 };
 const BITNET: common::GoldenModel = common::GoldenModel {
     slug: "mlx-community__bitnet-b1.58-2B-4T",
@@ -210,12 +206,6 @@ fn resume_then_hit(model: &common::GoldenModel, test: &str) {
 #[test]
 fn gemma4_exact_hit_replays_first_logprobs() {
     miss_then_hit(&GEMMA4, "gemma4_exact_hit_replays_first_logprobs");
-}
-
-#[ignore = "loads a model and drives the GPU"]
-#[test]
-fn gemma3_exact_hit_replays_first_logprobs() {
-    miss_then_hit(&MEDGEMMA, "gemma3_exact_hit_replays_first_logprobs");
 }
 
 #[ignore = "loads a model and drives the GPU"]

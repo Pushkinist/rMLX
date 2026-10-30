@@ -5,7 +5,7 @@ variable has a flag, the flag wins.
 
 | Variable | Flag | Read by | Effect |
 |---|---|---|---|
-| `RMLX_HOME` | — | `rmlx_core::paths` | Root of all on-disk state. A relative path is ignored with a `warn!`. Else `<workspace>/.rmlx/` (nearest `Cargo.lock` upward), else `$HOME/.rmlx/`. |
+| `RMLX_HOME` | — | `rmlx_core::paths` | Root of all on-disk state. Must be absolute: a relative value is refused at start, exit 1, with one error line naming it, and nothing falls back. Unset: `<workspace>/.rmlx/` (nearest `Cargo.lock` upward), else `$HOME/.rmlx/`. |
 | `RUST_BACKTRACE` | — | `main` | Set to `full` at startup when unset. |
 | `RUST_LOG` | `--log` | the tracing filter | Overrides `--log` when set, e.g. `RUST_LOG=debug,rmlx=trace`. |
 | `RMLX_LOG_CAP_MB` | `--log-cap-mb` | clap | Log directory cap. |

@@ -95,11 +95,13 @@ sys.path.insert(0, str(_SCRIPT_DIR.parent))
 sys.path.insert(0, str(_SCRIPT_DIR.parent / "lib"))
 from published_requery import LABEL_PATTERN, Unreadable, check  # noqa: E402
 from published_samples import body_sha256  # noqa: E402
+from recorder_check import require_run_class_recorder  # noqa: E402
+from rmlx_home import rmlx_home  # noqa: E402
 
 RMLX_REPO_ROOT = Path(os.environ.get("RMLX_REPO_ROOT", str(_SCRIPT_DIR.parents[1])))
 # Runtime state lives under a single root (CLAUDE.md). `RMLX_HOME` wins; the
 # in-repo `.rmlx/` is the dev default.
-RMLX_HOME = Path(os.environ.get("RMLX_HOME", str(RMLX_REPO_ROOT / ".rmlx")))
+RMLX_HOME = rmlx_home(RMLX_REPO_ROOT)
 BUFFER_PENDING = RMLX_HOME / "metrics" / "buffer" / "pending"
 # Records are assembled in `records/` beside the result and only moved into
 # `pending/` for the moment the recorder claims one: anything sitting in
@@ -244,6 +246,7 @@ def base_record(result: dict[str, Any], args: argparse.Namespace) -> dict[str, A
         # spread in `notes` a reading of machine variance.
         "seed": sampling.get("seed"),
         "description": args.description,
+        "run_class": "gate",
     }
     # `decode_config` is cell identity: absent means every engine setting at its
     # default, and the empty string is not a spelling of that.
@@ -631,6 +634,9 @@ def main() -> int:
             print(json.dumps(trimmed, indent=2))
         print(f"{len(records)} records", file=sys.stderr)
         return 0
+
+    if args.record:
+        require_run_class_recorder(args.rmlx_bin)
 
     stamp = result["ts_utc"].replace("-", "").replace(":", "")
     staging = Path(args.result).resolve().parent / STAGING_DIR

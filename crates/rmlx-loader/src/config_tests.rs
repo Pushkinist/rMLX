@@ -788,3 +788,18 @@ fn every_local_snapshot_dispatches_on_the_class_its_config_names() {
     );
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+/// The one table both label producers are held to: this one, and
+/// `weight_quant` in `scripts/lib/snapshot_identity.py`, which
+/// `scripts/run_class_selftest.sh` runs over the same file.
+#[test]
+fn weight_quant_label_matches_the_shared_fixture_table() {
+    let table: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("../tests/fixtures/weight_quant_labels.json")).unwrap();
+    assert!(table.len() >= 17, "the table lost cases: {}", table.len());
+    for case in &table {
+        let cfg: ModelConfig = serde_json::from_value(case["config"].clone()).unwrap();
+        let want = case["label"].as_str().map(str::to_owned);
+        assert_eq!(cfg.weight_quant_label(), want, "{}", case["name"]);
+    }
+}

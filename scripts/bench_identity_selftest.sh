@@ -179,6 +179,8 @@ HOSTILE_SHA="a', 'b': __import__('os').system('touch $WORK/pwned'), 'c': 'd"
 
 CASE="$WORK/decode_sha_is_data"
 mkdir -p "$CASE/home" "$CASE/model/ns__m"
+# 8-bit affine: a label read off the name `m` could only guess.
+printf '{"quantization": {"group_size": 64, "bits": 8}}\n' >"$CASE/model/ns__m/config.json"
 rm -f "$WORK/pwned"
 set +e
 (
@@ -207,6 +209,9 @@ bad=""
 filed="$(python3 -c 'import json, sys
 print(json.load(open(sys.argv[1])).get("git_sha"))' "$CASE/home/recorded.json" 2>/dev/null || echo "no record")"
 [ "$filed" = "$HOSTILE_SHA" ] || bad="$bad; filed git_sha=$filed"
+filed_wq="$(python3 -c 'import json, sys
+print(json.load(open(sys.argv[1])).get("weight_quant"))' "$CASE/home/recorded.json" 2>/dev/null || echo "no record")"
+[ "$filed_wq" = 8bit ] || bad="$bad; filed weight_quant=$filed_wq (want the config's 8bit)"
 jsonl="$(python3 -c 'import json, sys
 print(json.loads(open(sys.argv[1]).readline()).get("git_sha"))' "$CASE/home/metrics/perf-iter/baseline.jsonl" 2>/dev/null || echo "no line")"
 [ "$jsonl" = "$HOSTILE_SHA" ] || bad="$bad; jsonl git_sha=$jsonl"
@@ -235,12 +240,24 @@ baseline)
 	fi
 	printf '%s\n' "{\"timestamp\":\"2026-09-03T00:00:00Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"rmlx start\",\"version\":\"9.9.9\",\"run_id\":\"stub\",\"pid\":\$\$}}" >>"\$log"
 	printf '%s\n' "{\"timestamp\":\"2026-09-03T00:00:00Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"cache-type resolved\",\"arch\":\"Stub\",\"kv_quant\":\"stubq\"}}" >>"\$log"
+	case " \$* " in *" --kv-quant k8vturbo3 "*) [ -z "\${STUB_TURBO_NO_TPS:-}" ] || exit 0 ;; esac
 	echo "decode_tps=12.5"
+	# Like the real binary: the measurement prints, then a record that did not
+	# land fails the run.
+	pending() {
+		echo "error: baseline: measured, but the record did not reach runs.db; it is kept at \$RMLX_HOME/metrics/buffer/pending/stub.json for \\\`rmlx metrics record --replay-pending\\\`" >&2
+		exit 75
+	}
+	case " \$* " in *" --run-class gate "*) [ -z "\${STUB_FAIL_GATE:-}" ] || pending ;; esac
+	case " \$* " in *" measured "*) [ -z "\${STUB_FAIL_MEASURED:-}" ] || pending ;; esac
+	case " \$* " in *" measured "*) [ -z "\${STUB_CRASH_MEASURED:-}" ] || exit 1 ;; esac
 	;;
 esac
 STUBEOF
 chmod +x "$CANARY_STUB"
-mkdir -p "$WORK/models/prism-ml__Ternary-Bonsai-2-27B-mlx-2bit"
+CANARY_MODEL="$WORK/models/prism-ml__Ternary-Bonsai-2-27B-mlx-2bit"
+mkdir -p "$CANARY_MODEL"
+printf '{"quantization": {"group_size": 64, "bits": 2}}\n' >"$CANARY_MODEL/config.json"
 
 # canary_case <name> <identity-json-or-empty> <shared-log-name-or-empty>
 canary_case() {
@@ -249,6 +266,10 @@ canary_case() {
 	mkdir -p "$home/logs"
 	local env_extra=()
 	[ -z "$identity" ] || env_extra+=("RMLX_IDENTITY_JSON=$identity")
+	[ -z "${STUB_FAIL_GATE:-}" ] || env_extra+=("STUB_FAIL_GATE=1")
+	[ -z "${STUB_FAIL_MEASURED:-}" ] || env_extra+=("STUB_FAIL_MEASURED=1")
+	[ -z "${STUB_CRASH_MEASURED:-}" ] || env_extra+=("STUB_CRASH_MEASURED=1")
+	[ -z "${STUB_TURBO_NO_TPS:-}" ] || env_extra+=("STUB_TURBO_NO_TPS=1")
 	if [ -n "$shared" ]; then
 		printf '%s\n' '{"timestamp":"2026-09-03T00:00:00Z","level":"INFO","fields":{"message":"rmlx start","version":"9.9.9","run_id":"stub","pid":4242}}' \
 			'{"timestamp":"2026-09-03T00:00:00Z","level":"INFO","fields":{"message":"cache-type resolved","arch":"Stub","kv_quant":"none"}}' \
@@ -283,7 +304,11 @@ bad=""
 /usr/bin/grep -q -- '--label canary sha=feedbee' "$CANARY_HOME/baseline_argv" ||
 	bad="$bad; the label does not carry the identity's sha"
 [ "$(csv_field "$CANARY_HOME" 4)" = stubq ] || bad="$bad; csv kv_quant=$(csv_field "$CANARY_HOME" 4) (want stubq)"
-verdict canary_identity_sha "the canary files the identity's commit and reads the codec from the probe's log" "${bad#; }"
+diag="$(/usr/bin/grep -c -- '--record --run-class diagnostic' "$CANARY_HOME/baseline_argv" || true)"
+gate="$(/usr/bin/grep -c -- '--record --run-class gate' "$CANARY_HOME/baseline_argv" || true)"
+[ "$diag" = 8 ] || bad="$bad; $diag diagnostic records (want 8: 1+3 auto, 1+3 k8vturbo3)"
+[ "$gate" = 1 ] || bad="$bad; $gate gate records (want 1)"
+verdict canary_identity_sha "the canary files the identity's commit, reads the codec from the probe's log, and records 8 diagnostic runs and 1 gate run" "${bad#; }"
 
 canary_case canary_same_second_log "" 20260903-000000-9.9.9.jsonl
 bad=""
@@ -292,6 +317,47 @@ bad=""
 [ "$(csv_field "$CANARY_HOME" 4)" = stubq ] ||
 	bad="$bad; csv kv_quant=$(csv_field "$CANARY_HOME" 4) (want stubq, not the earlier process's none)"
 verdict canary_same_second_log "a probe that appends to an earlier process's log is attributed by pid" "${bad#; }"
+
+STUB_FAIL_GATE=1 canary_case canary_gate_record_fails "" ""
+bad=""
+[ "$CANARY_STATUS" -eq 1 ] || bad="exit=$CANARY_STATUS (want 1)"
+/usr/bin/grep -q 'the gate record failed' "$CANARY_HOME/out.log" || bad="$bad; no error naming the gate record"
+/usr/bin/grep -q 'record pending: .*metrics/buffer/pending/stub.json' "$CANARY_HOME/out.log" ||
+	bad="$bad; the gate's buffer file is not named"
+/usr/bin/grep -q 'replaying it adds the gate row' "$CANARY_HOME/out.log" || bad="$bad; no warning that a replay adds the gate row"
+verdict canary_gate_record_fails "a gate record that does not land (exit 75) stops the canary and names its buffer file" "${bad#; }"
+
+STUB_FAIL_MEASURED=1 canary_case canary_diagnostic_record_pending "" ""
+bad=""
+[ "$CANARY_STATUS" -eq 75 ] || bad="exit=$CANARY_STATUS (want 75)"
+[ "$(csv_field "$CANARY_HOME" 6)" = 12.5 ] || bad="$bad; the measurement was not kept (csv decode_tps=$(csv_field "$CANARY_HOME" 6))"
+/usr/bin/grep -q 'record pending: .*metrics/buffer/pending/stub.json' "$CANARY_HOME/out.log" ||
+	bad="$bad; the buffer file is not named"
+/usr/bin/grep -q 'canary INCOMPLETE: 3 diagnostic record' "$CANARY_HOME/out.log" || bad="$bad; no INCOMPLETE line counting the 3 pending records"
+verdict canary_diagnostic_record_pending "a diagnostic run whose record does not land keeps its measurement, names the file, and the canary ends 75" "${bad#; }"
+
+STUB_CRASH_MEASURED=1 canary_case canary_measured_run_crashes "" ""
+bad=""
+[ "$CANARY_STATUS" -eq 1 ] || bad="exit=$CANARY_STATUS (want 1)"
+/usr/bin/grep -q 'the measured run failed (exit 1' "$CANARY_HOME/out.log" || bad="$bad; no error naming the run that failed"
+verdict canary_measured_run_crashes "a measured run that fails without measuring stops the canary" "${bad#; }"
+
+STUB_TURBO_NO_TPS=1 canary_case canary_turbo_arm_without_a_reading "" ""
+bad=""
+[ "$CANARY_STATUS" -eq 0 ] || bad="exit=$CANARY_STATUS (want 0: the k8vturbo3 arm is informational)"
+turbo_warns="$(/usr/bin/grep -c 'WARN: k8vturbo3 run [0-9] failed to parse decode_tps' "$CANARY_HOME/out.log" || true)"
+[ "$turbo_warns" = 3 ] || bad="$bad; $turbo_warns k8vturbo3 warnings (want 3)"
+! /usr/bin/grep -q ',k8vturbo3,' "$CANARY_HOME/bench/perf_canary.csv" || bad="$bad; a k8vturbo3 row with no reading was written"
+[ "$(csv_field "$CANARY_HOME" 6)" = 12.5 ] || bad="$bad; the plain row is missing"
+verdict canary_turbo_arm_without_a_reading "a k8vturbo3 run with no reading is warned about and skipped, not fatal" "${bad#; }"
+
+printf '{}\n' >"$CANARY_MODEL/config.json"
+canary_case canary_unrecordable_identity "" ""
+bad=""
+[ "$CANARY_STATUS" -eq 1 ] || bad="exit=$CANARY_STATUS (want 1)"
+[ ! -s "$CANARY_HOME/baseline_argv" ] || bad="$bad; $(wc -l <"$CANARY_HOME/baseline_argv" | tr -d ' ') run(s) before the refusal"
+/usr/bin/grep -q 'its identity cannot be recorded' "$CANARY_HOME/out.log" || bad="$bad; no error naming the identity"
+verdict canary_unrecordable_identity "a snapshot whose identity cannot be recorded stops the canary before any run" "${bad#; }"
 
 echo
 echo "passed=$PASSED failed=$FAILED"

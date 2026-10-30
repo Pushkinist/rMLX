@@ -78,7 +78,11 @@ PORT=62265
 RMLX_BIN="$RMLX_DIR/target/release/rmlx"
 BUDGET_S=$((BUDGET_MIN * 60))
 
-export RMLX_METRICS_DB="${RMLX_DIR}/.rmlx/metrics/runs.db"
+# Runtime state lives under one root (CLAUDE.md): `RMLX_HOME`, else the
+# checkout's `.rmlx/`. The CBB harness reads the DB path from RMLX_METRICS_DB.
+RMLX_HOME="${RMLX_HOME:-${RMLX_DIR}/.rmlx}"
+export RMLX_HOME
+export RMLX_METRICS_DB="${RMLX_HOME}/metrics/runs.db"
 export RMLX_REPO_ROOT="${RMLX_DIR}"
 
 # --- env-var override resolution -------------------------------------------
@@ -255,7 +259,7 @@ if [ "$_CT_MODE" -eq 1 ]; then
       }')
   fi
 
-  # --- Resolve weight_quant via `rmlx info` (best-effort; fall back to arg) ---
+  # --- weight_quant: the weight label the caller passed ($7) ---------------
   _WQ_EFF="$WEIGHT_QUANT"
 
   # --- Resolve canonical kv_quant string ------------------------------------
@@ -339,72 +343,18 @@ if [ "$_CT_MODE" -eq 1 ]; then
     exit 8
   fi
 
-  _BUFFER_DIR="${RMLX_DIR}/.rmlx/metrics/buffer/pending"
+  _BUFFER_DIR="${RMLX_HOME}/metrics/buffer/pending"
   mkdir -p "$_BUFFER_DIR"
 
-  # Bug-1: if median TPS < 0.5 the baseline run succeeded syntactically but
-  # produced no decode output (e.g. Gemma4 Shared-KV rejects Mixed codec and
-  # emits TPS=0.000). Emit a §8.5 record with value=0.0 and
-  # notes containing status=runtime_fail, then exit 10 so the outer matrix
-  # loop can distinguish this from a clean skip (78) or content failure.
+  # If median TPS < 0.5 the baseline run succeeded syntactically but produced
+  # no decode output (e.g. Gemma4 Shared-KV rejects Mixed codec and emits
+  # TPS=0.000). That run measured nothing, so it writes no record (the recorder
+  # refuses one with no measurement); exit 10 lets the outer matrix loop tell
+  # it apart from a clean skip (78) or a content failure.
   _TPS_FAIL=$(awk -v t="${_MEDIAN_TPS:-0}" 'BEGIN { print (t+0 < 0.5) ? "1" : "0" }')
   if [ "$_TPS_FAIL" = "1" ]; then
     echo "[$(date +%T)] CELL FAIL tps-below-threshold median=${_MEDIAN_TPS:-0} tag=$TAG" >&2
     echo "[$TS_HMS] $TAG | $BACKEND | kv=$_KV_CANON | success=false | coh=false | TPS_BELOW_THRESHOLD" >>"$PROGRESS"
-    _FAIL_UNIQ=$(date -u +"%Y%m%dT%H%M%S%3N")-bench-$$-rtfail
-    _FAIL_JSON="${_BUFFER_DIR}/${_FAIL_UNIQ}.json"
-    PROMPT_FILE="$_PROMPT_FILE" \
-    BACKEND_VAL="rmlx" \
-    NS_VAL="$_NS" \
-    MODEL_VAL="$_MODEL_NAME" \
-    WQ_VAL="$_WQ_EFF" \
-    KV_VAL="$_KV_CANON" \
-    CTX_VAL="$_CTX_MAX_EFF" \
-    PROMPT_NAME_VAL="$_PROMPT_ID_EFF" \
-    TS_VAL="$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
-    HW_VAL="$_HW_TAG" \
-    PROMPT_TOK_VAL="$_PROMPT_TOKENS" \
-    MAX_TOK_VAL="$_MAX_TOKENS_EFF" \
-    N_WARM_VAL="$_WARMUP_EFF" \
-    N_MEAS_VAL="$_MEASURED_EFF" \
-    NOTES_VAL="${_NOTES} status=runtime_fail tps=${_MEDIAN_TPS:-0}" \
-    DESC_VAL="bench_cell ct ${TAG} ${_LABEL_PREFIX_EFF} runtime_fail" \
-    GIT_SHA_VAL="$GIT_SHA" \
-    python3 -c '
-import json, os, sys
-with open(os.environ["PROMPT_FILE"], "r") as f:
-    body = json.load(f)
-rec = {
-    **json.loads(os.environ["RMLX_IDENTITY_JSON"]),
-  # "unknown" is a fallback, never provenance — a checkout without .git
-  # must not stamp git_sha at all.
-  **({"git_sha": os.environ["GIT_SHA_VAL"]} if not os.environ["GIT_SHA_VAL"].startswith("unknown") else {}),
-  "model_namespace": os.environ["NS_VAL"],
-  "model": os.environ["MODEL_VAL"],
-  "weight_quant": os.environ["WQ_VAL"],
-  "kv_quant": os.environ["KV_VAL"],
-  "ctx_max": int(os.environ["CTX_VAL"]),
-  "prompt": {"name": os.environ["PROMPT_NAME_VAL"], "body": body},
-  "ts_utc": os.environ["TS_VAL"],
-  "prompt_tokens": int(os.environ["PROMPT_TOK_VAL"]),
-  "max_tokens": int(os.environ["MAX_TOK_VAL"]),
-  "temperature": 0.0,
-  "n_warmups": int(os.environ["N_WARM_VAL"]),
-  "n_measure": int(os.environ["N_MEAS_VAL"]),
-  "notes": os.environ["NOTES_VAL"],
-  "description": os.environ["DESC_VAL"],
-  # A run that failed its throughput threshold measured no throughput. `null`
-  # records the attempt (notes carry status=runtime_fail and the observed tps)
-  # without filing a fabricated 0.0 that would rank as a measurement.
-  "metrics": [
-    {"name": "decode_tps_warm", "value": None, "stddev": None},
-  ],
-}
-json.dump(rec, sys.stdout, indent=2)
-' >"$_FAIL_JSON"
-    if ! ( cd "$RMLX_DIR" && ./target/release/rmlx metrics record --file "$_FAIL_JSON" >/dev/null 2>&1 ); then
-      echo "[$(date +%T)] WARN: failed to ingest runtime_fail record $_FAIL_JSON" >&2
-    fi
     exit 10
   fi
 
@@ -466,6 +416,7 @@ rec = {
   "n_measure": int(os.environ["N_MEAS_VAL"]),
   "notes": os.environ["NOTES_VAL"],
   "description": os.environ["DESC_VAL"],
+  "run_class": "gate",
   # `or 0` coerced a scrape that came back empty into a measurement of zero.
   # A missed RSS scrape is not a 0 MB process, and a zero rate is not a rate:
   # send null and let the recorder write no row for that metric.

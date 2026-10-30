@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Ingest a `scripts/bench_llama_ab.sh` result into the rMLX metrics DB.
 
-`bench_llama_ab.sh` deliberately never touches `runs.db` — an A/B run is an
-experiment and the store is append-only. This is the separate, explicit step
-that promotes one accepted comparison into two §8.5 RunRecords, one per arm.
+`bench_llama_ab.sh` runs this at the end of every real comparison, with no
+`--keep-arm`: both arms are written as `ab_arm` records, one per arm, which
+reach no champion and no gate. Promoting the surviving arm is a second,
+explicit run with `--keep-arm A|B`, which writes that arm alone as `gate`.
 
 Sibling of `llama_bench_ingest.py`, which reads `llama-bench -o json`. The two
 inputs are unrelated shapes: `llama-bench` measures synthetic token generation
@@ -17,7 +18,7 @@ Usage:
         --arm-a-backend llama_cpp --arm-b-backend llama_cpp_tq \
         --model Qwen3-8B-Q8_0 --weight-quant q8_0 \
         --arm-a-kv-quant none --arm-b-kv-quant turbo3 \
-        --prompt-name longctx_8k_text --prompt-file PROMPT.txt
+        --prompt-name longctx_8k_text --prompt-file PROMPT.txt --keep-arm B
 
     # Write buffer files and ingest them:
     python3 scripts/ingest/llama_ab_ingest.py --record RESULT.json ...
@@ -43,10 +44,14 @@ from pathlib import Path
 from typing import Any
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(_SCRIPT_DIR.parent / "lib"))
+from recorder_check import require_run_class_recorder  # noqa: E402
+from rmlx_home import rmlx_home  # noqa: E402
+
 RMLX_REPO_ROOT = Path(os.environ.get("RMLX_REPO_ROOT", str(_SCRIPT_DIR.parents[1])))
 # Runtime state lives under a single root (CLAUDE.md). `RMLX_HOME` wins; the
 # in-repo `.rmlx/` is the dev default.
-RMLX_HOME = Path(os.environ.get("RMLX_HOME", str(RMLX_REPO_ROOT / ".rmlx")))
+RMLX_HOME = rmlx_home(RMLX_REPO_ROOT)
 BUFFER_PENDING = RMLX_HOME / "metrics" / "buffer" / "pending"
 # Records are assembled HERE first and only moved into `pending/` for the
 # moment the recorder is actually invoked. Anything sitting in `pending/` is,
@@ -64,6 +69,7 @@ def _arm_record(
     arm: str,
     args: argparse.Namespace,
     prompt_body: str,
+    run_class: str,
 ) -> dict[str, Any]:
     """Build one §8.5 RunRecord from one arm of an A/B result."""
     slots = [s for s in result["slots"] if s["arm"] == arm]
@@ -131,6 +137,7 @@ def _arm_record(
         "output_first_64": slots[0].get("output_first_64") or None,
         "notes": notes,
         "description": args.description,
+        "run_class": run_class,
         "metrics": [
             {"name": "decode_tps_warm", "value": statistics.median(tps), "stddev": stddev},
             {
@@ -145,7 +152,7 @@ def _arm_record(
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("result", help="JSON emitted by bench_llama_ab.sh")
+    p.add_argument("result", nargs="?", help="JSON emitted by bench_llama_ab.sh")
     p.add_argument("--prompt-file", required=True, help="the prompt body that was sent")
     p.add_argument("--prompt-name", required=True)
     p.add_argument("--prompt-notes", default=None)
@@ -176,11 +183,32 @@ def main() -> int:
         "test' on others cannot be queried. Pass the arm's own commit, or omit it.",
     )
     p.add_argument("--description", default=None)
+    p.add_argument(
+        "--keep-arm",
+        choices=["A", "B"],
+        default=None,
+        help="write only this arm, as gate: the surviving arm of an accepted "
+        "comparison (docs/METRICS_DB.md §8.5). Without it both arms are written "
+        "as ab_arm, which is what bench_llama_ab.sh does after every real run.",
+    )
     p.add_argument("--accept-tainted", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--record", action="store_true", help="ingest via `rmlx metrics record --file`")
     p.add_argument("--rmlx-bin", default=str(RMLX_REPO_ROOT / "target" / "release" / "rmlx"))
+    p.add_argument(
+        "--check-args",
+        action="store_true",
+        help="parse the arguments, and with --record check the recorder, then exit 0 "
+        "without reading a result: bench_llama_ab.sh runs this before its first slot",
+    )
     args = p.parse_args()
+
+    if args.check_args:
+        if args.record:
+            require_run_class_recorder(args.rmlx_bin)
+        return 0
+    if args.result is None:
+        p.error("the following arguments are required: result")
 
     result = json.loads(Path(args.result).read_text(encoding="utf-8"))
     # A run made with --synthetic-arms drove stub servers, so its numbers
@@ -208,7 +236,10 @@ def main() -> int:
         return 2
 
     prompt_body = Path(args.prompt_file).read_text(encoding="utf-8")
-    records = [_arm_record(result, arm, args, prompt_body) for arm in ("A", "B")]
+    if args.keep_arm:
+        records = [_arm_record(result, args.keep_arm, args, prompt_body, "gate")]
+    else:
+        records = [_arm_record(result, arm, args, prompt_body, "ab_arm") for arm in ("A", "B")]
 
     if args.dry_run:
         for rec in records:
@@ -216,6 +247,9 @@ def main() -> int:
             trimmed["prompt"] = dict(rec["prompt"], body=f"<{len(prompt_body)} chars>")
             print(json.dumps(trimmed, indent=2))
         return 0
+
+    if args.record:
+        require_run_class_recorder(args.rmlx_bin)
 
     # Compact stamp: every other producer in this tree names buffer files
     # `YYYYMMDDTHHMMSS...`, and the ISO form puts colons in a filename.
@@ -243,7 +277,7 @@ def main() -> int:
     # writes is reachable by `--replay-pending` unless that invocation put it
     # there.
     BUFFER_PENDING.mkdir(parents=True, exist_ok=True)
-    failed = 0
+    failed: list[Path] = []
     for path in staged:
         queued = BUFFER_PENDING / path.name
         path.rename(queued)
@@ -262,7 +296,18 @@ def main() -> int:
                 "record kept in staging, not in the pending queue",
                 file=sys.stderr,
             )
-            failed += 1
+            failed.append(path)
+    if failed:
+        # The other records landed, so re-running this ingest would write
+        # them a second time; the ones that did not are recorded one by one.
+        for path in failed:
+            print(f"not recorded: {path}", file=sys.stderr)
+        print(
+            f"  record each with `{args.rmlx_bin} metrics record --file <path>`; do not "
+            f"re-run this ingest, which would write the {len(staged) - len(failed)} "
+            "record(s) that landed again",
+            file=sys.stderr,
+        )
     return 1 if failed else 0
 
 

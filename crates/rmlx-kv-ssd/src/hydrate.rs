@@ -106,20 +106,21 @@ pub struct SsdHydrator {
 }
 
 impl SsdHydrator {
-    /// Open the hydrate source for the `model_id` namespace.
+    /// Open the hydrate source for the `model_id` namespace below `kv_root`.
     ///
-    /// The `.kvb` directory + index DB are resolved via
-    /// `paths::kv_cache_dir(model_id)` — the same namespace the spiller
-    /// writes to. Returns `Err` only if the index cannot be opened; the caller
-    /// (model-load) decides whether to proceed without an SSD tier.
+    /// The `.kvb` directory + index DB are `<kv_root>/<model_id>/` — the same
+    /// namespace the spiller writes to. Returns `Err` only if the index cannot
+    /// be opened; the caller (model-load) decides whether to proceed without an
+    /// SSD tier.
     pub fn open(
+        kv_root: &std::path::Path,
         model_id: impl Into<String>,
         layout_key: u64,
         device: Device,
     ) -> rmlx_core::error::Result<Self> {
         let model_id = model_id.into();
-        let dir = rmlx_core::paths::kv_cache_dir(&model_id);
-        let index = SsdKvIndex::open(&model_id)
+        let dir = kv_root.join(&model_id);
+        let index = SsdKvIndex::open(kv_root, &model_id)
             .map_err(|e| rmlx_core::error::Error::Mlx(format!("ssd-hydrate index open: {e}")))?;
         Ok(Self {
             index,
@@ -130,8 +131,8 @@ impl SsdHydrator {
         })
     }
 
-    /// Test-only: build a hydrator bound to an explicit dir + already-open
-    /// index, bypassing `paths::kv_cache_dir` so tests are hermetic.
+    /// Test-only: build a hydrator over an index the test already opened — an
+    /// in-memory one, or one handle shared with a second hydrator.
     #[cfg(test)]
     pub fn with_index(
         model_id: impl Into<String>,

@@ -20,7 +20,7 @@ use tracing::{debug, info};
 use rmlx_core::{Error, Result};
 
 use crate::calibration_writer::{outlier_count_for, CalibrationMeta, KvCalibration, LayerCalib};
-use crate::{load_config, load_shard_index, QuantConfig, ShardSet};
+use crate::{load_config, load_shard_index, release_mapped, QuantConfig, ShardSet};
 
 // ── public API ────────────────────────────────────────────────────────────────
 
@@ -344,6 +344,8 @@ pub fn top_k_norm_indices(
             ))
         })?;
 
+        release_mapped(data_bytes);
+
         let total_elems: usize = shape.iter().product();
         if flat.len() != total_elems {
             return Err(Error::Loader(format!(
@@ -434,7 +436,9 @@ fn read_tensor_bytes(
             "cannot get tensor '{name}' from shard '{shard_filename}': {e}"
         ))
     })?;
-    Ok((t.data().to_vec(), t.shape().to_vec(), t.dtype()))
+    let bytes = t.data().to_vec();
+    release_mapped(t.data());
+    Ok((bytes, t.shape().to_vec(), t.dtype()))
 }
 
 /// Resolve the effective `QuantConfig` for `weight_name`, honouring per-tensor

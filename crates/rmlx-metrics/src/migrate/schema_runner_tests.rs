@@ -174,13 +174,7 @@ fn migrating_moves_a_default_spelling_into_the_default_cell() {
         "kv_boundary/head=0,kv_boundary/tail=0",
     );
 
-    crate::bests_view::ensure(&conn).unwrap();
-    let before: Vec<(i64, Option<String>)> = champions(&conn);
-    assert_eq!(
-        before.len(),
-        3,
-        "three spellings, three cells, three champions: {before:?}"
-    );
+    assert_eq!(cells(&conn), 3, "three spellings, three cells");
 
     crate::migrate::run_pending(&mut conn).unwrap();
 
@@ -226,13 +220,7 @@ fn migrating_moves_an_adaptive_drafter_out_of_the_fixed_block_cell() {
     // and keeps its own cell.
     insert_with_decode_config(&conn, 3, 457_703_424.0, "mtp/block=16");
 
-    crate::bests_view::ensure(&conn).unwrap();
-    let before: Vec<(i64, Option<String>)> = champions(&conn);
-    assert_eq!(
-        before.len(),
-        3,
-        "three spellings, three cells, three champions: {before:?}"
-    );
+    assert_eq!(cells(&conn), 3, "three spellings, three cells");
 
     crate::migrate::run_pending(&mut conn).unwrap();
 
@@ -384,6 +372,19 @@ fn a_failing_post_hook_leaves_the_version_where_it_was() {
     assert_eq!(repaired, "dflash/block=16,dflash/depth=accept_rate");
 }
 
+/// How many cells the rows fall in. Every other cell column is the same in
+/// these fixtures, so a cell is a `decode_config` spelling. Read off the base
+/// table: the `bests` of the current schema reads a column these old schemas
+/// do not have.
+fn cells(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM (SELECT DISTINCT decode_config FROM observations)",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
 /// `bests` champions as `(id, decode_config)`, lowest `kv_cache_bytes` per cell.
 fn champions(conn: &Connection) -> Vec<(i64, Option<String>)> {
     let mut stmt = conn
@@ -396,4 +397,19 @@ fn champions(conn: &Connection) -> Vec<(i64, Option<String>)> {
         .unwrap()
         .map(Result::unwrap)
         .collect()
+}
+
+/// A DB a newer binary migrated has a schema this binary cannot describe:
+/// rebuilding `bests` over it would drop whatever the later migrations put in
+/// the view, so the open is refused, naming both versions.
+#[test]
+fn a_db_newer_than_this_binary_is_refused() {
+    let last = MIGRATIONS.last().map_or(0, |&(v, _)| v);
+    let mut conn = conn_at_version(last);
+    conn.execute_batch(&format!("PRAGMA user_version = {};", last + 1))
+        .unwrap();
+
+    let err = super::run_pending(&mut conn).unwrap_err().to_string();
+    assert!(err.contains(&format!("version {}", last + 1)), "{err}");
+    assert!(err.contains(&format!("version {last}")), "{err}");
 }

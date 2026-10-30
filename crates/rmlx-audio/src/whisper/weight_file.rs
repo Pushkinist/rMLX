@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use rmlx_loader::{SafetensorsDtype, ShardHandle};
+use rmlx_loader::{release_mapped, SafetensorsDtype, ShardHandle};
 use rmlx_mlx::{dtype_from_safetensors, Array, Dtype};
 use tracing::{debug, error};
 
@@ -53,6 +53,7 @@ fn load_safetensors(dir: &Path) -> Result<WeightMap, WhisperError> {
                 array_of(tensor.dtype(), tensor.shape(), tensor.data()).map_err(|cause| {
                     WhisperError::WeightFile(format!("{SAFETENSORS_FILE}: tensor {name}: {cause}"))
                 })?;
+            release_mapped(tensor.data());
             Ok((name, array))
         })
         .collect()

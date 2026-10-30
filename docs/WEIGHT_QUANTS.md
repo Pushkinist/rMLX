@@ -389,10 +389,28 @@ checks the contract. The Qwen3.5 loader (`load_from_path` in
 `crates/rmlx-models/src/qwen3_5_moe/loader.rs`) folds each contract module
 through `HadamardFold` (`crates/rmlx-models/src/qwen3_5_moe/layers.rs`): the
 quantized layer becomes `Linear::Hadamard` or `Embedding::Hadamard`, with one
-`SignedBlockHadamard` (`crates/rmlx-models/src/hadamard.rs`) per input width,
-over MLX's `hadamard_transform` (`rmlx_mlx::hadamard_transform`). The load
-fails on a contract module the loader built no layer for, and logs
+`SignedBlockHadamard` (`crates/rmlx-models/src/hadamard.rs`) per input width.
+The load fails on a contract module the loader built no layer for, and logs
 `Qwen3_5: Hadamard pack, folding its modules` with the module counts.
+
+Layers that read one input through the same transform share it, once per
+forward pass: one decode token of Ternary-Bonsai-2-27B runs 258 transforms
+for its 402 folded modules.
+
+On the GPU a transform is one Metal kernel,
+`crates/rmlx-models/src/metal/signed_block_hadamard.metal`, dispatched from
+`crates/rmlx-models/src/hadamard_msl.rs` and ported from MLX's `hadamard_n`
+(`mlx/backend/metal/kernels/hadamard.h`, v0.32.3). It reads the activation
+dtype, applies the signs and the butterfly in f32 in registers and
+threadgroup memory, and rounds once at the store. On the CPU the transform
+runs as MLX ops: a cast to f32, the signs, `rmlx_mlx::hadamard_transform`
+and a cast back. MLX's custom kernels have no CPU backend. The GPU test
+`the_signed_block_hadamard_kernel_is_within_one_bf16_ulp_of_the_op_chain_on_gpu`
+(`crates/rmlx-models/src/hadamard_msl_tests.rs`) holds the kernel to that op
+chain at the pack's widths; measured, the two are bit-identical.
+`the_signed_block_hadamard_kernel_is_within_one_ulp_of_the_op_chain_at_every_block_on_gpu`
+holds it to one ulp at every block from 2 to `MAX_BLOCK` (4096), in f32 and
+bf16.
 
 ### 10.3 What is checked
 
@@ -446,8 +464,6 @@ to refuse every request.
   tower the checkpoint carries.
 - The EAGLE-3 restricted-vocabulary head, sparse MoE layers, a tied head and
   an MTP component are refused (section 10.3).
-- Each module transforms its own input. One decode token runs 402 transforms
-  where 258 distinct inputs would do. The cost is not measured.
 
 ### 10.5 Activation dtype and the noise floor
 

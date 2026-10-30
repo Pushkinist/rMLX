@@ -192,14 +192,16 @@ prompt and enforces the trace cap afterwards.
 
 Capture serialises every dispatch and snapshots every resident buffer. Decode
 drops to a few tokens per second, and a bundle is about the size of the
-model's resident footprint. So `--gpu-capture` conflicts with `--record` and
-forces the metrics kill switch to `off`: no `events` row, no `observations`
-row, no `metrics/baseline.csv` line.
+model's resident footprint. So every number the run prints is false, and
+`--gpu-capture` requires `--record --run-class diagnostic`: the run is
+recorded, and its rows reach no champion and no gate. Its `events` rows and
+its `metrics/baseline.csv` line carry no class.
 
 Driving the binary directly:
 
 ```sh
-MTL_CAPTURE_ENABLED=1 ./target/release-debug/rmlx --metrics off baseline \
+MTL_CAPTURE_ENABLED=1 ./target/release-debug/rmlx baseline \
+  --record --run-class diagnostic \
   --model /path/to/snapshot --kv-quant none \
   --prompt-tokens 4096 --max-tokens 18 --max-ctx 4700 \
   --gpu-capture .rmlx/traces/run.gputrace --gpu-capture-skip 4 --gpu-capture-steps 8
@@ -248,7 +250,9 @@ each submission's `start` and `duration` in nanoseconds, `gpu-channel-name`,
   `--skip-ms`. An explicit `--skip-ms` wins. When no event is found, the
   harness says so and summarises the whole window. `--skip-ms` counts from the
   matched process's first submission.
-- **Tracing slows decode**, so the harness forces `--metrics off`.
+- **Tracing slows decode**, so the harness records the run as
+  `--run-class diagnostic`, which reaches no champion and no gate. The record
+  is written at exit: a run `--time-limit` stops first leaves no row.
 - **The export XML uses `id`/`ref` back-references** and `<sentinel/>` for
   NULL. A naive parser misaligns columns into plausible wrong numbers.
   `rmlx_mlx::xctrace` checks each row's cell count and each cell's tag

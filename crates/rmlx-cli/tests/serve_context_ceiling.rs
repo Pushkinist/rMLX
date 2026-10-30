@@ -17,12 +17,7 @@
     reason = "integration-test scaffolding: panics surface assertion failures and stderr is the artefact under test"
 )]
 
-use std::process::Command;
-
-/// Locate the cargo-built `rmlx` binary.
-fn rmlx_bin() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_BIN_EXE_rmlx"))
-}
+mod common;
 
 /// A port no other test in this file uses, high enough to be free on a dev box.
 const PORT: &str = "8231";
@@ -37,10 +32,9 @@ fn serve_refuses_to_start_above_the_positional_capacity() {
         eprintln!("RMLX_TEST_MODEL_GEMMA4_E2B not set — skipping");
         return;
     };
-    let rmlx_home = std::env::temp_dir().join(format!("rmlx_serve_ctx_{}", std::process::id()));
+    let rmlx_home = tempfile::tempdir().expect("create RMLX_HOME tempdir");
 
-    let out = Command::new(rmlx_bin())
-        .env("RMLX_HOME", &rmlx_home)
+    let out = common::rmlx_at(rmlx_home.path())
         .arg("serve")
         .arg("--model")
         .arg(&model)

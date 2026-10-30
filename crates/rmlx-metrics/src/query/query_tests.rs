@@ -53,6 +53,7 @@ fn make_run(
         notes: None,
         description: None,
         decode_config: None,
+        run_class: Some(crate::run_class::RunClass::Gate),
         metrics: vec![MetricEntry {
             name: metric.into(),
             value: Some(value),
@@ -400,11 +401,11 @@ fn clone_row_with(conn: &Connection, metric: &str, value: f64, ts_utc: &str, git
         "INSERT INTO observations (
              backend, model_namespace, model, weight_quant, kv_quant, ctx_max, prompt_id,
              metric, value, unit, direction, run_id, ts_utc, git_sha, hardware_tag,
-             inserted_utc, inserted_by
+             inserted_utc, inserted_by, run_class
          )
          SELECT backend, model_namespace, model, weight_quant, kv_quant, ctx_max, prompt_id,
                 metric, ?1, unit, direction, run_id, ?2, ?3, hardware_tag,
-                inserted_utc, inserted_by
+                inserted_utc, inserted_by, run_class
            FROM observations WHERE metric = ?4 LIMIT 1",
         rusqlite::params![value, ts_utc, git_sha, metric],
     )
@@ -547,6 +548,45 @@ fn champions_with_backend_filter_picks_per_backend_best() {
     let cell = rows[0].metrics.get("decode_tps_warm").unwrap();
     assert_eq!(cell.value, 100.0);
     assert_eq!(cell.backend, "rmlx");
+}
+
+/// The per-backend champion reads `observations` in its own SQL, so it must
+/// refuse the rows `bests` refuses: a gate row outside its bound is not a
+/// champion, and a cell whose only gate rows are outside it is not listed.
+#[test]
+fn champions_with_backend_filter_do_not_rank_an_implausible_row() {
+    let mut conn = test_conn();
+    seed_two_backend_one_metric(&mut conn);
+    clone_row_with(
+        &conn,
+        "decode_tps_warm",
+        1.0e9,
+        "2026-05-02T10:00:00Z",
+        "sha",
+    );
+    conn.execute(
+        "UPDATE observations SET backend = 'rmlx' WHERE value = 1.0e9",
+        [],
+    )
+    .unwrap();
+    let rows = champions(&conn, Some("rmlx")).unwrap();
+    let cell = rows[0].metrics.get("decode_tps_warm").unwrap();
+    assert_eq!(cell.value, 100.0);
+
+    conn.execute(
+        "UPDATE observations SET model = 'only-implausible' WHERE value = 1.0e9",
+        [],
+    )
+    .unwrap();
+    let models: Vec<String> = champions(&conn, Some("rmlx"))
+        .unwrap()
+        .into_iter()
+        .map(|r| r.model)
+        .collect();
+    assert!(
+        !models.iter().any(|m| m == "only-implausible"),
+        "a cell with no plausible gate row was listed: {models:?}"
+    );
 }
 
 #[test]
@@ -918,7 +958,7 @@ fn deltas_prompt_prefix_scopes_the_sha_lookup() {
     let err = deltas(&conn, "sha_other", Some(5.0), Some("ssd-canary-")).unwrap_err();
     assert!(
         err.to_string()
-            .contains("no observations found with git_sha 'sha_other'"),
+            .contains("no gate observations found with git_sha 'sha_other'"),
         "{err}"
     );
     assert!(deltas(&conn, "sha_canary", Some(5.0), Some("ssd-canary-")).is_ok());
@@ -944,6 +984,248 @@ fn cell_predicate_reaches_every_consumer() {
             );
         }
     }
+}
+
+/// The readers of `read.rs` that show every class: a cell's history and its
+/// time series.
+const HISTORY_READERS: [&str; 2] = ["history_sql", "timeseries_sql"];
+
+/// A top-level item of a source file the scan reads: a fn up to its closing
+/// brace, or a `const` / `static` up to its closing semicolon.
+struct Item<'a> {
+    is_fn: bool,
+    name: &'a str,
+    text: String,
+}
+
+/// A string literal a `const` item's scan is inside: a normal one, or a raw
+/// one closed by `"` and this many `#`s.
+#[derive(Clone, Copy)]
+enum Open {
+    Str,
+    Raw(usize),
+}
+
+/// Whether `line` closes a `const` item: it ends in `;` outside any string or
+/// char literal. `open` carries a string literal left open by an earlier line.
+fn ends_const(line: &str, open: &mut Option<Open>) -> bool {
+    let chars: Vec<char> = line.chars().collect();
+    let mut last = None;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match *open {
+            Some(Open::Str) => match c {
+                '\\' => i += 1,
+                '"' => *open = None,
+                _ => {}
+            },
+            Some(Open::Raw(hashes)) => {
+                let closes = c == '"' && (1..=hashes).all(|k| chars.get(i + k) == Some(&'#'));
+                if closes {
+                    *open = None;
+                    i += hashes;
+                }
+            }
+            None => {
+                let after_ident = i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_');
+                if c == '"' {
+                    *open = Some(Open::Str);
+                } else if c == 'r' && !after_ident {
+                    let hashes = chars[i + 1..].iter().take_while(|&&h| h == '#').count();
+                    if chars.get(i + 1 + hashes) == Some(&'"') {
+                        *open = Some(Open::Raw(hashes));
+                        i += 1 + hashes;
+                    } else {
+                        last = Some(c);
+                    }
+                } else if c == '\'' {
+                    // A char literal (`'"'`, `'\''`); a lifetime has no closing quote.
+                    if chars.get(i + 1) == Some(&'\\') {
+                        if let Some(end) = (i + 2..chars.len()).find(|&k| chars[k] == '\'') {
+                            i = end;
+                        }
+                    } else if chars.get(i + 2) == Some(&'\'') {
+                        i += 2;
+                    }
+                    last = Some('\'');
+                } else if c == '/' && chars.get(i + 1) == Some(&'/') {
+                    break;
+                } else if !c.is_whitespace() {
+                    last = Some(c);
+                }
+            }
+        }
+        i += 1;
+    }
+    open.is_none() && last == Some(';')
+}
+
+/// Every top-level fn, `const` and `static` of `source`, in order.
+fn top_level_items(source: &str) -> Vec<Item<'_>> {
+    let decl = regex_lite::Regex::new(
+        r"^(?:pub(?:\([^)]*\))?\s+)?((?:(?:const|async|unsafe)\s+)*fn|const|static)\s+([A-Za-z_][A-Za-z0-9_]*)",
+    )
+    .unwrap();
+    let mut items = Vec::new();
+    let mut current: Option<Item<'_>> = None;
+    let mut open = None;
+    for line in source.lines() {
+        if current.is_none() {
+            if let Some(caps) = decl.captures(line) {
+                current = Some(Item {
+                    is_fn: caps[1].ends_with("fn"),
+                    name: caps.get(2).map_or("", |m| m.as_str()),
+                    text: String::new(),
+                });
+                open = None;
+            }
+        }
+        let Some(item) = current.as_mut() else {
+            continue;
+        };
+        item.text.push_str(line);
+        item.text.push('\n');
+        let closed = if item.is_fn {
+            line == "}"
+        } else {
+            ends_const(line, &mut open)
+        };
+        if closed {
+            items.extend(current.take());
+        }
+    }
+    items
+}
+
+/// The names of the items of `source` that read `observations` (`FROM` or
+/// `JOIN`, any case), and of those, the ones outside `history` that do not
+/// carry `bests_view::gate_rows_sql`. An error when the scan delimited fewer
+/// fns than `source` declares, so a reader it cannot parse fails the check
+/// rather than dropping out of it.
+fn gate_offenders(
+    source: &str,
+    history: &[&str],
+) -> std::result::Result<(Vec<String>, Vec<String>), String> {
+    let items = top_level_items(source);
+    let declared = regex_lite::Regex::new(
+        r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:const|async|unsafe)\s+)*fn\s+[A-Za-z_]",
+    )
+    .unwrap()
+    .find_iter(source)
+    .count();
+    let scanned = items.iter().filter(|i| i.is_fn).count();
+    if scanned != declared {
+        return Err(format!(
+            "the source declares {declared} fns but the scan read {scanned}; a fn the scan \
+             cannot delimit (nested, or not closed by a bare `}}`) would escape the gate check"
+        ));
+    }
+    let reads = regex_lite::Regex::new(r"(?i)\b(?:from|join)\s+observations\b").unwrap();
+    let readers: Vec<&Item<'_>> = items.iter().filter(|i| reads.is_match(&i.text)).collect();
+    let offenders = readers
+        .iter()
+        .filter(|i| !history.contains(&i.name) && !i.text.contains("gate_rows_sql()"))
+        .map(|i| i.name.to_owned())
+        .collect();
+    Ok((
+        readers.iter().map(|i| i.name.to_owned()).collect(),
+        offenders,
+    ))
+}
+
+/// Every query that feeds a gate reads `gate` rows only. A body that lost the
+/// filter would rank an A/B slot against the champion it is not allowed to
+/// move. So every top-level fn, `const` or `static` of `read.rs` whose SQL
+/// reads `observations` must carry `bests_view::gate_rows_sql`, except
+/// [`HISTORY_READERS`], which show every class.
+#[test]
+fn every_observations_reader_but_the_history_filters_on_the_gate_class() {
+    let (readers, offenders) = gate_offenders(include_str!("read.rs"), &HISTORY_READERS).unwrap();
+    for history in HISTORY_READERS {
+        assert!(
+            readers.iter().any(|r| r == history),
+            "{history} no longer reads observations; the allow-set names a reader that \
+             does not exist (found {readers:?})"
+        );
+    }
+    assert!(
+        readers.len() > HISTORY_READERS.len(),
+        "the scan found no gate reader in read.rs: {readers:?}"
+    );
+    assert_eq!(
+        offenders,
+        Vec::<String>::new(),
+        "these read observations without `bests_view::gate_rows_sql`"
+    );
+}
+
+/// The scan reads every shape a reader can take: a lowercase `join`, a `const`
+/// whose SQL holds a `;`, a raw string holding a `"` and a `;`, a char literal
+/// `'"'`, a `static`, a `const fn`, an `async fn` and a `pub(in …) fn`.
+#[test]
+fn the_gate_scan_reads_every_reader_shape() {
+    let source = r##"fn lower_join_reader() -> String {
+    "select v from x join observations o on o.id = x.id".to_owned()
+}
+
+const MULTI_STATEMENT: &str = "DELETE FROM t WHERE 1;
+SELECT value FROM observations WHERE metric = 'm'";
+
+pub const fn const_fn_reader() -> &'static str {
+    "SELECT value FROM observations"
+}
+
+async fn async_reader() -> String {
+    String::from("SELECT value FROM observations")
+}
+
+pub(in crate::query) fn scoped_reader() -> String {
+    "SELECT value FROM observations".to_owned()
+}
+
+const RAW_READER: &str = r#"SELECT "v";
+FROM observations"#;
+
+const QUOTE_THEN_READER: (char, &str) = ('"', "SELECT value FROM observations");
+
+static STATIC_READER: &str = "SELECT value FROM observations";
+
+fn gated() -> String {
+    format!("SELECT value FROM observations WHERE {}", crate::bests_view::gate_rows_sql())
+}
+"##;
+    let (readers, mut offenders) = gate_offenders(source, &[]).unwrap();
+    offenders.sort();
+    assert_eq!(readers.len(), 9, "{readers:?}");
+    assert_eq!(
+        offenders,
+        vec![
+            "MULTI_STATEMENT",
+            "QUOTE_THEN_READER",
+            "RAW_READER",
+            "STATIC_READER",
+            "async_reader",
+            "const_fn_reader",
+            "lower_join_reader",
+            "scoped_reader"
+        ]
+    );
+    let nested = "fn outer() {\n    fn inner() {}\n}\n";
+    assert!(
+        gate_offenders(nested, &[]).is_err(),
+        "a nested fn was not counted"
+    );
+}
+
+#[test]
+fn bests_ranks_gate_rows_only() {
+    let gate = crate::bests_view::gate_rows_sql();
+    let sql = crate::bests_view::create_sql();
+    assert!(
+        sql.contains(&gate),
+        "bests does not filter on `{gate}`:\n{sql}"
+    );
 }
 
 /// `best()` must answer for the cell it was asked about. With two arms in one

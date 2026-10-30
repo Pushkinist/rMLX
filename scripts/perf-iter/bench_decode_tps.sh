@@ -82,6 +82,14 @@ METRICS_OUT="${METRICS_OUT:-${RMLX_METRICS_DIR}/perf-iter/baseline.jsonl}"
 HEALTH_URL="http://127.0.0.1:${PORT}/health"
 COMPLETIONS_URL="http://127.0.0.1:${PORT}/v1/chat/completions"
 MODEL_ID="$(basename "${MODEL_PATH}")"
+# The weight label the snapshot's config describes, read through the one
+# shell-side producer of it, before anything runs.
+if ! _IDENTITY="$(python3 "$(dirname "${BASH_SOURCE[0]}")/../lib/snapshot_identity.py" "${MODEL_PATH}")"; then
+    echo "ERROR: ${MODEL_PATH}: its weight label cannot be recorded (above)" >&2
+    exit 2
+fi
+BENCH_WEIGHT_QUANT="$(printf '%s\n' "${_IDENTITY}" | sed -n 's/^weight_quant=//p')"
+export BENCH_WEIGHT_QUANT
 
 # ── Buffer dirs (§8.4) ────────────────────────────────────────────────────────
 mkdir -p "${RMLX_METRICS_DIR}/buffer/pending" "${RMLX_METRICS_DIR}/buffer/failed"
@@ -410,17 +418,7 @@ else:
     ns  = 'local'
     mdl = model_dir
 
-# weight_quant: infer from model name suffix keywords.
-def infer_weight_quant(name):
-    n = name.lower()
-    for tok, q in [('mxfp8','mxfp8'),('mxfp4','mxfp4'),('nvfp4','nvfp4'),
-                   ('8bit','q8_0'),('4bit','q4_k_m'),('2bit','2bit'),
-                   ('paro','paro'),('bf16','bf16'),('fp16','fp16')]:
-        if tok in n:
-            return q
-    return 'unknown'
-
-weight_quant = infer_weight_quant(mdl)
+weight_quant = os.environ['BENCH_WEIGHT_QUANT']
 
 # Load prompt body from file.
 prompt_body = None
@@ -459,6 +457,8 @@ rec = {
     'output_first_64': output_first_64,
     'notes':           'decode_window=engine_itl; perf-iter bench script',
     'description':     None,
+    # One iteration of a perf investigation, not a gate measurement.
+    'run_class':       'diagnostic',
     'metrics': [
         {'name': 'decode_tps_warm', 'value': float('${tps_mean}'),   'stddev': float('${tps_stddev}')},
         {'name': 'step_ms_mean',    'value': float('${ttft_mean}')},

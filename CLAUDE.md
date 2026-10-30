@@ -73,7 +73,9 @@ areas before touching code:
 | [`docs/SAMPLING.md`](docs/SAMPLING.md) | Per-token sampling (temperature, top-k/p, penalties, thinking budget, constrained decoding) |
 | [`docs/FFI.md`](docs/FFI.md) | rmlx-mlx ↔ mlx-c FFI bridge; MSL kernel surface; unsafe policy |
 | [`docs/MLX_PAIR.md`](docs/MLX_PAIR.md) | The pinned MLX / mlx-c pair: what to do on each Mac, the source build, `make mlx-restore-pin`, the pin gate and its verdicts, the two mlx-c C APIs, the attention row rule, moving the pin |
-| [`docs/METRICS_DB.md`](docs/METRICS_DB.md) | Metrics DB: path, identity rules, ingest, `rmlx metrics` tooling, operating rules |
+| [`docs/METRICS_DB.md`](docs/METRICS_DB.md) | Metrics DB: path, identity rules, ingest and the run class, `rmlx metrics` tooling, operating rules |
+| [`docs/METRICS_EXPORT.md`](docs/METRICS_EXPORT.md) | `BENCHMARK_CHAMPIONS.md` and the exports, split out of `METRICS_DB.md` for size: what `export --markdown` renders, the other formats, the `Updated` column |
+| [`docs/METRICS_IMPORT.md`](docs/METRICS_IMPORT.md) | `rmlx metrics import`, split out of `METRICS_DB.md` for size: what is copied, the run class by source version, the skip key, the report |
 | [`docs/METRICS_SCHEMA.md`](docs/METRICS_SCHEMA.md) | Metrics DB schema: tables (observations, events, prompts, the bests view), metric registry, plausible-value bounds, known-bad rows |
 | [`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md) | The three canary anchors and the bench methods: A/B comparison, per-codec cells, the bandwidth ceiling, cross-backend cells |
 | [`docs/PUBLISHED_PROTOCOL.md`](docs/PUBLISHED_PROTOCOL.md) | Generated: published-protocol results (MT-Bench / MATH-500 / HumanEval, fixed prompt) with every number beside the bound it cannot pass |
@@ -130,9 +132,9 @@ must serve end-to-end at every change:
 
 Other Open Models snapshots (`z-lab__Qwen3.6-27B-PARO`, `medgemma`, the `jina`
 embedding/reranker models, `ReaderLM-v2`, …) are in scope as feature
-coverage grows. Qwen3.6, medgemma and every Bonsai without "2" keep their
-cells and are not test targets; see `docs/TESTING.md` § "Test targets, kept
-cells and gaps".
+coverage grows. Qwen3.6 and every Bonsai without "2" keep their cells and are
+not test targets; medgemma, Laguna and DR-Venus have no test bound to their
+snapshots; see `docs/TESTING.md` § "Test targets, kept cells and gaps".
 
 ## Key external repos (GitHub)
 
@@ -359,7 +361,7 @@ hand — keeps the CI gate and the local gate identical.
 | `make check-published-samples` | CI gate (in `make ci` and hosted CI): the checked-in published-protocol sample sets under `prompts/published/` agree with the facts pinned in `scripts/published_samples.py` — seed, revision, template, count, licence, and the digest and byte length of each file — and each sample's user message renders from that template and the sample's own recorded copy of the upstream record. A manifest can be re-blessed around an edited file; the pins in the script cannot, so that is where the anchor is. `--sources` holds the samples to the upstream files record for record, and no gate passes it: the upstream files are not checked in. |
 | `make check-published-samples-fixtures` | CI gate (in `make ci` and hosted CI): recall test for the above, 30 synthetic sample-set roots (one edit each), each asserting the reason as well as exit 1 vs exit 2. The same rewritten prompt is run with the script's pin left alone and with it moved, so the layering is exercised rather than asserted. |
 | `make spec-bench-published-selftest` | CI gate (in `make ci`): mutation check for `scripts/spec_bench_published.sh` against a stub server over a shrunken copy of the checked-in sample sets, 125 cases, each asserting a literal exit code and, for every refusal, the reason. No GPU, no model, no DB. |
-| `make published-ingest-selftest` | CI gate (in `make ci`): mutation check for `scripts/ingest/published_ingest.py`, 50 cases over one synthetic published-protocol result on the real checked-in sample sets. One edit each, asserting the literal exit code and the reason: both ways a sample's content address can move, a sample set edited after the run, a rebuilt binary, a binary whose digest agrees but whose marker literals do not, each refusal and its waiver, and the buffer-queue discipline in all three outcomes. Never writes `runs.db`. |
+| `make published-ingest-selftest` | CI gate (in `make ci`): mutation check for `scripts/ingest/published_ingest.py`, 51 cases over one synthetic published-protocol result on the real checked-in sample sets. One edit each, asserting the literal exit code and the reason: both ways a sample's content address can move, a sample set edited after the run, a rebuilt binary, a binary whose digest agrees but whose marker literals do not, each refusal and its waiver, a recorder without `--run-class`, and the buffer-queue discipline in all three outcomes. Never writes `runs.db`. |
 | `make published-table` | Regenerate `docs/PUBLISHED_PROTOCOL.md` from the published-protocol result files. Every measured figure is rendered beside the bound it cannot exceed — the decode rate against `scripts/perf_ceiling.py`'s autoregressive ceiling, the resident peaks against the weight+KV floor, `tokens_per_round` against the drafter's block — and the pinned protocol choices and the three disclosures are printed in the header. Defaults to the checked-in fixture; `PUBLISHED_TABLE_RESULTS=` / `PUBLISHED_TABLE_MODEL=` render a real run. `PUBLISHED_TABLE_PPL=<rmlx eval ppl line>` on the make command line adds the perplexity section for a real run; the fixture render carries the checked-in record, and the environment is not read. |
 | `make check-published-table` | CI gate (in `make ci`): the committed `docs/PUBLISHED_PROTOCOL.md` is exactly what the emitter renders from its checked-in inputs — it is generated, never hand-written. It reads the fixture directly, so no variable can point it elsewhere; regenerating the doc from a real run without checking that run's result files in beside the fixture turns this red, which is how a published number with unrecorded inputs is found. |
 | `make published-table-selftest` | CI gate (in `make ci`): mutation check for `scripts/lib/published_table.py`, 69 cases against a header-only fixture snapshot. The numeric cases re-derive the ceiling and the resident floor from that snapshot's own safetensors header in arithmetic sharing no code with `perf_ceiling.py`; the codec and context ceiling are checked to be passed through, since a wrong bound renders exactly as plausibly as a right one. No GPU, no model, no DB. |
@@ -513,6 +515,13 @@ summary.
   stream, written by `rmlx_metrics::events::EventRecorder`), `prompts`
   (content-addressed bodies) and the `bests` view over `observations`.
 - **Append-only.** Do not delete or overwrite rows.
+- **Run class.** Every `observations` row is `gate`, `ab_arm` or `diagnostic`
+  (`docs/METRICS_DB.md` §8.5). Record every measurement run under its class:
+  canaries, release gates and the surviving arm of an A/B as `gate`, every A/B
+  slot as `ab_arm`, investigation runs as `diagnostic`. Only `gate` rows reach
+  `bests`, the gates and the exports. A record that states no class is refused.
+  `rmlx metrics import` brings a scratch DB's rows in
+  (`docs/METRICS_IMPORT.md`).
 - **Ingest**: a bench script writes a §8.5 record to
   `<RMLX_HOME>/metrics/buffer/pending/`, then `rmlx metrics record --file
   <path>` ingests and deletes it. Every backend emits that shape.
@@ -559,8 +568,8 @@ Through `make canary-gate`, a failed recipe line always reports `make`'s own
 exit code (2) — a regression, an unknown SHA and the underlying skip
 condition all surface as the same 2. Call `rmlx metrics deltas
 --since-sha <SHA> --threshold-pct 3 --exit-code true` directly to read its
-own exit codes: 1 for a regression or a SHA with no rows at all (unknown
-SHA), 125 for the skip condition (no comparable baseline). A known SHA with
+own exit codes: 1 for a regression or a SHA with no gate observations
+(unknown SHA), 125 for the skip condition (no comparable baseline). A known SHA with
 no cell measured again after it exits 0 even directly, so a clean exit does
 not prove every cell was re-measured. Two `Cargo.toml` perf profiles are
 in play: `release-perf` (`debug-assertions=false`, `overflow-checks=false`,

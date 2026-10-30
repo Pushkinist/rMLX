@@ -20,7 +20,7 @@ use std::cell::OnceCell;
 
 use rmlx_core::error::{Error, Result};
 use rmlx_loader::{
-    view_discriminated, ShardHandle, ShardIndex, ShardSet, TensorLookup, TensorView,
+    release_mapped, view_discriminated, ShardHandle, ShardIndex, ShardSet, TensorLookup, TensorView,
 };
 use rmlx_mlx::{Array, Dtype};
 use rmlx_quant::awq::{
@@ -280,7 +280,7 @@ impl<'a> Weights<'a> {
     /// header-scan-fallback resolution as [`array`](Weights::array).
     ///
     /// Returns an owned byte copy so the caller may outlive the borrow — the PARO
-    /// byte-math path consumes this.
+    /// byte-math path consumes this. The copied shard pages are released.
     pub(crate) fn raw(&self, name: &str) -> Result<(Vec<u8>, Vec<usize>, safetensors::Dtype)> {
         if let Some(idx) = self.idx {
             match view_discriminated(self.shards, idx, name)? {
@@ -290,7 +290,9 @@ impl<'a> Weights<'a> {
                     // `Array` allocation, so `classify_load_oom` (which maps
                     // device-alloc error strings) does not apply — PARO's
                     // `from_bytes` call sites surface any device-alloc failure.
-                    return Ok((tv.bytes.to_vec(), tv.shape, tv.dtype));
+                    let bytes = tv.bytes.to_vec();
+                    release_mapped(tv.bytes);
+                    return Ok((bytes, tv.shape, tv.dtype));
                 }
                 TensorLookup::NotInIndex | TensorLookup::WrongShard => {}
             }
@@ -300,7 +302,9 @@ impl<'a> Weights<'a> {
                 "tensor '{name}' not found in any open shard header"
             ))
         })?;
-        Ok((bytes.to_vec(), shape, dtype))
+        let owned = bytes.to_vec();
+        release_mapped(bytes);
+        Ok((owned, shape, dtype))
     }
 
     /// Assemble a [`Linear`] for `<base>` from its `.weight` and (optional)
@@ -319,7 +323,7 @@ impl<'a> Weights<'a> {
     ) -> Result<Linear> {
         let scales_name = format!("{base}.scales");
         if !self.has(&scales_name)? {
-            // No scales sibling → plain bf16 weight.
+            // No scales sibling: a plain weight, kept at its stored dtype.
             let weight = self.array(&format!("{base}.weight"))?;
             return Ok(Linear::Plain { weight });
         }
@@ -364,7 +368,7 @@ impl<'a> Weights<'a> {
     ) -> Result<Embedding> {
         let scales_name = format!("{base}.scales");
         if !self.has(&scales_name)? {
-            // No scales sibling → plain bf16 weight.
+            // No scales sibling: a plain weight, kept at its stored dtype.
             let weight = self.array(&format!("{base}.weight"))?;
             return Ok(Embedding::Plain { weight });
         }

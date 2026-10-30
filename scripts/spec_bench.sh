@@ -634,6 +634,9 @@ obj = {
         f"answer_check={answer_check_notes} answer={answer}"
     ),
     "description": f"spec_bench {config} sha={git_sha}",
+    # Both arms are kept cells, told apart by `decode_config`; neither is a
+    # discarded A/B slot.
+    "run_class": "gate",
     "metrics": metrics,
 }
 print(json.dumps(obj))

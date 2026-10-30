@@ -20,6 +20,11 @@ Exit codes:
     1  argument / I/O / subprocess error
     2  PPL value outside the plausible band (sanity gate, opt-in via
        ``--plausibility``)
+    75 measured, record pending: the PPL is printed, and its record did not
+       land; the buffer file ``rmlx eval ppl`` named is kept for
+       ``rmlx metrics record --replay-pending`` (docs/METRICS_DB.md section 13,
+       rule 24). A PPL outside the plausible band exits 2 even when its
+       record is also pending: 2 wins over 75.
 """
 
 from __future__ import annotations
@@ -108,6 +113,14 @@ def parse_args() -> argparse.Namespace:
         "an omitted flag leaves the column NULL.",
     )
     p.add_argument(
+        "--run-class",
+        required=True,
+        choices=["gate", "ab_arm", "diagnostic"],
+        help="Why the run is recorded (docs/METRICS_DB.md §8.5): gate for a "
+        "published or release number, diagnostic for an investigation. Only "
+        "gate rows reach bests and the gates.",
+    )
+    p.add_argument(
         "--plausibility",
         action="store_true",
         help="Gate the result: exit 2 when PPL is outside (1.5, 50.0).",
@@ -182,7 +195,14 @@ def resolve_rmlx_binary(arg_binary: str) -> Path:
     )
 
 
-def run_ppl(args: argparse.Namespace, text_path: Path, rmlx: Path) -> dict:
+# `rmlx eval ppl --corpus` exits with this code when it measured and its
+# record did not land; kept equal to `crate::exit::RECORD_PENDING` in
+# crates/rmlx-cli/src/exit.rs, which a test there holds.
+RECORD_PENDING_EXIT = 75
+
+
+def run_ppl(args: argparse.Namespace, text_path: Path, rmlx: Path) -> tuple[dict, bool]:
+    """The rMLX JSON line, and whether its record is pending."""
     cmd = [
         str(rmlx),
         "eval",
@@ -197,6 +217,8 @@ def run_ppl(args: argparse.Namespace, text_path: Path, rmlx: Path) -> dict:
         str(args.stride),
         "--corpus",
         args.corpus,
+        "--run-class",
+        args.run_class,
         "--device",
         args.device,
         "--max-tokens",
@@ -211,7 +233,18 @@ def run_ppl(args: argparse.Namespace, text_path: Path, rmlx: Path) -> dict:
         capture_output=True,
         text=True,
     )
-    if proc.returncode != 0:
+    pending = proc.returncode == RECORD_PENDING_EXIT
+    if pending:
+        # The measurement is real; the record is what did not land.
+        for line in proc.stderr.splitlines():
+            if "it is kept at" in line:
+                print(line, file=sys.stderr)
+        print(
+            "wikitext-2: WARNING: the PPL below was measured, but its record did not land; "
+            "replay it with `rmlx metrics record --replay-pending`",
+            file=sys.stderr,
+        )
+    elif proc.returncode != 0:
         print(
             f"wikitext-2: rmlx eval ppl failed (exit {proc.returncode}):\n"
             f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}",
@@ -227,7 +260,7 @@ def run_ppl(args: argparse.Namespace, text_path: Path, rmlx: Path) -> dict:
             file=sys.stderr,
         )
         raise SystemExit(1)
-    return json.loads(lines[-1])
+    return json.loads(lines[-1]), pending
 
 
 def main() -> int:
@@ -241,7 +274,7 @@ def main() -> int:
     cache_dir = resolve_cache_dir(args.cache_dir)
     text_path = download_wikitext2_test(cache_dir)
     rmlx = resolve_rmlx_binary(args.rmlx_binary)
-    result = run_ppl(args, text_path, rmlx)
+    result, pending = run_ppl(args, text_path, rmlx)
     # Forward the rMLX JSON line to stdout verbatim so calling scripts can
     # parse one line, full audit fields included.
     print(json.dumps(result))
@@ -260,7 +293,7 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 2
-    return 0
+    return RECORD_PENDING_EXIT if pending else 0
 
 
 if __name__ == "__main__":

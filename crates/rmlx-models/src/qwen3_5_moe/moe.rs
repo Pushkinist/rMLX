@@ -3,9 +3,10 @@
 //! SparseMoeBlock:
 //! Router: Linear -> softmax -> argpartition top-K -> gather scores -> optional normalize.
 //! SwitchMlp: SwiGLU via gather_qmm (batched over experts).
-//! SharedExpert: dense SwiGLU + sigmoid gate.
+//! Shared expert: a `DenseMlp`, gated by `SparseMoeBlock::shared_expert_gate`.
 //!
-//! DenseMlp: used by the PARO dense variant (Qwen3_5ForConditionalGeneration).
+//! DenseMlp: the dense layers of `Qwen3_5ForConditionalGeneration` and the
+//! shared expert of `SparseMoeBlock`.
 
 #![allow(clippy::struct_field_names)]
 use rmlx_core::error::Result;
@@ -14,7 +15,7 @@ use rmlx_mlx::{
     silu, softmax, sum_axis, take_along_axis, Array, Device, Dtype,
 };
 
-use super::layers::Linear;
+use super::layers::{Linear, SharedInput};
 
 /// Flattened `n_tokens * top_k` count at or above which the expert dispatch
 /// sorts indices for contiguous per-expert access (prefill). Below it (decode,
@@ -177,27 +178,10 @@ impl SwitchMlp {
 }
 
 #[allow(missing_debug_implementations)]
-pub(super) struct SharedExpert {
-    pub(super) gate_proj: Linear,
-    pub(super) up_proj: Linear,
-    pub(super) down_proj: Linear,
-}
-
-impl SharedExpert {
-    pub(super) fn forward(&self, x: &Array, device: Device) -> Result<Array> {
-        let gate = self.gate_proj.forward(x, device)?;
-        let gate = silu(&gate, device)?;
-        let up = self.up_proj.forward(x, device)?;
-        let gated = multiply(&gate, &up, device)?;
-        self.down_proj.forward(&gated, device)
-    }
-}
-
-#[allow(missing_debug_implementations)]
 pub(super) struct SparseMoeBlock {
     pub(super) gate: Linear,
     pub(super) switch_mlp: SwitchMlp,
-    pub(super) shared_expert: SharedExpert,
+    pub(super) shared_expert: DenseMlp,
     pub(super) shared_expert_gate: Linear,
     pub(super) num_experts: usize,
     pub(super) top_k: usize,
@@ -277,14 +261,12 @@ impl SparseMoeBlock {
 }
 
 // ---------------------------------------------------------------------------
-// Dense SwiGLU MLP (PARO dense variant)
+// Dense SwiGLU MLP
 // ---------------------------------------------------------------------------
 
-/// Dense gate-up-down SwiGLU FFN.
-///
-/// Used by `Qwen3_5ForConditionalGeneration` (e.g. z-lab PARO 27B).
-/// Identical feed-forward structure to the shared expert in `SparseMoeBlock`
-/// but without the MoE routing overhead.
+/// Dense gate-up-down SwiGLU FFN: a dense layer of
+/// `Qwen3_5ForConditionalGeneration`, and the shared expert of
+/// `SparseMoeBlock`, which applies its sigmoid gate outside it.
 #[allow(missing_debug_implementations)]
 pub(super) struct DenseMlp {
     pub(super) gate_proj: Linear,
@@ -294,9 +276,10 @@ pub(super) struct DenseMlp {
 
 impl DenseMlp {
     pub(super) fn forward(&self, x: &Array, device: Device) -> Result<Array> {
-        let gate = self.gate_proj.forward(x, device)?;
+        let mut input = SharedInput::new(x);
+        let gate = input.forward(&self.gate_proj, device)?;
         let gate = silu(&gate, device)?;
-        let up = self.up_proj.forward(x, device)?;
+        let up = input.forward(&self.up_proj, device)?;
         let gated = multiply(&gate, &up, device)?;
         self.down_proj.forward(&gated, device)
     }

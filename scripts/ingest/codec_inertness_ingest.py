@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Ingest `codec_inertness_probe.sh` residency cells into the rMLX metrics DB.
 
-The probe writes a CSV and never touches `runs.db` — a sweep is an experiment
-and the store is append-only. This is the separate, explicit step that promotes
-its cells into §8.5 RunRecords, one per (model, context, codec).
+The probe now records each of its runs itself, as `diagnostic`, and marks the
+row in its CSV's `recorded_run_class` column; such a row is skipped here, so no
+run's `kv_cache_bytes` is written twice. This ingests the rows of a sweep the
+probe did not record, into §8.5 RunRecords of class `diagnostic`, one per
+(model, context, codec): a probe sweep is an investigation.
 
 **Only `kv_cache_bytes` is recorded.** The probe's `decode_tps` / `ttft_ms` /
 `prefill_tps` columns are single unpaired runs on a shared host, where the same
@@ -31,11 +33,11 @@ either. Nothing derived from it should classify a codec.
 Usage:
     # Inspect the records without writing anything:
     python3 scripts/ingest/codec_inertness_ingest.py --dry-run CSV \\
-        --backend-version 0.3.0 --build-profile release-perf
+        --backend-version 0.3.0 --build-profile release-perf --models-root DIR
 
     # Write buffer files and ingest them:
     python3 scripts/ingest/codec_inertness_ingest.py --record CSV \\
-        --backend-version 0.3.0 --build-profile release-perf
+        --backend-version 0.3.0 --build-profile release-perf --models-root DIR
 """
 
 from __future__ import annotations
@@ -53,11 +55,17 @@ from typing import Any
 _SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPT_DIR.parent / "lib"))
 from kv_boundary_default import kv_boundary_default  # noqa: E402
-from snapshot_identity import split_model_dir  # noqa: E402
+from recorder_check import require_run_class_recorder  # noqa: E402
+from rmlx_home import rmlx_home  # noqa: E402
+from snapshot_identity import (  # noqa: E402
+    UnlabelledSnapshot,
+    snapshot_weight_quant,
+    split_model_dir,
+)
 RMLX_REPO_ROOT = Path(os.environ.get("RMLX_REPO_ROOT", str(_SCRIPT_DIR.parents[1])))
 # Runtime state lives under a single root (CLAUDE.md). `RMLX_HOME` wins; the
 # in-repo `.rmlx/` is the dev default.
-RMLX_HOME = Path(os.environ.get("RMLX_HOME", str(RMLX_REPO_ROOT / ".rmlx")))
+RMLX_HOME = rmlx_home(RMLX_REPO_ROOT)
 BUFFER_PENDING = RMLX_HOME / "metrics" / "buffer" / "pending"
 # Assembled here first, moved into `pending/` only for the moment the recorder
 # is invoked. Anything left sitting in `pending/` is, by contract, work the next
@@ -65,26 +73,22 @@ BUFFER_PENDING = RMLX_HOME / "metrics" / "buffer" / "pending"
 STAGING = RMLX_HOME / "bench" / "codec_inertness" / "records"
 
 # The probe's model column is a snapshot directory name, split by
-# `split_model_dir` into the identity columns `<namespace>__<model>`.
-# §5.2 whitelist tokens, most specific first — same order as
-# `rmlx_metrics::identity::infer_weight_quant`, which this mirrors on purpose so
-# a row ingested here lands in the same cell as one the binary recorded.
-WEIGHT_QUANT_TOKENS = [
-    "mxfp8", "mxfp4", "nvfp4", "q4_k_m", "q8_0",
-    "8bit", "4bit", "2bit", "3bit", "5bit", "6bit", "fp16", "bf16", "paro",
-]
-
-
-def weight_quant_of(model: str) -> str:
-    lower = model.lower()
-    for token in WEIGHT_QUANT_TOKENS:
-        if token in lower:
-            return token
-    return "bf16"
+# `split_model_dir` into the identity columns `<namespace>__<model>`. Its weight
+# label is the one that snapshot's `config.json` describes, read through
+# `snapshot_identity.snapshot_weight_quant` under `--models-root`, as `rmlx
+# baseline --record` reads it: a label guessed from the name would file the row
+# in another cell than the probe's own record.
+def weight_quant_of(models_root: Path, model_dir: str) -> str:
+    try:
+        return snapshot_weight_quant(str(models_root / model_dir))
+    except UnlabelledSnapshot as exc:
+        raise SystemExit(f"cannot label the row's weights: {exc}") from None
 
 
 # Column the probe records its `--kv-boundary-layers` value in.
 KV_BOUNDARY_FIELD = "kv_boundary"
+# Column the probe sets on a row whose run it recorded itself.
+RECORDED_FIELD = "recorded_run_class"
 # Where `csv.DictReader` puts fields the header does not name. Checked, not
 # ignored: a non-empty bucket means the columns are shifted.
 EXTRA_FIELDS_KEY = "__unnamed_fields__"
@@ -169,7 +173,7 @@ def build_record(row: dict[str, str], args: argparse.Namespace, prompts_dir: Pat
         "backend_version": args.backend_version,
         "model_namespace": namespace,
         "model": model,
-        "weight_quant": weight_quant_of(model),
+        "weight_quant": weight_quant_of(Path(args.models_root), row["model"]),
         "kv_quant": row["codec"],
         "decode_config": decode_config_of(row),
         "ctx_max": max_ctx,
@@ -198,6 +202,7 @@ def build_record(row: dict[str, str], args: argparse.Namespace, prompts_dir: Pat
             "runs on a shared host and are deliberately not recorded"
         ),
         "description": args.description,
+        "run_class": "diagnostic",
         "metrics": [{"name": "kv_cache_bytes", "value": float(row["kv_cache_bytes"])}],
     }
 
@@ -220,6 +225,12 @@ def main() -> int:
     p.add_argument("--hardware-tag", default="m5_max_128gb")
     p.add_argument("--description", default=None)
     p.add_argument("--prompts-dir", default=str(RMLX_REPO_ROOT / "prompts"))
+    p.add_argument(
+        "--models-root",
+        required=True,
+        help="the directory holding the snapshots the CSV's model column names; each "
+        "row's weight label is read from <models-root>/<model>/config.json",
+    )
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--record", action="store_true", help="ingest via `rmlx metrics record --file`")
     p.add_argument("--rmlx-bin", default=str(RMLX_REPO_ROOT / "target" / "release-perf" / "rmlx"))
@@ -255,6 +266,14 @@ def main() -> int:
     # A failed cell emits an empty `kv_cache_bytes` and an empty digest — the
     # sha256 of nothing, which reads exactly like a real result. The exit code
     # is the column that tells the two apart, so it is the filter.
+    recorded = [r for r in rows if (r.get(RECORDED_FIELD) or "").strip()]
+    if recorded:
+        print(
+            f"skipping {len(recorded)} row(s) the probe already recorded, or whose record is "
+            f"pending a replay (`{RECORDED_FIELD}` is set); ingesting them would write each "
+            "byte count twice"
+        )
+    rows = [r for r in rows if not (r.get(RECORDED_FIELD) or "").strip()]
     usable = [r for r in rows if r["exit_code"] == "0" and r["kv_cache_bytes"]]
     dropped = len(rows) - len(usable)
     if dropped:
@@ -271,6 +290,9 @@ def main() -> int:
             trimmed["prompt"] = dict(rec["prompt"], body=f"<{len(rec['prompt']['body'])} chars>")
             print(json.dumps(trimmed, indent=2))
         return 0
+
+    if args.record:
+        require_run_class_recorder(args.rmlx_bin)
 
     STAGING.mkdir(parents=True, exist_ok=True)
     staged: list[Path] = []

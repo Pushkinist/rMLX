@@ -31,6 +31,7 @@ pub mod error;
 pub mod kv_boundary;
 pub mod kvcache;
 pub mod mach_mem;
+pub mod mapped_pages;
 pub mod paths;
 pub mod projects_config;
 pub mod runinfo;

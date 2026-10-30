@@ -24,7 +24,7 @@ use rmlx_mlx::{Array, Device};
 use super::attention::FullAttention;
 use super::decoder_layer::{AttnBlock, DecoderLayer, MlpBlock};
 use super::layers::{Linear, RmsNorm};
-use super::moe::{DenseMlp, SharedExpert, SparseMoeBlock, SwitchMlp};
+use super::moe::{DenseMlp, SparseMoeBlock, SwitchMlp};
 use crate::layers::{resolve_quant, QuantParams};
 use rmlx_kv_quant::KvCache;
 
@@ -198,7 +198,7 @@ impl MtpLayer {
                     up_proj: load_linear(&format!("{m}.switch_mlp.up_proj"))?,
                     down_proj: load_linear(&format!("{m}.switch_mlp.down_proj"))?,
                 },
-                shared_expert: SharedExpert {
+                shared_expert: DenseMlp {
                     gate_proj: load_linear(&format!("{m}.shared_expert.gate_proj"))?,
                     up_proj: load_linear(&format!("{m}.shared_expert.up_proj"))?,
                     down_proj: load_linear(&format!("{m}.shared_expert.down_proj"))?,

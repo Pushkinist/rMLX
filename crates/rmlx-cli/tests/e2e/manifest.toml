@@ -48,7 +48,7 @@ subfeature = "baseline --record"
 model = "BONSAI"
 # Explicit absolute --prompt: the bundled default resolves CWD-relative and the
 # test CWD is the crate dir, not the workspace root.
-cli = ["baseline", "--model", "$MODEL", "--prompt", "$FIXTURES/baseline_prompt_smoke.txt", "--max-tokens", "16", "--record"]
+cli = ["baseline", "--model", "$MODEL", "--prompt", "$FIXTURES/baseline_prompt_smoke.txt", "--max-tokens", "16", "--record", "--run-class", "diagnostic"]
 assert = { kind = "exit_code", expect = "0" }
 tags = ["run1", "cli"]
 

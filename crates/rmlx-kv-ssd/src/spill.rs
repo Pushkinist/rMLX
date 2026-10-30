@@ -6,7 +6,7 @@
 //! evicted entry's caches plus its identity metadata — and `try_send`s it onto
 //! a **bounded `std::sync::mpsc::sync_channel`**. A single dedicated drain
 //! thread receives jobs, serializes them via 's `block_io::write_caches`
-//! to a `.kvb` file under `paths::kv_cache_dir(namespace)`, and records the
+//! to a `.kvb` file under `<kv_root>/<namespace>/`, and records the
 //! file in 's `SsdKvIndex`.
 //!
 //! ## Why a channel + drain thread (not `spawn_blocking`)
@@ -39,7 +39,7 @@
 //! `set_spill_sink`s it onto the per-arch `PROMPT_CACHE`, gated by
 //! `--kv-ssd-cache-gb`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::thread;
 use std::time::Instant;
@@ -114,11 +114,12 @@ pub struct SsdSpiller {
 }
 
 impl SsdSpiller {
-    /// Spawn the drain thread for `model_id` and return a handle.
+    /// Spawn the drain thread for `model_id` below `kv_root` and return a
+    /// handle.
     ///
     /// `model_id` (`<arch>/<snapshot>`) doubles as the spill namespace: it
-    /// selects the `paths::kv_cache_dir(model_id)` directory and the
-    /// `SsdKvIndex` DB, and is written to each block header + index row. The
+    /// selects the `<kv_root>/<model_id>/` directory and the `SsdKvIndex` DB,
+    /// and is written to each block header + index row. The
     /// per-entry `KvQuant` is recorded per-row, so one directory per model
     /// holds all quant variants. The index is opened **on the drain thread**
     /// so the hot path never touches SQLite. `device` is the device used for
@@ -132,8 +133,14 @@ impl SsdSpiller {
     /// SSD-tier config, so it is the same figure the attach-time maintenance
     /// pass evicted to. `0` (tier unconfigured) leaves the drain thread with no
     /// ceiling to enforce, exactly as before.
-    pub fn spawn(model_id: impl Into<String>, layout_key: u64, device: Device) -> Self {
+    pub fn spawn(
+        kv_root: &Path,
+        model_id: impl Into<String>,
+        layout_key: u64,
+        device: Device,
+    ) -> Self {
         let model_id = model_id.into();
+        let kv_root = kv_root.to_path_buf();
         let (tx, rx) = sync_channel::<SpillJob>(SPILL_CHANNEL_CAP);
 
         let budget_bytes = crate::ssd_tier::active()
@@ -143,8 +150,8 @@ impl SsdSpiller {
         let _ = thread::Builder::new()
             .name("rmlx-kv-spill".into())
             .spawn(move || {
-                let dir = rmlx_core::paths::kv_cache_dir(&ns);
-                let index = match SsdKvIndex::open(&ns) {
+                let dir = kv_root.join(&ns);
+                let index = match SsdKvIndex::open(&kv_root, &ns) {
                     Ok(idx) => idx,
                     Err(e) => {
                         tracing::error!(namespace = %ns, error = %e, "kv-spill: index open failed, every spill for this namespace is dropped");
@@ -169,13 +176,12 @@ impl SsdSpiller {
         }
     }
 
-    /// Test-only: spawn a drain thread bound to an explicit `dir` + `index`,
-    /// bypassing `paths::kv_cache_dir` so tests are hermetic (no env-var
-    /// coupling, no shared workspace `.rmlx/`). Same drain semantics as
-    /// [`Self::spawn`], including the post-spill evict-to-budget pass —
-    /// `budget_bytes` stands in for what [`Self::spawn`] reads from the
-    /// installed config (`0` = no ceiling). Returns the handle plus the spawned
-    /// thread's `JoinHandle` so a test can join after dropping the sender.
+    /// Test-only: spawn a drain thread over an index the test already opened.
+    /// Same drain semantics as [`Self::spawn`], including the post-spill
+    /// evict-to-budget pass — `budget_bytes` stands in for what
+    /// [`Self::spawn`] reads from the installed config (`0` = no ceiling).
+    /// Returns the handle plus the spawned thread's `JoinHandle` so a test can
+    /// join after dropping the sender.
     #[cfg(test)]
     #[allow(
         clippy::expect_used,
@@ -292,7 +298,7 @@ impl SsdSpiller {
 /// Returns `true` only when the block reached the index, which is the one
 /// outcome that grew the namespace and therefore the only one worth running an
 /// evict-to-budget pass after.
-fn drain_one(index: &SsdKvIndex, dir: &std::path::Path, device: Device, job: SpillJob) -> bool {
+fn drain_one(index: &SsdKvIndex, dir: &Path, device: Device, job: SpillJob) -> bool {
     drain_one_inner(index, dir, device, job, None)
 }
 
@@ -308,7 +314,7 @@ fn drain_one(index: &SsdKvIndex, dir: &std::path::Path, device: Device, job: Spi
 )]
 fn drain_one_inner(
     index: &SsdKvIndex,
-    dir: &std::path::Path,
+    dir: &Path,
     device: Device,
     job: SpillJob,
     test_recorder: Option<&EventRecorder>,

@@ -8,7 +8,7 @@
 //!
 //! Included:
 //! - `RmsNorm` — plain-gamma convention (Gemma4, Llama, Qwen).
-//! - `Linear` — plain bf16 or quantized (affine-int / mxfp8).
+//! - `Linear` — plain (at the stored float dtype) or quantized (affine-int / mxfp8).
 //! - `Embedding` — plain or quantized; also usable as tied-weight lm_head.
 //! - `Mlp` — dense gate-up-down FFN with pluggable activation.
 //! - `MoeBlock` — unimplemented stub; the MoE archs use their own paths.

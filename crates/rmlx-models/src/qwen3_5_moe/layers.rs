@@ -282,6 +282,49 @@ impl Linear {
     }
 }
 
+/// An input that several linear layers read: a Hadamard layer's transform of
+/// it is computed once and reused by the later layers holding that transform.
+///
+/// One slot is exact because the loader builds one transform per input width,
+/// so the Hadamard layers reading one input hold the same transform. A layer
+/// holding another transform computes its own, uncached.
+#[allow(missing_debug_implementations)]
+pub(super) struct SharedInput<'a> {
+    x: &'a Array,
+    transformed: Option<(&'a SignedBlockHadamard, Array)>,
+}
+
+impl<'a> SharedInput<'a> {
+    pub(super) fn new(x: &'a Array) -> Self {
+        Self {
+            x,
+            transformed: None,
+        }
+    }
+
+    /// `linear.forward(x)`.
+    ///
+    /// Layers share a transform when they hold the same `Arc`: the fold builds
+    /// one per sign vector, and the contract reader checked each module's
+    /// `.signs` tensor equal to it.
+    pub(super) fn forward(&mut self, linear: &'a Linear, device: Device) -> Result<Array> {
+        let Linear::Hadamard { transform, inner } = linear else {
+            return linear.forward(self.x, device);
+        };
+        let transform: &'a SignedBlockHadamard = transform;
+        match &self.transformed {
+            Some((cached, xt)) if std::ptr::eq(*cached, transform) => inner.forward(xt, device),
+            Some(_) => linear.forward(self.x, device),
+            None => {
+                let xt = transform.forward(self.x, device)?;
+                let y = inner.forward(&xt, device)?;
+                self.transformed = Some((transform, xt));
+                Ok(y)
+            }
+        }
+    }
+}
+
 #[allow(missing_debug_implementations)]
 pub(super) enum Embedding {
     Plain {

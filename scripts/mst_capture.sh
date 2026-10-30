@@ -15,6 +15,10 @@
 #   Use it WITH `scripts/gputrace_kernels.sh`, not instead: the export carries no
 #   pipeline or function names, so "which kernel" still comes from a capture.
 #
+# Exit 75: the trace and its table stand, and the run's diagnostic record did not
+# land; its buffer file, found by this run's label in the pending queue, is named
+# (docs/METRICS_DB.md section 13, rule 24).
+#
 # THREE TRAPS, ALL HANDLED HERE
 #   1. `--attach <pid>` does not work for this template. It reports "No
 #      configuration information received, will have to guess" and exports zero
@@ -223,7 +227,11 @@ csv="${base}.channels.csv"
 # and would otherwise reject the prefill and report a zero decode rate.
 max_ctx=$((PROMPT_TOKENS + MAX_TOKENS + 512))
 
-run_cmd=("$BIN" --metrics off baseline
+# Recorded as diagnostic: a traced run's numbers are perturbed, and a
+# diagnostic row reaches no champion and no gate. `baseline` records at exit, so
+# a run that --time-limit stops before it finishes leaves no row.
+run_cmd=("$BIN" baseline
+	--record --run-class diagnostic --label "mst_capture:${stamp}"
 	--model "$MODEL"
 	--kv-quant "$KV_QUANT"
 	--prompt-tokens "$PROMPT_TOKENS"
@@ -237,15 +245,35 @@ echo "trace:      $trace"
 # rows for this process. Print the command so it can be re-run by hand.
 echo "running:    ${run_cmd[*]}"
 
-# --launch, not --attach (trap 1). --metrics off because a traced run's numbers
-# are perturbed and must never reach runs.db.
+# xctrace takes the child's exit code with its output, so a record that did
+# not land (`baseline` exit 75) is found as the buffer file it leaves: the file
+# in the pending queue whose record carries this run's label. The label holds
+# the run's start second, so no file of an earlier run can carry it.
+label="mst_capture:${stamp}"
+pending_dir="$RMLX_HOME_DIR/metrics/buffer/pending"
+
+# --launch, not --attach (trap 1). RMLX_HOME is passed explicitly so the child
+# writes its log and its buffer file where this script reads them.
 xcrun xctrace record \
 	--template 'Metal System Trace' \
 	--no-prompt \
 	--output "$trace" \
 	--time-limit "${TIME_LIMIT}s" \
+	--env "RMLX_HOME=$RMLX_HOME_DIR" \
 	--launch -- "${run_cmd[@]}"
 rc=$?
+
+pending_buffer=""
+for f in "$pending_dir"/*.json; do
+	[ -e "$f" ] || continue
+	python3 -c 'import json, sys; notes = json.load(open(sys.argv[1])).get("notes") or ""; sys.exit(notes.split("; ")[0] != "label=" + sys.argv[2])' \
+		"$f" "$label" 2>/dev/null && pending_buffer="${pending_buffer:+$pending_buffer }$f"
+done
+if [ -n "$pending_buffer" ]; then
+	echo "record pending: $pending_buffer" >&2
+	echo "  the run's diagnostic record did not land; replay it with" >&2
+	echo "  \`rmlx metrics record --replay-pending\` once the cause is fixed" >&2
+fi
 # A bounded recording ends by killing the launched process, so xctrace reports
 # the child's termination as a non-zero exit on the ordinary, successful path.
 # The exit code therefore cannot be the gate; the bundle and the exported table
@@ -280,9 +308,15 @@ fi
 # submits no work, so the process's first row is already prefill and the
 # boundary is invisible. The run itself knows: `generate: prefill{prefill_ms}` is a
 # plain info! event, so it is in the run's own log at the default level even
-# though `xctrace --launch` swallowed the child's stdout.
+# though `xctrace --launch` swallowed the child's stdout. The log is the newest
+# one whose `rmlx start` event names this run's label, never merely the newest:
+# every rmlx process writes a log.
 if [ -z "$SKIP_MS" ]; then
-	log_file=$(ls -1t "$RMLX_HOME_DIR"/logs/*.jsonl 2>/dev/null | sed -n 1p)
+	log_file=""
+	for f in "$RMLX_HOME_DIR"/logs/*.jsonl; do
+		[ -e "$f" ] && grep -qF "$label" "$f" || continue
+		[ -z "$log_file" ] || [ "$f" -nt "$log_file" ] && log_file="$f"
+	done
 	if [ -n "$log_file" ]; then
 		SKIP_MS=$(python3 "$REPO_ROOT/scripts/lib/prefill_ms.py" "$log_file")
 	fi
@@ -350,3 +384,8 @@ echo "csv:    $csv"
 echo ""
 echo "This table has no kernel names — pair it with a capture when you need to"
 echo "know WHICH kernel: bash scripts/gputrace_kernels.sh <bundle>.gputrace"
+if [ -n "$pending_buffer" ]; then
+	echo "" >&2
+	echo "INCOMPLETE: the trace stands, its diagnostic record is pending: $pending_buffer" >&2
+	exit 75
+fi

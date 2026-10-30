@@ -135,6 +135,11 @@ fn build_record_git_sha_survives_stamp_json() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let model_dir = tmp.path().join("m");
     std::fs::create_dir_all(&model_dir).expect("mkdir m");
+    std::fs::write(
+        model_dir.join("config.json"),
+        r#"{"torch_dtype": "bfloat16"}"#,
+    )
+    .expect("write config.json");
 
     let args = BaselineRecordArgs {
         label: None,
@@ -142,6 +147,7 @@ fn build_record_git_sha_survives_stamp_json() {
         prompt_body: Some(serde_json::json!([{"role": "user", "content": "hi"}])),
         kv_quant: rmlx_kv_quant::KvQuant::None,
         git_sha: Some("cafebabe"),
+        run_class: rmlx_metrics::run_class::RunClass::Gate,
     };
 
     let rec = build_run_record(
@@ -178,6 +184,11 @@ fn build_record_git_sha_absent_is_null() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let model_dir = tmp.path().join("m2");
     std::fs::create_dir_all(&model_dir).expect("mkdir m2");
+    std::fs::write(
+        model_dir.join("config.json"),
+        r#"{"torch_dtype": "bfloat16"}"#,
+    )
+    .expect("write config.json");
 
     let args = BaselineRecordArgs {
         label: None,
@@ -185,6 +196,7 @@ fn build_record_git_sha_absent_is_null() {
         prompt_body: Some(serde_json::json!([{"role": "user", "content": "hi"}])),
         kv_quant: rmlx_kv_quant::KvQuant::None,
         git_sha: None,
+        run_class: rmlx_metrics::run_class::RunClass::Gate,
     };
 
     let rec = build_run_record(
@@ -218,6 +230,11 @@ fn build_record_git_sha_blank_string_is_null() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let model_dir = tmp.path().join("m3");
     std::fs::create_dir_all(&model_dir).expect("mkdir m3");
+    std::fs::write(
+        model_dir.join("config.json"),
+        r#"{"torch_dtype": "bfloat16"}"#,
+    )
+    .expect("write config.json");
 
     let args = BaselineRecordArgs {
         label: None,
@@ -225,6 +242,7 @@ fn build_record_git_sha_blank_string_is_null() {
         prompt_body: Some(serde_json::json!([{"role": "user", "content": "hi"}])),
         kv_quant: rmlx_kv_quant::KvQuant::None,
         git_sha: Some(""),
+        run_class: rmlx_metrics::run_class::RunClass::Gate,
     };
 
     let rec = build_run_record(
@@ -672,6 +690,7 @@ fn run_baseline_recording(model_dir: &Path, root: &Path) -> anyhow::Result<()> {
             prompt_body: None,
             kv_quant: rmlx_kv_quant::KvQuant::None,
             git_sha: None,
+            run_class: rmlx_metrics::run_class::RunClass::Gate,
         }),
     )
 }
@@ -700,4 +719,75 @@ fn baseline_refuses_an_unrecordable_weight_quant_before_any_work() {
     let msg = err.to_string();
     assert!(msg.contains("weight_quant"), "{msg}");
     assert!(!msg.contains("cannot read prompt file"), "{msg}");
+}
+
+/// A record `ingest_buffer_record` is handed, with `decode_tps_warm` = `tps`.
+fn buffered_record(dir: &Path, tps: f64) -> (serde_json::Value, PathBuf) {
+    let record = serde_json::json!({
+        "backend": "rmlx",
+        "backend_version": "0.4.5",
+        "model_namespace": "host",
+        "model": "m",
+        "weight_quant": "bf16",
+        "kv_quant": "none",
+        "ctx_max": 8192,
+        "prompt": { "name": "p", "body": "hi" },
+        "ts_utc": "2026-10-01T00:00:00Z",
+        "hardware_tag": "m5_max_128gb",
+        "run_class": "diagnostic",
+        "metrics": [ { "name": "decode_tps_warm", "value": tps } ],
+    });
+    let buffer = dir.join("pending.json");
+    std::fs::write(&buffer, record.to_string()).expect("write buffer");
+    (record, buffer)
+}
+
+#[test]
+fn a_record_that_lands_drops_its_buffer_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (record, buffer) = buffered_record(tmp.path(), 50.0);
+    ingest_buffer_record(record, &buffer, &tmp.path().join("runs.db"), "baseline")
+        .expect("a plausible record lands");
+    assert!(!buffer.exists(), "the buffer file outlived its record");
+}
+
+#[test]
+fn a_record_the_recorder_refuses_is_an_error_naming_its_buffer_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (record, buffer) = buffered_record(tmp.path(), 0.0);
+    let err = ingest_buffer_record(record, &buffer, &tmp.path().join("runs.db"), "baseline")
+        .expect_err("a 0.0 rate is refused, so the run did not record");
+    let msg = format!("{err:#}");
+    assert!(msg.contains(&buffer.display().to_string()), "{msg}");
+    assert_eq!(
+        err.downcast_ref::<crate::exit::ExitWith>().map(|e| e.0),
+        Some(crate::exit::RECORD_PENDING),
+        "a measured run whose record did not land exits with its own code, not a crash's"
+    );
+    assert!(
+        buffer.exists(),
+        "the buffer file was dropped with nothing recorded"
+    );
+    assert_eq!(
+        crate::exit::exit_code(Err(err)).ok(),
+        Some(crate::exit::RECORD_PENDING),
+        "main reads the code through the context the message adds"
+    );
+}
+
+#[test]
+fn a_db_that_cannot_be_opened_is_an_error_naming_the_buffer_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (record, buffer) = buffered_record(tmp.path(), 50.0);
+    let not_a_dir = tmp.path().join("file");
+    std::fs::write(&not_a_dir, "").expect("write file");
+    let err = ingest_buffer_record(record, &buffer, &not_a_dir.join("runs.db"), "baseline")
+        .expect_err("a DB under a regular file cannot be opened");
+    assert!(format!("{err:#}").contains(&buffer.display().to_string()));
+    assert_eq!(
+        err.downcast_ref::<crate::exit::ExitWith>().map(|e| e.0),
+        Some(crate::exit::RECORD_PENDING),
+        "a measured run whose record did not land exits with its own code, not a crash's"
+    );
+    assert!(buffer.exists());
 }

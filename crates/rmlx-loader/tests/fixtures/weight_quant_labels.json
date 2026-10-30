@@ -1,0 +1,19 @@
+[
+  {"name": "torch_dtype bfloat16", "config": {"torch_dtype": "bfloat16"}, "label": "bf16"},
+  {"name": "torch_dtype float16", "config": {"torch_dtype": "float16"}, "label": "fp16"},
+  {"name": "dtype key", "config": {"dtype": "bfloat16"}, "label": "bf16"},
+  {"name": "ParoQuant", "config": {"torch_dtype": "bfloat16", "quantization_config": {"quant_method": "paroquant", "bits": 4, "group_size": 128}}, "label": "paro"},
+  {"name": "no weight format", "config": {}, "label": null},
+  {"name": "affine 4bit", "config": {"quantization": {"group_size": 64, "bits": 4}}, "label": "4bit"},
+  {"name": "mxfp8", "config": {"quantization": {"group_size": 32, "bits": 8, "mode": "mxfp8"}}, "label": "mxfp8"},
+  {"name": "1bit", "config": {"quantization": {"group_size": 64, "bits": 1}}, "label": "1bit"},
+  {"name": "2bit", "config": {"quantization": {"group_size": 64, "bits": 2}}, "label": "2bit"},
+  {"name": "dtype bf16 beside an mxfp8 block", "config": {"dtype": "bfloat16", "quantization": {"group_size": 32, "bits": 8, "mode": "mxfp8"}}, "label": "mxfp8"},
+  {"name": "torch_dtype bf16 beside an affine 4-bit block", "config": {"torch_dtype": "bfloat16", "quantization": {"group_size": 64, "bits": 4}}, "label": "4bit"},
+  {"name": "explicit affine mode", "config": {"quantization": {"group_size": 64, "bits": 2, "mode": "affine"}}, "label": "2bit"},
+  {"name": "mxfp4", "config": {"quantization": {"group_size": 32, "bits": 4, "mode": "mxfp4"}}, "label": "mxfp4"},
+  {"name": "nvfp4", "config": {"quantization": {"group_size": 16, "bits": 4, "mode": "nvfp4"}}, "label": "nvfp4"},
+  {"name": "a mode no whitelist names passes through", "config": {"quantization": {"group_size": 32, "bits": 6, "mode": "mxfp6"}}, "label": "mxfp6"},
+  {"name": "an uppercase mode is lowercased", "config": {"quantization": {"group_size": 32, "bits": 8, "mode": "MXFP8"}}, "label": "mxfp8"},
+  {"name": "an uppercase affine mode is the bit width", "config": {"quantization": {"group_size": 64, "bits": 4, "mode": "Affine"}}, "label": "4bit"}
+]

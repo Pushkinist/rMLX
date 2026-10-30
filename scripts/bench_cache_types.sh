@@ -8,59 +8,70 @@
 #
 # Per combo:
 #   1. Smoke probe: short generation via `rmlx baseline`. Reject empty /
-#      non-UTF-8 / 4-gram-repeat-heavy output. On fail, write a §8.5 record
-#      with notes "status=smoke_fail" and skip the cell.
+#      non-UTF-8 / 4-gram-repeat-heavy output. On fail, log it in the summary
+#      and skip the cell.
 #   2. Call `scripts/bench_cell.sh` for the real measurement.
 #   3. Exit code 78 from `scripts/bench_cell.sh` (unsupported resolver combo) =>
-#      write a "status=skip" record and continue.
+#      log a skip in the summary and continue.
+#
+# A cell that fails or is skipped measured nothing, so it writes no runs.db
+# record: the recorder refuses a record with no measurement.
 #
 # Every step is a one-shot `rmlx` command that holds the Metal claim for its own
 # run, so nothing here stops a process. A claim another process holds fails the
 # step with exit 11 and names the holder.
 #
 # Usage:
-#   scripts/bench_cache_types.sh MODEL_PATH ARCH_CLASS [WEIGHT_BITS] [PROMPT_TOKENS]
+#   scripts/bench_cache_types.sh MODEL_PATH ARCH_CLASS [PROMPT_TOKENS]
 #
 #   MODEL_PATH      abs path to snapshot directory
 #   ARCH_CLASS      e.g. Qwen3ForCausalLM
-#   WEIGHT_BITS     optional; inferred from MODEL_PATH if omitted
-#                   (e.g. "2bit", "8bit", "mxfp8")
 #   PROMPT_TOKENS   optional; default 4096 (=> longctx_4k.json)
+#
+# The weight label is read from the snapshot's config.json through
+# scripts/lib/snapshot_identity.py, the one shell-side producer of it; there is
+# no argument to override it.
+#
+# Exit codes:
+#   0   every combo ran; a combo that failed or was skipped is in the summary
+#   2   usage: bad arguments, a missing snapshot or binary, or a snapshot whose
+#       weights have no label
+#   75  a smoke probe measured and its diagnostic record did not land; each
+#       buffer file is named (docs/METRICS_DB.md section 13, rule 24)
 #
 set -uo pipefail
 
 # ---------------------------------------------------------------------------
 # Args + defaults
 # ---------------------------------------------------------------------------
-if [ $# -lt 2 ]; then
-  echo "usage: $0 MODEL_PATH ARCH_CLASS [WEIGHT_BITS] [PROMPT_TOKENS]" >&2
+if [ $# -lt 2 ] || [ $# -gt 3 ]; then
+  echo "usage: $0 MODEL_PATH ARCH_CLASS [PROMPT_TOKENS]" >&2
+  echo "  (the weight label comes from the snapshot's config.json; it is not an argument)" >&2
   exit 2
 fi
 
 MODEL_PATH="$1"
 ARCH="$2"
-WEIGHT_BITS_IN="${3:-}"
-PROMPT_TOKENS="${4:-4096}"
+PROMPT_TOKENS="${3:-4096}"
+case "$PROMPT_TOKENS" in
+  '' | *[!0-9]*)
+    echo "PROMPT_TOKENS must be a token count, got '$PROMPT_TOKENS'" >&2
+    exit 2
+    ;;
+esac
 
 if [ ! -d "$MODEL_PATH" ]; then
   echo "model path does not exist: $MODEL_PATH" >&2
   exit 2
 fi
 
-# Resolve WEIGHT_BITS heuristically when not supplied.
-if [ -z "$WEIGHT_BITS_IN" ]; then
-  _BASE=$(basename "$MODEL_PATH")
-  case "$_BASE" in
-    *mxfp8*) WEIGHT_BITS_IN="mxfp8" ;;
-    *2bit*)  WEIGHT_BITS_IN="2bit" ;;
-    *3bit*)  WEIGHT_BITS_IN="3bit" ;;
-    *4bit*)  WEIGHT_BITS_IN="4bit" ;;
-    *6bit*)  WEIGHT_BITS_IN="6bit" ;;
-    *8bit*)  WEIGHT_BITS_IN="8bit" ;;
-    *PARO*|*paro*) WEIGHT_BITS_IN="paro" ;;
-    *)       WEIGHT_BITS_IN="unknown" ;;
-  esac
+# The weight label is the one the snapshot's own config describes, read
+# through the one shell-side producer of it.
+if ! _IDENTITY="$(python3 "$(dirname "$0")/lib/snapshot_identity.py" "$MODEL_PATH")"; then
+  echo "cannot label the snapshot's weights (above)" >&2
+  exit 2
 fi
+WEIGHT_BITS_IN="$(printf '%s\n' "$_IDENTITY" | sed -n 's/^weight_quant=//p')"
 
 # Map prompt tokens → prompt id (longctx_<N/1024>k).
 _PROMPT_K=$((PROMPT_TOKENS / 1024))
@@ -73,19 +84,11 @@ elif [ "$PROMPT_TOKENS" -le 16384 ]; then CTX_MAX_DEFAULT=32768
 else CTX_MAX_DEFAULT=$((PROMPT_TOKENS * 2)); fi
 
 RMLX_DIR=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source=scripts/lib/record_pending.sh
+. "$RMLX_DIR/scripts/lib/record_pending.sh"
+# Smoke probes that measured and whose diagnostic record did not land.
+SMOKE_RECORDS_PENDING=0
 RMLX_BIN="$RMLX_DIR/target/release/rmlx"
-
-# Run identity (backend / version / git sha / build profile / hardware tag)
-# comes from the measured binary — never hard-coded here.
-source "$(dirname "${BASH_SOURCE[0]}")/lib/identity.sh"
-rmlx_export_identity "$RMLX_BIN"
-# git_sha is caller-supplied provenance, not part of RunIdentity — the
-# identity's own when it carries one, else HEAD of RMLX_DIR (never the process
-# cwd) so a run from another checkout cannot stamp that repo's SHA into this
-# one's observations.git_sha.
-GIT_SHA="$(rmlx_git_sha "${RMLX_DIR}")"
-BUFFER_DIR="$RMLX_DIR/.rmlx/metrics/buffer/pending"
-mkdir -p "$BUFFER_DIR"
 
 if [ ! -x "$RMLX_BIN" ]; then
   echo "rmlx binary not found / not executable: $RMLX_BIN" >&2
@@ -94,16 +97,7 @@ fi
 
 RUN_TS=$(date -u +"%Y%m%dT%H%M%SZ")
 MODEL_BASENAME=$(basename "$MODEL_PATH")
-case "$MODEL_BASENAME" in
-  *__*)
-    NS="${MODEL_BASENAME%%__*}"
-    MODEL_NAME="${MODEL_BASENAME#*__}"
-    ;;
-  *)
-    NS="local"
-    MODEL_NAME="$MODEL_BASENAME"
-    ;;
-esac
+MODEL_NAME="${MODEL_BASENAME#*__}"
 
 # Pick a TAG for `scripts/bench_cell.sh` (used only for log filenames / progress line).
 TAG_BASE=$(echo "$MODEL_NAME" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g' | cut -c1-20)
@@ -147,71 +141,9 @@ printf "%s\t%s\t%s\t%s\t%s\n" "label" "kv_quant" "decode_tps" "decode_stddev" "s
 # Helpers
 # ---------------------------------------------------------------------------
 
-# Emit a §8.5 RunRecord JSON for skip / smoke_fail cases.
-#  $1 = canonical kv_quant string
-#  $2 = status string (e.g. smoke_fail, skip)
-#  $3 = combo label
-#  $4 = optional extra notes blob
-emit_status_record() {
-  local kv_canon="$1"
-  local status="$2"
-  local combo_label="$3"
-  local extra_notes="${4:-}"
-
-  local out_json
-  out_json="$BUFFER_DIR/$(date -u +"%Y%m%dT%H%M%S%3N")-bench-$$.json"
-  local prompt_file="$RMLX_DIR/prompts/${PROMPT_ID}.json"
-
-  PROMPT_FILE="$prompt_file" \
-  NS_VAL="$NS" \
-  MODEL_VAL="$MODEL_NAME" \
-  WQ_VAL="$WEIGHT_BITS_IN" \
-  KV_VAL="$kv_canon" \
-  CTX_VAL="$CTX_MAX_DEFAULT" \
-  PROMPT_NAME_VAL="$PROMPT_ID" \
-  TS_VAL="$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
-  HW_VAL="${RMLX_HARDWARE_TAG:-m5_max_128gb}" \
-  PROMPT_TOK_VAL="$PROMPT_TOKENS" \
-  NOTES_VAL="label=ctype-${combo_label} status=${status} ${extra_notes}" \
-  DESC_VAL="bench_cache_types ${combo_label} ${status}" \
-  GIT_SHA_VAL="$GIT_SHA" \
-  python3 -c '
-import json, os, sys
-with open(os.environ["PROMPT_FILE"], "r") as f:
-    body = json.load(f)
-rec = {
-    **json.loads(os.environ['RMLX_IDENTITY_JSON']),
-  # "unknown" is a fallback, never provenance — a checkout without .git
-  # must not stamp git_sha at all.
-  **({"git_sha": os.environ["GIT_SHA_VAL"]} if not os.environ["GIT_SHA_VAL"].startswith("unknown") else {}),
-  "model_namespace": os.environ["NS_VAL"],
-  "model": os.environ["MODEL_VAL"],
-  "weight_quant": os.environ["WQ_VAL"],
-  "kv_quant": os.environ["KV_VAL"],
-  "ctx_max": int(os.environ["CTX_VAL"]),
-  "prompt": {"name": os.environ["PROMPT_NAME_VAL"], "body": body},
-  "ts_utc": os.environ["TS_VAL"],
-  "prompt_tokens": int(os.environ["PROMPT_TOK_VAL"]),
-  "max_tokens": 32,
-  "temperature": 0.0,
-  "n_warmups": 0,
-  "n_measure": 0,
-  "notes": os.environ["NOTES_VAL"],
-  "description": os.environ["DESC_VAL"],
-  "metrics": [
-    {"name": "decode_tps_warm", "value": 0.0, "stddev": 0.0},
-  ],
-}
-json.dump(rec, sys.stdout, indent=2)
-' >"$out_json"
-
-  if ! ( cd "$RMLX_DIR" && "$RMLX_BIN" metrics record --file "$out_json" >/dev/null 2>&1 ); then
-    echo "[$(date +%T)] WARN: failed to ingest status record $out_json" >&2
-  fi
-}
-
 # Build the canonical kv_quant string for a (ctk, ctv, kv_quant_arg) tuple.
-# Mirrors the formula in scripts/bench_cell.sh so smoke/skip rows match warm rows.
+# Mirrors the formula in scripts/bench_cell.sh, so the summary names a cell as
+# its record does.
 compute_kv_canon() {
   local ctk="$1" ctv="$2" kvq="$3"
   if [ -n "$ctk" ] || [ -n "$ctv" ]; then
@@ -257,6 +189,7 @@ run_smoke_probe() {
     --gen-tokens 16
     --ctx-max 8192
     --device gpu
+    --record --run-class diagnostic --label "ctype-smoke-${LABEL}"
   )
   if [ -n "$ctk" ] && [ -n "$ctv" ]; then
     args+=(--cache-type-k "$ctk" --cache-type-v "$ctv")
@@ -272,6 +205,13 @@ run_smoke_probe() {
 
   ( cd "$RMLX_DIR" && "$RMLX_BIN" "${args[@]}" ) >"$smoke_log" 2>&1
   local rc=$?
+  # A probe that measured and whose record did not land is judged on its
+  # output like any other; the buffer file is named and the run ends non-zero.
+  if [ "$rc" -eq "$RECORD_PENDING_EXIT" ]; then
+    record_pending_note "$smoke_log"
+    SMOKE_RECORDS_PENDING=$((SMOKE_RECORDS_PENDING + 1))
+    rc=0
+  fi
   if [ "$rc" -ne 0 ]; then
     SMOKE_REASON="baseline_exit_${rc}"
     # Pass through exit 78 (unsupported combo) to caller via SMOKE_REASON.
@@ -282,7 +222,7 @@ run_smoke_probe() {
     return "$rc"
   fi
 
-  # Bug-1: parse TPS from the baseline summary line. If TPS < 0.5 the run
+  # Parse TPS from the baseline summary line. If TPS < 0.5 the run
   # succeeded syntactically but produced no real decode (e.g. Gemma4 Shared-KV
   # rejects Mixed codec, emits TPS=0.000). Treat this as a runtime failure.
   local smoke_tps
@@ -360,7 +300,7 @@ for entry in "${COMBOS[@]}"; do
 
   KV_CANON=$(compute_kv_canon "$CTK_VAL" "$CTV_VAL" "$KV_ARG")
 
-  # Bug-2: compute_kv_canon emits ct_<k>_<v> for non-numeric per-side codecs
+  # compute_kv_canon emits ct_<k>_<v> for non-numeric per-side codecs
   # (tq4, planar4). The metrics validator rejects those strings. Map them to
   # the canonical value the resolver would have chosen if it accepted the combo.
   # This override is applied before any record emission for this cell.
@@ -379,17 +319,15 @@ for entry in "${COMBOS[@]}"; do
     rc=$?
     if [ "$SMOKE_REASON" = "resolver_skip" ]; then
       echo "[$(date +%T)] CELL SKIP (resolver) label=$LABEL" >&2
-      emit_status_record "$KV_CANON" "skip" "$LABEL" "smoke_rc=$rc"
       printf "%s\t%s\t%s\t%s\t%s\n" "$LABEL" "$KV_CANON" "" "" "skip" >>"$SUMMARY_FILE"
     else
-      # Bug-1: tps_zero is a runtime failure (not a smoke content failure).
-      local _emit_status="smoke_fail"
+      # tps_zero is a runtime failure (not a smoke content failure).
+      local _status="smoke_fail"
       case "$SMOKE_REASON" in
-        tps_zero=*) _emit_status="runtime_fail" ;;
+        tps_zero=*) _status="runtime_fail" ;;
       esac
-      echo "[$(date +%T)] CELL SMOKE_FAIL label=$LABEL reason=$SMOKE_REASON status=$_emit_status" >&2
-      emit_status_record "$KV_CANON" "$_emit_status" "$LABEL" "reason=$SMOKE_REASON"
-      printf "%s\t%s\t%s\t%s\t%s\n" "$LABEL" "$KV_CANON" "" "" "$_emit_status" >>"$SUMMARY_FILE"
+      echo "[$(date +%T)] CELL SMOKE_FAIL label=$LABEL reason=$SMOKE_REASON status=$_status" >&2
+      printf "%s\t%s\t%s\t%s\t%s\n" "$LABEL" "$KV_CANON" "" "" "$_status" >>"$SUMMARY_FILE"
     fi
     continue
   fi
@@ -428,20 +366,17 @@ for entry in "${COMBOS[@]}"; do
       ;;
     78)
       echo "[$(date +%T)] CELL RESOLVER_SKIP label=$LABEL" >&2
-      emit_status_record "$KV_CANON" "skip" "$LABEL" "cell_rc=78"
       printf "%s\t%s\t%s\t%s\t%s\n" "$LABEL" "$KV_CANON" "" "" "skip" >>"$SUMMARY_FILE"
       ;;
     10)
-      # Bug-1: exit 10 = TPS below threshold in scripts/bench_cell.sh CT-mode loop.
+      # exit 10 = TPS below threshold in scripts/bench_cell.sh CT-mode loop.
       echo "[$(date +%T)] CELL RUNTIME_FAIL (tps=0) label=$LABEL" >&2
-      emit_status_record "$KV_CANON" "runtime_fail" "$LABEL" "cell_rc=10 status=runtime_fail"
       printf "%s\t%s\t%s\t%s\t%s\n" "$LABEL" "$KV_CANON" "0.0" "" "runtime_fail" >>"$SUMMARY_FILE"
       ;;
     *)
       # Tail of log helps diagnose.
       echo "[$(date +%T)] CELL FAIL label=$LABEL rc=$CELL_RC (log: $CELL_LOG)" >&2
       tail -15 "$CELL_LOG" >&2 || true
-      emit_status_record "$KV_CANON" "cell_fail" "$LABEL" "cell_rc=$CELL_RC"
       printf "%s\t%s\t%s\t%s\t%s\n" "$LABEL" "$KV_CANON" "" "" "fail_rc${CELL_RC}" >>"$SUMMARY_FILE"
       ;;
   esac
@@ -460,4 +395,8 @@ column -t -s "$(printf '\t')" "$SUMMARY_FILE" >&2 || cat "$SUMMARY_FILE" >&2
 echo "" >&2
 echo "(summary file: $SUMMARY_FILE)" >&2
 
+if [ "$SMOKE_RECORDS_PENDING" -gt 0 ]; then
+  echo "INCOMPLETE: $SMOKE_RECORDS_PENDING smoke record(s) pending (named above); the cells stand" >&2
+  exit "$RECORD_PENDING_EXIT"
+fi
 exit 0

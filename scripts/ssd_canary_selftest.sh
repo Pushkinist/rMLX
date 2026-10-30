@@ -25,7 +25,8 @@
 #
 # The stub resolves its data root and DB the way the binary does (an absolute
 # RMLX_HOME, else the checkout found by walking up for Cargo.lock, else
-# $HOME/.rmlx; RMLX_METRICS_DB or `--db` for the DB). Its `metrics record` logs
+# $HOME/.rmlx; RMLX_METRICS_DB or `--db` for the DB), and refuses a relative
+# RMLX_HOME with the binary's error line. Its `metrics record` logs
 # the DB it was pointed at and creates the file when absent, but never writes
 # into an existing DB, so `survive` covers the DB as well. It refuses any path
 # outside the fixture.
@@ -172,6 +173,10 @@ inside() {
 }
 resolve_home() {
     if [[ "${RMLX_HOME:-}" == /* ]]; then printf '%s\n' "$RMLX_HOME"; return; fi
+    if [[ -n "${RMLX_HOME+set}" ]]; then
+        echo "Error: config: RMLX_HOME=$RMLX_HOME must be an absolute path" >&2
+        return 1
+    fi
     local d="$PWD"
     while [[ "$d" != / && ! -f "$d/Cargo.lock" ]]; do d="$(dirname "$d")"; done
     if [[ -f "$d/Cargo.lock" ]]; then printf '%s\n' "$d/.rmlx"; else printf '%s\n' "$HOME/.rmlx"; fi
@@ -182,7 +187,7 @@ if [[ "${1:-} ${2:-}" == "metrics identity" ]]; then
 fi
 if [[ "${1:-}" == "serve" ]]; then
     raw="${RMLX_HOME-UNSET}"
-    home="$(resolve_home)"
+    home="$(resolve_home)" || exit 1
     printf 'raw=%s home=%s args=%s\n' "$raw" "$home" "$*" >>"$LOG/serve.log"
     inside "$home"
     port=""
@@ -239,7 +244,7 @@ if [[ "${1:-}" == "metrics" ]]; then
             *) rest+=("$1"); shift ;;
         esac
     done
-    home="$(resolve_home)"
+    home="$(resolve_home)" || exit 1
     [[ -n "$db" ]] || db="${RMLX_METRICS_DB:-$home/metrics/runs.db}"
     case "$sub" in
         path)
@@ -423,8 +428,6 @@ PY
 #   unset       the tree's own .rmlx is the seeded root, and the script is run
 #               by hand from outside the tree
 #   metrics-db  as `exported`, plus RMLX_METRICS_DB naming a DB elsewhere
-#   relative    RMLX_HOME is a relative path, which the binary ignores, so the
-#               tree's own .rmlx is the data root
 run_case() {
     local name="$1" mode="$2"
     local cdir="$WORK/$name"
@@ -439,9 +442,6 @@ run_case() {
         metrics-db)
             root="$cdir/data-root"
             home_env=("RMLX_HOME=$root" "RMLX_METRICS_DB=$cdir/elsewhere/runs.db") ;;
-        relative)
-            root="$tree/.rmlx"
-            home_env=("RMLX_HOME=rel-root") ;;
         *)
             root="$tree/.rmlx" ;;
     esac
@@ -499,9 +499,6 @@ run_case() {
     else
         run_dir="$raws"
         pass "$name: phase servers ran in an absolute directory the run created"
-    fi
-    if [[ "$mode" == relative && -e "$tree/rel-root" ]]; then
-        fail "$name: the relative RMLX_HOME was used as a path"
     fi
 
     # cleanup
@@ -853,6 +850,46 @@ run_zero_byte_hydrate_case() {
 
 echo "==> ssd-canary-selftest"
 
+# A relative RMLX_HOME is refused by the binary, so `make ssd-canary` fails
+# with its error before a phase server starts, and writes nothing: not the
+# relative path, not the checkout's own .rmlx.
+run_relative_home_case() {
+    local name=relative-home
+    local cdir="$WORK/$name"
+    local tree="$cdir/tree" root
+    mkdir -p "$cdir/home" "$cdir/tmp" "$cdir/log"
+    make_tree "$tree"
+    root="$tree/.rmlx"
+    seed_root "$root"
+    (cd "$root" && find . -type f -print0 | xargs -0 shasum -a 256) >"$cdir/before.sha"
+    find "$root" | sort >"$cdir/paths_before"
+    run_env "$cdir" "$tree" "RMLX_HOME=rel-root" \
+        "VERIFIER_MODEL=$tree/models/stub-ns__stub-model-8bit" "PORT=$(free_port)" -- \
+        make --no-print-directory -f "$tree/Makefile" ssd-canary >"$cdir/run.out" 2>&1
+    local rc=$?
+    if [[ $rc -ne 0 ]] && grep -qF 'RMLX_HOME=rel-root must be an absolute path' "$cdir/run.out"; then
+        pass "$name: make ssd-canary exits $rc with the binary's refusal"
+    else
+        fail "$name: make ssd-canary exited $rc without the refusal (tail: $(tail -3 "$cdir/run.out" | tr '\n' ' '))"
+    fi
+    if [[ -e "$tree/rel-root" ]]; then
+        fail "$name: the relative RMLX_HOME was used as a path"
+    else
+        pass "$name: the relative RMLX_HOME was not used as a path"
+    fi
+    if [[ -s "$cdir/log/serve.log" ]]; then
+        fail "$name: a phase server started: $(head -1 "$cdir/log/serve.log")"
+    else
+        pass "$name: no phase server started"
+    fi
+    if (cd "$root" && shasum -a 256 -c --quiet "$cdir/before.sha") >/dev/null 2>&1 &&
+        find "$root" | sort | cmp -s - "$cdir/paths_before"; then
+        pass "$name: the checkout's .rmlx is unchanged"
+    else
+        fail "$name: the checkout's .rmlx changed"
+    fi
+}
+
 # Every deletion must go through `rm`, the one the shim can see.
 if grep -nE '(/bin/rm|/usr/bin/rm|command rm|\\rm |unlink|rmdir|-delete|shred)' "$SCRIPT" >"$WORK/other_deletes"; then
     fail "static: the script deletes through something other than rm: $(head -1 "$WORK/other_deletes")"
@@ -863,7 +900,7 @@ fi
 run_case exported-home exported
 run_case unset-home unset
 run_case metrics-db-env metrics-db
-run_case relative-home relative
+run_relative_home_case
 run_null_hydrate_case
 run_revisit_hydrate_case
 run_populate_only_hydrate_case

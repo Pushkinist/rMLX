@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use rmlx_metrics::identity::RunIdentity;
+use rmlx_metrics::run_class::RunClass;
 use rmlx_metrics::{recorder::Recorder, schema};
 
 // ---------------------------------------------------------------------------
@@ -19,12 +20,13 @@ pub(super) fn cmd_record(
     stdin: bool,
     dry_run: bool,
     replay_pending: bool,
+    run_class: Option<RunClass>,
 ) -> anyhow::Result<()> {
     if replay_pending {
-        return cmd_record_replay(db_path, dry_run);
+        return cmd_record_replay(db_path, dry_run, run_class);
     }
     let payload = read_payload(inline, file.as_deref(), stdin)?;
-    let outcome = ingest_one(db_path, &payload, dry_run)?;
+    let outcome = ingest_one(db_path, &payload, dry_run, run_class)?;
     if let Some(o) = outcome {
         println!("{}", serde_json::to_string(&o)?);
     }
@@ -86,26 +88,29 @@ fn read_payload(
 /// structurally valid §8.5 JSON (same field names) — they just carry
 /// non-whitelisted values that only `validate()` catches.
 ///
+/// `run_class` fills a record that states no class, whichever converter
+/// produced it, before it is validated. A record that states a different class
+/// is refused.
+///
 /// If all three fail the canonical parse/validate error is returned.
-#[allow(
-    clippy::unwrap_used,
-    reason = "Mutex::lock() cannot poison; Option/Result unwrap on values established by construction in this fn"
-)]
 pub(super) fn ingest_one(
     db_path: &Path,
     json_text: &str,
     dry_run: bool,
+    run_class: Option<RunClass>,
 ) -> anyhow::Result<Option<rmlx_metrics::recorder::RecordOutcome>> {
     use rmlx_metrics::ingest::RunRecord;
+
+    let classed = |run: RunRecord| apply_run_class(run, run_class);
 
     // ── Attempt 1: canonical §8.5 parse + validate ────────────────────────────
     let run: RunRecord = match serde_json::from_str::<RunRecord>(json_text) {
         Err(canonical_err) => {
             // Structural parse failed — try legacy shape first.
             if let Some(converted) = rmlx_metrics::legacy_ingest::try_parse_legacy(json_text) {
-                converted
+                classed(converted)?
             } else if let Some(converted) = rmlx_metrics::legacy_ingest::try_parse_cbb(json_text) {
-                converted
+                classed(converted)?
             } else {
                 return Err(canonical_err).context("parse RunRecord JSON");
             }
@@ -113,21 +118,17 @@ pub(super) fn ingest_one(
         Ok(r) => {
             // Parse succeeded. Validate before accepting. If validate fails
             // and the file looks like a CBB record, try the CBB converter.
-            if r.validate().is_ok() {
-                r
-            } else if let Some(converted) = rmlx_metrics::legacy_ingest::try_parse_cbb(json_text) {
-                // CBB May-10: compound weight_quant / display backend names.
-                converted
-            } else {
-                // Neither canonical nor CBB — surface the original validate error.
-                // validate() is deterministic on &self and was Err at the is_ok()
-                // check above, so it is Err here too. Re-call, map to anyhow, and
-                // extract via unwrap_err() to satisfy the Result return type
-                // without an unreachable!() path.
-                return Err(r
-                    .validate()
-                    .map_err(|e| anyhow::anyhow!("{e}"))
-                    .unwrap_err());
+            let r = classed(r)?;
+            match r.validate() {
+                Ok(()) => r,
+                Err(canonical_err) => {
+                    match rmlx_metrics::legacy_ingest::try_parse_cbb(json_text) {
+                        // CBB May-10: compound weight_quant / display backend names.
+                        Some(converted) => classed(converted)?,
+                        // Neither canonical nor CBB — surface the original error.
+                        None => return Err(anyhow::anyhow!("{canonical_err}")),
+                    }
+                }
             }
         }
     };
@@ -142,7 +143,7 @@ pub(super) fn ingest_one(
             rmlx_metrics::ingest::PromptRef::BySha256 { sha256 } => sha256.as_str(),
         };
         println!(
-            "dry-run: backend={} model={}/{} weight={} kv={} metrics={} prompt={} ts={}",
+            "dry-run: backend={} model={}/{} weight={} kv={} metrics={} prompt={} ts={} run_class={}",
             run.backend(),
             run.model_namespace,
             run.model,
@@ -151,6 +152,7 @@ pub(super) fn ingest_one(
             non_null,
             prompt_name,
             run.ts_utc,
+            run.run_class.map_or("none", RunClass::as_str),
         );
         return Ok(None);
     }
@@ -164,13 +166,33 @@ pub(super) fn ingest_one(
     Ok(Some(outcome))
 }
 
+/// Set `flag` on a record that states no class; refuse one that states another.
+fn apply_run_class(
+    mut run: rmlx_metrics::ingest::RunRecord,
+    flag: Option<RunClass>,
+) -> anyhow::Result<rmlx_metrics::ingest::RunRecord> {
+    match (run.run_class, flag) {
+        (Some(stated), Some(flag)) if stated != flag => anyhow::bail!(
+            "the record states run_class {stated} and --run-class says {flag}; \
+             a record keeps the class its producer stated"
+        ),
+        (None, Some(flag)) => run.run_class = Some(flag),
+        _ => {}
+    }
+    Ok(run)
+}
+
 /// Walk `metrics/buffer/pending/`, attempt to ingest each `.json` file.
 /// Successes: file removed. Failures: file moved to `metrics/buffer/failed/`.
 #[allow(
     clippy::unwrap_used,
     reason = "Mutex::lock() cannot poison; Option/Result unwrap on values established by construction in this fn"
 )]
-fn cmd_record_replay(db_path: &Path, dry_run: bool) -> anyhow::Result<()> {
+fn cmd_record_replay(
+    db_path: &Path,
+    dry_run: bool,
+    run_class: Option<RunClass>,
+) -> anyhow::Result<()> {
     let pending = rmlx_core::paths::ingest_buffer_dir();
     let failed = rmlx_core::paths::metrics_dir()
         .join("buffer")
@@ -197,7 +219,7 @@ fn cmd_record_replay(db_path: &Path, dry_run: bool) -> anyhow::Result<()> {
                 continue;
             }
         };
-        let res = ingest_one(db_path, &payload, dry_run);
+        let res = ingest_one(db_path, &payload, dry_run, run_class);
         match res {
             Ok(_) => {
                 if !dry_run {

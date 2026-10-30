@@ -44,6 +44,7 @@ fn make_run(metric: &str, value: f64, kv_quant: &str) -> RunRecord {
         notes: None,
         description: None,
         decode_config: None,
+        run_class: Some(crate::run_class::RunClass::Gate),
         metrics: vec![MetricEntry {
             name: metric.into(),
             value: Some(value),
@@ -60,11 +61,11 @@ fn clone_row_with(conn: &Connection, metric: &str, value: f64, kv_quant: &str) {
         "INSERT INTO observations (
              backend, model_namespace, model, weight_quant, kv_quant, ctx_max, prompt_id,
              metric, value, unit, direction, run_id, ts_utc, hardware_tag,
-             inserted_utc, inserted_by
+             inserted_utc, inserted_by, run_class
          )
          SELECT backend, model_namespace, model, weight_quant, ?1, ctx_max, prompt_id,
                 metric, ?2, unit, direction, run_id, ts_utc, hardware_tag,
-                inserted_utc, inserted_by
+                inserted_utc, inserted_by, run_class
            FROM observations WHERE metric = ?3 LIMIT 1",
         rusqlite::params![kv_quant, value, metric],
     )

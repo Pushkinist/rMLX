@@ -21,7 +21,7 @@
     clippy::print_stderr
 )]
 
-use std::process::Command;
+mod common;
 
 struct RunResult {
     exit_code: i32,
@@ -65,7 +65,7 @@ fn run(args: &[&str]) -> RunResult {
 /// cleared so a test can deliberately pre-set one of them.
 fn run_with_env(args: &[&str], extra_env: &[(&str, &str)]) -> RunResult {
     let rmlx_home = tempfile::TempDir::new().expect("failed to create RMLX_HOME tempdir");
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rmlx"));
+    let mut cmd = common::rmlx_at(rmlx_home.path());
     cmd.env("RUST_LOG", "info")
         // A stale shell value is the `auto` fallback and would mask the flag.
         .env_remove("RMLX_TURBO_FLASH")
@@ -74,7 +74,6 @@ fn run_with_env(args: &[&str], extra_env: &[(&str, &str)]) -> RunResult {
         .env_remove("RMLX_FUSED_QK")
         .env_remove("RMLX_SPARSE_ATTN")
         .env_remove("RMLX_ROT_K_FUSED")
-        .env("RMLX_HOME", rmlx_home.path())
         .args(args);
     for (k, v) in extra_env {
         cmd.env(k, v);

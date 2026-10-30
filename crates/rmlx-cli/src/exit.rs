@@ -5,6 +5,12 @@
 
 use anyhow::Result;
 
+/// A recorded run measured, and its record did not reach the DB: the buffer
+/// file is kept for `rmlx metrics record --replay-pending`. 75 is sysexits'
+/// `EX_TEMPFAIL`, and no other exit path or script in the tree uses it, so a
+/// caller can tell this from a crash (1) or a refusal.
+pub(crate) const RECORD_PENDING: i32 = 75;
+
 /// Exit with this code. The command has already reported why.
 #[derive(Debug)]
 pub(crate) struct ExitWith(pub(crate) i32);
@@ -25,3 +31,7 @@ pub(crate) fn exit_code(outcome: Result<i32>) -> Result<i32> {
         Err(e) => e.downcast::<ExitWith>().map(|exit| exit.0),
     }
 }
+
+#[cfg(test)]
+#[path = "exit_tests.rs"]
+mod tests;

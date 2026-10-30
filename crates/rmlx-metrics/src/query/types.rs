@@ -4,6 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::run_class::RunClass;
+
 // ── Public types ──────────────────────────────────────────────────────────────
 
 /// Cell coordinates — the columns of [`crate::cell::CELL_COLUMNS`].
@@ -91,6 +93,8 @@ pub struct ObservationRow {
     pub run_id: String,
     /// Human-readable description, if present.
     pub description: Option<String>,
+    /// The row's class; `None` for a row written with no class.
+    pub run_class: Option<RunClass>,
 }
 
 /// Per-cell, per-backend champion row group returned by `compare`.
@@ -137,9 +141,11 @@ pub enum Bucket {
 pub struct TimeseriesPoint {
     /// ISO-8601 UTC start of the bucket (day or week).
     pub bucket_start_utc: String,
-    /// Mean value of all observations in this bucket.
+    /// The run class of every observation in this point; each class is its own point.
+    pub run_class: Option<RunClass>,
+    /// Mean value of the observations of this class in this bucket.
     pub mean_value: f64,
-    /// Number of observations in this bucket.
+    /// Number of observations of this class in this bucket.
     pub n: i64,
 }
 

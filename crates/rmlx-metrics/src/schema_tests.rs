@@ -73,12 +73,12 @@ fn bests_view_picks_higher_better() {
                  backend, model_namespace, model, weight_quant, kv_quant,
                  ctx_max, prompt_id, metric,
                  value, unit, direction,
-                 run_id, ts_utc, hardware_tag, inserted_utc, inserted_by)
+                 run_id, ts_utc, hardware_tag, inserted_utc, inserted_by, run_class)
              VALUES ('rmlx','mlx-community','test-model','mxfp8','none',
                      8192, ?1, 'decode_tps_warm',
                      ?2, 'tps', 'higher_better',
                      'run0', ?3, 'm5_max_128gb',
-                     '2026-01-01T00:00:00Z', 'test@0.0.1')",
+                     '2026-01-01T00:00:00Z', 'test@0.0.1', 'gate')",
             rusqlite::params![prompt_id, val, ts],
         )
         .unwrap();
@@ -130,12 +130,12 @@ fn bests_view_picks_lower_better() {
                  backend, model_namespace, model, weight_quant, kv_quant,
                  ctx_max, prompt_id, metric,
                  value, unit, direction,
-                 run_id, ts_utc, hardware_tag, inserted_utc, inserted_by)
+                 run_id, ts_utc, hardware_tag, inserted_utc, inserted_by, run_class)
              VALUES ('rmlx','mlx-community','test-model2','mxfp8','none',
                      8192, ?1, 'step_ms_mean',
                      ?2, 'ms', 'lower_better',
                      'run1', ?3, 'm5_max_128gb',
-                     '2026-01-01T00:00:00Z', 'test@0.0.1')",
+                     '2026-01-01T00:00:00Z', 'test@0.0.1', 'gate')",
             rusqlite::params![prompt_id, val, ts],
         )
         .unwrap();
@@ -183,12 +183,12 @@ fn bests_view_tiebreak_newer_wins() {
                  backend, model_namespace, model, weight_quant, kv_quant,
                  ctx_max, prompt_id, metric,
                  value, unit, direction,
-                 run_id, ts_utc, hardware_tag, inserted_utc, inserted_by)
+                 run_id, ts_utc, hardware_tag, inserted_utc, inserted_by, run_class)
              VALUES ('rmlx','mlx-community','test-model3','mxfp8','none',
                      8192, ?1, 'decode_tps_warm',
                      100.0, 'tps', 'higher_better',
                      'run2', ?2, 'm5_max_128gb',
-                     '2026-01-01T00:00:00Z', 'test@0.0.1')",
+                     '2026-01-01T00:00:00Z', 'test@0.0.1', 'gate')",
             rusqlite::params![prompt_id, ts],
         )
         .unwrap();
@@ -259,12 +259,12 @@ fn observations_no_pk_collision() {
                  backend, model_namespace, model, weight_quant, kv_quant,
                  ctx_max, prompt_id, metric,
                  value, unit, direction,
-                 run_id, ts_utc, hardware_tag, inserted_utc, inserted_by)
+                 run_id, ts_utc, hardware_tag, inserted_utc, inserted_by, run_class)
              VALUES ('rmlx','mlx-community','dupe-model','mxfp8','none',
                      8192, ?1, 'decode_tps_warm',
                      99.0, 'tps', 'higher_better',
                      'run3', ?2, 'm5_max_128gb',
-                     '2026-01-01T00:00:00Z', 'test@0.0.1')",
+                     '2026-01-01T00:00:00Z', 'test@0.0.1', 'gate')",
             rusqlite::params![prompt_id, ts],
         )
         .unwrap();
@@ -332,4 +332,24 @@ fn schema_meta_seeded() {
         created_utc.contains('T') && created_utc.ends_with('Z'),
         "created_utc must be ISO-8601 UTC, got: {created_utc}"
     );
+}
+
+/// A read command opens through `open_checked`, which must refuse a DB a newer
+/// binary migrated just as the writers' `run_pending` does: its `bests` and its
+/// rows may carry what this binary does not know to filter.
+#[test]
+fn open_checked_refuses_a_db_newer_than_this_binary() {
+    let td = tempfile::tempdir().unwrap();
+    let path = td.path().join("runs.db");
+    {
+        let mut conn = open(&path).unwrap();
+        migrate::run_pending(&mut conn).unwrap();
+        let last = MIGRATIONS.last().map_or(0, |&(v, _)| v);
+        conn.execute_batch(&format!("PRAGMA user_version = {};", last + 1))
+            .unwrap();
+    }
+    let last = MIGRATIONS.last().map_or(0, |&(v, _)| v);
+    let err = open_checked(&path).unwrap_err().to_string();
+    assert!(err.contains(&format!("version {}", last + 1)), "{err}");
+    assert!(err.contains("RMLX_HOME"), "{err}");
 }

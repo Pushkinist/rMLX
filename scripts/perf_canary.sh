@@ -6,8 +6,22 @@
 # Runs 1 warmup + 3 measured baseline calls per model, prints median decode_tps
 # ± sample stddev, appends one CSV row per model to
 # <RMLX_HOME>/bench/perf_canary.csv, and records one further run into runs.db
-# via `rmlx baseline --record`. Each model also gets an explicit `k8vturbo3`
-# arm, which appends its own CSV row after the `auto` row.
+# via `rmlx baseline --record --run-class gate`. Each model also gets an
+# explicit `k8vturbo3` arm, which appends its own CSV row after the `auto` row.
+# The warmup, the measured calls and the `k8vturbo3` arm are recorded too, as
+# `diagnostic`, labelled `canary sha=<sha> <phase>`: only the one further run
+# is the gate's. The one-token run that reads the codec name off the log is not
+# recorded: a one-token generation has no decode rate, and the recorder refuses
+# a record that carries none.
+#
+# A snapshot whose identity cannot be recorded (`lib/snapshot_identity.py`,
+# which labels a snapshot as `rmlx baseline --record` does) stops the canary
+# before its first run. A gate record that does not land stops it with exit 1,
+# naming its buffer file: the gate has no row to read, and a replay adds one.
+# A diagnostic run that measured and whose record did not
+# land (`baseline` exit 75) keeps its measurement, names its buffer file, and
+# the canary ends with exit 75 after the last model (docs/METRICS_DB.md
+# section 13, rule 24).
 #
 # The default mode measures ONE build. All of its measured runs for a model
 # happen together, which is fine for tracking one build over time but not for
@@ -98,25 +112,50 @@ source "${REPO_ROOT}/scripts/lib/identity.sh"
 rmlx_export_identity "${BINARY}"
 GIT_SHA="$(rmlx_git_sha "${REPO_ROOT}")"
 
-# Helper: run one baseline, parse decode_tps from stdout
-# Usage: run_once <model_path> [--kv-quant <tag>]
+# "unknown" is a fallback for the --label text, never provenance — a checkout
+# without .git must not pass --git-sha at all.
+git_sha_args=()
+if [[ "${GIT_SHA}" != unknown* ]]; then
+    git_sha_args=(--git-sha "${GIT_SHA}")
+fi
+
+source "${REPO_ROOT}/scripts/lib/record_pending.sh"
+# One line per diagnostic run that measured and whose record did not land.
+CANARY_PENDING="$(mktemp "${TMPDIR:-/tmp}/perf_canary_pending.XXXXXX")"
+trap 'rm -f "${CANARY_PENDING}"' EXIT
+
+# Helper: run one baseline, recorded as diagnostic, and parse decode_tps from stdout.
+# A run that measured and whose record did not land (exit
+# RECORD_PENDING_EXIT) keeps its measurement: the buffer file is named, and the
+# canary ends non-zero. Any other failure stops it.
+# Usage: run_once <phase> <model_path> [--kv-quant <tag>]
 run_once() {
-    local model_path="$1"
-    local kv_flag="${2:-}"
-    local kv_val="${3:-}"
-    local extra_args=()
-    if [[ -n "${kv_flag}" ]]; then
-        extra_args=("${kv_flag}" "${kv_val}")
-    fi
-    RMLX_HOME="${RMLX_HOME}" "${BINARY}" baseline \
+    local phase="$1"
+    local model_path="$2"
+    local extra_args=("${@:3}")
+    local out rc=0 err
+    err="$(mktemp "${TMPDIR:-/tmp}/perf_canary_err.XXXXXX")"
+    out="$(RMLX_HOME="${RMLX_HOME}" "${BINARY}" baseline \
         --model "${model_path}" \
         --prompt-tokens "${PROMPT_TOKENS}" \
         --max-tokens "${MAX_TOKENS}" \
         --max-ctx "${MAX_CTX}" \
+        --label "canary sha=${GIT_SHA} ${phase}" \
+        ${git_sha_args[@]+"${git_sha_args[@]}"} \
+        --record --run-class diagnostic \
         ${extra_args[@]+"${extra_args[@]}"} \
-        2>/dev/null \
-        | grep -o 'decode_tps=[0-9.]*' \
-        | cut -d= -f2
+        2>"${err}")" || rc=$?
+    if [[ "${rc}" -eq "${RECORD_PENDING_EXIT}" ]]; then
+        record_pending_note "${err}"
+        echo "${model_path##*/} ${phase}" >>"${CANARY_PENDING}"
+    elif [[ "${rc}" -ne 0 ]]; then
+        rm -f "${err}"
+        echo "ERROR: ${model_path##*/}: the ${phase} run failed (exit ${rc}; see ${LOG_DIR})" >&2
+        exit 1
+    fi
+    rm -f "${err}"
+    # An empty reading is the caller's to judge, not this function's.
+    printf '%s\n' "${out}" | grep -o 'decode_tps=[0-9.]*' | cut -d= -f2 || true
 }
 
 # Which KV codec a one-token run resolves, read out of that run's own log.
@@ -174,6 +213,17 @@ stddev() {
     }'
 }
 
+# Every run below records, so an identity the DB would refuse stops the canary
+# here, before any model is loaded, and not at its first measured run.
+for entry in "${MODELS[@]}"; do
+    model_path="${entry##*|}"
+    [[ -d "${model_path}" ]] || continue
+    if ! python3 "${REPO_ROOT}/scripts/lib/snapshot_identity.py" "${model_path}" > /dev/null; then
+        echo "ERROR: ${model_path}: its identity cannot be recorded (above); nothing was measured" >&2
+        exit 1
+    fi
+done
+
 # Main loop
 for entry in "${MODELS[@]}"; do
     short_name="${entry%%|*}"
@@ -189,14 +239,14 @@ for entry in "${MODELS[@]}"; do
     # Warmup (discarded)
     for i in $(seq 1 ${WARMUP_RUNS}); do
         echo "  warmup ${i}/${WARMUP_RUNS}..." >&2
-        run_once "${model_path}" > /dev/null
+        run_once warmup "${model_path}" > /dev/null
     done
 
     # Measured runs
     tps_values=()
     for i in $(seq 1 ${MEASURED_RUNS}); do
         echo "  measured run ${i}/${MEASURED_RUNS}..." >&2
-        val="$(run_once "${model_path}" "" "")"
+        val="$(run_once measured "${model_path}")"
         if [[ -z "${val}" ]]; then
             echo "ERROR: failed to parse decode_tps for ${short_name} run ${i}" >&2
             exit 1
@@ -221,26 +271,29 @@ for entry in "${MODELS[@]}"; do
     # same protocol: prompt-tokens/max-tokens/max-ctx as the measured runs, kv_quant=auto).
     # This is the authoritative canary record; use `make canary-gate` to gate regressions.
     echo "  recording into runs.db..." >&2
-    # "unknown" is a fallback for the --label text above, never provenance —
-    # a checkout without .git must not pass --git-sha at all.
-    # (top-level loop body, not a function — `local` is not valid here.)
-    git_sha_args=()
-    if [[ "${GIT_SHA}" != unknown* ]]; then
-        git_sha_args=(--git-sha "${GIT_SHA}")
-    fi
-    if RMLX_HOME="${RMLX_HOME}" "${BINARY}" baseline \
+    gate_err="$(mktemp "${TMPDIR:-/tmp}/perf_canary_gate_err.XXXXXX")"
+    gate_rc=0
+    RMLX_HOME="${RMLX_HOME}" "${BINARY}" baseline \
         --model "${model_path}" \
         --prompt-tokens "${PROMPT_TOKENS}" \
         --max-tokens "${MAX_TOKENS}" \
         --max-ctx "${MAX_CTX}" \
         --label "canary sha=${GIT_SHA}" \
         ${git_sha_args[@]+"${git_sha_args[@]}"} \
-        --record \
-        > /dev/null 2>&1; then
+        --record --run-class gate \
+        > /dev/null 2>"${gate_err}" || gate_rc=$?
+    if [[ "${gate_rc}" -eq 0 ]]; then
         echo "  runs.db: ok" >&2
     else
-        echo "  WARN: runs.db record failed (non-fatal; CSV row still written)" >&2
+        if [[ "${gate_rc}" -eq "${RECORD_PENDING_EXIT}" ]]; then
+            record_pending_note "${gate_err}"
+            echo "  replaying it adds the gate row this canary reports as missing" >&2
+        fi
+        rm -f "${gate_err}"
+        echo "ERROR: ${short_name}: the gate record failed (exit ${gate_rc}); the canary has no row to gate on" >&2
+        exit 1
     fi
+    rm -f "${gate_err}"
 
     # Print result
     printf "%s  decode_tps=%.2f ± %.2f\n" "${short_name}" "${med}" "${sd}"
@@ -248,11 +301,11 @@ for entry in "${MODELS[@]}"; do
     # K8VTurbo3 informational column (1 warmup + 3 measured, explicit --kv-quant)
     # for every model; `auto` resolves to bf16.
     echo "  [k8vturbo3] warmup..." >&2
-    run_once "${model_path}" --kv-quant k8vturbo3 > /dev/null
+    run_once k8vturbo3-warmup "${model_path}" --kv-quant k8vturbo3 > /dev/null
     turbo3_values=()
     for i in $(seq 1 ${MEASURED_RUNS}); do
         echo "  [k8vturbo3] measured run ${i}/${MEASURED_RUNS}..." >&2
-        val="$(run_once "${model_path}" --kv-quant k8vturbo3)"
+        val="$(run_once k8vturbo3 "${model_path}" --kv-quant k8vturbo3)"
         if [[ -z "${val}" ]]; then
             echo "  WARN: k8vturbo3 run ${i} failed to parse decode_tps — skipping" >&2
             continue
@@ -270,3 +323,7 @@ done
 echo "" >&2
 echo "LEGACY CSV: ${CSV}" >&2
 echo "DB: ${RMLX_HOME}/metrics/runs.db (use 'make canary-gate SHA=<sha>' to gate)" >&2
+if [[ -s "${CANARY_PENDING}" ]]; then
+    echo "canary INCOMPLETE: $(wc -l <"${CANARY_PENDING}" | tr -d ' ') diagnostic record(s) did not land (named above)" >&2
+    exit "${RECORD_PENDING_EXIT}"
+fi

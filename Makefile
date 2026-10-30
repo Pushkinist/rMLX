@@ -95,7 +95,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         build-perf build-debug test-perf ci-perf gpu-test claim-rmlx model-check model-check-full \
         profile-samply profile-samply-debug profile-instruments bench asm perf-iter \
         canary canary-gate canary-ab canary-ab-selftest canary-ab-ingest-selftest \
-        canary-ab-host-gate-fixtures codec-smoke-runner-selftest llama-ab-selftest spec-bench-selftest bench-identity-selftest \
+        canary-ab-host-gate-fixtures codec-smoke-runner-selftest llama-ab-selftest spec-bench-selftest bench-identity-selftest run-class-selftest \
         spec-bench-published-selftest published-ingest-selftest \
         published-table check-published-table published-table-selftest \
         check-spec-metric-parity check-spec-metric-parity-fixtures \
@@ -756,6 +756,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/bench_llama_ab_selftest.sh
 	@bash scripts/spec_bench_selftest.sh
 	@bash scripts/bench_identity_selftest.sh
+	@bash scripts/run_class_selftest.sh
 	@bash scripts/spec_bench_published_selftest.sh
 	@bash scripts/published_ingest_selftest.sh
 	@bash scripts/published_table_selftest.sh
@@ -845,12 +846,13 @@ metrics-champions-rmlx: ## Print champion table (rMLX only, markdown)
 	cargo run --release --bin rmlx -- metrics champions --backend rmlx
 
 ci-metrics:      ## Verify metrics DB sanity via doctor (no-op if DB absent)
-	@RMLX_HOME="$${RMLX_HOME:-$$PWD/.rmlx}"; \
-	if [ ! -f "$$RMLX_HOME/metrics/runs.db" ]; then \
-		echo "$$RMLX_HOME/metrics/runs.db absent — skipping ci-metrics (run 'make metrics-init' once)"; \
+	@db="$$(cargo run -q --release --bin rmlx -- metrics path)" || exit $$?; \
+	if [ ! -f "$$db" ]; then \
+		echo "$$db absent — skipping ci-metrics (run 'make metrics-init' once)"; \
 		exit 0; \
-	fi
-	cargo run --release --bin rmlx -- metrics doctor
+	fi; \
+	echo "ci-metrics: $$db"; \
+	cargo run --release --bin rmlx -- metrics --db "$$db" doctor
 
 # ---- profiling (on-demand; NOT part of make ci) ---------------------------
 # See docs/PROFILING.md for full runbook.
@@ -961,6 +963,9 @@ spec-bench-selftest: ## mutation-check the spec-decode bench against a stub serv
 
 bench-identity-selftest: ## mutation-check the commit and run-log sources of perf_canary.sh, bench_decode_tps.sh and lib/identity.sh against stub binaries (no GPU, no model, no DB write)
 	bash scripts/bench_identity_selftest.sh
+
+run-class-selftest: ## check that the capture scripts, the codec probe and its ingest record under a stated run class, and record a run once (stub binaries; no GPU, no model, no DB write)
+	bash scripts/run_class_selftest.sh
 
 spec-bench-published-selftest: ## mutation-check the published-protocol bench against a stub server (no GPU, no model)
 	bash scripts/spec_bench_published_selftest.sh

@@ -1,4 +1,5 @@
-//! Linear layer — plain bf16, quantized (affine / mxfp8), or PARO INT4.
+//! Linear layer — plain (at the stored float dtype), quantized (affine / mxfp8), or
+//! PARO INT4.
 
 use rmlx_core::error::Result;
 use rmlx_mlx::{matmul, quantized_matmul, Array, Device};
@@ -48,10 +49,10 @@ pub struct ParoRotation {
 /// Linear layer — plain, quantized, or PARO INT4 (see docs/WEIGHT_QUANTS.md).
 #[allow(missing_debug_implementations)]
 pub enum Linear {
-    /// Plain bf16 weight matrix `[out, in]`.
+    /// Plain weight matrix `[out, in]`, at the float dtype the checkpoint stores.
     Plain {
-        /// Weight tensor shape `[out_features, in_features]` in bf16.
-        weight: Array, // [out, in] bf16
+        /// Weight tensor shape `[out_features, in_features]`.
+        weight: Array, // [out, in]
     },
     /// Affine/mxfp8 quantized (MLX `quantized_matmul` format).
     Quantized {
