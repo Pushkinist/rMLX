@@ -9,7 +9,6 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
 | `aggregate_decode_profile.py` | none | Aggregate per-model decode_profile lines from profile_<MODEL>.txt into one CSV row per model. |
-| `bench-records-sweep.sh` | none | 5-model x 4-KV-quant regression sweep, one cold and one warm run per cell. |
 | `bench_cache_types.sh` | none | bench_cache_types.sh — drive the cache-type combo matrix for a single model. |
 | `bench_cell.sh` | bench_cache_types.sh | Per-cell driver for cross-backend bench. |
 | `bench_codec_cell.sh` | make bench-codec-cell | bench_codec_cell.sh — single-codec × single-model bench runner. |
@@ -145,12 +144,6 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `lib/spec_round_log.py` | lib/binary_identity.py, lib/published_run_log.py, spec_bench.sh | Read a speculative round loop's own numbers back out of an rmlx run log. |
 | `lib/sse_decode_window.py` | spec_bench.sh, spec_bench_published.sh, spec_bench_selftest.sh | Time a streamed chat-completions response over its decode window. |
 | `lib/workspace_members.sh` | check/gpu_tests.sh, suite/gpu_test_classes.sh | The workspace members of a Cargo.toml, parsed and normalised once for the tools that read them. |
-
-## scripts/parity/
-
-| path | caller (derived) | purpose (header line 1) |
-|---|---|---|
-| `parity/jina_v4_parity.py` | none | jina-embeddings-v4 numeric parity: rMLX vs Python reference. |
 
 ## scripts/perf-iter/
 

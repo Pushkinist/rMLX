@@ -134,10 +134,6 @@ the stand-downs. No skip list exists.
 | `Ternary-Bonsai-8B-mlx-2bit` and the other first-generation Bonsai packs | Superseded by Bonsai 2; holds the only Qwen3 architecture and YaRN cells. | `bonsai_golden_tokens.rs`; `qwen3_tests.rs`; `niah_bonsai_*` and `niah_pflash_bonsai_*`; the `bonsai-8b` matrix rows; the 61 e2e cases bound to the `BONSAI` key (quant matrix, SSD tier, prompt cache, lifecycle); `bonsai_8b_prefill_stays_off_the_faulty_attention_configuration`; the first-generation 27B cells in `prefill_attention_configuration.rs` and `thread_boundary_text.rs`; `kv_calibrate_tests.rs`; the three thinking-budget and logprob cells in `bonsai_golden_tokens.rs`; `thinking_budget_exact_hit_qwen3_5_moe`; the Bonsai refusals in `cache_type_validate.rs` |
 | `medgemma-1.5-4b-it-8bit` (Gemma3) | Supported, not a target. | `medgemma_golden_tokens.rs`; `gemma3/tests.rs` and `gemma3/vision_tests.rs`; `thread_boundary_towers.rs`; `registry_tests.rs`; the `gemma3_basic` chat-template fixture |
 
-`scripts/bench-records-sweep.sh` is a broad records sweep, not a target list. It
-keeps naming Qwen3.6, Qwen3.6-27B-PARO, Bonsai-8B, gemma-4-e2b and medgemma on
-purpose.
-
 ### Gaps
 
 No target has these, so no routine run covers them:
