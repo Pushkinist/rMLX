@@ -268,7 +268,7 @@ st_case producer_output_passes_check 0 --what "a build with exactly the producer
     --has "release-cpu: ok" -- release_check "$root"
 
 # package_root <name> <honors-env: yes|no>: a copy of the files
-# package_binary.sh reads, and a stub `cargo` first on PATH. The stub links a
+# the package mode of release.sh reads, and a stub `cargo` first on PATH. The stub links a
 # binary and records rustflags the way cargo does: CARGO_ENCODED_RUSTFLAGS when
 # set (unless told to ignore it), else config.toml's. It refuses to build under
 # a rustc wrapper, whose arguments no record would show.
@@ -276,7 +276,7 @@ package_root() {
     local root="$ST_WORK/$1" honors="$2" release
     release="$(dirname "$TOOL")"
     mkdir -p "$root/scripts/release" "$root/.cargo" "$root/bin"
-    cp "$release/package_binary.sh" "$release/release_cpu.py" "$root/scripts/release/"
+    cp "$release/release.sh" "$release/release_cpu.py" "$root/scripts/release/"
     printf '[workspace.package]\nversion = "0.0.0"\n' >"$root/Cargo.toml"
     printf '[build]\nrustflags = %s\n' "$CONFIG_FLAGS" >"$root/.cargo/config.toml"
     printf 'licence\n' >"$root/LICENSE-MIT"
@@ -310,12 +310,12 @@ STUB
     printf '%s' "$root"
 }
 
-# package_exec <root> [VAR=value...]: package_binary.sh run from <root> with its
+# package_exec <root> [VAR=value...]: release.sh package run from <root> with its
 # stub cargo first on PATH.
 package_exec() {
     local root="$1"
     shift
-    (cd "$root" && env PATH="$root/bin:$PATH" "$@" bash scripts/release/package_binary.sh)
+    (cd "$root" && env PATH="$root/bin:$PATH" "$@" bash scripts/release/release.sh package)
 }
 
 # package_run <name> <what> <want-exit> <want-kept: yes|no> <root> [VAR=value...]
@@ -339,7 +339,7 @@ package_run() {
 }
 
 root=$(package_root package_pins yes)
-package_run package_keeps_checked_tarball "package_binary.sh builds with the pin, checks it, keeps the tarball" \
+package_run package_keeps_checked_tarball "release.sh package builds with the pin, checks it, keeps the tarball" \
     0 yes "$root"
 
 root=$(package_root package_clears_wrappers yes)

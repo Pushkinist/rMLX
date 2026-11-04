@@ -4,7 +4,7 @@ target/
 **/*.rs.bk
 *.pdb
 
-# Release artifacts (built locally by scripts/release/package_binary.sh)
+# Release artifacts (built locally by scripts/release/release.sh package)
 dist/
 
 # Cargo lockfile policy: keep for binary crate (workspace root)

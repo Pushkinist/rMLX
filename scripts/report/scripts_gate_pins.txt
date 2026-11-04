@@ -122,7 +122,6 @@ usage published_samples.py
 usage published_table_selftest.sh
 usage release/release_cpu.py
 usage release/release_cpu_selftest.sh
-usage release/sign_artifact.sh
 usage run_gpu_tests.sh
 usage run_gpu_tests_selftest.sh
 usage schema_constraint_canary.sh
@@ -165,12 +164,6 @@ exit-undeclared perf_canary.sh 1,125
 exit-undeclared prefill_chunk_sweep.sh 0,125
 exit-undeclared published_ingest_selftest.sh 1,2
 exit-undeclared published_table_selftest.sh 0,1,2
-exit-undeclared release/build_bottle.sh 1
-exit-undeclared release/changelog_section.sh 1
-exit-undeclared release/package_binary.sh 1
-exit-undeclared release/sign_artifact.sh 1
-exit-undeclared release/source_sha256.sh 1
-exit-undeclared release/sync_tap.sh 1
 exit-undeclared release_e2e/stage6_perf/codec_smoke_runner.sh 0,1,2,3
 exit-undeclared release_e2e/stage6_perf/niah_long_context.sh 1,2
 exit-undeclared run_gpu_tests.sh 0,1
@@ -329,7 +322,6 @@ binary-literal perf-iter/bench_decode_tps.sh 4
 binary-literal perf_ab.sh 2
 binary-literal perf_canary.sh 1
 binary-literal prefill_chunk_sweep.sh 2
-binary-literal release/package_binary.sh 1
 binary-literal release_e2e/stage6_perf/codec_smoke_runner.sh 1
 binary-literal release_e2e/stage6_perf/niah_long_context.sh 1
 binary-literal schema_constraint_canary.sh 1

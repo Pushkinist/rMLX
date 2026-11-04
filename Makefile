@@ -821,25 +821,25 @@ tag:             ## create annotated git tag v<version> from Cargo.toml [workspa
 
 # ---- release (all local; hosted CI cannot build rMLX — no usable Metal) ----
 release-package: ## build + bundle dist/rmlx-v<ver>-aarch64-apple-darwin.tar.gz (+ .sha256), compiled for apple-m1 and checked
-	bash scripts/release/package_binary.sh
+	bash scripts/release/release.sh package
 
 release-cpu-selftest: ## CI gate: recall test for the release tarball's target-CPU check, each case asserting its exit code and reason
 	@bash scripts/release/release_cpu_selftest.sh
 
-release-selftest: ## CI gate: recall test for the six release steps (package, sign, sha, bottle, tap-sync, notes) against stub external tools, each case asserting the exit code, the output and the files or argv the steps produce
+release-selftest: ## CI gate: recall test for the six modes of the release tool (package, sign, sha, bottle, tap-sync, notes) against stub external tools, each case asserting the exit code, the output and the files or argv the modes produce
 	@bash scripts/release/release_selftest.sh
 
 release-sha:     ## print sha256 of the v<ver> GitHub source tarball (append --write to patch the formula)
-	bash scripts/release/source_sha256.sh
+	bash scripts/release/release.sh sha
 
 release-sign:    ## cosign-sign dist/rmlx-v<ver>-...tar.gz with the maintainer key pair -> .cosign.bundle (KEY=<path>; default ~/.config/rmlx/cosign.key; prompts for the key password)
-	bash scripts/release/sign_artifact.sh $(KEY)
+	bash scripts/release/release.sh sign $(KEY)
 
 bottle:          ## build a Homebrew bottle from the installed rmlx keg (run after brew install --build-bottle)
-	bash scripts/release/build_bottle.sh
+	bash scripts/release/release.sh bottle
 
 tap-sync:        ## copy packaging/homebrew/rmlx.rb into the homebrew-rmlx tap and push
-	bash scripts/release/sync_tap.sh
+	bash scripts/release/release.sh tap-sync
 
 clean:           ## cargo clean
 	cargo clean

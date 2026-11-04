@@ -1,18 +1,13 @@
 #!/usr/bin/env bash
-# Recall test for the six release steps: a scratch repo, stub external tools, no network.
+# Recall test for the release tool's six modes: a scratch repo, stub external tools, no network.
 #
-# Recall test for: release/package_binary.sh
-#                  release/sign_artifact.sh
-#                  release/source_sha256.sh
-#                  release/build_bottle.sh
-#                  release/sync_tap.sh
-#                  release/changelog_section.sh
+# Recall test for: release/release.sh package sign sha bottle tap-sync notes default
 # Not a mode of: release/release_cpu_selftest.sh — that one tests the target-CPU check alone; this one runs the steps around it
 #
-# Each step is copied into a scratch repo under ST_WORK, beside a planted Cargo.toml, CHANGELOG.md,
+# The tool is copied into a scratch repo under ST_WORK, beside a planted Cargo.toml, CHANGELOG.md,
 # formula, licenses and tap directory, and run there on a PATH of its own whose cargo, curl, cosign,
 # brew, gh and git record their argv and return a planted result. Every case asserts the literal
-# exit code, what was printed, and the files written or the argv the stubs received. The steps are
+# exit code, what was printed, and the files written or the argv the stubs received. The modes are
 # named in one place each: the `tool_*` functions.
 #
 # Not reached: the build itself (the cargo stub writes a binary and cargo's fingerprint record), the
@@ -46,25 +41,27 @@ export HOME="$ST_WORK/home"
 mkdir -p "$HOME/.config/rmlx" "$STUBS" "$NOJQ"
 export PATH="$STUBS:/usr/bin:/bin"
 
-# ---- the six steps, one function each ---------------------------------------------------------
+# ---- the six modes, one function each ---------------------------------------------------------
 
 place_tools() {
     local f
-    for f in package_binary.sh sign_artifact.sh source_sha256.sh build_bottle.sh sync_tap.sh \
-        changelog_section.sh release_cpu.py; do
+    for f in release.sh release_cpu.py; do
         cp "$REPO_ROOT/scripts/release/$f" "$REL/" || st_die "cannot copy $f"
     done
 }
 
-tool_package() { st_bounded 120 bash "$REL/package_binary.sh" "$@"; }
-tool_sign() { st_bounded 60 bash "$REL/sign_artifact.sh" "$@"; }
-tool_sha() { st_bounded 60 bash "$REL/source_sha256.sh" "$@"; }
-tool_bottle() { st_bounded 60 bash "$REL/build_bottle.sh" "$@"; }
-tool_tap_sync() { st_bounded 60 bash "$REL/sync_tap.sh" "$@"; }
-tool_notes() { st_bounded 60 bash "$REL/changelog_section.sh" "$@"; }
+tool_package() { st_bounded 120 bash "$REL/release.sh" package "$@"; }
+tool_sign() { st_bounded 60 bash "$REL/release.sh" sign "$@"; }
+tool_sha() { st_bounded 60 bash "$REL/release.sh" sha "$@"; }
+tool_bottle() { st_bounded 60 bash "$REL/release.sh" bottle "$@"; }
+tool_tap_sync() { st_bounded 60 bash "$REL/release.sh" tap-sync "$@"; }
+tool_notes() { st_bounded 60 bash "$REL/release.sh" notes "$@"; }
 
-# tool_bottle_no_jq: the bottle step on a PATH that holds brew and dirname but no jq.
-tool_bottle_no_jq() { PATH="$NOJQ" /bin/bash "$REL/build_bottle.sh"; }
+# tool_default: the tool with the arguments given, the first of which is not one of the six modes.
+tool_default() { st_bounded 60 bash "$REL/release.sh" "$@"; }
+
+# tool_bottle_no_jq: the bottle mode on a PATH that holds brew and dirname but no jq.
+tool_bottle_no_jq() { PATH="$NOJQ" /bin/bash "$REL/release.sh" bottle; }
 
 # tool_without <tool> <cmd...>: run the command with that stub taken off the PATH.
 tool_without() {
@@ -192,7 +189,7 @@ end
 EOF2
 }
 
-# fresh [<version>]: a scratch repo holding the six steps and everything they read; stub state cleared.
+# fresh [<version>]: a scratch repo holding the tool and everything it reads; stub state cleared.
 fresh() {
     local ver="${1:-0.4.5}"
     rm -rf "$REPO" "$S" "$TAP"
@@ -316,7 +313,13 @@ finish notes_last_section 0 --is '- last one'
 
 fresh
 st_run tool_notes 9.9.9
-finish notes_missing_version_prints_nothing 0 --is ''
+finish notes_missing_version_prints_nothing 1 --is 'error: CHANGELOG.md has no section for version 9.9.9'
+
+fresh
+{ printf '## [0x4y5] - 2026-11-02\n\n- decoy\n\n'; cat "$REPO/CHANGELOG.md"; } >"$ST_WORK/changelog"
+mv "$ST_WORK/changelog" "$REPO/CHANGELOG.md"
+st_run tool_notes 0.4.5
+finish notes_version_is_matched_literally 0 --is $'\n### Fixed\n\n- fix five\n\n- fix six'
 
 fresh
 rm "$REPO/CHANGELOG.md"
@@ -347,6 +350,13 @@ st_run tool_sha --write
 plant_formula "$ST_WORK/formula_want" 0.4.5 "$SRC_SHA"
 expect_eq "formula" "$(cat "$REPO/$FORMULA")" "$(cat "$ST_WORK/formula_want")"
 finish sha_write_patches_url_and_sha_only 0 --has "sha256: $SRC_SHA" --has "==> patched $FORMULA (url -> v0.4.5, sha256)"
+
+fresh
+: >"$S/curl.body"
+st_run tool_sha --write
+plant_formula "$ST_WORK/formula_before" 0.4.4 0000000000000000000000000000000000000000000000000000000000000000
+expect_eq "formula" "$(cat "$REPO/$FORMULA")" "$(cat "$ST_WORK/formula_before")"
+finish sha_empty_download_is_refused 1 --has "error: the download was empty" --lacks "sha256:" --lacks "patched"
 
 fresh
 printf '22\n' >"$S/curl.rc"
@@ -526,6 +536,14 @@ finish bottle_root_url_follows_cargo_toml 0 --has "root_url: https://github.com/
 
 fresh
 plant_bottle any
+printf '{"pushkinist/rmlx/rmlx":{"bottle":{"cellar":"any","tags":{"arm64_tahoe":{"sha256":"abcd1234"}}}}}\n' >"$S/brew.files/$BOTTLE_JSON"
+st_run tool_bottle
+expect_absent "$REPO/dist/$BOTTLE_JSON"
+expect_present "$REPO/$BOTTLE_JSON"
+finish bottle_json_without_filename 1 --has "error: $BOTTLE_JSON names no filename for the bottle" --lacks "bottle do"
+
+fresh
+plant_bottle any
 st_run tool_bottle --root-url
 expect_argv brew
 finish bottle_root_url_without_value 1 --has "--root-url requires a URL argument"
@@ -612,5 +630,56 @@ st_run tool_tap_sync "$TAP"
 expect_argv git
 expect_argv gh
 finish tap_sync_no_formula 1 --has "error: $FORMULA missing"
+
+# ---- usage -------------------------------------------------------------------------------------
+
+USAGE="usage: release.sh {package|sign [KEY]|sha [--write]|bottle [--root-url URL]|tap-sync [DIR]|notes [VER]}"
+
+fresh
+st_run tool_default
+finish usage_no_mode 2 --has "$USAGE"
+
+fresh
+st_run tool_default frobnicate
+finish usage_unknown_mode 2 --has "$USAGE"
+
+fresh
+st_run tool_package extra
+expect_argv cargo
+finish usage_package_takes_no_argument 2 --has "$USAGE"
+
+fresh
+st_run tool_sign one.key two.key
+expect_argv cosign
+finish usage_sign_takes_one_argument 2 --has "$USAGE"
+
+fresh
+st_run tool_sha --read
+expect_argv curl
+finish usage_sha_unknown_option 2 --has "$USAGE"
+
+fresh
+st_run tool_sha --write extra
+expect_argv curl
+finish usage_sha_extra_argument 2 --has "$USAGE"
+
+fresh
+st_run tool_bottle --root
+expect_argv brew
+finish usage_bottle_unknown_option 2 --has "$USAGE"
+
+fresh
+st_run tool_bottle --root-url https://example.invalid/dl extra
+expect_argv brew
+finish usage_bottle_extra_argument 2 --has "$USAGE"
+
+fresh
+st_run tool_tap_sync "$TAP" extra
+expect_argv git
+finish usage_tap_sync_takes_one_argument 2 --has "$USAGE"
+
+fresh
+st_run tool_notes 0.4.5 0.4.4
+finish usage_notes_takes_one_argument 2 --has "$USAGE"
 
 st_done
