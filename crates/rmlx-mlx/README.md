@@ -13,8 +13,8 @@ brew install mlx-c   # pulls mlx
 
 Apple Silicon only. `build.rs` fails when either dylib is missing. The
 validated MLX / mlx-c pair is declared in [`mlx-pin.txt`](mlx-pin.txt). The
-pin test, `rmlx healthcheck` and `make mlx-preflight` check the loaded pair
-against it; `build.rs` does not. See
+pin test, `rmlx healthcheck` and the refusal of `rmlx baseline` and `rmlx bench`
+check the loaded pair against it; `build.rs` does not. See
 [`docs/FFI.md`](../../docs/FFI.md#pinned-mlx--mlx-c-pair).
 
 ## Environment variables

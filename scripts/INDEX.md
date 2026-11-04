@@ -37,10 +37,6 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `gpu_capture.sh` | make profile-gputrace | Capture a Metal GPU trace of a bounded window of steady-state decode, for |
 | `gpu_validation_census.txt` | run_gpu_tests.sh, run_gpu_tests_selftest.sh | The Metal shader-validation hits run_gpu_tests.sh accepts, per (kernel, kind, crate, test). |
 | `gputrace_preflight.sh` | make build-capture, make gputrace-preflight, gpu_capture.sh | Check the host prerequisites for Apple's GPU tools to work with a Metal capture of this binary. |
-| `mlx_preflight.sh` | make mlx-preflight, gpu_capture.sh, mlx_preflight_selftest.sh, mlx_restore_pin.sh | Stop a measurement where rmlx baseline and rmlx bench refuse: a bad mlx-c C API or MLX pair. |
-| `mlx_preflight_selftest.sh` | make ci, make mlx-preflight-selftest | Recall test for mlx_preflight.sh: throwaway Homebrew prefixes and stubs, asserting output. |
-| `mlx_restore_pin.sh` | make mlx-restore-pin, mlx_restore_pin_selftest.sh | Restore the MLX and mlx-c pair named by crates/rmlx-mlx/mlx-pin.txt, then link and pin those kegs. |
-| `mlx_restore_pin_selftest.sh` | make ci, make mlx-restore-pin-selftest | Recall test for mlx_restore_pin.sh: throwaway prefixes, stub brew, asserting exit and records. |
 | `mst_capture.sh` | make profile-mst | Record a Metal System Trace of a live rmlx run, export the GPU-interval table |
 | `perf_ab.sh` | perf_ab_host_gate_fixtures.sh, perf_ab_selftest.sh, perf_canary.sh | perf_ab.sh — ABBA-interleaved A/B comparison of two `rmlx baseline` arms. |
 | `perf_ab_host_gate_fixtures.sh` | make canary-ab-host-gate-fixtures, make ci | Recall test for the perf_ab.sh boundary: --synthetic-arms gives the same verdict on any host. |
@@ -102,6 +98,8 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 |---|---|---|
 | `host/gc.sh` | make ci, make target-gc, make target-size-report, make traces-gc, gpu_capture.sh, host/gc_selftest.sh | Bound a regenerable directory: prune stale target/ profiles, or evict old .rmlx/traces bundles. |
 | `host/gc_selftest.sh` | make ci, make gc-selftest | Recall test for the cleanup tools: planted scratch trees, never the real target/ or traces. |
+| `host/mlx_restore_pin.sh` | make mlx-restore-pin, host/mlx_restore_pin_selftest.sh | Restore the MLX and mlx-c pair named by crates/rmlx-mlx/mlx-pin.txt, then link and pin those kegs. |
+| `host/mlx_restore_pin_selftest.sh` | make ci, make mlx-restore-pin-selftest | Recall test for mlx_restore_pin.sh: throwaway prefixes, stub brew, asserting exit and records. |
 
 ## scripts/ingest/
 
@@ -125,7 +123,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `lib/identity.sh` | bench_cache_types.sh, bench_cell.sh, perf-iter/bench_decode_tps.sh, +5 more scripts | Shared §8.5 run-identity for rMLX bench scripts. |
 | `lib/kv_boundary_default.py` | ingest/codec_inertness_ingest.py, ingest/perf_ab_ingest.py | The engine's default KV boundary-layer counts, read from the engine. |
 | `lib/metal_dirs.sh` | check/kernel_dispatch.sh, check/metal_kernels.sh, check/metal_kernels_selftest.sh, +1 more scripts | The directories holding gated .metal kernels; sourced by the metal gates. |
-| `lib/mlx_pin.sh` | crates/rmlx-mlx/src/pin_tests.rs, mlx_preflight.sh, mlx_restore_pin.sh | Read the validated MLX / mlx-c pair from its one declaration. |
+| `lib/mlx_pin.sh` | crates/rmlx-mlx/src/pin_tests.rs, host/mlx_restore_pin.sh | Read the validated MLX / mlx-c pair from its one declaration. |
 | `lib/prefill_ms.py` | mst_capture.sh | Read the prefill time of an rmlx run out of its log: `generate: prefill{prefill_ms}`. |
 | `lib/published_aggregate.py` | spec_bench_published.sh, spec_bench_published_selftest.sh | Assemble and summarise a published-protocol speculative-decoding run. |
 | `lib/published_fixed_prompt.py` | spec_bench_published.sh | Fit the published protocol's fixed-length prompt against a live server. |
@@ -137,7 +135,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `lib/published_run_log.py` | lib/binary_identity.py, lib/prefill_ms.py, lib/published_greedy.py, +1 more scripts | Read one rmlx run log back as a per-request table. |
 | `lib/published_table.py` | make check-published-table, make published-table, published_table_selftest.sh | Render published-protocol runs as the Markdown table a post needs. |
 | `lib/run_log_for_pid.py` | lib/bench_server.sh | Pick the run log a given process wrote, out of the candidates on stdin. |
-| `lib/selftest_support.sh` | bench_llama_ab_selftest.sh, check/gpu_tests_selftest.sh, check/metal_kernels_selftest.sh, +16 more scripts | The case runner and shims the self-tests share; source it. |
+| `lib/selftest_support.sh` | bench_llama_ab_selftest.sh, check/gpu_tests_selftest.sh, check/metal_kernels_selftest.sh, +15 more scripts | The case runner and shims the self-tests share; source it. |
 | `lib/server_decode_tps.py` | perf-iter/bench_decode_tps.sh, spec_bench.sh | Read one request's decode rate off a running rmlx server. |
 | `lib/server_kv_quant.py` | lib/bench_server.sh, lib/binary_identity.py, perf_canary.sh, +1 more scripts | Read the KV codec a run resolved out of its rmlx run log. |
 | `lib/server_sampling.py` | crates/rmlx-server/src/engine/sampler_event_tests.rs, lib/published_run_log.py, spec_bench.sh | Read whether a run's requests were sampled, out of its rmlx run log. |

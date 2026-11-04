@@ -6,8 +6,8 @@
 #
 # The grammar here is the same one `parse_pin` (crates/rmlx-mlx/src/pin.rs)
 # applies, and `the_shell_pin_parser_agrees_with_the_rust_one` holds the two
-# together. A file the Rust gate calls unusable must not be one these scripts
-# quietly proceed on.
+# together. A file the Rust gate calls unusable must not be one the restore
+# script quietly proceeds on.
 #
 # The version shape is an allowlist, not a sanity check: the restore script
 # puts these values in the Cellar paths it moves kegs to and in the Ruby text

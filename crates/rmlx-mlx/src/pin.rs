@@ -58,8 +58,8 @@ pub(crate) struct MlxPin {
 /// half-declared, doubled or typo'd pin would quietly stop checking the very
 /// coupling it exists to enforce.
 ///
-/// `scripts/lib/mlx_pin.sh` applies the same grammar for the bench preflight
-/// and the restore script, which run before any binary exists to ask. They are
+/// `scripts/lib/mlx_pin.sh` applies the same grammar for the restore script,
+/// which runs before any binary exists to ask. They are
 /// held together by `the_shell_pin_parser_agrees_with_the_rust_one`.
 pub(crate) fn parse_pin(src: &str) -> Option<MlxPin> {
     let mut mlx = None;
@@ -90,7 +90,7 @@ pub(crate) fn parse_pin(src: &str) -> Option<MlxPin> {
 /// Whether a token is shaped like a Homebrew keg directory name.
 ///
 /// An allowlist, not a sanity check. These values name the Cellar directories
-/// that `scripts/mlx_restore_pin.sh` moves kegs to and links, and go into the
+/// that `scripts/host/mlx_restore_pin.sh` moves kegs to and links, and go into the
 /// Ruby text it gives `brew ruby`, so a token such as `..` would reach far
 /// outside a keg. Keeping the rule here as well as in the shell means neither
 /// parser can be the one that accepts it.
@@ -469,8 +469,8 @@ pub enum PinRefusal {
 
 impl PinCheck {
     /// Why a measurement must not run in this process, or `None` when it may.
-    /// The one verdict that `rmlx baseline`, `rmlx bench`,
-    /// `rmlx healthcheck` and the preflight apply.
+    /// The one verdict that `rmlx baseline`, `rmlx bench` and
+    /// `rmlx healthcheck` apply.
     #[must_use]
     pub const fn refusal(&self) -> Option<PinRefusal> {
         if !self.c_api_matches {

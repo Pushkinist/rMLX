@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Recall test for mlx_restore_pin.sh: throwaway prefixes, stub brew, asserting exit and records.
 #
+# Recall test for: host/mlx_restore_pin.sh
 #
-# Recall test for: mlx_restore_pin.sh
-#
-#     bash scripts/mlx_restore_pin_selftest.sh [<script under test>]
+# Usage:  bash scripts/host/mlx_restore_pin_selftest.sh [<script under test>]
+# Exit:   0 every case held; 1 a case did not, or none ran
+# Set:    -uo — a failed case is counted and the run goes on to the next
 #
 # Each case builds a throwaway Homebrew prefix, a durable store and a repo tree
 # whose pin names mlx 9.9.9 + mlx-c 8.8.8, runs the script with a stub `brew`
@@ -24,8 +25,9 @@ export LC_ALL=C
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SUT="${1:-$HERE/mlx_restore_pin.sh}"
+LIB="$HERE/../lib"
 # shellcheck source=scripts/lib/selftest_support.sh
-. "$HERE/lib/selftest_support.sh"
+. "$LIB/selftest_support.sh"
 st_init mlx-restore-pin-selftest
 
 MLX_V=9.9.9
@@ -105,12 +107,10 @@ keg() {
 # new_case <name> -> prints the case directory, with repo, prefix and store.
 new_case() {
 	local c="$ST_WORK/$1"
-	mkdir -p "$c/repo/scripts/lib" "$c/repo/crates/rmlx-mlx" "$c/prefix/Cellar" \
+	mkdir -p "$c/repo/scripts/host" "$c/repo/scripts/lib" "$c/repo/crates/rmlx-mlx" "$c/prefix/Cellar" \
 		"$c/store/source-built"
-	cp "$SUT" "$c/repo/scripts/mlx_restore_pin.sh"
-	cp "$HERE/lib/mlx_pin.sh" "$c/repo/scripts/lib/mlx_pin.sh"
-	printf '#!/usr/bin/env bash\necho "[preflight stub]"\n' >"$c/repo/scripts/mlx_preflight.sh"
-	chmod +x "$c/repo/scripts/mlx_preflight.sh"
+	cp "$SUT" "$c/repo/scripts/host/mlx_restore_pin.sh"
+	cp "$LIB/mlx_pin.sh" "$c/repo/scripts/lib/mlx_pin.sh"
 	printf 'mlx    %s\nmlx-c  %s\n' "$MLX_V" "$MLXC_V" >"$c/repo/crates/rmlx-mlx/mlx-pin.txt"
 	printf '%s\n' "$c"
 }
@@ -136,8 +136,8 @@ resolves() { (cd "$1/prefix/$2" 2>/dev/null && pwd -P); }
 # restore_run <case>: the script under test, run from the case's repo tree.
 restore_run() {
 	local repo="$1/repo"
-	PATH="$1/bin:$ST_WORK/bin:$PATH" HOMEBREW_PREFIX="$1/prefix" RMLX_BOTTLE_STORE="$1/store" \
-		bash "$repo/scripts/mlx_restore_pin.sh"
+	PATH="$1/bin:$ST_WORK/bin:$PATH" HOMEBREW_PREFIX="$1/prefix" \
+		bash "$repo/scripts/host/mlx_restore_pin.sh" --store "$1/store"
 }
 
 # expect <name> <case> <exit> <needles> [<check> <arg>]...
@@ -187,8 +187,7 @@ keg "$c/prefix/Cellar" mlx-c "$MLXC_V" yes
 mkdir -p "$c/prefix/opt" "$c/prefix/var/homebrew/pinned"
 ln -sfn "$c/prefix/Cellar/mlx/$NEWER_V" "$c/prefix/opt/mlx"
 ln -sfn "$c/prefix/Cellar/mlx/$NEWER_V" "$c/prefix/var/homebrew/pinned/mlx"
-expect "kegs in the Cellar: link and pin the exact pinned kegs" "$c" 0 "[preflight stub]
-[brew ruby under the restore lock]" "${LINKED[@]}" \
+expect "kegs in the Cellar: link and pin the exact pinned kegs" "$c" 0 "[brew ruby under the restore lock]" "${LINKED[@]}" \
 	absent "Cellar/.rmlx-restore-lock"
 
 c=$(new_case store)
@@ -262,7 +261,7 @@ c=$(new_case no-nax)
 keg "$c/prefix/Cellar" mlx "$MLX_V" no
 keg "$c/prefix/Cellar" mlx-c "$MLXC_V" yes
 expect "a keg without NAX kernels is refused and named for removal" "$c" 1 \
-	"$c/prefix/Cellar/mlx/$MLX_V has no NAX GEMM kernels. It is a bottle build, not the source build the pin names. Remove that directory, then run this again"
+	"$c/prefix/Cellar/mlx/$MLX_V has no NAX GEMM kernels. The pin names a source build with them; a bottle and a plain --build-from-source keg have none. Remove that directory, then run this again"
 
 # The copy is checked in staging, so a refused one never becomes a keg that a
 # later run or Homebrew takes as installed.
@@ -321,7 +320,7 @@ store_tar "$c" mlx-c-copy.tar.gz mlx-c "$MLXC_V" yes
 mkdir "$c/prefix/Cellar/.rmlx-restore-lock"
 keg "$c/prefix/Cellar/.rmlx-restore.LIVE" mlx "$MLX_V" yes
 expect "a second restore stops on the lock and keeps the first run's files" "$c" 1 \
-	"another restore holds $c/prefix/Cellar/.rmlx-restore-lock. When \`pgrep -f mlx_restore_pin.sh\` finds no restore, \`rmdir $c/prefix/Cellar/.rmlx-restore-lock\`, then run this again" \
+	"another restore holds $c/prefix/Cellar/.rmlx-restore-lock. When \`pgrep -f '[m]lx_restore_pin.sh'\` finds no restore, \`rmdir $c/prefix/Cellar/.rmlx-restore-lock\`, then run this again" \
 	present "Cellar/.rmlx-restore-lock" present "Cellar/.rmlx-restore.LIVE" absent "Cellar/mlx/$MLX_V"
 
 # A file where the formula directory must be: the move into the Cellar fails.
@@ -339,16 +338,8 @@ c=$(new_case stale-staging)
 keg "$c/prefix/Cellar" mlx "$MLX_V" yes
 keg "$c/prefix/Cellar" mlx-c "$MLXC_V" yes
 keg "$c/prefix/Cellar/.rmlx-restore.KILLED" mlx "$MLX_V" yes
-expect "the staging a killed run left is removed" "$c" 0 "[preflight stub]" \
+expect "the staging a killed run left is removed" "$c" 0 "[link] link and pin mlx $MLX_V + mlx-c $MLXC_V" \
 	"${LINKED[@]}" absent "Cellar/.rmlx-restore.*"
-
-# The preflight runs last and its verdict is the verdict of the restore.
-c=$(new_case preflight-fails)
-keg "$c/prefix/Cellar" mlx "$MLX_V" yes
-keg "$c/prefix/Cellar" mlx-c "$MLXC_V" yes
-printf '#!/usr/bin/env bash\necho "[preflight stub fails]"\nexit 1\n' >"$c/repo/scripts/mlx_preflight.sh"
-expect "a preflight that fails after the link fails the restore and releases the lock" "$c" 1 \
-	"[preflight stub fails]" "${LINKED[@]}" absent "Cellar/.rmlx-restore-lock"
 
 c=$(new_case cellar-empty-dylib)
 keg "$c/prefix/Cellar" mlx "$MLX_V" yes

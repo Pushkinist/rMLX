@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 # Restore the MLX and mlx-c pair named by crates/rmlx-mlx/mlx-pin.txt, then link and pin those kegs.
 #
+# Usage:  bash scripts/host/mlx_restore_pin.sh [--store DIR]
+#         --store DIR holds the durable copy (default ~/.rmlx/bottles); it is read from DIR/source-built.
+# Exit:   0 the pair is linked and pinned; 1 a keg or copy was refused, or brew could not link; 2 usage error
+# Set:    -uo — a refusal is reported by die or link_failed, which name the cause and the fix
+#
 # The pinned pair is a source build with the NAX kernels (docs/MLX_PAIR.md).
 # No Homebrew bottle for macOS 26 carries them, so this script pours no
 # bottle. It takes each keg from, in this order:
 #
 #   1. the Cellar, when a usable keg is there;
-#   2. the durable copy in $RMLX_BOTTLE_STORE/source-built (default
+#   2. the durable copy in DIR/source-built (--store DIR, default
 #      ~/.rmlx/bottles/source-built): a tar of the Cellar keg directory, listed
 #      in the SHA256SUMS file there.
 #
@@ -25,19 +30,33 @@
 # `brew link <f>` and `brew pin <f>` act on the newest keg in the Cellar, not on
 # the one the pin names.
 #
-# Verify afterwards with scripts/mlx_preflight.sh.
+# Verify afterwards with `rmlx healthcheck --human`: its mlx_pin line.
 
 set -uo pipefail
 
 PREFIX="${HOMEBREW_PREFIX:-/opt/homebrew}"
 CELLAR="$PREFIX/Cellar"
-STORE="${RMLX_BOTTLE_STORE:-$HOME/.rmlx/bottles}/source-built"
+STORE_ROOT="$HOME/.rmlx/bottles"
+while [ $# -gt 0 ]; do
+	case $1 in
+	--store)
+		[ $# -ge 2 ] || { echo "--store needs a directory" >&2; exit 2; }
+		STORE_ROOT=$2
+		shift 2
+		;;
+	*)
+		echo "usage: $0 [--store DIR]" >&2
+		exit 2
+		;;
+	esac
+done
+STORE="$STORE_ROOT/source-built"
 RECORDS="opt var/homebrew/linked var/homebrew/pinned"
 
 # The pinned pair, read from its one declaration by the one parser. The
 # versions pass the allowlist in scripts/lib/mlx_pin.sh before they reach a
 # path or the Ruby text below.
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$REPO_ROOT/scripts/lib/mlx_pin.sh"
 mlx_pin_load "$REPO_ROOT/crates/rmlx-mlx/mlx-pin.txt" || exit 1
 
@@ -54,7 +73,7 @@ LOCK="$CELLAR/.rmlx-restore-lock"
 STAGE=""
 if ! mkdir "$LOCK" 2>/dev/null; then
 	[ -d "$LOCK" ] &&
-		die "another restore holds $LOCK. When \`pgrep -f mlx_restore_pin.sh\` finds no restore," \
+		die "another restore holds $LOCK. When \`pgrep -f '[m]lx_restore_pin.sh'\` finds no restore," \
 			"\`rmdir $LOCK\`, then run this again"
 	die "cannot make $LOCK. $CELLAR must be a directory that you can write to"
 fi
@@ -97,7 +116,7 @@ keg_problem() {
 		return 2
 	fi
 	if [ "$(printf '%s\n' "$symbols" | grep -c steel_gemm_fused_nax)" -lt 1 ]; then
-		echo "has no NAX GEMM kernels. It is a bottle build, not the source build the pin names"
+		echo "has no NAX GEMM kernels. The pin names a source build with them; a bottle and a plain --build-from-source keg have none"
 		return 0
 	fi
 	return 1
@@ -210,5 +229,3 @@ for f in mlx mlx-c; do
 done
 echo "[done] opt, linked and pinned records name mlx $PIN_MLX + mlx-c $PIN_MLXC"
 echo "       rebuild rmlx against them:  cargo clean -p rmlx-mlx && make build-perf"
-# Not exec: the exit trap must run to release the lock.
-"$(dirname "$0")/mlx_preflight.sh"

@@ -27,7 +27,7 @@ the MLX that Homebrew links on the user's machine at run time.
   `packaging/homebrew/rmlx.rb`.
 - The binary reads `events.mlx_nax` from the metallib it loaded at run time
   (`crates/rmlx-mlx/src/nax.rs`), so the value describes the user's MLX.
-- Run `make mlx-preflight` on the release machine before building.
+- Run `rmlx healthcheck --human` on the release machine before building and read its `mlx_pin` line.
 
 ## The tarball's target CPU
 
@@ -143,9 +143,9 @@ bypass — the ruleset's target is `main` alone, so a tag ref is outside it.
 10. **Verify** the install paths (§Verify the install paths).
 11. **Restore the pin.** The install check can move this host off the pinned
     MLX pair: Homebrew upgrades `mlx` and `mlx-c` to bottles that lack the
-    NAX GEMM kernels. Run `make mlx-restore-pin`, then `make mlx-preflight`.
-    Preflight prints the pinned pair. Check it before any GPU run on this
-    host. See [Restoring the pair: `make mlx-restore-pin`](MLX_PAIR.md#restoring-the-pair-make-mlx-restore-pin).
+    NAX GEMM kernels. Run `make mlx-restore-pin`, rebuild, then read the
+    `mlx_pin` line of `rmlx healthcheck --human`. Check it before any GPU run
+    on this host. See [Restoring the pair: `make mlx-restore-pin`](MLX_PAIR.md#restoring-the-pair-make-mlx-restore-pin).
 12. **Retrospective** over the diff from the previous tag to the new one
     (§Retrospective).
 

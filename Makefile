@@ -103,7 +103,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         check-spec-charge check-spec-charge-fixtures \
         spec-round-stream-selftest \
         check-published-samples check-published-samples-fixtures \
-        mlx-preflight mlx-preflight-selftest mlx-restore-pin mlx-restore-pin-selftest target-gc target-size-report profile-gputrace \
+        mlx-restore-pin mlx-restore-pin-selftest target-gc target-size-report profile-gputrace \
         profile-mst \
         build-capture test-capture gputrace-preflight traces-gc \
         ssd-canary ssd-canary-gate ssd-canary-selftest \
@@ -145,12 +145,6 @@ check:           ## cargo check (fast, no codegen)
 
 test:            ## cargo test --workspace
 	cargo test --workspace
-
-mlx-preflight:   ## verify the linked MLX stack (and nax kernels on M5+) before benching
-	bash scripts/mlx_preflight.sh
-
-mlx-preflight-selftest: ## CI gate: recall test for mlx-preflight over throwaway prefixes, a stub chip and a stub built binary, each case asserting the exit code and the lines printed
-	bash scripts/mlx_preflight_selftest.sh
 
 target-gc:       ## report stale target/ profiles (APPLY=1 to prune, MAX_AGE_DAYS= to retune; target/ has no size cap)
 	bash scripts/host/gc.sh target $(if $(APPLY),--apply,) $(if $(ALL),--all,) \
@@ -230,10 +224,10 @@ profile-mst: ## record a Metal System Trace of a live rmlx run and summarise GPU
 		$(if $(KEEP),--keep $(KEEP),)
 
 mlx-restore-pin: ## restore the pinned mlx + mlx-c pair (crates/rmlx-mlx/mlx-pin.txt) from the Cellar or the durable store, then link and pin it
-	bash scripts/mlx_restore_pin.sh
+	bash scripts/host/mlx_restore_pin.sh
 
 mlx-restore-pin-selftest: ## CI gate: recall test for mlx-restore-pin over throwaway prefixes and a stub brew, each case asserting the exit code, a reason and the records left
-	bash scripts/mlx_restore_pin_selftest.sh
+	bash scripts/host/mlx_restore_pin_selftest.sh
 
 build-perf:      ## cargo build --profile release-perf (debug-assertions off, stripped)
 	cargo build --workspace --profile release-perf
@@ -789,8 +783,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check/tree_lines_selftest.sh claim-bypass
 	@bash scripts/check/tree_lines.sh personal-data
 	@bash scripts/check/tree_lines_selftest.sh personal-data
-	@bash scripts/mlx_restore_pin_selftest.sh
-	@bash scripts/mlx_preflight_selftest.sh
+	@bash scripts/host/mlx_restore_pin_selftest.sh
 	@bash scripts/check/kernel_dispatch.sh dtype-contract
 	@bash scripts/check/rust_gates_fixtures.sh kernel_dtype_contract
 	@bash scripts/perf_ab_selftest.sh
@@ -977,7 +970,7 @@ CANARY_THRESHOLD_PCT ?= 3
 # SHA to compare against for canary-gate; required — no default.
 # Usage: make canary-gate SHA=3ba8aee
 
-canary: mlx-preflight build-perf  ## run 3-model TPS canary (records into runs.db + legacy CSV); requires release-perf binary
+canary: build-perf  ## run 3-model TPS canary (records into runs.db + legacy CSV); requires release-perf binary
 	bash scripts/perf_canary.sh
 
 # The canary tracks ONE build over time. Comparing two builds (or two flag
@@ -986,7 +979,7 @@ canary: mlx-preflight build-perf  ## run 3-model TPS canary (records into runs.d
 #
 # Pass arms through ARGS, e.g.
 #   make canary-ab ARGS='--binary-a target/release-perf/rmlx.main --binary-b target/release-perf/rmlx'
-canary-ab: mlx-preflight build-perf  ## interleaved A/B of two arms (ARGS='--binary-a … --binary-b …'); see docs/PERF_BASELINE.md
+canary-ab: build-perf  ## interleaved A/B of two arms (ARGS='--binary-a … --binary-b …'); see docs/PERF_BASELINE.md
 	bash scripts/perf_canary.sh --ab $(ARGS)
 
 canary-ab-selftest: ## mutation-check the A/B harness against stub binaries (no GPU, no model)
@@ -1174,7 +1167,7 @@ ssd-canary-gate:   ## gate SSD-tier regressions; SHA= required, THRESHOLD_PCT=3 
 # See scripts/bench_codec_cell.sh for full options (--max-tokens, --prompt-len).
 # CSV schema documented in docs/PERF_BASELINE.md § "Per-codec × per-model cells".
 
-bench-codec-cell: mlx-preflight  ## bench one codec × one model cell (CODEC= MODEL= required); appends to .rmlx/bench/codec_cells.csv
+bench-codec-cell: ## bench one codec × one model cell (CODEC= MODEL= required); appends to .rmlx/bench/codec_cells.csv
 	@if [ -z "$(CODEC)" ] || [ -z "$(MODEL)" ]; then \
 		echo "Usage: make bench-codec-cell CODEC=<codec> MODEL=<snapshot-abs-path>"; \
 		exit 2; \

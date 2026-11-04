@@ -135,9 +135,6 @@ fi
 # writes several GB and only reveals the problem as an empty Xcode timeline.
 bash scripts/gputrace_preflight.sh --binary "$BIN" || exit 1
 
-# --- 3. toolchain sanity: same gate the bench path uses ---------------------
-bash scripts/mlx_preflight.sh || exit 1
-
 mkdir -p "$OUT_DIR"
 stamp=$(date +%Y%m%d-%H%M%S)
 # The model goes in the name: bundles are multi-GB and land side by side, and

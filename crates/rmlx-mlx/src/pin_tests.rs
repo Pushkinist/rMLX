@@ -130,8 +130,8 @@ fn parse_pin_rejects_versions_that_are_not_keg_names() {
 
 /// The shell parser and this one must call the same files usable.
 ///
-/// The bench preflight and the restore script run before any binary exists to
-/// ask, so they carry their own parser. If it were the more permissive of the
+/// The restore script runs before any binary exists to ask, so it carries its
+/// own parser. If it were the more permissive of the
 /// two, a pin the Rust gate refuses to check would still drive a restore.
 #[test]
 fn the_shell_pin_parser_agrees_with_the_rust_one() {
@@ -468,9 +468,8 @@ fn no_two_verdicts_read_the_same() {
 
 /// No script writes the pinned versions down itself.
 ///
-/// The bench preflight and the restore script both act on these versions, and
-/// each used to carry its own copy — so a pin bump silently left them
-/// restoring and validating the previous pair.
+/// The restore script acts on these versions, and a copy of its own would let
+/// a pin bump silently leave it restoring the previous pair.
 ///
 /// Scoped to `scripts/`, and the set is read from the directory rather than
 /// listed here, so a *new* script hardcoding the pair is caught too. Prose in

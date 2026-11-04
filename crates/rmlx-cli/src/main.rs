@@ -1801,9 +1801,6 @@ const fn gpu_capture_requested(_cmd: &Cmd) -> bool {
 ///
 /// Checked here, in the process that is about to take the measurement, because
 /// that is the only place the answer describes the library actually loaded.
-/// With no built binary, `scripts/mlx_preflight.sh` can read only the `opt`
-/// symlinks. With one, it reads this verdict through the binary's `mlx_pin`
-/// line.
 ///
 /// An mlx-c C API mismatch refuses on every host, not only where the pin
 /// binds: attention cannot run, so the run would fail after the model load.

@@ -41,10 +41,6 @@ class gen_lloyd_codebook.py
 class gpu_capture.sh
 class gpu_validation_census.txt
 class gputrace_preflight.sh
-class mlx_preflight.sh
-class mlx_preflight_selftest.sh
-class mlx_restore_pin.sh
-class mlx_restore_pin_selftest.sh
 class mst_capture.sh
 class parity/jina_v4_parity.py
 class perf-iter/bench_decode_tps.sh
@@ -117,10 +113,6 @@ usage lib/server_sampling.py
 usage lib/snapshot_identity.py
 usage lib/snapshot_sampling.py
 usage lib/spec_round_log.py
-usage mlx_preflight.sh
-usage mlx_preflight_selftest.sh
-usage mlx_restore_pin.sh
-usage mlx_restore_pin_selftest.sh
 usage mst_capture.sh
 usage parity/jina_v4_parity.py
 usage perf_ab.sh
@@ -167,8 +159,6 @@ exit-undeclared eval_lock_stress.sh 1
 exit-undeclared gen_lloyd_codebook.py 1
 exit-undeclared gpu_capture.sh 1,2
 exit-undeclared ingest/llama_bench_ingest.py 1
-exit-undeclared mlx_preflight.sh 0,1
-exit-undeclared mlx_restore_pin.sh 1
 exit-undeclared mst_capture.sh 0,1,2
 exit-undeclared perf-iter/bench_decode_tps.sh 1
 exit-undeclared perf_ab.sh 0,1,125
@@ -269,9 +259,6 @@ set-mode check_kv_codec_disposition.sh
 set-mode codec_smoke_runner_selftest.sh
 set-mode gpu_capture.sh
 set-mode gputrace_preflight.sh
-set-mode mlx_preflight.sh
-set-mode mlx_restore_pin.sh
-set-mode mlx_restore_pin_selftest.sh
 set-mode mst_capture.sh
 set-mode perf_ab.sh
 set-mode perf_ab_ingest_selftest.sh
@@ -347,7 +334,6 @@ binary-literal codec_smoke_runner_selftest.sh 2
 binary-literal eval/wikitext2_ppl.py 2
 binary-literal gpu_capture.sh 1
 binary-literal gputrace_preflight.sh 1
-binary-literal mlx_preflight.sh 1
 binary-literal mst_capture.sh 2
 binary-literal perf-iter/bench_decode_tps.sh 4
 binary-literal perf_ab.sh 2
@@ -380,8 +366,7 @@ env-knob lib/cpu_snapshot.sh CPU_SNAPSHOT_MIN_ROWS,SYNTHETIC_ARMS
 env-knob lib/identity.sh RMLX_IDENTITY_JSON
 env-knob lib/kv_boundary_default.py RMLX_REPO_ROOT
 env-knob lib/selftest_support.sh TOOL
-env-knob mlx_preflight.sh HOMEBREW_PREFIX
-env-knob mlx_restore_pin.sh HOMEBREW_PREFIX,RMLX_BOTTLE_STORE
+env-knob host/mlx_restore_pin.sh HOMEBREW_PREFIX
 env-knob mst_capture.sh RMLX_HOME
 env-knob parity/jina_v4_parity.py RMLX_O_MODELS_ROOT,RMLX_ROOT
 env-knob perf-iter/bench_decode_tps.sh KV_QUANT,MAX_CTX,MEASURE_RUNS,METRICS_DB,METRICS_OUT,MODEL_PATH,PORT,RMLX_BIN,RMLX_HOME,WARMUP_RUNS
