@@ -322,6 +322,7 @@ binary-literal perf-iter/bench_decode_tps.sh 4
 binary-literal perf_ab.sh 2
 binary-literal perf_canary.sh 1
 binary-literal prefill_chunk_sweep.sh 2
+binary-literal release/release.sh 1
 binary-literal release_e2e/stage6_perf/codec_smoke_runner.sh 1
 binary-literal release_e2e/stage6_perf/niah_long_context.sh 1
 binary-literal schema_constraint_canary.sh 1

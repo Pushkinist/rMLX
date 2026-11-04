@@ -52,8 +52,7 @@ package() {
   RUSTC_WRAPPER= RUSTC_WORKSPACE_WRAPPER= CARGO_ENCODED_RUSTFLAGS="$RELEASE_RUSTFLAGS" \
     cargo build --release -p rmlx-cli
 
-  BUILD_DIR="target/release"
-  BIN="${BUILD_DIR}/rmlx"
+  BIN="target/release/rmlx"
   [ -x "$BIN" ] || { echo "error: $BIN not found"; exit 1; }
 
   # A dependency's panic location is an absolute source path, and under the build
