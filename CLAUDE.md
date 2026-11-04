@@ -287,7 +287,7 @@ Hard rules:
   dispatches Metal but never names the device: an in-process HTTP handler, or a
   child process), drop the `#[ignore]` and pass `Device::Cpu`, or reword the
   `#[ignore]` so it does not claim Metal. A declared test is enforced but
-  deliberately **not** in `check/gpu_tests.sh list` — `run_gpu_tests.sh` asserts a Metal
+  deliberately **not** in `check/gpu_tests.sh list` — `suite/run_gpu_tests.sh` asserts a Metal
   validation banner per crate and every declared test is snapshot-gated or drives
   a child, so listing one would fail the suite over a missing model. This one
   check keys on the ignore *text*, which is why a Metal-driving test whose reason

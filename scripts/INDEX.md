@@ -204,6 +204,6 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 |---|---|---|
 | `suite/eval_lock_stress.sh` | make eval-lock-stress | Drive the evaluation-lock reproducer across fresh processes; a non-zero exit or timeout fails. |
 | `suite/gpu_test_classes.sh` | suite/run_gpu_tests.sh, suite/run_gpu_tests_selftest.sh | Print the half (codec\|rest) or threadgroup setting (on\|off) of each classified GPU test. |
-| `suite/gpu_validation_census.txt` | suite/run_gpu_tests.sh, suite/run_gpu_tests_selftest.sh | The Metal shader-validation hits run_gpu_tests.sh accepts, per (kernel, kind, crate, test). |
+| `suite/gpu_validation_census.txt` | suite/run_gpu_tests.sh, suite/run_gpu_tests_selftest.sh | The Metal shader-validation hits suite/run_gpu_tests.sh accepts, per (kernel, kind, crate, test). |
 | `suite/run_gpu_tests.sh` | make ci-perf, make gpu-test, suite/run_gpu_tests_selftest.sh | Run the #[ignore] Metal tests of every member crate, serialized, under Metal shader validation. |
 | `suite/run_gpu_tests_selftest.sh` | make ci, make gpu-runner-selftest | Recall test for suite/run_gpu_tests.sh: how it reports red runs, waivers and census verdicts. |

@@ -313,7 +313,7 @@ VALIDATION_DIAGNOSTIC='Invalid .{0,120}(at offset [0-9]+|executing kernel functi
 # shape lives in one file both this runner and the source gate read, rather than
 # in each of them. Neither pattern is anchored at line start, because under
 # --nocapture the notice lands after libtest's `test some::name ... ` prefix.
-# shellcheck source=lib/skip_notice_patterns.sh
+# shellcheck source=scripts/lib/skip_notice_patterns.sh
 . "${REPO_ROOT}/scripts/lib/skip_notice_patterns.sh"
 
 # One `<kind><TAB><kernel>` record per diagnostic, read from stdin one

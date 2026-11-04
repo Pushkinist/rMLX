@@ -239,7 +239,7 @@
 #   the excluded set so the divergence is stated rather than silent.
 #
 #   A `metal-unscanned` test is excluded for a different reason, and it is a
-#   property of the RUNNER, not of the classifier. `run_gpu_tests.sh` asserts,
+#   property of the RUNNER, not of the classifier. `suite/run_gpu_tests.sh` asserts,
 #   per crate, that Metal's shader-validation banner appeared — a crate that
 #   created no Metal device proved nothing and is reported as having run
 #   uninstrumented. Every `metal-unscanned` test in this tree is snapshot-gated

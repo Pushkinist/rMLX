@@ -416,7 +416,7 @@ the rest half. The whole gate on `main` finds it one merge later.
 
 `make ci-perf` is the only shared gate that runs the GPU tests. In order:
 
-1. `run_gpu_tests.sh --preflight` checks the environment and runs no test:
+1. `suite/run_gpu_tests.sh --preflight` checks the environment and runs no test:
    `RMLX_SKIP_GPU` unset and a non-empty classification. Then
    `rmlx claim run -- true` takes the Metal claim and releases it, so a claim
    another process holds fails here with exit 11. Both fail before the long

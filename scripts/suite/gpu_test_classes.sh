@@ -3,7 +3,7 @@
 #
 # Usage:  bash scripts/suite/gpu_test_classes.sh half [--root <dir>]
 #         bash scripts/suite/gpu_test_classes.sh threadgroup [--root <dir>]
-#         half         codec|rest, crate, test: the partition `run_gpu_tests.sh --half` runs one side of
+#         half         codec|rest, crate, test: the partition `suite/run_gpu_tests.sh --half` runs one side of
 #         threadgroup  on|off, crate, test: the threadgroup-memory validation setting of each test
 #         --root       the tree to classify; points the tool at a synthetic fixture workspace
 # Exit:   0 the rows, on stdout; 2 they could not be computed, with the reason named
@@ -18,7 +18,7 @@
 #
 # HALF
 #   The whole GPU suite is hours of wall, and a change pays for all of it to learn about the part
-#   it touched, so the suite is partitioned in two and `run_gpu_tests.sh --half <name>` runs one.
+#   it touched, so the suite is partitioned in two and `suite/run_gpu_tests.sh --half <name>` runs one.
 #
 #   A classified GPU test is in the `codec` half if and only if its declaring file is
 #     * under a workspace member that `rmlx-models` depends on, or

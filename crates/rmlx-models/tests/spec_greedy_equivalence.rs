@@ -3234,7 +3234,7 @@ const DRAFT_MODEL_VAR: &str = "RMLX_DRAFT_TEST_MODEL";
 /// through `common::model_for`.
 ///
 /// Resolving by slug is what puts this gate inside `make gpu-test` on a machine
-/// holding the snapshots: it joins the population `run_gpu_tests.sh` already
+/// holding the snapshots: it joins the population `suite/run_gpu_tests.sh` already
 /// reports as INCOMPLETE when the models root is unset, instead of a variable
 /// nobody exports and a green run that asserted nothing.
 ///
