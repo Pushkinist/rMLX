@@ -87,7 +87,7 @@ PROF_GEN    ?= 500
 AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
 
 .PHONY: help build check test fmt fmt-check lint audit deny precommit hooks \
-        ci ci-metrics tag release-package release-cpu-selftest release-sha release-sign bottle tap-sync \
+        ci ci-metrics tag release-package release-cpu-selftest release-selftest release-sha release-sign bottle tap-sync \
         clean serve chat info logs-tail metrics-summary \
         metrics-init metrics-doctor metrics-doctor-fix metrics-export \
         metrics-backup metrics-replay-pending metrics-prompts-sync \
@@ -741,6 +741,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/report/scripts_gate_selftest.sh
 	@bash scripts/report/scripts_gate_content_selftest.sh
 	@bash scripts/release/release_cpu_selftest.sh
+	@bash scripts/release/release_selftest.sh
 	@bash scripts/report/kv_census_selftest.sh
 	@bash scripts/check_no_inline_tests.sh
 	@bash scripts/check/rust_gates_fixtures.sh no_inline_tests
@@ -824,6 +825,9 @@ release-package: ## build + bundle dist/rmlx-v<ver>-aarch64-apple-darwin.tar.gz 
 
 release-cpu-selftest: ## CI gate: recall test for the release tarball's target-CPU check, each case asserting its exit code and reason
 	@bash scripts/release/release_cpu_selftest.sh
+
+release-selftest: ## CI gate: recall test for the six release steps (package, sign, sha, bottle, tap-sync, notes) against stub external tools, each case asserting the exit code, the output and the files or argv the steps produce
+	@bash scripts/release/release_selftest.sh
 
 release-sha:     ## print sha256 of the v<ver> GitHub source tarball (append --write to patch the formula)
 	bash scripts/release/source_sha256.sh

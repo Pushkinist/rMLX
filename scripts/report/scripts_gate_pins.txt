@@ -192,7 +192,6 @@ caller gen_lloyd_codebook.py
 caller ingest/codec_inertness_ingest.py
 caller ingest/llama_bench_ingest.py
 caller prefill_chunk_sweep.sh
-caller release/changelog_section.sh
 caller release_e2e/stage6_perf/niah_long_context.sh
 caller sdpa_headdim_bench.py
 caller spec_broken_engine.sh

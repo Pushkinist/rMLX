@@ -134,7 +134,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `lib/published_run_log.py` | lib/binary_identity.py, lib/prefill_ms.py, lib/published_greedy.py, +1 more scripts | Read one rmlx run log back as a per-request table. |
 | `lib/published_table.py` | make check-published-table, make published-table, published_table_selftest.sh | Render published-protocol runs as the Markdown table a post needs. |
 | `lib/run_log_for_pid.py` | lib/bench_server.sh | Pick the run log a given process wrote, out of the candidates on stdin. |
-| `lib/selftest_support.sh` | bench_llama_ab_selftest.sh, check/gpu_tests_selftest.sh, check/metal_kernels_selftest.sh, +15 more scripts | The case runner and shims the self-tests share; source it. |
+| `lib/selftest_support.sh` | bench_llama_ab_selftest.sh, check/gpu_tests_selftest.sh, check/metal_kernels_selftest.sh, +16 more scripts | The case runner and shims the self-tests share; source it. |
 | `lib/server_decode_tps.py` | perf-iter/bench_decode_tps.sh, spec_bench.sh | Read one request's decode rate off a running rmlx server. |
 | `lib/server_kv_quant.py` | lib/bench_server.sh, lib/binary_identity.py, perf_canary.sh, +1 more scripts | Read the KV codec a run resolved out of its rmlx run log. |
 | `lib/server_sampling.py` | crates/rmlx-server/src/engine/sampler_event_tests.rs, lib/published_run_log.py, spec_bench.sh | Read whether a run's requests were sampled, out of its rmlx run log. |
@@ -162,14 +162,15 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
-| `release/build_bottle.sh` | make bottle | Build a Homebrew bottle from the installed rmlx keg and prepare it for the GitHub Release. |
-| `release/changelog_section.sh` | none | Print one version's CHANGELOG.md section, for use as the GitHub release body. |
-| `release/package_binary.sh` | make release-package, release/release_cpu_selftest.sh | Build + package the rMLX release binary for aarch64-apple-darwin. |
+| `release/build_bottle.sh` | make bottle, release/release_selftest.sh | Build a Homebrew bottle from the installed rmlx keg and prepare it for the GitHub Release. |
+| `release/changelog_section.sh` | release/release_selftest.sh | Print one version's CHANGELOG.md section, for use as the GitHub release body. |
+| `release/package_binary.sh` | make release-package, release/release_cpu_selftest.sh, release/release_selftest.sh | Build + package the rMLX release binary for aarch64-apple-darwin. |
 | `release/release_cpu.py` | release/package_binary.sh, release/release_cpu_selftest.sh | The CPU target of the release tarball binary. |
 | `release/release_cpu_selftest.sh` | make ci, make release-cpu-selftest | Recall test for release_cpu.py: throwaway repo roots and a stub cargo, asserting exit and reason. |
-| `release/sign_artifact.sh` | make release-sign | Sign the release tarball with the maintainer's cosign key pair, producing a .cosign.bundle. |
-| `release/source_sha256.sh` | make release-sha | Compute the sha256 of a GitHub source tarball for the Homebrew formula; --write patches it in. |
-| `release/sync_tap.sh` | make tap-sync | Sync packaging/homebrew/rmlx.rb into the Homebrew tap repo as Formula/rmlx.rb, commit and push. |
+| `release/release_selftest.sh` | make ci, make release-selftest | Recall test for the six release steps: a scratch repo, stub external tools, no network. |
+| `release/sign_artifact.sh` | make release-sign, release/release_selftest.sh | Sign the release tarball with the maintainer's cosign key pair, producing a .cosign.bundle. |
+| `release/source_sha256.sh` | make release-sha, release/release_selftest.sh | Compute the sha256 of a GitHub source tarball for the Homebrew formula; --write patches it in. |
+| `release/sync_tap.sh` | make tap-sync, release/release_selftest.sh | Sync packaging/homebrew/rmlx.rb into the Homebrew tap repo as Formula/rmlx.rb, commit and push. |
 
 ## scripts/release_e2e/stage6_perf/
 
