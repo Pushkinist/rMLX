@@ -437,7 +437,7 @@ variable `ci-perf` takes, under the rules above.
 The GPU suite builds under `dev`, with debug assertions live, while
 `test-perf` builds under `release-perf`. So no gate runs a `Device::Gpu` test
 with debug assertions off (CLAUDE.md hard rule 9). The `dev` build is not
-shared with `test-perf`. `scripts/target_gc.sh` protects `release-perf` and
+shared with `test-perf`. `scripts/host/gc.sh target` protects `release-perf` and
 prunes stale profiles, so a run after `make target-gc` can pay a cold `dev`
 build.
 

@@ -76,9 +76,6 @@ class spec_round_stream_compare.py
 class spec_round_stream_compare_selftest.sh
 class ssd_canary.sh
 class ssd_canary_selftest.sh
-class target_gc.sh
-class target_size_report.sh
-class traces_gc.sh
 purpose bench_identity_selftest.sh
 purpose codec_smoke_runner_selftest.sh
 purpose gpu_capture.sh
@@ -201,9 +198,6 @@ exit-undeclared spec_round_stream_compare.py 2
 exit-undeclared spec_round_stream_compare_selftest.sh 1
 exit-undeclared ssd_canary.sh 1,125
 exit-undeclared ssd_canary_selftest.sh 2
-exit-undeclared target_gc.sh 0,1,2
-exit-undeclared target_size_report.sh 0
-exit-undeclared traces_gc.sh 1
 caller aggregate_decode_profile.py
 caller bench-records-sweep.sh
 caller bench/codec_inertness_probe.sh
@@ -227,7 +221,6 @@ recall-missing perf_ab_selftest.sh default
 recall-missing published_ingest_selftest.sh default
 silenced lib/published_table.py default
 silenced report/debt_report.py --file-sizes,default
-silenced target_size_report.sh default
 lib-consumers lib/binary_identity.py
 lib-consumers lib/prefill_ms.py
 lib-consumers lib/published_aggregate.py
@@ -289,9 +282,6 @@ set-mode schema_constraint_canary.sh
 set-mode spec_bench_selftest.sh
 set-mode spec_broken_engine.sh
 set-mode spec_round_stream_compare_selftest.sh
-set-mode target_gc.sh
-set-mode target_size_report.sh
-set-mode traces_gc.sh
 name bench-records-sweep.sh RMLX_DIR,hyphen
 name bench_cache_types.sh RMLX_DIR
 name bench_llama_ab_selftest.sh ROOT
@@ -406,7 +396,6 @@ env-knob spec_bench.sh BENCH_PROMPT,BENCH_PROMPT_FILE,BENCH_PROMPT_NAME,DRAFTER_
 env-knob spec_bench_published.sh KV_QUANT_SEEN,MEMORY_PID,RMLX_HOME,SAMPLING_SEEN,SERVER_PID
 env-knob spec_bench_selftest.sh OUT_PATH
 env-knob ssd_canary.sh PORT,SSD_GB,VERIFIER_MODEL
-env-knob target_gc.sh MAX_AGE_DAYS
 unguarded-array check_kv_codec_disposition.sh BANNER_DOCS
 unguarded-array check_kv_codec_disposition_fixtures.sh BASE_FILES,CASES
 unguarded-array check_published_samples_fixtures.sh args

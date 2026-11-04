@@ -385,11 +385,11 @@ the claim file. [gate: `make check-claim-bypass`, tree-wide]
   compound command (`if`, `for`, `case`, `!`), a tool run inside `$( )`, and a
   `$(MAKE) -k` or `$(MAKE) -i`, for every tool of a target only that line
   reaches. The rule does not read what follows `||`, by choice: a `|| exit 1` that
-  keeps the failure and a `|| true` that drops it are both pinned when they occur. The four such lines
-  `make ci` holds are pinned: `debt_report.py --file-sizes`, `debt_report.py` and
-  `target_size_report.sh` (all advisory reports, each ending in `|| true`) and
+  keeps the failure and a `|| true` that drops it are both pinned when they occur. The three such lines
+  `make ci` holds are pinned: `debt_report.py --file-sizes` and `debt_report.py`
+  (advisory reports, each ending in `|| true`) and
   `lib/published_table.py` (`... && diff -u ... || { ...; exit 1; }`, which keeps
-  the failure); so is the recall test `target_size_report.sh` lacks.
+  the failure).
   [gate: `silenced`]
 * A recall test never sources its gate, and a gate never sources the case
   runner. [review]

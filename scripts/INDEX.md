@@ -66,9 +66,6 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `spec_round_stream_compare_selftest.sh` | make ci, make spec-round-stream-selftest | Recall test for spec_round_stream_compare.py verify: synthetic captures, asserting the exit code. |
 | `ssd_canary.sh` | make ssd-canary, ssd_canary_selftest.sh | ssd_canary.sh — end-to-end long-session SSD prompt-cache tier canary. |
 | `ssd_canary_selftest.sh` | make ci, make ssd-canary-selftest | Recall test for ssd_canary.sh and its make targets, against a stub rmlx and a stub HTTP server. |
-| `target_gc.sh` | make target-gc, host/gc_selftest.sh | Reclaim space in ./target by pruning build profiles that have gone stale. |
-| `target_size_report.sh` | make ci, make target-size-report, host/gc_selftest.sh | Advisory (non-failing) report of target/ size, with a make target-gc hint past a threshold. |
-| `traces_gc.sh` | make traces-gc, gpu_capture.sh, host/gc_selftest.sh | Bound how much disk .rmlx/traces holds, and say exactly what was removed. |
 
 ## scripts/bench/
 
@@ -103,6 +100,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
+| `host/gc.sh` | make ci, make target-gc, make target-size-report, make traces-gc, gpu_capture.sh, host/gc_selftest.sh | Bound a regenerable directory: prune stale target/ profiles, or evict old .rmlx/traces bundles. |
 | `host/gc_selftest.sh` | make ci, make gc-selftest | Recall test for the cleanup tools: planted scratch trees, never the real target/ or traces. |
 
 ## scripts/ingest/

@@ -152,11 +152,12 @@ mlx-preflight:   ## verify the linked MLX stack (and nax kernels on M5+) before 
 mlx-preflight-selftest: ## CI gate: recall test for mlx-preflight over throwaway prefixes, a stub chip and a stub built binary, each case asserting the exit code and the lines printed
 	bash scripts/mlx_preflight_selftest.sh
 
-target-gc:       ## report stale target/ profiles (APPLY=1 to prune; target/ has no size cap)
-	bash scripts/target_gc.sh $(if $(APPLY),--apply,) $(if $(ALL),--all,)
+target-gc:       ## report stale target/ profiles (APPLY=1 to prune, MAX_AGE_DAYS= to retune; target/ has no size cap)
+	bash scripts/host/gc.sh target $(if $(APPLY),--apply,) $(if $(ALL),--all,) \
+		$(if $(MAX_AGE_DAYS),--max-age-days $(MAX_AGE_DAYS),)
 
 target-size-report: ## advisory: print target/ size + hint when over threshold (non-failing; also runs at the end of `make ci`)
-	@bash scripts/target_size_report.sh
+	@bash scripts/host/gc.sh target --warn-gb 50
 
 # The re-sign is not optional decoration. Cargo emits an ad-hoc *linker-signed*
 # binary with no entitlements at all; com.apple.security.get-task-allow is what
@@ -174,7 +175,7 @@ gputrace-preflight: ## check the GPU-tools prerequisites (developer mode, get-ta
 	@bash scripts/gputrace_preflight.sh $(if $(BIN),--binary $(BIN),)
 
 traces-gc:       ## report .rmlx/traces against the retention caps (APPLY=1 to prune; MAX_COUNT=/MAX_TOTAL_GB=/MAX_AGE_DAYS= to retune)
-	bash scripts/traces_gc.sh $(if $(APPLY),--apply,) $(if $(ALL),--all,) \
+	bash scripts/host/gc.sh traces $(if $(APPLY),--apply,) $(if $(ALL),--all,) \
 		$(if $(MAX_COUNT),--max-count $(MAX_COUNT),) \
 		$(if $(MAX_TOTAL_GB),--max-total-gb $(MAX_TOTAL_GB),) \
 		$(if $(MAX_AGE_DAYS),--max-age-days $(MAX_AGE_DAYS),)
@@ -734,7 +735,7 @@ check-metal-kernels-selftest: ## CI gate: recall test for the two MSL kernel gat
 gputrace-selftest: ## CI gate: recall test for the three modes of the .gputrace reader (kernels, diff, summary) over synthetic bundles, each case asserting the exit code and the line or reason
 	@bash scripts/profile/gputrace_selftest.sh
 
-gc-selftest: ## CI gate: recall test for the cleanup tools (target_gc.sh, traces_gc.sh, target_size_report.sh) over planted scratch trees, each case asserting the exit code, the output and what is left on disk
+gc-selftest: ## CI gate: recall test for the cleanup tool (host/gc.sh, target and traces) over planted scratch trees, each case asserting the exit code, the output and what is left on disk
 	@bash scripts/host/gc_selftest.sh
 
 # ---- one-shot CI gate -------------------------------------------------
@@ -811,7 +812,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check/metal_kernels.sh compile
 	@python3 scripts/report/debt_report.py --shellcheck
 	@python3 scripts/report/debt_report.py --file-sizes || true
-	@bash scripts/target_size_report.sh || true
+	@bash scripts/host/gc.sh target --warn-gb 50
 	@python3 scripts/report/debt_report.py || true
 	@echo "ci ok"
 

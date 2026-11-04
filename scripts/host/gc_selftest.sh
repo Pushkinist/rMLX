@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
 # Recall test for the cleanup tools: planted scratch trees, never the real target/ or traces.
 #
-# Recall test for: target_gc.sh --apply --all
-#   traces_gc.sh --apply --all --max-count --max-total-gb --max-age-days --dir
-#   target_size_report.sh
+# Recall test for: host/gc.sh target traces
 # Not a mode of: profile/gputrace_selftest.sh — that one reads .gputrace bundles; this one plants and deletes them
 #
-# Each tool is copied into a scratch repo under ST_WORK and run there, so its own `cd` to the repo
+# The tool is copied into a scratch repo under ST_WORK and run there, so its own `cd` to the repo
 # root lands on the planted tree. Ages are set with `touch -t`. A stub `du` reads a planted `.kb`
 # file as the size of a directory, so a boundary in gigabytes needs no gigabytes on disk. Every
-# case asserts the literal exit code, what was printed and the entries left on disk. The tools are
-# named in one place each: `tool_target`, `tool_traces` and `tool_report`.
+# case asserts the literal exit code, what was printed and the entries left on disk. The tool is
+# named in one place each way it is used: `tool_target`, `tool_traces` and `tool_report`.
 #
 # Usage:  bash scripts/host/gc_selftest.sh
 # Exit:   0 every case held; 1 a case did not, or none ran; 2 a fixture could not be built
@@ -22,12 +20,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=scripts/lib/selftest_support.sh
 . "$REPO_ROOT/scripts/lib/selftest_support.sh"
 st_init gc-selftest
-unset MAX_AGE_DAYS
 
 SCRATCH_REPO="$ST_WORK/repo"
 GIB_KB=1048576
 
-SCRATCH_TOOLS="$SCRATCH_REPO/scripts"
+SCRATCH_TOOLS="$SCRATCH_REPO/scripts/host"
 
 mkdir -p "$SCRATCH_TOOLS" "$ST_WORK/stubs"
 cat >"$ST_WORK/stubs/du" <<'EOF2'
@@ -43,31 +40,37 @@ EOF2
 chmod +x "$ST_WORK/stubs/du"
 export PATH="$ST_WORK/stubs:$PATH"
 
-# ---- the three tools, one function each ----------------------------------------------------
+# ---- the tool, one function per use ---------------------------------------------------------
 
-# tool_target [args]: prune stale target/ profiles; MAX_AGE_DAYS in the environment sets the age cut.
+place_tool() {
+    cp "$REPO_ROOT/scripts/host/gc.sh" "$SCRATCH_TOOLS/" || st_die "cannot copy gc.sh"
+}
+
+# tool_target [args]: prune stale target/ profiles.
 tool_target() {
-    cp "$REPO_ROOT/scripts/target_gc.sh" "$SCRATCH_TOOLS/" || st_die "cannot copy target_gc.sh"
-    st_bounded 60 bash "$SCRATCH_TOOLS/target_gc.sh" ${1+"$@"}
+    place_tool
+    st_bounded 60 bash "$SCRATCH_TOOLS/gc.sh" target ${1+"$@"}
 }
 
 # tool_traces [args]: bound the trace bundles.
 tool_traces() {
-    cp "$REPO_ROOT/scripts/traces_gc.sh" "$SCRATCH_TOOLS/" || st_die "cannot copy traces_gc.sh"
-    st_bounded 60 bash "$SCRATCH_TOOLS/traces_gc.sh" ${1+"$@"}
+    place_tool
+    st_bounded 60 bash "$SCRATCH_TOOLS/gc.sh" traces ${1+"$@"}
 }
 
-# tool_report [args]: print the target/ size and the hint.
+# tool_env_age: tool_target with a non-numeric MAX_AGE_DAYS in the environment.
+tool_env_age() { MAX_AGE_DAYS=abc tool_target "$@"; }
+
+# tool_mode <arg>: the tool with a first argument that is no mode.
+tool_mode() {
+    place_tool
+    st_bounded 60 bash "$SCRATCH_TOOLS/gc.sh" "$@"
+}
+
+# tool_report [threshold]: print the target/ size and the hint at or past the threshold (default 50).
 tool_report() {
-    cp "$REPO_ROOT/scripts/target_size_report.sh" "$SCRATCH_TOOLS/" || st_die "cannot copy target_size_report.sh"
-    st_bounded 60 bash "$SCRATCH_TOOLS/target_size_report.sh" ${1+"$@"}
-}
-
-# tool_target_aged <days> <args>: tool_target with the age cut set.
-tool_target_aged() {
-    local days="$1"
-    shift
-    MAX_AGE_DAYS="$days" tool_target ${1+"$@"}
+    place_tool
+    st_bounded 60 bash "$SCRATCH_TOOLS/gc.sh" target --warn-gb "${1:-50}"
 }
 
 # ---- planting ------------------------------------------------------------------------------
@@ -139,7 +142,7 @@ plant_traces() {
     bundle t8 1
 }
 
-# ---- target_gc.sh --------------------------------------------------------------------------
+# ---- target --------------------------------------------------------------------------
 
 ALL_PROFILES="criterion dev doc release release-debug release-perf"
 
@@ -162,11 +165,11 @@ disk_case "target report --all: still deletes nothing" 0 left_target "$ALL_PROFI
 
 plant_profiles
 disk_case "target: MAX_AGE_DAYS=3 moves the age cut down" 0 left_target "criterion doc release release-perf" \
-    --has "prune   dev" --has "prune   release-debug" --has "touched within 3d" -- tool_target_aged 3 --apply
+    --has "prune   dev" --has "prune   release-debug" --has "touched within 3d" -- tool_target --max-age-days 3 --apply
 
 plant_profiles
 disk_case "target: MAX_AGE_DAYS=10 moves the age cut up" 0 left_target "$ALL_PROFILES" \
-    --lacks "prune   " --has "touched within 10d" -- tool_target_aged 10 --apply
+    --lacks "prune   " --has "touched within 10d" -- tool_target --max-age-days 10 --apply
 
 plant_profiles
 disk_case "target: a profile 6.5 days old stays under the 7 day cut" 0 left_target "criterion doc release release-debug release-perf" \
@@ -186,7 +189,30 @@ plant_profiles
 disk_case "target: an unknown argument is a usage error, even after --apply, and deletes nothing" 2 left_target "$ALL_PROFILES" \
     --has "unknown argument: --bogus" -- tool_target --apply --bogus
 
-# ---- traces_gc.sh --------------------------------------------------------------------------
+plant_profiles
+disk_case "target: MAX_AGE_DAYS in the environment is not read" 0 left_target "criterion doc release release-debug release-perf" \
+    --has "prune   dev" --has "touched within 7d" --lacks "prune   release" -- tool_env_age --apply
+
+plant_profiles
+disk_case "target: a non-numeric --max-age-days is a usage error and deletes nothing" 2 left_target "$ALL_PROFILES" \
+    --has "--max-age-days must be a whole number (got 'abc')" --has "usage:" -- tool_target --apply --max-age-days abc
+disk_case "target: a negative --max-age-days is a usage error and deletes nothing" 2 left_target "$ALL_PROFILES" \
+    --has "--max-age-days must be a whole number (got '-1')" -- tool_target --apply --max-age-days -1
+disk_case "target: an empty --max-age-days is a usage error and deletes nothing" 2 left_target "$ALL_PROFILES" \
+    --has "--max-age-days must be a whole number (got '')" -- tool_target --apply --max-age-days ""
+disk_case "target: --max-age-days with no value is a usage error and deletes nothing" 2 left_target "$ALL_PROFILES" \
+    --has "--max-age-days needs a value" -- tool_target --apply --max-age-days
+disk_case "target: a --max-age-days past nine digits is a usage error and deletes nothing" 2 left_target "$ALL_PROFILES" \
+    --has "--max-age-days is too large (got '1234567890')" -- tool_target --apply --max-age-days 1234567890
+disk_case "target: a flag of the traces mode is a usage error and deletes nothing" 2 left_target "$ALL_PROFILES" \
+    --has "--max-count does not apply to the target mode" -- tool_target --apply --max-count 3
+disk_case "target: the size report takes no --apply and deletes nothing" 2 left_target "$ALL_PROFILES" \
+    --has "--warn-gb is the size report" -- tool_target --warn-gb 50 --apply
+
+disk_case "gc: an unknown mode is a usage error and deletes nothing" 2 left_target "$ALL_PROFILES" \
+    --has "needs a mode, target or traces (got 'bogus')" --has "usage:" -- tool_mode bogus --apply
+
+# ---- traces --------------------------------------------------------------------------
 
 ALL_BUNDLES="t1 t2 t3 t4 t5 t6 t7 t8"
 
@@ -309,10 +335,18 @@ disk_case "traces: a flag with no value is a usage error" 2 left_traces "$ALL_BU
     --has "--max-count needs a value" -- tool_traces --apply --max-count
 disk_case "traces: a value that is not a whole number is a usage error" 2 left_traces "$ALL_BUNDLES" \
     --has "--max-total-gb must be a whole number (got 'x')" -- tool_traces --apply --max-total-gb x
+disk_case "traces: a negative number is a usage error and deletes nothing" 2 left_traces "$ALL_BUNDLES" \
+    --has "--max-age-days must be a whole number (got '-1')" -- tool_traces --apply --max-age-days -1
+disk_case "traces: a non-numeric --max-count is a usage error and deletes nothing" 2 left_traces "$ALL_BUNDLES" \
+    --has "--max-count must be a whole number (got 'abc')" -- tool_traces --apply --max-count abc
+disk_case "traces: a number past nine digits is a usage error and deletes nothing" 2 left_traces "$ALL_BUNDLES" \
+    --has "--max-total-gb is too large (got '1234567890')" -- tool_traces --apply --max-total-gb 1234567890
+disk_case "traces: a flag of the target mode is a usage error and deletes nothing" 2 left_traces "$ALL_BUNDLES" \
+    --has "--warn-gb does not apply to the traces mode" -- tool_traces --apply --warn-gb 5
 disk_case "traces: --help prints the usage and deletes nothing" 0 left_traces "$ALL_BUNDLES" \
     --has "usage:" -- tool_traces --apply --help
 
-# ---- target_size_report.sh -----------------------------------------------------------------
+# ---- target --warn-gb -----------------------------------------------------------------
 
 # sized_target <kb>: a target/ that `du` reports at <kb>.
 sized_target() {
@@ -330,6 +364,9 @@ sized_target $((10 * GIB_KB))
 st_case "size report: a custom threshold is read from the first argument" 0 --has "target/ is 10G (>= 10G advisory threshold)" -- tool_report 10
 sized_target $((10 * GIB_KB))
 st_case "size report: a custom threshold above the size prints no hint" 0 --lacks "advisory threshold" -- tool_report 11
+sized_target $((60 * GIB_KB))
+st_case "size report: a non-numeric threshold is a usage error" 2 --has "--warn-gb must be a whole number (got 'abc')" --lacks "target/: " -- tool_report abc
+st_case "size report: a negative threshold is a usage error" 2 --has "--warn-gb must be a whole number (got '-5')" --lacks "target/: " -- tool_report -5
 rm -rf "$SCRATCH_REPO/target"
 st_case "size report: no target/ is a no-op" 0 --has "target/ absent" -- tool_report
 

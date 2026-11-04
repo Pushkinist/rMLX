@@ -310,7 +310,7 @@ answerable offline, how many times is not.
 make traces-gc                                   # report what is over the caps
 make traces-gc APPLY=1                           # enforce them
 make traces-gc APPLY=1 MAX_COUNT=12 MAX_TOTAL_GB=80
-bash scripts/traces_gc.sh --apply --max-age-days 7   # optional age rule
+bash scripts/host/gc.sh traces --apply --max-age-days 7   # optional age rule
 ```
 
 ### Tests

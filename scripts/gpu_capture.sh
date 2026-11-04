@@ -35,7 +35,7 @@
 #   bash scripts/gpu_capture.sh ... --keep-all     # do not enforce the trace cap
 #
 # Output: a .gputrace bundle under .rmlx/traces/, ready to open in Xcode. After
-# a successful capture the trace directory is bounded by scripts/traces_gc.sh
+# a successful capture the trace directory is bounded by scripts/host/gc.sh traces
 # (oldest-first, never the new bundle, every removal printed); --keep-all skips
 # that for a session that wants to keep more than the cap.
 
@@ -196,7 +196,7 @@ echo ""
 if [ "$KEEP_ALL" = "1" ]; then
 	echo "retention: --keep-all, cap not enforced ($(ls -d "$OUT_DIR"/*.gputrace 2>/dev/null | wc -l | tr -d ' ') bundles in $OUT_DIR)"
 else
-	bash scripts/traces_gc.sh --apply --dir "$OUT_DIR"
+	bash scripts/host/gc.sh traces --apply --dir "$OUT_DIR"
 fi
 echo ""
 echo "Offline, no Xcode:"
