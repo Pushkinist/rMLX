@@ -9,7 +9,7 @@ non-default sweep under the default cell, permanently, in an append-only table.
 So this reads the constants rather than restating them, and raises when it
 cannot. A parse that silently falls back to a literal would be the copy again.
 
-`scripts/check_kv_boundary_default_parity.sh` (in `make ci`) checks the other
+`scripts/check/engine_parity.sh kv-boundary-default` (in `make ci`) checks the other
 direction: that the CLI help and `docs/CLI.md` still name the same pair.
 """
 

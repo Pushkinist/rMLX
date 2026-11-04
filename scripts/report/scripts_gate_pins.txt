@@ -21,14 +21,10 @@ class bench_llama_ab_selftest.sh
 class check_eval_lock.sh
 class check_gpu_device_census.sh
 class check_gpu_device_census_selftest.sh
-class check_kv_boundary_default_parity.sh
-class check_kv_byte_model_parity.sh
-class check_kv_codec_disposition.sh
 class check_kv_layer_quants.sh
 class check_no_decode_swallow.sh
 class check_no_inline_tests.sh
 class check_published_samples_fixtures.sh
-class check_spec_metric_parity.sh
 class codec_smoke_runner_selftest.sh
 class convert_silero_vad.py
 class eval/wikitext2_ppl.py
@@ -79,11 +75,7 @@ usage bench_llama_ab.sh
 usage bench_llama_ab_selftest.sh
 usage check_eval_lock.sh
 usage check_gpu_device_census_selftest.sh
-usage check_kv_boundary_default_parity.sh
-usage check_kv_byte_model_parity.sh
-usage check_kv_codec_disposition.sh
 usage check_published_samples_fixtures.sh
-usage check_spec_metric_parity.sh
 usage codec_smoke_runner_selftest.sh
 usage eval/wikitext2_ppl.py
 usage eval_lock_stress.sh
@@ -134,11 +126,7 @@ exit-undeclared bench_llama_ab.sh 0,125
 exit-undeclared bench_llama_ab_selftest.sh 1
 exit-undeclared check_eval_lock.sh 1
 exit-undeclared check_gpu_device_census.sh 2
-exit-undeclared check_kv_boundary_default_parity.sh 1,2
-exit-undeclared check_kv_byte_model_parity.sh 1,2
-exit-undeclared check_kv_codec_disposition.sh 1,2
 exit-undeclared check_published_samples_fixtures.sh 1
-exit-undeclared check_spec_metric_parity.sh 2
 exit-undeclared codec_smoke_runner_selftest.sh 0,1
 exit-undeclared eval/wikitext2_ppl.py 1
 exit-undeclared eval_lock_stress.sh 1
@@ -230,8 +218,6 @@ set-mode bench_identity_selftest.sh
 set-mode bench_llama_ab.sh
 set-mode bench_llama_ab_selftest.sh
 set-mode check_gpu_device_census.sh
-set-mode check_kv_byte_model_parity.sh
-set-mode check_kv_codec_disposition.sh
 set-mode codec_smoke_runner_selftest.sh
 set-mode gpu_capture.sh
 set-mode gputrace_preflight.sh
@@ -351,7 +337,6 @@ env-knob spec_bench.sh BENCH_PROMPT,BENCH_PROMPT_FILE,BENCH_PROMPT_NAME,DRAFTER_
 env-knob spec_bench_published.sh KV_QUANT_SEEN,MEMORY_PID,RMLX_HOME,SAMPLING_SEEN,SERVER_PID
 env-knob spec_bench_selftest.sh OUT_PATH
 env-knob ssd_canary.sh PORT,SSD_GB,VERIFIER_MODEL
-unguarded-array check_kv_codec_disposition.sh BANNER_DOCS
 unguarded-array check_published_samples_fixtures.sh args
 unguarded-array mst_capture.sh run_cmd
 unguarded-array perf_ab.sh A_KV,A_MEM,A_TPS,B_KV,B_MEM,B_TPS,MODELS

@@ -1,23 +1,21 @@
 #!/usr/bin/env bash
-# Recall test for the four engine-parity gates: one case group per gate, rule and exit code.
+# Recall test for the four engine-parity modes: one case group per mode, rule and exit code.
 #
-# Recall test for: check_kv_byte_model_parity.sh
-#                  check_kv_codec_disposition.sh
-#                  check_kv_boundary_default_parity.sh
-#                  check_spec_metric_parity.sh
+# Recall test for: check/engine_parity.sh kv-byte-model kv-codec-disposition kv-boundary-default spec-metrics
 #
-# Each gate holds a restatement of an engine fact to the engine, and each is one regex edit away
+# Each mode holds a restatement of an engine fact to the engine, and each is one regex edit away
 # from matching nothing and going permanently green. Every case makes one edit to a manifest or
 # to a synthetic scan root and asserts the literal exit code and the reason: a gate that
 # refuses for the wrong reason stops refusing when that reason moves, and "nothing was looked at"
 # (exit 2) must never read as "a violation was found" (exit 1) or as green.
 #
-# The four gates are named in one place each, the functions `gate_byte_model`,
+# The four modes are named in one place each, the functions `gate_byte_model`,
 # `gate_codec_disposition`, `gate_boundary_default` and `gate_spec_metrics`. The byte-model
 # cases need no byte count: the passing manifest is produced by `perf_ceiling.py --byte-model`
 # from a skeleton. The codec-disposition cases copy `scripts/fixtures/kv_codec_disposition/base/`
-# and make one edit. The boundary and spec-metric gates read fixed repo paths, so each case runs
-# a copy of the gate inside a scratch tree holding the files it reads.
+# and make one edit. The boundary and spec-metric modes read fixed repo paths, so each case runs
+# a copy of the tool inside a scratch tree holding the files it reads. Two cases in the
+# byte-model group run the tool with no mode and with an unknown one.
 #
 # Usage:  bash scripts/check/engine_parity_selftest.sh [<kv-byte-model|kv-codec-disposition|
 #         kv-boundary-default|spec-metrics>]
@@ -46,36 +44,36 @@ esac
 
 PERF_CEILING="$REPO_ROOT/scripts/perf_ceiling.py"
 CODEC_BASE="$REPO_ROOT/scripts/fixtures/kv_codec_disposition/base"
-CODEC_GATE="$REPO_ROOT/scripts/check_kv_codec_disposition.sh"
+ENGINE_PARITY="$REPO_ROOT/scripts/check/engine_parity.sh"
 
 # ---- the gates, one function each ------------------------------------------------------------
 
 # gate_byte_model <manifest>: the byte-model gate over a pre-captured manifest.
 gate_byte_model() {
-    bash "$REPO_ROOT/scripts/check_kv_byte_model_parity.sh" "$1"
+    bash "$ENGINE_PARITY" kv-byte-model "$1"
 }
 
-# gate_codec_disposition <scan-root> [<gate-file>]: the disposition gate over a scan root,
-# or an edited copy of it.
+# gate_codec_disposition <scan-root> [<tool-file>]: the disposition mode over a scan root,
+# or an edited copy of the tool.
 gate_codec_disposition() {
-    bash "${2:-$CODEC_GATE}" "$1"
+    bash "${2:-$ENGINE_PARITY}" kv-codec-disposition "$1"
 }
 
-# gate_boundary_default <scan-root>: the boundary gate and the resolver module it imports, copied
-# into the root and run there.
+# gate_boundary_default <scan-root>: the tool and the resolver module it imports, copied into the
+# root and run there.
 gate_boundary_default() {
-    mkdir -p "$1/scripts/lib"
-    cp -f "$REPO_ROOT/scripts/check_kv_boundary_default_parity.sh" "$1/scripts/"
+    mkdir -p "$1/scripts/lib" "$1/scripts/check"
+    cp -f "$ENGINE_PARITY" "$1/scripts/check/"
     [ -e "$1/scripts/lib/kv_boundary_default.py" ] ||
         cp -f "$REPO_ROOT/scripts/lib/kv_boundary_default.py" "$1/scripts/lib/"
-    env -u RMLX_REPO_ROOT bash "$1/scripts/check_kv_boundary_default_parity.sh"
+    env -u RMLX_REPO_ROOT bash "$1/scripts/check/engine_parity.sh" kv-boundary-default
 }
 
-# gate_spec_metrics <scan-root>: the spec-metric gate, copied into the root and run there.
+# gate_spec_metrics <scan-root>: the tool, copied into the root and run there.
 gate_spec_metrics() {
-    mkdir -p "$1/scripts"
-    cp -f "$REPO_ROOT/scripts/check_spec_metric_parity.sh" "$1/scripts/"
-    bash "$1/scripts/check_spec_metric_parity.sh"
+    mkdir -p "$1/scripts/check"
+    cp -f "$ENGINE_PARITY" "$1/scripts/check/"
+    bash "$1/scripts/check/engine_parity.sh" spec-metrics
 }
 
 # ---- shared planting -------------------------------------------------------------------------
@@ -195,6 +193,9 @@ EOF
     : >"$w/rows.empty"
     wrap "$w/rows.empty" "$w/empty.manifest" 0
     bm "empty manifest" "$w/empty.manifest" 2 "the manifest is empty"
+
+    st_case "usage_no_mode" 2 --has "usage: engine_parity.sh" -- bash "$ENGINE_PARITY"
+    st_case "usage_unknown_mode" 2 --has "usage: engine_parity.sh" -- bash "$ENGINE_PARITY" no-such-mode
 }
 
 # ---- kv-codec-disposition --------------------------------------------------------------------
@@ -298,10 +299,10 @@ OTHER
         ;;
     rule10_empty_list)
         # The list is config inside the gate, so this case runs an edited copy of the gate.
-        sed 's/^BANNER_DOCS=(.*)$/BANNER_DOCS=()/' "$CODEC_GATE" >"$dir/gate.sh"
+        sed 's/^BANNER_DOCS=(.*)$/BANNER_DOCS=()/' "$ENGINE_PARITY" >"$dir/gate.sh"
         ;;
     rule10_duplicate_list_entry)
-        sed 's/^BANNER_DOCS=(\(.*\))$/BANNER_DOCS=(\1 KV_CODECS.md)/' "$CODEC_GATE" >"$dir/gate.sh"
+        sed 's/^BANNER_DOCS=(\(.*\))$/BANNER_DOCS=(\1 KV_CODECS.md)/' "$ENGINE_PARITY" >"$dir/gate.sh"
         ;;
     rule10_listed_doc_missing)
         rm -f "$dir/KV_ROTATION_CODECS.md"
@@ -370,7 +371,7 @@ codec_disposition_cases() {
         IFS='|' read -r name want_exit want_msg what <<<"$entry"
         dir="$ST_WORK/$name"
         build_case "$name" "$dir"
-        gate="$CODEC_GATE"
+        gate="$ENGINE_PARITY"
         if [ -f "$dir/gate.sh" ]; then gate="$dir/gate.sh"; fi
         st_case "$name" "$want_exit" --what "$what" --has "$want_msg" -- gate_codec_disposition "$dir" "$gate"
     done
@@ -435,13 +436,18 @@ boundary_default_cases() {
     bd_case "oracle_constant_renamed" 2 "cannot read DEFAULT_BOUNDARY_{HEAD,TAIL}_N" \
         crates/rmlx-core/src/kv_boundary.rs 'DEFAULT_BOUNDARY_TAIL_N' 'DEFAULT_TAIL_N'
 
+    dir="$(bd_root oracle_file_missing)"
+    rm -f "$dir/crates/rmlx-core/src/kv_boundary.rs"
+    st_case "oracle_file_missing" 2 --has "missing crates/rmlx-core/src/kv_boundary.rs" \
+        -- gate_boundary_default "$dir"
+
     dir="$(bd_root cli_source_missing)"
     rm -f "$dir/crates/rmlx-cli/src/main.rs"
-    st_case "cli_source_missing" 1 --has "names no" -- gate_boundary_default "$dir"
+    st_case "cli_source_missing" 2 --has "missing crates/rmlx-cli/src/main.rs" -- gate_boundary_default "$dir"
 
     dir="$(bd_root doc_missing)"
     rm -f "$dir/docs/CLI.md"
-    st_case "doc_missing" 1 --has "documents no --kv-boundary-layers flag" -- gate_boundary_default "$dir"
+    st_case "doc_missing" 2 --has "missing docs/CLI.md" -- gate_boundary_default "$dir"
 
     dir="$(bd_root resolver_disagrees)"
     mkdir -p "$dir/scripts/lib"

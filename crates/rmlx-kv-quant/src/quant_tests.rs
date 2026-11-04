@@ -1258,7 +1258,7 @@ fn surface_stem(q: KvQuant) -> String {
 }
 
 /// Print one line per codec, classified by the runtime's own predicates, for
-/// `scripts/check_kv_codec_disposition.sh` to check the CLI help and
+/// `scripts/check/engine_parity.sh kv-codec-disposition` to check the CLI help and
 /// the INERT banners in `docs/KV_CODECS.md` and `docs/KV_ROTATION_CODECS.md`
 /// against.
 ///

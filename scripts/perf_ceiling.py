@@ -1033,7 +1033,7 @@ def emit_byte_model(lines: list[str]) -> int:
     the codec sweep, the shapes and the layer count all come from the Rust side,
     so this mode adds no second list of what to cover. Output carries the same
     key fields with this script's value in the last column, which is what
-    `scripts/check_kv_byte_model_parity.sh` diffs.
+    `scripts/check/engine_parity.sh kv-byte-model` diffs.
     """
     rows = 0
     for raw in lines:

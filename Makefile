@@ -522,26 +522,26 @@ check-kv-layer-quants-fixtures: ## CI gate: recall test for the above, 24 plante
 	@bash scripts/check/rust_gates_fixtures.sh kv_layer_quants
 
 check-kv-codec-disposition: ## CI gate: fail if the --kv-quant/--kv-bits help or the INERT banner docs contradict a codec's runtime disposition
-	@bash scripts/check_kv_codec_disposition.sh
+	@bash scripts/check/engine_parity.sh kv-codec-disposition
 
 check-kv-codec-disposition-fixtures: ## CI gate: recall test for the above — 25 synthetic scan roots, each asserting which rule fired
 	@bash scripts/check/engine_parity_selftest.sh kv-codec-disposition
 
 check-kv-byte-model-parity: ## CI gate: fail if scripts/perf_ceiling.py's KV byte model disagrees with the engine's
-	@bash scripts/check_kv_byte_model_parity.sh
+	@bash scripts/check/engine_parity.sh kv-byte-model
 
-check-kv-byte-model-parity-fixtures: ## CI gate: recall test for the above — 9 synthetic manifests, each asserting which check fired
+check-kv-byte-model-parity-fixtures: ## CI gate: recall test for the above — 9 synthetic manifests and the two usage errors, each asserting which check fired
 	@bash scripts/check/engine_parity_selftest.sh kv-byte-model
 
 check-kv-boundary-default-parity: ## CI gate: fail if the CLI help, docs/CLI.md or the ingest resolver names a different default KV boundary than the engine
-	@bash scripts/check_kv_boundary_default_parity.sh
+	@bash scripts/check/engine_parity.sh kv-boundary-default
 
-check-kv-boundary-default-parity-fixtures: ## CI gate: recall test for the above — 14 planted scan roots, each asserting the reason as well as the exit code
+check-kv-boundary-default-parity-fixtures: ## CI gate: recall test for the above — 15 planted scan roots, each asserting the reason as well as the exit code
 	@bash scripts/check/engine_parity_selftest.sh kv-boundary-default
 
 .PHONY: check-spec-metric-parity
 check-spec-metric-parity: ## CI gate: fail if the speculative metrics the engine declares are not the ones the bench records
-	@bash scripts/check_spec_metric_parity.sh
+	@bash scripts/check/engine_parity.sh spec-metrics
 
 .PHONY: check-spec-metric-parity-fixtures
 check-spec-metric-parity-fixtures: ## CI gate: recall test for the above — one synthetic scan root per case, asserting the reason as well as the exit code
@@ -753,13 +753,13 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check/rust_gates_fixtures.sh scalar_f32_leak
 	@bash scripts/check_kv_layer_quants.sh
 	@bash scripts/check/rust_gates_fixtures.sh kv_layer_quants
-	@bash scripts/check_kv_codec_disposition.sh
+	@bash scripts/check/engine_parity.sh kv-codec-disposition
 	@bash scripts/check/engine_parity_selftest.sh kv-codec-disposition
-	@bash scripts/check_kv_byte_model_parity.sh
+	@bash scripts/check/engine_parity.sh kv-byte-model
 	@bash scripts/check/engine_parity_selftest.sh kv-byte-model
-	@bash scripts/check_kv_boundary_default_parity.sh
+	@bash scripts/check/engine_parity.sh kv-boundary-default
 	@bash scripts/check/engine_parity_selftest.sh kv-boundary-default
-	@bash scripts/check_spec_metric_parity.sh
+	@bash scripts/check/engine_parity.sh spec-metrics
 	@bash scripts/check/engine_parity_selftest.sh spec-metrics
 	@bash scripts/check/spec_round_loops.sh sampling
 	@bash scripts/check/spec_round_loops_selftest.sh sampling

@@ -57,8 +57,8 @@ doc the same way, or no gate sees a cut that deletes its figure.
 
 Readers of doc text that this script does not parse have their own gates:
 the INERT banners of docs/KV_CODECS.md and docs/KV_ROTATION_CODECS.md
-(check_kv_codec_disposition.sh), the
-`--kv-boundary-layers` rows of docs/CLI.md (check_kv_boundary_default_parity.sh)
+(check/engine_parity.sh kv-codec-disposition), the
+`--kv-boundary-layers` rows of docs/CLI.md (check/engine_parity.sh kv-boundary-default)
 and the generated docs/PUBLISHED_PROTOCOL.md (make check-published-table).
 `make check-doc-consumers` runs those, this script and its `--source-paths` mode.
 
