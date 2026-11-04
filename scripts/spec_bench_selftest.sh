@@ -65,6 +65,7 @@ chmod +x "$SHIM_DIR/sleep"
 # ── Stub server ───────────────────────────────────────────────────────────────
 
 SERVER_PY="$WORK/stub_server.py"
+st_stub_http "$WORK"
 cat >"$SERVER_PY" <<'PYEOF'
 """Canned OpenAI-compatible server for the spec_bench selftest.
 
@@ -130,19 +131,14 @@ them:
                        request, `arm` being `spec` on the speculative server
 """
 
-import argparse
 import json
 import os
 import statistics
 import sys
-import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
-parser = argparse.ArgumentParser()
-parser.add_argument("port", type=int)
-parser.add_argument("--marks", default="")
-parser.add_argument("--hold", default="")
-parser.add_argument("--hold-wait", type=float, default=300.0)
+from stub_http import StubHandler, make_parser, note_client_mark, serve
+
+parser = make_parser()
 parser.add_argument("--requests", default="")
 ARGS = parser.parse_args()
 
@@ -325,19 +321,6 @@ def write_request_events(raw_rate=None):
             handle.write(done_line(raw_rate) + "\n")
 
 
-def note_client_mark():
-    """Note in the marks directory whether the client that sent this request
-    was already running."""
-    seen = os.path.join(ARGS.marks, "seen")
-    number = 1
-    if os.path.exists(seen):
-        with open(seen, encoding="utf-8") as handle:
-            number += len(handle.readlines())
-    up = os.path.exists(os.path.join(ARGS.marks, f"mark.{number}"))
-    with open(seen, "a", encoding="utf-8") as handle:
-        handle.write("up\n" if up else "down\n")
-
-
 def same_request_as_before(request):
     """Whether this request asks for the answer the first one asked for."""
     fields = {k: request.get(k) for k in ("messages", "max_tokens", "temperature", "seed")}
@@ -373,18 +356,7 @@ def completion_body(request):
     return {"object": "chat.completion", "choices": [choice], "usage": usage}
 
 
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *_args):
-        pass
-
-    def _json(self, body):
-        raw = json.dumps(body).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
-
+class Handler(StubHandler):
     def do_GET(self):
         if self.path.startswith("/metrics/cache"):
             self._json({"models": [], "ttft": [], "itl": itl_ring})
@@ -395,7 +367,7 @@ class Handler(BaseHTTPRequestHandler):
         global served
         request = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
         if ARGS.marks:
-            note_client_mark()
+            note_client_mark(ARGS.marks)
         if not same_request_as_before(request):
             self.send_error(400)
             return
@@ -410,24 +382,8 @@ class Handler(BaseHTTPRequestHandler):
             write_request_events('"Some(20.0)"')
             self._json({"detail": "not a completion"} if UNSTREAMED_BODY == "junk" else completion_body(request))
             return
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.end_headers()
-
-        def chunk(payload, sent_at=None):
-            if sent_at is not None:
-                self.wfile.write(f": sent-at={sent_at}\n".encode())
-            self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode())
-            self.wfile.flush()
-
-        chunk({"choices": [{"delta": {"role": "assistant"}, "index": 0}]}, 0.0)
-        if ARGS.hold:
-            open(ARGS.hold + ".held", "w").close()
-            # A poll for the file the case creates; the limit ends a stub whose
-            # case has died.
-            deadline = time.monotonic() + ARGS.hold_wait
-            while not os.path.exists(ARGS.hold + ".release") and time.monotonic() < deadline:
-                time.sleep(0.05)
+        chunk = self.open_stream()
+        self.role_chunk_then_hold(chunk, ARGS)
         sends = []
         for i in range(TOKENS):
             due = PREFILL_S + i * GAP_S
@@ -448,15 +404,10 @@ class Handler(BaseHTTPRequestHandler):
                 handle.write(done_line() + "\n")
         served += 1
 
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.wfile.flush()
+        self.close_stream()
 
 
-server = HTTPServer(("127.0.0.1", ARGS.port), Handler)
-if BOUND_FLAG:
-    with open(BOUND_FLAG, "a", encoding="utf-8") as handle:
-        handle.write(f"{os.getpid()}\n")
-server.serve_forever()
+serve(Handler, ARGS.port, BOUND_FLAG)
 PYEOF
 
 # stop_stubs <bound-file> — stop every stub server a case started, by the PID

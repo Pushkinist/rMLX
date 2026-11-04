@@ -15,6 +15,110 @@
 # stand-in for `python3` that stands between the harness and the client reader.
 # They and bench_llama_ab_selftest.sh need a wait that cannot hang.
 
+# st_stub_http <dir> — write stub_http.py into <dir>, beside the stub server file
+# that imports it. It is what the two spec-bench tests' stub servers share; each
+# test's own stub holds only what it answers.
+st_stub_http() {
+	cat >"$1/stub_http.py" <<'PYEOF'
+"""The shared body of the canned OpenAI-compatible servers the spec-bench recall tests run.
+
+Each recall test writes its own stub server, which holds what it answers, and
+imports this file for how it answers: the command-line options both take, the
+JSON and text replies, the SSE stream with its `: sent-at=` stamps, the marks and
+hold hooks that let a case act on a request in flight, and the bound-flag file.
+"""
+
+import argparse
+import json
+import os
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
+
+
+def make_parser():
+    """The options every stub takes after the port; the caller adds its own."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("port", type=int)
+    parser.add_argument("--marks", default="")
+    parser.add_argument("--hold", default="")
+    parser.add_argument("--hold-wait", type=float, default=300.0)
+    return parser
+
+
+def note_client_mark(marks_dir):
+    """Note in `marks_dir/seen` whether the client that sent this request was
+    already running: whether it had left `mark.N` for the Nth request."""
+    seen = os.path.join(marks_dir, "seen")
+    number = 1
+    if os.path.exists(seen):
+        with open(seen, encoding="utf-8") as handle:
+            number += len(handle.readlines())
+    up = os.path.exists(os.path.join(marks_dir, f"mark.{number}"))
+    with open(seen, "a", encoding="utf-8") as handle:
+        handle.write("up\n" if up else "down\n")
+
+
+class StubHandler(BaseHTTPRequestHandler):
+    def log_message(self, *_args):
+        pass
+
+    def _reply(self, content_type, raw):
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _json(self, body):
+        self._reply("application/json", json.dumps(body).encode())
+
+    def _text(self, body):
+        self._reply("text/plain; version=0.0.4", body.encode())
+
+    def open_stream(self):
+        """Send the stream's headers; return the fn that writes one SSE chunk,
+        preceded by the `: sent-at=<seconds>` stamp when it is given one."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+
+        def chunk(payload, sent_at=None):
+            if sent_at is not None:
+                self.wfile.write(f": sent-at={sent_at}\n".encode())
+            self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode())
+            self.wfile.flush()
+
+        return chunk
+
+    def role_chunk_then_hold(self, chunk, args):
+        """Write the role chunk; with `--hold`, create `PREFIX.held` and wait for
+        `PREFIX.release`, so a case can act while the request is in flight."""
+        chunk({"choices": [{"delta": {"role": "assistant"}, "index": 0}]}, 0.0)
+        if args.hold:
+            open(args.hold + ".held", "w").close()
+            # The limit ends a stub whose case has died.
+            deadline = time.monotonic() + args.hold_wait
+            while not os.path.exists(args.hold + ".release") and time.monotonic() < deadline:
+                time.sleep(0.05)
+
+    def close_stream(self):
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
+
+def serve(handler, port, bound_flag, threaded=False):
+    """Bind, record this process in the `bound_flag` file when it is set, and serve."""
+    server_class = ThreadingHTTPServer if threaded else HTTPServer
+    server = server_class(("127.0.0.1", port), handler)
+    if threaded:
+        server.daemon_threads = True
+    if bound_flag:
+        with open(bound_flag, "a", encoding="utf-8") as handle:
+            handle.write(f"{os.getpid()}\n")
+    server.serve_forever()
+PYEOF
+}
+
 # st_init <suite> — zero the counters and make the scratch directory ST_WORK,
 # removed when the harness exits.
 st_init() {

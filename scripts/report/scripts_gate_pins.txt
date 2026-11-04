@@ -247,8 +247,8 @@ size report/kv_census_selftest.sh 1212
 size run_gpu_tests.sh 1322
 size spec_bench.sh 1169
 size spec_bench_published.sh 1185
-size spec_bench_published_selftest.sh 2842
-size spec_bench_selftest.sh 1924
+size spec_bench_published_selftest.sh 2790
+size spec_bench_selftest.sh 1875
 size ssd_canary.sh 1283
 heredoc bench_cell.sh 40,30
 heredoc bench_llama_ab.sh 30,27
@@ -278,7 +278,7 @@ twin published_table_selftest.sh+spec_bench_published_selftest.sh 82
 twin published_table_selftest.sh+spec_bench_selftest.sh 81
 twin spec_bench.sh+spec_bench_published.sh 51
 twin spec_bench.sh+ssd_canary.sh 95
-twin spec_bench_published_selftest.sh+spec_bench_selftest.sh 229
+twin spec_bench_published_selftest.sh+spec_bench_selftest.sh 199
 lib-shadow perf-iter/bench_decode_tps.sh field_of
 lib-shadow schema_constraint_canary.sh wait_for_server
 lib-shadow ssd_canary.sh wait_for_server

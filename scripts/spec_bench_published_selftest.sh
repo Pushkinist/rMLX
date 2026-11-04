@@ -249,6 +249,7 @@ chmod +x "${WORK}/quiet/ps" "${WORK}/hostile/ps" "${WORK}/flaky/ps"
 # ── Stub server ───────────────────────────────────────────────────────────────
 
 SERVER_PY="${WORK}/stub_server.py"
+st_stub_http "${WORK}"
 cat >"${SERVER_PY}" <<'PYEOF'
 """Canned OpenAI-compatible server for the published-harness selftest.
 
@@ -312,20 +313,15 @@ window agrees with it. STUB_ITL_MEAN_MS overrides the first, which is how a
 disagreement is staged.
 """
 
-import argparse
 import hashlib
 import json
 import os
 import sys
 import threading
-import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-parser = argparse.ArgumentParser()
-parser.add_argument("port", type=int)
-parser.add_argument("--marks", default="")
-parser.add_argument("--hold", default="")
-parser.add_argument("--hold-wait", type=float, default=300.0)
+from stub_http import StubHandler, make_parser, note_client_mark, serve
+
+parser = make_parser()
 parser.add_argument("--sample-wait", type=float, default=120.0)
 parser.add_argument("--inflight-log", default="")
 ARGS = parser.parse_args()
@@ -503,26 +499,7 @@ def log(line):
         handle.write(line + "\n")
 
 
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *_args):
-        pass
-
-    def _json(self, body):
-        raw = json.dumps(body).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
-
-    def _text(self, body):
-        raw = body.encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; version=0.0.4")
-        self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
-
+class Handler(StubHandler):
     def do_GET(self):
         global metrics_in_flight
         if self.path == "/metrics":
@@ -611,33 +588,10 @@ class Handler(BaseHTTPRequestHandler):
     def _stream(self, request, readings_before):
         global served
         this_gap_ms = gap_ms()
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.end_headers()
-
-        def chunk(payload, sent_at=None):
-            if sent_at is not None:
-                self.wfile.write(f": sent-at={sent_at}\n".encode())
-            self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode())
-            self.wfile.flush()
-
+        chunk = self.open_stream()
         if ARGS.marks:
-            seen = os.path.join(ARGS.marks, "seen")
-            number = 1
-            if os.path.exists(seen):
-                with open(seen, encoding="utf-8") as handle:
-                    number += len(handle.readlines())
-            up = os.path.exists(os.path.join(ARGS.marks, f"mark.{number}"))
-            with open(seen, "a", encoding="utf-8") as handle:
-                handle.write("up\n" if up else "down\n")
-        chunk({"choices": [{"delta": {"role": "assistant"}, "index": 0}]}, 0.0)
-        if ARGS.hold:
-            open(ARGS.hold + ".held", "w").close()
-            # A poll for the file the case creates; the limit ends a stub whose
-            # case has died.
-            deadline = time.monotonic() + ARGS.hold_wait
-            while not os.path.exists(ARGS.hold + ".release") and time.monotonic() < deadline:
-                time.sleep(0.05)
+            note_client_mark(ARGS.marks)
+        self.role_chunk_then_hold(chunk, ARGS)
         if not SPECULATIVE and served == 1:
             with FLIGHT:
                 FLIGHT.wait_for(lambda: metrics_in_flight > readings_before,
@@ -697,16 +651,10 @@ class Handler(BaseHTTPRequestHandler):
             log(done_line(round(1000.0 / this_gap_ms, 6)))
         served += 1
 
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.wfile.flush()
+        self.close_stream()
 
 
-server = ThreadingHTTPServer(("127.0.0.1", ARGS.port), Handler)
-server.daemon_threads = True
-if BOUND_FLAG:
-    with open(BOUND_FLAG, "a", encoding="utf-8") as handle:
-        handle.write(f"{os.getpid()}\n")
-server.serve_forever()
+serve(Handler, ARGS.port, BOUND_FLAG, threaded=True)
 PYEOF
 
 # stop_stubs <bound-file> — stop every stub server a case started, by the PID
