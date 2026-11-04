@@ -197,6 +197,9 @@ comment):
 | 78 | passthrough: `rmlx` refused the configuration (EX_CONFIG) |
 | 125 | a measurement precondition failed; `git bisect` skips |
 
+The gate checks that a file declares every code it uses (`exit-undeclared`,
+section 3); that a code means what this table says is the reviewer's. [review]
+
 ## 5. Shell and Python
 
 * Python for parsing, arithmetic, JSON, SQLite, HTTP and source scanning;
@@ -274,6 +277,9 @@ comment):
 | comment and literal blanking in a Rust scanner | `lib/awk_text.sh` |
 | a snapshot's identity columns | `lib/snapshot_identity.py` |
 | the gated `.metal` directories | `lib/metal_dirs.sh` |
+
+A script uses these and writes no copy of its own. [gate: `lib-shadow` for a
+copy under the same name, section 1; review: a copy under another name]
 
 A harness on the case runner ends in `st_done`, ends early on purpose through
 `st_finish_early`, and sets no EXIT trap of its own: the runner's trap turns an
@@ -386,8 +392,8 @@ the claim file. [gate: `make check-claim-bypass`, tree-wide]
   `$(MAKE) -k` or `$(MAKE) -i`, for every tool of a target only that line
   reaches. The rule does not read what follows `||`, by choice: a `|| exit 1` that
   keeps the failure and a `|| true` that drops it are both pinned when they occur. The three such lines
-  `make ci` holds are pinned: `debt_report.py --file-sizes` and `debt_report.py`
-  (advisory reports, each ending in `|| true`) and
+  in the `make ci` closure are pinned: `debt_report.py --file-sizes` and
+  `debt_report.py` (advisory reports; their `make ci` lines end in `|| true`) and
   `lib/published_table.py` (`... && diff -u ... || { ...; exit 1; }`, which keeps
   the failure).
   [gate: `silenced`]
@@ -402,7 +408,8 @@ the claim file. [gate: `make check-claim-bypass`, tree-wide]
   `size-pin`]
 * `make shellcheck-report` prints the `shellcheck` findings of every shell file
   in `scripts/` (`debt_report.py --shellcheck`), or `skipped: shellcheck not on
-  PATH`. It runs at the end of `make ci`, gates nothing and exits 0.
+  PATH`. It runs at the end of `make ci`, gates nothing and exits 0. No rule
+  makes a finding fail; the reviewer reads the report. [review]
 
 ## 11. Pins
 
@@ -526,6 +533,6 @@ accepts every violation of that rule in that file and can only shrink. [gate]
 * A function defined in `lib/` and redefined outside it by `eval`, or a Python
   function of the same name.
 * The `sg_*` builders in `lib/selftest_support.sh` serve the recall tests of
-  this gate alone and sit in the generic case runner for now, with a third copy
-  of the pinnable list (`SG_PINNABLE`) and the `TOOL` they read pinned as a
-  knob; they move to a module of the gate in a later chunk.
+  this gate alone and sit in the generic case runner, with a third copy of the
+  pinnable list (`SG_PINNABLE`) and the `TOOL` they read pinned as a knob. A
+  reviewer decides whether they belong in a module of the gate. [review]
