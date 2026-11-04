@@ -506,7 +506,7 @@ kv-update-census-selftest: ## CI gate: recall test for the KV structural figures
 check-no-inline-tests: ## CI gate: fail if any non-test.rs file has inline #[cfg(test)] mod tests { ... }
 	@bash scripts/check_no_inline_tests.sh
 
-check-no-inline-tests-fixtures: ## CI gate: recall test for the above, 20 planted scan roots, each asserting the rule or the refusal as well as the exit code
+check-no-inline-tests-fixtures: ## CI gate: recall test for the above, 32 planted scan roots, each asserting the rule or the refusal as well as the exit code
 	@bash scripts/check/rust_gates_fixtures.sh no_inline_tests
 
 check-no-scalar-f32-leak: ## CI gate: fail if arch-layer code has unguarded scalar_f32( not followed by .astype(
