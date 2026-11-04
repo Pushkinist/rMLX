@@ -113,7 +113,7 @@
 //! two token streams — and is refused. Which position the loop was at is the
 //! only thing that separates them, so the loop reports it per emitted token
 //! rather than the gate inferring it from the answer. [`Restriction`] carries
-//! the rule; `scripts/spec_broken_engine.sh` takes the readings the thresholds
+//! the rule; `scripts/spec/broken_engine.sh` takes the readings the thresholds
 //! are set from.
 //!
 //! # Pairs
@@ -4242,7 +4242,7 @@ const ROUND_STREAM_MANIFEST: &str = include_str!(concat!(
 /// The one reader of [`ROUND_STREAM_MANIFEST`].
 const ROUND_STREAM_COMPARE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../scripts/spec_round_stream_compare.py"
+    "/../../scripts/spec/round_stream_compare.py"
 );
 
 /// Whether the manifest pins any cell of `test`. The pairs run past their
@@ -4256,7 +4256,7 @@ fn round_stream_is_pinned(test: &str) -> bool {
 }
 
 /// What a pinned pair's run does with the answer of
-/// `spec_round_stream_compare.py verify --pair`.
+/// `round_stream_compare.py verify --pair`.
 #[derive(Debug, PartialEq, Eq)]
 enum RoundStreamVerdict {
     Matched,
@@ -4292,7 +4292,7 @@ fn check_round_streams(test: &str) {
         .arg(&dir)
         .args(["--pair", test])
         .output()
-        .expect("run spec_round_stream_compare.py");
+        .expect("run round_stream_compare.py");
     let said = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -4560,7 +4560,7 @@ fn the_round_stream_recorder_keeps_a_round_and_charges_no_phase() {
 /// rounds.
 ///
 /// **What a round line carries.** `ROUND_EVENT_FIELDS` decides which events
-/// reach a capture; `spec_round_stream_compare.py` decides which lines it will
+/// reach a capture; `round_stream_compare.py` decides which lines it will
 /// read one back from. The silent direction is the engine gaining a field the
 /// script does not require: the script then accepts a line the engine would not
 /// have written, and a stream missing that field digests as a clean one.
@@ -4574,10 +4574,8 @@ fn the_engine_and_its_readers_state_the_same_target_and_round_fields() {
         env!("CARGO_MANIFEST_DIR"),
         "/src/speculative/round_stats.rs"
     ));
-    const COMPARE: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../scripts/spec_round_stream_compare.py"
-    ));
+    let compare = std::fs::read_to_string(ROUND_STREAM_COMPARE)
+        .expect("read the round-stream compare script");
 
     let target = format!("const PHASE_TARGET: &str = \"{PHASE_SWITCH_TARGET}\";");
     assert!(
@@ -4593,8 +4591,8 @@ fn the_engine_and_its_readers_state_the_same_target_and_round_fields() {
         .join(", ");
     let fields = format!("ROUND_EVENT_FIELDS = ({rendered})");
     assert!(
-        COMPARE.contains(&fields),
-        "`scripts/spec_round_stream_compare.py` does not state `{fields}`, so the \
+        compare.contains(&fields),
+        "`scripts/spec/round_stream_compare.py` does not state `{fields}`, so the \
          filter the engine writes a capture through and the filter that reads one \
          back are two different rules"
     );

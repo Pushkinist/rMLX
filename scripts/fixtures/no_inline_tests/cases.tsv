@@ -1,4 +1,4 @@
-# Planted scan roots for check_no_inline_tests.sh: the inline-block rule, its exemptions and its refusals.
+# Planted scan roots for check/no_inline_tests.sh: the inline-block rule, its exemptions and its refusals.
 #
 # Columns, tab-separated, none empty ("-" for none): fixture (a directory beside this
 # table), args (gate arguments, "{}" is the fixture path), stream (both, out or err: the

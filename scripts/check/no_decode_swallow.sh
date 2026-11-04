@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # CI gate: a failed decode step or prefill chunk propagates instead of looking like a success.
 #
-# Usage:  bash scripts/check_no_decode_swallow.sh [<root>]
+# Usage:  bash scripts/check/no_decode_swallow.sh [<root>]
 # Exit:   0 clean; 1 a violation or a pinned site count off; 2 <root> is no directory
 #
 # <root> is the directory that holds crates/; it defaults to the repository.
@@ -68,7 +68,7 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCAN_ROOT="${1:-${REPO_ROOT}}"
 cd "${SCAN_ROOT}" 2>/dev/null || {
     echo "check_no_decode_swallow: no scan root at ${SCAN_ROOT}" >&2

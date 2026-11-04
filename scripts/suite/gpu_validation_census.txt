@@ -1,6 +1,6 @@
 # The Metal shader-validation hits run_gpu_tests.sh accepts, per (kernel, kind, crate, test).
 #
-# `scripts/run_gpu_tests.sh` instruments every Metal pipeline and scans for
+# `scripts/suite/run_gpu_tests.sh` instruments every Metal pipeline and scans for
 # invalid-access diagnostics. Some of them come from a kernel this repo neither
 # compiles nor can fix, and failing every run on those teaches their readers to
 # read `Error 1` as background noise — at which point the next real hit is

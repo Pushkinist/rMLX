@@ -215,7 +215,7 @@ installed, and prints a note when only one is.
 ## Running the GPU tests: `make gpu-test`
 
 `make test` passes no `--ignored`, and hosted CI has no Metal. `make gpu-test`
-(`scripts/run_gpu_tests.sh`) is the step that runs the GPU tests:
+(`scripts/suite/run_gpu_tests.sh`) is the step that runs the GPU tests:
 
 ```bash
 make gpu-test                                   # every member crate
@@ -247,7 +247,7 @@ checkout of the base commit and compare.
 
 The runner reports every red it found before it exits: shader-validation hits,
 failing tests, under-matched crates and crates with no validation banner.
-`make gpu-runner-selftest` (`scripts/run_gpu_tests_selftest.sh`, in `make ci`
+`make gpu-runner-selftest` (`scripts/suite/run_gpu_tests_selftest.sh`, in `make ci`
 and hosted CI) pins each report against stub crates, with no GPU.
 
 ### A cell that stood down is reported, and it is not a pass
@@ -408,7 +408,7 @@ Under `--half` the runner holds:
 - A stand-down inside a half still ends it INCOMPLETE.
 - The two halves' selections and census expectations sum to the whole run's.
 
-Each rule is a case under `THE HALVES` in `scripts/run_gpu_tests_selftest.sh`.
+Each rule is a case under `THE HALVES` in `scripts/suite/run_gpu_tests_selftest.sh`.
 No case can see a codec change that passes the codec half and breaks a test in
 the rest half. The whole gate on `main` finds it one merge later.
 
@@ -542,7 +542,7 @@ the one the attention kernel above got. Find the configuration with a
 reproduction in pure MLX, and stop reaching it.
 
 Each rule is a case under `THE VERDICT` in
-`scripts/run_gpu_tests_selftest.sh`.
+`scripts/suite/run_gpu_tests_selftest.sh`.
 
 ### Threadgroup-memory validation: on for rMLX's kernels, off for MLX's
 
@@ -658,13 +658,13 @@ output. The tests
 `split_k_tail_row_reads_never_reach_the_output` and
 `implicit_gemm_conv_tail_channel_reads_never_reach_the_output` in
 `crates/rmlx-mlx/src/ops/matmul_tests.rs` show it bit for bit with the tail rows
-poisoned. The header of `scripts/gpu_validation_census.txt` gives the argument
+poisoned. The header of `scripts/suite/gpu_validation_census.txt` gives the argument
 and the run the pin was derived from. The cells that run left standing down
 for a variable were armed in filtered runs afterwards and reported nothing.
 
 ### The census pin
 
-`scripts/gpu_validation_census.txt` pins the accepted hits, so a standing
+`scripts/suite/gpu_validation_census.txt` pins the accepted hits, so a standing
 diagnostic from a kernel this repo does not compile does not keep every run
 red. One entry per `(kernel, kind, crate, test)` carries that test's own count
 and the reference to the analysis. The file's header states the fields.

@@ -12,7 +12,7 @@
 #                violation); this one reads the finished listing and judges nothing, so it has no exit 1
 #
 # One reader of the population, two predicates. Both modes print the same row shape, one row per
-# classified test, and `scripts/run_gpu_tests.sh` is the only consumer. A partition is only a gate if
+# classified test, and `scripts/suite/run_gpu_tests.sh` is the only consumer. A partition is only a gate if
 # it is computed in ONE place: two readers deriving it separately would eventually disagree, and a
 # test both of them called the other's would run under neither.
 #

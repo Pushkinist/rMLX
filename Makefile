@@ -331,13 +331,13 @@ claim-rmlx:      ## build the rmlx binary the GPU suite takes the Metal claim wi
 # `test-perf` and is what `make target-gc` prunes first, so a run after a GC
 # pays a cold opt-level-0 build on top. See docs/GPU_TESTS.md.
 ci-perf:         ## pre-push gate under release-perf + the serialized GPU/Metal suite (HALF=codec|rest runs one side of the partition; separate from make ci)
-	@bash scripts/run_gpu_tests.sh --preflight
+	@bash scripts/suite/run_gpu_tests.sh --preflight
 	$(MAKE) claim-rmlx
 	@$(CLAIM_RMLX) claim run -- true
 	$(MAKE) test-perf
-	@bash scripts/run_gpu_tests.sh --build $(GPU_HALF_ARG)
+	@bash scripts/suite/run_gpu_tests.sh --build $(GPU_HALF_ARG)
 	@log="$$(mktemp)"; rc="$$(mktemp)"; \
-	{ $(CLAIM_RMLX) claim run -- bash scripts/run_gpu_tests.sh $(GPU_HALF_ARG); echo $$? >"$$rc"; } | tee "$$log"; \
+	{ $(CLAIM_RMLX) claim run -- bash scripts/suite/run_gpu_tests.sh $(GPU_HALF_ARG); echo $$? >"$$rc"; } | tee "$$log"; \
 	code="$$(cat "$$rc")"; rm -f "$$rc"; \
 	if [ "$$code" -ne 0 ]; then rm -f "$$log"; exit "$$code"; fi; \
 	if grep -q INCOMPLETE "$$log"; then \
@@ -365,7 +365,7 @@ ci-perf:         ## pre-push gate under release-perf + the serialized GPU/Metal 
 # costs throughput, which is why it lives on this target and not on any cell
 # whose numbers get recorded. VALIDATE=0 opts out.
 #
-# The hits it observes are compared against scripts/gpu_validation_census.txt,
+# The hits it observes are compared against scripts/suite/gpu_validation_census.txt,
 # which pins the ones this tree has already accounted for, one count per
 # originating test. The expectation is the sum over the tests that actually ran,
 # so a narrowed run and a machine with no snapshots are still compared exactly;
@@ -376,8 +376,8 @@ ci-perf:         ## pre-push gate under release-perf + the serialized GPU/Metal 
 GPU_TEST_ARGS = $(GPU_HALF_ARG) $(if $(CRATE),--crate '$(CRATE)',) $(if $(FILTER),--filter '$(FILTER)',) \
 	$(if $(filter 0,$(VALIDATE)),--no-shader-validation,)
 gpu-test: claim-rmlx ## run the GPU/Metal #[ignore] tests serialized under Metal shader validation for the scan and uninstrumented for the verdict, holding the Metal claim (HALF=codec|rest, CRATE= FILTER= to narrow, VALIDATE=0 to skip instrumentation)
-	@bash scripts/run_gpu_tests.sh --build $(GPU_TEST_ARGS)
-	@$(CLAIM_RMLX) claim run -- bash scripts/run_gpu_tests.sh $(GPU_TEST_ARGS)
+	@bash scripts/suite/run_gpu_tests.sh --build $(GPU_TEST_ARGS)
+	@$(CLAIM_RMLX) claim run -- bash scripts/suite/run_gpu_tests.sh $(GPU_TEST_ARGS)
 
 # model-check: run only the model-logic crates (rmlx-models, rmlx-runtime,
 # rmlx-quant) plus the KV-codec crate (rmlx-kv-quant). Excludes server, CLI, and
@@ -504,7 +504,7 @@ kv-update-census-selftest: ## CI gate: recall test for the KV structural figures
 	@bash scripts/report/kv_census_selftest.sh
 
 check-no-inline-tests: ## CI gate: fail if any non-test.rs file has inline #[cfg(test)] mod tests { ... }
-	@bash scripts/check_no_inline_tests.sh
+	@bash scripts/check/no_inline_tests.sh
 
 check-no-inline-tests-fixtures: ## CI gate: recall test for the above, 32 planted scan roots, each asserting the rule or the refusal as well as the exit code
 	@bash scripts/check/rust_gates_fixtures.sh no_inline_tests
@@ -516,7 +516,7 @@ check-no-scalar-f32-leak-fixtures: ## CI gate: recall test for the above, 43 pla
 	@bash scripts/check/rust_gates_fixtures.sh scalar_f32_leak
 
 check-kv-layer-quants: ## CI gate: fail if kv_quant_for_layer is called outside kv_cache/ (one producer: kv_layer_quants)
-	@bash scripts/check_kv_layer_quants.sh
+	@bash scripts/check/kv_layer_quants.sh
 
 check-kv-layer-quants-fixtures: ## CI gate: recall test for the above, 24 planted scan roots, each asserting the rule or the refusal as well as the exit code
 	@bash scripts/check/rust_gates_fixtures.sh kv_layer_quants
@@ -565,7 +565,7 @@ check-spec-charge-fixtures: ## CI gate: recall test for the above, and for the d
 
 .PHONY: spec-round-stream-selftest
 spec-round-stream-selftest: ## CI gate: recall test for the round-stream manifest reader — 17 cases, a stale pin and a true one among them
-	@bash scripts/spec_round_stream_compare_selftest.sh
+	@bash scripts/spec/round_stream_compare_selftest.sh
 
 .PHONY: check-published-samples
 check-published-samples: ## CI gate: fail if the checked-in published sample sets do not re-derive from their recorded seeds, digests and templates
@@ -640,19 +640,19 @@ check-doc-refs-selftest: ## CI gate: recall test for check/doc_refs.py over a sy
 check-doc-consumers: check-doc-refs check-doc-source-citations check-kv-codec-disposition check-kv-boundary-default-parity check-published-table ## every reader of doc text still finds what it reads
 
 check-no-decode-swallow: ## CI gate: fail if a decode-step failure breaks instead of propagating (would report as finish_reason="length")
-	@bash scripts/check_no_decode_swallow.sh
+	@bash scripts/check/no_decode_swallow.sh
 
 check-no-decode-swallow-fixtures: ## CI gate: recall test for the above, 42 planted scan roots, each asserting the rule, the pinned site count or the refusal as well as the exit code
 	@bash scripts/check/rust_gates_fixtures.sh no_decode_swallow
 
 check-eval-lock:  ## CI gate: fail if an MLX eval FFI call is made without the process-wide evaluation lock
-	@bash scripts/check_eval_lock.sh
+	@bash scripts/check/eval_lock.sh
 
 check-eval-lock-fixtures: ## CI gate: recall test for check-eval-lock (synthetic scan roots)
 	@bash scripts/check/rust_gates_fixtures.sh eval_lock
 
 eval-lock-stress: ## run the evaluation-lock reproducer across RUNS fresh processes (default 60); not in `make ci`
-	@bash scripts/eval_lock_stress.sh $(RUNS)
+	@bash scripts/suite/eval_lock_stress.sh $(RUNS)
 
 # The skipped tests call mlx-c or read files, which Miri refuses. A new test
 # that calls mlx-c fails here, so the skip list cannot hide one. The MLX thread
@@ -675,7 +675,7 @@ check-gpu-tests-ignored-fixtures: ## CI gate: the #[ignore] gate still fires on 
 	@bash scripts/check/rust_gates_fixtures.sh gpu_tests_ignored
 
 gpu-runner-selftest: ## CI gate: the GPU runner reports a failing test and a shader-validation hit in the same run, reports the access mix it saw, reads the verdict from the uninstrumented run, and reaches every census-pin verdict (stubbed crates, no GPU)
-	@bash scripts/run_gpu_tests_selftest.sh
+	@bash scripts/suite/run_gpu_tests_selftest.sh
 
 check-named-skip-notices: ## CI gate: a classified GPU test that announces its own stand-down names itself, so the runner can attribute it
 	@bash scripts/check/gpu_tests.sh skip-notices
@@ -690,13 +690,13 @@ check-no-kernel-input-eval-fixtures: ## CI gate: the eval gate still fires on re
 	@bash scripts/check/rust_gates_fixtures.sh no_kernel_input_eval
 
 check-gpu-device-census: ## CI gate: the rmlx binary names Device::Gpu in exactly one place, claim_gpu, which takes the Metal claim, and never takes .device() from a fresh claim
-	@bash scripts/check_gpu_device_census.sh
+	@bash scripts/check/gpu_device_census.sh
 
 check-gpu-device-census-library: ## CI gate: library code in rmlx-audio, rmlx-server and rmlx-models never names Device::Gpu as a value; the device comes from the caller
-	@bash scripts/check_gpu_device_census.sh --library
+	@bash scripts/check/gpu_device_census.sh --library
 
 check-gpu-device-census-selftest: ## CI gate: recall test for the above and its library mode, 69 cases, each asserting the reason as well as the exit code
-	@bash scripts/check_gpu_device_census_selftest.sh
+	@bash scripts/check/gpu_device_census_selftest.sh
 
 check-claim-bypass: ## CI gate: nothing in the tree deletes the Metal claim, names its file outside the claim module, or kills by process-name pattern
 	@bash scripts/check/tree_lines.sh claim-bypass
@@ -747,11 +747,11 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/release/release_cpu_selftest.sh
 	@bash scripts/release/release_selftest.sh
 	@bash scripts/report/kv_census_selftest.sh
-	@bash scripts/check_no_inline_tests.sh
+	@bash scripts/check/no_inline_tests.sh
 	@bash scripts/check/rust_gates_fixtures.sh no_inline_tests
 	@bash scripts/check/kernel_dispatch.sh scalar-f32
 	@bash scripts/check/rust_gates_fixtures.sh scalar_f32_leak
-	@bash scripts/check_kv_layer_quants.sh
+	@bash scripts/check/kv_layer_quants.sh
 	@bash scripts/check/rust_gates_fixtures.sh kv_layer_quants
 	@bash scripts/check/engine_parity.sh kv-codec-disposition
 	@bash scripts/check/engine_parity_selftest.sh kv-codec-disposition
@@ -765,26 +765,26 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check/spec_round_loops_selftest.sh sampling
 	@bash scripts/check/spec_round_loops.sh charge
 	@bash scripts/check/spec_round_loops_selftest.sh charge
-	@bash scripts/spec_round_stream_compare_selftest.sh
+	@bash scripts/spec/round_stream_compare_selftest.sh
 	@python3 scripts/published_samples.py verify
 	@bash scripts/check_published_samples_fixtures.sh
 	@python3 scripts/check/doc_refs.py --source-paths
 	@bash scripts/check/doc_refs_selftest.sh
 	@$(MAKE) --no-print-directory check-doc-refs
-	@bash scripts/check_no_decode_swallow.sh
+	@bash scripts/check/no_decode_swallow.sh
 	@bash scripts/check/rust_gates_fixtures.sh no_decode_swallow
-	@bash scripts/check_eval_lock.sh
+	@bash scripts/check/eval_lock.sh
 	@bash scripts/check/rust_gates_fixtures.sh eval_lock
 	@bash scripts/check/gpu_tests.sh ignored
 	@bash scripts/check/rust_gates_fixtures.sh gpu_tests_ignored
-	@bash scripts/run_gpu_tests_selftest.sh
+	@bash scripts/suite/run_gpu_tests_selftest.sh
 	@bash scripts/check/gpu_tests.sh skip-notices
 	@bash scripts/check/gpu_tests_selftest.sh
 	@bash scripts/check/kernel_dispatch.sh input-eval
 	@bash scripts/check/rust_gates_fixtures.sh no_kernel_input_eval
-	@bash scripts/check_gpu_device_census.sh
-	@bash scripts/check_gpu_device_census.sh --library
-	@bash scripts/check_gpu_device_census_selftest.sh
+	@bash scripts/check/gpu_device_census.sh
+	@bash scripts/check/gpu_device_census.sh --library
+	@bash scripts/check/gpu_device_census_selftest.sh
 	@bash scripts/check/tree_lines.sh claim-bypass
 	@bash scripts/check/tree_lines_selftest.sh claim-bypass
 	@bash scripts/check/tree_lines.sh personal-data

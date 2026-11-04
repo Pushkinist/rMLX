@@ -1,6 +1,6 @@
 //! Positive control for the shader-validation gate.
 //!
-//! `scripts/run_gpu_tests.sh` scans test output for Metal's invalid-access
+//! `scripts/suite/run_gpu_tests.sh` scans test output for Metal's invalid-access
 //! report. That scan is a hand-written pattern over an undocumented,
 //! version-specific message, and its *absence* is what the gate reports as
 //! success — so a wording change at a toolchain bump would silently convert it

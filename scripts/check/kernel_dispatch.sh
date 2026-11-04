@@ -91,7 +91,7 @@
 #         (no mode, an unknown mode, a bad option, a repeated --min, an invalid --min, --min on
 #         scalar-f32), a scan root that is not a directory, nothing to scan (scalar-f32), or an
 #         awk scan that failed
-# Not a mode of: check_eval_lock.sh — that gate reads every MLX eval FFI call of the workspace
+# Not a mode of: check/eval_lock.sh — that gate reads every MLX eval FFI call of the workspace
 #                for the lock held around it; this one reads only the dispatcher files of the
 #                crates that own `.metal` kernels, for three rules that are not about a lock
 

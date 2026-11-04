@@ -22,12 +22,12 @@
 #   prove zero.
 #
 # USAGE
-#   bash scripts/eval_lock_stress.sh [RUNS] [TIMEOUT_SECS]
+#   bash scripts/suite/eval_lock_stress.sh [RUNS] [TIMEOUT_SECS]
 #   make eval-lock-stress RUNS=100
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUNS="${1:-${RUNS:-60}}"
 TMO="${2:-${TIMEOUT_SECS:-60}}"
 TEST_NAME="lib_tests::concurrent_first_eval_reproducer"

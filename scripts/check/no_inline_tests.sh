@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # CI gate: no inline #[cfg(test)] module body in a non-test source file.
 #
-# Usage:  bash scripts/check_no_inline_tests.sh [<root>]
+# Usage:  bash scripts/check/no_inline_tests.sh [<root>]
 # Exit:   0 clean; 1 a violation; 2 nothing to scan under <root>/crates
+#
+# Not a mode of: check/tree_lines.sh — that gate matches raw lines; this one reads Rust items
+#                (attributes, braces) under crates/
 #
 # <root> is the directory that holds crates/; it defaults to the repository.
 #
@@ -32,7 +35,7 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCAN_ROOT="${1:-${REPO_ROOT}}"
 
 if [ ! -d "${SCAN_ROOT}/crates" ]; then

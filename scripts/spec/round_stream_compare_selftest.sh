@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Recall test for spec_round_stream_compare.py verify: synthetic captures, asserting the exit code.
+# Recall test for spec/round_stream_compare.py verify: synthetic captures, asserting the exit code.
 #
 #
-# Recall test for: spec_round_stream_compare.py verify
+# Recall test for: spec/round_stream_compare.py verify
 #
 # Each case builds a synthetic capture of the 36 pinned cells, whose round
 # counts sum to the script's own TOTAL_ROUNDS, and asserts the literal exit code
@@ -13,8 +13,8 @@
 
 set -uo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TOOL="$REPO_ROOT/scripts/spec_round_stream_compare.py"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TOOL="$REPO_ROOT/scripts/spec/round_stream_compare.py"
 # shellcheck source=scripts/lib/selftest_support.sh
 . "$REPO_ROOT/scripts/lib/selftest_support.sh"
 st_init spec-round-stream-compare-selftest

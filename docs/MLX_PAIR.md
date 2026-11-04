@@ -334,7 +334,7 @@ the mask at the padded rows, the HTTP server path, and speculative prefill.
 3. `cargo clean -p rmlx-mlx` and build. `cargo build -p rmlx-mlx -vv` shows
    whether `build.rs` ran. A new mlx-c C API stops the build in `build.rs`
    until [Two mlx-c C APIs](#two-mlx-c-c-apis) knows it.
-4. Re-derive the evaluation-lock reach set (`scripts/check_eval_lock.sh`
+4. Re-derive the evaluation-lock reach set (`scripts/check/eval_lock.sh`
    header), re-run `layout_flag_classifies_views_once_they_are_evaluated` and
    the JIT language probe (`docs/FFI.md`), and derive the GPU census again
    (`docs/GPU_TESTS.md`).

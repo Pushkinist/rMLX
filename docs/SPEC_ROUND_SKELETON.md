@@ -216,7 +216,7 @@ Five observables, each blind to something different:
 
 - **The per-round event stream**, against
   `crates/rmlx-models/tests/fixtures/spec_round_baseline/MANIFEST.sha256`,
-  compared by `scripts/spec_round_stream_compare.py`. Each of the six pinned
+  compared by `scripts/spec/round_stream_compare.py`. Each of the six pinned
   equivalence tests runs that comparison on the cells it wrote, and fails on a
   moved cell on the pinned MLX pair. It sees each round's shape. It is blind to
   the values inside a round, to `charged` (every pinned run is uncharged), to

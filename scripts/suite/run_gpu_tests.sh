@@ -127,7 +127,7 @@
 #   A tree can carry a diagnostic from a kernel it does not own and cannot fix.
 #   Failing every run on it is the inverse of a vacuous gate: the exit code stops
 #   carrying information, and the next real hit arrives inside a standing one.
-#   So `scripts/gpu_validation_census.txt` pins the accepted hits and this script
+#   So `scripts/suite/gpu_validation_census.txt` pins the accepted hits and this script
 #   diffs the tally it just computed against that file. An exact match is a pass
 #   that prints the census it accepted. A new kernel, a count that moved in
 #   either direction, any store, or a pinned kernel that stopped firing is a
@@ -145,12 +145,12 @@
 #   An entry's test must therefore print a NAMED skip notice.
 #
 # USAGE
-#   bash scripts/run_gpu_tests.sh
-#   bash scripts/run_gpu_tests.sh --crate rmlx-kv-quant
-#   bash scripts/run_gpu_tests.sh --crate rmlx-kv-quant --filter rotor_flash
-#   bash scripts/run_gpu_tests.sh --half codec
-#   bash scripts/run_gpu_tests.sh --no-shader-validation
-#   bash scripts/run_gpu_tests.sh --preflight   # preconditions only, no tests
+#   bash scripts/suite/run_gpu_tests.sh
+#   bash scripts/suite/run_gpu_tests.sh --crate rmlx-kv-quant
+#   bash scripts/suite/run_gpu_tests.sh --crate rmlx-kv-quant --filter rotor_flash
+#   bash scripts/suite/run_gpu_tests.sh --half codec
+#   bash scripts/suite/run_gpu_tests.sh --no-shader-validation
+#   bash scripts/suite/run_gpu_tests.sh --preflight   # preconditions only, no tests
 #
 #   The narrowing options exist for iterating by hand. A gate must invoke this
 #   script with NO arguments — `--crate`/`--filter` narrow the classified
@@ -193,7 +193,7 @@
 # a fatal error.
 set -uo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 usage() {
     cat <<'USAGE'
@@ -354,7 +354,7 @@ diagnostic_records() {
 # one. With it, an accepted census is a pass that prints what it accepted, and
 # every deviation from the pin is a failure naming the delta. The comparison is
 # a tally diff — this script knows no kernel name.
-CENSUS_PIN="${REPO_ROOT}/scripts/gpu_validation_census.txt"
+CENSUS_PIN="${REPO_ROOT}/scripts/suite/gpu_validation_census.txt"
 
 # Strip leading and trailing whitespace, so the pin can be laid out as a table.
 trim() {

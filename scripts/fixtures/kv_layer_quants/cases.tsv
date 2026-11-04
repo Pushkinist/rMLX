@@ -1,4 +1,4 @@
-# Planted scan roots for check_kv_layer_quants.sh: the single-producer rule, the declared-uniformity rule and the refusals.
+# Planted scan roots for check/kv_layer_quants.sh: the single-producer rule, the declared-uniformity rule and the refusals.
 #
 # Columns, tab-separated, none empty ("-" for none): fixture (a directory beside this
 # table), args (gate arguments, "{}" is the fixture path), stream (both, out or err: the

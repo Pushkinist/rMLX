@@ -297,7 +297,7 @@ fn ssd_disk_state(rmlx_home: &Path) -> (usize, usize) {
 // The Metal context this test needs belongs to the `rmlx serve` CHILD, not to
 // the test binary — this process only speaks HTTP to it — so no source shape
 // here can express the device and the `#[ignore]` gate is told rather than
-// shown. It stays out of `scripts/run_gpu_tests.sh` on top of that: that runner
+// shown. It stays out of `scripts/suite/run_gpu_tests.sh` on top of that: that runner
 // instruments the test process, which dispatches no Metal at all; the test also
 // needs `cargo build -p rmlx-cli` first (`cargo test --tests` does not build the
 // binary), spawns `rmlx` itself, which the runner's own Metal claim would

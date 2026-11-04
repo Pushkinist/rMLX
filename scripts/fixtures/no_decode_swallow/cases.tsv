@@ -1,4 +1,4 @@
-# Planted scan roots for check_no_decode_swallow.sh: the four rules and the pinned site counts.
+# Planted scan roots for check/no_decode_swallow.sh: the four rules and the pinned site counts.
 #
 # Columns, tab-separated, none empty ("-" for none): fixture (a directory beside this
 # table), args (gate arguments, "{}" is the fixture path), stream (both, out or err: the

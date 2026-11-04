@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Recall test for check_gpu_device_census.sh: scan roots, asserting exit code and file:line.
+# Recall test for check/gpu_device_census.sh: scan roots, asserting exit code and file:line.
 #
 #
-# Recall test for: check_gpu_device_census.sh default --library
+# Recall test for: check/gpu_device_census.sh default --library
 #
 # Each case builds a throwaway scan root holding the one legitimate site, plants
 # one file, runs the gate and asserts the literal exit code and, for a failure,
@@ -15,8 +15,8 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-GATE="$REPO_ROOT/scripts/check_gpu_device_census.sh"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+GATE="$REPO_ROOT/scripts/check/gpu_device_census.sh"
 # shellcheck source=scripts/lib/selftest_support.sh
 . "$REPO_ROOT/scripts/lib/selftest_support.sh"
 st_init check-gpu-device-census-selftest

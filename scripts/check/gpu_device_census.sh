@@ -51,9 +51,9 @@
 # the scan; and nothing outside the scan roots is counted. The text readers do
 # not know raw strings (scripts/lib/awk_text.sh).
 #
-# Usage: check_gpu_device_census.sh [<rmlx-cli-src-dir>]
+# Usage: bash scripts/check/gpu_device_census.sh [<rmlx-cli-src-dir>]
 #        (default: crates/rmlx-cli/src)
-#        check_gpu_device_census.sh --library [<src-dir>...]
+#        bash scripts/check/gpu_device_census.sh --library [<src-dir>...]
 #        (default: crates/rmlx-audio/src crates/rmlx-server/src
 #         crates/rmlx-models/src)
 # Exit 0 = exactly one site (library mode: no value site), no alias, no dropped
@@ -63,7 +63,7 @@
 set -uo pipefail
 export LC_ALL=C
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=scripts/lib/awk_text.sh
 . "$REPO_ROOT/scripts/lib/awk_text.sh"
 

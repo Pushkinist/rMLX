@@ -26,7 +26,7 @@ throughput row is worth recording, and it is a filter: this gate is what judges
 the round loop, on 256-token prose, with the repetition control.
 
 The thresholds below are set from runs of the gate against the shipped
-engine and against deliberately broken ones. `scripts/spec_broken_engine.sh`
+engine and against deliberately broken ones. `scripts/spec/broken_engine.sh`
 applies each broken engine by name; take the readings with it.
 
 ## What it runs
@@ -100,7 +100,7 @@ follows it with a 4- or 6-wide one, a sequence the served block never reaches.
 
 The per-round event stream of the six pairs at the served block is pinned
 separately, in `crates/rmlx-models/tests/fixtures/spec_round_baseline/`, and
-compared by `scripts/spec_round_stream_compare.py`. This gate reads the
+compared by `scripts/spec/round_stream_compare.py`. This gate reads the
 answer; that comparison reads which round moved. The same six tests run it on
 their own cells after the answers are judged.
 
@@ -308,7 +308,7 @@ it. Both sides are measured:
   takes it.
 - Broken side: a broken engine refused on `k` prompts without the excuse is
   refused on at least `k - 1` with it, since the bound lets at most one prompt
-  through. Re-read under the current rule with `scripts/spec_broken_engine.sh`,
+  through. Re-read under the current rule with `scripts/spec/broken_engine.sh`,
   the `rejected-draft-kept` engine is refused on 5 of 6 judged prompts on the
   block pair (6 of 6 at its declared block), 6 of 6 on the adaptive pair (5 of 5
   over its whole schedule, the sixth prompt excused), and 5 of 5 on the two-model

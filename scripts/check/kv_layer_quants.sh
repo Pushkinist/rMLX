@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # CI gate: the per-layer KV codec vector has one producer, and every cache stack uses it.
 #
-# Usage:  bash scripts/check_kv_layer_quants.sh [<root>]
+# Usage:  bash scripts/check/kv_layer_quants.sh [<root>]
 # Exit:   0 clean; 1 a violation; 2 nothing to scan under <root>/crates/rmlx-models/src
 #
 # <root> is the directory that holds crates/; it defaults to the repository.
@@ -53,7 +53,7 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCAN_ROOT="${1:-${REPO_ROOT}}"
 POLICY_DIR="crates/rmlx-models/src/kv_cache/"
 MODELS_SRC="crates/rmlx-models/src"

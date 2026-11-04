@@ -6,7 +6,7 @@
 # the ability to take them again, so each broken engine is a named edit here
 # rather than a number in a document nobody can regenerate.
 #
-#   scripts/spec_broken_engine.sh <engine> <test-name>
+#   scripts/spec/broken_engine.sh <engine> <test-name>
 #
 # Engines. Each names the file it edits, because the two no longer live in one
 # place: the restricted read-back is the EAGLE-3 drafter's and the verifier's
@@ -37,7 +37,7 @@
 # documents. No GPU work happens here that the gate would not do on its own.
 set -uo pipefail
 
-readonly ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly SPEC="$ROOT/crates/rmlx-models/src/speculative"
 
 engine="${1:-}"

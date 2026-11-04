@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Recall test for run_gpu_tests.sh: how it reports red runs, waivers and census verdicts.
+# Recall test for suite/run_gpu_tests.sh: how it reports red runs, waivers and census verdicts.
 #
 # Set:    -uo — a non-zero status inside a case ends the run under -e, before the cases after it
 #
 # LOC-exempt: one planted run per case; the cases are the spec
 #
-# Recall test for: run_gpu_tests.sh
+# Recall test for: suite/run_gpu_tests.sh
 #                  suite/gpu_test_classes.sh half threadgroup
 #
 # The runner accumulates two independent kinds of red across its crate loop:
@@ -18,7 +18,7 @@
 # deleted inside the loop, so nothing survives to re-read.
 #
 # It also decides which validation hits are a failure at all. The runner accepts
-# exactly the census pinned in `scripts/gpu_validation_census.txt` and fails on
+# exactly the census pinned in `scripts/suite/gpu_validation_census.txt` and fails on
 # any deviation from it, so both halves of that — the pass and each kind of
 # deviation — are checked here too. A pin that could only fail would leave the
 # gate as red as it was without one; a pin that could only pass would be a gate
@@ -50,8 +50,8 @@
 
 set -uo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RUNNER="${ROOT}/scripts/run_gpu_tests.sh"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+RUNNER="${ROOT}/scripts/suite/run_gpu_tests.sh"
 
 # shellcheck source=scripts/lib/selftest_support.sh
 . "${ROOT}/scripts/lib/selftest_support.sh"
@@ -85,7 +85,7 @@ new_case() {
     CASE_ROOT="${WORK}/$1"
     local root="${CASE_ROOT}"
     mkdir -p "${root}/scripts/lib" "${root}/scripts/check" "${root}/scripts/suite" "${root}/bin" "${root}/logs" || return 1
-    cp "${RUNNER}" "${root}/scripts/run_gpu_tests.sh" || return 1
+    cp "${RUNNER}" "${root}/scripts/suite/run_gpu_tests.sh" || return 1
     # Symlinked, not copied: the runner reads the stand-down notice's shape from
     # this file and so does the source gate, and a fixture carrying its own copy
     # would keep passing after the real shape moved.
@@ -96,7 +96,7 @@ new_case() {
     # starts from an empty one and says so; the cases that pin something
     # overwrite it.
     printf '# kernel | kind | count | crate | test | reference\n' \
-        >"${root}/scripts/gpu_validation_census.txt"
+        >"${root}/scripts/suite/gpu_validation_census.txt"
 
     cat >"${root}/scripts/check/gpu_tests.sh" <<STUB
 #!/usr/bin/env bash
@@ -254,7 +254,7 @@ crate_log() {
 
 # pin <root> — write this case's shader-validation census pin, contents on stdin.
 pin() {
-    cat >"$1/scripts/gpu_validation_census.txt"
+    cat >"$1/scripts/suite/gpu_validation_census.txt"
 }
 
 # run_case <root> [runner args...] — run this case's runner; set OUT, STATUS,
@@ -276,7 +276,7 @@ run_case() {
     : >"${root}/invocations"
     : >"${root}/mtl_seen"
     PATH="${root}/bin:${PATH}" env -u RMLX_SKIP_GPU \
-        RMLX_O_MODELS_ROOT="${WORK}" bash "${root}/scripts/run_gpu_tests.sh" "$@" >"${root}/output" 2>&1
+        RMLX_O_MODELS_ROOT="${WORK}" bash "${root}/scripts/suite/run_gpu_tests.sh" "$@" >"${root}/output" 2>&1
     STATUS=$?
     OUT="$(cat "${root}/output")"
     ARGV="$(cat "${root}/cargo_argv")"
@@ -749,7 +749,7 @@ CENSUS_KERNEL="mlx_qmm_stub"
 
 # census_pin <root> <count> [test] [crate] — a one-entry pin.
 census_pin() {
-    census_pin_line "$1" "${2}" "${3:-kv_gpu_alpha}" "${4:-rmlx-kv-quant}" >"$1/scripts/gpu_validation_census.txt"
+    census_pin_line "$1" "${2}" "${3:-kv_gpu_alpha}" "${4:-rmlx-kv-quant}" >"$1/scripts/suite/gpu_validation_census.txt"
 }
 
 # census_pin_line <root> <count> <test> <crate> — one entry, on stdout.
@@ -937,7 +937,7 @@ classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
 {
     census_pin_line "${CASE_ROOT}" 4 kv_gpu_alpha rmlx-kv-quant
     census_pin_line "${CASE_ROOT}" 6 kv_gpu_beta rmlx-kv-quant
-} >"${CASE_ROOT}/scripts/gpu_validation_census.txt"
+} >"${CASE_ROOT}/scripts/suite/gpu_validation_census.txt"
 census_log "${CASE_ROOT}" rmlx-kv-quant 4 kv_gpu_beta 2
 run_case "${CASE_ROOT}"
 expect_status 0
@@ -1098,7 +1098,7 @@ expect_report "is pinned twice"
 # reading it as such would let a deleted file pass unremarked.
 new_case census_missing_pin_file_is_named || exit 1
 classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
-rm -f "${CASE_ROOT}/scripts/gpu_validation_census.txt"
+rm -f "${CASE_ROOT}/scripts/suite/gpu_validation_census.txt"
 census_log "${CASE_ROOT}" rmlx-kv-quant 4
 run_case "${CASE_ROOT}"
 expect_status 1
@@ -1119,7 +1119,7 @@ expect_report "not pinned: 4 device load \"${CENSUS_KERNEL}\" in rmlx-kv-quant"
 # so — it would surface only on a machine with a GPU. Every entry is reported as
 # skipped here, which is what proves the file parsed into entries at all.
 new_case tracked_census_pin || exit 1
-cp "${ROOT}/scripts/gpu_validation_census.txt" "${CASE_ROOT}/scripts/gpu_validation_census.txt" || exit 1
+cp "${ROOT}/scripts/suite/gpu_validation_census.txt" "${CASE_ROOT}/scripts/suite/gpu_validation_census.txt" || exit 1
 bash "${ROOT}/scripts/check/gpu_tests.sh" list >"${CASE_ROOT}/classified" || exit 1
 while IFS= read -r tracked_crate; do
     [ -n "${tracked_crate}" ] || continue
@@ -1130,7 +1130,7 @@ while IFS= read -r tracked_crate; do
             { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $4)
               gsub(/^[[:space:]]+|[[:space:]]+$/, "", $5)
               if ($4 == c) print "test " $5 " ... SKIP " $5 ": no snapshot in this fixture" }
-        ' "${CASE_ROOT}/scripts/gpu_validation_census.txt"
+        ' "${CASE_ROOT}/scripts/suite/gpu_validation_census.txt"
         printf 'test result: ok. %s passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s\n' \
             "$(awk -F'\t' -v c="${tracked_crate}" '$1 == c' "${CASE_ROOT}/classified" | grep -c '')"
     } | crate_log "${CASE_ROOT}" "${tracked_crate}" 0
@@ -1146,7 +1146,7 @@ expect_no_out "never pinnable"
 # An at-most count has no floor and no stale verdict, so nothing but this line
 # and review stops an exact entry from being rewritten as one. Re-pin the
 # figure in the change that adds such an entry.
-tracked_at_most="$(awk -F'|' '!/^[[:space:]]*#/ && $3 ~ /<=/' "${ROOT}/scripts/gpu_validation_census.txt" | grep -c '')"
+tracked_at_most="$(awk -F'|' '!/^[[:space:]]*#/ && $3 ~ /<=/' "${ROOT}/scripts/suite/gpu_validation_census.txt" | grep -c '')"
 [ "${tracked_at_most}" = "4" ] || fail "the tracked census pins ${tracked_at_most} at-most count(s), expected 4"
 expect_no_out "has no classified GPU test"
 expect_no_out "not found"
@@ -1940,7 +1940,7 @@ HALVES
 {
     census_pin_line "${CASE_ROOT}" 4 kv_gpu_alpha rmlx-kv-quant
     census_pin_line "${CASE_ROOT}" 6 models_gpu_alpha rmlx-models
-} >"${CASE_ROOT}/scripts/gpu_validation_census.txt"
+} >"${CASE_ROOT}/scripts/suite/gpu_validation_census.txt"
 census_log "${CASE_ROOT}" rmlx-kv-quant 4
 run_case "${CASE_ROOT}" --half codec
 expect_status 0
@@ -1963,7 +1963,7 @@ HALVES
 {
     census_pin_line "${CASE_ROOT}" 4 kv_gpu_alpha rmlx-kv-quant
     census_pin_line "${CASE_ROOT}" 6 kv_gpu_beta rmlx-kv-quant
-} >"${CASE_ROOT}/scripts/gpu_validation_census.txt"
+} >"${CASE_ROOT}/scripts/suite/gpu_validation_census.txt"
 census_log "${CASE_ROOT}" rmlx-kv-quant 4
 run_case "${CASE_ROOT}" --half codec
 expect_status 0
@@ -2033,7 +2033,7 @@ HALVES
 {
     census_pin_line "${CASE_ROOT}" 4 kv_gpu_alpha rmlx-kv-quant
     census_pin_line "${CASE_ROOT}" 6 kv_gpu_beta rmlx-kv-quant
-} >"${CASE_ROOT}/scripts/gpu_validation_census.txt"
+} >"${CASE_ROOT}/scripts/suite/gpu_validation_census.txt"
 census_log "${CASE_ROOT}" rmlx-kv-quant 4
 run_case "${CASE_ROOT}" --half codec
 expect_status 0
@@ -2165,7 +2165,7 @@ HALVES
 printf 'on\trmlx-kv-quant\tkv_gpu_alpha\n' >"${CASE_ROOT}/tg"
 cat >"${CASE_ROOT}/note_macro" <<'NOTE'
 NOTE: macro-generated GPU tests — the #[ignore] rule is ENFORCED on the macro
-body, but the cells are not listed for scripts/run_gpu_tests.sh (their fn names
+body, but the cells are not listed for scripts/suite/run_gpu_tests.sh (their fn names
 exist only after expansion, so a filter cannot be derived):
   crates/rmlx-models/tests/niah_long_context.rs: niah_cell!{$name}
   -> These run under their own driver; see docs/TESTING.md.
@@ -2173,7 +2173,7 @@ exist only after expansion, so a filter cannot be derived):
 NOTE
 cat >"${CASE_ROOT}/note_declared" <<'NOTE'
 NOTE: declared-route GPU tests — the #[ignore] rule is ENFORCED on them, but
-they are not listed for scripts/run_gpu_tests.sh (that runner asserts a Metal
+they are not listed for scripts/suite/run_gpu_tests.sh (that runner asserts a Metal
 validation banner per crate, and these are snapshot-gated or drive a child
 process, so listing them would fail the suite for a missing model):
   crates/rmlx-server/tests/ssd_cache_restart.rs: ssd_cache_survives_server_restart

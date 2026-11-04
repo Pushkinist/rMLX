@@ -305,7 +305,7 @@ fn boundary_floor(base_quant: KvQuant, shares_kv: bool) -> KvQuant {
 /// three describe what the third builds, so a second copy of the loop is not a
 /// duplication of style — it is a way for the description to stop matching the
 /// thing described, silently, the next time the constants or the rule move.
-/// `scripts/check_kv_layer_quants.sh` (in `make ci`) keeps it that way by
+/// `scripts/check/kv_layer_quants.sh` (in `make ci`) keeps it that way by
 /// failing on a direct [`kv_quant_for_layer`] call outside this module.
 ///
 /// `shares_kv` is the stack's cross-layer-KV topology and must be the value the

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Recall test for the Rust-source gates: planted scan roots from a table, asserting exit and reason.
 #
-# Recall test for: check_eval_lock.sh
+# Recall test for: check/eval_lock.sh
 #                  check/gpu_tests.sh ignored
 #                  check/kernel_dispatch.sh input-eval dtype-contract scalar-f32
-#                  check_kv_layer_quants.sh
-#                  check_no_decode_swallow.sh
-#                  check_no_inline_tests.sh
+#                  check/kv_layer_quants.sh
+#                  check/no_decode_swallow.sh
+#                  check/no_inline_tests.sh
 #
 # The mode is a directory under scripts/fixtures/ that holds a planted tree for
 # each case and a cases.tsv: one row per case, tab-separated, no empty field
@@ -47,7 +47,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MODE="${1:-}"
 GATE_MODE=""
 case "$MODE" in
-eval_lock) GATE="$REPO_ROOT/scripts/check_eval_lock.sh" ;;
+eval_lock) GATE="$REPO_ROOT/scripts/check/eval_lock.sh" ;;
 gpu_tests_ignored)
     GATE="$REPO_ROOT/scripts/check/gpu_tests.sh"
     GATE_MODE=ignored
@@ -60,9 +60,9 @@ no_kernel_input_eval)
     GATE="$REPO_ROOT/scripts/check/kernel_dispatch.sh"
     GATE_MODE=input-eval
     ;;
-kv_layer_quants) GATE="$REPO_ROOT/scripts/check_kv_layer_quants.sh" ;;
-no_decode_swallow) GATE="$REPO_ROOT/scripts/check_no_decode_swallow.sh" ;;
-no_inline_tests) GATE="$REPO_ROOT/scripts/check_no_inline_tests.sh" ;;
+kv_layer_quants) GATE="$REPO_ROOT/scripts/check/kv_layer_quants.sh" ;;
+no_decode_swallow) GATE="$REPO_ROOT/scripts/check/no_decode_swallow.sh" ;;
+no_inline_tests) GATE="$REPO_ROOT/scripts/check/no_inline_tests.sh" ;;
 scalar_f32_leak)
     GATE="$REPO_ROOT/scripts/check/kernel_dispatch.sh"
     GATE_MODE=scalar-f32

@@ -4,7 +4,7 @@
 # `SKIP <test>: <why>`. Two tools read that line and they must agree exactly on
 # what it is:
 #
-#   * `scripts/run_gpu_tests.sh` reads it out of a libtest log, to list the cell
+#   * `scripts/suite/run_gpu_tests.sh` reads it out of a libtest log, to list the cell
 #     and to drop its count from the shader-validation census expectation.
 #   * `scripts/check/gpu_tests.sh skip-notices` reads it out of the source, to
 #     fail the build on a notice that names no test.

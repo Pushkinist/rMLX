@@ -18,20 +18,12 @@ class bench_codec_cell.sh
 class bench_identity_selftest.sh
 class bench_llama_ab.sh
 class bench_llama_ab_selftest.sh
-class check_eval_lock.sh
-class check_gpu_device_census.sh
-class check_gpu_device_census_selftest.sh
-class check_kv_layer_quants.sh
-class check_no_decode_swallow.sh
-class check_no_inline_tests.sh
 class check_published_samples_fixtures.sh
 class codec_smoke_runner_selftest.sh
 class convert_silero_vad.py
 class eval/wikitext2_ppl.py
-class eval_lock_stress.sh
 class gen_lloyd_codebook.py
 class gpu_capture.sh
-class gpu_validation_census.txt
 class gputrace_preflight.sh
 class mst_capture.sh
 class perf-iter/bench_decode_tps.sh
@@ -50,17 +42,12 @@ class release_e2e/stage6_perf/kv_codec_matrix.toml
 class release_e2e/stage6_perf/niah_long_context.sh
 class release_e2e/stage6_perf/smoke_prompts.toml
 class rmlx-capture.entitlements
-class run_gpu_tests.sh
-class run_gpu_tests_selftest.sh
 class schema_constraint_canary.sh
 class sdpa_headdim_bench.py
 class spec_bench.sh
 class spec_bench_published.sh
 class spec_bench_published_selftest.sh
 class spec_bench_selftest.sh
-class spec_broken_engine.sh
-class spec_round_stream_compare.py
-class spec_round_stream_compare_selftest.sh
 class ssd_canary.sh
 class ssd_canary_selftest.sh
 purpose bench_identity_selftest.sh
@@ -73,12 +60,12 @@ usage bench_cell.sh
 usage bench_identity_selftest.sh
 usage bench_llama_ab.sh
 usage bench_llama_ab_selftest.sh
-usage check_eval_lock.sh
-usage check_gpu_device_census_selftest.sh
+usage check/eval_lock.sh
+usage check/gpu_device_census_selftest.sh
 usage check_published_samples_fixtures.sh
 usage codec_smoke_runner_selftest.sh
 usage eval/wikitext2_ppl.py
-usage eval_lock_stress.sh
+usage suite/eval_lock_stress.sh
 usage lib/binary_identity.py
 usage lib/prefill_ms.py
 usage lib/published_aggregate.py
@@ -108,14 +95,14 @@ usage published_samples.py
 usage published_table_selftest.sh
 usage release/release_cpu.py
 usage release/release_cpu_selftest.sh
-usage run_gpu_tests.sh
-usage run_gpu_tests_selftest.sh
+usage suite/run_gpu_tests.sh
+usage suite/run_gpu_tests_selftest.sh
 usage schema_constraint_canary.sh
 usage spec_bench_published_selftest.sh
 usage spec_bench_selftest.sh
-usage spec_broken_engine.sh
-usage spec_round_stream_compare.py
-usage spec_round_stream_compare_selftest.sh
+usage spec/broken_engine.sh
+usage spec/round_stream_compare.py
+usage spec/round_stream_compare_selftest.sh
 exit-undeclared aggregate_decode_profile.py 2
 exit-undeclared bench/codec_inertness_probe.sh 0,2
 exit-undeclared bench_cache_types.sh 0,2
@@ -124,12 +111,12 @@ exit-undeclared bench_codec_cell.sh 1
 exit-undeclared bench_identity_selftest.sh 1
 exit-undeclared bench_llama_ab.sh 0,125
 exit-undeclared bench_llama_ab_selftest.sh 1
-exit-undeclared check_eval_lock.sh 1
-exit-undeclared check_gpu_device_census.sh 2
+exit-undeclared check/eval_lock.sh 1
+exit-undeclared check/gpu_device_census.sh 2
 exit-undeclared check_published_samples_fixtures.sh 1
 exit-undeclared codec_smoke_runner_selftest.sh 0,1
 exit-undeclared eval/wikitext2_ppl.py 1
-exit-undeclared eval_lock_stress.sh 1
+exit-undeclared suite/eval_lock_stress.sh 1
 exit-undeclared gen_lloyd_codebook.py 1
 exit-undeclared gpu_capture.sh 1,2
 exit-undeclared ingest/llama_bench_ingest.py 1
@@ -145,15 +132,15 @@ exit-undeclared published_ingest_selftest.sh 1,2
 exit-undeclared published_table_selftest.sh 0,1,2
 exit-undeclared release_e2e/stage6_perf/codec_smoke_runner.sh 0,1,2,3
 exit-undeclared release_e2e/stage6_perf/niah_long_context.sh 1,2
-exit-undeclared run_gpu_tests.sh 0,1
+exit-undeclared suite/run_gpu_tests.sh 0,1
 exit-undeclared schema_constraint_canary.sh 0,2
 exit-undeclared spec_bench.sh 1,125
 exit-undeclared spec_bench_published.sh 1,125
 exit-undeclared spec_bench_published_selftest.sh 1,2
 exit-undeclared spec_bench_selftest.sh 1,2
-exit-undeclared spec_broken_engine.sh 2,3
-exit-undeclared spec_round_stream_compare.py 2
-exit-undeclared spec_round_stream_compare_selftest.sh 1
+exit-undeclared spec/broken_engine.sh 2,3
+exit-undeclared spec/round_stream_compare.py 2
+exit-undeclared spec/round_stream_compare_selftest.sh 1
 exit-undeclared ssd_canary.sh 1,125
 exit-undeclared ssd_canary_selftest.sh 2
 caller aggregate_decode_profile.py
@@ -166,7 +153,7 @@ caller ingest/llama_bench_ingest.py
 caller prefill_chunk_sweep.sh
 caller release_e2e/stage6_perf/niah_long_context.sh
 caller sdpa_headdim_bench.py
-caller spec_broken_engine.sh
+caller spec/broken_engine.sh
 recall-missing bench_identity_selftest.sh default
 recall-missing bench_llama_ab_selftest.sh default
 recall-missing codec_smoke_runner_selftest.sh default
@@ -217,7 +204,7 @@ set-mode bench_cell.sh
 set-mode bench_identity_selftest.sh
 set-mode bench_llama_ab.sh
 set-mode bench_llama_ab_selftest.sh
-set-mode check_gpu_device_census.sh
+set-mode check/gpu_device_census.sh
 set-mode codec_smoke_runner_selftest.sh
 set-mode gpu_capture.sh
 set-mode gputrace_preflight.sh
@@ -229,8 +216,8 @@ set-mode prefill_chunk_sweep.sh
 set-mode published_ingest_selftest.sh
 set-mode schema_constraint_canary.sh
 set-mode spec_bench_selftest.sh
-set-mode spec_broken_engine.sh
-set-mode spec_round_stream_compare_selftest.sh
+set-mode spec/broken_engine.sh
+set-mode spec/round_stream_compare_selftest.sh
 name bench_cache_types.sh RMLX_DIR
 name bench_llama_ab_selftest.sh ROOT
 name eval/wikitext2_ppl.py workspace
@@ -238,13 +225,13 @@ name lib/kv_boundary_default.py _REPO_ROOT
 name perf-iter/bench_decode_tps.sh _RMLX_ROOT
 name perf_ab_selftest.sh ROOT
 name rmlx-capture.entitlements hyphen
-name run_gpu_tests_selftest.sh ROOT
-name spec_broken_engine.sh ROOT
+name suite/run_gpu_tests_selftest.sh ROOT
+name spec/broken_engine.sh ROOT
 size perf_ab.sh 1031
 size perf_ceiling.py 1107
 size report/debt_report_selftest.sh 1598
 size report/kv_census_selftest.sh 1212
-size run_gpu_tests.sh 1322
+size suite/run_gpu_tests.sh 1322
 size spec_bench.sh 1169
 size spec_bench_published.sh 1185
 size spec_bench_published_selftest.sh 2790
@@ -312,7 +299,7 @@ env-knob bench_llama_ab.sh RMLX_HOME
 env-knob bench_llama_ab_selftest.sh FORCE_UNMEASURED_ROWS
 env-knob codec_smoke_runner_selftest.sh GATE_BIN
 env-knob eval/wikitext2_ppl.py RMLX_HOME
-env-knob eval_lock_stress.sh RUNS,TIMEOUT_SECS
+env-knob suite/eval_lock_stress.sh RUNS,TIMEOUT_SECS
 env-knob ingest/codec_inertness_ingest.py RMLX_HOME,RMLX_REPO_ROOT
 env-knob ingest/llama_ab_ingest.py RMLX_HOME,RMLX_REPO_ROOT
 env-knob ingest/llama_bench_ingest.py RMLX_METRICS_DB,RMLX_REPO_ROOT
@@ -331,7 +318,7 @@ env-knob perf_canary.sh RMLX_HOME,RMLX_O_MODELS_ROOT
 env-knob prefill_chunk_sweep.sh RMLX_HOME
 env-knob published_table_selftest.sh MAKE_ENV
 env-knob release_e2e/stage6_perf/codec_smoke_runner.sh RMLX_O_MODELS_ROOT
-env-knob run_gpu_tests.sh RMLX_O_MODELS_ROOT,RMLX_SKIP_GPU
+env-knob suite/run_gpu_tests.sh RMLX_O_MODELS_ROOT,RMLX_SKIP_GPU
 env-knob schema_constraint_canary.sh BONSAI_MODEL,GEMMA_E2B_MODEL,PORT,RMLX_O_MODELS_ROOT
 env-knob spec_bench.sh BENCH_PROMPT,BENCH_PROMPT_FILE,BENCH_PROMPT_NAME,DRAFTER_MODEL,PORT,RMLX_HARDWARE_TAG,RMLX_HOME,VERIFIER_MODEL
 env-knob spec_bench_published.sh KV_QUANT_SEEN,MEMORY_PID,RMLX_HOME,SAMPLING_SEEN,SERVER_PID

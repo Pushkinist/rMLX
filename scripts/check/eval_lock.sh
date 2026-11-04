@@ -143,7 +143,7 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # Optional scan root, so the fixture suite can point the gate at a synthetic
 # tree. Defaults to the real one.
 SCAN_DIR="${1:-${REPO_ROOT}/crates}"

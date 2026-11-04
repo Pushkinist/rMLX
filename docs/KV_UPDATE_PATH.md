@@ -369,7 +369,7 @@ keeps one structured parser per payload shape (`mixed_*`, `rot_k_v*`,
   `make check-kv-codec-disposition` reads the help text and the INERT banners
   against the runtime disposition.
 - The `.metal` kernels and their `probes/kernels.manifest` entries, and
-  `scripts/gpu_validation_census.txt`.
+  `scripts/suite/gpu_validation_census.txt`.
 - The iso trace target `rmlx_kv_quant::kvcache::update_iso`, which
   `docs/PERF_BASELINE.md` § "Iso trace phases" names. An event without a
   `target =` override takes its module path, so moving a body moves its target.

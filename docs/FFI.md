@@ -327,7 +327,7 @@ still pipelines: only the graph walk and dispatch hold the lock.
 
 ### Which C entry points need the lock
 
-Twenty-five. `scripts/check_eval_lock.sh` records how they were derived; re-run
+Twenty-five. `scripts/check/eval_lock.sh` records how they were derived; re-run
 it when the pin moves. Its automated pass finds 24; it cannot follow the
 `std::function` call through which `mlx_closure_apply` evaluates, so do not
 delete the closure guard.

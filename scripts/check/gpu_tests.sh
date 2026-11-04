@@ -10,7 +10,7 @@
 #                 notice, and none stands down silently.
 #   list          the compliant set, `<crate><TAB><fn>` per line; with --files a third column
 #                 names the declaring file, which is `scripts/suite/gpu_test_classes.sh`'s input.
-#                 `scripts/run_gpu_tests.sh` turns the two columns into the tests it runs.
+#                 `scripts/suite/run_gpu_tests.sh` turns the two columns into the tests it runs.
 #
 # The population is classified once, by the code below the awk program. `ignored` and `list` are
 # its two ends, and `skip-notices` reads its listing with the declaring file, so the three cannot
@@ -230,7 +230,7 @@
 #   review a marker inside a macro body against every invocation, not one.
 #
 # LIST vs ENFORCE (they are not the same population, on purpose)
-#   `list` feeds `scripts/run_gpu_tests.sh`, which turns each name into a
+#   `list` feeds `scripts/suite/run_gpu_tests.sh`, which turns each name into a
 #   libtest substring filter. A macro-generated test has no name until the
 #   compiler expands it — the classifier holds the macro's name, not the cells'
 #   — so listing it would emit a filter that selects nothing and trip that
@@ -334,7 +334,7 @@
 #
 # ---- the `skip-notices` rule --------------------------------------------------------------
 # WHY
-#   `scripts/run_gpu_tests.sh` reads the tests' own words to tell a cell that
+#   `scripts/suite/run_gpu_tests.sh` reads the tests' own words to tell a cell that
 #   held from one that was never asked. The notice it reads is
 #   `SKIP <test>: <why>`, and the NAME is the whole of the attribution: it is
 #   what puts the cell on the stand-down list an operator reads, and what lets
@@ -385,7 +385,7 @@
 #   (`let Ok(p) = std::env::var("X") else { return; };`) reads as a block with
 #   no return in it at all.
 #
-#   `RMLX_SKIP_GPU` is out of it: `scripts/run_gpu_tests.sh` refuses to start
+#   `RMLX_SKIP_GPU` is out of it: `scripts/suite/run_gpu_tests.sh` refuses to start
 #   with that variable set, so a guard on it cannot stand a cell down in this
 #   suite.
 #
@@ -435,7 +435,7 @@
 #   one the runner counts and lists nowhere.
 #
 #   The notice's SHAPE is not defined here. `scripts/lib/skip_notice_patterns.sh`
-#   holds it, and `scripts/run_gpu_tests.sh` reads the same file — a source gate
+#   holds it, and `scripts/suite/run_gpu_tests.sh` reads the same file — a source gate
 #   that accepted `SKIP  foo:` while the runner counted it as nameless would pass
 #   CI and leave every run INCOMPLETE with a number and no name.
 #
@@ -1268,7 +1268,7 @@ read -r -d '' AWK_DETECT <<'AWK' || true
                 printf "V  %s: %s\n", file_of[g], label_of[g]
             }
             # The compliant set: GPU-touching AND ignored. This is exactly the
-            # population `scripts/run_gpu_tests.sh` must execute, so it is
+            # population `scripts/suite/run_gpu_tests.sh` must execute, so it is
             # derived from the same classifier rather than from a second,
             # drifting list. Exempt fns are device-as-value, not Metal.
             #
@@ -1502,7 +1502,7 @@ classify_root() {
         echo "    with a line-leading marker in the fn's own attribute block:" >&2
         echo "      // gpu-test-gate: metal-unscanned  <why the scanner cannot see it>" >&2
         echo "    It then counts as GPU-touching (the #[ignore] rule bites on it) and" >&2
-        echo "    is deliberately NOT listed for scripts/run_gpu_tests.sh." >&2
+        echo "    is deliberately NOT listed for scripts/suite/run_gpu_tests.sh." >&2
         echo "  * it does not touch the GPU — drop the #[ignore] and pass Device::Cpu," >&2
         echo "    so it runs in the default gate again." >&2
         echo "  * it is ignored for some other reason — say THAT reason in the #[ignore]" >&2
@@ -1545,7 +1545,7 @@ print_notes() {
     # stdout listing clean.
     if [ -n "$macro_generated" ]; then
         echo "NOTE: macro-generated GPU tests — the #[ignore] rule is ENFORCED on the macro" >&2
-        echo "body, but the cells are not listed for scripts/run_gpu_tests.sh (their fn names" >&2
+        echo "body, but the cells are not listed for scripts/suite/run_gpu_tests.sh (their fn names" >&2
         echo "exist only after expansion, so a filter cannot be derived):" >&2
         printf '%s' "$macro_generated" >&2
         echo "  -> These run under their own driver; see docs/TESTING.md." >&2
@@ -1557,7 +1557,7 @@ print_notes() {
     # that run must be told what it does not cover.
     if [ -n "$declared_unscanned" ]; then
         echo "NOTE: declared-route GPU tests — the #[ignore] rule is ENFORCED on them, but" >&2
-        echo "they are not listed for scripts/run_gpu_tests.sh (that runner asserts a Metal" >&2
+        echo "they are not listed for scripts/suite/run_gpu_tests.sh (that runner asserts a Metal" >&2
         echo "validation banner per crate, and these are snapshot-gated or drive a child" >&2
         echo "process, so listing them would fail the suite for a missing model):" >&2
         printf '%s' "$declared_unscanned" >&2
@@ -1873,7 +1873,7 @@ mode_skip_notices() {
         printf '%s' "${other}" >&2
         echo >&2
         echo "A fn that prints and returns with no value did not run to its end. libtest" >&2
-        echo "reports it as \`ok\`, and scripts/run_gpu_tests.sh lists it only when the line" >&2
+        echo "reports it as \`ok\`, and scripts/suite/run_gpu_tests.sh lists it only when the line" >&2
         echo "it printed is" >&2
         echo "  SKIP <this test fn>: <why>" >&2
         echo "A helper takes the caller's test name and prints \`SKIP {test}: <why>\`." >&2
@@ -1887,7 +1887,7 @@ mode_skip_notices() {
         echo "       cell down and announce nothing:" >&2
         printf '%s' "${silent}" >&2
         echo >&2
-        echo "libtest reports such a cell as \`ok\` and scripts/run_gpu_tests.sh never sees" >&2
+        echo "libtest reports such a cell as \`ok\` and scripts/suite/run_gpu_tests.sh never sees" >&2
         echo "it, so a cell that could not run is counted as one that passed. Announce it:" >&2
         echo "  SKIP <the test fn>: <why>" >&2
         echo "A helper takes the caller's test name as an argument and prints" >&2
@@ -1900,7 +1900,7 @@ mode_skip_notices() {
         echo "ERROR: ${n} stand-down notice(s) in classified GPU tests do not name their test:" >&2
         printf '%s' "${violations}" >&2
         echo >&2
-        echo "scripts/run_gpu_tests.sh counts such a notice and lists it nowhere, so the run" >&2
+        echo "scripts/suite/run_gpu_tests.sh counts such a notice and lists it nowhere, so the run" >&2
         echo "is INCOMPLETE with a number and no name. Write it as" >&2
         echo "  SKIP <this test fn>: <why>" >&2
         echo "See docs/GPU_TESTS.md." >&2
@@ -1911,7 +1911,7 @@ mode_skip_notices() {
         echo "ERROR: ${n_waivers} waiver(s) in classified GPU tests' files do not name their test:" >&2
         printf '%s' "${waivers}" >&2
         echo >&2
-        echo "scripts/run_gpu_tests.sh counts such a waiver and lists it nowhere. Write it as" >&2
+        echo "scripts/suite/run_gpu_tests.sh counts such a waiver and lists it nowhere. Write it as" >&2
         echo "  WAIVED <this test fn>: <why>" >&2
         echo "or, in a helper, \`WAIVED {test}: <why>\`. See docs/GPU_TESTS.md." >&2
         red=1

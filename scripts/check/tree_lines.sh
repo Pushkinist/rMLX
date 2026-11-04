@@ -60,7 +60,7 @@
 #         one, a root that is not a directory or not inside a git work tree, a scope that
 #         holds no file, a file that cannot be read, or no file left to scan because every
 #         one in scope is missing, empty or binary
-# Not a mode of: check_no_inline_tests.sh — that gate reads Rust items (attributes, braces)
+# Not a mode of: check/no_inline_tests.sh — that gate reads Rust items (attributes, braces)
 #                under crates/; this one matches raw lines, comments included, in any file
 
 set -euo pipefail
