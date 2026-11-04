@@ -12,35 +12,35 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `bench_cache_types.sh` | none | bench_cache_types.sh — drive the cache-type combo matrix for a single model. |
 | `bench_cell.sh` | bench_cache_types.sh | Per-cell driver for cross-backend bench. |
 | `bench_codec_cell.sh` | make bench-codec-cell | bench_codec_cell.sh — single-codec × single-model bench runner. |
-| `bench_identity_selftest.sh` | make bench-identity-selftest, make ci | bench_identity_selftest.sh — mutation check for the commit and run-log sources |
+| `bench_identity_selftest.sh` | make bench-identity-selftest | bench_identity_selftest.sh — mutation check for the commit and run-log sources |
 | `bench_llama_ab.sh` | bench_llama_ab_selftest.sh | bench_llama_ab.sh — ABBA-interleaved A/B comparison of two `llama-server` arms. |
-| `bench_llama_ab_selftest.sh` | make ci, make llama-ab-selftest | bench_llama_ab_selftest.sh — mutation check for `scripts/bench_llama_ab.sh`. |
-| `check_published_samples_fixtures.sh` | make check-published-samples-fixtures, make ci | Recall test for published_samples.py verify: synthetic sample-set roots, one edit per case. |
-| `codec_smoke_runner_selftest.sh` | make ci, make codec-smoke-runner-selftest | scripts/codec_smoke_runner_selftest.sh — recall test for the verdict of |
+| `bench_llama_ab_selftest.sh` | make llama-ab-selftest | bench_llama_ab_selftest.sh — mutation check for `scripts/bench_llama_ab.sh`. |
+| `check_published_samples_fixtures.sh` | make check-published-samples-fixtures | Recall test for published_samples.py verify: synthetic sample-set roots, one edit per case. |
+| `codec_smoke_runner_selftest.sh` | make codec-smoke-runner-selftest | scripts/codec_smoke_runner_selftest.sh — recall test for the verdict of |
 | `convert_silero_vad.py` | by hand | Convert Silero VAD v4 ONNX weights (16kHz branch only) to safetensors. |
 | `gen_lloyd_codebook.py` | none | Generate Lloyd-Max optimal N(0,1) centroids for TurboQuant codebook. |
 | `gpu_capture.sh` | make profile-gputrace | Capture a Metal GPU trace of a bounded window of steady-state decode, for |
 | `gputrace_preflight.sh` | make build-capture, make gputrace-preflight, gpu_capture.sh | Check the host prerequisites for Apple's GPU tools to work with a Metal capture of this binary. |
 | `mst_capture.sh` | make profile-mst | Record a Metal System Trace of a live rmlx run, export the GPU-interval table |
 | `perf_ab.sh` | perf_ab_host_gate_fixtures.sh, perf_ab_selftest.sh, perf_canary.sh | perf_ab.sh — ABBA-interleaved A/B comparison of two `rmlx baseline` arms. |
-| `perf_ab_host_gate_fixtures.sh` | make canary-ab-host-gate-fixtures, make ci | Recall test for the perf_ab.sh boundary: --synthetic-arms gives the same verdict on any host. |
-| `perf_ab_ingest_selftest.sh` | make canary-ab-ingest-selftest, make ci | perf_ab_ingest_selftest.sh — mutation check for scripts/ingest/perf_ab_ingest.py. |
-| `perf_ab_selftest.sh` | make canary-ab-selftest, make ci | perf_ab_selftest.sh — mutation check for `scripts/perf_ab.sh`. |
+| `perf_ab_host_gate_fixtures.sh` | make canary-ab-host-gate-fixtures | Recall test for the perf_ab.sh boundary: --synthetic-arms gives the same verdict on any host. |
+| `perf_ab_ingest_selftest.sh` | make canary-ab-ingest-selftest | perf_ab_ingest_selftest.sh — mutation check for scripts/ingest/perf_ab_ingest.py. |
+| `perf_ab_selftest.sh` | make canary-ab-selftest | perf_ab_selftest.sh — mutation check for `scripts/perf_ab.sh`. |
 | `perf_canary.sh` | make canary, make canary-ab | perf_canary.sh — fast decode-TPS canary for the three standard test-target models. |
 | `perf_ceiling.py` | check/engine_parity_selftest.sh, lib/published_table.py | Theoretical decode/prefill ceiling calculator for rMLX on Apple Silicon. |
 | `prefill_chunk_sweep.sh` | none | prefill_chunk_sweep.sh — Latin-square sweep of one architecture's prefill |
-| `published_ingest_selftest.sh` | make ci, make published-ingest-selftest | published_ingest_selftest.sh — mutation check for |
-| `published_samples.py` | make check-published-samples, make ci, check_published_samples_fixtures.sh, ingest/published_ingest.py, lib/published_fixed_prompt.py, +2 more scripts | Build and verify the checked-in published-protocol sample sets. |
-| `published_table_selftest.sh` | make ci, make published-table-selftest | Mutation check for lib/published_table.py: a fixture snapshot, asserting exit code and reason. |
+| `published_ingest_selftest.sh` | make published-ingest-selftest | published_ingest_selftest.sh — mutation check for |
+| `published_samples.py` | make check-published-samples, check_published_samples_fixtures.sh, ingest/published_ingest.py, lib/published_fixed_prompt.py, +2 more scripts | Build and verify the checked-in published-protocol sample sets. |
+| `published_table_selftest.sh` | make published-table-selftest | Mutation check for lib/published_table.py: a fixture snapshot, asserting exit code and reason. |
 | `rmlx-capture.entitlements` | make build-capture | Debug-only entitlement for the GPU-capture binary (`make build-capture`). |
 | `schema_constraint_canary.sh` | make schema-constraint-canary | Real-model proof for the json_schema constrained-decoding path: two probes, two architectures. |
 | `sdpa_headdim_bench.py` | none | What MLX's SDPA dispatch costs as a function of `head_dim`. |
 | `spec_bench.sh` | make spec-canary, spec_bench_selftest.sh | spec_bench.sh — bench one model in normal vs MTP speculative-decode mode. |
 | `spec_bench_published.sh` | spec_bench_published_selftest.sh | Bench one verifier under the published on-device speculative-decoding protocol, three passes. |
-| `spec_bench_published_selftest.sh` | make ci, make spec-bench-published-selftest | Mutation check for spec_bench_published.sh: a stub server, asserting exit codes and refusals. |
-| `spec_bench_selftest.sh` | make ci, make spec-bench-selftest | Mutation check for spec_bench.sh: a stub rmlx server, asserting recorded values and refusals. |
+| `spec_bench_published_selftest.sh` | make spec-bench-published-selftest | Mutation check for spec_bench_published.sh: a stub server, asserting exit codes and refusals. |
+| `spec_bench_selftest.sh` | make spec-bench-selftest | Mutation check for spec_bench.sh: a stub rmlx server, asserting recorded values and refusals. |
 | `ssd_canary.sh` | make ssd-canary, ssd_canary_selftest.sh | ssd_canary.sh — end-to-end long-session SSD prompt-cache tier canary. |
-| `ssd_canary_selftest.sh` | make ci, make ssd-canary-selftest | Recall test for ssd_canary.sh and its make targets, against a stub rmlx and a stub HTTP server. |
+| `ssd_canary_selftest.sh` | make ssd-canary-selftest | Recall test for ssd_canary.sh and its make targets, against a stub rmlx and a stub HTTP server. |
 
 ## scripts/bench/
 
@@ -52,26 +52,26 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
-| `check/doc_refs.py` | make check-doc-refs, make check-doc-source-citations, make ci, check/doc_refs_selftest.sh | References into docs/ resolve and no edit re-points one; --source-paths: cited crates/ files exist. |
-| `check/doc_refs_selftest.sh` | make check-doc-refs-selftest, make ci | Recall test for doc_refs.py: synthetic git repos, asserting exit code and reason. |
-| `check/engine_parity.sh` | make check-kv-boundary-default-parity, make check-kv-byte-model-parity, make check-kv-codec-disposition, make check-spec-metric-parity, make ci, check/engine_parity_selftest.sh | CI gate: a restatement of an engine fact agrees with the engine, one mode per fact. |
-| `check/engine_parity_selftest.sh` | make check-kv-boundary-default-parity-fixtures, make check-kv-byte-model-parity-fixtures, make check-kv-codec-disposition-fixtures, make check-spec-metric-parity-fixtures, make ci | Recall test for the four engine-parity modes: one case group per mode, rule and exit code. |
-| `check/eval_lock.sh` | make check-eval-lock, make ci, check/rust_gates_fixtures.sh | CI gate: every MLX FFI call that can evaluate runs under the process-wide evaluation lock. |
-| `check/gpu_device_census.sh` | make check-gpu-device-census, make check-gpu-device-census-library, make ci, check/gpu_device_census_selftest.sh | CI gate: the rmlx binary's source names Device::Gpu in exactly one place, claim_gpu. |
-| `check/gpu_device_census_selftest.sh` | make check-gpu-device-census-selftest, make ci | Recall test for check/gpu_device_census.sh: scan roots, asserting exit code and file:line. |
-| `check/gpu_tests.sh` | make check-gpu-tests-ignored, make check-named-skip-notices, make ci, check/gpu_tests_selftest.sh, check/rust_gates_fixtures.sh, suite/gpu_test_classes.sh, +2 more scripts | CI gate: the classified GPU tests carry #[ignore] and name their stand-downs; one tool lists them. |
-| `check/gpu_tests_selftest.sh` | make check-named-skip-notices-fixtures, make ci | Recall test for check/gpu_tests.sh skip-notices and list: planted shapes, asserting the reason. |
-| `check/kernel_dispatch.sh` | make check-kernel-dtype-contract, make check-no-kernel-input-eval, make check-no-scalar-f32-leak, make ci, check/rust_gates_fixtures.sh | CI gate: Metal-kernel dispatchers keep inputs lazy, return the caller's dtype, leak no f32 scalar. |
-| `check/kv_layer_quants.sh` | make check-kv-layer-quants, make ci, check/rust_gates_fixtures.sh | CI gate: the per-layer KV codec vector has one producer, and every cache stack uses it. |
-| `check/metal_kernels.sh` | make check-metal-compiles, make check-metal-format, make ci, pre-commit, check/metal_kernels_selftest.sh | CI gate: gated .metal kernels compile (compile) or are clang-format clean (format). |
-| `check/metal_kernels_selftest.sh` | make check-metal-kernels-selftest, make ci | Recall test for the MSL kernel gates: planted kernel trees and stub toolchains. |
-| `check/no_decode_swallow.sh` | make check-no-decode-swallow, make ci, check/rust_gates_fixtures.sh | CI gate: a failed decode step or prefill chunk propagates instead of looking like a success. |
-| `check/no_inline_tests.sh` | make check-no-inline-tests, make ci, check/rust_gates_fixtures.sh | CI gate: no inline #[cfg(test)] module body in a non-test source file. |
-| `check/rust_gates_fixtures.sh` | make check-eval-lock-fixtures, make check-gpu-tests-ignored-fixtures, make check-kernel-dtype-contract-fixtures, make check-kv-layer-quants-fixtures, make check-no-decode-swallow-fixtures, make check-no-inline-tests-fixtures, make check-no-kernel-input-eval-fixtures, make check-no-scalar-f32-leak-fixtures, make ci | Recall test for the Rust-source gates: planted scan roots from a table, asserting exit and reason. |
-| `check/spec_round_loops.sh` | make check-spec-charge, make check-spec-sampling, make ci, check/spec_round_loops_selftest.sh, report/debt_report.py | CI gate: speculative round loops carry one phase-charge decision and the request's sampler. |
-| `check/spec_round_loops_selftest.sh` | make check-spec-charge-fixtures, make check-spec-sampling-fixtures, make ci | Recall test for the speculative round-loop gate: one edit per synthetic source root, rule and exit. |
-| `check/tree_lines.sh` | make check-claim-bypass, make check-personal-data, make ci, check/tree_lines_selftest.sh | CI gate: forbidden lines in the files git does not ignore, one rule set per mode. |
-| `check/tree_lines_selftest.sh` | make check-claim-bypass-selftest, make check-personal-data-selftest, make ci | Recall test for the tree-line gate: planted git work trees, asserting exit code and file:line. |
+| `check/doc_refs.py` | make check-doc-refs, make check-doc-source-citations, check/doc_refs_selftest.sh | References into docs/ resolve and no edit re-points one; --source-paths: cited crates/ files exist. |
+| `check/doc_refs_selftest.sh` | make check-doc-refs-selftest | Recall test for doc_refs.py: synthetic git repos, asserting exit code and reason. |
+| `check/engine_parity.sh` | make check-kv-boundary-default-parity, make check-kv-byte-model-parity, make check-kv-codec-disposition, make check-spec-metric-parity, check/engine_parity_selftest.sh | CI gate: a restatement of an engine fact agrees with the engine, one mode per fact. |
+| `check/engine_parity_selftest.sh` | make check-kv-boundary-default-parity-fixtures, make check-kv-byte-model-parity-fixtures, make check-kv-codec-disposition-fixtures, make check-spec-metric-parity-fixtures | Recall test for the four engine-parity modes: one case group per mode, rule and exit code. |
+| `check/eval_lock.sh` | make check-eval-lock, check/rust_gates_fixtures.sh | CI gate: every MLX FFI call that can evaluate runs under the process-wide evaluation lock. |
+| `check/gpu_device_census.sh` | make check-gpu-device-census, make check-gpu-device-census-library, check/gpu_device_census_selftest.sh | CI gate: the rmlx binary's source names Device::Gpu in exactly one place, claim_gpu. |
+| `check/gpu_device_census_selftest.sh` | make check-gpu-device-census-selftest | Recall test for check/gpu_device_census.sh: scan roots, asserting exit code and file:line. |
+| `check/gpu_tests.sh` | make check-gpu-tests-ignored, make check-named-skip-notices, check/gpu_tests_selftest.sh, check/rust_gates_fixtures.sh, suite/gpu_test_classes.sh, +2 more scripts | CI gate: the classified GPU tests carry #[ignore] and name their stand-downs; one tool lists them. |
+| `check/gpu_tests_selftest.sh` | make check-named-skip-notices-fixtures | Recall test for check/gpu_tests.sh skip-notices and list: planted shapes, asserting the reason. |
+| `check/kernel_dispatch.sh` | make check-kernel-dtype-contract, make check-no-kernel-input-eval, make check-no-scalar-f32-leak, check/rust_gates_fixtures.sh | CI gate: Metal-kernel dispatchers keep inputs lazy, return the caller's dtype, leak no f32 scalar. |
+| `check/kv_layer_quants.sh` | make check-kv-layer-quants, check/rust_gates_fixtures.sh | CI gate: the per-layer KV codec vector has one producer, and every cache stack uses it. |
+| `check/metal_kernels.sh` | make check-metal-compiles, make check-metal-format, pre-commit, check/metal_kernels_selftest.sh | CI gate: gated .metal kernels compile (compile) or are clang-format clean (format). |
+| `check/metal_kernels_selftest.sh` | make check-metal-kernels-selftest | Recall test for the MSL kernel gates: planted kernel trees and stub toolchains. |
+| `check/no_decode_swallow.sh` | make check-no-decode-swallow, check/rust_gates_fixtures.sh | CI gate: a failed decode step or prefill chunk propagates instead of looking like a success. |
+| `check/no_inline_tests.sh` | make check-no-inline-tests, check/rust_gates_fixtures.sh | CI gate: no inline #[cfg(test)] module body in a non-test source file. |
+| `check/rust_gates_fixtures.sh` | make check-eval-lock-fixtures, make check-gpu-tests-ignored-fixtures, make check-kernel-dtype-contract-fixtures, make check-kv-layer-quants-fixtures, make check-no-decode-swallow-fixtures, make check-no-inline-tests-fixtures, make check-no-kernel-input-eval-fixtures, make check-no-scalar-f32-leak-fixtures | Recall test for the Rust-source gates: planted scan roots from a table, asserting exit and reason. |
+| `check/spec_round_loops.sh` | make check-spec-charge, make check-spec-sampling, check/spec_round_loops_selftest.sh, report/debt_report.py | CI gate: speculative round loops carry one phase-charge decision and the request's sampler. |
+| `check/spec_round_loops_selftest.sh` | make check-spec-charge-fixtures, make check-spec-sampling-fixtures | Recall test for the speculative round-loop gate: one edit per synthetic source root, rule and exit. |
+| `check/tree_lines.sh` | make check-claim-bypass, make check-personal-data, check/tree_lines_selftest.sh | CI gate: forbidden lines in the files git does not ignore, one rule set per mode. |
+| `check/tree_lines_selftest.sh` | make check-claim-bypass-selftest, make check-personal-data-selftest | Recall test for the tree-line gate: planted git work trees, asserting exit code and file:line. |
 
 ## scripts/eval/
 
@@ -83,10 +83,10 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
-| `host/gc.sh` | make ci, make target-gc, make target-size-report, make traces-gc, gpu_capture.sh, host/gc_selftest.sh | Bound a regenerable directory: prune stale target/ profiles, or evict old .rmlx/traces bundles. |
-| `host/gc_selftest.sh` | make ci, make gc-selftest | Recall test for the cleanup tools: planted scratch trees, never the real target/ or traces. |
+| `host/gc.sh` | make target-gc, make target-size-report, make traces-gc, gpu_capture.sh, host/gc_selftest.sh | Bound a regenerable directory: prune stale target/ profiles, or evict old .rmlx/traces bundles. |
+| `host/gc_selftest.sh` | make gc-selftest | Recall test for the cleanup tools: planted scratch trees, never the real target/ or traces. |
 | `host/mlx_restore_pin.sh` | make mlx-restore-pin, host/mlx_restore_pin_selftest.sh | Restore the MLX and mlx-c pair named by crates/rmlx-mlx/mlx-pin.txt, then link and pin those kegs. |
-| `host/mlx_restore_pin_selftest.sh` | make ci, make mlx-restore-pin-selftest | Recall test for mlx_restore_pin.sh: throwaway prefixes, stub brew, asserting exit and records. |
+| `host/mlx_restore_pin_selftest.sh` | make mlx-restore-pin-selftest | Recall test for mlx_restore_pin.sh: throwaway prefixes, stub brew, asserting exit and records. |
 
 ## scripts/ingest/
 
@@ -144,7 +144,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
 | `profile/gputrace.sh` | profile/gputrace_selftest.sh | Read a .gputrace bundle offline: the Metal functions it names, a diff of two, or a summary. |
-| `profile/gputrace_selftest.sh` | make ci, make gputrace-selftest | Recall test for the .gputrace readers: synthetic bundles, no trace, no Xcode tool, no GPU. |
+| `profile/gputrace_selftest.sh` | make gputrace-selftest | Recall test for the .gputrace readers: synthetic bundles, no trace, no Xcode tool, no GPU. |
 
 ## scripts/release/
 
@@ -152,8 +152,8 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 |---|---|---|
 | `release/release.sh` | make bottle, make release-package, make release-sha, make release-sign, make tap-sync, release/release_cpu_selftest.sh, release/release_selftest.sh | The release steps in one tool: package, sign, sha, bottle, tap-sync, notes. |
 | `release/release_cpu.py` | release/release.sh, release/release_cpu_selftest.sh | The CPU target of the release tarball binary. |
-| `release/release_cpu_selftest.sh` | make ci, make release-cpu-selftest | Recall test for release_cpu.py: throwaway repo roots and a stub cargo, asserting exit and reason. |
-| `release/release_selftest.sh` | make ci, make release-selftest | Recall test for the release tool's six modes: a scratch repo, stub external tools, no network. |
+| `release/release_cpu_selftest.sh` | make release-cpu-selftest | Recall test for release_cpu.py: throwaway repo roots and a stub cargo, asserting exit and reason. |
+| `release/release_selftest.sh` | make release-selftest | Recall test for the release tool's six modes: a scratch repo, stub external tools, no network. |
 
 ## scripts/release_e2e/stage6_perf/
 
@@ -168,24 +168,24 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
-| `report/debt_report.py` | make check-doc-size, make check-scripts, make ci, make debt-report, make file-size-report, make kv-update-census, make scripts-index, make shellcheck-report, report/debt_report_selftest.sh, report/doc_size_selftest.sh, report/kv_census_selftest.sh, +2 more scripts | Advisory reports about the tree, the doc-size gate and the KV structural figures. |
-| `report/debt_report_selftest.sh` | make ci, make debt-report-selftest | Recall test for debt_report.py: fixture trees, asserting what the printed text holds. |
-| `report/doc_size_selftest.sh` | make check-doc-size-selftest, make ci | Recall test for debt_report.py --check-doc-size: throwaway git trees, asserting exit and reason. |
+| `report/debt_report.py` | make check-doc-size, make check-scripts, make debt-report, make file-size-report, make kv-update-census, make scripts-index, make shellcheck-report, report/debt_report_selftest.sh, report/doc_size_selftest.sh, report/kv_census_selftest.sh, +2 more scripts | Advisory reports about the tree, the doc-size gate and the KV structural figures. |
+| `report/debt_report_selftest.sh` | make debt-report-selftest | Recall test for debt_report.py: fixture trees, asserting what the printed text holds. |
+| `report/doc_size_selftest.sh` | make check-doc-size-selftest | Recall test for debt_report.py --check-doc-size: throwaway git trees, asserting exit and reason. |
 | `report/kv_census.py` | report/debt_report.py | Structural figures for the KV update path: variant shapes, match sites, update bodies, refs. |
-| `report/kv_census_selftest.sh` | make ci, make kv-update-census-selftest | Recall test for debt_report.py --kv-census: synthetic trees, asserting exit code and figure. |
+| `report/kv_census_selftest.sh` | make kv-update-census-selftest | Recall test for debt_report.py --kv-census: synthetic trees, asserting exit code and figure. |
 | `report/line_match.py` | report/debt_report.py, report/scripts_gate_twin.py | Line-level overlap of two texts: digit-folded lines and the matched-line count. |
 | `report/rust_scan.py` | report/debt_report.py, report/kv_census.py | Rust source reader for the report tools: enums, `match` arms and `fn` bodies. |
 | `report/scripts_gate.py` | report/debt_report.py | The rules for scripts/ and the generated scripts/INDEX.md. |
 | `report/scripts_gate_callers.py` | report/scripts_gate.py, report/scripts_gate_rules.py | The derived caller of each file and the INDEX.md built from it. |
 | `report/scripts_gate_content.py` | report/scripts_gate.py | Per-file content rules of the scripts gate: shell mode, Python floor, names, size, heredocs, knobs. |
-| `report/scripts_gate_content_selftest.sh` | make check-scripts-selftest, make ci | Recall test for the per-file rules of debt_report.py --scripts: planted files, exit code, rule:line. |
+| `report/scripts_gate_content_selftest.sh` | make check-scripts-selftest | Recall test for the per-file rules of debt_report.py --scripts: planted files, exit code, rule:line. |
 | `report/scripts_gate_env.py` | report/scripts_gate_content.py | Environment reads of the scripts gate: the knobs a file takes from the environment. |
 | `report/scripts_gate_external.py` | report/scripts_gate.py, report/scripts_gate_callers.py, report/scripts_gate_rules.py | Callers of scripts/ that are not scripts: hosted CI steps, pre-commit hooks, Rust sources. |
 | `report/scripts_gate_files.py` | report/scripts_gate.py, report/scripts_gate_callers.py, report/scripts_gate_content.py, +6 more scripts | The population of scripts/ and the header each file carries. |
 | `report/scripts_gate_pins.txt` | lib/selftest_support.sh, report/scripts_gate.py, report/scripts_gate_selftest.sh | Accepted violations of the scripts/ rules: `<rule> <path> [<members>]`; a pin only shrinks. |
 | `report/scripts_gate_recall.py` | report/scripts_gate.py, report/scripts_gate_content.py, report/scripts_gate_rules.py, +1 more scripts | Recall tests of the scripts gate: what `make ci` runs, who covers it, what a line silences. |
 | `report/scripts_gate_rules.py` | report/scripts_gate.py, report/scripts_gate_content.py, report/scripts_gate_env.py, +3 more scripts | The per-file rules of the scripts gate and their registry. |
-| `report/scripts_gate_selftest.sh` | make check-scripts-selftest, make ci | Recall test for debt_report.py --scripts: planted trees, asserting exit code and rule:file:line. |
+| `report/scripts_gate_selftest.sh` | make check-scripts-selftest | Recall test for debt_report.py --scripts: planted trees, asserting exit code and rule:file:line. |
 | `report/scripts_gate_structure.py` | report/scripts_gate.py, report/scripts_gate_content.py | Structural rules of the scripts gate: lib/, modules, shebang, exec bit, orphans, dead paths. |
 | `report/scripts_gate_text.py` | report/scripts_gate_callers.py, report/scripts_gate_content.py, report/scripts_gate_env.py, +3 more scripts | Readers of script text: shell, Python and Makefile source. |
 | `report/scripts_gate_twin.py` | report/scripts_gate.py | The twin rule of the scripts gate: two files of one language that say the same lines. |
@@ -196,7 +196,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 |---|---|---|
 | `spec/broken_engine.sh` | none | Run the answer-equivalence gate against a deliberately broken round loop. |
 | `spec/round_stream_compare.py` | crates/rmlx-models/tests/spec_greedy_equivalence.rs, spec/round_stream_compare_selftest.sh | Compare two speculative per-round event-stream captures, or hold one to the pinned manifest. |
-| `spec/round_stream_compare_selftest.sh` | make ci, make spec-round-stream-selftest | Recall test for spec/round_stream_compare.py verify: synthetic captures, asserting the exit code. |
+| `spec/round_stream_compare_selftest.sh` | make spec-round-stream-selftest | Recall test for spec/round_stream_compare.py verify: synthetic captures, asserting the exit code. |
 
 ## scripts/suite/
 
@@ -206,4 +206,4 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `suite/gpu_test_classes.sh` | suite/run_gpu_tests.sh, suite/run_gpu_tests_selftest.sh | Print the half (codec\|rest) or threadgroup setting (on\|off) of each classified GPU test. |
 | `suite/gpu_validation_census.txt` | suite/run_gpu_tests.sh, suite/run_gpu_tests_selftest.sh | The Metal shader-validation hits suite/run_gpu_tests.sh accepts, per (kernel, kind, crate, test). |
 | `suite/run_gpu_tests.sh` | make ci-perf, make gpu-test, suite/run_gpu_tests_selftest.sh | Run the #[ignore] Metal tests of every member crate, serialized, under Metal shader validation. |
-| `suite/run_gpu_tests_selftest.sh` | make ci, make gpu-runner-selftest | Recall test for suite/run_gpu_tests.sh: how it reports red runs, waivers and census verdicts. |
+| `suite/run_gpu_tests_selftest.sh` | make gpu-runner-selftest | Recall test for suite/run_gpu_tests.sh: how it reports red runs, waivers and census verdicts. |

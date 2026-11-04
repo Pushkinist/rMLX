@@ -506,37 +506,37 @@ kv-update-census-selftest: ## CI gate: recall test for the KV structural figures
 check-no-inline-tests: ## CI gate: fail if any non-test.rs file has inline #[cfg(test)] mod tests { ... }
 	@bash scripts/check/no_inline_tests.sh
 
-check-no-inline-tests-fixtures: ## CI gate: recall test for the above, 32 planted scan roots, each asserting the rule or the refusal as well as the exit code
+check-no-inline-tests-fixtures: ## CI gate: recall test for the above, planted scan roots, each asserting the rule or the refusal as well as the exit code
 	@bash scripts/check/rust_gates_fixtures.sh no_inline_tests
 
 check-no-scalar-f32-leak: ## CI gate: fail if arch-layer code has unguarded scalar_f32( not followed by .astype(
 	@bash scripts/check/kernel_dispatch.sh scalar-f32
 
-check-no-scalar-f32-leak-fixtures: ## CI gate: recall test for the above, 43 planted scan roots, each asserting the line it names or the refusal as well as the exit code
+check-no-scalar-f32-leak-fixtures: ## CI gate: recall test for the above, planted scan roots, each asserting the line it names or the refusal as well as the exit code
 	@bash scripts/check/rust_gates_fixtures.sh scalar_f32_leak
 
 check-kv-layer-quants: ## CI gate: fail if kv_quant_for_layer is called outside kv_cache/ (one producer: kv_layer_quants)
 	@bash scripts/check/kv_layer_quants.sh
 
-check-kv-layer-quants-fixtures: ## CI gate: recall test for the above, 24 planted scan roots, each asserting the rule or the refusal as well as the exit code
+check-kv-layer-quants-fixtures: ## CI gate: recall test for the above, planted scan roots, each asserting the rule or the refusal as well as the exit code
 	@bash scripts/check/rust_gates_fixtures.sh kv_layer_quants
 
 check-kv-codec-disposition: ## CI gate: fail if the --kv-quant/--kv-bits help or the INERT banner docs contradict a codec's runtime disposition
 	@bash scripts/check/engine_parity.sh kv-codec-disposition
 
-check-kv-codec-disposition-fixtures: ## CI gate: recall test for the above — 25 synthetic scan roots, each asserting which rule fired
+check-kv-codec-disposition-fixtures: ## CI gate: recall test for the above — synthetic scan roots, each asserting which rule fired
 	@bash scripts/check/engine_parity_selftest.sh kv-codec-disposition
 
 check-kv-byte-model-parity: ## CI gate: fail if scripts/perf_ceiling.py's KV byte model disagrees with the engine's
 	@bash scripts/check/engine_parity.sh kv-byte-model
 
-check-kv-byte-model-parity-fixtures: ## CI gate: recall test for the above — 9 synthetic manifests and the two usage errors, each asserting which check fired
+check-kv-byte-model-parity-fixtures: ## CI gate: recall test for the above — synthetic manifests and the two usage errors, each asserting which check fired
 	@bash scripts/check/engine_parity_selftest.sh kv-byte-model
 
 check-kv-boundary-default-parity: ## CI gate: fail if the CLI help, docs/CLI.md or the ingest resolver names a different default KV boundary than the engine
 	@bash scripts/check/engine_parity.sh kv-boundary-default
 
-check-kv-boundary-default-parity-fixtures: ## CI gate: recall test for the above — 15 planted scan roots, each asserting the reason as well as the exit code
+check-kv-boundary-default-parity-fixtures: ## CI gate: recall test for the above — planted scan roots, each asserting the reason as well as the exit code
 	@bash scripts/check/engine_parity_selftest.sh kv-boundary-default
 
 .PHONY: check-spec-metric-parity
@@ -552,7 +552,7 @@ check-spec-sampling: ## CI gate: fail if a speculative round loop is not handed 
 	@bash scripts/check/spec_round_loops.sh sampling
 
 .PHONY: check-spec-sampling-fixtures
-check-spec-sampling-fixtures: ## CI gate: recall test for the above — 53 cases over four tree shapes, each asserting the reason as well as exit 1 vs exit 2
+check-spec-sampling-fixtures: ## CI gate: recall test for the above — cases over four tree shapes, each asserting the reason as well as exit 1 vs exit 2
 	@bash scripts/check/spec_round_loops_selftest.sh sampling
 
 .PHONY: check-spec-charge
@@ -560,11 +560,11 @@ check-spec-charge: ## CI gate: fail if a speculative round loop names more than 
 	@bash scripts/check/spec_round_loops.sh charge
 
 .PHONY: check-spec-charge-fixtures
-check-spec-charge-fixtures: ## CI gate: recall test for the above, and for the driver listing and the arguments — 114 cases over three tree shapes, each asserting the reason as well as exit 1 vs exit 2
+check-spec-charge-fixtures: ## CI gate: recall test for the above, and for the driver listing and the arguments — cases over three tree shapes, each asserting the reason as well as exit 1 vs exit 2
 	@bash scripts/check/spec_round_loops_selftest.sh charge
 
 .PHONY: spec-round-stream-selftest
-spec-round-stream-selftest: ## CI gate: recall test for the round-stream manifest reader — 17 cases, a stale pin and a true one among them
+spec-round-stream-selftest: ## CI gate: recall test for the round-stream manifest reader — cases, a stale pin and a true one among them
 	@bash scripts/spec/round_stream_compare_selftest.sh
 
 .PHONY: check-published-samples
@@ -642,7 +642,7 @@ check-doc-consumers: check-doc-refs check-doc-source-citations check-kv-codec-di
 check-no-decode-swallow: ## CI gate: fail if a decode-step failure breaks instead of propagating (would report as finish_reason="length")
 	@bash scripts/check/no_decode_swallow.sh
 
-check-no-decode-swallow-fixtures: ## CI gate: recall test for the above, 42 planted scan roots, each asserting the rule, the pinned site count or the refusal as well as the exit code
+check-no-decode-swallow-fixtures: ## CI gate: recall test for the above, planted scan roots, each asserting the rule, the pinned site count or the refusal as well as the exit code
 	@bash scripts/check/rust_gates_fixtures.sh no_decode_swallow
 
 check-eval-lock:  ## CI gate: fail if an MLX eval FFI call is made without the process-wide evaluation lock
@@ -680,7 +680,7 @@ gpu-runner-selftest: ## CI gate: the GPU runner reports a failing test and a sha
 check-named-skip-notices: ## CI gate: a classified GPU test that announces its own stand-down names itself, so the runner can attribute it
 	@bash scripts/check/gpu_tests.sh skip-notices
 
-check-named-skip-notices-fixtures: ## CI gate: recall test for the above and for the classified-test listing, 162 cases, each asserting the reason as well as the exit code
+check-named-skip-notices-fixtures: ## CI gate: recall test for the above and for the classified-test listing, cases, each asserting the reason as well as the exit code
 	@bash scripts/check/gpu_tests_selftest.sh
 
 check-no-kernel-input-eval: ## CI gate: fail if a Metal-kernel dispatcher blocks on Array::eval() (serialises host vs GPU once per layer per decode step)
@@ -695,7 +695,7 @@ check-gpu-device-census: ## CI gate: the rmlx binary names Device::Gpu in exactl
 check-gpu-device-census-library: ## CI gate: library code in rmlx-audio, rmlx-server and rmlx-models never names Device::Gpu as a value; the device comes from the caller
 	@bash scripts/check/gpu_device_census.sh --library
 
-check-gpu-device-census-selftest: ## CI gate: recall test for the above and its library mode, 69 cases, each asserting the reason as well as the exit code
+check-gpu-device-census-selftest: ## CI gate: recall test for the above and its library mode, cases, each asserting the reason as well as the exit code
 	@bash scripts/check/gpu_device_census_selftest.sh
 
 check-claim-bypass: ## CI gate: nothing in the tree deletes the Metal claim, names its file outside the claim module, or kills by process-name pattern
@@ -738,81 +738,80 @@ gc-selftest: ## CI gate: recall test for the cleanup tool (host/gc.sh, target an
 
 # ---- one-shot CI gate -------------------------------------------------
 ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gate: fmt + clippy + test + feature-gated capture tests + deny + audit + metrics-sanity + inline-test + A/B-harness + MSL gates
-	@bash scripts/report/debt_report_selftest.sh
-	@bash scripts/report/doc_size_selftest.sh
-	@python3 scripts/report/debt_report.py --check-doc-size
-	@python3 scripts/report/debt_report.py --scripts
-	@bash scripts/report/scripts_gate_selftest.sh
-	@bash scripts/report/scripts_gate_content_selftest.sh
-	@bash scripts/release/release_cpu_selftest.sh
-	@bash scripts/release/release_selftest.sh
-	@bash scripts/report/kv_census_selftest.sh
-	@bash scripts/check/no_inline_tests.sh
-	@bash scripts/check/rust_gates_fixtures.sh no_inline_tests
-	@bash scripts/check/kernel_dispatch.sh scalar-f32
-	@bash scripts/check/rust_gates_fixtures.sh scalar_f32_leak
-	@bash scripts/check/kv_layer_quants.sh
-	@bash scripts/check/rust_gates_fixtures.sh kv_layer_quants
-	@bash scripts/check/engine_parity.sh kv-codec-disposition
-	@bash scripts/check/engine_parity_selftest.sh kv-codec-disposition
-	@bash scripts/check/engine_parity.sh kv-byte-model
-	@bash scripts/check/engine_parity_selftest.sh kv-byte-model
-	@bash scripts/check/engine_parity.sh kv-boundary-default
-	@bash scripts/check/engine_parity_selftest.sh kv-boundary-default
-	@bash scripts/check/engine_parity.sh spec-metrics
-	@bash scripts/check/engine_parity_selftest.sh spec-metrics
-	@bash scripts/check/spec_round_loops.sh sampling
-	@bash scripts/check/spec_round_loops_selftest.sh sampling
-	@bash scripts/check/spec_round_loops.sh charge
-	@bash scripts/check/spec_round_loops_selftest.sh charge
-	@bash scripts/spec/round_stream_compare_selftest.sh
-	@python3 scripts/published_samples.py verify
-	@bash scripts/check_published_samples_fixtures.sh
-	@python3 scripts/check/doc_refs.py --source-paths
-	@bash scripts/check/doc_refs_selftest.sh
+	@$(MAKE) --no-print-directory debt-report-selftest
+	@$(MAKE) --no-print-directory check-doc-size-selftest
+	@$(MAKE) --no-print-directory check-doc-size
+	@$(MAKE) --no-print-directory check-scripts
+	@$(MAKE) --no-print-directory check-scripts-selftest
+	@$(MAKE) --no-print-directory release-cpu-selftest
+	@$(MAKE) --no-print-directory release-selftest
+	@$(MAKE) --no-print-directory kv-update-census-selftest
+	@$(MAKE) --no-print-directory check-no-inline-tests
+	@$(MAKE) --no-print-directory check-no-inline-tests-fixtures
+	@$(MAKE) --no-print-directory check-no-scalar-f32-leak
+	@$(MAKE) --no-print-directory check-no-scalar-f32-leak-fixtures
+	@$(MAKE) --no-print-directory check-kv-layer-quants
+	@$(MAKE) --no-print-directory check-kv-layer-quants-fixtures
+	@$(MAKE) --no-print-directory check-kv-codec-disposition
+	@$(MAKE) --no-print-directory check-kv-codec-disposition-fixtures
+	@$(MAKE) --no-print-directory check-kv-byte-model-parity
+	@$(MAKE) --no-print-directory check-kv-byte-model-parity-fixtures
+	@$(MAKE) --no-print-directory check-kv-boundary-default-parity
+	@$(MAKE) --no-print-directory check-kv-boundary-default-parity-fixtures
+	@$(MAKE) --no-print-directory check-spec-metric-parity
+	@$(MAKE) --no-print-directory check-spec-metric-parity-fixtures
+	@$(MAKE) --no-print-directory check-spec-sampling
+	@$(MAKE) --no-print-directory check-spec-sampling-fixtures
+	@$(MAKE) --no-print-directory check-spec-charge
+	@$(MAKE) --no-print-directory check-spec-charge-fixtures
+	@$(MAKE) --no-print-directory spec-round-stream-selftest
+	@$(MAKE) --no-print-directory check-published-samples
+	@$(MAKE) --no-print-directory check-published-samples-fixtures
+	@$(MAKE) --no-print-directory check-doc-source-citations
+	@$(MAKE) --no-print-directory check-doc-refs-selftest
 	@$(MAKE) --no-print-directory check-doc-refs
-	@bash scripts/check/no_decode_swallow.sh
-	@bash scripts/check/rust_gates_fixtures.sh no_decode_swallow
-	@bash scripts/check/eval_lock.sh
-	@bash scripts/check/rust_gates_fixtures.sh eval_lock
-	@bash scripts/check/gpu_tests.sh ignored
-	@bash scripts/check/rust_gates_fixtures.sh gpu_tests_ignored
-	@bash scripts/suite/run_gpu_tests_selftest.sh
-	@bash scripts/check/gpu_tests.sh skip-notices
-	@bash scripts/check/gpu_tests_selftest.sh
-	@bash scripts/check/kernel_dispatch.sh input-eval
-	@bash scripts/check/rust_gates_fixtures.sh no_kernel_input_eval
-	@bash scripts/check/gpu_device_census.sh
-	@bash scripts/check/gpu_device_census.sh --library
-	@bash scripts/check/gpu_device_census_selftest.sh
-	@bash scripts/check/tree_lines.sh claim-bypass
-	@bash scripts/check/tree_lines_selftest.sh claim-bypass
-	@bash scripts/check/tree_lines.sh personal-data
-	@bash scripts/check/tree_lines_selftest.sh personal-data
-	@bash scripts/host/mlx_restore_pin_selftest.sh
-	@bash scripts/check/kernel_dispatch.sh dtype-contract
-	@bash scripts/check/rust_gates_fixtures.sh kernel_dtype_contract
-	@bash scripts/perf_ab_selftest.sh
-	@bash scripts/codec_smoke_runner_selftest.sh
-	@bash scripts/perf_ab_host_gate_fixtures.sh
-	@bash scripts/perf_ab_ingest_selftest.sh
-	@bash scripts/bench_llama_ab_selftest.sh
-	@bash scripts/spec_bench_selftest.sh
-	@bash scripts/bench_identity_selftest.sh
-	@bash scripts/spec_bench_published_selftest.sh
-	@bash scripts/published_ingest_selftest.sh
-	@bash scripts/published_table_selftest.sh
-	@bash scripts/ssd_canary_selftest.sh
+	@$(MAKE) --no-print-directory check-no-decode-swallow
+	@$(MAKE) --no-print-directory check-no-decode-swallow-fixtures
+	@$(MAKE) --no-print-directory check-eval-lock
+	@$(MAKE) --no-print-directory check-eval-lock-fixtures
+	@$(MAKE) --no-print-directory check-gpu-tests-ignored
+	@$(MAKE) --no-print-directory check-gpu-tests-ignored-fixtures
+	@$(MAKE) --no-print-directory gpu-runner-selftest
+	@$(MAKE) --no-print-directory check-named-skip-notices
+	@$(MAKE) --no-print-directory check-named-skip-notices-fixtures
+	@$(MAKE) --no-print-directory check-no-kernel-input-eval
+	@$(MAKE) --no-print-directory check-no-kernel-input-eval-fixtures
+	@$(MAKE) --no-print-directory check-gpu-device-census
+	@$(MAKE) --no-print-directory check-gpu-device-census-library
+	@$(MAKE) --no-print-directory check-gpu-device-census-selftest
+	@$(MAKE) --no-print-directory check-claim-bypass
+	@$(MAKE) --no-print-directory check-claim-bypass-selftest
+	@$(MAKE) --no-print-directory check-personal-data
+	@$(MAKE) --no-print-directory check-personal-data-selftest
+	@$(MAKE) --no-print-directory mlx-restore-pin-selftest
+	@$(MAKE) --no-print-directory check-kernel-dtype-contract
+	@$(MAKE) --no-print-directory check-kernel-dtype-contract-fixtures
+	@$(MAKE) --no-print-directory canary-ab-selftest
+	@$(MAKE) --no-print-directory codec-smoke-runner-selftest
+	@$(MAKE) --no-print-directory canary-ab-host-gate-fixtures
+	@$(MAKE) --no-print-directory canary-ab-ingest-selftest
+	@$(MAKE) --no-print-directory llama-ab-selftest
+	@$(MAKE) --no-print-directory spec-bench-selftest
+	@$(MAKE) --no-print-directory bench-identity-selftest
+	@$(MAKE) --no-print-directory spec-bench-published-selftest
+	@$(MAKE) --no-print-directory published-ingest-selftest
+	@$(MAKE) --no-print-directory published-table-selftest
+	@$(MAKE) --no-print-directory ssd-canary-selftest
 	@$(MAKE) --no-print-directory check-published-table
-	@bash scripts/check/metal_kernels_selftest.sh
-	@bash scripts/profile/gputrace_selftest.sh
-	@bash scripts/host/gc_selftest.sh
-	@bash scripts/check/metal_kernels.sh format
-	@bash scripts/check/metal_kernels.sh compile
-	@python3 scripts/report/debt_report.py --shellcheck
-	@python3 scripts/report/debt_report.py --file-sizes || true
-	@bash scripts/host/gc.sh target --warn-gb 50
-	@python3 scripts/report/debt_report.py || true
+	@$(MAKE) --no-print-directory check-metal-kernels-selftest
+	@$(MAKE) --no-print-directory gputrace-selftest
+	@$(MAKE) --no-print-directory gc-selftest
+	@$(MAKE) --no-print-directory check-metal-format
+	@$(MAKE) --no-print-directory check-metal-compiles
+	@$(MAKE) --no-print-directory shellcheck-report
+	@$(MAKE) --no-print-directory file-size-report || true
+	@$(MAKE) --no-print-directory target-size-report
+	@$(MAKE) --no-print-directory debt-report || true
 	@echo "ci ok"
 
 # tag: derive v<version> from the single source of truth
@@ -1019,20 +1018,26 @@ spec-bench-published-selftest: ## mutation-check the published-protocol bench ag
 published-ingest-selftest: ## mutation-check the published-protocol runs.db ingester against synthetic results (no DB write)
 	bash scripts/published_ingest_selftest.sh
 
+# Gate one canary against a recorded SHA via `rmlx metrics deltas`.
+# $(1) is the gate target's name, $(2) the target that writes the rows it reads.
+define canary_deltas
+@test -n "$(SHA)" || { echo "ERROR: SHA= required. Usage: make $(1) SHA=<last-green-sha>"; exit 125; }
+@RMLX_HOME="$${RMLX_HOME:-$$PWD/.rmlx}"; \
+DB_PATH="$${CANARY_DB:-$$RMLX_HOME/metrics/runs.db}"; \
+if [ ! -f "$$DB_PATH" ]; then \
+	echo "skip: runs.db not found at $$DB_PATH (run 'make $(2)' first)"; \
+	exit 125; \
+fi; \
+echo "==> $(1): comparing vs SHA=$(SHA) threshold=$(CANARY_THRESHOLD_PCT)%"; \
+RMLX_METRICS_DB="$$DB_PATH" cargo run --release --bin rmlx -- \
+	metrics deltas \
+	--since-sha "$(SHA)" \
+	--threshold-pct $(CANARY_THRESHOLD_PCT) \
+	--exit-code true
+endef
+
 canary-gate:        ## gate TPS regressions via runs.db (SHA= required; e.g. make canary-gate SHA=3ba8aee)
-	@test -n "$(SHA)" || { echo "ERROR: SHA= required. Usage: make canary-gate SHA=<last-green-sha>"; exit 125; }
-	@RMLX_HOME="$${RMLX_HOME:-$$PWD/.rmlx}"; \
-	DB_PATH="$${CANARY_DB:-$$RMLX_HOME/metrics/runs.db}"; \
-	if [ ! -f "$$DB_PATH" ]; then \
-		echo "skip: runs.db not found at $$DB_PATH (run 'make canary' first)"; \
-		exit 125; \
-	fi; \
-	echo "==> canary-gate: comparing vs SHA=$(SHA) threshold=$(CANARY_THRESHOLD_PCT)%"; \
-	RMLX_METRICS_DB="$$DB_PATH" cargo run --release --bin rmlx -- \
-		metrics deltas \
-		--since-sha "$(SHA)" \
-		--threshold-pct $(CANARY_THRESHOLD_PCT) \
-		--exit-code true
+	$(call canary_deltas,canary-gate,canary)
 
 # ---- Spec-decode canary (MTP / DFlash / Eagle3 accept_rate gate) -------------
 #
@@ -1067,19 +1072,7 @@ spec-canary: build-perf  ## run spec-decode canary (normal+MTP × 3 prompt class
 		bash scripts/spec_bench.sh --tag canary-code
 
 spec-canary-gate:   ## gate spec-decode regressions (decode_tps_warm + accept_rate); SHA= required
-	@test -n "$(SHA)" || { echo "ERROR: SHA= required. Usage: make spec-canary-gate SHA=<last-green-sha>"; exit 125; }
-	@RMLX_HOME="$${RMLX_HOME:-$$PWD/.rmlx}"; \
-	DB_PATH="$${CANARY_DB:-$$RMLX_HOME/metrics/runs.db}"; \
-	if [ ! -f "$$DB_PATH" ]; then \
-		echo "skip: runs.db not found at $$DB_PATH (run 'make spec-canary' first)"; \
-		exit 125; \
-	fi; \
-	echo "==> spec-canary-gate: comparing vs SHA=$(SHA) threshold=$(CANARY_THRESHOLD_PCT)%"; \
-	RMLX_METRICS_DB="$$DB_PATH" cargo run --release --bin rmlx -- \
-		metrics deltas \
-		--since-sha "$(SHA)" \
-		--threshold-pct $(CANARY_THRESHOLD_PCT) \
-		--exit-code true
+	$(call canary_deltas,spec-canary-gate,spec-canary)
 
 # ---- SSD-tier canary (POPULATE / REVISIT / EVICT) -------------------------
 #
