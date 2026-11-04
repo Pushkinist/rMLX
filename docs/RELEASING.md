@@ -27,7 +27,10 @@ the MLX that Homebrew links on the user's machine at run time.
   `packaging/homebrew/rmlx.rb`.
 - The binary reads `events.mlx_nax` from the metallib it loaded at run time
   (`crates/rmlx-mlx/src/nax.rs`), so the value describes the user's MLX.
-- Run `rmlx healthcheck --human` on the release machine before building and read its `mlx_pin` line.
+- After building, run `target/release/rmlx healthcheck --human` and read its
+  `mlx_pin` line. It compares the MLX that dyld loads for that binary with the
+  pinned pair, so it reads the pair the shipped binary uses, not the pair an
+  installed `rmlx` loads.
 
 ## The tarball's target CPU
 

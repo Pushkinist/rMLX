@@ -134,10 +134,13 @@ store_tar() {
 resolves() { (cd "$1/prefix/$2" 2>/dev/null && pwd -P); }
 
 # restore_run <case>: the script under test, run from the case's repo tree.
+# It gets --store <case>/store, or RAW_ARGS when that is not empty.
+RAW_ARGS=()
 restore_run() {
-	local repo="$1/repo"
+	local repo="$1/repo" args=(--store "$1/store")
+	[ "${#RAW_ARGS[@]}" -eq 0 ] || args=("${RAW_ARGS[@]}")
 	PATH="$1/bin:$ST_WORK/bin:$PATH" HOMEBREW_PREFIX="$1/prefix" \
-		bash "$repo/scripts/host/mlx_restore_pin.sh" --store "$1/store"
+		bash "$repo/scripts/host/mlx_restore_pin.sh" "${args[@]}"
 }
 
 # expect <name> <case> <exit> <needles> [<check> <arg>]...
@@ -396,5 +399,24 @@ touch "$c/prefix/brew.no-linked"
 expect "a link that leaves no linked record is a failure" "$c" 1 \
 	"$c/prefix/var/homebrew/linked/mlx resolves to 'nothing'
 run make mlx-restore-pin again"
+
+# Bad arguments stop the run before it touches the prefix.
+UNTOUCHED=(absent "Cellar/.rmlx-restore-lock" absent "Cellar/.rmlx-restore.*" absent "Cellar/mlx" absent "Cellar/mlx-c")
+
+c=$(new_case store-no-value)
+store_tar "$c" mlx-copy.tar.gz mlx "$MLX_V" yes
+RAW_ARGS=(--store)
+expect "--store without a value is a usage error" "$c" 2 "--store needs a directory" "${UNTOUCHED[@]}"
+
+c=$(new_case store-empty-value)
+store_tar "$c" mlx-copy.tar.gz mlx "$MLX_V" yes
+RAW_ARGS=(--store "")
+expect "--store with an empty value is a usage error" "$c" 2 "--store needs a directory" "${UNTOUCHED[@]}"
+
+c=$(new_case unknown-flag)
+store_tar "$c" mlx-copy.tar.gz mlx "$MLX_V" yes
+RAW_ARGS=(--bogus)
+expect "an unknown flag is a usage error" "$c" 2 "usage: " "${UNTOUCHED[@]}"
+RAW_ARGS=()
 
 st_done

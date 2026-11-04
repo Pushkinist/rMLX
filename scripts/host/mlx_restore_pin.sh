@@ -40,7 +40,7 @@ STORE_ROOT="$HOME/.rmlx/bottles"
 while [ $# -gt 0 ]; do
 	case $1 in
 	--store)
-		[ $# -ge 2 ] || { echo "--store needs a directory" >&2; exit 2; }
+		[ -n "${2:-}" ] || { echo "--store needs a directory" >&2; exit 2; }
 		STORE_ROOT=$2
 		shift 2
 		;;
