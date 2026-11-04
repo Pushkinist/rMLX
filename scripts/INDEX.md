@@ -18,17 +18,14 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `check_eval_lock.sh` | make check-eval-lock, make ci, check/rust_gates_fixtures.sh | CI gate: every MLX FFI call that can evaluate runs under the process-wide evaluation lock. |
 | `check_gpu_device_census.sh` | make check-gpu-device-census, make check-gpu-device-census-library, make ci, check_gpu_device_census_selftest.sh | CI gate: the rmlx binary's source names Device::Gpu in exactly one place, claim_gpu. |
 | `check_gpu_device_census_selftest.sh` | make check-gpu-device-census-selftest, make ci | Recall test for check_gpu_device_census.sh: scan roots, asserting exit code and file:line. |
-| `check_kv_boundary_default_parity.sh` | make check-kv-boundary-default-parity, make ci | CI gate: every surface naming the default KV boundary-layer counts agrees with the engine's pair. |
-| `check_kv_byte_model_parity.sh` | make check-kv-byte-model-parity, make ci, check_kv_byte_model_parity_fixtures.sh | CI gate: the KV byte model in perf_ceiling.py agrees byte for byte with the engine's. |
-| `check_kv_byte_model_parity_fixtures.sh` | make check-kv-byte-model-parity-fixtures, make ci | Recall test for check_kv_byte_model_parity.sh: one edited manifest per case, asserting the check. |
-| `check_kv_codec_disposition.sh` | make check-kv-codec-disposition, make ci, check_kv_codec_disposition_fixtures.sh | CI gate: what the KV help and docs say a codec does agrees with its runtime disposition. |
-| `check_kv_codec_disposition_fixtures.sh` | make check-kv-codec-disposition-fixtures, make ci | Recall test for check_kv_codec_disposition.sh: synthetic scan roots, asserting rule and exit code. |
+| `check_kv_boundary_default_parity.sh` | make check-kv-boundary-default-parity, make ci, check/engine_parity_selftest.sh | CI gate: every surface naming the default KV boundary-layer counts agrees with the engine's pair. |
+| `check_kv_byte_model_parity.sh` | make check-kv-byte-model-parity, make ci, check/engine_parity_selftest.sh | CI gate: the KV byte model in perf_ceiling.py agrees byte for byte with the engine's. |
+| `check_kv_codec_disposition.sh` | make check-kv-codec-disposition, make ci, check/engine_parity_selftest.sh | CI gate: what the KV help and docs say a codec does agrees with its runtime disposition. |
 | `check_kv_layer_quants.sh` | make check-kv-layer-quants, make ci, check/rust_gates_fixtures.sh | CI gate: the per-layer KV codec vector has one producer, and every cache stack uses it. |
 | `check_no_decode_swallow.sh` | make check-no-decode-swallow, make ci, check/rust_gates_fixtures.sh | CI gate: a failed decode step or prefill chunk propagates instead of looking like a success. |
 | `check_no_inline_tests.sh` | make check-no-inline-tests, make ci, check/rust_gates_fixtures.sh | CI gate: no inline #[cfg(test)] mod tests block in a non-test source file. |
 | `check_published_samples_fixtures.sh` | make check-published-samples-fixtures, make ci | Recall test for published_samples.py verify: synthetic sample-set roots, one edit per case. |
-| `check_spec_metric_parity.sh` | make check-spec-metric-parity, make ci, check_spec_metric_parity_fixtures.sh | CI gate: every speculative metric the engine declares is one spec_bench.sh records. |
-| `check_spec_metric_parity_fixtures.sh` | make check-spec-metric-parity-fixtures, make ci | Recall test for check_spec_metric_parity.sh: synthetic scan roots, asserting exit code and reason. |
+| `check_spec_metric_parity.sh` | make check-spec-metric-parity, make ci, check/engine_parity_selftest.sh | CI gate: every speculative metric the engine declares is one spec_bench.sh records. |
 | `codec_smoke_runner_selftest.sh` | make ci, make codec-smoke-runner-selftest | scripts/codec_smoke_runner_selftest.sh — recall test for the verdict of |
 | `convert_silero_vad.py` | by hand | Convert Silero VAD v4 ONNX weights (16kHz branch only) to safetensors. |
 | `eval_lock_stress.sh` | make eval-lock-stress | Drive the evaluation-lock reproducer across fresh processes; a non-zero exit or timeout fails. |
@@ -42,7 +39,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `perf_ab_ingest_selftest.sh` | make canary-ab-ingest-selftest, make ci | perf_ab_ingest_selftest.sh — mutation check for scripts/ingest/perf_ab_ingest.py. |
 | `perf_ab_selftest.sh` | make canary-ab-selftest, make ci | perf_ab_selftest.sh — mutation check for `scripts/perf_ab.sh`. |
 | `perf_canary.sh` | make canary, make canary-ab | perf_canary.sh — fast decode-TPS canary for the three standard test-target models. |
-| `perf_ceiling.py` | check_kv_byte_model_parity.sh, check_kv_byte_model_parity_fixtures.sh, lib/published_table.py | Theoretical decode/prefill ceiling calculator for rMLX on Apple Silicon. |
+| `perf_ceiling.py` | check/engine_parity_selftest.sh, check_kv_byte_model_parity.sh, lib/published_table.py | Theoretical decode/prefill ceiling calculator for rMLX on Apple Silicon. |
 | `prefill_chunk_sweep.sh` | none | prefill_chunk_sweep.sh — Latin-square sweep of one architecture's prefill |
 | `published_ingest_selftest.sh` | make ci, make published-ingest-selftest | published_ingest_selftest.sh — mutation check for |
 | `published_samples.py` | make check-published-samples, make ci, check_published_samples_fixtures.sh, ingest/published_ingest.py, lib/published_fixed_prompt.py, +2 more scripts | Build and verify the checked-in published-protocol sample sets. |
@@ -52,7 +49,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `run_gpu_tests_selftest.sh` | make ci, make gpu-runner-selftest | Recall test for run_gpu_tests.sh: how it reports red runs, waivers and census verdicts. |
 | `schema_constraint_canary.sh` | make schema-constraint-canary | Real-model proof for the json_schema constrained-decoding path: two probes, two architectures. |
 | `sdpa_headdim_bench.py` | none | What MLX's SDPA dispatch costs as a function of `head_dim`. |
-| `spec_bench.sh` | make spec-canary, check_spec_metric_parity_fixtures.sh, spec_bench_selftest.sh | spec_bench.sh — bench one model in normal vs MTP speculative-decode mode. |
+| `spec_bench.sh` | make spec-canary, spec_bench_selftest.sh | spec_bench.sh — bench one model in normal vs MTP speculative-decode mode. |
 | `spec_bench_published.sh` | spec_bench_published_selftest.sh | Bench one verifier under the published on-device speculative-decoding protocol, three passes. |
 | `spec_bench_published_selftest.sh` | make ci, make spec-bench-published-selftest | Mutation check for spec_bench_published.sh: a stub server, asserting exit codes and refusals. |
 | `spec_bench_selftest.sh` | make ci, make spec-bench-selftest | Mutation check for spec_bench.sh: a stub rmlx server, asserting recorded values and refusals. |
@@ -74,6 +71,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 |---|---|---|
 | `check/doc_refs.py` | make check-doc-refs, make check-doc-source-citations, make ci, check/doc_refs_selftest.sh | References into docs/ resolve and no edit re-points one; --source-paths: cited crates/ files exist. |
 | `check/doc_refs_selftest.sh` | make check-doc-refs-selftest, make ci | Recall test for doc_refs.py: synthetic git repos, asserting exit code and reason. |
+| `check/engine_parity_selftest.sh` | make check-kv-boundary-default-parity-fixtures, make check-kv-byte-model-parity-fixtures, make check-kv-codec-disposition-fixtures, make check-spec-metric-parity-fixtures, make ci | Recall test for the four engine-parity gates: one case group per gate, rule and exit code. |
 | `check/gpu_tests.sh` | make check-gpu-tests-ignored, make check-named-skip-notices, make ci, check/gpu_tests_selftest.sh, check/rust_gates_fixtures.sh, run_gpu_tests.sh, +2 more scripts | CI gate: the classified GPU tests carry #[ignore] and name their stand-downs; one tool lists them. |
 | `check/gpu_tests_selftest.sh` | make check-named-skip-notices-fixtures, make ci | Recall test for check/gpu_tests.sh skip-notices and list: planted shapes, asserting the reason. |
 | `check/kernel_dispatch.sh` | make check-kernel-dtype-contract, make check-no-kernel-input-eval, make check-no-scalar-f32-leak, make ci, check/rust_gates_fixtures.sh | CI gate: Metal-kernel dispatchers keep inputs lazy, return the caller's dtype, leak no f32 scalar. |
@@ -134,7 +132,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `lib/published_run_log.py` | lib/binary_identity.py, lib/prefill_ms.py, lib/published_greedy.py, +1 more scripts | Read one rmlx run log back as a per-request table. |
 | `lib/published_table.py` | make check-published-table, make published-table, published_table_selftest.sh | Render published-protocol runs as the Markdown table a post needs. |
 | `lib/run_log_for_pid.py` | lib/bench_server.sh | Pick the run log a given process wrote, out of the candidates on stdin. |
-| `lib/selftest_support.sh` | bench_llama_ab_selftest.sh, check/gpu_tests_selftest.sh, check/metal_kernels_selftest.sh, +16 more scripts | The case runner and shims the self-tests share; source it. |
+| `lib/selftest_support.sh` | bench_llama_ab_selftest.sh, check/engine_parity_selftest.sh, check/gpu_tests_selftest.sh, +17 more scripts | The case runner and shims the self-tests share; source it. |
 | `lib/server_decode_tps.py` | perf-iter/bench_decode_tps.sh, spec_bench.sh | Read one request's decode rate off a running rmlx server. |
 | `lib/server_kv_quant.py` | lib/bench_server.sh, lib/binary_identity.py, perf_canary.sh, +1 more scripts | Read the KV codec a run resolved out of its rmlx run log. |
 | `lib/server_sampling.py` | crates/rmlx-server/src/engine/sampler_event_tests.rs, lib/published_run_log.py, spec_bench.sh | Read whether a run's requests were sampled, out of its rmlx run log. |

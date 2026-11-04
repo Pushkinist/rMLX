@@ -121,6 +121,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         check-kv-layer-quants check-kv-layer-quants-fixtures check-kv-codec-disposition \
         check-kv-codec-disposition-fixtures \
         check-kv-byte-model-parity check-kv-byte-model-parity-fixtures \
+        check-kv-boundary-default-parity-fixtures \
         check-no-decode-swallow check-no-decode-swallow-fixtures check-gpu-tests-ignored \
         check-gpu-tests-ignored-fixtures gpu-runner-selftest \
         check-named-skip-notices check-named-skip-notices-fixtures \
@@ -524,16 +525,19 @@ check-kv-codec-disposition: ## CI gate: fail if the --kv-quant/--kv-bits help or
 	@bash scripts/check_kv_codec_disposition.sh
 
 check-kv-codec-disposition-fixtures: ## CI gate: recall test for the above — 25 synthetic scan roots, each asserting which rule fired
-	@bash scripts/check_kv_codec_disposition_fixtures.sh
+	@bash scripts/check/engine_parity_selftest.sh kv-codec-disposition
 
 check-kv-byte-model-parity: ## CI gate: fail if scripts/perf_ceiling.py's KV byte model disagrees with the engine's
 	@bash scripts/check_kv_byte_model_parity.sh
 
-check-kv-byte-model-parity-fixtures: ## CI gate: recall test for the above — 8 synthetic manifests, each asserting which check fired
-	@bash scripts/check_kv_byte_model_parity_fixtures.sh
+check-kv-byte-model-parity-fixtures: ## CI gate: recall test for the above — 9 synthetic manifests, each asserting which check fired
+	@bash scripts/check/engine_parity_selftest.sh kv-byte-model
 
 check-kv-boundary-default-parity: ## CI gate: fail if the CLI help, docs/CLI.md or the ingest resolver names a different default KV boundary than the engine
 	@bash scripts/check_kv_boundary_default_parity.sh
+
+check-kv-boundary-default-parity-fixtures: ## CI gate: recall test for the above — 14 planted scan roots, each asserting the reason as well as the exit code
+	@bash scripts/check/engine_parity_selftest.sh kv-boundary-default
 
 .PHONY: check-spec-metric-parity
 check-spec-metric-parity: ## CI gate: fail if the speculative metrics the engine declares are not the ones the bench records
@@ -541,7 +545,7 @@ check-spec-metric-parity: ## CI gate: fail if the speculative metrics the engine
 
 .PHONY: check-spec-metric-parity-fixtures
 check-spec-metric-parity-fixtures: ## CI gate: recall test for the above — one synthetic scan root per case, asserting the reason as well as the exit code
-	@bash scripts/check_spec_metric_parity_fixtures.sh
+	@bash scripts/check/engine_parity_selftest.sh spec-metrics
 
 .PHONY: check-spec-sampling
 check-spec-sampling: ## CI gate: fail if a speculative round loop is not handed the request's sampler, or a drafter arm does not pass it
@@ -750,12 +754,13 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_kv_layer_quants.sh
 	@bash scripts/check/rust_gates_fixtures.sh kv_layer_quants
 	@bash scripts/check_kv_codec_disposition.sh
-	@bash scripts/check_kv_codec_disposition_fixtures.sh
+	@bash scripts/check/engine_parity_selftest.sh kv-codec-disposition
 	@bash scripts/check_kv_byte_model_parity.sh
-	@bash scripts/check_kv_byte_model_parity_fixtures.sh
+	@bash scripts/check/engine_parity_selftest.sh kv-byte-model
 	@bash scripts/check_kv_boundary_default_parity.sh
+	@bash scripts/check/engine_parity_selftest.sh kv-boundary-default
 	@bash scripts/check_spec_metric_parity.sh
-	@bash scripts/check_spec_metric_parity_fixtures.sh
+	@bash scripts/check/engine_parity_selftest.sh spec-metrics
 	@bash scripts/check/spec_round_loops.sh sampling
 	@bash scripts/check/spec_round_loops_selftest.sh sampling
 	@bash scripts/check/spec_round_loops.sh charge

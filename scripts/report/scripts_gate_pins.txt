@@ -23,15 +23,12 @@ class check_gpu_device_census.sh
 class check_gpu_device_census_selftest.sh
 class check_kv_boundary_default_parity.sh
 class check_kv_byte_model_parity.sh
-class check_kv_byte_model_parity_fixtures.sh
 class check_kv_codec_disposition.sh
-class check_kv_codec_disposition_fixtures.sh
 class check_kv_layer_quants.sh
 class check_no_decode_swallow.sh
 class check_no_inline_tests.sh
 class check_published_samples_fixtures.sh
 class check_spec_metric_parity.sh
-class check_spec_metric_parity_fixtures.sh
 class codec_smoke_runner_selftest.sh
 class convert_silero_vad.py
 class eval/wikitext2_ppl.py
@@ -84,12 +81,9 @@ usage check_eval_lock.sh
 usage check_gpu_device_census_selftest.sh
 usage check_kv_boundary_default_parity.sh
 usage check_kv_byte_model_parity.sh
-usage check_kv_byte_model_parity_fixtures.sh
 usage check_kv_codec_disposition.sh
-usage check_kv_codec_disposition_fixtures.sh
 usage check_published_samples_fixtures.sh
 usage check_spec_metric_parity.sh
-usage check_spec_metric_parity_fixtures.sh
 usage codec_smoke_runner_selftest.sh
 usage eval/wikitext2_ppl.py
 usage eval_lock_stress.sh
@@ -142,12 +136,9 @@ exit-undeclared check_eval_lock.sh 1
 exit-undeclared check_gpu_device_census.sh 2
 exit-undeclared check_kv_boundary_default_parity.sh 1,2
 exit-undeclared check_kv_byte_model_parity.sh 1,2
-exit-undeclared check_kv_byte_model_parity_fixtures.sh 1,2
 exit-undeclared check_kv_codec_disposition.sh 1,2
-exit-undeclared check_kv_codec_disposition_fixtures.sh 1
 exit-undeclared check_published_samples_fixtures.sh 1
 exit-undeclared check_spec_metric_parity.sh 2
-exit-undeclared check_spec_metric_parity_fixtures.sh 1
 exit-undeclared codec_smoke_runner_selftest.sh 0,1
 exit-undeclared eval/wikitext2_ppl.py 1
 exit-undeclared eval_lock_stress.sh 1
@@ -190,7 +181,6 @@ caller sdpa_headdim_bench.py
 caller spec_broken_engine.sh
 recall-missing bench_identity_selftest.sh default
 recall-missing bench_llama_ab_selftest.sh default
-recall-missing check_kv_boundary_default_parity.sh default
 recall-missing codec_smoke_runner_selftest.sh default
 recall-missing perf_ab_ingest_selftest.sh default
 recall-missing perf_ab_selftest.sh default
@@ -257,7 +247,6 @@ set-mode spec_broken_engine.sh
 set-mode spec_round_stream_compare_selftest.sh
 name bench_cache_types.sh RMLX_DIR
 name bench_llama_ab_selftest.sh ROOT
-name check_kv_codec_disposition_fixtures.sh ROOT
 name eval/wikitext2_ppl.py workspace
 name lib/kv_boundary_default.py _REPO_ROOT
 name perf-iter/bench_decode_tps.sh _RMLX_ROOT
@@ -363,7 +352,6 @@ env-knob spec_bench_published.sh KV_QUANT_SEEN,MEMORY_PID,RMLX_HOME,SAMPLING_SEE
 env-knob spec_bench_selftest.sh OUT_PATH
 env-knob ssd_canary.sh PORT,SSD_GB,VERIFIER_MODEL
 unguarded-array check_kv_codec_disposition.sh BANNER_DOCS
-unguarded-array check_kv_codec_disposition_fixtures.sh BASE_FILES,CASES
 unguarded-array check_published_samples_fixtures.sh args
 unguarded-array mst_capture.sh run_cmd
 unguarded-array perf_ab.sh A_KV,A_MEM,A_TPS,B_KV,B_MEM,B_TPS,MODELS

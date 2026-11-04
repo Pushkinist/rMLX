@@ -1,5 +1,5 @@
 // Synthetic stand-in for crates/rmlx-cli/src/main.rs, read only by
-// scripts/check_kv_codec_disposition_fixtures.sh. It is not compiled and is not
+// scripts/check/engine_parity_selftest.sh. It is not compiled and is not
 // part of any crate: the gate reads six help constants and the `--kv-quant` /
 // `--kv-bits` / `--kv-preset` argument declarations out of the source, and each
 // fixture makes one edit to this file, to a doc beside it, or to

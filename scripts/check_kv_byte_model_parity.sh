@@ -6,7 +6,7 @@
 #
 #   With no argument it derives the manifest by running the emitter test. With a
 #   MANIFEST file it reads a pre-captured one instead — how
-#   `check_kv_byte_model_parity_fixtures.sh` drives it, one mutation at a time.
+#   `check/engine_parity_selftest.sh` drives it, one mutation at a time.
 #
 # WHY
 #   `perf_ceiling.py` prices a codec without building the workspace, so it

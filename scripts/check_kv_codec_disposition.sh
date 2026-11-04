@@ -7,7 +7,7 @@
 #   With no argument it reads the real surfaces and derives the manifest by
 #   running the emitter test. With a SCAN_ROOT it reads `main.rs`, a
 #   pre-captured `manifest.raw` and the banner docs from that directory instead,
-#   which stands in for `docs/` — how `check_kv_codec_disposition_fixtures.sh`
+#   which stands in for `docs/` — how `check/engine_parity_selftest.sh`
 #   drives it, one mutation at a time.
 #
 # WHY
