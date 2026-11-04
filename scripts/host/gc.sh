@@ -125,7 +125,7 @@ if [ -n "$WARN_GB" ] && { [ "$APPLY" = "1" ] || [ "$ALL" = "1" ]; }; then
 	refuse "--warn-gb is the size report and takes neither --apply nor --all"
 fi
 
-cd "$REPO_ROOT" || exit 1
+[ -n "$REPO_ROOT" ] && cd "$REPO_ROOT" || exit 1
 
 size_report() {
 	if [ ! -d target ]; then
