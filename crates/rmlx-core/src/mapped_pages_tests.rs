@@ -71,12 +71,14 @@ fn file_pages_in_cache_is_empty_for_an_empty_file() {
 
 #[test]
 fn invalidate_file_pages_drops_unsynced_pages_and_keeps_their_bytes() {
+    // "Unsynced": written with no explicit `fsync`; the test does not check that the pages are dirty.
     let page = page_size().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("unsynced.bin");
     let data: Vec<u8> = (0..4 * page).map(|i| (i % 251) as u8).collect();
     std::fs::write(&path, &data).unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), data);
+    assert!(file_pages_in_cache(&path).unwrap().iter().all(|&c| c));
     let file = File::open(&path).unwrap();
     // SAFETY: a new read-only shared mapping of a file this test owns and does
     // not write while it is mapped.

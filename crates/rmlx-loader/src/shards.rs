@@ -69,8 +69,9 @@ pub struct ShardHandle {
     // lifetime of this handle. We open the file read-only and never mutate
     // the mapped region; `release_mapped` only invalidates whole pages of it,
     // which leaves them mapped to the same file bytes.
-    // Concurrent writes to the file from another process would be UB, but
-    // model weights on disk are never modified while the server is running.
+    // Concurrent writes or truncation of the file from another process would
+    // be UB, but model weights on disk are never modified while the server is
+    // running.
     mmap: memmap2::Mmap,
 }
 
