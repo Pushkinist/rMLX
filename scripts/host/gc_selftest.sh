@@ -3,6 +3,7 @@
 #
 # Recall test for: host/gc.sh target traces
 # Not a mode of: profile/gputrace_selftest.sh — that one reads .gputrace bundles; this one plants and deletes them
+# Runs in make ci, not in hosted CI: it uses BSD stat and date.
 #
 # The tool is copied into a scratch repo under ST_WORK and run there, so its own `cd` to the repo
 # root lands on the planted tree. Ages are set with `touch -t`. A stub `du` reads a planted `.kb`

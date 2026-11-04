@@ -3,6 +3,7 @@
 #
 # Recall test for: release/release.sh package sign sha bottle tap-sync notes default
 # Not a mode of: release/release_cpu_selftest.sh — that one tests the target-CPU check alone; this one runs the steps around it
+# Runs in make ci, not in hosted CI: it uses BSD sed -i '' and date and tar flags.
 #
 # The tool is copied into a scratch repo under ST_WORK, beside a planted Cargo.toml, CHANGELOG.md,
 # formula, licenses and tap directory, and run there on a PATH of its own whose cargo, curl, cosign,

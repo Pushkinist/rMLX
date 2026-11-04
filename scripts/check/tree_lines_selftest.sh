@@ -407,13 +407,13 @@ PERSONAL_DATA_CASES=(
     "private_tmp_of_another_name|n.txt|see /private/tmp/other|0|-"
 )
 
-# doc_rows_plant <docs root> <scan root>: copy the lines of CLAUDE.md and
-# scripts/INDEX.md that name the gate into the scan root; set why when a doc
+# doc_rows_plant <docs root> <scan root>: copy the lines of scripts/INDEX.md and
+# the Makefile that name the gate into the scan root; set why when a file
 # has fewer than two (why is empty otherwise).
 doc_rows_plant() {
     local docs="$1" root="$2" doc rows
     why=""
-    for doc in CLAUDE.md scripts/INDEX.md; do
+    for doc in scripts/INDEX.md Makefile; do
         rows="$(grep -F -e 'check-claim-bypass' -e "${TOOL_REL#scripts/}" "$docs/$doc" || true)"
         if [ "$(grep -c '' <<<"$rows")" -lt 2 ]; then
             why="$doc has fewer than two rows naming the gate"
@@ -447,17 +447,17 @@ claim_bypass_cases() {
     if [ -n "$why" ]; then
         st_verdict doc_rows "$why"
     else
-        st_case doc_rows 0 --what "the gate's rows in CLAUDE.md and scripts/INDEX.md pass it" -- st_bounded "$TIMEOUT_S" bash "$TOOL" claim-bypass "$root"
+        st_case doc_rows 0 --what "the gate's rows in scripts/INDEX.md and the Makefile pass it" -- st_bounded "$TIMEOUT_S" bash "$TOOL" claim-bypass "$root"
     fi
 
     # A doc with no row is named, and the verdict is reached.
     docs="$ST_WORK/docs_without_rows"
     mkdir -p "$docs/scripts"
-    printf 'no row here\n' >"$docs/CLAUDE.md"
+    printf 'no row here\n' >"$docs/Makefile"
     printf 'no row here\n' >"$docs/scripts/INDEX.md"
     root="$(fresh doc_rows_lost)"
     doc_rows_plant "$docs" "$root"
-    st_verdict doc_rows_lost "$([ "$why" = "CLAUDE.md has fewer than two rows naming the gate" ] || echo "verdict is '$why'")" \
+    st_verdict doc_rows_lost "$([ "$why" = "scripts/INDEX.md has fewer than two rows naming the gate" ] || echo "verdict is '$why'")" \
         "a doc with no row is named, not a silent abort"
 
     # Unlike personal-data, this mode does not skip a file that holds a NUL byte.
