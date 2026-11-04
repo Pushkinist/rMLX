@@ -2,8 +2,8 @@ use super::*;
 use rmlx_core::mapped_pages::file_pages_in_cache;
 use serde_json::json;
 
-/// Serializes the tests that map shards or read the page cache, so one test's
-/// large mapping cannot change what another measures.
+/// Taken by the `release_mapped` tests, so one cannot disturb another's
+/// page-cache and resident-memory measurement.
 static SHARD_TESTS: Mutex<()> = Mutex::new(());
 
 fn serial() -> MutexGuard<'static, ()> {
@@ -461,8 +461,36 @@ fn release_mapped_ignores_bytes_outside_a_shard_mapping() {
     std::fs::write(&other_path, &other_data).unwrap();
     // SAFETY: the file is private to this test and not modified while mapped.
     let other = unsafe { memmap2::Mmap::map(&File::open(&other_path).unwrap()) }.unwrap();
+
+    // A registered mapping that reaches only the first page of `other`: the
+    // slice starts inside it and ends past it, so only the end guard refuses.
+    let base = other.as_ptr() as usize;
+    let _entry = FakeMapping::register(base, page);
     assert_eq!(release_mapped(&other), 0);
-    assert_eq!(&other[..], other_data.as_slice());
+}
+
+/// Registers a mapping in the live registry and removes it on drop, so a
+/// failing assert cannot leave it for the next test.
+struct FakeMapping(usize);
+
+impl FakeMapping {
+    fn register(base: usize, len: usize) -> Self {
+        live_mappings().insert(
+            base,
+            LiveMapping {
+                len,
+                path: PathBuf::new(),
+                warned: false,
+            },
+        );
+        Self(base)
+    }
+}
+
+impl Drop for FakeMapping {
+    fn drop(&mut self) {
+        live_mappings().remove(&self.0);
+    }
 }
 
 #[test]

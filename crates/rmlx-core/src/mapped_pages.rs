@@ -40,14 +40,15 @@ pub fn inner_page_range(start: usize, end: usize, page: usize) -> Option<Range<u
 /// # Safety
 ///
 /// `addr` is page-aligned and `addr..addr + len` lies inside a live
-/// `PROT_READ`, `MAP_SHARED` file mapping. Never call it on anonymous or
-/// private memory: `MS_INVALIDATE` there is unmeasured and may discard data.
+/// `PROT_READ`, `MAP_SHARED` file mapping, and the file is not written or
+/// truncated while it is mapped. Never call it on anonymous or private memory:
+/// `MS_INVALIDATE` there is unmeasured and may discard data.
 pub unsafe fn invalidate_file_pages(addr: usize, len: usize) -> io::Result<()> {
-    // SAFETY: by the contract the range is a shared file mapping. Another writer
-    // of the file can dirty its pages, but a synchronous `msync` writes back a
-    // dirty page before `MS_INVALIDATE` drops it, so no data is lost. The
-    // mapping stays in place with no holes, so a `&[u8]` into it stays valid and
-    // reads the same file bytes.
+    // `MS_SYNC` writes a dirty page back before `MS_INVALIDATE` drops it; on
+    // Darwin XNU adds `VM_SYNC_SYNCHRONOUS` when `MS_ASYNC` is absent.
+    // SAFETY: by the contract the range is a live `PROT_READ`, `MAP_SHARED`
+    // mapping of a file nobody writes. `msync` leaves it mapped with no holes,
+    // so a `&[u8]` into it stays valid and faults the same bytes back in.
     let rc = unsafe {
         libc::msync(
             addr as *mut c_void,

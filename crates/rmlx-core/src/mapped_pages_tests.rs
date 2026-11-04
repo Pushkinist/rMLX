@@ -55,8 +55,7 @@ fn file_pages_in_cache_has_one_entry_per_page_of_a_written_file() {
     let path = dir.path().join("pages.bin");
     std::fs::write(&path, vec![7u8; 3 * page + 1]).unwrap();
     File::open(&path).unwrap().sync_all().unwrap();
-    let contents = std::fs::read(&path).unwrap();
-    std::hint::black_box(contents.iter().fold(0u64, |sum, &b| sum + u64::from(b)));
+    std::hint::black_box(std::fs::read(&path).unwrap());
     let cached = file_pages_in_cache(&path).unwrap();
     assert_eq!(cached.len(), 4);
     assert!(cached.iter().all(|&c| c));
@@ -68,4 +67,43 @@ fn file_pages_in_cache_is_empty_for_an_empty_file() {
     let path = dir.path().join("empty.bin");
     std::fs::write(&path, []).unwrap();
     assert_eq!(file_pages_in_cache(&path).unwrap(), Vec::<bool>::new());
+}
+
+#[test]
+fn invalidate_file_pages_drops_unsynced_pages_and_keeps_their_bytes() {
+    let page = page_size().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unsynced.bin");
+    let data: Vec<u8> = (0..4 * page).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&path, &data).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), data);
+    let file = File::open(&path).unwrap();
+    // SAFETY: a new read-only shared mapping of a file this test owns and does
+    // not write while it is mapped.
+    let addr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            data.len(),
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    assert_ne!(addr, libc::MAP_FAILED);
+    // SAFETY: `addr` is page-aligned and the range is the whole mapping made
+    // above, which nobody writes.
+    let released = unsafe { invalidate_file_pages(addr as usize, data.len()) };
+    // SAFETY: `addr` is the mapping of `data.len()` bytes created above; nothing
+    // borrows it.
+    unsafe { libc::munmap(addr, data.len()) };
+    released.unwrap();
+
+    let cached = file_pages_in_cache(&path).unwrap();
+    assert_eq!(cached.len(), 4);
+    assert!(
+        cached.iter().all(|&c| !c),
+        "pages still in the cache: {cached:?}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), data);
 }
