@@ -12,6 +12,7 @@
 //! - `doctor` — check schema integrity; `--fix` applies repairs.
 //! - `record` — ingest one universal §8.5 JSON payload into `observations`.
 //! - `record --replay-pending` — re-ingest all pending buffer files.
+//! - `import` — copy the observations of another metrics DB into this one.
 //! - `best` — print the best-known measurement per metric × model × backend.
 //! - `rank` / `compare` — leaderboard and pairwise diff views.
 //! - `export` — print the current bests (the `BENCHMARK_CHAMPIONS.md` source).
@@ -41,6 +42,7 @@
 mod admin;
 mod export;
 mod identity_cmd;
+mod import_cmd;
 mod migrate_cmd;
 mod prompts_cmds;
 mod query_cmds;
@@ -49,6 +51,7 @@ mod record;
 use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
+use rmlx_metrics::run_class::RunClass;
 
 #[derive(Debug, Args)]
 pub(crate) struct MetricsCmd {
@@ -98,6 +101,10 @@ pub(crate) enum MetricsAction {
         /// Walk metrics/buffer/pending/, attempt each, move failures to failed/.
         #[arg(long, default_value_t = false, conflicts_with_all = ["inline", "file", "stdin"])]
         replay_pending: bool,
+        /// Why the run was recorded: gate, ab_arm or diagnostic. Fills a record
+        /// that states no `run_class`; a record that states another is refused.
+        #[arg(long, value_name = "CLASS")]
+        run_class: Option<RunClass>,
     },
     /// Print this binary's §8.5 run-identity block (backend, version, build
     /// profile, hardware tag). Shell emitters merge this instead of
@@ -244,7 +251,7 @@ pub(crate) enum MetricsAction {
     /// Exit codes:
     ///   0   — within tolerance (or improvement)
     ///   1   — regressed beyond `--threshold-pct`
-    ///   125 — no champion or no observations found (skip, bisect-safe)
+    ///   125 — no champion or no gate observations found (skip, bisect-safe)
     Regress {
         /// Model name substring to match (e.g. "bonsai" matches any model
         /// whose name contains "bonsai").
@@ -359,6 +366,19 @@ pub(crate) enum MetricsAction {
         #[arg(long, default_value = "m5_max_128gb")]
         hardware_tag: String,
     },
+
+    /// Copy the observations of another metrics DB, and the prompts they
+    /// reference, into this one. A row already present is skipped.
+    Import {
+        /// The source DB. Opened read-only and never migrated.
+        #[arg(long)]
+        from: PathBuf,
+        /// The class of every imported row (gate, ab_arm or diagnostic), for a
+        /// source at schema version 8. Refused for a source whose rows carry
+        /// their own class.
+        #[arg(long, value_name = "CLASS")]
+        run_class: Option<RunClass>,
+    },
 }
 
 /// Sub-subcommands for `rmlx metrics prompts`.
@@ -397,7 +417,16 @@ pub(crate) fn dispatch(cmd: MetricsCmd) -> anyhow::Result<()> {
             stdin,
             dry_run,
             replay_pending,
-        } => record::cmd_record(&db_path, inline, file, stdin, dry_run, replay_pending),
+            run_class,
+        } => record::cmd_record(
+            &db_path,
+            inline,
+            file,
+            stdin,
+            dry_run,
+            replay_pending,
+            run_class,
+        ),
         MetricsAction::Identity { json } => identity_cmd::cmd_identity(json),
         MetricsAction::Validate { file, stdin } => identity_cmd::cmd_validate(file, stdin),
         MetricsAction::Best {
@@ -550,6 +579,9 @@ pub(crate) fn dispatch(cmd: MetricsCmd) -> anyhow::Result<()> {
             records_md,
             hardware_tag,
         } => migrate_cmd::cmd_migrate(&db_path, rmlx_glob, cbb_csv, records_md, &hardware_tag),
+        MetricsAction::Import { from, run_class } => {
+            import_cmd::cmd_import(&db_path, &from, run_class)
+        }
     }
 }
 

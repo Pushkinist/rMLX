@@ -705,9 +705,14 @@ fn effective_namespace_budget_never_yields_zero_while_the_tier_is_on() {
 ///
 /// Test process is shared, so this test (and only this test) drives the
 /// process-global `CONFIG` `OnceLock`. No other test in this binary calls
-/// `install_config`.
+/// `install_config`. The wipe runs over a temp `kv_root`, never the real one.
 #[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "temp dir creation for a fixture this test owns; a failure is a broken fixture, not a condition under test"
+)]
 fn install_config_double_call_returns_err() {
+    let kv_root = tempfile::TempDir::new().unwrap();
     let cfg = SsdTierConfig {
         per_namespace_budget_bytes: 0,
         global_budget_bytes: 0,
@@ -716,9 +721,9 @@ fn install_config_double_call_returns_err() {
     };
     // First call must succeed (or the OnceLock was already set by a prior test run
     // in the same process — that is fine; what we care about is the second call).
-    let _ = install_config(cfg.clone());
+    let _ = install_config(cfg.clone(), kv_root.path());
     // Second call must return Err(SsdTierAlreadyInstalled).
-    match install_config(cfg) {
+    match install_config(cfg, kv_root.path()) {
         Err(Error::SsdTierAlreadyInstalled) => {}
         other => panic!("expected Err(SsdTierAlreadyInstalled), got {other:?}"),
     }

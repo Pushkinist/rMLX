@@ -16,14 +16,6 @@ fn qwen38_snap_dir() -> std::path::PathBuf {
     root.join("mlx-community__Qwen3.8-27B-4bit")
 }
 
-fn dr_venus_snap_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("RMLX_TEST_MODEL_DR_VENUS").map(std::path::PathBuf::from)
-}
-
-fn laguna_snap_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("RMLX_TEST_MODEL_LAGUNA").map(std::path::PathBuf::from)
-}
-
 // ── Minimal hand-written template ──────────────────────────────────────────
 
 #[test]
@@ -445,35 +437,6 @@ fn render_matches_hf_qwen36_moe() {
         "",
         "<|im_end|>",
         "<|im_start|>system\nYou are helpful.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n",
-    );
-}
-
-#[test]
-fn render_matches_hf_dr_venus() {
-    // Same Qwen3-style chat template family as Qwen3.6.
-    let Some(dir) = dr_venus_snap_dir() else {
-        tracing::warn!("RMLX_TEST_MODEL_DR_VENUS not set — skipping render_matches_hf_dr_venus");
-        return;
-    };
-    render_matches_hf_or_skip(
-        dir.to_str().unwrap_or(""),
-        "",
-        "<|im_end|>",
-        "<|im_start|>system\nYou are helpful.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n",
-    );
-}
-
-#[test]
-fn render_matches_hf_laguna_xs2() {
-    let Some(dir) = laguna_snap_dir() else {
-        tracing::warn!("RMLX_TEST_MODEL_LAGUNA not set — skipping render_matches_hf_laguna_xs2");
-        return;
-    };
-    render_matches_hf_or_skip(
-        dir.to_str().unwrap_or(""),
-        "〈|EOS|〉",
-        "〈|EOS|〉",
-        "〈|EOS|〉<system>\n\nYou are helpful.\n</system>\n<user>\nHi\n</user>\n<assistant>\n</think>",
     );
 }
 

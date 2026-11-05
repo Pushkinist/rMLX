@@ -137,6 +137,40 @@ impl ModelConfig {
             .is_some_and(|qc| qc.quant_method.as_deref() == Some("paroquant"))
     }
 
+    /// The `docs/METRICS_DB.md` §5.2 weight label this config describes, or
+    /// `None` when it names no weight format.
+    ///
+    /// ParoQuant first, then the MLX `quantization` block — its `mode`
+    /// lowercased, or `<bits>bit` when the mode is absent or `affine` — then an
+    /// unquantized `dtype` / `torch_dtype`. No list of modes lives here: the
+    /// recorder's §5.2 whitelist is the one check, and it refuses a mode it
+    /// does not name. Kept in step with `weight_quant` in
+    /// `scripts/lib/snapshot_identity.py` by one shared table,
+    /// `tests/fixtures/weight_quant_labels.json`: the two disagreeing would
+    /// split one model across two cells.
+    pub fn weight_quant_label(&self) -> Option<String> {
+        if self.is_paroquant() {
+            return Some("paro".to_owned());
+        }
+        if let Some(quant) = &self.quantization {
+            let mode = quant.mode_or_default().to_lowercase();
+            return Some(match mode.as_str() {
+                "" | "affine" => format!("{}bit", quant.bits),
+                _ => mode,
+            });
+        }
+        let dtype = self
+            .dtype
+            .as_deref()
+            .filter(|d| !d.is_empty())
+            .or_else(|| self.extras.get("torch_dtype").and_then(|v| v.as_str()));
+        match dtype {
+            Some("bfloat16") => Some("bf16".to_owned()),
+            Some("float16") => Some("fp16".to_owned()),
+            _ => None,
+        }
+    }
+
     /// Returns `true` when `config.json` names a Hadamard contract file
     /// (`hadamard_config`): the snapshot is a Prism Hadamard pack. Whether the
     /// contract holds is [`crate::HadamardContract::read`]'s question.

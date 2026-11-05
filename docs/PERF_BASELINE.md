@@ -40,16 +40,21 @@ interleaved A/B run supports a direction between two builds.
   `ts_utc,git_sha,model,kv_quant,prompt_tokens,decode_tps,stddev,build_profile`.
   `kv_quant` is the codec name the run's own log states, or `auto` if that
   probe fails.
-- `runs.db`: one further run per model with `rmlx baseline --record`. A
-  failed record is a warning; the CSV row is still written.
-- A `k8vturbo3` arm follows each model: 1 warmup, 3 measured, CSV row only.
+- `runs.db`: one further run per model with `rmlx baseline --record
+  --run-class gate`, and the warmup, measured and `k8vturbo3` runs as
+  `diagnostic`. A snapshot whose identity cannot be recorded stops the canary
+  before its first run, and a gate record that does not land stops it too
+  (exit 1). A diagnostic record that does not land keeps its reading and its
+  CSV row, names its buffer file, and ends the canary 75 after the last
+  model (`docs/METRICS_DB.md` §13, rule 24).
+- A `k8vturbo3` arm follows each model: 1 warmup, 3 measured, one CSV row.
 
 **Gating.** Two gates read what the canary wrote:
 
 - `make canary-gate SHA=<last-green-sha>` runs `rmlx metrics deltas
   --since-sha <SHA> --threshold-pct 3 --exit-code true` against `runs.db`.
-  `CANARY_THRESHOLD_PCT` sets the threshold. A SHA with no observations at
-  all is an error (exit 1). Otherwise: exit 0 is clean and 1 a regression.
+  `CANARY_THRESHOLD_PCT` sets the threshold. A SHA with no gate observations
+  is an error (exit 1). Otherwise: exit 0 is clean and 1 a regression.
   Exit 125 (a `git bisect` skip) means no returned row has a baseline. A
   known SHA with no cell measured again after it also exits 0, so a clean
   exit does not prove every cell was re-measured. Through `make`, a failed
@@ -149,9 +154,10 @@ Four of those rows read the machine: host quiescence, per-slot and
 whole-comparison interference, and the Metal-exclusivity check. The load
 average is recorded beside them as context. Every other row reads the arms.
 
-`--metrics` is refused in arm arguments because it is declared
-`global = true`. An occurrence after the subcommand overrides the leading
-`--metrics off`, and the slot would open the real `runs.db`.
+`--metrics`, `--record`, `--run-class` and `--label` are refused in arm
+arguments. The harness sets them for every slot, and `--metrics` is declared
+`global = true`, so an arm's own occurrence would win and change how that arm
+is recorded.
 
 **`--synthetic-arms` is not an escape hatch — it says the run is not a
 measurement.** It declares the arms are stubs, for a caller that checks this
@@ -164,7 +170,11 @@ arm-reading guards still apply.
 The boundary lives in `scripts/lib/cpu_snapshot.sh`, as `snapshot_ok` and
 `window_not_sampled`. `scripts/bench_llama_ab.sh` takes the same
 `--synthetic-arms` flag through it. Its result file carries `synthetic_arms`,
-and `scripts/ingest/llama_ab_ingest.py` refuses that result with no waiver.
+and `scripts/ingest/llama_ab_ingest.py` refuses that result with no waiver. A
+real `bench_llama_ab.sh` run ends by handing its result to that ingest, which
+records both arms as `ab_arm` rows under the identity `--record-args` carries;
+`--keep-arm A|B` on a second run of the ingest records the surviving arm as
+`gate`.
 
 **Interference measurement.** The figure is the change in a process's
 cumulative CPU time across a known window, per slot and across the whole
@@ -185,18 +195,31 @@ reads `+0.0 MB` there. `kv_cache_bytes` is `KvCache::resident_bytes` off the
 `baseline` summary line: the cache itself. Where a slot's KV accounting
 refused, the column reads `n/a` for that whole arm, never `0`.
 
-**Never writes `runs.db`.** Every slot runs `--metrics off`, so the file is
-never opened. Promoting an accepted comparison is a separate step:
-`scripts/ingest/perf_ab_ingest.py` turns one result file into two
-`docs/METRICS_DB.md` §8.5 RunRecords (`decode_tps_warm`, `kv_cache_bytes`). It
-refuses a TAINTED run unless told otherwise, and carries the taint text into
-`notes`.
+**Every slot is an `ab_arm` row.** Each slot, warmups included, runs
+`rmlx baseline --record --run-class ab_arm --label perf_ab:<ts>:<A|B>:<slot>`.
+`runs.db` keeps the whole comparison, and no `ab_arm` row reaches `bests` or a
+gate (`docs/METRICS_DB.md` §13). Find one run's rows with
+`notes LIKE 'label=perf_ab:<ts>:%'`. Each arm's binary is asked once,
+through `baseline --help`, whether it has `--run-class`: an arm built before
+the run class runs `--metrics off` and records nothing, and the report says so
+per arm. A `--synthetic-arms` run passes `--metrics off` to every slot and
+records nothing. A slot whose record does not land keeps its reading and the
+verdict, names its buffer file, and ends the run 75 when nothing else failed.
+Promoting the surviving
+arm is a separate step: `scripts/ingest/perf_ab_ingest.py --keep-arm A|B`
+turns one result file into one `gate` RunRecord (`docs/METRICS_DB.md` §8.5;
+`decode_tps_warm`, `kv_cache_bytes`) for that arm, whose slots are already
+`ab_arm` rows. It refuses a TAINTED run unless told otherwise, and carries the
+taint text into `notes`.
 
 The result lands in `$RMLX_HOME/bench/perf_ab/<timestamp>.json`, with the
 host conditions, the statistics and the binary digests. Each slot is a full
 `rmlx` process that writes its own `$RMLX_HOME/logs/<run-id>.jsonl`. A default
 three-model run writes 42 of them, and each launch runs the log size-cap
-rotation. Point `RMLX_HOME` at a scratch directory when that matters.
+rotation. A recorded slot also appends one `metrics/baseline.csv` row and its
+`events` rows, 42 of each in a default run. Neither carries a run class, so an
+A/B slot there reads like any other baseline run. Point `RMLX_HOME` at a
+scratch directory when that matters.
 
 **Cost.** `2 + slots` process launches per model: 14 at the default.
 

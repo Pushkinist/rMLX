@@ -21,6 +21,7 @@
     clippy::ref_option,
     clippy::too_many_lines
 )]
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -29,6 +30,7 @@ use rmlx_metrics::identity::RunIdentity;
 use rmlx_metrics::ingest::{MetricEntry, PromptRef, RunRecord, RunRecordBuilder};
 use rmlx_metrics::migrate;
 use rmlx_metrics::recorder::Recorder;
+use rmlx_metrics::run_class::RunClass;
 use rmlx_metrics::schema;
 use tokio::sync::mpsc;
 
@@ -269,7 +271,15 @@ const FLUSH_INTERVAL_MS: u64 = 100;
 ///
 /// Under any mode below `full` no task is spawned at all: the handle's sender is
 /// `None`, `try_emit` drops at the producer, and the DB is never touched.
-pub fn spawn_drainer(db_path: PathBuf) -> DrainerHandle {
+///
+/// `weight_quants` maps each model id to the weight label its config describes
+/// (`ModelRegistry::weight_quants`). A model with no recordable label is warned
+/// about once, here, and its events are then skipped quietly rather than filed
+/// under a guessed label.
+pub fn spawn_drainer(
+    db_path: PathBuf,
+    weight_quants: BTreeMap<String, Option<String>>,
+) -> DrainerHandle {
     let dropped = Arc::new(AtomicU64::new(0));
 
     if !rmlx_metrics::mode::observations_enabled() {
@@ -277,15 +287,46 @@ pub fn spawn_drainer(db_path: PathBuf) -> DrainerHandle {
         return DrainerHandle { tx: None, dropped };
     }
 
+    let labelled = recordable_labels(weight_quants);
     let (tx, rx) = mpsc::channel::<MetricEvent>(CHANNEL_CAPACITY);
     let dropped_task = Arc::clone(&dropped);
 
-    tokio::spawn(drainer_task(rx, db_path, dropped_task));
+    tokio::spawn(drainer_task(rx, db_path, dropped_task, Arc::new(labelled)));
 
     DrainerHandle {
         tx: Some(tx),
         dropped,
     }
+}
+
+/// The models whose rows can be filed, each with its label. A model with no
+/// label, or one the metrics DB does not record, is warned about once here, and
+/// its events are skipped quietly later.
+fn recordable_labels(weight_quants: BTreeMap<String, Option<String>>) -> BTreeMap<String, String> {
+    use rmlx_metrics::identity::{canonicalize, WEIGHT_QUANT_WHITELIST};
+    let mut labelled = BTreeMap::new();
+    for (model_id, label) in weight_quants {
+        let Some(label) = label else {
+            tracing::warn!(
+                model_id = %model_id,
+                "metrics_drainer: the model's config names no weight format, so its \
+                 live-request rows are not recorded"
+            );
+            continue;
+        };
+        match canonicalize("weight_quant", &label, WEIGHT_QUANT_WHITELIST) {
+            Ok(label) => {
+                labelled.insert(model_id, label);
+            }
+            Err(e) => tracing::warn!(
+                model_id = %model_id,
+                error = %e,
+                "metrics_drainer: the model's weight label is not one the metrics DB \
+                 records, so its live-request rows are not recorded"
+            ),
+        }
+    }
+    labelled
 }
 
 // ── Consumer task ─────────────────────────────────────────────────────────────
@@ -294,6 +335,7 @@ async fn drainer_task(
     mut rx: mpsc::Receiver<MetricEvent>,
     db_path: PathBuf,
     dropped: Arc<AtomicU64>,
+    weight_quants: Arc<BTreeMap<String, String>>,
 ) {
     tracing::info!(
         db_path = %db_path.display(),
@@ -316,7 +358,7 @@ async fn drainer_task(
                 Ok(Some(ev)) => batch.push(ev),
                 // Channel closed — drain remaining and exit.
                 Ok(None) => {
-                    flush_batch(&batch, &db_path, &dropped).await;
+                    flush_batch(&batch, &db_path, &dropped, &weight_quants).await;
                     tracing::info!("metrics_drainer: channel closed, task exiting");
                     return;
                 }
@@ -326,23 +368,31 @@ async fn drainer_task(
         }
 
         if !batch.is_empty() {
-            flush_batch(&batch, &db_path, &dropped).await;
+            flush_batch(&batch, &db_path, &dropped, &weight_quants).await;
             batch.clear();
         }
     }
 }
 
 /// Write the batch to SQLite inside `spawn_blocking` so no executor thread blocks.
-async fn flush_batch(batch: &[MetricEvent], db_path: &Path, dropped: &Arc<AtomicU64>) {
+async fn flush_batch(
+    batch: &[MetricEvent],
+    db_path: &Path,
+    dropped: &Arc<AtomicU64>,
+    weight_quants: &Arc<BTreeMap<String, String>>,
+) {
     if batch.is_empty() {
         return;
     }
 
     let owned_batch = batch.to_vec();
     let db_path = db_path.to_path_buf(); // owned PathBuf for the spawn_blocking closure
+    let weight_quants = Arc::clone(weight_quants);
 
-    let result =
-        tokio::task::spawn_blocking(move || write_batch_to_db(&owned_batch, &db_path)).await;
+    let result = tokio::task::spawn_blocking(move || {
+        write_batch_to_db(&owned_batch, &db_path, &weight_quants)
+    })
+    .await;
 
     match result {
         Ok(Ok(n)) => {
@@ -373,6 +423,7 @@ async fn flush_batch(batch: &[MetricEvent], db_path: &Path, dropped: &Arc<Atomic
 fn write_batch_to_db(
     batch: &[MetricEvent],
     db_path: &Path,
+    weight_quants: &BTreeMap<String, String>,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     // Ensure parent dir exists.
     if let Some(parent) = db_path.parent() {
@@ -407,7 +458,12 @@ fn write_batch_to_db(
             _ => {}
         }
 
-        let run = match event_to_run_record(ev) {
+        // Warned about once, when the drainer was spawned.
+        let Some(weight_quant) = weight_quants.get(&ev.model_id) else {
+            tracing::debug!(model_id = %ev.model_id, "metrics_drainer: no weight label, event skipped");
+            continue;
+        };
+        let run = match event_to_run_record(ev, weight_quant) {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(
@@ -441,12 +497,17 @@ fn write_batch_to_db(
 /// `"(live_request)"` so the recorder can dedup via sha256 without knowing
 /// the actual prompt body.
 ///
-/// Identity, namespace/model split, weight-quant inference and kv-quant
-/// canonicalization all come from the builder — this function supplies the
-/// measurement and nothing else.
-fn event_to_run_record(ev: &MetricEvent) -> rmlx_metrics::error::Result<RunRecord> {
+/// Identity, the namespace/model split and kv-quant canonicalization come from
+/// the builder, and the weight label from the model's config — this function supplies the
+/// measurement and the class. Live-request telemetry is `diagnostic`: it is
+/// not a controlled run, so it reaches no champion and no gate.
+fn event_to_run_record(
+    ev: &MetricEvent,
+    weight_quant: &str,
+) -> rmlx_metrics::error::Result<RunRecord> {
     RunRecordBuilder::rmlx(
         &ev.model_id,
+        weight_quant,
         &ev.kv_quant,
         ev.ctx_max, // real per-request effective_max_ctx threaded via MetricEvent
         PromptRef::ByBody {
@@ -458,6 +519,7 @@ fn event_to_run_record(ev: &MetricEvent) -> rmlx_metrics::error::Result<RunRecor
     )?
     .ts_utc(ev.ts_utc.clone())
     .notes("spsc_drainer")
+    .run_class(RunClass::Diagnostic)
     .metrics(event_kind_to_metrics(&ev.kind))
     .build()
 }

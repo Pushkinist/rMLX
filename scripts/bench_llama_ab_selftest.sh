@@ -116,10 +116,21 @@ KV_OK='llama_kv_cache:       MTL0 KV buffer size =   512.00 MiB'
 # Stands in for `rmlx claim run -- <command>`: runs the command as its child,
 # passes SIGTERM on, and exits with the child's status, so the harness's
 # wrapper-versus-server bookkeeping is exercised without a real claim. Each use
-# is recorded, so a case can tell that every slot ran under it.
+# is recorded, so a case can tell that every slot ran under it. It also stands
+# in for `rmlx metrics record --file <record>`, logging the class of each
+# record it is handed instead of writing a DB, and answers `metrics record
+# --help` the way a binary with the run class does.
 CLAIM_STUB="$WORK/claim_rmlx"
 cat >"$CLAIM_STUB" <<STUB
 #!/usr/bin/env bash
+if [ "\$1 \$2 \$3" = "metrics record --help" ]; then
+    echo "      --run-class <CLASS>"
+    exit 0
+fi
+if [ "\$1 \$2 \$3" = "metrics record --file" ]; then
+    python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r["run_class"], r["backend"])' "\$4" >>"$WORK/recorded"
+    exit 0
+fi
 [ "\$1 \$2 \$3" = "claim run --" ] || { echo "claim stub: unexpected argv \$*" >&2; exit 2; }
 shift 3
 echo "\$\$" >>"$WORK/claim_runs"
@@ -162,6 +173,9 @@ SYNTHETIC_CASES=0
 REAL_HOST_CASES=0
 HOST_READING_CASES=0
 RUN_SEQ=0
+# The identity a real run hands its ingest. Under --synthetic-arms it is not
+# needed, and a REALHOST case can drop it with NO_RECORD_ARGS=1.
+RECORD_ARGS_REAL="--model stub --weight-quant q8_0 --arm-a-backend llama_cpp --arm-b-backend llama_cpp_tq --arm-a-kv-quant none --arm-b-kv-quant turbo3 --prompt-name selftest"
 
 run_ab() { # [REALHOST:<shim-dir>] <extra args...> -> stdout+stderr in $OUT, code in $CODE
 	local host_shim="" boundary=(--synthetic-arms)
@@ -176,6 +190,9 @@ run_ab() { # [REALHOST:<shim-dir>] <extra args...> -> stdout+stderr in $OUT, cod
 			return
 		fi
 		REAL_HOST_CASES=$((REAL_HOST_CASES + 1))
+		if [ -z "${NO_RECORD_ARGS:-}" ]; then
+			boundary=(--record-args "$RECORD_ARGS_REAL")
+		fi
 	else
 		SYNTHETIC_CASES=$((SYNTHETIC_CASES + 1))
 	fi
@@ -355,6 +372,18 @@ chmod +x "$HELD_CLAIM"
 run_ab --bin-a "$STUB_A" --bin-b "$STUB_B" --pairs 2 --allow-busy-host --claim-rmlx "$HELD_CLAIM"
 check "a held Metal claim fails the slot with exit 11" 125 "server-not-ready (exit 11"
 
+# --- a --synthetic-arms run records nothing ----------------------------------
+#
+# Every case above that ran a comparison declared its arms synthetic, so none
+# of them may have handed a record to the recorder.
+if [ -s "$WORK/recorded" ]; then
+	echo "  FAIL  a --synthetic-arms run handed records to the recorder"
+	FAIL=$((FAIL + 1))
+else
+	echo "  PASS  no --synthetic-arms run handed a record to the recorder"
+	PASS=$((PASS + 1))
+fi
+
 # --- the same three verdicts, with the taint path forced --------------------
 #
 # The point of the three cases above is that the verdict is a property of the
@@ -373,8 +402,101 @@ check "...and a forced taint really did taint" 125 "TAINTED"
 run_ab "$HOST" --bin-a "$STUB_A" --bin-b "$STUB_B" --pairs 2 --allow-busy-host
 check_verdict "SEPARATED-WEAK survives a tainted host" 125 "SEPARATED-WEAK n=2-per-arm"
 
+# --- a real run records both arms as ab_arm rows ----------------------------
+: >"$WORK/recorded"
 run_ab "$HOST" --bin-a "$STUB_A" --bin-b "$STUB_B" --pairs 3 --allow-busy-host
 check_verdict "SEPARATED survives a tainted host" 125 "SEPARATED 0."
+RECORDED="$(sort "$WORK/recorded" | tr '\n' ' ')"
+if [ "$RECORDED" = "ab_arm llama_cpp ab_arm llama_cpp_tq " ]; then
+	echo "  PASS  a real run, tainted included, records each arm once as ab_arm"
+	PASS=$((PASS + 1))
+else
+	echo "  FAIL  a real run should record each arm once as ab_arm (recorded: ${RECORDED:-nothing})"
+	FAIL=$((FAIL + 1))
+fi
+
+NO_RECORD_ARGS=1 run_ab "$HOST" --bin-a "$STUB_A" --bin-b "$STUB_B" --pairs 2 --allow-busy-host
+check "a real run without --record-args is refused before any slot" 125 "missing required --record-args"
+
+# The ingest's own argparse judges --record-args, before anything is measured.
+: >"$WORK/claim_runs"
+NO_RECORD_ARGS=1 run_ab "$HOST" --bin-a "$STUB_A" --bin-b "$STUB_B" --pairs 2 --allow-busy-host \
+	--record-args "--model stub --weight-quant q8_0 --arm-a-backend llama_cpp"
+check "--record-args the ingest refuses stop the run before any slot" 125 "the following arguments are required"
+if [ -s "$WORK/claim_runs" ]; then
+	echo "  FAIL  a refused --record-args still ran a slot"
+	FAIL=$((FAIL + 1))
+else
+	echo "  PASS  a refused --record-args ran no slot"
+	PASS=$((PASS + 1))
+fi
+
+# A recorder built before the run class would store classless rows.
+OLD_RECORDER="$WORK/claim_rmlx_old"
+sed 's/--run-class <CLASS>/--label <LABEL>/' "$CLAIM_STUB" >"$OLD_RECORDER"
+chmod +x "$OLD_RECORDER"
+run_ab "$HOST" --bin-a "$STUB_A" --bin-b "$STUB_B" --pairs 2 --allow-busy-host --claim-rmlx "$OLD_RECORDER"
+check "a recorder without --run-class is refused before any slot, by name" 125 "claim_rmlx_old has no \`metrics record --run-class\`"
+
+# A record that fails after the comparison has its own exit code.
+FAILING_RECORDER="$WORK/claim_rmlx_failing"
+sed 's|^    python3 -c .*|    exit 1|' "$CLAIM_STUB" >"$FAILING_RECORDER"
+chmod +x "$FAILING_RECORDER"
+run_ab "$HOST" --bin-a "$STUB_A" --bin-b "$STUB_B" --pairs 2 --allow-busy-host --claim-rmlx "$FAILING_RECORDER"
+check "a record that fails after the comparison exits 4, not the verdict's code" 4 "recorded   NOT ALL"
+
+# Arm A lands and arm B is refused, on a tainted host: the run says it was
+# tainted, names the one record that did not land and how to record it, and does
+# not send the operator back to the ingest, which would write arm A twice.
+HALF_RECORDER="$WORK/claim_rmlx_half"
+sed 's|^    python3 -c .*|    grep -q llama_cpp_tq "\$4" \&\& exit 1|' "$CLAIM_STUB" >"$HALF_RECORDER"
+chmod +x "$HALF_RECORDER"
+run_ab "$HOST" --bin-a "$STUB_A" --bin-b "$STUB_B" --pairs 2 --allow-busy-host --claim-rmlx "$HALF_RECORDER"
+check "a half-recorded tainted run exits 4" 4 "TAINTED"
+HALF_BAD=""
+grep -q 'not recorded: .*llama_cpp_tq' <<<"$OUT" || HALF_BAD="the record that did not land is not named"
+grep -q 'metrics record --file' <<<"$OUT" || HALF_BAD="${HALF_BAD:+$HALF_BAD; }no command to record it"
+grep -q 're-run scripts/ingest/llama_ab_ingest.py' <<<"$OUT" && HALF_BAD="${HALF_BAD:+$HALF_BAD; }the run says to re-run the ingest"
+grep -q 'not recorded: .*-llama_cpp-' <<<"$OUT" && HALF_BAD="${HALF_BAD:+$HALF_BAD; }arm A, which landed, is named as not recorded"
+if [ -z "$HALF_BAD" ]; then
+	echo "  PASS  a half-recorded run names the record that did not land, and how to record it alone"
+	PASS=$((PASS + 1))
+else
+	echo "  FAIL  half-recorded run: $HALF_BAD"
+	printf '%s\n' "$OUT" | sed 's/^/        /' | tail -8
+	FAIL=$((FAIL + 1))
+fi
+
+# The ingest checks its recorder on the real path too, not only under
+# --check-args: a classless recorder is refused before anything is staged.
+POST_HOME="$WORK/home/post_check"
+POST_OUT="$(RMLX_HOME="$POST_HOME" python3 "$ROOT/scripts/ingest/llama_ab_ingest.py" "$(printf '%s' "$OUT" | sed -n 's/^result     //p' | tail -1)" \
+	--prompt-file "$PROMPT" --accept-tainted --record --rmlx-bin "$OLD_RECORDER" $RECORD_ARGS_REAL 2>&1)"
+POST_CODE=$?
+if [ "$POST_CODE" -ne 0 ] && grep -q "claim_rmlx_old has no \`metrics record --run-class\`" <<<"$POST_OUT" &&
+	[ ! -d "$POST_HOME/bench/llama_ab/records" ]; then
+	echo "  PASS  the ingest refuses a classless recorder after a run, before staging anything"
+	PASS=$((PASS + 1))
+else
+	echo "  FAIL  the ingest's post-run recorder check (exit $POST_CODE)"
+	printf '%s\n' "$POST_OUT" | sed 's/^/        /' | tail -4
+	FAIL=$((FAIL + 1))
+fi
+
+# --keep-arm writes the surviving arm alone, as gate, under its own backend.
+REAL_RESULT="$(printf '%s' "$OUT" | sed -n 's/^result     //p' | tail -1)"
+KEEP_OUT="$(python3 "$ROOT/scripts/ingest/llama_ab_ingest.py" --dry-run "$REAL_RESULT" \
+	--prompt-file "$PROMPT" --accept-tainted --keep-arm B $RECORD_ARGS_REAL 2>&1)"
+KEEP_RECORDS="$(grep -c '"schema_version"' <<<"$KEEP_OUT" || true)"
+if [ "$KEEP_RECORDS" = 1 ] && grep -q '"run_class": "gate"' <<<"$KEEP_OUT" &&
+	grep -q '"backend": "llama_cpp_tq"' <<<"$KEEP_OUT" && ! grep -q '"backend": "llama_cpp"' <<<"$KEEP_OUT"; then
+	echo "  PASS  --keep-arm B writes one gate record, under arm B's backend"
+	PASS=$((PASS + 1))
+else
+	echo "  FAIL  --keep-arm B should write one gate record under llama_cpp_tq ($KEEP_RECORDS record(s))"
+	printf '%s\n' "$KEEP_OUT" | sed 's/^/        /' | tail -8
+	FAIL=$((FAIL + 1))
+fi
 
 unset FORCE_UNMEASURED_ROWS
 
@@ -419,12 +541,12 @@ else
 	FAIL=$((FAIL + 1))
 fi
 
-# --- the harness must never write runs.db ------------------------------------
+# --- the harness writes runs.db only through the recorder --------------------
 if find "$WORK/home" -name 'runs.db*' -print -quit 2>/dev/null | grep . >/dev/null; then
-	echo "  FAIL  harness wrote a metrics DB"
+	echo "  FAIL  harness wrote a metrics DB around the recorder"
 	FAIL=$((FAIL + 1))
 else
-	echo "  PASS  no metrics DB written"
+	echo "  PASS  no metrics DB written around the recorder"
 	PASS=$((PASS + 1))
 fi
 

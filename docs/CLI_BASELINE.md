@@ -10,7 +10,7 @@ One generation per process, with EOS stop off. Prints one summary line.
 ```bash
 rmlx baseline --model /path/to/snapshot
 rmlx baseline --model /path/to/snapshot --prompt-tokens 4096 --max-tokens 128 \
-  --record
+  --record --run-class gate
 ```
 
 | Flag | Type | Default | Description |
@@ -28,7 +28,8 @@ rmlx baseline --model /path/to/snapshot --prompt-tokens 4096 --max-tokens 128 \
 | `--allow-truncate` | bool flag | off | Truncate an over-cap prompt on the GPU instead of refusing it. |
 | `--kv-boundary-layers` | `HEAD,TAIL` | `2,8` | See [`CLI.md`](CLI.md) § "KV codec flags". |
 | `--label` | string | — | Written to the record's `notes` column. |
-| `--record` | bool flag | off | Writes a [`METRICS_DB.md`](METRICS_DB.md) §8.5 record to the buffer and ingests it into `runs.db`. |
+| `--record` | bool flag | off | Writes a [`METRICS_DB.md`](METRICS_DB.md) §8.5 record to the buffer and ingests it into `runs.db`. Needs `--run-class`; refused with `--metrics off` or `events`, which record no observation. A record that does not land exits **75** after the summary line, naming the buffer file left for `rmlx metrics record --replay-pending`; 75 means "measured, record pending" and nothing else (`METRICS_DB.md` §13, rule 24). A snapshot whose `config.json` names no weight format (no `quantization`, no ParoQuant `quantization_config`, no bfloat16 or float16 `dtype` / `torch_dtype`) is refused before the run ([`METRICS_DB.md`](METRICS_DB.md) §5.2). |
+| `--run-class` | `gate \| ab_arm \| diagnostic` | — | Why the run is recorded. Required with `--record`, refused without it. Only `gate` rows reach `bests` and the gates ([`METRICS_DB.md`](METRICS_DB.md) §8.5). |
 | `--git-sha` | string | — | Commit SHA for the record's `git_sha`; the binary never derives one. |
 | `--emit-token-ids` | bool flag | off | Adds a `baseline: token_ids=<ids>` line, so an A/B harness can compare token streams. |
 
@@ -84,7 +85,7 @@ These flags exist only in a binary built with
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
-| `--gpu-capture` | path | — | Writes a `.gputrace` of a window of decode steps. Conflicts with `--record`, and forces `--metrics off`. |
+| `--gpu-capture` | path | — | Writes a `.gputrace` of a window of decode steps. Requires `--record --run-class diagnostic`: capture makes every timing false. |
 | `--gpu-capture-skip` | u32 | `4` | Decode steps before the window. Requires `--gpu-capture`. |
 | `--gpu-capture-steps` | u32 | `8` | Decode steps in the window. Requires `--gpu-capture`. |
 

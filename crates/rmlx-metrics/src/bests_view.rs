@@ -24,6 +24,9 @@
 //! stored definition and the registry disagree, so a bounds change propagates
 //! on the next open instead of silently applying to new rows only.
 //!
+//! The view also ranks only `gate` rows ([`gate_rows_sql`]): an A/B slot or a
+//! diagnostic run is recorded and competes for no champion.
+//!
 //! [`Bounds`]: crate::registry::Bounds
 
 use std::fmt::Write as _;
@@ -32,6 +35,7 @@ use rusqlite::Connection;
 
 use crate::error::Result;
 use crate::registry;
+use crate::run_class::RunClass;
 
 /// Renders the `docs/METRICS_SCHEMA.md` §4.1 plausibility predicate as a SQLite
 /// boolean expression over `column`, keyed on the row's `metric`.
@@ -58,9 +62,18 @@ pub fn plausible_sql(column: &str) -> String {
     sql
 }
 
+/// The rows a gate or a published figure may read: `run_class = 'gate'`.
+///
+/// `bests` and every gate query `AND` this in. A row with no class is NULL
+/// here, and NULL is never `gate`.
+pub fn gate_rows_sql() -> String {
+    format!("run_class = '{}'", RunClass::Gate.as_str())
+}
+
 /// Renders the `CREATE VIEW` statement for `bests` from the `docs/METRICS_SCHEMA.md` §4 registry.
 pub fn create_sql() -> String {
     let plausible = plausible_sql("value");
+    let gate = gate_rows_sql();
     let partition = crate::cell::partition_columns();
 
     format!(
@@ -76,7 +89,8 @@ WITH ranked AS (
                 ts_utc DESC
         ) AS rn
     FROM observations o
-    WHERE {plausible}
+    WHERE {gate}
+      AND {plausible}
 )
 SELECT * FROM ranked WHERE rn = 1"
     )

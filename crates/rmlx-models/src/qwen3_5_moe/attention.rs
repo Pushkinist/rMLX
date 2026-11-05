@@ -12,7 +12,7 @@ use rmlx_mlx::{
 
 use rmlx_kv_quant::KvCache;
 
-use super::layers::{qk_norm_fused, repeat_kv, Linear, RmsNorm};
+use super::layers::{qk_norm_fused, repeat_kv, Linear, RmsNorm, SharedInput};
 
 #[allow(missing_debug_implementations)]
 pub(super) struct FullAttention {
@@ -70,8 +70,9 @@ impl FullAttention {
         let batch = s[0];
         let seq = s[1];
 
+        let mut input = SharedInput::new(x);
         // q_proj: [B, S, n_heads * head_dim * 2]
-        let q_proj_out = self.q_proj.forward(x, device)?;
+        let q_proj_out = input.forward(&self.q_proj, device)?;
         // Reshape to [B, S, n_heads, head_dim * 2] then split on last dim via slice.
         let q_full = q_proj_out.reshape(
             &[batch, seq, self.n_heads as i32, (self.head_dim * 2) as i32],
@@ -91,12 +92,12 @@ impl FullAttention {
             gate_heads.reshape(&[batch, seq, (self.n_heads * self.head_dim) as i32], device)?;
 
         // K, V.
-        let k = self.k_proj.forward(x, device)?;
+        let k = input.forward(&self.k_proj, device)?;
         let k = k.reshape(
             &[batch, seq, self.n_kv_heads as i32, self.head_dim as i32],
             device,
         )?;
-        let v = self.v_proj.forward(x, device)?;
+        let v = input.forward(&self.v_proj, device)?;
         let v = v.reshape(
             &[batch, seq, self.n_kv_heads as i32, self.head_dim as i32],
             device,

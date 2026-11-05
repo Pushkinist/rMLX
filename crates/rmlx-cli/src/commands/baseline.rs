@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::commands::parse::ClaimedDevice;
+use anyhow::Context as _;
 use rmlx_metrics::events::EventRecorder;
 use rmlx_metrics::identity::RunIdentity;
 use rmlx_mlx::Device;
@@ -379,12 +380,12 @@ pub(crate) fn run_baseline(
     record_args: Option<BaselineRecordArgs<'_>>,
 ) -> anyhow::Result<()> {
     let device = claimed.device();
-    // Resolved before any work: a run whose identity cannot be recorded stops here.
-    let identity = if record_args.is_some() && rmlx_metrics::mode::observations_enabled() {
-        Some(resolve_record_identity(model_path)?)
-    } else {
-        None
-    };
+    // Resolved before any work: a run whose identity cannot be recorded stops
+    // here. `main` refuses `--record` under `--metrics off` or `events`.
+    let identity = record_args
+        .as_ref()
+        .map(|_| resolve_record_identity(model_path))
+        .transpose()?;
     // -- Read prompt file -------------------------------------------------------
     let prompt_text = std::fs::read_to_string(prompt_path)
         .map_err(|e| anyhow::anyhow!("cannot read prompt file {}: {e}", prompt_path.display()))?;
@@ -855,14 +856,7 @@ pub(crate) fn run_baseline(
     );
 
     // -- §8.5 universal record (Phase-8 bench harness) ------------------------
-    if let Some(record_args) = record_args.as_ref() {
-        // `--metrics off` means a no-op at the producer, not "build the record,
-        // then throw it away".
-        let Some(identity) = identity else {
-            info!("baseline: observations disabled, no record written");
-            return Ok(());
-        };
-
+    if let (Some(record_args), Some(identity)) = (record_args.as_ref(), identity) {
         // First-64-char preview for the `output_first_64` column.
         let preview_64: String = preview_full.chars().take(64).collect();
 
@@ -889,43 +883,12 @@ pub(crate) fn run_baseline(
         let path = write_buffer_record(&record)?;
         info!(path = %path.display(), "baseline: wrote §8.5 ingest record");
 
-        // Inline ingest so the row is visible to `rmlx metrics champions` /
-        // `bests` right away. Drop the buffer file on success; leave it for
-        // `rmlx metrics record --replay-pending` to pick up on failure.
-        let db_path = rmlx_core::paths::metrics_db_path();
-        match rmlx_metrics::schema::open(&db_path) {
-            Ok(mut conn) => {
-                let inserted_by = RunIdentity::get().inserted_by("rmlx-cli");
-                let mut rec_inst = rmlx_metrics::recorder::Recorder::new(&mut conn, inserted_by);
-                let run: rmlx_metrics::ingest::RunRecord = serde_json::from_value(record)
-                    .map_err(|e| anyhow::anyhow!("deserialize RunRecord: {e}"))?;
-                match rec_inst.record_run(&run) {
-                    Ok(outcome) => {
-                        info!(
-                            run_id = %outcome.run_id,
-                            inserted = outcome.observation_ids.len(),
-                            "baseline: ingested record into runs.db"
-                        );
-                        // Drop the buffer file: row is durable in the DB.
-                        let _ = std::fs::remove_file(&path);
-                    }
-                    Err(e) => {
-                        warn!(
-                            error = %e,
-                            buffer = %path.display(),
-                            "baseline: inline ingest failed; leaving buffer file for replay"
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    buffer = %path.display(),
-                    "baseline: cannot open metrics DB; leaving buffer file for replay"
-                );
-            }
-        }
+        ingest_buffer_record(
+            record,
+            &path,
+            &rmlx_core::paths::metrics_db_path(),
+            "baseline",
+        )?;
     }
 
     Ok(())
@@ -940,21 +903,31 @@ pub(crate) struct RecordIdentity {
 
 /// Resolve and check the identity of a run before it does any work.
 ///
-/// `weight_quant` is derived from the snapshot's quantization config and
-/// checked against the metrics DB's list here, so a value the DB would refuse
-/// stops the run now and not after the measurement.
+/// `weight_quant` is the label the snapshot's own config describes
+/// ([`rmlx_loader::ModelConfig::weight_quant_label`]), checked against the
+/// metrics DB's list here, so a value the DB would refuse stops the run now and
+/// not after the measurement.
+/// A missing or unreadable config, or one that names no weight format, is
+/// refused rather than recorded under a label nothing measured.
 pub(crate) fn resolve_record_identity(model_path: &Path) -> anyhow::Result<RecordIdentity> {
     let (namespace, model) = rmlx_metrics::identity::snapshot_identity(model_path)?;
-    let weight_quant = rmlx_loader::load_config(model_path)
-        .ok()
-        .and_then(|c| c.quantization)
-        .map_or_else(
-            || "bf16".to_string(),
-            |q| match q.mode_or_default() {
-                "mxfp8" | "mxfp4" | "nvfp4" => q.mode_or_default().to_string(),
-                _ => format!("{}bit", q.bits),
-            },
+    let config_path = model_path.join("config.json");
+    if !config_path.is_file() {
+        anyhow::bail!(
+            "no config.json at {}, so the run's weight_quant cannot be recorded",
+            config_path.display()
         );
+    }
+    let config = rmlx_loader::load_config(model_path)
+        .context("read the snapshot's config for the recorded weight_quant")?;
+    let Some(weight_quant) = config.weight_quant_label() else {
+        anyhow::bail!(
+            "{} names no weight format (no `quantization`, no ParoQuant `quantization_config`, \
+             and no `dtype` / `torch_dtype` of bfloat16 or float16), so the run's weight_quant \
+             cannot be recorded",
+            config_path.display()
+        );
+    };
     let weight_quant = rmlx_metrics::identity::canonicalize(
         "weight_quant",
         &weight_quant,
@@ -984,6 +957,8 @@ pub(crate) struct BaselineRecordArgs<'a> {
     /// Caller-supplied `--git-sha` value, or `None`. Provenance only — the
     /// binary never derives this itself (see `RunIdentity`'s doc).
     pub git_sha: Option<&'a str>,
+    /// Why the run is recorded (`--run-class`).
+    pub run_class: rmlx_metrics::run_class::RunClass,
 }
 
 /// Resolve a `--prompt-tokens N` flag to the canonical `prompts/longctx_<N/1024>k.json`
@@ -1125,6 +1100,7 @@ fn build_run_record(
         "output_first_64": preview_first_64,
         "notes": notes,
         "description": format!("baseline {run_id}"),
+        "run_class": args.run_class,
         "metrics": metrics,
     });
 
@@ -1145,6 +1121,76 @@ fn build_run_record(
         .insert("git_sha".to_string(), serde_json::Value::from(git_sha));
 
     Ok(record)
+}
+
+/// Record the §8.5 `record` that [`write_buffer_record`] left at `buffer` into
+/// the DB at `db_path`, so the row is visible to `bests` right away.
+///
+/// On success the buffer file is dropped. On failure it is kept for
+/// `rmlx metrics record --replay-pending`, the failure is printed naming it,
+/// and the run exits [`crate::exit::RECORD_PENDING`]: it measured, and did not
+/// record what it was asked to.
+pub(crate) fn ingest_buffer_record(
+    record: serde_json::Value,
+    buffer: &Path,
+    db_path: &Path,
+    what: &str,
+) -> anyhow::Result<()> {
+    let landed = (|| -> anyhow::Result<rmlx_metrics::recorder::RecordOutcome> {
+        let mut conn = rmlx_metrics::schema::open_migrated(db_path)?;
+        let inserted_by = RunIdentity::get().inserted_by("rmlx-cli");
+        let mut recorder = rmlx_metrics::recorder::Recorder::new(&mut conn, inserted_by);
+        let run: rmlx_metrics::ingest::RunRecord = serde_json::from_value(record)?;
+        Ok(recorder.record_run(&run)?)
+    })();
+    match landed {
+        Ok(outcome) => {
+            info!(
+                run_id = %outcome.run_id,
+                inserted = outcome.observation_ids.len(),
+                "{what}: ingested record into runs.db"
+            );
+            if let Err(e) = std::fs::remove_file(buffer) {
+                warn!(
+                    error = %e,
+                    buffer = %buffer.display(),
+                    "{what}: the record landed, but its buffer file stays; delete it, do not \
+                     replay it, or its rows are written twice"
+                );
+            }
+            Ok(())
+        }
+        Err(e) => {
+            // The scripts send stderr to /dev/null and point at the run log,
+            // so the log names the file to replay.
+            tracing::error!(
+                error = %e,
+                buffer = %buffer.display(),
+                db = %db_path.display(),
+                "{what}: record did not land"
+            );
+            let message = format!(
+                "{what}: measured, but the record did not reach {}: {e:#}; it is kept at {} for \
+                 `rmlx metrics record --replay-pending`",
+                db_path.display(),
+                buffer.display()
+            );
+            #[allow(
+                clippy::print_stderr,
+                reason = "operator-facing: the exit code alone does not say which file to replay"
+            )]
+            {
+                eprintln!(
+                    "error: {message}\nrMLX exits with code {}.",
+                    crate::exit::RECORD_PENDING
+                );
+            }
+            Err(
+                anyhow::Error::new(crate::exit::ExitWith(crate::exit::RECORD_PENDING))
+                    .context(message),
+            )
+        }
+    }
 }
 
 /// Write a `RunRecord` JSON to `<RMLX_HOME>/metrics/buffer/pending/<ts>-<uniq>.json`.

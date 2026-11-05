@@ -104,15 +104,15 @@ echo "codec_smoke_runner selftest"
 
 run_case present 0 "a present slug runs and the verdict is clean" \
     "$ROOT_GEMMA" "$WORK/m_present.toml" "ran=1 skipped=0" "snapshot=present" "!INCOMPLETE"
-json_has present "the result file records ran=1 and not incomplete" '"ran":1,"skipped_known":0,"skipped_absent":0,"unrecorded":0,"incomplete":false'
+json_has present "the result file records ran=1 and not incomplete" '"ran":1,"skipped_known":0,"skipped_absent":0,"unrecorded":0,"records_pending":0,"incomplete":false'
 
 run_case absent_slug 3 "an absent slug beside a run row is INCOMPLETE with its own exit code" \
     "$ROOT_GEMMA" "$WORK/m_absent.toml" "ran=1 skipped=1" "snapshot=absent" "matrix INCOMPLETE"
-json_has absent_slug "the result file records the incompleteness" '"skipped_absent":1,"unrecorded":0,"incomplete":true'
+json_has absent_slug "the result file records the incompleteness" '"skipped_absent":1,"unrecorded":0,"records_pending":0,"incomplete":true'
 
 run_case skip_reason_row 0 "a manifest skip_reason row is a known disposition, not INCOMPLETE" \
     "$ROOT_GEMMA" "$WORK/m_known.toml" "ran=1 skipped=1" "!INCOMPLETE"
-json_has skip_reason_row "the result file counts it as skipped_known" '"skipped_known":1,"skipped_absent":0,"unrecorded":0,"incomplete":false'
+json_has skip_reason_row "the result file counts it as skipped_known" '"skipped_known":1,"skipped_absent":0,"unrecorded":0,"records_pending":0,"incomplete":false'
 
 run_case unset_root 1 "an unset root runs no row: non-zero, and INCOMPLETE is said" \
     UNSET "$WORK/m_absent.toml" "ran=0 skipped=2" "matrix INCOMPLETE" "matrix ran no row"
@@ -129,6 +129,8 @@ FAKE="$WORK/fake"
 mkdir -p "$FAKE/scripts/release_e2e/stage6_perf" "$FAKE/target/release-perf" "$FAKE/bin"
 cp "$RUNNER" "$REPO_ROOT/scripts/release_e2e/stage6_perf/smoke_prompts.toml" \
     "$FAKE/scripts/release_e2e/stage6_perf/"
+mkdir -p "$FAKE/scripts/lib"
+cp "$REPO_ROOT/scripts/lib/record_pending.sh" "$FAKE/scripts/lib/"
 printf '#!/bin/sh\nfor i in 1 2 3 4 5; do echo "needle_found=$STUB_FOUND"; done\nexit ${STUB_RC:-0}\n' >"$FAKE/target/release-perf/rmlx"
 printf '#!/bin/sh\nexit 0\n' >"$FAKE/bin/cargo"
 chmod +x "$FAKE/target/release-perf/rmlx" "$FAKE/bin/cargo"
@@ -182,6 +184,20 @@ gate_case gate_record_run 0 "a record run still records a zero expectation" \
 sed 's/^smoke_probe_prompts = \[\]/smoke_probe_prompts = ["coherence"]/' "$WORK/g_one.toml" >"$WORK/g_smoke.toml"
 GATE_BIN="$FAKE/bin_run_fails" gate_case gate_baseline_fails 1 "a baseline that exits non-zero fails the row with its own status" \
     true "$WORK/g_smoke.toml" "" "smoke_fail" "rc=7" "!reason=validate"
+
+# A `cargo` whose baseline measured fluent text and whose record did not land.
+mkdir -p "$FAKE/bin_pending"
+cat >"$FAKE/bin_pending/cargo" <<'CARGO'
+#!/bin/sh
+[ "$1" = run ] || exit 0
+echo 'decoded="The sun rises slowly over the quiet hills, and the light spreads gold across every field."'
+echo "error: baseline: measured, but the record did not reach runs.db; it is kept at /x/pending/smoke.json for \`rmlx metrics record --replay-pending\`" >&2
+exit 75
+CARGO
+chmod +x "$FAKE/bin_pending/cargo"
+GATE_BIN="$FAKE/bin_pending" gate_case gate_smoke_record_pending 3 "a smoke run whose record did not land is judged on its output, named, and the matrix is INCOMPLETE" \
+    true "$WORK/g_smoke.toml" "" "record_pending" "record pending: /x/pending/smoke.json" "niah_pass" "!smoke_fail"
+json_has gate_smoke_record_pending "the result file counts the pending record" '"records_pending":1'
 
 STUB_RC=7 gate_case gate_niah_fails 1 "a NIAH pass that exits non-zero fails the row with its own status" \
     true "$WORK/g_one.toml" "" "niah_fail" "rc=7" "!niah_pass" "!niah_no_pct"

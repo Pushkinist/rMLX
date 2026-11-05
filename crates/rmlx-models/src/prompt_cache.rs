@@ -1431,6 +1431,7 @@ pub(crate) enum ReusePolicy {
 /// survive `ensure_prompt_cache`'s capacity-change re-creation.
 #[derive(Clone)]
 pub(crate) struct AttachParams {
+    pub(crate) kv_root: std::path::PathBuf,
     pub(crate) namespace: String,
     pub(crate) layout_key: u64,
     pub(crate) device: rmlx_mlx::Device,
@@ -1629,6 +1630,7 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
     /// reaches the hydrator through [`Self::consume`] instead.
     pub(crate) fn attach_ssd_tier(
         &self,
+        kv_root: &std::path::Path,
         namespace: &str,
         kv_quant: KvQuant,
         layout_key: u64,
@@ -1641,6 +1643,7 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
         // request may hot-swap it. Storing it would put an attach-time codec
         // where a per-request one belongs.
         let params = AttachParams {
+            kv_root: kv_root.to_path_buf(),
             namespace: namespace.to_string(),
             layout_key,
             device,
@@ -2026,11 +2029,12 @@ where
     SsdHydrator: SsdHydrate<E>,
 {
     cache.set_spill_sink(Box::new(SsdSpiller::spawn(
+        &p.kv_root,
         &p.namespace,
         p.layout_key,
         p.device,
     )));
-    match SsdHydrator::open(&p.namespace, p.layout_key, p.device) {
+    match SsdHydrator::open(&p.kv_root, &p.namespace, p.layout_key, p.device) {
         Ok(h) => cache.set_ssd_source(Box::new(h)),
         Err(e) => tracing::error!(
             namespace = %p.namespace,

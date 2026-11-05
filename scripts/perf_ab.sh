@@ -59,18 +59,27 @@
 # (binary, arguments) pair. Nothing in this harness changes when it does: an
 # in-process policy arm is just another argument.
 #
-# NEVER WRITES TO runs.db. An A/B run is an experiment, not a recorded
-# baseline; the append-only metrics store must not accumulate rows from arms
-# that were built to be thrown away, and a wrong row there cannot be taken
-# back out. Every slot runs with `--metrics off`, which never opens the file,
-# and `--metrics` is refused in arm arguments — it is a global flag, so an
-# occurrence after the subcommand would win and re-enable recording.
+# EVERY SLOT IS RECORDED AS AN `ab_arm` ROW. Each slot, warmups included, runs
+# `rmlx baseline --record --run-class ab_arm --label perf_ab:<ts>:<A|B>:<slot>`,
+# so `runs.db` keeps the whole comparison and no row of it reaches `bests` or a
+# gate (docs/METRICS_DB.md section 13). Find a run's rows with
+# `notes LIKE 'label=perf_ab:<ts>:%'`. `ingest/perf_ab_ingest.py` promotes the
+# surviving arm of an accepted comparison as `gate`. A binary built before the
+# run class existed rejects `--run-class`, so each arm's binary is asked once,
+# through `baseline --help`, before the first slot: an arm whose binary lacks
+# the flag runs `--metrics off` and records nothing, and the report says so.
+# Under `--synthetic-arms` the arms are stubs and measure nothing, so every
+# slot runs `--metrics off` and the binaries are not asked. `--metrics`,
+# `--record`, `--run-class` and `--label` are refused in arm arguments: the
+# harness sets them for every slot, and an arm's own occurrence would win.
 #
-# It does write elsewhere: the result lands in
+# It also writes elsewhere: the result lands in
 # `$RMLX_HOME/bench/perf_ab/<timestamp>.json`, and every slot is a full `rmlx`
 # process that writes its own `$RMLX_HOME/logs/<run-id>.jsonl` and runs the log
-# size-cap rotation. A default run is 42 of those. Point RMLX_HOME at a scratch
-# directory when that matters.
+# size-cap rotation. A recorded slot also appends one `metrics/baseline.csv`
+# row and its `events` rows; neither carries a run class, so an A/B slot there
+# looks like any other baseline run. A default run is 42 slots of each. Point
+# RMLX_HOME at a scratch directory when that matters.
 #
 # Exit codes:
 #   0   — ran cleanly; the verdict is on stdout. Under --synthetic-arms this
@@ -79,6 +88,10 @@
 #   125 — the comparison is not usable: a precondition failed (busy host,
 #         indistinguishable arms, missing binary/model, unparseable output), or
 #         the run completed but was TAINTED by interference.
+#   75  — the comparison ran and its verdict is printed, but at least one
+#         slot's ab_arm record did not land (`baseline` exit 75); each buffer
+#         file is named for `rmlx metrics record --replay-pending`. Only when
+#         nothing above already applies: 1 and 125 win.
 
 # No `pipefail`: several parses here legitimately end in `| head -1`, which
 # SIGPIPEs its producer once it has what it needs. Under pipefail that reads as
@@ -89,6 +102,10 @@ set -eu
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RMLX_HOME="${RMLX_HOME:-${REPO_ROOT}/.rmlx}"
+# shellcheck source=scripts/lib/record_pending.sh
+. "${REPO_ROOT}/scripts/lib/record_pending.sh"
+# Slots that measured and whose ab_arm record did not land.
+PENDING_RECORDS=0
 AWK_BUSIEST="${REPO_ROOT}/scripts/lib/busiest_between.awk"
 
 # ---- defaults ----------------------------------------------------------------
@@ -139,9 +156,9 @@ Protocol:
                          a short generation is refused, not averaged in.
   --max-ctx N            default 8192
 
-Arm arguments may not contain --metrics: it is a global flag, so an occurrence
-after the subcommand overrides the --metrics off every slot runs with, and the
-slot would write to the append-only runs.db.
+Every slot is recorded in runs.db as an ab_arm row, which reaches no champion
+and no gate. Arm arguments may not contain --metrics, --record, --run-class or
+--label: the harness sets them for every slot.
 
 Escape hatches (each one weakens a guard; each is reported in the output):
   --allow-null-arms          permit two identical arms (the null calibration)
@@ -250,23 +267,24 @@ SD_RSE_PCT="$(awk -v n="$((SLOTS / 2))" 'BEGIN { printf "%.0f", 100 / sqrt(2 * (
 # a run emits one independent verdict per model.
 FAMILY_P="$(awk -v p="$NULL_P" -v m="${#MODELS[@]}" 'BEGIN { printf "%.5f", 1 - (1 - p) ^ m }')"
 
-# `--metrics` may not appear in arm arguments. It is declared `global = true`,
-# so a subcommand-level occurrence overrides the harness's leading
-# `--metrics off` and the slot opens the real append-only runs.db -- verified,
-# including on a failure path where the model never loaded. This is refused
-# rather than overridden, because silently ignoring a flag the caller passed is
-# its own defect.
-case " $ARGS_A $ARGS_B " in
-*" --metrics "* | *" --metrics="*)
-	echo "ERROR: --metrics may not appear in arm arguments." >&2
-	echo "  It is a global flag, so an occurrence after the subcommand wins over" >&2
-	echo "  the --metrics off this harness passes, and the slot would write to the" >&2
-	echo "  append-only runs.db. A row from a discarded arm cannot be removed." >&2
-	echo "  arm A args: '$ARGS_A'" >&2
-	echo "  arm B args: '$ARGS_B'" >&2
-	exit 125
-	;;
-esac
+# The harness sets how every slot records. An arm's own `--metrics` would stop
+# or change that arm's rows, and a second `--record`, `--run-class` or `--label`
+# would be refused by the binary or move the arm into another class. Refused
+# here rather than overridden, because silently ignoring a flag the caller
+# passed is its own defect.
+for flag in --metrics --record --run-class --label; do
+	case " $ARGS_A $ARGS_B " in
+	*" $flag "* | *" $flag="*)
+		echo "ERROR: $flag may not appear in arm arguments." >&2
+		echo "  The harness records every slot as an ab_arm row and sets --metrics," >&2
+		echo "  --record, --run-class and --label for it; an arm's own $flag would" >&2
+		echo "  change how that arm is recorded." >&2
+		echo "  arm A args: '$ARGS_A'" >&2
+		echo "  arm B args: '$ARGS_B'" >&2
+		exit 125
+		;;
+	esac
+done
 
 if [[ ${#MODELS[@]} -eq 0 ]]; then
 	: "${RMLX_O_MODELS_ROOT:?Set RMLX_O_MODELS_ROOT, or pass --model - see .env.example}"
@@ -318,6 +336,21 @@ if [[ "$SHA_A" == "$SHA_B" && "$ARGS_A" == "$ARGS_B" ]]; then
 		exit 125
 	fi
 	echo "NOTE: --allow-null-arms: arms are identical by construction (null calibration)." >&2
+fi
+
+# A binary built before the run class existed has no `--run-class`, and clap
+# would refuse the first slot. Read from the help text, not from a version: the
+# flag is the fact the slot depends on.
+records_run_class() {
+	local help
+	help="$("$1" baseline --help 2>/dev/null || true)"
+	[[ "$help" == *--run-class* ]]
+}
+RECORDS_A=false
+RECORDS_B=false
+if ! $SYNTHETIC_ARMS; then
+	if records_run_class "$BIN_A"; then RECORDS_A=true; fi
+	if records_run_class "$BIN_B"; then RECORDS_B=true; fi
 fi
 
 TS="$(date -u +"%Y%m%dT%H%M%SZ")"
@@ -492,7 +525,7 @@ SLOT_IDS_FILE=""
 SLOT_HOST=""
 
 run_slot() {
-	local bin="$1" model="$2" extra="$3" tag="$4"
+	local bin="$1" model="$2" extra="$3" tag="$4" arm="$5"
 	local raw="${WORK_DIR}/${tag}.out"
 	local ids="${WORK_DIR}/${tag}.ids"
 	local snap_a="${WORK_DIR}/${tag}.cpu_a"
@@ -504,23 +537,32 @@ run_slot() {
 	# has whole-second resolution, which rounds a short slot's window to 0 and
 	# makes the interference reading unmeasurable for reasons that have nothing
 	# to do with the host. TIMEFORMAT=%R gives milliseconds and forks nothing.
-	#
-	# `--metrics off` is not a preference. An A/B run exercises arms that were
-	# built to be thrown away, and `runs.db` is append-only: a row written from
-	# a discarded arm cannot be taken back out. `off` never opens the file.
+	local records="$RECORDS_B" record=(--metrics off)
+	if [[ "$arm" == A ]]; then records="$RECORDS_A"; fi
+	if $records; then
+		record=(--record --run-class ab_arm --label "perf_ab:${TS}:${arm}:${tag}")
+	fi
 	TIMEFORMAT='%R'
+	local slot_rc=0
 	# shellcheck disable=SC2086  # extra args are deliberately word-split
-	if ! elapsed="$( { time {
-		RMLX_HOME="$RMLX_HOME" "$bin" --metrics off baseline \
+	elapsed="$( { time {
+		RMLX_HOME="$RMLX_HOME" "$bin" baseline \
 			--model "$model" \
 			--prompt-tokens "$PROMPT_TOKENS" \
 			--max-tokens "$MAX_TOKENS" \
 			--max-ctx "$MAX_CTX" \
 			--emit-token-ids \
+			"${record[@]}" \
 			$extra \
 			>"$raw" 2>"${raw}.err"
-	}; } 2>&1 )"; then
-		echo "ERROR: slot $tag failed to run" >&2
+	}; } 2>&1 )" || slot_rc=$?
+	# A slot that measured and whose record did not land is still a slot: its
+	# reading counts, and its buffer file is named for replay.
+	if [[ "$slot_rc" -eq "$RECORD_PENDING_EXIT" ]]; then
+		record_pending_note "${raw}.err"
+		PENDING_RECORDS=$((PENDING_RECORDS + 1))
+	elif [[ "$slot_rc" -ne 0 ]]; then
+		echo "ERROR: slot $tag failed to run (exit $slot_rc)" >&2
 		echo "  cmd: $bin baseline --model $model ... $extra" >&2
 		sed 's/^/    | /' "${raw}.err" | tail -20 >&2
 		exit 125
@@ -678,7 +720,24 @@ if $SYNTHETIC_ARMS; then
   nothing. The machine is not consulted at all: no quiescence probe, no per-slot
   interference sampling, no Metal-exclusivity check. No number below describes
   this host or any model, and the runs.db promoter refuses this result."
+	RECORDING="Every slot runs with --metrics off: the stub arms measure nothing, so runs.db
+is not opened."
 else
+	RECORDING=""
+	for letter in A B; do
+		records="$RECORDS_B"
+		if [[ "$letter" == A ]]; then records="$RECORDS_A"; fi
+		if $records; then
+			RECORDING="${RECORDING}arm $letter: every slot, warmups included, is recorded in runs.db as an ab_arm
+  row labelled perf_ab:${TS}:$letter:<slot>, which reaches no champion and no gate.
+"
+		else
+			RECORDING="${RECORDING}arm $letter: its binary has no --run-class (built before the run class), so
+  its slots run with --metrics off and record nothing.
+"
+		fi
+	done
+
 	# One awk, not `awk && echo`: this is an assignment, so a false test would
 	# be the assignment's exit status and `set -e` would end the run here.
 	HOST_DISPOSITION="INTERFERENCE GATE: a foreign process at or above ${BUSY_PCT}% of one core taints the
@@ -723,8 +782,8 @@ WHAT THE NUMBERS LICENSE:
 
 $HOST_DISPOSITION
 
-Every slot runs with --metrics off, so runs.db is never opened. This run writes
-its result to $RESULT_JSON. Each slot is a full rmlx process
+$RECORDING
+This run writes its result to $RESULT_JSON. Each slot is a full rmlx process
 and still writes its own \$RMLX_HOME/logs/<run-id>.jsonl, and each launch runs
 the log size-cap rotation -- point RMLX_HOME at a scratch directory if that
 matters.
@@ -795,10 +854,10 @@ for model in "${MODELS[@]}"; do
 	# shader-compile costs that would otherwise land entirely on slot 1, and
 	# it establishes each arm's correctness reference.
 	echo "  warmup A..." >&2
-	run_slot "$BIN_A" "$model" "$ARGS_A" "warm_a"
+	run_slot "$BIN_A" "$model" "$ARGS_A" "warm_a" A
 	cp "$SLOT_IDS_FILE" "${WORK_DIR}/ref_a"
 	echo "  warmup B..." >&2
-	run_slot "$BIN_B" "$model" "$ARGS_B" "warm_b"
+	run_slot "$BIN_B" "$model" "$ARGS_B" "warm_b" B
 	cp "$SLOT_IDS_FILE" "${WORK_DIR}/ref_b"
 
 	REF_TOKENS="$(wc -l <"${WORK_DIR}/ref_a" | tr -d ' ')"
@@ -837,12 +896,12 @@ for model in "${MODELS[@]}"; do
 	for ((i = 0; i < SLOTS; i++)); do
 		arm="${PATTERN:i:1}"
 		if [[ "$arm" == "0" ]]; then
-			bin="$BIN_A"; extra="$ARGS_A"; name="$LABEL_A"
+			bin="$BIN_A"; extra="$ARGS_A"; name="$LABEL_A"; letter=A
 		else
-			bin="$BIN_B"; extra="$ARGS_B"; name="$LABEL_B"
+			bin="$BIN_B"; extra="$ARGS_B"; name="$LABEL_B"; letter=B
 		fi
 
-		run_slot "$bin" "$model" "$extra" "slot_$i"
+		run_slot "$bin" "$model" "$extra" "slot_$i" "$letter"
 
 		# Every measured slot must reproduce its arm's reference. A slot that
 		# drifts mid-run is a correctness failure even if the arms agreed at
@@ -1028,4 +1087,9 @@ else
 	echo "host at end:   busiest foreign process over a 1s window: $(host_detail "$FINAL_HOST")"
 fi
 echo "result: $RESULT_JSON"
+if [[ "$PENDING_RECORDS" -gt 0 ]]; then
+	echo "INCOMPLETE: $PENDING_RECORDS slot record(s) did not land (named above); the verdict stands,"
+	echo "  and \`rmlx metrics record --replay-pending\` records them once the cause is fixed."
+	if [[ "$OVERALL_EXIT" -eq 0 ]]; then OVERALL_EXIT="$RECORD_PENDING_EXIT"; fi
+fi
 exit "$OVERALL_EXIT"

@@ -36,8 +36,18 @@
 #   * Spread is reported, never hidden. When the two arms' [min,max] ranges
 #     overlap the verdict is INCONCLUSIVE, whatever the medians say.
 #
-# NEVER WRITES TO runs.db. An A/B run is an experiment. Feed an accepted cell
-# to `rmlx metrics record --file` yourself, from the emitted JSON.
+# EVERY REAL RUN IS RECORDED. At the end of a comparison that is not
+# `--synthetic-arms`, the result is handed to `ingest/llama_ab_ingest.py`, which
+# writes both arms as `ab_arm` records: they reach no champion and no gate
+# (docs/METRICS_DB.md section 13). A TAINTED run is recorded too, with the taint
+# in `notes`. The identity of the rows (model label, weight quant, each arm's
+# backend and codec, prompt name) is not something a llama-server reports, so
+# `--record-args` carries it to the ingest, split on whitespace and never
+# globbed. Before the first slot the ingest itself checks those arguments and
+# the recorder (`--check-args`), so a set it would refuse, or a recorder built
+# before the run class, stops the run before anything is measured. Promoting
+# the surviving arm as `gate` is a second, explicit run of the ingest with
+# `--keep-arm A|B`.
 #
 # MEASUREMENT VS LOGIC
 #
@@ -57,7 +67,12 @@
 # Exit codes:
 #   0   — ran cleanly; verdict on stdout
 #   125 — not usable: busy host, indistinguishable arms, missing binary or
-#         model, a slot that produced no parseable timing, or TAINTED.
+#         model, `--record-args` the ingest refuses, a slot that produced no
+#         parseable timing, or TAINTED.
+#   4   — the comparison ran, but a record did not land. The verdict, and a
+#         TAINTED line when the run was tainted, are printed and the result file
+#         kept; the ingest names each record that did not land. Overrides the
+#         verdict's own code, 125 included.
 #         Under --synthetic-arms a 0 says the logic ran, not that a measurement
 #         was clean.
 
@@ -77,6 +92,7 @@ SYNTHETIC_ARMS=false
 READY_TIMEOUT=600
 OUT_DIR="${RMLX_HOME}/bench/llama_ab"
 CLAIM_RMLX="${REPO_ROOT}/target/release-perf/rmlx"
+RECORD_ARGS=""
 
 usage() {
 	cat <<'USAGE'
@@ -104,8 +120,14 @@ bench_llama_ab.sh --bin-a P --bin-b P --model GGUF --prompt-file F [options]
   --ready-timeout S        seconds to wait for /health per slot (default 600)
   --out-dir PATH           JSON result directory (default $RMLX_HOME/bench/llama_ab)
   --claim-rmlx PATH        the rmlx binary each slot's server runs under, as
-                           `rmlx claim run`, so it holds the Metal claim
-                           (default target/release-perf/rmlx)
+                           `rmlx claim run`, so it holds the Metal claim, and
+                           that records the run (default target/release-perf/rmlx)
+  --record-args STR        identity flags for ingest/llama_ab_ingest.py, which
+                           records both arms as ab_arm rows at the end of a real
+                           run: --model, --weight-quant, --arm-a-backend,
+                           --arm-b-backend, --arm-a-kv-quant, --arm-b-kv-quant,
+                           --prompt-name, and any of its optional flags.
+                           Required unless --synthetic-arms.
 USAGE
 }
 
@@ -133,6 +155,7 @@ while [ $# -gt 0 ]; do
 	--ready-timeout) need_value "$1" $#; READY_TIMEOUT="$2"; shift 2 ;;
 	--out-dir) need_value "$1" $#; OUT_DIR="$2"; shift 2 ;;
 	--claim-rmlx) need_value "$1" $#; CLAIM_RMLX="$2"; shift 2 ;;
+	--record-args) need_value "$1" $#; RECORD_ARGS="$2"; shift 2 ;;
 	-h | --help) usage; exit 0 ;;
 	*) echo "unknown argument: $1" >&2; usage >&2; exit 125 ;;
 	esac
@@ -142,6 +165,21 @@ done
 [ -n "$BIN_B" ] || { echo "missing required --bin-b" >&2; exit 125; }
 [ -n "$MODEL" ] || { echo "missing required --model" >&2; exit 125; }
 [ -n "$PROMPT_FILE" ] || { echo "missing required --prompt-file" >&2; exit 125; }
+if ! $SYNTHETIC_ARMS && [ -z "$RECORD_ARGS" ]; then
+	echo "missing required --record-args: a real run records both arms as ab_arm rows," >&2
+	echo "  and the rows' identity (model label, weight quant, each arm's backend and" >&2
+	echo "  codec, prompt name) is not something llama-server reports." >&2
+	exit 125
+fi
+RECORD_ARGV=()
+if [ -n "$RECORD_ARGS" ]; then
+	read -ra RECORD_ARGV <<<"$RECORD_ARGS"
+fi
+INGEST="${REPO_ROOT}/scripts/ingest/llama_ab_ingest.py"
+ingest() { # <ingest args...> -- the arguments every recording run of the ingest takes
+	python3 "$INGEST" "$@" --prompt-file "$PROMPT_FILE" --accept-tainted --record \
+		--rmlx-bin "$CLAIM_RMLX" ${RECORD_ARGV[@]+"${RECORD_ARGV[@]}"}
+}
 [ -x "$CLAIM_RMLX" ] || { echo "no rmlx binary at $CLAIM_RMLX (make build-perf, or --claim-rmlx)" >&2; exit 125; }
 for f in "$BIN_A" "$BIN_B" "$MODEL" "$PROMPT_FILE"; do
 	[ -e "$f" ] || { echo "not found: $f" >&2; exit 125; }
@@ -153,6 +191,11 @@ done
 if [ "$PAIRS" -lt 2 ]; then
 	echo "--pairs must be >= 2: at 1 slot per arm each range is a single point," >&2
 	echo "  so the overlap test cannot fire and every run reads SEPARATED." >&2
+	exit 125
+fi
+if ! $SYNTHETIC_ARMS && ! ingest --check-args >&2; then
+	echo "the ingest refuses --record-args or the recorder (above), so this run could" >&2
+	echo "  not be recorded; nothing was measured." >&2
 	exit 125
 fi
 
@@ -550,6 +593,18 @@ echo "verdict    $VERDICT   (B/A on medians)"
 echo "result     $RESULT"
 if $SYNTHETIC_ARMS; then
 	echo "host       not sampled (--synthetic-arms): stub arms, so nothing above measures this machine or any model"
+else
+	if ingest "$RESULT" >&2; then
+		echo "recorded   both arms as ab_arm rows in runs.db"
+	else
+		echo "recorded   NOT ALL: the ingest names above, as \`not recorded\`, each record that did" >&2
+		echo "  not land, and how to record it; if it names none, nothing was written and the" >&2
+		echo "  ingest can be run again on $RESULT" >&2
+		if [ -n "$TAINT" ]; then
+			echo "TAINTED    ${TAINT%; }"
+		fi
+		exit 4
+	fi
 fi
 if [ -n "$TAINT" ]; then
 	echo "TAINTED    ${TAINT%; }"

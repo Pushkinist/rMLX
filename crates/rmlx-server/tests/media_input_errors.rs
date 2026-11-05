@@ -132,6 +132,7 @@ async fn start_server_under(
         Arc::new(move |_path, _id| Ok(Box::new(loader_generator.clone()) as Box<dyn Generator>));
     let state = AppState {
         device: rmlx_mlx::Device::Cpu,
+        metrics_drainer: Some(spawn_drainer(metrics_db, reg.weight_quants())),
         registry: Arc::new(reg),
         slots: Arc::new(parking_lot::RwLock::new(Vec::new())),
         embed_slot: Arc::new(parking_lot::RwLock::new(None)),
@@ -151,7 +152,6 @@ async fn start_server_under(
         prompt_cache_slots: 4,
         ttft_store: TtftStore::default(),
         itl_store: ItlStore::default(),
-        metrics_drainer: Some(spawn_drainer(metrics_db)),
         require_smoke_probe: false,
         default_temperature: None,
         default_enable_thinking: None,

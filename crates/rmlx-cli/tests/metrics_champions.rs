@@ -16,35 +16,19 @@
     clippy::float_cmp
 )]
 
+mod common;
+
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+use common::{rmlx_at, rmlx_metrics};
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn rmlx_bin() -> PathBuf {
-    let manifest_dir =
-        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set by cargo");
-    let workspace_root = PathBuf::from(manifest_dir)
-        .parent() // crates/
-        .and_then(|p| p.parent()) // workspace root
-        .expect("workspace root from CARGO_MANIFEST_DIR")
-        .to_path_buf();
-    let debug = workspace_root.join("target/debug/rmlx");
-    assert!(
-        debug.exists(),
-        "target/debug/rmlx not found at {} — run `cargo build -p rmlx-cli` first",
-        debug.display()
-    );
-    debug
-}
-
 fn init_db(td: &tempfile::TempDir) -> PathBuf {
     let db = td.path().join("runs.db");
-    let out = Command::new(rmlx_bin())
-        .args(["metrics", "--db"])
-        .arg(&db)
+    let out = rmlx_metrics(&db)
         .arg("init")
         .output()
         .expect("launch rmlx metrics init");
@@ -57,10 +41,7 @@ fn init_db(td: &tempfile::TempDir) -> PathBuf {
 }
 
 fn run_metrics(db: &Path, subargs: &[&str]) -> std::process::Output {
-    Command::new(rmlx_bin())
-        .arg("metrics")
-        .arg("--db")
-        .arg(db)
+    rmlx_metrics(db)
         .args(subargs)
         .output()
         .expect("launch rmlx")
@@ -79,6 +60,7 @@ fn record_one(db: &Path, backend: &str, model: &str, metric: &str, value: f64, t
         "prompt": { "name": "test_prompt", "body": "Hello world" },
         "ts_utc": ts,
         "hardware_tag": "m5_max_128gb",
+        "run_class": "gate",
         "metrics": [{ "name": metric, "value": value }]
     })
     .to_string();
@@ -246,7 +228,8 @@ fn champions_real_db_runs() {
         return;
     }
 
-    let out = Command::new(rmlx_bin())
+    let home = tempfile::tempdir().unwrap();
+    let out = rmlx_at(home.path())
         .args(["metrics", "--db"])
         .arg(&real_db)
         .arg("champions")

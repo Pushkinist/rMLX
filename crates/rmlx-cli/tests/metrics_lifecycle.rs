@@ -20,42 +20,20 @@
     clippy::case_sensitive_file_extension_comparisons
 )]
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+mod common;
+
+use std::path::Path;
+
+use common::{rmlx_at, rmlx_metrics};
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Locate the rmlx binary: debug build (built by `cargo test`).
-///
-/// `CARGO_MANIFEST_DIR` points to `crates/rmlx-cli/`. The workspace root is two
-/// levels up. `cargo test --test` also builds the named binary, so `rmlx` should
-/// always be present when this test file runs.
-fn rmlx_bin() -> PathBuf {
-    let manifest_dir =
-        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set by cargo");
-    let workspace_root = PathBuf::from(manifest_dir)
-        .parent() // crates/
-        .and_then(|p| p.parent()) // workspace root
-        .expect("workspace root from CARGO_MANIFEST_DIR")
-        .to_path_buf();
-    let debug = workspace_root.join("target/debug/rmlx");
-    assert!(
-        debug.exists(),
-        "target/debug/rmlx not found at {} — run `cargo build -p rmlx-cli` first",
-        debug.display()
-    );
-    debug
-}
-
-/// Run `rmlx metrics --db <db_path> <subargs...>` from the workspace root.
-/// Returns the `Output`.
+/// Run `rmlx metrics --db <db_path> <subargs...>` with the directory holding
+/// the db as its runtime home. Returns the `Output`.
 fn run_metrics(db_path: &Path, subargs: &[&str]) -> std::process::Output {
-    Command::new(rmlx_bin())
-        .arg("metrics")
-        .arg("--db")
-        .arg(db_path)
+    rmlx_metrics(db_path)
         .args(subargs)
         .output()
         .expect("failed to launch rmlx")
@@ -168,11 +146,11 @@ fn doctor_detects_unknown_backend() {
             "INSERT INTO observations(
                  backend, model_namespace, model, weight_quant, kv_quant,
                  ctx_max, prompt_id, metric, value, unit, direction,
-                 run_id, ts_utc, hardware_tag, inserted_utc, inserted_by)
+                 run_id, ts_utc, hardware_tag, inserted_utc, inserted_by, run_class)
              VALUES ('pytorch','mlx-community','test-model','mxfp8','none',
                      8192, ?1, 'decode_tps_warm', 42.0, 'tps', 'higher_better',
                      'run0', '2026-01-01T00:00:00Z', 'm5_max_128gb',
-                     '2026-01-01T00:00:00Z', 'test@0.0.1')",
+                     '2026-01-01T00:00:00Z', 'test@0.0.1', 'gate')",
             rusqlite::params![prompt_id],
         )
         .expect("insert bad observation");
@@ -276,11 +254,11 @@ fn f13_doctor_coverage_matrix_no_gaps_when_all_present() {
                 "INSERT INTO observations(
                      backend, model_namespace, model, weight_quant, kv_quant,
                      ctx_max, prompt_id, metric, value, unit, direction,
-                     run_id, ts_utc, hardware_tag, inserted_utc, inserted_by)
+                     run_id, ts_utc, hardware_tag, inserted_utc, inserted_by, run_class)
                  VALUES (?1,'mlx-community','f13-model','mxfp8','none',
                          8192, ?2, ?3, 1.0, ?4, ?5,
                          'f13run', '2026-01-01T00:00:00Z', 'm5_max_128gb',
-                         '2026-01-01T00:00:00Z', 'test@0.0.1')",
+                         '2026-01-01T00:00:00Z', 'test@0.0.1', 'gate')",
                 rusqlite::params![backend, prompt_id, metric, unit, dir.as_str()],
             )
             .expect("insert coverage row");
@@ -300,12 +278,7 @@ fn f13_doctor_coverage_matrix_no_gaps_when_all_present() {
     );
 }
 
-/// `backup` with no explicit `--out` creates a file in `metrics/backups/`.
-///
-/// Note: the backup will land in the cwd (`metrics/backups/`) — the test
-/// verifies the backup file exists in the temp-subdir passed via `--db`.
-/// Because the default backups dir is relative to cwd (workspace root), we
-/// use `--out` to redirect to a path we control.
+/// `backup --out <path>` writes the snapshot to that path.
 #[test]
 fn backup_out_path_creates_file() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -454,11 +427,11 @@ fn f17_doctor_no_warning_for_refract_validated_kv_quant() {
                 "INSERT INTO observations(
                      backend, model_namespace, model, weight_quant, kv_quant,
                      ctx_max, prompt_id, metric, value, unit, direction,
-                     run_id, ts_utc, hardware_tag, inserted_utc, inserted_by)
+                     run_id, ts_utc, hardware_tag, inserted_utc, inserted_by, run_class)
                  VALUES ('rmlx','mlx-community','f17-model','mxfp8',?1,
                          8192, ?2, 'decode_tps_warm', 50.0, ?3, ?4,
                          'f17run0', '2026-01-01T00:00:00Z', 'm5_max_128gb',
-                         '2026-01-01T00:00:00Z', 'test@0.0.1')",
+                         '2026-01-01T00:00:00Z', 'test@0.0.1', 'gate')",
                 rusqlite::params![kq, prompt_id, unit, dir.as_str()],
             )
             .expect("insert validated kv_quant row");
@@ -523,11 +496,11 @@ fn f17_doctor_warns_for_refract_unvalidated_kv_quant() {
                 "INSERT INTO observations(
                      backend, model_namespace, model, weight_quant, kv_quant,
                      ctx_max, prompt_id, metric, value, unit, direction,
-                     run_id, ts_utc, hardware_tag, inserted_utc, inserted_by)
+                     run_id, ts_utc, hardware_tag, inserted_utc, inserted_by, run_class)
                  VALUES ('rmlx','mlx-community','f17u-model','mxfp8',?1,
                          8192, ?2, 'decode_tps_warm', 50.0, ?3, ?4,
                          'f17run1', '2026-01-01T00:00:00Z', 'm5_max_128gb',
-                         '2026-01-01T00:00:00Z', 'test@0.0.1')",
+                         '2026-01-01T00:00:00Z', 'test@0.0.1', 'gate')",
                 rusqlite::params![kq, prompt_id, unit, dir.as_str()],
             )
             .expect("insert unvalidated kv_quant row");
@@ -570,10 +543,8 @@ fn run_metrics_with_home(
     rmlx_home: &Path,
     subargs: &[&str],
 ) -> std::process::Output {
-    Command::new(rmlx_bin())
-        .env("RMLX_HOME", rmlx_home)
-        .arg("metrics")
-        .arg("--db")
+    rmlx_at(rmlx_home)
+        .args(["metrics", "--db"])
         .arg(db_path)
         .args(subargs)
         .output()

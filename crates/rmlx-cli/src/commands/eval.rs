@@ -15,10 +15,11 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::commands::baseline::{resolve_record_identity, RecordIdentity};
+use crate::commands::baseline::{ingest_buffer_record, resolve_record_identity, RecordIdentity};
 use crate::commands::parse::ClaimedDevice;
 use anyhow::Result;
 use rmlx_metrics::identity::RunIdentity;
+use rmlx_metrics::run_class::RunClass;
 use rmlx_models::{arch, ppl};
 use tracing::{info, instrument, warn};
 
@@ -36,7 +37,7 @@ use tracing::{info, instrument, warn};
     text_file = %text_file.display(),
     ctx_window,
     stride,
-    corpus,
+    corpus = recording.map_or("", |(corpus, _)| corpus),
     device = ?claimed.device(),
     ?kv_quant,
 ))]
@@ -50,7 +51,7 @@ pub(crate) fn run_ppl(
     text_file: &Path,
     ctx_window: usize,
     stride: usize,
-    corpus: &str,
+    recording: Option<(&str, RunClass)>,
     claimed: &ClaimedDevice,
     max_tokens: usize,
     run_id: &str,
@@ -58,12 +59,11 @@ pub(crate) fn run_ppl(
     kv_quant: Option<rmlx_kv_quant::KvQuant>,
 ) -> Result<()> {
     let device = claimed.device();
-    // Resolved before any work: a run whose identity cannot be recorded stops here.
-    let identity = if !corpus.is_empty() && rmlx_metrics::mode::observations_enabled() {
-        Some(resolve_record_identity(model_path)?)
-    } else {
-        None
-    };
+    // Resolved before any work: a run whose identity cannot be recorded stops
+    // here. `main` refuses `--corpus` under `--metrics off` or `events`.
+    let identity = recording
+        .map(|_| resolve_record_identity(model_path))
+        .transpose()?;
     // -- Read corpus + tokenize ------------------------------------------------
     let corpus_text = std::fs::read_to_string(text_file)
         .map_err(|e| anyhow::anyhow!("cannot read text file {}: {e}", text_file.display()))?;
@@ -136,7 +136,7 @@ pub(crate) fn run_ppl(
         "ctx_window": ctx_window,
         "stride": stride,
         "n_tokens": n_tokens,
-        "corpus": corpus,
+        "corpus": recording.map_or("", |(corpus, _)| corpus),
         "model": model_path.display().to_string(),
         "arch": model.arch_class(),
         "load_ms": load_ms,
@@ -147,7 +147,7 @@ pub(crate) fn run_ppl(
     println!("{}", serde_json::to_string(&out)?);
 
     // -- §8.5 universal record -------------------------------------------------
-    if corpus.is_empty() {
+    let (Some((corpus, run_class)), Some(identity)) = (recording, identity) else {
         // A run that measured something and stored nothing should say so. The
         // number is on stdout either way, but a sweep whose rows never reach
         // the DB looks exactly like a sweep that did until someone queries for
@@ -157,10 +157,6 @@ pub(crate) fn run_ppl(
             "ppl: no --corpus given, so this measurement is printed and not recorded; \
              pass --corpus <name> to write it to runs.db"
         );
-        return Ok(());
-    }
-    let Some(identity) = identity else {
-        info!("ppl: observations disabled, no record written");
         return Ok(());
     };
     record_ppl_run(&PplRecordArgs {
@@ -174,6 +170,7 @@ pub(crate) fn run_ppl(
         load_ms,
         score_ms,
         git_sha,
+        run_class,
         kv_quant,
         decode_config: decode_config.as_deref(),
     })
@@ -214,6 +211,7 @@ struct PplRecordArgs<'a> {
     load_ms: f64,
     score_ms: f64,
     git_sha: Option<&'a str>,
+    run_class: RunClass,
     kv_quant: Option<rmlx_kv_quant::KvQuant>,
     decode_config: Option<&'a str>,
 }
@@ -234,6 +232,7 @@ fn record_ppl_run(args: &PplRecordArgs<'_>) -> Result<()> {
         args.load_ms,
         args.score_ms,
         args.git_sha,
+        args.run_class,
         args.kv_quant,
         args.decode_config,
     )?;
@@ -241,40 +240,12 @@ fn record_ppl_run(args: &PplRecordArgs<'_>) -> Result<()> {
     let buf_path = write_buffer_record(&record)?;
     info!(path = %buf_path.display(), "ppl: wrote §8.5 ingest record");
 
-    let db_path = rmlx_core::paths::metrics_db_path();
-    match rmlx_metrics::schema::open(&db_path) {
-        Ok(mut conn) => {
-            let inserted_by = RunIdentity::get().inserted_by("rmlx-cli");
-            let mut rec_inst = rmlx_metrics::recorder::Recorder::new(&mut conn, inserted_by);
-            let run: rmlx_metrics::ingest::RunRecord = serde_json::from_value(record)
-                .map_err(|e| anyhow::anyhow!("deserialize RunRecord: {e}"))?;
-            match rec_inst.record_run(&run) {
-                Ok(outcome) => {
-                    info!(
-                        run_id = %outcome.run_id,
-                        inserted = outcome.observation_ids.len(),
-                        "ppl: ingested record into runs.db"
-                    );
-                    let _ = std::fs::remove_file(&buf_path);
-                }
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        buffer = %buf_path.display(),
-                        "ppl: inline ingest failed; leaving buffer file for replay"
-                    );
-                }
-            }
-        }
-        Err(e) => {
-            warn!(
-                error = %e,
-                buffer = %buf_path.display(),
-                "ppl: cannot open metrics DB; leaving buffer file for replay"
-            );
-        }
-    }
-    Ok(())
+    ingest_buffer_record(
+        record,
+        &buf_path,
+        &rmlx_core::paths::metrics_db_path(),
+        "ppl",
+    )
 }
 
 /// Build a §8.5 universal `RunRecord` JSON for a completed PPL run.
@@ -293,6 +264,7 @@ fn build_ppl_run_record(
     load_ms: f64,
     score_ms: f64,
     git_sha: Option<&str>,
+    run_class: RunClass,
     kv_quant: Option<rmlx_kv_quant::KvQuant>,
     decode_config: Option<&str>,
 ) -> Result<serde_json::Value> {
@@ -337,6 +309,7 @@ fn build_ppl_run_record(
         "output_first_64": "",
         "notes": format!("corpus={corpus} ctx_window={ctx_window} stride={stride}"),
         "description": format!("ppl {run_id}"),
+        "run_class": run_class,
         "metrics": metrics,
     });
 

@@ -29,6 +29,8 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+mod common;
+
 /// The reply bound of the server, read from the doc that states it. A unit
 /// test of `rmlx-server` holds that sentence to the constant of the server,
 /// so this file has no copy of the value.
@@ -79,8 +81,7 @@ impl Server {
             .local_addr()
             .unwrap()
             .port();
-        let child = Command::new(env!("CARGO_BIN_EXE_rmlx"))
-            .env("RMLX_HOME", home.path())
+        let child = common::rmlx_at(home.path())
             .args(["serve", "--device", "cpu", "--metrics", "off"])
             .args(["--max-timeout-secs", "0", "--port", &port.to_string()])
             .stdin(Stdio::null())

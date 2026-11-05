@@ -32,16 +32,9 @@
     clippy::manual_let_else
 )]
 
-use std::process::Command;
+mod common;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
-
-/// Locate the cargo-built `rmlx` binary.
-///
-/// `CARGO_BIN_EXE_rmlx` is injected by Cargo's integration-test runner.
-fn rmlx_bin() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_BIN_EXE_rmlx"))
-}
 
 struct RunResult {
     exit_code: i32,
@@ -51,24 +44,11 @@ struct RunResult {
 /// Run `rmlx` with the given args, isolated in a per-invocation temp dir so
 /// parallel tests do not contend on the same SQLite metrics DB.
 fn run(args: &[&str]) -> RunResult {
-    // Each call gets a unique directory under /tmp so concurrent test threads
-    // don't contend on the same SQLite `runs.db`.
-    let rmlx_home = std::env::temp_dir().join(format!(
-        "rmlx_ctv_{}_{}",
-        std::process::id(),
-        // Use a monotonic counter to differentiate calls within the same process.
-        {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static CTR: AtomicU64 = AtomicU64::new(0);
-            CTR.fetch_add(1, Ordering::Relaxed)
-        }
-    ));
+    let rmlx_home = tempfile::tempdir().expect("create RMLX_HOME tempdir");
 
-    let out = Command::new(rmlx_bin())
+    let out = common::rmlx_at(rmlx_home.path())
         // Suppress log noise; tests assert on plain `error:` lines written via `eprintln!`.
         .env("RUST_LOG", "off")
-        // Isolate filesystem side-effects from the workspace .rmlx/ directory.
-        .env("RMLX_HOME", &rmlx_home)
         .args(args)
         .output()
         .expect("failed to spawn rmlx subprocess");

@@ -12,7 +12,8 @@
 )]
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+mod common;
 
 struct Run {
     code: Option<i32>,
@@ -26,12 +27,11 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 fn spec_answer(home: &Path, plain: &Path, spec: &Path) -> Run {
-    let out = Command::new(env!("CARGO_BIN_EXE_rmlx"))
+    let out = common::rmlx_at(home)
         .args(["eval", "spec-answer", "--plain"])
         .arg(plain)
         .arg("--spec")
         .arg(spec)
-        .env("RMLX_HOME", home)
         .env("HOME", home)
         .output()
         .expect("launch rmlx");

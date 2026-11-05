@@ -42,6 +42,7 @@ fn seed_one(conn: &mut Connection, value: f64, description: Option<&str>) {
         notes: None,
         description: description.map(ToOwned::to_owned),
         decode_config: None,
+        run_class: Some(crate::run_class::RunClass::Gate),
         metrics: vec![MetricEntry {
             name: "decode_tps_warm".into(),
             value: Some(value),
@@ -90,6 +91,7 @@ fn seed_named(
         notes: None,
         description: None,
         decode_config: None,
+        run_class: Some(crate::run_class::RunClass::Gate),
         metrics: vec![MetricEntry {
             name: metric.into(),
             value: Some(value),
@@ -146,6 +148,7 @@ fn seed_speculative_at(
         notes: None,
         description: None,
         decode_config: decode_config.map(ToOwned::to_owned),
+        run_class: Some(crate::run_class::RunClass::Gate),
         metrics: metrics
             .iter()
             .map(|(name, value)| MetricEntry {
@@ -239,6 +242,7 @@ fn record_spec(conn: &mut Connection, run: &SpecRun) {
         notes: None,
         description: None,
         decode_config: Some(run.decode_config.clone()),
+        run_class: Some(crate::run_class::RunClass::Gate),
         metrics: vec![MetricEntry {
             name: "tokens_per_round".into(),
             value: Some(2.5),
@@ -740,6 +744,7 @@ fn the_markdown_table_keeps_the_two_arms_apart() {
             notes: None,
             description: None,
             decode_config: Some("mtp/block=5".into()),
+            run_class: Some(crate::run_class::RunClass::Gate),
             metrics: vec![MetricEntry {
                 name: "decode_tps_warm".into(),
                 value: Some(275.7),
@@ -1063,6 +1068,7 @@ fn seed_run(
         notes: Some(notes.into()),
         description: None,
         decode_config: decode_config.map(ToOwned::to_owned),
+        run_class: Some(crate::run_class::RunClass::Gate),
         metrics: metrics
             .iter()
             .map(|(name, value)| MetricEntry {

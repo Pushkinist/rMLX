@@ -4,7 +4,8 @@
 //! on-disk state live under a single root directory referred to as
 //! `.rmlx/`. The root is resolved once at process start in this exact order:
 //!
-//! 1. `$RMLX_HOME` (if set; must be absolute).
+//! 1. `$RMLX_HOME` (if set; must be absolute — a relative value is refused,
+//!    see [`check_env_home`]).
 //! 2. `<workspace>/.rmlx/` — found by walking up from the current working
 //!    directory until `Cargo.lock` appears. This is the **dev default**:
 //!    state is co-located with the checkout, gitignored, and trivially
@@ -34,6 +35,8 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+
+use crate::error::{Error, Result};
 
 const ENV_HOME: &str = "RMLX_HOME";
 
@@ -101,15 +104,9 @@ pub fn cache_dir() -> PathBuf {
     p
 }
 
-/// `<home>/cache/kv/<namespace>/` — per-namespace KV-block SSD cache.
-///
-/// Each namespace (typically `<model_id>/<kv_quant>`) gets its own
-/// sub-directory so block files and the index DB are collocated.
-/// Created on demand, matching the pattern of the other path helpers.
-pub fn kv_cache_dir(namespace: &str) -> PathBuf {
-    let p = cache_dir().join("kv").join(namespace);
-    let _ = std::fs::create_dir_all(&p);
-    p
+/// `<home>/cache/kv/` — root of the SSD KV tier, one namespace per subdirectory.
+pub fn kv_cache_root() -> PathBuf {
+    cache_dir().join("kv")
 }
 
 /// `<home>/bench/` — micro-benchmark artefacts (CSV rows, ad-hoc baselines).
@@ -151,10 +148,26 @@ pub fn projects_toml_path() -> PathBuf {
 
 // ── Resolution ───────────────────────────────────────────────────────────────
 
+/// Refuse a relative `$RMLX_HOME`.
+///
+/// # Errors
+/// `Error::Config` naming the value when `$RMLX_HOME` is set and not
+/// absolute. The binary calls this before anything resolves [`home`].
+pub fn check_env_home() -> Result<()> {
+    env_home().map(drop)
+}
+
+#[allow(
+    clippy::panic,
+    reason = "a relative RMLX_HOME has no root to fall back to: the binary refuses it at start \
+              (check_env_home), and any other caller stops here rather than write elsewhere"
+)]
 fn resolve() -> PathBuf {
     // 1. Env var override (dev shells, CI, installed-binary on non-standard layouts).
-    if let Some(p) = env_home() {
-        return p;
+    match env_home() {
+        Ok(Some(p)) => return p,
+        Ok(None) => {}
+        Err(e) => panic!("{e}"),
     }
     // 2. Workspace-local for dev: walk up from cwd for Cargo.lock.
     if let Some(ws) = workspace_root() {
@@ -164,18 +177,18 @@ fn resolve() -> PathBuf {
     user_home_rmlx().unwrap_or_else(|| PathBuf::from(".rmlx"))
 }
 
-fn env_home() -> Option<PathBuf> {
-    let raw = std::env::var_os(ENV_HOME)?;
+fn env_home() -> Result<Option<PathBuf>> {
+    let Some(raw) = std::env::var_os(ENV_HOME) else {
+        return Ok(None);
+    };
     let p = PathBuf::from(raw);
     if !p.is_absolute() {
-        tracing::warn!(
-            env = ENV_HOME,
-            path = %p.display(),
-            "RMLX_HOME must be absolute; ignoring"
-        );
-        return None;
+        return Err(Error::Config(format!(
+            "{ENV_HOME}={} must be an absolute path",
+            p.display()
+        )));
     }
-    Some(p)
+    Ok(Some(p))
 }
 
 fn workspace_root() -> Option<PathBuf> {

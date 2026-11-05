@@ -41,6 +41,7 @@ fn base_run() -> RunRecord {
         notes: Some("auto-summary".into()),
         description: Some("abc1234: test run".into()),
         decode_config: None,
+        run_class: Some(RunClass::Gate),
         metrics: vec![
             MetricEntry {
                 name: "decode_tps_warm".into(),

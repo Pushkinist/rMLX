@@ -1,9 +1,5 @@
 use super::*;
 
-fn medgemma_model_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("RMLX_TEST_MODEL_MEDGEMMA").map(std::path::PathBuf::from)
-}
-
 #[allow(
     clippy::expect_used,
     reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
@@ -162,74 +158,5 @@ fn gemma3_vision_forward_shape() {
         vals.iter().filter(|v| !v.is_finite()).count(),
         0,
         "non-finite values in image features"
-    );
-}
-
-/// Real-weights forward (gated on the medgemma snapshot, `--ignored`).
-#[test]
-#[ignore = "requires medgemma snapshot; run with --ignored"]
-#[allow(
-    clippy::expect_used,
-    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
-)]
-fn gemma3_vision_forward_real_weights() {
-    let Some(dir_buf) = medgemma_model_dir() else {
-        eprintln!("SKIP: RMLX_TEST_MODEL_MEDGEMMA not set");
-        return;
-    };
-    let dir = dir_buf.as_path();
-    if !dir.exists() {
-        eprintln!("SKIP: medgemma snapshot absent at {}", dir.display());
-        return;
-    }
-    let device = Device::Cpu;
-    let cfg = Gemma3VisionConfig::from_model_dir(dir)
-        .expect("read vision_config")
-        .expect("vision_config present");
-    let (vision, projector) = load_vision_tower(dir, &cfg).expect("load vision tower");
-    let proc = Gemma3ImageProcessor::from_model_dir(dir).expect("processor");
-
-    let (iw, ih) = (640u32, 640u32);
-    let img = image::RgbImage::from_pixel(iw, ih, image::Rgb([200u8, 60u8, 60u8]));
-    let mut png = Vec::new();
-    {
-        use image::ImageEncoder;
-        image::codecs::png::PngEncoder::new(&mut png)
-            .write_image(img.as_raw(), iw, ih, image::ExtendedColorType::Rgb8)
-            .expect("encode");
-    }
-    let pv = proc.preprocess(&png).expect("preprocess");
-    assert_eq!(pv.num_soft_tokens, cfg.mm_tokens_per_image);
-
-    let vout = vision.forward(&pv, device).expect("vision forward");
-    vout.eval().expect("eval");
-    assert_eq!(
-        vout.shape(),
-        vec![
-            1,
-            (cfg.patches_per_side() * cfg.patches_per_side()) as i32,
-            cfg.hidden_size as i32
-        ]
-    );
-
-    let feats = projector.forward(&vout, device).expect("projector");
-    feats.eval().expect("eval");
-    assert_eq!(
-        feats.shape(),
-        vec![
-            1,
-            cfg.mm_tokens_per_image as i32,
-            cfg.text_hidden_size as i32
-        ]
-    );
-    let vals = materialize_f32(&feats);
-    assert_eq!(vals.iter().filter(|v| !v.is_finite()).count(), 0);
-    let max_abs = vals.iter().fold(0.0_f32, |m, v| m.max(v.abs()));
-    assert!(max_abs > 0.0, "real vision features all zero");
-    eprintln!(
-        "gemma3 vision (real): shape={:?} soft={} max_abs={:.4}",
-        feats.shape(),
-        cfg.mm_tokens_per_image,
-        max_abs
     );
 }

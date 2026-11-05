@@ -340,7 +340,7 @@ impl Served {
         let dbs = [dir.path().join("runs.db"), dir.path().join("events.db")];
         let drainer = {
             let _in_pool = pool.enter();
-            spawn_drainer(dbs[0].clone())
+            spawn_drainer(dbs[0].clone(), std::collections::BTreeMap::new())
         };
         let recorder = Arc::new(EventRecorder::open_at(&dbs[1], "gone").expect("an events DB"));
         Self {

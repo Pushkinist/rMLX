@@ -1284,9 +1284,13 @@ enum Cmd {
         /// Emit one §8.5 universal `RunRecord` to `<RMLX_HOME>/metrics/buffer/pending/`
         /// at the end of the run and ingest it into `runs.db` in-process. The
         /// resulting row is visible to `rmlx metrics champions` / the `bests`
-        /// view immediately. Used by the bench harness.
-        #[arg(long, default_value_t = false)]
+        /// view immediately. Used by the bench harness. Needs `--run-class`.
+        #[arg(long, default_value_t = false, requires = "run_class")]
         record: bool,
+        /// Why the run is recorded: `gate`, `ab_arm` or `diagnostic`. Required
+        /// with `--record`; only `gate` rows reach `bests` and the gates.
+        #[arg(long, value_name = "CLASS", requires = "record")]
+        run_class: Option<rmlx_metrics::run_class::RunClass>,
         /// Commit SHA to record as provenance on the emitted metrics row
         /// (only meaningful with `--record`). Optional caller-supplied
         /// value — the binary cannot honestly know what commit it was
@@ -1337,10 +1341,11 @@ enum Cmd {
         /// Metal inserts the capture layer at launch and cannot do so later.
         /// `scripts/gpu_capture.sh` handles both.
         ///
-        /// Capture perturbs every timing this command measures, so it cannot be
-        /// combined with `--record`.
+        /// Capture serialises every dispatch, so every timing this command
+        /// measures is false: the run needs `--record --run-class diagnostic`,
+        /// which keeps it out of `bests` and the gates.
         #[cfg(feature = "metal-capture")]
-        #[arg(long, value_name = "PATH", conflicts_with = "record")]
+        #[arg(long, value_name = "PATH", requires = "record")]
         gpu_capture: Option<PathBuf>,
         /// Decode steps to run before the GPU-capture window opens. Skipping the
         /// first steps keeps first-touch kernel compilation and pipeline warm-up
@@ -1626,6 +1631,11 @@ enum EvalCmd {
         /// guessed. Absent by default (`git_sha` is `NULL`).
         #[arg(long, value_name = "SHA")]
         git_sha: Option<String>,
+        /// Why the run is recorded: `gate`, `ab_arm` or `diagnostic`. Required
+        /// with a non-empty `--corpus`; only `gate` rows reach `bests` and the
+        /// gates.
+        #[arg(long, value_name = "CLASS")]
+        run_class: Option<rmlx_metrics::run_class::RunClass>,
         #[arg(long, help = KV_QUANT_HELP, long_help = KV_QUANT_LONG_HELP)]
         kv_quant: Option<String>,
         /// Named KV-cache preset (see long-help). Mutually exclusive with
@@ -1769,28 +1779,6 @@ fn resolve_prompts_root(prompts_dir: Option<PathBuf>) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("prompts"))
 }
 
-/// Whether this invocation asks for a GPU trace capture.
-///
-/// Read before the metrics kill switch is resolved: a captured run's numbers are
-/// instrumentation artefacts, not measurements, and must not reach any metrics
-/// surface. See the call site in [`main`].
-#[cfg(feature = "metal-capture")]
-fn gpu_capture_requested(cmd: &Cmd) -> bool {
-    matches!(
-        cmd,
-        Cmd::Baseline {
-            gpu_capture: Some(_),
-            ..
-        }
-    )
-}
-
-/// Without the capture feature there is no flag to ask with.
-#[cfg(not(feature = "metal-capture"))]
-const fn gpu_capture_requested(_cmd: &Cmd) -> bool {
-    false
-}
-
 /// Refuse to measure against an MLX that is not the validated pair.
 ///
 /// The pin exists because a drifted MLX changes prefill throughput by ~3.8x
@@ -1850,25 +1838,13 @@ fn main() -> Result<()> {
 
     // Parse CLI first so `--log` can shape the tracing filter.
     let cli = Cli::parse();
+    rmlx_core::paths::check_env_home()?;
     let run_id = make_run_id();
 
     // Resolve the metrics kill switch exactly once, before anything can open
     // the DB or spawn the drainer. Every writer reads it from here; no call
     // site carries its own toggle.
-    //
-    // A GPU-capture run is instrumentation, not measurement: the capture layer
-    // serialises every dispatch and collapses decode to single-digit TPS, so
-    // every number the run produces is false. Force the switch off for it. The
-    // clap conflict with `--record` covers the §8.5 observations row only —
-    // the `events` rows and the `metrics/baseline.csv` append happen outside
-    // it, so without this a hand-run capture still wrote a ~2.5 TPS row into
-    // append-only surfaces.
-    let capture_forces_metrics_off = gpu_capture_requested(&cli.cmd);
-    rmlx_metrics::mode::init(if capture_forces_metrics_off {
-        rmlx_metrics::mode::MetricsMode::Off
-    } else {
-        cli.metrics_mode.mode()
-    });
+    rmlx_metrics::mode::init(cli.metrics_mode.mode());
 
     // Set RUST_BACKTRACE before init_tracing so the call happens while the
     // process is genuinely single-threaded — no background threads exist yet
@@ -1888,7 +1864,7 @@ fn main() -> Result<()> {
         }
     }
     let log_guard = init_tracing(&run_id, cli.log, cli.log_cap_mb)?;
-    let outcome = run(cli, &run_id, capture_forces_metrics_off);
+    let outcome = run(cli, &run_id);
     finish(log_guard, outcome)
 }
 
@@ -1918,7 +1894,7 @@ fn finish(log_guard: WorkerGuard, outcome: Result<i32>) -> Result<()> {
     reason = "run() is the top-level CLI dispatch — splitting fragments the \
               subcommand wiring, which must remain co-located for clap arg resolution"
 )]
-fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> {
+fn run(cli: Cli, run_id: &str) -> Result<i32> {
     // Record the nax-GEMM-kernel capability of the MLX this process loaded.
     // `rmlx-metrics` cannot read this itself (see `identity::set_mlx_nax`
     // doc) — `rmlx-cli` is the one binary that links both `rmlx-mlx` and
@@ -1929,14 +1905,6 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
     // cannot read the metallib, and that warning is the only record of *why* a
     // run ends up stamped `unknown` in an append-only table.
     rmlx_metrics::identity::set_mlx_nax(rmlx_mlx::nax_capability());
-
-    // Reported after tracing is up, since the decision above predates it.
-    if capture_forces_metrics_off {
-        info!(
-            "--gpu-capture: metrics forced off — a capture-distorted run writes no events \
-             row, no baseline.csv row and no observation"
-        );
-    }
 
     // Install the rotor-QJL toggle before any cache construction.
     // This is a process-wide one-shot OnceLock; safe to call once at startup.
@@ -2601,6 +2569,7 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
             allow_truncate,
             label: bench_label,
             record,
+            run_class,
             git_sha,
             prompts_dir,
             yarn_factor,
@@ -2614,6 +2583,21 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
             gpu_capture_steps,
             kv_boundary_layers,
         } => {
+            if record && !rmlx_metrics::mode::observations_enabled() {
+                anyhow::bail!(
+                    "--record writes a runs.db row, and --metrics off or events records no \
+                     observation: drop one of the two"
+                );
+            }
+            #[cfg(feature = "metal-capture")]
+            if gpu_capture.is_some()
+                && run_class != Some(rmlx_metrics::run_class::RunClass::Diagnostic)
+            {
+                anyhow::bail!(
+                    "--gpu-capture makes every timing false, so the run records only as \
+                     --run-class diagnostic"
+                );
+            }
             rmlx_models::kv_cache::install_kv_boundary(kv_boundary_layers)?;
             refuse_to_measure_off_the_pin("rmlx baseline")?;
 
@@ -2699,16 +2683,20 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
             let bench_label_ref = bench_label.as_deref();
             let prompt_id_ref = prompt_id_opt.as_deref();
             let git_sha_ref = git_sha.as_deref();
-            let record_args = if record {
-                Some(commands::baseline::BaselineRecordArgs {
+            let record_args = match (record, run_class) {
+                (true, Some(run_class)) => Some(commands::baseline::BaselineRecordArgs {
                     label: bench_label_ref,
                     prompt_id: prompt_id_ref,
                     prompt_body: prompt_body_opt,
                     kv_quant: kv_quant_resolved,
                     git_sha: git_sha_ref,
-                })
-            } else {
-                None
+                    run_class,
+                }),
+                (false, None) => None,
+                // clap's `requires` on both flags rejects either one alone first.
+                (true, None) | (false, Some(_)) => {
+                    anyhow::bail!("--record and --run-class must be given together")
+                }
             };
 
             // Build YARN override from CLI flags. None when yarn_factor is absent.
@@ -2829,6 +2817,7 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
                 device,
                 max_tokens,
                 git_sha,
+                run_class,
                 kv_quant,
                 kv_preset,
                 cache_type_k,
@@ -2837,6 +2826,24 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
                 kv_group_size,
                 kv_boundary_layers,
             } => {
+                if !corpus.is_empty() && !rmlx_metrics::mode::observations_enabled() {
+                    anyhow::bail!(
+                        "--corpus writes a runs.db row, and --metrics off or events records no \
+                         observation: drop one of the two"
+                    );
+                }
+                let recording = match (corpus.is_empty(), run_class) {
+                    (true, None) => None,
+                    (false, Some(class)) => Some((corpus.as_str(), class)),
+                    (false, None) => anyhow::bail!(
+                        "--corpus records the run, so it needs --run-class (gate, ab_arm or \
+                         diagnostic): only gate rows reach bests and the gates"
+                    ),
+                    (true, Some(_)) => anyhow::bail!(
+                        "--run-class names the class of a recorded run, and with no --corpus \
+                         this run is not recorded"
+                    ),
+                };
                 // A KV codec is opt-in here: with none of these flags the
                 // scorer keeps its cacheless full-window forward, which is what
                 // every PPL row already in the DB was measured with. Asking for
@@ -2889,7 +2896,7 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
                     &text_file,
                     ctx_window,
                     stride,
-                    &corpus,
+                    recording,
                     &claimed,
                     max_tokens,
                     run_id,

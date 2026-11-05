@@ -328,7 +328,7 @@ async fn start_server(case: Case) -> Server {
     std::fs::create_dir_all(&snap).unwrap();
     std::fs::write(
         snap.join("config.json"),
-        r#"{"architectures":["Scripted"]}"#,
+        r#"{"architectures":["Scripted"],"torch_dtype":"bfloat16"}"#,
     )
     .unwrap();
     std::fs::write(
@@ -356,6 +356,7 @@ async fn start_server(case: Case) -> Server {
     let tokens_out = Arc::new(AtomicU64::new(0));
     let state = AppState {
         device: rmlx_mlx::Device::Cpu,
+        metrics_drainer: Some(spawn_drainer(metrics_db.clone(), reg.weight_quants())),
         registry: Arc::new(reg),
         slots: Arc::new(parking_lot::RwLock::new(Vec::new())),
         embed_slot: Arc::new(parking_lot::RwLock::new(None)),
@@ -375,7 +376,6 @@ async fn start_server(case: Case) -> Server {
         prompt_cache_slots: 4,
         ttft_store: TtftStore::default(),
         itl_store: ItlStore::default(),
-        metrics_drainer: Some(spawn_drainer(metrics_db.clone())),
         require_smoke_probe: false,
         default_temperature: None,
         default_enable_thinking: None,
