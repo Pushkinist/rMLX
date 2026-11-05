@@ -117,7 +117,7 @@ prompt:
   read by `scripts/lib/spec_round_log.py`. That reader re-derives every derived
   field from the event's own counters and refuses a mismatch.
 - The no-drafter arm's rate is `1000 / step_mean_ms` from `GET /metrics/cache`,
-  read by `scripts/lib/server_decode_tps.py`.
+  read by `scripts/bench/server_decode_tps.py`.
 - Both use the window from the first emitted token to the last.
   `scripts/lib/sse_decode_window.py` times the same window client-side. A
   disagreement past `CROSS_CHECK_BAND_PCT` (10) stops the run.

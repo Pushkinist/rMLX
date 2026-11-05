@@ -608,7 +608,7 @@ kinds. The rows are inside their bounds, so a predicate names each.
     AND (notes IS NULL OR notes NOT LIKE '%decode_window=%');
   ```
 - **MLX snapshots filed under a GGUF weight label.** Early rMLX bench
-  scripts (`perf-iter/bench_decode_tps.sh` among them) labelled an MLX
+  scripts labelled an MLX
   `8bit` snapshot `q8_0` and a `4bit` one `q4_k_m` from a name table. rMLX
   reads no GGUF, so an `rmlx` row carrying either label is one of these;
   current producers read the label from the snapshot's `config.json`

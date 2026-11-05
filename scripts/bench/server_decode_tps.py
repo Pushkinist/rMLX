@@ -1,5 +1,7 @@
 """Read one request's decode rate off a running rmlx server.
 
+Module of: bench/serve_bench.sh
+
 The server times every generation's inter-token gaps and appends the aggregate
 to a ring exposed as JSON at `GET /metrics/cache` under `itl`, newest last. The
 `step_mean_ms` there is the mean of the gaps between consecutive tokens, so

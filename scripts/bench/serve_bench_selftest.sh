@@ -555,7 +555,7 @@ sys.exit("no free port in 18000-19999")
 # run_case <name> <want-exit> <what-it-proves> [KEY=VALUE ...] [ARGS:flag ...]
 #          [BASE:<replacement --model / --draft-model flags>] [CLIENT_SHIM:N] [NO_STAMPS:1] [READER_CLOCK:<step>]
 #          [STUB:<stub server arguments>] [PRELOG:<run log name>]
-#          [STALE:<run log name>]
+#          [STALE:<run log name>] [RECORD:<--record value, or - to leave the flag out; default gate>]
 #          [GREP:pat ...]
 #
 # Stub defaults describe a run streaming eight tokens 50 ms apart, so the rate
@@ -571,7 +571,7 @@ run_case() {
 	CASE_HOME="$WORK/home_$CASE_NAME"
 	mkdir -p "$CASE_HOME/logs" "$CASE_HOME/metrics/buffer/pending"
 
-	local env_pairs=() greps=() extra_args=() a delayed=0 stamps=true stub_args="" step="" prelog="" stale=""
+	local env_pairs=() greps=() extra_args=() a delayed=0 stamps=true stub_args="" step="" prelog="" stale="" record=gate
 	local base_args=(--model "$VERIFIER_DIR" --draft-model "$WORK/drafter")
 	for a in "$@"; do
 		case "$a" in
@@ -584,10 +584,12 @@ run_case() {
 		STUB:*) stub_args="$stub_args ${a#STUB:}" ;;
 		PRELOG:*) prelog="${a#PRELOG:}" ;;
 		STALE:*) stale="${a#STALE:}" ;;
+		RECORD:*) record="${a#RECORD:}" ;;
 		*) env_pairs+=("$a") ;;
 		esac
 	done
 	$stamps && extra_args+=(--server-stamps)
+	[ "$record" = "-" ] || extra_args+=(--record "$record")
 	write_client_shim "$CASE_HOME/client" "$delayed" "$step"
 	# A run log an earlier rmlx process left in this second: the servers of the
 	# case append to it instead of opening their own. It carries that process's
@@ -991,9 +993,7 @@ grep -q 'Say hello.' "$CASE_HOME/tmp/request_body.json" || note_bad "the request
 verdict
 
 refused missing_model_refused "a run with no --model is refused" \
-	"BASE:--draft-model $WORK/drafter" 'GREP:ERROR: --model and --draft-model are required'
-refused missing_draft_model_refused "a run with no --draft-model is refused" \
-	"BASE:--model $VERIFIER_DIR" 'GREP:ERROR: --model and --draft-model are required'
+	"BASE:--draft-model $WORK/drafter" 'GREP:ERROR: --model and --record are required'
 refused missing_prompt_file_refused "a prompt file that is not there is refused" \
 	"ARGS:--prompt-file=$WORK/none.json" 'GREP:ERROR: --prompt-file not found'
 refused unknown_flag_refused "a flag the tool does not have is refused by name" \
@@ -1136,6 +1136,109 @@ if [ -s "$CASE_HOME/serve_argv" ]; then
 		note_bad "the serve argv did not carry the block the caller named"
 else
 	note_bad "the stub recorded no serve argv"
+fi
+verdict
+
+# Without --draft-model the tool runs the no-drafter arm only: no drafter server,
+# no logprob pass and so no pause after it, no judge, one record.
+run_case plain_only_runs_one_arm 0 \
+	"no --draft-model runs the no-drafter arm only and files one record" \
+	"BASE:--model $VERIFIER_DIR" RECORD:diagnostic \
+	'GREP:Phase 1 complete'
+[ "$(sort -u "$CASE_HOME/requests" 2>/dev/null)" = "plain stream" ] ||
+	note_bad "requests were: $(sort -u "$CASE_HOME/requests" 2>/dev/null | tr '\n' ' ')"
+[ "$(wc -l <"$CASE_HOME/requests" 2>/dev/null | tr -d ' ')" = "4" ] ||
+	note_bad "$(wc -l <"$CASE_HOME/requests" 2>/dev/null | tr -d ' ') requests (want 4: one warmup, three measured)"
+for flag in --draft-model --draft-kind --kv-quant; do
+	grep -qx -- "$flag" "$CASE_HOME/serve_argv" &&
+		note_bad "the serve argv carried $flag with no caller asking"
+done
+grep -qx 15 "$CASE_HOME/sleeps" && note_bad "the run paused for a logprob pass it did not make"
+no_judge
+no_row mtp
+[ "$(ls "$CASE_HOME/tmp/stamped_records" | wc -l | tr -d ' ')" = "1" ] ||
+	note_bad "records filed: $(ls "$CASE_HOME/tmp/stamped_records" | tr '\n' ' ')"
+[ "$(field_of_record normal run_class)" = "diagnostic" ] ||
+	note_bad "normal run_class=$(field_of_record normal run_class)"
+verdict
+
+# prompt_is_the_sent_one <config> — the record's prompt body is the messages the
+# client sent.
+prompt_is_the_sent_one() {
+	python3 -c 'import json, sys
+rec = json.load(open(sys.argv[1]))
+sent = json.load(open(sys.argv[2]))
+sys.exit(0 if rec["prompt"]["body"] == sent["messages"] else 1)' \
+		"$(record_of "$1")" "$CASE_HOME/tmp/request_body.json"
+}
+
+run_case plain_only_names_the_prompt_it_sent 0 \
+	"the plain record carries the sent prompt text and the prompt length the server counted" \
+	"BASE:--model=$VERIFIER_DIR" ARGS:--prompt-file "ARGS:$PROMPT_JSON" STUB_PROMPT_TOKENS=777
+grep -q 'Say hello.' "$CASE_HOME/tmp/request_body.json" || note_bad "the request does not carry the prompt text"
+prompt_is_the_sent_one normal || note_bad "the record's prompt body is not the sent messages"
+[ "$(field_of_record normal prompt_tokens)" = "777" ] ||
+	note_bad "normal prompt_tokens=$(field_of_record normal prompt_tokens) (want the 777 the server counted)"
+verdict
+
+run_case plain_only_default_prompt_is_recorded 0 \
+	"the plain record carries the default prompt when no file is given" \
+	"BASE:--model $VERIFIER_DIR"
+prompt_is_the_sent_one normal || note_bad "the record's prompt body is not the sent messages"
+verdict
+
+run_case kv_quant_reaches_the_server 0 \
+	"--kv-quant is passed to the server the plain arm starts" \
+	"BASE:--model $VERIFIER_DIR" ARGS:--kv-quant ARGS:k8v8
+grep -qx -- '--kv-quant' "$CASE_HOME/serve_argv" && grep -qx -- 'k8v8' "$CASE_HOME/serve_argv" ||
+	note_bad "the serve argv did not carry --kv-quant k8v8"
+verdict
+
+run_case record_gate_is_the_run_class 0 \
+	"--record gate files both arms as gate"
+for arm in normal mtp; do
+	[ "$(field_of_record "$arm" run_class)" = "gate" ] ||
+		note_bad "$arm run_class=$(field_of_record "$arm" run_class)"
+done
+verdict
+
+run_case record_diagnostic_is_the_run_class 0 \
+	"--record diagnostic files both arms as diagnostic" \
+	RECORD:diagnostic
+for arm in normal mtp; do
+	[ "$(field_of_record "$arm" run_class)" = "diagnostic" ] ||
+		note_bad "$arm run_class=$(field_of_record "$arm" run_class)"
+done
+verdict
+
+refused record_missing_refused "a run that names no --record is refused" \
+	RECORD:- 'GREP:ERROR: --model and --record are required'
+refused record_other_value_refused "a --record value other than gate or diagnostic is refused" \
+	RECORD:ab_arm "GREP:ERROR: --record 'ab_arm' is not gate or diagnostic"
+refused draft_kind_needs_a_drafter_refused "--draft-kind without --draft-model is refused" \
+	"BASE:--model $VERIFIER_DIR" ARGS:--draft-kind ARGS:mtp 'GREP:need --draft-model'
+refused draft_block_size_needs_a_drafter_refused "--draft-block-size without --draft-model is refused" \
+	"BASE:--model $VERIFIER_DIR" ARGS:--draft-block-size=7 'GREP:need --draft-model'
+
+# A git_sha in the run identity is data: it is filed as given, never run and never
+# part of a file name. The snapshot is 8-bit affine, a label a guess from its name
+# could not produce.
+HOSTILE_SHA="a', 'b': __import__('os').system('touch $WORK/pwned'), 'c': 'd"
+EIGHT_BIT_DIR="$WORK/models/ns__m"
+mkdir -p "$EIGHT_BIT_DIR"
+printf '%s\n' '{"quantization": {"group_size": 64, "bits": 8}}' >"$EIGHT_BIT_DIR/config.json"
+rm -f "$WORK/pwned"
+run_case plain_only_sha_is_data 0 \
+	"a git_sha is data: never run, filed as given, not in file names" \
+	"BASE:--model $EIGHT_BIT_DIR" \
+	'RMLX_IDENTITY_JSON={"backend":"rmlx","backend_version":"9.9.9","build_profile":"release-perf","hardware_tag":"m5_max_128gb","git_sha":"'"$HOSTILE_SHA"'"}'
+[ ! -e "$WORK/pwned" ] || note_bad "the git_sha ran as code"
+[ "$(field_of_record normal git_sha)" = "$HOSTILE_SHA" ] ||
+	note_bad "filed git_sha=$(field_of_record normal git_sha)"
+[ "$(field_of_record normal weight_quant)" = "8bit" ] ||
+	note_bad "filed weight_quant=$(field_of_record normal weight_quant) (want the config's 8bit)"
+if find "$CASE_HOME" \( -name "*'*" -o -name "* *" \) | grep -q .; then
+	note_bad "a file name carries the raw sha"
 fi
 verdict
 
@@ -1664,7 +1767,7 @@ sigterm_case() {
 		STUB_PROMPT_TOKENS=1234 \
 		STUB_BOUND_FLAG="$CASE_HOME/stub_bound" \
 		bash "$FAKE_ROOT/scripts/bench/serve_bench.sh" --model "$VERIFIER_DIR" \
-			--draft-model "$WORK/drafter" --port "$PORT" --server-stamps >"$CASE_OUT" 2>&1 &
+			--draft-model "$WORK/drafter" --record gate --port "$PORT" --server-stamps >"$CASE_OUT" 2>&1 &
 	local harness=$!
 
 	request_held_or_harness_gone() {

@@ -4,11 +4,10 @@
 #
 # A bench row is filed under the commit its run identity names, and the run log
 # a phase reads is the one its own server wrote. Each case drives the real script
-# against a stub `rmlx` (and, for bench_decode_tps.sh, a stub server) and asserts
-# what the script filed or passed on, not that it ran.
+# against a stub `rmlx` and asserts what the script filed or passed on, not that it
+# ran.
 #
 #   - lib/identity.sh: the identity's git_sha, its refusals, its normalisation.
-#   - perf-iter/bench_decode_tps.sh: a git_sha is data, never source.
 #   - bench/baseline_cells.sh --preset canary: the filed sha is the identity's, the
 #     codec is read from the run log the probe wrote, also when that log is shared
 #     with another process.
@@ -28,7 +27,7 @@ FAILED=0
 
 # ── Fake repo root ────────────────────────────────────────────────────────────
 FAKE_ROOT="$WORK/repo"
-mkdir -p "$FAKE_ROOT/target/release-perf" "$FAKE_ROOT/target/release"
+mkdir -p "$FAKE_ROOT/target/release-perf"
 ln -s "$REPO_ROOT/scripts" "$FAKE_ROOT/scripts"
 git -C "$FAKE_ROOT" init -q
 git -C "$FAKE_ROOT" -c user.name=selftest -c user.email=selftest@example.invalid \
@@ -84,144 +83,6 @@ verdict identity_unresolvable_is_verbatim "a hex sha that resolves nowhere is ke
 got="$(identity_sha "{$BASE_IDENTITY}")"
 verdict identity_without_sha_uses_head "an identity with no git_sha leaves HEAD" \
 	"$([ "$got" = "0|$HEAD_SHA|" ] || echo "got $got (want 0|$HEAD_SHA|)")"
-
-# ── A port and a stub server ──────────────────────────────────────────────────
-
-PORT="$(python3 -c '
-import random, socket, sys
-for _ in range(200):
-    port = random.randint(18000, 19999)
-    probe = socket.socket()
-    try:
-        probe.bind(("127.0.0.1", port))
-    except OSError:
-        continue
-    finally:
-        probe.close()
-    print(port)
-    sys.exit(0)
-sys.exit("no free port in 18000-19999")
-')"
-
-SERVER_PY="$WORK/stub_server.py"
-cat >"$SERVER_PY" <<'PYEOF'
-"""Canned server for bench_decode_tps.sh: /health, one ITL sample per request."""
-
-import json
-import sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
-
-ring = []
-
-
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *_args):
-        pass
-
-    def _json(self, body):
-        raw = json.dumps(body).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
-
-    def do_GET(self):
-        if self.path.startswith("/metrics/cache"):
-            self._json({"itl": ring})
-        else:
-            self._json({"status": "ok"})
-
-    def do_POST(self):
-        self.rfile.read(int(self.headers.get("Content-Length", "0")))
-        ring.append({"step_mean_ms": 50.0, "step_count": 30})
-        self._json(
-            {
-                "usage": {"completion_tokens": 30},
-                "choices": [{"message": {"content": "hello world"}}],
-            }
-        )
-
-
-HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
-PYEOF
-
-# ── perf-iter/bench_decode_tps.sh ─────────────────────────────────────────────
-
-DECODE_STUB="$FAKE_ROOT/target/release/rmlx"
-cat >"$DECODE_STUB" <<STUBEOF
-#!/usr/bin/env bash
-set -eu
-case "\$1" in
-metrics)
-	case "\$2" in
-	identity) echo '{$BASE_IDENTITY}' ;;
-	--db)
-		cp "\$6" "\$RMLX_HOME/recorded.json"
-		rm -f "\$6"
-		;;
-	esac
-	;;
-serve)
-	while [ \$# -gt 0 ]; do
-		[ "\$1" = --port ] && port="\$2"
-		shift
-	done
-	echo \$\$ >"\$RMLX_HOME/server.pid"
-	exec python3 "$SERVER_PY" "\$port"
-	;;
-esac
-STUBEOF
-chmod +x "$DECODE_STUB"
-
-# A value that is valid inside a Python dict literal and runs a command when it
-# is spliced into source; as data it is only an odd string.
-HOSTILE_SHA="a', 'b': __import__('os').system('touch $WORK/pwned'), 'c': 'd"
-
-CASE="$WORK/decode_sha_is_data"
-mkdir -p "$CASE/home" "$CASE/model/ns__m"
-# 8-bit affine: a label read off the name `m` could only guess.
-printf '{"quantization": {"group_size": 64, "bits": 8}}\n' >"$CASE/model/ns__m/config.json"
-rm -f "$WORK/pwned"
-set +e
-(
-	cd "$CASE"
-	env -i \
-		PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
-		HOME="$WORK" \
-		RMLX_HOME="$CASE/home" \
-		MODEL_PATH="$CASE/model/ns__m" \
-		KV_QUANT=k8v8 \
-		PORT="$PORT" \
-		WARMUP_RUNS=1 \
-		MEASURE_RUNS=2 \
-		RMLX_BIN="$DECODE_STUB" \
-		RMLX_IDENTITY_JSON="{$BASE_IDENTITY,\"git_sha\":\"$HOSTILE_SHA\"}" \
-		bash "$FAKE_ROOT/scripts/perf-iter/bench_decode_tps.sh" >"$CASE/out.log" 2>&1
-)
-decode_status=$?
-set -e
-# The script stops its own server; a script that died first may not have.
-kill "$(cat "$CASE/home/server.pid" 2>/dev/null)" 2>/dev/null || true
-
-bad=""
-[ "$decode_status" -eq 0 ] || bad="exit=$decode_status"
-[ ! -e "$WORK/pwned" ] || bad="$bad; the git_sha ran as code"
-filed="$(python3 -c 'import json, sys
-print(json.load(open(sys.argv[1])).get("git_sha"))' "$CASE/home/recorded.json" 2>/dev/null || echo "no record")"
-[ "$filed" = "$HOSTILE_SHA" ] || bad="$bad; filed git_sha=$filed"
-filed_wq="$(python3 -c 'import json, sys
-print(json.load(open(sys.argv[1])).get("weight_quant"))' "$CASE/home/recorded.json" 2>/dev/null || echo "no record")"
-[ "$filed_wq" = 8bit ] || bad="$bad; filed weight_quant=$filed_wq (want the config's 8bit)"
-jsonl="$(python3 -c 'import json, sys
-print(json.loads(open(sys.argv[1]).readline()).get("git_sha"))' "$CASE/home/metrics/perf-iter/baseline.jsonl" 2>/dev/null || echo "no line")"
-[ "$jsonl" = "$HOSTILE_SHA" ] || bad="$bad; jsonl git_sha=$jsonl"
-case "$(ls "$CASE/logs" 2>/dev/null)" in
-*"'"* | *" "*) bad="$bad; the serve log name carries the raw sha" ;;
-esac
-tail -3 "$CASE/out.log" | sed 's/^/        | /' >"$CASE/tail.txt"
-verdict decode_sha_is_data "a git_sha is data: never run, filed as given, not in file names" "${bad#; }"
-[ -z "$bad" ] || cat "$CASE/tail.txt"
 
 # ── bench/baseline_cells.sh --preset canary ───────────────────────────────────
 

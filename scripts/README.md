@@ -328,10 +328,9 @@ site count; one more site, or a larger count, fails `binary-literal-pin`. [gate:
   by every file that sources it is that file's knob (`lib/bench_server.sh` reads
   `PORT`, which `bench/baseline_cells.sh` does not set).
   A file pins the set of names it reads; a name outside the set fails, and
-  `pin-new` refuses a name added to a pin. `RMLX_BIN` (in
-  `perf-iter/bench_decode_tps.sh`) is pinned where it is read today, and
-  `RMLX_BINARY` and `RMLX` are read by no file; the `--binary` sweep removes
-  the first, and a new file that reads any of the three in a form above fails.
+  `pin-new` refuses a name added to a pin. `RMLX_BIN`,
+  `RMLX_BINARY` and `RMLX` are read by no file, and a new file that reads any
+  of the three in a form above fails.
   [gate: `env-knob`]
 * File names use underscores. [gate: `name`] The repository root variable is
   `REPO_ROOT`, derived from the file's own location. A variable is a root

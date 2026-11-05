@@ -932,25 +932,20 @@ bench:           ## cargo bench -p rmlx-quant --bench dequant  (on-demand; not i
 
 # ---- perf-iter regression bench (on-demand; NOT part of make ci) ---------------
 # Runs the 3-model regression bench in series (one process at a time — Apple
-# Silicon Metal context rule).  Appends results to metrics/perf-iter/baseline.jsonl.
-# Compare two snapshots by diffing the JSONL files.
-#
-# Env-var overrides (all optional):
-#   MEASURE_RUNS=5   — more samples for stable per-finding numbers
-#   WARMUP_RUNS=2    — extra warmup for cold GPU
-#   METRICS_OUT=...  — redirect output (default: metrics/perf-iter/baseline.jsonl)
+# Silicon Metal context rule).  Each model's no-drafter arm is filed in runs.db
+# as a diagnostic record by bench/serve_bench.sh.
 PERF_ITER_E2B  ?= $(O_MODELS_ROOT)/mlx-community__gemma-4-e2b-it-mxfp8
 PERF_ITER_E4B  ?= $(O_MODELS_ROOT)/mlx-community__gemma-4-e4b-it-mxfp8
 PERF_ITER_QWEN38 ?= $(O_MODELS_ROOT)/mlx-community__Qwen3.8-27B-4bit
 
-perf-iter:       ## run 3-model regression bench in series (appends to metrics/perf-iter/baseline.jsonl)
+perf-iter:       ## run 3-model regression bench in series (files diagnostic records in runs.db)
 	@echo "=== perf-iter: gemma-4-e2b k8v8 ==="
-	MODEL_PATH="$(PERF_ITER_E2B)"  KV_QUANT=k8v8 bash scripts/perf-iter/bench_decode_tps.sh
+	bash scripts/bench/serve_bench.sh --model "$(PERF_ITER_E2B)" --kv-quant k8v8 --record diagnostic
 	@echo "=== perf-iter: gemma-4-e4b k8v8 ==="
-	MODEL_PATH="$(PERF_ITER_E4B)"  KV_QUANT=k8v8 bash scripts/perf-iter/bench_decode_tps.sh
+	bash scripts/bench/serve_bench.sh --model "$(PERF_ITER_E4B)" --kv-quant k8v8 --record diagnostic
 	@echo "=== perf-iter: Qwen3.8-27B-4bit k8v4 ==="
-	MODEL_PATH="$(PERF_ITER_QWEN38)" KV_QUANT=k8v4 bash scripts/perf-iter/bench_decode_tps.sh
-	@echo "=== perf-iter done. Compare against a saved snapshot of metrics/perf-iter/baseline.jsonl ==="
+	bash scripts/bench/serve_bench.sh --model "$(PERF_ITER_QWEN38)" --kv-quant k8v4 --record diagnostic
+	@echo "=== perf-iter done. Records are diagnostic rows in runs.db ==="
 
 # ---- canary TPS gate (DB-backed, release-perf binary) -----------------
 #
@@ -1016,7 +1011,7 @@ llama-ab-selftest: ## mutation-check the llama-server A/B harness against a stub
 spec-bench-selftest: ## mutation-check the spec-decode bench against a stub server (no GPU, no model, no DB write; builds the dev rmlx, which judges a near-tie flip)
 	bash scripts/bench/serve_bench_selftest.sh
 
-bench-identity-selftest: ## mutation-check the commit and run-log sources of the canary, bench_decode_tps.sh and lib/identity.sh against stub binaries (no GPU, no model, no DB write)
+bench-identity-selftest: ## mutation-check the commit and run-log sources of the canary and lib/identity.sh against stub binaries (no GPU, no model, no DB write)
 	bash scripts/bench_identity_selftest.sh
 
 baseline-cells-selftest: ## recall-check the canary preset, the single codec cell and the inertness sweep: argv, CSV rows, median and stddev, digests, records, exit codes (stub binary; no GPU, no model, no DB write)
@@ -1077,13 +1072,13 @@ spec-canary: build-perf  ## run spec-decode canary (normal+MTP × 3 prompt class
 	@test -n "$$DRAFTER_MODEL"  || { echo "ERROR: DRAFTER_MODEL= required (resolve via LOCAL.md)";  exit 125; }
 	@echo "==> spec-canary: prose"
 	bash scripts/bench/serve_bench.sh --model "$$VERIFIER_MODEL" --draft-model "$$DRAFTER_MODEL" \
-		--prompt-file prompts/spec_bench/prose.json --tag canary-prose
+		--prompt-file prompts/spec_bench/prose.json --tag canary-prose --record gate
 	@echo "==> spec-canary: structured (fibonacci)"
 	bash scripts/bench/serve_bench.sh --model "$$VERIFIER_MODEL" --draft-model "$$DRAFTER_MODEL" \
-		--prompt-file prompts/spec_bench/structured.json --tag canary-structured
+		--prompt-file prompts/spec_bench/structured.json --tag canary-structured --record gate
 	@echo "==> spec-canary: code (fizzbuzz Rust)"
 	bash scripts/bench/serve_bench.sh --model "$$VERIFIER_MODEL" --draft-model "$$DRAFTER_MODEL" \
-		--prompt-file prompts/spec_bench/code.json --tag canary-code
+		--prompt-file prompts/spec_bench/code.json --tag canary-code --record gate
 
 spec-canary-gate:   ## gate spec-decode regressions (decode_tps_warm + accept_rate); SHA= required
 	$(call canary_deltas,spec-canary-gate,spec-canary)

@@ -353,8 +353,6 @@ locked or missing DB.
 - `rmlx baseline --record` and `rmlx eval ppl` ingest in-process and delete
   the file on success. On failure they leave it in `pending/` and exit
   non-zero, naming the file, after printing the measurement.
-- A script that calls `record --file` moves a rejected file to
-  `buffer/failed/` for triage (`scripts/perf-iter/bench_decode_tps.sh`).
 - `rmlx metrics record --replay-pending` walks `pending/` in name order. It
   deletes each file that ingests and moves each one that fails to
   `buffer/failed/`. A file that states no class fails unless `--run-class`
@@ -500,8 +498,7 @@ supplies:
   (`rmlx_git_sha` in `scripts/lib/identity.sh`). A hex sha that resolves in
   that repo is filed in the short form HEAD is filed in; any other value is
   filed as given, and an `unknown...` value counts as none. This covers
-  `bench/serve_bench.sh`, `ssd_canary.sh`, `bench/baseline_cells.sh` and
-  `perf-iter/bench_decode_tps.sh`.
+  `bench/serve_bench.sh`, `ssd_canary.sh` and `bench/baseline_cells.sh`.
 - `rmlx baseline --git-sha <sha>` and `rmlx eval ppl --git-sha <sha>` stamp
   it. Without the flag it is `NULL`.
 

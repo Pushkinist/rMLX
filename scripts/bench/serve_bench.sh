@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
-# serve_bench.sh — bench one model through rmlx serve, no drafter against a drafter
+# serve_bench.sh — bench one model through rmlx serve, alone or against a drafter
 #
-# Usage:  bash scripts/bench/serve_bench.sh --model DIR --draft-model DIR [--prompt-file F]
-#             [--port N] [--dry-run] [--draft-kind KIND] [--draft-block-size N]
-#             [--kv-quant Q] [--max-ctx N] [--tag T] [--server-stamps]
-# Exit:   0 both arms measured and filed; 1 a usage error, a missing model or prompt file, or a
+# Usage:  bash scripts/bench/serve_bench.sh --model DIR --record gate|diagnostic
+#             [--draft-model DIR [--draft-kind KIND] [--draft-block-size N]] [--prompt-file F]
+#             [--port N] [--dry-run] [--kv-quant Q] [--max-ctx N] [--tag T] [--server-stamps]
+# Exit:   0 every arm measured and filed; 1 a usage error, a missing model or prompt file, or a
 #         run the checks refused; 125 the release-perf binary is missing; passthrough of rmlx
 #         serve (11: another process holds the Metal claim)
 #
-# --model is the verifier snapshot dir (mxfp8), --draft-model the assistant drafter snapshot dir
-# (bf16); both are required. --prompt-file is a canonical JSON prompt (prompts/spec_bench/*.json)
-# whose `messages[0].content` is sent and whose `name` is the registered prompt row name; without
+# --model is the verifier snapshot dir. Without --draft-model only the no-drafter arm runs and
+# one record is filed; with it (the assistant drafter snapshot dir) a drafter arm follows, is
+# judged against the first, and files a second. --record sets the `run_class` of every record
+# filed. --prompt-file is a canonical JSON prompt (prompts/spec_bench/*.json) whose
+# `messages[0].content` is sent and whose `name` is the registered prompt row name; without
 # it a short prose prompt is sent. The binary is target/release-perf/rmlx (make build-perf).
 #
 # `--server-stamps` is for a self-test. The client rate is then read from the stub server's own
@@ -18,7 +20,7 @@
 # `stamped_records/` in the scratch directory and are never passed to `rmlx metrics record`.
 #
 # Output:
-#   - Two RunRecord JSON files written + ingested into runs.db
+#   - One RunRecord JSON file per arm written + ingested into runs.db
 #   - Final comparison table printed to stdout
 #
 # Measurement basis (docs/SPEC_READING_A_RUN.md § "Benching an arm"):
@@ -53,8 +55,8 @@
 #   - Single server process at a time; the script stops the server it started
 #     (kill + wait on its PID) between phases. A claim some other process holds
 #     stops the run with the server's exit status (11).
-#   - 1 warmup + 1 logprob pass + 3 measured requests per config; 5 s sleep
-#     between requests, LOGPROB_PASS_PAUSE_S after the logprob pass
+#   - 1 warmup + 3 measured requests per config, plus 1 logprob pass when a drafter
+#     runs; 5 s sleep between requests, LOGPROB_PASS_PAUSE_S after the logprob pass
 #   - All inserts go through `rmlx metrics record --file` (no direct sqlite writes)
 
 set -euo pipefail
@@ -71,6 +73,11 @@ stop_live_server() {
     fi
 }
 trap stop_live_server EXIT
+
+usage_error() {
+    echo "ERROR: $1" >&2
+    exit 1
+}
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
@@ -97,7 +104,6 @@ MEASURED_RUNS=3
 # back to the host at every step, which the measured runs must never do, so it
 # is its own request and no rate is taken from it.
 LOGPROB_PASSES=1
-REQUESTS_PER_PHASE=$((WARMUP_RUNS + LOGPROB_PASSES + MEASURED_RUNS))
 # That read-back is a larger thermal event than a measured run.
 LOGPROB_PASS_PAUSE_S=15
 MAX_TOKENS=128
@@ -128,6 +134,9 @@ CROSS_CHECK_BAND_PCT=10
 
 VERIFIER_MODEL=""
 DRAFTER_MODEL=""
+DRAFT_KIND_SET=false
+DRAFT_BLOCK_SIZE_SET=false
+RECORD_CLASS=""
 PROMPT_FILE=""
 DRY_RUN=false
 SERVER_STAMPS_ARG=()
@@ -153,10 +162,12 @@ while [[ $# -gt 0 ]]; do
         --kv-quant) shift; KV_QUANT="${1:?--kv-quant requires a value}"; shift ;;
         --max-ctx=*) MAX_CTX="${1#--max-ctx=}"; shift ;;
         --max-ctx) shift; MAX_CTX="${1:?--max-ctx requires a value}"; shift ;;
-        --draft-kind=*) DRAFT_KIND="${1#--draft-kind=}"; shift ;;
-        --draft-kind) shift; DRAFT_KIND="${1:?--draft-kind requires a value}"; shift ;;
-        --draft-block-size=*) DRAFT_BLOCK_SIZE="${1#--draft-block-size=}"; shift ;;
-        --draft-block-size) shift; DRAFT_BLOCK_SIZE="${1:?--draft-block-size requires a value}"; shift ;;
+        --draft-kind=*) DRAFT_KIND="${1#--draft-kind=}"; DRAFT_KIND_SET=true; shift ;;
+        --draft-kind) shift; DRAFT_KIND="${1:?--draft-kind requires a value}"; DRAFT_KIND_SET=true; shift ;;
+        --draft-block-size=*) DRAFT_BLOCK_SIZE="${1#--draft-block-size=}"; DRAFT_BLOCK_SIZE_SET=true; shift ;;
+        --draft-block-size) shift; DRAFT_BLOCK_SIZE="${1:?--draft-block-size requires a value}"; DRAFT_BLOCK_SIZE_SET=true; shift ;;
+        --record=*) RECORD_CLASS="${1#--record=}"; shift ;;
+        --record) shift; RECORD_CLASS="${1:?--record requires a value}"; shift ;;
         *) echo "Unknown flag: $1" >&2; exit 1 ;;
     esac
 done
@@ -175,19 +186,32 @@ if ! [[ "${DRAFT_KIND}" =~ ^[a-z0-9_]+$ ]]; then
     exit 1
 fi
 
-if [[ -z "${VERIFIER_MODEL}" || -z "${DRAFTER_MODEL}" ]]; then
+if [[ -z "${VERIFIER_MODEL}" || -z "${RECORD_CLASS}" ]]; then
     cat >&2 <<USAGE
-ERROR: --model and --draft-model are required.
+ERROR: --model and --record are required.
 
 Resolve concrete absolute paths from LOCAL.md (gitignored). Example:
 
   bash scripts/bench/serve_bench.sh \\
     --model \$O_MODELS/mlx-community__gemma-4-e2b-it-mxfp8 \\
-    --draft-model \$O_MODELS/mlx-community__gemma-4-E2B-it-assistant-bf16
+    --draft-model \$O_MODELS/mlx-community__gemma-4-E2B-it-assistant-bf16 \\
+    --record gate
 
 USAGE
     exit 1
 fi
+
+if [[ "${RECORD_CLASS}" != gate && "${RECORD_CLASS}" != diagnostic ]]; then
+    usage_error "--record '${RECORD_CLASS}' is not gate or diagnostic"
+fi
+
+if [[ -z "${DRAFTER_MODEL}" ]]; then
+    if $DRAFT_KIND_SET || $DRAFT_BLOCK_SIZE_SET; then
+        usage_error "--draft-kind and --draft-block-size need --draft-model"
+    fi
+    LOGPROB_PASSES=0
+fi
+REQUESTS_PER_PHASE=$((WARMUP_RUNS + LOGPROB_PASSES + MEASURED_RUNS))
 
 if [[ -n "${DRAFT_BLOCK_SIZE}" ]]; then
     if ! [[ "${DRAFT_BLOCK_SIZE}" =~ ^[0-9]+$ ]] || (( DRAFT_BLOCK_SIZE < 2 )); then
@@ -269,7 +293,7 @@ if [[ ! -d "${VERIFIER_MODEL}" ]]; then
     exit 1
 fi
 
-if [[ ! -d "${DRAFTER_MODEL}" ]]; then
+if [[ -n "${DRAFTER_MODEL}" && ! -d "${DRAFTER_MODEL}" ]]; then
     echo "ERROR: drafter model not found: ${DRAFTER_MODEL}" >&2
     exit 1
 fi
@@ -283,17 +307,19 @@ printf '%s\n' "${REQUEST_BODY}" > "${REQUEST_BODY_FILE}"
 # The logprob pass asks for the same answer as the measured runs, whole and
 # with the two best candidates of every position.
 LOGPROB_BODY_FILE="${SCRATCH_DIR}/logprob_request_body.json"
-REQUEST_BODY="${REQUEST_BODY}" python3 -c '
+if [[ -n "${DRAFTER_MODEL}" ]]; then
+    REQUEST_BODY="${REQUEST_BODY}" python3 -c '
 import json, os
 body = json.loads(os.environ["REQUEST_BODY"])
 del body["stream_options"]
 body.update({"stream": False, "logprobs": True, "top_logprobs": 2})
 print(json.dumps(body))
 ' > "${LOGPROB_BODY_FILE}"
+fi
 
 echo "==> serve_bench.sh"
 echo "    verifier : ${VERIFIER_MODEL}"
-echo "    drafter  : ${DRAFTER_MODEL}"
+echo "    drafter  : ${DRAFTER_MODEL:-<none>}"
 echo "    port     : ${PORT}"
 echo "    git_sha  : ${GIT_SHA}"
 echo "    dry_run  : ${DRY_RUN}"
@@ -347,14 +373,14 @@ logprob_pass() {
 
 # How many ITL samples the server has recorded so far.
 ring_len() {
-    field_of "$(python3 "${REPO_ROOT}/scripts/lib/server_decode_tps.py" \
+    field_of "$(python3 "${REPO_ROOT}/scripts/bench/server_decode_tps.py" \
         "http://127.0.0.1:${PORT}")" ring_len
 }
 
 # The rate the server measured for the request that just finished, given the
 # ring length observed before it. Empty when the server could not attribute one.
 server_rate_after() {
-    field_of "$(python3 "${REPO_ROOT}/scripts/lib/server_decode_tps.py" \
+    field_of "$(python3 "${REPO_ROOT}/scripts/bench/server_decode_tps.py" \
         "http://127.0.0.1:${PORT}" --after "$1")" decode_tps
 }
 
@@ -498,6 +524,7 @@ emit_and_ingest() {
         BENCH_TAG="${BENCH_TAG}" \
         BENCH_PROMPT_CONTENT="${PROMPT_CONTENT}" \
         BENCH_PROMPT_NAME="${PROMPT_NAME}" \
+        BENCH_RUN_CLASS="${RECORD_CLASS}" \
         python3 - <<'PYEOF'
 import json, os
 
@@ -634,9 +661,7 @@ obj = {
         f"answer_check={answer_check_notes} answer={answer}"
     ),
     "description": f"spec_bench {config} sha={git_sha}",
-    # Both arms are kept cells, told apart by `decode_config`; neither is a
-    # discarded A/B slot.
-    "run_class": "gate",
+    "run_class": os.environ["BENCH_RUN_CLASS"],
     "metrics": metrics,
 }
 print(json.dumps(obj))
@@ -704,10 +729,12 @@ for i in $(seq 1 ${WARMUP_RUNS}); do
     sleep 5
 done
 
-echo "  [normal] logprob pass..." >&2
 NORMAL_PASS_FILE="${SCRATCH_DIR}/normal_logprobs.json"
-NORMAL_PASS_ANSWER="$(logprob_pass normal "${NORMAL_PASS_FILE}")" || exit 1
-sleep "${LOGPROB_PASS_PAUSE_S}"
+if [[ -n "${DRAFTER_MODEL}" ]]; then
+    echo "  [normal] logprob pass..." >&2
+    NORMAL_PASS_ANSWER="$(logprob_pass normal "${NORMAL_PASS_FILE}")" || exit 1
+    sleep "${LOGPROB_PASS_PAUSE_S}"
+fi
 
 echo "  [normal] measured runs..." >&2
 NORMAL_ENGINE_TPS_VALUES=()
@@ -831,6 +858,14 @@ NORMAL_BUF_PATH=$(emit_and_ingest \
 echo ""
 echo "==> Phase 1 complete. Median decode TPS: ${NORMAL_MEDIAN_TPS}"
 echo ""
+
+if [[ -z "${DRAFTER_MODEL}" ]]; then
+    echo "  normal : ${NORMAL_BUF_PATH:-(dry-run or failed)}"
+    echo "  stddev : ${NORMAL_STDDEV_TPS}"
+    echo "DB: ${DB_PATH}"
+    echo "Done."
+    exit 0
+fi
 
 # Judge a speculative answer that differs from the no-drafter one, when no
 # sampler ran. Reads both phases' logprob passes, each held to the digest its
