@@ -3,9 +3,10 @@
 Module of: bench/baseline_cells.sh
 
 `record` writes the one run record of a measured cell: the median decode rate of its
-measured runs, with their stddev, filed as `gate`. It prints the cell's `kv_quant`
-label, which the matrix summary shows. `repeat` reads a smoke run's text on stdin
-and prints how often its most repeated four-word sequence occurs.
+measured runs, with their stddev, filed as `gate`. Its `kv_quant` is the codec name the
+caller read from the run's own log; this module maps no flags to a name. `repeat` reads a
+smoke run's stderr log on stdin. It prints how often the most repeated four-word sequence
+of the last `decoded="..."` field occurs, or `none` when the log holds no such field.
 """
 
 from __future__ import annotations
@@ -17,24 +18,11 @@ import re
 import sys
 from pathlib import Path
 
-AFFINE_SIDE = re.compile(r"q(\d+)_g(\d+)")
 FOUR_GRAM = 4
-
-
-def kv_quant_label(ctk: str, ctv: str, kv_quant: str) -> str:
-    """The `kv_quant` a cell's record carries: what the per-side pair or the preset resolves to."""
-    if not ctk:
-        return "k8v8" if kv_quant == "auto" else kv_quant
-    if (ctk, ctv) == ("bf16", "bf16"):
-        return "none"
-    if (ctk, ctv) == ("q8_g128", "tq4"):
-        return "k8v4"
-    if (ctk, ctv) == ("q8_g128", "planar4"):
-        return "planar"
-    k, v = AFFINE_SIDE.fullmatch(ctk), AFFINE_SIDE.fullmatch(ctv)
-    if k and v:
-        return f"mixed_k{k[1]}g{k[2]}_v{v[1]}g{v[2]}"
-    raise SystemExit(f"no canonical kv_quant for --cache-type-k {ctk} --cache-type-v {ctv}")
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+DECODED = re.compile(r'decoded="((?:[^"\\]|\\.)*)"')
+DEBUG_ESCAPE = re.compile(r'\\(["\\nt])')
+UNESCAPED = {'"': '"', "\\": "\\", "n": "\n", "t": "\t"}
 
 
 def number(raw: str) -> float | None:
@@ -52,7 +40,7 @@ def model_identity(model_path: str) -> tuple[str, str]:
     return "local", base
 
 
-def build_record(args: argparse.Namespace, kv_quant: str) -> dict:
+def build_record(args: argparse.Namespace) -> dict:
     namespace, model = model_identity(args.model_path)
     prompt_file = Path(args.prompt_file)
     git_sha = {"git_sha": args.git_sha} if args.git_sha else {}
@@ -62,7 +50,7 @@ def build_record(args: argparse.Namespace, kv_quant: str) -> dict:
         "model_namespace": namespace,
         "model": model,
         "weight_quant": args.weight_quant,
-        "kv_quant": kv_quant,
+        "kv_quant": args.kv_quant,
         "ctx_max": args.ctx_max,
         "prompt": {"name": prompt_file.stem, "body": json.loads(prompt_file.read_text())},
         "ts_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -82,6 +70,17 @@ def build_record(args: argparse.Namespace, kv_quant: str) -> dict:
             {"name": "peak_rss_mb", "value": number(args.rss)},
         ],
     }
+
+
+def decoded_text(log: str) -> str | None:
+    """The text of the last `decoded` field of a run's stderr log, or None when it has none.
+
+    The field is a Rust Debug string, so `"`, `\\`, newline and tab arrive escaped.
+    """
+    fields = DECODED.findall(ANSI.sub("", log))
+    if not fields:
+        return None
+    return DEBUG_ESCAPE.sub(lambda m: UNESCAPED[m[1]], fields[-1])
 
 
 def max_repeat(text: str) -> int:
@@ -107,11 +106,10 @@ def main() -> int:
         record.add_argument(f"--{name}", type=int, required=True)
     args = parser.parse_args()
     if args.command == "repeat":
-        print(max_repeat(sys.stdin.read()))
+        text = decoded_text(sys.stdin.read())
+        print("none" if text is None else max_repeat(text))
         return 0
-    kv_quant = kv_quant_label(args.ctk, args.ctv, args.kv_quant)
-    Path(args.out).write_text(json.dumps(build_record(args, kv_quant), indent=2))
-    print(kv_quant)
+    Path(args.out).write_text(json.dumps(build_record(args), indent=2))
     return 0
 
 

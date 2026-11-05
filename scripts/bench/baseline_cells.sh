@@ -68,16 +68,22 @@
 # --preset cache-types runs one model through a fixed list of KV cache-type combinations. Per combo:
 #   1. a smoke probe, 16 tokens at 4096 prompt tokens, recorded `diagnostic` under the label
 #      ctype-smoke-<combo>. It is rejected when the run failed (exit 78 is a resolver skip), the
-#      decode rate is below 0.5, it printed no `baseline:` line, its `output:` text is not UTF-8, or
-#      one four-word sequence of it repeats more than 3 times.
+#      decode rate is below 0.5, it printed no `baseline:` line, its log holds no `decoded="..."`
+#      field, or one four-word sequence of that text repeats more than 3 times. The text is read
+#      from the stderr log: the last `decoded` field, ANSI codes stripped, its Debug escapes undone.
 #   2. 2 warmup and 3 measured runs of 32 tokens, none recorded one by one. One `gate` record holds
 #      the median decode rate (with the stddev), ttft, load time and peak RSS of the last measured
 #      run, filed through `rmlx metrics record --file`.
-# A median below 0.5 files no record. Every combo ends in one summary row:
-# label, kv_quant, decode_tps, decode_stddev, status (ok, skip, smoke_fail, runtime_fail or
-# fail_rc<N>, N the exit code of the run, or 9 when the record did not land). --prompt-tokens
-# takes a multiple of 1024 and picks prompts/longctx_<N/1024>k.json; the context is 8192 up to 4096
-# prompt tokens, 16384 up to 8192, 32768 up to 16384 and twice the prompt above that.
+# The record's `kv_quant` is the name the smoke probe's own run log states (the `cache-type
+# resolved` event), never a name this tool derives from the flags. A smoke log that states none
+# files no record. A measured run that reads 0 tok/s (or none) is not a measurement: the combo
+# ends with a runtime_fail row and no record, and the matrix goes on. A median below 0.5 files no
+# record either. Every combo ends in one summary row: label, kv_quant (the name the log stated, `-`
+# when it stated none), decode_tps, decode_stddev, status (ok, skip, smoke_fail, runtime_fail,
+# no_kv_name or fail_rc<N>, N the exit code of the run, 8 for a missing prompt file, or 9 when the
+# record did not land). --prompt-tokens takes a multiple of 1024 and picks
+# prompts/longctx_<N/1024>k.json; the context is 8192 up to 4096 prompt tokens, 16384 up to 8192,
+# 32768 up to 16384 and twice the prompt above that.
 #
 # This tool measures one build. Comparing two builds needs scripts/perf_ab.sh, which interleaves
 # the arms: ordering and thermal drift land on whichever arm ran second here.
@@ -131,23 +137,21 @@ DEFAULT_CODECS=(
     rotor3_sym rotor4_sym k_rotor3 k_rotor4
 )
 
-# The cache-types matrix, one combo per entry:
-#   label|cache-type-k|cache-type-v|kv_quant preset|kv_quant the summary shows when no record was filed
-# A combo names a per-side pair or a preset, never both.
+# The cache-types matrix, one combo per entry: label|cache-type-k|cache-type-v|kv_quant preset.
+# A combo names a per-side pair or a preset, never both. The default codec is the bf16 pair's.
 CACHE_TYPE_COMBOS=(
-    "auto|||auto|auto"
-    "bf16|bf16|bf16||ct_bf16_bf16"
-    "k8v4|||k8v4|k8v4"
-    "k8v8|||k8v8|k8v8"
-    "planar|||planar|planar"
-    "q8g128_q4g64|q8_g128|q4_g64||mixed_k8g128_v4g64"
-    "q8g128_q8g64|q8_g128|q8_g64||mixed_k8g128_v8g64"
-    "q8g128_q4g128|q8_g128|q4_g128||mixed_k8g128_v4g128"
-    "q8g128_q6g64|q8_g128|q6_g64||mixed_k8g128_v6g64"
-    "q8g128_q8g32|q8_g128|q8_g32||mixed_k8g128_v8g32"
-    "q4g64_q4g64|q4_g64|q4_g64||mixed_k4g64_v4g64"
-    "q8g128_tq4|q8_g128|tq4||k8v4"
-    "q8g128_planar4|q8_g128|planar4||planar"
+    "bf16|bf16|bf16|"
+    "k8v4|||k8v4"
+    "k8v8|||k8v8"
+    "planar|||planar"
+    "q8g128_q4g64|q8_g128|q4_g64|"
+    "q8g128_q8g64|q8_g128|q8_g64|"
+    "q8g128_q4g128|q8_g128|q4_g128|"
+    "q8g128_q6g64|q8_g128|q6_g64|"
+    "q8g128_q8g32|q8_g128|q8_g32|"
+    "q4g64_q4g64|q4_g64|q4_g64|"
+    "q8g128_tq4|q8_g128|tq4|"
+    "q8g128_planar4|q8_g128|planar4|"
 )
 
 usage_error() {
@@ -340,18 +344,20 @@ label_for() {
 # whose record did not land (exit RECORD_PENDING_EXIT) keeps its reading and is
 # noted in PENDING, except a gate run, which the canary cannot go on without.
 # Any other failure stops the tool, except in the inertness sweep and the cache-types matrix, which
-# keep the failed run's row. Leaves the run's readings, exit code, stdout and stderr in RUN_DECODE,
-# RUN_PREFILL, RUN_RC, RUN_OUT and RUN_LOG.
+# keep the failed run's row. Leaves the run's readings, exit code, stdout, stderr and process id in
+# RUN_DECODE, RUN_PREFILL, RUN_RC, RUN_OUT, RUN_LOG and RUN_PID. The run stays in the foreground, so
+# an interrupt reaches it; the shell that execs it first writes its own pid, which the binary keeps.
 # Usage: run_once <phase> <class> <model_path> [baseline args...]
 run_once() {
     local phase="$1" class="$2" model_path="$3"
     shift 3
-    local record_args=() out rc=0 err ptps
+    local record_args=() out rc=0 err pidfile ptps
     if [[ -n "${class}" ]]; then
         record_args=(--record --run-class "${class}")
     fi
     err="$(mktemp "${TMPDIR:-/tmp}/baseline_cells_err.XXXXXX")"
-    out="$("${BINARY}" baseline \
+    pidfile="$(mktemp "${TMPDIR:-/tmp}/baseline_cells_pid.XXXXXX")"
+    out="$(sh -c 'echo $$ >"$1"; shift; exec "$@"' sh "${pidfile}" "${BINARY}" baseline \
         --model "${model_path}" \
         --prompt-tokens "${PROMPT_TOKENS}" \
         --max-tokens "${MAX_TOKENS}" \
@@ -361,6 +367,8 @@ run_once() {
         ${record_args[@]+"${record_args[@]}"} \
         "$@" \
         2>"${err}")" || rc=$?
+    RUN_PID="$(cat "${pidfile}")"
+    rm -f "${pidfile}"
     RUN_RC="${rc}"
     RUN_OUT="${out}"
     RUN_LOG="$(cat "${err}")"
@@ -388,8 +396,9 @@ run_once() {
 
 # Warmup runs, then measured runs, filling DECODE and PREFILL with the readings.
 # <arm> names the arm in the progress lines and run phases; empty is the default
-# arm. A measured run with no reading stops the tool when <strict> is 1, else it
-# is warned about and skipped. A run that failed ends the arm with that run's exit
+# arm. A measured run with no reading stops the tool when <strict> is 1, ends the
+# arm with status 1 and its number in ZERO_RUN when <strict> is 2, else it is
+# warned about and skipped. A run that failed ends the arm with that run's exit
 # code (only a tool that keeps failed runs gets here).
 # Usage: measure_arm <model_path> <arm> <strict> [baseline args...]
 measure_arm() {
@@ -398,6 +407,7 @@ measure_arm() {
     local tag="${arm:+[${arm}] }"
     DECODE=()
     PREFILL=()
+    ZERO_RUN=""
     for ((i = 1; i <= WARMUP_RUNS; i++)); do
         echo "  ${tag}warmup ${i}/${WARMUP_RUNS}..." >&2
         run_once "${arm:+${arm}-}warmup" "${RECORD_CLASS}" "${model_path}" "$@"
@@ -412,11 +422,15 @@ measure_arm() {
         # A zero reading is a silent model failure, not a measurement.
         ok="$(awk -v v="${dtps}" 'BEGIN { print (v+0 > 0.001) ? "yes" : "no" }')"
         if [[ "${ok}" != yes ]]; then
-            if [[ "${strict}" -eq 1 ]]; then
+            if [[ "${strict}" -ge 1 ]]; then
                 if [[ -z "${dtps}" ]]; then
                     echo "ERROR: failed to parse decode_tps for ${model_path##*/} run ${i}" >&2
                 else
-                    echo "ERROR: ${model_path##*/} [${KV_QUANT:-default codec}] run ${i} read ${dtps} tok/s decode_tps; a zero is not a measurement" >&2
+                    echo "ERROR: ${model_path##*/} [${KV_QUANT:-${LABEL:-default codec}}] run ${i} read ${dtps} tok/s decode_tps; a zero is not a measurement" >&2
+                fi
+                if [[ "${strict}" -eq 2 ]]; then
+                    ZERO_RUN="${i}"
+                    return 1
                 fi
                 exit 1
             fi
@@ -570,10 +584,18 @@ types_run_size() {
     ctx_args=(--max-ctx "$3")
 }
 
+# The codec name the run that just ended states in its own log, or nothing. snapshot_logs
+# runs before that run.
+run_kv_quant() {
+    local log
+    log="$(phase_log "${RUN_PID}")" || return 0
+    log_kv_quant "${log}"
+}
+
 # Why the smoke run that just ended is rejected, or nothing when it passes.
 # Usage: smoke_rejection <exit code of the run>
 smoke_rejection() {
-    local rc="$1" output repeat
+    local rc="$1" repeat
     if [[ "${rc}" -eq "${RECORD_PENDING_EXIT}" ]]; then
         rc=0
     fi
@@ -589,37 +611,40 @@ smoke_rejection() {
         echo "tps_zero=${RUN_DECODE}"
         return
     fi
-    output="$(LC_ALL=C sed -n 's/^output: //p' <<<"${RUN_OUT}" | tail -1)"
-    if [[ -z "${output}" ]]; then
-        grep -q '^baseline: ' <<<"${RUN_OUT}" || echo no_output
+    if ! grep -q '^baseline: ' <<<"${RUN_OUT}"; then
+        echo no_output
         return
     fi
-    if ! printf '%s' "${output}" | iconv -f utf-8 -t utf-8 >/dev/null 2>&1; then
-        echo non_utf8
+    repeat="$(python3 "${REPO_ROOT}/scripts/bench/cache_types.py" repeat <<<"${RUN_LOG}")" || {
+        echo smoke_check_failed
         return
-    fi
-    repeat="$(printf '%s\n' "${output}" | python3 "${REPO_ROOT}/scripts/bench/cache_types.py" repeat 2>/dev/null || echo 0)"
-    if [[ "${repeat}" -gt 3 ]]; then
+    }
+    if [[ "${repeat}" == none ]]; then
+        echo no_output
+    elif [[ "${repeat}" -gt 3 ]]; then
         echo "4gram_repeat=${repeat}"
     fi
 }
 
 # One combo: its smoke probe, then its measured cell. Adds one row to the summary.
-# Usage: cache_types_combo <label> <ctk> <ctv> <kv_quant> <kv_quant shown without a record>
+# Usage: cache_types_combo <label> <ctk> <ctv> <kv_quant>
 cache_types_combo() {
-    local label="$1" ctk="$2" ctv="$3" kv_quant="$4" shown_kv="$5"
-    local flags=() rejection status rc=0 med sd summary record_file recorded_kv prompt_name
+    local label="$1" ctk="$2" ctv="$3" kv_quant="$4"
+    local flags=() rejection status rc=0 med sd summary record_file engine_kv shown_kv prompt_name
     echo "" >&2
     echo "==> ${label} ctk='${ctk}' ctv='${ctv}' kv_quant='${kv_quant}'" >&2
     if [[ -n "${ctk}" ]]; then
         flags=(--cache-type-k "${ctk}" --cache-type-v "${ctv}")
-    elif [[ "${kv_quant}" != auto ]]; then
+    elif [[ -n "${kv_quant}" ]]; then
         flags=(--kv-quant "${kv_quant}")
     fi
 
     types_run_size 4096 16 8192
     LABEL="ctype-smoke-${label}"
+    snapshot_logs
     run_once smoke diagnostic "${MODEL_PATH}" ${flags[@]+"${flags[@]}"}
+    engine_kv="$(run_kv_quant)"
+    shown_kv="${engine_kv:--}"
     rejection="$(smoke_rejection "${RUN_RC}")"
     if [[ "${rejection}" == resolver_skip ]]; then
         echo "CELL SKIP (resolver) label=${label}" >&2
@@ -633,6 +658,12 @@ cache_types_combo() {
         return
     fi
 
+    if [[ -z "${engine_kv}" ]]; then
+        echo "CELL FAIL label=${label}: the smoke run's log does not state the codec it ran" >&2
+        types_row "${label}" "${shown_kv}" "" "" no_kv_name
+        return
+    fi
+
     prompt_name="longctx_$((TYPES_PROMPT_TOKENS / 1024))k"
     if [[ ! -f "${REPO_ROOT}/prompts/${prompt_name}.json" ]]; then
         echo "CELL FAIL label=${label}: prompts/${prompt_name}.json is missing" >&2
@@ -641,8 +672,12 @@ cache_types_combo() {
     fi
     types_run_size "${TYPES_PROMPT_TOKENS}" 32 "${TYPES_CTX}"
     LABEL="ctype-${label}"
-    measure_arm "${MODEL_PATH}" "" 0 ${flags[@]+"${flags[@]}"} || rc=$?
-    if [[ "${rc}" -eq 78 ]]; then
+    measure_arm "${MODEL_PATH}" "" 2 ${flags[@]+"${flags[@]}"} || rc=$?
+    if [[ -n "${ZERO_RUN}" ]]; then
+        echo "CELL RUNTIME_FAIL (measured run ${ZERO_RUN} read no decode rate) label=${label}" >&2
+        types_row "${label}" "${shown_kv}" 0.0 "" runtime_fail
+        return
+    elif [[ "${rc}" -eq 78 ]]; then
         echo "CELL SKIP (resolver) label=${label}" >&2
         types_row "${label}" "${shown_kv}" "" "" skip
         return
@@ -663,29 +698,29 @@ cache_types_combo() {
     summary="$(grep -m1 '^baseline: model=' <<<"${RUN_OUT}" || true)"
     record_file="${DATA_ROOT}/metrics/buffer/pending/$(date -u +%Y%m%dT%H%M%SZ)-cache-types-${label}-$$.json"
     mkdir -p "${record_file%/*}"
-    if ! recorded_kv="$(python3 "${REPO_ROOT}/scripts/bench/cache_types.py" record \
+    if ! python3 "${REPO_ROOT}/scripts/bench/cache_types.py" record \
         --out "${record_file}" --identity-json "${RMLX_IDENTITY_JSON}" \
         ${git_sha_args[@]+"${git_sha_args[@]}"} \
         --model-path "${MODEL_PATH}" --weight-quant "${WEIGHT_QUANT}" \
-        --ctk "${ctk}" --ctv "${ctv}" --kv-quant "${kv_quant}" \
+        --ctk "${ctk}" --ctv "${ctv}" --kv-quant "${engine_kv}" \
         --ctx-max "${TYPES_CTX}" --prompt-file "${REPO_ROOT}/prompts/${prompt_name}.json" \
         --prompt-tokens "${TYPES_PROMPT_TOKENS}" --max-tokens 32 \
         --warmups "${WARMUP_RUNS}" --measured "${MEASURED_RUNS}" \
         --label "ctype-${label}" --tag "${TYPES_TAG}" --median "${med}" --stddev "${sd}" \
         --ttft "$(sed -n 's/.*ttft_ms=\([0-9.]*\).*/\1/p' <<<"${summary}")" \
         --load "$(sed -n 's/.*load=\([0-9.]*\)ms.*/\1/p' <<<"${summary}")" \
-        --rss "$(sed -n 's/.*peak_rss=\([0-9.]*\)MB.*/\1/p' <<<"${summary}")")" ||
+        --rss "$(sed -n 's/.*peak_rss=\([0-9.]*\)MB.*/\1/p' <<<"${summary}")" ||
         ! "${BINARY}" metrics record --file "${record_file}"; then
         echo "CELL FAIL label=${label}: the record did not land (${record_file##*/})" >&2
         types_row "${label}" "${shown_kv}" "" "" fail_rc9
         return
     fi
-    echo "CELL OK label=${label} kv=${recorded_kv} median=${med} stddev=${sd}" >&2
-    types_row "${label}" "${recorded_kv}" "${med}" "${sd}" ok
+    echo "CELL OK label=${label} kv=${engine_kv} median=${med} stddev=${sd}" >&2
+    types_row "${label}" "${engine_kv}" "${med}" "${sd}" ok
 }
 
 cache_types_matrix() {
-    local entry label ctk ctv kv_quant shown_kv base
+    local entry label ctk ctv kv_quant base
     TYPES_PROMPT_TOKENS="${PROMPT_TOKENS}"
     if [[ "${TYPES_PROMPT_TOKENS}" -le 4096 ]]; then
         TYPES_CTX=8192
@@ -702,10 +737,11 @@ cache_types_matrix() {
 
     echo "==> cache types × ${base}: arch=${ARCH_CLASS} weight=${WEIGHT_QUANT} ${#CACHE_TYPE_COMBOS[@]} combos" >&2
     SUMMARY_ROWS=""
+    mkdir -p "${LOG_DIR}" "${SCRATCH_DIR}"
     types_row label kv_quant decode_tps decode_stddev status
     for entry in ${CACHE_TYPE_COMBOS[@]+"${CACHE_TYPE_COMBOS[@]}"}; do
-        IFS='|' read -r label ctk ctv kv_quant shown_kv <<<"${entry}"
-        cache_types_combo "${label}" "${ctk}" "${ctv}" "${kv_quant}" "${shown_kv}"
+        IFS='|' read -r label ctk ctv kv_quant <<<"${entry}"
+        cache_types_combo "${label}" "${ctk}" "${ctv}" "${kv_quant}"
     done
 
     echo "" >&2

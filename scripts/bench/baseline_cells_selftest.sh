@@ -25,18 +25,27 @@ BASE_IDENTITY='"backend":"rmlx","backend_version":"9.9.9","build_profile":"relea
 BONSAI=prism-ml__Ternary-Bonsai-2-27B-mlx-2bit
 GEMMA26=mlx-community__gemma-4-26b-a4b-it-mxfp8
 
-# make_stub <path> — a stub `rmlx`. Controls live in files under $RMLX_HOME:
-#   readings     lines `<call number> <decode_tps> <prefill_tps>`; any other call reads 10.0 1.0
-#   crash_on     the run whose argv holds this text exits 1 without a reading
+# make_stub <path> — a stub `rmlx` that prints what the real one prints: the `baseline: model=` summary
+# line (and `token_ids=` when asked) on stdout; on stderr the generated text as a `decoded="..."` field
+# and a run log that states the codec it ran, `stubq` plus the cache flags of its argv. Controls live in
+# files under $RMLX_HOME:
+#   readings     lines `<call number> <decode_tps> <prefill_tps> [<ttft_ms> <load ms> <peak rss MB>]`; any
+#                other call reads 10.0 1.0, ttft 1, load 250, rss 2048.5
+#   crash_on    the run whose argv holds this text exits 1 without a reading
 #   silent_on    the run whose argv holds this text exits 0 without a reading
 #   pending_on   the recorded run whose argv holds this text prints its reading, then exits 75
 #   shared_log   name of a run log another process already wrote, which the run appends to
 #   claim_held   `claim run` exits 11
 #   inertness    lines `<call number> <kv_cache_bytes> <token ids> <store skipped 0|1>`: the residency the
 #                run prints, its `token_ids=` line and, for 1, the packed-store-skipped line on stderr
-#   outputs      lines `<call number> <printf text>`: the `output:` line that run prints
+#   decoded      lines `<call number> <text>`: the body of one `decoded="..."` field that run prints, as
+#                Rust Debug writes it, one field per line; any other call prints one clean sentence
+#   no_decoded_on  the run whose argv holds this text prints its summary line and no `decoded` field
+#   no_summary_on  the run whose argv holds this text prints its `decoded` field and no summary line
+#   no_codec_on  the run whose argv holds this text states no codec in its log
 #   fail_on      the first line is an exit code; the run whose argv holds every later line exits with it
 #   record_fails `metrics record` exits 1; otherwise it keeps a copy of the file under $RMLX_HOME/records
+#   record_calls (written) the file each `metrics record` call was handed
 make_stub() {
 	cat >"$1" <<'STUB'
 #!/usr/bin/env bash
@@ -58,6 +67,7 @@ metrics)
 	path) echo "$RMLX_HOME" ;;
 	identity) cat "$RMLX_HOME/identity.json" ;;
 	record)
+		echo "$4" >>"$RMLX_HOME/record_calls"
 		[ ! -e "$RMLX_HOME/record_fails" ] || exit 1
 		mkdir -p "$RMLX_HOME/records"
 		cp "$4" "$RMLX_HOME/records/$(($(ls "$RMLX_HOME/records" | wc -l) + 1))"
@@ -75,7 +85,12 @@ baseline)
 		log="$RMLX_HOME/logs/$(date +%s)-$$.jsonl"
 	fi
 	printf '%s\n' "{\"timestamp\":\"2026-09-03T00:00:00Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"rmlx start\",\"version\":\"9.9.9\",\"run_id\":\"stub\",\"pid\":$$}}" >>"$log"
-	printf '%s\n' "{\"timestamp\":\"2026-09-03T00:00:00Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"cache-type resolved\",\"arch\":\"Stub\",\"kv_quant\":\"stubq\"}}" >>"$log"
+	case "$args" in
+	*" --kv-quant "*) flagged="_$(sed 's/.* --kv-quant \([^ ]*\) .*/\1/' <<<"$args")" ;;
+	*" --cache-type-k "*) flagged="_$(sed 's/.* --cache-type-k \([^ ]*\) --cache-type-v \([^ ]*\) .*/\1_\2/' <<<"$args")" ;;
+	*) flagged="" ;;
+	esac
+	holds no_codec_on || printf '%s\n' "{\"timestamp\":\"2026-09-03T00:00:00Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"cache-type resolved\",\"arch\":\"Stub\",\"kv_quant\":\"stubq$flagged\"}}" >>"$log"
 	if holds crash_on; then exit 1; fi
 	if holds silent_on; then exit 0; fi
 	if [ -e "$RMLX_HOME/fail_on" ]; then
@@ -85,14 +100,19 @@ baseline)
 		done < <(sed 1d "$RMLX_HOME/fail_on")
 		[ "$hit" = 0 ] || exit "$(sed -n 1p "$RMLX_HOME/fail_on")"
 	fi
-	row="$(awk -v n="$n" '$1 == n { print $2, $3 }' "$RMLX_HOME/readings" 2>/dev/null || true)"
+	row="$(awk -v n="$n" '$1 == n { $1 = ""; print }' "$RMLX_HOME/readings" 2>/dev/null || true)"
 	set -- ${row:-10.0 1.0}
+	ttft="${3:-1}" load="${4:-250}" rss="${5:-2048.5}"
 	bytes=1000 ids="" skipped=0
 	irow="$(awk -v n="$n" '$1 == n { print $2, $3, $4 }' "$RMLX_HOME/inertness" 2>/dev/null || true)"
 	[ -z "$irow" ] || read -r bytes ids skipped <<<"$irow"
-	echo "baseline: model=stub  load=250ms  ttft_ms=1  decode_tps=$1  prefill_tps=$2  prompt_tokens=4200  peak_rss=2048.5MB  kv_cache_bytes=$bytes"
-	text="$(awk -v n="$n" '$1 == n { sub(/^[^ ]+ /, ""); print }' "$RMLX_HOME/outputs" 2>/dev/null || true)"
-	[ -z "$text" ] || printf "output: $text\n"
+	holds no_summary_on || echo "baseline: model=stub  load=${load}ms ttft_ms=$ttft  decode_tps=$1  prefill_tps=$2  prompt_tokens=4200  peak_rss=${rss}MB  kv_cache_bytes=$bytes"
+	text="$(awk -v n="$n" '$1 == n { sub(/^[^ ]+ /, ""); print }' "$RMLX_HOME/decoded" 2>/dev/null || true)"
+	if ! holds no_decoded_on; then
+		while IFS= read -r line; do
+			printf '\033[2m2026-09-03T00:00:00Z\033[0m \033[32m INFO\033[0m baseline: decoded preview \033[3mdecoded\033[0m\033[2m=\033[0m"%s"\n' "$line" >&2
+		done <<<"${text:-the quick brown fox jumps over the lazy dog}"
+	fi
 	[ -z "$ids" ] || echo "baseline: token_ids=$ids"
 	[ "$skipped" = 0 ] || echo "exit_prefill: packed store skipped - decode reads the bf16 mirror only" >&2
 	case "$args" in *" --record "*)
@@ -540,21 +560,20 @@ st_verdict inertness_csv_and_binary_flags "$why" "--csv names the file the rows 
 
 # ── the cache-types preset ────────────────────────────────────────────────────
 
-# label|flags of its runs|kv_quant of its record|kv_quant of a row that filed no record
+# label|flags of its runs
 CT_COMBOS=(
-	"auto||k8v8|auto"
-	"bf16|--cache-type-k bf16 --cache-type-v bf16|none|ct_bf16_bf16"
-	"k8v4|--kv-quant k8v4|k8v4|k8v4"
-	"k8v8|--kv-quant k8v8|k8v8|k8v8"
-	"planar|--kv-quant planar|planar|planar"
-	"q8g128_q4g64|--cache-type-k q8_g128 --cache-type-v q4_g64|mixed_k8g128_v4g64|mixed_k8g128_v4g64"
-	"q8g128_q8g64|--cache-type-k q8_g128 --cache-type-v q8_g64|mixed_k8g128_v8g64|mixed_k8g128_v8g64"
-	"q8g128_q4g128|--cache-type-k q8_g128 --cache-type-v q4_g128|mixed_k8g128_v4g128|mixed_k8g128_v4g128"
-	"q8g128_q6g64|--cache-type-k q8_g128 --cache-type-v q6_g64|mixed_k8g128_v6g64|mixed_k8g128_v6g64"
-	"q8g128_q8g32|--cache-type-k q8_g128 --cache-type-v q8_g32|mixed_k8g128_v8g32|mixed_k8g128_v8g32"
-	"q4g64_q4g64|--cache-type-k q4_g64 --cache-type-v q4_g64|mixed_k4g64_v4g64|mixed_k4g64_v4g64"
-	"q8g128_tq4|--cache-type-k q8_g128 --cache-type-v tq4|k8v4|k8v4"
-	"q8g128_planar4|--cache-type-k q8_g128 --cache-type-v planar4|planar|planar"
+	"bf16|--cache-type-k bf16 --cache-type-v bf16"
+	"k8v4|--kv-quant k8v4"
+	"k8v8|--kv-quant k8v8"
+	"planar|--kv-quant planar"
+	"q8g128_q4g64|--cache-type-k q8_g128 --cache-type-v q4_g64"
+	"q8g128_q8g64|--cache-type-k q8_g128 --cache-type-v q8_g64"
+	"q8g128_q4g128|--cache-type-k q8_g128 --cache-type-v q4_g128"
+	"q8g128_q6g64|--cache-type-k q8_g128 --cache-type-v q6_g64"
+	"q8g128_q8g32|--cache-type-k q8_g128 --cache-type-v q8_g32"
+	"q4g64_q4g64|--cache-type-k q4_g64 --cache-type-v q4_g64"
+	"q8g128_tq4|--cache-type-k q8_g128 --cache-type-v tq4"
+	"q8g128_planar4|--cache-type-k q8_g128 --cache-type-v planar4"
 )
 
 ct_run() { # <home> [tool args...] — the matrix over the cell model
@@ -563,14 +582,27 @@ ct_run() { # <home> [tool args...] — the matrix over the cell model
 	run_tool "$home" "$FAKE" --preset cache-types --model "$CELL_MODEL" --arch-class Stub "$@"
 }
 
-# ct_field <n> — field <n> of every combo, space separated
-ct_field() {
-	local entry out="" f1 f2 f3 f4
+# ct_labels — the label of every combo, space separated
+ct_labels() {
+	local entry out="" label flags
 	for entry in "${CT_COMBOS[@]}"; do
-		IFS='|' read -r f1 f2 f3 f4 <<<"$entry"
-		case "$1" in 1) out="$out $f1" ;; 3) out="$out $f3" ;; esac
+		IFS='|' read -r label flags <<<"$entry"
+		out="$out $label"
 	done
 	printf '%s' "${out# }"
+}
+
+# ct_name <label> — the codec name the stub states in the log of that combo's runs: `stubq` and its cache flags
+ct_name() {
+	local entry label flags words
+	for entry in "${CT_COMBOS[@]}"; do
+		IFS='|' read -r label flags <<<"$entry"
+		[ "$label" = "$1" ] || continue
+		words="${flags#--kv-quant }"
+		words="${words//--cache-type-k /}"
+		words="${words//--cache-type-v /}"
+		printf 'stubq_%s' "${words// /_}"
+	done
 }
 
 # run_facts <argv-file> — per logged run: prompt tokens, generated tokens, context, record class, cache flags.
@@ -593,7 +625,7 @@ run_facts() {
 ct_expected_runs() {
 	local entry flags rest i
 	for entry in "${CT_COMBOS[@]}"; do
-		IFS='|' read -r rest flags rest <<<"$entry"
+		IFS='|' read -r rest flags <<<"$entry"
 		echo "p=4096 n=16 c=8192 rec=diagnostic flags=$flags"
 		for i in 1 2 3 4 5; do
 			echo "p=$1 n=32 c=$2 rec=- flags=$flags"
@@ -603,16 +635,16 @@ ct_expected_runs() {
 
 # ct_rows <output> — the summary table, its numbers read as numbers (12.0 and 12 are one reading)
 ct_rows() {
-	grep -A13 '^label  *kv_quant' <<<"$1" | awk '{ $1 = $1; for (i = 1; i <= NF; i++) if ($i ~ /^[0-9.]+$/) $i = $i + 0; print }'
+	grep -A12 '^label  *kv_quant' <<<"$1" | awk '{ $1 = $1; for (i = 1; i <= NF; i++) if ($i ~ /^[0-9.]+$/) $i = $i + 0; print }'
 }
 
 # ct_expected_rows [<label>=<row>]... — the summary of a matrix whose rows all passed, bar the rows given
 ct_expected_rows() {
-	local entry label kv arg row rest
+	local entry label arg row rest
 	echo "label kv_quant decode_tps decode_stddev status"
 	for entry in "${CT_COMBOS[@]}"; do
-		IFS='|' read -r label rest kv rest <<<"$entry"
-		row="$label $kv 10 0 ok"
+		IFS='|' read -r label rest <<<"$entry"
+		row="$label $(ct_name "$label") 10 0 ok"
 		for arg in "$@"; do
 			case "$arg" in "$label="*) row="${arg#*=}" ;; esac
 		done
@@ -622,11 +654,11 @@ ct_expected_rows() {
 
 # ct_expected_failed <status> — a matrix in which no combo filed a record: every row has this status
 ct_expected_failed() {
-	local entry label kv rest
+	local entry label rest
 	echo "label kv_quant decode_tps decode_stddev status"
 	for entry in "${CT_COMBOS[@]}"; do
-		IFS='|' read -r label rest rest kv <<<"$entry"
-		echo "$label $kv $1"
+		IFS='|' read -r label rest <<<"$entry"
+		echo "$label $(ct_name "$label") $1"
 	done
 }
 
@@ -640,26 +672,29 @@ ct_record_field() { # <record file> <python expression over r>
 
 # Call numbers of a matrix in which every probe and cell passes: combo i (from 0) makes
 # 6i+1 the smoke probe, 6i+2 and 6i+3 the warmups, 6i+4 to 6i+6 the measured runs.
+# The first combo's measured runs read 10, 12 and 14 tok/s: the median is the second run, ttft, load and
+# peak RSS are the last run's.
 home="$(new_home cache_types_default)"
-control "$home" readings "$(printf '%s\n' '4 10.0 1.0' '5 14.0 2.0' '6 12.0 3.0')"
+control "$home" readings "$(printf '%s\n' '4 10.0 1.0 11 301 2001.5' '5 12.0 2.0 12 302 2002.5' '6 14.0 3.0 13 303 2003.5')"
 ct_run "$home"
 CT_OUT="$ST_OUT"
 why="$(st_check 0 --has "MATRIX SUMMARY  model=host__m arch=Stub weight=fp16" --has "prompt_id=longctx_4k prompt_tokens=4096 ctx_max=8192")"
 want "runs" "$(run_facts "$home/baseline_argv")" "$(ct_expected_runs 4096 8192)"
 want "smoke labels" "$(sed -n 's/.* --label \(ctype-smoke-[^ ]*\).*/\1/p' "$home/baseline_argv" | tr '\n' ' ')" \
-	"$(for l in $(ct_field 1); do printf 'ctype-smoke-%s ' "$l"; done)"
+	"$(for l in $(ct_labels); do printf 'ctype-smoke-%s ' "$l"; done)"
 st_verdict cache_types_argv_per_combo "$why" "per combo: one smoke probe (16 tokens, recorded diagnostic) and 2 + 3 unrecorded runs (32 tokens) with the combo's cache flags"
 
 why=""
-want "records filed" "$(ct_records "$home")" 13
-want "record kv_quant" "$(for n in $(seq 1 13); do ct_record_field "$home/records/$n" 'r["kv_quant"]'; done | tr '\n' ' ' | sed 's/ $//')" "$(ct_field 3)"
-want "record ctk ctv in notes" "$(for n in 2 6 12; do ct_record_field "$home/records/$n" 'r["notes"]'; done | tr '\n' '|')" \
+want "records filed" "$(ct_records "$home")" 12
+want "record kv_quant" "$(for n in $(seq 1 12); do ct_record_field "$home/records/$n" 'r["kv_quant"]'; done | tr '\n' ' ' | sed 's/ $//')" \
+	"$(for l in $(ct_labels); do printf '%s ' "$(ct_name "$l")"; done | sed 's/ $//')"
+want "record ctk ctv in notes" "$(for n in 1 5 11; do ct_record_field "$home/records/$n" 'r["notes"]'; done | tr '\n' '|')" \
 	"label=ctype-bf16 ctk=bf16 ctv=bf16 warmup=2 measured=3|label=ctype-q8g128_q4g64 ctk=q8_g128 ctv=q4_g64 warmup=2 measured=3|label=ctype-q8g128_tq4 ctk=q8_g128 ctv=tq4 warmup=2 measured=3|"
-st_verdict cache_types_record_kv_quant "$why" "a cell's record names the pair as mixed_k<bits>g<group>_v<bits>g<group>, none for bf16, k8v4 for tq4, planar for planar4"
+st_verdict cache_types_record_kv_quant "$why" "a cell's record names the codec the smoke run's log states, for every combo, whatever its flags"
 
 why=""
 rec1="$(sed 's/"ts_utc": "[^"]*"/"ts_utc": "MASKED"/; /"description"/d' "$home/records/1")"
-want "first record" "$rec1" "$(cat <<EOF
+want "bf16 record" "$rec1" "$(cat <<EOF
 {
   "backend": "rmlx",
   "backend_version": "9.9.9",
@@ -669,7 +704,7 @@ want "first record" "$rec1" "$(cat <<EOF
   "model_namespace": "host",
   "model": "m",
   "weight_quant": "fp16",
-  "kv_quant": "k8v8",
+  "kv_quant": "stubq_bf16_bf16",
   "ctx_max": 8192,
   "prompt": {
     "name": "longctx_4k",
@@ -688,7 +723,7 @@ want "first record" "$rec1" "$(cat <<EOF
   "temperature": 0.0,
   "n_warmups": 2,
   "n_measure": 3,
-  "notes": "label=ctype-auto ctk=auto ctv=auto warmup=2 measured=3",
+  "notes": "label=ctype-bf16 ctk=bf16 ctv=bf16 warmup=2 measured=3",
   "run_class": "gate",
   "metrics": [
     {
@@ -698,26 +733,26 @@ want "first record" "$rec1" "$(cat <<EOF
     },
     {
       "name": "ttft_warm_ms",
-      "value": 1.0
+      "value": 13.0
     },
     {
       "name": "model_load_ms",
-      "value": 250.0
+      "value": 303.0
     },
     {
       "name": "peak_rss_mb",
-      "value": 2048.5
+      "value": 2003.5
     }
   ]
 }
 EOF
 )"
-want "description" "$(ct_record_field "$home/records/1" 'r["description"].split(" ", 2)[2]')" "m ctype-auto"
+want "description" "$(ct_record_field "$home/records/1" 'r["description"].split(" ", 2)[2]')" "m ctype-bf16"
 want "ts_utc" "$(ct_record_field "$home/records/1" 'r["ts_utc"]' | grep -cE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' || true)" 1
-st_verdict cache_types_record_fields "$why" "the cell's one record: identity, the combo's kv_quant, the prompt, the sizes, class gate, and the median decode rate with its stddev, ttft, load time and peak RSS"
+st_verdict cache_types_record_fields "$why" "the cell's one record: identity, the codec the log states, the prompt, the sizes, class gate, the median decode rate with its stddev, and the ttft, load time and peak RSS of the last measured run"
 
 why=""
-want "summary" "$(ct_rows "$CT_OUT")" "$(ct_expected_rows "auto=auto k8v8 12 2 ok")"
+want "summary" "$(ct_rows "$CT_OUT")" "$(ct_expected_rows "bf16=bf16 $(ct_name bf16) 12 2 ok")"
 st_verdict cache_types_summary_rows "$why" "one row per combo: label, kv_quant, median decode rate, stddev, status"
 
 home="$(new_home cache_types_prompt_16k)"
@@ -743,37 +778,37 @@ home="$(new_home cache_types_resolver_skip)"
 control "$home" fail_on "$(printf '%s\n' 78 ' --cache-type-v tq4 ' ' --record ')"
 ct_run "$home"
 why="$(st_check 0 --has "CELL SKIP (resolver) label=q8g128_tq4")"
-want "summary" "$(ct_rows "$ST_OUT")" "$(ct_expected_rows "q8g128_tq4=q8g128_tq4 k8v4 skip")"
-want "records filed" "$(ct_records "$home")" 12
-want "runs" "$(wc -l <"$home/baseline_argv" | tr -d ' ')" 73
+want "summary" "$(ct_rows "$ST_OUT")" "$(ct_expected_rows "q8g128_tq4=q8g128_tq4 $(ct_name q8g128_tq4) skip")"
+want "records filed" "$(ct_records "$home")" 11
+want "runs" "$(wc -l <"$home/baseline_argv" | tr -d ' ')" 67
 st_verdict cache_types_resolver_skip_in_smoke "$why" "a smoke probe that exits 78 skips its cell: a skip row, no cell runs, no record"
 
 home="$(new_home cache_types_resolver_skip_in_cell)"
 control "$home" fail_on "$(printf '%s\n' 78 ' --cache-type-v planar4 ' ' --max-tokens 32 ')"
 ct_run "$home"
 why="$(st_check 0)"
-want "summary" "$(ct_rows "$ST_OUT")" "$(ct_expected_rows "q8g128_planar4=q8g128_planar4 planar skip")"
-want "records filed" "$(ct_records "$home")" 12
-want "runs" "$(wc -l <"$home/baseline_argv" | tr -d ' ')" 74
+want "summary" "$(ct_rows "$ST_OUT")" "$(ct_expected_rows "q8g128_planar4=q8g128_planar4 $(ct_name q8g128_planar4) skip")"
+want "records filed" "$(ct_records "$home")" 11
+want "runs" "$(wc -l <"$home/baseline_argv" | tr -d ' ')" 68
 st_verdict cache_types_resolver_skip_in_cell "$why" "a cell run that exits 78 ends the cell at that run: a skip row and no record"
 
 home="$(new_home cache_types_low_median)"
-control "$home" readings "$(printf '%s\n' '4 0.3 1.0' '5 0.3 1.0' '6 0.3 1.0' '10 0.0 1.0' '11 0.0 1.0' '12 0.0 1.0' '16 0.5 1.0' '17 0.5 1.0' '18 0.5 1.0')"
+control "$home" readings "$(printf '%s\n' '4 0.3 1.0' '5 0.3 1.0' '6 0.3 1.0' '10 0.5 1.0' '11 0.5 1.0' '12 0.5 1.0')"
 ct_run "$home"
 why="$(st_check 0 --has "CELL RUNTIME_FAIL")"
-want "summary" "$(ct_rows "$ST_OUT")" "$(ct_expected_rows "auto=auto auto 0 runtime_fail" "bf16=bf16 ct_bf16_bf16 0 runtime_fail" "k8v4=k8v4 k8v4 0.5 0 ok")"
+want "summary" "$(ct_rows "$ST_OUT")" "$(ct_expected_rows "bf16=bf16 $(ct_name bf16) 0 runtime_fail" "k8v4=k8v4 $(ct_name k8v4) 0.5 0 ok")"
 want "records filed" "$(ct_records "$home")" 11
 st_verdict cache_types_median_below_half_files_no_record "$why" "a median below 0.5 is a runtime_fail row with no record; a median of exactly 0.5 is a result"
 
-smoke_case() { # <name> <what> <status> <reason> — combo 2 (bf16) fails its probe, which is run 7; the control files are set by the caller
-	why="$(st_check 0 --has "CELL SMOKE_FAIL label=bf16 reason=$4 status=$3")"
-	want "summary" "$(ct_rows "$ST_OUT")" "$(ct_expected_rows "bf16=bf16 ct_bf16_bf16 $3")"
-	want "records filed" "$(ct_records "$home")" 12
+smoke_case() { # <name> <what> <status> <reason> — combo 2 (k8v4) fails its probe, which is run 7; the control files are set by the caller
+	why="$(st_check 0 --has "CELL SMOKE_FAIL label=k8v4 reason=$4 status=$3")"
+	want "summary" "$(ct_rows "$ST_OUT")" "$(ct_expected_rows "k8v4=k8v4 $(ct_name k8v4) $3")"
+	want "records filed" "$(ct_records "$home")" 11
 	st_verdict "$1" "$why" "$2"
 }
 
 home="$(new_home cache_types_smoke_run_fails)"
-control "$home" fail_on "$(printf '%s\n' 1 ' --cache-type-k bf16 ' ' --record ')"
+control "$home" fail_on "$(printf '%s\n' 1 ' --kv-quant k8v4 ' ' --record ')"
 ct_run "$home"
 smoke_case cache_types_smoke_run_fails "a smoke run that fails is a smoke_fail row with no cell" smoke_fail baseline_exit_1
 
@@ -783,19 +818,41 @@ ct_run "$home"
 smoke_case cache_types_smoke_low_rate "a smoke decode rate below 0.5 is a runtime_fail row" runtime_fail tps_zero=0.2
 
 home="$(new_home cache_types_smoke_no_output)"
-control "$home" silent_on " --label ctype-smoke-bf16 "
+control "$home" silent_on " --label ctype-smoke-k8v4 "
 ct_run "$home"
-smoke_case cache_types_smoke_no_output "a smoke run that prints no summary line is a smoke_fail row" smoke_fail no_output
+smoke_case cache_types_smoke_no_output "a smoke run that prints nothing is a smoke_fail row" smoke_fail no_output
 
-home="$(new_home cache_types_smoke_not_utf8)"
-control "$home" outputs '7 \377\376 broken'
+home="$(new_home cache_types_smoke_no_decoded_field)"
+control "$home" no_decoded_on " --label ctype-smoke-k8v4 "
 ct_run "$home"
-smoke_case cache_types_smoke_not_utf8 "a smoke text that is not UTF-8 is a smoke_fail row" smoke_fail non_utf8
+smoke_case cache_types_smoke_no_decoded_field "a smoke run that prints its summary line and no decoded field is a smoke_fail row" smoke_fail no_output
+
+home="$(new_home cache_types_smoke_no_summary_line)"
+control "$home" no_summary_on " --label ctype-smoke-k8v4 "
+ct_run "$home"
+smoke_case cache_types_smoke_no_summary_line "a smoke run that prints a decoded text and no summary line is a smoke_fail row" smoke_fail no_output
 
 home="$(new_home cache_types_smoke_repeats)"
-control "$home" outputs "$(printf '%s\n' '7 a b c d a b c d a b c d a b c d' '8 a b c d a b c d a b c d')"
+control "$home" decoded "$(printf '%s\n' '7 a b c d a b c d a b c d a b c d' '8 a b c d a b c d a b c d')"
 ct_run "$home"
-smoke_case cache_types_smoke_repeats "a smoke text repeating one four-word sequence 4 times is a smoke_fail row; 3 times passes" smoke_fail 4gram_repeat=4
+CT_OUT="$ST_OUT"
+smoke_case cache_types_smoke_repeats "a smoke text repeating one four-word sequence 4 times is a smoke_fail row" smoke_fail 4gram_repeat=4
+why=""
+want "k8v8 probe (run 8, 3 repeats) passed" "$(ct_rows "$CT_OUT" | grep -c '^k8v8 .* ok$' || true)" 1
+st_verdict cache_types_smoke_repeats_threshold "$why" "the same sequence 3 times passes"
+
+home="$(new_home cache_types_smoke_decoded_escapes)"
+control "$home" decoded '7 she said \"stop\" in C:\\temp then one\ntwo\nthree\nfour\none\ntwo\nthree\nfour\none\ntwo\nthree\nfour\none\ntwo\nthree\nfour'
+ct_run "$home"
+smoke_case cache_types_smoke_decoded_escapes "the decoded field is read to its closing quote past an escaped quote, ANSI codes are stripped and escaped newlines separate words" smoke_fail 4gram_repeat=4
+
+
+home="$(new_home cache_types_smoke_reads_last_decoded_field)"
+control "$home" decoded "$(printf '%s\n' '7 a b c d a b c d a b c d a b c d' '7 a clean sentence of unique words')"
+ct_run "$home"
+why="$(st_check 0)"
+want "summary" "$(ct_rows "$ST_OUT")" "$(ct_expected_rows)"
+st_verdict cache_types_smoke_reads_last_decoded_field "$why" "of several decoded fields in a log, the last one is the generated text"
 
 home="$(new_home cache_types_smoke_pending_record)"
 control "$home" pending_on "--record"
@@ -803,18 +860,18 @@ ct_run "$home"
 why="$(st_check 75 \
 	--has "record pending: $home/metrics/buffer/pending/stub.json" \
 	--has "CELL OK" \
-	--has "INCOMPLETE: 13 " \
+	--has "INCOMPLETE: 12 " \
 	--lacks "baseline_exit_75")"
 want "summary" "$(ct_rows "$ST_OUT")" "$(ct_expected_rows)"
-want "records filed" "$(ct_records "$home")" 13
+want "records filed" "$(ct_records "$home")" 12
 st_verdict cache_types_smoke_with_a_pending_record_is_measured "$why" "a smoke probe whose record did not land still lets its cell run; the run ends 75"
 
 home="$(new_home cache_types_smoke_records_diagnostic)"
 control "$home" fail_on "78"
 ct_run "$home"
 why="$(st_check 0)"
-want "smoke probes recording as diagnostic" "$(argv_lines_with "$home/baseline_argv" "--record --run-class diagnostic" "--label ctype-smoke-")" 13
-want "runs" "$(wc -l <"$home/baseline_argv" | tr -d ' ')" 13
+want "smoke probes recording as diagnostic" "$(argv_lines_with "$home/baseline_argv" "--record --run-class diagnostic" "--label ctype-smoke-")" 12
+want "runs" "$(wc -l <"$home/baseline_argv" | tr -d ' ')" 12
 st_verdict cache_types_smoke_records_diagnostic "$why" "every smoke probe records as diagnostic"
 
 home="$(new_home cache_types_run_fails)"
@@ -828,8 +885,8 @@ st_verdict cache_types_run_fails "$why" "a cell run that fails ends its cell: a 
 home="$(new_home cache_types_record_not_filed)"
 control "$home" record_fails 1
 ct_run "$home"
-why="$(st_check 0 --has "CELL FAIL label=auto")"
-want "failed rows" "$(ct_rows "$ST_OUT" | grep -c ' fail_rc9$' || true)" 13
+why="$(st_check 0 --has "CELL FAIL label=bf16")"
+want "failed rows" "$(ct_rows "$ST_OUT" | grep -c ' fail_rc9$' || true)" 12
 st_verdict cache_types_record_not_filed "$why" "a record that does not land is a fail_rc9 row"
 
 home="$(new_home cache_types_unlabelled_snapshot)"
@@ -870,10 +927,21 @@ usage_case usage_inertness_missing_model "model path not found: $ST_WORK/no_such
 home="$(new_home cache_types_zero_reading)"
 control "$home" readings "$(printf '%s\n' '4 10.0 1.0' '5 0.0 1.0' '6 14.0 1.0')"
 ct_run "$home"
-why="$(st_check 0 --has "run 2 failed to parse decode_tps")"
-want "summary" "$(ct_rows "$ST_OUT")" "$(ct_expected_rows "auto=auto k8v8 12 2.8284 ok")"
-want "record median and stddev" "$(ct_record_field "$home/records/1" 'r["metrics"][0]["value"], r["metrics"][0]["stddev"]')" "(12.0, 2.8284)"
-st_verdict cache_types_zero_reading_is_not_a_measurement "$why" "a measured run that reads zero is left out of the median and the stddev"
+why="$(st_check 0 --has "ERROR: host__m [ctype-bf16] run 2 read 0.0 tok/s decode_tps; a zero is not a measurement" --has "CELL RUNTIME_FAIL" --has "label=bf16")"
+want "summary" "$(ct_rows "$ST_OUT")" "$(ct_expected_rows "bf16=bf16 $(ct_name bf16) 0 runtime_fail")"
+want "records filed" "$(ct_records "$home")" 11
+want "record files handed to metrics record for the combo" "$(grep -c 'cache-types-bf16-' "$home/record_calls" || true)" 0
+want "runs" "$(wc -l <"$home/baseline_argv" | tr -d ' ')" 71
+st_verdict cache_types_zero_reading_is_not_a_measurement "$why" "a measured run that reads zero ends its combo: a runtime_fail row, no record, an error naming the combo, the run and the reading, and the matrix goes on"
+
+home="$(new_home cache_types_unstated_codec)"
+control "$home" no_codec_on " --kv-quant k8v8 "
+ct_run "$home"
+why="$(st_check 0 --has "CELL FAIL label=k8v8: the smoke run's log does not state the codec it ran")"
+want "summary" "$(ct_rows "$ST_OUT")" "$(ct_expected_rows "k8v8=k8v8 - no_kv_name")"
+want "records filed" "$(ct_records "$home")" 11
+want "runs" "$(wc -l <"$home/baseline_argv" | tr -d ' ')" 67
+st_verdict cache_types_unstated_codec_files_no_record "$why" "a smoke log that states no codec files no record, runs no cell, and the row says no_kv_name"
 
 home="$(new_home cache_types_claim_held)"
 control "$home" claim_held 1
